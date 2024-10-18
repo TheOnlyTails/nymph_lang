@@ -1,0 +1,44 @@
+import stdlib/option with (Option)
+
+interface Divide<Other, Output> {
+  func divide(other: Other): Output
+}
+
+impl Divide<Other = int, Output = Option<float>> for int {
+  func divide(other: int) -> match (other) {
+    0 -> Option.None,
+    _ as other -> Option.Some(this / other)
+  }
+}
+
+impl Divide<Other = int !is 0, Output = float> for int {
+  external func divide(other: int): float
+}
+
+impl Divide<Other = int is 0, Output = never> for int {
+  func divide(other: int is 0): float
+}
+
+impl Divide<Other = float, Output = float> for int {
+  external func divide(other: float): float
+}
+
+impl Divide<Other = float is 0f, Output = never> for int {
+  func divide(other: float is 0): float
+}
+
+impl Divide<Other = float, Output = float> for float {
+  external func divide(other: float): float
+}
+
+impl Divide<Other = float is 0f, Output = never> for float {
+  func divide(other: float): float
+}
+
+impl Divide<Other = int, Output = float> for float {
+  external func divide(other: int): float
+}
+
+impl Divide<Other = int is 0, Output = never> for float {
+  func divide(other: int): float
+}

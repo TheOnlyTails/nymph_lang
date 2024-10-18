@@ -1,0 +1,14 @@
+public enum Result<T, E> {
+  Ok(value: T),
+  Error(error: E)
+
+  func map<R>(f: (T) -> R) -> match (this) {
+    Ok(value) -> Ok(value = f(value)),
+    Error(error) -> Error(error)
+  }
+  
+  func unwrap_or(default: T) -> match (this) {
+    Ok(value) -> value,
+    Error(...) -> default
+  }
+}

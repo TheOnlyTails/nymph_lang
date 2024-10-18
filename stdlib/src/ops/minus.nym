@@ -1,0 +1,23 @@
+interface Minus<Other, Output> {
+  func minus(other: Other): Output
+}
+
+impl Minus<Other = int, Output = int> for int {
+  external func minus(other: int): int
+}
+
+impl Minus<Other = float, Output = float> for int {
+  external func minus(other: float): float
+}
+
+impl Minus<Other = float, Output = float> for float {
+  external func minus(other: float): float
+}
+
+impl Minus<Other = int, Output = float> for float {
+  external func minus(other: int): float
+}
+
+impl<T: Plus<Other = T, Output = T> + Negate<Output = T>> Minus<Other = self, Output = self> for T {
+  func minus(other: self) = this + (-other)
+}

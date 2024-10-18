@@ -1,0 +1,7 @@
+interface Remainder<Other, Output> {
+  func remainder(other: Other): Output
+}
+
+impl Remainder<Other = int, Output = int> for int {
+  external func remainder(other: int): int
+}

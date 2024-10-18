@@ -1,0 +1,153 @@
+interface Equals<Other> {
+  func equals(other: Other): boolean
+
+  func not_equals(other: Other) -> !this.equals(other)
+}
+
+impl<T> Equals<Other = self> for T {
+  external func equals(other: self): boolean
+}
+
+impl<T: Equals> Equals<Other = self> for #[T] {
+  func equals(other: self) ->
+    this.length() == other.length() && (0..this.length()).all((i) -> this[i] == other[i])
+}
+
+impl<K: Equals<K>, V: Equals<V>> Equals<Other = self> for #{K: V} {
+  func equals(other: self) ->
+    this.size() == other.size() && this.keys().all((k) -> this[k] == other[k])
+}
+
+impl Equals<Other = self> for #() {
+  func equals(_: self) -> true
+}
+
+impl<A> Equals<Other = self> for #(A) {
+  func equals(other: self) ->
+    this[0] == other[0]
+}
+
+impl<A, B> Equals<Other = self> for #(A, B) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1]
+}
+
+impl<A, B, C> Equals<Other = self> for #(A, B, C) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2]
+}
+
+impl<A, B, C, D> Equals<Other = self> for #(A, B, C, D) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3]
+}
+
+impl<A, B, C, D, E> Equals<Other = self> for #(A, B, C, D, E) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4]
+}
+
+impl<A, B, C, D, E, F> Equals<Other = self> for #(A, B, C, D, E, F) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5]
+}
+
+impl<A, B, C, D, E, F, G> Equals<Other = self> for #(A, B, C, D, E, F, G) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6]
+}
+
+impl<A, B, C, D, E, F, G, H> Equals<Other = self> for #(A, B, C, D, E, F, G, H) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7]
+}
+
+impl<A, B, C, D, E, F, G, H, I> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J, K> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J, K) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9] && this[10] == other[10]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J, K, L> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J, K, L) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9] && this[10] == other[10] && this[11] == other[11]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J, K, L, M> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J, K, L, M) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9] && this[10] == other[10] && this[11] == other[11] && this[12] == other[12]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J, K, L, M, N> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J, K, L, M, N) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9] && this[10] == other[10] && this[11] == other[11] && this[12] == other[12] && this[13] == other[13]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9] && this[10] == other[10] && this[11] == other[11] && this[12] == other[12] && this[13] == other[13] && this[14] == other[14]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9] && this[10] == other[10] && this[11] == other[11] && this[12] == other[12] && this[13] == other[13] && this[14] == other[14] && this[15] == other[15]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9] && this[10] == other[10] && this[11] == other[11] && this[12] == other[12] && this[13] == other[13] && this[14] == other[14] && this[15] == other[15] && this[16] == other[16]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9] && this[10] == other[10] && this[11] == other[11] && this[12] == other[12] && this[13] == other[13] && this[14] == other[14] && this[15] == other[15] && this[16] == other[16] && this[17] == other[17]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9] && this[10] == other[10] && this[11] == other[11] && this[12] == other[12] && this[13] == other[13] && this[14] == other[14] && this[15] == other[15] && this[16] == other[16] && this[17] == other[17] && this[18] == other[18]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9] && this[10] == other[10] && this[11] == other[11] && this[12] == other[12] && this[13] == other[13] && this[14] == other[14] && this[15] == other[15] && this[16] == other[16] && this[17] == other[17] && this[18] == other[18] && this[19] == other[19]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9] && this[10] == other[10] && this[11] == other[11] && this[12] == other[12] && this[13] == other[13] && this[14] == other[14] && this[15] == other[15] && this[16] == other[16] && this[17] == other[17] && this[18] == other[18] && this[19] == other[19] && this[20] == other[20]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9] && this[10] == other[10] && this[11] == other[11] && this[12] == other[12] && this[13] == other[13] && this[14] == other[14] && this[15] == other[15] && this[16] == other[16] && this[17] == other[17] && this[18] == other[18] && this[19] == other[19] && this[20] == other[20] && this[21] == other[21]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9] && this[10] == other[10] && this[11] == other[11] && this[12] == other[12] && this[13] == other[13] && this[14] == other[14] && this[15] == other[15] && this[16] == other[16] && this[17] == other[17] && this[18] == other[18] && this[19] == other[19] && this[20] == other[20] && this[21] == other[21] && this[22] == other[22]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9] && this[10] == other[10] && this[11] == other[11] && this[12] == other[12] && this[13] == other[13] && this[14] == other[14] && this[15] == other[15] && this[16] == other[16] && this[17] == other[17] && this[18] == other[18] && this[19] == other[19] && this[20] == other[20] && this[21] == other[21] && this[22] == other[22] && this[23] == other[23]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9] && this[10] == other[10] && this[11] == other[11] && this[12] == other[12] && this[13] == other[13] && this[14] == other[14] && this[15] == other[15] && this[16] == other[16] && this[17] == other[17] && this[18] == other[18] && this[19] == other[19] && this[20] == other[20] && this[21] == other[21] && this[22] == other[22] && this[23] == other[23] && this[24] == other[24]
+}
+
+impl<A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z> Equals<Other = self> for #(A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z) {
+  func equals(other: self) ->
+    this[0] == other[0] && this[1] == other[1] && this[2] == other[2] && this[3] == other[3] && this[4] == other[4] && this[5] == other[5] && this[6] == other[6] && this[7] == other[7] && this[8] == other[8] && this[9] == other[9] && this[10] == other[10] && this[11] == other[11] && this[12] == other[12] && this[13] == other[13] && this[14] == other[14] && this[15] == other[15] && this[16] == other[16] && this[17] == other[17] && this[18] == other[18] && this[19] == other[19] && this[20] == other[20] && this[21] == other[21] && this[22] == other[22] && this[23] == other[23] && this[24] == other[24] && this[25] == other[25]
+}

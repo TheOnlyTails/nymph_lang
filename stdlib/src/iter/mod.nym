@@ -1,0 +1,251 @@
+/**
+* write the documentation for an iterator
+
+* An iterator is a structure that allows you to iterate over a collection of items.
+* It provides a way to access each item in the collection one at a time, without exposing the underlying structure of the collection.
+*
+* Iterators are often used in functional programming to process collections of data in a more declarative way.
+* They can be used to implement various algorithms, such as filtering, mapping, and reducing.
+
+* ```nym
+* let iter = #[1, 2, 3]
+* 
+*/
+public interface Iterator<T> {
+  func next(): Option<T>
+
+  func for_each(f: (T) -> void) -> {
+    for (item in this) {
+      f(item)
+    }
+  }
+
+  func fold<A>(initial: A, f: (A, T) -> A) -> {
+    let mut accumulator = initial
+    let current = this.next()
+
+    while (true) {
+      match (current) {
+        Some(value) -> accumulator = f(value),
+        None -> return accumulator
+      }
+    }
+  }
+
+  func any(predicate: (T) -> boolean) -> {
+    let current = this.next()
+    while (current is Some(value)) {
+      if (predicate(value)) return true
+      current = this.next()
+    }
+
+    false
+  }
+
+  func all(predicate: (T) -> boolean) -> {
+    let current = this.next()
+    while (current is Some(value)) {
+      if (!predicate(value)) return false
+      current = this.next()
+    }
+
+    true
+  }
+
+  func map<R>(f: (T) -> R) -> Map(iter = this, f)
+  
+  func filter(predicate: (T) -> boolean) -> Filter(iter = this, predicate)
+
+  func indexed() -> Indexed(iter = this, count = 0)
+
+  func zip<U>(other: Iterator<U>) -> Zip(iter1 = this, iter2 = other)
+
+  func chain(other: Iterator<T>) -> Chain(iter1 = this, iter2 = other)
+
+  func cycle() -> Cycle(iter = this, original = this)
+
+  func take(amount: int) -> Take(iter = this, amount = amount)
+
+  func take_while(predicate: (T) -> boolean) -> TakeWhile(iter = this, stop = false, predicate)
+
+  func skip(amount: int) -> Skip(iter = this, amount = amount)
+
+  func skip_while(predicate: (T) -> boolean) -> SkipWhile(iter = this, predicate)
+
+  namespace {
+    func new() -> Empty
+    func new<T>(next: () -> Option<T>) -> BasicIterator(next)
+
+    func once<T>(value: T) -> Once(value, used = false)
+    func repeat<T>(value: T) -> Repeat(value)
+  }
+}
+
+public struct Empty {
+  impl<Any> Iterator<Any> {
+    func next() -> None
+  }
+}
+
+public struct BasicIterator<T>(
+  next: () -> Option<T>
+) {
+  impl Iterator<T> {
+    func next() -> next()
+  }
+}
+
+public struct Map<T, R>(
+  iter: Iterator<T>,
+  f: (T) -> R,
+) {
+  impl Iterator<R> {
+    func next() -> iter.next().map(f)
+  }
+}
+
+public struct Filter<T>(
+  iter: Iterator<T>,
+  predicate: (T) -> boolean,
+) {
+  impl Iterator<T> {
+    func next() -> match (this.iter.next()) {
+      Some(value) if this.predicate(value) -> Some(value),
+      Some(...) -> this.next(),
+      None -> None
+    }
+  }
+}
+
+public struct Zip<T, U>(
+  iter1: Iterator<T>,
+  iter2: Iterator<U>,
+) {
+  impl Iterator<(T, U)> {
+    func next() -> match (this.iter1.next(), this.iter2.next()) {
+      (Some(value1), Some(value2)) -> Some((value1, value2)),
+      _ -> None
+    }
+  }
+}
+
+public struct Chain<T>(
+  iter1: Iterator<T>,
+  iter2: Iterator<T>,
+) {
+  impl Iterator<T> {
+    func next() -> match (this.iter1.next()) {
+      Some(value) -> Some(value),
+      None -> this.iter2.next()
+    }
+  }
+}
+
+public struct Cycle<T>(
+  iter: Iterator<T>,
+  original: Iterator<T>,
+) {
+  impl Iterator<T> {
+    func next() -> match (this.iter.next()) {
+      Some(value) -> Some(value),
+      None -> {
+        this.iter = this.original
+        this.iter.next()
+      }
+    }
+  }
+}
+
+public struct Indexed<T>(
+  iter: Iterator<T>,
+  count: int
+) {
+  impl Iterator<#(T, int)> {
+    func next() -> {
+      match (this.iter.next()) {
+        Some(value) -> {
+          let count = this.count
+          this.count += 1
+          return #(value, count)
+        },
+        None -> None
+      }
+    }
+  }
+}
+
+public struct Repeat<T>(value: T) {
+  impl Iterator<T> {
+    func next() -> Some(value)
+  }
+}
+
+public struct Take<T>(
+  iter: Iterator<T>,
+  amount: int
+) {
+  impl Iterator<T> {
+    func next() -> if (amount > 0) {
+      this.amount -= 1
+      this.iter.next()
+    } else None
+  }
+}
+
+public struct TakeWhile<T>(
+  iter: Iterator<T>,
+  stop: boolean,
+  predicate: (T) -> boolean,
+) {
+  impl Iterator<T> {
+    func next() -> if (!stop) match (this.iter.next()) {
+      Some(value) if this.predicate(value) -> Some(value),
+      Some(...) -> {
+        this.stop = true
+        None
+      },
+      None -> None
+    } else None
+  }
+}
+
+public struct Skip<T>(
+  iter: Iterator<T>,
+  amount: int
+) {
+  impl Iterator<T> {
+    func next() -> if (amount > 0) {
+      this.amount -= 1
+      this.iter.next()
+    } else this.iter.next()
+  }
+}
+
+public struct SkipWhile<T>(
+  iter: Iterator<T>,
+  predicate: (T) -> boolean,
+) {
+  impl Iterator<T> {
+    func next() -> match (this.iter.next()) {
+      Some(value) if this.predicate(value) -> this.next(),
+      Some(value) -> Some(value),
+      None -> None
+    }
+  }
+}
+
+public struct Once<T>(
+  value: T,
+  used: boolean
+) {
+  impl Iterator<T> {
+    func next() -> if (!used) {
+      this.used = true
+      Some(value)
+    } else None
+  }
+}
+
+impl<T> Iterator<T> for #[T] {
+  func next() -> if (this.is_empty()) None else Some(this[0])
+}

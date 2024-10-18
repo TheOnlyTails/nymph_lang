@@ -1,0 +1,97 @@
+import std/result with (Result)
+
+public enum Option<T> {
+  Some(value: T),
+  None
+
+  func is_some() -> match (this) {
+    Some(...) -> true,
+    None -> false,
+  }
+  
+  func is_some_and(f: (T) -> boolean) -> match (this) {
+    Some(value) -> f(value),
+    None -> false,
+  }
+
+  func is_none() -> !this.is_some()
+
+  func is_none_or(f: (T) -> boolean) -> match (this) {
+    Some(value) -> f(value),
+    None -> true,
+  }
+
+  func map<R>(f: (T) -> R) -> match (this) {
+    Some(value) -> Some(value = f(value)),
+    None -> None
+  }
+  
+  func map_or<R>(default: R, f: (T) -> R) -> this.map_or_else(() -> default, f)
+  
+  func map_or_else<R>(default: () -> R, f: (T) -> R) -> match (this) {
+    Some(value) -> f(value),
+    None -> default()
+  }
+  
+  func unwrap_or(default: T) -> this.unwrap_or_else(() -> default)
+  
+  func unwrap_or_else(default: () -> T) -> match (this) {
+    Some(value) -> value,
+    None -> default()
+  }
+
+  func inspect(f: (T) -> void) -> {
+    if (this is Some(value)) f(value)
+
+    this
+  }
+
+  func ok_or<E>(error: E) -> this.ok_or_else(() -> error)
+  
+  func ok_or_else<E>(error: () -> E) -> match (this) {
+    Some(value) -> Result.Ok(value),
+    None -> Result.Error(error)
+  }
+
+  func and<U>(other: Option<U>) -> match (this) {
+    Some(...) -> other,
+    None -> None
+  }
+  
+  func and_then<U>(other: (T) -> Option<U>) -> match (this) {
+    Some(value) -> other(value),
+    None -> None
+  }
+
+  func filter(predicate: (T) -> boolean) -> match (this) {
+    Some(value) if predicate(value) -> Some(value),
+    _ -> None
+  }
+
+  func or(other: Option<T>) -> match (this) {
+    Some(...) -> this,
+    None -> other
+  }
+
+  func or_else(f: () -> Option<T>) -> match (this) {
+    Some(...) -> this,
+    None -> f()
+  }
+
+  func xor(other: Option<T>) -> match (#(this, other)) {
+    #(Some(...), None) -> this,
+    #(None, Some(...)) -> other,
+    _ -> None
+  }
+}
+
+impl<T: Default> Option<T> {
+  func unwrap_or_default() -> this.unwrap_or(T.default())
+}
+
+impl<T, U> Option<#(T, U)> {
+  func unzip() -> match (this) {
+    Some(value = #(a, b)) -> #(Some(value = a), Some(value = b)),
+    None -> #(None, None)
+  }
+}

@@ -1,0 +1,47 @@
+interface Plus<Other, Output> {
+  func plus(other: Other): Output
+}
+
+impl Plus<Other = self, Output = self> for int {
+  external func plus(other: self): self
+}
+
+impl Plus<Other = float, Output = float> for int {
+  external func plus(other: float): float
+}
+
+impl Plus<Other = self, Output = self> for float {
+  external func plus(other: self): self
+}
+
+impl Plus<Other = int, Output = self> for float {
+  external func plus(other: int): self
+}
+
+impl Plus<Other = int, Output = self> for char {
+  func plus(other: int) -> this.charCode().plus(other).toChar()
+}
+
+impl Plus<Other = self, Output = self> for string {
+  func plus(other: self) -> this.concat(other)
+}
+
+impl Plus<Other = #[char], Output = self> for string {
+  func plus(other: #[char]) -> this.concat(other)
+}
+
+impl<T> Plus<Other = self, Output = self> for #[T] {
+  func plus(other: self) -> this.concat(other)
+}
+
+impl<K, V> Plus<Other = self, Output = self> for #{K: V} {
+  func plus(other: self) -> this.merge(other)
+}
+
+impl<T> Plus<Other: self, Output = self> for Iterator<T> {
+  func plus(other: self) -> Iterator.from(() -> {
+    // if `this` is not done, advance it
+    // otherwise, advance `other`
+    this.next().and_then(() -> other.next())
+  })
+}

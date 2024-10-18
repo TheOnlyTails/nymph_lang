@@ -1,0 +1,62 @@
+/**
+  The ratio between a circle's circumference and its diameter.
+*/
+public let pi = 3.14159265358979323846
+/**
+  The ratio between a circle's circumference and its radius, or 2π.
+*/
+public let tau = 6.28318530717958647692
+/**
+  The base of the natural logarithm, or Euler's number.
+*/
+public let e = 2.71828182845904523536
+/**
+  The golden ratio, (1 + √5) / 2.
+*/
+public let phi = 1.61803398874989484820
+
+/**
+  
+*/
+public func abs(x: int): int is 0.. -> if (x > 0) x else -x
+public func abs(x: float): float is 0f.. -> if (x > 0) x else -x
+
+public external func sin(x: float): float is -1f..=1f
+public external func cos(x: float): float is -1f..=1f
+public external func tan(x: float): float
+
+public external func asin(x: float): float is -1.57079633..=1.57079633
+public external func acos(x: float): float is 0f..=3.1415926535
+public external func atan(x: float): float is -1.57079633..=1.57079633
+
+public external func sinh(x: float): float
+public external func cosh(x: float): float
+public external func tanh(x: float): float is -1f..=1f
+
+public external func asinh(x: float): float
+public external func acosh(x: float): float
+public external func atanh(x: float): float
+
+public external func atan2(y: float, x: float): float
+
+public func sign(x: int): int is 0 | 1 | -1 -> match (x) {
+  0 -> 0,
+  1.. -> 1,
+  ..=-1 -> -1,
+}
+public func sign(x: float): int is 0 | 1 | -1 -> match (x) {
+  0 -> 0,
+  1.. -> 1,
+  ..=-1 -> -1,
+}
+public external func floor(x: float): int
+public external func ceil(x: float): int
+public external func round(x: float): int
+
+public func midpoint(x: int, y: int) -> (x + y) / 2
+public func midpoint(x: float, y: float) -> (x + y) / 2
+
+public external let max_int: int is 9.0071993e15
+public external let min_int: int is -9.0071993e15
+public external let max_float: float
+public external let min_float: float

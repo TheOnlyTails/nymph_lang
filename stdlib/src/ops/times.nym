@@ -1,0 +1,27 @@
+interface Times<Other, Output> {
+  func times(other: Other): Output
+}
+
+impl Times<Other = self, Output = self> for int {
+  func times(other: self): self
+}
+
+impl Times<Other = float, Output = float> for int {
+  external func times(other: float): float
+}
+
+impl Times<Other = self, Output = self> for float {
+  func times(other: self): self
+}
+
+impl Times<Other = int, Output = self> for float {
+  external func times(other: int): self
+}
+
+impl<T: Plus<Other = T, Output = T> + Default> Times<Other = int, Output = self> for T {
+  func times(other: int) -> match (other) {
+    ..=0 -> T.default(),
+    1 -> this,
+    _ -> this + this.times(other - 1)
+  }
+}

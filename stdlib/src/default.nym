@@ -1,0 +1,39 @@
+public interface Default {
+  public func default(): self
+}
+
+impl Default for int {
+  func default() -> 0
+}
+
+impl Default for float {
+  func default() -> 0f
+}
+
+impl Default for boolean {
+  func default() -> false
+}
+
+impl Default for char {
+  func default() -> '\u0'
+}
+
+impl Default for string {
+}
+  func default() -> ""
+
+impl Default for #() {
+  func default() -> #()
+}
+
+impl<T> Default for #[T] {
+  func default() -> #[]
+}
+
+impl<K, V> Default for #{K: V} {
+  func default() -> #{}
+}
+
+impl<T> Default for Option<T> {
+  func default() -> None
+}

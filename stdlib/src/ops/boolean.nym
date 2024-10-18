@@ -1,0 +1,23 @@
+interface And<Other, Output> {
+  func and(other: Other): Output
+}
+
+impl And<Other = boolean, Output = boolean> for boolean {
+  external func and(other: boolean): boolean
+}
+
+interface Or<Other, Output> {
+  func or(other: Other): Output
+}
+
+impl Or<Other = boolean, Output = boolean> for boolean {
+  external func or(other: boolean): boolean
+}
+
+interface Not<Output> {
+  func not(): Output
+}
+
+impl Not<Output = boolean> for boolean {
+  external func not(): boolean
+}

@@ -1,0 +1,46 @@
+{
+  "name": "nymph",
+  "displayName": "Nymph",
+  "description": "Support for the Nymph programming language",
+  "publisher": "theonlytails",
+  "license": "MIT",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.100.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "nymph",
+        "aliases": [
+          "Nymph",
+          "nymph"
+        ],
+        "extensions": [
+          ".nym"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "nymph",
+        "scopeName": "source.nymph",
+        "path": "./syntaxes/nymph.tmLanguage.json"
+      },
+      {
+        "scopeName": "markdown.nymph.codeblock",
+        "path": "./syntaxes/nymph.codeblock.json",
+        "injectTo": [
+          "text.html.markdown"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.block.nymph": "nymph"
+        }
+      }
+    ]
+  }
+}

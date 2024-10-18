@@ -1,0 +1,55 @@
+enum Order {
+  LessThan,
+  Equal,
+  GreaterThan,
+}
+
+interface Comparable<Other> {
+  func compare_to(other: Other): Order
+
+  func less_than(other: Other) -> this.compare_to(other) == Order.LessThan
+  func less_than_eq(other: Other) -> this.compare_to(other) != Order.GreaterThan
+
+  func greater_than(other: Other) -> this.compare_to(other) == Order.GreaterThan
+  func greater_than_eq(other: Other) -> this.compare_to(other) != Order.LessThan
+
+  func min(other: Other) -> if (this.compare_to(other) == Order.LessThan) this else other
+  func max(other: Other) -> if (this.compare_to(other) == Order.GreaterThan) this else other
+
+  impl Equal<Other> {
+    func equals(other: Other) -> this.compare_to(other) == Order.Equal
+  }
+}
+
+impl Comparable<Other = self> for int {
+  external func compare_to(other: self): Order
+}
+
+impl Comparable<Other = self> for float {
+  external func compare_to(other: self): Order
+}
+
+impl Comparable<Other = self> for char {
+  external func compare_to(other: self): Order
+}
+
+impl Comparable<Other = self> for string {
+  external func compare_to(other: self): Order
+}
+
+impl Comparable<Other = self> for boolean {
+  func compare_to(other: self) match (#(this, other)) {
+    #(false, true) -> Order.LessThan,
+    #(false, false) | #(true, true) -> Order.Equal,
+    #(true, false) -> Order.GreaterThan,
+  }
+}
+
+impl Comparable<Other = self> for #() {
+  func compare_to(_: self) -> Order.Equal
+}
+
+impl<T> Comparable<Other = T> {
+  func minmax(other: T) ->
+    if (this.compare_to(other) == Order.LessThan) #(this, other) else #(other, this)  
+}

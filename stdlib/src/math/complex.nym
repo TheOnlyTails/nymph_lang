@@ -1,0 +1,59 @@
+import stdlib/math with (sqrt)
+
+public struct Complex(real: float, imaginary: float) {
+  func conjugate() -> Complex(real = real, imaginary = -imaginary)
+
+  func abs() -> sqrt(real ** 2 + imaginary ** 2)
+
+  impl Plus<Other = Complex, Output = Complex> {
+    func plus(other: Complex) -> Complex(
+      real = this.real + other.real,
+      imaginary = this.imaginary + other.imaginary,
+    )
+  }
+
+  impl Minus<Other = Complex, Output = Complex> {
+    func minus(other: Complex) -> Complex(
+      real = this.real - other.real,
+      imaginary = this.imaginary - other.imaginary,
+    )
+  }
+  
+  impl Times<Other = Complex, Output = Complex> {
+    func times(other: Complex) -> Complex(
+      real = this.real * other.real - this.imaginary * other.imaginary,
+      imaginary = this.real * other.imaginary + this.imaginary * other.real,
+    )
+  }
+
+  impl Divide<Other = Complex, Output = Complex> {
+    func divide(other: Complex) -> {
+      let multiplied = this * other
+      let divisor = other.real ** 2 + other.imaginary ** 2
+
+      Complex(
+        real = multiplied.real / divisor,
+        imaginary = multiplied.imaginary / divisor
+      )
+    }
+  }
+  
+  impl Divide<Other = Complex, Output = Complex> {
+    func divide(other: Complex) -> {
+      let multiplied = this * other
+      let divisor = other.real ** 2 + other.imaginary ** 2
+
+      Complex(
+        real = multiplied.real / divisor,
+        imaginary = multiplied.imaginary / divisor
+      )
+    }
+  }
+  
+  impl Negate<Output = Complex> {
+    func negate() -> Complex(
+      real = -this.real,
+      imaginary = -this.imaginary
+    )
+  }
+}

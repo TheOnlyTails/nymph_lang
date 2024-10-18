@@ -1,0 +1,17 @@
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:ital,wght@0,100..800;1,100..800&display=swap");
+
+:root {
+	--vp-font-family-mono: ui-monospace, "JetBrains Mono", "Cascadia Code", "Fira Code", "Menlo",
+		"Monaco", "Consolas", "Liberation Mono", "Courier New", monospace;
+	--vp-c-brand-1: var(--vp-c-green-1);
+	--vp-c-brand-2: var(--vp-c-green-2);
+	--vp-c-brand-3: var(--vp-c-green-3);
+	--vp-c-brand-soft: var(--vp-c-green-soft);
+
+	--vp-home-hero-name-color: transparent;
+	--vp-home-hero-name-background: linear-gradient(
+		in oklch 325deg,
+		var(--vp-c-green-1),
+		var(--vp-c-indigo-2)
+	);
+}

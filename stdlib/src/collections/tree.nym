@@ -1,0 +1,9 @@
+enum Tree<T> {
+  Leaf(value: T),
+  Node(children: #[Tree<T>]),
+}
+
+enum BinaryTree<T> {
+  Leaf(value: T),
+  Node(left: BinaryTree<T>, right: BinaryTree<T>),
+}

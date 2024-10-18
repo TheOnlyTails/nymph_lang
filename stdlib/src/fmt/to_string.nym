@@ -1,0 +1,11 @@
+public interface ToString {
+  func to_string(): string
+}
+
+impl ToString for string {
+  func to_string() -> this
+}
+
+impl ToString for bool {
+  func to_string() -> if (this) "true" else "false"
+}

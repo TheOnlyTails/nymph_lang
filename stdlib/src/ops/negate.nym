@@ -1,0 +1,11 @@
+interface Negate<Output> {
+  func negate(): Output
+}
+
+impl Negate<Output = int> for int {
+  external func negate(): int
+}
+
+impl Negate<Output = float> for float {
+  external func negate(): float
+}
