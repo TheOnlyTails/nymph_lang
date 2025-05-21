@@ -40,8 +40,8 @@ func factorial(n: int) -> match (n) {
 
 ```nym [types.nym]
 enum BinaryTree<T> {
-  Leaf { value: T },
-  Node { left: BinaryTree<T>, right: BinaryTree<T> },
+  Leaf(value: T),
+  Node(left: BinaryTree<T>, right: BinaryTree<T>),
 }
 ```
 
@@ -49,8 +49,8 @@ enum BinaryTree<T> {
 let nums = #[1, 2, 3]
 
 nums
-  .filter((x) -> x % 2 == 1)
-  .map((x) -> x ** 2)
+  .filter(_ % 2 == 1)
+  .map(_ ** 2)
   .fold(0, (x, y) -> x + y)
   |> println(_) // 10
 ```
