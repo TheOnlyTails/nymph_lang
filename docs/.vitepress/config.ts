@@ -26,14 +26,27 @@ export default defineConfig({
 		nav: [
 			{ text: "Home", link: "/" },
 			{ text: "Guide", link: "/guide/" },
+			{ text: "Reference", link: "/reference/" },
 		],
 		search: { provider: "local" },
 
 		sidebar: [
 			{
 				text: "Guide",
-				items: [{ text: "Getting Started", link: "/guide/" }],
+				base: "/guide",
+				items: [{ text: "Getting Started", link: "/" }],
 			},
+			{
+				text: "Reference",
+				base: "/reference",
+				items: [
+					{ text: "Introduction", link: "/" },
+					{ text: "Literals", link: "/literals/" },
+					{ text: "Declarations", link: "/declarations/" },
+					{ text: "Expressions", link: "/expressions/" },
+					{ text: "Standard Library", link: "/stdlib/" },
+				],
+			}
 		],
 
 		socialLinks: [{ icon: "github", link: "https://github.com/theonlytails/nymph_lang" }],

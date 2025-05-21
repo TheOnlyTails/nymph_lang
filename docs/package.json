@@ -14,7 +14,8 @@
 	},
 	"devDependencies": {
 		"markdown-it-mathjax3": "^4.3.2",
-		"vitepress": "^2.0.0-alpha.5"
+		"vitepress": "^2.0.0-alpha.5",
+		"prettier": "catalog:"
 	},
 	"prettier": {
 		"useTabs": true,

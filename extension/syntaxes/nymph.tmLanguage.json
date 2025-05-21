@@ -43,7 +43,7 @@
 				},
 				{
 					"name": "meta.interpolation.nymph",
-					"begin": "\\${",
+					"begin": "(?<!\\\\)\\${",
 					"beginCaptures": { "0": { "name": "punctuation.definition.template-expression.begin.nymph" } },
 					"end": "}",
 					"endCaptures": { "0": { "name": "punctuation.definition.template-expression.end.nymph" } },
