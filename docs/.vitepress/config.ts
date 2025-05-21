@@ -14,7 +14,7 @@ export default defineConfig({
 			{
 				...(grammar as any),
 				name: "nymph",
-				aliases: "nym",
+				aliases: ["nym"],
 			},
 		],
 	},
