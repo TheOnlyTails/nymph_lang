@@ -8,11 +8,8 @@ hero:
   tagline: "A simple language that gets out of your way."
   actions:
     - theme: brand
-      text: Markdown Examples
-      link: /markdown-examples
-    - theme: alt
-      text: API Examples
-      link: /api-examples
+      text: Get Started
+      link: /guide/
 
 features:
   - title: Feature A
@@ -25,27 +22,27 @@ features:
 
 ::: code-group
 
-```nym [hello_world.nym]
+```nymph [hello_world.nym]
 func main() -> {
   println("Hello world!")
 }
 ```
 
-```nym [functions.nym]
+```nymph [functions.nym]
 func factorial(n: int) -> match (n) {
   ..=1 -> 1
   _ -> n * factorial(n - 1)
 }
 ```
 
-```nym [types.nym]
+```nymph [types.nym]
 enum BinaryTree<T> {
   Leaf(value: T),
   Node(left: BinaryTree<T>, right: BinaryTree<T>),
 }
 ```
 
-```nym [lists.nym]
+```nymph [lists.nym]
 let nums = #[1, 2, 3]
 
 nums

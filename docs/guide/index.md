@@ -1,4 +1,1 @@
----
-layout: docs
-
----
+# Hello world

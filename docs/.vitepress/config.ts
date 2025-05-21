@@ -10,26 +10,26 @@ export default defineConfig({
 	markdown: {
 		math: true,
 		lineNumbers: true,
-		languageAlias: { nym: "Nymph" },
-		shikiSetup: async (shiki) => {
-			await shiki.loadLanguage(grammar as any);
-		},
+		languages: [{
+			...(grammar as any),
+			name: "nymph",
+		}],
 	},
 	sitemap: {
-		hostname: "nymphlang.dev",
+		hostname: "https://nymphlang.dev",
 	},
 	themeConfig: {
 		// https://vitepress.dev/reference/default-theme-config
 		nav: [
 			{ text: "Home", link: "/" },
-			{ text: "Guide", link: "/guide" },
+			{ text: "Guide", link: "/guide/" },
 		],
 		search: { provider: "local" },
 
 		sidebar: [
 			{
 				text: "Guide",
-				items: [{ text: "Getting Started", link: "/guide" }],
+				items: [{ text: "Getting Started", link: "/guide/" }],
 			},
 		],
 

@@ -1,5 +1,5 @@
 target
 .idea
 node_modules
-docs/.vitepress/dish
+docs/.vitepress/dist
 docs/.vitepress/cache
