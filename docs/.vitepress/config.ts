@@ -10,10 +10,13 @@ export default defineConfig({
 	markdown: {
 		math: true,
 		lineNumbers: true,
-		languages: [{
-			...(grammar as any),
-			name: "nymph",
-		}],
+		languages: [
+			{
+				...(grammar as any),
+				name: "nymph",
+				aliases: "nym",
+			},
+		],
 	},
 	sitemap: {
 		hostname: "https://nymphlang.dev",

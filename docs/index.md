@@ -22,34 +22,34 @@ features:
 
 ::: code-group
 
-```nymph [hello_world.nym]
+```nym [hello_world.nym]
 func main() -> {
   println("Hello world!")
 }
 ```
 
-```nymph [functions.nym]
+```nym [functions.nym]
 func factorial(n: int) -> match (n) {
   ..=1 -> 1
   _ -> n * factorial(n - 1)
 }
 ```
 
-```nymph [types.nym]
+```nym [types.nym]
 enum BinaryTree<T> {
   Leaf(value: T),
   Node(left: BinaryTree<T>, right: BinaryTree<T>),
 }
 ```
 
-```nymph [lists.nym]
+```nym [lists.nym]
 let nums = #[1, 2, 3]
 
 nums
   .filter(_ % 2 == 1)
   .map(_ ** 2)
   .fold(0, (x, y) -> x + y)
-  |> println(_) // 10
+  |> println // 10
 ```
 
 :::
