@@ -1,5 +1,5 @@
 import { defineConfig } from "vitepress";
-import grammar from "../../vscode/syntaxes/nymph.tmLanguage.json" with { type: "json" };
+import grammar from "../../extension/syntaxes/nymph.tmLanguage.json" with { type: "json" };
 
 // https://vitepress.dev/reference/site-config
 export default defineConfig({
@@ -33,6 +33,6 @@ export default defineConfig({
 			},
 		],
 
-		socialLinks: [{ icon: "github", link: "https://github.com/theonlytails/nymph_gleam" }],
+		socialLinks: [{ icon: "github", link: "https://github.com/theonlytails/nymph_lang" }],
 	},
 });
