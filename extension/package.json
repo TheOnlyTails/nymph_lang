@@ -56,5 +56,6 @@
     "@vscode/vsce": "^3.4.1",
     "prettier": "catalog:"
   },
+  "homepage": "https://nymphlang.dev/",
   "packageManager": "pnpm@10.11.0"
 }
