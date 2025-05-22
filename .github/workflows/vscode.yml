@@ -14,6 +14,7 @@ jobs:
       - name: Setup pnpm
         uses: pnpm/action-setup@v2 # uses version from packageManager field
         with:
+          run_install: true
           package_json_file: ./extension/package.json
       - name: Publish
         run: pnpm run deploy
