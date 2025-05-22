@@ -1,0 +1,18 @@
+on:
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./extension
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v2
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v2 # uses version from packageManager field
+      - name: Publish
+        run: pnpm run deploy
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}

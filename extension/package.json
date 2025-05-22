@@ -49,6 +49,9 @@
       }
     ]
   },
+  "scripts": {
+    "deploy": "vsce publish"
+  },
   "devDependencies": {
     "@vscode/vsce": "^3.4.1",
     "prettier": "catalog:"
