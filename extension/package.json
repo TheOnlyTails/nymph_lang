@@ -3,7 +3,7 @@
   "displayName": "Nymph",
   "description": "Support for the Nymph programming language",
   "publisher": "theonlytails",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.100.0"
@@ -11,6 +11,12 @@
   "categories": [
     "Programming Languages"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/theonlytails/nymph_lang.git",
+    "directory": "extension"
+  },
+  "preview": true,
   "contributes": {
     "languages": [
       {
