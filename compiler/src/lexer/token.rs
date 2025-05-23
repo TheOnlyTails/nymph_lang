@@ -19,8 +19,14 @@ pub(crate) enum Token {
 	/// `1234`
 	DecimalInt(u64),
 
-	/// `1.2`, `.12`, `1.2e3`, `12f`
+	/// `1.2`
 	Float(OrderedFloat<f64>),
+	/// `1.2e3`
+	IntExpFloat(u64, i32),
+	/// `1.2e-3`
+	FloatExpFloat(OrderedFloat<f64>, i32),
+	/// `12f`
+	IntFloat(u64),
 
 	/// `'a'`
 	Char(char),
@@ -231,6 +237,8 @@ pub(crate) enum Token {
 	Return,
 	/// `this`
 	This,
+
+	Error,
 }
 
 impl Display for Token {
@@ -244,7 +252,8 @@ impl Display for Token {
 				OctalInt(_) => "an octal integer literal",
 				HexInt(_) => "a hexadecimal integer literal",
 				DecimalInt(_) => "an integer literal",
-				Float(_) => "a floating point literal",
+				Float(_) | IntFloat(_) | IntExpFloat(_, _) | FloatExpFloat(_, _) =>
+					"a floating point literal",
 				Identifier(_) => "an identifier",
 				Char(_) | CharEscape(_) => "a character literal",
 				String(_) => "a string literal",
@@ -349,6 +358,7 @@ impl Display for Token {
 				Break => "break",
 				Return => "return",
 				This => "this",
+				Error => "invalid input",
 			}
 		)
 	}

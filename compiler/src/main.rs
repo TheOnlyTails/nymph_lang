@@ -66,9 +66,7 @@ fn run(filename: &str, source: &str) -> anyhow::Result<()> {
 	let (tokens, lexer_errors) = lexer().parse(source).into_output_errors();
 
 	let parser_errors = if let Some(tokens) = tokens {
-		for token in tokens.clone() {
-			info!("{token:?}");
-		}
+		info!("{tokens:?}");
 
 		let (module, parser_errors) = parser(make_input)
 			.parse(make_input((source.len()..source.len()).into(), &tokens))

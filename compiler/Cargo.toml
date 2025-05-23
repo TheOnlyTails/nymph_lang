@@ -23,9 +23,8 @@ tokio = { version = "1.45.0", features = ["full"] }
 tracing = "0.1.41"
 tracing-subscriber = "0.3.19"
 reedline = "0.40.0"
-unicode-xid = "0.2.6"
 ecow = "0.2.4"
-test-case = "3.3.1"
+regex = "1.11.1"
 
 [dev-dependencies]
 test-case = "3.3.1"

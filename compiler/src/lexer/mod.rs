@@ -1,12 +1,14 @@
 pub(crate) mod token;
 
-use chumsky::{prelude::*, text::Char};
+use chumsky::{input::MapExtra, prelude::*};
 use ecow::EcoString;
+use itertools::Itertools;
 use ordered_float::OrderedFloat;
+use regex::Regex;
 
 use crate::{
 	ast::{
-		Spanned, SpannedExt,
+		Spanned,
 		expr::{CharEscape, StringEscape},
 	},
 	lexer::token::Token,
@@ -33,7 +35,6 @@ pub(crate) fn lexer<'src>() -> impl Lexer<'src, Vec<Spanned<Token>>> {
 		.map_with(Spanned::new)
 		.padded_by(comment_lexer().repeated())
 		.padded()
-		.recover_with(skip_then_retry_until(any().ignored(), end()))
 	});
 
 	token.repeated().collect()
@@ -58,27 +59,118 @@ fn int_lexer<'src>() -> impl Lexer<'src, Token> {
 			.unwrapped()
 			.map(Token::DecimalInt),
 	))
-	.then_ignore(
+	.then(
 		any()
-			.filter(|c: &char| !c.is_ident_start())
-			.rewind()
-			.or_not(),
+			.filter(|&c: &char| !c.is_whitespace())
+			.repeated()
+			.collect::<String>(),
 	)
+	.validate(|(int, text), e: &mut MapExtra<&str, LexerExtra>, emitter| {
+		let span = SimpleSpan::from((e.span().end - text.len())..e.span().end);
+
+		match (&int, text.as_str()) {
+			(_, "") => int,
+
+			(_, separators) if Regex::new("_+").unwrap().is_match(separators) => {
+				emitter.emit(Rich::custom(
+					span,
+					"Found invalid digit separators in integer literal",
+				));
+				Token::Error
+			}
+
+			(Token::BinaryInt(_) | Token::DecimalInt(0), invalid_digits)
+				if Regex::new(r"[bB]?(_?[2-9])+")
+					.unwrap()
+					.is_match(invalid_digits) =>
+			{
+				emitter.emit(Rich::custom(span, "Found invalid digit in binary integer"));
+				Token::Error
+			}
+
+			(Token::OctalInt(_) | Token::DecimalInt(0), invalid_digits)
+				if Regex::new(r"[oO]?(_?[8-9])+")
+					.unwrap()
+					.is_match(invalid_digits) =>
+			{
+				emitter.emit(Rich::custom(span, "Found invalid digit in octal integer"));
+				Token::Error
+			}
+
+			(Token::HexInt(_) | Token::DecimalInt(0), invalid_digits)
+				if Regex::new(r"[xX]?(_?[g-zG-Z])+")
+					.unwrap()
+					.is_match(invalid_digits) =>
+			{
+				emitter.emit(Rich::custom(
+					span,
+					"Found invalid digit in hexadecimal integer",
+				));
+				Token::Error
+			}
+
+			(Token::DecimalInt(_), "e" | "E" | "e-" | "E-" | "e+" | "E+") => {
+				emitter.emit(Rich::custom(span, "Found start of exponent, but no digits"));
+				Token::Error
+			}
+			(_, exp) if Regex::new(r"[eE][-+]?\d?(_?\d)*").unwrap().is_match(exp) => {
+				emitter.emit(Rich::custom(span, "Found exponent on non-decimal integer"));
+				Token::Error
+			}
+			(Token::DecimalInt(0), "b" | "B") => {
+				emitter.emit(Rich::custom(span, "Found binary suffix without digits"));
+				Token::Error
+			}
+			(Token::DecimalInt(0), "x" | "X") => {
+				emitter.emit(Rich::custom(
+					span,
+					"Found hexadecimal suffix without digits",
+				));
+				Token::Error
+			}
+			(Token::DecimalInt(0), "o" | "O") => {
+				emitter.emit(Rich::custom(span, "Found octal suffix without digits"));
+				Token::Error
+			}
+			_ => {
+				emitter.emit(Rich::custom(span, "Found unexpected character"));
+				Token::Error
+			}
+		}
+	})
+	.labelled("integer literal")
+	.as_context()
 	.boxed()
 }
 
 fn float_lexer<'src>() -> impl Lexer<'src, Token> {
 	choice((
 		// 1.2e-3
-		regex(r"\d(_?\d)*\.\d(_?\d)*[eE][-+]?\d(_?\d)*")
-			.map(|it: &str| it.replace("_", "").parse::<OrderedFloat<f64>>())
-			.unwrapped()
-			.map(Token::Float),
+		regex(r"\d(_?\d)*\.\d(_?\d)*[eE][-+]?\d(_?\d)*").try_map(|input: &str, span| {
+			let unseparated = input.replace("_", "");
+			let (mantissa, exponent) = unseparated.split(['e', 'E']).collect_tuple().unwrap();
+
+			let mantissa = mantissa
+				.parse::<OrderedFloat<f64>>()
+				.map_err(|e| Rich::custom(span, format!("Invalid mantissa: {e}")))?;
+			let exponent = exponent
+				.parse::<i32>()
+				.map_err(|e| Rich::custom(span, format!("Invalid exponent: {e}")))?;
+			Ok(Token::FloatExpFloat(mantissa, exponent))
+		}),
 		// 1e-2
-		regex(r"\d(_?\d)*[eE][-+]?\d(_?\d)*")
-			.map(|it: &str| it.replace("_", "").parse::<OrderedFloat<f64>>())
-			.unwrapped()
-			.map(Token::Float),
+		regex(r"\d(_?\d)*[eE][-+]?\d(_?\d)*").try_map(|input: &str, span| {
+			let unseparated = input.replace("_", "");
+			let (mantissa, exponent) = unseparated.split(['e', 'E']).collect_tuple().unwrap();
+
+			let mantissa = mantissa
+				.parse::<u64>()
+				.map_err(|e| Rich::custom(span, format!("Invalid mantissa: {e}")))?;
+			let exponent = exponent
+				.parse::<i32>()
+				.map_err(|e| Rich::custom(span, format!("Invalid exponent: {e}")))?;
+			Ok(Token::IntExpFloat(mantissa, exponent))
+		}),
 		// 1.2
 		regex(r"(0|[1-9](_?\d)*)\.\d(_?\d)*")
 			.map(|it: &str| it.replace("_", "").parse::<OrderedFloat<f64>>())
@@ -90,12 +182,55 @@ fn float_lexer<'src>() -> impl Lexer<'src, Token> {
 				it.strip_suffix(['f', 'F'])
 					.unwrap()
 					.replace("_", "")
-					.parse::<OrderedFloat<f64>>()
+					.parse::<u64>()
 			})
 			.unwrapped()
-			.map(Token::Float),
+			.map(Token::IntFloat),
 	))
-	.labelled("floating point literal")
+	.then(
+		any()
+			.filter(|&c: &char| !c.is_whitespace())
+			.repeated()
+			.collect::<String>(),
+	)
+	.validate(|(float, text), e, emitter| match (&float, text.as_str()) {
+		(_, "") => float,
+
+		(_, separators) if Regex::new("_+").unwrap().is_match(separators) => {
+			emitter.emit(Rich::custom(
+				e.span(),
+				"Found invalid digit separators in float literal",
+			));
+			Token::Error
+		}
+
+		(Token::IntFloat(_), exp) if Regex::new(r"[eE][-+]?\d?(_?\d)*").unwrap().is_match(exp) => {
+			emitter.emit(Rich::custom(e.span(), "Found exponent on integer float"));
+			Token::Error
+		}
+		(_, "e" | "E" | "e-" | "E-" | "e+" | "E+") => {
+			emitter.emit(Rich::custom(
+				e.span(),
+				"Found start of exponent, but no digits",
+			));
+			Token::Error
+		}
+
+		(Token::IntFloat(_), suffix) => {
+			emitter.emit(Rich::custom(
+				e.span(),
+				format!("Found invalid suffix for an integer: {suffix:?}"),
+			));
+			Token::Error
+		}
+
+		_ => {
+			emitter.emit(Rich::custom(e.span(), "Found unexpected character"));
+			Token::Error
+		}
+	})
+	.labelled("float literal")
+	.as_context()
 	.boxed()
 }
 
@@ -112,21 +247,36 @@ fn char_lexer<'src>() -> impl Lexer<'src, Token> {
 			)
 			.map(|s| u32::from_str_radix(s, 16))
 			.unwrapped()
-			.map(char::from_u32)
-			.unwrapped()
-			.map(|c| Token::CharEscape(CharEscape::Unicode(c))),
+			.validate(|code, e, emitter| match char::from_u32(code) {
+				Some(c) => Token::CharEscape(CharEscape::Unicode(c)),
+				None => {
+					emitter.emit(Rich::custom(
+						e.span(),
+						format!("Invalid unicode codepoint: U+{code:X}"),
+					));
+					Token::Error
+				}
+			}),
 		just(r"\n").to(Token::CharEscape(CharEscape::Newline)),
 		just(r"\N").to(Token::CharEscape(CharEscape::Newline)),
 		just(r"\r").to(Token::CharEscape(CharEscape::Carriage)),
 		just(r"\R").to(Token::CharEscape(CharEscape::Carriage)),
 		just(r"\t").to(Token::CharEscape(CharEscape::Tab)),
 		just(r"\T").to(Token::CharEscape(CharEscape::Tab)),
-		just(r"\\\").to(Token::CharEscape(CharEscape::Backslash)),
+		just(r"\\").to(Token::CharEscape(CharEscape::Backslash)),
 		just(r"\'").to(Token::CharEscape(CharEscape::Apostrophe)),
+		just(r"\").ignore_then(any()).validate(|c, e, emitter| {
+			emitter.emit(Rich::custom(
+				e.span(),
+				format!(r"Invalid escape sequence: \{c}"),
+			));
+			Token::Error
+		}),
 		none_of(r"[^\\']").map(Token::Char),
 	))
 	.delimited_by(just('\''), just('\''))
 	.labelled("character literal")
+	.as_context()
 	.boxed()
 }
 
@@ -141,9 +291,16 @@ fn string_lexer<'src, T: Lexer<'src, Spanned<Token>>>(token: T) -> impl Lexer<'s
 		regex(r"\\[uU][a-fA-F\d]{1,6}")
 			.map(|s: &str| u32::from_str_radix(&s[2..], 16))
 			.unwrapped()
-			.map(char::from_u32)
-			.unwrapped()
-			.map(|c| Token::StringEscape(StringEscape::Unicode(c))),
+			.validate(|code, e, emitter| match char::from_u32(code) {
+				Some(c) => Token::StringEscape(StringEscape::Unicode(c)),
+				None => {
+					emitter.emit(Rich::custom(
+						e.span(),
+						format!("Invalid unicode codepoint: U+{code:X}"),
+					));
+					Token::Error
+				}
+			}),
 		// escape sequences
 		just(r"\n").to(Token::StringEscape(StringEscape::Newline)),
 		just(r"\N").to(Token::StringEscape(StringEscape::Newline)),
@@ -154,8 +311,15 @@ fn string_lexer<'src, T: Lexer<'src, Spanned<Token>>>(token: T) -> impl Lexer<'s
 		just(r"\\").to(Token::StringEscape(StringEscape::Backslash)),
 		just(r#"\""#).to(Token::StringEscape(StringEscape::Quote)),
 		just(r"\${").to(Token::StringEscape(StringEscape::Interpolation)),
+		just(r"\").ignore_then(any()).validate(|c, e, emitter| {
+			emitter.emit(Rich::custom(
+				e.span(),
+				format!(r"Invalid escape sequence: \{c}"),
+			));
+			Token::Error
+		}),
 		// regular text
-		none_of(r#""\"#).map(|c: char| Token::StringChar(c)),
+		none_of("\"\\").map(|c: char| Token::StringChar(c)),
 	));
 
 	string_token
@@ -164,6 +328,8 @@ fn string_lexer<'src, T: Lexer<'src, Spanned<Token>>>(token: T) -> impl Lexer<'s
 		.collect()
 		.delimited_by(just('"'), just('"'))
 		.map(Token::String)
+		.labelled("string literal")
+		.as_context()
 		.boxed()
 }
 
@@ -292,22 +458,17 @@ fn punct_lexer<'src>() -> impl Lexer<'src, Token> {
 }
 
 fn comment_lexer<'src>() -> impl Lexer<'src, ()> {
-	choice((
-		just("/*")
-			.ignore_then(any().repeated())
-			.then_ignore(just("*/"))
-			.to(()),
-		just("//")
-			.then(any().and_is(just("\n").not()).repeated())
-			.to(()),
-	))
-	.padded()
-	.boxed()
+	just("//")
+		.then(any().and_is(just("\n").not()).repeated())
+		.padded()
+		.ignored()
+		.boxed()
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::ast::SpannedExt;
 	use test_case::test_case;
 
 	#[test_case("1234" => Ok(vec![Token::DecimalInt(1234).spanned(0..4)]) ; "decimal")]
@@ -454,7 +615,6 @@ mod tests {
 	}
 
 	#[test_case("1// This is a comment" => Ok(vec![Token::DecimalInt(1).spanned(0..1)]) ; "single line comment")]
-	#[test_case("/* This is a comment */1" => Ok(vec![Token::DecimalInt(1).spanned(23..24)]) ; "multi line comment")]
 	fn test_comments(input: &str) -> Result<Vec<Spanned<Token>>, Vec<Rich<char, SimpleSpan>>> {
 		lexer().parse(input).into_result()
 	}
@@ -546,26 +706,10 @@ mod tests {
 		lexer().parse(input).into_result()
 	}
 
-	#[test_case("0x" => matches Err(_) ; "invalid hex")]
-	#[test_case("0b2" => matches Err(_) ; "invalid binary")]
-	#[test_case("0o8" => matches Err(_) ; "invalid octal")]
-	fn test_invalid_integers(
-		input: &str,
-	) -> Result<Vec<Spanned<Token>>, Vec<Rich<char, SimpleSpan>>> {
-		lexer().parse(input).into_result()
-	}
-
-	#[test_case("1.2e" => matches Err(_) ; "incomplete exponent")]
-	#[test_case("1.2e+" => matches Err(_) ; "missing exponent after sign")]
-	#[test_case("1._2" => matches Err(_) ; "separator in wrong position")]
-	fn test_invalid_floats(input: &str) -> Result<Vec<Spanned<Token>>, Vec<Rich<char, SimpleSpan>>> {
-		lexer().parse(input).into_result()
-	}
-
 	#[test_case("''" => matches Err(_) ; "empty char")]
 	#[test_case("'ab'" => matches Err(_) ; "char too long")]
 	#[test_case("'\\'" => matches Err(_) ; "incomplete escape")]
-	#[test_case(r"'\u{110000}'" => matches Err(_) ; "invalid unicode")]
+	#[test_case(r"'\u110000'" => matches Err(_) ; "invalid unicode")]
 	fn test_invalid_chars(input: &str) -> Result<Vec<Spanned<Token>>, Vec<Rich<char, SimpleSpan>>> {
 		lexer().parse(input).into_result()
 	}
@@ -577,11 +721,24 @@ mod tests {
 		lexer().parse(input).into_result()
 	}
 
-	#[test_case("/* unclosed comment" => matches Err(_) ; "unclosed block comment")]
-	#[test_case("/* nested /* comment */ */" => matches Err(_) ; "nested comments not supported")]
-	fn test_invalid_comments(
-		input: &str,
-	) -> Result<Vec<Spanned<Token>>, Vec<Rich<char, SimpleSpan>>> {
+	#[test_case("1.a" => matches Err(_) ; "invalid float decimal")]
+	#[test_case("1e" => matches Err(_) ; "incomplete exponent")]
+	#[test_case("1e+" => matches Err(_) ; "incomplete signed exponent")]
+	#[test_case("1ea" => matches Err(_) ; "invalid exponent")]
+	#[test_case("0b2" => matches Err(_) ; "invalid binary digit")]
+	#[test_case("0o8" => matches Err(_) ; "invalid octal digit")]
+	#[test_case("0xg" => matches Err(_) ; "invalid hex digit")]
+	#[test_case("1_" => matches Err(_) ; "trailing underscore")]
+	#[test_case("0x_" => matches Err(_) ; "trailing underscore in hex")]
+	#[test_case("0b_" => matches Err(_) ; "trailing underscore in binary")]
+	#[test_case("0o_" => matches Err(_) ; "trailing underscore in octal")]
+	#[test_case("0b" => matches Err(_) ; "incomplete binary")]
+	#[test_case("0o" => matches Err(_) ; "incomplete octal")]
+	#[test_case("0x" => matches Err(_) ; "incomplete hex")]
+	#[test_case("0b1_2" => matches Err(_) ; "invalid binary digit with separator")]
+	#[test_case("0o7_8" => matches Err(_) ; "invalid octal digit with separator")]
+	#[test_case("0xF_FG" => matches Err(_) ; "invalid hex digit with separator")]
+	fn test_invalid_numbers(input: &str) -> Result<Vec<Spanned<Token>>, Vec<Rich<char, SimpleSpan>>> {
 		lexer().parse(input).into_result()
 	}
 }

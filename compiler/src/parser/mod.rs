@@ -714,13 +714,16 @@ where
 		expr_atom.pratt(vec![
 			postfix(
 				Precedence::FuncCall as u16,
-				generic_args(type_def(make_input)).or_not().then(
-					call_arg(expression.clone())
-						.separated_by(just(Token::Comma))
-						.allow_trailing()
-						.collect()
-						.delimited_by(just(Token::LParen), just(Token::RParen)),
-				),
+				generic_args(type_def(make_input))
+					.or_not()
+					.then(
+						call_arg(expression.clone())
+							.separated_by(just(Token::Comma))
+							.allow_trailing()
+							.collect()
+							.delimited_by(just(Token::LParen), just(Token::RParen)),
+					)
+					.labelled("a function call"),
 				|func: Spanned<_>, (generics, args): (Option<_>, _), e| {
 					Spanned(
 						Expr::Call {
@@ -1861,6 +1864,9 @@ fn int<'src, I: TokenInput<'src>>() -> impl NymphParser<'src, I, Spanned<u64>> {
 fn float<'src, I: TokenInput<'src>>() -> impl NymphParser<'src, I, Spanned<OrderedFloat<f64>>> {
 	select! {
 		Token::Float(val) = e => Spanned(val, e.span()),
+		Token::IntFloat(val) = e => Spanned(OrderedFloat(val as f64), e.span()),
+		Token::IntExpFloat(mantissa, exponent) = e => Spanned(OrderedFloat(10f64.powi(exponent) * mantissa as f64), e.span()),
+		Token::FloatExpFloat(mantissa, exponent) = e => Spanned(mantissa * 10f64.powi(exponent), e.span()),
 	}
 	.labelled("a float literal")
 }
