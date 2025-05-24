@@ -54,6 +54,10 @@ false
 Character literals are single characters, enclosed in single quotes.
 They are a single UTF-8 codepoint, and may be entered either directly or using escape sequences.
 
+The only available escape sequences are newline (`\n`), tab (`\t`), carriage return (`\r`),
+apostrophe (`\'`), backslash (`\\`), and the unicode escape (`\uXXXX`).
+Unicode escape sequences always use 4-6 hexadecimal digits, and must represent a valid unicode codepoint.
+
 ```nym
 'a' // regular character
 '\n' // newline

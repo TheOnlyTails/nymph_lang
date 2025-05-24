@@ -42,8 +42,9 @@ export default defineConfig({
 				items: [
 					{ text: "Introduction", link: "/" },
 					{ text: "Literals", link: "/literals/" },
-					{ text: "Declarations", link: "/declarations/" },
 					{ text: "Expressions", link: "/expressions/" },
+					{ text: "Declarations", link: "/declarations/" },
+					{ text: "Types", link: "/types/" },
 					{ text: "Standard Library", link: "/stdlib/" },
 				],
 			}
