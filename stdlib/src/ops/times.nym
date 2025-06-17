@@ -3,7 +3,7 @@ interface Times<Other, Output> {
 }
 
 impl Times<Other = self, Output = self> for int {
-  func times(other: self): self
+  external func times(other: self): self
 }
 
 impl Times<Other = float, Output = float> for int {
@@ -11,7 +11,7 @@ impl Times<Other = float, Output = float> for int {
 }
 
 impl Times<Other = self, Output = self> for float {
-  func times(other: self): self
+  external func times(other: self): self
 }
 
 impl Times<Other = int, Output = self> for float {

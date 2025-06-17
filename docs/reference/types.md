@@ -44,3 +44,4 @@ Compound types are reference to other types, usually imposing a kind of constrai
   any type that implements both of them.
 - Pattern `A is B`: given a type `A` and a pattern `B`, the pattern type represents only the values
   of `A` that also match `B`. The `!is` operator is used to represent only values that _don't_ match `B`.
+- Grouped `(A)`: equal to the inner type `A`, used to group together type operations or clarify precedence.

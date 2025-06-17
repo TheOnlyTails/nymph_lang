@@ -1,4 +1,4 @@
-use std::{fmt::Display, ops::Range};
+use std::fmt::Display;
 
 use chumsky::{
 	extra::ParserExtra,
@@ -7,16 +7,15 @@ use chumsky::{
 };
 use ecow::EcoString;
 
-pub(crate) mod declaration;
-pub(crate) mod error;
-pub(crate) mod expr;
-pub(crate) mod ops;
-pub(crate) mod types;
+pub mod declaration;
+pub mod expr;
+pub mod ops;
+pub mod types;
 
-pub(crate) type Ident = Spanned<EcoString>;
+pub type Ident = Spanned<EcoString>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Spanned<T>(pub(crate) T, pub(crate) SimpleSpan);
+pub struct Spanned<T>(pub(crate) T, pub(crate) SimpleSpan);
 
 impl<T> Spanned<T> {
 	pub(crate) fn new<'src, I: Input<'src, Span = SimpleSpan>, E: ParserExtra<'src, I>>(
@@ -24,26 +23,6 @@ impl<T> Spanned<T> {
 		e: &mut MapExtra<'src, '_, I, E>,
 	) -> Self {
 		Self(value, e.span())
-	}
-
-	pub(crate) fn start(&self) -> usize {
-		self.1.start
-	}
-
-	pub(crate) fn end(&self) -> usize {
-		self.1.end
-	}
-
-	pub(crate) fn span(&self) -> SimpleSpan {
-		self.1
-	}
-
-	pub(crate) fn value(&self) -> &T {
-		&self.0
-	}
-
-	pub(crate) fn from_range(value: T, range: Range<usize>) -> Self {
-		Self(value, range.into())
 	}
 
 	fn map<R, F: Fn(&T) -> R>(&self, f: F) -> Spanned<R> {
@@ -57,12 +36,17 @@ impl<T: Display> Display for Spanned<T> {
 	}
 }
 
-pub(crate) trait SpannedExt where Self: Sized {
-	fn spanned(self, range: Range<usize>) -> Spanned<Self>;
+#[cfg(test)]
+pub(crate) trait SpannedExt
+where
+	Self: Sized,
+{
+	fn spanned<S: Into<SimpleSpan>>(self, range: S) -> Spanned<Self>;
 }
 
+#[cfg(test)]
 impl<T> SpannedExt for T {
-	fn spanned(self, range: Range<usize>) -> Spanned<Self> {
+	fn spanned<S: Into<SimpleSpan>>(self, range: S) -> Spanned<Self> {
 		Spanned(self, range.into())
 	}
 }

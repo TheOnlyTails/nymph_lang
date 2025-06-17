@@ -1,0 +1,18 @@
+public struct Set<Item>(inner: #{Item: void}) {
+  /// Inserts an item into the set.
+  /// Returns `true` if the set did not contain this item previously, and `false` if it did. 
+  func insert(item: Item): boolean -> this.inner.insert(item, #())
+
+  func remove(item: Item) -> if (item in this.inner) {
+    inner -= item
+
+  }
+
+  namespace {
+    func new<T>(...from: T) -> Set(from.map(#(_, #())).collect())
+  }
+
+  impl Default {
+    func default() -> Set(inner = #{})
+  }
+}

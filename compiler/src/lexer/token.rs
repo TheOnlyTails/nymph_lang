@@ -35,7 +35,7 @@ pub(crate) enum Token {
 
 	/// `"abc"`, `"${b}"`, `"\n\u32"`
 	String(Vec<Spanned<Self>>),
-	StringChar(char),
+	StringText(EcoString),
 	StringEscape(StringEscape),
 	StringInterpolation(Vec<Spanned<Self>>),
 
@@ -55,18 +55,18 @@ pub(crate) enum Token {
 	Import,
 	/// `with`
 	With,
-	/// `(`
-	LParen,
-	/// `)`
-	RParen,
-	/// `[`
-	LBracket,
-	/// `]`
-	RBracket,
-	/// `{`
-	LBrace,
-	/// `}`
-	RBrace,
+	/// `()`
+	Parens(Vec<Spanned<Self>>),
+	// `[]`
+	Brackets(Vec<Spanned<Self>>),
+	// `{}`
+	Braces(Vec<Spanned<Self>>),
+	// `#[]`
+	List(Vec<Spanned<Self>>),
+	// `#()`
+	Tuple(Vec<Spanned<Self>>),
+	// `#{}`
+	Map(Vec<Spanned<Self>>),
 	/// `async`
 	Async,
 	/// `await`
@@ -117,12 +117,6 @@ pub(crate) enum Token {
 	NeverType,
 	/// `self`
 	SelfType,
-	/// `#[`
-	ListStart,
-	/// `#(`
-	TupleStart,
-	/// `#{`
-	MapStart,
 	/// `->`
 	Arrow,
 	/// `...`
@@ -257,7 +251,7 @@ impl Display for Token {
 				Identifier(_) => "an identifier",
 				Char(_) | CharEscape(_) => "a character literal",
 				String(_) => "a string literal",
-				StringChar(_) => "a character in a string",
+				StringText(_) => "a character in a string",
 				StringEscape(_) => "an escape sequence",
 				StringInterpolation(_) => "an interpolated expression",
 				True => "true",
@@ -267,12 +261,12 @@ impl Display for Token {
 				Private => "private",
 				Import => "import",
 				With => "with",
-				LParen => "(",
-				RParen => ")",
-				LBracket => "[",
-				RBracket => "]",
-				LBrace => "{",
-				RBrace => "}",
+				Parens(_) => "a pair of parentheses",
+				Brackets(_) => "a pair of brackets",
+				Braces(_) => "a pair of braces",
+				List(_) => "list literal braces",
+				Tuple(_) => "tuple parentheses",
+				Map(_) => "map literal braces",
 				Async => "async",
 				Await => "await",
 				Type => "type",
@@ -298,9 +292,6 @@ impl Display for Token {
 				VoidType => "void",
 				NeverType => "never",
 				SelfType => "self",
-				ListStart => "#[",
-				TupleStart => "#(",
-				MapStart => "#{",
 				Arrow => "->",
 				DotDotDot => "...",
 				QuestionMark => "?",

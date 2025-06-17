@@ -1,16 +1,12 @@
-/**
-* write the documentation for an iterator
-
-* An iterator is a structure that allows you to iterate over a collection of items.
-* It provides a way to access each item in the collection one at a time, without exposing the underlying structure of the collection.
-*
-* Iterators are often used in functional programming to process collections of data in a more declarative way.
-* They can be used to implement various algorithms, such as filtering, mapping, and reducing.
-
-* ```nym
-* let iter = #[1, 2, 3]
-* 
-*/
+/// An iterator is a structure that allows you to iterate over a collection of items.
+/// It provides a way to access each item in the collection one at a time, without exposing the underlying structure of the collection.
+/// 
+/// Iterators are often used in functional programming to process collections of data in a more declarative way.
+/// They can be used to implement various algorithms, such as filtering, mapping, and reducing.
+///
+/// ```nym
+/// let iter = #[1, 2, 3]
+/// ```
 public interface Iterator<Item> {
   func next(): Option<Item>
 
@@ -123,7 +119,7 @@ public struct Zip<Item1, Item2>(
 ) {
   impl Iterator<#(Item1, Item2)> {
     func next() -> match (#(this.iter1.next(), this.iter2.next())) {
-      #(Some(value1), Some(value2)) -> Some((value1, value2)),
+      #(Some(value1), Some(value2)) -> Some(#(value1, value2)),
       _ -> None
     }
   }

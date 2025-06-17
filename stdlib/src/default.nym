@@ -1,5 +1,5 @@
 public interface Default {
-  public func default(): self
+  func default(): self
 }
 
 impl Default for int {
@@ -19,8 +19,8 @@ impl Default for char {
 }
 
 impl Default for string {
-}
   func default() -> ""
+}
 
 impl Default for #() {
   func default() -> #()

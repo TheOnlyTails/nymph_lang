@@ -1,29 +1,34 @@
-/**
-  The ratio between a circle's circumference and its diameter.
-*/
+/// The ratio between a circle's circumference and its diameter.
 public let pi = 3.14159265358979323846
-/**
-  The ratio between a circle's circumference and its radius, or 2π.
-*/
+/// The ratio between a circle's circumference and its radius, or 2π.
 public let tau = 6.28318530717958647692
-/**
-  The base of the natural logarithm, or Euler's number.
-*/
+/// The base of the natural logarithm, or Euler's number.
 public let e = 2.71828182845904523536
-/**
-  The golden ratio, (1 + √5) / 2.
-*/
+/// The golden ratio, (1 + √5) / 2.
 public let phi = 1.61803398874989484820
 
-/**
-  
-*/
+/// Returns the distance of the input from 0, which is the value without its sign.
 public func abs(x: int): int is 0.. -> if (x > 0) x else -x
+/// Returns the distance of the input from 0, which is the value without its sign.
 public func abs(x: float): float is 0f.. -> if (x > 0) x else -x
 
+/// Returns the sine of the input (in radians).
+/// Given a right triangle ABC and angle A as the input,
+/// the output of the function would be the ratio between the side opposite the angle
+/// to the hypotenuse of the triangle.
 public external func sin(x: float): float is -1f..=1f
-public external func cos(x: float): float is -1f..=1f
-public external func tan(x: float): float
+
+/// Returns the cosine of the input (in radians).
+/// Given a right triangle ABC and angle A as the input,
+/// the output of the function would be the ratio between the side adjecent to the angle
+/// to the hypotenuse of the triangle.
+public func cos(x: float) -> sin(x + pi / 2)
+
+/// Returns the tangent of the input (in radians).
+/// Given a right triangle ABC and angle A as the input,
+/// the output of the function would be the ratio between the side opposite to the angle
+/// to the side adjecent to the angle.
+public func tan(x: float) -> sin(x) / cos(x)
 
 public external func asin(x: float): float is -1.57079633..=1.57079633
 public external func acos(x: float): float is 0f..=3.1415926535

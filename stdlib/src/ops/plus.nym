@@ -38,7 +38,7 @@ impl<K, V> Plus<Other = self, Output = self> for #{K: V} {
   func plus(other: self) -> this.merge(other)
 }
 
-impl<T> Plus<Other: self, Output = self> for Iterator<T> {
+impl<T> Plus<Other = self, Output = self> for Iterator<T> {
   func plus(other: self) -> Iterator.from(() -> {
     // if `this` is not done, advance it
     // otherwise, advance `other`

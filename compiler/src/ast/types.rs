@@ -3,7 +3,7 @@ use crate::ast::expr::Pattern;
 use std::collections::BTreeSet;
 
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
-pub(crate) enum Type {
+pub enum Type {
 	// Type declarations
 	/// `int`
 	Int,
@@ -123,14 +123,14 @@ pub(crate) struct StructImplId {
 }
 
 #[derive(Debug, PartialEq, Hash, Clone, Eq)]
-pub(crate) struct GenericArg {
-	pub(crate) value: Spanned<Type>,
-	pub(crate) name: Option<Ident>,
+pub struct GenericArg {
+	pub value: Spanned<Type>,
+	pub name: Option<Ident>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct GenericParam {
-	pub(crate) name: Ident,
-	pub(crate) constraint: Option<Spanned<Type>>,
-	pub(crate) default: Option<Spanned<Type>>,
+pub struct GenericParam {
+	pub name: Ident,
+	pub constraint: Option<Spanned<Type>>,
+	pub default: Option<Spanned<Type>>,
 }

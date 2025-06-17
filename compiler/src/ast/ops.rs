@@ -1,7 +1,7 @@
 use strum::FromRepr;
 
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Debug, FromRepr)]
-pub(crate) enum Precedence {
+pub enum Precedence {
 	Assignment,
 	Pipeline,
 	BoolOr,
@@ -27,7 +27,7 @@ pub(crate) enum Precedence {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum PrefixOperator {
+pub enum PrefixOperator {
 	/// `!`
 	BoolNot,
 	/// `-`
@@ -37,13 +37,13 @@ pub(crate) enum PrefixOperator {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum PostfixOperator {
+pub enum PostfixOperator {
 	/// `?`
 	ErrorReturn,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum BinaryOperator {
+pub enum BinaryOperator {
 	/// `+`
 	Plus,
 	/// `-`
@@ -93,13 +93,13 @@ pub(crate) enum BinaryOperator {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum TypeOperator {
+pub enum TypeOperator {
 	/// `as`
 	As,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum PatternOperator {
+pub enum PatternOperator {
 	/// `is`
 	Is,
 	/// `!is`
@@ -107,7 +107,7 @@ pub(crate) enum PatternOperator {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum AssignOperator {
+pub enum AssignOperator {
 	/// `=`
 	Assign,
 	/// `+=`

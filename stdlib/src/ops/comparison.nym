@@ -38,7 +38,7 @@ impl Comparable<Other = self> for string {
 }
 
 impl Comparable<Other = self> for boolean {
-  func compare_to(other: self) match (#(this, other)) {
+  func compare_to(other: self) -> match (#(this, other)) {
     #(false, true) -> Order.LessThan,
     #(false, false) | #(true, true) -> Order.Equal,
     #(true, false) -> Order.GreaterThan,

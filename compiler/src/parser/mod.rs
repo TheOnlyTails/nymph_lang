@@ -1,5 +1,3 @@
-pub(crate) mod error;
-
 use crate::{
 	ast::{
 		Ident, Spanned,
@@ -43,6 +41,8 @@ where
 		.repeated()
 		.collect()
 		.map_with(|members, e| Spanned(Module { members }, e.span()))
+		.labelled("a module")
+		.boxed()
 }
 
 fn declaration<'src, I: TokenInput<'src>, M>(
@@ -53,7 +53,7 @@ where
 {
 	choice((
 		// import
-		import(),
+		import(make_input),
 		// let
 		visibility()
 			.or_not()
@@ -110,7 +110,10 @@ where
 	.boxed()
 }
 
-fn import<'src, I: TokenInput<'src>>() -> impl NymphParser<'src, I, Declaration> {
+fn import<'src, I: TokenInput<'src>, M>(make_input: M) -> impl NymphParser<'src, I, Declaration>
+where
+	M: Fn(SimpleSpan, &'src Vec<Spanned<Token>>) -> I + Copy + 'src,
+{
 	let import_ident = identifier()
 		.then(just(Token::As).ignore_then(identifier()).or_not())
 		.labelled("an import identifier")
@@ -133,13 +136,13 @@ fn import<'src, I: TokenInput<'src>>() -> impl NymphParser<'src, I, Declaration>
 		)
 		.then(
 			just(Token::With)
-				.ignore_then(
+				.ignore_then(parens(
 					import_ident
 						.separated_by(just(Token::Comma))
 						.allow_trailing()
-						.collect()
-						.delimited_by(just(Token::LParen), just(Token::RParen)),
-				)
+						.collect(),
+					make_input,
+				))
 				.or_not(),
 		)
 		.map(|((root, path), idents)| Declaration::Import {
@@ -205,13 +208,13 @@ where
 	just(Token::Func)
 		.ignore_then(identifier())
 		.then(generic_params(make_input).or_not())
-		.then(
+		.then(parens(
 			func_param
 				.separated_by(just(Token::Comma))
 				.allow_trailing()
-				.collect()
-				.delimited_by(just(Token::LParen), just(Token::RParen)),
-		)
+				.collect(),
+			make_input,
+		))
 		.then(
 			just(Token::Colon)
 				.ignore_then(type_def(make_input))
@@ -258,22 +261,17 @@ where
 		.then(identifier())
 		.then(generic_params(make_input).or_not())
 		.then(
-			struct_field(make_input)
-				.separated_by(just(Token::Comma))
-				.allow_trailing()
-				.at_least(1)
-				.collect()
-				.delimited_by(just(Token::LParen), just(Token::RParen))
-				.or_not(),
+			parens(
+				struct_field(make_input)
+					.separated_by(just(Token::Comma))
+					.allow_trailing()
+					.at_least(1)
+					.collect(),
+				make_input,
+			)
+			.or_not(),
 		)
-		.then(
-			struct_member(make_input)
-				.repeated()
-				.at_least(1)
-				.collect()
-				.delimited_by(just(Token::LBrace), just(Token::RBrace))
-				.or_not(),
-		)
+		.then(braces(struct_member(make_input).repeated().collect(), make_input).or_not())
 		.map(
 			|((((visibility, name), generics), fields), members)| Declaration::Struct {
 				visibility,
@@ -321,33 +319,27 @@ where
 	choice((
 		impl_member(make_input).map(StructInnerMember::Member),
 		just(Token::Namespace)
-			.ignore_then(
-				impl_member(make_input)
-					.repeated()
-					.collect()
-					.delimited_by(just(Token::LBrace), just(Token::RBrace)),
-			)
+			.ignore_then(braces(
+				impl_member(make_input).repeated().collect(),
+				make_input,
+			))
 			.map(StructInnerMember::Namespace),
 		just(Token::Impl)
 			.ignore_then(just(Token::Mut))
-			.ignore_then(
-				impl_member(make_input)
-					.repeated()
-					.collect()
-					.delimited_by(just(Token::LBrace), just(Token::RBrace)),
-			)
+			.ignore_then(braces(
+				impl_member(make_input).repeated().collect(),
+				make_input,
+			))
 			.map(StructInnerMember::ImplMut),
 		// impl A<B>
 		just(Token::Impl)
 			.ignore_then(generic_params(make_input).or_not())
 			.then(identifier())
 			.then(generic_args(type_def(make_input)).or_not())
-			.then(
-				impl_member(make_input)
-					.repeated()
-					.collect()
-					.delimited_by(just(Token::LBrace), just(Token::RBrace)),
-			)
+			.then(braces(
+				impl_member(make_input).repeated().collect(),
+				make_input,
+			))
 			.map(
 				|(((generics, interface), interface_generics), members)| StructInnerMember::Impl {
 					interface: (interface, interface_generics.unwrap_or(vec![])),
@@ -368,13 +360,15 @@ where
 {
 	let enum_variant = identifier()
 		.then(
-			struct_field(make_input)
-				.separated_by(just(Token::Comma))
-				.allow_trailing()
-				.at_least(1)
-				.collect()
-				.delimited_by(just(Token::LParen), just(Token::RParen))
-				.or_not(),
+			parens(
+				struct_field(make_input)
+					.separated_by(just(Token::Comma))
+					.allow_trailing()
+					.at_least(1)
+					.collect(),
+				make_input,
+			)
+			.or_not(),
 		)
 		.map_with(|(name, fields), e| {
 			Spanned(
@@ -391,15 +385,14 @@ where
 		.then_ignore(just(Token::Enum))
 		.then(identifier())
 		.then(generic_params(make_input).or_not())
-		.then(
+		.then(braces(
 			enum_variant
 				.separated_by(just(Token::Comma))
 				.allow_trailing()
-				.at_least(1)
 				.collect()
-				.then(struct_member(make_input).repeated().collect::<Vec<_>>())
-				.delimited_by(just(Token::LBrace), just(Token::RBrace)),
-		)
+				.then(struct_member(make_input).repeated().collect::<Vec<_>>()),
+			make_input,
+		))
 		.map(
 			|(((visibility, name), generics), (variants, members))| Declaration::Enum {
 				visibility,
@@ -421,12 +414,10 @@ where
 		.or_not()
 		.then_ignore(just(Token::Namespace))
 		.then(identifier())
-		.then(
-			impl_member(make_input)
-				.repeated()
-				.collect()
-				.delimited_by(just(Token::LBrace), just(Token::RBrace)),
-		)
+		.then(braces(
+			impl_member(make_input).repeated().collect(),
+			make_input,
+		))
 		.map(|((visibility, name), members)| Declaration::Namespace {
 			visibility,
 			name,
@@ -446,12 +437,10 @@ where
 		.then(generic_params(make_input).or_not())
 		.then(just(Token::Mut).or_not())
 		.then(type_def(make_input))
-		.then(
-			impl_member(make_input)
-				.repeated()
-				.collect()
-				.delimited_by(just(Token::LBrace), just(Token::RBrace)),
-		)
+		.then(braces(
+			impl_member(make_input).repeated().collect(),
+			make_input,
+		))
 		.map(
 			|((((visibility, generics), mutable), type_), members)| Declaration::Impl {
 				visibility,
@@ -477,12 +466,10 @@ where
 		.then(identifier().then(generic_args(type_def(make_input)).or_not()))
 		.then_ignore(just(Token::For))
 		.then(type_def(make_input))
-		.then(
-			impl_member(make_input)
-				.repeated()
-				.collect()
-				.delimited_by(just(Token::LBrace), just(Token::RBrace)),
-		)
+		.then(braces(
+			impl_member(make_input).repeated().collect(),
+			make_input,
+		))
 		.map(
 			|(((((visibility, generics), mutable), for_interface), type_), members)| {
 				Declaration::ImplFor {
@@ -567,12 +554,10 @@ where
 				)
 				.or_not(),
 		)
-		.then(
-			interface_member(make_input)
-				.repeated()
-				.collect()
-				.delimited_by(just(Token::LBrace), just(Token::RBrace)),
-		)
+		.then(braces(
+			interface_member(make_input).repeated().collect(),
+			make_input,
+		))
 		.map(
 			|(((((visibility, mutable), name), generics), super_interfaces), members)| {
 				Declaration::Interface {
@@ -596,33 +581,27 @@ where
 	choice((
 		interface_element(make_input).map(InterfaceMember::Element),
 		just(Token::Namespace)
-			.ignore_then(
-				impl_member(make_input)
-					.repeated()
-					.collect()
-					.delimited_by(just(Token::LBrace), just(Token::RBrace)),
-			)
+			.ignore_then(braces(
+				impl_member(make_input).repeated().collect(),
+				make_input,
+			))
 			.map(InterfaceMember::Namespace),
 		just(Token::Impl)
 			.ignore_then(just(Token::Mut))
-			.ignore_then(
-				interface_element(make_input)
-					.repeated()
-					.collect()
-					.delimited_by(just(Token::LBrace), just(Token::RBrace)),
-			)
+			.ignore_then(braces(
+				interface_element(make_input).repeated().collect(),
+				make_input,
+			))
 			.map(InterfaceMember::ImplMut),
 		// impl A<B>
 		just(Token::Impl)
 			.ignore_then(generic_params(make_input).or_not())
 			.then(identifier())
 			.then(generic_args(type_def(make_input)).or_not())
-			.then(
-				impl_member(make_input)
-					.repeated()
-					.collect()
-					.delimited_by(just(Token::LBrace), just(Token::RBrace)),
-			)
+			.then(braces(
+				impl_member(make_input).repeated().collect(),
+				make_input,
+			))
 			.map(
 				|(((generics, interface_name), interface_generics), members)| InterfaceMember::Impl {
 					interface: (interface_name, interface_generics.unwrap_or(vec![])),
@@ -675,15 +654,15 @@ where
 			string(expression.clone(), make_input).map(Expr::String),
 			boolean().map(Expr::Boolean),
 			identifier().map(Expr::Identifier),
-			list_literal(expression.clone()).map(Expr::List),
-			tuple_literal(expression.clone()).map(Expr::Tuple),
-			map_literal(expression.clone()).map(Expr::Map),
+			list_literal(expression.clone(), make_input).map(Expr::List),
+			tuple_literal(expression.clone(), make_input).map(Expr::Tuple),
+			map_literal(expression.clone(), make_input).map(Expr::Map),
 			just(Token::Underscore).to(Expr::Placeholder),
 			just(Token::This).to(Expr::This),
 			closure(expression.clone(), make_input),
 			// control flow
-			if_expr(expression.clone()),
-			while_expr(expression.clone()),
+			if_expr(expression.clone(), make_input),
+			while_expr(expression.clone(), make_input),
 			for_expr(expression.clone(), make_input),
 			match_expr(expression.clone(), make_input),
 			just(Token::Return)
@@ -704,10 +683,7 @@ where
 				.ignore_then(just(Token::AtSign).ignore_then(identifier()).or_not())
 				.map(|label| Expr::Continue { label }),
 			// Grouped expr
-			expression
-				.clone()
-				.delimited_by(just(Token::LParen), just(Token::RParen))
-				.map(|ex| Expr::Grouped(ex.into())),
+			parens(expression.clone(), make_input).map(|ex| Expr::Grouped(ex.into())),
 		))
 		.map_with(Spanned::new);
 
@@ -716,13 +692,13 @@ where
 				Precedence::FuncCall as u16,
 				generic_args(type_def(make_input))
 					.or_not()
-					.then(
+					.then(parens(
 						call_arg(expression.clone())
 							.separated_by(just(Token::Comma))
 							.allow_trailing()
-							.collect()
-							.delimited_by(just(Token::LParen), just(Token::RParen)),
-					)
+							.collect(),
+						make_input,
+					))
 					.labelled("a function call"),
 				|func: Spanned<_>, (generics, args): (Option<_>, _), e| {
 					Spanned(
@@ -768,9 +744,7 @@ where
 			.boxed(),
 			postfix(
 				Precedence::IndexAccess as u16,
-				expression
-					.clone()
-					.delimited_by(just(Token::LBracket), just(Token::RBracket)),
+				brackets(expression.clone(), make_input),
 				|parent: Spanned<_>, index: Spanned<_>, e| {
 					Spanned(
 						Expr::IndexAccess {
@@ -785,10 +759,7 @@ where
 			.boxed(),
 			postfix(
 				Precedence::IndexAccess as u16,
-				expression.clone().delimited_by(
-					just(Token::QuestionDot).then(just(Token::LBracket)),
-					just(Token::RBracket),
-				),
+				just(Token::QuestionDot).ignore_then(brackets(expression.clone(), make_input)),
 				|parent: Spanned<_>, index: Spanned<_>, e| {
 					Spanned(
 						Expr::IndexAccess {
@@ -1556,28 +1527,34 @@ fn call_arg<'src, I: TokenInput<'src>, E: NymphParser<'src, I, Spanned<Expr>>>(
 	.boxed()
 }
 
-fn list_literal<'src, I: TokenInput<'src>, E: NymphParser<'src, I, Spanned<Expr>>>(
+fn list_literal<'src, I: TokenInput<'src>, E: NymphParser<'src, I, Spanned<Expr>>, M>(
 	expression: E,
-) -> impl NymphParser<'src, I, Vec<Spanned<ListItem>>> {
-	just(Token::DotDotDot)
-		.or_not()
-		.then(expression)
-		.map_with(|(spread, value), e| {
-			Spanned(
-				if spread.is_some() {
-					ListItem::Spread(value)
-				} else {
-					ListItem::Expr(value)
-				},
-				e.span(),
-			)
-		})
-		.separated_by(just(Token::Comma))
-		.allow_trailing()
-		.collect()
-		.delimited_by(just(Token::ListStart), just(Token::RBracket))
-		.labelled("a list literal")
-		.boxed()
+	make_input: M,
+) -> impl NymphParser<'src, I, Vec<Spanned<ListItem>>>
+where
+	M: Fn(SimpleSpan, &'src Vec<Spanned<Token>>) -> I + Copy + 'src,
+{
+	list_delimiter(
+		just(Token::DotDotDot)
+			.or_not()
+			.then(expression)
+			.map_with(|(spread, value), e| {
+				Spanned(
+					if spread.is_some() {
+						ListItem::Spread(value)
+					} else {
+						ListItem::Expr(value)
+					},
+					e.span(),
+				)
+			})
+			.separated_by(just(Token::Comma))
+			.allow_trailing()
+			.collect(),
+		make_input,
+	)
+	.labelled("a list literal")
+	.boxed()
 }
 
 fn block<'src, I: TokenInput<'src>, E: NymphParser<'src, I, Spanned<Expr>>, M>(
@@ -1598,12 +1575,7 @@ where
 	identifier()
 		.then_ignore(just(Token::AtSign))
 		.or_not()
-		.then(
-			statement
-				.repeated()
-				.collect()
-				.delimited_by(just(Token::LBrace), just(Token::RBrace)),
-		)
+		.then(braces(statement.repeated().collect(), make_input))
 		.map(|(label, body)| Expr::Block { body, label })
 		.labelled("a block expression")
 		.boxed()
@@ -1641,12 +1613,10 @@ where
 
 	generic_params(make_input)
 		.or_not()
-		.then(
-			closure_param
-				.separated_by(just(Token::Comma))
-				.collect()
-				.delimited_by(just(Token::LParen), just(Token::RParen)),
-		)
+		.then(parens(
+			closure_param.separated_by(just(Token::Comma)).collect(),
+			make_input,
+		))
 		.then(
 			just(Token::Colon)
 				.ignore_then(type_def(make_input))
@@ -1664,60 +1634,72 @@ where
 		.boxed()
 }
 
-fn tuple_literal<'src, I: TokenInput<'src>, E: NymphParser<'src, I, Spanned<Expr>>>(
+fn tuple_literal<'src, I: TokenInput<'src>, E: NymphParser<'src, I, Spanned<Expr>>, M>(
 	expression: E,
-) -> impl NymphParser<'src, I, Vec<Spanned<ListItem>>> {
-	just(Token::DotDotDot)
-		.or_not()
-		.then(expression)
-		.map_with(|(spread, value), e| {
-			Spanned(
-				if spread.is_some() {
-					ListItem::Spread(value)
-				} else {
-					ListItem::Expr(value)
-				},
-				e.span(),
-			)
-		})
-		.separated_by(just(Token::Comma))
-		.allow_trailing()
-		.collect()
-		.delimited_by(just(Token::TupleStart), just(Token::RParen))
-		.labelled("a tuple literal")
-		.boxed()
+	make_input: M,
+) -> impl NymphParser<'src, I, Vec<Spanned<ListItem>>>
+where
+	M: Fn(SimpleSpan, &'src Vec<Spanned<Token>>) -> I + Copy + 'src,
+{
+	tuple_delimiter(
+		just(Token::DotDotDot)
+			.or_not()
+			.then(expression)
+			.map_with(|(spread, value), e| {
+				Spanned(
+					if spread.is_some() {
+						ListItem::Spread(value)
+					} else {
+						ListItem::Expr(value)
+					},
+					e.span(),
+				)
+			})
+			.separated_by(just(Token::Comma))
+			.allow_trailing()
+			.collect(),
+		make_input,
+	)
+	.labelled("a tuple literal")
+	.boxed()
 }
 
-fn map_literal<'src, I: TokenInput<'src>, E: NymphParser<'src, I, Spanned<Expr>>>(
+fn map_literal<'src, I: TokenInput<'src>, E: NymphParser<'src, I, Spanned<Expr>>, M>(
 	expression: E,
-) -> impl NymphParser<'src, I, Vec<Spanned<MapEntry>>> {
-	choice((
-		just(Token::DotDotDot)
-			.ignore_then(expression.clone())
-			.map_with(|val, e| Spanned(MapEntry::Spread(val), e.span())),
-		expression
-			.clone()
-			.then_ignore(just(Token::Colon))
-			.then(expression)
-			.map_with(|(key, value), e| Spanned(MapEntry::Expr(key, value), e.span())),
-	))
-	.separated_by(just(Token::Comma))
-	.allow_trailing()
-	.collect()
-	.delimited_by(just(Token::MapStart), just(Token::RBrace))
+	make_input: M,
+) -> impl NymphParser<'src, I, Vec<Spanned<MapEntry>>>
+where
+	M: Fn(SimpleSpan, &'src Vec<Spanned<Token>>) -> I + Copy + 'src,
+{
+	map_delimiter(
+		choice((
+			just(Token::DotDotDot)
+				.ignore_then(expression.clone())
+				.map_with(|val, e| Spanned(MapEntry::Spread(val), e.span())),
+			expression
+				.clone()
+				.then_ignore(just(Token::Colon))
+				.then(expression)
+				.map_with(|(key, value), e| Spanned(MapEntry::Expr(key, value), e.span())),
+		))
+		.separated_by(just(Token::Comma))
+		.allow_trailing()
+		.collect(),
+		make_input,
+	)
 	.labelled("a map literal")
 	.boxed()
 }
 
-fn if_expr<'src, I: TokenInput<'src>, E: NymphParser<'src, I, Spanned<Expr>>>(
+fn if_expr<'src, I: TokenInput<'src>, E: NymphParser<'src, I, Spanned<Expr>>, M>(
 	expression: E,
-) -> impl NymphParser<'src, I, Expr> {
+	make_input: M,
+) -> impl NymphParser<'src, I, Expr>
+where
+	M: Fn(SimpleSpan, &'src Vec<Spanned<Token>>) -> I + Copy + 'src,
+{
 	just(Token::If)
-		.ignore_then(
-			expression
-				.clone()
-				.delimited_by(just(Token::LParen), just(Token::RParen)),
-		)
+		.ignore_then(parens(expression.clone(), make_input))
 		.then(expression.clone())
 		.then(just(Token::Else).ignore_then(expression).or_not())
 		.map(|((condition, then), otherwise)| Expr::If {
@@ -1729,16 +1711,16 @@ fn if_expr<'src, I: TokenInput<'src>, E: NymphParser<'src, I, Spanned<Expr>>>(
 		.boxed()
 }
 
-fn while_expr<'src, I: TokenInput<'src>, E: NymphParser<'src, I, Spanned<Expr>>>(
+fn while_expr<'src, I: TokenInput<'src>, E: NymphParser<'src, I, Spanned<Expr>>, M>(
 	expression: E,
-) -> impl NymphParser<'src, I, Expr> {
+	make_input: M,
+) -> impl NymphParser<'src, I, Expr>
+where
+	M: Fn(SimpleSpan, &'src Vec<Spanned<Token>>) -> I + Copy + 'src,
+{
 	just(Token::While)
 		.ignore_then(just(Token::AtSign).ignore_then(identifier()).or_not())
-		.then(
-			expression
-				.clone()
-				.delimited_by(just(Token::LParen), just(Token::RParen)),
-		)
+		.then(parens(expression.clone(), make_input))
 		.then(expression.clone())
 		.map(|((label, condition), body)| Expr::While {
 			label,
@@ -1758,12 +1740,12 @@ where
 {
 	just(Token::For)
 		.ignore_then(just(Token::AtSign).ignore_then(identifier()).or_not())
-		.then(
+		.then(parens(
 			pattern(make_input)
 				.then_ignore(just(Token::In))
-				.then(expression.clone())
-				.delimited_by(just(Token::LParen), just(Token::RParen)),
-		)
+				.then(expression.clone()),
+			make_input,
+		))
 		.then(expression.clone())
 		.map(|((label, (variable, iterable)), body)| Expr::For {
 			label,
@@ -1793,18 +1775,14 @@ where
 		});
 
 	just(Token::Match)
-		.ignore_then(
-			expression
-				.clone()
-				.delimited_by(just(Token::LParen), just(Token::RParen)),
-		)
-		.then(
+		.ignore_then(parens(expression.clone(), make_input))
+		.then(braces(
 			match_arm
 				.separated_by(just(Token::Comma))
 				.allow_trailing()
-				.collect()
-				.delimited_by(just(Token::LBrace), just(Token::RBrace)),
-		)
+				.collect(),
+			make_input,
+		))
 		.map(|(value, arms)| Expr::Match {
 			value: value.into(),
 			arms,
@@ -1821,7 +1799,7 @@ where
 	M: Fn(SimpleSpan, &'src Vec<Spanned<Token>>) -> I + Copy + 'src,
 {
 	let string_part = select! {
-		Token::StringChar(c) = e => Spanned(StringPart::Char(c), e.span()),
+		Token::StringText(text) = e => Spanned(StringPart::Text(text), e.span()),
 		Token::StringEscape(c) = e => Spanned(StringPart::EscapeSequence(c), e.span()),
 	}
 	.or(
@@ -1904,27 +1882,25 @@ where
 			just(Token::SelfType).to(Type::Self_),
 			just(Token::Underscore).to(Type::Infer),
 			// Data structures
-			type_def
-				.clone()
-				.delimited_by(just(Token::ListStart), just(Token::RBracket))
-				.map(|t: Spanned<Type>| Type::List(t.into())),
-			type_def
-				.clone()
-				.then(just(Token::Colon))
-				.then(type_def.clone())
-				.delimited_by(just(Token::MapStart), just(Token::RBrace))
-				.map(|((key, _), value)| Type::Map(key.into(), value.into())),
-			type_def
-				.clone()
-				.separated_by(just(Token::Comma))
-				.allow_trailing()
-				.collect()
-				.delimited_by(just(Token::TupleStart), just(Token::RParen))
-				.map(|elements| Type::Tuple(elements)),
-			type_def
-				.clone()
-				.delimited_by(just(Token::LParen), just(Token::RParen))
-				.map(|t| Type::Grouped(t.into())),
+			list_delimiter(type_def.clone(), make_input).map(|t: Spanned<_>| Type::List(t.into())),
+			map_delimiter(
+				type_def
+					.clone()
+					.then(just(Token::Colon))
+					.then(type_def.clone()),
+				make_input,
+			)
+			.map(|((key, _), value)| Type::Map(key.into(), value.into())),
+			tuple_delimiter(
+				type_def
+					.clone()
+					.separated_by(just(Token::Comma))
+					.allow_trailing()
+					.collect(),
+				make_input,
+			)
+			.map(|elements| Type::Tuple(elements)),
+			parens(type_def.clone(), make_input).map(|t| Type::Grouped(t.into())),
 			identifier()
 				.then(generic_args(type_def.clone()).or_not())
 				.map(|(name, generics)| Type::Reference {
@@ -1950,12 +1926,14 @@ where
 			}),
 			prefix(
 				0,
-				type_def
-					.separated_by(just(Token::Comma))
-					.allow_trailing()
-					.collect()
-					.delimited_by(just(Token::LParen), just(Token::RParen))
-					.then_ignore(just(Token::Arrow)),
+				parens(
+					type_def
+						.separated_by(just(Token::Comma))
+						.allow_trailing()
+						.collect(),
+					make_input,
+				)
+				.then_ignore(just(Token::Arrow)),
 				|params, return_type: Spanned<_>, e| {
 					Spanned(
 						Type::Function {
@@ -2055,29 +2033,32 @@ where
 			boolean().map(Pattern::Boolean),
 			just(Token::Underscore).to(Pattern::Placeholder),
 			// data structures
-			list_pattern_entry(pattern.clone())
-				.separated_by(just(Token::Comma))
-				.allow_trailing()
-				.collect()
-				.delimited_by(just(Token::ListStart), just(Token::RBracket))
-				.map(Pattern::List),
-			list_pattern_entry(pattern.clone())
-				.separated_by(just(Token::Comma))
-				.allow_trailing()
-				.collect()
-				.delimited_by(just(Token::TupleStart), just(Token::RParen))
-				.map(Pattern::Tuple),
-			map_pattern_entry(pattern.clone())
-				.separated_by(just(Token::Comma))
-				.allow_trailing()
-				.collect()
-				.delimited_by(just(Token::MapStart), just(Token::RBrace))
-				.map(Pattern::Map),
-			struct_pattern(pattern.clone()),
-			pattern
-				.clone()
-				.delimited_by(just(Token::LParen), just(Token::RParen))
-				.map(|p: Spanned<_>| Pattern::Grouped(p.into())),
+			list_delimiter(
+				list_pattern_entry(pattern.clone())
+					.separated_by(just(Token::Comma))
+					.allow_trailing()
+					.collect(),
+				make_input,
+			)
+			.map(Pattern::List),
+			tuple_delimiter(
+				list_pattern_entry(pattern.clone())
+					.separated_by(just(Token::Comma))
+					.allow_trailing()
+					.collect(),
+				make_input,
+			)
+			.map(Pattern::Tuple),
+			map_delimiter(
+				map_pattern_entry(pattern.clone())
+					.separated_by(just(Token::Comma))
+					.allow_trailing()
+					.collect(),
+				make_input,
+			)
+			.map(Pattern::Map),
+			struct_pattern(pattern.clone(), make_input),
+			parens(pattern.clone(), make_input).map(|p: Spanned<_>| Pattern::Grouped(p.into())),
 		))
 		.map_with(Spanned::new);
 
@@ -2138,27 +2119,33 @@ fn map_pattern_entry<'src, I: TokenInput<'src>, P: NymphParser<'src, I, Spanned<
 	.boxed()
 }
 
-fn struct_pattern<'src, I: TokenInput<'src>, P: NymphParser<'src, I, Spanned<Pattern>>>(
+fn struct_pattern<'src, I: TokenInput<'src>, P: NymphParser<'src, I, Spanned<Pattern>>, M>(
 	pattern: P,
-) -> impl NymphParser<'src, I, Pattern> {
+	make_input: M,
+) -> impl NymphParser<'src, I, Pattern>
+where
+	M: Fn(SimpleSpan, &'src Vec<Spanned<Token>>) -> I + Copy + 'src,
+{
 	let struct_pattern_field = choice((
 		just(Token::DotDotDot).to(StructPatternField::Rest),
-		identifier().map(StructPatternField::Named),
 		identifier()
 			.then_ignore(just(Token::Eq))
 			.then(pattern)
 			.map(|(name, value)| StructPatternField::Value { name, value }),
+		identifier().map(StructPatternField::Named),
 	))
 	.map_with(Spanned::new);
 
 	identifier()
 		.then(
-			struct_pattern_field
-				.separated_by(just(Token::Comma))
-				.allow_trailing()
-				.collect()
-				.delimited_by(just(Token::LParen), just(Token::RParen))
-				.or_not(),
+			parens(
+				struct_pattern_field
+					.separated_by(just(Token::Comma))
+					.allow_trailing()
+					.collect(),
+				make_input,
+			)
+			.or_not(),
 		)
 		.map(|(name, fields)| Pattern::Struct {
 			name,
@@ -2231,7 +2218,7 @@ where
 	M: Fn(SimpleSpan, &'src Vec<Spanned<Token>>) -> I + Copy + 'src,
 {
 	let string_part = select! {
-		Token::StringChar(c) = e => Spanned(StringPatternPart::Char(c), e.span()),
+		Token::StringText(text) = e => Spanned(StringPatternPart::Text(text), e.span()),
 		Token::StringEscape(c) = e => Spanned(StringPatternPart::EscapeSequence(c), e.span()),
 	};
 
@@ -2252,6 +2239,78 @@ fn visibility<'src, I: TokenInput<'src>>() -> impl NymphParser<'src, I, Visibili
 		Token::Private => Visibility::Private,
 	}
 	.labelled("a visibility modifier")
+}
+
+fn parens<'src, I: TokenInput<'src>, O: 'src, P: NymphParser<'src, I, O>, M>(
+	inner: P,
+	make_input: M,
+) -> impl NymphParser<'src, I, O>
+where
+	M: Fn(SimpleSpan, &'src Vec<Spanned<Token>>) -> I + Copy + 'src,
+{
+	inner.nested_in(select_ref! {
+		Token::Parens(toks) = e => make_input(e.span(), toks)
+	})
+}
+
+fn brackets<'src, I: TokenInput<'src>, O: 'src, P: NymphParser<'src, I, O>, M>(
+	inner: P,
+	make_input: M,
+) -> impl NymphParser<'src, I, O>
+where
+	M: Fn(SimpleSpan, &'src Vec<Spanned<Token>>) -> I + Copy + 'src,
+{
+	inner.nested_in(select_ref! {
+		Token::Brackets(toks) = e => make_input(e.span(), toks)
+	})
+}
+
+fn braces<'src, I: TokenInput<'src>, O: 'src, P: NymphParser<'src, I, O>, M>(
+	inner: P,
+	make_input: M,
+) -> impl NymphParser<'src, I, O>
+where
+	M: Fn(SimpleSpan, &'src Vec<Spanned<Token>>) -> I + Copy + 'src,
+{
+	inner.nested_in(select_ref! {
+		Token::Braces(toks) = e => make_input(e.span(), toks)
+	})
+}
+
+fn list_delimiter<'src, I: TokenInput<'src>, O: 'src, P: NymphParser<'src, I, O>, M>(
+	inner: P,
+	make_input: M,
+) -> impl NymphParser<'src, I, O>
+where
+	M: Fn(SimpleSpan, &'src Vec<Spanned<Token>>) -> I + Copy + 'src,
+{
+	inner.nested_in(select_ref! {
+		Token::List(toks) = e => make_input(e.span(), toks)
+	})
+}
+
+fn tuple_delimiter<'src, I: TokenInput<'src>, O: 'src, P: NymphParser<'src, I, O>, M>(
+	inner: P,
+	make_input: M,
+) -> impl NymphParser<'src, I, O>
+where
+	M: Fn(SimpleSpan, &'src Vec<Spanned<Token>>) -> I + Copy + 'src,
+{
+	inner.nested_in(select_ref! {
+		Token::Tuple(toks) = e => make_input(e.span(), toks)
+	})
+}
+
+fn map_delimiter<'src, I: TokenInput<'src>, O: 'src, P: NymphParser<'src, I, O>, M>(
+	inner: P,
+	make_input: M,
+) -> impl NymphParser<'src, I, O>
+where
+	M: Fn(SimpleSpan, &'src Vec<Spanned<Token>>) -> I + Copy + 'src,
+{
+	inner.nested_in(select_ref! {
+		Token::Map(toks) = e => make_input(e.span(), toks)
+	})
 }
 
 pub(crate) fn make_input<'src>(

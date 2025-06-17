@@ -19,5 +19,5 @@ impl Minus<Other = int, Output = float> for float {
 }
 
 impl<T: Plus<Other = T, Output = T> + Negate<Output = T>> Minus<Other = self, Output = self> for T {
-  func minus(other: self) = this + (-other)
+  func minus(other: self) -> this + (-other)
 }

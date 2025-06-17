@@ -5,11 +5,12 @@ use super::{
 	types::{GenericArg, GenericParam, Type},
 };
 use crate::ast::ops::PatternOperator;
+use ecow::EcoString;
 use ordered_float::OrderedFloat;
 use strum::Display;
 
 #[derive(Clone, PartialEq, Debug)]
-pub(crate) enum Statement {
+pub enum Statement {
 	Expr(Spanned<Expr>),
 	Let {
 		meta: LetDeclaration,
@@ -18,7 +19,7 @@ pub(crate) enum Statement {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum Expr {
+pub enum Expr {
 	/// `1`, `0b010001`, `0xDEADF00D`
 	Int(Spanned<u64>),
 	/// `0.1`, 2f`, `6.02e23`
@@ -130,14 +131,14 @@ pub(crate) enum Expr {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum StringPart {
-	Char(char),
+pub enum StringPart {
+	Text(EcoString),
 	EscapeSequence(StringEscape),
 	InterpolatedExpr(Spanned<Expr>),
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Display)]
-pub(crate) enum CharEscape {
+pub enum CharEscape {
 	Backslash,
 	Newline,
 	Carriage,
@@ -160,7 +161,7 @@ impl From<CharEscape> for char {
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Display)]
-pub(crate) enum StringEscape {
+pub enum StringEscape {
 	#[strum(to_string = r"\\")]
 	Backslash,
 	#[strum(to_string = r"\n")]
@@ -178,26 +179,19 @@ pub(crate) enum StringEscape {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum ListItem {
+pub enum ListItem {
 	Expr(Spanned<Expr>),
 	Spread(Spanned<Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum MapEntry {
+pub enum MapEntry {
 	Expr(Spanned<Expr>, Spanned<Expr>),
 	Spread(Spanned<Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) enum StructLiteralField {
-	Named { name: Ident, value: Expr },
-	Shorthand(Ident),
-	Spread(Expr),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum RangeKind {
+pub enum RangeKind {
 	From(Box<Spanned<Expr>>),
 	To(Box<Spanned<Expr>>),
 	Exclusive {
@@ -212,29 +206,29 @@ pub(crate) enum RangeKind {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ClosureParam {
-	pub(crate) name: Spanned<Pattern>,
-	pub(crate) type_: Option<Spanned<Type>>,
-	pub(crate) mutable: bool,
-	pub(crate) spread: bool,
+pub struct ClosureParam {
+	pub name: Spanned<Pattern>,
+	pub type_: Option<Spanned<Type>>,
+	pub mutable: bool,
+	pub spread: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct CallArg {
-	pub(crate) value: Spanned<Expr>,
-	pub(crate) name: Option<Ident>,
-	pub(crate) spread: bool,
+pub struct CallArg {
+	pub value: Spanned<Expr>,
+	pub name: Option<Ident>,
+	pub spread: bool,
 }
 
 #[derive(Clone, PartialEq, Debug)]
-pub(crate) struct MatchArm {
-	pub(crate) pattern: Spanned<Pattern>,
-	pub(crate) guard: Option<Spanned<Expr>>,
-	pub(crate) body: Spanned<Expr>,
+pub struct MatchArm {
+	pub pattern: Spanned<Pattern>,
+	pub guard: Option<Spanned<Expr>>,
+	pub body: Spanned<Expr>,
 }
 
 #[derive(Clone, PartialEq, Debug, Eq, Hash)]
-pub(crate) enum Pattern {
+pub enum Pattern {
 	Int(Spanned<i64>),
 	Float(Spanned<OrderedFloat<f64>>),
 	Char(Spanned<char>),
@@ -258,13 +252,13 @@ pub(crate) enum Pattern {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) enum StringPatternPart {
-	Char(char),
+pub enum StringPatternPart {
+	Text(EcoString),
 	EscapeSequence(StringEscape),
 }
 
 #[derive(PartialEq, Clone, Debug, Eq, Hash)]
-pub(crate) enum RangePatternKind {
+pub enum RangePatternKind {
 	/// `1..`
 	ExclusiveMin(Box<Spanned<Pattern>>),
 	/// `1..3`
@@ -282,7 +276,7 @@ pub(crate) enum RangePatternKind {
 }
 
 #[derive(PartialEq, Clone, Debug, Eq, Hash)]
-pub(crate) enum StructPatternField {
+pub enum StructPatternField {
 	Value {
 		name: Ident,
 		value: Spanned<Pattern>,
@@ -292,13 +286,13 @@ pub(crate) enum StructPatternField {
 }
 
 #[derive(PartialEq, Clone, Debug, Eq, Hash)]
-pub(crate) enum ListPatternEntry {
+pub enum ListPatternEntry {
 	Item(Spanned<Pattern>),
 	Rest(Option<Ident>),
 }
 
 #[derive(PartialEq, Clone, Debug, Eq, Hash)]
-pub(crate) enum MapPatternEntry {
+pub enum MapPatternEntry {
 	Entry(Spanned<Pattern>, Spanned<Pattern>),
 	Rest(Option<Ident>),
 }

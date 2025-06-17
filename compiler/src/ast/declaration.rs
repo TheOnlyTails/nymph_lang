@@ -7,18 +7,18 @@ use crate::ast::{
 };
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct Module {
-	pub(crate) members: Vec<Declaration>,
+pub struct Module {
+	pub members: Vec<Declaration>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Declaration {
+pub enum Declaration {
 	/// An `import` declaration imports an external module into the current module,
 	/// either from inside the project or from a published package.
 	/// An optional `with` clause can be used to only import specific items from the module,
 	/// and make them available without a module qualifier, or under different names.
 	///
-	/// ```
+	/// ```nym
 	/// import std/math
 	/// import std/math with (sin as sine, cos as cosine, tan as tangent)
 	/// ```
@@ -40,7 +40,7 @@ pub(crate) enum Declaration {
 	},
 	ExternalFunc(Option<Visibility>, FuncDeclaration),
 	/// Redefines a type with a new name.
-	/// ```
+	/// ```nym
 	/// type VeryVeryNested = #[#(#{#[int]: #(string, float)}, #[boolean)]
 	/// type TupleList<K, V> = #[#(K, V)]
 	/// ```
@@ -62,7 +62,7 @@ pub(crate) enum Declaration {
 	/// - They are both instances of the same struct.
 	/// - The values of each of their fields are the same.
 	///
-	/// ```
+	/// ```nym
 	/// struct Person(name: string, age: int) {
 	///   let first_name = name.split()[0]
 	///   let last_name = name.split()[1]
@@ -84,7 +84,7 @@ pub(crate) enum Declaration {
 	/// An algebraic sum type, containing multiple named variants,
 	/// each having an associated constructor and fields.
 	///
-	/// ```
+	/// ```nym
 	/// enum Option<T> {
 	///   Some(T),
 	///   None
@@ -117,7 +117,7 @@ pub(crate) enum Declaration {
 	},
 	/// An `impl` block extends a declaration with custom variables, functions, and types.
 	///
-	/// ```
+	/// ```nym
 	/// impl<T> Option<T> {
 	/// 	func maybe_print() -> match (this) {
 	/// 		Option.Some(value) -> io.println(value),
@@ -134,7 +134,7 @@ pub(crate) enum Declaration {
 	},
 	/// An `impl for` block extends a declaration using an interface.
 	/// For example:
-	/// ```
+	/// ```nym
 	/// impl Comparable<Person> for Person {
 	///   func compare(other: Person) -> this.age.compare(other.age)
 	/// }
@@ -150,59 +150,59 @@ pub(crate) enum Declaration {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Visibility {
+pub enum Visibility {
 	Public,
 	Internal,
 	Private,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ImportRoot {
+pub enum ImportRoot {
 	PackageRoot,
 	Current,
 	Parent,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct TypeAliasDeclaration {
-	pub(crate) name: Ident,
-	pub(crate) generics: Vec<Spanned<GenericParam>>,
+pub struct TypeAliasDeclaration {
+	pub name: Ident,
+	pub generics: Vec<Spanned<GenericParam>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct LetDeclaration {
-	pub(crate) mutable: bool,
-	pub(crate) name: Spanned<Pattern>,
-	pub(crate) type_: Option<Spanned<Type>>,
+pub struct LetDeclaration {
+	pub mutable: bool,
+	pub name: Spanned<Pattern>,
+	pub type_: Option<Spanned<Type>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct FuncDeclaration {
-	pub(crate) name: Ident,
-	pub(crate) generics: Vec<Spanned<GenericParam>>,
-	pub(crate) params: Vec<Spanned<FuncParam>>,
-	pub(crate) return_type: Option<Spanned<Type>>,
+pub struct FuncDeclaration {
+	pub name: Ident,
+	pub generics: Vec<Spanned<GenericParam>>,
+	pub params: Vec<Spanned<FuncParam>>,
+	pub return_type: Option<Spanned<Type>>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct FuncParam {
-	pub(crate) name: Spanned<Pattern>,
-	pub(crate) type_: Spanned<Type>,
-	pub(crate) default: Option<Spanned<Expr>>,
-	pub(crate) mutable: bool,
-	pub(crate) spread: bool,
+pub struct FuncParam {
+	pub name: Spanned<Pattern>,
+	pub type_: Spanned<Type>,
+	pub default: Option<Spanned<Expr>>,
+	pub mutable: bool,
+	pub spread: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct StructField {
-	pub(crate) visibility: Option<Visibility>,
-	pub(crate) name: Ident,
-	pub(crate) type_: Spanned<Type>,
-	pub(crate) default: Option<Spanned<Expr>>,
+pub struct StructField {
+	pub visibility: Option<Visibility>,
+	pub name: Ident,
+	pub type_: Spanned<Type>,
+	pub default: Option<Spanned<Expr>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum StructInnerMember {
+pub enum StructInnerMember {
 	Member(Spanned<ImplMember>),
 	Namespace(Vec<Spanned<ImplMember>>),
 	Impl {
@@ -214,7 +214,7 @@ pub(crate) enum StructInnerMember {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum ImplMember {
+pub enum ImplMember {
 	Let {
 		visibility: Option<Visibility>,
 		meta: LetDeclaration,
@@ -230,8 +230,8 @@ pub(crate) enum ImplMember {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum InterfaceMember {
-  Element(Spanned<InterfaceElement>),
+pub enum InterfaceMember {
+	Element(Spanned<InterfaceElement>),
 	Namespace(Vec<Spanned<ImplMember>>),
 	ImplMut(Vec<Spanned<InterfaceElement>>),
 	Impl {
@@ -242,7 +242,7 @@ pub(crate) enum InterfaceMember {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum InterfaceElement {
+pub enum InterfaceElement {
 	Let {
 		meta: LetDeclaration,
 		value: Option<Spanned<Expr>>,
@@ -254,7 +254,7 @@ pub(crate) enum InterfaceElement {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct EnumVariant {
-	pub(crate) name: Ident,
-	pub(crate) fields: Vec<Spanned<StructField>>,
+pub struct EnumVariant {
+	pub name: Ident,
+	pub fields: Vec<Spanned<StructField>>,
 }

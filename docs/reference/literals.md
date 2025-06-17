@@ -55,8 +55,8 @@ Character literals are single characters, enclosed in single quotes.
 They are a single UTF-8 codepoint, and may be entered either directly or using escape sequences.
 
 The only available escape sequences are newline (`\n`), tab (`\t`), carriage return (`\r`),
-apostrophe (`\'`), backslash (`\\`), and the unicode escape (`\uXXXX`).
-Unicode escape sequences always use 4-6 hexadecimal digits, and must represent a valid unicode codepoint.
+apostrophe (`\'`), backslash (`\\`), and the Unicode escape (`\uXXXX`).
+Unicode escape sequences always use 4-6 hexadecimal digits, and must represent a valid Unicode codepoint.
 
 ```nym
 'a' // regular character
@@ -92,7 +92,7 @@ world!" // newline
 ## Identifiers
 
 Identifiers are names for variables, functions, types, and other constructs.
-They are case-sensitive, and may include letters (including some unicode characters), digits, and underscores.
+They are case-sensitive, and may include letters (including some Unicode characters), digits, and underscores.
 They must start with a letter or underscore, and may not be a reserved keyword.
 
 The single underscore `_` is a special identifier,
@@ -125,6 +125,12 @@ and span multiple lines.
 
 Other [Iterators](./stdlib/iter#Iterator) may be spread into a list using the `...` operator,
 so long as the `Item` type of the iterator matches the list type.
+
+> [!NOTE] Array lists vs. Linked lists
+> There are 2 ways to make lists - either use an array and expand its capacity as needed,
+> or have each item in the list store a reference to the next item.
+> Nymph uses array-backed lists for its list literal, but [linked lists](./stdlib/collections-linked_list#LinkedList)
+> are also available from the standard library.
 
 ```nym
 #["apple", "banana", "cherry"]
