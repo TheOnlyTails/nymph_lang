@@ -1,0 +1,73 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "npm: compile - extension",
+			"type": "shell",
+			"command": "npm",
+			"args": ["run", "compile"],
+			"cwd": "${workspaceFolder}/extension",
+			"isBackground": false,
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared",
+				"showReuseMessage": true,
+				"clear": false
+			},
+			"problemMatcher": "$tsc"
+		},
+		{
+			"label": "npm: watch - extension",
+			"type": "shell",
+			"command": "npm",
+			"args": ["run", "watch"],
+			"cwd": "${workspaceFolder}/extension",
+			"isBackground": true,
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared",
+				"showReuseMessage": true,
+				"clear": false
+			},
+			"problemMatcher": "$tsc-watch"
+		},
+		{
+			"label": "Build LSP Server (release)",
+			"type": "shell",
+			"command": "cargo",
+			"args": ["build", "--release", "--package", "nymph-lsp"],
+			"cwd": "${workspaceFolder}",
+			"isBackground": false,
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared",
+				"showReuseMessage": true,
+				"clear": false
+			},
+			"problemMatcher": "$rustc"
+		},
+		{
+			"label": "Build LSP Server (debug)",
+			"type": "shell",
+			"command": "cargo",
+			"args": ["build", "--package", "nymph-lsp"],
+			"cwd": "${workspaceFolder}",
+			"isBackground": false,
+			"presentation": {
+				"echo": true,
+				"reveal": "always",
+				"focus": false,
+				"panel": "shared",
+				"showReuseMessage": true,
+				"clear": false
+			},
+			"problemMatcher": "$rustc"
+		}
+	]
+}

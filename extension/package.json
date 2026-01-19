@@ -1,61 +1,71 @@
 {
-  "name": "nymph",
-  "displayName": "Nymph",
-  "description": "Support for the Nymph programming language",
-  "publisher": "theonlytails",
-  "license": "Apache-2.0",
-  "version": "0.0.1",
-  "engines": {
-    "vscode": "^1.100.0"
-  },
-  "categories": [
-    "Programming Languages"
-  ],
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/theonlytails/nymph_lang.git",
-    "directory": "extension"
-  },
-  "preview": true,
-  "contributes": {
-    "languages": [
-      {
-        "id": "nymph",
-        "aliases": [
-          "Nymph",
-          "nymph"
-        ],
-        "extensions": [
-          ".nym"
-        ],
-        "configuration": "./language-configuration.json"
-      }
-    ],
-    "grammars": [
-      {
-        "language": "nymph",
-        "scopeName": "source.nymph",
-        "path": "./syntaxes/nymph.tmLanguage.json"
-      },
-      {
-        "scopeName": "markdown.nymph.codeblock",
-        "path": "./syntaxes/nymph.codeblock.json",
-        "injectTo": [
-          "text.html.markdown"
-        ],
-        "embeddedLanguages": {
-          "meta.embedded.block.nymph": "nymph"
-        }
-      }
-    ]
-  },
-  "scripts": {
-    "deploy": "vsce publish"
-  },
-  "devDependencies": {
-    "@vscode/vsce": "^3.4.1",
-    "prettier": "catalog:"
-  },
-  "homepage": "https://nymphlang.dev/",
-  "packageManager": "pnpm@10.11.0"
+	"name": "nymph",
+	"displayName": "Nymph",
+	"version": "0.0.1",
+	"description": "Support for the Nymph programming language",
+	"categories": [
+		"Programming Languages"
+	],
+	"homepage": "https://nymphlang.dev/",
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/theonlytails/nymph_lang.git",
+		"directory": "extension"
+	},
+	"publisher": "theonlytails",
+	"main": "./out/extension.js",
+	"scripts": {
+		"vscode:prepublish": "npm run compile",
+		"compile": "tsc -p ./",
+		"watch": "tsc -watch -p ./",
+		"deploy": "vsce publish"
+	},
+	"dependencies": {
+		"vscode-languageclient": "^9.0.1"
+	},
+	"devDependencies": {
+		"@types/node": "^25.0.9",
+		"@types/vscode": "^1.108.1",
+		"@vscode/vsce": "^3.7.1",
+		"typescript": "^5.9.3"
+	},
+	"contributes": {
+		"languages": [
+			{
+				"id": "nymph",
+				"aliases": [
+					"Nymph",
+					"nymph"
+				],
+				"extensions": [
+					".nym",
+					".nymph"
+				],
+				"configuration": "./language-configuration.json"
+			}
+		],
+		"grammars": [
+			{
+				"language": "nymph",
+				"scopeName": "source.nymph",
+				"path": "./syntaxes/nymph.tmLanguage.json"
+			},
+			{
+				"scopeName": "markdown.nymph.codeblock",
+				"path": "./syntaxes/nymph.codeblock.json",
+				"injectTo": [
+					"text.html.markdown"
+				],
+				"embeddedLanguages": {
+					"meta.embedded.block.nymph": "nymph"
+				}
+			}
+		]
+	},
+	"preview": true,
+	"engines": {
+		"vscode": "^1.100.0"
+	},
+	"packageManager": "pnpm@10.28.1"
 }

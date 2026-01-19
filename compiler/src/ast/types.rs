@@ -1,8 +1,6 @@
 use super::{Ident, Spanned};
-use crate::ast::expr::Pattern;
-use std::collections::BTreeSet;
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone, salsa::Update)]
 pub enum Type {
 	// Type declarations
 	/// `int`
@@ -31,104 +29,29 @@ pub enum Type {
 	Tuple(Vec<Spanned<Self>>),
 	/// `#{ A: B }`
 	Map(Box<Spanned<Self>>, Box<Spanned<Self>>),
-	/// `(A, B) -> C`
+	/// `(A, b: B) -> C`
 	Function {
-		params: Vec<Spanned<Self>>,
+		params: Vec<FunctionTypeParam>,
 		return_type: Box<Spanned<Self>>,
 	},
-	/// `A<B>`
+	/// `A<B, C>`
 	Reference {
 		name: Ident,
 		generics: Vec<Spanned<GenericArg>>,
 	},
-	/// `int is 1..=6`, `#[T] is #[_, ...]`
-	Pattern(Box<Spanned<Self>>, Spanned<Pattern>),
-	/// `int !is 0`
-	NotPattern(Box<Spanned<Self>>, Spanned<Pattern>),
 	/// `(A)`
 	Grouped(Box<Spanned<Self>>),
-
-	// Internal types for resolving into
-	Struct {
-		members: BTreeSet<StructTypeMember>,
-		impls: Vec<StructImplId>,
-	},
-	Generic {
-		constraint: Option<Box<Self>>,
-		default: Option<Box<Self>>,
-	},
 }
 
-impl Type {
-	pub(crate) fn simplify(&self) -> Self {
-		match self {
-			Type::Intersection(left, right) => {
-				if left.0 == right.0 {
-					left.0.simplify()
-				} else {
-					Type::Intersection(
-						left.map(Type::simplify).into(),
-						right.map(Type::simplify).into(),
-					)
-				}
-			}
-			Type::List(item) => Type::List(item.map(Type::simplify).into()),
-			Type::Tuple(members) => {
-				Type::Tuple(members.iter().map(|it| it.map(Type::simplify)).collect())
-			}
-			Type::Map(key, value) => Type::Map(
-				key.map(Type::simplify).into(),
-				value.map(Type::simplify).into(),
-			),
-			Type::Function {
-				params,
-				return_type,
-			} => Type::Function {
-				params: params.iter().map(|p| p.map(Type::simplify)).collect(),
-				return_type: return_type.map(Type::simplify).into(),
-			},
-			Type::Generic {
-				constraint,
-				default,
-			} => Type::Generic {
-				constraint: constraint.as_ref().map(|it| it.simplify().into()),
-				default: default.as_ref().map(|it| it.simplify().into()),
-			},
-			Type::Grouped(value) => value.0.simplify(),
-			_ => self.clone(),
-		}
-	}
+pub type FunctionTypeParam = (Option<Ident>, Spanned<Type>);
 
-	pub(crate) fn assignable_to(&self, to: &Type) -> bool {
-		match (self, to) {
-			(a, b) if a == b => true,
-			(Type::Int, Type::Float) | (_, Type::Infer) => true,
-			(Type::Grouped(a), b) => a.0.assignable_to(b),
-			(a, Type::Grouped(b)) => a.assignable_to(&b.0),
-			(Type::Generic { constraint, .. }, other) => constraint
-				.as_ref()
-				.map(|it| it.assignable_to(other))
-				.unwrap_or(false),
-			_ => false,
-		}
-	}
-}
-
-pub(crate) type StructTypeMember = (Ident, Type);
-
-#[derive(Debug, PartialEq, Hash, Clone, Eq)]
-pub(crate) struct StructImplId {
-	name: Ident,
-	generics: Vec<GenericArg>,
-}
-
-#[derive(Debug, PartialEq, Hash, Clone, Eq)]
+#[derive(Debug, PartialEq, Hash, Clone, Eq, salsa::Update)]
 pub struct GenericArg {
 	pub value: Spanned<Type>,
 	pub name: Option<Ident>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, salsa::Update)]
 pub struct GenericParam {
 	pub name: Ident,
 	pub constraint: Option<Spanned<Type>>,

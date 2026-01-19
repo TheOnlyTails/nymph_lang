@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use ecow::EcoString;
 
 use crate::ast::{
 	Ident, Spanned,
@@ -6,12 +6,13 @@ use crate::ast::{
 	types::{GenericArg, GenericParam, Type},
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, salsa::Update)]
 pub struct Module {
 	pub members: Vec<Declaration>,
+	pub path: EcoString,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, salsa::Update)]
 pub enum Declaration {
 	/// An `import` declaration imports an external module into the current module,
 	/// either from inside the project or from a published package.
@@ -25,7 +26,7 @@ pub enum Declaration {
 	Import {
 		root: ImportRoot,
 		path: Vec<Ident>,
-		idents: Option<HashMap<Ident, Option<Ident>>>,
+		idents: Option<Vec<(Ident, Option<Ident>)>>,
 	},
 	Let {
 		visibility: Option<Visibility>,
@@ -86,11 +87,11 @@ pub enum Declaration {
 	///
 	/// ```nym
 	/// enum Option<T> {
-	///   Some(T),
+	///   Some(value: T),
 	///   None
 	///
-	///   func map<R>(f: (T) -> R) -> match this {
-	///     Some(it) -> Some(f(it)),
+	///   func map<R>(f: (T) -> R) -> match (this) {
+	///     Some(value) -> Some(f(value)),
 	///     None -> None
 	///   }
 	/// }
@@ -109,7 +110,6 @@ pub enum Declaration {
 	},
 	Interface {
 		visibility: Option<Visibility>,
-		mutable: bool,
 		name: Ident,
 		generics: Vec<Spanned<GenericParam>>,
 		super_interfaces: Vec<Spanned<(Ident, Vec<Spanned<GenericArg>>)>>,
@@ -119,10 +119,10 @@ pub enum Declaration {
 	///
 	/// ```nym
 	/// impl<T> Option<T> {
-	/// 	func maybe_print() -> match (this) {
-	/// 		Option.Some(value) -> io.println(value),
-	/// 		Option.None -> {}
-	/// 	}
+	///   func maybe_print() -> match (this) {
+	///     Some(value) -> io.println(value),
+	///     None -> {}
+	///   }
 	/// }
 	/// ```
 	Impl {
@@ -149,34 +149,35 @@ pub enum Declaration {
 	},
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Copy, Eq, Clone, PartialEq, Hash, salsa::Update)]
 pub enum Visibility {
 	Public,
 	Internal,
 	Private,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update)]
 pub enum ImportRoot {
-	PackageRoot,
+	Package(Ident),
+	Project,
 	Current,
 	Parent,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, salsa::Update)]
 pub struct TypeAliasDeclaration {
 	pub name: Ident,
 	pub generics: Vec<Spanned<GenericParam>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, salsa::Update)]
 pub struct LetDeclaration {
 	pub mutable: bool,
 	pub name: Spanned<Pattern>,
 	pub type_: Option<Spanned<Type>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, salsa::Update)]
 pub struct FuncDeclaration {
 	pub name: Ident,
 	pub generics: Vec<Spanned<GenericParam>>,
@@ -184,16 +185,15 @@ pub struct FuncDeclaration {
 	pub return_type: Option<Spanned<Type>>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, salsa::Update)]
 pub struct FuncParam {
 	pub name: Spanned<Pattern>,
 	pub type_: Spanned<Type>,
-	pub default: Option<Spanned<Expr>>,
 	pub mutable: bool,
 	pub spread: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, salsa::Update)]
 pub struct StructField {
 	pub visibility: Option<Visibility>,
 	pub name: Ident,
@@ -201,9 +201,9 @@ pub struct StructField {
 	pub default: Option<Spanned<Expr>>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, salsa::Update)]
 pub enum StructInnerMember {
-	Member(Spanned<ImplMember>),
+	Member(Box<Spanned<ImplMember>>),
 	Namespace(Vec<Spanned<ImplMember>>),
 	Impl {
 		interface: (Ident, Vec<Spanned<GenericArg>>),
@@ -213,7 +213,7 @@ pub enum StructInnerMember {
 	ImplMut(Vec<Spanned<ImplMember>>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, salsa::Update)]
 pub enum ImplMember {
 	Let {
 		visibility: Option<Visibility>,
@@ -229,9 +229,9 @@ pub enum ImplMember {
 	ExternalFunc(Option<Visibility>, FuncDeclaration),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, salsa::Update)]
 pub enum InterfaceMember {
-	Element(Spanned<InterfaceElement>),
+	Element(Box<Spanned<InterfaceElement>>),
 	Namespace(Vec<Spanned<ImplMember>>),
 	ImplMut(Vec<Spanned<InterfaceElement>>),
 	Impl {
@@ -241,7 +241,7 @@ pub enum InterfaceMember {
 	},
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, salsa::Update)]
 pub enum InterfaceElement {
 	Let {
 		meta: LetDeclaration,
@@ -253,7 +253,7 @@ pub enum InterfaceElement {
 	},
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, salsa::Update)]
 pub struct EnumVariant {
 	pub name: Ident,
 	pub fields: Vec<Spanned<StructField>>,

@@ -8,8 +8,8 @@ use crate::ast::{
 	expr::{CharEscape, StringEscape},
 };
 
-#[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub(crate) enum Token {
+#[derive(Clone, PartialEq, Eq, Debug, Hash, salsa::Update)]
+pub enum Token {
 	/// `0b1101001`
 	BinaryInt(u64),
 	/// `0o7165341`

@@ -8,35 +8,35 @@ public let e = 2.71828182845904523536
 public let phi = 1.61803398874989484820
 
 /// Returns the distance of the input from 0, which is the value without its sign.
-public func abs(x: int): int is 0.. -> if (x > 0) x else -x
+public func abs(x: int): int -> if (x > 0) x else -x
 /// Returns the distance of the input from 0, which is the value without its sign.
-public func abs(x: float): float is 0f.. -> if (x > 0) x else -x
+public func abs(x: float): float -> if (x > 0) x else -x
 
 /// Returns the sine of the input (in radians).
 /// Given a right triangle ABC and angle A as the input,
 /// the output of the function would be the ratio between the side opposite the angle
 /// to the hypotenuse of the triangle.
-public external func sin(x: float): float is -1f..=1f
+public external func sin(x: float): float
 
 /// Returns the cosine of the input (in radians).
 /// Given a right triangle ABC and angle A as the input,
 /// the output of the function would be the ratio between the side adjecent to the angle
 /// to the hypotenuse of the triangle.
-public func cos(x: float) -> sin(x + pi / 2)
+public external func cos(x: float): float
 
 /// Returns the tangent of the input (in radians).
 /// Given a right triangle ABC and angle A as the input,
 /// the output of the function would be the ratio between the side opposite to the angle
 /// to the side adjecent to the angle.
-public func tan(x: float) -> sin(x) / cos(x)
+public external func tan(x: float): float
 
-public external func asin(x: float): float is -1.57079633..=1.57079633
-public external func acos(x: float): float is 0f..=3.1415926535
-public external func atan(x: float): float is -1.57079633..=1.57079633
+public external func asin(x: float): float
+public external func acos(x: float): float
+public external func atan(x: float): float
 
 public external func sinh(x: float): float
 public external func cosh(x: float): float
-public external func tanh(x: float): float is -1f..=1f
+public external func tanh(x: float): float
 
 public external func asinh(x: float): float
 public external func acosh(x: float): float
@@ -44,12 +44,12 @@ public external func atanh(x: float): float
 
 public external func atan2(y: float, x: float): float
 
-public func sign(x: int): int is 0 | 1 | -1 -> match (x) {
+public func sign(x: int): int -> match (x) {
   0 -> 0,
   1.. -> 1,
   ..=-1 -> -1,
 }
-public func sign(x: float): int is 0 | 1 | -1 -> match (x) {
+public func sign(x: float): int -> match (x) {
   0 -> 0,
   1.. -> 1,
   ..=-1 -> -1,
@@ -61,7 +61,9 @@ public external func round(x: float): int
 public func midpoint(x: int, y: int) -> (x + y) / 2
 public func midpoint(x: float, y: float) -> (x + y) / 2
 
-public external let max_int: int is 9.0071993e15
-public external let min_int: int is -9.0071993e15
+public func sqrt(x: float) -> x ** 0.5
+
+public let max_int = 2 ** 63 - 1
+public let min_int = -2 ** 63
 public external let max_float: float
 public external let min_float: float

@@ -33,7 +33,3 @@ impl<T> Default for #[T] {
 impl<K, V> Default for #{K: V} {
   func default() -> #{}
 }
-
-impl<T> Default for Option<T> {
-  func default() -> None
-}

@@ -1,0 +1,16 @@
+{
+	"name": "nymph_lang_monorepo",
+	"version": "1.0.0",
+	"private": true,
+	"description": "",
+	"scripts": {
+		"format": "oxfmt",
+		"lint": "oxlint --type-aware --type-check"
+	},
+	"devDependencies": {
+		"oxfmt": "catalog:",
+		"oxlint": "catalog:",
+		"oxlint-tsgolint": "catalog:"
+	},
+	"packageManager": "pnpm@10.28.1"
+}

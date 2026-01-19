@@ -46,10 +46,7 @@ command = ["cargo", "test"]
 need_stdout = true
 
 [jobs.nextest]
-command = [
-    "cargo", "nextest", "run",
-    "--hide-progress-bar", "--failure-output", "final"
-]
+command = ["cargo", "nextest", "run", "--hide-progress-bar", "--failure-output", "final"]
 need_stdout = true
 analyzer = "nextest"
 
@@ -68,8 +65,9 @@ on_success = "back" # so that we don't open the browser at each change
 # if it makes sense for this crate.
 [jobs.run]
 command = [
-    "cargo", "run",
-    # put launch parameters for your program behind a `--` separator
+	"cargo",
+	"run",
+	# put launch parameters for your program behind a `--` separator
 ]
 need_stdout = true
 allow_warnings = true
@@ -87,8 +85,9 @@ background = true
 # long running programs (uncomment it if you need it)
 [jobs.run-long]
 command = [
-    "cargo", "run",
-    # put launch parameters for your program behind a `--` separator
+	"cargo",
+	"run",
+	# put launch parameters for your program behind a `--` separator
 ]
 need_stdout = true
 allow_warnings = true

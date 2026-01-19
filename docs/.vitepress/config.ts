@@ -47,7 +47,7 @@ export default defineConfig({
 					{ text: "Types", link: "/types/" },
 					{ text: "Standard Library", link: "/stdlib/" },
 				],
-			}
+			},
 		],
 
 		socialLinks: [{ icon: "github", link: "https://github.com/theonlytails/nymph_lang" }],

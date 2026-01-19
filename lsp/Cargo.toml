@@ -1,0 +1,34 @@
+[package]
+name = "nymph-lsp"
+description = "Language Server Protocol implementation for Nymph"
+version = "0.1.0"
+edition = "2024"
+homepage = "https://nymphlang.dev/"
+repository = "https://github.com/theonlytails/nymph_lang"
+license = "Apache-2.0"
+authors = ["Shachar Zidon <theonlytails@theonlytails.com>"]
+keywords = ["language-server", "lsp", "nymph"]
+categories = ["development-tools", "parser-implementations"]
+
+[[bin]]
+name = "nymph-lsp"
+path = "src/main.rs"
+
+[dependencies]
+nymph-compiler = { path = "../compiler" }
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tower-lsp = "0.20.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+thiserror = "2.0.18"
+itertools = { workspace = true }
+ecow = "0.2.6"
+url = "2.5.8"
+chumsky = "0.12.0"
+ariadne = "0.6.0"
+
+[dev-dependencies]
+tempfile = "3.24.0"

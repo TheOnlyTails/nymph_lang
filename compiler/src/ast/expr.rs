@@ -9,7 +9,7 @@ use ecow::EcoString;
 use ordered_float::OrderedFloat;
 use strum::Display;
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, salsa::Update)]
 pub enum Statement {
 	Expr(Spanned<Expr>),
 	Let {
@@ -18,7 +18,7 @@ pub enum Statement {
 	},
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, salsa::Update)]
 pub enum Expr {
 	/// `1`, `0b010001`, `0xDEADF00D`
 	Int(Spanned<u64>),
@@ -130,14 +130,14 @@ pub enum Expr {
 	Grouped(Box<Spanned<Self>>),
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, salsa::Update)]
 pub enum StringPart {
 	Text(EcoString),
 	EscapeSequence(StringEscape),
 	InterpolatedExpr(Spanned<Expr>),
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Display)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Display, salsa::Update)]
 pub enum CharEscape {
 	Backslash,
 	Newline,
@@ -160,7 +160,7 @@ impl From<CharEscape> for char {
 	}
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Display)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Display, salsa::Update)]
 pub enum StringEscape {
 	#[strum(to_string = r"\\")]
 	Backslash,
@@ -178,19 +178,19 @@ pub enum StringEscape {
 	Unicode(char),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, salsa::Update)]
 pub enum ListItem {
 	Expr(Spanned<Expr>),
 	Spread(Spanned<Expr>),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, salsa::Update)]
 pub enum MapEntry {
 	Expr(Spanned<Expr>, Spanned<Expr>),
 	Spread(Spanned<Expr>),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, salsa::Update)]
 pub enum RangeKind {
 	From(Box<Spanned<Expr>>),
 	To(Box<Spanned<Expr>>),
@@ -205,7 +205,7 @@ pub enum RangeKind {
 	},
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, salsa::Update)]
 pub struct ClosureParam {
 	pub name: Spanned<Pattern>,
 	pub type_: Option<Spanned<Type>>,
@@ -213,21 +213,21 @@ pub struct ClosureParam {
 	pub spread: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, salsa::Update)]
 pub struct CallArg {
 	pub value: Spanned<Expr>,
 	pub name: Option<Ident>,
 	pub spread: bool,
 }
 
-#[derive(Clone, PartialEq, Debug)]
+#[derive(Clone, PartialEq, Debug, salsa::Update)]
 pub struct MatchArm {
 	pub pattern: Spanned<Pattern>,
 	pub guard: Option<Spanned<Expr>>,
 	pub body: Spanned<Expr>,
 }
 
-#[derive(Clone, PartialEq, Debug, Eq, Hash)]
+#[derive(Clone, PartialEq, Debug, Eq, Hash, salsa::Update)]
 pub enum Pattern {
 	Int(Spanned<i64>),
 	Float(Spanned<OrderedFloat<f64>>),
@@ -243,7 +243,7 @@ pub enum Pattern {
 	Map(Vec<Spanned<MapPatternEntry>>),
 	Range(RangePatternKind),
 	Struct {
-		name: Ident,
+		path: Vec<Ident>,
 		fields: Vec<Spanned<StructPatternField>>,
 	},
 	Placeholder,
@@ -251,13 +251,48 @@ pub enum Pattern {
 	Grouped(Box<Spanned<Self>>),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+impl Pattern {
+	/// Extract the main identifier from a pattern, if it's a simple binding
+	pub fn as_binding(&self) -> Option<&Ident> {
+		match self {
+			Pattern::Binding { name, inner: _ } => Some(name),
+			_ => None,
+		}
+	}
+	pub(crate) fn is_constant(&self) -> bool {
+		match self {
+			Pattern::Int(_)
+			| Pattern::Float(_)
+			| Pattern::Char(_)
+			| Pattern::String(_)
+			| Pattern::Boolean(_) => true,
+			Self::Range(_) | Self::Placeholder => false,
+			Self::Binding { inner, .. } => inner.0.is_constant(),
+			Self::List(items) | Self::Tuple(items) => items.iter().all(|it| match &it.0 {
+				ListPatternEntry::Item(pat) => pat.0.is_constant(),
+				ListPatternEntry::Rest(_) => false,
+			}),
+			Self::Map(items) => items.iter().all(|it| match &it.0 {
+				MapPatternEntry::Entry(key, value) => key.0.is_constant() && value.0.is_constant(),
+				MapPatternEntry::Rest(_) => false,
+			}),
+			Self::Struct { fields, .. } => fields.iter().all(|field| match &field.0 {
+				StructPatternField::Value { name: _, value } => value.0.is_constant(),
+				StructPatternField::Named(_) | StructPatternField::Rest => false,
+			}),
+			Self::Union(first, second) => first.0.is_constant() && second.0.is_constant(),
+			Self::Grouped(inner) => inner.0.is_constant(),
+		}
+	}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update)]
 pub enum StringPatternPart {
 	Text(EcoString),
 	EscapeSequence(StringEscape),
 }
 
-#[derive(PartialEq, Clone, Debug, Eq, Hash)]
+#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::Update)]
 pub enum RangePatternKind {
 	/// `1..`
 	ExclusiveMin(Box<Spanned<Pattern>>),
@@ -275,7 +310,7 @@ pub enum RangePatternKind {
 	},
 }
 
-#[derive(PartialEq, Clone, Debug, Eq, Hash)]
+#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::Update)]
 pub enum StructPatternField {
 	Value {
 		name: Ident,
@@ -285,13 +320,13 @@ pub enum StructPatternField {
 	Rest,
 }
 
-#[derive(PartialEq, Clone, Debug, Eq, Hash)]
+#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::Update)]
 pub enum ListPatternEntry {
 	Item(Spanned<Pattern>),
 	Rest(Option<Ident>),
 }
 
-#[derive(PartialEq, Clone, Debug, Eq, Hash)]
+#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::Update)]
 pub enum MapPatternEntry {
 	Entry(Spanned<Pattern>, Spanned<Pattern>),
 	Rest(Option<Ident>),

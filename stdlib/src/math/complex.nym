@@ -1,9 +1,14 @@
-import stdlib/math with (sqrt)
+import @/math
+import @/ops/plus with (Plus)
+import @/ops/minus with (Minus)
+import @/ops/times with (Times)
+import @/ops/divide with (Divide)
+import @/ops/negate with (Negate)
 
 public struct Complex(real: float, imaginary: float) {
   func conjugate() -> Complex(real = real, imaginary = -imaginary)
 
-  func abs() -> sqrt(real ** 2 + imaginary ** 2)
+  func abs() -> math.sqrt(real ** 2 + imaginary ** 2)
 
   impl Plus<Other = Complex, Output = Complex> {
     func plus(other: Complex) -> Complex(

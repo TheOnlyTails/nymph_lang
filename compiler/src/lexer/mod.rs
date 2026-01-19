@@ -62,7 +62,9 @@ fn int_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
 	.then(
 		comment_lexer().to(String::new()).or(
 			any()
-				.filter(|&c: &char| c.is_alphabetic() || c == '_' || c.is_digit(10) || c == '-' || c == '+')
+				.filter(|&c: &char| {
+					c.is_alphabetic() || c == '_' || c.is_ascii_digit() || c == '-' || c == '+'
+				})
 				.repeated()
 				.collect::<String>(),
 		),
@@ -80,7 +82,7 @@ fn int_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
 						span,
 						"Found invalid digit separators in integer literal",
 					));
-					Spanned(Token::Error, span)
+					Spanned(Token::Error, span.into())
 				}
 
 				(Token::BinaryInt(_) | Token::DecimalInt(0), invalid_digits)
@@ -89,7 +91,7 @@ fn int_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
 						.is_match(invalid_digits) =>
 				{
 					emitter.emit(Rich::custom(span, "Found invalid digit in binary integer"));
-					Spanned(Token::Error, span)
+					Spanned(Token::Error, span.into())
 				}
 
 				(Token::OctalInt(_) | Token::DecimalInt(0), invalid_digits)
@@ -98,7 +100,7 @@ fn int_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
 						.is_match(invalid_digits) =>
 				{
 					emitter.emit(Rich::custom(span, "Found invalid digit in octal integer"));
-					Spanned(Token::Error, span)
+					Spanned(Token::Error, span.into())
 				}
 
 				(Token::HexInt(_) | Token::DecimalInt(0), invalid_digits)
@@ -110,35 +112,35 @@ fn int_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
 						span,
 						"Found invalid digit in hexadecimal integer",
 					));
-					Spanned(Token::Error, span)
+					Spanned(Token::Error, span.into())
 				}
 
 				(Token::DecimalInt(_), "e" | "E" | "e-" | "E-" | "e+" | "E+") => {
 					emitter.emit(Rich::custom(span, "Found start of exponent, but no digits"));
-					Spanned(Token::Error, span)
+					Spanned(Token::Error, span.into())
 				}
 				(_, exp) if Regex::new(r"[eE][-+]?\d?(_?\d)*").unwrap().is_match(exp) => {
 					emitter.emit(Rich::custom(span, "Found exponent on non-decimal integer"));
-					Spanned(Token::Error, span)
+					Spanned(Token::Error, span.into())
 				}
 				(Token::DecimalInt(0), "b" | "B") => {
 					emitter.emit(Rich::custom(span, "Found binary suffix without digits"));
-					Spanned(Token::Error, span)
+					Spanned(Token::Error, span.into())
 				}
 				(Token::DecimalInt(0), "x" | "X") => {
 					emitter.emit(Rich::custom(
 						span,
 						"Found hexadecimal suffix without digits",
 					));
-					Spanned(Token::Error, span)
+					Spanned(Token::Error, span.into())
 				}
 				(Token::DecimalInt(0), "o" | "O") => {
 					emitter.emit(Rich::custom(span, "Found octal suffix without digits"));
-					Spanned(Token::Error, span)
+					Spanned(Token::Error, span.into())
 				}
 				_ => {
 					emitter.emit(Rich::custom(span, "Found unexpected character"));
-					Spanned(Token::Error, span)
+					Spanned(Token::Error, span.into())
 				}
 			}
 		},
@@ -196,7 +198,9 @@ fn float_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
 	.then(
 		comment_lexer().to(String::new()).or(
 			any()
-				.filter(|&c: &char| c.is_alphabetic() || c == '_' || c.is_digit(10) || c == '-' || c == '+')
+				.filter(|&c: &char| {
+					c.is_alphabetic() || c == '_' || c.is_ascii_digit() || c == '-' || c == '+'
+				})
 				.repeated()
 				.collect::<String>(),
 		),
@@ -213,19 +217,19 @@ fn float_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
 					e.span(),
 					"Found invalid digit separators in float literal",
 				));
-				Spanned(Token::Error, span)
+				Spanned(Token::Error, span.into())
 			}
 
 			(Token::IntFloat(_), exp) if Regex::new(r"[eE][-+]?\d?(_?\d)*").unwrap().is_match(exp) => {
 				emitter.emit(Rich::custom(e.span(), "Found exponent on integer float"));
-				Spanned(Token::Error, span)
+				Spanned(Token::Error, span.into())
 			}
 			(_, "e" | "E" | "e-" | "E-" | "e+" | "E+") => {
 				emitter.emit(Rich::custom(
 					e.span(),
 					"Found start of exponent, but no digits",
 				));
-				Spanned(Token::Error, span)
+				Spanned(Token::Error, span.into())
 			}
 
 			(Token::IntFloat(_), suffix) => {
@@ -233,7 +237,7 @@ fn float_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
 					e.span(),
 					format!("Found invalid suffix for an integer: {suffix:?}"),
 				));
-				Spanned(Token::Error, span)
+				Spanned(Token::Error, span.into())
 			}
 
 			(_, c) => {
@@ -241,7 +245,7 @@ fn float_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
 					e.span(),
 					format!("Found unexpected character: {c:?}"),
 				));
-				Spanned(Token::Error, span)
+				Spanned(Token::Error, span.into())
 			}
 		}
 	})
@@ -359,7 +363,7 @@ fn string_lexer<'src, T: Lexer<'src, Spanned<Token>>>(
 		.repeated()
 		.collect()
 		.delimited_by(just('"'), just('"'))
-		.map_with(|toks, e| Spanned(Token::String(toks), e.span()))
+		.map_with(|toks, e| Spanned(Token::String(toks), e.span().into()))
 		.labelled("string literal")
 		.as_context()
 		.boxed()

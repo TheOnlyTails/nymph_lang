@@ -82,7 +82,7 @@ They are UTF-8 encoded, and may include unescaped newlines.
 ```nym
 "Hello, world!" // regular string
 "Hello, \"world!\"" // escaped double quotes
-"Hello, 
+"Hello,
 world!" // newline
 "Hello, \nworld!" // escaped newline
 "Hello, ${name}!" // interpolated expression

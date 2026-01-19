@@ -1,5 +1,3 @@
-import stdlib/math with (round)
-
 interface Into<Other> {
   func into() -> Other
 }

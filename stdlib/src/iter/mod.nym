@@ -1,3 +1,5 @@
+import @/option with (Option)
+
 /// An iterator is a structure that allows you to iterate over a collection of items.
 /// It provides a way to access each item in the collection one at a time, without exposing the underlying structure of the collection.
 /// 
@@ -105,11 +107,13 @@ public struct Filter<Item>(
   predicate: (Item) -> boolean,
 ) {
   impl Iterator<Item> {
-    func next() -> match (this.iter.next()) {
-      Some(value) if this.predicate(value) -> Some(value),
-      Some(...) -> this.next(),
-      None -> None
-    }
+    func next() -> this.iter
+      .next()
+      .map((value) -> 
+        if (this.predicate(value)) Some(value)
+        else this.next()
+      )
+      .flatten()
   }
 }
 
@@ -119,8 +123,8 @@ public struct Zip<Item1, Item2>(
 ) {
   impl Iterator<#(Item1, Item2)> {
     func next() -> match (#(this.iter1.next(), this.iter2.next())) {
-      #(Some(value1), Some(value2)) -> Some(#(value1, value2)),
-      _ -> None
+      #(Some(value1), Some(value2)) -> Option.Some(#(value1, value2)),
+      _ -> Option.None
     }
   }
 }
@@ -131,7 +135,7 @@ public struct Chain<Item>(
 ) {
   impl Iterator<Item> {
     func next() -> match (this.iter1.next()) {
-      Some(value) -> Some(value),
+      Some(value) -> Option.Some(value),
       None -> this.iter2.next()
     }
   }
@@ -143,7 +147,7 @@ public struct Cycle<Item>(
 ) {
   impl Iterator<Item> {
     func next() -> match (this.iter.next()) {
-      Some(value) -> Some(value),
+      Some(value) -> Option.Some(value),
       None -> {
         this.iter = this.original
         this.iter.next()
@@ -157,22 +161,17 @@ public struct Indexed<Item>(
   count: int
 ) {
   impl Iterator<#(Item, int)> {
-    func next() -> {
-      match (this.iter.next()) {
-        Some(value) -> {
-          let count = this.count
-          this.count += 1
-          return #(value, count)
-        },
-        None -> None
-      }
-    }
+    func next() -> this.iter.next().map((value) -> {
+      let count = this.count
+      this.count += 1
+      return #(value, count)
+    })
   }
 }
 
 public struct Repeat<Item>(value: Item) {
   impl Iterator<Item> {
-    func next() -> Some(value)
+    func next() -> Option.Some(value)
   }
 }
 
@@ -184,7 +183,7 @@ public struct Take<Item>(
     func next() -> if (amount > 0) {
       this.amount -= 1
       this.iter.next()
-    } else None
+    } else Option.None
   }
 }
 
@@ -195,13 +194,13 @@ public struct TakeWhile<Item>(
 ) {
   impl Iterator<Item> {
     func next() -> if (!stop) match (this.iter.next()) {
-      Some(value) if this.predicate(value) -> Some(value),
+      Some(value) if this.predicate(value) -> Option.Some(value),
       Some(...) -> {
         this.stop = true
-        None
+        Option.None
       },
-      None -> None
-    } else None
+      None -> Option.None
+    } else Option.None
   }
 }
 

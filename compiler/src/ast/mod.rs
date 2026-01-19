@@ -8,25 +8,77 @@ use chumsky::{
 use ecow::EcoString;
 
 pub mod declaration;
+pub mod display;
 pub mod expr;
 pub mod ops;
 pub mod types;
 
 pub type Ident = Spanned<EcoString>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Spanned<T>(pub(crate) T, pub(crate) SimpleSpan);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::Update)]
+pub struct Span {
+	pub start: usize,
+	pub end: usize,
+}
+
+impl Span {
+	pub fn new(start: usize, end: usize) -> Self {
+		Self { start, end }
+	}
+}
+
+impl From<SimpleSpan> for Span {
+	fn from(span: SimpleSpan) -> Self {
+		Self {
+			start: span.start,
+			end: span.end,
+		}
+	}
+}
+
+impl From<std::ops::Range<usize>> for Span {
+	fn from(range: std::ops::Range<usize>) -> Self {
+		Self {
+			start: range.start,
+			end: range.end,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::Update)]
+pub struct Spanned<T>(pub(crate) T, pub(crate) Span);
 
 impl<T> Spanned<T> {
 	pub(crate) fn new<'src, I: Input<'src, Span = SimpleSpan>, E: ParserExtra<'src, I>>(
 		value: T,
 		e: &mut MapExtra<'src, '_, I, E>,
 	) -> Self {
-		Self(value, e.span())
+		Self(value, e.span().into())
 	}
 
+	#[allow(dead_code)]
 	fn map<R, F: Fn(&T) -> R>(&self, f: F) -> Spanned<R> {
 		Spanned(f(&self.0), self.1)
+	}
+
+	/// Get the inner value
+	pub fn inner(&self) -> &T {
+		&self.0
+	}
+
+	/// Get the span (start and end offsets)
+	pub fn span(&self) -> Span {
+		self.1
+	}
+
+	/// Get start offset
+	pub fn start(&self) -> usize {
+		self.1.start
+	}
+
+	/// Get end offset
+	pub fn end(&self) -> usize {
+		self.1.end
 	}
 }
 
@@ -41,12 +93,12 @@ pub(crate) trait SpannedExt
 where
 	Self: Sized,
 {
-	fn spanned<S: Into<SimpleSpan>>(self, range: S) -> Spanned<Self>;
+	fn spanned<S: Into<Span>>(self, range: S) -> Spanned<Self>;
 }
 
 #[cfg(test)]
 impl<T> SpannedExt for T {
-	fn spanned<S: Into<SimpleSpan>>(self, range: S) -> Spanned<Self> {
+	fn spanned<S: Into<Span>>(self, range: S) -> Spanned<Self> {
 		Spanned(self, range.into())
 	}
 }

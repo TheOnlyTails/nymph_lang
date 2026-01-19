@@ -12,14 +12,15 @@ categories = ["compilers", "command-line-utilities", "parser-implementations"]
 
 [dependencies]
 anyhow = { workspace = true }
-clap = { version = "4.5.38", features = ["derive", "cargo"] }
+clap = { version = "4.5.56", features = ["derive", "cargo"] }
+ecow = "0.2.6"
 itertools = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-reedline = "0.40.0"
+reedline = "0.45.0"
 nymph-compiler = { path = "../compiler" }
-ariadne = "0.5.1"
+ariadne = "0.6.0"
 rayon = { workspace = true }
 
 [[bin]]

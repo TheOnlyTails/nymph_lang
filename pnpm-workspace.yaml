@@ -3,4 +3,10 @@ packages:
   - extension
 
 catalog:
-  prettier: "^3.5.3"
+  oxfmt: ^0.26.0
+  oxlint: ^1.41.0
+  oxlint-tsgolint: ^0.11.1
+  prettier: ^3.5.3
+
+onlyBuiltDependencies:
+  - '@vscode/vsce-sign'

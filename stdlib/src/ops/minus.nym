@@ -1,3 +1,6 @@
+import @/ops/plus with (Plus)
+import @/ops/negate with (Negate)
+
 interface Minus<Other, Output> {
   func minus(other: Other): Output
 }
