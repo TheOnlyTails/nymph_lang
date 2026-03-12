@@ -925,39 +925,6 @@ fn find_symbol_in_expr(
 			find_symbol_in_expr(body.inner(), offset, doc, ctx)
 		}
 
-		// For loop - check loop variable
-		Expr::For {
-			variable,
-			iterable,
-			body,
-			..
-		} => {
-			if let Some(name_ident) = variable.inner().as_binding()
-				&& offset_in_span(offset, name_ident.start(), name_ident.end())
-			{
-				let iter_type = infer_expr_type(iterable.inner())
-					.map(|t| {
-						// Try to extract element type from list type
-						if t.starts_with("#[") && t.ends_with("]") {
-							t[2..t.len() - 1].to_string()
-						} else {
-							"_".to_string()
-						}
-					})
-					.unwrap_or_else(|| "_".to_string());
-				return Some(make_symbol_at_location(
-					name_ident.inner(),
-					SymbolKind::Variable,
-					Some(format!("for {}: {}", name_ident.inner(), iter_type)),
-					name_ident.start(),
-					name_ident.end(),
-					doc,
-				));
-			}
-			find_symbol_in_expr(iterable.inner(), offset, doc, ctx)
-				.or_else(|| find_symbol_in_expr(body.inner(), offset, doc, ctx))
-		}
-
 		// Match - check pattern bindings in arms
 		Expr::Match { value, arms } => {
 			if let Some(sym) = find_symbol_in_expr(value.inner(), offset, doc, ctx) {
@@ -989,6 +956,29 @@ fn find_symbol_in_expr(
 			condition, body, ..
 		} => find_symbol_in_expr(condition.inner(), offset, doc, ctx)
 			.or_else(|| find_symbol_in_expr(body.inner(), offset, doc, ctx)),
+
+		Expr::For {
+			variable,
+			iterable,
+			body,
+			..
+		} => {
+			if let Some(binding) = variable.inner().as_binding()
+				&& offset_in_span(offset, binding.start(), binding.end())
+			{
+				let type_info = infer_expr_type(iterable.inner()).map(|t| format!("element of {}", t));
+				return Some(make_symbol_at_location(
+					binding.inner(),
+					SymbolKind::Variable,
+					type_info,
+					binding.start(),
+					binding.end(),
+					doc,
+				));
+			}
+			find_symbol_in_expr(iterable.inner(), offset, doc, ctx)
+				.or_else(|| find_symbol_in_expr(body.inner(), offset, doc, ctx))
+		}
 
 		// Binary/Prefix/Postfix ops
 		Expr::BinaryOp { lhs, rhs, .. } => find_symbol_in_expr(lhs.inner(), offset, doc, ctx)
@@ -1628,7 +1618,7 @@ fn infer_expr_type(expr: &Expr) -> Option<String> {
 		Expr::Continue { .. } => Some("never".to_string()),
 
 		// Loops return void unless broken with a value
-		Expr::For { .. } | Expr::While { .. } => Some("void".to_string()),
+		Expr::While { .. } | Expr::For { .. } => Some("void".to_string()),
 
 		// Assignment returns void
 		Expr::AssignOp { .. } => Some("void".to_string()),

@@ -1,7 +1,7 @@
 {
 	"name": "Nymph",
 	"scopeName": "source.nymph",
-	"fileTypes": ["nym"],
+	"fileTypes": [ "nym" ],
 	"patterns": [
 		{ "include": "#comments" },
 		{ "include": "#strings" },
@@ -44,13 +44,9 @@
 				{
 					"name": "meta.interpolation.nymph",
 					"begin": "(?<!\\\\)\\${",
-					"beginCaptures": {
-						"0": { "name": "punctuation.definition.template-expression.begin.nymph" }
-					},
+					"beginCaptures": { "0": { "name": "punctuation.definition.template-expression.begin.nymph" } },
 					"end": "}",
-					"endCaptures": {
-						"0": { "name": "punctuation.definition.template-expression.end.nymph" }
-					},
+					"endCaptures": { "0": { "name": "punctuation.definition.template-expression.end.nymph" } },
 					"contentName": "meta.embedded.line.nymph",
 					"patterns": [
 						{ "include": "#literals" },
@@ -101,7 +97,7 @@
 			"patterns": [
 				{
 					"name": "keyword.control.nymph",
-					"match": "\\b(if|else|while|for|match|return|break|continue)\\b"
+					"match": "\\b(if|else|for|while|match|return|break|continue)\\b"
 				},
 				{
 					"name": "keyword.other.nymph",
@@ -159,7 +155,7 @@
 			"patterns": [
 				{
 					"name": "keyword.operator.range.nymph",
-					"match": "\\.\\.=|\\.\\."
+					"match": "\\.\\.|\\.\\.=|\\.\\.<"
 				},
 				{
 					"name": "keyword.operator.arrow.nymph",
@@ -229,7 +225,7 @@
 					},
 					"end": ">",
 					"endCaptures": { "0": { "name": "punctuation.definition.generic.end.nymph" } },
-					"patterns": [{ "include": "#type-expressions" }]
+					"patterns": [ { "include": "#type-expressions" } ]
 				},
 				{
 					"match": "\\b[A-Z][\\p{XID_Continue}]*\\b",
@@ -336,7 +332,7 @@
 					},
 					"end": ">\\s*\\(",
 					"endCaptures": { "0": { "name": "punctuation.definition.parameters.begin.nymph" } },
-					"patterns": [{ "include": "#type-expressions" }]
+					"patterns": [ { "include": "#type-expressions" } ]
 				},
 				{
 					"name": "meta.function-call.nymph",
@@ -366,7 +362,7 @@
 			},
 			"end": "\\]",
 			"endCaptures": { "0": { "name": "punctuation.definition.index.end.nymph" } },
-			"patterns": [{ "include": "#expression" }]
+			"patterns": [ { "include": "#expression" } ]
 		}
 	}
 }

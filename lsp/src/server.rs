@@ -75,16 +75,14 @@ impl NymphLanguageServer {
 		// Add type errors
 		for error in &doc.type_errors {
 			if let Some(module_path) = error.file_path() {
-				let source =
-					std::fs::read_to_string(module_path.as_str()).unwrap_or_default();
+				let source = std::fs::read_to_string(module_path.as_str()).unwrap_or_default();
 				let span = error.span();
 				let start = Self::position_in_source(&source, span.start);
 				let end = Self::position_in_source(&source, span.end);
 
-				let module_uri =
-					Url::from_file_path(module_path.as_str())
-						.map(|u| u.to_string())
-						.unwrap_or_else(|_| uri.to_string());
+				let module_uri = Url::from_file_path(module_path.as_str())
+					.map(|u| u.to_string())
+					.unwrap_or_else(|_| uri.to_string());
 
 				diagnostics_by_uri
 					.entry(module_uri)
