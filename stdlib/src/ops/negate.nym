@@ -3,9 +3,9 @@ interface Negate<Output> {
 }
 
 impl Negate<Output = int> for int {
-  external func negate(): int
+  func negate(): int -> this * -1
 }
 
 impl Negate<Output = float> for float {
-  external func negate(): float
+  func negate(): float -> this * -1
 }

@@ -61,4 +61,14 @@ public struct Complex(real: float, imaginary: float) {
       imaginary = -this.imaginary
     )
   }
+
+  impl Into<string> {
+    func into() -> match #(this.real, this.imaginary) {
+      #(0, 0) -> "0",
+      #(real, 0) -> "${real}",
+      #(0, imaginary) -> "${imaginary}i",
+      #(real, imaginary) if imaginary < 0 -> "${real}${imaginary}i",
+      #(real, imaginary) -> "${real}+${imaginary}i"
+    }
+  }
 }

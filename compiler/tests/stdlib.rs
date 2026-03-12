@@ -1,45 +1,75 @@
 use ariadne::Source;
-use assertables::assert_some;
-use nymph_compiler::types::type_error_to_report;
-use std::ffi::OsStr;
+use nymph_compiler::db::{DiagnosticKind, Diagnostics, NymphDatabase, ProjectConfig, SourceFile};
+use nymph_compiler::queries::{parse_file, typecheck_file};
 use std::fs::read_to_string;
+use std::path::PathBuf;
 
 #[test]
 fn stdlib_tests() {
+	let db = NymphDatabase::default();
+	let stdlib_root = PathBuf::from("../stdlib")
+		.canonicalize()
+		.expect("stdlib directory not found");
+	let config = ProjectConfig::new(&db, stdlib_root);
+
 	for file in glob::glob("../stdlib/src/**/*.nym")
 		.unwrap()
 		.filter_map(Result::ok)
 	{
-		let name = file.file_name().and_then(OsStr::to_str).unwrap();
-		let source = read_to_string(file.clone()).unwrap();
 		let abs_path = file.canonicalize().unwrap_or_else(|_| file.clone());
+		let abs_str = abs_path.to_string_lossy().to_string();
+		let source = read_to_string(&abs_path).unwrap();
 
-		let (module, reports) = nymph_compiler::parse(name.into(), source.as_str());
-		if !reports.is_empty() {
-			for report in reports {
+		let sf = SourceFile::new(&db, abs_str.clone(), source.clone());
+
+		// Check for parse errors
+		let result = parse_file(&db, sf);
+		let parse_diagnostics: Vec<_> = parse_file::accumulated::<Diagnostics>(&db, sf)
+			.into_iter()
+			.filter(|d| d.0.kind == DiagnosticKind::ParseError)
+			.collect();
+
+		if !parse_diagnostics.is_empty() {
+			for diag in &parse_diagnostics {
+				let d = &diag.0;
+				eprintln!("Parse error in {abs_str}: {}", d.message);
+			}
+			panic!("Parse errors in {abs_str}");
+		}
+		assert!(result.module.is_some(), "Failed to parse {abs_str}");
+
+		// Type-check using salsa (results are cached across files)
+		let _tc_result = typecheck_file(&db, sf, config);
+		let tc_diagnostics: Vec<_> = typecheck_file::accumulated::<Diagnostics>(&db, sf, config)
+			.into_iter()
+			.filter(|d| d.0.kind == DiagnosticKind::TypeError)
+			.collect();
+
+		if !tc_diagnostics.is_empty() {
+			for diag in &tc_diagnostics {
+				let d = &diag.0;
+				let error_source = if d.file_path == abs_str.as_str() {
+					source.clone()
+				} else {
+					read_to_string(d.file_path.as_str()).unwrap_or_default()
+				};
+				let report = ariadne::Report::build(
+					ariadne::ReportKind::Error,
+					(d.file_path.clone(), d.span.start..d.span.end),
+				)
+				.with_config(ariadne::Config::new().with_tab_width(2))
+				.with_message(&d.message)
+				.with_label(
+					ariadne::Label::new((d.file_path.clone(), d.span.start..d.span.end))
+						.with_message(&d.message)
+						.with_color(ariadne::Color::Red),
+				)
+				.finish();
 				report
-					.finish()
-					.eprint((name.into(), Source::from(source.clone())))
+					.eprint((d.file_path.clone(), Source::from(error_source)))
 					.unwrap();
 			}
-			panic!("Parse errors in {name}");
-		}
-		let module = assert_some!(module, "Failed to parse {name}");
-
-		// Type-check the module with file path for import resolution
-		if let Err(error) = nymph_compiler::types::type_check_with_path(module.inner(), abs_path) {
-			let error_file: ecow::EcoString = error
-				.file_path()
-				.unwrap_or_else(|| name.into());
-			let error_source = if error_file == name {
-				source.clone()
-			} else {
-				read_to_string(error_file.as_str()).unwrap_or_default()
-			};
-			type_error_to_report(name.into(), &error)
-				.eprint((error_file, Source::from(error_source)))
-				.unwrap();
-			panic!("Type check failed for {name}");
+			panic!("Type check failed for {abs_str}");
 		}
 	}
 }

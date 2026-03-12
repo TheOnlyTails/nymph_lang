@@ -1,0 +1,20 @@
+import @/ops/comparison with (Comparable)
+import @/ops/into with (Into)
+
+public struct RangeExclusive<Idx: Comparable>(start: Idx, end: Idx) {
+  func contains(item: Idx) -> this.start <= item && item < this.end
+  func is_empty() -> this.start >= this.end
+}
+
+impl<Idx: Into<string> + Comparable> RangeExclusive<Idx> for Into<string> {
+  func into() -> "${this.start}..<${this.end}"
+}
+
+public struct RangeInclusive<Idx: Comparable>(start: Idx, end: Idx) {
+  func contains(item: Idx) -> this.start <= item && item <= this.end
+  func is_empty() -> this.start > this.end
+}
+
+impl<Idx: Into<string> + Comparable> RangeInclusive<Idx> for Into<string> {
+  func into() -> "${this.start}..=${this.end}"
+}

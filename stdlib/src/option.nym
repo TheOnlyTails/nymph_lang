@@ -47,7 +47,10 @@ public enum Option<T> {
   }
 
   func inspect(f: (T) -> void) -> {
-    if (this is Some(value)) f(value)
+    match (this) {
+      Some(value) -> f(value)
+      _ -> {}
+    }
 
     this
   }

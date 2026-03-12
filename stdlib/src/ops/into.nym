@@ -2,3 +2,14 @@ interface Into<Other> {
   func into() -> Other
 }
 
+impl Into<string> for boolean {
+  func into() -> if (this) "true" else "false"
+}
+
+impl<T: Into<string>> Into<string> for #[T] {
+  func into() -> "#[${this.map(_.into()).join(", ")}]"
+}
+
+impl<K: Into<string>, V: Into<string>> Into<string> for #{K: V} {
+  func into() -> "#{${this.map("${_[0]}: ${_[1]}").join(", ")}}"
+}

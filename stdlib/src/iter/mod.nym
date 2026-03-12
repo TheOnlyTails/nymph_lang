@@ -7,14 +7,19 @@ import @/option with (Option)
 /// They can be used to implement various algorithms, such as filtering, mapping, and reducing.
 ///
 /// ```nym
-/// let iter = #[1, 2, 3]
+/// #[1, 2, 3, 4, 5]
+///   .map(_ * 2) // #[2, 4, 6, 8, 10]
+///   .filter(_ <= 6) // #[2, 4, 6]
+///   .sum() // 12
 /// ```
 public interface Iterator<Item> {
   func next(): Option<Item>
 
   func for_each(f: (Item) -> void) -> {
-    for (item in this) {
-      f(item)
+    let mut current = this.next()
+    while (current is Some(value)) {
+      f(value)
+      current = this.next()
     }
   }
 
@@ -24,7 +29,7 @@ public interface Iterator<Item> {
 
     while (true) {
       match (current) {
-        Some(value) -> accumulator = f(value),
+        Some(value) -> accumulator = f(accumulator, value),
         None -> return accumulator
       }
     }
@@ -79,8 +84,24 @@ public interface Iterator<Item> {
   }
 }
 
-public struct Empty {
-  impl<Any> Iterator<Any> {
+impl Iterator<int> {
+  func sum() -> this.fold(0, (acc, x) -> acc + x)
+
+  func product() -> this.fold(1, (acc, x) -> acc * x)
+}
+
+impl Iterator<float> {
+  func sum() -> this.fold(0f, (acc, x) -> acc + x)
+
+  func product() -> this.fold(1f, (acc, x) -> acc * x)
+}
+
+impl Iterator<string> {
+  func join() -> this.fold("", (acc, x) -> acc + x)
+}
+
+public namespace Empty {
+  impl Iterator<never> {
     func next() -> None
   }
 }

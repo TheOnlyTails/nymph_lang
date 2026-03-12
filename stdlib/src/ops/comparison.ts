@@ -1,5 +1,3 @@
-import @/ops/equality with (Equal)
-
 enum Order {
   LessThan,
   Equal,

@@ -3,7 +3,7 @@ interface And<Other, Output> {
 }
 
 impl And<Other = boolean, Output = boolean> for boolean {
-  external func and(other: boolean): boolean
+  func and(other: boolean): boolean -> if (this) other else false 
 }
 
 interface Or<Other, Output> {
@@ -11,7 +11,7 @@ interface Or<Other, Output> {
 }
 
 impl Or<Other = boolean, Output = boolean> for boolean {
-  external func or(other: boolean): boolean
+  func or(other: boolean): boolean -> if (this) true else other
 }
 
 interface Not<Output> {
@@ -19,5 +19,5 @@ interface Not<Output> {
 }
 
 impl Not<Output = boolean> for boolean {
-  external func not(): boolean
+  func not(): boolean -> if (this) false else true
 }
