@@ -128,7 +128,7 @@ fn test_parse_let_declaration() {
 #[test]
 fn test_parse_let_mut_with_type() {
 	let (module, errors) = parse_module("let mut counter: int = 0");
-	assert!(errors.is_empty(), "errors: {errors:?}", );
+	assert!(errors.is_empty(), "errors: {errors:?}",);
 
 	match &module.members[0] {
 		Declaration::Let { meta, .. } => {
@@ -449,28 +449,13 @@ fn test_parse_expression_match() {
 }
 
 #[test]
-fn test_parse_expression_for() {
-	let expr = parse_expr("for (item in items) process(item)").unwrap();
-	match &expr.0 {
-		Expr::For {
-			variable,
-			iterable: _,
-			body: _,
-			..
-		} => match &variable.0 {
-			Pattern::Struct { path, .. } => assert_eq!(path[0].0, "item"),
-			_ => panic!("expected struct pattern"),
-		},
-		_ => panic!("expected for expression"),
-	}
-}
-
-#[test]
 fn test_parse_expression_while() {
 	let expr = parse_expr("while (running) loop()").unwrap();
 	match &expr.0 {
 		Expr::While {
-			condition: _, body: _, ..
+			condition: _,
+			body: _,
+			..
 		} => {}
 		_ => panic!("expected while expression"),
 	}
@@ -535,7 +520,7 @@ fn test_parse_expression_map() {
 
 #[test]
 fn test_parse_expression_range() {
-	let expr = parse_expr("1..10").unwrap();
+	let expr = parse_expr("1..<10").unwrap();
 	match &expr.0 {
 		Expr::Range(_) => {}
 		_ => panic!("expected range"),
@@ -733,7 +718,7 @@ fn test_parse_pattern_binding() {
 
 #[test]
 fn test_parse_pattern_range() {
-	let pat = parse_pattern("1..10").unwrap();
+	let pat = parse_pattern("1..<10").unwrap();
 	match pat.0 {
 		Pattern::Range(_) => {}
 		_ => panic!("expected range pattern"),
@@ -819,6 +804,24 @@ fn test_parse_struct_with_impl() {
 }
 
 #[test]
+fn test_parse_expression_for() {
+	let expr = parse_expr("for (x in items) { print(x) }").unwrap();
+	match &expr.0 {
+		Expr::For {
+			variable,
+			iterable,
+			body,
+			label,
+		} => {
+			assert!(label.is_none());
+			assert!(matches!(iterable.0, Expr::Identifier(_)));
+			assert!(matches!(body.0, Expr::Block { .. }));
+		}
+		_ => panic!("expected for expression, got {:?}", expr.0),
+	}
+}
+
+#[test]
 fn test_parse_pipeline_operator() {
 	let expr = parse_expr("x |> f |> g").unwrap();
 	match &expr.0 {
@@ -848,7 +851,9 @@ fn test_parse_generic_call() {
 	match &expr.0 {
 		Expr::Call { func, generics, .. } => {
 			match &func.0 {
-				Expr::MemberAccess { parent: _, member, .. } => {
+				Expr::MemberAccess {
+					parent: _, member, ..
+				} => {
 					assert_eq!(member.0, "new");
 				}
 				_ => panic!("expected member access"),

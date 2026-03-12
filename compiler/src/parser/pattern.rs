@@ -251,7 +251,7 @@ impl<'src> Parser<'src> {
 			));
 		}
 
-		if self.consume(&Token::DotDot).is_some() {
+		if self.consume(&Token::DotDotLt).is_some() {
 			if let Some(max) = self.parse_range_bound() {
 				let end_span = self.previous_span();
 				return Some(Spanned(

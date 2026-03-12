@@ -101,14 +101,14 @@ pub enum Expr {
 	Continue {
 		label: Option<Ident>,
 	},
-	For {
-		variable: Spanned<Pattern>,
-		iterable: Box<Spanned<Self>>,
+	While {
+		condition: Box<Spanned<Self>>,
 		body: Box<Spanned<Self>>,
 		label: Option<Ident>,
 	},
-	While {
-		condition: Box<Spanned<Self>>,
+	For {
+		variable: Spanned<Pattern>,
+		iterable: Box<Spanned<Self>>,
 		body: Box<Spanned<Self>>,
 		label: Option<Ident>,
 	},
@@ -294,9 +294,9 @@ pub enum StringPatternPart {
 
 #[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::Update)]
 pub enum RangePatternKind {
-	/// `1..`
+	/// `1..<`
 	ExclusiveMin(Box<Spanned<Pattern>>),
-	/// `1..3`
+	/// `1..<3`
 	ExclusiveBoth {
 		min: Box<Spanned<Pattern>>,
 		max: Box<Spanned<Pattern>>,

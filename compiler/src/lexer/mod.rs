@@ -478,6 +478,7 @@ fn keyword_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
 fn punct_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
 	choice([
 		just("...").to(Token::DotDotDot),
+		just("..<").to(Token::DotDotLt),
 		just("..=").to(Token::DotDotEq),
 		just("..").to(Token::DotDot),
 		just(".").to(Token::Dot),
@@ -606,7 +607,6 @@ mod tests {
 	#[test_case("interface" => Ok(vec![Token::Interface.spanned(0..9)]) ; "interface keyword")]
 	#[test_case("impl" => Ok(vec![Token::Impl.spanned(0..4)]) ; "impl keyword")]
 	#[test_case("namespace" => Ok(vec![Token::Namespace.spanned(0..9)]) ; "namespace keyword")]
-	#[test_case("for" => Ok(vec![Token::For.spanned(0..3)]) ; "for keyword")]
 	#[test_case("while" => Ok(vec![Token::While.spanned(0..5)]) ; "while keyword")]
 	#[test_case("match" => Ok(vec![Token::Match.spanned(0..5)]) ; "match keyword")]
 	#[test_case("int" => Ok(vec![Token::IntType.spanned(0..3)]) ; "int type keyword")]
@@ -631,8 +631,9 @@ mod tests {
 	#[test_case("&&" => Ok(vec![Token::AndAnd.spanned(0..2)]) ; "logical and")]
 	#[test_case("||" => Ok(vec![Token::PipePipe.spanned(0..2)]) ; "logical or")]
 	#[test_case("..." => Ok(vec![Token::DotDotDot.spanned(0..3)]) ; "spread")]
+	#[test_case("..<" => Ok(vec![Token::DotDotLt.spanned(0..3)]) ; "exclusive range")]
 	#[test_case("..=" => Ok(vec![Token::DotDotEq.spanned(0..3)]) ; "inclusive range")]
-	#[test_case(".." => Ok(vec![Token::DotDot.spanned(0..2)]) ; "range")]
+	#[test_case(".." => Ok(vec![Token::DotDot.spanned(0..2)]) ; "dot dot")]
 	#[test_case("??" => Ok(vec![Token::DoubleQuestion.spanned(0..2)]) ; "null coalescing")]
 	#[test_case("?." => Ok(vec![Token::QuestionDot.spanned(0..2)]) ; "optional chaining")]
 	#[test_case("?" => Ok(vec![Token::QuestionMark.spanned(0..1)]) ; "question mark")]

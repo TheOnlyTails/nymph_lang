@@ -221,6 +221,8 @@ pub enum Token {
 	GtGtEq,
 	/// `..`
 	DotDot,
+	/// `..<`
+	DotDotLt,
 	/// `..=`
 	DotDotEq,
 	/// `continue`
@@ -280,7 +282,7 @@ impl Display for Token {
 				Impl => "impl",
 				Namespace => "namespace",
 				For => "for",
-				While => "while",
+			While => "while",
 				If => "if",
 				Else => "else",
 				Match => "match",
@@ -344,6 +346,7 @@ impl Display for Token {
 				LtLtEq => "<<=",
 				GtGtEq => ">>=",
 				DotDot => "..",
+				DotDotLt => "..<",
 				DotDotEq => "..=",
 				Continue => "continue",
 				Break => "break",

@@ -59,7 +59,7 @@ impl<'src> Parser<'src> {
 	fn prefix_binding_power(&self) -> Option<((), u8)> {
 		match self.peek()? {
 			Token::Minus | Token::ExclamationMark | Token::Tilde => Some(((), 23)),
-			Token::DotDot | Token::DotDotEq => Some(((), 15)),
+			Token::DotDotLt | Token::DotDotEq => Some(((), 15)),
 			_ => None,
 		}
 	}
@@ -73,7 +73,7 @@ impl<'src> Parser<'src> {
 			Token::QuestionMark => Some((23,)),
 			Token::Is | Token::NotIs => Some((21,)),
 			Token::As => Some((21,)),
-			Token::DotDot => Some((15,)),
+			Token::DotDotLt => Some((15,)),
 			_ => None,
 		}
 	}
@@ -176,7 +176,7 @@ impl<'src> Parser<'src> {
 						span,
 					));
 				}
-				Token::DotDot => {
+				Token::DotDotLt => {
 					self.advance();
 					let max = self.parse_expr_pratt(r_bp)?;
 					let span = span(start_span.start, max.span().end);
@@ -345,7 +345,7 @@ impl<'src> Parser<'src> {
 					span,
 				))
 			}
-			Token::DotDot => {
+			Token::DotDotLt => {
 				self.advance();
 				if let Some(max) = self.parse_expr_pratt(15) {
 					let span = span(start, max.span().end);
@@ -1074,9 +1074,9 @@ impl<'src> Parser<'src> {
 			None
 		};
 
-		let Token::Parens(inner) = self.peek()?.clone() else {
+		let Token::Parens(parens_inner) = self.peek()?.clone() else {
 			self.error(ParseError::custom(
-				"expected (pattern in iterable)",
+				"expected pattern and iterable in parentheses",
 				self.current_span(),
 			));
 			return None;
@@ -1084,7 +1084,7 @@ impl<'src> Parser<'src> {
 		let parens_span = self.current_span();
 		self.advance();
 
-		let (variable, iterable) = self.with_nested(&inner, parens_span, |p| {
+		let (variable, iterable) = self.with_nested(&parens_inner, parens_span, |p| {
 			let variable = p.parse_pattern()?;
 			p.expect(&Token::In, "in")?;
 			let iterable = p.parse_expression()?;
