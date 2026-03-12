@@ -1,4 +1,4 @@
-#![feature(trait_alias, map_try_insert, result_option_map_or_default)]
+#![feature(trait_alias)]
 #![warn(clippy::all)]
 
 use std::ops::Range;
@@ -18,6 +18,7 @@ pub(crate) mod lexer;
 pub(crate) mod parser;
 pub mod queries;
 pub(crate) mod resolver;
+pub mod transpiler;
 pub mod types;
 
 pub type ParseResult<'src> = (

@@ -4,21 +4,34 @@ use ecow::EcoString;
 
 use crate::{ast::expr::Pattern, types::Type};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TypeError {
-	UnknownIdentifier(EcoString, Range<usize>),
-	UnknownType(EcoString, Range<usize>),
+	UnknownIdentifier {
+		name: EcoString,
+		suggestion: Option<EcoString>,
+		span: Range<usize>,
+	},
+	UnknownType {
+		name: EcoString,
+		suggestion: Option<EcoString>,
+		span: Range<usize>,
+	},
 	TypeMismatch {
 		expected: Box<Type>,
 		found: Box<Type>,
 		span: Range<usize>,
 	},
-	NotCallable(Range<usize>),
+	NotCallable(Box<Type>, Range<usize>),
+	EmptyStruct {
+		name: EcoString,
+		span: Range<usize>,
+	},
 	NotIndexable(Range<usize>),
 	NotAccessible(Range<usize>),
 	UnknownMember {
 		type_: Box<Type>,
 		member: EcoString,
+		suggestion: Option<EcoString>,
 		span: Range<usize>,
 	},
 	SpreadNonFinalParam(Range<usize>),
@@ -113,11 +126,17 @@ pub enum TypeError {
 	ImportedItemNotFound {
 		item: EcoString,
 		module: EcoString,
+		suggestion: Option<EcoString>,
 		span: Range<usize>,
 	},
 	ModuleParseError {
-		path: EcoString,
+		module_path: EcoString,
 		message: EcoString,
+		span: Range<usize>,
+	},
+	UnknownNamedArgument {
+		name: EcoString,
+		suggestion: Option<EcoString>,
 		span: Range<usize>,
 	},
 	ExternalDeclarationMissingType(Range<usize>),
@@ -131,10 +150,11 @@ impl TypeError {
 	/// Get the span associated with this error
 	pub fn span(&self) -> Range<usize> {
 		match self {
-			TypeError::UnknownIdentifier(_, span) => span.clone(),
-			TypeError::UnknownType(_, span) => span.clone(),
+			TypeError::UnknownIdentifier { span, .. } => span.clone(),
+			TypeError::UnknownType { span, .. } => span.clone(),
 			TypeError::TypeMismatch { span, .. } => span.clone(),
-			TypeError::NotCallable(span) => span.clone(),
+			TypeError::NotCallable(_, span) => span.clone(),
+			TypeError::EmptyStruct { span, .. } => span.clone(),
 			TypeError::NotIndexable(span) => span.clone(),
 			TypeError::NotAccessible(span) => span.clone(),
 			TypeError::UnknownMember { span, .. } => span.clone(),
@@ -162,6 +182,7 @@ impl TypeError {
 			TypeError::AmbiguousModule { span, .. } => span.clone(),
 			TypeError::ImportedItemNotFound { span, .. } => span.clone(),
 			TypeError::ModuleParseError { span, .. } => span.clone(),
+			TypeError::UnknownNamedArgument { span, .. } => span.clone(),
 			TypeError::ExternalDeclarationMissingType(span) => span.clone(),
 			TypeError::ModuleTypeError { error, .. } => error.span(),
 		}
@@ -170,6 +191,7 @@ impl TypeError {
 	/// Get the file path associated with this error, if it originated from a different module
 	pub fn file_path(&self) -> Option<EcoString> {
 		match self {
+			TypeError::ModuleParseError { module_path, .. } => Some(module_path.clone()),
 			TypeError::ModuleTypeError { module_path, error } => {
 				error.file_path().or_else(|| Some(module_path.clone()))
 			}
@@ -181,14 +203,23 @@ impl TypeError {
 impl Display for TypeError {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
-			TypeError::UnknownIdentifier(id, _) => write!(f, "Unknown identifier: {}", id),
-			TypeError::UnknownType(id, _) => write!(f, "Unknown type: {}", id),
+			TypeError::UnknownIdentifier { name, .. } => write!(f, "Unknown identifier: {}", name),
+			TypeError::UnknownType { name, .. } => write!(f, "Unknown type: {}", name),
 			TypeError::TypeMismatch {
 				expected, found, ..
 			} => {
 				write!(f, "Type mismatch: expected {}, found {}", expected, found)
 			}
-			TypeError::NotCallable(_) => write!(f, "Cannot call non-function type"),
+			TypeError::NotCallable(type_, _) => {
+				write!(f, "Cannot call non-function type `{}`", type_)
+			}
+			TypeError::EmptyStruct { name, .. } => {
+				write!(
+					f,
+					"Struct `{}` has no fields; use a `namespace` instead",
+					name
+				)
+			}
 			TypeError::NotIndexable(_) => write!(f, "Cannot index non-indexable type"),
 			TypeError::NotAccessible(_) => write!(f, "Cannot access members of non-accessible type"),
 			TypeError::UnknownMember {
@@ -315,8 +346,11 @@ impl Display for TypeError {
 			TypeError::ImportedItemNotFound { item, module, .. } => {
 				write!(f, "Item '{}' not found in module '{}'", item, module)
 			}
-			TypeError::ModuleParseError { path, message, .. } => {
-				write!(f, "Error parsing module '{}': {}", path, message)
+			TypeError::ModuleParseError { message, .. } => {
+				write!(f, "{}", message)
+			}
+			TypeError::UnknownNamedArgument { name, .. } => {
+				write!(f, "Unknown named argument '{}'", name)
 			}
 			TypeError::ExternalDeclarationMissingType(_) => {
 				write!(

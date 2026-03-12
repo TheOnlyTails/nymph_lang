@@ -8,6 +8,7 @@ use ecow::EcoString;
 use crate::ast::Span;
 use crate::ast::declaration::ImportRoot;
 use crate::types::{GenericParamInfo, StructMember, Type};
+use crate::types::error::TypeError;
 
 #[salsa::input]
 pub struct SourceFile {
@@ -124,6 +125,9 @@ pub enum DiagnosticKind {
 	ParseError,
 	TypeError,
 }
+
+#[salsa::accumulator]
+pub struct TypeErrors(pub TypeError);
 
 #[salsa::db]
 pub trait Db: salsa::Database {}

@@ -9,11 +9,13 @@ use std::{
 	fs,
 	hash::Hash,
 	path::{Path, PathBuf},
+	sync::Arc,
 };
 
 use ecow::EcoString;
 use itertools::Itertools;
 
+use crate::ast::Span;
 use crate::{
 	ast::{
 		self, Spanned,
@@ -24,17 +26,19 @@ use crate::{
 		expr::{Expr, ListItem, Pattern, Statement},
 		ops::{BinaryOperator, PrefixOperator, TypeOperator},
 	},
-	db::{Db, DefKey, ProjectConfig, SourceFile},
-	parse,
+	db::{Db, DefKey, DiagnosticKind, Diagnostics, NymphDatabase, ProjectConfig, SourceFile},
 	queries,
 	types::error::TypeError,
 };
-use crate::ast::Span;
 
 /// Extract a `Range<usize>` from a `Span`
 fn span_to_range(span: Span) -> std::ops::Range<usize> {
 	span.start..span.end
 }
+
+/// Unique identifier for type variables, to distinguish variables with the same name in different scopes
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TypeVarId(u64);
 
 /// Result type for processing struct/enum members
 type ProcessMembersResult = (BTreeMap<EcoString, StructMember>, BTreeMap<EcoString, Type>);
@@ -42,6 +46,7 @@ type ProcessMembersResult = (BTreeMap<EcoString, StructMember>, BTreeMap<EcoStri
 /// Resolved generic parameter info (for type constructors)
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub struct GenericParamInfo {
+	pub id: TypeVarId,
 	pub name: EcoString,
 	pub constraint: Option<Type>,
 	pub default: Option<Type>,
@@ -71,51 +76,54 @@ pub enum Type {
 		value: Box<Self>,
 	},
 	Function {
-		generics: Vec<GenericParamInfo>,
+		generics: Arc<Vec<GenericParamInfo>>,
 		params: Vec<(Option<EcoString>, Self)>,
 		has_spread: bool,
 		return_type: Box<Self>,
+		/// Whether this function is a struct constructor (needs `new` in JS emission).
+		constructor: bool,
 	},
 	Variable {
+		id: TypeVarId,
 		name: EcoString,
 		constraint: Option<Box<Self>>,
 	},
 	Struct {
 		name: EcoString,
 		def_key: Option<DefKey>,
-		generics: Vec<GenericParamInfo>,
+		generics: Arc<Vec<GenericParamInfo>>,
 		type_args: Vec<Self>,
-		fields: BTreeMap<EcoString, Self>,
-		members: BTreeMap<EcoString, StructMember>,
-		impls: BTreeMap<EcoString, Self>,
+		fields: Arc<BTreeMap<EcoString, Self>>,
+		members: Arc<BTreeMap<EcoString, StructMember>>,
+		impls: Arc<BTreeMap<EcoString, Self>>,
 	},
 	Enum {
 		name: EcoString,
 		def_key: Option<DefKey>,
-		generics: Vec<GenericParamInfo>,
+		generics: Arc<Vec<GenericParamInfo>>,
 		type_args: Vec<Self>,
-		variants: BTreeMap<EcoString, BTreeMap<EcoString, Self>>,
-		members: BTreeMap<EcoString, StructMember>,
-		impls: BTreeMap<EcoString, Self>,
+		variants: Arc<BTreeMap<EcoString, BTreeMap<EcoString, Self>>>,
+		members: Arc<BTreeMap<EcoString, StructMember>>,
+		impls: Arc<BTreeMap<EcoString, Self>>,
 	},
 	EnumVariant {
 		name: EcoString,
 		variant_name: EcoString,
-		fields: BTreeMap<EcoString, Self>,
+		fields: Arc<BTreeMap<EcoString, Self>>,
 		variant_of: Box<Self>,
-		impls: BTreeMap<EcoString, Self>,
+		impls: Arc<BTreeMap<EcoString, Self>>,
 	},
 	Interface {
 		name: EcoString,
 		def_key: Option<DefKey>,
-		generics: Vec<GenericParamInfo>,
+		generics: Arc<Vec<GenericParamInfo>>,
 		type_args: Vec<Self>,
-		members: BTreeMap<EcoString, StructMember>,
-		impls: BTreeMap<EcoString, Self>,
+		members: Arc<BTreeMap<EcoString, StructMember>>,
+		impls: Arc<BTreeMap<EcoString, Self>>,
 	},
 	Module {
 		name: EcoString,
-		members: BTreeMap<EcoString, ContextEntry>,
+		members: Arc<BTreeMap<EcoString, ContextEntry>>,
 	},
 }
 
@@ -138,6 +146,7 @@ impl Type {
 			(a, b) if a == b => true,
 			(Type::Never, _) => true,
 			(_, Type::Never) => false,
+			(_, Type::Variable { .. }) | (Type::Variable { .. }, _) => true,
 			(Type::Intersection { first, second }, target) => {
 				first.assignable_to(target, _ctx) && second.assignable_to(target, _ctx)
 			}
@@ -193,9 +202,12 @@ impl Type {
 		if self == other {
 			self.clone()
 		} else {
-			Type::Intersection {
-				first: Box::new(self.clone()),
-				second: Box::new(other.clone()),
+			match (self, other) {
+				(Type::Never, t) | (t, Type::Never) => t.clone(),
+				_ => Type::Intersection {
+					first: Box::new(self.clone()),
+					second: Box::new(other.clone()),
+				},
 			}
 		}
 	}
@@ -242,6 +254,7 @@ impl Display for Type {
 				params,
 				return_type,
 				has_spread,
+				..
 			} => {
 				if !generics.is_empty() {
 					write!(f, "<")?;
@@ -271,7 +284,9 @@ impl Display for Type {
 				}
 				write!(f, ") -> {}", return_type)
 			}
-			Type::Variable { name, constraint } => {
+			Type::Variable {
+				name, constraint, ..
+			} => {
 				if let Some(c) = constraint {
 					write!(f, "{}: {}", name, c)
 				} else {
@@ -362,6 +377,8 @@ pub struct Context {
 	pub impls: HashMap<EcoString, Vec<Type>>,
 	/// The current `self` type (for interface definitions and impl blocks)
 	pub self_type: Option<Type>,
+	/// The next type variable ID to use (threaded through salsa queries to avoid ID collisions)
+	pub next_type_var_id: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -387,6 +404,11 @@ impl Context {
 		new_ctx
 	}
 
+	/// Add an entry in place without cloning the context.
+	pub fn insert_entry(&mut self, name: EcoString, entry: ContextEntry) {
+		self.local_ctx.insert(name, entry);
+	}
+
 	pub fn with_new_entries<I: IntoIterator<Item = (EcoString, ContextEntry)>>(
 		&self,
 		entries: I,
@@ -406,6 +428,14 @@ impl Context {
 		})
 	}
 
+	/// Look up a type by name in the context, returning a reference.
+	pub fn lookup_type_ref(&self, name: &EcoString) -> Option<&Type> {
+		self.local_ctx.get(name).map(|entry| match entry {
+			ContextEntry::Value(val) => &val.type_,
+			ContextEntry::Impl { parent, .. } => &parent.type_,
+		})
+	}
+
 	/// Register that a type implements an interface
 	pub fn with_impl(&self, type_name: EcoString, interface_type: Type) -> Self {
 		let mut new_ctx = self.clone();
@@ -418,8 +448,8 @@ impl Context {
 	}
 
 	/// Get all interfaces implemented by a type
-	pub fn get_impls(&self, type_name: &EcoString) -> Option<Vec<Type>> {
-		self.impls.get(type_name).cloned()
+	pub fn get_impls(&self, type_name: &EcoString) -> Option<&Vec<Type>> {
+		self.impls.get(type_name)
 	}
 
 	/// Set the `self` type for interface definitions and impl blocks
@@ -442,6 +472,8 @@ enum ModuleStatus {
 
 #[derive(Clone, Debug, Default)]
 pub struct TypeChecker {
+	/// Counter for generating unique type variable IDs
+	pub next_type_var_id: u64,
 	/// Cache of processed modules (absolute path -> status) — used in non-salsa mode
 	module_cache: HashMap<PathBuf, ModuleStatus>,
 	/// The project root directory (where nymph.toml is located)
@@ -455,6 +487,7 @@ impl TypeChecker {
 	pub fn new(file_path: Option<PathBuf>) -> Self {
 		let project_root = file_path.as_ref().and_then(|p| Self::find_project_root(p));
 		Self {
+			next_type_var_id: 0,
 			module_cache: HashMap::new(),
 			project_root,
 			current_file: file_path,
@@ -462,11 +495,26 @@ impl TypeChecker {
 	}
 
 	/// Create a new TypeChecker for use with salsa queries
-	pub fn with_salsa(file_path: PathBuf, project_root: PathBuf) -> Self {
+	pub fn with_salsa(file_path: PathBuf, project_root: PathBuf, next_type_var_id: u64) -> Self {
 		Self {
+			next_type_var_id,
 			module_cache: HashMap::new(),
 			project_root: Some(project_root),
 			current_file: Some(file_path),
+		}
+	}
+
+	fn fresh_type_var_id(&mut self) -> TypeVarId {
+		let id = self.next_type_var_id;
+		self.next_type_var_id += 1;
+		TypeVarId(id)
+	}
+
+	pub fn fresh_var(&mut self, name: impl Into<EcoString>, constraint: Option<Type>) -> Type {
+		Type::Variable {
+			id: self.fresh_type_var_id(),
+			name: name.into(),
+			constraint: constraint.map(Box::new),
 		}
 	}
 
@@ -608,20 +656,27 @@ impl TypeChecker {
 		})?;
 
 		let filename: EcoString = abs_path.display().to_string().into();
-		let (parsed_module, errors) = parse(filename.clone(), &source);
+		let db = NymphDatabase::default();
+		let file = SourceFile::new(&db, filename.to_string(), source.to_string());
+		let result = queries::parse_file(&db, file);
+		let parse_errors: Vec<_> = queries::parse_file::accumulated::<Diagnostics>(&db, file)
+			.into_iter()
+			.filter(|d| d.0.kind == DiagnosticKind::ParseError)
+			.collect();
 
-		if !errors.is_empty() {
+		if let Some(first) = parse_errors.first() {
+			let diag = &first.0;
 			return Err(TypeError::ModuleParseError {
-				path: filename,
-				message: format!("{} parse error(s)", errors.len()).into(),
-				span: span_to_range(span),
+				module_path: filename,
+				message: diag.message.clone().into(),
+				span: diag.span.start..diag.span.end,
 			});
 		}
 
-		let module = parsed_module.ok_or_else(|| TypeError::ModuleParseError {
-			path: filename,
+		let module = result.module.ok_or_else(|| TypeError::ModuleParseError {
+			module_path: filename,
 			message: "Failed to parse module".into(),
-			span: span_to_range(span),
+			span: 0..0,
 		})?;
 
 		// Save current file and set new one
@@ -629,12 +684,13 @@ impl TypeChecker {
 		self.current_file = Some(abs_path.clone());
 
 		// Type-check the module
-		let module_ctx = self
-			.check_module(module.inner(), base_ctx)
-			.map_err(|e| TypeError::ModuleTypeError {
-				module_path: abs_path.display().to_string().into(),
-				error: Box::new(e),
-			})?;
+		let module_ctx =
+			self
+				.check_module(module.inner(), base_ctx)
+				.map_err(|e| TypeError::ModuleTypeError {
+					module_path: abs_path.display().to_string().into(),
+					error: Box::new(e),
+				})?;
 
 		// Restore previous file
 		self.current_file = prev_file;
@@ -663,7 +719,10 @@ impl TypeChecker {
 			}
 		}
 
-		Type::Module { name, members }
+		Type::Module {
+			name,
+			members: Arc::new(members),
+		}
 	}
 
 	/// Infer the type of an expression in a given context
@@ -671,12 +730,7 @@ impl TypeChecker {
 		self.infer_expr(&expr.0, expr.1, ctx)
 	}
 
-	fn infer_expr(
-		&mut self,
-		expr: &Expr,
-		span: Span,
-		ctx: &Context,
-	) -> Result<Type, TypeError> {
+	fn infer_expr(&mut self, expr: &Expr, span: Span, ctx: &Context) -> Result<Type, TypeError> {
 		match expr {
 			Expr::Int(_) => Ok(Type::Int),
 			Expr::Float(_) => Ok(Type::Float),
@@ -692,19 +746,17 @@ impl TypeChecker {
 						ContextEntry::Value(val) => val.type_.clone(),
 						ContextEntry::Impl { parent, .. } => parent.type_.clone(),
 					})
-					.ok_or(TypeError::UnknownIdentifier(
-						name.clone(),
-						span_to_range(*ident_span),
-					))
+					.ok_or_else(|| TypeError::UnknownIdentifier {
+						name: name.clone(),
+						suggestion: find_similar_name(name, ctx.local_ctx.keys()),
+						span: span_to_range(*ident_span),
+					})
 			}
 			Expr::List(items) => {
 				if items.is_empty() {
 					// Empty list: can't infer element type
 					Ok(Type::List {
-						item: Box::new(Type::Variable {
-							name: EcoString::from("_infer"),
-							constraint: None,
-						}),
+						item: Box::new(self.fresh_var("_infer", None)),
 					})
 				} else {
 					let item_type = match &items[0].0 {
@@ -732,14 +784,8 @@ impl TypeChecker {
 			Expr::Map(entries) => {
 				if entries.is_empty() {
 					Ok(Type::Map {
-						key: Box::new(Type::Variable {
-							name: EcoString::from("_infer_key"),
-							constraint: None,
-						}),
-						value: Box::new(Type::Variable {
-							name: EcoString::from("_infer_val"),
-							constraint: None,
-						}),
+						key: Box::new(self.fresh_var("_infer_key", None)),
+						value: Box::new(self.fresh_var("_infer_val", None)),
 					})
 				} else {
 					let (key_type, value_type) = match &entries[0].0 {
@@ -776,6 +822,35 @@ impl TypeChecker {
 						..
 					} => {
 						if func_generics.is_empty() {
+							for arg in args {
+								if let Some(name_ident) = &arg.0.name {
+									let name = &name_ident.0;
+									if !params
+										.iter()
+										.any(|(p_name, _)| p_name.as_ref().is_some_and(|n| n == name))
+									{
+										let suggestion =
+											find_similar_name(name, params.iter().filter_map(|(n, _)| n.as_ref()));
+										return Err(TypeError::UnknownNamedArgument {
+											name: name.clone(),
+											suggestion,
+											span: span_to_range(name_ident.1),
+										});
+									}
+								}
+							}
+							let min_args = std::cmp::min(args.len(), params.len());
+							for i in 0..min_args {
+								let arg_type = self.infer(&args[i].0.value, ctx)?;
+								let (_, param_type) = &params[i];
+								if !arg_type.assignable_to(param_type, ctx) {
+									return Err(TypeError::TypeMismatch {
+										expected: Box::new(param_type.clone()),
+										found: Box::new(arg_type),
+										span: span_to_range(args[i].0.value.1),
+									});
+								}
+							}
 							Ok(*return_type)
 						} else {
 							let instantiated_func = self.instantiate_generic_call(
@@ -790,7 +865,7 @@ impl TypeChecker {
 							Ok(instantiated_func)
 						}
 					}
-					_ => Err(TypeError::NotCallable(span_to_range(span))),
+					other => Err(TypeError::NotCallable(other.into(), span_to_range(span))),
 				}
 			}
 			Expr::MemberAccess {
@@ -815,10 +890,7 @@ impl TypeChecker {
 				let result = match parent_type {
 					Type::List { item } => Ok(*item),
 					Type::Map { value, .. } => Ok(*value),
-					Type::Tuple { .. } => Ok(Type::Variable {
-						name: EcoString::from("_index_result"),
-						constraint: None,
-					}),
+					Type::Tuple { .. } => Ok(self.fresh_var("_index_result", None)),
 					_ => Err(TypeError::NotIndexable(span_to_range(span))),
 				};
 				if *optional {
@@ -833,31 +905,13 @@ impl TypeChecker {
 				return_type,
 				body,
 			} => {
-				let mut closure_ctx = ctx.clone();
-
-				let generic_params = self.resolve_generic_params(generics, ctx)?;
-				for gp in &generic_params {
-					closure_ctx = closure_ctx.with_new_entry(
-						gp.name.clone(),
-						ContextEntry::Value(ContextValue {
-							type_: Type::Variable {
-								name: gp.name.clone(),
-								constraint: gp.constraint.clone().map(Box::new),
-							},
-							mutable: false,
-							visibility: Visibility::Private,
-						}),
-					);
-				}
+				let (generic_params, mut closure_ctx) = self.resolve_generic_params(generics, ctx)?;
 
 				let mut param_types = Vec::new();
 				for param in params {
 					let param_type = match &param.0.type_ {
 						Some(t) => self.resolve_ast_type(&t.0, t.1, &closure_ctx)?,
-						None => Type::Variable {
-							name: EcoString::from("_infer"),
-							constraint: None,
-						},
+						None => self.fresh_var("_infer", None),
 					};
 					param_types.push((
 						match &param.0.name.0 {
@@ -867,7 +921,7 @@ impl TypeChecker {
 						param_type.clone(),
 					));
 					if let Pattern::Binding { name, .. } = &param.0.name.0 {
-						closure_ctx = closure_ctx.with_new_entry(
+						closure_ctx.insert_entry(
 							name.0.clone(),
 							ContextEntry::Value(ContextValue {
 								type_: param_type,
@@ -884,10 +938,11 @@ impl TypeChecker {
 				};
 
 				Ok(Type::Function {
-					generics: generic_params,
+					generics: Arc::new(generic_params),
 					params: param_types,
 					has_spread: params.last().map(|p| p.0.spread).unwrap_or(false),
 					return_type: Box::new(return_t),
+					constructor: false,
 				})
 			}
 			Expr::PrefixOp { op, value } => {
@@ -934,6 +989,15 @@ impl TypeChecker {
 				Ok(Type::Void)
 			}
 			Expr::Continue { label: _ } => Ok(Type::Void),
+			Expr::While {
+				condition,
+				body,
+				label: _,
+			} => {
+				self.infer(condition, ctx)?;
+				self.infer(body, ctx)?;
+				Ok(Type::Void)
+			}
 			Expr::For {
 				variable,
 				iterable,
@@ -944,34 +1008,23 @@ impl TypeChecker {
 				let item_type = match iterable_type {
 					Type::List { item } => *item,
 					Type::Map { value, .. } => *value,
-					_ => Type::Variable {
-						name: EcoString::from("_infer"),
-						constraint: None,
-					},
+					_ => self.fresh_var("_infer", None),
 				};
 
-				let mut loop_ctx = ctx.clone();
-				if let Pattern::Binding { name, .. } = &variable.0 {
-					loop_ctx = loop_ctx.with_new_entry(
-						name.0.clone(),
+				let identifiers = self.pattern_identifiers(&variable.0, item_type, ctx)?;
+				let mut body_ctx = ctx.clone();
+				for (name, ty) in identifiers {
+					body_ctx.insert_entry(
+						name,
 						ContextEntry::Value(ContextValue {
-							type_: item_type,
+							type_: ty,
 							mutable: false,
 							visibility: Visibility::Private,
 						}),
 					);
 				}
 
-				self.infer(body, &loop_ctx)?;
-				Ok(Type::Void)
-			}
-			Expr::While {
-				condition,
-				body,
-				label: _,
-			} => {
-				self.infer(condition, ctx)?;
-				self.infer(body, ctx)?;
+				self.infer(body, &body_ctx)?;
 				Ok(Type::Void)
 			}
 			Expr::If {
@@ -998,7 +1051,7 @@ impl TypeChecker {
 
 					let mut arm_ctx = ctx.clone();
 					for (name, ty) in identifiers {
-						arm_ctx = arm_ctx.with_new_entry(
+						arm_ctx.insert_entry(
 							name,
 							ContextEntry::Value(ContextValue {
 								type_: ty,
@@ -1024,10 +1077,7 @@ impl TypeChecker {
 					ContextEntry::Impl { parent, .. } => parent.type_.clone(),
 				})
 				.ok_or(TypeError::ThisOutsideStruct(span_to_range(span))),
-			Expr::Placeholder => Ok(Type::Variable {
-				name: EcoString::from("_placeholder"),
-				constraint: None,
-			}),
+			Expr::Placeholder => Ok(self.fresh_var("_placeholder", None)),
 			Expr::Block { body, label: _ } => {
 				let mut block_ctx = ctx.clone();
 				let mut result_type = Type::Void;
@@ -1051,12 +1101,17 @@ impl TypeChecker {
 								None => inferred,
 							};
 
-							if let Pattern::Binding {
-								name: binding_name, ..
-							} = &name.0
-							{
-								block_ctx = block_ctx.with_new_entry(
-									binding_name.0.clone(),
+							let binding_name = match &name.0 {
+								Pattern::Binding { name, .. } => Some(name.0.clone()),
+								Pattern::Struct { path, fields } if path.len() == 1 && fields.is_empty() => {
+									Some(path[0].0.clone())
+								}
+								_ => None,
+							};
+
+							if let Some(binding_name) = binding_name {
+								block_ctx.insert_entry(
+									binding_name,
 									ContextEntry::Value(ContextValue {
 										type_: final_type,
 										mutable: *mutable,
@@ -1110,31 +1165,49 @@ impl TypeChecker {
 				} else if let Some(impl_member) = self.lookup_impl_member(impls, &member.0) {
 					Ok(impl_member)
 				} else {
+					let candidates = fields.keys().chain(members.keys());
 					Err(TypeError::UnknownMember {
 						type_: ty.clone().into(),
 						member: member.0.clone(),
+						suggestion: find_similar_name(&member.0, candidates),
 						span: span_to_range(member.1),
 					})
 				}
 			}
 			Type::Enum {
-				members, impls, ..
+				members,
+				impls,
+				variants,
+				generics,
+				..
 			} => {
 				if let Some(member_def) = members.get(&member.0) {
 					Ok(member_def.type_.as_ref().clone())
 				} else if let Some(impl_member) = self.lookup_impl_member(impls, &member.0) {
 					Ok(impl_member)
+				} else if let Some(variant_fields) = variants.get(&member.0) {
+					let mut param_types = Vec::new();
+					for (field_name, field_type) in variant_fields {
+						param_types.push((Some(field_name.clone()), field_type.clone()));
+					}
+					Ok(Type::Function {
+						generics: Arc::new(Vec::new()),
+						params: param_types,
+						has_spread: false,
+						return_type: Box::new(ty.clone()),
+						constructor: false,
+					})
 				} else {
+					let candidates = members.keys().chain(variants.keys());
 					Err(TypeError::UnknownMember {
 						type_: ty.clone().into(),
 						member: member.0.clone(),
+						suggestion: find_similar_name(&member.0, candidates),
 						span: span_to_range(member.1),
 					})
 				}
 			}
-			Type::EnumVariant {
-				fields, impls, ..
-			} => {
+			Type::EnumVariant { fields, impls, .. } => {
 				if let Some(field_type) = fields.get(&member.0) {
 					Ok(field_type.clone())
 				} else if let Some(impl_member) = self.lookup_impl_member(impls, &member.0) {
@@ -1143,6 +1216,7 @@ impl TypeChecker {
 					Err(TypeError::UnknownMember {
 						type_: ty.clone().into(),
 						member: member.0.clone(),
+						suggestion: find_similar_name(&member.0, fields.keys()),
 						span: span_to_range(member.1),
 					})
 				}
@@ -1154,6 +1228,7 @@ impl TypeChecker {
 					Err(TypeError::UnknownMember {
 						type_: ty.clone().into(),
 						member: member.0.clone(),
+						suggestion: find_similar_name(&member.0, members.keys()),
 						span: span_to_range(member.1),
 					})
 				}
@@ -1167,8 +1242,13 @@ impl TypeChecker {
 				.ok_or_else(|| TypeError::UnknownMember {
 					type_: ty.clone().into(),
 					member: member.0.clone(),
+					suggestion: find_similar_name(&member.0, members.keys()),
 					span: span_to_range(member.1),
 				}),
+			Type::Variable {
+				constraint: Some(constraint),
+				..
+			} => self.access_member(constraint, member),
 			_ => Err(TypeError::NotAccessible(span_to_range(member.1))),
 		}
 	}
@@ -1179,10 +1259,10 @@ impl TypeChecker {
 		member_name: &EcoString,
 	) -> Option<Type> {
 		for interface_ty in impls.values() {
-			if let Type::Interface { members, .. } = interface_ty {
-				if let Some(member_def) = members.get(member_name) {
-					return Some(member_def.type_.as_ref().clone());
-				}
+			if let Type::Interface { members, .. } = interface_ty
+				&& let Some(member_def) = members.get(member_name)
+			{
+				return Some(member_def.type_.as_ref().clone());
 			}
 		}
 		None
@@ -1308,10 +1388,7 @@ impl TypeChecker {
 				.self_type
 				.clone()
 				.ok_or_else(|| TypeError::SelfTypeInGlobalScope(span_to_range(span))),
-			ast::types::Type::Infer => Ok(Type::Variable {
-				name: EcoString::from("_infer"),
-				constraint: None,
-			}),
+			ast::types::Type::Infer => Ok(self.fresh_var("_infer", None)),
 			ast::types::Type::Intersection(a, b) => {
 				let first = self.resolve_ast_type(&a.0, a.1, ctx)?;
 				let second = self.resolve_ast_type(&b.0, b.1, ctx)?;
@@ -1355,10 +1432,11 @@ impl TypeChecker {
 					.collect();
 				let return_t = self.resolve_ast_type(&return_type.0, return_type.1, ctx)?;
 				Ok(Type::Function {
-					generics: Vec::new(),
+					generics: Arc::new(Vec::new()),
 					params: param_types?,
 					has_spread: false,
 					return_type: Box::new(return_t),
+					constructor: false,
 				})
 			}
 			ast::types::Type::Reference { name, generics } => {
@@ -1378,9 +1456,22 @@ impl TypeChecker {
 		ctx: &Context,
 	) -> Result<Type, TypeError> {
 		// Look up the base type
-		let base_type = ctx
+		let raw_type = ctx
 			.lookup_type(name)
-			.ok_or_else(|| TypeError::UnknownType(name.clone(), span_to_range(span)))?;
+			.ok_or_else(|| TypeError::UnknownType {
+				name: name.clone(),
+				suggestion: find_similar_name(name, ctx.local_ctx.keys()),
+				span: span_to_range(span),
+			})?;
+
+		// If the entry is a constructor function whose return type is a struct,
+		// resolve to the struct type instead.
+		let base_type = match &raw_type {
+			Type::Function { return_type, .. } if matches!(return_type.as_ref(), Type::Struct { .. }) => {
+				*return_type.clone()
+			}
+			_ => raw_type,
+		};
 
 		// If there are generic arguments, instantiate them
 		if !generics.is_empty() {
@@ -1390,12 +1481,14 @@ impl TypeChecker {
 		}
 	}
 
-	/// Resolve AST generic parameters into GenericParamInfo
+	/// Resolve AST generic parameters into GenericParamInfo, also returning the
+	/// context extended with the new type variables so callers don't need to
+	/// re-create entries with different IDs.
 	fn resolve_generic_params(
 		&mut self,
 		params: &[Spanned<ast::types::GenericParam>],
 		ctx: &Context,
-	) -> Result<Vec<GenericParamInfo>, TypeError> {
+	) -> Result<(Vec<GenericParamInfo>, Context), TypeError> {
 		let mut result = Vec::with_capacity(params.len());
 		let mut resolve_ctx = ctx.clone();
 
@@ -1409,17 +1502,20 @@ impl TypeChecker {
 				None => None,
 			};
 
+			let id = self.fresh_type_var_id();
 			let gp = GenericParamInfo {
+				id,
 				name: param.0.name.0.clone(),
 				constraint,
 				default,
 			};
 			result.push(gp.clone());
 
-			resolve_ctx = resolve_ctx.with_new_entry(
+			resolve_ctx.insert_entry(
 				param.0.name.0.clone(),
 				ContextEntry::Value(ContextValue {
 					type_: Type::Variable {
+						id,
 						name: param.0.name.0.clone(),
 						constraint: gp.constraint.clone().map(Box::new),
 					},
@@ -1429,7 +1525,7 @@ impl TypeChecker {
 			);
 		}
 
-		Ok(result)
+		Ok((result, resolve_ctx))
 	}
 
 	/// Instantiate a generic type with concrete type arguments
@@ -1441,10 +1537,10 @@ impl TypeChecker {
 		ctx: &Context,
 	) -> Result<Type, TypeError> {
 		let type_params = match &base_type {
-			Type::Struct { generics, .. } => generics.clone(),
-			Type::Enum { generics, .. } => generics.clone(),
-			Type::Interface { generics, .. } => generics.clone(),
-			Type::Function { generics, .. } => generics.clone(),
+			Type::Struct { generics, .. }
+			| Type::Enum { generics, .. }
+			| Type::Interface { generics, .. }
+			| Type::Function { generics, .. } => (**generics).clone(),
 			_ => Vec::new(),
 		};
 
@@ -1456,7 +1552,7 @@ impl TypeChecker {
 			});
 		}
 
-		let mut subst: HashMap<EcoString, Type> = HashMap::new();
+		let mut subst: HashMap<TypeVarId, Type> = HashMap::new();
 		let mut provided_by_name: HashMap<EcoString, Type> = HashMap::new();
 		let mut positional_args: Vec<Type> = Vec::new();
 
@@ -1478,7 +1574,7 @@ impl TypeChecker {
 				positional_idx += 1;
 				Some(ty)
 			} else if let Some(default) = &param.default {
-				Some(self.substitute(default, &subst)?)
+				Some(self.substitute(default, &subst, span)?)
 			} else {
 				None
 			};
@@ -1486,10 +1582,10 @@ impl TypeChecker {
 			match arg_type {
 				Some(ty) => {
 					if let Some(constraint) = &param.constraint {
-						let subst_constraint = self.substitute(constraint, &subst)?;
+						let subst_constraint = self.substitute(constraint, &subst, span)?;
 						self.check_constraint_at(&ty, &subst_constraint, span)?;
 					}
-					subst.insert(param.name.clone(), ty);
+					subst.insert(param.id, ty);
 				}
 				None => {
 					return Err(TypeError::GenericArgumentMismatch {
@@ -1501,29 +1597,36 @@ impl TypeChecker {
 			}
 		}
 
-		let type_args: Vec<Type> = type_params.iter().map(|p| subst[&p.name].clone()).collect();
-		self.substitute_with_args(&base_type, &subst, type_args)
+		let type_args: Vec<Type> = type_params.iter().map(|p| subst[&p.id].clone()).collect();
+		self.substitute_with_args(&base_type, &subst, type_args, span)
 	}
 
 	/// Substitute type variables in a type according to the substitution map
-	fn substitute(&self, ty: &Type, subst: &HashMap<EcoString, Type>) -> Result<Type, TypeError> {
-		self.substitute_with_args(ty, subst, Vec::new())
+	fn substitute(
+		&self,
+		ty: &Type,
+		subst: &HashMap<TypeVarId, Type>,
+		span: Span,
+	) -> Result<Type, TypeError> {
+		self.substitute_with_args(ty, subst, Vec::new(), span)
 	}
 
 	fn substitute_with_args(
 		&self,
 		ty: &Type,
-		subst: &HashMap<EcoString, Type>,
+		subst: &HashMap<TypeVarId, Type>,
 		type_args: Vec<Type>,
+		span: Span,
 	) -> Result<Type, TypeError> {
 		match ty {
-			Type::Variable { name, .. } => {
-				if let Some(replacement) = subst.get(name) {
-					if self.occurs_in(name, replacement) {
+			Type::Variable { id, name, .. } => {
+				if let Some(replacement) = subst.get(id) {
+					let is_identity = matches!(replacement, Type::Variable { id: rid, .. } if rid == id);
+					if !is_identity && self.occurs_in(id, replacement) {
 						return Err(TypeError::InfiniteTypeInstantiation {
 							var: name.clone(),
 							ty: Box::new(replacement.clone()),
-							span: 0..0,
+							span: span_to_range(span),
 						});
 					}
 					Ok(replacement.clone())
@@ -1532,38 +1635,40 @@ impl TypeChecker {
 				}
 			}
 			Type::List { item } => Ok(Type::List {
-				item: Box::new(self.substitute(item, subst)?),
+				item: Box::new(self.substitute(item, subst, span)?),
 			}),
 			Type::Tuple { items } => Ok(Type::Tuple {
 				items: items
 					.iter()
-					.map(|i| self.substitute(i, subst))
+					.map(|i| self.substitute(i, subst, span))
 					.collect::<Result<_, _>>()?,
 			}),
 			Type::Map { key, value } => Ok(Type::Map {
-				key: Box::new(self.substitute(key, subst)?),
-				value: Box::new(self.substitute(value, subst)?),
+				key: Box::new(self.substitute(key, subst, span)?),
+				value: Box::new(self.substitute(value, subst, span)?),
 			}),
 			Type::Function {
 				generics,
 				params,
 				has_spread,
 				return_type,
+				..
 			} => {
 				let new_params: Result<Vec<_>, _> = params
 					.iter()
-					.map(|(name, ty)| self.substitute(ty, subst).map(|t| (name.clone(), t)))
+					.map(|(name, ty)| self.substitute(ty, subst, span).map(|t| (name.clone(), t)))
 					.collect();
 				Ok(Type::Function {
 					generics: generics.clone(),
 					params: new_params?,
 					has_spread: *has_spread,
-					return_type: Box::new(self.substitute(return_type, subst)?),
+					return_type: Box::new(self.substitute(return_type, subst, span)?),
+					constructor: false,
 				})
 			}
 			Type::Intersection { first, second } => Ok(Type::Intersection {
-				first: Box::new(self.substitute(first, subst)?),
-				second: Box::new(self.substitute(second, subst)?),
+				first: Box::new(self.substitute(first, subst, span)?),
+				second: Box::new(self.substitute(second, subst, span)?),
 			}),
 			Type::Struct {
 				name,
@@ -1575,12 +1680,12 @@ impl TypeChecker {
 			} => {
 				let new_fields: Result<BTreeMap<_, _>, _> = fields
 					.iter()
-					.map(|(k, v)| self.substitute(v, subst).map(|t| (k.clone(), t)))
+					.map(|(k, v)| self.substitute(v, subst, span).map(|t| (k.clone(), t)))
 					.collect();
 				let new_members: Result<BTreeMap<_, _>, _> = members
 					.iter()
 					.map(|(k, m)| {
-						self.substitute(&m.type_, subst).map(|t| {
+						self.substitute(&m.type_, subst, span).map(|t| {
 							(
 								k.clone(),
 								StructMember {
@@ -1599,8 +1704,8 @@ impl TypeChecker {
 					} else {
 						type_args
 					},
-					fields: new_fields?,
-					members: new_members?,
+					fields: Arc::new(new_fields?),
+					members: Arc::new(new_members?),
 					impls: impls.clone(),
 					def_key: None,
 				})
@@ -1618,7 +1723,7 @@ impl TypeChecker {
 					.map(|(vname, vfields)| {
 						let new_vfields: Result<BTreeMap<_, _>, _> = vfields
 							.iter()
-							.map(|(k, v)| self.substitute(v, subst).map(|t| (k.clone(), t)))
+							.map(|(k, v)| self.substitute(v, subst, span).map(|t| (k.clone(), t)))
 							.collect();
 						new_vfields.map(|f| (vname.clone(), f))
 					})
@@ -1626,7 +1731,7 @@ impl TypeChecker {
 				let new_members: Result<BTreeMap<_, _>, _> = members
 					.iter()
 					.map(|(k, m)| {
-						self.substitute(&m.type_, subst).map(|t| {
+						self.substitute(&m.type_, subst, span).map(|t| {
 							(
 								k.clone(),
 								StructMember {
@@ -1645,8 +1750,8 @@ impl TypeChecker {
 					} else {
 						type_args
 					},
-					variants: new_variants?,
-					members: new_members?,
+					variants: Arc::new(new_variants?),
+					members: Arc::new(new_members?),
 					impls: impls.clone(),
 					def_key: None,
 				})
@@ -1660,13 +1765,13 @@ impl TypeChecker {
 			} => {
 				let new_fields: Result<BTreeMap<_, _>, _> = fields
 					.iter()
-					.map(|(k, v)| self.substitute(v, subst).map(|t| (k.clone(), t)))
+					.map(|(k, v)| self.substitute(v, subst, span).map(|t| (k.clone(), t)))
 					.collect();
 				Ok(Type::EnumVariant {
 					name: name.clone(),
 					variant_name: variant_name.clone(),
-					fields: new_fields?,
-					variant_of: Box::new(self.substitute(variant_of, subst)?),
+					fields: Arc::new(new_fields?),
+					variant_of: Box::new(self.substitute(variant_of, subst, span)?),
 					impls: impls.clone(),
 				})
 			}
@@ -1680,7 +1785,7 @@ impl TypeChecker {
 				let new_members: Result<BTreeMap<_, _>, _> = members
 					.iter()
 					.map(|(k, m)| {
-						self.substitute(&m.type_, subst).map(|t| {
+						self.substitute(&m.type_, subst, span).map(|t| {
 							(
 								k.clone(),
 								StructMember {
@@ -1699,7 +1804,7 @@ impl TypeChecker {
 					} else {
 						type_args
 					},
-					members: new_members?,
+					members: Arc::new(new_members?),
 					impls: impls.clone(),
 					def_key: None,
 				})
@@ -1715,9 +1820,9 @@ impl TypeChecker {
 		}
 	}
 
-	fn occurs_in(&self, var: &EcoString, ty: &Type) -> bool {
+	fn occurs_in(&self, var: &TypeVarId, ty: &Type) -> bool {
 		match ty {
-			Type::Variable { name, .. } => name == var,
+			Type::Variable { id, .. } => id == var,
 			Type::List { item } => self.occurs_in(var, item),
 			Type::Tuple { items } => items.iter().any(|i| self.occurs_in(var, i)),
 			Type::Map { key, value } => self.occurs_in(var, key) || self.occurs_in(var, value),
@@ -1741,12 +1846,7 @@ impl TypeChecker {
 		}
 	}
 
-	fn check_constraint_at(
-		&self,
-		ty: &Type,
-		constraint: &Type,
-		span: Span,
-	) -> Result<(), TypeError> {
+	fn check_constraint_at(&self, ty: &Type, constraint: &Type, span: Span) -> Result<(), TypeError> {
 		if ty.assignable_to(constraint, &Context::default()) {
 			Ok(())
 		} else {
@@ -1770,7 +1870,7 @@ impl TypeChecker {
 		span: Span,
 		ctx: &Context,
 	) -> Result<Type, TypeError> {
-		let mut subst: HashMap<EcoString, Type> = HashMap::new();
+		let mut subst: HashMap<TypeVarId, Type> = HashMap::new();
 
 		let mut provided_by_name: HashMap<EcoString, Type> = HashMap::new();
 		let mut positional_args: Vec<Type> = Vec::new();
@@ -1787,10 +1887,28 @@ impl TypeChecker {
 		let mut positional_idx = 0;
 		for param in func_generics {
 			if let Some(ty) = provided_by_name.remove(&param.name) {
-				subst.insert(param.name.clone(), ty);
+				subst.insert(param.id, ty);
 			} else if positional_idx < positional_args.len() {
-				subst.insert(param.name.clone(), positional_args[positional_idx].clone());
+				subst.insert(param.id, positional_args[positional_idx].clone());
 				positional_idx += 1;
+			}
+		}
+
+		for arg in args {
+			if let Some(name_ident) = &arg.0.name {
+				let name = &name_ident.0;
+				if !func_params
+					.iter()
+					.any(|(p_name, _)| p_name.as_ref().is_some_and(|n| n == name))
+				{
+					let suggestion =
+						find_similar_name(name, func_params.iter().filter_map(|(n, _)| n.as_ref()));
+					return Err(TypeError::UnknownNamedArgument {
+						name: name.clone(),
+						suggestion,
+						span: span_to_range(name_ident.1),
+					});
+				}
 			}
 		}
 
@@ -1803,10 +1921,10 @@ impl TypeChecker {
 		}
 
 		for param in func_generics {
-			if !subst.contains_key(&param.name) {
+			if !subst.contains_key(&param.id) {
 				if let Some(default) = &param.default {
-					let default_resolved = self.substitute(default, &subst)?;
-					subst.insert(param.name.clone(), default_resolved);
+					let default_resolved = self.substitute(default, &subst, span)?;
+					subst.insert(param.id, default_resolved);
 				} else {
 					return Err(TypeError::GenericArgumentMismatch {
 						expected: func_generics.len(),
@@ -1819,27 +1937,25 @@ impl TypeChecker {
 
 		for param in func_generics {
 			if let Some(constraint) = &param.constraint {
-				let subst_constraint = self.substitute(constraint, &subst)?;
-				if let Some(arg_ty) = subst.get(&param.name) {
+				let subst_constraint = self.substitute(constraint, &subst, span)?;
+				if let Some(arg_ty) = subst.get(&param.id) {
 					self.check_constraint_at(arg_ty, &subst_constraint, span)?;
 				}
 			}
 		}
 
-		self.substitute(func_return_type, &subst)
+		self.substitute(func_return_type, &subst, span)
 	}
 
 	fn unify_for_inference(
 		&self,
 		param_type: &Type,
 		arg_type: &Type,
-		subst: &mut HashMap<EcoString, Type>,
+		subst: &mut HashMap<TypeVarId, Type>,
 	) {
 		match param_type {
-			Type::Variable { name, .. } => {
-				if !subst.contains_key(name) && !name.starts_with('_') {
-					subst.insert(name.clone(), arg_type.clone());
-				}
+			Type::Variable { id, name, .. } if !subst.contains_key(id) && !name.starts_with('_') => {
+				subst.insert(*id, arg_type.clone());
 			}
 			Type::List { item } => {
 				if let Type::List { item: arg_item } = arg_type {
@@ -1907,7 +2023,7 @@ impl TypeChecker {
 	}
 
 	fn pattern_identifiers(
-		&self,
+		&mut self,
 		pattern: &Pattern,
 		scrutinee: Type,
 		_ctx: &Context,
@@ -1918,7 +2034,7 @@ impl TypeChecker {
 	}
 
 	fn collect_pattern_identifiers(
-		&self,
+		&mut self,
 		pattern: &Pattern,
 		scrutinee: Type,
 		identifiers: &mut HashMap<EcoString, Type>,
@@ -2037,10 +2153,7 @@ impl TypeChecker {
 									span: 0..0,
 								});
 							}
-							let value_type = Type::Variable {
-								name: EcoString::from("_map_value"),
-								constraint: None,
-							};
+							let value_type = self.fresh_var("_map_value", None);
 							self.collect_pattern_identifiers(&value.0, value_type, identifiers)?;
 						}
 						ast::expr::MapPatternEntry::Rest(_) => {}
@@ -2064,7 +2177,7 @@ impl TypeChecker {
 					Type::Struct {
 						fields: struct_fields,
 						..
-					} => Some(struct_fields.clone()),
+					} => Some((**struct_fields).clone()),
 					_ => None,
 				};
 
@@ -2073,27 +2186,19 @@ impl TypeChecker {
 						match &field.0 {
 							ast::expr::StructPatternField::Value { name, value } => {
 								// Get the type for this field from the variant
-								let field_type =
-									variant_fields
-										.get(&name.0)
-										.cloned()
-										.unwrap_or_else(|| Type::Variable {
-											name: EcoString::from("_unknown_field"),
-											constraint: None,
-										});
+								let field_type = variant_fields
+									.get(&name.0)
+									.cloned()
+									.unwrap_or_else(|| self.fresh_var("_unknown_field", None));
 								// Recursively extract identifiers from the value pattern
 								self.collect_pattern_identifiers(&value.0, field_type, identifiers)?;
 							}
 							ast::expr::StructPatternField::Named(ident) => {
 								// Shorthand: `field_name` binds field_name to the field's type
-								let field_type =
-									variant_fields
-										.get(&ident.0)
-										.cloned()
-										.unwrap_or_else(|| Type::Variable {
-											name: EcoString::from("_unknown_field"),
-											constraint: None,
-										});
+								let field_type = variant_fields
+									.get(&ident.0)
+									.cloned()
+									.unwrap_or_else(|| self.fresh_var("_unknown_field", None));
 								if identifiers.insert(ident.0.clone(), field_type).is_some() {
 									return Err(TypeError::DuplicatePatternIdentifier {
 										pattern: pattern.clone(),
@@ -2183,15 +2288,31 @@ impl TypeChecker {
 	) -> Result<BTreeMap<EcoString, StructMember>, TypeError> {
 		let mut interface_members = BTreeMap::new();
 
+		// Add `this` to the context for default implementations, typed as the self type
+		let this_type = ctx
+			.self_type
+			.clone()
+			.unwrap_or_else(|| self.fresh_var("self", None));
+		let member_ctx = ctx.with_new_entry(
+			EcoString::from("this"),
+			ContextEntry::Value(ContextValue {
+				type_: this_type,
+				mutable: false,
+				visibility: Visibility::Private,
+			}),
+		);
+
 		for member_spanned in members {
 			match &member_spanned.0 {
 				InterfaceMember::Element(elem_spanned) => {
-					if let Some((name, member)) = self.check_interface_element(&elem_spanned.0, ctx)? {
+					if let Some((name, member)) =
+						self.check_interface_element(&elem_spanned.0, &member_ctx)?
+					{
 						interface_members.insert(name, member);
 					}
 				}
 				InterfaceMember::Namespace(impl_members) => {
-					// Namespace members in interface (static members)
+					// Namespace members in interface (static members — no `this`)
 					for impl_member in impl_members {
 						if let Some((name, struct_member)) =
 							self.check_impl_member(impl_member, ctx, StructMemberKind::Namespace)?
@@ -2202,8 +2323,19 @@ impl TypeChecker {
 				}
 				InterfaceMember::ImplMut(elements) => {
 					// Mutable interface elements
+					let mutable_ctx = ctx.with_new_entry(
+						EcoString::from("this"),
+						ContextEntry::Value(ContextValue {
+							type_: ctx
+								.self_type
+								.clone()
+								.unwrap_or_else(|| self.fresh_var("self", None)),
+							mutable: true,
+							visibility: Visibility::Private,
+						}),
+					);
 					for elem in elements {
-						if let Some((name, member)) = self.check_interface_element(&elem.0, ctx)? {
+						if let Some((name, member)) = self.check_interface_element(&elem.0, &mutable_ctx)? {
 							interface_members.insert(
 								name,
 								StructMember {
@@ -2222,7 +2354,7 @@ impl TypeChecker {
 					// Impl blocks inside interface
 					for impl_member in impl_members {
 						if let Some((name, struct_member)) =
-							self.check_impl_member(impl_member, ctx, StructMemberKind::Immutable)?
+							self.check_impl_member(impl_member, &member_ctx, StructMemberKind::Immutable)?
 						{
 							interface_members.insert(name, struct_member);
 						}
@@ -2250,10 +2382,12 @@ impl TypeChecker {
 						Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, ctx)?)),
 						None => None,
 					};
-					func_ctx = func_ctx.with_new_entry(
+					let id = self.fresh_type_var_id();
+					func_ctx.insert_entry(
 						generic.0.name.0.clone(),
 						ContextEntry::Value(ContextValue {
 							type_: Type::Variable {
+								id,
 								name: generic.0.name.0.clone(),
 								constraint,
 							},
@@ -2281,7 +2415,7 @@ impl TypeChecker {
 					param_types.push((param_name.clone(), param_type.clone()));
 
 					if let Some(name) = param_name {
-						func_ctx = func_ctx.with_new_entry(
+						func_ctx.insert_entry(
 							name,
 							ContextEntry::Value(ContextValue {
 								type_: param_type,
@@ -2310,10 +2444,11 @@ impl TypeChecker {
 				}
 
 				let func_type = Type::Function {
-					generics: Vec::new(),
+					generics: Arc::new(Vec::new()),
 					params: param_types,
 					has_spread: meta.params.last().is_some_and(|p| p.0.spread),
 					return_type: Box::new(return_type),
+					constructor: false,
 				};
 
 				Ok(Some((
@@ -2332,10 +2467,7 @@ impl TypeChecker {
 						if let Some(val) = value {
 							self.infer(val, ctx)?
 						} else {
-							Type::Variable {
-								name: EcoString::from("_infer"),
-								constraint: None,
-							}
+							self.fresh_var("_infer", None)
 						}
 					}
 				};
@@ -2372,8 +2504,10 @@ impl TypeChecker {
 		}
 	}
 
-	/// Type-check a single ImplMember and return its name, type, and member kind
-	fn check_impl_member(
+	/// Collect the signature of an ImplMember without type-checking its body.
+	/// For functions, this resolves param types and return type annotation.
+	/// For let bindings, this resolves the type annotation (or infers from value if no annotation).
+	fn collect_impl_member_signature(
 		&mut self,
 		member: &Spanned<ImplMember>,
 		member_ctx: &Context,
@@ -2389,13 +2523,9 @@ impl TypeChecker {
 				},
 				value,
 			} => {
-				let inferred_type = self.infer(value, member_ctx)?;
 				let final_type = match type_ {
-					Some(t) => {
-						let expected = self.resolve_ast_type(&t.0, t.1, member_ctx)?;
-						self.check_expr(value, &expected, member_ctx)?
-					}
-					None => inferred_type,
+					Some(t) => self.resolve_ast_type(&t.0, t.1, member_ctx)?,
+					None => self.infer(value, member_ctx)?,
 				};
 
 				if let Pattern::Binding {
@@ -2428,10 +2558,7 @@ impl TypeChecker {
 			) => {
 				let let_type = match type_ {
 					Some(t) => self.resolve_ast_type(&t.0, t.1, member_ctx)?,
-					None => Type::Variable {
-						name: EcoString::from("_infer"),
-						constraint: None,
-					},
+					None => self.fresh_var("_infer", None),
 				};
 
 				if let Pattern::Binding {
@@ -2463,20 +2590,30 @@ impl TypeChecker {
 						params,
 						return_type,
 					},
-				body,
-			} => {
+				body: _,
+			}
+			| ImplMember::ExternalFunc(
+				_,
+				FuncDeclaration {
+					name: Spanned(func_name, _),
+					generics,
+					params,
+					return_type,
+				},
+			) => {
 				let mut func_ctx = member_ctx.clone();
 
-				// Add generics to context
 				for generic in generics {
 					let constraint = match &generic.0.constraint {
 						Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, member_ctx)?)),
 						None => None,
 					};
-					func_ctx = func_ctx.with_new_entry(
+					let id = self.fresh_type_var_id();
+					func_ctx.insert_entry(
 						generic.0.name.0.clone(),
 						ContextEntry::Value(ContextValue {
 							type_: Type::Variable {
+								id,
 								name: generic.0.name.0.clone(),
 								constraint,
 							},
@@ -2486,25 +2623,27 @@ impl TypeChecker {
 					);
 				}
 
-				// Add parameters to context and collect parameter types
 				let mut param_types = Vec::new();
 				for param in params {
-					let param_type = self.resolve_ast_type(&param.0.type_.0, param.0.type_.1, &func_ctx)?;
-
-					// Extract parameter name from pattern
+					let param_type = {
+						let ty = self.resolve_ast_type(&param.0.type_.0, param.0.type_.1, &func_ctx)?;
+						if param.0.spread {
+							Type::List { item: Box::new(ty) }
+						} else {
+							ty
+						}
+					};
 					let param_name = match &param.0.name.0 {
 						Pattern::Binding { name, .. } => Some(name.0.clone()),
-						// Handle bare identifiers parsed as struct patterns with no fields
 						Pattern::Struct { path, fields } if path.len() == 1 && fields.is_empty() => {
 							Some(path[0].0.clone())
 						}
 						_ => None,
 					};
-
 					param_types.push((param_name.clone(), param_type.clone()));
 
 					if let Some(name) = param_name {
-						func_ctx = func_ctx.with_new_entry(
+						func_ctx.insert_entry(
 							name,
 							ContextEntry::Value(ContextValue {
 								type_: param_type,
@@ -2515,7 +2654,112 @@ impl TypeChecker {
 					}
 				}
 
-				// Check body
+				let return_ty = match return_type {
+					Some(t) => self.resolve_ast_type(&t.0, t.1, &func_ctx)?,
+					None => self.fresh_var("_infer", None),
+				};
+
+				let func_type = Type::Function {
+					generics: Arc::new(Vec::new()),
+					params: param_types,
+					has_spread: params.last().is_some_and(|p| p.0.spread),
+					return_type: Box::new(return_ty),
+					constructor: false,
+				};
+
+				Ok(Some((
+					func_name.clone(),
+					StructMember {
+						type_: Box::new(func_type),
+						kind: member_kind,
+					},
+				)))
+			}
+		}
+	}
+
+	/// Type-check a single ImplMember body against the context (which should already have
+	/// all sibling member signatures). Returns the checked type for functions without
+	/// explicit return type annotations.
+	fn check_impl_member_body(
+		&mut self,
+		member: &Spanned<ImplMember>,
+		member_ctx: &Context,
+	) -> Result<(), TypeError> {
+		match &member.0 {
+			ImplMember::Let {
+				visibility: _,
+				meta: LetDeclaration { type_: Some(t), .. },
+				value,
+			} => {
+				let expected = self.resolve_ast_type(&t.0, t.1, member_ctx)?;
+				self.check_expr(value, &expected, member_ctx)?;
+				Ok(())
+			}
+			ImplMember::Let { value, .. } => {
+				self.infer(value, member_ctx)?;
+				Ok(())
+			}
+			ImplMember::Func {
+				visibility: _,
+				meta: FuncDeclaration {
+					generics,
+					params,
+					return_type,
+					..
+				},
+				body,
+			} => {
+				let mut func_ctx = member_ctx.clone();
+
+				for generic in generics {
+					let constraint = match &generic.0.constraint {
+						Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, member_ctx)?)),
+						None => None,
+					};
+					let id = self.fresh_type_var_id();
+					func_ctx.insert_entry(
+						generic.0.name.0.clone(),
+						ContextEntry::Value(ContextValue {
+							type_: Type::Variable {
+								id,
+								name: generic.0.name.0.clone(),
+								constraint,
+							},
+							mutable: false,
+							visibility: Visibility::Private,
+						}),
+					);
+				}
+
+				for param in params {
+					let param_type = {
+						let ty = self.resolve_ast_type(&param.0.type_.0, param.0.type_.1, &func_ctx)?;
+						if param.0.spread {
+							Type::List { item: Box::new(ty) }
+						} else {
+							ty
+						}
+					};
+					let param_name = match &param.0.name.0 {
+						Pattern::Binding { name, .. } => Some(name.0.clone()),
+						Pattern::Struct { path, fields } if path.len() == 1 && fields.is_empty() => {
+							Some(path[0].0.clone())
+						}
+						_ => None,
+					};
+					if let Some(name) = param_name {
+						func_ctx.insert_entry(
+							name,
+							ContextEntry::Value(ContextValue {
+								type_: param_type,
+								mutable: param.0.mutable,
+								visibility: Visibility::Private,
+							}),
+						);
+					}
+				}
+
 				let inferred_return = self.infer(body, &func_ctx)?;
 				let expected_return = match return_type {
 					Some(t) => self.resolve_ast_type(&t.0, t.1, member_ctx)?,
@@ -2530,85 +2774,23 @@ impl TypeChecker {
 					});
 				}
 
-				let func_type = Type::Function {
-					generics: Vec::new(),
-					params: param_types,
-					has_spread: params.last().is_some_and(|p| p.0.spread),
-					return_type: Box::new(expected_return),
-				};
-
-				Ok(Some((
-					func_name.clone(),
-					StructMember {
-						type_: Box::new(func_type),
-						kind: member_kind,
-					},
-				)))
+				Ok(())
 			}
-			ImplMember::ExternalFunc(
-				_visibility,
-				FuncDeclaration {
-					name: Spanned(func_name, _),
-					generics,
-					params,
-					return_type,
-				},
-			) => {
-				let mut func_ctx = member_ctx.clone();
-
-				// Add generics to context
-				for generic in generics {
-					let constraint = match &generic.0.constraint {
-						Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, member_ctx)?)),
-						None => None,
-					};
-					func_ctx = func_ctx.with_new_entry(
-						generic.0.name.0.clone(),
-						ContextEntry::Value(ContextValue {
-							type_: Type::Variable {
-								name: generic.0.name.0.clone(),
-								constraint,
-							},
-							mutable: false,
-							visibility: Visibility::Private,
-						}),
-					);
-				}
-
-				// Collect parameter types
-				let mut param_types = Vec::new();
-				for param in params {
-					let param_type = self.resolve_ast_type(&param.0.type_.0, param.0.type_.1, &func_ctx)?;
-					param_types.push((
-						match &param.0.name.0 {
-							Pattern::Binding { name, .. } => Some(name.0.clone()),
-							_ => None,
-						},
-						param_type,
-					));
-				}
-
-				let return_ty = match return_type {
-					Some(t) => self.resolve_ast_type(&t.0, t.1, member_ctx)?,
-					None => Type::Void,
-				};
-
-				let func_type = Type::Function {
-					generics: Vec::new(),
-					params: param_types,
-					has_spread: params.last().is_some_and(|p| p.0.spread),
-					return_type: Box::new(return_ty),
-				};
-
-				Ok(Some((
-					func_name.clone(),
-					StructMember {
-						type_: Box::new(func_type),
-						kind: member_kind,
-					},
-				)))
-			}
+			ImplMember::ExternalLet(..) | ImplMember::ExternalFunc(..) => Ok(()),
 		}
+	}
+
+	/// Type-check a single ImplMember and return its name, type, and member kind.
+	/// This is used for standalone impl blocks where forward-referencing is not needed.
+	fn check_impl_member(
+		&mut self,
+		member: &Spanned<ImplMember>,
+		member_ctx: &Context,
+		member_kind: StructMemberKind,
+	) -> Result<Option<(EcoString, StructMember)>, TypeError> {
+		let sig = self.collect_impl_member_signature(member, member_ctx, member_kind)?;
+		self.check_impl_member_body(member, member_ctx)?;
+		Ok(sig)
 	}
 
 	/// Type-check struct/enum inner members and return the processed members map
@@ -2633,7 +2815,7 @@ impl TypeChecker {
 			} => {
 				// Create a function type for the struct constructor
 				let mut param_types = Vec::new();
-				for (field_name, field_type) in fields {
+				for (field_name, field_type) in fields.iter() {
 					param_types.push((Some(field_name.clone()), field_type.clone()));
 				}
 
@@ -2642,6 +2824,7 @@ impl TypeChecker {
 					params: param_types,
 					has_spread: false,
 					return_type: Box::new(self_type.clone()),
+					constructor: true,
 				};
 
 				base_ctx_with_self.with_new_entry(
@@ -2653,46 +2836,31 @@ impl TypeChecker {
 					}),
 				)
 			}
-			Type::Enum {
-				generics: _,
-				variants,
-				..
-			} => {
+			Type::Enum { .. } => {
 				// For enums, each variant is a constructor
 				// Within the enum's member methods, variant constructors should NOT be generic
 				// functions - they should use the type variables from the enclosing scope
-				let mut enum_ctx = base_ctx_with_self.clone();
-
-				for (variant_name, variant_fields) in variants {
-					let mut param_types = Vec::new();
-					for (field_name, field_type) in variant_fields {
-						param_types.push((Some(field_name.clone()), field_type.clone()));
-					}
-
-					let variant_type = Type::Function {
-						generics: Vec::new(),
-						params: param_types,
-						has_spread: false,
-						return_type: Box::new(self_type.clone()),
-					};
-
-					enum_ctx = enum_ctx.with_new_entry(
-						variant_name.clone(),
-						ContextEntry::Value(ContextValue {
-							type_: variant_type,
-							mutable: false,
-							visibility: Visibility::Private,
-						}),
-					);
-				}
-
-				enum_ctx
+				self.inject_enum_variants(self_type, &base_ctx_with_self)
 			}
 			_ => base_ctx_with_self.clone(),
 		};
 
-		// Create a context with `this` bound to the struct/enum type (self_type already set in ctx_with_constructor)
-		let member_ctx = ctx_with_constructor.with_new_entry(
+		// Multi-pass approach to handle forward references between members:
+		// Pass 1: Collect signatures for all members (functions with explicit return types get
+		//         their type from the annotation; functions without need body inference)
+		// Pass 2: For functions without return type annotations, infer from body with intermediate context
+		// Pass 3: Check all member bodies with the complete self_type
+
+		struct DeferredMember<'a> {
+			member: &'a Spanned<ImplMember>,
+			base_ctx: Context,
+			kind: StructMemberKind,
+			mutable_this: bool,
+			has_this: bool,
+		}
+		let mut all_members: Vec<DeferredMember<'_>> = Vec::new();
+
+		let sig_ctx = ctx_with_constructor.with_new_entry(
 			EcoString::from("this"),
 			ContextEntry::Value(ContextValue {
 				type_: self_type.clone(),
@@ -2701,30 +2869,45 @@ impl TypeChecker {
 			}),
 		);
 
+		// === Pass 1: collect signatures with explicit return types ===
 		for member_spanned in members {
 			match &member_spanned.0 {
 				StructInnerMember::Member(impl_member) => {
-					if let Some((name, struct_member)) =
-						self.check_impl_member(impl_member, &member_ctx, StructMemberKind::Immutable)?
-					{
+					if let Some((name, struct_member)) = self.collect_impl_member_signature(
+						impl_member,
+						&sig_ctx,
+						StructMemberKind::Immutable,
+					)? {
 						result_members.insert(name, struct_member);
 					}
+					all_members.push(DeferredMember {
+						member: impl_member,
+						base_ctx: ctx_with_constructor.clone(),
+						kind: StructMemberKind::Immutable,
+						mutable_this: false,
+						has_this: true,
+					});
 				}
 				StructInnerMember::Namespace(namespace_members) => {
-					// Namespace members are static (don't have access to `this`, but have access to constructor)
 					for impl_member in namespace_members {
-						if let Some((name, struct_member)) = self.check_impl_member(
+						if let Some((name, struct_member)) = self.collect_impl_member_signature(
 							impl_member,
 							&ctx_with_constructor,
 							StructMemberKind::Namespace,
 						)? {
 							result_members.insert(name, struct_member);
 						}
+						all_members.push(DeferredMember {
+							member: impl_member,
+							base_ctx: ctx_with_constructor.clone(),
+							kind: StructMemberKind::Namespace,
+							mutable_this: false,
+							has_this: false,
+						});
 					}
 				}
 				StructInnerMember::ImplMut(mutable_members) => {
-					// Mutable context with mutable `this` (self_type already set in base_ctx_with_self)
-					let mutable_ctx = base_ctx_with_self.with_new_entry(
+					let mutable_sig_ctx = base_ctx_with_self.with_new_entry(
 						EcoString::from("this"),
 						ContextEntry::Value(ContextValue {
 							type_: self_type.clone(),
@@ -2733,11 +2916,20 @@ impl TypeChecker {
 						}),
 					);
 					for impl_member in mutable_members {
-						if let Some((name, struct_member)) =
-							self.check_impl_member(impl_member, &mutable_ctx, StructMemberKind::Mutable)?
-						{
+						if let Some((name, struct_member)) = self.collect_impl_member_signature(
+							impl_member,
+							&mutable_sig_ctx,
+							StructMemberKind::Mutable,
+						)? {
 							result_members.insert(name, struct_member);
 						}
+						all_members.push(DeferredMember {
+							member: impl_member,
+							base_ctx: base_ctx_with_self.clone(),
+							kind: StructMemberKind::Mutable,
+							mutable_this: true,
+							has_this: true,
+						});
 					}
 				}
 				StructInnerMember::Impl {
@@ -2745,16 +2937,18 @@ impl TypeChecker {
 					generics: impl_generics,
 					members: impl_members,
 				} => {
-					let mut impl_ctx = member_ctx.clone();
+					let mut impl_ctx = sig_ctx.clone();
 					for generic in impl_generics {
 						let constraint = match &generic.0.constraint {
-							Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, &member_ctx)?)),
+							Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, &sig_ctx)?)),
 							None => None,
 						};
-						impl_ctx = impl_ctx.with_new_entry(
+						let id = self.fresh_type_var_id();
+						impl_ctx.insert_entry(
 							generic.0.name.0.clone(),
 							ContextEntry::Value(ContextValue {
 								type_: Type::Variable {
+									id,
 									name: generic.0.name.0.clone(),
 									constraint,
 								},
@@ -2764,31 +2958,229 @@ impl TypeChecker {
 						);
 					}
 
-					// Resolve the interface type
 					let Spanned(interface_name, interface_span) = interface_ident;
-					let interface_ty = base_ctx.lookup_type(interface_name).ok_or_else(|| {
-						TypeError::UnknownType(interface_name.clone(), span_to_range(*interface_span))
-					})?;
-
-					// Register the interface implementation
+					let interface_ty =
+						base_ctx
+							.lookup_type(interface_name)
+							.ok_or_else(|| TypeError::UnknownType {
+								name: interface_name.clone(),
+								suggestion: find_similar_name(interface_name, base_ctx.local_ctx.keys()),
+								span: span_to_range(*interface_span),
+							})?;
 					result_impls.insert(interface_name.clone(), interface_ty);
 
-					// Check all impl members
 					for impl_member in impl_members {
-						if let Some((name, struct_member)) =
-							self.check_impl_member(impl_member, &impl_ctx, StructMemberKind::Immutable)?
-						{
+						if let Some((name, struct_member)) = self.collect_impl_member_signature(
+							impl_member,
+							&impl_ctx,
+							StructMemberKind::Immutable,
+						)? {
 							result_members.insert(name, struct_member);
 						}
+						all_members.push(DeferredMember {
+							member: impl_member,
+							base_ctx: impl_ctx.clone(),
+							kind: StructMemberKind::Immutable,
+							mutable_this: false,
+							has_this: true,
+						});
 					}
 				}
 			}
+		}
+
+		// Build a helper to create the self_type with current members
+		let build_self_type =
+			|members: &BTreeMap<EcoString, StructMember>, impls: &BTreeMap<EcoString, Type>| -> Type {
+				match self_type {
+					Type::Struct {
+						name,
+						def_key,
+						generics,
+						type_args,
+						fields,
+						..
+					} => Type::Struct {
+						name: name.clone(),
+						def_key: *def_key,
+						generics: generics.clone(),
+						type_args: type_args.clone(),
+						fields: fields.clone(),
+						members: Arc::new(members.clone()),
+						impls: Arc::new(impls.clone()),
+					},
+					Type::Enum {
+						name,
+						def_key,
+						generics,
+						type_args,
+						variants,
+						..
+					} => Type::Enum {
+						name: name.clone(),
+						def_key: *def_key,
+						generics: generics.clone(),
+						type_args: type_args.clone(),
+						variants: variants.clone(),
+						members: Arc::new(members.clone()),
+						impls: Arc::new(impls.clone()),
+					},
+					other => other.clone(),
+				}
+			};
+
+		// === Pass 2: Infer return types for functions without explicit annotations ===
+		// Rebuild self_type incrementally so each function sees previously inferred return types
+		for dm in &all_members {
+			if let ImplMember::Func {
+				meta:
+					FuncDeclaration {
+						return_type: None,
+						name: Spanned(func_name, _),
+						generics,
+						params,
+					},
+				body,
+				..
+			} = &dm.member.0
+			{
+				let current_self_type = build_self_type(&result_members, &result_impls);
+				let member_ctx = if dm.has_this {
+					dm.base_ctx
+						.with_self_type(current_self_type.clone())
+						.with_new_entry(
+							EcoString::from("this"),
+							ContextEntry::Value(ContextValue {
+								type_: current_self_type,
+								mutable: dm.mutable_this,
+								visibility: Visibility::Private,
+							}),
+						)
+				} else {
+					dm.base_ctx.clone()
+				};
+
+				let mut func_ctx = member_ctx.clone();
+				for generic in generics {
+					let constraint = match &generic.0.constraint {
+						Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, &member_ctx)?)),
+						None => None,
+					};
+					let id = self.fresh_type_var_id();
+					func_ctx.insert_entry(
+						generic.0.name.0.clone(),
+						ContextEntry::Value(ContextValue {
+							type_: Type::Variable {
+								id,
+								name: generic.0.name.0.clone(),
+								constraint,
+							},
+							mutable: false,
+							visibility: Visibility::Private,
+						}),
+					);
+				}
+				let mut param_types = Vec::new();
+				for param in params {
+					let param_type = self.resolve_ast_type(&param.0.type_.0, param.0.type_.1, &func_ctx)?;
+					let param_name = match &param.0.name.0 {
+						Pattern::Binding { name, .. } => Some(name.0.clone()),
+						Pattern::Struct { path, fields } if path.len() == 1 && fields.is_empty() => {
+							Some(path[0].0.clone())
+						}
+						_ => None,
+					};
+					param_types.push((param_name.clone(), param_type.clone()));
+					if let Some(name) = param_name {
+						func_ctx.insert_entry(
+							name,
+							ContextEntry::Value(ContextValue {
+								type_: param_type,
+								mutable: param.0.mutable,
+								visibility: Visibility::Private,
+							}),
+						);
+					}
+				}
+
+				let inferred_return = self.infer(body, &func_ctx)?;
+				let func_type = Type::Function {
+					generics: Arc::new(Vec::new()),
+					params: param_types,
+					has_spread: params.last().is_some_and(|p| p.0.spread),
+					return_type: Box::new(inferred_return),
+					constructor: false,
+				};
+
+				result_members.insert(
+					func_name.clone(),
+					StructMember {
+						type_: Box::new(func_type),
+						kind: dm.kind,
+					},
+				);
+			}
+		}
+
+		// === Pass 3: Check all member bodies with the complete self_type ===
+		let complete_self_type = build_self_type(&result_members, &result_impls);
+
+		for dm in &all_members {
+			let body_ctx = if dm.has_this {
+				dm.base_ctx
+					.with_self_type(complete_self_type.clone())
+					.with_new_entry(
+						EcoString::from("this"),
+						ContextEntry::Value(ContextValue {
+							type_: complete_self_type.clone(),
+							mutable: dm.mutable_this,
+							visibility: Visibility::Private,
+						}),
+					)
+			} else {
+				dm.base_ctx.clone()
+			};
+			self.check_impl_member_body(dm.member, &body_ctx)?;
 		}
 
 		Ok((result_members, result_impls))
 	}
 
 	/// Check an impl declaration and register implementations
+	/// If `ty` is an enum, inject its variant constructors into `ctx` and return the extended context.
+	/// Otherwise, return `ctx` unchanged.
+	fn inject_enum_variants(&self, ty: &Type, ctx: &Context) -> Context {
+		if let Type::Enum { variants, .. } = ty {
+			let mut ctx = ctx.clone();
+			for (variant_name, variant_fields) in variants.iter() {
+				let mut param_types = Vec::new();
+				for (field_name, field_type) in variant_fields {
+					param_types.push((Some(field_name.clone()), field_type.clone()));
+				}
+
+				let variant_type = Type::Function {
+					generics: Arc::new(Vec::new()),
+					params: param_types,
+					has_spread: false,
+					return_type: Box::new(ty.clone()),
+					constructor: false,
+				};
+
+				ctx.insert_entry(
+					variant_name.clone(),
+					ContextEntry::Value(ContextValue {
+						type_: variant_type,
+						mutable: false,
+						visibility: Visibility::Private,
+					}),
+				);
+			}
+			ctx
+		} else {
+			ctx.clone()
+		}
+	}
+
 	fn process_impl(&mut self, impl_decl: &Declaration, ctx: &Context) -> Result<Context, TypeError> {
 		match impl_decl {
 			Declaration::ImplFor {
@@ -2805,10 +3197,12 @@ impl TypeChecker {
 						Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, ctx)?)),
 						None => None,
 					};
-					impl_ctx = impl_ctx.with_new_entry(
+					let id = self.fresh_type_var_id();
+					impl_ctx.insert_entry(
 						generic.0.name.0.clone(),
 						ContextEntry::Value(ContextValue {
 							type_: Type::Variable {
+								id,
 								name: generic.0.name.0.clone(),
 								constraint,
 							},
@@ -2823,21 +3217,25 @@ impl TypeChecker {
 
 				// Resolve the interface
 				let Spanned(interface_name, interface_span) = interface_ident;
-				let interface_ty = impl_ctx.lookup_type(interface_name).ok_or_else(|| {
-					TypeError::UnknownType(interface_name.clone(), span_to_range(*interface_span))
-				})?;
+				let interface_ty =
+					impl_ctx
+						.lookup_type(interface_name)
+						.ok_or_else(|| TypeError::UnknownType {
+							name: interface_name.clone(),
+							suggestion: find_similar_name(interface_name, impl_ctx.local_ctx.keys()),
+							span: span_to_range(*interface_span),
+						})?;
 
 				// Set up context with self_type and this for member type-checking
-				let member_ctx = impl_ctx
-					.with_self_type(ty.clone())
-					.with_new_entry(
-						EcoString::from("this"),
-						ContextEntry::Value(ContextValue {
-							type_: ty.clone(),
-							mutable: *mutable,
-							visibility: Visibility::Private,
-						}),
-					);
+				let member_ctx = impl_ctx.with_self_type(ty.clone()).with_new_entry(
+					EcoString::from("this"),
+					ContextEntry::Value(ContextValue {
+						type_: ty.clone(),
+						mutable: *mutable,
+						visibility: Visibility::Private,
+					}),
+				);
+				let member_ctx = self.inject_enum_variants(&ty, &member_ctx);
 
 				let member_kind = if *mutable {
 					StructMemberKind::Mutable
@@ -2871,10 +3269,12 @@ impl TypeChecker {
 						Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, ctx)?)),
 						None => None,
 					};
-					impl_ctx = impl_ctx.with_new_entry(
+					let id = self.fresh_type_var_id();
+					impl_ctx.insert_entry(
 						generic.0.name.0.clone(),
 						ContextEntry::Value(ContextValue {
 							type_: Type::Variable {
+								id,
 								name: generic.0.name.0.clone(),
 								constraint,
 							},
@@ -2888,16 +3288,15 @@ impl TypeChecker {
 				let ty = self.resolve_ast_type(&type_.0, type_.1, &impl_ctx)?;
 
 				// Set up context with self_type and this for member type-checking
-				let member_ctx = impl_ctx
-					.with_self_type(ty.clone())
-					.with_new_entry(
-						EcoString::from("this"),
-						ContextEntry::Value(ContextValue {
-							type_: ty.clone(),
-							mutable: *mutable,
-							visibility: Visibility::Private,
-						}),
-					);
+				let member_ctx = impl_ctx.with_self_type(ty.clone()).with_new_entry(
+					EcoString::from("this"),
+					ContextEntry::Value(ContextValue {
+						type_: ty.clone(),
+						mutable: *mutable,
+						visibility: Visibility::Private,
+					}),
+				);
+				let member_ctx = self.inject_enum_variants(&ty, &member_ctx);
 
 				let member_kind = if *mutable {
 					StructMemberKind::Mutable
@@ -2939,12 +3338,17 @@ impl TypeChecker {
 					None => inferred_type,
 				};
 
-				if let Pattern::Binding {
-					name: binding_name, ..
-				} = &name.0
-				{
+				let binding_name = match &name.0 {
+					Pattern::Binding { name, .. } => Some(name.0.clone()),
+					Pattern::Struct { path, fields } if path.len() == 1 && fields.is_empty() => {
+						Some(path[0].0.clone())
+					}
+					_ => None,
+				};
+
+				if let Some(binding_name) = binding_name {
 					Ok(ctx.with_new_entry(
-						binding_name.0.clone(),
+						binding_name,
 						ContextEntry::Value(ContextValue {
 							type_: final_type,
 							mutable: *mutable,
@@ -2966,26 +3370,7 @@ impl TypeChecker {
 					},
 				body,
 			} => {
-				let mut func_ctx = ctx.clone();
-
-				// Add generics to context
-				for generic in generics {
-					let constraint = match &generic.0.constraint {
-						Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, ctx)?)),
-						None => None,
-					};
-					func_ctx = func_ctx.with_new_entry(
-						generic.0.name.0.clone(),
-						ContextEntry::Value(ContextValue {
-							type_: Type::Variable {
-								name: generic.0.name.0.clone(),
-								constraint,
-							},
-							mutable: false,
-							visibility: Visibility::Private,
-						}),
-					);
-				}
+				let (generic_params, mut func_ctx) = self.resolve_generic_params(generics, ctx)?;
 
 				// Add parameters to context and collect parameter types
 				let mut param_types = Vec::new();
@@ -3005,7 +3390,7 @@ impl TypeChecker {
 					param_types.push((param_name.clone(), param_type.clone()));
 
 					if let Some(name) = param_name {
-						func_ctx = func_ctx.with_new_entry(
+						func_ctx.insert_entry(
 							name,
 							ContextEntry::Value(ContextValue {
 								type_: param_type,
@@ -3031,13 +3416,12 @@ impl TypeChecker {
 					});
 				}
 
-				let generic_params = self.resolve_generic_params(generics, ctx)?;
-
 				let func_type = Type::Function {
-					generics: generic_params,
+					generics: Arc::new(generic_params),
 					params: param_types,
 					has_spread: params.last().map(|p| p.0.spread).unwrap_or(false),
 					return_type: Box::new(expected_return),
+					constructor: false,
 				};
 
 				Ok(ctx.with_new_entry(
@@ -3056,26 +3440,33 @@ impl TypeChecker {
 				fields,
 				members,
 			} => {
-				let mut struct_ctx = ctx.clone();
-
-				// Add generics to context
-				for generic in generics {
-					let constraint = match &generic.0.constraint {
-						Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, ctx)?)),
-						None => None,
-					};
-					struct_ctx = struct_ctx.with_new_entry(
-						generic.0.name.0.clone(),
-						ContextEntry::Value(ContextValue {
-							type_: Type::Variable {
-								name: generic.0.name.0.clone(),
-								constraint,
-							},
-							mutable: false,
-							visibility: Visibility::Private,
-						}),
-					);
+				if fields.is_empty() {
+					return Err(TypeError::EmptyStruct {
+						name: name.0.clone(),
+						span: span_to_range(name.1),
+					});
 				}
+
+				let (generic_params, mut struct_ctx) = self.resolve_generic_params(generics, ctx)?;
+
+				// Register a forward-declaration so fields can self-reference the struct
+				let forward_struct_type = Type::Struct {
+					name: name.0.clone(),
+					generics: Arc::new(generic_params.clone()),
+					type_args: Vec::new(),
+					fields: Arc::new(BTreeMap::new()),
+					members: Arc::new(BTreeMap::new()),
+					impls: Arc::new(BTreeMap::new()),
+					def_key: None,
+				};
+				struct_ctx = struct_ctx.with_new_entry(
+					name.0.clone(),
+					ContextEntry::Value(ContextValue {
+						type_: forward_struct_type,
+						mutable: false,
+						visibility: Visibility::Public,
+					}),
+				);
 
 				let mut field_map = BTreeMap::new();
 				for field in fields {
@@ -3096,7 +3487,7 @@ impl TypeChecker {
 					field_map.insert(field.0.name.0.clone(), field_type.clone());
 
 					// Also add field to context so members can access fields directly
-					struct_ctx = struct_ctx.with_new_entry(
+					struct_ctx.insert_entry(
 						field.0.name.0.clone(),
 						ContextEntry::Value(ContextValue {
 							type_: field_type,
@@ -3106,37 +3497,59 @@ impl TypeChecker {
 					);
 				}
 
-				let generic_params = self.resolve_generic_params(generics, &struct_ctx)?;
-
 				// Create a preliminary struct type for self-reference in members
 				let preliminary_struct_type = Type::Struct {
 					name: name.0.clone(),
-					generics: generic_params.clone(),
+					generics: Arc::new(generic_params.clone()),
 					type_args: Vec::new(),
-					fields: field_map.clone(),
-					members: BTreeMap::new(),
-					impls: BTreeMap::new(),
+					fields: Arc::new(field_map.clone()),
+					members: Arc::new(BTreeMap::new()),
+					impls: Arc::new(BTreeMap::new()),
 					def_key: None,
 				};
 
+				// Add preliminary type to context so members can self-reference by name
+				let struct_ctx_with_self = struct_ctx.with_new_entry(
+					name.0.clone(),
+					ContextEntry::Value(ContextValue {
+						type_: preliminary_struct_type.clone(),
+						mutable: false,
+						visibility: Visibility::Public,
+					}),
+				);
+
 				// Process struct members (methods, computed properties, etc.)
 				let (processed_members, processed_impls) =
-					self.process_struct_members(members, &preliminary_struct_type, &struct_ctx)?;
+					self.process_struct_members(members, &preliminary_struct_type, &struct_ctx_with_self)?;
 
 				let struct_type = Type::Struct {
 					name: name.0.clone(),
-					generics: generic_params,
+					generics: Arc::new(generic_params.clone()),
 					type_args: Vec::new(),
-					fields: field_map,
-					members: processed_members,
-					impls: processed_impls,
+					fields: Arc::new(field_map.clone()),
+					members: Arc::new(processed_members),
+					impls: Arc::new(processed_impls),
 					def_key: None,
+				};
+
+				// Build the constructor function type for the struct
+				let constructor_params: Vec<(Option<EcoString>, Type)> = field_map
+					.iter()
+					.map(|(field_name, field_type)| (Some(field_name.clone()), field_type.clone()))
+					.collect();
+
+				let constructor_type = Type::Function {
+					generics: Arc::new(generic_params),
+					params: constructor_params,
+					has_spread: false,
+					return_type: Box::new(struct_type.clone()),
+					constructor: true,
 				};
 
 				Ok(ctx.with_new_entry(
 					name.0.clone(),
 					ContextEntry::Value(ContextValue {
-						type_: struct_type,
+						type_: constructor_type,
 						mutable: false,
 						visibility: Visibility::Public,
 					}),
@@ -3149,26 +3562,26 @@ impl TypeChecker {
 				variants,
 				members,
 			} => {
-				let mut enum_ctx = ctx.clone();
+				let (generic_params, mut enum_ctx) = self.resolve_generic_params(generics, ctx)?;
 
-				// Add generics to context
-				for generic in generics {
-					let constraint = match &generic.0.constraint {
-						Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, ctx)?)),
-						None => None,
-					};
-					enum_ctx = enum_ctx.with_new_entry(
-						generic.0.name.0.clone(),
-						ContextEntry::Value(ContextValue {
-							type_: Type::Variable {
-								name: generic.0.name.0.clone(),
-								constraint,
-							},
-							mutable: false,
-							visibility: Visibility::Private,
-						}),
-					);
-				}
+				// Register a forward-declaration so variant fields can self-reference the enum
+				let forward_enum_type = Type::Enum {
+					name: name.0.clone(),
+					generics: Arc::new(generic_params.clone()),
+					type_args: Vec::new(),
+					variants: Arc::new(BTreeMap::new()),
+					members: Arc::new(BTreeMap::new()),
+					impls: Arc::new(BTreeMap::new()),
+					def_key: None,
+				};
+				enum_ctx = enum_ctx.with_new_entry(
+					name.0.clone(),
+					ContextEntry::Value(ContextValue {
+						type_: forward_enum_type,
+						mutable: false,
+						visibility: Visibility::Public,
+					}),
+				);
 
 				let mut variants_map = BTreeMap::new();
 				for variant in variants {
@@ -3193,30 +3606,38 @@ impl TypeChecker {
 					variants_map.insert(variant.0.name.0.clone(), variant_fields);
 				}
 
-				let generic_params = self.resolve_generic_params(generics, &enum_ctx)?;
-
 				// Create a preliminary enum type for self-reference in members
 				let preliminary_enum_type = Type::Enum {
 					name: name.0.clone(),
-					generics: generic_params.clone(),
+					generics: Arc::new(generic_params.clone()),
 					type_args: Vec::new(),
-					variants: variants_map.clone(),
-					members: BTreeMap::new(),
-					impls: BTreeMap::new(),
+					variants: Arc::new(variants_map.clone()),
+					members: Arc::new(BTreeMap::new()),
+					impls: Arc::new(BTreeMap::new()),
 					def_key: None,
 				};
 
+				// Add preliminary type to context so members can self-reference by name
+				let enum_ctx_with_self = enum_ctx.with_new_entry(
+					name.0.clone(),
+					ContextEntry::Value(ContextValue {
+						type_: preliminary_enum_type.clone(),
+						mutable: false,
+						visibility: Visibility::Public,
+					}),
+				);
+
 				// Process enum members (methods, computed properties, etc.)
 				let (processed_members, processed_impls) =
-					self.process_struct_members(members, &preliminary_enum_type, &enum_ctx)?;
+					self.process_struct_members(members, &preliminary_enum_type, &enum_ctx_with_self)?;
 
 				let enum_type = Type::Enum {
 					name: name.0.clone(),
-					generics: generic_params,
+					generics: Arc::new(generic_params),
 					type_args: Vec::new(),
-					variants: variants_map,
-					members: processed_members,
-					impls: processed_impls,
+					variants: Arc::new(variants_map),
+					members: Arc::new(processed_members),
+					impls: Arc::new(processed_impls),
 					def_key: None,
 				};
 
@@ -3236,21 +3657,21 @@ impl TypeChecker {
 				super_interfaces: _,
 				members,
 			} => {
-				let generic_params = self.resolve_generic_params(generics, ctx)?;
+				let (generic_params, _generics_ctx) = self.resolve_generic_params(generics, ctx)?;
 
 				// Create a self type variable for interface member resolution
 				// In interface definitions, `self` is abstract (a type variable with the interface as constraint)
-				let self_type = Type::Variable {
-					name: EcoString::from("self"),
-					constraint: Some(Box::new(Type::Interface {
+				let self_type = self.fresh_var(
+					"self",
+					Some(Type::Interface {
 						name: name.0.clone(),
-						generics: generic_params.clone(),
+						generics: Arc::new(generic_params.clone()),
 						type_args: Vec::new(),
-						members: BTreeMap::new(),
-						impls: BTreeMap::new(),
+						members: Arc::new(BTreeMap::new()),
+						impls: Arc::new(BTreeMap::new()),
 						def_key: None,
-					})),
-				};
+					}),
+				);
 				let interface_ctx = ctx.with_self_type(self_type);
 
 				// Process interface members with self type in scope
@@ -3261,10 +3682,10 @@ impl TypeChecker {
 					ContextEntry::Value(ContextValue {
 						type_: Type::Interface {
 							name: name.0.clone(),
-							generics: generic_params,
+							generics: Arc::new(generic_params),
 							type_args: Vec::new(),
-							members: interface_members,
-							impls: BTreeMap::new(),
+							members: Arc::new(interface_members),
+							impls: Arc::new(BTreeMap::new()),
 							def_key: None,
 						},
 						mutable: false,
@@ -3287,7 +3708,7 @@ impl TypeChecker {
 					ContextEntry::Value(ContextValue {
 						type_: Type::Module {
 							name: name.0.clone(),
-							members: BTreeMap::new(),
+							members: Arc::new(BTreeMap::new()),
 						},
 						mutable: false,
 						visibility: Visibility::Public,
@@ -3339,26 +3760,7 @@ impl TypeChecker {
 					return_type,
 				},
 			) => {
-				let mut func_ctx = ctx.clone();
-
-				// Add generics to context for resolving parameter/return types
-				for generic in generics {
-					let constraint = match &generic.0.constraint {
-						Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, ctx)?)),
-						None => None,
-					};
-					func_ctx = func_ctx.with_new_entry(
-						generic.0.name.0.clone(),
-						ContextEntry::Value(ContextValue {
-							type_: Type::Variable {
-								name: generic.0.name.0.clone(),
-								constraint,
-							},
-							mutable: false,
-							visibility: Visibility::Private,
-						}),
-					);
-				}
+				let (generic_params, func_ctx) = self.resolve_generic_params(generics, ctx)?;
 
 				// Collect parameter types
 				let mut param_types = Vec::new();
@@ -3379,13 +3781,12 @@ impl TypeChecker {
 					None => Type::Void,
 				};
 
-				let generic_params = self.resolve_generic_params(generics, ctx)?;
-
 				let func_type = Type::Function {
-					generics: generic_params,
+					generics: Arc::new(generic_params),
 					params: param_types,
 					has_spread: params.last().map(|p| p.0.spread).unwrap_or(false),
 					return_type: Box::new(return_ty),
+					constructor: false,
 				};
 
 				Ok(ctx.with_new_entry(
@@ -3402,26 +3803,7 @@ impl TypeChecker {
 				meta: TypeAliasDeclaration { name, generics },
 				value,
 			} => {
-				let mut alias_ctx = ctx.clone();
-
-				// Add generics to context for resolving the aliased type
-				for generic in generics {
-					let constraint = match &generic.0.constraint {
-						Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, ctx)?)),
-						None => None,
-					};
-					alias_ctx = alias_ctx.with_new_entry(
-						generic.0.name.0.clone(),
-						ContextEntry::Value(ContextValue {
-							type_: Type::Variable {
-								name: generic.0.name.0.clone(),
-								constraint,
-							},
-							mutable: false,
-							visibility: Visibility::Private,
-						}),
-					);
-				}
+				let (_generic_params, alias_ctx) = self.resolve_generic_params(generics, ctx)?;
 
 				let aliased_type = self.resolve_ast_type(&value.0, value.1, &alias_ctx)?;
 
@@ -3450,10 +3832,7 @@ impl TypeChecker {
 		}
 
 		// Calculate span from path
-		let first_span = path
-			.first()
-			.map(|i| i.1)
-			.unwrap_or(Span::new(0, 0));
+		let first_span = path.first().map(|i| i.1).unwrap_or(Span::new(0, 0));
 		let last_span = path.last().map(|i| i.1).unwrap_or(first_span);
 		let import_span = Span::new(first_span.start, last_span.end);
 
@@ -3493,6 +3872,7 @@ impl TypeChecker {
 						.ok_or_else(|| TypeError::ImportedItemNotFound {
 							item: item_name.clone(),
 							module: module_name.clone(),
+							suggestion: find_similar_name(item_name, module_ctx.local_ctx.keys()),
 							span: span_to_range(*item_span),
 						})?;
 
@@ -3506,6 +3886,7 @@ impl TypeChecker {
 					return Err(TypeError::ImportedItemNotFound {
 						item: item_name.clone(),
 						module: module_name.clone(),
+						suggestion: None,
 						span: span_to_range(*item_span),
 					});
 				}
@@ -3541,18 +3922,15 @@ impl TypeChecker {
 			return Ok(ctx.clone());
 		}
 
-		let first_span = path
-			.first()
-			.map(|i| i.1)
-			.unwrap_or(Span::new(0, 0));
+		let first_span = path.first().map(|i| i.1).unwrap_or(Span::new(0, 0));
 		let last_span = path.last().map(|i| i.1).unwrap_or(first_span);
 		let import_span = Span::new(first_span.start, last_span.end);
 
-		let path_strings: Vec<String> =
-			path.iter().map(|seg| seg.inner().to_string()).collect();
+		let path_strings: Vec<String> = path.iter().map(|seg| seg.inner().to_string()).collect();
 
 		let imported_idents = idents.map(|ids| {
-			ids.iter()
+			ids
+				.iter()
 				.map(|(name, alias)| ImportedIdent {
 					name: name.inner().to_string(),
 					alias: alias.as_ref().map(|a| a.inner().to_string()),
@@ -3574,10 +3952,8 @@ impl TypeChecker {
 			return Ok(ctx.clone());
 		};
 
-		let imported_file = queries::load_source_file(
-			db,
-			module_file_path.to_string_lossy().to_string(),
-		);
+		let imported_file =
+			queries::load_source_file(db, module_file_path.to_string_lossy().to_string());
 		let result = queries::typecheck_file(db, imported_file, config);
 		let module_ctx = result.ctx;
 
@@ -3604,6 +3980,7 @@ impl TypeChecker {
 						.ok_or_else(|| TypeError::ImportedItemNotFound {
 							item: item_name.clone(),
 							module: module_name.clone(),
+							suggestion: find_similar_name(item_name, module_ctx.local_ctx.keys()),
 							span: span_to_range(*item_span),
 						})?;
 
@@ -3616,6 +3993,7 @@ impl TypeChecker {
 					return Err(TypeError::ImportedItemNotFound {
 						item: item_name.clone(),
 						module: module_name.clone(),
+						suggestion: None,
 						span: span_to_range(*item_span),
 					});
 				}
@@ -3648,6 +4026,25 @@ pub fn type_check_with_path(module: &Module, file_path: PathBuf) -> Result<(), T
 	Ok(())
 }
 
+/// Find the closest matching parameter name using Levenshtein distance.
+/// Returns `Some(name)` if a sufficiently similar name is found.
+fn find_similar_name<'a>(
+	name: &str,
+	candidates: impl Iterator<Item = &'a EcoString>,
+) -> Option<EcoString> {
+	let max_dist = match name.len() {
+		0..=2 => 0,
+		3..=5 => 1,
+		_ => 2,
+	};
+
+	candidates
+		.map(|c| (c, strsim::levenshtein(name, c)))
+		.filter(|(_, d)| *d <= max_dist)
+		.min_by_key(|(_, d)| *d)
+		.map(|(c, _)| c.clone())
+}
+
 /// Convert a TypeError to an ariadne Report for display
 pub fn type_error_to_report(
 	filename: EcoString,
@@ -3657,13 +4054,27 @@ pub fn type_error_to_report(
 
 	let error_file = error.file_path().unwrap_or(filename);
 	let span = error.span();
-	Report::build(ReportKind::Error, (error_file.clone(), span.clone()))
+	let mut report = Report::build(ReportKind::Error, (error_file.clone(), span.clone()))
 		.with_config(ariadne::Config::new().with_tab_width(2))
 		.with_message(error.to_string())
 		.with_label(
 			Label::new((error_file, span))
 				.with_message(error)
 				.with_color(Color::Red),
-		)
-		.finish()
+		);
+
+	let suggestion = match error {
+		TypeError::UnknownIdentifier { suggestion, .. }
+		| TypeError::UnknownType { suggestion, .. }
+		| TypeError::UnknownMember { suggestion, .. }
+		| TypeError::UnknownNamedArgument { suggestion, .. }
+		| TypeError::ImportedItemNotFound { suggestion, .. } => suggestion.as_ref(),
+		_ => None,
+	};
+
+	if let Some(suggestion) = suggestion {
+		report = report.with_help(format!("did you mean '{suggestion}'?"));
+	}
+
+	report.finish()
 }

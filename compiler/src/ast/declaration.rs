@@ -132,10 +132,10 @@ pub enum Declaration {
 		type_: Spanned<Type>,
 		members: Vec<Spanned<ImplMember>>,
 	},
-	/// An `impl for` block extends a declaration using an interface.
+	/// An `impl as` block extends a declaration using an interface.
 	/// For example:
 	/// ```nym
-	/// impl Comparable<Person> for Person {
+	/// impl Comparable<Person> as Person {
 	///   func compare(other: Person) -> this.age.compare(other.age)
 	/// }
 	/// ```

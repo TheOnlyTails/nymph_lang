@@ -1,10 +1,10 @@
+use crate::ast::Span;
 use crate::{
 	ast::{Spanned, declaration::Visibility, expr::Expr},
-	types::{Context, ContextEntry, ContextValue, Type, TypeChecker},
+	types::{Context, ContextEntry, ContextValue, Type, TypeChecker, TypeVarId},
 };
-use crate::ast::Span;
 use ecow::EcoString;
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 fn span(s: usize, e: usize) -> Span {
 	Span::new(s, e)
@@ -564,10 +564,11 @@ fn test_type_display_map() {
 #[test]
 fn test_type_display_function() {
 	let func = Type::Function {
-		generics: Vec::new(),
+		generics: Arc::new(Vec::new()),
 		params: vec![(Some(EcoString::from("x")), Type::Int)],
 		has_spread: false,
 		return_type: Box::new(Type::String),
+		constructor: false,
 	};
 	assert_eq!(func.to_string(), "(x: int) -> string");
 }
@@ -575,6 +576,7 @@ fn test_type_display_function() {
 #[test]
 fn test_type_display_variable() {
 	let var = Type::Variable {
+		id: TypeVarId(0),
 		name: EcoString::from("T"),
 		constraint: None,
 	};
@@ -605,7 +607,7 @@ fn test_unknown_identifier_error() {
 	let result = checker.infer(&expr, &ctx);
 	assert!(result.is_err());
 	match result.unwrap_err() {
-		crate::types::error::TypeError::UnknownIdentifier(name, _) => {
+		crate::types::error::TypeError::UnknownIdentifier { name, .. } => {
 			assert_eq!(name, ident_name);
 		}
 		_ => panic!("Expected UnknownIdentifier error"),
@@ -746,10 +748,10 @@ fn test_context_register_impl() {
 	let ctx = Context::default();
 	let interface_type = Type::Interface {
 		name: EcoString::from("Comparable"),
-		generics: Vec::new(),
+		generics: Arc::new(Vec::new()),
 		type_args: Vec::new(),
-		members: BTreeMap::new(),
-		impls: BTreeMap::new(),
+		members: Arc::new(BTreeMap::new()),
+		impls: Arc::new(BTreeMap::new()),
 		def_key: None,
 	};
 
@@ -809,6 +811,7 @@ fn test_qualify_type_with_unresolved_generic() {
 		ContextEntry::Value(ContextValue {
 			type_: Type::List {
 				item: Box::new(Type::Variable {
+					id: TypeVarId(0),
 					name: EcoString::from("T"),
 					constraint: None,
 				}),
@@ -820,12 +823,8 @@ fn test_qualify_type_with_unresolved_generic() {
 
 	// Try to instantiate List with a generic argument
 	// This should fail with GenericArgumentMismatch (stub implementation)
-	let result = checker.resolve_qualified_type(
-		&EcoString::from("List"),
-		&[],
-		Span::new(0, 0),
-		&_ctx,
-	);
+	let result =
+		checker.resolve_qualified_type(&EcoString::from("List"), &[], Span::new(0, 0), &_ctx);
 
 	assert!(result.is_ok());
 }
@@ -835,16 +834,12 @@ fn test_resolve_unknown_qualified_type() {
 	let mut checker = TypeChecker::default();
 	let ctx = Context::default();
 
-	let result = checker.resolve_qualified_type(
-		&EcoString::from("UnknownType"),
-		&[],
-		Span::new(0, 0),
-		&ctx,
-	);
+	let result =
+		checker.resolve_qualified_type(&EcoString::from("UnknownType"), &[], Span::new(0, 0), &ctx);
 
 	assert!(result.is_err());
 	match result.unwrap_err() {
-		crate::types::error::TypeError::UnknownType(name, _) => {
+		crate::types::error::TypeError::UnknownType { name, .. } => {
 			assert_eq!(name, EcoString::from("UnknownType"));
 		}
 		_ => panic!("Expected UnknownType error"),
@@ -857,20 +852,20 @@ fn test_struct_with_interface() {
 
 	let struct_type = Type::Struct {
 		name: EcoString::from("Point"),
-		generics: Vec::new(),
+		generics: Arc::new(Vec::new()),
 		type_args: Vec::new(),
-		fields: BTreeMap::new(),
-		members: BTreeMap::new(),
-		impls: BTreeMap::new(),
+		fields: Arc::new(BTreeMap::new()),
+		members: Arc::new(BTreeMap::new()),
+		impls: Arc::new(BTreeMap::new()),
 		def_key: None,
 	};
 
 	let interface_type = Type::Interface {
 		name: EcoString::from("Eq"),
-		generics: Vec::new(),
+		generics: Arc::new(Vec::new()),
 		type_args: Vec::new(),
-		members: BTreeMap::new(),
-		impls: BTreeMap::new(),
+		members: Arc::new(BTreeMap::new()),
+		impls: Arc::new(BTreeMap::new()),
 		def_key: None,
 	};
 
@@ -930,10 +925,10 @@ fn test_error_display_impl_not_found() {
 		type_: Type::Int.into(),
 		interface: Type::Interface {
 			name: EcoString::from("Printable"),
-			generics: Vec::new(),
+			generics: Arc::new(Vec::new()),
 			type_args: Vec::new(),
-			members: BTreeMap::new(),
-			impls: BTreeMap::new(),
+			members: Arc::new(BTreeMap::new()),
+			impls: Arc::new(BTreeMap::new()),
 			def_key: None,
 		}
 		.into(),
@@ -954,10 +949,11 @@ fn test_struct_member_type_stored() {
 		EcoString::from("get_x"),
 		StructMember {
 			type_: Box::new(Type::Function {
-				generics: Vec::new(),
+				generics: Arc::new(Vec::new()),
 				params: vec![],
 				has_spread: false,
 				return_type: Box::new(Type::Int),
+				constructor: false,
 			}),
 			kind: crate::types::StructMemberKind::Immutable,
 		},
@@ -965,16 +961,16 @@ fn test_struct_member_type_stored() {
 
 	let struct_type = Type::Struct {
 		name: EcoString::from("Point"),
-		generics: Vec::new(),
+		generics: Arc::new(Vec::new()),
 		type_args: Vec::new(),
 		fields: {
 			let mut f = BTreeMap::new();
 			f.insert(EcoString::from("x"), Type::Int);
 			f.insert(EcoString::from("y"), Type::Int);
-			f
+			Arc::new(f)
 		},
-		members,
-		impls: BTreeMap::new(),
+		members: Arc::new(members),
+		impls: Arc::new(BTreeMap::new()),
 		def_key: None,
 	};
 
@@ -1001,10 +997,11 @@ fn test_enum_member_type_stored() {
 		EcoString::from("is_some"),
 		StructMember {
 			type_: Box::new(Type::Function {
-				generics: Vec::new(),
+				generics: Arc::new(Vec::new()),
 				params: vec![],
 				has_spread: false,
 				return_type: Box::new(Type::Boolean),
+				constructor: false,
 			}),
 			kind: crate::types::StructMemberKind::Immutable,
 		},
@@ -1016,6 +1013,7 @@ fn test_enum_member_type_stored() {
 		fields.insert(
 			EcoString::from("value"),
 			Type::Variable {
+				id: TypeVarId(0),
 				name: EcoString::from("T"),
 				constraint: None,
 			},
@@ -1026,11 +1024,11 @@ fn test_enum_member_type_stored() {
 
 	let enum_type = Type::Enum {
 		name: EcoString::from("Option"),
-		generics: Vec::new(),
+		generics: Arc::new(Vec::new()),
 		type_args: Vec::new(),
-		variants,
-		members,
-		impls: BTreeMap::new(),
+		variants: Arc::new(variants),
+		members: Arc::new(members),
+		impls: Arc::new(BTreeMap::new()),
 		def_key: None,
 	};
 
@@ -1079,21 +1077,21 @@ fn test_struct_with_impl_interface() {
 		EcoString::from("Eq"),
 		Type::Interface {
 			name: EcoString::from("Eq"),
-			generics: Vec::new(),
+			generics: Arc::new(Vec::new()),
 			type_args: Vec::new(),
-			members: BTreeMap::new(),
-			impls: BTreeMap::new(),
+			members: Arc::new(BTreeMap::new()),
+			impls: Arc::new(BTreeMap::new()),
 			def_key: None,
 		},
 	);
 
 	let struct_type = Type::Struct {
 		name: EcoString::from("Point"),
-		generics: Vec::new(),
+		generics: Arc::new(Vec::new()),
 		type_args: Vec::new(),
-		fields: BTreeMap::new(),
-		members: BTreeMap::new(),
-		impls,
+		fields: Arc::new(BTreeMap::new()),
+		members: Arc::new(BTreeMap::new()),
+		impls: Arc::new(impls),
 		def_key: None,
 	};
 
@@ -1114,10 +1112,11 @@ fn test_struct_member_func_return_type() {
 		EcoString::from("get_name"),
 		StructMember {
 			type_: Box::new(Type::Function {
-				generics: Vec::new(),
+				generics: Arc::new(Vec::new()),
 				params: vec![],
 				has_spread: false,
 				return_type: Box::new(Type::String),
+				constructor: false,
 			}),
 			kind: crate::types::StructMemberKind::Immutable,
 		},
@@ -1126,10 +1125,11 @@ fn test_struct_member_func_return_type() {
 		EcoString::from("get_age"),
 		StructMember {
 			type_: Box::new(Type::Function {
-				generics: Vec::new(),
+				generics: Arc::new(Vec::new()),
 				params: vec![],
 				has_spread: false,
 				return_type: Box::new(Type::Int),
+				constructor: false,
 			}),
 			kind: crate::types::StructMemberKind::Immutable,
 		},
@@ -1137,16 +1137,16 @@ fn test_struct_member_func_return_type() {
 
 	let struct_type = Type::Struct {
 		name: EcoString::from("Person"),
-		generics: Vec::new(),
+		generics: Arc::new(Vec::new()),
 		type_args: Vec::new(),
 		fields: {
 			let mut f = BTreeMap::new();
 			f.insert(EcoString::from("name"), Type::String);
 			f.insert(EcoString::from("age"), Type::Int);
-			f
+			Arc::new(f)
 		},
-		members,
-		impls: BTreeMap::new(),
+		members: Arc::new(members),
+		impls: Arc::new(BTreeMap::new()),
 		def_key: None,
 	};
 
@@ -1201,16 +1201,18 @@ fn test_interface_with_members() {
 		EcoString::from("compare"),
 		StructMember {
 			type_: Box::new(Type::Function {
-				generics: Vec::new(),
+				generics: Arc::new(Vec::new()),
 				params: vec![(
 					Some(EcoString::from("other")),
 					Type::Variable {
+						id: TypeVarId(0),
 						name: EcoString::from("Self"),
 						constraint: None,
 					},
 				)],
 				has_spread: false,
 				return_type: Box::new(Type::Int),
+				constructor: false,
 			}),
 			kind: crate::types::StructMemberKind::Immutable,
 		},
@@ -1218,10 +1220,10 @@ fn test_interface_with_members() {
 
 	let interface_type = Type::Interface {
 		name: EcoString::from("Comparable"),
-		generics: Vec::new(),
+		generics: Arc::new(Vec::new()),
 		type_args: Vec::new(),
-		members,
-		impls: BTreeMap::new(),
+		members: Arc::new(members),
+		impls: Arc::new(BTreeMap::new()),
 		def_key: None,
 	};
 
@@ -1241,25 +1243,27 @@ fn test_generic_struct_instantiation() {
 
 	let box_type = Type::Struct {
 		name: EcoString::from("Box"),
-		generics: vec![GenericParamInfo {
+		generics: Arc::new(vec![GenericParamInfo {
+			id: TypeVarId(0),
 			name: EcoString::from("T"),
 			constraint: None,
 			default: None,
-		}],
+		}]),
 		type_args: Vec::new(),
 		fields: {
 			let mut f = BTreeMap::new();
 			f.insert(
 				EcoString::from("value"),
 				Type::Variable {
+					id: TypeVarId(0),
 					name: EcoString::from("T"),
 					constraint: None,
 				},
 			);
-			f
+			Arc::new(f)
 		},
-		members: BTreeMap::new(),
-		impls: BTreeMap::new(),
+		members: Arc::new(BTreeMap::new()),
+		impls: Arc::new(BTreeMap::new()),
 		def_key: None,
 	};
 
@@ -1308,30 +1312,35 @@ fn test_generic_function_type_display() {
 	use crate::types::GenericParamInfo;
 
 	let func = Type::Function {
-		generics: vec![
+		generics: Arc::new(vec![
 			GenericParamInfo {
+				id: TypeVarId(0),
 				name: EcoString::from("T"),
 				constraint: None,
 				default: None,
 			},
 			GenericParamInfo {
+				id: TypeVarId(1),
 				name: EcoString::from("U"),
 				constraint: Some(Type::String),
 				default: None,
 			},
-		],
+		]),
 		params: vec![(
 			Some(EcoString::from("x")),
 			Type::Variable {
+				id: TypeVarId(0),
 				name: EcoString::from("T"),
 				constraint: None,
 			},
 		)],
 		has_spread: false,
 		return_type: Box::new(Type::Variable {
+			id: TypeVarId(1),
 			name: EcoString::from("U"),
 			constraint: Some(Box::new(Type::String)),
 		}),
+		constructor: false,
 	};
 
 	let display = format!("{}", func);
@@ -1343,11 +1352,11 @@ fn test_generic_function_type_display() {
 fn test_generic_struct_type_display_with_args() {
 	let struct_type = Type::Struct {
 		name: EcoString::from("List"),
-		generics: Vec::new(),
+		generics: Arc::new(Vec::new()),
 		type_args: vec![Type::Int],
-		fields: BTreeMap::new(),
-		members: BTreeMap::new(),
-		impls: BTreeMap::new(),
+		fields: Arc::new(BTreeMap::new()),
+		members: Arc::new(BTreeMap::new()),
+		impls: Arc::new(BTreeMap::new()),
 		def_key: None,
 	};
 
@@ -1362,24 +1371,27 @@ fn test_generic_instantiation_with_defaults() {
 
 	let pair_type = Type::Struct {
 		name: EcoString::from("Pair"),
-		generics: vec![
+		generics: Arc::new(vec![
 			GenericParamInfo {
+				id: TypeVarId(0),
 				name: EcoString::from("T"),
 				constraint: None,
 				default: None,
 			},
 			GenericParamInfo {
+				id: TypeVarId(1),
 				name: EcoString::from("U"),
 				constraint: None,
 				default: Some(Type::Int),
 			},
-		],
+		]),
 		type_args: Vec::new(),
 		fields: {
 			let mut f = BTreeMap::new();
 			f.insert(
 				EcoString::from("first"),
 				Type::Variable {
+					id: TypeVarId(0),
 					name: EcoString::from("T"),
 					constraint: None,
 				},
@@ -1387,14 +1399,15 @@ fn test_generic_instantiation_with_defaults() {
 			f.insert(
 				EcoString::from("second"),
 				Type::Variable {
+					id: TypeVarId(1),
 					name: EcoString::from("U"),
 					constraint: None,
 				},
 			);
-			f
+			Arc::new(f)
 		},
-		members: BTreeMap::new(),
-		impls: BTreeMap::new(),
+		members: Arc::new(BTreeMap::new()),
+		impls: Arc::new(BTreeMap::new()),
 		def_key: None,
 	};
 
@@ -1438,15 +1451,16 @@ fn test_generic_instantiation_error_missing_args() {
 
 	let box_type = Type::Struct {
 		name: EcoString::from("Box"),
-		generics: vec![GenericParamInfo {
+		generics: Arc::new(vec![GenericParamInfo {
+			id: TypeVarId(0),
 			name: EcoString::from("T"),
 			constraint: None,
 			default: None,
-		}],
+		}]),
 		type_args: Vec::new(),
-		fields: BTreeMap::new(),
-		members: BTreeMap::new(),
-		impls: BTreeMap::new(),
+		fields: Arc::new(BTreeMap::new()),
+		members: Arc::new(BTreeMap::new()),
+		impls: Arc::new(BTreeMap::new()),
 		def_key: None,
 	};
 
@@ -1470,11 +1484,11 @@ fn test_generic_instantiation_error_too_many_args() {
 
 	let simple_struct = Type::Struct {
 		name: EcoString::from("Point"),
-		generics: Vec::new(),
+		generics: Arc::new(Vec::new()),
 		type_args: Vec::new(),
-		fields: BTreeMap::new(),
-		members: BTreeMap::new(),
-		impls: BTreeMap::new(),
+		fields: Arc::new(BTreeMap::new()),
+		members: Arc::new(BTreeMap::new()),
+		impls: Arc::new(BTreeMap::new()),
 		def_key: None,
 	};
 
@@ -1516,18 +1530,20 @@ fn test_substitute_nested_types() {
 	use std::collections::HashMap;
 
 	let checker = TypeChecker::default();
+	let t_id = TypeVarId(0);
 
 	let list_of_t = Type::List {
 		item: Box::new(Type::Variable {
+			id: t_id,
 			name: EcoString::from("T"),
 			constraint: None,
 		}),
 	};
 
 	let mut subst = HashMap::new();
-	subst.insert(EcoString::from("T"), Type::Int);
+	subst.insert(t_id, Type::Int);
 
-	let result = checker.substitute(&list_of_t, &subst);
+	let result = checker.substitute(&list_of_t, &subst, span(0, 1));
 	assert!(result.is_ok());
 	assert_eq!(
 		result.unwrap(),
@@ -1540,8 +1556,11 @@ fn test_substitute_nested_types() {
 #[test]
 fn test_occurs_check() {
 	let checker = TypeChecker::default();
+	let t_id = TypeVarId(0);
+	let u_id = TypeVarId(1);
 
 	let var_t = Type::Variable {
+		id: t_id,
 		name: EcoString::from("T"),
 		constraint: None,
 	};
@@ -1550,8 +1569,8 @@ fn test_occurs_check() {
 		item: Box::new(var_t.clone()),
 	};
 
-	assert!(checker.occurs_in(&EcoString::from("T"), &list_of_t));
-	assert!(!checker.occurs_in(&EcoString::from("U"), &list_of_t));
+	assert!(checker.occurs_in(&t_id, &list_of_t));
+	assert!(!checker.occurs_in(&u_id, &list_of_t));
 }
 
 #[test]
@@ -1570,12 +1589,12 @@ fn test_struct_constructor_accessible_in_members() {
 
 	let complex_type = Type::Struct {
 		name: EcoString::from("Complex"),
-		generics: Vec::new(),
+		generics: Arc::new(Vec::new()),
 		type_args: Vec::new(),
-		fields: complex_fields.clone(),
-		members: BTreeMap::new(),
-		impls: BTreeMap::new(),
-    def_key: None,
+		fields: Arc::new(complex_fields.clone()),
+		members: Arc::new(BTreeMap::new()),
+		impls: Arc::new(BTreeMap::new()),
+		def_key: None,
 	};
 
 	// Register the Complex type in the context

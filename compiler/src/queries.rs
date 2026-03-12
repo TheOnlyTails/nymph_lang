@@ -6,7 +6,7 @@ use crate::{
 	ast::{Span, Spanned, declaration::{Declaration, Module}},
 	db::{
 		Db, DefId, Diagnostic, DiagnosticKind, Diagnostics, ImportSpec, ImportedIdent, ProjectConfig,
-		SourceFile,
+		SourceFile, TypeErrors,
 	},
 	lexer::{lexer, token::Token},
 	parser::{self, error::ParseError},
@@ -297,6 +297,7 @@ pub fn context_after(
 	let mut checker = TypeChecker::with_salsa(
 		PathBuf::from(file.path(db).as_str()),
 		config.root(db).clone(),
+		prev_ctx.next_type_var_id,
 	);
 
 	let result = match &decl {
@@ -307,7 +308,10 @@ pub fn context_after(
 	};
 
 	match result {
-		Ok(ctx) => ctx,
+		Ok(mut ctx) => {
+			ctx.next_type_var_id = checker.next_type_var_id;
+			ctx
+		}
 		Err(err) => {
 			let err_span = err.span();
 			let err_file = err.file_path()
@@ -319,6 +323,7 @@ pub fn context_after(
 				kind: DiagnosticKind::TypeError,
 			})
 			.accumulate(db);
+			TypeErrors(err).accumulate(db);
 			prev_ctx
 		}
 	}
