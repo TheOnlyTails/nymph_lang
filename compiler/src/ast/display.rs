@@ -1,11 +1,8 @@
 use std::fmt::{Display, Formatter, Result};
 
-use super::{
-	declaration::*,
-	expr::*,
-	ops::*,
-	types::*,
-};
+use crate::ast::Spanned;
+
+use super::{declaration::*, expr::*, ops::*, types::*};
 
 // ============================================================================
 // Expr Display
@@ -14,9 +11,9 @@ use super::{
 impl Display for Expr {
 	fn fmt(&self, f: &mut Formatter<'_>) -> Result {
 		match self {
-			Expr::Int(n) => write!(f, "int({})", n.inner()),
-			Expr::Float(n) => write!(f, "float({})", n.inner()),
-			Expr::Char(c) => write!(f, "char({:?})", c.inner()),
+			Expr::Int(Spanned(n, _)) => write!(f, "int({n})"),
+			Expr::Float(Spanned(n, _)) => write!(f, "float({n})"),
+			Expr::Char(Spanned(c, _)) => write!(f, "char({c:?})"),
 			Expr::String(parts) => {
 				write!(f, "str(")?;
 				for (i, part) in parts.iter().enumerate() {
@@ -24,15 +21,15 @@ impl Display for Expr {
 						write!(f, " + ")?;
 					}
 					match &part.inner() {
-						StringPart::Text(s) => write!(f, "{:?}", s)?,
-						StringPart::EscapeSequence(esc) => write!(f, "{}", esc)?,
-						StringPart::InterpolatedExpr(expr) => write!(f, "${{{}}}", expr.inner())?,
+						StringPart::Text(s) => write!(f, "{s:?}")?,
+						StringPart::EscapeSequence(esc) => write!(f, "{esc}")?,
+						StringPart::InterpolatedExpr(Spanned(expr, _)) => write!(f, "${{{expr}}}")?,
 					}
 				}
 				write!(f, ")")
 			}
-			Expr::Boolean(b) => write!(f, "bool({})", b.inner()),
-			Expr::Identifier(id) => write!(f, "id({})", id.inner()),
+			Expr::Boolean(Spanned(b, _)) => write!(f, "{b}"),
+			Expr::Identifier(Spanned(id, _)) => write!(f, "id({id})"),
 			Expr::List(items) => {
 				write!(f, "#[")?;
 				for (i, item) in items.iter().enumerate() {
@@ -40,8 +37,8 @@ impl Display for Expr {
 						write!(f, ", ")?;
 					}
 					match &item.inner() {
-						ListItem::Expr(e) => write!(f, "{}", e.inner())?,
-						ListItem::Spread(e) => write!(f, "...{}", e.inner())?,
+						ListItem::Expr(Spanned(e, _)) => write!(f, "{e}")?,
+						ListItem::Spread(Spanned(e, _)) => write!(f, "...{e}")?,
 					}
 				}
 				write!(f, "]")
@@ -53,8 +50,8 @@ impl Display for Expr {
 						write!(f, ", ")?;
 					}
 					match &item.inner() {
-						ListItem::Expr(e) => write!(f, "{}", e.inner())?,
-						ListItem::Spread(e) => write!(f, "...{}", e.inner())?,
+						ListItem::Expr(Spanned(e, _)) => write!(f, "{e}")?,
+						ListItem::Spread(Spanned(e, _)) => write!(f, "...{e}")?,
 					}
 				}
 				write!(f, ")")
@@ -66,26 +63,28 @@ impl Display for Expr {
 						write!(f, ", ")?;
 					}
 					match &entry.inner() {
-						MapEntry::Expr(k, v) => write!(f, "{}: {}", k.inner(), v.inner())?,
-						MapEntry::Spread(e) => write!(f, "...{}", e.inner())?,
+						MapEntry::Expr(Spanned(k, _), Spanned(v, _)) => write!(f, "{k}: {v}")?,
+						MapEntry::Spread(Spanned(e, _)) => write!(f, "...{e}")?,
 					}
 				}
 				write!(f, " }}")
 			}
-			Expr::Range(kind) => {
-				match kind {
-					RangeKind::From(e) => write!(f, "range({}..)", e.inner()),
-					RangeKind::To(e) => write!(f, "range(..{})", e.inner()),
-					RangeKind::Exclusive { min, max } => {
-						write!(f, "range({}..{})", min.inner(), max.inner())
-					}
-					RangeKind::ToInclusive(e) => write!(f, "range(..={})", e.inner()),
-					RangeKind::Inclusive { min, max } => {
-						write!(f, "range({}..={})", min.inner(), max.inner())
-					}
+			Expr::Range(kind) => match kind {
+				RangeKind::From(e) => write!(f, "{}..", e.inner()),
+				RangeKind::To(e) => write!(f, "..<{}", e.inner()),
+				RangeKind::Exclusive { min, max } => {
+					write!(f, "{}..<{}", min.inner(), max.inner())
 				}
-			}
-			Expr::Call { func, generics, args } => {
+				RangeKind::ToInclusive(e) => write!(f, "..={}", e.inner()),
+				RangeKind::Inclusive { min, max } => {
+					write!(f, "{}..={}", min.inner(), max.inner())
+				}
+			},
+			Expr::Call {
+				func,
+				generics,
+				args,
+			} => {
 				write!(f, "call({}", func.inner())?;
 				if !generics.is_empty() {
 					write!(f, "<")?;
@@ -112,14 +111,39 @@ impl Display for Expr {
 				}
 				write!(f, "))")
 			}
-			Expr::MemberAccess { parent, member, optional } => {
-				write!(f, "access({}{}{})", parent.inner(), if *optional { "?." } else { "." }, member.inner())
+			Expr::MemberAccess {
+				parent,
+				member,
+				optional,
+			} => {
+				write!(
+					f,
+					"access({}{}{})",
+					parent.inner(),
+					if *optional { "?." } else { "." },
+					member.inner()
+				)
 			}
-			Expr::IndexAccess { parent, index, optional } => {
-				write!(f, "index({}{}[{}])", parent.inner(), if *optional { "?" } else { "" }, index.inner())
+			Expr::IndexAccess {
+				parent,
+				index,
+				optional,
+			} => {
+				write!(
+					f,
+					"index({}{}[{}])",
+					parent.inner(),
+					if *optional { "?" } else { "" },
+					index.inner()
+				)
 			}
-			Expr::Closure { params, generics, return_type, body } => {
-				write!(f, "λ(")?;
+			Expr::Closure {
+				params,
+				generics,
+				return_type,
+				body,
+			} => {
+				write!(f, "(")?;
 				for (i, param) in params.iter().enumerate() {
 					if i > 0 {
 						write!(f, ", ")?;
@@ -148,32 +172,32 @@ impl Display for Expr {
 					write!(f, ">")?;
 				}
 				if let Some(ret) = return_type {
-					write!(f, " -> {}", ret.inner())?;
+					write!(f, " : {}", ret.inner())?;
 				}
-				write!(f, " => {})", body.inner())
+				write!(f, " -> {})", body.inner())
 			}
 			Expr::PrefixOp { op, value } => {
-				write!(f, "{}({})", op, value.inner())
+				write!(f, "{op}({})", value.inner())
 			}
 			Expr::PostfixOp { op, value } => {
-				write!(f, "{}({})", op, value.inner())
+				write!(f, "{op}({})", value.inner())
 			}
 			Expr::BinaryOp { lhs, op, rhs } => {
-				write!(f, "{}({}, {})", op, lhs.inner(), rhs.inner())
+				write!(f, "{op}({}, {})", lhs.inner(), rhs.inner())
 			}
 			Expr::TypeOp { lhs, op, rhs } => {
-				write!(f, "{}({}, {})", op, lhs.inner(), rhs.inner())
+				write!(f, "{op}({}, {})", lhs.inner(), rhs.inner())
 			}
 			Expr::PatternOp { lhs, op, rhs } => {
-				write!(f, "{}({}, {})", op, lhs.inner(), rhs.inner())
+				write!(f, "{op}({}, {})", lhs.inner(), rhs.inner())
 			}
 			Expr::AssignOp { lhs, op, rhs } => {
-				write!(f, "{}({}, {})", op, lhs.inner(), rhs.inner())
+				write!(f, "{op}({}, {})", lhs.inner(), rhs.inner())
 			}
 			Expr::Return { value, label } => {
 				write!(f, "return")?;
-				if let Some(lbl) = label {
-					write!(f, " @{}", lbl.inner())?;
+				if let Some(Spanned(label, _)) = label {
+					write!(f, " @{label}")?;
 				}
 				if let Some(val) = value {
 					write!(f, "({})", val.inner())?;
@@ -184,8 +208,8 @@ impl Display for Expr {
 			}
 			Expr::Break { value, label } => {
 				write!(f, "break")?;
-				if let Some(lbl) = label {
-					write!(f, " @{}", lbl.inner())?;
+				if let Some(Spanned(label, _)) = label {
+					write!(f, " @{label}")?;
 				}
 				if let Some(val) = value {
 					write!(f, "({})", val.inner())?;
@@ -196,26 +220,45 @@ impl Display for Expr {
 			}
 			Expr::Continue { label } => {
 				write!(f, "continue")?;
-				if let Some(lbl) = label {
-					write!(f, " @{}", lbl.inner())?;
+				if let Some(Spanned(label, _)) = label {
+					write!(f, " @{label}")?;
 				}
 				Ok(())
 			}
-			Expr::For { variable, iterable, body, label } => {
-				write!(f, "for")?;
-				if let Some(lbl) = label {
-					write!(f, " @{}", lbl.inner())?;
-				}
-				write!(f, "({} in {}) {}", variable.inner(), iterable.inner(), body.inner())
-			}
-			Expr::While { condition, body, label } => {
+			Expr::While {
+				condition,
+				body,
+				label,
+			} => {
 				write!(f, "while")?;
-				if let Some(lbl) = label {
-					write!(f, " @{}", lbl.inner())?;
+				if let Some(Spanned(label, _)) = label {
+					write!(f, " @{label}")?;
 				}
 				write!(f, "({}) {}", condition.inner(), body.inner())
 			}
-			Expr::If { condition, then, otherwise } => {
+			Expr::For {
+				variable,
+				iterable,
+				body,
+				label,
+			} => {
+				write!(f, "for")?;
+				if let Some(Spanned(label, _)) = label {
+					write!(f, " @{label}")?;
+				}
+				write!(
+					f,
+					"({} in {}) {}",
+					variable.inner(),
+					iterable.inner(),
+					body.inner()
+				)
+			}
+			Expr::If {
+				condition,
+				then,
+				otherwise,
+			} => {
 				write!(f, "if({}) {} ", condition.inner(), then.inner())?;
 				if let Some(els) = otherwise {
 					write!(f, "else {}", els.inner())?;
@@ -240,15 +283,15 @@ impl Display for Expr {
 			Expr::Placeholder => write!(f, "_"),
 			Expr::Block { body, label } => {
 				write!(f, "block")?;
-				if let Some(lbl) = label {
-					write!(f, " @{}", lbl.inner())?;
+				if let Some(Spanned(label, _)) = label {
+					write!(f, " @{label}")?;
 				}
 				write!(f, " {{ ")?;
-				for (i, stmt) in body.iter().enumerate() {
+				for (i, Spanned(stmt, _)) in body.iter().enumerate() {
 					if i > 0 {
 						write!(f, "; ")?;
 					}
-					write!(f, "{}", stmt.inner())?;
+					write!(f, "{stmt}")?;
 				}
 				write!(f, " }}")
 			}
@@ -260,13 +303,16 @@ impl Display for Expr {
 impl Display for Statement {
 	fn fmt(&self, f: &mut Formatter<'_>) -> Result {
 		match self {
-			Statement::Expr(expr) => write!(f, "{}", expr.inner()),
-			Statement::Let { meta, value } => {
+			Statement::Expr(Spanned(expr, _)) => write!(f, "{expr}"),
+			Statement::Let {
+				meta,
+				value: Spanned(value, _),
+			} => {
 				write!(f, "let")?;
 				if meta.mutable {
 					write!(f, " mut")?;
 				}
-				write!(f, " {} = {}", meta.name.inner(), value.inner())
+				write!(f, " {} = {value}", meta.name.inner())
 			}
 		}
 	}
@@ -275,22 +321,25 @@ impl Display for Statement {
 impl Display for Pattern {
 	fn fmt(&self, f: &mut Formatter<'_>) -> Result {
 		match self {
-			Pattern::Int(n) => write!(f, "{}", n.inner()),
-			Pattern::Float(fl) => write!(f, "{}", fl.inner()),
-			Pattern::Char(c) => write!(f, "{:?}", c.inner()),
+			Pattern::Int(Spanned(n, _)) => write!(f, "{n}"),
+			Pattern::Float(Spanned(fl, _)) => write!(f, "{fl}"),
+			Pattern::Char(Spanned(c, _)) => write!(f, "{c:?}"),
 			Pattern::String(parts) => {
 				write!(f, "\"")?;
 				for part in parts.iter() {
 					match &part.inner() {
-						StringPatternPart::Text(s) => write!(f, "{}", s)?,
-						StringPatternPart::EscapeSequence(esc) => write!(f, "{}", esc)?,
+						StringPatternPart::Text(s) => write!(f, "{s}")?,
+						StringPatternPart::EscapeSequence(esc) => write!(f, "{esc}")?,
 					}
 				}
 				write!(f, "\"")
 			}
-			Pattern::Boolean(b) => write!(f, "{}", b.inner()),
-			Pattern::Binding { name, inner } => {
-				write!(f, "{}@{}", name.inner(), inner.inner())
+			Pattern::Boolean(Spanned(b, _)) => write!(f, "{b}"),
+			Pattern::Binding {
+				name: Spanned(name, _),
+				inner,
+			} => {
+				write!(f, "{name} @ {}", inner.inner())
 			}
 			Pattern::List(items) => {
 				write!(f, "#[")?;
@@ -299,11 +348,11 @@ impl Display for Pattern {
 						write!(f, ", ")?;
 					}
 					match &item.inner() {
-						ListPatternEntry::Item(pat) => write!(f, "{}", pat.inner())?,
+						ListPatternEntry::Item(Spanned(pat, _)) => write!(f, "{pat}")?,
 						ListPatternEntry::Rest(name) => {
 							write!(f, "...")?;
-							if let Some(n) = name {
-								write!(f, "{}", n.inner())?;
+							if let Some(Spanned(name, _)) = name {
+								write!(f, "{name}")?;
 							}
 						}
 					}
@@ -317,11 +366,11 @@ impl Display for Pattern {
 						write!(f, ", ")?;
 					}
 					match &item.inner() {
-						ListPatternEntry::Item(pat) => write!(f, "{}", pat.inner())?,
+						ListPatternEntry::Item(Spanned(pat, _)) => write!(f, "{pat}")?,
 						ListPatternEntry::Rest(name) => {
 							write!(f, "...")?;
-							if let Some(n) = name {
-								write!(f, "{}", n.inner())?;
+							if let Some(Spanned(name, _)) = name {
+								write!(f, "{name}")?;
 							}
 						}
 					}
@@ -335,13 +384,11 @@ impl Display for Pattern {
 						write!(f, ", ")?;
 					}
 					match &entry.inner() {
-						MapPatternEntry::Entry(k, v) => {
-							write!(f, "{}: {}", k.inner(), v.inner())?
-						}
+						MapPatternEntry::Entry(Spanned(k, _), Spanned(v, _)) => write!(f, "{k}: {v}")?,
 						MapPatternEntry::Rest(name) => {
 							write!(f, "...")?;
-							if let Some(n) = name {
-								write!(f, "{}", n.inner())?;
+							if let Some(Spanned(name, _)) = name {
+								write!(f, "{name}")?;
 							}
 						}
 					}
@@ -349,9 +396,9 @@ impl Display for Pattern {
 				write!(f, " }}")
 			}
 			Pattern::Range(kind) => match kind {
-				RangePatternKind::ExclusiveMin(e) => write!(f, "{}..)", e.inner()),
+				RangePatternKind::ExclusiveMin(e) => write!(f, "{}..", e.inner()),
 				RangePatternKind::ExclusiveBoth { min, max } => {
-					write!(f, "{}..{}", min.inner(), max.inner())
+					write!(f, "{}..<{}", min.inner(), max.inner())
 				}
 				RangePatternKind::InclusiveMax(e) => write!(f, "..={}", e.inner()),
 				RangePatternKind::InclusiveBoth { min, max } => {
@@ -360,11 +407,11 @@ impl Display for Pattern {
 			},
 			Pattern::Struct { path, fields } => {
 				write!(f, "struct(")?;
-				for (i, seg) in path.iter().enumerate() {
+				for (i, Spanned(seg, _)) in path.iter().enumerate() {
 					if i > 0 {
 						write!(f, "::")?;
 					}
-					write!(f, "{}", seg.inner())?;
+					write!(f, "{seg}")?;
 				}
 				write!(f, " {{ ")?;
 				for (i, field) in fields.iter().enumerate() {
@@ -372,10 +419,11 @@ impl Display for Pattern {
 						write!(f, ", ")?;
 					}
 					match &field.inner() {
-						StructPatternField::Value { name, value } => {
-							write!(f, "{}: {}", name.inner(), value.inner())?
-						}
-						StructPatternField::Named(name) => write!(f, "{}", name.inner())?,
+						StructPatternField::Value {
+							name: Spanned(name, _),
+							value: Spanned(value, _),
+						} => write!(f, "{name}: {value}")?,
+						StructPatternField::Named(Spanned(name, _)) => write!(f, "{name}")?,
 						StructPatternField::Rest => write!(f, "..")?,
 					}
 				}
@@ -412,30 +460,36 @@ impl Display for Type {
 			Type::List(inner) => write!(f, "#[{}]", inner.inner()),
 			Type::Tuple(items) => {
 				write!(f, "#(")?;
-				for (i, ty) in items.iter().enumerate() {
+				for (i, Spanned(ty, _)) in items.iter().enumerate() {
 					if i > 0 {
 						write!(f, ", ")?;
 					}
-					write!(f, "{}", ty.inner())?;
+					write!(f, "{ty}")?;
 				}
 				write!(f, ")")
 			}
 			Type::Map(k, v) => write!(f, "#{{{}:{}}}", k.inner(), v.inner()),
-			Type::Function { params, return_type } => {
+			Type::Function {
+				params,
+				return_type,
+			} => {
 				write!(f, "(")?;
-				for (i, (name, ty)) in params.iter().enumerate() {
+				for (i, (name, Spanned(ty, _))) in params.iter().enumerate() {
 					if i > 0 {
 						write!(f, ", ")?;
 					}
-					if let Some(n) = name {
-						write!(f, "{}:", n.inner())?;
+					if let Some(Spanned(name, _)) = name {
+						write!(f, "{name}: ")?;
 					}
-					write!(f, "{}", ty.inner())?;
+					write!(f, "{ty}")?;
 				}
 				write!(f, ") -> {}", return_type.inner())
 			}
-			Type::Reference { name, generics } => {
-				write!(f, "{}", name.inner())?;
+			Type::Reference {
+				name: Spanned(name, _),
+				generics,
+			} => {
+				write!(f, "{name}")?;
 				if !generics.is_empty() {
 					write!(f, "<")?;
 					for (i, g) in generics.iter().enumerate() {
@@ -459,88 +513,112 @@ impl Display for Type {
 
 impl Display for PrefixOperator {
 	fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-		match self {
-			PrefixOperator::BoolNot => write!(f, "!"),
-			PrefixOperator::Negate => write!(f, "-"),
-			PrefixOperator::BitNot => write!(f, "~"),
-		}
+		write!(
+			f,
+			"{}",
+			match self {
+				PrefixOperator::BoolNot => "!",
+				PrefixOperator::Negate => "-",
+				PrefixOperator::BitNot => "~",
+			}
+		)
 	}
 }
 
 impl Display for PostfixOperator {
 	fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-		match self {
-			PostfixOperator::ErrorReturn => write!(f, "?"),
-		}
+		write!(
+			f,
+			"{}",
+			match self {
+				PostfixOperator::ErrorReturn => "?",
+			}
+		)
 	}
 }
 
 impl Display for BinaryOperator {
 	fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-		match self {
-			BinaryOperator::Plus => write!(f, "+"),
-			BinaryOperator::Minus => write!(f, "-"),
-			BinaryOperator::Times => write!(f, "*"),
-			BinaryOperator::Divide => write!(f, "/"),
-			BinaryOperator::Remainder => write!(f, "%"),
-			BinaryOperator::Power => write!(f, "**"),
-			BinaryOperator::BitAnd => write!(f, "&"),
-			BinaryOperator::BitOr => write!(f, "|"),
-			BinaryOperator::BitXor => write!(f, "^"),
-			BinaryOperator::LeftShift => write!(f, "<<"),
-			BinaryOperator::RightShift => write!(f, ">>"),
-			BinaryOperator::Equals => write!(f, "=="),
-			BinaryOperator::NotEquals => write!(f, "!="),
-			BinaryOperator::LessThan => write!(f, "<"),
-			BinaryOperator::LessThanEquals => write!(f, "<="),
-			BinaryOperator::GreaterThan => write!(f, ">"),
-			BinaryOperator::GreaterThanEquals => write!(f, ">="),
-			BinaryOperator::In => write!(f, "in"),
-			BinaryOperator::NotIn => write!(f, "!in"),
-			BinaryOperator::BoolAnd => write!(f, "&&"),
-			BinaryOperator::BoolOr => write!(f, "||"),
-			BinaryOperator::Pipe => write!(f, "|>"),
-			BinaryOperator::Unwrap => write!(f, "??"),
-		}
+		write!(
+			f,
+			"{}",
+			match self {
+				BinaryOperator::Plus => "+",
+				BinaryOperator::Minus => "-",
+				BinaryOperator::Times => "*",
+				BinaryOperator::Divide => "/",
+				BinaryOperator::Remainder => "%",
+				BinaryOperator::Power => "**",
+				BinaryOperator::BitAnd => "&",
+				BinaryOperator::BitOr => "|",
+				BinaryOperator::BitXor => "^",
+				BinaryOperator::LeftShift => "<<",
+				BinaryOperator::RightShift => ">>",
+				BinaryOperator::Equals => "==",
+				BinaryOperator::NotEquals => "!=",
+				BinaryOperator::LessThan => "<",
+				BinaryOperator::LessThanEquals => "<=",
+				BinaryOperator::GreaterThan => ">",
+				BinaryOperator::GreaterThanEquals => ">=",
+				BinaryOperator::In => "in",
+				BinaryOperator::NotIn => "!in",
+				BinaryOperator::BoolAnd => "&&",
+				BinaryOperator::BoolOr => "||",
+				BinaryOperator::Pipe => "|>",
+				BinaryOperator::Unwrap => "??",
+			}
+		)
 	}
 }
 
 impl Display for TypeOperator {
 	fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-		match self {
-			TypeOperator::As => write!(f, "as"),
-		}
+		write!(
+			f,
+			"{}",
+			match self {
+				TypeOperator::As => "as",
+			}
+		)
 	}
 }
 
 impl Display for PatternOperator {
 	fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-		match self {
-			PatternOperator::Is => write!(f, "is"),
-			PatternOperator::NotIs => write!(f, "!is"),
-		}
+		write!(
+			f,
+			"{}",
+			match self {
+				PatternOperator::Is => "is",
+				PatternOperator::NotIs => "!is",
+			}
+		)
 	}
 }
 
 impl Display for AssignOperator {
 	fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-		match self {
-			AssignOperator::Assign => write!(f, "="),
-			AssignOperator::PlusAssign => write!(f, "+="),
-			AssignOperator::MinusAssign => write!(f, "-="),
-			AssignOperator::TimesAssign => write!(f, "*="),
-			AssignOperator::DivideAssign => write!(f, "/="),
-			AssignOperator::RemainderAssign => write!(f, "%="),
-			AssignOperator::PowerAssign => write!(f, "**="),
-			AssignOperator::LeftShiftAssign => write!(f, "<<="),
-			AssignOperator::RightShiftAssign => write!(f, ">>="),
-			AssignOperator::BitAndAssign => write!(f, "&="),
-			AssignOperator::BitXorAssign => write!(f, "^="),
-			AssignOperator::BitOrAssign => write!(f, "|="),
-			AssignOperator::BitNotAssign => write!(f, "~="),
-			AssignOperator::BoolAndAssign => write!(f, "&&="),
-			AssignOperator::BoolOrAssign => write!(f, "||="),
-		}
+		write!(
+			f,
+			"{}",
+			match self {
+				AssignOperator::Assign => "=",
+				AssignOperator::PlusAssign => "+=",
+				AssignOperator::MinusAssign => "-=",
+				AssignOperator::TimesAssign => "*=",
+				AssignOperator::DivideAssign => "/=",
+				AssignOperator::RemainderAssign => "%=",
+				AssignOperator::PowerAssign => "**=",
+				AssignOperator::LeftShiftAssign => "<<=",
+				AssignOperator::RightShiftAssign => ">>=",
+				AssignOperator::BitAndAssign => "&=",
+				AssignOperator::BitXorAssign => "^=",
+				AssignOperator::BitOrAssign => "|=",
+				AssignOperator::BitNotAssign => "~=",
+				AssignOperator::BoolAndAssign => "&&=",
+				AssignOperator::BoolOrAssign => "||=",
+			}
+		)
 	}
 }
 
@@ -555,7 +633,7 @@ impl Display for Module {
 			if i > 0 {
 				write!(f, ";")?;
 			}
-			write!(f, "\n\t{}", member)?;
+			write!(f, "\n\t{member}")?;
 		}
 		write!(f, "\n]")
 	}
@@ -571,30 +649,34 @@ impl Display for Declaration {
 			Declaration::Import { root, path, idents } => {
 				write!(f, "import ")?;
 				match root {
-					ImportRoot::Package(p) => write!(f, "{}", p.inner())?,
+					ImportRoot::Package(Spanned(p, _)) => write!(f, "{p}")?,
 					ImportRoot::Project => write!(f, "^")?,
 					ImportRoot::Current => write!(f, ".")?,
 					ImportRoot::Parent => write!(f, "..")?,
 				}
-				for seg in path {
-					write!(f, "/{}", seg.inner())?;
+				for Spanned(seg, _) in path {
+					write!(f, "/{seg}")?;
 				}
 				if let Some(list) = idents {
 					write!(f, " with (")?;
-					for (i, (name, alias)) in list.iter().enumerate() {
+					for (i, (Spanned(name, _), alias)) in list.iter().enumerate() {
 						if i > 0 {
 							write!(f, ", ")?;
 						}
-						write!(f, "{}", name.inner())?;
-						if let Some(a) = alias {
-							write!(f, " as {}", a.inner())?;
+						write!(f, "{name}")?;
+						if let Some(Spanned(alias, _)) = alias {
+							write!(f, " as {alias}")?;
 						}
 					}
 					write!(f, ")")?;
 				}
 				Ok(())
 			}
-			Declaration::Let { visibility, meta, value } => {
+			Declaration::Let {
+				visibility,
+				meta,
+				value,
+			} => {
 				write_visibility(f, visibility)?;
 				write!(f, "let")?;
 				if meta.mutable {
@@ -610,7 +692,11 @@ impl Display for Declaration {
 				}
 				write!(f, " {}", meta.name.inner())
 			}
-			Declaration::Func { visibility, meta, body } => {
+			Declaration::Func {
+				visibility,
+				meta,
+				body: Spanned(body, _),
+			} => {
 				write_visibility(f, visibility)?;
 				write!(f, "func {}(", meta.name.inner())?;
 				for (i, param) in meta.params.iter().enumerate() {
@@ -637,10 +723,10 @@ impl Display for Declaration {
 					}
 					write!(f, ">")?;
 				}
-				if let Some(ret) = &meta.return_type {
-					write!(f, " -> {}", ret.inner())?;
+				if let Some(Spanned(ret, _)) = &meta.return_type {
+					write!(f, " -> {ret}")?;
 				}
-				write!(f, " = {}", body.inner())
+				write!(f, " = {body}")
 			}
 			Declaration::ExternalFunc(visibility, meta) => {
 				write_visibility(f, visibility)?;
@@ -653,12 +739,16 @@ impl Display for Declaration {
 					write!(f, "{}: {}", p.name.inner(), p.type_.inner())?;
 				}
 				write!(f, ")")?;
-				if let Some(ret) = &meta.return_type {
-					write!(f, " -> {}", ret.inner())?;
+				if let Some(Spanned(ret, _)) = &meta.return_type {
+					write!(f, " -> {ret}")?;
 				}
 				Ok(())
 			}
-			Declaration::TypeAlias { visibility, meta, value } => {
+			Declaration::TypeAlias {
+				visibility,
+				meta,
+				value: Spanned(value, _),
+			} => {
 				write_visibility(f, visibility)?;
 				write!(f, "type {}(", meta.name.inner())?;
 				for (i, g) in meta.generics.iter().enumerate() {
@@ -667,11 +757,17 @@ impl Display for Declaration {
 					}
 					write!(f, "{}", g.inner().name.inner())?;
 				}
-				write!(f, ") = {}", value.inner())
+				write!(f, ") = {value}")
 			}
-			Declaration::Struct { visibility, name, generics, fields, members } => {
+			Declaration::Struct {
+				visibility,
+				name: Spanned(name, _),
+				generics,
+				fields,
+				members,
+			} => {
 				write_visibility(f, visibility)?;
-				write!(f, "struct {}(", name.inner())?;
+				write!(f, "struct {name}(")?;
 				for (i, g) in generics.iter().enumerate() {
 					if i > 0 {
 						write!(f, ", ")?;
@@ -688,7 +784,13 @@ impl Display for Declaration {
 				}
 				write!(f, ", members: [{}] }}", members.len())
 			}
-			Declaration::Enum { visibility, name, generics, variants, members } => {
+			Declaration::Enum {
+				visibility,
+				name,
+				generics,
+				variants,
+				members,
+			} => {
 				write_visibility(f, visibility)?;
 				write!(f, "enum {}(", name.inner())?;
 				for (i, g) in generics.iter().enumerate() {
@@ -706,11 +808,21 @@ impl Display for Declaration {
 				}
 				write!(f, ", members: [{}] }}", members.len())
 			}
-			Declaration::Namespace { visibility, name, members } => {
+			Declaration::Namespace {
+				visibility,
+				name,
+				members,
+			} => {
 				write_visibility(f, visibility)?;
 				write!(f, "namespace {} [{}]", name.inner(), members.len())
 			}
-			Declaration::Interface { visibility, name, generics, super_interfaces, members } => {
+			Declaration::Interface {
+				visibility,
+				name,
+				generics,
+				super_interfaces,
+				members,
+			} => {
 				write_visibility(f, visibility)?;
 				write!(f, "interface {}(", name.inner())?;
 				for (i, g) in generics.iter().enumerate() {
@@ -742,7 +854,13 @@ impl Display for Declaration {
 				}
 				write!(f, " [{}]", members.len())
 			}
-			Declaration::Impl { visibility, generics, mutable, type_, members } => {
+			Declaration::Impl {
+				visibility,
+				generics,
+				mutable,
+				type_,
+				members,
+			} => {
 				write_visibility(f, visibility)?;
 				if *mutable {
 					write!(f, "impl mut")?;
@@ -817,8 +935,8 @@ fn write_visibility(f: &mut Formatter<'_>, vis: &Option<Visibility>) -> Result {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::ast::Spanned;
 	use crate::ast::Span;
+	use crate::ast::Spanned;
 
 	fn span() -> Span {
 		Span::new(0, 0)
@@ -891,7 +1009,10 @@ mod tests {
 			type_: None,
 		};
 		let value = Spanned(Expr::Int(Spanned(0, span())), span());
-		let stmt = Statement::Let { meta: let_decl, value };
+		let stmt = Statement::Let {
+			meta: let_decl,
+			value,
+		};
 		assert_eq!(stmt.to_string(), "let mut _ = int(0)");
 	}
 
