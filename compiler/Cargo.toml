@@ -14,10 +14,16 @@ categories = ["compilers", "command-line-utilities", "parser-implementations"]
 anyhow = { workspace = true }
 ariadne = "0.6.0"
 chumsky = { version = "0.12.0", features = ["pratt", "memoization", "regex", "serde", "nightly"] }
-clap = { version = "4.5.56", features = ["derive", "cargo"] }
+clap = { version = "4.5.60", features = ["derive", "cargo"] }
 itertools = { workspace = true }
 ordered-float = "5.1.0"
+oxc_allocator = "0.116.0"
+oxc_ast = "0.116.0"
+oxc_codegen = "0.116.0"
+oxc_span = "0.116.0"
+oxc_syntax = "0.116.0"
 salsa = "0.26.0"
+strsim = { workspace = true }
 strum = { version = "0.27.2", features = ["derive"] }
 thiserror = "2.0.18"
 tokio = { workspace = true }
@@ -25,11 +31,11 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 reedline = "0.45.0"
 ecow = "0.2.6"
-regex = "1.12.2"
+regex = "1.12.3"
 indexmap = "2.13.0"
 vec1 = "1.12.1"
 
 [dev-dependencies]
 glob = "0.3.3"
 test-case = "3.3.1"
-assertables = "9.8.4"
+assertables = "9.8.6"

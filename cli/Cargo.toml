@@ -12,7 +12,7 @@ categories = ["compilers", "command-line-utilities", "parser-implementations"]
 
 [dependencies]
 anyhow = { workspace = true }
-clap = { version = "4.5.56", features = ["derive", "cargo"] }
+clap = { version = "4.5.60", features = ["derive", "cargo"] }
 ecow = "0.2.6"
 itertools = { workspace = true }
 tokio = { workspace = true }
