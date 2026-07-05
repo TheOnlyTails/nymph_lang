@@ -32,7 +32,7 @@ pub struct InherentMethod<'m> {
 	pub ret: Ty,
 	pub namespaced: bool,
 	pub meta: &'m FuncDeclaration,
-	pub body: Option<&'m Spanned<Expr>>,
+	pub body: Option<&'m Expr>,
 }
 
 /// A set of inherent methods sharing a self type (a `struct`/`enum` body, or a
@@ -192,7 +192,7 @@ impl<'m> Checker<'m> {
 		namespaced: bool,
 		out: &mut FxHashMap<EcoString, InherentMethod<'m>>,
 	) {
-		let (meta, body): (&'m FuncDeclaration, Option<&'m Spanned<Expr>>) = match member {
+		let (meta, body): (&'m FuncDeclaration, Option<&'m Expr>) = match member {
 			ImplMember::Func { meta, body, .. } => (meta, Some(body)),
 			ImplMember::ExternalFunc(_, _, meta) => (meta, None),
 			ImplMember::Let { .. } | ImplMember::ExternalLet(..) => return,
@@ -455,7 +455,7 @@ impl<'m> Checker<'m> {
 			owner_generics: &'m [Spanned<GenericParam>],
 			self_ty: Ty,
 			meta: &'m FuncDeclaration,
-			body: &'m Spanned<Expr>,
+			body: &'m Expr,
 			params: Vec<Ty>,
 			ret: Ty,
 			namespaced: bool,
@@ -501,7 +501,7 @@ impl<'m> Checker<'m> {
 		owner_generics: &'m [Spanned<GenericParam>],
 		self_ty: Ty,
 		meta: &'m FuncDeclaration,
-		body: &'m Spanned<Expr>,
+		body: &'m Expr,
 		params: &[Ty],
 		ret: Ty,
 		namespaced: bool,

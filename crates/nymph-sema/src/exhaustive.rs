@@ -80,7 +80,7 @@ impl Checker<'_> {
 		for arm in arms {
 			let query: Row = vec![Pat::Ref(&arm.pattern.0)];
 			if self.useful(&matrix, &query, &[scrutinee]).is_none() {
-				self.warn_unreachable(arm.body.1);
+				self.warn_unreachable(arm.body.span);
 			}
 			// Only unguarded arms block later ones and contribute to coverage.
 			if arm.guard.is_none() {
@@ -514,7 +514,7 @@ impl Checker<'_> {
 		for arm in arms {
 			if arm.guard.is_none() && is_irrefutable(&arm.pattern.0) {
 				if has_catch_all {
-					self.warn_unreachable(arm.body.1);
+					self.warn_unreachable(arm.body.span);
 				}
 				has_catch_all = true;
 			}

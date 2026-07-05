@@ -12,7 +12,7 @@ use ecow::EcoString;
 use nymph_ast::{
 	Span, Spanned,
 	decl::Declaration,
-	expr::{CallArg, Expr, RangeKind, Statement, StringPart},
+	expr::{CallArg, Expr, ExprKind, RangeKind, Statement, StringPart},
 	ops::{AssignOperator, BinaryOperator},
 };
 use rustc_hash::FxHashMap;
@@ -77,14 +77,14 @@ impl<'m> Checker<'m> {
 	}
 
 	// ── check mode ───────────────────────────────────────────────────────────
-	pub(crate) fn check(&mut self, expr: &Spanned<Expr>, expected: Ty) {
-		match &expr.0 {
-			Expr::Closure { .. } => self.check_closure(expr, expected),
-			Expr::Block { body, .. } => {
+	pub(crate) fn check(&mut self, expr: &Expr, expected: Ty) {
+		match &expr.kind {
+			ExprKind::Closure { .. } => self.check_closure(expr, expected),
+			ExprKind::Block { body, .. } => {
 				let ty = self.infer_block(body, Some(expected));
-				self.subtype(ty, expected, expr.1);
+				self.subtype(ty, expected, expr.span);
 			}
-			Expr::If {
+			ExprKind::If {
 				condition,
 				then,
 				otherwise,
@@ -97,11 +97,11 @@ impl<'m> Checker<'m> {
 					None => {
 						// A value is expected but there's no else branch.
 						let void = self.interner.void();
-						self.subtype(void, expected, expr.1);
+						self.subtype(void, expected, expr.span);
 					}
 				}
 			}
-			Expr::Match { value, arms } => {
+			ExprKind::Match { value, arms } => {
 				let scrutinee = self.infer(value);
 				for arm in arms {
 					self.push_scope();
@@ -113,30 +113,30 @@ impl<'m> Checker<'m> {
 					self.check(&arm.body, expected);
 					self.pop_scope();
 				}
-				self.check_exhaustive(scrutinee, arms, expr.1);
+				self.check_exhaustive(scrutinee, arms, expr.span);
 			}
-			Expr::Grouped(inner) => self.check(inner, expected),
+			ExprKind::Grouped(inner) => self.check(inner, expected),
 			// An integer literal implicitly widens to the expected `float`/`uint` (the
 			// literal is retyped, e.g. `1` → `1f` / `1u`, rather than reported as a
 			// mismatch). In any other expected context it synthesises `int` as usual.
-			Expr::Int(_) if self.int_literal_coerces_to(expected) => {}
+			ExprKind::Int(_) if self.int_literal_coerces_to(expected) => {}
 			_ => {
 				let got = self.infer(expr);
-				self.subtype(got, expected, expr.1);
+				self.subtype(got, expected, expr.span);
 			}
 		}
 	}
 
 	// ── infer mode ───────────────────────────────────────────────────────────
-	pub(crate) fn infer(&mut self, expr: &Spanned<Expr>) -> Ty {
-		let span = expr.1;
-		match &expr.0 {
-			Expr::Int(_) => self.interner.int(),
-			Expr::UInt(_) => self.interner.uint(),
-			Expr::Float(_) => self.interner.float(),
-			Expr::Char(_) => self.interner.char(),
-			Expr::Boolean(_) => self.interner.boolean(),
-			Expr::String(parts) => {
+	pub(crate) fn infer(&mut self, expr: &Expr) -> Ty {
+		let span = expr.span;
+		match &expr.kind {
+			ExprKind::Int(_) => self.interner.int(),
+			ExprKind::UInt(_) => self.interner.uint(),
+			ExprKind::Float(_) => self.interner.float(),
+			ExprKind::Char(_) => self.interner.char(),
+			ExprKind::Boolean(_) => self.interner.boolean(),
+			ExprKind::String(parts) => {
 				for part in parts {
 					if let StringPart::InterpolatedExpr(inner) = &part.0 {
 						self.infer(inner);
@@ -144,19 +144,19 @@ impl<'m> Checker<'m> {
 				}
 				self.interner.string()
 			}
-			Expr::This => match self.self_ty {
+			ExprKind::This => match self.self_ty {
 				Some(ty) => ty,
 				None => {
 					self.error("`this` is only valid inside a method", span);
 					self.interner.error()
 				}
 			},
-			Expr::Identifier(name) => self.infer_identifier(&name.0, span),
-			Expr::AnonymousParam(_) => {
+			ExprKind::Identifier(name) => self.infer_identifier(&name.0, span),
+			ExprKind::AnonymousParam(_) => {
 				self.error("anonymous closure parameters are not supported yet", span);
 				self.fresh()
 			}
-			Expr::List(items) => {
+			ExprKind::List(items) => {
 				let elem = self.fresh();
 				for item in items {
 					use nymph_ast::expr::ListItem;
@@ -170,7 +170,7 @@ impl<'m> Checker<'m> {
 				}
 				self.interner.mk_list(elem)
 			}
-			Expr::Tuple(items) => {
+			ExprKind::Tuple(items) => {
 				use nymph_ast::expr::ListItem;
 				// Spreads in tuples are not statically sized in Milestone A; infer
 				// non-spread items positionally.
@@ -185,7 +185,7 @@ impl<'m> Checker<'m> {
 				}
 				self.interner.mk_tuple(tys)
 			}
-			Expr::Map(entries) => {
+			ExprKind::Map(entries) => {
 				use nymph_ast::expr::MapEntry;
 				let key = self.fresh();
 				let value = self.fresh();
@@ -203,47 +203,49 @@ impl<'m> Checker<'m> {
 				}
 				self.interner.mk_map(key, value)
 			}
-			Expr::Range(kind) => {
+			ExprKind::Range(kind) => {
 				self.infer_range_element(kind);
 				// A range value's own type (an iterable) is Milestone B; for now it
 				// is an opaque hole, while `for` extracts the element directly.
 				self.fresh()
 			}
-			Expr::Call { func, args, .. } => self.infer_call(func, args, span),
-			Expr::MemberAccess { parent, member, .. } => self.infer_member(parent, &member.0, member.1),
-			Expr::IndexAccess { parent, index, .. } => {
+			ExprKind::Call { func, args, .. } => self.infer_call(func, args, span),
+			ExprKind::MemberAccess { parent, member, .. } => {
+				self.infer_member(parent, &member.0, member.1)
+			}
+			ExprKind::IndexAccess { parent, index, .. } => {
 				// `a[i]` ≡ `a.index(i)` through the `Index` interface.
 				let recv = self.infer(parent);
 				let key = self.infer(index);
-				let key_lit = matches!(index.0, Expr::Int(_));
+				let key_lit = matches!(index.kind, ExprKind::Int(_));
 				match self.resolve_method(recv, "index", &[key], &[key_lit], span) {
 					Some(ret) => ret,
 					None => self.fresh(),
 				}
 			}
-			Expr::Closure { .. } => self.infer_closure(expr),
-			Expr::PrefixOp { op, value } => self.infer_prefix(*op, value, span),
-			Expr::PostfixOp { value, .. } => {
+			ExprKind::Closure { .. } => self.infer_closure(expr),
+			ExprKind::PrefixOp { op, value } => self.infer_prefix(*op, value, span),
+			ExprKind::PostfixOp { value, .. } => {
 				// `?` error propagation — Milestone B; unwrap best-effort.
 				self.infer(value);
 				self.fresh()
 			}
-			Expr::BinaryOp { lhs, op, rhs } => self.infer_binary(lhs, *op, rhs, span),
-			Expr::TypeOp { lhs, rhs, .. } => {
+			ExprKind::BinaryOp { lhs, op, rhs } => self.infer_binary(lhs, *op, rhs, span),
+			ExprKind::TypeOp { lhs, rhs, .. } => {
 				let src = self.infer(lhs);
 				let target = self.lower_type(rhs);
 				self.check_cast(src, target, span);
 				target
 			}
-			Expr::PatternOp { lhs, rhs, .. } => {
+			ExprKind::PatternOp { lhs, rhs, .. } => {
 				let scrutinee = self.infer(lhs);
 				self.push_scope();
 				self.check_pattern(rhs, scrutinee);
 				self.pop_scope();
 				self.interner.boolean()
 			}
-			Expr::AssignOp { lhs, op, rhs } => self.infer_assign(lhs, *op, rhs, span),
-			Expr::Return { value, .. } => {
+			ExprKind::AssignOp { lhs, op, rhs } => self.infer_assign(lhs, *op, rhs, span),
+			ExprKind::Return { value, .. } => {
 				let ret = self.ret_ty;
 				if let Some(v) = value {
 					match ret {
@@ -255,14 +257,14 @@ impl<'m> Checker<'m> {
 				}
 				self.interner.never()
 			}
-			Expr::Break { value, .. } => {
+			ExprKind::Break { value, .. } => {
 				if let Some(v) = value {
 					self.infer(v);
 				}
 				self.interner.never()
 			}
-			Expr::Continue { .. } => self.interner.never(),
-			Expr::While {
+			ExprKind::Continue { .. } => self.interner.never(),
+			ExprKind::While {
 				condition, body, ..
 			} => {
 				let boolean = self.interner.boolean();
@@ -272,7 +274,7 @@ impl<'m> Checker<'m> {
 				self.pop_scope();
 				self.interner.void()
 			}
-			Expr::For {
+			ExprKind::For {
 				variable,
 				iterable,
 				body,
@@ -285,7 +287,7 @@ impl<'m> Checker<'m> {
 				self.pop_scope();
 				self.interner.void()
 			}
-			Expr::If {
+			ExprKind::If {
 				condition,
 				then,
 				otherwise,
@@ -304,7 +306,7 @@ impl<'m> Checker<'m> {
 					}
 				}
 			}
-			Expr::Match { value, arms } => {
+			ExprKind::Match { value, arms } => {
 				let scrutinee = self.infer(value);
 				let result = self.fresh();
 				for arm in arms {
@@ -320,8 +322,8 @@ impl<'m> Checker<'m> {
 				self.check_exhaustive(scrutinee, arms, span);
 				result
 			}
-			Expr::Block { body, .. } => self.infer_block(body, None),
-			Expr::Grouped(inner) => self.infer(inner),
+			ExprKind::Block { body, .. } => self.infer_block(body, None),
+			ExprKind::Grouped(inner) => self.infer(inner),
 		}
 	}
 
@@ -421,9 +423,9 @@ impl<'m> Checker<'m> {
 	}
 
 	// ── Calls & construction ─────────────────────────────────────────────────
-	fn infer_call(&mut self, func: &Spanned<Expr>, args: &[Spanned<CallArg>], span: Span) -> Ty {
+	fn infer_call(&mut self, func: &Expr, args: &[Spanned<CallArg>], span: Span) -> Ty {
 		// Constructor calls: `Struct(field = …)` / `Variant(field = …)`.
-		if let Expr::Identifier(name) = &func.0 {
+		if let ExprKind::Identifier(name) = &func.kind {
 			if let Some(def) = self.defs.get(&name.0)
 				&& let DefKind::Struct { .. } = self.defs.data(def).kind
 			{
@@ -443,8 +445,8 @@ impl<'m> Checker<'m> {
 
 		// `Type.variant(…)` construction and `Type.static(…)` calls: the parent is a
 		// type name, not a value.
-		if let Expr::MemberAccess { parent, member, .. } = &func.0
-			&& let Expr::Identifier(type_name) = &parent.0
+		if let ExprKind::MemberAccess { parent, member, .. } = &func.kind
+			&& let ExprKind::Identifier(type_name) = &parent.kind
 			&& let Some(def) = self.defs.get(&type_name.0)
 		{
 			match self.defs.data(def).kind {
@@ -493,8 +495,8 @@ impl<'m> Checker<'m> {
 
 		// `P.name(args…)` where `P` is a generic type parameter: a namespaced interface
 		// function reached through `P`'s bound, e.g. `R.default()` with `R: Default`.
-		if let Expr::MemberAccess { parent, member, .. } = &func.0
-			&& let Expr::Identifier(pname) = &parent.0
+		if let ExprKind::MemberAccess { parent, member, .. } = &func.kind
+			&& let ExprKind::Identifier(pname) = &parent.kind
 			&& self.lookup_local(&pname.0).is_none()
 			&& let Some(pidx) = self.lookup_param(&pname.0)
 		{
@@ -503,7 +505,7 @@ impl<'m> Checker<'m> {
 		}
 
 		// Method call: `receiver.method(args…)` resolves through the interface solver.
-		if let Expr::MemberAccess { parent, member, .. } = &func.0 {
+		if let ExprKind::MemberAccess { parent, member, .. } = &func.kind {
 			let recv = self.infer(parent);
 			let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
 			let arg_lits = arg_int_lits(args);
@@ -606,7 +608,7 @@ impl<'m> Checker<'m> {
 				match fields.get(i) {
 					Some((_, ty)) => Some(*ty),
 					None => {
-						self.error("too many fields supplied", call.value.1);
+						self.error("too many fields supplied", call.value.span);
 						None
 					}
 				}
@@ -621,9 +623,9 @@ impl<'m> Checker<'m> {
 	}
 
 	// ── Member access ────────────────────────────────────────────────────────
-	fn infer_member(&mut self, parent: &Spanned<Expr>, member: &str, span: Span) -> Ty {
+	fn infer_member(&mut self, parent: &Expr, member: &str, span: Span) -> Ty {
 		// `EnumName.Variant` — a variant referenced through its type.
-		if let Expr::Identifier(tname) = &parent.0
+		if let ExprKind::Identifier(tname) = &parent.kind
 			&& let Some(def) = self.defs.get(&tname.0)
 			&& let DefKind::Enum { .. } = self.defs.data(def).kind
 		{
@@ -663,13 +665,13 @@ impl<'m> Checker<'m> {
 	}
 
 	// ── Closures ─────────────────────────────────────────────────────────────
-	fn infer_closure(&mut self, expr: &Spanned<Expr>) -> Ty {
-		let Expr::Closure {
+	fn infer_closure(&mut self, expr: &Expr) -> Ty {
+		let ExprKind::Closure {
 			params,
 			generics,
 			return_type,
 			body,
-		} = &expr.0
+		} = &expr.kind
 		else {
 			unreachable!("guarded by caller");
 		};
@@ -697,14 +699,14 @@ impl<'m> Checker<'m> {
 		self.interner.mk_fn(param_tys, ret)
 	}
 
-	fn check_closure(&mut self, expr: &Spanned<Expr>, expected: Ty) {
+	fn check_closure(&mut self, expr: &Expr, expected: Ty) {
 		let expected = self.shallow_resolve(expected);
-		let Expr::Closure {
+		let ExprKind::Closure {
 			params,
 			generics,
 			return_type,
 			body,
-		} = &expr.0
+		} = &expr.kind
 		else {
 			unreachable!("guarded by caller");
 		};
@@ -744,16 +746,11 @@ impl<'m> Checker<'m> {
 		self.pop_scope();
 		self.pop_params();
 		let got = self.interner.mk_fn(param_tys, ret);
-		self.subtype(got, expected, expr.1);
+		self.subtype(got, expected, expr.span);
 	}
 
 	// ── Operators (built-in only in Milestone A) ─────────────────────────────
-	fn infer_prefix(
-		&mut self,
-		op: nymph_ast::ops::PrefixOperator,
-		value: &Spanned<Expr>,
-		span: Span,
-	) -> Ty {
+	fn infer_prefix(&mut self, op: nymph_ast::ops::PrefixOperator, value: &Expr, span: Span) -> Ty {
 		use nymph_ast::ops::PrefixOperator::*;
 		// `!true`/negation on a primitive is built in; otherwise desugar to the
 		// interface method (`not`/`negate`/`bit_not`).
@@ -795,13 +792,7 @@ impl<'m> Checker<'m> {
 	/// fast-paths (so basic arithmetic needs no impls in scope); everything else —
 	/// including mixed-primitive arithmetic like `int + float` — routes through the
 	/// solver, where the method's return type *is* the operator's result type.
-	fn infer_binary(
-		&mut self,
-		lhs: &Spanned<Expr>,
-		op: BinaryOperator,
-		rhs: &Spanned<Expr>,
-		span: Span,
-	) -> Ty {
+	fn infer_binary(&mut self, lhs: &Expr, op: BinaryOperator, rhs: &Expr, span: Span) -> Ty {
 		use BinaryOperator::*;
 
 		// `|>` is application, not a method.
@@ -828,9 +819,9 @@ impl<'m> Checker<'m> {
 				// a genuine mixed-type operator that must be overloaded (e.g. `x + y` with
 				// `x: float`, `y: int`).
 				(Some(_), Some(_)) => {
-					if matches!(rhs.0, Expr::Int(_)) && self.int_literal_coerces_to(l) {
+					if matches!(rhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(l) {
 						l
-					} else if matches!(lhs.0, Expr::Int(_)) && self.int_literal_coerces_to(r) {
+					} else if matches!(lhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(r) {
 						r
 					} else {
 						self.dispatch_operator(l, binary_method(op), &[r], span)
@@ -906,9 +897,9 @@ impl<'m> Checker<'m> {
 
 	/// Unify two operand types, but let an `int` *literal* operand widen to a `float`/
 	/// `uint` sibling instead of clashing (so `someFloat > 0` and `someUint == 0` type).
-	fn unify_operands(&mut self, lhs: &Spanned<Expr>, l: Ty, rhs: &Spanned<Expr>, r: Ty, span: Span) {
-		if (matches!(lhs.0, Expr::Int(_)) && self.int_literal_coerces_to(r))
-			|| (matches!(rhs.0, Expr::Int(_)) && self.int_literal_coerces_to(l))
+	fn unify_operands(&mut self, lhs: &Expr, l: Ty, rhs: &Expr, r: Ty, span: Span) {
+		if (matches!(lhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(r))
+			|| (matches!(rhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(l))
 		{
 			return;
 		}
@@ -1021,24 +1012,18 @@ impl<'m> Checker<'m> {
 	/// assignment reads as `place = place <op> value`, so its value type comes from the
 	/// underlying binary operator; a plain `=` checks the value against the place type
 	/// (letting an `int` literal widen, etc.).
-	fn infer_assign(
-		&mut self,
-		lhs: &Spanned<Expr>,
-		op: AssignOperator,
-		rhs: &Spanned<Expr>,
-		span: Span,
-	) -> Ty {
+	fn infer_assign(&mut self, lhs: &Expr, op: AssignOperator, rhs: &Expr, span: Span) -> Ty {
 		// Resolve the assignable place, reporting non-places and immutable targets.
-		let place_ty = match &lhs.0 {
-			Expr::Identifier(name) => match self.lookup_local(&name.0).map(|b| (b.ty, b.mutable)) {
+		let place_ty = match &lhs.kind {
+			ExprKind::Identifier(name) => match self.lookup_local(&name.0).map(|b| (b.ty, b.mutable)) {
 				Some((ty, mutable)) => {
 					if !mutable {
-						self.error(format!("cannot assign to immutable `{}`", name.0), lhs.1);
+						self.error(format!("cannot assign to immutable `{}`", name.0), lhs.span);
 					}
 					ty
 				}
 				None => {
-					self.error(format!("cannot assign to `{}`", name.0), lhs.1);
+					self.error(format!("cannot assign to `{}`", name.0), lhs.span);
 					self.infer(rhs);
 					return self.interner.void();
 				}
@@ -1091,7 +1076,7 @@ impl<'m> Checker<'m> {
 		result
 	}
 
-	fn check_let_statement(&mut self, meta: &nymph_ast::decl::LetDeclaration, value: &Spanned<Expr>) {
+	fn check_let_statement(&mut self, meta: &nymph_ast::decl::LetDeclaration, value: &Expr) {
 		let ty = match &meta.type_ {
 			Some(annot) => {
 				let declared = self.lower_type(annot);
@@ -1104,8 +1089,8 @@ impl<'m> Checker<'m> {
 	}
 
 	// ── Iteration ────────────────────────────────────────────────────────────
-	fn infer_iterable_element(&mut self, iterable: &Spanned<Expr>) -> Ty {
-		if let Expr::Range(kind) = &iterable.0 {
+	fn infer_iterable_element(&mut self, iterable: &Expr) -> Ty {
+		if let ExprKind::Range(kind) = &iterable.kind {
 			return self.infer_range_element(kind);
 		}
 		let ty = self.infer(iterable);
@@ -1119,7 +1104,7 @@ impl<'m> Checker<'m> {
 
 	fn infer_range_element(&mut self, kind: &RangeKind) -> Ty {
 		let elem = self.fresh();
-		let bound = |checker: &mut Self, e: &Spanned<Expr>| checker.check(e, elem);
+		let bound = |checker: &mut Self, e: &Expr| checker.check(e, elem);
 		match kind {
 			RangeKind::From(a) | RangeKind::To(a) | RangeKind::ToInclusive(a) => bound(self, a),
 			RangeKind::Exclusive { min, max } | RangeKind::Inclusive { min, max } => {
@@ -1182,7 +1167,7 @@ fn ambiguous_variant(name: &str) -> String {
 fn arg_int_lits(args: &[Spanned<CallArg>]) -> Vec<bool> {
 	args
 		.iter()
-		.map(|a| matches!(a.0.value.0, Expr::Int(_)))
+		.map(|a| matches!(a.0.value.kind, ExprKind::Int(_)))
 		.collect()
 }
 
