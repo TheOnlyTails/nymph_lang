@@ -8,7 +8,7 @@ use nymph_ast::{
 		InterfaceMember, LetDeclaration, StructField, StructInnerMember, TypeAliasDeclaration,
 		Visibility,
 	},
-	expr::Expr,
+	expr::{Expr, ExprKind},
 	token::Token,
 	ty::{GenericArg, Type},
 };
@@ -126,7 +126,7 @@ impl Parser<'_> {
 	}
 
 	/// Parse `let [mut] pattern [: type] = expr`, shared by declarations and statements.
-	pub(super) fn parse_let_binding(&mut self) -> (LetDeclaration, Spanned<Expr>) {
+	pub(super) fn parse_let_binding(&mut self) -> (LetDeclaration, Expr) {
 		self.advance(); // `let`
 		let mutable = self.eat(&Token::Mut).is_some();
 		let name = self.parse_binding_pattern();
@@ -443,7 +443,7 @@ impl Parser<'_> {
 					name: Spanned(nymph_ast::expr::Pattern::Placeholder, span),
 					type_: None,
 				},
-				value: Spanned(Expr::Tuple(Vec::new()), span),
+				value: self.mk_expr(ExprKind::Tuple(Vec::new()), span),
 			}
 		};
 		Spanned(member, self.span_from(start))

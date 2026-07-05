@@ -13,7 +13,12 @@ mod ty;
 
 use cursor::TokenCursor;
 use ecow::EcoString;
-use nymph_ast::{Ident, Span, Spanned, decl::Module, expr::Expr, token::Token};
+use nymph_ast::{
+	Ident, NodeId, Span, Spanned,
+	decl::Module,
+	expr::{Expr, ExprKind},
+	token::Token,
+};
 use nymph_diagnostics::Diagnostic;
 
 use crate::lex;
@@ -21,6 +26,7 @@ use crate::lex;
 pub struct Parser<'src> {
 	cursor: TokenCursor<'src>,
 	diagnostics: Vec<Diagnostic>,
+	next_id: u32,
 }
 
 /// The result of parsing: the (best-effort) tree plus every diagnostic encountered.
@@ -47,7 +53,7 @@ pub fn parse_module(source: &str, module_path: impl Into<EcoString>) -> ParseRes
 }
 
 /// Lex and parse a single expression (used by the REPL and tests).
-pub fn parse_expression(source: &str) -> ParseResult<Spanned<Expr>> {
+pub fn parse_expression(source: &str) -> ParseResult<Expr> {
 	let lexed = lex(source);
 	let eoi = Span::new(source.len(), source.len());
 	let mut parser = Parser::new(&lexed.tokens, eoi);
@@ -72,7 +78,15 @@ impl<'src> Parser<'src> {
 		Self {
 			cursor: TokenCursor::new(tokens, eoi),
 			diagnostics: Vec::new(),
+			next_id: 0,
 		}
+	}
+
+	/// Build a self-spanned expression, assigning the next fresh node id.
+	pub(super) fn mk_expr(&mut self, kind: ExprKind, span: Span) -> Expr {
+		let id = NodeId(self.next_id);
+		self.next_id += 1;
+		Expr { kind, span, id }
 	}
 
 	// ── Cursor conveniences ──────────────────────────────────────────────────

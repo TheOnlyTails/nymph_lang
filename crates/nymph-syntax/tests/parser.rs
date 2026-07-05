@@ -2,14 +2,13 @@
 //! (lex → parse).
 
 use nymph_ast::{
-	Spanned,
 	decl::Declaration,
-	expr::{Expr, RangeKind},
+	expr::{Expr, ExprKind, RangeKind},
 	ops::BinaryOperator,
 };
 use nymph_syntax::{parse_expression, parse_module};
 
-fn expr(src: &str) -> Spanned<Expr> {
+fn expr(src: &str) -> Expr {
 	let result = parse_expression(src);
 	assert!(
 		result.diagnostics.is_empty(),
@@ -31,24 +30,24 @@ fn module_ok(src: &str) -> Vec<Declaration> {
 
 #[test]
 fn literals_and_identifiers() {
-	assert!(matches!(expr("42").0, Expr::Int(_)));
-	assert!(matches!(expr("3.14").0, Expr::Float(_)));
-	assert!(matches!(expr("true").0, Expr::Boolean(_)));
-	assert!(matches!(expr("'a'").0, Expr::Char(_)));
-	assert!(matches!(expr("foo").0, Expr::Identifier(_)));
-	assert!(matches!(expr("this").0, Expr::This));
+	assert!(matches!(expr("42").kind, ExprKind::Int(_)));
+	assert!(matches!(expr("3.14").kind, ExprKind::Float(_)));
+	assert!(matches!(expr("true").kind, ExprKind::Boolean(_)));
+	assert!(matches!(expr("'a'").kind, ExprKind::Char(_)));
+	assert!(matches!(expr("foo").kind, ExprKind::Identifier(_)));
+	assert!(matches!(expr("this").kind, ExprKind::This));
 }
 
 #[test]
 fn arithmetic_precedence() {
 	// 1 + 2 * 3 parses as 1 + (2 * 3)
-	let Expr::BinaryOp { op, rhs, .. } = expr("1 + 2 * 3").0 else {
+	let ExprKind::BinaryOp { op, rhs, .. } = expr("1 + 2 * 3").kind else {
 		panic!("expected a binary op");
 	};
 	assert_eq!(op, BinaryOperator::Plus);
 	assert!(matches!(
-		rhs.0,
-		Expr::BinaryOp {
+		rhs.kind,
+		ExprKind::BinaryOp {
 			op: BinaryOperator::Times,
 			..
 		}
@@ -58,13 +57,13 @@ fn arithmetic_precedence() {
 #[test]
 fn power_is_right_associative() {
 	// 2 ** 3 ** 2 parses as 2 ** (3 ** 2)
-	let Expr::BinaryOp { op, rhs, .. } = expr("2 ** 3 ** 2").0 else {
+	let ExprKind::BinaryOp { op, rhs, .. } = expr("2 ** 3 ** 2").kind else {
 		panic!("expected a binary op");
 	};
 	assert_eq!(op, BinaryOperator::Power);
 	assert!(matches!(
-		rhs.0,
-		Expr::BinaryOp {
+		rhs.kind,
+		ExprKind::BinaryOp {
 			op: BinaryOperator::Power,
 			..
 		}
@@ -73,7 +72,7 @@ fn power_is_right_associative() {
 
 #[test]
 fn shift_recombination() {
-	let Expr::BinaryOp { op, .. } = expr("a << b").0 else {
+	let ExprKind::BinaryOp { op, .. } = expr("a << b").kind else {
 		panic!("expected a binary op");
 	};
 	assert_eq!(op, BinaryOperator::LeftShift);
@@ -81,22 +80,28 @@ fn shift_recombination() {
 
 #[test]
 fn collections_and_ranges() {
-	assert!(matches!(expr("#[1, 2, 3]").0, Expr::List(_)));
-	assert!(matches!(expr("#(1, true, 'a')").0, Expr::Tuple(_)));
-	assert!(matches!(expr(r#"#{"a": 1}"#).0, Expr::Map(_)));
+	assert!(matches!(expr("#[1, 2, 3]").kind, ExprKind::List(_)));
+	assert!(matches!(expr("#(1, true, 'a')").kind, ExprKind::Tuple(_)));
+	assert!(matches!(expr(r#"#{"a": 1}"#).kind, ExprKind::Map(_)));
 	assert!(matches!(
-		expr("1..10").0,
-		Expr::Range(RangeKind::Exclusive { .. })
+		expr("1..10").kind,
+		ExprKind::Range(RangeKind::Exclusive { .. })
 	));
 	assert!(matches!(
-		expr("1..=10").0,
-		Expr::Range(RangeKind::Inclusive { .. })
+		expr("1..=10").kind,
+		ExprKind::Range(RangeKind::Inclusive { .. })
 	));
-	assert!(matches!(expr("1..").0, Expr::Range(RangeKind::From(_))));
-	assert!(matches!(expr("..10").0, Expr::Range(RangeKind::To(_))));
 	assert!(matches!(
-		expr("..=10").0,
-		Expr::Range(RangeKind::ToInclusive(_))
+		expr("1..").kind,
+		ExprKind::Range(RangeKind::From(_))
+	));
+	assert!(matches!(
+		expr("..10").kind,
+		ExprKind::Range(RangeKind::To(_))
+	));
+	assert!(matches!(
+		expr("..=10").kind,
+		ExprKind::Range(RangeKind::ToInclusive(_))
 	));
 }
 
@@ -104,39 +109,48 @@ fn collections_and_ranges() {
 fn calls_and_member_access() {
 	// foo.bar(1).baz chains member/call postfix operators.
 	assert!(matches!(
-		expr("foo.bar(1).baz").0,
-		Expr::MemberAccess { .. }
+		expr("foo.bar(1).baz").kind,
+		ExprKind::MemberAccess { .. }
 	));
 	assert!(matches!(
-		expr("list?.first").0,
-		Expr::MemberAccess { optional: true, .. }
+		expr("list?.first").kind,
+		ExprKind::MemberAccess { optional: true, .. }
 	));
-	assert!(matches!(expr("value?").0, Expr::PostfixOp { .. }));
+	assert!(matches!(expr("value?").kind, ExprKind::PostfixOp { .. }));
 }
 
 #[test]
 fn closures() {
-	assert!(matches!(expr("x -> x + 1").0, Expr::Closure { .. }));
-	assert!(matches!(expr("(a, b) -> a + b").0, Expr::Closure { .. }));
-	assert!(matches!(expr("() -> 0").0, Expr::Closure { .. }));
+	assert!(matches!(expr("x -> x + 1").kind, ExprKind::Closure { .. }));
+	assert!(matches!(
+		expr("(a, b) -> a + b").kind,
+		ExprKind::Closure { .. }
+	));
+	assert!(matches!(expr("() -> 0").kind, ExprKind::Closure { .. }));
 	// A grouped expression, not a closure.
-	assert!(matches!(expr("(1 + 2)").0, Expr::Grouped(_)));
+	assert!(matches!(expr("(1 + 2)").kind, ExprKind::Grouped(_)));
 }
 
 #[test]
 fn control_flow_expressions() {
-	assert!(matches!(expr("if (x > 0) x else -x").0, Expr::If { .. }));
 	assert!(matches!(
-		expr("match (n) { 0 -> true, _ -> false }").0,
-		Expr::Match { .. }
+		expr("if (x > 0) x else -x").kind,
+		ExprKind::If { .. }
 	));
-	assert!(matches!(expr("{ let x = 1 x + 1 }").0, Expr::Block { .. }));
+	assert!(matches!(
+		expr("match (n) { 0 -> true, _ -> false }").kind,
+		ExprKind::Match { .. }
+	));
+	assert!(matches!(
+		expr("{ let x = 1 x + 1 }").kind,
+		ExprKind::Block { .. }
+	));
 }
 
 #[test]
 fn string_interpolation() {
 	let e = expr(r#""Hello, ${name}!""#);
-	let Expr::String(parts) = e.0 else {
+	let ExprKind::String(parts) = e.kind else {
 		panic!("expected string");
 	};
 	assert_eq!(parts.len(), 3);
@@ -148,9 +162,15 @@ fn string_interpolation() {
 
 #[test]
 fn pattern_operators() {
-	assert!(matches!(expr("x is Some(value)").0, Expr::PatternOp { .. }));
-	assert!(matches!(expr("x !is None").0, Expr::PatternOp { .. }));
-	assert!(matches!(expr("x as float").0, Expr::TypeOp { .. }));
+	assert!(matches!(
+		expr("x is Some(value)").kind,
+		ExprKind::PatternOp { .. }
+	));
+	assert!(matches!(
+		expr("x !is None").kind,
+		ExprKind::PatternOp { .. }
+	));
+	assert!(matches!(expr("x as float").kind, ExprKind::TypeOp { .. }));
 }
 
 #[test]
@@ -210,4 +230,60 @@ fn import_declaration() {
 	};
 	assert_eq!(path.len(), 1);
 	assert_eq!(idents.as_ref().unwrap().len(), 2);
+}
+
+/// Recursively push every expression node id reachable from `expr`. Kept minimal:
+/// it only needs to reach the nodes produced by
+/// `expression_node_ids_are_unique_and_dense`'s source (binary ops, a call, args,
+/// literals), not exhaustively every `ExprKind` variant.
+fn collect_expr_ids(expr: &Expr, out: &mut Vec<u32>) {
+	out.push(expr.id.0);
+	match &expr.kind {
+		ExprKind::BinaryOp { lhs, rhs, .. } | ExprKind::AssignOp { lhs, rhs, .. } => {
+			collect_expr_ids(lhs, out);
+			collect_expr_ids(rhs, out);
+		}
+		ExprKind::Call { func, args, .. } => {
+			collect_expr_ids(func, out);
+			for arg in args {
+				collect_expr_ids(&arg.0.value, out);
+			}
+		}
+		ExprKind::PrefixOp { value, .. }
+		| ExprKind::PostfixOp { value, .. }
+		| ExprKind::Grouped(value) => {
+			collect_expr_ids(value, out);
+		}
+		_ => {}
+	}
+}
+
+/// Push every expression node id reachable from a declaration's body/value.
+fn collect_decl_expr_ids(decl: &Declaration, out: &mut Vec<u32>) {
+	match decl {
+		Declaration::Func { body, .. } => collect_expr_ids(body, out),
+		Declaration::Let { value, .. } => collect_expr_ids(value, out),
+		_ => {}
+	}
+}
+
+#[test]
+fn expression_node_ids_are_unique_and_dense() {
+	// A body with several nested expressions: binary ops, a call, a literal.
+	let src = "func f() = 1 + g(2) * 3";
+	let members = module_ok(src);
+
+	let mut ids = Vec::new();
+	for member in &members {
+		collect_decl_expr_ids(member, &mut ids);
+	}
+
+	let mut sorted = ids.clone();
+	sorted.sort_unstable();
+	sorted.dedup();
+	assert_eq!(sorted.len(), ids.len(), "node ids must be unique");
+	assert_ne!(ids.len(), 0, "expected several expression nodes");
+	// Dense from 0: the parser numbers in construction order starting at 0.
+	assert_eq!(*sorted.first().unwrap(), 0);
+	assert_eq!(*sorted.last().unwrap(), (ids.len() as u32) - 1);
 }

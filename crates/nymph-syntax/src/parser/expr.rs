@@ -3,7 +3,8 @@
 use nymph_ast::{
 	Span, Spanned,
 	expr::{
-		CallArg, ClosureParam, Expr, ListItem, MapEntry, MatchArm, RangeKind, Statement, StringPart,
+		CallArg, ClosureParam, Expr, ExprKind, ListItem, MapEntry, MatchArm, RangeKind, Statement,
+		StringPart,
 	},
 	ops::{AssignOperator, BinaryOperator, Precedence, PrefixOperator},
 	token::{StrFragment, Token},
@@ -35,11 +36,11 @@ fn bp(prec: Precedence, right_assoc: bool) -> (u16, u16) {
 }
 
 impl Parser<'_> {
-	pub(super) fn parse_expr(&mut self) -> Spanned<Expr> {
+	pub(super) fn parse_expr(&mut self) -> Expr {
 		self.parse_bp(0)
 	}
 
-	fn parse_bp(&mut self, min_bp: u16) -> Spanned<Expr> {
+	fn parse_bp(&mut self, min_bp: u16) -> Expr {
 		let start = self.position();
 		let mut lhs = self.parse_prefix();
 
@@ -53,8 +54,8 @@ impl Parser<'_> {
 			lhs = match infix {
 				Infix::Binary(op) => {
 					let rhs = self.parse_bp(r_bp);
-					Spanned(
-						Expr::BinaryOp {
+					self.mk_expr(
+						ExprKind::BinaryOp {
 							lhs: Box::new(lhs),
 							op,
 							rhs: Box::new(rhs),
@@ -64,8 +65,8 @@ impl Parser<'_> {
 				}
 				Infix::Assign(op) => {
 					let rhs = self.parse_bp(r_bp);
-					Spanned(
-						Expr::AssignOp {
+					self.mk_expr(
+						ExprKind::AssignOp {
 							lhs: Box::new(lhs),
 							op,
 							rhs: Box::new(rhs),
@@ -75,8 +76,8 @@ impl Parser<'_> {
 				}
 				Infix::As => {
 					let ty = self.parse_type();
-					Spanned(
-						Expr::TypeOp {
+					self.mk_expr(
+						ExprKind::TypeOp {
 							lhs: Box::new(lhs),
 							op: nymph_ast::ops::TypeOperator::As,
 							rhs: ty,
@@ -91,8 +92,8 @@ impl Parser<'_> {
 						nymph_ast::ops::PatternOperator::NotIs
 					};
 					let pat = self.parse_pattern();
-					Spanned(
-						Expr::PatternOp {
+					self.mk_expr(
+						ExprKind::PatternOp {
 							lhs: Box::new(lhs),
 							op,
 							rhs: pat,
@@ -103,24 +104,24 @@ impl Parser<'_> {
 				Infix::RangeExclusive => {
 					if self.can_start_expr() {
 						let max = self.parse_bp(r_bp);
-						Spanned(
-							Expr::Range(RangeKind::Exclusive {
+						self.mk_expr(
+							ExprKind::Range(RangeKind::Exclusive {
 								min: Box::new(lhs),
 								max: Box::new(max),
 							}),
 							self.span_from(start),
 						)
 					} else {
-						Spanned(
-							Expr::Range(RangeKind::From(Box::new(lhs))),
+						self.mk_expr(
+							ExprKind::Range(RangeKind::From(Box::new(lhs))),
 							self.span_from(start),
 						)
 					}
 				}
 				Infix::RangeInclusive => {
 					let max = self.parse_bp(r_bp);
-					Spanned(
-						Expr::Range(RangeKind::Inclusive {
+					self.mk_expr(
+						ExprKind::Range(RangeKind::Inclusive {
 							min: Box::new(lhs),
 							max: Box::new(max),
 						}),
@@ -237,7 +238,7 @@ impl Parser<'_> {
 		}
 	}
 
-	fn parse_prefix(&mut self) -> Spanned<Expr> {
+	fn parse_prefix(&mut self) -> Expr {
 		let start = self.position();
 		let prefix = match self.peek() {
 			Some(Token::Bang) => Some(PrefixOperator::BoolNot),
@@ -249,8 +250,8 @@ impl Parser<'_> {
 			self.advance();
 			let (_, r) = bp(Precedence::Unary, false);
 			let operand = self.parse_bp(r);
-			return Spanned(
-				Expr::PrefixOp {
+			return self.mk_expr(
+				ExprKind::PrefixOp {
 					op,
 					value: Box::new(operand),
 				},
@@ -263,8 +264,8 @@ impl Parser<'_> {
 			self.advance();
 			let (_, r) = bp(Precedence::Range, false);
 			let max = self.parse_bp(r);
-			return Spanned(
-				Expr::Range(RangeKind::To(Box::new(max))),
+			return self.mk_expr(
+				ExprKind::Range(RangeKind::To(Box::new(max))),
 				self.span_from(start),
 			);
 		}
@@ -272,8 +273,8 @@ impl Parser<'_> {
 			self.advance();
 			let (_, r) = bp(Precedence::Range, false);
 			let max = self.parse_bp(r);
-			return Spanned(
-				Expr::Range(RangeKind::ToInclusive(Box::new(max))),
+			return self.mk_expr(
+				ExprKind::Range(RangeKind::ToInclusive(Box::new(max))),
 				self.span_from(start),
 			);
 		}
@@ -282,15 +283,15 @@ impl Parser<'_> {
 		self.parse_postfix(atom)
 	}
 
-	fn parse_postfix(&mut self, mut expr: Spanned<Expr>) -> Spanned<Expr> {
+	fn parse_postfix(&mut self, mut expr: Expr) -> Expr {
 		let start = self.position();
 		loop {
 			expr = match self.peek() {
 				Some(Token::Dot) => {
 					self.advance();
 					let member = self.expect_ident();
-					Spanned(
-						Expr::MemberAccess {
+					self.mk_expr(
+						ExprKind::MemberAccess {
 							parent: Box::new(expr),
 							member,
 							optional: false,
@@ -304,8 +305,8 @@ impl Parser<'_> {
 						self.advance();
 						let index = self.parse_expr();
 						self.expect(&Token::RBracket);
-						Spanned(
-							Expr::IndexAccess {
+						self.mk_expr(
+							ExprKind::IndexAccess {
 								parent: Box::new(expr),
 								index: Box::new(index),
 								optional: true,
@@ -314,8 +315,8 @@ impl Parser<'_> {
 						)
 					} else {
 						let member = self.expect_ident();
-						Spanned(
-							Expr::MemberAccess {
+						self.mk_expr(
+							ExprKind::MemberAccess {
 								parent: Box::new(expr),
 								member,
 								optional: true,
@@ -328,8 +329,8 @@ impl Parser<'_> {
 					self.advance();
 					let index = self.parse_expr();
 					self.expect(&Token::RBracket);
-					Spanned(
-						Expr::IndexAccess {
+					self.mk_expr(
+						ExprKind::IndexAccess {
 							parent: Box::new(expr),
 							index: Box::new(index),
 							optional: false,
@@ -340,8 +341,8 @@ impl Parser<'_> {
 				Some(Token::LParen) => {
 					self.advance();
 					let args = self.comma_separated(&Token::RParen, |p| p.parse_call_arg());
-					Spanned(
-						Expr::Call {
+					self.mk_expr(
+						ExprKind::Call {
 							func: Box::new(expr),
 							generics: Vec::new(),
 							args,
@@ -351,8 +352,8 @@ impl Parser<'_> {
 				}
 				Some(Token::Question) => {
 					self.advance();
-					Spanned(
-						Expr::PostfixOp {
+					self.mk_expr(
+						ExprKind::PostfixOp {
 							op: nymph_ast::ops::PostfixOperator::ErrorReturn,
 							value: Box::new(expr),
 						},
@@ -399,7 +400,7 @@ impl Parser<'_> {
 		)
 	}
 
-	fn parse_primary(&mut self) -> Spanned<Expr> {
+	fn parse_primary(&mut self) -> Expr {
 		let start = self.position();
 		let Some(token) = self.peek() else {
 			let span = self.current_span();
@@ -407,47 +408,47 @@ impl Parser<'_> {
 				"expected an expression, found end of input",
 				span,
 			));
-			return Spanned(Expr::Tuple(Vec::new()), span);
+			return self.mk_expr(ExprKind::Tuple(Vec::new()), span);
 		};
 
 		match token {
 			Token::Int(v) => {
 				let v = *v;
 				let span = self.advance().unwrap().1;
-				Spanned(Expr::Int(Spanned(v, span)), span)
+				self.mk_expr(ExprKind::Int(Spanned(v, span)), span)
 			}
 			Token::UInt(v) => {
 				let v = *v;
 				let span = self.advance().unwrap().1;
-				Spanned(Expr::UInt(Spanned(v, span)), span)
+				self.mk_expr(ExprKind::UInt(Spanned(v, span)), span)
 			}
 			Token::Float(v) => {
 				let v = *v;
 				let span = self.advance().unwrap().1;
-				Spanned(Expr::Float(Spanned(v, span)), span)
+				self.mk_expr(ExprKind::Float(Spanned(v, span)), span)
 			}
 			Token::Char(c) => {
 				let c = *c;
 				let span = self.advance().unwrap().1;
-				Spanned(Expr::Char(Spanned(c, span)), span)
+				self.mk_expr(ExprKind::Char(Spanned(c, span)), span)
 			}
 			Token::True => {
 				let span = self.advance().unwrap().1;
-				Spanned(Expr::Boolean(Spanned(true, span)), span)
+				self.mk_expr(ExprKind::Boolean(Spanned(true, span)), span)
 			}
 			Token::False => {
 				let span = self.advance().unwrap().1;
-				Spanned(Expr::Boolean(Spanned(false, span)), span)
+				self.mk_expr(ExprKind::Boolean(Spanned(false, span)), span)
 			}
 			Token::Str(_) => self.parse_string(),
 			Token::This => {
 				let span = self.advance().unwrap().1;
-				Spanned(Expr::This, span)
+				self.mk_expr(ExprKind::This, span)
 			}
 			Token::AnonymousParam(index) => {
 				let index = *index;
 				let span = self.advance().unwrap().1;
-				Spanned(Expr::AnonymousParam(index), span)
+				self.mk_expr(ExprKind::AnonymousParam(index), span)
 			}
 			Token::Identifier(_) => {
 				// A single-parameter closure: `x -> body`.
@@ -455,7 +456,7 @@ impl Parser<'_> {
 					self.parse_ident_closure()
 				} else {
 					let name = self.expect_ident();
-					Spanned(Expr::Identifier(name.clone()), name.1)
+					self.mk_expr(ExprKind::Identifier(name.clone()), name.1)
 				}
 			}
 			Token::HashLBracket => self.parse_list_literal(),
@@ -474,7 +475,10 @@ impl Parser<'_> {
 				} else {
 					None
 				};
-				Spanned(Expr::Return { value, label: None }, self.span_from(start))
+				self.mk_expr(
+					ExprKind::Return { value, label: None },
+					self.span_from(start),
+				)
 			}
 			Token::Break => {
 				self.advance();
@@ -483,11 +487,14 @@ impl Parser<'_> {
 				} else {
 					None
 				};
-				Spanned(Expr::Break { value, label: None }, self.span_from(start))
+				self.mk_expr(
+					ExprKind::Break { value, label: None },
+					self.span_from(start),
+				)
 			}
 			Token::Continue => {
 				self.advance();
-				Spanned(Expr::Continue { label: None }, self.span_from(start))
+				self.mk_expr(ExprKind::Continue { label: None }, self.span_from(start))
 			}
 			other => {
 				let span = self.current_span();
@@ -496,12 +503,12 @@ impl Parser<'_> {
 					span,
 				));
 				self.advance();
-				Spanned(Expr::Tuple(Vec::new()), span)
+				self.mk_expr(ExprKind::Tuple(Vec::new()), span)
 			}
 		}
 	}
 
-	fn parse_string(&mut self) -> Spanned<Expr> {
+	fn parse_string(&mut self) -> Expr {
 		let start = self.position();
 		let fragments = match self.peek() {
 			Some(Token::Str(f)) => f.clone(),
@@ -524,21 +531,21 @@ impl Parser<'_> {
 			}
 		}
 		self.advance();
-		Spanned(Expr::String(parts), self.span_from(start))
+		self.mk_expr(ExprKind::String(parts), self.span_from(start))
 	}
 
-	fn parse_list_literal(&mut self) -> Spanned<Expr> {
+	fn parse_list_literal(&mut self) -> Expr {
 		let start = self.position();
 		self.advance(); // `#[`
 		let items = self.comma_separated(&Token::RBracket, |p| p.parse_list_item());
-		Spanned(Expr::List(items), self.span_from(start))
+		self.mk_expr(ExprKind::List(items), self.span_from(start))
 	}
 
-	fn parse_tuple_literal(&mut self) -> Spanned<Expr> {
+	fn parse_tuple_literal(&mut self) -> Expr {
 		let start = self.position();
 		self.advance(); // `#(`
 		let items = self.comma_separated(&Token::RParen, |p| p.parse_list_item());
-		Spanned(Expr::Tuple(items), self.span_from(start))
+		self.mk_expr(ExprKind::Tuple(items), self.span_from(start))
 	}
 
 	fn parse_list_item(&mut self) -> Spanned<ListItem> {
@@ -553,7 +560,7 @@ impl Parser<'_> {
 		}
 	}
 
-	fn parse_map_literal(&mut self) -> Spanned<Expr> {
+	fn parse_map_literal(&mut self) -> Expr {
 		let start = self.position();
 		self.advance(); // `#{`
 		let entries = self.comma_separated(&Token::RBrace, |p| {
@@ -569,11 +576,11 @@ impl Parser<'_> {
 				Spanned(MapEntry::Entry(key, value), p.span_from(entry_start))
 			}
 		});
-		Spanned(Expr::Map(entries), self.span_from(start))
+		self.mk_expr(ExprKind::Map(entries), self.span_from(start))
 	}
 
 	/// `(` may open a grouped expression or a parenthesised closure `(params) -> body`.
-	fn parse_paren_or_closure(&mut self) -> Spanned<Expr> {
+	fn parse_paren_or_closure(&mut self) -> Expr {
 		let save = self.position();
 		if let Some(closure) = self.try_parse_paren_closure() {
 			return closure;
@@ -583,10 +590,10 @@ impl Parser<'_> {
 		self.advance(); // `(`
 		let inner = self.parse_expr();
 		self.expect(&Token::RParen);
-		Spanned(Expr::Grouped(Box::new(inner)), self.span_from(start))
+		self.mk_expr(ExprKind::Grouped(Box::new(inner)), self.span_from(start))
 	}
 
-	fn try_parse_paren_closure(&mut self) -> Option<Spanned<Expr>> {
+	fn try_parse_paren_closure(&mut self) -> Option<Expr> {
 		let start = self.position();
 		let before = self.diagnostics.len();
 		self.advance(); // `(`
@@ -612,8 +619,8 @@ impl Parser<'_> {
 			return None;
 		}
 		let body = self.parse_expr();
-		Some(Spanned(
-			Expr::Closure {
+		Some(self.mk_expr(
+			ExprKind::Closure {
 				params,
 				generics: Vec::new(),
 				return_type,
@@ -644,7 +651,7 @@ impl Parser<'_> {
 		)
 	}
 
-	fn parse_ident_closure(&mut self) -> Spanned<Expr> {
+	fn parse_ident_closure(&mut self) -> Expr {
 		let start = self.position();
 		let name = self.expect_ident();
 		let param = Spanned(
@@ -664,8 +671,8 @@ impl Parser<'_> {
 		);
 		self.expect(&Token::Arrow);
 		let body = self.parse_expr();
-		Spanned(
-			Expr::Closure {
+		self.mk_expr(
+			ExprKind::Closure {
 				params: vec![param],
 				generics: Vec::new(),
 				return_type: None,
@@ -675,7 +682,7 @@ impl Parser<'_> {
 		)
 	}
 
-	fn parse_if(&mut self) -> Spanned<Expr> {
+	fn parse_if(&mut self) -> Expr {
 		let start = self.position();
 		self.advance(); // `if`
 		self.expect(&Token::LParen);
@@ -687,8 +694,8 @@ impl Parser<'_> {
 		} else {
 			None
 		};
-		Spanned(
-			Expr::If {
+		self.mk_expr(
+			ExprKind::If {
 				condition: Box::new(condition),
 				then: Box::new(then),
 				otherwise,
@@ -697,7 +704,7 @@ impl Parser<'_> {
 		)
 	}
 
-	fn parse_match(&mut self) -> Spanned<Expr> {
+	fn parse_match(&mut self) -> Expr {
 		let start = self.position();
 		self.advance(); // `match`
 		self.expect(&Token::LParen);
@@ -719,8 +726,8 @@ impl Parser<'_> {
 				body,
 			}
 		});
-		Spanned(
-			Expr::Match {
+		self.mk_expr(
+			ExprKind::Match {
 				value: Box::new(value),
 				arms,
 			},
@@ -728,15 +735,15 @@ impl Parser<'_> {
 		)
 	}
 
-	fn parse_while(&mut self) -> Spanned<Expr> {
+	fn parse_while(&mut self) -> Expr {
 		let start = self.position();
 		self.advance(); // `while`
 		self.expect(&Token::LParen);
 		let condition = self.parse_expr();
 		self.expect(&Token::RParen);
 		let body = self.parse_expr();
-		Spanned(
-			Expr::While {
+		self.mk_expr(
+			ExprKind::While {
 				condition: Box::new(condition),
 				body: Box::new(body),
 				label: None,
@@ -745,7 +752,7 @@ impl Parser<'_> {
 		)
 	}
 
-	fn parse_for(&mut self) -> Spanned<Expr> {
+	fn parse_for(&mut self) -> Expr {
 		let start = self.position();
 		self.advance(); // `for`
 		self.expect(&Token::LParen);
@@ -754,8 +761,8 @@ impl Parser<'_> {
 		let iterable = self.parse_expr();
 		self.expect(&Token::RParen);
 		let body = self.parse_expr();
-		Spanned(
-			Expr::For {
+		self.mk_expr(
+			ExprKind::For {
 				variable,
 				iterable: Box::new(iterable),
 				body: Box::new(body),
@@ -765,7 +772,7 @@ impl Parser<'_> {
 		)
 	}
 
-	pub(super) fn parse_block(&mut self) -> Spanned<Expr> {
+	pub(super) fn parse_block(&mut self) -> Expr {
 		let start = self.position();
 		self.expect(&Token::LBrace);
 		let mut body = Vec::new();
@@ -773,7 +780,7 @@ impl Parser<'_> {
 			body.push(self.parse_statement());
 		}
 		self.expect(&Token::RBrace);
-		Spanned(Expr::Block { body, label: None }, self.span_from(start))
+		self.mk_expr(ExprKind::Block { body, label: None }, self.span_from(start))
 	}
 
 	fn parse_statement(&mut self) -> Spanned<Statement> {
