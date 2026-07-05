@@ -66,6 +66,19 @@ impl From<Span> for std::ops::Range<usize> {
 	}
 }
 
+/// Stable identity for an AST expression node, assigned once by the parser in
+/// construction order. Distinct from [`Span`]: two nodes can share text but never
+/// an id. Used to key semantic annotations (resolved types, operator impl
+/// selections) that later passes read back.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, salsa::Update)]
+pub struct NodeId(pub u32);
+
+impl NodeId {
+	/// A placeholder id for nodes built outside the parser (tests, synthetic
+	/// nodes). Never assigned by the parser, so it never collides with a real id.
+	pub const DUMMY: NodeId = NodeId(u32::MAX);
+}
+
 /// A value paired with the source [`Span`] it was produced from.
 ///
 /// This is the workhorse wrapper of the AST: nearly every node is stored as a

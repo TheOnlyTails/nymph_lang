@@ -27,7 +27,7 @@ pub enum Declaration {
 	Let {
 		visibility: Option<Visibility>,
 		meta: LetDeclaration,
-		value: Spanned<Expr>,
+		value: Expr,
 	},
 	/// `external(js_name) let max_float: float`
 	ExternalLet(Option<Visibility>, EcoString, LetDeclaration),
@@ -35,7 +35,7 @@ pub enum Declaration {
 	Func {
 		visibility: Option<Visibility>,
 		meta: FuncDeclaration,
-		body: Spanned<Expr>,
+		body: Expr,
 	},
 	/// `external(char_at) func char_at(index: int): char`
 	ExternalFunc(Option<Visibility>, EcoString, FuncDeclaration),
@@ -147,7 +147,7 @@ pub struct StructField {
 	pub visibility: Option<Visibility>,
 	pub name: Ident,
 	pub type_: Spanned<Type>,
-	pub default: Option<Spanned<Expr>>,
+	pub default: Option<Expr>,
 }
 
 /// The forms that can appear inside a `struct`/`enum` body.
@@ -172,13 +172,13 @@ pub enum ImplMember {
 	Let {
 		visibility: Option<Visibility>,
 		meta: LetDeclaration,
-		value: Spanned<Expr>,
+		value: Expr,
 	},
 	ExternalLet(Option<Visibility>, EcoString, LetDeclaration),
 	Func {
 		visibility: Option<Visibility>,
 		meta: FuncDeclaration,
-		body: Spanned<Expr>,
+		body: Expr,
 	},
 	ExternalFunc(Option<Visibility>, EcoString, FuncDeclaration),
 }
@@ -201,11 +201,11 @@ pub enum InterfaceMember {
 pub enum InterfaceElement {
 	Let {
 		meta: LetDeclaration,
-		value: Option<Spanned<Expr>>,
+		value: Option<Expr>,
 	},
 	Func {
 		meta: FuncDeclaration,
-		body: Option<Spanned<Expr>>,
+		body: Option<Expr>,
 	},
 }
 

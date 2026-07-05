@@ -9,7 +9,7 @@ use ordered_float::OrderedFloat;
 use strum::Display;
 
 use crate::{
-	Ident, Spanned,
+	Ident, NodeId, Span, Spanned,
 	decl::LetDeclaration,
 	ops::{
 		AssignOperator, BinaryOperator, PatternOperator, PostfixOperator, PrefixOperator, TypeOperator,
@@ -19,15 +19,29 @@ use crate::{
 
 #[derive(Clone, PartialEq, Debug, salsa::Update)]
 pub enum Statement {
-	Expr(Spanned<Expr>),
-	Let {
-		meta: LetDeclaration,
-		value: Spanned<Expr>,
-	},
+	Expr(Expr),
+	Let { meta: LetDeclaration, value: Expr },
+}
+
+/// A self-spanned expression node: its kind, the source span it covers, and a
+/// stable [`NodeId`]. Expressions carry their own span (unlike other AST nodes,
+/// which are wrapped in [`Spanned`]) so that identity, position, and shape travel
+/// together — the shape the HIR and LSP both want.
+#[derive(Clone, Debug, PartialEq, salsa::Update)]
+pub struct Expr {
+	pub kind: ExprKind,
+	pub span: Span,
+	pub id: NodeId,
+}
+
+impl Expr {
+	pub fn new(kind: ExprKind, span: Span, id: NodeId) -> Self {
+		Self { kind, span, id }
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, salsa::Update)]
-pub enum Expr {
+pub enum ExprKind {
 	/// `1`, `0b010001`, `0xDEADF00D`
 	Int(Spanned<u64>),
 	/// `1u`, `0xDEADF00Du`
@@ -53,19 +67,19 @@ pub enum Expr {
 	/// `1..10`, `1..=10`, `1..`, `..10`, `..=10`
 	Range(RangeKind),
 	Call {
-		func: Box<Spanned<Self>>,
+		func: Box<Expr>,
 		generics: Vec<Spanned<GenericArg>>,
 		args: Vec<Spanned<CallArg>>,
 	},
 	MemberAccess {
-		parent: Box<Spanned<Self>>,
+		parent: Box<Expr>,
 		member: Ident,
 		/// The `?.` optional-chaining form.
 		optional: bool,
 	},
 	IndexAccess {
-		parent: Box<Spanned<Self>>,
-		index: Box<Spanned<Self>>,
+		parent: Box<Expr>,
+		index: Box<Expr>,
 		/// The `?.[i]` optional-chaining form.
 		optional: bool,
 	},
@@ -74,67 +88,67 @@ pub enum Expr {
 		params: Vec<Spanned<ClosureParam>>,
 		generics: Vec<Spanned<GenericParam>>,
 		return_type: Option<Spanned<Type>>,
-		body: Box<Spanned<Self>>,
+		body: Box<Expr>,
 	},
 	PrefixOp {
 		op: PrefixOperator,
-		value: Box<Spanned<Self>>,
+		value: Box<Expr>,
 	},
 	PostfixOp {
 		op: PostfixOperator,
-		value: Box<Spanned<Self>>,
+		value: Box<Expr>,
 	},
 	BinaryOp {
-		lhs: Box<Spanned<Self>>,
+		lhs: Box<Expr>,
 		op: BinaryOperator,
-		rhs: Box<Spanned<Self>>,
+		rhs: Box<Expr>,
 	},
 	/// `value as Type`
 	TypeOp {
-		lhs: Box<Spanned<Self>>,
+		lhs: Box<Expr>,
 		op: TypeOperator,
 		rhs: Spanned<Type>,
 	},
 	/// `value is Pattern`, `value !is Pattern`
 	PatternOp {
-		lhs: Box<Spanned<Self>>,
+		lhs: Box<Expr>,
 		op: PatternOperator,
 		rhs: Spanned<Pattern>,
 	},
 	AssignOp {
-		lhs: Box<Spanned<Self>>,
+		lhs: Box<Expr>,
 		op: AssignOperator,
-		rhs: Box<Spanned<Self>>,
+		rhs: Box<Expr>,
 	},
 	Return {
-		value: Option<Box<Spanned<Self>>>,
+		value: Option<Box<Expr>>,
 		label: Option<Ident>,
 	},
 	Break {
-		value: Option<Box<Spanned<Self>>>,
+		value: Option<Box<Expr>>,
 		label: Option<Ident>,
 	},
 	Continue {
 		label: Option<Ident>,
 	},
 	While {
-		condition: Box<Spanned<Self>>,
-		body: Box<Spanned<Self>>,
+		condition: Box<Expr>,
+		body: Box<Expr>,
 		label: Option<Ident>,
 	},
 	For {
 		variable: Spanned<Pattern>,
-		iterable: Box<Spanned<Self>>,
-		body: Box<Spanned<Self>>,
+		iterable: Box<Expr>,
+		body: Box<Expr>,
 		label: Option<Ident>,
 	},
 	If {
-		condition: Box<Spanned<Self>>,
-		then: Box<Spanned<Self>>,
-		otherwise: Option<Box<Spanned<Self>>>,
+		condition: Box<Expr>,
+		then: Box<Expr>,
+		otherwise: Option<Box<Expr>>,
 	},
 	Match {
-		value: Box<Spanned<Self>>,
+		value: Box<Expr>,
 		arms: Vec<MatchArm>,
 	},
 	/// `this` — the current instance.
@@ -144,14 +158,14 @@ pub enum Expr {
 		label: Option<Ident>,
 	},
 	/// `(expr)` — kept to preserve grouping intent.
-	Grouped(Box<Spanned<Self>>),
+	Grouped(Box<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq, salsa::Update)]
 pub enum StringPart {
 	Text(EcoString),
 	EscapeSequence(StringEscape),
-	InterpolatedExpr(Spanned<Expr>),
+	InterpolatedExpr(Expr),
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Display, salsa::Update)]
@@ -212,14 +226,14 @@ impl StringEscape {
 
 #[derive(Clone, Debug, PartialEq, salsa::Update)]
 pub enum ListItem {
-	Expr(Spanned<Expr>),
-	Spread(Spanned<Expr>),
+	Expr(Expr),
+	Spread(Expr),
 }
 
 #[derive(Clone, Debug, PartialEq, salsa::Update)]
 pub enum MapEntry {
-	Entry(Spanned<Expr>, Spanned<Expr>),
-	Spread(Spanned<Expr>),
+	Entry(Expr, Expr),
+	Spread(Expr),
 }
 
 /// The five forms a range expression can take. All use `..` (exclusive) or `..=`
@@ -227,21 +241,15 @@ pub enum MapEntry {
 #[derive(Clone, Debug, PartialEq, salsa::Update)]
 pub enum RangeKind {
 	/// `1..` — from a lower bound, unbounded above (iterable, infinite).
-	From(Box<Spanned<Expr>>),
+	From(Box<Expr>),
 	/// `..10` — up to an exclusive upper bound (inclusion-test only).
-	To(Box<Spanned<Expr>>),
+	To(Box<Expr>),
 	/// `1..10`
-	Exclusive {
-		min: Box<Spanned<Expr>>,
-		max: Box<Spanned<Expr>>,
-	},
+	Exclusive { min: Box<Expr>, max: Box<Expr> },
 	/// `..=10`
-	ToInclusive(Box<Spanned<Expr>>),
+	ToInclusive(Box<Expr>),
 	/// `1..=10`
-	Inclusive {
-		min: Box<Spanned<Expr>>,
-		max: Box<Spanned<Expr>>,
-	},
+	Inclusive { min: Box<Expr>, max: Box<Expr> },
 }
 
 #[derive(Clone, Debug, PartialEq, salsa::Update)]
@@ -254,7 +262,7 @@ pub struct ClosureParam {
 
 #[derive(Clone, Debug, PartialEq, salsa::Update)]
 pub struct CallArg {
-	pub value: Spanned<Expr>,
+	pub value: Expr,
 	pub name: Option<Ident>,
 	pub spread: bool,
 }
@@ -262,8 +270,8 @@ pub struct CallArg {
 #[derive(Clone, PartialEq, Debug, salsa::Update)]
 pub struct MatchArm {
 	pub pattern: Spanned<Pattern>,
-	pub guard: Option<Spanned<Expr>>,
-	pub body: Spanned<Expr>,
+	pub guard: Option<Expr>,
+	pub body: Expr,
 }
 
 #[derive(Clone, PartialEq, Debug, Eq, Hash, salsa::Update)]
