@@ -1,0 +1,22 @@
+[package]
+name = "nymph-syntax"
+description = "Lexer and parser for the Nymph language, producing the nymph-ast tree."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nymph-ast = { workspace = true }
+nymph-diagnostics = { workspace = true }
+chumsky = { workspace = true }
+ecow = { workspace = true }
+ordered-float = { workspace = true }
+
+[dev-dependencies]
+test-case = { workspace = true }
+
+[lints.clippy]
+all = "warn"

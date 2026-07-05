@@ -5,6 +5,8 @@ pub enum Type {
 	// Type declarations
 	/// `int`
 	Int,
+	/// `uint`
+	UInt,
 	/// `float`
 	Float,
 	/// `char`

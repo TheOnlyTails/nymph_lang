@@ -13,9 +13,11 @@ use ecow::EcoString;
 use itertools::Itertools;
 
 pub mod ast;
+pub mod config;
 pub mod db;
 pub(crate) mod lexer;
 pub(crate) mod parser;
+pub(crate) mod prelude;
 pub mod queries;
 pub(crate) mod resolver;
 pub mod transpiler;
@@ -54,3 +56,5 @@ pub fn parse<'src>(filename: EcoString, source: &'src str) -> ParseResult<'src> 
 
 	(result.module, reports)
 }
+
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");

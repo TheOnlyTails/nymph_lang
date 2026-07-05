@@ -15,14 +15,8 @@ pub fn find_external_module(nym_path: &Path) -> Option<PathBuf> {
 	None
 }
 
-/// Build the JS export name for an external declaration.
-///
-/// Top-level declarations use their own name directly.
-/// Declarations nested inside a struct/enum/interface use
-/// `OuterName$decl_name` to avoid collisions.
-pub fn external_export_name(outer: Option<&str>, decl_name: &str) -> String {
-	match outer {
-		Some(parent) => format!("{parent}${decl_name}"),
-		None => decl_name.to_string(),
-	}
+pub fn bundled_external_module_name(ext_path: &Path) -> Option<String> {
+	let stem = ext_path.file_stem()?.to_string_lossy();
+	let ext = ext_path.extension()?.to_string_lossy();
+	Some(format!("{stem}.external.{ext}"))
 }

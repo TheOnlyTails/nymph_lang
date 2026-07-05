@@ -1,3 +1,5 @@
+use ecow::EcoString;
+
 use crate::{
 	ast::{
 		Ident, Spanned,
@@ -6,6 +8,7 @@ use crate::{
 			InterfaceElement, InterfaceMember, LetDeclaration, Module, StructField, StructInnerMember,
 			TypeAliasDeclaration, Visibility,
 		},
+		expr::Pattern,
 	},
 	lexer::token::Token,
 	parser::error::ParseErrorKind,
@@ -93,14 +96,25 @@ impl<'src> Parser<'src> {
 
 	fn parse_external_declaration(&mut self, visibility: Option<Visibility>) -> Option<Declaration> {
 		self.expect(&Token::External, "external")?;
+
+		let external_name = if matches!(self.peek(), Some(Token::Parens(_))) {
+			Some(self.parse_external_name()?)
+		} else {
+			None
+		};
+
 		match self.peek()? {
 			Token::Let => {
 				let meta = self.parse_let_meta()?;
-				Some(Declaration::ExternalLet(visibility, meta))
+				let external_name = external_name
+					.or_else(|| shorthand_external_name(&meta.name.0))
+					.unwrap_or_default();
+				Some(Declaration::ExternalLet(visibility, external_name, meta))
 			}
 			Token::Func => {
 				let meta = self.parse_func_meta()?;
-				Some(Declaration::ExternalFunc(visibility, meta))
+				let external_name = external_name.unwrap_or_else(|| meta.name.0.clone());
+				Some(Declaration::ExternalFunc(visibility, external_name, meta))
 			}
 			_ => {
 				let found = self.peek().cloned().unwrap();
@@ -116,6 +130,22 @@ impl<'src> Parser<'src> {
 				None
 			}
 		}
+	}
+
+	fn parse_external_name(&mut self) -> Option<EcoString> {
+		let Token::Parens(inner) = self.peek()?.clone() else {
+			self.error(ParseError::custom(
+				"expected external name in parentheses, e.g. `external(my_export)`",
+				self.current_span(),
+			));
+			return None;
+		};
+		let parens_span = self.current_span();
+		self.advance();
+
+		self.with_nested(&inner, parens_span, |p| {
+			p.expect_identifier().map(|ident| ident.0)
+		})
 	}
 
 	fn parse_visibility(&mut self) -> Option<Visibility> {
@@ -335,7 +365,7 @@ impl<'src> Parser<'src> {
 				break;
 			};
 
-			let end_span = type_.span();
+			let end_span = type_.1;
 			params.push(Spanned(
 				FuncParam {
 					spread,
@@ -904,6 +934,11 @@ impl<'src> Parser<'src> {
 
 		let member = if self.check(&Token::External) {
 			self.advance();
+			let external_name = if matches!(self.peek(), Some(Token::Parens(_))) {
+				Some(self.parse_external_name()?)
+			} else {
+				None
+			};
 			if self.check(&Token::Let) {
 				self.advance();
 				let mutable = self.consume(&Token::Mut).is_some();
@@ -913,8 +948,12 @@ impl<'src> Parser<'src> {
 				} else {
 					None
 				};
+				let external_name = external_name
+					.or_else(|| shorthand_external_name(&name.0))
+					.unwrap_or_default();
 				ImplMember::ExternalLet(
 					visibility,
+					external_name,
 					LetDeclaration {
 						mutable,
 						name,
@@ -923,7 +962,8 @@ impl<'src> Parser<'src> {
 				)
 			} else {
 				let meta = self.parse_func_meta()?;
-				ImplMember::ExternalFunc(visibility, meta)
+				let external_name = external_name.unwrap_or_else(|| meta.name.0.clone());
+				ImplMember::ExternalFunc(visibility, external_name, meta)
 			}
 		} else if self.check(&Token::Let) {
 			self.advance();
@@ -960,5 +1000,15 @@ impl<'src> Parser<'src> {
 
 		let end_span = self.previous_span();
 		Some(Spanned(member, span(start_span.start, end_span.end)))
+	}
+}
+
+fn shorthand_external_name(pattern: &Pattern) -> Option<EcoString> {
+	match pattern {
+		Pattern::Binding { name, .. } => Some(name.0.clone()),
+		Pattern::Struct { path, fields } if path.len() == 1 && fields.is_empty() => {
+			Some(path[0].0.clone())
+		}
+		_ => None,
 	}
 }

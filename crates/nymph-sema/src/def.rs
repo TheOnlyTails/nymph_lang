@@ -1,0 +1,260 @@
+//! Item-level name resolution and the lowered signatures of top-level definitions.
+//!
+//! [`build_def_map`] is the *separate* resolution pass the old checker lacked: a
+//! single walk over a module that assigns every top-level definition (and every enum
+//! variant) a [`DefId`] and records where it came from. Type checking consumes the
+//! resulting [`DefMap`] and never re-resolves top-level names inline.
+//!
+//! The lowered [`Signatures`] (field/parameter/return types expressed as semantic
+//! [`Ty`]s) are computed once in `lower.rs` and are the global data that body
+//! inference reads but never mutates — the incrementality boundary from the plan.
+
+use ecow::EcoString;
+use nymph_ast::{
+	Ident, Span, Spanned,
+	decl::{Declaration, Module},
+	expr::Pattern,
+};
+use nymph_diagnostics::{Diagnostic, Label};
+use rustc_hash::FxHashMap;
+
+use crate::{DefId, Ty};
+
+/// The resolved top-level items of a module.
+#[derive(Debug, Default)]
+pub struct DefMap {
+	pub defs: Vec<DefData>,
+	/// Top-level names (types, functions, lets, namespaces) in a single value/type
+	/// namespace. Enum variants are *not* here — they live in [`DefMap::variants`], so
+	/// two enums may share a variant name and a struct may share a name with a variant.
+	pub by_name: FxHashMap<EcoString, DefId>,
+	/// Enum variants by bare name; a name maps to every variant declared with it (across
+	/// enums). A bare use is resolved against this and is ambiguous only if more than one
+	/// candidate exists — a qualified `Enum.Variant` always disambiguates.
+	pub variants: FxHashMap<EcoString, Vec<DefId>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DefData {
+	pub name: EcoString,
+	/// The defining occurrence's span. Reserved for go-to-definition (LSP) and
+	/// richer diagnostics; not read by Milestone-A checking itself.
+	#[allow(dead_code)]
+	pub span: Span,
+	pub kind: DefKind,
+}
+
+/// What a [`DefId`] refers to. `member` is the index into `Module::members` of the
+/// declaration that introduced it, so lowering can read the original AST node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DefKind {
+	Func {
+		member: usize,
+	},
+	Struct {
+		member: usize,
+	},
+	Enum {
+		member: usize,
+	},
+	/// An enum variant, referenced by bare name as a constructor/pattern.
+	Variant {
+		enum_def: DefId,
+		variant: usize,
+	},
+	Let {
+		member: usize,
+	},
+	TypeAlias {
+		member: usize,
+	},
+	Namespace {
+		member: usize,
+	},
+	Interface {
+		member: usize,
+	},
+}
+
+impl DefMap {
+	pub fn get(&self, name: &str) -> Option<DefId> {
+		self.by_name.get(name).copied()
+	}
+
+	pub fn data(&self, def: DefId) -> &DefData {
+		&self.defs[def.0 as usize]
+	}
+
+	fn define(&mut self, name: EcoString, span: Span, kind: DefKind) -> DefId {
+		let id = DefId(self.defs.len() as u32);
+		self.defs.push(DefData {
+			name: name.clone(),
+			span,
+			kind,
+		});
+		self.by_name.insert(name, id);
+		id
+	}
+
+	/// Define an enum variant: it gets a [`DefData`] and joins the bare-name → variants
+	/// multimap, but never the single `by_name` namespace (so variant names don't clash).
+	fn define_variant(&mut self, name: EcoString, span: Span, kind: DefKind) -> DefId {
+		let id = DefId(self.defs.len() as u32);
+		self.defs.push(DefData {
+			name: name.clone(),
+			span,
+			kind,
+		});
+		self.variants.entry(name).or_default().push(id);
+		id
+	}
+
+	/// Resolve a bare variant name: `None` if unknown, `Some(Ok)` if a single variant
+	/// matches, `Some(Err)` if several do (ambiguous — needs a qualified `Enum.Variant`).
+	pub fn resolve_variant(&self, name: &str) -> Option<Result<(DefId, usize), ()>> {
+		let ids = self.variants.get(name)?;
+		match ids.as_slice() {
+			[] => None,
+			[id] => match self.data(*id).kind {
+				DefKind::Variant { enum_def, variant } => Some(Ok((enum_def, variant))),
+				_ => None,
+			},
+			_ => Some(Err(())),
+		}
+	}
+}
+
+/// The bound name of a plain binding pattern (a top-level `let x = …`).
+fn binding_name(pattern: &Spanned<Pattern>) -> Option<&Ident> {
+	match &pattern.0 {
+		Pattern::Binding { name, .. } => Some(name),
+		_ => None,
+	}
+}
+
+/// Walk a module's members and assign a [`DefId`] to every top-level definition and
+/// enum variant. Duplicate names are reported and the later definition wins.
+pub fn build_def_map(module: &Module, diags: &mut Vec<Diagnostic>) -> DefMap {
+	let mut map = DefMap::default();
+	let mut seen: FxHashMap<EcoString, Span> = FxHashMap::default();
+
+	let mut declare =
+		|map: &mut DefMap, diags: &mut Vec<Diagnostic>, name: &Ident, kind: DefKind| -> DefId {
+			if let Some(&prev) = seen.get(&name.0) {
+				diags.push(
+					Diagnostic::error(format!("`{}` is defined more than once", name.0), name.1)
+						.with_label(Label::new(name.1, "redefined here"))
+						.with_label(Label::new(prev, "first defined here")),
+				);
+			}
+			seen.insert(name.0.clone(), name.1);
+			map.define(name.0.clone(), name.1, kind)
+		};
+
+	for (i, decl) in module.members.iter().enumerate() {
+		match decl {
+			Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => {
+				declare(&mut map, diags, &meta.name, DefKind::Func { member: i });
+			}
+			Declaration::Let { meta, .. } | Declaration::ExternalLet(_, _, meta) => {
+				if let Some(name) = binding_name(&meta.name) {
+					declare(&mut map, diags, name, DefKind::Let { member: i });
+				}
+			}
+			Declaration::Struct { name, .. } => {
+				declare(&mut map, diags, name, DefKind::Struct { member: i });
+			}
+			Declaration::Enum { name, variants, .. } => {
+				let enum_def = declare(&mut map, diags, name, DefKind::Enum { member: i });
+				for (v, variant) in variants.iter().enumerate() {
+					// Variants share a separate namespace, so duplicates across enums are
+					// fine and are never reported as redefinitions.
+					map.define_variant(
+						variant.0.name.0.clone(),
+						variant.0.name.1,
+						DefKind::Variant {
+							enum_def,
+							variant: v,
+						},
+					);
+				}
+			}
+			Declaration::TypeAlias { meta, .. } => {
+				declare(
+					&mut map,
+					diags,
+					&meta.name,
+					DefKind::TypeAlias { member: i },
+				);
+			}
+			Declaration::Namespace { name, .. } => {
+				declare(&mut map, diags, name, DefKind::Namespace { member: i });
+			}
+			Declaration::Interface { name, .. } => {
+				declare(&mut map, diags, name, DefKind::Interface { member: i });
+			}
+			// Imports introduce no local name here; impl blocks are anonymous (their
+			// contents are collected separately in `iface.rs`).
+			Declaration::Import { .. } | Declaration::Impl { .. } | Declaration::ImplFor { .. } => {}
+		}
+	}
+
+	map
+}
+
+// ── Lowered signatures ───────────────────────────────────────────────────────
+
+/// A generic parameter list, storing just the parameter names; the `i`-th name
+/// corresponds to `ParamIdx(i)` in the lowered types.
+pub type Generics = Vec<EcoString>;
+
+#[derive(Debug, Clone)]
+pub struct StructSig {
+	pub generics: Generics,
+	pub fields: Vec<(EcoString, Ty)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumSig {
+	pub generics: Generics,
+	pub variants: Vec<VariantSig>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VariantSig {
+	pub name: EcoString,
+	pub fields: Vec<(EcoString, Ty)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FuncParamSig {
+	/// The parameter's binding name, used for named-argument calls (Milestone B).
+	#[allow(dead_code)]
+	pub label: Option<EcoString>,
+	pub ty: Ty,
+	/// A `...rest` spread parameter (Milestone B).
+	#[allow(dead_code)]
+	pub spread: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct FuncSig {
+	pub generics: Generics,
+	pub params: Vec<FuncParamSig>,
+	pub ret: Ty,
+	/// Whether the function has a `this` receiver (an inherent method). Always
+	/// `false` in Milestone A, which has no method definitions.
+	#[allow(dead_code)]
+	pub has_self: bool,
+}
+
+/// The lowered signatures of every top-level definition. Built once, read-only
+/// during body inference. Type aliases are expanded on demand from the AST, so
+/// they need no stored signature here.
+#[derive(Debug, Default)]
+pub struct Signatures {
+	pub structs: FxHashMap<DefId, StructSig>,
+	pub enums: FxHashMap<DefId, EnumSig>,
+	pub funcs: FxHashMap<DefId, FuncSig>,
+	pub lets: FxHashMap<DefId, Ty>,
+}

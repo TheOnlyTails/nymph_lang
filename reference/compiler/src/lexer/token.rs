@@ -19,6 +19,15 @@ pub enum Token {
 	/// `1234`
 	DecimalInt(u64),
 
+	/// `1234u`
+	DecimalUInt(u64),
+	/// `0b1101001u`
+	BinaryUInt(u64),
+	/// `0o7165341u`
+	OctalUInt(u64),
+	/// `0xDEADF00Du`
+	HexUInt(u64),
+
 	/// `1.2`
 	Float(OrderedFloat<f64>),
 	/// `1.2e3`
@@ -40,6 +49,8 @@ pub enum Token {
 	StringInterpolation(Vec<Spanned<Self>>),
 
 	Identifier(EcoString),
+	/// `$`, `$0`, `$1`
+	AnonymousParam(Option<u32>),
 
 	/// `true`
 	True,
@@ -103,6 +114,8 @@ pub enum Token {
 	Match,
 	/// `int`
 	IntType,
+	/// `uint`
+	UIntType,
 	/// `float`
 	FloatType,
 	/// `boolean`
@@ -248,9 +261,14 @@ impl Display for Token {
 				OctalInt(_) => "an octal integer literal",
 				HexInt(_) => "a hexadecimal integer literal",
 				DecimalInt(_) => "an integer literal",
+				BinaryUInt(_) => "a binary unsigned integer literal",
+				OctalUInt(_) => "an octal unsigned integer literal",
+				HexUInt(_) => "a hexadecimal unsigned integer literal",
+				DecimalUInt(_) => "an unsigned integer literal",
 				Float(_) | IntFloat(_) | IntExpFloat(_, _) | FloatExpFloat(_, _) =>
 					"a floating point literal",
 				Identifier(_) => "an identifier",
+				AnonymousParam(_) => "an anonymous function parameter",
 				Char(_) | CharEscape(_) => "a character literal",
 				String(_) => "a string literal",
 				StringText(_) => "a character in a string",
@@ -282,11 +300,12 @@ impl Display for Token {
 				Impl => "impl",
 				Namespace => "namespace",
 				For => "for",
-			While => "while",
+				While => "while",
 				If => "if",
 				Else => "else",
 				Match => "match",
 				IntType => "int",
+				UIntType => "uint",
 				FloatType => "float",
 				BooleanType => "boolean",
 				CharType => "char",

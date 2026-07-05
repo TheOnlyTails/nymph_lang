@@ -46,7 +46,7 @@ impl From<std::ops::Range<usize>> for Span {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::Update)]
-pub struct Spanned<T>(pub(crate) T, pub(crate) Span);
+pub struct Spanned<T>(pub T, pub Span);
 
 impl<T> Spanned<T> {
 	pub(crate) fn new<'src, I: Input<'src, Span = SimpleSpan>, E: ParserExtra<'src, I>>(
@@ -59,26 +59,6 @@ impl<T> Spanned<T> {
 	#[allow(dead_code)]
 	fn map<R, F: Fn(&T) -> R>(&self, f: F) -> Spanned<R> {
 		Spanned(f(&self.0), self.1)
-	}
-
-	/// Get the inner value
-	pub fn inner(&self) -> &T {
-		&self.0
-	}
-
-	/// Get the span (start and end offsets)
-	pub fn span(&self) -> Span {
-		self.1
-	}
-
-	/// Get start offset
-	pub fn start(&self) -> usize {
-		self.1.start
-	}
-
-	/// Get end offset
-	pub fn end(&self) -> usize {
-		self.1.end
 	}
 }
 

@@ -1,7 +1,7 @@
 [package]
 name = "nymph-compiler"
 description = "A simple language that gets out of your way."
-version = "0.1.0"
+version = "1.0.0-alpha.0"
 edition = "2024"
 homepage = "https://nymphlang.dev/"
 repository = "https://github.com/theonlytails/nymph_lang"
@@ -13,27 +13,33 @@ categories = ["compilers", "command-line-utilities", "parser-implementations"]
 [dependencies]
 anyhow = { workspace = true }
 ariadne = "0.6.0"
-chumsky = { version = "0.12.0", features = ["pratt", "memoization", "regex", "serde", "nightly"] }
-clap = { version = "4.5.60", features = ["derive", "cargo"] }
+chumsky = { version = "0.12.0", features = [
+  "pratt",
+  "memoization",
+  "regex",
+  "serde",
+  "nightly",
+] }
+clap = { version = "4.6.0", features = ["derive", "cargo"] }
 itertools = { workspace = true }
-ordered-float = "5.1.0"
-oxc_allocator = "0.116.0"
-oxc_ast = "0.116.0"
-oxc_codegen = "0.116.0"
-oxc_span = "0.116.0"
-oxc_syntax = "0.116.0"
+rayon = { workspace = true }
+ordered-float = "5.3.0"
+oxc = { version = "0.123.0", features = ["codegen"] }
 salsa = "0.26.0"
 strsim = { workspace = true }
-strum = { version = "0.27.2", features = ["derive"] }
+strum = { version = "0.28.0", features = ["derive"] }
 thiserror = "2.0.18"
-tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-reedline = "0.45.0"
+reedline = "0.46.0"
 ecow = "0.2.6"
 regex = "1.12.3"
 indexmap = "2.13.0"
 vec1 = "1.12.1"
+serde = { version = "1.0.228", features = ["derive"] }
+toml = "1.0.7"
+semver = { version = "1.0.27", features = ["serde"] }
+url = { version = "2.5.8", features = ["serde"] }
 
 [dev-dependencies]
 glob = "0.3.3"

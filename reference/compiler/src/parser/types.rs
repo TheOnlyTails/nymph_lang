@@ -43,9 +43,9 @@ impl<'src> Parser<'src> {
 			let s = span(
 				params
 					.first()
-					.map(|(_, t)| t.span().start)
+					.map(|(_, t)| t.1.start)
 					.unwrap_or(arrow_span.start),
-				return_type.span().end,
+				return_type.1.end,
 			);
 			return Some(Spanned(
 				Type::Function {
@@ -120,7 +120,7 @@ impl<'src> Parser<'src> {
 			Token::Plus => {
 				self.advance();
 				let rhs = self.parse_type_pratt(2)?;
-				let s = span(lhs.span().start, rhs.span().end);
+				let s = span(lhs.1.start, rhs.1.end);
 				Some(Spanned(Type::Intersection(lhs.into(), rhs.into()), s))
 			}
 			_ => Some(lhs),
@@ -134,6 +134,10 @@ impl<'src> Parser<'src> {
 			Token::IntType => {
 				self.advance();
 				Type::Int
+			}
+			Token::UIntType => {
+				self.advance();
+				Type::UInt
 			}
 			Token::FloatType => {
 				self.advance();
@@ -268,9 +272,9 @@ impl<'src> Parser<'src> {
 
 			let value = self.parse_type()?;
 			let s = if let Some(ref n) = name {
-				span(n.span().start, value.span().end)
+				span(n.1.start, value.1.end)
 			} else {
-				value.span()
+				value.1
 			};
 			args.push(Spanned(GenericArg { name, value }, s));
 

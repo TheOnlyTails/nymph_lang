@@ -1,74 +1,77 @@
 import @/math
-import @/ops/plus with (Plus)
-import @/ops/minus with (Minus)
-import @/ops/times with (Times)
-import @/ops/divide with (Divide)
-import @/ops/negate with (Negate)
+import @/ops with (Plus, Minus, Times, Divide, Negate, Into, Power)
 
 public struct Complex(real: float, imaginary: float) {
-  func conjugate() -> Complex(real = real, imaginary = -imaginary)
+  func conjugate() = Complex(real = this.real, imaginary = -this.imaginary)
 
-  func abs() -> math.sqrt(real ** 2 + imaginary ** 2)
+  func abs() = (this.real ** 2 + this.imaginary ** 2).sqrt()
 
   impl Plus<Other = Complex, Output = Complex> {
-    func plus(other: Complex) -> Complex(
+    func plus(other: Complex) = Complex(
       real = this.real + other.real,
       imaginary = this.imaginary + other.imaginary,
     )
   }
 
   impl Minus<Other = Complex, Output = Complex> {
-    func minus(other: Complex) -> Complex(
+    func minus(other: Complex) = Complex(
       real = this.real - other.real,
       imaginary = this.imaginary - other.imaginary,
     )
   }
   
   impl Times<Other = Complex, Output = Complex> {
-    func times(other: Complex) -> Complex(
+    func times(other: Complex) = Complex(
       real = this.real * other.real - this.imaginary * other.imaginary,
       imaginary = this.real * other.imaginary + this.imaginary * other.real,
     )
   }
 
   impl Divide<Other = Complex, Output = Complex> {
-    func divide(other: Complex) -> {
-      let multiplied = this * other
+    func divide(other: Complex) = {
       let divisor = other.real ** 2 + other.imaginary ** 2
 
       Complex(
-        real = multiplied.real / divisor,
-        imaginary = multiplied.imaginary / divisor
-      )
-    }
-  }
-  
-  impl Divide<Other = Complex, Output = Complex> {
-    func divide(other: Complex) -> {
-      let multiplied = this * other
-      let divisor = other.real ** 2 + other.imaginary ** 2
-
-      Complex(
-        real = multiplied.real / divisor,
-        imaginary = multiplied.imaginary / divisor
+        real = (this.real * other.real + this.imaginary * other.imaginary) / divisor,
+        imaginary = (this.imaginary * other.real - this.real * other.imaginary) / divisor
       )
     }
   }
   
   impl Negate<Output = Complex> {
-    func negate() -> Complex(
+    func negate() = Complex(
       real = -this.real,
       imaginary = -this.imaginary
     )
   }
 
   impl Into<string> {
-    func into() -> match #(this.real, this.imaginary) {
-      #(0, 0) -> "0",
-      #(real, 0) -> "${real}",
-      #(0, imaginary) -> "${imaginary}i",
-      #(real, imaginary) if imaginary < 0 -> "${real}${imaginary}i",
-      #(real, imaginary) -> "${real}+${imaginary}i"
+    func into() = if (this.real == 0 && this.imaginary == 0) {
+      "0"
+    } else if (this.imaginary == 0) {
+      "${this.real}"
+    } else if (this.real == 0) {
+      "${this.imaginary}i"
+    } else if (this.imaginary.sign() == -1) {
+      "${this.real}${this.imaginary}i"
+    } else {
+      "${this.real}+${this.imaginary}i"
     }
   }
+}
+
+impl Power<Other = int, Output = Complex> for int {
+  external func power(other: int): Complex
+}
+
+impl Power<Other = float, Output = Complex> for int {
+  external func power(other: float): Complex
+}
+
+impl Power<Other = self, Output = Complex> for float {
+  external func power(other: self): Complex
+}
+
+impl Power<Other = int, Output = Complex> for float {
+  external func power(other: int): Complex
 }

@@ -8,25 +8,35 @@ use std::{
 	fmt::Display,
 	fs,
 	hash::Hash,
+	ops::Range,
 	path::{Path, PathBuf},
 	sync::Arc,
 };
 
 use ecow::EcoString;
 use itertools::Itertools;
+use salsa::Accumulator;
 
-use crate::ast::Span;
+use crate::{ast::Span, types::error::TypeErrorKind};
 use crate::{
 	ast::{
-		self, Spanned,
+		self, Ident, Spanned,
 		declaration::{
 			Declaration, FuncDeclaration, ImplMember, ImportRoot, InterfaceElement, InterfaceMember,
 			LetDeclaration, Module, StructInnerMember, TypeAliasDeclaration, Visibility,
 		},
-		expr::{Expr, ListItem, Pattern, Statement},
+		expr::{
+			Expr, ListItem, Pattern, Statement, anonymous_param_syntaxes, anonymous_params,
+			rewrite_anonymous_params,
+		},
 		ops::{BinaryOperator, PrefixOperator, TypeOperator},
 	},
-	db::{Db, DefKey, DiagnosticKind, Diagnostics, NymphDatabase, ProjectConfig, SourceFile},
+	config,
+	db::{
+		Db, DefKey, Diagnostic, DiagnosticKind, Diagnostics, NymphDatabase, ProjectConfig, SourceFile,
+		TypeErrors,
+	},
+	prelude::IMPLICIT_PRELUDE_MODULES,
 	queries,
 	types::error::TypeError,
 };
@@ -36,12 +46,47 @@ fn span_to_range(span: Span) -> std::ops::Range<usize> {
 	span.start..span.end
 }
 
+fn private_context_entry(entry: &ContextEntry) -> ContextEntry {
+	match entry {
+		ContextEntry::Value(value) => ContextEntry::Value(ContextValue {
+			type_: value.type_.clone(),
+			mutable: value.mutable,
+			visibility: Visibility::Private,
+		}),
+		ContextEntry::Impl { parent, members } => ContextEntry::Impl {
+			parent: Box::new(ContextValue {
+				type_: parent.type_.clone(),
+				mutable: parent.mutable,
+				visibility: Visibility::Private,
+			}),
+			members: members.clone(),
+		},
+	}
+}
+
+const BUILTIN_RANGE_CONSTRUCTOR: &str = "__nymph_builtin_range_Range";
+const BUILTIN_RANGE_FROM_CONSTRUCTOR: &str = "__nymph_builtin_range_RangeFrom";
+const BUILTIN_RANGE_TO_CONSTRUCTOR: &str = "__nymph_builtin_range_RangeTo";
+const BUILTIN_RANGE_INCLUSIVE_CONSTRUCTOR: &str = "__nymph_builtin_range_RangeInclusive";
+const BUILTIN_RANGE_TO_INCLUSIVE_CONSTRUCTOR: &str = "__nymph_builtin_range_RangeToInclusive";
+const BUILTIN_RANGE_ITEMS: [(&str, &str); 5] = [
+	("Range", BUILTIN_RANGE_CONSTRUCTOR),
+	("RangeFrom", BUILTIN_RANGE_FROM_CONSTRUCTOR),
+	("RangeTo", BUILTIN_RANGE_TO_CONSTRUCTOR),
+	("RangeInclusive", BUILTIN_RANGE_INCLUSIVE_CONSTRUCTOR),
+	("RangeToInclusive", BUILTIN_RANGE_TO_INCLUSIVE_CONSTRUCTOR),
+];
+
 /// Unique identifier for type variables, to distinguish variables with the same name in different scopes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TypeVarId(u64);
 
 /// Result type for processing struct/enum members
-type ProcessMembersResult = (BTreeMap<EcoString, StructMember>, BTreeMap<EcoString, Type>);
+type ProcessMembersResult = (
+	BTreeMap<EcoString, StructMember>,
+	BTreeMap<EcoString, Type>,
+	Vec<ImplRecord>,
+);
 
 /// Resolved generic parameter info (for type constructors)
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
@@ -55,6 +100,7 @@ pub struct GenericParamInfo {
 #[derive(Debug, Eq, PartialEq, Hash, Clone)]
 pub enum Type {
 	Int,
+	UInt,
 	Float,
 	Char,
 	String,
@@ -131,6 +177,7 @@ pub enum Type {
 pub struct StructMember {
 	pub type_: Box<Type>,
 	pub kind: StructMemberKind,
+	pub required: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -140,28 +187,52 @@ pub enum StructMemberKind {
 	Immutable,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImplRecord {
+	pub generics: Arc<Vec<GenericParamInfo>>,
+	pub receiver: Type,
+	pub interface: Type,
+	pub span: Range<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceExtensionRecord {
+	pub generics: Arc<Vec<GenericParamInfo>>,
+	pub interface: Type,
+	pub members: BTreeMap<EcoString, StructMember>,
+	pub span: Range<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TypeExtensionRecord {
+	pub generics: Arc<Vec<GenericParamInfo>>,
+	pub receiver: Type,
+	pub members: BTreeMap<EcoString, StructMember>,
+	pub span: Range<usize>,
+}
+
 impl Type {
-	fn assignable_to(&self, target: &Self, _ctx: &Context) -> bool {
+	fn assignable_to(&self, target: &Self, ctx: &Context) -> bool {
 		match (self, target) {
 			(a, b) if a == b => true,
 			(Type::Never, _) => true,
 			(_, Type::Never) => false,
 			(_, Type::Variable { .. }) | (Type::Variable { .. }, _) => true,
 			(Type::Intersection { first, second }, target) => {
-				first.assignable_to(target, _ctx) && second.assignable_to(target, _ctx)
+				self.intersection_to_type(first, second, target, ctx)
 			}
 			(source, Type::Intersection { first, second }) => {
-				source.assignable_to(first, _ctx) || source.assignable_to(second, _ctx)
+				source.assignable_to(first, ctx) && source.assignable_to(second, ctx)
 			}
 			(Type::List { item: item_a }, Type::List { item: item_b }) => {
-				item_a.assignable_to(item_b, _ctx)
+				item_a.assignable_to(item_b, ctx)
 			}
 			(Type::Tuple { items: items_a }, Type::Tuple { items: items_b }) => {
 				items_a.len() == items_b.len()
 					&& items_a
 						.iter()
 						.zip(items_b)
-						.all(|(a, b)| a.assignable_to(b, _ctx))
+						.all(|(a, b)| a.assignable_to(b, ctx))
 			}
 			(
 				Type::Map {
@@ -172,7 +243,7 @@ impl Type {
 					key: key_b,
 					value: value_b,
 				},
-			) => key_a.assignable_to(key_b, _ctx) && value_a.assignable_to(value_b, _ctx),
+			) => key_a.assignable_to(key_b, ctx) && value_a.assignable_to(value_b, ctx),
 			(
 				Type::Function {
 					params: params_a,
@@ -187,12 +258,12 @@ impl Type {
 					..
 				},
 			) => {
-				return_a.assignable_to(return_b, _ctx)
+				return_a.assignable_to(return_b, ctx)
 					&& params_a.len() == params_b.len()
 					&& params_a
 						.iter()
 						.zip(params_b)
-						.all(|((_, a), (_, b))| b.assignable_to(a, _ctx))
+						.all(|((_, a), (_, b))| b.assignable_to(a, ctx))
 			}
 			_ => false,
 		}
@@ -204,24 +275,110 @@ impl Type {
 		} else {
 			match (self, other) {
 				(Type::Never, t) | (t, Type::Never) => t.clone(),
-				_ => Type::Intersection {
-					first: Box::new(self.clone()),
-					second: Box::new(other.clone()),
-				},
+				(a, b) if a.assignable_to(b, &Context::default()) => b.clone(),
+				(a, b) if b.assignable_to(a, &Context::default()) => a.clone(),
+				_ => Type::Never,
 			}
 		}
 	}
 
-	#[allow(dead_code)]
-	fn meet(&self, other: &Self) -> Option<Self> {
-		if self == other {
-			return Some(self.clone());
+	fn intersection_to_type(
+		&self,
+		first: &Self,
+		second: &Self,
+		target: &Self,
+		ctx: &Context,
+	) -> bool {
+		match self.normalize_intersection(first, second, ctx) {
+			Type::Never => true,
+			normalized => normalized.assignable_to(target, ctx),
 		}
-		match (self, other) {
-			(Type::Never, t) | (t, Type::Never) => Some(t.clone()),
-			(Type::Intersection { first, second }, t) => first.meet(t).or_else(|| second.meet(t)),
-			(t, Type::Intersection { first, second }) => t.meet(first).or_else(|| t.meet(second)),
-			_ => None,
+	}
+
+	fn normalize_intersection(&self, first: &Self, second: &Self, ctx: &Context) -> Self {
+		if first == second {
+			return first.clone();
+		}
+
+		if matches!(first, Type::Never) || matches!(second, Type::Never) {
+			return Type::Never;
+		}
+
+		if first.assignable_to(second, ctx) {
+			return first.clone();
+		}
+
+		if second.assignable_to(first, ctx) {
+			return second.clone();
+		}
+
+		match (first, second) {
+			(Type::Int, Type::UInt)
+			| (Type::Int, Type::Float)
+			| (Type::Int, Type::Char)
+			| (Type::Int, Type::String)
+			| (Type::Int, Type::Boolean)
+			| (Type::UInt, Type::Float)
+			| (Type::UInt, Type::Char)
+			| (Type::UInt, Type::String)
+			| (Type::UInt, Type::Boolean)
+			| (Type::Float, Type::Char)
+			| (Type::Float, Type::String)
+			| (Type::Float, Type::Boolean)
+			| (Type::Char, Type::String)
+			| (Type::Char, Type::Boolean)
+			| (Type::String, Type::Boolean) => Type::Never,
+			(Type::List { item: first_item }, Type::List { item: second_item }) => {
+				let item = self.normalize_intersection(first_item, second_item, ctx);
+				if matches!(item, Type::Never) {
+					Type::Never
+				} else {
+					Type::List {
+						item: Box::new(item),
+					}
+				}
+			}
+			(
+				Type::Tuple { items: first_items },
+				Type::Tuple {
+					items: second_items,
+				},
+			) if first_items.len() == second_items.len() => {
+				let mut items = Vec::with_capacity(first_items.len());
+				for (first_item, second_item) in first_items.iter().zip(second_items) {
+					let item = self.normalize_intersection(first_item, second_item, ctx);
+					if matches!(item, Type::Never) {
+						return Type::Never;
+					}
+					items.push(item);
+				}
+				Type::Tuple { items }
+			}
+			(
+				Type::Map {
+					key: first_key,
+					value: first_value,
+				},
+				Type::Map {
+					key: second_key,
+					value: second_value,
+				},
+			) => {
+				let key = self.normalize_intersection(first_key, second_key, ctx);
+				let value = self.normalize_intersection(first_value, second_value, ctx);
+				if matches!(key, Type::Never) || matches!(value, Type::Never) {
+					Type::Never
+				} else {
+					Type::Map {
+						key: Box::new(key),
+						value: Box::new(value),
+					}
+				}
+			}
+			_ => Type::Intersection {
+				first: Box::new(first.clone()),
+				second: Box::new(second.clone()),
+			},
 		}
 	}
 }
@@ -230,6 +387,7 @@ impl Display for Type {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Type::Int => write!(f, "int"),
+			Type::UInt => write!(f, "uint"),
 			Type::Float => write!(f, "float"),
 			Type::Char => write!(f, "char"),
 			Type::String => write!(f, "string"),
@@ -373,8 +531,12 @@ impl Display for Type {
 pub struct Context {
 	pub local_ctx: HashMap<EcoString, ContextEntry>,
 	pub file_ctx: HashMap<EcoString, HashSet<(EcoString, ContextEntry)>>,
-	/// Maps type names to their implementations (list of interface types)
-	pub impls: HashMap<EcoString, Vec<Type>>,
+	/// Top-level `impl Interface for Type` registrations.
+	pub impl_records: Vec<ImplRecord>,
+	/// Top-level `impl Interface<...> { ... }` extension members.
+	pub interface_extensions: Vec<InterfaceExtensionRecord>,
+	/// Top-level `impl Type { ... }` extension members.
+	pub type_extensions: Vec<TypeExtensionRecord>,
 	/// The current `self` type (for interface definitions and impl blocks)
 	pub self_type: Option<Type>,
 	/// The next type variable ID to use (threaded through salsa queries to avoid ID collisions)
@@ -395,6 +557,19 @@ pub struct ContextValue {
 	pub type_: Type,
 	pub mutable: bool,
 	pub visibility: Visibility,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AvailableInterface {
+	interface: Type,
+	span: Option<Range<usize>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemberCandidate {
+	interface: Type,
+	member: StructMember,
+	span: Option<Range<usize>>,
 }
 
 impl Context {
@@ -436,20 +611,22 @@ impl Context {
 		})
 	}
 
-	/// Register that a type implements an interface
-	pub fn with_impl(&self, type_name: EcoString, interface_type: Type) -> Self {
+	pub fn with_impl_record(&self, record: ImplRecord) -> Self {
 		let mut new_ctx = self.clone();
-		new_ctx
-			.impls
-			.entry(type_name)
-			.or_default()
-			.push(interface_type);
+		new_ctx.impl_records.push(record);
 		new_ctx
 	}
 
-	/// Get all interfaces implemented by a type
-	pub fn get_impls(&self, type_name: &EcoString) -> Option<&Vec<Type>> {
-		self.impls.get(type_name)
+	pub fn with_interface_extension(&self, record: InterfaceExtensionRecord) -> Self {
+		let mut new_ctx = self.clone();
+		new_ctx.interface_extensions.push(record);
+		new_ctx
+	}
+
+	pub fn with_type_extension(&self, record: TypeExtensionRecord) -> Self {
+		let mut new_ctx = self.clone();
+		new_ctx.type_extensions.push(record);
+		new_ctx
 	}
 
 	/// Set the `self` type for interface definitions and impl blocks
@@ -464,13 +641,13 @@ impl Context {
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 enum ModuleStatus {
-	/// Module is currently being processed (for cycle detection)
-	InProgress,
+	/// Module is currently being processed; keep a predeclared context available for cycles.
+	InProgress(Context),
 	/// Module has been fully processed
 	Complete(Context),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct TypeChecker {
 	/// Counter for generating unique type variable IDs
 	pub next_type_var_id: u64,
@@ -480,27 +657,45 @@ pub struct TypeChecker {
 	project_root: Option<PathBuf>,
 	/// The current file being processed (for resolving relative imports)
 	current_file: Option<PathBuf>,
+	implicit_prelude: bool,
+}
+
+impl Default for TypeChecker {
+	fn default() -> Self {
+		Self::new(None)
+	}
 }
 
 impl TypeChecker {
 	/// Create a new TypeChecker with the given file path (non-salsa mode)
 	pub fn new(file_path: Option<PathBuf>) -> Self {
 		let project_root = file_path.as_ref().and_then(|p| Self::find_project_root(p));
+		let implicit_prelude = project_root
+			.as_ref()
+			.and_then(|root| config::implicit_prelude_enabled(root).ok())
+			.unwrap_or(true);
 		Self {
 			next_type_var_id: 0,
 			module_cache: HashMap::new(),
 			project_root,
 			current_file: file_path,
+			implicit_prelude,
 		}
 	}
 
 	/// Create a new TypeChecker for use with salsa queries
-	pub fn with_salsa(file_path: PathBuf, project_root: PathBuf, next_type_var_id: u64) -> Self {
+	pub fn with_salsa(
+		file_path: PathBuf,
+		project_root: PathBuf,
+		next_type_var_id: u64,
+		implicit_prelude: bool,
+	) -> Self {
 		Self {
 			next_type_var_id,
 			module_cache: HashMap::new(),
 			project_root: Some(project_root),
 			current_file: Some(file_path),
+			implicit_prelude,
 		}
 	}
 
@@ -515,6 +710,19 @@ impl TypeChecker {
 			id: self.fresh_type_var_id(),
 			name: name.into(),
 			constraint: constraint.map(Box::new),
+		}
+	}
+
+	fn resolve_func_param_type(
+		&mut self,
+		param: &Spanned<ast::declaration::FuncParam>,
+		ctx: &Context,
+	) -> Result<Type, TypeError> {
+		let ty = self.resolve_ast_type(&param.0.type_.0, param.0.type_.1, ctx)?;
+		if param.0.spread {
+			Ok(Type::List { item: Box::new(ty) })
+		} else {
+			Ok(ty)
 		}
 	}
 
@@ -539,6 +747,286 @@ impl TypeChecker {
 		}
 	}
 
+	fn project_module_path(&self, path: &[&str]) -> Option<PathBuf> {
+		let mut module_path = self.project_root.as_ref()?.join("src");
+		for segment in path {
+			module_path = module_path.join(segment);
+		}
+
+		let file_path = module_path.with_extension("nym");
+		let dir_path = module_path.join("mod.nym");
+
+		match (file_path.exists(), dir_path.exists()) {
+			(true, false) => Some(file_path),
+			(false, true) | (true, true) => Some(dir_path),
+			(false, false) => None,
+		}
+	}
+
+	fn builtin_range_module_path(&self) -> Option<PathBuf> {
+		self.project_module_path(&["range"])
+	}
+
+	fn is_current_module(&self, module_path: &Path) -> bool {
+		let Some(current_file) = &self.current_file else {
+			return false;
+		};
+
+		let current_file = current_file
+			.canonicalize()
+			.unwrap_or_else(|_| current_file.clone());
+		let module_path = module_path
+			.canonicalize()
+			.unwrap_or_else(|_| module_path.to_path_buf());
+
+		current_file == module_path
+	}
+
+	fn is_current_implicit_prelude_module(&self) -> bool {
+		IMPLICIT_PRELUDE_MODULES.iter().any(|module| {
+			self
+				.project_module_path(module.path)
+				.as_ref()
+				.is_some_and(|path| self.is_current_module(path))
+		}) || self
+			.builtin_range_module_path()
+			.as_ref()
+			.is_some_and(|path| self.is_current_module(path))
+	}
+
+	fn should_inject_implicit_prelude(&self, module: &Module) -> bool {
+		if !self.implicit_prelude {
+			return false;
+		}
+
+		if self.is_current_implicit_prelude_module() {
+			return false;
+		}
+
+		!module.members.iter().any(|decl| {
+			let Declaration::Import {
+				root: ImportRoot::Project,
+				path,
+				..
+			} = decl
+			else {
+				return false;
+			};
+
+			IMPLICIT_PRELUDE_MODULES.iter().any(|module| {
+				path.len() == module.path.len()
+					&& path
+						.iter()
+						.zip(module.path.iter())
+						.all(|(segment, expected)| segment.0.as_ref() == *expected)
+			})
+		})
+	}
+
+	fn implicit_prelude_entry(
+		base_ctx: &Context,
+		module_ctx: &Context,
+		name: &str,
+	) -> Option<(EcoString, ContextEntry)> {
+		let name = EcoString::from(name);
+		if base_ctx.local_ctx.contains_key(&name) {
+			return None;
+		}
+
+		let entry = module_ctx.local_ctx.get(&name)?;
+		let visibility = match entry {
+			ContextEntry::Value(value) => value.visibility,
+			ContextEntry::Impl { parent, .. } => parent.visibility,
+		};
+
+		(visibility == Visibility::Public).then(|| (name, private_context_entry(entry)))
+	}
+
+	fn implicit_prelude_entries(
+		base_ctx: &Context,
+		module_ctx: &Context,
+		name: &str,
+	) -> Vec<(EcoString, ContextEntry)> {
+		let Some((name, entry)) = Self::implicit_prelude_entry(base_ctx, module_ctx, name) else {
+			return Vec::new();
+		};
+
+		let mut entries = vec![(name, entry.clone())];
+		for (variant_name, variant_entry) in Self::enum_variant_context_entries(
+			match &entry {
+				ContextEntry::Value(value) => &value.type_,
+				ContextEntry::Impl { parent, .. } => &parent.type_,
+			},
+			Visibility::Private,
+		) {
+			if !base_ctx.local_ctx.contains_key(&variant_name) {
+				entries.push((variant_name, variant_entry));
+			}
+		}
+
+		entries
+	}
+
+	fn merge_module_effects(&self, base_ctx: &Context, module_ctx: &Context) -> Context {
+		let mut next_ctx = base_ctx.clone();
+
+		for record in &module_ctx.impl_records {
+			if !next_ctx.impl_records.contains(record) {
+				next_ctx.impl_records.push(record.clone());
+			}
+		}
+
+		for record in &module_ctx.interface_extensions {
+			if !next_ctx.interface_extensions.contains(record) {
+				next_ctx.interface_extensions.push(record.clone());
+			}
+		}
+
+		for record in &module_ctx.type_extensions {
+			if !next_ctx.type_extensions.contains(record) {
+				next_ctx.type_extensions.push(record.clone());
+			}
+		}
+
+		next_ctx
+	}
+
+	fn inject_implicit_prelude_entries(&mut self, ctx: &Context) -> Context {
+		if self.is_current_implicit_prelude_module() {
+			return ctx.clone();
+		}
+
+		let mut next_ctx = ctx.clone();
+
+		for module in IMPLICIT_PRELUDE_MODULES {
+			let Some(module_path) = self.project_module_path(module.path) else {
+				continue;
+			};
+
+			if self.is_current_module(&module_path) {
+				continue;
+			}
+
+			let Ok(module_ctx) = self.load_module(&module_path, Span::new(0, 0), &next_ctx) else {
+				continue;
+			};
+			next_ctx = self.merge_module_effects(&next_ctx, &module_ctx);
+
+			for name in module.names {
+				for (name, entry) in Self::implicit_prelude_entries(&next_ctx, &module_ctx, name) {
+					next_ctx.insert_entry(name, entry);
+				}
+			}
+		}
+
+		next_ctx
+	}
+
+	fn inject_implicit_prelude_entries_salsa(
+		&mut self,
+		db: &dyn Db,
+		config: ProjectConfig,
+		ctx: &Context,
+	) -> Context {
+		if self.is_current_implicit_prelude_module() {
+			return ctx.clone();
+		}
+
+		let mut next_ctx = ctx.clone();
+
+		for module in IMPLICIT_PRELUDE_MODULES {
+			let Some(module_path) = self.project_module_path(module.path) else {
+				continue;
+			};
+
+			if self.is_current_module(&module_path) {
+				continue;
+			}
+
+			let imported_file = queries::load_source_file(db, module_path.to_string_lossy().to_string());
+			let module_ctx = self.check_file_salsa(db, imported_file, config);
+			next_ctx = self.merge_module_effects(&next_ctx, &module_ctx);
+
+			for name in module.names {
+				for (name, entry) in Self::implicit_prelude_entries(&next_ctx, &module_ctx, name) {
+					next_ctx.insert_entry(name, entry);
+				}
+			}
+		}
+
+		next_ctx
+	}
+
+	fn with_builtin_range_entries(&self, ctx: &Context, module_ctx: &Context) -> Context {
+		let mut next_ctx = ctx.clone();
+
+		for (public_name, hidden_name) in BUILTIN_RANGE_ITEMS {
+			let public_name = EcoString::from(public_name);
+			let hidden_name = EcoString::from(hidden_name);
+
+			if next_ctx.local_ctx.contains_key(&hidden_name) {
+				continue;
+			}
+
+			if let Some(entry) = module_ctx.local_ctx.get(&public_name) {
+				let hidden_entry = match entry {
+					ContextEntry::Value(value) => ContextEntry::Value(ContextValue {
+						type_: value.type_.clone(),
+						mutable: value.mutable,
+						visibility: Visibility::Private,
+					}),
+					ContextEntry::Impl { parent, members } => ContextEntry::Impl {
+						parent: Box::new(ContextValue {
+							type_: parent.type_.clone(),
+							mutable: parent.mutable,
+							visibility: Visibility::Private,
+						}),
+						members: members.clone(),
+					},
+				};
+				next_ctx.insert_entry(hidden_name, hidden_entry);
+			}
+		}
+
+		next_ctx
+	}
+
+	fn inject_builtin_range_entries(&mut self, ctx: &Context) -> Context {
+		let Some(range_path) = self.builtin_range_module_path() else {
+			return ctx.clone();
+		};
+
+		if self.is_current_module(&range_path) {
+			return ctx.clone();
+		}
+
+		let base_ctx = Context::default();
+		let Ok(module_ctx) = self.load_module(&range_path, Span::new(0, 0), &base_ctx) else {
+			return ctx.clone();
+		};
+
+		self.with_builtin_range_entries(ctx, &module_ctx)
+	}
+
+	fn inject_builtin_range_entries_salsa(
+		&mut self,
+		db: &dyn Db,
+		config: ProjectConfig,
+		ctx: &Context,
+	) -> Context {
+		let Some(range_path) = self.builtin_range_module_path() else {
+			return ctx.clone();
+		};
+
+		if self.is_current_module(&range_path) {
+			return ctx.clone();
+		}
+
+		let range_file = queries::load_source_file(db, range_path.to_string_lossy().to_string());
+		let module_ctx = self.check_file_salsa(db, range_file, config);
+		self.with_builtin_range_entries(ctx, &module_ctx)
+	}
+
 	/// Resolve an import path to an absolute file path
 	pub fn resolve_import_path(
 		&self,
@@ -548,8 +1036,10 @@ impl TypeChecker {
 	) -> Result<PathBuf, TypeError> {
 		let base_dir = match root {
 			ImportRoot::Package(Spanned(pkg_name, pkg_span)) => {
-				return Err(TypeError::ExternalDependencyNotSupported {
-					package: pkg_name.clone(),
+				return Err(TypeError {
+					kind: TypeErrorKind::ExternalDependencyNotSupported {
+						package: pkg_name.clone(),
+					},
 					span: span_to_range(*pkg_span),
 				});
 			}
@@ -560,8 +1050,10 @@ impl TypeChecker {
 						.as_ref()
 						.map(|p| p.display().to_string())
 						.unwrap_or_else(|| "<unknown>".to_string());
-					TypeError::ProjectRootNotFound {
-						searched_from: searched_from.into(),
+					TypeError {
+						kind: TypeErrorKind::ProjectRootNotFound {
+							searched_from: searched_from.into(),
+						},
 						span: span_to_range(span),
 					}
 				})?;
@@ -573,8 +1065,10 @@ impl TypeChecker {
 				.as_ref()
 				.and_then(|p| p.parent())
 				.map(|p| p.to_path_buf())
-				.ok_or_else(|| TypeError::ProjectRootNotFound {
-					searched_from: "<unknown>".into(),
+				.ok_or_else(|| TypeError {
+					kind: TypeErrorKind::ProjectRootNotFound {
+						searched_from: "<unknown>".into(),
+					},
 					span: span_to_range(span),
 				})?,
 			ImportRoot::Parent => self
@@ -583,8 +1077,10 @@ impl TypeChecker {
 				.and_then(|p| p.parent())
 				.and_then(|p| p.parent())
 				.map(|p| p.to_path_buf())
-				.ok_or_else(|| TypeError::ProjectRootNotFound {
-					searched_from: "<unknown>".into(),
+				.ok_or_else(|| TypeError {
+					kind: TypeErrorKind::ProjectRootNotFound {
+						searched_from: "<unknown>".into(),
+					},
 					span: span_to_range(span),
 				})?,
 		};
@@ -603,16 +1099,20 @@ impl TypeChecker {
 		let dir_exists = dir_path.exists();
 
 		match (file_exists, dir_exists) {
-			(true, true) => Err(TypeError::AmbiguousModule {
-				path: path.iter().map(|s| s.0.as_str()).join("/").into(),
-				file_path: file_path.display().to_string().into(),
-				dir_path: dir_path.display().to_string().into(),
+			(true, true) => Err(TypeError {
+				kind: TypeErrorKind::AmbiguousModule {
+					path: path.iter().map(|s| s.0.as_str()).join("/").into(),
+					file_path: file_path.display().to_string().into(),
+					dir_path: dir_path.display().to_string().into(),
+				},
 				span: span_to_range(span),
 			}),
 			(true, false) => Ok(file_path),
 			(false, true) => Ok(dir_path),
-			(false, false) => Err(TypeError::ModuleNotFound {
-				path: path.iter().map(|s| s.0.as_str()).join("/").into(),
+			(false, false) => Err(TypeError {
+				kind: TypeErrorKind::ModuleNotFound {
+					path: path.iter().map(|s| s.0.as_str()).join("/").into(),
+				},
 				span: span_to_range(span),
 			}),
 		}
@@ -625,33 +1125,26 @@ impl TypeChecker {
 		span: Span,
 		base_ctx: &Context,
 	) -> Result<Context, TypeError> {
-		let abs_path = module_path
-			.canonicalize()
-			.map_err(|_| TypeError::ModuleNotFound {
+		let abs_path = module_path.canonicalize().map_err(|_| TypeError {
+			kind: TypeErrorKind::ModuleNotFound {
 				path: module_path.display().to_string().into(),
-				span: span_to_range(span),
-			})?;
+			},
+			span: span_to_range(span),
+		})?;
 
 		// Check cache
 		if let Some(status) = self.module_cache.get(&abs_path) {
 			return match status {
-				ModuleStatus::InProgress => {
-					// Circular import - return empty context for now
-					// The module will be available after the cycle completes
-					Ok(Context::default())
-				}
+				ModuleStatus::InProgress(ctx) => Ok(ctx.clone()),
 				ModuleStatus::Complete(ctx) => Ok(ctx.clone()),
 			};
 		}
 
-		// Mark as in-progress for cycle detection
-		self
-			.module_cache
-			.insert(abs_path.clone(), ModuleStatus::InProgress);
-
 		// Read and parse the module
-		let source = fs::read_to_string(&abs_path).map_err(|_| TypeError::ModuleNotFound {
-			path: abs_path.display().to_string().into(),
+		let source = fs::read_to_string(&abs_path).map_err(|_| TypeError {
+			kind: TypeErrorKind::ModuleNotFound {
+				path: abs_path.display().to_string().into(),
+			},
 			span: span_to_range(span),
 		})?;
 
@@ -666,31 +1159,43 @@ impl TypeChecker {
 
 		if let Some(first) = parse_errors.first() {
 			let diag = &first.0;
-			return Err(TypeError::ModuleParseError {
-				module_path: filename,
-				message: diag.message.clone().into(),
+			return Err(TypeError {
+				kind: TypeErrorKind::ModuleParseError {
+					module_path: filename,
+					message: diag.message.clone().into(),
+				},
 				span: diag.span.start..diag.span.end,
 			});
 		}
 
-		let module = result.module.ok_or_else(|| TypeError::ModuleParseError {
-			module_path: filename,
-			message: "Failed to parse module".into(),
+		let module = result.module.ok_or_else(|| TypeError {
+			kind: TypeErrorKind::ModuleParseError {
+				module_path: filename,
+				message: "Failed to parse module".into(),
+			},
 			span: 0..0,
 		})?;
+
+		let predeclared_ctx = self.predeclare_module(&module.0);
+		self
+			.module_cache
+			.insert(abs_path.clone(), ModuleStatus::InProgress(predeclared_ctx));
 
 		// Save current file and set new one
 		let prev_file = self.current_file.take();
 		self.current_file = Some(abs_path.clone());
 
 		// Type-check the module
-		let module_ctx =
-			self
-				.check_module(module.inner(), base_ctx)
-				.map_err(|e| TypeError::ModuleTypeError {
+		let module_ctx = self.check_module(&module.0, base_ctx).map_err(|e| {
+			let span = e.span.clone();
+			TypeError {
+				kind: TypeErrorKind::ModuleTypeError {
 					module_path: abs_path.display().to_string().into(),
 					error: Box::new(e),
-				})?;
+				},
+				span,
+			}
+		})?;
 
 		// Restore previous file
 		self.current_file = prev_file;
@@ -727,12 +1232,124 @@ impl TypeChecker {
 
 	/// Infer the type of an expression in a given context
 	pub fn infer(&mut self, expr: &Spanned<Expr>, ctx: &Context) -> Result<Type, TypeError> {
-		self.infer_expr(&expr.0, expr.1, ctx)
+		self.infer_with_expected(expr, None, ctx)
+	}
+
+	fn infer_with_expected(
+		&mut self,
+		expr: &Spanned<Expr>,
+		expected: Option<&Type>,
+		ctx: &Context,
+	) -> Result<Type, TypeError> {
+		let placeholders = anonymous_params(expr);
+		if placeholders.is_empty() {
+			return self.infer_expr(&expr.0, expr.1, ctx);
+		}
+
+		if matches!(expected, Some(Type::Function { .. })) {
+			return self.infer_anonymous_function(expr, expected, ctx, &placeholders);
+		} else {
+			self.infer_expr(&expr.0, expr.1, ctx).map_err(|error| {
+				if matches!(
+					error.kind,
+					TypeErrorKind::CannotInferAnonymousFunction { .. }
+				) {
+					TypeError {
+						kind: TypeErrorKind::CannotInferAnonymousFunction {
+							placeholders: anonymous_param_syntaxes(expr),
+						},
+						span: error.span,
+					}
+				} else {
+					error
+				}
+			})
+		}
+	}
+
+	fn infer_anonymous_function(
+		&mut self,
+		expr: &Spanned<Expr>,
+		expected: Option<&Type>,
+		ctx: &Context,
+		placeholders: &BTreeMap<usize, Span>,
+	) -> Result<Type, TypeError> {
+		let Some(Type::Function {
+			generics,
+			params,
+			has_spread,
+			return_type,
+			constructor: _,
+		}) = expected
+		else {
+			return Err(TypeError {
+				kind: TypeErrorKind::CannotInferAnonymousFunction {
+					placeholders: anonymous_param_syntaxes(expr),
+				},
+				span: span_to_range(expr.1),
+			});
+		};
+
+		let required_params = placeholders.keys().next_back().map_or(0, |index| index + 1);
+		if params.len() < required_params {
+			let found = Type::Function {
+				generics: Arc::new(Vec::new()),
+				params: (0..required_params)
+					.map(|index| (None, self.fresh_var(format!("$anon{index}"), None)))
+					.collect(),
+				has_spread: false,
+				return_type: Box::new(self.fresh_var("_anon_return", None)),
+				constructor: false,
+			};
+			return Err(TypeError {
+				kind: TypeErrorKind::TypeMismatch {
+					expected: Box::new(expected.cloned().unwrap()),
+					found: Box::new(found),
+				},
+				span: span_to_range(expr.1),
+			});
+		}
+
+		let mut rewritten_names = BTreeMap::new();
+		let mut closure_ctx = ctx.clone();
+		for (index, param) in params.iter().enumerate().take(required_params) {
+			let name: EcoString = format!("__anon_param_{index}").into();
+			rewritten_names.insert(index, name.clone());
+			closure_ctx.insert_entry(
+				name,
+				ContextEntry::Value(ContextValue {
+					type_: param.1.clone(),
+					mutable: false,
+					visibility: Visibility::Private,
+				}),
+			);
+		}
+
+		let rewritten = rewrite_anonymous_params(expr, &rewritten_names);
+		let body_type = self.infer_expr(&rewritten.0, rewritten.1, &closure_ctx)?;
+		if !self.type_satisfies(&body_type, return_type, &closure_ctx) {
+			return Err(TypeError {
+				kind: TypeErrorKind::TypeMismatch {
+					expected: return_type.clone(),
+					found: Box::new(body_type.clone()),
+				},
+				span: span_to_range(expr.1),
+			});
+		}
+
+		Ok(Type::Function {
+			generics: generics.clone(),
+			params: params.clone(),
+			has_spread: *has_spread,
+			return_type: Box::new(body_type),
+			constructor: false,
+		})
 	}
 
 	fn infer_expr(&mut self, expr: &Expr, span: Span, ctx: &Context) -> Result<Type, TypeError> {
 		match expr {
 			Expr::Int(_) => Ok(Type::Int),
+			Expr::UInt(_) => Ok(Type::UInt),
 			Expr::Float(_) => Ok(Type::Float),
 			Expr::Char(_) => Ok(Type::Char),
 			Expr::String(_) => Ok(Type::String),
@@ -746,9 +1363,11 @@ impl TypeChecker {
 						ContextEntry::Value(val) => val.type_.clone(),
 						ContextEntry::Impl { parent, .. } => parent.type_.clone(),
 					})
-					.ok_or_else(|| TypeError::UnknownIdentifier {
-						name: name.clone(),
-						suggestion: find_similar_name(name, ctx.local_ctx.keys()),
+					.ok_or_else(|| TypeError {
+						kind: TypeErrorKind::UnknownIdentifier {
+							name: name.clone(),
+							suggestion: find_similar_name(name, ctx.local_ctx.keys()),
+						},
 						span: span_to_range(*ident_span),
 					})
 			}
@@ -776,7 +1395,10 @@ impl TypeChecker {
 					.iter()
 					.map(|item| match &item.0 {
 						ListItem::Expr(val) => self.infer(val, ctx),
-						ListItem::Spread(_) => Err(TypeError::SpreadNonFinalParam(span_to_range(item.1))),
+						ListItem::Spread(_) => Err(TypeError {
+							kind: TypeErrorKind::SpreadNonFinalParam,
+							span: span_to_range(item.1),
+						}),
 					})
 					.collect();
 				Ok(Type::Tuple { items: types? })
@@ -805,9 +1427,7 @@ impl TypeChecker {
 					})
 				}
 			}
-			Expr::Range(_) => Ok(Type::List {
-				item: Box::new(Type::Int),
-			}),
+			Expr::Range(range) => self.infer_range_expr(range, span, ctx),
 			Expr::Call {
 				func,
 				generics,
@@ -831,9 +1451,11 @@ impl TypeChecker {
 									{
 										let suggestion =
 											find_similar_name(name, params.iter().filter_map(|(n, _)| n.as_ref()));
-										return Err(TypeError::UnknownNamedArgument {
-											name: name.clone(),
-											suggestion,
+										return Err(TypeError {
+											kind: TypeErrorKind::UnknownNamedArgument {
+												name: name.clone(),
+												suggestion,
+											},
 											span: span_to_range(name_ident.1),
 										});
 									}
@@ -841,12 +1463,15 @@ impl TypeChecker {
 							}
 							let min_args = std::cmp::min(args.len(), params.len());
 							for i in 0..min_args {
-								let arg_type = self.infer(&args[i].0.value, ctx)?;
+								let arg_type =
+									self.infer_with_expected(&args[i].0.value, Some(&params[i].1), ctx)?;
 								let (_, param_type) = &params[i];
 								if !arg_type.assignable_to(param_type, ctx) {
-									return Err(TypeError::TypeMismatch {
-										expected: Box::new(param_type.clone()),
-										found: Box::new(arg_type),
+									return Err(TypeError {
+										kind: TypeErrorKind::TypeMismatch {
+											expected: Box::new(param_type.clone()),
+											found: Box::new(arg_type),
+										},
 										span: span_to_range(args[i].0.value.1),
 									});
 								}
@@ -865,7 +1490,10 @@ impl TypeChecker {
 							Ok(instantiated_func)
 						}
 					}
-					other => Err(TypeError::NotCallable(other.into(), span_to_range(span))),
+					other => Err(TypeError {
+						kind: TypeErrorKind::NotCallable(other.into()),
+						span: span_to_range(span),
+					}),
 				}
 			}
 			Expr::MemberAccess {
@@ -874,7 +1502,7 @@ impl TypeChecker {
 				optional,
 			} => {
 				let parent_type = self.infer(parent, ctx)?;
-				let resolved = self.access_member(&parent_type, member)?;
+				let resolved = self.access_member(&parent_type, member, ctx)?;
 				if *optional {
 					Ok(resolved.join(&Type::Void))
 				} else {
@@ -891,7 +1519,10 @@ impl TypeChecker {
 					Type::List { item } => Ok(*item),
 					Type::Map { value, .. } => Ok(*value),
 					Type::Tuple { .. } => Ok(self.fresh_var("_index_result", None)),
-					_ => Err(TypeError::NotIndexable(span_to_range(span))),
+					_ => Err(TypeError {
+						kind: TypeErrorKind::NotIndexable,
+						span: span_to_range(span),
+					}),
 				};
 				if *optional {
 					result.map(|t| t.join(&Type::Void))
@@ -933,7 +1564,10 @@ impl TypeChecker {
 				}
 
 				let return_t = match return_type {
-					Some(t) => self.resolve_ast_type(&t.0, t.1, &closure_ctx)?,
+					Some(t) => {
+						let expected = self.resolve_ast_type(&t.0, t.1, &closure_ctx)?;
+						self.check_expr(body, &expected, &closure_ctx)?
+					}
 					None => self.infer(body, &closure_ctx)?,
 				};
 
@@ -955,8 +1589,19 @@ impl TypeChecker {
 			}
 			Expr::BinaryOp { lhs, op, rhs } => {
 				let lhs_type = self.infer(lhs, ctx)?;
-				let rhs_type = self.infer(rhs, ctx)?;
-				Self::infer_binary_op(lhs_type, *op, rhs_type, span)
+				let rhs_type = if *op == BinaryOperator::Pipe {
+					let expected_rhs = Type::Function {
+						generics: Arc::new(Vec::new()),
+						params: vec![(None, lhs_type.clone())],
+						has_spread: false,
+						return_type: Box::new(self.fresh_var("_pipe_return", None)),
+						constructor: false,
+					};
+					self.infer_with_expected(rhs, Some(&expected_rhs), ctx)?
+				} else {
+					self.infer(rhs, ctx)?
+				};
+				self.infer_binary_op(lhs_type, *op, rhs_type, span)
 			}
 			Expr::TypeOp { lhs, op, rhs } => {
 				let _lhs_type = self.infer(lhs, ctx)?;
@@ -973,8 +1618,9 @@ impl TypeChecker {
 				Ok(Type::Boolean) // Pattern matches return boolean
 			}
 			Expr::AssignOp { lhs, op: _, rhs } => {
-				let _rhs_type = self.infer(rhs, ctx)?;
-				self.infer(lhs, ctx)
+				let lhs_type = self.infer(lhs, ctx)?;
+				self.infer_with_expected(rhs, Some(&lhs_type), ctx)?;
+				Ok(lhs_type)
 			}
 			Expr::Return { value, label: _ } => {
 				if let Some(v) = value {
@@ -1076,7 +1722,16 @@ impl TypeChecker {
 					ContextEntry::Value(val) => val.type_.clone(),
 					ContextEntry::Impl { parent, .. } => parent.type_.clone(),
 				})
-				.ok_or(TypeError::ThisOutsideStruct(span_to_range(span))),
+				.ok_or(TypeError {
+					kind: TypeErrorKind::ThisOutsideStruct,
+					span: span_to_range(span),
+				}),
+			Expr::AnonymousParam(index) => Err(TypeError {
+				kind: TypeErrorKind::CannotInferAnonymousFunction {
+					placeholders: vec![*index],
+				},
+				span: span_to_range(span),
+			}),
 			Expr::Placeholder => Ok(self.fresh_var("_placeholder", None)),
 			Expr::Block { body, label: _ } => {
 				let mut block_ctx = ctx.clone();
@@ -1095,10 +1750,12 @@ impl TypeChecker {
 							},
 							value,
 						} => {
-							let inferred = self.infer(value, &block_ctx)?;
 							let final_type = match type_ {
-								Some(t) => self.resolve_ast_type(&t.0, t.1, ctx)?,
-								None => inferred,
+								Some(t) => {
+									let expected = self.resolve_ast_type(&t.0, t.1, ctx)?;
+									self.check_expr(value, &expected, &block_ctx)?
+								}
+								None => self.infer(value, &block_ctx)?,
 							};
 
 							let binding_name = match &name.0 {
@@ -1131,6 +1788,267 @@ impl TypeChecker {
 		}
 	}
 
+	fn infer_range_expr(
+		&mut self,
+		range: &ast::expr::RangeKind,
+		span: Span,
+		ctx: &Context,
+	) -> Result<Type, TypeError> {
+		match range {
+			ast::expr::RangeKind::From(start) => {
+				let item_type = self.infer(start, ctx)?;
+				self.instantiate_range_type(
+					ctx,
+					BUILTIN_RANGE_FROM_CONSTRUCTOR,
+					"RangeFrom",
+					item_type,
+					span,
+				)
+			}
+			ast::expr::RangeKind::To(end) => {
+				let item_type = self.infer(end, ctx)?;
+				self.instantiate_range_type(
+					ctx,
+					BUILTIN_RANGE_TO_CONSTRUCTOR,
+					"RangeTo",
+					item_type,
+					span,
+				)
+			}
+			ast::expr::RangeKind::Exclusive { min, max } => {
+				let item_type = self.infer_range_bound_pair(min, max, span, ctx)?;
+				self.instantiate_range_type(ctx, BUILTIN_RANGE_CONSTRUCTOR, "Range", item_type, span)
+			}
+			ast::expr::RangeKind::ToInclusive(end) => {
+				let item_type = self.infer(end, ctx)?;
+				self.instantiate_range_type(
+					ctx,
+					BUILTIN_RANGE_TO_INCLUSIVE_CONSTRUCTOR,
+					"RangeToInclusive",
+					item_type,
+					span,
+				)
+			}
+			ast::expr::RangeKind::Inclusive { min, max } => {
+				let item_type = self.infer_range_bound_pair(min, max, span, ctx)?;
+				self.instantiate_range_type(
+					ctx,
+					BUILTIN_RANGE_INCLUSIVE_CONSTRUCTOR,
+					"RangeInclusive",
+					item_type,
+					span,
+				)
+			}
+		}
+	}
+
+	fn infer_range_bound_pair(
+		&mut self,
+		min: &Spanned<Expr>,
+		max: &Spanned<Expr>,
+		span: Span,
+		ctx: &Context,
+	) -> Result<Type, TypeError> {
+		let min_type = self.infer(min, ctx)?;
+		let max_type = self.infer(max, ctx)?;
+
+		if min_type.assignable_to(&max_type, ctx) {
+			return Ok(max_type);
+		}
+
+		if max_type.assignable_to(&min_type, ctx) {
+			return Ok(min_type);
+		}
+
+		Err(TypeError {
+			kind: TypeErrorKind::TypeMismatch {
+				expected: Box::new(min_type),
+				found: Box::new(max_type),
+			},
+			span: span_to_range(span),
+		})
+	}
+
+	fn instantiate_range_type(
+		&self,
+		ctx: &Context,
+		hidden_name: &str,
+		fallback_name: &str,
+		item_type: Type,
+		span: Span,
+	) -> Result<Type, TypeError> {
+		let hidden_name = EcoString::from(hidden_name);
+
+		if let Some(raw_type) = ctx.lookup_type(&hidden_name) {
+			let base_type = match &raw_type {
+				Type::Function { return_type, .. }
+					if matches!(return_type.as_ref(), Type::Struct { .. }) =>
+				{
+					*return_type.clone()
+				}
+				_ => raw_type,
+			};
+
+			if let Type::Struct { generics, .. } = &base_type
+				&& let Some(param) = generics.first()
+			{
+				let mut subst = HashMap::new();
+				subst.insert(param.id, item_type.clone());
+				return self.substitute_with_args(&base_type, &subst, vec![item_type], span);
+			}
+
+			return Ok(base_type);
+		}
+
+		Ok(self.synthesize_range_type(fallback_name, item_type))
+	}
+
+	fn synthesize_range_type(&self, name: &str, item_type: Type) -> Type {
+		let mut fields = BTreeMap::new();
+		let mut members = BTreeMap::new();
+		let bound_type = self.synthesize_bound_type(item_type.clone());
+
+		match name {
+			"Range" | "RangeInclusive" => {
+				fields.insert(EcoString::from("start"), item_type.clone());
+				fields.insert(EcoString::from("end"), item_type.clone());
+			}
+			"RangeFrom" => {
+				fields.insert(EcoString::from("start"), item_type.clone());
+			}
+			"RangeTo" | "RangeToInclusive" => {
+				fields.insert(EcoString::from("end"), item_type.clone());
+			}
+			_ => {}
+		}
+
+		members.insert(
+			EcoString::from("contains"),
+			StructMember {
+				type_: Box::new(Type::Function {
+					generics: Arc::new(Vec::new()),
+					params: vec![(Some(EcoString::from("item")), item_type.clone())],
+					has_spread: false,
+					return_type: Box::new(Type::Boolean),
+					constructor: false,
+				}),
+				kind: StructMemberKind::Immutable,
+				required: false,
+			},
+		);
+		members.insert(
+			EcoString::from("start_bound"),
+			StructMember {
+				type_: Box::new(Type::Function {
+					generics: Arc::new(Vec::new()),
+					params: Vec::new(),
+					has_spread: false,
+					return_type: Box::new(bound_type.clone()),
+					constructor: false,
+				}),
+				kind: StructMemberKind::Immutable,
+				required: false,
+			},
+		);
+		members.insert(
+			EcoString::from("end_bound"),
+			StructMember {
+				type_: Box::new(Type::Function {
+					generics: Arc::new(Vec::new()),
+					params: Vec::new(),
+					has_spread: false,
+					return_type: Box::new(bound_type),
+					constructor: false,
+				}),
+				kind: StructMemberKind::Immutable,
+				required: false,
+			},
+		);
+		members.insert(
+			EcoString::from("into"),
+			StructMember {
+				type_: Box::new(Type::Function {
+					generics: Arc::new(Vec::new()),
+					params: Vec::new(),
+					has_spread: false,
+					return_type: Box::new(Type::String),
+					constructor: false,
+				}),
+				kind: StructMemberKind::Immutable,
+				required: false,
+			},
+		);
+
+		if matches!(name, "Range" | "RangeInclusive") {
+			members.insert(
+				EcoString::from("is_empty"),
+				StructMember {
+					type_: Box::new(Type::Function {
+						generics: Arc::new(Vec::new()),
+						params: Vec::new(),
+						has_spread: false,
+						return_type: Box::new(Type::Boolean),
+						constructor: false,
+					}),
+					kind: StructMemberKind::Immutable,
+					required: false,
+				},
+			);
+		}
+
+		Type::Struct {
+			name: EcoString::from(name),
+			def_key: None,
+			generics: Arc::new(Vec::new()),
+			type_args: vec![item_type],
+			fields: Arc::new(fields),
+			members: Arc::new(members),
+			impls: Arc::new(BTreeMap::new()),
+		}
+	}
+
+	fn synthesize_bound_type(&self, item_type: Type) -> Type {
+		Type::Enum {
+			name: EcoString::from("Bound"),
+			def_key: None,
+			generics: Arc::new(Vec::new()),
+			type_args: vec![item_type.clone()],
+			variants: Arc::new(BTreeMap::from([
+				(
+					EcoString::from("Included"),
+					BTreeMap::from([(EcoString::from("value"), item_type.clone())]),
+				),
+				(
+					EcoString::from("Excluded"),
+					BTreeMap::from([(EcoString::from("value"), item_type)]),
+				),
+				(EcoString::from("Unbounded"), BTreeMap::new()),
+			])),
+			members: Arc::new(BTreeMap::new()),
+			impls: Arc::new(BTreeMap::new()),
+		}
+	}
+
+	fn range_item_type(&self, ty: &Type) -> Option<Type> {
+		let Type::Struct {
+			name,
+			type_args,
+			fields,
+			..
+		} = ty
+		else {
+			return None;
+		};
+
+		match name.as_str() {
+			"Range" | "RangeFrom" | "RangeTo" | "RangeInclusive" | "RangeToInclusive" => type_args
+				.first()
+				.cloned()
+				.or_else(|| fields.values().next().cloned()),
+			_ => None,
+		}
+	}
+
 	/// Check that an expression has a specific type (bidirectional checking)
 	fn check_expr(
 		&mut self,
@@ -1138,53 +2056,43 @@ impl TypeChecker {
 		expected: &Type,
 		ctx: &Context,
 	) -> Result<Type, TypeError> {
-		let inferred = self.infer(expr, ctx)?;
-		if inferred.assignable_to(expected, ctx) {
+		let inferred = self.infer_with_expected(expr, Some(expected), ctx)?;
+		if self.type_satisfies(&inferred, expected, ctx) {
 			Ok(expected.clone())
 		} else {
-			Err(TypeError::TypeMismatch {
-				expected: expected.clone().into(),
-				found: inferred.into(),
+			Err(TypeError {
+				kind: TypeErrorKind::TypeMismatch {
+					expected: expected.clone().into(),
+					found: inferred.into(),
+				},
 				span: span_to_range(expr.1),
 			})
 		}
 	}
 
-	fn access_member(&self, ty: &Type, member: &Spanned<EcoString>) -> Result<Type, TypeError> {
+	fn access_member(
+		&self,
+		ty: &Type,
+		member: &Spanned<EcoString>,
+		ctx: &Context,
+	) -> Result<Type, TypeError> {
 		match ty {
 			Type::Struct {
-				fields,
-				members,
-				impls,
-				..
+				fields, members, ..
 			} => {
 				if let Some(field_type) = fields.get(&member.0) {
 					Ok(field_type.clone())
 				} else if let Some(member_def) = members.get(&member.0) {
 					Ok(member_def.type_.as_ref().clone())
-				} else if let Some(impl_member) = self.lookup_impl_member(impls, &member.0) {
-					Ok(impl_member)
 				} else {
-					let candidates = fields.keys().chain(members.keys());
-					Err(TypeError::UnknownMember {
-						type_: ty.clone().into(),
-						member: member.0.clone(),
-						suggestion: find_similar_name(&member.0, candidates),
-						span: span_to_range(member.1),
-					})
+					self.resolve_interface_member(ty, member, ctx)
 				}
 			}
 			Type::Enum {
-				members,
-				impls,
-				variants,
-				generics,
-				..
+				members, variants, ..
 			} => {
 				if let Some(member_def) = members.get(&member.0) {
 					Ok(member_def.type_.as_ref().clone())
-				} else if let Some(impl_member) = self.lookup_impl_member(impls, &member.0) {
-					Ok(impl_member)
 				} else if let Some(variant_fields) = variants.get(&member.0) {
 					let mut param_types = Vec::new();
 					for (field_name, field_type) in variant_fields {
@@ -1198,39 +2106,21 @@ impl TypeChecker {
 						constructor: false,
 					})
 				} else {
-					let candidates = members.keys().chain(variants.keys());
-					Err(TypeError::UnknownMember {
-						type_: ty.clone().into(),
-						member: member.0.clone(),
-						suggestion: find_similar_name(&member.0, candidates),
-						span: span_to_range(member.1),
-					})
+					self.resolve_interface_member(ty, member, ctx)
 				}
 			}
-			Type::EnumVariant { fields, impls, .. } => {
+			Type::EnumVariant { fields, .. } => {
 				if let Some(field_type) = fields.get(&member.0) {
 					Ok(field_type.clone())
-				} else if let Some(impl_member) = self.lookup_impl_member(impls, &member.0) {
-					Ok(impl_member)
 				} else {
-					Err(TypeError::UnknownMember {
-						type_: ty.clone().into(),
-						member: member.0.clone(),
-						suggestion: find_similar_name(&member.0, fields.keys()),
-						span: span_to_range(member.1),
-					})
+					self.resolve_interface_member(ty, member, ctx)
 				}
 			}
 			Type::Interface { members, .. } => {
 				if let Some(member_def) = members.get(&member.0) {
 					Ok(member_def.type_.as_ref().clone())
 				} else {
-					Err(TypeError::UnknownMember {
-						type_: ty.clone().into(),
-						member: member.0.clone(),
-						suggestion: find_similar_name(&member.0, members.keys()),
-						span: span_to_range(member.1),
-					})
+					self.resolve_interface_member(ty, member, ctx)
 				}
 			}
 			Type::Module { members, .. } => members
@@ -1239,33 +2129,682 @@ impl TypeChecker {
 					ContextEntry::Value(val) => val.type_.clone(),
 					ContextEntry::Impl { parent, .. } => parent.type_.clone(),
 				})
-				.ok_or_else(|| TypeError::UnknownMember {
-					type_: ty.clone().into(),
-					member: member.0.clone(),
-					suggestion: find_similar_name(&member.0, members.keys()),
+				.ok_or_else(|| TypeError {
+					kind: TypeErrorKind::UnknownMember {
+						type_: ty.clone().into(),
+						member: member.0.clone(),
+						suggestion: find_similar_name(&member.0, members.keys()),
+					},
 					span: span_to_range(member.1),
 				}),
 			Type::Variable {
 				constraint: Some(constraint),
 				..
-			} => self.access_member(constraint, member),
-			_ => Err(TypeError::NotAccessible(span_to_range(member.1))),
+			} => self.access_member(constraint, member, ctx),
+			_ => self.resolve_interface_member(ty, member, ctx),
 		}
 	}
 
-	fn lookup_impl_member(
+	fn resolve_interface_member(
 		&self,
-		impls: &BTreeMap<EcoString, Type>,
+		receiver: &Type,
+		member: &Spanned<EcoString>,
+		ctx: &Context,
+	) -> Result<Type, TypeError> {
+		let candidates = self.collect_interface_member_candidates(receiver, &member.0, ctx);
+		if candidates.len() == 1 {
+			return Ok(candidates[0].member.type_.as_ref().clone());
+		}
+
+		if candidates.len() > 1 {
+			return Err(TypeError {
+				kind: TypeErrorKind::AmbiguousMemberAccess {
+					type_: receiver.clone().into(),
+					member: member.0.clone(),
+					candidates: candidates
+						.into_iter()
+						.map(|candidate| error::AmbiguousMemberCandidate {
+							interface: candidate.interface.into(),
+							span: candidate.span,
+						})
+						.collect(),
+				},
+				span: span_to_range(member.1),
+			});
+		}
+
+		let candidate_names = self.collect_available_member_names(receiver, ctx);
+		Err(TypeError {
+			kind: TypeErrorKind::UnknownMember {
+				type_: receiver.clone().into(),
+				member: member.0.clone(),
+				suggestion: find_similar_name(&member.0, candidate_names.iter()),
+			},
+			span: span_to_range(member.1),
+		})
+	}
+
+	fn collect_interface_member_candidates(
+		&self,
+		receiver: &Type,
 		member_name: &EcoString,
-	) -> Option<Type> {
-		for interface_ty in impls.values() {
-			if let Type::Interface { members, .. } = interface_ty
-				&& let Some(member_def) = members.get(member_name)
-			{
-				return Some(member_def.type_.as_ref().clone());
+		ctx: &Context,
+	) -> Vec<MemberCandidate> {
+		let mut candidates = Vec::new();
+		for extension in &ctx.type_extensions {
+			let mut subst = HashMap::new();
+			if self.match_type_pattern(&extension.receiver, receiver, &mut subst)
+				&& self.impl_constraints_satisfied(&extension.generics, &subst, ctx, &extension.span)
+				&& let Some(member) = extension.members.get(member_name)
+				&& let Ok(member) = self.substitute_member(
+					member,
+					&subst,
+					Span::new(extension.span.start, extension.span.end),
+				) {
+				let interface = self
+					.substitute(
+						&extension.receiver,
+						&subst,
+						Span::new(extension.span.start, extension.span.end),
+					)
+					.unwrap_or_else(|_| receiver.clone());
+				self.push_member_candidate(
+					&mut candidates,
+					interface,
+					member,
+					Some(extension.span.clone()),
+				);
 			}
 		}
-		None
+
+		for available in self.collect_available_interfaces(receiver, ctx) {
+			if let Type::Interface { members, .. } = &available.interface
+				&& let Some(member) = members.get(member_name)
+			{
+				self.push_member_candidate(
+					&mut candidates,
+					available.interface.clone(),
+					member.clone(),
+					available.span.clone(),
+				);
+			}
+
+			for extension in &ctx.interface_extensions {
+				let mut subst = HashMap::new();
+				if self.match_type_pattern(&extension.interface, &available.interface, &mut subst)
+					&& self.impl_constraints_satisfied(&extension.generics, &subst, ctx, &extension.span)
+					&& let Some(member) = extension.members.get(member_name)
+					&& let Ok(member) = self.substitute_member(
+						member,
+						&subst,
+						Span::new(extension.span.start, extension.span.end),
+					) {
+					self.push_member_candidate(
+						&mut candidates,
+						available.interface.clone(),
+						member,
+						Some(extension.span.clone()),
+					);
+				}
+			}
+		}
+
+		candidates
+	}
+
+	fn push_member_candidate(
+		&self,
+		candidates: &mut Vec<MemberCandidate>,
+		interface: Type,
+		member: StructMember,
+		span: Option<Range<usize>>,
+	) {
+		if let Some(existing) = candidates.iter_mut().find(|candidate| {
+			self.same_type_identity(&candidate.interface, &interface) && candidate.member == member
+		}) {
+			if existing.span.is_none() {
+				existing.span = span;
+			}
+			return;
+		}
+
+		candidates.push(MemberCandidate {
+			interface,
+			member,
+			span,
+		});
+	}
+
+	fn collect_available_member_names(&self, receiver: &Type, ctx: &Context) -> Vec<EcoString> {
+		let mut names = Vec::new();
+		match receiver {
+			Type::Struct {
+				fields, members, ..
+			} => {
+				names.extend(fields.keys().cloned());
+				names.extend(members.keys().cloned());
+			}
+			Type::EnumVariant { fields, .. } => {
+				names.extend(fields.keys().cloned());
+			}
+			Type::Enum {
+				members, variants, ..
+			} => {
+				names.extend(members.keys().cloned());
+				names.extend(variants.keys().cloned());
+			}
+			Type::Interface { members, .. } => {
+				names.extend(members.keys().cloned());
+			}
+			Type::Module { members, .. } => {
+				names.extend(members.keys().cloned());
+			}
+			_ => {}
+		}
+
+		for extension in &ctx.type_extensions {
+			let mut subst = HashMap::new();
+			if self.match_type_pattern(&extension.receiver, receiver, &mut subst)
+				&& self.impl_constraints_satisfied(&extension.generics, &subst, ctx, &extension.span)
+			{
+				names.extend(extension.members.keys().cloned());
+			}
+		}
+
+		for available in self.collect_available_interfaces(receiver, ctx) {
+			if let Type::Interface { members, .. } = &available.interface {
+				names.extend(members.keys().cloned());
+			}
+			for extension in &ctx.interface_extensions {
+				let mut subst = HashMap::new();
+				if self.match_type_pattern(&extension.interface, &available.interface, &mut subst)
+					&& self.impl_constraints_satisfied(&extension.generics, &subst, ctx, &extension.span)
+				{
+					names.extend(extension.members.keys().cloned());
+				}
+			}
+		}
+
+		names.sort();
+		names.dedup();
+		names
+	}
+
+	fn type_satisfies(&self, source: &Type, target: &Type, ctx: &Context) -> bool {
+		if source.assignable_to(target, ctx) {
+			return true;
+		}
+
+		match target {
+			Type::Interface { .. } => self.satisfies_interface(source, target, ctx),
+			Type::Intersection { first, second } => {
+				self.type_satisfies(source, first, ctx) && self.type_satisfies(source, second, ctx)
+			}
+			_ => false,
+		}
+	}
+
+	fn satisfies_interface(&self, source: &Type, target: &Type, ctx: &Context) -> bool {
+		self
+			.collect_available_interfaces(source, ctx)
+			.into_iter()
+			.any(|available| self.interface_matches_goal(&available.interface, target, ctx))
+	}
+
+	fn interface_matches_goal(&self, candidate: &Type, target: &Type, ctx: &Context) -> bool {
+		let (
+			Type::Interface {
+				type_args: candidate_args,
+				..
+			},
+			Type::Interface {
+				type_args: target_args,
+				..
+			},
+		) = (candidate, target)
+		else {
+			return false;
+		};
+
+		self.same_type_identity(candidate, target)
+			&& candidate_args.len() == target_args.len()
+			&& candidate_args
+				.iter()
+				.zip(target_args)
+				.all(|(candidate_arg, target_arg)| self.type_satisfies(candidate_arg, target_arg, ctx))
+	}
+
+	fn collect_available_interfaces(
+		&self,
+		receiver: &Type,
+		ctx: &Context,
+	) -> Vec<AvailableInterface> {
+		let mut available = Vec::new();
+		if matches!(receiver, Type::Interface { .. }) {
+			self.collect_interface_recursive(receiver, receiver, None, &mut available);
+		}
+
+		for interface in self.direct_type_impls(receiver) {
+			self.collect_interface_recursive(receiver, &interface, None, &mut available);
+		}
+
+		for record in &ctx.impl_records {
+			let mut subst = HashMap::new();
+			if self.match_type_pattern(&record.receiver, receiver, &mut subst)
+				&& self.impl_constraints_satisfied(&record.generics, &subst, ctx, &record.span)
+				&& let Ok(interface) = self.substitute(
+					&record.interface,
+					&subst,
+					Span::new(record.span.start, record.span.end),
+				) {
+				self.collect_interface_recursive(
+					receiver,
+					&interface,
+					Some(record.span.clone()),
+					&mut available,
+				);
+			}
+		}
+
+		available
+	}
+
+	fn collect_interface_recursive(
+		&self,
+		receiver: &Type,
+		interface: &Type,
+		span: Option<Range<usize>>,
+		available: &mut Vec<AvailableInterface>,
+	) {
+		let Type::Interface { .. } = interface else {
+			return;
+		};
+		let normalized = self.substitute_self_type(interface, receiver);
+		if let Some(existing) = available
+			.iter_mut()
+			.find(|item| item.interface == normalized)
+		{
+			if existing.span.is_none() {
+				existing.span = span;
+			}
+			return;
+		}
+
+		available.push(AvailableInterface {
+			interface: normalized.clone(),
+			span: span.clone(),
+		});
+
+		if let Type::Interface { impls, .. } = normalized {
+			for implied in impls.values() {
+				self.collect_interface_recursive(receiver, implied, span.clone(), available);
+			}
+		}
+	}
+
+	fn direct_type_impls(&self, receiver: &Type) -> Vec<Type> {
+		match receiver {
+			Type::Struct { impls, .. }
+			| Type::Enum { impls, .. }
+			| Type::EnumVariant { impls, .. }
+			| Type::Interface { impls, .. } => impls.values().cloned().collect(),
+			_ => Vec::new(),
+		}
+	}
+
+	fn impl_constraints_satisfied(
+		&self,
+		generics: &[GenericParamInfo],
+		subst: &HashMap<TypeVarId, Type>,
+		ctx: &Context,
+		span: &Range<usize>,
+	) -> bool {
+		generics.iter().all(|generic| {
+			let Some(constraint) = &generic.constraint else {
+				return true;
+			};
+			let Some(type_) = subst.get(&generic.id) else {
+				return false;
+			};
+			let Ok(constraint) = self.substitute(constraint, subst, Span::new(span.start, span.end))
+			else {
+				return false;
+			};
+			self.type_satisfies(type_, &constraint, ctx)
+		})
+	}
+
+	fn substitute_self_type(&self, ty: &Type, receiver: &Type) -> Type {
+		match ty {
+			Type::Variable { name, .. } if name == "self" => receiver.clone(),
+			Type::List { item } => Type::List {
+				item: Box::new(self.substitute_self_type(item, receiver)),
+			},
+			Type::Tuple { items } => Type::Tuple {
+				items: items
+					.iter()
+					.map(|item| self.substitute_self_type(item, receiver))
+					.collect(),
+			},
+			Type::Map { key, value } => Type::Map {
+				key: Box::new(self.substitute_self_type(key, receiver)),
+				value: Box::new(self.substitute_self_type(value, receiver)),
+			},
+			Type::Function {
+				generics,
+				params,
+				has_spread,
+				return_type,
+				constructor,
+			} => Type::Function {
+				generics: generics.clone(),
+				params: params
+					.iter()
+					.map(|(name, type_)| (name.clone(), self.substitute_self_type(type_, receiver)))
+					.collect(),
+				has_spread: *has_spread,
+				return_type: Box::new(self.substitute_self_type(return_type, receiver)),
+				constructor: *constructor,
+			},
+			Type::Intersection { first, second } => Type::Intersection {
+				first: Box::new(self.substitute_self_type(first, receiver)),
+				second: Box::new(self.substitute_self_type(second, receiver)),
+			},
+			Type::Struct {
+				name,
+				def_key,
+				generics,
+				type_args,
+				fields,
+				members,
+				impls,
+			} => Type::Struct {
+				name: name.clone(),
+				def_key: *def_key,
+				generics: generics.clone(),
+				type_args: type_args
+					.iter()
+					.map(|arg| self.substitute_self_type(arg, receiver))
+					.collect(),
+				fields: Arc::new(
+					fields
+						.iter()
+						.map(|(name, type_)| (name.clone(), self.substitute_self_type(type_, receiver)))
+						.collect(),
+				),
+				members: Arc::new(
+					members
+						.iter()
+						.map(|(name, member)| {
+							(
+								name.clone(),
+								StructMember {
+									type_: Box::new(self.substitute_self_type(&member.type_, receiver)),
+									kind: member.kind,
+									required: member.required,
+								},
+							)
+						})
+						.collect(),
+				),
+				impls: Arc::new(
+					impls
+						.iter()
+						.map(|(name, interface)| (name.clone(), self.substitute_self_type(interface, receiver)))
+						.collect(),
+				),
+			},
+			Type::Enum {
+				name,
+				def_key,
+				generics,
+				type_args,
+				variants,
+				members,
+				impls,
+			} => Type::Enum {
+				name: name.clone(),
+				def_key: *def_key,
+				generics: generics.clone(),
+				type_args: type_args
+					.iter()
+					.map(|arg| self.substitute_self_type(arg, receiver))
+					.collect(),
+				variants: Arc::new(
+					variants
+						.iter()
+						.map(|(variant_name, fields)| {
+							(
+								variant_name.clone(),
+								fields
+									.iter()
+									.map(|(name, type_)| (name.clone(), self.substitute_self_type(type_, receiver)))
+									.collect(),
+							)
+						})
+						.collect(),
+				),
+				members: Arc::new(
+					members
+						.iter()
+						.map(|(name, member)| {
+							(
+								name.clone(),
+								StructMember {
+									type_: Box::new(self.substitute_self_type(&member.type_, receiver)),
+									kind: member.kind,
+									required: member.required,
+								},
+							)
+						})
+						.collect(),
+				),
+				impls: Arc::new(
+					impls
+						.iter()
+						.map(|(name, interface)| (name.clone(), self.substitute_self_type(interface, receiver)))
+						.collect(),
+				),
+			},
+			Type::EnumVariant {
+				name,
+				variant_name,
+				fields,
+				variant_of,
+				impls,
+			} => Type::EnumVariant {
+				name: name.clone(),
+				variant_name: variant_name.clone(),
+				fields: Arc::new(
+					fields
+						.iter()
+						.map(|(name, type_)| (name.clone(), self.substitute_self_type(type_, receiver)))
+						.collect(),
+				),
+				variant_of: Box::new(self.substitute_self_type(variant_of, receiver)),
+				impls: Arc::new(
+					impls
+						.iter()
+						.map(|(name, interface)| (name.clone(), self.substitute_self_type(interface, receiver)))
+						.collect(),
+				),
+			},
+			Type::Interface {
+				name,
+				def_key,
+				generics,
+				type_args,
+				members,
+				impls,
+			} => Type::Interface {
+				name: name.clone(),
+				def_key: *def_key,
+				generics: generics.clone(),
+				type_args: type_args
+					.iter()
+					.map(|arg| self.substitute_self_type(arg, receiver))
+					.collect(),
+				members: Arc::new(
+					members
+						.iter()
+						.map(|(name, member)| {
+							(
+								name.clone(),
+								StructMember {
+									type_: Box::new(self.substitute_self_type(&member.type_, receiver)),
+									kind: member.kind,
+									required: member.required,
+								},
+							)
+						})
+						.collect(),
+				),
+				impls: Arc::new(
+					impls
+						.iter()
+						.map(|(name, interface)| (name.clone(), self.substitute_self_type(interface, receiver)))
+						.collect(),
+				),
+			},
+			_ => ty.clone(),
+		}
+	}
+
+	fn substitute_member(
+		&self,
+		member: &StructMember,
+		subst: &HashMap<TypeVarId, Type>,
+		span: Span,
+	) -> Result<StructMember, TypeError> {
+		Ok(StructMember {
+			type_: Box::new(self.substitute(&member.type_, subst, span)?),
+			kind: member.kind,
+			required: member.required,
+		})
+	}
+
+	fn same_type_identity(&self, left: &Type, right: &Type) -> bool {
+		match (left, right) {
+			(
+				Type::Struct {
+					name: left_name,
+					def_key: left_key,
+					..
+				},
+				Type::Struct {
+					name: right_name,
+					def_key: right_key,
+					..
+				},
+			)
+			| (
+				Type::Enum {
+					name: left_name,
+					def_key: left_key,
+					..
+				},
+				Type::Enum {
+					name: right_name,
+					def_key: right_key,
+					..
+				},
+			)
+			| (
+				Type::Interface {
+					name: left_name,
+					def_key: left_key,
+					..
+				},
+				Type::Interface {
+					name: right_name,
+					def_key: right_key,
+					..
+				},
+			) => match (left_key, right_key) {
+				(Some(left_key), Some(right_key)) => left_key == right_key,
+				_ => left_name == right_name,
+			},
+			(
+				Type::Module {
+					name: left_name, ..
+				},
+				Type::Module {
+					name: right_name, ..
+				},
+			) => left_name == right_name,
+			_ => left == right,
+		}
+	}
+
+	fn match_type_pattern(
+		&self,
+		pattern: &Type,
+		actual: &Type,
+		subst: &mut HashMap<TypeVarId, Type>,
+	) -> bool {
+		match pattern {
+			Type::Variable { id, .. } => match subst.get(id) {
+				Some(existing) => existing == actual,
+				None => {
+					subst.insert(*id, actual.clone());
+					true
+				}
+			},
+			Type::Int
+			| Type::UInt
+			| Type::Float
+			| Type::Char
+			| Type::String
+			| Type::Boolean
+			| Type::Void
+			| Type::Never => pattern == actual,
+			Type::List { item } => {
+				matches!(actual, Type::List { item: actual_item } if self.match_type_pattern(item, actual_item, subst))
+			}
+			Type::Tuple { items } => {
+				matches!(actual, Type::Tuple { items: actual_items } if items.len() == actual_items.len() && items.iter().zip(actual_items).all(|(pattern_item, actual_item)| self.match_type_pattern(pattern_item, actual_item, subst)))
+			}
+			Type::Map { key, value } => {
+				matches!(actual, Type::Map { key: actual_key, value: actual_value } if self.match_type_pattern(key, actual_key, subst) && self.match_type_pattern(value, actual_value, subst))
+			}
+			Type::Function {
+				params,
+				return_type,
+				..
+			} => {
+				matches!(actual, Type::Function { params: actual_params, return_type: actual_return_type, .. } if params.len() == actual_params.len() && params.iter().zip(actual_params).all(|((_, pattern_param), (_, actual_param))| self.match_type_pattern(pattern_param, actual_param, subst)) && self.match_type_pattern(return_type, actual_return_type, subst))
+			}
+			Type::Intersection { first, second } => {
+				self.match_type_pattern(first, actual, subst)
+					&& self.match_type_pattern(second, actual, subst)
+			}
+			Type::Struct { type_args, .. }
+			| Type::Enum { type_args, .. }
+			| Type::Interface { type_args, .. } => {
+				let actual_args = match actual {
+					Type::Struct { type_args, .. }
+					| Type::Enum { type_args, .. }
+					| Type::Interface { type_args, .. } => type_args,
+					_ => return false,
+				};
+				self.same_type_identity(pattern, actual)
+					&& type_args.len() == actual_args.len()
+					&& type_args
+						.iter()
+						.zip(actual_args)
+						.all(|(pattern_arg, actual_arg)| {
+							self.match_type_pattern(pattern_arg, actual_arg, subst)
+						})
+			}
+			Type::EnumVariant {
+				variant_name,
+				variant_of,
+				..
+			} => {
+				matches!(actual, Type::EnumVariant { variant_name: actual_variant_name, variant_of: actual_variant_of, .. } if variant_name == actual_variant_name && self.match_type_pattern(variant_of, actual_variant_of, subst))
+			}
+			Type::Module { .. } => self.same_type_identity(pattern, actual),
+		}
 	}
 
 	fn infer_prefix_op(
@@ -1279,7 +2818,10 @@ impl TypeChecker {
 			(PrefixOperator::Negate, Type::Int) => Ok(Type::Int),
 			(PrefixOperator::Negate, Type::Float) => Ok(Type::Float),
 			(PrefixOperator::BitNot, Type::Int) => Ok(Type::Int),
-			_ => Err(TypeError::InvalidUnaryOp(span_to_range(span))),
+			_ => Err(TypeError {
+				kind: TypeErrorKind::InvalidUnaryOp,
+				span: span_to_range(span),
+			}),
 		}
 	}
 
@@ -1293,6 +2835,7 @@ impl TypeChecker {
 	}
 
 	fn infer_binary_op(
+		&self,
 		lhs: Type,
 		op: BinaryOperator,
 		rhs: Type,
@@ -1309,7 +2852,10 @@ impl TypeChecker {
 				(Type::Float, Type::Float) => Ok(Type::Float),
 				(Type::Int, Type::Float) | (Type::Float, Type::Int) => Ok(Type::Float),
 				(Type::String, Type::String) if matches!(op, BinaryOperator::Plus) => Ok(Type::String),
-				_ => Err(TypeError::InvalidBinaryOp(span_to_range(span))),
+				_ => Err(TypeError {
+					kind: TypeErrorKind::InvalidBinaryOp,
+					span: span_to_range(span),
+				}),
 			},
 			BinaryOperator::Equals
 			| BinaryOperator::NotEquals
@@ -1321,26 +2867,39 @@ impl TypeChecker {
 				if matches!(lhs, Type::Boolean) && matches!(rhs, Type::Boolean) {
 					Ok(Type::Boolean)
 				} else {
-					Err(TypeError::InvalidBinaryOp(span_to_range(span)))
+					Err(TypeError {
+						kind: TypeErrorKind::InvalidBinaryOp,
+						span: span_to_range(span),
+					})
 				}
 			}
 			BinaryOperator::BitAnd | BinaryOperator::BitOr | BinaryOperator::BitXor => {
 				if matches!(lhs, Type::Int) && matches!(rhs, Type::Int) {
 					Ok(Type::Int)
 				} else {
-					Err(TypeError::InvalidBinaryOp(span_to_range(span)))
+					Err(TypeError {
+						kind: TypeErrorKind::InvalidBinaryOp,
+						span: span_to_range(span),
+					})
 				}
 			}
 			BinaryOperator::LeftShift | BinaryOperator::RightShift => {
 				if matches!(lhs, Type::Int) && matches!(rhs, Type::Int) {
 					Ok(Type::Int)
 				} else {
-					Err(TypeError::InvalidBinaryOp(span_to_range(span)))
+					Err(TypeError {
+						kind: TypeErrorKind::InvalidBinaryOp,
+						span: span_to_range(span),
+					})
 				}
 			}
 			BinaryOperator::In | BinaryOperator::NotIn => match rhs {
 				Type::List { .. } | Type::Map { .. } => Ok(Type::Boolean),
-				_ => Err(TypeError::InvalidBinaryOp(span_to_range(span))),
+				_ if self.range_item_type(&rhs).is_some() => Ok(Type::Boolean),
+				_ => Err(TypeError {
+					kind: TypeErrorKind::InvalidBinaryOp,
+					span: span_to_range(span),
+				}),
 			},
 			BinaryOperator::Pipe => {
 				// Pipe: lhs |> rhs, rhs should be a function that accepts lhs
@@ -1354,13 +2913,22 @@ impl TypeChecker {
 							if lhs.assignable_to(&params[0].1, &Default::default()) {
 								Ok(*return_type)
 							} else {
-								Err(TypeError::InvalidBinaryOp(span_to_range(span)))
+								Err(TypeError {
+									kind: TypeErrorKind::InvalidBinaryOp,
+									span: span_to_range(span),
+								})
 							}
 						} else {
-							Err(TypeError::InvalidBinaryOp(span_to_range(span)))
+							Err(TypeError {
+								kind: TypeErrorKind::InvalidBinaryOp,
+								span: span_to_range(span),
+							})
 						}
 					}
-					_ => Err(TypeError::InvalidBinaryOp(span_to_range(span))),
+					_ => Err(TypeError {
+						kind: TypeErrorKind::InvalidBinaryOp,
+						span: span_to_range(span),
+					}),
 				}
 			}
 			BinaryOperator::Unwrap => {
@@ -1378,16 +2946,17 @@ impl TypeChecker {
 	) -> Result<Type, TypeError> {
 		match ast_type {
 			ast::types::Type::Int => Ok(Type::Int),
+			ast::types::Type::UInt => Ok(Type::UInt),
 			ast::types::Type::Float => Ok(Type::Float),
 			ast::types::Type::Char => Ok(Type::Char),
 			ast::types::Type::String => Ok(Type::String),
 			ast::types::Type::Boolean => Ok(Type::Boolean),
 			ast::types::Type::Void => Ok(Type::Void),
 			ast::types::Type::Never => Ok(Type::Never),
-			ast::types::Type::Self_ => ctx
-				.self_type
-				.clone()
-				.ok_or_else(|| TypeError::SelfTypeInGlobalScope(span_to_range(span))),
+			ast::types::Type::Self_ => ctx.self_type.clone().ok_or_else(|| TypeError {
+				kind: TypeErrorKind::SelfTypeInGlobalScope,
+				span: span_to_range(span),
+			}),
 			ast::types::Type::Infer => Ok(self.fresh_var("_infer", None)),
 			ast::types::Type::Intersection(a, b) => {
 				let first = self.resolve_ast_type(&a.0, a.1, ctx)?;
@@ -1456,13 +3025,13 @@ impl TypeChecker {
 		ctx: &Context,
 	) -> Result<Type, TypeError> {
 		// Look up the base type
-		let raw_type = ctx
-			.lookup_type(name)
-			.ok_or_else(|| TypeError::UnknownType {
+		let raw_type = ctx.lookup_type(name).ok_or_else(|| TypeError {
+			kind: TypeErrorKind::UnknownType {
 				name: name.clone(),
 				suggestion: find_similar_name(name, ctx.local_ctx.keys()),
-				span: span_to_range(span),
-			})?;
+			},
+			span: span_to_range(span),
+		})?;
 
 		// If the entry is a constructor function whose return type is a struct,
 		// resolve to the struct type instead.
@@ -1493,21 +3062,12 @@ impl TypeChecker {
 		let mut resolve_ctx = ctx.clone();
 
 		for param in params {
-			let constraint = match &param.0.constraint {
-				Some(c) => Some(self.resolve_ast_type(&c.0, c.1, &resolve_ctx)?),
-				None => None,
-			};
-			let default = match &param.0.default {
-				Some(d) => Some(self.resolve_ast_type(&d.0, d.1, &resolve_ctx)?),
-				None => None,
-			};
-
 			let id = self.fresh_type_var_id();
 			let gp = GenericParamInfo {
 				id,
 				name: param.0.name.0.clone(),
-				constraint,
-				default,
+				constraint: None,
+				default: None,
 			};
 			result.push(gp.clone());
 
@@ -1518,6 +3078,32 @@ impl TypeChecker {
 						id,
 						name: param.0.name.0.clone(),
 						constraint: gp.constraint.clone().map(Box::new),
+					},
+					mutable: false,
+					visibility: Visibility::Private,
+				}),
+			);
+		}
+
+		for (index, param) in params.iter().enumerate() {
+			let constraint = match &param.0.constraint {
+				Some(c) => Some(self.resolve_ast_type(&c.0, c.1, &resolve_ctx)?),
+				None => None,
+			};
+			let default = match &param.0.default {
+				Some(d) => Some(self.resolve_ast_type(&d.0, d.1, &resolve_ctx)?),
+				None => None,
+			};
+
+			result[index].constraint = constraint.clone();
+			result[index].default = default;
+			resolve_ctx.insert_entry(
+				param.0.name.0.clone(),
+				ContextEntry::Value(ContextValue {
+					type_: Type::Variable {
+						id: result[index].id,
+						name: param.0.name.0.clone(),
+						constraint: constraint.map(Box::new),
 					},
 					mutable: false,
 					visibility: Visibility::Private,
@@ -1545,9 +3131,11 @@ impl TypeChecker {
 		};
 
 		if type_params.is_empty() && !generics.is_empty() {
-			return Err(TypeError::GenericArgumentMismatch {
-				expected: 0,
-				found: generics.len(),
+			return Err(TypeError {
+				kind: TypeErrorKind::GenericArgumentMismatch {
+					expected: 0,
+					found: generics.len(),
+				},
 				span: span_to_range(span),
 			});
 		}
@@ -1583,14 +3171,16 @@ impl TypeChecker {
 				Some(ty) => {
 					if let Some(constraint) = &param.constraint {
 						let subst_constraint = self.substitute(constraint, &subst, span)?;
-						self.check_constraint_at(&ty, &subst_constraint, span)?;
+						self.check_constraint_at(&ty, &subst_constraint, span, ctx)?;
 					}
 					subst.insert(param.id, ty);
 				}
 				None => {
-					return Err(TypeError::GenericArgumentMismatch {
-						expected: type_params.len(),
-						found: generics.len(),
+					return Err(TypeError {
+						kind: TypeErrorKind::GenericArgumentMismatch {
+							expected: type_params.len(),
+							found: generics.len(),
+						},
 						span: span_to_range(span),
 					});
 				}
@@ -1611,6 +3201,36 @@ impl TypeChecker {
 		self.substitute_with_args(ty, subst, Vec::new(), span)
 	}
 
+	fn resolve_nominal_type_args(
+		&self,
+		generics: &[GenericParamInfo],
+		existing_type_args: &[Type],
+		type_args: Vec<Type>,
+		subst: &HashMap<TypeVarId, Type>,
+		span: Span,
+	) -> Result<Vec<Type>, TypeError> {
+		if !type_args.is_empty() {
+			return Ok(type_args);
+		}
+
+		if !existing_type_args.is_empty() {
+			return existing_type_args
+				.iter()
+				.map(|arg| self.substitute(arg, subst, span))
+				.collect();
+		}
+
+		let inferred_type_args: Vec<_> = generics
+			.iter()
+			.filter_map(|param| subst.get(&param.id).cloned())
+			.collect();
+		if inferred_type_args.len() == generics.len() {
+			Ok(inferred_type_args)
+		} else {
+			Ok(Vec::new())
+		}
+	}
+
 	fn substitute_with_args(
 		&self,
 		ty: &Type,
@@ -1623,9 +3243,11 @@ impl TypeChecker {
 				if let Some(replacement) = subst.get(id) {
 					let is_identity = matches!(replacement, Type::Variable { id: rid, .. } if rid == id);
 					if !is_identity && self.occurs_in(id, replacement) {
-						return Err(TypeError::InfiniteTypeInstantiation {
-							var: name.clone(),
-							ty: Box::new(replacement.clone()),
+						return Err(TypeError {
+							kind: TypeErrorKind::InfiniteTypeInstantiation {
+								var: name.clone(),
+								ty: Box::new(replacement.clone()),
+							},
 							span: span_to_range(span),
 						});
 					}
@@ -1672,12 +3294,20 @@ impl TypeChecker {
 			}),
 			Type::Struct {
 				name,
+				def_key,
 				generics,
+				type_args: existing_type_args,
 				fields,
 				members,
 				impls,
-				..
 			} => {
+				let resolved_type_args = self.resolve_nominal_type_args(
+					generics,
+					existing_type_args,
+					type_args,
+					subst,
+					span,
+				)?;
 				let new_fields: Result<BTreeMap<_, _>, _> = fields
 					.iter()
 					.map(|(k, v)| self.substitute(v, subst, span).map(|t| (k.clone(), t)))
@@ -1691,33 +3321,42 @@ impl TypeChecker {
 								StructMember {
 									type_: Box::new(t),
 									kind: m.kind,
+									required: m.required,
 								},
 							)
 						})
 					})
 					.collect();
+				let new_impls: Result<BTreeMap<_, _>, _> = impls
+					.iter()
+					.map(|(k, v)| self.substitute(v, subst, span).map(|t| (k.clone(), t)))
+					.collect();
 				Ok(Type::Struct {
 					name: name.clone(),
+					def_key: *def_key,
 					generics: generics.clone(),
-					type_args: if type_args.is_empty() {
-						Vec::new()
-					} else {
-						type_args
-					},
+					type_args: resolved_type_args,
 					fields: Arc::new(new_fields?),
 					members: Arc::new(new_members?),
-					impls: impls.clone(),
-					def_key: None,
+					impls: Arc::new(new_impls?),
 				})
 			}
 			Type::Enum {
 				name,
+				def_key,
 				generics,
+				type_args: existing_type_args,
 				variants,
 				members,
 				impls,
-				..
 			} => {
+				let resolved_type_args = self.resolve_nominal_type_args(
+					generics,
+					existing_type_args,
+					type_args,
+					subst,
+					span,
+				)?;
 				let new_variants: Result<BTreeMap<_, _>, _> = variants
 					.iter()
 					.map(|(vname, vfields)| {
@@ -1737,23 +3376,24 @@ impl TypeChecker {
 								StructMember {
 									type_: Box::new(t),
 									kind: m.kind,
+									required: m.required,
 								},
 							)
 						})
 					})
 					.collect();
+				let new_impls: Result<BTreeMap<_, _>, _> = impls
+					.iter()
+					.map(|(k, v)| self.substitute(v, subst, span).map(|t| (k.clone(), t)))
+					.collect();
 				Ok(Type::Enum {
 					name: name.clone(),
+					def_key: *def_key,
 					generics: generics.clone(),
-					type_args: if type_args.is_empty() {
-						Vec::new()
-					} else {
-						type_args
-					},
+					type_args: resolved_type_args,
 					variants: Arc::new(new_variants?),
 					members: Arc::new(new_members?),
-					impls: impls.clone(),
-					def_key: None,
+					impls: Arc::new(new_impls?),
 				})
 			}
 			Type::EnumVariant {
@@ -1772,16 +3412,29 @@ impl TypeChecker {
 					variant_name: variant_name.clone(),
 					fields: Arc::new(new_fields?),
 					variant_of: Box::new(self.substitute(variant_of, subst, span)?),
-					impls: impls.clone(),
+					impls: Arc::new(
+						impls
+							.iter()
+							.map(|(k, v)| self.substitute(v, subst, span).map(|t| (k.clone(), t)))
+							.collect::<Result<_, _>>()?,
+					),
 				})
 			}
 			Type::Interface {
 				name,
+				def_key,
 				generics,
+				type_args: existing_type_args,
 				members,
 				impls,
-				..
 			} => {
+				let resolved_type_args = self.resolve_nominal_type_args(
+					generics,
+					existing_type_args,
+					type_args,
+					subst,
+					span,
+				)?;
 				let new_members: Result<BTreeMap<_, _>, _> = members
 					.iter()
 					.map(|(k, m)| {
@@ -1791,25 +3444,27 @@ impl TypeChecker {
 								StructMember {
 									type_: Box::new(t),
 									kind: m.kind,
+									required: m.required,
 								},
 							)
 						})
 					})
 					.collect();
+				let new_impls: Result<BTreeMap<_, _>, _> = impls
+					.iter()
+					.map(|(k, v)| self.substitute(v, subst, span).map(|t| (k.clone(), t)))
+					.collect();
 				Ok(Type::Interface {
 					name: name.clone(),
+					def_key: *def_key,
 					generics: generics.clone(),
-					type_args: if type_args.is_empty() {
-						Vec::new()
-					} else {
-						type_args
-					},
+					type_args: resolved_type_args,
 					members: Arc::new(new_members?),
-					impls: impls.clone(),
-					def_key: None,
+					impls: Arc::new(new_impls?),
 				})
 			}
 			Type::Int
+			| Type::UInt
 			| Type::Float
 			| Type::Char
 			| Type::String
@@ -1846,13 +3501,35 @@ impl TypeChecker {
 		}
 	}
 
-	fn check_constraint_at(&self, ty: &Type, constraint: &Type, span: Span) -> Result<(), TypeError> {
-		if ty.assignable_to(constraint, &Context::default()) {
+	fn check_constraint_at(
+		&self,
+		ty: &Type,
+		constraint: &Type,
+		span: Span,
+		ctx: &Context,
+	) -> Result<(), TypeError> {
+		if self.type_satisfies(ty, constraint, ctx) {
 			Ok(())
+		} else if matches!(constraint, Type::Interface { .. }) {
+			Err(TypeError {
+				kind: TypeErrorKind::ImplNotFound {
+					type_: ty.clone().into(),
+					interface: constraint.clone().into(),
+				},
+				span: span_to_range(span),
+			})
+		} else if let Type::Intersection { first, second } = constraint {
+			if !self.type_satisfies(ty, first, ctx) {
+				self.check_constraint_at(ty, first, span, ctx)
+			} else {
+				self.check_constraint_at(ty, second, span, ctx)
+			}
 		} else {
-			Err(TypeError::ConstraintViolation {
-				type_: ty.clone().into(),
-				constraint: constraint.clone().into(),
+			Err(TypeError {
+				kind: TypeErrorKind::ConstraintViolation {
+					type_: ty.clone().into(),
+					constraint: constraint.clone().into(),
+				},
 				span: span_to_range(span),
 			})
 		}
@@ -1903,9 +3580,11 @@ impl TypeChecker {
 				{
 					let suggestion =
 						find_similar_name(name, func_params.iter().filter_map(|(n, _)| n.as_ref()));
-					return Err(TypeError::UnknownNamedArgument {
-						name: name.clone(),
-						suggestion,
+					return Err(TypeError {
+						kind: TypeErrorKind::UnknownNamedArgument {
+							name: name.clone(),
+							suggestion,
+						},
 						span: span_to_range(name_ident.1),
 					});
 				}
@@ -1914,7 +3593,7 @@ impl TypeChecker {
 
 		let min_args = std::cmp::min(args.len(), func_params.len());
 		for i in 0..min_args {
-			let arg_type = self.infer(&args[i].0.value, ctx)?;
+			let arg_type = self.infer_with_expected(&args[i].0.value, Some(&func_params[i].1), ctx)?;
 			let (_, param_type) = &func_params[i];
 
 			self.unify_for_inference(param_type, &arg_type, &mut subst);
@@ -1926,9 +3605,11 @@ impl TypeChecker {
 					let default_resolved = self.substitute(default, &subst, span)?;
 					subst.insert(param.id, default_resolved);
 				} else {
-					return Err(TypeError::GenericArgumentMismatch {
-						expected: func_generics.len(),
-						found: explicit_generics.len(),
+					return Err(TypeError {
+						kind: TypeErrorKind::GenericArgumentMismatch {
+							expected: func_generics.len(),
+							found: explicit_generics.len(),
+						},
 						span: span_to_range(span),
 					});
 				}
@@ -1939,7 +3620,7 @@ impl TypeChecker {
 			if let Some(constraint) = &param.constraint {
 				let subst_constraint = self.substitute(constraint, &subst, span)?;
 				if let Some(arg_ty) = subst.get(&param.id) {
-					self.check_constraint_at(arg_ty, &subst_constraint, span)?;
+					self.check_constraint_at(arg_ty, &subst_constraint, span, ctx)?;
 				}
 			}
 		}
@@ -1954,6 +3635,15 @@ impl TypeChecker {
 		subst: &mut HashMap<TypeVarId, Type>,
 	) {
 		match param_type {
+			_ if matches!(arg_type, Type::Variable { constraint: Some(_), .. }) => {
+				if let Type::Variable {
+					constraint: Some(constraint),
+					..
+				} = arg_type
+				{
+					self.unify_for_inference(param_type, constraint, subst);
+				}
+			}
 			Type::Variable { id, name, .. } if !subst.contains_key(id) && !name.starts_with('_') => {
 				subst.insert(*id, arg_type.clone());
 			}
@@ -1996,29 +3686,34 @@ impl TypeChecker {
 					self.unify_for_inference(return_type, arg_return, subst);
 				}
 			}
-			_ => {}
-		}
-	}
-
-	/// Check that a type satisfies a constraint (for type variables)
-	#[allow(dead_code)]
-	fn check_constraint(&self, ty: &Type, constraint: &Type) -> Result<(), TypeError> {
-		match (ty, constraint) {
-			// A type satisfies itself as a constraint
-			(a, b) if a == b => Ok(()),
-			// Never satisfies any constraint
-			(Type::Never, _) => Ok(()),
-			// Intersection: both parts must satisfy
-			(Type::Intersection { first, second }, c) => {
-				self.check_constraint(first, c)?;
-				self.check_constraint(second, c)
+			Type::Struct {
+				type_args: param_args,
+				..
 			}
-			// Otherwise, fail
-			_ => Err(TypeError::ConstraintViolation {
-				type_: ty.clone().into(),
-				constraint: constraint.clone().into(),
-				span: 0..0,
-			}),
+			| Type::Enum {
+				type_args: param_args,
+				..
+			}
+			| Type::Interface {
+				type_args: param_args,
+				..
+			} => match arg_type {
+				Type::Struct {
+					type_args: arg_args, ..
+				}
+				| Type::Enum {
+					type_args: arg_args, ..
+				}
+				| Type::Interface {
+					type_args: arg_args, ..
+				} => {
+					for (param_arg, arg_arg) in param_args.iter().zip(arg_args.iter()) {
+						self.unify_for_inference(param_arg, arg_arg, subst);
+					}
+				}
+				_ => {}
+			},
+			_ => {}
 		}
 	}
 
@@ -2041,6 +3736,7 @@ impl TypeChecker {
 	) -> Result<(), TypeError> {
 		match pattern {
 			Pattern::Int(_)
+			| Pattern::UInt(_)
 			| Pattern::Float(_)
 			| Pattern::Char(_)
 			| Pattern::String(_)
@@ -2049,9 +3745,11 @@ impl TypeChecker {
 			Pattern::Binding { name, inner } => {
 				self.collect_pattern_identifiers(&inner.0, scrutinee.clone(), identifiers)?;
 				if identifiers.insert(name.0.clone(), scrutinee).is_some() {
-					return Err(TypeError::DuplicatePatternIdentifier {
-						pattern: pattern.clone(),
-						identifier: name.0.clone(),
+					return Err(TypeError {
+						kind: TypeErrorKind::DuplicatePatternIdentifier {
+							pattern: pattern.clone(),
+							identifier: name.0.clone(),
+						},
 						span: 0..0,
 					});
 				}
@@ -2061,9 +3759,11 @@ impl TypeChecker {
 				let item_type = match scrutinee {
 					Type::List { item } => *item,
 					_ => {
-						return Err(TypeError::PatternTypeMismatch {
-							pattern: pattern.clone(),
-							scrutinee: scrutinee.into(),
+						return Err(TypeError {
+							kind: TypeErrorKind::PatternTypeMismatch {
+								pattern: pattern.clone(),
+								scrutinee: scrutinee.into(),
+							},
 							span: 0..0,
 						});
 					}
@@ -2085,9 +3785,11 @@ impl TypeChecker {
 									)
 									.is_some()
 							{
-								return Err(TypeError::DuplicatePatternIdentifier {
-									pattern: pattern.clone(),
-									identifier: name.0.clone(),
+								return Err(TypeError {
+									kind: TypeErrorKind::DuplicatePatternIdentifier {
+										pattern: pattern.clone(),
+										identifier: name.0.clone(),
+									},
 									span: 0..0,
 								});
 							}
@@ -2100,18 +3802,22 @@ impl TypeChecker {
 				let tuple_items = match scrutinee {
 					Type::Tuple { items: t } => t,
 					_ => {
-						return Err(TypeError::PatternTypeMismatch {
-							pattern: pattern.clone(),
-							scrutinee: scrutinee.into(),
+						return Err(TypeError {
+							kind: TypeErrorKind::PatternTypeMismatch {
+								pattern: pattern.clone(),
+								scrutinee: scrutinee.into(),
+							},
 							span: 0..0,
 						});
 					}
 				};
 
 				if items.len() > tuple_items.len() {
-					return Err(TypeError::TuplePatternTooLong {
-						pattern: pattern.clone(),
-						tuple_items,
+					return Err(TypeError {
+						kind: TypeErrorKind::TuplePatternTooLong {
+							pattern: pattern.clone(),
+							tuple_items,
+						},
 						span: 0..0,
 					});
 				}
@@ -2122,8 +3828,10 @@ impl TypeChecker {
 							self.collect_pattern_identifiers(&p.0, ty.clone(), identifiers)?;
 						}
 						ast::expr::ListPatternEntry::Rest(_) => {
-							return Err(TypeError::RestPatternNotAtEnd {
-								pattern: pattern.clone(),
+							return Err(TypeError {
+								kind: TypeErrorKind::RestPatternNotAtEnd {
+									pattern: pattern.clone(),
+								},
 								span: 0..0,
 							});
 						}
@@ -2135,9 +3843,11 @@ impl TypeChecker {
 				match scrutinee {
 					Type::Map { .. } => {}
 					_ => {
-						return Err(TypeError::PatternTypeMismatch {
-							pattern: pattern.clone(),
-							scrutinee: scrutinee.into(),
+						return Err(TypeError {
+							kind: TypeErrorKind::PatternTypeMismatch {
+								pattern: pattern.clone(),
+								scrutinee: scrutinee.into(),
+							},
 							span: 0..0,
 						});
 					}
@@ -2147,9 +3857,11 @@ impl TypeChecker {
 					match &entry.0 {
 						ast::expr::MapPatternEntry::Entry(key, value) => {
 							if !key.0.is_constant() {
-								return Err(TypeError::NonConstantMapPatternKey {
-									key_pattern: key.0.clone(),
-									pattern: pattern.clone(),
+								return Err(TypeError {
+									kind: TypeErrorKind::NonConstantMapPatternKey {
+										key_pattern: key.0.clone(),
+										pattern: pattern.clone(),
+									},
 									span: 0..0,
 								});
 							}
@@ -2200,9 +3912,11 @@ impl TypeChecker {
 									.cloned()
 									.unwrap_or_else(|| self.fresh_var("_unknown_field", None));
 								if identifiers.insert(ident.0.clone(), field_type).is_some() {
-									return Err(TypeError::DuplicatePatternIdentifier {
-										pattern: pattern.clone(),
-										identifier: ident.0.clone(),
+									return Err(TypeError {
+										kind: TypeErrorKind::DuplicatePatternIdentifier {
+											pattern: pattern.clone(),
+											identifier: ident.0.clone(),
+										},
 										span: 0..0,
 									});
 								}
@@ -2211,6 +3925,19 @@ impl TypeChecker {
 								// `...` - no bindings
 							}
 						}
+					}
+				} else if path.len() == 1 && fields.is_empty() {
+					// A single identifier with no fields that doesn't match any variant/struct
+					// is treated as a variable binding (e.g., `a` in `Some(value = a)`)
+					let name = &path[0];
+					if identifiers.insert(name.0.clone(), scrutinee).is_some() {
+						return Err(TypeError {
+							kind: TypeErrorKind::DuplicatePatternIdentifier {
+								pattern: pattern.clone(),
+								identifier: name.0.clone(),
+							},
+							span: 0..0,
+						});
 					}
 				}
 				Ok(())
@@ -2226,10 +3953,12 @@ impl TypeChecker {
 				for (name, ty) in first_idents {
 					if let Some(other_ty) = identifiers.get(&name) {
 						if ty != *other_ty {
-							return Err(TypeError::ConflictingUnionPatternIdentifiers {
-								identifier: name,
-								first_type: ty.into(),
-								second_type: other_ty.clone().into(),
+							return Err(TypeError {
+								kind: TypeErrorKind::ConflictingUnionPatternIdentifiers {
+									identifier: name,
+									first_type: ty.into(),
+									second_type: other_ty.clone().into(),
+								},
 								span: 0..0,
 							});
 						}
@@ -2244,7 +3973,12 @@ impl TypeChecker {
 	}
 
 	pub fn check_module(&mut self, module: &Module, ctx: &Context) -> Result<Context, TypeError> {
-		let mut current_ctx = ctx.clone();
+		let mut current_ctx = if self.should_inject_implicit_prelude(module) {
+			self.inject_implicit_prelude_entries(ctx)
+		} else {
+			ctx.clone()
+		};
+		current_ctx = self.inject_builtin_range_entries(&current_ctx);
 
 		for decl in &module.members {
 			current_ctx = self.check_declaration(decl, &current_ctx)?;
@@ -2253,42 +3987,330 @@ impl TypeChecker {
 		Ok(current_ctx)
 	}
 
-	/// Check a module using salsa queries for import resolution.
-	/// Note: `typecheck_file` now uses `context_after` for per-declaration incrementality.
-	/// This method is retained for backward compatibility.
-	#[allow(dead_code)]
-	pub fn check_module_salsa(
+	fn predeclare_module(&mut self, module: &Module) -> Context {
+		let mut current_ctx = Context::default();
+
+		for decl in &module.members {
+			current_ctx = self.predeclare_declaration(decl, &current_ctx);
+		}
+
+		current_ctx
+	}
+
+	fn predeclare_declaration(&mut self, declaration: &Declaration, ctx: &Context) -> Context {
+		match declaration {
+			Declaration::Struct {
+				visibility: _,
+				name,
+				generics,
+				fields,
+				members: _,
+			} => {
+				if fields.is_empty() {
+					return ctx.clone();
+				}
+
+				let Ok((generic_params, mut struct_ctx)) = self.resolve_generic_params(generics, ctx)
+				else {
+					return ctx.clone();
+				};
+
+				let forward_struct_type = Type::Struct {
+					name: name.0.clone(),
+					generics: Arc::new(generic_params.clone()),
+					type_args: Vec::new(),
+					fields: Arc::new(BTreeMap::new()),
+					members: Arc::new(BTreeMap::new()),
+					impls: Arc::new(BTreeMap::new()),
+					def_key: None,
+				};
+				struct_ctx = struct_ctx.with_new_entry(
+					name.0.clone(),
+					ContextEntry::Value(ContextValue {
+						type_: forward_struct_type,
+						mutable: false,
+						visibility: Visibility::Public,
+					}),
+				);
+
+				let mut field_map = BTreeMap::new();
+				for field in fields {
+					let Ok(field_type) =
+						self.resolve_ast_type(&field.0.type_.0, field.0.type_.1, &struct_ctx)
+					else {
+						return ctx.clone();
+					};
+
+					field_map.insert(field.0.name.0.clone(), field_type.clone());
+					struct_ctx.insert_entry(
+						field.0.name.0.clone(),
+						ContextEntry::Value(ContextValue {
+							type_: field_type,
+							mutable: false,
+							visibility: Visibility::Private,
+						}),
+					);
+				}
+
+				let struct_type = Type::Struct {
+					name: name.0.clone(),
+					generics: Arc::new(generic_params.clone()),
+					type_args: Vec::new(),
+					fields: Arc::new(field_map.clone()),
+					members: Arc::new(BTreeMap::new()),
+					impls: Arc::new(BTreeMap::new()),
+					def_key: None,
+				};
+
+				let constructor_params = fields
+					.iter()
+					.filter_map(|field| {
+						field_map
+							.get(&field.0.name.0)
+							.cloned()
+							.map(|field_type| (Some(field.0.name.0.clone()), field_type))
+					})
+					.collect();
+
+				ctx.with_new_entry(
+					name.0.clone(),
+					ContextEntry::Value(ContextValue {
+						type_: Type::Function {
+							generics: Arc::new(generic_params),
+							params: constructor_params,
+							has_spread: false,
+							return_type: Box::new(struct_type),
+							constructor: true,
+						},
+						mutable: false,
+						visibility: Visibility::Public,
+					}),
+				)
+			}
+			Declaration::Enum {
+				visibility: _,
+				name,
+				generics,
+				variants,
+				members: _,
+			} => {
+				let Ok((generic_params, mut enum_ctx)) = self.resolve_generic_params(generics, ctx) else {
+					return ctx.clone();
+				};
+
+				let forward_enum_type = Type::Enum {
+					name: name.0.clone(),
+					generics: Arc::new(generic_params.clone()),
+					type_args: Vec::new(),
+					variants: Arc::new(BTreeMap::new()),
+					members: Arc::new(BTreeMap::new()),
+					impls: Arc::new(BTreeMap::new()),
+					def_key: None,
+				};
+				enum_ctx = enum_ctx.with_new_entry(
+					name.0.clone(),
+					ContextEntry::Value(ContextValue {
+						type_: forward_enum_type,
+						mutable: false,
+						visibility: Visibility::Public,
+					}),
+				);
+
+				let mut variants_map = BTreeMap::new();
+				for variant in variants {
+					let mut variant_fields = BTreeMap::new();
+					for field in &variant.0.fields {
+						let Ok(field_type) =
+							self.resolve_ast_type(&field.0.type_.0, field.0.type_.1, &enum_ctx)
+						else {
+							return ctx.clone();
+						};
+
+						variant_fields.insert(field.0.name.0.clone(), field_type);
+					}
+					variants_map.insert(variant.0.name.0.clone(), variant_fields);
+				}
+
+				ctx.with_new_entry(
+					name.0.clone(),
+					ContextEntry::Value(ContextValue {
+						type_: Type::Enum {
+							name: name.0.clone(),
+							generics: Arc::new(generic_params),
+							type_args: Vec::new(),
+							variants: Arc::new(variants_map),
+							members: Arc::new(BTreeMap::new()),
+							impls: Arc::new(BTreeMap::new()),
+							def_key: None,
+						},
+						mutable: false,
+						visibility: Visibility::Public,
+					}),
+				)
+			}
+			Declaration::Interface {
+				visibility: _,
+				name,
+				generics,
+				super_interfaces: _,
+				members: _,
+			} => {
+				let Ok((generic_params, _)) = self.resolve_generic_params(generics, ctx) else {
+					return ctx.clone();
+				};
+
+				ctx.with_new_entry(
+					name.0.clone(),
+					ContextEntry::Value(ContextValue {
+						type_: Type::Interface {
+							name: name.0.clone(),
+							generics: Arc::new(generic_params),
+							type_args: Vec::new(),
+							members: Arc::new(BTreeMap::new()),
+							impls: Arc::new(BTreeMap::new()),
+							def_key: None,
+						},
+						mutable: false,
+						visibility: Visibility::Public,
+					}),
+				)
+			}
+			Declaration::TypeAlias {
+				visibility: _,
+				meta: TypeAliasDeclaration { name, generics },
+				value,
+			} => {
+				let Ok((_generic_params, alias_ctx)) = self.resolve_generic_params(generics, ctx) else {
+					return ctx.clone();
+				};
+
+				let Ok(aliased_type) = self.resolve_ast_type(&value.0, value.1, &alias_ctx) else {
+					return ctx.clone();
+				};
+
+				ctx.with_new_entry(
+					name.0.clone(),
+					ContextEntry::Value(ContextValue {
+						type_: aliased_type,
+						mutable: false,
+						visibility: Visibility::Public,
+					}),
+				)
+			}
+			Declaration::Namespace {
+				visibility: _,
+				name,
+				members: _,
+			} => ctx.with_new_entry(
+				name.0.clone(),
+				ContextEntry::Value(ContextValue {
+					type_: Type::Module {
+						name: name.0.clone(),
+						members: Arc::new(BTreeMap::new()),
+					},
+					mutable: false,
+					visibility: Visibility::Public,
+				}),
+			),
+			_ => ctx.clone(),
+		}
+	}
+
+	fn accumulate_type_error(&self, db: &dyn Db, file: SourceFile, err: TypeError) {
+		let err_span = err.span.clone();
+		let err_file = err
+			.file_path()
+			.unwrap_or_else(|| EcoString::from(file.path(db).as_str()));
+
+		Diagnostics(Diagnostic {
+			file_path: err_file,
+			span: Span::new(err_span.start, err_span.end),
+			message: err.to_string(),
+			kind: DiagnosticKind::TypeError,
+		})
+		.accumulate(db);
+		TypeErrors(err).accumulate(db);
+	}
+
+	pub fn check_file_salsa(
 		&mut self,
 		db: &dyn Db,
 		file: SourceFile,
 		config: ProjectConfig,
-		module: &Module,
-	) -> Result<Context, TypeError> {
-		let ctx = Context::default();
-		let mut current_ctx = ctx;
+	) -> Context {
+		let source_path = PathBuf::from(file.path(db).as_str());
+		let cache_key = source_path
+			.canonicalize()
+			.unwrap_or_else(|_| source_path.clone());
 
-		for decl in &module.members {
-			current_ctx = match decl {
-				Declaration::Import { root, path, idents } => {
-					self.check_import_salsa(db, file, config, root, path, idents.as_ref(), &current_ctx)?
-				}
-				_ => self.check_declaration(decl, &current_ctx)?,
+		if let Some(status) = self.module_cache.get(&cache_key) {
+			return match status {
+				ModuleStatus::InProgress(ctx) | ModuleStatus::Complete(ctx) => ctx.clone(),
 			};
 		}
 
-		Ok(current_ctx)
+		let parse_result = queries::parse_file(db, file);
+		let Some(module) = parse_result.module else {
+			self
+				.module_cache
+				.insert(cache_key, ModuleStatus::Complete(Context::default()));
+			return Context::default();
+		};
+
+		let predeclared_ctx = self.predeclare_module(&module.0);
+		self.module_cache.insert(
+			cache_key.clone(),
+			ModuleStatus::InProgress(predeclared_ctx.clone()),
+		);
+
+		let prev_file = self.current_file.replace(source_path);
+		let mut current_ctx = if self.should_inject_implicit_prelude(&module.0) {
+			self.inject_implicit_prelude_entries_salsa(db, config, &predeclared_ctx)
+		} else {
+			predeclared_ctx.clone()
+		};
+		current_ctx = self.inject_builtin_range_entries_salsa(db, config, &current_ctx);
+
+		for decl in &module.0.members {
+			let result = match decl {
+				Declaration::Import { root, path, idents } => self.check_import_salsa(
+					db,
+					file,
+					config,
+					root,
+					path,
+					idents.as_ref().map(Vec::as_slice),
+					&current_ctx,
+				),
+				_ => self.check_declaration(decl, &current_ctx),
+			};
+
+			match result {
+				Ok(ctx) => current_ctx = ctx,
+				Err(err) => self.accumulate_type_error(db, file, err),
+			}
+		}
+
+		self.current_file = prev_file;
+		current_ctx.next_type_var_id = self.next_type_var_id;
+		self
+			.module_cache
+			.insert(cache_key, ModuleStatus::Complete(current_ctx.clone()));
+
+		current_ctx
 	}
 
 	/// Check an interface declaration and extract its members
 	fn process_interface(
 		&mut self,
-		_name: &EcoString,
+		name: &EcoString,
+		super_interfaces: &[Spanned<(Ident, Vec<Spanned<ast::types::GenericArg>>)>],
 		members: &[Spanned<InterfaceMember>],
 		ctx: &Context,
-	) -> Result<BTreeMap<EcoString, StructMember>, TypeError> {
+	) -> Result<(BTreeMap<EcoString, StructMember>, BTreeMap<EcoString, Type>), TypeError> {
 		let mut interface_members = BTreeMap::new();
+		let mut implied_interfaces = BTreeMap::new();
 
-		// Add `this` to the context for default implementations, typed as the self type
 		let this_type = ctx
 			.self_type
 			.clone()
@@ -2296,12 +4318,20 @@ impl TypeChecker {
 		let member_ctx = ctx.with_new_entry(
 			EcoString::from("this"),
 			ContextEntry::Value(ContextValue {
-				type_: this_type,
+				type_: this_type.clone(),
 				mutable: false,
 				visibility: Visibility::Private,
 			}),
 		);
 
+		for super_interface in super_interfaces {
+			let Spanned((interface_name, interface_generics), interface_span) = super_interface;
+			let interface_ty =
+				self.resolve_qualified_type(&interface_name.0, interface_generics, *interface_span, ctx)?;
+			implied_interfaces.insert(interface_name.0.clone(), interface_ty);
+		}
+
+		// Pass 1: collect signatures and implied interfaces so default bodies can see the full contract.
 		for member_spanned in members {
 			match &member_spanned.0 {
 				InterfaceMember::Element(elem_spanned) => {
@@ -2315,7 +4345,11 @@ impl TypeChecker {
 					// Namespace members in interface (static members — no `this`)
 					for impl_member in impl_members {
 						if let Some((name, struct_member)) =
-							self.check_impl_member(impl_member, ctx, StructMemberKind::Namespace)?
+							self.collect_impl_member_signature(
+								impl_member,
+								ctx,
+								StructMemberKind::Namespace,
+							)?
 						{
 							interface_members.insert(name, struct_member);
 						}
@@ -2341,42 +4375,384 @@ impl TypeChecker {
 								StructMember {
 									type_: member.type_,
 									kind: StructMemberKind::Mutable,
+									required: member.required,
 								},
 							);
 						}
 					}
 				}
 				InterfaceMember::Impl {
-					interface: _,
-					generics: _,
+					interface: (interface_ident, interface_generics),
+					generics,
 					members: impl_members,
 				} => {
-					// Impl blocks inside interface
-					for impl_member in impl_members {
-						if let Some((name, struct_member)) =
-							self.check_impl_member(impl_member, &member_ctx, StructMemberKind::Immutable)?
-						{
-							interface_members.insert(name, struct_member);
-						}
+					let (_generic_params, impl_ctx) = self.resolve_generic_params(generics, &member_ctx)?;
+					let interface_ty = self.resolve_qualified_type(
+						&interface_ident.0,
+						interface_generics,
+						interface_ident.1,
+						&impl_ctx,
+					)?;
+					let provided_members = self.collect_impl_member_signatures(
+						impl_members,
+						&impl_ctx,
+						StructMemberKind::Immutable,
+					)?;
+					for (member_name, member) in provided_members {
+						interface_members.insert(member_name, member);
+					}
+					if let Type::Interface { name, .. } = &interface_ty {
+						implied_interfaces.insert(name.clone(), interface_ty);
 					}
 				}
 			}
 		}
 
-		Ok(interface_members)
+		let full_interface_type = match this_type.clone() {
+			Type::Variable { id, name: self_name, .. } => Type::Variable {
+				id,
+				name: self_name,
+				constraint: Some(Box::new(Type::Interface {
+					name: name.clone(),
+					generics: match &ctx.self_type {
+						Some(Type::Variable {
+							constraint: Some(constraint),
+							..
+						}) => match constraint.as_ref() {
+							Type::Interface { generics, .. } => generics.clone(),
+							_ => Arc::new(Vec::new()),
+						},
+						_ => Arc::new(Vec::new()),
+					},
+					type_args: match &ctx.self_type {
+						Some(Type::Variable {
+							constraint: Some(constraint),
+							..
+						}) => match constraint.as_ref() {
+							Type::Interface { type_args, .. } => type_args.clone(),
+							_ => Vec::new(),
+						},
+						_ => Vec::new(),
+					},
+					members: Arc::new(interface_members.clone()),
+					impls: Arc::new(implied_interfaces.clone()),
+					def_key: None,
+				})),
+			},
+			other => other,
+		};
+		let body_ctx = ctx
+			.with_self_type(full_interface_type.clone())
+			.with_new_entry(
+				EcoString::from("this"),
+				ContextEntry::Value(ContextValue {
+					type_: full_interface_type.clone(),
+					mutable: false,
+					visibility: Visibility::Private,
+				}),
+			);
+		let mutable_body_ctx = ctx
+			.with_self_type(full_interface_type.clone())
+			.with_new_entry(
+				EcoString::from("this"),
+				ContextEntry::Value(ContextValue {
+					type_: full_interface_type.clone(),
+					mutable: true,
+					visibility: Visibility::Private,
+				}),
+			);
+		let _namespace_ctx = ctx.with_self_type(full_interface_type.clone());
+
+		for member_spanned in members {
+			match &member_spanned.0 {
+				InterfaceMember::Element(elem_spanned) => {
+					if let InterfaceElement::Func { meta, body } = &elem_spanned.0
+						&& meta.return_type.is_none()
+						&& body.is_some()
+					{
+						interface_members.insert(
+							meta.name.0.clone(),
+							self.collect_interface_func_signature(
+								meta,
+								body.as_ref(),
+								&body_ctx,
+								true,
+							)?,
+						);
+					}
+				}
+				InterfaceMember::ImplMut(elements) => {
+					for elem in elements {
+						if let InterfaceElement::Func { meta, body } = &elem.0
+							&& meta.return_type.is_none()
+							&& body.is_some()
+						{
+							let mut member = self.collect_interface_func_signature(
+								meta,
+								body.as_ref(),
+								&mutable_body_ctx,
+								true,
+							)?;
+							member.kind = StructMemberKind::Mutable;
+							interface_members.insert(meta.name.0.clone(), member);
+						}
+					}
+				}
+				InterfaceMember::Namespace(_) | InterfaceMember::Impl { .. } => {}
+			}
+		}
+
+		let full_interface_type = match this_type.clone() {
+			Type::Variable { id, name: self_name, .. } => Type::Variable {
+				id,
+				name: self_name,
+				constraint: Some(Box::new(Type::Interface {
+					name: name.clone(),
+					generics: match &ctx.self_type {
+						Some(Type::Variable {
+							constraint: Some(constraint),
+							..
+						}) => match constraint.as_ref() {
+							Type::Interface { generics, .. } => generics.clone(),
+							_ => Arc::new(Vec::new()),
+						},
+						_ => Arc::new(Vec::new()),
+					},
+					type_args: match &ctx.self_type {
+						Some(Type::Variable {
+							constraint: Some(constraint),
+							..
+						}) => match constraint.as_ref() {
+							Type::Interface { type_args, .. } => type_args.clone(),
+							_ => Vec::new(),
+						},
+						_ => Vec::new(),
+					},
+					members: Arc::new(interface_members.clone()),
+					impls: Arc::new(implied_interfaces.clone()),
+					def_key: None,
+				})),
+			},
+			other => other,
+		};
+		let body_ctx = ctx
+			.with_self_type(full_interface_type.clone())
+			.with_new_entry(
+				EcoString::from("this"),
+				ContextEntry::Value(ContextValue {
+					type_: full_interface_type.clone(),
+					mutable: false,
+					visibility: Visibility::Private,
+				}),
+			);
+		let mutable_body_ctx = ctx
+			.with_self_type(full_interface_type.clone())
+			.with_new_entry(
+				EcoString::from("this"),
+				ContextEntry::Value(ContextValue {
+					type_: full_interface_type.clone(),
+					mutable: true,
+					visibility: Visibility::Private,
+				}),
+			);
+		let namespace_ctx = ctx.with_self_type(full_interface_type.clone());
+
+		// Pass 2: type-check default bodies against the completed interface contract.
+		for member_spanned in members {
+			match &member_spanned.0 {
+				InterfaceMember::Element(elem_spanned) => {
+					self.check_interface_element_body(&elem_spanned.0, &body_ctx)?;
+				}
+				InterfaceMember::Namespace(impl_members) => {
+					for impl_member in impl_members {
+						self.check_impl_member_body(impl_member, &namespace_ctx)?;
+					}
+				}
+				InterfaceMember::ImplMut(elements) => {
+					for elem in elements {
+						self.check_interface_element_body(&elem.0, &mutable_body_ctx)?;
+					}
+				}
+				InterfaceMember::Impl {
+					interface: (interface_ident, interface_generics),
+					generics,
+					members: impl_members,
+				} => {
+					let (generic_params, impl_ctx) =
+						self.resolve_generic_params(generics, &body_ctx)?;
+					let interface_ty = self.resolve_qualified_type(
+						&interface_ident.0,
+						interface_generics,
+						interface_ident.1,
+						&impl_ctx,
+					)?;
+					let provided_members = self.collect_impl_member_signatures(
+						impl_members,
+						&impl_ctx,
+						StructMemberKind::Immutable,
+					)?;
+					self.validate_interface_impl(
+						&full_interface_type,
+						&interface_ty,
+						&provided_members,
+						member_spanned.1,
+						&impl_ctx,
+					)?;
+
+					let impl_body_ctx = impl_ctx.with_impl_record(ImplRecord {
+						generics: Arc::new(generic_params),
+						receiver: full_interface_type.clone(),
+						interface: interface_ty,
+						span: span_to_range(member_spanned.1),
+					});
+					for impl_member in impl_members {
+						self.check_impl_member_body(impl_member, &impl_body_ctx)?;
+					}
+				}
+			}
+		}
+
+		Ok((interface_members, implied_interfaces))
 	}
 
-	/// Type-check an interface element (let or func with optional default implementation)
+	/// Collect an interface element signature without type-checking its default body.
+	fn collect_interface_func_signature(
+		&mut self,
+		meta: &FuncDeclaration,
+		body: Option<&Spanned<Expr>>,
+		ctx: &Context,
+		infer_unannotated_return: bool,
+	) -> Result<StructMember, TypeError> {
+		let mut func_ctx = ctx.clone();
+		let mut generic_params = Vec::with_capacity(meta.generics.len());
+
+		for generic in &meta.generics {
+			let constraint = match &generic.0.constraint {
+				Some(c) => Some(self.resolve_ast_type(&c.0, c.1, ctx)?),
+				None => None,
+			};
+			let id = self.fresh_type_var_id();
+			generic_params.push(GenericParamInfo {
+				id,
+				name: generic.0.name.0.clone(),
+				constraint: constraint.clone(),
+				default: None,
+			});
+			func_ctx.insert_entry(
+				generic.0.name.0.clone(),
+				ContextEntry::Value(ContextValue {
+					type_: Type::Variable {
+						id,
+						name: generic.0.name.0.clone(),
+						constraint: constraint.map(Box::new),
+					},
+					mutable: false,
+					visibility: Visibility::Private,
+				}),
+			);
+		}
+
+		let mut param_types = Vec::new();
+		for param in &meta.params {
+			let param_type = self.resolve_func_param_type(param, &func_ctx)?;
+			let param_name = match &param.0.name.0 {
+				Pattern::Binding { name, .. } => Some(name.0.clone()),
+				Pattern::Struct { path, fields } if path.len() == 1 && fields.is_empty() => {
+					Some(path[0].0.clone())
+				}
+				_ => None,
+			};
+
+			param_types.push((param_name.clone(), param_type.clone()));
+
+			if let Some(name) = param_name {
+				func_ctx.insert_entry(
+					name,
+					ContextEntry::Value(ContextValue {
+						type_: param_type,
+						mutable: param.0.mutable,
+						visibility: Visibility::Private,
+					}),
+				);
+			}
+		}
+
+		let return_type = match (&meta.return_type, body, infer_unannotated_return) {
+			(Some(t), _, _) => self.resolve_ast_type(&t.0, t.1, ctx)?,
+			(None, Some(body_expr), true) => self.infer(body_expr, &func_ctx)?,
+			(None, Some(_), false) => self.fresh_var("_infer", None),
+			(None, None, _) => Type::Void,
+		};
+
+		Ok(StructMember {
+			type_: Box::new(Type::Function {
+				generics: Arc::new(generic_params),
+				params: param_types,
+				has_spread: meta.params.last().is_some_and(|p| p.0.spread),
+				return_type: Box::new(return_type),
+				constructor: false,
+			}),
+			kind: StructMemberKind::Immutable,
+			required: body.is_none(),
+		})
+	}
+
 	fn check_interface_element(
 		&mut self,
 		element: &InterfaceElement,
 		ctx: &Context,
 	) -> Result<Option<(EcoString, StructMember)>, TypeError> {
 		match element {
-			InterfaceElement::Func { meta, body } => {
-				let mut func_ctx = ctx.clone();
+			InterfaceElement::Func { meta, body } => Ok(Some((
+				meta.name.0.clone(),
+				self.collect_interface_func_signature(meta, body.as_ref(), ctx, false)?,
+			))),
+			InterfaceElement::Let { meta, value } => {
+				let let_type = match &meta.type_ {
+					Some(t) => self.resolve_ast_type(&t.0, t.1, ctx)?,
+					None => {
+						// Infer from default value if present
+						if let Some(val) = value {
+							self.infer(val, ctx)?
+						} else {
+							self.fresh_var("_infer", None)
+						}
+					}
+				};
 
-				// Add generics to context
+				let name = match &meta.name.0 {
+					Pattern::Binding { name, .. } => name.0.clone(),
+					_ => return Ok(None),
+				};
+
+				Ok(Some((
+					name,
+					StructMember {
+						type_: Box::new(let_type),
+						kind: if meta.mutable {
+							StructMemberKind::Mutable
+						} else {
+							StructMemberKind::Immutable
+						},
+						required: value.is_none(),
+					},
+				)))
+			}
+		}
+	}
+
+	fn check_interface_element_body(
+		&mut self,
+		element: &InterfaceElement,
+		ctx: &Context,
+	) -> Result<(), TypeError> {
+		match element {
+			InterfaceElement::Func { meta, body } => {
+				let Some(body_expr) = body else {
+					return Ok(());
+				};
+
+				let mut func_ctx = ctx.clone();
 				for generic in &meta.generics {
 					let constraint = match &generic.0.constraint {
 						Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, ctx)?)),
@@ -2397,22 +4773,15 @@ impl TypeChecker {
 					);
 				}
 
-				// Extract function signature
-				let mut param_types = Vec::new();
 				for param in &meta.params {
-					let param_type = self.resolve_ast_type(&param.0.type_.0, param.0.type_.1, &func_ctx)?;
-
-					// Extract parameter name from pattern
+					let param_type = self.resolve_func_param_type(param, &func_ctx)?;
 					let param_name = match &param.0.name.0 {
 						Pattern::Binding { name, .. } => Some(name.0.clone()),
-						// Handle bare identifiers parsed as struct patterns with no fields
 						Pattern::Struct { path, fields } if path.len() == 1 && fields.is_empty() => {
 							Some(path[0].0.clone())
 						}
 						_ => None,
 					};
-
-					param_types.push((param_name.clone(), param_type.clone()));
 
 					if let Some(name) = param_name {
 						func_ctx.insert_entry(
@@ -2428,78 +4797,40 @@ impl TypeChecker {
 
 				let return_type = match &meta.return_type {
 					Some(t) => self.resolve_ast_type(&t.0, t.1, ctx)?,
-					None => Type::Void,
+					None => self.infer(body_expr, &func_ctx)?,
 				};
-
-				// Type-check default body if present
-				if let Some(body_expr) = body {
-					let inferred_return = self.infer(body_expr, &func_ctx)?;
-					if !inferred_return.assignable_to(&return_type, &func_ctx) {
-						return Err(TypeError::TypeMismatch {
-							expected: return_type.clone().into(),
-							found: inferred_return.into(),
-							span: span_to_range(body_expr.1),
-						});
-					}
+				let checked_return = self.check_expr(body_expr, &return_type, &func_ctx)?;
+				if !checked_return.assignable_to(&return_type, &func_ctx) {
+					return Err(TypeError {
+						kind: TypeErrorKind::TypeMismatch {
+							expected: return_type.into(),
+							found: checked_return.into(),
+						},
+						span: span_to_range(body_expr.1),
+					});
 				}
-
-				let func_type = Type::Function {
-					generics: Arc::new(Vec::new()),
-					params: param_types,
-					has_spread: meta.params.last().is_some_and(|p| p.0.spread),
-					return_type: Box::new(return_type),
-					constructor: false,
-				};
-
-				Ok(Some((
-					meta.name.0.clone(),
-					StructMember {
-						type_: Box::new(func_type),
-						kind: StructMemberKind::Immutable,
-					},
-				)))
+				Ok(())
 			}
 			InterfaceElement::Let { meta, value } => {
+				let Some(val) = value else {
+					return Ok(());
+				};
+
 				let let_type = match &meta.type_ {
 					Some(t) => self.resolve_ast_type(&t.0, t.1, ctx)?,
-					None => {
-						// Infer from default value if present
-						if let Some(val) = value {
-							self.infer(val, ctx)?
-						} else {
-							self.fresh_var("_infer", None)
-						}
-					}
+					None => self.infer(val, ctx)?,
 				};
-
-				// Type-check default value if present
-				if let Some(val) = value {
-					let val_type = self.infer(val, ctx)?;
-					if !val_type.assignable_to(&let_type, ctx) {
-						return Err(TypeError::TypeMismatch {
-							expected: let_type.clone().into(),
+				let val_type = self.infer(val, ctx)?;
+				if !val_type.assignable_to(&let_type, ctx) {
+					return Err(TypeError {
+						kind: TypeErrorKind::TypeMismatch {
+							expected: let_type.into(),
 							found: val_type.into(),
-							span: span_to_range(val.1),
-						});
-					}
-				}
-
-				let name = match &meta.name.0 {
-					Pattern::Binding { name, .. } => name.0.clone(),
-					_ => return Ok(None),
-				};
-
-				Ok(Some((
-					name,
-					StructMember {
-						type_: Box::new(let_type),
-						kind: if meta.mutable {
-							StructMemberKind::Mutable
-						} else {
-							StructMemberKind::Immutable
 						},
-					},
-				)))
+						span: span_to_range(val.1),
+					});
+				}
+				Ok(())
 			}
 		}
 	}
@@ -2542,6 +4873,7 @@ impl TypeChecker {
 						StructMember {
 							type_: Box::new(final_type),
 							kind,
+							required: false,
 						},
 					)))
 				} else {
@@ -2550,6 +4882,7 @@ impl TypeChecker {
 			}
 			ImplMember::ExternalLet(
 				_visibility,
+				_external_name,
 				LetDeclaration {
 					name,
 					type_,
@@ -2575,6 +4908,7 @@ impl TypeChecker {
 						StructMember {
 							type_: Box::new(let_type),
 							kind,
+							required: false,
 						},
 					)))
 				} else {
@@ -2593,6 +4927,7 @@ impl TypeChecker {
 				body: _,
 			}
 			| ImplMember::ExternalFunc(
+				_,
 				_,
 				FuncDeclaration {
 					name: Spanned(func_name, _),
@@ -2672,6 +5007,7 @@ impl TypeChecker {
 					StructMember {
 						type_: Box::new(func_type),
 						kind: member_kind,
+						required: false,
 					},
 				)))
 			}
@@ -2760,16 +5096,18 @@ impl TypeChecker {
 					}
 				}
 
-				let inferred_return = self.infer(body, &func_ctx)?;
 				let expected_return = match return_type {
 					Some(t) => self.resolve_ast_type(&t.0, t.1, member_ctx)?,
-					None => inferred_return.clone(),
+					None => self.infer(body, &func_ctx)?,
 				};
+				let inferred_return = self.check_expr(body, &expected_return, &func_ctx)?;
 
 				if !inferred_return.assignable_to(&expected_return, &func_ctx) {
-					return Err(TypeError::TypeMismatch {
-						expected: expected_return.into(),
-						found: inferred_return.into(),
+					return Err(TypeError {
+						kind: TypeErrorKind::TypeMismatch {
+							expected: expected_return.into(),
+							found: inferred_return.into(),
+						},
 						span: span_to_range(body.1),
 					});
 				}
@@ -2793,6 +5131,279 @@ impl TypeChecker {
 		Ok(sig)
 	}
 
+	fn collect_impl_member_signatures(
+		&mut self,
+		members: &[Spanned<ImplMember>],
+		member_ctx: &Context,
+		member_kind: StructMemberKind,
+	) -> Result<BTreeMap<EcoString, StructMember>, TypeError> {
+		let mut signatures = BTreeMap::new();
+		for member in members {
+			if let Some((name, signature)) =
+				self.collect_impl_member_signature(member, member_ctx, member_kind)?
+			{
+				signatures.insert(name, signature);
+			}
+		}
+		Ok(signatures)
+	}
+
+	fn collect_interface_contract_members(
+		&self,
+		receiver: &Type,
+		interface: &Type,
+		members: &mut BTreeMap<EcoString, StructMember>,
+	) {
+		let normalized = self.substitute_self_type(interface, receiver);
+		let Type::Interface {
+			members: local_members,
+			impls,
+			..
+		} = normalized
+		else {
+			return;
+		};
+
+		for (name, member) in local_members.iter() {
+			members
+				.entry(name.clone())
+				.or_insert_with(|| member.clone());
+		}
+
+		for implied in impls.values() {
+			self.collect_interface_contract_members(receiver, implied, members);
+		}
+	}
+
+	fn validate_interface_impl(
+		&self,
+		receiver: &Type,
+		interface: &Type,
+		provided_members: &BTreeMap<EcoString, StructMember>,
+		span: Span,
+		ctx: &Context,
+	) -> Result<(), TypeError> {
+		let mut contract_members = BTreeMap::new();
+		self.collect_interface_contract_members(receiver, interface, &mut contract_members);
+
+		for (name, provided_member) in provided_members {
+			let Some(expected_member) = contract_members.get(name) else {
+				return Err(TypeError {
+					kind: TypeErrorKind::UnknownMember {
+						type_: interface.clone().into(),
+						member: name.clone(),
+						suggestion: find_similar_name(name, contract_members.keys()),
+					},
+					span: span_to_range(span),
+				});
+			};
+
+			let provided_type = provided_member.type_.as_ref();
+			let expected_type = expected_member.type_.as_ref();
+			if !self.type_satisfies(provided_type, expected_type, ctx)
+				|| !self.type_satisfies(expected_type, provided_type, ctx)
+			{
+				return Err(TypeError {
+					kind: TypeErrorKind::IncompatibleImplMember {
+						member: name.clone(),
+						expected: expected_type.clone().into(),
+						found: provided_type.clone().into(),
+					},
+					span: span_to_range(span),
+				});
+			}
+		}
+
+		let missing_members: Vec<_> = contract_members
+			.iter()
+			.filter(|(name, member)| member.required && !provided_members.contains_key(*name))
+			.map(|(name, _)| name.clone())
+			.collect();
+
+		if missing_members.is_empty() {
+			Ok(())
+		} else {
+			Err(TypeError {
+				kind: TypeErrorKind::MissingImplMembers {
+					type_: receiver.clone().into(),
+					interface: interface.clone().into(),
+					members: missing_members,
+				},
+				span: span_to_range(span),
+			})
+		}
+	}
+
+	fn types_overlap(&self, left: &Type, right: &Type) -> bool {
+		let mut left_subst = HashMap::new();
+		let mut right_subst = HashMap::new();
+		self.types_overlap_inner(left, right, &mut left_subst, &mut right_subst)
+	}
+
+	fn types_overlap_inner(
+		&self,
+		left: &Type,
+		right: &Type,
+		left_subst: &mut HashMap<TypeVarId, Type>,
+		right_subst: &mut HashMap<TypeVarId, Type>,
+	) -> bool {
+		match (left, right) {
+			(Type::Never, _) | (_, Type::Never) => false,
+			(Type::Variable { id, .. }, _) => match left_subst.get(id).cloned() {
+				Some(existing) => self.types_overlap_inner(&existing, right, left_subst, right_subst),
+				None => {
+					left_subst.insert(*id, right.clone());
+					true
+				}
+			},
+			(_, Type::Variable { id, .. }) => match right_subst.get(id).cloned() {
+				Some(existing) => self.types_overlap_inner(left, &existing, left_subst, right_subst),
+				None => {
+					right_subst.insert(*id, left.clone());
+					true
+				}
+			},
+			(Type::Int, Type::Int)
+			| (Type::Float, Type::Float)
+			| (Type::Char, Type::Char)
+			| (Type::String, Type::String)
+			| (Type::Boolean, Type::Boolean)
+			| (Type::Void, Type::Void) => true,
+			(Type::List { item: left_item }, Type::List { item: right_item }) => {
+				self.types_overlap_inner(left_item, right_item, left_subst, right_subst)
+			}
+			(Type::Tuple { items: left_items }, Type::Tuple { items: right_items }) => {
+				left_items.len() == right_items.len()
+					&& left_items
+						.iter()
+						.zip(right_items)
+						.all(|(left_item, right_item)| {
+							self.types_overlap_inner(left_item, right_item, left_subst, right_subst)
+						})
+			}
+			(
+				Type::Map {
+					key: left_key,
+					value: left_value,
+				},
+				Type::Map {
+					key: right_key,
+					value: right_value,
+				},
+			) => {
+				self.types_overlap_inner(left_key, right_key, left_subst, right_subst)
+					&& self.types_overlap_inner(left_value, right_value, left_subst, right_subst)
+			}
+			(
+				Type::Function {
+					params: left_params,
+					return_type: left_return,
+					..
+				},
+				Type::Function {
+					params: right_params,
+					return_type: right_return,
+					..
+				},
+			) => {
+				left_params.len() == right_params.len()
+					&& left_params
+						.iter()
+						.zip(right_params)
+						.all(|((_, left_param), (_, right_param))| {
+							self.types_overlap_inner(left_param, right_param, left_subst, right_subst)
+						}) && self.types_overlap_inner(left_return, right_return, left_subst, right_subst)
+			}
+			(
+				Type::Struct {
+					type_args: left_args,
+					..
+				},
+				Type::Struct {
+					type_args: right_args,
+					..
+				},
+			)
+			| (
+				Type::Enum {
+					type_args: left_args,
+					..
+				},
+				Type::Enum {
+					type_args: right_args,
+					..
+				},
+			)
+			| (
+				Type::Interface {
+					type_args: left_args,
+					..
+				},
+				Type::Interface {
+					type_args: right_args,
+					..
+				},
+			) => {
+				self.same_type_identity(left, right)
+					&& left_args.len() == right_args.len()
+					&& left_args
+						.iter()
+						.zip(right_args)
+						.all(|(left_arg, right_arg)| {
+							self.types_overlap_inner(left_arg, right_arg, left_subst, right_subst)
+						})
+			}
+			(
+				Type::EnumVariant {
+					variant_name: left_variant,
+					variant_of: left_of,
+					..
+				},
+				Type::EnumVariant {
+					variant_name: right_variant,
+					variant_of: right_of,
+					..
+				},
+			) => {
+				left_variant == right_variant
+					&& self.types_overlap_inner(left_of, right_of, left_subst, right_subst)
+			}
+			(Type::Intersection { first, second }, _) => {
+				self.types_overlap_inner(first, right, left_subst, right_subst)
+					&& self.types_overlap_inner(second, right, left_subst, right_subst)
+			}
+			(_, Type::Intersection { first, second }) => {
+				self.types_overlap_inner(left, first, left_subst, right_subst)
+					&& self.types_overlap_inner(left, second, left_subst, right_subst)
+			}
+			(Type::Module { .. }, Type::Module { .. }) => self.same_type_identity(left, right),
+			_ => false,
+		}
+	}
+
+	fn check_conflicting_impl_record(
+		&self,
+		record: &ImplRecord,
+		existing_records: &[ImplRecord],
+	) -> Result<(), TypeError> {
+		if let Some(existing) = existing_records.iter().find(|existing| {
+			self.types_overlap(&record.receiver, &existing.receiver)
+				&& self.types_overlap(&record.interface, &existing.interface)
+		}) {
+			return Err(TypeError {
+				kind: TypeErrorKind::ConflictingImpls {
+					receiver: record.receiver.clone().into(),
+					interface: record.interface.clone().into(),
+					first_span: existing.span.clone(),
+					second_span: record.span.clone(),
+				},
+				span: record.span.clone(),
+			});
+		}
+
+		Ok(())
+	}
+
 	/// Type-check struct/enum inner members and return the processed members map
 	/// Also returns a list of interface implementations
 	fn process_struct_members(
@@ -2803,6 +5414,7 @@ impl TypeChecker {
 	) -> Result<ProcessMembersResult, TypeError> {
 		let mut result_members = BTreeMap::new();
 		let mut result_impls = BTreeMap::new();
+		let mut result_impl_records = Vec::new();
 
 		// Add constructor to context based on self_type, and set self_type in context
 		let base_ctx_with_self = base_ctx.with_self_type(self_type.clone());
@@ -2933,41 +5545,43 @@ impl TypeChecker {
 					}
 				}
 				StructInnerMember::Impl {
-					interface: (interface_ident, _generics),
+					interface: (interface_ident, interface_generics),
 					generics: impl_generics,
 					members: impl_members,
 				} => {
-					let mut impl_ctx = sig_ctx.clone();
-					for generic in impl_generics {
-						let constraint = match &generic.0.constraint {
-							Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, &sig_ctx)?)),
-							None => None,
-						};
-						let id = self.fresh_type_var_id();
-						impl_ctx.insert_entry(
-							generic.0.name.0.clone(),
-							ContextEntry::Value(ContextValue {
-								type_: Type::Variable {
-									id,
-									name: generic.0.name.0.clone(),
-									constraint,
-								},
-								mutable: false,
-								visibility: Visibility::Private,
-							}),
-						);
-					}
+					let (impl_generic_params, impl_ctx) =
+						self.resolve_generic_params(impl_generics, &sig_ctx)?;
+					let interface_ty = self.resolve_qualified_type(
+						&interface_ident.0,
+						interface_generics,
+						interface_ident.1,
+						&impl_ctx,
+					)?;
+					let provided_members = self.collect_impl_member_signatures(
+						impl_members,
+						&impl_ctx,
+						StructMemberKind::Immutable,
+					)?;
+					self.validate_interface_impl(
+						self_type,
+						&interface_ty,
+						&provided_members,
+						member_spanned.1,
+						&impl_ctx,
+					)?;
 
-					let Spanned(interface_name, interface_span) = interface_ident;
-					let interface_ty =
-						base_ctx
-							.lookup_type(interface_name)
-							.ok_or_else(|| TypeError::UnknownType {
-								name: interface_name.clone(),
-								suggestion: find_similar_name(interface_name, base_ctx.local_ctx.keys()),
-								span: span_to_range(*interface_span),
-							})?;
-					result_impls.insert(interface_name.clone(), interface_ty);
+					let impl_record = ImplRecord {
+						generics: Arc::new(impl_generic_params),
+						receiver: self_type.clone(),
+						interface: interface_ty.clone(),
+						span: span_to_range(member_spanned.1),
+					};
+					self.check_conflicting_impl_record(&impl_record, &result_impl_records)?;
+					result_impl_records.push(impl_record.clone());
+
+					if let Type::Interface { name, .. } = &interface_ty {
+						result_impls.insert(name.clone(), interface_ty.clone());
+					}
 
 					for impl_member in impl_members {
 						if let Some((name, struct_member)) = self.collect_impl_member_signature(
@@ -2979,7 +5593,7 @@ impl TypeChecker {
 						}
 						all_members.push(DeferredMember {
 							member: impl_member,
-							base_ctx: impl_ctx.clone(),
+							base_ctx: impl_ctx.with_impl_record(impl_record.clone()),
 							kind: StructMemberKind::Immutable,
 							mutable_this: false,
 							has_this: true,
@@ -3082,7 +5696,7 @@ impl TypeChecker {
 				}
 				let mut param_types = Vec::new();
 				for param in params {
-					let param_type = self.resolve_ast_type(&param.0.type_.0, param.0.type_.1, &func_ctx)?;
+					let param_type = self.resolve_func_param_type(param, &func_ctx)?;
 					let param_name = match &param.0.name.0 {
 						Pattern::Binding { name, .. } => Some(name.0.clone()),
 						Pattern::Struct { path, fields } if path.len() == 1 && fields.is_empty() => {
@@ -3117,6 +5731,7 @@ impl TypeChecker {
 					StructMember {
 						type_: Box::new(func_type),
 						kind: dm.kind,
+						required: false,
 					},
 				);
 			}
@@ -3143,42 +5758,56 @@ impl TypeChecker {
 			self.check_impl_member_body(dm.member, &body_ctx)?;
 		}
 
-		Ok((result_members, result_impls))
+		Ok((result_members, result_impls, result_impl_records))
 	}
 
 	/// Check an impl declaration and register implementations
 	/// If `ty` is an enum, inject its variant constructors into `ctx` and return the extended context.
 	/// Otherwise, return `ctx` unchanged.
-	fn inject_enum_variants(&self, ty: &Type, ctx: &Context) -> Context {
-		if let Type::Enum { variants, .. } = ty {
-			let mut ctx = ctx.clone();
-			for (variant_name, variant_fields) in variants.iter() {
+	fn enum_variant_context_entries(
+		ty: &Type,
+		visibility: Visibility,
+	) -> Vec<(EcoString, ContextEntry)> {
+		let Type::Enum { variants, .. } = ty else {
+			return Vec::new();
+		};
+
+		variants
+			.iter()
+			.map(|(variant_name, variant_fields)| {
 				let mut param_types = Vec::new();
 				for (field_name, field_type) in variant_fields {
 					param_types.push((Some(field_name.clone()), field_type.clone()));
 				}
 
-				let variant_type = Type::Function {
-					generics: Arc::new(Vec::new()),
-					params: param_types,
-					has_spread: false,
-					return_type: Box::new(ty.clone()),
-					constructor: false,
-				};
-
-				ctx.insert_entry(
+				(
 					variant_name.clone(),
 					ContextEntry::Value(ContextValue {
-						type_: variant_type,
+						type_: Type::Function {
+							generics: Arc::new(Vec::new()),
+							params: param_types,
+							has_spread: false,
+							return_type: Box::new(ty.clone()),
+							constructor: false,
+						},
 						mutable: false,
-						visibility: Visibility::Private,
+						visibility,
 					}),
-				);
-			}
-			ctx
-		} else {
-			ctx.clone()
+				)
+			})
+			.collect()
+	}
+
+	fn inject_enum_variants(&self, ty: &Type, ctx: &Context) -> Context {
+		if !matches!(ty, Type::Enum { .. }) {
+			return ctx.clone();
 		}
+
+		let mut ctx = ctx.clone();
+		for (name, entry) in Self::enum_variant_context_entries(ty, Visibility::Private) {
+			ctx.insert_entry(name, entry);
+		}
+		ctx
 	}
 
 	fn process_impl(&mut self, impl_decl: &Declaration, ctx: &Context) -> Result<Context, TypeError> {
@@ -3188,46 +5817,20 @@ impl TypeChecker {
 				generics,
 				mutable,
 				type_,
-				for_interface: (interface_ident, _generics),
+				for_interface: (interface_ident, interface_generics),
 				members,
 			} => {
-				let mut impl_ctx = ctx.clone();
-				for generic in generics {
-					let constraint = match &generic.0.constraint {
-						Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, ctx)?)),
-						None => None,
-					};
-					let id = self.fresh_type_var_id();
-					impl_ctx.insert_entry(
-						generic.0.name.0.clone(),
-						ContextEntry::Value(ContextValue {
-							type_: Type::Variable {
-								id,
-								name: generic.0.name.0.clone(),
-								constraint,
-							},
-							mutable: false,
-							visibility: Visibility::Private,
-						}),
-					);
-				}
-
-				// Resolve the type being implemented
+				let (generic_params, impl_ctx) = self.resolve_generic_params(generics, ctx)?;
 				let ty = self.resolve_ast_type(&type_.0, type_.1, &impl_ctx)?;
+				let interface_ctx = impl_ctx.with_self_type(ty.clone());
+				let interface_ty = self.resolve_qualified_type(
+					&interface_ident.0,
+					interface_generics,
+					interface_ident.1,
+					&interface_ctx,
+				)?;
 
-				// Resolve the interface
-				let Spanned(interface_name, interface_span) = interface_ident;
-				let interface_ty =
-					impl_ctx
-						.lookup_type(interface_name)
-						.ok_or_else(|| TypeError::UnknownType {
-							name: interface_name.clone(),
-							suggestion: find_similar_name(interface_name, impl_ctx.local_ctx.keys()),
-							span: span_to_range(*interface_span),
-						})?;
-
-				// Set up context with self_type and this for member type-checking
-				let member_ctx = impl_ctx.with_self_type(ty.clone()).with_new_entry(
+				let member_ctx = interface_ctx.with_new_entry(
 					EcoString::from("this"),
 					ContextEntry::Value(ContextValue {
 						type_: ty.clone(),
@@ -3242,19 +5845,30 @@ impl TypeChecker {
 				} else {
 					StructMemberKind::Immutable
 				};
+				let provided_members =
+					self.collect_impl_member_signatures(members, &member_ctx, member_kind)?;
+				self.validate_interface_impl(
+					&ty,
+					&interface_ty,
+					&provided_members,
+					interface_ident.1,
+					&member_ctx,
+				)?;
 
+				let impl_record = ImplRecord {
+					generics: Arc::new(generic_params),
+					receiver: ty.clone(),
+					interface: interface_ty,
+					span: span_to_range(interface_ident.1),
+				};
+				self.check_conflicting_impl_record(&impl_record, &ctx.impl_records)?;
+
+				let body_ctx = member_ctx.with_impl_record(impl_record.clone());
 				for member in members {
-					self.check_impl_member(member, &member_ctx, member_kind)?;
+					self.check_impl_member_body(member, &body_ctx)?;
 				}
 
-				// Register the implementation
-				if let Type::Struct { name, .. } | Type::Enum { name, .. } = &ty {
-					Ok(ctx.with_impl(name.clone(), interface_ty))
-				} else if let Type::Module { name, .. } = &ty {
-					Ok(ctx.with_impl(name.clone(), interface_ty))
-				} else {
-					Ok(ctx.clone())
-				}
+				Ok(ctx.with_impl_record(impl_record))
 			}
 			Declaration::Impl {
 				visibility: _,
@@ -3263,28 +5877,7 @@ impl TypeChecker {
 				type_,
 				members,
 			} => {
-				let mut impl_ctx = ctx.clone();
-				for generic in generics {
-					let constraint = match &generic.0.constraint {
-						Some(c) => Some(Box::new(self.resolve_ast_type(&c.0, c.1, ctx)?)),
-						None => None,
-					};
-					let id = self.fresh_type_var_id();
-					impl_ctx.insert_entry(
-						generic.0.name.0.clone(),
-						ContextEntry::Value(ContextValue {
-							type_: Type::Variable {
-								id,
-								name: generic.0.name.0.clone(),
-								constraint,
-							},
-							mutable: false,
-							visibility: Visibility::Private,
-						}),
-					);
-				}
-
-				// Resolve the type being implemented on
+				let (generic_params, impl_ctx) = self.resolve_generic_params(generics, ctx)?;
 				let ty = self.resolve_ast_type(&type_.0, type_.1, &impl_ctx)?;
 
 				// Set up context with self_type and this for member type-checking
@@ -3303,12 +5896,35 @@ impl TypeChecker {
 				} else {
 					StructMemberKind::Immutable
 				};
+				let provided_members =
+					self.collect_impl_member_signatures(members, &member_ctx, member_kind)?;
 
-				for member in members {
-					self.check_impl_member(member, &member_ctx, member_kind)?;
+				if matches!(ty, Type::Interface { .. }) {
+					let extension = InterfaceExtensionRecord {
+						generics: Arc::new(generic_params),
+						interface: ty.clone(),
+						members: provided_members,
+						span: span_to_range(type_.1),
+					};
+					let body_ctx = member_ctx.with_interface_extension(extension.clone());
+					for member in members {
+						self.check_impl_member_body(member, &body_ctx)?;
+					}
+					Ok(ctx.with_interface_extension(extension))
+				} else {
+					let extension = TypeExtensionRecord {
+						generics: Arc::new(generic_params),
+						receiver: ty.clone(),
+						members: provided_members,
+						span: span_to_range(type_.1),
+					};
+					let body_ctx = member_ctx.with_type_extension(extension.clone());
+					for member in members {
+						self.check_impl_member_body(member, &body_ctx)?;
+					}
+
+					Ok(ctx.with_type_extension(extension))
 				}
-
-				Ok(ctx.clone())
 			}
 			_ => Ok(ctx.clone()),
 		}
@@ -3329,13 +5945,12 @@ impl TypeChecker {
 				},
 				value,
 			} => {
-				let inferred_type = self.infer(value, ctx)?;
 				let final_type = match type_ {
 					Some(t) => {
 						let expected = self.resolve_ast_type(&t.0, t.1, ctx)?;
 						self.check_expr(value, &expected, ctx)?
 					}
-					None => inferred_type,
+					None => self.infer(value, ctx)?,
 				};
 
 				let binding_name = match &name.0 {
@@ -3375,7 +5990,7 @@ impl TypeChecker {
 				// Add parameters to context and collect parameter types
 				let mut param_types = Vec::new();
 				for param in params {
-					let param_type = self.resolve_ast_type(&param.0.type_.0, param.0.type_.1, &func_ctx)?;
+					let param_type = self.resolve_func_param_type(param, &func_ctx)?;
 
 					// Extract parameter name from pattern
 					let param_name = match &param.0.name.0 {
@@ -3402,16 +6017,18 @@ impl TypeChecker {
 				}
 
 				// Check body
-				let inferred_return = self.infer(body, &func_ctx)?;
 				let expected_return = match return_type {
 					Some(t) => self.resolve_ast_type(&t.0, t.1, ctx)?,
-					None => inferred_return.clone(),
+					None => self.infer(body, &func_ctx)?,
 				};
+				let inferred_return = self.check_expr(body, &expected_return, &func_ctx)?;
 
 				if !inferred_return.assignable_to(&expected_return, &func_ctx) {
-					return Err(TypeError::TypeMismatch {
-						expected: expected_return.into(),
-						found: inferred_return.into(),
+					return Err(TypeError {
+						kind: TypeErrorKind::TypeMismatch {
+							expected: expected_return.into(),
+							found: inferred_return.into(),
+						},
 						span: 0..0,
 					});
 				}
@@ -3441,8 +6058,10 @@ impl TypeChecker {
 				members,
 			} => {
 				if fields.is_empty() {
-					return Err(TypeError::EmptyStruct {
-						name: name.0.clone(),
+					return Err(TypeError {
+						kind: TypeErrorKind::EmptyStruct {
+							name: name.0.clone(),
+						},
 						span: span_to_range(name.1),
 					});
 				}
@@ -3476,9 +6095,11 @@ impl TypeChecker {
 					if let Some(default_expr) = &field.0.default {
 						let default_type = self.infer(default_expr, &struct_ctx)?;
 						if !default_type.assignable_to(&field_type, &struct_ctx) {
-							return Err(TypeError::TypeMismatch {
-								expected: field_type.into(),
-								found: default_type.into(),
+							return Err(TypeError {
+								kind: TypeErrorKind::TypeMismatch {
+									expected: field_type.into(),
+									found: default_type.into(),
+								},
 								span: span_to_range(default_expr.1),
 							});
 						}
@@ -3519,7 +6140,7 @@ impl TypeChecker {
 				);
 
 				// Process struct members (methods, computed properties, etc.)
-				let (processed_members, processed_impls) =
+				let (processed_members, processed_impls, processed_impl_records) =
 					self.process_struct_members(members, &preliminary_struct_type, &struct_ctx_with_self)?;
 
 				let struct_type = Type::Struct {
@@ -3533,9 +6154,13 @@ impl TypeChecker {
 				};
 
 				// Build the constructor function type for the struct
-				let constructor_params: Vec<(Option<EcoString>, Type)> = field_map
+				// Use `fields` (source order) instead of `field_map` (alphabetical BTreeMap order)
+				let constructor_params: Vec<(Option<EcoString>, Type)> = fields
 					.iter()
-					.map(|(field_name, field_type)| (Some(field_name.clone()), field_type.clone()))
+					.map(|field| {
+						let field_type = field_map[&field.0.name.0].clone();
+						(Some(field.0.name.0.clone()), field_type)
+					})
 					.collect();
 
 				let constructor_type = Type::Function {
@@ -3546,14 +6171,18 @@ impl TypeChecker {
 					constructor: true,
 				};
 
-				Ok(ctx.with_new_entry(
+				let mut next_ctx = ctx.with_new_entry(
 					name.0.clone(),
 					ContextEntry::Value(ContextValue {
 						type_: constructor_type,
 						mutable: false,
 						visibility: Visibility::Public,
 					}),
-				))
+				);
+				for record in processed_impl_records {
+					next_ctx = next_ctx.with_impl_record(record);
+				}
+				Ok(next_ctx)
 			}
 			Declaration::Enum {
 				visibility: _,
@@ -3593,9 +6222,11 @@ impl TypeChecker {
 						if let Some(default_expr) = &field.0.default {
 							let default_type = self.infer(default_expr, &enum_ctx)?;
 							if !default_type.assignable_to(&field_type, &enum_ctx) {
-								return Err(TypeError::TypeMismatch {
-									expected: field_type.into(),
-									found: default_type.into(),
+								return Err(TypeError {
+									kind: TypeErrorKind::TypeMismatch {
+										expected: field_type.into(),
+										found: default_type.into(),
+									},
 									span: span_to_range(default_expr.1),
 								});
 							}
@@ -3628,7 +6259,7 @@ impl TypeChecker {
 				);
 
 				// Process enum members (methods, computed properties, etc.)
-				let (processed_members, processed_impls) =
+				let (processed_members, processed_impls, processed_impl_records) =
 					self.process_struct_members(members, &preliminary_enum_type, &enum_ctx_with_self)?;
 
 				let enum_type = Type::Enum {
@@ -3641,23 +6272,35 @@ impl TypeChecker {
 					def_key: None,
 				};
 
-				Ok(ctx.with_new_entry(
+				let mut next_ctx = ctx.with_new_entry(
 					name.0.clone(),
 					ContextEntry::Value(ContextValue {
 						type_: enum_type,
 						mutable: false,
 						visibility: Visibility::Public,
 					}),
-				))
+				);
+				for record in processed_impl_records {
+					next_ctx = next_ctx.with_impl_record(record);
+				}
+				Ok(next_ctx)
 			}
 			Declaration::Interface {
 				visibility: _,
 				name,
 				generics,
-				super_interfaces: _,
+				super_interfaces,
 				members,
 			} => {
-				let (generic_params, _generics_ctx) = self.resolve_generic_params(generics, ctx)?;
+				let (generic_params, generics_ctx) = self.resolve_generic_params(generics, ctx)?;
+				let interface_type_args = generic_params
+					.iter()
+					.map(|param| Type::Variable {
+						id: param.id,
+						name: param.name.clone(),
+						constraint: param.constraint.clone().map(Box::new),
+					})
+					.collect();
 
 				// Create a self type variable for interface member resolution
 				// In interface definitions, `self` is abstract (a type variable with the interface as constraint)
@@ -3666,16 +6309,17 @@ impl TypeChecker {
 					Some(Type::Interface {
 						name: name.0.clone(),
 						generics: Arc::new(generic_params.clone()),
-						type_args: Vec::new(),
+						type_args: interface_type_args,
 						members: Arc::new(BTreeMap::new()),
 						impls: Arc::new(BTreeMap::new()),
 						def_key: None,
 					}),
 				);
-				let interface_ctx = ctx.with_self_type(self_type);
+				let interface_ctx = generics_ctx.with_self_type(self_type);
 
 				// Process interface members with self type in scope
-				let interface_members = self.process_interface(&name.0, members, &interface_ctx)?;
+				let (interface_members, implied_interfaces) =
+					self.process_interface(&name.0, super_interfaces, members, &interface_ctx)?;
 
 				Ok(ctx.with_new_entry(
 					name.0.clone(),
@@ -3685,7 +6329,7 @@ impl TypeChecker {
 							generics: Arc::new(generic_params),
 							type_args: Vec::new(),
 							members: Arc::new(interface_members),
-							impls: Arc::new(BTreeMap::new()),
+							impls: Arc::new(implied_interfaces),
 							def_key: None,
 						},
 						mutable: false,
@@ -3716,10 +6360,11 @@ impl TypeChecker {
 				))
 			}
 			Declaration::Import { root, path, idents } => {
-				self.check_import(root, path, idents.as_ref(), ctx)
+				self.check_import(root, path, idents.as_ref().map(Vec::as_slice), ctx)
 			}
 			Declaration::ExternalLet(
 				_visibility,
+				_external_name,
 				LetDeclaration {
 					name,
 					type_,
@@ -3729,9 +6374,10 @@ impl TypeChecker {
 				let let_type = match type_ {
 					Some(t) => self.resolve_ast_type(&t.0, t.1, ctx)?,
 					None => {
-						return Err(TypeError::ExternalDeclarationMissingType(span_to_range(
-							name.1,
-						)));
+						return Err(TypeError {
+							kind: TypeErrorKind::ExternalDeclarationMissingType,
+							span: span_to_range(name.1),
+						});
 					}
 				};
 
@@ -3753,6 +6399,7 @@ impl TypeChecker {
 			}
 			Declaration::ExternalFunc(
 				_visibility,
+				_external_name,
 				FuncDeclaration {
 					name: Spanned(func_name, _),
 					generics,
@@ -3765,7 +6412,7 @@ impl TypeChecker {
 				// Collect parameter types
 				let mut param_types = Vec::new();
 				for param in params {
-					let param_type = self.resolve_ast_type(&param.0.type_.0, param.0.type_.1, &func_ctx)?;
+					let param_type = self.resolve_func_param_type(param, &func_ctx)?;
 					let param_name = match &param.0.name.0 {
 						Pattern::Binding { name, .. } => Some(name.0.clone()),
 						Pattern::Struct { path, fields } if path.len() == 1 && fields.is_empty() => {
@@ -3824,7 +6471,7 @@ impl TypeChecker {
 		&mut self,
 		root: &ImportRoot,
 		path: &[ast::Ident],
-		idents: Option<&Vec<(ast::Ident, Option<ast::Ident>)>>,
+		idents: Option<&[(ast::Ident, Option<ast::Ident>)]>,
 		ctx: &Context,
 	) -> Result<Context, TypeError> {
 		if path.is_empty() {
@@ -3849,7 +6496,7 @@ impl TypeChecker {
 		let module_type = self.context_to_module_type(module_name.clone(), &module_ctx);
 
 		// Start with current context
-		let mut new_ctx = ctx.clone();
+		let mut new_ctx = self.merge_module_effects(ctx, &module_ctx);
 
 		// Add the module itself to context (for qualified access like `math.cos`)
 		new_ctx = new_ctx.with_new_entry(
@@ -3865,16 +6512,17 @@ impl TypeChecker {
 		if let Some(import_idents) = idents {
 			for (Spanned(item_name, item_span), alias) in import_idents {
 				// Look up the item in the module's context
-				let entry =
-					module_ctx
-						.local_ctx
-						.get(item_name)
-						.ok_or_else(|| TypeError::ImportedItemNotFound {
+				let entry = module_ctx
+					.local_ctx
+					.get(item_name)
+					.ok_or_else(|| TypeError {
+						kind: TypeErrorKind::ImportedItemNotFound {
 							item: item_name.clone(),
 							module: module_name.clone(),
 							suggestion: find_similar_name(item_name, module_ctx.local_ctx.keys()),
-							span: span_to_range(*item_span),
-						})?;
+						},
+						span: span_to_range(*item_span),
+					})?;
 
 				// Check visibility
 				let visibility = match entry {
@@ -3883,10 +6531,12 @@ impl TypeChecker {
 				};
 
 				if visibility == Visibility::Private {
-					return Err(TypeError::ImportedItemNotFound {
-						item: item_name.clone(),
-						module: module_name.clone(),
-						suggestion: None,
+					return Err(TypeError {
+						kind: TypeErrorKind::ImportedItemNotFound {
+							item: item_name.clone(),
+							module: module_name.clone(),
+							suggestion: None,
+						},
 						span: span_to_range(*item_span),
 					});
 				}
@@ -3913,7 +6563,7 @@ impl TypeChecker {
 		config: ProjectConfig,
 		root: &ImportRoot,
 		path: &[ast::Ident],
-		idents: Option<&Vec<(ast::Ident, Option<ast::Ident>)>>,
+		idents: Option<&[(ast::Ident, Option<ast::Ident>)]>,
 		ctx: &Context,
 	) -> Result<Context, TypeError> {
 		use crate::db::{ImportSpec, ImportedIdent};
@@ -3926,15 +6576,15 @@ impl TypeChecker {
 		let last_span = path.last().map(|i| i.1).unwrap_or(first_span);
 		let import_span = Span::new(first_span.start, last_span.end);
 
-		let path_strings: Vec<String> = path.iter().map(|seg| seg.inner().to_string()).collect();
+		let path_strings: Vec<String> = path.iter().map(|seg| seg.0.to_string()).collect();
 
 		let imported_idents = idents.map(|ids| {
 			ids
 				.iter()
 				.map(|(name, alias)| ImportedIdent {
-					name: name.inner().to_string(),
-					alias: alias.as_ref().map(|a| a.inner().to_string()),
-					span: name.span(),
+					name: name.0.to_string(),
+					alias: alias.as_ref().map(|a| a.0.to_string()),
+					span: name.1,
 				})
 				.collect()
 		});
@@ -3954,13 +6604,12 @@ impl TypeChecker {
 
 		let imported_file =
 			queries::load_source_file(db, module_file_path.to_string_lossy().to_string());
-		let result = queries::typecheck_file(db, imported_file, config);
-		let module_ctx = result.ctx;
+		let module_ctx = self.check_file_salsa(db, imported_file, config);
 
 		let module_name = path.last().map(|s| s.0.clone()).unwrap_or_default();
 		let module_type = self.context_to_module_type(module_name.clone(), &module_ctx);
 
-		let mut new_ctx = ctx.clone();
+		let mut new_ctx = self.merge_module_effects(ctx, &module_ctx);
 
 		new_ctx = new_ctx.with_new_entry(
 			module_name.clone(),
@@ -3973,16 +6622,17 @@ impl TypeChecker {
 
 		if let Some(import_idents) = idents {
 			for (Spanned(item_name, item_span), alias) in import_idents {
-				let entry =
-					module_ctx
-						.local_ctx
-						.get(item_name)
-						.ok_or_else(|| TypeError::ImportedItemNotFound {
+				let entry = module_ctx
+					.local_ctx
+					.get(item_name)
+					.ok_or_else(|| TypeError {
+						kind: TypeErrorKind::ImportedItemNotFound {
 							item: item_name.clone(),
 							module: module_name.clone(),
 							suggestion: find_similar_name(item_name, module_ctx.local_ctx.keys()),
-							span: span_to_range(*item_span),
-						})?;
+						},
+						span: span_to_range(*item_span),
+					})?;
 
 				let visibility = match entry {
 					ContextEntry::Value(val) => val.visibility,
@@ -3990,10 +6640,12 @@ impl TypeChecker {
 				};
 
 				if visibility == Visibility::Private {
-					return Err(TypeError::ImportedItemNotFound {
-						item: item_name.clone(),
-						module: module_name.clone(),
-						suggestion: None,
+					return Err(TypeError {
+						kind: TypeErrorKind::ImportedItemNotFound {
+							item: item_name.clone(),
+							module: module_name.clone(),
+							suggestion: None,
+						},
 						span: span_to_range(*item_span),
 					});
 				}
@@ -4053,7 +6705,7 @@ pub fn type_error_to_report(
 	use ariadne::{Color, Label, Report, ReportKind};
 
 	let error_file = error.file_path().unwrap_or(filename);
-	let span = error.span();
+	let span = error.span.clone();
 	let mut report = Report::build(ReportKind::Error, (error_file.clone(), span.clone()))
 		.with_config(ariadne::Config::new().with_tab_width(2))
 		.with_message(error.to_string())
@@ -4063,18 +6715,55 @@ pub fn type_error_to_report(
 				.with_color(Color::Red),
 		);
 
-	let suggestion = match error {
-		TypeError::UnknownIdentifier { suggestion, .. }
-		| TypeError::UnknownType { suggestion, .. }
-		| TypeError::UnknownMember { suggestion, .. }
-		| TypeError::UnknownNamedArgument { suggestion, .. }
-		| TypeError::ImportedItemNotFound { suggestion, .. } => suggestion.as_ref(),
+	let suggestion = match &error.kind {
+		TypeErrorKind::UnknownIdentifier { suggestion, .. }
+		| TypeErrorKind::UnknownType { suggestion, .. }
+		| TypeErrorKind::UnknownMember { suggestion, .. }
+		| TypeErrorKind::UnknownNamedArgument { suggestion, .. }
+		| TypeErrorKind::ImportedItemNotFound { suggestion, .. } => suggestion.as_ref(),
+		_ => None,
+	};
+	let anonymous_function_help = match &error.kind {
+		TypeErrorKind::CannotInferAnonymousFunction { placeholders } => Some(format!(
+			"anonymous placeholders like {} need an expected function type; add one or rewrite the expression as an explicit closure such as {}",
+			format_anonymous_placeholders(placeholders),
+			closure_help_example(anonymous_placeholder_arity(placeholders)),
+		)),
 		_ => None,
 	};
 
 	if let Some(suggestion) = suggestion {
 		report = report.with_help(format!("did you mean '{suggestion}'?"));
+	} else if let Some(help) = anonymous_function_help {
+		report = report.with_help(help);
 	}
 
 	report.finish()
+}
+
+fn format_anonymous_placeholders(placeholders: &[Option<u32>]) -> String {
+	placeholders
+		.iter()
+		.map(|index| match index {
+			None => "$".to_string(),
+			Some(index) => format!("${index}"),
+		})
+		.collect::<Vec<_>>()
+		.join(", ")
+}
+
+fn anonymous_placeholder_arity(placeholders: &[Option<u32>]) -> usize {
+	placeholders
+		.iter()
+		.map(|index| index.unwrap_or(0) as usize)
+		.max()
+		.map_or(1, |index| index + 1)
+}
+
+fn closure_help_example(arity: usize) -> String {
+	let params = (0..arity.max(1))
+		.map(|index| format!("arg{index}: int"))
+		.collect::<Vec<_>>()
+		.join(", ");
+	format!("`({params}) -> ...`")
 }

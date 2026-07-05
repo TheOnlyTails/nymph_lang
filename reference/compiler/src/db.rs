@@ -1,14 +1,11 @@
-use std::{
-	collections::BTreeMap,
-	path::PathBuf,
-};
+use std::{collections::BTreeMap, path::PathBuf};
 
 use ecow::EcoString;
 
 use crate::ast::Span;
 use crate::ast::declaration::ImportRoot;
-use crate::types::{GenericParamInfo, StructMember, Type};
 use crate::types::error::TypeError;
+use crate::types::{GenericParamInfo, StructMember, Type};
 
 #[salsa::input]
 pub struct SourceFile {
@@ -22,6 +19,9 @@ pub struct SourceFile {
 pub struct ProjectConfig {
 	#[returns(ref)]
 	pub root: PathBuf,
+	#[returns(ref)]
+	pub output_dir: PathBuf,
+	pub implicit_prelude: bool,
 }
 
 #[salsa::interned]

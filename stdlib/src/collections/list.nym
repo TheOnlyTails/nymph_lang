@@ -1,0 +1,67 @@
+import @/option with (Option)
+import @/ops with (Plus, Into, Contains, Equals)
+
+impl<T> mut #[T] {
+  external(length) func length(): uint
+  external(insert) func insert(i: uint, item: T)
+  external(get) func get(i: uint): Option<T>
+  external(remove) func remove(i: uint): Option<T>
+  external(clear) func clear()
+  external(splice) func splice(start: uint, end: uint, replacement: #[T]): #[T]
+
+  /// Appends an item to the end of the list.
+  external(push) func push(item: T)
+
+  /// Removes and returns the last element, or `None` if empty.
+  external(pop) func pop(): Option<T>
+
+  func is_empty(): boolean = this.length() == 0
+  func is_not_empty(): boolean = !this.is_empty()
+}
+
+impl<T> #[T] {
+  external(length) func length(): uint
+  external(get) func get(i: uint): Option<T>
+
+  /// Returns the first element, or `None` if empty.
+  external(first) func first(): Option<T>
+
+  /// Returns the last element, or `None` if empty.
+  external(last) func last(): Option<T>
+
+  /// Returns a new list with elements from `start` (inclusive) to `end` (exclusive).
+  external(slice) func slice(start: uint, end: uint): #[T]
+
+  /// Returns a new list with `other` appended.
+  external(concat) func concat(other: #[T]): #[T]
+
+  /// Returns a new list with the elements in reverse order.
+  external(reversed) func reversed(): #[T]
+
+  /// Returns a new sorted list.
+  external(sorted) func sorted(): #[T]
+
+  /// Returns a list of sub-lists, each of the given `size` (the last chunk may be smaller).
+  external(chunked) func chunked(size: uint): #[#[T]]
+
+  /// Returns a new list with duplicate elements removed.
+  external(distinct) func distinct(): #[T]
+
+  /// Returns a new list with the first `n` elements dropped.
+  external(drop) func drop(n: uint): #[T]
+
+  /// Returns a new list with only the first `n` elements.
+  external(take) func take(n: uint): #[T]
+}
+
+impl<T> Plus<Other = self, Output = self> for #[T] {
+  external(concat) func plus(other: self): self
+}
+
+impl<T: Into<string>> Into<string> for #[T] {
+  external(to_string) func into(): string
+}
+
+impl<T: Equals<Other = T>> Contains<Item = T> for #[T] {
+  external(contains) func contains(item: T): boolean
+}

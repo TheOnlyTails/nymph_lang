@@ -1,20 +1,38 @@
 import @/default with (Default)
+import @/collections/map
+import @/ops with (Contains)
 
-public struct Set<Item>(inner: #{Item: void}) {
-  /// Inserts an item into the set.
-  /// Returns `true` if the set did not contain this item previously, and `false` if it did. 
-  func insert(item: Item): boolean -> this.inner.insert(item, #())
+public struct Set<Item>(inner: #{Item: #()}) {
+  impl mut {
+    /// Inserts an item into the set.
+    /// Returns `true` if the set did not contain this item previously, and `false` if it did. 
+    func insert(item: Item): boolean = this.inner.insert(item, #())
 
-  func remove(item: Item) -> if (item in this.inner) {
-    inner -= item
-
+    func remove(item: Item) = if (item in this.inner) {
+      this.inner.remove(item)
+      true
+    } else false
   }
 
   namespace {
-    func new<T>(...from: T) -> Set(from.map(#(_, #())).collect())
+    func new(...from: Item): Set<Item> = {
+      let mut inner: #{Item: #()} = #{}
+      for (item in from) {
+        inner.insert(item, #())
+      }
+
+      Set(inner = inner)
+    }
+  }
+
+  impl Contains<Item> {
+    func contains(item: Item): boolean = this.inner.contains_key(item)
   }
 
   impl Default {
-    func default() -> Set(inner = #{})
+    func default() = {
+      let inner: #{Item: #()} = #{}
+      Set(inner = inner)
+    }
   }
 }

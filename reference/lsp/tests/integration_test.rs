@@ -32,9 +32,9 @@ mod tests {
 		use nymph_lsp::semantic_tokens::{SemanticTokenizer, TokenType};
 
 		let mut tokenizer = SemanticTokenizer::new();
-		let tokens = tokenizer.tokenize("let x = 5\nfn foo() {}");
+		let tokens = tokenizer.tokenize("let x = 5\nfunc foo() -> 1");
 
-		// Should find 'let' and 'fn' keywords
+		// Should find 'let' and 'func' keywords
 		let keyword_tokens: Vec<_> = tokens
 			.iter()
 			.filter(|t| t.token_type == TokenType::Keyword)
@@ -43,24 +43,26 @@ mod tests {
 		assert!(!keyword_tokens.is_empty());
 	}
 
-	#[tokio::test]
-	async fn test_workspace() {
+	#[test]
+	fn test_workspace() {
 		use nymph_lsp::workspace::Workspace;
 
-		let ws = Workspace::new();
-		ws.open_document("file:///test.nymph".to_string(), "let x = 5".to_string())
-			.await;
+		smol::block_on(async {
+			let ws = Workspace::new();
+			ws.open_document("file:///test.nymph".to_string(), "let x = 5".to_string())
+				.await;
 
-		let count = ws.document_count().await;
-		assert_eq!(count, 1);
+			let count = ws.document_count().await;
+			assert_eq!(count, 1);
 
-		let content = ws
-			.get_document("file:///test.nymph", |doc| doc.content.clone())
-			.await;
-		assert_eq!(content, Some("let x = 5".to_string()));
+			let content = ws
+				.get_document("file:///test.nymph", |doc| doc.content.clone())
+				.await;
+			assert_eq!(content, Some("let x = 5".to_string()));
 
-		ws.close_document("file:///test.nymph").await;
-		let count = ws.document_count().await;
-		assert_eq!(count, 0);
+			ws.close_document("file:///test.nymph").await;
+			let count = ws.document_count().await;
+			assert_eq!(count, 0);
+		});
 	}
 }

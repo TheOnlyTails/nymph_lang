@@ -54,7 +54,7 @@ impl<'src> Parser<'src> {
 			Token::As => {
 				self.advance();
 				let name = self.expect_identifier()?;
-				let span = span(lhs.span().start, name.span().end);
+				let span = span(lhs.1.start, name.1.end);
 				Some(Spanned(
 					Pattern::Binding {
 						name,
@@ -66,7 +66,7 @@ impl<'src> Parser<'src> {
 			Token::Pipe => {
 				self.advance();
 				let rhs = self.parse_pattern_pratt(next_bp)?;
-				let span = span(lhs.span().start, rhs.span().end);
+				let span = span(lhs.1.start, rhs.1.end);
 				Some(Spanned(Pattern::Union(lhs.into(), rhs.into()), span))
 			}
 			_ => Some(lhs),
@@ -91,6 +91,13 @@ impl<'src> Parser<'src> {
 			| Token::OctalInt(val) => {
 				self.advance();
 				Pattern::Int(Spanned(val as i64, start_span))
+			}
+			Token::DecimalUInt(val)
+			| Token::HexUInt(val)
+			| Token::BinaryUInt(val)
+			| Token::OctalUInt(val) => {
+				self.advance();
+				Pattern::UInt(Spanned(val, start_span))
 			}
 			Token::Float(val) => {
 				self.advance();

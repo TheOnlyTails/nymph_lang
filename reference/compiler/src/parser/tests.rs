@@ -4,8 +4,11 @@ use crate::{
 	ast::{
 		Spanned,
 		declaration::{Declaration, ImportRoot, Visibility},
-		expr::{Expr, Pattern},
-		ops::{AssignOperator, BinaryOperator, PrefixOperator},
+		expr::{CallArg, Expr, ListItem, MapEntry, Pattern, RangeKind, RangePatternKind, StringPart},
+		ops::{
+			AssignOperator, BinaryOperator, PatternOperator, PostfixOperator, PrefixOperator,
+			TypeOperator,
+		},
 		types::Type,
 	},
 	lexer::lexer,
@@ -358,7 +361,7 @@ fn test_parse_expression_member_access() {
 			member,
 			optional,
 		} => {
-			let Expr::Identifier(Spanned(parent, _)) = parent.inner() else {
+			let Expr::Identifier(Spanned(parent, _)) = &parent.0 else {
 				panic!("expected identifier")
 			};
 			assert_eq!(parent, "obj");
@@ -389,7 +392,7 @@ fn test_parse_expression_index_access() {
 			index,
 			optional,
 		} => {
-			let Expr::Identifier(Spanned(parent, _)) = parent.inner() else {
+			let Expr::Identifier(Spanned(parent, _)) = &parent.0 else {
 				panic!("expected identifier")
 			};
 			assert_eq!(parent, "arr");
@@ -834,6 +837,18 @@ fn test_parse_pipeline_operator() {
 }
 
 #[test]
+fn test_parse_anonymous_param_preserves_omitted_index() {
+	let expr = parse_expr("$").unwrap();
+	assert!(matches!(expr.0, Expr::AnonymousParam(None)));
+}
+
+#[test]
+fn test_parse_anonymous_param_preserves_explicit_zero() {
+	let expr = parse_expr("$0").unwrap();
+	assert!(matches!(expr.0, Expr::AnonymousParam(Some(0))));
+}
+
+#[test]
 fn test_parse_null_coalescing() {
 	let expr = parse_expr("x ?? default").unwrap();
 	match &expr.0 {
@@ -862,5 +877,1246 @@ fn test_parse_generic_call() {
 			assert_eq!(generics[0].0.value.0, Type::Int);
 		}
 		_ => panic!("expected call"),
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Expression tests
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_parse_expression_true() {
+	let expr = parse_expr("true").unwrap();
+	assert!(matches!(expr.0, Expr::Boolean(Spanned(true, _))));
+}
+
+#[test]
+fn test_parse_expression_false() {
+	let expr = parse_expr("false").unwrap();
+	assert!(matches!(expr.0, Expr::Boolean(Spanned(false, _))));
+}
+
+#[test]
+fn test_parse_expression_char() {
+	let expr = parse_expr("'a'").unwrap();
+	assert!(matches!(expr.0, Expr::Char(Spanned('a', _))));
+}
+
+#[test]
+fn test_parse_expression_char_escape() {
+	let expr = parse_expr(r"'\n'").unwrap();
+	assert!(matches!(expr.0, Expr::Char(_)));
+}
+
+#[test]
+fn test_parse_expression_this() {
+	let expr = parse_expr("this").unwrap();
+	assert!(matches!(expr.0, Expr::This));
+}
+
+#[test]
+fn test_parse_expression_grouped() {
+	let expr = parse_expr("(1 + 2)").unwrap();
+	match &expr.0 {
+		Expr::Grouped(inner) => {
+			assert!(matches!(
+				&inner.0,
+				Expr::BinaryOp {
+					op: BinaryOperator::Plus,
+					..
+				}
+			));
+		}
+		_ => panic!("expected grouped expression"),
+	}
+}
+
+#[test]
+fn test_parse_expression_subtraction() {
+	let expr = parse_expr("5 - 3").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::Minus,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_multiplication() {
+	let expr = parse_expr("2 * 3").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::Times,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_division() {
+	let expr = parse_expr("10 / 2").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::Divide,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_remainder() {
+	let expr = parse_expr("10 % 3").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::Remainder,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_power() {
+	let expr = parse_expr("2 ** 8").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::Power,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_bitwise_and() {
+	let expr = parse_expr("a & b").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::BitAnd,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_bitwise_or() {
+	let expr = parse_expr("a | b").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::BitOr,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_bitwise_xor() {
+	let expr = parse_expr("a ^ b").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::BitXor,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_right_shift() {
+	let expr = parse_expr("a >> b").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::RightShift,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_equals() {
+	let expr = parse_expr("a == b").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::Equals,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_not_equals() {
+	let expr = parse_expr("a != b").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::NotEquals,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_less_than_equals() {
+	let expr = parse_expr("a <= b").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::LessThanEquals,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_greater_than() {
+	let expr = parse_expr("a > b").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::GreaterThan,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_greater_than_equals() {
+	let expr = parse_expr("a >= b").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::GreaterThanEquals,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_in() {
+	let expr = parse_expr("x in list").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::In,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_not_in() {
+	let expr = parse_expr("x !in list").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::NotIn,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_bool_and() {
+	let expr = parse_expr("a && b").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::BoolAnd,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_bool_or() {
+	let expr = parse_expr("a || b").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::BinaryOp {
+			op: BinaryOperator::BoolOr,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_prefix_not() {
+	let expr = parse_expr("!x").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::PrefixOp {
+			op: PrefixOperator::BoolNot,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_prefix_bitnot() {
+	let expr = parse_expr("~x").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::PrefixOp {
+			op: PrefixOperator::BitNot,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_postfix_error_return() {
+	let expr = parse_expr("value?").unwrap();
+	match &expr.0 {
+		Expr::PostfixOp { op, value } => {
+			assert!(matches!(op, crate::ast::ops::PostfixOperator::ErrorReturn));
+			assert!(matches!(&value.0, Expr::Identifier(_)));
+		}
+		_ => panic!("expected postfix op"),
+	}
+}
+
+#[test]
+fn test_parse_expression_return_with_value() {
+	let expr = parse_expr("return 42").unwrap();
+	match &expr.0 {
+		Expr::Return { value, label } => {
+			assert!(value.is_some());
+			assert!(label.is_none());
+		}
+		_ => panic!("expected return"),
+	}
+}
+
+#[test]
+fn test_parse_expression_return_no_value() {
+	let expr = parse_expr("return").unwrap();
+	match &expr.0 {
+		Expr::Return { value, label } => {
+			assert!(value.is_none());
+			assert!(label.is_none());
+		}
+		_ => panic!("expected return"),
+	}
+}
+
+#[test]
+fn test_parse_expression_break_with_value() {
+	let expr = parse_expr("break 42").unwrap();
+	match &expr.0 {
+		Expr::Break { value, label } => {
+			assert!(value.is_some());
+			assert!(label.is_none());
+		}
+		_ => panic!("expected break"),
+	}
+}
+
+#[test]
+fn test_parse_expression_break_no_value() {
+	let expr = parse_expr("break").unwrap();
+	match &expr.0 {
+		Expr::Break { value, label } => {
+			assert!(value.is_none());
+			assert!(label.is_none());
+		}
+		_ => panic!("expected break"),
+	}
+}
+
+#[test]
+fn test_parse_expression_continue() {
+	let expr = parse_expr("continue").unwrap();
+	assert!(matches!(&expr.0, Expr::Continue { label: None }));
+}
+
+#[test]
+fn test_parse_expression_labeled_while() {
+	let expr = parse_expr("while@loop (true) { break@loop }").unwrap();
+	match &expr.0 {
+		Expr::While { label, .. } => {
+			assert!(label.is_some());
+			assert_eq!(label.as_ref().unwrap().0, "loop");
+		}
+		_ => panic!("expected labeled while"),
+	}
+}
+
+#[test]
+fn test_parse_expression_labeled_for() {
+	let expr = parse_expr("for@outer (x in items) { break@outer }").unwrap();
+	match &expr.0 {
+		Expr::For { label, .. } => {
+			assert!(label.is_some());
+			assert_eq!(label.as_ref().unwrap().0, "outer");
+		}
+		_ => panic!("expected labeled for"),
+	}
+}
+
+#[test]
+fn test_parse_expression_list_with_spread() {
+	let expr = parse_expr("#[1, 2, ...rest]").unwrap();
+	match &expr.0 {
+		Expr::List(items) => {
+			assert_eq!(items.len(), 3);
+		}
+		_ => panic!("expected list"),
+	}
+}
+
+#[test]
+fn test_parse_expression_map_with_spread() {
+	let expr = parse_expr("#{'a': 1, ...rest}").unwrap();
+	match &expr.0 {
+		Expr::Map(entries) => {
+			assert_eq!(entries.len(), 2);
+		}
+		_ => panic!("expected map"),
+	}
+}
+
+#[test]
+fn test_parse_expression_match_with_guard() {
+	let expr = parse_expr(
+		r#"match (x) {
+			n if n > 0 -> n,
+			_ -> 0
+		}"#,
+	)
+	.unwrap();
+	match &expr.0 {
+		Expr::Match { arms, .. } => {
+			assert_eq!(arms.len(), 2);
+			assert!(arms[0].guard.is_some());
+			assert!(arms[1].guard.is_none());
+		}
+		_ => panic!("expected match"),
+	}
+}
+
+#[test]
+fn test_parse_expression_closure_no_params() {
+	let expr = parse_expr("() -> 42").unwrap();
+	match &expr.0 {
+		Expr::Closure { params, .. } => {
+			assert_eq!(params.len(), 0);
+		}
+		_ => panic!("expected closure"),
+	}
+}
+
+#[test]
+fn test_parse_expression_closure_with_type_annotations() {
+	let expr = parse_expr("(x: int): string -> x").unwrap();
+	match &expr.0 {
+		Expr::Closure {
+			params,
+			return_type,
+			..
+		} => {
+			assert_eq!(params.len(), 1);
+			assert!(params[0].0.type_.is_some());
+			assert!(return_type.is_some());
+		}
+		_ => panic!("expected closure"),
+	}
+}
+
+#[test]
+fn test_parse_expression_optional_index_access() {
+	let expr = parse_expr("arr?.[0]").unwrap();
+	match &expr.0 {
+		Expr::IndexAccess { optional, .. } => {
+			assert!(*optional);
+		}
+		_ => panic!("expected optional index access"),
+	}
+}
+
+#[test]
+fn test_parse_expression_chained_member_access() {
+	let expr = parse_expr("a.b.c").unwrap();
+	match &expr.0 {
+		Expr::MemberAccess { parent, member, .. } => {
+			assert_eq!(member.0, "c");
+			assert!(matches!(&parent.0, Expr::MemberAccess { .. }));
+		}
+		_ => panic!("expected chained member access"),
+	}
+}
+
+#[test]
+fn test_parse_expression_string_interpolation() {
+	let expr = parse_expr(r#""hello ${name}""#).unwrap();
+	match &expr.0 {
+		Expr::String(parts) => {
+			assert!(parts.len() >= 2);
+		}
+		_ => panic!("expected string with interpolation"),
+	}
+}
+
+#[test]
+fn test_parse_expression_named_call_args() {
+	let expr = parse_expr("foo(x = 1, y = 2)").unwrap();
+	match &expr.0 {
+		Expr::Call { args, .. } => {
+			assert_eq!(args.len(), 2);
+			assert!(args[0].0.name.is_some());
+			assert_eq!(args[0].0.name.as_ref().unwrap().0, "x");
+			assert!(args[1].0.name.is_some());
+			assert_eq!(args[1].0.name.as_ref().unwrap().0, "y");
+		}
+		_ => panic!("expected call with named args"),
+	}
+}
+
+#[test]
+fn test_parse_expression_spread_call_arg() {
+	let expr = parse_expr("foo(...args)").unwrap();
+	match &expr.0 {
+		Expr::Call { args, .. } => {
+			assert_eq!(args.len(), 1);
+			assert!(args[0].0.spread);
+		}
+		_ => panic!("expected call with spread arg"),
+	}
+}
+
+#[test]
+fn test_parse_expression_as_cast() {
+	let expr = parse_expr("x as int").unwrap();
+	match &expr.0 {
+		Expr::TypeOp { op, rhs, .. } => {
+			assert!(matches!(op, crate::ast::ops::TypeOperator::As));
+			assert!(matches!(&rhs.0, Type::Int));
+		}
+		_ => panic!("expected type op"),
+	}
+}
+
+#[test]
+fn test_parse_expression_not_is() {
+	let expr = parse_expr("x !is None").unwrap();
+	match &expr.0 {
+		Expr::PatternOp { op, .. } => {
+			assert!(matches!(op, crate::ast::ops::PatternOperator::NotIs));
+		}
+		_ => panic!("expected pattern op"),
+	}
+}
+
+#[test]
+fn test_parse_expression_compound_minus_assign() {
+	let expr = parse_expr("x -= 1").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::AssignOp {
+			op: AssignOperator::MinusAssign,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_compound_times_assign() {
+	let expr = parse_expr("x *= 2").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::AssignOp {
+			op: AssignOperator::TimesAssign,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_compound_divide_assign() {
+	let expr = parse_expr("x /= 2").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::AssignOp {
+			op: AssignOperator::DivideAssign,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_compound_remainder_assign() {
+	let expr = parse_expr("x %= 3").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::AssignOp {
+			op: AssignOperator::RemainderAssign,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_compound_power_assign() {
+	let expr = parse_expr("x **= 2").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::AssignOp {
+			op: AssignOperator::PowerAssign,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_compound_left_shift_assign() {
+	let expr = parse_expr("x <<= 2").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::AssignOp {
+			op: AssignOperator::LeftShiftAssign,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_compound_right_shift_assign() {
+	let expr = parse_expr("x >>= 2").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::AssignOp {
+			op: AssignOperator::RightShiftAssign,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_compound_bitand_assign() {
+	let expr = parse_expr("x &= 0xFF").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::AssignOp {
+			op: AssignOperator::BitAndAssign,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_compound_bitxor_assign() {
+	let expr = parse_expr("x ^= 1").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::AssignOp {
+			op: AssignOperator::BitXorAssign,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_compound_bitor_assign() {
+	let expr = parse_expr("x |= 1").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::AssignOp {
+			op: AssignOperator::BitOrAssign,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_compound_bitnot_assign() {
+	let expr = parse_expr("x ~= 1").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::AssignOp {
+			op: AssignOperator::BitNotAssign,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_compound_booland_assign() {
+	let expr = parse_expr("x &&= true").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::AssignOp {
+			op: AssignOperator::BoolAndAssign,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_compound_boolor_assign() {
+	let expr = parse_expr("x ||= false").unwrap();
+	assert!(matches!(
+		&expr.0,
+		Expr::AssignOp {
+			op: AssignOperator::BoolOrAssign,
+			..
+		}
+	));
+}
+
+#[test]
+fn test_parse_expression_anonymous_param() {
+	let expr = parse_expr("$ + 1").unwrap();
+	match &expr.0 {
+		Expr::BinaryOp { lhs, .. } => {
+			assert!(matches!(lhs.0, Expr::AnonymousParam(None)));
+		}
+		_ => panic!("expected binary op with anonymous param"),
+	}
+}
+
+#[test]
+fn test_parse_expression_anonymous_param_indexed() {
+	let expr = parse_expr("$0 + $1").unwrap();
+	match &expr.0 {
+		Expr::BinaryOp { lhs, rhs, .. } => {
+			assert!(matches!(lhs.0, Expr::AnonymousParam(Some(0))));
+			assert!(matches!(rhs.0, Expr::AnonymousParam(Some(1))));
+		}
+		_ => panic!("expected binary op with anonymous params"),
+	}
+}
+
+#[test]
+fn test_parse_expression_range_inclusive() {
+	let expr = parse_expr("1..=10").unwrap();
+	assert!(matches!(&expr.0, Expr::Range(_)));
+}
+
+#[test]
+fn test_parse_expression_range_from() {
+	let expr = parse_expr("1..<").unwrap();
+	assert!(matches!(&expr.0, Expr::Range(_)));
+}
+
+#[test]
+fn test_parse_expression_empty_list() {
+	let expr = parse_expr("#[]").unwrap();
+	match &expr.0 {
+		Expr::List(items) => assert!(items.is_empty()),
+		_ => panic!("expected empty list"),
+	}
+}
+
+#[test]
+fn test_parse_expression_empty_tuple() {
+	let expr = parse_expr("#()").unwrap();
+	match &expr.0 {
+		Expr::Tuple(items) => assert!(items.is_empty()),
+		_ => panic!("expected empty tuple"),
+	}
+}
+
+#[test]
+fn test_parse_expression_empty_map() {
+	let expr = parse_expr("#{}").unwrap();
+	match &expr.0 {
+		Expr::Map(entries) => assert!(entries.is_empty()),
+		_ => panic!("expected empty map"),
+	}
+}
+
+#[test]
+fn test_parse_expression_precedence_mul_over_add() {
+	let expr = parse_expr("a + b * c").unwrap();
+	match &expr.0 {
+		Expr::BinaryOp {
+			op: BinaryOperator::Plus,
+			rhs,
+			..
+		} => {
+			assert!(matches!(
+				&rhs.0,
+				Expr::BinaryOp {
+					op: BinaryOperator::Times,
+					..
+				}
+			));
+		}
+		_ => panic!("expected + at top, * in rhs"),
+	}
+}
+
+#[test]
+fn test_parse_expression_precedence_power_right_assoc() {
+	let expr = parse_expr("2 ** 3 ** 4").unwrap();
+	match &expr.0 {
+		Expr::BinaryOp {
+			op: BinaryOperator::Power,
+			rhs,
+			..
+		} => {
+			assert!(matches!(
+				&rhs.0,
+				Expr::BinaryOp {
+					op: BinaryOperator::Power,
+					..
+				}
+			));
+		}
+		_ => panic!("expected right-associative power"),
+	}
+}
+
+#[test]
+fn test_parse_expression_nested_call() {
+	let expr = parse_expr("f(g(x))").unwrap();
+	match &expr.0 {
+		Expr::Call { func, args, .. } => {
+			assert!(matches!(&func.0, Expr::Identifier(_)));
+			assert_eq!(args.len(), 1);
+			assert!(matches!(&args[0].0.value.0, Expr::Call { .. }));
+		}
+		_ => panic!("expected nested call"),
+	}
+}
+
+#[test]
+fn test_parse_expression_method_call() {
+	let expr = parse_expr("obj.method(1, 2)").unwrap();
+	match &expr.0 {
+		Expr::Call { func, args, .. } => {
+			assert!(matches!(&func.0, Expr::MemberAccess { .. }));
+			assert_eq!(args.len(), 2);
+		}
+		_ => panic!("expected method call"),
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Type tests
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_parse_type_nested_list() {
+	let ty = parse_type("#[#[int]]").unwrap();
+	match ty.0 {
+		Type::List(inner) => match inner.0 {
+			Type::List(inner2) => assert!(matches!(inner2.0, Type::Int)),
+			_ => panic!("expected inner list"),
+		},
+		_ => panic!("expected nested list type"),
+	}
+}
+
+#[test]
+fn test_parse_type_nested_map() {
+	let ty = parse_type("#{string: #[int]}").unwrap();
+	match ty.0 {
+		Type::Map(key, value) => {
+			assert!(matches!(key.0, Type::String));
+			match value.0 {
+				Type::List(inner) => assert!(matches!(inner.0, Type::Int)),
+				_ => panic!("expected list value type"),
+			}
+		}
+		_ => panic!("expected map type"),
+	}
+}
+
+#[test]
+fn test_parse_type_function_named_params() {
+	let ty = parse_type("(x: int, y: int) -> int").unwrap();
+	match ty.0 {
+		Type::Function {
+			params,
+			return_type,
+		} => {
+			assert_eq!(params.len(), 2);
+			assert!(params[0].0.is_some());
+			assert!(params[1].0.is_some());
+			assert!(matches!(return_type.0, Type::Int));
+		}
+		_ => panic!("expected function type with named params"),
+	}
+}
+
+#[test]
+fn test_parse_type_grouped() {
+	let ty = parse_type("(int)").unwrap();
+	match ty.0 {
+		Type::Grouped(inner) => assert!(matches!(inner.0, Type::Int)),
+		_ => panic!("expected grouped type"),
+	}
+}
+
+#[test]
+fn test_parse_type_infer() {
+	let ty = parse_type("_").unwrap();
+	assert!(matches!(ty.0, Type::Infer));
+}
+
+#[test]
+fn test_parse_type_multi_generic() {
+	let ty = parse_type("Map<string, int>").unwrap();
+	match ty.0 {
+		Type::Reference { name, generics } => {
+			assert_eq!(name.0, "Map");
+			assert_eq!(generics.len(), 2);
+		}
+		_ => panic!("expected multi-generic reference type"),
+	}
+}
+
+#[test]
+fn test_parse_type_function_no_params() {
+	let ty = parse_type("() -> void").unwrap();
+	match ty.0 {
+		Type::Function {
+			params,
+			return_type,
+		} => {
+			assert!(params.is_empty());
+			assert!(matches!(return_type.0, Type::Void));
+		}
+		_ => panic!("expected function type with no params"),
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Pattern tests
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_parse_pattern_nested_struct() {
+	let pat = parse_pattern("Some(Some(x))").unwrap();
+	match pat.0 {
+		Pattern::Struct { path, fields } => {
+			assert_eq!(path[0].0, "Some");
+			assert_eq!(fields.len(), 1);
+		}
+		_ => panic!("expected struct pattern"),
+	}
+}
+
+#[test]
+fn test_parse_pattern_grouped() {
+	let pat = parse_pattern("(1 | 2)").unwrap();
+	assert!(matches!(pat.0, Pattern::Grouped(_)));
+}
+
+#[test]
+fn test_parse_pattern_map() {
+	let pat = parse_pattern("#{'a': x, ...rest}").unwrap();
+	match pat.0 {
+		Pattern::Map(entries) => {
+			assert_eq!(entries.len(), 2);
+		}
+		_ => panic!("expected map pattern"),
+	}
+}
+
+#[test]
+fn test_parse_pattern_range_inclusive() {
+	let pat = parse_pattern("1..=10").unwrap();
+	assert!(matches!(pat.0, Pattern::Range(_)));
+}
+
+#[test]
+fn test_parse_pattern_range_inclusive_max_only() {
+	let pat = parse_pattern("..=5").unwrap();
+	assert!(matches!(pat.0, Pattern::Range(_)));
+}
+
+#[test]
+fn test_parse_pattern_placeholder() {
+	let pat = parse_pattern("_").unwrap();
+	assert!(matches!(pat.0, Pattern::Placeholder));
+}
+
+#[test]
+fn test_parse_pattern_negative_int() {
+	let pat = parse_pattern("-42").unwrap();
+	match pat.0 {
+		Pattern::Int(Spanned(val, _)) => assert_eq!(val, -42),
+		_ => panic!("expected negative int pattern"),
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Declaration tests
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_parse_import_current_dir() {
+	let (module, errors) = parse_module("import ./util");
+	assert!(errors.is_empty(), "errors: {errors:?}");
+	match &module.members[0] {
+		Declaration::Import { root, path, .. } => {
+			assert!(matches!(root, ImportRoot::Current));
+			assert_eq!(path.len(), 1);
+			assert_eq!(path[0].0, "util");
+		}
+		_ => panic!("expected import"),
+	}
+}
+
+#[test]
+fn test_parse_import_parent_dir() {
+	let (module, errors) = parse_module("import ../util");
+	assert!(errors.is_empty(), "errors: {errors:?}");
+	match &module.members[0] {
+		Declaration::Import { root, .. } => {
+			assert!(matches!(root, ImportRoot::Parent));
+		}
+		_ => panic!("expected import"),
+	}
+}
+
+#[test]
+fn test_parse_func_no_return_type() {
+	let (module, errors) = parse_module(r#"func greet() -> "hello""#);
+	assert!(errors.is_empty(), "errors: {errors:?}");
+	match &module.members[0] {
+		Declaration::Func { meta, .. } => {
+			assert_eq!(meta.name.0, "greet");
+			assert!(meta.return_type.is_none());
+		}
+		_ => panic!("expected func"),
+	}
+}
+
+#[test]
+fn test_parse_external_let() {
+	let (module, errors) = parse_module("external(x) let x: int");
+	assert!(errors.is_empty(), "errors: {errors:?}");
+	assert!(matches!(&module.members[0], Declaration::ExternalLet(..)));
+}
+
+#[test]
+fn test_parse_external_func() {
+	let (module, errors) = parse_module("external(add) func add(a: int, b: int): int");
+	assert!(errors.is_empty(), "errors: {errors:?}");
+	match &module.members[0] {
+		Declaration::ExternalFunc(_, _, meta) => {
+			assert_eq!(meta.name.0, "add");
+			assert_eq!(meta.params.len(), 2);
+			assert!(meta.return_type.is_some());
+		}
+		_ => panic!("expected external func"),
+	}
+}
+
+#[test]
+fn test_parse_type_alias() {
+	let (module, errors) = parse_module("type IntList = #[int]");
+	assert!(errors.is_empty(), "errors: {errors:?}");
+	match &module.members[0] {
+		Declaration::TypeAlias { meta, value, .. } => {
+			assert_eq!(meta.name.0, "IntList");
+			assert!(matches!(value.0, Type::List(_)));
+		}
+		_ => panic!("expected type alias"),
+	}
+}
+
+#[test]
+fn test_parse_type_alias_with_generics() {
+	let (module, errors) = parse_module("type Pair<A, B> = #(A, B)");
+	assert!(errors.is_empty(), "errors: {errors:?}");
+	match &module.members[0] {
+		Declaration::TypeAlias { meta, value, .. } => {
+			assert_eq!(meta.name.0, "Pair");
+			assert_eq!(meta.generics.len(), 2);
+			assert!(matches!(value.0, Type::Tuple(_)));
+		}
+		_ => panic!("expected type alias"),
+	}
+}
+
+#[test]
+fn test_parse_namespace() {
+	let (module, errors) = parse_module(
+		r#"namespace Math {
+			let PI = 3.14
+		}"#,
+	);
+	assert!(errors.is_empty(), "errors: {errors:?}");
+	match &module.members[0] {
+		Declaration::Namespace { name, members, .. } => {
+			assert_eq!(name.0, "Math");
+			assert!(!members.is_empty());
+		}
+		_ => panic!("expected namespace"),
+	}
+}
+
+#[test]
+fn test_parse_impl_block() {
+	let (module, errors) = parse_module(
+		r#"impl int {
+			func double() -> this * 2
+		}"#,
+	);
+	assert!(errors.is_empty(), "errors: {errors:?}");
+	match &module.members[0] {
+		Declaration::Impl { type_, members, .. } => {
+			assert!(matches!(&type_.0, Type::Int));
+			assert!(!members.is_empty());
+		}
+		_ => panic!("expected impl block"),
+	}
+}
+
+#[test]
+fn test_parse_struct_with_default_field() {
+	let (module, errors) = parse_module("struct Config(debug: boolean = false) {}");
+	assert!(errors.is_empty(), "errors: {errors:?}");
+	match &module.members[0] {
+		Declaration::Struct { name, fields, .. } => {
+			assert_eq!(name.0, "Config");
+			assert_eq!(fields.len(), 1);
+			assert!(fields[0].0.default.is_some());
+		}
+		_ => panic!("expected struct"),
+	}
+}
+
+#[test]
+fn test_parse_internal_let() {
+	let (module, errors) = parse_module("internal let secret = 42");
+	assert!(errors.is_empty(), "errors: {errors:?}");
+	match &module.members[0] {
+		Declaration::Let { visibility, .. } => {
+			assert_eq!(*visibility, Some(Visibility::Internal));
+		}
+		_ => panic!("expected internal let"),
+	}
+}
+
+#[test]
+fn test_parse_private_func() {
+	let (module, errors) = parse_module("private func helper() -> 0");
+	assert!(errors.is_empty(), "errors: {errors:?}");
+	match &module.members[0] {
+		Declaration::Func { visibility, .. } => {
+			assert_eq!(*visibility, Some(Visibility::Private));
+		}
+		_ => panic!("expected private func"),
+	}
+}
+
+#[test]
+fn test_parse_multiple_declarations() {
+	let (module, errors) = parse_module(
+		r#"
+		let x = 1
+		let y = 2
+		func add(a: int, b: int) -> a + b
+		"#,
+	);
+	assert!(errors.is_empty(), "errors: {errors:?}");
+	assert_eq!(module.members.len(), 3);
+}
+
+#[test]
+fn test_parse_struct_with_members_and_namespace() {
+	let (module, errors) = parse_module(
+		r#"struct Counter(value: int = 0) {
+			func increment() -> Counter(value = this.value + 1)
+
+			namespace {
+				let ZERO = Counter(value = 0)
+			}
+		}"#,
+	);
+	assert!(errors.is_empty(), "errors: {errors:?}");
+	match &module.members[0] {
+		Declaration::Struct { name, members, .. } => {
+			assert_eq!(name.0, "Counter");
+			assert!(members.len() >= 2);
+		}
+		_ => panic!("expected struct with members"),
+	}
+}
+
+#[test]
+fn test_parse_interface_with_extends() {
+	let (module, errors) = parse_module(
+		r#"interface Ordered: Comparable {
+			func compare(other: self): int
+		}"#,
+	);
+	assert!(errors.is_empty(), "errors: {errors:?}");
+	match &module.members[0] {
+		Declaration::Interface {
+			name,
+			super_interfaces,
+			..
+		} => {
+			assert_eq!(name.0, "Ordered");
+			assert_eq!(super_interfaces.len(), 1);
+		}
+		_ => panic!("expected interface with extends"),
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Error recovery tests
+// ═══════════════════════════════════════════════════════════════
+
+#[test]
+fn test_error_recovery_missing_func_body() {
+	let (_, errors) = parse_module("func foo()");
+	assert!(!errors.is_empty());
+}
+
+#[test]
+fn test_parse_deeply_nested_expression() {
+	let expr = parse_expr("((((42))))").unwrap();
+	match &expr.0 {
+		Expr::Grouped(inner) => match &inner.0 {
+			Expr::Grouped(inner2) => match &inner2.0 {
+				Expr::Grouped(inner3) => match &inner3.0 {
+					Expr::Grouped(inner4) => {
+						assert!(matches!(&inner4.0, Expr::Int(Spanned(42, _))));
+					}
+					_ => panic!("expected inner grouped"),
+				},
+				_ => panic!("expected inner grouped"),
+			},
+			_ => panic!("expected inner grouped"),
+		},
+		_ => panic!("expected grouped"),
+	}
+}
+
+#[test]
+fn test_parse_complex_pipeline() {
+	let expr = parse_expr("x |> f |> g |> h").unwrap();
+	match &expr.0 {
+		Expr::BinaryOp {
+			op: BinaryOperator::Pipe,
+			..
+		} => {}
+		_ => panic!("expected pipeline chain"),
+	}
+}
+
+#[test]
+fn test_parse_if_else_if_chain() {
+	let expr = parse_expr("if (a) 1 else if (b) 2 else 3").unwrap();
+	match &expr.0 {
+		Expr::If { otherwise, .. } => {
+			let otherwise = otherwise.as_ref().unwrap();
+			assert!(matches!(&otherwise.0, Expr::If { .. }));
+		}
+		_ => panic!("expected if-else-if chain"),
 	}
 }

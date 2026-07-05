@@ -1,9 +1,0 @@
-interface Equals<Other> {
-  func equals(other: Other): boolean
-
-  func not_equals(other: Other) -> !this.equals(other)
-}
-
-impl<T> Equals<Other = self> for T {
-  external func equals(other: self): boolean
-}

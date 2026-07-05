@@ -7,63 +7,104 @@ public let e = 2.71828182845904523536
 /// The golden ratio, (1 + √5) / 2.
 public let phi = 1.61803398874989484820
 
-/// Returns the distance of the input from 0, which is the value without its sign.
-public func abs(x: int): int -> if (x > 0) x else -x
-/// Returns the distance of the input from 0, which is the value without its sign.
-public func abs(x: float): float -> if (x > 0) x else -x
+/// Numeric methods shared by the built-in number types.
+impl int {
+  /// The distance from 0 — the value without its sign.
+  func abs(): int = if (this > 0) this else -this
+  /// -1, 0, or 1 according to the number's sign.
+  func sign(): int = match (this) {
+    0 -> 0,
+    1.. -> 1,
+    ..=-1 -> -1,
+  }
+  /// The midpoint between this number and `other`.
+  func midpoint(other: int) = (this + other) / 2
 
-/// Returns the sine of the input (in radians).
-/// Given a right triangle ABC and angle A as the input,
-/// the output of the function would be the ratio between the side opposite the angle
-/// to the hypotenuse of the triangle.
-public external func sin(x: float): float
+  /// Returns the sine of the input (in radians).
+  /// Given a right triangle ABC and angle A as the input,
+  /// the output of the function would be the ratio between the side opposite the angle
+  /// to the hypotenuse of the triangle.
+  func sin() = (this as float).sin()
 
-/// Returns the cosine of the input (in radians).
-/// Given a right triangle ABC and angle A as the input,
-/// the output of the function would be the ratio between the side adjecent to the angle
-/// to the hypotenuse of the triangle.
-public external func cos(x: float): float
+  /// Returns the cosine of the input (in radians).
+  /// Given a right triangle ABC and angle A as the input,
+  /// the output of the function would be the ratio between the side adjecent to the angle
+  /// to the hypotenuse of the triangle.
+  func cos() = (this as float).cos()
 
-/// Returns the tangent of the input (in radians).
-/// Given a right triangle ABC and angle A as the input,
-/// the output of the function would be the ratio between the side opposite to the angle
-/// to the side adjecent to the angle.
-public external func tan(x: float): float
+  /// Returns the tangent of the input (in radians).
+  /// Given a right triangle ABC and angle A as the input,
+  /// the output of the function would be the ratio between the side opposite to the angle
+  /// to the side adjecent to the angle.
+  func tan() = (this as float).tan()
 
-public external func asin(x: float): float
-public external func acos(x: float): float
-public external func atan(x: float): float
+  func asin() = (this as float).asin()
+  func acos() = (this as float).acos()
+  func atan() = (this as float).atan()
 
-public external func sinh(x: float): float
-public external func cosh(x: float): float
-public external func tanh(x: float): float
+  func sinh() = (this as float).sinh()
+  func cosh() = (this as float).cosh()
+  func tanh() = (this as float).tanh()
 
-public external func asinh(x: float): float
-public external func acosh(x: float): float
-public external func atanh(x: float): float
+  func asinh() = (this as float).asinh()
+  func acosh() = (this as float).acosh()
+  func atanh() = (this as float).atanh()
 
-public external func atan2(y: float, x: float): float
-
-public func sign(x: int): int -> match (x) {
-  0 -> 0,
-  1..< -> 1,
-  ..=-1 -> -1,
+  func sqrt() = this ** 0.5
 }
-public func sign(x: float): int -> match (x) {
-  0 -> 0,
-  1..< -> 1,
-  ..=-1 -> -1,
+
+impl float {
+  /// The distance from 0 — the value without its sign.
+  func abs(): float = if (this > 0) this else -this
+  /// -1, 0, or 1 according to the number's sign.
+  func sign(): int = match (this.compare_to(0)) {
+    Order.Equal -> 0,
+    Order.GreaterThan -> 1,
+    Order.LessThan -> -1,
+  }
+  /// The midpoint between this number and `other`.
+  func midpoint(other: float) = (this + other) / 2
+
+  /// Returns the sine of the input (in radians).
+  /// Given a right triangle ABC and angle A as the input,
+  /// the output of the function would be the ratio between the side opposite the angle
+  /// to the hypotenuse of the triangle.
+  external(sin) func sin(): float
+
+  /// Returns the cosine of the input (in radians).
+  /// Given a right triangle ABC and angle A as the input,
+  /// the output of the function would be the ratio between the side adjecent to the angle
+  /// to the hypotenuse of the triangle.
+  external(cos) func cos(): float
+
+  /// Returns the tangent of the input (in radians).
+  /// Given a right triangle ABC and angle A as the input,
+  /// the output of the function would be the ratio between the side opposite to the angle
+  /// to the side adjecent to the angle.
+  external(tan) func tan(): float
+
+  external(asin) func asin(): float
+  external(acos) func acos(): float
+  external(atan) func atan(): float
+
+  external(sinh) func sinh(): float
+  external(cosh) func cosh(): float
+  external(tanh) func tanh(): float
+
+  external(asinh) func asinh(): float
+  external(acosh) func acosh(): float
+  external(atanh) func atanh(): float
+
+  external(floor) func floor(): int
+  external(ceil) func ceil(): int
+  external(round) func round(): int
+
+  func sqrt() = this ** 0.5
 }
-public external func floor(x: float): int
-public external func ceil(x: float): int
-public external func round(x: float): int
 
-public func midpoint(x: int, y: int) -> (x + y) / 2
-public func midpoint(x: float, y: float) -> (x + y) / 2
-
-public func sqrt(x: float) -> x ** 0.5
+public external(atan2) func atan2(y: float, x: float): float
 
 public let max_int = 2 ** 63 - 1
 public let min_int = -2 ** 63
-public external let max_float: float
-public external let min_float: float
+public external(max_float) let max_float: float
+public external(min_float) let min_float: float

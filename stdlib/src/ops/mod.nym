@@ -1,0 +1,329 @@
+interface Plus<Other, Output> {
+  func plus(other: Other): Output
+}
+
+interface Minus<Other, Output> {
+  func minus(other: Other): Output
+}
+
+interface Times<Other, Output> {
+  func times(other: Other): Output
+}
+
+interface Divide<Other, Output> {
+  func divide(other: Other): Output
+}
+
+interface Remainder<Other, Output> {
+  func remainder(other: Other): Output
+}
+
+interface Power<Other, Output> {
+  func power(other: Other): Output
+}
+
+interface Negate<Output> {
+  func negate(): Output
+}
+
+interface LeftShift<Other, Output> {
+  func shl(other: Other): Output
+}
+
+interface RightShift<Other, Output> {
+  func shr(other: Other): Output
+}
+
+interface BitAnd<Other, Output> {
+  func bit_and(other: Other): Output
+}
+
+interface BitOr<Other, Output> {
+  func bit_or(other: Other): Output
+}
+
+interface BitXor<Other, Output> {
+  func bit_xor(other: Other): Output
+}
+
+interface BitNot<Output> {
+  func bit_not(): Output
+}
+
+interface And<Other, Output> {
+  func and(other: Other): Output
+}
+
+interface Or<Other, Output> {
+  func or(other: Other): Output
+}
+
+interface Not<Output> {
+  func not(): Output
+}
+
+enum Order {
+  LessThan,
+  Equal,
+  GreaterThan,
+}
+
+interface Equals<Other> {
+  func equals(other: Other): boolean
+
+  func not_equals(other: Other): boolean = !this.equals(other)
+}
+
+interface Contains<Item: Equals<Other = Item>> {
+  func contains(item: Item): boolean
+
+  func not_contains(item: Item): boolean = !this.contains(item)
+}
+
+interface Unwrap<Output> {
+  func unwrap(default: Output): Output
+}
+
+interface Index<Key, Output> {
+  func index(key: Key): Output
+}
+
+interface Into<Other> {
+  func into(): Other
+}
+
+interface Comparable<Other> {
+  func compare_to(other: Other): Order
+
+  func less_than(other: Other): boolean = this.compare_to(other) == Order.LessThan
+  func less_than_eq(other: Other): boolean = this.compare_to(other) != Order.GreaterThan
+
+  func greater_than(other: Other): boolean = this.compare_to(other) == Order.GreaterThan
+  func greater_than_eq(other: Other): boolean = this.compare_to(other) != Order.LessThan
+
+  func min(other: Other): self = if (this.compare_to(other) == Order.LessThan) this else other
+  func max(other: Other): self = if (this.compare_to(other) == Order.GreaterThan) this else other
+
+  impl Equals<Other> {
+    func equals(other: Other): boolean = this.compare_to(other) == Order.Equal
+  }
+}
+
+// --- Primitive / generic implementations that have no type-specific module ---
+
+// Plus for int
+impl Plus<Other = self, Output = self> for int {
+  external func plus(other: self): self
+}
+
+impl Plus<Other = float, Output = float> for int {
+  external func plus(other: float): float
+}
+
+// Plus for float
+impl Plus<Other = self, Output = self> for float {
+  external func plus(other: self): self
+}
+
+impl Plus<Other = int, Output = self> for float {
+  external func plus(other: int): self
+}
+
+// Plus for char
+impl Plus<Other = int, Output = self> for char {
+  external(plus_char_int) func plus(other: int): self
+}
+
+// Minus for int
+impl Minus<Other = int, Output = int> for int {
+  external(minus) func minus(other: int): int
+}
+
+impl Minus<Other = float, Output = float> for int {
+  external(minus) func minus(other: float): float
+}
+
+// Minus for float
+impl Minus<Other = float, Output = float> for float {
+  external(minus) func minus(other: float): float
+}
+
+impl Minus<Other = int, Output = float> for float {
+  external(minus) func minus(other: int): float
+}
+
+// Times for int
+impl Times<Other = self, Output = self> for int {
+  external func times(other: self): self
+}
+
+impl Times<Other = float, Output = float> for int {
+  external func times(other: float): float
+}
+
+// Times for float
+impl Times<Other = self, Output = self> for float {
+  external func times(other: self): self
+}
+
+impl Times<Other = int, Output = self> for float {
+  external func times(other: int): self
+}
+
+// Divide for int
+impl Divide<Other = int, Output = float> for int {
+  external(divide) func divide(other: int): float
+}
+
+impl Divide<Other = float, Output = float> for int {
+  external(divide) func divide(other: float): float
+}
+
+// Divide for float
+impl Divide<Other = float, Output = float> for float {
+  external(divide) func divide(other: float): float
+}
+
+impl Divide<Other = int, Output = float> for float {
+  external(divide) func divide(other: int): float
+}
+
+// Remainder for int
+impl Remainder<Other = int, Output = int> for int {
+  external func remainder(other: int): int
+}
+
+// Power for uint -> float (no negative bases, but fractional results possible)
+impl Power<Other = uint, Output = float> for uint {
+  external func power(other: uint): float
+}
+
+impl Power<Other = int, Output = float> for uint {
+  external func power(other: int): float
+}
+
+impl Power<Other = float, Output = float> for uint {
+  external func power(other: float): float
+}
+
+// Negate for int/float
+impl Negate<Output = int> for int {
+  func negate(): int = this * -1
+}
+
+impl Negate<Output = float> for float {
+  func negate(): float = this * -1
+}
+
+// Bitwise for int
+impl LeftShift<Other = int, Output = int> for int {
+  external(shl) func shl(other: int): int
+}
+
+impl RightShift<Other = int, Output = int> for int {
+  external(shr) func shr(other: int): int
+}
+
+impl BitAnd<Other = int, Output = int> for int {
+  external(bit_and) func bit_and(other: int): int
+}
+
+impl BitOr<Other = int, Output = int> for int {
+  external(bit_or) func bit_or(other: int): int
+}
+
+impl BitXor<Other = int, Output = int> for int {
+  external(bit_xor) func bit_xor(other: int): int
+}
+
+impl BitNot<Output = int> for int {
+  external(bit_not) func bit_not(): int
+}
+
+// Bitwise for boolean
+impl BitAnd<Other = boolean, Output = boolean> for boolean {
+  func bit_and(other: boolean): boolean = if (this) other else false
+}
+
+impl BitOr<Other = boolean, Output = boolean> for boolean {
+  func bit_or(other: boolean): boolean = if (this) true else other
+}
+
+impl BitXor<Other = boolean, Output = boolean> for boolean {
+  func bit_xor(other: boolean): boolean = if (this) !other else other
+}
+
+impl BitNot<Output = boolean> for boolean {
+  func bit_not(): boolean = !this
+}
+
+// Boolean ops
+impl And<Other = boolean, Output = boolean> for boolean {
+  func and(other: boolean): boolean = if (this) other else false 
+}
+
+impl Or<Other = boolean, Output = boolean> for boolean {
+  func or(other: boolean): boolean = if (this) true else other
+}
+
+impl Not<Output = boolean> for boolean {
+  func not(): boolean = if (this) false else true
+}
+
+// Comparable for int
+impl Comparable<Other = self> for int {
+  external(compare_to_int) func compare_to(other: self): Order
+}
+
+// Comparable for float
+impl Comparable<Other = self> for float {
+  external(compare_to_float) func compare_to(other: self): Order
+}
+
+// Comparable for char
+impl Comparable<Other = self> for char {
+  external(compare_to_char) func compare_to(other: self): Order
+}
+
+// Comparable for string
+external(compare_to_string) func compare_to_string(first: string, second: string): int
+
+impl Comparable<Other = self> for string {
+  func compare_to(other: self) = {
+    let ordering = compare_to_string(this, other)
+
+    if (ordering < 0) Order.LessThan
+    else if (ordering > 0) Order.GreaterThan
+    else Order.Equal
+  }
+}
+
+// Comparable for boolean
+impl Comparable<Other = self> for boolean {
+  func compare_to(other: self) = match (#(this, other)) {
+    #(false, true) -> Order.LessThan,
+    #(false, false) | #(true, true) -> Order.Equal,
+    #(true, false) -> Order.GreaterThan,
+  }
+}
+
+// Comparable for unit
+impl Comparable<Other = self> for #() {
+  func compare_to(_: self) = Order.Equal
+}
+
+// Comparable extension: minmax
+impl<T> Comparable<Other = T> for T {
+  func minmax(other: T) =
+    if (this.compare_to(other) == Order.LessThan) #(this, other) else #(other, this)  
+}
+
+// Equals blanket impl
+impl<T> Equals<Other = self> for T {
+  external(equals) func equals(other: self): boolean
+}
+
+// Into for boolean -> string
+impl Into<string> for boolean {
+  func into() = if (this) "true" else "false"
+}

@@ -1,35 +1,7 @@
 import @/iter with (Iterator)
 
-/**
-  An object which is able to be iterated over (using a `for` loop, for example) by turning it into
-  an iterator.
-*/
+/// An object which is able to be iterated over, for example by a `for` loop, by turning it into
+/// an iterator.
 public interface Iterable<T> {
   func iter(): Iterator<T>
-}
-
-impl<T> Iterable<T> for #[T] {
-  func iter() -> ListIterator(this)
-}
-
-struct ListIterator<T>(list: #[T], current: int = 0) {
-  impl Iterator<T> {
-    func next() -> {
-      this.current += 1
-      this.list[this.current - 1]
-    }
-  }
-}
-
-impl<K, V> Iterable<#(K, V)> for #{K: V} {
-  func iter() -> MapIter(this)
-}
-
-struct MapIter<K, V>(map: #{K: V}, current: int = 0) {
-  impl Iterator<#(K, V)> {
-    func next() -> {
-      this.current += 1
-      this.list[this.current - 1]
-    }
-  }
 }

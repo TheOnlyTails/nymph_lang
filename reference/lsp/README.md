@@ -106,7 +106,7 @@ cargo test --package nymph-lsp
 ## Dependencies
 
 - `tower-lsp` - LSP protocol framework
-- `tokio` - Async runtime
+- `smol` - Async runtime
 - `serde` / `serde_json` - JSON serialization
 - `nymph-compiler` - Nymph language compiler
 - `ecow` - Efficient copy-on-write strings

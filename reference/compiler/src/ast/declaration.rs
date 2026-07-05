@@ -33,13 +33,13 @@ pub enum Declaration {
 		meta: LetDeclaration,
 		value: Spanned<Expr>,
 	},
-	ExternalLet(Option<Visibility>, LetDeclaration),
+	ExternalLet(Option<Visibility>, EcoString, LetDeclaration),
 	Func {
 		visibility: Option<Visibility>,
 		meta: FuncDeclaration,
 		body: Spanned<Expr>,
 	},
-	ExternalFunc(Option<Visibility>, FuncDeclaration),
+	ExternalFunc(Option<Visibility>, EcoString, FuncDeclaration),
 	/// Redefines a type with a new name.
 	/// ```nym
 	/// type VeryVeryNested = #[#(#{#[int]: #(string, float)}, #[boolean)]
@@ -220,13 +220,13 @@ pub enum ImplMember {
 		meta: LetDeclaration,
 		value: Spanned<Expr>,
 	},
-	ExternalLet(Option<Visibility>, LetDeclaration),
+	ExternalLet(Option<Visibility>, EcoString, LetDeclaration),
 	Func {
 		visibility: Option<Visibility>,
 		meta: FuncDeclaration,
 		body: Spanned<Expr>,
 	},
-	ExternalFunc(Option<Visibility>, FuncDeclaration),
+	ExternalFunc(Option<Visibility>, EcoString, FuncDeclaration),
 }
 
 #[derive(Debug, Clone, PartialEq, salsa::Update)]

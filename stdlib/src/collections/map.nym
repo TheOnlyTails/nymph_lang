@@ -1,0 +1,41 @@
+import @/option with (Option)
+import @/ops with (Plus, Into, Contains)
+
+impl<K, V> mut #{K: V} {
+  external(size) func size(): uint
+  external(get) func get(key: K): Option<V>
+  external(insert) func insert(key: K, value: V): boolean
+  external(remove) func remove(key: K): Option<V>
+  external(clear) func clear()
+  external(get_or_insert) func get_or_insert(key: K, default: V): V
+
+  /// Returns `true` if the map contains no entries.
+  func is_empty(): boolean = this.size() == 0
+  func is_not_empty(): boolean = !this.is_empty()
+}
+
+impl<K, V> #{K: V} {
+  /// Returns `true` if the map contains the given key.
+  external(contains_key) func contains_key(key: K): boolean
+
+  /// Returns a list of all keys.
+  external(keys) func keys(): #[K]
+
+  /// Returns a list of all values.
+  external(values) func values(): #[V]
+
+  /// Returns a list of all key-value pairs as tuples.
+  external(entries) func entries(): #[#(K, V)]
+}
+
+impl<K, V> Plus<Other = self, Output = self> for #{K: V} {
+  external(merge) func plus(other: self): self
+}
+
+impl<K: Into<string>, V: Into<string>> Into<string> for #{K: V} {
+  external(to_string) func into(): string
+}
+
+impl<K, V> Contains<Item = K> for #{K: V} {
+  external(contains_key) func contains(item: K): boolean
+}

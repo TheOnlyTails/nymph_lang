@@ -1,5 +1,6 @@
-use ariadne::Source;
-use nymph_compiler::db::{DiagnosticKind, Diagnostics, NymphDatabase, ProjectConfig, SourceFile};
+use ariadne::{Color, Config, Label, Report, ReportKind, Source};
+use nymph_compiler::config::load_compiler_project_config;
+use nymph_compiler::db::{DiagnosticKind, Diagnostics, NymphDatabase, SourceFile};
 use nymph_compiler::queries::{parse_file, typecheck_file};
 use std::fs::read_to_string;
 use std::path::PathBuf;
@@ -10,7 +11,8 @@ fn stdlib_tests() {
 	let stdlib_root = PathBuf::from("../stdlib")
 		.canonicalize()
 		.expect("stdlib directory not found");
-	let config = ProjectConfig::new(&db, stdlib_root);
+	let config = load_compiler_project_config(&db, stdlib_root, PathBuf::from("dist"))
+		.expect("expected stdlib config to load");
 
 	for file in glob::glob("../stdlib/src/**/*.nym")
 		.unwrap()
@@ -53,16 +55,16 @@ fn stdlib_tests() {
 				} else {
 					read_to_string(d.file_path.as_str()).unwrap_or_default()
 				};
-				let report = ariadne::Report::build(
-					ariadne::ReportKind::Error,
+				let report = Report::build(
+					ReportKind::Error,
 					(d.file_path.clone(), d.span.start..d.span.end),
 				)
-				.with_config(ariadne::Config::new().with_tab_width(2))
+				.with_config(Config::new().with_tab_width(2))
 				.with_message(&d.message)
 				.with_label(
-					ariadne::Label::new((d.file_path.clone(), d.span.start..d.span.end))
+					Label::new((d.file_path.clone(), d.span.start..d.span.end))
 						.with_message(&d.message)
-						.with_color(ariadne::Color::Red),
+						.with_color(Color::Red),
 				)
 				.finish();
 				report

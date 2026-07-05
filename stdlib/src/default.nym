@@ -3,33 +3,33 @@ public interface Default {
 }
 
 impl Default for int {
-  func default() -> 0
+  func default() = 0
 }
 
 impl Default for float {
-  func default() -> 0f
+  func default() = 0f
 }
 
 impl Default for boolean {
-  func default() -> false
+  func default() = false
 }
 
 impl Default for char {
-  func default() -> '\u0'
+  func default() = '\u0'
 }
 
 impl Default for string {
-  func default() -> ""
+  func default() = ""
 }
 
 impl Default for #() {
-  func default() -> #()
+  func default() = #()
 }
 
 impl<T> Default for #[T] {
-  func default() -> #[]
+  func default() = #[]
 }
 
 impl<K, V> Default for #{K: V} {
-  func default() -> #{}
+  func default() = #{}
 }

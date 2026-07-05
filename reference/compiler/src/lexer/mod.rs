@@ -26,6 +26,7 @@ pub(crate) fn lexer<'src>() -> impl Lexer<'src, Vec<Spanned<Token>>> {
 			float_lexer(),
 			int_lexer(),
 			keyword_lexer(),
+			anonymous_param_lexer(),
 			punct_lexer(),
 			ident_lexer(),
 			char_lexer(),
@@ -84,6 +85,11 @@ fn int_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
 					));
 					Spanned(Token::Error, span.into())
 				}
+
+				(Token::BinaryInt(v), "u" | "U") => Spanned(Token::BinaryUInt(*v), e.span().into()),
+				(Token::OctalInt(v), "u" | "U") => Spanned(Token::OctalUInt(*v), e.span().into()),
+				(Token::HexInt(v), "u" | "U") => Spanned(Token::HexUInt(*v), e.span().into()),
+				(Token::DecimalInt(v), "u" | "U") => Spanned(Token::DecimalUInt(*v), e.span().into()),
 
 				(Token::BinaryInt(_) | Token::DecimalInt(0), invalid_digits)
 					if Regex::new(r"[bB]?(_?[2-9])+")
@@ -379,6 +385,24 @@ fn ident_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
 		.boxed()
 }
 
+fn anonymous_param_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
+	just('$')
+		.ignore_then(text::digits(10).to_slice().or_not())
+		.try_map(|digits, span| {
+			digits
+				.map(|digits: &str| {
+					digits
+						.parse::<u32>()
+						.map(Some)
+						.map_err(|_| Rich::custom(span, "Anonymous parameter index is too large"))
+				})
+				.unwrap_or(Ok(None))
+				.map(Token::AnonymousParam)
+		})
+		.map_with(Spanned::new)
+		.boxed()
+}
+
 fn delimiter_lexer<'src, T: Lexer<'src, Spanned<Token>>>(
 	token: T,
 ) -> impl Lexer<'src, Spanned<Token>> {
@@ -456,6 +480,7 @@ fn keyword_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
 		text::keyword("else").to(Token::Else),
 		text::keyword("match").to(Token::Match),
 		text::keyword("int").to(Token::IntType),
+		text::keyword("uint").to(Token::UIntType),
 		text::keyword("float").to(Token::FloatType),
 		text::keyword("boolean").to(Token::BooleanType),
 		text::keyword("char").to(Token::CharType),
@@ -556,6 +581,10 @@ mod tests {
 	#[test_case("0b1010_1010" => Ok(vec![Token::BinaryInt(170).spanned(0..11)]) ; "binary with separator")]
 	#[test_case("0o755" => Ok(vec![Token::OctalInt(493).spanned(0..5)]) ; "octal")]
 	#[test_case("0o77_77" => Ok(vec![Token::OctalInt(4095).spanned(0..7)]) ; "octal with separator")]
+	#[test_case("1234u" => Ok(vec![Token::DecimalUInt(1234).spanned(0..5)]) ; "unsigned decimal")]
+	#[test_case("0xFFu" => Ok(vec![Token::HexUInt(255).spanned(0..5)]) ; "unsigned hex")]
+	#[test_case("0b1010u" => Ok(vec![Token::BinaryUInt(10).spanned(0..7)]) ; "unsigned binary")]
+	#[test_case("0o755u" => Ok(vec![Token::OctalUInt(493).spanned(0..6)]) ; "unsigned octal")]
 	// floats
 	#[test_case("1.23" => Ok(vec![Token::Float(OrderedFloat(1.23)).spanned(0..4)]) ; "simple float")]
 	#[test_case("1_234.567_89" => Ok(vec![Token::Float(OrderedFloat(1234.56789)).spanned(0..12)]) ; "float with separators")]
@@ -584,6 +613,9 @@ mod tests {
 	#[test_case("SCREAMING_SNAKE" => Ok(vec![Token::Identifier("SCREAMING_SNAKE".into()).spanned(0..15)]) ; "screaming snake")]
 	#[test_case("αβγ" => Ok(vec![Token::Identifier("αβγ".into()).spanned(0..6)]) ; "unicode letters")]
 	#[test_case("foo123_αβγ" => Ok(vec![Token::Identifier("foo123_αβγ".into()).spanned(0..13)]) ; "mixed alphanumeric unicode")]
+	#[test_case("$" => Ok(vec![Token::AnonymousParam(None).spanned(0..1)]) ; "anonymous param default")]
+	#[test_case("$0" => Ok(vec![Token::AnonymousParam(Some(0)).spanned(0..2)]) ; "anonymous param zero")]
+	#[test_case("$12" => Ok(vec![Token::AnonymousParam(Some(12)).spanned(0..3)]) ; "anonymous param index")]
 	// keywords
 	#[test_case("func" => Ok(vec![Token::Func.spanned(0..4)]) ; "func keyword")]
 	#[test_case("let" => Ok(vec![Token::Let.spanned(0..3)]) ; "let keyword")]
@@ -610,6 +642,7 @@ mod tests {
 	#[test_case("while" => Ok(vec![Token::While.spanned(0..5)]) ; "while keyword")]
 	#[test_case("match" => Ok(vec![Token::Match.spanned(0..5)]) ; "match keyword")]
 	#[test_case("int" => Ok(vec![Token::IntType.spanned(0..3)]) ; "int type keyword")]
+	#[test_case("uint" => Ok(vec![Token::UIntType.spanned(0..4)]) ; "uint type keyword")]
 	#[test_case("float" => Ok(vec![Token::FloatType.spanned(0..5)]) ; "float type keyword")]
 	#[test_case("boolean" => Ok(vec![Token::BooleanType.spanned(0..7)]) ; "boolean type keyword")]
 	#[test_case("char" => Ok(vec![Token::CharType.spanned(0..4)]) ; "char type keyword")]

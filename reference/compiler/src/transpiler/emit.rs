@@ -1,24 +1,26 @@
 use std::path::Path;
 
-use oxc_allocator::{Allocator, Vec as OxcVec};
-use oxc_ast::{AstBuilder, NONE, ast::*};
-use oxc_span::SPAN;
+use oxc::{
+	allocator::{Allocator, Vec as OxcVec},
+	ast::{AstBuilder, NONE, ast::*},
+	span::SPAN,
+};
 
 use crate::{
 	ast::{
 		self, Spanned,
 		declaration::{
-			Declaration, FuncDeclaration, ImplMember, LetDeclaration, Module, StructInnerMember,
-			Visibility,
+			Declaration, EnumVariant, FuncDeclaration, ImplMember, LetDeclaration, Module,
+			StructInnerMember, Visibility,
 		},
 		expr::{
 			Expr, ListItem, MapEntry, MatchArm, Pattern, Statement as NymphStatement, StringEscape,
-			StringPart,
+			StringPart, anonymous_params, rewrite_anonymous_params,
 		},
 		ops::{AssignOperator, BinaryOperator, PatternOperator},
 	},
 	transpiler::{
-		external::{external_export_name, find_external_module},
+		external::{bundled_external_module_name, find_external_module},
 		operators::{assign_op_to_binary, binary_op_method, postfix_op_method, prefix_op_method},
 	},
 	types::{Context, Type},
@@ -177,24 +179,118 @@ impl<'a> Emitter<'a> {
 		)
 	}
 
+	fn object_property(&self, name: &str, value: Expression<'a>) -> ObjectPropertyKind<'a> {
+		self.ast.object_property_kind_object_property(
+			SPAN,
+			PropertyKind::Init,
+			self
+				.ast
+				.property_key_static_identifier(SPAN, self.ast.ident(self.arena_str(name))),
+			value,
+			false,
+			false,
+			false,
+		)
+	}
+
+	fn object_string_property(&self, name: &str, value: Expression<'a>) -> ObjectPropertyKind<'a> {
+		self.ast.object_property_kind_object_property(
+			SPAN,
+			PropertyKind::Init,
+			self.string_lit(name).into(),
+			value,
+			false,
+			false,
+			false,
+		)
+	}
+
+	fn function_expression(&self, params: &[&str], body_expr: Expression<'a>) -> Expression<'a> {
+		let mut js_params = self.ast.vec();
+		for param in params {
+			js_params.push(
+				self
+					.ast
+					.plain_formal_parameter(SPAN, self.binding_pattern(param)),
+			);
+		}
+
+		let formal_params =
+			self
+				.ast
+				.formal_parameters(SPAN, FormalParameterKind::FormalParameter, js_params, NONE);
+		let body = self.ast.function_body(SPAN, self.ast.vec(), {
+			let mut stmts = self.ast.vec();
+			stmts.push(self.ast.statement_return(SPAN, Some(body_expr)));
+			stmts
+		});
+
+		self.ast.expression_function(
+			SPAN,
+			FunctionType::FunctionExpression,
+			None::<BindingIdentifier<'a>>,
+			false,
+			false,
+			false,
+			NONE,
+			NONE,
+			formal_params,
+			NONE,
+			Some(body),
+		)
+	}
+
+	fn bound_object(&self, tag: &str, value: Option<Expression<'a>>) -> Expression<'a> {
+		let mut props = self.ast.vec();
+		props.push(self.object_string_property("~tag", self.string_lit(tag)));
+		if let Some(value) = value {
+			props.push(self.object_property("value", value));
+		}
+		self.ast.expression_object(SPAN, props)
+	}
+
+	fn nymph_string(&self, value: Expression<'a>) -> Expression<'a> {
+		let mut args = self.ast.vec();
+		args.push(Argument::from(value));
+		self.call(self.ident_ref("__nymph_str"), args)
+	}
+
+	fn concat_expressions(&self, parts: Vec<Expression<'a>>) -> Expression<'a> {
+		parts
+			.into_iter()
+			.reduce(|left, right| {
+				self.ast.expression_binary(
+					SPAN,
+					left,
+					oxc::syntax::operator::BinaryOperator::Addition,
+					right,
+				)
+			})
+			.unwrap_or_else(|| self.string_lit(""))
+	}
+
 	fn var_decl_stmt(
 		&self,
 		kind: VariableDeclarationKind,
 		name: &str,
 		init: Expression<'a>,
 	) -> Statement<'a> {
-		let declarator = self.ast.variable_declarator(
-			SPAN,
-			kind,
-			self.binding_pattern(name),
-			NONE,
-			Some(init),
-			false,
-		);
+		self.var_decl_stmt_pat(kind, self.binding_pattern(name), init)
+	}
+
+	fn var_decl_stmt_pat(
+		&self,
+		kind: VariableDeclarationKind,
+		pat: BindingPattern<'a>,
+		init: Expression<'a>,
+	) -> Statement<'a> {
+		let declarator = self
+			.ast
+			.variable_declarator(SPAN, kind, pat, NONE, Some(init), false);
 		let decl = self
 			.ast
 			.variable_declaration(SPAN, kind, self.ast.vec1(declarator), false);
-		Statement::from(oxc_ast::ast::Declaration::VariableDeclaration(
+		Statement::from(oxc::ast::ast::Declaration::VariableDeclaration(
 			self.ast.alloc(decl),
 		))
 	}
@@ -238,8 +334,8 @@ impl<'a> Emitter<'a> {
 				} else {
 					VariableDeclarationKind::Const
 				};
-				let name = self.pattern_to_binding_name(&meta.name.0);
-				let stmt = self.var_decl_stmt(kind, &name, expr);
+				let pat = self.emit_pattern_binding(&meta.name.0);
+				let stmt = self.var_decl_stmt_pat(kind, pat, expr);
 				if is_export {
 					vec![self.export_stmt(stmt)]
 				} else {
@@ -247,8 +343,8 @@ impl<'a> Emitter<'a> {
 				}
 			}
 
-			Declaration::ExternalLet(visibility, meta) => {
-				self.emit_external_let(meta, *visibility, outer_name)
+			Declaration::ExternalLet(visibility, external_name, meta) => {
+				self.emit_external_let(meta, *visibility, external_name)
 			}
 
 			Declaration::Func {
@@ -260,8 +356,8 @@ impl<'a> Emitter<'a> {
 				vec![func_stmt]
 			}
 
-			Declaration::ExternalFunc(visibility, meta) => {
-				self.emit_external_func(meta, *visibility, outer_name)
+			Declaration::ExternalFunc(visibility, external_name, meta) => {
+				self.emit_external_func(meta, *visibility, external_name)
 			}
 
 			Declaration::TypeAlias { .. } => {
@@ -325,106 +421,7 @@ impl<'a> Emitter<'a> {
 		inner_members: &'a [Spanned<StructInnerMember>],
 		export: bool,
 	) -> Vec<Statement<'a>> {
-		let class_name = name.0.as_str();
-
-		// Constructor parameters & assignment
-		let mut constructor_params = self.ast.vec();
-		let mut constructor_body_stmts = self.ast.vec();
-
-		for field in fields {
-			let fname = field.0.name.0.as_str();
-			let param = self
-				.ast
-				.plain_formal_parameter(SPAN, self.binding_pattern(fname));
-			constructor_params.push(param);
-
-			// this.fieldName = fieldName;
-			let assign = self.ast.expression_assignment(
-				SPAN,
-				AssignmentOperator::Assign,
-				self.assign_target_static_member(self.ast.expression_this(SPAN), fname),
-				self.ident_ref(fname),
-			);
-			constructor_body_stmts.push(self.ast.statement_expression(SPAN, assign));
-		}
-
-		let constructor_params = self.ast.formal_parameters(
-			SPAN,
-			FormalParameterKind::FormalParameter,
-			constructor_params,
-			NONE,
-		);
-		let constructor_body = self
-			.ast
-			.function_body(SPAN, self.ast.vec(), constructor_body_stmts);
-
-		let constructor = self.ast.class_element_method_definition(
-			SPAN,
-			MethodDefinitionType::MethodDefinition,
-			self.ast.vec(),
-			PropertyKey::StaticIdentifier(
-				self
-					.ast
-					.alloc(self.ast.identifier_name(SPAN, "constructor")),
-			),
-			self.ast.alloc(self.ast.function(
-				SPAN,
-				FunctionType::FunctionExpression,
-				None::<BindingIdentifier<'a>>,
-				false, // generator
-				false, // async
-				false, // declare
-				NONE,
-				NONE,
-				constructor_params,
-				NONE,
-				Some(constructor_body),
-			)),
-			MethodDefinitionKind::Constructor,
-			false, // computed
-			false, // static
-			false, // override
-			false, // optional
-			None,
-		);
-
-		let mut class_body_elements = self.ast.vec();
-		class_body_elements.push(constructor);
-
-		// Emit instance members
-		for inner in inner_members {
-			match &inner.0 {
-				StructInnerMember::Member(member) => {
-					if let Some(el) = self.emit_impl_member_as_class_element(&member.0, false) {
-						class_body_elements.push(el);
-					}
-				}
-				StructInnerMember::Namespace(members) => {
-					for m in members {
-						if let Some(el) = self.emit_impl_member_as_class_element(&m.0, true) {
-							class_body_elements.push(el);
-						}
-					}
-				}
-				StructInnerMember::Impl { members, .. } => {
-					for m in members {
-						if let Some(el) = self.emit_impl_member_as_class_element(&m.0, false) {
-							class_body_elements.push(el);
-						}
-					}
-				}
-				StructInnerMember::ImplMut(members) => {
-					for m in members {
-						if let Some(el) = self.emit_impl_member_as_class_element(&m.0, false) {
-							class_body_elements.push(el);
-						}
-					}
-				}
-			}
-		}
-
-		// Actually, let's use declaration_class directly
-		self.emit_class_declaration(class_name, fields, inner_members, export)
+		self.emit_class_declaration(name.0.as_str(), fields, inner_members, export)
 	}
 
 	fn emit_class_declaration(
@@ -494,24 +491,31 @@ impl<'a> Emitter<'a> {
 
 		let mut elements = self.ast.vec();
 		elements.push(constructor);
+		let mut hoisted: Vec<Statement<'a>> = vec![];
 
 		for inner in inner_members {
 			match &inner.0 {
 				StructInnerMember::Member(m) => {
-					if let Some(el) = self.emit_impl_member_as_class_element(&m.0, false) {
+					let (extra, el) = self.emit_impl_member_as_class_element(&m.0, false);
+					hoisted.extend(extra);
+					if let Some(el) = el {
 						elements.push(el);
 					}
 				}
 				StructInnerMember::Namespace(members) => {
 					for m in members {
-						if let Some(el) = self.emit_impl_member_as_class_element(&m.0, true) {
+						let (extra, el) = self.emit_impl_member_as_class_element(&m.0, true);
+						hoisted.extend(extra);
+						if let Some(el) = el {
 							elements.push(el);
 						}
 					}
 				}
 				StructInnerMember::Impl { members, .. } | StructInnerMember::ImplMut(members) => {
 					for m in members {
-						if let Some(el) = self.emit_impl_member_as_class_element(&m.0, false) {
+						let (extra, el) = self.emit_impl_member_as_class_element(&m.0, false);
+						hoisted.extend(extra);
+						if let Some(el) = el {
 							elements.push(el);
 						}
 					}
@@ -535,18 +539,25 @@ impl<'a> Emitter<'a> {
 		);
 
 		let stmt: Statement<'a> = Statement::from(class_decl);
+		let mut result = hoisted;
 		if export {
-			vec![self.export_stmt(stmt)]
+			result.push(self.export_stmt(stmt));
 		} else {
-			vec![stmt]
+			result.push(stmt);
 		}
+		result
 	}
 
+	/// Emit an `ImplMember` as a class element (for structs).
+	///
+	/// Returns `(hoisted_stmts, class_element)`. The hoisted statements (e.g.
+	/// import declarations for external functions) must be placed *before* the
+	/// class declaration.
 	fn emit_impl_member_as_class_element(
 		&mut self,
 		member: &'a ImplMember,
 		is_static: bool,
-	) -> Option<ClassElement<'a>> {
+	) -> (Vec<Statement<'a>>, Option<ClassElement<'a>>) {
 		match member {
 			ImplMember::Func { meta, body, .. } => {
 				let method_name = meta.name.0.as_str();
@@ -570,66 +581,247 @@ impl<'a> Emitter<'a> {
 				body_stmts.push(self.ast.statement_return(SPAN, Some(ret_expr)));
 				let fn_body = self.ast.function_body(SPAN, self.ast.vec(), body_stmts);
 
-				Some(self.ast.class_element_method_definition(
-					SPAN,
-					MethodDefinitionType::MethodDefinition,
-					self.ast.vec(),
-					PropertyKey::StaticIdentifier(
-						self.ast.alloc(self.ast.identifier_name(SPAN, method_name)),
-					),
-					self.ast.alloc(self.ast.function(
+				(
+					vec![],
+					Some(self.ast.class_element_method_definition(
 						SPAN,
-						FunctionType::FunctionExpression,
-						None::<BindingIdentifier<'a>>,
+						MethodDefinitionType::MethodDefinition,
+						self.ast.vec(),
+						PropertyKey::StaticIdentifier(
+							self.ast.alloc(self.ast.identifier_name(SPAN, method_name)),
+						),
+						self.ast.alloc(self.ast.function(
+							SPAN,
+							FunctionType::FunctionExpression,
+							None::<BindingIdentifier<'a>>,
+							false,
+							false,
+							false,
+							NONE,
+							NONE,
+							formal_params,
+							NONE,
+							Some(fn_body),
+						)),
+						MethodDefinitionKind::Method,
+						false,
+						is_static,
 						false,
 						false,
-						false,
-						NONE,
-						NONE,
-						formal_params,
-						NONE,
-						Some(fn_body),
+						None,
 					)),
-					MethodDefinitionKind::Method,
-					false,
-					is_static,
-					false,
-					false,
-					None,
-				))
+				)
 			}
 			ImplMember::Let { meta, value, .. } => {
 				let js_val = self.emit_expr(value);
 				let init = js_val.into_expression(self.ast, self.alloc);
 				let prop_name = self.pattern_to_binding_name(&meta.name.0);
-				Some(
-					self.ast.class_element_property_definition(
-						SPAN,
-						PropertyDefinitionType::PropertyDefinition,
-						self.ast.vec(),
-						PropertyKey::StaticIdentifier(
-							self
-								.ast
-								.alloc(self.ast.identifier_name(SPAN, self.arena_str(&prop_name))),
+				(
+					vec![],
+					Some(
+						self.ast.class_element_property_definition(
+							SPAN,
+							PropertyDefinitionType::PropertyDefinition,
+							self.ast.vec(),
+							PropertyKey::StaticIdentifier(
+								self
+									.ast
+									.alloc(self.ast.identifier_name(SPAN, self.arena_str(&prop_name))),
+							),
+							NONE,
+							Some(init),
+							false,
+							is_static,
+							false,
+							false,
+							false,
+							false,
+							false,
+							None,
 						),
-						NONE,
-						Some(init),
-						false,
-						is_static,
-						false,
-						false,
-						false,
-						false,
-						false,
-						None,
 					),
 				)
 			}
-			ImplMember::ExternalFunc(..) | ImplMember::ExternalLet(..) => {
-				// TODO: emit import from external module
-				None
+			ImplMember::ExternalFunc(_, external_name, meta) => {
+				self.emit_external_impl_func_as_class_element(meta, external_name, is_static)
+			}
+			ImplMember::ExternalLet(_, external_name, meta) => {
+				self.emit_external_impl_let_as_class_element(meta, external_name, is_static)
 			}
 		}
+	}
+
+	/// Emit an external function inside an impl block as a class method.
+	///
+	/// Generates:
+	/// 1. `import { externalName as __ext$N } from "./file.ext";` (hoisted)
+	/// 2. A class method `methodName(...args) { return __ext$N(this, ...args); }`
+	fn emit_external_impl_func_as_class_element(
+		&mut self,
+		meta: &'a FuncDeclaration,
+		external_name: &str,
+		is_static: bool,
+	) -> (Vec<Statement<'a>>, Option<ClassElement<'a>>) {
+		let Some(ext_path) = self.source_path.and_then(find_external_module) else {
+			return (vec![], None);
+		};
+
+		let method_name = meta.name.0.as_str();
+		let import_alias = self.gensym("ext");
+		let import_alias_str = self.arena_str(&import_alias);
+
+		// import { externalName as __ext$N } from "./file.ext";
+		let rel = format!(
+			"./{}",
+			bundled_external_module_name(&ext_path)
+				.unwrap_or_else(|| { ext_path.file_name().unwrap().to_string_lossy().into_owned() })
+		);
+		let mut specifiers = self.ast.vec();
+		specifiers.push(ImportDeclarationSpecifier::ImportSpecifier(
+			self.ast.alloc(
+				self.ast.import_specifier(
+					SPAN,
+					self
+						.ast
+						.module_export_name_identifier_name(SPAN, self.arena_str(external_name)),
+					self.ast.binding_identifier(SPAN, import_alias_str),
+					ImportOrExportKind::Value,
+				),
+			),
+		));
+		let import = self.ast.module_declaration_import_declaration(
+			SPAN,
+			Some(specifiers),
+			self.ast.string_literal(SPAN, self.arena_str(&rel), None),
+			None,
+			NONE,
+			ImportOrExportKind::Value,
+		);
+		let import_stmt = Statement::from(import);
+
+		// Build wrapper method: methodName(...params) { return __ext$N(this, ...params); }
+		let mut params = self.ast.vec();
+		let mut call_args = self.ast.vec();
+
+		// First argument to the external function: `this`
+		if !is_static {
+			call_args.push(Argument::from(self.ast.expression_this(SPAN)));
+		}
+
+		for p in &meta.params {
+			let pname = self.pattern_to_binding_name(&p.0.name.0);
+			params.push(
+				self
+					.ast
+					.plain_formal_parameter(SPAN, self.binding_pattern(&pname)),
+			);
+			call_args.push(Argument::from(self.ident_ref(&pname)));
+		}
+
+		let formal_params =
+			self
+				.ast
+				.formal_parameters(SPAN, FormalParameterKind::FormalParameter, params, NONE);
+
+		let call_expr = self.call(self.ident_ref(import_alias_str), call_args);
+		let mut body_stmts = self.ast.vec();
+		body_stmts.push(self.ast.statement_return(SPAN, Some(call_expr)));
+		let fn_body = self.ast.function_body(SPAN, self.ast.vec(), body_stmts);
+
+		let class_el = self.ast.class_element_method_definition(
+			SPAN,
+			MethodDefinitionType::MethodDefinition,
+			self.ast.vec(),
+			PropertyKey::StaticIdentifier(self.ast.alloc(self.ast.identifier_name(SPAN, method_name))),
+			self.ast.alloc(self.ast.function(
+				SPAN,
+				FunctionType::FunctionExpression,
+				None::<BindingIdentifier<'a>>,
+				false,
+				false,
+				false,
+				NONE,
+				NONE,
+				formal_params,
+				NONE,
+				Some(fn_body),
+			)),
+			MethodDefinitionKind::Method,
+			false,
+			is_static,
+			false,
+			false,
+			None,
+		);
+
+		(vec![import_stmt], Some(class_el))
+	}
+
+	/// Emit an external let inside an impl block as a class property.
+	fn emit_external_impl_let_as_class_element(
+		&mut self,
+		meta: &LetDeclaration,
+		external_name: &str,
+		is_static: bool,
+	) -> (Vec<Statement<'a>>, Option<ClassElement<'a>>) {
+		let Some(ext_path) = self.source_path.and_then(find_external_module) else {
+			return (vec![], None);
+		};
+
+		let prop_name = self.pattern_to_binding_name(&meta.name.0);
+		let import_alias = self.gensym("ext");
+		let import_alias_str = self.arena_str(&import_alias);
+
+		let rel = format!(
+			"./{}",
+			bundled_external_module_name(&ext_path)
+				.unwrap_or_else(|| { ext_path.file_name().unwrap().to_string_lossy().into_owned() })
+		);
+		let mut specifiers = self.ast.vec();
+		specifiers.push(ImportDeclarationSpecifier::ImportSpecifier(
+			self.ast.alloc(
+				self.ast.import_specifier(
+					SPAN,
+					self
+						.ast
+						.module_export_name_identifier_name(SPAN, self.arena_str(external_name)),
+					self.ast.binding_identifier(SPAN, import_alias_str),
+					ImportOrExportKind::Value,
+				),
+			),
+		));
+		let import = self.ast.module_declaration_import_declaration(
+			SPAN,
+			Some(specifiers),
+			self.ast.string_literal(SPAN, self.arena_str(&rel), None),
+			None,
+			NONE,
+			ImportOrExportKind::Value,
+		);
+		let import_stmt = Statement::from(import);
+
+		let class_el = self.ast.class_element_property_definition(
+			SPAN,
+			PropertyDefinitionType::PropertyDefinition,
+			self.ast.vec(),
+			PropertyKey::StaticIdentifier(
+				self
+					.ast
+					.alloc(self.ast.identifier_name(SPAN, self.arena_str(&prop_name))),
+			),
+			NONE,
+			Some(self.ident_ref(import_alias_str)),
+			false,
+			is_static,
+			false,
+			false,
+			false,
+			false,
+			false,
+			None,
+		);
+
+		(vec![import_stmt], Some(class_el))
 	}
 
 	// ───────────────── enum emit ─────────────────
@@ -637,7 +829,7 @@ impl<'a> Emitter<'a> {
 	fn emit_enum(
 		&mut self,
 		name: &ast::Ident,
-		variants: &[Spanned<crate::ast::declaration::EnumVariant>],
+		variants: &[Spanned<EnumVariant>],
 		inner_members: &'a [Spanned<StructInnerMember>],
 		export: bool,
 	) -> Vec<Statement<'a>> {
@@ -657,19 +849,15 @@ impl<'a> Emitter<'a> {
 			if vfields.is_empty() {
 				// Singleton variant: EnumName.Variant = Object.freeze({ _tag: 'Variant' });
 				let mut props = self.ast.vec();
-				props.push(
-					self.ast.object_property_kind_object_property(
-						SPAN,
-						PropertyKind::Init,
-						self
-							.ast
-							.property_key_static_identifier(SPAN, self.ast.atom("~tag")),
-						self.string_lit(variant_name),
-						false,
-						false,
-						false,
-					),
-				);
+				props.push(self.ast.object_property_kind_object_property(
+					SPAN,
+					PropertyKind::Init,
+					self.string_lit("~tag").into(),
+					self.string_lit(variant_name),
+					false,
+					false,
+					false,
+				));
 				let obj = self.ast.expression_object(SPAN, props);
 				let frozen = self.method_call(self.ident_ref("Object"), "freeze", {
 					let mut args = self.ast.vec();
@@ -689,19 +877,15 @@ impl<'a> Emitter<'a> {
 				let mut obj_props = self.ast.vec();
 
 				// _tag property
-				obj_props.push(
-					self.ast.object_property_kind_object_property(
-						SPAN,
-						PropertyKind::Init,
-						self
-							.ast
-							.property_key_static_identifier(SPAN, self.ast.atom("~tag")),
-						self.string_lit(variant_name),
-						false,
-						false,
-						false,
-					),
-				);
+				obj_props.push(self.ast.object_property_kind_object_property(
+					SPAN,
+					PropertyKind::Init,
+					self.string_lit("~tag").into(),
+					self.string_lit(variant_name),
+					false,
+					false,
+					false,
+				));
 
 				for f in vfields {
 					let fname = f.0.name.0.as_str();
@@ -716,7 +900,7 @@ impl<'a> Emitter<'a> {
 							PropertyKind::Init,
 							self
 								.ast
-								.property_key_static_identifier(SPAN, self.ast.atom(fname)),
+								.property_key_static_identifier(SPAN, self.ast.ident(fname)),
 							self.ident_ref(fname),
 							false,
 							true, // shorthand
@@ -741,7 +925,7 @@ impl<'a> Emitter<'a> {
 
 				let arrow = self
 					.ast
-					.expression_arrow_function(SPAN, true, false, NONE, params, NONE, arrow_body);
+					.expression_arrow_function(SPAN, false, false, NONE, params, NONE, arrow_body);
 
 				let assign = self.ast.expression_assignment(
 					SPAN,
@@ -816,10 +1000,15 @@ impl<'a> Emitter<'a> {
 					s
 				});
 
-				let arrow =
-					self
-						.ast
-						.expression_arrow_function(SPAN, true, false, NONE, formal_params, NONE, fn_body);
+				let arrow = self.ast.expression_arrow_function(
+					SPAN,
+					false,
+					false,
+					NONE,
+					formal_params,
+					NONE,
+					fn_body,
+				);
 
 				let assign = self.ast.expression_assignment(
 					SPAN,
@@ -841,10 +1030,123 @@ impl<'a> Emitter<'a> {
 				);
 				stmts.push(self.ast.statement_expression(SPAN, assign));
 			}
-			ImplMember::ExternalFunc(..) | ImplMember::ExternalLet(..) => {
-				// TODO
+			ImplMember::ExternalFunc(_, external_name, meta) => {
+				self.emit_external_impl_func_on_object(meta, external_name, obj_name, stmts);
+			}
+			ImplMember::ExternalLet(_, external_name, meta) => {
+				self.emit_external_impl_let_on_object(meta, external_name, obj_name, stmts);
 			}
 		}
+	}
+
+	/// Emit an external function as a property on a namespace/enum object.
+	///
+	/// Generates:
+	/// 1. `import { externalName as __ext$N } from "./file.ext";`
+	/// 2. `ObjName.methodName = __ext$N;`
+	fn emit_external_impl_func_on_object(
+		&mut self,
+		meta: &FuncDeclaration,
+		external_name: &str,
+		obj_name: &str,
+		stmts: &mut Vec<Statement<'a>>,
+	) {
+		let Some(ext_path) = self.source_path.and_then(find_external_module) else {
+			return;
+		};
+
+		let method_name = meta.name.0.as_str();
+		let import_alias = self.gensym("ext");
+		let import_alias_str = self.arena_str(&import_alias);
+
+		let rel = format!(
+			"./{}",
+			bundled_external_module_name(&ext_path)
+				.unwrap_or_else(|| { ext_path.file_name().unwrap().to_string_lossy().into_owned() })
+		);
+		let mut specifiers = self.ast.vec();
+		specifiers.push(ImportDeclarationSpecifier::ImportSpecifier(
+			self.ast.alloc(
+				self.ast.import_specifier(
+					SPAN,
+					self
+						.ast
+						.module_export_name_identifier_name(SPAN, self.arena_str(external_name)),
+					self.ast.binding_identifier(SPAN, import_alias_str),
+					ImportOrExportKind::Value,
+				),
+			),
+		));
+		let import = self.ast.module_declaration_import_declaration(
+			SPAN,
+			Some(specifiers),
+			self.ast.string_literal(SPAN, self.arena_str(&rel), None),
+			None,
+			NONE,
+			ImportOrExportKind::Value,
+		);
+		stmts.push(Statement::from(import));
+
+		let assign = self.ast.expression_assignment(
+			SPAN,
+			AssignmentOperator::Assign,
+			self.assign_target_static_member(self.ident_ref(obj_name), method_name),
+			self.ident_ref(import_alias_str),
+		);
+		stmts.push(self.ast.statement_expression(SPAN, assign));
+	}
+
+	/// Emit an external let as a property on a namespace/enum object.
+	fn emit_external_impl_let_on_object(
+		&mut self,
+		meta: &LetDeclaration,
+		external_name: &str,
+		obj_name: &str,
+		stmts: &mut Vec<Statement<'a>>,
+	) {
+		let Some(ext_path) = self.source_path.and_then(find_external_module) else {
+			return;
+		};
+
+		let prop_name = self.pattern_to_binding_name(&meta.name.0);
+		let import_alias = self.gensym("ext");
+		let import_alias_str = self.arena_str(&import_alias);
+
+		let rel = format!(
+			"./{}",
+			bundled_external_module_name(&ext_path)
+				.unwrap_or_else(|| { ext_path.file_name().unwrap().to_string_lossy().into_owned() })
+		);
+		let mut specifiers = self.ast.vec();
+		specifiers.push(ImportDeclarationSpecifier::ImportSpecifier(
+			self.ast.alloc(
+				self.ast.import_specifier(
+					SPAN,
+					self
+						.ast
+						.module_export_name_identifier_name(SPAN, self.arena_str(external_name)),
+					self.ast.binding_identifier(SPAN, import_alias_str),
+					ImportOrExportKind::Value,
+				),
+			),
+		));
+		let import = self.ast.module_declaration_import_declaration(
+			SPAN,
+			Some(specifiers),
+			self.ast.string_literal(SPAN, self.arena_str(&rel), None),
+			None,
+			NONE,
+			ImportOrExportKind::Value,
+		);
+		stmts.push(Statement::from(import));
+
+		let assign = self.ast.expression_assignment(
+			SPAN,
+			AssignmentOperator::Assign,
+			self.assign_target_static_member(self.ident_ref(obj_name), &prop_name),
+			self.ident_ref(import_alias_str),
+		);
+		stmts.push(self.ast.statement_expression(SPAN, assign));
 	}
 
 	// ───────────────── namespace ─────────────────
@@ -888,64 +1190,177 @@ impl<'a> Emitter<'a> {
 
 		let mut stmts: Vec<Statement<'a>> = vec![];
 		for m in members {
-			if let ImplMember::Func { meta, body, .. } = &m.0 {
-				let method_name = meta.name.0.as_str();
-				let mut params = self.ast.vec();
-				for p in &meta.params {
-					let pname = self.pattern_to_binding_name(&p.0.name.0);
-					params.push(
-						self
-							.ast
-							.plain_formal_parameter(SPAN, self.binding_pattern(&pname)),
+			match &m.0 {
+				ImplMember::Func { meta, body, .. } => {
+					let method_name = meta.name.0.as_str();
+					let mut params = self.ast.vec();
+					for p in &meta.params {
+						let pname = self.pattern_to_binding_name(&p.0.name.0);
+						params.push(
+							self
+								.ast
+								.plain_formal_parameter(SPAN, self.binding_pattern(&pname)),
+						);
+					}
+					let formal_params = self.ast.formal_parameters(
+						SPAN,
+						FormalParameterKind::ArrowFormalParameters,
+						params,
+						NONE,
 					);
+
+					let js_val = self.emit_expr(body);
+					let ret = js_val.into_expression(self.ast, self.alloc);
+					let fn_body = self.ast.function_body(SPAN, self.ast.vec(), {
+						let mut s = self.ast.vec();
+						s.push(self.ast.statement_return(SPAN, Some(ret)));
+						s
+					});
+
+					let func_expr = self.ast.expression_function(
+						SPAN,
+						FunctionType::FunctionExpression,
+						None::<BindingIdentifier<'a>>,
+						false,
+						false,
+						false,
+						NONE,
+						NONE,
+						formal_params,
+						NONE,
+						Some(fn_body),
+					);
+
+					// TypeName.prototype.methodName = function(...) { ... };
+					let target = self.member(
+						self.member(self.ident_ref(type_name), "prototype"),
+						method_name,
+					);
+					let assign = self.ast.expression_assignment(
+						SPAN,
+						AssignmentOperator::Assign,
+						match target {
+							Expression::StaticMemberExpression(m) => AssignmentTarget::StaticMemberExpression(m),
+							_ => unreachable!(),
+						},
+						func_expr,
+					);
+					stmts.push(self.ast.statement_expression(SPAN, assign));
 				}
-				let formal_params = self.ast.formal_parameters(
-					SPAN,
-					FormalParameterKind::ArrowFormalParameters,
-					params,
-					NONE,
-				);
-
-				let js_val = self.emit_expr(body);
-				let ret = js_val.into_expression(self.ast, self.alloc);
-				let fn_body = self.ast.function_body(SPAN, self.ast.vec(), {
-					let mut s = self.ast.vec();
-					s.push(self.ast.statement_return(SPAN, Some(ret)));
-					s
-				});
-
-				let func_expr = self.ast.expression_function(
-					SPAN,
-					FunctionType::FunctionExpression,
-					None::<BindingIdentifier<'a>>,
-					false,
-					false,
-					false,
-					NONE,
-					NONE,
-					formal_params,
-					NONE,
-					Some(fn_body),
-				);
-
-				// TypeName.prototype.methodName = function(...) { ... };
-				let target = self.member(
-					self.member(self.ident_ref(type_name), "prototype"),
-					method_name,
-				);
-				let assign = self.ast.expression_assignment(
-					SPAN,
-					AssignmentOperator::Assign,
-					match target {
-						Expression::StaticMemberExpression(m) => AssignmentTarget::StaticMemberExpression(m),
-						_ => unreachable!(),
-					},
-					func_expr,
-				);
-				stmts.push(self.ast.statement_expression(SPAN, assign));
+				ImplMember::ExternalFunc(_, external_name, meta) => {
+					self.emit_external_impl_func_on_prototype(meta, external_name, type_name, &mut stmts);
+				}
+				_ => {}
 			}
 		}
 		stmts
+	}
+
+	/// Emit an external function as a prototype method on a type.
+	///
+	/// Generates:
+	/// 1. `import { externalName as __ext$N } from "./file.ext";`
+	/// 2. `TypeName.prototype.methodName = function(...args) { return __ext$N(this, ...args); };`
+	fn emit_external_impl_func_on_prototype(
+		&mut self,
+		meta: &FuncDeclaration,
+		external_name: &str,
+		type_name: &str,
+		stmts: &mut Vec<Statement<'a>>,
+	) {
+		let Some(ext_path) = self.source_path.and_then(find_external_module) else {
+			return;
+		};
+
+		let method_name = meta.name.0.as_str();
+		let import_alias = self.gensym("ext");
+		let import_alias_str = self.arena_str(&import_alias);
+
+		let rel = format!(
+			"./{}",
+			bundled_external_module_name(&ext_path)
+				.unwrap_or_else(|| { ext_path.file_name().unwrap().to_string_lossy().into_owned() })
+		);
+		let mut specifiers = self.ast.vec();
+		specifiers.push(ImportDeclarationSpecifier::ImportSpecifier(
+			self.ast.alloc(
+				self.ast.import_specifier(
+					SPAN,
+					self
+						.ast
+						.module_export_name_identifier_name(SPAN, self.arena_str(external_name)),
+					self.ast.binding_identifier(SPAN, import_alias_str),
+					ImportOrExportKind::Value,
+				),
+			),
+		));
+		let import = self.ast.module_declaration_import_declaration(
+			SPAN,
+			Some(specifiers),
+			self.ast.string_literal(SPAN, self.arena_str(&rel), None),
+			None,
+			NONE,
+			ImportOrExportKind::Value,
+		);
+		stmts.push(Statement::from(import));
+
+		// Build wrapper: function(...params) { return __ext$N(this, ...params); }
+		let mut params = self.ast.vec();
+		let mut call_args = self.ast.vec();
+
+		call_args.push(Argument::from(self.ast.expression_this(SPAN)));
+
+		for p in &meta.params {
+			let pname = self.pattern_to_binding_name(&p.0.name.0);
+			params.push(
+				self
+					.ast
+					.plain_formal_parameter(SPAN, self.binding_pattern(&pname)),
+			);
+			call_args.push(Argument::from(self.ident_ref(&pname)));
+		}
+
+		let formal_params =
+			self
+				.ast
+				.formal_parameters(SPAN, FormalParameterKind::FormalParameter, params, NONE);
+
+		let call_expr = self.call(self.ident_ref(import_alias_str), call_args);
+		let fn_body = self.ast.function_body(SPAN, self.ast.vec(), {
+			let mut s = self.ast.vec();
+			s.push(self.ast.statement_return(SPAN, Some(call_expr)));
+			s
+		});
+
+		let func_expr = self.ast.expression_function(
+			SPAN,
+			FunctionType::FunctionExpression,
+			None::<BindingIdentifier<'a>>,
+			false,
+			false,
+			false,
+			NONE,
+			NONE,
+			formal_params,
+			NONE,
+			Some(fn_body),
+		);
+
+		// TypeName.prototype.methodName = function(...) { ... };
+		let target = self.member(
+			self.member(self.ident_ref(type_name), "prototype"),
+			method_name,
+		);
+		let assign = self.ast.expression_assignment(
+			SPAN,
+			AssignmentOperator::Assign,
+			match target {
+				Expression::StaticMemberExpression(m) => AssignmentTarget::StaticMemberExpression(m),
+				_ => unreachable!(),
+			},
+			func_expr,
+		);
+		stmts.push(self.ast.statement_expression(SPAN, assign));
 	}
 
 	// ───────────────── func emit ─────────────────
@@ -953,7 +1368,7 @@ impl<'a> Emitter<'a> {
 	fn emit_func(
 		&mut self,
 		meta: &'a FuncDeclaration,
-		body: &'a Spanned<Expr>,
+		body: &Spanned<Expr>,
 		export: bool,
 	) -> Statement<'a> {
 		let func_name = meta.name.0.as_str();
@@ -1000,13 +1415,16 @@ impl<'a> Emitter<'a> {
 		&mut self,
 		meta: &LetDeclaration,
 		visibility: Option<Visibility>,
-		outer_name: Option<&str>,
+		external_name: &str,
 	) -> Vec<Statement<'a>> {
 		let name = self.pattern_to_binding_name(&meta.name.0);
-		let export_name = external_export_name(outer_name, &name);
 
 		if let Some(ext_path) = self.source_path.and_then(find_external_module) {
-			let rel = format!("./{}", ext_path.file_name().unwrap().to_string_lossy());
+			let rel = format!(
+				"./{}",
+				bundled_external_module_name(&ext_path)
+					.unwrap_or_else(|| { ext_path.file_name().unwrap().to_string_lossy().into_owned() })
+			);
 			let mut specifiers = self.ast.vec();
 			specifiers.push(ImportDeclarationSpecifier::ImportSpecifier(
 				self.ast.alloc(
@@ -1014,7 +1432,7 @@ impl<'a> Emitter<'a> {
 						SPAN,
 						self
 							.ast
-							.module_export_name_identifier_name(SPAN, self.arena_str(&export_name)),
+							.module_export_name_identifier_name(SPAN, self.arena_str(external_name)),
 						self.ast.binding_identifier(SPAN, self.arena_str(&name)),
 						ImportOrExportKind::Value,
 					),
@@ -1044,13 +1462,16 @@ impl<'a> Emitter<'a> {
 		&mut self,
 		meta: &FuncDeclaration,
 		visibility: Option<Visibility>,
-		outer_name: Option<&str>,
+		external_name: &str,
 	) -> Vec<Statement<'a>> {
 		let name = meta.name.0.as_str();
-		let export_name = external_export_name(outer_name, name);
 
 		if let Some(ext_path) = self.source_path.and_then(find_external_module) {
-			let rel = format!("./{}", ext_path.file_name().unwrap().to_string_lossy());
+			let rel = format!(
+				"./{}",
+				bundled_external_module_name(&ext_path)
+					.unwrap_or_else(|| { ext_path.file_name().unwrap().to_string_lossy().into_owned() })
+			);
 			let mut specifiers = self.ast.vec();
 			specifiers.push(ImportDeclarationSpecifier::ImportSpecifier(
 				self.ast.alloc(
@@ -1058,7 +1479,7 @@ impl<'a> Emitter<'a> {
 						SPAN,
 						self
 							.ast
-							.module_export_name_identifier_name(SPAN, self.arena_str(&export_name)),
+							.module_export_name_identifier_name(SPAN, self.arena_str(external_name)),
 						self.ast.binding_identifier(SPAN, self.arena_str(name)),
 						ImportOrExportKind::Value,
 					),
@@ -1086,7 +1507,7 @@ impl<'a> Emitter<'a> {
 
 	// ───────────────── statement emit ─────────────────
 
-	pub fn emit_statement(&mut self, stmt: &'a NymphStatement) -> Statement<'a> {
+	pub fn emit_statement(&mut self, stmt: &NymphStatement) -> Statement<'a> {
 		match stmt {
 			NymphStatement::Expr(e) => {
 				let js = self.emit_expr(e);
@@ -1113,13 +1534,363 @@ impl<'a> Emitter<'a> {
 
 	// ───────────────── expression emit ─────────────────
 
-	pub fn emit_expr(&mut self, expr: &'a Spanned<Expr>) -> JsValue<'a> {
+	fn expr_contains_anonymous_params(&self, expr: &Spanned<Expr>) -> bool {
+		!anonymous_params(expr).is_empty()
+	}
+
+	fn should_emit_anonymous_function(&self, expr: &Spanned<Expr>) -> bool {
+		match &expr.0 {
+			Expr::AnonymousParam(_) => true,
+			Expr::Grouped(inner) => self.should_emit_anonymous_function(inner),
+			Expr::MemberAccess { parent, .. }
+			| Expr::PrefixOp { value: parent, .. }
+			| Expr::PostfixOp { value: parent, .. }
+			| Expr::TypeOp { lhs: parent, .. }
+			| Expr::PatternOp { lhs: parent, .. } => self.expr_contains_anonymous_params(parent),
+			Expr::IndexAccess { parent, index, .. } => {
+				self.expr_contains_anonymous_params(parent) || self.expr_contains_anonymous_params(index)
+			}
+			Expr::BinaryOp { lhs, op, rhs } => {
+				if *op == BinaryOperator::Pipe {
+					self.expr_contains_anonymous_params(lhs)
+				} else {
+					self.expr_contains_anonymous_params(lhs) || self.expr_contains_anonymous_params(rhs)
+				}
+			}
+			Expr::AssignOp { lhs, .. } => self.expr_contains_anonymous_params(lhs),
+			Expr::Call { func, .. } => self.expr_contains_anonymous_params(func),
+			Expr::If {
+				condition,
+				then,
+				otherwise,
+			} => {
+				self.expr_contains_anonymous_params(condition)
+					|| self.expr_contains_anonymous_params(then)
+					|| otherwise
+						.as_ref()
+						.map(|it| self.expr_contains_anonymous_params(it))
+						.unwrap_or_default()
+			}
+			Expr::Match { value, .. } => self.expr_contains_anonymous_params(value),
+			Expr::List(items) | Expr::Tuple(items) => items.iter().any(|Spanned(item, _)| match item {
+				ListItem::Expr(it) | ListItem::Spread(it) => self.expr_contains_anonymous_params(it),
+			}),
+			Expr::Map(entries) => entries.iter().any(|Spanned(item, _)| match item {
+				MapEntry::Expr(key, value) => {
+					self.expr_contains_anonymous_params(key) || self.expr_contains_anonymous_params(value)
+				}
+				MapEntry::Spread(it) => self.expr_contains_anonymous_params(it),
+			}),
+			Expr::Int(_)
+			| Expr::UInt(_)
+			| Expr::Float(_)
+			| Expr::Char(_)
+			| Expr::String(_)
+			| Expr::Boolean(_)
+			| Expr::Identifier(_)
+			| Expr::Range(_)
+			| Expr::Closure { .. }
+			| Expr::Return { .. }
+			| Expr::Break { .. }
+			| Expr::Continue { .. }
+			| Expr::While { .. }
+			| Expr::For { .. }
+			| Expr::This
+			| Expr::Placeholder
+			| Expr::Block { .. } => false,
+		}
+	}
+
+	pub fn emit_expr(&mut self, expr: &Spanned<Expr>) -> JsValue<'a> {
+		if self.should_emit_anonymous_function(expr)
+			&& let Some(js) = self.emit_anonymous_function(expr)
+		{
+			return js;
+		}
+
 		self.emit_expr_inner(&expr.0)
 	}
 
-	fn emit_expr_inner(&mut self, expr: &'a Expr) -> JsValue<'a> {
+	fn emit_anonymous_function(&mut self, expr: &Spanned<Expr>) -> Option<JsValue<'a>> {
+		let placeholders = anonymous_params(expr);
+		if placeholders.is_empty() {
+			return None;
+		}
+
+		let arity = placeholders.keys().next_back().map_or(0, |index| index + 1);
+		let mut names = std::collections::BTreeMap::new();
+		for index in 0..arity {
+			names.insert(index, format!("__anon_param_{index}").into());
+		}
+
+		let rewritten = rewrite_anonymous_params(expr, &names);
+		let mut arrow_params = self.ast.vec();
+		for index in 0..arity {
+			let name = names
+				.get(&index)
+				.expect("anonymous param name should exist");
+			arrow_params.push(
+				self
+					.ast
+					.plain_formal_parameter(SPAN, self.binding_pattern(name.as_str())),
+			);
+		}
+		let formal = self.ast.formal_parameters(
+			SPAN,
+			FormalParameterKind::ArrowFormalParameters,
+			arrow_params,
+			NONE,
+		);
+		let js_body = self.emit_expr(&rewritten);
+		let body_expr = js_body.into_expression(self.ast, self.alloc);
+		let fn_body = self.ast.function_body(SPAN, self.ast.vec(), {
+			let mut s = self.ast.vec();
+			s.push(self.ast.statement_return(SPAN, Some(body_expr)));
+			s
+		});
+
+		Some(JsValue {
+			stmts: self.ast.vec(),
+			expr: self
+				.ast
+				.expression_arrow_function(SPAN, false, false, NONE, formal, NONE, fn_body),
+		})
+	}
+
+	fn emit_range_expr(&mut self, range: &ast::expr::RangeKind) -> Expression<'a> {
+		match range {
+			ast::expr::RangeKind::From(start) => {
+				let start = self.emit_expr(start).into_expression(self.ast, self.alloc);
+				let contains = self.ast.expression_binary(
+					SPAN,
+					self.member(self.ast.expression_this(SPAN), "start"),
+					oxc::syntax::operator::BinaryOperator::LessEqualThan,
+					self.ident_ref("item"),
+				);
+				let into = self.nymph_string(self.concat_expressions(vec![
+					self.member(self.ast.expression_this(SPAN), "start"),
+					self.string_lit("..<"),
+				]));
+
+				let mut props = self.ast.vec();
+				props.push(self.object_property("start", start));
+				props.push(self.object_property("contains", self.function_expression(&["item"], contains)));
+				props.push(self.object_property(
+					"start_bound",
+					self.function_expression(
+						&[],
+						self.bound_object(
+							"Included",
+							Some(self.member(self.ast.expression_this(SPAN), "start")),
+						),
+					),
+				));
+				props.push(self.object_property(
+					"end_bound",
+					self.function_expression(&[], self.bound_object("Unbounded", None)),
+				));
+				props.push(self.object_property("into", self.function_expression(&[], into)));
+
+				self.ast.expression_object(SPAN, props)
+			}
+			ast::expr::RangeKind::To(end) => {
+				let end = self.emit_expr(end).into_expression(self.ast, self.alloc);
+				let contains = self.ast.expression_binary(
+					SPAN,
+					self.ident_ref("item"),
+					oxc::syntax::operator::BinaryOperator::LessThan,
+					self.member(self.ast.expression_this(SPAN), "end"),
+				);
+				let into = self.nymph_string(self.concat_expressions(vec![
+					self.string_lit("..<"),
+					self.member(self.ast.expression_this(SPAN), "end"),
+				]));
+
+				let mut props = self.ast.vec();
+				props.push(self.object_property("end", end));
+				props.push(self.object_property("contains", self.function_expression(&["item"], contains)));
+				props.push(self.object_property(
+					"start_bound",
+					self.function_expression(&[], self.bound_object("Unbounded", None)),
+				));
+				props.push(self.object_property(
+					"end_bound",
+					self.function_expression(
+						&[],
+						self.bound_object(
+							"Excluded",
+							Some(self.member(self.ast.expression_this(SPAN), "end")),
+						),
+					),
+				));
+				props.push(self.object_property("into", self.function_expression(&[], into)));
+
+				self.ast.expression_object(SPAN, props)
+			}
+			ast::expr::RangeKind::Exclusive { min, max } => {
+				let start = self.emit_expr(min).into_expression(self.ast, self.alloc);
+				let end = self.emit_expr(max).into_expression(self.ast, self.alloc);
+				let contains = self.ast.expression_logical(
+					SPAN,
+					self.ast.expression_binary(
+						SPAN,
+						self.member(self.ast.expression_this(SPAN), "start"),
+						oxc::syntax::operator::BinaryOperator::LessEqualThan,
+						self.ident_ref("item"),
+					),
+					LogicalOperator::And,
+					self.ast.expression_binary(
+						SPAN,
+						self.ident_ref("item"),
+						oxc::syntax::operator::BinaryOperator::LessThan,
+						self.member(self.ast.expression_this(SPAN), "end"),
+					),
+				);
+				let is_empty = self.ast.expression_binary(
+					SPAN,
+					self.member(self.ast.expression_this(SPAN), "start"),
+					oxc::syntax::operator::BinaryOperator::GreaterEqualThan,
+					self.member(self.ast.expression_this(SPAN), "end"),
+				);
+				let into = self.nymph_string(self.concat_expressions(vec![
+					self.member(self.ast.expression_this(SPAN), "start"),
+					self.string_lit("..<"),
+					self.member(self.ast.expression_this(SPAN), "end"),
+				]));
+
+				let mut props = self.ast.vec();
+				props.push(self.object_property("start", start));
+				props.push(self.object_property("end", end));
+				props.push(self.object_property("contains", self.function_expression(&["item"], contains)));
+				props.push(self.object_property(
+					"start_bound",
+					self.function_expression(
+						&[],
+						self.bound_object(
+							"Included",
+							Some(self.member(self.ast.expression_this(SPAN), "start")),
+						),
+					),
+				));
+				props.push(self.object_property(
+					"end_bound",
+					self.function_expression(
+						&[],
+						self.bound_object(
+							"Excluded",
+							Some(self.member(self.ast.expression_this(SPAN), "end")),
+						),
+					),
+				));
+				props.push(self.object_property("is_empty", self.function_expression(&[], is_empty)));
+				props.push(self.object_property("into", self.function_expression(&[], into)));
+
+				self.ast.expression_object(SPAN, props)
+			}
+			ast::expr::RangeKind::ToInclusive(end) => {
+				let end = self.emit_expr(end).into_expression(self.ast, self.alloc);
+				let contains = self.ast.expression_binary(
+					SPAN,
+					self.ident_ref("item"),
+					oxc::syntax::operator::BinaryOperator::LessEqualThan,
+					self.member(self.ast.expression_this(SPAN), "end"),
+				);
+				let into = self.nymph_string(self.concat_expressions(vec![
+					self.string_lit("..="),
+					self.member(self.ast.expression_this(SPAN), "end"),
+				]));
+
+				let mut props = self.ast.vec();
+				props.push(self.object_property("end", end));
+				props.push(self.object_property("contains", self.function_expression(&["item"], contains)));
+				props.push(self.object_property(
+					"start_bound",
+					self.function_expression(&[], self.bound_object("Unbounded", None)),
+				));
+				props.push(self.object_property(
+					"end_bound",
+					self.function_expression(
+						&[],
+						self.bound_object(
+							"Included",
+							Some(self.member(self.ast.expression_this(SPAN), "end")),
+						),
+					),
+				));
+				props.push(self.object_property("into", self.function_expression(&[], into)));
+
+				self.ast.expression_object(SPAN, props)
+			}
+			ast::expr::RangeKind::Inclusive { min, max } => {
+				let start = self.emit_expr(min).into_expression(self.ast, self.alloc);
+				let end = self.emit_expr(max).into_expression(self.ast, self.alloc);
+				let contains = self.ast.expression_logical(
+					SPAN,
+					self.ast.expression_binary(
+						SPAN,
+						self.member(self.ast.expression_this(SPAN), "start"),
+						oxc::syntax::operator::BinaryOperator::LessEqualThan,
+						self.ident_ref("item"),
+					),
+					LogicalOperator::And,
+					self.ast.expression_binary(
+						SPAN,
+						self.ident_ref("item"),
+						oxc::syntax::operator::BinaryOperator::LessEqualThan,
+						self.member(self.ast.expression_this(SPAN), "end"),
+					),
+				);
+				let is_empty = self.ast.expression_binary(
+					SPAN,
+					self.member(self.ast.expression_this(SPAN), "start"),
+					oxc::syntax::operator::BinaryOperator::GreaterThan,
+					self.member(self.ast.expression_this(SPAN), "end"),
+				);
+				let into = self.nymph_string(self.concat_expressions(vec![
+					self.member(self.ast.expression_this(SPAN), "start"),
+					self.string_lit("..="),
+					self.member(self.ast.expression_this(SPAN), "end"),
+				]));
+
+				let mut props = self.ast.vec();
+				props.push(self.object_property("start", start));
+				props.push(self.object_property("end", end));
+				props.push(self.object_property("contains", self.function_expression(&["item"], contains)));
+				props.push(self.object_property(
+					"start_bound",
+					self.function_expression(
+						&[],
+						self.bound_object(
+							"Included",
+							Some(self.member(self.ast.expression_this(SPAN), "start")),
+						),
+					),
+				));
+				props.push(self.object_property(
+					"end_bound",
+					self.function_expression(
+						&[],
+						self.bound_object(
+							"Included",
+							Some(self.member(self.ast.expression_this(SPAN), "end")),
+						),
+					),
+				));
+				props.push(self.object_property("is_empty", self.function_expression(&[], is_empty)));
+				props.push(self.object_property("into", self.function_expression(&[], into)));
+
+				self.ast.expression_object(SPAN, props)
+			}
+		}
+	}
+
+	fn emit_expr_inner(&mut self, expr: &Expr) -> JsValue<'a> {
 		match expr {
 			Expr::Int(Spanned(n, _)) => JsValue {
+				stmts: self.ast.vec(),
+				expr: self.number_lit(*n as f64),
+			},
+			Expr::UInt(Spanned(n, _)) => JsValue {
 				stmts: self.ast.vec(),
 				expr: self.number_lit(*n as f64),
 			},
@@ -1146,6 +1917,7 @@ impl<'a> Emitter<'a> {
 				stmts: self.ast.vec(),
 				expr: self.ident_ref(ident.0.as_str()),
 			},
+			Expr::AnonymousParam(_) => unreachable!("anonymous params are lowered before emission"),
 			Expr::List(items) => {
 				let mut elems = self.ast.vec();
 				for item in items {
@@ -1229,23 +2001,25 @@ impl<'a> Emitter<'a> {
 						.expression_new(SPAN, self.ident_ref("Map"), NONE, args),
 				}
 			}
-			Expr::Range(_) => {
-				// TODO: emit range helper
-				JsValue {
-					stmts: self.ast.vec(),
-					expr: self.ast.expression_array(SPAN, self.ast.vec()),
-				}
-			}
+			Expr::Range(range) => JsValue {
+				stmts: self.ast.vec(),
+				expr: self.emit_range_expr(range),
+			},
 			Expr::Call {
 				func,
 				args,
 				generics: _,
 			} => {
 				let is_constructor = match &func.0 {
-					Expr::Identifier(ident) => self
-						.ctx
-						.lookup_type_ref(&ident.0)
-						.is_some_and(|ty| matches!(ty, Type::Function { constructor: true, .. })),
+					Expr::Identifier(ident) => self.ctx.lookup_type_ref(&ident.0).is_some_and(|ty| {
+						matches!(
+							ty,
+							Type::Function {
+								constructor: true,
+								..
+							}
+						)
+					}),
 					_ => false,
 				};
 
@@ -1280,7 +2054,7 @@ impl<'a> Emitter<'a> {
 			} => {
 				let obj = self.emit_expr(parent);
 				let obj_expr = obj.into_expression(self.ast, self.alloc);
-				let prop = member.0.as_str();
+				let prop = self.arena_str(member.0.as_str());
 				if *optional {
 					JsValue {
 						stmts: self.ast.vec(),
@@ -1348,7 +2122,7 @@ impl<'a> Emitter<'a> {
 					stmts: self.ast.vec(),
 					expr: self
 						.ast
-						.expression_arrow_function(SPAN, true, false, NONE, formal, NONE, fn_body),
+						.expression_arrow_function(SPAN, false, false, NONE, formal, NONE, fn_body),
 				}
 			}
 			Expr::PrefixOp { op, value } => {
@@ -1494,7 +2268,7 @@ impl<'a> Emitter<'a> {
 								SPAN,
 								self
 									.ast
-									.label_identifier(SPAN, self.ast.atom(label.0.as_str())),
+									.label_identifier(SPAN, self.ast.ident(self.arena_str(label.0.as_str()))),
 								for_stmt,
 							)
 						} else {
@@ -1528,9 +2302,9 @@ impl<'a> Emitter<'a> {
 
 	fn emit_binary_op(
 		&mut self,
-		lhs: &'a Spanned<Expr>,
+		lhs: &Spanned<Expr>,
 		op: BinaryOperator,
-		rhs: &'a Spanned<Expr>,
+		rhs: &Spanned<Expr>,
 	) -> JsValue<'a> {
 		match op {
 			// Pipe: a |> f → f(a)
@@ -1546,7 +2320,7 @@ impl<'a> Emitter<'a> {
 					expr: self.call(func, args),
 				}
 			}
-			// Unwrap: a ?? b → a.unwrap_or(() => b)
+			// Unwrap: a ?? b → a.unwrap(() => b)
 			BinaryOperator::Unwrap => {
 				let lhs_val = self.emit_expr(lhs);
 				let lhs_expr = lhs_val.into_expression(self.ast, self.alloc);
@@ -1579,7 +2353,7 @@ impl<'a> Emitter<'a> {
 
 				JsValue {
 					stmts: self.ast.vec(),
-					expr: self.method_call(lhs_expr, "unwrap_or", args),
+					expr: self.method_call(lhs_expr, "unwrap", args),
 				}
 			}
 			// In: a in b → b.contains(a)
@@ -1628,9 +2402,9 @@ impl<'a> Emitter<'a> {
 
 	fn emit_assign_op(
 		&mut self,
-		lhs: &'a Spanned<Expr>,
+		lhs: &Spanned<Expr>,
 		op: AssignOperator,
-		rhs: &'a Spanned<Expr>,
+		rhs: &Spanned<Expr>,
 	) -> JsValue<'a> {
 		let rhs_val = self.emit_expr(rhs);
 		let rhs_expr = rhs_val.into_expression(self.ast, self.alloc);
@@ -1657,11 +2431,14 @@ impl<'a> Emitter<'a> {
 		}
 	}
 
-	fn emit_assignment_target(&mut self, expr: &'a Spanned<Expr>) -> AssignmentTarget<'a> {
+	fn emit_assignment_target(&mut self, expr: &Spanned<Expr>) -> AssignmentTarget<'a> {
 		match &expr.0 {
 			Expr::Identifier(ident) => self
 				.ast
-				.simple_assignment_target_assignment_target_identifier(SPAN, ident.0.as_str())
+				.simple_assignment_target_assignment_target_identifier(
+					SPAN,
+					self.arena_str(ident.0.as_str()),
+				)
 				.into(),
 			Expr::MemberAccess {
 				parent,
@@ -1697,7 +2474,7 @@ impl<'a> Emitter<'a> {
 
 	fn emit_pattern_op(
 		&mut self,
-		lhs: &'a Spanned<Expr>,
+		lhs: &Spanned<Expr>,
 		op: PatternOperator,
 		pattern: &Pattern,
 	) -> JsValue<'a> {
@@ -1725,36 +2502,45 @@ impl<'a> Emitter<'a> {
 			Pattern::Int(Spanned(n, _)) => self.ast.expression_binary(
 				SPAN,
 				self.ident_ref(var_name),
-				oxc_syntax::operator::BinaryOperator::StrictEquality,
+				oxc::syntax::operator::BinaryOperator::StrictEquality,
 				self.number_lit(*n as f64),
 			),
 			Pattern::Float(Spanned(f, _)) => self.ast.expression_binary(
 				SPAN,
 				self.ident_ref(var_name),
-				oxc_syntax::operator::BinaryOperator::StrictEquality,
+				oxc::syntax::operator::BinaryOperator::StrictEquality,
 				self.number_lit(f.into_inner()),
 			),
 			Pattern::Char(Spanned(c, _)) => self.ast.expression_binary(
 				SPAN,
 				self.ident_ref(var_name),
-				oxc_syntax::operator::BinaryOperator::StrictEquality,
+				oxc::syntax::operator::BinaryOperator::StrictEquality,
 				self.number_lit(*c as u32 as f64),
 			),
 			Pattern::Boolean(Spanned(b, _)) => self.ast.expression_binary(
 				SPAN,
 				self.ident_ref(var_name),
-				oxc_syntax::operator::BinaryOperator::StrictEquality,
+				oxc::syntax::operator::BinaryOperator::StrictEquality,
 				self.bool_lit(*b),
 			),
 			Pattern::Placeholder => self.bool_lit(true),
 			Pattern::Binding { name: _, inner } => self.emit_pattern_check(var_name, &inner.0),
+			Pattern::Struct { path, fields } if fields.is_empty() && path.len() == 1 => {
+				// A single identifier with no fields is a variable binding (catch-all)
+				self.bool_lit(true)
+			}
 			Pattern::Struct { path, fields: _ } => {
 				// Check _tag for enum variant matching
 				if let Some(last) = path.last() {
 					self.ast.expression_binary(
 						SPAN,
-						self.member(self.ident_ref(var_name), "~tag"),
-						oxc_syntax::operator::BinaryOperator::StrictEquality,
+						Expression::ComputedMemberExpression(self.ast.alloc_computed_member_expression(
+							SPAN,
+							self.ident_ref(var_name),
+							self.string_lit("~tag"),
+							false,
+						)),
+						oxc::syntax::operator::BinaryOperator::StrictEquality,
 						self.string_lit(last.0.as_str()),
 					)
 				} else {
@@ -1776,13 +2562,66 @@ impl<'a> Emitter<'a> {
 		}
 	}
 
+	/// Collect `const` declarations for variables bound by a pattern.
+	/// `var_name` is the JS variable holding the matched value.
+	fn collect_pattern_bindings(
+		&self,
+		var_name: &str,
+		pattern: &Pattern,
+		out: &mut OxcVec<'a, Statement<'a>>,
+	) {
+		match pattern {
+			Pattern::Binding { name, inner } => {
+				// `name @ inner` — bind `name` to the scrutinee, then recurse into inner
+				let init = self.ident_ref(var_name);
+				out.push(self.var_decl_stmt(VariableDeclarationKind::Const, name.0.as_str(), init));
+				self.collect_pattern_bindings(var_name, &inner.0, out);
+			}
+			Pattern::Struct { path, fields } if fields.is_empty() && path.len() == 1 => {
+				// Bare identifier used as a variable binding
+				let init = self.ident_ref(var_name);
+				out.push(self.var_decl_stmt(VariableDeclarationKind::Const, path[0].0.as_str(), init));
+			}
+			Pattern::Struct { fields, .. } => {
+				// Enum variant / struct pattern — bind fields
+				for field in fields {
+					match &field.0 {
+						ast::expr::StructPatternField::Named(ident) => {
+							let init = self.member(self.ident_ref(var_name), ident.0.as_str());
+							out.push(self.var_decl_stmt(VariableDeclarationKind::Const, ident.0.as_str(), init));
+						}
+						ast::expr::StructPatternField::Value { name, value } => {
+							let field_tmp = format!("{var_name}.{}", name.0);
+							let field_access = self.member(self.ident_ref(var_name), name.0.as_str());
+							let binding_name = self.pattern_to_binding_name(&value.0);
+							out.push(self.var_decl_stmt(
+								VariableDeclarationKind::Const,
+								&binding_name,
+								field_access,
+							));
+							// Recurse for nested patterns (e.g., `field = inner @ _`)
+							self.collect_pattern_bindings(&field_tmp, &value.0, out);
+						}
+						ast::expr::StructPatternField::Rest => {}
+					}
+				}
+			}
+			Pattern::Grouped(inner) => self.collect_pattern_bindings(var_name, &inner.0, out),
+			Pattern::Union(a, _) => {
+				// Union patterns must bind the same names; just use the first branch
+				self.collect_pattern_bindings(var_name, &a.0, out);
+			}
+			_ => {}
+		}
+	}
+
 	// ───────────────── if expression ─────────────────
 
 	fn emit_if(
 		&mut self,
-		condition: &'a Spanned<Expr>,
-		then: &'a Spanned<Expr>,
-		otherwise: Option<&'a Spanned<Expr>>,
+		condition: &Spanned<Expr>,
+		then: &Spanned<Expr>,
+		otherwise: Option<&Spanned<Expr>>,
 	) -> JsValue<'a> {
 		let cond = self.emit_expr(condition);
 		let cond_expr = cond.into_expression(self.ast, self.alloc);
@@ -1821,7 +2660,7 @@ impl<'a> Emitter<'a> {
 
 	// ───────────────── match expression ─────────────────
 
-	fn emit_match(&mut self, value: &'a Spanned<Expr>, arms: &'a [MatchArm]) -> JsValue<'a> {
+	fn emit_match(&mut self, value: &Spanned<Expr>, arms: &[MatchArm]) -> JsValue<'a> {
 		let scrutinee = self.emit_expr(value);
 		let scrutinee_expr = scrutinee.into_expression(self.ast, self.alloc);
 		let tmp = self.gensym("match");
@@ -1834,6 +2673,10 @@ impl<'a> Emitter<'a> {
 
 		for arm in arms.iter().rev() {
 			let check = self.emit_pattern_check(&tmp, &arm.pattern.0);
+
+			// Collect pattern bindings and emit them as const declarations
+			let mut binding_stmts = self.ast.vec();
+			self.collect_pattern_bindings(&tmp, &arm.pattern.0, &mut binding_stmts);
 
 			// Evaluate guard if present
 			let full_check = if let Some(guard) = &arm.guard {
@@ -1848,7 +2691,14 @@ impl<'a> Emitter<'a> {
 
 			let body_val = self.emit_expr(&arm.body);
 			let body_expr = body_val.into_expression(self.ast, self.alloc);
-			let consequent = self.ast.statement_return(SPAN, Some(body_expr));
+
+			// Wrap bindings + body in a block
+			let mut body_stmts = self.ast.vec();
+			for s in binding_stmts {
+				body_stmts.push(s);
+			}
+			body_stmts.push(self.ast.statement_return(SPAN, Some(body_expr)));
+			let consequent = self.ast.statement_block(SPAN, body_stmts);
 
 			let if_stmt = self
 				.ast
@@ -1868,7 +2718,7 @@ impl<'a> Emitter<'a> {
 
 	// ───────────────── block expression ─────────────────
 
-	fn emit_block(&mut self, body: &'a [Spanned<NymphStatement>]) -> JsValue<'a> {
+	fn emit_block(&mut self, body: &[Spanned<NymphStatement>]) -> JsValue<'a> {
 		if body.is_empty() {
 			return JsValue {
 				stmts: self.ast.vec(),
@@ -1913,7 +2763,7 @@ impl<'a> Emitter<'a> {
 
 	// ───────────────── string emit ─────────────────
 
-	fn emit_string_parts(&mut self, parts: &'a [Spanned<StringPart>]) -> Expression<'a> {
+	fn emit_string_parts(&mut self, parts: &[Spanned<StringPart>]) -> Expression<'a> {
 		// String in Nymph is Uint8Array (UTF-8 encoded).
 		// For now, emit as a helper call: __nymph_str("...")
 		// The runtime will provide __nymph_str that converts to Uint8Array.
@@ -1983,7 +2833,7 @@ impl<'a> Emitter<'a> {
 				.reduce(|a, b| {
 					self
 						.ast
-						.expression_binary(SPAN, a, oxc_syntax::operator::BinaryOperator::Addition, b)
+						.expression_binary(SPAN, a, oxc::syntax::operator::BinaryOperator::Addition, b)
 				})
 				.unwrap_or_else(|| self.string_lit(""));
 
@@ -2006,11 +2856,87 @@ impl<'a> Emitter<'a> {
 		}
 	}
 
+	fn emit_pattern_binding(&self, pat: &Pattern) -> BindingPattern<'a> {
+		match pat {
+			Pattern::Binding { name, inner } => {
+				if matches!(inner.0, Pattern::Placeholder) {
+					self.binding_pattern(name.0.as_str())
+				} else {
+					self.emit_pattern_binding(&inner.0)
+				}
+			}
+			Pattern::Struct { path, fields } if fields.is_empty() && path.len() == 1 => {
+				self.binding_pattern(path[0].0.as_str())
+			}
+			Pattern::Struct { fields, .. } => {
+				let mut props = self.ast.vec();
+				let mut rest = None;
+				for field in fields {
+					match &field.0 {
+						ast::expr::StructPatternField::Named(ident) => {
+							let key = PropertyKey::StaticIdentifier(
+								self.ast.alloc(
+									self
+										.ast
+										.identifier_name(SPAN, self.arena_str(ident.0.as_str())),
+								),
+							);
+							let value = self.binding_pattern(ident.0.as_str());
+							props.push(self.ast.binding_property(SPAN, key, value, true, false));
+						}
+						ast::expr::StructPatternField::Value { name, value } => {
+							let key = PropertyKey::StaticIdentifier(
+								self.ast.alloc(
+									self
+										.ast
+										.identifier_name(SPAN, self.arena_str(name.0.as_str())),
+								),
+							);
+							let val_pat = self.emit_pattern_binding(&value.0);
+							props.push(self.ast.binding_property(SPAN, key, val_pat, false, false));
+						}
+						ast::expr::StructPatternField::Rest => {
+							rest = Some(
+								self
+									.ast
+									.alloc_binding_rest_element(SPAN, self.binding_pattern("_")),
+							);
+						}
+					}
+				}
+				self.ast.binding_pattern_object_pattern(SPAN, props, rest)
+			}
+			Pattern::List(items) | Pattern::Tuple(items) => {
+				let mut elems = self.ast.vec();
+				let mut rest = None;
+				for item in items {
+					match &item.0 {
+						ast::expr::ListPatternEntry::Item(inner) => {
+							elems.push(Some(self.emit_pattern_binding(&inner.0)));
+						}
+						ast::expr::ListPatternEntry::Rest(name) => {
+							let rest_name = name.as_ref().map(|n| n.0.as_str()).unwrap_or("_");
+							rest = Some(
+								self
+									.ast
+									.alloc_binding_rest_element(SPAN, self.binding_pattern(rest_name)),
+							);
+						}
+					}
+				}
+				self.ast.binding_pattern_array_pattern(SPAN, elems, rest)
+			}
+			Pattern::Placeholder => self.binding_pattern("_"),
+			Pattern::Grouped(inner) => self.emit_pattern_binding(&inner.0),
+			_ => self.binding_pattern("_"),
+		}
+	}
+
 	fn export_stmt(&self, stmt: Statement<'a>) -> Statement<'a> {
 		let decl = match stmt {
-			Statement::VariableDeclaration(d) => oxc_ast::ast::Declaration::VariableDeclaration(d),
-			Statement::ClassDeclaration(d) => oxc_ast::ast::Declaration::ClassDeclaration(d),
-			Statement::FunctionDeclaration(d) => oxc_ast::ast::Declaration::FunctionDeclaration(d),
+			Statement::VariableDeclaration(d) => oxc::ast::ast::Declaration::VariableDeclaration(d),
+			Statement::ClassDeclaration(d) => oxc::ast::ast::Declaration::ClassDeclaration(d),
+			Statement::FunctionDeclaration(d) => oxc::ast::ast::Declaration::FunctionDeclaration(d),
 			_ => return stmt,
 		};
 		let export = self.ast.module_declaration_export_named_declaration(
@@ -2041,7 +2967,7 @@ impl<'a> Emitter<'a> {
 		);
 		let export = self.ast.module_declaration_export_named_declaration(
 			SPAN,
-			Option::<oxc_ast::ast::Declaration<'a>>::None,
+			Option::<oxc::ast::ast::Declaration<'a>>::None,
 			specifiers,
 			None,
 			ImportOrExportKind::Value,

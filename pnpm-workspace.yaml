@@ -9,4 +9,4 @@ catalog:
   prettier: ^3.5.3
 
 onlyBuiltDependencies:
-  - '@vscode/vsce-sign'
+  - "@vscode/vsce-sign"

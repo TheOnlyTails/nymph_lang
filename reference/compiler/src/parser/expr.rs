@@ -12,19 +12,14 @@ use crate::{
 			TypeOperator,
 		},
 	},
-	lexer::token::Token, parser::error::ParseErrorKind,
+	lexer::token::Token,
+	parser::error::ParseErrorKind,
 };
 
 use super::{
 	core::{Parser, span},
 	error::ParseError,
 };
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Assoc {
-	Left,
-	Right,
-}
 
 impl<'src> Parser<'src> {
 	pub fn parse_expression(&mut self) -> Option<Spanned<Expr>> {
@@ -143,7 +138,7 @@ impl<'src> Parser<'src> {
 				Token::Minus => {
 					self.advance();
 					let value = self.parse_expr_pratt(r_bp)?;
-					let span = span(start_span.start, value.span().end);
+					let span = span(start_span.start, value.1.end);
 					return Some(Spanned(
 						Expr::PrefixOp {
 							op: PrefixOperator::Negate,
@@ -155,7 +150,7 @@ impl<'src> Parser<'src> {
 				Token::ExclamationMark => {
 					self.advance();
 					let value = self.parse_expr_pratt(r_bp)?;
-					let span = span(start_span.start, value.span().end);
+					let span = span(start_span.start, value.1.end);
 					return Some(Spanned(
 						Expr::PrefixOp {
 							op: PrefixOperator::BoolNot,
@@ -167,7 +162,7 @@ impl<'src> Parser<'src> {
 				Token::Tilde => {
 					self.advance();
 					let value = self.parse_expr_pratt(r_bp)?;
-					let span = span(start_span.start, value.span().end);
+					let span = span(start_span.start, value.1.end);
 					return Some(Spanned(
 						Expr::PrefixOp {
 							op: PrefixOperator::BitNot,
@@ -179,13 +174,13 @@ impl<'src> Parser<'src> {
 				Token::DotDotLt => {
 					self.advance();
 					let max = self.parse_expr_pratt(r_bp)?;
-					let span = span(start_span.start, max.span().end);
+					let span = span(start_span.start, max.1.end);
 					return Some(Spanned(Expr::Range(RangeKind::To(max.into())), span));
 				}
 				Token::DotDotEq => {
 					self.advance();
 					let max = self.parse_expr_pratt(r_bp)?;
-					let span = span(start_span.start, max.span().end);
+					let span = span(start_span.start, max.1.end);
 					return Some(Spanned(
 						Expr::Range(RangeKind::ToInclusive(max.into())),
 						span,
@@ -199,7 +194,7 @@ impl<'src> Parser<'src> {
 	}
 
 	fn parse_postfix(&mut self, lhs: Spanned<Expr>) -> Option<Spanned<Expr>> {
-		let start = lhs.span().start;
+		let start = lhs.1.start;
 
 		match self.peek()?.clone() {
 			Token::Lt => {
@@ -242,7 +237,7 @@ impl<'src> Parser<'src> {
 			Token::Dot => {
 				self.advance();
 				let member = self.expect_identifier()?;
-				let span = span(start, member.span().end);
+				let span = span(start, member.1.end);
 				Some(Spanned(
 					Expr::MemberAccess {
 						parent: lhs.into(),
@@ -270,7 +265,7 @@ impl<'src> Parser<'src> {
 					))
 				} else {
 					let member = self.expect_identifier()?;
-					let span = span(start, member.span().end);
+					let span = span(start, member.1.end);
 					Some(Spanned(
 						Expr::MemberAccess {
 							parent: lhs.into(),
@@ -309,7 +304,7 @@ impl<'src> Parser<'src> {
 			Token::Is => {
 				self.advance();
 				let pattern = self.parse_pattern()?;
-				let span = span(start, pattern.span().end);
+				let span = span(start, pattern.1.end);
 				Some(Spanned(
 					Expr::PatternOp {
 						lhs: lhs.into(),
@@ -322,7 +317,7 @@ impl<'src> Parser<'src> {
 			Token::NotIs => {
 				self.advance();
 				let pattern = self.parse_pattern()?;
-				let span = span(start, pattern.span().end);
+				let span = span(start, pattern.1.end);
 				Some(Spanned(
 					Expr::PatternOp {
 						lhs: lhs.into(),
@@ -335,7 +330,7 @@ impl<'src> Parser<'src> {
 			Token::As => {
 				self.advance();
 				let ty = self.parse_type()?;
-				let span = span(start, ty.span().end);
+				let span = span(start, ty.1.end);
 				Some(Spanned(
 					Expr::TypeOp {
 						lhs: lhs.into(),
@@ -348,7 +343,7 @@ impl<'src> Parser<'src> {
 			Token::DotDotLt => {
 				self.advance();
 				if let Some(max) = self.parse_expr_pratt(15) {
-					let span = span(start, max.span().end);
+					let span = span(start, max.1.end);
 					Some(Spanned(
 						Expr::Range(RangeKind::Exclusive {
 							min: lhs.into(),
@@ -366,37 +361,37 @@ impl<'src> Parser<'src> {
 	}
 
 	fn parse_infix(&mut self, lhs: Spanned<Expr>, r_bp: u8) -> Option<Spanned<Expr>> {
-		let start = lhs.span().start;
+		let start = lhs.1.start;
 
-		let (op, is_assign) = match self.peek()?.clone() {
+		let op = match self.peek()?.clone() {
 			Token::StarStar => {
 				self.advance();
-				(BinaryOperator::Power, false)
+				BinaryOperator::Power
 			}
 			Token::Star => {
 				self.advance();
-				(BinaryOperator::Times, false)
+				BinaryOperator::Times
 			}
 			Token::Slash => {
 				self.advance();
-				(BinaryOperator::Divide, false)
+				BinaryOperator::Divide
 			}
 			Token::Percent => {
 				self.advance();
-				(BinaryOperator::Remainder, false)
+				BinaryOperator::Remainder
 			}
 			Token::Plus => {
 				self.advance();
-				(BinaryOperator::Plus, false)
+				BinaryOperator::Plus
 			}
 			Token::Minus => {
 				self.advance();
-				(BinaryOperator::Minus, false)
+				BinaryOperator::Minus
 			}
 			Token::DotDotEq => {
 				self.advance();
 				let rhs = self.parse_expr_pratt(r_bp)?;
-				let span = span(start, rhs.span().end);
+				let span = span(start, rhs.1.end);
 				return Some(Spanned(
 					Expr::Range(RangeKind::Inclusive {
 						min: lhs.into(),
@@ -408,77 +403,77 @@ impl<'src> Parser<'src> {
 			Token::Lt if self.is_left_shift() => {
 				self.advance();
 				self.advance();
-				(BinaryOperator::LeftShift, false)
+				BinaryOperator::LeftShift
 			}
 			Token::Gt if self.is_right_shift() => {
 				self.advance();
 				self.advance();
-				(BinaryOperator::RightShift, false)
+				BinaryOperator::RightShift
 			}
 			Token::And => {
 				self.advance();
-				(BinaryOperator::BitAnd, false)
+				BinaryOperator::BitAnd
 			}
 			Token::Caret => {
 				self.advance();
-				(BinaryOperator::BitXor, false)
+				BinaryOperator::BitXor
 			}
 			Token::Pipe => {
 				self.advance();
-				(BinaryOperator::BitOr, false)
+				BinaryOperator::BitOr
 			}
 			Token::DoubleQuestion => {
 				self.advance();
-				(BinaryOperator::Unwrap, false)
+				BinaryOperator::Unwrap
 			}
 			Token::In => {
 				self.advance();
-				(BinaryOperator::In, false)
+				BinaryOperator::In
 			}
 			Token::NotIn => {
 				self.advance();
-				(BinaryOperator::NotIn, false)
+				BinaryOperator::NotIn
 			}
 			Token::Lt => {
 				self.advance();
-				(BinaryOperator::LessThan, false)
+				BinaryOperator::LessThan
 			}
 			Token::LtEq => {
 				self.advance();
-				(BinaryOperator::LessThanEquals, false)
+				BinaryOperator::LessThanEquals
 			}
 			Token::Gt => {
 				self.advance();
-				(BinaryOperator::GreaterThan, false)
+				BinaryOperator::GreaterThan
 			}
 			Token::GtEq => {
 				self.advance();
-				(BinaryOperator::GreaterThanEquals, false)
+				BinaryOperator::GreaterThanEquals
 			}
 			Token::EqEq => {
 				self.advance();
-				(BinaryOperator::Equals, false)
+				BinaryOperator::Equals
 			}
 			Token::NotEq => {
 				self.advance();
-				(BinaryOperator::NotEquals, false)
+				BinaryOperator::NotEquals
 			}
 			Token::AndAnd => {
 				self.advance();
-				(BinaryOperator::BoolAnd, false)
+				BinaryOperator::BoolAnd
 			}
 			Token::PipePipe => {
 				self.advance();
-				(BinaryOperator::BoolOr, false)
+				BinaryOperator::BoolOr
 			}
 			Token::Triangle => {
 				self.advance();
-				(BinaryOperator::Pipe, false)
+				BinaryOperator::Pipe
 			}
 			Token::Eq => {
 				self.advance();
 				let rhs = self.parse_expr_pratt(r_bp)?;
-				let span = span(start, rhs.span().end);
+				let span = span(start, rhs.1.end);
 				return Some(Spanned(
 					Expr::AssignOp {
 						lhs: lhs.into(),
@@ -518,7 +513,7 @@ impl<'src> Parser<'src> {
 		};
 
 		let rhs = self.parse_expr_pratt(r_bp)?;
-		let span = span(start, rhs.span().end);
+		let span = span(start, rhs.1.end);
 		Some(Spanned(
 			Expr::BinaryOp {
 				lhs: lhs.into(),
@@ -535,10 +530,10 @@ impl<'src> Parser<'src> {
 		op: AssignOperator,
 		r_bp: u8,
 	) -> Option<Spanned<Expr>> {
-		let start = lhs.span().start;
+		let start = lhs.1.start;
 		self.advance();
 		let rhs = self.parse_expr_pratt(r_bp)?;
-		let span = span(start, rhs.span().end);
+		let span = span(start, rhs.1.end);
 		Some(Spanned(
 			Expr::AssignOp {
 				lhs: lhs.into(),
@@ -562,6 +557,13 @@ impl<'src> Parser<'src> {
 			| Token::OctalInt(val) => {
 				self.advance();
 				Expr::Int(Spanned(val, start_span))
+			}
+			Token::DecimalUInt(val)
+			| Token::HexUInt(val)
+			| Token::BinaryUInt(val)
+			| Token::OctalUInt(val) => {
+				self.advance();
+				Expr::UInt(Spanned(val, start_span))
 			}
 			Token::Float(val) => {
 				self.advance();
@@ -637,6 +639,10 @@ impl<'src> Parser<'src> {
 					Expr::Identifier(ident)
 				}
 			}
+			Token::AnonymousParam(index) => {
+				self.advance();
+				Expr::AnonymousParam(index)
+			}
 			Token::List(inner) => {
 				self.advance();
 				let items = self.with_nested(&inner, start_span, |p| p.parse_list_items());
@@ -660,7 +666,7 @@ impl<'src> Parser<'src> {
 				self.advance();
 				Expr::This
 			}
-			Token::Parens(inner) => {
+			Token::Parens(_) => {
 				return self.try_parse_closure_or_grouped();
 			}
 			Token::Lt => {
@@ -686,10 +692,7 @@ impl<'src> Parser<'src> {
 					None
 				};
 				let value = self.parse_expression().map(Box::new);
-				let end = value
-					.as_ref()
-					.map(|v| v.span().end)
-					.unwrap_or(start_span.end);
+				let end = value.as_ref().map(|v| v.1.end).unwrap_or(start_span.end);
 				return Some(Spanned(
 					Expr::Return { value, label },
 					span(start_span.start, end),
@@ -703,10 +706,7 @@ impl<'src> Parser<'src> {
 					None
 				};
 				let value = self.parse_expression().map(Box::new);
-				let end = value
-					.as_ref()
-					.map(|v| v.span().end)
-					.unwrap_or(start_span.end);
+				let end = value.as_ref().map(|v| v.1.end).unwrap_or(start_span.end);
 				return Some(Spanned(
 					Expr::Break { value, label },
 					span(start_span.start, end),
@@ -742,7 +742,7 @@ impl<'src> Parser<'src> {
 	) -> Option<Spanned<Expr>> {
 		let start_span = label
 			.as_ref()
-			.map(|l| l.span())
+			.map(|l| l.1)
 			.unwrap_or_else(|| self.current_span());
 
 		let braces_span = self.current_span();
@@ -771,7 +771,7 @@ impl<'src> Parser<'src> {
 			}
 
 			if let Some(expr) = self.parse_expression() {
-				let end_span = expr.span();
+				let end_span = expr.1;
 				statements.push(Spanned(
 					Statement::Expr(expr),
 					span(start_span.start, end_span.end),
@@ -799,7 +799,7 @@ impl<'src> Parser<'src> {
 		self.expect(&Token::Eq, "=")?;
 		let value = self.parse_expression()?;
 
-		let end_span = value.span();
+		let end_span = value.1;
 		Some(Spanned(
 			Statement::Let {
 				meta: LetDeclaration {
@@ -891,7 +891,7 @@ impl<'src> Parser<'src> {
 		self.expect(&Token::Arrow, "->")?;
 		let body = self.parse_expression()?;
 
-		let end_span = body.span();
+		let end_span = body.1;
 		Some(Spanned(
 			Expr::Closure {
 				generics,
@@ -938,7 +938,7 @@ impl<'src> Parser<'src> {
 
 		let body = self.parse_expression()?;
 
-		let end_span = body.span();
+		let end_span = body.1;
 		Some(Spanned(
 			Expr::Closure {
 				generics,
@@ -1015,10 +1015,7 @@ impl<'src> Parser<'src> {
 			None
 		};
 
-		let end_span = otherwise
-			.as_ref()
-			.map(|e: &Box<_>| e.span())
-			.unwrap_or(then.span());
+		let end_span = otherwise.as_ref().map(|e: &Box<_>| e.1).unwrap_or(then.1);
 
 		Some(Spanned(
 			Expr::If {
@@ -1053,7 +1050,7 @@ impl<'src> Parser<'src> {
 		let condition = self.with_nested(&cond_inner, parens_span, |p| p.parse_expression())?;
 		let body = self.parse_expression()?;
 
-		let end_span = body.span();
+		let end_span = body.1;
 		Some(Spanned(
 			Expr::While {
 				label,
@@ -1093,7 +1090,7 @@ impl<'src> Parser<'src> {
 
 		let body = self.parse_expression()?;
 
-		let end_span = body.span();
+		let end_span = body.1;
 		Some(Spanned(
 			Expr::For {
 				label,
@@ -1212,7 +1209,7 @@ impl<'src> Parser<'src> {
 				break;
 			};
 
-			let end_span = value.span();
+			let end_span = value.1;
 			args.push(Spanned(
 				CallArg {
 					name,
@@ -1276,7 +1273,7 @@ impl<'src> Parser<'src> {
 				let Some(value) = self.parse_expression() else {
 					break;
 				};
-				let end_span = value.span();
+				let end_span = value.1;
 				entries.push(Spanned(
 					MapEntry::Spread(value),
 					span(start_span.start, end_span.end),
@@ -1291,7 +1288,7 @@ impl<'src> Parser<'src> {
 				let Some(value) = self.parse_expression() else {
 					break;
 				};
-				let end_span = value.span();
+				let end_span = value.1;
 				entries.push(Spanned(
 					MapEntry::Expr(key, value),
 					span(start_span.start, end_span.end),
