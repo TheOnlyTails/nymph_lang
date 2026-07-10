@@ -6,5 +6,7 @@
 pub mod ids;
 pub mod ty;
 
+pub mod hir;
+
 pub use ids::{DefId, InferVar, ParamIdx};
 pub use ty::{GenericArgs, Interner, Ty, TyKind};
