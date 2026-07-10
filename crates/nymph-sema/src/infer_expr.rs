@@ -131,7 +131,11 @@ impl<'m> Checker<'m> {
 	pub(crate) fn infer(&mut self, expr: &Expr) -> Ty {
 		let span = expr.span;
 		match &expr.kind {
-			ExprKind::Int(_) => self.interner.int(),
+			ExprKind::Int(_) => {
+				let ty = self.interner.int();
+				self.record(expr.id, ty, None);
+				ty
+			}
 			ExprKind::UInt(_) => self.interner.uint(),
 			ExprKind::Float(_) => self.interner.float(),
 			ExprKind::Char(_) => self.interner.char(),
@@ -230,7 +234,14 @@ impl<'m> Checker<'m> {
 				self.infer(value);
 				self.fresh()
 			}
-			ExprKind::BinaryOp { lhs, op, rhs } => self.infer_binary(lhs, *op, rhs, span),
+			ExprKind::BinaryOp { lhs, op, rhs } => {
+				// The operands are recorded by their own `infer` calls inside
+				// `infer_binary`. The selected-impl `Resolution` (dispatch kind) is
+				// recorded later, in the operator-lowering slice that consumes it.
+				let ty = self.infer_binary(lhs, *op, rhs, span);
+				self.record(expr.id, ty, None);
+				ty
+			}
 			ExprKind::TypeOp { lhs, rhs, .. } => {
 				let src = self.infer(lhs);
 				let target = self.lower_type(rhs);

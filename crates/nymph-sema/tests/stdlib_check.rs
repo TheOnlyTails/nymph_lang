@@ -47,6 +47,7 @@ fn stdlib_typechecks_cleanly() {
 		.collect();
 
 	let diagnostics: Vec<String> = check_program(&modules)
+		.diags
 		.iter()
 		.map(|d| {
 			let kind = if d.is_error() { "error" } else { "warning" };

@@ -17,6 +17,7 @@ fn check(source: &str) -> Vec<String> {
 		"source failed to parse: {parse_errors:?}\n---\n{source}"
 	);
 	check_module(&parsed.tree)
+		.diags
 		.iter()
 		.filter(|d| d.is_error())
 		.map(|d| d.message.to_string())

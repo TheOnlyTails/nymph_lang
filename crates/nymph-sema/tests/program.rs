@@ -27,6 +27,7 @@ fn check(sources: &[&str]) -> Vec<String> {
 		})
 		.collect();
 	check_program(&modules)
+		.diags
 		.iter()
 		.filter(|d| d.is_error())
 		.map(|d| d.message.to_string())

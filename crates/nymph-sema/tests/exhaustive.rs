@@ -16,7 +16,7 @@ fn diagnose(source: &str) -> (Vec<String>, Vec<String>) {
 		parse_errors.is_empty(),
 		"source failed to parse: {parse_errors:?}\n---\n{source}"
 	);
-	let diags = check_module(&parsed.tree);
+	let diags = check_module(&parsed.tree).diags;
 	let errors = diags
 		.iter()
 		.filter(|d| d.is_error())

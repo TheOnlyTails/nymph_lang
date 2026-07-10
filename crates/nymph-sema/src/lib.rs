@@ -17,6 +17,7 @@
 //! Milestone B (interface solving, operator overloading, associated generics, and
 //! match exhaustiveness) is layered on top later.
 
+mod annotate;
 mod check;
 mod coerce;
 mod def;
@@ -29,6 +30,7 @@ mod members;
 mod solve;
 mod unify;
 
+pub use annotate::{Annotations, Checked, DispatchKind, ExprInfo, Resolution};
 pub use check::{check_module, check_program};
 pub use nymph_hir::ids::{self, DefId, InferVar, ParamIdx};
 pub use nymph_hir::ty::{self, GenericArgs, Interner, Ty, TyKind};

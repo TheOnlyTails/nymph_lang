@@ -12,6 +12,7 @@ use nymph_ast::{Span, decl::Declaration, decl::Module};
 use nymph_diagnostics::Diagnostic;
 use rustc_hash::FxHashMap;
 
+use crate::annotate::Checked;
 use crate::def::{DefMap, Signatures, build_def_map};
 use crate::ids::{DefId, InferVar, ParamIdx};
 use crate::ty::fold::occurs;
@@ -62,6 +63,11 @@ pub struct Checker<'m> {
 	/// are recorded once at mint time and persist, because the parameter is baked into a
 	/// stored signature and its bound must still resolve at every call site.
 	pub(crate) synthetic_bounds: FxHashMap<ParamIdx, Vec<DefId>>,
+
+	/// The per-expression decisions recorded for the lowering pass (resolved type,
+	/// selected operator/method impl). Keyed by [`nymph_ast::NodeId`]. Emitted
+	/// alongside diagnostics as part of [`crate::Checked`].
+	pub(crate) annotations: crate::annotate::Annotations,
 }
 
 /// Check a whole (single) module and return every diagnostic produced.
@@ -70,7 +76,7 @@ pub struct Checker<'m> {
 /// order: item resolution (`build_def_map`), signature lowering, then body
 /// inference. The signature/body split mirrors the incremental query boundary the
 /// full salsa driver will formalise later.
-pub fn check_module(module: &Module) -> Vec<Diagnostic> {
+pub fn check_module(module: &Module) -> Checked {
 	let mut diags = Vec::new();
 	let defs = build_def_map(module, &mut diags);
 	let mut checker = Checker::new(module, defs, diags);
@@ -83,7 +89,10 @@ pub fn check_module(module: &Module) -> Vec<Diagnostic> {
 	checker.generalize_returns();
 	checker.check_bodies();
 	checker.check_member_bodies();
-	checker.diags
+	Checked {
+		diags: checker.diags,
+		annotations: checker.annotations,
+	}
 }
 
 /// Check several modules together as one program.
@@ -96,7 +105,7 @@ pub fn check_module(module: &Module) -> Vec<Diagnostic> {
 /// stdlib typecheck before the full salsa module graph (a later project-layer concern)
 /// exists. It deliberately does *not* yet enforce per-module visibility or import
 /// aliasing; those arrive with the real module graph.
-pub fn check_program(modules: &[Module]) -> Vec<Diagnostic> {
+pub fn check_program(modules: &[Module]) -> Checked {
 	let mut members = Vec::new();
 	for module in modules {
 		for decl in &module.members {
@@ -133,12 +142,28 @@ impl<'m> Checker<'m> {
 			alias_depth: 0,
 			synthetic_params: 0,
 			synthetic_bounds: FxHashMap::default(),
+			annotations: crate::annotate::Annotations::default(),
 		}
 	}
 
 	// ── Diagnostics ──────────────────────────────────────────────────────────
 	pub(crate) fn error(&mut self, message: impl Into<EcoString>, span: Span) {
 		self.diags.push(Diagnostic::error(message, span));
+	}
+
+	// ── Annotations ──────────────────────────────────────────────────────────
+	/// Record the checker's decision about an expression node so the lowering pass
+	/// can read it back. `ty` is the node's resolved type; `resolution` is set only
+	/// for desugared operator/cast/method nodes (whose selected impl codegen needs).
+	pub(crate) fn record(
+		&mut self,
+		id: nymph_ast::NodeId,
+		ty: Ty,
+		resolution: Option<crate::annotate::Resolution>,
+	) {
+		self
+			.annotations
+			.record(id, crate::annotate::ExprInfo { ty, resolution });
 	}
 
 	// ── Inference variables ──────────────────────────────────────────────────
