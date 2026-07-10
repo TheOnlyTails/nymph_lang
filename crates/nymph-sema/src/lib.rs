@@ -26,11 +26,13 @@ mod iface;
 mod infer_expr;
 mod infer_pattern;
 mod lower;
+mod lower_hir;
 mod members;
 mod solve;
 mod unify;
 
 pub use annotate::{Annotations, Checked, DispatchKind, ExprInfo, Resolution};
 pub use check::{check_module, check_program};
+pub use lower_hir::lower_hir;
 pub use nymph_hir::ids::{self, DefId, InferVar, ParamIdx};
 pub use nymph_hir::ty::{self, GenericArgs, Interner, Ty, TyKind};
