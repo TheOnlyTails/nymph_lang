@@ -12,7 +12,7 @@ use oxc::{
 	span::SPAN,
 };
 
-use nymph_hir::hir::{HirExpr, HirFunc, HirModule};
+use nymph_hir::hir::{BinOp, HirExpr, HirFunc, HirModule, UnOp};
 
 pub struct Emitter<'a> {
 	ast: AstBuilder<'a>,
@@ -60,10 +60,17 @@ impl<'a> Emitter<'a> {
 		let body_expr = self.emit_expr(&func.body);
 		let mut body_stmts = self.ast.vec();
 		body_stmts.push(self.ast.statement_return(SPAN, Some(body_expr)));
+		let mut js_params = self.ast.vec();
+		for param in &func.params {
+			let binding_pattern = self
+				.ast
+				.binding_pattern_binding_identifier(SPAN, self.ast.allocator.alloc_str(param));
+			js_params.push(self.ast.plain_formal_parameter(SPAN, binding_pattern));
+		}
 		let params = self.ast.formal_parameters(
 			SPAN,
 			FormalParameterKind::FormalParameter,
-			self.ast.vec(),
+			js_params,
 			oxc::ast::NONE,
 		);
 		let fn_body = self.ast.function_body(SPAN, self.ast.vec(), body_stmts);
@@ -94,7 +101,79 @@ impl<'a> Emitter<'a> {
 					.ast
 					.expression_numeric_literal(SPAN, *value, None, NumberBase::Decimal)
 			}
-			_ => unreachable!("only Num is supported in the slice-1 spike"),
+			HirExpr::Str(s) => {
+				self
+					.ast
+					.expression_string_literal(SPAN, self.ast.allocator.alloc_str(s), None)
+			}
+			HirExpr::Bool(b) => self.ast.expression_boolean_literal(SPAN, *b),
+			HirExpr::Char(c) => {
+				// A Nymph char is a single-character JS string.
+				let s = self.ast.allocator.alloc_str(&c.to_string());
+				self.ast.expression_string_literal(SPAN, s, None)
+			}
+			HirExpr::Local(name) => self
+				.ast
+				.expression_identifier(SPAN, self.ast.allocator.alloc_str(name)),
+			HirExpr::Binary { op, lhs, rhs } => {
+				let left = self.emit_expr(lhs);
+				let right = self.emit_expr(rhs);
+				self.emit_binary(*op, left, right)
+			}
+			HirExpr::Unary { op, operand } => {
+				let inner = self.emit_expr(operand);
+				let operator = match op {
+					UnOp::Neg => UnaryOperator::UnaryNegation,
+					UnOp::Not => UnaryOperator::LogicalNot,
+				};
+				self.ast.expression_unary(SPAN, operator, inner)
+			}
+			HirExpr::Call { callee, args } => {
+				let callee = self.emit_expr(callee);
+				let mut arguments = self.ast.vec();
+				for arg in args {
+					arguments.push(Argument::from(self.emit_expr(arg)));
+				}
+				self
+					.ast
+					.expression_call(SPAN, callee, oxc::ast::NONE, arguments, false)
+			}
+			HirExpr::Block { .. } | HirExpr::If { .. } | HirExpr::While { .. } => {
+				unreachable!("control-flow expressions are handled in Task 5/6")
+			}
 		}
+	}
+
+	fn emit_binary(&self, op: BinOp, left: Expression<'a>, right: Expression<'a>) -> Expression<'a> {
+		// Logical operators are a distinct oxc node from binary operators.
+		if let BinOp::And | BinOp::Or = op {
+			let operator = if op == BinOp::And {
+				LogicalOperator::And
+			} else {
+				LogicalOperator::Or
+			};
+			return self.ast.expression_logical(SPAN, left, operator, right);
+		}
+		let operator = match op {
+			BinOp::Add => BinaryOperator::Addition,
+			BinOp::Sub => BinaryOperator::Subtraction,
+			BinOp::Mul => BinaryOperator::Multiplication,
+			BinOp::Div => BinaryOperator::Division,
+			BinOp::Rem => BinaryOperator::Remainder,
+			BinOp::Pow => BinaryOperator::Exponential,
+			BinOp::Eq => BinaryOperator::StrictEquality,
+			BinOp::Ne => BinaryOperator::StrictInequality,
+			BinOp::Lt => BinaryOperator::LessThan,
+			BinOp::Le => BinaryOperator::LessEqualThan,
+			BinOp::Gt => BinaryOperator::GreaterThan,
+			BinOp::Ge => BinaryOperator::GreaterEqualThan,
+			BinOp::BitAnd => BinaryOperator::BitwiseAnd,
+			BinOp::BitOr => BinaryOperator::BitwiseOR,
+			BinOp::BitXor => BinaryOperator::BitwiseXOR,
+			BinOp::Shl => BinaryOperator::ShiftLeft,
+			BinOp::Shr => BinaryOperator::ShiftRight,
+			BinOp::And | BinOp::Or => unreachable!("handled above"),
+		};
+		self.ast.expression_binary(SPAN, left, operator, right)
 	}
 }
