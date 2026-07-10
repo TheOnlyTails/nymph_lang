@@ -236,8 +236,9 @@ impl<'m> Checker<'m> {
 			}
 			ExprKind::BinaryOp { lhs, op, rhs } => {
 				// The operands are recorded by their own `infer` calls inside
-				// `infer_binary`. The selected-impl `Resolution` (dispatch kind) is
-				// recorded later, in the operator-lowering slice that consumes it.
+				// `infer_binary`. TODO(codegen-slice-4): populate the selected-impl
+				// `Resolution` (dispatch kind) here, in the operator-lowering slice that
+				// consumes it (built-in fast-path → BuiltinEager, dispatch → UserImpl).
 				let ty = self.infer_binary(lhs, *op, rhs, span);
 				self.record(expr.id, ty, None);
 				ty

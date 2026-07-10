@@ -161,6 +161,11 @@ impl<'m> Checker<'m> {
 		ty: Ty,
 		resolution: Option<crate::annotate::Resolution>,
 	) {
+		// Zonk before storing: a raw `Ty` can still be an unsolved inference variable,
+		// and the unify table is dropped when checking finishes, so it must be resolved
+		// to its concrete form *now* while the table is alive. (Interpreting the stored
+		// `Ty` also needs the `Interner`, which the lowering slice threads through.)
+		let ty = self.resolve_deep(ty);
 		self
 			.annotations
 			.record(id, crate::annotate::ExprInfo { ty, resolution });
