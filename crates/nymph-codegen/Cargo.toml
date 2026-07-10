@@ -12,3 +12,7 @@ authors.workspace = true
 nymph-hir = { workspace = true }
 oxc = { workspace = true }
 ecow = { workspace = true }
+
+[dev-dependencies]
+nymph-sema = { workspace = true }
+nymph-syntax = { workspace = true }
