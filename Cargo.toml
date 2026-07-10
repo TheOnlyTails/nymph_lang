@@ -6,8 +6,8 @@ members = [
 	"crates/nymph-syntax",
 	"crates/nymph-hir",
 	"crates/nymph-sema",
+	"crates/nymph-codegen",
 	# Added layer by layer as each crate is built:
-	# "crates/nymph-codegen",
 	# "crates/nymph-compiler",
 	# "crates/nymph-cli",
 	# "crates/nymph-lsp",
