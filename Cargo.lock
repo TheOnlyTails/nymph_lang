@@ -293,6 +293,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "nymph-hir"
+version = "0.1.0"
+dependencies = [
+ "ecow",
+ "rustc-hash",
+]
+
+[[package]]
 name = "nymph-sema"
 version = "0.1.0"
 dependencies = [
@@ -300,6 +308,7 @@ dependencies = [
  "ena",
  "nymph-ast",
  "nymph-diagnostics",
+ "nymph-hir",
  "nymph-syntax",
  "ordered-float",
  "rustc-hash",

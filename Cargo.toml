@@ -4,6 +4,7 @@ members = [
 	"crates/nymph-ast",
 	"crates/nymph-diagnostics",
 	"crates/nymph-syntax",
+	"crates/nymph-hir",
 	"crates/nymph-sema",
 	# Added layer by layer as each crate is built:
 	# "crates/nymph-codegen",
@@ -25,6 +26,7 @@ authors = ["Shachar Zidon <theonlytails@theonlytails.com>"]
 nymph-ast = { path = "crates/nymph-ast" }
 nymph-diagnostics = { path = "crates/nymph-diagnostics" }
 nymph-syntax = { path = "crates/nymph-syntax" }
+nymph-hir = { path = "crates/nymph-hir" }
 nymph-sema = { path = "crates/nymph-sema" }
 nymph-codegen = { path = "crates/nymph-codegen" }
 nymph-compiler = { path = "crates/nymph-compiler" }

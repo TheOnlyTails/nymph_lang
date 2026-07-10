@@ -17,9 +17,6 @@
 //! Milestone B (interface solving, operator overloading, associated generics, and
 //! match exhaustiveness) is layered on top later.
 
-pub mod ids;
-pub mod ty;
-
 mod check;
 mod coerce;
 mod def;
@@ -33,5 +30,5 @@ mod solve;
 mod unify;
 
 pub use check::{check_module, check_program};
-pub use ids::{DefId, InferVar, ParamIdx};
-pub use ty::{GenericArgs, Interner, Ty, TyKind};
+pub use nymph_hir::ids::{self, DefId, InferVar, ParamIdx};
+pub use nymph_hir::ty::{self, GenericArgs, Interner, Ty, TyKind};

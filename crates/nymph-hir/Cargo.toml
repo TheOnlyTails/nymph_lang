@@ -1,0 +1,13 @@
+[package]
+name = "nymph-hir"
+description = "The interned semantic type model and stable identity handles shared between type checking and code generation."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+ecow = { workspace = true }
+rustc-hash = { workspace = true }

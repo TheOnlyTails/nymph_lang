@@ -11,9 +11,16 @@ use ena::unify::{InPlace, InPlaceUnificationTable, NoError, Snapshot, UnifyKey, 
 use crate::ids::InferVar;
 use crate::ty::Ty;
 
+/// The ena union-find key. A crate-local newtype isomorphic to [`InferVar`]:
+/// [`InferVar`] itself lives in `nymph-hir` (the pure type model), so the orphan
+/// rule forbids implementing `ena`'s [`UnifyKey`] for it here. We convert at the
+/// table boundary (`InferVar(k.0)` ↔ `Key(v.0)`), which is free.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Key(u32);
+
 /// A saved point in the unification table, for trial unification during overload
 /// resolution (try a candidate, then keep or discard its bindings).
-pub type UnifySnapshot = Snapshot<InPlace<InferVar>>;
+pub type UnifySnapshot = Snapshot<InPlace<Key>>;
 
 /// The value stored for an inference variable's equivalence class: either still
 /// unknown, or resolved to a concrete type.
@@ -23,7 +30,7 @@ pub enum TyVarValue {
 	Known(Ty),
 }
 
-impl UnifyKey for InferVar {
+impl UnifyKey for Key {
 	type Value = TyVarValue;
 
 	fn index(&self) -> u32 {
@@ -31,7 +38,7 @@ impl UnifyKey for InferVar {
 	}
 
 	fn from_index(index: u32) -> Self {
-		InferVar(index)
+		Key(index)
 	}
 
 	fn tag() -> &'static str {
@@ -59,7 +66,7 @@ impl UnifyValue for TyVarValue {
 /// Fresh-variable allocator and binding store for inference.
 #[derive(Debug, Default)]
 pub struct UnifyTable {
-	table: InPlaceUnificationTable<InferVar>,
+	table: InPlaceUnificationTable<Key>,
 }
 
 impl UnifyTable {
@@ -69,27 +76,27 @@ impl UnifyTable {
 
 	/// Allocate a fresh, unbound inference variable.
 	pub fn new_var(&mut self) -> InferVar {
-		self.table.new_key(TyVarValue::Unknown)
+		InferVar(self.table.new_key(TyVarValue::Unknown).0)
 	}
 
 	/// The current value of a variable's class (following it to its root).
 	pub fn probe(&mut self, var: InferVar) -> TyVarValue {
-		self.table.probe_value(var)
+		self.table.probe_value(Key(var.0))
 	}
 
 	/// The canonical representative of a variable's class.
 	pub fn root(&mut self, var: InferVar) -> InferVar {
-		self.table.find(var)
+		InferVar(self.table.find(Key(var.0)).0)
 	}
 
 	/// Merge two still-unbound variables into one class.
 	pub fn union_var(&mut self, a: InferVar, b: InferVar) {
-		self.table.union(a, b);
+		self.table.union(Key(a.0), Key(b.0));
 	}
 
 	/// Bind a variable's class to a concrete type.
 	pub fn assign(&mut self, var: InferVar, ty: Ty) {
-		self.table.union_value(var, TyVarValue::Known(ty));
+		self.table.union_value(Key(var.0), TyVarValue::Known(ty));
 	}
 
 	/// Begin a trial: bindings made after this can be undone with [`Self::rollback_to`].
