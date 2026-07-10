@@ -1,11 +1,11 @@
 //! Parsing of the surface type grammar.
 
+use crate::errors::ParseError;
 use nymph_ast::{
 	Spanned,
 	token::Token,
 	ty::{FunctionTypeParam, GenericArg, GenericParam, Type},
 };
-use nymph_diagnostics::Diagnostic;
 
 use super::Parser;
 
@@ -27,10 +27,7 @@ impl Parser<'_> {
 		let start = self.position();
 		let Some(token) = self.peek() else {
 			let span = self.current_span();
-			self.error(Diagnostic::error(
-				"expected a type, found end of input",
-				span,
-			));
+			self.emit(span, ParseError::ExpectedTypeFoundEof);
 			return Spanned(Type::Infer, span);
 		};
 
@@ -52,10 +49,12 @@ impl Parser<'_> {
 			Token::Identifier(_) => self.parse_reference_type(),
 			other => {
 				let span = self.current_span();
-				self.error(Diagnostic::error(
-					format!("expected a type, found {}", other.describe()),
+				self.emit(
 					span,
-				));
+					ParseError::ExpectedType {
+						found: other.describe().into(),
+					},
+				);
 				self.advance();
 				return Spanned(Type::Infer, span);
 			}
@@ -123,10 +122,7 @@ impl Parser<'_> {
 			Spanned(Type::Grouped(Box::new(inner)), self.span_from(start))
 		} else {
 			let span = self.span_from(start);
-			self.error(Diagnostic::error(
-				"expected `->` to complete a function type",
-				span,
-			));
+			self.emit(span, ParseError::ExpectedArrowInFnType);
 			Spanned(Type::Infer, span)
 		}
 	}

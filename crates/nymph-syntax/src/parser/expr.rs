@@ -1,5 +1,6 @@
 //! Pratt (precedence-climbing) parsing of expressions.
 
+use crate::errors::ParseError;
 use nymph_ast::{
 	Span, Spanned,
 	expr::{
@@ -9,7 +10,6 @@ use nymph_ast::{
 	ops::{AssignOperator, BinaryOperator, Precedence, PrefixOperator},
 	token::{StrFragment, Token},
 };
-use nymph_diagnostics::Diagnostic;
 
 use super::Parser;
 
@@ -404,10 +404,7 @@ impl Parser<'_> {
 		let start = self.position();
 		let Some(token) = self.peek() else {
 			let span = self.current_span();
-			self.error(Diagnostic::error(
-				"expected an expression, found end of input",
-				span,
-			));
+			self.emit(span, ParseError::ExpectedExpressionFoundEof);
 			return self.mk_expr(ExprKind::Tuple(Vec::new()), span);
 		};
 
@@ -498,10 +495,12 @@ impl Parser<'_> {
 			}
 			other => {
 				let span = self.current_span();
-				self.error(Diagnostic::error(
-					format!("expected an expression, found {}", other.describe()),
+				self.emit(
 					span,
-				));
+					ParseError::ExpectedExpression {
+						found: other.describe().into(),
+					},
+				);
 				self.advance();
 				self.mk_expr(ExprKind::Tuple(Vec::new()), span)
 			}

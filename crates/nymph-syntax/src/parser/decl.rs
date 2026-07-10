@@ -1,5 +1,6 @@
 //! Parsing of top-level and member declarations.
 
+use crate::errors::ParseError;
 use ecow::EcoString;
 use nymph_ast::{
 	Ident, Spanned,
@@ -12,7 +13,6 @@ use nymph_ast::{
 	token::Token,
 	ty::{GenericArg, Type},
 };
-use nymph_diagnostics::Diagnostic;
 
 use super::Parser;
 
@@ -28,10 +28,12 @@ impl Parser<'_> {
 			if self.position() == before {
 				let span = self.current_span();
 				let found = self.peek().map_or("end of input", Token::describe);
-				self.error(Diagnostic::error(
-					format!("expected a declaration, found {found}"),
+				self.emit(
 					span,
-				));
+					ParseError::ExpectedDeclaration {
+						found: found.into(),
+					},
+				);
 				self.advance();
 				self.recover_to_declaration();
 			}
@@ -69,10 +71,12 @@ impl Parser<'_> {
 			_ => {
 				let span = self.current_span();
 				let found = self.peek().map_or("end of input", Token::describe);
-				self.error(Diagnostic::error(
-					format!("expected a declaration, found {found}"),
+				self.emit(
 					span,
-				));
+					ParseError::ExpectedDeclaration {
+						found: found.into(),
+					},
+				);
 				None
 			}
 		}
@@ -431,10 +435,12 @@ impl Parser<'_> {
 		} else {
 			let span = self.current_span();
 			let found = self.peek().map_or("end of input", Token::describe);
-			self.error(Diagnostic::error(
-				format!("expected a member (`func`, `let`, or `external`), found {found}"),
+			self.emit(
 				span,
-			));
+				ParseError::ExpectedMember {
+					found: found.into(),
+				},
+			);
 			// Return a dummy so the caller can make progress.
 			ImplMember::Let {
 				visibility,
@@ -547,10 +553,12 @@ impl Parser<'_> {
 		} else {
 			let span = self.current_span();
 			let found = self.peek().map_or("end of input", Token::describe);
-			self.error(Diagnostic::error(
-				format!("expected an interface member, found {found}"),
+			self.emit(
 				span,
-			));
+				ParseError::ExpectedInterfaceMember {
+					found: found.into(),
+				},
+			);
 			None
 		}
 	}
@@ -614,10 +622,7 @@ impl Parser<'_> {
 		match ty.0 {
 			Type::Reference { name, generics } => (name, generics),
 			_ => {
-				self.error(Diagnostic::error(
-					"expected an interface name before `for`",
-					ty.1,
-				));
+				self.emit(ty.1, ParseError::ExpectedInterfaceName);
 				(Spanned(EcoString::new(), ty.1), Vec::new())
 			}
 		}

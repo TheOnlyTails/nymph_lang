@@ -7,6 +7,7 @@
 //! `infer_pattern.rs`, `lower.rs`, and `coerce.rs` as further `impl Checker` blocks;
 //! keeping them in separate files is the deliberate anti-monolith split.
 
+use crate::errors::TypeError;
 use ecow::EcoString;
 use nymph_ast::{Span, decl::Declaration, decl::Module};
 use nymph_diagnostics::Diagnostic;
@@ -147,8 +148,10 @@ impl<'m> Checker<'m> {
 	}
 
 	// ── Diagnostics ──────────────────────────────────────────────────────────
-	pub(crate) fn error(&mut self, message: impl Into<EcoString>, span: Span) {
-		self.diags.push(Diagnostic::error(message, span));
+	/// Emit a typed [`TypeError`](crate::errors::TypeError), anchored at `span`.
+	pub(crate) fn emit(&mut self, span: Span, err: TypeError) {
+		use nymph_diagnostics::IntoDiagnostic;
+		self.diags.push(err.into_diagnostic(span));
 	}
 
 	// ── Annotations ──────────────────────────────────────────────────────────
@@ -368,10 +371,7 @@ impl<'m> Checker<'m> {
 	pub(crate) fn bind_var(&mut self, var: InferVar, ty: Ty, span: Span) {
 		if occurs(&self.interner, var, ty) {
 			let rendered = self.display(ty);
-			self.error(
-				format!("this expression has an infinite type `{rendered}`"),
-				span,
-			);
+			self.emit(span, TypeError::InfiniteType { ty: rendered });
 			let error = self.interner.error();
 			self.table.assign(var, error);
 			return;

@@ -6,6 +6,7 @@
 //! nominal `Adt` if it names a struct/enum. Type aliases are expanded on demand
 //! (guarded against recursion) so definition order does not matter.
 
+use crate::errors::TypeError;
 use ecow::EcoString;
 use nymph_ast::{
 	Span, Spanned,
@@ -212,9 +213,11 @@ impl Checker<'_> {
 		// A bare generic parameter in scope wins over any nominal type.
 		if let Some(idx) = self.lookup_param(&name.0) {
 			if !generics.is_empty() {
-				self.error(
-					format!("generic parameter `{}` cannot take type arguments", name.0),
+				self.emit(
 					span,
+					TypeError::GenericParamWithArgs {
+						name: name.0.clone(),
+					},
 				);
 			}
 			return self.interner.mk_param(idx);
@@ -231,7 +234,12 @@ impl Checker<'_> {
 		}
 
 		let Some(def) = self.defs.get(&name.0) else {
-			self.error(format!("cannot find type `{}` in this scope", name.0), span);
+			self.emit(
+				span,
+				TypeError::CannotFindType {
+					name: name.0.clone(),
+				},
+			);
 			return self.interner.error();
 		};
 
@@ -248,7 +256,12 @@ impl Checker<'_> {
 			// it resolve through the interface.
 			DefKind::Interface { .. } => self.mint_synthetic_param(def),
 			_ => {
-				self.error(format!("`{}` is not a type", name.0), span);
+				self.emit(
+					span,
+					TypeError::NotAType {
+						name: name.0.clone(),
+					},
+				);
 				self.interner.error()
 			}
 		}
@@ -278,7 +291,7 @@ impl Checker<'_> {
 		span: Span,
 	) -> Ty {
 		if self.alias_depth > 64 {
-			self.error("type alias expands recursively without end", span);
+			self.emit(span, TypeError::RecursiveTypeAlias);
 			return self.interner.error();
 		}
 		let module = self.module;

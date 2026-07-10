@@ -11,6 +11,7 @@ mod expr;
 mod pattern;
 mod ty;
 
+use crate::errors::ParseError;
 use cursor::TokenCursor;
 use ecow::EcoString;
 use nymph_ast::{
@@ -60,10 +61,7 @@ pub fn parse_expression(source: &str) -> ParseResult<Expr> {
 	let expr = parser.parse_expr();
 	if !parser.at_end() {
 		let span = parser.current_span();
-		parser.error(Diagnostic::error(
-			"unexpected trailing tokens after expression",
-			span,
-		));
+		parser.emit(span, ParseError::TrailingTokens);
 	}
 	let mut diagnostics = lexed.diagnostics;
 	diagnostics.extend(parser.diagnostics);
@@ -130,8 +128,10 @@ impl<'src> Parser<'src> {
 		self.cursor.restore(pos);
 	}
 
-	fn error(&mut self, diagnostic: Diagnostic) {
-		self.diagnostics.push(diagnostic);
+	/// Emit a typed [`ParseError`](crate::errors::ParseError), anchored at `span`.
+	fn emit(&mut self, span: Span, err: crate::errors::ParseError) {
+		use nymph_diagnostics::IntoDiagnostic;
+		self.diagnostics.push(err.into_diagnostic(span));
 	}
 
 	/// Consume the given token if present, returning its span.
@@ -150,10 +150,13 @@ impl<'src> Parser<'src> {
 		} else {
 			let found = self.peek().map_or("end of input", Token::describe);
 			let span = self.current_span();
-			self.error(Diagnostic::error(
-				format!("expected {}, found {found}", token.describe()),
+			self.emit(
 				span,
-			));
+				ParseError::ExpectedToken {
+					expected: token.describe().into(),
+					found: found.into(),
+				},
+			);
 			None
 		}
 	}
@@ -172,10 +175,12 @@ impl<'src> Parser<'src> {
 			_ => {
 				let found = self.peek().map_or("end of input", Token::describe);
 				let span = self.current_span();
-				self.error(Diagnostic::error(
-					format!("expected an identifier, found {found}"),
+				self.emit(
 					span,
-				));
+					ParseError::ExpectedIdentifier {
+						found: found.into(),
+					},
+				);
 				Spanned(EcoString::new(), span)
 			}
 		}

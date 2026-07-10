@@ -13,6 +13,7 @@
 //! - `!in` / `!is` are produced by merging an adjacent `!` with the `in` / `is` keyword,
 //!   which correctly leaves `!inside` as `!` followed by the identifier `inside`.
 
+use crate::errors::LexError;
 use chumsky::prelude::*;
 use nymph_ast::{
 	Span, Spanned,
@@ -170,7 +171,10 @@ fn char_literal<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src
 		.map(|s: &str| u32::from_str_radix(s, 16).ok().and_then(char::from_u32))
 		.validate(|c, e, emitter| {
 			c.unwrap_or_else(|| {
-				emitter.emit(Rich::custom(e.span(), "invalid unicode code point"));
+				emitter.emit(Rich::custom(
+					e.span(),
+					LexError::InvalidUnicodeCodePoint.text(),
+				));
 				'\u{FFFD}'
 			})
 		});
@@ -199,7 +203,10 @@ fn string_literal<'src>(
 		})
 		.validate(|c, e, emitter| {
 			StrFragment::Escape(StringEscape::Unicode(c.unwrap_or_else(|| {
-				emitter.emit(Rich::custom(e.span(), "invalid unicode code point"));
+				emitter.emit(Rich::custom(
+					e.span(),
+					LexError::InvalidUnicodeCodePoint.text(),
+				));
 				'\u{FFFD}'
 			})))
 		});
@@ -248,7 +255,7 @@ fn anonymous_param<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'
 				d.parse::<u32>().unwrap_or_else(|_| {
 					emitter.emit(Rich::custom(
 						e.span(),
-						"closure parameter index is too large",
+						LexError::ClosureIndexTooLarge.text(),
 					));
 					0
 				})

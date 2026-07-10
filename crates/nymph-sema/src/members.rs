@@ -9,6 +9,7 @@
 //! signatures once means an omitted return type's inference variable is shared
 //! between the two, so a method like `is_some()` resolves to `boolean` for callers.
 
+use crate::errors::TypeError;
 use ecow::EcoString;
 use nymph_ast::{
 	Spanned,
@@ -329,13 +330,13 @@ impl<'m> Checker<'m> {
 		let ret = self.subst(ret, &subst, Some(self_concrete));
 
 		if params.len() != arg_tys.len() {
-			self.error(
-				format!(
-					"`{name}` expects {} argument(s), found {}",
-					params.len(),
-					arg_tys.len()
-				),
+			self.emit(
 				span,
+				TypeError::NamedWrongArgCount {
+					name: name.into(),
+					expected: params.len(),
+					found: arg_tys.len(),
+				},
 			);
 			return ret;
 		}

@@ -8,6 +8,7 @@
 //! checking, and — for `resolve_method` — argument-type-directed overload selection
 //! with concrete impls winning over blanket ones.
 
+use crate::errors::TypeError;
 use ecow::EcoString;
 use nymph_ast::Span;
 use rustc_hash::FxHashMap;
@@ -123,13 +124,13 @@ impl Checker<'_> {
 				.collect();
 			let ret = self.subst(method.ret, &isubst, Some(param_ty));
 			if params.len() != arg_tys.len() {
-				self.error(
-					format!(
-						"`{name}` expects {} argument(s), found {}",
-						params.len(),
-						arg_tys.len()
-					),
+				self.emit(
 					span,
+					TypeError::NamedWrongArgCount {
+						name: name.into(),
+						expected: params.len(),
+						found: arg_tys.len(),
+					},
 				);
 				return ret;
 			}
@@ -138,10 +139,7 @@ impl Checker<'_> {
 			}
 			return ret;
 		}
-		self.error(
-			format!("no namespaced function `{name}` found on this type parameter"),
-			span,
-		);
+		self.emit(span, TypeError::NoNamespacedFnOnParam { name: name.into() });
 		self.interner.error()
 	}
 
@@ -185,13 +183,13 @@ impl Checker<'_> {
 				.collect();
 			let ret = self.subst(method.ret, &isubst, Some(param_ty));
 			if params.len() != arg_tys.len() {
-				self.error(
-					format!(
-						"`{name}` expects {} argument(s), found {}",
-						params.len(),
-						arg_tys.len()
-					),
+				self.emit(
 					span,
+					TypeError::NamedWrongArgCount {
+						name: name.into(),
+						expected: params.len(),
+						found: arg_tys.len(),
+					},
 				);
 				return Some(ret);
 			}
@@ -223,10 +221,7 @@ impl Checker<'_> {
 				}
 				if self.impls_overlap(&a, &b) {
 					let iface = self.defs.data(a.interface).name.clone();
-					self.error(
-						format!("conflicting implementations of interface `{iface}`"),
-						b.span,
-					);
+					self.emit(b.span, TypeError::ConflictingImpls { iface });
 				}
 			}
 		}
@@ -336,18 +331,12 @@ impl Checker<'_> {
 		let chosen = self.most_specific(&arg_matches);
 		match chosen.len() {
 			0 => {
-				self.error(
-					format!("no overload of `{name}` matches these arguments"),
-					span,
-				);
+				self.emit(span, TypeError::NoMatchingOverload { name: name.into() });
 				Some(self.interner.error())
 			}
 			1 => Some(self.commit_method(chosen[0], recv, name, arg_tys, arg_lits, span)),
 			_ => {
-				self.error(
-					format!("ambiguous call to `{name}`: multiple impls apply"),
-					span,
-				);
+				self.emit(span, TypeError::AmbiguousCall { name: name.into() });
 				Some(self.interner.error())
 			}
 		}
@@ -423,13 +412,13 @@ impl Checker<'_> {
 			return self.interner.error();
 		};
 		if params.len() != arg_tys.len() {
-			self.error(
-				format!(
-					"`{name}` expects {} argument(s), found {}",
-					params.len(),
-					arg_tys.len()
-				),
+			self.emit(
 				span,
+				TypeError::NamedWrongArgCount {
+					name: name.into(),
+					expected: params.len(),
+					found: arg_tys.len(),
+				},
 			);
 			return ret;
 		}

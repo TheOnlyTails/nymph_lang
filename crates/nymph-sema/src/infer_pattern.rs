@@ -15,6 +15,7 @@ use nymph_ast::{
 
 use crate::check::Checker;
 use crate::def::DefKind;
+use crate::errors::TypeError;
 use crate::ids::DefId;
 use crate::ty::Ty;
 
@@ -171,12 +172,22 @@ impl Checker<'_> {
 				StructPatternField::Value { name, value } => {
 					match field_tys.iter().find(|(n, _)| n == &name.0) {
 						Some((_, fty)) => self.pattern(value, *fty, mutable),
-						None => self.error(format!("unknown field `{}`", name.0), name.1),
+						None => self.emit(
+							name.1,
+							TypeError::UnknownField {
+								field: name.0.clone(),
+							},
+						),
 					}
 				}
 				StructPatternField::Named(name) => match field_tys.iter().find(|(n, _)| n == &name.0) {
 					Some((_, fty)) => self.define_local(name.0.clone(), *fty, mutable),
-					None => self.error(format!("unknown field `{}`", name.0), name.1),
+					None => self.emit(
+						name.1,
+						TypeError::UnknownField {
+							field: name.0.clone(),
+						},
+					),
 				},
 				StructPatternField::Rest => {}
 			}
@@ -200,10 +211,7 @@ impl Checker<'_> {
 				}
 			}
 			Err(()) => {
-				self.error(
-					format!("ambiguous variant `{0}`; qualify it as `Enum.{0}`", name),
-					span,
-				);
+				self.emit(span, TypeError::AmbiguousVariant { name: name.into() });
 				Some(self.interner.error())
 			}
 		}
@@ -222,18 +230,22 @@ impl Checker<'_> {
 						return Some(PatternTarget::Variant(enum_def, variant));
 					}
 					Some(Err(())) => {
-						self.error(
-							format!(
-								"ambiguous variant `{0}`; qualify it as `Enum.{0}`",
-								single.0
-							),
+						self.emit(
 							span,
+							TypeError::AmbiguousVariant {
+								name: single.0.clone(),
+							},
 						);
 						return None;
 					}
 					None => {}
 				}
-				self.error(format!("cannot find constructor `{}`", single.0), span);
+				self.emit(
+					span,
+					TypeError::CannotFindConstructor {
+						name: single.0.clone(),
+					},
+				);
 				None
 			}
 			[type_name, variant_name] => {
@@ -247,19 +259,27 @@ impl Checker<'_> {
 					return match position {
 						Some(variant) => Some(PatternTarget::Variant(def, variant)),
 						None => {
-							self.error(
-								format!("enum `{}` has no variant `{}`", type_name.0, variant_name.0),
+							self.emit(
 								span,
+								TypeError::EnumHasNoVariant {
+									enum_name: type_name.0.clone(),
+									variant: variant_name.0.clone(),
+								},
 							);
 							None
 						}
 					};
 				}
-				self.error(format!("cannot find enum `{}`", type_name.0), span);
+				self.emit(
+					span,
+					TypeError::CannotFindEnum {
+						name: type_name.0.clone(),
+					},
+				);
 				None
 			}
 			_ => {
-				self.error("unsupported constructor path", span);
+				self.emit(span, TypeError::UnsupportedConstructorPath);
 				None
 			}
 		}

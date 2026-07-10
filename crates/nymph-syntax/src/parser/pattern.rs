@@ -1,6 +1,7 @@
 //! Parsing of patterns, shared by `match`, `let`, function parameters, and the
 //! `is` / `!is` operators.
 
+use crate::errors::ParseError;
 use nymph_ast::{
 	Spanned,
 	expr::{
@@ -9,7 +10,6 @@ use nymph_ast::{
 	},
 	token::{StrFragment, Token},
 };
-use nymph_diagnostics::Diagnostic;
 use ordered_float::OrderedFloat;
 
 use super::Parser;
@@ -111,10 +111,7 @@ impl Parser<'_> {
 		let start = self.position();
 		let Some(token) = self.peek() else {
 			let span = self.current_span();
-			self.error(Diagnostic::error(
-				"expected a pattern, found end of input",
-				span,
-			));
+			self.emit(span, ParseError::ExpectedPatternFoundEof);
 			return Spanned(Pattern::Placeholder, span);
 		};
 
@@ -165,10 +162,12 @@ impl Parser<'_> {
 			Token::Identifier(_) => self.parse_ident_pattern(),
 			other => {
 				let span = self.current_span();
-				self.error(Diagnostic::error(
-					format!("expected a pattern, found {}", other.describe()),
+				self.emit(
 					span,
-				));
+					ParseError::ExpectedPattern {
+						found: other.describe().into(),
+					},
+				);
 				self.advance();
 				Spanned(Pattern::Placeholder, span)
 			}
@@ -197,10 +196,7 @@ impl Parser<'_> {
 			}
 			_ => {
 				let span = self.span_from(start);
-				self.error(Diagnostic::error(
-					"expected a number after `-` in a pattern",
-					span,
-				));
+				self.emit(span, ParseError::ExpectedNumberAfterMinus);
 				Spanned(Pattern::Placeholder, span)
 			}
 		}
@@ -221,10 +217,7 @@ impl Parser<'_> {
 					StringPatternPart::EscapeSequence(*escape),
 					fragment.1,
 				)),
-				StrFragment::Interpolation(_) => self.error(Diagnostic::error(
-					"string interpolation is not allowed in patterns",
-					fragment.1,
-				)),
+				StrFragment::Interpolation(_) => self.emit(fragment.1, ParseError::InterpolationInPattern),
 			}
 		}
 		self.advance();

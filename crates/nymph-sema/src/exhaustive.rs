@@ -11,12 +11,12 @@
 //! `int` scrutinees keep a dedicated interval check (their constructor space is
 //! unbounded, but literal/range patterns can still tile the whole line).
 
+use crate::errors::TypeError;
 use ecow::EcoString;
 use nymph_ast::{
 	Span,
 	expr::{ListPatternEntry, MatchArm, Pattern, RangePatternKind, StructPatternField},
 };
-use nymph_diagnostics::{Diagnostic, Severity};
 
 use crate::check::Checker;
 use crate::def::DefKind;
@@ -90,10 +90,7 @@ impl Checker<'_> {
 
 		if let Some(witness) = self.useful(&matrix, &[Pat::Wild], &[scrutinee]) {
 			let rendered = self.render_witness(witness.first().unwrap_or(&Witness::Wild), scrutinee);
-			self.error(
-				format!("non-exhaustive match: `{rendered}` is not covered"),
-				span,
-			);
+			self.emit(span, TypeError::NonExhaustiveMatch { witness: rendered });
 		}
 	}
 
@@ -502,10 +499,7 @@ impl Checker<'_> {
 			}
 		}
 		if !covers_full_int_range(ranges) {
-			self.error(
-				"non-exhaustive match: some `int` values are not covered — add a `_` arm",
-				span,
-			);
+			self.emit(span, TypeError::NonExhaustiveInt);
 		}
 	}
 
@@ -520,18 +514,12 @@ impl Checker<'_> {
 			}
 		}
 		if !has_catch_all {
-			self.error(
-				"non-exhaustive match: add a `_` arm to cover the remaining cases",
-				span,
-			);
+			self.emit(span, TypeError::NonExhaustiveNeedsWildcard);
 		}
 	}
 
 	fn warn_unreachable(&mut self, span: Span) {
-		self.diags.push(
-			Diagnostic::new(Severity::Warning, "unreachable match arm", span)
-				.with_help("a previous arm already covers this case"),
-		);
+		self.emit(span, TypeError::UnreachableArm);
 	}
 }
 

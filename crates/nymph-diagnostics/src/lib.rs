@@ -96,6 +96,54 @@ impl Diagnostic {
 	}
 }
 
+/// A typed diagnostic: an error/warning defined as one variant of a phase enum
+/// (`LexError`, `ParseError`, `TypeError`, …) rather than an inline string. The
+/// variant owns its message, severity, secondary labels, notes, and help; the
+/// primary span is supplied when it is emitted. `code` defaults to `None` and is
+/// filled in per-variant once the code scheme is assigned.
+pub trait IntoDiagnostic {
+	/// The primary human-readable message.
+	fn message(&self) -> EcoString;
+
+	fn severity(&self) -> Severity {
+		Severity::Error
+	}
+
+	/// Secondary annotations pointing at related spans (e.g. a previous definition).
+	fn labels(&self) -> Vec<Label> {
+		Vec::new()
+	}
+
+	fn notes(&self) -> Vec<EcoString> {
+		Vec::new()
+	}
+
+	fn help(&self) -> Option<EcoString> {
+		None
+	}
+
+	/// The stable error code, once assigned. Defaults to `None`.
+	fn code(&self) -> Option<&'static str> {
+		None
+	}
+
+	/// Assemble the full [`Diagnostic`], anchoring the primary message at `span`.
+	fn into_diagnostic(self, span: Span) -> Diagnostic
+	where
+		Self: Sized,
+	{
+		Diagnostic {
+			severity: self.severity(),
+			code: self.code().map(EcoString::from),
+			message: self.message(),
+			span,
+			labels: self.labels(),
+			notes: self.notes(),
+			help: self.help(),
+		}
+	}
+}
+
 fn range(span: Span) -> std::ops::Range<usize> {
 	span.start..span.end
 }

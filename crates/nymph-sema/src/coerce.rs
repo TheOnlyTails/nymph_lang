@@ -5,6 +5,7 @@
 //! an occurs-check in `bind_var`), and reports a precise mismatch otherwise. It
 //! never silently no-ops on a conflict.
 
+use crate::errors::TypeError;
 use nymph_ast::Span;
 
 use crate::check::Checker;
@@ -201,9 +202,6 @@ impl Checker<'_> {
 	fn mismatch(&mut self, a: Ty, b: Ty, span: Span) {
 		let found = self.display(a);
 		let expected = self.display(b);
-		self.error(
-			format!("mismatched types: expected `{expected}`, found `{found}`"),
-			span,
-		);
+		self.emit(span, TypeError::MismatchedTypes { expected, found });
 	}
 }

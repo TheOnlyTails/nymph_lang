@@ -19,6 +19,7 @@ use rustc_hash::FxHashMap;
 
 use crate::check::Checker;
 use crate::def::DefKind;
+use crate::errors::TypeError;
 use crate::ids::{DefId, ParamIdx};
 use crate::lower::build_param_scope;
 use crate::ty::{GenericArgs, Ty, TyKind};
@@ -151,13 +152,13 @@ impl<'m> Checker<'m> {
 			ExprKind::This => match self.self_ty {
 				Some(ty) => ty,
 				None => {
-					self.error("`this` is only valid inside a method", span);
+					self.emit(span, TypeError::ThisOutsideMethod);
 					self.interner.error()
 				}
 			},
 			ExprKind::Identifier(name) => self.infer_identifier(&name.0, span),
 			ExprKind::AnonymousParam(_) => {
-				self.error("anonymous closure parameters are not supported yet", span);
+				self.emit(span, TypeError::AnonymousParamUnsupported);
 				self.fresh()
 			}
 			ExprKind::List(items) => {
@@ -350,12 +351,12 @@ impl<'m> Checker<'m> {
 		match self.defs.resolve_variant(name) {
 			Some(Ok((enum_def, variant))) => return self.variant_value(enum_def, variant),
 			Some(Err(())) => {
-				self.error(ambiguous_variant(name), span);
+				self.emit(span, TypeError::AmbiguousVariant { name: name.into() });
 				return self.interner.error();
 			}
 			None => {}
 		}
-		self.error(format!("cannot find `{name}` in this scope"), span);
+		self.emit(span, TypeError::CannotFind { name: name.into() });
 		self.interner.error()
 	}
 
@@ -370,14 +371,14 @@ impl<'m> Checker<'m> {
 			DefKind::Func { .. } => self.fn_type_of(def),
 			DefKind::Variant { enum_def, variant } => self.variant_value(enum_def, variant),
 			DefKind::Struct { .. } => {
-				self.error("a struct type cannot be used as a value directly", span);
+				self.emit(span, TypeError::StructTypeAsValue);
 				self.interner.error()
 			}
 			DefKind::Enum { .. }
 			| DefKind::TypeAlias { .. }
 			| DefKind::Namespace { .. }
 			| DefKind::Interface { .. } => {
-				self.error("a type cannot be used as a value", span);
+				self.emit(span, TypeError::TypeAsValue);
 				self.interner.error()
 			}
 		}
@@ -448,7 +449,12 @@ impl<'m> Checker<'m> {
 					return self.infer_variant_ctor(enum_def, variant, args, span);
 				}
 				Some(Err(())) => {
-					self.error(ambiguous_variant(&name.0), span);
+					self.emit(
+						span,
+						TypeError::AmbiguousVariant {
+							name: name.0.clone(),
+						},
+					);
 					return self.interner.error();
 				}
 				None => {}
@@ -476,12 +482,12 @@ impl<'m> Checker<'m> {
 					{
 						return ret;
 					}
-					self.error(
-						format!(
-							"`{}` has no variant or namespaced function `{}`",
-							type_name.0, member.0
-						),
+					self.emit(
 						member.1,
+						TypeError::NoVariantOrNamespacedFn {
+							ty: type_name.0.clone(),
+							name: member.0.clone(),
+						},
 					);
 					return self.interner.error();
 				}
@@ -492,12 +498,12 @@ impl<'m> Checker<'m> {
 					{
 						return ret;
 					}
-					self.error(
-						format!(
-							"`{}` has no namespaced function `{}`",
-							type_name.0, member.0
-						),
+					self.emit(
 						member.1,
+						TypeError::NoNamespacedFn {
+							ty: type_name.0.clone(),
+							name: member.0.clone(),
+						},
 					);
 					return self.interner.error();
 				}
@@ -525,9 +531,12 @@ impl<'m> Checker<'m> {
 				Some(ret) => ret,
 				None => {
 					let rendered = self.display(recv);
-					self.error(
-						format!("no method `{}` found for `{rendered}`", member.0),
+					self.emit(
 						member.1,
+						TypeError::NoMethod {
+							method: member.0.clone(),
+							ty: rendered,
+						},
 					);
 					self.interner.error()
 				}
@@ -539,13 +548,12 @@ impl<'m> Checker<'m> {
 		match self.interner.kind(callee).clone() {
 			TyKind::Fn { params, ret } => {
 				if args.len() != params.len() {
-					self.error(
-						format!(
-							"expected {} argument(s), found {}",
-							params.len(),
-							args.len()
-						),
+					self.emit(
 						span,
+						TypeError::WrongArgCount {
+							expected: params.len(),
+							found: args.len(),
+						},
 					);
 				}
 				for (arg, pty) in args.iter().zip(&params) {
@@ -564,7 +572,7 @@ impl<'m> Checker<'m> {
 				self.fresh()
 			}
 			_ => {
-				self.error("this expression is not callable", span);
+				self.emit(span, TypeError::NotCallable);
 				for arg in args {
 					self.infer(&arg.0.value);
 				}
@@ -612,7 +620,12 @@ impl<'m> Checker<'m> {
 				match fields.iter().find(|(n, _)| n == &label.0) {
 					Some((_, ty)) => Some(*ty),
 					None => {
-						self.error(format!("unknown field `{}`", label.0), label.1);
+						self.emit(
+							label.1,
+							TypeError::UnknownField {
+								field: label.0.clone(),
+							},
+						);
 						None
 					}
 				}
@@ -620,7 +633,7 @@ impl<'m> Checker<'m> {
 				match fields.get(i) {
 					Some((_, ty)) => Some(*ty),
 					None => {
-						self.error("too many fields supplied", call.value.span);
+						self.emit(call.value.span, TypeError::TooManyFields);
 						None
 					}
 				}
@@ -645,7 +658,13 @@ impl<'m> Checker<'m> {
 			if let Some(vidx) = variants.iter().position(|v| v.name == member) {
 				return self.variant_value(def, vidx);
 			}
-			self.error(format!("enum `{tname}` has no variant `{member}`"), span);
+			self.emit(
+				span,
+				TypeError::EnumHasNoVariant {
+					enum_name: tname.0.clone(),
+					variant: member.into(),
+				},
+			);
 			return self.interner.error();
 		}
 
@@ -660,17 +679,29 @@ impl<'m> Checker<'m> {
 						return self.subst(*fty, &subst, Some(parent_ty));
 					}
 					let owner = self.defs.data(def).name.clone();
-					self.error(format!("no field `{member}` on `{owner}`"), span);
+					self.emit(
+						span,
+						TypeError::NoField {
+							field: member.into(),
+							ty: owner.to_string(),
+						},
+					);
 					return self.interner.error();
 				}
-				self.error("method calls are not supported yet (Milestone B)", span);
+				self.emit(span, TypeError::MethodCallsUnsupported);
 				self.interner.error()
 			}
 			TyKind::Error => self.interner.error(),
 			TyKind::Infer(_) => self.fresh(),
 			_ => {
 				let rendered = self.display(parent_ty);
-				self.error(format!("cannot access `{member}` on `{rendered}`"), span);
+				self.emit(
+					span,
+					TypeError::CannotAccess {
+						member: member.into(),
+						ty: rendered,
+					},
+				);
 				self.interner.error()
 			}
 		}
@@ -927,9 +958,12 @@ impl<'m> Checker<'m> {
 			Some(ret) => ret,
 			None => {
 				let rendered = self.display(recv);
-				self.error(
-					format!("`{method}` is not implemented for `{rendered}`"),
+				self.emit(
 					span,
+					TypeError::NotImplemented {
+						method: method.into(),
+						ty: rendered,
+					},
 				);
 				self.interner.error()
 			}
@@ -964,10 +998,7 @@ impl<'m> Checker<'m> {
 		if !self.holds(src, into, &known, 0) {
 			let s = self.display(src);
 			let t = self.display(target);
-			self.error(
-				format!("cannot cast `{s}` to `{t}`: no `Into` implementation"),
-				span,
-			);
+			self.emit(span, TypeError::CannotCast { from: s, to: t });
 		}
 	}
 
@@ -1030,12 +1061,22 @@ impl<'m> Checker<'m> {
 			ExprKind::Identifier(name) => match self.lookup_local(&name.0).map(|b| (b.ty, b.mutable)) {
 				Some((ty, mutable)) => {
 					if !mutable {
-						self.error(format!("cannot assign to immutable `{}`", name.0), lhs.span);
+						self.emit(
+							lhs.span,
+							TypeError::AssignToImmutable {
+								name: name.0.clone(),
+							},
+						);
 					}
 					ty
 				}
 				None => {
-					self.error(format!("cannot assign to `{}`", name.0), lhs.span);
+					self.emit(
+						lhs.span,
+						TypeError::CannotAssign {
+							name: name.0.clone(),
+						},
+					);
 					self.infer(rhs);
 					return self.interner.void();
 				}
@@ -1168,10 +1209,6 @@ fn adt_subst(args: &GenericArgs) -> FxHashMap<ParamIdx, Ty> {
 		.enumerate()
 		.map(|(i, &ty)| (ParamIdx(i as u32), ty))
 		.collect()
-}
-
-fn ambiguous_variant(name: &str) -> String {
-	format!("ambiguous variant `{name}`; qualify it as `Enum.{name}`")
 }
 
 /// Which call arguments are bare integer literals — these may widen to a `float`/`uint`

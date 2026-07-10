@@ -9,13 +9,14 @@
 //! [`Ty`]s) are computed once in `lower.rs` and are the global data that body
 //! inference reads but never mutates — the incrementality boundary from the plan.
 
+use crate::errors::TypeError;
 use ecow::EcoString;
 use nymph_ast::{
 	Ident, Span, Spanned,
 	decl::{Declaration, Module},
 	expr::Pattern,
 };
-use nymph_diagnostics::{Diagnostic, Label};
+use nymph_diagnostics::{Diagnostic, IntoDiagnostic};
 use rustc_hash::FxHashMap;
 
 use crate::{DefId, Ty};
@@ -142,9 +143,12 @@ pub fn build_def_map(module: &Module, diags: &mut Vec<Diagnostic>) -> DefMap {
 		|map: &mut DefMap, diags: &mut Vec<Diagnostic>, name: &Ident, kind: DefKind| -> DefId {
 			if let Some(&prev) = seen.get(&name.0) {
 				diags.push(
-					Diagnostic::error(format!("`{}` is defined more than once", name.0), name.1)
-						.with_label(Label::new(name.1, "redefined here"))
-						.with_label(Label::new(prev, "first defined here")),
+					TypeError::Redefinition {
+						name: name.0.clone(),
+						redefined_span: name.1,
+						prev,
+					}
+					.into_diagnostic(name.1),
 				);
 			}
 			seen.insert(name.0.clone(), name.1);

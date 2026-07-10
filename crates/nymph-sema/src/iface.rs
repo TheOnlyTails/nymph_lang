@@ -12,6 +12,7 @@
 //! candidates in O(candidates), with blanket impls (`impl<T> … for T`) in a separate
 //! per-interface bucket.
 
+use crate::errors::TypeError;
 use ecow::EcoString;
 use nymph_ast::{
 	Ident, Span, Spanned,
@@ -327,9 +328,11 @@ impl Checker<'_> {
 			.get(&iface_name.0)
 			.filter(|&d| self.is_interface(d))
 		else {
-			self.error(
-				format!("`{}` is not an interface", iface_name.0),
+			self.emit(
 				iface_name.1,
+				TypeError::NotAnInterface {
+					name: iface_name.0.clone(),
+				},
 			);
 			return;
 		};

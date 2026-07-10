@@ -21,6 +21,7 @@ mod annotate;
 mod check;
 mod coerce;
 mod def;
+mod errors;
 mod exhaustive;
 mod iface;
 mod infer_expr;
@@ -33,6 +34,7 @@ mod unify;
 
 pub use annotate::{Annotations, Checked, DispatchKind, ExprInfo, Resolution};
 pub use check::{check_module, check_program};
+pub use errors::TypeError;
 pub use lower_hir::lower_hir;
 pub use nymph_hir::ids::{self, DefId, InferVar, ParamIdx};
 pub use nymph_hir::ty::{self, GenericArgs, Interner, Ty, TyKind};
