@@ -14,24 +14,20 @@
 //!   which correctly leaves `!inside` as `!` followed by the identifier `inside`.
 
 use crate::errors::LexError;
-use chumsky::prelude::*;
+use chumsky::{error::RichReason, prelude::*};
 use nymph_ast::{
 	Span, Spanned,
 	expr::StringEscape,
 	token::{StrFragment, Token},
 };
-use nymph_diagnostics::Diagnostic;
+use nymph_diagnostics::{Diagnostic, IntoDiagnostic};
 
-type Err<'src> = extra::Err<Rich<'src, char>>;
+type Err<'src> = extra::Err<Rich<'src, char, SimpleSpan, LexError>>;
 
 /// The result of lexing: the token stream plus any diagnostics gathered along the way.
 pub struct LexResult {
 	pub tokens: Vec<Spanned<Token>>,
 	pub diagnostics: Vec<Diagnostic>,
-}
-
-fn conv(s: SimpleSpan) -> Span {
-	Span::new(s.start, s.end)
 }
 
 fn clean(s: &str) -> String {
@@ -50,7 +46,17 @@ pub fn lex(source: &str) -> LexResult {
 
 	let diagnostics = errors
 		.into_iter()
-		.map(|e| Diagnostic::error(e.to_string(), conv(*e.span())).with_code("lex"))
+		.map(|err| {
+			let span = *err.span();
+			let err = match err.reason() {
+				RichReason::ExpectedFound { expected, found } => &LexError::ExpectedFound {
+					found: found.map(|it| it.into_inner()),
+					expected: expected.iter().map(|it| it.to_string().into()).collect(),
+				},
+				RichReason::Custom(err) => err,
+			};
+			err.into_diagnostic(span)
+		})
 		.collect();
 
 	LexResult {
@@ -135,7 +141,7 @@ fn number<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> + C
 	// Floats are tried before integers so `1.5` is not read as `1` `.` `5`, and the
 	// dotted form is tried first so `1e3` and `1f` still work.
 	choice((float_dot, float_exp, float_suffix, hex, oct, bin, dec))
-		.map_with(|tok, e| Spanned(tok, conv(e.span())))
+		.map_with(|v, e| Spanned::new(v, e.span()))
 }
 
 fn int_radix(s: &str, radix: u32) -> Token {
@@ -171,10 +177,7 @@ fn char_literal<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src
 		.map(|s: &str| u32::from_str_radix(s, 16).ok().and_then(char::from_u32))
 		.validate(|c, e, emitter| {
 			c.unwrap_or_else(|| {
-				emitter.emit(Rich::custom(
-					e.span(),
-					LexError::InvalidUnicodeCodePoint.text(),
-				));
+				emitter.emit(Rich::custom(e.span(), LexError::InvalidUnicodeCodePoint));
 				'\u{FFFD}'
 			})
 		});
@@ -189,7 +192,8 @@ fn char_literal<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src
 
 	choice((unicode, escape, none_of("\\'")))
 		.delimited_by(just('\''), just('\''))
-		.map_with(|c, e| Spanned(Token::Char(c), conv(e.span())))
+		.map(Token::Char)
+		.map_with(|v, e| Spanned::new(v, e.span()))
 }
 
 fn string_literal<'src>(
@@ -203,10 +207,7 @@ fn string_literal<'src>(
 		})
 		.validate(|c, e, emitter| {
 			StrFragment::Escape(StringEscape::Unicode(c.unwrap_or_else(|| {
-				emitter.emit(Rich::custom(
-					e.span(),
-					LexError::InvalidUnicodeCodePoint.text(),
-				));
+				emitter.emit(Rich::custom(e.span(), LexError::InvalidUnicodeCodePoint));
 				'\u{FFFD}'
 			})))
 		});
@@ -240,11 +241,12 @@ fn string_literal<'src>(
 		.map(|s: &str| StrFragment::Text(s.into()));
 
 	choice((unicode, escape, interpolation, text))
-		.map_with(|fragment, e| Spanned(fragment, conv(e.span())))
+		.map_with(|v, e| Spanned::new(v, e.span()))
 		.repeated()
 		.collect::<Vec<_>>()
 		.delimited_by(just('"'), just('"'))
-		.map_with(|fragments, e| Spanned(Token::Str(fragments), conv(e.span())))
+		.map(Token::Str)
+		.map_with(|v, e| Spanned::new(v, e.span()))
 }
 
 fn anonymous_param<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> + Clone {
@@ -253,16 +255,13 @@ fn anonymous_param<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'
 		.validate(|digits: Option<&str>, e, emitter| {
 			let index = digits.map(|d| {
 				d.parse::<u8>().unwrap_or_else(|_| {
-					emitter.emit(Rich::custom(
-						e.span(),
-						LexError::ClosureIndexTooLarge.text(),
-					));
+					emitter.emit(Rich::custom(e.span(), LexError::ClosureIndexTooLarge));
 					0
 				})
 			});
 			Token::AnonymousParam(index)
 		})
-		.map_with(|tok, e| Spanned(tok, conv(e.span())))
+		.map_with(|v, e| Spanned::new(v, e.span()))
 }
 
 fn keyword_or_ident<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> + Clone {
@@ -314,7 +313,7 @@ fn keyword_or_ident<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<
 		other => Token::Identifier(other.into()),
 	});
 
-	choice((keyword, ident)).map_with(|tok, e| Spanned(tok, conv(e.span())))
+	choice((keyword, ident)).map_with(|v, e| Spanned::new(v, e.span()))
 }
 
 fn operators<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> + Clone {
@@ -394,7 +393,7 @@ fn operators<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> 
 		dots, stars, angles, questions, dashes, pipes, amps, carets, tildes, eqs, bangs, pluses,
 		slashes, percents, colons, hashes, singles,
 	))
-	.map_with(|tok, e| Spanned(tok, conv(e.span())))
+	.map_with(|v, e| Spanned::new(v, e.span()))
 }
 
 #[cfg(test)]

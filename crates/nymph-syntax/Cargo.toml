@@ -11,6 +11,7 @@ authors.workspace = true
 [dependencies]
 nymph-ast = { workspace = true }
 nymph-diagnostics = { workspace = true }
+nymph-errorcode = { workspace = true }
 chumsky = { workspace = true }
 ecow = { workspace = true }
 ordered-float = { workspace = true }

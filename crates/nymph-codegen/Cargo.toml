@@ -16,3 +16,6 @@ ecow = { workspace = true }
 [dev-dependencies]
 nymph-sema = { workspace = true }
 nymph-syntax = { workspace = true }
+
+[lints.clippy]
+all = "warn"

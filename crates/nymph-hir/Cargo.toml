@@ -11,3 +11,6 @@ authors.workspace = true
 [dependencies]
 ecow = { workspace = true }
 rustc-hash = { workspace = true }
+
+[lints.clippy]
+all = "warn"

@@ -1,0 +1,17 @@
+[package]
+name = "nymph-errorcode"
+description = "A macro to generate stable error codes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+proc-macro = true
+
+[dependencies]
+nymph-diagnostics = { workspace = true }
+syn = "2.0.118"
+quote = "1.0.46"

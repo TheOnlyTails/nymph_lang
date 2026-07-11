@@ -9,10 +9,12 @@
 
 use ecow::EcoString;
 use nymph_ast::Span;
-use nymph_diagnostics::{IntoDiagnostic, Label, Severity};
+use nymph_diagnostics::{ErrorCode, IntoDiagnostic, Label, Severity};
+use nymph_errorcode::ErrorCode;
 
 /// A diagnostic produced by name resolution, type checking, or the interface solver.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, ErrorCode)]
+#[error_code(2)]
 pub enum TypeError {
 	// ── Names & resolution ───────────────────────────────────────────────────
 	/// A name was referenced that isn't bound in the current scope.

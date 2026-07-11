@@ -3,6 +3,7 @@ resolver = "3"
 members = [
 	"crates/nymph-ast",
 	"crates/nymph-diagnostics",
+	"crates/nymph-errorcode",
 	"crates/nymph-syntax",
 	"crates/nymph-hir",
 	"crates/nymph-sema",
@@ -25,6 +26,7 @@ authors = ["Shachar Zidon <theonlytails@theonlytails.com>"]
 # Internal crates
 nymph-ast = { path = "crates/nymph-ast" }
 nymph-diagnostics = { path = "crates/nymph-diagnostics" }
+nymph-errorcode = { path = "crates/nymph-errorcode" }
 nymph-syntax = { path = "crates/nymph-syntax" }
 nymph-hir = { path = "crates/nymph-hir" }
 nymph-sema = { path = "crates/nymph-sema" }
@@ -41,9 +43,9 @@ ena = "0.14.3"
 indexmap = "2.13.0"
 itertools = "0.15.0"
 ordered-float = "5.3.0"
-oxc = { version = "0.138.0", features = ["codegen"] }
+oxc = { version = "0.139.0", features = ["codegen"] }
 rayon = "1.11.0"
-reedline = "0.48.0"
+reedline = "0.49.0"
 rustc-hash = "2.1.1"
 salsa = "0.27.2"
 semver = { version = "1.0.27", features = ["serde"] }

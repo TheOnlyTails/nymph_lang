@@ -9,10 +9,12 @@
 //! `code()` inherits the trait default (`None`).
 
 use ecow::EcoString;
-use nymph_diagnostics::IntoDiagnostic;
+use nymph_diagnostics::{ErrorCode, IntoDiagnostic};
+use nymph_errorcode::ErrorCode;
 
 /// A diagnostic produced while parsing (after lexing).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, ErrorCode)]
+#[error_code(1)]
 pub enum ParseError {
 	/// A type was expected but the input ended.
 	ExpectedTypeFoundEof,
@@ -82,28 +84,35 @@ impl IntoDiagnostic for ParseError {
 /// A diagnostic produced while lexing. Because lexing runs on chumsky (whose
 /// `Rich::custom` message is a `&'static str`), the lexer passes [`LexError::text`]
 /// at the error site; the enum is still the single home for the message text.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, ErrorCode)]
+#[error_code(0)]
 pub enum LexError {
+	ExpectedFound {
+		found: Option<char>,
+		expected: Vec<EcoString>,
+	},
 	/// A `\u{…}` escape named a code point outside the Unicode range.
 	InvalidUnicodeCodePoint,
 	/// A `$N` closure parameter index did not fit in a `u8`.
 	ClosureIndexTooLarge,
 }
 
-impl LexError {
-	/// The message text, as a `&'static str` for chumsky's `Rich::custom`.
-	pub fn text(self) -> &'static str {
-		match self {
-			LexError::InvalidUnicodeCodePoint => "invalid unicode code point",
-			LexError::ClosureIndexTooLarge => {
-				"closure parameter index is too large, must be smaller than 256"
-			}
-		}
-	}
-}
-
 impl IntoDiagnostic for LexError {
 	fn message(&self) -> EcoString {
-		self.text().into()
+		match self {
+			LexError::ExpectedFound { found, expected } => format!(
+				"Expected {}{}",
+				expected.join(", "),
+				match found {
+					Some(found) => format!(", Found {found}"),
+					None => String::new(),
+				}
+			),
+			LexError::InvalidUnicodeCodePoint => "invalid unicode code point".into(),
+			LexError::ClosureIndexTooLarge => {
+				"closure parameter index is too large, must be smaller than 256".into()
+			}
+		}
+		.into()
 	}
 }

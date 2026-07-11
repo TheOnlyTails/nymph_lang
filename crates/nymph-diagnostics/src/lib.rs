@@ -38,7 +38,7 @@ impl Label {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Diagnostic {
 	pub severity: Severity,
-	pub code: Option<EcoString>,
+	pub code: EcoString,
 	pub message: EcoString,
 	pub span: Span,
 	pub labels: Vec<Label>,
@@ -47,10 +47,15 @@ pub struct Diagnostic {
 }
 
 impl Diagnostic {
-	pub fn new(severity: Severity, message: impl Into<EcoString>, span: Span) -> Self {
+	pub fn new(
+		severity: Severity,
+		code: EcoString,
+		message: impl Into<EcoString>,
+		span: Span,
+	) -> Self {
 		Self {
 			severity,
-			code: None,
+			code,
 			message: message.into(),
 			span,
 			labels: Vec::new(),
@@ -59,17 +64,17 @@ impl Diagnostic {
 		}
 	}
 
-	pub fn error(message: impl Into<EcoString>, span: Span) -> Self {
-		Self::new(Severity::Error, message, span)
+	pub fn error(code: EcoString, message: impl Into<EcoString>, span: impl Into<Span>) -> Self {
+		Self::new(Severity::Error, code, message, span.into())
 	}
 
-	pub fn warning(message: impl Into<EcoString>, span: Span) -> Self {
-		Self::new(Severity::Warning, message, span)
+	pub fn warning(code: EcoString, message: impl Into<EcoString>, span: impl Into<Span>) -> Self {
+		Self::new(Severity::Warning, code, message, span.into())
 	}
 
 	#[must_use]
 	pub fn with_code(mut self, code: impl Into<EcoString>) -> Self {
-		self.code = Some(code.into());
+		self.code = code.into();
 		self
 	}
 
@@ -101,7 +106,7 @@ impl Diagnostic {
 /// variant owns its message, severity, secondary labels, notes, and help; the
 /// primary span is supplied when it is emitted. `code` defaults to `None` and is
 /// filled in per-variant once the code scheme is assigned.
-pub trait IntoDiagnostic {
+pub trait IntoDiagnostic: ErrorCode {
 	/// The primary human-readable message.
 	fn message(&self) -> EcoString;
 
@@ -122,26 +127,26 @@ pub trait IntoDiagnostic {
 		None
 	}
 
-	/// The stable error code, once assigned. Defaults to `None`.
-	fn code(&self) -> Option<&'static str> {
-		None
-	}
-
 	/// Assemble the full [`Diagnostic`], anchoring the primary message at `span`.
-	fn into_diagnostic(self, span: Span) -> Diagnostic
+	fn into_diagnostic(&self, span: impl Into<Span>) -> Diagnostic
 	where
 		Self: Sized,
 	{
 		Diagnostic {
 			severity: self.severity(),
-			code: self.code().map(EcoString::from),
+			code: self.code().to_string().into(),
 			message: self.message(),
-			span,
+			span: span.into(),
 			labels: self.labels(),
 			notes: self.notes(),
 			help: self.help(),
 		}
 	}
+}
+
+pub trait ErrorCode {
+	/// The stable error code, once assigned. Defaults to `None`.
+	fn code(&self) -> u16;
 }
 
 fn range(span: Span) -> std::ops::Range<usize> {
@@ -167,9 +172,7 @@ pub fn render(filename: &str, source: &str, diagnostics: &[Diagnostic]) -> Strin
 		)
 		.with_message(diagnostic.message.as_str());
 
-		if let Some(code) = &diagnostic.code {
-			builder = builder.with_code(code.as_str());
-		}
+		builder = builder.with_code(diagnostic.code.as_str());
 
 		builder = builder.with_label(
 			AriadneLabel::new((filename, range(diagnostic.span)))
