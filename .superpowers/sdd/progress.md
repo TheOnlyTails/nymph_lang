@@ -33,3 +33,11 @@ Base (before Task 1): fc692d54
 - Task 3: complete (HIR collection nodes Array/MapLit/Index/MapGet + typed lowering via Lowerer{annotations,interner}; IndexAccess dispatches Map->MapGet else Index. emit.rs has temporary unreachable! arms until Task 4. Controller-implemented inline; FLAG for independent review). lower_hir 3/3 green, sema unit tests green, codegen builds, clippy/fmt clean. String-literal lowering deferred out of this collections slice (map tests use int keys).
 - Task 4: complete (emit Array→JS array, MapLit→new Map([[k,v],…]), Index→recv[i], MapGet→recv.get(k); controller-implemented inline). oxc is 0.139 not 0.138: expression_array dropped its trailing Option arg. runs_list_and_index→30, runs_tuple_roundtrip→[1,2], runs_map_get→6 all run under Node. Full workspace tests green, codegen clippy/fmt clean. Map test uses int keys (strings deferred).
 - SLICE 2A COMPLETE. PENDING: independent whole-branch review of Tasks 3-4 (implemented inline, no independent review).
+
+## Slice 2B (Structs & Field Access)
+Plan: docs/superpowers/plans/2026-07-11-nymph-codegen-slice2b-structs.md
+Base (before Task 1): 57e8661b (Slice 2A Task 4)
+Design: structs → JS classes; construction detected via Lowerer struct-name pre-pass (no checker change); labeled ctor args only (positional deferred); field defaults deferred; methods deferred to Slice 5.
+- Task 1: pending — HIR class + New/Field nodes
+- Task 2: pending — lower struct decls/construction/field access
+- Task 3: pending — emit classes + New + Field, Node round-trip
