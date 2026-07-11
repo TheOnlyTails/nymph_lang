@@ -2,6 +2,11 @@ packages:
   - docs
   - extension
 
+allowBuilds:
+  '@vscode/vsce-sign': set this to true or false
+  esbuild: set this to true or false
+  keytar: set this to true or false
+
 catalog:
   oxfmt: ^0.26.0
   oxlint: ^1.41.0
