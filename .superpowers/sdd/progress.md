@@ -31,4 +31,5 @@ Base (before Task 1): fc692d54
 - Task 1: complete (Checked+interner, controller-verified inline; clean move). sema+codegen tests green.
 - Task 2: complete (uniform recording + index fast-path, controller-verified inline). 102 sema tests green.
 - Task 3: complete (HIR collection nodes Array/MapLit/Index/MapGet + typed lowering via Lowerer{annotations,interner}; IndexAccess dispatches Map->MapGet else Index. emit.rs has temporary unreachable! arms until Task 4. Controller-implemented inline; FLAG for independent review). lower_hir 3/3 green, sema unit tests green, codegen builds, clippy/fmt clean. String-literal lowering deferred out of this collections slice (map tests use int keys).
-- Task 4: pending — emit collections + Node run
+- Task 4: complete (emit Array→JS array, MapLit→new Map([[k,v],…]), Index→recv[i], MapGet→recv.get(k); controller-implemented inline). oxc is 0.139 not 0.138: expression_array dropped its trailing Option arg. runs_list_and_index→30, runs_tuple_roundtrip→[1,2], runs_map_get→6 all run under Node. Full workspace tests green, codegen clippy/fmt clean. Map test uses int keys (strings deferred).
+- SLICE 2A COMPLETE. PENDING: independent whole-branch review of Tasks 3-4 (implemented inline, no independent review).

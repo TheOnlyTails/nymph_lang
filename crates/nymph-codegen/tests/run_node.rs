@@ -109,6 +109,28 @@ fn runs_while_loop() {
 }
 
 #[test]
+fn runs_list_and_index() {
+	// A list literal emits as a JS array; indexing is a computed member `arr[i]`.
+	let src = "func third(): int = #[10, 20, 30][2]";
+	assert_eq!(run(src, "third()"), "30");
+}
+
+#[test]
+fn runs_tuple_roundtrip() {
+	// A tuple emits as a JS array — `JSON.stringify` proves the shape survives.
+	let src = "func pair(): #(int, int) = #(1, 2)";
+	assert_eq!(run(src, "JSON.stringify(pair())"), "[1,2]");
+}
+
+#[test]
+fn runs_map_get() {
+	// A map emits as `new Map([[k, v], …])`; indexing dispatches to `.get(key)`.
+	// Int keys keep this slice free of string-literal lowering (a later slice).
+	let src = "func lookup(): int = #{ 1: 5, 2: 6 }[2]";
+	assert_eq!(run(src, "lookup()"), "6");
+}
+
+#[test]
 fn compile_reports_check_errors() {
 	// A type error surfaces as diagnostics, not JS.
 	let result = nymph_codegen::compile("func f(): int = true", "test");

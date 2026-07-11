@@ -206,10 +206,54 @@ impl<'a> Emitter<'a> {
 					.ast
 					.expression_call(SPAN, callee, oxc::ast::NONE, arguments, false)
 			}
-			// Collection literals and index access are lowered starting in Task 3 but
-			// not yet emitted — that's Task 4.
-			HirExpr::Array(_) | HirExpr::MapLit(_) | HirExpr::Index { .. } | HirExpr::MapGet { .. } => {
-				unreachable!("emitted in Task 4")
+			// A tuple/list literal → a JS array `[a, b, …]`.
+			HirExpr::Array(items) => {
+				let mut elems = self.ast.vec();
+				for item in items {
+					elems.push(ArrayExpressionElement::from(self.emit_expr(item)));
+				}
+				self.ast.expression_array(SPAN, elems)
+			}
+			// A map literal → `new Map([[k, v], …])`.
+			HirExpr::MapLit(pairs) => {
+				let mut entries = self.ast.vec();
+				for (k, v) in pairs {
+					let mut pair = self.ast.vec();
+					pair.push(ArrayExpressionElement::from(self.emit_expr(k)));
+					pair.push(ArrayExpressionElement::from(self.emit_expr(v)));
+					let arr = self.ast.expression_array(SPAN, pair);
+					entries.push(ArrayExpressionElement::from(arr));
+				}
+				let outer = self.ast.expression_array(SPAN, entries);
+				let callee = self.ast.expression_identifier(SPAN, "Map");
+				let mut args = self.ast.vec();
+				args.push(Argument::from(outer));
+				self.ast.expression_new(SPAN, callee, oxc::ast::NONE, args)
+			}
+			// A list/tuple subscript → a computed member `recv[index]`.
+			HirExpr::Index { recv, index } => {
+				let object = self.emit_expr(recv);
+				let property = self.emit_expr(index);
+				Expression::ComputedMemberExpression(
+					self
+						.ast
+						.alloc_computed_member_expression(SPAN, object, property, false),
+				)
+			}
+			// A map lookup → `recv.get(key)`.
+			HirExpr::MapGet { recv, key } => {
+				let object = self.emit_expr(recv);
+				let member = Expression::StaticMemberExpression(self.ast.alloc_static_member_expression(
+					SPAN,
+					object,
+					self.ast.identifier_name(SPAN, "get"),
+					false,
+				));
+				let mut args = self.ast.vec();
+				args.push(Argument::from(self.emit_expr(key)));
+				self
+					.ast
+					.expression_call(SPAN, member, oxc::ast::NONE, args, false)
 			}
 			HirExpr::Assign { target, value } => {
 				let value_expr = self.emit_expr(value);
