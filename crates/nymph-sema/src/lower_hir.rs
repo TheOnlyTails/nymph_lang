@@ -44,7 +44,10 @@ impl Lowerer<'_> {
 				funcs.push(self.lower_func(meta, body));
 			}
 		}
-		HirModule { funcs }
+		HirModule {
+			funcs,
+			classes: Vec::new(),
+		}
 	}
 
 	fn lower_func(&self, meta: &FuncDeclaration, body: &Expr) -> HirFunc {

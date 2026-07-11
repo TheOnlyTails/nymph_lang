@@ -9,6 +9,15 @@ use ecow::EcoString;
 #[derive(Clone, Debug, PartialEq)]
 pub struct HirModule {
 	pub funcs: Vec<HirFunc>,
+	pub classes: Vec<HirClass>,
+}
+
+/// A `struct` declaration → a JS class. Fields are stored in declaration order;
+/// the emitted constructor takes one object argument and assigns each field.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirClass {
+	pub name: EcoString,
+	pub fields: Vec<EcoString>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -56,6 +65,16 @@ pub enum HirExpr {
 	MapGet {
 		recv: Box<HirExpr>,
 		key: Box<HirExpr>,
+	},
+	/// Struct construction — emits as `new <class>({ field: value, … })`.
+	New {
+		class: EcoString,
+		fields: Vec<(EcoString, HirExpr)>,
+	},
+	/// Field access — emits as `recv.name`.
+	Field {
+		recv: Box<HirExpr>,
+		name: EcoString,
 	},
 	Binary {
 		op: BinOp,

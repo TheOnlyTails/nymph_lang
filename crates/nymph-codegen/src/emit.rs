@@ -240,6 +240,9 @@ impl<'a> Emitter<'a> {
 						.alloc_computed_member_expression(SPAN, object, property, false),
 				)
 			}
+			// Struct construction and field access are lowered in Task 2 but not
+			// emitted until Task 3.
+			HirExpr::New { .. } | HirExpr::Field { .. } => unreachable!("emitted in Task 3"),
 			// A map lookup → `recv.get(key)`.
 			HirExpr::MapGet { recv, key } => {
 				let object = self.emit_expr(recv);
