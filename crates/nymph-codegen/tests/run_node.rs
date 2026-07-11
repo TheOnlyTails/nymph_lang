@@ -107,3 +107,19 @@ fn runs_while_loop() {
 	"#;
 	assert_eq!(run(src, "sum_to(5)"), "15");
 }
+
+#[test]
+fn compile_reports_check_errors() {
+	// A type error surfaces as diagnostics, not JS.
+	let result = nymph_codegen::compile("func f(): int = true", "test");
+	assert!(result.is_err(), "type error should not produce JS");
+}
+
+#[test]
+fn compile_produces_runnable_js() {
+	let result = nymph_codegen::compile("func double(n: int): int = n * 2", "test");
+	assert!(
+		result.is_ok(),
+		"well-typed program should compile: {result:?}"
+	);
+}

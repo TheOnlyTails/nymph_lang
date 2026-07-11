@@ -386,6 +386,7 @@ name = "nymph-codegen"
 version = "0.1.0"
 dependencies = [
  "ecow",
+ "nymph-diagnostics",
  "nymph-hir",
  "nymph-sema",
  "nymph-syntax",

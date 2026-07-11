@@ -10,12 +10,11 @@ authors.workspace = true
 
 [dependencies]
 nymph-hir = { workspace = true }
+nymph-syntax = { workspace = true }
+nymph-sema = { workspace = true }
+nymph-diagnostics = { workspace = true }
 oxc = { workspace = true }
 ecow = { workspace = true }
-
-[dev-dependencies]
-nymph-sema = { workspace = true }
-nymph-syntax = { workspace = true }
 
 [lints.clippy]
 all = "warn"
