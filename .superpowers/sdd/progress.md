@@ -1,17 +1,34 @@
-[38;2;127;132;156m─────┬──────────────────────────────────────────────────────────────────────────[0m
-     [38;2;127;132;156m│ [0m[1mSTDIN[0m
-[38;2;127;132;156m─────┼──────────────────────────────────────────────────────────────────────────[0m
-[38;2;127;132;156m   1[0m [38;2;127;132;156m│[0m [38;2;205;214;244m# Codegen Slice 0 (Foundation) — progress[0m
-[38;2;127;132;156m   2[0m [38;2;127;132;156m│[0m 
-[38;2;127;132;156m   3[0m [38;2;127;132;156m│[0m [38;2;205;214;244mPlan: docs/superpowers/plans/2026-07-05-nymph-codegen-slice0-foundation.md[0m
-[38;2;127;132;156m   4[0m [38;2;127;132;156m│[0m [38;2;205;214;244mBranch: codegen[0m
-[38;2;127;132;156m   5[0m [38;2;127;132;156m│[0m [38;2;205;214;244mBase (before Task 1): 9a956c89[0m
-[38;2;127;132;156m   6[0m [38;2;127;132;156m│[0m 
-[38;2;127;132;156m   7[0m [38;2;127;132;156m│[0m [38;2;205;214;244m- Task 1: pending — NodeId + Expr/ExprKind split (nymph-ast)[0m
-[38;2;127;132;156m   8[0m [38;2;127;132;156m│[0m [38;2;205;214;244m- Task 2: pending — parser assigns NodeIds[0m
-[38;2;127;132;156m   9[0m [38;2;127;132;156m│[0m [38;2;205;214;244m- Task 3: pending — adapt nymph-sema to ExprKind[0m
-[38;2;127;132;156m  10[0m [38;2;127;132;156m│[0m [38;2;205;214;244m- Task 4: pending — nymph-hir crate + Ty migration[0m
-[38;2;127;132;156m  11[0m [38;2;127;132;156m│[0m [38;2;205;214;244m- Task 5: pending — Annotations + Checked plumbing[0m
-[38;2;127;132;156m  12[0m [38;2;127;132;156m│[0m [38;2;205;214;244m- Task 6: pending — record annotations (literals + binary ops)[0m
-[38;2;127;132;156m  13[0m [38;2;127;132;156m│[0m [38;2;205;214;244m- Task 7: pending — verify + memory note[0m
-[38;2;127;132;156m─────┴──────────────────────────────────────────────────────────────────────────[0m
+# Codegen Slice 0 (Foundation) — progress
+
+Plan: docs/superpowers/plans/2026-07-05-nymph-codegen-slice0-foundation.md
+Branch: codegen
+Base (before Task 1): e159d099 (jj working-copy baseline)
+
+- Task 1: complete (commits e159d09..42beed2b, review clean; Minor: review-package under-renders small hunks)
+- Task 2: complete (commits 42beed2b..fc896533, controller review clean; parse_expression now returns Expr)
+- Task 3: complete (commits fc896533..4b720f14, controller-implemented+reviewed inline; FLAG for extra scrutiny in final review since no independent review). 97 sema + 29 syntax tests green, clippy clean.
+- Task 4: complete (commits 4b720f14..2bc22908, controller inline). nymph-hir crate + Ty/ids moved; ena Key newtype for orphan rule; 126 tests green, clippy clean.
+- Task 5+6: complete (merged, commit 2bc22908..c52864d9, controller inline; FLAG for independent review). annotate.rs + Checked + recording literals/binary ops. 128 tests green, clippy+fmt clean.
+- Task 7: complete. Slice 0 acceptance gate passed (build+fmt-check+clippy+128 tests). Memory updated.
+- Whole-branch review: DONE (opus, merge-yes, no Critical). Follow-ups applied in 22e2089c (zonk recorded types + TODO marker). Rejected the "uniform literal recording" finding: int-only is intentional (only int literals widen). Interner-in-Checked deferred to Slice 1 (lowering needs it).
+- SLICE 0 COMPLETE + REVIEWED.
+
+## Slice 1 (Core Exprs & Functions)
+Plan: docs/superpowers/plans/2026-07-10-nymph-codegen-slice1-core-exprs.md
+Base (before Task 1): 115006aa
+- Task 1: complete (HIR types, controller-verified inline; trivial pure-data diff). Build/clippy/fmt clean.
+- Task 2: complete (oxc 0.138 spike, controller-reviewed inline). NOTE: whole oxc AstBuilder API deprecated in 0.138 (module-scoped allow); allocator Box::leak'd. Both documented slice-1 simplifications.
+- Task 3: complete (scalar/operator/call emit, controller-verified inline incl. full BinOp mapping). 3/3 codegen tests pass, clippy/fmt clean.
+- Task 4: complete (structural lowering, controller-verified inline). Reconciled LetDeclaration.name + PrefixOperator::BoolNot. 101 sema tests pass, clippy/fmt clean.
+- Task 5: complete (blocks/let/mut + FIRST NODE EXECUTION, controller-verified inline). add(3,4)=11, compute()=30 run under node. Harness hardened (temp-file race, FORCE_COLOR). clippy/fmt clean.
+- Task 6: complete (value-position if/while + assignment, commit 0702496e). Control-flow programs run under Node.
+- Task 7: complete (public compile() entry, commit 94536513). parse->check->lower->emit pipeline.
+- SLICE 1 COMPLETE.
+
+## Slice 2A (Collections & Interner Threading)
+Plan: docs/superpowers/plans/2026-07-11-nymph-codegen-slice2a-collections.md
+Base (before Task 1): fc692d54
+- Task 1: complete (Checked+interner, controller-verified inline; clean move). sema+codegen tests green.
+- Task 2: complete (uniform recording + index fast-path, controller-verified inline). 102 sema tests green.
+- Task 3: complete (HIR collection nodes Array/MapLit/Index/MapGet + typed lowering via Lowerer{annotations,interner}; IndexAccess dispatches Map->MapGet else Index. emit.rs has temporary unreachable! arms until Task 4. Controller-implemented inline; FLAG for independent review). lower_hir 3/3 green, sema unit tests green, codegen builds, clippy/fmt clean. String-literal lowering deferred out of this collections slice (map tests use int keys).
+- Task 4: pending — emit collections + Node run

@@ -206,6 +206,11 @@ impl<'a> Emitter<'a> {
 					.ast
 					.expression_call(SPAN, callee, oxc::ast::NONE, arguments, false)
 			}
+			// Collection literals and index access are lowered starting in Task 3 but
+			// not yet emitted — that's Task 4.
+			HirExpr::Array(_) | HirExpr::MapLit(_) | HirExpr::Index { .. } | HirExpr::MapGet { .. } => {
+				unreachable!("emitted in Task 4")
+			}
 			HirExpr::Assign { target, value } => {
 				let value_expr = self.emit_expr(value);
 				let name = match target.as_ref() {

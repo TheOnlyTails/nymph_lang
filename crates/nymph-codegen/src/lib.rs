@@ -28,5 +28,5 @@ pub fn compile(source: &str, path: &str) -> Result<String, Vec<Diagnostic>> {
 	if !diags.is_empty() {
 		return Err(diags);
 	}
-	Ok(emit(&nymph_sema::lower_hir(&parsed.tree)))
+	Ok(emit(&nymph_sema::lower_hir(&parsed.tree, &checked)))
 }

@@ -22,7 +22,7 @@ fn compile(src: &str) -> String {
 		"check errors: {:?}",
 		checked.diags
 	);
-	emit(&lower_hir(&parsed.tree))
+	emit(&lower_hir(&parsed.tree, &checked))
 }
 
 /// Emit `src`, append a driver that logs `expr`, run under Node, return trimmed stdout.

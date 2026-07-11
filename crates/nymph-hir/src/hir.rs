@@ -43,6 +43,20 @@ pub enum HirExpr {
 		callee: Box<HirExpr>,
 		args: Vec<HirExpr>,
 	},
+	/// A tuple or list literal — both emit as a JS array.
+	Array(Vec<HirExpr>),
+	/// A map literal — emits as `new Map([[k, v], …])`.
+	MapLit(Vec<(HirExpr, HirExpr)>),
+	/// A subscript into a list/tuple — emits as `recv[index]`.
+	Index {
+		recv: Box<HirExpr>,
+		index: Box<HirExpr>,
+	},
+	/// A map lookup — emits as `recv.get(key)`.
+	MapGet {
+		recv: Box<HirExpr>,
+		key: Box<HirExpr>,
+	},
 	Binary {
 		op: BinOp,
 		lhs: Box<HirExpr>,

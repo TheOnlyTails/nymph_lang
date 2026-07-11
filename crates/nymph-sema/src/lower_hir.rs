@@ -1,34 +1,185 @@
 //! Structural lowering of the AST into the code-generation HIR.
 //!
-//! Slice 1 is a pure syntactic walk: it consumes neither type annotations nor the
-//! interner, because JS needs no type information to emit correct scalar/control-flow
-//! code (see the slice-1 plan's Design Decisions). Later slices thread annotations
-//! through here for value-copy insertion and operator-overload dispatch.
+//! Slice 1 was a pure syntactic walk that consumed neither type annotations nor
+//! the interner, because JS needs no type information to emit correct
+//! scalar/control-flow code (see the slice-1 plan's Design Decisions). Slice 2A
+//! starts consuming the checker's output: index-access lowering must know whether
+//! the receiver is a `Map` (→ `HirExpr::MapGet`) or a list/tuple (→ `HirExpr::Index`),
+//! which is only recorded in the checker's `Annotations` side-table. `lower_hir` now
+//! takes the full `Checked` result and threads `&Annotations`/`&Interner` down through
+//! a `Lowerer` so later slices can add further type-directed lowering without another
+//! signature change.
 
 use nymph_ast::{
 	decl::{Declaration, FuncDeclaration, Module},
-	expr::{Expr, ExprKind, Statement},
+	expr::{Expr, ExprKind, ListItem, MapEntry, Statement},
 	ops::{AssignOperator, BinaryOperator, PrefixOperator},
 };
 use nymph_hir::hir::{BinOp, HirExpr, HirFunc, HirModule, HirStmt, UnOp};
+use nymph_hir::ty::{Interner, TyKind};
 
-/// Lower a checked module into the code-generation HIR.
-pub fn lower_hir(module: &Module) -> HirModule {
-	let mut funcs = Vec::new();
-	for decl in &module.members {
-		if let Declaration::Func { meta, body, .. } = decl {
-			funcs.push(lower_func(meta, body));
-		}
-	}
-	HirModule { funcs }
+use crate::{Annotations, Checked};
+
+/// Lower a checked module into the code-generation HIR, consulting `checked`'s
+/// annotations/interner for type-directed decisions (e.g. index-access dispatch).
+pub fn lower_hir(module: &Module, checked: &Checked) -> HirModule {
+	let lowerer = Lowerer {
+		annotations: &checked.annotations,
+		interner: &checked.interner,
+	};
+	lowerer.lower_module(module)
 }
 
-fn lower_func(meta: &FuncDeclaration, body: &Expr) -> HirFunc {
-	let params = meta.params.iter().map(|p| param_name(&p.0.name)).collect();
-	HirFunc {
-		name: meta.name.0.clone(),
-		params,
-		body: lower_expr(body),
+/// Carries the checker's output through the recursive lowering walk.
+struct Lowerer<'a> {
+	annotations: &'a Annotations,
+	interner: &'a Interner,
+}
+
+impl Lowerer<'_> {
+	fn lower_module(&self, module: &Module) -> HirModule {
+		let mut funcs = Vec::new();
+		for decl in &module.members {
+			if let Declaration::Func { meta, body, .. } = decl {
+				funcs.push(self.lower_func(meta, body));
+			}
+		}
+		HirModule { funcs }
+	}
+
+	fn lower_func(&self, meta: &FuncDeclaration, body: &Expr) -> HirFunc {
+		let params = meta.params.iter().map(|p| param_name(&p.0.name)).collect();
+		HirFunc {
+			name: meta.name.0.clone(),
+			params,
+			body: self.lower_expr(body),
+		}
+	}
+
+	fn lower_expr(&self, expr: &Expr) -> HirExpr {
+		match &expr.kind {
+			ExprKind::Int(v) => HirExpr::Num(v.0 as f64),
+			ExprKind::UInt(v) => HirExpr::Num(v.0 as f64),
+			ExprKind::Float(v) => HirExpr::Num(v.0.into_inner()),
+			ExprKind::Boolean(b) => HirExpr::Bool(b.0),
+			ExprKind::Char(c) => HirExpr::Char(c.0),
+			ExprKind::Identifier(name) => HirExpr::Local(name.0.clone()),
+			ExprKind::Grouped(inner) => self.lower_expr(inner),
+			ExprKind::Call { func, args, .. } => HirExpr::Call {
+				callee: Box::new(self.lower_expr(func)),
+				args: args.iter().map(|a| self.lower_expr(&a.0.value)).collect(),
+			},
+			ExprKind::Tuple(items) => HirExpr::Array(self.lower_items(items)),
+			ExprKind::List(items) => HirExpr::Array(self.lower_items(items)),
+			ExprKind::Map(entries) => HirExpr::MapLit(self.lower_map_entries(entries)),
+			ExprKind::IndexAccess { parent, index, .. } => {
+				// Dispatch on the receiver's recorded type: Map → get, else subscript.
+				let recv = self.lower_expr(parent);
+				let index = self.lower_expr(index);
+				let recv_is_map = self
+					.annotations
+					.get(parent.id)
+					.is_some_and(|info| matches!(self.interner.kind(info.ty), TyKind::Map(..)));
+				if recv_is_map {
+					HirExpr::MapGet {
+						recv: Box::new(recv),
+						key: Box::new(index),
+					}
+				} else {
+					HirExpr::Index {
+						recv: Box::new(recv),
+						index: Box::new(index),
+					}
+				}
+			}
+			ExprKind::BinaryOp { lhs, op, rhs } => HirExpr::Binary {
+				op: lower_binop(*op),
+				lhs: Box::new(self.lower_expr(lhs)),
+				rhs: Box::new(self.lower_expr(rhs)),
+			},
+			ExprKind::PrefixOp { op, value } => HirExpr::Unary {
+				op: lower_prefix(*op),
+				operand: Box::new(self.lower_expr(value)),
+			},
+			ExprKind::AssignOp { lhs, op, rhs } => {
+				// A compound assignment `a op= b` desugars to `a = a op b`; a plain `=`
+				// assigns the value directly.
+				let value = match assign_binop(*op) {
+					None => self.lower_expr(rhs),
+					Some(binop) => HirExpr::Binary {
+						op: binop,
+						lhs: Box::new(self.lower_expr(lhs)),
+						rhs: Box::new(self.lower_expr(rhs)),
+					},
+				};
+				HirExpr::Assign {
+					target: Box::new(self.lower_expr(lhs)),
+					value: Box::new(value),
+				}
+			}
+			ExprKind::Block { body, .. } => self.lower_block(body),
+			ExprKind::If {
+				condition,
+				then,
+				otherwise,
+			} => HirExpr::If {
+				cond: Box::new(self.lower_expr(condition)),
+				then: Box::new(self.lower_expr(then)),
+				otherwise: otherwise.as_ref().map(|e| Box::new(self.lower_expr(e))),
+			},
+			ExprKind::While {
+				condition, body, ..
+			} => HirExpr::While {
+				cond: Box::new(self.lower_expr(condition)),
+				body: Box::new(self.lower_expr(body)),
+			},
+			other => panic!("slice-2a lowering does not yet handle {other:?}"),
+		}
+	}
+
+	/// Lower a list/tuple literal's items. 2A does not yet support spread elements.
+	fn lower_items(&self, items: &[nymph_ast::Spanned<ListItem>]) -> Vec<HirExpr> {
+		items
+			.iter()
+			.map(|item| match &item.0 {
+				ListItem::Expr(e) => self.lower_expr(e),
+				ListItem::Spread(_) => panic!("slice-2a lowering does not yet handle spread list items"),
+			})
+			.collect()
+	}
+
+	/// Lower a map literal's entries. 2A does not yet support spread entries.
+	fn lower_map_entries(&self, entries: &[nymph_ast::Spanned<MapEntry>]) -> Vec<(HirExpr, HirExpr)> {
+		entries
+			.iter()
+			.map(|entry| match &entry.0 {
+				MapEntry::Entry(k, v) => (self.lower_expr(k), self.lower_expr(v)),
+				MapEntry::Spread(_) => panic!("slice-2a lowering does not yet handle spread map entries"),
+			})
+			.collect()
+	}
+
+	fn lower_block(&self, body: &[nymph_ast::Spanned<Statement>]) -> HirExpr {
+		let mut stmts = Vec::new();
+		let mut tail = None;
+		for (i, stmt) in body.iter().enumerate() {
+			let is_last = i + 1 == body.len();
+			match &stmt.0 {
+				Statement::Let { meta, value } => stmts.push(HirStmt::Let {
+					name: param_name(&meta.name),
+					mutable: meta.mutable,
+					value: self.lower_expr(value),
+				}),
+				Statement::Expr(e) => {
+					if is_last {
+						tail = Some(Box::new(self.lower_expr(e)));
+					} else {
+						stmts.push(HirStmt::Expr(self.lower_expr(e)));
+					}
+				}
+			}
+		}
+		HirExpr::Block { stmts, tail }
 	}
 }
 
@@ -39,87 +190,6 @@ fn param_name(pattern: &nymph_ast::Spanned<nymph_ast::expr::Pattern>) -> ecow::E
 		nymph_ast::expr::Pattern::Binding { name, .. } => name.0.clone(),
 		other => panic!("slice-1 lowering supports only identifier params, got {other:?}"),
 	}
-}
-
-fn lower_expr(expr: &Expr) -> HirExpr {
-	match &expr.kind {
-		ExprKind::Int(v) => HirExpr::Num(v.0 as f64),
-		ExprKind::UInt(v) => HirExpr::Num(v.0 as f64),
-		ExprKind::Float(v) => HirExpr::Num(v.0.into_inner()),
-		ExprKind::Boolean(b) => HirExpr::Bool(b.0),
-		ExprKind::Char(c) => HirExpr::Char(c.0),
-		ExprKind::Identifier(name) => HirExpr::Local(name.0.clone()),
-		ExprKind::Grouped(inner) => lower_expr(inner),
-		ExprKind::Call { func, args, .. } => HirExpr::Call {
-			callee: Box::new(lower_expr(func)),
-			args: args.iter().map(|a| lower_expr(&a.0.value)).collect(),
-		},
-		ExprKind::BinaryOp { lhs, op, rhs } => HirExpr::Binary {
-			op: lower_binop(*op),
-			lhs: Box::new(lower_expr(lhs)),
-			rhs: Box::new(lower_expr(rhs)),
-		},
-		ExprKind::PrefixOp { op, value } => HirExpr::Unary {
-			op: lower_prefix(*op),
-			operand: Box::new(lower_expr(value)),
-		},
-		ExprKind::AssignOp { lhs, op, rhs } => {
-			// A compound assignment `a op= b` desugars to `a = a op b`; a plain `=`
-			// assigns the value directly.
-			let value = match assign_binop(*op) {
-				None => lower_expr(rhs),
-				Some(binop) => HirExpr::Binary {
-					op: binop,
-					lhs: Box::new(lower_expr(lhs)),
-					rhs: Box::new(lower_expr(rhs)),
-				},
-			};
-			HirExpr::Assign {
-				target: Box::new(lower_expr(lhs)),
-				value: Box::new(value),
-			}
-		}
-		ExprKind::Block { body, .. } => lower_block(body),
-		ExprKind::If {
-			condition,
-			then,
-			otherwise,
-		} => HirExpr::If {
-			cond: Box::new(lower_expr(condition)),
-			then: Box::new(lower_expr(then)),
-			otherwise: otherwise.as_ref().map(|e| Box::new(lower_expr(e))),
-		},
-		ExprKind::While {
-			condition, body, ..
-		} => HirExpr::While {
-			cond: Box::new(lower_expr(condition)),
-			body: Box::new(lower_expr(body)),
-		},
-		other => panic!("slice-1 lowering does not yet handle {other:?}"),
-	}
-}
-
-fn lower_block(body: &[nymph_ast::Spanned<Statement>]) -> HirExpr {
-	let mut stmts = Vec::new();
-	let mut tail = None;
-	for (i, stmt) in body.iter().enumerate() {
-		let is_last = i + 1 == body.len();
-		match &stmt.0 {
-			Statement::Let { meta, value } => stmts.push(HirStmt::Let {
-				name: param_name(&meta.name),
-				mutable: meta.mutable,
-				value: lower_expr(value),
-			}),
-			Statement::Expr(e) => {
-				if is_last {
-					tail = Some(Box::new(lower_expr(e)));
-				} else {
-					stmts.push(HirStmt::Expr(lower_expr(e)));
-				}
-			}
-		}
-	}
-	HirExpr::Block { stmts, tail }
 }
 
 fn lower_binop(op: BinaryOperator) -> BinOp {
