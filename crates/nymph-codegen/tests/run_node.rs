@@ -131,6 +131,27 @@ fn runs_map_get() {
 }
 
 #[test]
+fn runs_struct_construction_and_field() {
+	// A struct constructs as `new Class({…})`; a field reads back as `.field`.
+	let src = r#"
+		struct Point(x: int, y: int)
+		func make(): Point = Point(x = 3, y = 4)
+	"#;
+	assert_eq!(run(src, "make().y"), "4");
+}
+
+#[test]
+fn runs_struct_field_through_param() {
+	// A struct passed as a parameter; fields summed. Proves the class ctor matches
+	// the object shape the JS driver constructs.
+	let src = r#"
+		struct Point(x: int, y: int)
+		func sum(p: Point): int = p.x + p.y
+	"#;
+	assert_eq!(run(src, "sum(new Point({ x: 10, y: 20 }))"), "30");
+}
+
+#[test]
 fn compile_reports_check_errors() {
 	// A type error surfaces as diagnostics, not JS.
 	let result = nymph_codegen::compile("func f(): int = true", "test");

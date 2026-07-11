@@ -9,6 +9,7 @@ fn emits_a_function_returning_a_number() {
 			params: vec![],
 			body: HirExpr::Num(42.0),
 		}],
+		classes: vec![],
 	};
 	let js = emit(&module);
 	// A single-expression body becomes an arrow-style function returning the value.
@@ -33,6 +34,7 @@ fn emits_arithmetic_and_params() {
 				}),
 			},
 		}],
+		classes: vec![],
 	};
 	let js = emit(&module);
 	assert!(js.contains("function add(a, b)"), "{js}");
@@ -51,6 +53,7 @@ fn emits_call_and_string() {
 				args: vec![HirExpr::Str("hi".into())],
 			},
 		}],
+		classes: vec![],
 	};
 	let js = emit(&module);
 	assert!(

@@ -38,6 +38,7 @@ Base (before Task 1): fc692d54
 Plan: docs/superpowers/plans/2026-07-11-nymph-codegen-slice2b-structs.md
 Base (before Task 1): 57e8661b (Slice 2A Task 4)
 Design: structs → JS classes; construction detected via Lowerer struct-name pre-pass (no checker change); labeled ctor args only (positional deferred); field defaults deferred; methods deferred to Slice 5.
-- Task 1: pending — HIR class + New/Field nodes
-- Task 2: pending — lower struct decls/construction/field access
-- Task 3: pending — emit classes + New + Field, Node round-trip
+- Task 1: complete (HIR class + New/Field nodes, controller inline; commit 83155f99). HirModule.classes, HirClass, HirExpr::New/Field.
+- Task 2: complete (lower struct decls→HirClass, construction→New via struct-name pre-pass, MemberAccess→Field; commit 427e4a40). Labeled ctor args only. lower_hir 5/5 green.
+- Task 3: complete (emit classes as `class N { constructor(fields){ Object.assign(this,fields) } }`, New→`new N({…})`, Field→`recv.name`; controller inline). Chose Object.assign over per-field assignment (simpler, order-free, no field defaults in 2B). runs_struct_construction_and_field→4, runs_struct_field_through_param→30 under Node. Full workspace green, codegen clippy/fmt clean.
+- SLICE 2B COMPLETE. PENDING: independent whole-branch review of Slice 2A+2B (all implemented inline, no independent review).

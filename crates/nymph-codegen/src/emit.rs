@@ -12,7 +12,7 @@ use oxc::{
 	span::SPAN,
 };
 
-use nymph_hir::hir::{BinOp, HirExpr, HirFunc, HirModule, HirStmt, UnOp};
+use nymph_hir::hir::{BinOp, HirClass, HirExpr, HirFunc, HirModule, HirStmt, UnOp};
 
 /// Intermediate representation for expression-valued code.
 ///
@@ -95,6 +95,10 @@ impl<'a> Emitter<'a> {
 
 	pub fn emit_module(&self, module: &HirModule) -> String {
 		let mut stmts = self.ast.vec();
+		// Classes first so constructors are in scope for the functions that build them.
+		for class in &module.classes {
+			stmts.push(self.emit_class(class));
+		}
 		for func in &module.funcs {
 			stmts.push(self.emit_func(func));
 		}
@@ -160,6 +164,92 @@ impl<'a> Emitter<'a> {
 			Some(fn_body),
 		);
 		Statement::FunctionDeclaration(function)
+	}
+
+	/// Emit a struct as `class <Name> { constructor(fields) { Object.assign(this, fields); } }`.
+	///
+	/// The object-argument constructor lets construction pass labeled fields as a
+	/// plain object (`new Point({ x, y })`) without depending on field order.
+	/// `Object.assign` copies each property onto the instance; field defaults and
+	/// validation are deferred to a later slice.
+	fn emit_class(&self, class: &HirClass) -> Statement<'a> {
+		// Object.assign(this, fields)
+		let object_assign = Expression::from(self.ast.member_expression_static(
+			SPAN,
+			self.ast.expression_identifier(SPAN, "Object"),
+			self.ast.identifier_name(SPAN, "assign"),
+			false,
+		));
+		let mut call_args = self.ast.vec();
+		call_args.push(Argument::from(self.ast.expression_this(SPAN)));
+		call_args.push(Argument::from(
+			self.ast.expression_identifier(SPAN, "fields"),
+		));
+		let assign_call =
+			self
+				.ast
+				.expression_call(SPAN, object_assign, oxc::ast::NONE, call_args, false);
+		let mut ctor_stmts = self.ast.vec();
+		ctor_stmts.push(self.ast.statement_expression(SPAN, assign_call));
+
+		// constructor(fields) { … }
+		let mut ctor_params = self.ast.vec();
+		let fields_pat = self.ast.binding_pattern_binding_identifier(SPAN, "fields");
+		ctor_params.push(self.ast.plain_formal_parameter(SPAN, fields_pat));
+		let params = self.ast.formal_parameters(
+			SPAN,
+			FormalParameterKind::FormalParameter,
+			ctor_params,
+			oxc::ast::NONE,
+		);
+		let ctor_body = self.ast.function_body(SPAN, self.ast.vec(), ctor_stmts);
+		let ctor_fn = self.ast.alloc_function(
+			SPAN,
+			FunctionType::FunctionExpression,
+			None,
+			false,
+			false,
+			false,
+			oxc::ast::NONE,
+			oxc::ast::NONE,
+			params,
+			oxc::ast::NONE,
+			Some(ctor_body),
+		);
+		let ctor = self.ast.class_element_method_definition(
+			SPAN,
+			MethodDefinitionType::MethodDefinition,
+			self.ast.vec(),
+			self.ast.property_key_static_identifier(SPAN, "constructor"),
+			ctor_fn,
+			MethodDefinitionKind::Constructor,
+			false,
+			false,
+			false,
+			false,
+			None,
+		);
+
+		let mut elements = self.ast.vec();
+		elements.push(ctor);
+		let body = self.ast.class_body(SPAN, elements);
+		let name = self
+			.ast
+			.binding_identifier(SPAN, self.ast.allocator.alloc_str(&class.name));
+		let class = self.ast.alloc_class(
+			SPAN,
+			ClassType::ClassDeclaration,
+			self.ast.vec(),
+			Some(name),
+			oxc::ast::NONE,
+			None,
+			oxc::ast::NONE,
+			self.ast.vec(),
+			body,
+			false,
+			false,
+		);
+		Statement::ClassDeclaration(class)
 	}
 
 	fn emit_expr(&self, expr: &HirExpr) -> Expression<'a> {
@@ -240,9 +330,42 @@ impl<'a> Emitter<'a> {
 						.alloc_computed_member_expression(SPAN, object, property, false),
 				)
 			}
-			// Struct construction and field access are lowered in Task 2 but not
-			// emitted until Task 3.
-			HirExpr::New { .. } | HirExpr::Field { .. } => unreachable!("emitted in Task 3"),
+			// Struct construction → `new <class>({ field: value, … })`.
+			HirExpr::New { class, fields } => {
+				let mut props = self.ast.vec();
+				for (name, value) in fields {
+					let key = self
+						.ast
+						.property_key_static_identifier(SPAN, self.ast.allocator.alloc_str(name));
+					let val = self.emit_expr(value);
+					props.push(ObjectPropertyKind::ObjectProperty(
+						self
+							.ast
+							.alloc_object_property(SPAN, PropertyKind::Init, key, val, false, false, false),
+					));
+				}
+				let obj = self.ast.expression_object(SPAN, props);
+				let callee = self
+					.ast
+					.expression_identifier(SPAN, self.ast.allocator.alloc_str(class));
+				let mut args = self.ast.vec();
+				args.push(Argument::from(obj));
+				self.ast.expression_new(SPAN, callee, oxc::ast::NONE, args)
+			}
+			// Field access → `recv.name`.
+			HirExpr::Field { recv, name } => {
+				let object = self.emit_expr(recv);
+				Expression::from(
+					self.ast.member_expression_static(
+						SPAN,
+						object,
+						self
+							.ast
+							.identifier_name(SPAN, self.ast.allocator.alloc_str(name)),
+						false,
+					),
+				)
+			}
 			// A map lookup → `recv.get(key)`.
 			HirExpr::MapGet { recv, key } => {
 				let object = self.emit_expr(recv);
