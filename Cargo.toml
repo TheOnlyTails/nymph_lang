@@ -10,7 +10,7 @@ members = [
 	"crates/nymph-codegen",
 	# Added layer by layer as each crate is built:
 	# "crates/nymph-compiler",
-	# "crates/nymph-cli",
+	"crates/nymph-cli",
 	# "crates/nymph-lsp",
 ]
 

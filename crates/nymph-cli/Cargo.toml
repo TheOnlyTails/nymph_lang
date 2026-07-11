@@ -1,0 +1,18 @@
+[package]
+name = "nymph-cli"
+description = ""
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nymph-sema = { workspace = true }
+nymph-diagnostics = { workspace = true }
+ecow = { workspace = true }
+clap = { workspace = true }
+
+[lints.clippy]
+all = "warn"

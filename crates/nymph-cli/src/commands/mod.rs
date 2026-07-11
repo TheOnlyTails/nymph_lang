@@ -1,0 +1,11 @@
+pub(crate) mod build;
+pub(crate) mod check;
+pub(crate) mod doc;
+pub(crate) mod format;
+pub(crate) mod install;
+pub(crate) mod new;
+pub(crate) mod remove;
+pub(crate) mod repl;
+pub(crate) mod run;
+pub(crate) mod search;
+pub(crate) mod add;
