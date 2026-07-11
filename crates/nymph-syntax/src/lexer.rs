@@ -252,7 +252,7 @@ fn anonymous_param<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'
 		.ignore_then(text::digits(10).to_slice().or_not())
 		.validate(|digits: Option<&str>, e, emitter| {
 			let index = digits.map(|d| {
-				d.parse::<u32>().unwrap_or_else(|_| {
+				d.parse::<u8>().unwrap_or_else(|_| {
 					emitter.emit(Rich::custom(
 						e.span(),
 						LexError::ClosureIndexTooLarge.text(),

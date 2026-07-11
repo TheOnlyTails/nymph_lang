@@ -57,7 +57,7 @@ pub enum ExprKind {
 	/// `a`, `my_var`
 	Identifier(Ident),
 	/// `$`, `$0`, `$1` — a positional parameter of the enclosing implicit closure.
-	AnonymousParam(Option<u32>),
+	AnonymousParam(Option<u8>),
 	/// `#[]`, `#[1, 2, ...rest]`
 	List(Vec<Spanned<ListItem>>),
 	/// `#()`, `#(1, true, ...other)`

@@ -36,7 +36,7 @@ pub enum Token {
 	/// An identifier. `_` alone is lexed as [`Token::Underscore`] instead.
 	Identifier(EcoString),
 	/// A positional closure parameter: `$` (== `$0`), `$0`, `$1`, ...
-	AnonymousParam(Option<u32>),
+	AnonymousParam(Option<u8>),
 
 	// ── Keywords ────────────────────────────────────────────────────────────
 	Public,
