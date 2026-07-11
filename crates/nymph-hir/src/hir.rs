@@ -52,6 +52,12 @@ pub enum HirExpr {
 		op: UnOp,
 		operand: Box<HirExpr>,
 	},
+	/// An assignment `target = value`. Compound assignments (`+=`, …) are desugared
+	/// by lowering into `target = target <op> value`, so this is always a plain `=`.
+	Assign {
+		target: Box<HirExpr>,
+		value: Box<HirExpr>,
+	},
 	/// A block: statements then an optional trailing expression (the block's value).
 	Block {
 		stmts: Vec<HirStmt>,

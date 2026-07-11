@@ -8,7 +8,7 @@
 use nymph_ast::{
 	decl::{Declaration, FuncDeclaration, Module},
 	expr::{Expr, ExprKind, Statement},
-	ops::{BinaryOperator, PrefixOperator},
+	ops::{AssignOperator, BinaryOperator, PrefixOperator},
 };
 use nymph_hir::hir::{BinOp, HirExpr, HirFunc, HirModule, HirStmt, UnOp};
 
@@ -63,6 +63,22 @@ fn lower_expr(expr: &Expr) -> HirExpr {
 			op: lower_prefix(*op),
 			operand: Box::new(lower_expr(value)),
 		},
+		ExprKind::AssignOp { lhs, op, rhs } => {
+			// A compound assignment `a op= b` desugars to `a = a op b`; a plain `=`
+			// assigns the value directly.
+			let value = match assign_binop(*op) {
+				None => lower_expr(rhs),
+				Some(binop) => HirExpr::Binary {
+					op: binop,
+					lhs: Box::new(lower_expr(lhs)),
+					rhs: Box::new(lower_expr(rhs)),
+				},
+			};
+			HirExpr::Assign {
+				target: Box::new(lower_expr(lhs)),
+				value: Box::new(value),
+			}
+		}
 		ExprKind::Block { body, .. } => lower_block(body),
 		ExprKind::If {
 			condition,
@@ -130,6 +146,28 @@ fn lower_binop(op: BinaryOperator) -> BinOp {
 		B::RightShift => BinOp::Shr,
 		other => panic!("slice-1 lowering does not yet handle operator {other:?}"),
 	}
+}
+
+/// The binary operator a compound assignment desugars to, or `None` for a plain `=`.
+fn assign_binop(op: AssignOperator) -> Option<BinOp> {
+	use AssignOperator as A;
+	Some(match op {
+		A::Assign => return None,
+		A::PlusAssign => BinOp::Add,
+		A::MinusAssign => BinOp::Sub,
+		A::TimesAssign => BinOp::Mul,
+		A::DivideAssign => BinOp::Div,
+		A::RemainderAssign => BinOp::Rem,
+		A::PowerAssign => BinOp::Pow,
+		A::LeftShiftAssign => BinOp::Shl,
+		A::RightShiftAssign => BinOp::Shr,
+		A::BitAndAssign => BinOp::BitAnd,
+		A::BitXorAssign => BinOp::BitXor,
+		A::BitOrAssign => BinOp::BitOr,
+		A::BoolAndAssign => BinOp::And,
+		A::BoolOrAssign => BinOp::Or,
+		other => panic!("slice-1 lowering does not yet handle {other:?}"),
+	})
 }
 
 fn lower_prefix(op: PrefixOperator) -> UnOp {

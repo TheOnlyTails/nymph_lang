@@ -13,7 +13,8 @@ fn compile(src: &str) -> String {
 	let parsed = parse_module(src, "test");
 	assert!(
 		!parsed.diagnostics.iter().any(|d| d.is_error()),
-		"parse errors in test source"
+		"parse errors in test source: {:?}",
+		parsed.diagnostics
 	);
 	let checked = check_module(&parsed.tree);
 	assert!(
@@ -66,7 +67,43 @@ fn runs_arithmetic() {
 
 #[test]
 fn runs_a_block_with_bindings() {
-	let src = "func compute(): int = {\n  let x = 10\n  let y = x + 5\n  y * 2\n}";
+	let src = r#"
+		func compute(): int = {
+			let x = 10
+			let y = x + 5
+			y * 2
+		}
+	"#;
 	let out = run(src, "compute()");
 	assert_eq!(out, "30");
+}
+
+#[test]
+fn runs_if_as_value() {
+	// `if`/`else` in value position (nested), each branch a block with a tail value.
+	let src = r#"
+		func sign(n: int): int =
+			if (n > 0) { 1 }
+			else { if (n < 0) { -1 } else { 0 } }
+	"#;
+	assert_eq!(run(src, "sign(5)"), "1");
+	assert_eq!(run(src, "sign(-3)"), "-1");
+	assert_eq!(run(src, "sign(0)"), "0");
+}
+
+#[test]
+fn runs_while_loop() {
+	// A `while` loop with a mutable accumulator; assignment (`=`) drives it.
+	let src = r#"
+		func sum_to(n: int): int = {
+			let mut total = 0
+			let mut i = 1
+			while (i <= n) {
+				total = total + i
+				i = i + 1
+			}
+			total
+		}
+	"#;
+	assert_eq!(run(src, "sum_to(5)"), "15");
 }

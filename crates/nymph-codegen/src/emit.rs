@@ -62,6 +62,9 @@ pub struct Emitter<'a> {
 	ast: AstBuilder<'a>,
 	#[allow(dead_code)]
 	alloc: &'a Allocator,
+	/// Counter for fresh temporary names (result temporaries for value-position
+	/// control flow). `Cell` keeps the emit methods `&self`.
+	gensym: std::cell::Cell<u32>,
 }
 
 impl Default for Emitter<'_> {
@@ -79,7 +82,15 @@ impl<'a> Emitter<'a> {
 		Emitter {
 			ast: AstBuilder::new(alloc),
 			alloc,
+			gensym: std::cell::Cell::new(0),
 		}
+	}
+
+	/// A fresh temporary variable name (`_t0`, `_t1`, …).
+	fn gensym(&self) -> String {
+		let n = self.gensym.get();
+		self.gensym.set(n + 1);
+		format!("_t{n}")
 	}
 
 	pub fn emit_module(&self, module: &HirModule) -> String {
@@ -195,11 +206,80 @@ impl<'a> Emitter<'a> {
 					.ast
 					.expression_call(SPAN, callee, oxc::ast::NONE, arguments, false)
 			}
-			HirExpr::Block { .. } => self.emit_value(expr).into_expression(self.ast),
-			HirExpr::If { .. } | HirExpr::While { .. } => {
-				unreachable!("value-position if/while are handled in Task 6")
+			HirExpr::Assign { target, value } => {
+				let value_expr = self.emit_expr(value);
+				let name = match target.as_ref() {
+					HirExpr::Local(n) => self.ast.allocator.alloc_str(n),
+					_ => unreachable!("slice-1 assignment targets are identifiers"),
+				};
+				self.ast.expression_assignment(
+					SPAN,
+					AssignmentOperator::Assign,
+					self.assign_target(name),
+					value_expr,
+				)
+			}
+			// Control-flow expressions in value position collapse to an expression
+			// (an IIFE when they carry leading statements).
+			HirExpr::Block { .. } | HirExpr::If { .. } | HirExpr::While { .. } => {
+				self.emit_value(expr).into_expression(self.ast)
 			}
 		}
+	}
+
+	/// A simple-identifier assignment target for `<name> = …`.
+	fn assign_target(&self, name: &'a str) -> AssignmentTarget<'a> {
+		AssignmentTarget::AssignmentTargetIdentifier(self.ast.alloc_identifier_reference(SPAN, name))
+	}
+
+	/// `let <name>;` — an uninitialised binding for a control-flow result temporary.
+	fn let_uninit(&self, name: &'a str) -> Statement<'a> {
+		let pat = self.ast.binding_pattern_binding_identifier(SPAN, name);
+		let declarator = self.ast.variable_declarator(
+			SPAN,
+			VariableDeclarationKind::Let,
+			pat,
+			oxc::ast::NONE,
+			None,
+			false,
+		);
+		let decl = self.ast.variable_declaration(
+			SPAN,
+			VariableDeclarationKind::Let,
+			self.ast.vec1(declarator),
+			false,
+		);
+		Statement::from(Declaration::VariableDeclaration(self.ast.alloc(decl)))
+	}
+
+	/// `{ <branch stmts>; <name> = <branch value>; }` — a block that assigns an
+	/// (optional) branch's value to `name` (or `undefined` when the branch is absent).
+	fn assign_block(&self, name: &'a str, branch: Option<&HirExpr>) -> Statement<'a> {
+		let val = match branch {
+			Some(b) => self.emit_value(b),
+			None => JsValue {
+				stmts: self.ast.vec(),
+				expr: self.ast.expression_identifier(SPAN, "undefined"),
+			},
+		};
+		let mut stmts = val.stmts;
+		let assign = self.ast.expression_assignment(
+			SPAN,
+			AssignmentOperator::Assign,
+			self.assign_target(name),
+			val.expr,
+		);
+		stmts.push(self.ast.statement_expression(SPAN, assign));
+		self.ast.statement_block(SPAN, stmts)
+	}
+
+	/// A HIR expression emitted as a JS block statement, evaluating its value for
+	/// effect (used for a `while` body, whose value is discarded).
+	fn block_stmt(&self, expr: &HirExpr) -> Statement<'a> {
+		let val = self.emit_value(expr);
+		let mut stmts = val.stmts;
+		stmts.push(self.ast.statement_expression(SPAN, val.expr));
+		self.ast.statement_block(SPAN, stmts)
 	}
 
 	/// Emit a single HIR statement as a JS statement.
@@ -254,6 +334,40 @@ impl<'a> Emitter<'a> {
 				JsValue {
 					stmts: js_stmts,
 					expr: tail_expr,
+				}
+			}
+			HirExpr::If {
+				cond,
+				then,
+				otherwise,
+			} => {
+				// let <tmp>; if (cond) { <tmp> = then } else { <tmp> = else }; → <tmp>
+				let tmp = self.ast.allocator.alloc_str(&self.gensym());
+				let decl = self.let_uninit(tmp);
+				let cond_expr = self.emit_expr(cond);
+				let then_stmt = self.assign_block(tmp, Some(then));
+				let else_stmt = self.assign_block(tmp, otherwise.as_deref());
+				let if_stmt = self
+					.ast
+					.statement_if(SPAN, cond_expr, then_stmt, Some(else_stmt));
+				let mut stmts = self.ast.vec();
+				stmts.push(decl);
+				stmts.push(if_stmt);
+				JsValue {
+					stmts,
+					expr: self.ast.expression_identifier(SPAN, tmp),
+				}
+			}
+			HirExpr::While { cond, body } => {
+				// A `while` is a statement; its value is `undefined`.
+				let cond_expr = self.emit_expr(cond);
+				let body_stmt = self.block_stmt(body);
+				let while_stmt = self.ast.statement_while(SPAN, cond_expr, body_stmt);
+				let mut stmts = self.ast.vec();
+				stmts.push(while_stmt);
+				JsValue {
+					stmts,
+					expr: self.ast.expression_identifier(SPAN, "undefined"),
 				}
 			}
 			other => JsValue {
