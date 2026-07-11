@@ -10,22 +10,37 @@
 //! a `Lowerer` so later slices can add further type-directed lowering without another
 //! signature change.
 
+use ecow::EcoString;
 use nymph_ast::{
 	decl::{Declaration, FuncDeclaration, Module},
 	expr::{Expr, ExprKind, ListItem, MapEntry, Statement},
 	ops::{AssignOperator, BinaryOperator, PrefixOperator},
 };
-use nymph_hir::hir::{BinOp, HirExpr, HirFunc, HirModule, HirStmt, UnOp};
+use nymph_hir::hir::{BinOp, HirClass, HirExpr, HirFunc, HirModule, HirStmt, UnOp};
 use nymph_hir::ty::{Interner, TyKind};
+use rustc_hash::FxHashSet;
 
 use crate::{Annotations, Checked};
 
 /// Lower a checked module into the code-generation HIR, consulting `checked`'s
 /// annotations/interner for type-directed decisions (e.g. index-access dispatch).
 pub fn lower_hir(module: &Module, checked: &Checked) -> HirModule {
+	// A call whose callee names a struct is construction, not an ordinary call.
+	// Collect the module's struct names up front so `lower_expr` can dispatch on
+	// them. Sound because lowering runs only on error-free programs, where a struct
+	// and a function cannot share a name.
+	let struct_names = module
+		.members
+		.iter()
+		.filter_map(|decl| match decl {
+			Declaration::Struct { name, .. } => Some(name.0.clone()),
+			_ => None,
+		})
+		.collect();
 	let lowerer = Lowerer {
 		annotations: &checked.annotations,
 		interner: &checked.interner,
+		struct_names,
 	};
 	lowerer.lower_module(module)
 }
@@ -34,20 +49,24 @@ pub fn lower_hir(module: &Module, checked: &Checked) -> HirModule {
 struct Lowerer<'a> {
 	annotations: &'a Annotations,
 	interner: &'a Interner,
+	struct_names: FxHashSet<EcoString>,
 }
 
 impl Lowerer<'_> {
 	fn lower_module(&self, module: &Module) -> HirModule {
 		let mut funcs = Vec::new();
+		let mut classes = Vec::new();
 		for decl in &module.members {
-			if let Declaration::Func { meta, body, .. } = decl {
-				funcs.push(self.lower_func(meta, body));
+			match decl {
+				Declaration::Func { meta, body, .. } => funcs.push(self.lower_func(meta, body)),
+				Declaration::Struct { name, fields, .. } => classes.push(HirClass {
+					name: name.0.clone(),
+					fields: fields.iter().map(|f| f.0.name.0.clone()).collect(),
+				}),
+				_ => {}
 			}
 		}
-		HirModule {
-			funcs,
-			classes: Vec::new(),
-		}
+		HirModule { funcs, classes }
 	}
 
 	fn lower_func(&self, meta: &FuncDeclaration, body: &Expr) -> HirFunc {
@@ -68,9 +87,36 @@ impl Lowerer<'_> {
 			ExprKind::Char(c) => HirExpr::Char(c.0),
 			ExprKind::Identifier(name) => HirExpr::Local(name.0.clone()),
 			ExprKind::Grouped(inner) => self.lower_expr(inner),
-			ExprKind::Call { func, args, .. } => HirExpr::Call {
-				callee: Box::new(self.lower_expr(func)),
-				args: args.iter().map(|a| self.lower_expr(&a.0.value)).collect(),
+			ExprKind::Call { func, args, .. } => {
+				// A call whose callee names a struct is construction → `New`. 2B supports
+				// labeled fields only; positional construction is deferred.
+				if let ExprKind::Identifier(name) = &func.kind
+					&& self.struct_names.contains(&name.0)
+				{
+					let fields = args
+						.iter()
+						.map(|a| {
+							let label =
+								a.0.name.as_ref().unwrap_or_else(|| {
+									panic!("slice-2b struct construction requires labeled fields")
+								});
+							(label.0.clone(), self.lower_expr(&a.0.value))
+						})
+						.collect();
+					HirExpr::New {
+						class: name.0.clone(),
+						fields,
+					}
+				} else {
+					HirExpr::Call {
+						callee: Box::new(self.lower_expr(func)),
+						args: args.iter().map(|a| self.lower_expr(&a.0.value)).collect(),
+					}
+				}
+			}
+			ExprKind::MemberAccess { parent, member, .. } => HirExpr::Field {
+				recv: Box::new(self.lower_expr(parent)),
+				name: member.0.clone(),
 			},
 			ExprKind::Tuple(items) => HirExpr::Array(self.lower_items(items)),
 			ExprKind::List(items) => HirExpr::Array(self.lower_items(items)),

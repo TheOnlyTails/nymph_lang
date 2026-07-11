@@ -84,3 +84,50 @@ fn lowers_collections_and_index() {
 		"list index → Index"
 	);
 }
+
+#[test]
+fn lowers_struct_decl_and_construction() {
+	let hir = lower(
+		r#"
+		struct Point(x: int, y: int)
+		func origin(): Point = Point(x = 0, y = 0)
+		"#,
+	);
+	// The struct becomes a class carrying its field names in order.
+	assert_eq!(hir.classes.len(), 1);
+	assert_eq!(hir.classes[0].name, "Point");
+	assert_eq!(
+		hir.classes[0].fields,
+		vec!["x".to_string(), "y".to_string()]
+	);
+
+	// Construction lowers to a `New` naming the class, with labeled field values.
+	let f = hir
+		.funcs
+		.iter()
+		.find(|f| f.name == "origin")
+		.expect("origin");
+	let HirExpr::New { class, fields } = &f.body else {
+		panic!("expected New, got {:?}", f.body);
+	};
+	assert_eq!(class, "Point");
+	assert_eq!(fields.len(), 2);
+	assert_eq!(fields[0].0, "x");
+	assert_eq!(fields[1].0, "y");
+}
+
+#[test]
+fn lowers_field_access() {
+	let hir = lower(
+		r#"
+		struct Point(x: int, y: int)
+		func get_x(p: Point): int = p.x
+		"#,
+	);
+	let f = hir.funcs.iter().find(|f| f.name == "get_x").expect("get_x");
+	let HirExpr::Field { recv, name } = &f.body else {
+		panic!("expected Field, got {:?}", f.body);
+	};
+	assert_eq!(name, "x");
+	assert!(matches!(recv.as_ref(), HirExpr::Local(n) if n == "p"));
+}
