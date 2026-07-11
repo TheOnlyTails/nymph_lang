@@ -7,6 +7,7 @@ use nymph_ast::NodeId;
 use nymph_diagnostics::Diagnostic;
 use rustc_hash::FxHashMap;
 
+use crate::ty::Interner;
 use crate::{DefId, Ty};
 
 /// How a resolved operator/method call must be emitted by codegen.
@@ -64,8 +65,11 @@ impl Annotations {
 
 /// The full result of checking: diagnostics plus the annotation side-table. When
 /// `diags` contains errors, `annotations` may be incomplete and lowering is skipped.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Checked {
 	pub diags: Vec<Diagnostic>,
 	pub annotations: Annotations,
+	/// The interner that minted the types in `annotations`. A `Ty` is meaningless
+	/// without it, so it travels with the result for the lowering pass to consult.
+	pub interner: Interner,
 }

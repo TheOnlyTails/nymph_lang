@@ -93,6 +93,7 @@ pub fn check_module(module: &Module) -> Checked {
 	Checked {
 		diags: checker.diags,
 		annotations: checker.annotations,
+		interner: checker.interner,
 	}
 }
 
