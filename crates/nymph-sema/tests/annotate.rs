@@ -46,6 +46,28 @@ fn collect_ids(expr: &Expr, out: &mut Vec<nymph_ast::NodeId>) {
 	}
 }
 
+/// Walk every expression node reachable from `expr`, including list/tuple/map
+/// literal elements. Broader than [`collect_ids`] above (which only recurses into
+/// `BinaryOp`) so it can walk collection literals too.
+fn collect_expr_ids(expr: &Expr, out: &mut Vec<nymph_ast::NodeId>) {
+	use nymph_ast::expr::ListItem;
+	out.push(expr.id);
+	match &expr.kind {
+		ExprKind::BinaryOp { lhs, rhs, .. } => {
+			collect_expr_ids(lhs, out);
+			collect_expr_ids(rhs, out);
+		}
+		ExprKind::List(items) | ExprKind::Tuple(items) => {
+			for item in items {
+				match &item.0 {
+					ListItem::Expr(e) | ListItem::Spread(e) => collect_expr_ids(e, out),
+				}
+			}
+		}
+		_ => {}
+	}
+}
+
 #[test]
 fn literals_and_operators_are_annotated() {
 	let module = parse("func f(): int = 1 + 2");
@@ -73,4 +95,29 @@ fn literals_and_operators_are_annotated() {
 			"node {id:?} should be annotated",
 		);
 	}
+}
+
+#[test]
+fn records_type_of_collection_literals() {
+	// A list literal's node should carry a recorded type after checking.
+	let module = parse("func f(): #[int] = #[1, 2, 3]");
+	let checked = check_module(&module);
+	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+
+	// Reach the `#[1, 2, 3]` body: the single func's body expression.
+	let nymph_ast::decl::Declaration::Func { body, .. } = &module.members[0] else {
+		panic!("expected a func declaration, got {:?}", module.members[0]);
+	};
+
+	let mut ids = Vec::new();
+	collect_expr_ids(body, &mut ids);
+	let annotated = ids
+		.iter()
+		.filter(|id| checked.annotations.get(**id).is_some())
+		.count();
+	assert_eq!(
+		annotated,
+		ids.len(),
+		"every inferred expression node should be annotated"
+	);
 }

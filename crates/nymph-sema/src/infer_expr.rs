@@ -130,13 +130,17 @@ impl<'m> Checker<'m> {
 
 	// ── infer mode ───────────────────────────────────────────────────────────
 	pub(crate) fn infer(&mut self, expr: &Expr) -> Ty {
+		let ty = self.infer_kind(expr);
+		// Record the node's resolved type for the lowering pass. Zonking happens
+		// inside `record`. Returns the *raw* ty so callers can still unify against it.
+		self.record(expr.id, ty, None);
+		ty
+	}
+
+	fn infer_kind(&mut self, expr: &Expr) -> Ty {
 		let span = expr.span;
 		match &expr.kind {
-			ExprKind::Int(_) => {
-				let ty = self.interner.int();
-				self.record(expr.id, ty, None);
-				ty
-			}
+			ExprKind::Int(_) => self.interner.int(),
 			ExprKind::UInt(_) => self.interner.uint(),
 			ExprKind::Float(_) => self.interner.float(),
 			ExprKind::Char(_) => self.interner.char(),
@@ -219,13 +223,35 @@ impl<'m> Checker<'m> {
 				self.infer_member(parent, &member.0, member.1)
 			}
 			ExprKind::IndexAccess { parent, index, .. } => {
-				// `a[i]` ≡ `a.index(i)` through the `Index` interface.
+				// `a[i]` ≡ `a.index(i)` through the `Index` interface, but lists/maps/
+				// tuples are fast-pathed as built-ins so indexing them type-checks with
+				// no `Index` impl in scope.
 				let recv = self.infer(parent);
 				let key = self.infer(index);
-				let key_lit = matches!(index.kind, ExprKind::Int(_));
-				match self.resolve_method(recv, "index", &[key], &[key_lit], span) {
-					Some(ret) => ret,
-					None => self.fresh(),
+				let recv_r = self.shallow_resolve(recv);
+				match self.interner.kind(recv_r).clone() {
+					TyKind::List(elem) => {
+						let int = self.interner.int();
+						self.unify(key, int, span); // list index is an int
+						elem
+					}
+					TyKind::Tuple(elems) => {
+						// A tuple index yields a fresh var (heterogeneous; precise typing
+						// needs a const index and is deferred).
+						let _ = elems;
+						self.fresh()
+					}
+					TyKind::Map(k, v) => {
+						self.unify(key, k, span);
+						v
+					}
+					_ => {
+						let key_lit = matches!(index.kind, ExprKind::Int(_));
+						match self.resolve_method(recv, "index", &[key], &[key_lit], span) {
+							Some(ret) => ret,
+							None => self.fresh(),
+						}
+					}
 				}
 			}
 			ExprKind::Closure { .. } => self.infer_closure(expr),
@@ -240,9 +266,7 @@ impl<'m> Checker<'m> {
 				// `infer_binary`. TODO(codegen-slice-4): populate the selected-impl
 				// `Resolution` (dispatch kind) here, in the operator-lowering slice that
 				// consumes it (built-in fast-path → BuiltinEager, dispatch → UserImpl).
-				let ty = self.infer_binary(lhs, *op, rhs, span);
-				self.record(expr.id, ty, None);
-				ty
+				self.infer_binary(lhs, *op, rhs, span)
 			}
 			ExprKind::TypeOp { lhs, rhs, .. } => {
 				let src = self.infer(lhs);

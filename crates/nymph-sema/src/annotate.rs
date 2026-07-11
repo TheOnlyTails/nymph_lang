@@ -61,6 +61,29 @@ impl Annotations {
 			self.0.insert(id, info);
 		}
 	}
+
+	/// Attach a `Resolution` to a node, preserving its already-recorded type. Used
+	/// by later slices for operator/method dispatch without clobbering the type
+	/// recorded by the uniform `infer` wrapper.
+	///
+	/// A resolved node is always also `infer`'d first (the wrapper records its type
+	/// before any resolution is attached), so the entry is expected to already
+	/// exist; this only updates it in place, and never inserts a bare
+	/// resolution-only entry (there is no placeholder `Ty` to insert with). Slice 2A
+	/// does not yet call this method — it is future-proofing for operator dispatch.
+	#[allow(dead_code)]
+	pub(crate) fn record_resolution(&mut self, id: NodeId, resolution: Resolution) {
+		if id == NodeId::DUMMY {
+			return;
+		}
+		match self.0.get_mut(&id) {
+			Some(info) => info.resolution = Some(resolution),
+			None => debug_assert!(
+				false,
+				"record_resolution({id:?}) called before the node was infer'd"
+			),
+		}
+	}
 }
 
 /// The full result of checking: diagnostics plus the annotation side-table. When
