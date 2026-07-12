@@ -65,21 +65,24 @@ impl Lowerer<'_> {
 		use nymph_ast::decl::{ImplMember, StructInnerMember};
 		use nymph_ast::ty::Type;
 
-		// First pass: collect inherent instance methods from top-level `impl <Named>`
-		// blocks, keyed by the target type name. Interface impls (`impl … for`) are a
-		// distinct `Declaration::ImplFor` and are not matched here. Non-`func` members
-		// (namespaced statics, nested impls, `impl mut`) are deferred and panic loudly
-		// rather than silently disappearing.
+		// First pass: collect instance methods from top-level `impl <Named>` blocks
+		// (inherent, 4A) and top-level `impl <Interface> for <Named>` blocks
+		// (interface impls, 4B/D5), keyed by the target type name. Non-`func`
+		// members (namespaced statics, nested impls, `impl mut`) are deferred and
+		// panic loudly rather than silently disappearing.
 		let mut methods_by_type: FxHashMap<EcoString, Vec<HirMethod>> = FxHashMap::default();
 		for decl in &module.members {
-			if let Declaration::Impl { type_, members, .. } = decl
-				&& let Type::Reference { name, .. } = &type_.0
-			{
+			let (type_, members) = match decl {
+				Declaration::Impl { type_, members, .. } => (type_, members),
+				Declaration::ImplFor { type_, members, .. } => (type_, members),
+				_ => continue,
+			};
+			if let Type::Reference { name, .. } = &type_.0 {
 				let entry = methods_by_type.entry(name.0.clone()).or_default();
 				for member in members {
 					match &member.0 {
 						ImplMember::Func { meta, body, .. } => entry.push(self.lower_method(meta, body)),
-						other => panic!("slice-4a lowering does not yet handle impl member {other:?}"),
+						other => panic!("slice-4b lowering does not yet handle impl member {other:?}"),
 					}
 				}
 			}
@@ -97,7 +100,8 @@ impl Lowerer<'_> {
 					members,
 					..
 				} => {
-					// Methods from top-level impls, plus the struct's own inner `func`s.
+					// Methods from top-level impls, the struct's own inner `func`s, and
+					// nested `impl <Interface> { .. }` blocks inside the struct body.
 					let mut methods = methods_by_type.remove(&name.0).unwrap_or_default();
 					for member in members {
 						match &member.0 {
@@ -107,6 +111,16 @@ impl Lowerer<'_> {
 									panic!("slice-4a lowering does not yet handle struct inner member {other:?}")
 								}
 							},
+							StructInnerMember::Impl { members, .. } => {
+								for member in members {
+									match &member.0 {
+										ImplMember::Func { meta, body, .. } => {
+											methods.push(self.lower_method(meta, body))
+										}
+										other => panic!("slice-4b lowering does not yet handle impl member {other:?}"),
+									}
+								}
+							}
 							other => {
 								panic!("slice-4a lowering does not yet handle struct inner member {other:?}")
 							}
@@ -133,7 +147,7 @@ impl Lowerer<'_> {
 		}
 		assert!(
 			methods_by_type.is_empty(),
-			"slice-4a lowering does not yet support inherent methods on non-struct types (e.g. enums); found impls for: {:?}",
+			"slice-4b lowering does not yet support inherent or interface-impl methods on non-struct types (e.g. enums); found impls for: {:?}",
 			methods_by_type.keys().collect::<Vec<_>>()
 		);
 		HirModule {

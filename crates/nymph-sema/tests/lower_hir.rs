@@ -341,3 +341,62 @@ fn enum_inherent_methods_panic_in_lowering() {
 		"#,
 	);
 }
+
+#[test]
+fn lowers_nested_struct_impl_methods() {
+	// A nested `impl Plus<...> { ... }` block inside a struct body (as in
+	// stdlib/src/math/complex.nym) feeds its `func` members into the class's
+	// methods, same as an inherent struct-inner `func`.
+	let hir = lower(
+		r#"
+		interface Plus<Other, Output> { func plus(other: Other): Output }
+		struct Vec2(x: int, y: int) {
+			impl Plus<Other = Vec2, Output = Vec2> {
+				func plus(other: Vec2): Vec2 = other
+			}
+		}
+		"#,
+	);
+	assert_eq!(hir.classes.len(), 1);
+	let class = &hir.classes[0];
+	assert_eq!(class.name, "Vec2");
+	assert_eq!(class.methods.len(), 1);
+	assert_eq!(class.methods[0].name, "plus");
+}
+
+#[test]
+fn lowers_top_level_impl_for_methods() {
+	// A top-level `impl Plus<...> for Vec2 { ... }` (interface impl) targeting a
+	// struct also feeds its `func` members into that struct's class methods.
+	let hir = lower(
+		r#"
+		interface Plus<Other, Output> { func plus(other: Other): Output }
+		struct Vec2(x: int, y: int)
+		impl Plus<Other = Vec2, Output = Vec2> for Vec2 {
+			func plus(other: Vec2): Vec2 = other
+		}
+		"#,
+	);
+	assert_eq!(hir.classes.len(), 1);
+	let class = &hir.classes[0];
+	assert_eq!(class.name, "Vec2");
+	assert_eq!(class.methods.len(), 1);
+	assert_eq!(class.methods[0].name, "plus");
+}
+
+#[test]
+#[should_panic(expected = "non-struct types")]
+fn impl_for_on_enum_panics_in_lowering() {
+	// `impl Plus<...> for Color { ... }` on an enum type-checks (stdlib does this
+	// for `Result`'s `Unwrap` impl), but lowering does not yet attach methods to
+	// enums; it must panic loudly instead of silently dropping the impl.
+	lower(
+		r#"
+		interface Plus<Other, Output> { func plus(other: Other): Output }
+		enum Color { Red, Green }
+		impl Plus<Other = Color, Output = Color> for Color {
+			func plus(other: Color): Color = other
+		}
+		"#,
+	);
+}
