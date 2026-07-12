@@ -13,7 +13,8 @@ use oxc::{
 };
 
 use nymph_hir::hir::{
-	BinOp, HirClass, HirEnum, HirExpr, HirFunc, HirLit, HirModule, HirPat, HirRange, HirStmt, UnOp,
+	BinOp, HirClass, HirEnum, HirExpr, HirFunc, HirLit, HirMethod, HirModule, HirPat, HirRange,
+	HirStmt, UnOp,
 };
 
 /// A re-emittable reference to a sub-value of the scrutinee, used while compiling a
@@ -263,6 +264,9 @@ impl<'a> Emitter<'a> {
 
 		let mut elements = self.ast.vec();
 		elements.push(ctor);
+		for method in &class.methods {
+			elements.push(self.emit_method(method));
+		}
 		let body = self.ast.class_body(SPAN, elements);
 		let name = self
 			.ast
@@ -281,6 +285,65 @@ impl<'a> Emitter<'a> {
 			false,
 		);
 		Statement::ClassDeclaration(class)
+	}
+
+	/// Emit an inherent instance method as a class method `<name>(<params>) { return
+	/// <body>; }`. Mirrors [`Self::emit_func`]'s param/body handling.
+	fn emit_method(&self, method: &HirMethod) -> ClassElement<'a> {
+		let mut body_stmts = self.ast.vec();
+		match &method.body {
+			HirExpr::Block { .. } => {
+				let value = self.emit_value(&method.body);
+				body_stmts.extend(value.stmts);
+				body_stmts.push(self.ast.statement_return(SPAN, Some(value.expr)));
+			}
+			other => {
+				let body_expr = self.emit_expr(other);
+				body_stmts.push(self.ast.statement_return(SPAN, Some(body_expr)));
+			}
+		}
+		let mut js_params = self.ast.vec();
+		for param in &method.params {
+			let pat = self
+				.ast
+				.binding_pattern_binding_identifier(SPAN, self.ast.allocator.alloc_str(param));
+			js_params.push(self.ast.plain_formal_parameter(SPAN, pat));
+		}
+		let params = self.ast.formal_parameters(
+			SPAN,
+			FormalParameterKind::FormalParameter,
+			js_params,
+			oxc::ast::NONE,
+		);
+		let fn_body = self.ast.function_body(SPAN, self.ast.vec(), body_stmts);
+		let func = self.ast.alloc_function(
+			SPAN,
+			FunctionType::FunctionExpression,
+			None,
+			false,
+			false,
+			false,
+			oxc::ast::NONE,
+			oxc::ast::NONE,
+			params,
+			oxc::ast::NONE,
+			Some(fn_body),
+		);
+		self.ast.class_element_method_definition(
+			SPAN,
+			MethodDefinitionType::MethodDefinition,
+			self.ast.vec(),
+			self
+				.ast
+				.property_key_static_identifier(SPAN, self.ast.allocator.alloc_str(&method.name)),
+			func,
+			MethodDefinitionKind::Method,
+			false,
+			false,
+			false,
+			false,
+			None,
+		)
 	}
 
 	// ── Enum Symbol-tag ABI ────────────────────────────────────────────────────
@@ -518,8 +581,8 @@ impl<'a> Emitter<'a> {
 			HirExpr::Local(name) => self
 				.ast
 				.expression_identifier(SPAN, self.ast.allocator.alloc_str(name)),
-			// The `this` receiver — emitted in Slice 4A Task 3.
-			HirExpr::This => unreachable!("emitted in slice-4a Task 3"),
+			// The `this` receiver.
+			HirExpr::This => self.ast.expression_this(SPAN),
 			HirExpr::Binary { op, lhs, rhs } => {
 				let left = self.emit_expr(lhs);
 				let right = self.emit_expr(rhs);

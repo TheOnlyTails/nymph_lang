@@ -348,6 +348,32 @@ fn runs_match_union() {
 }
 
 #[test]
+fn runs_struct_method_with_this() {
+	// An inherent method emits as a class method; `this` reads the instance's fields.
+	let src = r#"
+		struct Point(x: int, y: int)
+		impl Point {
+			func sum(): int = this.x + this.y
+		}
+		func total(p: Point): int = p.sum()
+	"#;
+	assert_eq!(run(src, "total(new Point({ x: 3, y: 4 }))"), "7");
+}
+
+#[test]
+fn runs_struct_method_with_args() {
+	// A method taking a parameter, called positionally.
+	let src = r#"
+		struct Counter(n: int)
+		impl Counter {
+			func add(k: int): int = this.n + k
+		}
+		func bump(c: Counter): int = c.add(10)
+	"#;
+	assert_eq!(run(src, "bump(new Counter({ n: 5 }))"), "15");
+}
+
+#[test]
 fn compile_reports_check_errors() {
 	// A type error surfaces as diagnostics, not JS.
 	let result = nymph_codegen::compile("func f(): int = true", "test");
