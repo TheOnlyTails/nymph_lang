@@ -9,7 +9,7 @@ use ecow::EcoString;
 use ordered_float::OrderedFloat;
 use strum::Display;
 
-#[derive(Clone, PartialEq, Debug, salsa::Update)]
+#[derive(Clone, PartialEq, Debug, salsa::SalsaValue)]
 pub enum Statement {
 	Expr(Spanned<Expr>),
 	Let {
@@ -18,7 +18,7 @@ pub enum Statement {
 	},
 }
 
-#[derive(Clone, Debug, PartialEq, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub enum Expr {
 	/// `1`, `0b010001`, `0xDEADF00D`
 	Int(Spanned<u64>),
@@ -134,14 +134,14 @@ pub enum Expr {
 	Grouped(Box<Spanned<Self>>),
 }
 
-#[derive(Debug, Clone, PartialEq, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
 pub enum StringPart {
 	Text(EcoString),
 	EscapeSequence(StringEscape),
 	InterpolatedExpr(Spanned<Expr>),
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Display, salsa::Update)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Display, salsa::SalsaValue)]
 pub enum CharEscape {
 	Backslash,
 	Newline,
@@ -164,7 +164,7 @@ impl From<CharEscape> for char {
 	}
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Display, salsa::Update)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Display, salsa::SalsaValue)]
 pub enum StringEscape {
 	#[strum(to_string = r"\\")]
 	Backslash,
@@ -182,19 +182,19 @@ pub enum StringEscape {
 	Unicode(char),
 }
 
-#[derive(Clone, Debug, PartialEq, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub enum ListItem {
 	Expr(Spanned<Expr>),
 	Spread(Spanned<Expr>),
 }
 
-#[derive(Clone, Debug, PartialEq, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub enum MapEntry {
 	Expr(Spanned<Expr>, Spanned<Expr>),
 	Spread(Spanned<Expr>),
 }
 
-#[derive(Clone, Debug, PartialEq, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub enum RangeKind {
 	From(Box<Spanned<Expr>>),
 	To(Box<Spanned<Expr>>),
@@ -209,7 +209,7 @@ pub enum RangeKind {
 	},
 }
 
-#[derive(Clone, Debug, PartialEq, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub struct ClosureParam {
 	pub name: Spanned<Pattern>,
 	pub type_: Option<Spanned<Type>>,
@@ -217,21 +217,21 @@ pub struct ClosureParam {
 	pub spread: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub struct CallArg {
 	pub value: Spanned<Expr>,
 	pub name: Option<Ident>,
 	pub spread: bool,
 }
 
-#[derive(Clone, PartialEq, Debug, salsa::Update)]
+#[derive(Clone, PartialEq, Debug, salsa::SalsaValue)]
 pub struct MatchArm {
 	pub pattern: Spanned<Pattern>,
 	pub guard: Option<Spanned<Expr>>,
 	pub body: Spanned<Expr>,
 }
 
-#[derive(Clone, PartialEq, Debug, Eq, Hash, salsa::Update)]
+#[derive(Clone, PartialEq, Debug, Eq, Hash, salsa::SalsaValue)]
 pub enum Pattern {
 	Int(Spanned<i64>),
 	UInt(Spanned<u64>),
@@ -743,13 +743,13 @@ pub fn rewrite_anonymous_params(
 	rewrite(expr, names)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum StringPatternPart {
 	Text(EcoString),
 	EscapeSequence(StringEscape),
 }
 
-#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::Update)]
+#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::SalsaValue)]
 pub enum RangePatternKind {
 	/// `1..<`
 	ExclusiveMin(Box<Spanned<Pattern>>),
@@ -767,7 +767,7 @@ pub enum RangePatternKind {
 	},
 }
 
-#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::Update)]
+#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::SalsaValue)]
 pub enum StructPatternField {
 	Value {
 		name: Ident,
@@ -777,13 +777,13 @@ pub enum StructPatternField {
 	Rest,
 }
 
-#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::Update)]
+#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::SalsaValue)]
 pub enum ListPatternEntry {
 	Item(Spanned<Pattern>),
 	Rest(Option<Ident>),
 }
 
-#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::Update)]
+#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::SalsaValue)]
 pub enum MapPatternEntry {
 	Entry(Spanned<Pattern>, Spanned<Pattern>),
 	Rest(Option<Ident>),

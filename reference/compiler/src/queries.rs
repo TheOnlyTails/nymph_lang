@@ -47,7 +47,7 @@ pub fn lex_file(db: &dyn Db, file: SourceFile) -> Vec<Spanned<Token>> {
 	tokens.unwrap_or_default()
 }
 
-#[derive(Debug, Clone, PartialEq, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
 pub struct ParseResult {
 	pub module: Option<Spanned<Module>>,
 	pub errors: Vec<ParseError>,
@@ -249,25 +249,25 @@ pub fn module_deps(db: &dyn Db, file: SourceFile, config: ProjectConfig) -> Vec<
 		.collect()
 }
 
-#[derive(Debug, Clone, PartialEq, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
 pub struct TypecheckResult {
 	pub ctx: Context,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Eq, salsa::SalsaValue)]
 pub struct BundledModule {
 	pub source_path: PathBuf,
 	pub output_path: PathBuf,
 	pub code: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Eq, salsa::SalsaValue)]
 pub struct CopiedAsset {
 	pub source_path: PathBuf,
 	pub output_path: PathBuf,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Eq, salsa::SalsaValue)]
 pub struct BundleResult {
 	pub emitted_modules: Vec<BundledModule>,
 	pub copied_assets: Vec<CopiedAsset>,

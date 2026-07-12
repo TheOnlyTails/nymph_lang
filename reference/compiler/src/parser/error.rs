@@ -3,14 +3,14 @@ use ecow::EcoString;
 
 use crate::lexer::token::Token;
 
-#[derive(Debug, Clone, PartialEq, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
 pub struct ParseError {
 	pub kind: ParseErrorKind,
 	pub span: Span,
 	pub context: Vec<(EcoString, Span)>,
 }
 
-#[derive(Debug, Clone, PartialEq, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
 pub enum ParseErrorKind {
 	UnexpectedToken {
 		found: Token,

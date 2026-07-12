@@ -69,7 +69,7 @@ impl DefKey {
 
 /// Shape data for a struct type definition (fields, members, impls, generics).
 /// Computed lazily via salsa queries; not stored inline in `Type`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct StructShape {
 	pub generics: Vec<GenericParamInfo>,
 	pub fields: BTreeMap<EcoString, Type>,
@@ -78,7 +78,7 @@ pub struct StructShape {
 }
 
 /// Shape data for an enum type definition.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct EnumShape {
 	pub generics: Vec<GenericParamInfo>,
 	pub variants: BTreeMap<EcoString, BTreeMap<EcoString, Type>>,
@@ -87,14 +87,14 @@ pub struct EnumShape {
 }
 
 /// Shape data for an interface type definition.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct InterfaceShape {
 	pub generics: Vec<GenericParamInfo>,
 	pub members: BTreeMap<EcoString, StructMember>,
 	pub impls: BTreeMap<EcoString, Type>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct ImportSpec {
 	pub root: ImportRoot,
 	pub path: Vec<String>,
@@ -102,7 +102,7 @@ pub struct ImportSpec {
 	pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct ImportedIdent {
 	pub name: String,
 	pub alias: Option<String>,

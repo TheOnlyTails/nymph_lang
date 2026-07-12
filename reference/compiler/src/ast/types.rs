@@ -1,6 +1,6 @@
 use super::{Ident, Spanned};
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone, salsa::Update)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone, salsa::SalsaValue)]
 pub enum Type {
 	// Type declarations
 	/// `int`
@@ -47,13 +47,13 @@ pub enum Type {
 
 pub type FunctionTypeParam = (Option<Ident>, Spanned<Type>);
 
-#[derive(Debug, PartialEq, Hash, Clone, Eq, salsa::Update)]
+#[derive(Debug, PartialEq, Hash, Clone, Eq, salsa::SalsaValue)]
 pub struct GenericArg {
 	pub value: Spanned<Type>,
 	pub name: Option<Ident>,
 }
 
-#[derive(Clone, Debug, PartialEq, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub struct GenericParam {
 	pub name: Ident,
 	pub constraint: Option<Spanned<Type>>,

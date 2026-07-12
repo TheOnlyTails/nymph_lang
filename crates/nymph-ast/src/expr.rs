@@ -17,7 +17,7 @@ use crate::{
 	ty::{GenericArg, GenericParam, Type},
 };
 
-#[derive(Clone, PartialEq, Debug, salsa::Update)]
+#[derive(Clone, PartialEq, Debug, salsa::SalsaValue)]
 pub enum Statement {
 	Expr(Expr),
 	Let { meta: LetDeclaration, value: Expr },
@@ -27,7 +27,7 @@ pub enum Statement {
 /// stable [`NodeId`]. Expressions carry their own span (unlike other AST nodes,
 /// which are wrapped in [`Spanned`]) so that identity, position, and shape travel
 /// together — the shape the HIR and LSP both want.
-#[derive(Clone, Debug, PartialEq, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub struct Expr {
 	pub kind: ExprKind,
 	pub span: Span,
@@ -40,7 +40,7 @@ impl Expr {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub enum ExprKind {
 	/// `1`, `0b010001`, `0xDEADF00D`
 	Int(Spanned<u64>),
@@ -161,14 +161,14 @@ pub enum ExprKind {
 	Grouped(Box<Expr>),
 }
 
-#[derive(Debug, Clone, PartialEq, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
 pub enum StringPart {
 	Text(EcoString),
 	EscapeSequence(StringEscape),
 	InterpolatedExpr(Expr),
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Display, salsa::Update)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Display, salsa::SalsaValue)]
 pub enum CharEscape {
 	Backslash,
 	Newline,
@@ -191,7 +191,7 @@ impl From<CharEscape> for char {
 	}
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Display, salsa::Update)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Display, salsa::SalsaValue)]
 pub enum StringEscape {
 	#[strum(to_string = r"\\")]
 	Backslash,
@@ -224,13 +224,13 @@ impl StringEscape {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub enum ListItem {
 	Expr(Expr),
 	Spread(Expr),
 }
 
-#[derive(Clone, Debug, PartialEq, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub enum MapEntry {
 	Entry(Expr, Expr),
 	Spread(Expr),
@@ -238,7 +238,7 @@ pub enum MapEntry {
 
 /// The five forms a range expression can take. All use `..` (exclusive) or `..=`
 /// (inclusive); the previous `..<` pattern-only form has been removed.
-#[derive(Clone, Debug, PartialEq, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub enum RangeKind {
 	/// `1..` — from a lower bound, unbounded above (iterable, infinite).
 	From(Box<Expr>),
@@ -252,7 +252,7 @@ pub enum RangeKind {
 	Inclusive { min: Box<Expr>, max: Box<Expr> },
 }
 
-#[derive(Clone, Debug, PartialEq, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub struct ClosureParam {
 	pub name: Spanned<Pattern>,
 	pub type_: Option<Spanned<Type>>,
@@ -260,21 +260,21 @@ pub struct ClosureParam {
 	pub spread: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub struct CallArg {
 	pub value: Expr,
 	pub name: Option<Ident>,
 	pub spread: bool,
 }
 
-#[derive(Clone, PartialEq, Debug, salsa::Update)]
+#[derive(Clone, PartialEq, Debug, salsa::SalsaValue)]
 pub struct MatchArm {
 	pub pattern: Spanned<Pattern>,
 	pub guard: Option<Expr>,
 	pub body: Expr,
 }
 
-#[derive(Clone, PartialEq, Debug, Eq, Hash, salsa::Update)]
+#[derive(Clone, PartialEq, Debug, Eq, Hash, salsa::SalsaValue)]
 pub enum Pattern {
 	Int(Spanned<i64>),
 	UInt(Spanned<u64>),
@@ -313,14 +313,14 @@ impl Pattern {
 	}
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum StringPatternPart {
 	Text(EcoString),
 	EscapeSequence(StringEscape),
 }
 
 /// Range patterns mirror [`RangeKind`], using unified `..` / `..=` bounds.
-#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::Update)]
+#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::SalsaValue)]
 pub enum RangePatternKind {
 	/// `1..` — matches values `>= min`.
 	From(Box<Spanned<Pattern>>),
@@ -340,7 +340,7 @@ pub enum RangePatternKind {
 	},
 }
 
-#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::Update)]
+#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::SalsaValue)]
 pub enum StructPatternField {
 	/// `field = pattern`
 	Value {
@@ -353,14 +353,14 @@ pub enum StructPatternField {
 	Rest,
 }
 
-#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::Update)]
+#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::SalsaValue)]
 pub enum ListPatternEntry {
 	Item(Spanned<Pattern>),
 	/// `...` or `...rest`
 	Rest(Option<Ident>),
 }
 
-#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::Update)]
+#[derive(PartialEq, Clone, Debug, Eq, Hash, salsa::SalsaValue)]
 pub enum MapPatternEntry {
 	Entry(Spanned<Pattern>, Spanned<Pattern>),
 	Rest(Option<Ident>),

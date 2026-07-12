@@ -14,7 +14,7 @@ use strum::Display;
 use crate::Spanned;
 use crate::expr::StringEscape;
 
-#[derive(Clone, PartialEq, Debug, salsa::Update)]
+#[derive(Clone, PartialEq, Debug, salsa::SalsaValue)]
 pub enum Token {
 	// ── Literals ────────────────────────────────────────────────────────────
 	/// A signed integer literal, already decoded from its radix: `1234`,
@@ -215,7 +215,7 @@ pub enum Token {
 
 /// One fragment of a string literal. A plain string is a single [`StrFragment::Text`];
 /// interpolation and escapes split it into multiple fragments.
-#[derive(Clone, PartialEq, Debug, salsa::Update)]
+#[derive(Clone, PartialEq, Debug, salsa::SalsaValue)]
 pub enum StrFragment {
 	/// Raw text between escapes/interpolations.
 	Text(EcoString),

@@ -4,7 +4,7 @@ use strum::FromRepr;
 
 /// Binding strength of an operator, lowest to highest. The Pratt parser consults this
 /// to decide how to fold `a + b * c` into `a + (b * c)`.
-#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Debug, FromRepr, salsa::Update)]
+#[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Debug, FromRepr, salsa::SalsaValue)]
 pub enum Precedence {
 	Assignment,
 	Pipeline,
@@ -30,7 +30,7 @@ pub enum Precedence {
 	FuncCall,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, salsa::Update)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, salsa::SalsaValue)]
 pub enum PrefixOperator {
 	/// `!`
 	BoolNot,
@@ -40,13 +40,13 @@ pub enum PrefixOperator {
 	BitNot,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, salsa::Update)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, salsa::SalsaValue)]
 pub enum PostfixOperator {
 	/// `?` — propagate an error / `None` out of the enclosing function.
 	ErrorReturn,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, salsa::Update)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, salsa::SalsaValue)]
 pub enum BinaryOperator {
 	/// `+`
 	Plus,
@@ -118,13 +118,13 @@ impl BinaryOperator {
 	}
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, salsa::Update)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, salsa::SalsaValue)]
 pub enum TypeOperator {
 	/// `as`
 	As,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, salsa::Update)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, salsa::SalsaValue)]
 pub enum PatternOperator {
 	/// `is`
 	Is,
@@ -132,7 +132,7 @@ pub enum PatternOperator {
 	NotIs,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug, salsa::Update)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, salsa::SalsaValue)]
 pub enum AssignOperator {
 	/// `=`
 	Assign,

@@ -3,7 +3,7 @@
 
 use crate::{Ident, Spanned};
 
-#[derive(Debug, Eq, PartialEq, Hash, Clone, salsa::Update)]
+#[derive(Debug, Eq, PartialEq, Hash, Clone, salsa::SalsaValue)]
 pub enum Type {
 	/// `int`
 	Int,
@@ -52,14 +52,14 @@ pub enum Type {
 pub type FunctionTypeParam = (Option<Ident>, Spanned<Type>);
 
 /// A single generic argument, optionally labelled (`Output = T`).
-#[derive(Debug, PartialEq, Hash, Clone, Eq, salsa::Update)]
+#[derive(Debug, PartialEq, Hash, Clone, Eq, salsa::SalsaValue)]
 pub struct GenericArg {
 	pub value: Spanned<Type>,
 	pub name: Option<Ident>,
 }
 
 /// A declared generic parameter, with an optional interface constraint and default.
-#[derive(Clone, Debug, PartialEq, salsa::Update)]
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub struct GenericParam {
 	pub name: Ident,
 	pub constraint: Option<Spanned<Type>>,

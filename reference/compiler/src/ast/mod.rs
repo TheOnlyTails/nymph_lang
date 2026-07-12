@@ -15,7 +15,7 @@ pub mod types;
 
 pub type Ident = Spanned<EcoString>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct Span {
 	pub start: usize,
 	pub end: usize,
@@ -45,7 +45,7 @@ impl From<std::ops::Range<usize>> for Span {
 	}
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct Spanned<T>(pub T, pub Span);
 
 impl<T> Spanned<T> {

@@ -6,7 +6,7 @@
 //! code-generation logic. Every downstream crate ([`nymph-syntax`], [`nymph-sema`],
 //! [`nymph-codegen`], the driver, and the tooling) speaks in terms of these types.
 //!
-//! All nodes derive [`salsa::Update`] so that a whole tree can be stored inside the
+//! All nodes derive [`salsa::SalsaValue`] so that a whole tree can be stored inside the
 //! incremental compilation database without extra glue.
 
 use std::fmt::Display;
@@ -23,7 +23,7 @@ pub mod ty;
 pub type Ident = Spanned<EcoString>;
 
 /// A half-open byte range `[start, end)` into a source file.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct Span {
 	pub start: usize,
 	pub end: usize,
@@ -76,7 +76,7 @@ impl From<chumsky::span::SimpleSpan> for Span {
 /// construction order. Distinct from [`Span`]: two nodes can share text but never
 /// an id. Used to key semantic annotations (resolved types, operator impl
 /// selections) that later passes read back.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, salsa::Update)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, salsa::SalsaValue)]
 pub struct NodeId(pub u32);
 
 impl NodeId {
@@ -90,7 +90,7 @@ impl NodeId {
 /// This is the workhorse wrapper of the AST: nearly every node is stored as a
 /// `Spanned<T>` so diagnostics, hover, and go-to-definition can point back at exact
 /// source ranges.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::Update)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct Spanned<T>(pub T, pub Span);
 
 impl<T> Spanned<T> {
