@@ -62,6 +62,15 @@ Scope: match with literal/binding/placeholder/variant patterns (nested), leverag
 - Task 3: complete (lower match → HirExpr::Match, lower_pattern for scalar/binding/placeholder/variant; guards+aggregates panic; commit 75486a33).
 - Task 4: complete (compile_pat → (test, bindings) with re-emittable Subject; emit match as const _s/let _r/if-chain built back-to-front, last arm testless; variant test = _s?.[TAG]===E.V[TAG]; controller inline). Node: unwrap_or(Some 42)→42, None→0, classify 100/200/300. 16 codegen Node tests green, full workspace green, clippy/fmt clean.
 - SLICE 3A COMPLETE. Deferred to 3B: guards, tuple/list/map/struct patterns, range/string/union, standalone `is`.
+
+## Slice 3B (Pattern Matching — full)
+Plan: docs/superpowers/plans/2026-07-11-nymph-codegen-slice3b-patterns-full.md
+Base (before Task 1): 8d1f6897
+Scope (user chose 3B-full): struct/tuple/list(+rest)/map/range/string/union patterns + guards. NO checker change (guards type-check; structural patterns need no resolution; struct-vs-variant Pattern::Struct distinguished by pattern_variant_of). Guards force a match-emission rewrite: if/else-if chain → labeled block + break (a matched-but-guard-failed arm must fall through). Deferred edges (panic loudly): map-rest, non-literal map keys, interpolated/escaped string patterns, binding unions. `is` expression still deferred.
+- Task 1: pending — HIR pattern variants + guard + Subject::Index
+- Task 2: pending — lower guards + new pattern forms
+- Task 3: pending — labeled-block emission (guards) + struct/tuple patterns
+- Task 4: pending — list/map/range/string/union patterns
 - Review (Slice 3A): independent subagent review (opus). Verdict "with fixes"; NO Critical. Core engine verified sound (exhaustiveness backs testless-last-arm; nested/optional-chaining/binding/char all correct). Fixes applied in 0f0e7ef0: should_panic test pinning guard-in-lowering panic; Node tests for nested variant (Wrap(i=A(n))) + match-as-subexpression (IIFE path); stale exhaustiveness doc comment + _s/_r naming drift fixed. Accepted as loud deferrals (not silent miscompiles, consistent with codebase): guards + string/range/tuple/list/map/union patterns panic in lowering. Binding-with-subpattern (name=pat) doesn't parse in match arms → that HirPat::Binding sub branch unreachable from match (harmless). Noted pre-existing (not fixed, affects if/while too): gensym _tN temps not reserved vs user identifiers. SLICE 3A REVIEWED + FIXED.
 
 ---
