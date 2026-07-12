@@ -53,4 +53,17 @@ Scope (user chose full bare+qualified via checker recording): enums → TAG=Symb
 - Task 3: complete (lower enum decls→HirEnum, variant construction→VariantNew, nullary ref→VariantRef via annotation; commit 682499c1). lower_hir 6/6 green.
 - Task 4: complete (emit TAG=Symbol.for + per-enum IIFE of factories/frozen singletons, VariantNew→E.V({…}), VariantRef→E.V; equality.ts ~tag→[TAG]; controller inline). Chose IIFE-per-enum shape (const E = (()=>{const t=Symbol();return{…}})()) reusing JsValue IIFE machinery, avoiding member-target assignments. Node: mk().value→7, none()===Opt.None, cross-variant tags distinct. 14 codegen Node tests green, equality.ts oxlint-clean, full workspace green.
 - SLICE 2C COMPLETE. Deferred: matching/is (Slice 3), Copy (no mutation path), positional/spread args.
+## Slice 3A (Pattern Matching — scalar & variant core)
+Plan: docs/superpowers/plans/2026-07-11-nymph-codegen-slice3a-matching.md
+Base (before Task 1): c6a27fa1
+Scope: match with literal/binding/placeholder/variant patterns (nested), leveraging the 2C Symbol-tag ABI. Variant-pattern resolution recorded span-keyed (patterns have no NodeId). Deferred to 3B: guards, tuple/list/map/struct patterns, range/string/union, standalone `is`.
+- Task 1: pending — HIR match/arm/pattern nodes
+- Task 2: pending — checker records variant-pattern resolution (span-keyed)
+- Task 3: pending — lower match + patterns
+- Task 4: pending — compile patterns + emit match, Node round-trip
+
+---
+(Older entries below.)
+
+## Slice 2C review
 - Review (Slice 2C): independent subagent review (opus). Verdict "with fixes". Critical: field-variant used as first-class value (`let g = Some`) silently miscompiled → FIXED in 124b1ad3 (checker rejects via FieldVariantAsValue; nullary-as-value stays valid). Added tests (reject/accept, qualified-nullary lowering) + deduped tag_obj in emit_enum. Rejected the "shadowing negative test" idea — empirically a variant-named param is a pattern not a binding, so shadowing a variant with a local is unexpressible (invariant vacuously holds). Accepted as known-limitation: positional variant/struct construction panics in lowering (loud ICE, consistent with the codebase's not-yet-implemented deferral pattern). Deferred: equals-via-[TAG] runtime test (needs stdlib linkage, not wired until Slice 5); the tag-identity ABI it relies on IS covered by runs_enum_variant_tag_distinct. SLICE 2C REVIEWED + FIXED.
