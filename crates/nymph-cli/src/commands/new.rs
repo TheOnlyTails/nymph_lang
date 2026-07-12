@@ -1,4 +1,2 @@
 #[derive(clap::Args)]
-pub(crate) struct NewCommand {
-
-}
+pub(crate) struct NewCommand {}

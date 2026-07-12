@@ -13,6 +13,10 @@ nymph-sema = { workspace = true }
 nymph-diagnostics = { workspace = true }
 ecow = { workspace = true }
 clap = { workspace = true }
+serde = { workspace = true }
+semver = { workspace = true }
+inquire = "0.9.4"
+owo-colors = "4.3.0"
 
 [lints.clippy]
 all = "warn"

@@ -1,4 +1,2 @@
 #[derive(clap::Args)]
-pub(crate) struct FormatCommand {
-
-}
+pub(crate) struct FormatCommand {}

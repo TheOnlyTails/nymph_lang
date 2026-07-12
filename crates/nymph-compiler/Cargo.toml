@@ -15,5 +15,6 @@ nymph-codegen = { workspace = true }
 nymph-diagnostics = { workspace = true }
 nymph-ast = { workspace = true }
 
+
 [lints.clippy]
 all = "warn"

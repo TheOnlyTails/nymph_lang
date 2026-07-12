@@ -49,7 +49,9 @@ pub fn error_code_derive(input: TokenStream) -> TokenStream {
 				Fields::Unnamed(..) => quote! { (..) },
 				Fields::Unit => quote! {},
 			};
-      let Ok(code) = format!("{leading_digit}{i:0>3}").parse::<u16>() else { return None };
+			let Ok(code) = format!("{leading_digit}{i:0>3}").parse::<u16>() else {
+				return None;
+			};
 			Some((quote! { #ident #fields }, code))
 		})
 		.unzip();
