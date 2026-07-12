@@ -66,8 +66,10 @@ impl Lowerer<'_> {
 		use nymph_ast::ty::Type;
 
 		// First pass: collect inherent instance methods from top-level `impl <Named>`
-		// blocks, keyed by the target struct's name. Non-`Reference` targets and
-		// interface impls (`impl … for`) are handled in later slices.
+		// blocks, keyed by the target type name. Interface impls (`impl … for`) are a
+		// distinct `Declaration::ImplFor` and are not matched here. Non-`func` members
+		// (namespaced statics, nested impls, `impl mut`) are deferred and panic loudly
+		// rather than silently disappearing.
 		let mut methods_by_type: FxHashMap<EcoString, Vec<HirMethod>> = FxHashMap::default();
 		for decl in &module.members {
 			if let Declaration::Impl { type_, members, .. } = decl
@@ -75,8 +77,9 @@ impl Lowerer<'_> {
 			{
 				let entry = methods_by_type.entry(name.0.clone()).or_default();
 				for member in members {
-					if let ImplMember::Func { meta, body, .. } = &member.0 {
-						entry.push(self.lower_method(meta, body));
+					match &member.0 {
+						ImplMember::Func { meta, body, .. } => entry.push(self.lower_method(meta, body)),
+						other => panic!("slice-4a lowering does not yet handle impl member {other:?}"),
 					}
 				}
 			}
@@ -97,10 +100,16 @@ impl Lowerer<'_> {
 					// Methods from top-level impls, plus the struct's own inner `func`s.
 					let mut methods = methods_by_type.remove(&name.0).unwrap_or_default();
 					for member in members {
-						if let StructInnerMember::Member(inner) = &member.0
-							&& let ImplMember::Func { meta, body, .. } = &inner.0
-						{
-							methods.push(self.lower_method(meta, body));
+						match &member.0 {
+							StructInnerMember::Member(inner) => match &inner.0 {
+								ImplMember::Func { meta, body, .. } => methods.push(self.lower_method(meta, body)),
+								other => {
+									panic!("slice-4a lowering does not yet handle struct inner member {other:?}")
+								}
+							},
+							other => {
+								panic!("slice-4a lowering does not yet handle struct inner member {other:?}")
+							}
 						}
 					}
 					classes.push(HirClass {
@@ -122,6 +131,11 @@ impl Lowerer<'_> {
 				_ => {}
 			}
 		}
+		assert!(
+			methods_by_type.is_empty(),
+			"slice-4a lowering does not yet support inherent methods on non-struct types (e.g. enums); found impls for: {:?}",
+			methods_by_type.keys().collect::<Vec<_>>()
+		);
 		HirModule {
 			funcs,
 			classes,

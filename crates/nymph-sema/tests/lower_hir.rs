@@ -325,3 +325,19 @@ fn binding_union_panics_in_lowering() {
 		"#,
 	);
 }
+
+#[test]
+#[should_panic(expected = "non-struct types")]
+fn enum_inherent_methods_panic_in_lowering() {
+	// `impl Color { func ... }` on an enum type-checks, but lowering does not yet
+	// attach methods to enums; it must panic loudly instead of silently emitting
+	// JS that crashes at runtime. This pins that behavior.
+	lower(
+		r#"
+		enum Color { Red, Green }
+		impl Color {
+			func idx(): int = 0
+		}
+		"#,
+	);
+}
