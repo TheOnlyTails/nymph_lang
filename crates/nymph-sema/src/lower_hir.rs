@@ -13,10 +13,12 @@
 use ecow::EcoString;
 use nymph_ast::{
 	decl::{Declaration, FuncDeclaration, Module},
-	expr::{Expr, ExprKind, ListItem, MapEntry, Statement},
+	expr::{CallArg, Expr, ExprKind, ListItem, MapEntry, Statement},
 	ops::{AssignOperator, BinaryOperator, PrefixOperator},
 };
-use nymph_hir::hir::{BinOp, HirClass, HirExpr, HirFunc, HirModule, HirStmt, UnOp};
+use nymph_hir::hir::{
+	BinOp, HirClass, HirEnum, HirExpr, HirFunc, HirModule, HirStmt, HirVariant, UnOp,
+};
 use nymph_hir::ty::{Interner, TyKind};
 use rustc_hash::FxHashSet;
 
@@ -61,6 +63,7 @@ impl Lowerer<'_> {
 	fn lower_module(&self, module: &Module) -> HirModule {
 		let mut funcs = Vec::new();
 		let mut classes = Vec::new();
+		let mut enums = Vec::new();
 		for decl in &module.members {
 			match decl {
 				Declaration::Func { meta, body, .. } => funcs.push(self.lower_func(meta, body)),
@@ -68,13 +71,23 @@ impl Lowerer<'_> {
 					name: name.0.clone(),
 					fields: fields.iter().map(|f| f.0.name.0.clone()).collect(),
 				}),
+				Declaration::Enum { name, variants, .. } => enums.push(HirEnum {
+					name: name.0.clone(),
+					variants: variants
+						.iter()
+						.map(|v| HirVariant {
+							name: v.0.name.0.clone(),
+							fields: v.0.fields.iter().map(|f| f.0.name.0.clone()).collect(),
+						})
+						.collect(),
+				}),
 				_ => {}
 			}
 		}
 		HirModule {
 			funcs,
 			classes,
-			enums: Vec::new(),
+			enums,
 		}
 	}
 
@@ -94,12 +107,25 @@ impl Lowerer<'_> {
 			ExprKind::Float(v) => HirExpr::Num(v.0.into_inner()),
 			ExprKind::Boolean(b) => HirExpr::Bool(b.0),
 			ExprKind::Char(c) => HirExpr::Char(c.0),
-			ExprKind::Identifier(name) => HirExpr::Local(name.0.clone()),
+			ExprKind::Identifier(name) => match self.annotations.variant_of(expr.id) {
+				// A bare name resolving to a variant (`None`, or `Some` as a value) →
+				// the variant binding `Enum.Variant`.
+				Some(res) => HirExpr::VariantRef {
+					enum_name: res.enum_name.clone(),
+					variant: res.variant.clone(),
+				},
+				None => HirExpr::Local(name.0.clone()),
+			},
 			ExprKind::Grouped(inner) => self.lower_expr(inner),
 			ExprKind::Call { func, args, .. } => {
+				// A call the checker resolved to a variant is variant construction →
+				// `VariantNew` (bare `Some(…)` or qualified `Opt.Some(…)`).
+				if let Some(variant_new) = self.variant_new(expr.id, args) {
+					variant_new
+				}
 				// A call whose callee names a struct is construction → `New`. 2B supports
 				// labeled fields only; positional construction is deferred.
-				if let ExprKind::Identifier(name) = &func.kind
+				else if let ExprKind::Identifier(name) = &func.kind
 					&& self.struct_names.contains(&name.0)
 				{
 					let fields = args
@@ -123,10 +149,19 @@ impl Lowerer<'_> {
 					}
 				}
 			}
-			ExprKind::MemberAccess { parent, member, .. } => HirExpr::Field {
-				recv: Box::new(self.lower_expr(parent)),
-				name: member.0.clone(),
-			},
+			ExprKind::MemberAccess { parent, member, .. } => {
+				match self.annotations.variant_of(expr.id) {
+					// A qualified nullary reference `Opt.None` → the variant binding.
+					Some(res) => HirExpr::VariantRef {
+						enum_name: res.enum_name.clone(),
+						variant: res.variant.clone(),
+					},
+					None => HirExpr::Field {
+						recv: Box::new(self.lower_expr(parent)),
+						name: member.0.clone(),
+					},
+				}
+			}
 			ExprKind::Tuple(items) => HirExpr::Array(self.lower_items(items)),
 			ExprKind::List(items) => HirExpr::Array(self.lower_items(items)),
 			ExprKind::Map(entries) => HirExpr::MapLit(self.lower_map_entries(entries)),
@@ -193,6 +228,33 @@ impl Lowerer<'_> {
 			},
 			other => panic!("slice-2a lowering does not yet handle {other:?}"),
 		}
+	}
+
+	/// If the checker resolved node `id` to a variant, lower a construction call to
+	/// `VariantNew`. 2C supports labeled fields only (positional deferred). Returns
+	/// `None` when the node is not a variant construction (an ordinary call/struct).
+	fn variant_new(
+		&self,
+		id: nymph_ast::NodeId,
+		args: &[nymph_ast::Spanned<CallArg>],
+	) -> Option<HirExpr> {
+		let res = self.annotations.variant_of(id)?;
+		let fields = args
+			.iter()
+			.map(|a| {
+				let label = a
+					.0
+					.name
+					.as_ref()
+					.unwrap_or_else(|| panic!("slice-2c variant construction requires labeled fields"));
+				(label.0.clone(), self.lower_expr(&a.0.value))
+			})
+			.collect();
+		Some(HirExpr::VariantNew {
+			enum_name: res.enum_name.clone(),
+			variant: res.variant.clone(),
+			fields,
+		})
 	}
 
 	/// Lower a list/tuple literal's items. 2A does not yet support spread elements.

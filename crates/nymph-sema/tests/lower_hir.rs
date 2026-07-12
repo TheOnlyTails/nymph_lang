@@ -131,3 +131,56 @@ fn lowers_field_access() {
 	assert_eq!(name, "x");
 	assert!(matches!(recv.as_ref(), HirExpr::Local(n) if n == "p"));
 }
+
+#[test]
+fn lowers_enum_decl_and_variants() {
+	let hir = lower(
+		r#"
+		enum Opt { Some(value: int), None }
+		func s(): Opt = Some(value = 1)
+		func n(): Opt = None
+		func q(): Opt = Opt.Some(value = 2)
+		"#,
+	);
+	// The enum becomes an HirEnum with both variants (Some has a field, None nullary).
+	assert_eq!(hir.enums.len(), 1);
+	assert_eq!(hir.enums[0].name, "Opt");
+	let some = hir.enums[0]
+		.variants
+		.iter()
+		.find(|v| v.name == "Some")
+		.unwrap();
+	let none = hir.enums[0]
+		.variants
+		.iter()
+		.find(|v| v.name == "None")
+		.unwrap();
+	assert_eq!(some.fields, vec!["value".to_string()]);
+	assert!(none.fields.is_empty());
+
+	// Bare construction, bare nullary ref, and qualified construction all lower.
+	let body = |name: &str| {
+		hir
+			.funcs
+			.iter()
+			.find(|f| f.name == name)
+			.unwrap()
+			.body
+			.clone()
+	};
+	assert!(
+		matches!(body("s"), HirExpr::VariantNew { .. }),
+		"bare ctor → VariantNew, got {:?}",
+		body("s")
+	);
+	assert!(
+		matches!(body("n"), HirExpr::VariantRef { .. }),
+		"bare nullary → VariantRef, got {:?}",
+		body("n")
+	);
+	assert!(
+		matches!(body("q"), HirExpr::VariantNew { .. }),
+		"qualified ctor → VariantNew, got {:?}",
+		body("q")
+	);
+}
