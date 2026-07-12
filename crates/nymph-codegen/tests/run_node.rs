@@ -276,6 +276,51 @@ fn runs_match_as_subexpression() {
 }
 
 #[test]
+fn runs_match_list_patterns() {
+	// Exact-length (`#[]`) and spread (`#[a, ...rest]`) list patterns.
+	// The checker requires a `_` arm for list matches (it does not infer that empty +
+	// spread covers all lists); the wildcard is unreachable at runtime here.
+	let src = r#"
+		func head_or(xs: #[int]): int = match (xs) {
+			#[] -> -1,
+			#[a, ...rest] -> a,
+			_ -> 0,
+		}
+	"#;
+	assert_eq!(run(src, "head_or([])"), "-1"); // exact-length #[] arm
+	assert_eq!(run(src, "head_or([7, 8, 9])"), "7"); // spread arm binds head
+}
+
+#[test]
+fn runs_match_range_and_string() {
+	let n = r#"
+		func size(n: int): int = match (n) {
+			1..10 -> 1,
+			10..=100 -> 2,
+			_ -> 3,
+		}
+	"#;
+	assert_eq!(run(n, "size(5)"), "1");
+	assert_eq!(run(n, "size(100)"), "2");
+	assert_eq!(run(n, "size(500)"), "3");
+}
+
+#[test]
+fn runs_match_union() {
+	// A union of nullary variants tests either tag.
+	let src = r#"
+		enum Color { Red, Green, Blue }
+		func warm(c: Color): boolean = match (c) {
+			Red | Green -> true,
+			Blue -> false,
+		}
+	"#;
+	assert_eq!(run(src, "warm(Color.Red)"), "true");
+	assert_eq!(run(src, "warm(Color.Green)"), "true");
+	assert_eq!(run(src, "warm(Color.Blue)"), "false");
+}
+
+#[test]
 fn compile_reports_check_errors() {
 	// A type error surfaces as diagnostics, not JS.
 	let result = nymph_codegen::compile("func f(): int = true", "test");

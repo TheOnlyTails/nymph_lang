@@ -13,7 +13,7 @@ use oxc::{
 };
 
 use nymph_hir::hir::{
-	BinOp, HirClass, HirEnum, HirExpr, HirFunc, HirLit, HirModule, HirPat, HirStmt, UnOp,
+	BinOp, HirClass, HirEnum, HirExpr, HirFunc, HirLit, HirModule, HirPat, HirRange, HirStmt, UnOp,
 };
 
 /// A re-emittable reference to a sub-value of the scrutinee, used while compiling a
@@ -28,6 +28,14 @@ enum Subject {
 	Field(Box<Subject>, String),
 	/// `<base>[<index>]`.
 	Index(Box<Subject>, usize),
+	/// `<base>[<base>.length - <offset>]` — a list element counted from the end
+	/// (`offset` ≥ 1; the last element is offset 1).
+	IndexFromEnd(Box<Subject>, usize),
+	/// `<base>.get(<key>)` — a map value.
+	MapGet(Box<Subject>, HirLit),
+	/// `<base>.slice(<start>, <base>.length - <end_from_end>)` — a list rest slice
+	/// (`end_from_end == 0` ⇒ `<base>.slice(<start>)`).
+	Slice(Box<Subject>, usize, usize),
 }
 
 /// Intermediate representation for expression-valued code.
@@ -889,6 +897,59 @@ impl<'a> Emitter<'a> {
 						.alloc_computed_member_expression(SPAN, object, idx, false),
 				)
 			}
+			Subject::IndexFromEnd(base, offset) => {
+				// <base>[<base>.length - <offset>]
+				let arr = self.emit_subject(base);
+				let len = Expression::from(self.ast.member_expression_static(
+					SPAN,
+					self.emit_subject(base),
+					self.ast.identifier_name(SPAN, "length"),
+					false,
+				));
+				let off =
+					self
+						.ast
+						.expression_numeric_literal(SPAN, *offset as f64, None, NumberBase::Decimal);
+				let index = self
+					.ast
+					.expression_binary(SPAN, len, BinaryOperator::Subtraction, off);
+				Expression::ComputedMemberExpression(
+					self
+						.ast
+						.alloc_computed_member_expression(SPAN, arr, index, false),
+				)
+			}
+			Subject::MapGet(base, key) => {
+				let map = self.emit_subject(base);
+				self.member_call(map, "get", vec![self.emit_lit(key)])
+			}
+			Subject::Slice(base, start, end_from_end) => {
+				let arr = self.emit_subject(base);
+				let start_lit =
+					self
+						.ast
+						.expression_numeric_literal(SPAN, *start as f64, None, NumberBase::Decimal);
+				if *end_from_end == 0 {
+					self.member_call(arr, "slice", vec![start_lit])
+				} else {
+					let len = Expression::from(self.ast.member_expression_static(
+						SPAN,
+						self.emit_subject(base),
+						self.ast.identifier_name(SPAN, "length"),
+						false,
+					));
+					let end_lit = self.ast.expression_numeric_literal(
+						SPAN,
+						*end_from_end as f64,
+						None,
+						NumberBase::Decimal,
+					);
+					let end = self
+						.ast
+						.expression_binary(SPAN, len, BinaryOperator::Subtraction, end_lit);
+					self.member_call(arr, "slice", vec![start_lit, end])
+				}
+			}
 		}
 	}
 
@@ -1001,9 +1062,119 @@ impl<'a> Emitter<'a> {
 				}
 				(test, binds)
 			}
-			// List/map/range/union patterns are compiled in Slice 3B Task 4.
-			HirPat::List { .. } | HirPat::Map(_) | HirPat::Range(_) | HirPat::Or(..) => {
-				unreachable!("compiled in slice-3b Task 4")
+			// A list pattern: a length test (exact or `>=`), element bindings by index
+			// (prefix from the front, suffix from the end), and an optional rest slice.
+			HirPat::List {
+				prefix,
+				rest,
+				suffix,
+			} => {
+				let min_len = prefix.len() + suffix.len();
+				let length = Expression::from(self.ast.member_expression_static(
+					SPAN,
+					self.emit_subject(subj),
+					self.ast.identifier_name(SPAN, "length"),
+					false,
+				));
+				let n =
+					self
+						.ast
+						.expression_numeric_literal(SPAN, min_len as f64, None, NumberBase::Decimal);
+				let length_op = if rest.is_none() {
+					BinaryOperator::StrictEquality
+				} else {
+					BinaryOperator::GreaterEqualThan
+				};
+				let mut test = Some(self.ast.expression_binary(SPAN, length, length_op, n));
+				let mut binds = Vec::new();
+				for (i, sub) in prefix.iter().enumerate() {
+					let elem = Subject::Index(Box::new(subj.clone()), i);
+					let (t, mut b) = self.compile_pat(sub, &elem);
+					binds.append(&mut b);
+					test = self.and_test(test, t);
+				}
+				let suf_len = suffix.len();
+				for (j, sub) in suffix.iter().enumerate() {
+					// The j-th suffix element is `suf_len - j` from the end.
+					let elem = Subject::IndexFromEnd(Box::new(subj.clone()), suf_len - j);
+					let (t, mut b) = self.compile_pat(sub, &elem);
+					binds.append(&mut b);
+					test = self.and_test(test, t);
+				}
+				if let Some(Some(name)) = rest {
+					let slice = Subject::Slice(Box::new(subj.clone()), prefix.len(), suffix.len());
+					binds.push((name.to_string(), slice));
+				}
+				(test, binds)
+			}
+			// A map pattern: for each `key: vpat`, test `_s.has(key)` and match `vpat`
+			// against `_s.get(key)`.
+			HirPat::Map(entries) => {
+				let mut test: Option<Expression<'a>> = None;
+				let mut binds = Vec::new();
+				for (key, vpat) in entries {
+					let has = self.member_call(self.emit_subject(subj), "has", vec![self.emit_lit(key)]);
+					test = self.and_test(test, Some(has));
+					let val = Subject::MapGet(Box::new(subj.clone()), key.clone());
+					let (t, mut b) = self.compile_pat(vpat, &val);
+					binds.append(&mut b);
+					test = self.and_test(test, t);
+				}
+				(test, binds)
+			}
+			// A range pattern: bound comparisons against the subject.
+			HirPat::Range(range) => (Some(self.compile_range(range, subj)), Vec::new()),
+			// A union: matches if either side matches. 3B unions bind nothing.
+			HirPat::Or(a, b) => {
+				let (ta, ba) = self.compile_pat(a, subj);
+				let (tb, bb) = self.compile_pat(b, subj);
+				assert!(
+					ba.is_empty() && bb.is_empty(),
+					"slice-3b union patterns cannot bind"
+				);
+				// A `None` sub-test means that side is irrefutable ⇒ the whole `Or` is.
+				let test = match (ta, tb) {
+					(Some(a), Some(b)) => Some(self.ast.expression_logical(SPAN, a, LogicalOperator::Or, b)),
+					_ => None,
+				};
+				(test, Vec::new())
+			}
+		}
+	}
+
+	/// Emit a range pattern's bound test against the subject.
+	fn compile_range(&self, range: &HirRange, subj: &Subject) -> Expression<'a> {
+		// `<lit> <= <subj>`
+		let ge = |me: &Self, lit: &HirLit| {
+			me.ast.expression_binary(
+				SPAN,
+				me.emit_lit(lit),
+				BinaryOperator::LessEqualThan,
+				me.emit_subject(subj),
+			)
+		};
+		// `<subj> <op> <lit>`
+		let lt = |me: &Self, lit: &HirLit, op: BinaryOperator| {
+			me.ast
+				.expression_binary(SPAN, me.emit_subject(subj), op, me.emit_lit(lit))
+		};
+		match range {
+			HirRange::From(min) => ge(self, min),
+			HirRange::To(max) => lt(self, max, BinaryOperator::LessThan),
+			HirRange::ToInclusive(max) => lt(self, max, BinaryOperator::LessEqualThan),
+			HirRange::Exclusive { min, max } => {
+				let lo = ge(self, min);
+				let hi = lt(self, max, BinaryOperator::LessThan);
+				self
+					.ast
+					.expression_logical(SPAN, lo, LogicalOperator::And, hi)
+			}
+			HirRange::Inclusive { min, max } => {
+				let lo = ge(self, min);
+				let hi = lt(self, max, BinaryOperator::LessEqualThan);
+				self
+					.ast
+					.expression_logical(SPAN, lo, LogicalOperator::And, hi)
 			}
 		}
 	}

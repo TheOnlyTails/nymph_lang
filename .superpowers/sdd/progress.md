@@ -67,10 +67,11 @@ Scope: match with literal/binding/placeholder/variant patterns (nested), leverag
 Plan: docs/superpowers/plans/2026-07-11-nymph-codegen-slice3b-patterns-full.md
 Base (before Task 1): 8d1f6897
 Scope (user chose 3B-full): struct/tuple/list(+rest)/map/range/string/union patterns + guards. NO checker change (guards type-check; structural patterns need no resolution; struct-vs-variant Pattern::Struct distinguished by pattern_variant_of). Guards force a match-emission rewrite: if/else-if chain → labeled block + break (a matched-but-guard-failed arm must fall through). Deferred edges (panic loudly): map-rest, non-literal map keys, interpolated/escaped string patterns, binding unions. `is` expression still deferred.
-- Task 1: pending — HIR pattern variants + guard + Subject::Index
-- Task 2: pending — lower guards + new pattern forms
-- Task 3: pending — labeled-block emission (guards) + struct/tuple patterns
-- Task 4: pending — list/map/range/string/union patterns
+- Task 1: complete (HIR: HirArm.guard, HirLit::Str, HirPat Struct/Tuple/List/Map/Range/Or, HirRange; Subject::Index; commit db61ffbd).
+- Task 2: complete (lower guards + all new pattern forms; helpers lower_lit_pattern/lower_string_pattern/lower_range_pattern; struct-vs-variant via pattern_variant_of; commit 75f528d6). Deferred-edge panics: map-rest, non-literal map keys, escaped strings.
+- Task 3: complete (match emission rewritten if/else-if → labeled block + break for guard fall-through; match_arm helper; struct/tuple compile_pat with and_test; commit cc5b945a). All 3A tests still pass (behavior-preserving rewrite).
+- Task 4: complete (list/map/range/string/union compile_pat; Subject::IndexFromEnd/MapGet/Slice; compile_range; union binds-nothing guard; controller inline). Node: list #[]/spread+head, range 1..10/10..=100, union Red|Green. 23 codegen Node tests green, full workspace green, clippy/fmt clean.
+- SLICE 3B COMPLETE. match is fully general. Deferred (loud panics): map-rest, non-literal map keys, escaped/interpolated string patterns, binding unions. Checker requires `_` arm for list matches (doesn't infer empty+spread coverage). PENDING: independent review.
 - Review (Slice 3A): independent subagent review (opus). Verdict "with fixes"; NO Critical. Core engine verified sound (exhaustiveness backs testless-last-arm; nested/optional-chaining/binding/char all correct). Fixes applied in 0f0e7ef0: should_panic test pinning guard-in-lowering panic; Node tests for nested variant (Wrap(i=A(n))) + match-as-subexpression (IIFE path); stale exhaustiveness doc comment + _s/_r naming drift fixed. Accepted as loud deferrals (not silent miscompiles, consistent with codebase): guards + string/range/tuple/list/map/union patterns panic in lowering. Binding-with-subpattern (name=pat) doesn't parse in match arms → that HirPat::Binding sub branch unreachable from match (harmless). Noted pre-existing (not fixed, affects if/while too): gensym _tN temps not reserved vs user identifiers. SLICE 3A REVIEWED + FIXED.
 
 ---
