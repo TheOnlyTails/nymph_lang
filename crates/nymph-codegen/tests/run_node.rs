@@ -188,6 +188,35 @@ fn runs_enum_variant_tag_distinct() {
 }
 
 #[test]
+fn runs_match_variant_binding() {
+	// `match` over an enum, binding a field variant's payload; nullary falls through.
+	let src = r#"
+		enum Opt { Some(value: int), None }
+		func unwrap_or(o: Opt): int = match (o) {
+			Some(value) -> value,
+			None -> 0,
+		}
+	"#;
+	assert_eq!(run(src, "unwrap_or(Opt.Some({ value: 42 }))"), "42");
+	assert_eq!(run(src, "unwrap_or(Opt.None)"), "0");
+}
+
+#[test]
+fn runs_match_literal_and_wildcard() {
+	// Scalar literal arms plus a wildcard fallback.
+	let src = r#"
+		func classify(n: int): int = match (n) {
+			0 -> 100,
+			1 -> 200,
+			_ -> 300,
+		}
+	"#;
+	assert_eq!(run(src, "classify(0)"), "100");
+	assert_eq!(run(src, "classify(1)"), "200");
+	assert_eq!(run(src, "classify(9)"), "300");
+}
+
+#[test]
 fn compile_reports_check_errors() {
 	// A type error surfaces as diagnostics, not JS.
 	let result = nymph_codegen::compile("func f(): int = true", "test");

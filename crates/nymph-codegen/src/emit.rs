@@ -12,7 +12,21 @@ use oxc::{
 	span::SPAN,
 };
 
-use nymph_hir::hir::{BinOp, HirClass, HirEnum, HirExpr, HirFunc, HirModule, HirStmt, UnOp};
+use nymph_hir::hir::{
+	BinOp, HirClass, HirEnum, HirExpr, HirFunc, HirLit, HirModule, HirPat, HirStmt, UnOp,
+};
+
+/// A re-emittable reference to a sub-value of the scrutinee, used while compiling a
+/// pattern. oxc expression nodes are arena values that can't be cheaply cloned, so
+/// pattern bindings and tests carry a `Subject` (which re-emits a fresh expression
+/// each time) instead of a built `Expression`.
+#[derive(Clone)]
+enum Subject {
+	/// The scrutinee temporary, by name.
+	Temp(String),
+	/// `<base>.<field>`.
+	Field(Box<Subject>, String),
+}
 
 /// Intermediate representation for expression-valued code.
 ///
@@ -641,11 +655,10 @@ impl<'a> Emitter<'a> {
 			}
 			// Control-flow expressions in value position collapse to an expression
 			// (an IIFE when they carry leading statements).
-			HirExpr::Block { .. } | HirExpr::If { .. } | HirExpr::While { .. } => {
-				self.emit_value(expr).into_expression(self.ast)
-			}
-			// `match` is lowered in Slice 3A Task 3 but not emitted until Task 4.
-			HirExpr::Match { .. } => unreachable!("emitted in slice-3a Task 4"),
+			HirExpr::Block { .. }
+			| HirExpr::If { .. }
+			| HirExpr::While { .. }
+			| HirExpr::Match { .. } => self.emit_value(expr).into_expression(self.ast),
 		}
 	}
 
@@ -792,11 +805,173 @@ impl<'a> Emitter<'a> {
 					expr: self.ast.expression_identifier(SPAN, "undefined"),
 				}
 			}
+			HirExpr::Match { scrutinee, arms } => {
+				// const _s = <scrutinee>; let _r;
+				// if (<test0>) { <binds0>; _r = <body0> } else if … else { <bindsN>; _r = <bodyN> }
+				// → _r    (totality lets the last arm skip its test)
+				let s = self.ast.allocator.alloc_str(&self.gensym());
+				let r = self.ast.allocator.alloc_str(&self.gensym());
+				let mut stmts = self.ast.vec();
+				let scrutinee_expr = self.emit_expr(scrutinee);
+				stmts.push(self.const_decl(s, scrutinee_expr));
+				stmts.push(self.let_uninit(r));
+				let subj = Subject::Temp(s.to_string());
+				// Build the chain back-to-front so each `else` is the previously-built arm.
+				let mut chain: Option<Statement<'a>> = None;
+				for (i, arm) in arms.iter().enumerate().rev() {
+					let (test, binds) = self.compile_pat(&arm.pat, &subj);
+					let block = self.arm_block(r, &binds, &arm.body);
+					let is_last = i + 1 == arms.len();
+					chain = Some(if is_last && chain.is_none() {
+						block
+					} else {
+						let cond = test.unwrap_or_else(|| self.ast.expression_boolean_literal(SPAN, true));
+						self.ast.statement_if(SPAN, cond, block, chain.take())
+					});
+				}
+				if let Some(chain) = chain {
+					stmts.push(chain);
+				}
+				JsValue {
+					stmts,
+					expr: self.ast.expression_identifier(SPAN, r),
+				}
+			}
 			other => JsValue {
 				stmts: self.ast.vec(),
 				expr: self.emit_expr(other),
 			},
 		}
+	}
+
+	/// Re-emit a subject reference (scrutinee temp or a field path) as a fresh
+	/// expression. Needed because tests and each binding require their own copy.
+	fn emit_subject(&self, s: &Subject) -> Expression<'a> {
+		match s {
+			Subject::Temp(name) => self
+				.ast
+				.expression_identifier(SPAN, self.ast.allocator.alloc_str(name)),
+			Subject::Field(base, field) => {
+				let object = self.emit_subject(base);
+				Expression::from(
+					self.ast.member_expression_static(
+						SPAN,
+						object,
+						self
+							.ast
+							.identifier_name(SPAN, self.ast.allocator.alloc_str(field)),
+						false,
+					),
+				)
+			}
+		}
+	}
+
+	/// A scalar pattern literal as a JS expression (for `=== <lit>` tests).
+	fn emit_lit(&self, lit: &HirLit) -> Expression<'a> {
+		match lit {
+			HirLit::Num(v) => self
+				.ast
+				.expression_numeric_literal(SPAN, *v, None, NumberBase::Decimal),
+			HirLit::Bool(b) => self.ast.expression_boolean_literal(SPAN, *b),
+			HirLit::Char(c) => {
+				let s = self.ast.allocator.alloc_str(&c.to_string());
+				self.ast.expression_string_literal(SPAN, s, None)
+			}
+		}
+	}
+
+	/// `<obj>[TAG]` (optional-chained when `optional`), reading the variant tag.
+	fn tag_read(&self, obj: Expression<'a>, optional: bool) -> Expression<'a> {
+		Expression::ComputedMemberExpression(self.ast.alloc_computed_member_expression(
+			SPAN,
+			obj,
+			self.ast.expression_identifier(SPAN, "TAG"),
+			optional,
+		))
+	}
+
+	/// Compile a pattern against a subject into a boolean test (`None` ⇒ always true)
+	/// and a sequence of `(name, subject)` bindings.
+	fn compile_pat(
+		&self,
+		pat: &HirPat,
+		subj: &Subject,
+	) -> (Option<Expression<'a>>, Vec<(String, Subject)>) {
+		match pat {
+			HirPat::Wildcard => (None, Vec::new()),
+			HirPat::Binding { name, sub } => {
+				let mut binds = vec![(name.to_string(), subj.clone())];
+				let test = match sub {
+					None => None,
+					Some(sub) => {
+						let (t, mut b) = self.compile_pat(sub, subj);
+						binds.append(&mut b);
+						t
+					}
+				};
+				(test, binds)
+			}
+			HirPat::Lit(lit) => {
+				let subject = self.emit_subject(subj);
+				let value = self.emit_lit(lit);
+				let test = self
+					.ast
+					.expression_binary(SPAN, subject, BinaryOperator::StrictEquality, value);
+				(Some(test), Vec::new())
+			}
+			HirPat::Variant {
+				enum_name,
+				variant,
+				fields,
+			} => {
+				// <subject>?.[TAG] === <enum>.<variant>[TAG]
+				let subject_tag = self.tag_read(self.emit_subject(subj), true);
+				let variant_tag = self.tag_read(self.variant_member(enum_name, variant), false);
+				let mut test = self.ast.expression_binary(
+					SPAN,
+					subject_tag,
+					BinaryOperator::StrictEquality,
+					variant_tag,
+				);
+				let mut binds = Vec::new();
+				for (field, sub) in fields {
+					let field_subj = Subject::Field(Box::new(subj.clone()), field.to_string());
+					let (t, mut b) = self.compile_pat(sub, &field_subj);
+					binds.append(&mut b);
+					if let Some(t) = t {
+						test = self
+							.ast
+							.expression_logical(SPAN, test, LogicalOperator::And, t);
+					}
+				}
+				(Some(test), binds)
+			}
+		}
+	}
+
+	/// `{ const <name> = <subject>; …; <result> = <body>; }` — an arm's body block.
+	fn arm_block(
+		&self,
+		result: &'a str,
+		binds: &[(String, Subject)],
+		body: &HirExpr,
+	) -> Statement<'a> {
+		let mut stmts = self.ast.vec();
+		for (name, subj) in binds {
+			let init = self.emit_subject(subj);
+			stmts.push(self.const_decl(name, init));
+		}
+		let val = self.emit_value(body);
+		stmts.extend(val.stmts);
+		let assign = self.ast.expression_assignment(
+			SPAN,
+			AssignmentOperator::Assign,
+			self.assign_target(result),
+			val.expr,
+		);
+		stmts.push(self.ast.statement_expression(SPAN, assign));
+		self.ast.statement_block(SPAN, stmts)
 	}
 
 	fn emit_binary(&self, op: BinOp, left: Expression<'a>, right: Expression<'a>) -> Expression<'a> {

@@ -57,10 +57,11 @@ Scope (user chose full bare+qualified via checker recording): enums → TAG=Symb
 Plan: docs/superpowers/plans/2026-07-11-nymph-codegen-slice3a-matching.md
 Base (before Task 1): c6a27fa1
 Scope: match with literal/binding/placeholder/variant patterns (nested), leveraging the 2C Symbol-tag ABI. Variant-pattern resolution recorded span-keyed (patterns have no NodeId). Deferred to 3B: guards, tuple/list/map/struct patterns, range/string/union, standalone `is`.
-- Task 1: pending — HIR match/arm/pattern nodes
-- Task 2: pending — checker records variant-pattern resolution (span-keyed)
-- Task 3: pending — lower match + patterns
-- Task 4: pending — compile patterns + emit match, Node round-trip
+- Task 1: complete (HIR match/arm/pattern nodes: HirExpr::Match, HirArm, HirPat, HirLit; commit 35332a98).
+- Task 2: complete (checker records variant-pattern resolution span-keyed in Annotations.pattern_variants, at both nullary + struct-path sites; variant_resolution → pub(crate); commit 12daa882).
+- Task 3: complete (lower match → HirExpr::Match, lower_pattern for scalar/binding/placeholder/variant; guards+aggregates panic; commit 75486a33).
+- Task 4: complete (compile_pat → (test, bindings) with re-emittable Subject; emit match as const _s/let _r/if-chain built back-to-front, last arm testless; variant test = _s?.[TAG]===E.V[TAG]; controller inline). Node: unwrap_or(Some 42)→42, None→0, classify 100/200/300. 16 codegen Node tests green, full workspace green, clippy/fmt clean.
+- SLICE 3A COMPLETE. Deferred to 3B: guards, tuple/list/map/struct patterns, range/string/union, standalone `is`. PENDING: independent review.
 
 ---
 (Older entries below.)
