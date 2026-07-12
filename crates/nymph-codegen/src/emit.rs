@@ -806,9 +806,10 @@ impl<'a> Emitter<'a> {
 				}
 			}
 			HirExpr::Match { scrutinee, arms } => {
-				// const _s = <scrutinee>; let _r;
-				// if (<test0>) { <binds0>; _r = <body0> } else if … else { <bindsN>; _r = <bodyN> }
-				// → _r    (totality lets the last arm skip its test)
+				// const <s> = <scrutinee>; let <r>;
+				// if (<test0>) { <binds0>; <r> = <body0> } else if … else { <bindsN>; <r> = <bodyN> }
+				// → <r>    (totality lets the last arm skip its test)
+				// `s`/`r` are fresh gensym temps (`_tN`), not literally `_s`/`_r`.
 				let s = self.ast.allocator.alloc_str(&self.gensym());
 				let r = self.ast.allocator.alloc_str(&self.gensym());
 				let mut stmts = self.ast.vec();

@@ -5,8 +5,9 @@
 //! locals. `bind_pattern` (for `let`/parameters) and `check_pattern` (for `match`
 //! and `is`) differ only in the mutability the introduced bindings get.
 //!
-//! Milestone A does not yet check exhaustiveness or that union arms bind identical
-//! names — those are Milestone B (`exhaustive.rs`).
+//! Exhaustiveness of `match` is checked separately (`exhaustive.rs`), which is what
+//! lets codegen assume totality and drop the final arm's test. Checking that union
+//! arms bind identical names is still pending.
 
 use nymph_ast::{
 	Ident, Span, Spanned,

@@ -217,6 +217,38 @@ fn runs_match_literal_and_wildcard() {
 }
 
 #[test]
+fn runs_match_nested_variant() {
+	// A variant pattern nested inside another (`Wrap(i = A(n))`): the field subject
+	// path `_s.i` is itself matched against a variant, binding `n` from `_s.i.n`.
+	let src = r#"
+		enum Inner { A(n: int), B }
+		enum Outer { Wrap(i: Inner), Nil }
+		func f(o: Outer): int = match (o) {
+			Wrap(i = A(n)) -> n,
+			Wrap(i = B) -> 0,
+			Nil -> -1,
+		}
+	"#;
+	assert_eq!(run(src, "f(Outer.Wrap({ i: Inner.A({ n: 5 }) }))"), "5");
+	assert_eq!(run(src, "f(Outer.Wrap({ i: Inner.B }))"), "0");
+	assert_eq!(run(src, "f(Outer.Nil)"), "-1");
+}
+
+#[test]
+fn runs_match_as_subexpression() {
+	// `match` in value position (an operand of `+`) collapses to an IIFE.
+	let src = r#"
+		enum Opt { Some(value: int), None }
+		func f(o: Opt): int = 1 + match (o) {
+			Some(value) -> value,
+			None -> 0,
+		}
+	"#;
+	assert_eq!(run(src, "f(Opt.Some({ value: 41 }))"), "42");
+	assert_eq!(run(src, "f(Opt.None)"), "1");
+}
+
+#[test]
 fn compile_reports_check_errors() {
 	// A type error surfaces as diagnostics, not JS.
 	let result = nymph_codegen::compile("func f(): int = true", "test");

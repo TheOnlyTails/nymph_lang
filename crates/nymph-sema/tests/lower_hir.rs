@@ -230,3 +230,19 @@ fn lowers_match_over_enum() {
 		matches!(&arms[1].pat, HirPat::Variant { variant, fields, .. } if variant == "None" && fields.is_empty())
 	);
 }
+
+#[test]
+#[should_panic(expected = "does not yet handle guards")]
+fn match_guard_panics_in_lowering() {
+	// Guards type-check (sema accepts them and treats guarded arms as fall-through),
+	// but are deferred to 3B. Lowering panics loudly rather than silently
+	// miscompiling — this test pins that behavior so a future regression is caught.
+	lower(
+		r#"
+		func f(n: int): int = match (n) {
+			x if x > 0 -> 1,
+			_ -> 0,
+		}
+		"#,
+	);
+}
