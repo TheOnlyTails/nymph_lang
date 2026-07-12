@@ -43,3 +43,12 @@ Design: structs → JS classes; construction detected via Lowerer struct-name pr
 - Task 3: complete (emit classes as `class N { constructor(fields){ Object.assign(this,fields) } }`, New→`new N({…})`, Field→`recv.name`; controller inline). Chose Object.assign over per-field assignment (simpler, order-free, no field defaults in 2B). runs_struct_construction_and_field→4, runs_struct_field_through_param→30 under Node. Full workspace green, codegen clippy/fmt clean.
 - SLICE 2B COMPLETE.
 - Review (Slice 2A+2B): subagent review blocked by session limit; completed inline as controller. No Critical/live bugs — codegen verified type-free; Map-vs-Index dispatch sound (zonked types, no alias TyKind, non-Map falls through to recv[i]); pre-pass mirrors checker's construction dispatch. Follow-up applied in b4f474c7 (sharpened pre-pass comment: real soundness argument + module-local-structs assumption for future imports). Known limitations by the established panic pattern: positional ctor args (type-valid, fails loudly), collection spreads, string-keyed maps. SLICE 2A+2B REVIEWED.
+
+## Slice 2C (Enums & the Symbol-tag Value ABI)
+Plan: docs/superpowers/plans/2026-07-11-nymph-codegen-slice2c-enums.md
+Base (before Task 1): d73eb0e5
+Scope (user chose full bare+qualified via checker recording): enums → TAG=Symbol.for("nymph.tag") + per-enum object of variant factories (fields) / frozen singletons (nullary); checker records (enum,variant) resolution per variant node; lowering emits VariantNew/VariantRef; equality.ts ~tag→[TAG]. Matching (Slice 3), Copy (no mutation path), positional/spread args deferred. NOTE: enum variant syntax uses braces `enum E { V(f: T), N }` (per check.rs), not parens.
+- Task 1: pending — HIR enum + VariantNew/VariantRef nodes
+- Task 2: pending — checker records variant resolution
+- Task 3: pending — lower enum decls + variant exprs
+- Task 4: pending — emit Symbol-tag ABI + equality.ts, Node round-trip
