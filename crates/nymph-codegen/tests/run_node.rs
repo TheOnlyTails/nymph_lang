@@ -374,6 +374,43 @@ fn runs_struct_method_with_args() {
 }
 
 #[test]
+fn runs_struct_method_with_if_control_flow() {
+	// A method body uses `if`/`else` as a value, branching on `this` field access.
+	let src = r#"
+		struct Point(x: int, y: int)
+		impl Point {
+			func biggest(): int = if (this.x > this.y) this.x else this.y
+		}
+		func main(): int = Point(x = 3, y = 9).biggest()
+	"#;
+	assert_eq!(run(src, "main()"), "9");
+}
+
+#[test]
+fn runs_struct_method_calls_sibling_method() {
+	// A method calls another method on the same struct via `this`.
+	let src = r#"
+		struct Counter(n: int)
+		impl Counter {
+			func base(): int = this.n
+			func doubled(): int = this.base() + this.base()
+		}
+	"#;
+	assert_eq!(run(src, "new Counter({ n: 21 }).doubled()"), "42");
+}
+
+#[test]
+fn runs_struct_inner_func() {
+	// A method declared inside the struct body itself (not a top-level `impl` block).
+	let src = r#"
+		struct Point(x: int, y: int) {
+			func sum(): int = this.x + this.y
+		}
+	"#;
+	assert_eq!(run(src, "new Point({ x: 10, y: 5 }).sum()"), "15");
+}
+
+#[test]
 fn compile_reports_check_errors() {
 	// A type error surfaces as diagnostics, not JS.
 	let result = nymph_codegen::compile("func f(): int = true", "test");
