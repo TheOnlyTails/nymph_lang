@@ -1,0 +1,19 @@
+[package]
+name = "nymph-compiler"
+description = "The Nymph compiler pipeline: the top-level API for parsing, checking, and compiling Nymph source to JavaScript."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nymph-syntax = { workspace = true }
+nymph-sema = { workspace = true }
+nymph-codegen = { workspace = true }
+nymph-diagnostics = { workspace = true }
+nymph-ast = { workspace = true }
+
+[lints.clippy]
+all = "warn"

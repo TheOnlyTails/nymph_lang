@@ -506,6 +506,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nymph-compiler"
+version = "0.1.0"
+dependencies = [
+ "nymph-ast",
+ "nymph-codegen",
+ "nymph-diagnostics",
+ "nymph-sema",
+ "nymph-syntax",
+]
+
+[[package]]
 name = "nymph-diagnostics"
 version = "0.1.0"
 dependencies = [
