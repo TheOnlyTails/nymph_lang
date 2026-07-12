@@ -333,10 +333,18 @@ impl Lowerer<'_> {
 				HirPat::Map(lowered)
 			}
 			Pattern::Range(kind) => HirPat::Range(lower_range_pattern(kind)),
-			Pattern::Union(a, b) => HirPat::Or(
-				Box::new(self.lower_pattern(a)),
-				Box::new(self.lower_pattern(b)),
-			),
+			Pattern::Union(a, b) => {
+				// A union whose sides bind would need cross-branch consistent-name analysis
+				// (which the checker doesn't yet do); 3B rejects it here rather than in
+				// codegen so the failure is a clear lowering panic like every other deferral.
+				let a = self.lower_pattern(a);
+				let b = self.lower_pattern(b);
+				assert!(
+					!pat_binds(&a) && !pat_binds(&b),
+					"slice-3b lowering does not yet handle union patterns that bind"
+				);
+				HirPat::Or(Box::new(a), Box::new(b))
+			}
 		}
 	}
 
@@ -474,6 +482,26 @@ fn lower_lit_pattern(pat: &nymph_ast::Spanned<nymph_ast::expr::Pattern>) -> HirL
 		Pattern::String(parts) => HirLit::Str(lower_string_pattern(parts)),
 		Pattern::Grouped(inner) => lower_lit_pattern(inner),
 		other => panic!("slice-3b expects a literal pattern (map key / range bound), got {other:?}"),
+	}
+}
+
+/// Whether a lowered pattern introduces any binding — used to reject binding
+/// unions, which 3B does not support.
+fn pat_binds(pat: &HirPat) -> bool {
+	match pat {
+		HirPat::Wildcard | HirPat::Lit(_) | HirPat::Range(_) => false,
+		HirPat::Binding { .. } => true,
+		HirPat::Variant { fields, .. } | HirPat::Struct { fields } => {
+			fields.iter().any(|(_, p)| pat_binds(p))
+		}
+		HirPat::Tuple(ps) => ps.iter().any(pat_binds),
+		HirPat::List {
+			prefix,
+			rest,
+			suffix,
+		} => matches!(rest, Some(Some(_))) || prefix.iter().chain(suffix).any(pat_binds),
+		HirPat::Map(entries) => entries.iter().any(|(_, p)| pat_binds(p)),
+		HirPat::Or(a, b) => pat_binds(a) || pat_binds(b),
 	}
 }
 

@@ -285,3 +285,18 @@ fn lowers_full_patterns_and_guards() {
 	assert!(matches!(&arm0("str_match")[0].pat, HirPat::Lit(HirLit::Str(s)) if s == "hi"));
 	assert!(matches!(&arm0("uni")[0].pat, HirPat::Or(..)));
 }
+
+#[test]
+#[should_panic(expected = "union patterns that bind")]
+fn binding_union_panics_in_lowering() {
+	// A union whose side binds (`A(n) | B`) type-checks but is deferred; lowering
+	// panics loudly rather than silently miscompiling. This pins that behavior.
+	lower(
+		r#"
+		enum E { A(n: int), B }
+		func f(e: E): int = match (e) {
+			A(n) | B -> 0,
+		}
+		"#,
+	);
+}

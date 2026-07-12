@@ -292,6 +292,33 @@ fn runs_match_list_patterns() {
 }
 
 #[test]
+fn runs_match_list_rest_with_suffix() {
+	// `#[a, ...mid, b]` — a bound head, a rest slice, and a bound tail-from-the-end.
+	let src = r#"
+		func ends(xs: #[int]): int = match (xs) {
+			#[a, ...mid, b] -> a + b,
+			_ -> -1,
+		}
+	"#;
+	assert_eq!(run(src, "ends([10, 2, 3, 20])"), "30"); // a=10, b=20 (mid=[2,3])
+	assert_eq!(run(src, "ends([1, 9])"), "10"); // a=1, b=9, mid=[]
+	assert_eq!(run(src, "ends([5])"), "-1"); // length 1 < 2 → wildcard
+}
+
+#[test]
+fn runs_match_map_pattern() {
+	// A map pattern tests `.has(key)` and binds `.get(key)`.
+	let src = r#"
+		func lookup(m: #{int: int}): int = match (m) {
+			#{ 1: v } -> v,
+			_ -> -1,
+		}
+	"#;
+	assert_eq!(run(src, "lookup(new Map([[1, 42]]))"), "42");
+	assert_eq!(run(src, "lookup(new Map([[2, 9]]))"), "-1");
+}
+
+#[test]
 fn runs_match_range_and_string() {
 	let n = r#"
 		func size(n: int): int = match (n) {

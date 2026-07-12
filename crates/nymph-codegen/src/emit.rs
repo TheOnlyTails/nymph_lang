@@ -1070,22 +1070,29 @@ impl<'a> Emitter<'a> {
 				suffix,
 			} => {
 				let min_len = prefix.len() + suffix.len();
-				let length = Expression::from(self.ast.member_expression_static(
-					SPAN,
-					self.emit_subject(subj),
-					self.ast.identifier_name(SPAN, "length"),
-					false,
-				));
-				let n =
-					self
-						.ast
-						.expression_numeric_literal(SPAN, min_len as f64, None, NumberBase::Decimal);
-				let length_op = if rest.is_none() {
-					BinaryOperator::StrictEquality
+				// A rest capturing everything (`#[...rest]`, no fixed elements) matches any
+				// list, so it needs no length test. Otherwise: exact `===` (no rest) or
+				// `>= min_len` (with rest).
+				let mut test = if rest.is_some() && min_len == 0 {
+					None
 				} else {
-					BinaryOperator::GreaterEqualThan
+					let length = Expression::from(self.ast.member_expression_static(
+						SPAN,
+						self.emit_subject(subj),
+						self.ast.identifier_name(SPAN, "length"),
+						false,
+					));
+					let n =
+						self
+							.ast
+							.expression_numeric_literal(SPAN, min_len as f64, None, NumberBase::Decimal);
+					let length_op = if rest.is_none() {
+						BinaryOperator::StrictEquality
+					} else {
+						BinaryOperator::GreaterEqualThan
+					};
+					Some(self.ast.expression_binary(SPAN, length, length_op, n))
 				};
-				let mut test = Some(self.ast.expression_binary(SPAN, length, length_op, n));
 				let mut binds = Vec::new();
 				for (i, sub) in prefix.iter().enumerate() {
 					let elem = Subject::Index(Box::new(subj.clone()), i);
@@ -1128,9 +1135,10 @@ impl<'a> Emitter<'a> {
 			HirPat::Or(a, b) => {
 				let (ta, ba) = self.compile_pat(a, subj);
 				let (tb, bb) = self.compile_pat(b, subj);
-				assert!(
+				// Lowering already rejects binding unions; this is a defensive check.
+				debug_assert!(
 					ba.is_empty() && bb.is_empty(),
-					"slice-3b union patterns cannot bind"
+					"union patterns cannot bind (should be rejected in lowering)"
 				);
 				// A `None` sub-test means that side is irrefutable ⇒ the whole `Or` is.
 				let test = match (ta, tb) {
