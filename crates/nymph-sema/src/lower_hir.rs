@@ -27,8 +27,13 @@ use crate::{Annotations, Checked};
 pub fn lower_hir(module: &Module, checked: &Checked) -> HirModule {
 	// A call whose callee names a struct is construction, not an ordinary call.
 	// Collect the module's struct names up front so `lower_expr` can dispatch on
-	// them. Sound because lowering runs only on error-free programs, where a struct
-	// and a function cannot share a name.
+	// them. This mirrors the checker's own dispatch: `infer_call` treats *any*
+	// identifier resolving to a struct def as construction, before trying variant/
+	// method/function resolution — so lowering stays consistent with checking.
+	// ASSUMPTION: every constructible struct is declared in this module. That holds
+	// for the current single-module pipeline; when cross-module imports are wired,
+	// this set must also include imported struct names (otherwise an imported
+	// `Point(…)` would lower to a plain call instead of `New`).
 	let struct_names = module
 		.members
 		.iter()
