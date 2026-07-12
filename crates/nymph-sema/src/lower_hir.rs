@@ -71,6 +71,7 @@ impl Lowerer<'_> {
 				Declaration::Struct { name, fields, .. } => classes.push(HirClass {
 					name: name.0.clone(),
 					fields: fields.iter().map(|f| f.0.name.0.clone()).collect(),
+					methods: Vec::new(),
 				}),
 				Declaration::Enum { name, variants, .. } => enums.push(HirEnum {
 					name: name.0.clone(),

@@ -518,6 +518,8 @@ impl<'a> Emitter<'a> {
 			HirExpr::Local(name) => self
 				.ast
 				.expression_identifier(SPAN, self.ast.allocator.alloc_str(name)),
+			// The `this` receiver — emitted in Slice 4A Task 3.
+			HirExpr::This => unreachable!("emitted in slice-4a Task 3"),
 			HirExpr::Binary { op, lhs, rhs } => {
 				let left = self.emit_expr(lhs);
 				let right = self.emit_expr(rhs);

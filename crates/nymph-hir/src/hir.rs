@@ -15,10 +15,21 @@ pub struct HirModule {
 
 /// A `struct` declaration → a JS class. Fields are stored in declaration order;
 /// the emitted constructor takes one object argument and assigns each field.
+/// Inherent instance methods are emitted into the class body.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HirClass {
 	pub name: EcoString,
 	pub fields: Vec<EcoString>,
+	pub methods: Vec<HirMethod>,
+}
+
+/// An inherent instance method → a JS class method. `this` in the body refers to
+/// the receiver instance.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirMethod {
+	pub name: EcoString,
+	pub params: Vec<EcoString>,
+	pub body: HirExpr,
 }
 
 /// An `enum` declaration → the Symbol-tag ABI object. Each variant becomes a
@@ -64,6 +75,8 @@ pub enum HirExpr {
 	Char(char),
 	/// An identifier or parameter reference.
 	Local(EcoString),
+	/// The method receiver — emits as the JS `this` keyword.
+	This,
 	Call {
 		callee: Box<HirExpr>,
 		args: Vec<HirExpr>,
