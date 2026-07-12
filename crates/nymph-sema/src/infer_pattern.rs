@@ -155,6 +155,9 @@ impl Checker<'_> {
 					.collect::<Vec<_>>()
 			}
 			Some(PatternTarget::Variant(enum_def, variant)) => {
+				// Record the variant this pattern resolved to (span-keyed) for lowering.
+				let res = self.variant_resolution(enum_def, variant);
+				self.annotations.record_pattern_variant(span, res);
 				let (adt, subst) = self.instantiate_enum(enum_def);
 				self.unify(ty, adt, span);
 				let vsig = self.sigs.enums[&enum_def].variants[variant].clone();
@@ -204,6 +207,9 @@ impl Checker<'_> {
 					.fields
 					.is_empty()
 				{
+					// A nullary variant pattern (`None`): record its resolution for lowering.
+					let res = self.variant_resolution(enum_def, variant);
+					self.annotations.record_pattern_variant(span, res);
 					let (adt, _) = self.instantiate_enum(enum_def);
 					Some(adt)
 				} else {

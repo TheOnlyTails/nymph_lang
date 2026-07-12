@@ -423,7 +423,7 @@ impl<'m> Checker<'m> {
 	}
 
 	/// Build the `(enum, variant)` resolution recorded for lowering.
-	fn variant_resolution(
+	pub(crate) fn variant_resolution(
 		&self,
 		enum_def: DefId,
 		variant: usize,

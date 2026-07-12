@@ -123,6 +123,38 @@ fn records_type_of_collection_literals() {
 }
 
 #[test]
+fn records_variant_pattern_resolution() {
+	let module = parse(
+		r#"
+		enum Opt { Some(value: int), None }
+		func f(o: Opt): int = match (o) {
+			Some(value) -> value,
+			None -> 0,
+		}
+		"#,
+	);
+	let checked = check_module(&module);
+	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+
+	// Reach the match arms and assert each variant pattern was recorded by its span.
+	let nymph_ast::decl::Declaration::Func { body, .. } = &module.members[1] else {
+		panic!("expected a func declaration");
+	};
+	let ExprKind::Match { arms, .. } = &body.kind else {
+		panic!("expected a match, got {:?}", body.kind);
+	};
+	let mut found = 0;
+	for arm in arms {
+		if let Some(res) = checked.annotations.pattern_variant_of(arm.pattern.1) {
+			assert_eq!(res.enum_name, "Opt");
+			assert!(res.variant == "Some" || res.variant == "None");
+			found += 1;
+		}
+	}
+	assert_eq!(found, 2, "both Some(value) and None patterns recorded");
+}
+
+#[test]
 fn records_variant_resolution() {
 	// Bare construction, bare nullary reference, and qualified construction each
 	// record their resolved (enum, variant) so lowering can emit the tag ABI.

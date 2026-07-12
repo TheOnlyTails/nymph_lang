@@ -3,7 +3,7 @@
 //! its resolved type and (for desugared operators/casts/calls) which impl was
 //! selected and how it must be dispatched in codegen.
 
-use nymph_ast::NodeId;
+use nymph_ast::{NodeId, Span};
 use nymph_diagnostics::Diagnostic;
 use rustc_hash::FxHashMap;
 
@@ -51,6 +51,9 @@ pub struct VariantResolution {
 pub struct Annotations {
 	infos: FxHashMap<NodeId, ExprInfo>,
 	variants: FxHashMap<NodeId, VariantResolution>,
+	/// Variant *patterns*, keyed by span — patterns carry no `NodeId`, but each
+	/// written pattern has a unique source span.
+	pattern_variants: FxHashMap<Span, VariantResolution>,
 }
 
 impl Annotations {
@@ -84,6 +87,17 @@ impl Annotations {
 	/// The variant a construction/reference node resolved to, if any.
 	pub fn variant_of(&self, id: NodeId) -> Option<&VariantResolution> {
 		self.variants.get(&id)
+	}
+
+	/// Record which `(enum, variant)` a variant *pattern* resolved to, keyed by the
+	/// pattern's source span.
+	pub(crate) fn record_pattern_variant(&mut self, span: Span, res: VariantResolution) {
+		self.pattern_variants.insert(span, res);
+	}
+
+	/// The variant a pattern (by span) resolved to, if any.
+	pub fn pattern_variant_of(&self, span: Span) -> Option<&VariantResolution> {
+		self.pattern_variants.get(&span)
 	}
 
 	/// Attach a `Resolution` to a node, preserving its already-recorded type. Used
