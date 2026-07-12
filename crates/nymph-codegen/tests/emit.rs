@@ -10,6 +10,7 @@ fn emits_a_function_returning_a_number() {
 			body: HirExpr::Num(42.0),
 		}],
 		classes: vec![],
+		enums: vec![],
 	};
 	let js = emit(&module);
 	// A single-expression body becomes an arrow-style function returning the value.
@@ -35,6 +36,7 @@ fn emits_arithmetic_and_params() {
 			},
 		}],
 		classes: vec![],
+		enums: vec![],
 	};
 	let js = emit(&module);
 	assert!(js.contains("function add(a, b)"), "{js}");
@@ -54,6 +56,7 @@ fn emits_call_and_string() {
 			},
 		}],
 		classes: vec![],
+		enums: vec![],
 	};
 	let js = emit(&module);
 	assert!(

@@ -366,6 +366,10 @@ impl<'a> Emitter<'a> {
 					),
 				)
 			}
+			// Enum variant construction/reference: lowered in Slice 2C Task 3, emitted in Task 4.
+			HirExpr::VariantNew { .. } | HirExpr::VariantRef { .. } => {
+				unreachable!("emitted in slice-2c Task 4")
+			}
 			// A map lookup → `recv.get(key)`.
 			HirExpr::MapGet { recv, key } => {
 				let object = self.emit_expr(recv);

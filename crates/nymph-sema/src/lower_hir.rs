@@ -71,7 +71,11 @@ impl Lowerer<'_> {
 				_ => {}
 			}
 		}
-		HirModule { funcs, classes }
+		HirModule {
+			funcs,
+			classes,
+			enums: Vec::new(),
+		}
 	}
 
 	fn lower_func(&self, meta: &FuncDeclaration, body: &Expr) -> HirFunc {

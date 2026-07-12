@@ -10,6 +10,7 @@ use ecow::EcoString;
 pub struct HirModule {
 	pub funcs: Vec<HirFunc>,
 	pub classes: Vec<HirClass>,
+	pub enums: Vec<HirEnum>,
 }
 
 /// A `struct` declaration → a JS class. Fields are stored in declaration order;
@@ -17,6 +18,21 @@ pub struct HirModule {
 #[derive(Clone, Debug, PartialEq)]
 pub struct HirClass {
 	pub name: EcoString,
+	pub fields: Vec<EcoString>,
+}
+
+/// An `enum` declaration → the Symbol-tag ABI object. Each variant becomes a
+/// factory (fields) or a frozen singleton (nullary).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirEnum {
+	pub name: EcoString,
+	pub variants: Vec<HirVariant>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirVariant {
+	pub name: EcoString,
+	/// Field names in declaration order; empty ⇒ nullary singleton variant.
 	pub fields: Vec<EcoString>,
 }
 
@@ -75,6 +91,17 @@ pub enum HirExpr {
 	Field {
 		recv: Box<HirExpr>,
 		name: EcoString,
+	},
+	/// Variant construction — emits as `<enum>.<variant>({ field: value, … })`.
+	VariantNew {
+		enum_name: EcoString,
+		variant: EcoString,
+		fields: Vec<(EcoString, HirExpr)>,
+	},
+	/// Nullary variant reference — emits as `<enum>.<variant>` (frozen singleton).
+	VariantRef {
+		enum_name: EcoString,
+		variant: EcoString,
 	},
 	Binary {
 		op: BinOp,
