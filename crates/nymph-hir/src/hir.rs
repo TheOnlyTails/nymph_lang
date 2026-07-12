@@ -142,6 +142,9 @@ pub enum HirExpr {
 #[derive(Clone, Debug, PartialEq)]
 pub struct HirArm {
 	pub pat: HirPat,
+	/// A `pattern if <cond>` guard — the arm matches only when this is truthy. A
+	/// matched-but-guard-failed arm falls through to the next arm.
+	pub guard: Option<HirExpr>,
 	pub body: HirExpr,
 }
 
@@ -165,6 +168,24 @@ pub enum HirPat {
 		variant: EcoString,
 		fields: Vec<(EcoString, HirPat)>,
 	},
+	/// A struct pattern — irrefutable (the nominal type guarantees the shape); binds
+	/// each named field (a field sub-pattern may still be refutable).
+	Struct { fields: Vec<(EcoString, HirPat)> },
+	/// A tuple pattern — irrefutable, binds each element by index.
+	Tuple(Vec<HirPat>),
+	/// A list pattern `#[<prefix>, ...rest, <suffix>]`. `rest` present ⇒ a spread
+	/// (with an optional binding) and a `length >=` test; absent ⇒ an exact-length test.
+	List {
+		prefix: Vec<HirPat>,
+		rest: Option<Option<EcoString>>,
+		suffix: Vec<HirPat>,
+	},
+	/// A map pattern — tests `.has(key)` and matches the value pattern against `.get(key)`.
+	Map(Vec<(HirLit, HirPat)>),
+	/// A range pattern over scalar bounds.
+	Range(HirRange),
+	/// `A | B` — matches if either side matches (3B: neither side binds).
+	Or(Box<HirPat>, Box<HirPat>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -172,6 +193,22 @@ pub enum HirLit {
 	Num(f64),
 	Bool(bool),
 	Char(char),
+	Str(EcoString),
+}
+
+/// A range pattern's bounds (scalar literals).
+#[derive(Clone, Debug, PartialEq)]
+pub enum HirRange {
+	/// `min..`
+	From(HirLit),
+	/// `..max`
+	To(HirLit),
+	/// `..=max`
+	ToInclusive(HirLit),
+	/// `min..max`
+	Exclusive { min: HirLit, max: HirLit },
+	/// `min..=max`
+	Inclusive { min: HirLit, max: HirLit },
 }
 
 /// Binary operators that map directly to a JS operator (primitive fast-path).

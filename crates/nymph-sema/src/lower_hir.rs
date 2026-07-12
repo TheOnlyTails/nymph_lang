@@ -237,6 +237,7 @@ impl Lowerer<'_> {
 						);
 						HirArm {
 							pat: self.lower_pattern(&arm.pattern),
+							guard: None,
 							body: self.lower_expr(&arm.body),
 						}
 					})

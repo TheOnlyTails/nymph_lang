@@ -26,6 +26,8 @@ enum Subject {
 	Temp(String),
 	/// `<base>.<field>`.
 	Field(Box<Subject>, String),
+	/// `<base>[<index>]`.
+	Index(Box<Subject>, usize),
 }
 
 /// Intermediate representation for expression-valued code.
@@ -865,6 +867,18 @@ impl<'a> Emitter<'a> {
 					),
 				)
 			}
+			Subject::Index(base, index) => {
+				let object = self.emit_subject(base);
+				let idx =
+					self
+						.ast
+						.expression_numeric_literal(SPAN, *index as f64, None, NumberBase::Decimal);
+				Expression::ComputedMemberExpression(
+					self
+						.ast
+						.alloc_computed_member_expression(SPAN, object, idx, false),
+				)
+			}
 		}
 	}
 
@@ -877,6 +891,10 @@ impl<'a> Emitter<'a> {
 			HirLit::Bool(b) => self.ast.expression_boolean_literal(SPAN, *b),
 			HirLit::Char(c) => {
 				let s = self.ast.allocator.alloc_str(&c.to_string());
+				self.ast.expression_string_literal(SPAN, s, None)
+			}
+			HirLit::Str(s) => {
+				let s = self.ast.allocator.alloc_str(s);
 				self.ast.expression_string_literal(SPAN, s, None)
 			}
 		}
@@ -948,6 +966,13 @@ impl<'a> Emitter<'a> {
 				}
 				(Some(test), binds)
 			}
+			// Aggregate/refutable pattern families are compiled in Slice 3B Tasks 3–4.
+			HirPat::Struct { .. }
+			| HirPat::Tuple(_)
+			| HirPat::List { .. }
+			| HirPat::Map(_)
+			| HirPat::Range(_)
+			| HirPat::Or(..) => unreachable!("compiled in slice-3b Task 3/4"),
 		}
 	}
 
