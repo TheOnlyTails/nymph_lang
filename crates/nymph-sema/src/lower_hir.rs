@@ -17,7 +17,8 @@ use nymph_ast::{
 	ops::{AssignOperator, BinaryOperator, PrefixOperator},
 };
 use nymph_hir::hir::{
-	BinOp, HirClass, HirEnum, HirExpr, HirFunc, HirModule, HirStmt, HirVariant, UnOp,
+	BinOp, HirArm, HirClass, HirEnum, HirExpr, HirFunc, HirLit, HirModule, HirPat, HirStmt,
+	HirVariant, UnOp,
 };
 use nymph_hir::ty::{Interner, TyKind};
 use rustc_hash::FxHashSet;
@@ -226,7 +227,89 @@ impl Lowerer<'_> {
 				cond: Box::new(self.lower_expr(condition)),
 				body: Box::new(self.lower_expr(body)),
 			},
+			ExprKind::Match { value, arms } => {
+				let arms = arms
+					.iter()
+					.map(|arm| {
+						assert!(
+							arm.guard.is_none(),
+							"slice-3a match lowering does not yet handle guards"
+						);
+						HirArm {
+							pat: self.lower_pattern(&arm.pattern),
+							body: self.lower_expr(&arm.body),
+						}
+					})
+					.collect();
+				HirExpr::Match {
+					scrutinee: Box::new(self.lower_expr(value)),
+					arms,
+				}
+			}
 			other => panic!("slice-2a lowering does not yet handle {other:?}"),
+		}
+	}
+
+	/// Lower an AST pattern into a `HirPat`. 3A supports scalar literals, bindings,
+	/// placeholders, and variant patterns (nullary + field-carrying, nested). Guards
+	/// and aggregate/range/string/union patterns are deferred to 3B.
+	fn lower_pattern(&self, pat: &nymph_ast::Spanned<nymph_ast::expr::Pattern>) -> HirPat {
+		use nymph_ast::expr::{Pattern, StructPatternField};
+		match &pat.0 {
+			Pattern::Placeholder => HirPat::Wildcard,
+			Pattern::Int(v) => HirPat::Lit(HirLit::Num(v.0 as f64)),
+			Pattern::UInt(v) => HirPat::Lit(HirLit::Num(v.0 as f64)),
+			Pattern::Float(v) => HirPat::Lit(HirLit::Num(v.0.into_inner())),
+			Pattern::Boolean(b) => HirPat::Lit(HirLit::Bool(b.0)),
+			Pattern::Char(c) => HirPat::Lit(HirLit::Char(c.0)),
+			Pattern::Grouped(inner) => self.lower_pattern(inner),
+			Pattern::Binding { name, inner } => {
+				// A bare name recorded as a variant is a nullary variant pattern; else a
+				// binding, optionally with a sub-pattern.
+				if let Some(res) = self.annotations.pattern_variant_of(pat.1) {
+					HirPat::Variant {
+						enum_name: res.enum_name.clone(),
+						variant: res.variant.clone(),
+						fields: Vec::new(),
+					}
+				} else {
+					let sub = match &inner.0 {
+						Pattern::Placeholder => None,
+						_ => Some(Box::new(self.lower_pattern(inner))),
+					};
+					HirPat::Binding {
+						name: name.0.clone(),
+						sub,
+					}
+				}
+			}
+			Pattern::Struct { fields, .. } => {
+				let res = self.annotations.pattern_variant_of(pat.1).expect(
+					"slice-3a struct-path patterns must resolve to a variant (struct patterns deferred)",
+				);
+				let lowered = fields
+					.iter()
+					.filter_map(|f| match &f.0 {
+						StructPatternField::Value { name, value } => {
+							Some((name.0.clone(), self.lower_pattern(value)))
+						}
+						StructPatternField::Named(name) => Some((
+							name.0.clone(),
+							HirPat::Binding {
+								name: name.0.clone(),
+								sub: None,
+							},
+						)),
+						StructPatternField::Rest => None,
+					})
+					.collect();
+				HirPat::Variant {
+					enum_name: res.enum_name.clone(),
+					variant: res.variant.clone(),
+					fields: lowered,
+				}
+			}
+			other => panic!("slice-3a lowering does not yet handle pattern {other:?}"),
 		}
 	}
 

@@ -190,3 +190,43 @@ fn lowers_enum_decl_and_variants() {
 		body("qn")
 	);
 }
+
+#[test]
+fn lowers_match_over_enum() {
+	use nymph_hir::hir::{HirArm, HirPat};
+	let hir = lower(
+		r#"
+		enum Opt { Some(value: int), None }
+		func unwrap_or(o: Opt): int = match (o) {
+			Some(value) -> value,
+			None -> 0,
+		}
+		"#,
+	);
+	let f = hir.funcs.iter().find(|f| f.name == "unwrap_or").unwrap();
+	let HirExpr::Match { arms, .. } = &f.body else {
+		panic!("expected Match, got {:?}", f.body);
+	};
+	assert_eq!(arms.len(), 2);
+	// First arm: Some(value) → a Variant pattern binding `value`.
+	let HirArm {
+		pat: HirPat::Variant {
+			enum_name,
+			variant,
+			fields,
+		},
+		..
+	} = &arms[0]
+	else {
+		panic!("expected Variant pattern, got {:?}", arms[0].pat);
+	};
+	assert_eq!(enum_name, "Opt");
+	assert_eq!(variant, "Some");
+	assert_eq!(fields.len(), 1);
+	assert_eq!(fields[0].0, "value");
+	assert!(matches!(&fields[0].1, HirPat::Binding { name, sub: None } if name == "value"));
+	// Second arm: None → a nullary Variant pattern.
+	assert!(
+		matches!(&arms[1].pat, HirPat::Variant { variant, fields, .. } if variant == "None" && fields.is_empty())
+	);
+}
