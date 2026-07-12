@@ -17,11 +17,13 @@ use nymph_ast::{
 };
 use rustc_hash::FxHashMap;
 
+use crate::annotate::{DispatchKind, Resolution};
 use crate::check::Checker;
 use crate::def::DefKind;
 use crate::errors::TypeError;
 use crate::ids::{DefId, ParamIdx};
 use crate::lower::build_param_scope;
+use crate::solve::MethodSource;
 use crate::ty::{GenericArgs, Ty, TyKind};
 
 impl<'m> Checker<'m> {
@@ -130,6 +132,20 @@ impl<'m> Checker<'m> {
 
 	// ── infer mode ───────────────────────────────────────────────────────────
 	pub(crate) fn infer(&mut self, expr: &Expr) -> Ty {
+		// `BinaryOp` is special-cased: `infer_binary` also decides the operator's
+		// `Resolution` (Slice 4B), which `record_resolution` requires the node to
+		// already be `record`'d before attaching — so the type is recorded first here,
+		// then the resolution is layered on, rather than threading it through the
+		// generic `infer_kind` match (whose own `BinaryOp` arm below is unreachable
+		// through this path, kept only so the match stays exhaustive).
+		if let ExprKind::BinaryOp { lhs, op, rhs } = &expr.kind {
+			let (ty, resolution) = self.infer_binary(lhs, *op, rhs, expr.span);
+			self.record(expr.id, ty, None);
+			if let Some(resolution) = resolution {
+				self.annotations.record_resolution(expr.id, resolution);
+			}
+			return ty;
+		}
 		let ty = self.infer_kind(expr);
 		// Record the node's resolved type for the lowering pass. Zonking happens
 		// inside `record`. Returns the *raw* ty so callers can still unify against it.
@@ -248,7 +264,7 @@ impl<'m> Checker<'m> {
 					_ => {
 						let key_lit = matches!(index.kind, ExprKind::Int(_));
 						match self.resolve_method(recv, "index", &[key], &[key_lit], span) {
-							Some(ret) => ret,
+							Some(res) => res.ty,
 							None => self.fresh(),
 						}
 					}
@@ -262,11 +278,12 @@ impl<'m> Checker<'m> {
 				self.fresh()
 			}
 			ExprKind::BinaryOp { lhs, op, rhs } => {
-				// The operands are recorded by their own `infer` calls inside
-				// `infer_binary`. TODO(codegen-slice-4): populate the selected-impl
-				// `Resolution` (dispatch kind) here, in the operator-lowering slice that
-				// consumes it (built-in fast-path → BuiltinEager, dispatch → UserImpl).
-				self.infer_binary(lhs, *op, rhs, span)
+				// Unreachable in practice: `infer` (the sole caller of `infer_kind`)
+				// intercepts `BinaryOp` before it gets here, because recording the
+				// operator's `Resolution` needs the node's type entry to already exist
+				// (see `infer`). This arm only exists so the match stays exhaustive; it
+				// discards the resolution rather than duplicating that recording logic.
+				self.infer_binary(lhs, *op, rhs, span).0
 			}
 			ExprKind::TypeOp { lhs, rhs, .. } => {
 				let src = self.infer(lhs);
@@ -567,7 +584,7 @@ impl<'m> Checker<'m> {
 			let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
 			let arg_lits = arg_int_lits(args);
 			return match self.resolve_method(recv, &member.0, &arg_tys, &arg_lits, member.1) {
-				Some(ret) => ret,
+				Some(res) => res.ty,
 				None => {
 					let rendered = self.display(recv);
 					self.emit(
@@ -853,21 +870,21 @@ impl<'m> Checker<'m> {
 					self.unify(operand, boolean, span);
 					boolean
 				} else {
-					self.dispatch_operator(operand, "not", &[], span)
+					self.dispatch_operator(operand, "not", &[], span).0
 				}
 			}
 			Negate => {
 				if self.prim_kind(operand).is_some() {
 					operand
 				} else {
-					self.dispatch_operator(operand, "negate", &[], span)
+					self.dispatch_operator(operand, "negate", &[], span).0
 				}
 			}
 			BitNot => {
 				if self.prim_kind(operand).is_some() {
 					operand
 				} else {
-					self.dispatch_operator(operand, "bit_not", &[], span)
+					self.dispatch_operator(operand, "bit_not", &[], span).0
 				}
 			}
 		}
@@ -877,19 +894,39 @@ impl<'m> Checker<'m> {
 	/// fast-paths (so basic arithmetic needs no impls in scope); everything else —
 	/// including mixed-primitive arithmetic like `int + float` — routes through the
 	/// solver, where the method's return type *is* the operator's result type.
-	fn infer_binary(&mut self, lhs: &Expr, op: BinaryOperator, rhs: &Expr, span: Span) -> Ty {
+	///
+	/// Also decides, per D3 of the Slice 4B plan, the operator's [`Resolution`] —
+	/// how codegen must compile this exact node — returned alongside the type so
+	/// `infer` can record both against the `BinaryOp` node once it exists in the
+	/// annotation table. `None` marks an exit path D3 deliberately leaves
+	/// unresolved (`??`, `in`/`!in`, `|>`, and the inference-var/generic-operand
+	/// fallback below); lowering panics loudly on those rather than guessing.
+	fn infer_binary(
+		&mut self,
+		lhs: &Expr,
+		op: BinaryOperator,
+		rhs: &Expr,
+		span: Span,
+	) -> (Ty, Option<Resolution>) {
 		use BinaryOperator::*;
 
-		// `|>` is application, not a method.
+		// `|>` is application, not a method. D3: `lower_binop` already panics on
+		// `Pipe` before any dispatch question arises, so no resolution is needed.
 		if op == Pipe {
 			let arg = self.infer(lhs);
 			let callee = self.infer(rhs);
-			return self.apply(callee, vec![arg], span);
+			return (self.apply(callee, vec![arg], span), None);
 		}
 
 		let l = self.infer(lhs);
 		let r = self.infer(rhs);
 		let boolean = self.interner.boolean();
+		let eager = |method: &str| {
+			Some(Resolution {
+				method: method.into(),
+				dispatch: DispatchKind::BuiltinEager,
+			})
+		};
 
 		match op {
 			Plus | Minus | Times | Divide | Remainder | Power | BitAnd | BitOr | BitXor | LeftShift
@@ -897,29 +934,46 @@ impl<'m> Checker<'m> {
 				// Same primitive → built-in, result is that type.
 				(Some(a), Some(b)) if a == b => {
 					self.unify(l, r, span);
-					l
+					(l, eager(binary_method(op)))
 				}
 				// Different concrete primitives: an `int` literal against a `float`/`uint`
 				// widens (so `1.5 * 2` is a `float` with no impl needed); otherwise this is
 				// a genuine mixed-type operator that must be overloaded (e.g. `x + y` with
-				// `x: float`, `y: int`).
+				// `x: float`, `y: int`). Both sub-cases still compile to a native JS
+				// operator (D3: literal widening never dispatches; the dispatched case is
+				// "impl self-type is a primitive" — stdlib isn't linked until Slice 5, so
+				// its JS numeric semantics already match).
 				(Some(_), Some(_)) => {
 					if matches!(rhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(l) {
-						l
+						(l, eager(binary_method(op)))
 					} else if matches!(lhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(r) {
-						r
+						(r, eager(binary_method(op)))
 					} else {
-						self.dispatch_operator(l, binary_method(op), &[r], span)
+						let (ty, _) = self.dispatch_operator(l, binary_method(op), &[r], span);
+						(ty, eager(binary_method(op)))
 					}
 				}
 				// A non-primitive operand: user type → overload; inference var/param →
 				// best-effort unify (covers generic `T + T` and not-yet-known types).
 				_ => {
 					if self.is_adt(l) {
-						self.dispatch_operator(l, binary_method(op), &[r], span)
+						let (ty, dispatch) = self.dispatch_operator(l, binary_method(op), &[r], span);
+						(
+							ty,
+							Some(Resolution {
+								method: binary_method(op).into(),
+								dispatch,
+							}),
+						)
 					} else {
+						// D3 doesn't cover this fallback (an unresolved inference variable or
+						// generic parameter operand, which never reaches `dispatch_operator`
+						// since `is_adt` is false for it too). Recording a guessed dispatch
+						// kind here could silently miscompile a case we don't actually
+						// understand yet, so this deliberately leaves no `Resolution` —
+						// Task 3's lowering panics loudly on it instead.
 						self.unify(l, r, span);
-						l
+						(l, None)
 					}
 				}
 			},
@@ -928,17 +982,27 @@ impl<'m> Checker<'m> {
 				if self.prim_kind(l).is_some() || !self.is_adt(l) {
 					self.unify_operands(lhs, l, rhs, r, span);
 				} else {
+					// D3: `equals` dispatch is deferred to the stdlib slice — even when an
+					// ADT has a user `Equals` impl, codegen still emits `===`/`!==` for now.
 					self.dispatch_operator(l, method, &[r], span);
 				}
-				boolean
+				(boolean, eager(method))
 			}
 			LessThan | LessThanEquals | GreaterThan | GreaterThanEquals => {
+				let method = comparison_method(op);
 				if self.prim_kind(l).is_some() || !self.is_adt(l) {
 					self.unify_operands(lhs, l, rhs, r, span);
+					(boolean, eager(method))
 				} else {
-					self.dispatch_operator(l, comparison_method(op), &[r], span);
+					let (_, dispatch) = self.dispatch_operator(l, method, &[r], span);
+					(
+						boolean,
+						Some(Resolution {
+							method: method.into(),
+							dispatch,
+						}),
+					)
 				}
-				boolean
 			}
 			// `&&`/`||` are overloadable via the `And`/`Or` interfaces like any operator.
 			// The built-in `boolean` *default* impl is fast-pathed here and short-circuits
@@ -946,28 +1010,48 @@ impl<'m> Checker<'m> {
 			// interface and lowers to an ordinary (eager) method call. Typing checks both
 			// operands regardless of runtime laziness.
 			BoolAnd | BoolOr => {
+				let method = if op == BoolAnd { "and" } else { "or" };
 				if self.prim_kind(l).is_some() || !self.is_adt(l) {
 					self.unify(l, boolean, span);
 					self.unify(r, boolean, span);
-					boolean
+					(
+						boolean,
+						Some(Resolution {
+							method: method.into(),
+							dispatch: DispatchKind::BuiltinShortCircuit,
+						}),
+					)
 				} else {
-					self.dispatch_operator(l, if op == BoolAnd { "and" } else { "or" }, &[r], span)
+					let (ty, dispatch) = self.dispatch_operator(l, method, &[r], span);
+					(
+						ty,
+						Some(Resolution {
+							method: method.into(),
+							dispatch,
+						}),
+					)
 				}
 			}
 			In | NotIn => {
-				// `a in c` ≡ `c.contains(a)` — receiver is the collection.
+				// `a in c` ≡ `c.contains(a)` — receiver is the collection. D3: `lower_binop`
+				// already panics on `In`/`NotIn` before any dispatch question arises, so no
+				// resolution is needed.
 				let method = if op == In { "contains" } else { "not_contains" };
 				if self.is_adt(r) {
 					self.dispatch_operator(r, method, &[l], span);
 				}
-				boolean
+				(boolean, None)
 			}
 			// `??` is overloadable via the `Unwrap` interface. Its built-in *default*
 			// impls (`Option`/`Result`) short-circuit — codegen lowers those to
 			// `match a { Some(v) -> v, _ -> b }`, not evaluating `b` when `a` holds a
 			// value — while a user `Unwrap` overload is an ordinary (eager) method call.
-			// Typing: `b` and the result are `Output`.
-			Unwrap => self.dispatch_operator(l, "unwrap", &[r], span),
+			// Typing: `b` and the result are `Output`. D3: `lower_binop` already panics on
+			// `Unwrap` before any dispatch question arises, so no resolution is needed.
+			Unwrap => {
+				let (ty, _) = self.dispatch_operator(l, "unwrap", &[r], span);
+				(ty, None)
+			}
 			Pipe => unreachable!("handled above"),
 		}
 	}
@@ -992,12 +1076,37 @@ impl<'m> Checker<'m> {
 	}
 
 	/// Resolve an operator's method call, reporting an error if no impl provides it.
-	fn dispatch_operator(&mut self, recv: Ty, method: &str, args: &[Ty], span: Span) -> Ty {
+	/// The paired [`DispatchKind`] tells the binary-operator caller (Slice 4B)
+	/// whether the matched method is a real, directly-callable method (`UserImpl` —
+	/// covers both an inherent method and one an impl defines itself) or only an
+	/// interface default body codegen can't yet reach (`UserImplDefaultMethod`).
+	/// Unary callers (`infer_prefix`) ignore the dispatch kind; unary operator
+	/// overloading is out of scope for this slice (lowering still emits a native JS
+	/// unary op unconditionally — a known gap, not fixed here).
+	fn dispatch_operator(
+		&mut self,
+		recv: Ty,
+		method: &str,
+		args: &[Ty],
+		span: Span,
+	) -> (Ty, DispatchKind) {
 		// Operator operands are already typed; literal widening on them is handled on the
 		// primitive fast-paths, so no argument is flagged as a coercible literal here.
 		let lits = vec![false; args.len()];
 		match self.resolve_method(recv, method, args, &lits, span) {
-			Some(ret) => ret,
+			Some(res) => {
+				let dispatch = match res.source {
+					MethodSource::Inherent | MethodSource::ImplDirect => DispatchKind::UserImpl,
+					// No current binary-operator call site reaches `GenericBound` (they all
+					// gate on `is_adt(recv)` before calling here, which a generic parameter
+					// never satisfies) — treated as the same loud deferral as an interface
+					// default rather than guessed at, per D2/D3's "never miscompile silently".
+					MethodSource::InterfaceDefault | MethodSource::GenericBound => {
+						DispatchKind::UserImplDefaultMethod
+					}
+				};
+				(res.ty, dispatch)
+			}
 			None => {
 				let rendered = self.display(recv);
 				self.emit(
@@ -1007,7 +1116,9 @@ impl<'m> Checker<'m> {
 						ty: rendered,
 					},
 				);
-				self.interner.error()
+				// An error path (diagnostics already emitted): lowering never runs when
+				// `Checked::diags` has errors, so this `DispatchKind` is never consumed.
+				(self.interner.error(), DispatchKind::UserImpl)
 			}
 		}
 	}
@@ -1131,7 +1242,11 @@ impl<'m> Checker<'m> {
 			// `place op= value` ≡ `place = place op value`: the operator's result type
 			// must be assignable back into the place.
 			Some(binop) => {
-				let result = self.infer_binary(lhs, binop, rhs, span);
+				// The desugared `place op value` has no `BinaryOp` AST node of its own (no
+				// id to record a `Resolution` against), so the resolution half of
+				// `infer_binary`'s result is discarded here — compound-assignment operator
+				// lowering is unaffected by Slice 4B's recording (out of scope for Task 1).
+				let (result, _) = self.infer_binary(lhs, binop, rhs, span);
 				self.unify(result, place_ty, span);
 			}
 			// Plain `=`.

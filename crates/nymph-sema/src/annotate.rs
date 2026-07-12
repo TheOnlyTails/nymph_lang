@@ -3,34 +3,45 @@
 //! its resolved type and (for desugared operators/casts/calls) which impl was
 //! selected and how it must be dispatched in codegen.
 
+use ecow::EcoString;
 use nymph_ast::{NodeId, Span};
 use nymph_diagnostics::Diagnostic;
 use rustc_hash::FxHashMap;
 
+use crate::Ty;
 use crate::ty::Interner;
-use crate::{DefId, Ty};
 
-/// How a resolved operator/method call must be emitted by codegen.
+/// How a resolved binary operator must be emitted by codegen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DispatchKind {
-	/// A built-in primitive operation emitted as a native JS operator.
+	/// A built-in primitive operation emitted as a native JS operator, eagerly
+	/// evaluated (`+`, `-`, `===`, …).
 	BuiltinEager,
-	/// A built-in default whose semantics short-circuit (`&&`, `||`, `??`),
-	/// lowered to lazy control flow rather than an eager call.
+	/// A built-in default whose semantics short-circuit (`&&`, `||`), lowered to
+	/// lazy control flow rather than an eager call.
 	BuiltinShortCircuit,
-	/// A user-provided interface impl: an ordinary eager method/function call.
+	/// A method defined directly in a user impl: compile to `lhs.method(rhs)`.
 	UserImpl,
+	/// Resolved to an interface *default* method body (e.g. `Comparable`'s
+	/// `less_than`, which calls `compare_to` under the hood). Codegen cannot
+	/// materialize interface default methods yet, so lowering panics on this
+	/// rather than emitting a call to a method that doesn't exist on the class.
+	UserImplDefaultMethod,
 }
 
-/// The resolved callee behind a desugared operator, cast, index, or method call.
-#[derive(Clone, Copy, PartialEq, Debug)]
+/// How a binary operator at a specific node must be compiled.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolution {
-	pub method: DefId,
+	/// Interface method name the operator resolved to (e.g. `plus`). Codegen
+	/// only needs the JS method name — impl methods are not `DefId`'d
+	/// (`ImplDef.methods` is a name-keyed map), so a name is all lowering needs
+	/// to build a `Call { callee: Field { .. }, .. }`.
+	pub method: EcoString,
 	pub dispatch: DispatchKind,
 }
 
 /// What the checker learned about one expression node.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ExprInfo {
 	pub ty: Ty,
 	pub resolution: Option<Resolution>,
@@ -58,7 +69,7 @@ pub struct Annotations {
 
 impl Annotations {
 	pub fn get(&self, id: NodeId) -> Option<ExprInfo> {
-		self.infos.get(&id).copied()
+		self.infos.get(&id).cloned()
 	}
 
 	pub fn len(&self) -> usize {
@@ -101,15 +112,13 @@ impl Annotations {
 	}
 
 	/// Attach a `Resolution` to a node, preserving its already-recorded type. Used
-	/// by later slices for operator/method dispatch without clobbering the type
-	/// recorded by the uniform `infer` wrapper.
+	/// by operator dispatch (Slice 4B) without clobbering the type recorded by the
+	/// uniform `infer` wrapper.
 	///
 	/// A resolved node is always also `infer`'d first (the wrapper records its type
 	/// before any resolution is attached), so the entry is expected to already
 	/// exist; this only updates it in place, and never inserts a bare
-	/// resolution-only entry (there is no placeholder `Ty` to insert with). Slice 2A
-	/// does not yet call this method — it is future-proofing for operator dispatch.
-	#[allow(dead_code)]
+	/// resolution-only entry (there is no placeholder `Ty` to insert with).
 	pub(crate) fn record_resolution(&mut self, id: NodeId, resolution: Resolution) {
 		if id == NodeId::DUMMY {
 			return;
@@ -121,6 +130,16 @@ impl Annotations {
 				"record_resolution({id:?}) called before the node was infer'd"
 			),
 		}
+	}
+
+	/// The operator `Resolution` recorded for a `BinaryOp` node, if any. Mirrors
+	/// [`Annotations::variant_of`]'s access pattern: lowering reads this back to
+	/// decide how to compile the operator (native JS vs. a dispatched method call).
+	pub fn resolution_of(&self, id: NodeId) -> Option<&Resolution> {
+		self
+			.infos
+			.get(&id)
+			.and_then(|info| info.resolution.as_ref())
 	}
 }
 

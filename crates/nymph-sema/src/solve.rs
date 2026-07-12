@@ -21,6 +21,36 @@ use crate::ty::Ty;
 /// The maximum obligation-solving depth, guarding against cyclic impls.
 const MAX_DEPTH: u32 = 32;
 
+/// Where a resolved method's implementation actually lives. Operator dispatch
+/// (Slice 4B) needs this distinction: codegen can compile a direct call
+/// (`lhs.method(rhs)`) for an inherent or impl-defined method, but not yet for a
+/// method that only exists as an interface's default body (that body isn't
+/// materialized on any class).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum MethodSource {
+	/// An inherent method (`impl Type { .. }`, no interface involved).
+	Inherent,
+	/// A method the matched impl defines directly.
+	ImplDirect,
+	/// The interface's own default-method body; the impl relies on it rather
+	/// than overriding it (e.g. `Comparable`'s `less_than` over `compare_to`).
+	InterfaceDefault,
+	/// Resolved through a generic parameter's interface bound (`resolve_param_method`):
+	/// the concrete impl is only known once the parameter is instantiated, which
+	/// this type-erased-at-lowering compiler does not track. No current operator
+	/// call site reaches this (`is_adt` gates receivers to concrete ADTs before
+	/// dispatching), but it is tagged honestly rather than reused as one of the
+	/// other variants in case a future caller does reach it.
+	GenericBound,
+}
+
+/// A resolved method call: its instantiated return type plus where the matched
+/// method body actually lives.
+pub(crate) struct MethodResolution {
+	pub(crate) ty: Ty,
+	pub(crate) source: MethodSource,
+}
+
 impl Checker<'_> {
 	/// Does `self_ty` implement `interface`, with the given known argument bindings?
 	/// Existence only — used for winnowing an impl's constraints.
@@ -268,12 +298,15 @@ impl Checker<'_> {
 		arg_tys: &[Ty],
 		arg_lits: &[bool],
 		span: Span,
-	) -> Option<Ty> {
+	) -> Option<MethodResolution> {
 		let recv = self.shallow_resolve(recv);
 
 		// Inherent methods take priority over interface methods.
 		if let Some(ret) = self.resolve_inherent(recv, name, arg_tys, arg_lits, span) {
-			return Some(ret);
+			return Some(MethodResolution {
+				ty: ret,
+				source: MethodSource::Inherent,
+			});
 		}
 
 		let head = head_of(&self.interner, recv);
@@ -306,7 +339,12 @@ impl Checker<'_> {
 			// bound (a declared `<T: Iface>` or a synthetic one minted for `impl Iface`),
 			// resolve the method through that bound.
 			if let crate::ty::TyKind::Param(idx) = *self.interner.kind(recv) {
-				return self.resolve_param_method(idx, name, arg_tys, arg_lits, span);
+				return self
+					.resolve_param_method(idx, name, arg_tys, arg_lits, span)
+					.map(|ty| MethodResolution {
+						ty,
+						source: MethodSource::GenericBound,
+					});
 			}
 			return None;
 		}
@@ -332,12 +370,22 @@ impl Checker<'_> {
 		match chosen.len() {
 			0 => {
 				self.emit(span, TypeError::NoMatchingOverload { name: name.into() });
-				Some(self.interner.error())
+				// An error path: diagnostics are already emitted, so `Checked::diags` is
+				// non-empty and lowering never runs on this result — the `source` tag is
+				// inert here, but `ImplDirect` is picked to keep this branch total without
+				// implying a (nonexistent) default-method body.
+				Some(MethodResolution {
+					ty: self.interner.error(),
+					source: MethodSource::ImplDirect,
+				})
 			}
 			1 => Some(self.commit_method(chosen[0], recv, name, arg_tys, arg_lits, span)),
 			_ => {
 				self.emit(span, TypeError::AmbiguousCall { name: name.into() });
-				Some(self.interner.error())
+				Some(MethodResolution {
+					ty: self.interner.error(),
+					source: MethodSource::ImplDirect,
+				})
 			}
 		}
 	}
@@ -379,7 +427,7 @@ impl Checker<'_> {
 		if !self.try_unify(recv, impl_self) || !self.constraints_hold(&def.constraints, &subst, 0) {
 			return None;
 		}
-		let (params, ret) = self.method_signature(&def, &subst, recv, name)?;
+		let (params, ret, _source) = self.method_signature(&def, &subst, recv, name)?;
 		if params.len() != arg_tys.len() {
 			return None;
 		}
@@ -402,14 +450,22 @@ impl Checker<'_> {
 		arg_tys: &[Ty],
 		arg_lits: &[bool],
 		span: Span,
-	) -> Ty {
+	) -> MethodResolution {
 		let def = self.impls.impls[idx].clone();
 		let subst = self.fresh_subst(def.generics.len());
 		let impl_self = self.subst(def.self_ty, &subst, None);
 		self.unify(recv, impl_self, span);
 
-		let Some((params, ret)) = self.method_signature(&def, &subst, recv, name) else {
-			return self.interner.error();
+		let Some((params, ret, source)) = self.method_signature(&def, &subst, recv, name) else {
+			// Unreachable in practice: `candidates` was assembled from interfaces whose
+			// `methods` map already contains `name`, so `method_signature` always finds
+			// either the impl's own method or the interface's default. Kept total rather
+			// than `unreachable!()` so a future change to that invariant fails loudly via
+			// a wrong-but-safe error type instead of a panic mid-typecheck.
+			return MethodResolution {
+				ty: self.interner.error(),
+				source: MethodSource::ImplDirect,
+			};
 		};
 		if params.len() != arg_tys.len() {
 			self.emit(
@@ -420,7 +476,7 @@ impl Checker<'_> {
 					found: arg_tys.len(),
 				},
 			);
-			return ret;
+			return MethodResolution { ty: ret, source };
 		}
 		for (i, (param, arg)) in params.iter().zip(arg_tys).enumerate() {
 			self.unify_arg(
@@ -430,19 +486,22 @@ impl Checker<'_> {
 				span,
 			);
 		}
-		ret
+		MethodResolution { ty: ret, source }
 	}
 
-	/// The instantiated `(params, ret)` of `name` for impl `def` under substitution
-	/// `subst` and receiver `recv`. Prefers the impl's own signature, else the
-	/// interface's (default) method with interface parameters mapped to impl args.
+	/// The instantiated `(params, ret, source)` of `name` for impl `def` under
+	/// substitution `subst` and receiver `recv`. Prefers the impl's own signature
+	/// (`source: ImplDirect`), else the interface's (default) method with interface
+	/// parameters mapped to impl args (`source: InterfaceDefault`) — this is the
+	/// seam Slice 4B's operator dispatch reads to decide whether codegen can compile
+	/// a direct method call or must defer.
 	fn method_signature(
 		&mut self,
 		def: &crate::iface::ImplDef,
 		subst: &FxHashMap<ParamIdx, Ty>,
 		recv: Ty,
 		name: &str,
-	) -> Option<(Vec<Ty>, Ty)> {
+	) -> Option<(Vec<Ty>, Ty, MethodSource)> {
 		if let Some(method) = def.methods.get(name) {
 			let params = method
 				.params
@@ -450,7 +509,7 @@ impl Checker<'_> {
 				.map(|t| self.subst(*t, subst, Some(recv)))
 				.collect();
 			let ret = self.subst(method.ret, subst, Some(recv));
-			return Some((params, ret));
+			return Some((params, ret, MethodSource::ImplDirect));
 		}
 
 		// Interface default method: map interface Param(k) → this impl's arg bindings.
@@ -472,6 +531,6 @@ impl Checker<'_> {
 			.map(|t| self.subst(*t, &isubst, Some(recv)))
 			.collect();
 		let ret = self.subst(method.ret, &isubst, Some(recv));
-		Some((params, ret))
+		Some((params, ret, MethodSource::InterfaceDefault))
 	}
 }
