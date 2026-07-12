@@ -232,6 +232,31 @@ fn lowers_match_over_enum() {
 }
 
 #[test]
+fn lowers_struct_methods_and_this() {
+	let hir = lower(
+		r#"
+		struct Point(x: int, y: int)
+		impl Point {
+			func sum(): int = this.x + this.y
+		}
+		"#,
+	);
+	assert_eq!(hir.classes.len(), 1);
+	let class = &hir.classes[0];
+	assert_eq!(class.name, "Point");
+	assert_eq!(class.methods.len(), 1);
+	assert_eq!(class.methods[0].name, "sum");
+	// The body `this.x + this.y` lowers with `This` receivers under the field access.
+	let HirExpr::Binary { lhs, .. } = &class.methods[0].body else {
+		panic!("expected a binary body, got {:?}", class.methods[0].body);
+	};
+	assert!(matches!(
+		lhs.as_ref(),
+		HirExpr::Field { recv, name } if matches!(recv.as_ref(), HirExpr::This) && name == "x"
+	));
+}
+
+#[test]
 fn lowers_full_patterns_and_guards() {
 	use nymph_hir::hir::{HirLit, HirPat, HirRange};
 	let hir = lower(

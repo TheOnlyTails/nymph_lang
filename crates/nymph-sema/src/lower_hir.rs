@@ -17,11 +17,11 @@ use nymph_ast::{
 	ops::{AssignOperator, BinaryOperator, PrefixOperator},
 };
 use nymph_hir::hir::{
-	BinOp, HirArm, HirClass, HirEnum, HirExpr, HirFunc, HirLit, HirModule, HirPat, HirRange, HirStmt,
-	HirVariant, UnOp,
+	BinOp, HirArm, HirClass, HirEnum, HirExpr, HirFunc, HirLit, HirMethod, HirModule, HirPat,
+	HirRange, HirStmt, HirVariant, UnOp,
 };
 use nymph_hir::ty::{Interner, TyKind};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{Annotations, Checked};
 
@@ -62,17 +62,53 @@ struct Lowerer<'a> {
 
 impl Lowerer<'_> {
 	fn lower_module(&self, module: &Module) -> HirModule {
+		use nymph_ast::decl::{ImplMember, StructInnerMember};
+		use nymph_ast::ty::Type;
+
+		// First pass: collect inherent instance methods from top-level `impl <Named>`
+		// blocks, keyed by the target struct's name. Non-`Reference` targets and
+		// interface impls (`impl … for`) are handled in later slices.
+		let mut methods_by_type: FxHashMap<EcoString, Vec<HirMethod>> = FxHashMap::default();
+		for decl in &module.members {
+			if let Declaration::Impl { type_, members, .. } = decl
+				&& let Type::Reference { name, .. } = &type_.0
+			{
+				let entry = methods_by_type.entry(name.0.clone()).or_default();
+				for member in members {
+					if let ImplMember::Func { meta, body, .. } = &member.0 {
+						entry.push(self.lower_method(meta, body));
+					}
+				}
+			}
+		}
+
 		let mut funcs = Vec::new();
 		let mut classes = Vec::new();
 		let mut enums = Vec::new();
 		for decl in &module.members {
 			match decl {
 				Declaration::Func { meta, body, .. } => funcs.push(self.lower_func(meta, body)),
-				Declaration::Struct { name, fields, .. } => classes.push(HirClass {
-					name: name.0.clone(),
-					fields: fields.iter().map(|f| f.0.name.0.clone()).collect(),
-					methods: Vec::new(),
-				}),
+				Declaration::Struct {
+					name,
+					fields,
+					members,
+					..
+				} => {
+					// Methods from top-level impls, plus the struct's own inner `func`s.
+					let mut methods = methods_by_type.remove(&name.0).unwrap_or_default();
+					for member in members {
+						if let StructInnerMember::Member(inner) = &member.0
+							&& let ImplMember::Func { meta, body, .. } = &inner.0
+						{
+							methods.push(self.lower_method(meta, body));
+						}
+					}
+					classes.push(HirClass {
+						name: name.0.clone(),
+						fields: fields.iter().map(|f| f.0.name.0.clone()).collect(),
+						methods,
+					});
+				}
 				Declaration::Enum { name, variants, .. } => enums.push(HirEnum {
 					name: name.0.clone(),
 					variants: variants
@@ -102,6 +138,16 @@ impl Lowerer<'_> {
 		}
 	}
 
+	/// Lower one inherent instance method (mirrors [`Self::lower_func`]). `this` in
+	/// the body lowers to [`HirExpr::This`].
+	fn lower_method(&self, meta: &FuncDeclaration, body: &Expr) -> HirMethod {
+		HirMethod {
+			name: meta.name.0.clone(),
+			params: meta.params.iter().map(|p| param_name(&p.0.name)).collect(),
+			body: self.lower_expr(body),
+		}
+	}
+
 	fn lower_expr(&self, expr: &Expr) -> HirExpr {
 		match &expr.kind {
 			ExprKind::Int(v) => HirExpr::Num(v.0 as f64),
@@ -118,6 +164,7 @@ impl Lowerer<'_> {
 				},
 				None => HirExpr::Local(name.0.clone()),
 			},
+			ExprKind::This => HirExpr::This,
 			ExprKind::Grouped(inner) => self.lower_expr(inner),
 			ExprKind::Call { func, args, .. } => {
 				// A call the checker resolved to a variant is variant construction →
