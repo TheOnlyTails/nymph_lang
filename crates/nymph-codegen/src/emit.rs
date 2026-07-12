@@ -644,6 +644,8 @@ impl<'a> Emitter<'a> {
 			HirExpr::Block { .. } | HirExpr::If { .. } | HirExpr::While { .. } => {
 				self.emit_value(expr).into_expression(self.ast)
 			}
+			// `match` is lowered in Slice 3A Task 3 but not emitted until Task 4.
+			HirExpr::Match { .. } => unreachable!("emitted in slice-3a Task 4"),
 		}
 	}
 

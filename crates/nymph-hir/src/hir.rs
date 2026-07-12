@@ -132,6 +132,46 @@ pub enum HirExpr {
 		cond: Box<HirExpr>,
 		body: Box<HirExpr>,
 	},
+	/// `match <scrutinee> { <arms> }` — compiled to an if/else-if chain.
+	Match {
+		scrutinee: Box<HirExpr>,
+		arms: Vec<HirArm>,
+	},
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirArm {
+	pub pat: HirPat,
+	pub body: HirExpr,
+}
+
+/// A compiled pattern. Codegen turns each into a test expression plus a binding
+/// sequence against a subject expression.
+#[derive(Clone, Debug, PartialEq)]
+pub enum HirPat {
+	/// `_` — always matches, binds nothing.
+	Wildcard,
+	/// Bind the subject to `name`, then match `sub` against it (if present).
+	Binding {
+		name: EcoString,
+		sub: Option<Box<HirPat>>,
+	},
+	/// A scalar literal — matches by `===`.
+	Lit(HirLit),
+	/// A variant — matches by tag identity, then matches each field sub-pattern
+	/// against the corresponding field of the subject.
+	Variant {
+		enum_name: EcoString,
+		variant: EcoString,
+		fields: Vec<(EcoString, HirPat)>,
+	},
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum HirLit {
+	Num(f64),
+	Bool(bool),
+	Char(char),
 }
 
 /// Binary operators that map directly to a JS operator (primitive fast-path).
