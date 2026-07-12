@@ -10,7 +10,7 @@
 
 use ecow::EcoString;
 use nymph_ast::{
-	Span, Spanned,
+	NodeId, Span, Spanned,
 	decl::Declaration,
 	expr::{CallArg, Expr, ExprKind, RangeKind, Statement, StringPart},
 	ops::{AssignOperator, BinaryOperator},
@@ -160,7 +160,7 @@ impl<'m> Checker<'m> {
 					self.interner.error()
 				}
 			},
-			ExprKind::Identifier(name) => self.infer_identifier(&name.0, span),
+			ExprKind::Identifier(name) => self.infer_identifier(&name.0, span, expr.id),
 			ExprKind::AnonymousParam(_) => {
 				self.emit(span, TypeError::AnonymousParamUnsupported);
 				self.fresh()
@@ -218,9 +218,9 @@ impl<'m> Checker<'m> {
 				// is an opaque hole, while `for` extracts the element directly.
 				self.fresh()
 			}
-			ExprKind::Call { func, args, .. } => self.infer_call(func, args, span),
+			ExprKind::Call { func, args, .. } => self.infer_call(func, args, span, expr.id),
 			ExprKind::MemberAccess { parent, member, .. } => {
-				self.infer_member(parent, &member.0, member.1)
+				self.infer_member(parent, &member.0, member.1, expr.id)
 			}
 			ExprKind::IndexAccess { parent, index, .. } => {
 				// `a[i]` ≡ `a.index(i)` through the `Index` interface, but lists/maps/
@@ -365,15 +365,15 @@ impl<'m> Checker<'m> {
 	}
 
 	// ── Identifiers & definitions ────────────────────────────────────────────
-	fn infer_identifier(&mut self, name: &str, span: Span) -> Ty {
+	fn infer_identifier(&mut self, name: &str, span: Span, id: NodeId) -> Ty {
 		if let Some(binding) = self.lookup_local(name) {
 			return binding.ty;
 		}
 		if let Some(def) = self.defs.get(name) {
-			return self.type_of_def(def, span);
+			return self.type_of_def(def, span, id);
 		}
 		match self.defs.resolve_variant(name) {
-			Some(Ok((enum_def, variant))) => return self.variant_value(enum_def, variant),
+			Some(Ok((enum_def, variant))) => return self.variant_value(enum_def, variant, id),
 			Some(Err(())) => {
 				self.emit(span, TypeError::AmbiguousVariant { name: name.into() });
 				return self.interner.error();
@@ -384,7 +384,7 @@ impl<'m> Checker<'m> {
 		self.interner.error()
 	}
 
-	fn type_of_def(&mut self, def: DefId, span: Span) -> Ty {
+	fn type_of_def(&mut self, def: DefId, span: Span, id: NodeId) -> Ty {
 		match self.defs.data(def).kind {
 			DefKind::Let { .. } => self
 				.sigs
@@ -393,7 +393,7 @@ impl<'m> Checker<'m> {
 				.copied()
 				.unwrap_or_else(|| self.fresh()),
 			DefKind::Func { .. } => self.fn_type_of(def),
-			DefKind::Variant { enum_def, variant } => self.variant_value(enum_def, variant),
+			DefKind::Variant { enum_def, variant } => self.variant_value(enum_def, variant, id),
 			DefKind::Struct { .. } => {
 				self.emit(span, TypeError::StructTypeAsValue);
 				self.interner.error()
@@ -422,9 +422,24 @@ impl<'m> Checker<'m> {
 		self.interner.mk_fn(params, ret)
 	}
 
+	/// Build the `(enum, variant)` resolution recorded for lowering.
+	fn variant_resolution(
+		&self,
+		enum_def: DefId,
+		variant: usize,
+	) -> crate::annotate::VariantResolution {
+		crate::annotate::VariantResolution {
+			enum_name: self.defs.data(enum_def).name.clone(),
+			variant: self.sigs.enums[&enum_def].variants[variant].name.clone(),
+		}
+	}
+
 	/// The value of an enum variant referenced by name: the enum type itself for a
-	/// field-less variant, or a constructor function for one with fields.
-	fn variant_value(&mut self, enum_def: DefId, variant: usize) -> Ty {
+	/// field-less variant, or a constructor function for one with fields. Records
+	/// the resolution on `id` so lowering can emit the Symbol-tag ABI.
+	fn variant_value(&mut self, enum_def: DefId, variant: usize, id: NodeId) -> Ty {
+		let res = self.variant_resolution(enum_def, variant);
+		self.annotations.record_variant(id, res);
 		let (adt, subst) = self.instantiate_enum(enum_def);
 		let vsig = self.sigs.enums[&enum_def].variants[variant].clone();
 		if vsig.fields.is_empty() {
@@ -460,7 +475,7 @@ impl<'m> Checker<'m> {
 	}
 
 	// ── Calls & construction ─────────────────────────────────────────────────
-	fn infer_call(&mut self, func: &Expr, args: &[Spanned<CallArg>], span: Span) -> Ty {
+	fn infer_call(&mut self, func: &Expr, args: &[Spanned<CallArg>], span: Span, id: NodeId) -> Ty {
 		// Constructor calls: `Struct(field = …)` / `Variant(field = …)`.
 		if let ExprKind::Identifier(name) = &func.kind {
 			if let Some(def) = self.defs.get(&name.0)
@@ -470,7 +485,7 @@ impl<'m> Checker<'m> {
 			}
 			match self.defs.resolve_variant(&name.0) {
 				Some(Ok((enum_def, variant))) => {
-					return self.infer_variant_ctor(enum_def, variant, args, span);
+					return self.infer_variant_ctor(enum_def, variant, args, span, id);
 				}
 				Some(Err(())) => {
 					self.emit(
@@ -498,7 +513,7 @@ impl<'m> Checker<'m> {
 						.iter()
 						.position(|v| v.name == member.0);
 					if let Some(variant) = variant {
-						return self.infer_variant_ctor(def, variant, args, member.1);
+						return self.infer_variant_ctor(def, variant, args, member.1, id);
 					}
 					let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
 					let arg_lits = arg_int_lits(args);
@@ -623,7 +638,10 @@ impl<'m> Checker<'m> {
 		variant: usize,
 		args: &[Spanned<CallArg>],
 		_span: Span,
+		id: NodeId,
 	) -> Ty {
+		let res = self.variant_resolution(enum_def, variant);
+		self.annotations.record_variant(id, res);
 		let (adt, subst) = self.instantiate_enum(enum_def);
 		let vsig = self.sigs.enums[&enum_def].variants[variant].clone();
 		let fields: Vec<(EcoString, Ty)> = vsig
@@ -672,7 +690,7 @@ impl<'m> Checker<'m> {
 	}
 
 	// ── Member access ────────────────────────────────────────────────────────
-	fn infer_member(&mut self, parent: &Expr, member: &str, span: Span) -> Ty {
+	fn infer_member(&mut self, parent: &Expr, member: &str, span: Span, id: NodeId) -> Ty {
 		// `EnumName.Variant` — a variant referenced through its type.
 		if let ExprKind::Identifier(tname) = &parent.kind
 			&& let Some(def) = self.defs.get(&tname.0)
@@ -680,7 +698,7 @@ impl<'m> Checker<'m> {
 		{
 			let variants = &self.sigs.enums[&def].variants;
 			if let Some(vidx) = variants.iter().position(|v| v.name == member) {
-				return self.variant_value(def, vidx);
+				return self.variant_value(def, vidx, id);
 			}
 			self.emit(
 				span,

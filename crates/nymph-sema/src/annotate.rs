@@ -36,30 +36,54 @@ pub struct ExprInfo {
 	pub resolution: Option<Resolution>,
 }
 
-/// A [`NodeId`]-keyed map of [`ExprInfo`], produced by checking and consumed by
-/// lowering.
+/// The resolved `(enum, variant)` names behind a variant construction or
+/// reference. Recorded so lowering can emit the Symbol-tag ABI without
+/// re-resolving ambiguous bare variant names (`None`, `Some`).
+#[derive(Clone, Debug)]
+pub struct VariantResolution {
+	pub enum_name: ecow::EcoString,
+	pub variant: ecow::EcoString,
+}
+
+/// A [`NodeId`]-keyed map of [`ExprInfo`] plus variant resolutions, produced by
+/// checking and consumed by lowering.
 #[derive(Clone, Debug, Default)]
-pub struct Annotations(FxHashMap<NodeId, ExprInfo>);
+pub struct Annotations {
+	infos: FxHashMap<NodeId, ExprInfo>,
+	variants: FxHashMap<NodeId, VariantResolution>,
+}
 
 impl Annotations {
 	pub fn get(&self, id: NodeId) -> Option<ExprInfo> {
-		self.0.get(&id).copied()
+		self.infos.get(&id).copied()
 	}
 
 	pub fn len(&self) -> usize {
-		self.0.len()
+		self.infos.len()
 	}
 
 	pub fn is_empty(&self) -> bool {
-		self.0.is_empty()
+		self.infos.is_empty()
 	}
 
 	/// Record the checker's decision about an expression node. Nodes built outside
 	/// the parser carry [`NodeId::DUMMY`] and are never annotated.
 	pub(crate) fn record(&mut self, id: NodeId, info: ExprInfo) {
 		if id != NodeId::DUMMY {
-			self.0.insert(id, info);
+			self.infos.insert(id, info);
 		}
+	}
+
+	/// Record which `(enum, variant)` a variant construction/reference resolved to.
+	pub(crate) fn record_variant(&mut self, id: NodeId, res: VariantResolution) {
+		if id != NodeId::DUMMY {
+			self.variants.insert(id, res);
+		}
+	}
+
+	/// The variant a construction/reference node resolved to, if any.
+	pub fn variant_of(&self, id: NodeId) -> Option<&VariantResolution> {
+		self.variants.get(&id)
 	}
 
 	/// Attach a `Resolution` to a node, preserving its already-recorded type. Used
@@ -76,7 +100,7 @@ impl Annotations {
 		if id == NodeId::DUMMY {
 			return;
 		}
-		match self.0.get_mut(&id) {
+		match self.infos.get_mut(&id) {
 			Some(info) => info.resolution = Some(resolution),
 			None => debug_assert!(
 				false,

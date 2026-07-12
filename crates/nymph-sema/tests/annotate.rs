@@ -121,3 +121,38 @@ fn records_type_of_collection_literals() {
 		"every inferred expression node should be annotated"
 	);
 }
+
+#[test]
+fn records_variant_resolution() {
+	// Bare construction, bare nullary reference, and qualified construction each
+	// record their resolved (enum, variant) so lowering can emit the tag ABI.
+	let module = parse(
+		r#"
+		enum Opt { Some(value: int), None }
+		func f(): Opt = Some(value = 1)
+		func g(): Opt = None
+		func h(): Opt = Opt.Some(value = 2)
+		"#,
+	);
+	let checked = check_module(&module);
+	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+
+	let mut found = 0;
+	for member in &module.members {
+		let nymph_ast::decl::Declaration::Func { body, .. } = member else {
+			continue;
+		};
+		// Each func body IS a variant expression; its top-level node carries the
+		// resolution.
+		if let Some(res) = checked.annotations.variant_of(body.id) {
+			assert_eq!(res.enum_name, "Opt");
+			assert!(
+				res.variant == "Some" || res.variant == "None",
+				"unexpected variant {:?}",
+				res.variant
+			);
+			found += 1;
+		}
+	}
+	assert_eq!(found, 3, "Some, None, and Opt.Some each recorded once");
+}
