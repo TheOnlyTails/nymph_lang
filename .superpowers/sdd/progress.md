@@ -61,7 +61,8 @@ Scope: match with literal/binding/placeholder/variant patterns (nested), leverag
 - Task 2: complete (checker records variant-pattern resolution span-keyed in Annotations.pattern_variants, at both nullary + struct-path sites; variant_resolution → pub(crate); commit 12daa882).
 - Task 3: complete (lower match → HirExpr::Match, lower_pattern for scalar/binding/placeholder/variant; guards+aggregates panic; commit 75486a33).
 - Task 4: complete (compile_pat → (test, bindings) with re-emittable Subject; emit match as const _s/let _r/if-chain built back-to-front, last arm testless; variant test = _s?.[TAG]===E.V[TAG]; controller inline). Node: unwrap_or(Some 42)→42, None→0, classify 100/200/300. 16 codegen Node tests green, full workspace green, clippy/fmt clean.
-- SLICE 3A COMPLETE. Deferred to 3B: guards, tuple/list/map/struct patterns, range/string/union, standalone `is`. PENDING: independent review.
+- SLICE 3A COMPLETE. Deferred to 3B: guards, tuple/list/map/struct patterns, range/string/union, standalone `is`.
+- Review (Slice 3A): independent subagent review (opus). Verdict "with fixes"; NO Critical. Core engine verified sound (exhaustiveness backs testless-last-arm; nested/optional-chaining/binding/char all correct). Fixes applied in 0f0e7ef0: should_panic test pinning guard-in-lowering panic; Node tests for nested variant (Wrap(i=A(n))) + match-as-subexpression (IIFE path); stale exhaustiveness doc comment + _s/_r naming drift fixed. Accepted as loud deferrals (not silent miscompiles, consistent with codebase): guards + string/range/tuple/list/map/union patterns panic in lowering. Binding-with-subpattern (name=pat) doesn't parse in match arms → that HirPat::Binding sub branch unreachable from match (harmless). Noted pre-existing (not fixed, affects if/while too): gensym _tN temps not reserved vs user identifiers. SLICE 3A REVIEWED + FIXED.
 
 ---
 (Older entries below.)
