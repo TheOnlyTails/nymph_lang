@@ -809,32 +809,42 @@ impl<'a> Emitter<'a> {
 			}
 			HirExpr::Match { scrutinee, arms } => {
 				// const <s> = <scrutinee>; let <r>;
-				// if (<test0>) { <binds0>; <r> = <body0> } else if … else { <bindsN>; <r> = <bodyN> }
-				// → <r>    (totality lets the last arm skip its test)
-				// `s`/`r` are fresh gensym temps (`_tN`), not literally `_s`/`_r`.
+				// <m>: {
+				//   if (<test0>) { <binds0>; if (<guard0>) { <r> = <body0>; break <m>; } }
+				//   …
+				//   { <bindsLast>; <r> = <bodyLast>; }   // last arm: unguarded ⇒ testless tail
+				// }  → <r>
+				// A labeled block (not an if/else-if chain) is required so a matched-but-
+				// guard-failed arm falls through to the next arm. `s`/`r`/`m` are gensym
+				// temps (`_tN`), not literally `_s`/`_r`/`_m`.
 				let s = self.ast.allocator.alloc_str(&self.gensym());
 				let r = self.ast.allocator.alloc_str(&self.gensym());
+				let label = self.ast.allocator.alloc_str(&self.gensym());
 				let mut stmts = self.ast.vec();
 				let scrutinee_expr = self.emit_expr(scrutinee);
 				stmts.push(self.const_decl(s, scrutinee_expr));
 				stmts.push(self.let_uninit(r));
 				let subj = Subject::Temp(s.to_string());
-				// Build the chain back-to-front so each `else` is the previously-built arm.
-				let mut chain: Option<Statement<'a>> = None;
-				for (i, arm) in arms.iter().enumerate().rev() {
-					let (test, binds) = self.compile_pat(&arm.pat, &subj);
-					let block = self.arm_block(r, &binds, &arm.body);
+
+				let mut body = self.ast.vec();
+				for (i, arm) in arms.iter().enumerate() {
 					let is_last = i + 1 == arms.len();
-					chain = Some(if is_last && chain.is_none() {
-						block
+					let (test, binds) = self.compile_pat(&arm.pat, &subj);
+					let guard = arm.guard.as_ref().map(|g| self.emit_expr(g));
+					// An unguarded last arm is the guaranteed fallback (exhaustiveness) → no
+					// test, no break. Any other arm commits then breaks, guarded by its test.
+					if is_last && arm.guard.is_none() {
+						body.push(self.match_arm(r, &binds, &arm.body, None, None, None));
 					} else {
-						let cond = test.unwrap_or_else(|| self.ast.expression_boolean_literal(SPAN, true));
-						self.ast.statement_if(SPAN, cond, block, chain.take())
-					});
+						body.push(self.match_arm(r, &binds, &arm.body, guard, test, Some(label)));
+					}
 				}
-				if let Some(chain) = chain {
-					stmts.push(chain);
-				}
+				let block = self.ast.statement_block(SPAN, body);
+				stmts.push(
+					self
+						.ast
+						.statement_labeled(SPAN, self.ast.label_identifier(SPAN, label), block),
+				);
 				JsValue {
 					stmts,
 					expr: self.ast.expression_identifier(SPAN, r),
@@ -966,38 +976,106 @@ impl<'a> Emitter<'a> {
 				}
 				(Some(test), binds)
 			}
-			// Aggregate/refutable pattern families are compiled in Slice 3B Tasks 3–4.
-			HirPat::Struct { .. }
-			| HirPat::Tuple(_)
-			| HirPat::List { .. }
-			| HirPat::Map(_)
-			| HirPat::Range(_)
-			| HirPat::Or(..) => unreachable!("compiled in slice-3b Task 3/4"),
+			// A struct pattern is irrefutable at its own level (nominal type guarantees
+			// the shape); a field sub-pattern may still contribute a test.
+			HirPat::Struct { fields } => {
+				let mut test: Option<Expression<'a>> = None;
+				let mut binds = Vec::new();
+				for (field, sub) in fields {
+					let field_subj = Subject::Field(Box::new(subj.clone()), field.to_string());
+					let (t, mut b) = self.compile_pat(sub, &field_subj);
+					binds.append(&mut b);
+					test = self.and_test(test, t);
+				}
+				(test, binds)
+			}
+			// A tuple pattern binds by index; irrefutable at its own level.
+			HirPat::Tuple(elems) => {
+				let mut test: Option<Expression<'a>> = None;
+				let mut binds = Vec::new();
+				for (i, sub) in elems.iter().enumerate() {
+					let elem_subj = Subject::Index(Box::new(subj.clone()), i);
+					let (t, mut b) = self.compile_pat(sub, &elem_subj);
+					binds.append(&mut b);
+					test = self.and_test(test, t);
+				}
+				(test, binds)
+			}
+			// List/map/range/union patterns are compiled in Slice 3B Task 4.
+			HirPat::List { .. } | HirPat::Map(_) | HirPat::Range(_) | HirPat::Or(..) => {
+				unreachable!("compiled in slice-3b Task 4")
+			}
 		}
 	}
 
-	/// `{ const <name> = <subject>; …; <result> = <body>; }` — an arm's body block.
-	fn arm_block(
+	/// Combine an accumulated test with an optional new one via `&&` (either may be
+	/// `None`, meaning "always true").
+	fn and_test(
+		&self,
+		acc: Option<Expression<'a>>,
+		next: Option<Expression<'a>>,
+	) -> Option<Expression<'a>> {
+		match (acc, next) {
+			(None, t) | (t, None) => t,
+			(Some(a), Some(b)) => Some(
+				self
+					.ast
+					.expression_logical(SPAN, a, LogicalOperator::And, b),
+			),
+		}
+	}
+
+	/// Emit one match arm as a statement inside the labeled block:
+	/// `if (<test>) { const <binds>; if (<guard>) { <result> = <body>; break <label>; } }`.
+	/// `test`/`guard`/`label` are each optional: no `test` ⇒ the block runs
+	/// unconditionally; no `guard` ⇒ the commit is unconditional; no `label` ⇒ the tail
+	/// arm (no `break`). Bindings precede the guard so the guard can read them.
+	fn match_arm(
 		&self,
 		result: &'a str,
 		binds: &[(String, Subject)],
 		body: &HirExpr,
+		guard: Option<Expression<'a>>,
+		test: Option<Expression<'a>>,
+		label: Option<&'a str>,
 	) -> Statement<'a> {
-		let mut stmts = self.ast.vec();
-		for (name, subj) in binds {
-			let init = self.emit_subject(subj);
-			stmts.push(self.const_decl(name, init));
-		}
+		// commit: `<result> = <body>;` then `break <label>;` (unless this is the tail arm).
+		let mut commit = self.ast.vec();
 		let val = self.emit_value(body);
-		stmts.extend(val.stmts);
+		commit.extend(val.stmts);
 		let assign = self.ast.expression_assignment(
 			SPAN,
 			AssignmentOperator::Assign,
 			self.assign_target(result),
 			val.expr,
 		);
-		stmts.push(self.ast.statement_expression(SPAN, assign));
-		self.ast.statement_block(SPAN, stmts)
+		commit.push(self.ast.statement_expression(SPAN, assign));
+		if let Some(label) = label {
+			commit.push(
+				self
+					.ast
+					.statement_break(SPAN, Some(self.ast.label_identifier(SPAN, label))),
+			);
+		}
+		let committed = match guard {
+			Some(guard) => {
+				let commit_block = self.ast.statement_block(SPAN, commit);
+				self.ast.statement_if(SPAN, guard, commit_block, None)
+			}
+			None => self.ast.statement_block(SPAN, commit),
+		};
+		// block: `{ const <binds>; <committed> }`
+		let mut block = self.ast.vec();
+		for (name, subj) in binds {
+			let init = self.emit_subject(subj);
+			block.push(self.const_decl(name, init));
+		}
+		block.push(committed);
+		let block = self.ast.statement_block(SPAN, block);
+		match test {
+			Some(test) => self.ast.statement_if(SPAN, test, block, None),
+			None => block,
+		}
 	}
 
 	fn emit_binary(&self, op: BinOp, left: Expression<'a>, right: Expression<'a>) -> Expression<'a> {

@@ -235,6 +235,33 @@ fn runs_match_nested_variant() {
 }
 
 #[test]
+fn runs_match_tuple_and_guard() {
+	// Tuple destructuring by index, plus a guard that falls through when it fails.
+	let src = r#"
+		func f(p: #(int, int)): int = match (p) {
+			#(0, y) -> y,
+			#(x, _) if x > 10 -> x,
+			#(x, _) -> 0,
+		}
+	"#;
+	assert_eq!(run(src, "f([0, 7])"), "7"); // first arm (literal 0 matches)
+	assert_eq!(run(src, "f([20, 1])"), "20"); // guard passes
+	assert_eq!(run(src, "f([5, 1])"), "0"); // guard fails → fall through
+}
+
+#[test]
+fn runs_match_struct_pattern() {
+	// A struct pattern is irrefutable: it just binds fields.
+	let src = r#"
+		struct Point(x: int, y: int)
+		func f(pt: Point): int = match (pt) {
+			Point(x = px, y = py) -> px + py,
+		}
+	"#;
+	assert_eq!(run(src, "f(new Point({ x: 3, y: 4 }))"), "7");
+}
+
+#[test]
 fn runs_match_as_subexpression() {
 	// `match` in value position (an operand of `+`) collapses to an IIFE.
 	let src = r#"
