@@ -373,7 +373,7 @@ impl<'m> Checker<'m> {
 			return self.type_of_def(def, span, id);
 		}
 		match self.defs.resolve_variant(name) {
-			Some(Ok((enum_def, variant))) => return self.variant_value(enum_def, variant, id),
+			Some(Ok((enum_def, variant))) => return self.variant_value(enum_def, variant, id, span),
 			Some(Err(())) => {
 				self.emit(span, TypeError::AmbiguousVariant { name: name.into() });
 				return self.interner.error();
@@ -393,7 +393,7 @@ impl<'m> Checker<'m> {
 				.copied()
 				.unwrap_or_else(|| self.fresh()),
 			DefKind::Func { .. } => self.fn_type_of(def),
-			DefKind::Variant { enum_def, variant } => self.variant_value(enum_def, variant, id),
+			DefKind::Variant { enum_def, variant } => self.variant_value(enum_def, variant, id, span),
 			DefKind::Struct { .. } => {
 				self.emit(span, TypeError::StructTypeAsValue);
 				self.interner.error()
@@ -434,23 +434,23 @@ impl<'m> Checker<'m> {
 		}
 	}
 
-	/// The value of an enum variant referenced by name: the enum type itself for a
-	/// field-less variant, or a constructor function for one with fields. Records
-	/// the resolution on `id` so lowering can emit the Symbol-tag ABI.
-	fn variant_value(&mut self, enum_def: DefId, variant: usize, id: NodeId) -> Ty {
-		let res = self.variant_resolution(enum_def, variant);
-		self.annotations.record_variant(id, res);
-		let (adt, subst) = self.instantiate_enum(enum_def);
-		let vsig = self.sigs.enums[&enum_def].variants[variant].clone();
-		if vsig.fields.is_empty() {
+	/// The value of an enum variant *referenced* by name (not constructed). A nullary
+	/// variant is a value of the enum type; a field variant would be a first-class
+	/// constructor, whose value ABI (an object-arg factory) does not match its
+	/// positional function type — so it is rejected rather than silently miscompiled.
+	/// Records the resolution on `id` (nullary only) so lowering can emit the ABI.
+	fn variant_value(&mut self, enum_def: DefId, variant: usize, id: NodeId, span: Span) -> Ty {
+		let vsig = &self.sigs.enums[&enum_def].variants[variant];
+		let fields_empty = vsig.fields.is_empty();
+		let name = vsig.name.clone();
+		if fields_empty {
+			let res = self.variant_resolution(enum_def, variant);
+			self.annotations.record_variant(id, res);
+			let (adt, _) = self.instantiate_enum(enum_def);
 			adt
 		} else {
-			let params = vsig
-				.fields
-				.iter()
-				.map(|(_, t)| self.subst(*t, &subst, None))
-				.collect();
-			self.interner.mk_fn(params, adt)
+			self.emit(span, TypeError::FieldVariantAsValue { variant: name });
+			self.interner.error()
 		}
 	}
 
@@ -698,7 +698,7 @@ impl<'m> Checker<'m> {
 		{
 			let variants = &self.sigs.enums[&def].variants;
 			if let Some(vidx) = variants.iter().position(|v| v.name == member) {
-				return self.variant_value(def, vidx, id);
+				return self.variant_value(def, vidx, id, span);
 			}
 			self.emit(
 				span,

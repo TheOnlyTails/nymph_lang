@@ -140,6 +140,7 @@ fn lowers_enum_decl_and_variants() {
 		func s(): Opt = Some(value = 1)
 		func n(): Opt = None
 		func q(): Opt = Opt.Some(value = 2)
+		func qn(): Opt = Opt.None
 		"#,
 	);
 	// The enum becomes an HirEnum with both variants (Some has a field, None nullary).
@@ -182,5 +183,10 @@ fn lowers_enum_decl_and_variants() {
 		matches!(body("q"), HirExpr::VariantNew { .. }),
 		"qualified ctor → VariantNew, got {:?}",
 		body("q")
+	);
+	assert!(
+		matches!(body("qn"), HirExpr::VariantRef { .. }),
+		"qualified nullary (member access) → VariantRef, got {:?}",
+		body("qn")
 	);
 }

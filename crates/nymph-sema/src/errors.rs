@@ -124,6 +124,13 @@ pub enum TypeError {
 	NonExhaustiveNeedsWildcard,
 	/// A `match` arm can never be reached. **Warning.**
 	UnreachableArm,
+
+	// ── Codegen-ABI limitations ──────────────────────────────────────────────
+	/// A field-carrying variant was used as a first-class value (e.g. `let g = Some`).
+	/// Its constructor is not yet expressible in the value ABI (the emitted factory
+	/// takes an object, not positional args), so this is rejected rather than
+	/// silently miscompiled. Call it to construct instead.
+	FieldVariantAsValue { variant: EcoString },
 }
 
 impl IntoDiagnostic for TypeError {
@@ -148,6 +155,10 @@ impl IntoDiagnostic for TypeError {
 
 			E::ThisOutsideMethod => "`this` is only valid inside a method".into(),
 			E::StructTypeAsValue => "a struct type cannot be used as a value directly".into(),
+			E::FieldVariantAsValue { variant } => format!(
+				"variant `{variant}` carries fields and cannot be used as a value; call it to construct, e.g. `{variant}(field = …)`"
+			)
+			.into(),
 			E::TypeAsValue => "a type cannot be used as a value".into(),
 			E::NotCallable => "this expression is not callable".into(),
 			E::UnknownField { field } => format!("unknown field `{field}`").into(),

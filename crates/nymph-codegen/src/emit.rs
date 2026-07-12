@@ -308,11 +308,12 @@ impl<'a> Emitter<'a> {
 			);
 			stmts.push(self.const_decl(&t_name, sym_call));
 
+			// The `{ [TAG]: t<i> }` object both variant shapes carry.
+			let mut tag_props = self.ast.vec();
+			tag_props.push(self.tag_prop(&t_name));
+			let tag_obj = self.ast.expression_object(SPAN, tag_props);
 			// The variant's value: a factory (fields) or a frozen singleton (nullary).
 			let value = if variant.fields.is_empty() {
-				let mut tag_props = self.ast.vec();
-				tag_props.push(self.tag_prop(&t_name));
-				let tag_obj = self.ast.expression_object(SPAN, tag_props);
 				self.member_call(
 					self.ast.expression_identifier(SPAN, "Object"),
 					"freeze",
@@ -320,9 +321,6 @@ impl<'a> Emitter<'a> {
 				)
 			} else {
 				let factory = self.variant_factory(&t_name);
-				let mut tag_props = self.ast.vec();
-				tag_props.push(self.tag_prop(&t_name));
-				let tag_obj = self.ast.expression_object(SPAN, tag_props);
 				self.member_call(
 					self.ast.expression_identifier(SPAN, "Object"),
 					"assign",

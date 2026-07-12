@@ -94,6 +94,27 @@ fn struct_construction_and_field_access() {
 }
 
 #[test]
+fn field_variant_as_value_is_rejected() {
+	// A field-carrying variant used as a first-class value has no representable
+	// constructor in the current value ABI, so it is rejected (not miscompiled).
+	assert_error_contains(
+		"enum Opt { Some(value: int), None }
+		 func f(): Opt = Some",
+		"cannot be used as a value",
+	);
+}
+
+#[test]
+fn nullary_variant_as_value_is_ok() {
+	// A nullary variant, by contrast, is a perfectly good value of the enum type.
+	assert_ok(
+		"enum Opt { Some(value: int), None }
+		 func f(): Opt = None
+		 func g(): Opt = Opt.None",
+	);
+}
+
+#[test]
 fn struct_field_type_mismatch() {
 	assert_error_contains(
 		"struct Point(x: int, y: int)
