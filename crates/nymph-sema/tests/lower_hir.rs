@@ -232,17 +232,56 @@ fn lowers_match_over_enum() {
 }
 
 #[test]
-#[should_panic(expected = "does not yet handle guards")]
-fn match_guard_panics_in_lowering() {
-	// Guards type-check (sema accepts them and treats guarded arms as fall-through),
-	// but are deferred to 3B. Lowering panics loudly rather than silently
-	// miscompiling — this test pins that behavior so a future regression is caught.
-	lower(
+fn lowers_full_patterns_and_guards() {
+	use nymph_hir::hir::{HirLit, HirPat, HirRange};
+	let hir = lower(
 		r#"
-		func f(n: int): int = match (n) {
-			x if x > 0 -> 1,
+		struct Point(x: int, y: int)
+		enum Color { Red, Green, Blue }
+		func tup(p: #(int, int)): int = match (p) {
+			#(0, y) -> y,
+			#(x, _) if x > 0 -> x,
+			#(x, _) -> 0,
+		}
+		func strukt(pt: Point): int = match (pt) {
+			Point(x = px, y = _) -> px,
+		}
+		func lst(xs: #[int]): int = match (xs) {
+			#[] -> 0,
+			#[a, ...rest] -> a,
+			_ -> -1,
+		}
+		func rng(n: int): int = match (n) {
+			1..10 -> 1,
 			_ -> 0,
+		}
+		func str_match(s: string): int = match (s) {
+			"hi" -> 1,
+			_ -> 0,
+		}
+		func uni(c: Color): boolean = match (c) {
+			Red | Green -> true,
+			Blue -> false,
 		}
 		"#,
 	);
+	let arm0 = |name: &str| {
+		let f = hir.funcs.iter().find(|f| f.name == name).unwrap();
+		let HirExpr::Match { arms, .. } = &f.body else {
+			panic!("expected Match in {name}");
+		};
+		arms.clone()
+	};
+	assert!(matches!(&arm0("tup")[0].pat, HirPat::Tuple(e) if e.len() == 2));
+	assert!(arm0("tup")[1].guard.is_some(), "guard lowered");
+	assert!(matches!(&arm0("strukt")[0].pat, HirPat::Struct { fields } if fields.len() == 2));
+	assert!(
+		matches!(&arm0("lst")[1].pat, HirPat::List { prefix, rest: Some(_), .. } if prefix.len() == 1)
+	);
+	assert!(matches!(
+		&arm0("rng")[0].pat,
+		HirPat::Range(HirRange::Exclusive { .. })
+	));
+	assert!(matches!(&arm0("str_match")[0].pat, HirPat::Lit(HirLit::Str(s)) if s == "hi"));
+	assert!(matches!(&arm0("uni")[0].pat, HirPat::Or(..)));
 }

@@ -17,7 +17,7 @@ use nymph_ast::{
 	ops::{AssignOperator, BinaryOperator, PrefixOperator},
 };
 use nymph_hir::hir::{
-	BinOp, HirArm, HirClass, HirEnum, HirExpr, HirFunc, HirLit, HirModule, HirPat, HirStmt,
+	BinOp, HirArm, HirClass, HirEnum, HirExpr, HirFunc, HirLit, HirModule, HirPat, HirRange, HirStmt,
 	HirVariant, UnOp,
 };
 use nymph_hir::ty::{Interner, TyKind};
@@ -230,16 +230,10 @@ impl Lowerer<'_> {
 			ExprKind::Match { value, arms } => {
 				let arms = arms
 					.iter()
-					.map(|arm| {
-						assert!(
-							arm.guard.is_none(),
-							"slice-3a match lowering does not yet handle guards"
-						);
-						HirArm {
-							pat: self.lower_pattern(&arm.pattern),
-							guard: None,
-							body: self.lower_expr(&arm.body),
-						}
+					.map(|arm| HirArm {
+						pat: self.lower_pattern(&arm.pattern),
+						guard: arm.guard.as_ref().map(|g| self.lower_expr(g)),
+						body: self.lower_expr(&arm.body),
 					})
 					.collect();
 				HirExpr::Match {
@@ -251,11 +245,12 @@ impl Lowerer<'_> {
 		}
 	}
 
-	/// Lower an AST pattern into a `HirPat`. 3A supports scalar literals, bindings,
-	/// placeholders, and variant patterns (nullary + field-carrying, nested). Guards
-	/// and aggregate/range/string/union patterns are deferred to 3B.
+	/// Lower an AST pattern into a `HirPat`. 3B handles the full pattern surface:
+	/// scalar/string literals, bindings, placeholders, variant/struct/tuple/list/map/
+	/// range/union patterns. Deferred edges panic loudly: map-rest, non-literal map
+	/// keys, interpolated/escaped string patterns.
 	fn lower_pattern(&self, pat: &nymph_ast::Spanned<nymph_ast::expr::Pattern>) -> HirPat {
-		use nymph_ast::expr::{Pattern, StructPatternField};
+		use nymph_ast::expr::{ListPatternEntry, Pattern};
 		match &pat.0 {
 			Pattern::Placeholder => HirPat::Wildcard,
 			Pattern::Int(v) => HirPat::Lit(HirLit::Num(v.0 as f64)),
@@ -263,6 +258,7 @@ impl Lowerer<'_> {
 			Pattern::Float(v) => HirPat::Lit(HirLit::Num(v.0.into_inner())),
 			Pattern::Boolean(b) => HirPat::Lit(HirLit::Bool(b.0)),
 			Pattern::Char(c) => HirPat::Lit(HirLit::Char(c.0)),
+			Pattern::String(parts) => HirPat::Lit(HirLit::Str(lower_string_pattern(parts))),
 			Pattern::Grouped(inner) => self.lower_pattern(inner),
 			Pattern::Binding { name, inner } => {
 				// A bare name recorded as a variant is a nullary variant pattern; else a
@@ -285,33 +281,102 @@ impl Lowerer<'_> {
 				}
 			}
 			Pattern::Struct { fields, .. } => {
-				let res = self.annotations.pattern_variant_of(pat.1).expect(
-					"slice-3a struct-path patterns must resolve to a variant (struct patterns deferred)",
-				);
-				let lowered = fields
-					.iter()
-					.filter_map(|f| match &f.0 {
-						StructPatternField::Value { name, value } => {
-							Some((name.0.clone(), self.lower_pattern(value)))
-						}
-						StructPatternField::Named(name) => Some((
-							name.0.clone(),
-							HirPat::Binding {
-								name: name.0.clone(),
-								sub: None,
-							},
-						)),
-						StructPatternField::Rest => None,
-					})
-					.collect();
-				HirPat::Variant {
-					enum_name: res.enum_name.clone(),
-					variant: res.variant.clone(),
-					fields: lowered,
+				let lowered = self.lower_struct_fields(fields);
+				// A `Pattern::Struct` recorded as a variant is a variant pattern; otherwise
+				// it is a struct pattern (irrefutable, binds fields only).
+				match self.annotations.pattern_variant_of(pat.1) {
+					Some(res) => HirPat::Variant {
+						enum_name: res.enum_name.clone(),
+						variant: res.variant.clone(),
+						fields: lowered,
+					},
+					None => HirPat::Struct { fields: lowered },
 				}
 			}
-			other => panic!("slice-3a lowering does not yet handle pattern {other:?}"),
+			Pattern::Tuple(entries) => HirPat::Tuple(self.lower_pattern_items(entries)),
+			Pattern::List(entries) => {
+				let mut prefix = Vec::new();
+				let mut suffix = Vec::new();
+				let mut rest: Option<Option<ecow::EcoString>> = None;
+				for entry in entries {
+					match &entry.0 {
+						ListPatternEntry::Item(p) => {
+							if rest.is_none() {
+								prefix.push(self.lower_pattern(p));
+							} else {
+								suffix.push(self.lower_pattern(p));
+							}
+						}
+						ListPatternEntry::Rest(name) => {
+							assert!(rest.is_none(), "list pattern has at most one `...` rest");
+							rest = Some(name.as_ref().map(|n| n.0.clone()));
+						}
+					}
+				}
+				HirPat::List {
+					prefix,
+					rest,
+					suffix,
+				}
+			}
+			Pattern::Map(entries) => {
+				use nymph_ast::expr::MapPatternEntry;
+				let lowered = entries
+					.iter()
+					.map(|entry| match &entry.0 {
+						MapPatternEntry::Entry(k, v) => (lower_lit_pattern(k), self.lower_pattern(v)),
+						MapPatternEntry::Rest(_) => {
+							panic!("slice-3b lowering does not yet handle map-pattern rest")
+						}
+					})
+					.collect();
+				HirPat::Map(lowered)
+			}
+			Pattern::Range(kind) => HirPat::Range(lower_range_pattern(kind)),
+			Pattern::Union(a, b) => HirPat::Or(
+				Box::new(self.lower_pattern(a)),
+				Box::new(self.lower_pattern(b)),
+			),
 		}
+	}
+
+	/// Lower a struct/variant pattern's fields into `(name, sub-pattern)` pairs.
+	fn lower_struct_fields(
+		&self,
+		fields: &[nymph_ast::Spanned<nymph_ast::expr::StructPatternField>],
+	) -> Vec<(ecow::EcoString, HirPat)> {
+		use nymph_ast::expr::StructPatternField;
+		fields
+			.iter()
+			.filter_map(|f| match &f.0 {
+				StructPatternField::Value { name, value } => {
+					Some((name.0.clone(), self.lower_pattern(value)))
+				}
+				StructPatternField::Named(name) => Some((
+					name.0.clone(),
+					HirPat::Binding {
+						name: name.0.clone(),
+						sub: None,
+					},
+				)),
+				StructPatternField::Rest => None,
+			})
+			.collect()
+	}
+
+	/// Lower tuple-pattern items (no rest allowed in a tuple).
+	fn lower_pattern_items(
+		&self,
+		entries: &[nymph_ast::Spanned<nymph_ast::expr::ListPatternEntry>],
+	) -> Vec<HirPat> {
+		use nymph_ast::expr::ListPatternEntry;
+		entries
+			.iter()
+			.map(|entry| match &entry.0 {
+				ListPatternEntry::Item(p) => self.lower_pattern(p),
+				ListPatternEntry::Rest(_) => panic!("slice-3b lowering does not handle tuple rest"),
+			})
+			.collect()
 	}
 
 	/// If the checker resolved node `id` to a variant, lower a construction call to
@@ -393,6 +458,57 @@ fn param_name(pattern: &nymph_ast::Spanned<nymph_ast::expr::Pattern>) -> ecow::E
 	match &pattern.0 {
 		nymph_ast::expr::Pattern::Binding { name, .. } => name.0.clone(),
 		other => panic!("slice-1 lowering supports only identifier params, got {other:?}"),
+	}
+}
+
+/// Lower a literal pattern to a `HirLit` (for map keys and range bounds). Panics on
+/// a non-literal pattern (3B only supports literal keys/bounds).
+fn lower_lit_pattern(pat: &nymph_ast::Spanned<nymph_ast::expr::Pattern>) -> HirLit {
+	use nymph_ast::expr::Pattern;
+	match &pat.0 {
+		Pattern::Int(v) => HirLit::Num(v.0 as f64),
+		Pattern::UInt(v) => HirLit::Num(v.0 as f64),
+		Pattern::Float(v) => HirLit::Num(v.0.into_inner()),
+		Pattern::Boolean(b) => HirLit::Bool(b.0),
+		Pattern::Char(c) => HirLit::Char(c.0),
+		Pattern::String(parts) => HirLit::Str(lower_string_pattern(parts)),
+		Pattern::Grouped(inner) => lower_lit_pattern(inner),
+		other => panic!("slice-3b expects a literal pattern (map key / range bound), got {other:?}"),
+	}
+}
+
+/// Concatenate a string pattern's text parts. 3B string patterns are text-only.
+fn lower_string_pattern(
+	parts: &[nymph_ast::Spanned<nymph_ast::expr::StringPatternPart>],
+) -> ecow::EcoString {
+	use nymph_ast::expr::StringPatternPart;
+	let mut s = ecow::EcoString::new();
+	for part in parts {
+		match &part.0 {
+			StringPatternPart::Text(t) => s.push_str(t),
+			StringPatternPart::EscapeSequence(_) => {
+				panic!("slice-3b string patterns are text-only (escapes not yet lowered)")
+			}
+		}
+	}
+	s
+}
+
+/// Lower a range pattern's bounds into a `HirRange`.
+fn lower_range_pattern(kind: &nymph_ast::expr::RangePatternKind) -> HirRange {
+	use nymph_ast::expr::RangePatternKind as R;
+	match kind {
+		R::From(p) => HirRange::From(lower_lit_pattern(p)),
+		R::To(p) => HirRange::To(lower_lit_pattern(p)),
+		R::ToInclusive(p) => HirRange::ToInclusive(lower_lit_pattern(p)),
+		R::Exclusive { min, max } => HirRange::Exclusive {
+			min: lower_lit_pattern(min),
+			max: lower_lit_pattern(max),
+		},
+		R::Inclusive { min, max } => HirRange::Inclusive {
+			min: lower_lit_pattern(min),
+			max: lower_lit_pattern(max),
+		},
 	}
 }
 
