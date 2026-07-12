@@ -12,7 +12,7 @@ use oxc::{
 	span::SPAN,
 };
 
-use nymph_hir::hir::{BinOp, HirClass, HirExpr, HirFunc, HirModule, HirStmt, UnOp};
+use nymph_hir::hir::{BinOp, HirClass, HirEnum, HirExpr, HirFunc, HirModule, HirStmt, UnOp};
 
 /// Intermediate representation for expression-valued code.
 ///
@@ -95,7 +95,14 @@ impl<'a> Emitter<'a> {
 
 	pub fn emit_module(&self, module: &HirModule) -> String {
 		let mut stmts = self.ast.vec();
-		// Classes first so constructors are in scope for the functions that build them.
+		// The shared discriminant symbol, emitted once if the module has any enum.
+		if !module.enums.is_empty() {
+			stmts.push(self.emit_tag_const());
+			for hir_enum in &module.enums {
+				stmts.push(self.emit_enum(hir_enum));
+			}
+		}
+		// Classes next so constructors are in scope for the functions that build them.
 		for class in &module.classes {
 			stmts.push(self.emit_class(class));
 		}
@@ -252,6 +259,222 @@ impl<'a> Emitter<'a> {
 		Statement::ClassDeclaration(class)
 	}
 
+	// ── Enum Symbol-tag ABI ────────────────────────────────────────────────────
+
+	/// `const TAG = Symbol.for("nymph.tag");` — the shared discriminant key, the
+	/// same symbol in every module via the global registry.
+	fn emit_tag_const(&self) -> Statement<'a> {
+		let symbol_for = Expression::from(self.ast.member_expression_static(
+			SPAN,
+			self.ast.expression_identifier(SPAN, "Symbol"),
+			self.ast.identifier_name(SPAN, "for"),
+			false,
+		));
+		let mut args = self.ast.vec();
+		args.push(Argument::from(self.ast.expression_string_literal(
+			SPAN,
+			self.ast.allocator.alloc_str("nymph.tag"),
+			None,
+		)));
+		let init = self
+			.ast
+			.expression_call(SPAN, symbol_for, oxc::ast::NONE, args, false);
+		self.const_decl("TAG", init)
+	}
+
+	/// Emit an enum as `const <E> = (() => { const t0 = Symbol("E.V0"); … return
+	/// { V0: <factory|singleton>, … }; })();`. The IIFE scopes each variant's unique
+	/// symbol; field variants become object-arg factories, nullary variants frozen
+	/// singletons — each carrying `[TAG]` so a matcher can compare identity.
+	fn emit_enum(&self, hir_enum: &HirEnum) -> Statement<'a> {
+		let mut stmts = self.ast.vec();
+		let mut props = self.ast.vec();
+		for (i, variant) in hir_enum.variants.iter().enumerate() {
+			let t_name = format!("t{i}");
+			// const t<i> = Symbol("<E>.<V>");
+			let label = format!("{}.{}", hir_enum.name, variant.name);
+			let mut sym_args = self.ast.vec();
+			sym_args.push(Argument::from(self.ast.expression_string_literal(
+				SPAN,
+				self.ast.allocator.alloc_str(&label),
+				None,
+			)));
+			let sym_call = self.ast.expression_call(
+				SPAN,
+				self.ast.expression_identifier(SPAN, "Symbol"),
+				oxc::ast::NONE,
+				sym_args,
+				false,
+			);
+			stmts.push(self.const_decl(&t_name, sym_call));
+
+			// The variant's value: a factory (fields) or a frozen singleton (nullary).
+			let value = if variant.fields.is_empty() {
+				let mut tag_props = self.ast.vec();
+				tag_props.push(self.tag_prop(&t_name));
+				let tag_obj = self.ast.expression_object(SPAN, tag_props);
+				self.member_call(
+					self.ast.expression_identifier(SPAN, "Object"),
+					"freeze",
+					vec![tag_obj],
+				)
+			} else {
+				let factory = self.variant_factory(&t_name);
+				let mut tag_props = self.ast.vec();
+				tag_props.push(self.tag_prop(&t_name));
+				let tag_obj = self.ast.expression_object(SPAN, tag_props);
+				self.member_call(
+					self.ast.expression_identifier(SPAN, "Object"),
+					"assign",
+					vec![factory, tag_obj],
+				)
+			};
+
+			let key = self
+				.ast
+				.property_key_static_identifier(SPAN, self.ast.allocator.alloc_str(&variant.name));
+			props.push(ObjectPropertyKind::ObjectProperty(
+				self
+					.ast
+					.alloc_object_property(SPAN, PropertyKind::Init, key, value, false, false, false),
+			));
+		}
+		let return_obj = self.ast.expression_object(SPAN, props);
+		let iife = JsValue {
+			stmts,
+			expr: return_obj,
+		}
+		.into_expression(self.ast);
+		self.const_decl(hir_enum.name.as_str(), iife)
+	}
+
+	/// `(fields) => { return { [TAG]: <t_name>, ...fields }; }` — a field variant's
+	/// object-argument factory.
+	fn variant_factory(&self, t_name: &str) -> Expression<'a> {
+		let mut obj_props = self.ast.vec();
+		obj_props.push(self.tag_prop(t_name));
+		obj_props.push(
+			self
+				.ast
+				.object_property_kind_spread_property(SPAN, self.ast.expression_identifier(SPAN, "fields")),
+		);
+		let obj = self.ast.expression_object(SPAN, obj_props);
+		let mut body_stmts = self.ast.vec();
+		body_stmts.push(self.ast.statement_return(SPAN, Some(obj)));
+		let body = self.ast.function_body(SPAN, self.ast.vec(), body_stmts);
+		let mut params = self.ast.vec();
+		params.push(self.ast.plain_formal_parameter(
+			SPAN,
+			self.ast.binding_pattern_binding_identifier(SPAN, "fields"),
+		));
+		let formal = self.ast.formal_parameters(
+			SPAN,
+			FormalParameterKind::ArrowFormalParameters,
+			params,
+			oxc::ast::NONE,
+		);
+		self.ast.expression_arrow_function(
+			SPAN,
+			false,
+			false,
+			oxc::ast::NONE,
+			formal,
+			oxc::ast::NONE,
+			body,
+		)
+	}
+
+	/// A computed `[TAG]: <t_name>` object property.
+	fn tag_prop(&self, t_name: &str) -> ObjectPropertyKind<'a> {
+		let key = PropertyKey::from(self.ast.expression_identifier(SPAN, "TAG"));
+		let value = self
+			.ast
+			.expression_identifier(SPAN, self.ast.allocator.alloc_str(t_name));
+		ObjectPropertyKind::ObjectProperty(self.ast.alloc_object_property(
+			SPAN,
+			PropertyKind::Init,
+			key,
+			value,
+			false,
+			false,
+			true,
+		))
+	}
+
+	/// `const <name> = <init>;`
+	fn const_decl(&self, name: &str, init: Expression<'a>) -> Statement<'a> {
+		let pat = self
+			.ast
+			.binding_pattern_binding_identifier(SPAN, self.ast.allocator.alloc_str(name));
+		let declarator = self.ast.variable_declarator(
+			SPAN,
+			VariableDeclarationKind::Const,
+			pat,
+			oxc::ast::NONE,
+			Some(init),
+			false,
+		);
+		let decl = self.ast.variable_declaration(
+			SPAN,
+			VariableDeclarationKind::Const,
+			self.ast.vec1(declarator),
+			false,
+		);
+		Statement::from(Declaration::VariableDeclaration(self.ast.alloc(decl)))
+	}
+
+	/// `<enum>.<variant>` — a member access on the enum's ABI object (a factory or
+	/// a frozen singleton).
+	fn variant_member(&self, enum_name: &str, variant: &str) -> Expression<'a> {
+		Expression::from(
+			self.ast.member_expression_static(
+				SPAN,
+				self
+					.ast
+					.expression_identifier(SPAN, self.ast.allocator.alloc_str(enum_name)),
+				self
+					.ast
+					.identifier_name(SPAN, self.ast.allocator.alloc_str(variant)),
+				false,
+			),
+		)
+	}
+
+	/// `<callee>(<arg>)` — a single-argument call.
+	fn call1(&self, callee: Expression<'a>, arg: Expression<'a>) -> Expression<'a> {
+		let mut args = self.ast.vec();
+		args.push(Argument::from(arg));
+		self
+			.ast
+			.expression_call(SPAN, callee, oxc::ast::NONE, args, false)
+	}
+
+	/// `object.method(...args)`.
+	fn member_call(
+		&self,
+		object: Expression<'a>,
+		method: &str,
+		args: Vec<Expression<'a>>,
+	) -> Expression<'a> {
+		let callee = Expression::from(
+			self.ast.member_expression_static(
+				SPAN,
+				object,
+				self
+					.ast
+					.identifier_name(SPAN, self.ast.allocator.alloc_str(method)),
+				false,
+			),
+		);
+		let mut js_args = self.ast.vec();
+		for a in args {
+			js_args.push(Argument::from(a));
+		}
+		self
+			.ast
+			.expression_call(SPAN, callee, oxc::ast::NONE, js_args, false)
+	}
+
 	fn emit_expr(&self, expr: &HirExpr) -> Expression<'a> {
 		match expr {
 			HirExpr::Num(value) => {
@@ -366,10 +589,30 @@ impl<'a> Emitter<'a> {
 					),
 				)
 			}
-			// Enum variant construction/reference: lowered in Slice 2C Task 3, emitted in Task 4.
-			HirExpr::VariantNew { .. } | HirExpr::VariantRef { .. } => {
-				unreachable!("emitted in slice-2c Task 4")
+			// Variant construction → `<enum>.<variant>({ field: value, … })`.
+			HirExpr::VariantNew {
+				enum_name,
+				variant,
+				fields,
+			} => {
+				let mut props = self.ast.vec();
+				for (name, value) in fields {
+					let key = self
+						.ast
+						.property_key_static_identifier(SPAN, self.ast.allocator.alloc_str(name));
+					let val = self.emit_expr(value);
+					props.push(ObjectPropertyKind::ObjectProperty(
+						self
+							.ast
+							.alloc_object_property(SPAN, PropertyKind::Init, key, val, false, false, false),
+					));
+				}
+				let obj = self.ast.expression_object(SPAN, props);
+				let callee = self.variant_member(enum_name, variant);
+				self.call1(callee, obj)
 			}
+			// Nullary variant reference → `<enum>.<variant>` (the frozen singleton).
+			HirExpr::VariantRef { enum_name, variant } => self.variant_member(enum_name, variant),
 			// A map lookup → `recv.get(key)`.
 			HirExpr::MapGet { recv, key } => {
 				let object = self.emit_expr(recv);

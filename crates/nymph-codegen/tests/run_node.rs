@@ -152,6 +152,42 @@ fn runs_struct_field_through_param() {
 }
 
 #[test]
+fn runs_enum_field_variant() {
+	// A field variant constructs via its factory; a field reads back.
+	let src = r#"
+		enum Opt { Some(value: int), None }
+		func mk(): Opt = Some(value = 7)
+	"#;
+	assert_eq!(run(src, "mk().value"), "7");
+}
+
+#[test]
+fn runs_enum_nullary_identity() {
+	// A nullary variant is a frozen singleton: every reference is identical.
+	let src = r#"
+		enum Opt { Some(value: int), None }
+		func none(): Opt = None
+	"#;
+	assert_eq!(run(src, "none() === Opt.None"), "true");
+}
+
+#[test]
+fn runs_enum_variant_tag_distinct() {
+	// Variants carry the shared TAG symbol; distinct variants have distinct tags.
+	let src = r#"
+		enum A { X(n: int), Y }
+	"#;
+	let tag = "Symbol.for('nymph.tag')";
+	// A constructed X shares X's tag (the factory takes an object arg), and X's tag
+	// differs from Y's.
+	assert_eq!(
+		run(src, &format!("A.X({{ n: 1 }})[{tag}] === A.X[{tag}]")),
+		"true"
+	);
+	assert_eq!(run(src, &format!("A.X[{tag}] === A.Y[{tag}]")), "false");
+}
+
+#[test]
 fn compile_reports_check_errors() {
 	// A type error surfaces as diagnostics, not JS.
 	let result = nymph_codegen::compile("func f(): int = true", "test");

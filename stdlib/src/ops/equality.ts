@@ -1,3 +1,5 @@
+const TAG = Symbol.for("nymph.tag");
+
 export function equals<T>($_this: T, other: T): boolean {
 	// ints, floats, strings, chars, booleans
 	if ($_this === other) return true;
@@ -18,16 +20,17 @@ export function equals<T>($_this: T, other: T): boolean {
 	)
 		return true;
 
+	// Enum variants carry their identity under the shared `TAG` symbol. Compare that
+	// identity, then the string-keyed fields — symbol keys are invisible to
+	// `Object.keys`/`Object.entries`, so `TAG` is excluded from the field walk.
 	if (
 		typeof $_this === "object" &&
 		typeof other === "object" &&
 		$_this &&
 		other &&
-		"~tag" in $_this &&
-		"~tag" in other &&
-		typeof $_this["~tag"] === "string" &&
-		typeof other["~tag"] === "string" &&
-		$_this["~tag"] === other["~tag"] &&
+		TAG in $_this &&
+		TAG in other &&
+		$_this[TAG] === other[TAG] &&
 		Object.keys($_this).length === Object.keys(other).length &&
 		Object.entries($_this).every(([k, v]) => equals(v, other[k]))
 	) {

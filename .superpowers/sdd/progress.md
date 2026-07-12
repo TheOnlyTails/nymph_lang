@@ -48,7 +48,8 @@ Design: structs → JS classes; construction detected via Lowerer struct-name pr
 Plan: docs/superpowers/plans/2026-07-11-nymph-codegen-slice2c-enums.md
 Base (before Task 1): d73eb0e5
 Scope (user chose full bare+qualified via checker recording): enums → TAG=Symbol.for("nymph.tag") + per-enum object of variant factories (fields) / frozen singletons (nullary); checker records (enum,variant) resolution per variant node; lowering emits VariantNew/VariantRef; equality.ts ~tag→[TAG]. Matching (Slice 3), Copy (no mutation path), positional/spread args deferred. NOTE: enum variant syntax uses braces `enum E { V(f: T), N }` (per check.rs), not parens.
-- Task 1: pending — HIR enum + VariantNew/VariantRef nodes
-- Task 2: pending — checker records variant resolution
-- Task 3: pending — lower enum decls + variant exprs
-- Task 4: pending — emit Symbol-tag ABI + equality.ts, Node round-trip
+- Task 1: complete (HIR enum + VariantNew/VariantRef nodes; commit 5c0c50c5).
+- Task 2: complete (checker records (enum,variant) resolution in a NodeId side-table via variant_value/infer_variant_ctor + threaded node id; commit fb59c676). records_variant_resolution green.
+- Task 3: complete (lower enum decls→HirEnum, variant construction→VariantNew, nullary ref→VariantRef via annotation; commit 682499c1). lower_hir 6/6 green.
+- Task 4: complete (emit TAG=Symbol.for + per-enum IIFE of factories/frozen singletons, VariantNew→E.V({…}), VariantRef→E.V; equality.ts ~tag→[TAG]; controller inline). Chose IIFE-per-enum shape (const E = (()=>{const t=Symbol();return{…}})()) reusing JsValue IIFE machinery, avoiding member-target assignments. Node: mk().value→7, none()===Opt.None, cross-variant tags distinct. 14 codegen Node tests green, equality.ts oxlint-clean, full workspace green.
+- SLICE 2C COMPLETE. Deferred: matching/is (Slice 3), Copy (no mutation path), positional/spread args. PENDING: independent whole-branch review of Slice 2C.
