@@ -411,6 +411,79 @@ fn runs_struct_inner_func() {
 }
 
 #[test]
+fn runs_operator_overload_via_nested_impl() {
+	// `+` on a struct with a NESTED `impl Plus<...>` (declared inside the struct
+	// body) dispatches to `.plus(...)` rather than a native JS `+` (Slice 4B, D3/D4).
+	let src = r#"
+		interface Plus<Other, Output> { func plus(other: Other): Output }
+		struct Vec2(x: int, y: int) {
+			impl Plus<Other = Vec2, Output = Vec2> {
+				func plus(other: Vec2): Vec2 = Vec2(x = this.x + other.x, y = this.y + other.y)
+			}
+		}
+		func add(a: Vec2, b: Vec2): Vec2 = a + b
+	"#;
+	assert_eq!(
+		run(
+			src,
+			"add(new Vec2({ x: 1, y: 2 }), new Vec2({ x: 3, y: 4 })).x"
+		),
+		"4"
+	);
+}
+
+#[test]
+fn runs_operator_overload_via_top_level_impl() {
+	// Same behavior as the nested case, but the impl is a TOP-LEVEL
+	// `impl Plus<...> for Vec2` block rather than nested inside the struct body.
+	let src = r#"
+		interface Plus<Other, Output> { func plus(other: Other): Output }
+		struct Vec2(x: int, y: int)
+		impl Plus<Other = Vec2, Output = Vec2> for Vec2 {
+			func plus(other: Vec2): Vec2 = Vec2(x = this.x + other.x, y = this.y + other.y)
+		}
+		func add(a: Vec2, b: Vec2): Vec2 = a + b
+	"#;
+	assert_eq!(
+		run(
+			src,
+			"add(new Vec2({ x: 1, y: 2 }), new Vec2({ x: 3, y: 4 })).x"
+		),
+		"4"
+	);
+}
+
+#[test]
+fn runs_operator_inside_method_body_stays_native_but_outer_dispatches() {
+	// The outer `a + b` inside `combine` dispatches to `.plus(...)` (a `UserImpl`
+	// resolution); the inner `this.x + other.x` inside the method body itself is
+	// `float + float`, which stays a native JS `+` (`BuiltinEager`).
+	let src = r#"
+		interface Plus<Other, Output> { func plus(other: Other): Output }
+		struct Vec2(x: float, y: float)
+		impl Plus<Other = Vec2, Output = float> for Vec2 {
+			func plus(other: Vec2): float = this.x + other.x
+		}
+		func combine(a: Vec2, b: Vec2): float = a + b
+	"#;
+	assert_eq!(
+		run(
+			src,
+			"combine(new Vec2({ x: 1, y: 2 }), new Vec2({ x: 3, y: 4 }))"
+		),
+		"4"
+	);
+}
+
+#[test]
+fn runs_mixed_int_and_float_stays_native() {
+	// An `int` literal against a `float` operand widens rather than dispatching to
+	// an overload (no impl needed) — this stays a native JS `+`.
+	let src = "func bump(x: float): float = x + 1";
+	assert_eq!(run(src, "bump(2.5)"), "3.5");
+}
+
+#[test]
 fn compile_reports_check_errors() {
 	// A type error surfaces as diagnostics, not JS.
 	let result = nymph_codegen::compile("func f(): int = true", "test");
