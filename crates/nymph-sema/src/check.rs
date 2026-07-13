@@ -80,6 +80,13 @@ pub struct Checker<'m> {
 	/// are recorded once at mint time and persist, because the parameter is baked into a
 	/// stored signature and its bound must still resolve at every call site.
 	pub(crate) synthetic_bounds: FxHashMap<ParamIdx, Vec<DefId>>,
+	/// Set only while checking an interface's own default-method body
+	/// (`check_interface_default_body`, Slice 4C-b): `(interface, this's ParamIdx)`.
+	/// `resolve_method` consults this to resolve a call to another method of *this
+	/// same interface* on `this` directly against the interface's own signature,
+	/// bypassing impl search entirely — see `resolve_method`'s doc comment on why
+	/// the ordinary impl/blanket search is wrong for this one case.
+	pub(crate) checking_interface_default: Option<(DefId, ParamIdx)>,
 
 	/// The per-expression decisions recorded for the lowering pass (resolved type,
 	/// selected operator/method impl). Keyed by [`nymph_ast::NodeId`]. Emitted
@@ -192,6 +199,7 @@ impl<'m> Checker<'m> {
 			alias_depth: 0,
 			synthetic_params: 0,
 			synthetic_bounds: FxHashMap::default(),
+			checking_interface_default: None,
 			annotations: crate::annotate::Annotations::default(),
 			pending_operators: Vec::new(),
 		}

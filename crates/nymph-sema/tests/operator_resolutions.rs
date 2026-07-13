@@ -176,10 +176,12 @@ fn user_struct_plus_is_user_impl() {
 }
 
 #[test]
-fn comparable_less_than_is_interface_default_method() {
+fn comparable_less_than_is_materialized_user_impl() {
 	// `v1 < v2` desugars to `Comparable::less_than`, which `Vec2` never defines
 	// directly — only `compare_to`. `less_than` is only reachable as the
-	// interface's *default* body, so this resolves as `UserImplDefaultMethod`.
+	// interface's *default* body; Slice 4C-b materializes un-overridden defaults
+	// onto the implementing class, so codegen can dispatch to it directly and
+	// this now resolves as `UserImpl` (was `UserImplDefaultMethod` pre-4C-b).
 	let res = resolution_for(
 		"interface Comparable<Other> {
 		   func compare_to(other: Other): int
@@ -192,7 +194,7 @@ fn comparable_less_than_is_interface_default_method() {
 		 func f(v1: Vec2, v2: Vec2): boolean = v1 < v2",
 		"f",
 	);
-	assert_eq!(res.dispatch, DispatchKind::UserImplDefaultMethod);
+	assert_eq!(res.dispatch, DispatchKind::UserImpl);
 	assert_eq!(res.method, "less_than");
 }
 
@@ -575,10 +577,11 @@ fn negate_user_struct_direct_impl_is_user_impl() {
 }
 
 #[test]
-fn negate_interface_default_method_is_user_impl_default_method() {
+fn negate_interface_default_method_is_materialized_user_impl() {
 	// `-v` resolves through `Negate`'s interface *default* body (`negate`, provided
 	// in terms of `base`), which `Vec2`'s impl never defines directly — only
-	// `base` — so this resolves as `UserImplDefaultMethod`.
+	// `base`. Slice 4C-b materializes the un-overridden default onto the class, so
+	// this now resolves as `UserImpl` (was `UserImplDefaultMethod` pre-4C-b).
 	let res = prefix_resolution_for(
 		"interface Negate<Output> {
 		   func base(): Output
@@ -591,7 +594,7 @@ fn negate_interface_default_method_is_user_impl_default_method() {
 		 func f(v: Vec2): Vec2 = -v",
 		"f",
 	);
-	assert_eq!(res.dispatch, DispatchKind::UserImplDefaultMethod);
+	assert_eq!(res.dispatch, DispatchKind::UserImpl);
 	assert_eq!(res.method, "negate");
 }
 

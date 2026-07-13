@@ -13,7 +13,9 @@ use crate::errors::TypeError;
 use ecow::EcoString;
 use nymph_ast::{
 	Spanned,
-	decl::{Declaration, FuncDeclaration, ImplMember, StructInnerMember},
+	decl::{
+		Declaration, FuncDeclaration, ImplMember, InterfaceElement, InterfaceMember, StructInnerMember,
+	},
 	expr::Expr,
 	ty::GenericParam,
 };
@@ -501,6 +503,11 @@ impl<'m> Checker<'m> {
 		// `impl … for …` and the `impl Iface { … }` blocks nested in ADT bodies.
 		self.check_impl_for_bodies();
 		self.check_inner_impl_bodies();
+		// An interface's own default-bodied methods (Slice 4C-b): checked once,
+		// generically, with `this` bound to a rigid synthetic `Param` constrained to
+		// the interface — see `check_interface_default_bodies` for why that (and not
+		// `SelfTy`) is the receiver type that actually resolves method calls.
+		self.check_interface_default_bodies();
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -655,5 +662,136 @@ impl<'m> Checker<'m> {
 			self.self_ty = prev_self;
 			self.pop_scope();
 		}
+	}
+
+	/// Check the default (non-abstract) `func` bodies declared directly in every
+	/// `interface { … }` block. Nothing else visited these before Slice 4C-b:
+	/// `collect_interfaces` (iface.rs) only lowers signatures, discarding the body,
+	/// and every other body-checking path here re-traverses `impl`/`impl … for`
+	/// blocks, never `Declaration::Interface` itself.
+	fn check_interface_default_bodies(&mut self) {
+		let module = self.module;
+		let ifaces: Vec<(DefId, usize)> = self
+			.defs
+			.defs
+			.iter()
+			.enumerate()
+			.filter_map(|(i, d)| match d.kind {
+				DefKind::Interface { member } => Some((DefId(i as u32), member)),
+				_ => None,
+			})
+			.collect();
+		for (iface_id, member) in ifaces {
+			let Declaration::Interface {
+				generics, members, ..
+			} = &module.members[member]
+			else {
+				continue;
+			};
+			for m in members {
+				let InterfaceMember::Element(element) = &m.0 else {
+					continue;
+				};
+				let InterfaceElement::Func {
+					meta,
+					body: Some(body),
+				} = &element.0
+				else {
+					continue;
+				};
+				self.check_interface_default_body(iface_id, generics, meta, body);
+			}
+		}
+	}
+
+	/// Check one interface default method body. `this` cannot be bound to `SelfTy`
+	/// directly — `head_of(SelfTy)` is `None`, so `resolve_method` on a `SelfTy`
+	/// receiver would find no candidates and no fallback (`SelfTy` isn't
+	/// `TyKind::Param`, so the generic-parameter fallback in `resolve_method`
+	/// doesn't trigger either). Instead `this` is bound to a *rigid synthetic
+	/// `Param`* placed right after the interface's own generics (and this method's
+	/// own, if it declares any), with `param_bounds` recording that it is
+	/// constrained by this very interface — exactly mirroring how a bounded generic
+	/// function parameter's body (`f<T: Comparable<Other = T>>`) already checks
+	/// today via `resolve_param_method` (solve.rs). A body whose operator depends on
+	/// `Self` (e.g. `this + other` under an arithmetic-operator interface) still
+	/// resolves through that same generic-bound path, recording
+	/// `MethodSource::GenericBound` → `DispatchKind::UserImplDefaultMethod` — an
+	/// honest deferral (never a silent miscompile), not a defect of this check.
+	///
+	/// Reuses the method's signature already collected into `self.interfaces` (its
+	/// params/ret in terms of `SelfTy`/interface `Param(k)`) rather than re-lowering
+	/// it, so an omitted return type's inference variable is the same one every
+	/// caller sees.
+	fn check_interface_default_body(
+		&mut self,
+		iface_id: DefId,
+		iface_generics: &'m [Spanned<GenericParam>],
+		meta: &'m FuncDeclaration,
+		body: &'m Expr,
+	) {
+		let iface_len = iface_generics.len();
+		let self_idx = ParamIdx((iface_len + meta.generics.len()) as u32);
+
+		let mut scope = build_param_scope(iface_generics);
+		for (j, g) in meta.generics.iter().enumerate() {
+			scope.insert(g.0.name.0.clone(), ParamIdx((iface_len + j) as u32));
+		}
+		self.param_bounds.clear();
+		self.record_param_bounds(iface_generics, 0);
+		self.record_param_bounds(&meta.generics, iface_len);
+		self
+			.param_bounds
+			.entry(self_idx)
+			.or_default()
+			.push(iface_id);
+
+		self.push_params(scope);
+		self.push_scope();
+
+		let self_ty = self.interner.mk_param(self_idx);
+		let prev_self = self.self_ty.replace(self_ty);
+		// See `resolve_method`'s doc comment: a call to another method of *this same
+		// interface* on `this` must bypass ordinary impl search (which could
+		// otherwise match this interface's own blanket impl elsewhere in the
+		// program and wrongly pin its generics to `Self`).
+		let prev_checking = self
+			.checking_interface_default
+			.replace((iface_id, self_idx));
+
+		let Some(method) = self
+			.interfaces
+			.get(&iface_id)
+			.and_then(|i| i.methods.get(&meta.name.0))
+			.cloned()
+		else {
+			// `collect_interfaces` inserts a signature for every `Func` element, so
+			// this is unreachable in practice; kept total rather than `unreachable!()`
+			// so a future desync fails as a no-op instead of a panic mid-typecheck.
+			self.checking_interface_default = prev_checking;
+			self.self_ty = prev_self;
+			self.pop_scope();
+			self.pop_params();
+			return;
+		};
+
+		let empty = FxHashMap::default();
+		for (param, &ty) in meta.params.iter().zip(&method.params) {
+			let ty = self.subst(ty, &empty, Some(self_ty));
+			self.bind_pattern(&param.0.name, ty, param.0.mutable);
+		}
+		let ret = self.subst(method.ret, &empty, Some(self_ty));
+		let prev_ret = self.ret_ty.replace(ret);
+		self.check(body, ret);
+		// Drain this body's deferred operators now, while its `param_bounds` (the
+		// interface's generics + the synthetic self bound) are still live — see
+		// `pending_operators`'s doc comment.
+		self.finalize_pending_operators();
+
+		self.ret_ty = prev_ret;
+		self.checking_interface_default = prev_checking;
+		self.self_ty = prev_self;
+		self.pop_scope();
+		self.pop_params();
 	}
 }

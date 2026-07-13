@@ -1300,8 +1300,11 @@ impl<'m> Checker<'m> {
 	/// Resolve an operator's method call, reporting an error if no impl provides it.
 	/// The paired [`DispatchKind`] tells the binary-operator caller (Slice 4B)
 	/// whether the matched method is a real, directly-callable method (`UserImpl` —
-	/// covers both an inherent method and one an impl defines itself) or only an
-	/// interface default body codegen can't yet reach (`UserImplDefaultMethod`).
+	/// covers an inherent method, an impl-direct method, and (Slice 4C-b) an
+	/// interface default method, since lowering now materializes un-overridden
+	/// defaults onto the implementing class) or only reachable through a
+	/// still-generic receiver codegen can't dispatch at compile time
+	/// (`UserImplDefaultMethod`, from `MethodSource::GenericBound`).
 	/// Unary callers (`infer_prefix`, Slice 4C-a) use the same `DispatchKind` the
 	/// same way binary callers do — the two now share one lowering mechanism.
 	fn dispatch_operator(
@@ -1317,14 +1320,23 @@ impl<'m> Checker<'m> {
 		match self.resolve_method(recv, method, args, &lits, span) {
 			Some(res) => {
 				let dispatch = match res.source {
-					MethodSource::Inherent | MethodSource::ImplDirect => DispatchKind::UserImpl,
-					// No current binary-operator call site reaches `GenericBound` (they all
-					// gate on `is_adt(recv)` before calling here, which a generic parameter
-					// never satisfies) — treated as the same loud deferral as an interface
-					// default rather than guessed at, per D2/D3's "never miscompile silently".
-					MethodSource::InterfaceDefault | MethodSource::GenericBound => {
-						DispatchKind::UserImplDefaultMethod
+					// Slice 4C-b materializes un-overridden interface default methods onto
+					// every implementing struct's class (`lower_hir.rs`), so a method that
+					// only exists as an interface default is now a real, directly-callable
+					// class method just like an inherent/impl-direct one.
+					MethodSource::Inherent | MethodSource::ImplDirect | MethodSource::InterfaceDefault => {
+						DispatchKind::UserImpl
 					}
+					// `GenericBound` *is* reachable here: the arithmetic-operator arm above
+					// routes a `Param`-typed receiver through `dispatch_operator` too (see the
+					// `TyKind::Param` check alongside `is_adt` at its call sites), and a
+					// default body checked with `this` bound to a rigid synthetic `Param`
+					// (`check_interface_default_bodies`) hits this same path for a
+					// Self-dependent arithmetic/bitwise operator. The concrete impl is only
+					// known once the parameter is instantiated, which this
+					// type-erased-at-lowering compiler does not track, so it stays a loud
+					// lowering deferral rather than a silent miscompile.
+					MethodSource::GenericBound => DispatchKind::UserImplDefaultMethod,
 				};
 				(res.ty, dispatch)
 			}

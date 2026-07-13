@@ -16,7 +16,7 @@ use rustc_hash::FxHashMap;
 use crate::check::Checker;
 use crate::ids::{DefId, ParamIdx};
 use crate::iface::head_of;
-use crate::ty::Ty;
+use crate::ty::{Ty, TyKind};
 
 /// The maximum obligation-solving depth, guarding against cyclic impls.
 const MAX_DEPTH: u32 = 32;
@@ -37,10 +37,11 @@ pub(crate) enum MethodSource {
 	InterfaceDefault,
 	/// Resolved through a generic parameter's interface bound (`resolve_param_method`):
 	/// the concrete impl is only known once the parameter is instantiated, which
-	/// this type-erased-at-lowering compiler does not track. No current operator
-	/// call site reaches this (`is_adt` gates receivers to concrete ADTs before
-	/// dispatching), but it is tagged honestly rather than reused as one of the
-	/// other variants in case a future caller does reach it.
+	/// this type-erased-at-lowering compiler does not track. Reached by a
+	/// `Param`-typed receiver — either a bounded generic function parameter, or
+	/// `this` inside an interface default body (Slice 4C-b binds it to a rigid
+	/// synthetic `Param` so the body checks generically once for every impl) —
+	/// tagged honestly rather than reused as one of the other variants.
 	GenericBound,
 }
 
@@ -300,6 +301,65 @@ impl Checker<'_> {
 		span: Span,
 	) -> Option<MethodResolution> {
 		let recv = self.shallow_resolve(recv);
+
+		// While checking an interface's own default-method body (Slice 4C-b), `this`
+		// is bound to a rigid synthetic `Param` so the body checks once, generically,
+		// for every future implementor (`check_interface_default_body`). A call to
+		// *another method of that same interface* on `this` must resolve directly
+		// against the interface's own signature — the ordinary impl search below
+		// would instead match that interface's own blanket impl, if one happens to
+		// exist anywhere in the program (a real, common pattern — e.g. stdlib's
+		// `impl<T> Comparable<Other = T> for T`), which pins the interface's *other*
+		// generics to `Self` for this one lookup. That is correct when the receiver
+		// really is some concrete `T`, but wrong here: the default body being checked
+		// must stay valid for every possible implementor, most of which do *not* set
+		// `Other = Self`. Bypassing impl search (no `isubst`: the interface's own
+		// generics stay the literal, still-abstract `Param(k)` they already are)
+		// keeps e.g. `this.compare_to(other)` inside `Comparable`'s own `less_than`
+		// default checked against `compare_to`'s *abstract* signature, matching what
+		// `other`'s own (equally abstract) parameter type already is.
+		if let Some((iface_id, self_idx)) = self.checking_interface_default
+			&& matches!(self.interner.kind(recv), TyKind::Param(idx) if *idx == self_idx)
+			&& let Some(method) = self
+				.interfaces
+				.get(&iface_id)
+				.and_then(|i| i.methods.get(name))
+				.cloned()
+		{
+			let empty = FxHashMap::default();
+			let params: Vec<Ty> = method
+				.params
+				.iter()
+				.map(|t| self.subst(*t, &empty, Some(recv)))
+				.collect();
+			let ret = self.subst(method.ret, &empty, Some(recv));
+			if params.len() != arg_tys.len() {
+				self.emit(
+					span,
+					TypeError::NamedWrongArgCount {
+						name: name.into(),
+						expected: params.len(),
+						found: arg_tys.len(),
+					},
+				);
+				return Some(MethodResolution {
+					ty: ret,
+					source: MethodSource::GenericBound,
+				});
+			}
+			for (i, (param, arg)) in params.iter().zip(arg_tys).enumerate() {
+				self.unify_arg(
+					*param,
+					*arg,
+					arg_lits.get(i).copied().unwrap_or(false),
+					span,
+				);
+			}
+			return Some(MethodResolution {
+				ty: ret,
+				source: MethodSource::GenericBound,
+			});
+		}
 
 		// Inherent methods take priority over interface methods.
 		if let Some(ret) = self.resolve_inherent(recv, name, arg_tys, arg_lits, span) {

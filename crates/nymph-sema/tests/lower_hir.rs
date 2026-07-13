@@ -514,13 +514,13 @@ fn lowers_compound_assign_on_int_stays_native() {
 }
 
 #[test]
-#[should_panic(expected = "default method")]
-fn user_comparable_default_method_panics_in_lowering() {
+fn user_comparable_default_method_materializes_and_dispatches() {
 	// `v1 < v2` resolves through `Comparable`'s interface *default* method
-	// (`less_than`, provided in terms of `compare_to`), which codegen cannot yet
-	// dispatch to — lowering must panic loudly rather than emit a call to a method
-	// that doesn't exist on the class (Slice 4B, D4: `UserImplDefaultMethod`).
-	lower(
+	// (`less_than`, provided in terms of `compare_to`), which `Vec2`'s impl never
+	// defines directly. Slice 4C-b materializes the un-overridden default onto
+	// `Vec2`'s class, so `<` dispatches to a real, directly-callable method
+	// (was a lowering panic pre-4C-b).
+	let hir = lower(
 		r#"
 		interface Comparable<Other> {
 			func compare_to(other: Other): int
@@ -531,6 +531,94 @@ fn user_comparable_default_method_panics_in_lowering() {
 			func compare_to(other: Vec2): int = 0
 		}
 		func lt(v1: Vec2, v2: Vec2): boolean = v1 < v2
+		"#,
+	);
+	let class = hir.classes.iter().find(|c| c.name == "Vec2").expect("Vec2");
+	let mut names: Vec<_> = class.methods.iter().map(|m| m.name.as_str()).collect();
+	names.sort_unstable();
+	assert_eq!(names, ["compare_to", "less_than"]);
+
+	let lt = hir.funcs.iter().find(|f| f.name == "lt").expect("lt");
+	let HirExpr::Call { callee, args } = &lt.body else {
+		panic!("expected Call, got {:?}", lt.body);
+	};
+	let HirExpr::Field { recv, name } = callee.as_ref() else {
+		panic!("expected Field callee, got {callee:?}");
+	};
+	assert_eq!(name, "less_than");
+	assert!(matches!(recv.as_ref(), HirExpr::Local(n) if n == "v1"));
+	assert_eq!(args.len(), 1);
+	assert!(matches!(&args[0], HirExpr::Local(n) if n == "v2"));
+}
+
+#[test]
+fn overridden_default_method_is_not_duplicated() {
+	// `Vec2` overrides `Comparable`'s default `less_than` directly — the class
+	// must carry the override's body, not also materialize the interface's
+	// default (Slice 4C-b, V1: override always wins).
+	let hir = lower(
+		r#"
+		interface Comparable<Other> {
+			func compare_to(other: Other): int
+			func less_than(other: Other): boolean = true
+		}
+		struct Vec2(x: int, y: int)
+		impl Comparable<Other = Vec2> for Vec2 {
+			func compare_to(other: Vec2): int = 0
+			func less_than(other: Vec2): boolean = false
+		}
+		"#,
+	);
+	let class = hir.classes.iter().find(|c| c.name == "Vec2").expect("Vec2");
+	assert_eq!(class.methods.len(), 2);
+	let less_than = class
+		.methods
+		.iter()
+		.find(|m| m.name == "less_than")
+		.expect("less_than");
+	// The override's body (`false`), not the interface default's (`true`).
+	assert_eq!(less_than.body, HirExpr::Bool(false));
+}
+
+#[test]
+#[should_panic(expected = "multiple methods named")]
+fn colliding_defaults_from_two_interfaces_panics_in_lowering() {
+	// Two interfaces both default a method named `describe`; `Vec2` implements
+	// both without overriding either. Materializing both defaults onto the same
+	// class would silently produce a duplicate-named JS method (last one wins);
+	// V4 requires a loud panic naming the struct and method instead.
+	lower(
+		r#"
+		interface A { func describe(): int = 1 }
+		interface B { func describe(): int = 2 }
+		struct Vec2(x: int, y: int)
+		impl A for Vec2 { }
+		impl B for Vec2 { }
+		"#,
+	);
+}
+
+#[test]
+#[should_panic(expected = "does not yet dispatch operator to interface default method")]
+fn bounded_generic_plus_default_still_panics_in_lowering() {
+	// A bounded generic function's `t1 + t2` resolves through `T`'s interface
+	// bound (`MethodSource::GenericBound`), not through any concrete impl — the
+	// concrete impl is only known once `T` is instantiated, which this
+	// type-erased-at-lowering compiler does not track. Codegen still cannot
+	// dispatch that at compile time, so this stays a loud lowering deferral (V2:
+	// only `InterfaceDefault` flips to `UserImpl`; `GenericBound` is unchanged).
+	//
+	// NB: comparison/equality/logical operators on a `Param` receiver do *not*
+	// reach `dispatch_operator` at all (a pre-existing, out-of-scope hazard —
+	// see the Slice 4C-b plan's investigation brief, "corrections" (1)), so this
+	// pin deliberately uses an arithmetic operator, which does.
+	lower(
+		r#"
+		interface Plus<Other, Output> {
+			func base(): Output
+			func plus(other: Other): Output = this.base()
+		}
+		func add<T: Plus<Other = T, Output = T>>(t1: T, t2: T): T = t1 + t2
 		"#,
 	);
 }
@@ -622,13 +710,13 @@ fn lowers_primitive_bit_not_to_unary_unchanged() {
 }
 
 #[test]
-#[should_panic(expected = "default method")]
-fn user_negate_default_method_panics_in_lowering() {
+fn user_negate_default_method_materializes_and_dispatches() {
 	// `-v` resolves through `Negate`'s interface *default* method (`negate`,
-	// provided in terms of `base`), which codegen cannot yet dispatch to —
-	// lowering must panic loudly rather than emit a call to a method that doesn't
-	// exist on the class (Slice 4C-a, U3: `UserImplDefaultMethod`).
-	lower(
+	// provided in terms of `base`), which `Vec2`'s impl never defines directly.
+	// Slice 4C-b materializes the un-overridden default (which itself calls
+	// `this.base()`, another materialized/impl method) onto `Vec2`'s class, so
+	// `-v` dispatches to a real method (was a lowering panic pre-4C-b).
+	let hir = lower(
 		r#"
 		interface Negate<Output> {
 			func base(): Output
@@ -641,6 +729,37 @@ fn user_negate_default_method_panics_in_lowering() {
 		func f(v: Vec2): Vec2 = -v
 		"#,
 	);
+	let class = hir.classes.iter().find(|c| c.name == "Vec2").expect("Vec2");
+	let mut names: Vec<_> = class.methods.iter().map(|m| m.name.as_str()).collect();
+	names.sort_unstable();
+	assert_eq!(names, ["base", "negate"]);
+
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::Call { callee, args } = &f.body else {
+		panic!("expected Call, got {:?}", f.body);
+	};
+	let HirExpr::Field { recv, name } = callee.as_ref() else {
+		panic!("expected Field callee, got {callee:?}");
+	};
+	assert_eq!(name, "negate");
+	assert!(matches!(recv.as_ref(), HirExpr::Local(n) if n == "v"));
+	assert!(args.is_empty());
+
+	// The materialized `negate` body itself lowers `this.base()` as an ordinary
+	// call on `This` — same mechanism impl-defined method bodies already use.
+	let negate = class
+		.methods
+		.iter()
+		.find(|m| m.name == "negate")
+		.expect("negate");
+	let HirExpr::Call { callee, args } = &negate.body else {
+		panic!("expected Call, got {:?}", negate.body);
+	};
+	assert!(args.is_empty());
+	assert!(matches!(
+		callee.as_ref(),
+		HirExpr::Field { recv, name } if matches!(recv.as_ref(), HirExpr::This) && name == "base"
+	));
 }
 
 #[test]

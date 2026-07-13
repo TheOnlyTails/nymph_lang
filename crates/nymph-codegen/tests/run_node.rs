@@ -594,6 +594,101 @@ fn runs_prefix_bit_not_overload_dispatches_to_method() {
 	assert_eq!(run(src, "flip(new Mask({ a: 5, b: 0 })).b"), "-1");
 }
 
+// ── Slice 4C-b: interface default method materialization ───────────────────
+
+#[test]
+fn runs_interface_default_dispatches_via_operator() {
+	// `v1 < v2` desugars to `Comparable::less_than`, which `Vec2` never defines
+	// directly — only `compare_to`. Slice 4C-b materializes `less_than`'s
+	// interface-default body onto `Vec2`'s class, and `less_than` itself calls
+	// `this.compare_to(other)` (another materialized/impl method) — both must
+	// actually run under Node and return the right boolean.
+	let src = r#"
+		interface Comparable<Other> {
+			func compare_to(other: Other): int
+			func less_than(other: Other): boolean = this.compare_to(other) < 0
+		}
+		struct Vec2(x: int, y: int)
+		impl Comparable<Other = Vec2> for Vec2 {
+			func compare_to(other: Vec2): int = this.x - other.x
+		}
+		func lt(v1: Vec2, v2: Vec2): boolean = v1 < v2
+	"#;
+	assert_eq!(
+		run(
+			src,
+			"lt(new Vec2({ x: 1, y: 0 }), new Vec2({ x: 2, y: 0 }))"
+		),
+		"true"
+	);
+	assert_eq!(
+		run(
+			src,
+			"lt(new Vec2({ x: 2, y: 0 }), new Vec2({ x: 1, y: 0 }))"
+		),
+		"false"
+	);
+}
+
+#[test]
+fn runs_interface_default_explicit_call() {
+	// The same materialized `less_than` default, called explicitly
+	// (`v.less_than(w)`) rather than through the `<` operator. Before Slice 4C-b
+	// this was a *silent* miscompile (a zero-diagnostic program whose lowered JS
+	// called a method that didn't exist on the class); now it's a real method.
+	let src = r#"
+		interface Comparable<Other> {
+			func compare_to(other: Other): int
+			func less_than(other: Other): boolean = this.compare_to(other) < 0
+		}
+		struct Vec2(x: int, y: int)
+		impl Comparable<Other = Vec2> for Vec2 {
+			func compare_to(other: Vec2): int = this.x - other.x
+		}
+		func lt(v1: Vec2, v2: Vec2): boolean = v1.less_than(v2)
+	"#;
+	assert_eq!(
+		run(
+			src,
+			"lt(new Vec2({ x: 1, y: 0 }), new Vec2({ x: 2, y: 0 }))"
+		),
+		"true"
+	);
+	assert_eq!(
+		run(
+			src,
+			"lt(new Vec2({ x: 2, y: 0 }), new Vec2({ x: 1, y: 0 }))"
+		),
+		"false"
+	);
+}
+
+#[test]
+fn runs_interface_default_override_wins() {
+	// `Vec2` overrides `less_than` directly rather than relying on the interface
+	// default — the override's body must be the one that actually runs (a
+	// constant `false`), not the materialized default (V1: override always wins).
+	let src = r#"
+		interface Comparable<Other> {
+			func compare_to(other: Other): int
+			func less_than(other: Other): boolean = this.compare_to(other) < 0
+		}
+		struct Vec2(x: int, y: int)
+		impl Comparable<Other = Vec2> for Vec2 {
+			func compare_to(other: Vec2): int = this.x - other.x
+			func less_than(other: Vec2): boolean = false
+		}
+		func lt(v1: Vec2, v2: Vec2): boolean = v1 < v2
+	"#;
+	assert_eq!(
+		run(
+			src,
+			"lt(new Vec2({ x: 1, y: 0 }), new Vec2({ x: 2, y: 0 }))"
+		),
+		"false"
+	);
+}
+
 #[test]
 fn compile_reports_check_errors() {
 	// A type error surfaces as diagnostics, not JS.

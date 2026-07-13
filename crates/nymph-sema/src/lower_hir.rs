@@ -12,9 +12,11 @@
 
 use ecow::EcoString;
 use nymph_ast::{
+	Ident, Spanned,
 	decl::{Declaration, FuncDeclaration, Module},
 	expr::{CallArg, Expr, ExprKind, ListItem, MapEntry, Statement},
 	ops::{AssignOperator, BinaryOperator, PrefixOperator},
+	ty::{GenericArg, GenericParam},
 };
 use nymph_hir::hir::{
 	BinOp, HirArm, HirClass, HirEnum, HirExpr, HirFunc, HirLit, HirMethod, HirModule, HirPat,
@@ -62,29 +64,62 @@ struct Lowerer<'a> {
 
 impl Lowerer<'_> {
 	fn lower_module(&self, module: &Module) -> HirModule {
-		use nymph_ast::decl::{ImplMember, StructInnerMember};
+		use nymph_ast::decl::{ImplMember, InterfaceMember, StructInnerMember};
 		use nymph_ast::ty::Type;
+
+		// Interface bodies, for materializing un-overridden default methods onto
+		// implementing struct classes (Slice 4C-b). Resolution is by bare name
+		// within this flattened module — stdlib isn't linked in yet, so no
+		// cross-module lookup is needed (mirrors the checker's own
+		// `finish_interface_impl`, which resolves the same way via `defs.get`).
+		let mut interfaces_by_name: FxHashMap<EcoString, &[Spanned<InterfaceMember>]> =
+			FxHashMap::default();
+		for decl in &module.members {
+			if let Declaration::Interface { name, members, .. } = decl {
+				interfaces_by_name.insert(name.0.clone(), members.as_slice());
+			}
+		}
 
 		// First pass: collect instance methods from top-level `impl <Named>` blocks
 		// (inherent, 4A) and top-level `impl <Interface> for <Named>` blocks
-		// (interface impls, 4B/D5), keyed by the target type name. Non-`func`
+		// (interface impls, 4B/D5, now also materializing un-overridden interface
+		// defaults per Slice 4C-b), keyed by the target type name. Non-`func`
 		// members (namespaced statics, nested impls, `impl mut`) are deferred and
 		// panic loudly rather than silently disappearing.
 		let mut methods_by_type: FxHashMap<EcoString, Vec<HirMethod>> = FxHashMap::default();
 		for decl in &module.members {
-			let (type_, members) = match decl {
-				Declaration::Impl { type_, members, .. } => (type_, members),
-				Declaration::ImplFor { type_, members, .. } => (type_, members),
-				_ => continue,
-			};
-			if let Type::Reference { name, .. } = &type_.0 {
-				let entry = methods_by_type.entry(name.0.clone()).or_default();
-				for member in members {
-					match &member.0 {
-						ImplMember::Func { meta, body, .. } => entry.push(self.lower_method(meta, body)),
-						other => panic!("slice-4b lowering does not yet handle impl member {other:?}"),
+			match decl {
+				Declaration::Impl { type_, members, .. } => {
+					// Inherent impl: no interface, no defaults to materialize. A
+					// non-`Reference` target silently contributes nothing here, same as
+					// before Slice 4C-b — unchanged, out of this slice's scope.
+					if let Type::Reference { name, .. } = &type_.0 {
+						let entry = methods_by_type.entry(name.0.clone()).or_default();
+						for member in members {
+							match &member.0 {
+								ImplMember::Func { meta, body, .. } => entry.push(self.lower_method(meta, body)),
+								other => panic!("slice-4b lowering does not yet handle impl member {other:?}"),
+							}
+						}
 					}
 				}
+				Declaration::ImplFor {
+					generics,
+					type_,
+					for_interface,
+					members,
+					..
+				} => {
+					self.push_impl_for_methods(
+						generics,
+						type_,
+						for_interface,
+						members,
+						&interfaces_by_name,
+						&mut methods_by_type,
+					);
+				}
+				_ => {}
 			}
 		}
 
@@ -101,7 +136,9 @@ impl Lowerer<'_> {
 					..
 				} => {
 					// Methods from top-level impls, the struct's own inner `func`s, and
-					// nested `impl <Interface> { .. }` blocks inside the struct body.
+					// nested `impl <Interface> { .. }` blocks inside the struct body
+					// (also materializing that interface's un-overridden defaults,
+					// Slice 4C-b).
 					let mut methods = methods_by_type.remove(&name.0).unwrap_or_default();
 					for member in members {
 						match &member.0 {
@@ -111,21 +148,36 @@ impl Lowerer<'_> {
 									panic!("slice-4a lowering does not yet handle struct inner member {other:?}")
 								}
 							},
-							StructInnerMember::Impl { members, .. } => {
+							StructInnerMember::Impl {
+								interface, members, ..
+							} => {
+								let mut overridden: FxHashSet<EcoString> = FxHashSet::default();
 								for member in members {
 									match &member.0 {
 										ImplMember::Func { meta, body, .. } => {
-											methods.push(self.lower_method(meta, body))
+											overridden.insert(meta.name.0.clone());
+											methods.push(self.lower_method(meta, body));
 										}
 										other => panic!("slice-4b lowering does not yet handle impl member {other:?}"),
 									}
 								}
+								self.push_unoverridden_defaults(
+									&interface.0,
+									&overridden,
+									&interfaces_by_name,
+									&mut methods,
+								);
 							}
 							other => {
 								panic!("slice-4a lowering does not yet handle struct inner member {other:?}")
 							}
 						}
 					}
+					// V4: two interfaces (or an override and a same-named default)
+					// materializing the same method name on one class is a real
+					// ambiguity codegen cannot silently resolve (JS would just let the
+					// last one win) — panic loudly, naming the struct and method.
+					self.assert_no_duplicate_methods(&name.0, &methods);
 					classes.push(HirClass {
 						name: name.0.clone(),
 						fields: fields.iter().map(|f| f.0.name.0.clone()).collect(),
@@ -154,6 +206,120 @@ impl Lowerer<'_> {
 			funcs,
 			classes,
 			enums,
+		}
+	}
+
+	/// Lower a top-level `impl <Interface> for <Type> { … }`'s own methods into
+	/// `methods_by_type[Type]`, then materialize (append) that interface's
+	/// un-overridden default-bodied methods (Slice 4C-b, V1: impl-provided methods
+	/// first in source order, then defaults in interface source order).
+	fn push_impl_for_methods(
+		&self,
+		generics: &[Spanned<GenericParam>],
+		type_: &Spanned<nymph_ast::ty::Type>,
+		for_interface: &(Ident, Vec<Spanned<GenericArg>>),
+		members: &[Spanned<nymph_ast::decl::ImplMember>],
+		interfaces_by_name: &FxHashMap<EcoString, &[Spanned<nymph_ast::decl::InterfaceMember>]>,
+		methods_by_type: &mut FxHashMap<EcoString, Vec<HirMethod>>,
+	) {
+		use nymph_ast::decl::ImplMember;
+		use nymph_ast::ty::Type;
+
+		let Type::Reference { name, .. } = &type_.0 else {
+			// A structural target (e.g. `impl Plus<...> for #[int] { .. }`) type-checks
+			// today (the checker resolves its operator as a real `UserImpl`), but this
+			// lowering has no representation for attaching methods to anything but a
+			// named struct class — silently dropping it would let the checker's
+			// resolution point at a method that was never emitted. Loud is the floor.
+			panic!(
+				"slice-4c-b lowering does not yet support `impl {} for {:?}` targeting a non-named type",
+				for_interface.0.0, type_.0
+			);
+		};
+
+		// A blanket impl (`impl<T> Iface for T`) parses its target as a bare
+		// `Type::Reference` naming the impl's own generic parameter. Left
+		// unchecked, that name could coincide with an unrelated real struct in the
+		// module and silently attach the blanket's methods to it; refuse instead
+		// (V5: blanket impls stay a loud deferral, never materialized).
+		if generics.iter().any(|g| g.0.name.0 == name.0) {
+			panic!(
+				"slice-4c-b lowering does not yet support blanket impls (`impl<{0}> {1} for {0}`)",
+				name.0, for_interface.0.0
+			);
+		}
+
+		let entry = methods_by_type.entry(name.0.clone()).or_default();
+		let mut overridden: FxHashSet<EcoString> = FxHashSet::default();
+		for member in members {
+			match &member.0 {
+				ImplMember::Func { meta, body, .. } => {
+					overridden.insert(meta.name.0.clone());
+					entry.push(self.lower_method(meta, body));
+				}
+				other => panic!("slice-4b lowering does not yet handle impl member {other:?}"),
+			}
+		}
+		self.push_unoverridden_defaults(&for_interface.0, &overridden, interfaces_by_name, entry);
+	}
+
+	/// Append `iface_name`'s default-bodied methods that aren't in `overridden` to
+	/// `out`, each lowered via the same [`Self::lower_method`] path an impl's own
+	/// methods use (Slice 4C-b, V1). The interface's default body is checked once,
+	/// generically (`check_interface_default_bodies`), and its annotations are
+	/// impl-independent (no per-impl type information is consulted while lowering
+	/// an operator/variant/map-index dispatch), so lowering the same AST body once
+	/// per implementing impl is sound — see the Slice 4C-b plan's investigation
+	/// brief ("annotations_shape").
+	fn push_unoverridden_defaults(
+		&self,
+		iface_name: &Ident,
+		overridden: &FxHashSet<EcoString>,
+		interfaces_by_name: &FxHashMap<EcoString, &[Spanned<nymph_ast::decl::InterfaceMember>]>,
+		out: &mut Vec<HirMethod>,
+	) {
+		use nymph_ast::decl::{InterfaceElement, InterfaceMember};
+
+		let Some(members) = interfaces_by_name.get(&iface_name.0) else {
+			// The checker already rejects an `impl … for …`/`impl … { … }` naming an
+			// undefined or non-interface type (`TypeError::NotAnInterface`) before
+			// lowering ever runs, so a zero-diagnostic program always has this entry.
+			panic!(
+				"slice-4c-b lowering: impl references unknown interface `{}`",
+				iface_name.0
+			);
+		};
+		for m in *members {
+			let InterfaceMember::Element(element) = &m.0 else {
+				continue;
+			};
+			let InterfaceElement::Func {
+				meta,
+				body: Some(body),
+			} = &element.0
+			else {
+				continue;
+			};
+			if overridden.contains(&meta.name.0) {
+				continue;
+			}
+			out.push(self.lower_method(meta, body));
+		}
+	}
+
+	/// V4: panic loudly, naming the struct and the offending method, if two
+	/// materialized/overridden methods share a name on one class — two interfaces
+	/// both defaulting the same method name, an override colliding with the other
+	/// interface's default, or two overrides sharing a name. JS would let the last
+	/// one silently win; this compiler never miscompiles silently instead.
+	fn assert_no_duplicate_methods(&self, struct_name: &EcoString, methods: &[HirMethod]) {
+		let mut seen: FxHashSet<&EcoString> = FxHashSet::default();
+		for m in methods {
+			assert!(
+				seen.insert(&m.name),
+				"slice-4c-b lowering: struct `{struct_name}` has multiple methods named `{}` (conflicting interface defaults/overrides)",
+				m.name
+			);
 		}
 	}
 
