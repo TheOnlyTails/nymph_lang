@@ -4,6 +4,7 @@ use nymph_hir::hir::{BinOp, HirEnum, HirExpr, HirFunc, HirMethod, HirModule, Hir
 #[test]
 fn emits_a_function_returning_a_number() {
 	let module = HirModule {
+		lets: vec![],
 		funcs: vec![HirFunc {
 			name: "answer".into(),
 			params: vec![],
@@ -22,6 +23,7 @@ fn emits_a_function_returning_a_number() {
 fn emits_arithmetic_and_params() {
 	// function add(a, b) { return a + b * 2; }
 	let module = HirModule {
+		lets: vec![],
 		funcs: vec![HirFunc {
 			name: "add".into(),
 			params: vec!["a".into(), "b".into()],
@@ -47,6 +49,7 @@ fn emits_arithmetic_and_params() {
 fn emits_call_and_string() {
 	// function greet() { return log("hi"); }
 	let module = HirModule {
+		lets: vec![],
 		funcs: vec![HirFunc {
 			name: "greet".into(),
 			params: vec![],
@@ -70,6 +73,7 @@ fn emits_method_less_enum_without_a_prototype() {
 	// X1: a method-less enum must keep today's exact shape — no `proto`, no
 	// `Object.create` — regardless of the new methodful codepath existing.
 	let module = HirModule {
+		lets: vec![],
 		funcs: vec![],
 		classes: vec![],
 		enums: vec![HirEnum {
@@ -107,6 +111,7 @@ fn emits_enum_with_methods_prototype_shape() {
 	// is created via `Object.create(proto)`, while the tag ABI (Object.freeze /
 	// factory-tagging Object.assign) stays intact.
 	let module = HirModule {
+		lets: vec![],
 		funcs: vec![],
 		classes: vec![],
 		enums: vec![HirEnum {

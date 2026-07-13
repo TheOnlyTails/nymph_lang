@@ -8,9 +8,21 @@ use ecow::EcoString;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HirModule {
+	pub lets: Vec<HirLet>,
 	pub funcs: Vec<HirFunc>,
 	pub classes: Vec<HirClass>,
 	pub enums: Vec<HirEnum>,
+}
+
+/// A top-level `let`/`let mut` binding → a module-scope `const`/`let` declaration
+/// (Slice 4E, Y3). Kept in source order relative to other top-level lets; emitted
+/// after classes/enums (so a let constructing/referencing one is safe) and before
+/// functions (whose JS `function` declarations hoist regardless of placement).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirLet {
+	pub name: EcoString,
+	pub mutable: bool,
+	pub value: HirExpr,
 }
 
 /// A `struct` declaration → a JS class. Fields are stored in declaration order;
@@ -67,6 +79,14 @@ pub enum HirStmt {
 	},
 	/// A bare expression evaluated for its effect.
 	Expr(HirExpr),
+	/// `return <value>;` (`None` for a bare `return`). Statement-flavored: valid
+	/// only directly inside a `HirExpr::Block`'s `stmts` — never reachable as a
+	/// subexpression. Lowering panics loudly if `return` appears anywhere else
+	/// (an expression position, or with a label); emit panics loudly if a
+	/// `Return` is reached while emitting an expression-position (IIFE-wrapped)
+	/// block/if/match, where a JS `return` would target the IIFE rather than the
+	/// enclosing function (Slice 4E, Y1).
+	Return(Option<HirExpr>),
 }
 
 #[derive(Clone, Debug, PartialEq)]

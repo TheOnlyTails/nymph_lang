@@ -6,8 +6,8 @@ use oxc::{
 };
 
 use nymph_hir::hir::{
-	BinOp, HirClass, HirEnum, HirExpr, HirFunc, HirLit, HirMethod, HirModule, HirPat, HirRange,
-	HirStmt, UnOp,
+	BinOp, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit, HirMethod, HirModule, HirPat,
+	HirRange, HirStmt, UnOp,
 };
 
 /// A re-emittable reference to a sub-value of the scrutinee, used while compiling a
@@ -96,6 +96,17 @@ pub struct Emitter<'a> {
 	/// Counter for fresh temporary names (result temporaries for value-position
 	/// control flow). `Cell` keeps the emit methods `&self`.
 	gensym: std::cell::Cell<u32>,
+	/// Set while emitting a control-flow expression's (`Block`/`If`/`While`/
+	/// `Match`) IIFE body from `emit_expr`'s subexpression-position fallthrough —
+	/// the ONLY place `JsValue::into_expression` wraps in an arrow-IIFE (the enum
+	/// factory path in `emit_enum` never contains user statement code, so it needs
+	/// no guard). A JS `return` emitted while this is set would return from that
+	/// IIFE, not the enclosing function, so `emit_stmt`'s `HirStmt::Return` arm
+	/// asserts against it. `Cell` keeps emit methods `&self`; save/restore (never a
+	/// bare `set(true)`) around each use so the flag can't stay stuck true after a
+	/// nested subexpression-position construct returns control to a statement-
+	/// position caller (Slice 4E, Y1).
+	in_iife_subexpr: std::cell::Cell<bool>,
 }
 
 impl Default for Emitter<'_> {
@@ -114,6 +125,7 @@ impl<'a> Emitter<'a> {
 			ast: AstBuilder::new(alloc),
 			alloc,
 			gensym: std::cell::Cell::new(0),
+			in_iife_subexpr: std::cell::Cell::new(false),
 		}
 	}
 
@@ -136,6 +148,14 @@ impl<'a> Emitter<'a> {
 		// Classes next so constructors are in scope for the functions that build them.
 		for class in &module.classes {
 			stmts.push(self.emit_class(class));
+		}
+		// Top-level `let`s (Slice 4E, Y3) after classes/enums (a let constructing or
+		// referencing one must see it already defined — module-scope `const`/`let`
+		// is TDZ, unlike a function declaration) and before functions (whose JS
+		// `function` declarations hoist, so a let calling one is safe regardless of
+		// relative placement). Kept in source order relative to each other.
+		for let_ in &module.lets {
+			stmts.push(self.emit_module_let(let_));
 		}
 		for func in &module.funcs {
 			stmts.push(self.emit_func(func));
@@ -215,6 +235,43 @@ impl<'a> Emitter<'a> {
 			&self.ast,
 		);
 		Statement::FunctionDeclaration(function)
+	}
+
+	/// `const <name> = <value>;` (or `let` when `mutable`) — a top-level `let`
+	/// (Slice 4E, Y3). Mirrors `HirStmt::Let`'s mutable → `Let`/`Const` mapping in
+	/// `emit_stmt`, generalizing the const-only `const_decl` helper for the `let
+	/// mut` case (the checker accepts top-level `let mut`, so codegen honors it).
+	fn emit_module_let(&self, let_: &HirLet) -> Statement<'a> {
+		let kind = if let_.mutable {
+			VariableDeclarationKind::Let
+		} else {
+			VariableDeclarationKind::Const
+		};
+		let init = self.emit_expr(&let_.value);
+		let pat = BindingPattern::new_binding_identifier(
+			SPAN,
+			self.ast.allocator.alloc_str(&let_.name),
+			&self.ast,
+		);
+		let declarator = VariableDeclarator::new(
+			SPAN,
+			kind,
+			pat,
+			oxc::ast::NONE,
+			Some(init),
+			false,
+			&self.ast,
+		);
+		let decl = VariableDeclaration::new(
+			SPAN,
+			kind,
+			ArenaVec::from_value_in(declarator, &self.ast),
+			false,
+			&self.ast,
+		);
+		Statement::from(Declaration::VariableDeclaration(ArenaBox::new_in(
+			decl, &self.ast,
+		)))
 	}
 
 	/// Emit a struct as `class <Name> { constructor(fields) { Object.assign(this, fields); } }`.
@@ -867,11 +924,25 @@ impl<'a> Emitter<'a> {
 				)
 			}
 			// Control-flow expressions in value position collapse to an expression
-			// (an IIFE when they carry leading statements).
+			// (an IIFE when they carry leading statements). Mark that we're inside
+			// that IIFE's body while building it — a `return` reached anywhere
+			// underneath (e.g. a braced match-arm body used as a subexpression)
+			// would target this IIFE, not the enclosing function, so
+			// `emit_stmt`'s `HirStmt::Return` arm asserts against this flag.
+			// Save/restore rather than a bare `set(true)`: this same fallthrough
+			// arm can recurse (a match arm's own body can itself be a
+			// subexpression-position `if`), and a bare set would leave the flag
+			// stuck true once the outer call returns to a statement-position
+			// caller (Slice 4E, Y1).
 			HirExpr::Block { .. }
 			| HirExpr::If { .. }
 			| HirExpr::While { .. }
-			| HirExpr::Match { .. } => self.emit_value(expr).into_expression(self.ast),
+			| HirExpr::Match { .. } => {
+				let prev = self.in_iife_subexpr.replace(true);
+				let result = self.emit_value(expr).into_expression(self.ast);
+				self.in_iife_subexpr.set(prev);
+				result
+			}
 		}
 	}
 
@@ -976,9 +1047,39 @@ impl<'a> Emitter<'a> {
 					decl, &self.ast,
 				)))
 			}
+			// A statement-position control-flow expression flattens directly into a
+			// plain JS `BlockStatement` via `block_stmt` (matching how a `while` body
+			// already does), rather than going through `emit_expr`'s subexpression
+			// fallthrough — which would otherwise wrap it in a needless IIFE, and
+			// (post Slice 4E, Y1) trip the `return`-inside-IIFE guard for a
+			// statement-position `if`/`while`/`match` that legitimately contains a
+			// `return`. The `BlockStatement` still gives it its own JS scope
+			// (unaffected by Y2 shadowing) and keeps any gensym `let _tN` temps
+			// scoped to it, same as before.
+			HirStmt::Expr(
+				e @ (HirExpr::Block { .. }
+				| HirExpr::If { .. }
+				| HirExpr::While { .. }
+				| HirExpr::Match { .. }),
+			) => self.block_stmt(e),
 			HirStmt::Expr(e) => {
 				let expr = self.emit_expr(e);
 				Statement::new_expression_statement(SPAN, expr, &self.ast)
+			}
+			// `return <value>;` (Slice 4E, Y1). The `assert!` is the load-bearing
+			// half of the scope guard: a `Return` reached while `in_iife_subexpr` is
+			// set means it's transitively underneath a subexpression-position
+			// block/if/match's IIFE (see `emit_expr`'s control-flow arm) — a JS
+			// `return` there would return from the IIFE, not the enclosing
+			// function/method, so this must panic loudly rather than emit
+			// quietly-wrong control flow.
+			HirStmt::Return(value) => {
+				assert!(
+					!self.in_iife_subexpr.get(),
+					"slice-4e: `return` inside an expression-position block/if/match would return from the emitted IIFE, not the enclosing function"
+				);
+				let value_expr = value.as_ref().map(|v| self.emit_expr(v));
+				Statement::new_return_statement(SPAN, value_expr, &self.ast)
 			}
 		}
 	}

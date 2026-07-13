@@ -1177,8 +1177,6 @@ fn golden_run_inventory_program() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-#[ignore = "FINDING: `return` type-checks clean but panics in lowering (slice-2a catch-all); \
-            not in any progress.md deferral list — a zero-diagnostic program ICEs"]
 fn golden_finding_return_statement_ices_in_lowering() {
 	// (`0 - n` rather than a line-leading `-n`, which would continue the previous
 	// expression as a binary minus — the parse gotcha, not the finding.)
@@ -1193,8 +1191,6 @@ fn golden_finding_return_statement_ices_in_lowering() {
 }
 
 #[test]
-#[ignore = "FINDING: let-shadowing type-checks clean but emits invalid JS \
-            (`const x` redeclared in one scope) — Node dies with SyntaxError; silent miscompile"]
 fn golden_finding_let_shadowing_emits_invalid_js() {
 	let src = r#"
 		func f(): int = {
@@ -1207,8 +1203,6 @@ fn golden_finding_let_shadowing_emits_invalid_js() {
 }
 
 #[test]
-#[ignore = "FINDING: a top-level `let` type-checks clean but is silently dropped from the \
-            emitted module — references to it throw ReferenceError at runtime; silent miscompile"]
 fn golden_finding_top_level_let_is_silently_dropped() {
 	let src = r#"
 		let answer = 42

@@ -864,3 +864,298 @@ fn compile_produces_runnable_js() {
 		"well-typed program should compile: {result:?}"
 	);
 }
+
+// ── Slice 4E: `return`, let-shadowing, module lets ──────────────────────────
+
+#[test]
+fn runs_early_return_with_value_inside_a_statement_position_if() {
+	// The corpus `abs` shape: an early `return n` inside a statement-position
+	// `if`, falling through to the trailing expression otherwise (Slice 4E, Y1).
+	let src = r#"
+		func abs(n: int): int = {
+			if (n >= 0) { return n }
+			0 - n
+		}
+	"#;
+	assert_eq!(run(src, "abs(5)"), "5");
+	assert_eq!(run(src, "abs(-3)"), "3");
+	assert_eq!(run(src, "abs(0)"), "0");
+}
+
+#[test]
+fn runs_bare_return_in_a_void_function() {
+	let src = r#"
+		func noop(): void = {
+			return
+		}
+	"#;
+	// A `void` function still has SOME js return value (`undefined`) — assert via
+	// a driver call that only checks it doesn't throw.
+	assert_eq!(run(src, "(noop(), 'ok')"), "ok");
+}
+
+#[test]
+fn runs_return_inside_a_statement_position_while() {
+	// A `return` inside a `while` body must target the enclosing function, not
+	// some IIFE — the `while` body is flattened via `block_stmt`, never wrapped.
+	// (`result` starts with `-1` on the SAME statement as its `let`, not as a
+	// line-leading operator that would continue the `while` via subtraction.)
+	let src = r#"
+		func first_over(xs: #[int], limit: int): int = {
+			let mut i = 0
+			let mut result = -1
+			while (i < 3) {
+				if (xs[i] > limit) { return xs[i] }
+				i += 1
+			}
+			result
+		}
+	"#;
+	assert_eq!(run(src, "first_over([1, 5, 9], 3)"), "5");
+	assert_eq!(run(src, "first_over([1, 2, 3], 100)"), "-1");
+}
+
+#[test]
+fn runs_return_inside_a_statement_position_match() {
+	// A braced match-arm body (`-> { return .. }`) in a STATEMENT-position match
+	// (not a subexpression) emits for free — the whole `match` is flattened via
+	// `block_stmt`, never wrapped in an IIFE, so the `return` inside targets the
+	// enclosing function correctly.
+	let src = r#"
+		func classify(n: int): int = {
+			match (n) {
+				0 -> { return 100 },
+				_ -> { },
+			}
+			n * 2
+		}
+	"#;
+	assert_eq!(run(src, "classify(0)"), "100");
+	assert_eq!(run(src, "classify(5)"), "10");
+}
+
+#[test]
+#[should_panic(expected = "would return from the emitted IIFE")]
+fn return_inside_a_subexpression_position_match_arm_panics_in_emit() {
+	// A braced match-arm body used as a SUBEXPRESSION (here, a `let` initializer)
+	// IS wrapped in an IIFE by emit — a `return` there would return from that
+	// IIFE, not the enclosing function. Lowering accepts it (the arm body is a
+	// block whose last statement is `return`), so this panics later, in emit,
+	// via the scope guard (Slice 4E, Y1).
+	let src = r#"
+		func f(n: int): int = {
+			let x = match (n) {
+				0 -> { return 7 },
+				_ -> n,
+			}
+			x
+		}
+	"#;
+	run(src, "f(0)");
+}
+
+#[test]
+fn runs_same_scope_let_shadow_computes_using_the_prior_binding() {
+	// `let x = 1; let x = x + 1; x * 10` — the redeclaration renames in emitted
+	// JS (avoiding a `SyntaxError: Identifier 'x' has already been declared`),
+	// and its RHS reads the PRIOR `x` (Slice 4E, Y2).
+	let src = r#"
+		func f(): int = {
+			let x = 1
+			let x = x + 1
+			x * 10
+		}
+	"#;
+	assert_eq!(run(src, "f()"), "20");
+}
+
+#[test]
+fn runs_triple_same_scope_let_shadow() {
+	let src = r#"
+		func f(): int = {
+			let x = 1
+			let x = x + 1
+			let x = x * 10
+			x + 1
+		}
+	"#;
+	assert_eq!(run(src, "f()"), "21");
+}
+
+#[test]
+fn runs_nested_block_shadow_keeps_both_values_distinct() {
+	// A nested block's `let x` shadows the outer `x` inside its own JS scope
+	// without any rename needed; the outer `x` is unaffected once the branch
+	// exits.
+	let src = r#"
+		func f(): int = {
+			let x = 1
+			let y = if (true) { let x = 5 x * 2 } else { 0 }
+			x + y
+		}
+	"#;
+	assert_eq!(run(src, "f()"), "11"); // outer x=1, y = 5*2=10 -> 11
+}
+
+#[test]
+fn runs_shadowed_name_inside_a_method_body() {
+	// A body `let` reusing a PARAM's name (same merged JS scope) also needs the
+	// rename to avoid a JS redeclaration error.
+	let src = r#"
+		struct Counter(n: int)
+		impl Counter {
+			func bump(n: int): int = {
+				let n = n + this.n
+				n
+			}
+		}
+	"#;
+	assert_eq!(run(src, "new Counter({ n: 10 }).bump(5)"), "15");
+}
+
+#[test]
+fn runs_top_level_let_referenced_by_a_function() {
+	let src = r#"
+		let answer = 42
+		func f(): int = answer
+	"#;
+	assert_eq!(run(src, "f()"), "42");
+}
+
+#[test]
+fn runs_two_top_level_lets_where_the_second_references_the_first() {
+	let src = r#"
+		let base = 10
+		let total = base + 5
+		func f(): int = total
+	"#;
+	assert_eq!(run(src, "f()"), "15");
+}
+
+#[test]
+fn runs_top_level_let_referencing_a_function_result() {
+	let src = r#"
+		let r = f2()
+		func f2(): int = 9
+		func f(): int = r
+	"#;
+	assert_eq!(run(src, "f()"), "9");
+}
+
+#[test]
+fn runs_mutable_top_level_let() {
+	let src = "let mut counter = 0
+	           func bump(): int = counter + 1";
+	assert_eq!(run(src, "bump()"), "1");
+}
+
+#[test]
+fn runs_nested_block_shadow_that_reads_the_outer_binding() {
+	// The exact reported hazard: a nested block's `let i` redeclares the outer
+	// `i` AND its own initializer reads that outer `i` (`let i = i + 100`).
+	// Without the Y2 fix, both bindings would emit as the identical JS
+	// identifier `i`, and JS's block-scope hoisting (TDZ) would make the inner
+	// initializer read the not-yet-initialized inner `i` instead of the outer
+	// one, throwing `ReferenceError: Cannot access 'i' before initialization`.
+	let src = r#"
+		func f(): int = {
+			let i = 1
+			let r = { let i = i + 100 i }
+			r
+		}
+	"#;
+	assert_eq!(run(src, "f()"), "101");
+}
+
+#[test]
+fn runs_top_level_let_referencing_a_later_let() {
+	// `a`'s initializer directly names `b`, which is declared LATER in source —
+	// naive source-order emission throws a TDZ `ReferenceError` under Node.
+	let src = r#"
+		let a = b + 1
+		let b = 10
+		func f(): int = a
+	"#;
+	assert_eq!(run(src, "f()"), "11");
+}
+
+#[test]
+fn runs_top_level_let_via_a_function_reading_a_later_let() {
+	// `a`'s initializer calls `g`, whose body reads `b` — a top-level `let`
+	// declared textually AFTER both `a` and `g`. Function declarations hoist,
+	// but `b`'s own `const` line executing only AFTER `a`'s means calling `g()`
+	// as part of `a`'s initializer reads `b` while still in its TDZ, unless the
+	// lets are reordered.
+	let src = r#"
+		let a = g()
+		func g(): int = b
+		let b = 5
+	"#;
+	assert_eq!(run(src, "a"), "5");
+}
+
+#[test]
+fn runs_top_level_lets_via_mutually_recursive_functions() {
+	// `f` and `g` call each other (mutual recursion). `f`'s nested call to `g`
+	// means the single-pass memoized DFS resolver hits `f` again while it's
+	// still `in_progress`, truncates that back-edge to `{}`, and PERMANENTLY
+	// memoizes `f`'s transitive let-deps as `{d}` — missing `c` and `z`, which
+	// are only reachable through `g`. `ef` (which calls `f`) then gets ordered
+	// after `d` but before `c`/`z`, and the emitted JS throws a TDZ
+	// `ReferenceError: Cannot access 'c' before initialization`. The correct
+	// answer: `f(1)` -> `g(0)` -> `c` -> `z + 10` -> `1 + 10` -> `11`.
+	let src = r#"
+		func f(n: int): int = if (n <= 0) { d } else { g(n - 1) }
+		func g(n: int): int = if (n <= 0) { c } else { f(n - 1) }
+		let ef = f(1)
+		let c = z + 10
+		let d = 100
+		let z = 1
+	"#;
+	assert_eq!(run(src, "ef"), "11");
+}
+
+#[test]
+fn runs_top_level_lets_via_a_three_function_mutual_recursion_cycle() {
+	// `f -> g -> h -> f`, a three-function cycle, with the let-deps spread
+	// across all three (`x` only reachable via `f`, `y` only via `g`, `z` only
+	// via `h`). This exercises the fixpoint converging over a cycle longer than
+	// two functions: `r` (which calls `f`) must land after `x`, `y`, AND `z`.
+	// `f(2)` -> `g(1)` -> `h(0)` -> `z` -> `3`.
+	let src = r#"
+		func f(n: int): int = if (n <= 0) { x } else { g(n - 1) }
+		func g(n: int): int = if (n <= 0) { y } else { h(n - 1) }
+		func h(n: int): int = if (n <= 0) { z } else { f(n - 1) }
+		let r = f(2)
+		let x = 1
+		let y = 2
+		let z = 3
+	"#;
+	assert_eq!(run(src, "r"), "3");
+}
+
+// ── Slice 4E follow-up: `return` inside an UNBRACED if/while branch ─────────
+
+#[test]
+fn runs_bare_return_as_an_unbraced_while_body() {
+	let src = r#"
+		func f(n: int): int = {
+			while (n > 0) return n
+			0
+		}
+	"#;
+	assert_eq!(run(src, "f(5)"), "5");
+	assert_eq!(run(src, "f(0)"), "0");
+}
+
+#[test]
+fn runs_bare_return_as_an_unbraced_if_then_branch() {
+	let src = r#"
+		func f(n: int): int = {
+			if (n < 0) return 0 - n
+			n
+		}
+	"#;
+	assert_eq!(run(src, "f(-3)"), "3");
+	assert_eq!(run(src, "f(3)"), "3");
+}

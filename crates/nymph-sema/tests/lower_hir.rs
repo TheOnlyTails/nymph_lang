@@ -946,3 +946,530 @@ fn missing_prefix_resolution_still_panics_in_lowering() {
 	};
 	nymph_sema::lower_hir(&parsed.tree, &stripped);
 }
+
+// ── Slice 4E: `return`, let-shadowing, module lets ──────────────────────────
+
+#[test]
+fn lowers_return_with_value_as_last_statement_of_a_block() {
+	// The exact corpus shape: an if-branch block whose only statement is
+	// `return n` — it must become a `HirStmt::Return`, NOT the block's tail
+	// expression (emit has no way to represent "return" as a value).
+	let hir = lower(
+		r#"
+		func abs(n: int): int = {
+			if (n >= 0) { return n }
+			0 - n
+		}
+		"#,
+	);
+	let HirExpr::Block { stmts, tail } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	// `0 - n` is the block's LAST statement, so it becomes the `tail` expression,
+	// not a pushed `stmts` entry — only the `if` is a statement here.
+	assert_eq!(stmts.len(), 1);
+	let HirStmt::Expr(HirExpr::If {
+		then, otherwise, ..
+	}) = &stmts[0]
+	else {
+		panic!("expected an If statement, got {:?}", stmts[0]);
+	};
+	assert!(otherwise.is_none());
+	let HirExpr::Block {
+		stmts: then_stmts,
+		tail: then_tail,
+	} = then.as_ref()
+	else {
+		panic!("expected the then-branch to be a Block, got {then:?}");
+	};
+	assert_eq!(
+		then_stmts,
+		&vec![HirStmt::Return(Some(HirExpr::Local("n".into())))]
+	);
+	assert!(
+		then_tail.is_none(),
+		"a block whose only statement is `return` must have no tail expression"
+	);
+	assert!(
+		tail.is_some(),
+		"the trailing `0 - n` stays the block's tail"
+	);
+}
+
+#[test]
+fn lowers_bare_return_in_a_void_function() {
+	let hir = lower("func f(): void = { return }");
+	assert_eq!(
+		hir.funcs[0].body,
+		HirExpr::Block {
+			stmts: vec![HirStmt::Return(None)],
+			tail: None,
+		}
+	);
+}
+
+#[test]
+#[should_panic(expected = "only supported in statement position")]
+fn return_as_an_unbraced_match_arm_body_panics_in_lowering() {
+	// `return` reached in genuine expression position (an unbraced match-arm
+	// body) has no HIR representation — lowering panics loudly rather than
+	// silently dropping or misplacing it (Slice 4E, Y1).
+	lower(
+		r#"
+		func f(n: int): int = match (n) {
+			0 -> return 7,
+			_ -> n,
+		}
+		"#,
+	);
+}
+
+#[test]
+fn lowers_same_scope_let_shadow_with_a_rename() {
+	// `let x = 1; let x = x + 1` redeclares `x` in the SAME JS scope — the second
+	// binding renames to `x$1`; the RHS reads the PRIOR `x`, and the tail
+	// resolves through the renamed binding (Slice 4E, Y2).
+	let hir = lower(
+		r#"
+		func f(): int = {
+			let x = 1
+			let x = x + 1
+			x * 10
+		}
+		"#,
+	);
+	let HirExpr::Block { stmts, tail } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	let HirStmt::Let { name, value, .. } = &stmts[0] else {
+		panic!("expected a Let statement, got {:?}", stmts[0]);
+	};
+	assert_eq!(name, "x");
+	assert_eq!(value, &HirExpr::Num(1.0));
+
+	let HirStmt::Let { name, value, .. } = &stmts[1] else {
+		panic!("expected a Let statement, got {:?}", stmts[1]);
+	};
+	assert_eq!(name, "x$1", "same-scope redeclaration renames");
+	assert_eq!(
+		value,
+		&HirExpr::Binary {
+			op: BinOp::Add,
+			lhs: Box::new(HirExpr::Local("x".into())),
+			rhs: Box::new(HirExpr::Num(1.0)),
+		},
+		"the redeclaration's RHS reads the PRIOR binding, not itself"
+	);
+
+	let tail = tail.as_ref().expect("tail present");
+	assert_eq!(
+		tail.as_ref(),
+		&HirExpr::Binary {
+			op: BinOp::Mul,
+			lhs: Box::new(HirExpr::Local("x$1".into())),
+			rhs: Box::new(HirExpr::Num(10.0)),
+		},
+		"later references resolve through the renamed binding"
+	);
+}
+
+#[test]
+fn lowers_triple_same_scope_let_shadow() {
+	// A third same-scope redeclaration renames again (`x$2`), not by reusing `x$1`.
+	let hir = lower(
+		r#"
+		func f(): int = {
+			let x = 1
+			let x = x + 1
+			let x = x + 1
+			x
+		}
+		"#,
+	);
+	let HirExpr::Block { stmts, tail } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	let names: Vec<&str> = stmts
+		.iter()
+		.map(|s| match s {
+			HirStmt::Let { name, .. } => name.as_str(),
+			other => panic!("expected a Let statement, got {other:?}"),
+		})
+		.collect();
+	assert_eq!(names, ["x", "x$1", "x$2"]);
+	assert_eq!(
+		tail.as_deref(),
+		Some(&HirExpr::Local("x$2".into())),
+		"the tail resolves through the LAST rename"
+	);
+}
+
+#[test]
+fn nested_block_shadow_renames_to_avoid_the_tdz_hazard() {
+	// A nested block (a separate JS scope — its own `BlockStatement`/IIFE) can
+	// still trip JS's `const`/`let` TDZ if it reuses an outer name: JS hoists a
+	// block's own declaration for the whole block, so if this rename didn't
+	// happen, a *different* nested `let` reusing the same outer name (e.g. `let
+	// i = i + 100`) would read the not-yet-initialized inner binding instead of
+	// the outer one. Renaming on ANY active-scope collision — not only when
+	// this specific initializer would hit the hazard — sidesteps having to
+	// prove per-declaration whether the hazard applies (Slice 4E, Y2 fix). So
+	// even this harmless-looking shadow (`let x = 5`, not referencing the outer
+	// `x`) renames.
+	let hir = lower(
+		r#"
+		func f(): int = {
+			let x = 1
+			let y = if (true) { let x = 5 x } else { 0 }
+			x + y
+		}
+		"#,
+	);
+	let HirExpr::Block { stmts, tail } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	let HirStmt::Let { name, .. } = &stmts[0] else {
+		panic!("expected a Let statement, got {:?}", stmts[0]);
+	};
+	assert_eq!(name, "x", "the outer `x` is never renamed");
+
+	let HirStmt::Let { value, .. } = &stmts[1] else {
+		panic!("expected a Let statement, got {:?}", stmts[1]);
+	};
+	let HirExpr::If { then, .. } = value else {
+		panic!("expected an If, got {value:?}");
+	};
+	let HirExpr::Block {
+		stmts: inner_stmts,
+		tail: inner_tail,
+	} = then.as_ref()
+	else {
+		panic!("expected the then-branch to be a Block, got {then:?}");
+	};
+	let HirStmt::Let {
+		name: inner_name, ..
+	} = &inner_stmts[0]
+	else {
+		panic!("expected a Let statement, got {:?}", inner_stmts[0]);
+	};
+	assert_eq!(
+		inner_name, "x$1",
+		"a nested-scope shadow of an active outer `x` renames too"
+	);
+	assert_eq!(
+		inner_tail.as_deref(),
+		Some(&HirExpr::Local("x$1".into())),
+		"and resolves through the rename"
+	);
+
+	assert_eq!(
+		tail.as_deref(),
+		Some(&HirExpr::Binary {
+			op: BinOp::Add,
+			lhs: Box::new(HirExpr::Local("x".into())),
+			rhs: Box::new(HirExpr::Local("y".into())),
+		}),
+		"the outer tail still resolves the outer (unrenamed) `x`"
+	);
+}
+
+#[test]
+fn nested_block_shadow_that_reads_the_outer_binding_renames_and_reads_the_prior_value() {
+	// The exact defect this fix closes: `let i = 1; let r = { let i = i + 100;
+	// i }; r` — without the rename, both the outer `i` and the inner `let i`
+	// would emit as the identical JS identifier `i`, and since JS hoists the
+	// inner block's own `const i` for its whole block, the inner initializer's
+	// read of `i` would resolve to the not-yet-initialized inner binding
+	// instead of the outer one (`ReferenceError: Cannot access 'i' before
+	// initialization` at runtime) — silently-wrong JS from a zero-diagnostic
+	// program.
+	let hir = lower(
+		r#"
+		func f(): int = {
+			let i = 1
+			let r = { let i = i + 100 i }
+			r
+		}
+		"#,
+	);
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	let HirStmt::Let { name, .. } = &stmts[0] else {
+		panic!("expected a Let statement, got {:?}", stmts[0]);
+	};
+	assert_eq!(name, "i", "the outer `i` is never renamed");
+
+	let HirStmt::Let { value, .. } = &stmts[1] else {
+		panic!("expected a Let statement, got {:?}", stmts[1]);
+	};
+	let HirExpr::Block {
+		stmts: inner_stmts,
+		tail: inner_tail,
+	} = value
+	else {
+		panic!("expected a Block, got {value:?}");
+	};
+	let HirStmt::Let {
+		name: inner_name,
+		value: inner_value,
+		..
+	} = &inner_stmts[0]
+	else {
+		panic!("expected a Let statement, got {:?}", inner_stmts[0]);
+	};
+	assert_eq!(
+		inner_name, "i$1",
+		"the nested redeclaration of the active outer `i` renames"
+	);
+	assert_eq!(
+		inner_value,
+		&HirExpr::Binary {
+			op: BinOp::Add,
+			lhs: Box::new(HirExpr::Local("i".into())),
+			rhs: Box::new(HirExpr::Num(100.0)),
+		},
+		"its RHS reads the OUTER `i`, not the not-yet-declared inner one"
+	);
+	assert_eq!(
+		inner_tail.as_deref(),
+		Some(&HirExpr::Local("i$1".into())),
+		"the inner tail resolves through the rename"
+	);
+}
+
+#[test]
+fn lowers_param_shadowed_by_a_body_let_inside_a_method() {
+	// A body `let` reusing a PARAM's name is a same-scope redeclaration too —
+	// params and the body block's own `let`s share one merged JS scope.
+	let hir = lower(
+		r#"
+		struct Counter(n: int)
+		impl Counter {
+			func bump(n: int): int = {
+				let n = n + this.n
+				n
+			}
+		}
+		"#,
+	);
+	let class = hir.classes.iter().find(|c| c.name == "Counter").unwrap();
+	let method = class.methods.iter().find(|m| m.name == "bump").unwrap();
+	assert_eq!(method.params, vec!["n".to_string()]);
+	let HirExpr::Block { stmts, tail } = &method.body else {
+		panic!("expected Block, got {:?}", method.body);
+	};
+	let HirStmt::Let { name, .. } = &stmts[0] else {
+		panic!("expected a Let statement, got {:?}", stmts[0]);
+	};
+	assert_eq!(name, "n$1", "the body let renames, shadowing the param");
+	assert_eq!(tail.as_deref(), Some(&HirExpr::Local("n$1".into())));
+}
+
+#[test]
+fn lowers_a_top_level_let_into_the_module() {
+	use nymph_hir::hir::HirLet;
+	let hir = lower(
+		r#"
+		let answer = 42
+		func f(): int = answer
+		"#,
+	);
+	assert_eq!(
+		hir.lets,
+		vec![HirLet {
+			name: "answer".into(),
+			mutable: false,
+			value: HirExpr::Num(42.0),
+		}]
+	);
+	// A reference to it from a function body stays the bare (unrenamed) name.
+	assert_eq!(hir.funcs[0].body, HirExpr::Local("answer".into()));
+}
+
+#[test]
+fn lowers_two_top_level_lets_in_source_order_with_the_second_referencing_the_first() {
+	use nymph_hir::hir::HirLet;
+	let hir = lower(
+		r#"
+		let base = 10
+		let total = base + 5
+		func f(): int = total
+		"#,
+	);
+	assert_eq!(
+		hir.lets,
+		vec![
+			HirLet {
+				name: "base".into(),
+				mutable: false,
+				value: HirExpr::Num(10.0),
+			},
+			HirLet {
+				name: "total".into(),
+				mutable: false,
+				value: HirExpr::Binary {
+					op: BinOp::Add,
+					lhs: Box::new(HirExpr::Local("base".into())),
+					rhs: Box::new(HirExpr::Num(5.0)),
+				},
+			},
+		]
+	);
+}
+
+#[test]
+fn lowers_a_mutable_top_level_let() {
+	use nymph_hir::hir::HirLet;
+	let hir = lower("let mut counter = 0");
+	assert_eq!(
+		hir.lets,
+		vec![HirLet {
+			name: "counter".into(),
+			mutable: true,
+			value: HirExpr::Num(0.0),
+		}]
+	);
+}
+
+#[test]
+fn reorders_a_top_level_let_that_references_a_later_let() {
+	// `let a = b + 1; let b = 10; func f(): int = a` — naive source-order
+	// emission would put `a`'s `const` before `b`'s, throwing a TDZ
+	// `ReferenceError` under Node (Finding: module-let ordering). Lowering must
+	// reorder `HirModule::lets` so `b` comes first.
+	use nymph_hir::hir::HirLet;
+	let hir = lower(
+		r#"
+		let a = b + 1
+		let b = 10
+		func f(): int = a
+		"#,
+	);
+	let names: Vec<&str> = hir.lets.iter().map(|l| l.name.as_str()).collect();
+	assert_eq!(
+		names,
+		["b", "a"],
+		"`b` has no dependency and must be emitted before `a`, which needs it"
+	);
+	assert_eq!(
+		hir.lets,
+		vec![
+			HirLet {
+				name: "b".into(),
+				mutable: false,
+				value: HirExpr::Num(10.0),
+			},
+			HirLet {
+				name: "a".into(),
+				mutable: false,
+				value: HirExpr::Binary {
+					op: BinOp::Add,
+					lhs: Box::new(HirExpr::Local("b".into())),
+					rhs: Box::new(HirExpr::Num(1.0)),
+				},
+			},
+		]
+	);
+}
+
+#[test]
+fn reorders_a_top_level_let_whose_called_function_reads_a_later_let() {
+	// `let a = g(); func g(): int = b; let b = 5;` — `a`'s initializer calls
+	// `g`, whose body reads `b`, a top-level `let` declared textually AFTER
+	// both `a` and `g`. Naive source-order emission puts `b`'s `const` last, so
+	// calling `g()` as part of `a`'s own initializer reads `b` while it's still
+	// in its module-scope TDZ.
+	let hir = lower(
+		r#"
+		let a = g()
+		func g(): int = b
+		let b = 5
+		"#,
+	);
+	let names: Vec<&str> = hir.lets.iter().map(|l| l.name.as_str()).collect();
+	assert_eq!(
+		names,
+		["b", "a"],
+		"`b` must be emitted before `a`, whose initializer transitively reads it via `g`"
+	);
+}
+
+#[test]
+#[should_panic(expected = "circular top-level `let` dependency")]
+fn circular_top_level_let_dependency_panics_in_lowering() {
+	// `let a = b + 1; let b = a + 1;` has no valid JS module-init order at all
+	// (`const`s can't forward-reference each other in either direction) — this
+	// must panic loudly rather than silently pick a (broken) order.
+	lower(
+		r#"
+		let a = b + 1
+		let b = a + 1
+		"#,
+	);
+}
+
+// ── Slice 4E follow-up: `return` inside an UNBRACED if/while branch ─────────
+
+#[test]
+fn lowers_bare_return_as_an_unbraced_while_body() {
+	// `while (n > 0) return n` — an unbraced while-body that is directly
+	// `return n`, with no surrounding `{ .. }`. Must lower the same as the
+	// braced `while (n > 0) { return n }` shape.
+	let hir = lower(
+		r#"
+		func f(n: int): int = {
+			while (n > 0) return n
+			0
+		}
+		"#,
+	);
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	let HirStmt::Expr(HirExpr::While { body, .. }) = &stmts[0] else {
+		panic!("expected a While statement, got {:?}", stmts[0]);
+	};
+	assert_eq!(
+		body.as_ref(),
+		&HirExpr::Block {
+			stmts: vec![HirStmt::Return(Some(HirExpr::Local("n".into())))],
+			tail: None,
+		}
+	);
+}
+
+#[test]
+fn lowers_bare_return_as_an_unbraced_if_then_branch() {
+	// `if (n < 0) return 0 - n` — an unbraced then-branch that is directly
+	// `return ..`, with no surrounding `{ .. }` and no `else`.
+	let hir = lower(
+		r#"
+		func f(n: int): int = {
+			if (n < 0) return 0 - n
+			n
+		}
+		"#,
+	);
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	let HirStmt::Expr(HirExpr::If {
+		then, otherwise, ..
+	}) = &stmts[0]
+	else {
+		panic!("expected an If statement, got {:?}", stmts[0]);
+	};
+	assert!(otherwise.is_none());
+	assert_eq!(
+		then.as_ref(),
+		&HirExpr::Block {
+			stmts: vec![HirStmt::Return(Some(HirExpr::Binary {
+				op: BinOp::Sub,
+				lhs: Box::new(HirExpr::Num(0.0)),
+				rhs: Box::new(HirExpr::Local("n".into())),
+			}))],
+			tail: None,
+		}
+	);
+}
