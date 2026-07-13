@@ -1159,21 +1159,68 @@ impl<'m> Checker<'m> {
 				}
 				(boolean, eager(method), None)
 			}
+			// W1 (Slice 4C-c): comparison operators now mirror the arithmetic arm's
+			// dispatch table exactly, just with a result type fixed at `boolean`
+			// throughout (rather than the operand/`Output` type arithmetic uses) — a
+			// concrete primitive pair stays a native comparison; an ADT or
+			// generic-parameter receiver dispatches through `dispatch_operator`
+			// (bound → `UserImplDefaultMethod`, unbound → `NotImplemented`); a still-
+			// unresolved inference variable defers to the per-body pending queue
+			// rather than guessing `BuiltinEager` immediately, which is exactly the
+			// silent-miscompile gap this slice closes (see the 4C-c investigation
+			// brief's `late_pinned_adt_comparison` probe).
 			LessThan | LessThanEquals | GreaterThan | GreaterThanEquals => {
 				let method = comparison_method(op);
-				if self.prim_kind(l).is_some() || !self.is_adt(l) {
-					self.unify_operands(lhs, l, rhs, r, span);
-					(boolean, eager(method), None)
-				} else {
-					let (_, dispatch) = self.dispatch_operator(l, method, &[r], span);
-					(
-						boolean,
-						Some(Resolution {
-							method: method.into(),
-							dispatch,
-						}),
-						None,
-					)
+				match (self.prim_kind(l), self.prim_kind(r)) {
+					(Some(a), Some(b)) if a == b => {
+						self.unify(l, r, span);
+						(boolean, eager(method), None)
+					}
+					// Unlike the arithmetic arm, a comparison's result is always
+					// `boolean` regardless of which side (if either) is the widening
+					// int literal, so both literal-widening cases collapse into one
+					// condition here (the arithmetic arm keeps them separate because it
+					// must pick *which* operand's type becomes the result).
+					(Some(_), Some(_)) => {
+						let literal_widens = (matches!(rhs.kind, ExprKind::Int(_))
+							&& self.int_literal_coerces_to(l))
+							|| (matches!(lhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(r));
+						if literal_widens {
+							(boolean, eager(method), None)
+						} else {
+							let (_, dispatch) = self.dispatch_operator(l, method, &[r], span);
+							(
+								boolean,
+								Some(Resolution {
+									method: method.into(),
+									dispatch,
+								}),
+								None,
+							)
+						}
+					}
+					_ if self.is_adt(l) || {
+						let resolved = self.shallow_resolve(l);
+						matches!(self.interner.kind(resolved), TyKind::Param(_))
+					} =>
+					{
+						let (_, dispatch) = self.dispatch_operator(l, method, &[r], span);
+						(
+							boolean,
+							Some(Resolution {
+								method: method.into(),
+								dispatch,
+							}),
+							None,
+						)
+					}
+					_ => {
+						self.unify_operands(lhs, l, rhs, r, span);
+						match self.resolve_fallback_operand(op, l, span) {
+							Some((_, res)) => (boolean, Some(res), None),
+							None => (boolean, None, Some(l)),
+						}
+					}
 				}
 			}
 			// `&&`/`||` are overloadable via the `And`/`Or` interfaces like any operator.
@@ -1246,17 +1293,36 @@ impl<'m> Checker<'m> {
 	/// unsupported type (a function value being the concrete case found) fell
 	/// through with neither a `Resolution` nor a diagnostic, and still reached
 	/// lowering's `None => panic!(..)` on an otherwise zero-diagnostic program.
+	///
+	/// W1 (Slice 4C-c) reuses this same fallback for a deferred *comparison*
+	/// operator (`PendingOperatorKind::BinaryOp` doesn't distinguish the two
+	/// families) — `binary_method` would `unreachable!()` on a comparison
+	/// operator, and the arithmetic result type would clobber the node's `boolean`
+	/// type (comparisons always produce `boolean`, never the operand type), so
+	/// both the method-name lookup and the returned result type are op-class
+	/// aware here.
 	fn resolve_fallback_operand(
 		&mut self,
 		op: BinaryOperator,
 		ty: Ty,
 		span: Span,
 	) -> Option<(Ty, Resolution)> {
+		let is_comparison = is_comparison_op(op);
+		let method = if is_comparison {
+			comparison_method(op)
+		} else {
+			binary_method(op)
+		};
 		if self.prim_kind(ty).is_some() {
+			let result_ty = if is_comparison {
+				self.interner.boolean()
+			} else {
+				ty
+			};
 			return Some((
-				ty,
+				result_ty,
 				Resolution {
-					method: binary_method(op).into(),
+					method: method.into(),
 					dispatch: DispatchKind::BuiltinEager,
 				},
 			));
@@ -1268,11 +1334,16 @@ impl<'m> Checker<'m> {
 		) {
 			return None;
 		}
-		let (result_ty, dispatch) = self.dispatch_operator(ty, binary_method(op), &[ty], span);
+		let (dispatch_ty, dispatch) = self.dispatch_operator(ty, method, &[ty], span);
+		let result_ty = if is_comparison {
+			self.interner.boolean()
+		} else {
+			dispatch_ty
+		};
 		Some((
 			result_ty,
 			Resolution {
-				method: binary_method(op).into(),
+				method: method.into(),
 				dispatch,
 			},
 		))
@@ -1650,6 +1721,18 @@ fn binary_method(op: BinaryOperator) -> &'static str {
 		RightShift => "shr",
 		other => unreachable!("not an arithmetic operator: {other:?}"),
 	}
+}
+
+/// Whether `op` is one of the four comparison operators (`<`, `<=`, `>`, `>=`) —
+/// used by `resolve_fallback_operand` to pick `comparison_method` over
+/// `binary_method` and to force a `boolean` result type for a deferred
+/// comparison (Slice 4C-c, W1).
+fn is_comparison_op(op: BinaryOperator) -> bool {
+	use BinaryOperator::*;
+	matches!(
+		op,
+		LessThan | LessThanEquals | GreaterThan | GreaterThanEquals
+	)
 }
 
 /// The `Comparable` method a comparison operator desugars to.

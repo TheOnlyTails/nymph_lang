@@ -689,6 +689,75 @@ fn runs_interface_default_override_wins() {
 	);
 }
 
+// ── Slice 4C-c, Task 3: comparison/equality generics end-to-end ─────────────
+
+#[test]
+fn runs_late_pinned_adt_comparison_dispatches_at_runtime() {
+	// The headline silent-miscompile probe, run for real under Node: `xs[0] <
+	// xs[0]` is recorded against a still-unbound inference variable, later
+	// pinned to `Vec2` by the `#[Vec2]` annotation. Before W1 this compiled to a
+	// native JS `<` between two class instances (`NaN`-ish nonsense); after W1
+	// it must actually call `.less_than(...)` and produce the impl's real
+	// answer.
+	let src = r#"
+		interface Comparable<Other> { func less_than(other: Other): boolean }
+		struct Vec2(x: int)
+		impl Comparable<Other = Vec2> for Vec2 {
+			func less_than(other: Vec2): boolean = this.x < other.x
+		}
+		func f(a: Vec2, b: Vec2): boolean = {
+			let xs = #[a, b]
+			let c = xs[0] < xs[1]
+			let pin: #[Vec2] = xs
+			c
+		}
+	"#;
+	assert_eq!(
+		run(src, "f(new Vec2({ x: 1 }), new Vec2({ x: 2 }))"),
+		"true"
+	);
+	assert_eq!(
+		run(src, "f(new Vec2({ x: 2 }), new Vec2({ x: 1 }))"),
+		"false"
+	);
+}
+
+#[test]
+fn runs_native_int_and_float_comparison_unchanged() {
+	// W1 leaves the concrete-primitive fast path untouched: `int`/`float`
+	// comparisons still compile to a native JS `<`/`>`, not a dispatched call.
+	let src = "func lt(a: int, b: int): boolean = a < b
+	           func gt(a: float, b: float): boolean = a > b";
+	assert_eq!(run(src, "lt(1, 2)"), "true");
+	assert_eq!(run(src, "lt(2, 1)"), "false");
+	assert_eq!(run(src, "gt(2.5, 1.5)"), "true");
+}
+
+#[test]
+fn runs_equals_on_user_struct_stays_native_reference_equality() {
+	// W2: `==` on a user struct stays `BuiltinEager` — native JS `===` (reference
+	// equality), even with a user `Equals` impl in scope (the ADT equality arm
+	// dispatches only for typing side-effects; codegen still emits `===`). Two
+	// structurally-equal but distinct `Vec2` instances are therefore *not* `==`,
+	// while a single instance compared against itself (the same object
+	// reference, passed twice) is. (A concrete, rather than blanket, `Equals`
+	// impl is used here — lowering a *blanket* impl is an unrelated, out-of-scope
+	// deferral, V5; `operator_resolutions.rs`'s `user_struct_equals_is_builtin_eager`
+	// already pins the blanket-impl checker case.)
+	let src = r#"
+		interface Equals<Other> { func equals(other: Other): boolean }
+		struct Vec2(x: int)
+		impl Equals<Other = Vec2> for Vec2 { func equals(other: Vec2): boolean = true }
+		func same(a: Vec2, b: Vec2): boolean = a == b
+		func self_same(a: Vec2): boolean = a == a
+	"#;
+	assert_eq!(
+		run(src, "same(new Vec2({ x: 1 }), new Vec2({ x: 1 }))"),
+		"false"
+	);
+	assert_eq!(run(src, "self_same(new Vec2({ x: 1 }))"), "true");
+}
+
 #[test]
 fn compile_reports_check_errors() {
 	// A type error surfaces as diagnostics, not JS.

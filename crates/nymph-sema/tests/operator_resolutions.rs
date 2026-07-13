@@ -198,6 +198,83 @@ fn comparable_less_than_is_materialized_user_impl() {
 	assert_eq!(res.method, "less_than");
 }
 
+// ── Slice 4C-c, Task 1: comparison-arm parity with the arithmetic arm (W1) ──
+
+#[test]
+fn bounded_generic_less_than_dispatches_through_bound() {
+	// A bounded generic parameter's `a < b` resolves through its `Comparable`
+	// bound (W1) — mirrors the arithmetic arm's `GenericBound` →
+	// `UserImplDefaultMethod` mapping. Before this slice the comparison arm never
+	// routed a `Param` receiver through `dispatch_operator` at all, so this used
+	// to record `BuiltinEager` and silently emit a native JS `<` on the
+	// still-generic operands.
+	let res = resolution_for(
+		"interface Comparable<Other> { func less_than(other: Other): boolean }
+		 func f<T: Comparable<Other = T>>(a: T, b: T): boolean = a < b",
+		"f",
+	);
+	assert_eq!(res.dispatch, DispatchKind::UserImplDefaultMethod);
+	assert_eq!(res.method, "less_than");
+}
+
+#[test]
+fn late_resolved_infer_var_less_than_is_builtin_eager() {
+	// Mirrors `late_resolved_infer_var_operand_is_builtin_eager` for `<`: `xs`'s
+	// element type is a genuinely unconstrained inference variable at the moment
+	// this `BinaryOp` node is recorded, pinned to `int` only afterward. W1 routes
+	// this through the pending-operator queue (comparisons never used to defer at
+	// all), finalized once `f`'s body is fully checked.
+	let res = resolution_for(
+		"func f(): boolean = {
+		   let xs = #[]
+		   let c = xs[0] < xs[0]
+		   let pin: int = xs[0]
+		   c
+		 }",
+		"f",
+	);
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+	assert_eq!(res.method, "less_than");
+}
+
+#[test]
+fn late_pinned_adt_less_than_dispatches_to_user_impl() {
+	// The headline silent-miscompile probe from the 4C-c investigation: `xs`'s
+	// element type is still an inference variable when `xs[0] < xs[0]` is
+	// recorded, and is only pinned to `Vec2` afterward via the `#[Vec2]`
+	// annotation. Before W1 this recorded `BuiltinEager` with zero diagnostics —
+	// native JS `<` on `Vec2` objects. W1's pending-queue deferral re-resolves it
+	// against the now-known `Vec2` element type, finding the direct `less_than`
+	// impl (`UserImpl`).
+	let res = resolution_for(
+		"interface Comparable<Other> { func less_than(other: Other): boolean }
+		 struct Vec2(x: int)
+		 impl Comparable<Other = Vec2> for Vec2 {
+		   func less_than(other: Vec2): boolean = true
+		 }
+		 func f(): boolean = {
+		   let xs = #[]
+		   let c = xs[0] < xs[0]
+		   let pin: #[Vec2] = xs
+		   c
+		 }",
+		"f",
+	);
+	assert_eq!(res.dispatch, DispatchKind::UserImpl);
+	assert_eq!(res.method, "less_than");
+}
+
+#[test]
+fn unbounded_generic_equals_is_builtin_eager() {
+	// W2: equality stays `BuiltinEager` for every operand kind, including a
+	// generic parameter with no bound at all — `==`/`!=` is always native
+	// reference equality, never dispatched to a user `Equals` impl (D3, unchanged
+	// by this slice).
+	let res = resolution_for("func f<T>(a: T, b: T): boolean = a == b", "f");
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+	assert_eq!(res.method, "equals");
+}
+
 /// Like [`collect_binary_ops`], but collects `AssignOp` nodes instead — Finding 1
 /// records the compound-assign operator's `Resolution` on the `AssignOp` node
 /// itself (there's no separate desugared `BinaryOp` AST node to hang it on).

@@ -186,6 +186,44 @@ fn function_valued_operator_operand_is_reported() {
 	);
 }
 
+// ── Slice 4C-c, Task 1: comparison/logical diagnostics (W1, W3) ─────────────
+
+#[test]
+fn unbounded_generic_less_than_is_reported() {
+	// W1: an unbounded generic parameter has no `Comparable` bound to dispatch
+	// `<` to — a `NotImplemented` diagnostic, not a silent native `<` on
+	// still-generic operands (the pre-4C-c behavior).
+	assert_error_contains("func f<T>(a: T, b: T): boolean = a < b", "less_than");
+}
+
+#[test]
+fn never_pinned_infer_less_than_reports_cannot_infer_operand_type() {
+	// W1: `xs[0] < xs[0]` whose element type never gets pinned down by the end of
+	// the body reports `CannotInferOperandType`, exactly like the arithmetic
+	// arm's `unresolved_prefix_operand_reports_cannot_infer_operand_type`-style
+	// guard — this is a *new* diagnostic on a program that used to compile clean
+	// with a silently wrong `BuiltinEager` resolution (see the 4C-c investigation
+	// brief's "corrections" note).
+	assert_error_contains(
+		"func f(): boolean = {
+		   let xs = #[]
+		   xs[0] < xs[0]
+		 }",
+		"cannot infer",
+	);
+}
+
+#[test]
+fn bounded_generic_logical_and_is_reported() {
+	// W3: `&&`/`||` on a rigid, still-generic `Param` operand fails to unify
+	// against `boolean` — a plain `mismatched types` diagnostic. No routing
+	// change was needed here; this pins the already-loud behavior.
+	assert_error_contains(
+		"func f<T>(a: T, b: T): boolean = a && b",
+		"mismatched types",
+	);
+}
+
 #[test]
 fn method_call_resolves_through_interface() {
 	assert_ok(

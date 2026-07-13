@@ -608,10 +608,11 @@ fn bounded_generic_plus_default_still_panics_in_lowering() {
 	// dispatch that at compile time, so this stays a loud lowering deferral (V2:
 	// only `InterfaceDefault` flips to `UserImpl`; `GenericBound` is unchanged).
 	//
-	// NB: comparison/equality/logical operators on a `Param` receiver do *not*
-	// reach `dispatch_operator` at all (a pre-existing, out-of-scope hazard —
-	// see the Slice 4C-b plan's investigation brief, "corrections" (1)), so this
-	// pin deliberately uses an arithmetic operator, which does.
+	// NB: prior to Slice 4C-c, comparison/equality/logical operators on a `Param`
+	// receiver did not reach `dispatch_operator` at all, so this pin deliberately
+	// used an arithmetic operator. 4C-c (W1) brings comparisons to parity — see
+	// `bounded_generic_less_than_still_panics_in_lowering` below for the
+	// comparison-operator sibling of this same case.
 	lower(
 		r#"
 		interface Plus<Other, Output> {
@@ -620,6 +621,103 @@ fn bounded_generic_plus_default_still_panics_in_lowering() {
 		}
 		func add<T: Plus<Other = T, Output = T>>(t1: T, t2: T): T = t1 + t2
 		"#,
+	);
+}
+
+// ── Slice 4C-c, Task 2: comparison-operator lowering pins (W1, W4) ──────────
+
+#[test]
+#[should_panic(expected = "does not yet dispatch operator to interface default method")]
+fn bounded_generic_less_than_still_panics_in_lowering() {
+	// W1's comparison-arm parity means a bounded generic parameter's `a < b` now
+	// resolves through `T`'s `Comparable` bound (`MethodSource::GenericBound`),
+	// exactly like the arithmetic case above — still a loud lowering deferral,
+	// not the silent native `<` on still-generic operands this slice closes.
+	lower(
+		r#"
+		interface Comparable<Other> { func less_than(other: Other): boolean }
+		func lt<T: Comparable<Other = T>>(a: T, b: T): boolean = a < b
+		"#,
+	);
+}
+
+#[test]
+#[should_panic(expected = "does not yet dispatch operator to interface default method")]
+fn this_less_than_other_in_interface_default_body_panics_in_lowering() {
+	// W4: an interface default method whose *own* body uses `this < other`
+	// directly (rather than calling another method) checks `this` bound to a
+	// rigid synthetic `Param` (`check_interface_default_bodies`) — W1 now routes
+	// that `Param` receiver through `dispatch_operator`, recording
+	// `MethodSource::GenericBound` → `UserImplDefaultMethod`. `Vec2` never
+	// overrides `at_most`, so its default body (with this still-generic
+	// resolution) is materialized verbatim onto `Vec2`'s class and lowering it
+	// panics loudly instead of silently emitting a native `<` between two
+	// `Vec2` instances.
+	lower(
+		r#"
+		interface Comparable<Other> {
+			func less_than(other: Other): boolean
+			func at_most(other: Other): boolean = this < other
+		}
+		struct Vec2(x: int, y: int)
+		impl Comparable<Other = Vec2> for Vec2 {
+			func less_than(other: Vec2): boolean = true
+		}
+		func f(v: Vec2): Vec2 = v
+		"#,
+	);
+}
+
+#[test]
+fn late_pinned_adt_less_than_lowers_to_a_method_call() {
+	// W1: `xs[0] < xs[0]`'s element type is a genuinely unconstrained inference
+	// variable at the moment the `BinaryOp` node is recorded, pinned to `Vec2`
+	// only afterward. The pending-operator queue re-resolves it once `Vec2` is
+	// known, finding the direct `less_than` impl (`UserImpl`) — lowering must
+	// dispatch to `xs[0].less_than(xs[0])`, not a native `<` on two objects.
+	let hir = lower(
+		r#"
+		interface Comparable<Other> { func less_than(other: Other): boolean }
+		struct Vec2(x: int)
+		impl Comparable<Other = Vec2> for Vec2 {
+			func less_than(other: Vec2): boolean = true
+		}
+		func f(): boolean = {
+			let xs = #[]
+			let c = xs[0] < xs[0]
+			let pin: #[Vec2] = xs
+			c
+		}
+		"#,
+	);
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	let HirStmt::Let { value, .. } = &stmts[1] else {
+		panic!("expected a Let statement, got {:?}", stmts[1]);
+	};
+	let HirExpr::Call { callee, args } = value else {
+		panic!("expected Call, got {value:?}");
+	};
+	let HirExpr::Field { name, .. } = callee.as_ref() else {
+		panic!("expected Field callee, got {callee:?}");
+	};
+	assert_eq!(name, "less_than");
+	assert_eq!(args.len(), 1);
+}
+
+#[test]
+fn lowers_primitive_less_than_to_binary_unchanged() {
+	// `int < int` still lowers to `HirExpr::Binary`, not a dispatched call — the
+	// `BuiltinEager` resolution keeps the existing native-operator path.
+	let hir = lower("func f(a: int, b: int): boolean = a < b");
+	assert_eq!(
+		hir.funcs[0].body,
+		HirExpr::Binary {
+			op: BinOp::Lt,
+			lhs: Box::new(HirExpr::Local("a".into())),
+			rhs: Box::new(HirExpr::Local("b".into())),
+		}
 	);
 }
 
