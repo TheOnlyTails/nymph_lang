@@ -129,6 +129,32 @@ Executed as ONE dynamic Workflow (slice4cb-default-methods). Implementation comm
 - Review: round 1 single raw finding refuted, zero confirmed, nothing unresolved. 236 workspace tests green (Node e2e: default-via-operator, explicit default call, override-wins), fmt/clippy clean.
 - SLICE 4C-b COMPLETE, REVIEWED CLEAN.
 
+## Slice 4C-c (Comparisons on Non-Concrete Operands)
+Plan: docs/superpowers/plans/2026-07-13-nymph-codegen-slice4cc-comparison-generics.md (decisions W1–W5). Implementation commit: 0ec3a9e2. ONE dynamic Workflow; review round 1 had ZERO raw findings.
+- Comparison arm reached parity with arithmetic: Param → dispatch_operator (bound → UserImplDefaultMethod loud deferral; none → NotImplemented); Infer → per-body pending queue (fallback resolver is now op-class-aware: comparison_method vs binary_method, and comparison nodes keep their boolean type on finalization — naive reuse would have panicked binary_method's unreachable! AND clobbered the node type).
+- Closed silent miscompile: late-pinned ADT comparison (xs[0] < xs[0], xs pinned to #[Vec2] later) recorded BuiltinEager → native JS < on objects; now dispatches to the materialized less_than.
+- BEHAVIOR CHANGE: never-pinned comparison operands now diagnose CannotInferOperandType (previously compiled "clean" with a wrong eager resolution).
+- Pinned decisions: equality stays always-native === for ALL operand kinds (W2, reference semantics); logical ops on generics were already loud unify-with-boolean type errors (W3, zero code change). 250 tests at commit time.
+
+## Slice 4D (Enum Methods — Prototype ABI)
+Plan: docs/superpowers/plans/2026-07-13-nymph-codegen-slice4d-enum-methods.md (decisions X1–X5). Implementation commit: 95ff09ac (original f338c3fd, rewritten by rebase + oxc-API port). Developed in a PARALLEL jj workspace (nymph_lang-ws-enums) while 4C-c ran in main — first use of the workspace-per-feature protocol.
+- ABI: enums WITH methods emit a proto object in the enum IIFE; every variant is Object.create(proto)-based — nullary singletons stay frozen, field-variant FACTORY functions keep their own [TAG] (pattern matching reads it off the factory), only the returned object carries the prototype. Method-less enums emit byte-identical JS (pinned by test).
+- HirEnum.methods; collect_adt_methods unifies struct+enum collection (top-level impl/impl-for + body-inner members + default materialization + duplicate-name panic).
+- Investigation findings: enum-BODY members (inherent funcs, nested impls) type-checked then were SILENTLY DROPPED by lowering (worse than the known top-level panic) — closed; `this.field` on enum receivers is rejected by the checker (field access resolves only on structs) — enum methods read payloads via match(this); checker-side enum dispatch needed zero changes (is_adt/dispatch symmetric with structs).
+- Two pre-existing should_panic("non-struct types") tests flipped to positive lowering assertions. 246 tests in-workspace pre-integration.
+
+## Golden-program regression corpus
+Commit 6b243b84: crates/nymph-compiler/tests/golden_programs.rs — 29 compile-clean multi-feature programs + 12 Node-executed with asserted stdout, through the nymph-compiler facade; pins the whole implemented surface (user request: known-good Nymph must keep compiling). Parse gotcha documented: match-guard expressions ending in an identifier need parens or `x -> y` parses as a closure.
+- FOUR should-work-but-doesn't findings checked in as #[ignore]d tests (un-ignoring them later is the fix's acceptance test):
+  1. `return` in a valid function ICEs in lowering (slice-2a catch-all; in NO deferral list).
+  2. `let` shadowing emits `const x` twice → invalid JS, SyntaxError at load (SILENT MISCOMPILE).
+  3. Top-level `let` silently dropped from the emitted module → ReferenceError at runtime (SILENT MISCOMPILE).
+  4. `impl Trait` param sugar rejects concrete call-site arguments (synthetic bound param never instantiates; body-side works).
+  Findings 1–3 are the natural next slice.
+
+## Parallel-workspace integration note (2026-07-13)
+4C-c (main) and 4D (jj workspace) ran as concurrent workflows; meanwhile the USER landed commits on main directly (0cc9d404 clippy-config move, fad21a9b oxc AstBuilder API migration — a 938-line emit.rs refactor). Integration: 4D stack rebased onto main → 7 real jj conflicts in emit.rs (old-API 4D code vs new API) resolved by a port agent, which ALSO caught 3 stale old-API call sites that auto-merged WITHOUT conflict markers (clean merge ≠ correct — grep new insertions for old idioms after any API-migration rebase). Combined suite 301/301 (+4 ignored corpus findings). jj mechanics that worked: workspace-per-feature for simultaneous agents; jj absorb only with --into fencing (unfenced absorb rewrites mutable reviewed commits; new files never absorb).
+
 ## Slice 4A review
 - Review (Slice 4A): independent subagent review. Verdict "with fixes". Critical: `impl <Enum> { func … }` type-checks but lowering silently dropped it (no HirClass for enums) → JS crashes at runtime (`c.m is not a function`). FIXED in 13224421 (sonnet subagent, controller-directed): lowering now panics on non-Func impl members (top-level AND struct-inner), and a leftover-`methods_by_type` assert catches impls targeting non-struct types (enums etc.) — one assert covers all such cases since struct lowering consumes entries via `.remove`. Added should_panic test pinning the enum-impl case. 179 workspace tests green, clippy/fmt clean. Important test gaps FILLED (sonnet subagent): Node tests runs_struct_method_with_if_control_flow (if/else on this fields → 9), runs_struct_method_calls_sibling_method (this.base() twice → 42), runs_struct_inner_func (func in struct body, confirmed parses via parse_inner_members → 15). All 3 passed immediately → paths were correct, just untested. 30 codegen Node tests green. SLICE 4A REVIEWED + FIXED.
 
