@@ -33,11 +33,14 @@ pub struct HirMethod {
 }
 
 /// An `enum` declaration → the Symbol-tag ABI object. Each variant becomes a
-/// factory (fields) or a frozen singleton (nullary).
+/// factory (fields) or a frozen singleton (nullary). Instance methods (from
+/// top-level `impl`/`impl … for` blocks and enum-body inherent funcs/nested
+/// impls) share a per-enum prototype object every variant is created against.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HirEnum {
 	pub name: EcoString,
 	pub variants: Vec<HirVariant>,
+	pub methods: Vec<HirMethod>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

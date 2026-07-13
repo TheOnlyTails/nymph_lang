@@ -64,7 +64,7 @@ struct Lowerer<'a> {
 
 impl Lowerer<'_> {
 	fn lower_module(&self, module: &Module) -> HirModule {
-		use nymph_ast::decl::{ImplMember, InterfaceMember, StructInnerMember};
+		use nymph_ast::decl::{ImplMember, InterfaceMember};
 		use nymph_ast::ty::Type;
 
 		// Interface bodies, for materializing un-overridden default methods onto
@@ -139,67 +139,44 @@ impl Lowerer<'_> {
 					// nested `impl <Interface> { .. }` blocks inside the struct body
 					// (also materializing that interface's un-overridden defaults,
 					// Slice 4C-b).
-					let mut methods = methods_by_type.remove(&name.0).unwrap_or_default();
-					for member in members {
-						match &member.0 {
-							StructInnerMember::Member(inner) => match &inner.0 {
-								ImplMember::Func { meta, body, .. } => methods.push(self.lower_method(meta, body)),
-								other => {
-									panic!("slice-4a lowering does not yet handle struct inner member {other:?}")
-								}
-							},
-							StructInnerMember::Impl {
-								interface, members, ..
-							} => {
-								let mut overridden: FxHashSet<EcoString> = FxHashSet::default();
-								for member in members {
-									match &member.0 {
-										ImplMember::Func { meta, body, .. } => {
-											overridden.insert(meta.name.0.clone());
-											methods.push(self.lower_method(meta, body));
-										}
-										other => panic!("slice-4b lowering does not yet handle impl member {other:?}"),
-									}
-								}
-								self.push_unoverridden_defaults(
-									&interface.0,
-									&overridden,
-									&interfaces_by_name,
-									&mut methods,
-								);
-							}
-							other => {
-								panic!("slice-4a lowering does not yet handle struct inner member {other:?}")
-							}
-						}
-					}
-					// V4: two interfaces (or an override and a same-named default)
-					// materializing the same method name on one class is a real
-					// ambiguity codegen cannot silently resolve (JS would just let the
-					// last one win) — panic loudly, naming the struct and method.
-					self.assert_no_duplicate_methods(&name.0, &methods);
+					let methods =
+						self.collect_adt_methods(&name.0, members, &interfaces_by_name, &mut methods_by_type);
 					classes.push(HirClass {
 						name: name.0.clone(),
 						fields: fields.iter().map(|f| f.0.name.0.clone()).collect(),
 						methods,
 					});
 				}
-				Declaration::Enum { name, variants, .. } => enums.push(HirEnum {
-					name: name.0.clone(),
-					variants: variants
-						.iter()
-						.map(|v| HirVariant {
-							name: v.0.name.0.clone(),
-							fields: v.0.fields.iter().map(|f| f.0.name.0.clone()).collect(),
-						})
-						.collect(),
-				}),
+				Declaration::Enum {
+					name,
+					variants,
+					members,
+					..
+				} => {
+					// Slice 4D: enums consume `methods_by_type` (top-level `impl`/`impl
+					// … for`) and their own inner members through the exact same path
+					// as structs — enum-body inherent funcs and nested `impl <Interface>
+					// { .. }` blocks are the same `StructInnerMember` shape.
+					let methods =
+						self.collect_adt_methods(&name.0, members, &interfaces_by_name, &mut methods_by_type);
+					enums.push(HirEnum {
+						name: name.0.clone(),
+						variants: variants
+							.iter()
+							.map(|v| HirVariant {
+								name: v.0.name.0.clone(),
+								fields: v.0.fields.iter().map(|f| f.0.name.0.clone()).collect(),
+							})
+							.collect(),
+						methods,
+					});
+				}
 				_ => {}
 			}
 		}
 		assert!(
 			methods_by_type.is_empty(),
-			"slice-4b lowering does not yet support inherent or interface-impl methods on non-struct types (e.g. enums); found impls for: {:?}",
+			"slice-4d lowering does not yet support inherent or interface-impl methods on types that are neither struct nor enum; found impls for: {:?}",
 			methods_by_type.keys().collect::<Vec<_>>()
 		);
 		HirModule {
@@ -305,6 +282,64 @@ impl Lowerer<'_> {
 			}
 			out.push(self.lower_method(meta, body));
 		}
+	}
+
+	/// Collect a struct's or enum's full method list: entries already gathered
+	/// into `methods_by_type` from top-level `impl <Name>`/`impl <Interface> for
+	/// <Name>` blocks, plus the type's own inner members (inherent `func`s and
+	/// nested `impl <Interface> { .. }` blocks, each materializing that
+	/// interface's un-overridden defaults, Slice 4C-b). Struct and enum bodies
+	/// share the identical `StructInnerMember` AST shape, so this one path
+	/// serves both (Slice 4D, X2).
+	fn collect_adt_methods(
+		&self,
+		type_name: &EcoString,
+		members: &[Spanned<nymph_ast::decl::StructInnerMember>],
+		interfaces_by_name: &FxHashMap<EcoString, &[Spanned<nymph_ast::decl::InterfaceMember>]>,
+		methods_by_type: &mut FxHashMap<EcoString, Vec<HirMethod>>,
+	) -> Vec<HirMethod> {
+		use nymph_ast::decl::{ImplMember, StructInnerMember};
+
+		let mut methods = methods_by_type.remove(type_name).unwrap_or_default();
+		for member in members {
+			match &member.0 {
+				StructInnerMember::Member(inner) => match &inner.0 {
+					ImplMember::Func { meta, body, .. } => methods.push(self.lower_method(meta, body)),
+					other => {
+						panic!("slice-4a lowering does not yet handle struct inner member {other:?}")
+					}
+				},
+				StructInnerMember::Impl {
+					interface, members, ..
+				} => {
+					let mut overridden: FxHashSet<EcoString> = FxHashSet::default();
+					for member in members {
+						match &member.0 {
+							ImplMember::Func { meta, body, .. } => {
+								overridden.insert(meta.name.0.clone());
+								methods.push(self.lower_method(meta, body));
+							}
+							other => panic!("slice-4b lowering does not yet handle impl member {other:?}"),
+						}
+					}
+					self.push_unoverridden_defaults(
+						&interface.0,
+						&overridden,
+						interfaces_by_name,
+						&mut methods,
+					);
+				}
+				other => {
+					panic!("slice-4a lowering does not yet handle struct inner member {other:?}")
+				}
+			}
+		}
+		// V4: two interfaces (or an override and a same-named default)
+		// materializing the same method name on one type is a real ambiguity
+		// codegen cannot silently resolve (JS would just let the last one win) —
+		// panic loudly, naming the type and method.
+		self.assert_no_duplicate_methods(type_name, &methods);
+		methods
 	}
 
 	/// V4: panic loudly, naming the struct and the offending method, if two

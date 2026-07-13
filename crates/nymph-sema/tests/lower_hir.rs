@@ -327,17 +327,77 @@ fn binding_union_panics_in_lowering() {
 }
 
 #[test]
-#[should_panic(expected = "non-struct types")]
-fn enum_inherent_methods_panic_in_lowering() {
-	// `impl Color { func ... }` on an enum type-checks, but lowering does not yet
-	// attach methods to enums; it must panic loudly instead of silently emitting
-	// JS that crashes at runtime. This pins that behavior.
-	lower(
+fn lowers_enum_inherent_methods() {
+	// `impl Color { func ... }` on an enum type-checks and, per Slice 4D, now
+	// lowers onto the enum's own `methods`, mirroring struct inherent methods.
+	let hir = lower(
 		r#"
 		enum Color { Red, Green }
 		impl Color {
 			func idx(): int = 0
 		}
+		"#,
+	);
+	assert_eq!(hir.enums.len(), 1);
+	let e = &hir.enums[0];
+	assert_eq!(e.name, "Color");
+	assert_eq!(e.methods.len(), 1);
+	assert_eq!(e.methods[0].name, "idx");
+}
+
+#[test]
+fn lowers_enum_inner_inherent_method() {
+	// An inherent `func` inside the enum body (not a top-level `impl`) also
+	// lands in the enum's methods — previously silently dropped by lowering
+	// (Slice 4D corrections #1: the `Declaration::Enum` arm used to ignore
+	// `members` entirely).
+	let hir = lower(
+		r#"
+		enum Color { Red, Green
+			func idx(): int = 0
+		}
+		"#,
+	);
+	let e = hir.enums.iter().find(|e| e.name == "Color").expect("Color");
+	assert_eq!(e.methods.len(), 1);
+	assert_eq!(e.methods[0].name, "idx");
+}
+
+#[test]
+fn lowers_enum_inner_impl_with_default_materialization() {
+	// A nested `impl Comparable<...> { .. }` block inside the enum body feeds
+	// its own methods plus the interface's un-overridden defaults, mirroring
+	// `lowers_nested_struct_impl_methods` / Slice 4C-b for structs.
+	let hir = lower(
+		r#"
+		interface Comparable<Other> {
+			func compare_to(other: Other): int
+			func less_than(other: Other): boolean = true
+		}
+		enum Color { Red, Green
+			impl Comparable<Other = Color> {
+				func compare_to(other: Color): int = 0
+			}
+		}
+		"#,
+	);
+	let e = hir.enums.iter().find(|e| e.name == "Color").expect("Color");
+	assert_eq!(e.methods.len(), 2);
+	assert!(e.methods.iter().any(|m| m.name == "compare_to"));
+	assert!(e.methods.iter().any(|m| m.name == "less_than"));
+}
+
+#[test]
+#[should_panic(expected = "multiple methods named")]
+fn colliding_defaults_from_two_interfaces_panics_in_lowering_for_enum() {
+	// The same V4 duplicate-method guard applies to enums as to structs.
+	lower(
+		r#"
+		interface A { func describe(): int = 1 }
+		interface B { func describe(): int = 2 }
+		enum Color { Red, Green }
+		impl A for Color { }
+		impl B for Color { }
 		"#,
 	);
 }
@@ -385,12 +445,10 @@ fn lowers_top_level_impl_for_methods() {
 }
 
 #[test]
-#[should_panic(expected = "non-struct types")]
-fn impl_for_on_enum_panics_in_lowering() {
-	// `impl Plus<...> for Color { ... }` on an enum type-checks (stdlib does this
-	// for `Result`'s `Unwrap` impl), but lowering does not yet attach methods to
-	// enums; it must panic loudly instead of silently dropping the impl.
-	lower(
+fn lowers_enum_impl_for_methods() {
+	// `impl Plus<...> for Color { ... }` on an enum (stdlib does this for
+	// `Result`'s `Unwrap` impl) now lowers onto the enum's methods (Slice 4D).
+	let hir = lower(
 		r#"
 		interface Plus<Other, Output> { func plus(other: Other): Output }
 		enum Color { Red, Green }
@@ -399,6 +457,9 @@ fn impl_for_on_enum_panics_in_lowering() {
 		}
 		"#,
 	);
+	let e = hir.enums.iter().find(|e| e.name == "Color").expect("Color");
+	assert_eq!(e.methods.len(), 1);
+	assert_eq!(e.methods[0].name, "plus");
 }
 
 #[test]

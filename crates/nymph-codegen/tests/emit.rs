@@ -1,5 +1,5 @@
 use nymph_codegen::emit;
-use nymph_hir::hir::{BinOp, HirExpr, HirFunc, HirModule};
+use nymph_hir::hir::{BinOp, HirEnum, HirExpr, HirFunc, HirMethod, HirModule, HirVariant};
 
 #[test]
 fn emits_a_function_returning_a_number() {
@@ -62,5 +62,82 @@ fn emits_call_and_string() {
 	assert!(
 		js.contains("log('hi')") || js.contains("log(\"hi\")"),
 		"{js}"
+	);
+}
+
+#[test]
+fn emits_method_less_enum_without_a_prototype() {
+	// X1: a method-less enum must keep today's exact shape — no `proto`, no
+	// `Object.create` — regardless of the new methodful codepath existing.
+	let module = HirModule {
+		funcs: vec![],
+		classes: vec![],
+		enums: vec![HirEnum {
+			name: "Opt".into(),
+			variants: vec![
+				HirVariant {
+					name: "Some".into(),
+					fields: vec!["value".into()],
+				},
+				HirVariant {
+					name: "None".into(),
+					fields: vec![],
+				},
+			],
+			methods: vec![],
+		}],
+	};
+	let js = emit(&module);
+	assert!(!js.contains("proto"), "no prototype object: {js}");
+	assert!(!js.contains("Object.create"), "no Object.create: {js}");
+	assert!(js.contains("Object.freeze"), "nullary stays frozen: {js}");
+	assert!(
+		js.contains("Object.assign"),
+		"field variant tags factory: {js}"
+	);
+	assert!(
+		js.contains("...fields"),
+		"field variant spreads fields: {js}"
+	);
+}
+
+#[test]
+fn emits_enum_with_methods_prototype_shape() {
+	// X1: an enum WITH methods gets a shared `proto` object and every variant
+	// is created via `Object.create(proto)`, while the tag ABI (Object.freeze /
+	// factory-tagging Object.assign) stays intact.
+	let module = HirModule {
+		funcs: vec![],
+		classes: vec![],
+		enums: vec![HirEnum {
+			name: "Color".into(),
+			variants: vec![
+				HirVariant {
+					name: "Red".into(),
+					fields: vec![],
+				},
+				HirVariant {
+					name: "Custom".into(),
+					fields: vec!["n".into()],
+				},
+			],
+			methods: vec![HirMethod {
+				name: "idx".into(),
+				params: vec![],
+				body: HirExpr::Num(0.0),
+			}],
+		}],
+	};
+	let js = emit(&module);
+	assert!(js.contains("proto"), "prototype object present: {js}");
+	assert!(
+		js.contains("Object.create(proto)"),
+		"variants built via Object.create(proto): {js}"
+	);
+	assert!(js.contains("idx"), "method name present: {js}");
+	assert!(js.contains("Object.freeze"), "nullary stays frozen: {js}");
+	assert!(
+		js.contains("...fields"),
+		"field variant spreads fields: {js}"
 	);
 }

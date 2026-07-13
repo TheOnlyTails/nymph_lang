@@ -319,9 +319,14 @@ impl<'a> Emitter<'a> {
 		Statement::ClassDeclaration(class)
 	}
 
-	/// Emit an inherent instance method as a class method `<name>(<params>) { return
-	/// <body>; }`. Mirrors [`Self::emit_func`]'s param/body handling.
-	fn emit_method(&self, method: &HirMethod) -> ClassElement<'a> {
+	/// Build a method's params/body into a plain JS `FunctionExpression`
+	/// (`(<params>) { return <body>; }`), independent of how the caller wraps
+	/// it — a class method definition (struct/class instance methods) or an
+	/// object-literal method property (the enum prototype ABI, Slice 4D) both
+	/// share this exactly. Mirrors [`Self::emit_func`]'s param/body handling.
+	/// Deliberately a plain function, never an arrow: prototype methods need
+	/// their own `this` bound to the receiver at call time.
+	fn method_function(&self, method: &HirMethod) -> ArenaBox<'a, Function<'a>> {
 		let mut body_stmts = ArenaVec::new_in(&self.ast);
 		match &method.body {
 			HirExpr::Block { .. } => {
@@ -359,7 +364,7 @@ impl<'a> Emitter<'a> {
 			&self.ast,
 		);
 		let fn_body = FunctionBody::new(SPAN, ArenaVec::new_in(&self.ast), body_stmts, &self.ast);
-		let func = Function::boxed(
+		Function::boxed(
 			SPAN,
 			FunctionType::FunctionExpression,
 			None,
@@ -372,7 +377,13 @@ impl<'a> Emitter<'a> {
 			oxc::ast::NONE,
 			Some(fn_body),
 			&self.ast,
-		);
+		)
+	}
+
+	/// Emit an inherent instance method as a class method `<name>(<params>) { return
+	/// <body>; }`.
+	fn emit_method(&self, method: &HirMethod) -> ClassElement<'a> {
+		let func = self.method_function(method);
 		ClassElement::new_method_definition(
 			SPAN,
 			MethodDefinitionType::MethodDefinition,
@@ -391,6 +402,29 @@ impl<'a> Emitter<'a> {
 			None,
 			&self.ast,
 		)
+	}
+
+	/// Emit an instance method as an object-literal method property (shorthand
+	/// `<name>(<params>) { … }` syntax), used for the enum prototype ABI's
+	/// `const proto = { … };` object (Slice 4D). Must stay a plain
+	/// `FunctionExpression` (never an arrow) so each call gets its own `this`.
+	fn emit_method_property(&self, method: &HirMethod) -> ObjectPropertyKind<'a> {
+		let func = self.method_function(method);
+		let key = PropertyKey::new_static_identifier(
+			SPAN,
+			self.ast.allocator.alloc_str(&method.name),
+			&self.ast,
+		);
+		ObjectPropertyKind::ObjectProperty(ObjectProperty::boxed(
+			SPAN,
+			PropertyKind::Init,
+			key,
+			Expression::FunctionExpression(func),
+			true,
+			false,
+			false,
+			&self.ast,
+		))
 	}
 
 	// ── Enum Symbol-tag ABI ────────────────────────────────────────────────────
@@ -421,8 +455,19 @@ impl<'a> Emitter<'a> {
 	/// { V0: <factory|singleton>, … }; })();`. The IIFE scopes each variant's unique
 	/// symbol; field variants become object-arg factories, nullary variants frozen
 	/// singletons — each carrying `[TAG]` so a matcher can compare identity.
+	///
+	/// X1: when the enum has methods, a `const proto = { … };` object (built the
+	/// same way as struct class methods, see [`Self::emit_method_property`]) is
+	/// also emitted inside the IIFE, and every variant value is created with
+	/// `Object.create(proto)` as its prototype instead of a plain object literal
+	/// — so `c.m()` and `this` inside a method work natively. A method-less enum
+	/// emits none of that, staying byte-identical to before Slice 4D.
 	fn emit_enum(&self, hir_enum: &HirEnum) -> Statement<'a> {
 		let mut stmts = ArenaVec::new_in(&self.ast);
+		let has_methods = !hir_enum.methods.is_empty();
+		if has_methods {
+			stmts.push(self.emit_enum_proto(&hir_enum.methods));
+		}
 		let mut props = ArenaVec::new_in(&self.ast);
 		for (i, variant) in hir_enum.variants.iter().enumerate() {
 			let t_name = format!("t{i}");
@@ -451,13 +496,18 @@ impl<'a> Emitter<'a> {
 			let tag_obj = Expression::new_object_expression(SPAN, tag_props, &self.ast);
 			// The variant's value: a factory (fields) or a frozen singleton (nullary).
 			let value = if variant.fields.is_empty() {
+				let base = if has_methods {
+					self.object_create_and_assign("proto", tag_obj)
+				} else {
+					tag_obj
+				};
 				self.member_call(
 					Expression::new_identifier(SPAN, "Object", &self.ast),
 					"freeze",
-					vec![tag_obj],
+					vec![base],
 				)
 			} else {
-				let factory = self.variant_factory(&t_name);
+				let factory = self.variant_factory(&t_name, has_methods);
 				self.member_call(
 					Expression::new_identifier(SPAN, "Object", &self.ast),
 					"assign",
@@ -490,9 +540,41 @@ impl<'a> Emitter<'a> {
 		self.const_decl(hir_enum.name.as_str(), iife)
 	}
 
+	/// `const proto = { m1(…) { … }, … };` — the shared prototype object an
+	/// enum's methodful variants are `Object.create`d against (Slice 4D, X1).
+	/// Each method is built the same way a struct's class method is (via
+	/// [`Self::method_function`]), just wrapped as an object-literal method
+	/// property instead of a class element.
+	fn emit_enum_proto(&self, methods: &[HirMethod]) -> Statement<'a> {
+		let mut props = ArenaVec::new_in(&self.ast);
+		for method in methods {
+			props.push(self.emit_method_property(method));
+		}
+		let obj = Expression::new_object_expression(SPAN, props, &self.ast);
+		self.const_decl("proto", obj)
+	}
+
+	/// `Object.assign(Object.create(<proto_name>), <props>)` — a methodful
+	/// variant's value, sharing `proto_name`'s prototype while still carrying
+	/// `props`' own properties (the `[TAG]` / fields).
+	fn object_create_and_assign(&self, proto_name: &'a str, props: Expression<'a>) -> Expression<'a> {
+		let create_call = self.member_call(
+			Expression::new_identifier(SPAN, "Object", &self.ast),
+			"create",
+			vec![Expression::new_identifier(SPAN, proto_name, &self.ast)],
+		);
+		self.member_call(
+			Expression::new_identifier(SPAN, "Object", &self.ast),
+			"assign",
+			vec![create_call, props],
+		)
+	}
+
 	/// `(fields) => { return { [TAG]: <t_name>, ...fields }; }` — a field variant's
-	/// object-argument factory.
-	fn variant_factory(&self, t_name: &str) -> Expression<'a> {
+	/// object-argument factory. When `has_methods`, the returned object is instead
+	/// `Object.assign(Object.create(proto), { [TAG]: <t_name>, ...fields })` so the
+	/// constructed value carries the shared prototype's methods (Slice 4D, X1).
+	fn variant_factory(&self, t_name: &str, has_methods: bool) -> Expression<'a> {
 		let mut obj_props = ArenaVec::new_in(&self.ast);
 		obj_props.push(self.tag_prop(t_name));
 		obj_props.push(ObjectPropertyKind::new_spread_property(
@@ -501,8 +583,17 @@ impl<'a> Emitter<'a> {
 			&self.ast,
 		));
 		let obj = Expression::new_object_expression(SPAN, obj_props, &self.ast);
+		let ret_expr = if has_methods {
+			self.object_create_and_assign("proto", obj)
+		} else {
+			obj
+		};
 		let mut body_stmts = ArenaVec::new_in(&self.ast);
-		body_stmts.push(Statement::new_return_statement(SPAN, Some(obj), &self.ast));
+		body_stmts.push(Statement::new_return_statement(
+			SPAN,
+			Some(ret_expr),
+			&self.ast,
+		));
 		let body = FunctionBody::new(SPAN, ArenaVec::new_in(&self.ast), body_stmts, &self.ast);
 		let mut params = ArenaVec::new_in(&self.ast);
 		params.push(FormalParameter::new_plain(

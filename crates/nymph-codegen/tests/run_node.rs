@@ -759,6 +759,97 @@ fn runs_equals_on_user_struct_stays_native_reference_equality() {
 }
 
 #[test]
+fn runs_enum_inherent_method_matching_this() {
+	// An inherent method on an enum branches on `match (this) { .. }` (the
+	// checker rejects direct `this.field` access on an enum receiver — see the
+	// Slice 4D plan's investigation brief, "corrections" #2 — so matching is
+	// the supported way to inspect `this` inside an enum method).
+	let src = r#"
+		enum Color { Red, Green, Blue }
+		impl Color {
+			func is_red(): boolean = match (this) {
+				Red -> true,
+				_ -> false,
+			}
+		}
+		func check(c: Color): boolean = c.is_red()
+	"#;
+	assert_eq!(run(src, "check(Color.Red)"), "true");
+	assert_eq!(run(src, "check(Color.Green)"), "false");
+}
+
+#[test]
+fn runs_enum_method_reads_field_variant_payload_via_match() {
+	// A method reads a field variant's payload by matching `this`, working on
+	// both the field variant and the nullary variant of the same enum.
+	let src = r#"
+		enum Opt { Some(value: int), None }
+		impl Opt {
+			func unwrap_or(fallback: int): int = match (this) {
+				Some(value) -> value,
+				None -> fallback,
+			}
+		}
+	"#;
+	assert_eq!(run(src, "Opt.Some({ value: 42 }).unwrap_or(0)"), "42");
+	assert_eq!(run(src, "Opt.None.unwrap_or(0)"), "0");
+}
+
+#[test]
+fn runs_enum_operator_overload_dispatches_to_method() {
+	// `a + b` on an enum dispatches to `.plus(...)` (a `UserImpl` resolution),
+	// exactly like the struct case, now that enums can carry methods.
+	let src = r#"
+		interface Plus<Other, Output> { func plus(other: Other): Output }
+		enum Color { Red, Green }
+		impl Plus<Other = Color, Output = Color> for Color {
+			func plus(other: Color): Color = Red
+		}
+		func add(a: Color, b: Color): Color = a + b
+	"#;
+	assert_eq!(
+		run(src, "add(Color.Red, Color.Green) === Color.Red"),
+		"true"
+	);
+}
+
+#[test]
+fn runs_enum_interface_default_method() {
+	// An empty `impl Describe for Color {}` materializes the interface's
+	// default-bodied method onto the enum, callable like any other method.
+	let src = r#"
+		interface Describe { func label(): int = 1 }
+		enum Color { Red, Green }
+		impl Describe for Color { }
+		func d(c: Color): int = c.label()
+	"#;
+	assert_eq!(run(src, "d(Color.Red)"), "1");
+	assert_eq!(run(src, "d(Color.Green)"), "1");
+}
+
+#[test]
+fn runs_enum_with_methods_preserves_tag_identity() {
+	// The Slice 2C tag-identity value ABI must not change for a methodful enum:
+	// a constructed field variant still shares the factory's own `[TAG]`, and
+	// distinct variants still have distinct tags — while methods are also
+	// callable on both variant shapes.
+	let src = r#"
+		enum A { X(n: int), Y }
+		impl A {
+			func f(): int = 0
+		}
+	"#;
+	let tag = "Symbol.for('nymph.tag')";
+	assert_eq!(
+		run(src, &format!("A.X({{ n: 1 }})[{tag}] === A.X[{tag}]")),
+		"true"
+	);
+	assert_eq!(run(src, &format!("A.X[{tag}] === A.Y[{tag}]")), "false");
+	assert_eq!(run(src, "A.X({ n: 1 }).f()"), "0");
+	assert_eq!(run(src, "A.Y.f()"), "0");
+}
+
+#[test]
 fn compile_reports_check_errors() {
 	// A type error surfaces as diagnostics, not JS.
 	let result = nymph_codegen::compile("func f(): int = true", "test");
