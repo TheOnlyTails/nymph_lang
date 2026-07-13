@@ -1202,18 +1202,17 @@ fn collect_locals_stmt(stmt: &HirStmt, out: &mut FxHashSet<EcoString>) {
 	}
 }
 
-/// Reorder top-level `let`s into a valid module-init order (Slice 4E, Y3 fix):
-/// each `let` must be emitted after every OTHER top-level `let` its own
-/// initializer needs at module-init time — either by directly naming it, or
-/// by calling a function that (transitively) reads it. JS module-scope
-/// `const`/`let` is TDZ (unlike a hoisted `function` declaration), so naive
-/// source-order emission can throw `ReferenceError: Cannot access '<x>'
-/// before initialization` when a let references a LATER let, directly or
-/// through a function-call chain. Ties (no dependency either way) keep
-/// source order — the reordering is a stable, minimal-movement pass, not an
-/// arbitrary topological sort. A genuine cycle between top-level lets (`let a
-/// = b + 1; let b = a + 1;`) has no valid JS order at all — panic loudly
-/// rather than silently pick one and let it throw at runtime instead.
+/// Reorder top-level `let`s into a valid module-init order via Kahn's topological sort
+/// plus a worklist fixpoint for transitive function-call dependencies.
+///
+/// Each `let` must be emitted after every OTHER top-level `let` its own initializer
+/// needs at module-init time — either by directly naming it, or by calling a function
+/// that (transitively) reads it. JS module-scope `const`/`let` is TDZ (unlike a hoisted
+/// `function` declaration), so naive source-order emission throws `ReferenceError` when
+/// a let references a LATER let, directly or through a call chain. Ties keep source order
+/// (stable sort). Genuine cycles panic. The fixpoint resolves transitive call-graph
+/// dependencies (avoiding the memoization bugs of a recursion-guarded DFS under mutual
+/// recursion), then Kahn's algorithm emits lets in dependency order.
 fn reorder_lets_by_dependency(lets: Vec<HirLet>, funcs: &[HirFunc]) -> Vec<HirLet> {
 	let let_names: FxHashSet<EcoString> = lets.iter().map(|l| l.name.clone()).collect();
 	let func_names: FxHashSet<EcoString> = funcs.iter().map(|f| f.name.clone()).collect();

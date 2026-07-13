@@ -90,11 +90,11 @@ fn substitute_args(
 	GenericArgs { positional, named }
 }
 
-/// Does the inference variable `var` occur anywhere within `ty`?
+/// The occurs-check: does the inference variable `var` occur anywhere within `ty`?
 ///
-/// This is the structural occurs-check. During unification the caller must first
-/// resolve `ty` through the union-find table (so bound variables are followed)
-/// before calling this on the residual term.
+/// Rejects unification of a variable with a type containing it (prevents infinite types).
+/// Caller must first resolve `ty` through the union-find table; structural walk rejects
+/// if `var` appears in any nested component.
 pub fn occurs(interner: &Interner, var: InferVar, ty: Ty) -> bool {
 	match interner.kind(ty) {
 		TyKind::Infer(v) => *v == var,

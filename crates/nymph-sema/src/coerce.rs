@@ -1,9 +1,10 @@
-//! Structural unification and (Milestone-A) subtyping.
+//! Hindley-Milner-style structural unification and (Milestone-A) subtyping.
 //!
-//! `unify` is the symmetric structural unifier the old checker never had: it walks
-//! two types together, binds inference variables through the union-find table (with
-//! an occurs-check in `bind_var`), and reports a precise mismatch otherwise. It
-//! never silently no-ops on a conflict.
+//! `unify` implements the symmetric structural unifier via occurs-check and
+//! inference-variable binding through a union-find table: walks two types,
+//! binds inference variables (rejecting occurrence), and reports precise mismatches.
+//! The occurs-check prevents infinite types; `try_unify` implements trial unification
+//! for overload resolution (bindings kept iff the trial succeeds).
 
 use crate::errors::TypeError;
 use nymph_ast::Span;
@@ -39,9 +40,10 @@ impl Checker<'_> {
 		self.try_unify(param, arg)
 	}
 
-	/// Make two types equal, solving inference variables as needed. On an
-	/// irreconcilable conflict, report a mismatch and continue (the `Error` type
-	/// then flows outward, keeping later checking useful).
+	/// Structural unification (Hindley-Milner): make two types equal by walking them
+	/// together, binding inference variables through union-find, and applying the
+	/// occurs-check to reject infinite types. On conflict, emits a type mismatch and
+	/// returns, allowing checking to continue.
 	pub(crate) fn unify(&mut self, a: Ty, b: Ty, span: Span) {
 		let a = self.shallow_resolve(a);
 		let b = self.shallow_resolve(b);
@@ -108,10 +110,9 @@ impl Checker<'_> {
 		}
 	}
 
-	/// A trial unification for overload/impl selection: like [`Self::unify`] but
-	/// returns whether it succeeded instead of emitting a diagnostic, and treats an
-	/// occurs-check failure as failure. Bindings it makes are real; callers wrap it
-	/// in a [`snapshot`](crate::unify::UnifyTable::snapshot) to undo them.
+	/// Trial unification (Hindley-Milner): like [`Self::unify`] but silent (no diagnostic)
+	/// and returns success/failure. Rejects on occurs-check failure. Used for overload
+	/// and impl resolution; caller wraps in union-find snapshots to roll back bindings.
 	pub(crate) fn try_unify(&mut self, a: Ty, b: Ty) -> bool {
 		let a = self.shallow_resolve(a);
 		let b = self.shallow_resolve(b);

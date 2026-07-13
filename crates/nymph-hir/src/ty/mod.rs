@@ -164,7 +164,8 @@ impl Interner {
 		this
 	}
 
-	/// Intern a kind, returning its handle. Structurally equal kinds share a handle.
+	/// Hash-consing (structural interning): intern a kind, returning its handle.
+	/// Structurally equal kinds share the same handle (cheap copy/equality checks).
 	pub fn intern(&mut self, kind: TyKind) -> Ty {
 		if let Some(&ty) = self.dedup.get(&kind) {
 			return ty;
