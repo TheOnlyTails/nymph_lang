@@ -389,6 +389,95 @@ fn impl_trait_parameter_method_return_is_enforced() {
 	);
 }
 
+// ── Slice 4F: call-site instantiation of `impl Trait` param sugar ──────────
+//
+// Body-side resolution of `s.show()` above already worked before this slice.
+// What didn't: *calling* such a function with a concrete argument, because the
+// synthetic `Param` minted for the sugar never got a fresh variable at the
+// call site (only declared generics did) and so stayed rigid, making the
+// concrete argument fail to unify against it.
+
+#[test]
+fn impl_trait_parameter_accepts_a_concrete_implementing_argument() {
+	assert_ok(
+		"interface Area { func area(): int }
+		 struct Square(side: int)
+		 impl Area for Square { func area(): int = this.side * this.side }
+		 func measure(shape: Area): int = shape.area()
+		 func total(s: Square): int = measure(s)",
+	);
+}
+
+#[test]
+fn impl_trait_parameter_via_function_value_reference_also_instantiates() {
+	// A bare identifier reference to the function (not a direct call) types
+	// through the same `type_of_def` -> `fn_type_of` path as a call, so it
+	// must get the same fresh-per-use-site treatment.
+	assert_ok(
+		"interface Area { func area(): int }
+		 struct Square(side: int)
+		 impl Area for Square { func area(): int = this.side * this.side }
+		 func measure(shape: Area): int = shape.area()
+		 func total(s: Square): int = {
+		   let m = measure
+		   m(s)
+		 }",
+	);
+}
+
+#[test]
+fn two_impl_trait_parameters_of_the_same_interface_are_independent() {
+	// Every mention of an interface name in type position mints its own
+	// synthetic `Param` (they are anonymous — no surface syntax can refer back
+	// to one), so two `Area`-sugared params here are two distinct synthetics;
+	// each must independently freshen and unify with its own argument's type.
+	assert_ok(
+		"interface Area { func area(): int }
+		 struct Square(side: int)
+		 impl Area for Square { func area(): int = this.side * this.side }
+		 struct Rect(w: int, h: int)
+		 impl Area for Rect { func area(): int = this.w * this.h }
+		 func combine(a: Area, b: Area): int = a.area() + b.area()
+		 func total(s: Square, r: Rect): int = combine(s, r)",
+	);
+}
+
+#[test]
+fn impl_trait_return_position_stays_rejected_when_it_disagrees_with_the_body() {
+	// A param-position and a return-position mention of the same interface
+	// name mint *different* synthetic `Param`s, so they never unify — the
+	// callee's own body-check rejects this regardless of any call site, and
+	// call-site instantiation (this slice) neither fixes nor breaks that: only
+	// synthetics occurring in parameter position are freshened at a use site,
+	// exactly like today's behavior kept return-position rigid.
+	assert_error_contains(
+		"interface Area { func area(): int }
+		 func id(x: Area): Area = x",
+		"mismatched types",
+	);
+}
+
+#[test]
+fn impl_trait_parameter_non_implementing_argument_parity_with_explicit_generic() {
+	// KNOWN PRE-EXISTING GAP, not introduced or fixed by this slice: there is
+	// no call-site bound-*enforcement* machinery for declared generics either
+	// — `fresh_subst` mints an unconstrained inference variable, and unifying
+	// it against any concrete argument type trivially succeeds regardless of
+	// whether that type actually implements the bound. `impl Trait` sugar now
+	// goes through the exact same substitution as a declared generic (Z1's
+	// equivalence), so it inherits the identical gap rather than a new or
+	// different one: both spellings below silently accept `int` — which does
+	// not implement `Area` — with zero diagnostics, and would panic at Node
+	// runtime if actually called. Building bound enforcement is a separate,
+	// larger change with no existing call-site mechanism to reuse.
+	assert_ok(
+		"interface Area { func area(): int }
+		 func measure_explicit<T: Area>(shape: T): int = shape.area()
+		 func measure_sugar(shape: Area): int = shape.area()
+		 func total(n: int): int = measure_explicit(n) + measure_sugar(n)",
+	);
+}
+
 const INTO: &str = "interface Into<Other> { func into(): Other }\n";
 
 #[test]

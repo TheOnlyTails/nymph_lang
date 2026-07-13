@@ -269,10 +269,10 @@ impl Checker<'_> {
 
 	/// Mint a fresh anonymous generic parameter for an `impl Interface` type, recording
 	/// `interface` as its bound. Synthetic indices sit far above any declared generic so
-	/// they never collide within a signature.
+	/// they never collide within a signature (see `Checker::SYNTHETIC_PARAM_BASE`, which
+	/// callers instantiating a signature at a use site key off to freshen these too).
 	fn mint_synthetic_param(&mut self, interface: DefId) -> Ty {
-		const SYNTHETIC_BASE: u32 = 1 << 28;
-		let idx = ParamIdx(SYNTHETIC_BASE + self.synthetic_params);
+		let idx = ParamIdx(Self::SYNTHETIC_PARAM_BASE + self.synthetic_params);
 		self.synthetic_params += 1;
 		self
 			.synthetic_bounds

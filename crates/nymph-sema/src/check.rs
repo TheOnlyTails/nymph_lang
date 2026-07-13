@@ -11,7 +11,7 @@ use crate::errors::TypeError;
 use ecow::EcoString;
 use nymph_ast::{Span, decl::Declaration, decl::Module};
 use nymph_diagnostics::Diagnostic;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::annotate::Checked;
 use crate::def::{DefMap, Signatures, build_def_map};
@@ -422,6 +422,58 @@ impl<'m> Checker<'m> {
 		(0..count)
 			.map(|i| (ParamIdx(i as u32), self.fresh()))
 			.collect()
+	}
+
+	/// The offset above which a `ParamIdx` is *synthetic*: minted by
+	/// `mint_synthetic_param` (`lower.rs`) for an `impl Interface` type reference
+	/// (Slice 4F sugar) rather than a declared generic parameter. Declared
+	/// generics occupy `0..sig.generics.len()`, well below this offset, so the
+	/// two never collide within one signature.
+	pub(crate) const SYNTHETIC_PARAM_BASE: u32 = 1 << 28;
+
+	/// Collect every synthetic `ParamIdx` (see [`Self::SYNTHETIC_PARAM_BASE`])
+	/// occurring in `ty`, mirroring `subst`'s traversal. Callers that instantiate
+	/// a stored signature at a use site (a call, a function-value reference) use
+	/// this to extend their substitution with a fresh variable per synthetic
+	/// param, exactly like a declared generic — otherwise a synthetic param
+	/// leaks through `subst` rigid (it is Some `ParamIdx`, just not one `0..n`
+	/// covers) and unifying a concrete argument against it fails outright.
+	pub(crate) fn synthetic_params_in(&self, ty: Ty, out: &mut FxHashSet<ParamIdx>) {
+		match self.interner.kind(ty).clone() {
+			TyKind::Param(p) if p.0 >= Self::SYNTHETIC_PARAM_BASE => {
+				out.insert(p);
+			}
+			TyKind::List(elem) => self.synthetic_params_in(elem, out),
+			TyKind::Tuple(elems) => {
+				for e in elems {
+					self.synthetic_params_in(e, out);
+				}
+			}
+			TyKind::Map(key, value) => {
+				self.synthetic_params_in(key, out);
+				self.synthetic_params_in(value, out);
+			}
+			TyKind::Fn { params, ret } => {
+				for p in params {
+					self.synthetic_params_in(p, out);
+				}
+				self.synthetic_params_in(ret, out);
+			}
+			TyKind::Adt(_, args) => {
+				for &t in &args.positional {
+					self.synthetic_params_in(t, out);
+				}
+				for (_, t) in &args.named {
+					self.synthetic_params_in(*t, out);
+				}
+			}
+			TyKind::Intersection(parts) => {
+				for p in parts {
+					self.synthetic_params_in(p, out);
+				}
+			}
+			_ => {}
+		}
 	}
 
 	// ── Unification helpers shared with coerce.rs ────────────────────────────

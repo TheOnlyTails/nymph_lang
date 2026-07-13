@@ -714,6 +714,24 @@ fn bounded_generic_negate_dispatches_through_bound() {
 }
 
 #[test]
+fn impl_trait_parameter_negate_dispatches_through_bound() {
+	// Z3 (Slice 4F): `impl Trait` param sugar (`t: Negate<Output = int>`, sugar
+	// for a synthetic generic parameter bounded by `Negate`) resolves `-t`
+	// through that bound exactly like the declared-generic spelling above —
+	// still `GenericBound` → `UserImplDefaultMethod`, unaffected by this
+	// slice's call-site instantiation fix (that fix only touches how the
+	// function's *type* is instantiated at a use site, not how operators
+	// dispatch on the param inside the body being checked).
+	let res = prefix_resolution_for(
+		"interface Negate<Output> { func negate(): Output }
+		 func f(t: Negate<Output = int>): int = -t",
+		"f",
+	);
+	assert_eq!(res.dispatch, DispatchKind::UserImplDefaultMethod);
+	assert_eq!(res.method, "negate");
+}
+
+#[test]
 fn unbounded_generic_negate_is_not_implemented() {
 	// An unbounded generic parameter has no `Negate` impl to dispatch to — a
 	// `NotImplemented` diagnostic, not a lowering-time ICE.

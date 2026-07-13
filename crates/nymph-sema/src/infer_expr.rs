@@ -15,7 +15,7 @@ use nymph_ast::{
 	expr::{CallArg, Expr, ExprKind, RangeKind, Statement, StringPart},
 	ops::{AssignOperator, BinaryOperator, PrefixOperator},
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::annotate::{DispatchKind, Resolution};
 use crate::check::Checker;
@@ -493,10 +493,29 @@ impl<'m> Checker<'m> {
 	}
 
 	/// The instantiated function type of a top-level `func`, with fresh variables
-	/// for its generic parameters.
+	/// for its generic parameters — declared (`0..sig.generics.len()`) and, per
+	/// Slice 4F, synthetic (minted for `impl Interface` param sugar, see
+	/// `Checker::synthetic_params_in`). Without the latter, a synthetic param
+	/// leaks through `subst` rigid and unifying a concrete argument against it
+	/// fails outright ("mismatched types: expected `T268435456`, found …") even
+	/// though the exact same sugar resolves fine *inside* the callee's body.
+	///
+	/// Only synthetics occurring in *parameter* position are freshened here — a
+	/// synthetic occurring only in return position (`impl Trait` return sugar)
+	/// is left rigid, matching pre-4F behavior: the callee's own body-check
+	/// already rejects it loudly (a distinct synthetic per mention never
+	/// unifies with the body's result), and freshening it here would instead
+	/// hand the caller an unconstrained variable carrying an unenforced bound.
 	fn fn_type_of(&mut self, def: DefId) -> Ty {
 		let sig = self.sigs.funcs[&def].clone();
-		let subst = self.fresh_subst(sig.generics.len());
+		let mut subst = self.fresh_subst(sig.generics.len());
+		let mut synthetics = FxHashSet::default();
+		for p in &sig.params {
+			self.synthetic_params_in(p.ty, &mut synthetics);
+		}
+		for idx in synthetics {
+			subst.entry(idx).or_insert_with(|| self.fresh());
+		}
 		let params = sig
 			.params
 			.iter()

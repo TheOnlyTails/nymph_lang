@@ -1212,13 +1212,13 @@ fn golden_finding_top_level_let_is_silently_dropped() {
 }
 
 #[test]
-#[ignore = "FINDING: calling a function whose param uses `impl Trait` sugar (`shape: Area`) \
-            with a concrete impl'ing type is rejected — `mismatched types: expected \
-            `T268435456`, found `Square`` (the synthetic bound param never instantiates at \
-            call sites); declaring/uses inside the body work fine"]
 fn golden_finding_impl_trait_param_rejects_concrete_argument() {
-	compile_ok(
-		r#"
+	// FINDING (fixed by Slice 4F): calling a function whose param uses `impl
+	// Trait` sugar (`shape: Area`) with a concrete impl'ing type used to be
+	// rejected — `mismatched types: expected `T268435456`, found `Square`` (the
+	// synthetic bound param never instantiated at call sites); declaring/using
+	// it inside the body always worked fine.
+	let src = r#"
 		interface Area { func area(): int }
 		struct Square(side: int)
 		impl Area for Square {
@@ -1226,6 +1226,6 @@ fn golden_finding_impl_trait_param_rejects_concrete_argument() {
 		}
 		func measure(shape: Area): int = shape.area()
 		func total(s: Square): int = measure(s)
-		"#,
-	);
+		"#;
+	assert_eq!(run(src, "total(new Square({ side: 3 }))"), "9");
 }
