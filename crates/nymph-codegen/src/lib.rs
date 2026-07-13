@@ -1,5 +1,7 @@
 //! JavaScript code generation from the Nymph HIR, via oxc's AST builder + codegen.
 
+#![warn(clippy::all)]
+
 mod emit;
 
 use nymph_diagnostics::Diagnostic;

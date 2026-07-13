@@ -1,3 +1,5 @@
+#![warn(clippy::all)]
+
 use clap::Parser;
 
 use crate::commands::{

@@ -15,6 +15,3 @@ nymph-sema = { workspace = true }
 nymph-diagnostics = { workspace = true }
 oxc = { workspace = true }
 ecow = { workspace = true }
-
-[lints.clippy]
-all = "warn"

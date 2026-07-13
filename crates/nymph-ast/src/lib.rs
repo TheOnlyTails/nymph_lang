@@ -9,6 +9,8 @@
 //! All nodes derive [`salsa::SalsaValue`] so that a whole tree can be stored inside the
 //! incremental compilation database without extra glue.
 
+#![warn(clippy::all)]
+
 use std::fmt::Display;
 
 use ecow::EcoString;

@@ -12,5 +12,5 @@
 		"oxlint": "catalog:",
 		"oxlint-tsgolint": "catalog:"
 	},
-	"packageManager": "pnpm@11.11.0"
+	"packageManager": "pnpm@11.12.0"
 }
