@@ -23,7 +23,7 @@ use nymph_hir::hir::{
 use nymph_hir::ty::{Interner, TyKind};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::{Annotations, Checked};
+use crate::{Annotations, Checked, DispatchKind};
 
 /// Lower a checked module into the code-generation HIR, consulting `checked`'s
 /// annotations/interner for type-directed decisions (e.g. index-access dispatch).
@@ -262,11 +262,7 @@ impl Lowerer<'_> {
 					}
 				}
 			}
-			ExprKind::BinaryOp { lhs, op, rhs } => HirExpr::Binary {
-				op: lower_binop(*op),
-				lhs: Box::new(self.lower_expr(lhs)),
-				rhs: Box::new(self.lower_expr(rhs)),
-			},
+			ExprKind::BinaryOp { lhs, op, rhs } => self.lower_binary(expr.id, lhs, *op, rhs),
 			ExprKind::PrefixOp { op, value } => HirExpr::Unary {
 				op: lower_prefix(*op),
 				operand: Box::new(self.lower_expr(value)),
@@ -318,6 +314,49 @@ impl Lowerer<'_> {
 				}
 			}
 			other => panic!("slice-2a lowering does not yet handle {other:?}"),
+		}
+	}
+
+	/// Lower a `BinaryOp` node per its recorded [`crate::Resolution`] (Slice 4B,
+	/// D4). `BuiltinEager`/`BuiltinShortCircuit` keep the existing native-JS
+	/// `HirExpr::Binary` path; `UserImpl` dispatches to a method call on the lhs
+	/// (`lhs.method(rhs)`, mirroring how method calls elsewhere in this file lower
+	/// to `Call { callee: Field { .. }, .. }`). `UserImplDefaultMethod` and a
+	/// missing resolution both panic loudly — codegen cannot yet materialize
+	/// interface default methods, and an unresolved node is a checker bug we want
+	/// to see immediately rather than silently miscompile.
+	fn lower_binary(
+		&self,
+		id: nymph_ast::NodeId,
+		lhs: &Expr,
+		op: BinaryOperator,
+		rhs: &Expr,
+	) -> HirExpr {
+		match self.annotations.resolution_of(id) {
+			Some(res)
+				if matches!(
+					res.dispatch,
+					DispatchKind::BuiltinEager | DispatchKind::BuiltinShortCircuit
+				) =>
+			{
+				HirExpr::Binary {
+					op: lower_binop(op),
+					lhs: Box::new(self.lower_expr(lhs)),
+					rhs: Box::new(self.lower_expr(rhs)),
+				}
+			}
+			Some(res) if res.dispatch == DispatchKind::UserImpl => HirExpr::Call {
+				callee: Box::new(HirExpr::Field {
+					recv: Box::new(self.lower_expr(lhs)),
+					name: res.method.clone(),
+				}),
+				args: vec![self.lower_expr(rhs)],
+			},
+			Some(res) => panic!(
+				"slice-4b lowering does not yet dispatch operator to interface default method {}",
+				res.method
+			),
+			None => panic!("slice-4b lowering: no operator resolution recorded for binary op {op:?}"),
 		}
 	}
 

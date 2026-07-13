@@ -400,3 +400,67 @@ fn impl_for_on_enum_panics_in_lowering() {
 		"#,
 	);
 }
+
+#[test]
+fn lowers_user_operator_overload_to_a_method_call() {
+	// `a + b` on a user struct with a directly-defined `Plus.plus` impl dispatches
+	// to `a.plus(b)` rather than a native JS `+` (Slice 4B, D4: `UserImpl`).
+	let hir = lower(
+		r#"
+		interface Plus<Other, Output> { func plus(other: Other): Output }
+		struct Vec2(x: int, y: int)
+		impl Plus<Other = Vec2, Output = Vec2> for Vec2 {
+			func plus(other: Vec2): Vec2 = other
+		}
+		func add(a: Vec2, b: Vec2): Vec2 = a + b
+		"#,
+	);
+	let f = hir.funcs.iter().find(|f| f.name == "add").expect("add");
+	let HirExpr::Call { callee, args } = &f.body else {
+		panic!("expected Call, got {:?}", f.body);
+	};
+	let HirExpr::Field { recv, name } = callee.as_ref() else {
+		panic!("expected Field callee, got {callee:?}");
+	};
+	assert_eq!(name, "plus");
+	assert!(matches!(recv.as_ref(), HirExpr::Local(n) if n == "a"));
+	assert_eq!(args.len(), 1);
+	assert!(matches!(&args[0], HirExpr::Local(n) if n == "b"));
+}
+
+#[test]
+fn lowers_primitive_arithmetic_to_binary_unchanged() {
+	// `int + int` still lowers to `HirExpr::Binary`, not a dispatched call — the
+	// `BuiltinEager` resolution keeps the existing native-operator path.
+	let hir = lower("func f(a: int, b: int): int = a + b");
+	assert_eq!(
+		hir.funcs[0].body,
+		HirExpr::Binary {
+			op: BinOp::Add,
+			lhs: Box::new(HirExpr::Local("a".into())),
+			rhs: Box::new(HirExpr::Local("b".into())),
+		}
+	);
+}
+
+#[test]
+#[should_panic(expected = "default method")]
+fn user_comparable_default_method_panics_in_lowering() {
+	// `v1 < v2` resolves through `Comparable`'s interface *default* method
+	// (`less_than`, provided in terms of `compare_to`), which codegen cannot yet
+	// dispatch to — lowering must panic loudly rather than emit a call to a method
+	// that doesn't exist on the class (Slice 4B, D4: `UserImplDefaultMethod`).
+	lower(
+		r#"
+		interface Comparable<Other> {
+			func compare_to(other: Other): int
+			func less_than(other: Other): boolean = true
+		}
+		struct Vec2(x: int, y: int)
+		impl Comparable<Other = Vec2> for Vec2 {
+			func compare_to(other: Vec2): int = 0
+		}
+		func lt(v1: Vec2, v2: Vec2): boolean = v1 < v2
+		"#,
+	);
+}
