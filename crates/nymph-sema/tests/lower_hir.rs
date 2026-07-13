@@ -1,4 +1,4 @@
-use nymph_hir::hir::{BinOp, HirExpr, HirModule, HirStmt};
+use nymph_hir::hir::{BinOp, HirExpr, HirModule, HirStmt, UnOp};
 use nymph_sema::check_module;
 use nymph_syntax::parse_module;
 
@@ -547,6 +547,110 @@ fn missing_resolution_still_panics_in_lowering() {
 	// `Checked` whose annotations were wiped, as if the checker had failed to
 	// record a resolution it should have.
 	let parsed = parse_module("func f(a: int, b: int): int = a + b", "test");
+	assert!(
+		!parsed.diagnostics.iter().any(|d| d.is_error()),
+		"parse failed"
+	);
+	let checked = check_module(&parsed.tree);
+	assert!(
+		checked.diags.is_empty(),
+		"check failed: {:?}",
+		checked.diags
+	);
+	let stripped = nymph_sema::Checked {
+		diags: checked.diags,
+		annotations: nymph_sema::Annotations::default(),
+		interner: checked.interner,
+	};
+	nymph_sema::lower_hir(&parsed.tree, &stripped);
+}
+
+// ── Slice 4C-a, Task 2: `PrefixOp` lowering dispatch ────────────────────────
+
+#[test]
+fn lowers_user_negate_overload_to_a_method_call() {
+	// `-v` on a user struct with a directly-defined `Negate.negate` impl dispatches
+	// to `v.negate()` rather than a native JS `-` (Slice 4C-a, U3: `UserImpl`).
+	let hir = lower(
+		r#"
+		interface Negate<Output> { func negate(): Output }
+		struct Vec2(x: int, y: int)
+		impl Negate<Output = Vec2> for Vec2 {
+			func negate(): Vec2 = this
+		}
+		func f(v: Vec2): Vec2 = -v
+		"#,
+	);
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::Call { callee, args } = &f.body else {
+		panic!("expected Call, got {:?}", f.body);
+	};
+	let HirExpr::Field { recv, name } = callee.as_ref() else {
+		panic!("expected Field callee, got {callee:?}");
+	};
+	assert_eq!(name, "negate");
+	assert!(matches!(recv.as_ref(), HirExpr::Local(n) if n == "v"));
+	assert!(args.is_empty());
+}
+
+#[test]
+fn lowers_primitive_negate_to_unary_unchanged() {
+	// `-x` on a plain `int` still lowers to `HirExpr::Unary { op: Neg, .. }`, not a
+	// dispatched call — the `BuiltinEager` resolution keeps the existing
+	// native-operator path.
+	let hir = lower("func f(x: int): int = -x");
+	assert_eq!(
+		hir.funcs[0].body,
+		HirExpr::Unary {
+			op: UnOp::Neg,
+			operand: Box::new(HirExpr::Local("x".into())),
+		}
+	);
+}
+
+#[test]
+fn lowers_primitive_bit_not_to_unary_unchanged() {
+	// `~x` on a plain `int` lowers to `HirExpr::Unary { op: BitNot, .. }`.
+	let hir = lower("func f(x: int): int = ~x");
+	assert_eq!(
+		hir.funcs[0].body,
+		HirExpr::Unary {
+			op: UnOp::BitNot,
+			operand: Box::new(HirExpr::Local("x".into())),
+		}
+	);
+}
+
+#[test]
+#[should_panic(expected = "default method")]
+fn user_negate_default_method_panics_in_lowering() {
+	// `-v` resolves through `Negate`'s interface *default* method (`negate`,
+	// provided in terms of `base`), which codegen cannot yet dispatch to —
+	// lowering must panic loudly rather than emit a call to a method that doesn't
+	// exist on the class (Slice 4C-a, U3: `UserImplDefaultMethod`).
+	lower(
+		r#"
+		interface Negate<Output> {
+			func base(): Output
+			func negate(): Output = this.base()
+		}
+		struct Vec2(x: int, y: int)
+		impl Negate<Output = Vec2> for Vec2 {
+			func base(): Vec2 = this
+		}
+		func f(v: Vec2): Vec2 = -v
+		"#,
+	);
+}
+
+#[test]
+#[should_panic(expected = "no operator resolution recorded for prefix op")]
+fn missing_prefix_resolution_still_panics_in_lowering() {
+	// Mirrors `missing_resolution_still_panics_in_lowering` for the unary case:
+	// pins that the `None` panic is live as an invariant guard against a future
+	// checker regression, by handing lowering a `Checked` whose annotations were
+	// wiped, as if the checker had failed to record a resolution it should have.
+	let parsed = parse_module("func f(a: int): int = -a", "test");
 	assert!(
 		!parsed.diagnostics.iter().any(|d| d.is_error()),
 		"parse failed"

@@ -263,10 +263,7 @@ impl Lowerer<'_> {
 				}
 			}
 			ExprKind::BinaryOp { lhs, op, rhs } => self.lower_binary(expr.id, lhs, *op, rhs),
-			ExprKind::PrefixOp { op, value } => HirExpr::Unary {
-				op: lower_prefix(*op),
-				operand: Box::new(self.lower_expr(value)),
-			},
+			ExprKind::PrefixOp { op, value } => self.lower_prefix_op(expr.id, *op, value),
 			ExprKind::AssignOp { lhs, op, rhs } => {
 				// A compound assignment `a op= b` desugars to `a = a op b`, dispatched
 				// per its recorded `Resolution` just like a `BinaryOp` node (Finding 1);
@@ -397,6 +394,41 @@ impl Lowerer<'_> {
 				res.method
 			),
 			None => panic!("{}", missing_resolution_msg()),
+		}
+	}
+
+	/// Lower a `PrefixOp` node per its recorded [`crate::Resolution`] (Slice 4C-a,
+	/// U3) — the unary counterpart of [`Self::lower_operator`]. `BuiltinEager` keeps
+	/// the existing native-JS `HirExpr::Unary` path (`lower_prefix` supplies the
+	/// operator for it); `UserImpl` dispatches to a zero-argument method call on the
+	/// operand (`value.method()`, mirroring `lower_operator`'s `lhs.method(rhs)`).
+	/// `UserImplDefaultMethod`, `BuiltinShortCircuit` (never produced for a unary
+	/// operator — `&&`/`||` are the only short-circuiting operators and both are
+	/// binary), and a missing resolution all panic loudly — codegen cannot yet
+	/// materialize interface default methods, and an unresolved node is a checker
+	/// bug we want to see immediately rather than silently miscompile.
+	fn lower_prefix_op(&self, id: nymph_ast::NodeId, op: PrefixOperator, value: &Expr) -> HirExpr {
+		match self.annotations.resolution_of(id) {
+			Some(res) if res.dispatch == DispatchKind::BuiltinEager => HirExpr::Unary {
+				op: lower_prefix(op),
+				operand: Box::new(self.lower_expr(value)),
+			},
+			Some(res) if res.dispatch == DispatchKind::UserImpl => HirExpr::Call {
+				callee: Box::new(HirExpr::Field {
+					recv: Box::new(self.lower_expr(value)),
+					name: res.method.clone(),
+				}),
+				args: vec![],
+			},
+			Some(res) if res.dispatch == DispatchKind::BuiltinShortCircuit => panic!(
+				"slice-4c lowering: BuiltinShortCircuit is unreachable for a prefix operator (method {})",
+				res.method
+			),
+			Some(res) => panic!(
+				"slice-4c lowering does not yet dispatch operator to interface default method {}",
+				res.method
+			),
+			None => panic!("slice-4c lowering: no operator resolution recorded for prefix op {op:?}"),
 		}
 	}
 
@@ -747,6 +779,6 @@ fn lower_prefix(op: PrefixOperator) -> UnOp {
 	match op {
 		PrefixOperator::Negate => UnOp::Neg,
 		PrefixOperator::BoolNot => UnOp::Not,
-		other => panic!("slice-1 lowering does not yet handle prefix {other:?}"),
+		PrefixOperator::BitNot => UnOp::BitNot,
 	}
 }

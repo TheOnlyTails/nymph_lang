@@ -13,7 +13,7 @@ use nymph_ast::{
 	NodeId, Span, Spanned,
 	decl::Declaration,
 	expr::{CallArg, Expr, ExprKind, RangeKind, Statement, StringPart},
-	ops::{AssignOperator, BinaryOperator},
+	ops::{AssignOperator, BinaryOperator, PrefixOperator},
 };
 use rustc_hash::FxHashMap;
 
@@ -151,10 +151,9 @@ impl<'m> Checker<'m> {
 			if let Some(pending_ty) = pending {
 				self.pending_operators.push((
 					expr.id,
-					*op,
 					expr.span,
 					pending_ty,
-					crate::check::PendingOperatorKind::BinaryOp,
+					crate::check::PendingOperatorKind::BinaryOp(*op),
 				));
 			}
 			return ty;
@@ -174,10 +173,28 @@ impl<'m> Checker<'m> {
 			if let Some((binop, pending_ty)) = pending {
 				self.pending_operators.push((
 					expr.id,
-					binop,
 					expr.span,
 					pending_ty,
-					crate::check::PendingOperatorKind::AssignOp,
+					crate::check::PendingOperatorKind::AssignOp(binop),
+				));
+			}
+			return ty;
+		}
+		// `PrefixOp` mirrors the `BinaryOp` special case above (Slice 4C-a):
+		// `infer_prefix` also decides the operator's `Resolution`, recorded on the
+		// `PrefixOp` node itself once it exists in the annotation table.
+		if let ExprKind::PrefixOp { op, value } = &expr.kind {
+			let (ty, resolution, pending) = self.infer_prefix(*op, value, expr.span);
+			self.record(expr.id, ty, None);
+			if let Some(resolution) = resolution {
+				self.annotations.record_resolution(expr.id, resolution);
+			}
+			if let Some(pending_ty) = pending {
+				self.pending_operators.push((
+					expr.id,
+					expr.span,
+					pending_ty,
+					crate::check::PendingOperatorKind::PrefixOp(*op),
 				));
 			}
 			return ty;
@@ -307,7 +324,15 @@ impl<'m> Checker<'m> {
 				}
 			}
 			ExprKind::Closure { .. } => self.infer_closure(expr),
-			ExprKind::PrefixOp { op, value } => self.infer_prefix(*op, value, span),
+			ExprKind::PrefixOp { op, value } => {
+				// Unreachable in practice: `infer` intercepts `PrefixOp` before it gets
+				// here, for the same reason it intercepts `BinaryOp`/`AssignOp` above —
+				// recording the operator's `Resolution` needs the node's type entry to
+				// already exist. This arm only exists so the match stays exhaustive; it
+				// discards the resolution/pending slot rather than duplicating that
+				// recording logic.
+				self.infer_prefix(*op, value, span).0
+			}
 			ExprKind::PostfixOp { value, .. } => {
 				// `?` error propagation — Milestone B; unwrap best-effort.
 				self.infer(value);
@@ -893,11 +918,25 @@ impl<'m> Checker<'m> {
 		self.subtype(got, expected, expr.span);
 	}
 
-	// ── Operators (built-in only in Milestone A) ─────────────────────────────
-	fn infer_prefix(&mut self, op: nymph_ast::ops::PrefixOperator, value: &Expr, span: Span) -> Ty {
+	// ── Operators ─────────────────────────────────────────────────────────────
+	/// `!true`/negation on a primitive is built in; otherwise `-`/`~` desugar to the
+	/// interface method (`negate`/`bit_not`). Also decides, per U2 of the Slice 4C-a
+	/// plan, the operator's [`Resolution`] (mirroring `infer_binary`'s D3 table),
+	/// returned alongside the type so `infer`'s `PrefixOp` interception can record
+	/// both once the node exists in the annotation table. The third element of the
+	/// tuple is `Some(ty)` only for `Negate`/`BitNot`'s still-unresolved-inference-
+	/// variable case: the caller enqueues `(node, span, ty, PrefixOp(op))` for
+	/// `finalize_pending_operators` to retry once the current body has been checked.
+	/// `BoolNot` never defers — a primitive-or-`Infer` operand eagerly unifies with
+	/// `boolean` (unchanged from before this slice), so it never reaches a state
+	/// where finalization could still help.
+	fn infer_prefix(
+		&mut self,
+		op: nymph_ast::ops::PrefixOperator,
+		value: &Expr,
+		span: Span,
+	) -> (Ty, Option<Resolution>, Option<Ty>) {
 		use nymph_ast::ops::PrefixOperator::*;
-		// `!true`/negation on a primitive is built in; otherwise desugar to the
-		// interface method (`not`/`negate`/`bit_not`).
 		let operand = self.infer(value);
 		match op {
 			BoolNot => {
@@ -910,26 +949,101 @@ impl<'m> Checker<'m> {
 				{
 					let boolean = self.interner.boolean();
 					self.unify(operand, boolean, span);
-					boolean
+					(
+						boolean,
+						Some(Resolution {
+							method: "not".into(),
+							dispatch: DispatchKind::BuiltinEager,
+						}),
+						None,
+					)
 				} else {
-					self.dispatch_operator(operand, "not", &[], span).0
+					let (ty, dispatch) = self.dispatch_operator(operand, "not", &[], span);
+					(
+						ty,
+						Some(Resolution {
+							method: "not".into(),
+							dispatch,
+						}),
+						None,
+					)
 				}
 			}
-			Negate => {
+			Negate | BitNot => {
+				let method = prefix_method(op);
 				if self.prim_kind(operand).is_some() {
-					operand
+					(
+						operand,
+						Some(Resolution {
+							method: method.into(),
+							dispatch: DispatchKind::BuiltinEager,
+						}),
+						None,
+					)
+				} else if self.is_adt(operand) || {
+					let resolved = self.shallow_resolve(operand);
+					matches!(self.interner.kind(resolved), TyKind::Param(_))
+				} {
+					// A resolved ADT or generic-parameter operand dispatches through the
+					// solver immediately, exactly like `infer_binary`'s equivalent branch.
+					let (ty, dispatch) = self.dispatch_operator(operand, method, &[], span);
+					(
+						ty,
+						Some(Resolution {
+							method: method.into(),
+							dispatch,
+						}),
+						None,
+					)
 				} else {
-					self.dispatch_operator(operand, "negate", &[], span).0
-				}
-			}
-			BitNot => {
-				if self.prim_kind(operand).is_some() {
-					operand
-				} else {
-					self.dispatch_operator(operand, "bit_not", &[], span).0
+					match self.resolve_fallback_prefix_operand(op, operand, span) {
+						Some((ty, res)) => (ty, Some(res), None),
+						// Still an unresolved inference variable (or `Error`, from an
+						// already-diagnosed upstream mistake): defer to the end-of-body
+						// finalization pass rather than guessing or panicking now.
+						None => (operand, None, Some(operand)),
+					}
 				}
 			}
 		}
+	}
+
+	/// Mirrors [`Self::resolve_fallback_operand`] for a prefix (`Negate`/`BitNot`)
+	/// operator: attempt to resolve once the operand's final type is known. Returns
+	/// `None` only when the operand is still an unresolved inference variable (or
+	/// `Error`) — the caller either defers to `finalize_pending_operators` (during a
+	/// body) or, there, reports [`TypeError::CannotInferOperandType`].
+	fn resolve_fallback_prefix_operand(
+		&mut self,
+		op: nymph_ast::ops::PrefixOperator,
+		ty: Ty,
+		span: Span,
+	) -> Option<(Ty, Resolution)> {
+		let method = prefix_method(op);
+		if self.prim_kind(ty).is_some() {
+			return Some((
+				ty,
+				Resolution {
+					method: method.into(),
+					dispatch: DispatchKind::BuiltinEager,
+				},
+			));
+		}
+		let resolved_ty = self.shallow_resolve(ty);
+		if matches!(
+			self.interner.kind(resolved_ty),
+			TyKind::Infer(_) | TyKind::Error
+		) {
+			return None;
+		}
+		let (result_ty, dispatch) = self.dispatch_operator(ty, method, &[], span);
+		Some((
+			result_ty,
+			Resolution {
+				method: method.into(),
+				dispatch,
+			},
+		))
 	}
 
 	/// Operators desugar to interface method calls. Primitives keep built-in
@@ -1188,9 +1302,8 @@ impl<'m> Checker<'m> {
 	/// whether the matched method is a real, directly-callable method (`UserImpl` —
 	/// covers both an inherent method and one an impl defines itself) or only an
 	/// interface default body codegen can't yet reach (`UserImplDefaultMethod`).
-	/// Unary callers (`infer_prefix`) ignore the dispatch kind; unary operator
-	/// overloading is out of scope for this slice (lowering still emits a native JS
-	/// unary op unconditionally — a known gap, not fixed here).
+	/// Unary callers (`infer_prefix`, Slice 4C-a) use the same `DispatchKind` the
+	/// same way binary callers do — the two now share one lowering mechanism.
 	fn dispatch_operator(
 		&mut self,
 		recv: Ty,
@@ -1467,13 +1580,24 @@ impl<'m> Checker<'m> {
 		use crate::check::PendingOperatorKind;
 
 		let pending = std::mem::take(&mut self.pending_operators);
-		for (id, op, span, ty, kind) in pending {
-			match self.resolve_fallback_operand(op, ty, span) {
+		for (id, span, ty, kind) in pending {
+			let resolved = match kind {
+				PendingOperatorKind::BinaryOp(op) | PendingOperatorKind::AssignOp(op) => {
+					self.resolve_fallback_operand(op, ty, span)
+				}
+				PendingOperatorKind::PrefixOp(op) => self.resolve_fallback_prefix_operand(op, ty, span),
+			};
+			match resolved {
 				Some((result_ty, resolution)) => match kind {
-					// A `BinaryOp` node's initially-recorded type was only the (possibly
-					// still-unbound) operand placeholder; overwrite it with the now-final
-					// result type, same as the immediately-resolved path would have.
-					PendingOperatorKind::BinaryOp => self.record(id, result_ty, Some(resolution)),
+					// A `BinaryOp`/`PrefixOp` node's initially-recorded type was only the
+					// (possibly still-unbound) operand placeholder; overwrite it with the
+					// now-final result type, same as the immediately-resolved path would
+					// have (a `PrefixOp`'s placeholder is the operand type itself, per
+					// `infer_prefix`, exactly mirroring the arithmetic fallback's
+					// operand-as-placeholder shape).
+					PendingOperatorKind::BinaryOp(_) | PendingOperatorKind::PrefixOp(_) => {
+						self.record(id, result_ty, Some(resolution))
+					}
 					// Finding 1: an `AssignOp` node's own type is always `Void` — set
 					// immediately in `infer`'s `AssignOp` special case — and must stay
 					// that way. `record` overwrites the whole `ExprInfo` (including
@@ -1481,7 +1605,7 @@ impl<'m> Checker<'m> {
 					// `resolution` field) is safe here; it must never regress to
 					// clobbering `Void` with the operator's operand/result type the way
 					// the immediately-resolved compound-assign path never does.
-					PendingOperatorKind::AssignOp => self.annotations.record_resolution(id, resolution),
+					PendingOperatorKind::AssignOp(_) => self.annotations.record_resolution(id, resolution),
 				},
 				None => {
 					// Still unbound (a genuinely under-determined program) or `Error` (an
@@ -1525,6 +1649,16 @@ fn comparison_method(op: BinaryOperator) -> &'static str {
 		GreaterThan => "greater_than",
 		GreaterThanEquals => "greater_than_eq",
 		other => unreachable!("not a comparison operator: {other:?}"),
+	}
+}
+
+/// The interface method a deferrable prefix operator (`Negate`/`BitNot`) desugars
+/// to. `BoolNot` never defers (see `infer_prefix`), so it has no entry here.
+fn prefix_method(op: PrefixOperator) -> &'static str {
+	match op {
+		PrefixOperator::Negate => "negate",
+		PrefixOperator::BitNot => "bit_not",
+		PrefixOperator::BoolNot => unreachable!("BoolNot never defers to the fallback path"),
 	}
 }
 

@@ -26,13 +26,20 @@ pub(crate) struct Binding {
 	pub mutable: bool,
 }
 
-/// Which AST node shape a deferred `pending_operators` entry was recorded from —
-/// see [`Checker::pending_operators`] for why `finalize_pending_operators` must
-/// treat the two differently (Finding 1).
+/// Which AST node shape a deferred `pending_operators` entry was recorded from,
+/// carrying the specific operator itself (Slice 4C-a: a prefix op has no separate
+/// `BinaryOperator` to hang off a shared tuple slot, so the operator moved into the
+/// variant) — see [`Checker::pending_operators`] for why `finalize_pending_operators`
+/// must treat `BinaryOp`/`AssignOp` vs. `PrefixOp` differently (Finding 1).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+// The shared `Op` postfix names the AST node shape each variant was recorded
+// from (`BinaryOp`/`AssignOp`/`PrefixOp` expression kinds) — deliberate, not an
+// accidental naming collision the lint should flag.
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum PendingOperatorKind {
-	BinaryOp,
-	AssignOp,
+	BinaryOp(nymph_ast::ops::BinaryOperator),
+	AssignOp(nymph_ast::ops::BinaryOperator),
+	PrefixOp(nymph_ast::ops::PrefixOperator),
 }
 
 pub struct Checker<'m> {
@@ -98,13 +105,7 @@ pub struct Checker<'m> {
 	/// finally-resolved type) from an `AssignOp` node (whose recorded type is always
 	/// `Void` and must be left alone — Finding 1: only the `Resolution` gets attached
 	/// there).
-	pub(crate) pending_operators: Vec<(
-		nymph_ast::NodeId,
-		nymph_ast::ops::BinaryOperator,
-		Span,
-		Ty,
-		PendingOperatorKind,
-	)>,
+	pub(crate) pending_operators: Vec<(nymph_ast::NodeId, Span, Ty, PendingOperatorKind)>,
 }
 
 /// Check a whole (single) module and return every diagnostic produced.

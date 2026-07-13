@@ -530,6 +530,71 @@ fn runs_compound_assign_on_int_stays_native() {
 }
 
 #[test]
+fn runs_prefix_negate_overload_dispatches_to_method() {
+	// `-v` on a struct with a directly-defined `Negate.negate` impl actually calls
+	// `.negate()` at runtime, componentwise negating the vector (Slice 4C-a).
+	let src = r#"
+		interface Negate<Output> { func negate(): Output }
+		struct Vec2(x: int, y: int)
+		impl Negate<Output = Vec2> for Vec2 {
+			func negate(): Vec2 = Vec2(x = -this.x, y = -this.y)
+		}
+		func flip(v: Vec2): Vec2 = -v
+	"#;
+	assert_eq!(run(src, "flip(new Vec2({ x: 1, y: 2 })).x"), "-1");
+	assert_eq!(run(src, "flip(new Vec2({ x: 1, y: 2 })).y"), "-2");
+}
+
+#[test]
+fn runs_prefix_bool_not_and_native_int_float_negate_stay_native() {
+	// `!boolean` and `-int`/`-float` stay native JS unary operators — no impl in
+	// scope, `BuiltinEager` resolution.
+	assert_eq!(run("func f(b: boolean): boolean = !b", "f(true)"), "false");
+	assert_eq!(run("func f(x: int): int = -x", "f(5)"), "-5");
+	assert_eq!(run("func f(x: float): float = -x", "f(2.5)"), "-2.5");
+}
+
+#[test]
+fn runs_prefix_operator_inside_method_body_stays_native_but_outer_dispatches() {
+	// The outer `-v` dispatches to `.negate()` (a `UserImpl` resolution); the inner
+	// `this.x * -1` inside the method body itself is `int * -1` — the `-1` there is
+	// a native unary negate on a literal, not a dispatched call.
+	let src = r#"
+		interface Negate<Output> { func negate(): Output }
+		struct Vec2(x: int, y: int)
+		impl Negate<Output = Vec2> for Vec2 {
+			func negate(): Vec2 = Vec2(x = this.x * -1, y = this.y * -1)
+		}
+		func flip(v: Vec2): Vec2 = -v
+	"#;
+	assert_eq!(run(src, "flip(new Vec2({ x: 1, y: 2 })).x"), "-1");
+}
+
+#[test]
+fn runs_prefix_bit_not_native_on_int() {
+	// `~x` on a plain `int` stays a native JS bitwise-not — no impl in scope,
+	// `BuiltinEager` resolution.
+	assert_eq!(run("func f(x: int): int = ~x", "f(5)"), "-6");
+	assert_eq!(run("func f(x: int): int = ~x", "f(0)"), "-1");
+}
+
+#[test]
+fn runs_prefix_bit_not_overload_dispatches_to_method() {
+	// `~m` on a struct with a directly-defined `BitNot.bit_not` impl actually calls
+	// `.bit_not()` at runtime, componentwise bit-negating the mask (Slice 4C-a).
+	let src = r#"
+		interface BitNot<Output> { func bit_not(): Output }
+		struct Mask(a: int, b: int)
+		impl BitNot<Output = Mask> for Mask {
+			func bit_not(): Mask = Mask(a = ~this.a, b = ~this.b)
+		}
+		func flip(m: Mask): Mask = ~m
+	"#;
+	assert_eq!(run(src, "flip(new Mask({ a: 5, b: 0 })).a"), "-6");
+	assert_eq!(run(src, "flip(new Mask({ a: 5, b: 0 })).b"), "-1");
+}
+
+#[test]
 fn compile_reports_check_errors() {
 	// A type error surfaces as diagnostics, not JS.
 	let result = nymph_codegen::compile("func f(): int = true", "test");

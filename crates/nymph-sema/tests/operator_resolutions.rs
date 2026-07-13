@@ -431,3 +431,262 @@ fn user_struct_equals_is_builtin_eager() {
 	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
 	assert_eq!(res.method, "equals");
 }
+
+// ── Slice 4C-a: prefix (unary) operator resolutions ─────────────────────────
+
+/// Like [`collect_binary_ops`], but collects `PrefixOp` nodes instead.
+fn collect_prefix_ops(expr: &Expr, out: &mut Vec<NodeId>) {
+	if let ExprKind::PrefixOp { value, .. } = &expr.kind {
+		out.push(expr.id);
+		collect_prefix_ops(value, out);
+		return;
+	}
+	match &expr.kind {
+		ExprKind::Grouped(inner) => collect_prefix_ops(inner, out),
+		ExprKind::If {
+			condition,
+			then,
+			otherwise,
+		} => {
+			collect_prefix_ops(condition, out);
+			collect_prefix_ops(then, out);
+			if let Some(otherwise) = otherwise {
+				collect_prefix_ops(otherwise, out);
+			}
+		}
+		ExprKind::Block { body, .. } => {
+			for stmt in body {
+				match &stmt.0 {
+					Statement::Expr(e) => collect_prefix_ops(e, out),
+					Statement::Let { value, .. } => collect_prefix_ops(value, out),
+				}
+			}
+		}
+		ExprKind::Call { func, args, .. } => {
+			collect_prefix_ops(func, out);
+			for arg in args {
+				collect_prefix_ops(&arg.0.value, out);
+			}
+		}
+		ExprKind::MemberAccess { parent, .. } => collect_prefix_ops(parent, out),
+		ExprKind::IndexAccess { parent, index, .. } => {
+			collect_prefix_ops(parent, out);
+			collect_prefix_ops(index, out);
+		}
+		ExprKind::PostfixOp { value, .. } => collect_prefix_ops(value, out),
+		ExprKind::AssignOp { lhs, rhs, .. } | ExprKind::BinaryOp { lhs, rhs, .. } => {
+			collect_prefix_ops(lhs, out);
+			collect_prefix_ops(rhs, out);
+		}
+		_ => {}
+	}
+}
+
+/// Parse+check `source` (asserting zero diagnostics), find the single `PrefixOp`
+/// node inside the named top-level `func`'s body, and return the `Resolution` the
+/// checker recorded for it.
+fn prefix_resolution_for(source: &str, func_name: &str) -> Resolution {
+	let parsed = parse_module(source, "test");
+	let parse_errors: Vec<_> = parsed
+		.diagnostics
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert!(
+		parse_errors.is_empty(),
+		"source failed to parse: {parse_errors:?}\n---\n{source}"
+	);
+
+	let checked = check_module(&parsed.tree);
+	let check_errors: Vec<_> = checked
+		.diags
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert!(
+		check_errors.is_empty(),
+		"expected no errors, got: {check_errors:?}\n---\n{source}"
+	);
+
+	let body = parsed
+		.tree
+		.members
+		.iter()
+		.find_map(|member| match member {
+			Declaration::Func { meta, body, .. } if meta.name.0 == func_name => Some(body),
+			_ => None,
+		})
+		.unwrap_or_else(|| panic!("no func named `{func_name}` in module:\n{source}"));
+
+	let mut ops = Vec::new();
+	collect_prefix_ops(body, &mut ops);
+	assert_eq!(
+		ops.len(),
+		1,
+		"expected exactly one PrefixOp node in `{func_name}`'s body, found {}",
+		ops.len()
+	);
+
+	checked
+		.annotations
+		.resolution_of(ops[0])
+		.unwrap_or_else(|| panic!("no Resolution recorded for the PrefixOp node in `{func_name}`"))
+		.clone()
+}
+
+#[test]
+fn negate_int_is_builtin_eager() {
+	let res = prefix_resolution_for("func f(a: int): int = -a", "f");
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+	assert_eq!(res.method, "negate");
+}
+
+#[test]
+fn bool_not_on_boolean_is_builtin_eager() {
+	let res = prefix_resolution_for("func f(a: boolean): boolean = !a", "f");
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+	assert_eq!(res.method, "not");
+}
+
+#[test]
+fn bit_not_int_is_builtin_eager() {
+	let res = prefix_resolution_for("func f(a: int): int = ~a", "f");
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+	assert_eq!(res.method, "bit_not");
+}
+
+#[test]
+fn negate_user_struct_direct_impl_is_user_impl() {
+	// `-v` on a struct with a directly-defined `Negate.negate` impl: `UserImpl`,
+	// compiled as `v.negate()`.
+	let res = prefix_resolution_for(
+		"interface Negate<Output> { func negate(): Output }
+		 struct Vec2(x: int, y: int)
+		 impl Negate<Output = Vec2> for Vec2 {
+		   func negate(): Vec2 = this
+		 }
+		 func f(v: Vec2): Vec2 = -v",
+		"f",
+	);
+	assert_eq!(res.dispatch, DispatchKind::UserImpl);
+	assert_eq!(res.method, "negate");
+}
+
+#[test]
+fn negate_interface_default_method_is_user_impl_default_method() {
+	// `-v` resolves through `Negate`'s interface *default* body (`negate`, provided
+	// in terms of `base`), which `Vec2`'s impl never defines directly — only
+	// `base` — so this resolves as `UserImplDefaultMethod`.
+	let res = prefix_resolution_for(
+		"interface Negate<Output> {
+		   func base(): Output
+		   func negate(): Output = this.base()
+		 }
+		 struct Vec2(x: int, y: int)
+		 impl Negate<Output = Vec2> for Vec2 {
+		   func base(): Vec2 = this
+		 }
+		 func f(v: Vec2): Vec2 = -v",
+		"f",
+	);
+	assert_eq!(res.dispatch, DispatchKind::UserImplDefaultMethod);
+	assert_eq!(res.method, "negate");
+}
+
+#[test]
+fn late_resolved_infer_var_negate_operand_is_builtin_eager() {
+	// Mirrors `late_resolved_infer_var_operand_is_builtin_eager` for the binary
+	// case: `xs[0]`'s element type is a genuinely unconstrained inference variable
+	// at the moment this `PrefixOp` node is recorded, pinned to `int` only
+	// afterward via `f`'s declared return type. Zero diagnostics, so
+	// `finalize_pending_operators` must retry this node.
+	//
+	// NB: a leading `-` on its own statement line continuing a previous expression
+	// parses as *binary* minus, not a prefix negate — the fixture binds the negation
+	// to its own `let` to avoid that trap.
+	let res = prefix_resolution_for(
+		"func f(): int = {
+		   let xs = #[]
+		   let y = -xs[0]
+		   y
+		 }",
+		"f",
+	);
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+	assert_eq!(res.method, "negate");
+}
+
+#[test]
+fn bounded_generic_negate_dispatches_through_bound() {
+	// A bounded generic parameter's `-t` resolves through its `Negate` bound —
+	// mirrors the binary case's `GenericBound` → `UserImplDefaultMethod` mapping
+	// (no direct-call binary-operator call site reaches `GenericBound` either; both
+	// share the same "never miscompile silently" deferral).
+	let res = prefix_resolution_for(
+		"interface Negate<Output> { func negate(): Output }
+		 func f<T: Negate<Output = T>>(t: T): T = -t",
+		"f",
+	);
+	assert_eq!(res.dispatch, DispatchKind::UserImplDefaultMethod);
+	assert_eq!(res.method, "negate");
+}
+
+#[test]
+fn unbounded_generic_negate_is_not_implemented() {
+	// An unbounded generic parameter has no `Negate` impl to dispatch to — a
+	// `NotImplemented` diagnostic, not a lowering-time ICE.
+	let parsed = parse_module("func f<T>(t: T): T = -t", "test");
+	assert!(
+		!parsed.diagnostics.iter().any(|d| d.is_error()),
+		"parse failed"
+	);
+	let checked = check_module(&parsed.tree);
+	let messages: Vec<_> = checked
+		.diags
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert_eq!(
+		messages.len(),
+		1,
+		"expected exactly one error: {messages:?}"
+	);
+	assert!(
+		messages[0].contains("negate") && messages[0].contains("not implemented"),
+		"unexpected message: {messages:?}"
+	);
+}
+
+#[test]
+fn unresolved_prefix_operand_reports_cannot_infer_operand_type() {
+	// A prefix negate whose operand type never gets pinned down by the end of the
+	// body reports `CannotInferOperandType` rather than silently leaving lowering
+	// to panic on a supposedly zero-diagnostic program.
+	let parsed = parse_module(
+		"func f(): int = {
+		   let xs = #[]
+		   let y = -xs[0]
+		   0
+		 }",
+		"test",
+	);
+	assert!(
+		!parsed.diagnostics.iter().any(|d| d.is_error()),
+		"parse failed"
+	);
+	let checked = check_module(&parsed.tree);
+	let messages: Vec<_> = checked
+		.diags
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert_eq!(
+		messages.len(),
+		1,
+		"expected exactly one error: {messages:?}"
+	);
+}

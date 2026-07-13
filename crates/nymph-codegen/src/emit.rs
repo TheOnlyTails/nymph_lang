@@ -593,6 +593,7 @@ impl<'a> Emitter<'a> {
 				let operator = match op {
 					UnOp::Neg => UnaryOperator::UnaryNegation,
 					UnOp::Not => UnaryOperator::LogicalNot,
+					UnOp::BitNot => UnaryOperator::BitwiseNot,
 				};
 				self.ast.expression_unary(SPAN, operator, inner)
 			}
