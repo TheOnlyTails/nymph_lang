@@ -26,6 +26,15 @@ pub(crate) struct Binding {
 	pub mutable: bool,
 }
 
+/// Which AST node shape a deferred `pending_operators` entry was recorded from —
+/// see [`Checker::pending_operators`] for why `finalize_pending_operators` must
+/// treat the two differently (Finding 1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PendingOperatorKind {
+	BinaryOp,
+	AssignOp,
+}
+
 pub struct Checker<'m> {
 	pub(crate) module: &'m Module,
 	pub(crate) interner: Interner,
@@ -69,6 +78,33 @@ pub struct Checker<'m> {
 	/// selected operator/method impl). Keyed by [`nymph_ast::NodeId`]. Emitted
 	/// alongside diagnostics as part of [`crate::Checked`].
 	pub(crate) annotations: crate::annotate::Annotations,
+
+	/// Operator nodes whose LHS operand was still an unresolved inference variable
+	/// at the moment `infer_binary`'s fallback arm ran (an `Infer` type var that
+	/// hasn't unified with a primitive/ADT yet — see the D3 fallback in
+	/// `infer_expr.rs`). Recorded as `(node id, operator, span, operand ty, kind)` and
+	/// drained at the end of the *same body* that recorded it (`finalize_pending_operators`,
+	/// called from `check_func_body`, `check_let_body`, `check_method_body`, and
+	/// `check_interface_impl_members`), while that body's own `param_bounds` and the
+	/// unify table are still alive, so an operand resolved later in the same body
+	/// (e.g. via a `check`-mode subtype applied *after* the operator node was
+	/// recorded) still gets a `Resolution` instead of forcing lowering to panic on a
+	/// valid program. Must be drained per body, not once at module end: `param_bounds`
+	/// is a single shared map that each body's checking clears and rebuilds, so a
+	/// module-end pass would resolve every deferred operator against only the *last*
+	/// body's bounds, making a valid program's diagnostics depend on declaration
+	/// order. `kind` distinguishes a `BinaryOp` node (whose recorded type is the
+	/// operator's own placeholder result and must be overwritten with the
+	/// finally-resolved type) from an `AssignOp` node (whose recorded type is always
+	/// `Void` and must be left alone — Finding 1: only the `Resolution` gets attached
+	/// there).
+	pub(crate) pending_operators: Vec<(
+		nymph_ast::NodeId,
+		nymph_ast::ops::BinaryOperator,
+		Span,
+		Ty,
+		PendingOperatorKind,
+	)>,
 }
 
 /// Check a whole (single) module and return every diagnostic produced.
@@ -90,6 +126,17 @@ pub fn check_module(module: &Module) -> Checked {
 	checker.generalize_returns();
 	checker.check_bodies();
 	checker.check_member_bodies();
+	// Every body-checking path (`check_func_body`, `check_let_body`,
+	// `check_method_body`, `check_interface_impl_members`) drains its own
+	// `pending_operators` entries before the next body's `param_bounds` are
+	// built, while that body's own bounds are still live -- see
+	// `finalize_pending_operators`'s doc comment for why per-body draining, not a
+	// single module-end pass, is required. Nothing should be left by the time
+	// every body has been checked.
+	debug_assert!(
+		checker.pending_operators.is_empty(),
+		"pending_operators should be drained per-body, not left for module end"
+	);
 	Checked {
 		diags: checker.diags,
 		annotations: checker.annotations,
@@ -145,6 +192,7 @@ impl<'m> Checker<'m> {
 			synthetic_params: 0,
 			synthetic_bounds: FxHashMap::default(),
 			annotations: crate::annotate::Annotations::default(),
+			pending_operators: Vec::new(),
 		}
 	}
 

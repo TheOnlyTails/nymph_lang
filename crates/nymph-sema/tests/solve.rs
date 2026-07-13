@@ -97,6 +97,96 @@ fn missing_operator_impl_is_reported() {
 }
 
 #[test]
+fn unbounded_generic_operator_operand_is_reported() {
+	// Finding 2: `a + b` on two values of an unbounded generic parameter `T` used
+	// to type-check with zero diagnostics (the old fallback silently accepted any
+	// non-ADT operand via a best-effort `unify`), then ICE in lowering — a valid
+	// program should never reach an unrecoverable compiler panic. `T` has no bound
+	// providing `plus`, so this is now a proper `NotImplemented` diagnostic, exactly
+	// like the concrete `missing_operator_impl_is_reported` case above.
+	assert_error_contains("func f<T>(a: T, b: T): T = a + b", "plus");
+}
+
+#[test]
+fn bounded_generic_operator_operand_resolves_through_the_bound() {
+	// A `T: Plus<...>` bound provides `plus`, so this type-checks with zero
+	// diagnostics — `dispatch_operator` resolves it via `resolve_param_method`
+	// (`MethodSource::GenericBound`), the same path `method_resolves_through_generic_bound`
+	// above exercises for an ordinary method call.
+	assert_ok(&format!(
+		"{PLUS}
+		 func f<T: Plus<Other = T, Output = T>>(a: T, b: T): T = a + b",
+	));
+}
+
+#[test]
+fn pending_operator_finalization_is_declaration_order_independent() {
+	// `Checker::pending_operators` entries whose operand is a still-unbound
+	// inference variable used to all be retried once at module end
+	// (`finalize_pending_operators`), by which point `Checker::param_bounds` held
+	// only the *last*-checked function's bounds (`param_bounds` is a single shared
+	// map that each body's checking clears and rebuilds). `a`'s operator resolves
+	// through its own bound (`T: Plus<...>`) only if `a`'s bounds are still live
+	// when its pending entry is retried -- if an unrelated `b` is checked
+	// afterward and finalization still happens at module end, `a`'s pending entry
+	// gets retried against `b`'s (empty) bounds and spuriously fails. Both
+	// declaration orders of the same valid program must produce identical (zero)
+	// diagnostics.
+	let a_then_b = format!(
+		"{PLUS}
+		 func a<T: Plus<Other = T, Output = T>>(): T = {{
+		   let xs = #[]
+		   let y = xs[0] + xs[0]
+		   let z: T = xs[0]
+		   y
+		 }}
+		 func b(): int = 1",
+	);
+	let b_then_a = format!(
+		"{PLUS}
+		 func b(): int = 1
+		 func a<T: Plus<Other = T, Output = T>>(): T = {{
+		   let xs = #[]
+		   let y = xs[0] + xs[0]
+		   let z: T = xs[0]
+		   y
+		 }}",
+	);
+	let errors_a_then_b = check(&a_then_b);
+	let errors_b_then_a = check(&b_then_a);
+	assert!(
+		errors_a_then_b.is_empty(),
+		"expected no errors (a then b), got: {errors_a_then_b:?}"
+	);
+	assert!(
+		errors_b_then_a.is_empty(),
+		"expected no errors (b then a), got: {errors_b_then_a:?}"
+	);
+}
+
+#[test]
+fn function_valued_operator_operand_is_reported() {
+	// Finding 2: the fallback's three-way match (primitive / ADT-or-Param / still-
+	// `Infer`) didn't enumerate a *resolved* type with no operator support at all --
+	// concretely, a first-class function value. `resolve_fallback_operand` returned
+	// `None` for it (not primitive, not ADT, not `Param`), and the diagnostic guard
+	// only fired for a still-unresolved `Infer` var, so this used to type-check with
+	// zero diagnostics and then ICE in `lower_hir` on `None => panic!(..)` -- the
+	// exact "valid program reaches an unrecoverable panic" pathology this closes.
+	assert_error_contains(
+		"func g(x: int): int = x
+		 func h(x: int): int = x
+		 func f(): int = {
+		   let a = g
+		   let b = h
+		   let c = a + b
+		   1
+		 }",
+		"plus",
+	);
+}
+
+#[test]
 fn method_call_resolves_through_interface() {
 	assert_ok(
 		"interface Show { func show(): string }

@@ -268,15 +268,35 @@ impl Lowerer<'_> {
 				operand: Box::new(self.lower_expr(value)),
 			},
 			ExprKind::AssignOp { lhs, op, rhs } => {
-				// A compound assignment `a op= b` desugars to `a = a op b`; a plain `=`
-				// assigns the value directly.
+				// A compound assignment `a op= b` desugars to `a = a op b`, dispatched
+				// per its recorded `Resolution` just like a `BinaryOp` node (Finding 1);
+				// a plain `=` (or `~=`, which has no binary form) assigns the value
+				// directly, with no operator resolution involved.
 				let value = match assign_binop(*op) {
 					None => self.lower_expr(rhs),
-					Some(binop) => HirExpr::Binary {
-						op: binop,
-						lhs: Box::new(self.lower_expr(lhs)),
-						rhs: Box::new(self.lower_expr(rhs)),
-					},
+					Some(binop) => {
+						// The lhs would otherwise be lowered twice here: once as the
+						// operator's own operand (via `lower_operator`, mirroring `a op
+						// b`), once as the `Assign` target below. That's only safe for an
+						// identifier target (re-reading a plain local has no side effect);
+						// codegen only supports `HirExpr::Local` assignment targets anyway
+						// (see the `unreachable!` in `emit.rs`), so panic here — loudly,
+						// with a clearer message — rather than let a field/index target
+						// silently double-evaluate its receiver chain. When field/index
+						// compound-assign targets land, they'll need a hoisted receiver
+						// temp (`let $t = a.b; $t.x = $t.x.plus(v)`).
+						if !matches!(lhs.kind, ExprKind::Identifier(_)) {
+							panic!(
+								"slice-4b lowering: compound-assign targets must be identifiers (got {:?})",
+								lhs.kind
+							);
+						}
+						self.lower_operator(expr.id, binop, lhs, rhs, || {
+							format!(
+								"slice-4b lowering: no operator resolution recorded for compound assign {op:?}"
+							)
+						})
+					}
 				};
 				HirExpr::Assign {
 					target: Box::new(self.lower_expr(lhs)),
@@ -317,20 +337,40 @@ impl Lowerer<'_> {
 		}
 	}
 
-	/// Lower a `BinaryOp` node per its recorded [`crate::Resolution`] (Slice 4B,
-	/// D4). `BuiltinEager`/`BuiltinShortCircuit` keep the existing native-JS
-	/// `HirExpr::Binary` path; `UserImpl` dispatches to a method call on the lhs
-	/// (`lhs.method(rhs)`, mirroring how method calls elsewhere in this file lower
-	/// to `Call { callee: Field { .. }, .. }`). `UserImplDefaultMethod` and a
-	/// missing resolution both panic loudly — codegen cannot yet materialize
-	/// interface default methods, and an unresolved node is a checker bug we want
-	/// to see immediately rather than silently miscompile.
+	/// Lower a `BinaryOp` node per its recorded [`crate::Resolution`] (Slice 4B, D4).
+	/// Thin wrapper over [`Self::lower_operator`] that just picks the native `BinOp`
+	/// and the panic message for an unresolved node; see that method for the actual
+	/// dispatch (shared with compound-assignment lowering, Finding 1).
 	fn lower_binary(
 		&self,
 		id: nymph_ast::NodeId,
 		lhs: &Expr,
 		op: BinaryOperator,
 		rhs: &Expr,
+	) -> HirExpr {
+		self.lower_operator(id, lower_binop(op), lhs, rhs, || {
+			format!("slice-4b lowering: no operator resolution recorded for binary op {op:?}")
+		})
+	}
+
+	/// Lower an operator-shaped node — a `BinaryOp`, or the desugared `place op
+	/// value` inside a compound assignment (Finding 1) — per its recorded
+	/// [`crate::Resolution`] (Slice 4B, D4). `BuiltinEager`/`BuiltinShortCircuit`
+	/// keep the existing native-JS `HirExpr::Binary` path (`native` supplies the
+	/// operator for it); `UserImpl` dispatches to a method call on the lhs
+	/// (`lhs.method(rhs)`, mirroring how method calls elsewhere in this file lower
+	/// to `Call { callee: Field { .. }, .. }`). `UserImplDefaultMethod` and a missing
+	/// resolution both panic loudly — codegen cannot yet materialize interface
+	/// default methods, and an unresolved node is a checker bug we want to see
+	/// immediately rather than silently miscompile. `missing_resolution_msg` lets
+	/// each call site name its own AST shape in that last panic.
+	fn lower_operator(
+		&self,
+		id: nymph_ast::NodeId,
+		native: BinOp,
+		lhs: &Expr,
+		rhs: &Expr,
+		missing_resolution_msg: impl FnOnce() -> String,
 	) -> HirExpr {
 		match self.annotations.resolution_of(id) {
 			Some(res)
@@ -340,7 +380,7 @@ impl Lowerer<'_> {
 				) =>
 			{
 				HirExpr::Binary {
-					op: lower_binop(op),
+					op: native,
 					lhs: Box::new(self.lower_expr(lhs)),
 					rhs: Box::new(self.lower_expr(rhs)),
 				}
@@ -356,7 +396,7 @@ impl Lowerer<'_> {
 				"slice-4b lowering does not yet dispatch operator to interface default method {}",
 				res.method
 			),
-			None => panic!("slice-4b lowering: no operator resolution recorded for binary op {op:?}"),
+			None => panic!("{}", missing_resolution_msg()),
 		}
 	}
 

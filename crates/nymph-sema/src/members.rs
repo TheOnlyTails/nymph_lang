@@ -418,6 +418,7 @@ impl<'m> Checker<'m> {
 
 		let snapshot = self.table.snapshot();
 		let diag_mark = self.diags.len();
+		let pending_mark = self.pending_operators.len();
 		self.param_bounds.clear();
 		self.record_param_bounds(owner_generics, 0);
 		self.record_param_bounds(&meta.generics, base);
@@ -441,6 +442,12 @@ impl<'m> Checker<'m> {
 		self.pop_params();
 		self.diags.truncate(diag_mark);
 		self.table.rollback_to(snapshot);
+		// This trial run is entirely discarded (diags truncated, unify bindings
+		// rolled back) and the real body is re-checked later by `check_method_body`
+		// — so any operator this trial deferred must be discarded too, not left to
+		// be finalized against a rolled-back table or leak into the next body's
+		// drain.
+		self.pending_operators.truncate(pending_mark);
 
 		// Accept the inferred type only if it is fully generalised.
 		if self.has_infer(ret) { None } else { Some(ret) }
@@ -530,6 +537,10 @@ impl<'m> Checker<'m> {
 		let ret = self.subst(ret, &empty, Some(self_ty));
 		let prev_ret = self.ret_ty.replace(ret);
 		self.check(body, ret);
+		// Drain this method body's deferred operators now, while its `param_bounds`
+		// (owner generics + this method's own) are still live — see
+		// `pending_operators`'s doc comment.
+		self.finalize_pending_operators();
 
 		self.ret_ty = prev_ret;
 		self.self_ty = prev_self;
@@ -635,6 +646,11 @@ impl<'m> Checker<'m> {
 			};
 			let prev_ret = self.ret_ty.replace(ret);
 			self.check(body, ret);
+			// Drain this member body's deferred operators now, while the impl
+			// block's `param_bounds` are still live — see `pending_operators`'s doc
+			// comment. All members of one impl block share the same bounds, but the
+			// next impl block (or nested impl block) clears and rebuilds them.
+			self.finalize_pending_operators();
 			self.ret_ty = prev_ret;
 			self.self_ty = prev_self;
 			self.pop_scope();

@@ -1,4 +1,4 @@
-use nymph_hir::hir::{BinOp, HirExpr, HirModule};
+use nymph_hir::hir::{BinOp, HirExpr, HirModule, HirStmt};
 use nymph_sema::check_module;
 use nymph_syntax::parse_module;
 
@@ -444,6 +444,76 @@ fn lowers_primitive_arithmetic_to_binary_unchanged() {
 }
 
 #[test]
+fn lowers_compound_assign_user_operator_overload_to_a_method_call() {
+	// `v1 += v2` on a struct with a directly-defined `Plus.plus` impl dispatches to
+	// `v1 = v1.plus(v2)` rather than a native JS `v1 = v1 + v2` (Finding 1).
+	let hir = lower(
+		r#"
+		interface Plus<Other, Output> { func plus(other: Other): Output }
+		struct Vec2(x: int, y: int)
+		impl Plus<Other = Vec2, Output = Vec2> for Vec2 {
+			func plus(other: Vec2): Vec2 = other
+		}
+		func add(a: Vec2, b: Vec2): Vec2 = {
+			let mut v1 = a
+			v1 += b
+			v1
+		}
+		"#,
+	);
+	let f = hir.funcs.iter().find(|f| f.name == "add").expect("add");
+	let HirExpr::Block { stmts, .. } = &f.body else {
+		panic!("expected Block, got {:?}", f.body);
+	};
+	// stmts[0] is the `let mut v1 = a`; stmts[1] is the compound assign (the
+	// trailing `v1` is the block's separate `tail`, not a stmt).
+	let HirStmt::Expr(HirExpr::Assign { target, value }) = &stmts[1] else {
+		panic!("expected an Assign statement, got {:?}", stmts[1]);
+	};
+	assert!(matches!(target.as_ref(), HirExpr::Local(n) if n == "v1"));
+	let HirExpr::Call { callee, args } = value.as_ref() else {
+		panic!("expected Call, got {value:?}");
+	};
+	let HirExpr::Field { recv, name } = callee.as_ref() else {
+		panic!("expected Field callee, got {callee:?}");
+	};
+	assert_eq!(name, "plus");
+	assert!(matches!(recv.as_ref(), HirExpr::Local(n) if n == "v1"));
+	assert_eq!(args.len(), 1);
+	assert!(matches!(&args[0], HirExpr::Local(n) if n == "b"));
+}
+
+#[test]
+fn lowers_compound_assign_on_int_stays_native() {
+	// `x += 1` on a plain `int` still lowers to `HirExpr::Binary`, not a dispatched
+	// call — the `BuiltinEager` resolution keeps the existing native-operator path.
+	let hir = lower(
+		r#"
+		func f(): int = {
+			let mut x = 1
+			x += 1
+			x
+		}
+		"#,
+	);
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	let HirStmt::Expr(HirExpr::Assign { target, value }) = &stmts[1] else {
+		panic!("expected an Assign statement, got {:?}", stmts[1]);
+	};
+	assert!(matches!(target.as_ref(), HirExpr::Local(n) if n == "x"));
+	assert_eq!(
+		value.as_ref(),
+		&HirExpr::Binary {
+			op: BinOp::Add,
+			lhs: Box::new(HirExpr::Local("x".into())),
+			rhs: Box::new(HirExpr::Num(1.0)),
+		}
+	);
+}
+
+#[test]
 #[should_panic(expected = "default method")]
 fn user_comparable_default_method_panics_in_lowering() {
 	// `v1 < v2` resolves through `Comparable`'s interface *default* method
@@ -463,4 +533,34 @@ fn user_comparable_default_method_panics_in_lowering() {
 		func lt(v1: Vec2, v2: Vec2): boolean = v1 < v2
 		"#,
 	);
+}
+
+#[test]
+#[should_panic(expected = "no operator resolution recorded for binary op")]
+fn missing_resolution_still_panics_in_lowering() {
+	// Finding 2 closes the two known valid-program gaps that used to leave a
+	// `BinaryOp`/`AssignOp` node with no recorded `Resolution` (an unresolved
+	// generic-parameter operand, and an inference variable resolved only after the
+	// node was recorded) — every zero-diagnostic program now reaches lowering fully
+	// resolved. This pins that the `None` panic itself is still live as an
+	// invariant guard against a *future* checker regression, by handing lowering a
+	// `Checked` whose annotations were wiped, as if the checker had failed to
+	// record a resolution it should have.
+	let parsed = parse_module("func f(a: int, b: int): int = a + b", "test");
+	assert!(
+		!parsed.diagnostics.iter().any(|d| d.is_error()),
+		"parse failed"
+	);
+	let checked = check_module(&parsed.tree);
+	assert!(
+		checked.diags.is_empty(),
+		"check failed: {:?}",
+		checked.diags
+	);
+	let stripped = nymph_sema::Checked {
+		diags: checked.diags,
+		annotations: nymph_sema::Annotations::default(),
+		interner: checked.interner,
+	};
+	nymph_sema::lower_hir(&parsed.tree, &stripped);
 }

@@ -484,6 +484,52 @@ fn runs_mixed_int_and_float_stays_native() {
 }
 
 #[test]
+fn runs_compound_assign_dispatches_user_operator() {
+	// `v1 += v2` on a struct with a directly-defined `Plus.plus` impl actually calls
+	// `.plus(...)` at runtime, rather than emitting a literal JS `v1 = v1 + v2`
+	// (which would silently string-coerce two class instances) — Finding 1.
+	let src = r#"
+		interface Plus<Other, Output> { func plus(other: Other): Output }
+		struct Vec2(x: int, y: int)
+		impl Plus<Other = Vec2, Output = Vec2> for Vec2 {
+			func plus(other: Vec2): Vec2 = Vec2(x = this.x + other.x, y = this.y + other.y)
+		}
+		func combine(a: Vec2, b: Vec2): Vec2 = {
+			let mut v1 = a
+			v1 += b
+			v1
+		}
+	"#;
+	assert_eq!(
+		run(
+			src,
+			"combine(new Vec2({ x: 1, y: 2 }), new Vec2({ x: 3, y: 4 })).x"
+		),
+		"4"
+	);
+	assert_eq!(
+		run(
+			src,
+			"combine(new Vec2({ x: 1, y: 2 }), new Vec2({ x: 3, y: 4 })).y"
+		),
+		"6"
+	);
+}
+
+#[test]
+fn runs_compound_assign_on_int_stays_native() {
+	// `x += 1` on a plain `int` still runs as a native JS `+=`, not a dispatched call.
+	let src = r#"
+		func bump(): int = {
+			let mut x = 10
+			x += 5
+			x
+		}
+	"#;
+	assert_eq!(run(src, "bump()"), "15");
+}
+
+#[test]
 fn compile_reports_check_errors() {
 	// A type error surfaces as diagnostics, not JS.
 	let result = nymph_codegen::compile("func f(): int = true", "test");

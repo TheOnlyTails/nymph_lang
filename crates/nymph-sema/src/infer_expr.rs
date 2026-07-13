@@ -63,6 +63,9 @@ impl<'m> Checker<'m> {
 		let prev = self.ret_ty.replace(sig.ret);
 		self.check(body, sig.ret);
 		self.ret_ty = prev;
+		// Drain this body's deferred operators now, while its `param_bounds` are
+		// still the ones just built above — see `pending_operators`'s doc comment.
+		self.finalize_pending_operators();
 		self.pop_scope();
 		self.pop_params();
 	}
@@ -76,6 +79,7 @@ impl<'m> Checker<'m> {
 		let ty = self.sigs.lets[&id];
 		self.push_scope();
 		self.check(value, ty);
+		self.finalize_pending_operators();
 		self.pop_scope();
 	}
 
@@ -139,10 +143,42 @@ impl<'m> Checker<'m> {
 		// generic `infer_kind` match (whose own `BinaryOp` arm below is unreachable
 		// through this path, kept only so the match stays exhaustive).
 		if let ExprKind::BinaryOp { lhs, op, rhs } = &expr.kind {
-			let (ty, resolution) = self.infer_binary(lhs, *op, rhs, expr.span);
+			let (ty, resolution, pending) = self.infer_binary(lhs, *op, rhs, expr.span);
 			self.record(expr.id, ty, None);
 			if let Some(resolution) = resolution {
 				self.annotations.record_resolution(expr.id, resolution);
+			}
+			if let Some(pending_ty) = pending {
+				self.pending_operators.push((
+					expr.id,
+					*op,
+					expr.span,
+					pending_ty,
+					crate::check::PendingOperatorKind::BinaryOp,
+				));
+			}
+			return ty;
+		}
+		// `AssignOp` mirrors the `BinaryOp` special case above: a compound assign
+		// (`v1 += v2`) desugars to a binary op whose `Resolution` (Finding 1, Slice
+		// 4B follow-up) must be recorded on the `AssignOp` node itself — there is no
+		// separate desugared `BinaryOp` AST node to hang it on. Plain `=` and `~=`
+		// (`BitNotAssign`) never produce a resolution (`binary_of_assign` maps both
+		// to `None`).
+		if let ExprKind::AssignOp { lhs, op, rhs } = &expr.kind {
+			let (ty, resolution, pending) = self.infer_assign(lhs, *op, rhs, expr.span);
+			self.record(expr.id, ty, None);
+			if let Some(resolution) = resolution {
+				self.annotations.record_resolution(expr.id, resolution);
+			}
+			if let Some((binop, pending_ty)) = pending {
+				self.pending_operators.push((
+					expr.id,
+					binop,
+					expr.span,
+					pending_ty,
+					crate::check::PendingOperatorKind::AssignOp,
+				));
 			}
 			return ty;
 		}
@@ -298,7 +334,13 @@ impl<'m> Checker<'m> {
 				self.pop_scope();
 				self.interner.boolean()
 			}
-			ExprKind::AssignOp { lhs, op, rhs } => self.infer_assign(lhs, *op, rhs, span),
+			ExprKind::AssignOp { lhs, op, rhs } => {
+				// Unreachable in practice: `infer` intercepts `AssignOp` before it gets
+				// here, for the same reason it intercepts `BinaryOp` above — recording the
+				// operator's `Resolution` needs the node's type entry to already exist.
+				// This arm only exists so the match stays exhaustive.
+				self.infer_assign(lhs, *op, rhs, span).0
+			}
 			ExprKind::Return { value, .. } => {
 				let ret = self.ret_ty;
 				if let Some(v) = value {
@@ -898,16 +940,20 @@ impl<'m> Checker<'m> {
 	/// Also decides, per D3 of the Slice 4B plan, the operator's [`Resolution`] —
 	/// how codegen must compile this exact node — returned alongside the type so
 	/// `infer` can record both against the `BinaryOp` node once it exists in the
-	/// annotation table. `None` marks an exit path D3 deliberately leaves
-	/// unresolved (`??`, `in`/`!in`, `|>`, and the inference-var/generic-operand
-	/// fallback below); lowering panics loudly on those rather than guessing.
+	/// annotation table. The third element of the tuple is `Some(ty)` only for the
+	/// arithmetic fallback's still-unresolved-inference-variable case (Finding 2): the
+	/// caller enqueues `(node, op, span, ty)` for `finalize_pending_operators` to
+	/// retry once the current body has been checked, rather than giving up. A plain
+	/// `None` resolution (with no pending ty) marks an exit path D3 deliberately
+	/// leaves unresolved (`??`, `in`/`!in`, `|>`); lowering panics loudly on those
+	/// rather than guessing.
 	fn infer_binary(
 		&mut self,
 		lhs: &Expr,
 		op: BinaryOperator,
 		rhs: &Expr,
 		span: Span,
-	) -> (Ty, Option<Resolution>) {
+	) -> (Ty, Option<Resolution>, Option<Ty>) {
 		use BinaryOperator::*;
 
 		// `|>` is application, not a method. D3: `lower_binop` already panics on
@@ -915,7 +961,7 @@ impl<'m> Checker<'m> {
 		if op == Pipe {
 			let arg = self.infer(lhs);
 			let callee = self.infer(rhs);
-			return (self.apply(callee, vec![arg], span), None);
+			return (self.apply(callee, vec![arg], span), None, None);
 		}
 
 		let l = self.infer(lhs);
@@ -934,7 +980,7 @@ impl<'m> Checker<'m> {
 				// Same primitive → built-in, result is that type.
 				(Some(a), Some(b)) if a == b => {
 					self.unify(l, r, span);
-					(l, eager(binary_method(op)))
+					(l, eager(binary_method(op)), None)
 				}
 				// Different concrete primitives: an `int` literal against a `float`/`uint`
 				// widens (so `1.5 * 2` is a `float` with no impl needed); otherwise this is
@@ -945,35 +991,46 @@ impl<'m> Checker<'m> {
 				// its JS numeric semantics already match).
 				(Some(_), Some(_)) => {
 					if matches!(rhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(l) {
-						(l, eager(binary_method(op)))
+						(l, eager(binary_method(op)), None)
 					} else if matches!(lhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(r) {
-						(r, eager(binary_method(op)))
+						(r, eager(binary_method(op)), None)
 					} else {
 						let (ty, _) = self.dispatch_operator(l, binary_method(op), &[r], span);
-						(ty, eager(binary_method(op)))
+						(ty, eager(binary_method(op)), None)
 					}
 				}
-				// A non-primitive operand: user type → overload; inference var/param →
-				// best-effort unify (covers generic `T + T` and not-yet-known types).
+				// A non-primitive operand: an ADT or generic-parameter receiver dispatches
+				// through the solver (Finding 2 routes `Param` receivers here too, rather
+				// than silently accepting them below — a bounded parameter resolves through
+				// its bound, an unbounded one gets a proper `NotImplemented` diagnostic from
+				// `dispatch_operator`, never a lowering-time ICE on a type-checked program).
+				// An inference variable falls to the `unify`-then-recheck fallback, which
+				// covers `xs[0] + 1` (resolved by this very unify) and `xs[0] + xs[0]`
+				// (resolved only later, via a `check`-mode subtype after this node is
+				// recorded) by deferring to `finalize_pending_operators`.
+				_ if self.is_adt(l) || {
+					let resolved = self.shallow_resolve(l);
+					matches!(self.interner.kind(resolved), TyKind::Param(_))
+				} =>
+				{
+					let (ty, dispatch) = self.dispatch_operator(l, binary_method(op), &[r], span);
+					(
+						ty,
+						Some(Resolution {
+							method: binary_method(op).into(),
+							dispatch,
+						}),
+						None,
+					)
+				}
 				_ => {
-					if self.is_adt(l) {
-						let (ty, dispatch) = self.dispatch_operator(l, binary_method(op), &[r], span);
-						(
-							ty,
-							Some(Resolution {
-								method: binary_method(op).into(),
-								dispatch,
-							}),
-						)
-					} else {
-						// D3 doesn't cover this fallback (an unresolved inference variable or
-						// generic parameter operand, which never reaches `dispatch_operator`
-						// since `is_adt` is false for it too). Recording a guessed dispatch
-						// kind here could silently miscompile a case we don't actually
-						// understand yet, so this deliberately leaves no `Resolution` —
-						// Task 3's lowering panics loudly on it instead.
-						self.unify(l, r, span);
-						(l, None)
+					self.unify(l, r, span);
+					match self.resolve_fallback_operand(op, l, span) {
+						Some((ty, res)) => (ty, Some(res), None),
+						// Still an unresolved inference variable (or `Error`, from an
+						// already-diagnosed upstream mistake): defer to the end-of-module
+						// finalization pass rather than guessing or panicking now.
+						None => (l, None, Some(l)),
 					}
 				}
 			},
@@ -986,13 +1043,13 @@ impl<'m> Checker<'m> {
 					// ADT has a user `Equals` impl, codegen still emits `===`/`!==` for now.
 					self.dispatch_operator(l, method, &[r], span);
 				}
-				(boolean, eager(method))
+				(boolean, eager(method), None)
 			}
 			LessThan | LessThanEquals | GreaterThan | GreaterThanEquals => {
 				let method = comparison_method(op);
 				if self.prim_kind(l).is_some() || !self.is_adt(l) {
 					self.unify_operands(lhs, l, rhs, r, span);
-					(boolean, eager(method))
+					(boolean, eager(method), None)
 				} else {
 					let (_, dispatch) = self.dispatch_operator(l, method, &[r], span);
 					(
@@ -1001,6 +1058,7 @@ impl<'m> Checker<'m> {
 							method: method.into(),
 							dispatch,
 						}),
+						None,
 					)
 				}
 			}
@@ -1020,6 +1078,7 @@ impl<'m> Checker<'m> {
 							method: method.into(),
 							dispatch: DispatchKind::BuiltinShortCircuit,
 						}),
+						None,
 					)
 				} else {
 					let (ty, dispatch) = self.dispatch_operator(l, method, &[r], span);
@@ -1029,6 +1088,7 @@ impl<'m> Checker<'m> {
 							method: method.into(),
 							dispatch,
 						}),
+						None,
 					)
 				}
 			}
@@ -1040,7 +1100,7 @@ impl<'m> Checker<'m> {
 				if self.is_adt(r) {
 					self.dispatch_operator(r, method, &[l], span);
 				}
-				(boolean, None)
+				(boolean, None, None)
 			}
 			// `??` is overloadable via the `Unwrap` interface. Its built-in *default*
 			// impls (`Option`/`Result`) short-circuit — codegen lowers those to
@@ -1050,10 +1110,58 @@ impl<'m> Checker<'m> {
 			// `Unwrap` before any dispatch question arises, so no resolution is needed.
 			Unwrap => {
 				let (ty, _) = self.dispatch_operator(l, "unwrap", &[r], span);
-				(ty, None)
+				(ty, None, None)
 			}
 			Pipe => unreachable!("handled above"),
 		}
+	}
+
+	/// Attempt to resolve an arithmetic operator's `Resolution` once both operands
+	/// are known to be the same type `ty` (the fallback arm unifies them first).
+	/// Returns `None` only when `ty` is still an unresolved inference variable (or
+	/// `Error`, from an already-diagnosed mistake) — the caller either defers to
+	/// `finalize_pending_operators` (during a body) or, there, reports
+	/// [`TypeError::CannotInferOperandType`] (after the whole module is checked and
+	/// no more information is coming).
+	///
+	/// Every other resolved type — including an ADT/generic parameter *and* any
+	/// other concrete shape with no operator support at all (e.g. a first-class
+	/// function value) — dispatches through `dispatch_operator`, which reports a
+	/// `NotImplemented` diagnostic when no impl provides the method. Finding 2: the
+	/// old code only routed ADT/`Param` receivers there, so a resolved-but-
+	/// unsupported type (a function value being the concrete case found) fell
+	/// through with neither a `Resolution` nor a diagnostic, and still reached
+	/// lowering's `None => panic!(..)` on an otherwise zero-diagnostic program.
+	fn resolve_fallback_operand(
+		&mut self,
+		op: BinaryOperator,
+		ty: Ty,
+		span: Span,
+	) -> Option<(Ty, Resolution)> {
+		if self.prim_kind(ty).is_some() {
+			return Some((
+				ty,
+				Resolution {
+					method: binary_method(op).into(),
+					dispatch: DispatchKind::BuiltinEager,
+				},
+			));
+		}
+		let resolved_ty = self.shallow_resolve(ty);
+		if matches!(
+			self.interner.kind(resolved_ty),
+			TyKind::Infer(_) | TyKind::Error
+		) {
+			return None;
+		}
+		let (result_ty, dispatch) = self.dispatch_operator(ty, binary_method(op), &[ty], span);
+		Some((
+			result_ty,
+			Resolution {
+				method: binary_method(op).into(),
+				dispatch,
+			},
+		))
 	}
 
 	/// Whether an `int` literal is allowed to implicitly become `expected`. Integer
@@ -1208,7 +1316,22 @@ impl<'m> Checker<'m> {
 	/// assignment reads as `place = place <op> value`, so its value type comes from the
 	/// underlying binary operator; a plain `=` checks the value against the place type
 	/// (letting an `int` literal widen, etc.).
-	fn infer_assign(&mut self, lhs: &Expr, op: AssignOperator, rhs: &Expr, span: Span) -> Ty {
+	///
+	/// Returns the assignment's (void) type, plus — for a compound assignment — the
+	/// underlying operator's `Resolution`, mirroring `infer_binary`. The desugared
+	/// `place op value` has no `BinaryOp` AST node of its own; the `AssignOp` node
+	/// itself carries the id the resolution is recorded against, in `infer`'s
+	/// `AssignOp` special case (Finding 1). The third element mirrors
+	/// `infer_binary`'s pending-operand slot for Finding 2's late finalization,
+	/// paired with the operator so `finalize_pending_operators` knows which method to
+	/// retry.
+	fn infer_assign(
+		&mut self,
+		lhs: &Expr,
+		op: AssignOperator,
+		rhs: &Expr,
+		span: Span,
+	) -> (Ty, Option<Resolution>, Option<(BinaryOperator, Ty)>) {
 		// Resolve the assignable place, reporting non-places and immutable targets.
 		let place_ty = match &lhs.kind {
 			ExprKind::Identifier(name) => match self.lookup_local(&name.0).map(|b| (b.ty, b.mutable)) {
@@ -1231,28 +1354,28 @@ impl<'m> Checker<'m> {
 						},
 					);
 					self.infer(rhs);
-					return self.interner.void();
+					return (self.interner.void(), None, None);
 				}
 			},
 			// A field or index target (`this.field`, `xs[i]`): its type is the place type.
 			_ => self.infer(lhs),
 		};
 
+		let mut resolution = None;
+		let mut pending = None;
 		match binary_of_assign(op) {
 			// `place op= value` ≡ `place = place op value`: the operator's result type
 			// must be assignable back into the place.
 			Some(binop) => {
-				// The desugared `place op value` has no `BinaryOp` AST node of its own (no
-				// id to record a `Resolution` against), so the resolution half of
-				// `infer_binary`'s result is discarded here — compound-assignment operator
-				// lowering is unaffected by Slice 4B's recording (out of scope for Task 1).
-				let (result, _) = self.infer_binary(lhs, binop, rhs, span);
+				let (result, res, pend) = self.infer_binary(lhs, binop, rhs, span);
 				self.unify(result, place_ty, span);
+				resolution = res;
+				pending = pend.map(|ty| (binop, ty));
 			}
 			// Plain `=`.
 			None => self.check(rhs, place_ty),
 		}
-		self.interner.void()
+		(self.interner.void(), resolution, pending)
 	}
 
 	// ── Blocks ───────────────────────────────────────────────────────────────
@@ -1323,6 +1446,54 @@ impl<'m> Checker<'m> {
 			}
 		}
 		elem
+	}
+
+	// ── Late operator finalization (Finding 2) ────────────────────────────────
+	/// Retry every operator node `infer_binary`'s fallback arm deferred (its operand
+	/// was still an unresolved inference variable at the moment it was recorded).
+	/// Called at the end of each body's own checking (`check_func_body`,
+	/// `check_let_body`, `check_method_body`, `check_interface_impl_members`), while
+	/// that body's `param_bounds` and the unify table are still alive — an operand
+	/// left unbound at record time may since have been pinned down by a
+	/// `check`-mode subtype applied *later in the same body* (e.g. the function's
+	/// declared return type). This must run per body, not once at module end:
+	/// inference variables are body-local, so nothing outside the body can pin them
+	/// down later, and `param_bounds` itself is cleared and rebuilt per body — a
+	/// module-end pass would resolve every pending operator against whichever
+	/// body's bounds happened to be checked last. Every zero-diagnostic program
+	/// must leave this method with a `Resolution` recorded on every operator node
+	/// it drains, or lowering's `None` panic is a real bug, not an expected gap.
+	pub(crate) fn finalize_pending_operators(&mut self) {
+		use crate::check::PendingOperatorKind;
+
+		let pending = std::mem::take(&mut self.pending_operators);
+		for (id, op, span, ty, kind) in pending {
+			match self.resolve_fallback_operand(op, ty, span) {
+				Some((result_ty, resolution)) => match kind {
+					// A `BinaryOp` node's initially-recorded type was only the (possibly
+					// still-unbound) operand placeholder; overwrite it with the now-final
+					// result type, same as the immediately-resolved path would have.
+					PendingOperatorKind::BinaryOp => self.record(id, result_ty, Some(resolution)),
+					// Finding 1: an `AssignOp` node's own type is always `Void` — set
+					// immediately in `infer`'s `AssignOp` special case — and must stay
+					// that way. `record` overwrites the whole `ExprInfo` (including
+					// `ty`), so only `record_resolution` (which touches just the
+					// `resolution` field) is safe here; it must never regress to
+					// clobbering `Void` with the operator's operand/result type the way
+					// the immediately-resolved compound-assign path never does.
+					PendingOperatorKind::AssignOp => self.annotations.record_resolution(id, resolution),
+				},
+				None => {
+					// Still unbound (a genuinely under-determined program) or `Error` (an
+					// already-diagnosed upstream mistake, where piling on a second
+					// diagnostic would be noise): only the former gets a fresh diagnostic.
+					let resolved = self.shallow_resolve(ty);
+					if matches!(self.interner.kind(resolved), TyKind::Infer(_)) {
+						self.emit(span, TypeError::CannotInferOperandType);
+					}
+				}
+			}
+		}
 	}
 }
 

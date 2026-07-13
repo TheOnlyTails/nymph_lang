@@ -196,6 +196,225 @@ fn comparable_less_than_is_interface_default_method() {
 	assert_eq!(res.method, "less_than");
 }
 
+/// Like [`collect_binary_ops`], but collects `AssignOp` nodes instead — Finding 1
+/// records the compound-assign operator's `Resolution` on the `AssignOp` node
+/// itself (there's no separate desugared `BinaryOp` AST node to hang it on).
+fn collect_assign_ops(expr: &Expr, out: &mut Vec<NodeId>) {
+	if let ExprKind::AssignOp { lhs, rhs, .. } = &expr.kind {
+		out.push(expr.id);
+		collect_assign_ops(lhs, out);
+		collect_assign_ops(rhs, out);
+		return;
+	}
+	match &expr.kind {
+		ExprKind::Grouped(inner) => collect_assign_ops(inner, out),
+		ExprKind::Block { body, .. } => {
+			for stmt in body {
+				match &stmt.0 {
+					Statement::Expr(e) => collect_assign_ops(e, out),
+					Statement::Let { value, .. } => collect_assign_ops(value, out),
+				}
+			}
+		}
+		ExprKind::While { body, .. } => collect_assign_ops(body, out),
+		_ => {}
+	}
+}
+
+/// Parse+check `source` (asserting zero diagnostics), find the single `AssignOp`
+/// node inside the named top-level `func`'s body, and return the `Resolution` the
+/// checker recorded for it.
+fn assign_resolution_for(source: &str, func_name: &str) -> Resolution {
+	let parsed = parse_module(source, "test");
+	let parse_errors: Vec<_> = parsed
+		.diagnostics
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert!(
+		parse_errors.is_empty(),
+		"source failed to parse: {parse_errors:?}\n---\n{source}"
+	);
+
+	let checked = check_module(&parsed.tree);
+	let check_errors: Vec<_> = checked
+		.diags
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert!(
+		check_errors.is_empty(),
+		"expected no errors, got: {check_errors:?}\n---\n{source}"
+	);
+
+	let body = parsed
+		.tree
+		.members
+		.iter()
+		.find_map(|member| match member {
+			Declaration::Func { meta, body, .. } if meta.name.0 == func_name => Some(body),
+			_ => None,
+		})
+		.unwrap_or_else(|| panic!("no func named `{func_name}` in module:\n{source}"));
+
+	let mut ops = Vec::new();
+	collect_assign_ops(body, &mut ops);
+	assert_eq!(
+		ops.len(),
+		1,
+		"expected exactly one AssignOp node in `{func_name}`'s body, found {}",
+		ops.len()
+	);
+
+	checked
+		.annotations
+		.resolution_of(ops[0])
+		.unwrap_or_else(|| panic!("no Resolution recorded for the AssignOp node in `{func_name}`"))
+		.clone()
+}
+
+#[test]
+fn compound_assign_user_struct_plus_is_user_impl() {
+	// `v1 += v2` on a struct with a directly-defined `Plus.plus` impl resolves
+	// through a direct user impl method, same as `v1 + v2` would (Finding 1): the
+	// `AssignOp` node itself carries the `Resolution`, not a separate `BinaryOp`.
+	let res = assign_resolution_for(
+		&format!(
+			"{PLUS}
+			 struct Vec2(x: int, y: int)
+			 impl Plus<Other = Vec2, Output = Vec2> for Vec2 {{
+			   func plus(other: Vec2): Vec2 = other
+			 }}
+			 func add(a: Vec2, b: Vec2): Vec2 = {{
+			   let mut v1 = a
+			   v1 += b
+			   v1
+			 }}",
+		),
+		"add",
+	);
+	assert_eq!(res.dispatch, DispatchKind::UserImpl);
+	assert_eq!(res.method, "plus");
+}
+
+#[test]
+fn compound_assign_int_plus_is_builtin_eager() {
+	// `x += 1` on a plain `int` stays a native builtin, same as `x + 1` would.
+	let res = assign_resolution_for(
+		"func f(): int = {
+		   let mut x = 1
+		   x += 1
+		   x
+		 }",
+		"f",
+	);
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+	assert_eq!(res.method, "plus");
+}
+
+#[test]
+fn deferred_compound_assign_keeps_its_own_type_as_void() {
+	// Finding 1: `finalize_pending_operators` used to overwrite the `AssignOp`
+	// node's own recorded type with the operator's resolved operand/result type
+	// whenever the resolution was *deferred* (the operand still an unresolved
+	// inference variable at the moment `infer_binary`'s fallback ran, later pinned
+	// down by a `check`-mode subtype applied elsewhere in the body -- here, the
+	// function's declared `int` return type). The immediately-resolved compound-
+	// assign path (`compound_assign_int_plus_is_builtin_eager` above) never
+	// clobbers `ty` this way -- it only ever calls `record_resolution`, leaving
+	// `ty` at the `Void` that `infer`'s `AssignOp` special case sets up front. The
+	// two paths must agree on the stored `ExprInfo.ty` for the same AST shape.
+	let source = "func f(): int = {
+	   let mut xs = #[]
+	   let mut x = xs[0]
+	   x += xs[0]
+	   x
+	 }";
+	let parsed = parse_module(source, "test");
+	let parse_errors: Vec<_> = parsed
+		.diagnostics
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert!(
+		parse_errors.is_empty(),
+		"source failed to parse: {parse_errors:?}\n---\n{source}"
+	);
+
+	let checked = check_module(&parsed.tree);
+	let check_errors: Vec<_> = checked
+		.diags
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert!(
+		check_errors.is_empty(),
+		"expected no errors, got: {check_errors:?}\n---\n{source}"
+	);
+
+	let body = parsed
+		.tree
+		.members
+		.iter()
+		.find_map(|member| match member {
+			Declaration::Func { meta, body, .. } if meta.name.0 == "f" => Some(body),
+			_ => None,
+		})
+		.expect("no func named `f` in module");
+
+	let mut ops = Vec::new();
+	collect_assign_ops(body, &mut ops);
+	assert_eq!(
+		ops.len(),
+		1,
+		"expected exactly one AssignOp node in `f`'s body, found {}",
+		ops.len()
+	);
+
+	let info = checked
+		.annotations
+		.get(ops[0])
+		.unwrap_or_else(|| panic!("no ExprInfo recorded for the AssignOp node in `f`"));
+	assert_eq!(
+		info.ty,
+		checked.interner.void(),
+		"the AssignOp node's own recorded type must stay Void even when its operator \
+		 Resolution was deferred to finalize_pending_operators"
+	);
+
+	// Sanity: the deferred `Resolution` itself is still attached correctly.
+	let res = checked
+		.annotations
+		.resolution_of(ops[0])
+		.unwrap_or_else(|| panic!("no Resolution recorded for the AssignOp node in `f`"));
+	assert_eq!(res.method, "plus");
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+}
+
+#[test]
+fn late_resolved_infer_var_operand_is_builtin_eager() {
+	// Finding 2: `xs[0] + xs[0]` — `xs`'s element type is a genuinely unconstrained
+	// inference variable at the moment this `BinaryOp` node is recorded (the
+	// fallback's own `unify(l, r)` is a no-op here, since both operands are already
+	// the same still-unbound variable). It only gets pinned to `int` *afterward*,
+	// when `f`'s body is checked against its declared `int` return type. Zero
+	// diagnostics, so `finalize_pending_operators` must retry this node once the
+	// whole module is checked, rather than leaving lowering to panic on it.
+	let res = resolution_for(
+		"func f(): int = {
+		   let xs = #[]
+		   xs[0] + xs[0]
+		 }",
+		"f",
+	);
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+	assert_eq!(res.method, "plus");
+}
+
 #[test]
 fn user_struct_equals_is_builtin_eager() {
 	// D3 defers `equals` dispatch to the stdlib slice: even with a user `Equals`

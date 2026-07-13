@@ -131,6 +131,12 @@ pub enum TypeError {
 	/// takes an object, not positional args), so this is rejected rather than
 	/// silently miscompiled. Call it to construct instead.
 	FieldVariantAsValue { variant: EcoString },
+
+	// ── Operators (late finalization) ────────────────────────────────────────
+	/// A binary operator's operand type was still an unresolved inference variable
+	/// after the whole module was checked — genuinely under-determined, so an
+	/// explicit type annotation is needed rather than lowering guessing at it.
+	CannotInferOperandType,
 }
 
 impl IntoDiagnostic for TypeError {
@@ -225,6 +231,10 @@ impl IntoDiagnostic for TypeError {
 				"non-exhaustive match: add a `_` arm to cover the remaining cases".into()
 			}
 			E::UnreachableArm => "unreachable match arm".into(),
+
+			E::CannotInferOperandType => {
+				"cannot infer the operand type of this operator; add a type annotation".into()
+			}
 		}
 	}
 
