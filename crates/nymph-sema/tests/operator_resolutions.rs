@@ -753,9 +753,194 @@ fn unbounded_generic_negate_is_not_implemented() {
 		"expected exactly one error: {messages:?}"
 	);
 	assert!(
-		messages[0].contains("negate") && messages[0].contains("not implemented"),
+		messages[0].contains('-')
+			&& messages[0].contains("Negate")
+			&& messages[0].contains("not implemented"),
 		"unexpected message: {messages:?}"
 	);
+}
+
+// ── Slice 4I, Task 1: `in`/`!in`/`??` resolutions, `|>` typing ──────────────
+
+#[test]
+fn user_contains_impl_in_is_user_impl() {
+	// `a in c` ≡ `c.contains(a)` — the RHS (collection) is the receiver.
+	let res = resolution_for(
+		"interface Contains<Item> { func contains(item: Item): boolean }
+		 struct Bag(n: int)
+		 impl Contains<Item = int> for Bag {
+		   func contains(item: int): boolean = true
+		 }
+		 func f(b: Bag, x: int): boolean = x in b",
+		"f",
+	);
+	assert_eq!(res.dispatch, DispatchKind::UserImpl);
+	assert_eq!(res.method, "contains");
+}
+
+#[test]
+fn user_contains_impl_not_in_dispatches_not_contains() {
+	// `!in` resolves the separate `not_contains` method name.
+	let res = resolution_for(
+		"interface Contains<Item> {
+		   func contains(item: Item): boolean
+		   func not_contains(item: Item): boolean
+		 }
+		 struct Bag(n: int)
+		 impl Contains<Item = int> for Bag {
+		   func contains(item: int): boolean = true
+		   func not_contains(item: int): boolean = false
+		 }
+		 func f(b: Bag, x: int): boolean = x !in b",
+		"f",
+	);
+	assert_eq!(res.dispatch, DispatchKind::UserImpl);
+	assert_eq!(res.method, "not_contains");
+}
+
+#[test]
+fn primitive_rhs_in_is_not_implemented() {
+	// D2/Task 1 gap closed: a primitive RHS with no `Contains` impl used to
+	// type-check silently (zero diagnostics, `is_adt` gated dispatch off); it must
+	// now report `NotImplemented` rather than reach the lowering panic.
+	let parsed = parse_module("func f(x: int, y: int): boolean = x in y", "test");
+	assert!(
+		!parsed.diagnostics.iter().any(|d| d.is_error()),
+		"parse failed"
+	);
+	let checked = check_module(&parsed.tree);
+	let messages: Vec<_> = checked
+		.diags
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert_eq!(
+		messages.len(),
+		1,
+		"expected exactly one error: {messages:?}"
+	);
+	assert!(
+		messages[0].contains("in")
+			&& messages[0].contains("Contains")
+			&& messages[0].contains("not implemented"),
+		"unexpected message: {messages:?}"
+	);
+}
+
+#[test]
+fn user_unwrap_impl_is_user_impl_eager() {
+	// `a ?? b` on a struct with a directly-defined `Unwrap.unwrap` impl resolves
+	// eagerly to `UserImpl` — `recv.unwrap(fallback)`, not short-circuiting.
+	let res = resolution_for(
+		"interface Unwrap<Output> { func unwrap(default: Output): Output }
+		 struct MaybeInt(present: boolean, value: int)
+		 impl Unwrap<Output = int> for MaybeInt {
+		   func unwrap(default: int): int = default
+		 }
+		 func f(m: MaybeInt, d: int): int = m ?? d",
+		"f",
+	);
+	assert_eq!(res.dispatch, DispatchKind::UserImpl);
+	assert_eq!(res.method, "unwrap");
+}
+
+#[test]
+fn unwrap_with_no_impl_is_not_implemented() {
+	// An int LHS has no `Unwrap` impl — `NotImplemented`, never a silent
+	// lowering-time panic.
+	let parsed = parse_module("func f(a: int, b: int): int = a ?? b", "test");
+	assert!(
+		!parsed.diagnostics.iter().any(|d| d.is_error()),
+		"parse failed"
+	);
+	let checked = check_module(&parsed.tree);
+	let messages: Vec<_> = checked
+		.diags
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert_eq!(
+		messages.len(),
+		1,
+		"expected exactly one error: {messages:?}"
+	);
+	assert!(
+		messages[0].contains("??")
+			&& messages[0].contains("Unwrap")
+			&& messages[0].contains("not implemented"),
+		"unexpected message: {messages:?}"
+	);
+}
+
+#[test]
+fn bounded_generic_unwrap_dispatches_through_bound() {
+	// A bounded generic parameter's `a ?? b` resolves through its `Unwrap`
+	// bound — `GenericBound` → `UserImplDefaultMethod`, mirroring every other
+	// operator's bound-dispatch mapping.
+	let res = resolution_for(
+		"interface Unwrap<Output> { func unwrap(default: Output): Output }
+		 func f<T: Unwrap<Output = int>>(a: T, b: int): int = a ?? b",
+		"f",
+	);
+	assert_eq!(res.dispatch, DispatchKind::UserImplDefaultMethod);
+	assert_eq!(res.method, "unwrap");
+}
+
+#[test]
+fn pipe_chain_types_as_left_associative_application() {
+	// `10 |> double |> inc` types cleanly and (per D1/DD1) records no
+	// `Resolution` at all — `|>` lowers structurally to a `Call`, not a dispatch.
+	// This is a smoke check that the checker's existing Pipe handling still
+	// agrees with structural-`Call` lowering; `collect_binary_ops` doesn't walk
+	// through `Pipe`'s `Call`-shaped AST node so we just assert zero diagnostics.
+	let parsed = parse_module(
+		"func double(x: int): int = x * 2
+		 func inc(x: int): int = x + 1
+		 func f(): int = 10 |> double |> inc",
+		"test",
+	);
+	assert!(
+		!parsed.diagnostics.iter().any(|d| d.is_error()),
+		"parse failed"
+	);
+	let checked = check_module(&parsed.tree);
+	let messages: Vec<_> = checked
+		.diags
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert!(messages.is_empty(), "expected no errors: {messages:?}");
+}
+
+#[test]
+fn pipe_widens_int_literal_argument_like_a_direct_call() {
+	// `5 |> takes_float` must type-check exactly like `takes_float(5)`: an int
+	// literal argument widens to the parameter's `float` type either way, since
+	// `|>` lowers structurally to the same `Call` shape (DD1). Regression test for
+	// the confirmed Pipe-widening gap: the checker's Pipe arm used to type the
+	// piped-in literal via `infer` (concrete `int`) instead of `check` against the
+	// callee's parameter type, so the direct call and its pipe-equivalent
+	// disagreed.
+	let parsed = parse_module(
+		"func takes_float(x: float): float = x
+		 func f(): float = 5 |> takes_float",
+		"test",
+	);
+	assert!(
+		!parsed.diagnostics.iter().any(|d| d.is_error()),
+		"parse failed"
+	);
+	let checked = check_module(&parsed.tree);
+	let messages: Vec<_> = checked
+		.diags
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert!(messages.is_empty(), "expected no errors: {messages:?}");
 }
 
 #[test]
@@ -787,4 +972,308 @@ fn unresolved_prefix_operand_reports_cannot_infer_operand_type() {
 		1,
 		"expected exactly one error: {messages:?}"
 	);
+}
+
+// ── Resolver precedence for `Param` receivers (MM2, prelude-flavored pins) ──
+//
+// A still-generic `TyKind::Param` receiver used to lose a method name declared
+// by the param's OWN bound to an unrelated blanket impl of the same name
+// (`resolve_method`, `solve.rs`), because `head_of(Param)` is `None` and phase
+// 1's impl-index search only ever finds blanket buckets. These pins exercise
+// that precedence against the real stdlib prelude (`stdlib/src/ops/mod.nym`),
+// which is exactly where the bug was first reported (the prelude flip's
+// `less_than` → `lighter_than` rename worked around it rather than fixing the
+// resolver). `tests/solve.rs` pins the same two shapes with local interface
+// declarations under bare `check_module`; these mirror them through
+// `check_module_with_prelude` and inspect the recorded `Resolution` directly
+// rather than relying solely on a return-type mismatch to prove which impl
+// won. Neither test calls `lower_hir` — only `check_module_with_prelude` — so
+// the "prelude bodies still panic in lowering" caveat (materialization is a
+// separate slice's concern) never triggers here.
+
+fn ops_prelude_module() -> Module {
+	let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+		.join("../../stdlib/src/ops/mod.nym")
+		.canonicalize()
+		.unwrap();
+	let source = std::fs::read_to_string(path).unwrap();
+	let parsed = parse_module(&source, "std/ops");
+	assert!(
+		parsed.diagnostics.iter().all(|d| !d.is_error()),
+		"std/ops failed to parse"
+	);
+	parsed.tree
+}
+
+/// Minimal recursive descent collecting every method-call (`Call` whose `func` is
+/// a `MemberAccess`) node's [`NodeId`] found in `expr`. Mirrors
+/// `collect_binary_ops` above, but for `receiver.method(args)` shapes.
+fn collect_method_calls(expr: &Expr, out: &mut Vec<NodeId>) {
+	if let ExprKind::Call { func, args, .. } = &expr.kind {
+		if matches!(func.kind, ExprKind::MemberAccess { .. }) {
+			out.push(expr.id);
+		}
+		collect_method_calls(func, out);
+		for arg in args {
+			collect_method_calls(&arg.0.value, out);
+		}
+		return;
+	}
+	match &expr.kind {
+		ExprKind::Grouped(inner) => collect_method_calls(inner, out),
+		ExprKind::If {
+			condition,
+			then,
+			otherwise,
+		} => {
+			collect_method_calls(condition, out);
+			collect_method_calls(then, out);
+			if let Some(otherwise) = otherwise {
+				collect_method_calls(otherwise, out);
+			}
+		}
+		ExprKind::Block { body, .. } => {
+			for stmt in body {
+				match &stmt.0 {
+					Statement::Expr(e) => collect_method_calls(e, out),
+					Statement::Let { value, .. } => collect_method_calls(value, out),
+				}
+			}
+		}
+		ExprKind::MemberAccess { parent, .. } => collect_method_calls(parent, out),
+		ExprKind::PrefixOp { value, .. } | ExprKind::PostfixOp { value, .. } => {
+			collect_method_calls(value, out);
+		}
+		ExprKind::AssignOp { lhs, rhs, .. } => {
+			collect_method_calls(lhs, out);
+			collect_method_calls(rhs, out);
+		}
+		_ => {}
+	}
+}
+
+/// Parse `user` + the real stdlib ops prelude, check them together via
+/// `check_module_with_prelude` (asserting zero diagnostics), find the single
+/// method-call node inside the named top-level `func`'s body, and return the
+/// `Resolution` the checker recorded for it.
+fn resolution_for_prelude(user_source: &str, func_name: &str) -> Resolution {
+	let parsed = parse_module(user_source, "test");
+	assert!(
+		!parsed.diagnostics.iter().any(|d| d.is_error()),
+		"source failed to parse: {:?}\n---\n{user_source}",
+		parsed.diagnostics
+	);
+	let user = parsed.tree;
+	let prelude = ops_prelude_module();
+
+	let checked = check_module_with_prelude(&user, std::slice::from_ref(&prelude));
+	let errors: Vec<_> = checked
+		.diags
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert!(
+		errors.is_empty(),
+		"expected no errors, got: {errors:?}\n---\n{user_source}"
+	);
+
+	let body = user
+		.members
+		.iter()
+		.find_map(|member| match member {
+			Declaration::Func { meta, body, .. } if meta.name.0 == func_name => Some(body),
+			_ => None,
+		})
+		.unwrap_or_else(|| panic!("no func named `{func_name}` in module:\n{user_source}"));
+
+	let mut calls = Vec::new();
+	collect_method_calls(body, &mut calls);
+	assert_eq!(
+		calls.len(),
+		1,
+		"expected exactly one method-call node in `{func_name}`'s body, found {}",
+		calls.len()
+	);
+
+	checked
+		.annotations
+		.resolution_of(calls[0])
+		.unwrap_or_else(|| panic!("no Resolution recorded for the method-call node in `{func_name}`"))
+		.clone()
+}
+
+#[test]
+fn param_bound_method_beats_prelude_blanket_default() {
+	// Collision shape: a user-declared bound `Weighty::less_than` (returns `int`)
+	// must win over the prelude's blanket `impl<T> Comparable<Other = T> for T`,
+	// whose `less_than` is an interface *default* method (returns `boolean`).
+	// Before the MM1 fix, `head_of(Param) == None` forced candidate gathering to
+	// that blanket bucket, which matched *any* receiver and got committed before
+	// `T`'s own bound was ever consulted — this is precisely the shape the
+	// prelude flip migrated away from by renaming to `lighter_than`.
+	let res = resolution_for_prelude(
+		"interface Weighty<Other> { func less_than(other: Other): int }
+		 func f<T: Weighty<Other = T>>(a: T, b: T): int = a.less_than(b)",
+		"f",
+	);
+	assert_eq!(res.method, "less_than");
+	// The bound is a plain user-declared interface (not prelude-origin), so this
+	// resolves as an ordinary, immediately-lowerable generic-bound dispatch.
+	assert_eq!(res.dispatch, DispatchKind::UserImpl);
+}
+
+#[test]
+fn unconstrained_param_still_dispatches_through_prelude_blanket() {
+	// The blanket-dispatch behavior MM1 must preserve: with no bound at all on
+	// `T`, `a.equals(b)` has nothing to consult in `resolve_param_method` (no
+	// bounds recorded), so control falls through to phase 1's blanket-bucket
+	// search, which matches the prelude's blanket `impl<T> Equals<Other = self>
+	// for T`. A prior (reverted) fix attempt returned eagerly on a bounds miss
+	// here and broke exactly this case (error 2021, "no method `equals`").
+	let res = resolution_for_prelude("func same<T>(a: T, b: T): boolean = a.equals(b)", "same");
+	assert_eq!(res.method, "equals");
+	// The matched impl is the prelude's own blanket impl, so it is
+	// prelude-origin/unmaterialized and deferred accordingly.
+	assert_eq!(res.dispatch, DispatchKind::UserImplDefaultMethod);
+}
+
+/// Like [`resolution_for_prelude`], but for a `BinaryOp` node (not a method call).
+fn binary_resolution_for_prelude(user_source: &str, func_name: &str) -> Resolution {
+	let parsed = parse_module(user_source, "test");
+	assert!(
+		!parsed.diagnostics.iter().any(|d| d.is_error()),
+		"source failed to parse: {:?}\n---\n{user_source}",
+		parsed.diagnostics
+	);
+	let user = parsed.tree;
+	let prelude = ops_prelude_module();
+	let checked = check_module_with_prelude(&user, std::slice::from_ref(&prelude));
+	let errors: Vec<_> = checked
+		.diags
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert!(
+		errors.is_empty(),
+		"expected no errors, got: {errors:?}\n---\n{user_source}"
+	);
+	let body = user
+		.members
+		.iter()
+		.find_map(|member| match member {
+			Declaration::Func { meta, body, .. } if meta.name.0 == func_name => Some(body),
+			_ => None,
+		})
+		.unwrap_or_else(|| panic!("no func named `{func_name}` in module:\n{user_source}"));
+	let mut ops = Vec::new();
+	collect_binary_ops(body, &mut ops);
+	assert_eq!(
+		ops.len(),
+		1,
+		"expected exactly one BinaryOp in `{func_name}`"
+	);
+	checked
+		.annotations
+		.resolution_of(ops[0])
+		.unwrap_or_else(|| panic!("no Resolution recorded for the BinaryOp in `{func_name}`"))
+		.clone()
+}
+
+// ── Bug 3: a clearer operator-missing diagnostic ────────────────────────────
+
+#[test]
+fn missing_binary_operator_impl_names_the_operator_operands_and_interface() {
+	// `A + B` with no `Plus` impl for either type: the old bare message leaked
+	// the internal method name (`plus`) and named only the LHS type. The new
+	// message must name the surface operator, BOTH operand types, and the
+	// interface implementing it.
+	let parsed = parse_module(
+		"interface Plus<Other, Output> { func plus(other: Other): Output }
+		 struct A(x: int)
+		 struct B(y: int)
+		 func f(a: A, b: B): A = a + b",
+		"test",
+	);
+	assert!(
+		!parsed.diagnostics.iter().any(|d| d.is_error()),
+		"parse failed"
+	);
+	let checked = check_module(&parsed.tree);
+	let messages: Vec<_> = checked
+		.diags
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert_eq!(
+		messages.len(),
+		1,
+		"expected exactly one error: {messages:?}"
+	);
+	let message = &messages[0];
+	assert!(
+		message.contains('+')
+			&& message.contains('A')
+			&& message.contains('B')
+			&& message.contains("Plus")
+			&& message.contains("not implemented"),
+		"unexpected message: {messages:?}"
+	);
+}
+
+#[test]
+fn missing_unary_operator_impl_names_the_operator_operand_and_interface_with_no_rhs() {
+	// A unary operator (`-t`, `Negate`) with no impl: the message must still name
+	// the operator and the sole operand type, with no dangling "and `..`" for a
+	// nonexistent RHS.
+	let parsed = parse_module("func f<T>(t: T): T = -t", "test");
+	assert!(
+		!parsed.diagnostics.iter().any(|d| d.is_error()),
+		"parse failed"
+	);
+	let checked = check_module(&parsed.tree);
+	let messages: Vec<_> = checked
+		.diags
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert_eq!(
+		messages.len(),
+		1,
+		"expected exactly one error: {messages:?}"
+	);
+	let message = &messages[0];
+	assert!(
+		message.contains('-') && message.contains('T') && message.contains("Negate"),
+		"unexpected message: {messages:?}"
+	);
+	assert!(
+		!message.contains(" and "),
+		"unary diagnostic should not mention a second operand: {messages:?}"
+	);
+}
+
+#[test]
+fn boolean_bitwise_operators_dispatch_to_the_prelude_not_native_js() {
+	// Booleans have no native JS `&`/`|`/`^` semantics to reuse (JS coerces them
+	// to numbers: `true & false` → 0). infer_binary's same-primitive fast path
+	// therefore does NOT take `BuiltinEager` for a boolean receiver; it dispatches
+	// to the stdlib BitAnd/BitOr/BitXor impls instead, which the prelude provides
+	// and lowering can materialize.
+	for (src, method) in [
+		("func f(a: boolean, b: boolean): boolean = a & b", "bit_and"),
+		("func f(a: boolean, b: boolean): boolean = a | b", "bit_or"),
+		("func f(a: boolean, b: boolean): boolean = a ^ b", "bit_xor"),
+	] {
+		let res = binary_resolution_for_prelude(src, "f");
+		assert_eq!(res.method, method, "for {src:?}");
+		assert_ne!(
+			res.dispatch,
+			DispatchKind::BuiltinEager,
+			"boolean `{method}` must not compile to a native JS operator ({src:?})"
+		);
+	}
 }

@@ -409,14 +409,56 @@ impl Checker<'_> {
 			return None;
 		}
 
-		let chosen = self.most_specific(&receiver_matches);
-		if chosen.len() == 1 {
-			return Some(self.commit_method(chosen[0], recv, name, arg_tys, arg_lits, span));
+		let phase1_chosen = self.most_specific(&receiver_matches);
+		if phase1_chosen.len() == 1 {
+			// `most_specific` only ever filters on `Self`-type concreteness — a
+			// concrete impl differing from a blanket sibling ONLY in some other
+			// generic parameter (e.g. `Equals<Other = uint> for int` alongside the
+			// blanket `impl<T> Equals<Other = self> for T`) still "wins" here purely
+			// because it's concrete, even when it doesn't actually apply to the given
+			// arguments (`method_matches_receiver`, phase 1's filter, only unifies
+			// `Self` + constraints, never `arg_tys`). Confirm the sole survivor really
+			// applies before committing to it outright; when a blanket impl was
+			// filtered out of `phase1_chosen` alongside it (`phase1_chosen.len() <
+			// receiver_matches.len()`), fall through to phase 2 over the *full*
+			// `receiver_matches` instead — the blanket sibling stays reachable rather
+			// than being shadowed by a concrete impl for the wrong argument shape.
+			// Skip this double-check entirely when there was nothing else to fall
+			// back to (`phase1_chosen.len() == receiver_matches.len()`): the
+			// overwhelmingly common single-impl case commits exactly as before, no
+			// extra trial unification.
+			let applies = phase1_chosen.len() == receiver_matches.len() || {
+				let snapshot = self.table.snapshot();
+				let applies = self
+					.try_method(phase1_chosen[0], recv, recv_is_mut, name, arg_tys, arg_lits)
+					.is_some();
+				self.table.rollback_to(snapshot);
+				applies
+			};
+			if applies {
+				self.gate_mutating(
+					self.impls.impls[phase1_chosen[0]].interface,
+					name,
+					recv_is_mut,
+					span,
+				);
+				return Some(self.commit_method(phase1_chosen[0], recv, name, arg_tys, arg_lits, span));
+			}
 		}
 
 		// Phase 2: several impls share the receiver — disambiguate by argument types.
+		// Re-widened to `receiver_matches` (rather than `phase1_chosen`) whenever the
+		// sole "most specific" candidate above didn't actually apply, so a blanket
+		// impl `most_specific` discarded purely for not being concrete is still a
+		// candidate here; otherwise (the ordinary multiple-concrete-impls case)
+		// `phase1_chosen` is exactly the concrete-only bucket it always was.
+		let phase2_candidates: &[usize] = if phase1_chosen.len() > 1 {
+			&phase1_chosen
+		} else {
+			&receiver_matches
+		};
 		let mut arg_matches: Vec<usize> = Vec::new();
-		for &idx in &chosen {
+		for &idx in phase2_candidates {
 			let snapshot = self.table.snapshot();
 			let matched = self
 				.try_method(idx, recv, name, arg_tys, arg_lits)
@@ -429,15 +471,25 @@ impl Checker<'_> {
 		let chosen = self.most_specific(&arg_matches);
 		match chosen.len() {
 			0 => {
-				self.emit(span, TypeError::NoMatchingOverload { name: name.into() });
-				// An error path: diagnostics are already emitted, so `Checked::diags` is
-				// non-empty and lowering never runs on this result — the `source` tag is
-				// inert here, but `ImplDirect` is picked to keep this branch total without
-				// implying a (nonexistent) default-method body.
-				Some(MethodResolution {
-					ty: self.interner.error(),
-					source: MethodSource::ImplDirect,
-				})
+				// No candidate's argument types actually unify with what was passed —
+				// reported directly, this would be the internal `NoMatchingOverload`,
+				// which names the *interface's* method (`equals`, `less_than`, …)
+				// rather than the operator or the operand types, and always did once
+				// a receiver had two-or-more receiver-matching impls of the same
+				// interface (e.g. a primitive with both a same-type concrete impl and
+				// a newly-added cross-type one, alongside the interface's blanket).
+				// `phase1_chosen[0]` is well-defined here — `receiver_matches` was
+				// non-empty on entry, so `most_specific` never returns empty — so
+				// commit to it anyway: its own unification of `arg_tys` against the
+				// impl's real signature produces the ordinary, actionable
+				// `MismatchedTypes` diagnostic instead of this leaky one.
+				self.gate_mutating(
+					self.impls.impls[phase1_chosen[0]].interface,
+					name,
+					recv_is_mut,
+					span,
+				);
+				Some(self.commit_method(phase1_chosen[0], recv, name, arg_tys, arg_lits, span))
 			}
 			1 => Some(self.commit_method(chosen[0], recv, name, arg_tys, arg_lits, span)),
 			_ => {

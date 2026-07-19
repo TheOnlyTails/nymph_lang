@@ -1169,12 +1169,28 @@ impl<'m> Checker<'m> {
 			},
 			Equals | NotEquals => {
 				let method = if op == Equals { "equals" } else { "not_equals" };
-				if self.prim_kind(l).is_some() || !self.is_adt(l) {
-					self.unify_operands(lhs, l, rhs, r, span);
-				} else {
-					// D3: `equals` dispatch is deferred to the stdlib slice — even when an
-					// ADT has a user `Equals` impl, codegen still emits `===`/`!==` for now.
-					self.dispatch_operator(l, method, &[r], span);
+				let literal_widens = (matches!(rhs.kind, ExprKind::Int(_))
+					&& self.int_literal_coerces_to(l))
+					|| (matches!(lhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(r));
+				match (self.prim_kind(l), self.prim_kind(r)) {
+					// Two *different* concrete primitives (e.g. `int == uint`) that aren't
+					// just an int literal widening to its float/uint sibling: `unify_operands`
+					// would unconditionally `unify` them and report `MismatchedTypes`, even
+					// when a valid cross-type `Equals` impl exists (mirrors the arithmetic/
+					// comparison arms' mixed-primitive handling above). Still gates on a
+					// matching impl — `int == string` has none and is correctly rejected,
+					// just via `dispatch_operator`'s diagnostic rather than a type mismatch.
+					(Some(a), Some(b)) if a != b && !literal_widens => {
+						self.dispatch_operator(l, method, &[r], span);
+					}
+					_ if self.prim_kind(l).is_some() || !self.is_adt(l) => {
+						self.unify_operands(lhs, l, rhs, r, span);
+					}
+					_ => {
+						// D3: `equals` dispatch is deferred to the stdlib slice — even when an
+						// ADT has a user `Equals` impl, codegen still emits `===`/`!==` for now.
+						self.dispatch_operator(l, method, &[r], span);
+					}
 				}
 				(boolean, eager(method), None)
 			}
@@ -1207,15 +1223,20 @@ impl<'m> Checker<'m> {
 						if literal_widens {
 							(boolean, eager(method), None)
 						} else {
-							let (_, dispatch) = self.dispatch_operator(l, method, &[r], span);
-							(
-								boolean,
-								Some(Resolution {
-									method: method.into(),
-									dispatch,
-								}),
-								None,
-							)
+							// Two *different* concrete primitives (e.g. `int < uint`) still
+							// compile to a native JS comparison — mirroring the arithmetic
+							// mixed-primitive arm just above, which forces `BuiltinEager`
+							// rather than trusting whatever `DispatchKind` the resolved impl
+							// carries. `dispatch_operator` is called purely to gate on a
+							// cross-type `Comparable` impl existing; its own `Resolution`
+							// (possibly `UserImplDefaultMethod`, for an impl materialized from
+							// a prelude default body) is discarded, because lowering a
+							// primitive-to-primitive comparison as an interface method call
+							// panics (`lower_hir.rs`'s "does not yet dispatch operator to
+							// interface default method" — there is no method to call on a
+							// bare JS number).
+							self.dispatch_operator(l, method, &[r], span);
+							(boolean, eager(method), None)
 						}
 					}
 					_ if self.is_adt(l) || {
@@ -1431,12 +1452,16 @@ impl<'m> Checker<'m> {
 				(res.ty, dispatch)
 			}
 			None => {
-				let rendered = self.display(recv);
+				let lhs = self.display(recv);
+				let rhs = args.first().map(|&a| self.display(a));
+				let (operator, interface) = operator_symbol_and_interface(method);
 				self.emit(
 					span,
-					TypeError::NotImplemented {
-						method: method.into(),
-						ty: rendered,
+					TypeError::OperatorNotImplemented {
+						operator: operator.into(),
+						lhs,
+						rhs,
+						interface: interface.into(),
 					},
 				);
 				// An error path (diagnostics already emitted): lowering never runs when
@@ -1773,6 +1798,44 @@ fn prefix_method(op: PrefixOperator) -> &'static str {
 		PrefixOperator::Negate => "negate",
 		PrefixOperator::BitNot => "bit_not",
 		PrefixOperator::BoolNot => unreachable!("BoolNot never defers to the fallback path"),
+	}
+}
+
+/// The surface operator spelling and backing interface name for every method
+/// `dispatch_operator` can be asked to resolve, keyed by the (internal)
+/// method name callers pass it — `binary_method`/`comparison_method`/
+/// `prefix_method`'s outputs, plus the two operators (`unwrap`, `contains`/
+/// `not_contains`) that don't route through any of those three. Used only to
+/// render [`TypeError::OperatorNotImplemented`]'s message: the internal
+/// method name (`less_than_eq`, `bit_and`, …) is meaningless to a Nymph
+/// programmer, but the operator they actually wrote and the interface they'd
+/// need to implement are exactly what the diagnostic must name.
+fn operator_symbol_and_interface(method: &str) -> (&'static str, &'static str) {
+	match method {
+		"plus" => ("+", "Plus"),
+		"minus" => ("-", "Minus"),
+		"times" => ("*", "Times"),
+		"divide" => ("/", "Divide"),
+		"remainder" => ("%", "Remainder"),
+		"power" => ("**", "Power"),
+		"shl" => ("<<", "LeftShift"),
+		"shr" => (">>", "RightShift"),
+		"bit_and" => ("&", "BitAnd"),
+		"bit_or" => ("|", "BitOr"),
+		"bit_xor" => ("^", "BitXor"),
+		"bit_not" => ("~", "BitNot"),
+		"less_than" => ("<", "Comparable"),
+		"less_than_eq" => ("<=", "Comparable"),
+		"greater_than" => (">", "Comparable"),
+		"greater_than_eq" => (">=", "Comparable"),
+		"equals" => ("==", "Equals"),
+		"not_equals" => ("!=", "Equals"),
+		"contains" => ("in", "Contains"),
+		"not_contains" => ("!in", "Contains"),
+		"unwrap" => ("??", "Unwrap"),
+		"not" => ("!", "Not"),
+		"negate" => ("-", "Negate"),
+		other => unreachable!("dispatch_operator reached with an unknown method: {other}"),
 	}
 }
 

@@ -197,6 +197,76 @@ impl Remainder<Other = int, Output = int> for int {
   external func remainder(other: int): int
 }
 
+// --- int <-> uint cross-type operators ---
+//
+// `int` and `uint` are both JS doubles at runtime, but `int` is the wider
+// *signed* domain — a mixed arithmetic result can go negative (e.g.
+// `(-5 as int) - (2 as uint)` == -7), so every mixed arithmetic Output below
+// is `int`, never `uint`, matching the existing int/float widening-to-the-
+// superset pattern above. `Divide` stays `float` in both directions, exactly
+// like same-type `int`/`int` division. Comparison (`Comparable`) and equality
+// (`Equals`) always resolve to `boolean` regardless of direction.
+//
+// Same-type `uint` arithmetic/comparison already resolves through the
+// checker's native fast path (no impl needed here) — only the cross-type
+// pairs are missing.
+
+impl Plus<Other = uint, Output = int> for int {
+  external func plus(other: uint): int
+}
+
+impl Plus<Other = int, Output = int> for uint {
+  external func plus(other: int): int
+}
+
+impl Minus<Other = uint, Output = int> for int {
+  external(minus) func minus(other: uint): int
+}
+
+impl Minus<Other = int, Output = int> for uint {
+  external(minus) func minus(other: int): int
+}
+
+impl Times<Other = uint, Output = int> for int {
+  external func times(other: uint): int
+}
+
+impl Times<Other = int, Output = int> for uint {
+  external func times(other: int): int
+}
+
+impl Remainder<Other = uint, Output = int> for int {
+  external func remainder(other: uint): int
+}
+
+impl Remainder<Other = int, Output = int> for uint {
+  external func remainder(other: int): int
+}
+
+impl Divide<Other = uint, Output = float> for int {
+  external(divide) func divide(other: uint): float
+}
+
+impl Divide<Other = int, Output = float> for uint {
+  external(divide) func divide(other: int): float
+}
+
+impl Comparable<Other = uint> for int {
+  external(compare_to_int) func compare_to(other: uint): Order
+}
+
+impl Comparable<Other = int> for uint {
+  external(compare_to_int) func compare_to(other: int): Order
+}
+
+impl Equals<Other = uint> for int {
+  external(equals) func equals(other: uint): boolean
+}
+
+impl Equals<Other = int> for uint {
+  external(equals) func equals(other: int): boolean
+}
+
 // Power for uint -> float (no negative bases, but fractional results possible)
 impl Power<Other = uint, Output = float> for uint {
   external func power(other: uint): float
@@ -208,6 +278,14 @@ impl Power<Other = int, Output = float> for uint {
 
 impl Power<Other = float, Output = float> for uint {
   external func power(other: float): float
+}
+
+// int ** uint mirrors uint's own Power<Other = int, ...> above: a uint
+// exponent has no negative-base concern, but a negative int base raised to a
+// uint power can still fall out of int's own integral range, so this stays
+// float like every other int Power impl.
+impl Power<Other = uint, Output = float> for int {
+  external func power(other: uint): float
 }
 
 // Negate for int/float

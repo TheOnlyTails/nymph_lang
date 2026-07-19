@@ -92,7 +92,7 @@ fn missing_operator_impl_is_reported() {
 			 struct Vec2(x: int, y: int)
 			 func add(a: Vec2, b: Vec2): Vec2 = a + b",
 		),
-		"plus",
+		"Plus",
 	);
 }
 
@@ -104,7 +104,7 @@ fn unbounded_generic_operator_operand_is_reported() {
 	// program should never reach an unrecoverable compiler panic. `T` has no bound
 	// providing `plus`, so this is now a proper `NotImplemented` diagnostic, exactly
 	// like the concrete `missing_operator_impl_is_reported` case above.
-	assert_error_contains("func f<T>(a: T, b: T): T = a + b", "plus");
+	assert_error_contains("func f<T>(a: T, b: T): T = a + b", "Plus");
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn function_valued_operator_operand_is_reported() {
 		   let c = a + b
 		   1
 		 }",
-		"plus",
+		"Plus",
 	);
 }
 
@@ -193,7 +193,7 @@ fn unbounded_generic_less_than_is_reported() {
 	// W1: an unbounded generic parameter has no `Comparable` bound to dispatch
 	// `<` to — a `NotImplemented` diagnostic, not a silent native `<` on
 	// still-generic operands (the pre-4C-c behavior).
-	assert_error_contains("func f<T>(a: T, b: T): boolean = a < b", "less_than");
+	assert_error_contains("func f<T>(a: T, b: T): boolean = a < b", "Comparable");
 }
 
 #[test]

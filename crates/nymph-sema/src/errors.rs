@@ -84,7 +84,15 @@ pub enum TypeError {
 	MismatchedTypes { expected: String, found: String },
 	/// Two impls of one interface overlap for the same receiver.
 	ConflictingImpls { iface: EcoString },
-	/// No overload of a function matches the given arguments.
+	/// No overload of a function matches the given arguments. `solve.rs`'s
+	/// `resolve_method` no longer constructs this: it named an internal
+	/// interface method (`equals`, `less_than`, …) rather than the operator or
+	/// operand types, which leaked once a receiver could have two or more
+	/// receiver-matching impls of the same interface (e.g. a primitive with
+	/// both a same-type concrete impl and a cross-type one, alongside the
+	/// interface's blanket) — every such zero-argument-match case now commits
+	/// to the phase-1 "most specific" candidate instead, producing an ordinary
+	/// `MismatchedTypes`. Kept, unused, to preserve error codes.
 	NoMatchingOverload { name: EcoString },
 	/// Multiple impls apply to a call, and none is more specific.
 	AmbiguousCall { name: EcoString },
@@ -137,6 +145,28 @@ pub enum TypeError {
 	/// after the whole module was checked — genuinely under-determined, so an
 	/// explicit type annotation is needed rather than lowering guessing at it.
 	CannotInferOperandType,
+
+	/// A `match` over a `uint` scrutinee leaves some values in `[0, u64::MAX]`
+	/// uncovered. Distinct from [`TypeError::NonExhaustiveInt`] — the unsigned
+	/// domain has no negative half, so reusing the `int`-worded message would
+	/// misleadingly suggest negative values are the gap. New variant appended at
+	/// the enum's end (mints 2060; `NotIterable` above kept its existing 2059).
+	NonExhaustiveUInt,
+
+	/// An operator has no impl providing its backing interface method for the
+	/// operand type(s) — the `dispatch_operator` sole failure site. Replaces the
+	/// old bare `NotImplemented { method, ty }` (kept, unused, to preserve error
+	/// codes) with a message that names the operator's surface spelling (`+`,
+	/// `**`, `<`, …), both operand types (`rhs` is `None` for a unary operator),
+	/// and the interface implementing it, so the fix is obvious instead of
+	/// leaking an internal method name. New variant appended at the enum's end
+	/// (mints 2061; `NonExhaustiveUInt` above kept its existing 2060).
+	OperatorNotImplemented {
+		operator: EcoString,
+		lhs: String,
+		rhs: Option<String>,
+		interface: EcoString,
+	},
 }
 
 impl IntoDiagnostic for TypeError {
@@ -235,6 +265,28 @@ impl IntoDiagnostic for TypeError {
 			E::CannotInferOperandType => {
 				"cannot infer the operand type of this operator; add a type annotation".into()
 			}
+
+			E::NonExhaustiveUInt => {
+				"non-exhaustive match: some `uint` values are not covered — add a `_` arm".into()
+			}
+
+			E::OperatorNotImplemented {
+				operator,
+				lhs,
+				rhs,
+				interface,
+			} => match rhs {
+				Some(rhs) => format!(
+					"the `{operator}` operator is not implemented for `{lhs}` and `{rhs}`; implement \
+					 `{interface}` to support it"
+				)
+				.into(),
+				None => format!(
+					"the `{operator}` operator is not implemented for `{lhs}`; implement `{interface}` \
+					 to support it"
+				)
+				.into(),
+			},
 		}
 	}
 

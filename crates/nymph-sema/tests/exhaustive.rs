@@ -160,6 +160,65 @@ fn int_inclusive_range_plus_tails_is_exhaustive() {
 	);
 }
 
+// ── `uint` exhaustiveness (Bug 2): the unsigned mirror of the `int` checks
+// above — `TyKind::UInt` now gets its own interval check (`check_uint_match`)
+// instead of falling through to `check_catch_all`'s "add a `_` arm" demand.
+
+#[test]
+fn uint_match_without_wildcard_is_non_exhaustive() {
+	assert_error_contains(
+		"func f(n: uint): int = match (n) {
+		   0u -> 1,
+		   2u -> 2,
+		 }",
+		"non-exhaustive",
+	);
+}
+
+#[test]
+fn uint_ranges_can_be_exhaustive() {
+	// `0u` plus `1u..` together cover every `uint` value: the unsigned domain
+	// starts at `0`, so (unlike `int`) there is no negative tail to also cover.
+	assert_ok(
+		"func f(n: uint): int = match (n) {
+		   0u -> 0,
+		   1u.. -> 1,
+		 }",
+	);
+}
+
+#[test]
+fn uint_ranges_with_a_gap_are_non_exhaustive() {
+	// `0u` and `2u..` leave `1u` uncovered — the witness the diagnostic reports.
+	assert_error_contains(
+		"func f(n: uint): int = match (n) {
+		   0u -> 0,
+		   2u.. -> 2,
+		 }",
+		"non-exhaustive",
+	);
+}
+
+#[test]
+fn uint_inclusive_range_plus_tail_is_exhaustive() {
+	assert_ok(
+		"func f(n: uint): int = match (n) {
+		   0u..=9u -> 0,
+		   10u.. -> 1,
+		 }",
+	);
+}
+
+#[test]
+fn uint_match_with_wildcard_is_ok() {
+	assert_ok(
+		"func f(n: uint): int = match (n) {
+		   0u -> 0,
+		   _ -> 1,
+		 }",
+	);
+}
+
 const NEST: &str = "enum Inner { C, D }\nenum Outer { A(x: Inner), B }\n";
 
 #[test]
