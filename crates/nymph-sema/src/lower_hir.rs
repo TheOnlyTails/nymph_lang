@@ -201,6 +201,7 @@ fn lower_hir_impl(
 		current_materializing_enum: RefCell::new(Vec::new()),
 		pending_prelude_enum_methods: RefCell::new(FxHashMap::default()),
 		materialized_prelude_enum_methods: RefCell::new(FxHashMap::default()),
+		pending_prelude_struct_demands: RefCell::new(FxHashSet::default()),
 	};
 	lowerer.lower_module(module)
 }
@@ -409,6 +410,14 @@ struct Lowerer<'a> {
 	/// that discovered it, so the outer loop must notice the growth and run it
 	/// again).
 	materialized_prelude_enum_methods: RefCell<FxHashMap<EcoString, FxHashSet<EcoString>>>,
+	/// Prelude STRUCTS a method call dispatched `OntoClass` against (a method on a
+	/// prelude struct receiver — including an inherited interface default like an
+	/// adapter's `fold`). Unlike a `New`-constructed adapter (found by
+	/// `materialize_referenced_prelude_structs`'s body scan), a struct reached ONLY
+	/// through a method call leaves no `HirExpr::New` trace, so its demand is recorded
+	/// here and folded into that same fixed-point pass — otherwise the `recv.method(..)`
+	/// call would hit an unemitted class.
+	pending_prelude_struct_demands: RefCell<FxHashSet<EcoString>>,
 }
 
 /// Where a `DispatchKind::UserImplDefaultMethod` resolution's prelude-origin
@@ -1455,6 +1464,11 @@ impl<'a> Lowerer<'a> {
 					collect_variant_ref_enums(&m.body, &mut referenced);
 				}
 			}
+			// A prelude struct reached only through a method call (`OntoClass`) leaves no
+			// `New` for the body scan, so fold in the demand set the dispatch recorded.
+			for name in self.pending_prelude_struct_demands.borrow().iter() {
+				referenced.insert(name.clone());
+			}
 			let known: FxHashSet<&EcoString> = classes.iter().map(|c| &c.name).collect();
 			// `referenced` also holds enum names (shared scan) and mangled project-module
 			// names; `materialize_prelude_struct` returns `None` for anything that isn't a
@@ -1829,11 +1843,8 @@ impl<'a> Lowerer<'a> {
 		// An EMITTED dependency module's STRUCT method (an imported `Set`/
 		// `LinkedList`/`Tree`/`Complex`, direct member OR nested `impl Iface { .. }`):
 		// the struct's class is emitted by the driver on that module's own turn, so a
-		// call to its method lowers as an ordinary `recv.method(..)` call on that
-		// class — `OntoClass`, with NO materialization demand (the body is already
-		// emitted). Scanned over `emitted_dep_modules` ONLY, never the ambient `core`
-		// prelude: a `core` struct (`Range`/…) is not emitted, so it must keep the
-		// loud defer below.
+		// call to its method lowers as an ordinary `recv.method(..)` call on that class
+		// — `OntoClass`, with NO materialization demand (the body is already emitted).
 		for module in self.emitted_dep_modules {
 			for decl in &module.members {
 				if let Declaration::Struct { members, impls, .. } = decl {
@@ -1855,6 +1866,40 @@ impl<'a> Lowerer<'a> {
 							method: res.method.clone(),
 						});
 					}
+				}
+			}
+		}
+		// An ambient `core` prelude struct's method reached through a nested
+		// `impl Iface { .. }` block by the INTERFACE's span — i.e. an INHERITED interface
+		// DEFAULT the struct doesn't override (an iterator adapter's `fold`/`to_list`/
+		// `count`/`map` on `Mapped`). The struct's class is emitted on demand (task #24),
+		// and a default body is pure Nymph over the interface's surface (never the
+		// struct's own `external`/generic-operator members), so a plain `recv.method(..)`
+		// call is safe; record a demand so the class is materialized even when the struct
+		// is reached ONLY through this call (no `HirExpr::New` for the body scan to find).
+		// Restricted to a method the struct's impl does NOT itself provide as a member —
+		// i.e. a pure INHERITED default (`fold`/`to_list`/…), never an abstract interface
+		// method the struct implements with its OWN body. A struct's own body may
+		// transitively call an unlinked `external` (`Set::insert`) or use an erased-generic
+		// operator (`Range::contains`'s `this.start <= item`, ALSO reached through its
+		// interface span since `contains` is abstract in `RangeBounds`), neither of which
+		// is materializable — those keep the loud defer below.
+		for module in self.prelude_modules {
+			for decl in &module.members {
+				if let Declaration::Struct { name, impls, .. } = decl
+					&& impls.iter().any(|si| {
+						si.0.interface.0.1 == span
+							&& !si.0.members.iter().any(
+								|m| matches!(&m.0, ImplMember::Func { meta, .. } if meta.name.0 == res.method),
+							)
+					}) {
+					self
+						.pending_prelude_struct_demands
+						.borrow_mut()
+						.insert(name.0.clone());
+					return Some(PreludeDispatch::OntoClass {
+						method: res.method.clone(),
+					});
 				}
 			}
 		}

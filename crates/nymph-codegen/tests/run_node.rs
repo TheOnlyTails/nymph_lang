@@ -3271,6 +3271,71 @@ func g(): #[uint] = {
 	assert_eq!(run_with_prelude(user, prelude, "g()"), "[ 0, 1, 2, 3 ]");
 }
 
+#[test]
+fn a_terminal_chained_onto_a_lazy_map_adapter_runs() {
+	// `c.map(f).to_list()` / `.count()` — a draining terminal called on a `Mapped`
+	// adapter TEMPORARY (a demand-materialized core prelude struct). The terminal is an
+	// inherited `Iterator` default on `Mapped`; dispatching it as a plain call on the
+	// materialized adapter class (rather than a loud "prelude-only impl" defer) is the
+	// chaining payoff. `map(n -> n*n)` over 0..4 → to_list [0,1,4,9]; `.count()` → 4.
+	let prelude = r#"enum Option<T> {
+	Some(value: T),
+	None
+
+	func map<R>(f: (T) -> R): Option<R> = match (this) {
+		Some(value) -> Option.Some(value = f(value)),
+		None -> Option.None
+	}
+}
+struct Mapped<Item, R, S: Iterator<Item>>(source: S, f: (Item) -> R) {
+	impl Iterator<R> {
+		mut func next(): Option<R> = this.source.next().map(this.f)
+	}
+}
+interface Iterator<Item> {
+	mut func next(): Option<Item>
+
+	func map<R>(f: (Item) -> R): Mapped<Item, R, self> = Mapped(source = this, f = f)
+
+	mut func to_list(): #[Item] = {
+		let mut out: #[Item] = #[]
+		for (item in this) {
+			out.push(item)
+		}
+		out
+	}
+
+	mut func count(): uint = {
+		let mut n = 0u
+		for (item in this) {
+			n = n + 1u
+		}
+		n
+	}
+}"#;
+	let user = r#"struct Counter(current: uint, limit: uint) {
+	impl Iterator<uint> {
+		mut func next(): Option<uint> = if (this.current < this.limit) {
+			let value = this.current
+			this.current = this.current + 1u
+			Option.Some(value = value)
+		} else {
+			Option.None
+		}
+	}
+}
+func squares(): #[uint] = {
+	let mut c = Counter(current = 0u, limit = 4u)
+	c.map((n) -> n * n).to_list()
+}
+func how_many(): uint = {
+	let mut c = Counter(current = 0u, limit = 4u)
+	c.map((n) -> n * n).count()
+}"#;
+	assert_eq!(run_with_prelude(user, prelude, "squares()"), "[ 0, 1, 4, 9 ]");
+	assert_eq!(run_with_prelude(user, prelude, "how_many()"), "4");
+}
+
 // ── Positional sub-patterns on single-field constructors ─────────────────────
 
 #[test]
