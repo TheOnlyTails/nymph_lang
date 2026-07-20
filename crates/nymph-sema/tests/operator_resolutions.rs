@@ -755,7 +755,9 @@ fn unbounded_generic_negate_is_not_implemented() {
 		"expected exactly one error: {messages:?}"
 	);
 	assert!(
-		messages[0].contains("negate") && messages[0].contains("not implemented"),
+		messages[0].contains("`-` operator")
+			&& messages[0].contains("Negate")
+			&& messages[0].contains("not implemented"),
 		"unexpected message: {messages:?}"
 	);
 }
@@ -821,7 +823,9 @@ fn primitive_rhs_in_is_not_implemented() {
 		"expected exactly one error: {messages:?}"
 	);
 	assert!(
-		messages[0].contains("contains") && messages[0].contains("not implemented"),
+		messages[0].contains("`in` operator")
+			&& messages[0].contains("Contains")
+			&& messages[0].contains("not implemented"),
 		"unexpected message: {messages:?}"
 	);
 }
@@ -865,7 +869,9 @@ fn unwrap_with_no_impl_is_not_implemented() {
 		"expected exactly one error: {messages:?}"
 	);
 	assert!(
-		messages[0].contains("unwrap") && messages[0].contains("not implemented"),
+		messages[0].contains("`??` operator")
+			&& messages[0].contains("Unwrap")
+			&& messages[0].contains("not implemented"),
 		"unexpected message: {messages:?}"
 	);
 }
@@ -1197,4 +1203,179 @@ fn boolean_bitwise_operators_dispatch_to_the_prelude_not_native_js() {
 			"boolean `{method}` must not compile to a native JS operator ({src:?})"
 		);
 	}
+}
+
+// ---- Mixed int <-> uint operators (int<->uint slice) ----
+// The stdlib declares cross-type operator impls between `int` and `uint` in BOTH
+// directions. `binary_resolution_for_prelude` asserts the program type-checks
+// cleanly against the real `ops` prelude — so the func's return annotation pins the
+// Output type (an arithmetic result annotated `int`, division `float`, comparison /
+// equality `boolean`; a wrong Output would fail to unify and panic the helper) — and
+// returns the recorded `Resolution`. Every mixed primitive operator still lowers
+// `BuiltinEager` (a native JS operator), exactly like the pre-existing `int`/`float`
+// mixed pair.
+
+#[test]
+fn mixed_int_plus_uint_resolves_to_int() {
+	let res = binary_resolution_for_prelude("func f(a: int, b: uint): int = a + b", "f");
+	assert_eq!(res.method, "plus");
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+}
+
+#[test]
+fn mixed_uint_plus_int_resolves_to_int() {
+	let res = binary_resolution_for_prelude("func f(a: uint, b: int): int = a + b", "f");
+	assert_eq!(res.method, "plus");
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+}
+
+#[test]
+fn mixed_int_minus_uint_resolves_to_int() {
+	let res = binary_resolution_for_prelude("func f(a: int, b: uint): int = a - b", "f");
+	assert_eq!(res.method, "minus");
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+}
+
+#[test]
+fn mixed_int_times_uint_resolves_to_int() {
+	let res = binary_resolution_for_prelude("func f(a: int, b: uint): int = a * b", "f");
+	assert_eq!(res.method, "times");
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+}
+
+#[test]
+fn mixed_int_divide_uint_resolves_to_float() {
+	// Division is the one arithmetic operator whose Output is `float`, not `int` —
+	// the `: float` annotation would fail to unify if the cross impl said otherwise.
+	let res = binary_resolution_for_prelude("func f(a: int, b: uint): float = a / b", "f");
+	assert_eq!(res.method, "divide");
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+}
+
+#[test]
+fn mixed_int_remainder_uint_resolves_to_int() {
+	let res = binary_resolution_for_prelude("func f(a: int, b: uint): int = a % b", "f");
+	assert_eq!(res.method, "remainder");
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+}
+
+#[test]
+fn mixed_int_comparison_uint_resolves_to_boolean() {
+	// `<` (and its siblings) desugar through `Comparable`; a mixed primitive
+	// comparison still lowers to a native JS operator (`BuiltinEager`).
+	for src in [
+		"func f(a: int, b: uint): boolean = a < b",
+		"func f(a: int, b: uint): boolean = a <= b",
+		"func f(a: uint, b: int): boolean = a > b",
+		"func f(a: uint, b: int): boolean = a >= b",
+	] {
+		let res = binary_resolution_for_prelude(src, "f");
+		assert_eq!(res.dispatch, DispatchKind::BuiltinEager, "for {src:?}");
+	}
+}
+
+#[test]
+fn mixed_int_equality_uint_resolves_to_boolean() {
+	for src in [
+		"func f(a: int, b: uint): boolean = a == b",
+		"func f(a: int, b: uint): boolean = a != b",
+		"func f(a: uint, b: int): boolean = a == b",
+	] {
+		let res = binary_resolution_for_prelude(src, "f");
+		assert_eq!(res.dispatch, DispatchKind::BuiltinEager, "for {src:?}");
+	}
+}
+
+// ---- The ambiguity regression this slice must NOT reintroduce ----
+// Adding a cross-type `Plus<Other = uint> for int` alongside the same-type
+// `Plus<Other = self> for int` must NOT make a literal-argument call ambiguous: the
+// `int` literal `2` matches the same-type impl exactly, so it wins over the uint
+// impl (which only matches via widening). Both helpers assert zero diagnostics, so an
+// `AmbiguousCall` here would fail the test.
+
+#[test]
+fn int_plus_int_literal_method_call_stays_unambiguous() {
+	let res = resolution_for_prelude("func f(a: int): int = a.plus(2)", "f");
+	assert_eq!(res.method, "plus");
+}
+
+#[test]
+fn int_plus_int_literal_infix_stays_unambiguous() {
+	let res = binary_resolution_for_prelude("func f(a: int): int = a + 2", "f");
+	assert_eq!(res.method, "plus");
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+}
+
+#[test]
+fn int_comparison_int_literal_stays_unambiguous() {
+	let res = binary_resolution_for_prelude("func f(a: int): boolean = a < 2", "f");
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+}
+
+#[test]
+fn int_equals_int_value_still_resolves() {
+	// Same-type `==` on two `int` VALUES (not literals): the cross-type
+	// `Equals<Other = uint> for int` matches the receiver but not an `int` argument,
+	// so resolution must fall back to the blanket `Equals<Other = self>` rather than
+	// committing the cross impl and mismatching the argument.
+	let res = binary_resolution_for_prelude("func f(a: int, b: int): boolean = a == b", "f");
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+}
+
+// ---- Operator-resolution-failure diagnostic (#7) ----
+// When an operator has no impl for its operands, the diagnostic names the operator
+// symbol, BOTH operands, and the interface to implement — not the internal desugared
+// method name and only the receiver type.
+
+#[test]
+fn missing_binary_operator_names_operator_operands_and_interface() {
+	let parsed = parse_module(
+		"struct A(n: int)\n struct B(n: int)\n func f(a: A, b: B): float = a ** b",
+		"test",
+	);
+	assert!(
+		!parsed.diagnostics.iter().any(|d| d.is_error()),
+		"parse failed"
+	);
+	let checked = check_module(&parsed.tree);
+	let messages: Vec<_> = checked
+		.diags
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert_eq!(
+		messages.len(),
+		1,
+		"expected exactly one error: {messages:?}"
+	);
+	assert_eq!(
+		messages[0],
+		"the `**` operator is not implemented for `A` and `B`; implement `Power` to support it"
+	);
+}
+
+#[test]
+fn missing_unary_operator_names_operator_operand_and_interface() {
+	let parsed = parse_module("struct A(n: int)\n func f(a: A): A = -a", "test");
+	assert!(
+		!parsed.diagnostics.iter().any(|d| d.is_error()),
+		"parse failed"
+	);
+	let checked = check_module(&parsed.tree);
+	let messages: Vec<_> = checked
+		.diags
+		.iter()
+		.filter(|d| d.is_error())
+		.map(|d| d.message.to_string())
+		.collect();
+	assert_eq!(
+		messages.len(),
+		1,
+		"expected exactly one error: {messages:?}"
+	);
+	assert_eq!(
+		messages[0],
+		"the `-` operator is not implemented for `A`; implement `Negate` to support it"
+	);
 }

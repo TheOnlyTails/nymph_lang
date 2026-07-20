@@ -63,6 +63,8 @@ impl Checker<'_> {
 			TyKind::Infer(_) | TyKind::Error => {}
 			// `int`'s constructors are unbounded; reason over integer intervals instead.
 			TyKind::Int => self.check_int_match(arms, span),
+			// `uint` is the same interval reasoning over the unsigned domain [0, u64::MAX].
+			TyKind::UInt => self.check_uint_match(arms, span),
 			// Structural types have finite constructor signatures the algorithm enumerates.
 			TyKind::Boolean | TyKind::Tuple(_) => self.usefulness_check(scrutinee, arms, span),
 			TyKind::Adt(def, _)
@@ -556,6 +558,22 @@ impl Checker<'_> {
 		}
 	}
 
+	fn check_uint_match(&mut self, arms: &[MatchArm], span: Span) {
+		let mut ranges: Vec<(u64, u64)> = Vec::new();
+		for arm in arms {
+			if arm.guard.is_some() {
+				continue;
+			}
+			match uint_cover(&arm.pattern.0) {
+				UIntCover::All => return,
+				UIntCover::Ranges(rs) => ranges.extend(rs),
+			}
+		}
+		if !covers_full_uint_range(ranges) {
+			self.emit(span, TypeError::NonExhaustiveUInt);
+		}
+	}
+
 	fn check_catch_all(&mut self, arms: &[MatchArm], span: Span) {
 		let mut has_catch_all = false;
 		for arm in arms {
@@ -683,6 +701,82 @@ fn covers_full_int_range(mut ranges: Vec<(i64, i64)>) -> bool {
 		reach = reach.max(hi);
 	}
 	reach == i64::MAX
+}
+
+/// What a `uint` pattern covers on the unsigned `u64` line — the `int` machinery's
+/// counterpart over the `[0, u64::MAX]` domain. A `uint` match arm must use
+/// `u`-suffixed literals (`0u`, `1u..`); a plain `int` literal against a `uint`
+/// scrutinee is a separate "mismatched types" error from pattern inference, so
+/// `uint_cover`/`uint_lit` key on `Pattern::UInt` only.
+enum UIntCover {
+	All,
+	Ranges(Vec<(u64, u64)>),
+}
+
+fn uint_cover(pattern: &Pattern) -> UIntCover {
+	match pattern {
+		Pattern::Placeholder => UIntCover::All,
+		Pattern::Binding { inner, .. } => uint_cover(&inner.0),
+		Pattern::Grouped(inner) => uint_cover(&inner.0),
+		Pattern::Union(a, b) => match (uint_cover(&a.0), uint_cover(&b.0)) {
+			(UIntCover::All, _) | (_, UIntCover::All) => UIntCover::All,
+			(UIntCover::Ranges(mut x), UIntCover::Ranges(y)) => {
+				x.extend(y);
+				UIntCover::Ranges(x)
+			}
+		},
+		Pattern::UInt(n) => UIntCover::Ranges(vec![(n.0, n.0)]),
+		Pattern::Range(kind) => match uint_range_bounds(kind) {
+			Some((lo, hi)) if lo <= hi => UIntCover::Ranges(vec![(lo, hi)]),
+			_ => UIntCover::Ranges(Vec::new()),
+		},
+		_ => UIntCover::Ranges(Vec::new()),
+	}
+}
+
+fn uint_range_bounds(kind: &RangePatternKind) -> Option<(u64, u64)> {
+	match kind {
+		RangePatternKind::From(min) => Some((uint_lit(&min.0)?, u64::MAX)),
+		// `..max` / `min..max` are half-open: a `checked_sub` underflows to `None` when
+		// `max` is `0` (`..0u` covers nothing), rather than wrapping around the domain.
+		RangePatternKind::To(max) => Some((0, uint_lit(&max.0)?.checked_sub(1)?)),
+		RangePatternKind::ToInclusive(max) => Some((0, uint_lit(&max.0)?)),
+		RangePatternKind::Exclusive { min, max } => {
+			Some((uint_lit(&min.0)?, uint_lit(&max.0)?.checked_sub(1)?))
+		}
+		RangePatternKind::Inclusive { min, max } => Some((uint_lit(&min.0)?, uint_lit(&max.0)?)),
+	}
+}
+
+fn uint_lit(pattern: &Pattern) -> Option<u64> {
+	match pattern {
+		Pattern::UInt(n) => Some(n.0),
+		Pattern::Grouped(inner) => uint_lit(&inner.0),
+		_ => None,
+	}
+}
+
+fn covers_full_uint_range(mut ranges: Vec<(u64, u64)>) -> bool {
+	ranges.retain(|&(lo, hi)| lo <= hi);
+	ranges.sort_by_key(|&(lo, _)| lo);
+	let Some(&(first_lo, first_hi)) = ranges.first() else {
+		return false;
+	};
+	if first_lo > 0 {
+		return false;
+	}
+	let mut reach = first_hi;
+	for &(lo, hi) in &ranges[1..] {
+		// Short-circuit BEFORE `reach + 1`, which would overflow at `u64::MAX`.
+		if reach == u64::MAX {
+			return true;
+		}
+		if lo > reach + 1 {
+			return false;
+		}
+		reach = reach.max(hi);
+	}
+	reach == u64::MAX
 }
 
 fn is_irrefutable(pattern: &Pattern) -> bool {

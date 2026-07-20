@@ -51,16 +51,29 @@ impl Checker<'_> {
 	}
 
 	/// Trial version of [`Checker::unify_arg`] for overload selection (non-emitting).
-	pub(crate) fn try_unify_arg(&mut self, param: Ty, arg: Ty, is_int_literal: bool) -> bool {
+	/// On success also reports whether the match required `int`-literal widening
+	/// (`int` literal → `float`/`uint`) rather than an exact-type unification. Overload
+	/// phase 2 uses this to prefer an exact-type
+	/// argument match over a widened one, so a same-type operator impl
+	/// (`Plus<Other = int> for int`) beats a cross-type sibling
+	/// (`Plus<Other = uint> for int`) for an `int`-literal argument instead of the two
+	/// tying into an `AmbiguousCall`. Returns `None` on unification failure, `Some(true)`
+	/// when at least one widening step was taken, `Some(false)` for an exact match.
+	pub(crate) fn try_unify_arg_widened(
+		&mut self,
+		param: Ty,
+		arg: Ty,
+		is_int_literal: bool,
+	) -> Option<bool> {
 		if is_int_literal && self.int_literal_fits_param(param, arg) {
-			return true;
+			return Some(true);
 		}
 		let param_r = self.shallow_resolve(param);
 		let arg_r = self.shallow_resolve(arg);
 		match (self.interner.kind(param_r), self.interner.kind(arg_r)) {
-			(&TyKind::Mut(p), &TyKind::Mut(a)) => self.try_unify_arg(p, a, is_int_literal),
-			(_, &TyKind::Mut(a)) => self.try_unify_arg(param, a, is_int_literal),
-			_ => self.try_unify(param, arg),
+			(&TyKind::Mut(p), &TyKind::Mut(a)) => self.try_unify_arg_widened(p, a, is_int_literal),
+			(_, &TyKind::Mut(a)) => self.try_unify_arg_widened(param, a, is_int_literal),
+			_ => self.try_unify(param, arg).then_some(false),
 		}
 	}
 

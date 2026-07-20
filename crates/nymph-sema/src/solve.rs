@@ -618,29 +618,50 @@ impl Checker<'_> {
 			return None;
 		}
 
-		let chosen = self.most_specific(&receiver_matches);
-		if chosen.len() == 1 {
+		// The overwhelmingly common case: exactly one impl matches the receiver, so
+		// commit it directly without argument disambiguation.
+		if receiver_matches.len() == 1 {
 			self.gate_mutating(
-				self.impls.impls[chosen[0]].interface,
+				self.impls.impls[receiver_matches[0]].interface,
 				name,
 				recv_is_mut,
 				span,
 			);
-			return Some(self.commit_method(chosen[0], recv, name, arg_tys, arg_lits, span));
+			return Some(self.commit_method(receiver_matches[0], recv, name, arg_tys, arg_lits, span));
 		}
 
-		// Phase 2: several impls share the receiver — disambiguate by argument types.
-		let mut arg_matches: Vec<usize> = Vec::new();
-		for &idx in &chosen {
+		// Phase 2: several impls share the receiver — disambiguate by argument types over
+		// the FULL receiver-match set (not `most_specific`'d first), so a blanket impl
+		// stays reachable when a concrete sibling matches the receiver but does not
+		// actually fit the arguments — e.g. `intVal.equals(intVal)` must fall to the
+		// blanket `Equals<Other = self>` rather than committing the cross-type
+		// `Equals<Other = uint> for int` and then mismatching the `int` argument.
+		// Each surviving candidate is tagged with whether it matched only via
+		// `int`-literal widening (`int` literal → `uint`/`float`); an exact-type match is
+		// strictly more specific, so if any candidate matches exactly, the widened ones
+		// are dropped, and `most_specific` (concrete over blanket) breaks any remaining
+		// tie. This keeps `a.plus(2)` (a: int) resolving to `Plus<Other = int> for int`
+		// rather than tying with the cross-type `Plus<Other = uint> for int`, and
+		// generalises the pre-existing `int`/`float` operator overload pair the same way.
+		let mut arg_matches: Vec<(usize, bool)> = Vec::new();
+		for &idx in &receiver_matches {
 			let snapshot = self.table.snapshot();
-			let matched = self
-				.try_method(idx, recv, recv_is_mut, name, arg_tys, arg_lits)
-				.is_some();
+			let matched = self.try_method(idx, recv, recv_is_mut, name, arg_tys, arg_lits);
 			self.table.rollback_to(snapshot);
-			if matched {
-				arg_matches.push(idx);
+			if let Some((_, widened)) = matched {
+				arg_matches.push((idx, widened));
 			}
 		}
+		let exact: Vec<usize> = arg_matches
+			.iter()
+			.filter(|(_, widened)| !widened)
+			.map(|(idx, _)| *idx)
+			.collect();
+		let arg_matches: Vec<usize> = if exact.is_empty() {
+			arg_matches.iter().map(|(idx, _)| *idx).collect()
+		} else {
+			exact
+		};
 		let chosen = self.most_specific(&arg_matches);
 		match chosen.len() {
 			0 => {
@@ -728,6 +749,10 @@ impl Checker<'_> {
 	}
 
 	/// Trial (arg-aware): does impl `idx` provide `name` applicable to `recv(args)`?
+	/// On success returns `(return type, widened)`, where `widened` is true iff any
+	/// argument matched only via `int`-literal widening (see
+	/// [`Checker::try_unify_arg_widened`]) rather than an exact-type unification —
+	/// phase 2 uses it to prefer exact matches over widened ones.
 	fn try_method(
 		&mut self,
 		idx: usize,
@@ -736,7 +761,7 @@ impl Checker<'_> {
 		name: &str,
 		arg_tys: &[Ty],
 		arg_lits: &[bool],
-	) -> Option<Ty> {
+	) -> Option<(Ty, bool)> {
 		let def = self.impls.impls[idx].clone();
 		let subst = self.fresh_subst(def.generics.len());
 		let impl_self = self.subst(def.self_ty, &subst, None);
@@ -749,12 +774,14 @@ impl Checker<'_> {
 		if params.len() != arg_tys.len() {
 			return None;
 		}
+		let mut widened = false;
 		for (i, (param, arg)) in params.iter().zip(arg_tys).enumerate() {
-			if !self.try_unify_arg(*param, *arg, arg_lits.get(i).copied().unwrap_or(false)) {
-				return None;
+			match self.try_unify_arg_widened(*param, *arg, arg_lits.get(i).copied().unwrap_or(false)) {
+				Some(w) => widened |= w,
+				None => return None,
 			}
 		}
-		Some(ret)
+		Some((ret, widened))
 	}
 
 	/// Commit a chosen impl for real: unify the receiver, then check each argument

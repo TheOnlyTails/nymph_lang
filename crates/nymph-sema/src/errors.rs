@@ -297,6 +297,24 @@ pub enum TypeError {
 	/// inference variable that let the body typecheck against garbage, only to
 	/// panic in lowering. New variant appended at the enum's end (mints 2059).
 	NotIterable { ty: String },
+
+	/// A `match` over `uint` leaves some values uncovered — the unsigned-domain
+	/// counterpart of [`TypeError::NonExhaustiveInt`], worded for `uint` so the
+	/// message never claims the gap is in `int` values. New variant appended at the
+	/// enum's end (mints 2060).
+	NonExhaustiveUInt,
+
+	/// An operator has no implementation for its operand type(s). The user-facing
+	/// counterpart of [`TypeError::NotImplemented`] for operator syntax: names the
+	/// operator symbol, both operands, and the interface to implement — rather than
+	/// leaking the internal desugared method name and only one operand type. `rhs` is
+	/// `None` for a unary operator. New variant appended at the enum's end (mints 2061).
+	OperatorNotImplemented {
+		operator: EcoString,
+		interface: EcoString,
+		lhs: String,
+		rhs: Option<String>,
+	},
 }
 
 impl IntoDiagnostic for TypeError {
@@ -348,6 +366,23 @@ impl IntoDiagnostic for TypeError {
 			E::NotImplemented { method, ty } => {
 				format!("`{method}` is not implemented for `{ty}`").into()
 			}
+			E::OperatorNotImplemented {
+				operator,
+				interface,
+				lhs,
+				rhs,
+			} => match rhs {
+				Some(rhs) => format!(
+					"the `{operator}` operator is not implemented for `{lhs}` and `{rhs}`; \
+					 implement `{interface}` to support it"
+				)
+				.into(),
+				None => format!(
+					"the `{operator}` operator is not implemented for `{lhs}`; \
+					 implement `{interface}` to support it"
+				)
+				.into(),
+			},
 			E::CannotCast { from, to } => {
 				format!("cannot cast `{from}` to `{to}`: no `Into` implementation").into()
 			}
@@ -388,6 +423,9 @@ impl IntoDiagnostic for TypeError {
 			}
 			E::NonExhaustiveInt => {
 				"non-exhaustive match: some `int` values are not covered — add a `_` arm".into()
+			}
+			E::NonExhaustiveUInt => {
+				"non-exhaustive match: some `uint` values are not covered — add a `_` arm".into()
 			}
 			E::NonExhaustiveNeedsWildcard => {
 				"non-exhaustive match: add a `_` arm to cover the remaining cases".into()

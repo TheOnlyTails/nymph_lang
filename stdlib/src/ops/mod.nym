@@ -189,6 +189,64 @@ impl Remainder<Other = int, Output = int> for int {
   external func remainder(other: int): int
 }
 
+// --- Mixed int <-> uint operators (both directions) ---
+// Arithmetic yields the wider signed domain `int` (a mixed result can be
+// negative, e.g. `(2 as int) - (5 as uint)`); division yields `float`;
+// comparison/equality yield `boolean`. Same-type `uint` operators are handled
+// by the native fast path, so only the cross-type pairs are declared here.
+// Like the other primitive operator impls these lower to native JS operators
+// (the `external` bodies are never emitted). An `int`-literal argument still
+// resolves to the same-type impl via the resolver's exact-over-widened
+// preference, so `a.plus(2)` stays unambiguous.
+impl Plus<Other = uint, Output = int> for int {
+  external func plus(other: uint): int
+}
+impl Plus<Other = int, Output = int> for uint {
+  external func plus(other: int): int
+}
+
+impl Minus<Other = uint, Output = int> for int {
+  external(minus) func minus(other: uint): int
+}
+impl Minus<Other = int, Output = int> for uint {
+  external(minus) func minus(other: int): int
+}
+
+impl Times<Other = uint, Output = int> for int {
+  external func times(other: uint): int
+}
+impl Times<Other = int, Output = int> for uint {
+  external func times(other: int): int
+}
+
+impl Divide<Other = uint, Output = float> for int {
+  external(divide) func divide(other: uint): float
+}
+impl Divide<Other = int, Output = float> for uint {
+  external(divide) func divide(other: int): float
+}
+
+impl Remainder<Other = uint, Output = int> for int {
+  external func remainder(other: uint): int
+}
+impl Remainder<Other = int, Output = int> for uint {
+  external func remainder(other: int): int
+}
+
+impl Comparable<Other = uint> for int {
+  external(compare_to_int) func compare_to(other: uint): Order
+}
+impl Comparable<Other = int> for uint {
+  external(compare_to_int) func compare_to(other: int): Order
+}
+
+impl Equals<Other = uint> for int {
+  external(equals) func equals(other: uint): boolean
+}
+impl Equals<Other = int> for uint {
+  external(equals) func equals(other: int): boolean
+}
+
 // Power for uint -> float (no negative bases, but fractional results possible)
 impl Power<Other = uint, Output = float> for uint {
   external func power(other: uint): float

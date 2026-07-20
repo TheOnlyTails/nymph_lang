@@ -2676,6 +2676,31 @@ fn real_list_push_materializes_once_push_is_linked() {
 	);
 }
 
+#[test]
+fn mixed_int_uint_operators_run_under_node() {
+	// End-to-end for the int<->uint operator slice: mixed operators type-check
+	// against the real stdlib's cross-type impls and execute as native JS. Notably
+	// the arithmetic Output is the signed `int` domain (so `sub` can go negative) and
+	// division is `float` (`7 / 2 == 3.5`, not integer). Since every mixed primitive
+	// operator lowers `BuiltinEager`, the emitted body is a plain native operator.
+	let src = "\
+		func add(a: int, b: uint): int = a + b\n\
+		func sub(a: int, b: uint): int = a - b\n\
+		func mul(a: int, b: uint): int = a * b\n\
+		func div(a: int, b: uint): float = a / b\n\
+		func lt(a: int, b: uint): boolean = a < b\n\
+		func eq(a: int, b: uint): boolean = a == b\n\
+		func ne(a: int, b: uint): boolean = a != b";
+	let js = compile_against_real_stdlib(src);
+	assert_eq!(run_js(js.clone(), "add(3, 2)"), "5");
+	assert_eq!(run_js(js.clone(), "sub(2, 5)"), "-3");
+	assert_eq!(run_js(js.clone(), "mul(4, 3)"), "12");
+	assert_eq!(run_js(js.clone(), "div(7, 2)"), "3.5");
+	assert_eq!(run_js(js.clone(), "lt(3, 5)"), "true");
+	assert_eq!(run_js(js.clone(), "eq(4, 4)"), "true");
+	assert_eq!(run_js(js, "ne(4, 5)"), "true");
+}
+
 // FLIP (Gap 3, L0): `is_empty` (`this.length() == 0`) is real Nymph source,
 // not `external` itself — it used to stay a loud defer because the method it
 // transitively calls, `length`, WAS `external` with no JS binding anywhere

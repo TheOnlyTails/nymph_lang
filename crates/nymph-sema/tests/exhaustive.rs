@@ -160,6 +160,81 @@ fn int_inclusive_range_plus_tails_is_exhaustive() {
 	);
 }
 
+#[test]
+fn uint_match_without_wildcard_is_non_exhaustive() {
+	assert_error_contains(
+		"func f(n: uint): int = match (n) {
+		   0u -> 0,
+		   1u -> 1,
+		 }",
+		"non-exhaustive",
+	);
+}
+
+#[test]
+fn uint_match_with_wildcard_is_ok() {
+	assert_ok(
+		"func f(n: uint): int = match (n) {
+		   0u -> 0,
+		   _ -> 1,
+		 }",
+	);
+}
+
+#[test]
+fn uint_ranges_can_be_exhaustive() {
+	// `0u` and `1u..` (≥1) together cover every `uint` — there is nothing below 0,
+	// so unlike `int` no negative tail is needed. This is the case that spuriously
+	// demanded a `_` arm before `uint` got its own interval reasoning.
+	assert_ok(
+		"func f(n: uint): int = match (n) {
+		   0u -> 0,
+		   1u.. -> 1,
+		 }",
+	);
+}
+
+#[test]
+fn uint_ranges_with_a_gap_are_non_exhaustive() {
+	// `0u` and `2u..` leave `1u` uncovered.
+	assert_error_contains(
+		"func f(n: uint): int = match (n) {
+		   0u -> 0,
+		   2u.. -> 2,
+		 }",
+		"non-exhaustive",
+	);
+}
+
+#[test]
+fn uint_inclusive_range_plus_tail_is_exhaustive() {
+	assert_ok(
+		"func f(n: uint): int = match (n) {
+		   0u..=9u -> 0,
+		   10u.. -> 1,
+		 }",
+	);
+}
+
+#[test]
+fn uint_non_exhaustive_message_names_uint_not_int() {
+	// A dedicated `NonExhaustiveUInt`: the message must say `uint`, never `int`.
+	let (errors, _) = diagnose(
+		"func f(n: uint): int = match (n) {
+		   0u -> 0,
+		   1u -> 1,
+		 }",
+	);
+	assert!(
+		errors.iter().any(|e| e.contains("uint")),
+		"expected a uint-worded non-exhaustive error, got: {errors:?}"
+	);
+	assert!(
+		!errors.iter().any(|e| e.contains("`int`")),
+		"the uint non-exhaustive message must not claim the gap is in `int`, got: {errors:?}"
+	);
+}
+
 const NEST: &str = "enum Inner { C, D }\nenum Outer { A(x: Inner), B }\n";
 
 #[test]
