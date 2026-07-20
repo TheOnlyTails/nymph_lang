@@ -1,0 +1,33 @@
+import std/io with (println)
+import std/fs with (read_file)
+
+/// Count how often each word appears in a document, then print the most common.
+func main() = {
+  // `read_file` is fallible (the file might not exist), so it returns a
+  // `Result<string, IoError>`. `??` collapses it to a plain string, using the
+  // fallback text when the read fails.
+  let text = read_file("poem.txt") ?? "the quick brown fox the lazy dog the fox the"
+
+  // Tally words into a `word -> count` map. `split` yields the words; we normalize
+  // each (trim + lowercase) and skip the empties.
+  let mut counts: #{string: int} = #{}
+  for (raw in text.split(" ")) {
+    let word = raw.trim().to_lower()
+    if (word.length() > 0u) {
+      counts.insert(word, (counts.get(word) ?? 0) + 1)
+    }
+  }
+
+  // Rank the entries by count (descending) and keep the top five. This is a lazy
+  // iterator pipeline: `sorted_by` and `take` compose without building throwaway
+  // intermediate lists — nothing runs until the `for` loop pulls values out.
+  let top = counts
+    .entries()
+    .sorted_by((a, b) -> b[1] - a[1])
+    .take(5)
+
+  println("most common words:")
+  for (#(word, count) in top) {
+    println("  ${count}  ${word}")
+  }
+}

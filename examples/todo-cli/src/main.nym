@@ -1,0 +1,109 @@
+import std/io with (println)
+import std/os with (args)
+
+/// One todo item.
+struct Task(id: int, title: string, done: boolean)
+
+/// The intent parsed out of the command line.
+enum Command {
+  Add(title: string),
+  Complete(id: int),
+  List,
+  Help,
+}
+
+/// Turn raw arguments into a `Command`, or explain why we couldn't. List patterns
+/// (`#["add", ...words]`) match the subcommand and split off the rest.
+func parse(argv: #[string]): Result<Command, string> = match (argv) {
+  #["add", ...words] -> if (words.length() == 0u) {
+    Error("`add` needs a title")
+  } else {
+    Ok(Command.Add(title = words.join(" ")))
+  },
+  #["done", id] -> match (id.to_int()) {
+    Some(value = n) -> Ok(Command.Complete(id = n)),
+    None -> Error("`done` needs a numeric id, got `${id}`"),
+  },
+  #["list"] -> Ok(Command.List),
+  #["help"] -> Ok(Command.Help),
+  #[] -> Ok(Command.Help),
+  #[other, ...] -> Error("unknown command `${other}` — try `help`"),
+}
+
+/// The app's state: a growing list of tasks and the next id to hand out.
+struct Store(tasks: mut #[Task], next_id: int)
+
+impl Store {
+  namespace func empty(): Store = Store(tasks = #[], next_id = 1)
+
+  mut func add(title: string): int = {
+    let id = this.next_id
+    this.tasks.push(Task(id = id, title = title, done = false))
+    this.next_id = this.next_id + 1
+    id
+  }
+
+  /// Mark a task done by rebuilding the list with that one task flipped.
+  mut func complete(id: int): Result<int, string> =
+    if (this.tasks.any((task) -> task.id == id)) {
+      this.tasks = this.tasks.map((task) ->
+        if (task.id == id) {
+          Task(id = task.id, title = task.title, done = true)
+        } else {
+          task
+        })
+      Ok(id)
+    } else {
+      Error("no task with id ${id}")
+    }
+
+  func render(): string =
+    if (this.tasks.length() == 0u) {
+      "no tasks yet — add one with `todo add <title>`"
+    } else {
+      this.tasks
+        .map((task) -> {
+          let mark = if (task.done) { "[x]" } else { "[ ]" }
+          "${mark} #${task.id} ${task.title}"
+        })
+        .join("\n")
+    }
+}
+
+func usage(): string =
+  "todo — a tiny task manager
+
+  todo add <title>   add a task
+  todo done <id>     mark a task complete
+  todo list          show all tasks
+  todo help          show this message"
+
+/// Run one parsed command against the store. Matched at the top level, so each
+/// `Command` variant is a plain (un-nested) pattern.
+func dispatch(command: Command, store: mut Store) = match (command) {
+  Add(title) -> {
+    let id = store.add(title)
+    println("added #${id}: ${title}")
+  },
+  Complete(id) -> match (store.complete(id)) {
+    Ok(value = done) -> println("completed #${done}"),
+    Error(error) -> println("error: ${error}"),
+  },
+  List -> println(store.render()),
+  Help -> println(usage()),
+}
+
+func main() = {
+  let mut store = Store.empty()
+
+  // Match the `Result` first, binding its own field, then dispatch the `Command`
+  // in a separate top-level match. Constructor patterns match fields by name, so
+  // this keeps every variant pattern un-nested.
+  match (parse(args())) {
+    Ok(value = command) -> dispatch(command, store),
+    Error(error) -> {
+      println("error: ${error}")
+      println(usage())
+    },
+  }
+}
