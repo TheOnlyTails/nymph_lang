@@ -523,7 +523,16 @@ impl Parser<'_> {
 				StrFragment::Interpolation(tokens) => {
 					let eoi = Span::new(fragment.1.end, fragment.1.end);
 					let mut sub = Parser::new(tokens, eoi);
+					// Continue THIS parser's node-id counter through the sub-parser and read
+					// it back, so an interpolated expression's node ids never collide with the
+					// surrounding tree's. A fresh `Parser` restarts `next_id` at 0, so without
+					// this an interpolated `${a + b}` and some unrelated node would share an id
+					// — and the second to be `record`ed would clobber the first's
+					// resolution/type (e.g. the operator's dispatch, lost at lowering as "no
+					// operator resolution recorded").
+					sub.next_id = self.next_id;
 					let expr = sub.parse_expr();
+					self.next_id = sub.next_id;
 					self.diagnostics.extend(sub.diagnostics);
 					parts.push(Spanned(StringPart::InterpolatedExpr(expr), fragment.1));
 				}

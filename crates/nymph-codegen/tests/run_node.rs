@@ -111,6 +111,26 @@ fn runs_arithmetic() {
 }
 
 #[test]
+fn runs_an_operator_inside_a_string_interpolation() {
+	// Regression: an interpolated expression used to be parsed by a FRESH sub-parser
+	// whose node ids restarted at 0, colliding with the surrounding tree's — so the
+	// operator's recorded dispatch was clobbered by whatever unrelated node shared its
+	// id, surfacing at lowering as "no operator resolution recorded". The interpolated
+	// `${a + b}` (and a call/closure inside one) must run.
+	let out = run(
+		"func f(a: int, b: int): string = \"sum=${a + b}\"",
+		"f(3, 4)",
+	);
+	assert_eq!(out, "sum=7");
+	let out2 = run(
+		"func apply(g: (int, int) -> int, a: int, b: int): int = g(a, b)\n\
+		 func f(): string = \"r=${apply((x: int, y: int) -> x + y, 3, 4)}\"",
+		"f()",
+	);
+	assert_eq!(out2, "r=7");
+}
+
+#[test]
 fn runs_a_block_with_bindings() {
 	let src = r#"
 		func compute(): int = {
