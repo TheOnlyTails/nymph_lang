@@ -3461,6 +3461,12 @@ func chained(): #[uint] = {
 	);
 }
 
+// NOTE: `#[T]` list iteration (`xs.iter().map(..).to_list()` via the `Iterable` impl on
+// `#[T]` + `ListIter`) can't be exercised here — `ListIter::next` calls the LINKED
+// `list.get` external, which the `run_with_prelude` harness (a hand-written prelude, no
+// stdlib linkage) doesn't provide. It is covered by `stdlib_check` (type-checks) and end
+// to end by the CLI against the real stdlib.
+
 // ── Positional sub-patterns on single-field constructors ─────────────────────
 
 #[test]

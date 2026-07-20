@@ -1,7 +1,32 @@
 import @/iter with (Iterator)
+import @/option with (Option)
 
 /// An object which is able to be iterated over, for example by a `for` loop, by turning it into
 /// an iterator.
 public interface Iterable<T> {
   func iter(): Iterator<T>
+}
+
+/// The iterator over a list `#[T]`: walks indices `0 .. length`, yielding each
+/// element in turn. Produced by [`Iterable::iter`] on a list, so the whole lazy
+/// adapter surface (`map`/`filter`/`fold`/…) composes over a plain list.
+struct ListIter<T>(items: #[T], index: uint) {
+  impl Iterator<T> {
+    mut func next(): Option<T> = {
+      // `get` is a linked external returning the INTRINSIC `Option` (a plain
+      // tagged object with no methods); re-wrap it into a Nymph `Option` so the
+      // adapters' `Option::map` etc. are available (the tags compare equal, both
+      // being `Symbol.for("Option.…")`). Past the end, `get` yields `None`.
+      let current = this.items.get(this.index)
+      this.index = this.index + 1u
+      match (current) {
+        Some(value) -> Option.Some(value = value),
+        None -> Option.None,
+      }
+    }
+  }
+}
+
+impl<T> Iterable<T> for #[T] {
+  func iter(): ListIter<T> = ListIter(items = this, index = 0u)
 }
