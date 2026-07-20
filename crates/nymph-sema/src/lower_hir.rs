@@ -45,7 +45,7 @@ type InterfaceTable<'m> =
 /// No prelude is fed — `interfaces_by_name` (below) sees only `module`'s own
 /// interfaces, exactly the pre-stdlib-materialization behavior.
 pub fn lower_hir(module: &Module, checked: &Checked) -> HirModule {
-	lower_hir_impl(module, &[], checked)
+	lower_hir_impl(module, &[], 0, checked)
 }
 
 /// Lower a checked module the SAME way [`check_module_with_prelude`]
@@ -88,15 +88,39 @@ pub fn lower_hir(module: &Module, checked: &Checked) -> HirModule {
 ///   markers, a blanket impl, a still-generic bound) keeps panicking loudly —
 ///   silent wrong JS is never an acceptable alternative to a loud deferral.
 pub fn lower_hir_with_prelude(module: &Module, prelude: &[Module], checked: &Checked) -> HirModule {
+	// No `dep_start` boundary: every prelude module is treated as ambient `core`
+	// (not an emitted dep), so a struct method still panics as before — the plain
+	// callers (tests, the LSP) never compile a multi-module project graph.
+	lower_hir_with_prelude_and_deps(module, prelude, prelude.len(), checked)
+}
+
+/// Like [`lower_hir_with_prelude`], but the `prelude` slice is `core ++ deps`
+/// where `dep_start` is the index the (emitted) dependency modules begin at.
+/// A dependency module's own class IS emitted (the project driver lowers+emits
+/// every module in the graph), so a call to a dep STRUCT's method lowers as an
+/// ordinary `recv.method(..)` call on that emitted class, rather than being
+/// materialized — unlike a `core` struct (`Range`/…), which is never emitted.
+pub fn lower_hir_with_prelude_and_deps(
+	module: &Module,
+	prelude: &[Module],
+	dep_start: usize,
+	checked: &Checked,
+) -> HirModule {
 	let offset_prelude: Vec<Module> = prelude
 		.iter()
 		.enumerate()
 		.map(|(index, p)| crate::prelude::offset_module(p, index))
 		.collect();
-	lower_hir_impl(module, &offset_prelude, checked)
+	let dep_start = dep_start.min(offset_prelude.len());
+	lower_hir_impl(module, &offset_prelude, dep_start, checked)
 }
 
-fn lower_hir_impl(module: &Module, prelude_modules: &[Module], checked: &Checked) -> HirModule {
+fn lower_hir_impl(
+	module: &Module,
+	prelude_modules: &[Module],
+	dep_start: usize,
+	checked: &Checked,
+) -> HirModule {
 	// A call whose callee names a struct is construction, not an ordinary call.
 	// Collect the module's struct names up front so `lower_expr` can dispatch on
 	// them. This mirrors the checker's own dispatch: `infer_call` treats *any*
@@ -162,6 +186,7 @@ fn lower_hir_impl(module: &Module, prelude_modules: &[Module], checked: &Checked
 		struct_names,
 		variant_fields,
 		prelude_modules,
+		emitted_dep_modules: &prelude_modules[dep_start..],
 		interfaces_by_name,
 		scopes: RefCell::new(Vec::new()),
 		rename_counters: RefCell::new(FxHashMap::default()),
@@ -198,6 +223,13 @@ struct Lowerer<'a> {
 	/// to locate the AST of a prelude-origin impl/interface-default/enum a
 	/// `DispatchKind::UserImplDefaultMethod`/`VariantRef` needs materialized.
 	prelude_modules: &'a [Module],
+	/// The subset of `prelude_modules` that are EMITTED dependency modules (a
+	/// project's imported `std/…`/`@/…` modules), as opposed to the ambient
+	/// `core` prelude (never emitted). A dep module's own class IS emitted by the
+	/// driver, so `try_materialize_prelude_dispatch` returns `OntoClass` (an
+	/// ordinary `recv.method(..)` call) for a dep STRUCT's method — a `core`
+	/// struct (`Range`/…) stays unmaterializable (`None`), as before.
+	emitted_dep_modules: &'a [Module],
 	/// Interface name → (its own generics, its member list) — `module`'s own
 	/// interfaces AND (stdlib body materialization slice, gap a) every
 	/// prelude module's, built once up front in `lower_hir_impl`. See that
@@ -1622,6 +1654,38 @@ impl<'a> Lowerer<'a> {
 						.any(|m| matches!(&m.0, ImplMember::Func { meta, .. } if meta.name.1 == span));
 					if hit {
 						return Some(self.demand_onto_class(enum_name.0.clone(), res.method.clone()));
+					}
+				}
+			}
+		}
+		// An EMITTED dependency module's STRUCT method (an imported `Set`/
+		// `LinkedList`/`Tree`/`Complex`, direct member OR nested `impl Iface { .. }`):
+		// the struct's class is emitted by the driver on that module's own turn, so a
+		// call to its method lowers as an ordinary `recv.method(..)` call on that
+		// class — `OntoClass`, with NO materialization demand (the body is already
+		// emitted). Scanned over `emitted_dep_modules` ONLY, never the ambient `core`
+		// prelude: a `core` struct (`Range`/…) is not emitted, so it must keep the
+		// loud defer below.
+		for module in self.emitted_dep_modules {
+			for decl in &module.members {
+				if let Declaration::Struct { members, impls, .. } = decl {
+					// A DIRECT member method (`mut func insert`) is resolved by its own
+					// name span; a method reached through a nested `impl Iface { .. }`
+					// block is resolved by the INTERFACE's span (mirrors the top-level
+					// `ImplFor` branch's `for_interface.0.1` match key), so accept either.
+					let hit = members
+						.iter()
+						.any(|m| matches!(&m.0, ImplMember::Func { meta, .. } if meta.name.1 == span))
+						|| impls.iter().any(|si| {
+							si.0.interface.0.1 == span
+								|| si.0.members.iter().any(
+									|m| matches!(&m.0, ImplMember::Func { meta, .. } if meta.name.1 == span),
+								)
+						});
+					if hit {
+						return Some(PreludeDispatch::OntoClass {
+							method: res.method.clone(),
+						});
 					}
 				}
 			}

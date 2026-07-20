@@ -496,7 +496,17 @@ impl Driver {
 			if has_errors {
 				continue;
 			}
-			let hir = nymph_sema::lower_hir_with_prelude(module, &prelude, &checked);
+			// `prelude` is `core_prelude() ++ transitive_deps` (see `prelude_slice`),
+			// so the ambient `core` modules occupy the leading `core_prelude().len()`
+			// slots and everything after is an EMITTED dependency module — a call to
+			// one of those dep structs' methods lowers as a real class-method call
+			// rather than a (struct-unsupported) materialization.
+			let hir = nymph_sema::lower_hir_with_prelude_and_deps(
+				module,
+				&prelude,
+				crate::prelude::core_prelude().len(),
+				&checked,
+			);
 			let body = nymph_codegen::emit(&hir);
 			module_sources.insert(key.clone(), self.wrap_module_js(key, &body));
 		}

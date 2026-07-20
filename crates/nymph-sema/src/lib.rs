@@ -39,7 +39,7 @@ mod unify;
 pub use annotate::{Annotations, Checked, DispatchKind, ExprInfo, IterMode, Resolution};
 pub use check::{check_module, check_module_entry, check_program};
 pub use errors::TypeError;
-pub use lower_hir::{lower_hir, lower_hir_with_prelude};
+pub use lower_hir::{lower_hir, lower_hir_with_prelude, lower_hir_with_prelude_and_deps};
 pub use nymph_hir::ids::{self, DefId, InferVar, ParamIdx};
 pub use nymph_hir::ty::{self, GenericArgs, Interner, Ty, TyKind};
 pub use prelude::{check_module_entry_with_prelude, check_module_with_prelude};
