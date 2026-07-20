@@ -3205,6 +3205,19 @@ fn a_lazy_map_adapter_over_a_generic_iterator_source_runs() {
 	assert_eq!(run_with_prelude(user, prelude, "f()"), "12");
 }
 
+#[test]
+fn a_default_map_method_on_the_ambient_iterator_interface_materializes_its_adapter_and_runs() {
+	// The user-facing directive shape: `map` is a DEFAULT method on the AMBIENT
+	// `Iterator` interface, returning a lazy `MapAdapter<Item, R, self>` that also lives
+	// in the prelude. Calling `c.map(f)` on a concrete `Counter` materializes the default
+	// body onto the emitted class — and the referenced `MapAdapter` struct, emitted
+	// nowhere in the user module, is demand-materialized from the prelude (its own `next`
+	// then chains through the generic source). 0,2,4,6 → sum 12.
+	let prelude = "enum Option<T> {\n\tSome(value: T),\n\tNone\n\n\tfunc map<R>(f: (T) -> R): Option<R> = match (this) {\n\t\tSome(value) -> Option.Some(value = f(value)),\n\t\tNone -> Option.None\n\t}\n}\nstruct MapAdapter<Item, R, S: Iterator<Item>>(source: S, f: (Item) -> R) {\n\timpl Iterator<R> {\n\t\tmut func next(): Option<R> = this.source.next().map(this.f)\n\t}\n}\ninterface Iterator<Item> {\n\tmut func next(): Option<Item>\n\n\tfunc map<R>(f: (Item) -> R): MapAdapter<Item, R, self> = MapAdapter(source = this, f = f)\n}";
+	let user = "struct Counter(current: uint, limit: uint) {\n\timpl Iterator<uint> {\n\t\tmut func next(): Option<uint> = if (this.current < this.limit) {\n\t\t\tlet value = this.current\n\t\t\tthis.current = this.current + 1u\n\t\t\tOption.Some(value = value)\n\t\t} else {\n\t\t\tOption.None\n\t\t}\n\t}\n}\nfunc f(): uint = {\n\tlet c = Counter(current = 0u, limit = 4u)\n\tlet mut doubled = c.map((n) -> n * 2u)\n\tlet mut total = 0u\n\tfor (x in doubled) {\n\t\ttotal = total + x\n\t}\n\ttotal\n}";
+	assert_eq!(run_with_prelude(user, prelude, "f()"), "12");
+}
+
 // ── Positional sub-patterns on single-field constructors ─────────────────────
 
 #[test]

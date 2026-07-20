@@ -880,6 +880,13 @@ impl<'a> Lowerer<'a> {
 		// on-demand from the prelude, to a fixed point (an enum's own methods,
 		// though none in `ops/mod.nym` today, could in principle reference
 		// another prelude enum).
+		// Gap (a)-for-structs (iterator adapters): an interface-default method
+		// materialized onto a user class may construct an ambient adapter struct
+		// (`c.map(f)` → `MapAdapter(source = this, f = f)`) whose class is emitted
+		// nowhere. Materialize referenced prelude structs FIRST, so an adapter method
+		// that reaches a prelude enum method (`Option::map`) records that demand before
+		// the enum pass below runs.
+		let classes = self.materialize_referenced_prelude_structs(classes, &lets, &funcs, &enums);
 		let enums = self.materialize_referenced_prelude_enums(enums, &lets, &funcs, &classes);
 
 		// Stdlib body materialization slice's missed case (core/std split
@@ -1408,6 +1415,126 @@ impl<'a> Lowerer<'a> {
 		Some(HirEnum {
 			name: name.clone(),
 			variants: lowered_variants,
+			methods,
+			statics,
+		})
+	}
+
+	/// Scan every already-lowered body (including the classes/enums materialized so
+	/// far) for a `HirExpr::New` constructing a struct this module doesn't already
+	/// emit a class for — an ambient iterator adapter (`MapAdapter`, `FilterAdapter`)
+	/// referenced from an interface-default method that was materialized onto a
+	/// concrete class (`c.map(f)` → `MapAdapter(source = this, f = f)`). A user
+	/// program never declares such a struct (it isn't theirs), so leaving it
+	/// unmaterialized compiles clean to a JS `ReferenceError` on the undefined class —
+	/// the same silent failure `materialize_referenced_prelude_enums` closes for
+	/// enums. Materialize each from the prelude to a fixed point (an adapter's own
+	/// method may construct another adapter).
+	fn materialize_referenced_prelude_structs(
+		&self,
+		mut classes: Vec<HirClass>,
+		lets: &[HirLet],
+		funcs: &[HirFunc],
+		enums: &[HirEnum],
+	) -> Vec<HirClass> {
+		loop {
+			let mut referenced = FxHashSet::default();
+			for l in lets {
+				collect_variant_ref_enums(&l.value, &mut referenced);
+			}
+			for f in funcs {
+				collect_variant_ref_enums(&f.body, &mut referenced);
+			}
+			for c in &classes {
+				for m in c.methods.iter().chain(&c.statics) {
+					collect_variant_ref_enums(&m.body, &mut referenced);
+				}
+			}
+			for e in enums {
+				for m in e.methods.iter().chain(&e.statics) {
+					collect_variant_ref_enums(&m.body, &mut referenced);
+				}
+			}
+			let known: FxHashSet<&EcoString> = classes.iter().map(|c| &c.name).collect();
+			// `referenced` also holds enum names (shared scan) and mangled project-module
+			// names; `materialize_prelude_struct` returns `None` for anything that isn't a
+			// plain prelude struct, so both are skipped.
+			let missing: Vec<EcoString> = referenced
+				.into_iter()
+				.filter(|name| !known.contains(name) && !name.starts_with('$'))
+				.collect();
+			if missing.is_empty() {
+				return classes;
+			}
+			let mut changed = false;
+			for name in missing {
+				if let Some(class) = self.materialize_prelude_struct(&name) {
+					classes.push(class);
+					changed = true;
+				}
+			}
+			if !changed {
+				return classes;
+			}
+		}
+	}
+
+	/// Locate `name` among `self.prelude_modules`' top-level `struct` declarations and
+	/// lower it into a `HirClass` exactly like `lower_module`'s own
+	/// `Declaration::Struct` arm — its inline members and nested `impl <Interface>
+	/// { .. }` blocks (an adapter's `impl Iterator<R> { mut func next() = .. }`),
+	/// eagerly (all methods, `demand: None`): unlike a prelude ENUM, an adapter struct
+	/// has no still-generic `T.default()`-style method that can't be compiled, so there
+	/// is nothing to demand-gate. `materializing_onto_class` is bumped while lowering the
+	/// methods so an inner `this.method()` call resolves as a plain class-method call,
+	/// and any prelude enum method it reaches (`Option::map` in
+	/// `this.source.next().map(this.f)`) records its own demand for the enum pass that
+	/// runs next. Returns `None` when `name` isn't a prelude struct.
+	fn materialize_prelude_struct(&self, name: &EcoString) -> Option<HirClass> {
+		let (generics, fields, members, impls) = self.prelude_modules.iter().find_map(|m| {
+			m.members.iter().find_map(|decl| match decl {
+				Declaration::Struct {
+					name: n,
+					generics,
+					fields,
+					members,
+					impls,
+					..
+				} if n.0 == *name => Some((
+					generics.as_slice(),
+					fields.as_slice(),
+					members.as_slice(),
+					impls.as_slice(),
+				)),
+				_ => None,
+			})
+		})?;
+
+		self
+			.materializing_onto_class
+			.set(self.materializing_onto_class.get() + 1);
+
+		let mut methods_by_type: FxHashMap<EcoString, Vec<HirMethod>> = FxHashMap::default();
+		let (methods, statics) = self.collect_adt_methods(
+			name,
+			generics,
+			members,
+			impls,
+			&self.interfaces_by_name,
+			&mut methods_by_type,
+			None,
+		);
+
+		self
+			.materializing_onto_class
+			.set(self.materializing_onto_class.get() - 1);
+
+		self.assert_no_duplicate_methods(name, &methods);
+		self.assert_no_duplicate_methods(name, &statics);
+
+		Some(HirClass {
+			name: name.clone(),
+			fields: fields.iter().map(|f| f.0.name.0.clone()).collect(),
 			methods,
 			statics,
 		})
@@ -4800,7 +4927,13 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 			collect_variant_ref_enums(recv, out);
 			collect_variant_ref_enums(key, out);
 		}
-		HirExpr::New { fields, .. } => {
+		HirExpr::New { class, fields } => {
+			// The constructed struct's own name is a type reference that may need
+			// prelude materialization (an ambient iterator adapter like `MapAdapter`,
+			// emitted nowhere until demanded) — surfaced here alongside enum names;
+			// the enum-materialization loop ignores any name that isn't a prelude enum,
+			// and `materialize_referenced_prelude_structs` picks up the struct ones.
+			out.insert(class.clone());
 			for (_, v) in fields {
 				collect_variant_ref_enums(v, out);
 			}
