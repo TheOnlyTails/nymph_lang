@@ -3,15 +3,25 @@ import @/option with (Option)
 /// The iterator surface: `next` advances the iterator, so it is a `mut func`
 /// (producing the next value mutates the iterator's own state).
 ///
-/// The adapter methods (`map`, …) are default methods, so every type that
-/// implements `next` inherits the whole lazy-iteration surface for free — the
-/// combinators are defined ONCE here, never per collection.
+/// The adapter methods (`map`, `filter`, …) are default methods, so every type
+/// that implements `next` inherits the whole lazy-iteration surface for free —
+/// the combinators are defined ONCE here, never per collection.
 public interface Iterator<Item> {
   mut func next(): Option<Item>
 
   /// Lazily transform each item with `f`. Returns a new iterator; nothing runs
   /// until the result is consumed (by a `for` loop or a terminal like `to_list`).
   func map<R>(f: (Item) -> R): Mapped<Item, R, self> = Mapped(source = this, f = f)
+
+  /// Lazily keep only the items for which `predicate` holds.
+  func filter(predicate: (Item) -> boolean): Filtered<Item, self> =
+    Filtered(source = this, predicate = predicate)
+
+  /// Lazily yield at most the first `n` items, then stop.
+  func take(n: uint): Take<Item, self> = Take(source = this, remaining = n)
+
+  /// Lazily skip the first `n` items, then yield the rest.
+  func drop(n: uint): Drop<Item, self> = Drop(source = this, remaining = n)
 
   /// Run `f` for its side effect on every remaining item, draining the iterator.
   mut func for_each(f: (Item) -> void): void = {
@@ -53,5 +63,57 @@ public interface Iterator<Item> {
 struct Mapped<Item, R, S: Iterator<Item>>(source: S, f: (Item) -> R) {
   impl Iterator<R> {
     mut func next(): Option<R> = this.source.next().map(this.f)
+  }
+}
+
+/// The lazy adapter behind [`Iterator::filter`]: advances the source until it
+/// finds an item satisfying `predicate` (or the source is exhausted).
+struct Filtered<Item, S: Iterator<Item>>(source: S, predicate: (Item) -> boolean) {
+  impl Iterator<Item> {
+    mut func next(): Option<Item> = {
+      // `this.predicate(x)` would parse as a method call named `predicate`; bind the
+      // closure field to a local so it is called as an ordinary function value.
+      let keep = this.predicate
+      let mut found: Option<Item> = Option.None
+      let mut searching = true
+      while (searching) {
+        match (this.source.next()) {
+          Some(value) -> if (keep(value)) {
+            found = Option.Some(value = value)
+            searching = false
+          } else {},
+          None -> {
+            searching = false
+          },
+        }
+      }
+      found
+    }
+  }
+}
+
+/// The lazy adapter behind [`Iterator::take`]: yields at most `remaining` items.
+struct Take<Item, S: Iterator<Item>>(source: S, remaining: uint) {
+  impl Iterator<Item> {
+    mut func next(): Option<Item> = if (this.remaining > 0u) {
+      this.remaining = this.remaining - 1u
+      this.source.next()
+    } else {
+      Option.None
+    }
+  }
+}
+
+/// The lazy adapter behind [`Iterator::drop`]: discards the first `remaining`
+/// items on the first pull, then yields the rest.
+struct Drop<Item, S: Iterator<Item>>(source: S, remaining: uint) {
+  impl Iterator<Item> {
+    mut func next(): Option<Item> = {
+      while (this.remaining > 0u) {
+        this.remaining = this.remaining - 1u
+        this.source.next()
+      }
+      this.source.next()
+    }
   }
 }

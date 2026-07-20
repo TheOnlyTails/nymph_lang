@@ -3356,6 +3356,111 @@ func how_many(): uint = {
 	assert_eq!(run_with_prelude(user, prelude, "how_many()"), "4");
 }
 
+#[test]
+fn filter_take_drop_adapters_chain_and_run() {
+	// `filter` (a `while`-looping adapter calling a closure FIELD), `take`, and `drop`
+	// as ambient `Iterator` defaults, chained with `map`: 0..20 → evens → ×10 → first 4.
+	let prelude = r#"enum Option<T> {
+	Some(value: T),
+	None
+
+	func map<R>(f: (T) -> R): Option<R> = match (this) {
+		Some(value) -> Option.Some(value = f(value)),
+		None -> Option.None
+	}
+}
+struct Mapped<Item, R, S: Iterator<Item>>(source: S, f: (Item) -> R) {
+	impl Iterator<R> {
+		mut func next(): Option<R> = this.source.next().map(this.f)
+	}
+}
+struct Filtered<Item, S: Iterator<Item>>(source: S, predicate: (Item) -> boolean) {
+	impl Iterator<Item> {
+		mut func next(): Option<Item> = {
+			let keep = this.predicate
+			let mut found: Option<Item> = Option.None
+			let mut searching = true
+			while (searching) {
+				match (this.source.next()) {
+					Some(value) -> if (keep(value)) {
+						found = Option.Some(value = value)
+						searching = false
+					} else {},
+					None -> { searching = false },
+				}
+			}
+			found
+		}
+	}
+}
+struct Take<Item, S: Iterator<Item>>(source: S, remaining: uint) {
+	impl Iterator<Item> {
+		mut func next(): Option<Item> = if (this.remaining > 0u) {
+			this.remaining = this.remaining - 1u
+			this.source.next()
+		} else {
+			Option.None
+		}
+	}
+}
+struct Drop<Item, S: Iterator<Item>>(source: S, remaining: uint) {
+	impl Iterator<Item> {
+		mut func next(): Option<Item> = {
+			while (this.remaining > 0u) {
+				this.remaining = this.remaining - 1u
+				this.source.next()
+			}
+			this.source.next()
+		}
+	}
+}
+interface Iterator<Item> {
+	mut func next(): Option<Item>
+
+	func map<R>(f: (Item) -> R): Mapped<Item, R, self> = Mapped(source = this, f = f)
+	func filter(predicate: (Item) -> boolean): Filtered<Item, self> = Filtered(source = this, predicate = predicate)
+	func take(n: uint): Take<Item, self> = Take(source = this, remaining = n)
+	func drop(n: uint): Drop<Item, self> = Drop(source = this, remaining = n)
+
+	mut func to_list(): #[Item] = {
+		let mut out: #[Item] = #[]
+		for (item in this) {
+			out.push(item)
+		}
+		out
+	}
+}"#;
+	let user = r#"struct Counter(current: uint, limit: uint) {
+	impl Iterator<uint> {
+		mut func next(): Option<uint> = if (this.current < this.limit) {
+			let value = this.current
+			this.current = this.current + 1u
+			Option.Some(value = value)
+		} else {
+			Option.None
+		}
+	}
+}
+func evens(): #[uint] = {
+	let mut c = Counter(current = 0u, limit = 10u)
+	c.filter((n) -> n % 2u == 0u).to_list()
+}
+func dropped(): #[uint] = {
+	let mut c = Counter(current = 0u, limit = 10u)
+	c.drop(7u).to_list()
+}
+func chained(): #[uint] = {
+	let mut c = Counter(current = 0u, limit = 20u)
+	c.filter((n) -> n % 2u == 0u).map((n) -> n * 10u).take(4u).to_list()
+}"#;
+	assert_eq!(run_with_prelude(user, prelude, "evens()"), "[ 0, 2, 4, 6, 8 ]");
+	assert_eq!(run_with_prelude(user, prelude, "dropped()"), "[ 7, 8, 9 ]");
+	assert_eq!(
+		run_with_prelude(user, prelude, "chained()"),
+		"[ 0, 20, 40, 60 ]"
+	);
+}
+
 // ── Positional sub-patterns on single-field constructors ─────────────────────
 
 #[test]
