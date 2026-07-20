@@ -1,7 +1,3 @@
-import @/default with (Default)
-import @/collections/map
-import @/ops with (Contains)
-
 public struct Set<Item>(inner: #{Item: #()}) {
   /// Inserts an item into the set.
   /// Returns `true` if the set did not contain this item previously, and `false` if it did.

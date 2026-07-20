@@ -64,11 +64,11 @@ const CORE_SOURCES: &[(&str, &str)] = &[
 	),
 	("std/math", include_str!("../../../stdlib/src/math/mod.nym")),
 	// Methods on the built-in/primitive types are ambient too: `"…".length()`,
-	// `#[…].map()`, `#{…}.get()`, and `Set` operations must "just work" with no
-	// `import`, exactly like arithmetic on `int`. These modules only depend on
-	// other `core` modules above (set → map), so they flatten in cleanly. Genuinely
-	// optional modules (io's free functions, `LinkedList`/`Tree`/`Complex`) stay
-	// behind `import std/…`.
+	// `#[…].sorted()`, `#{…}.get()` must "just work" with no `import`, exactly
+	// like arithmetic on `int`. Primitives (via `ops`/`math`/`string`) and the
+	// built-in literal collections (`#[T]` list, `#{K:V}` map) are ambient; NAMED
+	// types (`Set`, `LinkedList`, `Tree`, `Complex`) and io's free functions stay
+	// behind `import std/…` (see `crate::std_source`).
 	("std/string", include_str!("../../../stdlib/src/string.nym")),
 	(
 		"std/collections/list",
@@ -77,10 +77,6 @@ const CORE_SOURCES: &[(&str, &str)] = &[
 	(
 		"std/collections/map",
 		include_str!("../../../stdlib/src/collections/map.nym"),
-	),
-	(
-		"std/collections/set",
-		include_str!("../../../stdlib/src/collections/set.nym"),
 	),
 ];
 

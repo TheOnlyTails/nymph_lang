@@ -1,5 +1,3 @@
-import @/option with (Option)
-
 struct Node<T>(
   prev: Option<Node<T>>,
   next: Option<Node<T>>,

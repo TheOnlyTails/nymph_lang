@@ -17,6 +17,10 @@
 const STD_SOURCES: &[(&str, &str)] = &[
 	("io", include_str!("../../../stdlib/src/io.nym")),
 	(
+		"collections/set",
+		include_str!("../../../stdlib/src/collections/set.nym"),
+	),
+	(
 		"collections/linked_list",
 		include_str!("../../../stdlib/src/collections/linked_list.nym"),
 	),

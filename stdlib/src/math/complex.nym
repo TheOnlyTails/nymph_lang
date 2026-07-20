@@ -1,6 +1,3 @@
-import @/math
-import @/ops with (Plus, Minus, Times, Divide, Negate, Into, Power)
-
 public struct Complex(real: float, imaginary: float) {
   func conjugate() = Complex(real = this.real, imaginary = -this.imaginary)
 
