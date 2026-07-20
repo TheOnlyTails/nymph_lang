@@ -14,12 +14,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
       - name: Set Rust nightly
         run: rustup override set nightly
+      - name: Set up Node
+        # The codegen crate executes the JavaScript it emits under `node` as
+        # part of the test suite, so `node` must be on PATH.
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+      - name: Install nextest
+        # `cargo binstall` is not preinstalled on the runner; install-action
+        # fetches a prebuilt nextest binary directly.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
       - name: Build
         run: cargo build --verbose
-      - name: Install nextest
-        run: cargo binstall cargo-nextest
       - name: Test
         run: cargo nextest run
