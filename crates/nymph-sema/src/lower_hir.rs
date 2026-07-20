@@ -567,6 +567,47 @@ impl<'a> Lowerer<'a> {
 			.is_some_and(|g| g.contains(name))
 	}
 
+	/// Is `receiver`'s inferred type a bare type parameter (after peeling a `mut`
+	/// view)? Such a receiver is only known through a generic bound, so a method
+	/// call on it must lower to a plain dynamic `recv.method(args)` — the concrete
+	/// impl is chosen by whatever object flows in at runtime (type erasure).
+	fn receiver_is_still_generic(&self, receiver: &Expr) -> bool {
+		self
+			.annotations
+			.get(receiver.id)
+			.map(|info| Self::peel_mut(self.interner, info.ty))
+			.is_some_and(|ty| matches!(self.interner.kind(ty), TyKind::Param(_)))
+	}
+
+	/// Does any prelude impl back a method named `method` with an `external` body
+	/// (`ImplMember::ExternalFunc`)? If so, a still-generic receiver calling that
+	/// method is NOT safe to lower as a plain `recv.method(args)`: the concrete
+	/// runtime value could be a primitive/collection whose impl is an intrinsic with
+	/// no such JS method (e.g. `Plus::plus` on `int` is `external(plus)`, not a class
+	/// method). Such a call stays a loud deferral rather than a silent miscompile.
+	/// The genuinely-safe generic dispatches (an adapter's `this.source.next()` under
+	/// `S: Iterator`) name methods with no `external` prelude backing at all.
+	fn method_is_externally_backed_in_prelude(&self, method: &str) -> bool {
+		fn members_have_external(members: &[Spanned<ImplMember>], method: &str) -> bool {
+			members
+				.iter()
+				.any(|m| matches!(&m.0, ImplMember::ExternalFunc(_, _, meta) if meta.name.0 == method))
+		}
+		self.prelude_modules.iter().any(|module| {
+			module.members.iter().any(|decl| match decl {
+				Declaration::ExternalFunc(_, _, meta) => meta.name.0 == method,
+				Declaration::Impl { members, .. } | Declaration::ImplFor { members, .. } => {
+					members_have_external(members, method)
+				}
+				Declaration::Struct { members, impls, .. } | Declaration::Enum { members, impls, .. } => {
+					members_have_external(members, method)
+						|| impls.iter().any(|si| members_have_external(&si.0.members, method))
+				}
+				_ => false,
+			})
+		})
+	}
+
 	/// Bind `name` in the CURRENT (innermost) JS scope, returning the name to
 	/// actually emit for this declaration: `name` itself if it isn't currently
 	/// bound in ANY active scope (this one or an ancestor), or a fresh `name$1`,
@@ -2602,6 +2643,31 @@ impl<'a> Lowerer<'a> {
 					// sibling method too — see `record_inner_prelude_demand`'s
 					// doc comment.
 					self.record_inner_prelude_demand(&res.method);
+					HirExpr::Call {
+						callee: Box::new(self.lower_expr(func)),
+						args: args.iter().map(|a| self.lower_expr(&a.0.value)).collect(),
+					}
+				} else if let ExprKind::MemberAccess { parent, .. } = &func.kind
+					&& let Some(res) = self.annotations.resolution_of(expr.id)
+					&& res.dispatch == DispatchKind::UserImplDefaultMethod
+					&& !Self::is_this_receiver(parent)
+					&& self.receiver_is_still_generic(parent)
+					&& !self.method_is_externally_backed_in_prelude(&res.method)
+				{
+					// A method call dispatched through a STILL-GENERIC bound whose receiver
+					// is some concrete sub-expression (a field or parameter), NOT `this` —
+					// its type head is a type parameter (`S: Iterator`'s
+					// `this.source.next()`). There is no single concrete prelude impl to
+					// materialize, but none is needed: under type erasure the emitted JS is a
+					// plain `recv.method(args)` and the concrete object supplied at runtime
+					// carries the real method (duck typing) — exactly the "safe" case the
+					// operator-dispatch comment above describes. Emit the direct call rather
+					// than routing into the concrete-materialization path (which returns
+					// `None` and panics). `this`-receivered sibling calls are EXCLUDED: while
+					// materializing a prelude default body onto a class or as a mangled
+					// top-level function, `this` carries the synthetic `Self` param and must
+					// stay on the two branches around this one (they record the sibling
+					// demand / build the mangled call), not be short-circuited here.
 					HirExpr::Call {
 						callee: Box::new(self.lower_expr(func)),
 						args: args.iter().map(|a| self.lower_expr(&a.0.value)).collect(),

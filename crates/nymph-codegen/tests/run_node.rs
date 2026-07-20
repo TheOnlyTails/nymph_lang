@@ -3177,3 +3177,30 @@ fn an_unannotated_inherent_method_with_an_if_block_body_runs_and_returns_the_bra
 	assert_eq!(run(user, "t(true)"), "true");
 	assert_eq!(run(user, "t(false)"), "false");
 }
+
+// ── Mutable-field projection + still-generic bound dispatch (iterator-adapter
+// groundwork), driven under Node ─────────────────────────────────────────────
+
+#[test]
+fn a_mut_func_can_call_a_mut_method_on_a_concrete_field_and_it_runs() {
+	// Projecting a field out of a `mut` receiver yields a mutable place, so `step`
+	// (a `mut func`) may call `bump` (also `mut func`) on `this.inner`. Before the
+	// mutable-field-projection fix this failed to type-check ("bump requires a mut
+	// receiver"); now it runs, and the two `bump`s mutate shared state (0 → 2).
+	let user = "struct Inner(n: int) {\n\tmut func bump(): int = {\n\t\tthis.n = this.n + 1\n\t\tthis.n\n\t}\n}\nstruct Outer(inner: Inner) {\n\tmut func step(): int = this.inner.bump()\n}\nfunc t(): int = {\n\tlet mut o = Outer(inner = Inner(n = 0))\n\tlet a = o.step()\n\tlet b = o.step()\n\ta + b\n}";
+	assert_eq!(run(user, "t()"), "3");
+}
+
+#[test]
+fn a_lazy_map_adapter_over_a_generic_iterator_source_runs() {
+	// The full lazy-adapter shape: `Map` is generic over its source iterator
+	// (`S: Iterator<Item>`) and, inside its own `next`, calls `this.source.next()`
+	// — a `mut` method on a generic FIELD, dispatched through the bound. That relies
+	// on BOTH fixes: mutable-field projection (so `this.source` is a mutable place)
+	// and still-generic bound lowering (so `next` emits a plain dynamic call rather
+	// than panicking as an unmaterializable prelude impl). Consuming `doubled` in a
+	// for-loop yields 0,2,4,6 → sum 12.
+	let prelude = "enum Option<T> {\n\tSome(value: T),\n\tNone\n\n\tfunc map<R>(f: (T) -> R): Option<R> = match (this) {\n\t\tSome(value) -> Option.Some(value = f(value)),\n\t\tNone -> Option.None\n\t}\n}\ninterface Iterator<Item> {\n\tmut func next(): Option<Item>\n}";
+	let user = "struct Map<Item, R, S: Iterator<Item>>(source: S, f: (Item) -> R) {\n\timpl Iterator<R> {\n\t\tmut func next(): Option<R> = this.source.next().map(this.f)\n\t}\n}\nstruct Counter(current: uint, limit: uint) {\n\timpl Iterator<uint> {\n\t\tmut func next(): Option<uint> = if (this.current < this.limit) {\n\t\t\tlet value = this.current\n\t\t\tthis.current = this.current + 1u\n\t\t\tOption.Some(value = value)\n\t\t} else {\n\t\t\tOption.None\n\t\t}\n\t}\n}\nfunc f(): uint = {\n\tlet c = Counter(current = 0u, limit = 4u)\n\tlet mut doubled = Map(source = c, f = (n) -> n * 2u)\n\tlet mut total = 0u\n\tfor (x in doubled) {\n\t\ttotal = total + x\n\t}\n\ttotal\n}";
+	assert_eq!(run_with_prelude(user, prelude, "f()"), "12");
+}

@@ -1334,10 +1334,21 @@ impl<'m> Checker<'m> {
 				self.emit(span, TypeError::MethodCallsUnsupported);
 				self.interner.error()
 			}
-			// A `mut Struct` still has the struct's fields — re-dispatch on the
-			// peeled inner type. The field's own declared type (which may or may
-			// not itself be `mut`) is unaffected: `subst` above preserves it.
-			TyKind::Mut(inner) => self.member_ty_of(inner, member, span),
+			// A `mut Struct` still has the struct's fields — re-dispatch on the peeled
+			// inner type, then re-wrap the field in `mut`: projecting a field out of a
+			// mutable receiver yields a mutable *place*, so a `mut func` may be called on
+			// it (e.g. an iterator adapter's `this.source.next()`) and it may be
+			// reassigned. Reads coerce `mut T` → `T` as usual (`coerce.rs`), so this
+			// doesn't disturb ordinary field reads. `mk_mut` is idempotent, so a field
+			// whose declared type is already `mut` isn't double-wrapped; `Error` stays
+			// `Error`.
+			TyKind::Mut(inner) => {
+				let fty = self.member_ty_of(inner, member, span);
+				match self.interner.kind(fty) {
+					TyKind::Error => fty,
+					_ => self.interner.mk_mut(fty),
+				}
+			}
 			TyKind::Error => self.interner.error(),
 			TyKind::Infer(_) => self.fresh(),
 			_ => {
