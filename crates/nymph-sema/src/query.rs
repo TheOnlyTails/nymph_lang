@@ -998,6 +998,7 @@ fn pattern_bindings<'a>(pattern: &'a Pattern, out: &mut Vec<(&'a str, Span)>) {
 			for field in fields {
 				match &field.0 {
 					StructPatternField::Value { value, .. } => pattern_bindings(&value.0, out),
+					StructPatternField::Positional(value) => pattern_bindings(&value.0, out),
 					StructPatternField::Named(name) => out.push((name.0.as_str(), name.1)),
 					StructPatternField::Rest => {}
 				}
@@ -2357,6 +2358,13 @@ fn bind_struct_pattern_fields(
 					out.push((name.1, rendered));
 				}
 			}
+			// A positional sub-pattern destructures the constructor's sole field; recurse
+			// against that one field's declared type when there is exactly one.
+			StructPatternField::Positional(value) => {
+				if let [(_, ft)] = field_list {
+					bind_pattern_syntactic(value, &ft.0, subst, checked, module, defs, out);
+				}
+			}
 			StructPatternField::Rest => {}
 		}
 	}
@@ -2672,8 +2680,12 @@ fn push_pattern_variant_candidates(
 		}
 		Pattern::Struct { fields, .. } => {
 			for field in fields {
-				if let StructPatternField::Value { value, .. } = &field.0 {
-					push_pattern_variant_candidates(value, checked, module, defs, out);
+				match &field.0 {
+					StructPatternField::Value { value, .. }
+					| StructPatternField::Positional(value) => {
+						push_pattern_variant_candidates(value, checked, module, defs, out);
+					}
+					StructPatternField::Named(_) | StructPatternField::Rest => {}
 				}
 			}
 		}

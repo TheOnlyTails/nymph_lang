@@ -12,11 +12,10 @@ The focus here is the shape of a real CLI:
   binds the remainder; `#[other, ...]` catches anything unrecognized.
 - **State behind methods** — `Store` holds a `mut #[Task]`; `add`/`complete` are
   `mut func`s that update it. `complete` rebuilds the list functionally with `map`.
-- **Two-level dispatch** — `main` matches the `Result` and hands the inner `Command`
-  to `dispatch`, which matches each variant at the top level. Constructor patterns
-  bind fields **by name** (`Add(title)`, `Complete(id)` use the real field names),
-  and the `field = binding` form renames as it binds — `Ok(value = command)` pulls
-  the `Result`'s `value` field out under the clearer name `command`.
+- **Nested positional patterns** — `main` matches both levels at once:
+  `Ok(Add(title))` matches the `Result`'s `Ok` and, positionally, its sole payload
+  against the `Command` variant. A single-field constructor accepts an un-named
+  sub-pattern, so the `Result` wrapper melts away and every case is one arm.
 
 ```sh
 todo add write the compiler

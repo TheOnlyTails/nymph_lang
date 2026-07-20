@@ -349,6 +349,11 @@ pub enum StructPatternField {
 	},
 	/// `field` — shorthand binding the field to a same-named variable.
 	Named(Ident),
+	/// A bare sub-pattern with no field name (`Ok(Add(title))`, `Some(3)`). Only
+	/// valid when the struct/variant has exactly ONE field — then it unambiguously
+	/// matches that field. The checker rejects it for a zero- or multi-field
+	/// constructor (where there is no single field to bind it to).
+	Positional(Spanned<Pattern>),
 	/// `...`
 	Rest,
 }

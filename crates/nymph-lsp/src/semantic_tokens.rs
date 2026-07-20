@@ -1287,6 +1287,9 @@ fn walk_pattern_uses(
 						out.push((name.1.start, (PROPERTY, 0)));
 						walk_pattern_uses(value, module, checked, variant_names, out);
 					}
+					StructPatternField::Positional(value) => {
+						walk_pattern_uses(value, module, checked, variant_names, out);
+					}
 					StructPatternField::Named(name) => out.push((name.1.start, (PROPERTY, 0))),
 					StructPatternField::Rest => {}
 				}

@@ -21,7 +21,7 @@ func parse(argv: #[string]): Result<Command, string> = match (argv) {
     Ok(Command.Add(title = words.join(" ")))
   },
   #["done", id] -> match (id.to_int()) {
-    Some(value = n) -> Ok(Command.Complete(id = n)),
+    Some(n) -> Ok(Command.Complete(id = n)),
     None -> Error("`done` needs a numeric id, got `${id}`"),
   },
   #["list"] -> Ok(Command.List),
@@ -78,31 +78,26 @@ func usage(): string =
   todo list          show all tasks
   todo help          show this message"
 
-/// Run one parsed command against the store. Matched at the top level, so each
-/// `Command` variant is a plain (un-nested) pattern.
-func dispatch(command: Command, store: mut Store) = match (command) {
-  Add(title) -> {
-    let id = store.add(title)
-    println("added #${id}: ${title}")
-  },
-  Complete(id) -> match (store.complete(id)) {
-    Ok(value = done) -> println("completed #${done}"),
-    Error(error) -> println("error: ${error}"),
-  },
-  List -> println(store.render()),
-  Help -> println(usage()),
-}
-
 func main() = {
   let mut store = Store.empty()
 
-  // Match the `Result` first, binding its own field, then dispatch the `Command`
-  // in a separate top-level match. Constructor patterns match fields by name, so
-  // this keeps every variant pattern un-nested.
+  // Nested positional patterns handle both levels at once: `Ok(Add(title))` matches
+  // the `Result`'s `Ok` and, positionally, its sole payload against the `Command`
+  // variant. A single-field constructor accepts an un-named sub-pattern, so `Ok(...)`
+  // takes the inner `Command` pattern directly.
   match (parse(args())) {
-    Ok(value = command) -> dispatch(command, store),
-    Error(error) -> {
-      println("error: ${error}")
+    Ok(Add(title)) -> {
+      let id = store.add(title)
+      println("added #${id}: ${title}")
+    },
+    Ok(Complete(id)) -> match (store.complete(id)) {
+      Ok(done) -> println("completed #${done}"),
+      Error(msg) -> println("error: ${msg}"),
+    },
+    Ok(List) -> println(store.render()),
+    Ok(Help) -> println(usage()),
+    Error(msg) -> {
+      println("error: ${msg}")
       println(usage())
     },
   }

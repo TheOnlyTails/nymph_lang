@@ -93,6 +93,11 @@ pub struct Annotations {
 	/// Variant *patterns*, keyed by span — patterns carry no `NodeId`, but each
 	/// written pattern has a unique source span.
 	pattern_variants: FxHashMap<Span, VariantResolution>,
+	/// The field name a positional (unnamed) constructor sub-pattern binds, keyed by
+	/// that sub-pattern's span. A positional field carries no name in the AST, but the
+	/// checker resolves it to the constructor's sole field; lowering reads this back to
+	/// emit the field access, having no type access of its own.
+	positional_fields: FxHashMap<Span, EcoString>,
 	/// A `for` loop's iterable, keyed by its own `NodeId` — see [`IterMode`].
 	iter_modes: FxHashMap<NodeId, IterMode>,
 	/// NodeId of a committed anonymous-closure-parameter (`$N`) boundary → its
@@ -148,6 +153,14 @@ impl Annotations {
 	/// The variant a pattern (by span) resolved to, if any.
 	pub fn pattern_variant_of(&self, span: Span) -> Option<&VariantResolution> {
 		self.pattern_variants.get(&span)
+	}
+
+	pub(crate) fn record_positional_field(&mut self, span: Span, field: EcoString) {
+		self.positional_fields.insert(span, field);
+	}
+
+	pub fn positional_field_of(&self, span: Span) -> Option<&EcoString> {
+		self.positional_fields.get(&span)
 	}
 
 	/// Record how a `for` loop's iterable (by its own `NodeId`) was proven

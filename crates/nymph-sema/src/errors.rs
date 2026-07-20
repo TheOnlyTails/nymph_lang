@@ -315,6 +315,12 @@ pub enum TypeError {
 		lhs: String,
 		rhs: Option<String>,
 	},
+
+	/// A positional (unnamed) sub-pattern was used on a constructor that does not have
+	/// exactly one field, so there is no single field for it to bind to. `fields` is
+	/// the constructor's actual field count. New variant appended at the enum's end
+	/// (mints 2062).
+	PositionalPatternArity { fields: usize },
 }
 
 impl IntoDiagnostic for TypeError {
@@ -383,6 +389,11 @@ impl IntoDiagnostic for TypeError {
 				)
 				.into(),
 			},
+			E::PositionalPatternArity { fields } => format!(
+				"a positional sub-pattern is only allowed on a constructor with exactly one field, \
+				 but this one has {fields}; name the fields (`field = pattern`) instead"
+			)
+			.into(),
 			E::CannotCast { from, to } => {
 				format!("cannot cast `{from}` to `{to}`: no `Into` implementation").into()
 			}

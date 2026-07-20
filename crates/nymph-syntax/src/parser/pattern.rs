@@ -317,16 +317,32 @@ impl Parser<'_> {
 			self.advance();
 			return Spanned(StructPatternField::Rest, self.span_from(start));
 		}
-		let name = self.expect_ident();
-		if self.eat(&Token::Eq).is_some() {
-			let value = self.parse_pattern();
-			Spanned(
-				StructPatternField::Value { name, value },
-				self.span_from(start),
-			)
-		} else {
-			Spanned(StructPatternField::Named(name), self.span_from(start))
+		// A field name is a bare identifier that stands alone (`field`, ending the
+		// field) or introduces a sub-pattern (`field = pattern`). An identifier that
+		// instead HEADS a larger pattern — a nested variant `Add(..)` or a qualified
+		// path `Cmd.Add` — is a positional sub-pattern, not a field name; so is any
+		// non-identifier pattern (`_`, a literal, `#(..)`, ...). Positional fields are
+		// only valid on a single-field constructor, which the checker enforces.
+		if let Some(Token::Identifier(_)) = self.peek() {
+			match self.peek_nth(1) {
+				Some(Token::Eq) => {
+					let name = self.expect_ident();
+					self.advance(); // `=`
+					let value = self.parse_pattern();
+					return Spanned(
+						StructPatternField::Value { name, value },
+						self.span_from(start),
+					);
+				}
+				Some(Token::Comma | Token::RParen) | None => {
+					let name = self.expect_ident();
+					return Spanned(StructPatternField::Named(name), self.span_from(start));
+				}
+				_ => {}
+			}
 		}
+		let pat = self.parse_pattern();
+		Spanned(StructPatternField::Positional(pat), self.span_from(start))
 	}
 
 	/// Used by `let` bindings and parameters, which take a pattern but not a top-level

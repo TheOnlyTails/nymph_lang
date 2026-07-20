@@ -358,3 +358,29 @@ fn interface_default_method_generic_instantiates_at_call_site() {
 		 }",
 	);
 }
+
+#[test]
+fn positional_subpattern_on_a_single_field_variant_binds_the_sole_field() {
+	// `Box(inner)` — `inner` is not the field name (`value`), but the constructor has
+	// exactly one field, so it's a positional binding of that field, not an error.
+	assert_ok(
+		"enum Box { Full(value: int), Empty }
+		 func unwrap_or(b: Box): int = match (b) {
+		   Full(inner) -> inner,
+		   Empty -> 0,
+		 }",
+	);
+}
+
+#[test]
+fn positional_subpattern_on_a_multi_field_constructor_is_rejected() {
+	// A positional (un-named) sub-pattern has no single field to bind to on a
+	// two-field struct — the checker rejects it rather than guessing.
+	assert_error_contains(
+		"struct Pair(a: int, b: int)
+		 func f(p: Pair): int = match (p) {
+		   Pair(#(1, 2)) -> 0,
+		 }",
+		"positional sub-pattern is only allowed on a constructor with exactly one field",
+	);
+}

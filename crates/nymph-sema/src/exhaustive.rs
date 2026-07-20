@@ -375,6 +375,17 @@ impl Checker<'_> {
 			}
 			Pattern::Struct { fields, .. } => {
 				let names = self.ctor_field_names(ctor, ty);
+				// A positional (un-named) sub-pattern is valid only on a single-field
+				// constructor, where it fills that sole field's column. On a multi-field
+				// constructor it is a type error (already reported); treat every column as
+				// a wildcard rather than mis-expanding one pattern across many fields.
+				if names.len() == 1
+					&& let Some(pat) = fields.iter().find_map(|f| match &f.0 {
+						StructPatternField::Positional(p) => Some(p),
+						_ => None,
+					}) {
+					return vec![Pat::Ref(&pat.0)];
+				}
 				names
 					.iter()
 					.map(|fname| field_subpattern(fields, fname))

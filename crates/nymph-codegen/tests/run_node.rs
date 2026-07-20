@@ -3204,3 +3204,27 @@ fn a_lazy_map_adapter_over_a_generic_iterator_source_runs() {
 	let user = "struct Map<Item, R, S: Iterator<Item>>(source: S, f: (Item) -> R) {\n\timpl Iterator<R> {\n\t\tmut func next(): Option<R> = this.source.next().map(this.f)\n\t}\n}\nstruct Counter(current: uint, limit: uint) {\n\timpl Iterator<uint> {\n\t\tmut func next(): Option<uint> = if (this.current < this.limit) {\n\t\t\tlet value = this.current\n\t\t\tthis.current = this.current + 1u\n\t\t\tOption.Some(value = value)\n\t\t} else {\n\t\t\tOption.None\n\t\t}\n\t}\n}\nfunc f(): uint = {\n\tlet c = Counter(current = 0u, limit = 4u)\n\tlet mut doubled = Map(source = c, f = (n) -> n * 2u)\n\tlet mut total = 0u\n\tfor (x in doubled) {\n\t\ttotal = total + x\n\t}\n\ttotal\n}";
 	assert_eq!(run_with_prelude(user, prelude, "f()"), "12");
 }
+
+// ── Positional sub-patterns on single-field constructors ─────────────────────
+
+#[test]
+fn positional_variant_subpatterns_on_single_field_constructors_run() {
+	// A single-field constructor may take a bare positional sub-pattern: a nested
+	// variant WITH a field (`Holds(One(value))`) and a nested nullary variant
+	// (`Holds(Zero)`), each matched against the sole field by position, not by name.
+	// (Values are built inside no-arg wrappers — the harness appends `call` as raw JS,
+	// where Nymph named-arg construction isn't valid.)
+	let src = "enum Inner { One(value: int), Zero }\nenum Wrap { Holds(inner: Inner) }\nfunc classify(w: Wrap): int = match (w) {\n\tHolds(One(value)) -> value,\n\tHolds(Zero) -> 0,\n}\nfunc nested(): int = classify(Wrap.Holds(inner = Inner.One(value = 7)))\nfunc empty(): int = classify(Wrap.Holds(inner = Inner.Zero))";
+	assert_eq!(run(src, "nested()"), "7");
+	assert_eq!(run(src, "empty()"), "0");
+}
+
+#[test]
+fn positional_literal_and_binding_subpatterns_run() {
+	// A literal (`One(5)`) and a bare binding whose name is NOT the field name
+	// (`One(x)` binds the sole `value` field to `x`) both work positionally.
+	let src = "enum Inner { One(value: int), Zero }\nfunc pick(b: Inner): int = match (b) {\n\tOne(5) -> 500,\n\tOne(x) -> x,\n\tZero -> 0,\n}\nfunc lit(): int = pick(Inner.One(value = 5))\nfunc bound(): int = pick(Inner.One(value = 8))\nfunc nil(): int = pick(Inner.Zero)";
+	assert_eq!(run(src, "lit()"), "500");
+	assert_eq!(run(src, "bound()"), "8");
+	assert_eq!(run(src, "nil()"), "0");
+}

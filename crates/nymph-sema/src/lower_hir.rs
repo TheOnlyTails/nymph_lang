@@ -4305,13 +4305,42 @@ impl<'a> Lowerer<'a> {
 				StructPatternField::Value { name, value } => {
 					Some((name.0.clone(), self.lower_pattern(value)))
 				}
-				StructPatternField::Named(name) => Some((
-					name.0.clone(),
-					HirPat::Binding {
-						name: self.declare(&name.0),
-						sub: None,
-					},
-				)),
+				StructPatternField::Named(name) => {
+					// A bare identifier the checker reinterpreted as a positional sub-pattern
+					// on a single-field constructor carries a recorded field name; the name is
+					// then a nullary-variant pattern or a plain binding (as in `lower_pattern`'s
+					// `Binding` arm), not a field shorthand.
+					match self.annotations.positional_field_of(f.1).cloned() {
+						Some(fname) => {
+							let sub = match self.annotations.pattern_variant_of(f.1).cloned() {
+								Some(res) => HirPat::Variant {
+									enum_name: res.enum_name.clone(),
+									variant: res.variant.clone(),
+									fields: Vec::new(),
+								},
+								None => HirPat::Binding {
+									name: self.declare(&name.0),
+									sub: None,
+								},
+							};
+							Some((fname, sub))
+						}
+						None => Some((
+							name.0.clone(),
+							HirPat::Binding {
+								name: self.declare(&name.0),
+								sub: None,
+							},
+						)),
+					}
+				}
+				// A positional sub-pattern: the checker recorded (by the field's span)
+				// which single field it binds — pair that field name with the lowered
+				// sub-pattern, exactly as a `field = pattern` (`Value`) would.
+				StructPatternField::Positional(value) => self
+					.annotations
+					.positional_field_of(f.1)
+					.map(|fname| (fname.clone(), self.lower_pattern(value))),
 				StructPatternField::Rest => None,
 			})
 			.collect()

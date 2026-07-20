@@ -305,6 +305,9 @@ fn struct_pattern_field(f: Spanned<StructPatternField>) -> Spanned<StructPattern
 			value: spanned_pattern(value),
 		},
 		StructPatternField::Named(name) => StructPatternField::Named(ident(name)),
+		StructPatternField::Positional(value) => {
+			StructPatternField::Positional(spanned_pattern(value))
+		}
 		StructPatternField::Rest => StructPatternField::Rest,
 	})
 }

@@ -483,6 +483,9 @@ fn rewrite_pattern(p: Spanned<Pattern>, ctx: &RewriteCtx) -> Spanned<Pattern> {
 								name,
 								value: rewrite_pattern(value, ctx),
 							},
+							StructPatternField::Positional(value) => {
+								StructPatternField::Positional(rewrite_pattern(value, ctx))
+							}
 							other @ (StructPatternField::Named(_) | StructPatternField::Rest) => other,
 						},
 						f.1,
