@@ -266,3 +266,17 @@ cargo nextest run          # requires `node` on PATH for codegen tests
 cargo clippy --all-targets --all-features
 pnpm lint
 ```
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are tracked as GitHub issues (`gh` CLI) in `TheOnlyTails/nymph_lang`. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Default five-role vocabulary, each label string equal to its name. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
