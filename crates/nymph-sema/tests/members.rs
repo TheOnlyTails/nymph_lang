@@ -316,3 +316,45 @@ fn shadowed_body_type_error_still_surfaces_the_duplicate_diagnostic() {
 		"defined more than once",
 	);
 }
+
+#[test]
+fn interface_default_method_own_generic_scopes_into_signature() {
+	// A generic parameter declared on an interface DEFAULT method (`wrap<R>`) must be
+	// in scope when its own signature (`value: R): R`) is lowered — previously this
+	// failed with `cannot find type R` because only the interface's generics were
+	// registered, not the method's.
+	assert_ok(
+		"interface Widget {
+		   func base(): int
+		   func wrap<R>(value: R): R = value
+		 }
+		 struct Thing() {
+		   impl Widget {
+		     func base(): int = 7
+		   }
+		 }
+		 func run(t: Thing): int = t.wrap(42)",
+	);
+}
+
+#[test]
+fn interface_default_method_generic_instantiates_at_call_site() {
+	// The method generic `R` must be instantiated to a fresh inference variable per
+	// call, so `wrap` infers `R` from the argument at each site (here `int`, then
+	// `boolean`) rather than leaking the rigid parameter or pinning it across calls.
+	assert_ok(
+		"interface Widget {
+		   func base(): int
+		   func wrap<R>(value: R): R = value
+		 }
+		 struct Thing() {
+		   impl Widget {
+		     func base(): int = 7
+		   }
+		 }
+		 func run(t: Thing): boolean = {
+		   let n: int = t.wrap(42)
+		   t.wrap(true)
+		 }",
+	);
+}

@@ -286,6 +286,10 @@ impl Checker<'_> {
 			for k in 0..iface.generics.len() {
 				isubst.insert(ParamIdx(k as u32), self.fresh());
 			}
+			// The method's own generics (`Param(iface_len + j)`) → fresh vars too.
+			for j in 0..method.generics.len() {
+				isubst.insert(ParamIdx((iface.generics.len() + j) as u32), self.fresh());
+			}
 			let params: Vec<Ty> = method
 				.params
 				.iter()
@@ -352,6 +356,10 @@ impl Checker<'_> {
 			let mut isubst: FxHashMap<ParamIdx, Ty> = FxHashMap::default();
 			for k in 0..iface.generics.len() {
 				isubst.insert(ParamIdx(k as u32), self.fresh());
+			}
+			// The method's own generics (`Param(iface_len + j)`) → fresh vars too.
+			for j in 0..method.generics.len() {
+				isubst.insert(ParamIdx((iface.generics.len() + j) as u32), self.fresh());
 			}
 			let params: Vec<Ty> = method
 				.params
@@ -878,6 +886,13 @@ impl Checker<'_> {
 				.map(|(_, t)| self.subst(*t, subst, None))
 				.unwrap_or_else(|| self.fresh());
 			isubst.insert(ParamIdx(k as u32), value);
+		}
+		// The method's OWN generics sit at `Param(iface_len + j)` (see `lower_method_sig`);
+		// instantiate each to a fresh inference variable so a call like `it.map(f)` infers
+		// them from the arguments instead of leaking the rigid parameter.
+		let iface_len = interface.generics.len();
+		for j in 0..method.generics.len() {
+			isubst.insert(ParamIdx((iface_len + j) as u32), self.fresh());
 		}
 		let params = method
 			.params

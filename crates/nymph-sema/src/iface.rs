@@ -33,6 +33,13 @@ use crate::ty::{GenericArgs, Interner, Ty, TyKind};
 pub struct IfaceMethod {
 	pub params: Vec<Ty>,
 	pub ret: Ty,
+	/// The method's OWN generic parameter names (e.g. `map<R>` → `["R"]`), in
+	/// declaration order. Their `Param` indices follow the owning interface's/impl's
+	/// generics: a method generic `j` is `Param(owner_generics + j)`, and any
+	/// synthetic `Self` param sits after them (see `check_interface_default_body`).
+	/// Empty for the common no-generics method. Call sites read this to allocate a
+	/// fresh inference variable per method generic when instantiating the signature.
+	pub generics: Vec<EcoString>,
 	/// Whether this method is declared `mut func` (needs a `mut` receiver) rather
 	/// than plain `func`. On an [`InterfaceDef`]'s copy this is the SOURCE OF
 	/// TRUTH (MT2, OO1) that every call-site gate (`solve.rs`) consults; on an
@@ -194,7 +201,7 @@ impl Checker<'_> {
 				if let InterfaceMember::Element(element) = &m.0
 					&& let InterfaceElement::Func { meta, .. } = &element.0
 				{
-					let sig = self.lower_method_sig(meta);
+					let sig = self.lower_method_sig(meta, generics.len());
 					methods.insert(meta.name.0.clone(), sig);
 				}
 			}
@@ -492,6 +499,7 @@ impl Checker<'_> {
 				IfaceMethod {
 					params,
 					ret,
+					generics: generic_names(&meta.generics),
 					mutating,
 				},
 			);
@@ -536,7 +544,19 @@ impl Checker<'_> {
 	// ── Helpers ──────────────────────────────────────────────────────────────
 	/// Lower a function declaration to a method signature (params + return), under the
 	/// currently-active parameter scope. `self`/`Self` stays as `SelfTy`.
-	fn lower_method_sig(&mut self, meta: &FuncDeclaration) -> IfaceMethod {
+	/// Lower one interface method's signature. `base` is the number of generic
+	/// parameters already occupying `0..base` in the active scope (the owning
+	/// interface's generics); the method's OWN generics are registered on top at
+	/// `Param(base + j)` so a signature that mentions them (`map<R>(f: (Item) -> R): …R…`)
+	/// resolves instead of failing `cannot find type R`.
+	fn lower_method_sig(&mut self, meta: &FuncDeclaration, base: usize) -> IfaceMethod {
+		let method_scope: FxHashMap<EcoString, ParamIdx> = meta
+			.generics
+			.iter()
+			.enumerate()
+			.map(|(j, g)| (g.0.name.0.clone(), ParamIdx((base + j) as u32)))
+			.collect();
+		self.push_params(method_scope);
 		let params = meta
 			.params
 			.iter()
@@ -546,9 +566,11 @@ impl Checker<'_> {
 			Some(ty) => self.lower_type(ty),
 			None => self.interner.void(),
 		};
+		self.pop_params();
 		IfaceMethod {
 			params,
 			ret,
+			generics: generic_names(&meta.generics),
 			mutating: meta.kind == FuncKind::Mut,
 		}
 	}
