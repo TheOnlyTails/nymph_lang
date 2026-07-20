@@ -3276,8 +3276,16 @@ impl<'a> Lowerer<'a> {
 			.annotations
 			.get(iterable.id)
 			.map(|info| Self::peel_mut(self.interner, info.ty));
-		let is_list_like = source_ty
-			.is_some_and(|ty| matches!(self.interner.kind(ty), TyKind::List(_) | TyKind::Param(_)));
+		// A native list always takes the index fast path. A bare `Param` does TOO, but
+		// only for the spread-parameter carve-out where the checker recorded no
+		// `IterMode` (`resolve_iterable_source`); a `Param` bound by `Iterator`/`Iterable`
+		// records `IterMode::Direct`/`ViaIter` and must go through the protocol (calling
+		// `.next()`), not be mis-lowered as an array index walk.
+		let is_list_like = source_ty.is_some_and(|ty| match self.interner.kind(ty) {
+			TyKind::List(_) => true,
+			TyKind::Param(_) => self.annotations.iter_mode_of(iterable.id).is_none(),
+			_ => false,
+		});
 		if is_list_like {
 			self.lower_for_list(variable, iterable, body)
 		} else {

@@ -95,6 +95,23 @@ fn dispatch_kind_for_method_call(res: &MethodResolution) -> DispatchKind {
 	}
 }
 
+/// Whether `expr` denotes a *place* (an lvalue with backing storage — a variable,
+/// field, or element) rather than a freshly-produced temporary (a call result,
+/// constructor, block, `if`/`match` value, …). A temporary receiver is exclusively
+/// owned at the call site, so it is eligible to be a `mut` receiver even without a
+/// `mut`-typed binding — mirroring calling a `&mut` method on a temporary in Rust, and
+/// letting `a.map(f).fold(..)` chain a draining terminal straight off the adapter.
+fn expr_is_place(expr: &Expr) -> bool {
+	match &expr.kind {
+		ExprKind::Identifier(_)
+		| ExprKind::This
+		| ExprKind::MemberAccess { .. }
+		| ExprKind::IndexAccess { .. } => true,
+		ExprKind::Grouped(inner) => expr_is_place(inner),
+		_ => false,
+	}
+}
+
 impl<'m> Checker<'m> {
 	// ── Body driver ──────────────────────────────────────────────────────────
 	pub(crate) fn check_bodies(&mut self) {
@@ -1096,12 +1113,23 @@ impl<'m> Checker<'m> {
 		// Method call: `receiver.method(args…)` resolves through the interface solver.
 		if let ExprKind::MemberAccess { parent, member, .. } = &func.kind {
 			let recv = self.infer(parent);
+			// A temporary (rvalue) receiver is owned here, so present it to the solver as
+			// `mut`: a `mut func` such as an iterator's `fold`/`to_list`/`count` may then be
+			// called directly on `a.map(f)` without an intermediate `let mut` binding.
+			let recv_dispatch = {
+				let resolved = self.shallow_resolve(recv);
+				if !expr_is_place(parent) && !matches!(self.interner.kind(resolved), TyKind::Mut(_)) {
+					self.interner.mk_mut(resolved)
+				} else {
+					recv
+				}
+			};
 			let arg_tys: Vec<Ty> = args
 				.iter()
 				.map(|a| self.infer_method_call_arg(&a.0.value))
 				.collect();
 			let arg_lits = arg_int_lits(args);
-			return match self.resolve_method(recv, &member.0, &arg_tys, &arg_lits, member.1) {
+			return match self.resolve_method(recv_dispatch, &member.0, &arg_tys, &arg_lits, member.1) {
 				Some(res) => {
 					let dispatch = dispatch_kind_for_method_call(&res);
 					let resolution = Resolution {
@@ -2537,7 +2565,27 @@ impl<'m> Checker<'m> {
 		// (`#[Item]`) — it stays the bare element type `Item` — a distinct,
 		// out-of-footprint gap (spread/rest typing, the sibling track's
 		// territory) this slice does not touch.
-		if matches!(self.interner.kind(stripped), TyKind::Param(_)) {
+		if let TyKind::Param(idx) = self.interner.kind(stripped) {
+			let idx = *idx;
+			// A generic parameter's iterability can't be found through the impl registry
+			// (`head_of` maps `Param` to `None`), but it CAN be found through the
+			// parameter's own interface bound (`T: Iterator<Item>`) — resolve `next`
+			// against that bound and read the element type off its `Option<Item>` return,
+			// exactly the way an ambient `Iterator` default method (`fold`/`to_list`/…)
+			// iterates its own `this`. Records `IterMode::Direct` so lowering emits the
+			// `.next()` protocol rather than the native-list index fast path.
+			if let Some((ret, iface)) = self.resolve_param_method(idx, "next", &[], &[], iterable.span)
+				&& let Some(item) = self.option_element(ret)
+			{
+				self.gate_mutating(iface, "next", self_is_mut, iterable.span);
+				self
+					.annotations
+					.record_iter_mode(iterable.id, IterMode::Direct);
+				return item;
+			}
+			// A bare, unbounded `Param` (the `...from: Item` spread-parameter carve-out)
+			// records no `IterMode`; lowering keeps treating exactly that shape as
+			// list-like (its runtime value is an array).
 			return self.fresh();
 		}
 		if let Some(iterator) = self.defs.get("Iterator").filter(|&d| self.is_interface(d))
@@ -2580,6 +2628,20 @@ impl<'m> Checker<'m> {
 		let s = self.display(ty);
 		self.emit(iterable.span, TypeError::NotIterable { ty: s });
 		self.interner.error()
+	}
+
+	/// If `ty` is `Option<T>` (the return of `Iterator::next`), return `T`.
+	fn option_element(&mut self, ty: Ty) -> Option<Ty> {
+		let ty = self.shallow_resolve(ty);
+		let (def, first) = match self.interner.kind(ty) {
+			TyKind::Adt(def, args) => (*def, args.positional.first().copied()),
+			_ => return None,
+		};
+		if self.defs.get("Option") == Some(def) {
+			first
+		} else {
+			None
+		}
 	}
 
 	fn infer_range_element(&mut self, kind: &RangeKind) -> Ty {

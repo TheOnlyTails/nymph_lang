@@ -329,7 +329,7 @@ impl Checker<'_> {
 	/// resolution as prelude-origin exactly the way it already does for
 	/// `ImplDirect`/`InterfaceDefault`, without changing behavior for an ordinary
 	/// user-declared interface bound (whose span is always well below `SPAN_BASE`).
-	fn resolve_param_method(
+	pub(crate) fn resolve_param_method(
 		&mut self,
 		param: ParamIdx,
 		name: &str,

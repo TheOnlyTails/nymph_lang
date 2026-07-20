@@ -3218,6 +3218,59 @@ fn a_default_map_method_on_the_ambient_iterator_interface_materializes_its_adapt
 	assert_eq!(run_with_prelude(user, prelude, "f()"), "12");
 }
 
+#[test]
+fn an_ambient_iterator_draining_terminal_default_iterates_this_and_runs() {
+	// A draining terminal (`count`) is a `mut func` DEFAULT on the ambient `Iterator`
+	// whose body does `for (item in this)`. That exercises: `this` bound as `mut Self`
+	// in the default body; the for-loop over a `Param` bound by `Iterator` resolving to
+	// the `.next()` protocol (not the native-list index walk); and the materialized
+	// default's own operator (`n + 1u`). `count()` over 0..6 → 6.
+	let prelude = r#"enum Option<T> {
+	Some(value: T),
+	None
+}
+interface Iterator<Item> {
+	mut func next(): Option<Item>
+
+	mut func count(): uint = {
+		let mut n = 0u
+		for (item in this) {
+			n = n + 1u
+		}
+		n
+	}
+
+	mut func to_list(): #[Item] = {
+		let mut out: #[Item] = #[]
+		for (item in this) {
+			out.push(item)
+		}
+		out
+	}
+}"#;
+	let user = r#"struct Counter(current: uint, limit: uint) {
+	impl Iterator<uint> {
+		mut func next(): Option<uint> = if (this.current < this.limit) {
+			let value = this.current
+			this.current = this.current + 1u
+			Option.Some(value = value)
+		} else {
+			Option.None
+		}
+	}
+}
+func f(): uint = {
+	let mut c = Counter(current = 0u, limit = 6u)
+	c.count()
+}
+func g(): #[uint] = {
+	let mut c = Counter(current = 0u, limit = 4u)
+	c.to_list()
+}"#;
+	assert_eq!(run_with_prelude(user, prelude, "f()"), "6");
+	assert_eq!(run_with_prelude(user, prelude, "g()"), "[ 0, 1, 2, 3 ]");
+}
+
 // ── Positional sub-patterns on single-field constructors ─────────────────────
 
 #[test]

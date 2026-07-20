@@ -2,6 +2,56 @@ import @/option with (Option)
 
 /// The iterator surface: `next` advances the iterator, so it is a `mut func`
 /// (producing the next value mutates the iterator's own state).
+///
+/// The adapter methods (`map`, …) are default methods, so every type that
+/// implements `next` inherits the whole lazy-iteration surface for free — the
+/// combinators are defined ONCE here, never per collection.
 public interface Iterator<Item> {
   mut func next(): Option<Item>
+
+  /// Lazily transform each item with `f`. Returns a new iterator; nothing runs
+  /// until the result is consumed (by a `for` loop or a terminal like `to_list`).
+  func map<R>(f: (Item) -> R): Mapped<Item, R, self> = Mapped(source = this, f = f)
+
+  /// Run `f` for its side effect on every remaining item, draining the iterator.
+  mut func for_each(f: (Item) -> void): void = {
+    for (item in this) {
+      f(item)
+    }
+  }
+
+  /// Reduce the remaining items to a single value, left to right.
+  mut func fold<Acc>(initial: Acc, combine: (Acc, Item) -> Acc): Acc = {
+    let mut acc = initial
+    for (item in this) {
+      acc = combine(acc, item)
+    }
+    acc
+  }
+
+  /// Collect the remaining items into a list.
+  mut func to_list(): #[Item] = {
+    let mut out: #[Item] = #[]
+    for (item in this) {
+      out.push(item)
+    }
+    out
+  }
+
+  /// Count the remaining items, draining the iterator.
+  mut func count(): uint = {
+    let mut n = 0u
+    for (item in this) {
+      n = n + 1u
+    }
+    n
+  }
+}
+
+/// The lazy adapter behind [`Iterator::map`]: yields `f(x)` for each `x` the
+/// wrapped `source` yields.
+struct Mapped<Item, R, S: Iterator<Item>>(source: S, f: (Item) -> R) {
+  impl Iterator<R> {
+    mut func next(): Option<R> = this.source.next().map(this.f)
+  }
 }

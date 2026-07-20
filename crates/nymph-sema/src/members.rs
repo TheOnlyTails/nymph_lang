@@ -869,7 +869,15 @@ impl<'m> Checker<'m> {
 		self.push_params(scope);
 		self.push_scope();
 
+		// A `mut func` default binds `this` as `mut Self`, exactly as a `mut func` on a
+		// concrete type does — so its body may mutate the receiver (call a `mut` method,
+		// e.g. iterate `this` via `this.next()` in `Iterator`'s `for_each`/`fold`/…).
 		let self_ty = self.interner.mk_param(self_idx);
+		let self_ty = if meta.kind == FuncKind::Mut {
+			self.interner.mk_mut(self_ty)
+		} else {
+			self_ty
+		};
 		let prev_self = self.self_ty.replace(self_ty);
 		// See `resolve_method`'s doc comment: a call to another method of *this same
 		// interface* on `this` must bypass ordinary impl search (which could
