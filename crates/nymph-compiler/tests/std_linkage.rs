@@ -326,53 +326,23 @@ fn linked_map_get_insert_remove_and_keys_compile_bundle_and_run() {
 	);
 }
 
-/// L3's `merge`/`to_string` proof: `map.nym` links these two markers via
-/// STRUCTURAL `ImplFor` blocks (`impl<K,V> Plus<Other=self,Output=self> for
-/// #{K:V}` / `impl<K,V> Into<string> for #{K:V}`, target `Type::Map`, not a
-/// named `Type::Reference`) rather than a plain inherent `impl<K,V> #{K:V} {
-/// .. }` like every other map marker — the ONLY production import path
-/// (`import std/collections/map`) fully lowers this module on its own turn,
-/// which used to unconditionally panic in `push_impl_for_methods` the moment
-/// it walked one of these two blocks (a structural `ImplFor` target used to
-/// hit the same loud defer a blanket impl does), even though nothing here
-/// ever calls `.plus()`/`.into()`. Mirrors `synth_std_map_provider` but adds
-/// the two structural blocks so this module's OWN declaration-lowering pass
-/// exercises exactly the shape that used to crash, then actually calls both
-/// linked markers end to end under Node.
-fn synth_std_map_provider_with_plus_and_into(path: &str) -> Option<String> {
-	(path == "collections/map").then(|| {
-		"impl<K, V> mut #{K: V} {\n  \
-			external(size) func size(): uint\n  \
-			external(insert) func insert(key: K, value: V): boolean\n\
-		}\n\
-		impl<K, V> Plus<Other = self, Output = self> for #{K: V} {\n  \
-			external(merge) func plus(other: self): self\n\
-		}\n\
-		impl<K: Into<string>, V: Into<string>> Into<string> for #{K: V} {\n  \
-			external(to_string) func into(): string\n\
-		}\n"
-			.to_string()
-	})
-}
-
-/// The confirmed-defect regression: importing `std/collections/map` must not
-/// panic while lowering the module's own `Plus`/`Into` structural `ImplFor`
-/// blocks (both are present in the provider above, so this module's
-/// declaration-lowering pass exercises both shapes that used to crash), and
-/// once `merge` is linked, `.plus()` must actually compile, bundle, and run
+/// The map merge/to_string linkage proof, driven against the AMBIENT map (map
+/// is now part of the `core` prelude, so no `import`/synthetic std module is
+/// needed). `merge` (`Plus<Other=self,Output=self> for #{K:V}`) is a STRUCTURAL
+/// `ImplFor` block — the shape that used to unconditionally panic in
+/// `push_impl_for_methods` — so lowering the ambient map's own declarations
+/// exercises it; once linked, `.plus()` actually compiles, bundles, and runs
 /// under Node. `to_string` (`Into<string> for #{K:V}`'s `into`) is linked in
-/// the registry the same way, but — exactly like `list.nym`'s own `to_string`
-/// row (see `nymph_hir::linkage`'s own doc comment) — there is today no
-/// checker-accepted call site that reaches it for a STRUCTURAL receiver (a
-/// bare `m.into()` is a checker error: `TypeError`/"no method `into` found
-/// for `#{..}`", a separate, pre-existing checker-side gap in
-/// `nymph-sema/src/query.rs`/`check.rs`, out of this fix's owned-files scope)
-/// — so this test proves the row is linked and lowering never panics on it,
-/// without asserting a call site this compiler doesn't support yet.
+/// the registry the same way, but there is today no checker-accepted call site
+/// that reaches it for a STRUCTURAL receiver (a bare `m.into()` is a checker
+/// error — a separate, pre-existing gap), so this test only asserts the row is
+/// linked and lowering never panics on it.
 #[test]
 fn linked_map_merge_and_to_string_compile_bundle_and_run() {
-	let entry = "import std/collections/map\n\
-		func demo_merge_size(): uint = {\n\
+	// `map` is now ambient (part of the `core` prelude), so no `import` is
+	// needed — the map literals' `.plus()` (merge, via `Plus for #{K:V}`) and
+	// `.size()` link against the registry directly, no synthetic std module.
+	let entry = "func demo_merge_size(): uint = {\n\
 		\tlet mut a = #{1: 10}\n\
 		\tlet b = #{2: 20}\n\
 		\tlet merged = a.plus(b)\n\
@@ -381,12 +351,10 @@ fn linked_map_merge_and_to_string_compile_bundle_and_run() {
 		func main(): void = {}\n";
 	let load = only_entry("main", entry);
 
-	let compiled =
-		compile_project_with_std("main", &load, &synth_std_map_provider_with_plus_and_into).expect(
-			"expected `import std/collections/map` to lower cleanly even though the module \
-			 declares `merge`/`to_string` via structural `ImplFor` blocks, and `.plus()` to \
-			 compile once linked",
-		);
+	let compiled = compile_project_with_std("main", &load, &|_| None).expect(
+		"expected the ambient map's `.plus()` (merge, a structural `ImplFor` block) and \
+		 `.size()` to link and lower cleanly",
+	);
 
 	assert!(
 		nymph_hir::linkage::lookup("to_string", Some("map")).is_some(),
@@ -468,4 +436,46 @@ fn a_user_set_struct_backed_by_the_linked_map_inserts_removes_and_contains_round
 		"true",
 		"expected the Set insert/remove/contains round-trip to hold end to end"
 	);
+}
+
+/// The ambient `string` methods (now `core`, linked to `string.ts`): a program
+/// calls several on a plain string literal WITH NO IMPORT, and they compile,
+/// bundle, and run under Node — the primitive-methods-just-work payoff.
+#[test]
+fn ambient_string_methods_link_and_run() {
+	let entry = "func demo(): string = {\n\
+		\tlet s = \"Hello\"\n\
+		\ts.to_upper().concat(\" \").concat(s.reversed())\n\
+		}\n\
+		func main(): void = {}\n";
+	let load = only_entry("main", entry);
+
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("ambient string methods should link and lower with no import");
+
+	let call = compiled.entry_symbol("demo");
+	let mut js = compiled.js;
+	js.push_str(&format!("\nconsole.log({call}());\n"));
+
+	assert_eq!(
+		run_node(&js, "string_methods"),
+		"HELLO olleH",
+		"expected `\"Hello\".to_upper().concat(\" \").concat(\"Hello\".reversed())`"
+	);
+}
+
+/// `import std/io` resolves through the EMBEDDED std provider (the one the CLI
+/// wires), so `println` is available in a real build — not just when a test
+/// hands in a synthetic provider. Compiles, bundles, and runs under Node.
+#[test]
+fn import_std_io_resolves_via_embedded_provider_and_runs() {
+	let entry = "import std/io with (println)\n\
+		func main(): void = println(\"hi from std/io\")\n";
+	let load = only_entry("main", entry);
+
+	let compiled = compile_project_with_std("main", &load, &nymph_compiler::embedded_std_provider)
+		.expect("`import std/io` should resolve via the embedded std provider");
+
+	let js = format!("{}\n{}();\n", compiled.js, compiled.entry_main);
+	assert_eq!(run_node(&js, "std_io"), "hi from std/io");
 }

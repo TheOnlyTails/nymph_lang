@@ -55,6 +55,10 @@ const INTRINSIC_TS_SOURCES: &[(&str, &str)] = &[
 	// `"print"`/`"println"` rows) — `io.ts` has no `import` of its own, so
 	// unlike `list.ts` it needs no `IMPORT_REWRITES` entry.
 	("std/io", include_str!("../../../stdlib/src/io.ts")),
+	// The ambient `string` methods (linked so `"…".contains(…)` etc. lower to
+	// native JS). `string.ts` imports `Option` via `"./option"` (it sits at the
+	// stdlib root, so `./` not `../`) — see `IMPORT_REWRITES` below.
+	("std/string", include_str!("../../../stdlib/src/string.ts")),
 ];
 
 /// Every relative import specifier an intrinsic `.ts` source might write,
@@ -64,7 +68,11 @@ const INTRINSIC_TS_SOURCES: &[(&str, &str)] = &[
 /// for `stdlib/src/option.ts` (which doesn't exist as a real file — see
 /// [`OPTION_MODULE_JS`]); a future intrinsic module needing a different
 /// relative import would add its own row here.
-const IMPORT_REWRITES: &[(&str, &str)] = &[("../option", "std/option")];
+const IMPORT_REWRITES: &[(&str, &str)] = &[
+	("../option", "std/option"),
+	// `string.ts` sits at the stdlib root, so its `Option` import is `./option`.
+	("./option", "std/option"),
+];
 
 /// The virtual `std/option` module every Option-returning `List` intrinsic
 /// (`get`/`first`/`last`/`pop`) imports as `import { Option } from

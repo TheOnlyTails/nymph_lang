@@ -94,6 +94,33 @@ pub(crate) fn compile_guarded(source: &str, path: &str, entry: Entry) -> Compile
 	}
 }
 
+/// Run a compile call `f`, catching any pipeline panic (a deferred-but-typed
+/// feature the backend doesn't support yet) and returning its captured message
+/// as `Err` instead of unwinding into the caller. The generic core the
+/// single-module [`compile_guarded`] wraps — exposed so the project-driver path
+/// (`compile_project_with_std`, used for `nymph.toml` projects AND bare
+/// single-file entries) gets the same "readable message, not a raw panic"
+/// guarantee.
+pub(crate) fn guarded<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+	CAPTURED_PANIC_MESSAGE.with(|cell| *cell.borrow_mut() = None);
+
+	let previous_hook = panic::take_hook();
+	panic::set_hook(Box::new(|info| {
+		let message = panic_payload_to_string(info.payload());
+		CAPTURED_PANIC_MESSAGE.with(|cell| *cell.borrow_mut() = Some(message));
+	}));
+
+	let result = panic::catch_unwind(AssertUnwindSafe(f));
+
+	panic::set_hook(previous_hook);
+
+	result.map_err(|_| {
+		CAPTURED_PANIC_MESSAGE
+			.with(|cell| cell.borrow_mut().take())
+			.unwrap_or_else(|| "<no panic message captured>".to_string())
+	})
+}
+
 /// Render a panic payload the way `panic!`/`assert!` produce it: a
 /// `&'static str` for a string-literal message, or a `String` for a
 /// formatted one (the two shapes `std` itself ever panics with).

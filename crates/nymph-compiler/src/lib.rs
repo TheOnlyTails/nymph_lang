@@ -50,6 +50,7 @@
 mod intrinsics;
 mod prelude;
 pub mod project;
+mod std_source;
 
 use std::path::{Path, PathBuf};
 
@@ -59,6 +60,7 @@ pub use project::{
 	check_project_library_with_std, check_project_with_std, compile_project, compile_project_library,
 	compile_project_library_with_std, compile_project_with_std,
 };
+pub use std_source::embedded_std_provider;
 
 /// Whether a compile/check pass should additionally require a valid
 /// top-level `main` entry point ([`nymph_sema::check_module_entry`]) or run

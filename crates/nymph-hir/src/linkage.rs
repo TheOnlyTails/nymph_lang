@@ -393,6 +393,235 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 			receiver_tag: Some("map"),
 		},
 	),
+	// `string.nym`'s ambient methods. `string` is a primitive, so its receiver
+	// tag (`inherent_self_type_tag` → `primitive_type_tag`) is `"string"`, which
+	// disambiguates the markers it shares with `list`/`map` (`contains`, `concat`,
+	// `reversed`, `drop`, `take`, `first`, `last`, `split`, `chars`). `symbol ==
+	// marker`; each maps to a `string.ts` export.
+	(
+		"char_at",
+		Linked {
+			module: "std/string",
+			symbol: "char_at",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"chars",
+		Linked {
+			module: "std/string",
+			symbol: "chars",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"concat",
+		Linked {
+			module: "std/string",
+			symbol: "concat",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"concat_chars",
+		Linked {
+			module: "std/string",
+			symbol: "concat_chars",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"contains",
+		Linked {
+			module: "std/string",
+			symbol: "contains",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"contains_char",
+		Linked {
+			module: "std/string",
+			symbol: "contains_char",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"drop",
+		Linked {
+			module: "std/string",
+			symbol: "drop",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"ends_with",
+		Linked {
+			module: "std/string",
+			symbol: "ends_with",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"first",
+		Linked {
+			module: "std/string",
+			symbol: "first",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"index_of",
+		Linked {
+			module: "std/string",
+			symbol: "index_of",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"last",
+		Linked {
+			module: "std/string",
+			symbol: "last",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"last_index_of",
+		Linked {
+			module: "std/string",
+			symbol: "last_index_of",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"length",
+		Linked {
+			module: "std/string",
+			symbol: "length",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"pad_end",
+		Linked {
+			module: "std/string",
+			symbol: "pad_end",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"pad_start",
+		Linked {
+			module: "std/string",
+			symbol: "pad_start",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"repeat",
+		Linked {
+			module: "std/string",
+			symbol: "repeat",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"replace",
+		Linked {
+			module: "std/string",
+			symbol: "replace",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"replace_first",
+		Linked {
+			module: "std/string",
+			symbol: "replace_first",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"reversed",
+		Linked {
+			module: "std/string",
+			symbol: "reversed",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"split",
+		Linked {
+			module: "std/string",
+			symbol: "split",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"starts_with",
+		Linked {
+			module: "std/string",
+			symbol: "starts_with",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"substring",
+		Linked {
+			module: "std/string",
+			symbol: "substring",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"take",
+		Linked {
+			module: "std/string",
+			symbol: "take",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"to_lower",
+		Linked {
+			module: "std/string",
+			symbol: "to_lower",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"to_upper",
+		Linked {
+			module: "std/string",
+			symbol: "to_upper",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"trim",
+		Linked {
+			module: "std/string",
+			symbol: "trim",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"trim_end",
+		Linked {
+			module: "std/string",
+			symbol: "trim_end",
+			receiver_tag: Some("string"),
+		},
+	),
+	(
+		"trim_start",
+		Linked {
+			module: "std/string",
+			symbol: "trim_start",
+			receiver_tag: Some("string"),
+		},
+	),
 ];
 
 /// Look up an `external(name)` marker's linkage for a receiver whose
@@ -489,9 +718,9 @@ mod tests {
 
 	#[test]
 	fn an_unlinked_marker_is_none() {
-		// Every collection marker declared today is now linked — retarget to
-		// a genuinely still-unlinked surface (string/iterator/range) instead.
-		assert!(lookup("chars", Some("string")).is_none());
+		// The collection AND string markers are all linked now — retarget to a
+		// genuinely still-unlinked surface (iterator/range) instead.
+		assert!(lookup("iter", Some("list")).is_none());
 		assert!(lookup("len", Some("list")).is_none());
 	}
 
@@ -544,6 +773,39 @@ mod tests {
 					]
 				),
 				("std/io", vec!["print", "println"]),
+				(
+					"std/string",
+					vec![
+						"char_at",
+						"chars",
+						"concat",
+						"concat_chars",
+						"contains",
+						"contains_char",
+						"drop",
+						"ends_with",
+						"first",
+						"index_of",
+						"last",
+						"last_index_of",
+						"length",
+						"pad_end",
+						"pad_start",
+						"repeat",
+						"replace",
+						"replace_first",
+						"reversed",
+						"split",
+						"starts_with",
+						"substring",
+						"take",
+						"to_lower",
+						"to_upper",
+						"trim",
+						"trim_end",
+						"trim_start",
+					]
+				),
 			]
 		);
 	}

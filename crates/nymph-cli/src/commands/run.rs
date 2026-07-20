@@ -3,7 +3,9 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::NymphCommand;
-use crate::compile_guard::{CompileOutcome, Entry, compile_guarded, unsupported_feature_message};
+use crate::compile_guard::{
+	CompileOutcome, Entry, compile_guarded, guarded, unsupported_feature_message,
+};
 use crate::project_support::{self, fs_loader, render_project_diagnostics};
 
 /// `nymph run <file>` — compile a Nymph source file and execute it under
@@ -54,12 +56,27 @@ impl NymphCommand for RunCommand {
 			.as_ref()
 			.expect("clap requires a file when --expr is absent");
 
-		if let Some(project) = project_support::detect(file) {
+		// A file inside a `nymph.toml` project resolves imports across the whole
+		// project; a bare file is compiled as its own single-file project (rooted
+		// at its own directory) so it can still `import std/…` and import siblings.
+		if let Some(project) =
+			project_support::detect(file).or_else(|| project_support::single_file(file))
+		{
 			let load = fs_loader(project.src_root);
-			return match nymph_compiler::compile_project(&project.entry_key, &load) {
-				Ok(compiled) => execute(&format!("{}\n{}();\n", compiled.js, compiled.entry_main)),
-				Err(diags) => {
+			return match guarded(|| {
+				nymph_compiler::compile_project_with_std(
+					&project.entry_key,
+					&load,
+					&nymph_compiler::embedded_std_provider,
+				)
+			}) {
+				Ok(Ok(compiled)) => execute(&format!("{}\n{}();\n", compiled.js, compiled.entry_main)),
+				Ok(Err(diags)) => {
 					eprint!("{}", render_project_diagnostics(&diags, &load));
+					1
+				}
+				Err(payload) => {
+					eprintln!("{}", unsupported_feature_message(&payload));
 					1
 				}
 			};

@@ -40,6 +40,22 @@ pub(crate) fn detect(file: &Path) -> Option<Project> {
 	})
 }
 
+/// Treat a bare, project-less `.nym` file as its own single-file project:
+/// rooted at the file's own directory (so `import @/sibling` still resolves
+/// against neighbouring files), with the file itself as the graph entry. This
+/// is what lets a lone file `import std/…` (resolved via the embedded std
+/// provider the driver is threaded with) without a `nymph.toml`.
+pub(crate) fn single_file(file: &Path) -> Option<Project> {
+	let file_abs = std::path::absolute(file).ok()?;
+	let src_root = file_abs.parent()?.to_path_buf();
+	let rel = file_abs.strip_prefix(&src_root).ok()?;
+	let entry_key = module_key_from_relative_path(rel)?;
+	Some(Project {
+		src_root,
+		entry_key,
+	})
+}
+
 /// Turn a source-root-relative file path into the driver's canonical module
 /// key: `/`-separated, `.nym` extension stripped (`geometry/vec.nym` →
 /// `"geometry/vec"`).

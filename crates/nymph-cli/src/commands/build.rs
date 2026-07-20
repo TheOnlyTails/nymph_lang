@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::NymphCommand;
-use crate::compile_guard::{CompileOutcome, Entry, compile_guarded, unsupported_feature_message};
+use crate::compile_guard::{
+	CompileOutcome, Entry, compile_guarded, guarded, unsupported_feature_message,
+};
 use crate::project_support::{self, fs_loader, render_project_diagnostics};
 
 /// compile a Nymph source file to a JavaScript module.
@@ -24,23 +26,42 @@ impl NymphCommand for BuildCommand {
 			.unwrap_or_else(|| self.file.with_extension("mjs"));
 		let is_entry = self.file.file_stem() == Some(std::ffi::OsStr::new("main"));
 
-		if let Some(project) = project_support::detect(&self.file) {
+		// A bare file compiles as its own single-file project (rooted at its own
+		// directory), so it can `import std/…` and import siblings without a
+		// `nymph.toml` — see `project_support::single_file`.
+		if let Some(project) =
+			project_support::detect(&self.file).or_else(|| project_support::single_file(&self.file))
+		{
 			let load = fs_loader(project.src_root);
-			let result = if is_entry {
-				nymph_compiler::compile_project(&project.entry_key, &load)
-			} else {
-				nymph_compiler::compile_project_library(&project.entry_key, &load)
-			};
+			let result = guarded(|| {
+				if is_entry {
+					nymph_compiler::compile_project_with_std(
+						&project.entry_key,
+						&load,
+						&nymph_compiler::embedded_std_provider,
+					)
+				} else {
+					nymph_compiler::compile_project_library_with_std(
+						&project.entry_key,
+						&load,
+						&nymph_compiler::embedded_std_provider,
+					)
+				}
+			});
 			return match result {
-				Ok(compiled) => match write_output_atomically(&output_path, &compiled.js) {
+				Ok(Ok(compiled)) => match write_output_atomically(&output_path, &compiled.js) {
 					Ok(()) => 0,
 					Err(err) => {
 						eprintln!("error: could not write {}: {err}", output_path.display());
 						1
 					}
 				},
-				Err(diags) => {
+				Ok(Err(diags)) => {
 					eprint!("{}", render_project_diagnostics(&diags, &load));
+					1
+				}
+				Err(payload) => {
+					eprintln!("{}", unsupported_feature_message(&payload));
 					1
 				}
 			};

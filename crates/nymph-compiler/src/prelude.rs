@@ -63,6 +63,25 @@ const CORE_SOURCES: &[(&str, &str)] = &[
 		include_str!("../../../stdlib/src/range/mod.nym"),
 	),
 	("std/math", include_str!("../../../stdlib/src/math/mod.nym")),
+	// Methods on the built-in/primitive types are ambient too: `"…".length()`,
+	// `#[…].map()`, `#{…}.get()`, and `Set` operations must "just work" with no
+	// `import`, exactly like arithmetic on `int`. These modules only depend on
+	// other `core` modules above (set → map), so they flatten in cleanly. Genuinely
+	// optional modules (io's free functions, `LinkedList`/`Tree`/`Complex`) stay
+	// behind `import std/…`.
+	("std/string", include_str!("../../../stdlib/src/string.nym")),
+	(
+		"std/collections/list",
+		include_str!("../../../stdlib/src/collections/list.nym"),
+	),
+	(
+		"std/collections/map",
+		include_str!("../../../stdlib/src/collections/map.nym"),
+	),
+	(
+		"std/collections/set",
+		include_str!("../../../stdlib/src/collections/set.nym"),
+	),
 ];
 
 static CORE_PRELUDE: OnceLock<Vec<Module>> = OnceLock::new();
