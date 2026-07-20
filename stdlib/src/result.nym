@@ -1,4 +1,3 @@
-import @/option with (Option)
 import @/ops with (Unwrap)
 
 public enum Result<T, E> {
@@ -83,18 +82,6 @@ public enum Result<T, E> {
   func or_else<F>(f: (E) -> Result<T, F>) = match (this) {
     Ok(value) -> Ok(value),
     Error(error) -> f(error)
-  }
-
-  /// Converts a `Result<T, E>` into an `Option<T>`, discarding the error.
-  func ok(): Option<T> = match (this) {
-    Ok(value) -> Option.Some(value),
-    Error(...) -> Option.None
-  }
-
-  /// Converts a `Result<T, E>` into an `Option<E>`, discarding the success value.
-  func err(): Option<E> = match (this) {
-    Ok(...) -> Option.None,
-    Error(error) -> Option.Some(error)
   }
 }
 

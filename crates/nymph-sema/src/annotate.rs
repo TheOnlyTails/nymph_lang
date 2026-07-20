@@ -38,6 +38,19 @@ pub struct Resolution {
 	/// to build a `Call { callee: Field { .. }, .. }`.
 	pub method: EcoString,
 	pub dispatch: DispatchKind,
+	/// The defining span of whatever provided `method` — an impl's own `impl
+	/// Interface … for …`/nested `impl Interface { .. }` header (the `Ident`
+	/// naming the interface, `solve::ImplDef::span`), or an interface's own
+	/// span when resolved through a still-generic bound. `None` for a
+	/// `BuiltinEager`/`BuiltinShortCircuit` dispatch, which never goes through
+	/// the impl index at all. Lowering (Slice: stdlib body materialization)
+	/// reads this back to locate, inside the reconstructed offset prelude AST,
+	/// exactly which prelude impl/interface-default body a
+	/// `UserImplDefaultMethod` dispatch is unmaterialized *from* — the same
+	/// span `crate::infer_expr::impl_is_unmaterialized` already compares
+	/// against `SPAN_BASE` to classify `dispatch` in the first place, just
+	/// carried forward instead of discarded.
+	pub impl_span: Option<Span>,
 }
 
 /// What the checker learned about one expression node.
@@ -56,6 +69,21 @@ pub struct VariantResolution {
 	pub variant: ecow::EcoString,
 }
 
+/// How a `for` loop's source was proven iterable, once the syntactic-range and
+/// native-list fast paths are ruled out (see `infer_iterable_element`). Recorded
+/// on the iterable expression's `NodeId` so lowering (`lower_for`), which has no
+/// solver access of its own, can tell a source that IS the iterator (call
+/// `.next()` directly) apart from one that must first be turned into one (call
+/// `.iter()`). Both desugar to the same while/match protocol; only the first
+/// statement of the desugared block differs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IterMode {
+	/// The source itself implements `Iterator<Item>` — use it as-is.
+	Direct,
+	/// The source implements `Iterable<T>` — call `.iter()` to get the iterator.
+	ViaIter,
+}
+
 /// A [`NodeId`]-keyed map of [`ExprInfo`] plus variant resolutions, produced by
 /// checking and consumed by lowering.
 #[derive(Clone, Debug, Default)]
@@ -65,6 +93,17 @@ pub struct Annotations {
 	/// Variant *patterns*, keyed by span — patterns carry no `NodeId`, but each
 	/// written pattern has a unique source span.
 	pattern_variants: FxHashMap<Span, VariantResolution>,
+	/// A `for` loop's iterable, keyed by its own `NodeId` — see [`IterMode`].
+	iter_modes: FxHashMap<NodeId, IterMode>,
+	/// NodeId of a committed anonymous-closure-parameter (`$N`) boundary → its
+	/// arity (Slice: `$N` anonymous closure params). Populated by the
+	/// checker's type-directed boundary search (`anon_closure.rs`) as each
+	/// boundary is finally committed — this is the one channel from that
+	/// search back to lowering, which re-walks the original AST and has no
+	/// solver/type access of its own. Consumed by `lower_anon_closure` to know
+	/// which nodes must be wrapped as a synthesized `HirExpr::Closure` rather
+	/// than lowered as their own expression kind.
+	anon_boundaries: FxHashMap<NodeId, u8>,
 }
 
 impl Annotations {
@@ -109,6 +148,48 @@ impl Annotations {
 	/// The variant a pattern (by span) resolved to, if any.
 	pub fn pattern_variant_of(&self, span: Span) -> Option<&VariantResolution> {
 		self.pattern_variants.get(&span)
+	}
+
+	/// Record how a `for` loop's iterable (by its own `NodeId`) was proven
+	/// iterable. Nodes built outside the parser carry [`NodeId::DUMMY`] and are
+	/// never annotated (mirrors [`Annotations::record`]).
+	pub(crate) fn record_iter_mode(&mut self, id: NodeId, mode: IterMode) {
+		if id != NodeId::DUMMY {
+			self.iter_modes.insert(id, mode);
+		}
+	}
+
+	/// The [`IterMode`] recorded for a `for` loop's iterable, if any.
+	pub fn iter_mode_of(&self, id: NodeId) -> Option<IterMode> {
+		self.iter_modes.get(&id).copied()
+	}
+
+	/// Record `id` as a committed anonymous-closure-parameter boundary with
+	/// the given arity. Called only from the checker's trial-search commit
+	/// points (`anon_closure.rs`) — both the winning hypothesis of a
+	/// successful trial round and the final, widest hypothesis on search
+	/// exhaustion (so the subsequent real check/infer still forms a closure
+	/// and surfaces its natural type error loudly, rather than silently
+	/// falling through to `AnonymousParamUnsupported`).
+	pub(crate) fn record_anon_boundary(&mut self, id: NodeId, arity: u8) {
+		self.anon_boundaries.insert(id, arity);
+	}
+
+	/// Undo a trial [`Self::record_anon_boundary`] whose round's diagnostics
+	/// were discarded (the hypothesis didn't check) — see
+	/// `Checker::resolve_anon`.
+	pub(crate) fn remove_anon_boundary(&mut self, id: NodeId) {
+		self.anon_boundaries.remove(&id);
+	}
+
+	/// The arity of the anonymous-closure boundary committed at `id`, if any.
+	/// `Checker::check`/`Checker::infer` consult this at the top of every
+	/// dispatch (during both trial and real evaluation) to intercept a
+	/// boundary node before its ordinary expression-kind handling runs;
+	/// lowering (`lower_anon_closure`) consults the same map afterward to
+	/// rebuild the synthesized closure.
+	pub fn anon_boundary_arity(&self, id: NodeId) -> Option<u8> {
+		self.anon_boundaries.get(&id).copied()
 	}
 
 	/// Attach a `Resolution` to a node, preserving its already-recorded type. Used

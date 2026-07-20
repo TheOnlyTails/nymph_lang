@@ -64,12 +64,17 @@ impl Checker<'_> {
 						.iter()
 						.map(|f| (f.0.name.0.clone(), self.lower_type(&f.0.type_)))
 						.collect();
+					// Lower the struct's own generics' bounds while their param scope is
+					// still active (Slice 4G-b), so `Bound::ty`/`args` land in the same
+					// `Param` index space as `fields` above.
+					let bounds = self.lower_constraints(generics, 0);
 					self.pop_params();
 					self.sigs.structs.insert(
 						id,
 						StructSig {
 							generics: names,
 							fields,
+							bounds,
 						},
 					);
 				}
@@ -95,12 +100,16 @@ impl Checker<'_> {
 								.collect(),
 						})
 						.collect();
+					// Lower the enum's own generics' bounds while their param scope is
+					// still active (Slice 4G-b), same reasoning as the struct arm above.
+					let bounds = self.lower_constraints(generics, 0);
 					self.pop_params();
 					self.sigs.enums.insert(
 						id,
 						EnumSig {
 							generics: names,
 							variants,
+							bounds,
 						},
 					);
 				}
@@ -126,6 +135,11 @@ impl Checker<'_> {
 						Some(ty) => self.lower_type(ty),
 						None => self.fresh(),
 					};
+					// Lower the generics' own bounds while their param scope is still
+					// active (Slice 4G), so `Bound::ty`/`args` land in the same `Param`
+					// index space as `params`/`ret` above and a call site can substitute
+					// them with the identical `fresh_subst` map.
+					let bounds = self.lower_constraints(&meta.generics, 0);
 					self.pop_params();
 					self.sigs.funcs.insert(
 						id,
@@ -134,6 +148,7 @@ impl Checker<'_> {
 							params,
 							ret,
 							has_self: false,
+							bounds,
 						},
 					);
 				}
@@ -200,6 +215,10 @@ impl Checker<'_> {
 				self.interner.mk_fn(params, ret)
 			}
 			Type::Grouped(inner) => self.lower_type(inner),
+			Type::Mut(inner) => {
+				let inner = self.lower_type(inner);
+				self.interner.mk_mut(inner)
+			}
 			Type::Reference { name, generics } => self.lower_reference(ast.1, name, generics),
 		}
 	}

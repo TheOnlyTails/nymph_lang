@@ -21,7 +21,7 @@ impl string {
   external(repeat) func repeat(n: uint): string
   external(chars) func chars(): #[char]
   external(concat) func concat(other: string): string
-  external(concat_chars) func concat(other: #[char]): string
+  external(concat_chars) func concat_chars(other: #[char]): string
   external(reversed) func reversed(): string
   external(pad_start) func pad_start(length: uint, pad: char): string
   external(pad_end) func pad_end(length: uint, pad: char): string

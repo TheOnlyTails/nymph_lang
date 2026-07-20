@@ -53,18 +53,16 @@ enum Witness {
 
 impl Checker<'_> {
 	pub(crate) fn check_exhaustive(&mut self, scrutinee: Ty, arms: &[MatchArm], span: Span) {
+		// Peel a top-level `mut` before resolving: mutability doesn't affect the
+		// constructor space, but an unstripped `TyKind::Mut` would fall through to
+		// the catch-all-only arm below and spuriously demand a `_` case.
+		let scrutinee = self.strip_mut(scrutinee);
 		let scrutinee = self.resolve_deep(scrutinee);
 		match self.interner.kind(scrutinee) {
 			// Can't judge an unknown or already-errored scrutinee.
 			TyKind::Infer(_) | TyKind::Error => {}
 			// `int`'s constructors are unbounded; reason over integer intervals instead.
 			TyKind::Int => self.check_int_match(arms, span),
-			// `uint`'s constructors are unbounded too, but its domain is `[0, u64::MAX]`
-			// (no negative half) rather than `int`'s `[i64::MIN, i64::MAX]`, so it gets
-			// its own interval check over the unsigned line instead of falling through
-			// to `check_catch_all` (which would spuriously demand a `_` arm even when
-			// e.g. `0u -> .., 1u.. -> ..` already covers every `uint` value).
-			TyKind::UInt => self.check_uint_match(arms, span),
 			// Structural types have finite constructor signatures the algorithm enumerates.
 			TyKind::Boolean | TyKind::Tuple(_) => self.usefulness_check(scrutinee, arms, span),
 			TyKind::Adt(def, _)
@@ -107,7 +105,11 @@ impl Checker<'_> {
 			// No columns left: useful iff nothing above matched everything.
 			return matrix.is_empty().then(Vec::new);
 		};
-		let ty = types[0];
+		// A column's type can itself carry `mut` at any recursion depth (a tuple
+		// element, a struct field, an enum-variant field) — strip it before it
+		// drives constructor-signature lookups, or a `mut`-typed sub-position
+		// falls through to "no signature" and spuriously demands a catch-all.
+		let ty = self.strip_mut(types[0]);
 
 		match self.head_ctor(head, ty) {
 			Head::Or(a, b) => {
@@ -168,7 +170,7 @@ impl Checker<'_> {
 		ctor: &Ctor,
 		types: &[Ty],
 	) -> Option<Vec<Witness>> {
-		let ty = types[0];
+		let ty = self.strip_mut(types[0]);
 		let arity = self.ctor_arity(ctor, ty);
 		let mut sub_types = self.ctor_sub_types(ctor, ty);
 		sub_types.extend_from_slice(&types[1..]);
@@ -317,13 +319,58 @@ impl Checker<'_> {
 			}
 		}
 		match p {
-			Pattern::Tuple(entries) => entries
-				.iter()
-				.filter_map(|e| match &e.0 {
-					ListPatternEntry::Item(sub) => Some(Pat::Ref(&sub.0)),
-					_ => None,
-				})
-				.collect(),
+			// A tuple with no rest: one column per item, in order (the common case).
+			Pattern::Tuple(entries)
+				if !entries
+					.iter()
+					.any(|e| matches!(e.0, ListPatternEntry::Rest(_))) =>
+			{
+				entries
+					.iter()
+					.filter_map(|e| match &e.0 {
+						ListPatternEntry::Item(sub) => Some(Pat::Ref(&sub.0)),
+						_ => None,
+					})
+					.collect()
+			}
+			// A tuple with `...rest`: the row must still have exactly `arity` columns
+			// (one per tuple element) or the matrix's column-width invariant breaks
+			// (`default_matrix`'s `split_first` assumes uniform width) — expand `rest`
+			// to wildcard fillers spanning the elements it covers, prefix and suffix
+			// bound to the front/back columns as usual.
+			Pattern::Tuple(entries) => {
+				let mut prefix = Vec::new();
+				let mut suffix = Vec::new();
+				let mut seen_rest = false;
+				for e in entries {
+					match &e.0 {
+						ListPatternEntry::Item(sub) => {
+							if seen_rest {
+								suffix.push(Pat::Ref(&sub.0));
+							} else {
+								prefix.push(Pat::Ref(&sub.0));
+							}
+						}
+						ListPatternEntry::Rest(_) => seen_rest = true,
+					}
+				}
+				// Degenerate case (already reported by the checker as a type mismatch —
+				// `#(a, b, ...rest, c, d)` against a shorter tuple): prefix+suffix alone
+				// can exceed `arity`. Truncate to keep the row exactly `arity` columns
+				// wide rather than overrunning it and panicking downstream.
+				if prefix.len() > arity {
+					prefix.truncate(arity);
+				}
+				let remaining = arity - prefix.len();
+				if suffix.len() > remaining {
+					let drop = suffix.len() - remaining;
+					suffix.drain(0..drop);
+				}
+				let filler = remaining.saturating_sub(suffix.len());
+				prefix.extend(std::iter::repeat_n(Pat::Wild, filler));
+				prefix.extend(suffix);
+				prefix
+			}
 			Pattern::Struct { fields, .. } => {
 				let names = self.ctor_field_names(ctor, ty);
 				names
@@ -509,24 +556,6 @@ impl Checker<'_> {
 		}
 	}
 
-	/// Check a `uint` match by covering the full unsigned `[0, u64::MAX]` line
-	/// with literal/range patterns — the unsigned mirror of `check_int_match`.
-	fn check_uint_match(&mut self, arms: &[MatchArm], span: Span) {
-		let mut ranges: Vec<(u64, u64)> = Vec::new();
-		for arm in arms {
-			if arm.guard.is_some() {
-				continue;
-			}
-			match uint_cover(&arm.pattern.0) {
-				UIntCover::All => return,
-				UIntCover::Ranges(rs) => ranges.extend(rs),
-			}
-		}
-		if !covers_full_uint_range(ranges) {
-			self.emit(span, TypeError::NonExhaustiveUInt);
-		}
-	}
-
 	fn check_catch_all(&mut self, arms: &[MatchArm], span: Span) {
 		let mut has_catch_all = false;
 		for arm in arms {
@@ -654,92 +683,6 @@ fn covers_full_int_range(mut ranges: Vec<(i64, i64)>) -> bool {
 		reach = reach.max(hi);
 	}
 	reach == i64::MAX
-}
-
-/// What a `uint` pattern covers on the unsigned `[0, u64::MAX]` line — the
-/// unsigned mirror of [`IntCover`]. Keyed on `Pattern::UInt`/`Pattern::Range`
-/// only: a well-typed `uint` match arm uses `u`-suffixed integer literals
-/// (`0u`, `1u..`), never a plain `int` literal — pattern inference rejects the
-/// latter against a `uint` scrutinee with a `MismatchedTypes` diagnostic of
-/// its own, so this never needs to treat `Pattern::Int` as unsigned.
-enum UIntCover {
-	All,
-	Ranges(Vec<(u64, u64)>),
-}
-
-fn uint_cover(pattern: &Pattern) -> UIntCover {
-	match pattern {
-		Pattern::Placeholder => UIntCover::All,
-		Pattern::Binding { inner, .. } => uint_cover(&inner.0),
-		Pattern::Grouped(inner) => uint_cover(&inner.0),
-		Pattern::Union(a, b) => match (uint_cover(&a.0), uint_cover(&b.0)) {
-			(UIntCover::All, _) | (_, UIntCover::All) => UIntCover::All,
-			(UIntCover::Ranges(mut x), UIntCover::Ranges(y)) => {
-				x.extend(y);
-				UIntCover::Ranges(x)
-			}
-		},
-		Pattern::UInt(n) => UIntCover::Ranges(vec![(n.0, n.0)]),
-		Pattern::Range(kind) => match uint_range_bounds(kind) {
-			Some((lo, hi)) if lo <= hi => UIntCover::Ranges(vec![(lo, hi)]),
-			_ => UIntCover::Ranges(Vec::new()),
-		},
-		_ => UIntCover::Ranges(Vec::new()),
-	}
-}
-
-/// The unsigned mirror of `int_range_bounds`: the lower bound of an open
-/// (`From`) range is the domain floor `0`, not `u64::MIN` (which is also `0`,
-/// but spelled out for symmetry with `int_range_bounds`'s `i64::MIN`), and a
-/// `To`/`Exclusive` upper bound one below `0` (i.e. `max` itself is `0`) has
-/// no representable predecessor — `checked_sub` reports that as `None`
-/// rather than wrapping around to `u64::MAX`, matching `int_range_bounds`'
-/// use of `saturating_sub` only where wraparound can't occur (`i64` has
-/// headroom below `MIN` that `u64` doesn't have below `0`).
-fn uint_range_bounds(kind: &RangePatternKind) -> Option<(u64, u64)> {
-	match kind {
-		RangePatternKind::From(min) => Some((uint_lit(&min.0)?, u64::MAX)),
-		RangePatternKind::To(max) => Some((0, uint_lit(&max.0)?.checked_sub(1)?)),
-		RangePatternKind::ToInclusive(max) => Some((0, uint_lit(&max.0)?)),
-		RangePatternKind::Exclusive { min, max } => {
-			Some((uint_lit(&min.0)?, uint_lit(&max.0)?.checked_sub(1)?))
-		}
-		RangePatternKind::Inclusive { min, max } => Some((uint_lit(&min.0)?, uint_lit(&max.0)?)),
-	}
-}
-
-fn uint_lit(pattern: &Pattern) -> Option<u64> {
-	match pattern {
-		Pattern::UInt(n) => Some(n.0),
-		Pattern::Grouped(inner) => uint_lit(&inner.0),
-		_ => None,
-	}
-}
-
-/// The unsigned mirror of `covers_full_int_range`: the domain floor is `0`
-/// (never negative), and the `reach == u64::MAX` short-circuit must run
-/// BEFORE `lo > reach + 1` — `reach + 1` overflows a `u64` once `reach` hits
-/// `u64::MAX`, unlike `i64::MAX + 1`'s analogous (also avoided) overflow.
-fn covers_full_uint_range(mut ranges: Vec<(u64, u64)>) -> bool {
-	ranges.retain(|&(lo, hi)| lo <= hi);
-	ranges.sort_by_key(|&(lo, _)| lo);
-	let Some(&(first_lo, first_hi)) = ranges.first() else {
-		return false;
-	};
-	if first_lo > 0 {
-		return false;
-	}
-	let mut reach = first_hi;
-	for &(lo, hi) in &ranges[1..] {
-		if reach == u64::MAX {
-			return true;
-		}
-		if lo > reach + 1 {
-			return false;
-		}
-		reach = reach.max(hi);
-	}
-	reach == u64::MAX
 }
 
 fn is_irrefutable(pattern: &Pattern) -> bool {

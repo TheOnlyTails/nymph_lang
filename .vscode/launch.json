@@ -5,9 +5,9 @@
 			"name": "Extension Development Host",
 			"type": "extensionHost",
 			"request": "launch",
-			"args": ["--extensionDevelopmentPath=${workspaceFolder}/extension"],
+			"args": ["--extensionDevelopmentPath=${workspaceFolder}/extension", "--disable-extensions", "--profile-temp"],
 			"outFiles": ["${workspaceFolder}/extension/out/**/*.js"],
-			"preLaunchTask": "npm: compile - extension"
+			"preLaunchTask": "Build extension + LSP server",
 		},
 		{
 			"name": "Attach to Language Server",

@@ -1,4 +1,3 @@
-import @/result with (Result)
 import @/default with (Default)
 import @/ops with (Unwrap)
 
@@ -52,13 +51,6 @@ public enum Option<T> {
     }
 
     this
-  }
-
-  func ok_or<E>(error: E) = this.ok_or_else(() -> error)
-  
-  func ok_or_else<E>(error: () -> E) = match (this) {
-    Some(value) -> Result.Ok(value),
-    None -> Result.Error(error)
   }
 
   func and<U>(other: Option<U>) = match (this) {

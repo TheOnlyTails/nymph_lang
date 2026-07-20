@@ -216,12 +216,22 @@ pub type Generics = Vec<EcoString>;
 pub struct StructSig {
 	pub generics: Generics,
 	pub fields: Vec<(EcoString, Ty)>,
+	/// The interface bounds declared on this struct's own generics (Slice 4G-b),
+	/// e.g. `struct Range<Idx: Comparable<Idx>>` — one [`crate::iface::Bound`] per
+	/// bound, with `ty = Param(i)` in this signature's own `0..generics.len()` index
+	/// space (the same space `instantiate_struct`'s `fresh_subst` mints into), so a
+	/// construction site can substitute them exactly like `fields`.
+	pub bounds: Vec<crate::iface::Bound>,
 }
 
 #[derive(Debug, Clone)]
 pub struct EnumSig {
 	pub generics: Generics,
 	pub variants: Vec<VariantSig>,
+	/// The interface bounds declared on this enum's own generics (Slice 4G-b), same
+	/// index space as [`StructSig::bounds`] (matching `instantiate_enum`'s
+	/// `fresh_subst`).
+	pub bounds: Vec<crate::iface::Bound>,
 }
 
 #[derive(Debug, Clone)]
@@ -250,6 +260,13 @@ pub struct FuncSig {
 	/// `false` in Milestone A, which has no method definitions.
 	#[allow(dead_code)]
 	pub has_self: bool,
+	/// The interface bounds declared on this function's own generics (Slice 4G),
+	/// e.g. `T: Area` or `T: Comparable<Other = T>` — one [`crate::iface::Bound`]
+	/// per bound, with `ty = Param(i)` in this signature's own `0..generics.len()`
+	/// index space (the same space `fresh_subst` mints into), so a call site can
+	/// substitute them exactly like `params`/`ret`. Read by `fn_type_of` to defer a
+	/// call-site obligation per bound per instantiation.
+	pub bounds: Vec<crate::iface::Bound>,
 }
 
 /// The lowered signatures of every top-level definition. Built once, read-only

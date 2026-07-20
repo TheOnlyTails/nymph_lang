@@ -6,17 +6,68 @@
 //!
 //! 1. **Parse** ([`nymph_syntax::parse_module`]) — source text to an AST
 //!    ([`nymph_ast::decl::Module`]), plus any lex/parse diagnostics.
-//! 2. **Check** ([`nymph_sema::check_module`]) — name resolution and type
-//!    checking over the AST, producing diagnostics and type annotations.
-//! 3. **Lower** ([`nymph_sema::lower_hir`]) — the checked AST to HIR.
+//! 2. **Check** ([`nymph_sema::check_module_with_prelude`]) — name resolution
+//!    and type checking over the AST, with the stdlib operator-interface
+//!    prelude (`std/ops`: `Plus`, `Comparable`, `Equals`, …) flattened ahead of
+//!    it (see [`prelude`]), producing diagnostics and type annotations.
+//! 3. **Lower** ([`nymph_sema::lower_hir_with_prelude`]) — the checked AST to
+//!    HIR. `prelude` is passed through unchanged (the same raw slice `check`
+//!    fed the checker) so lowering can re-offset it itself and, per the
+//!    stdlib body materialization slice, both (a) resolve a user `impl
+//!    <PreludeInterface> for <Type>` (the interface's own declaration lives
+//!    in the prelude, invisible to a lowering that only ever walked the
+//!    user's own AST) and (b) demand-materialize a prelude-owned body
+//!    (a primitive/blanket impl, or an interface default reached through
+//!    one) as a top-level mangled function when it's real, self-contained
+//!    Nymph code — see [`nymph_sema::lower_hir_with_prelude`]'s doc comment.
 //! 4. **Emit** ([`nymph_codegen::emit`]) — HIR to a JavaScript module string.
 //!
 //! [`compile`] runs the full pipeline and only lowers/emits when parsing and
 //! checking are error-free. [`check`] runs just the parse and check stages
 //! and returns every diagnostic (errors and warnings alike), which is the
 //! entry point tooling such as an LSP should use.
+//!
+//! [`compile_entry`] and [`check_entry`] are additive entry-mode counterparts
+//! (GG1): identical to [`compile`]/[`check`], except the module is also
+//! required to declare a valid top-level `main` — the program's entry point —
+//! via [`nymph_sema::check_module_entry_with_prelude`]. Plain
+//! [`compile`]/[`check`] never require a `main`, so every existing
+//! library-mode caller is unaffected.
+//!
+//! Because the prelude is flattened ahead of every checked module, a user
+//! program can implement (and use) `Plus`/`Comparable`/… without declaring
+//! them locally, and `compile` now lowers and emits that program too. A
+//! dispatch into a prelude-owned body still panics loudly at lowering time
+//! when codegen genuinely cannot materialize it (`external`/intrinsic
+//! markers — every primitive arithmetic op, `compare_to_int`/`_float`/
+//! `_char`/`_string`, the `Equals`/`Contains` blanket externals — or a
+//! still-generic bound satisfied only through the prelude); silent wrong JS
+//! is never an acceptable alternative to that loud deferral. Compiling
+//! `stdlib/src/ops/mod.nym` itself through this facade is out of scope — the
+//! prelude would collide with itself (KK2) — real stdlib compilation arrives
+//! with import binding.
+
+mod intrinsics;
+mod prelude;
+pub mod project;
+
+use std::path::{Path, PathBuf};
 
 pub use nymph_diagnostics::{Diagnostic, Severity};
+pub use project::{
+	CompiledProject, ProjectDiagnostic, check_project, check_project_library,
+	check_project_library_with_std, check_project_with_std, compile_project, compile_project_library,
+	compile_project_library_with_std, compile_project_with_std,
+};
+
+/// Whether a compile/check pass should additionally require a valid
+/// top-level `main` entry point ([`nymph_sema::check_module_entry`]) or run
+/// as a plain library module ([`nymph_sema::check_module`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EntryMode {
+	Library,
+	Entry,
+}
 
 /// Compile Nymph `source` to a JavaScript module string.
 ///
@@ -34,6 +85,28 @@ pub use nymph_diagnostics::{Diagnostic, Severity};
 /// Returns `Err` with all error-severity diagnostics from parsing and
 /// checking if the source fails to parse or type-check.
 pub fn compile(source: &str, path: &str) -> Result<String, Vec<Diagnostic>> {
+	compile_impl(source, path, EntryMode::Library)
+}
+
+/// Compile Nymph `source` as the program's *entry module*, to a JavaScript
+/// module string.
+///
+/// Identical to [`compile`], except `source` is additionally required to
+/// declare a valid top-level `main` (see [`nymph_sema::check_module_entry`]);
+/// a missing or mis-shaped `main` is reported as an ordinary error diagnostic
+/// alongside any other parse/type errors, and lowering/emission are skipped
+/// just as for any other error.
+///
+/// # Errors
+///
+/// Returns `Err` with all error-severity diagnostics from parsing and
+/// checking if the source fails to parse, fails to type-check, or has no
+/// valid top-level `main`.
+pub fn compile_entry(source: &str, path: &str) -> Result<String, Vec<Diagnostic>> {
+	compile_impl(source, path, EntryMode::Entry)
+}
+
+fn compile_impl(source: &str, path: &str, entry: EntryMode) -> Result<String, Vec<Diagnostic>> {
 	let parsed = nymph_syntax::parse_module(source, path);
 	let mut diags: Vec<Diagnostic> = parsed
 		.diagnostics
@@ -42,15 +115,20 @@ pub fn compile(source: &str, path: &str) -> Result<String, Vec<Diagnostic>> {
 		.cloned()
 		.collect();
 
-	let checked = nymph_sema::check_module(&parsed.tree);
+	let prelude = prelude::core_prelude();
+	let checked = match entry {
+		EntryMode::Library => nymph_sema::check_module_with_prelude(&parsed.tree, prelude),
+		EntryMode::Entry => nymph_sema::check_module_entry_with_prelude(&parsed.tree, prelude),
+	};
 	diags.extend(checked.diags.iter().filter(|d| d.is_error()).cloned());
 
 	if !diags.is_empty() {
 		return Err(diags);
 	}
 
-	Ok(nymph_codegen::emit(&nymph_sema::lower_hir(
+	Ok(nymph_codegen::emit(&nymph_sema::lower_hir_with_prelude(
 		&parsed.tree,
+		prelude,
 		&checked,
 	)))
 }
@@ -66,6 +144,55 @@ pub fn compile(source: &str, path: &str) -> Result<String, Vec<Diagnostic>> {
 /// warnings. This is the entry point tooling and language servers should use
 /// to surface the full diagnostic picture for a source file.
 pub fn check(source: &str, path: &str) -> Vec<Diagnostic> {
+	check_impl(source, path, EntryMode::Library)
+}
+
+/// Parse and check Nymph `source` as the program's *entry module*, returning
+/// every diagnostic produced.
+///
+/// Identical to [`check`], except `source` is additionally required to
+/// declare a valid top-level `main` (see [`nymph_sema::check_module_entry`]).
+pub fn check_entry(source: &str, path: &str) -> Vec<Diagnostic> {
+	check_impl(source, path, EntryMode::Entry)
+}
+
+fn check_impl(source: &str, path: &str, entry: EntryMode) -> Vec<Diagnostic> {
+	let parsed = nymph_syntax::parse_module(source, path);
+	let mut diags = parsed.diagnostics;
+
+	let prelude = prelude::core_prelude();
+	let checked = match entry {
+		EntryMode::Library => nymph_sema::check_module_with_prelude(&parsed.tree, prelude),
+		EntryMode::Entry => nymph_sema::check_module_entry_with_prelude(&parsed.tree, prelude),
+	};
+	diags.extend(checked.diags);
+
+	diags
+}
+
+/// Parse and check Nymph `source` with **no ambient prelude** — the `core`
+/// module's own operator interfaces, `Option`/`Result`, `Iterator`/`Iterable`,
+/// etc. are *not* injected.
+///
+/// [`check`] always flattens [`prelude::core_prelude`] ahead of the checked
+/// module, which is exactly wrong for a **stdlib source file itself**: opening
+/// `stdlib/src/ops/mod.nym` (say) through [`check`] injects a second copy of
+/// `std/ops` right next to the real one, so every declaration in it collides
+/// with its own ambient copy — a flood of spurious duplicate-declaration
+/// errors that has nothing to do with the file's actual content. This entry
+/// point checks `source` in isolation instead, exactly like a normal
+/// `nymph_sema::check_module` library-mode module with no injected sources.
+///
+/// This trades self-duplication for a different, honest limitation: a stdlib
+/// file that imports siblings (e.g. `option.nym` importing `@/default`) will
+/// report those siblings as unresolved, since a prelude-free, project-free
+/// check only ever sees the one file. That's an inherent consequence of
+/// checking one file in isolation, not a regression — see
+/// [`is_stdlib_source_path`] for how callers (the LSP) decide when to use this
+/// instead of [`check`].
+///
+/// `path` is used only to anchor diagnostics, exactly as in [`check`].
+pub fn check_without_prelude(source: &str, path: &str) -> Vec<Diagnostic> {
 	let parsed = nymph_syntax::parse_module(source, path);
 	let mut diags = parsed.diagnostics;
 
@@ -73,4 +200,33 @@ pub fn check(source: &str, path: &str) -> Vec<Diagnostic> {
 	diags.extend(checked.diags);
 
 	diags
+}
+
+/// The filesystem root of the `stdlib/src` tree embedded (via `include_str!`)
+/// into [`prelude::core_prelude`], canonicalized. `None` if it can't be
+/// resolved (e.g. the embedding `stdlib/` directory has been moved or deleted
+/// out from under a built binary) — callers should treat that as "not a
+/// stdlib path".
+pub fn stdlib_source_root() -> Option<PathBuf> {
+	Path::new(env!("CARGO_MANIFEST_DIR"))
+		.join("../../stdlib/src")
+		.canonicalize()
+		.ok()
+}
+
+/// Whether `path` names a file inside the `stdlib/src` tree this compiler
+/// embeds as the ambient `core` prelude (see [`stdlib_source_root`]) — the
+/// principled signal for "this file IS (part of) the prelude", as opposed to
+/// a brittle path/substring guess. A normal user file, anywhere outside that
+/// tree, is never a stdlib source path.
+///
+/// Used by callers (the LSP) to decide between [`check`] (ambient prelude —
+/// every ordinary user file) and [`check_without_prelude`] (no ambient
+/// prelude — a stdlib source file, which would otherwise duplicate itself
+/// against its own injected copy).
+pub fn is_stdlib_source_path(path: &Path) -> bool {
+	matches!(
+		(stdlib_source_root(), path.canonicalize()),
+		(Some(root), Ok(p)) if p.starts_with(&root)
+	)
 }

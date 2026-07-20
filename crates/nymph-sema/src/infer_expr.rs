@@ -12,19 +12,88 @@ use ecow::EcoString;
 use nymph_ast::{
 	NodeId, Span, Spanned,
 	decl::Declaration,
-	expr::{CallArg, Expr, ExprKind, RangeKind, Statement, StringPart},
+	expr::{CallArg, Expr, ExprKind, ListItem, RangeKind, Statement, StringPart},
 	ops::{AssignOperator, BinaryOperator, PrefixOperator},
+	ty::Type,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::annotate::{DispatchKind, Resolution};
+use crate::annotate::{DispatchKind, IterMode, Resolution};
 use crate::check::Checker;
 use crate::def::DefKind;
 use crate::errors::TypeError;
 use crate::ids::{DefId, ParamIdx};
 use crate::lower::build_param_scope;
-use crate::solve::MethodSource;
+use crate::prelude::SPAN_BASE;
+use crate::solve::{MethodResolution, MethodSource};
 use crate::ty::{GenericArgs, Ty, TyKind};
+
+/// Whether a resolved method call's underlying impl is invisible to lowering: its
+/// declaration was cloned from an offset prelude module (`impl_span.start >=
+/// SPAN_BASE`, `check_module_with_prelude`'s prelude-origin marker), which
+/// `compile_with_prelude` never lowers (it lowers only the user's own AST — see
+/// `nymph_compiler::prelude`). True for a method the matched impl provides
+/// directly (e.g. the stdlib's `impl<T> Equals<Other = self> for T` blanket impl)
+/// just as much as one that falls back to the interface's own default body (e.g.
+/// that same `Equals`'s `not_equals`) — either way nothing materializes the
+/// method anywhere in the emitted class (Finding 2, stdlib linkage groundwork).
+/// Every `MethodSource` populates `impl_span` with *some* defining span (round 2
+/// of the stdlib linkage groundwork review closed the `Inherent`/`GenericBound`
+/// gap: `Inherent` now carries the matched inherent method's own span,
+/// `GenericBound` the span of the interface the bound was satisfied through —
+/// see their `MethodResolution` construction sites in `solve.rs`), so this
+/// correctly flags a prelude-origin resolution regardless of `MethodSource`,
+/// while staying `false` for every ordinary user-declared method/interface
+/// (whose span is always well below `SPAN_BASE`).
+fn impl_is_unmaterialized(res: &MethodResolution) -> bool {
+	res.impl_span.is_some_and(|span| span.start >= SPAN_BASE)
+}
+
+/// The `DispatchKind` a resolved *operator* desugaring (Slice 4B) must be lowered
+/// with. `Inherent`/`ImplDirect`/`InterfaceDefault` are a real, directly-callable
+/// method — Slice 4C-b materializes un-overridden interface default methods onto
+/// every implementing struct's class — *provided* the matched impl isn't
+/// prelude-only (`impl_is_unmaterialized`); `GenericBound` is always deferred
+/// regardless of `impl_is_unmaterialized` (see `dispatch_operator`'s call site
+/// for why a still-generic receiver can't pick a native operator or method name
+/// at lowering time the way a plain method call — `dispatch_kind_for_method_call`,
+/// below — safely can).
+fn dispatch_kind_for_operator(res: &MethodResolution) -> DispatchKind {
+	if impl_is_unmaterialized(res) {
+		return DispatchKind::UserImplDefaultMethod;
+	}
+	match res.source {
+		MethodSource::Inherent | MethodSource::ImplDirect | MethodSource::InterfaceDefault => {
+			DispatchKind::UserImpl
+		}
+		MethodSource::GenericBound => DispatchKind::UserImplDefaultMethod,
+	}
+}
+
+/// The `DispatchKind` a resolved plain `receiver.method(args…)` call (Finding 2,
+/// stdlib linkage groundwork) must be lowered with. Unlike an operator, a plain
+/// call's JS method name is always the literal identifier the user wrote
+/// (`member.0`, recorded verbatim as `Resolution::method`) regardless of which
+/// `MethodSource` it resolved through — there is no native-operator-vs-method-name
+/// choice to make at lowering time — so a still-generic `GenericBound` dispatch
+/// is *usually* safe here (type erasure: whichever concrete type instantiates the
+/// bound at a given call site provides its own compiled method, because that
+/// type's own impl is part of the user's module and gets lowered/materialized
+/// along with everything else — confirmed by golden-program coverage of
+/// `func f<T: Area>(shape: T): int = shape.area()`-shaped calls). The one real
+/// hazard, caught here via `impl_is_unmaterialized` rather than a blanket
+/// `GenericBound` deferral (contrast `dispatch_kind_for_operator`, which — for
+/// unrelated codegen reasons already covered by that function's own doc comment —
+/// defers *every* `GenericBound` operator, prelude-origin or not): a bound
+/// satisfied *only* through a prelude-only interface/impl (round 2, Findings 1 &
+/// 3), which is never materialized anywhere `compile_with_prelude` lowers.
+fn dispatch_kind_for_method_call(res: &MethodResolution) -> DispatchKind {
+	if impl_is_unmaterialized(res) {
+		DispatchKind::UserImplDefaultMethod
+	} else {
+		DispatchKind::UserImpl
+	}
+}
 
 impl<'m> Checker<'m> {
 	// ── Body driver ──────────────────────────────────────────────────────────
@@ -61,11 +130,18 @@ impl<'m> Checker<'m> {
 			self.bind_pattern(&param.0.name, psig.ty, param.0.mutable);
 		}
 		let prev = self.ret_ty.replace(sig.ret);
+		// A function's own body is exactly the same kind of closure slot a
+		// `let` initializer is (see `check_let_body`'s matching call) — e.g.
+		// `func pred(): (int) -> boolean = $ % 2 == 0` is just the top-level
+		// spelling of the same boundary the canonical `xs.filter($ % 2 == 0)`
+		// example forms as a call argument.
+		self.resolve_anon(body, Some(sig.ret));
 		self.check(body, sig.ret);
 		self.ret_ty = prev;
 		// Drain this body's deferred operators now, while its `param_bounds` are
 		// still the ones just built above — see `pending_operators`'s doc comment.
 		self.finalize_pending_operators();
+		self.finalize_pending_bounds();
 		self.pop_scope();
 		self.pop_params();
 	}
@@ -78,13 +154,43 @@ impl<'m> Checker<'m> {
 		};
 		let ty = self.sigs.lets[&id];
 		self.push_scope();
+		self.resolve_anon(value, Some(ty));
 		self.check(value, ty);
 		self.finalize_pending_operators();
+		self.finalize_pending_bounds();
 		self.pop_scope();
 	}
 
 	// ── check mode ───────────────────────────────────────────────────────────
+	/// Thin wrapper around [`Self::check_dispatch`]: intercepts a committed
+	/// anonymous-closure (`$N`) boundary (Slice: `$N` anonymous closure
+	/// params) BEFORE the ordinary per-kind dispatch, forming the closure and
+	/// subtyping it against `expected` exactly like an explicit closure would
+	/// — see `anon_closure.rs`'s module doc for why this split (mirroring
+	/// `lower_expr`/`lower_expr_inner` in `lower_hir.rs`) is needed: calling
+	/// `self.check` again from inside the boundary's own formation would just
+	/// re-hit this same interception and recurse forever.
 	pub(crate) fn check(&mut self, expr: &Expr, expected: Ty) {
+		if let Some(arity) = self.annotations.anon_boundary_arity(expr.id) {
+			let got = self.form_anon_closure(expr, arity);
+			self.subtype(got, expected, expr.span);
+			return;
+		}
+		self.check_dispatch(expr, expected);
+	}
+
+	fn check_dispatch(&mut self, expr: &Expr, expected: Ty) {
+		// Owned-literal → `mut` coercion (Bug 2): a `#{…}`/`#[…]` literal never
+		// infers as `mut` (see `infer_kind`'s `Map`/`List` arms), so without this it
+		// would always fail the one-way `mut T <: T` `subtype` check below when
+		// `expected` is `mut`. Handled once here, ahead of the per-kind match, so
+		// every `check`-routed call site — struct/enum ctor fields, block/if/match
+		// branches, the `List` arm just below — benefits uniformly. See
+		// `try_coerce_owned_literal_to_mut`'s doc comment for why this can't leak
+		// into accepting a named binding.
+		if self.try_coerce_owned_literal_to_mut(expr, expected) {
+			return;
+		}
 		match &expr.kind {
 			ExprKind::Closure { .. } => self.check_closure(expr, expected),
 			ExprKind::Block { body, .. } => {
@@ -127,15 +233,176 @@ impl<'m> Checker<'m> {
 			// literal is retyped, e.g. `1` → `1f` / `1u`, rather than reported as a
 			// mismatch). In any other expected context it synthesises `int` as usual.
 			ExprKind::Int(_) if self.int_literal_coerces_to(expected) => {}
+			// Mirrors `infer_kind`'s own `ExprKind::List` arm, but — when `expected` is
+			// (or resolves to) a concrete `List` — checks each element against the
+			// ALREADY-concrete element type from `expected`, rather than a fresh var
+			// only unified with `expected` after every element has been checked. That
+			// ordering is what lets a nested bare variant (or anything else driven by
+			// `check`'s `expected`) see the real element type: `#[Leaf]` checked
+			// against `#[Tree]` must resolve `Leaf` against `Tree`, not fall back to
+			// the ambiguous global lookup because the shared `elem` var was still
+			// unbound at the moment `Leaf` itself was checked.
+			ExprKind::List(items) => {
+				let elem = self
+					.expected_list_element(expected)
+					.unwrap_or_else(|| self.fresh());
+				let ty = self.check_list(items, elem, expr.span);
+				// This arm bypasses the catch-all `_ => self.infer(expr)` below (whose
+				// callee, `infer_dispatch`, is what normally records a node's type), so
+				// it must record the list's own node explicitly — mirrors
+				// `try_check_expected_variant`'s explicit `record` calls, needed for
+				// exactly the same reason.
+				self.record(expr.id, ty, None);
+				self.subtype(ty, expected, expr.span);
+			}
+			// Mirrors the `ExprKind::List` arm just above (see its doc comment): when
+			// `expected` pins a concrete `Map`, each entry checks against the
+			// ALREADY-concrete key/value types instead of a fresh var only unified
+			// after the fact — the fix that lets a nested `mut`-expected value (e.g.
+			// `#{int: mut #[int]}`'s value) reach its own
+			// `try_coerce_owned_literal_to_mut` in turn (Confirmed defect 1).
+			ExprKind::Map(entries) => {
+				let (key, value) = self
+					.expected_map_entry(expected)
+					.unwrap_or_else(|| (self.fresh(), self.fresh()));
+				let ty = self.check_map(entries, key, value, expr.span);
+				// Bypasses the catch-all `_ => self.infer(expr)` below, so — mirroring
+				// the `List` arm — this must record the map's own node explicitly.
+				self.record(expr.id, ty, None);
+				self.subtype(ty, expected, expr.span);
+			}
 			_ => {
-				let got = self.infer(expr);
+				let got = match self.try_check_expected_variant(expr, expected) {
+					Some(ty) => ty,
+					None => self.infer(expr),
+				};
 				self.subtype(got, expected, expr.span);
 			}
 		}
 	}
 
+	/// A bare nullary variant identifier (`Equal`) or a bare variant call (`Some(x)`)
+	/// checked against a concrete expected enum type resolves against THAT enum before
+	/// falling back to the global by-name lookup `infer` would otherwise use — this is
+	/// what lets `let o: Order = Equal` (and a fn returning a bare variant) check even
+	/// when another enum shares the variant name. Returns `None` (leaving `check_dispatch`
+	/// to fall through to `self.infer`) for every other expression shape, for a bare name
+	/// already resolved by a local binding or a top-level def (preserving local/def
+	/// precedence exactly as `infer_identifier`/`infer_call` do), or when `expected`
+	/// doesn't pin a concrete enum that declares the name as a variant.
+	fn try_check_expected_variant(&mut self, expr: &Expr, expected: Ty) -> Option<Ty> {
+		match &expr.kind {
+			ExprKind::Identifier(name) => {
+				if self.lookup_local(&name.0).is_some() || self.defs.get(&name.0).is_some() {
+					return None;
+				}
+				let (enum_def, variant) = self.expected_enum_variant(expected, &name.0)?;
+				let ty = self.variant_value(enum_def, variant, expr.id, expr.span);
+				self.record(expr.id, ty, None);
+				Some(ty)
+			}
+			ExprKind::Call { func, args, .. } => {
+				let ExprKind::Identifier(name) = &func.kind else {
+					return None;
+				};
+				if self.defs.get(&name.0).is_some() {
+					return None;
+				}
+				let (enum_def, variant) = self.expected_enum_variant(expected, &name.0)?;
+				let ty =
+					self.infer_variant_ctor(enum_def, variant, args, expr.span, expr.id, Some(expected));
+				self.record(expr.id, ty, None);
+				Some(ty)
+			}
+			_ => None,
+		}
+	}
+
+	/// Check every item of a list literal against `elem` — a concrete element type
+	/// pinned by the caller's own expected type when one is available (`check_dispatch`
+	/// uses `expected_list_element`), or a fresh var when there is none (`infer_kind`'s
+	/// unchecked `infer`). Checking each item against the ALREADY-concrete `elem` — as
+	/// opposed to a fresh var only unified with the outer expected type after every
+	/// item has been checked — is what lets a nested bare variant (or anything else
+	/// driven by `check`'s `expected`) see the real element type.
+	fn check_list(&mut self, items: &[Spanned<ListItem>], elem: Ty, span: Span) -> Ty {
+		for item in items {
+			match &item.0 {
+				ListItem::Expr(e) => self.check(e, elem),
+				// SS1 (SMART spread): the source need not be a same-kind `#[T]` literal
+				// — ANY `Iterator<T>`/`Iterable<T>` whose element unifies with `elem`
+				// is accepted, reusing Track A's own iterable resolution
+				// (`infer_iterable_element`, which itself already special-cases a
+				// syntactic range and a native list before falling back to the
+				// `Iterator`/`Iterable` interfaces) rather than forcing an exact
+				// `#[elem]` `check`. A non-iterable source gets Track A's own
+				// `NotIterable` diagnostic for free.
+				ListItem::Spread(e) => {
+					let src_elem = self.infer_iterable_element(e);
+					self.unify(src_elem, elem, span);
+				}
+			}
+		}
+		self.interner.mk_list(elem)
+	}
+
+	/// Check every entry of a map literal against `(key, value)` — concrete
+	/// key/value types pinned by the caller's own expected type when one is
+	/// available (`check_dispatch` uses `expected_map_entry`), or fresh vars
+	/// when there is none. Mirrors [`Self::check_list`] exactly (see its doc
+	/// comment for why checking against an already-concrete type, rather than a
+	/// fresh var only unified after the fact, matters); the spread-entry
+	/// handling below mirrors `infer_kind`'s own `ExprKind::Map` arm.
+	fn check_map(
+		&mut self,
+		entries: &[Spanned<nymph_ast::expr::MapEntry>],
+		key: Ty,
+		value: Ty,
+		span: Span,
+	) -> Ty {
+		use nymph_ast::expr::MapEntry;
+		for entry in entries {
+			match &entry.0 {
+				MapEntry::Entry(k, v) => {
+					self.check(k, key);
+					self.check(v, value);
+				}
+				MapEntry::Spread(e) => {
+					let ty = self.infer(e);
+					let stripped = self.strip_mut(ty);
+					match self.interner.kind(stripped).clone() {
+						TyKind::Map(k2, v2) => {
+							self.unify(k2, key, span);
+							self.unify(v2, value, span);
+						}
+						TyKind::List(elem) => {
+							let pair = self.interner.mk_tuple(vec![key, value]);
+							self.unify(elem, pair, span);
+						}
+						_ => {
+							let elem = self.resolve_iterable_source(e, ty, stripped);
+							let pair = self.interner.mk_tuple(vec![key, value]);
+							self.unify(elem, pair, span);
+						}
+					}
+				}
+			}
+		}
+		self.interner.mk_map(key, value)
+	}
+
 	// ── infer mode ───────────────────────────────────────────────────────────
+	/// Thin wrapper around [`Self::infer_dispatch`]: intercepts a committed
+	/// anonymous-closure (`$N`) boundary before the ordinary per-kind dispatch
+	/// — mirrors [`Self::check`]'s wrapper exactly; see its doc comment.
 	pub(crate) fn infer(&mut self, expr: &Expr) -> Ty {
+		if let Some(arity) = self.annotations.anon_boundary_arity(expr.id) {
+			return self.form_anon_closure(expr, arity);
+		}
+		self.infer_dispatch(expr)
+	}
+
+	pub(crate) fn infer_dispatch(&mut self, expr: &Expr) -> Ty {
 		// `BinaryOp` is special-cased: `infer_binary` also decides the operator's
 		// `Resolution` (Slice 4B), which `record_resolution` requires the node to
 		// already be `record`'d before attaching — so the type is recorded first here,
@@ -199,6 +466,34 @@ impl<'m> Checker<'m> {
 			}
 			return ty;
 		}
+		// `TypeOp` (`as`, Slice 4K) mirrors the `BinaryOp` special case above:
+		// `infer_cast` also decides the cast's `Resolution` (identity/scalar builtin
+		// vs. a dispatched `Into` impl), recorded on the `TypeOp` node itself once it
+		// exists in the annotation table.
+		if let ExprKind::TypeOp { lhs, rhs, .. } = &expr.kind {
+			let (ty, resolution) = self.infer_cast(lhs, rhs, expr.span);
+			self.record(expr.id, ty, None);
+			if let Some(resolution) = resolution {
+				self.annotations.record_resolution(expr.id, resolution);
+			}
+			return ty;
+		}
+		// `Call` mirrors the same special case (Finding 2, stdlib linkage
+		// groundwork): a plain `receiver.method(args…)` call resolved through the
+		// interface solver carries a `Resolution` too (mirroring operator syntax),
+		// which `record_resolution` requires the node to already be `record`'d
+		// before attaching. Every other call shape returns `None` here and behaves
+		// exactly as it did through the generic `infer_kind` match (whose own
+		// `Call` arm below is unreachable through this path, kept only so the
+		// match stays exhaustive).
+		if let ExprKind::Call { func, args, .. } = &expr.kind {
+			let (ty, resolution) = self.infer_call(func, args, expr.span, expr.id);
+			self.record(expr.id, ty, None);
+			if let Some(resolution) = resolution {
+				self.annotations.record_resolution(expr.id, resolution);
+			}
+			return ty;
+		}
 		let ty = self.infer_kind(expr);
 		// Record the node's resolved type for the lowering pass. Zonking happens
 		// inside `record`. Returns the *raw* ty so callers can still unify against it.
@@ -209,8 +504,14 @@ impl<'m> Checker<'m> {
 	fn infer_kind(&mut self, expr: &Expr) -> Ty {
 		let span = expr.span;
 		match &expr.kind {
-			ExprKind::Int(_) => self.interner.int(),
-			ExprKind::UInt(_) => self.interner.uint(),
+			ExprKind::Int(lit) => {
+				self.check_unsafe_int_literal(*lit.value(), lit.span());
+				self.interner.int()
+			}
+			ExprKind::UInt(lit) => {
+				self.check_unsafe_int_literal(*lit.value(), lit.span());
+				self.interner.uint()
+			}
 			ExprKind::Float(_) => self.interner.float(),
 			ExprKind::Char(_) => self.interner.char(),
 			ExprKind::Boolean(_) => self.interner.boolean(),
@@ -230,26 +531,33 @@ impl<'m> Checker<'m> {
 				}
 			},
 			ExprKind::Identifier(name) => self.infer_identifier(&name.0, span, expr.id),
-			ExprKind::AnonymousParam(_) => {
-				self.emit(span, TypeError::AnonymousParamUnsupported);
-				self.fresh()
-			}
+			// `$N` never resolves through the ordinary local-scope lookup every
+			// other identifier uses — it reads positionally out of the innermost
+			// `anon_ctx` frame `Checker::form_anon_closure` pushed while forming
+			// the enclosing committed boundary (`anon_closure.rs`). An empty
+			// `anon_ctx` here means `resolve_anon`'s search found no boundary
+			// (up to the enclosing slot) that type-checks — or, rarer still,
+			// this `$N` sits somewhere `resolve_anon` was never invoked over at
+			// all — either way, loud, not silent.
+			ExprKind::AnonymousParam(idx) => match self.anon_ctx.last() {
+				Some(params) => params
+					.get(idx.unwrap_or(0) as usize)
+					.copied()
+					.unwrap_or_else(|| self.interner.error()),
+				None => {
+					self.emit(span, TypeError::AnonymousParamUnsupported);
+					self.interner.error()
+				}
+			},
+			// A bare `infer` of a list literal has no expected element type to work
+			// from, so `check_list` mints a fresh one — see its doc comment for why
+			// `check_dispatch`'s own `ExprKind::List` arm calls the same helper with a
+			// concrete element type instead, when one is available.
 			ExprKind::List(items) => {
 				let elem = self.fresh();
-				for item in items {
-					use nymph_ast::expr::ListItem;
-					match &item.0 {
-						ListItem::Expr(e) => self.check(e, elem),
-						ListItem::Spread(e) => {
-							let list = self.interner.mk_list(elem);
-							self.check(e, list);
-						}
-					}
-				}
-				self.interner.mk_list(elem)
+				self.check_list(items, elem, span)
 			}
 			ExprKind::Tuple(items) => {
-				use nymph_ast::expr::ListItem;
 				// Spreads in tuples are not statically sized in Milestone A; infer
 				// non-spread items positionally.
 				let mut tys = Vec::new();
@@ -273,9 +581,38 @@ impl<'m> Checker<'m> {
 							self.check(k, key);
 							self.check(v, value);
 						}
+						// SS1 (SMART spread): a native `Map` source unifies its key/value
+						// directly (the fast, no-drain merge path). A native `#[#(K, V)]`
+						// list source (e.g. from `#[...pairs]`-style merges) is likewise
+						// fast-pathed — `List` implements neither `Iterator` nor
+						// `Iterable`, so without this arm `resolve_iterable_source` would
+						// always reject it as `NotIterable`, even though
+						// `lower_spread_source`'s own `is_list_like` check already treats
+						// any `TyKind::List` source as a native JS array and lowers it
+						// correctly with no drain (mirrors list-spread's own list fast
+						// path in `infer_iterable_element`). Anything else must be a
+						// non-map, non-list `Iterator`/`Iterable<#(K, V)>` of entry pairs
+						// — only that fallback reuses Track A's own interface resolution
+						// (`resolve_iterable_source`), unifying its resolved element
+						// against the `#(K, V)` pair type.
 						MapEntry::Spread(e) => {
-							let map = self.interner.mk_map(key, value);
-							self.check(e, map);
+							let ty = self.infer(e);
+							let stripped = self.strip_mut(ty);
+							match self.interner.kind(stripped).clone() {
+								TyKind::Map(k2, v2) => {
+									self.unify(k2, key, span);
+									self.unify(v2, value, span);
+								}
+								TyKind::List(elem) => {
+									let pair = self.interner.mk_tuple(vec![key, value]);
+									self.unify(elem, pair, span);
+								}
+								_ => {
+									let elem = self.resolve_iterable_source(e, ty, stripped);
+									let pair = self.interner.mk_tuple(vec![key, value]);
+									self.unify(elem, pair, span);
+								}
+							}
 						}
 					}
 				}
@@ -287,7 +624,7 @@ impl<'m> Checker<'m> {
 				// is an opaque hole, while `for` extracts the element directly.
 				self.fresh()
 			}
-			ExprKind::Call { func, args, .. } => self.infer_call(func, args, span, expr.id),
+			ExprKind::Call { func, args, .. } => self.infer_call(func, args, span, expr.id).0,
 			ExprKind::MemberAccess { parent, member, .. } => {
 				self.infer_member(parent, &member.0, member.1, expr.id)
 			}
@@ -297,7 +634,11 @@ impl<'m> Checker<'m> {
 				// no `Index` impl in scope.
 				let recv = self.infer(parent);
 				let key = self.infer(index);
-				let recv_r = self.shallow_resolve(recv);
+				let recv_r = self.strip_mut(recv);
+				// The key is itself an ordinary value being read here (not a place),
+				// so it's used mut-transparently too — `xs[i]` for a `let mut i` index
+				// must unify against `int` exactly like a plain `i` would.
+				let key = self.strip_mut(key);
 				match self.interner.kind(recv_r).clone() {
 					TyKind::List(elem) => {
 						let int = self.interner.int();
@@ -347,10 +688,11 @@ impl<'m> Checker<'m> {
 				self.infer_binary(lhs, *op, rhs, span).0
 			}
 			ExprKind::TypeOp { lhs, rhs, .. } => {
-				let src = self.infer(lhs);
-				let target = self.lower_type(rhs);
-				self.check_cast(src, target, span);
-				target
+				// Unreachable in practice: `infer` intercepts `TypeOp` before it gets
+				// here, for the same reason it intercepts `BinaryOp`/`PrefixOp` above —
+				// recording the cast's `Resolution` needs the node's type entry to
+				// already exist. This arm only exists so the match stays exhaustive.
+				self.infer_cast(lhs, rhs, span).0
 			}
 			ExprKind::PatternOp { lhs, rhs, .. } => {
 				let scrutinee = self.infer(lhs);
@@ -370,8 +712,12 @@ impl<'m> Checker<'m> {
 				let ret = self.ret_ty;
 				if let Some(v) = value {
 					match ret {
-						Some(rt) => self.check(v, rt),
+						Some(rt) => {
+							self.resolve_anon(v, Some(rt));
+							self.check(v, rt);
+						}
 						None => {
+							self.resolve_anon(v, None);
 							self.infer(v);
 						}
 					}
@@ -448,6 +794,20 @@ impl<'m> Checker<'m> {
 		}
 	}
 
+	/// Warn on a source `int`/`uint` literal whose magnitude can't round-trip
+	/// through the `f64` Nymph's `int`/`uint` are backed by at runtime. `Int`/
+	/// `UInt` literals (`ExprKind::Int`/`ExprKind::UInt`) store their magnitude as
+	/// a `u64`; a negative `int` literal is this same (positive) literal node
+	/// wrapped in a `PrefixOperator::Negate` at parse time, so calling this once
+	/// per literal (regardless of any enclosing `Negate`) is already correct —
+	/// no separate handling of the negative case is needed.
+	fn check_unsafe_int_literal(&mut self, value: u64, span: Span) {
+		const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991; // 2^53 - 1
+		if value > MAX_SAFE_INTEGER {
+			self.emit(span, TypeError::IntLiteralUnsafe { value });
+		}
+	}
+
 	// ── Identifiers & definitions ────────────────────────────────────────────
 	fn infer_identifier(&mut self, name: &str, span: Span, id: NodeId) -> Ty {
 		if let Some(binding) = self.lookup_local(name) {
@@ -476,7 +836,7 @@ impl<'m> Checker<'m> {
 				.get(&def)
 				.copied()
 				.unwrap_or_else(|| self.fresh()),
-			DefKind::Func { .. } => self.fn_type_of(def),
+			DefKind::Func { .. } => self.fn_type_of(def, span),
 			DefKind::Variant { enum_def, variant } => self.variant_value(enum_def, variant, id, span),
 			DefKind::Struct { .. } => {
 				self.emit(span, TypeError::StructTypeAsValue);
@@ -506,15 +866,41 @@ impl<'m> Checker<'m> {
 	/// already rejects it loudly (a distinct synthetic per mention never
 	/// unifies with the body's result), and freshening it here would instead
 	/// hand the caller an unconstrained variable carrying an unenforced bound.
-	fn fn_type_of(&mut self, def: DefId) -> Ty {
+	///
+	/// Slice 4G: also defers one `pending_bounds` obligation per bound on every
+	/// minted var — declared generics from `sig.bounds` (substituted through the
+	/// same `subst` map as `params`/`ret`, so `Bound::ty`/`args` land on the
+	/// freshly-minted variable) and synthetics from `synthetic_bounds` (bare
+	/// interface only, no argument fidelity — `lower_reference` discards the
+	/// interface's own arguments before minting the synthetic param). `span` is
+	/// the call/reference site, so a violated bound diagnoses there rather than
+	/// at the callee's declaration.
+	fn fn_type_of(&mut self, def: DefId, span: Span) -> Ty {
 		let sig = self.sigs.funcs[&def].clone();
 		let mut subst = self.fresh_subst(sig.generics.len());
 		let mut synthetics = FxHashSet::default();
 		for p in &sig.params {
 			self.synthetic_params_in(p.ty, &mut synthetics);
 		}
-		for idx in synthetics {
+		for &idx in &synthetics {
 			subst.entry(idx).or_insert_with(|| self.fresh());
+		}
+		for bound in &sig.bounds {
+			let ty = self.subst(bound.ty, &subst, None);
+			let args: Vec<(EcoString, Ty)> = bound
+				.args
+				.iter()
+				.map(|(name, t)| (name.clone(), self.subst(*t, &subst, None)))
+				.collect();
+			self.pending_bounds.push((span, ty, bound.interface, args));
+		}
+		for idx in &synthetics {
+			if let Some(interfaces) = self.synthetic_bounds.get(idx).cloned() {
+				let ty = subst[idx];
+				for interface in interfaces {
+					self.pending_bounds.push((span, ty, interface, Vec::new()));
+				}
+			}
 		}
 		let params = sig
 			.params
@@ -549,7 +935,26 @@ impl<'m> Checker<'m> {
 		if fields_empty {
 			let res = self.variant_resolution(enum_def, variant);
 			self.annotations.record_variant(id, res);
-			let (adt, _) = self.instantiate_enum(enum_def);
+			let (adt, subst) = self.instantiate_enum(enum_def);
+			// Defer one `pending_bounds` obligation per bound on the enum's own
+			// generics (Slice 4G-b) — a nullary variant reference still
+			// instantiates them (see `instantiate_enum` above), so it needs the
+			// same enforcement as a labeled construction. Not pushed inside
+			// `instantiate_enum` itself: `infer_pattern.rs` calls that same
+			// function for match-arm patterns, which must NOT get obligations
+			// (CC3 — a pattern destructures an already-constructed value).
+			let bounds = self.sigs.enums[&enum_def].bounds.clone();
+			for bound in &bounds {
+				let ty = self.subst(bound.ty, &subst, None);
+				let bound_args: Vec<(EcoString, Ty)> = bound
+					.args
+					.iter()
+					.map(|(name, t)| (name.clone(), self.subst(*t, &subst, None)))
+					.collect();
+				self
+					.pending_bounds
+					.push((span, ty, bound.interface, bound_args));
+			}
 			adt
 		} else {
 			self.emit(span, TypeError::FieldVariantAsValue { variant: name });
@@ -578,17 +983,35 @@ impl<'m> Checker<'m> {
 	}
 
 	// ── Calls & construction ─────────────────────────────────────────────────
-	fn infer_call(&mut self, func: &Expr, args: &[Spanned<CallArg>], span: Span, id: NodeId) -> Ty {
+	/// Infer a call's type. Also returns a `Resolution` when the call is a plain
+	/// `receiver.method(args…)` dispatched through the interface solver (Finding
+	/// 2, stdlib linkage groundwork) — mirroring how `infer_binary`/`infer_prefix`
+	/// already return one for operator syntax — so `infer` (the sole caller) can
+	/// record it once the node itself is recorded, and lowering can later refuse
+	/// to emit a call to a method resolved through a prelude-only impl, which is
+	/// never materialized anywhere lowering walks (see
+	/// `dispatch_kind_for_method_call`). Every other call shape (constructor,
+	/// namespaced, plain function call) carries no such resolution.
+	fn infer_call(
+		&mut self,
+		func: &Expr,
+		args: &[Spanned<CallArg>],
+		span: Span,
+		id: NodeId,
+	) -> (Ty, Option<Resolution>) {
 		// Constructor calls: `Struct(field = …)` / `Variant(field = …)`.
 		if let ExprKind::Identifier(name) = &func.kind {
 			if let Some(def) = self.defs.get(&name.0)
 				&& let DefKind::Struct { .. } = self.defs.data(def).kind
 			{
-				return self.infer_struct_ctor(def, args, span);
+				return (self.infer_struct_ctor(def, args, span), None);
 			}
 			match self.defs.resolve_variant(&name.0) {
 				Some(Ok((enum_def, variant))) => {
-					return self.infer_variant_ctor(enum_def, variant, args, span, id);
+					return (
+						self.infer_variant_ctor(enum_def, variant, args, span, id, None),
+						None,
+					);
 				}
 				Some(Err(())) => {
 					self.emit(
@@ -597,7 +1020,7 @@ impl<'m> Checker<'m> {
 							name: name.0.clone(),
 						},
 					);
-					return self.interner.error();
+					return (self.interner.error(), None);
 				}
 				None => {}
 			}
@@ -616,13 +1039,16 @@ impl<'m> Checker<'m> {
 						.iter()
 						.position(|v| v.name == member.0);
 					if let Some(variant) = variant {
-						return self.infer_variant_ctor(def, variant, args, member.1, id);
+						return (
+							self.infer_variant_ctor(def, variant, args, member.1, id, None),
+							None,
+						);
 					}
 					let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
 					let arg_lits = arg_int_lits(args);
 					if let Some(ret) = self.resolve_namespaced(def, &member.0, &arg_tys, &arg_lits, member.1)
 					{
-						return ret;
+						return (ret, None);
 					}
 					self.emit(
 						member.1,
@@ -631,14 +1057,14 @@ impl<'m> Checker<'m> {
 							name: member.0.clone(),
 						},
 					);
-					return self.interner.error();
+					return (self.interner.error(), None);
 				}
 				DefKind::Struct { .. } => {
 					let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
 					let arg_lits = arg_int_lits(args);
 					if let Some(ret) = self.resolve_namespaced(def, &member.0, &arg_tys, &arg_lits, member.1)
 					{
-						return ret;
+						return (ret, None);
 					}
 					self.emit(
 						member.1,
@@ -647,7 +1073,7 @@ impl<'m> Checker<'m> {
 							name: member.0.clone(),
 						},
 					);
-					return self.interner.error();
+					return (self.interner.error(), None);
 				}
 				_ => {}
 			}
@@ -661,16 +1087,30 @@ impl<'m> Checker<'m> {
 			&& let Some(pidx) = self.lookup_param(&pname.0)
 		{
 			let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
-			return self.resolve_param_namespaced(pidx, &member.0, &arg_tys, member.1);
+			return (
+				self.resolve_param_namespaced(pidx, &member.0, &arg_tys, member.1),
+				None,
+			);
 		}
 
 		// Method call: `receiver.method(args…)` resolves through the interface solver.
 		if let ExprKind::MemberAccess { parent, member, .. } = &func.kind {
 			let recv = self.infer(parent);
-			let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
+			let arg_tys: Vec<Ty> = args
+				.iter()
+				.map(|a| self.infer_method_call_arg(&a.0.value))
+				.collect();
 			let arg_lits = arg_int_lits(args);
 			return match self.resolve_method(recv, &member.0, &arg_tys, &arg_lits, member.1) {
-				Some(res) => res.ty,
+				Some(res) => {
+					let dispatch = dispatch_kind_for_method_call(&res);
+					let resolution = Resolution {
+						method: member.0.clone(),
+						dispatch,
+						impl_span: res.impl_span,
+					};
+					(res.ty, Some(resolution))
+				}
 				None => {
 					let rendered = self.display(recv);
 					self.emit(
@@ -680,14 +1120,14 @@ impl<'m> Checker<'m> {
 							ty: rendered,
 						},
 					);
-					self.interner.error()
+					(self.interner.error(), None)
 				}
 			};
 		}
 
 		let callee = self.infer(func);
-		let callee = self.shallow_resolve(callee);
-		match self.interner.kind(callee).clone() {
+		let callee = self.strip_mut(callee);
+		let ty = match self.interner.kind(callee).clone() {
 			TyKind::Fn { params, ret } => {
 				if args.len() != params.len() {
 					self.emit(
@@ -699,7 +1139,7 @@ impl<'m> Checker<'m> {
 					);
 				}
 				for (arg, pty) in args.iter().zip(&params) {
-					self.check(&arg.0.value, *pty);
+					self.check_call_arg(&arg.0.value, *pty);
 				}
 				for arg in args.iter().skip(params.len()) {
 					self.infer(&arg.0.value);
@@ -720,12 +1160,29 @@ impl<'m> Checker<'m> {
 				}
 				self.interner.error()
 			}
-		}
+		};
+		(ty, None)
 	}
 
-	fn infer_struct_ctor(&mut self, def: DefId, args: &[Spanned<CallArg>], _span: Span) -> Ty {
+	fn infer_struct_ctor(&mut self, def: DefId, args: &[Spanned<CallArg>], span: Span) -> Ty {
 		let (adt, subst) = self.instantiate_struct(def);
 		let sig = self.sigs.structs[&def].clone();
+		// Defer one `pending_bounds` obligation per bound on the struct's own
+		// generics (Slice 4G-b), substituted through the same `subst` as `fields`
+		// below so it lands on the freshly-minted variable — mirrors
+		// `fn_type_of`'s treatment of `FuncSig::bounds`. Not pushed inside
+		// `instantiate_struct` itself: see the comment in `variant_value`.
+		for bound in &sig.bounds {
+			let ty = self.subst(bound.ty, &subst, None);
+			let bound_args: Vec<(EcoString, Ty)> = bound
+				.args
+				.iter()
+				.map(|(name, t)| (name.clone(), self.subst(*t, &subst, None)))
+				.collect();
+			self
+				.pending_bounds
+				.push((span, ty, bound.interface, bound_args));
+		}
 		let fields: Vec<(EcoString, Ty)> = sig
 			.fields
 			.iter()
@@ -735,18 +1192,47 @@ impl<'m> Checker<'m> {
 		adt
 	}
 
+	/// `expected`, when given, is the concrete enum type the caller already knows this
+	/// construction must produce (from [`Self::try_check_expected_variant`], which only
+	/// reaches here once `expected_enum_variant` has confirmed `enum_def` matches it).
+	/// Unifying the fresh instantiation against it *before* substituting field types
+	/// means a generic field's expected type (e.g. `Option<Tree>`'s `value: T`) is
+	/// already the concrete `Tree` — not a still-unbound `Infer` var — by the time
+	/// `check_ctor_args` recurses into a nested bare-variant argument, so that nested
+	/// argument's own type-directed disambiguation (`try_check_expected_variant` again,
+	/// transitively) has something concrete to resolve against. Without this, the
+	/// unification that pins the var only happens afterward, in the *outer*
+	/// `check_dispatch`'s `subtype(got, expected, ...)` call — too late for the nested
+	/// argument, which has already fallen back to the ambiguous global lookup.
 	fn infer_variant_ctor(
 		&mut self,
 		enum_def: DefId,
 		variant: usize,
 		args: &[Spanned<CallArg>],
-		_span: Span,
+		span: Span,
 		id: NodeId,
+		expected: Option<Ty>,
 	) -> Ty {
 		let res = self.variant_resolution(enum_def, variant);
 		self.annotations.record_variant(id, res);
 		let (adt, subst) = self.instantiate_enum(enum_def);
-		let vsig = self.sigs.enums[&enum_def].variants[variant].clone();
+		if let Some(expected) = expected {
+			self.unify(adt, expected, span);
+		}
+		let sig = self.sigs.enums[&enum_def].clone();
+		// Same reasoning as `infer_struct_ctor` above, for the enum's own bounds.
+		for bound in &sig.bounds {
+			let ty = self.subst(bound.ty, &subst, None);
+			let bound_args: Vec<(EcoString, Ty)> = bound
+				.args
+				.iter()
+				.map(|(name, t)| (name.clone(), self.subst(*t, &subst, None)))
+				.collect();
+			self
+				.pending_bounds
+				.push((span, ty, bound.interface, bound_args));
+		}
+		let vsig = sig.variants[variant].clone();
 		let fields: Vec<(EcoString, Ty)> = vsig
 			.fields
 			.iter()
@@ -784,8 +1270,12 @@ impl<'m> Checker<'m> {
 				}
 			};
 			match target {
-				Some(ty) => self.check(&call.value, ty),
+				Some(ty) => {
+					self.resolve_anon(&call.value, Some(ty));
+					self.check(&call.value, ty);
+				}
 				None => {
+					self.resolve_anon(&call.value, None);
 					self.infer(&call.value);
 				}
 			}
@@ -814,6 +1304,14 @@ impl<'m> Checker<'m> {
 		}
 
 		let parent_ty = self.infer(parent);
+		self.member_ty_of(parent_ty, member, span)
+	}
+
+	/// The type of `member` accessed on a value of type `parent_ty`. Split out of
+	/// [`Self::infer_member`] so a `mut Adt` receiver (e.g. `this` inside a `mut
+	/// func`) can re-dispatch field lookup on the peeled inner type without
+	/// re-inferring (and so re-recording) the parent expression.
+	fn member_ty_of(&mut self, parent_ty: Ty, member: &str, span: Span) -> Ty {
 		let parent_ty = self.shallow_resolve(parent_ty);
 		match self.interner.kind(parent_ty).clone() {
 			TyKind::Adt(def, args) => {
@@ -836,6 +1334,10 @@ impl<'m> Checker<'m> {
 				self.emit(span, TypeError::MethodCallsUnsupported);
 				self.interner.error()
 			}
+			// A `mut Struct` still has the struct's fields — re-dispatch on the
+			// peeled inner type. The field's own declared type (which may or may
+			// not itself be `mut`) is unaffected: `subst` above preserves it.
+			TyKind::Mut(inner) => self.member_ty_of(inner, member, span),
 			TyKind::Error => self.interner.error(),
 			TyKind::Infer(_) => self.fresh(),
 			_ => {
@@ -874,13 +1376,22 @@ impl<'m> Checker<'m> {
 			self.bind_pattern(&param.0.name, ty, param.0.mutable);
 			param_tys.push(ty);
 		}
+		// An explicit closure's own body is itself a hard `$N` boundary: it does
+		// NOT let an inner `$N` escape out to some OUTER enclosing slot (see
+		// `resolve_anon`'s doc comment on why every closure-slot call site,
+		// this one included, must scan its own slot before checking/inferring
+		// it).
 		let ret = match return_type {
 			Some(annot) => {
 				let rt = self.lower_type(annot);
+				self.resolve_anon(body, Some(rt));
 				self.check(body, rt);
 				rt
 			}
-			None => self.infer(body),
+			None => {
+				self.resolve_anon(body, None);
+				self.infer(body)
+			}
 		};
 		self.pop_scope();
 		self.pop_params();
@@ -888,7 +1399,7 @@ impl<'m> Checker<'m> {
 	}
 
 	fn check_closure(&mut self, expr: &Expr, expected: Ty) {
-		let expected = self.shallow_resolve(expected);
+		let expected = self.strip_mut(expected);
 		let ExprKind::Closure {
 			params,
 			generics,
@@ -919,17 +1430,24 @@ impl<'m> Checker<'m> {
 			self.bind_pattern(&param.0.name, ty, param.0.mutable);
 			param_tys.push(ty);
 		}
+		// See `infer_closure`'s matching comment: an explicit closure's body is
+		// its own hard `$N` boundary.
 		let ret = match (return_type, exp_ret) {
 			(Some(annot), _) => {
 				let rt = self.lower_type(annot);
+				self.resolve_anon(body, Some(rt));
 				self.check(body, rt);
 				rt
 			}
 			(None, Some(rt)) => {
+				self.resolve_anon(body, Some(rt));
 				self.check(body, rt);
 				rt
 			}
-			(None, None) => self.infer(body),
+			(None, None) => {
+				self.resolve_anon(body, None);
+				self.infer(body)
+			}
 		};
 		self.pop_scope();
 		self.pop_params();
@@ -957,6 +1475,9 @@ impl<'m> Checker<'m> {
 	) -> (Ty, Option<Resolution>, Option<Ty>) {
 		use nymph_ast::ops::PrefixOperator::*;
 		let operand = self.infer(value);
+		// See the matching comment in `infer_binary`: an operator's operand type
+		// is used mut-transparently throughout this function.
+		let operand = self.strip_mut(operand);
 		match op {
 			BoolNot => {
 				// `!` defaults to `boolean`: a primitive or a still-unresolved operand
@@ -973,16 +1494,18 @@ impl<'m> Checker<'m> {
 						Some(Resolution {
 							method: "not".into(),
 							dispatch: DispatchKind::BuiltinEager,
+							impl_span: None,
 						}),
 						None,
 					)
 				} else {
-					let (ty, dispatch) = self.dispatch_operator(operand, "not", &[], span);
+					let (ty, dispatch, impl_span) = self.dispatch_operator(operand, "not", &[], span);
 					(
 						ty,
 						Some(Resolution {
 							method: "not".into(),
 							dispatch,
+							impl_span,
 						}),
 						None,
 					)
@@ -996,6 +1519,7 @@ impl<'m> Checker<'m> {
 						Some(Resolution {
 							method: method.into(),
 							dispatch: DispatchKind::BuiltinEager,
+							impl_span: None,
 						}),
 						None,
 					)
@@ -1005,12 +1529,13 @@ impl<'m> Checker<'m> {
 				} {
 					// A resolved ADT or generic-parameter operand dispatches through the
 					// solver immediately, exactly like `infer_binary`'s equivalent branch.
-					let (ty, dispatch) = self.dispatch_operator(operand, method, &[], span);
+					let (ty, dispatch, impl_span) = self.dispatch_operator(operand, method, &[], span);
 					(
 						ty,
 						Some(Resolution {
 							method: method.into(),
 							dispatch,
+							impl_span,
 						}),
 						None,
 					)
@@ -1045,6 +1570,7 @@ impl<'m> Checker<'m> {
 				Resolution {
 					method: method.into(),
 					dispatch: DispatchKind::BuiltinEager,
+					impl_span: None,
 				},
 			));
 		}
@@ -1055,12 +1581,13 @@ impl<'m> Checker<'m> {
 		) {
 			return None;
 		}
-		let (result_ty, dispatch) = self.dispatch_operator(ty, method, &[], span);
+		let (result_ty, dispatch, impl_span) = self.dispatch_operator(ty, method, &[], span);
 		Some((
 			result_ty,
 			Resolution {
 				method: method.into(),
 				dispatch,
+				impl_span,
 			},
 		))
 	}
@@ -1077,9 +1604,10 @@ impl<'m> Checker<'m> {
 	/// arithmetic fallback's still-unresolved-inference-variable case (Finding 2): the
 	/// caller enqueues `(node, op, span, ty)` for `finalize_pending_operators` to
 	/// retry once the current body has been checked, rather than giving up. A plain
-	/// `None` resolution (with no pending ty) marks an exit path D3 deliberately
-	/// leaves unresolved (`??`, `in`/`!in`, `|>`); lowering panics loudly on those
-	/// rather than guessing.
+	/// A plain `None` resolution (with no pending ty) marks `|>`, whose
+	/// `Call`-shaped lowering (Slice 4I, D1) needs no `Resolution` at all — every
+	/// other operator, including `??`/`in`/`!in` since Slice 4I, always records one
+	/// (or reports a diagnostic and never reaches lowering).
 	fn infer_binary(
 		&mut self,
 		lhs: &Expr,
@@ -1091,29 +1619,80 @@ impl<'m> Checker<'m> {
 
 		// `|>` is application, not a method. D3: `lower_binop` already panics on
 		// `Pipe` before any dispatch question arises, so no resolution is needed.
+		//
+		// `x |> f` lowers structurally to `f(x)` (DD1), so its LHS must be typed the
+		// same way a direct call types its sole argument: `check`-ed against the
+		// callee's known parameter type (letting an int literal widen to
+		// `float`/`uint`, exactly like `infer_call`'s `TyKind::Fn` arm), not
+		// `infer`-ed up front as a concrete type and then unified. Only fall back to
+		// `infer` + `apply`'s unification-based typing when the callee isn't (yet)
+		// known to be a plain function type — an unresolved inference variable, or
+		// an already-diagnosed `Error` — where there's no parameter type to check
+		// against anyway.
 		if op == Pipe {
-			let arg = self.infer(lhs);
 			let callee = self.infer(rhs);
-			return (self.apply(callee, vec![arg], span), None, None);
+			// A `mut`-bound closure pipes exactly like a plain one — see the
+			// matching comment above `l`/`r`'s strip a few lines down.
+			let resolved_callee = self.strip_mut(callee);
+			return match self.interner.kind(resolved_callee).clone() {
+				TyKind::Fn { params, ret } if params.len() == 1 => {
+					self.check(lhs, params[0]);
+					(ret, None, None)
+				}
+				_ => {
+					let arg = self.infer(lhs);
+					(self.apply(callee, vec![arg], span), None, None)
+				}
+			};
 		}
 
 		let l = self.infer(lhs);
 		let r = self.infer(rhs);
+		// Operators never produce (or require) a `mut` operand — arithmetic on a
+		// `mut int` local reads through exactly like on a plain `int` (peeling
+		// mirrors `prim_kind`/`is_adt` above; stripping it here too, once, keeps
+		// every later `self.unify(l, r, ..)`/`dispatch_operator(l, ..)` call and
+		// the returned result type consistent, instead of comparing a peeled
+		// discriminant against still-`mut`-wrapped operand handles).
+		let l = self.strip_mut(l);
+		let r = self.strip_mut(r);
 		let boolean = self.interner.boolean();
 		let eager = |method: &str| {
 			Some(Resolution {
 				method: method.into(),
 				dispatch: DispatchKind::BuiltinEager,
+				impl_span: None,
 			})
 		};
 
 		match op {
 			Plus | Minus | Times | Divide | Remainder | Power | BitAnd | BitOr | BitXor | LeftShift
 			| RightShift => match (self.prim_kind(l), self.prim_kind(r)) {
-				// Same primitive → built-in, result is that type.
+				// Same primitive → built-in, result is that type — EXCEPT boolean,
+				// which has no native JS arithmetic/bitwise semantics to reuse: JS
+				// coerces booleans to numbers (`true & false` → 0, not `false`). A
+				// boolean's only real binary operators are the stdlib's
+				// BitAnd/BitOr/BitXor (`&`/`|`/`^`), so route every boolean binary op
+				// through the solver — it resolves those to the (materializable)
+				// prelude impls and reports the rest (`true + false`, `true << false`)
+				// as `NotImplemented`, never emitting silently-wrong native JS.
 				(Some(a), Some(b)) if a == b => {
 					self.unify(l, r, span);
-					(l, eager(binary_method(op)), None)
+					if matches!(a, TyKind::Boolean) {
+						let (ty, dispatch, impl_span) =
+							self.dispatch_operator(l, binary_method(op), &[r], span);
+						(
+							ty,
+							Some(Resolution {
+								method: binary_method(op).into(),
+								dispatch,
+								impl_span,
+							}),
+							None,
+						)
+					} else {
+						(l, eager(binary_method(op)), None)
+					}
 				}
 				// Different concrete primitives: an `int` literal against a `float`/`uint`
 				// widens (so `1.5 * 2` is a `float` with no impl needed); otherwise this is
@@ -1128,7 +1707,7 @@ impl<'m> Checker<'m> {
 					} else if matches!(lhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(r) {
 						(r, eager(binary_method(op)), None)
 					} else {
-						let (ty, _) = self.dispatch_operator(l, binary_method(op), &[r], span);
+						let (ty, _, _) = self.dispatch_operator(l, binary_method(op), &[r], span);
 						(ty, eager(binary_method(op)), None)
 					}
 				}
@@ -1146,12 +1725,13 @@ impl<'m> Checker<'m> {
 					matches!(self.interner.kind(resolved), TyKind::Param(_))
 				} =>
 				{
-					let (ty, dispatch) = self.dispatch_operator(l, binary_method(op), &[r], span);
+					let (ty, dispatch, impl_span) = self.dispatch_operator(l, binary_method(op), &[r], span);
 					(
 						ty,
 						Some(Resolution {
 							method: binary_method(op).into(),
 							dispatch,
+							impl_span,
 						}),
 						None,
 					)
@@ -1169,28 +1749,12 @@ impl<'m> Checker<'m> {
 			},
 			Equals | NotEquals => {
 				let method = if op == Equals { "equals" } else { "not_equals" };
-				let literal_widens = (matches!(rhs.kind, ExprKind::Int(_))
-					&& self.int_literal_coerces_to(l))
-					|| (matches!(lhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(r));
-				match (self.prim_kind(l), self.prim_kind(r)) {
-					// Two *different* concrete primitives (e.g. `int == uint`) that aren't
-					// just an int literal widening to its float/uint sibling: `unify_operands`
-					// would unconditionally `unify` them and report `MismatchedTypes`, even
-					// when a valid cross-type `Equals` impl exists (mirrors the arithmetic/
-					// comparison arms' mixed-primitive handling above). Still gates on a
-					// matching impl — `int == string` has none and is correctly rejected,
-					// just via `dispatch_operator`'s diagnostic rather than a type mismatch.
-					(Some(a), Some(b)) if a != b && !literal_widens => {
-						self.dispatch_operator(l, method, &[r], span);
-					}
-					_ if self.prim_kind(l).is_some() || !self.is_adt(l) => {
-						self.unify_operands(lhs, l, rhs, r, span);
-					}
-					_ => {
-						// D3: `equals` dispatch is deferred to the stdlib slice — even when an
-						// ADT has a user `Equals` impl, codegen still emits `===`/`!==` for now.
-						self.dispatch_operator(l, method, &[r], span);
-					}
+				if self.prim_kind(l).is_some() || !self.is_adt(l) {
+					self.unify_operands(lhs, l, rhs, r, span);
+				} else {
+					// D3: `equals` dispatch is deferred to the stdlib slice — even when an
+					// ADT has a user `Equals` impl, codegen still emits `===`/`!==` for now.
+					self.dispatch_operator(l, method, &[r], span);
 				}
 				(boolean, eager(method), None)
 			}
@@ -1223,20 +1787,16 @@ impl<'m> Checker<'m> {
 						if literal_widens {
 							(boolean, eager(method), None)
 						} else {
-							// Two *different* concrete primitives (e.g. `int < uint`) still
-							// compile to a native JS comparison — mirroring the arithmetic
-							// mixed-primitive arm just above, which forces `BuiltinEager`
-							// rather than trusting whatever `DispatchKind` the resolved impl
-							// carries. `dispatch_operator` is called purely to gate on a
-							// cross-type `Comparable` impl existing; its own `Resolution`
-							// (possibly `UserImplDefaultMethod`, for an impl materialized from
-							// a prelude default body) is discarded, because lowering a
-							// primitive-to-primitive comparison as an interface method call
-							// panics (`lower_hir.rs`'s "does not yet dispatch operator to
-							// interface default method" — there is no method to call on a
-							// bare JS number).
-							self.dispatch_operator(l, method, &[r], span);
-							(boolean, eager(method), None)
+							let (_, dispatch, impl_span) = self.dispatch_operator(l, method, &[r], span);
+							(
+								boolean,
+								Some(Resolution {
+									method: method.into(),
+									dispatch,
+									impl_span,
+								}),
+								None,
+							)
 						}
 					}
 					_ if self.is_adt(l) || {
@@ -1244,12 +1804,13 @@ impl<'m> Checker<'m> {
 						matches!(self.interner.kind(resolved), TyKind::Param(_))
 					} =>
 					{
-						let (_, dispatch) = self.dispatch_operator(l, method, &[r], span);
+						let (_, dispatch, impl_span) = self.dispatch_operator(l, method, &[r], span);
 						(
 							boolean,
 							Some(Resolution {
 								method: method.into(),
 								dispatch,
+								impl_span,
 							}),
 							None,
 						)
@@ -1263,55 +1824,74 @@ impl<'m> Checker<'m> {
 					}
 				}
 			}
-			// `&&`/`||` are overloadable via the `And`/`Or` interfaces like any operator.
-			// The built-in `boolean` *default* impl is fast-pathed here and short-circuits
-			// at codegen (`a ? b : false`); a user overload on an ADT resolves through the
-			// interface and lowers to an ordinary (eager) method call. Typing checks both
-			// operands regardless of runtime laziness.
+			// `&&`/`||` are NOT overloadable — mirroring Rust's design, whether `b`
+			// evaluates in `a && b` must never depend on operand types. Both operands
+			// therefore always unify with `boolean` (never dispatch through an
+			// interface, even for an ADT receiver) and the built-in always
+			// short-circuits at codegen (`a ? b : false` / `a ? true : b`). A
+			// non-boolean operand is diagnosed with a dedicated variant (rather than
+			// plain `unify`'s generic `MismatchedTypes`) so the message can carry a
+			// help hint explaining this is by design, not a missing overload.
 			BoolAnd | BoolOr => {
 				let method = if op == BoolAnd { "and" } else { "or" };
-				if self.prim_kind(l).is_some() || !self.is_adt(l) {
-					self.unify(l, boolean, span);
-					self.unify(r, boolean, span);
-					(
-						boolean,
-						Some(Resolution {
-							method: method.into(),
-							dispatch: DispatchKind::BuiltinShortCircuit,
-						}),
-						None,
-					)
-				} else {
-					let (ty, dispatch) = self.dispatch_operator(l, method, &[r], span);
-					(
-						ty,
-						Some(Resolution {
-							method: method.into(),
-							dispatch,
-						}),
-						None,
-					)
-				}
+				self.check_logical_operand(l, span);
+				self.check_logical_operand(r, span);
+				(
+					boolean,
+					Some(Resolution {
+						method: method.into(),
+						dispatch: DispatchKind::BuiltinShortCircuit,
+						impl_span: None,
+					}),
+					None,
+				)
 			}
 			In | NotIn => {
-				// `a in c` ≡ `c.contains(a)` — receiver is the collection. D3: `lower_binop`
-				// already panics on `In`/`NotIn` before any dispatch question arises, so no
-				// resolution is needed.
+				// `a in c` ≡ `c.contains(a)` — receiver is the RHS (the collection), with
+				// the LHS (the searched-for item) passed as the sole argument, so operand
+				// order is swapped relative to every other binary operator (Slice 4I, D2).
+				// Unlike the pre-4I code, this now dispatches unconditionally rather than
+				// only when `is_adt(r)`: a primitive/string RHS with no `Contains` impl used
+				// to type-check silently (zero diagnostics) and only panic later in
+				// lowering; routing every concrete/`Param` receiver through
+				// `dispatch_operator` gets it a proper `NotImplemented` diagnostic instead,
+				// mirroring the arithmetic/comparison arms. There is no built-in/native `in`
+				// row — JS's `in` is key-membership, wrong for lists — so an unresolvable
+				// receiver must always diagnose, never silently resolve to `boolean`.
+				// (A still-unresolved inference-variable RHS is not specially deferred via
+				// `pending_operators` here, unlike the lhs-receiver-shaped arithmetic arms:
+				// that queue is shaped for a lhs receiver, and reusing it for a rhs-receiver
+				// operator is left for a future slice; such a RHS reaches
+				// `dispatch_operator` directly and gets whatever diagnostic that produces.)
 				let method = if op == In { "contains" } else { "not_contains" };
-				if self.is_adt(r) {
-					self.dispatch_operator(r, method, &[l], span);
-				}
-				(boolean, None, None)
+				let (_, dispatch, impl_span) = self.dispatch_operator(r, method, &[l], span);
+				(
+					boolean,
+					Some(Resolution {
+						method: method.into(),
+						dispatch,
+						impl_span,
+					}),
+					None,
+				)
 			}
-			// `??` is overloadable via the `Unwrap` interface. Its built-in *default*
-			// impls (`Option`/`Result`) short-circuit — codegen lowers those to
-			// `match a { Some(v) -> v, _ -> b }`, not evaluating `b` when `a` holds a
-			// value — while a user `Unwrap` overload is an ordinary (eager) method call.
-			// Typing: `b` and the result are `Output`. D3: `lower_binop` already panics on
-			// `Unwrap` before any dispatch question arises, so no resolution is needed.
+			// `??` is overloadable via the `Unwrap` interface. Nymph has no optional
+			// type today (no `T?` surface syntax, no `TyKind::Optional`, no builtin
+			// `Option`/`Result`) — every `??` dispatch is an ordinary, eager user-method
+			// call (`recv.unwrap(fallback)`), never a short-circuiting builtin default;
+			// an unresolvable receiver is a `NotImplemented` diagnostic, exactly like any
+			// other operator with no matching impl (`dispatch_operator`'s `None` arm).
 			Unwrap => {
-				let (ty, _) = self.dispatch_operator(l, "unwrap", &[r], span);
-				(ty, None, None)
+				let (ty, dispatch, impl_span) = self.dispatch_operator(l, "unwrap", &[r], span);
+				(
+					ty,
+					Some(Resolution {
+						method: "unwrap".into(),
+						dispatch,
+						impl_span,
+					}),
+					None,
+				)
 			}
 			Pipe => unreachable!("handled above"),
 		}
@@ -1364,6 +1944,7 @@ impl<'m> Checker<'m> {
 				Resolution {
 					method: method.into(),
 					dispatch: DispatchKind::BuiltinEager,
+					impl_span: None,
 				},
 			));
 		}
@@ -1374,7 +1955,7 @@ impl<'m> Checker<'m> {
 		) {
 			return None;
 		}
-		let (dispatch_ty, dispatch) = self.dispatch_operator(ty, method, &[ty], span);
+		let (dispatch_ty, dispatch, impl_span) = self.dispatch_operator(ty, method, &[ty], span);
 		let result_ty = if is_comparison {
 			self.interner.boolean()
 		} else {
@@ -1385,6 +1966,7 @@ impl<'m> Checker<'m> {
 			Resolution {
 				method: method.into(),
 				dispatch,
+				impl_span,
 			},
 		))
 	}
@@ -1408,6 +1990,27 @@ impl<'m> Checker<'m> {
 		self.unify(l, r, span);
 	}
 
+	/// Check a `&&`/`||` operand against `boolean`. Unlike every other binary
+	/// operator, `&&`/`||` are never overloadable (see the `BoolAnd | BoolOr` arm
+	/// above): a still-unresolved inference variable or an already-diagnosed
+	/// `Error` type unifies with `boolean` as usual (binding the var, or silently
+	/// continuing), but a concrete non-boolean type — including any ADT — is
+	/// reported with the dedicated [`TypeError::LogicalOperandNotBoolean`] instead
+	/// of `unify`'s generic `MismatchedTypes`, so the diagnostic can carry a help
+	/// hint stating that logical operators aren't overloadable, rather than
+	/// reading like a missing-overload bug.
+	fn check_logical_operand(&mut self, ty: Ty, span: Span) {
+		let boolean = self.interner.boolean();
+		let resolved = self.shallow_resolve(ty);
+		match self.interner.kind(resolved) {
+			TyKind::Boolean | TyKind::Infer(_) | TyKind::Error => self.unify(ty, boolean, span),
+			_ => {
+				let found = self.display(ty);
+				self.emit(span, TypeError::LogicalOperandNotBoolean { found });
+			}
+		}
+	}
+
 	/// Resolve an operator's method call, reporting an error if no impl provides it.
 	/// The paired [`DispatchKind`] tells the binary-operator caller (Slice 4B)
 	/// whether the matched method is a real, directly-callable method (`UserImpl` —
@@ -1424,70 +2027,98 @@ impl<'m> Checker<'m> {
 		method: &str,
 		args: &[Ty],
 		span: Span,
-	) -> (Ty, DispatchKind) {
+	) -> (Ty, DispatchKind, Option<Span>) {
 		// Operator operands are already typed; literal widening on them is handled on the
 		// primitive fast-paths, so no argument is flagged as a coercible literal here.
 		let lits = vec![false; args.len()];
 		match self.resolve_method(recv, method, args, &lits, span) {
 			Some(res) => {
-				let dispatch = match res.source {
-					// Slice 4C-b materializes un-overridden interface default methods onto
-					// every implementing struct's class (`lower_hir.rs`), so a method that
-					// only exists as an interface default is now a real, directly-callable
-					// class method just like an inherent/impl-direct one.
-					MethodSource::Inherent | MethodSource::ImplDirect | MethodSource::InterfaceDefault => {
-						DispatchKind::UserImpl
-					}
-					// `GenericBound` *is* reachable here: the arithmetic-operator arm above
-					// routes a `Param`-typed receiver through `dispatch_operator` too (see the
-					// `TyKind::Param` check alongside `is_adt` at its call sites), and a
-					// default body checked with `this` bound to a rigid synthetic `Param`
-					// (`check_interface_default_bodies`) hits this same path for a
-					// Self-dependent arithmetic/bitwise operator. The concrete impl is only
-					// known once the parameter is instantiated, which this
-					// type-erased-at-lowering compiler does not track, so it stays a loud
-					// lowering deferral rather than a silent miscompile.
-					MethodSource::GenericBound => DispatchKind::UserImplDefaultMethod,
-				};
-				(res.ty, dispatch)
+				// `GenericBound` *is* reachable here: the arithmetic-operator arm above
+				// routes a `Param`-typed receiver through `dispatch_operator` too (see the
+				// `TyKind::Param` check alongside `is_adt` at its call sites), and a
+				// default body checked with `this` bound to a rigid synthetic `Param`
+				// (`check_interface_default_bodies`) hits this same path for a
+				// Self-dependent arithmetic/bitwise operator. The concrete impl is only
+				// known once the parameter is instantiated, which this
+				// type-erased-at-lowering compiler does not track, so it stays a loud
+				// lowering deferral rather than a silent miscompile —
+				// `dispatch_kind_for_operator` maps it (and a prelude-origin impl) to
+				// `UserImplDefaultMethod` too.
+				let dispatch = dispatch_kind_for_operator(&res);
+				(res.ty, dispatch, res.impl_span)
 			}
 			None => {
-				let lhs = self.display(recv);
-				let rhs = args.first().map(|&a| self.display(a));
-				let (operator, interface) = operator_symbol_and_interface(method);
+				let rendered = self.display(recv);
 				self.emit(
 					span,
-					TypeError::OperatorNotImplemented {
-						operator: operator.into(),
-						lhs,
-						rhs,
-						interface: interface.into(),
+					TypeError::NotImplemented {
+						method: method.into(),
+						ty: rendered,
 					},
 				);
 				// An error path (diagnostics already emitted): lowering never runs when
 				// `Checked::diags` has errors, so this `DispatchKind` is never consumed.
-				(self.interner.error(), DispatchKind::UserImpl)
+				(self.interner.error(), DispatchKind::UserImpl, None)
 			}
 		}
 	}
 
-	/// Check a `value as Target` cast. An identity cast and conversions among the scalar
-	/// numeric/`char` types are built in; every other cast requires the source type to
-	/// implement `Into<Other = Target>`. When no `Into` interface is in scope (e.g. a test
-	/// snippet without the prelude) the cast is left unchecked.
-	fn check_cast(&mut self, src: Ty, target: Ty, span: Span) {
-		let src = self.shallow_resolve(src);
-		let target_r = self.shallow_resolve(target);
-		// Don't pile diagnostics onto a poisoned or still-unknown operand.
+	/// Infer a `value as Target` cast (Slice 4K) and decide its `Resolution` —
+	/// mirrors `infer_binary`'s two-purposes-at-once shape (Slice 4B): `infer`
+	/// needs the node's type recorded before a resolution can be attached to it
+	/// (see the `TypeOp` special case in `infer` above), so this splits the same
+	/// way the operator-inferring methods do rather than living entirely inside
+	/// `check_cast`.
+	fn infer_cast(
+		&mut self,
+		lhs: &Expr,
+		rhs: &Spanned<Type>,
+		span: Span,
+	) -> (Ty, Option<Resolution>) {
+		let src = self.infer(lhs);
+		let target = self.lower_type(rhs);
+		let resolution = self.check_cast(src, target, span);
+		(target, resolution)
+	}
+
+	/// Check a `value as Target` cast, returning the `Resolution` lowering needs to
+	/// compile it. An identity cast and conversions among the scalar numeric/`char`
+	/// types are built in (`DispatchKind::BuiltinEager` — lowering picks the exact JS
+	/// mapping itself from the recorded operand/target types); every other cast
+	/// requires the source type to implement `Into<Other = Target>`
+	/// (`DispatchKind::UserImpl`, dispatched to its `into` method). When no `Into`
+	/// interface is even in scope, the cast used to be left completely unchecked
+	/// (silently type-checking a program that would panic in lowering); it now
+	/// reports [`TypeError::CastRequiresInto`] instead, distinct from
+	/// [`TypeError::CannotCast`] (which fires when `Into` *is* in scope but no impl
+	/// satisfies it).
+	fn check_cast(&mut self, src: Ty, target: Ty, span: Span) -> Option<Resolution> {
+		// `mut` is transparent to casting — `mut int as int` is the same identity
+		// cast as `int as int`. Peel it off both sides (a common `let mut`/`mut`
+		// param/field operand) before the built-in-path check, else the cast falls
+		// through to a bogus "no `Into` impl" diagnostic.
+		let src = self.strip_mut(src);
+		let target_r = self.strip_mut(target);
+		// Don't pile diagnostics onto a poisoned or still-unknown operand, and don't
+		// record a resolution lowering could act on either — an `Error`/`Infer` type
+		// already has (or will have) its own diagnostic; lowering never runs on a
+		// program with any diagnostic at all.
 		if self.is_error_or_infer(src) || self.is_error_or_infer(target_r) {
-			return;
+			return None;
 		}
 		// Identity and scalar numeric/char conversions need no `Into` impl.
 		if src == target_r || (self.is_scalar_cast_ty(src) && self.is_scalar_cast_ty(target_r)) {
-			return;
+			return Some(Resolution {
+				method: "as".into(),
+				dispatch: DispatchKind::BuiltinEager,
+				impl_span: None,
+			});
 		}
 		let Some(into) = self.defs.get("Into").filter(|&d| self.is_interface(d)) else {
-			return;
+			let s = self.display(src);
+			let t = self.display(target);
+			self.emit(span, TypeError::CastRequiresInto { from: s, to: t });
+			return None;
 		};
 		let known: Vec<(EcoString, Ty)> = self
 			.interfaces
@@ -1496,10 +2127,78 @@ impl<'m> Checker<'m> {
 			.map(|name| (name, target))
 			.into_iter()
 			.collect();
-		if !self.holds(src, into, &known, 0) {
+		if self.holds(src, into, &known, 0) {
+			// `into` is only the stdlib `Into`'s conventional method name — `into` is
+			// looked up purely BY NAME (`self.defs.get("Into")` above), so a local
+			// interface literally called `Into` whose sole method isn't named `into`
+			// (e.g. `func convert(): Other`) is a legal shape `holds` alone can't
+			// rule out (it only checks the interface's generic args, never method
+			// names). Read the actual dispatched name back off the interface's own
+			// declared methods instead of assuming "into" — the exact zero-arg
+			// method the `Into` shape declares — rather than emitting a call to a
+			// name that may not exist on the class at all (a silent-miscompile
+			// bug this fixes; see `TypeError::IntoInterfaceMalformed`'s doc for the
+			// ambiguous/malformed fallback). `Into` declares no default body
+			// (`ops/mod.nym:91`), so any impl that satisfies `holds` necessarily
+			// defines that method directly.
+			//
+			// The actual dispatch is decided by re-resolving `method` through the
+			// solver (`resolve_method`, exactly `dispatch_kind_for_method_call`'s
+			// method-call path) rather than assuming `UserImpl` outright: `holds`
+			// only proves *some* impl provides `method`, not that the impl lives
+			// in the user's own module — a cast whose only `Into` impl is one of
+			// the stdlib prelude's own (e.g. `impl Into<string> for boolean`, a
+			// prelude-origin `ImplDirect`) used to still get `UserImpl` here,
+			// which lowering trusted unconditionally and compiled straight to
+			// `operand.into()` — a silent `TypeError: operand.into is not a
+			// function` under Node for a JS primitive with no such method,
+			// confirmed by probe. Re-resolving gets the exact same
+			// `UserImplDefaultMethod` deferral (or, once materializable, the
+			// mangled-function dispatch) a plain method call on the same impl
+			// would get.
+			let zero_arg_methods: Vec<EcoString> = self
+				.interfaces
+				.get(&into)
+				.map(|def| {
+					def
+						.methods
+						.iter()
+						.filter(|(_, m)| m.params.is_empty())
+						.map(|(name, _)| name.clone())
+						.collect()
+				})
+				.unwrap_or_default();
+			match <[EcoString; 1]>::try_from(zero_arg_methods) {
+				Ok([method]) => match self.resolve_method(src, &method, &[], &[], span) {
+					Some(res) => Some(Resolution {
+						method,
+						dispatch: dispatch_kind_for_method_call(&res),
+						impl_span: res.impl_span,
+					}),
+					// `holds` already proved an impl exists; `resolve_method` failing
+					// here would mean the two solver entry points disagree — kept
+					// total (falls to `CannotCast`) rather than `unreachable!()` so a
+					// future divergence between them fails loudly via a wrong-but-safe
+					// diagnostic instead of a panic mid-typecheck.
+					None => {
+						let s = self.display(src);
+						let t = self.display(target);
+						self.emit(span, TypeError::CannotCast { from: s, to: t });
+						None
+					}
+				},
+				Err(_) => {
+					let s = self.display(src);
+					let t = self.display(target);
+					self.emit(span, TypeError::IntoInterfaceMalformed { from: s, to: t });
+					None
+				}
+			}
+		} else {
 			let s = self.display(src);
 			let t = self.display(target);
 			self.emit(span, TypeError::CannotCast { from: s, to: t });
+			None
 		}
 	}
 
@@ -1519,7 +2218,10 @@ impl<'m> Checker<'m> {
 
 	/// The primitive kind of a (resolved) type, if it is one.
 	fn prim_kind(&mut self, ty: Ty) -> Option<TyKind> {
-		let ty = self.shallow_resolve(ty);
+		// A `mut` primitive is still that primitive for every dispatch purpose —
+		// `mut` is a compile-time-only view, transparent here exactly like
+		// `head_of` treats it for method/impl dispatch.
+		let ty = self.strip_mut(ty);
 		match self.interner.kind(ty) {
 			k @ (TyKind::Int
 			| TyKind::UInt
@@ -1532,8 +2234,9 @@ impl<'m> Checker<'m> {
 	}
 
 	/// Whether a (resolved) type has a nominal head an impl could be keyed on.
+	/// Peels `mut` first, same rationale as [`Self::prim_kind`].
 	fn is_adt(&mut self, ty: Ty) -> bool {
-		let ty = self.shallow_resolve(ty);
+		let ty = self.strip_mut(ty);
 		matches!(
 			self.interner.kind(ty),
 			TyKind::Adt(..) | TyKind::List(_) | TyKind::Tuple(_) | TyKind::Map(..)
@@ -1542,7 +2245,7 @@ impl<'m> Checker<'m> {
 
 	/// Apply a callee type to argument types via unification (used by `|>`).
 	fn apply(&mut self, callee: Ty, arg_tys: Vec<Ty>, span: Span) -> Ty {
-		let callee = self.shallow_resolve(callee);
+		let callee = self.strip_mut(callee);
 		if matches!(self.interner.kind(callee), TyKind::Error) {
 			return self.interner.error();
 		}
@@ -1597,9 +2300,38 @@ impl<'m> Checker<'m> {
 					return (self.interner.void(), None, None);
 				}
 			},
-			// A field or index target (`this.field`, `xs[i]`): its type is the place type.
+			// A field-slot target (`p.field`): gated on a `mut` receiver — the
+			// headline mutable-types enforcement. `xs[i]` index targets are left
+			// ungated in MT1 (a separate question the plan defers).
+			ExprKind::MemberAccess { parent, member, .. } => {
+				let parent_ty = self.infer(parent);
+				let resolved = self.shallow_resolve(parent_ty);
+				match self.interner.kind(resolved) {
+					// A prior error/unresolved var: don't cascade a second diagnostic.
+					TyKind::Mut(_) | TyKind::Error | TyKind::Infer(_) => {}
+					_ => {
+						let ty = self.display(resolved);
+						self.emit(
+							lhs.span,
+							TypeError::AssignFieldThroughImmutable {
+								field: member.0.clone(),
+								ty,
+							},
+						);
+					}
+				}
+				self.member_ty_of(parent_ty, &member.0, member.1)
+			}
+			// An index target (`xs[i]`): its type is the place type.
 			_ => self.infer(lhs),
 		};
+
+		// Fitting a value back into a place is about the STORED value's type, not
+		// the place's own `mut`-ness (a characteristic of the binding/field slot,
+		// already gated above for a field target) — strip it here so storing an
+		// ordinary `T` into a `mut T` place (e.g. reassigning a `let mut` local)
+		// doesn't spuriously demand the value itself be `mut`-typed too.
+		let expected = self.strip_mut(place_ty);
 
 		let mut resolution = None;
 		let mut pending = None;
@@ -1608,12 +2340,12 @@ impl<'m> Checker<'m> {
 			// must be assignable back into the place.
 			Some(binop) => {
 				let (result, res, pend) = self.infer_binary(lhs, binop, rhs, span);
-				self.unify(result, place_ty, span);
+				self.unify(result, expected, span);
 				resolution = res;
 				pending = pend.map(|ty| (binop, ty));
 			}
 			// Plain `=`.
-			None => self.check(rhs, place_ty),
+			None => self.check(rhs, expected),
 		}
 		(self.interner.void(), resolution, pending)
 	}
@@ -1650,15 +2382,43 @@ impl<'m> Checker<'m> {
 	}
 
 	fn check_let_statement(&mut self, meta: &nymph_ast::decl::LetDeclaration, value: &Expr) {
+		let has_annot = meta.type_.is_some();
 		let ty = match &meta.type_ {
 			Some(annot) => {
 				let declared = self.lower_type(annot);
-				self.check(value, declared);
+				// Check the initializer against the declared type with any `mut` the
+				// annotation itself carries peeled off first: initializing a
+				// `mut T`-annotated binding only needs a plain `T`-compatible value —
+				// `mut` here is a capability layer the BINDING gains, not a runtime
+				// distinction the initializer must already carry (mirrors the
+				// un-annotated `let mut` form below, which already accepts a plain
+				// value and wraps it in `mut` after the fact). Without this peel,
+				// `subtype` (one-way `mut T <: T`, never the reverse) would reject
+				// every plain-typed initializer against an explicit `mut T`
+				// annotation, e.g. `let mut c: mut Counter = Counter(n = 0)`.
+				let expected = self.strip_mut(declared);
+				self.check(value, expected);
 				declared
 			}
 			None => self.infer(value),
 		};
-		self.bind_pattern(&meta.name, ty, meta.mutable);
+		// `let mut x = v` binds `x` at `mut <ty(v)>` (one of the two mutability
+		// cancel points: dropping into a `let mut` always gains `mut`, whatever
+		// `v`'s own mutability was — `mk_mut` is idempotent, so this never nests).
+		// A plain `let x = v` WITHOUT an explicit annotation instead drops any
+		// `mut` `v` had (the other cancel point): the binding is immutable, so its
+		// type must be too. But a plain `let x: mut T = v` — an explicit `mut`
+		// annotation is its own, separate authority (NN2), independent of the
+		// `let mut` keyword (NN4) — must keep the `mut` the user wrote instead of
+		// silently stripping it.
+		let ty = if meta.is_mutable() {
+			self.interner.mk_mut(ty)
+		} else if has_annot {
+			ty
+		} else {
+			self.strip_mut(ty)
+		};
+		self.bind_pattern(&meta.name, ty, meta.is_mutable());
 	}
 
 	// ── Iteration ────────────────────────────────────────────────────────────
@@ -1667,12 +2427,108 @@ impl<'m> Checker<'m> {
 			return self.infer_range_element(kind);
 		}
 		let ty = self.infer(iterable);
-		let ty = self.shallow_resolve(ty);
-		match self.interner.kind(ty).clone() {
+		// `mut` is transparent to iteration: `for x in xs` over a `mut #[int]`
+		// yields `int` elements, same as an immutable list. Peel it, else the
+		// element type falls through to an unconstrained fresh var and the loop
+		// body escapes type-checking.
+		let stripped = self.strip_mut(ty);
+		match self.interner.kind(stripped).clone() {
 			TyKind::List(elem) => elem,
-			// Other iterables resolve through the `Iterable` interface (Milestone B).
-			_ => self.fresh(),
+			// Anything else resolves through the `Iterator`/`Iterable` interfaces.
+			_ => self.resolve_iterable_source(iterable, ty, stripped),
 		}
+	}
+
+	/// Resolve a non-range, non-list `for`-loop source (RR1): prefer
+	/// ITERATOR-DIRECT (the source itself implements `Iterator<Item>`) over
+	/// ITERABLE-VIA-ITER (the source implements `Iterable<T>`, reached through
+	/// `.iter()`) — a type implementing both uses its own `next()` directly
+	/// rather than paying for an extra `.iter()` hop. Neither ⇒ `NotIterable`,
+	/// replacing what used to be a silent `self.fresh()` accept (the loop
+	/// pattern bound to an unconstrained inference variable that let the body
+	/// typecheck against garbage, only to panic in lowering).
+	///
+	/// Item/`T` is read directly off the matched impl's substituted argument
+	/// (`resolve_iface_arg`) rather than by typing `iter()`'s return: `Iterator<T>`
+	/// in RETURN position lowers through `mint_synthetic_param` (lower.rs) to an
+	/// anonymous `impl Trait` param whose interface generic args are discarded, so
+	/// a two-hop `iter().next()` would come back unpinned.
+	///
+	/// Records which mode won (`IterMode`) on the iterable's own node id —
+	/// `lower_for` has no solver access of its own and reads this back to know
+	/// whether to emit `<src>.iter()` or `<src>` as the desugar's first `let`.
+	fn resolve_iterable_source(&mut self, iterable: &Expr, ty: Ty, stripped: Ty) -> Ty {
+		if self.is_error_or_infer(stripped) {
+			return self.interner.error();
+		}
+		// Captured the same way `resolve_method`'s own `recv_is_mut` is (BEFORE
+		// the `mut` peel above erases it): whether the source, as the caller
+		// actually wrote it, is `mut`. Needed so an `Iterator`/`Iterable` impl
+		// reachable only through the mutable view (`impl A for mut B` / `impl
+		// mut A for B`, MT2 OO4/OO5 — the only way such an impl's `next`/`iter`
+		// can mutate `this`, since a plain `func` binds `this: Self`, not `mut
+		// Self`) is actually reachable, rather than permanently unmatched.
+		let resolved = self.shallow_resolve(ty);
+		let self_is_mut = matches!(self.interner.kind(resolved), TyKind::Mut(_));
+		// A bare, unbounded generic type parameter's iterability can't be
+		// resolved through the impl registry: `head_of` maps `Param` to `None`,
+		// so only a blanket `Iterator`/`Iterable` impl could ever match it (none
+		// exists yet), and there is no separate mechanism here (unlike
+		// `resolve_param_namespaced`'s namespaced-call path) for a for-loop
+		// source bound by an interface constraint declared on its own generic
+		// parameter — RR1 targets concrete ADT sources (per the plan), a bare
+		// `Param` is out of scope for this slice. Keep the pre-existing
+		// permissive fallback for exactly this shape rather than a new
+		// false-positive `NotIterable`. This also happens to be what keeps
+		// `stdlib_typechecks_cleanly` green for `collections/set.nym`'s
+		// `for (item in from)` over a `...from: Item` spread parameter: spread
+		// parameter typing doesn't yet wrap the body-visible type in a list
+		// (`#[Item]`) — it stays the bare element type `Item` — a distinct,
+		// out-of-footprint gap (spread/rest typing, the sibling track's
+		// territory) this slice does not touch.
+		if matches!(self.interner.kind(stripped), TyKind::Param(_)) {
+			return self.fresh();
+		}
+		if let Some(iterator) = self.defs.get("Iterator").filter(|&d| self.is_interface(d))
+			&& let Some(item_name) = self
+				.interfaces
+				.get(&iterator)
+				.and_then(|i| i.generics.first().cloned())
+			&& let Some(item) = self.resolve_iface_arg(stripped, self_is_mut, iterator, &item_name, 0)
+		{
+			// The desugar (`lower_for_protocol`) invokes `next()` on this exact
+			// source directly (`IterMode::Direct`: `let $it = <src>`) — gate it
+			// exactly like an explicit `<src>.next()` call would be via
+			// `resolve_method`, or a non-`mut` receiver's fields get mutated
+			// through the loop with no diagnostic at all (MutMethodNeedsMutReceiver
+			// bypassed).
+			self.gate_mutating(iterator, "next", self_is_mut, iterable.span);
+			self
+				.annotations
+				.record_iter_mode(iterable.id, IterMode::Direct);
+			return item;
+		}
+		if let Some(iface) = self.defs.get("Iterable").filter(|&d| self.is_interface(d))
+			&& let Some(t_name) = self
+				.interfaces
+				.get(&iface)
+				.and_then(|i| i.generics.first().cloned())
+			&& let Some(elem) = self.resolve_iface_arg(stripped, self_is_mut, iface, &t_name, 0)
+		{
+			// Same reasoning as the `Direct` gate above, but for the `.iter()` hop
+			// the desugar calls on this source (`IterMode::ViaIter`): gate it
+			// against `Iterable::iter`'s own declared mutability, not `Iterator::next`'s
+			// (the iterator `iter()` returns is a distinct value, resolved and
+			// gated separately were it ever user-callable — out of scope here).
+			self.gate_mutating(iface, "iter", self_is_mut, iterable.span);
+			self
+				.annotations
+				.record_iter_mode(iterable.id, IterMode::ViaIter);
+			return elem;
+		}
+		let s = self.display(ty);
+		self.emit(iterable.span, TypeError::NotIterable { ty: s });
+		self.interner.error()
 	}
 
 	fn infer_range_element(&mut self, kind: &RangeKind) -> Ty {
@@ -1746,6 +2602,182 @@ impl<'m> Checker<'m> {
 			}
 		}
 	}
+
+	/// Drain this body's `pending_bounds` obligations (Slice 4G), mirroring
+	/// `finalize_pending_operators` exactly: called from every per-body driver
+	/// while that body's `param_bounds`/`synthetic_bounds` and the unify table
+	/// are still live, and truncated (not drained) by `infer_inherent_return`'s
+	/// discarded trial run, for the same reasons documented on `pending_operators`.
+	///
+	/// For each obligation, shallow-resolve the minted variable:
+	/// - Still `Infer` (never pinned to a concrete argument — reachable from a
+	///   handful of zero-diagnostic programs, e.g. an unapplied function value,
+	///   or a generic mentioned in no parameter): skip silently, matching
+	///   `finalize_pending_operators`'s treatment of a genuinely
+	///   under-determined var (there is no concrete type yet to check, and no
+	///   runtime value of it ever exists in these shapes either).
+	/// - `Error`: skip (an upstream mistake already diagnosed elsewhere).
+	/// - A rigid `Param` (the classic generic-to-generic forwarding case, e.g.
+	///   `outer<T: Area>(x: T) = measure(x)`): satisfied if the *caller's own*
+	///   `param_bounds`/`synthetic_bounds` already record this interface for
+	///   that `Param` — those maps are live because this is still that caller's
+	///   own body. `holds` cannot see them at all (a rigid `Param` has no
+	///   `head_of`, so only the interface's blanket bucket is even considered),
+	///   so it is consulted only as a fallback, to still accept an
+	///   *unconstrained* blanket impl (e.g. stdlib's
+	///   `impl<T> Comparable<Other = T> for T`).
+	/// - Any other concrete type: satisfied iff `holds` finds a matching impl
+	///   (with the bound's own, call-site-substituted arguments, giving full
+	///   fidelity for an argful declared bound like `Comparable<Other = T>`).
+	pub(crate) fn finalize_pending_bounds(&mut self) {
+		let pending = std::mem::take(&mut self.pending_bounds);
+		let arg_mut = std::mem::take(&mut self.pending_bound_arg_mut);
+		for (span, ty, interface, args) in pending {
+			let resolved = self.shallow_resolve(ty);
+			let kind = self.interner.kind(resolved).clone();
+			let satisfied = match kind {
+				TyKind::Infer(_) | TyKind::Error => true,
+				TyKind::Param(p) => {
+					let bounded = self
+						.param_bounds
+						.get(&p)
+						.is_some_and(|is| is.contains(&interface))
+						|| self
+							.synthetic_bounds
+							.get(&p)
+							.is_some_and(|is| is.contains(&interface));
+					bounded || self.holds(resolved, interface, &args, 0)
+				}
+				// MT2 OO4: `resolved` here has already had any `mut` cancelled by
+				// `subtype`'s one-way `mut T <: T` (`check_call_arg` is what binds
+				// this obligation's variable) — `pending_bound_arg_mut`, keyed by
+				// the SAME un-resolved `ty` `fn_type_of` pushed this obligation
+				// with, is the side channel that survived that cancellation.
+				_ => match arg_mut.get(&ty).copied() {
+					// One contributing argument was `mut`, another wasn't. This is
+					// NOT automatically an error: if the bound is satisfied by the
+					// PLAIN type (an ordinary `impl A for B`, no mut-only impl), both
+					// a `mut` and a plain argument satisfy it — the mixed-ness is
+					// harmless. Only when the plain type FAILS the bound (i.e. A is
+					// implemented only for `mut B`) does this reject, and then the
+					// general `!satisfied` block below emits `BoundSatisfiedOnlyByMut`
+					// — the precise "B doesn't fit; A is implemented for `mut B`"
+					// message — rather than a vaguer mixed-arguments one. So the
+					// mixed case is just the ordinary plain-type check.
+					Some((true, true)) => self.holds(resolved, interface, &args, 0),
+					// Every contributing argument was `mut`: a `Mut(B)`-only impl
+					// additionally matches (`holds_self`, mut-aware), on top of the
+					// ordinary plain-type check every argument (mut or not) already
+					// gets — a `mut` argument still satisfies an unrelated, non-mut
+					// bound one-way, same as the `mut T <: T` subtype rule elsewhere.
+					Some((true, false)) => {
+						self.holds(resolved, interface, &args, 0)
+							|| self.holds_self(resolved, true, interface, &args, 0)
+					}
+					_ => self.holds(resolved, interface, &args, 0),
+				},
+			};
+			if !satisfied {
+				// The plain type failed the bound — if its `mut` version WOULD
+				// satisfy it (`impl A for mut ty` / `impl mut A for ty`), say so
+				// directly rather than a bare "does not implement". `holds_self`
+				// (not a `mk_mut`-wrapped `holds`) so a `Mut` impl self type is
+				// peeled correctly rather than compared against a doubly-`Mut`
+				// `self_ty` (see `holds_self`'s doc comment).
+				if self.holds_self(resolved, true, interface, &args, 0) {
+					let ty = self.display(resolved);
+					let interface = self.defs.data(interface).name.clone();
+					self.emit(span, TypeError::BoundSatisfiedOnlyByMut { ty, interface });
+				} else {
+					let ty = self.display(resolved);
+					let interface = self.defs.data(interface).name.clone();
+					self.emit(span, TypeError::BoundNotSatisfied { ty, interface });
+				}
+			}
+		}
+	}
+
+	/// Infer a `receiver.method(args…)` call argument's type for `resolve_method`,
+	/// wrapping a fresh `#{…}`/`#[…]` literal argument's inferred type in `Mut` so
+	/// it can satisfy a `mut`-typed method parameter (Confirmed defect 2: unlike
+	/// free-function calls — `check_call_arg` — and ctor/block/if/match positions
+	/// — `check_dispatch`'s own hook — a method call has no parameter type to
+	/// `check` the argument against up front; the candidate's params only become
+	/// known *after* `resolve_method` has already committed to one). This is
+	/// exactly [`Checker::try_coerce_owned_literal_to_mut`]'s own rationale
+	/// (a collection literal is a uniquely-owned temporary with no other alias,
+	/// so it may stand in for `mut T`), applied at the type level instead: wrapping
+	/// unconditionally is safe because `unify_arg` (`coerce.rs`) already peels a
+	/// `mut`-typed ARGUMENT one-way — `(_, Mut(a)) => unify_arg(param, a, …)` —
+	/// whenever the matched parameter isn't itself `mut`, so this can never leak a
+	/// spurious `Mut` into a non-`mut`/generic parameter's binding; it only ever
+	/// unlocks the one case `unify_arg` couldn't reach before: a genuinely
+	/// `mut`-typed parameter matched against this now-`Mut`-typed literal argument.
+	/// A NAMED binding (`ExprKind::Identifier`, never wrapped here) is untouched,
+	/// so the existing one-way `mut T <: T` invariant — a plain-typed named
+	/// argument still can't satisfy a `mut` parameter — is unaffected.
+	fn infer_method_call_arg(&mut self, expr: &Expr) -> Ty {
+		let ty = self.infer(expr);
+		if matches!(expr.kind, ExprKind::Map(_) | ExprKind::List(_)) {
+			self.interner.mk_mut(ty)
+		} else {
+			ty
+		}
+	}
+
+	/// Check a free-function call argument against its (possibly still a fresh
+	/// generic-parameter variable) parameter type, additionally recording the
+	/// argument's ACTUAL, pre-cancellation mutability against that parameter
+	/// type (MT2 OO4) — mirrors [`Self::check`] exactly, branch for branch, so
+	/// behavior is unchanged; the one addition is the record in the generic
+	/// fallback arm, made before `subtype` (via the fallback's call) cancels a
+	/// `mut` argument's tag. See [`Checker::pending_bound_arg_mut`]'s doc
+	/// comment for why this can't instead hook `subtype` itself (it also
+	/// checks return values, `let` bindings, etc. — this call site is the one
+	/// `fn_type_of`'s `pending_bounds` obligations are actually about).
+	fn check_call_arg(&mut self, expr: &Expr, pty: Ty) {
+		self.resolve_anon(expr, Some(pty));
+		match &expr.kind {
+			ExprKind::Closure { .. }
+			| ExprKind::Block { .. }
+			| ExprKind::If { .. }
+			| ExprKind::Match { .. }
+			| ExprKind::Grouped(_) => self.check(expr, pty),
+			ExprKind::Int(_) if self.int_literal_coerces_to(pty) => {}
+			// Owned-literal → `mut` coercion, mirroring `check_dispatch`'s own hook:
+			// a `#{…}`/`#[…]` literal argument may satisfy a `mut` parameter
+			// directly. On guard failure (`pty`'s own top level isn't `mut`), routes
+			// through `self.check(expr, pty)` — NOT the `_` arm's blind
+			// `self.infer(expr)` — so `check_dispatch`'s `List`/`Map` arms still
+			// propagate a concrete (possibly nested-`mut`) element/value type down
+			// into this literal's own items/entries, letting a NESTED literal reach
+			// `try_coerce_owned_literal_to_mut` in turn (Confirmed defect 1: a
+			// blind `infer()` here left nested elements with no expected type at
+			// all, so a `mut`-expected nested item could never win the coercion).
+			// `check_call_arg`'s extra `pending_bound_arg_mut` tracking (below, in
+			// the `_` arm) is for a NAMED argument's own recorded mutability
+			// feeding a later generic-bound check; a `Map`/`List` literal is never
+			// itself typed `mut` by `infer`, so skipping that tracking here changes
+			// nothing observable — `is_mut` in the `_` arm would always have read
+			// `false` for these two expression kinds anyway.
+			ExprKind::Map(_) | ExprKind::List(_) => self.check(expr, pty),
+			_ => {
+				let got = self.infer(expr);
+				let got_resolved = self.shallow_resolve(got);
+				let is_mut = matches!(self.interner.kind(got_resolved), TyKind::Mut(_));
+				let entry = self
+					.pending_bound_arg_mut
+					.entry(pty)
+					.or_insert((false, false));
+				if is_mut {
+					entry.0 = true;
+				} else {
+					entry.1 = true;
+				}
+				self.subtype(got, pty, expr.span);
+			}
+		}
+	}
 }
 
 /// The interface method a binary arithmetic/bitwise operator desugars to.
@@ -1798,44 +2830,6 @@ fn prefix_method(op: PrefixOperator) -> &'static str {
 		PrefixOperator::Negate => "negate",
 		PrefixOperator::BitNot => "bit_not",
 		PrefixOperator::BoolNot => unreachable!("BoolNot never defers to the fallback path"),
-	}
-}
-
-/// The surface operator spelling and backing interface name for every method
-/// `dispatch_operator` can be asked to resolve, keyed by the (internal)
-/// method name callers pass it — `binary_method`/`comparison_method`/
-/// `prefix_method`'s outputs, plus the two operators (`unwrap`, `contains`/
-/// `not_contains`) that don't route through any of those three. Used only to
-/// render [`TypeError::OperatorNotImplemented`]'s message: the internal
-/// method name (`less_than_eq`, `bit_and`, …) is meaningless to a Nymph
-/// programmer, but the operator they actually wrote and the interface they'd
-/// need to implement are exactly what the diagnostic must name.
-fn operator_symbol_and_interface(method: &str) -> (&'static str, &'static str) {
-	match method {
-		"plus" => ("+", "Plus"),
-		"minus" => ("-", "Minus"),
-		"times" => ("*", "Times"),
-		"divide" => ("/", "Divide"),
-		"remainder" => ("%", "Remainder"),
-		"power" => ("**", "Power"),
-		"shl" => ("<<", "LeftShift"),
-		"shr" => (">>", "RightShift"),
-		"bit_and" => ("&", "BitAnd"),
-		"bit_or" => ("|", "BitOr"),
-		"bit_xor" => ("^", "BitXor"),
-		"bit_not" => ("~", "BitNot"),
-		"less_than" => ("<", "Comparable"),
-		"less_than_eq" => ("<=", "Comparable"),
-		"greater_than" => (">", "Comparable"),
-		"greater_than_eq" => (">=", "Comparable"),
-		"equals" => ("==", "Equals"),
-		"not_equals" => ("!=", "Equals"),
-		"contains" => ("in", "Contains"),
-		"not_contains" => ("!in", "Contains"),
-		"unwrap" => ("??", "Unwrap"),
-		"not" => ("!", "Not"),
-		"negate" => ("-", "Negate"),
-		other => unreachable!("dispatch_operator reached with an unknown method: {other}"),
 	}
 }
 

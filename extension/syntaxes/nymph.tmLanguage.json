@@ -1,12 +1,13 @@
 {
 	"name": "Nymph",
 	"scopeName": "source.nymph",
-	"fileTypes": ["nym"],
+	"fileTypes": ["nym", "nymph"],
 	"patterns": [
 		{ "include": "#comments" },
 		{ "include": "#strings" },
 		{ "include": "#characters" },
 		{ "include": "#numbers" },
+		{ "include": "#anonymous-parameters" },
 		{ "include": "#keywords" },
 		{ "include": "#label" },
 		{ "include": "#operators" },
@@ -22,6 +23,10 @@
 		"comments": {
 			"patterns": [
 				{
+					"name": "comment.line.documentation.nymph",
+					"match": "///.*$"
+				},
+				{
 					"name": "comment.line.double-slash.nymph",
 					"match": "//.*$"
 				},
@@ -32,70 +37,68 @@
 				}
 			]
 		},
+		"escapes": {
+			"name": "constant.character.escape.nymph",
+			"match": "\\\\(u\\{[0-9A-Fa-f]+\\}|[nrt0\\\\\"'])"
+		},
 		"strings": {
 			"name": "string.quoted.double.nymph",
 			"begin": "\"",
+			"beginCaptures": { "0": { "name": "punctuation.definition.string.begin.nymph" } },
 			"end": "\"",
+			"endCaptures": { "0": { "name": "punctuation.definition.string.end.nymph" } },
 			"patterns": [
-				{
-					"name": "constant.character.escape.nymph",
-					"match": "\\\\(n|r|t|\\\\|\"|'|u[0-9A-Fa-f]{4})"
-				},
+				{ "include": "#escapes" },
 				{
 					"name": "meta.interpolation.nymph",
-					"begin": "(?<!\\\\)\\${",
+					"begin": "(?<!\\\\)\\$\\{",
 					"beginCaptures": {
 						"0": { "name": "punctuation.definition.template-expression.begin.nymph" }
 					},
-					"end": "}",
+					"end": "\\}",
 					"endCaptures": {
 						"0": { "name": "punctuation.definition.template-expression.end.nymph" }
 					},
 					"contentName": "meta.embedded.line.nymph",
-					"patterns": [
-						{ "include": "#literals" },
-						{ "include": "#keywords" },
-						{ "include": "#operators" },
-						{ "include": "#type-expressions" },
-						{ "include": "#member-access" }
-					]
+					"patterns": [{ "include": "#expression" }]
 				}
 			]
 		},
 		"characters": {
 			"name": "string.quoted.single.nymph",
 			"begin": "'",
+			"beginCaptures": { "0": { "name": "punctuation.definition.string.begin.nymph" } },
 			"end": "'",
-			"patterns": [
-				{
-					"name": "constant.character.escape.nymph",
-					"match": "\\\\(n|r|t|\\\\|\"|'|u[0-9A-Fa-f]{4})"
-				}
-			]
+			"endCaptures": { "0": { "name": "punctuation.definition.string.end.nymph" } },
+			"patterns": [{ "include": "#escapes" }]
 		},
 		"numbers": {
 			"patterns": [
 				{
-					"name": "constant.numeric.binary.nymph",
-					"match": "-?0[bB][01](_?[01])*(?!\\w)"
+					"name": "constant.numeric.hex.nymph",
+					"match": "\\b0[xX][0-9a-fA-F](_?[0-9a-fA-F])*[uU]?\\b"
 				},
 				{
 					"name": "constant.numeric.octal.nymph",
-					"match": "-?0[oO][0-7](_?[0-7])*(?!\\w)"
+					"match": "\\b0[oO][0-7](_?[0-7])*[uU]?\\b"
 				},
 				{
-					"name": "constant.numeric.hex.nymph",
-					"match": "-?0[xX][a-fA-F\\d](_?[a-fA-F\\d])*(?!\\w)(?!\\w)"
-				},
-				{
-					"name": "constant.numeric.decimal.nymph",
-					"match": "-?\\d(_?\\d)*(?!\\w)"
+					"name": "constant.numeric.binary.nymph",
+					"match": "\\b0[bB][01](_?[01])*[uU]?\\b"
 				},
 				{
 					"name": "constant.numeric.float.nymph",
-					"match": "-?\\d(_?\\d)*(\\.\\d(_?\\d)*)?([eE][-+]?\\d(_?\\d)*)?[fF]?(?!\\w)"
+					"match": "\\b\\d(_?\\d)*(\\.\\d(_?\\d)*([eE][-+]?\\d(_?\\d)*)?|[eE][-+]?\\d(_?\\d)*|[fF])"
+				},
+				{
+					"name": "constant.numeric.decimal.nymph",
+					"match": "\\b\\d(_?\\d)*[uU]?\\b"
 				}
 			]
+		},
+		"anonymous-parameters": {
+			"name": "variable.language.anonymous-parameter.nymph",
+			"match": "\\$\\d*(?!\\{)"
 		},
 		"keywords": {
 			"patterns": [
@@ -104,34 +107,43 @@
 					"match": "\\b(if|else|for|while|match|return|break|continue)\\b"
 				},
 				{
-					"name": "keyword.other.nymph",
-					"match": "\\b(func|let|mut|type|struct|enum|interface|impl|namespace|external|import|with|async|await)\\b"
+					"name": "keyword.control.import.nymph",
+					"match": "\\b(import|with)\\b"
 				},
 				{
-					"name": "keyword.operator.comparison.nymph",
-					"match": "\\b(is|in)\\b"
+					"name": "storage.type.function.nymph",
+					"match": "\\b(func)\\b"
 				},
 				{
-					"name": "keyword.operator.casting.nymph",
-					"match": "\\b(as)\\b"
+					"name": "storage.type.nymph",
+					"match": "\\b(let|struct|enum|interface|impl|namespace|type)\\b"
 				},
 				{
 					"name": "storage.modifier.nymph",
-					"match": "\\b(public|internal|private)\\b"
+					"match": "\\b(public|internal|private|mut|external|async|await)\\b"
+				},
+				{
+					"name": "keyword.operator.word.nymph",
+					"match": "\\b(as|is|in)\\b"
 				},
 				{
 					"name": "entity.name.type.builtin.nymph",
-					"match": "\\b(int|float|boolean|char|string|void|never|self)\\b"
+					"match": "\\b(int|uint|float|boolean|char|string|void|never|self)\\b"
 				},
 				{
-					"name": "constant.language.nymph",
-					"match": "\\b(true|false|this)\\b"
+					"name": "constant.language.boolean.nymph",
+					"match": "\\b(true|false)\\b"
 				},
 				{
-					"match": "\\b([A-Z][\\p{XID_Continue}]*)\\.([A-Z][\\p{XID_Continue}]*)\\b",
+					"name": "variable.language.this.nymph",
+					"match": "\\bthis\\b"
+				},
+				{
+					"match": "\\b([A-Z][\\p{XID_Continue}]*)\\s*(\\.)\\s*([A-Z][\\p{XID_Continue}]*)\\b",
 					"captures": {
 						"1": { "name": "entity.name.type.nymph" },
-						"2": { "name": "entity.name.type.enum.nymph" }
+						"2": { "name": "punctuation.accessor.nymph" },
+						"3": { "name": "entity.name.type.enum-variant.nymph" }
 					}
 				},
 				{
@@ -139,17 +151,17 @@
 					"name": "entity.name.function.nymph"
 				},
 				{
-					"match": "\\b(this)\\b(?=\\s*\\.)",
-					"name": "variable.language.this.nymph"
+					"name": "entity.name.type.nymph",
+					"match": "\\b[A-Z][\\p{XID_Continue}]*\\b"
 				},
 				{
 					"name": "variable.other.nymph",
-					"match": "[\\p{XID_Start}_][\\p{XID_Continue}]*"
+					"match": "\\b[\\p{XID_Start}_][\\p{XID_Continue}]*\\b"
 				}
 			]
 		},
 		"label": {
-			"match": "([\\p{XID_Start}_][\\p{XID_Continue}]*)\\s*(@)",
+			"match": "([\\p{XID_Start}_][\\p{XID_Continue}]*)\\s*(@)(?![/\\p{XID_Continue}])",
 			"captures": {
 				"1": { "name": "entity.name.label.nymph" },
 				"2": { "name": "punctuation.separator.label.nymph" }
@@ -158,68 +170,84 @@
 		"operators": {
 			"patterns": [
 				{
+					"name": "keyword.operator.spread.nymph",
+					"match": "\\.\\.\\."
+				},
+				{
 					"name": "keyword.operator.range.nymph",
-					"match": "\\.\\.|\\.\\.=|\\.\\.<"
+					"match": "\\.\\.=|\\.\\."
 				},
 				{
 					"name": "keyword.operator.arrow.nymph",
 					"match": "->"
 				},
 				{
-					"name": "keyword.operator.assignment.nymph",
-					"match": "="
+					"name": "keyword.operator.pipe.nymph",
+					"match": "\\|>"
 				},
 				{
-					"name": "keyword.operator.arithmetic.nymph",
-					"match": "\\*\\*=?|\\+=|-=|\\*=|/=|%=|(?<![<>=+\\-*/&|^~.])\\+|(?<![<>=+\\-*/&|^~.])\\-(?!>)|(?<![<>=+\\-*/&|^~])\\*|(?<![<>=+\\-*/&|^~])/|(?<![<>=+\\-*/&|^~])%"
-				},
-				{
-					"name": "keyword.operator.logical.nymph",
-					"match": "&&=?|\\|\\|=?|!|\\?\\?|\\?\\.|\\?"
+					"name": "keyword.operator.assignment.compound.nymph",
+					"match": "(\\*\\*|\\+|-|\\*|/|%|&&|\\|\\||&|\\||\\^|~|<<|>>)="
 				},
 				{
 					"name": "keyword.operator.comparison.nymph",
-					"match": "==|!=|<|>|<=|>=|!is|!in"
+					"match": "==|!=|<=|>=|!is|!in"
+				},
+				{
+					"name": "keyword.operator.logical.nymph",
+					"match": "&&|\\|\\||!|\\?\\?"
+				},
+				{
+					"name": "keyword.operator.optional-chaining.nymph",
+					"match": "\\?\\.|\\?"
+				},
+				{
+					"name": "keyword.operator.arithmetic.nymph",
+					"match": "\\*\\*|\\+|-|\\*|/|%"
 				},
 				{
 					"name": "keyword.operator.bitwise.nymph",
-					"match": "&=?|\\|=?|\\^=?|~=?|<<=?|>>=?"
+					"match": "<<|>>|&|\\||\\^|~"
+				},
+				{
+					"name": "keyword.operator.relational.nymph",
+					"match": "<|>"
+				},
+				{
+					"name": "keyword.operator.assignment.nymph",
+					"match": "="
 				}
 			]
 		},
 		"punctuation": {
 			"patterns": [
 				{
-					"name": "punctuation.separator.nymph",
-					"match": ",|\\.|::|:"
-				},
-				{
-					"name": "punctuation.terminator.nymph",
-					"match": ";"
+					"name": "punctuation.definition.collection.nymph",
+					"match": "#\\[|#\\{|#\\("
 				},
 				{
 					"name": "punctuation.accessor.nymph",
-					"match": "\\.|\\?\\."
+					"match": "\\?\\.|::|\\."
 				},
 				{
-					"name": "punctuation.definition.parameters.nymph",
-					"match": "\\(|\\)|\\[|\\]|\\{|\\}"
+					"name": "punctuation.separator.nymph",
+					"match": "[,:]"
 				},
 				{
-					"name": "punctuation.definition.interpolation.nymph",
-					"match": "\\$\\{|\\}"
+					"name": "keyword.operator.import-root.nymph",
+					"match": "@"
 				},
 				{
-					"name": "punctuation.definition.collection.nymph",
-					"match": "#\\[|#\\{|#\\("
+					"name": "punctuation.section.brackets.nymph",
+					"match": "[()\\[\\]{}]"
 				}
 			]
 		},
 		"type-expressions": {
 			"patterns": [
 				{
-					"match": "\\b(int|float|boolean|char|string|void|never|self)\\b",
-					"name": "support.type.builtin.nymph"
+					"match": "\\b(int|uint|float|boolean|char|string|void|never|self)\\b",
+					"name": "entity.name.type.builtin.nymph"
 				},
 				{
 					"begin": "\\b([A-Z][\\p{XID_Continue}]*)\\s*(<)",
@@ -240,39 +268,37 @@
 		"struct-fields": {
 			"patterns": [
 				{
-					"match": "\\b(public|internal|private)\\s+([\\p{XID_Start}][\\p{XID_Continue}]*)\\s*:",
+					"match": "\\b(public|internal|private)?\\s*(mut)?\\s*([\\p{XID_Start}][\\p{XID_Continue}]*)\\s*(?=:)",
 					"captures": {
 						"1": { "name": "storage.modifier.nymph" },
-						"2": { "name": "variable.other.property.nymph" }
+						"2": { "name": "storage.modifier.nymph" },
+						"3": { "name": "variable.other.property.nymph" }
 					}
-				},
-				{
-					"match": "\\b([\\p{XID_Start}][\\p{XID_Continue}]*)\\s*:",
-					"captures": { "1": { "name": "variable.other.property.nymph" } }
 				}
 			]
 		},
 		"member-access": {
-			"match": "\\.\\s*([\\p{XID_Start}][\\p{XID_Continue}]*)",
-			"captures": { "1": { "name": "variable.other.member.nymph" } }
+			"match": "(\\?\\.|\\.)\\s*([\\p{XID_Start}][\\p{XID_Continue}]*)",
+			"captures": {
+				"1": { "name": "punctuation.accessor.nymph" },
+				"2": { "name": "variable.other.member.nymph" }
+			}
 		},
 		"expression": {
 			"patterns": [
-				{ "include": "#literals" },
+				{ "include": "#comments" },
+				{ "include": "#strings" },
+				{ "include": "#characters" },
+				{ "include": "#numbers" },
+				{ "include": "#anonymous-parameters" },
 				{ "include": "#keywords" },
 				{ "include": "#operators" },
 				{ "include": "#type-expressions" },
 				{ "include": "#member-access" },
 				{ "include": "#collection-literals" },
 				{ "include": "#function-call" },
-				{ "include": "#index-access" }
-			]
-		},
-		"literals": {
-			"patterns": [
-				{ "include": "#strings" },
-				{ "include": "#numbers" },
-				{ "include": "#characters" }
+				{ "include": "#index-access" },
+				{ "include": "#punctuation" }
 			]
 		},
 		"collection-literals": {
@@ -283,13 +309,7 @@
 					"beginCaptures": { "0": { "name": "punctuation.definition.list.begin.nymph" } },
 					"end": "\\]",
 					"endCaptures": { "0": { "name": "punctuation.definition.list.end.nymph" } },
-					"patterns": [
-						{ "include": "#expression" },
-						{
-							"match": ",",
-							"name": "punctuation.separator.comma.nymph"
-						}
-					]
+					"patterns": [{ "include": "#expression" }]
 				},
 				{
 					"name": "meta.tuple.nymph",
@@ -297,45 +317,27 @@
 					"beginCaptures": { "0": { "name": "punctuation.definition.tuple.begin.nymph" } },
 					"end": "\\)",
 					"endCaptures": { "0": { "name": "punctuation.definition.tuple.end.nymph" } },
-					"patterns": [
-						{ "include": "#expression" },
-						{
-							"match": ",",
-							"name": "punctuation.separator.comma.nymph"
-						}
-					]
+					"patterns": [{ "include": "#expression" }]
 				},
 				{
 					"name": "meta.map.nymph",
-					"begin": "#{",
+					"begin": "#\\{",
 					"beginCaptures": { "0": { "name": "punctuation.definition.map.begin.nymph" } },
-					"end": "}",
+					"end": "\\}",
 					"endCaptures": { "0": { "name": "punctuation.definition.map.end.nymph" } },
-					"patterns": [
-						{ "include": "#expression" },
-						{
-							"match": ":",
-							"name": "punctuation.separator.key-value.nymph"
-						},
-						{
-							"match": ",",
-							"name": "punctuation.separator.comma.nymph"
-						}
-					]
+					"patterns": [{ "include": "#expression" }]
 				}
 			]
 		},
 		"function-call": {
 			"patterns": [
 				{
-					"name": "meta.function-call.nymph",
-					"begin": "([\\p{XID_Start}_][\\p{XID_Continue}]*)\\s*(?:<)",
+					"name": "meta.function-call.generic.nymph",
+					"begin": "([\\p{XID_Start}_][\\p{XID_Continue}]*)\\s*(?=<[^<>]*>\\s*\\()",
 					"beginCaptures": {
-						"1": { "name": "entity.name.function.nymph" },
-						"2": { "name": "punctuation.definition.generic.begin.nymph" }
+						"1": { "name": "entity.name.function.nymph" }
 					},
-					"end": ">\\s*\\(",
-					"endCaptures": { "0": { "name": "punctuation.definition.parameters.begin.nymph" } },
+					"end": "(?=\\()",
 					"patterns": [{ "include": "#type-expressions" }]
 				},
 				{
@@ -343,17 +345,11 @@
 					"begin": "([\\p{XID_Start}_][\\p{XID_Continue}]*)\\s*(\\()",
 					"beginCaptures": {
 						"1": { "name": "entity.name.function.nymph" },
-						"2": { "name": "punctuation.definition.parameters.begin.nymph" }
+						"2": { "name": "punctuation.section.parameters.begin.nymph" }
 					},
 					"end": "\\)",
-					"endCaptures": { "0": { "name": "punctuation.definition.parameters.end.nymph" } },
-					"patterns": [
-						{ "include": "#expression" },
-						{
-							"match": ",",
-							"name": "punctuation.separator.comma.nymph"
-						}
-					]
+					"endCaptures": { "0": { "name": "punctuation.section.parameters.end.nymph" } },
+					"patterns": [{ "include": "#expression" }]
 				}
 			]
 		},
@@ -361,11 +357,11 @@
 			"name": "meta.index-access.nymph",
 			"begin": "(\\?)?\\[",
 			"beginCaptures": {
-				"0": { "name": "punctuation.definition.index.begin.nymph" },
+				"0": { "name": "punctuation.section.brackets.begin.nymph" },
 				"1": { "name": "keyword.operator.optional-chaining.nymph" }
 			},
 			"end": "\\]",
-			"endCaptures": { "0": { "name": "punctuation.definition.index.end.nymph" } },
+			"endCaptures": { "0": { "name": "punctuation.section.brackets.end.nymph" } },
 			"patterns": [{ "include": "#expression" }]
 		}
 	}

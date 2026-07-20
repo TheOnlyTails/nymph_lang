@@ -14,6 +14,11 @@ nymph-sema = { workspace = true }
 nymph-codegen = { workspace = true }
 nymph-diagnostics = { workspace = true }
 nymph-ast = { workspace = true }
+nymph-hir = { workspace = true }
+ecow = { workspace = true }
+rustc-hash = { workspace = true }
+rolldown = "1.2.0"
+tokio = { version = "1", features = ["rt"] }
 
 
 [lints.clippy]

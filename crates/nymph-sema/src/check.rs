@@ -9,7 +9,7 @@
 
 use crate::errors::TypeError;
 use ecow::EcoString;
-use nymph_ast::{Span, decl::Declaration, decl::Module};
+use nymph_ast::{NodeId, Span, decl::Declaration, decl::Module};
 use nymph_diagnostics::Diagnostic;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -113,6 +113,78 @@ pub struct Checker<'m> {
 	/// `Void` and must be left alone — Finding 1: only the `Resolution` gets attached
 	/// there).
 	pub(crate) pending_operators: Vec<(nymph_ast::NodeId, Span, Ty, PendingOperatorKind)>,
+
+	/// Call-site bound obligations deferred until the instantiated variable has
+	/// had a chance to unify with a concrete argument (Slice 4G), mirroring
+	/// `pending_operators` exactly: `fn_type_of` pushes one entry per bound on
+	/// every minted var — declared generics (`FuncSig::bounds`) and `impl Trait`
+	/// synthetics (`synthetic_bounds`) alike — and `finalize_pending_bounds`
+	/// drains them at the end of the *same body* that recorded them (called
+	/// alongside `finalize_pending_operators` from every per-body driver), while
+	/// that body's own `param_bounds`/`synthetic_bounds` and the unify table are
+	/// still live. Must be drained per body, not once at module end, for the same
+	/// reason `pending_operators` is: a module-end pass would check every
+	/// obligation against only the last-checked body's `param_bounds`.
+	pub(crate) pending_bounds: Vec<PendingBound>,
+
+	/// MT2 OO4: per-`pending_bounds`-variable record of whether the ACTUAL
+	/// argument(s) bound to it (at a free-function call site) were `mut` —
+	/// `(saw_a_mut_arg, saw_a_plain_arg)`. `subtype`'s one-way `mut T <: T`
+	/// cancellation (`coerce.rs`) erases an argument's `mut`-ness the moment it
+	/// binds the call's freshly-minted generic-parameter variable, so a bound
+	/// obligation like `T: A` — where `A` is implemented only for `mut B`
+	/// (`impl A for mut B` / `impl mut A for B`) — would otherwise always see a
+	/// plain `B` by the time `finalize_pending_bounds` checks it, regardless of
+	/// what the caller actually passed. `check_call_arg` (`infer_expr.rs`) is
+	/// the one site that captures this, BEFORE the cancellation, keyed by the
+	/// exact (still-unresolved) `Ty` handle `fn_type_of` also used as the
+	/// obligation's own `ty` field — the same fresh variable, so the keys agree.
+	/// Drained per body alongside `pending_bounds` (same lifecycle, same
+	/// reasoning: a module-end pass would check every obligation against only
+	/// the last body's recordings).
+	pub(crate) pending_bound_arg_mut: FxHashMap<Ty, (bool, bool)>,
+
+	/// Stack of the parameter types of the anonymous (`$N`) closures currently
+	/// being FORMED, innermost last — pushed/popped only by
+	/// `Checker::form_anon_closure` (`anon_closure.rs`) around lowering the
+	/// committed boundary node's own kind. `ExprKind::AnonymousParam(idx)`
+	/// reads `idx` (default 0) out of the innermost frame directly, rather
+	/// than through the ordinary local-scope lookup every other identifier
+	/// uses — a `$N` is never a real binding, just a positional index into
+	/// whichever anonymous closure currently encloses it.
+	pub(crate) anon_ctx: Vec<Vec<Ty>>,
+	/// NodeIds of `$N` occurrences already claimed by an in-progress
+	/// `Checker::resolve_anon` scan (Slice: `$N` anonymous closure params).
+	/// Guards against a NESTED slot reached while trial- or really-evaluating
+	/// an already-committed boundary (e.g. `check_call_arg` on an argument
+	/// that turns out to just be a bare `$0`, itself already consumed by an
+	/// enclosing boundary one level up) rediscovering and re-binding the same
+	/// occurrence as an independent, spurious one-off boundary of its own.
+	/// Never cleared: a `NodeId` is assigned once, globally, by the parser,
+	/// so a given `$N` occurrence can only ever be discovered by exactly one
+	/// top-level `resolve_anon` scan.
+	pub(crate) anon_consumed: FxHashSet<NodeId>,
+}
+
+/// One deferred call-site bound obligation: the call/reference span, the
+/// (possibly still-unresolved) minted variable, the required interface, and
+/// its argument bindings (substituted through the same call-site map as the
+/// variable itself — empty for a synthetic `impl Trait` param, which carries
+/// no argument fidelity). See [`Checker::pending_bounds`].
+pub(crate) type PendingBound = (Span, Ty, DefId, Vec<(EcoString, Ty)>);
+
+/// Whether [`check_module_impl`] should additionally validate the module's
+/// entry point (`main`) — see [`check_module`] vs [`check_module_entry`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum EntryMode {
+	/// Plain library-mode checking: no `main` requirement. Every existing
+	/// caller of `check_module` gets this and is unaffected by entry-point
+	/// validation.
+	Library,
+	/// The module is the program's entry module: a top-level `func main`
+	/// taking no parameters, declaring no generics, and declaring no return
+	/// type other than `void` is required (see `entry::check_entry_main`).
+	Entry,
 }
 
 /// Check a whole (single) module and return every diagnostic produced.
@@ -120,20 +192,33 @@ pub struct Checker<'m> {
 /// This is the Milestone-A entry point. It runs the three conceptual passes in
 /// order: item resolution (`build_def_map`), signature lowering, then body
 /// inference. The signature/body split mirrors the incremental query boundary the
-/// full salsa driver will formalise later.
-pub fn check_module(module: &Module) -> Checked {
+/// full salsa driver will formalise later. Shared by [`check_module`] (library
+/// mode) and [`check_module_entry`] (entry mode) — see [`EntryMode`].
+pub(crate) fn check_module_impl(module: &Module, entry: EntryMode) -> Checked {
 	let mut diags = Vec::new();
 	let defs = build_def_map(module, &mut diags);
 	let mut checker = Checker::new(module, defs, diags);
 	checker.lower_signatures();
 	checker.collect_interfaces();
+	// Inherent methods (struct/enum body `func`s, top-level inherent `impl Type {
+	// .. }`) must be collected before interface impls (below) so `finish_interface_impl`
+	// (iface.rs) can cross-check an interface-impl method against the owning type's
+	// already-known inherent methods (Slice 4K, HH3) — closing the ICE where a
+	// same-named inherent method and interface-impl method type-checked clean and
+	// only panicked later in `lower_hir.rs`'s `assert_no_duplicate_methods`. Neither
+	// pass reads data the other produces otherwise, so this reordering is safe.
+	checker.collect_inherent();
 	checker.collect_impls();
 	checker.collect_inner_impls();
 	checker.check_coherence();
-	checker.collect_inherent();
 	checker.generalize_returns();
 	checker.check_bodies();
 	checker.check_member_bodies();
+	if entry == EntryMode::Entry {
+		// Runs after every body has been checked, so its diagnostics append
+		// after body-checking diagnostics rather than interleaving with them.
+		checker.check_entry_main();
+	}
 	// Every body-checking path (`check_func_body`, `check_let_body`,
 	// `check_method_body`, `check_interface_impl_members`) drains its own
 	// `pending_operators` entries before the next body's `param_bounds` are
@@ -145,11 +230,39 @@ pub fn check_module(module: &Module) -> Checked {
 		checker.pending_operators.is_empty(),
 		"pending_operators should be drained per-body, not left for module end"
 	);
+	debug_assert!(
+		checker.pending_bounds.is_empty(),
+		"pending_bounds should be drained per-body, not left for module end"
+	);
+	debug_assert!(
+		checker.pending_bound_arg_mut.is_empty(),
+		"pending_bound_arg_mut should be drained per-body, not left for module end"
+	);
 	Checked {
 		diags: checker.diags,
 		annotations: checker.annotations,
 		interner: checker.interner,
 	}
+}
+
+/// Check a whole (single) module and return every diagnostic produced.
+///
+/// Library mode: does not require a `main` entry point. Use
+/// [`check_module_entry`] for the program's entry module.
+pub fn check_module(module: &Module) -> Checked {
+	check_module_impl(module, EntryMode::Library)
+}
+
+/// Check a whole (single) module as the program's *entry module* and return
+/// every diagnostic produced.
+///
+/// Identical to [`check_module`], except it additionally requires a top-level
+/// `func main` taking no parameters, declaring no generics, and declaring no
+/// return type other than `void` — see `entry::check_entry_main` for the
+/// exact rules and [`crate::TypeError`]'s `Main*` variants for the
+/// diagnostics it can emit.
+pub fn check_module_entry(module: &Module) -> Checked {
+	check_module_impl(module, EntryMode::Entry)
 }
 
 /// Check several modules together as one program.
@@ -202,6 +315,10 @@ impl<'m> Checker<'m> {
 			checking_interface_default: None,
 			annotations: crate::annotate::Annotations::default(),
 			pending_operators: Vec::new(),
+			pending_bounds: Vec::new(),
+			pending_bound_arg_mut: FxHashMap::default(),
+			anon_ctx: Vec::new(),
+			anon_consumed: FxHashSet::default(),
 		}
 	}
 
@@ -291,6 +408,78 @@ impl<'m> Checker<'m> {
 		}
 	}
 
+	/// Peel a top-level `mut` wrapper, if present. `mk_mut` guarantees `Mut` never
+	/// nests, so a single peel is always enough. Used at the two mutability
+	/// "cancel points": a plain `let x = v` drops `v`'s `mut`, and dispatch/
+	/// type-inspection sites that don't care about mutability.
+	pub(crate) fn strip_mut(&mut self, ty: Ty) -> Ty {
+		let ty = self.shallow_resolve(ty);
+		match self.interner.kind(ty) {
+			TyKind::Mut(inner) => *inner,
+			_ => ty,
+		}
+	}
+
+	/// If `expected` is (shallow-resolved to) a concrete enum `Adt` whose variants
+	/// include `name`, return that enum's def and the variant's index — the
+	/// type-directed resolution a bare variant name (pattern or construction) should
+	/// try FIRST, before falling back to the global by-name `DefMap::resolve_variant`.
+	/// Returns `None` for an unbound inference var, a non-enum Adt, or a name that
+	/// isn't one of the enum's variants — in all of which cases the caller falls back
+	/// to today's global path unchanged.
+	pub(crate) fn expected_enum_variant(
+		&mut self,
+		expected: Ty,
+		name: &str,
+	) -> Option<(DefId, usize)> {
+		let ty = self.strip_mut(expected);
+		let TyKind::Adt(def, _) = self.interner.kind(ty).clone() else {
+			return None;
+		};
+		if !matches!(self.defs.data(def).kind, crate::def::DefKind::Enum { .. }) {
+			return None;
+		}
+		let idx = self
+			.sigs
+			.enums
+			.get(&def)?
+			.variants
+			.iter()
+			.position(|v| v.name == name)?;
+		Some((def, idx))
+	}
+
+	/// If `expected` is (shallow-resolved to) a concrete `List` type, return its
+	/// element type — the type-directed target a list literal's own elements should
+	/// check against, so a nested expression (e.g. a bare variant) sees the concrete
+	/// element type instead of a still-unbound fresh var that would only unify with
+	/// `expected` after the fact. Returns `None` for an unbound inference var or any
+	/// non-list type, in which case the caller falls back to a fresh element var
+	/// exactly as `infer_kind`'s own `ExprKind::List` arm does.
+	pub(crate) fn expected_list_element(&mut self, expected: Ty) -> Option<Ty> {
+		let ty = self.strip_mut(expected);
+		match self.interner.kind(ty) {
+			TyKind::List(elem) => Some(*elem),
+			_ => None,
+		}
+	}
+
+	/// If `expected` is (shallow-resolved to, through `mut`) a concrete `Map` type,
+	/// return its `(key, value)` types — the type-directed target a map literal's
+	/// own entries should check against. Mirrors [`Self::expected_list_element`]
+	/// exactly (see its doc comment); the `Map` counterpart is what lets
+	/// `check_dispatch`'s own `ExprKind::Map` arm propagate a concrete, possibly
+	/// `mut`, value type (e.g. `#{int: mut #[int]}`'s value) down into a nested
+	/// literal, instead of that nested literal only ever seeing an unconstrained
+	/// fresh var. Returns `None` for an unbound inference var or any non-map type.
+	pub(crate) fn expected_map_entry(&mut self, expected: Ty) -> Option<(Ty, Ty)> {
+		let ty = self.strip_mut(expected);
+		match self.interner.kind(ty) {
+			TyKind::Map(key, value) => Some((*key, *value)),
+			_ => None,
+		}
+	}
+
 	/// Fully resolve a type, replacing every bound variable throughout. Unbound
 	/// variables are left as canonical `Infer` handles.
 	pub(crate) fn resolve_deep(&mut self, ty: Ty) -> Ty {
@@ -333,6 +522,10 @@ impl<'m> Checker<'m> {
 				let parts = parts.iter().map(|&p| self.resolve_deep(p)).collect();
 				self.interner.mk_intersection(parts)
 			}
+			TyKind::Mut(inner) => {
+				let inner = self.resolve_deep(inner);
+				self.interner.mk_mut(inner)
+			}
 			_ => ty,
 		}
 	}
@@ -352,6 +545,7 @@ impl<'m> Checker<'m> {
 					|| args.named.iter().any(|(_, t)| self.has_infer(*t))
 			}
 			TyKind::Intersection(parts) => parts.iter().any(|&p| self.has_infer(p)),
+			TyKind::Mut(inner) => self.has_infer(*inner),
 			_ => false,
 		}
 	}
@@ -411,6 +605,10 @@ impl<'m> Checker<'m> {
 					.map(|&p| self.subst(p, params, self_ty))
 					.collect();
 				self.interner.mk_intersection(parts)
+			}
+			TyKind::Mut(inner) => {
+				let inner = self.subst(inner, params, self_ty);
+				self.interner.mk_mut(inner)
 			}
 			_ => ty,
 		}
@@ -472,6 +670,7 @@ impl<'m> Checker<'m> {
 					self.synthetic_params_in(p, out);
 				}
 			}
+			TyKind::Mut(inner) => self.synthetic_params_in(inner, out),
 			_ => {}
 		}
 	}
@@ -557,6 +756,7 @@ impl<'m> Checker<'m> {
 				let inner: Vec<_> = parts.iter().map(|&p| self.display_resolved(p)).collect();
 				inner.join(" + ")
 			}
+			TyKind::Mut(inner) => format!("mut {}", self.display_resolved(*inner)),
 		}
 	}
 }

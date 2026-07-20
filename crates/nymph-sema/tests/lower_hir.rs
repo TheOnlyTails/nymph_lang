@@ -1,4 +1,7 @@
-use nymph_hir::hir::{BinOp, HirExpr, HirModule, HirStmt, UnOp};
+use nymph_hir::hir::{
+	BinOp, HirArrayElem, HirExpr, HirLit, HirMapElem, HirModule, HirPat, HirStmt, ScalarCastKind,
+	UnOp,
+};
 use nymph_sema::check_module;
 use nymph_syntax::parse_module;
 
@@ -703,18 +706,24 @@ fn bounded_generic_less_than_still_panics_in_lowering() {
 }
 
 #[test]
-#[should_panic(expected = "does not yet dispatch operator to interface default method")]
-fn this_less_than_other_in_interface_default_body_panics_in_lowering() {
-	// W4: an interface default method whose *own* body uses `this < other`
-	// directly (rather than calling another method) checks `this` bound to a
-	// rigid synthetic `Param` (`check_interface_default_bodies`) — W1 now routes
-	// that `Param` receiver through `dispatch_operator`, recording
-	// `MethodSource::GenericBound` → `UserImplDefaultMethod`. `Vec2` never
-	// overrides `at_most`, so its default body (with this still-generic
-	// resolution) is materialized verbatim onto `Vec2`'s class and lowering it
-	// panics loudly instead of silently emitting a native `<` between two
-	// `Vec2` instances.
-	lower(
+fn this_less_than_other_in_interface_default_body_dispatches_to_this_method() {
+	// W4 (closed by the stdlib body materialization slice's
+	// `materializing_onto_class` mechanism): an interface default method
+	// whose *own* body uses `this < other` directly (rather than calling
+	// another method) checks `this` bound to a rigid synthetic `Param`
+	// (`check_interface_default_bodies`) — W1 routes that `Param` receiver
+	// through `dispatch_operator`, recording `MethodSource::GenericBound` →
+	// `UserImplDefaultMethod`, regardless of whether the interface is local
+	// or a prelude one. `Vec2` never overrides `at_most`, so its default
+	// body (with this still-generic resolution) is materialized onto
+	// `Vec2`'s class — and unlike before, lowering now recognizes it's
+	// materializing a default body ONTO A CONCRETE CLASS (not a still-
+	// generic function parameter, where the native-op-vs-method-call
+	// ambiguity `dispatch_kind_for_operator`'s doc comment describes is
+	// real): `Vec2` can only ever satisfy `<` via a method call, so `this <
+	// other` inside the materialized `at_most` lowers to an ordinary
+	// `this.less_than(other)` dispatch instead of panicking.
+	let hir = lower(
 		r#"
 		interface Comparable<Other> {
 			func less_than(other: Other): boolean
@@ -727,6 +736,22 @@ fn this_less_than_other_in_interface_default_body_panics_in_lowering() {
 		func f(v: Vec2): Vec2 = v
 		"#,
 	);
+	let class = hir.classes.iter().find(|c| c.name == "Vec2").expect("Vec2");
+	let at_most = class
+		.methods
+		.iter()
+		.find(|m| m.name == "at_most")
+		.expect("at_most materialized onto Vec2");
+	let HirExpr::Call { callee, args } = &at_most.body else {
+		panic!("expected Call, got {:?}", at_most.body);
+	};
+	let HirExpr::Field { recv, name } = callee.as_ref() else {
+		panic!("expected Field callee, got {callee:?}");
+	};
+	assert_eq!(name, "less_than");
+	assert!(matches!(recv.as_ref(), HirExpr::This));
+	assert_eq!(args.len(), 1);
+	assert!(matches!(&args[0], HirExpr::Local(n) if n == "other"));
 }
 
 #[test]
@@ -1409,6 +1434,55 @@ fn circular_top_level_let_dependency_panics_in_lowering() {
 	);
 }
 
+#[test]
+fn closure_param_shadowing_another_top_level_let_name_does_not_create_a_false_dependency() {
+	// `let a = (b: int) -> b + 1; let b = (a: int) -> a + 1;` — each closure's
+	// OWN parameter merely shares the OTHER top-level `let`'s name; neither
+	// closure body actually reads the other top-level `let`. The Y3 module-let
+	// dependency analysis (`collect_locals`/`reorder_lets_by_dependency`) must
+	// not conflate a closure's bound parameter with a genuine free-variable
+	// reference to a same-named top-level `let` — otherwise this legal,
+	// non-cyclic program spuriously looks circular and lowering panics.
+	let hir = lower(
+		r#"
+		let a = (b: int) -> b + 1
+		let b = (a: int) -> a + 1
+		func f(): int = a(1) + b(2)
+		"#,
+	);
+	let names: Vec<&str> = hir.lets.iter().map(|l| l.name.as_str()).collect();
+	assert_eq!(
+		names,
+		["a", "b"],
+		"neither closure body references the other top-level `let`; a closure's OWN param \
+		 (which merely shares the other let's name) must not be treated as a free-variable \
+		 dependency edge, so source order is preserved"
+	);
+}
+
+#[test]
+fn closure_param_shadowing_a_later_let_does_not_silently_reorder_it_first() {
+	// One-directional variant of the above: `let a = (b: int) -> b + 1; let b
+	// = (x: int) -> x + 1;` — `a`'s closure param happens to be named `b`, the
+	// OTHER top-level let's name, but the closure body never reads the real
+	// top-level `b`. Before the fix, `collect_locals` reported the closure's
+	// bound param as if it were a free reference to top-level `b`, so `b` got
+	// spuriously reordered ahead of `a` even though nothing requires it.
+	let hir = lower(
+		r#"
+		let a = (b: int) -> b + 1
+		let b = (x: int) -> x + 1
+		"#,
+	);
+	let names: Vec<&str> = hir.lets.iter().map(|l| l.name.as_str()).collect();
+	assert_eq!(
+		names,
+		["a", "b"],
+		"`a`'s closure param `b` shadows, but never references, the real top-level `let b`; \
+		 source order must be preserved rather than spuriously reordered"
+	);
+}
+
 // ── Slice 4E follow-up: `return` inside an UNBRACED if/while branch ─────────
 
 #[test]
@@ -1471,5 +1545,1354 @@ fn lowers_bare_return_as_an_unbraced_if_then_branch() {
 			}))],
 			tail: None,
 		}
+	);
+}
+
+// ── Slice 4H: string expressions ─────────────────────────────────────────────
+
+#[test]
+fn lowers_a_plain_string_literal() {
+	let hir = lower(r#"func f(): string = "hello""#);
+	assert_eq!(hir.funcs[0].body, HirExpr::Str("hello".into()));
+}
+
+#[test]
+fn lowers_string_escapes() {
+	let hir = lower(r#"func f(): string = "a\nb\"c\\d""#);
+	assert_eq!(hir.funcs[0].body, HirExpr::Str("a\nb\"c\\d".into()));
+}
+
+#[test]
+fn lowers_string_interpolation_to_left_assoc_concatenation() {
+	// Text runs cook into `Str` segments; the interpoland lowers normally and
+	// joins in with `+` — no leading `""` needed since the first part is text.
+	let hir = lower(r#"func f(name: string): string = "Hello, ${name}!""#);
+	assert_eq!(
+		hir.funcs[0].body,
+		HirExpr::Binary {
+			op: BinOp::Add,
+			lhs: Box::new(HirExpr::Binary {
+				op: BinOp::Add,
+				lhs: Box::new(HirExpr::Str("Hello, ".into())),
+				rhs: Box::new(HirExpr::Local("name".into())),
+			}),
+			rhs: Box::new(HirExpr::Str("!".into())),
+		}
+	);
+}
+
+#[test]
+fn lowers_leading_interpolation_with_an_empty_prefix_string() {
+	// The FIRST part is an interpolation with no leading text — a `Str("")` is
+	// prepended so the whole chain still coerces via JS string concatenation
+	// even though the interpoland (`n: int`) isn't itself a string.
+	let hir = lower(r#"func f(n: int): string = "${n}!""#);
+	assert_eq!(
+		hir.funcs[0].body,
+		HirExpr::Binary {
+			op: BinOp::Add,
+			lhs: Box::new(HirExpr::Binary {
+				op: BinOp::Add,
+				lhs: Box::new(HirExpr::Str("".into())),
+				rhs: Box::new(HirExpr::Local("n".into())),
+			}),
+			rhs: Box::new(HirExpr::Str("!".into())),
+		}
+	);
+}
+
+#[test]
+fn lowers_string_pattern_escapes_instead_of_panicking() {
+	use nymph_hir::hir::{HirLit, HirPat};
+
+	// String PATTERNS may also carry escapes (`StringPatternPart` has no
+	// interpolation variant) — cooking now extends here too, replacing the old
+	// escapes-always-panic arm.
+	let hir = lower(
+		r#"
+		func f(s: string): int = match (s) {
+			"a\nb" -> 1,
+			_ -> 0,
+		}
+		"#,
+	);
+	let HirExpr::Match { arms, .. } = &hir.funcs[0].body else {
+		panic!("expected Match");
+	};
+	assert!(matches!(&arms[0].pat, HirPat::Lit(HirLit::Str(s)) if s == "a\nb"));
+}
+
+// ── Slice 4H: range/for-loop expressions ────────────────────────────────────
+
+#[test]
+fn lowers_a_for_loop_over_an_exclusive_range_to_a_desugared_while() {
+	let hir = lower(
+		r#"
+		func f(): int = {
+			let mut total = 0
+			for (i in 1..3) {
+				total = total + i
+			}
+			total
+		}
+		"#,
+	);
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	let HirStmt::Expr(HirExpr::Block {
+		stmts: for_stmts, ..
+	}) = &stmts[1]
+	else {
+		panic!("expected desugared for-loop Block, got {:?}", stmts[1]);
+	};
+	assert_eq!(for_stmts.len(), 3, "$i let, $max let, while");
+
+	let HirStmt::Let {
+		name: i_name,
+		mutable,
+		value,
+	} = &for_stmts[0]
+	else {
+		panic!("expected induction-variable let, got {:?}", for_stmts[0]);
+	};
+	assert!(*mutable, "induction variable must be mutable");
+	assert_eq!(value, &HirExpr::Num(1.0));
+
+	let HirStmt::Let {
+		name: max_name,
+		mutable: max_mutable,
+		value: max_value,
+	} = &for_stmts[1]
+	else {
+		panic!("expected max-bound let, got {:?}", for_stmts[1]);
+	};
+	assert!(!max_mutable, "hoisted upper bound must not be mutable");
+	assert_eq!(max_value, &HirExpr::Num(3.0));
+
+	let HirStmt::Expr(HirExpr::While { cond, body }) = &for_stmts[2] else {
+		panic!("expected While, got {:?}", for_stmts[2]);
+	};
+	assert_eq!(
+		cond.as_ref(),
+		&HirExpr::Binary {
+			op: BinOp::Lt,
+			lhs: Box::new(HirExpr::Local(i_name.clone())),
+			rhs: Box::new(HirExpr::Local(max_name.clone())),
+		},
+		"exclusive range compares with `<`"
+	);
+	let HirExpr::Block {
+		stmts: body_stmts, ..
+	} = body.as_ref()
+	else {
+		panic!("expected while-body Block, got {body:?}");
+	};
+	assert_eq!(body_stmts.len(), 3, "pattern let, user body, increment");
+	assert!(matches!(
+		&body_stmts[0],
+		HirStmt::Let { name, mutable: false, value }
+			if value == &HirExpr::Local(i_name.clone()) && name != i_name
+	));
+	assert!(matches!(
+		&body_stmts[2],
+		HirStmt::Expr(HirExpr::Assign { target, value })
+			if target.as_ref() == &HirExpr::Local(i_name.clone())
+				&& value.as_ref() == &HirExpr::Binary {
+					op: BinOp::Add,
+					lhs: Box::new(HirExpr::Local(i_name.clone())),
+					rhs: Box::new(HirExpr::Num(1.0)),
+				}
+	));
+}
+
+#[test]
+fn lowers_a_for_loop_over_an_inclusive_range_with_le_comparison() {
+	let hir = lower(
+		r#"
+		func f(): int = {
+			for (i in 1..=3) {
+				i
+			}
+			0
+		}
+		"#,
+	);
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected Block");
+	};
+	let HirStmt::Expr(HirExpr::Block {
+		stmts: for_stmts, ..
+	}) = &stmts[0]
+	else {
+		panic!("expected desugared for-loop Block, got {:?}", stmts[0]);
+	};
+	let HirStmt::Expr(HirExpr::While { cond, .. }) = &for_stmts[2] else {
+		panic!("expected While");
+	};
+	assert!(
+		matches!(cond.as_ref(), HirExpr::Binary { op: BinOp::Le, .. }),
+		"inclusive range compares with `<=`, got {cond:?}"
+	);
+}
+
+#[test]
+fn lowers_a_for_loop_with_a_parenthesized_range_bound() {
+	// A parenthesized range bound is `ExprKind::Grouped` in the AST. The
+	// checker's `check()` recurses through `Grouped` without recording an
+	// annotation for the `Grouped` node's own id, so `lower_for`'s numeric-
+	// element guard must peel through it to the innermost expression before
+	// looking up the annotation — otherwise `annotations.get(min.id)` sees
+	// `None` and panics "got element type None" on a perfectly valid program.
+	// Exercise both a parenthesized literal bound and a parenthesized
+	// binary-expression bound.
+	let hir = lower(
+		r#"
+        func f(): int = {
+            let mut total = 0
+            for (i in (1)..5) {
+                total = total + i
+            }
+            total
+        }
+        "#,
+	);
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected Block");
+	};
+	let HirStmt::Expr(HirExpr::Block {
+		stmts: for_stmts, ..
+	}) = &stmts[1]
+	else {
+		panic!("expected desugared for-loop Block, got {:?}", stmts[1]);
+	};
+	assert!(
+		matches!(&for_stmts[2], HirStmt::Expr(HirExpr::While { .. })),
+		"expected While, got {:?}",
+		for_stmts[2]
+	);
+
+	let hir = lower(
+		r#"
+        func g(a: int, b: int, n: int): int = {
+            let mut total = 0
+            for (i in (a + b)..n) {
+                total = total + i
+            }
+            total
+        }
+        "#,
+	);
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected Block");
+	};
+	let HirStmt::Expr(HirExpr::Block {
+		stmts: for_stmts, ..
+	}) = &stmts[1]
+	else {
+		panic!("expected desugared for-loop Block, got {:?}", stmts[1]);
+	};
+	assert!(
+		matches!(&for_stmts[2], HirStmt::Expr(HirExpr::While { .. })),
+		"expected While, got {:?}",
+		for_stmts[2]
+	);
+}
+
+#[test]
+#[should_panic(expected = "for-loop sources")]
+fn range_in_value_position_panics_in_lowering() {
+	// A value-position range types as an unconstrained fresh variable (the
+	// checker's documented "opaque hole") and has no consumer anywhere in the
+	// language — a loud panic is mandatory rather than risking silent wrong JS.
+	lower(
+		r#"
+		func f(): int = {
+			let r = 1..=10
+			r
+		}
+		"#,
+	);
+}
+
+#[test]
+#[should_panic(expected = "start-less")]
+fn for_loop_over_a_startless_range_panics_in_lowering() {
+	lower(
+		r#"
+		func f(): int = {
+			for (i in ..10) {
+				i
+			}
+			0
+		}
+		"#,
+	);
+}
+
+#[test]
+#[should_panic(expected = "unbounded")]
+fn for_loop_over_an_unbounded_range_panics_in_lowering() {
+	lower(
+		r#"
+		func f(): int = {
+			for (i in 1..) {
+				i
+			}
+			0
+		}
+		"#,
+	);
+}
+
+#[test]
+#[should_panic(expected = "numeric (int/float)")]
+fn for_loop_over_a_char_range_panics_in_lowering() {
+	// `infer_range_element` unifies `min`/`max` against a fresh, otherwise-
+	// unconstrained type variable, so a `char` range type-checks with zero
+	// diagnostics. The induction-variable desugar (`$i + 1`, `$i < $max`) is
+	// only correct for a numeric element type; for `char` it would silently
+	// build an infinite loop (`$i + 1` is JS string concatenation, so `$i`
+	// never stops comparing less than `$max`). This must panic loudly instead.
+	lower(
+		r#"
+		func f(): int = {
+			let mut total = 0
+			for (c in 'a'..'c') {
+				total = total + 1
+			}
+			total
+		}
+		"#,
+	);
+}
+
+#[test]
+#[should_panic(expected = "numeric (int/float)")]
+fn for_loop_over_a_parenthesized_char_range_panics_in_lowering() {
+	// Peeling `ExprKind::Grouped` for the numeric-element annotation lookup
+	// must not weaken the char-range guard above: a parenthesized char bound
+	// (on either side) still has to panic loudly, not silently pass through
+	// as "no annotation found" turning into a false numeric accept.
+	lower(
+		r#"
+		func f(): int = {
+			let mut total = 0
+			for (c in ('a')..('c')) {
+				total = total + 1
+			}
+			total
+		}
+		"#,
+	);
+}
+
+#[test]
+#[should_panic(expected = "plain-binding")]
+fn for_loop_over_a_non_binding_pattern_panics_in_lowering() {
+	lower(
+		r#"
+		func f(): int = {
+			for (_ in 1..3) {
+				0
+			}
+			0
+		}
+		"#,
+	);
+}
+
+// ── Slice 4I, Task 2: `|>`, `in`/`!in`, `??` lowering ────────────────────────
+
+#[test]
+fn lowers_pipe_to_a_structural_call() {
+	// DD1: `x |> f` lowers to `Call { callee: <lowered f>, args: [<lowered x>] }` —
+	// no `Resolution` involved at all.
+	let hir = lower(
+		r#"
+		func double(x: int): int = x * 2
+		func f(a: int): int = a |> double
+		"#,
+	);
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::Call { callee, args } = &f.body else {
+		panic!("expected Call, got {:?}", f.body);
+	};
+	assert!(matches!(callee.as_ref(), HirExpr::Local(n) if n == "double"));
+	assert_eq!(args.len(), 1);
+	assert!(matches!(&args[0], HirExpr::Local(n) if n == "a"));
+}
+
+#[test]
+fn lowers_chained_pipe_left_associatively() {
+	// `10 |> double |> inc` parses left-associative (`(10 |> double) |> inc`), so
+	// the outer `Call`'s single argument is itself the inner pipe's `Call`.
+	let hir = lower(
+		r#"
+		func double(x: int): int = x * 2
+		func inc(x: int): int = x + 1
+		func f(): int = 10 |> double |> inc
+		"#,
+	);
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::Call { callee, args } = &f.body else {
+		panic!("expected outer Call, got {:?}", f.body);
+	};
+	assert!(matches!(callee.as_ref(), HirExpr::Local(n) if n == "inc"));
+	assert_eq!(args.len(), 1);
+	let HirExpr::Call {
+		callee: inner_callee,
+		args: inner_args,
+	} = &args[0]
+	else {
+		panic!("expected inner Call, got {:?}", args[0]);
+	};
+	assert!(matches!(inner_callee.as_ref(), HirExpr::Local(n) if n == "double"));
+	assert_eq!(inner_args.len(), 1);
+	assert_eq!(inner_args[0], HirExpr::Num(10.0));
+}
+
+#[test]
+fn lowers_in_operator_with_swapped_receiver() {
+	// DD2: `a in c` ≡ `c.contains(a)` — the RHS is the receiver, the LHS is the
+	// sole argument (operand order swapped relative to every other operator).
+	let hir = lower(
+		r#"
+		interface Contains<Item> { func contains(item: Item): boolean }
+		struct Bag(n: int)
+		impl Contains<Item = int> for Bag {
+			func contains(item: int): boolean = true
+		}
+		func f(b: Bag, x: int): boolean = x in b
+		"#,
+	);
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::Call { callee, args } = &f.body else {
+		panic!("expected Call, got {:?}", f.body);
+	};
+	let HirExpr::Field { recv, name } = callee.as_ref() else {
+		panic!("expected Field callee, got {callee:?}");
+	};
+	assert_eq!(name, "contains");
+	assert!(matches!(recv.as_ref(), HirExpr::Local(n) if n == "b"));
+	assert_eq!(args.len(), 1);
+	assert!(matches!(&args[0], HirExpr::Local(n) if n == "x"));
+}
+
+#[test]
+fn lowers_not_in_operator_to_not_contains() {
+	let hir = lower(
+		r#"
+		interface Contains<Item> {
+			func contains(item: Item): boolean
+			func not_contains(item: Item): boolean
+		}
+		struct Bag(n: int)
+		impl Contains<Item = int> for Bag {
+			func contains(item: int): boolean = true
+			func not_contains(item: int): boolean = false
+		}
+		func f(b: Bag, x: int): boolean = x !in b
+		"#,
+	);
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::Call { callee, args } = &f.body else {
+		panic!("expected Call, got {:?}", f.body);
+	};
+	let HirExpr::Field { recv, name } = callee.as_ref() else {
+		panic!("expected Field callee, got {callee:?}");
+	};
+	assert_eq!(name, "not_contains");
+	assert!(matches!(recv.as_ref(), HirExpr::Local(n) if n == "b"));
+	assert_eq!(args.len(), 1);
+	assert!(matches!(&args[0], HirExpr::Local(n) if n == "x"));
+}
+
+#[test]
+fn lowers_user_unwrap_impl_to_an_eager_method_call() {
+	// DD3 (corrected): Nymph has no optional runtime representation, so every
+	// `??` resolution is `UserImpl` — an eager `recv.unwrap(fallback)` call, never
+	// a native JS `??` and never short-circuiting.
+	let hir = lower(
+		r#"
+		interface Unwrap<Output> { func unwrap(default: Output): Output }
+		struct MaybeInt(present: boolean, value: int)
+		impl Unwrap<Output = int> for MaybeInt {
+			func unwrap(default: int): int = default
+		}
+		func f(m: MaybeInt, d: int): int = m ?? d
+		"#,
+	);
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::Call { callee, args } = &f.body else {
+		panic!("expected Call, got {:?}", f.body);
+	};
+	let HirExpr::Field { recv, name } = callee.as_ref() else {
+		panic!("expected Field callee, got {callee:?}");
+	};
+	assert_eq!(name, "unwrap");
+	assert!(matches!(recv.as_ref(), HirExpr::Local(n) if n == "m"));
+	assert_eq!(args.len(), 1);
+	assert!(matches!(&args[0], HirExpr::Local(n) if n == "d"));
+}
+
+#[test]
+#[should_panic(expected = "interface default method")]
+fn unwrap_bounded_generic_default_still_panics_in_lowering() {
+	// `GenericBound` → `UserImplDefaultMethod`: codegen cannot yet materialize an
+	// interface default method generically, so this stays a loud lowering panic
+	// (mirrors every other operator's `UserImplDefaultMethod` treatment).
+	lower(
+		"interface Unwrap<Output> { func unwrap(default: Output): Output }
+		 func f<T: Unwrap<Output = int>>(a: T, b: int): int = a ?? b",
+	);
+}
+
+// ── Slice 4J: `namespace func` statics, `mut func` methods ─────────────────
+
+#[test]
+fn lowers_a_struct_namespaced_function_into_statics() {
+	let hir = lower(
+		"struct Point(x: int) {
+		   namespace func at(v: int): Point = Point(x = v)
+		 }
+		 func origin(): Point = Point.at(0)",
+	);
+	assert_eq!(hir.classes.len(), 1);
+	let class = &hir.classes[0];
+	assert_eq!(class.name, "Point");
+	// The namespaced function lands in `statics`, not `methods`.
+	assert!(class.methods.is_empty(), "no instance methods: {class:?}");
+	assert_eq!(class.statics.len(), 1);
+	assert_eq!(class.statics[0].name, "at");
+	// The call site `Point.at(0)` needed zero lowering changes: it already
+	// falls to the generic `Call` arm, resolving to `Field { recv: Local
+	// ("Point"), name: "at" }`.
+	let origin = hir.funcs.iter().find(|f| f.name == "origin").unwrap();
+	let HirExpr::Call { callee, args } = &origin.body else {
+		panic!("expected Call, got {:?}", origin.body);
+	};
+	let HirExpr::Field { recv, name } = callee.as_ref() else {
+		panic!("expected Field callee, got {callee:?}");
+	};
+	assert_eq!(name, "at");
+	assert!(matches!(recv.as_ref(), HirExpr::Local(n) if n == "Point"));
+	assert_eq!(args.len(), 1);
+}
+
+#[test]
+fn lowers_an_enum_namespaced_function_into_statics() {
+	let hir = lower(
+		"enum Opt<T> {
+		   Some(value: T),
+		   None
+
+		   namespace func empty(): self = None
+		 }
+		 func none_int(): Opt<int> = Opt.empty()",
+	);
+	let e = hir.enums.iter().find(|e| e.name == "Opt").expect("Opt");
+	assert!(e.methods.is_empty(), "no instance methods: {e:?}");
+	assert_eq!(e.statics.len(), 1);
+	assert_eq!(e.statics[0].name, "empty");
+}
+
+#[test]
+#[should_panic(expected = "collides with a variant")]
+fn enum_namespaced_function_colliding_with_a_variant_name_panics() {
+	// A namespaced fn sharing a variant's name would put two entries under the
+	// same key on the enum's returned object (Slice 4J hazard) — loud, not a
+	// silent last-wins.
+	lower(
+		"enum Color {
+		   Red
+
+		   namespace func Red(): Color = Color.Red
+		 }",
+	);
+}
+
+#[test]
+fn lowers_impl_mut_methods_as_ordinary_instance_methods() {
+	// The checker enforces nothing extra for a `mut func` — a plain method
+	// mutating `this` fields checks identically — so lowering treats a
+	// `mut func` exactly like an ordinary instance method.
+	let hir = lower(
+		"struct Counter(n: int) {
+		   mut func bump(): void = { this.n = this.n + 1 }
+		 }",
+	);
+	assert_eq!(hir.classes.len(), 1);
+	let class = &hir.classes[0];
+	assert_eq!(class.methods.len(), 1);
+	assert_eq!(class.methods[0].name, "bump");
+	assert!(class.statics.is_empty());
+}
+
+#[test]
+#[should_panic(
+	expected = "does not yet support a namespaced call through a generic type parameter"
+)]
+fn namespaced_call_through_a_generic_parameter_panics_in_lowering() {
+	// Pre-existing silent-wrong-JS hole (Slice 4J, Task 1 Finding 3): `T` is a
+	// type parameter, not a struct/enum — it has no JS binding at all, so
+	// `T.default()` cannot lower to anything but a loud panic.
+	lower(
+		"interface Default { func default(): self }
+		 func make<T: Default>(): T = T.default()",
+	);
+}
+
+#[test]
+#[should_panic(
+	expected = "does not yet support a namespaced call through a generic type parameter"
+)]
+fn namespaced_call_through_a_struct_owned_generic_panics_in_lowering() {
+	// Confirmed defect (code review, Slice 4J): `push_generics` used to track
+	// only the CURRENT func/method's OWN generics, never the OWNING struct/
+	// enum's — so a namespaced call through a struct-owned generic type
+	// parameter used inside one of that struct's own methods/statics
+	// type-checked with zero diagnostics (the checker resolves it against
+	// EVERY active param scope, including the one `collect_adt_inherent`
+	// pushes for the struct's own generics) yet was invisible to
+	// `is_current_generic`, silently falling through to ordinary lowering and
+	// emitting a bare, unbound `T.default()` in the output JS. `T` has no JS
+	// binding at all, so this must panic loudly instead.
+	lower(
+		"interface Default { func default(): self }
+		 struct Box<T: Default> {
+		   namespace func make(): T = T.default()
+		 }",
+	);
+}
+
+#[test]
+#[should_panic(
+	expected = "does not yet support a namespaced call through a generic type parameter"
+)]
+fn namespaced_call_through_an_enum_owned_generic_panics_in_lowering() {
+	// Same defect, enum-owned generic reached from an ordinary inherent method
+	// (not just a `namespace` static) — `push_generics` must also see the
+	// enum's own generics while lowering its inherent method bodies.
+	lower(
+		"interface Default { func default(): self }
+		 enum Box<T: Default> {
+		   Empty
+
+		   func make(): T = T.default()
+		 }",
+	);
+}
+
+// ── Slice 4K: `is`/`!is` desugar, `as` scalar/`Into` dispatch ──────────────
+
+#[test]
+fn lowers_is_to_a_two_arm_boolean_match() {
+	// HH1: a one-arm pattern match plus a trailing `Wildcard` fallback — never a
+	// third case, so runtime fallthrough is structurally impossible.
+	let hir = lower("func f(x: int): boolean = x is 5");
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::Match { scrutinee, arms } = &f.body else {
+		panic!("expected Match, got {:?}", f.body);
+	};
+	assert!(matches!(scrutinee.as_ref(), HirExpr::Local(n) if n == "x"));
+	assert_eq!(arms.len(), 2);
+	assert_eq!(arms[0].pat, HirPat::Lit(HirLit::Num(5.0)));
+	assert!(arms[0].guard.is_none());
+	assert_eq!(arms[0].body, HirExpr::Bool(true));
+	assert_eq!(arms[1].pat, HirPat::Wildcard);
+	assert_eq!(arms[1].body, HirExpr::Bool(false));
+}
+
+#[test]
+fn lowers_not_is_with_swapped_arm_bodies() {
+	// `!is` is the same match shape with `true`/`false` swapped, not a double
+	// negation wrapping an `is` match.
+	let hir = lower("func f(x: int): boolean = x !is 5");
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::Match { arms, .. } = &f.body else {
+		panic!("expected Match, got {:?}", f.body);
+	};
+	assert_eq!(arms[0].body, HirExpr::Bool(false));
+	assert_eq!(arms[1].body, HirExpr::Bool(true));
+}
+
+#[test]
+fn is_pattern_bindings_do_not_leak_into_the_match_arm_body() {
+	// The pattern's binding (`n`) is bound only inside the pattern itself, never
+	// threaded into the arm body — the body is always a bare `Bool` literal,
+	// structurally incapable of referencing it.
+	let hir = lower(
+		"struct Point(x: int, y: int)
+		 func f(p: Point): boolean = p is Point(x = n, y = _)",
+	);
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::Match { arms, .. } = &f.body else {
+		panic!("expected Match, got {:?}", f.body);
+	};
+	assert_eq!(arms[0].body, HirExpr::Bool(true));
+	let HirPat::Struct { fields } = &arms[0].pat else {
+		panic!("expected Struct pattern, got {:?}", arms[0].pat);
+	};
+	assert!(
+		fields
+			.iter()
+			.any(|(name, pat)| name == "x" && matches!(pat, HirPat::Binding { name, .. } if name == "n"))
+	);
+}
+
+#[test]
+fn identity_cast_lowers_to_the_bare_operand() {
+	// `P as P` needs no runtime conversion at all — no `ScalarCast`, no `Into`
+	// call, just the lowered operand unchanged.
+	let hir = lower(
+		"struct P(x: int)
+		 func f(p: P): P = p as P",
+	);
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	assert!(matches!(&f.body, HirExpr::Local(n) if n == "p"));
+}
+
+#[test]
+fn int_to_float_cast_lowers_to_the_bare_operand() {
+	// `int`/`uint`/`float` share one JS `number` representation, so a cast that
+	// only ever widens or reinterprets among them (never crossing into `uint`,
+	// which now saturates via `Math.abs`) is a no-op too, not just same-type
+	// identity.
+	let hir = lower("func f(n: int): float = n as float");
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	assert!(matches!(&f.body, HirExpr::Local(n) if n == "n"));
+}
+
+#[test]
+fn float_to_int_cast_lowers_to_a_saturating_to_int_scalar_cast() {
+	let hir = lower("func f(x: float): int = x as int");
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::ScalarCast { kind, operand } = &f.body else {
+		panic!("expected ScalarCast, got {:?}", f.body);
+	};
+	assert_eq!(*kind, ScalarCastKind::SaturatingToInt);
+	assert!(matches!(operand.as_ref(), HirExpr::Local(n) if n == "x"));
+}
+
+#[test]
+fn float_to_uint_cast_lowers_to_a_saturating_to_uint_scalar_cast() {
+	let hir = lower("func f(x: float): uint = x as uint");
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::ScalarCast { kind, operand } = &f.body else {
+		panic!("expected ScalarCast, got {:?}", f.body);
+	};
+	assert_eq!(*kind, ScalarCastKind::SaturatingToUInt);
+	assert!(matches!(operand.as_ref(), HirExpr::Local(n) if n == "x"));
+}
+
+#[test]
+fn int_to_uint_cast_lowers_to_a_saturating_to_uint_scalar_cast() {
+	// `int as uint` used to be a bare-operand no-op (Slice 4K, HH2); the
+	// abs-first saturating rule makes it a real runtime operation now.
+	let hir = lower("func f(n: int): uint = n as uint");
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::ScalarCast { kind, operand } = &f.body else {
+		panic!("expected ScalarCast, got {:?}", f.body);
+	};
+	assert_eq!(*kind, ScalarCastKind::SaturatingToUInt);
+	assert!(matches!(operand.as_ref(), HirExpr::Local(n) if n == "n"));
+}
+
+#[test]
+fn char_to_int_cast_lowers_to_a_code_point_of_scalar_cast() {
+	let hir = lower("func f(c: char): int = c as int");
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::ScalarCast { kind, .. } = &f.body else {
+		panic!("expected ScalarCast, got {:?}", f.body);
+	};
+	assert_eq!(*kind, ScalarCastKind::CharToNum);
+}
+
+#[test]
+fn int_to_char_cast_lowers_to_a_char_from_num_scalar_cast() {
+	let hir = lower("func f(n: int): char = n as char");
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::ScalarCast { kind, .. } = &f.body else {
+		panic!("expected ScalarCast, got {:?}", f.body);
+	};
+	assert_eq!(*kind, ScalarCastKind::NumToChar);
+}
+
+#[test]
+fn float_to_char_cast_lowers_to_a_float_to_char_scalar_cast() {
+	let hir = lower("func f(x: float): char = x as char");
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::ScalarCast { kind, .. } = &f.body else {
+		panic!("expected ScalarCast, got {:?}", f.body);
+	};
+	assert_eq!(*kind, ScalarCastKind::FloatToChar);
+}
+
+#[test]
+fn cast_via_user_into_impl_lowers_to_an_into_method_call() {
+	let hir = lower(
+		"interface Into<Other> { func into(): Other }
+		 struct P(x: int)
+		 impl Into<string> for P { func into(): string = \"p\" }
+		 func f(p: P): string = p as string",
+	);
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::Call { callee, args } = &f.body else {
+		panic!("expected Call, got {:?}", f.body);
+	};
+	let HirExpr::Field { recv, name } = callee.as_ref() else {
+		panic!("expected Field callee, got {callee:?}");
+	};
+	assert_eq!(name, "into");
+	assert!(matches!(recv.as_ref(), HirExpr::Local(n) if n == "p"));
+	assert!(args.is_empty());
+}
+
+#[test]
+fn cast_via_into_impl_with_a_custom_method_name_lowers_to_a_call_to_that_name() {
+	// Defect 1: `check_cast` used to hardcode the dispatched method name to
+	// `"into"` regardless of what the resolved `Into`-named interface actually
+	// declares. A local `interface Into<Other> { func convert(): Other }` must
+	// lower `p as string` to a call to `convert`, never to a nonexistent `into`.
+	let hir = lower(
+		"interface Into<Other> { func convert(): Other }
+		 struct P(x: int)
+		 impl Into<string> for P { func convert(): string = \"p\" }
+		 func f(p: P): string = p as string",
+	);
+	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
+	let HirExpr::Call { callee, args } = &f.body else {
+		panic!("expected Call, got {:?}", f.body);
+	};
+	let HirExpr::Field { recv, name } = callee.as_ref() else {
+		panic!("expected Field callee, got {callee:?}");
+	};
+	assert_eq!(name, "convert");
+	assert!(matches!(recv.as_ref(), HirExpr::Local(n) if n == "p"));
+	assert!(args.is_empty());
+}
+
+// ── Closures (Slice 4L) ──────────────────────────────────────────────────────
+
+#[test]
+fn lowers_a_paren_closure_expression() {
+	let hir = lower(
+		r#"
+		func f(): int = {
+			let g = (x: int) -> x + 1
+			g(5)
+		}
+		"#,
+	);
+	let HirExpr::Block { stmts, tail } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	let HirStmt::Let { name, value, .. } = &stmts[0] else {
+		panic!("expected a Let statement, got {:?}", stmts[0]);
+	};
+	assert_eq!(name, "g");
+	assert_eq!(
+		value,
+		&HirExpr::Closure {
+			params: vec!["x".into()],
+			body: Box::new(HirExpr::Binary {
+				op: BinOp::Add,
+				lhs: Box::new(HirExpr::Local("x".into())),
+				rhs: Box::new(HirExpr::Num(1.0)),
+			}),
+		}
+	);
+	assert_eq!(
+		tail.as_deref(),
+		Some(&HirExpr::Call {
+			callee: Box::new(HirExpr::Local("g".into())),
+			args: vec![HirExpr::Num(5.0)],
+		})
+	);
+}
+
+#[test]
+fn lowers_a_single_ident_closure_as_a_pipe_rhs() {
+	// `10 |> x -> x * 2` — DD1 lowers `|>` structurally to a `Call` whose callee
+	// is the (lowered) RHS, so the single-ident closure form becomes the
+	// callee here.
+	let hir = lower("func f(): int = 10 |> x -> x * 2");
+	assert_eq!(
+		hir.funcs[0].body,
+		HirExpr::Call {
+			callee: Box::new(HirExpr::Closure {
+				params: vec!["x".into()],
+				body: Box::new(HirExpr::Binary {
+					op: BinOp::Mul,
+					lhs: Box::new(HirExpr::Local("x".into())),
+					rhs: Box::new(HirExpr::Num(2.0)),
+				}),
+			}),
+			args: vec![HirExpr::Num(10.0)],
+		}
+	);
+}
+
+#[test]
+fn lowers_a_multi_param_closure_with_a_block_body_sharing_one_scope() {
+	// Mirrors `lower_func`/`lower_func_body`: the params and the block body's
+	// own `let`s share ONE JS scope (no separate nested scope for the body),
+	// exactly like a function's own body.
+	let hir = lower(
+		r#"
+		func f(): int = {
+			let g = (a: int, b: int) -> { let s = a + b  s * 2 }
+			g(2, 3)
+		}
+		"#,
+	);
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	let HirStmt::Let { value, .. } = &stmts[0] else {
+		panic!("expected a Let statement, got {:?}", stmts[0]);
+	};
+	let HirExpr::Closure { params, body } = value else {
+		panic!("expected a Closure, got {value:?}");
+	};
+	assert_eq!(params, &vec!["a".to_string(), "b".to_string()]);
+	let HirExpr::Block {
+		stmts: body_stmts,
+		tail: body_tail,
+	} = body.as_ref()
+	else {
+		panic!("expected a Block closure body, got {body:?}");
+	};
+	let HirStmt::Let { name, value, .. } = &body_stmts[0] else {
+		panic!("expected a Let statement, got {:?}", body_stmts[0]);
+	};
+	assert_eq!(name, "s");
+	assert_eq!(
+		value,
+		&HirExpr::Binary {
+			op: BinOp::Add,
+			lhs: Box::new(HirExpr::Local("a".into())),
+			rhs: Box::new(HirExpr::Local("b".into())),
+		}
+	);
+	assert_eq!(
+		body_tail.as_deref(),
+		Some(&HirExpr::Binary {
+			op: BinOp::Mul,
+			lhs: Box::new(HirExpr::Local("s".into())),
+			rhs: Box::new(HirExpr::Num(2.0)),
+		})
+	);
+}
+
+#[test]
+fn closure_captures_a_shadow_renamed_outer_binding() {
+	// JJ3: `let x = 1; let x = x + 1` renames the second binding to `x$1` (Y2).
+	// A closure defined AFTER that redeclaration, reading the free variable
+	// `x`, must resolve through the scope stack to the renamed `x$1` — exactly
+	// the name a captured mutation would need to target under Node.
+	let hir = lower(
+		r#"
+		func f(): int = {
+			let x = 1
+			let x = x + 1
+			let g = () -> x
+			g()
+		}
+		"#,
+	);
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	let HirStmt::Let { name, value, .. } = &stmts[2] else {
+		panic!("expected a Let statement, got {:?}", stmts[2]);
+	};
+	assert_eq!(name, "g");
+	assert_eq!(
+		value,
+		&HirExpr::Closure {
+			params: vec![],
+			body: Box::new(HirExpr::Local("x$1".into())),
+		},
+		"the closure body must capture the RENAMED outer binding"
+	);
+}
+
+#[test]
+#[should_panic(expected = "return` inside a closure body is not supported")]
+fn return_inside_closure_block_body_panics_in_lowering() {
+	// P13's unsound-acceptance shape: the closure infers `(boolean) -> boolean`
+	// (its tail is `true`) yet its body does `if (b) { return 1 }` — the
+	// checker types that `return`'s value against the ENCLOSING function's
+	// `int` return type, not the closure's own inferred `boolean` signature
+	// (neither `infer_closure` nor `check_closure` ever touch `self.ret_ty`).
+	// An arrow-emitted `return 1` would silently make `g` return an `int`
+	// where the call site expects a `boolean` — lowering panics loudly instead
+	// (Slice 4L, JJ2) rather than ever emit that unsound arrow.
+	lower(
+		r#"
+		func f(): int = {
+			let g = (b: boolean) -> { if (b) { return 1 }  true }
+			g(true)
+			1
+		}
+		"#,
+	);
+}
+
+#[test]
+#[should_panic(expected = "return` inside a closure body is not supported")]
+fn return_inside_a_nested_subexpression_match_within_a_closure_body_panics_in_lowering() {
+	// The `closure_depth` guard must catch a `return` ANYWHERE lexically
+	// inside the closure body, not just ones directly at the body's own
+	// statement level — including one nested inside a subexpression-position
+	// construct (here, a `match` used as a `let` initializer) within the
+	// closure.
+	lower(
+		r#"
+		func f(): int = {
+			let g = (n: int) -> {
+				let y = match (n) {
+					0 -> { return 1 },
+					_ -> n,
+				}
+				y
+			}
+			g(2)
+		}
+		"#,
+	);
+}
+
+#[test]
+#[should_panic(expected = "only supported in statement position")]
+fn return_inside_an_unbraced_closure_body_panics_in_lowering() {
+	// P22: `(x) -> return x` typechecks (the checker permits a closure whose
+	// entire body is a bare `return`, inferring the closure's own return type
+	// as `never`). The body here is never a `Block`, so `lower_func_body`
+	// routes it straight to `lower_expr`, which panics unconditionally on a
+	// subexpression-position `Return` (Slice 4E, Y1) — belt-and-braces
+	// alongside the `closure_depth` guard above.
+	lower(
+		r#"
+		func f(): int = {
+			let g = (x: int) -> return x
+			g(5)
+		}
+		"#,
+	);
+}
+
+#[test]
+fn legal_return_in_a_statement_position_match_is_unaffected_by_a_sibling_closure() {
+	// Regression guard: an unrelated closure elsewhere in the same function
+	// body (with no `return` of its own) must not leak `closure_depth` state —
+	// a genuinely legal `return` inside a STATEMENT-position match, later in
+	// the same function, must still lower fine.
+	let hir = lower(
+		r#"
+		func f(n: int): int = {
+			let g = (x: int) -> x + 1
+			match (n) {
+				0 -> { return g(1) },
+				_ -> { },
+			}
+			n
+		}
+		"#,
+	);
+	let HirExpr::Block { stmts, tail } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	let HirStmt::Let { name, .. } = &stmts[0] else {
+		panic!("expected a Let statement, got {:?}", stmts[0]);
+	};
+	assert_eq!(name, "g");
+	assert!(
+		matches!(&stmts[1], HirStmt::Expr(HirExpr::Match { .. })),
+		"expected a statement-position Match, got {:?}",
+		stmts[1]
+	);
+	assert_eq!(tail.as_deref(), Some(&HirExpr::Local("n".into())));
+}
+
+#[test]
+fn for_loop_over_a_spread_param_does_not_panic_in_lowering() {
+	// A bare, unbounded generic `Param` for-loop source (the checker's
+	// pre-existing permissive fallback in `resolve_iterable_source`, kept for
+	// exactly this shape: a `...from: Item` spread parameter, e.g.
+	// `collections/set.nym`'s `Set::new`) must not crash the compiler at
+	// lowering time just because the checker let it through. `lower_for`
+	// treats a bare-`Param`-typed source the same as a native list source
+	// (the list fast path, not the `Iterator`/`Iterable` protocol desugar,
+	// which has no `IterMode` recorded for this carve-out and would panic).
+	let hir = lower(
+		r#"
+		func make<Item>(...from: Item): int = {
+			let mut total = 0
+			for (item in from) {
+				total = total + 1
+			}
+			total
+		}
+		"#,
+	);
+	assert_eq!(hir.funcs[0].name, "make");
+}
+
+#[test]
+#[should_panic(expected = "does not support a spread closure parameter")]
+fn spread_closure_param_panics_in_lowering() {
+	// The checker never reads `ClosureParam::spread` (silently ignores it) —
+	// lowering panics loudly on a spread closure parameter rather than
+	// silently dropping the flag and emitting a plain (non-variadic) param.
+	lower(
+		r#"
+		func f(): int = {
+			let g = (...xs: int) -> xs
+			g(5)
+		}
+		"#,
+	);
+}
+
+// ── SS1: smart literal spread lowering ──────────────────────────────────────
+
+#[test]
+fn lowers_a_list_spread_over_a_native_list_source_to_a_native_splice() {
+	// A native `#[T]` list source is already a JS array — no drain, just an
+	// ordinary `HirArrayElem::Spread` wrapping the lowered source directly.
+	let hir = lower(
+		r#"
+		func f(): #[int] = {
+			let xs = #[1, 2, 3]
+			#[...xs, 4]
+		}
+		"#,
+	);
+	let HirExpr::Block { tail, .. } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	assert_eq!(
+		tail.as_deref(),
+		Some(&HirExpr::ArraySpread(vec![
+			HirArrayElem::Spread(HirExpr::Local("xs".into())),
+			HirArrayElem::Item(HirExpr::Num(4.0)),
+		]))
+	);
+}
+
+#[test]
+fn lowers_a_list_spread_over_a_user_iterator_source_to_a_drain() {
+	// A non-array `Iterator` source drains through the shared `$acc`/`$it`/`$go`
+	// protocol machinery (Track A's own drain, extracted and reused) rather
+	// than a native splice.
+	let hir = lower(
+		r#"
+		enum Option<T> { Some(value: T), None }
+		interface Iterator<Item> { mut func next(): Option<Item> }
+		struct Counter(n: int, max: int)
+		impl Iterator<int> for Counter {
+			mut func next(): Option<int> = if (this.n > this.max) {
+				None
+			} else {
+				let v = this.n
+				this.n = this.n + 1
+				Some(value = v)
+			}
+		}
+		func f(): #[int] = {
+			let mut c = Counter(n = 1, max = 3)
+			#[...c, 99]
+		}
+		"#,
+	);
+	let f = hir
+		.funcs
+		.iter()
+		.find(|f| f.name == "f")
+		.expect("f in module");
+	let HirExpr::Block { tail, .. } = &f.body else {
+		panic!("expected Block, got {:?}", f.body);
+	};
+	let tail = tail.as_deref().expect("a tail expression");
+	let HirExpr::ArraySpread(elems) = tail else {
+		panic!("expected ArraySpread, got {tail:?}");
+	};
+	assert_eq!(elems.len(), 2);
+	assert_eq!(elems[1], HirArrayElem::Item(HirExpr::Num(99.0)));
+	let HirArrayElem::Spread(HirExpr::Block {
+		stmts,
+		tail: acc_tail,
+	}) = &elems[0]
+	else {
+		panic!(
+			"expected a drain Block for the non-native source, got {:?}",
+			elems[0]
+		);
+	};
+	// let $acc = []; let $it = ...; let mut $go = true; while (...) { .. }
+	assert_eq!(stmts.len(), 4);
+	assert!(matches!(
+		&stmts[0],
+		HirStmt::Let { name, value: HirExpr::Array(items), .. } if name == "$acc" && items.is_empty()
+	));
+	assert!(matches!(&stmts[1], HirStmt::Let { name, .. } if name == "$it"));
+	assert!(matches!(&stmts[2], HirStmt::Let { name, mutable: true, .. } if name == "$go"));
+	assert!(matches!(&stmts[3], HirStmt::Expr(HirExpr::While { .. })));
+	assert_eq!(acc_tail.as_deref(), Some(&HirExpr::Local("$acc".into())));
+}
+
+#[test]
+#[should_panic(expected = "no `IterMode` recorded for a non-list spread source")]
+fn list_spread_over_a_range_source_panics_loudly_in_lowering() {
+	// The checker types a `Range` spread source via its own short-circuit
+	// (`infer_iterable_element`'s direct `ExprKind::Range` match), which never
+	// consults `Iterator`/`Iterable` and so records no `IterMode` — an
+	// out-of-scope edge that must never silently miscompile.
+	lower(
+		r#"
+		func f(): #[int] = #[...0..5]
+		"#,
+	);
+}
+
+#[test]
+fn lowers_a_map_spread_over_a_native_map_source_to_a_native_merge() {
+	let hir = lower(
+		r#"
+		func f(): #{int: string} = {
+			let m = #{1: "a"}
+			#{...m, 2: "b"}
+		}
+		"#,
+	);
+	let HirExpr::Block { tail, .. } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	assert_eq!(
+		tail.as_deref(),
+		Some(&HirExpr::MapSpread(vec![
+			HirMapElem::Spread(HirExpr::Local("m".into())),
+			HirMapElem::Entry(HirExpr::Num(2.0), HirExpr::Str("b".into())),
+		]))
+	);
+}
+
+#[test]
+fn lowers_a_map_spread_over_a_native_list_of_pairs_source_directly() {
+	// A native `#[#(K, V)]` list source is a JS array already, same as the
+	// native `Map` fast path above — it lowers with no drain, splicing the
+	// list's own `[k, v]` tuples straight into the `new Map([...])` entries.
+	let hir = lower(
+		r#"
+		func f(): #{int: string} = {
+			let pairs = #[#(1, "a"), #(2, "b")]
+			#{...pairs, 9: "z"}
+		}
+		"#,
+	);
+	let HirExpr::Block { tail, .. } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	assert_eq!(
+		tail.as_deref(),
+		Some(&HirExpr::MapSpread(vec![
+			HirMapElem::Spread(HirExpr::Local("pairs".into())),
+			HirMapElem::Entry(HirExpr::Num(9.0), HirExpr::Str("z".into())),
+		]))
+	);
+}
+
+#[test]
+fn lowers_a_map_spread_over_a_non_map_iterable_of_pairs_to_a_drain() {
+	let hir = lower(
+		r#"
+		enum Option<T> { Some(value: T), None }
+		interface Iterator<Item> { mut func next(): Option<Item> }
+		struct Pairs(n: int, max: int)
+		impl Iterator<#(int, string)> for Pairs {
+			mut func next(): Option<#(int, string)> = if (this.n > this.max) {
+				None
+			} else {
+				let v = this.n
+				this.n = this.n + 1
+				Some(value = #(v, "x"))
+			}
+		}
+		func f(): #{int: string} = {
+			let mut p = Pairs(n = 1, max = 3)
+			#{...p, 9: "z"}
+		}
+		"#,
+	);
+	let f = hir
+		.funcs
+		.iter()
+		.find(|f| f.name == "f")
+		.expect("f in module");
+	let HirExpr::Block { tail, .. } = &f.body else {
+		panic!("expected Block, got {:?}", f.body);
+	};
+	let tail = tail.as_deref().expect("a tail expression");
+	let HirExpr::MapSpread(elems) = tail else {
+		panic!("expected MapSpread, got {tail:?}");
+	};
+	assert_eq!(elems.len(), 2);
+	assert_eq!(
+		elems[1],
+		HirMapElem::Entry(HirExpr::Num(9.0), HirExpr::Str("z".into()))
+	);
+	assert!(
+		matches!(&elems[0], HirMapElem::Spread(HirExpr::Block { .. })),
+		"expected a drain Block for the non-map source, got {:?}",
+		elems[0]
+	);
+}
+
+#[test]
+#[should_panic(expected = "does not yet handle spread tuple items")]
+fn tuple_spread_still_panics_in_lowering() {
+	// SS1 is list/map literal spread only — tuple spread stays deferred
+	// (untyped, element-wise; the checker only `infer`s and discards it).
+	lower(
+		r#"
+		func f(): #() = {
+			let xs = #[1, 2, 3]
+			#(...xs)
+		}
+		"#,
+	);
+}
+
+#[test]
+fn mut_func_in_a_top_level_impl_lowers_as_an_instance_method() {
+	// A `mut func` in a top-level `impl Type { … }` block is an ordinary
+	// instance method (mut carries no extra lowering, same as in a type body).
+	let hir = lower(
+		"struct Counter(n: int)
+		 impl Counter {
+		   mut func bump(): void = { this.n = this.n + 1 }
+		 }",
+	);
+	let class = hir.classes.iter().find(|c| c.name == "Counter").unwrap();
+	assert_eq!(class.methods.len(), 1);
+	assert_eq!(class.methods[0].name, "bump");
+	assert!(class.statics.is_empty());
+}
+
+#[test]
+#[should_panic(expected = "namespace func` in a top-level `impl` block")]
+fn namespace_func_in_a_top_level_impl_panics_in_lowering() {
+	// The checker models a `namespace func` in a top-level impl block as a
+	// static, but there is no channel from a top-level impl into the class's
+	// `statics` yet — lowering it as an instance method would be silent
+	// wrong-JS, so lowering defers it loudly (statics belong in the type body).
+	lower(
+		"struct Counter(n: int)
+		 impl Counter {
+		   namespace func zero(): Counter = Counter(n = 0)
+		 }",
 	);
 }

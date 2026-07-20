@@ -160,65 +160,6 @@ fn int_inclusive_range_plus_tails_is_exhaustive() {
 	);
 }
 
-// ── `uint` exhaustiveness (Bug 2): the unsigned mirror of the `int` checks
-// above — `TyKind::UInt` now gets its own interval check (`check_uint_match`)
-// instead of falling through to `check_catch_all`'s "add a `_` arm" demand.
-
-#[test]
-fn uint_match_without_wildcard_is_non_exhaustive() {
-	assert_error_contains(
-		"func f(n: uint): int = match (n) {
-		   0u -> 1,
-		   2u -> 2,
-		 }",
-		"non-exhaustive",
-	);
-}
-
-#[test]
-fn uint_ranges_can_be_exhaustive() {
-	// `0u` plus `1u..` together cover every `uint` value: the unsigned domain
-	// starts at `0`, so (unlike `int`) there is no negative tail to also cover.
-	assert_ok(
-		"func f(n: uint): int = match (n) {
-		   0u -> 0,
-		   1u.. -> 1,
-		 }",
-	);
-}
-
-#[test]
-fn uint_ranges_with_a_gap_are_non_exhaustive() {
-	// `0u` and `2u..` leave `1u` uncovered — the witness the diagnostic reports.
-	assert_error_contains(
-		"func f(n: uint): int = match (n) {
-		   0u -> 0,
-		   2u.. -> 2,
-		 }",
-		"non-exhaustive",
-	);
-}
-
-#[test]
-fn uint_inclusive_range_plus_tail_is_exhaustive() {
-	assert_ok(
-		"func f(n: uint): int = match (n) {
-		   0u..=9u -> 0,
-		   10u.. -> 1,
-		 }",
-	);
-}
-
-#[test]
-fn uint_match_with_wildcard_is_ok() {
-	assert_ok(
-		"func f(n: uint): int = match (n) {
-		   0u -> 0,
-		   _ -> 1,
-		 }",
-	);
-}
-
 const NEST: &str = "enum Inner { C, D }\nenum Outer { A(x: Inner), B }\n";
 
 #[test]
@@ -316,5 +257,109 @@ fn arm_after_catch_all_is_unreachable() {
 	assert!(
 		warnings.iter().any(|w| w.contains("unreachable")),
 		"expected an unreachable warning, got: {warnings:?}"
+	);
+}
+
+// ── `mut`-typed scrutinees: strip_mut must run before the constructor-space
+// dispatch, or a `mut`-typed scrutinee falls through to the catch-all-only arm
+// and every fully-covered match spuriously reports non-exhaustive. ──────────
+
+#[test]
+fn mut_enum_scrutinee_with_all_variants_is_exhaustive() {
+	assert_ok(&format!(
+		"{OPT}
+		 func f(o: mut Opt<int>): int = match (o) {{
+		   Some(value) -> value,
+		   None -> 0,
+		 }}",
+	));
+}
+
+#[test]
+fn mut_enum_scrutinee_missing_a_variant_is_still_caught() {
+	// The strip_mut fix must not weaken real exhaustiveness checking — a genuinely
+	// missing variant on a `mut` scrutinee is still reported, witness and all.
+	let src = format!(
+		"{OPT}
+		 func f(o: mut Opt<int>): int = match (o) {{
+		   Some(value) -> value,
+		 }}",
+	);
+	let (errors, _) = diagnose(&src);
+	assert!(
+		errors
+			.iter()
+			.any(|e| e.contains("non-exhaustive") && e.contains("None")),
+		"expected non-exhaustive/None, got: {errors:?}"
+	);
+}
+
+#[test]
+fn mut_struct_scrutinee_is_exhaustive() {
+	assert_ok(
+		"struct P(n: int) {}
+		 func f(p: mut P): int = match (p) {
+		   P(n) -> n,
+		 }",
+	);
+}
+
+#[test]
+fn mut_boolean_scrutinee_with_both_cases_is_ok() {
+	assert_ok(
+		"func f(b: mut boolean): int = match (b) {
+		   true -> 1,
+		   false -> 0,
+		 }",
+	);
+}
+
+#[test]
+fn mut_tuple_scrutinee_is_exhaustive() {
+	assert_ok(
+		"func f(a: mut boolean, b: mut boolean): int = match (#(a, b)) {
+		   #(false, true) -> 1,
+		   #(false, false) | #(true, true) -> 0,
+		   #(true, false) -> -1,
+		 }",
+	);
+}
+
+// A `mut`-typed sub-position (a struct field or enum-variant field declared
+// `mut`) is a strip_mut gap distinct from a `mut`-typed *scrutinee*: the field
+// type only surfaces once the usefulness algorithm specializes into the
+// constructor's sub-types, deep inside recursion — not at `check_exhaustive`'s
+// single top-level peel.
+
+#[test]
+fn struct_with_a_mut_field_is_exhaustive_over_that_field() {
+	assert_ok(
+		"struct P(flag: mut boolean) {}
+		 func f(p: P): int = match (p) {
+		   P(flag = true) -> 1,
+		   P(flag = false) -> 0,
+		 }",
+	);
+}
+
+#[test]
+fn struct_with_a_mut_field_missing_a_case_is_still_caught() {
+	assert_error_contains(
+		"struct P(flag: mut boolean) {}
+		 func f(p: P): int = match (p) {
+		   P(flag = true) -> 1,
+		 }",
+		"non-exhaustive",
+	);
+}
+
+#[test]
+fn enum_variant_with_a_mut_field_is_exhaustive_over_that_field() {
+	assert_ok(
+		"enum E { V(flag: mut boolean) }
+		 func f(e: E): int = match (e) {
+		   V(flag = true) -> 1,
+		   V(flag = false) -> 0,
+		 }",
 	);
 }

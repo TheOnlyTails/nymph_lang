@@ -92,7 +92,7 @@ fn missing_operator_impl_is_reported() {
 			 struct Vec2(x: int, y: int)
 			 func add(a: Vec2, b: Vec2): Vec2 = a + b",
 		),
-		"Plus",
+		"plus",
 	);
 }
 
@@ -104,7 +104,7 @@ fn unbounded_generic_operator_operand_is_reported() {
 	// program should never reach an unrecoverable compiler panic. `T` has no bound
 	// providing `plus`, so this is now a proper `NotImplemented` diagnostic, exactly
 	// like the concrete `missing_operator_impl_is_reported` case above.
-	assert_error_contains("func f<T>(a: T, b: T): T = a + b", "Plus");
+	assert_error_contains("func f<T>(a: T, b: T): T = a + b", "plus");
 }
 
 #[test]
@@ -182,7 +182,7 @@ fn function_valued_operator_operand_is_reported() {
 		   let c = a + b
 		   1
 		 }",
-		"Plus",
+		"plus",
 	);
 }
 
@@ -193,7 +193,7 @@ fn unbounded_generic_less_than_is_reported() {
 	// W1: an unbounded generic parameter has no `Comparable` bound to dispatch
 	// `<` to — a `NotImplemented` diagnostic, not a silent native `<` on
 	// still-generic operands (the pre-4C-c behavior).
-	assert_error_contains("func f<T>(a: T, b: T): boolean = a < b", "Comparable");
+	assert_error_contains("func f<T>(a: T, b: T): boolean = a < b", "less_than");
 }
 
 #[test]
@@ -221,6 +221,42 @@ fn bounded_generic_logical_and_is_reported() {
 	assert_error_contains(
 		"func f<T>(a: T, b: T): boolean = a && b",
 		"mismatched types",
+	);
+}
+
+#[test]
+fn struct_logical_and_operand_is_reported_with_a_help_hint() {
+	// The language decision this test pins: `&&`/`||` are never overloadable
+	// (mirroring Rust), so a struct operand is a plain mismatch against
+	// `boolean` — never an `And`/`Or` interface dispatch — but the diagnostic
+	// carries a dedicated help hint explaining *why* there's no overload to
+	// reach for, rather than reading like a missing-impl bug.
+	let parsed = parse_module(
+		"struct P(x: int)
+		 func f(a: P, b: boolean): boolean = a && b",
+		"test",
+	);
+	assert!(
+		parsed.diagnostics.iter().all(|d| !d.is_error()),
+		"source failed to parse: {:?}",
+		parsed.diagnostics
+	);
+	let checked = check_module(&parsed.tree);
+	let diag = checked
+		.diags
+		.iter()
+		.find(|d| d.is_error())
+		.expect("expected an error");
+	assert!(
+		diag.message.contains("mismatched types"),
+		"unexpected message: {}",
+		diag.message
+	);
+	assert_eq!(
+		diag.help.as_deref(),
+		Some(
+			"logical operators are not overloadable — `&&`/`||` always take booleans and short-circuit"
+		)
 	);
 }
 
@@ -369,6 +405,36 @@ fn method_resolves_through_generic_bound() {
 }
 
 #[test]
+fn mut_typed_argument_is_accepted_through_an_interface_impl_method_call() {
+	// `commit_method` (the interface-impl dispatch path) checks arguments via
+	// `unify_arg`, same as the inherent-method path — NN3's one-way `mut T <:
+	// T` must hold here too.
+	assert_ok(
+		"interface Adds { func plus(other: int): int }
+		 struct P(base: int)
+		 impl Adds for P { func plus(other: int): int = this.base + other }
+		 func f(): int = {
+		   let mut n = 1
+		   let p = P(base = 0)
+		   p.plus(n)
+		 }",
+	);
+}
+
+#[test]
+fn mut_typed_argument_is_accepted_through_a_generic_bound_method_call() {
+	// `resolve_param_method` (the generic-bound dispatch path) also checks
+	// arguments via `unify_arg`.
+	assert_ok(
+		"interface Adds { func plus(other: int): int }
+		 func f<T: Adds>(t: T): int = {
+		   let mut n = 1
+		   t.plus(n)
+		 }",
+	);
+}
+
+#[test]
 fn method_resolves_through_impl_trait_parameter() {
 	// `s: Show` is sugar for a generic parameter bounded by `Show`; `s.show()` resolves
 	// through that synthetic bound.
@@ -459,22 +525,272 @@ fn impl_trait_return_position_stays_rejected_when_it_disagrees_with_the_body() {
 
 #[test]
 fn impl_trait_parameter_non_implementing_argument_parity_with_explicit_generic() {
-	// KNOWN PRE-EXISTING GAP, not introduced or fixed by this slice: there is
-	// no call-site bound-*enforcement* machinery for declared generics either
-	// — `fresh_subst` mints an unconstrained inference variable, and unifying
-	// it against any concrete argument type trivially succeeds regardless of
-	// whether that type actually implements the bound. `impl Trait` sugar now
-	// goes through the exact same substitution as a declared generic (Z1's
-	// equivalence), so it inherits the identical gap rather than a new or
-	// different one: both spellings below silently accept `int` — which does
-	// not implement `Area` — with zero diagnostics, and would panic at Node
-	// runtime if actually called. Building bound enforcement is a separate,
-	// larger change with no existing call-site mechanism to reuse.
-	assert_ok(
+	// Slice 4G closes the KNOWN PRE-EXISTING GAP the previous version of this
+	// test documented: `int` does not implement `Area`, so both the declared
+	// generic (`T: Area`) and the `impl Trait` sugar spelling now diagnose at
+	// the call site instead of silently accepting a value that would crash
+	// (`shape.area is not a function`) at Node runtime. `impl Trait` sugar goes
+	// through the exact same substitution/obligation machinery as a declared
+	// generic (Z1's equivalence), so both get identical treatment here too.
+	assert_error_contains(
 		"interface Area { func area(): int }
 		 func measure_explicit<T: Area>(shape: T): int = shape.area()
+		 func total(n: int): int = measure_explicit(n)",
+		"does not implement `Area`",
+	);
+	assert_error_contains(
+		"interface Area { func area(): int }
 		 func measure_sugar(shape: Area): int = shape.area()
-		 func total(n: int): int = measure_explicit(n) + measure_sugar(n)",
+		 func total(n: int): int = measure_sugar(n)",
+		"does not implement `Area`",
+	);
+}
+
+// ── Slice 4G: call-site bound enforcement ───────────────────────────────────
+//
+// Closes the soundness hole above: a generic function call whose argument does
+// not implement the declared bound now diagnoses instead of type-checking and
+// then crashing at JS runtime.
+
+#[test]
+fn bound_violation_via_declared_generic_is_reported() {
+	assert_error_contains(
+		"interface Area { func area(): int }
+		 func measure<T: Area>(shape: T): int = shape.area()
+		 func total(): int = measure(3)",
+		"does not implement `Area`",
+	);
+}
+
+#[test]
+fn bound_violation_via_impl_trait_sugar_is_reported() {
+	assert_error_contains(
+		"interface Area { func area(): int }
+		 func measure(shape: Area): int = shape.area()
+		 func total(): int = measure(3)",
+		"does not implement `Area`",
+	);
+}
+
+#[test]
+fn bound_satisfying_argument_stays_clean_both_spellings() {
+	assert_ok(
+		"interface Area { func area(): int }
+		 struct Square(side: int)
+		 impl Area for Square { func area(): int = this.side * this.side }
+		 func measure_explicit<T: Area>(shape: T): int = shape.area()
+		 func measure_sugar(shape: Area): int = shape.area()
+		 func total(s: Square): int = measure_explicit(s) + measure_sugar(s)",
+	);
+}
+
+#[test]
+fn generic_to_generic_forwarding_stays_clean() {
+	// `outer`'s own `T: Area` bound satisfies `measure`'s identical requirement:
+	// the forwarded var resolves (at drain time) to `outer`'s own rigid `Param`,
+	// whose `param_bounds` entry (live during `outer`'s own body drain) already
+	// records `Area`.
+	assert_ok(
+		"interface Area { func area(): int }
+		 func measure<T: Area>(shape: T): int = shape.area()
+		 func outer<T: Area>(x: T): int = measure(x)",
+	);
+}
+
+#[test]
+fn generic_to_generic_forwarding_without_the_bound_is_reported() {
+	// The mirror image of the case above: `outer`'s own `T` is unbounded, so
+	// forwarding it into `measure`'s `T: Area` requirement is unsound and must
+	// now be reported, not silently accepted.
+	assert_error_contains(
+		"interface Area { func area(): int }
+		 func measure<T: Area>(shape: T): int = shape.area()
+		 func outer<T>(x: T): int = measure(x)",
+		"does not implement `Area`",
+	);
+}
+
+#[test]
+fn argful_bound_violation_is_reported() {
+	// `T: Comparable<Other = T>` requires `A`'s own `Comparable` impl to compare
+	// against itself — but `A` only implements `Comparable<Other = B>`. A
+	// bare-interface-only check would wrongly accept this (`A` does implement
+	// `Comparable`, just not with the required argument); full argful fidelity
+	// (substituting the call-site subst into the bound's args before deferring)
+	// correctly rejects it.
+	assert_error_contains(
+		"interface Comparable<Other> { func compare_to(other: Other): int }
+		 struct A(v: int)
+		 struct B(v: int)
+		 impl Comparable<Other = B> for A { func compare_to(other: B): int = 0 }
+		 func cmp<T: Comparable<Other = T>>(a: T): int = a.compare_to(a)
+		 func use_it(a: A): int = cmp(a)",
+		"does not implement `Comparable`",
+	);
+}
+
+#[test]
+fn argful_bound_satisfying_argument_stays_clean() {
+	assert_ok(
+		"interface Comparable<Other> { func compare_to(other: Other): int }
+		 struct A(v: int)
+		 impl Comparable<Other = A> for A { func compare_to(other: A): int = 0 }
+		 func cmp<T: Comparable<Other = T>>(a: T): int = a.compare_to(a)
+		 func use_it(a: A): int = cmp(a)",
+	);
+}
+
+// ── Slice 4G-b: method own-generic & constructor bound enforcement ─────────
+//
+// Closes the remaining holes 4G's ledger documented: an inherent method's own
+// generic bound, and a struct/enum constructor's declared generic bound, were
+// both unenforced — a call/construction whose argument didn't implement the
+// bound type-checked and then crashed at JS runtime.
+
+#[test]
+fn method_own_generic_bound_violation_is_reported() {
+	// `Box.apply<U: Area>` requires its argument to implement `Area` — `3` (an
+	// `int`, with no `Area` impl in scope) must now be reported, not silently
+	// accepted (this used to be a zero-diagnostic program, per the 4G ledger).
+	assert_error_contains(
+		"interface Area { func area(): int }
+		 struct Box(v: int) { func apply<U: Area>(u: U): int = u.area() }
+		 func total(b: Box): int = b.apply(3)",
+		"does not implement `Area`",
+	);
+}
+
+#[test]
+fn method_own_generic_bound_satisfying_argument_stays_clean() {
+	assert_ok(
+		"interface Area { func area(): int }
+		 struct Square(side: int)
+		 impl Area for Square { func area(): int = this.side * this.side }
+		 struct Box(v: int) { func apply<U: Area>(u: U): int = u.area() }
+		 func total(b: Box, s: Square): int = b.apply(s)",
+	);
+}
+
+#[test]
+fn method_own_generic_bound_forwarding_stays_clean() {
+	// The caller's own `T: Area` bound satisfies `apply`'s identical requirement
+	// — the classic generic-to-generic forwarding case, now for methods too.
+	assert_ok(
+		"interface Area { func area(): int }
+		 struct Box(v: int) { func apply<U: Area>(u: U): int = u.area() }
+		 func outer<T: Area>(b: Box, x: T): int = b.apply(x)",
+	);
+}
+
+#[test]
+fn method_own_generic_bound_forwarding_without_the_bound_is_reported() {
+	assert_error_contains(
+		"interface Area { func area(): int }
+		 struct Box(v: int) { func apply<U: Area>(u: U): int = u.area() }
+		 func outer<T>(b: Box, x: T): int = b.apply(x)",
+		"does not implement `Area`",
+	);
+}
+
+#[test]
+fn interface_impl_method_own_generic_stays_loud() {
+	// CC3: interface-impl method own-generics are inexpressible (not a bound
+	// enforcement gap — `finish_interface_impl` never pushes them into scope),
+	// so a USED own-generic must still error loudly, not silently miscompile.
+	assert_error_contains(
+		"interface Mapper { func extra(): int }
+		 interface Area { func area(): int }
+		 struct Square(side: int)
+		 impl Mapper for Square { func extra<U: Area>(u: U): int = u.area() }",
+		"cannot find type",
+	);
+}
+
+#[test]
+fn struct_ctor_bound_violation_is_reported() {
+	assert_error_contains(
+		"interface Area { func area(): int }
+		 struct Container<T: Area>(value: T)
+		 func make(): Container<int> = Container(value = 3)",
+		"does not implement `Area`",
+	);
+}
+
+#[test]
+fn struct_ctor_bound_satisfying_argument_stays_clean() {
+	assert_ok(
+		"interface Area { func area(): int }
+		 struct Square(side: int)
+		 impl Area for Square { func area(): int = this.side * this.side }
+		 struct Container<T: Area>(value: T)
+		 func make(s: Square): Container<Square> = Container(value = s)",
+	);
+}
+
+#[test]
+fn enum_ctor_bound_violation_is_reported() {
+	assert_error_contains(
+		"interface Area { func area(): int }
+		 enum Holder<T: Area> { Some(value: T), Empty }
+		 func make(): Holder<int> = Holder.Some(value = 3)",
+		"does not implement `Area`",
+	);
+}
+
+#[test]
+fn enum_ctor_bound_satisfying_argument_stays_clean() {
+	assert_ok(
+		"interface Area { func area(): int }
+		 struct Square(side: int)
+		 impl Area for Square { func area(): int = this.side * this.side }
+		 enum Holder<T: Area> { Some(value: T), Empty }
+		 func make(s: Square): Holder<Square> = Holder.Some(value = s)",
+	);
+}
+
+#[test]
+fn nullary_enum_ctor_bound_violation_is_reported() {
+	// A nullary variant reference still instantiates the enum's generics (see
+	// `variant_value`), so it needs the same enforcement as a labeled
+	// construction — even though `T` is never actually witnessed by a runtime
+	// value in the `Empty` case, the annotation pins it to `int` (which does not
+	// implement `Area`).
+	assert_error_contains(
+		"interface Area { func area(): int }
+		 enum Holder<T: Area> { Some(value: T), Empty }
+		 func make(): Holder<int> = Holder.Empty",
+		"does not implement `Area`",
+	);
+}
+
+#[test]
+fn pattern_position_does_not_enforce_ctor_bounds() {
+	// CC3: destructuring an existing (already validly constructed) value must
+	// not re-check the bound — `peek`'s own `T` is unbounded, and a pattern-site
+	// obligation would wrongly reject a program that never itself constructs an
+	// unbounded `Holder`.
+	assert_ok(
+		"interface Area { func area(): int }
+		 enum Holder<T> { Some(value: T), Empty }
+		 func peek<T>(h: Holder<T>): int = match (h) {
+		   Some(value) -> 1,
+		   Empty -> 0,
+		 }",
+	);
+}
+
+#[test]
+fn stdlib_range_style_bound_via_blanket_impl_stays_clean() {
+	// Mirrors stdlib's `Range<Idx: Comparable<Idx>>`: constructing with `int`
+	// satisfies the bound through the unconstrained blanket impl fallback (Slice
+	// 4G's `holds` fallback for the concrete-type case), so this must stay
+	// zero-diagnostic — the canary that this slice does not regress
+	// `stdlib_typechecks_cleanly`.
+	assert_ok(
+		"interface Comparable<Other> { func compare_to(other: Other): int }
+		 impl<T> Comparable<Other = T> for T { func compare_to(other: T): int = 0 }
+		 struct Range<Idx: Comparable<Idx>>(start: Idx, end: Idx)
+		 func make(): Range<int> = Range(start = 0, end = 10)",
 	);
 }
 
@@ -506,6 +822,64 @@ fn cast_without_into_impl_is_reported() {
 			 func f(p: P): string = p as string",
 		),
 		"cannot cast",
+	);
+}
+
+#[test]
+fn cast_with_no_into_interface_in_scope_is_reported() {
+	// Slice 4K: `check_cast` used to return silently whenever `Into` isn't even
+	// declared in the module (every real `nymph-compiler::compile()` program, since
+	// it checks standalone with no stdlib linkage) — a non-scalar cast type-checked
+	// completely unchecked and only died later at lowering's unresolved-cast panic.
+	// This is now a loud, distinct diagnostic from `cast_without_into_impl_is_reported`
+	// above (which has `Into` in scope, just no matching impl).
+	assert_error_contains(
+		"struct P(x: int)
+		 func f(p: P): string = p as string",
+		"no `Into` interface is in scope",
+	);
+}
+
+#[test]
+fn cast_between_int_and_uint_is_built_in() {
+	assert_ok("func f(n: int): uint = n as uint");
+}
+
+#[test]
+fn cast_from_char_to_int_is_built_in() {
+	assert_ok("func f(c: char): int = c as int");
+}
+
+#[test]
+fn cast_from_int_to_char_is_built_in() {
+	assert_ok("func f(n: int): char = n as char");
+}
+
+#[test]
+fn identity_cast_needs_no_into_impl_even_without_into_in_scope() {
+	// `Foo as Foo` is the identity case (`src == target_r`) and short-circuits
+	// before the `Into` lookup entirely — no diagnostic even though this module
+	// declares no `Into` interface at all.
+	assert_ok(
+		"struct P(x: int)
+		 func f(p: P): P = p as P",
+	);
+}
+
+#[test]
+fn cast_via_an_into_interface_with_a_custom_method_name_type_checks() {
+	// Defect 1 regression: `Into` is looked up purely by the NAME "Into" (`self.defs
+	// .get("Into")`), so a local interface literally called `Into` whose sole method
+	// isn't named `into` (e.g. `convert`) is a legal, checker-visible shape. This must
+	// type-check clean — the checker itself has no reason to reject it, since `holds`
+	// only checks the interface args, not any particular method name.
+	assert_ok(
+		r#"
+		interface Into<Other> { func convert(): Other }
+		struct P(x: int)
+		impl Into<string> for P { func convert(): string = "p" }
+		func f(p: P): string = p as string
+		"#,
 	);
 }
 
@@ -558,6 +932,115 @@ fn inner_impl_body_is_checked() {
 }
 
 #[test]
+fn nested_impl_with_duplicate_method_name_is_reported() {
+	// HH3 (Slice 4K): before this, a nested `impl Iface { .. }` block declaring the
+	// same method name twice type-checked completely clean (silent last-wins in
+	// `finish_interface_impl`'s `methods.insert`), and the first (shadowed, never
+	// checked) body still reached `lower_hir.rs`'s `assert_no_duplicate_methods`,
+	// which panicked — this is the ledgered ICE probe turned into a diagnostic test.
+	assert_error_contains(
+		&format!(
+			"{PLUS}
+			 struct Vec2(x: int, y: int) {{
+			   impl Plus<Other = Vec2, Output = Vec2> {{
+			     func plus(other: Vec2): Vec2 = other
+			     func plus(other: Vec2): Vec2 = other
+			   }}
+			 }}",
+		),
+		"defined more than once",
+	);
+}
+
+#[test]
+fn top_level_impl_for_with_duplicate_method_name_is_reported() {
+	// The same insert point (`finish_interface_impl`) is shared by top-level `impl
+	// … for` blocks, so the guard closes this shape too, not just the nested one.
+	assert_error_contains(
+		&format!(
+			"{PLUS}
+			 struct Vec2(x: int, y: int)
+			 impl Plus<Other = Vec2, Output = Vec2> for Vec2 {{
+			   func plus(other: Vec2): Vec2 = other
+			   func plus(other: Vec2): Vec2 = other
+			 }}",
+		),
+		"defined more than once",
+	);
+}
+
+#[test]
+fn nested_impl_method_colliding_with_inherent_method_is_reported() {
+	// HH3's actual named scenario: an inherent method (declared directly in the
+	// struct body) and a nested `impl Iface { .. }` method of the SAME name. This
+	// used to type-check clean (the two collection passes — `members.rs`'s inherent
+	// map and `iface.rs`'s `finish_interface_impl` — never compared notes) and then
+	// panic in `lower_hir.rs`'s `assert_no_duplicate_methods`.
+	assert_error_contains(
+		&format!(
+			"{PLUS}
+			 struct Vec2(x: int, y: int) {{
+			   func plus(other: Vec2): Vec2 = other
+			   impl Plus<Other = Vec2, Output = Vec2> {{
+			     func plus(other: Vec2): Vec2 = other
+			   }}
+			 }}",
+		),
+		"defined more than once",
+	);
+}
+
+#[test]
+fn top_level_impl_for_method_colliding_with_inherent_method_is_reported() {
+	// Same collision, top-level `impl … for` shape instead of nested.
+	assert_error_contains(
+		&format!(
+			"{PLUS}
+			 struct Vec2(x: int, y: int) {{
+			   func plus(other: Vec2): Vec2 = other
+			 }}
+			 impl Plus<Other = Vec2, Output = Vec2> for Vec2 {{
+			   func plus(other: Vec2): Vec2 = other
+			 }}",
+		),
+		"defined more than once",
+	);
+}
+
+#[test]
+fn nested_impl_method_does_not_collide_with_a_same_named_namespaced_static() {
+	// Defect 2: a `namespace func plus` static and a nested `impl Iface { .. }`
+	// instance method sharing the name `plus` are DIFFERENT JS slots (a class
+	// static vs. a prototype/instance method — see `collect_adt_methods`, which
+	// keeps namespaced members in a wholly separate `statics` list from `methods`,
+	// each independently checked by `assert_no_duplicate_methods`). This must check
+	// clean, unlike the genuine inherent-vs-impl collision above.
+	assert_ok(&format!(
+		"{PLUS}
+		 struct Vec2(x: int, y: int) {{
+		   namespace func plus(a: Vec2, b: Vec2): Vec2 = a
+		   impl Plus<Other = Vec2, Output = Vec2> {{
+		     func plus(other: Vec2): Vec2 = other
+		   }}
+		 }}",
+	));
+}
+
+#[test]
+fn top_level_impl_for_method_does_not_collide_with_a_same_named_namespaced_static() {
+	// Same non-collision, top-level `impl … for` shape instead of nested.
+	assert_ok(&format!(
+		"{PLUS}
+		 struct Vec2(x: int, y: int) {{
+		   namespace func plus(a: Vec2, b: Vec2): Vec2 = a
+		 }}
+		 impl Plus<Other = Vec2, Output = Vec2> for Vec2 {{
+		   func plus(other: Vec2): Vec2 = other
+		 }}",
+	));
+}
+
+#[test]
 fn blanket_and_concrete_do_not_conflict() {
 	// A blanket impl and a concrete impl of the same interface overlap by construction,
 	// but concrete-beats-blanket specificity disambiguates them, so this is allowed.
@@ -566,5 +1049,89 @@ fn blanket_and_concrete_do_not_conflict() {
 		 impl<T> Equals<Other = T> for T { func equals(other: T): boolean = true }
 		 struct P(x: int)
 		 impl Equals<Other = P> for P { func equals(other: P): boolean = false }",
+	);
+}
+
+// ── Resolver precedence for `Param` receivers (MM1/MM2/MM3) ──
+//
+// A still-generic `TyKind::Param` receiver used to lose a method name declared
+// by the param's OWN bound to an unrelated blanket impl of the same name:
+// `head_of(Param)` is `None`, so phase 1's impl-index search in
+// `resolve_method` (`solve.rs`) only ever finds each interface's blanket
+// bucket, and a blanket impl unifies with *any* receiver. The fix consults the
+// param's declared bounds (`resolve_param_method`) FIRST, falling through to
+// the ordinary blanket search only when none of the bounds provide the method
+// — never returning eagerly on a bounds miss, which would break unconstrained
+// blanket dispatch (see the second test below). `tests/operator_resolutions.rs`
+// pins the same two shapes against the real stdlib prelude.
+
+#[test]
+fn param_bound_method_wins_over_unrelated_blanket_impl() {
+	// Collision: `T`'s own bound `Mine::pick` (returns `int`) must beat the
+	// unrelated blanket `Blanket::pick` (returns `boolean`) in scope — before the
+	// fix, the blanket's receiver-matches-everything unify made phase 1 commit it
+	// first, and `f` (declared to return `int`) failed with a `boolean` mismatch.
+	assert_ok(
+		"interface Blanket<Other> { func pick(other: Other): boolean }
+		 impl<T> Blanket<Other = T> for T { func pick(other: T): boolean = true }
+		 interface Mine<Other> { func pick(other: Other): int }
+		 func f<T: Mine<Other = T>>(a: T, b: T): int = a.pick(b)",
+	);
+}
+
+#[test]
+fn unconstrained_param_still_dispatches_through_blanket_impl() {
+	// The blanket-dispatch behavior the fix must preserve: `T` has no bound at
+	// all, so `resolve_param_method` finds nothing and control must fall through
+	// (never return early) to the ordinary blanket-bucket search, which resolves
+	// `a.equals(b)` through the blanket `Equals` impl. A prior, reverted fix
+	// attempt returned eagerly on this bounds-miss and broke exactly this shape
+	// with a spurious "no method `equals`" error.
+	assert_ok(
+		"interface Equals<Other> { func equals(other: Other): boolean }
+		 impl<T> Equals<Other = T> for T { func equals(other: T): boolean = true }
+		 func same<T>(a: T, b: T): boolean = a.equals(b)",
+	);
+}
+
+#[test]
+fn two_conflicting_bounds_deterministically_pick_the_first_declared() {
+	// MM3: when two bounds on one param both declare the same method name with
+	// different return types, `resolve_param_method` iterates
+	// `param_bounds`/`synthetic_bounds` in declaration order and returns on the
+	// FIRST bound that provides the name — deterministic, and silent (no
+	// ambiguity diagnostic). This is type-sound from the resolution's own
+	// standpoint: a genuine clash surfaces loudly as a return-type mismatch (the
+	// next test), never as silent-wrong-JS from the pick itself.
+	assert_ok(
+		"interface A<Other> { func m(other: Other): int }
+		 interface B<Other> { func m(other: Other): string }
+		 func f<T: A<Other = T> + B<Other = T>>(a: T, b: T): int = a.m(b)",
+	);
+}
+
+#[test]
+fn conflicting_bound_pick_surfaces_loudly_as_a_type_mismatch() {
+	// Same two bounds, `A` declared first again, but `f` now expects `B`'s
+	// `string` return — the deterministic first-bound pick still resolves to
+	// `A` (returning `int`), so this is a loud "mismatched types" error, never a
+	// silently wrong resolution.
+	assert_error_contains(
+		"interface A<Other> { func m(other: Other): int }
+		 interface B<Other> { func m(other: Other): string }
+		 func f<T: A<Other = T> + B<Other = T>>(a: T, b: T): string = a.m(b)",
+		"mismatched types",
+	);
+}
+
+#[test]
+fn declaration_order_of_bounds_controls_the_deterministic_pick() {
+	// Reversing the bound order (`B` first) flips which interface wins: same
+	// method name, same param, but now `B`'s `string` return resolves cleanly
+	// because `B` is declared first this time.
+	assert_ok(
+		"interface A<Other> { func m(other: Other): int }
+		 interface B<Other> { func m(other: Other): string }
+		 func f<T: B<Other = T> + A<Other = T>>(a: T, b: T): string = a.m(b)",
 	);
 }

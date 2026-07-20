@@ -9,7 +9,7 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-nymph-sema = { workspace = true }
+nymph-compiler = { workspace = true }
 nymph-diagnostics = { workspace = true }
 ecow = { workspace = true }
 clap = { workspace = true }
@@ -17,4 +17,5 @@ serde = { workspace = true }
 semver = { workspace = true }
 inquire = "0.9.4"
 owo-colors = "4.3.0"
-
+toml = { workspace = true }
+anyhow = { workspace = true }

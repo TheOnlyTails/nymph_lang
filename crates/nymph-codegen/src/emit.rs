@@ -6,8 +6,8 @@ use oxc::{
 };
 
 use nymph_hir::hir::{
-	BinOp, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit, HirMethod, HirModule, HirPat,
-	HirRange, HirStmt, UnOp,
+	BinOp, HirArrayElem, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit, HirMapElem, HirMethod,
+	HirModule, HirPat, HirRange, HirStmt, ScalarCastKind, UnOp,
 };
 
 /// A re-emittable reference to a sub-value of the scrutinee, used while compiling a
@@ -30,6 +30,10 @@ enum Subject {
 	/// `<base>.slice(<start>, <base>.length - <end_from_end>)` — a list rest slice
 	/// (`end_from_end == 0` ⇒ `<base>.slice(<start>)`).
 	Slice(Box<Subject>, usize, usize),
+	/// The rest-of-map for a map pattern's `...rest` — a shallow copy of `<base>`
+	/// minus the named keys: `new Map(<base>)` when `keys` is empty, else an
+	/// IIFE that copies then deletes each key.
+	MapRest(Box<Subject>, Vec<HirLit>),
 }
 
 /// Intermediate representation for expression-valued code.
@@ -107,6 +111,15 @@ pub struct Emitter<'a> {
 	/// nested subexpression-position construct returns control to a statement-
 	/// position caller (Slice 4E, Y1).
 	in_iife_subexpr: std::cell::Cell<bool>,
+	/// Every `(module, symbol)` pair a `HirExpr::ExternCall` lowered during
+	/// this emit run needs imported (Gap 3, L0) — populated by the
+	/// `HirExpr::ExternCall` arm of [`Self::emit_expr`], drained by
+	/// [`Self::emit_module`] into a deduped, deterministically-ordered
+	/// `import { symbol } from "module";` per pair, prepended ahead of every
+	/// other top-level statement. A `BTreeSet` (not a `HashSet`) so the
+	/// prepended import order — and therefore the emitted JS text — stays
+	/// stable across runs, which the golden/e2e tests rely on.
+	needed_imports: std::cell::RefCell<std::collections::BTreeSet<(&'static str, &'static str)>>,
 }
 
 impl Default for Emitter<'_> {
@@ -126,6 +139,7 @@ impl<'a> Emitter<'a> {
 			alloc,
 			gensym: std::cell::Cell::new(0),
 			in_iife_subexpr: std::cell::Cell::new(false),
+			needed_imports: std::cell::RefCell::new(std::collections::BTreeSet::new()),
 		}
 	}
 
@@ -160,6 +174,23 @@ impl<'a> Emitter<'a> {
 		for func in &module.funcs {
 			stmts.push(self.emit_func(func));
 		}
+		// Gap 3 (L0): prepend one deduped, deterministically-ordered `import`
+		// per `(module, symbol)` pair any `HirExpr::ExternCall` above
+		// recorded — emitted INTO the returned module string rather than via
+		// a changed `emit`/`emit_module` return shape (a `-> String` many
+		// call sites depend on), so an import line can ride along even though
+		// `emit_module` still returns one flat `String`. Valid ES: an
+		// `import` hoists regardless of where in the module body it's
+		// textually written.
+		let imports = self.needed_imports.borrow();
+		if !imports.is_empty() {
+			let mut with_imports = ArenaVec::new_in(&self.ast);
+			for (module_specifier, symbol) in imports.iter() {
+				with_imports.push(self.build_import_statement(module_specifier, symbol));
+			}
+			with_imports.extend(stmts);
+			stmts = with_imports;
+		}
 		let program = Program::new(
 			SPAN,
 			SourceType::mjs(),
@@ -171,6 +202,35 @@ impl<'a> Emitter<'a> {
 			&self.ast,
 		);
 		Codegen::new().build(&program).code
+	}
+
+	/// Build `import { <symbol> } from "<module_specifier>";` (Gap 3, L0).
+	fn build_import_statement(&self, module_specifier: &str, symbol: &str) -> Statement<'a> {
+		let imported = ModuleExportName::IdentifierName(IdentifierName::new(
+			SPAN,
+			self.ast.allocator.alloc_str(symbol),
+			&self.ast,
+		));
+		let local = BindingIdentifier::new(SPAN, self.ast.allocator.alloc_str(symbol), &self.ast);
+		let mut specifiers = ArenaVec::new_in(&self.ast);
+		specifiers.push(ImportDeclarationSpecifier::ImportSpecifier(
+			ImportSpecifier::boxed(SPAN, imported, local, ImportOrExportKind::Value, &self.ast),
+		));
+		let source = StringLiteral::new(
+			SPAN,
+			self.ast.allocator.alloc_str(module_specifier),
+			None,
+			&self.ast,
+		);
+		Statement::ImportDeclaration(ImportDeclaration::boxed(
+			SPAN,
+			Some(specifiers),
+			source,
+			None,
+			oxc::ast::NONE,
+			ImportOrExportKind::Value,
+			&self.ast,
+		))
 	}
 
 	fn emit_func(&self, func: &HirFunc) -> Statement<'a> {
@@ -355,7 +415,10 @@ impl<'a> Emitter<'a> {
 		let mut elements = ArenaVec::new_in(&self.ast);
 		elements.push(ctor);
 		for method in &class.methods {
-			elements.push(self.emit_method(method));
+			elements.push(self.emit_method(method, false));
+		}
+		for method in &class.statics {
+			elements.push(self.emit_method(method, true));
 		}
 		let body = ClassBody::new(SPAN, elements, &self.ast);
 		let name = BindingIdentifier::new(SPAN, self.ast.allocator.alloc_str(&class.name), &self.ast);
@@ -438,8 +501,10 @@ impl<'a> Emitter<'a> {
 	}
 
 	/// Emit an inherent instance method as a class method `<name>(<params>) { return
-	/// <body>; }`.
-	fn emit_method(&self, method: &HirMethod) -> ClassElement<'a> {
+	/// <body>; }`. When `is_static`, emits a `namespace func` static function
+	/// (Slice 4J) as a JS `static` class method instead — `Type.func(args)` then
+	/// resolves to it natively, with zero call-site changes needed.
+	fn emit_method(&self, method: &HirMethod, is_static: bool) -> ClassElement<'a> {
 		let func = self.method_function(method);
 		ClassElement::new_method_definition(
 			SPAN,
@@ -453,7 +518,7 @@ impl<'a> Emitter<'a> {
 			func,
 			MethodDefinitionKind::Method,
 			false,
-			false,
+			is_static,
 			false,
 			false,
 			None,
@@ -508,10 +573,33 @@ impl<'a> Emitter<'a> {
 		self.const_decl("TAG", init)
 	}
 
-	/// Emit an enum as `const <E> = (() => { const t0 = Symbol("E.V0"); … return
-	/// { V0: <factory|singleton>, … }; })();`. The IIFE scopes each variant's unique
-	/// symbol; field variants become object-arg factories, nullary variants frozen
-	/// singletons — each carrying `[TAG]` so a matcher can compare identity.
+	/// Emit an enum as `const <E> = (() => { const t0 = Symbol.for("E.V0"); …
+	/// return { V0: <factory|singleton>, … }; })();`. The IIFE scopes each
+	/// variant's own symbol BINDING; field variants become object-arg
+	/// factories, nullary variants frozen singletons — each carrying `[TAG]`
+	/// so a matcher can compare identity.
+	///
+	/// L1 (external linkage's Option ABI seam): the variant discriminant is
+	/// `Symbol.for(label)` — the GLOBAL symbol registry, keyed by the exact
+	/// string `label` (`"<enum-name>.<variant-name>"`, enum name emitted
+	/// UNMANGLED) — not a bare `Symbol(label)` call, which mints a FRESH,
+	/// non-global symbol every time it runs. `Option` (and every other
+	/// prelude enum) is materialized INLINE, once per module that references
+	/// it (`Lowerer::materialize_referenced_prelude_enums`) — with a bare
+	/// `Symbol(..)`, two DIFFERENT modules' own inline `Option` IIFEs mint
+	/// two DIFFERENT `Symbol("Option.Some")` values, so a `Some` built in one
+	/// module fails an `=== ` tag comparison against `Option.Some[TAG]` read
+	/// from another module's own inline `Option` — cross-module (and,
+	/// crucially for this slice, intrinsic-runtime-built) `Option`/enum
+	/// values silently mismatch every `match`, EVEN THOUGH the checker
+	/// already treats them as the identical type. `Symbol.for` fixes this:
+	/// the same string always resolves to the same global symbol, so any two
+	/// independently-emitted (or independently hand-built, see
+	/// `nymph-compiler::intrinsics`'s injected `std/option` virtual module)
+	/// values of "the same" enum variant compare equal by construction. The
+	/// TAG KEY itself (`emit_tag_const`, above) was already global via
+	/// `Symbol.for("nymph.tag")` — only the per-variant discriminant VALUE
+	/// was the gap.
 	///
 	/// X1: when the enum has methods, a `const proto = { … };` object (built the
 	/// same way as struct class methods, see [`Self::emit_method_property`]) is
@@ -530,6 +618,17 @@ impl<'a> Emitter<'a> {
 			let t_name = format!("t{i}");
 			// const t<i> = Symbol("<E>.<V>");
 			let label = format!("{}.{}", hir_enum.name, variant.name);
+			// `Symbol.for(label)`, not a bare `Symbol(label)` call — see this
+			// method's own doc comment for why the discriminant must be the
+			// GLOBAL symbol registry entry, mirroring `emit_tag_const`'s own
+			// `Symbol.for("nymph.tag")` shape.
+			let symbol_for = Expression::new_static_member_expression(
+				SPAN,
+				Expression::new_identifier(SPAN, "Symbol", &self.ast),
+				IdentifierName::new(SPAN, "for", &self.ast),
+				false,
+				&self.ast,
+			);
 			let mut sym_args = ArenaVec::new_in(&self.ast);
 			sym_args.push(Argument::from(Expression::new_string_literal(
 				SPAN,
@@ -539,7 +638,7 @@ impl<'a> Emitter<'a> {
 			)));
 			let sym_call = Expression::new_call_expression(
 				SPAN,
-				Expression::new_identifier(SPAN, "Symbol", &self.ast),
+				symbol_for,
 				oxc::ast::NONE,
 				sym_args,
 				false,
@@ -587,6 +686,15 @@ impl<'a> Emitter<'a> {
 				false,
 				&self.ast,
 			)));
+		}
+		// `namespace func` static functions (Slice 4J) become OBJECT-level
+		// method properties on the returned object itself, alongside the
+		// variant keys — NOT on `proto` (only reachable through a constructed
+		// variant instance, never through the enum name; call sites emit
+		// `E.func(..)` against the object `E`, which is this returned object,
+		// see `HirEnum::statics`'s doc comment).
+		for method in &hir_enum.statics {
+			props.push(self.emit_method_property(method));
 		}
 		let return_obj = Expression::new_object_expression(SPAN, props, &self.ast);
 		let iife = JsValue {
@@ -758,6 +866,151 @@ impl<'a> Emitter<'a> {
 		Expression::new_call_expression(SPAN, callee, oxc::ast::NONE, js_args, false, &self.ast)
 	}
 
+	/// A bare global identifier reference (`Math`, `Number`, `Infinity`, or a
+	/// cast-IIFE's gensym parameter — see `saturating_scalar_cast`).
+	fn ident(&self, name: &'a str) -> Expression<'a> {
+		Expression::new_identifier(SPAN, name, &self.ast)
+	}
+
+	/// `Math.<method>(<arg>)`.
+	fn math_call(&self, method: &str, arg: Expression<'a>) -> Expression<'a> {
+		let math = self.ident("Math");
+		self.member_call(math, method, vec![arg])
+	}
+
+	/// `Number.isNaN(<arg>)`.
+	fn number_is_nan(&self, arg: Expression<'a>) -> Expression<'a> {
+		let number = self.ident("Number");
+		self.member_call(number, "isNaN", vec![arg])
+	}
+
+	/// `<left> === <right>`.
+	fn strict_eq(&self, left: Expression<'a>, right: Expression<'a>) -> Expression<'a> {
+		Expression::BinaryExpression(BinaryExpression::boxed(
+			SPAN,
+			left,
+			BinaryOperator::StrictEquality,
+			right,
+			&self.ast,
+		))
+	}
+
+	/// The numeric literal `0`.
+	fn zero(&self) -> Expression<'a> {
+		Expression::new_numeric_literal(SPAN, 0.0, None, NumberBase::Decimal, &self.ast)
+	}
+
+	/// `-Infinity` — a unary negation of the `Infinity` global.
+	fn neg_infinity(&self) -> Expression<'a> {
+		let infinity = self.ident("Infinity");
+		Expression::new_unary_expression(SPAN, UnaryOperator::UnaryNegation, infinity, &self.ast)
+	}
+
+	/// An `i64` value as a JS numeric literal. `i64::MAX` (`2^63 - 1`) isn't
+	/// exactly representable as an `f64` — JS stores/prints the nearest double,
+	/// `2^63`, exactly as if `9223372036854775807` had been written directly in
+	/// JS source and parsed as a `Number`. `i64::MIN` (`-2^63`) IS exactly
+	/// representable.
+	fn i64_literal(&self, value: i64) -> Expression<'a> {
+		Expression::new_numeric_literal(SPAN, value as f64, None, NumberBase::Decimal, &self.ast)
+	}
+
+	/// `((<param>) => <body>)(<operand>)` — an arrow-IIFE that evaluates `operand`
+	/// exactly once, as the sole call argument. `param` is a gensym, so it can
+	/// never collide with a user identifier.
+	fn arrow_iife(
+		&self,
+		param: &'a str,
+		body: Expression<'a>,
+		operand: Expression<'a>,
+	) -> Expression<'a> {
+		let mut body_stmts = ArenaVec::new_in(&self.ast);
+		body_stmts.push(Statement::new_return_statement(SPAN, Some(body), &self.ast));
+		let function_body = FunctionBody::new(SPAN, ArenaVec::new_in(&self.ast), body_stmts, &self.ast);
+		let mut params = ArenaVec::new_in(&self.ast);
+		params.push(FormalParameter::new_plain(
+			SPAN,
+			BindingPattern::new_binding_identifier(SPAN, param, &self.ast),
+			&self.ast,
+		));
+		let formal = FormalParameters::new(
+			SPAN,
+			FormalParameterKind::ArrowFormalParameters,
+			params,
+			oxc::ast::NONE,
+			&self.ast,
+		);
+		let arrow = Expression::new_arrow_function_expression(
+			SPAN,
+			false,
+			false,
+			oxc::ast::NONE,
+			formal,
+			oxc::ast::NONE,
+			function_body,
+			&self.ast,
+		);
+		self.call1(arrow, operand)
+	}
+
+	/// The saturating JS runtime mapping for a numeric `ScalarCast` (the change
+	/// that supersedes Slice 4K's plain `Math.trunc` passthrough): Nymph defines
+	/// its own float→int/uint semantics rather than inheriting JS's (`Math.trunc`
+	/// passes `NaN`/`±Infinity` straight through) or Rust's (`as` saturates, but
+	/// isn't reproducible on JS numbers as-is). Builds an `arrow_iife` around
+	/// `operand` — evaluating it exactly once — with `t` (a gensym) standing in
+	/// for it in the body:
+	///
+	/// * `unsigned == false` (`float as int`): `Number.isNaN(t) ? 0 : t ===
+	///   Infinity ? i64::MAX : t === -Infinity ? i64::MIN : Math.trunc(t)`.
+	/// * `unsigned == true` (`float as uint` / `int as uint`): `t` is
+	///   `Math.abs`-ed first, so `-Infinity` collapses onto the same `Infinity`
+	///   branch as `+Infinity`, and a negative finite value (or a negative `int`)
+	///   saturates to its absolute value: `Number.isNaN(a) ? 0 : a === Infinity ?
+	///   i64::MAX : Math.trunc(a)` where `a = Math.abs(t)`.
+	fn saturating_scalar_cast(&self, operand: Expression<'a>, unsigned: bool) -> Expression<'a> {
+		let param = self.gensym();
+		let param = self.ast.allocator.alloc_str(&param);
+		let max = self.i64_literal(i64::MAX);
+
+		let body = if unsigned {
+			let is_nan = self.number_is_nan(self.math_call("abs", self.ident(param)));
+			let is_inf = self.strict_eq(
+				self.math_call("abs", self.ident(param)),
+				self.ident("Infinity"),
+			);
+			let trunc = self.math_call("trunc", self.math_call("abs", self.ident(param)));
+			Expression::new_conditional_expression(
+				SPAN,
+				is_nan,
+				self.zero(),
+				Expression::new_conditional_expression(SPAN, is_inf, max, trunc, &self.ast),
+				&self.ast,
+			)
+		} else {
+			let is_nan = self.number_is_nan(self.ident(param));
+			let is_pos_inf = self.strict_eq(self.ident(param), self.ident("Infinity"));
+			let is_neg_inf = self.strict_eq(self.ident(param), self.neg_infinity());
+			let min = self.i64_literal(i64::MIN);
+			let trunc = self.math_call("trunc", self.ident(param));
+			Expression::new_conditional_expression(
+				SPAN,
+				is_nan,
+				self.zero(),
+				Expression::new_conditional_expression(
+					SPAN,
+					is_pos_inf,
+					max,
+					Expression::new_conditional_expression(SPAN, is_neg_inf, min, trunc, &self.ast),
+					&self.ast,
+				),
+				&self.ast,
+			)
+		};
+
+		self.arrow_iife(param, body, operand)
+	}
+
 	fn emit_expr(&self, expr: &HirExpr) -> Expression<'a> {
 		match expr {
 			HirExpr::Num(value) => {
@@ -799,6 +1052,28 @@ impl<'a> Emitter<'a> {
 				}
 				Expression::new_call_expression(SPAN, callee, oxc::ast::NONE, arguments, false, &self.ast)
 			}
+			// Gap 3 (L0/L1): a call resolved through the linkage registry —
+			// `module`/`symbol` are already the resolved `Linked` fields
+			// (lowering did the receiver-tag-disambiguated lookup; see
+			// `HirExpr::ExternCall`'s own doc comment for why emit never
+			// re-`lookup`s by marker). Emit a plain call to the linked JS
+			// symbol, `$_this`-first (`args` already carries the receiver as
+			// its first element), and record the `(module, symbol)` pair so
+			// `emit_module` can prepend the `import` it needs.
+			HirExpr::ExternCall {
+				module,
+				symbol,
+				args,
+			} => {
+				self.needed_imports.borrow_mut().insert((*module, *symbol));
+				let callee =
+					Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(symbol), &self.ast);
+				let mut arguments = ArenaVec::new_in(&self.ast);
+				for arg in args {
+					arguments.push(Argument::from(self.emit_expr(arg)));
+				}
+				Expression::new_call_expression(SPAN, callee, oxc::ast::NONE, arguments, false, &self.ast)
+			}
 			// A tuple/list literal → a JS array `[a, b, …]`.
 			HirExpr::Array(items) => {
 				let mut elems = ArenaVec::new_in(&self.ast);
@@ -806,6 +1081,26 @@ impl<'a> Emitter<'a> {
 					elems.push(ArrayExpressionElement::from(self.emit_expr(item)));
 				}
 				Expression::new_array_expression(SPAN, elems, &self.ast)
+			}
+			// A list literal with at least one spread element (SS1) → a JS array
+			// `[a, ...xs, b]`, preserving left-to-right source order. Each
+			// `HirArrayElem::Spread` payload is already a JS-array-valued
+			// expression (a native source or a `lower_spread_source` drain IIFE),
+			// so it always emits with JS spread syntax.
+			HirExpr::ArraySpread(elems) => {
+				let mut arr = ArenaVec::new_in(&self.ast);
+				for elem in elems {
+					match elem {
+						HirArrayElem::Item(e) => arr.push(ArrayExpressionElement::from(self.emit_expr(e))),
+						HirArrayElem::Spread(e) => {
+							let argument = self.emit_expr(e);
+							arr.push(ArrayExpressionElement::new_spread_element(
+								SPAN, argument, &self.ast,
+							));
+						}
+					}
+				}
+				Expression::new_array_expression(SPAN, arr, &self.ast)
 			}
 			// A map literal → `new Map([[k, v], …])`.
 			HirExpr::MapLit(pairs) => {
@@ -816,6 +1111,38 @@ impl<'a> Emitter<'a> {
 					pair.push(ArrayExpressionElement::from(self.emit_expr(v)));
 					let arr = Expression::new_array_expression(SPAN, pair, &self.ast);
 					entries.push(ArrayExpressionElement::from(arr));
+				}
+				let outer = Expression::new_array_expression(SPAN, entries, &self.ast);
+				let callee = Expression::new_identifier(SPAN, "Map", &self.ast);
+				let mut args = ArenaVec::new_in(&self.ast);
+				args.push(Argument::from(outer));
+				Expression::new_new_expression(SPAN, callee, oxc::ast::NONE, args, &self.ast)
+			}
+			// A map literal with at least one spread entry (SS1) → `new Map([...])`
+			// merging the spread entries in, left-to-right (a later duplicate key
+			// wins — the `Map` constructor processes its entries array in order,
+			// SS4). Each `HirMapElem::Spread` payload is already an array of
+			// `[k, v]` pairs (a native `Map` — iterates as `[k, v]` pairs — or a
+			// `lower_spread_source` drain IIFE), so it always emits with JS spread
+			// syntax inside the entries array.
+			HirExpr::MapSpread(elems) => {
+				let mut entries = ArenaVec::new_in(&self.ast);
+				for elem in elems {
+					match elem {
+						HirMapElem::Entry(k, v) => {
+							let mut pair = ArenaVec::new_in(&self.ast);
+							pair.push(ArrayExpressionElement::from(self.emit_expr(k)));
+							pair.push(ArrayExpressionElement::from(self.emit_expr(v)));
+							let arr = Expression::new_array_expression(SPAN, pair, &self.ast);
+							entries.push(ArrayExpressionElement::from(arr));
+						}
+						HirMapElem::Spread(e) => {
+							let argument = self.emit_expr(e);
+							entries.push(ArrayExpressionElement::new_spread_element(
+								SPAN, argument, &self.ast,
+							));
+						}
+					}
 				}
 				let outer = Expression::new_array_expression(SPAN, entries, &self.ast);
 				let callee = Expression::new_identifier(SPAN, "Map", &self.ast);
@@ -911,14 +1238,69 @@ impl<'a> Emitter<'a> {
 			}
 			HirExpr::Assign { target, value } => {
 				let value_expr = self.emit_expr(value);
-				let name = match target.as_ref() {
-					HirExpr::Local(n) => self.ast.allocator.alloc_str(n),
-					_ => unreachable!("slice-1 assignment targets are identifiers"),
+				// A `Map` target has no JS assignment-expression form at all — `m[k] =
+				// v` on a real `Map` would silently set an own property on the `Map`
+				// object rather than mutating its entries — so it lowers to a
+				// `.set(key, value)` call instead of an `AssignmentTarget` (confirmed
+				// reachable: `infer_assign`'s field/index arm, infer_expr.rs, accepts
+				// any place expression including `IndexAccess` with no restriction,
+				// and a `Map`-typed receiver's `IndexAccess` lowers to
+				// `HirExpr::MapGet` just like a read, lower_hir.rs — so `m[k] = v`
+				// reaches here as `Assign { target: MapGet { .. }, .. }` from a
+				// zero-diagnostic program).
+				if let HirExpr::MapGet { recv, key } = target.as_ref() {
+					let object = self.emit_expr(recv);
+					let key_expr = self.emit_expr(key);
+					return self.member_call(object, "set", vec![key_expr, value_expr]);
+				}
+				// Slice 4J, Task 2: a plain `this.field = value` assignment (a
+				// `mut func` — or, per the checker's own permissiveness, ANY
+				// method's — field mutation) lowers to `HirExpr::Assign { target:
+				// Field { .. }, .. }` and reaches here from a zero-diagnostic
+				// program (the checker imposes no mutability restriction beyond
+				// an ordinary field-assignment target, confirmed by probe). A
+				// member-expression target needs its own `AssignmentTarget`
+				// (`SimpleAssignmentTarget` inherits `MemberExpression`), not the
+				// identifier-only path `HirExpr::Local` uses.
+				//
+				// A list/tuple subscript target (`xs[i] = value`) is the same shape
+				// but with a COMPUTED member (`SimpleAssignmentTarget` also inherits
+				// `ComputedMemberExpression`) — confirmed reachable the same way as
+				// the `Map` case above: a non-`Map` receiver's `IndexAccess` lowers to
+				// `HirExpr::Index` (lower_hir.rs), so `xs[i] = value` reaches here as
+				// `Assign { target: Index { .. }, .. }` from a zero-diagnostic
+				// program. This `unreachable!` used to fire (an ICE) on exactly that
+				// valid input (confirmed by probe: `func f(xs: #[int], i: int): void
+				// = { xs[i] = 5 }` type-checks with zero diagnostics yet panicked
+				// here) — this codebase never treats a crash on valid input as an
+				// acceptable substitute for correct codegen.
+				let assignment_target = match target.as_ref() {
+					HirExpr::Local(n) => self.assign_target(self.ast.allocator.alloc_str(n)),
+					HirExpr::Field { recv, name } => {
+						let object = self.emit_expr(recv);
+						let member = StaticMemberExpression::boxed(
+							SPAN,
+							object,
+							IdentifierName::new(SPAN, self.ast.allocator.alloc_str(name), &self.ast),
+							false,
+							&self.ast,
+						);
+						AssignmentTarget::from(MemberExpression::StaticMemberExpression(member))
+					}
+					HirExpr::Index { recv, index } => {
+						let object = self.emit_expr(recv);
+						let property = self.emit_expr(index);
+						let member = ComputedMemberExpression::boxed(SPAN, object, property, false, &self.ast);
+						AssignmentTarget::from(MemberExpression::ComputedMemberExpression(member))
+					}
+					other => unreachable!(
+						"lowering never produces an assignment target other than a local, a field access, a list/tuple subscript, or a map index (got {other:?})"
+					),
 				};
 				Expression::new_assignment_expression(
 					SPAN,
 					AssignmentOperator::Assign,
-					self.assign_target(name),
+					assignment_target,
 					value_expr,
 					&self.ast,
 				)
@@ -943,7 +1325,106 @@ impl<'a> Emitter<'a> {
 				self.in_iife_subexpr.set(prev);
 				result
 			}
+			// A built-in `as` cast's JS runtime mapping (Slice 4K, extended by the
+			// saturating-cast change) — see `HirExpr::ScalarCast`'s doc comment for
+			// why these are dedicated calls rather than composed `Field`/`Call`
+			// nodes over a `Local("Math"/"String"/"Number")` (shadow-proofing a user
+			// local of that name).
+			HirExpr::ScalarCast { kind, operand } => {
+				let operand = self.emit_expr(operand);
+				match kind {
+					ScalarCastKind::SaturatingToInt => self.saturating_scalar_cast(operand, false),
+					ScalarCastKind::SaturatingToUInt => self.saturating_scalar_cast(operand, true),
+					ScalarCastKind::CharToNum => {
+						let zero =
+							Expression::new_numeric_literal(SPAN, 0.0, None, NumberBase::Decimal, &self.ast);
+						self.member_call(operand, "codePointAt", vec![zero])
+					}
+					ScalarCastKind::NumToChar => {
+						let string = Expression::new_identifier(SPAN, "String", &self.ast);
+						self.member_call(string, "fromCodePoint", vec![operand])
+					}
+					ScalarCastKind::FloatToChar => {
+						let math = Expression::new_identifier(SPAN, "Math", &self.ast);
+						let truncated = self.member_call(math, "trunc", vec![operand]);
+						let string = Expression::new_identifier(SPAN, "String", &self.ast);
+						self.member_call(string, "fromCodePoint", vec![truncated])
+					}
+				}
+			}
+			// A closure → a JS arrow function `(<params>) => { … }` (Slice 4L).
+			HirExpr::Closure { params, body } => self.closure_arrow(params, body),
 		}
+	}
+
+	/// `(<params>) => { <body stmts>; return <tail>; }` — a closure's arrow
+	/// function (Slice 4L). Mirrors `emit_func`'s body split exactly: a `Block`
+	/// body's own statements/tail flatten directly into the arrow's
+	/// `FunctionBody` (no needless nested IIFE), any other body becomes a
+	/// single `return <expr>;`.
+	///
+	/// Saves and resets `in_iife_subexpr` to `false` around the body emission —
+	/// the arrow is a real function boundary, exactly like `emit_func`'s
+	/// top-level function body implicitly is (that path never sets the flag at
+	/// all). Lowering already rejects every `return` lexically inside a closure
+	/// body (Slice 4L, JJ2), so no `HirStmt::Return` can actually reach this
+	/// boundary today — but it's the correct boundary story regardless (a
+	/// closure built while emitting an enclosing subexpression-position
+	/// construct, e.g. a closure passed as a call argument inside a match arm
+	/// used as a subexpression, must not inherit that outer IIFE's `return`
+	/// target), and it stops being merely defensive the moment closure-scoped
+	/// `return` is ever allowed.
+	fn closure_arrow(&self, params: &[ecow::EcoString], body: &HirExpr) -> Expression<'a> {
+		let prev = self.in_iife_subexpr.replace(false);
+		let mut body_stmts = ArenaVec::new_in(&self.ast);
+		match body {
+			HirExpr::Block { .. } => {
+				let value = self.emit_value(body);
+				body_stmts.extend(value.stmts);
+				body_stmts.push(Statement::new_return_statement(
+					SPAN,
+					Some(value.expr),
+					&self.ast,
+				));
+			}
+			other => {
+				let body_expr = self.emit_expr(other);
+				body_stmts.push(Statement::new_return_statement(
+					SPAN,
+					Some(body_expr),
+					&self.ast,
+				));
+			}
+		}
+		self.in_iife_subexpr.set(prev);
+
+		let mut js_params = ArenaVec::new_in(&self.ast);
+		for param in params {
+			let binding_pattern = BindingPattern::new_binding_identifier(
+				SPAN,
+				self.ast.allocator.alloc_str(param),
+				&self.ast,
+			);
+			js_params.push(FormalParameter::new_plain(SPAN, binding_pattern, &self.ast));
+		}
+		let formal = FormalParameters::new(
+			SPAN,
+			FormalParameterKind::ArrowFormalParameters,
+			js_params,
+			oxc::ast::NONE,
+			&self.ast,
+		);
+		let function_body = FunctionBody::new(SPAN, ArenaVec::new_in(&self.ast), body_stmts, &self.ast);
+		Expression::new_arrow_function_expression(
+			SPAN,
+			false,
+			false,
+			oxc::ast::NONE,
+			formal,
+			oxc::ast::NONE,
+			function_body,
+			&self.ast,
+		)
 	}
 
 	/// A simple-identifier assignment target for `<name> = …`.
@@ -1282,6 +1763,30 @@ impl<'a> Emitter<'a> {
 					self.member_call(arr, "slice", vec![start_lit, end])
 				}
 			}
+			Subject::MapRest(base, keys) => {
+				let map_expr = self.emit_subject(base);
+				let callee = Expression::new_identifier(SPAN, "Map", &self.ast);
+				let mut args = ArenaVec::new_in(&self.ast);
+				args.push(Argument::from(map_expr));
+				let new_map = Expression::new_new_expression(SPAN, callee, oxc::ast::NONE, args, &self.ast);
+				if keys.is_empty() {
+					return new_map;
+				}
+				// `(() => { const _tN = new Map(<base>); _tN.delete(<k1>); ...; return _tN; })()`
+				let tmp = self.ast.allocator.alloc_str(&self.gensym());
+				let mut stmts = ArenaVec::new_in(&self.ast);
+				stmts.push(self.const_decl(tmp, new_map));
+				for key in keys {
+					let m_ident = Expression::new_identifier(SPAN, tmp, &self.ast);
+					let del = self.member_call(m_ident, "delete", vec![self.emit_lit(key)]);
+					stmts.push(Statement::new_expression_statement(SPAN, del, &self.ast));
+				}
+				let value = JsValue {
+					stmts,
+					expr: Expression::new_identifier(SPAN, tmp, &self.ast),
+				};
+				value.into_expression(self.ast)
+			}
 		}
 	}
 
@@ -1458,8 +1963,8 @@ impl<'a> Emitter<'a> {
 				(test, binds)
 			}
 			// A map pattern: for each `key: vpat`, test `_s.has(key)` and match `vpat`
-			// against `_s.get(key)`.
-			HirPat::Map(entries) => {
+			// against `_s.get(key)`; an optional `...rest` binds the rest-of-map.
+			HirPat::Map { entries, rest } => {
 				let mut test: Option<Expression<'a>> = None;
 				let mut binds = Vec::new();
 				for (key, vpat) in entries {
@@ -1469,6 +1974,11 @@ impl<'a> Emitter<'a> {
 					let (t, mut b) = self.compile_pat(vpat, &val);
 					binds.append(&mut b);
 					test = self.and_test(test, t);
+				}
+				if let Some(Some(name)) = rest {
+					let keys = entries.iter().map(|(k, _)| k.clone()).collect();
+					let rest_subj = Subject::MapRest(Box::new(subj.clone()), keys);
+					binds.push((name.to_string(), rest_subj));
 				}
 				(test, binds)
 			}

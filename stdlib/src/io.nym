@@ -1,0 +1,2 @@
+public external(print) func print(x: string): void
+public external(println) func println(x: string): void

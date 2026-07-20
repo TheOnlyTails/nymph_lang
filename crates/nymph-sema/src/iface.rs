@@ -16,7 +16,7 @@ use crate::errors::TypeError;
 use ecow::EcoString;
 use nymph_ast::{
 	Ident, Span, Spanned,
-	decl::{Declaration, FuncDeclaration, ImplMember, StructInnerMember},
+	decl::{Declaration, FuncDeclaration, FuncKind, ImplMember, StructImpl},
 	ty::{GenericArg, GenericParam, Type},
 };
 use rustc_hash::FxHashMap;
@@ -33,6 +33,13 @@ use crate::ty::{GenericArgs, Interner, Ty, TyKind};
 pub struct IfaceMethod {
 	pub params: Vec<Ty>,
 	pub ret: Ty,
+	/// Whether this method is declared `mut func` (needs a `mut` receiver) rather
+	/// than plain `func`. On an [`InterfaceDef`]'s copy this is the SOURCE OF
+	/// TRUTH (MT2, OO1) that every call-site gate (`solve.rs`) consults; on an
+	/// [`ImplDef`]'s copy it is the impl's own restatement, compared against the
+	/// interface's declaration at collection time (OO2) and otherwise unused for
+	/// gating (the interface's copy is what's authoritative).
+	pub mutating: bool,
 }
 
 /// A collected `interface`.
@@ -103,6 +110,9 @@ pub fn head_of(interner: &Interner, ty: Ty) -> Option<Head> {
 		TyKind::Map(..) => Some(Head::Map),
 		TyKind::Fn { .. } => Some(Head::Fn),
 		TyKind::Adt(def, _) => Some(Head::Adt(*def)),
+		// `mut` is transparent to method/impl dispatch in MT1 — per-method mut
+		// availability (which methods a `mut` receiver additionally unlocks) is MT2.
+		TyKind::Mut(inner) => head_of(interner, *inner),
 		TyKind::Param(_)
 		| TyKind::Infer(_)
 		| TyKind::SelfTy
@@ -214,6 +224,7 @@ impl Checker<'_> {
 		let module = self.module;
 		let Declaration::ImplFor {
 			generics,
+			mutable,
 			type_,
 			for_interface,
 			members,
@@ -227,7 +238,23 @@ impl Checker<'_> {
 
 		self.push_params(build_param_scope(generics));
 		let self_ty = self.lower_type(type_);
-		let constraints = self.lower_constraints(generics);
+		// OO4/OO5 (MT2): `impl A for mut B` and `impl mut A for B` are the SAME
+		// feature under two spellings (design ruling: "`impl mut A for B` = mut
+		// applies to BOTH A and B (same effect: only mut B)") — the interface is
+		// implemented ONLY for the mutable view of the type. `impl A for mut B`
+		// already lowers `type_` to `TyKind::Mut(B)` above (nothing to do); `impl
+		// mut A for B` instead sets this header-level `mutable` flag with a PLAIN
+		// `type_`, so normalize it here to the same `Mut(B)` self type — every
+		// downstream consumer (the impl registry, receiver matching, bound
+		// satisfaction via `holds`) then only has to understand one shape.
+		// `mk_mut` never nests, so `impl mut A for mut B` (redundant but
+		// harmless) collapses to the same single `Mut(B)`.
+		let self_ty = if *mutable {
+			self.interner.mk_mut(self_ty)
+		} else {
+			self_ty
+		};
+		let constraints = self.lower_constraints(generics, 0);
 		self.finish_interface_impl(names, self_ty, iface_name, iface_args, members, constraints);
 		self.pop_params();
 	}
@@ -254,24 +281,22 @@ impl Checker<'_> {
 
 	fn collect_adt_inner_impls(&mut self, def: DefId, member: usize) {
 		let module = self.module;
-		let (generics, members) = match &module.members[member] {
+		let (generics, impls) = match &module.members[member] {
 			Declaration::Struct {
-				generics, members, ..
-			} => (generics.as_slice(), members.as_slice()),
+				generics, impls, ..
+			} => (generics.as_slice(), impls.as_slice()),
 			Declaration::Enum {
-				generics, members, ..
-			} => (generics.as_slice(), members.as_slice()),
+				generics, impls, ..
+			} => (generics.as_slice(), impls.as_slice()),
 			_ => return,
 		};
-		for m in members {
-			if let StructInnerMember::Impl {
+		for m in impls {
+			let StructImpl {
 				interface,
 				generics: impl_generics,
 				members: impl_members,
-			} = &m.0
-			{
-				self.collect_inner_impl(def, generics, interface, impl_generics, impl_members);
-			}
+			} = &m.0;
+			self.collect_inner_impl(def, generics, interface, impl_generics, impl_members);
 		}
 	}
 
@@ -300,7 +325,7 @@ impl Checker<'_> {
 			.interner
 			.mk_adt(def, GenericArgs::new(positional, Vec::new()));
 		let (iface_name, iface_args) = interface;
-		let constraints = self.lower_constraints(&combined);
+		let constraints = self.lower_constraints(&combined, 0);
 		self.finish_interface_impl(names, self_ty, iface_name, iface_args, members, constraints);
 		self.pop_params();
 	}
@@ -360,12 +385,67 @@ impl Checker<'_> {
 		}
 
 		let mut methods = FxHashMap::default();
+		// `IfaceMethod` carries no span (unlike `InherentMethod`'s `meta`), so track
+		// each name's first-seen span in a side map local to this one impl block —
+		// just enough for `DuplicateMember`'s `prev` label.
+		let mut first_seen: FxHashMap<EcoString, Span> = FxHashMap::default();
+		// The self type's inherent methods, if it's a struct/enum (`Head::Adt`) —
+		// collected before impls (see `check_module_impl`, check.rs) precisely so
+		// this cross-check has data to query. Closes the HH3 ICE: an interface-impl
+		// method (top-level `impl … for` or a nested `impl Iface { .. }`) of the
+		// same name as the ADT's own inherent method used to type-check clean (the
+		// two collection passes never compared notes) and only panicked later in
+		// `lower_hir.rs`'s `assert_no_duplicate_methods` — which walks exactly this
+		// combined method list for a struct/enum's *generated JS class*. Deliberately
+		// scoped to `Head::Adt`: builtin scalar/collection types (e.g. `string`) never
+		// materialize a JS class this way, so an inherent method and an interface-impl
+		// method of the same name on them (see `stdlib/src/string.nym`'s `contains`,
+		// both an inherent `external` method AND a `Contains` impl) is ordinary
+		// overloading, not a collision — flagging it here would be a false positive.
+		let inherent_head = head_of(&self.interner, self_ty).filter(|h| matches!(h, Head::Adt(_)));
 		for m in members {
 			let meta = match &m.0 {
 				ImplMember::Func { meta, .. } => meta,
 				ImplMember::ExternalFunc(_, _, meta) => meta,
 				ImplMember::Let { .. } | ImplMember::ExternalLet(..) => continue,
 			};
+			// A same-named method declared twice inside ONE `impl Iface { .. }`/`impl
+			// Iface for T { .. }` block used to silently last-wins here (mirrored by
+			// the `methods.insert` below), leaving the first body entirely unchecked
+			// while `lower_hir.rs` emits every one it walks — the same soundness hole
+			// `collect_impl_member` (members.rs) closes for inherent members. This is
+			// the shared insert point for BOTH top-level `impl … for` and nested
+			// `impl Iface { .. }` (both funnel through `finish_interface_impl`), so
+			// guarding here covers a within-block duplicate in either shape at once.
+			if let Some(&prev) = first_seen.get(&meta.name.0) {
+				let ty = self.display(self_ty);
+				self.emit(
+					meta.name.1,
+					TypeError::DuplicateMember {
+						name: meta.name.0.clone(),
+						ty,
+						redefined_span: meta.name.1,
+						prev,
+					},
+				);
+			} else {
+				first_seen.insert(meta.name.0.clone(), meta.name.1);
+				// Only check the type's inherent methods on this name's first
+				// appearance in the block — an already-reported within-block
+				// duplicate needn't also be reported against the inherent method.
+				if let Some(prev) = inherent_head.and_then(|h| self.inherent.method_span(h, &meta.name.0)) {
+					let ty = self.display(self_ty);
+					self.emit(
+						meta.name.1,
+						TypeError::DuplicateMember {
+							name: meta.name.0.clone(),
+							ty,
+							redefined_span: meta.name.1,
+							prev,
+						},
+					);
+				}
+			}
 			let params = meta
 				.params
 				.iter()
@@ -375,7 +455,46 @@ impl Checker<'_> {
 				Some(ty) => self.lower_type(ty),
 				None => self.interface_method_ret(interface, &meta.name.0, &isubst, self_ty),
 			};
-			methods.insert(meta.name.0.clone(), IfaceMethod { params, ret });
+			let mutating = meta.kind == FuncKind::Mut;
+			// OO2 (MT2): a plain-target impl (`impl A for B`, not `for mut B`)
+			// restates each method's `mut func`/`func` kind and it must MATCH the
+			// interface's own declaration — the interface is the source of truth
+			// every call-site gate (`solve.rs`) reads, so a mismatched restatement
+			// here would silently desync what the impl body actually requires
+			// (`this: mut Self` or not, `members.rs`) from what callers are gated
+			// against. Skipped for a `Mut` self type (`impl A for mut B` / `impl
+			// mut A for B`, OO4/OO5): there, EVERY method of `A` requires a `mut`
+			// receiver by construction (the interface is only reachable through
+			// the mutable view at all), so per-method kind restatement inside the
+			// impl body doesn't carry the same meaning and isn't checked against
+			// the interface's declared kind.
+			let self_ty_is_mut = matches!(self.interner.kind(self_ty), TyKind::Mut(_));
+			if !self_ty_is_mut
+				&& let Some(expected) = self
+					.interfaces
+					.get(&interface)
+					.and_then(|i| i.methods.get(&meta.name.0))
+					.map(|m| m.mutating)
+				&& expected != mutating
+			{
+				let ty = self.display(self_ty);
+				self.emit(
+					meta.name.1,
+					TypeError::MethodMutMismatch {
+						name: meta.name.0.clone(),
+						ty,
+						expected_mut: expected,
+					},
+				);
+			}
+			methods.insert(
+				meta.name.0.clone(),
+				IfaceMethod {
+					params,
+					ret,
+					mutating,
+				},
+			);
 		}
 
 		let blanket = matches!(self.interner.kind(self_ty), TyKind::Param(_));
@@ -427,7 +546,11 @@ impl Checker<'_> {
 			Some(ty) => self.lower_type(ty),
 			None => self.interner.void(),
 		};
-		IfaceMethod { params, ret }
+		IfaceMethod {
+			params,
+			ret,
+			mutating: meta.kind == FuncKind::Mut,
+		}
 	}
 
 	/// Align an interface reference's generic arguments to the interface's parameter
@@ -456,15 +579,21 @@ impl Checker<'_> {
 	}
 
 	/// Collect the interface bounds declared on a generic parameter list into solver
-	/// obligations (`Param(i): Interface<…>`).
+	/// obligations (`Param(base + i): Interface<…>`). `base` offsets the target past
+	/// any generics already occupying `0..base` in the active scope (e.g. a method's
+	/// own generics, lowered after its owner's) — every existing caller that has no
+	/// such prefix passes `0`.
 	pub(crate) fn lower_constraints(
 		&mut self,
 		generics: &[Spanned<nymph_ast::ty::GenericParam>],
+		base: usize,
 	) -> Vec<Bound> {
 		let mut out = Vec::new();
 		for (i, g) in generics.iter().enumerate() {
 			if let Some(constraint) = &g.0.constraint {
-				let target = self.interner.mk_param(crate::ids::ParamIdx(i as u32));
+				let target = self
+					.interner
+					.mk_param(crate::ids::ParamIdx((base + i) as u32));
 				self.lower_bound_into(constraint, target, &mut out);
 			}
 		}

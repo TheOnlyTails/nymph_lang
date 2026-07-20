@@ -13,5 +13,5 @@ proc-macro = true
 
 [dependencies]
 nymph-diagnostics = { workspace = true }
-syn = "2.0.118"
-quote = "1.0.46"
+syn = "3.0.0"
+quote = "1.0.47"

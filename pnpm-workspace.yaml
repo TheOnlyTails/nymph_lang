@@ -3,15 +3,11 @@ packages:
   - extension
 
 allowBuilds:
-  '@vscode/vsce-sign': set this to true or false
-  esbuild: set this to true or false
-  keytar: set this to true or false
+  '@vscode/vsce-sign': true
+  esbuild: true
 
 catalog:
-  oxfmt: ^0.26.0
-  oxlint: ^1.41.0
-  oxlint-tsgolint: ^0.11.1
+  oxfmt: ^0.59.0
+  oxlint: ^1.74.0
+  oxlint-tsgolint: ^0.24.0
   prettier: ^3.5.3
-
-onlyBuiltDependencies:
-  - "@vscode/vsce-sign"

@@ -18,9 +18,11 @@
 //! match exhaustiveness) is layered on top later.
 
 mod annotate;
+mod anon_closure;
 mod check;
 mod coerce;
 mod def;
+mod entry;
 mod errors;
 mod exhaustive;
 mod iface;
@@ -29,12 +31,15 @@ mod infer_pattern;
 mod lower;
 mod lower_hir;
 mod members;
+mod prelude;
+pub mod query;
 mod solve;
 mod unify;
 
-pub use annotate::{Annotations, Checked, DispatchKind, ExprInfo, Resolution};
-pub use check::{check_module, check_program};
+pub use annotate::{Annotations, Checked, DispatchKind, ExprInfo, IterMode, Resolution};
+pub use check::{check_module, check_module_entry, check_program};
 pub use errors::TypeError;
-pub use lower_hir::lower_hir;
+pub use lower_hir::{lower_hir, lower_hir_with_prelude};
 pub use nymph_hir::ids::{self, DefId, InferVar, ParamIdx};
 pub use nymph_hir::ty::{self, GenericArgs, Interner, Ty, TyKind};
+pub use prelude::{check_module_entry_with_prelude, check_module_with_prelude};

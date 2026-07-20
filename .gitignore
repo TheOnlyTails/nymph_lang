@@ -3,3 +3,9 @@ target
 node_modules
 docs/.vitepress/dist
 docs/.vitepress/cache
+
+# Internal agent progress trackers (specs, plans, ledgers) — not shipped
+docs/superpowers/
+.superpowers/
+docs/interface_solver_progress.md
+PLAN.md

@@ -5,7 +5,7 @@
 //! converts them into LSP diagnostics. Keeping one type here means neither backend
 //! leaks into the compiler crates.
 
-use ariadne::{Color, Label as AriadneLabel, Report, ReportKind, Source};
+use ariadne::{Color, Config, IndexType, Label as AriadneLabel, Report, ReportKind, Source};
 use ecow::EcoString;
 use nymph_ast::Span;
 
@@ -170,6 +170,7 @@ pub fn render(filename: &str, source: &str, diagnostics: &[Diagnostic]) -> Strin
 			report_kind(diagnostic.severity),
 			(filename, range(diagnostic.span)),
 		)
+		.with_config(Config::default().with_index_type(IndexType::Byte))
 		.with_message(diagnostic.message.as_str());
 
 		builder = builder.with_code(diagnostic.code.as_str());

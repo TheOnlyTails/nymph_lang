@@ -47,6 +47,10 @@ pub fn substitute_params(interner: &mut Interner, ty: Ty, subst: &FxHashMap<Para
 			let parts = substitute_each(interner, &parts, subst);
 			interner.mk_intersection(parts)
 		}
+		TyKind::Mut(inner) => {
+			let inner = substitute_params(interner, inner, subst);
+			interner.mk_mut(inner)
+		}
 
 		// Primitives, `self`, inference variables, error, and unmapped params are
 		// all leaves with nothing to rewrite.
@@ -110,6 +114,7 @@ pub fn occurs(interner: &Interner, var: InferVar, ty: Ty) -> bool {
 			args.positional.iter().any(|&t| occurs(interner, var, t))
 				|| args.named.iter().any(|(_, t)| occurs(interner, var, *t))
 		}
+		TyKind::Mut(inner) => occurs(interner, var, *inner),
 		TyKind::Int
 		| TyKind::UInt
 		| TyKind::Float

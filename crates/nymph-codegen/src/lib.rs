@@ -3,9 +3,12 @@
 #![warn(clippy::all)]
 
 mod emit;
+mod strip;
 
 use nymph_diagnostics::Diagnostic;
 use nymph_hir::hir::HirModule;
+
+pub use strip::strip_ts_to_js;
 
 /// Emit an ES module string for `module`.
 pub fn emit(module: &HirModule) -> String {

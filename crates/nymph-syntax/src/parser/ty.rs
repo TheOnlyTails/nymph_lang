@@ -25,6 +25,19 @@ impl Parser<'_> {
 
 	fn parse_type_primary(&mut self) -> Spanned<Type> {
 		let start = self.position();
+
+		// `mut T` — nests at primary level (not the outer `+` loop) so it can wrap
+		// anywhere a primary type can appear: map values, list elements, generic
+		// args, fn params/returns. `mut A + B` therefore parses as `(mut A) + B`;
+		// `mut (A + B)` needs explicit parens. Distinct from binding-position
+		// `mut` (`let mut`, `mut` params), which is always consumed before the `:`
+		// / `->` that precedes any type, so there is no ambiguity here.
+		if self.check(&Token::Mut) {
+			self.advance();
+			let inner = self.parse_type_primary();
+			return Spanned(Type::Mut(Box::new(inner)), self.span_from(start));
+		}
+
 		let Some(token) = self.peek() else {
 			let span = self.current_span();
 			self.emit(span, ParseError::ExpectedTypeFoundEof);

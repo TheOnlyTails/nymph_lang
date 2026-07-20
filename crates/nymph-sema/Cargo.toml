@@ -13,6 +13,7 @@ nymph-ast = { workspace = true }
 nymph-diagnostics = { workspace = true }
 nymph-errorcode = { workspace = true }
 nymph-hir = { workspace = true }
+nymph-syntax = { workspace = true }
 ecow = { workspace = true }
 ena = { workspace = true }
 ordered-float = { workspace = true }
@@ -20,7 +21,6 @@ rustc-hash = { workspace = true }
 
 [dev-dependencies]
 ecow = { workspace = true }
-nymph-syntax = { workspace = true }
 rustc-hash = { workspace = true }
 
 [lints.clippy]

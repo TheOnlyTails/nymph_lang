@@ -2,7 +2,7 @@ import { Option } from "../option";
 
 export const size = <K, V>($_this: Map<K, V>) => $_this.size;
 export const get = <K, V>($_this: Map<K, V>, key: K) =>
-	$_this.has(key) ? Option.Some($_this.get(key)!) : Option.None;
+	$_this.has(key) ? Option.Some({ value: $_this.get(key)! }) : Option.None;
 export const insert = <K, V>($_this: Map<K, V>, key: K, value: V): boolean => {
 	const existed = $_this.has(key);
 	$_this.set(key, value);
@@ -12,7 +12,7 @@ export const remove = <K, V>($_this: Map<K, V>, key: K) => {
 	if ($_this.has(key)) {
 		const value = $_this.get(key)!;
 		$_this.delete(key);
-		return Option.Some(value);
+		return Option.Some({ value });
 	}
 	return Option.None;
 };

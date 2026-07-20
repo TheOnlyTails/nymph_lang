@@ -5,9 +5,9 @@ use ecow::EcoString;
 use nymph_ast::{
 	Ident, Spanned,
 	decl::{
-		Declaration, EnumVariant, FuncDeclaration, FuncParam, ImplMember, ImportRoot, InterfaceElement,
-		InterfaceMember, LetDeclaration, StructField, StructInnerMember, TypeAliasDeclaration,
-		Visibility,
+		Declaration, EnumVariant, FuncDeclaration, FuncKind, FuncParam, ImplMember, ImportRoot,
+		InterfaceElement, InterfaceMember, LetDeclaration, LetKind, StructField, StructImpl,
+		TypeAliasDeclaration, Visibility,
 	},
 	expr::{Expr, ExprKind},
 	token::Token,
@@ -61,12 +61,52 @@ impl Parser<'_> {
 		match self.peek() {
 			Some(Token::External) => Some(self.parse_external(visibility)),
 			Some(Token::Let) => Some(self.parse_let_decl(visibility)),
-			Some(Token::Func) => Some(self.parse_func_decl(visibility)),
+			Some(Token::Func) => Some(self.parse_func_decl(visibility, FuncKind::Instance)),
+			// `mut func` at module level has no receiver to mutate — diagnose, but
+			// still parse it so recovery stays clean.
+			Some(Token::Mut) => {
+				self.emit(
+					self.current_span(),
+					ParseError::FuncKindOutsideType {
+						kind: "mut func".into(),
+					},
+				);
+				Some(self.parse_func_decl(visibility, FuncKind::Mut))
+			}
+			// `namespace` is overloaded: `namespace func …` / `namespace let …` are
+			// (misplaced at top level) namespaced members, while `namespace Name { … }`
+			// is a named namespace block. Disambiguate on the following token.
+			Some(Token::Namespace) => match self.peek_nth(1) {
+				Some(Token::Func) => {
+					self.emit(
+						self.current_span(),
+						ParseError::FuncKindOutsideType {
+							kind: "namespace func".into(),
+						},
+					);
+					Some(self.parse_func_decl(visibility, FuncKind::Namespace))
+				}
+				Some(Token::Let) => {
+					self.emit(
+						self.current_span(),
+						ParseError::FuncKindOutsideType {
+							kind: "namespace let".into(),
+						},
+					);
+					self.advance(); // `namespace`
+					let (meta, value) = self.parse_let_binding_kinded(true);
+					Some(Declaration::Let {
+						visibility,
+						meta,
+						value,
+					})
+				}
+				_ => Some(self.parse_namespace(visibility)),
+			},
 			Some(Token::Type) => Some(self.parse_type_alias(visibility)),
 			Some(Token::Struct) => Some(self.parse_struct(visibility)),
 			Some(Token::Enum) => Some(self.parse_enum(visibility)),
 			Some(Token::Interface) => Some(self.parse_interface(visibility)),
-			Some(Token::Namespace) => Some(self.parse_namespace(visibility)),
 			Some(Token::Impl) => Some(self.parse_impl(visibility)),
 			_ => {
 				let span = self.current_span();
@@ -111,6 +151,12 @@ impl Parser<'_> {
 			}
 		}
 
+		let alias = if self.eat(&Token::As).is_some() {
+			Some(self.expect_ident())
+		} else {
+			None
+		};
+
 		let idents = if self.eat(&Token::With).is_some() {
 			self.expect(&Token::LParen);
 			Some(self.comma_separated(&Token::RParen, |p| {
@@ -126,13 +172,35 @@ impl Parser<'_> {
 			None
 		};
 
-		Declaration::Import { root, path, idents }
+		Declaration::Import {
+			root,
+			path,
+			alias,
+			idents,
+		}
 	}
 
 	/// Parse `let [mut] pattern [: type] = expr`, shared by declarations and statements.
 	pub(super) fn parse_let_binding(&mut self) -> (LetDeclaration, Expr) {
+		self.parse_let_binding_kinded(false)
+	}
+
+	/// Parse a `[namespace] let [mut] …` binding. When `namespaced`, the caller has
+	/// already consumed the `namespace` keyword; a `mut` is then rejected (a static
+	/// binding can never be mutable — `namespace let mut` is unrepresentable).
+	fn parse_let_binding_kinded(&mut self, namespaced: bool) -> (LetDeclaration, Expr) {
 		self.advance(); // `let`
-		let mutable = self.eat(&Token::Mut).is_some();
+		let mut_span = self.eat(&Token::Mut);
+		let kind = if namespaced {
+			if let Some(span) = mut_span {
+				self.emit(span, ParseError::MutableNamespaceLet);
+			}
+			LetKind::Namespace
+		} else if mut_span.is_some() {
+			LetKind::Mut
+		} else {
+			LetKind::Instance
+		};
 		let name = self.parse_binding_pattern();
 		let type_ = if self.eat(&Token::Colon).is_some() {
 			Some(self.parse_type())
@@ -141,14 +209,7 @@ impl Parser<'_> {
 		};
 		self.expect(&Token::Eq);
 		let value = self.parse_expr();
-		(
-			LetDeclaration {
-				mutable,
-				name,
-				type_,
-			},
-			value,
-		)
+		(LetDeclaration { kind, name, type_ }, value)
 	}
 
 	fn parse_let_decl(&mut self, visibility: Option<Visibility>) -> Declaration {
@@ -160,8 +221,25 @@ impl Parser<'_> {
 		}
 	}
 
+	/// If the cursor is at the start of a function member — `func`, `mut func`, or
+	/// `namespace func` — return its [`FuncKind`], else `None`.
+	fn func_kind_here(&self) -> Option<FuncKind> {
+		match self.peek() {
+			Some(Token::Func) => Some(FuncKind::Instance),
+			Some(Token::Mut) if self.peek_nth(1) == Some(&Token::Func) => Some(FuncKind::Mut),
+			Some(Token::Namespace) if self.peek_nth(1) == Some(&Token::Func) => Some(FuncKind::Namespace),
+			_ => None,
+		}
+	}
+
 	/// Parse the signature `name<generics>(params) [: return_type]`.
-	fn parse_func_signature(&mut self) -> FuncDeclaration {
+	fn parse_func_signature(&mut self, kind: FuncKind) -> FuncDeclaration {
+		match kind {
+			FuncKind::Namespace | FuncKind::Mut => {
+				self.advance();
+			} // `namespace` or `mut`
+			FuncKind::Instance => {}
+		};
 		self.advance(); // `func`
 		let name = self.expect_ident();
 		let generics = self.parse_generic_params();
@@ -173,6 +251,7 @@ impl Parser<'_> {
 			None
 		};
 		FuncDeclaration {
+			kind,
 			name,
 			generics,
 			params,
@@ -198,8 +277,8 @@ impl Parser<'_> {
 		)
 	}
 
-	fn parse_func_decl(&mut self, visibility: Option<Visibility>) -> Declaration {
-		let meta = self.parse_func_signature();
+	fn parse_func_decl(&mut self, visibility: Option<Visibility>, kind: FuncKind) -> Declaration {
+		let meta = self.parse_func_signature(kind);
 		self.expect(&Token::Eq);
 		let body = self.parse_expr();
 		Declaration::Func {
@@ -219,14 +298,19 @@ impl Parser<'_> {
 			None
 		};
 
-		if self.check(&Token::Func) {
-			let meta = self.parse_func_signature();
+		if let Some(kind) = self.func_kind_here() {
+			// `external func`, `external mut func`, `external namespace func`.
+			let meta = self.parse_func_signature(kind);
 			let js_name = explicit_name.unwrap_or_else(|| meta.name.0.clone());
 			Declaration::ExternalFunc(visibility, js_name, meta)
 		} else {
 			// external let: `external(name) let x: T`
 			self.advance(); // `let`
-			let mutable = self.eat(&Token::Mut).is_some();
+			let kind = if self.eat(&Token::Mut).is_some() {
+				LetKind::Mut
+			} else {
+				LetKind::Instance
+			};
 			let name = self.parse_binding_pattern();
 			let type_ = if self.eat(&Token::Colon).is_some() {
 				Some(self.parse_type())
@@ -235,15 +319,7 @@ impl Parser<'_> {
 			};
 			let js_name = explicit_name
 				.unwrap_or_else(|| name.0.as_binding().map(|i| i.0.clone()).unwrap_or_default());
-			Declaration::ExternalLet(
-				visibility,
-				js_name,
-				LetDeclaration {
-					mutable,
-					name,
-					type_,
-				},
-			)
+			Declaration::ExternalLet(visibility, js_name, LetDeclaration { kind, name, type_ })
 		}
 	}
 
@@ -270,13 +346,13 @@ impl Parser<'_> {
 		} else {
 			Vec::new()
 		};
-		let members = if self.check(&Token::LBrace) {
+		let (members, impls) = if self.check(&Token::LBrace) {
 			self.advance();
 			let m = self.parse_inner_members();
 			self.expect(&Token::RBrace);
 			m
 		} else {
-			Vec::new()
+			(Vec::new(), Vec::new())
 		};
 		Declaration::Struct {
 			visibility,
@@ -284,12 +360,16 @@ impl Parser<'_> {
 			generics,
 			fields,
 			members,
+			impls,
 		}
 	}
 
 	fn parse_struct_field(&mut self) -> Spanned<StructField> {
 		let start = self.position();
 		let visibility = self.parse_visibility();
+		if let Some(span) = self.eat(&Token::Mut) {
+			self.emit(span, ParseError::MutFieldModifier);
+		}
 		let name = self.expect_ident();
 		self.expect(&Token::Colon);
 		let type_ = self.parse_type();
@@ -338,7 +418,7 @@ impl Parser<'_> {
 			}
 		}
 
-		let members = self.parse_inner_members();
+		let (members, impls) = self.parse_inner_members();
 		self.expect(&Token::RBrace);
 
 		Declaration::Enum {
@@ -347,39 +427,33 @@ impl Parser<'_> {
 			generics,
 			variants,
 			members,
+			impls,
 		}
 	}
 
-	/// Parse the members inside a `struct` / `enum` body (until, but not consuming, `}`).
-	fn parse_inner_members(&mut self) -> Vec<Spanned<StructInnerMember>> {
+	/// Parse the members inside a `struct` / `enum` body (until, but not consuming,
+	/// `}`), splitting flat members (instance / `mut` / `namespace` funcs and lets)
+	/// from nested interface `impl` blocks.
+	fn parse_inner_members(&mut self) -> (Vec<Spanned<ImplMember>>, Vec<Spanned<StructImpl>>) {
 		let mut members = Vec::new();
+		let mut impls = Vec::new();
 		while !self.check(&Token::RBrace) && !self.at_end() {
 			let start = self.position();
-			let member = if self.check(&Token::Namespace) {
+			if self.check(&Token::Impl) {
 				self.advance();
+				let generics = self.parse_generic_params();
+				let interface = self.parse_interface_ref();
 				self.expect(&Token::LBrace);
 				let inner = self.parse_impl_members();
 				self.expect(&Token::RBrace);
-				StructInnerMember::Namespace(inner)
-			} else if self.check(&Token::Impl) {
-				self.advance();
-				if self.eat(&Token::Mut).is_some() {
-					self.expect(&Token::LBrace);
-					let inner = self.parse_impl_members();
-					self.expect(&Token::RBrace);
-					StructInnerMember::ImplMut(inner)
-				} else {
-					let generics = self.parse_generic_params();
-					let interface = self.parse_interface_ref();
-					self.expect(&Token::LBrace);
-					let inner = self.parse_impl_members();
-					self.expect(&Token::RBrace);
-					StructInnerMember::Impl {
+				impls.push(Spanned(
+					StructImpl {
 						interface,
 						generics,
 						members: inner,
-					}
-				}
+					},
+					self.span_from(start),
+				));
 			} else {
 				let before = self.position();
 				let inner = self.parse_impl_member();
@@ -388,11 +462,10 @@ impl Parser<'_> {
 					self.advance();
 					continue;
 				}
-				StructInnerMember::Member(Box::new(inner))
-			};
-			members.push(Spanned(member, self.span_from(start)));
+				members.push(inner);
+			}
 		}
-		members
+		(members, impls)
 	}
 
 	fn parse_impl_members(&mut self) -> Vec<Spanned<ImplMember>> {
@@ -416,8 +489,8 @@ impl Parser<'_> {
 				Declaration::ExternalLet(v, n, m) => ImplMember::ExternalLet(v, n, m),
 				_ => unreachable!(),
 			}
-		} else if self.check(&Token::Func) {
-			let meta = self.parse_func_signature();
+		} else if let Some(kind) = self.func_kind_here() {
+			let meta = self.parse_func_signature(kind);
 			self.expect(&Token::Eq);
 			let body = self.parse_expr();
 			ImplMember::Func {
@@ -427,6 +500,15 @@ impl Parser<'_> {
 			}
 		} else if self.check(&Token::Let) {
 			let (meta, value) = self.parse_let_binding();
+			ImplMember::Let {
+				visibility,
+				meta,
+				value,
+			}
+		} else if self.check(&Token::Namespace) && self.peek_nth(1) == Some(&Token::Let) {
+			// `namespace let` — a static (type-level) binding.
+			self.advance(); // `namespace`
+			let (meta, value) = self.parse_let_binding_kinded(true);
 			ImplMember::Let {
 				visibility,
 				meta,
@@ -445,7 +527,7 @@ impl Parser<'_> {
 			ImplMember::Let {
 				visibility,
 				meta: LetDeclaration {
-					mutable: false,
+					kind: LetKind::Instance,
 					name: Spanned(nymph_ast::expr::Pattern::Placeholder, span),
 					type_: None,
 				},
@@ -493,8 +575,8 @@ impl Parser<'_> {
 
 	fn parse_interface_member(&mut self) -> Option<Spanned<InterfaceMember>> {
 		let start = self.position();
-		if self.check(&Token::Func) {
-			let meta = self.parse_func_signature();
+		if let Some(kind) = self.func_kind_here() {
+			let meta = self.parse_func_signature(kind);
 			let body = if self.eat(&Token::Eq).is_some() {
 				Some(self.parse_expr())
 			} else {
@@ -509,7 +591,11 @@ impl Parser<'_> {
 			))
 		} else if self.check(&Token::Let) {
 			self.advance(); // `let`
-			let mutable = self.eat(&Token::Mut).is_some();
+			let kind = if self.eat(&Token::Mut).is_some() {
+				LetKind::Mut
+			} else {
+				LetKind::Instance
+			};
 			let name = self.parse_binding_pattern();
 			let type_ = if self.eat(&Token::Colon).is_some() {
 				Some(self.parse_type())
@@ -524,11 +610,7 @@ impl Parser<'_> {
 			Some(Spanned(
 				InterfaceMember::Element(Box::new(Spanned(
 					InterfaceElement::Let {
-						meta: LetDeclaration {
-							mutable,
-							name,
-							type_,
-						},
+						meta: LetDeclaration { kind, name, type_ },
 						value,
 					},
 					self.span_from(start),
@@ -569,6 +651,32 @@ impl Parser<'_> {
 		self.expect(&Token::LBrace);
 		let members = self.parse_impl_members();
 		self.expect(&Token::RBrace);
+		// A namespace has no `this` to mutate and nesting another namespace is
+		// pointless, so it may only hold regular `func`s and `let`s.
+		for m in &members {
+			match &m.0 {
+				ImplMember::Func { meta, .. } => {
+					let kind = match meta.kind {
+						FuncKind::Mut => "mut func",
+						FuncKind::Namespace => "namespace func",
+						FuncKind::Instance => continue,
+					};
+					self.emit(
+						meta.name.1,
+						ParseError::FuncKindInNamespace { kind: kind.into() },
+					);
+				}
+				ImplMember::Let { meta, .. } if meta.is_namespaced() => {
+					self.emit(
+						meta.name.1,
+						ParseError::FuncKindInNamespace {
+							kind: "namespace let".into(),
+						},
+					);
+				}
+				_ => {}
+			}
+		}
 		Declaration::Namespace {
 			visibility,
 			name,

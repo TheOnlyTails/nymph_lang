@@ -64,10 +64,6 @@ impl Power<Other = int, Output = Complex> for int {
   external func power(other: int): Complex
 }
 
-impl Power<Other = float, Output = Complex> for int {
-  external func power(other: float): Complex
-}
-
 impl Power<Other = self, Output = Complex> for float {
   external func power(other: self): Complex
 }

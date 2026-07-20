@@ -11,7 +11,7 @@ and floats are IEEE 754 double-precision floating point numbers.
 Integers are sequences of digits, optionally separated by underscores,
 in either binary, octal, decimal, or hexadecimal.
 
-```nym
+```nymph
 12345 // decimal
 1_000_000_000 // digit separators
 0b10101101 // binary
@@ -22,7 +22,7 @@ in either binary, octal, decimal, or hexadecimal.
 Floats are only decimal, and they may include underscore digit separators, scientific-notation exponents.
 Decimal integer literals suffixed with `f` are treated as floats of the same value.
 
-```nym
+```nymph
 1.0 // regular float
 0.24e10 // exponent
 9e-1 // dotless float with exponent
@@ -33,7 +33,7 @@ Decimal integer literals suffixed with `f` are treated as floats of the same val
 Note that digit separators for both integers and floats may _only_ appear between digits,
 not other parts such as the `f` float prefix, `0b` radix specifier, etc:
 
-```nym
+```nymph
 0b_0110 // ❌
 10_f // ❌
 1._2 // ❌
@@ -44,7 +44,7 @@ not other parts such as the `f` float prefix, `0b` radix specifier, etc:
 Boolean literals are `true` and `false`, which are the only two values of the `boolean` type,
 represented by their respective case-sensitive keywords.
 
-```nym
+```nymph
 true
 false
 ```
@@ -58,7 +58,7 @@ The only available escape sequences are newline (`\n`), tab (`\t`), carriage ret
 apostrophe (`\'`), backslash (`\\`), and the Unicode escape (`\uXXXX`).
 Unicode escape sequences always use 4-6 hexadecimal digits, and must represent a valid Unicode codepoint.
 
-```nym
+```nymph
 'a' // regular character
 '\n' // newline
 '\t' // tab
@@ -79,7 +79,7 @@ They are UTF-8 encoded, and may include unescaped newlines.
 > On the flip side, string literals must escape double quotes `"\""`, and may include escaped
 > interpolated expressions `\${`.
 
-```nym
+```nymph
 "Hello, world!" // regular string
 "Hello, \"world!\"" // escaped double quotes
 "Hello,
@@ -104,7 +104,7 @@ Any declaration or assignment to `_` effectively discards the value.
 > However, it is recommended to use `snake_case` for variables and functions,
 > and `PascalCase` for types, structs, enums, etc.
 
-```nym
+```nymph
 myVariable
 _myVariable
 MY_VARIABLE
@@ -132,7 +132,7 @@ so long as the `Item` type of the iterator matches the list type.
 > Nymph uses array-backed lists for its list literal, but [linked lists](./stdlib/collections-linked_list#LinkedList)
 > are also available from the standard library.
 
-```nym
+```nymph
 #["apple", "banana", "cherry"]
 #[a, b, ...c]
 #[]
@@ -156,7 +156,7 @@ and span multiple lines.
 Other tuples may be spread into a tuple using the `...` operator,
 so long as their structure matches the structure of the parent tuple.
 
-```nym
+```nymph
 #(1, true, 'a')
 #(
   1,
@@ -178,7 +178,7 @@ and span multiple lines.
 Other [Iterators](./stdlib/iter#Iterator) may be spread into a map using the `...` operator,
 so long as their `Item` type is a tuple containing the key and value types of the map.
 
-```nym
+```nymph
 #{"apple": 1, "banana": 2, "cherry": 3}
 #{}
 #{
@@ -197,12 +197,16 @@ Inclusive ranges may omit either bound, but exclusive ranges must include an upp
 
 Ranges can be created for any type that implements the [`Range`](./stdlib/cmp-comparison#Comparable) interface, which provides a way to order values.
 
-Ranges which do not contain a lower bound are "max-only" ranges, and they cannot be iterated upon,
-only used to check for inclusion (using the [`in`](./expressions#Inclusion) operator).
-Ranges which do not contain an upper bound are "min-only" ranges, and they can be iterated upon,
-but are infinite in size and will never terminate.
+Ranges which do not contain a lower bound are "max-only" ranges, and ranges which do not contain
+an upper bound are "min-only" ranges; both are intended to be usable only for checking inclusion
+(using the [`in`](./expressions#Inclusion) operator), not for iterating in a `for` loop — a
+fully-bounded range (`1..10` or `1..=10`) is the only shape a `for` loop can iterate over today.
+The checker doesn't yet reject a max- or min-only range as a `for` source, so using one there is a
+compiler bug (a crash), not a supported behavior.
 
-```nym
+See [Iteration](./iteration#ranges) for how ranges behave inside a `for` loop.
+
+```nymph
 1..10 // exclusive range
 1..=10 // inclusive range
 1.. // min-only exclusive range

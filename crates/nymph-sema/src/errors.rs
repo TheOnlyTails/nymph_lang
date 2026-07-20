@@ -84,15 +84,7 @@ pub enum TypeError {
 	MismatchedTypes { expected: String, found: String },
 	/// Two impls of one interface overlap for the same receiver.
 	ConflictingImpls { iface: EcoString },
-	/// No overload of a function matches the given arguments. `solve.rs`'s
-	/// `resolve_method` no longer constructs this: it named an internal
-	/// interface method (`equals`, `less_than`, …) rather than the operator or
-	/// operand types, which leaked once a receiver could have two or more
-	/// receiver-matching impls of the same interface (e.g. a primitive with
-	/// both a same-type concrete impl and a cross-type one, alongside the
-	/// interface's blanket) — every such zero-argument-match case now commits
-	/// to the phase-1 "most specific" candidate instead, producing an ordinary
-	/// `MismatchedTypes`. Kept, unused, to preserve error codes.
+	/// No overload of a function matches the given arguments.
 	NoMatchingOverload { name: EcoString },
 	/// Multiple impls apply to a call, and none is more specific.
 	AmbiguousCall { name: EcoString },
@@ -118,7 +110,12 @@ pub enum TypeError {
 	UnsupportedConstructorPath,
 
 	// ── Not yet supported ────────────────────────────────────────────────────
-	/// Anonymous closure parameters (`$0`) are not implemented yet.
+	/// An anonymous closure parameter (`$`/`$0`/`$1`, …) that no candidate
+	/// boundary expression could resolve into a well-typed closure — either
+	/// every candidate boundary up to the enclosing slot still mismatched, or
+	/// (rarer) `$` was used with no enclosing slot at all. See
+	/// `crate::anon_closure` for the type-directed boundary search this
+	/// diagnostic is the loud fallback for.
 	AnonymousParamUnsupported,
 	/// Method-call syntax is not implemented yet (Milestone B).
 	MethodCallsUnsupported,
@@ -146,27 +143,160 @@ pub enum TypeError {
 	/// explicit type annotation is needed rather than lowering guessing at it.
 	CannotInferOperandType,
 
-	/// A `match` over a `uint` scrutinee leaves some values in `[0, u64::MAX]`
-	/// uncovered. Distinct from [`TypeError::NonExhaustiveInt`] — the unsigned
-	/// domain has no negative half, so reusing the `int`-worded message would
-	/// misleadingly suggest negative values are the gap. New variant appended at
-	/// the enum's end (mints 2060; `NotIterable` above kept its existing 2059).
-	NonExhaustiveUInt,
+	// ── Generics (call-site bound enforcement) ──────────────────────────────
+	/// A call site instantiated a generic parameter (declared `T: Interface` or
+	/// the `impl Interface` param sugar) with a type that does not implement the
+	/// required interface — e.g. `measure(3)` against `measure<T: Area>(shape: T)`.
+	/// Without this check the call type-checks and then crashes at JS runtime.
+	BoundNotSatisfied { ty: String, interface: EcoString },
 
-	/// An operator has no impl providing its backing interface method for the
-	/// operand type(s) — the `dispatch_operator` sole failure site. Replaces the
-	/// old bare `NotImplemented { method, ty }` (kept, unused, to preserve error
-	/// codes) with a message that names the operator's surface spelling (`+`,
-	/// `**`, `<`, …), both operand types (`rhs` is `None` for a unary operator),
-	/// and the interface implementing it, so the fix is obvious instead of
-	/// leaking an internal method name. New variant appended at the enum's end
-	/// (mints 2061; `NonExhaustiveUInt` above kept its existing 2060).
-	OperatorNotImplemented {
-		operator: EcoString,
-		lhs: String,
-		rhs: Option<String>,
-		interface: EcoString,
+	// ── Inner members ────────────────────────────────────────────────────────
+	/// A struct/enum inner member — an instance `func`, a `namespace func`
+	/// static, or a `mut func` method — was declared more than once under the
+	/// same name on the same type. `collect_impl_member` (members.rs) used to
+	/// collect all three kinds into one `FxHashMap` keyed only by name, letting a
+	/// later member silently overwrite an earlier same-named one; the shadowed
+	/// member's body was then never type-checked, yet the Slice 4J HIR lowering
+	/// walks the raw AST and emits every member's body regardless — an
+	/// unchecked-body-reaches-JS soundness hole. This diagnostic closes it at the
+	/// root: a program with this collision never has zero diagnostics, so it
+	/// never reaches lowering. `ty` names the owning struct/enum.
+	DuplicateMember {
+		name: EcoString,
+		ty: String,
+		redefined_span: Span,
+		prev: Span,
 	},
+
+	// ── Entry point (`main`) validation ─────────────────────────────────────
+	// New variants are appended at the END of the enum, never inserted earlier:
+	// the `ErrorCode` derive assigns codes as `2{variant_index:03}` purely by
+	// declaration order, so appending here preserves every existing code
+	// (DuplicateMember above took 2045 on the main line; these mint 2046-2049).
+	/// Entry mode (`check_module_entry`) found no top-level `func main` in the
+	/// module. Library mode (`check_module`) never emits this.
+	MainMissing,
+	/// The entry module's top-level `main` declares one or more generic
+	/// parameters; the entry point cannot be generic.
+	MainGeneric,
+	/// The entry module's top-level `main` declares one or more parameters;
+	/// the entry point is invoked with no arguments.
+	MainHasParams,
+	/// The entry module's top-level `main` declares an explicit return type
+	/// other than `void`; the entry point's result is discarded.
+	MainNonVoidReturn,
+
+	// ── Casts (Slice 4K) ─────────────────────────────────────────────────────
+	/// An `as` cast is neither identity/scalar-builtin nor resolvable through an
+	/// `Into` impl, because no `Into` interface is even in scope (`self.defs.get
+	/// ("Into")` found nothing) — distinct from [`TypeError::CannotCast`], which
+	/// fires when `Into` *is* in scope but no impl satisfies it. Without this,
+	/// `check_cast` used to return silently whenever a module (e.g. one that
+	/// doesn't link the stdlib) never declares `interface Into`, so a non-scalar
+	/// `as` type-checked completely unchecked and only died later at lowering's
+	/// unresolved-cast panic — a checker-bug-shaped hole on every real program,
+	/// since `nymph-compiler::compile` checks a module standalone with no stdlib
+	/// linkage. New variant appended at the enum's end per the `ErrorCode`
+	/// derive's declaration-order codes (mints 2050; MainNonVoidReturn above kept
+	/// its existing 2049).
+	CastRequiresInto { from: String, to: String },
+
+	/// An `as` cast resolved a `holds`-satisfying `Into`-named interface (`self.defs
+	/// .get("Into")` found one, and some impl satisfies it for `src`/`target`), but
+	/// the interface itself doesn't declare exactly one zero-arg method — the shape
+	/// `check_cast` needs to know WHICH method `as` should call. `holds` only checks
+	/// the interface's generic args (`Other`/whatever it's named), never method
+	/// names or arity, so a local `interface Into<Other> { .. }` with zero, two, or
+	/// only non-zero-arg methods satisfies `holds` just as readily as the canonical
+	/// single-zero-arg-method shape — this diagnostic closes the gap so lowering
+	/// never has to guess (or fall back to a hardcoded name that might not exist on
+	/// the class at all — the exact silent-miscompile bug this fixes). New variant
+	/// appended at the enum's end (mints 2051; CastRequiresInto above kept its
+	/// existing 2050).
+	IntoInterfaceMalformed { from: String, to: String },
+
+	/// A `&&`/`||` operand was not `boolean`. Logical operators are never
+	/// overloadable (copying Rust's design): whether the right-hand operand
+	/// evaluates must never depend on operand types, so both sides always unify
+	/// with `boolean` and the builtin always short-circuits — there is no
+	/// `And`/`Or` interface to dispatch through any more. This variant exists
+	/// (rather than reusing `MismatchedTypes`) purely so the diagnostic can
+	/// carry a dedicated help hint explaining *why* there's no overload to reach
+	/// for, instead of reading like an ordinary type-mismatch bug. New variant
+	/// appended at the enum's end (mints 2052; IntoInterfaceMalformed above kept
+	/// its existing 2051).
+	LogicalOperandNotBoolean { found: String },
+
+	/// A source `int`/`uint` literal whose magnitude exceeds `2^53 - 1`
+	/// (`Number.MAX_SAFE_INTEGER`) — Nymph's `int`/`uint` are JS doubles at
+	/// runtime, and a magnitude past this bound can't round-trip through one
+	/// exactly, so the literal as written and the value the program actually
+	/// runs with can silently diverge. A warning, not an error (precedent:
+	/// `UnreachableArm`'s `Severity::Warning` arm below) — the program still
+	/// runs, just with the nearest representable `f64` in place of the exact
+	/// literal. `int`/`uint` literals store their magnitude as `u64` with the
+	/// sign (for `int`) as a separate `PrefixOperator::Negate` wrapping the
+	/// literal node, so this also fires for a negative literal like
+	/// `-9007199254740992`: inferring the `Negate` operand infers the inner
+	/// literal expression first, which is where this warning is emitted — no
+	/// special-casing of the surrounding `Negate` is needed. New variant
+	/// appended at the enum's end (mints 2053; LogicalOperandNotBoolean above
+	/// kept its existing 2052).
+	IntLiteralUnsafe { value: u64 },
+
+	/// A field's SLOT was reassigned (`p.field = v`) through a receiver whose
+	/// type is not `mut` — mutable-types (MT1) enforcement. The field's own
+	/// declared type is irrelevant here; what's gating is whether `p` itself is
+	/// a `mut` view. New variant appended at the enum's end (mints 2054).
+	AssignFieldThroughImmutable { field: EcoString, ty: String },
+
+	// ── Mutable types, interfaces (MT2) ──────────────────────────────────────
+	/// A `mut func` interface method (OO1: the interface's declared kind is the
+	/// source of truth) was called on a receiver that isn't `mut` — a plain
+	/// value only has the interface's non-`mut` methods available. Reached
+	/// uniformly through `resolve_method`'s single gate for a concrete `mut B`
+	/// receiver, an interface default body, and a `T: A` bound's `mut T`
+	/// requirement (OO3) alike. New variant appended at the enum's end (mints
+	/// 2055).
+	MutMethodNeedsMutReceiver { method: EcoString },
+
+	/// An `impl A for B` (or nested `impl A { .. }`) restated a method's
+	/// `mut func`/`func` kind differently from what interface `A` itself
+	/// declares (OO2) — e.g. the interface says `mut func push`, the impl says
+	/// plain `func push`. The interface is the source of truth every call-site
+	/// gate reads, so a mismatch here would silently desync what the impl body
+	/// requires from what callers are checked against. `expected_mut` is the
+	/// interface's own declared kind. New variant appended at the enum's end
+	/// (mints 2056).
+	MethodMutMismatch {
+		name: EcoString,
+		ty: String,
+		expected_mut: bool,
+	},
+
+	/// A generic parameter `T: A` was instantiated, across the arguments of one
+	/// call, by BOTH a `mut` and a non-`mut` value at positions sharing that
+	/// same `T` (OO4) — e.g. `f<T: A>(x: T, y: T)` called `f(mut_b, b)`. No
+	/// single type for `T` can be correct for both call sites when `A` is
+	/// implemented only for `mut B` (`impl A for mut B` / `impl mut A for B`).
+	/// New variant appended at the enum's end (mints 2057).
+	MixedMutabilityForBound { interface: EcoString },
+
+	/// A `T: A` bound obligation failed for a plain type `ty`, but the `mut`
+	/// version of `ty` WOULD satisfy it (OO4: `A` is implemented only for
+	/// `mut ty`, via `impl A for mut ty` / `impl mut A for ty`) — a more
+	/// specific diagnostic than [`TypeError::BoundNotSatisfied`], hinting the
+	/// fix directly (pass a `mut` value) rather than leaving the caller to
+	/// guess. New variant appended at the enum's end (mints 2058).
+	BoundSatisfiedOnlyByMut { ty: String, interface: EcoString },
+
+	/// A `for` loop's source implements neither `Iterator` nor `Iterable` (the
+	/// only two shapes `infer_iterable_element` accepts once the syntactic-range
+	/// and list fast paths are ruled out). Replaces what used to be a silent
+	/// `self.fresh()` accept — the loop pattern bound to an unconstrained
+	/// inference variable that let the body typecheck against garbage, only to
+	/// panic in lowering. New variant appended at the enum's end (mints 2059).
+	NotIterable { ty: String },
 }
 
 impl IntoDiagnostic for TypeError {
@@ -248,7 +378,9 @@ impl IntoDiagnostic for TypeError {
 
 			E::UnsupportedConstructorPath => "unsupported constructor path".into(),
 
-			E::AnonymousParamUnsupported => "anonymous closure parameters are not supported yet".into(),
+			E::AnonymousParamUnsupported => {
+				"no enclosing closure boundary type-checks for this anonymous parameter (`$`)".into()
+			}
 			E::MethodCallsUnsupported => "method calls are not supported yet (Milestone B)".into(),
 
 			E::NonExhaustiveMatch { witness } => {
@@ -266,33 +398,74 @@ impl IntoDiagnostic for TypeError {
 				"cannot infer the operand type of this operator; add a type annotation".into()
 			}
 
-			E::NonExhaustiveUInt => {
-				"non-exhaustive match: some `uint` values are not covered — add a `_` arm".into()
+			E::BoundNotSatisfied { ty, interface } => {
+				format!("`{ty}` does not implement `{interface}`").into()
 			}
 
-			E::OperatorNotImplemented {
-				operator,
-				lhs,
-				rhs,
-				interface,
-			} => match rhs {
-				Some(rhs) => format!(
-					"the `{operator}` operator is not implemented for `{lhs}` and `{rhs}`; implement \
-					 `{interface}` to support it"
+			E::DuplicateMember { name, ty, .. } => {
+				format!("`{name}` is defined more than once on `{ty}`").into()
+			}
+
+			E::MainMissing => "no `main` function found".into(),
+			E::MainGeneric => "`main` cannot declare generic parameters".into(),
+			E::MainHasParams => "`main` must not declare any parameters".into(),
+			E::MainNonVoidReturn => {
+				"`main` must not declare a return type other than `void`".into()
+			}
+
+			E::CastRequiresInto { from, to } => {
+				format!("cannot cast `{from}` to `{to}`: no `Into` interface is in scope").into()
+			}
+			E::IntoInterfaceMalformed { from, to } => format!(
+				"cannot cast `{from}` to `{to}`: the resolved `Into` interface must declare exactly \
+				 one zero-argument method"
+			)
+			.into(),
+			E::LogicalOperandNotBoolean { found } => {
+				format!("mismatched types: expected `boolean`, found `{found}`").into()
+			}
+			E::IntLiteralUnsafe { value } => format!(
+				"integer literal `{value}` exceeds `Number.MAX_SAFE_INTEGER` (2^53 - 1) and will lose \
+				 precision"
+			)
+			.into(),
+			E::AssignFieldThroughImmutable { field, ty } => {
+				format!("cannot assign to field `{field}` through immutable `{ty}`").into()
+			}
+
+			E::MutMethodNeedsMutReceiver { method } => {
+				format!("`{method}` requires a `mut` receiver").into()
+			}
+			E::MethodMutMismatch {
+				name, expected_mut, ..
+			} => {
+				let (declared, restated) = if *expected_mut {
+					("mut func", "func")
+				} else {
+					("func", "mut func")
+				};
+				format!(
+					"`{name}` is declared `{declared}` on the interface but restated `{restated}` here"
 				)
-				.into(),
-				None => format!(
-					"the `{operator}` operator is not implemented for `{lhs}`; implement `{interface}` \
-					 to support it"
-				)
-				.into(),
-			},
+				.into()
+			}
+			E::MixedMutabilityForBound { interface } => format!(
+				"mixed `mut`/non-`mut` arguments for one type parameter bounded by `{interface}`"
+			)
+			.into(),
+			E::BoundSatisfiedOnlyByMut { ty, interface } => {
+				format!("`{ty}` does not implement `{interface}`; `mut {ty}` does").into()
+			}
+			E::NotIterable { ty } => {
+				format!("`{ty}` is not iterable; it implements neither `Iterator` nor `Iterable`")
+					.into()
+			}
 		}
 	}
 
 	fn severity(&self) -> Severity {
 		match self {
-			TypeError::UnreachableArm => Severity::Warning,
+			TypeError::UnreachableArm | TypeError::IntLiteralUnsafe { .. } => Severity::Warning,
 			_ => Severity::Error,
 		}
 	}
@@ -300,6 +473,11 @@ impl IntoDiagnostic for TypeError {
 	fn labels(&self) -> Vec<Label> {
 		match self {
 			TypeError::Redefinition {
+				redefined_span,
+				prev,
+				..
+			}
+			| TypeError::DuplicateMember {
 				redefined_span,
 				prev,
 				..
@@ -314,6 +492,65 @@ impl IntoDiagnostic for TypeError {
 	fn help(&self) -> Option<EcoString> {
 		match self {
 			TypeError::UnreachableArm => Some("a previous arm already covers this case".into()),
+			TypeError::DuplicateMember { name, .. } => {
+				Some(format!("rename one of the `{name}` members to remove the collision").into())
+			}
+			TypeError::MainMissing => Some(
+				"the entry module must declare a top-level `func main` taking no parameters and \
+				 declaring no return type other than `void`"
+					.into(),
+			),
+			TypeError::MainGeneric => Some(
+				"remove the generic parameters — `main` is the program's entry point and is \
+				 invoked directly, with no type arguments"
+					.into(),
+			),
+			TypeError::MainHasParams => {
+				Some("`main` is called with no arguments — remove the parameters".into())
+			}
+			TypeError::MainNonVoidReturn => {
+				Some("`main` returns nothing — remove the return type".into())
+			}
+			TypeError::CastRequiresInto { .. } => Some(
+				"declare or import an `Into` interface and implement it for the source type, or cast \
+				 between built-in scalar types instead"
+					.into(),
+			),
+			TypeError::IntoInterfaceMalformed { .. } => Some(
+				"give the `Into` interface exactly one zero-argument method (its conversion entry \
+				 point) — `as` dispatches to whichever one it declares"
+					.into(),
+			),
+			TypeError::LogicalOperandNotBoolean { .. } => Some(
+				"logical operators are not overloadable — `&&`/`||` always take booleans and \
+				 short-circuit"
+					.into(),
+			),
+			TypeError::IntLiteralUnsafe { .. } => Some(
+				"Nymph's `int`/`uint` are JS doubles at runtime — integers beyond ±(2^53 - 1) can't \
+				 be represented exactly and will be rounded to the nearest representable value"
+					.into(),
+			),
+			TypeError::AssignFieldThroughImmutable { ty, .. } => Some(
+				format!("make the receiver a mutable view, e.g. `let mut` or a `mut {ty}` annotation")
+					.into(),
+			),
+			TypeError::MutMethodNeedsMutReceiver { .. } => Some(
+				"bind or annotate the receiver as `mut`, e.g. `let mut` or a `mut` type annotation".into(),
+			),
+			TypeError::MethodMutMismatch {
+				name, expected_mut, ..
+			} => Some(if *expected_mut {
+				format!("declare `{name}` as `mut func` here to match the interface").into()
+			} else {
+				format!("declare `{name}` as `func` here to match the interface").into()
+			}),
+			TypeError::MixedMutabilityForBound { .. } => Some(
+				"pass `mut` values at every use of this type parameter, or non-`mut` values at none".into(),
+			),
+			TypeError::BoundSatisfiedOnlyByMut { ty, .. } => {
+				Some(format!("pass a `mut {ty}` instead").into())
+			}
 			_ => None,
 		}
 	}

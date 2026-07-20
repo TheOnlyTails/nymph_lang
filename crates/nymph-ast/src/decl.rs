@@ -17,10 +17,11 @@ pub struct Module {
 
 #[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
 pub enum Declaration {
-	/// `import @/math`, `import @/math with (sin as sine, cos)`
+	/// `import @/math`, `import @/math as m`, `import @/math with (sin as sine, cos)`
 	Import {
 		root: ImportRoot,
 		path: Vec<Ident>,
+		alias: Option<Ident>,
 		idents: Option<Vec<(Ident, Option<Ident>)>>,
 	},
 	/// `let x = 1`, `public let mut count: int = 0`
@@ -45,13 +46,15 @@ pub enum Declaration {
 		meta: TypeAliasDeclaration,
 		value: Spanned<Type>,
 	},
-	/// A product type. See [`StructInnerMember`] for the body forms.
+	/// A product type. Its body splits into flat [`ImplMember`]s (instance /
+	/// `mut` / `namespace` funcs and lets) and nested interface [`StructImpl`]s.
 	Struct {
 		visibility: Option<Visibility>,
 		name: Ident,
 		generics: Vec<Spanned<GenericParam>>,
 		fields: Vec<Spanned<StructField>>,
-		members: Vec<Spanned<StructInnerMember>>,
+		members: Vec<Spanned<ImplMember>>,
+		impls: Vec<Spanned<StructImpl>>,
 	},
 	/// A sum type.
 	Enum {
@@ -59,7 +62,8 @@ pub enum Declaration {
 		name: Ident,
 		generics: Vec<Spanned<GenericParam>>,
 		variants: Vec<Spanned<EnumVariant>>,
-		members: Vec<Spanned<StructInnerMember>>,
+		members: Vec<Spanned<ImplMember>>,
+		impls: Vec<Spanned<StructImpl>>,
 	},
 	/// A `namespace` of type-level (static) members.
 	Namespace {
@@ -121,17 +125,51 @@ pub struct TypeAliasDeclaration {
 
 #[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
 pub struct LetDeclaration {
-	pub mutable: bool,
+	pub kind: LetKind,
 	pub name: Spanned<Pattern>,
 	pub type_: Option<Spanned<Type>>,
+}
+
+/// How a `let` binding is introduced. `Mut` (mutable, `let mut`) and `Namespace`
+/// (a static `namespace let`) are mutually exclusive by construction — a
+/// namespaced binding can never be mutable, so `namespace let mut` is
+/// unrepresentable. Mirrors [`FuncKind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, salsa::SalsaValue)]
+pub enum LetKind {
+	/// `let x = …` — an immutable per-instance / local binding.
+	Instance,
+	/// `let mut x = …` — a mutable per-instance / local binding.
+	Mut,
+	/// `namespace let x = …` — an immutable static (type-level) binding.
+	Namespace,
+}
+
+impl LetDeclaration {
+	/// Whether the binding may be reassigned (`let mut`).
+	pub fn is_mutable(&self) -> bool {
+		matches!(self.kind, LetKind::Mut)
+	}
+
+	/// Whether the binding is a static `namespace let`.
+	pub fn is_namespaced(&self) -> bool {
+		matches!(self.kind, LetKind::Namespace)
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
 pub struct FuncDeclaration {
 	pub name: Ident,
+	pub kind: FuncKind,
 	pub generics: Vec<Spanned<GenericParam>>,
 	pub params: Vec<Spanned<FuncParam>>,
 	pub return_type: Option<Spanned<Type>>,
+}
+
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub enum FuncKind {
+	Instance,
+	Mut,
+	Namespace,
 }
 
 #[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
@@ -150,21 +188,13 @@ pub struct StructField {
 	pub default: Option<Expr>,
 }
 
-/// The forms that can appear inside a `struct`/`enum` body.
+/// A nested interface impl inside a `struct`/`enum` body:
+/// `impl Plus<Other = Self> { func plus(...) = ... }`.
 #[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
-pub enum StructInnerMember {
-	/// A derived `let` or instance `func`.
-	Member(Box<Spanned<ImplMember>>),
-	/// A `namespace { ... }` block of static members.
-	Namespace(Vec<Spanned<ImplMember>>),
-	/// A nested interface impl: `impl Plus<...> { ... }`.
-	Impl {
-		interface: (Ident, Vec<Spanned<GenericArg>>),
-		generics: Vec<Spanned<GenericParam>>,
-		members: Vec<Spanned<ImplMember>>,
-	},
-	/// `impl mut { ... }` — methods that mutate the receiver.
-	ImplMut(Vec<Spanned<ImplMember>>),
+pub struct StructImpl {
+	pub interface: (Ident, Vec<Spanned<GenericArg>>),
+	pub generics: Vec<Spanned<GenericParam>>,
+	pub members: Vec<Spanned<ImplMember>>,
 }
 
 #[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
@@ -186,8 +216,6 @@ pub enum ImplMember {
 #[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
 pub enum InterfaceMember {
 	Element(Box<Spanned<InterfaceElement>>),
-	Namespace(Vec<Spanned<ImplMember>>),
-	ImplMut(Vec<Spanned<InterfaceElement>>),
 	Impl {
 		interface: (Ident, Vec<Spanned<GenericArg>>),
 		generics: Vec<Spanned<GenericParam>>,

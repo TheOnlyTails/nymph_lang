@@ -3,26 +3,22 @@ import @/collections/map
 import @/ops with (Contains)
 
 public struct Set<Item>(inner: #{Item: #()}) {
-  impl mut {
-    /// Inserts an item into the set.
-    /// Returns `true` if the set did not contain this item previously, and `false` if it did. 
-    func insert(item: Item): boolean = this.inner.insert(item, #())
+  /// Inserts an item into the set.
+  /// Returns `true` if the set did not contain this item previously, and `false` if it did.
+  mut func insert(item: Item): boolean = this.inner.insert(item, #())
 
-    func remove(item: Item) = if (item in this.inner) {
-      this.inner.remove(item)
-      true
-    } else false
-  }
+  mut func remove(item: Item) = if (item in this.inner) {
+    this.inner.remove(item)
+    true
+  } else false
 
-  namespace {
-    func new(...from: Item): Set<Item> = {
-      let mut inner: #{Item: #()} = #{}
-      for (item in from) {
-        inner.insert(item, #())
-      }
-
-      Set(inner = inner)
+  namespace func new(...from: Item): Set<Item> = {
+    let mut inner: #{Item: #()} = #{}
+    for (item in from) {
+      inner.insert(item, #())
     }
+
+    Set(inner = inner)
   }
 
   impl Contains<Item> {

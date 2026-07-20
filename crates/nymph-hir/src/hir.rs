@@ -33,6 +33,12 @@ pub struct HirClass {
 	pub name: EcoString,
 	pub fields: Vec<EcoString>,
 	pub methods: Vec<HirMethod>,
+	/// `namespace func` static functions (Slice 4J) → JS `static` class methods.
+	/// A separate list, not a flag on `HirMethod`: JS legally allows a static and
+	/// an instance method sharing one name (they live in different tables), so
+	/// keeping them in separate lists keeps `assert_no_duplicate_methods`'
+	/// per-list "one name, one method" invariant meaningful for each.
+	pub statics: Vec<HirMethod>,
 }
 
 /// An inherent instance method → a JS class method. `this` in the body refers to
@@ -53,6 +59,13 @@ pub struct HirEnum {
 	pub name: EcoString,
 	pub variants: Vec<HirVariant>,
 	pub methods: Vec<HirMethod>,
+	/// `namespace func` static functions (Slice 4J). Unlike a struct's
+	/// `statics`, these become OBJECT-level method properties on the IIFE's
+	/// returned object (not `proto`-level): call sites emit `E.func(..)` against
+	/// the object `E` itself, and `proto` is only reachable through a
+	/// constructed variant instance, never through the enum name — a
+	/// proto-level property would be unreachable from what call sites emit to.
+	pub statics: Vec<HirMethod>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -104,10 +117,49 @@ pub enum HirExpr {
 		callee: Box<HirExpr>,
 		args: Vec<HirExpr>,
 	},
+	/// A call to a LINKED external (Gap 3, L0/L1) — a method call that
+	/// resolved through a prelude `external(name)` marker present in
+	/// [`nymph_hir::linkage::REGISTRY`], instead of the loud "prelude-only
+	/// impl" defer every other `external`/transitively-external body still
+	/// gets. `module`/`symbol` are the ALREADY-RESOLVED [`crate::linkage::Linked`]
+	/// fields — not the bare `external(name)` marker — because L1's `get` is
+	/// an AMBIGUOUS marker shared by `List` and `Map` with DIFFERENT JS
+	/// implementations: the only place that knows which receiver's `impl`
+	/// block resolved this call (and can therefore compute the receiver tag
+	/// [`crate::linkage::lookup`] needs to disambiguate) is lowering itself,
+	/// at the point it decides to build this variant — re-deriving that tag
+	/// from a bare marker at emit time, with only `args[0]`'s already-erased
+	/// HIR to go on, isn't possible. Baking the resolved pair into HIR (rather
+	/// than re-`lookup`-ing by marker in codegen, as L0 did) keeps codegen a
+	/// dumb consumer instead of a second place that has to re-derive
+	/// receiver-tag disambiguation. `args` is already in `$_this`-FIRST
+	/// order: the receiver lowered first, then the call's own arguments,
+	/// exactly the shape every `Linked` JS function expects (e.g.
+	/// `xs.length()` → `args = [xs]` → emits `length(xs)`).
+	ExternCall {
+		module: &'static str,
+		symbol: &'static str,
+		args: Vec<HirExpr>,
+	},
 	/// A tuple or list literal — both emit as a JS array.
 	Array(Vec<HirExpr>),
+	/// A list literal (SS1) containing at least one spread element
+	/// (`#[a, ...xs, b]`) — emits as a JS array literal with the spread
+	/// elements' JS `...` syntax preserved in position. A spread-free list
+	/// still lowers to the plain [`HirExpr::Array`] above (zero behavior
+	/// change for the common case); this variant exists only so a spread
+	/// element's shape (native splice vs. drained-then-spliced) is visible to
+	/// codegen. Tuple literals never produce this — tuple spread stays
+	/// deferred (untyped, element-wise) — only `ExprKind::List` does.
+	ArraySpread(Vec<HirArrayElem>),
 	/// A map literal — emits as `new Map([[k, v], …])`.
 	MapLit(Vec<(HirExpr, HirExpr)>),
+	/// A map literal (SS1) containing at least one spread entry
+	/// (`#{...m, k: v}`) — emits as `new Map([...])` with the spread entries'
+	/// JS `...` syntax preserved in position (a Map merge, later-key-wins,
+	/// since the `Map` constructor processes its entries array in order). A
+	/// spread-free map still lowers to the plain [`HirExpr::MapLit`] above.
+	MapSpread(Vec<HirMapElem>),
 	/// A subscript into a list/tuple — emits as `recv[index]`.
 	Index {
 		recv: Box<HirExpr>,
@@ -173,6 +225,78 @@ pub enum HirExpr {
 		scrutinee: Box<HirExpr>,
 		arms: Vec<HirArm>,
 	},
+	/// A built-in `as` scalar conversion (Slice 4K, extended by the saturating-cast
+	/// change below) that needs an actual JS runtime operation, not just a value
+	/// pass-through. Identity casts and the remaining same-"JS number" numeric
+	/// casts (`int`/`uint` → `float`, `uint` → `int`, plus `Foo as Foo` for any
+	/// `Foo`) need no node at all — lowering just returns the operand unchanged —
+	/// so this variant only ever wraps the `kind`s below. Kept as a dedicated node
+	/// (rather than composing `Call`/`Field` onto `Local("Math")`/`Local("String")`/
+	/// `Local("Number")`) so a user local of one of those names can never shadow
+	/// the conversion codegen emits (see `emit.rs`).
+	ScalarCast {
+		kind: ScalarCastKind,
+		operand: Box<HirExpr>,
+	},
+	/// A closure expression (`(x, y) -> x + y`, `x -> x * 2`) — emits as a JS
+	/// arrow function. Captures are free: JS arrows close over their enclosing
+	/// scope by reference, which already matches the checker's own capture
+	/// semantics (Slice 4L), so no explicit capture list is carried here.
+	/// `return` lexically inside `body` is rejected by lowering (never reaches
+	/// this node) — see `lower_hir`'s closure-depth guard for why.
+	Closure {
+		params: Vec<EcoString>,
+		body: Box<HirExpr>,
+	},
+}
+
+/// One element of a spread-bearing list literal (see [`HirExpr::ArraySpread`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum HirArrayElem {
+	/// An ordinary, non-spread item.
+	Item(HirExpr),
+	/// `...e` — `e` is already a JS-array-valued expression (either the
+	/// lowered spread source directly, when it's natively a JS array, or a
+	/// drain IIFE that collects a non-array `Iterator`/`Iterable` source into
+	/// one — see `Lowerer::lower_spread_source`), so codegen always emits it
+	/// with JS spread syntax.
+	Spread(HirExpr),
+}
+
+/// One element of a spread-bearing map literal (see [`HirExpr::MapSpread`]).
+#[derive(Clone, Debug, PartialEq)]
+pub enum HirMapElem {
+	/// An ordinary `k: v` entry.
+	Entry(HirExpr, HirExpr),
+	/// `...e` — `e` is already an array of `[k, v]` pairs (a native JS `Map`,
+	/// spliceable directly since a JS `Map` iterates as `[k, v]` pairs, or a
+	/// drain IIFE collecting a non-map `Iterator`/`Iterable<#(K, V)>` source
+	/// into one), so codegen always emits it with JS spread syntax inside the
+	/// `new Map([...])` entries array.
+	Spread(HirExpr),
+}
+
+/// Which JS runtime conversion a [`HirExpr::ScalarCast`] compiles to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScalarCastKind {
+	/// `float as int` — Nymph defines its own float→int semantics rather than
+	/// inheriting `Math.trunc`'s JS passthrough: `NaN` saturates to `0`,
+	/// `Infinity`/`-Infinity` saturate to `i64::MAX`/`i64::MIN` (JS stores the
+	/// former as `2^63`, the nearest `f64` to `2^63 - 1`), and any other (finite)
+	/// value truncates toward zero as before.
+	SaturatingToInt,
+	/// `float as uint` / `int as uint` — like `SaturatingToInt`, but the operand
+	/// is `Math.abs`-ed first: a negative finite value (or a negative `int` being
+	/// cast to `uint`) saturates to its absolute value, and `-Infinity` collapses
+	/// onto the same `Infinity → i64::MAX` branch as `+Infinity` (`int as uint`
+	/// previously had no runtime effect at all — this makes it a real operation).
+	SaturatingToUInt,
+	/// `char as int`/`char as uint`/`char as float` — `operand.codePointAt(0)`.
+	CharToNum,
+	/// `int as char`/`uint as char` — `String.fromCodePoint(operand)`.
+	NumToChar,
+	/// `float as char` — `String.fromCodePoint(Math.trunc(operand))`.
+	FloatToChar,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -216,8 +340,14 @@ pub enum HirPat {
 		rest: Option<Option<EcoString>>,
 		suffix: Vec<HirPat>,
 	},
-	/// A map pattern — tests `.has(key)` and matches the value pattern against `.get(key)`.
-	Map(Vec<(HirLit, HirPat)>),
+	/// A map pattern — tests `.has(key)` and matches the value pattern against
+	/// `.get(key)`. `rest` present ⇒ an optional binding to the rest-of-map (a
+	/// shallow copy of the scrutinee minus the named `entries` keys); absent ⇒ no
+	/// rest clause.
+	Map {
+		entries: Vec<(HirLit, HirPat)>,
+		rest: Option<Option<EcoString>>,
+	},
 	/// A range pattern over scalar bounds.
 	Range(HirRange),
 	/// `A | B` — matches if either side matches (3B: neither side binds).

@@ -40,15 +40,24 @@ impl Checker<'_> {
 
 	fn pattern(&mut self, pattern: &Spanned<Pattern>, ty: Ty, mutable: bool) {
 		let span = pattern.1;
+		// Matching against a scrutinee's SHAPE (a literal's type, a tuple/list/map/
+		// struct constructor) must ignore any top-level `mut` the scrutinee's type
+		// carries — `mut` is never itself a distinct shape to match against. Kept
+		// separate from `ty`: a bare-name binding (`Pattern::Binding`, below) still
+		// captures the scrutinee's own (possibly `mut`) type as-is, since field-
+		// type-authority (not the scrutinee's mutability) is what governs any
+		// FURTHER nested field/element type once this level's `subst`/fresh-var
+		// substitution takes over.
+		let shape = self.strip_mut(ty);
 		match &pattern.0 {
 			Pattern::Placeholder => {}
 			Pattern::Binding { name, inner } => {
 				// A bare name (`None`, `Red`) that names a nullary variant is a constructor
 				// pattern, not a new binding — resolution, not capitalisation, decides.
 				if matches!(inner.0, Pattern::Placeholder)
-					&& let Some(adt) = self.nullary_variant_pattern(&name.0, span)
+					&& let Some(adt) = self.nullary_variant_pattern(&name.0, shape, span)
 				{
-					self.unify(ty, adt, span);
+					self.unify(shape, adt, span);
 				} else {
 					self.define_local(name.0.clone(), ty, mutable);
 					if !matches!(inner.0, Pattern::Placeholder) {
@@ -58,27 +67,27 @@ impl Checker<'_> {
 			}
 			Pattern::Int(_) => {
 				let t = self.interner.int();
-				self.unify(ty, t, span);
+				self.unify(shape, t, span);
 			}
 			Pattern::UInt(_) => {
 				let t = self.interner.uint();
-				self.unify(ty, t, span);
+				self.unify(shape, t, span);
 			}
 			Pattern::Float(_) => {
 				let t = self.interner.float();
-				self.unify(ty, t, span);
+				self.unify(shape, t, span);
 			}
 			Pattern::Char(_) => {
 				let t = self.interner.char();
-				self.unify(ty, t, span);
+				self.unify(shape, t, span);
 			}
 			Pattern::Boolean(_) => {
 				let t = self.interner.boolean();
-				self.unify(ty, t, span);
+				self.unify(shape, t, span);
 			}
 			Pattern::String(_) => {
 				let t = self.interner.string();
-				self.unify(ty, t, span);
+				self.unify(shape, t, span);
 			}
 			Pattern::Grouped(inner) => self.pattern(inner, ty, mutable),
 			Pattern::Union(a, b) => {
@@ -89,7 +98,11 @@ impl Checker<'_> {
 				// A range pattern constrains an ordered scrutinee; Milestone A leaves
 				// the type as-is (it is typically already known to be numeric).
 			}
-			Pattern::Tuple(entries) => {
+			Pattern::Tuple(entries)
+				if !entries
+					.iter()
+					.any(|e| matches!(e.0, ListPatternEntry::Rest(_))) =>
+			{
 				let mut items = Vec::new();
 				for entry in entries {
 					if let ListPatternEntry::Item(p) = &entry.0 {
@@ -98,15 +111,80 @@ impl Checker<'_> {
 				}
 				let elem_tys: Vec<Ty> = items.iter().map(|_| self.fresh()).collect();
 				let tuple = self.interner.mk_tuple(elem_tys.clone());
-				self.unify(ty, tuple, span);
+				self.unify(shape, tuple, span);
 				for (p, elem) in items.iter().zip(&elem_tys) {
 					self.pattern(p, *elem, mutable);
+				}
+			}
+			// A tuple with `...rest`: unlike list rest (homogeneous elements), a tuple's
+			// elements are heterogeneous, so `rest`'s type is a specific sub-tuple that
+			// can only be built by slicing the scrutinee's ALREADY-KNOWN element types —
+			// this is an inference inversion relative to the no-rest arm above (which
+			// builds the tuple type FROM the pattern via fresh vars and unifies outward).
+			Pattern::Tuple(entries) => {
+				let mut prefix = Vec::new();
+				let mut suffix = Vec::new();
+				let mut rest_name: Option<Option<Ident>> = None;
+				let mut seen_rest = false;
+				for entry in entries {
+					match &entry.0 {
+						ListPatternEntry::Item(p) => {
+							if seen_rest {
+								suffix.push(p);
+							} else {
+								prefix.push(p);
+							}
+						}
+						ListPatternEntry::Rest(name) => {
+							seen_rest = true;
+							rest_name = Some(name.clone());
+						}
+					}
+				}
+				match self.interner.kind(shape).clone() {
+					crate::ty::TyKind::Tuple(elems) if elems.len() >= prefix.len() + suffix.len() => {
+						let n = elems.len();
+						for (i, p) in prefix.iter().enumerate() {
+							self.pattern(p, elems[i], mutable);
+						}
+						let suf_start = n - suffix.len();
+						for (j, p) in suffix.iter().enumerate() {
+							self.pattern(p, elems[suf_start + j], mutable);
+						}
+						if let Some(Some(name)) = &rest_name {
+							let mid = elems[prefix.len()..suf_start].to_vec();
+							let rest_ty = self.interner.mk_tuple(mid);
+							self.define_local(name.0.clone(), rest_ty, mutable);
+						}
+					}
+					_ => {
+						// Either the scrutinee isn't (yet) resolvable to a concrete tuple, or
+						// the pattern names more fixed elements than any tuple could supply —
+						// either way this is a genuine mismatch. Build the same-arity fresh
+						// tuple the no-rest arm would (treating `rest` as contributing zero
+						// elements) and let `unify` report the precise diagnostic, exactly as
+						// the no-rest arm does for an ordinary arity mismatch.
+						let elem_tys: Vec<Ty> = prefix
+							.iter()
+							.chain(suffix.iter())
+							.map(|_| self.fresh())
+							.collect();
+						let tuple = self.interner.mk_tuple(elem_tys.clone());
+						self.unify(shape, tuple, span);
+						for (p, elem) in prefix.iter().chain(suffix.iter()).zip(&elem_tys) {
+							self.pattern(p, *elem, mutable);
+						}
+						if let Some(Some(name)) = &rest_name {
+							let rest_ty = self.fresh();
+							self.define_local(name.0.clone(), rest_ty, mutable);
+						}
+					}
 				}
 			}
 			Pattern::List(entries) => {
 				let elem = self.fresh();
 				let list = self.interner.mk_list(elem);
-				self.unify(ty, list, span);
+				self.unify(shape, list, span);
 				for entry in entries {
 					match &entry.0 {
 						ListPatternEntry::Item(p) => self.pattern(p, elem, mutable),
@@ -119,7 +197,7 @@ impl Checker<'_> {
 				let key = self.fresh();
 				let value = self.fresh();
 				let map = self.interner.mk_map(key, value);
-				self.unify(ty, map, span);
+				self.unify(shape, map, span);
 				for entry in entries {
 					match &entry.0 {
 						MapPatternEntry::Entry(k, v) => {
@@ -131,7 +209,7 @@ impl Checker<'_> {
 					}
 				}
 			}
-			Pattern::Struct { path, fields } => self.pattern_struct(path, fields, ty, span, mutable),
+			Pattern::Struct { path, fields } => self.pattern_struct(path, fields, shape, span, mutable),
 		}
 	}
 
@@ -143,7 +221,7 @@ impl Checker<'_> {
 		span: Span,
 		mutable: bool,
 	) {
-		let target = self.resolve_pattern_path(path, span);
+		let target = self.resolve_pattern_path(path, ty, span);
 		let field_tys = match target {
 			Some(PatternTarget::Struct(def)) => {
 				let (adt, subst) = self.instantiate_struct(def);
@@ -200,9 +278,17 @@ impl Checker<'_> {
 
 	/// If a bare pattern name is a nullary variant, return a fresh instance of its enum
 	/// (to unify with the scrutinee). Returns `None` for a value-carrying variant or a
-	/// non-variant name — both of which are then treated as a binding.
-	fn nullary_variant_pattern(&mut self, name: &str, span: Span) -> Option<Ty> {
-		match self.defs.resolve_variant(name)? {
+	/// non-variant name — both of which are then treated as a binding. `expected` is the
+	/// scrutinee's (already-stripped) shape: when it names a concrete enum that has a
+	/// variant matching `name`, that enum wins over the global by-name lookup — this is
+	/// what lets a bare `Equal` resolve against a known `Order` scrutinee even when
+	/// another enum also declares an `Equal` variant.
+	fn nullary_variant_pattern(&mut self, name: &str, expected: Ty, span: Span) -> Option<Ty> {
+		let resolved = match self.expected_enum_variant(expected, name) {
+			Some(hit) => Ok(hit),
+			None => self.defs.resolve_variant(name)?,
+		};
+		match resolved {
 			Ok((enum_def, variant)) => {
 				if self.sigs.enums[&enum_def].variants[variant]
 					.fields
@@ -224,13 +310,21 @@ impl Checker<'_> {
 		}
 	}
 
-	fn resolve_pattern_path(&mut self, path: &[Ident], span: Span) -> Option<PatternTarget> {
+	fn resolve_pattern_path(
+		&mut self,
+		path: &[Ident],
+		expected: Ty,
+		span: Span,
+	) -> Option<PatternTarget> {
 		match path {
 			[single] => {
 				if let Some(def) = self.defs.get(&single.0)
 					&& let DefKind::Struct { .. } = self.defs.data(def).kind
 				{
 					return Some(PatternTarget::Struct(def));
+				}
+				if let Some((enum_def, variant)) = self.expected_enum_variant(expected, &single.0) {
+					return Some(PatternTarget::Variant(enum_def, variant));
 				}
 				match self.defs.resolve_variant(&single.0) {
 					Some(Ok((enum_def, variant))) => {

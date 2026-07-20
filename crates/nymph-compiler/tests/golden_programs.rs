@@ -7,18 +7,38 @@
 //!   that used to work).
 //! - **Run tier**: the emitted JS also executes under `node`, asserting stdout.
 //!
-//! The corpus deliberately stays inside the implemented surface (Slices 0–4C-c).
-//! Known deferrals it must NOT touch: string literals in expression position,
-//! closures, range *expressions* (range patterns are fine), `as` casts, `?`/`!`
-//! postfix, `??`/`in`/`!in`/`|>`, user `==`/`!=` dispatch, namespaced/static
-//! methods, mut methods, positional variant construction, enum methods/impls,
-//! blanket-impl materialization, bounded-generic *operator* dispatch, stdlib
-//! imports.
+//! The corpus deliberately stays inside the implemented surface (Slices 0–4H).
+//! Known deferrals it must NOT touch: closures (incl. calling a function
+//! *value*/function-typed parameter — the type-checks but has no HIR lowering
+//! path), range *expressions* in general value position (range patterns and
+//! `for`-loop iterable ranges are fine; non-numeric/char ranges and
+//! `To`/`ToInclusive`/`From` range sources in `for` still panic), `as` casts,
+//! `?`/`!` postfix, `??`/`in`/`!in`/`|>`, user `==`/`!=` dispatch (native `===`
+//! always, by design per 4C-c — not a missing-feature deferral), namespaced/
+//! static methods, mut methods, positional (unlabeled) variant/struct
+//! construction, zero-field structs, blanket-impl materialization, stdlib
+//! imports, interface-impl method own-generics (4G-b, inexpressible today).
+//! Enum methods/impls (4D) and string literal expressions (4H) are now
+//! IMPLEMENTED — do not re-add them here.
 //!
-//! Parse gotchas honored throughout: `if` requires parens; match arms use `->`
-//! and commas; a guard whose expression ends in an identifier must be
+//! Sharpest deferral to remember: a bounded-generic *operator* used via
+//! operator SYNTAX (bare `a < b` where `a: T, T: Comparable<Other = T>`)
+//! still panics in lowering (`DispatchKind::UserImplDefaultMethod` — an honest
+//! deferral, not a silent miscompile). A bounded-generic *method call* through
+//! the same bound (`a.less_than(b)`, or `a.area()` under `T: Area`) works fine
+//! today, because plain method calls lower to `Call{Field{..}}` regardless of
+//! dispatch kind — only literal operator syntax needs the (still-missing)
+//! dispatch table entry. Golden programs exercising comparisons on a raw
+//! generic Param must use the explicit method call, never the operator.
+//!
+//! Parse gotchas honored throughout: `if`/`while`/`for` require parens around
+//! their whole header (`for (x in a..b) { .. }`); match arms use `->` and
+//! commas; a guard whose expression ends in an identifier must be
 //! parenthesized (otherwise `ident -> body` parses as a closure); line-leading
-//! operators continue the previous expression.
+//! operators continue the previous expression; a field-variant pattern binds
+//! under the FIELD's own name unless aliased via `field = name` (`Some(n2)`
+//! against a variant whose field is named `n` is "unknown field `n2`", not a
+//! fresh binding — write `Some(n = n2)` to bind under a different name).
 
 use std::io::Write;
 use std::process::Command;
@@ -359,21 +379,21 @@ fn golden_operator_overloading_binary() {
 	// the method bodies stays native.
 	compile_ok(
 		r#"
-		interface Plus<Other, Output> { func plus(other: Other): Output }
-		interface Minus<Other, Output> { func minus(other: Other): Output }
-		interface Times<Other, Output> { func times(other: Other): Output }
+		interface MyPlus<Other, Output> { func plus(other: Other): Output }
+		interface MyMinus<Other, Output> { func minus(other: Other): Output }
+		interface MyTimes<Other, Output> { func times(other: Other): Output }
 
 		struct Vec2(x: int, y: int) {
-			impl Plus<Other = Vec2, Output = Vec2> {
+			impl MyPlus<Other = Vec2, Output = Vec2> {
 				func plus(other: Vec2): Vec2 = Vec2(x = this.x + other.x, y = this.y + other.y)
 			}
 		}
 
-		impl Minus<Other = Vec2, Output = Vec2> for Vec2 {
+		impl MyMinus<Other = Vec2, Output = Vec2> for Vec2 {
 			func minus(other: Vec2): Vec2 = Vec2(x = this.x - other.x, y = this.y - other.y)
 		}
 
-		impl Times<Other = int, Output = Vec2> for Vec2 {
+		impl MyTimes<Other = int, Output = Vec2> for Vec2 {
 			func times(scale: int): Vec2 = Vec2(x = this.x * scale, y = this.y * scale)
 		}
 
@@ -388,22 +408,22 @@ fn golden_operator_overloading_unary() {
 	// native unary on primitives in the same program.
 	compile_ok(
 		r#"
-		interface Negate<Output> { func negate(): Output }
-		interface Not<Output> { func not(): Output }
-		interface BitNot<Output> { func bit_not(): Output }
+		interface MyNegate<Output> { func negate(): Output }
+		interface MyNot<Output> { func not(): Output }
+		interface MyBitNot<Output> { func bit_not(): Output }
 
 		struct Vec2(x: int, y: int)
-		impl Negate<Output = Vec2> for Vec2 {
+		impl MyNegate<Output = Vec2> for Vec2 {
 			func negate(): Vec2 = Vec2(x = -this.x, y = -this.y)
 		}
 
 		struct Tristate(known: boolean, value: boolean)
-		impl Not<Output = Tristate> for Tristate {
+		impl MyNot<Output = Tristate> for Tristate {
 			func not(): Tristate = Tristate(known = this.known, value = !this.value)
 		}
 
 		struct Mask(bits: int)
-		impl BitNot<Output = Mask> for Mask {
+		impl MyBitNot<Output = Mask> for Mask {
 			func bit_not(): Mask = Mask(bits = ~this.bits)
 		}
 
@@ -423,10 +443,10 @@ fn golden_operator_compound_assign_on_user_type() {
 	// closeout's critical fix) — pinned here at the whole-program level.
 	compile_ok(
 		r#"
-		interface Plus<Other, Output> { func plus(other: Other): Output }
+		interface MyPlus<Other, Output> { func plus(other: Other): Output }
 
 		struct Money(cents: int)
-		impl Plus<Other = Money, Output = Money> for Money {
+		impl MyPlus<Other = Money, Output = Money> for Money {
 			func plus(other: Money): Money = Money(cents = this.cents + other.cents)
 		}
 
@@ -449,20 +469,20 @@ fn golden_interface_default_methods() {
 	// the `<` operator, an explicit call to a default, and an override winning.
 	compile_ok(
 		r#"
-		interface Comparable<Other> {
+		interface MyComparable<Other> {
 			func compare_to(other: Other): int
 			func less_than(other: Other): boolean = this.compare_to(other) < 0
 		}
 
 		struct Version(major: int, minor: int)
-		impl Comparable<Other = Version> for Version {
+		impl MyComparable<Other = Version> for Version {
 			func compare_to(other: Version): int =
 				if (this.major != other.major) { this.major - other.major }
 				else { this.minor - other.minor }
 		}
 
 		struct Priority(level: int)
-		impl Comparable<Other = Priority> for Priority {
+		impl MyComparable<Other = Priority> for Priority {
 			func compare_to(other: Priority): int = this.level - other.level
 			func less_than(other: Priority): boolean = this.level < other.level
 		}
@@ -477,11 +497,12 @@ fn golden_interface_default_methods() {
 #[test]
 fn golden_enums_construction_and_qualification() {
 	// Nullary and field variants, generic enums, bare and qualified
-	// construction, and variant names shared across enums.
+	// construction, and variant names shared across enums. `Option` is the
+	// ambient core one (no local declaration) — core-name redefinition was
+	// made a diagnosed collision once core became the ambient prelude.
 	compile_ok(
 		r#"
 		enum Status { Active, Suspended(reason_code: int), Closed }
-		enum Option<T> { Some(value: T), None }
 		enum Tree { Leaf(v: int), Branch }
 		enum Plant { Leaf(v: int), Root }
 
@@ -502,10 +523,11 @@ fn golden_enums_construction_and_qualification() {
 fn golden_match_variants_bindings_and_guards() {
 	// Match over enums: payload bindings, nested variant patterns, guards
 	// (parenthesized — a guard ending in an identifier would otherwise eat the
-	// `->` as a closure), and wildcard fallthrough.
+	// `->` as a closure), and wildcard fallthrough. `Option` is the ambient
+	// core one (no local declaration) — see
+	// `golden_enums_construction_and_qualification`.
 	compile_ok(
 		r#"
-		enum Option<T> { Some(value: T), None }
 		enum Request { Get(id: int), Put(id: int, payload: int), Ping }
 
 		func unwrap_or(o: Option<int>, fallback: int): int = match (o) {
@@ -602,9 +624,9 @@ fn golden_late_resolved_inference() {
 	// (the 4C-c pending-operator queue).
 	compile_ok(
 		r#"
-		interface Comparable<Other> { func less_than(other: Other): boolean }
+		interface MyComparable<Other> { func less_than(other: Other): boolean }
 		struct Card(rank: int)
-		impl Comparable<Other = Card> for Card {
+		impl MyComparable<Other = Card> for Card {
 			func less_than(other: Card): boolean = this.rank < other.rank
 		}
 
@@ -684,11 +706,11 @@ fn golden_program_geometry() {
 	// generic bounded function, collections, and inference.
 	compile_ok(
 		r#"
-		interface Plus<Other, Output> { func plus(other: Other): Output }
+		interface MyPlus<Other, Output> { func plus(other: Other): Output }
 		interface Area { func area(): int }
 
 		struct Vec2(x: int, y: int) {
-			impl Plus<Other = Vec2, Output = Vec2> {
+			impl MyPlus<Other = Vec2, Output = Vec2> {
 				func plus(other: Vec2): Vec2 = Vec2(x = this.x + other.x, y = this.y + other.y)
 			}
 			func dot(other: Vec2): int = this.x * other.x + this.y * other.y
@@ -727,9 +749,11 @@ fn golden_program_geometry() {
 fn golden_program_inventory() {
 	// Another combined program: maps and lists driving business-ish logic,
 	// compound assignment, enum results, and while loops over indices.
+	// `Full` (not `Ok`) — a core-name (`Result.Ok`) clash was made a
+	// diagnosed collision once core became the ambient prelude.
 	compile_ok(
 		r#"
-		enum Verdict { Ok, Short(missing: int) }
+		enum Verdict { Full, Short(missing: int) }
 
 		struct Item(sku: int, count: int) {
 			func short_by(needed: int): int =
@@ -743,11 +767,11 @@ fn golden_program_inventory() {
 				missing += items[i].short_by(needed)
 				i += 1
 			}
-			if (missing == 0) { Ok } else { Short(missing = missing) }
+			if (missing == 0) { Full } else { Short(missing = missing) }
 		}
 
 		func penalty(v: Verdict): int = match (v) {
-			Ok -> 0,
+			Full -> 0,
 			Short(missing) if (missing > 10) -> missing * 2,
 			Short(missing) -> missing,
 		}
@@ -858,6 +882,352 @@ fn golden_enum_payload_struct_roundtrip() {
 	);
 }
 
+#[test]
+fn golden_enum_inherent_methods_read_payload_via_match_this() {
+	// Enum methods (Slice 4D): `this.field` is rejected on enum receivers, so
+	// an inherent method reads its payload by matching `this` itself.
+	compile_ok(
+		r#"
+		enum Shape { Circle(r: int), Square(s: int) }
+		impl Shape {
+			func area(): int = match (this) {
+				Circle(r) -> 3 * r * r,
+				Square(s) -> s * s,
+			}
+		}
+		func total(a: Shape, b: Shape): int = a.area() + b.area()
+		"#,
+	);
+}
+
+#[test]
+fn golden_enum_operator_impl() {
+	// A binary operator impl on an enum (Slice 4D + 4B), matching `this` and
+	// `other` to build a new variant. Also exercises the `field = name` pattern
+	// alias, needed here because the inner match would otherwise re-bind the
+	// same field name at both levels.
+	compile_ok(
+		r#"
+		interface MyPlus<Other, Output> { func plus(other: Other): Output }
+		enum Count { Zero, Val(n: int) }
+		impl MyPlus<Other = Count, Output = Count> for Count {
+			func plus(other: Count): Count = match (this) {
+				Zero -> other,
+				Val(n = a) -> match (other) {
+					Zero -> Val(n = a),
+					Val(n = b) -> Val(n = a + b),
+				},
+			}
+		}
+		func combine(a: Count, b: Count): Count = a + b
+		"#,
+	);
+}
+
+#[test]
+fn golden_enum_interface_default_method() {
+	// An interface default method (4C-b) materialized on an enum impl (4D):
+	// `doubled_label` is defined only in the interface, dispatched through an
+	// enum receiver.
+	compile_ok(
+		r#"
+		interface Describable {
+			func label(): int
+			func doubled_label(): int = this.label() * 2
+		}
+		enum Level { Low, High }
+		impl Describable for Level {
+			func label(): int = match (this) {
+				Low -> 1,
+				High -> 2,
+			}
+		}
+		func demo(l: Level): int = l.doubled_label()
+		"#,
+	);
+}
+
+#[test]
+fn golden_enum_methodless_alongside_methodful() {
+	// A method-less enum (byte-identical emit, no proto) used alongside a
+	// methodful one (proto-based ABI) in the same program — the two ABIs must
+	// coexist without interfering.
+	compile_ok(
+		r#"
+		enum Plain { A, B }
+		enum Shape { Circle(r: int) }
+		impl Shape {
+			func area(): int = match (this) { Circle(r) -> 3 * r * r }
+		}
+		func classify(p: Plain): int = match (p) { A -> 0, B -> 1 }
+		func demo(p: Plain, s: Shape): int = classify(p) + s.area()
+		"#,
+	);
+}
+
+#[test]
+fn golden_bounded_generic_comparable_via_bound_explicit_call() {
+	// Comparisons on generics (4C-c): a bounded generic function body calls
+	// a bound-provided method THROUGH the bound. Deliberately an explicit
+	// method call, not `<` operator syntax — see the file header's
+	// sharpest-deferral note. The method is named `lighter_than`, not
+	// `less_than`: with the stdlib operator prelude on by default, a method
+	// named `less_than` would resolve through the prelude's own blanket
+	// `Comparable` impl (a genuine resolution-precedence surprise reported
+	// separately, not patched around here — KK5) instead of this test's own
+	// user-declared bound.
+	compile_ok(
+		r#"
+		interface MyComparable<Other> { func lighter_than(other: Other): boolean }
+		struct Weight(kg: int)
+		impl MyComparable<Other = Weight> for Weight {
+			func lighter_than(other: Weight): boolean = this.kg < other.kg
+		}
+		func lighter<T: MyComparable<Other = T>>(a: T, b: T): T =
+			if (a.lighter_than(b)) { a } else { b }
+		func demo(x: Weight, y: Weight): Weight = lighter(x, y)
+		"#,
+	);
+}
+
+// KNOWN BUG (reported, not fixed here — needs its own designed slice): when a
+// user's generic bound declares a method whose NAME collides with a method a
+// stdlib blanket impl provides (e.g. a bound `MyComparable` with `less_than`,
+// colliding with the prelude's blanket `Comparable`), `resolve_method` on a
+// still-generic `Param` receiver resolves through the blanket impl instead of
+// the parameter's own declared bound (`head_of` returns `None` for a bare
+// `Param`, so phase 1's candidate search only ever finds blanket buckets).
+// The sibling test above sidesteps it by renaming the method to
+// `lighter_than`. A naive fix — reordering `resolve_param_method` ahead of
+// phase 1 — was tried and REVERTED: it breaks explicit method calls through a
+// truly-unconstrained blanket impl (`func same<T>(a: T, b: T) = a.equals(b)`
+// via the prelude's blanket `Equals` stops resolving), which is the exact
+// shape the default prelude must keep working. The real fix needs designed
+// precedence rules between declared bounds and blanket impls.
+
+#[test]
+fn golden_late_pinned_comparison_via_param_annotation() {
+	// A second late-pinning site for the 4C-c queue, distinct from the
+	// `let`-annotation one above: the empty list's element type is pinned by
+	// flowing into a FUNCTION PARAMETER's annotated type instead.
+	compile_ok(
+		r#"
+		interface MyComparable<Other> { func less_than(other: Other): boolean }
+		struct Card(rank: int)
+		impl MyComparable<Other = Card> for Card {
+			func less_than(other: Card): boolean = this.rank < other.rank
+		}
+		func first(xs: #[Card]): Card = xs[0]
+
+		func beats(a: Card, b: Card): boolean = {
+			let xs = #[a, b]
+			let lt = xs[0] < xs[1]
+			let head = first(xs)
+			if (head.rank > 0) { lt } else { false }
+		}
+		"#,
+	);
+}
+
+#[test]
+fn golden_return_early_multiple_branches() {
+	// `return` (4E) in more than one guard branch of the same function body.
+	compile_ok(
+		r#"
+		func classify(n: int): int = {
+			if (n < 0) { return -1 }
+			if (n == 0) { return 0 }
+			1
+		}
+		"#,
+	);
+}
+
+#[test]
+fn golden_shadowing_multi_step_chain() {
+	// A same-scope re-let chain three deep (4E): each `let y` renames past the
+	// previous JS binding rather than colliding.
+	compile_ok(
+		r#"
+		func transform(x: int): int = {
+			let y = x + 1
+			let y = y * 2
+			let y = y - 3
+			y
+		}
+		"#,
+	);
+}
+
+#[test]
+fn golden_module_let_graph_with_mutual_recursion() {
+	// A top-level `let` (4E) whose initializer calls into a pair of mutually
+	// recursive module functions.
+	compile_ok(
+		r#"
+		func is_even(n: int): boolean = if (n == 0) { true } else { is_odd(n - 1) }
+		func is_odd(n: int): boolean = if (n == 0) { false } else { is_even(n - 1) }
+		let ten_is_even = is_even(10)
+		func demo(): boolean = ten_is_even
+		"#,
+	);
+}
+
+#[test]
+fn golden_method_own_generic_bound_satisfying() {
+	// An instance method's OWN generic bound (4G-b), called with a concrete
+	// argument that satisfies it.
+	compile_ok(
+		r#"
+		interface Area { func area(): int }
+		struct Square(side: int)
+		impl Area for Square { func area(): int = this.side * this.side }
+		struct Box(v: int) { func apply<U: Area>(u: U): int = u.area() }
+		func total(b: Box, s: Square): int = b.apply(s)
+		"#,
+	);
+}
+
+#[test]
+fn golden_method_own_generic_bound_forwarding() {
+	// The classic generic-to-generic forwarding case (4G-b): the caller's own
+	// `T: Area` bound satisfies the callee method's identical requirement.
+	compile_ok(
+		r#"
+		interface Area { func area(): int }
+		struct Box(v: int) { func apply<U: Area>(u: U): int = u.area() }
+		func outer<T: Area>(b: Box, x: T): int = b.apply(x)
+		"#,
+	);
+}
+
+#[test]
+fn golden_struct_ctor_bound_satisfying() {
+	// A struct constructor's declared generic bound (4G-b), constructed with a
+	// concrete type argument that satisfies it.
+	compile_ok(
+		r#"
+		interface Area { func area(): int }
+		struct Square(side: int)
+		impl Area for Square { func area(): int = this.side * this.side }
+		struct Container<T: Area>(value: T)
+		func make(s: Square): Container<Square> = Container(value = s)
+		func demo(s: Square): int = make(s).value.area()
+		"#,
+	);
+}
+
+#[test]
+fn golden_enum_ctor_bound_satisfying() {
+	// An enum (field-variant) constructor's declared generic bound (4G-b),
+	// constructed with a satisfying concrete type argument.
+	compile_ok(
+		r#"
+		interface Area { func area(): int }
+		struct Square(side: int)
+		impl Area for Square { func area(): int = this.side * this.side }
+		enum Holder<T: Area> { Some(value: T), Empty }
+		func make(s: Square): Holder<Square> = Holder.Some(value = s)
+		"#,
+	);
+}
+
+#[test]
+fn golden_strings_escapes_and_interpolation() {
+	// String expressions (4H): escapes alongside a string interpoland and an
+	// int interpoland in one literal.
+	compile_ok(
+		r#"
+		func greet(name: string, n: int): string = "Hello, ${name}! n=${n}\n"
+		"#,
+	);
+}
+
+#[test]
+fn golden_string_pattern_match_with_escapes() {
+	// String PATTERNS (4H) may carry escapes too, reusing the same cooking as
+	// string expressions.
+	compile_ok(
+		r#"
+		func classify(s: string): int = match (s) {
+			"a\nb" -> 1,
+			"tab\there" -> 2,
+			_ -> 0,
+		}
+		"#,
+	);
+}
+
+#[test]
+fn golden_for_loop_ranges_all_shapes() {
+	// `for` loops over numeric ranges (4H): exclusive, inclusive, and a
+	// parenthesized binary-expression bound.
+	compile_ok(
+		r#"
+		func sum_exclusive(n: int): int = {
+			let mut total = 0
+			for (i in 1..n) { total = total + i }
+			total
+		}
+		func sum_inclusive(n: int): int = {
+			let mut total = 0
+			for (i in 1..=n) { total = total + i }
+			total
+		}
+		func sum_paren_binary(a: int, b: int, n: int): int = {
+			let mut total = 0
+			for (i in (a + b)..n) { total = total + i }
+			total
+		}
+		"#,
+	);
+}
+
+#[test]
+fn golden_strings_equality_concat_compound_append() {
+	// String equality (native `===`), `+` concatenation, and `+=` compound
+	// append (4H) in one program.
+	compile_ok(
+		r#"
+		func label(a: string, b: string): string = {
+			let mut s = a
+			s += "-"
+			s += b
+			s
+		}
+		func same(a: string, b: string): boolean = a == b
+		"#,
+	);
+}
+
+#[test]
+fn golden_combo_enum_default_method_for_loop_string_builder() {
+	// Combination: an enum implementing an interface default method, called
+	// inside a `for` loop that builds a string via compound `+=` append.
+	compile_ok(
+		r#"
+		interface Describable {
+			func label(): string
+			func tagged(): string = "[${this.label()}]"
+		}
+		enum Item { Widget(id: int), Gadget(id: int) }
+		impl Describable for Item {
+			func label(): string = match (this) {
+				Widget(id) -> "w${id}",
+				Gadget(id) -> "g${id}",
+			}
+		}
+		func build_report(n: int): string = {
+			let mut report = ""
+			for (i in 0..n) {
+				report += Item.Widget(id = i).tagged()
+			}
+			report
+		}
+		"#,
+	);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Tier 2: run-tier programs (executed under Node, stdout asserted)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -866,23 +1236,23 @@ fn golden_enum_payload_struct_roundtrip() {
 fn golden_run_vec2_operator_suite() {
 	// Binary +, -, scaling by int, unary negate, and compound += on one struct.
 	let src = r#"
-		interface Plus<Other, Output> { func plus(other: Other): Output }
-		interface Minus<Other, Output> { func minus(other: Other): Output }
-		interface Times<Other, Output> { func times(other: Other): Output }
-		interface Negate<Output> { func negate(): Output }
+		interface MyPlus<Other, Output> { func plus(other: Other): Output }
+		interface MyMinus<Other, Output> { func minus(other: Other): Output }
+		interface MyTimes<Other, Output> { func times(other: Other): Output }
+		interface MyNegate<Output> { func negate(): Output }
 
 		struct Vec2(x: int, y: int) {
-			impl Plus<Other = Vec2, Output = Vec2> {
+			impl MyPlus<Other = Vec2, Output = Vec2> {
 				func plus(other: Vec2): Vec2 = Vec2(x = this.x + other.x, y = this.y + other.y)
 			}
-			impl Minus<Other = Vec2, Output = Vec2> {
+			impl MyMinus<Other = Vec2, Output = Vec2> {
 				func minus(other: Vec2): Vec2 = Vec2(x = this.x - other.x, y = this.y - other.y)
 			}
 		}
-		impl Times<Other = int, Output = Vec2> for Vec2 {
+		impl MyTimes<Other = int, Output = Vec2> for Vec2 {
 			func times(scale: int): Vec2 = Vec2(x = this.x * scale, y = this.y * scale)
 		}
-		impl Negate<Output = Vec2> for Vec2 {
+		impl MyNegate<Output = Vec2> for Vec2 {
 			func negate(): Vec2 = Vec2(x = -this.x, y = -this.y)
 		}
 
@@ -996,13 +1366,13 @@ fn golden_run_interface_default_method() {
 	// A materialized interface default (`less_than` defined only in the
 	// interface) drives both the `<` operator and an explicit call.
 	let src = r#"
-		interface Comparable<Other> {
+		interface MyComparable<Other> {
 			func compare_to(other: Other): int
 			func less_than(other: Other): boolean = this.compare_to(other) < 0
 		}
 
 		struct Version(major: int, minor: int)
-		impl Comparable<Other = Version> for Version {
+		impl MyComparable<Other = Version> for Version {
 			func compare_to(other: Version): int =
 				if (this.major != other.major) { this.major - other.major }
 				else { this.minor - other.minor }
@@ -1056,9 +1426,9 @@ fn golden_run_late_pinned_inference() {
 	// inference variable re-resolves to the user impl once pinned, and actually
 	// dispatches at runtime.
 	let src = r#"
-		interface Comparable<Other> { func less_than(other: Other): boolean }
+		interface MyComparable<Other> { func less_than(other: Other): boolean }
 		struct Card(rank: int)
-		impl Comparable<Other = Card> for Card {
+		impl MyComparable<Other = Card> for Card {
 			func less_than(other: Card): boolean = this.rank < other.rank
 		}
 
@@ -1139,7 +1509,7 @@ fn golden_run_bit_manipulation() {
 fn golden_run_inventory_program() {
 	// The combined inventory program from the compile tier, executed.
 	let src = r#"
-		enum Verdict { Ok, Short(missing: int) }
+		enum Verdict { Full, Short(missing: int) }
 
 		struct Item(sku: int, count: int) {
 			func short_by(needed: int): int =
@@ -1153,11 +1523,11 @@ fn golden_run_inventory_program() {
 				missing += items[i].short_by(needed)
 				i += 1
 			}
-			if (missing == 0) { Ok } else { Short(missing = missing) }
+			if (missing == 0) { Full } else { Short(missing = missing) }
 		}
 
 		func penalty(v: Verdict): int = match (v) {
-			Ok -> 0,
+			Full -> 0,
 			Short(missing) if (missing > 10) -> missing * 2,
 			Short(missing) -> missing,
 		}
@@ -1170,6 +1540,272 @@ fn golden_run_inventory_program() {
 	assert_eq!(run(src, "demo(3)"), "0"); // both items suffice
 	assert_eq!(run(src, "demo(5)"), "2"); // item 1 short by 2
 	assert_eq!(run(src, "demo(15)"), "36"); // short 12+6=18 > 10 → doubled
+}
+
+#[test]
+fn golden_run_enum_inherent_method_match_this() {
+	// Enum inherent method reading its payload via `match (this)` (4D).
+	let src = r#"
+		enum Shape { Circle(r: int), Square(s: int) }
+		impl Shape {
+			func area(): int = match (this) {
+				Circle(r) -> 3 * r * r,
+				Square(s) -> s * s,
+			}
+		}
+		func total(a: Shape, b: Shape): int = a.area() + b.area()
+	"#;
+	assert_eq!(
+		run(src, "total(Shape.Circle({ r: 2 }), Shape.Square({ s: 3 }))"),
+		"21"
+	);
+}
+
+#[test]
+fn golden_run_enum_operator_impl() {
+	// An operator impl on an enum (4D + 4B) actually dispatches at runtime.
+	let src = r#"
+		interface MyPlus<Other, Output> { func plus(other: Other): Output }
+		enum Count { Zero, Val(n: int) }
+		impl MyPlus<Other = Count, Output = Count> for Count {
+			func plus(other: Count): Count = match (this) {
+				Zero -> other,
+				Val(n = a) -> match (other) {
+					Zero -> Val(n = a),
+					Val(n = b) -> Val(n = a + b),
+				},
+			}
+		}
+		func combine(a: Count, b: Count): Count = a + b
+	"#;
+	assert_eq!(
+		run(src, "combine(Count.Val({ n: 3 }), Count.Val({ n: 4 })).n"),
+		"7"
+	);
+	assert_eq!(run(src, "combine(Count.Zero, Count.Val({ n: 5 })).n"), "5");
+}
+
+#[test]
+fn golden_run_enum_interface_default_method() {
+	// An interface default materialized on an enum impl (4C-b + 4D) runs.
+	let src = r#"
+		interface Describable {
+			func label(): int
+			func doubled_label(): int = this.label() * 2
+		}
+		enum Level { Low, High }
+		impl Describable for Level {
+			func label(): int = match (this) {
+				Low -> 1,
+				High -> 2,
+			}
+		}
+		func demo(l: Level): int = l.doubled_label()
+	"#;
+	assert_eq!(run(src, "demo(Level.Low)"), "2");
+	assert_eq!(run(src, "demo(Level.High)"), "4");
+}
+
+#[test]
+fn golden_run_bare_variant_pattern_disambiguated_by_scrutinee_type() {
+	// `Tree` and `Plant` both declare a `Leaf`/bare-shared-name variant, so `Leaf`/
+	// `Branch` alone are globally ambiguous — but the `t: Tree`-typed scrutinee
+	// pins the enum (type-directed variant resolution), so the bare arms need no
+	// `Tree.` prefix, and the emitted JS actually runs and dispatches correctly.
+	let src = r#"
+		enum Tree { Leaf, Branch }
+		enum Plant { Leaf, Root }
+
+		func describe(t: Tree): int = match (t) {
+			Leaf -> 0,
+			Branch -> 1,
+		}
+	"#;
+	assert_eq!(run(src, "describe(Tree.Leaf)"), "0");
+	assert_eq!(run(src, "describe(Tree.Branch)"), "1");
+}
+
+#[test]
+fn golden_run_bare_variant_construction_disambiguated_by_expected_type() {
+	// A bare nullary variant construction (`Leaf`, no `Tree.` prefix) disambiguates
+	// against the enum pinned by the enclosing return-type annotation, even though
+	// another enum shares the variant name.
+	let src = r#"
+		enum Tree { Leaf, Branch }
+		enum Plant { Leaf, Root }
+
+		func make(): Tree = Leaf
+
+		func tag(t: Tree): int = match (t) {
+			Leaf -> 0,
+			Branch -> 1,
+		}
+	"#;
+	assert_eq!(run(src, "tag(make())"), "0");
+}
+
+#[test]
+fn golden_run_interface_default_override_wins_at_runtime() {
+	// Override-wins (4C-b), verified with an override that computes something
+	// DIFFERENT from what the default would: default's `compare_to`-based
+	// `less_than` would say `10 < 3` is false, but the override unconditionally
+	// returns `true` — the runtime result can only be `true` if the override,
+	// not the default, is what actually got called.
+	let src = r#"
+		interface MyComparable<Other> {
+			func compare_to(other: Other): int
+			func less_than(other: Other): boolean = this.compare_to(other) < 0
+		}
+		struct Weird(v: int)
+		impl MyComparable<Other = Weird> for Weird {
+			func compare_to(other: Weird): int = this.v - other.v
+			func less_than(other: Weird): boolean = true
+		}
+		func check(a: Weird, b: Weird): boolean = a < b
+	"#;
+	assert_eq!(
+		run(src, "check(new Weird({ v: 10 }), new Weird({ v: 3 }))"),
+		"true"
+	);
+}
+
+#[test]
+fn golden_run_module_let_graph_mutual_recursion() {
+	// A top-level `let` whose initializer calls into mutually recursive
+	// module functions (4E) — the whole init graph must actually execute.
+	let src = r#"
+		func is_even(n: int): boolean = if (n == 0) { true } else { is_odd(n - 1) }
+		func is_odd(n: int): boolean = if (n == 0) { false } else { is_even(n - 1) }
+		let ten_is_even = is_even(10)
+		let eleven_is_even = is_even(11)
+		func demo(): boolean = ten_is_even
+		func demo2(): boolean = eleven_is_even
+	"#;
+	assert_eq!(run(src, "demo()"), "true");
+	assert_eq!(run(src, "demo2()"), "false");
+}
+
+#[test]
+fn golden_run_method_own_generic_bound() {
+	// Method own-generic bounds (4G-b), both satisfying and forwarding shapes,
+	// actually execute and dispatch to the right impl.
+	let src = r#"
+		interface Area { func area(): int }
+		struct Square(side: int)
+		impl Area for Square { func area(): int = this.side * this.side }
+		struct Box(v: int) { func apply<U: Area>(u: U): int = u.area() }
+		func total(b: Box, s: Square): int = b.apply(s)
+		func outer<T: Area>(b: Box, x: T): int = b.apply(x)
+	"#;
+	assert_eq!(
+		run(src, "total(new Box({ v: 1 }), new Square({ side: 4 }))"),
+		"16"
+	);
+	assert_eq!(
+		run(src, "outer(new Box({ v: 1 }), new Square({ side: 3 }))"),
+		"9"
+	);
+}
+
+#[test]
+fn golden_run_ctor_bounds_struct_and_enum() {
+	// Struct and enum constructor generic bounds (4G-b), both satisfying,
+	// exercised end-to-end.
+	let src = r#"
+		interface Area { func area(): int }
+		struct Square(side: int)
+		impl Area for Square { func area(): int = this.side * this.side }
+		struct Container<T: Area>(value: T)
+		enum Holder<T: Area> { Some(value: T), Empty }
+		func demo(s: Square): int = Container(value = s).value.area()
+		func demo_enum(s: Square): int = match (Holder.Some(value = s)) {
+			Holder.Some(value) -> value.area(),
+			Empty -> 0,
+		}
+	"#;
+	assert_eq!(run(src, "demo(new Square({ side: 5 }))"), "25");
+	assert_eq!(run(src, "demo_enum(new Square({ side: 6 }))"), "36");
+}
+
+#[test]
+fn golden_run_strings_escapes_interpolation_and_patterns() {
+	// Escapes, string + int interpolation, string equality/concat/compound
+	// append, and a string PATTERN with escapes, all executed under Node.
+	let src = r#"
+		func greet(name: string, n: int): string = "Hello, ${name}! n=${n}\n"
+		func label(a: string, b: string): string = {
+			let mut s = a
+			s += "-"
+			s += b
+			s
+		}
+		func same(a: string, b: string): boolean = a == b
+		func classify(s: string): int = match (s) {
+			"a\nb" -> 1,
+			"tab\there" -> 2,
+			_ -> 0,
+		}
+	"#;
+	assert_eq!(run(src, r#"greet("World", 5)"#), "Hello, World! n=5");
+	assert_eq!(run(src, r#"label("x", "y")"#), "x-y");
+	assert_eq!(run(src, r#"same("x", "x")"#), "true");
+	assert_eq!(run(src, r#"same("x", "y")"#), "false");
+	assert_eq!(run(src, r#"classify("a\nb")"#), "1");
+	assert_eq!(run(src, r#"classify("tab\there")"#), "2");
+	assert_eq!(run(src, r#"classify("nope")"#), "0");
+}
+
+#[test]
+fn golden_run_for_loop_ranges_all_shapes() {
+	// `for` loops (4H) over exclusive, inclusive, and parenthesized-bound
+	// ranges, verified against the classic 1..=n triangular-number sums.
+	let src = r#"
+		func sum_exclusive(n: int): int = {
+			let mut total = 0
+			for (i in 1..n) { total = total + i }
+			total
+		}
+		func sum_inclusive(n: int): int = {
+			let mut total = 0
+			for (i in 1..=n) { total = total + i }
+			total
+		}
+		func sum_paren_binary(a: int, b: int, n: int): int = {
+			let mut total = 0
+			for (i in (a + b)..n) { total = total + i }
+			total
+		}
+	"#;
+	assert_eq!(run(src, "sum_exclusive(5)"), "10"); // 1+2+3+4
+	assert_eq!(run(src, "sum_inclusive(5)"), "15"); // 1+2+3+4+5
+	assert_eq!(run(src, "sum_paren_binary(1, 1, 5)"), "9"); // 2+3+4
+}
+
+#[test]
+fn golden_run_combo_enum_default_method_for_loop_string_builder() {
+	// Combination end-to-end: an enum's interface default method, called
+	// inside a `for` loop that builds a string with compound `+=` append.
+	let src = r#"
+		interface Describable {
+			func label(): string
+			func tagged(): string = "[${this.label()}]"
+		}
+		enum Item { Widget(id: int), Gadget(id: int) }
+		impl Describable for Item {
+			func label(): string = match (this) {
+				Widget(id) -> "w${id}",
+				Gadget(id) -> "g${id}",
+			}
+		}
+		func build_report(n: int): string = {
+			let mut report = ""
+			for (i in 0..n) {
+				report += Item.Widget(id = i).tagged()
+			}
+			report
+		}
+	"#;
+	assert_eq!(run(src, "build_report(3)"), "[w0][w1][w2]");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

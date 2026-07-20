@@ -13,9 +13,7 @@ use crate::errors::TypeError;
 use ecow::EcoString;
 use nymph_ast::{
 	Spanned,
-	decl::{
-		Declaration, FuncDeclaration, ImplMember, InterfaceElement, InterfaceMember, StructInnerMember,
-	},
+	decl::{Declaration, FuncDeclaration, FuncKind, ImplMember, InterfaceElement, InterfaceMember},
 	expr::Expr,
 	ty::GenericParam,
 };
@@ -33,6 +31,12 @@ pub struct InherentMethod<'m> {
 	pub own_generics: usize,
 	pub params: Vec<Ty>,
 	pub ret: Ty,
+	/// The interface bounds declared on this method's own generics (Slice 4G-b),
+	/// e.g. `func apply<U: Area>(u: U)` — one [`Bound`] per bound, with `ty =
+	/// Param(base + j)` where `base` is the owner's generic count (the same offset
+	/// `collect_impl_member` uses for the method's own scope, and `commit_inherent`'s
+	/// subst covers), so a call site can substitute them exactly like `params`/`ret`.
+	pub bounds: Vec<Bound>,
 	pub namespaced: bool,
 	pub meta: &'m FuncDeclaration,
 	pub body: Option<&'m Expr>,
@@ -68,6 +72,33 @@ impl<'m> InherentRegistry<'m> {
 
 	fn candidates(&self, head: Head) -> Vec<usize> {
 		self.by_head.get(&head).cloned().unwrap_or_default()
+	}
+
+	/// The span of the non-namespaced (instance) inherent method named `name`
+	/// reachable from `head`'s self type, if any. Used by `finish_interface_impl`
+	/// (iface.rs, Slice 4K/HH3) to catch an interface-impl method (top-level `impl
+	/// … for` or a nested `impl Iface { .. }`) colliding with a same-named inherent
+	/// INSTANCE method on the same type — a collision `lower_hir.rs`'s
+	/// `assert_no_duplicate_methods` used to be the only thing catching, and only
+	/// by panicking.
+	///
+	/// Deliberately excludes `namespace func` statics (`m.namespaced`): a static
+	/// and an interface-impl instance method of the same name are DIFFERENT JS
+	/// slots (a class static vs. a prototype method — `collect_adt_methods`,
+	/// lower_hir.rs, keeps them in wholly separate `statics`/`methods` lists, each
+	/// independently checked by `assert_no_duplicate_methods`), so they're ordinary
+	/// overloading, not a collision. Without this filter, a `namespace func foo`
+	/// static false-positived a `DuplicateMember` against any interface-impl
+	/// instance method also named `foo` — legal, resolvable JS the checker
+	/// wrongly rejected (Slice 4K, Defect 2).
+	pub(crate) fn method_span(&self, head: Head, name: &str) -> Option<nymph_ast::Span> {
+		self.by_head.get(&head)?.iter().find_map(|&idx| {
+			self.impls[idx]
+				.methods
+				.get(name)
+				.filter(|m| !m.namespaced)
+				.map(|m| m.meta.name.1)
+		})
 	}
 }
 
@@ -119,25 +150,20 @@ impl<'m> Checker<'m> {
 			.interner
 			.mk_adt(def, GenericArgs::new(positional, Vec::new()));
 
+		// A `namespace func` is a static (`namespaced = true`); an instance `func`
+		// and a `mut func` both attach to `this` (`namespaced = false`; `mut`
+		// carries no extra checker restriction yet — see mutable-types, Task #1).
+		// Nested interface impls live in the separate `impls` field and are
+		// Milestone-B-later, so this inherent pass never sees them.
 		let mut methods = FxHashMap::default();
 		for m in members {
-			match &m.0 {
-				StructInnerMember::Member(inner) => {
-					self.collect_impl_member(&inner.0, generics_len, false, &mut methods);
+			let namespaced = match &m.0 {
+				ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => {
+					meta.kind == FuncKind::Namespace
 				}
-				StructInnerMember::ImplMut(members) => {
-					for inner in members {
-						self.collect_impl_member(&inner.0, generics_len, false, &mut methods);
-					}
-				}
-				StructInnerMember::Namespace(members) => {
-					for inner in members {
-						self.collect_impl_member(&inner.0, generics_len, true, &mut methods);
-					}
-				}
-				// Inner interface impls are Milestone-B-later.
-				StructInnerMember::Impl { .. } => {}
-			}
+				_ => false,
+			};
+			self.collect_impl_member(&m.0, generics_len, namespaced, self_ty, &mut methods);
 		}
 		self.pop_params();
 
@@ -170,9 +196,18 @@ impl<'m> Checker<'m> {
 		let self_ty = self.lower_type(type_);
 		let mut methods = FxHashMap::default();
 		for m in members {
-			self.collect_impl_member(&m.0, generics_len, false, &mut methods);
+			// Same kind-driven namespacing as a struct/enum body: a `namespace func`
+			// in an `impl Type { … }` block is a static. (Its lowering is a loud
+			// defer — see the `Declaration::Impl` arm in lower_hir.rs.)
+			let namespaced = match &m.0 {
+				ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => {
+					meta.kind == FuncKind::Namespace
+				}
+				_ => false,
+			};
+			self.collect_impl_member(&m.0, generics_len, namespaced, self_ty, &mut methods);
 		}
-		let constraints = self.lower_constraints(generics);
+		let constraints = self.lower_constraints(generics, 0);
 		self.pop_params();
 
 		let head = head_of(&self.interner, self_ty);
@@ -193,6 +228,7 @@ impl<'m> Checker<'m> {
 		member: &'m ImplMember,
 		base: usize,
 		namespaced: bool,
+		self_ty: Ty,
 		out: &mut FxHashMap<EcoString, InherentMethod<'m>>,
 	) {
 		let (meta, body): (&'m FuncDeclaration, Option<&'m Expr>) = match member {
@@ -200,6 +236,29 @@ impl<'m> Checker<'m> {
 			ImplMember::ExternalFunc(_, _, meta) => (meta, None),
 			ImplMember::Let { .. } | ImplMember::ExternalLet(..) => return,
 		};
+		// A struct/enum inner member of ANY kind (instance `func`, `namespace func`
+		// static, `mut func` method) shares this one per-type map keyed
+		// only by name — so a same-named member of a DIFFERENT kind collides here
+		// exactly as readily as two of the same kind (e.g. an instance `func at`
+		// and a `namespace func at`). Report it now, before it can silently
+		// shadow an unchecked body (see `TypeError::DuplicateMember`'s doc
+		// comment). Mirrors `build_def_map`'s top-level "duplicate reported, later
+		// definition wins" convention (def.rs) — the natural `out.insert` below
+		// already overwrites, so keeping that (rather than skipping the insert)
+		// keeps this check's fallback behavior consistent with the rest of the
+		// checker rather than introducing a second, different collision policy.
+		if let Some(prev) = out.get(&meta.name.0) {
+			let ty = self.display(self_ty);
+			self.emit(
+				meta.name.1,
+				TypeError::DuplicateMember {
+					name: meta.name.0.clone(),
+					ty,
+					redefined_span: meta.name.1,
+					prev: prev.meta.name.1,
+				},
+			);
+		}
 		let own_generics = meta.generics.len();
 		let mut scope = FxHashMap::default();
 		for (j, g) in meta.generics.iter().enumerate() {
@@ -215,6 +274,10 @@ impl<'m> Checker<'m> {
 			Some(ty) => self.lower_type(ty),
 			None => self.fresh(),
 		};
+		// Lower the method's own generics' bounds while their scope is still active
+		// (Slice 4G-b), offset past the owner's generics so `Bound::ty` lands at
+		// `Param(base + j)` — the exact index `commit_inherent`'s subst mints into.
+		let bounds = self.lower_constraints(&meta.generics, base);
 		self.pop_params();
 		out.insert(
 			meta.name.0.clone(),
@@ -222,6 +285,7 @@ impl<'m> Checker<'m> {
 				own_generics,
 				params,
 				ret,
+				bounds,
 				namespaced,
 				meta,
 				body,
@@ -230,7 +294,16 @@ impl<'m> Checker<'m> {
 	}
 
 	// ── Resolution ───────────────────────────────────────────────────────────
-	/// Resolve an inherent instance method `recv.name(args)`, if one exists.
+	/// Resolve an inherent instance method `recv.name(args)`. Returns the method's
+	/// instantiated return type paired with the *matched method's own defining
+	/// span* (its `func` name's identifier span, from `InherentMethod::meta`) — a
+	/// bare `impl Type { .. }` block commits no `ImplDef` (unlike an interface
+	/// impl, which threads `def.span` through `MethodResolution::impl_span` via
+	/// `commit_method`), so without this, an `Inherent`-sourced resolution could
+	/// never be told apart from one whose impl lives in an offset prelude clone
+	/// (Finding 2, stdlib linkage groundwork review round 2) — `impl_is_unmaterialized`
+	/// (`infer_expr.rs`) reads exactly this span the same way it reads
+	/// `ImplDirect`/`InterfaceDefault`'s `def.span`.
 	pub(crate) fn resolve_inherent(
 		&mut self,
 		recv: Ty,
@@ -238,8 +311,10 @@ impl<'m> Checker<'m> {
 		arg_tys: &[Ty],
 		arg_lits: &[bool],
 		span: nymph_ast::Span,
-	) -> Option<Ty> {
-		let recv = self.shallow_resolve(recv);
+	) -> Option<(Ty, nymph_ast::Span)> {
+		// See `resolve_method`'s matching comment: peel `mut` before matching
+		// against any impl's (never-`mut`) `Self` type.
+		let recv = self.strip_mut(recv);
 		let head = head_of(&self.interner, recv)?;
 		let candidates = self.inherent.candidates(head);
 		for idx in candidates {
@@ -256,7 +331,9 @@ impl<'m> Checker<'m> {
 			let matched = self.inherent_receiver_matches(idx, recv);
 			self.table.rollback_to(snapshot);
 			if matched {
-				return Some(self.commit_inherent(idx, recv, name, arg_tys, arg_lits, span, false));
+				let method_span = self.inherent.impls[idx].methods[name].meta.name.1;
+				let ret = self.commit_inherent(idx, recv, name, arg_tys, arg_lits, span, false);
+				return Some((ret, method_span));
 			}
 		}
 		None
@@ -315,6 +392,7 @@ impl<'m> Checker<'m> {
 		let own = method.own_generics;
 		let params = method.params.clone();
 		let ret = method.ret;
+		let bounds = method.bounds.clone();
 
 		let mut subst = self.fresh_subst(generics_len);
 		let impl_self = self.subst(self_pattern, &subst, None);
@@ -325,6 +403,23 @@ impl<'m> Checker<'m> {
 			subst.insert(ParamIdx((generics_len + j) as u32), self.fresh());
 		}
 		let self_concrete = impl_self;
+		// Defer one `pending_bounds` obligation per bound on the method's own
+		// generics (Slice 4G-b), substituted through the same `subst` as
+		// `params`/`ret` so it lands on the freshly-minted variable — mirrors
+		// `fn_type_of`'s treatment of `FuncSig::bounds` exactly. Owner/impl-level
+		// constraints are NOT pushed here: they are already enforced eagerly by
+		// `inherent_receiver_matches`'s `constraints_hold` call for instance
+		// receivers, and namespaced methods only exist in ADT bodies (whose
+		// `constraints` is always empty).
+		for bound in &bounds {
+			let ty = self.subst(bound.ty, &subst, Some(self_concrete));
+			let args: Vec<(EcoString, Ty)> = bound
+				.args
+				.iter()
+				.map(|(name, t)| (name.clone(), self.subst(*t, &subst, Some(self_concrete))))
+				.collect();
+			self.pending_bounds.push((span, ty, bound.interface, args));
+		}
 		let params: Vec<Ty> = params
 			.iter()
 			.map(|t| self.subst(*t, &subst, Some(self_concrete)))
@@ -421,14 +516,26 @@ impl<'m> Checker<'m> {
 		let snapshot = self.table.snapshot();
 		let diag_mark = self.diags.len();
 		let pending_mark = self.pending_operators.len();
+		let pending_bounds_mark = self.pending_bounds.len();
 		self.param_bounds.clear();
 		self.record_param_bounds(owner_generics, 0);
 		self.record_param_bounds(&meta.generics, base);
 		self.push_params(scope);
 		self.push_scope();
+		// A `mut func`'s `this` is bound as `mut Self` — the smaller correct step
+		// short of full MT2 mut-func semantics (per-method mut availability, bound-
+		// method typing), needed so field-slot reassignment through `this` inside
+		// an existing `mut func` body keeps type-checking. Param/return
+		// substitution below still uses the plain `self_ty` — `self` referenced
+		// there is unaffected by the receiver's own mutability.
+		let receiver_ty = if meta.kind == FuncKind::Mut {
+			self.interner.mk_mut(self_ty)
+		} else {
+			self_ty
+		};
 		let prev_self = std::mem::replace(
 			&mut self.self_ty,
-			if namespaced { None } else { Some(self_ty) },
+			if namespaced { None } else { Some(receiver_ty) },
 		);
 
 		let empty = FxHashMap::default();
@@ -450,6 +557,9 @@ impl<'m> Checker<'m> {
 		// be finalized against a rolled-back table or leak into the next body's
 		// drain.
 		self.pending_operators.truncate(pending_mark);
+		// Same discard for any bound obligation this trial deferred (Slice 4G) —
+		// see the comment just above.
+		self.pending_bounds.truncate(pending_bounds_mark);
 
 		// Accept the inferred type only if it is fully generalised.
 		if self.has_infer(ret) { None } else { Some(ret) }
@@ -531,9 +641,16 @@ impl<'m> Checker<'m> {
 		self.record_param_bounds(&meta.generics, base);
 		self.push_params(scope);
 		self.push_scope();
+		// See the matching comment in `infer_inherent_return`: a `mut func`'s
+		// `this` is bound as `mut Self`.
+		let receiver_ty = if meta.kind == FuncKind::Mut {
+			self.interner.mk_mut(self_ty)
+		} else {
+			self_ty
+		};
 		let prev_self = std::mem::replace(
 			&mut self.self_ty,
-			if namespaced { None } else { Some(self_ty) },
+			if namespaced { None } else { Some(receiver_ty) },
 		);
 
 		let empty = FxHashMap::default();
@@ -548,6 +665,7 @@ impl<'m> Checker<'m> {
 		// (owner generics + this method's own) are still live — see
 		// `pending_operators`'s doc comment.
 		self.finalize_pending_operators();
+		self.finalize_pending_bounds();
 
 		self.ret_ty = prev_ret;
 		self.self_ty = prev_self;
@@ -591,24 +709,18 @@ impl<'m> Checker<'m> {
 			.collect();
 		for (def, member) in adts {
 			let module = self.module;
-			let (generics, members) = match &module.members[member] {
+			let (generics, impls) = match &module.members[member] {
 				Declaration::Struct {
-					generics, members, ..
-				} => (generics.as_slice(), members.as_slice()),
+					generics, impls, ..
+				} => (generics.as_slice(), impls.as_slice()),
 				Declaration::Enum {
-					generics, members, ..
-				} => (generics.as_slice(), members.as_slice()),
+					generics, impls, ..
+				} => (generics.as_slice(), impls.as_slice()),
 				_ => continue,
 			};
-			for m in members {
-				let StructInnerMember::Impl {
-					generics: impl_generics,
-					members: impl_members,
-					..
-				} = &m.0
-				else {
-					continue;
-				};
+			for m in impls {
+				let impl_generics = &m.0.generics;
+				let impl_members = &m.0.members;
 				let combined: Vec<Spanned<GenericParam>> =
 					generics.iter().chain(impl_generics).cloned().collect();
 				self.push_params(build_param_scope(&combined));
@@ -638,7 +750,14 @@ impl<'m> Checker<'m> {
 				_ => continue,
 			};
 			self.push_scope();
-			let prev_self = self.self_ty.replace(self_ty);
+			// See the matching comment in `check_method_body`: a `mut func`'s
+			// `this` is bound as `mut Self`.
+			let receiver_ty = if meta.kind == FuncKind::Mut {
+				self.interner.mk_mut(self_ty)
+			} else {
+				self_ty
+			};
+			let prev_self = self.self_ty.replace(receiver_ty);
 			for param in &meta.params {
 				let ty = self.lower_type(&param.0.type_);
 				let ty = self.subst(ty, &empty, Some(self_ty));
@@ -658,6 +777,7 @@ impl<'m> Checker<'m> {
 			// comment. All members of one impl block share the same bounds, but the
 			// next impl block (or nested impl block) clears and rebuilds them.
 			self.finalize_pending_operators();
+			self.finalize_pending_bounds();
 			self.ret_ty = prev_ret;
 			self.self_ty = prev_self;
 			self.pop_scope();
@@ -787,6 +907,7 @@ impl<'m> Checker<'m> {
 		// interface's generics + the synthetic self bound) are still live — see
 		// `pending_operators`'s doc comment.
 		self.finalize_pending_operators();
+		self.finalize_pending_bounds();
 
 		self.ret_ty = prev_ret;
 		self.checking_interface_default = prev_checking;

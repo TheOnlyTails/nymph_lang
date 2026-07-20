@@ -1,0 +1,22 @@
+[package]
+name = "nymph-wasm"
+description = "Browser-loadable WASM module compiling Nymph source to JS + diagnostics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+nymph-ast = { workspace = true }
+nymph-diagnostics = { workspace = true }
+nymph-syntax = { workspace = true }
+nymph-sema = { workspace = true }
+nymph-codegen = { workspace = true }
+serde = { workspace = true }
+wasm-bindgen = "0.2.126"
+serde-wasm-bindgen = "0.6.5"

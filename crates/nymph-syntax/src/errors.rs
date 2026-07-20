@@ -51,6 +51,18 @@ pub enum ParseError {
 	ExpectedMember { found: EcoString },
 	/// An interface member was expected but a different token was found.
 	ExpectedInterfaceMember { found: EcoString },
+	/// A `mut func` / `namespace func` / `namespace let` appeared at module top
+	/// level, where there is no receiver type to attach it to.
+	FuncKindOutsideType { kind: EcoString },
+	/// A `mut func` / `namespace func` appeared inside a `namespace` block, which
+	/// may only hold regular `func`s.
+	FuncKindInNamespace { kind: EcoString },
+	/// A `namespace let` was written `mut`. A static binding can never be mutable.
+	MutableNamespaceLet,
+	/// A struct/enum-variant field was written with a `mut` modifier
+	/// (`mut n: int`). Field mutability is expressed on the field's *type*
+	/// (`n: mut int`), not as a modifier on the field itself.
+	MutFieldModifier,
 }
 
 impl IntoDiagnostic for ParseError {
@@ -76,6 +88,17 @@ impl IntoDiagnostic for ParseError {
 			}
 			E::ExpectedInterfaceMember { found } => {
 				format!("expected an interface member, found {found}").into()
+			}
+			E::FuncKindOutsideType { kind } => {
+				format!("a `{kind}` is only valid inside a struct, enum, interface, or impl body").into()
+			}
+			E::FuncKindInNamespace { kind } => {
+				format!("a `namespace` may only contain regular `func`s and `let`s, not a `{kind}`").into()
+			}
+			E::MutableNamespaceLet => "a `namespace let` is a static binding and cannot be `mut`".into(),
+			E::MutFieldModifier => {
+				"a field's mutability is written on its type (`n: mut int`), not as a `mut` field modifier"
+					.into()
 			}
 		}
 	}

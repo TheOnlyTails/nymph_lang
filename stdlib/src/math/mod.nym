@@ -57,11 +57,7 @@ impl float {
   /// The distance from 0 — the value without its sign.
   func abs(): float = if (this > 0) this else -this
   /// -1, 0, or 1 according to the number's sign.
-  func sign(): int = match (this.compare_to(0)) {
-    Order.Equal -> 0,
-    Order.GreaterThan -> 1,
-    Order.LessThan -> -1,
-  }
+  func sign(): int = if (this > 0) 1 else if (this < 0) -1 else 0
   /// The midpoint between this number and `other`.
   func midpoint(other: float) = (this + other) / 2
 

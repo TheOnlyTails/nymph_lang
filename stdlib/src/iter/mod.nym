@@ -1,6 +1,7 @@
 import @/option with (Option)
 
-/// Minimal iterator surface that the current stdlib and typechecker can agree on.
+/// The iterator surface: `next` advances the iterator, so it is a `mut func`
+/// (producing the next value mutates the iterator's own state).
 public interface Iterator<Item> {
-  func next(): Option<Item>
+  mut func next(): Option<Item>
 }

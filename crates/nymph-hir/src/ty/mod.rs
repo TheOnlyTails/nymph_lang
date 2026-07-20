@@ -59,6 +59,11 @@ pub enum TyKind {
 	/// this type satisfies every listed interface. Treated as logical AND
 	/// everywhere (the old checker's bug was treating it like OR).
 	Intersection(Vec<Ty>),
+	/// `mut T` — a mutable *view* of `T`. Compile-time-only: codegen ignores it,
+	/// since JS values are already mutable. `mut T` is implicitly assignable to
+	/// `T` (one-way; see `subtype`), never the reverse. The field's declared type
+	/// is the sole authority for whether that field's slot is mutable.
+	Mut(Ty),
 
 	// ── Variables ────────────────────────────────────────────────────────────
 	/// A rigid generic parameter (skolem) — may not be unified away.
@@ -234,6 +239,15 @@ impl Interner {
 	}
 	pub fn mk_infer(&mut self, var: InferVar) -> Ty {
 		self.intern(TyKind::Infer(var))
+	}
+	/// Idempotent: `mut mut T` collapses to `mut T` (a mutable view of a mutable
+	/// view is just a mutable view) so `Mut` never nests. Callers elsewhere in
+	/// the checker (e.g. `strip_mut`, one `match` peel) rely on this invariant.
+	pub fn mk_mut(&mut self, inner: Ty) -> Ty {
+		if matches!(self.kind(inner), TyKind::Mut(_)) {
+			return inner;
+		}
+		self.intern(TyKind::Mut(inner))
 	}
 
 	/// Build an intersection, flattening nested intersections and collapsing the

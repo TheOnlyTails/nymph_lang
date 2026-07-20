@@ -46,6 +46,9 @@ pub enum Type {
 	},
 	/// `(A)` — a parenthesised type, kept in the tree to preserve precedence intent.
 	Grouped(Box<Spanned<Self>>),
+	/// `mut A` — a mutable *view* of `A`. Distinct from binding-position `mut`
+	/// (`let mut`, `mut` params), which is consumed before a type is ever parsed.
+	Mut(Box<Spanned<Self>>),
 }
 
 /// A parameter in a function *type*: an optional label plus the parameter type.

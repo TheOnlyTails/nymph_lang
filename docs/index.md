@@ -12,26 +12,28 @@ hero:
       link: /guide/
 
 features:
-  - title: Feature A
-    details: Lorem ipsum dolor sit amet, consectetur adipiscing elit
-  - title: Feature B
-    details: Lorem ipsum dolor sit amet, consectetur adipiscing elit
-  - title: Feature C
-    details: Lorem ipsum dolor sit amet, consectetur adipiscing elit
+  - title: Expression-oriented
+    details: "if, match, blocks, and loops all produce values — write the answer, not a pile of statements."
+  - title: Structs, enums, and matching
+    details: Model your domain with product and sum types, then take them apart with exhaustive pattern matching.
+  - title: No null, no exceptions
+    details: Absence is Option, failure is Result — both ambient, both checked, so callers can't forget the edge cases.
 ---
 
 ::: code-group
 
-```nym [hello_world.nym]
-func main() -> {
-  println("Hello world!")
+```nymph [hello_world.nym]
+import std/io
+
+func main() = {
+  io.println("Hello world!")
 }
 ```
 
 ```nym [functions.nym]
-func factorial(n: int) -> match (n) {
-  ..=1 -> 1
-  _ -> n * factorial(n - 1)
+func factorial(n: int): int = match (n) {
+  ..=1 -> 1,
+  _ -> n * factorial(n - 1),
 }
 ```
 
@@ -42,14 +44,15 @@ enum BinaryTree<T> {
 }
 ```
 
-```nym [lists.nym]
-let nums = #[1, 2, 3]
+```nymph [lists.nym]
+import std/io
 
+let nums = #[1, 2, 3]
 nums
-  .filter(_ % 2 == 1)
-  .map(_ ** 2)
-  .fold(0, (x, y) -> x + y)
-  |> println // 10
+  .filter($ % 2 == 1)
+  .map($ ** 2)
+  .fold(0, $0 + $1)
+  |> io.println // 10
 ```
 
 :::

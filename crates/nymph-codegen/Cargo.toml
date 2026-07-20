@@ -15,3 +15,6 @@ nymph-sema = { workspace = true }
 nymph-diagnostics = { workspace = true }
 oxc = { workspace = true }
 ecow = { workspace = true }
+
+[dev-dependencies]
+nymph-ast = { workspace = true }
