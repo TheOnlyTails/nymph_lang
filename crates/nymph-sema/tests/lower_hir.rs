@@ -1,6 +1,6 @@
 use nymph_hir::hir::{
-	BinOp, HirArrayElem, HirExpr, HirLit, HirMapElem, HirModule, HirPat, HirStmt, NumKind,
-	ScalarCastKind, UnOp,
+	BinOp, BuiltinResult, HirArrayElem, HirExpr, HirLit, HirMapElem, HirModule, HirPat, HirStmt,
+	NumKind, ScalarCastKind, UnOp,
 };
 use nymph_sema::check_module;
 use nymph_syntax::parse_module;
@@ -31,6 +31,7 @@ fn lowers_a_function_with_arithmetic() {
 		f.body,
 		HirExpr::Binary {
 			op: BinOp::Add,
+			result: BuiltinResult::Int,
 			lhs: Box::new(HirExpr::Local("a".into())),
 			rhs: Box::new(HirExpr::Local("b".into())),
 		}
@@ -501,6 +502,7 @@ fn lowers_primitive_arithmetic_to_binary_unchanged() {
 		hir.funcs[0].body,
 		HirExpr::Binary {
 			op: BinOp::Add,
+			result: BuiltinResult::Int,
 			lhs: Box::new(HirExpr::Local("a".into())),
 			rhs: Box::new(HirExpr::Local("b".into())),
 		}
@@ -571,6 +573,7 @@ fn lowers_compound_assign_on_int_stays_native() {
 		value.as_ref(),
 		&HirExpr::Binary {
 			op: BinOp::Add,
+			result: BuiltinResult::Int,
 			lhs: Box::new(HirExpr::Local("x".into())),
 			rhs: Box::new(HirExpr::Num(1.0, NumKind::Int)),
 		}
@@ -801,6 +804,7 @@ fn lowers_primitive_less_than_to_binary_unchanged() {
 		hir.funcs[0].body,
 		HirExpr::Binary {
 			op: BinOp::Lt,
+			result: BuiltinResult::Boolean,
 			lhs: Box::new(HirExpr::Local("a".into())),
 			rhs: Box::new(HirExpr::Local("b".into())),
 		}
@@ -875,6 +879,7 @@ fn lowers_primitive_negate_to_unary_unchanged() {
 		hir.funcs[0].body,
 		HirExpr::Unary {
 			op: UnOp::Neg,
+			result: BuiltinResult::Int,
 			operand: Box::new(HirExpr::Local("x".into())),
 		}
 	);
@@ -888,6 +893,7 @@ fn lowers_primitive_bit_not_to_unary_unchanged() {
 		hir.funcs[0].body,
 		HirExpr::Unary {
 			op: UnOp::BitNot,
+			result: BuiltinResult::Int,
 			operand: Box::new(HirExpr::Local("x".into())),
 		}
 	);
@@ -1080,6 +1086,7 @@ fn lowers_same_scope_let_shadow_with_a_rename() {
 		value,
 		&HirExpr::Binary {
 			op: BinOp::Add,
+			result: BuiltinResult::Int,
 			lhs: Box::new(HirExpr::Local("x".into())),
 			rhs: Box::new(HirExpr::Num(1.0, NumKind::Int)),
 		},
@@ -1091,6 +1098,7 @@ fn lowers_same_scope_let_shadow_with_a_rename() {
 		tail.as_ref(),
 		&HirExpr::Binary {
 			op: BinOp::Mul,
+			result: BuiltinResult::Int,
 			lhs: Box::new(HirExpr::Local("x$1".into())),
 			rhs: Box::new(HirExpr::Num(10.0, NumKind::Int)),
 		},
@@ -1191,6 +1199,7 @@ fn nested_block_shadow_renames_to_avoid_the_tdz_hazard() {
 		tail.as_deref(),
 		Some(&HirExpr::Binary {
 			op: BinOp::Add,
+			result: BuiltinResult::Int,
 			lhs: Box::new(HirExpr::Local("x".into())),
 			rhs: Box::new(HirExpr::Local("y".into())),
 		}),
@@ -1251,6 +1260,7 @@ fn nested_block_shadow_that_reads_the_outer_binding_renames_and_reads_the_prior_
 		inner_value,
 		&HirExpr::Binary {
 			op: BinOp::Add,
+			result: BuiltinResult::Int,
 			lhs: Box::new(HirExpr::Local("i".into())),
 			rhs: Box::new(HirExpr::Num(100.0, NumKind::Int)),
 		},
@@ -1335,6 +1345,7 @@ fn lowers_two_top_level_lets_in_source_order_with_the_second_referencing_the_fir
 				mutable: false,
 				value: HirExpr::Binary {
 					op: BinOp::Add,
+					result: BuiltinResult::Int,
 					lhs: Box::new(HirExpr::Local("base".into())),
 					rhs: Box::new(HirExpr::Num(5.0, NumKind::Int)),
 				},
@@ -1390,6 +1401,7 @@ fn reorders_a_top_level_let_that_references_a_later_let() {
 				mutable: false,
 				value: HirExpr::Binary {
 					op: BinOp::Add,
+					result: BuiltinResult::Int,
 					lhs: Box::new(HirExpr::Local("b".into())),
 					rhs: Box::new(HirExpr::Num(1.0, NumKind::Int)),
 				},
@@ -1540,6 +1552,7 @@ fn lowers_bare_return_as_an_unbraced_if_then_branch() {
 		&HirExpr::Block {
 			stmts: vec![HirStmt::Return(Some(HirExpr::Binary {
 				op: BinOp::Sub,
+				result: BuiltinResult::Int,
 				lhs: Box::new(HirExpr::Num(0.0, NumKind::Int)),
 				rhs: Box::new(HirExpr::Local("n".into())),
 			}))],
@@ -1571,8 +1584,10 @@ fn lowers_string_interpolation_to_left_assoc_concatenation() {
 		hir.funcs[0].body,
 		HirExpr::Binary {
 			op: BinOp::Add,
+			result: BuiltinResult::Raw,
 			lhs: Box::new(HirExpr::Binary {
 				op: BinOp::Add,
+				result: BuiltinResult::Raw,
 				lhs: Box::new(HirExpr::Str("Hello, ".into())),
 				rhs: Box::new(HirExpr::Local("name".into())),
 			}),
@@ -1591,8 +1606,10 @@ fn lowers_leading_interpolation_with_an_empty_prefix_string() {
 		hir.funcs[0].body,
 		HirExpr::Binary {
 			op: BinOp::Add,
+			result: BuiltinResult::Raw,
 			lhs: Box::new(HirExpr::Binary {
 				op: BinOp::Add,
+				result: BuiltinResult::Raw,
 				lhs: Box::new(HirExpr::Str("".into())),
 				rhs: Box::new(HirExpr::Local("n".into())),
 			}),
@@ -1677,6 +1694,7 @@ fn lowers_a_for_loop_over_an_exclusive_range_to_a_desugared_while() {
 		cond.as_ref(),
 		&HirExpr::Binary {
 			op: BinOp::Lt,
+			result: BuiltinResult::Raw,
 			lhs: Box::new(HirExpr::Local(i_name.clone())),
 			rhs: Box::new(HirExpr::Local(max_name.clone())),
 		},
@@ -1700,6 +1718,7 @@ fn lowers_a_for_loop_over_an_exclusive_range_to_a_desugared_while() {
 			if target.as_ref() == &HirExpr::Local(i_name.clone())
 				&& value.as_ref() == &HirExpr::Binary {
 					op: BinOp::Add,
+					result: BuiltinResult::Raw,
 					lhs: Box::new(HirExpr::Local(i_name.clone())),
 					// The desugared loop counter is a compiler-internal RAW number
 					// (native JS `i + 1`), never a boxed user value (slice #2).
@@ -2400,6 +2419,7 @@ fn lowers_a_paren_closure_expression() {
 			params: vec!["x".into()],
 			body: Box::new(HirExpr::Binary {
 				op: BinOp::Add,
+				result: BuiltinResult::Int,
 				lhs: Box::new(HirExpr::Local("x".into())),
 				rhs: Box::new(HirExpr::Num(1.0, NumKind::Int)),
 			}),
@@ -2427,6 +2447,7 @@ fn lowers_a_single_ident_closure_as_a_pipe_rhs() {
 				params: vec!["x".into()],
 				body: Box::new(HirExpr::Binary {
 					op: BinOp::Mul,
+					result: BuiltinResult::Int,
 					lhs: Box::new(HirExpr::Local("x".into())),
 					rhs: Box::new(HirExpr::Num(2.0, NumKind::Int)),
 				}),
@@ -2474,6 +2495,7 @@ fn lowers_a_multi_param_closure_with_a_block_body_sharing_one_scope() {
 		value,
 		&HirExpr::Binary {
 			op: BinOp::Add,
+			result: BuiltinResult::Int,
 			lhs: Box::new(HirExpr::Local("a".into())),
 			rhs: Box::new(HirExpr::Local("b".into())),
 		}
@@ -2482,6 +2504,7 @@ fn lowers_a_multi_param_closure_with_a_block_body_sharing_one_scope() {
 		body_tail.as_deref(),
 		Some(&HirExpr::Binary {
 			op: BinOp::Mul,
+			result: BuiltinResult::Int,
 			lhs: Box::new(HirExpr::Local("s".into())),
 			rhs: Box::new(HirExpr::Num(2.0, NumKind::Int)),
 		})

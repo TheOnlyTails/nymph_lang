@@ -6,8 +6,8 @@ use oxc::{
 };
 
 use nymph_hir::hir::{
-	BinOp, HirArrayElem, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit, HirMapElem, HirMethod,
-	HirModule, HirPat, HirRange, HirStmt, NumKind, ScalarCastKind, UnOp,
+	BinOp, BuiltinResult, HirArrayElem, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit,
+	HirMapElem, HirMethod, HirModule, HirPat, HirRange, HirStmt, NumKind, ScalarCastKind, UnOp,
 };
 
 use crate::box_rt;
@@ -887,22 +887,14 @@ impl<'a> Emitter<'a> {
 		)
 	}
 
-	/// Whether `cond`, in a condition slot, already evaluates to a RAW JS boolean
-	/// and so must NOT be `.v`-unwrapped. The only raw-boolean-producing
-	/// expressions are the relational comparisons (`<`,`<=`,`>`,`>=`,`==`,`!=`),
-	/// which emit as native JS comparisons — crucially including the
-	/// `NumKind::Raw` loop-counter comparisons the range/list `for`-desugars build
-	/// (`$i < $n`), which must stay raw so the loop terminates. Every other
-	/// boolean-typed expression (a local, a call, `!x`, `a && b`, a boolean
-	/// literal, an `is`-test / `match`) is a boxed `NBool` and reads `.v`. (User
-	/// relational operators over boxed operands are still broken until slice #10a;
-	/// treating them as raw here neither helps nor harms that — it only keeps the
-	/// internal loop comparisons correct.)
+	/// Whether `cond`, in a condition slot, already evaluates to a raw JS boolean
+	/// and so must not be `.v`-unwrapped. Only compiler-generated operator nodes
+	/// carry `BuiltinResult::Raw`; user comparisons now produce boxed `NBool`s.
 	fn cond_is_raw(cond: &HirExpr) -> bool {
 		matches!(
 			cond,
 			HirExpr::Binary {
-				op: BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne,
+				result: BuiltinResult::Raw,
 				..
 			}
 		)
@@ -1173,11 +1165,17 @@ impl<'a> Emitter<'a> {
 				op: op @ (BinOp::And | BinOp::Or),
 				lhs,
 				rhs,
+				..
 			} => self.emit_logical(*op, lhs, rhs),
-			HirExpr::Binary { op, lhs, rhs } => {
+			HirExpr::Binary {
+				op,
+				result,
+				lhs,
+				rhs,
+			} => {
 				let left = self.emit_expr(lhs);
 				let right = self.emit_expr(rhs);
-				self.emit_binary(*op, left, right)
+				self.emit_binary(*op, *result, left, right)
 			}
 			// `!x` reads the raw boolean payload, negates it, and re-boxes:
 			// `new NBool(!x.v)` — `!box` is always `false` (a box is truthy), so the
@@ -1187,20 +1185,31 @@ impl<'a> Emitter<'a> {
 			HirExpr::Unary {
 				op: UnOp::Not,
 				operand,
+				..
 			} => {
 				let raw = self.emit_cond(operand);
 				let negated =
 					Expression::new_unary_expression(SPAN, UnaryOperator::LogicalNot, raw, &self.ast);
 				self.new_box("NBool", negated)
 			}
-			HirExpr::Unary { op, operand } => {
+			HirExpr::Unary {
+				op,
+				result,
+				operand,
+			} => {
 				let inner = self.emit_expr(operand);
+				let inner = if *result == BuiltinResult::Raw {
+					inner
+				} else {
+					self.unwrap_v(inner)
+				};
 				let operator = match op {
 					UnOp::Neg => UnaryOperator::UnaryNegation,
 					UnOp::Not => unreachable!("UnOp::Not is handled above"),
 					UnOp::BitNot => UnaryOperator::BitwiseNot,
 				};
-				Expression::new_unary_expression(SPAN, operator, inner, &self.ast)
+				let raw = Expression::new_unary_expression(SPAN, operator, inner, &self.ast);
+				self.box_builtin_result(*result, raw)
 			}
 			HirExpr::Call { callee, args } => {
 				let callee = self.emit_expr(callee);
@@ -2277,7 +2286,13 @@ impl<'a> Emitter<'a> {
 		}
 	}
 
-	fn emit_binary(&self, op: BinOp, left: Expression<'a>, right: Expression<'a>) -> Expression<'a> {
+	fn emit_binary(
+		&self,
+		op: BinOp,
+		result: BuiltinResult,
+		left: Expression<'a>,
+		right: Expression<'a>,
+	) -> Expression<'a> {
 		match op {
 			// `&&`/`||` are lowered in `emit_expr`'s `Binary` arm to an operand-reuse
 			// ternary (`emit_logical`) — they never reach here, since the raw payload
@@ -2285,32 +2300,54 @@ impl<'a> Emitter<'a> {
 			BinOp::And | BinOp::Or => {
 				unreachable!("logical `&&`/`||` are lowered in emit_expr, not emit_binary")
 			}
-			_ => Expression::BinaryExpression(BinaryExpression::boxed(
-				SPAN,
-				left,
-				match op {
-					BinOp::Add => BinaryOperator::Addition,
-					BinOp::Sub => BinaryOperator::Subtraction,
-					BinOp::Mul => BinaryOperator::Multiplication,
-					BinOp::Div => BinaryOperator::Division,
-					BinOp::Rem => BinaryOperator::Remainder,
-					BinOp::Pow => BinaryOperator::Exponential,
-					BinOp::Eq => BinaryOperator::StrictEquality,
-					BinOp::Ne => BinaryOperator::StrictInequality,
-					BinOp::Lt => BinaryOperator::LessThan,
-					BinOp::Le => BinaryOperator::LessEqualThan,
-					BinOp::Gt => BinaryOperator::GreaterThan,
-					BinOp::Ge => BinaryOperator::GreaterEqualThan,
-					BinOp::BitAnd => BinaryOperator::BitwiseAnd,
-					BinOp::BitOr => BinaryOperator::BitwiseOR,
-					BinOp::BitXor => BinaryOperator::BitwiseXOR,
-					BinOp::Shl => BinaryOperator::ShiftLeft,
-					BinOp::Shr => BinaryOperator::ShiftRight,
-					BinOp::And | BinOp::Or => unreachable!("handled above"),
-				},
-				right,
-				&self.ast,
-			)),
+			_ => {
+				let (left, right) = if matches!(result, BuiltinResult::Raw | BuiltinResult::IdentityBoolean)
+				{
+					(left, right)
+				} else {
+					(self.unwrap_v(left), self.unwrap_v(right))
+				};
+				let raw = Expression::BinaryExpression(BinaryExpression::boxed(
+					SPAN,
+					left,
+					match op {
+						BinOp::Add => BinaryOperator::Addition,
+						BinOp::Sub => BinaryOperator::Subtraction,
+						BinOp::Mul => BinaryOperator::Multiplication,
+						BinOp::Div => BinaryOperator::Division,
+						BinOp::Rem => BinaryOperator::Remainder,
+						BinOp::Pow => BinaryOperator::Exponential,
+						BinOp::Eq => BinaryOperator::StrictEquality,
+						BinOp::Ne => BinaryOperator::StrictInequality,
+						BinOp::Lt => BinaryOperator::LessThan,
+						BinOp::Le => BinaryOperator::LessEqualThan,
+						BinOp::Gt => BinaryOperator::GreaterThan,
+						BinOp::Ge => BinaryOperator::GreaterEqualThan,
+						BinOp::BitAnd => BinaryOperator::BitwiseAnd,
+						BinOp::BitOr => BinaryOperator::BitwiseOR,
+						BinOp::BitXor => BinaryOperator::BitwiseXOR,
+						BinOp::Shl => BinaryOperator::ShiftLeft,
+						BinOp::Shr => BinaryOperator::ShiftRight,
+						BinOp::And | BinOp::Or => unreachable!("handled above"),
+					},
+					right,
+					&self.ast,
+				));
+				self.box_builtin_result(result, raw)
+			}
 		}
+	}
+
+	fn box_builtin_result(&self, result: BuiltinResult, raw: Expression<'a>) -> Expression<'a> {
+		let class = match result {
+			BuiltinResult::Int => "NInt",
+			BuiltinResult::UInt => "NUint",
+			BuiltinResult::Float => "NFloat",
+			BuiltinResult::Char => "NChar",
+			BuiltinResult::String => "NString",
+			BuiltinResult::Boolean | BuiltinResult::IdentityBoolean => "NBool",
+			BuiltinResult::Raw => return raw,
+		};
+		self.new_box(class, raw)
 	}
 }

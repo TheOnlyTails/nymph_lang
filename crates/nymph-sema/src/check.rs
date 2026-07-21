@@ -108,11 +108,11 @@ pub struct Checker<'m> {
 	/// module-end pass would resolve every deferred operator against only the *last*
 	/// body's bounds, making a valid program's diagnostics depend on declaration
 	/// order. `kind` distinguishes a `BinaryOp` node (whose recorded type is the
-	/// operator's own placeholder result and must be overwritten with the
+	/// operator's own placeholder result and must be unified with the
 	/// finally-resolved type) from an `AssignOp` node (whose recorded type is always
 	/// `Void` and must be left alone — Finding 1: only the `Resolution` gets attached
 	/// there).
-	pub(crate) pending_operators: Vec<(nymph_ast::NodeId, Span, Ty, PendingOperatorKind)>,
+	pub(crate) pending_operators: Vec<(nymph_ast::NodeId, Span, Ty, Ty, PendingOperatorKind)>,
 
 	/// Call-site bound obligations deferred until the instantiated variable has
 	/// had a chance to unify with a concrete argument (Slice 4G), mirroring
@@ -238,9 +238,14 @@ pub(crate) fn check_module_impl(module: &Module, entry: EntryMode) -> Checked {
 		checker.pending_bound_arg_mut.is_empty(),
 		"pending_bound_arg_mut should be drained per-body, not left for module end"
 	);
+	// Some annotations are recorded before later expressions constrain their
+	// inference variables. Resolve them one final time while the unify table is
+	// still available so lowering never sees a stale `TyKind::Infer`.
+	let mut annotations = std::mem::take(&mut checker.annotations);
+	annotations.map_types(|ty| checker.resolve_deep(ty));
 	Checked {
 		diags: checker.diags,
-		annotations: checker.annotations,
+		annotations,
 		interner: checker.interner,
 	}
 }

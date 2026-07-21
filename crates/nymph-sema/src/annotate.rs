@@ -132,6 +132,12 @@ impl Annotations {
 		}
 	}
 
+	pub(crate) fn map_types(&mut self, mut map: impl FnMut(Ty) -> Ty) {
+		for info in self.infos.values_mut() {
+			info.ty = map(info.ty);
+		}
+	}
+
 	/// Record which `(enum, variant)` a variant construction/reference resolved to.
 	pub(crate) fn record_variant(&mut self, id: NodeId, res: VariantResolution) {
 		if id != NodeId::DUMMY {

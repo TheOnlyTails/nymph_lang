@@ -126,6 +126,25 @@ pub enum NumKind {
 	Raw,
 }
 
+/// The checker-resolved result representation of a built-in operator. User
+/// operators lower to method calls instead; this marker exists so codegen can
+/// re-box a native-JS fast-path result without re-deriving type information.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltinResult {
+	Int,
+	UInt,
+	Float,
+	Char,
+	String,
+	Boolean,
+	/// Transitional `==`/`!=` on non-primitives: compare object identity directly,
+	/// then box the raw comparison result as `NBool`. Value equality replaces this
+	/// in the later equality slice.
+	IdentityBoolean,
+	/// Compiler-generated arithmetic and predicates used by desugarings.
+	Raw,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum HirExpr {
 	/// Any numeric literal (int/uint/float), tagged with the [`NumKind`] codegen
@@ -218,11 +237,13 @@ pub enum HirExpr {
 	},
 	Binary {
 		op: BinOp,
+		result: BuiltinResult,
 		lhs: Box<HirExpr>,
 		rhs: Box<HirExpr>,
 	},
 	Unary {
 		op: UnOp,
+		result: BuiltinResult,
 		operand: Box<HirExpr>,
 	},
 	/// An assignment `target = value`. Compound assignments (`+=`, …) are desugared

@@ -21,8 +21,9 @@ use nymph_ast::{
 	ty::{GenericArg, GenericParam},
 };
 use nymph_hir::hir::{
-	BinOp, HirArm, HirArrayElem, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit, HirMapElem,
-	HirMethod, HirModule, HirPat, HirRange, HirStmt, HirVariant, NumKind, ScalarCastKind, UnOp,
+	BinOp, BuiltinResult, HirArm, HirArrayElem, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit,
+	HirMapElem, HirMethod, HirModule, HirPat, HirRange, HirStmt, HirVariant, NumKind, ScalarCastKind,
+	UnOp,
 };
 use nymph_hir::ty::{Interner, Ty, TyKind};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -3256,6 +3257,7 @@ impl<'a> Lowerer<'a> {
 				None => expr,
 				Some(lhs) => HirExpr::Binary {
 					op: BinOp::Add,
+					result: BuiltinResult::Raw,
 					lhs: Box::new(lhs),
 					rhs: Box::new(expr),
 				},
@@ -3449,6 +3451,7 @@ impl<'a> Lowerer<'a> {
 					target: Box::new(HirExpr::Local(i_name.clone())),
 					value: Box::new(HirExpr::Binary {
 						op: BinOp::Add,
+						result: BuiltinResult::Raw,
 						lhs: Box::new(HirExpr::Local(i_name.clone())),
 						rhs: Box::new(HirExpr::Num(1.0, NumKind::Raw)),
 					}),
@@ -3459,6 +3462,7 @@ impl<'a> Lowerer<'a> {
 		let while_expr = HirExpr::While {
 			cond: Box::new(HirExpr::Binary {
 				op: if inclusive { BinOp::Le } else { BinOp::Lt },
+				result: BuiltinResult::Raw,
 				lhs: Box::new(HirExpr::Local(i_name.clone())),
 				rhs: Box::new(HirExpr::Local(max_name.clone())),
 			}),
@@ -3543,6 +3547,7 @@ impl<'a> Lowerer<'a> {
 					target: Box::new(HirExpr::Local(i_name.clone())),
 					value: Box::new(HirExpr::Binary {
 						op: BinOp::Add,
+						result: BuiltinResult::Raw,
 						lhs: Box::new(HirExpr::Local(i_name.clone())),
 						rhs: Box::new(HirExpr::Num(1.0, NumKind::Raw)),
 					}),
@@ -3553,6 +3558,7 @@ impl<'a> Lowerer<'a> {
 		let while_expr = HirExpr::While {
 			cond: Box::new(HirExpr::Binary {
 				op: BinOp::Lt,
+				result: BuiltinResult::Raw,
 				lhs: Box::new(HirExpr::Local(i_name.clone())),
 				rhs: Box::new(HirExpr::Local(n_name.clone())),
 			}),
@@ -3898,6 +3904,57 @@ impl<'a> Lowerer<'a> {
 		}
 	}
 
+	/// Recover the result box selected by the checker for a built-in operator.
+	/// Built-in operators are the only operator HIR nodes that reach native JS;
+	/// user implementations have already become method calls.
+	fn builtin_result(&self, id: nymph_ast::NodeId, operand_id: nymph_ast::NodeId) -> BuiltinResult {
+		let info = self
+			.annotations
+			.get(id)
+			.unwrap_or_else(|| panic!("no result type recorded for built-in operator {id:?}"));
+		// Compound assignment nodes are statement-like and therefore annotated as
+		// `void`; their inner operation returns the target's type.
+		let ty = if matches!(self.interner.kind(info.ty), TyKind::Void) {
+			self
+				.annotations
+				.get(operand_id)
+				.unwrap_or_else(|| panic!("no operand type recorded for built-in operator {id:?}"))
+				.ty
+		} else {
+			info.ty
+		};
+		match self.interner.kind(Self::peel_mut(self.interner, ty)) {
+			TyKind::Int => BuiltinResult::Int,
+			TyKind::UInt => BuiltinResult::UInt,
+			TyKind::Float => BuiltinResult::Float,
+			TyKind::Char => BuiltinResult::Char,
+			TyKind::String => BuiltinResult::String,
+			TyKind::Boolean => BuiltinResult::Boolean,
+			kind => panic!("unsupported built-in operator result type {kind:?}"),
+		}
+	}
+
+	fn builtin_binary_result(&self, id: nymph_ast::NodeId, op: BinOp, lhs: &Expr) -> BuiltinResult {
+		let lhs = Self::peel_grouped(lhs);
+		let identity_comparison = matches!(op, BinOp::Eq | BinOp::Ne)
+			&& self.annotations.get(lhs.id).is_some_and(|info| {
+				!matches!(
+					self.interner.kind(Self::peel_mut(self.interner, info.ty)),
+					TyKind::Int
+						| TyKind::UInt
+						| TyKind::Float
+						| TyKind::Char
+						| TyKind::String
+						| TyKind::Boolean
+				)
+			});
+		if identity_comparison {
+			BuiltinResult::IdentityBoolean
+		} else {
+			self.builtin_result(id, lhs.id)
+		}
+	}
+
 	/// Whether `e` (after peeling any parens) is literally `this` — the ONLY
 	/// receiver shape for which `materializing_onto_class`'s fast path (an
 	/// ordinary `<recv>.method(args)` JS call, bypassing
@@ -4157,6 +4214,7 @@ impl<'a> Lowerer<'a> {
 			{
 				HirExpr::Binary {
 					op: native,
+					result: self.builtin_binary_result(id, native, lhs),
 					lhs: Box::new(self.lower_expr(lhs)),
 					rhs: Box::new(self.lower_expr(rhs)),
 				}
@@ -4235,6 +4293,7 @@ impl<'a> Lowerer<'a> {
 		match self.annotations.resolution_of(id) {
 			Some(res) if res.dispatch == DispatchKind::BuiltinEager => HirExpr::Unary {
 				op: lower_prefix(op),
+				result: self.builtin_result(id, value.id),
 				operand: Box::new(self.lower_expr(value)),
 			},
 			Some(res) if res.dispatch == DispatchKind::UserImpl => HirExpr::Call {

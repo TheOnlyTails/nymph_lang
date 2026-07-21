@@ -444,6 +444,7 @@ impl<'m> Checker<'m> {
 					expr.id,
 					expr.span,
 					pending_ty,
+					ty,
 					crate::check::PendingOperatorKind::BinaryOp(*op),
 				));
 			}
@@ -461,11 +462,12 @@ impl<'m> Checker<'m> {
 			if let Some(resolution) = resolution {
 				self.annotations.record_resolution(expr.id, resolution);
 			}
-			if let Some((binop, pending_ty)) = pending {
+			if let Some((binop, pending_ty, result_ty)) = pending {
 				self.pending_operators.push((
 					expr.id,
 					expr.span,
 					pending_ty,
+					result_ty,
 					crate::check::PendingOperatorKind::AssignOp(binop),
 				));
 			}
@@ -485,6 +487,7 @@ impl<'m> Checker<'m> {
 					expr.id,
 					expr.span,
 					pending_ty,
+					ty,
 					crate::check::PendingOperatorKind::PrefixOp(*op),
 				));
 			}
@@ -1714,7 +1717,9 @@ impl<'m> Checker<'m> {
 		match op {
 			Plus | Minus | Times | Divide | Remainder | Power | BitAnd | BitOr | BitXor | LeftShift
 			| RightShift => match (self.prim_kind(l), self.prim_kind(r)) {
-				// Same primitive → built-in, result is that type — EXCEPT boolean,
+				// Same primitive → built-in. Division of integral operands produces a
+				// float; every other result keeps the operand type. Boolean is the other
+				// exception,
 				// which has no native JS arithmetic/bitwise semantics to reuse: JS
 				// coerces booleans to numbers (`true & false` → 0, not `false`). A
 				// boolean's only real binary operators are the stdlib's
@@ -1737,7 +1742,12 @@ impl<'m> Checker<'m> {
 							None,
 						)
 					} else {
-						(l, eager(binary_method(op)), None)
+						let result = if op == Divide && matches!(a, TyKind::Int | TyKind::UInt) {
+							self.interner.float()
+						} else {
+							l
+						};
+						(result, eager(binary_method(op)), None)
 					}
 				}
 				// Different concrete primitives: an `int` literal against a `float`/`uint`
@@ -1789,7 +1799,10 @@ impl<'m> Checker<'m> {
 						// Still an unresolved inference variable (or `Error`, from an
 						// already-diagnosed upstream mistake): defer to the end-of-module
 						// finalization pass rather than guessing or panicking now.
-						None => (l, None, Some(l)),
+						None => {
+							let result = if op == Divide { self.fresh() } else { l };
+							(result, None, Some(l))
+						}
 					}
 				}
 			},
@@ -1999,9 +2012,11 @@ impl<'m> Checker<'m> {
 		} else {
 			binary_method(op)
 		};
-		if self.prim_kind(ty).is_some() {
+		if let Some(kind) = self.prim_kind(ty) {
 			let result_ty = if is_comparison {
 				self.interner.boolean()
+			} else if op == BinaryOperator::Divide && matches!(kind, TyKind::Int | TyKind::UInt) {
+				self.interner.float()
 			} else {
 				ty
 			};
@@ -2360,7 +2375,7 @@ impl<'m> Checker<'m> {
 		op: AssignOperator,
 		rhs: &Expr,
 		span: Span,
-	) -> (Ty, Option<Resolution>, Option<(BinaryOperator, Ty)>) {
+	) -> (Ty, Option<Resolution>, Option<(BinaryOperator, Ty, Ty)>) {
 		// Resolve the assignable place, reporting non-places and immutable targets.
 		let place_ty = match &lhs.kind {
 			ExprKind::Identifier(name) => match self.lookup_local(&name.0).map(|b| (b.ty, b.mutable)) {
@@ -2428,7 +2443,7 @@ impl<'m> Checker<'m> {
 				let (result, res, pend) = self.infer_binary(lhs, binop, rhs, span);
 				self.unify(result, expected, span);
 				resolution = res;
-				pending = pend.map(|ty| (binop, ty));
+				pending = pend.map(|ty| (binop, ty, result));
 			}
 			// Plain `=`.
 			None => self.check(rhs, expected),
@@ -2683,7 +2698,7 @@ impl<'m> Checker<'m> {
 		use crate::check::PendingOperatorKind;
 
 		let pending = std::mem::take(&mut self.pending_operators);
-		for (id, span, ty, kind) in pending {
+		for (id, span, ty, pending_result, kind) in pending {
 			let resolved = match kind {
 				PendingOperatorKind::BinaryOp(op) | PendingOperatorKind::AssignOp(op) => {
 					self.resolve_fallback_operand(op, ty, span)
@@ -2691,25 +2706,28 @@ impl<'m> Checker<'m> {
 				PendingOperatorKind::PrefixOp(op) => self.resolve_fallback_prefix_operand(op, ty, span),
 			};
 			match resolved {
-				Some((result_ty, resolution)) => match kind {
-					// A `BinaryOp`/`PrefixOp` node's initially-recorded type was only the
-					// (possibly still-unbound) operand placeholder; overwrite it with the
-					// now-final result type, same as the immediately-resolved path would
-					// have (a `PrefixOp`'s placeholder is the operand type itself, per
-					// `infer_prefix`, exactly mirroring the arithmetic fallback's
-					// operand-as-placeholder shape).
-					PendingOperatorKind::BinaryOp(_) | PendingOperatorKind::PrefixOp(_) => {
-						self.record(id, result_ty, Some(resolution))
+				Some((result_ty, resolution)) => {
+					self.unify(result_ty, pending_result, span);
+					match kind {
+						// A `BinaryOp`/`PrefixOp` node's initially-recorded type was only the
+						// (possibly still-unbound) operand placeholder; overwrite it with the
+						// now-final result type, same as the immediately-resolved path would
+						// have (a `PrefixOp`'s placeholder is the operand type itself, per
+						// `infer_prefix`, exactly mirroring the arithmetic fallback's
+						// operand-as-placeholder shape).
+						PendingOperatorKind::BinaryOp(_) | PendingOperatorKind::PrefixOp(_) => {
+							self.record(id, result_ty, Some(resolution))
+						}
+						// Finding 1: an `AssignOp` node's own type is always `Void` — set
+						// immediately in `infer`'s `AssignOp` special case — and must stay
+						// that way. `record` overwrites the whole `ExprInfo` (including
+						// `ty`), so only `record_resolution` (which touches just the
+						// `resolution` field) is safe here; it must never regress to
+						// clobbering `Void` with the operator's operand/result type the way
+						// the immediately-resolved compound-assign path never does.
+						PendingOperatorKind::AssignOp(_) => self.annotations.record_resolution(id, resolution),
 					}
-					// Finding 1: an `AssignOp` node's own type is always `Void` — set
-					// immediately in `infer`'s `AssignOp` special case — and must stay
-					// that way. `record` overwrites the whole `ExprInfo` (including
-					// `ty`), so only `record_resolution` (which touches just the
-					// `resolution` field) is safe here; it must never regress to
-					// clobbering `Void` with the operator's operand/result type the way
-					// the immediately-resolved compound-assign path never does.
-					PendingOperatorKind::AssignOp(_) => self.annotations.record_resolution(id, resolution),
-				},
+				}
 				None => {
 					// Still unbound (a genuinely under-determined program) or `Error` (an
 					// already-diagnosed upstream mistake, where piling on a second

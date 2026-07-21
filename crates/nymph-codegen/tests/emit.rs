@@ -1,7 +1,7 @@
 use nymph_codegen::emit;
 use nymph_hir::hir::{
-	BinOp, HirArm, HirEnum, HirExpr, HirFunc, HirLit, HirMethod, HirModule, HirPat, HirStmt,
-	HirVariant, NumKind,
+	BinOp, BuiltinResult, HirArm, HirEnum, HirExpr, HirFunc, HirLit, HirMethod, HirModule, HirPat,
+	HirStmt, HirVariant, NumKind,
 };
 
 #[test]
@@ -33,9 +33,11 @@ fn emits_arithmetic_and_params() {
 			params: vec!["a".into(), "b".into()],
 			body: HirExpr::Binary {
 				op: BinOp::Add,
+				result: BuiltinResult::Raw,
 				lhs: Box::new(HirExpr::Local("a".into())),
 				rhs: Box::new(HirExpr::Binary {
 					op: BinOp::Mul,
+					result: BuiltinResult::Raw,
 					lhs: Box::new(HirExpr::Local("b".into())),
 					rhs: Box::new(HirExpr::Num(2.0, NumKind::Int)),
 				}),
@@ -226,6 +228,7 @@ fn emits_a_closure_as_an_arrow_function() {
 				params: vec!["x".into(), "y".into()],
 				body: Box::new(HirExpr::Binary {
 					op: BinOp::Add,
+					result: BuiltinResult::Raw,
 					lhs: Box::new(HirExpr::Local("x".into())),
 					rhs: Box::new(HirExpr::Local("y".into())),
 				}),
