@@ -872,6 +872,88 @@ impl<'a> Emitter<'a> {
 		Expression::new_new_expression(SPAN, callee, oxc::ast::NONE, args, &self.ast)
 	}
 
+	/// `<expr>.v` — read a boxed value's raw payload (uniform value boxing,
+	/// ADR-0002). The condition/logical-operator unwrap of slice #4:
+	/// `ToBoolean(object)` is unconditionally `true`, so a user `boolean` in an
+	/// `if`/`while`/guard condition or an `&&`/`||`/`!` slot must consult its raw
+	/// `.v` payload rather than the (always-truthy) box.
+	fn unwrap_v(&self, expr: Expression<'a>) -> Expression<'a> {
+		Expression::new_static_member_expression(
+			SPAN,
+			expr,
+			IdentifierName::new(SPAN, "v", &self.ast),
+			false,
+			&self.ast,
+		)
+	}
+
+	/// Whether `cond`, in a condition slot, already evaluates to a RAW JS boolean
+	/// and so must NOT be `.v`-unwrapped. The only raw-boolean-producing
+	/// expressions are the relational comparisons (`<`,`<=`,`>`,`>=`,`==`,`!=`),
+	/// which emit as native JS comparisons — crucially including the
+	/// `NumKind::Raw` loop-counter comparisons the range/list `for`-desugars build
+	/// (`$i < $n`), which must stay raw so the loop terminates. Every other
+	/// boolean-typed expression (a local, a call, `!x`, `a && b`, a boolean
+	/// literal, an `is`-test / `match`) is a boxed `NBool` and reads `.v`. (User
+	/// relational operators over boxed operands are still broken until slice #10a;
+	/// treating them as raw here neither helps nor harms that — it only keeps the
+	/// internal loop comparisons correct.)
+	fn cond_is_raw(cond: &HirExpr) -> bool {
+		matches!(
+			cond,
+			HirExpr::Binary {
+				op: BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne,
+				..
+			}
+		)
+	}
+
+	/// Emit a user-condition/guard expression as a RAW JS boolean ready to drop
+	/// into an `if`/`while`/ternary test: `emit_expr` then `.v`-unwrap, unless the
+	/// expression already produces a raw boolean ([`Self::cond_is_raw`]).
+	fn emit_cond(&self, cond: &HirExpr) -> Expression<'a> {
+		let expr = self.emit_expr(cond);
+		if Self::cond_is_raw(cond) {
+			expr
+		} else {
+			self.unwrap_v(expr)
+		}
+	}
+
+	/// `a && b` / `a || b` under uniform value boxing (ADR-0002). The boolean
+	/// operands are boxed (`NBool`), so native `&&`/`||` can't short-circuit on the
+	/// raw payload (a box is always truthy). Lower to the operand-reuse ternary
+	/// that preserves short-circuit AND returns a box: `a && b` → `a.v ? b : a`,
+	/// `a || b` → `a.v ? a : b`. `a` is used twice (as the test and as one branch),
+	/// so a side-effecting `a` must be evaluated exactly once: a non-trivial `a` is
+	/// bound once in an arrow-IIFE (`((t) => t.v ? b : t)(a)`), while a plain local
+	/// or `this` — which have no side effects — is re-emitted directly. `b` sits in
+	/// a ternary branch, so it is only evaluated when the branch is taken
+	/// (short-circuit preserved).
+	fn emit_logical(&self, op: BinOp, lhs: &HirExpr, rhs: &HirExpr) -> Expression<'a> {
+		debug_assert!(matches!(op, BinOp::And | BinOp::Or));
+		let right = self.emit_expr(rhs);
+		let ternary = |this: &Self, test: Expression<'a>, reuse: Expression<'a>, right| {
+			let (consequent, alternate) = if op == BinOp::And {
+				(right, reuse)
+			} else {
+				(reuse, right)
+			};
+			Expression::new_conditional_expression(SPAN, test, consequent, alternate, &this.ast)
+		};
+		if matches!(lhs, HirExpr::Local(_) | HirExpr::This) {
+			// Side-effect-free: re-emit the operand directly for both uses.
+			let test = self.unwrap_v(self.emit_expr(lhs));
+			ternary(self, test, self.emit_expr(lhs), right)
+		} else {
+			// Bind the operand once in an arrow-IIFE and reuse the gensym param.
+			let param = self.ast.allocator.alloc_str(&self.gensym());
+			let test = self.unwrap_v(self.ident(param));
+			let body = ternary(self, test, self.ident(param), right);
+			self.arrow_iife(param, body, self.emit_expr(lhs))
+		}
+	}
+
 	/// `<callee>(<arg>)` — a single-argument call.
 	fn call1(&self, callee: Expression<'a>, arg: Expression<'a>) -> Expression<'a> {
 		let mut args = ArenaVec::new_in(&self.ast);
@@ -1083,16 +1165,39 @@ impl<'a> Emitter<'a> {
 			}
 			// The `this` receiver.
 			HirExpr::This => Expression::new_this_expression(SPAN, &self.ast),
+			// `&&`/`||` need the boxed operands' raw payloads to short-circuit, so
+			// they lower to an operand-reuse ternary (`emit_logical`), NOT a native
+			// JS logical op — see its doc comment. Every other binary op composes its
+			// already-emitted operands in `emit_binary`.
+			HirExpr::Binary {
+				op: op @ (BinOp::And | BinOp::Or),
+				lhs,
+				rhs,
+			} => self.emit_logical(*op, lhs, rhs),
 			HirExpr::Binary { op, lhs, rhs } => {
 				let left = self.emit_expr(lhs);
 				let right = self.emit_expr(rhs);
 				self.emit_binary(*op, left, right)
 			}
+			// `!x` reads the raw boolean payload, negates it, and re-boxes:
+			// `new NBool(!x.v)` — `!box` is always `false` (a box is truthy), so the
+			// native operator can't run on the box (uniform value boxing, ADR-0002).
+			// `Neg`/`BitNot` are arithmetic (still broken until slice #10a) and stay
+			// as bare native unary ops over the operand.
+			HirExpr::Unary {
+				op: UnOp::Not,
+				operand,
+			} => {
+				let raw = self.emit_cond(operand);
+				let negated =
+					Expression::new_unary_expression(SPAN, UnaryOperator::LogicalNot, raw, &self.ast);
+				self.new_box("NBool", negated)
+			}
 			HirExpr::Unary { op, operand } => {
 				let inner = self.emit_expr(operand);
 				let operator = match op {
 					UnOp::Neg => UnaryOperator::UnaryNegation,
-					UnOp::Not => UnaryOperator::LogicalNot,
+					UnOp::Not => unreachable!("UnOp::Not is handled above"),
 					UnOp::BitNot => UnaryOperator::BitwiseNot,
 				};
 				Expression::new_unary_expression(SPAN, operator, inner, &self.ast)
@@ -1647,7 +1752,7 @@ impl<'a> Emitter<'a> {
 				// let <tmp>; if (cond) { <tmp> = then } else { <tmp> = else }; → <tmp>
 				let tmp = self.ast.allocator.alloc_str(&self.gensym());
 				let decl = self.let_uninit(tmp);
-				let cond_expr = self.emit_expr(cond);
+				let cond_expr = self.emit_cond(cond);
 				let then_stmt = self.assign_block(tmp, Some(then));
 				let else_stmt = self.assign_block(tmp, otherwise.as_deref());
 				let if_stmt =
@@ -1662,7 +1767,7 @@ impl<'a> Emitter<'a> {
 			}
 			HirExpr::While { cond, body } => {
 				// A `while` is a statement; its value is `undefined`.
-				let cond_expr = self.emit_expr(cond);
+				let cond_expr = self.emit_cond(cond);
 				let body_stmt = self.block_stmt(body);
 				let while_stmt = Statement::new_while_statement(SPAN, cond_expr, body_stmt, &self.ast);
 				let mut stmts = ArenaVec::new_in(&self.ast);
@@ -1695,7 +1800,11 @@ impl<'a> Emitter<'a> {
 				for (i, arm) in arms.iter().enumerate() {
 					let is_last = i + 1 == arms.len();
 					let (test, binds) = self.compile_pat(&arm.pat, &subj);
-					let guard = arm.guard.as_ref().map(|g| self.emit_expr(g));
+					// The pattern `test` is a compiler-INTERNAL raw JS boolean built by
+					// `compile_pat` and stays raw. The `guard`, by contrast, is the lone
+					// user-`boolean` slot inside `match`, so it reads `.v` like any other
+					// user condition (uniform value boxing, ADR-0002).
+					let guard = arm.guard.as_ref().map(|g| self.emit_cond(g));
 					// An unguarded last arm is the guaranteed fallback (exhaustiveness) → no
 					// test, no break. Any other arm commits then breaks, guarded by its test.
 					if is_last && arm.guard.is_none() {
@@ -2170,18 +2279,12 @@ impl<'a> Emitter<'a> {
 
 	fn emit_binary(&self, op: BinOp, left: Expression<'a>, right: Expression<'a>) -> Expression<'a> {
 		match op {
-			// Logical operators are a distinct oxc node from binary operators.
-			BinOp::And | BinOp::Or => Expression::LogicalExpression(LogicalExpression::boxed(
-				SPAN,
-				left,
-				if op == BinOp::And {
-					LogicalOperator::And
-				} else {
-					LogicalOperator::Or
-				},
-				right,
-				&self.ast,
-			)),
+			// `&&`/`||` are lowered in `emit_expr`'s `Binary` arm to an operand-reuse
+			// ternary (`emit_logical`) — they never reach here, since the raw payload
+			// (not the always-truthy box) must drive short-circuiting.
+			BinOp::And | BinOp::Or => {
+				unreachable!("logical `&&`/`||` are lowered in emit_expr, not emit_binary")
+			}
 			_ => Expression::BinaryExpression(BinaryExpression::boxed(
 				SPAN,
 				left,
