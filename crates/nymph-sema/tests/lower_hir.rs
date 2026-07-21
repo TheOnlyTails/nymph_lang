@@ -1,6 +1,6 @@
 use nymph_hir::hir::{
-	BinOp, HirArrayElem, HirExpr, HirLit, HirMapElem, HirModule, HirPat, HirStmt, ScalarCastKind,
-	UnOp,
+	BinOp, HirArrayElem, HirExpr, HirLit, HirMapElem, HirModule, HirPat, HirStmt, NumKind,
+	ScalarCastKind, UnOp,
 };
 use nymph_sema::check_module;
 use nymph_syntax::parse_module;
@@ -56,7 +56,7 @@ fn lowers_a_call_and_int_literal() {
 		g.body,
 		HirExpr::Call {
 			callee: Box::new(HirExpr::Local("h".into())),
-			args: vec![HirExpr::Num(1.0)],
+			args: vec![HirExpr::Num(1.0, NumKind::Int)],
 		}
 	);
 }
@@ -67,9 +67,9 @@ fn lowers_collections_and_index() {
 	assert_eq!(
 		hir.funcs[0].body,
 		HirExpr::Array(vec![
-			HirExpr::Num(1.0),
-			HirExpr::Num(2.0),
-			HirExpr::Num(3.0)
+			HirExpr::Num(1.0, NumKind::Int),
+			HirExpr::Num(2.0, NumKind::Int),
+			HirExpr::Num(3.0, NumKind::Int)
 		]),
 	);
 
@@ -572,7 +572,7 @@ fn lowers_compound_assign_on_int_stays_native() {
 		&HirExpr::Binary {
 			op: BinOp::Add,
 			lhs: Box::new(HirExpr::Local("x".into())),
-			rhs: Box::new(HirExpr::Num(1.0)),
+			rhs: Box::new(HirExpr::Num(1.0, NumKind::Int)),
 		}
 	);
 }
@@ -1070,7 +1070,7 @@ fn lowers_same_scope_let_shadow_with_a_rename() {
 		panic!("expected a Let statement, got {:?}", stmts[0]);
 	};
 	assert_eq!(name, "x");
-	assert_eq!(value, &HirExpr::Num(1.0));
+	assert_eq!(value, &HirExpr::Num(1.0, NumKind::Int));
 
 	let HirStmt::Let { name, value, .. } = &stmts[1] else {
 		panic!("expected a Let statement, got {:?}", stmts[1]);
@@ -1081,7 +1081,7 @@ fn lowers_same_scope_let_shadow_with_a_rename() {
 		&HirExpr::Binary {
 			op: BinOp::Add,
 			lhs: Box::new(HirExpr::Local("x".into())),
-			rhs: Box::new(HirExpr::Num(1.0)),
+			rhs: Box::new(HirExpr::Num(1.0, NumKind::Int)),
 		},
 		"the redeclaration's RHS reads the PRIOR binding, not itself"
 	);
@@ -1092,7 +1092,7 @@ fn lowers_same_scope_let_shadow_with_a_rename() {
 		&HirExpr::Binary {
 			op: BinOp::Mul,
 			lhs: Box::new(HirExpr::Local("x$1".into())),
-			rhs: Box::new(HirExpr::Num(10.0)),
+			rhs: Box::new(HirExpr::Num(10.0, NumKind::Int)),
 		},
 		"later references resolve through the renamed binding"
 	);
@@ -1252,7 +1252,7 @@ fn nested_block_shadow_that_reads_the_outer_binding_renames_and_reads_the_prior_
 		&HirExpr::Binary {
 			op: BinOp::Add,
 			lhs: Box::new(HirExpr::Local("i".into())),
-			rhs: Box::new(HirExpr::Num(100.0)),
+			rhs: Box::new(HirExpr::Num(100.0, NumKind::Int)),
 		},
 		"its RHS reads the OUTER `i`, not the not-yet-declared inner one"
 	);
@@ -1305,7 +1305,7 @@ fn lowers_a_top_level_let_into_the_module() {
 		vec![HirLet {
 			name: "answer".into(),
 			mutable: false,
-			value: HirExpr::Num(42.0),
+			value: HirExpr::Num(42.0, NumKind::Int),
 		}]
 	);
 	// A reference to it from a function body stays the bare (unrenamed) name.
@@ -1328,7 +1328,7 @@ fn lowers_two_top_level_lets_in_source_order_with_the_second_referencing_the_fir
 			HirLet {
 				name: "base".into(),
 				mutable: false,
-				value: HirExpr::Num(10.0),
+				value: HirExpr::Num(10.0, NumKind::Int),
 			},
 			HirLet {
 				name: "total".into(),
@@ -1336,7 +1336,7 @@ fn lowers_two_top_level_lets_in_source_order_with_the_second_referencing_the_fir
 				value: HirExpr::Binary {
 					op: BinOp::Add,
 					lhs: Box::new(HirExpr::Local("base".into())),
-					rhs: Box::new(HirExpr::Num(5.0)),
+					rhs: Box::new(HirExpr::Num(5.0, NumKind::Int)),
 				},
 			},
 		]
@@ -1352,7 +1352,7 @@ fn lowers_a_mutable_top_level_let() {
 		vec![HirLet {
 			name: "counter".into(),
 			mutable: true,
-			value: HirExpr::Num(0.0),
+			value: HirExpr::Num(0.0, NumKind::Int),
 		}]
 	);
 }
@@ -1383,7 +1383,7 @@ fn reorders_a_top_level_let_that_references_a_later_let() {
 			HirLet {
 				name: "b".into(),
 				mutable: false,
-				value: HirExpr::Num(10.0),
+				value: HirExpr::Num(10.0, NumKind::Int),
 			},
 			HirLet {
 				name: "a".into(),
@@ -1391,7 +1391,7 @@ fn reorders_a_top_level_let_that_references_a_later_let() {
 				value: HirExpr::Binary {
 					op: BinOp::Add,
 					lhs: Box::new(HirExpr::Local("b".into())),
-					rhs: Box::new(HirExpr::Num(1.0)),
+					rhs: Box::new(HirExpr::Num(1.0, NumKind::Int)),
 				},
 			},
 		]
@@ -1540,7 +1540,7 @@ fn lowers_bare_return_as_an_unbraced_if_then_branch() {
 		&HirExpr::Block {
 			stmts: vec![HirStmt::Return(Some(HirExpr::Binary {
 				op: BinOp::Sub,
-				lhs: Box::new(HirExpr::Num(0.0)),
+				lhs: Box::new(HirExpr::Num(0.0, NumKind::Int)),
 				rhs: Box::new(HirExpr::Local("n".into())),
 			}))],
 			tail: None,
@@ -1657,7 +1657,7 @@ fn lowers_a_for_loop_over_an_exclusive_range_to_a_desugared_while() {
 		panic!("expected induction-variable let, got {:?}", for_stmts[0]);
 	};
 	assert!(*mutable, "induction variable must be mutable");
-	assert_eq!(value, &HirExpr::Num(1.0));
+	assert_eq!(value, &HirExpr::Num(1.0, NumKind::Int));
 
 	let HirStmt::Let {
 		name: max_name,
@@ -1668,7 +1668,7 @@ fn lowers_a_for_loop_over_an_exclusive_range_to_a_desugared_while() {
 		panic!("expected max-bound let, got {:?}", for_stmts[1]);
 	};
 	assert!(!max_mutable, "hoisted upper bound must not be mutable");
-	assert_eq!(max_value, &HirExpr::Num(3.0));
+	assert_eq!(max_value, &HirExpr::Num(3.0, NumKind::Int));
 
 	let HirStmt::Expr(HirExpr::While { cond, body }) = &for_stmts[2] else {
 		panic!("expected While, got {:?}", for_stmts[2]);
@@ -1701,7 +1701,9 @@ fn lowers_a_for_loop_over_an_exclusive_range_to_a_desugared_while() {
 				&& value.as_ref() == &HirExpr::Binary {
 					op: BinOp::Add,
 					lhs: Box::new(HirExpr::Local(i_name.clone())),
-					rhs: Box::new(HirExpr::Num(1.0)),
+					// The desugared loop counter is a compiler-internal RAW number
+					// (native JS `i + 1`), never a boxed user value (slice #2).
+					rhs: Box::new(HirExpr::Num(1.0, NumKind::Raw)),
 				}
 	));
 }
@@ -1949,7 +1951,7 @@ fn lowers_chained_pipe_left_associatively() {
 	};
 	assert!(matches!(inner_callee.as_ref(), HirExpr::Local(n) if n == "double"));
 	assert_eq!(inner_args.len(), 1);
-	assert_eq!(inner_args[0], HirExpr::Num(10.0));
+	assert_eq!(inner_args[0], HirExpr::Num(10.0, NumKind::Int));
 }
 
 #[test]
@@ -2399,7 +2401,7 @@ fn lowers_a_paren_closure_expression() {
 			body: Box::new(HirExpr::Binary {
 				op: BinOp::Add,
 				lhs: Box::new(HirExpr::Local("x".into())),
-				rhs: Box::new(HirExpr::Num(1.0)),
+				rhs: Box::new(HirExpr::Num(1.0, NumKind::Int)),
 			}),
 		}
 	);
@@ -2407,7 +2409,7 @@ fn lowers_a_paren_closure_expression() {
 		tail.as_deref(),
 		Some(&HirExpr::Call {
 			callee: Box::new(HirExpr::Local("g".into())),
-			args: vec![HirExpr::Num(5.0)],
+			args: vec![HirExpr::Num(5.0, NumKind::Int)],
 		})
 	);
 }
@@ -2426,10 +2428,10 @@ fn lowers_a_single_ident_closure_as_a_pipe_rhs() {
 				body: Box::new(HirExpr::Binary {
 					op: BinOp::Mul,
 					lhs: Box::new(HirExpr::Local("x".into())),
-					rhs: Box::new(HirExpr::Num(2.0)),
+					rhs: Box::new(HirExpr::Num(2.0, NumKind::Int)),
 				}),
 			}),
-			args: vec![HirExpr::Num(10.0)],
+			args: vec![HirExpr::Num(10.0, NumKind::Int)],
 		}
 	);
 }
@@ -2481,7 +2483,7 @@ fn lowers_a_multi_param_closure_with_a_block_body_sharing_one_scope() {
 		Some(&HirExpr::Binary {
 			op: BinOp::Mul,
 			lhs: Box::new(HirExpr::Local("s".into())),
-			rhs: Box::new(HirExpr::Num(2.0)),
+			rhs: Box::new(HirExpr::Num(2.0, NumKind::Int)),
 		})
 	);
 }
@@ -2678,7 +2680,7 @@ fn lowers_a_list_spread_over_a_native_list_source_to_a_native_splice() {
 		tail.as_deref(),
 		Some(&HirExpr::ArraySpread(vec![
 			HirArrayElem::Spread(HirExpr::Local("xs".into())),
-			HirArrayElem::Item(HirExpr::Num(4.0)),
+			HirArrayElem::Item(HirExpr::Num(4.0, NumKind::Int)),
 		]))
 	);
 }
@@ -2721,7 +2723,10 @@ fn lowers_a_list_spread_over_a_user_iterator_source_to_a_drain() {
 		panic!("expected ArraySpread, got {tail:?}");
 	};
 	assert_eq!(elems.len(), 2);
-	assert_eq!(elems[1], HirArrayElem::Item(HirExpr::Num(99.0)));
+	assert_eq!(
+		elems[1],
+		HirArrayElem::Item(HirExpr::Num(99.0, NumKind::Int))
+	);
 	let HirArrayElem::Spread(HirExpr::Block {
 		stmts,
 		tail: acc_tail,
@@ -2775,7 +2780,7 @@ fn lowers_a_map_spread_over_a_native_map_source_to_a_native_merge() {
 		tail.as_deref(),
 		Some(&HirExpr::MapSpread(vec![
 			HirMapElem::Spread(HirExpr::Local("m".into())),
-			HirMapElem::Entry(HirExpr::Num(2.0), HirExpr::Str("b".into())),
+			HirMapElem::Entry(HirExpr::Num(2.0, NumKind::Int), HirExpr::Str("b".into())),
 		]))
 	);
 }
@@ -2800,7 +2805,7 @@ fn lowers_a_map_spread_over_a_native_list_of_pairs_source_directly() {
 		tail.as_deref(),
 		Some(&HirExpr::MapSpread(vec![
 			HirMapElem::Spread(HirExpr::Local("pairs".into())),
-			HirMapElem::Entry(HirExpr::Num(9.0), HirExpr::Str("z".into())),
+			HirMapElem::Entry(HirExpr::Num(9.0, NumKind::Int), HirExpr::Str("z".into())),
 		]))
 	);
 }
@@ -2842,7 +2847,7 @@ fn lowers_a_map_spread_over_a_non_map_iterable_of_pairs_to_a_drain() {
 	assert_eq!(elems.len(), 2);
 	assert_eq!(
 		elems[1],
-		HirMapElem::Entry(HirExpr::Num(9.0), HirExpr::Str("z".into()))
+		HirMapElem::Entry(HirExpr::Num(9.0, NumKind::Int), HirExpr::Str("z".into()))
 	);
 	assert!(
 		matches!(&elems[0], HirMapElem::Spread(HirExpr::Block { .. })),

@@ -249,7 +249,14 @@ impl<'m> Checker<'m> {
 			// An integer literal implicitly widens to the expected `float`/`uint` (the
 			// literal is retyped, e.g. `1` → `1f` / `1u`, rather than reported as a
 			// mismatch). In any other expected context it synthesises `int` as usual.
-			ExprKind::Int(_) if self.int_literal_coerces_to(expected) => {}
+			// The literal's node is recorded with the RETYPED (coerced) type, not the
+			// syntactic `int` — uniform value boxing (slice #2) reads this back in
+			// lowering to box the literal as `NFloat`/`NUint` rather than `NInt`; a
+			// `func f(): float = 5` whose `5` stayed recorded as `int` would misbox.
+			ExprKind::Int(_) if self.int_literal_coerces_to(expected) => {
+				let coerced = self.shallow_resolve(expected);
+				self.record(expr.id, coerced, None);
+			}
 			// Mirrors `infer_kind`'s own `ExprKind::List` arm, but — when `expected` is
 			// (or resolves to) a concrete `List` — checks each element against the
 			// ALREADY-concrete element type from `expected`, rather than a fresh var
@@ -2856,7 +2863,17 @@ impl<'m> Checker<'m> {
 			| ExprKind::If { .. }
 			| ExprKind::Match { .. }
 			| ExprKind::Grouped(_) => self.check(expr, pty),
-			ExprKind::Int(_) if self.int_literal_coerces_to(pty) => {}
+			// An int literal implicitly widening to a `float`/`uint` PARAMETER must
+			// record the coerced type on its node, exactly like `check`'s own arm
+			// (see line ~256) — uniform value boxing (slice #2) reads this back in
+			// lowering to box the literal as `NFloat`/`NUint` rather than `NInt`.
+			// `check_call_arg` is the sole path for free-function call args, so
+			// without this record a coerced literal arg (`g(5)` where `g(x: float)`)
+			// falls back to the syntactic `int` kind and misboxes as `NInt`.
+			ExprKind::Int(_) if self.int_literal_coerces_to(pty) => {
+				let coerced = self.shallow_resolve(pty);
+				self.record(expr.id, coerced, None);
+			}
 			// Owned-literal → `mut` coercion, mirroring `check_dispatch`'s own hook:
 			// a `#{…}`/`#[…]` literal argument may satisfy a `mut` parameter
 			// directly. On guard failure (`pty`'s own top level isn't `mut`), routes

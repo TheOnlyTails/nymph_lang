@@ -22,7 +22,7 @@ use nymph_ast::{
 };
 use nymph_hir::hir::{
 	BinOp, HirArm, HirArrayElem, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit, HirMapElem,
-	HirMethod, HirModule, HirPat, HirRange, HirStmt, HirVariant, ScalarCastKind, UnOp,
+	HirMethod, HirModule, HirPat, HirRange, HirStmt, HirVariant, NumKind, ScalarCastKind, UnOp,
 };
 use nymph_hir::ty::{Interner, Ty, TyKind};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -610,7 +610,9 @@ impl<'a> Lowerer<'a> {
 				}
 				Declaration::Struct { members, impls, .. } | Declaration::Enum { members, impls, .. } => {
 					members_have_external(members, method)
-						|| impls.iter().any(|si| members_have_external(&si.0.members, method))
+						|| impls
+							.iter()
+							.any(|si| members_have_external(&si.0.members, method))
 				}
 				_ => false,
 			})
@@ -1857,9 +1859,11 @@ impl<'a> Lowerer<'a> {
 						.any(|m| matches!(&m.0, ImplMember::Func { meta, .. } if meta.name.1 == span))
 						|| impls.iter().any(|si| {
 							si.0.interface.0.1 == span
-								|| si.0.members.iter().any(
-									|m| matches!(&m.0, ImplMember::Func { meta, .. } if meta.name.1 == span),
-								)
+								|| si
+									.0
+									.members
+									.iter()
+									.any(|m| matches!(&m.0, ImplMember::Func { meta, .. } if meta.name.1 == span))
 						});
 					if hit {
 						return Some(PreludeDispatch::OntoClass {
@@ -1889,9 +1893,11 @@ impl<'a> Lowerer<'a> {
 				if let Declaration::Struct { name, impls, .. } = decl
 					&& impls.iter().any(|si| {
 						si.0.interface.0.1 == span
-							&& !si.0.members.iter().any(
-								|m| matches!(&m.0, ImplMember::Func { meta, .. } if meta.name.0 == res.method),
-							)
+							&& !si
+								.0
+								.members
+								.iter()
+								.any(|m| matches!(&m.0, ImplMember::Func { meta, .. } if meta.name.0 == res.method))
 					}) {
 					self
 						.pending_prelude_struct_demands
@@ -2707,9 +2713,9 @@ impl<'a> Lowerer<'a> {
 
 	fn lower_expr_inner(&self, expr: &Expr) -> HirExpr {
 		match &expr.kind {
-			ExprKind::Int(v) => HirExpr::Num(v.0 as f64),
-			ExprKind::UInt(v) => HirExpr::Num(v.0 as f64),
-			ExprKind::Float(v) => HirExpr::Num(v.0.into_inner()),
+			ExprKind::Int(v) => HirExpr::Num(v.0 as f64, self.num_kind(expr.id, NumKind::Int)),
+			ExprKind::UInt(v) => HirExpr::Num(v.0 as f64, self.num_kind(expr.id, NumKind::UInt)),
+			ExprKind::Float(v) => HirExpr::Num(v.0.into_inner(), self.num_kind(expr.id, NumKind::Float)),
 			ExprKind::Boolean(b) => HirExpr::Bool(b.0),
 			ExprKind::Char(c) => HirExpr::Char(c.0),
 			ExprKind::Identifier(name) => match self.annotations.variant_of(expr.id) {
@@ -3444,7 +3450,7 @@ impl<'a> Lowerer<'a> {
 					value: Box::new(HirExpr::Binary {
 						op: BinOp::Add,
 						lhs: Box::new(HirExpr::Local(i_name.clone())),
-						rhs: Box::new(HirExpr::Num(1.0)),
+						rhs: Box::new(HirExpr::Num(1.0, NumKind::Raw)),
 					}),
 				}),
 			],
@@ -3538,7 +3544,7 @@ impl<'a> Lowerer<'a> {
 					value: Box::new(HirExpr::Binary {
 						op: BinOp::Add,
 						lhs: Box::new(HirExpr::Local(i_name.clone())),
-						rhs: Box::new(HirExpr::Num(1.0)),
+						rhs: Box::new(HirExpr::Num(1.0, NumKind::Raw)),
 					}),
 				}),
 			],
@@ -3572,7 +3578,7 @@ impl<'a> Lowerer<'a> {
 				HirStmt::Let {
 					name: i_name,
 					mutable: true,
-					value: HirExpr::Num(0.0),
+					value: HirExpr::Num(0.0, NumKind::Raw),
 				},
 				HirStmt::Expr(while_expr),
 			],
@@ -3866,6 +3872,29 @@ impl<'a> Lowerer<'a> {
 		match interner.kind(ty) {
 			TyKind::Mut(inner) => *inner,
 			_ => ty,
+		}
+	}
+
+	/// The [`NumKind`] a numeric literal node must be boxed as (uniform value
+	/// boxing, slice #2). HIR is type-free, so the int/uint/float distinction —
+	/// which selects the `NInt`/`NUint`/`NFloat` wrapper — is recovered here from
+	/// the checker's inferred type for the literal's own node, exactly the
+	/// `info.ty` → `interner.kind` channel every other type-directed lowering
+	/// decision uses (`peel_mut` above). The checker's type is authoritative over
+	/// the syntactic form because a literal's kind can be re-decided by context
+	/// (`let x: float = 5` types the syntactically-`int` `5` as `float`). Only
+	/// when no usable type was recorded (a literal the checker never annotated, or
+	/// one still typed as an unsolved inference variable / an error) does it fall
+	/// back to `syntactic`, the kind the lexer gave the token.
+	fn num_kind(&self, id: nymph_ast::NodeId, syntactic: NumKind) -> NumKind {
+		match self.annotations.get(id) {
+			Some(info) => match self.interner.kind(Self::peel_mut(self.interner, info.ty)) {
+				TyKind::Int => NumKind::Int,
+				TyKind::UInt => NumKind::UInt,
+				TyKind::Float => NumKind::Float,
+				_ => syntactic,
+			},
+			None => syntactic,
 		}
 	}
 
@@ -4772,7 +4801,7 @@ fn collect_locals(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 		HirExpr::Local(name) => {
 			out.insert(name.clone());
 		}
-		HirExpr::Num(_)
+		HirExpr::Num(..)
 		| HirExpr::Str(_)
 		| HirExpr::Bool(_)
 		| HirExpr::Char(_)
@@ -4924,7 +4953,7 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 		HirExpr::VariantRef { enum_name, .. } => {
 			out.insert(enum_name.clone());
 		}
-		HirExpr::Num(_)
+		HirExpr::Num(..)
 		| HirExpr::Str(_)
 		| HirExpr::Bool(_)
 		| HirExpr::Char(_)

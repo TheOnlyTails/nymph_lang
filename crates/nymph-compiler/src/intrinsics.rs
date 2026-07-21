@@ -146,6 +146,18 @@ pub(crate) fn intrinsic_module_sources() -> FxHashMap<String, String> {
 		})
 		.collect();
 	sources.insert("std/option".to_string(), OPTION_MODULE_JS.to_string());
+	// Uniform value boxing (slice #2): the importable `std/box` runtime module
+	// carrying the primitive wrapper classes (`NInt`/`NString`/…). Injected
+	// UNCONDITIONALLY, for the same reason as `std/option` above — `VirtualFsPlugin`
+	// only loads a source when something imports it, and rolldown tree-shakes an
+	// unreferenced one away. Slice #2's emit inlines the wrapper definitions per
+	// module (`nymph_codegen::box_preamble`) rather than importing them, so nothing
+	// references this yet; it exists so slice #7's emitted `import { NInt } from
+	// "std/box"` resolves against a real bundle-graph module.
+	sources.insert(
+		nymph_codegen::BOX_MODULE_KEY.to_string(),
+		nymph_codegen::box_module_source(),
+	);
 	sources
 }
 

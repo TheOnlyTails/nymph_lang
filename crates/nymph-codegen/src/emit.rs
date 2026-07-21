@@ -7,8 +7,10 @@ use oxc::{
 
 use nymph_hir::hir::{
 	BinOp, HirArrayElem, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit, HirMapElem, HirMethod,
-	HirModule, HirPat, HirRange, HirStmt, ScalarCastKind, UnOp,
+	HirModule, HirPat, HirRange, HirStmt, NumKind, ScalarCastKind, UnOp,
 };
+
+use crate::box_rt;
 
 /// A re-emittable reference to a sub-value of the scrutinee, used while compiling a
 /// pattern. oxc expression nodes are arena values that can't be cheaply cloned, so
@@ -120,6 +122,12 @@ pub struct Emitter<'a> {
 	/// prepended import order — and therefore the emitted JS text — stays
 	/// stable across runs, which the golden/e2e tests rely on.
 	needed_imports: std::cell::RefCell<std::collections::BTreeSet<(&'static str, &'static str)>>,
+	/// Set the first time [`Self::new_box`] emits a `new N…(…)` box construction
+	/// (uniform value boxing, slice #2). When set, [`Self::emit_module`] prepends
+	/// the inline [`box_rt::box_preamble`] class definitions so the module is
+	/// self-contained under Node's single-file execution (no bundler to resolve a
+	/// `"std/box"` import). `Cell` keeps the emit methods `&self`.
+	used_box: std::cell::Cell<bool>,
 }
 
 impl Default for Emitter<'_> {
@@ -140,6 +148,7 @@ impl<'a> Emitter<'a> {
 			gensym: std::cell::Cell::new(0),
 			in_iife_subexpr: std::cell::Cell::new(false),
 			needed_imports: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+			used_box: std::cell::Cell::new(false),
 		}
 	}
 
@@ -201,7 +210,19 @@ impl<'a> Emitter<'a> {
 			stmts,
 			&self.ast,
 		);
-		Codegen::new().build(&program).code
+		let code = Codegen::new().build(&program).code;
+		// Uniform value boxing (slice #2): if this module constructed any box,
+		// prepend the inline wrapper-class definitions so it is self-contained
+		// under Node's single-file execution. The classes are top-level and thus
+		// in scope for every `new N…(…)` in the body below them; `import`
+		// declarations emitted into `code` hoist regardless of textually
+		// following these class declarations (valid ESM). A module that
+		// constructs no box gets byte-identical output to before this slice.
+		if self.used_box.get() {
+			format!("{}{code}", box_rt::box_preamble())
+		} else {
+			code
+		}
 	}
 
 	/// Build `import { <symbol> } from "<module_specifier>";` (Gap 3, L0).
@@ -838,6 +859,19 @@ impl<'a> Emitter<'a> {
 		)
 	}
 
+	/// `new <class>(<payload>)` — a boxed primitive value (uniform value boxing,
+	/// slice #2). `class` is a box wrapper name (`NInt`/`NString`/…); the wrapper
+	/// stores `payload` in `.v` and carries its type discriminant on its
+	/// prototype. Records that the module used a box so [`Self::emit_module`]
+	/// prepends the wrapper-class definitions.
+	fn new_box(&self, class: &str, payload: Expression<'a>) -> Expression<'a> {
+		self.used_box.set(true);
+		let callee = Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(class), &self.ast);
+		let mut args = ArenaVec::new_in(&self.ast);
+		args.push(Argument::from(payload));
+		Expression::new_new_expression(SPAN, callee, oxc::ast::NONE, args, &self.ast)
+	}
+
 	/// `<callee>(<arg>)` — a single-argument call.
 	fn call1(&self, callee: Expression<'a>, arg: Expression<'a>) -> Expression<'a> {
 		let mut args = ArenaVec::new_in(&self.ast);
@@ -1013,17 +1047,36 @@ impl<'a> Emitter<'a> {
 
 	fn emit_expr(&self, expr: &HirExpr) -> Expression<'a> {
 		match expr {
-			HirExpr::Num(value) => {
-				Expression::new_numeric_literal(SPAN, *value, None, NumberBase::Decimal, &self.ast)
+			// A numeric literal → a boxed `new NInt/NUint/NFloat(<raw>)` (uniform
+			// value boxing, slice #2), the box class chosen from the checker-threaded
+			// `NumKind`. `NumKind::Raw` is compiler-internal scaffolding (loop
+			// counters/indices doing native JS arithmetic) and stays an unboxed bare
+			// numeric literal — see `NumKind::Raw`'s own doc comment.
+			HirExpr::Num(value, kind) => {
+				let raw =
+					Expression::new_numeric_literal(SPAN, *value, None, NumberBase::Decimal, &self.ast);
+				match kind {
+					NumKind::Raw => raw,
+					NumKind::Int | NumKind::UInt | NumKind::Float => {
+						self.new_box(box_rt::num_box_class(*kind), raw)
+					}
+				}
 			}
+			// String/char/bool literals have an unambiguous box type.
 			HirExpr::Str(s) => {
-				Expression::new_string_literal(SPAN, self.ast.allocator.alloc_str(s), None, &self.ast)
+				let raw =
+					Expression::new_string_literal(SPAN, self.ast.allocator.alloc_str(s), None, &self.ast);
+				self.new_box("NString", raw)
 			}
-			HirExpr::Bool(b) => Expression::new_boolean_literal(SPAN, *b, &self.ast),
+			HirExpr::Bool(b) => {
+				let raw = Expression::new_boolean_literal(SPAN, *b, &self.ast);
+				self.new_box("NBool", raw)
+			}
 			HirExpr::Char(c) => {
 				// A Nymph char is a single-character JS string.
 				let s = self.ast.allocator.alloc_str(&c.to_string());
-				Expression::new_string_literal(SPAN, s, None, &self.ast)
+				let raw = Expression::new_string_literal(SPAN, s, None, &self.ast);
+				self.new_box("NChar", raw)
 			}
 			HirExpr::Local(name) => {
 				Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(name), &self.ast)

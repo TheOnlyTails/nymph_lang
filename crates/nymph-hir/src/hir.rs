@@ -102,10 +102,35 @@ pub enum HirStmt {
 	Return(Option<HirExpr>),
 }
 
+/// The runtime numeric type a boxed numeric value carries — the one piece of
+/// type information codegen needs to pick the right box wrapper class (`NInt` /
+/// `NUint` / `NFloat`) for an otherwise type-free numeric HIR node (uniform
+/// value boxing, slice #2). HIR is deliberately type-free (JS has one `number`),
+/// so lowering threads this on from the checker's inferred type at the point it
+/// builds a numeric node; without it emit could not tell `5`, `5u` and `5.0`
+/// apart, all of which lower to the same `f64`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NumKind {
+	/// `int` → boxed as `new NInt(v)`.
+	Int,
+	/// `uint` → boxed as `new NUint(v)`.
+	UInt,
+	/// `float` → boxed as `new NFloat(v)`.
+	Float,
+	/// A compiler-internal raw JS number — NEVER produced from a user literal.
+	/// Emitted as a bare numeric literal (no box), because it is scaffolding the
+	/// desugared control-flow machinery operates on with native JS arithmetic
+	/// (loop counters `i + 1`, list indices `arr[i]`, `i < arr.length`), not a
+	/// user-visible Nymph value. Boxing these would break the emitted loop
+	/// desugarings; they stay raw until a later slice reworks that machinery.
+	Raw,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum HirExpr {
-	/// Any numeric literal (int/uint/float) — all are JS `number`.
-	Num(f64),
+	/// Any numeric literal (int/uint/float), tagged with the [`NumKind`] codegen
+	/// boxes it as — all three are the same JS `number` at the payload level.
+	Num(f64, NumKind),
 	Str(EcoString),
 	Bool(bool),
 	Char(char),

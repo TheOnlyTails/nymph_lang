@@ -302,7 +302,9 @@ impl Checker<'_> {
 					if let [(fname, fty)] = field_tys.as_slice() {
 						// Record which field this positional sub-pattern resolved to, so
 						// lowering (no type access) can emit the field access.
-						self.annotations.record_positional_field(field.1, fname.clone());
+						self
+							.annotations
+							.record_positional_field(field.1, fname.clone());
 						self.pattern(pat, *fty, mutable);
 					} else {
 						self.emit(

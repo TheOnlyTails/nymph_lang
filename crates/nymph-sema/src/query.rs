@@ -2681,8 +2681,7 @@ fn push_pattern_variant_candidates(
 		Pattern::Struct { fields, .. } => {
 			for field in fields {
 				match &field.0 {
-					StructPatternField::Value { value, .. }
-					| StructPatternField::Positional(value) => {
+					StructPatternField::Value { value, .. } | StructPatternField::Positional(value) => {
 						push_pattern_variant_candidates(value, checked, module, defs, out);
 					}
 					StructPatternField::Named(_) | StructPatternField::Rest => {}

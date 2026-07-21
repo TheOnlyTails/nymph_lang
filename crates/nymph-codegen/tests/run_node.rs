@@ -3352,7 +3352,10 @@ func how_many(): uint = {
 	let mut c = Counter(current = 0u, limit = 4u)
 	c.map((n) -> n * n).count()
 }"#;
-	assert_eq!(run_with_prelude(user, prelude, "squares()"), "[ 0, 1, 4, 9 ]");
+	assert_eq!(
+		run_with_prelude(user, prelude, "squares()"),
+		"[ 0, 1, 4, 9 ]"
+	);
 	assert_eq!(run_with_prelude(user, prelude, "how_many()"), "4");
 }
 
@@ -3453,7 +3456,10 @@ func chained(): #[uint] = {
 	let mut c = Counter(current = 0u, limit = 20u)
 	c.filter((n) -> n % 2u == 0u).map((n) -> n * 10u).take(4u).to_list()
 }"#;
-	assert_eq!(run_with_prelude(user, prelude, "evens()"), "[ 0, 2, 4, 6, 8 ]");
+	assert_eq!(
+		run_with_prelude(user, prelude, "evens()"),
+		"[ 0, 2, 4, 6, 8 ]"
+	);
 	assert_eq!(run_with_prelude(user, prelude, "dropped()"), "[ 7, 8, 9 ]");
 	assert_eq!(
 		run_with_prelude(user, prelude, "chained()"),
