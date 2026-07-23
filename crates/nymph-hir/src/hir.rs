@@ -212,6 +212,11 @@ pub enum HirExpr {
 		recv: Box<HirExpr>,
 		index: Box<HirExpr>,
 	},
+	/// A compiler-internal subscript into a raw JS array.
+	RawIndex {
+		recv: Box<HirExpr>,
+		index: Box<HirExpr>,
+	},
 	/// A map lookup — emits as `recv.get(key)`.
 	MapGet {
 		recv: Box<HirExpr>,
@@ -392,6 +397,7 @@ pub enum HirPat {
 	/// A list pattern `#[<prefix>, ...rest, <suffix>]`. `rest` present ⇒ a spread
 	/// (with an optional binding) and a `length >=` test; absent ⇒ an exact-length test.
 	List {
+		kind: HirArrayKind,
 		prefix: Vec<HirPat>,
 		rest: Option<Option<EcoString>>,
 		suffix: Vec<HirPat>,

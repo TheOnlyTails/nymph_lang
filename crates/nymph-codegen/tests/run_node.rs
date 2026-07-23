@@ -1464,9 +1464,8 @@ fn runs_a_for_loop_with_a_parenthesized_range_bound() {
 
 #[test]
 fn runs_a_for_loop_over_a_list() {
-	// RR4: a native list source lowers to an index-counting fast path (no
-	// stdlib support needed — the checker resolves a list source purely by
-	// type inspection, and lowering mirrors that).
+	// Boxed lists route through `Iterable.iter()` / `Iterator.next()` like every
+	// other collection; the source-only facade remains prelude-free here.
 	let src = r#"
 		func sum_list(): int = {
 			let mut total = 0
@@ -1476,13 +1475,12 @@ fn runs_a_for_loop_over_a_list() {
 			total
 		}
 	"#;
-	assert_eq!(run(src, "sum_list()"), "10");
+	assert_eq!(run(src, "sum_list().v"), "10");
 }
 
 #[test]
 fn runs_a_for_loop_over_a_mut_list() {
-	// The native list fast path must also run for a `mut` list source — `mut`
-	// is transparent to iteration, same as the checker's own element typing.
+	// `mut` is transparent to the same uniform iteration protocol.
 	let src = r#"
 		func sum_mut_list(): int = {
 			let mut xs = #[1, 2, 3, 4]
@@ -1493,7 +1491,7 @@ fn runs_a_for_loop_over_a_mut_list() {
 			total
 		}
 	"#;
-	assert_eq!(run(src, "sum_mut_list()"), "10");
+	assert_eq!(run(src, "sum_mut_list().v"), "10");
 }
 
 #[test]
@@ -1599,7 +1597,7 @@ fn runs_a_for_loop_over_a_spread_param_bound_to_a_list() {
 			total
 		}
 	"#;
-	assert_eq!(run(src, "total([1, 2, 3, 4, 5])"), "5");
+	assert_eq!(run(src, "total([1, 2, 3, 4, 5]).v"), "5");
 }
 
 // ── Slice 4I: `|>`, `in`/`!in`, `??` (Task 2) ────────────────────────────────

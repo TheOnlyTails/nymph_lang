@@ -2533,14 +2533,19 @@ impl<'m> Checker<'m> {
 		// element type falls through to an unconstrained fresh var and the loop
 		// body escapes type-checking.
 		let stripped = self.strip_mut(ty);
-		match self.interner.kind(stripped).clone() {
-			TyKind::List(elem) => elem,
-			// Anything else resolves through the `Iterator`/`Iterable` interfaces.
-			_ => self.resolve_iterable_source(iterable, ty, stripped),
+		if let TyKind::List(elem) = self.interner.kind(stripped)
+			&& self.defs.get("Iterable").is_none()
+		{
+			let elem = *elem;
+			self
+				.annotations
+				.record_iter_mode(iterable.id, IterMode::ViaIter);
+			return elem;
 		}
+		self.resolve_iterable_source(iterable, ty, stripped)
 	}
 
-	/// Resolve a non-range, non-list `for`-loop source (RR1): prefer
+	/// Resolve a non-range `for`-loop source (RR1): prefer
 	/// ITERATOR-DIRECT (the source itself implements `Iterator<Item>`) over
 	/// ITERABLE-VIA-ITER (the source implements `Iterable<T>`, reached through
 	/// `.iter()`) — a type implementing both uses its own `next()` directly

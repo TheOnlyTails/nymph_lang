@@ -268,6 +268,31 @@ class NymphHamt {
 	*values() { for (const [, value] of this.entries()) yield value; }
 	[Symbol.iterator]() { return this.entries(); }
 }
+
+const NYMPH_OPTION_SOME = Symbol.for("Option.Some");
+const NYMPH_OPTION_NONE = Object.freeze({ [NYMPH_TAG]: Symbol.for("Option.None") });
+
+class NymphListIterator {
+	constructor(items) {
+		this.items = items;
+		this.index = 0;
+	}
+	next() {
+		if (this.index >= this.items.length) return NYMPH_OPTION_NONE;
+		return { [NYMPH_TAG]: NYMPH_OPTION_SOME, value: this.items[this.index++] };
+	}
+}
+
+class NymphMapIterator {
+	constructor(entries) {
+		this.entries = entries;
+	}
+	next() {
+		const entry = this.entries.next();
+		if (entry.done) return NYMPH_OPTION_NONE;
+		return { [NYMPH_TAG]: NYMPH_OPTION_SOME, value: new NTuple(entry.value) };
+	}
+}
 "#;
 
 /// Each built-in box wrapper: `(JS class name, the `nymph.<type>` discriminant
@@ -311,7 +336,7 @@ fn class_defs(export: bool) -> String {
 	for (class, _) in BOX_CLASSES {
 		if *class == "NMap" {
 			out.push_str(&format!(
-				"{kw}class {class} extends {BASE} {{\n\tconstructor(entries) {{\n\t\tsuper(new NymphHamt(entries));\n\t}}\n\tget size() {{ return this.v.size; }}\n\tget(key) {{ return this.v.get(key); }}\n\thas(key) {{ return this.v.has(key); }}\n\tset(key, value) {{ this.v.set(key, value); return this; }}\n\tdelete(key) {{ return this.v.delete(key); }}\n\tclear() {{ this.v.clear(); }}\n\tkeys() {{ return this.v.keys(); }}\n\tvalues() {{ return this.v.values(); }}\n\tentries() {{ return this.v.entries(); }}\n\t[Symbol.iterator]() {{ return this.v[Symbol.iterator](); }}\n}}\n"
+				"{kw}class {class} extends {BASE} {{\n\tconstructor(entries) {{\n\t\tsuper(new NymphHamt(entries));\n\t}}\n\tget size() {{ return this.v.size; }}\n\tget(key) {{ return this.v.get(key); }}\n\thas(key) {{ return this.v.has(key); }}\n\tset(key, value) {{ this.v.set(key, value); return this; }}\n\tdelete(key) {{ return this.v.delete(key); }}\n\tclear() {{ this.v.clear(); }}\n\tkeys() {{ return this.v.keys(); }}\n\tvalues() {{ return this.v.values(); }}\n\tentries() {{ return this.v.entries(); }}\n\titer() {{ return new NymphMapIterator(this.v.entries()); }}\n\t[Symbol.iterator]() {{ return this.v[Symbol.iterator](); }}\n}}\n"
 			));
 		} else if *class == "NTuple" {
 			// Native Map's constructor reads pair entries through numeric properties.
@@ -321,7 +346,7 @@ fn class_defs(export: bool) -> String {
 			));
 		} else if *class == "NList" {
 			out.push_str(&format!(
-				"{kw}class {class} extends {BASE} {{\n\tindex(key) {{\n\t\treturn this.v[key.v];\n\t}}\n}}\n"
+				"{kw}class {class} extends {BASE} {{\n\tindex(key) {{\n\t\treturn this.v[key.v];\n\t}}\n\titer() {{\n\t\treturn new NymphListIterator(this.v);\n\t}}\n}}\n"
 			));
 		} else {
 			out.push_str(&format!("{kw}class {class} extends {BASE} {{}}\n"));

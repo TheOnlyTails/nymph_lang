@@ -3289,19 +3289,14 @@ impl<'a> Lowerer<'a> {
 	}
 
 	/// Desugar `for (<pat> in <src>) <body>` (SLICE: iterator for-loops).
-	/// Dispatches on `<src>`'s shape/recorded type to one of three lowerings,
-	/// mirroring the checker's own `infer_iterable_element` three-way split
-	/// (RR3/RR4/RR1):
+	/// Dispatches ranges separately, then routes every ordinary collection
+	/// through the iteration protocols selected by the checker.
 	///
 	/// - a SYNTACTIC range literal (`iterable.kind` is `ExprKind::Range`) keeps
 	///   the original counting-`while` fast path (`lower_for_range`, Slice 4H,
 	///   BB2), UNCHANGED — it's faster than the general protocol and the
 	///   checker never routes a range through the interfaces at all;
-	/// - a native list source (the recorded element type is `TyKind::List`)
-	///   gets its own index-counting fast path (`lower_for_list`) — no stdlib
-	///   support needed, since the checker resolves a list source purely by
-	///   type inspection too, without ever consulting `Iterator`/`Iterable`;
-	/// - a bare, unbound generic `Param` source ALSO takes the list fast path.
+	/// - a bare, unbound generic `Param` source keeps a temporary raw-array path.
 	///   This mirrors `resolve_iterable_source`'s own pre-existing permissive
 	///   carve-out for exactly this shape (a `...from: Item` spread parameter,
 	///   e.g. `collections/set.nym`'s `Set::new` — spread-parameter typing
@@ -3332,18 +3327,17 @@ impl<'a> Lowerer<'a> {
 			.annotations
 			.get(iterable.id)
 			.map(|info| Self::peel_mut(self.interner, info.ty));
-		// A native list always takes the index fast path. A bare `Param` does TOO, but
-		// only for the spread-parameter carve-out where the checker recorded no
+		// A bare `Param` takes the raw-array path only for the spread-parameter
+		// carve-out where the checker recorded no
 		// `IterMode` (`resolve_iterable_source`); a `Param` bound by `Iterator`/`Iterable`
 		// records `IterMode::Direct`/`ViaIter` and must go through the protocol (calling
 		// `.next()`), not be mis-lowered as an array index walk.
-		let is_list_like = source_ty.is_some_and(|ty| match self.interner.kind(ty) {
-			TyKind::List(_) => true,
-			TyKind::Param(_) => self.annotations.iter_mode_of(iterable.id).is_none(),
-			_ => false,
+		let is_raw_spread_param = source_ty.is_some_and(|ty| {
+			matches!(self.interner.kind(ty), TyKind::Param(_))
+				&& self.annotations.iter_mode_of(iterable.id).is_none()
 		});
-		if is_list_like {
-			self.lower_for_list(variable, iterable, body)
+		if is_raw_spread_param {
+			self.lower_for_raw_spread_param(variable, iterable, body)
 		} else {
 			self.lower_for_protocol(variable, iterable, body)
 		}
@@ -3491,7 +3485,7 @@ impl<'a> Lowerer<'a> {
 		}
 	}
 
-	/// Native list fast path (RR4): `for (<pat> in <list-src>) <body>` lowers to
+	/// Temporary raw spread-parameter path: `for (<pat> in <param>) <body>` lowers to
 	/// the SAME index-counting `while` shape as the range fast path above, over
 	/// `$arr[$i]` instead of the induction variable itself. Type-free at the JS
 	/// level — `.length` is a real JS array property, not the stdlib's own
@@ -3504,7 +3498,7 @@ impl<'a> Lowerer<'a> {
 	/// supported, mirroring `lower_for_range`'s own restriction — HIR's `Let`
 	/// only binds a single name (`param_name`), so a `let` (unlike a `match`
 	/// arm) has no way to destructure a general pattern.
-	fn lower_for_list(
+	fn lower_for_raw_spread_param(
 		&self,
 		variable: &Spanned<nymph_ast::expr::Pattern>,
 		iterable: &Expr,
@@ -3540,7 +3534,7 @@ impl<'a> Lowerer<'a> {
 				HirStmt::Let {
 					name: pat_name,
 					mutable: false,
-					value: HirExpr::Index {
+					value: HirExpr::RawIndex {
 						recv: Box::new(HirExpr::Local(arr_name.clone())),
 						index: Box::new(HirExpr::Local(i_name.clone())),
 					},
@@ -3596,7 +3590,7 @@ impl<'a> Lowerer<'a> {
 	}
 
 	/// The general `Iterator`/`Iterable` protocol desugar (RR1/RR2): every
-	/// `for`-loop source that is neither a syntactic range nor a native list
+	/// `for`-loop source that is neither a syntactic range nor the temporary raw spread parameter
 	/// reaches here. HIR has no `Break`/`Continue` node, so the loop-exit signal
 	/// is a plain `mut` boolean flag rather than the more natural
 	/// `while (true) { match { .. -> break } }` shape:
@@ -3613,7 +3607,7 @@ impl<'a> Lowerer<'a> {
 	/// }
 	/// ```
 	///
-	/// Unlike `lower_for_range`/`lower_for_list` (which bind the loop pattern
+	/// Unlike `lower_for_range`/`lower_for_raw_spread_param` (which bind the loop pattern
 	/// through a HIR `Let`, so only a plain binding is supported — `Let` binds a
 	/// single name only), the loop pattern here is a genuine `match` arm
 	/// pattern (`HirPat`, via the ordinary `lower_pattern`), so ANY pattern
@@ -4502,6 +4496,7 @@ impl<'a> Lowerer<'a> {
 						}
 					}
 					HirPat::List {
+						kind: HirArrayKind::Tuple,
 						prefix,
 						rest,
 						suffix,
@@ -4530,6 +4525,7 @@ impl<'a> Lowerer<'a> {
 					}
 				}
 				HirPat::List {
+					kind: HirArrayKind::List,
 					prefix,
 					rest,
 					suffix,
@@ -4921,7 +4917,7 @@ fn collect_locals(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 				}
 			}
 		}
-		HirExpr::Index { recv, index } => {
+		HirExpr::Index { recv, index } | HirExpr::RawIndex { recv, index } => {
 			collect_locals(recv, out);
 			collect_locals(index, out);
 		}
@@ -5073,7 +5069,7 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 				}
 			}
 		}
-		HirExpr::Index { recv, index } => {
+		HirExpr::Index { recv, index } | HirExpr::RawIndex { recv, index } => {
 			collect_variant_ref_enums(recv, out);
 			collect_variant_ref_enums(index, out);
 		}
@@ -5480,6 +5476,7 @@ fn pat_binds(pat: &HirPat) -> bool {
 			prefix,
 			rest,
 			suffix,
+			..
 		} => matches!(rest, Some(Some(_))) || prefix.iter().chain(suffix).any(pat_binds),
 		HirPat::Map { entries, rest } => {
 			matches!(rest, Some(Some(_))) || entries.iter().any(|(_, p)| pat_binds(p))

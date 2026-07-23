@@ -483,6 +483,44 @@ fn boxed_collection_intrinsics_preserve_value_semantics_and_nested_shapes() {
 	);
 }
 
+#[test]
+fn boxed_lists_and_maps_iterate_through_the_uniform_protocol() {
+	let entry = r#"
+		func list_sum(): int = {
+			let mut total = 0
+			for (value in #[1, 2, 3, 4]) total = total + value
+			total
+		}
+		func map_sum(): int = {
+			let mut total = 0
+			for (#(key, value) in #{1: 10, 2: 20}) total = total + key + value
+			total
+		}
+		func pattern_sum(): int = {
+			let mut total = 0
+			for (#[a, b] in #[#[1, 2], #[3, 4]]) total = total + a + b
+			for (#(a, b, c) in #[#(5, 6, 7)]) total = total + a + b + c
+			for (#[first, ...rest] in #[#[8, 9]]) total = total + first + rest[0]
+			for (#(first, ...rest, last) in #[#(10, 11, 12)]) total = total + first + rest[0] + last
+			for (#[1, value] in #[#[1, 2], #[9, 9]]) total = total + value
+			for (#(1, value) in #{1: 10, 2: 20}) total = total + value
+			total
+		}
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("boxed collections should satisfy the ambient iteration protocols");
+	let list_sum = compiled.entry_symbol("list_sum");
+	let map_sum = compiled.entry_symbol("map_sum");
+	let pattern_sum = compiled.entry_symbol("pattern_sum");
+	let mut js = compiled.js;
+	js.push_str(&format!(
+		"\nconsole.log({list_sum}().v, {map_sum}().v, {pattern_sum}().v);\n"
+	));
+	assert_eq!(run_node(&js, "boxed_iteration"), "10 33 90");
+}
+
 /// The ambient `string` methods (now `core`, linked to `string.ts`): a program
 /// calls several on a plain string literal WITH NO IMPORT, and they compile,
 /// bundle, and run under Node — the primitive-methods-just-work payoff.

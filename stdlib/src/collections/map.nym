@@ -1,5 +1,7 @@
 import @/option with (Option)
 import @/ops with (Plus, Into, Contains, Hash)
+import @/iter with (Iterator)
+import @/iter/iterable with (Iterable)
 
 impl<K: Hash, V> mut #{K: V} {
   external(size) func size(): uint
@@ -38,4 +40,8 @@ impl<K: Hash + Into<string>, V: Into<string>> Into<string> for #{K: V} {
 
 impl<K: Hash, V> Contains<Item = K> for #{K: V} {
   external(contains_key) func contains(item: K): boolean
+}
+
+impl<K: Hash, V> Iterable<#(K, V)> for #{K: V} {
+  external(iter) func iter(): Iterator<#(K, V)>
 }

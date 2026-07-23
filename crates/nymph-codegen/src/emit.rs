@@ -32,7 +32,7 @@ enum Subject {
 	MapGet(Box<Subject>, HirLit),
 	/// `<base>.slice(<start>, <base>.length - <end_from_end>)` — a list rest slice
 	/// (`end_from_end == 0` ⇒ `<base>.slice(<start>)`).
-	Slice(Box<Subject>, usize, usize),
+	Slice(Box<Subject>, usize, usize, HirArrayKind),
 	/// The rest-of-map for a map pattern's `...rest` — a shallow copy of `<base>`
 	/// minus the named keys: `new NMap(<base>)` when `keys` is empty, else an
 	/// IIFE that copies then deletes each key.
@@ -1325,6 +1325,13 @@ impl<'a> Emitter<'a> {
 				let key = self.emit_expr(index);
 				self.member_call(object, "index", vec![key])
 			}
+			HirExpr::RawIndex { recv, index } => {
+				let object = self.emit_expr(recv);
+				let property = self.emit_expr(index);
+				Expression::ComputedMemberExpression(ComputedMemberExpression::boxed(
+					SPAN, object, property, false, &self.ast,
+				))
+			}
 			// Struct construction → `new <class>({ field: value, … })`.
 			HirExpr::New { class, fields } => {
 				let mut props = ArenaVec::new_in(&self.ast);
@@ -1861,7 +1868,13 @@ impl<'a> Emitter<'a> {
 				)
 			}
 			Subject::Index(base, index) => {
-				let object = self.emit_subject(base);
+				let object = Expression::new_static_member_expression(
+					SPAN,
+					self.emit_subject(base),
+					IdentifierName::new(SPAN, "v", &self.ast),
+					false,
+					&self.ast,
+				);
 				let idx = Expression::new_numeric_literal(
 					SPAN,
 					*index as f64,
@@ -1875,10 +1888,22 @@ impl<'a> Emitter<'a> {
 			}
 			Subject::IndexFromEnd(base, offset) => {
 				// <base>[<base>.length - <offset>]
-				let arr = self.emit_subject(base);
-				let len = Expression::new_static_member_expression(
+				let arr = Expression::new_static_member_expression(
 					SPAN,
 					self.emit_subject(base),
+					IdentifierName::new(SPAN, "v", &self.ast),
+					false,
+					&self.ast,
+				);
+				let len = Expression::new_static_member_expression(
+					SPAN,
+					Expression::new_static_member_expression(
+						SPAN,
+						self.emit_subject(base),
+						IdentifierName::new(SPAN, "v", &self.ast),
+						false,
+						&self.ast,
+					),
 					IdentifierName::new(SPAN, "length", &self.ast),
 					false,
 					&self.ast,
@@ -1900,8 +1925,14 @@ impl<'a> Emitter<'a> {
 				let map = self.emit_subject(base);
 				self.member_call(map, "get", vec![self.emit_boxed_lit(key)])
 			}
-			Subject::Slice(base, start, end_from_end) => {
-				let arr = self.emit_subject(base);
+			Subject::Slice(base, start, end_from_end, kind) => {
+				let arr = Expression::new_static_member_expression(
+					SPAN,
+					self.emit_subject(base),
+					IdentifierName::new(SPAN, "v", &self.ast),
+					false,
+					&self.ast,
+				);
 				let start_lit = Expression::new_numeric_literal(
 					SPAN,
 					*start as f64,
@@ -1909,12 +1940,18 @@ impl<'a> Emitter<'a> {
 					NumberBase::Decimal,
 					&self.ast,
 				);
-				if *end_from_end == 0 {
+				let slice = if *end_from_end == 0 {
 					self.member_call(arr, "slice", vec![start_lit])
 				} else {
 					let len = Expression::new_static_member_expression(
 						SPAN,
-						self.emit_subject(base),
+						Expression::new_static_member_expression(
+							SPAN,
+							self.emit_subject(base),
+							IdentifierName::new(SPAN, "v", &self.ast),
+							false,
+							&self.ast,
+						),
 						IdentifierName::new(SPAN, "length", &self.ast),
 						false,
 						&self.ast,
@@ -1934,7 +1971,15 @@ impl<'a> Emitter<'a> {
 						&self.ast,
 					);
 					self.member_call(arr, "slice", vec![start_lit, end])
-				}
+				};
+				self.new_box(
+					match kind {
+						HirArrayKind::Tuple => "NTuple",
+						HirArrayKind::List => "NList",
+						HirArrayKind::Raw => unreachable!("patterns never bind a raw-array rest"),
+					},
+					slice,
+				)
 			}
 			Subject::MapRest(base, keys) => {
 				let map_expr = self.emit_subject(base);
@@ -1994,10 +2039,31 @@ impl<'a> Emitter<'a> {
 		Expression::ComputedMemberExpression(ComputedMemberExpression::boxed(
 			SPAN,
 			obj,
-			Expression::new_identifier(SPAN, "TAG", &self.ast),
+			self.global_symbol("nymph.tag"),
 			optional,
 			&self.ast,
 		))
+	}
+
+	fn global_symbol(&self, name: &str) -> Expression<'a> {
+		let symbol = Expression::new_identifier(SPAN, "Symbol", &self.ast);
+		let member = Expression::new_static_member_expression(
+			SPAN,
+			symbol,
+			IdentifierName::new(SPAN, "for", &self.ast),
+			false,
+			&self.ast,
+		);
+		let value =
+			Expression::new_string_literal(SPAN, self.ast.allocator.alloc_str(name), None, &self.ast);
+		Expression::new_call_expression(
+			SPAN,
+			member,
+			oxc::ast::NONE,
+			ArenaVec::from_value_in(Argument::from(value), &self.ast),
+			false,
+			&self.ast,
+		)
 	}
 
 	/// Compile a pattern against a subject into a boolean test (`None` ⇒ always true)
@@ -2022,7 +2088,7 @@ impl<'a> Emitter<'a> {
 				(test, binds)
 			}
 			HirPat::Lit(lit) => {
-				let subject = self.emit_subject(subj);
+				let subject = self.unwrap_v(self.emit_subject(subj));
 				let value = self.emit_lit(lit);
 				let test = Expression::new_binary_expression(
 					SPAN,
@@ -2040,7 +2106,7 @@ impl<'a> Emitter<'a> {
 			} => {
 				// <subject>?.[TAG] === <enum>.<variant>[TAG]
 				let subject_tag = self.tag_read(self.emit_subject(subj), true);
-				let variant_tag = self.tag_read(self.variant_member(enum_name, variant), false);
+				let variant_tag = self.global_symbol(&format!("{enum_name}.{variant}"));
 				let mut test = Expression::new_binary_expression(
 					SPAN,
 					subject_tag,
@@ -2088,6 +2154,7 @@ impl<'a> Emitter<'a> {
 			// A list pattern: a length test (exact or `>=`), element bindings by index
 			// (prefix from the front, suffix from the end), and an optional rest slice.
 			HirPat::List {
+				kind,
 				prefix,
 				rest,
 				suffix,
@@ -2101,7 +2168,13 @@ impl<'a> Emitter<'a> {
 				} else {
 					let length = Expression::new_static_member_expression(
 						SPAN,
-						self.emit_subject(subj),
+						Expression::new_static_member_expression(
+							SPAN,
+							self.emit_subject(subj),
+							IdentifierName::new(SPAN, "v", &self.ast),
+							false,
+							&self.ast,
+						),
 						IdentifierName::new(SPAN, "length", &self.ast),
 						false,
 						&self.ast,
@@ -2138,7 +2211,7 @@ impl<'a> Emitter<'a> {
 					test = self.and_test(test, t);
 				}
 				if let Some(Some(name)) = rest {
-					let slice = Subject::Slice(Box::new(subj.clone()), prefix.len(), suffix.len());
+					let slice = Subject::Slice(Box::new(subj.clone()), prefix.len(), suffix.len(), *kind);
 					binds.push((name.to_string(), slice));
 				}
 				(test, binds)
@@ -2202,13 +2275,19 @@ impl<'a> Emitter<'a> {
 				SPAN,
 				me.emit_lit(lit),
 				BinaryOperator::LessEqualThan,
-				me.emit_subject(subj),
+				me.unwrap_v(me.emit_subject(subj)),
 				&me.ast,
 			)
 		};
 		// `<subj> <op> <lit>`
 		let lt = |me: &Self, lit: &HirLit, op: BinaryOperator| {
-			Expression::new_binary_expression(SPAN, me.emit_subject(subj), op, me.emit_lit(lit), &me.ast)
+			Expression::new_binary_expression(
+				SPAN,
+				me.unwrap_v(me.emit_subject(subj)),
+				op,
+				me.emit_lit(lit),
+				&me.ast,
+			)
 		};
 		match range {
 			HirRange::From(min) => ge(self, min),
