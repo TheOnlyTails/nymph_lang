@@ -1,6 +1,6 @@
 use nymph_hir::hir::{
-	BinOp, BuiltinResult, HirArrayElem, HirExpr, HirLit, HirMapElem, HirModule, HirPat, HirStmt,
-	NumKind, ScalarCastKind, UnOp,
+	BinOp, BuiltinResult, HirArrayElem, HirArrayKind, HirExpr, HirLit, HirMapElem, HirModule, HirPat,
+	HirStmt, NumKind, ScalarCastKind, UnOp,
 };
 use nymph_sema::check_module;
 use nymph_syntax::parse_module;
@@ -67,11 +67,14 @@ fn lowers_collections_and_index() {
 	let hir = lower("func f(): #[int] = #[1, 2, 3]");
 	assert_eq!(
 		hir.funcs[0].body,
-		HirExpr::Array(vec![
-			HirExpr::Num(1.0, NumKind::Int),
-			HirExpr::Num(2.0, NumKind::Int),
-			HirExpr::Num(3.0, NumKind::Int)
-		]),
+		HirExpr::Array {
+			kind: HirArrayKind::List,
+			items: vec![
+				HirExpr::Num(1.0, NumKind::Int),
+				HirExpr::Num(2.0, NumKind::Int),
+				HirExpr::Num(3.0, NumKind::Int)
+			],
+		},
 	);
 
 	// Indexing a map dispatches to `MapGet`. Int keys keep this collections slice
@@ -2686,8 +2689,8 @@ fn spread_closure_param_panics_in_lowering() {
 
 #[test]
 fn lowers_a_list_spread_over_a_native_list_source_to_a_native_splice() {
-	// A native `#[T]` list source is already a JS array — no drain, just an
-	// ordinary `HirArrayElem::Spread` wrapping the lowered source directly.
+	// A boxed `#[T]` list exposes its native payload directly to the spread; no
+	// protocol drain is needed.
 	let hir = lower(
 		r#"
 		func f(): #[int] = {
@@ -2702,7 +2705,10 @@ fn lowers_a_list_spread_over_a_native_list_source_to_a_native_splice() {
 	assert_eq!(
 		tail.as_deref(),
 		Some(&HirExpr::ArraySpread(vec![
-			HirArrayElem::Spread(HirExpr::Local("xs".into())),
+			HirArrayElem::Spread(HirExpr::Field {
+				recv: Box::new(HirExpr::Local("xs".into())),
+				name: "v".into(),
+			}),
 			HirArrayElem::Item(HirExpr::Num(4.0, NumKind::Int)),
 		]))
 	);
@@ -2764,7 +2770,11 @@ fn lowers_a_list_spread_over_a_user_iterator_source_to_a_drain() {
 	assert_eq!(stmts.len(), 4);
 	assert!(matches!(
 		&stmts[0],
-		HirStmt::Let { name, value: HirExpr::Array(items), .. } if name == "$acc" && items.is_empty()
+		HirStmt::Let {
+			name,
+			value: HirExpr::Array { kind: HirArrayKind::Raw, items },
+			..
+		} if name == "$acc" && items.is_empty()
 	));
 	assert!(matches!(&stmts[1], HirStmt::Let { name, .. } if name == "$it"));
 	assert!(matches!(&stmts[2], HirStmt::Let { name, mutable: true, .. } if name == "$go"));
@@ -2810,9 +2820,8 @@ fn lowers_a_map_spread_over_a_native_map_source_to_a_native_merge() {
 
 #[test]
 fn lowers_a_map_spread_over_a_native_list_of_pairs_source_directly() {
-	// A native `#[#(K, V)]` list source is a JS array already, same as the
-	// native `Map` fast path above — it lowers with no drain, splicing the
-	// list's own `[k, v]` tuples straight into the `new Map([...])` entries.
+	// A boxed `#[#(K, V)]` list exposes its native payload without a drain,
+	// splicing the list's tuple values into the map entries.
 	let hir = lower(
 		r#"
 		func f(): #{int: string} = {
@@ -2827,7 +2836,10 @@ fn lowers_a_map_spread_over_a_native_list_of_pairs_source_directly() {
 	assert_eq!(
 		tail.as_deref(),
 		Some(&HirExpr::MapSpread(vec![
-			HirMapElem::Spread(HirExpr::Local("pairs".into())),
+			HirMapElem::Spread(HirExpr::Field {
+				recv: Box::new(HirExpr::Local("pairs".into())),
+				name: "v".into(),
+			}),
 			HirMapElem::Entry(HirExpr::Num(9.0, NumKind::Int), HirExpr::Str("z".into())),
 		]))
 	);

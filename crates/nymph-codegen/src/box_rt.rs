@@ -1,6 +1,6 @@
 //! The uniform-value-boxing runtime representation (slice #2, the keystone).
 //!
-//! Every Nymph primitive value compiles to a *boxed value* — a per-type wrapper
+//! Every Nymph primitive, list, and tuple value compiles to a *boxed value* — a per-type wrapper
 //! ES class carrying its payload in `.v` and its type discriminant on its
 //! prototype under the shared `Symbol.for("nymph.tag")` key (ADR-0002). This
 //! module is the single source of truth for those wrapper class definitions, in
@@ -23,10 +23,8 @@
 //!   same `x[TAG]` — the same `Symbol.for`-keyed ABI `emit_enum` already relies on
 //!   for per-module `Option`.
 //!
-//! Per the slice, the wrappers are BARE: no `plus`/`equals`/`display` methods yet
-//! — those are lowered from the `impl`s targeting each type in later slices
-//! (#10a arithmetic, #6 equals/hash, #8 display). #2 is representation + literal
-//! boxing only.
+//! Primitive wrappers remain bare. Collection wrappers expose the payload-level
+//! `index` operation required by slice #6; equals/hash/display arrive separately.
 
 /// The virtual module specifier the box wrapper classes are importable under.
 /// Stable across the whole boxing branch (later slices' emitted `import`s name
@@ -37,7 +35,7 @@ pub const BOX_MODULE_KEY: &str = "std/box";
 /// The base class name every per-type wrapper extends; holds the `.v` payload.
 const BASE: &str = "NBox";
 
-/// Each primitive box wrapper: `(JS class name, the `nymph.<type>` discriminant
+/// Each built-in box wrapper: `(JS class name, the `nymph.<type>` discriminant
 /// suffix)`. The class name is what emitted `new N…(…)` construction and later
 /// slices' imports reference; the suffix builds the global
 /// `Symbol.for("nymph.<type>")` tag installed on the class prototype (which
@@ -51,6 +49,8 @@ const BOX_CLASSES: &[(&str, &str)] = &[
 	("NChar", "char"),
 	("NBool", "bool"),
 	("NString", "string"),
+	("NList", "list"),
+	("NTuple", "tuple"),
 ];
 
 /// The wrapper-class JS body, shared by both emitted forms. When `export` is
@@ -67,7 +67,19 @@ fn class_defs(export: bool) -> String {
 	out.push_str("\tconstructor(v) {\n\t\tthis.v = v;\n\t}\n");
 	out.push_str("}\n");
 	for (class, _) in BOX_CLASSES {
-		out.push_str(&format!("{kw}class {class} extends {BASE} {{}}\n"));
+		if *class == "NTuple" {
+			// Native Map's constructor reads pair entries through numeric properties.
+			// Keep that boundary compatible while the tuple's canonical storage stays `.v`.
+			out.push_str(&format!(
+				"{kw}class {class} extends {BASE} {{\n\tindex(key) {{\n\t\treturn this.v[key.v];\n\t}}\n\tget 0() {{\n\t\treturn this.v[0];\n\t}}\n\tget 1() {{\n\t\treturn this.v[1];\n\t}}\n}}\n"
+			));
+		} else if *class == "NList" {
+			out.push_str(&format!(
+				"{kw}class {class} extends {BASE} {{\n\tindex(key) {{\n\t\treturn this.v[key.v];\n\t}}\n}}\n"
+			));
+		} else {
+			out.push_str(&format!("{kw}class {class} extends {BASE} {{}}\n"));
+		}
 	}
 	for (class, tag) in BOX_CLASSES {
 		out.push_str(&format!(

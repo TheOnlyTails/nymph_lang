@@ -72,7 +72,7 @@ fn late_resolved_integral_division_reboxes_as_nfloat() {
 		}",
 	);
 	assert!(
-		js.contains("new NFloat(xs[") && js.contains("].v / xs[") && js.contains("].v)"),
+		js.contains("new NFloat(xs.index(") && js.contains(").v / xs.index(") && js.contains(").v)"),
 		"late-resolved integral division follows its float Output type: {js}"
 	);
 }
@@ -108,7 +108,7 @@ fn late_resolved_primitive_equality_compares_payloads() {
 		}",
 	);
 	assert!(
-		js.contains("].v === xs[") && js.contains("].v)"),
+		js.contains(").v === xs.index(") && js.contains(").v)"),
 		"late-resolved primitive equality compares boxed payloads: {js}"
 	);
 }

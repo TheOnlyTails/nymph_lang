@@ -6,8 +6,9 @@ use oxc::{
 };
 
 use nymph_hir::hir::{
-	BinOp, BuiltinResult, HirArrayElem, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit,
-	HirMapElem, HirMethod, HirModule, HirPat, HirRange, HirStmt, NumKind, ScalarCastKind, UnOp,
+	BinOp, BuiltinResult, HirArrayElem, HirArrayKind, HirClass, HirEnum, HirExpr, HirFunc, HirLet,
+	HirLit, HirMapElem, HirMethod, HirModule, HirPat, HirRange, HirStmt, NumKind, ScalarCastKind,
+	UnOp,
 };
 
 use crate::box_rt;
@@ -1241,13 +1242,19 @@ impl<'a> Emitter<'a> {
 				}
 				Expression::new_call_expression(SPAN, callee, oxc::ast::NONE, arguments, false, &self.ast)
 			}
-			// A tuple/list literal → a JS array `[a, b, …]`.
-			HirExpr::Array(items) => {
+			// Collection literals own a native array payload; compiler-internal
+			// accumulators remain raw arrays.
+			HirExpr::Array { kind, items } => {
 				let mut elems = ArenaVec::new_in(&self.ast);
 				for item in items {
 					elems.push(ArrayExpressionElement::from(self.emit_expr(item)));
 				}
-				Expression::new_array_expression(SPAN, elems, &self.ast)
+				let array = Expression::new_array_expression(SPAN, elems, &self.ast);
+				match kind {
+					HirArrayKind::List => self.new_box("NList", array),
+					HirArrayKind::Tuple => self.new_box("NTuple", array),
+					HirArrayKind::Raw => array,
+				}
 			}
 			// A list literal with at least one spread element (SS1) → a JS array
 			// `[a, ...xs, b]`, preserving left-to-right source order. Each
@@ -1267,7 +1274,8 @@ impl<'a> Emitter<'a> {
 						}
 					}
 				}
-				Expression::new_array_expression(SPAN, arr, &self.ast)
+				let array = Expression::new_array_expression(SPAN, arr, &self.ast);
+				self.new_box("NList", array)
 			}
 			// A map literal → `new Map([[k, v], …])`.
 			HirExpr::MapLit(pairs) => {
@@ -1317,13 +1325,11 @@ impl<'a> Emitter<'a> {
 				args.push(Argument::from(outer));
 				Expression::new_new_expression(SPAN, callee, oxc::ast::NONE, args, &self.ast)
 			}
-			// A list/tuple subscript → a computed member `recv[index]`.
+			// A list/tuple subscript dispatches through its boxed wrapper.
 			HirExpr::Index { recv, index } => {
 				let object = self.emit_expr(recv);
-				let property = self.emit_expr(index);
-				Expression::ComputedMemberExpression(ComputedMemberExpression::boxed(
-					SPAN, object, property, false, &self.ast,
-				))
+				let key = self.emit_expr(index);
+				self.member_call(object, "index", vec![key])
 			}
 			// Struct construction → `new <class>({ field: value, … })`.
 			HirExpr::New { class, fields } => {
@@ -1455,8 +1461,10 @@ impl<'a> Emitter<'a> {
 						AssignmentTarget::from(MemberExpression::StaticMemberExpression(member))
 					}
 					HirExpr::Index { recv, index } => {
-						let object = self.emit_expr(recv);
-						let property = self.emit_expr(index);
+						let recv = self.emit_expr(recv);
+						let object = self.unwrap_v(recv);
+						let index = self.emit_expr(index);
+						let property = self.unwrap_v(index);
 						let member = ComputedMemberExpression::boxed(SPAN, object, property, false, &self.ast);
 						AssignmentTarget::from(MemberExpression::ComputedMemberExpression(member))
 					}

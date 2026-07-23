@@ -185,10 +185,13 @@ pub enum HirExpr {
 		symbol: &'static str,
 		args: Vec<HirExpr>,
 	},
-	/// A tuple or list literal — both emit as a JS array.
-	Array(Vec<HirExpr>),
+	/// A tuple, list, or compiler-internal raw array.
+	Array {
+		kind: HirArrayKind,
+		items: Vec<HirExpr>,
+	},
 	/// A list literal (SS1) containing at least one spread element
-	/// (`#[a, ...xs, b]`) — emits as a JS array literal with the spread
+	/// (`#[a, ...xs, b]`) — emits as a boxed list carrying an array with the spread
 	/// elements' JS `...` syntax preserved in position. A spread-free list
 	/// still lowers to the plain [`HirExpr::Array`] above (zero behavior
 	/// change for the common case); this variant exists only so a spread
@@ -204,7 +207,7 @@ pub enum HirExpr {
 	/// since the `Map` constructor processes its entries array in order). A
 	/// spread-free map still lowers to the plain [`HirExpr::MapLit`] above.
 	MapSpread(Vec<HirMapElem>),
-	/// A subscript into a list/tuple — emits as `recv[index]`.
+	/// A subscript into a list/tuple — dispatches through its boxed wrapper.
 	Index {
 		recv: Box<HirExpr>,
 		index: Box<HirExpr>,
@@ -294,6 +297,13 @@ pub enum HirExpr {
 		params: Vec<EcoString>,
 		body: Box<HirExpr>,
 	},
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HirArrayKind {
+	List,
+	Tuple,
+	Raw,
 }
 
 /// One element of a spread-bearing list literal (see [`HirExpr::ArraySpread`]).

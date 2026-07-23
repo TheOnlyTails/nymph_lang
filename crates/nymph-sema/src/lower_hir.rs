@@ -21,9 +21,9 @@ use nymph_ast::{
 	ty::{GenericArg, GenericParam},
 };
 use nymph_hir::hir::{
-	BinOp, BuiltinResult, HirArm, HirArrayElem, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit,
-	HirMapElem, HirMethod, HirModule, HirPat, HirRange, HirStmt, HirVariant, NumKind, ScalarCastKind,
-	UnOp,
+	BinOp, BuiltinResult, HirArm, HirArrayElem, HirArrayKind, HirClass, HirEnum, HirExpr, HirFunc,
+	HirLet, HirLit, HirMapElem, HirMethod, HirModule, HirPat, HirRange, HirStmt, HirVariant, NumKind,
+	ScalarCastKind, UnOp,
 };
 use nymph_hir::ty::{Interner, Ty, TyKind};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -2947,7 +2947,10 @@ impl<'a> Lowerer<'a> {
 					},
 				}
 			}
-			ExprKind::Tuple(items) => HirExpr::Array(self.lower_items(items)),
+			ExprKind::Tuple(items) => HirExpr::Array {
+				kind: HirArrayKind::Tuple,
+				items: self.lower_items(items),
+			},
 			ExprKind::List(items) => self.lower_list(items),
 			ExprKind::Map(entries) => self.lower_map(entries),
 			ExprKind::IndexAccess { parent, index, .. } => {
@@ -3794,7 +3797,10 @@ impl<'a> Lowerer<'a> {
 		let mut stmts = vec![HirStmt::Let {
 			name: acc_name.clone(),
 			mutable: false,
-			value: HirExpr::Array(vec![]),
+			value: HirExpr::Array {
+				kind: HirArrayKind::Raw,
+				items: vec![],
+			},
 		}];
 		stmts.extend(self.drain_loop_stmts(it_value, |s| {
 			let x_name = s.declare(&EcoString::from("$x"));
@@ -3821,9 +3827,9 @@ impl<'a> Lowerer<'a> {
 	}
 
 	/// Lower a spread source `e` (`#[...e]` list item, or a non-map `#{...e}`
-	/// map entry) to the JS-array-valued expression the spread splices:
-	/// `lower_expr(e)` directly when `e`'s recorded type is already a native JS
-	/// array (a `#[T]` list, or a bare, unbound `Param` — the SAME carve-out
+	/// map entry) to the JS-array-valued expression the spread splices: a boxed
+	/// list contributes its `.v` payload directly; a bare, unbound `Param` keeps
+	/// the SAME raw-array carve-out
 	/// `lower_for` uses for a spread-parameter source), else drained into a
 	/// real array through the `Iterator`/`Iterable` protocol
 	/// ([`Self::drain_to_array`]), reading back which mode the checker matched
@@ -3839,9 +3845,13 @@ impl<'a> Lowerer<'a> {
 			.annotations
 			.get(e.id)
 			.map(|info| Self::peel_mut(self.interner, info.ty));
-		let is_list_like = source_ty
-			.is_some_and(|ty| matches!(self.interner.kind(ty), TyKind::List(_) | TyKind::Param(_)));
-		if is_list_like {
+		if source_ty.is_some_and(|ty| matches!(self.interner.kind(ty), TyKind::List(_))) {
+			return HirExpr::Field {
+				recv: Box::new(self.lower_expr(e)),
+				name: "v".into(),
+			};
+		}
+		if source_ty.is_some_and(|ty| matches!(self.interner.kind(ty), TyKind::Param(_))) {
 			return self.lower_expr(e);
 		}
 		let mode = self.annotations.iter_mode_of(e.id).unwrap_or_else(|| {
@@ -4702,9 +4712,9 @@ impl<'a> Lowerer<'a> {
 			.collect()
 	}
 
-	/// Lower a list literal `#[...]`. A spread-free list lowers exactly as
-	/// before SS1 (`HirExpr::Array` via [`Self::lower_items`], zero behavior
-	/// change). Any spread element (`#[a, ...xs, b]`) routes through
+	/// Lower a list literal `#[...]`. A spread-free list lowers to a typed
+	/// `HirExpr::Array` via [`Self::lower_items`]. Any spread element
+	/// (`#[a, ...xs, b]`) routes through
 	/// [`HirExpr::ArraySpread`] instead: each plain item lowers as usual, each
 	/// spread source lowers via [`Self::lower_spread_source`] (native splice for
 	/// an already-JS-array source, a protocol drain otherwise) — the JS spread
@@ -4713,7 +4723,10 @@ impl<'a> Lowerer<'a> {
 	/// mid-list spread (`#[a, ...xs, b]`) splices in-position correctly.
 	fn lower_list(&self, items: &[nymph_ast::Spanned<ListItem>]) -> HirExpr {
 		if !items.iter().any(|i| matches!(i.0, ListItem::Spread(_))) {
-			return HirExpr::Array(self.lower_items(items));
+			return HirExpr::Array {
+				kind: HirArrayKind::List,
+				items: self.lower_items(items),
+			};
 		}
 		let elems = items
 			.iter()
@@ -4879,7 +4892,7 @@ fn collect_locals(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 				collect_locals(a, out);
 			}
 		}
-		HirExpr::Array(items) => {
+		HirExpr::Array { items, .. } => {
 			for item in items {
 				collect_locals(item, out);
 			}
@@ -5031,7 +5044,7 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 				collect_variant_ref_enums(a, out);
 			}
 		}
-		HirExpr::Array(items) => {
+		HirExpr::Array { items, .. } => {
 			for item in items {
 				collect_variant_ref_enums(item, out);
 			}

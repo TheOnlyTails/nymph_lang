@@ -157,12 +157,7 @@ fn emits_enum_with_methods_prototype_shape() {
 }
 
 #[test]
-fn emits_list_index_assignment_as_a_computed_member_assignment() {
-	// Confirmed defect (code review): `HirExpr::Assign { target: Index { .. },
-	// .. }` used to hit an `unreachable!` panic in emit's `Assign` match — a
-	// zero-diagnostic program (`xs[i] = value`) always lowers to exactly this
-	// shape, so the panic was an ICE reachable on valid input, not a genuinely
-	// unreachable case. Emit must produce a plain `xs[i] = v` assignment.
+fn emits_list_index_assignment_against_the_boxed_payload() {
 	let module = HirModule {
 		lets: vec![],
 		funcs: vec![HirFunc {
@@ -180,7 +175,10 @@ fn emits_list_index_assignment_as_a_computed_member_assignment() {
 		enums: vec![],
 	};
 	let js = emit(&module);
-	assert!(js.contains("xs[i] = v"), "computed-member assignment: {js}");
+	assert!(
+		js.contains("xs.v[i.v] = v"),
+		"boxed-payload assignment: {js}"
+	);
 }
 
 #[test]
