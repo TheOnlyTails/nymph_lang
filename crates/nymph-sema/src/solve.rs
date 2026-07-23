@@ -82,6 +82,20 @@ impl Checker<'_> {
 		bounds
 	}
 
+	pub(crate) fn resolve_param_iface_arg(
+		&self,
+		param: ParamIdx,
+		interface: DefId,
+		arg_name: &str,
+	) -> Option<Ty> {
+		self
+			.param_interface_bounds(param)
+			.into_iter()
+			.find(|(bound, _)| *bound == interface)
+			.and_then(|(_, args)| args.into_iter().find(|(name, _)| name == arg_name))
+			.map(|(_, ty)| ty)
+	}
+
 	/// MT2 OO1/OO3: emit [`TypeError::MutMethodNeedsMutReceiver`] if `interface`'s
 	/// OWN declared kind for `name` (the source of truth — an impl's restatement
 	/// is checked to MATCH it at collection time, `iface.rs`'s OO2 check) is
@@ -816,10 +830,8 @@ impl Checker<'_> {
 		}
 		let mut widened = false;
 		for (i, (param, arg)) in params.iter().zip(arg_tys).enumerate() {
-			match self.try_unify_arg_widened(*param, *arg, arg_lits.get(i).copied().unwrap_or(false)) {
-				Some(w) => widened |= w,
-				None => return None,
-			}
+			widened |=
+				self.try_unify_arg_widened(*param, *arg, arg_lits.get(i).copied().unwrap_or(false))?
 		}
 		Some((ret, widened))
 	}

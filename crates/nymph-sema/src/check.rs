@@ -334,7 +334,7 @@ impl<'m> Checker<'m> {
 	/// Emit a typed [`TypeError`](crate::errors::TypeError), anchored at `span`.
 	pub(crate) fn emit(&mut self, span: Span, err: TypeError) {
 		use nymph_diagnostics::IntoDiagnostic;
-		self.diags.push(err.into_diagnostic(span));
+		self.diags.push(err.as_diagnostic(span));
 	}
 
 	// ── Annotations ──────────────────────────────────────────────────────────

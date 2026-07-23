@@ -55,7 +55,7 @@ pub fn lex(source: &str) -> LexResult {
 				},
 				RichReason::Custom(err) => err,
 			};
-			err.into_diagnostic(span)
+			err.as_diagnostic(span)
 		})
 		.collect();
 

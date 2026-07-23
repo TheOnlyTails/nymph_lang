@@ -128,7 +128,7 @@ pub trait IntoDiagnostic: ErrorCode {
 	}
 
 	/// Assemble the full [`Diagnostic`], anchoring the primary message at `span`.
-	fn into_diagnostic(&self, span: impl Into<Span>) -> Diagnostic
+	fn as_diagnostic(&self, span: impl Into<Span>) -> Diagnostic
 	where
 		Self: Sized,
 	{

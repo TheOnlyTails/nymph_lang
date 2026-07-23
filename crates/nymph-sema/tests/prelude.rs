@@ -335,7 +335,7 @@ fn inherent_prelude_only_method_call_panics_loudly_in_lowering() {
 	);
 }
 
-// ── Collections materialization: `try_materialize_prelude_dispatch` scanning
+// ── Collections materialization: `try_lower_runtime_dispatch` scanning
 // inherent `Declaration::Impl` blocks (`impl<T> #[T] { .. }`/`impl<T> mut
 // #[T] { .. }`/`impl<K,V> #{K:V} { .. }`) in addition to the `ImplFor`
 // blocks it already scanned — every real stdlib collection method lives in
@@ -425,7 +425,7 @@ fn inherent_prelude_map_method_materializes_instead_of_panicking() {
 #[test]
 fn inherent_prelude_external_instance_method_stays_a_loud_defer() {
 	// `external(len) func len(): uint` in an inherent `impl<T> #[T]` block —
-	// no `ImplMember::Func` body, so `try_materialize_prelude_dispatch`'s
+	// no `ImplMember::Func` body, so `try_lower_runtime_dispatch`'s
 	// inherent branch must return `None` (never panic INSIDE materializing a
 	// nonexistent body) and the call site keeps its loud panic.
 	let prelude = parse("impl<T> #[T] { external(len) func len(): uint }");

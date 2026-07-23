@@ -28,7 +28,8 @@ use crate::project_support::{self, fs_loader, render_project_diagnostics};
 /// `nymph run -e "<expr>"` instead evaluates a single inline expression and
 /// prints its value: the expression is wrapped in a throwaway nullary function
 /// compiled as a *library* module (no `main` required), and the emitted JS is
-/// invoked through `console.log`, so a quick `nymph run -e "1 + 2"` prints `3`.
+/// rendered through Nymph's `Display` protocol, so a quick
+/// `nymph run -e "1 + 2"` prints `3`.
 /// This is the manual-testing counterpart to a full REPL.
 ///
 /// A compile error, or the compiler backend panicking on an unsupported
@@ -110,12 +111,16 @@ impl NymphCommand for RunCommand {
 	}
 }
 
-/// Wrap an inline expression in a throwaway nullary function, compile it as a
-/// library module, and print its value through `console.log`.
+/// Wrap an inline expression in throwaway evaluation and display functions,
+/// compile them as a library module, and print the display string.
 fn run_inline_expr(expr: &str) -> i32 {
-	// `__nymph_repl` is `$`-free but unlikely to collide with anything the
+	// These names are `$`-free but unlikely to collide with anything the
 	// expression itself references (inline expressions are self-contained).
-	let source = format!("func __nymph_repl() = {expr}\n");
+	// Keep rendering in Nymph so CLI output observes the same inspectable
+	// `Display` behavior as interpolation and stdlib I/O.
+	let source = format!(
+		"func __nymph_repl() = {expr}\nfunc __nymph_repl_display(): string = \"${{__nymph_repl()}}\"\n"
+	);
 	let path = "<expr>";
 
 	let js = match compile_guarded(&source, path, Entry::Library) {
@@ -132,7 +137,7 @@ fn run_inline_expr(expr: &str) -> i32 {
 		}
 	};
 
-	execute(&format!("{js}\nconsole.log(__nymph_repl());\n"))
+	execute(&format!("{js}\nconsole.log(__nymph_repl_display().v);\n"))
 }
 
 /// Write `js` to a unique temp `.mjs` and run it under `node`, forwarding

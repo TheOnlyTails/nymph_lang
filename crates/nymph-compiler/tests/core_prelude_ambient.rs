@@ -18,8 +18,8 @@ use nymph_compiler::{check, compile};
 fn ambient_hash_interface_lowers_to_the_boxed_runtime_intrinsic() {
 	let js = compile("func value(): int = 1.hash()", "hash_ambient")
 		.expect("Hash should be available from the ambient ops prelude");
-	assert!(js.contains("import { hash } from \"std/hash\";"), "{js}");
-	assert!(js.contains("hash(new NInt(1))"), "{js}");
+	assert!(js.contains("//#region std/hash"), "{js}");
+	assert!(js.contains("return hash(new NInt(1))"), "{js}");
 }
 
 /// Emit `src`, append a driver that logs `call`, run under Node, return
@@ -30,7 +30,7 @@ fn run(src: &str, call: &str) -> String {
 	use std::sync::atomic::{AtomicU64, Ordering};
 
 	let mut js = compile(src, "core_prelude_ambient").expect("expected a clean compile");
-	js.push_str(&format!("\nconsole.log({call});\n"));
+	js.push_str(&format!("\nconsole.log(({call}).v);\n"));
 
 	static COUNTER: AtomicU64 = AtomicU64::new(0);
 	let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -77,7 +77,7 @@ fn ambient_core_option_result_convert_and_for_over_list_run_with_no_import() {
 			}
 		}
 
-		func safe_div(a: int, b: int): Result<int, string> = if (b == 0) {
+		func safe_div(a: int, b: int): Result<float, string> = if (b == 0) {
 			Result.Error(error = "div by zero")
 		} else {
 			Result.Ok(value = a / b)
@@ -98,7 +98,7 @@ fn ambient_core_option_result_convert_and_for_over_list_run_with_no_import() {
 		}
 
 		// `convert.nym`'s `Result::ok` (builds an `Option` from a `Result`).
-		func result_to_opt(b: int): int = safe_div(10, b).ok().unwrap(-1)
+		func result_to_opt(b: int): float = safe_div(10, b).ok().unwrap(-1.0)
 		"#;
 
 	let diags = check(src, "test");
@@ -107,19 +107,19 @@ fn ambient_core_option_result_convert_and_for_over_list_run_with_no_import() {
 		"expected the ambient-core program to check cleanly with no import, got: {diags:?}"
 	);
 
-	assert_eq!(run(src, "classify(5)"), "pos");
-	assert_eq!(run(src, "classify(-5)"), "non-pos");
+	assert_eq!(run(src, "classify(new NInt(5))"), "pos");
+	assert_eq!(run(src, "classify(new NInt(-5))"), "non-pos");
 	assert_eq!(run(src, "sum_list()"), "10");
 	// `n = 7 > 0` -> `Some(7)` -> `.ok_or(-1)` -> `Result.Ok(7)` -> `.unwrap(-99)` -> `7`.
-	assert_eq!(run(src, "opt_to_result(7)"), "7");
+	assert_eq!(run(src, "opt_to_result(new NInt(7))"), "7");
 	// `n = -1 <= 0` -> `None` -> `.ok_or(-1)` -> `Result.Error(-1)` -> `.unwrap(-99)` -> the
 	// fallback `-99` (Result's `unwrap(default)` returns `default` on `Error`, not the error
 	// value itself).
-	assert_eq!(run(src, "opt_to_result(-1)"), "-99");
+	assert_eq!(run(src, "opt_to_result(new NInt(-1))"), "-99");
 	// `safe_div(10, 2)` -> `Result.Ok(5)` -> `.ok()` -> `Some(5)` -> `.unwrap(-1)` -> `5`.
-	assert_eq!(run(src, "result_to_opt(2)"), "5");
+	assert_eq!(run(src, "result_to_opt(new NInt(2))"), "5");
 	// `safe_div(10, 0)` -> `Result.Error(..)` -> `.ok()` -> `None` -> `.unwrap(-1)` -> `-1`.
-	assert_eq!(run(src, "result_to_opt(0)"), "-1");
+	assert_eq!(run(src, "result_to_opt(new NInt(0))"), "-1");
 }
 
 /// `std/math` (added to `CORE_SOURCES` alongside the other core modules) is

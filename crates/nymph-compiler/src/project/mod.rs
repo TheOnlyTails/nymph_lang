@@ -52,6 +52,7 @@ mod rewrite;
 
 use nymph_ast::decl::{Module, Visibility};
 use nymph_diagnostics::Diagnostic;
+use nymph_hir::hir::{HirClass, HirEnum, HirFunc, HirMethod, HirModule};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use resolve::{GraphBuilder, RawModule};
@@ -64,6 +65,63 @@ use rewrite::{DeclaredName, NsInfo, RewriteCtx, declared_names, rewrite_module};
 pub struct ProjectDiagnostic {
 	pub module: String,
 	pub diag: Diagnostic,
+}
+
+fn merge_canonical_enum(target: &mut HirEnum, incoming: HirEnum) {
+	assert_eq!(target.name, incoming.name);
+	assert_eq!(target.variants, incoming.variants);
+	merge_canonical_methods(&mut target.methods, incoming.methods);
+	merge_canonical_methods(&mut target.statics, incoming.statics);
+}
+
+fn merge_canonical_class(target: &mut HirClass, incoming: HirClass) {
+	assert_eq!(target.name, incoming.name);
+	assert_eq!(target.fields, incoming.fields);
+	merge_canonical_methods(&mut target.methods, incoming.methods);
+	merge_canonical_methods(&mut target.statics, incoming.statics);
+}
+
+fn merge_canonical_methods(target: &mut Vec<HirMethod>, incoming: Vec<HirMethod>) {
+	for method in incoming {
+		// Prelude methods are lowered independently in each consumer. Their
+		// generated local names can differ with that consumer's rename counters,
+		// even though they came from the same checked declaration. The ambient
+		// owner has already enforced method-name uniqueness, so retain the first
+		// alpha-equivalent materialization in stable project traversal order.
+		if !target.iter().any(|item| item.name == method.name) {
+			target.push(method);
+		}
+	}
+}
+
+fn runtime_import_lines(imports: &[(String, Vec<String>)]) -> String {
+	let mut out = String::new();
+	for (specifier, names) in imports {
+		out.push_str(&format!(
+			"import {{ {} }} from \"{specifier}\";\n",
+			names.join(", ")
+		));
+	}
+	out
+}
+
+fn insert_runtime_module(
+	sources: &mut FxHashMap<String, String>,
+	key: String,
+	source: String,
+) -> Result<(), Vec<ProjectDiagnostic>> {
+	if sources.contains_key(&key) {
+		return Err(vec![ProjectDiagnostic {
+			module: key.clone(),
+			diag: Diagnostic::error(
+				"PROJECT-RUNTIME-MODULE-COLLISION".into(),
+				format!("project module `{key}` conflicts with a compiler runtime module"),
+				nymph_ast::Span::new(0, 0),
+			),
+		}]);
+	}
+	sources.insert(key, source);
+	Ok(())
 }
 
 /// The result of a successful [`compile_project`]: the whole program as one
@@ -118,7 +176,7 @@ pub fn check_project_with_std(
 	load: &dyn Fn(&str) -> Option<String>,
 	std_provider: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<ProjectDiagnostic> {
-	match Driver::resolve_and_bind(entry, load, std_provider, true) {
+	match Driver::resolve_and_bind(entry, load, std_provider, true, false) {
 		Err(diags) => diags,
 		Ok(driver) => driver.check_all(),
 	}
@@ -143,7 +201,7 @@ pub fn check_project_library_with_std(
 	load: &dyn Fn(&str) -> Option<String>,
 	std_provider: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<ProjectDiagnostic> {
-	match Driver::resolve_and_bind(entry, load, std_provider, false) {
+	match Driver::resolve_and_bind(entry, load, std_provider, false, false) {
 		Err(diags) => diags,
 		Ok(driver) => driver.check_all(),
 	}
@@ -178,8 +236,38 @@ pub fn compile_project_with_std(
 	load: &dyn Fn(&str) -> Option<String>,
 	std_provider: &dyn Fn(&str) -> Option<String>,
 ) -> Result<CompiledProject, Vec<ProjectDiagnostic>> {
-	let driver = Driver::resolve_and_bind(entry, load, std_provider, true)?;
+	let driver = Driver::resolve_and_bind(entry, load, std_provider, true, false)?;
 	driver.compile_all()
+}
+
+/// Compile one standalone source through the canonical virtual-module
+/// assembly while retaining the facade's unmangled top-level names.
+pub(crate) fn compile_standalone(
+	source: &str,
+	_path: &str,
+	entry_mode: bool,
+) -> Result<String, Vec<Diagnostic>> {
+	const STANDALONE_ENTRY: &str = "__nymph_internal_standalone_entry__";
+	let load = |key: &str| (key == STANDALONE_ENTRY).then(|| source.to_string());
+	let driver = Driver::resolve_and_bind(STANDALONE_ENTRY, &load, &|_| None, entry_mode, true)
+		.map_err(|diags| diags.into_iter().map(|item| item.diag).collect::<Vec<_>>())?;
+	driver
+		.compile_all()
+		.map(|compiled| compiled.js)
+		.map_err(|diags| diags.into_iter().map(|item| item.diag).collect())
+}
+
+/// Internal inspection seam for regressions that must assert the exact ES
+/// module graph assembled before rolldown transforms it.
+#[doc(hidden)]
+pub fn compile_project_module_sources_with_std(
+	entry: &str,
+	load: &dyn Fn(&str) -> Option<String>,
+	std_provider: &dyn Fn(&str) -> Option<String>,
+) -> Result<std::collections::HashMap<String, String>, Vec<ProjectDiagnostic>> {
+	let driver = Driver::resolve_and_bind(entry, load, std_provider, true, false)?;
+	let (sources, _) = driver.assemble_module_sources()?;
+	Ok(sources.into_iter().collect())
 }
 
 /// Library-mode counterpart of [`compile_project`]: `entry` is not required
@@ -208,7 +296,7 @@ pub fn compile_project_library_with_std(
 	load: &dyn Fn(&str) -> Option<String>,
 	std_provider: &dyn Fn(&str) -> Option<String>,
 ) -> Result<CompiledProject, Vec<ProjectDiagnostic>> {
-	let driver = Driver::resolve_and_bind(entry, load, std_provider, false)?;
+	let driver = Driver::resolve_and_bind(entry, load, std_provider, false, false)?;
 	driver.compile_all()
 }
 
@@ -220,6 +308,7 @@ struct Driver {
 	/// Whether `entry` must declare a valid top-level `main` — see
 	/// [`check_project`] vs [`check_project_library`].
 	entry_mode: bool,
+	preserve_entry_names: bool,
 	order: Vec<String>,
 	modules: FxHashMap<String, RawModule>,
 	tags: FxHashMap<String, usize>,
@@ -241,6 +330,7 @@ impl Driver {
 		load: &dyn Fn(&str) -> Option<String>,
 		std_provider: &dyn Fn(&str) -> Option<String>,
 		entry_mode: bool,
+		preserve_entry_names: bool,
 	) -> Result<Self, Vec<ProjectDiagnostic>> {
 		let mut builder = GraphBuilder::new(load, std_provider);
 		builder.visit(entry);
@@ -277,7 +367,7 @@ impl Driver {
 			let is_entry = entry_mode && *key == entry;
 			let mut renames: FxHashMap<_, _> = declared[key]
 				.iter()
-				.filter(|d| !(is_entry && d.name == "main"))
+				.filter(|d| !((preserve_entry_names && *key == entry) || (is_entry && d.name == "main")))
 				.map(|d| (d.name.clone(), format!("$m{own_tag}${}", d.name).into()))
 				.collect();
 			let mut namespaces: FxHashMap<_, NsInfo> = FxHashMap::default();
@@ -394,6 +484,7 @@ impl Driver {
 		Ok(Self {
 			entry: entry.to_string(),
 			entry_mode,
+			preserve_entry_names,
 			order,
 			modules,
 			tags,
@@ -470,9 +561,11 @@ impl Driver {
 		diags
 	}
 
-	fn compile_all(&self) -> Result<CompiledProject, Vec<ProjectDiagnostic>> {
+	fn assemble_module_sources(
+		&self,
+	) -> Result<(FxHashMap<String, String>, usize), Vec<ProjectDiagnostic>> {
 		let mut diags = Vec::new();
-		let mut module_sources: FxHashMap<String, String> = FxHashMap::default();
+		let mut lowered_modules = Vec::new();
 		for key in &self.order {
 			let prelude = self.prelude_slice(key);
 			let module = &self.processed[key];
@@ -501,17 +594,168 @@ impl Driver {
 			// slots and everything after is an EMITTED dependency module — a call to
 			// one of those dep structs' methods lowers as a real class-method call
 			// rather than a (struct-unsupported) materialization.
-			let hir = nymph_sema::lower_hir_with_prelude_and_deps(
+			let hir = nymph_sema::lower_hir_with_prelude_runtime_and_deps(
 				module,
 				&prelude,
 				crate::prelude::core_prelude().len(),
 				&checked,
 			);
-			let body = nymph_codegen::emit(&hir);
-			module_sources.insert(key.clone(), self.wrap_module_js(key, &body));
+			lowered_modules.push((key.clone(), hir));
 		}
 		if !diags.is_empty() {
 			return Err(diags);
+		}
+
+		let owners = crate::prelude::core_runtime_type_owners();
+		let intrinsic_sources = crate::intrinsics::intrinsic_module_sources();
+		let intrinsic_type_demands =
+			crate::intrinsics::runtime_type_imports(&intrinsic_sources, owners);
+		let declaration_seeds = crate::prelude::core_runtime_declaration_seeds();
+		let interface_owners = crate::prelude::core_interface_owners();
+		let function_owners = crate::prelude::core_function_owners();
+		let mut runtime_enums: FxHashMap<String, Vec<HirEnum>> = FxHashMap::default();
+		let mut runtime_classes: FxHashMap<String, Vec<HirClass>> = FxHashMap::default();
+		let mut runtime_funcs: FxHashMap<String, Vec<HirFunc>> = FxHashMap::default();
+		for seed in &declaration_seeds.enums {
+			if intrinsic_type_demands.contains(&seed.name) {
+				runtime_enums
+					.entry(owners[&seed.name].to_string())
+					.or_default()
+					.push(seed.clone());
+			}
+		}
+		for seed in &declaration_seeds.classes {
+			if intrinsic_type_demands.contains(&seed.name) {
+				runtime_classes
+					.entry(owners[&seed.name].to_string())
+					.or_default()
+					.push(seed.clone());
+			}
+		}
+		for (_, lowered) in &mut lowered_modules {
+			lowered
+				.prelude_runtime
+				.lets
+				.append(&mut lowered.module.lets);
+			lowered.module.lets = std::mem::take(&mut lowered.prelude_runtime.lets);
+			for func in lowered.prelude_runtime.funcs.drain(..) {
+				// Keep a local copy for ordinary demand-generated call sites and
+				// additionally publish a canonical copy for bound dispatchers in
+				// other runtime-owner modules.
+				lowered.module.funcs.push(func.clone());
+				let owner = func
+					.name
+					.strip_prefix("$std$")
+					.and_then(|rest| rest.split('$').next())
+					.and_then(|interface| interface_owners.get(interface))
+					.or_else(|| function_owners.get(&func.name));
+				if let Some(owner) = owner {
+					let funcs = runtime_funcs.entry((*owner).to_string()).or_default();
+					if let Some(existing) = funcs.iter().find(|item| item.name == func.name) {
+						assert_eq!(
+							existing, &func,
+							"conflicting ambient runtime function `{}`",
+							func.name
+						);
+					} else {
+						funcs.push(func);
+					}
+				}
+			}
+			for class in lowered.prelude_runtime.classes.drain(..) {
+				let owner = owners
+					.get(&class.name)
+					.unwrap_or_else(|| panic!("ambient class `{}` has no runtime owner", class.name));
+				let classes = runtime_classes.entry((*owner).to_string()).or_default();
+				if let Some(canonical) = classes.iter_mut().find(|item| item.name == class.name) {
+					merge_canonical_class(canonical, class);
+				} else {
+					classes.push(class);
+				}
+			}
+			for enum_ in lowered.prelude_runtime.enums.drain(..) {
+				let owner = owners
+					.get(&enum_.name)
+					.unwrap_or_else(|| panic!("ambient enum `{}` has no runtime owner", enum_.name));
+				let enums = runtime_enums.entry((*owner).to_string()).or_default();
+				if let Some(canonical) = enums.iter_mut().find(|item| item.name == enum_.name) {
+					merge_canonical_enum(canonical, enum_);
+				} else {
+					enums.push(enum_);
+				}
+			}
+		}
+		let runtime_names: FxHashSet<_> = runtime_enums
+			.values()
+			.flat_map(|enums| enums.iter().map(|enum_| enum_.name.clone()))
+			.chain(
+				runtime_classes
+					.values()
+					.flat_map(|classes| classes.iter().map(|class| class.name.clone())),
+			)
+			.collect();
+		let imports_for = |hir: &HirModule, own_owner: Option<&str>| {
+			let mut imports: FxHashMap<String, Vec<String>> = FxHashMap::default();
+			for name in hir.runtime_type_references() {
+				if !runtime_names.contains(&name) {
+					continue;
+				}
+				let owner = owners[&name];
+				if own_owner == Some(owner) {
+					continue;
+				}
+				imports
+					.entry(owner.to_string())
+					.or_default()
+					.push(name.to_string());
+			}
+			let mut imports: Vec<_> = imports.into_iter().collect();
+			for (_, names) in &mut imports {
+				names.sort_unstable();
+				names.dedup();
+			}
+			imports.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+			imports
+		};
+
+		let mut module_sources: FxHashMap<String, String> = FxHashMap::default();
+		for (key, lowered) in lowered_modules {
+			let imports = imports_for(&lowered.module, None);
+			let body = nymph_codegen::emit(&lowered.module);
+			module_sources.insert(key.clone(), self.wrap_module_js(&key, &body, &imports));
+		}
+		let runtime_owners: FxHashSet<_> = runtime_enums
+			.keys()
+			.chain(runtime_classes.keys())
+			.chain(runtime_funcs.keys())
+			.cloned()
+			.collect();
+		for owner in runtime_owners {
+			let mut enums = runtime_enums.remove(&owner).unwrap_or_default();
+			let mut classes = runtime_classes.remove(&owner).unwrap_or_default();
+			let mut funcs = runtime_funcs.remove(&owner).unwrap_or_default();
+			enums.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+			classes.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+			funcs.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+			let hir = HirModule {
+				lets: Vec::new(),
+				funcs,
+				classes,
+				enums,
+			};
+			let imports = imports_for(&hir, Some(&owner));
+			let mut source = runtime_import_lines(&imports);
+			source.push_str(&nymph_codegen::emit(&hir));
+			let names = hir
+				.classes
+				.iter()
+				.map(|item| item.name.as_str())
+				.chain(hir.enums.iter().map(|item| item.name.as_str()))
+				.chain(hir.funcs.iter().map(|item| item.name.as_str()))
+				.collect::<Vec<_>>()
+				.join(", ");
+			source.push_str(&format!("export {{ {names} }};\n"));
+			insert_runtime_module(&mut module_sources, owner, source)?;
 		}
 		// Gap 3 (L0): inject one virtual intrinsic module per distinct
 		// LINKED-external registry module (today, just
@@ -523,8 +767,18 @@ impl Driver {
 		// `VirtualFsPlugin::load` is only invoked on demand, so an unused
 		// intrinsic costs one un-consulted map entry, and rolldown
 		// tree-shakes it away regardless.
-		module_sources.extend(crate::intrinsics::intrinsic_module_sources());
-		let entry_tag = self.tags[&self.entry];
+		for (key, source) in intrinsic_sources {
+			assert_ne!(
+				key, "std/option",
+				"intrinsics must not replace the canonical Option module"
+			);
+			insert_runtime_module(&mut module_sources, key, source)?;
+		}
+		Ok((module_sources, self.tags[&self.entry]))
+	}
+
+	fn compile_all(&self) -> Result<CompiledProject, Vec<ProjectDiagnostic>> {
+		let (module_sources, entry_tag) = self.assemble_module_sources()?;
 		let js = bundle::bundle(&self.entry, module_sources).map_err(|msg| {
 			vec![ProjectDiagnostic {
 				module: self.entry.clone(),
@@ -558,9 +812,15 @@ impl Driver {
 	/// other exports, so it survives tree-shaking even though nothing in the
 	/// module graph itself calls it (only a caller appending `main();`
 	/// outside the bundle, exactly like the single-module facade).
-	fn wrap_module_js(&self, key: &str, body: &str) -> String {
+	fn wrap_module_js(
+		&self,
+		key: &str,
+		body: &str,
+		runtime_imports: &[(String, Vec<String>)],
+	) -> String {
 		let own_tag = self.tags[key];
 		let is_entry = self.entry_mode && key == self.entry;
+		let preserve_names = self.preserve_entry_names && key == self.entry;
 
 		let mut seen_deps = FxHashSet::default();
 		let mut import_lines = Vec::new();
@@ -586,10 +846,10 @@ impl Driver {
 
 		let mut export_names: Vec<String> = self.declared[key]
 			.iter()
-			.filter(|d| d.vis != Visibility::Private && d.has_runtime_binding)
+			.filter(|d| d.has_runtime_binding && (preserve_names || d.vis != Visibility::Private))
 			.map(|d| {
-				if is_entry && d.name == "main" {
-					"main".to_string()
+				if preserve_names || (is_entry && d.name == "main") {
+					d.name.to_string()
 				} else {
 					format!("$m{own_tag}${}", d.name)
 				}
@@ -598,6 +858,7 @@ impl Driver {
 		export_names.sort_unstable();
 
 		let mut out = String::new();
+		out.push_str(&runtime_import_lines(runtime_imports));
 		for line in &import_lines {
 			out.push_str(line);
 			out.push('\n');

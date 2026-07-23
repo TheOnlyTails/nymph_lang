@@ -5,6 +5,7 @@
 //! slices, where value-copy and operator-overload dispatch first need them.
 
 use ecow::EcoString;
+use rustc_hash::FxHashSet;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct HirModule {
@@ -12,6 +13,34 @@ pub struct HirModule {
 	pub funcs: Vec<HirFunc>,
 	pub classes: Vec<HirClass>,
 	pub enums: Vec<HirEnum>,
+}
+
+impl HirModule {
+	/// Return every nominal runtime type referenced by executable HIR.
+	///
+	/// This deliberately walks declaration bodies as well as top-level values:
+	/// canonical runtime declarations can themselves demand another canonical
+	/// enum or struct, and project linking uses that edge to synthesize imports.
+	pub fn runtime_type_references(&self) -> FxHashSet<EcoString> {
+		let mut references = FxHashSet::default();
+		for let_ in &self.lets {
+			let_.value.collect_runtime_type_references(&mut references);
+		}
+		for func in &self.funcs {
+			func.body.collect_runtime_type_references(&mut references);
+		}
+		for class in &self.classes {
+			for method in class.methods.iter().chain(&class.statics) {
+				method.body.collect_runtime_type_references(&mut references);
+			}
+		}
+		for enum_ in &self.enums {
+			for method in enum_.methods.iter().chain(&enum_.statics) {
+				method.body.collect_runtime_type_references(&mut references);
+			}
+		}
+		references
+	}
 }
 
 /// A top-level `let`/`let mut` binding → a module-scope `const`/`let` declaration
@@ -83,6 +112,25 @@ pub struct HirFunc {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct HirBoundDispatchCase {
+	pub receiver_tag: EcoString,
+	pub argument_tag: EcoString,
+	pub target: HirBoundDispatchTarget,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum HirBoundDispatchTarget {
+	TopLevel {
+		module: EcoString,
+		name: EcoString,
+	},
+	Extern {
+		module: &'static str,
+		symbol: &'static str,
+	},
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum HirStmt {
 	/// `let`/`mut` binding. `mutable` selects JS `let` vs `const`.
 	Let {
@@ -151,6 +199,9 @@ pub enum HirExpr {
 	/// boxes it as — all three are the same JS `number` at the payload level.
 	Num(f64, NumKind),
 	Str(EcoString),
+	/// Cooked string segments and Display-rendered interpolands, concatenated as
+	/// raw JS strings and boxed once by codegen.
+	InterpolatedString(Vec<HirExpr>),
 	Bool(bool),
 	Char(char),
 	/// An identifier or parameter reference.
@@ -184,6 +235,16 @@ pub enum HirExpr {
 		module: &'static str,
 		symbol: &'static str,
 		args: Vec<HirExpr>,
+	},
+	/// A binary operator selected through a still-generic interface bound.
+	/// Canonical boxed tags select concrete prelude implementations; user
+	/// classes fall back to their materialized method.
+	BoundDispatch {
+		interface: EcoString,
+		method: EcoString,
+		receiver: Box<HirExpr>,
+		argument: Box<HirExpr>,
+		cases: Vec<HirBoundDispatchCase>,
 	},
 	/// A tuple, list, or compiler-internal raw array.
 	Array {
@@ -299,6 +360,146 @@ pub enum HirExpr {
 	},
 }
 
+impl HirExpr {
+	fn collect_runtime_type_references(&self, references: &mut FxHashSet<EcoString>) {
+		match self {
+			Self::Num(..)
+			| Self::Str(_)
+			| Self::Bool(_)
+			| Self::Char(_)
+			| Self::Local(_)
+			| Self::This => {}
+			Self::InterpolatedString(items) => collect_exprs(items, references),
+			Self::Call { callee, args } => {
+				callee.collect_runtime_type_references(references);
+				collect_exprs(args, references);
+			}
+			Self::ExternCall { args, .. } => collect_exprs(args, references),
+			Self::BoundDispatch {
+				receiver, argument, ..
+			} => {
+				receiver.collect_runtime_type_references(references);
+				argument.collect_runtime_type_references(references);
+			}
+			Self::Array { items, .. } => collect_exprs(items, references),
+			Self::ArraySpread(items) => {
+				for item in items {
+					match item {
+						HirArrayElem::Item(expr) | HirArrayElem::Spread(expr) => {
+							expr.collect_runtime_type_references(references)
+						}
+					}
+				}
+			}
+			Self::MapLit(entries) => collect_pairs(entries, references),
+			Self::MapSpread(entries) => {
+				for entry in entries {
+					match entry {
+						HirMapElem::Entry(key, value) => {
+							key.collect_runtime_type_references(references);
+							value.collect_runtime_type_references(references);
+						}
+						HirMapElem::Spread(expr) => expr.collect_runtime_type_references(references),
+					}
+				}
+			}
+			Self::Index { recv, index } => {
+				recv.collect_runtime_type_references(references);
+				index.collect_runtime_type_references(references);
+			}
+			Self::MapGet { recv, key } => {
+				recv.collect_runtime_type_references(references);
+				key.collect_runtime_type_references(references);
+			}
+			Self::New { class, fields } => {
+				references.insert(class.clone());
+				collect_named(fields, references);
+			}
+			Self::Field { recv, .. } => recv.collect_runtime_type_references(references),
+			Self::VariantNew {
+				enum_name, fields, ..
+			} => {
+				references.insert(enum_name.clone());
+				collect_named(fields, references);
+			}
+			Self::VariantRef { enum_name, .. } => {
+				references.insert(enum_name.clone());
+			}
+			Self::Binary { lhs, rhs, .. } => {
+				lhs.collect_runtime_type_references(references);
+				rhs.collect_runtime_type_references(references);
+			}
+			Self::Unary { operand, .. } | Self::ScalarCast { operand, .. } => {
+				operand.collect_runtime_type_references(references)
+			}
+			Self::Assign { target, value } => {
+				target.collect_runtime_type_references(references);
+				value.collect_runtime_type_references(references);
+			}
+			Self::Block { stmts, tail } => {
+				for stmt in stmts {
+					match stmt {
+						HirStmt::Let { value, .. } | HirStmt::Expr(value) => {
+							value.collect_runtime_type_references(references)
+						}
+						HirStmt::Return(value) => {
+							if let Some(value) = value {
+								value.collect_runtime_type_references(references);
+							}
+						}
+					}
+				}
+				if let Some(tail) = tail {
+					tail.collect_runtime_type_references(references);
+				}
+			}
+			Self::If {
+				cond,
+				then,
+				otherwise,
+			} => {
+				cond.collect_runtime_type_references(references);
+				then.collect_runtime_type_references(references);
+				if let Some(otherwise) = otherwise {
+					otherwise.collect_runtime_type_references(references);
+				}
+			}
+			Self::While { cond, body } => {
+				cond.collect_runtime_type_references(references);
+				body.collect_runtime_type_references(references);
+			}
+			Self::Match { scrutinee, arms } => {
+				scrutinee.collect_runtime_type_references(references);
+				for arm in arms {
+					arm.pat.collect_runtime_type_references(references);
+					if let Some(guard) = &arm.guard {
+						guard.collect_runtime_type_references(references);
+					}
+					arm.body.collect_runtime_type_references(references);
+				}
+			}
+			Self::Closure { body, .. } => body.collect_runtime_type_references(references),
+		}
+	}
+}
+
+fn collect_exprs(exprs: &[HirExpr], references: &mut FxHashSet<EcoString>) {
+	for expr in exprs {
+		expr.collect_runtime_type_references(references);
+	}
+}
+fn collect_pairs(exprs: &[(HirExpr, HirExpr)], references: &mut FxHashSet<EcoString>) {
+	for (left, right) in exprs {
+		left.collect_runtime_type_references(references);
+		right.collect_runtime_type_references(references);
+	}
+}
+fn collect_named(exprs: &[(EcoString, HirExpr)], references: &mut FxHashSet<EcoString>) {
+	for (_, expr) in exprs {
+		expr.collect_runtime_type_references(references);
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HirArrayKind {
 	List,
@@ -409,6 +610,51 @@ pub enum HirPat {
 	Range(HirRange),
 	/// `A | B` — matches if either side matches (3B: neither side binds).
 	Or(Box<HirPat>, Box<HirPat>),
+}
+
+impl HirPat {
+	fn collect_runtime_type_references(&self, references: &mut FxHashSet<EcoString>) {
+		match self {
+			Self::Wildcard | Self::Lit(_) | Self::Range(_) => {}
+			Self::Binding { sub, .. } => {
+				if let Some(sub) = sub {
+					sub.collect_runtime_type_references(references);
+				}
+			}
+			Self::Variant {
+				enum_name, fields, ..
+			} => {
+				references.insert(enum_name.clone());
+				for (_, pat) in fields {
+					pat.collect_runtime_type_references(references);
+				}
+			}
+			Self::Struct { fields } => {
+				for (_, pat) in fields {
+					pat.collect_runtime_type_references(references);
+				}
+			}
+			Self::Tuple(items) => {
+				for pat in items {
+					pat.collect_runtime_type_references(references);
+				}
+			}
+			Self::List { prefix, suffix, .. } => {
+				for pat in prefix.iter().chain(suffix) {
+					pat.collect_runtime_type_references(references);
+				}
+			}
+			Self::Map { entries, .. } => {
+				for (_, pat) in entries {
+					pat.collect_runtime_type_references(references);
+				}
+			}
+			Self::Or(left, right) => {
+				left.collect_runtime_type_references(references);
+				right.collect_runtime_type_references(references);
+			}
+		}
+	}
 }
 
 #[derive(Clone, Debug, PartialEq)]

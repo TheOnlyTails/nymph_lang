@@ -2,7 +2,10 @@ use nymph_hir::hir::{
 	BinOp, BuiltinResult, HirArrayElem, HirArrayKind, HirExpr, HirLit, HirMapElem, HirModule, HirPat,
 	HirStmt, NumKind, ScalarCastKind, UnOp,
 };
-use nymph_sema::check_module;
+use nymph_sema::{
+	check_module, check_module_with_prelude, lower_hir_with_prelude,
+	lower_hir_with_prelude_runtime_and_deps,
+};
 use nymph_syntax::parse_module;
 
 fn lower(src: &str) -> HirModule {
@@ -18,6 +21,206 @@ fn lower(src: &str) -> HirModule {
 		checked.diags
 	);
 	nymph_sema::lower_hir(&parsed.tree, &checked)
+}
+
+#[test]
+fn separates_demanded_prelude_runtime_from_consumer_hir() {
+	let prelude = parse_module("enum Order { Less, Equal, Greater }", "prelude");
+	let user = parse_module("func equal(): Order = Order.Equal", "test");
+	assert!(prelude.diagnostics.is_empty(), "prelude parse failed");
+	assert!(user.diagnostics.is_empty(), "user parse failed");
+
+	let checked = check_module_with_prelude(&user.tree, std::slice::from_ref(&prelude.tree));
+	assert!(
+		checked.diags.is_empty(),
+		"check failed: {:?}",
+		checked.diags
+	);
+	let lowered = lower_hir_with_prelude_runtime_and_deps(
+		&user.tree,
+		std::slice::from_ref(&prelude.tree),
+		1,
+		&checked,
+	);
+
+	assert!(
+		lowered
+			.module
+			.enums
+			.iter()
+			.all(|enum_| enum_.name != "Order")
+	);
+	assert!(
+		lowered
+			.prelude_runtime
+			.enums
+			.iter()
+			.any(|enum_| enum_.name == "Order")
+	);
+	assert_eq!(lowered.module.funcs.len(), 1);
+	assert_eq!(lowered.module.funcs[0].name, "equal");
+	assert!(lowered.prelude_runtime.funcs.is_empty());
+
+	let merged = lower_hir_with_prelude(&user.tree, std::slice::from_ref(&prelude.tree), &checked);
+	assert_eq!(merged.funcs[0].name, "equal");
+	assert_eq!(merged.enums[0].name, "Order");
+}
+
+fn lower_split(prelude_src: &str, user_src: &str) -> nymph_sema::LoweredHir {
+	let prelude = parse_module(prelude_src, "prelude");
+	let user = parse_module(user_src, "test");
+	assert!(prelude.diagnostics.is_empty(), "prelude parse failed");
+	assert!(user.diagnostics.is_empty(), "user parse failed");
+	let checked = check_module_with_prelude(&user.tree, std::slice::from_ref(&prelude.tree));
+	assert!(
+		checked.diags.is_empty(),
+		"check failed: {:?}",
+		checked.diags
+	);
+	lower_hir_with_prelude_runtime_and_deps(
+		&user.tree,
+		std::slice::from_ref(&prelude.tree),
+		1,
+		&checked,
+	)
+}
+
+#[test]
+fn separates_demanded_ambient_struct_and_let_from_consumer_declarations() {
+	let lowered = lower_split(
+		"let answer: int = 42\nstruct Box(value: int)",
+		"let local: int = answer\nfunc make(): Box = Box(value = local)",
+	);
+	assert_eq!(
+		lowered
+			.module
+			.lets
+			.iter()
+			.map(|l| l.name.as_str())
+			.collect::<Vec<_>>(),
+		["local"]
+	);
+	assert_eq!(
+		lowered
+			.module
+			.funcs
+			.iter()
+			.map(|f| f.name.as_str())
+			.collect::<Vec<_>>(),
+		["make"]
+	);
+	assert!(lowered.module.classes.is_empty());
+	assert_eq!(
+		lowered
+			.prelude_runtime
+			.lets
+			.iter()
+			.map(|l| l.name.as_str())
+			.collect::<Vec<_>>(),
+		["answer"]
+	);
+	assert_eq!(
+		lowered
+			.prelude_runtime
+			.classes
+			.iter()
+			.map(|c| c.name.as_str())
+			.collect::<Vec<_>>(),
+		["Box"]
+	);
+}
+
+#[test]
+fn keeps_consumer_enums_and_classes_separate_from_ambient_runtime_declarations() {
+	let lowered = lower_split(
+		"enum AmbientChoice { Selected }\nstruct AmbientBox(value: int)",
+		"enum ConsumerChoice { Selected }\nstruct ConsumerBox(value: int)\nfunc ambient_choice(): AmbientChoice = AmbientChoice.Selected\nfunc ambient_box(): AmbientBox = AmbientBox(value = 1)",
+	);
+
+	assert_eq!(
+		lowered
+			.module
+			.enums
+			.iter()
+			.map(|enum_| enum_.name.as_str())
+			.collect::<Vec<_>>(),
+		["ConsumerChoice"]
+	);
+	assert_eq!(
+		lowered
+			.module
+			.classes
+			.iter()
+			.map(|class| class.name.as_str())
+			.collect::<Vec<_>>(),
+		["ConsumerBox"]
+	);
+	assert_eq!(
+		lowered
+			.prelude_runtime
+			.enums
+			.iter()
+			.map(|enum_| enum_.name.as_str())
+			.collect::<Vec<_>>(),
+		["AmbientChoice"]
+	);
+	assert_eq!(
+		lowered
+			.prelude_runtime
+			.classes
+			.iter()
+			.map(|class| class.name.as_str())
+			.collect::<Vec<_>>(),
+		["AmbientBox"]
+	);
+}
+
+#[test]
+fn compatibility_wrapper_orders_ambient_lets_before_referencing_consumer_lets() {
+	let prelude = parse_module("let ambient: int = 41", "prelude");
+	let user = parse_module("let consumer: int = ambient + 1", "test");
+	assert!(prelude.diagnostics.is_empty(), "prelude parse failed");
+	assert!(user.diagnostics.is_empty(), "user parse failed");
+	let checked = check_module_with_prelude(&user.tree, std::slice::from_ref(&prelude.tree));
+	assert!(
+		checked.diags.is_empty(),
+		"check failed: {:?}",
+		checked.diags
+	);
+
+	let merged = lower_hir_with_prelude(&user.tree, std::slice::from_ref(&prelude.tree), &checked);
+	assert_eq!(
+		merged
+			.lets
+			.iter()
+			.map(|let_| let_.name.as_str())
+			.collect::<Vec<_>>(),
+		["ambient", "consumer"]
+	);
+}
+
+#[test]
+fn separates_demanded_runtime_top_level_function() {
+	let lowered = lower_split(
+		"impl #[int] { func second(): int = this[1] }",
+		"func read(xs: #[int]): int = xs.second()",
+	);
+	assert_eq!(
+		lowered
+			.module
+			.funcs
+			.iter()
+			.map(|f| f.name.as_str())
+			.collect::<Vec<_>>(),
+		["read"]
+	);
+	assert!(
+		lowered
+			.prelude_runtime
+			.funcs
+			.iter()
+			.any(|f| f.name == "$std$$list$second")
+	);
 }
 
 #[test]
@@ -752,21 +955,8 @@ fn colliding_defaults_from_two_interfaces_panics_in_lowering() {
 }
 
 #[test]
-#[should_panic(expected = "does not yet dispatch operator to interface default method")]
-fn bounded_generic_plus_default_still_panics_in_lowering() {
-	// A bounded generic function's `t1 + t2` resolves through `T`'s interface
-	// bound (`MethodSource::GenericBound`), not through any concrete impl — the
-	// concrete impl is only known once `T` is instantiated, which this
-	// type-erased-at-lowering compiler does not track. Codegen still cannot
-	// dispatch that at compile time, so this stays a loud lowering deferral (V2:
-	// only `InterfaceDefault` flips to `UserImpl`; `GenericBound` is unchanged).
-	//
-	// NB: prior to Slice 4C-c, comparison/equality/logical operators on a `Param`
-	// receiver did not reach `dispatch_operator` at all, so this pin deliberately
-	// used an arithmetic operator. 4C-c (W1) brings comparisons to parity — see
-	// `bounded_generic_less_than_still_panics_in_lowering` below for the
-	// comparison-operator sibling of this same case.
-	lower(
+fn bounded_generic_plus_default_lowers_through_the_bound() {
+	let hir = lower(
 		r#"
 		interface Plus<Other, Output> {
 			func base(): Output
@@ -775,22 +965,29 @@ fn bounded_generic_plus_default_still_panics_in_lowering() {
 		func add<T: Plus<Other = T, Output = T>>(t1: T, t2: T): T = t1 + t2
 		"#,
 	);
+	let add = hir.funcs.iter().find(|f| f.name == "add").expect("add");
+	assert!(
+		matches!(&add.body, HirExpr::BoundDispatch { method, .. } if method == "plus"),
+		"expected generic bound dispatch, got {:?}",
+		add.body
+	);
 }
 
 // ── Slice 4C-c, Task 2: comparison-operator lowering pins (W1, W4) ──────────
 
 #[test]
-#[should_panic(expected = "does not yet dispatch operator to interface default method")]
-fn bounded_generic_less_than_still_panics_in_lowering() {
-	// W1's comparison-arm parity means a bounded generic parameter's `a < b` now
-	// resolves through `T`'s `Comparable` bound (`MethodSource::GenericBound`),
-	// exactly like the arithmetic case above — still a loud lowering deferral,
-	// not the silent native `<` on still-generic operands this slice closes.
-	lower(
+fn bounded_generic_less_than_lowers_through_the_bound() {
+	let hir = lower(
 		r#"
 		interface Comparable<Other> { func less_than(other: Other): boolean }
 		func lt<T: Comparable<Other = T>>(a: T, b: T): boolean = a < b
 		"#,
+	);
+	let lt = hir.funcs.iter().find(|f| f.name == "lt").expect("lt");
+	assert!(
+		matches!(&lt.body, HirExpr::BoundDispatch { method, .. } if method == "less_than"),
+		"expected generic bound dispatch, got {:?}",
+		lt.body
 	);
 }
 
@@ -1662,45 +1859,35 @@ fn lowers_string_escapes() {
 }
 
 #[test]
-fn lowers_string_interpolation_to_left_assoc_concatenation() {
-	// Text runs cook into `Str` segments; the interpoland lowers normally and
-	// joins in with `+` — no leading `""` needed since the first part is text.
+fn lowers_string_interpolation_through_display() {
 	let hir = lower(r#"func f(name: string): string = "Hello, ${name}!""#);
 	assert_eq!(
 		hir.funcs[0].body,
-		HirExpr::Binary {
-			op: BinOp::Add,
-			result: BuiltinResult::Raw,
-			lhs: Box::new(HirExpr::Binary {
-				op: BinOp::Add,
-				result: BuiltinResult::Raw,
-				lhs: Box::new(HirExpr::Str("Hello, ".into())),
-				rhs: Box::new(HirExpr::Local("name".into())),
-			}),
-			rhs: Box::new(HirExpr::Str("!".into())),
-		}
+		HirExpr::InterpolatedString(vec![
+			HirExpr::Str("Hello, ".into()),
+			HirExpr::ExternCall {
+				module: "std/display",
+				symbol: "display",
+				args: vec![HirExpr::Local("name".into())],
+			},
+			HirExpr::Str("!".into()),
+		])
 	);
 }
 
 #[test]
-fn lowers_leading_interpolation_with_an_empty_prefix_string() {
-	// The FIRST part is an interpolation with no leading text — a `Str("")` is
-	// prepended so the whole chain still coerces via JS string concatenation
-	// even though the interpoland (`n: int`) isn't itself a string.
+fn lowers_leading_interpolation_without_a_coercion_prefix() {
 	let hir = lower(r#"func f(n: int): string = "${n}!""#);
 	assert_eq!(
 		hir.funcs[0].body,
-		HirExpr::Binary {
-			op: BinOp::Add,
-			result: BuiltinResult::Raw,
-			lhs: Box::new(HirExpr::Binary {
-				op: BinOp::Add,
-				result: BuiltinResult::Raw,
-				lhs: Box::new(HirExpr::Str("".into())),
-				rhs: Box::new(HirExpr::Local("n".into())),
-			}),
-			rhs: Box::new(HirExpr::Str("!".into())),
-		}
+		HirExpr::InterpolatedString(vec![
+			HirExpr::ExternCall {
+				module: "std/display",
+				symbol: "display",
+				args: vec![HirExpr::Local("n".into())],
+			},
+			HirExpr::Str("!".into()),
+		])
 	);
 }
 
@@ -1728,7 +1915,7 @@ fn lowers_string_pattern_escapes_instead_of_panicking() {
 // ── Slice 4H: range/for-loop expressions ────────────────────────────────────
 
 #[test]
-fn lowers_a_for_loop_over_an_exclusive_range_to_a_desugared_while() {
+fn lowers_an_exclusive_range_for_loop_through_the_iterator_protocol() {
 	let hir = lower(
 		r#"
 		func f(): int = {
@@ -1749,72 +1936,45 @@ fn lowers_a_for_loop_over_an_exclusive_range_to_a_desugared_while() {
 	else {
 		panic!("expected desugared for-loop Block, got {:?}", stmts[1]);
 	};
-	assert_eq!(for_stmts.len(), 3, "$i let, $max let, while");
+	assert_range_protocol(for_stmts, false);
+}
 
-	let HirStmt::Let {
-		name: i_name,
-		mutable,
+#[test]
+fn range_for_loop_enters_the_iterator_protocol() {
+	let hir = lower("func f(): void = for (i in 1..3) { i }");
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected protocol block");
+	};
+	let HirStmt::Let { value, .. } = &stmts[0] else {
+		panic!("expected iterator binding");
+	};
+	assert!(matches!(
 		value,
-	} = &for_stmts[0]
-	else {
-		panic!("expected induction-variable let, got {:?}", for_stmts[0]);
-	};
-	assert!(*mutable, "induction variable must be mutable");
-	assert_eq!(value, &HirExpr::Num(1.0, NumKind::Int));
-
-	let HirStmt::Let {
-		name: max_name,
-		mutable: max_mutable,
-		value: max_value,
-	} = &for_stmts[1]
-	else {
-		panic!("expected max-bound let, got {:?}", for_stmts[1]);
-	};
-	assert!(!max_mutable, "hoisted upper bound must not be mutable");
-	assert_eq!(max_value, &HirExpr::Num(3.0, NumKind::Int));
-
-	let HirStmt::Expr(HirExpr::While { cond, body }) = &for_stmts[2] else {
-		panic!("expected While, got {:?}", for_stmts[2]);
-	};
-	assert_eq!(
-		cond.as_ref(),
-		&HirExpr::Binary {
-			op: BinOp::Lt,
-			result: BuiltinResult::Raw,
-			lhs: Box::new(HirExpr::Local(i_name.clone())),
-			rhs: Box::new(HirExpr::Local(max_name.clone())),
-		},
-		"exclusive range compares with `<`"
-	);
-	let HirExpr::Block {
-		stmts: body_stmts, ..
-	} = body.as_ref()
-	else {
-		panic!("expected while-body Block, got {body:?}");
-	};
-	assert_eq!(body_stmts.len(), 3, "pattern let, user body, increment");
-	assert!(matches!(
-		&body_stmts[0],
-		HirStmt::Let { name, mutable: false, value }
-			if value == &HirExpr::Local(i_name.clone()) && name != i_name
-	));
-	assert!(matches!(
-		&body_stmts[2],
-		HirStmt::Expr(HirExpr::Assign { target, value })
-			if target.as_ref() == &HirExpr::Local(i_name.clone())
-				&& value.as_ref() == &HirExpr::Binary {
-					op: BinOp::Add,
-					result: BuiltinResult::Raw,
-					lhs: Box::new(HirExpr::Local(i_name.clone())),
-					// The desugared loop counter is a compiler-internal RAW number
-					// (native JS `i + 1`), never a boxed user value (slice #2).
-					rhs: Box::new(HirExpr::Num(1.0, NumKind::Raw)),
-				}
+		HirExpr::Call { callee, args }
+			if args.is_empty() && matches!(callee.as_ref(), HirExpr::Field { name, .. } if name == "iter")
 	));
 }
 
 #[test]
-fn lowers_a_for_loop_over_an_inclusive_range_with_le_comparison() {
+fn generic_iterable_bound_lowers_through_iter() {
+	let hir = lower(
+		"enum Option<T> { Some(value: T), None }
+		 interface Iterator<Item> { mut func next(): Option<Item> }
+		 interface Iterable<Item> { func iter(): Iterator<Item> }
+		 func consume<T: Iterable<Item = int>>(items: T): void = for (item in items) { item }",
+	);
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected protocol block");
+	};
+	assert!(matches!(
+		&stmts[0],
+		HirStmt::Let { value: HirExpr::Call { callee, args }, .. }
+			if args.is_empty() && matches!(callee.as_ref(), HirExpr::Field { name, .. } if name == "iter")
+	));
+}
+
+#[test]
+fn lowers_an_inclusive_range_for_loop_through_the_iterator_protocol() {
 	let hir = lower(
 		r#"
 		func f(): int = {
@@ -1834,12 +1994,73 @@ fn lowers_a_for_loop_over_an_inclusive_range_with_le_comparison() {
 	else {
 		panic!("expected desugared for-loop Block, got {:?}", stmts[0]);
 	};
-	let HirStmt::Expr(HirExpr::While { cond, .. }) = &for_stmts[2] else {
-		panic!("expected While");
+	assert_range_protocol(for_stmts, true);
+}
+
+fn assert_range_protocol(stmts: &[HirStmt], inclusive: bool) {
+	assert_eq!(stmts.len(), 3, "iterator let, continuation let, while");
+	let HirStmt::Let {
+		name: iterator,
+		mutable: false,
+		value: HirExpr::Call { callee, args },
+	} = &stmts[0]
+	else {
+		panic!("expected immutable iterator binding, got {:?}", stmts[0]);
 	};
+	assert!(args.is_empty());
+	let HirExpr::Field { recv, name } = callee.as_ref() else {
+		panic!("expected `.iter` field call, got {callee:?}");
+	};
+	assert_eq!(name, "iter");
+	let HirExpr::New { class, fields } = recv.as_ref() else {
+		panic!("expected NymphRange construction, got {recv:?}");
+	};
+	assert_eq!(class, "NymphRange");
+	assert_eq!(fields.len(), 3);
+	assert_eq!(fields[0], ("start".into(), HirExpr::Num(1.0, NumKind::Int)));
+	assert_eq!(fields[1], ("end".into(), HirExpr::Num(3.0, NumKind::Int)));
+	assert_eq!(fields[2], ("inclusive".into(), HirExpr::Bool(inclusive)));
+
+	let HirStmt::Let {
+		name: continuation,
+		mutable: true,
+		value: HirExpr::Bool(true),
+	} = &stmts[1]
+	else {
+		panic!("expected mutable continuation binding, got {:?}", stmts[1]);
+	};
+	let HirStmt::Expr(HirExpr::While { cond, body }) = &stmts[2] else {
+		panic!("expected protocol while loop, got {:?}", stmts[2]);
+	};
+	assert_eq!(cond.as_ref(), &HirExpr::Local(continuation.clone()));
+	let HirExpr::Block {
+		stmts: body,
+		tail: None,
+	} = body.as_ref()
+	else {
+		panic!("expected while body block, got {body:?}");
+	};
+	let [HirStmt::Expr(HirExpr::Match { scrutinee, arms })] = body.as_slice() else {
+		panic!("expected a single protocol match, got {body:?}");
+	};
+	assert!(matches!(
+		scrutinee.as_ref(),
+		HirExpr::Call { callee, args }
+			if args.is_empty() && matches!(callee.as_ref(), HirExpr::Field { recv, name }
+				if name == "next" && recv.as_ref() == &HirExpr::Local(iterator.clone()))
+	));
 	assert!(
-		matches!(cond.as_ref(), HirExpr::Binary { op: BinOp::Le, .. }),
-		"inclusive range compares with `<=`, got {cond:?}"
+		matches!(&arms[0].pat, HirPat::Variant { enum_name, variant, .. } if enum_name == "Option" && variant == "Some")
+	);
+	assert!(
+		matches!(&arms[1].pat, HirPat::Variant { enum_name, variant, fields } if enum_name == "Option" && variant == "None" && fields.is_empty())
+	);
+	assert_eq!(
+		arms[1].body,
+		HirExpr::Assign {
+			target: Box::new(HirExpr::Local(continuation.clone())),
+			value: Box::new(HirExpr::Bool(false)),
+		}
 	);
 }
 
@@ -1953,50 +2174,7 @@ fn for_loop_over_an_unbounded_range_panics_in_lowering() {
 }
 
 #[test]
-#[should_panic(expected = "numeric (int/float)")]
-fn for_loop_over_a_char_range_panics_in_lowering() {
-	// `infer_range_element` unifies `min`/`max` against a fresh, otherwise-
-	// unconstrained type variable, so a `char` range type-checks with zero
-	// diagnostics. The induction-variable desugar (`$i + 1`, `$i < $max`) is
-	// only correct for a numeric element type; for `char` it would silently
-	// build an infinite loop (`$i + 1` is JS string concatenation, so `$i`
-	// never stops comparing less than `$max`). This must panic loudly instead.
-	lower(
-		r#"
-		func f(): int = {
-			let mut total = 0
-			for (c in 'a'..'c') {
-				total = total + 1
-			}
-			total
-		}
-		"#,
-	);
-}
-
-#[test]
-#[should_panic(expected = "numeric (int/float)")]
-fn for_loop_over_a_parenthesized_char_range_panics_in_lowering() {
-	// Peeling `ExprKind::Grouped` for the numeric-element annotation lookup
-	// must not weaken the char-range guard above: a parenthesized char bound
-	// (on either side) still has to panic loudly, not silently pass through
-	// as "no annotation found" turning into a false numeric accept.
-	lower(
-		r#"
-		func f(): int = {
-			let mut total = 0
-			for (c in ('a')..('c')) {
-				total = total + 1
-			}
-			total
-		}
-		"#,
-	);
-}
-
-#[test]
-#[should_panic(expected = "plain-binding")]
-fn for_loop_over_a_non_binding_pattern_panics_in_lowering() {
+fn range_for_loop_accepts_a_non_binding_pattern_through_protocol_lowering() {
 	lower(
 		r#"
 		func f(): int = {

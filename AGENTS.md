@@ -280,3 +280,19 @@ Default five-role vocabulary, each label string equal to its name. See `docs/age
 ### Domain docs
 
 Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+### Standard library ownership
+
+Prefer implementing standard-library behavior in Nymph whenever doing so is
+straightforward. Keep JavaScript externals for host/runtime primitives and
+other behavior that cannot reasonably be expressed in Nymph, so users can
+inspect ordinary stdlib behavior without reading the external JavaScript.
+
+### Completion summaries
+
+When finishing implementation work, include a file-by-file summary of every
+changed file so the user can review the working-copy diff efficiently. For each
+file, state what changed and why; group generated or purely mechanical changes
+only when reviewing them individually would add no useful information. Also
+report verification results and any known failures separately from the file
+summary.

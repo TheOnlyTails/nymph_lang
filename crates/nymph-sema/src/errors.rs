@@ -321,6 +321,11 @@ pub enum TypeError {
 	/// the constructor's actual field count. New variant appended at the enum's end
 	/// (mints 2062).
 	PositionalPatternArity { fields: usize },
+
+	/// Range iteration advances by one, so its bounds must be discrete integer
+	/// values. Floating-point and other `Comparable` values do not define that
+	/// progression. New variant appended at the enum's end (mints 2063).
+	InvalidRangeBound { ty: String },
 }
 
 impl IntoDiagnostic for TypeError {
@@ -508,6 +513,9 @@ impl IntoDiagnostic for TypeError {
 			E::NotIterable { ty } => {
 				format!("`{ty}` is not iterable; it implements neither `Iterator` nor `Iterable`")
 					.into()
+			}
+			E::InvalidRangeBound { ty } => {
+				format!("range bounds must be `int` or `uint`, not `{ty}`").into()
 			}
 		}
 	}

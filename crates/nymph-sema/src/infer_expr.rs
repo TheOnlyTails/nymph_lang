@@ -29,8 +29,8 @@ use crate::solve::{MethodResolution, MethodSource};
 use crate::ty::{GenericArgs, Ty, TyKind};
 
 /// Whether a resolved method call's underlying impl is invisible to lowering: its
-/// declaration was cloned from an offset prelude module (`impl_span.start >=
-/// SPAN_BASE`, `check_module_with_prelude`'s prelude-origin marker), which
+/// declaration was cloned from an offset canonical runtime module (`impl_span.start >=
+/// SPAN_BASE`, `check_module_with_prelude`'s canonical-runtime-origin marker), which
 /// `compile_with_prelude` never lowers (it lowers only the user's own AST — see
 /// `nymph_compiler::prelude`). True for a method the matched impl provides
 /// directly (e.g. the stdlib's `impl<T> Equals<Other = self> for T` blanket impl)
@@ -42,7 +42,7 @@ use crate::ty::{GenericArgs, Ty, TyKind};
 /// gap: `Inherent` now carries the matched inherent method's own span,
 /// `GenericBound` the span of the interface the bound was satisfied through —
 /// see their `MethodResolution` construction sites in `solve.rs`), so this
-/// correctly flags a prelude-origin resolution regardless of `MethodSource`,
+/// correctly flags a canonical-runtime resolution regardless of `MethodSource`,
 /// while staying `false` for every ordinary user-declared method/interface
 /// (whose span is always well below `SPAN_BASE`).
 fn impl_is_unmaterialized(res: &MethodResolution) -> bool {
@@ -53,7 +53,7 @@ fn impl_is_unmaterialized(res: &MethodResolution) -> bool {
 /// with. `Inherent`/`ImplDirect`/`InterfaceDefault` are a real, directly-callable
 /// method — Slice 4C-b materializes un-overridden interface default methods onto
 /// every implementing struct's class — *provided* the matched impl isn't
-/// prelude-only (`impl_is_unmaterialized`); `GenericBound` is always deferred
+/// canonical-runtime-only (`impl_is_unmaterialized`); `GenericBound` is always deferred
 /// regardless of `impl_is_unmaterialized` (see `dispatch_operator`'s call site
 /// for why a still-generic receiver can't pick a native operator or method name
 /// at lowering time the way a plain method call — `dispatch_kind_for_method_call`,
@@ -84,8 +84,8 @@ fn dispatch_kind_for_operator(res: &MethodResolution) -> DispatchKind {
 /// hazard, caught here via `impl_is_unmaterialized` rather than a blanket
 /// `GenericBound` deferral (contrast `dispatch_kind_for_operator`, which — for
 /// unrelated codegen reasons already covered by that function's own doc comment —
-/// defers *every* `GenericBound` operator, prelude-origin or not): a bound
-/// satisfied *only* through a prelude-only interface/impl (round 2, Findings 1 &
+/// defers *every* `GenericBound` operator, canonical-runtime-origin or not): a bound
+/// satisfied *only* through a canonical-runtime interface/impl (round 2, Findings 1 &
 /// 3), which is never materialized anywhere `compile_with_prelude` lowers.
 fn dispatch_kind_for_method_call(res: &MethodResolution) -> DispatchKind {
 	if impl_is_unmaterialized(res) {
@@ -1856,6 +1856,7 @@ impl<'m> Checker<'m> {
 					// native JS `===`/`!==`.
 					(Some(a), Some(b)) if a == b => {
 						self.unify_operands(lhs, l, rhs, r, span);
+						(boolean, eager(method), None)
 					}
 					// Two different primitives (e.g. int/uint): an `int` literal operand
 					// widens; otherwise a cross-type `Equals<Other = …>` impl must
@@ -1869,19 +1870,35 @@ impl<'m> Checker<'m> {
 						if !literal_widens {
 							self.dispatch_operator(l, method, &[r], span);
 						}
+						(boolean, eager(method), None)
 					}
-					// D3: `equals` dispatch is deferred to the stdlib slice — even when an
-					// ADT has a user `Equals` impl, codegen still emits `===`/`!==` for now.
-					_ if self.is_adt(l) => {
-						self.dispatch_operator(l, method, &[r], span);
-					}
-					// An inference variable (or already-diagnosed error) operand: unify
-					// the two sides, possibly deferring.
 					_ => {
-						self.unify_operands(lhs, l, rhs, r, span);
+						let resolved = self.shallow_resolve(l);
+						if matches!(self.interner.kind(resolved), TyKind::Infer(_)) {
+							self.unify_operands(lhs, l, rhs, r, span);
+							let resolved = self.shallow_resolve(l);
+							if matches!(self.interner.kind(resolved), TyKind::Infer(_)) {
+								return (boolean, None, Some(l));
+							}
+							if self.prim_kind(l).is_some() {
+								return (boolean, eager(method), None);
+							}
+						}
+						if matches!(self.interner.kind(resolved), TyKind::Error) {
+							return (boolean, eager(method), None);
+						}
+						let (_, dispatch, impl_span) = self.dispatch_operator(l, method, &[r], span);
+						(
+							boolean,
+							Some(Resolution {
+								method: method.into(),
+								dispatch,
+								impl_span,
+							}),
+							None,
+						)
 					}
 				}
-				(boolean, eager(method), None)
 			}
 			// W1 (Slice 4C-c): comparison operators now mirror the arithmetic arm's
 			// dispatch table exactly, just with a result type fixed at `boolean`
@@ -2036,11 +2053,11 @@ impl<'m> Checker<'m> {
 	/// through with neither a `Resolution` nor a diagnostic, and still reached
 	/// lowering's `None => panic!(..)` on an otherwise zero-diagnostic program.
 	///
-	/// W1 (Slice 4C-c) reuses this same fallback for a deferred *comparison*
+	/// W1 (Slice 4C-c) reuses this same fallback for a deferred *comparison or equality*
 	/// operator (`PendingOperatorKind::BinaryOp` doesn't distinguish the two
 	/// families) — `binary_method` would `unreachable!()` on a comparison
-	/// operator, and the arithmetic result type would clobber the node's `boolean`
-	/// type (comparisons always produce `boolean`, never the operand type), so
+	/// or equality operator, and the arithmetic result type would clobber the
+	/// node's `boolean` type (both families always produce `boolean`, never the operand type), so
 	/// both the method-name lookup and the returned result type are op-class
 	/// aware here.
 	fn resolve_fallback_operand(
@@ -2050,13 +2067,20 @@ impl<'m> Checker<'m> {
 		span: Span,
 	) -> Option<(Ty, Resolution)> {
 		let is_comparison = is_comparison_op(op);
+		let is_equality = matches!(op, BinaryOperator::Equals | BinaryOperator::NotEquals);
 		let method = if is_comparison {
 			comparison_method(op)
+		} else if is_equality {
+			if op == BinaryOperator::Equals {
+				"equals"
+			} else {
+				"not_equals"
+			}
 		} else {
 			binary_method(op)
 		};
 		if let Some(kind) = self.prim_kind(ty) {
-			let result_ty = if is_comparison {
+			let result_ty = if is_comparison || is_equality {
 				self.interner.boolean()
 			} else if op == BinaryOperator::Divide && matches!(kind, TyKind::Int | TyKind::UInt) {
 				self.interner.float()
@@ -2080,7 +2104,7 @@ impl<'m> Checker<'m> {
 			return None;
 		}
 		let (dispatch_ty, dispatch, impl_span) = self.dispatch_operator(ty, method, &[ty], span);
-		let result_ty = if is_comparison {
+		let result_ty = if is_comparison || is_equality {
 			self.interner.boolean()
 		} else {
 			dispatch_ty
@@ -2660,6 +2684,19 @@ impl<'m> Checker<'m> {
 					.record_iter_mode(iterable.id, IterMode::Direct);
 				return item;
 			}
+			if let Some(iface) = self.defs.get("Iterable").filter(|&d| self.is_interface(d))
+				&& let Some(item_name) = self
+					.interfaces
+					.get(&iface)
+					.and_then(|i| i.generics.first().cloned())
+				&& let Some(item) = self.resolve_param_iface_arg(idx, iface, &item_name)
+			{
+				self.gate_mutating(iface, "iter", self_is_mut, iterable.span);
+				self
+					.annotations
+					.record_iter_mode(iterable.id, IterMode::ViaIter);
+				return item;
+			}
 		}
 		if let Some(iterator) = self.defs.get("Iterator").filter(|&d| self.is_interface(d))
 			&& let Some(item_name) = self
@@ -2720,12 +2757,24 @@ impl<'m> Checker<'m> {
 	fn infer_range_element(&mut self, kind: &RangeKind) -> Ty {
 		let elem = self.fresh();
 		let bound = |checker: &mut Self, e: &Expr| checker.check(e, elem);
-		match kind {
-			RangeKind::From(a) | RangeKind::To(a) | RangeKind::ToInclusive(a) => bound(self, a),
+		let span = match kind {
+			RangeKind::From(a) | RangeKind::To(a) | RangeKind::ToInclusive(a) => {
+				bound(self, a);
+				a.span
+			}
 			RangeKind::Exclusive { min, max } | RangeKind::Inclusive { min, max } => {
 				bound(self, min);
 				bound(self, max);
+				min.span.to(max.span)
 			}
+		};
+		let resolved = self.shallow_resolve(elem);
+		if !matches!(
+			self.interner.kind(resolved),
+			TyKind::Int | TyKind::UInt | TyKind::Error
+		) {
+			let ty = self.display(resolved);
+			self.emit(span, TypeError::InvalidRangeBound { ty });
 		}
 		elem
 	}

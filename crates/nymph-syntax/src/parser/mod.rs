@@ -131,7 +131,7 @@ impl<'src> Parser<'src> {
 	/// Emit a typed [`ParseError`](crate::errors::ParseError), anchored at `span`.
 	fn emit(&mut self, span: Span, err: crate::errors::ParseError) {
 		use nymph_diagnostics::IntoDiagnostic;
-		self.diagnostics.push(err.into_diagnostic(span));
+		self.diagnostics.push(err.as_diagnostic(span));
 	}
 
 	/// Consume the given token if present, returning its span.

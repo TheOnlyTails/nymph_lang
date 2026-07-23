@@ -21,9 +21,9 @@ use nymph_ast::{
 	ty::{GenericArg, GenericParam},
 };
 use nymph_hir::hir::{
-	BinOp, BuiltinResult, HirArm, HirArrayElem, HirArrayKind, HirClass, HirEnum, HirExpr, HirFunc,
-	HirLet, HirLit, HirMapElem, HirMethod, HirModule, HirPat, HirRange, HirStmt, HirVariant, NumKind,
-	ScalarCastKind, UnOp,
+	BinOp, BuiltinResult, HirArm, HirArrayElem, HirArrayKind, HirBoundDispatchCase,
+	HirBoundDispatchTarget, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit, HirMapElem,
+	HirMethod, HirModule, HirPat, HirRange, HirStmt, HirVariant, NumKind, ScalarCastKind, UnOp,
 };
 use nymph_hir::ty::{Interner, Ty, TyKind};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -41,12 +41,32 @@ use crate::{Annotations, Checked, DispatchKind, IterMode, Resolution};
 type InterfaceTable<'m> =
 	FxHashMap<EcoString, (&'m [Spanned<GenericParam>], &'m [Spanned<InterfaceMember>])>;
 
+/// Consumer declarations and the ambient prelude declarations their bodies demand.
+pub struct LoweredHir {
+	pub module: HirModule,
+	pub prelude_runtime: HirModule,
+}
+
+impl LoweredHir {
+	fn merged(mut self) -> HirModule {
+		// Ambient lets cannot depend on consumer declarations, while consumer
+		// initializers may reference them. Preserve the combined lowerer's safe
+		// dependency order when compatibility callers request one module.
+		self.prelude_runtime.lets.extend(self.module.lets);
+		self.module.lets = self.prelude_runtime.lets;
+		self.module.funcs.extend(self.prelude_runtime.funcs);
+		self.module.classes.extend(self.prelude_runtime.classes);
+		self.module.enums.extend(self.prelude_runtime.enums);
+		self.module
+	}
+}
+
 /// Lower a checked module into the code-generation HIR, consulting `checked`'s
 /// annotations/interner for type-directed decisions (e.g. index-access dispatch).
 /// No prelude is fed — `interfaces_by_name` (below) sees only `module`'s own
-/// interfaces, exactly the pre-stdlib-materialization behavior.
+/// interfaces, exactly the pre-stdlib-lowering behavior.
 pub fn lower_hir(module: &Module, checked: &Checked) -> HirModule {
-	lower_hir_impl(module, &[], 0, checked)
+	lower_hir_impl(module, &[], 0, checked).merged()
 }
 
 /// Lower a checked module the SAME way [`check_module_with_prelude`]
@@ -58,7 +78,7 @@ pub fn lower_hir(module: &Module, checked: &Checked) -> HirModule {
 /// the exact entry the checker recorded.
 ///
 /// This closes two gaps `lower_hir` alone leaves open once a program resolves
-/// against the prelude (stdlib body materialization slice):
+/// against the prelude (stdlib body lowering slice):
 ///
 /// - **Gap (a)** — a user `impl <PreludeInterface> for <Type>` used to panic at
 ///   [`Lowerer::push_unoverridden_defaults`] ("impl references unknown
@@ -69,22 +89,22 @@ pub fn lower_hir(module: &Module, checked: &Checked) -> HirModule {
 ///   directly — for an interface with no default-bodied methods (`Plus`, and
 ///   every other arithmetic/bitwise/`Unwrap`/`Index`/`Into` interface) the fix
 ///   is complete on its own (the defaults loop just finds nothing to
-///   materialize). An interface WITH defaults (`Equals`, `Contains`,
+///   lower). An interface WITH defaults (`Equals`, `Contains`,
 ///   `Comparable`) needs gap (a)'s other half too: a default body may
 ///   reference the prelude's own `Order` enum (`Comparable`'s `less_than` &
-///   co.), which nothing yet emits — see `materialize_referenced_prelude_enums`
+///   co.), which nothing yet emits — see `lower_demanded_runtime_enums`
 ///   for the demand-driven fix.
 /// - **Gap (b)** — dispatch into a prelude-OWNED body (a primitive/blanket impl
 ///   or an interface default reached through one) tags `DispatchKind::
 ///   UserImplDefaultMethod` and used to always panic loudly (codegen had no
 ///   representation for a method that exists nowhere in the emitted program).
-///   `Resolution::impl_span` (stdlib body materialization slice) now carries
+///   `Resolution::impl_span` (stdlib body lowering slice) now carries
 ///   forward exactly the span `impl_is_unmaterialized` already classified
 ///   `dispatch` from, letting lowering locate that specific impl inside this
 ///   same offset prelude tree and — for a body that is genuinely pure Nymph
 ///   (not `external`, not a blanket impl targeting an unresolved generic
-///   parameter) — materialize it as a demand-driven, receiver-as-first-param
-///   top-level function (`try_materialize_prelude_dispatch`) instead of
+///   parameter) — lower it as a demand-driven, receiver-as-first-param
+///   top-level function (`try_lower_runtime_dispatch`) instead of
 ///   panicking. A body lowering still cannot compile (external/intrinsic
 ///   markers, a blanket impl, a still-generic bound) keeps panicking loudly —
 ///   silent wrong JS is never an acceptable alternative to a loud deferral.
@@ -100,13 +120,24 @@ pub fn lower_hir_with_prelude(module: &Module, prelude: &[Module], checked: &Che
 /// A dependency module's own class IS emitted (the project driver lowers+emits
 /// every module in the graph), so a call to a dep STRUCT's method lowers as an
 /// ordinary `recv.method(..)` call on that emitted class, rather than being
-/// materialized — unlike a `core` struct (`Range`/…), which is never emitted.
+/// lowered — unlike a `core` struct (`Range`/…), which is never emitted.
 pub fn lower_hir_with_prelude_and_deps(
 	module: &Module,
 	prelude: &[Module],
 	dep_start: usize,
 	checked: &Checked,
 ) -> HirModule {
+	lower_hir_with_prelude_runtime_and_deps(module, prelude, dep_start, checked).merged()
+}
+
+/// Lower a consumer module while keeping demanded ambient prelude declarations
+/// separate for canonical runtime emission.
+pub fn lower_hir_with_prelude_runtime_and_deps(
+	module: &Module,
+	prelude: &[Module],
+	dep_start: usize,
+	checked: &Checked,
+) -> LoweredHir {
 	let offset_prelude: Vec<Module> = prelude
 		.iter()
 		.enumerate()
@@ -121,7 +152,7 @@ fn lower_hir_impl(
 	prelude_modules: &[Module],
 	dep_start: usize,
 	checked: &Checked,
-) -> HirModule {
+) -> LoweredHir {
 	// A call whose callee names a struct is construction, not an ordinary call.
 	// Collect the module's struct names up front so `lower_expr` can dispatch on
 	// them. This mirrors the checker's own dispatch: `infer_call` treats *any*
@@ -164,7 +195,7 @@ fn lower_hir_impl(
 	// `variant_new`'s positional-argument fallback (the checker's own
 	// `check_ctor_args` supports "by label when present else positionally" for
 	// EVERY variant construction — a general, pre-existing checker feature this
-	// lowering never exercised until stdlib body materialization reached
+	// lowering never exercised until stdlib body lowering reached
 	// convert.nym's `impl<T, E> Result<T, E> { func ok() = .. Option.Some(value)
 	// .. }`, whose positional `Option.Some(value)` a zero-diagnostic program is
 	// perfectly entitled to write): every declared enum's variant → its field
@@ -182,6 +213,7 @@ fn lower_hir_impl(
 		}
 	}
 	let lowerer = Lowerer {
+		module,
 		annotations: &checked.annotations,
 		interner: &checked.interner,
 		struct_names,
@@ -194,21 +226,22 @@ fn lower_hir_impl(
 		generics_stack: RefCell::new(Vec::new()),
 		closure_depth: std::cell::Cell::new(0),
 		this_sub: RefCell::new(Vec::new()),
-		materializing_prelude_sibling: RefCell::new(Vec::new()),
-		prelude_funcs_seen: RefCell::new(FxHashSet::default()),
-		pending_prelude_funcs: RefCell::new(Vec::new()),
-		materialized_prelude_funcs: RefCell::new(Vec::new()),
-		materializing_onto_class: std::cell::Cell::new(0),
-		current_materializing_enum: RefCell::new(Vec::new()),
-		pending_prelude_enum_methods: RefCell::new(FxHashMap::default()),
-		materialized_prelude_enum_methods: RefCell::new(FxHashMap::default()),
-		pending_prelude_struct_demands: RefCell::new(FxHashSet::default()),
+		lowering_runtime_sibling: RefCell::new(Vec::new()),
+		runtime_funcs_seen: RefCell::new(FxHashSet::default()),
+		runtime_func_demands: RefCell::new(Vec::new()),
+		lowered_runtime_funcs: RefCell::new(Vec::new()),
+		lowering_onto_runtime_owner: std::cell::Cell::new(0),
+		current_runtime_owner_lowering: RefCell::new(Vec::new()),
+		runtime_enum_method_demands: RefCell::new(FxHashMap::default()),
+		lowered_runtime_enum_methods: RefCell::new(FxHashMap::default()),
+		runtime_struct_demands: RefCell::new(FxHashSet::default()),
 	};
 	lowerer.lower_module(module)
 }
 
 /// Carries the checker's output through the recursive lowering walk.
 struct Lowerer<'a> {
+	module: &'a Module,
 	annotations: &'a Annotations,
 	interner: &'a Interner,
 	struct_names: FxHashSet<EcoString>,
@@ -221,19 +254,19 @@ struct Lowerer<'a> {
 	variant_fields: FxHashMap<(EcoString, EcoString), Vec<EcoString>>,
 	/// The offset prelude modules `lower_hir_with_prelude` reconstructed
 	/// (empty for plain `lower_hir`). Consulted by
-	/// `try_materialize_prelude_dispatch`/`materialize_referenced_prelude_enums`
+	/// `try_lower_runtime_dispatch`/`lower_demanded_runtime_enums`
 	/// to locate the AST of a prelude-origin impl/interface-default/enum a
-	/// `DispatchKind::UserImplDefaultMethod`/`VariantRef` needs materialized.
+	/// `DispatchKind::UserImplDefaultMethod`/`VariantRef` needs lowered.
 	prelude_modules: &'a [Module],
 	/// The subset of `prelude_modules` that are EMITTED dependency modules (a
 	/// project's imported `std/…`/`@/…` modules), as opposed to the ambient
 	/// `core` prelude (never emitted). A dep module's own class IS emitted by the
-	/// driver, so `try_materialize_prelude_dispatch` returns `OntoClass` (an
+	/// driver, so `try_lower_runtime_dispatch` returns `OntoClass` (an
 	/// ordinary `recv.method(..)` call) for a dep STRUCT's method — a `core`
-	/// struct (`Range`/…) stays unmaterializable (`None`), as before.
+	/// struct (`Range`/…) stays unlowerable (`None`), as before.
 	emitted_dep_modules: &'a [Module],
 	/// Interface name → (its own generics, its member list) — `module`'s own
-	/// interfaces AND (stdlib body materialization slice, gap a) every
+	/// interfaces AND (stdlib body lowering slice, gap a) every
 	/// prelude module's, built once up front in `lower_hir_impl`. See that
 	/// function's doc comment for why merging the prelude in here is both
 	/// necessary and, for a no-default interface, sufficient.
@@ -282,22 +315,22 @@ struct Lowerer<'a> {
 	closure_depth: std::cell::Cell<u32>,
 	/// Stack of receiver-param names currently substituting for `this` while
 	/// lowering a prelude body as a top-level mangled function (stdlib body
-	/// materialization slice, gap b) — the innermost entry is what
+	/// lowering slice, gap b) — the innermost entry is what
 	/// `ExprKind::This` lowers to instead of `HirExpr::This` (which, as a
 	/// top-level function's `this`, would be `undefined`/global — silent
 	/// wrong JS). A stack, not a single `Cell<Option<_>>`, because a
-	/// materialized default body can itself call another materialized body
+	/// lowered default body can itself call another lowered body
 	/// (e.g. `Comparable`'s `less_than` default calling `this.compare_to(o)`)
-	/// — each nested materialization pushes its OWN receiver name and pops it
+	/// — each nested lowering pushes its OWN receiver name and pops it
 	/// on the way out, exactly like `generics_stack`/`closure_depth`. Empty
 	/// everywhere else, including while lowering an ordinary inherent/impl
 	/// method (`this` there stays `HirExpr::This`, unaffected).
 	this_sub: RefCell<Vec<EcoString>>,
 	/// Stack of Gap 2 sibling-dispatch frames — the innermost entry is the
 	/// `(interface, tag, impl members/generics)` context of the `ImplFor`
-	/// default body [`Self::lower_prelude_func`] is CURRENTLY lowering as a
+	/// default body [`Self::lower_runtime_func`] is CURRENTLY lowering as a
 	/// top-level mangled function, pushed/popped in lockstep with `this_sub`
-	/// (paired 1:1 whenever `PendingPreludeFunc::sibling_frame` is `Some`).
+	/// (paired 1:1 whenever `RuntimeFuncDemand::sibling_frame` is `Some`).
 	///
 	/// Needed because the checker types every interface default body exactly
 	/// ONCE, generically, against a rigid synthetic `this` owned by the
@@ -306,42 +339,42 @@ struct Lowerer<'a> {
 	/// recorded `Resolution.impl_span` always points at the interface
 	/// declaration's own name span, REGARDLESS of which concrete `impl
 	/// <Interface> for <Type>` block the body is currently being
-	/// materialized through. `try_materialize_prelude_dispatch`'s ordinary
+	/// lowered through. `try_lower_runtime_dispatch`'s ordinary
 	/// span-scan matches an `ImplFor` block by its `for_interface` span
 	/// (a DIFFERENT span, unique to that concrete impl block) — which an
 	/// inner call's `impl_span` can never equal — so that scan alone always
-	/// misses and would otherwise panic. `try_materialize_prelude_dispatch`
+	/// misses and would otherwise panic. `try_lower_runtime_dispatch`
 	/// falls back to this stack's top frame when the span-scan finds
 	/// nothing, resolving the sibling directly against the OUTER
-	/// materialization's own known interface/tag instead. Empty everywhere
-	/// else, including while materializing an inherent `Impl` body (D1: that
+	/// lowering's own known interface/tag instead. Empty everywhere
+	/// else, including while lowering an inherent `Impl` body (D1: that
 	/// case's inner calls already route correctly by span alone — see
-	/// `PendingPreludeFunc::sibling_frame`'s doc comment).
-	materializing_prelude_sibling: RefCell<Vec<PreludeSiblingFrame<'a>>>,
-	/// Mangled top-level function names (stdlib body materialization slice,
-	/// gap b) already discovered materializable — dedups repeat demand for
+	/// `RuntimeFuncDemand::sibling_frame`'s doc comment).
+	lowering_runtime_sibling: RefCell<Vec<RuntimeSiblingFrame<'a>>>,
+	/// Mangled top-level function names (stdlib body lowering slice,
+	/// gap b) already discovered lowerable — dedups repeat demand for
 	/// the same `(interface, self-type, method)` and, combined with being
-	/// inserted BEFORE the body is actually lowered (`try_materialize_prelude_dispatch`),
-	/// guards against infinite recursion if a materialized body ever called
+	/// inserted BEFORE the body is actually lowered (`try_lower_runtime_dispatch`),
+	/// guards against infinite recursion if a lowered body ever called
 	/// itself indirectly.
-	prelude_funcs_seen: RefCell<FxHashSet<EcoString>>,
-	/// Work queue of prelude bodies discovered materializable but not yet
+	runtime_funcs_seen: RefCell<FxHashSet<EcoString>>,
+	/// Work queue of prelude bodies discovered lowerable but not yet
 	/// lowered — Pass 2 of the demand-driven scheme (see `lower_hir_with_prelude`'s
 	/// doc comment): Pass 1 (the ordinary module walk) only rewrites call
 	/// sites and enqueues here; queued bodies are drained AFTER that walk
 	/// finishes, so each drains with an empty top-level `scopes`/`generics_stack`
 	/// (mirroring how an ordinary top-level `func`/method lowers) rather than
 	/// nested inside whatever user scope happened to trigger the demand.
-	/// Draining can itself grow this queue (a materialized body calling
-	/// another prelude body) — `drain_pending_prelude_funcs` loops until empty.
-	pending_prelude_funcs: RefCell<Vec<PendingPreludeFunc<'a>>>,
-	/// Finished `HirFunc`s for every drained `pending_prelude_funcs` entry, in
+	/// Draining can itself grow this queue (a lowered body calling
+	/// another prelude body) — `drain_runtime_func_demands` loops until empty.
+	runtime_func_demands: RefCell<Vec<RuntimeFuncDemand<'a>>>,
+	/// Finished `HirFunc`s for every drained `runtime_func_demands` entry, in
 	/// the order they were lowered — appended to `HirModule::funcs` once
 	/// `lower_module`'s own walk (and every prelude body it demanded) is done.
-	materialized_prelude_funcs: RefCell<Vec<HirFunc>>,
+	lowered_runtime_funcs: RefCell<Vec<HirFunc>>,
 	/// Nonzero while lowering an interface default body [`Self::push_unoverridden_defaults`]
-	/// materializes ONTO A CONCRETE STRUCT/ENUM CLASS (gap a) — as opposed to
-	/// [`Self::lower_prelude_func`] materializing one as a top-level mangled
+	/// lowers ONTO A CONCRETE STRUCT/ENUM CLASS (gap a) — as opposed to
+	/// [`Self::lower_runtime_func`] lowering one as a top-level mangled
 	/// function for a PRIMITIVE self-type (gap b). The distinction matters for
 	/// an inner dispatch the default body's OWN text makes back through
 	/// `this` (e.g. `Comparable`'s `less_than` default calling
@@ -351,42 +384,42 @@ struct Lowerer<'a> {
 	/// members.rs/solve.rs) — so that inner call's OWN recorded `Resolution`
 	/// is ALSO `UserImplDefaultMethod`, with `impl_span` set to the
 	/// INTERFACE's own span (prelude-origin, so `>= SPAN_BASE`) REGARDLESS of
-	/// which concrete type the whole default body later gets materialized
-	/// onto. When materializing gap (a) onto struct/enum `T`, that inner call
+	/// which concrete type the whole default body later gets lowered
+	/// onto. When lowering gap (a) onto struct/enum `T`, that inner call
 	/// is safe to lower as an ORDINARY direct `this.method(args)` dispatch —
 	/// every method a default body can reach through `this` is either a
 	/// required interface method `T`'s own impl must provide directly, or
 	/// another default of the SAME interface `push_unoverridden_defaults`
-	/// materializes onto `T` in this very pass — so trusting it needs no
-	/// `try_materialize_prelude_dispatch` span lookup at all (mangled-function
+	/// lowers onto `T` in this very pass — so trusting it needs no
+	/// `try_lower_runtime_dispatch` span lookup at all (mangled-function
 	/// dispatch is the wrong shape here regardless: `T` is a real class with a
-	/// real prototype, not a JS primitive). Gap (b)'s `lower_prelude_func`
+	/// real prototype, not a JS primitive). Gap (b)'s `lower_runtime_func`
 	/// does NOT set this: there, `$self` may be a bare JS primitive with no
 	/// such method at all, so the SAME inner-call shape must still recurse
-	/// through `try_materialize_prelude_dispatch` (e.g. `Comparable`'s
+	/// through `try_lower_runtime_dispatch` (e.g. `Comparable`'s
 	/// `less_than` for `boolean` calling `$self.compare_to(other)`, which
 	/// itself demands `$std$Comparable$boolean$compare_to`).
-	materializing_onto_class: std::cell::Cell<u32>,
-	/// Stack of prelude ENUM names currently being materialized onto their own
-	/// emitted class (this slice — named-type prelude method materialization),
-	/// innermost last. Distinguishes the TWO users of `materializing_onto_class`
+	lowering_onto_runtime_owner: std::cell::Cell<u32>,
+	/// Stack of prelude ENUM names currently being lowered onto their own
+	/// emitted class (this slice — named-type prelude method lowering),
+	/// innermost last. Distinguishes the TWO users of `lowering_onto_runtime_owner`
 	/// (see that field's doc comment): empty while `push_unoverridden_defaults`
-	/// materializes an interface default onto a USER class (that class is
-	/// already fully materialized, nothing to demand), non-empty with the
-	/// enum's own name on top while `materialize_prelude_enum` lowers ONE of
+	/// lowers an interface default onto a USER class (that class is
+	/// already fully lowered, nothing to demand), non-empty with the
+	/// enum's own name on top while `lower_runtime_enum` lowers ONE of
 	/// its own (inline or top-level-impl) methods. Consulted at every
-	/// `materializing_onto_class`-gated inner-dispatch fast path (`this.method()`,
-	/// `this as T`, `this op other`) to record a materialization DEMAND for the
-	/// sibling method being called — see `pending_prelude_enum_methods`.
-	current_materializing_enum: RefCell<Vec<EcoString>>,
-	/// Demand set driving `materialize_prelude_enum`'s DEMAND-ONLY method
+	/// `lowering_onto_runtime_owner`-gated inner-dispatch fast path (`this.method()`,
+	/// `this as T`, `this op other`) to record a lowering DEMAND for the
+	/// sibling method being called — see `runtime_enum_method_demands`.
+	current_runtime_owner_lowering: RefCell<Vec<EcoString>>,
+	/// Demand set driving `lower_runtime_enum`'s DEMAND-ONLY method
 	/// lowering (this slice): enum name → the method names some call site
-	/// actually needs materialized onto that enum's class. Populated by (a)
-	/// `try_materialize_prelude_dispatch` returning `PreludeDispatch::OntoClass`
+	/// actually needs lowered onto that enum's class. Populated by (a)
+	/// `try_lower_runtime_dispatch` returning `RuntimeDispatch::OntoClass`
 	/// for an EXTERNAL `recv.method()`/cast dispatch, and (b) the
-	/// `materializing_onto_class`-gated inner-dispatch fast path for an INNER
-	/// `this.method()` reached while already materializing a prelude enum
-	/// (`current_materializing_enum` non-empty).
+	/// `lowering_onto_runtime_owner`-gated inner-dispatch fast path for an INNER
+	/// `this.method()` reached while already lowering a prelude enum
+	/// (`current_runtime_owner_lowering` non-empty).
 	///
 	/// Demand-only, rather than eagerly lowering every inline method
 	/// (`collect_adt_methods`'s ordinary behavior for a user struct/enum), is
@@ -398,44 +431,44 @@ struct Lowerer<'a> {
 	/// (e.g. `let o: Option<int> = None`, which never calls a method at all)
 	/// would panic on those two methods even though the program never demanded
 	/// them. Demanding only what's actually called keeps that panic reachable
-	/// only when a program actually calls the unmaterializable method itself —
+	/// only when a program actually calls the unlowerable method itself —
 	/// the honest floor, not a blanket regression.
-	pending_prelude_enum_methods: RefCell<FxHashMap<EcoString, FxHashSet<EcoString>>>,
-	/// The method names actually materialized onto each prelude enum's class in
-	/// the MOST RECENT `materialize_prelude_enum` call for that enum — compared
-	/// against `pending_prelude_enum_methods`'s current (possibly since-grown)
-	/// demand set by `materialize_referenced_prelude_enums`'s fixed-point loop
-	/// to decide whether that enum needs re-materializing (lowering `is_none`
+	runtime_enum_method_demands: RefCell<FxHashMap<EcoString, FxHashSet<EcoString>>>,
+	/// The method names actually lowered onto each prelude enum's class in
+	/// the MOST RECENT `lower_runtime_enum` call for that enum — compared
+	/// against `runtime_enum_method_demands`'s current (possibly since-grown)
+	/// demand set by `lower_demanded_runtime_enums`'s fixed-point loop
+	/// to decide whether that enum needs re-lowering (lowering `is_none`
 	/// demands `is_some` only as a SIDE EFFECT of lowering its body — a demand
-	/// discovered too late to affect the SAME `materialize_prelude_enum` call
+	/// discovered too late to affect the SAME `lower_runtime_enum` call
 	/// that discovered it, so the outer loop must notice the growth and run it
 	/// again).
-	materialized_prelude_enum_methods: RefCell<FxHashMap<EcoString, FxHashSet<EcoString>>>,
+	lowered_runtime_enum_methods: RefCell<FxHashMap<EcoString, FxHashSet<EcoString>>>,
 	/// Prelude STRUCTS a method call dispatched `OntoClass` against (a method on a
 	/// prelude struct receiver — including an inherited interface default like an
 	/// adapter's `fold`). Unlike a `New`-constructed adapter (found by
-	/// `materialize_referenced_prelude_structs`'s body scan), a struct reached ONLY
+	/// `lower_demanded_runtime_classes`'s body scan), a struct reached ONLY
 	/// through a method call leaves no `HirExpr::New` trace, so its demand is recorded
 	/// here and folded into that same fixed-point pass — otherwise the `recv.method(..)`
 	/// call would hit an unemitted class.
-	pending_prelude_struct_demands: RefCell<FxHashSet<EcoString>>,
+	runtime_struct_demands: RefCell<FxHashSet<EcoString>>,
 }
 
 /// Where a `DispatchKind::UserImplDefaultMethod` resolution's prelude-origin
-/// body actually lives, once [`Lowerer::try_materialize_prelude_dispatch`]
+/// body actually lives, once [`Lowerer::try_lower_runtime_dispatch`]
 /// locates it (this slice extends gap (b) — see that function's doc comment
 /// for the full decision tree).
-enum PreludeDispatch {
+enum RuntimeDispatch {
 	/// A demand-driven top-level MANGLED function (the original gap (b)
 	/// shape, for a primitive/`List`/`Map` self-type with no emitted class of
 	/// its own) — call it as `<mangled>(recv, args…)`.
 	TopLevel(EcoString),
-	/// A method that materializes ONTO the named prelude ENUM's own emitted
-	/// class (this slice, named-type prelude method materialization) — call
+	/// A method that lowers ONTO the named prelude ENUM's own emitted
+	/// class (this slice, named-type prelude method lowering) — call
 	/// it as a plain `recv.method(args…)`, exactly like a user struct/enum's
 	/// own method. Doesn't carry the enum name: `Lowerer::demand_onto_class`,
 	/// the only place that constructs this variant, already recorded the
-	/// materialization demand (keyed by enum name) before returning it — no
+	/// lowering demand (keyed by enum name) before returning it — no
 	/// consumer needs it again.
 	OntoClass { method: EcoString },
 	/// A method call that resolved through an `external(name)` marker present
@@ -451,10 +484,10 @@ enum PreludeDispatch {
 	LinkedExtern(&'static nymph_hir::linkage::Linked),
 }
 
-/// One entry in `Lowerer::pending_prelude_funcs`: everything
-/// `drain_pending_prelude_funcs` needs to lower a demanded prelude body into a
+/// One entry in `Lowerer::runtime_func_demands`: everything
+/// `drain_runtime_func_demands` needs to lower a demanded prelude body into a
 /// `HirFunc`, without re-walking the prelude AST to rediscover it.
-struct PendingPreludeFunc<'a> {
+struct RuntimeFuncDemand<'a> {
 	/// The mangled name to emit this body under (`$std$<Interface>$<SelfTypeTag>$<method>`).
 	mangled: EcoString,
 	/// The owning impl's (or, for an interface-default fallback, the
@@ -464,29 +497,29 @@ struct PendingPreludeFunc<'a> {
 	owner_generics: &'a [Spanned<GenericParam>],
 	meta: &'a FuncDeclaration,
 	body: &'a Expr,
-	/// Gap 2 (sibling-interface-method dispatch inside a materialized
-	/// top-level default body): `Some` when this body was materialized
+	/// Gap 2 (sibling-interface-method dispatch inside a lowered
+	/// top-level default body): `Some` when this body was lowered
 	/// through an `ImplFor` block (`Declaration::ImplFor`, i.e. it carries an
 	/// interface name segment in its mangled name) — `None` for an inherent
 	/// `Impl` body, which needs no frame because its inner sibling calls
 	/// already route correctly by span alone (D1: an inherent method's own
 	/// name span IS its `impl_span`, so the ordinary span-scan in
-	/// `try_materialize_prelude_dispatch` finds it directly). See
-	/// `Lowerer::materializing_prelude_sibling`'s doc comment for why an
+	/// `try_lower_runtime_dispatch` finds it directly). See
+	/// `Lowerer::lowering_runtime_sibling`'s doc comment for why an
 	/// `ImplFor` body needs this at all.
-	sibling_frame: Option<PreludeSiblingFrame<'a>>,
+	sibling_frame: Option<RuntimeSiblingFrame<'a>>,
 }
 
 /// Gap 2's sibling-dispatch context, carried from the OUTER call that
-/// materialized an `ImplFor` default body (`Lowerer::materialize_impl_for_method`)
-/// through to `Lowerer::lower_prelude_func`, which pushes it onto
-/// `Lowerer::materializing_prelude_sibling` for exactly the body's own lowering
+/// lowered an `ImplFor` default body (`Lowerer::lower_impl_for_method`)
+/// through to `Lowerer::lower_runtime_func`, which pushes it onto
+/// `Lowerer::lowering_runtime_sibling` for exactly the body's own lowering
 /// duration — see that field's doc comment for why an inner `this.<method>()`
 /// call inside the body can't find its own concrete impl by span alone and
 /// needs this instead.
 #[derive(Clone)]
-struct PreludeSiblingFrame<'a> {
-	/// The interface segment of the mangled scheme this body materialized
+struct RuntimeSiblingFrame<'a> {
+	/// The interface segment of the mangled scheme this body lowered
 	/// under (`$std$<iface_name>$<tag>$<method>`) — every sibling call inside
 	/// the body resolves to a method of this SAME interface (the checker
 	/// types a default body's `this` as one rigid synthetic instance of its
@@ -494,12 +527,12 @@ struct PreludeSiblingFrame<'a> {
 	/// different interface's method).
 	iface_name: EcoString,
 	/// The canonical self-type tag (`inherent_self_type_tag`) this body's
-	/// concrete receiver materialized under — reused verbatim so a sibling
+	/// concrete receiver lowered under — reused verbatim so a sibling
 	/// call mangles to the IDENTICAL name a direct outer call to that sibling
 	/// would have produced (see `tag_consistency` in the task brief).
 	tag: EcoString,
 	/// The `impl<T> <iface_name> for <ReceiverType> { .. }` block's own
-	/// members — consulted first (mirrors `try_materialize_prelude_dispatch`'s
+	/// members — consulted first (mirrors `try_lower_runtime_dispatch`'s
 	/// own `own_member`-before-interface-default preference order) so a
 	/// sibling call finds an override this SAME impl block provides before
 	/// falling back to the interface's default.
@@ -589,6 +622,127 @@ impl<'a> Lowerer<'a> {
 			.is_some_and(|ty| matches!(self.interner.kind(ty), TyKind::Param(_)))
 	}
 
+	fn lower_bound_dispatch(
+		&self,
+		res: &Resolution,
+		receiver: &Expr,
+		argument: &Expr,
+	) -> Option<HirExpr> {
+		use nymph_ast::ty::Type;
+
+		let interface_span = res.impl_span?;
+		let modules = self
+			.prelude_modules
+			.iter()
+			.chain(std::iter::once(self.module));
+		let (interface, interface_module) = modules.clone().find_map(|module| {
+			match module.members.iter().find(
+				|decl| matches!(decl, Declaration::Interface { name, .. } if name.1 == interface_span),
+			) {
+				Some(Declaration::Interface { name, .. }) => Some((name.0.clone(), module.path.clone())),
+				_ => None,
+			}
+		})?;
+
+		let mut cases: Vec<HirBoundDispatchCase> = Vec::new();
+		for decl in modules.flat_map(|module| module.members.iter()) {
+			let Declaration::ImplFor {
+				generics,
+				mutable,
+				type_,
+				for_interface,
+				members,
+				..
+			} = decl
+			else {
+				continue;
+			};
+			if for_interface.0.0 != interface {
+				continue;
+			}
+			let Some(receiver_tag) = inherent_self_type_tag(&type_.0, *mutable) else {
+				continue;
+			};
+			let Some(other) = for_interface
+				.1
+				.iter()
+				.find(|arg| arg.0.name.as_ref().is_some_and(|name| name.0 == "Other"))
+				.or_else(|| for_interface.1.first())
+			else {
+				continue;
+			};
+			let Some(argument_tag) = (match &other.0.value.0 {
+				Type::SelfType => Some(receiver_tag.clone()),
+				type_ => inherent_self_type_tag(type_, false),
+			}) else {
+				continue;
+			};
+
+			let target = if let Some(marker) = members.iter().find_map(|member| match &member.0 {
+				ImplMember::ExternalFunc(_, marker, meta) if meta.name.0 == res.method => Some(marker),
+				_ => None,
+			}) {
+				let linked = nymph_hir::linkage::lookup(marker, Some(receiver_tag.as_str()))?;
+				HirBoundDispatchTarget::Extern {
+					module: linked.module,
+					symbol: linked.symbol,
+				}
+			} else {
+				let (owner_generics, meta, body) =
+					self.resolve_impl_for_source(&interface, members, generics, &res.method)?;
+				if self.body_calls_unlinked_external(body) {
+					return None;
+				}
+				match self.finish_runtime_impl_lowering(
+					&interface,
+					&receiver_tag,
+					members,
+					generics,
+					owner_generics,
+					meta,
+					body,
+					&res.method,
+				) {
+					RuntimeDispatch::TopLevel(name) => HirBoundDispatchTarget::TopLevel {
+						module: interface_module.clone(),
+						name,
+					},
+					RuntimeDispatch::LinkedExtern(linked) => HirBoundDispatchTarget::Extern {
+						module: linked.module,
+						symbol: linked.symbol,
+					},
+					RuntimeDispatch::OntoClass { .. } => continue,
+				}
+			};
+
+			if let Some(existing) = cases.iter().find(|case| {
+				case.receiver_tag == runtime_type_tag(&receiver_tag)
+					&& case.argument_tag == runtime_type_tag(&argument_tag)
+			}) {
+				assert_eq!(
+					existing.target, target,
+					"conflicting generic dispatch targets for {interface}.{} on ({receiver_tag}, {argument_tag})",
+					res.method
+				);
+				continue;
+			}
+			cases.push(HirBoundDispatchCase {
+				receiver_tag: runtime_type_tag(&receiver_tag),
+				argument_tag: runtime_type_tag(&argument_tag),
+				target,
+			});
+		}
+		cases
+			.sort_by(|a, b| (&a.receiver_tag, &a.argument_tag).cmp(&(&b.receiver_tag, &b.argument_tag)));
+		Some(HirExpr::BoundDispatch {
+			interface,
+			method: res.method.clone(),
+			receiver: Box::new(self.lower_expr(receiver)),
+			argument: Box::new(self.lower_expr(argument)),
+			cases,
+		})
+	}
+
 	/// Does any prelude impl back a method named `method` with an `external` body
 	/// (`ImplMember::ExternalFunc`)? If so, a still-generic receiver calling that
 	/// method is NOT safe to lower as a plain `recv.method(args)`: the concrete
@@ -652,7 +806,7 @@ impl<'a> Lowerer<'a> {
 	fn declare(&self, name: &EcoString) -> EcoString {
 		let mut scopes = self.scopes.borrow_mut();
 		let shadows_active_binding = scopes.iter().any(|s| s.current.contains_key(name));
-		// Named-type prelude method materialization: a Nymph parameter/`let`
+		// Named-type prelude method lowering: a Nymph parameter/`let`
 		// name that happens to be a JS RESERVED WORD (`default` — the one that
 		// actually appears in real stdlib source, e.g. `Unwrap.unwrap(default:
 		// T)`/`Option.map_or(default, f)`, mirroring Rust's `Option`/`Result`
@@ -699,15 +853,15 @@ impl<'a> Lowerer<'a> {
 		name.clone()
 	}
 
-	fn lower_module(&self, module: &Module) -> HirModule {
+	fn lower_module(&self, module: &Module) -> LoweredHir {
 		use nymph_ast::decl::ImplMember;
 		use nymph_ast::ty::Type;
 
-		// Interface bodies, for materializing un-overridden default methods onto
+		// Interface bodies, for lowering un-overridden default methods onto
 		// implementing struct classes (Slice 4C-b) — `self.interfaces_by_name`
 		// (built once in `lower_hir_impl`) already covers both `module`'s own
 		// interfaces AND, when lowering via `lower_hir_with_prelude`, every
-		// prelude module's (stdlib body materialization slice, gap a). Resolution
+		// prelude module's (stdlib body lowering slice, gap a). Resolution
 		// is by bare name within this flattened view — stdlib isn't cross-module
 		// linked in yet, so no real cross-module lookup is needed (mirrors the
 		// checker's own `finish_interface_impl`, which resolves the same way via
@@ -718,7 +872,7 @@ impl<'a> Lowerer<'a> {
 
 		// First pass: collect instance methods from top-level `impl <Named>` blocks
 		// (inherent, 4A) and top-level `impl <Interface> for <Named>` blocks
-		// (interface impls, 4B/D5, now also materializing un-overridden interface
+		// (interface impls, 4B/D5, now also lowering un-overridden interface
 		// defaults per Slice 4C-b), keyed by the target type name. Non-`func`
 		// members (namespaced statics, nested impls, `mut func`) are deferred and
 		// panic loudly rather than silently disappearing.
@@ -731,7 +885,7 @@ impl<'a> Lowerer<'a> {
 					members,
 					..
 				} => {
-					// Inherent impl: no interface, no defaults to materialize. A
+					// Inherent impl: no interface, no defaults to lower. A
 					// non-`Reference` target silently contributes nothing here, same as
 					// before Slice 4C-b — unchanged, out of this slice's scope.
 					if let Type::Reference { name, .. } = &type_.0 {
@@ -806,7 +960,7 @@ impl<'a> Lowerer<'a> {
 					// Methods from top-level impls, the struct's own inner `func`s /
 					// `namespace func` statics / `mut func` methods, and nested
 					// `impl <Interface> { .. }` blocks inside the struct body (also
-					// materializing that interface's un-overridden defaults, Slice 4C-b).
+					// lowering that interface's un-overridden defaults, Slice 4C-b).
 					let (methods, statics) = self.collect_adt_methods(
 						&name.0,
 						generics,
@@ -868,62 +1022,100 @@ impl<'a> Lowerer<'a> {
 			methods_by_type.keys().collect::<Vec<_>>()
 		);
 
-		// Gap (b), Pass 2 (stdlib body materialization slice): the module walk
-		// above only REWRITES a materializable `UserImplDefaultMethod` call site
+		// Gap (b), Pass 2 (stdlib body lowering slice): the module walk
+		// above only REWRITES a lowerable `UserImplDefaultMethod` call site
 		// and enqueues the demanded body — actually lower every queued body now,
 		// with a clean top-level scope stack (this can itself enqueue further
-		// demands, e.g. a materialized `Comparable` default calling
-		// `this.compare_to(o)`; `drain_pending_prelude_funcs` loops to a
+		// demands, e.g. a lowered `Comparable` default calling
+		// `this.compare_to(o)`; `drain_runtime_func_demands` loops to a
 		// fixed point).
-		self.drain_pending_prelude_funcs();
-		let mut funcs = funcs;
-		funcs.extend(self.materialized_prelude_funcs.borrow_mut().drain(..));
+		self.drain_runtime_func_demands();
+		let mut runtime_funcs: Vec<_> = self.lowered_runtime_funcs.borrow_mut().drain(..).collect();
 
-		// Gap (a)'s other half: any interface-default body materialized onto a
+		// Gap (a)'s other half: any interface-default body lowered onto a
 		// user class above (`push_unoverridden_defaults`, fed prelude
-		// interfaces) — or any gap (b) body just materialized — may reference a
+		// interfaces) — or any gap (b) body just lowered — may reference a
 		// prelude enum (`Comparable`'s defaults all reach for `Order`) that
 		// nothing has emitted anywhere in `enums` yet; a user program never
-		// declares it (it isn't theirs to declare), so leaving it unmaterialized
+		// declares it (it isn't theirs to declare), so leaving it unlowered
 		// would compile clean to a JS `ReferenceError` on the undefined `Order`
 		// binding — silently worse than the loud panic this compiler otherwise
 		// always prefers. Scan everything just lowered for a `VariantRef` naming
-		// an enum this module doesn't already declare, and materialize it
+		// an enum this module doesn't already declare, and lower it
 		// on-demand from the prelude, to a fixed point (an enum's own methods,
 		// though none in `ops/mod.nym` today, could in principle reference
 		// another prelude enum).
 		// Gap (a)-for-structs (iterator adapters): an interface-default method
-		// materialized onto a user class may construct an ambient adapter struct
+		// lowered onto a user class may construct an ambient adapter struct
 		// (`c.map(f)` → `MapAdapter(source = this, f = f)`) whose class is emitted
-		// nowhere. Materialize referenced prelude structs FIRST, so an adapter method
+		// nowhere. Lower referenced prelude structs FIRST, so an adapter method
 		// that reaches a prelude enum method (`Option::map`) records that demand before
 		// the enum pass below runs.
-		let classes = self.materialize_referenced_prelude_structs(classes, &lets, &funcs, &enums);
-		let enums = self.materialize_referenced_prelude_enums(enums, &lets, &funcs, &classes);
+		let runtime_classes = self.lower_demanded_runtime_classes(
+			Vec::new(),
+			&lets,
+			&funcs,
+			&classes,
+			&enums,
+			&runtime_funcs,
+		);
+		// Lowering a demanded prelude class can itself discover generic-bound
+		// primitive dispatchers (for example `RangeBounds.contains` comparing
+		// its generic index values). Drain those newly demanded top-level
+		// implementations before scanning for their enum dependencies.
+		self.drain_runtime_func_demands();
+		runtime_funcs.extend(self.lowered_runtime_funcs.borrow_mut().drain(..));
+		self.lower_demanded_runtime_free_funcs(&mut runtime_funcs);
+		let runtime_enums = self.lower_demanded_runtime_enums(
+			Vec::new(),
+			&lets,
+			&funcs,
+			&classes,
+			&enums,
+			&runtime_funcs,
+			&runtime_classes,
+		);
 
-		// Stdlib body materialization slice's missed case (core/std split
+		// Stdlib body lowering slice's missed case (core/std split
 		// follow-up): a bare identifier naming a prelude top-level `let`
 		// (`std/math`'s `pi`/`tau`/`e`/`phi`/`max_int`/`min_int` — plain,
 		// literal-initialized, never `external`) lowers through the ordinary
 		// `ExprKind::Identifier` arm's `resolve()` fallback exactly like any
 		// other unbound-in-scope module-level name (`HirExpr::Local(name)`,
 		// bare, unrenamed — see `resolve`'s doc comment), with NOTHING having
-		// ever demand-materialized the constant's own `const` binding anywhere
+		// ever demand-lowered the constant's own `const` binding anywhere
 		// in the emitted module: a user program compiles with zero
 		// diagnostics to a bare reference that throws `ReferenceError` at
-		// runtime. Mirrors `materialize_referenced_prelude_enums` exactly
+		// runtime. Mirrors `lower_demanded_runtime_enums` exactly
 		// (scan every body just lowered, including the enums just
-		// materialized above, for a free `Local` this module doesn't already
-		// bind as one of its own top-level `let`s, and materialize it from the
+		// lowered above, for a free `Local` this module doesn't already
+		// bind as one of its own top-level `let`s, and lower it from the
 		// prelude on demand) rather than pre-declaring every prelude constant
 		// unconditionally, since almost no program references most of them.
-		let lets = self.materialize_referenced_prelude_lets(lets, &funcs, &classes, &enums);
+		let runtime_lets = self.lower_demanded_runtime_lets(
+			Vec::new(),
+			&lets,
+			&funcs,
+			&classes,
+			&enums,
+			&runtime_funcs,
+			&runtime_classes,
+			&runtime_enums,
+		);
 
-		HirModule {
-			lets: reorder_lets_by_dependency(lets, &funcs),
-			funcs,
-			classes,
-			enums,
+		LoweredHir {
+			module: HirModule {
+				lets: reorder_lets_by_dependency(lets, &funcs),
+				funcs,
+				classes,
+				enums,
+			},
+			prelude_runtime: HirModule {
+				lets: reorder_lets_by_dependency(runtime_lets, &runtime_funcs),
+				funcs: runtime_funcs,
+				classes: runtime_classes,
+				enums: runtime_enums,
+			},
 		}
 	}
 
@@ -931,48 +1123,52 @@ impl<'a> Lowerer<'a> {
 	/// just lowered, for a free `HirExpr::Local` name none of them already
 	/// binds as a top-level `let` of its own, and — if that name matches a
 	/// plain top-level `let` in `self.prelude_modules` (`Declaration::Let`,
-	/// never `ExternalLet`; see [`Self::materialize_prelude_let`]'s doc
-	/// comment for why `external` is out of scope here) — materialize it into
-	/// a new `HirLet` and fold it in, to a fixed point (a materialized
+	/// never `ExternalLet`; see [`Self::lower_runtime_let`]'s doc
+	/// comment for why `external` is out of scope here) — lower it into
+	/// a new `HirLet` and fold it in, to a fixed point (a lowered
 	/// constant's own value could in principle reference another prelude
 	/// constant, though none in `std/math` today do). A name matching nothing
-	/// found is left alone here exactly like `materialize_referenced_prelude_
+	/// found is left alone here exactly like `lower_demanded_runtime_
 	/// enums` leaves an unresolvable enum reference alone: a genuine
 	/// checker/lowering mismatch on a zero-diagnostic program is a real bug,
 	/// not a gap this fixed point should paper over, and will surface as
 	/// emit's own undefined-reference behavior if it's ever hit.
-	fn materialize_referenced_prelude_lets(
+	fn lower_demanded_runtime_lets(
 		&self,
 		mut lets: Vec<HirLet>,
-		funcs: &[HirFunc],
-		classes: &[HirClass],
-		enums: &[HirEnum],
+		module_lets: &[HirLet],
+		module_funcs: &[HirFunc],
+		module_classes: &[HirClass],
+		module_enums: &[HirEnum],
+		runtime_funcs: &[HirFunc],
+		runtime_classes: &[HirClass],
+		runtime_enums: &[HirEnum],
 	) -> Vec<HirLet> {
 		loop {
 			let mut referenced = FxHashSet::default();
-			for l in &lets {
+			for l in module_lets.iter().chain(&lets) {
 				collect_locals(&l.value, &mut referenced);
 			}
-			for f in funcs {
+			for f in module_funcs.iter().chain(runtime_funcs) {
 				collect_locals(&f.body, &mut referenced);
 			}
-			for c in classes {
+			for c in module_classes.iter().chain(runtime_classes) {
 				for m in c.methods.iter().chain(&c.statics) {
 					collect_locals(&m.body, &mut referenced);
 				}
 			}
-			for e in enums {
+			for e in module_enums.iter().chain(runtime_enums) {
 				for m in e.methods.iter().chain(&e.statics) {
 					collect_locals(&m.body, &mut referenced);
 				}
 			}
-			let known: FxHashSet<&EcoString> = lets.iter().map(|l| &l.name).collect();
+			let known: FxHashSet<&EcoString> = module_lets.iter().chain(&lets).map(|l| &l.name).collect();
 			let missing: Vec<EcoString> = referenced
 				.into_iter()
 				// A mangled `$m{tag}$…` name belongs to a real project module (the
 				// import-binding rewrite pass), emitted on its own turn — never a
 				// bare prelude constant name, so never worth a lookup here (mirrors
-				// `materialize_referenced_prelude_enums`'s identical guard).
+				// `lower_demanded_runtime_enums`'s identical guard).
 				.filter(|name| !known.contains(name) && !name.starts_with('$'))
 				.collect();
 			if missing.is_empty() {
@@ -980,7 +1176,7 @@ impl<'a> Lowerer<'a> {
 			}
 			let mut changed = false;
 			for name in missing {
-				if let Some(new_let) = self.materialize_prelude_let(&name) {
+				if let Some(new_let) = self.lower_runtime_let(&name) {
 					lets.push(new_let);
 					changed = true;
 				}
@@ -988,7 +1184,7 @@ impl<'a> Lowerer<'a> {
 			if !changed {
 				// Every still-missing name was looked for and not found in the
 				// prelude either — left alone for the same reason
-				// `materialize_referenced_prelude_enums` leaves its own
+				// `lower_demanded_runtime_enums` leaves its own
 				// still-missing names alone (see this function's doc comment).
 				return lets;
 			}
@@ -1004,7 +1200,7 @@ impl<'a> Lowerer<'a> {
 	/// is empty here too, same as for the module's own top-level lets), name
 	/// kept bare (a prelude top-level name is never renamed, exactly like a
 	/// module's own).
-	fn materialize_prelude_let(&self, name: &EcoString) -> Option<HirLet> {
+	fn lower_runtime_let(&self, name: &EcoString) -> Option<HirLet> {
 		for module in self.prelude_modules {
 			for decl in &module.members {
 				if let Declaration::Let { meta, value, .. } = decl
@@ -1026,7 +1222,7 @@ impl<'a> Lowerer<'a> {
 	/// return its linkage if the marker is registered (`receiver_tag: None`
 	/// — a top-level `external` func has no receiver at all). This is the
 	/// free-function counterpart of the method-call `LinkedExtern` dispatch
-	/// (`try_materialize_prelude_dispatch`): a bare `print(x)` is `ExprKind::
+	/// (`try_lower_runtime_dispatch`): a bare `print(x)` is `ExprKind::
 	/// Call { func: Identifier("print"), .. }`, never a `MemberAccess`, so it
 	/// skips every method-dispatch arm above and would otherwise fall to the
 	/// final `else` as a plain `HirExpr::Call` to a name with no JS binding
@@ -1068,34 +1264,60 @@ impl<'a> Lowerer<'a> {
 		})
 	}
 
-	/// Drain [`Self::pending_prelude_funcs`] to a fixed point, lowering each
+	/// Drain [`Self::runtime_func_demands`] to a fixed point, lowering each
 	/// queued body into a `HirFunc` (appended to
-	/// [`Self::materialized_prelude_funcs`]) — see that field's doc comment for
+	/// [`Self::lowered_runtime_funcs`]) — see that field's doc comment for
 	/// why this must run with an empty top-level scope, after the ordinary
 	/// module walk, rather than inline at the demand site.
-	fn drain_pending_prelude_funcs(&self) {
+	fn drain_runtime_func_demands(&self) {
 		loop {
-			let next = self.pending_prelude_funcs.borrow_mut().pop();
+			let next = self.runtime_func_demands.borrow_mut().pop();
 			let Some(pending) = next else {
 				break;
 			};
-			let f = self.lower_prelude_func(&pending);
-			self.materialized_prelude_funcs.borrow_mut().push(f);
+			let f = self.lower_runtime_func(&pending);
+			self.lowered_runtime_funcs.borrow_mut().push(f);
 		}
 	}
 
-	/// Lower one queued [`PendingPreludeFunc`] into a top-level `HirFunc`
-	/// (stdlib body materialization slice, gap b): `$self` (declared via the
+	fn lower_demanded_runtime_free_funcs(&self, funcs: &mut Vec<HirFunc>) {
+		loop {
+			let existing: FxHashSet<_> = funcs.iter().map(|func| func.name.clone()).collect();
+			let mut referenced = FxHashSet::default();
+			for func in funcs.iter() {
+				collect_locals(&func.body, &mut referenced);
+			}
+			let demanded = self.prelude_modules.iter().find_map(|module| {
+				module.members.iter().find_map(|decl| match decl {
+					Declaration::Func { meta, body, .. }
+						if referenced.contains(&meta.name.0) && !existing.contains(&meta.name.0) =>
+					{
+						Some((meta, body))
+					}
+					_ => None,
+				})
+			});
+			let Some((meta, body)) = demanded else {
+				break;
+			};
+			funcs.push(self.lower_func(meta, body));
+			self.drain_runtime_func_demands();
+			funcs.extend(self.lowered_runtime_funcs.borrow_mut().drain(..));
+		}
+	}
+
+	/// Lower one queued [`RuntimeFuncDemand`] into a top-level `HirFunc`
+	/// (stdlib body lowering slice, gap b): `$self` (declared via the
 	/// ordinary [`Self::declare`] machinery, so it can never collide with the
-	/// body's own params/locals — see [`Self::try_materialize_prelude_dispatch`]'s
+	/// body's own params/locals — see [`Self::try_lower_runtime_dispatch`]'s
 	/// doc comment) becomes the receiver, pushed as a `this`-substitution
 	/// (`this_sub`) for the body's own duration so `ExprKind::This` resolves to
 	/// it instead of the meaningless top-level `HirExpr::This`. Otherwise
 	/// mirrors [`Self::lower_method`] exactly (own scope, own generics frame,
-	/// same param/body lowering) — a materialized prelude body is checked and
+	/// same param/body lowering) — a lowered prelude body is checked and
 	/// shaped exactly like any other method body, just re-targeted to a
 	/// top-level function instead of a class method.
-	fn lower_prelude_func(&self, pending: &PendingPreludeFunc<'a>) -> HirFunc {
+	fn lower_runtime_func(&self, pending: &RuntimeFuncDemand<'a>) -> HirFunc {
 		self.push_scope();
 		self.push_generics(pending.owner_generics, &pending.meta.generics);
 		let self_param = self.declare(&EcoString::from("$self"));
@@ -1108,21 +1330,21 @@ impl<'a> Lowerer<'a> {
 				.map(|p| self.declare(&param_name(&p.0.name))),
 		);
 		self.this_sub.borrow_mut().push(self_param);
-		// Gap 2: while lowering an `ImplFor`-materialized default body, push
+		// Gap 2: while lowering an `ImplFor`-lowered default body, push
 		// its own sibling-dispatch frame — see
-		// `Lowerer::materializing_prelude_sibling`'s doc comment — so an
+		// `Lowerer::lowering_runtime_sibling`'s doc comment — so an
 		// inner `this.<method>()` call can resolve directly against this SAME
 		// impl instead of failing the ordinary span-scan. `None` for an
 		// inherent `Impl` body (D1 needs no frame), so this is a no-op there.
 		if let Some(frame) = &pending.sibling_frame {
 			self
-				.materializing_prelude_sibling
+				.lowering_runtime_sibling
 				.borrow_mut()
 				.push(frame.clone());
 		}
 		let body = self.lower_func_body(pending.body);
 		if pending.sibling_frame.is_some() {
-			self.materializing_prelude_sibling.borrow_mut().pop();
+			self.lowering_runtime_sibling.borrow_mut().pop();
 		}
 		self.this_sub.borrow_mut().pop();
 		self.pop_generics();
@@ -1136,81 +1358,85 @@ impl<'a> Lowerer<'a> {
 
 	/// Gap (a)'s enum half (see `lower_module`'s tail doc comment): repeatedly
 	/// scan every body just lowered for a `VariantRef`/`VariantNew` naming an
-	/// enum not already in `enums`, and materialize (lower) that enum from
+	/// enum not already in `enums`, and lower (lower) that enum from
 	/// `self.prelude_modules` if it's found there — to a fixed point, so a
-	/// freshly materialized enum's own methods get the same treatment. A
+	/// freshly lowered enum's own methods get the same treatment. A
 	/// reference naming neither a declared enum nor a prelude one would mean
 	/// the checker recorded a variant resolution lowering can't account for —
 	/// a real checker/lowering mismatch, not an expected gap — so that case is
-	/// left alone here (not silently materialized as something it isn't) and
+	/// left alone here (not silently lowered as something it isn't) and
 	/// will surface as emit's own undefined-enum panic if it's ever hit.
 	///
 	/// This slice extends the fixed point two ways, both driven by
-	/// `pending_prelude_enum_methods` (named-type prelude method
-	/// materialization, demand-only):
+	/// `runtime_enum_method_demands` (named-type prelude method
+	/// lowering, demand-only):
 	/// - A prelude enum can be "referenced" purely through a method-call
 	///   DEMAND with no `VariantRef`/`VariantNew` anywhere in the lowered
 	///   program at all (e.g. a function parameter `o: Option<int>` calling
 	///   `o.is_some()`, never itself constructing an `Option`) —
-	///   `pending_prelude_enum_methods`'s keys are unioned into `referenced`
+	///   `runtime_enum_method_demands`'s keys are unioned into `referenced`
 	///   too, or that call's promised `recv.method()` would compile clean
 	///   against a class never emitted.
-	/// - An ALREADY-materialized enum's demand set can have GROWN since its
-	///   last materialization (lowering `is_none`'s body demands `is_some`
+	/// - An ALREADY-lowered enum's demand set can have GROWN since its
+	///   last lowering (lowering `is_none`'s body demands `is_some`
 	///   only as a side effect of lowering `is_none` ITSELF — too late to
-	///   affect the very `materialize_prelude_enum` call that discovered it);
+	///   affect the very `lower_runtime_enum` call that discovered it);
 	///   `grown` detects this by comparing the current demand set against
-	///   `materialized_prelude_enum_methods`' record of what actually got
-	///   lowered last time, and re-materializes (replacing the stale entry).
-	fn materialize_referenced_prelude_enums(
+	///   `lowered_runtime_enum_methods`' record of what actually got
+	///   lowered last time, and re-lowers (replacing the stale entry).
+	fn lower_demanded_runtime_enums(
 		&self,
 		mut enums: Vec<HirEnum>,
-		lets: &[HirLet],
-		funcs: &[HirFunc],
-		classes: &[HirClass],
+		module_lets: &[HirLet],
+		module_funcs: &[HirFunc],
+		module_classes: &[HirClass],
+		module_enums: &[HirEnum],
+		runtime_funcs: &[HirFunc],
+		runtime_classes: &[HirClass],
 	) -> Vec<HirEnum> {
 		loop {
 			let mut referenced = FxHashSet::default();
-			for l in lets {
+			for l in module_lets {
 				collect_variant_ref_enums(&l.value, &mut referenced);
 			}
-			for f in funcs {
+			for f in module_funcs.iter().chain(runtime_funcs) {
 				collect_variant_ref_enums(&f.body, &mut referenced);
 			}
-			for c in classes {
+			for c in module_classes.iter().chain(runtime_classes) {
 				for m in c.methods.iter().chain(&c.statics) {
 					collect_variant_ref_enums(&m.body, &mut referenced);
 				}
 			}
-			for e in &enums {
+			for e in module_enums.iter().chain(&enums) {
 				for m in e.methods.iter().chain(&e.statics) {
 					collect_variant_ref_enums(&m.body, &mut referenced);
 				}
 			}
-			for enum_name in self.pending_prelude_enum_methods.borrow().keys() {
+			for enum_name in self.runtime_enum_method_demands.borrow().keys() {
 				referenced.insert(enum_name.clone());
 			}
-			let known: FxHashSet<&EcoString> = enums.iter().map(|e| &e.name).collect();
+			let known: FxHashSet<&EcoString> =
+				module_enums.iter().chain(&enums).map(|e| &e.name).collect();
 			let missing: Vec<EcoString> = referenced
 				.into_iter()
 				// A mangled `$m{tag}$…` name belongs to a real project module (the
 				// import-binding rewrite pass) that is emitted on its OWN turn and
-				// referenced here by that mangled name — re-materializing it would
+				// referenced here by that mangled name — re-lowering it would
 				// emit its declaration a second time and crash Node with a
 				// redeclaration error. Only un-mangled ambient stdlib-prelude enums
 				// (e.g. `Order`, `Option`, `Result`), which are emitted nowhere
-				// else, are materialized.
+				// else, are lowered.
 				.filter(|name| !known.contains(name) && !name.starts_with('$'))
 				.collect();
 			let grown: Vec<EcoString> = enums
 				.iter()
 				.filter(|e| {
-					let demand = self.pending_prelude_enum_methods.borrow();
+					let demand = self.runtime_enum_method_demands.borrow();
 					let Some(demanded) = demand.get(&e.name) else {
 						return false;
 					};
-					let materialized = self.materialized_prelude_enum_methods.borrow();
-					let done = materialized.get(&e.name);
+					let lowered = self.lowered_runtime_enum_methods.borrow();
+					let done = lowered.get(&e.name);
 					!done.is_some_and(|done| demanded.is_subset(done))
 				})
 				.map(|e| e.name.clone())
@@ -1220,7 +1446,7 @@ impl<'a> Lowerer<'a> {
 			}
 			let mut changed = false;
 			for name in missing.into_iter().chain(grown) {
-				if let Some(e) = self.materialize_prelude_enum(&name) {
+				if let Some(e) = self.lower_runtime_enum(&name) {
 					enums.retain(|e2| e2.name != name);
 					enums.push(e);
 					changed = true;
@@ -1239,8 +1465,8 @@ impl<'a> Lowerer<'a> {
 	/// declarations and lower it exactly like an ordinary module enum
 	/// (`lower_module`'s own `Declaration::Enum` arm) — reusing
 	/// `collect_adt_methods` for consistency — except DEMAND-ONLY (this
-	/// slice, named-type prelude method materialization): only the methods
-	/// named in `pending_prelude_enum_methods[name]` at the moment of this
+	/// slice, named-type prelude method lowering): only the methods
+	/// named in `runtime_enum_method_demands[name]` at the moment of this
 	/// call are lowered, whether inline (this enum's own `func`s) or from a
 	/// TOP-LEVEL `impl <Interface> for <name>`/`impl <name> { .. }` block
 	/// (Sub-problem #4 — `collect_adt_methods` alone never sees these; they're
@@ -1254,22 +1480,22 @@ impl<'a> Lowerer<'a> {
 	/// on a bound generic `T`) — eagerly lowering them merely because
 	/// `Option` was referenced AT ALL (e.g. `let o: Option<int> = None`,
 	/// which never calls a method) would panic on a program that never
-	/// actually demanded either. See `pending_prelude_enum_methods`'s doc
+	/// actually demanded either. See `runtime_enum_method_demands`'s doc
 	/// comment.
 	///
-	/// While lowering this enum's own methods, `materializing_onto_class` is
-	/// bumped and `name` is pushed onto `current_materializing_enum`
+	/// While lowering this enum's own methods, `lowering_onto_runtime_owner` is
+	/// bumped and `name` is pushed onto `current_runtime_owner_lowering`
 	/// (Sub-problem #1, inner dispatch) — every inner `this.method()`/`this
 	/// as T`/`this op other` dispatch reached while lowering these bodies is
 	/// then safe as a plain class-method call (mirrors
-	/// `push_unoverridden_defaults`'s identical use of `materializing_onto_class`
+	/// `push_unoverridden_defaults`'s identical use of `lowering_onto_runtime_owner`
 	/// for a USER class), and records its own sibling demand
-	/// (`record_inner_prelude_demand`) so a GROWN demand set is caught by
-	/// `materialize_referenced_prelude_enums`'s fixed-point loop.
+	/// (`record_inner_runtime_enum_method_demand`) so a GROWN demand set is caught by
+	/// `lower_demanded_runtime_enums`'s fixed-point loop.
 	///
 	/// Returns `None` when `name` isn't a prelude enum at all (see the
 	/// caller's doc comment).
-	fn materialize_prelude_enum(&self, name: &EcoString) -> Option<HirEnum> {
+	fn lower_runtime_enum(&self, name: &EcoString) -> Option<HirEnum> {
 		use nymph_ast::ty::Type;
 
 		let (generics, variants, members, impls) = self.prelude_modules.iter().find_map(|m| {
@@ -1293,22 +1519,22 @@ impl<'a> Lowerer<'a> {
 
 		// Snapshot the demand set NOW — any growth discovered WHILE lowering
 		// these bodies (inner dispatch demanding a sibling method) is caught
-		// on the NEXT `materialize_referenced_prelude_enums` round instead
-		// (`materialized_prelude_enum_methods`'s doc comment), not this call.
+		// on the NEXT `lower_demanded_runtime_enums` round instead
+		// (`lowered_runtime_enum_methods`'s doc comment), not this call.
 		let demand: FxHashSet<EcoString> = self
-			.pending_prelude_enum_methods
+			.runtime_enum_method_demands
 			.borrow()
 			.get(name)
 			.cloned()
 			.unwrap_or_default();
 
 		self
-			.current_materializing_enum
+			.current_runtime_owner_lowering
 			.borrow_mut()
 			.push(name.clone());
 		self
-			.materializing_onto_class
-			.set(self.materializing_onto_class.get() + 1);
+			.lowering_onto_runtime_owner
+			.set(self.lowering_onto_runtime_owner.get() + 1);
 
 		let mut methods_by_type: FxHashMap<EcoString, Vec<HirMethod>> = FxHashMap::default();
 		let (mut methods, mut statics) = self.collect_adt_methods(
@@ -1322,7 +1548,7 @@ impl<'a> Lowerer<'a> {
 		);
 		assert!(
 			methods_by_type.is_empty(),
-			"stdlib body materialization: prelude enum `{name}`'s OWN nested `impl Iface {{ .. }}` block populated `methods_by_type` for a DIFFERENT type name — unexpected (`collect_adt_methods` only ever feeds it from `impls` belonging to `{name}` itself)"
+			"stdlib body lowering: prelude enum `{name}`'s OWN nested `impl Iface {{ .. }}` block populated `methods_by_type` for a DIFFERENT type name — unexpected (`collect_adt_methods` only ever feeds it from `impls` belonging to `{name}` itself)"
 		);
 
 		// Sub-problem #4: a TOP-LEVEL `impl <Interface> for <name>`/`impl
@@ -1388,23 +1614,23 @@ impl<'a> Lowerer<'a> {
 		}
 
 		self
-			.materializing_onto_class
-			.set(self.materializing_onto_class.get() - 1);
-		self.current_materializing_enum.borrow_mut().pop();
+			.lowering_onto_runtime_owner
+			.set(self.lowering_onto_runtime_owner.get() - 1);
+		self.current_runtime_owner_lowering.borrow_mut().pop();
 
-		// Record exactly which methods THIS round actually materialized —
-		// compared against `pending_prelude_enum_methods`'s (possibly
-		// since-grown) demand set by `materialize_referenced_prelude_enums`'s
-		// fixed-point loop to decide whether this enum needs re-materializing.
-		let materialized_names: FxHashSet<EcoString> = methods
+		// Record exactly which methods THIS round actually lowered —
+		// compared against `runtime_enum_method_demands`'s (possibly
+		// since-grown) demand set by `lower_demanded_runtime_enums`'s
+		// fixed-point loop to decide whether this enum needs re-lowering.
+		let lowered_names: FxHashSet<EcoString> = methods
 			.iter()
 			.chain(&statics)
 			.map(|m| m.name.clone())
 			.collect();
 		self
-			.materialized_prelude_enum_methods
+			.lowered_runtime_enum_methods
 			.borrow_mut()
-			.insert(name.clone(), materialized_names);
+			.insert(name.clone(), lowered_names);
 
 		// V4, re-asserted across the combined inline + top-level-impl method
 		// list (`collect_adt_methods` already checked its own slice of it).
@@ -1432,49 +1658,55 @@ impl<'a> Lowerer<'a> {
 		})
 	}
 
-	/// Scan every already-lowered body (including the classes/enums materialized so
+	/// Scan every already-lowered body (including the classes/enums lowered so
 	/// far) for a `HirExpr::New` constructing a struct this module doesn't already
 	/// emit a class for — an ambient iterator adapter (`MapAdapter`, `FilterAdapter`)
-	/// referenced from an interface-default method that was materialized onto a
+	/// referenced from an interface-default method that was lowered onto a
 	/// concrete class (`c.map(f)` → `MapAdapter(source = this, f = f)`). A user
 	/// program never declares such a struct (it isn't theirs), so leaving it
-	/// unmaterialized compiles clean to a JS `ReferenceError` on the undefined class —
-	/// the same silent failure `materialize_referenced_prelude_enums` closes for
-	/// enums. Materialize each from the prelude to a fixed point (an adapter's own
+	/// unlowered compiles clean to a JS `ReferenceError` on the undefined class —
+	/// the same silent failure `lower_demanded_runtime_enums` closes for
+	/// enums. Lower each from the prelude to a fixed point (an adapter's own
 	/// method may construct another adapter).
-	fn materialize_referenced_prelude_structs(
+	fn lower_demanded_runtime_classes(
 		&self,
 		mut classes: Vec<HirClass>,
-		lets: &[HirLet],
-		funcs: &[HirFunc],
-		enums: &[HirEnum],
+		module_lets: &[HirLet],
+		module_funcs: &[HirFunc],
+		module_classes: &[HirClass],
+		module_enums: &[HirEnum],
+		runtime_funcs: &[HirFunc],
 	) -> Vec<HirClass> {
 		loop {
 			let mut referenced = FxHashSet::default();
-			for l in lets {
+			for l in module_lets {
 				collect_variant_ref_enums(&l.value, &mut referenced);
 			}
-			for f in funcs {
+			for f in module_funcs.iter().chain(runtime_funcs) {
 				collect_variant_ref_enums(&f.body, &mut referenced);
 			}
-			for c in &classes {
+			for c in module_classes.iter().chain(&classes) {
 				for m in c.methods.iter().chain(&c.statics) {
 					collect_variant_ref_enums(&m.body, &mut referenced);
 				}
 			}
-			for e in enums {
+			for e in module_enums {
 				for m in e.methods.iter().chain(&e.statics) {
 					collect_variant_ref_enums(&m.body, &mut referenced);
 				}
 			}
 			// A prelude struct reached only through a method call (`OntoClass`) leaves no
 			// `New` for the body scan, so fold in the demand set the dispatch recorded.
-			for name in self.pending_prelude_struct_demands.borrow().iter() {
+			for name in self.runtime_struct_demands.borrow().iter() {
 				referenced.insert(name.clone());
 			}
-			let known: FxHashSet<&EcoString> = classes.iter().map(|c| &c.name).collect();
+			let known: FxHashSet<&EcoString> = module_classes
+				.iter()
+				.chain(&classes)
+				.map(|c| &c.name)
+				.collect();
 			// `referenced` also holds enum names (shared scan) and mangled project-module
-			// names; `materialize_prelude_struct` returns `None` for anything that isn't a
+			// names; `lower_runtime_struct` returns `None` for anything that isn't a
 			// plain prelude struct, so both are skipped.
 			let missing: Vec<EcoString> = referenced
 				.into_iter()
@@ -1485,7 +1717,7 @@ impl<'a> Lowerer<'a> {
 			}
 			let mut changed = false;
 			for name in missing {
-				if let Some(class) = self.materialize_prelude_struct(&name) {
+				if let Some(class) = self.lower_runtime_struct(&name) {
 					classes.push(class);
 					changed = true;
 				}
@@ -1502,12 +1734,12 @@ impl<'a> Lowerer<'a> {
 	/// { .. }` blocks (an adapter's `impl Iterator<R> { mut func next() = .. }`),
 	/// eagerly (all methods, `demand: None`): unlike a prelude ENUM, an adapter struct
 	/// has no still-generic `T.default()`-style method that can't be compiled, so there
-	/// is nothing to demand-gate. `materializing_onto_class` is bumped while lowering the
+	/// is nothing to demand-gate. `lowering_onto_runtime_owner` is bumped while lowering the
 	/// methods so an inner `this.method()` call resolves as a plain class-method call,
 	/// and any prelude enum method it reaches (`Option::map` in
 	/// `this.source.next().map(this.f)`) records its own demand for the enum pass that
 	/// runs next. Returns `None` when `name` isn't a prelude struct.
-	fn materialize_prelude_struct(&self, name: &EcoString) -> Option<HirClass> {
+	fn lower_runtime_struct(&self, name: &EcoString) -> Option<HirClass> {
 		let (generics, fields, members, impls) = self.prelude_modules.iter().find_map(|m| {
 			m.members.iter().find_map(|decl| match decl {
 				Declaration::Struct {
@@ -1528,8 +1760,8 @@ impl<'a> Lowerer<'a> {
 		})?;
 
 		self
-			.materializing_onto_class
-			.set(self.materializing_onto_class.get() + 1);
+			.lowering_onto_runtime_owner
+			.set(self.lowering_onto_runtime_owner.get() + 1);
 
 		let mut methods_by_type: FxHashMap<EcoString, Vec<HirMethod>> = FxHashMap::default();
 		let (methods, statics) = self.collect_adt_methods(
@@ -1543,8 +1775,8 @@ impl<'a> Lowerer<'a> {
 		);
 
 		self
-			.materializing_onto_class
-			.set(self.materializing_onto_class.get() - 1);
+			.lowering_onto_runtime_owner
+			.set(self.lowering_onto_runtime_owner.get() - 1);
 
 		self.assert_no_duplicate_methods(name, &methods);
 		self.assert_no_duplicate_methods(name, &statics);
@@ -1557,7 +1789,7 @@ impl<'a> Lowerer<'a> {
 		})
 	}
 
-	/// Sub-problem #4 helper for [`Self::materialize_prelude_enum`]: lower the
+	/// Sub-problem #4 helper for [`Self::lower_runtime_enum`]: lower the
 	/// DEMANDED (`demand`) methods of one top-level `impl <Interface> for
 	/// <enum_name>`/`impl <enum_name> { .. }` block's `impl_members` into
 	/// `methods`/`statics`, exactly like `collect_adt_methods`'s own flat-member
@@ -1578,7 +1810,7 @@ impl<'a> Lowerer<'a> {
 		for member in impl_members {
 			let ImplMember::Func { meta, body, .. } = &member.0 else {
 				panic!(
-					"stdlib body materialization: prelude enum `{enum_name}`'s top-level impl has a non-`func` member ({:?}) — demand-only enum materialization does not yet support it",
+					"stdlib body lowering: prelude enum `{enum_name}`'s top-level impl has a non-`func` member ({:?}) — demand-only enum lowering does not yet support it",
 					member.0
 				);
 			};
@@ -1594,7 +1826,7 @@ impl<'a> Lowerer<'a> {
 	}
 
 	/// Lower a top-level `impl <Interface> for <Type> { … }`'s own methods into
-	/// `methods_by_type[Type]`, then materialize (append) that interface's
+	/// `methods_by_type[Type]`, then lower (append) that interface's
 	/// un-overridden default-bodied methods (Slice 4C-b, V1: impl-provided methods
 	/// first in source order, then defaults in interface source order).
 	fn push_impl_for_methods(
@@ -1620,9 +1852,9 @@ impl<'a> Lowerer<'a> {
 			// `methods_by_type.remove(type_name)`); a structural target can never
 			// match one of those, so an entry keyed here would just sit unused
 			// (and trip the end-of-`lower_module` "neither struct nor enum"
-			// assert). The actual per-CALL-SITE materialization for a structural
+			// assert). The actual per-CALL-SITE lowering for a structural
 			// receiver goes through the entirely separate, registry-aware
-			// `try_materialize_prelude_dispatch` (its own `ImplFor` arm handles
+			// `try_lower_runtime_dispatch` (its own `ImplFor` arm handles
 			// this exact shape via `inherent_self_type_tag`, independent of
 			// `methods_by_type`), so silently contributing nothing here is exactly
 			// as safe as the sibling `Declaration::Impl` arm's identical skip
@@ -1636,7 +1868,7 @@ impl<'a> Lowerer<'a> {
 		// `Type::Reference` naming the impl's own generic parameter. Left
 		// unchecked, that name could coincide with an unrelated real struct in the
 		// module and silently attach the blanket's methods to it; refuse instead
-		// (V5: blanket impls stay a loud deferral, never materialized).
+		// (V5: blanket impls stay a loud deferral, never lowered).
 		if generics.iter().any(|g| g.0.name.0 == name.0) {
 			panic!(
 				"slice-4c-b lowering does not yet support blanket impls (`impl<{0}> {1} for {0}`)",
@@ -1650,7 +1882,9 @@ impl<'a> Lowerer<'a> {
 			match &member.0 {
 				ImplMember::Func { meta, body, .. } => {
 					overridden.insert(meta.name.0.clone());
-					entry.push(self.lower_method(generics, meta, body));
+					let method = self.lower_method(generics, meta, body);
+					Self::push_protocol_impl_alias(&for_interface.0.0, &method, entry);
+					entry.push(method);
 				}
 				other => panic!("slice-4b lowering does not yet handle impl member {other:?}"),
 			}
@@ -1702,34 +1936,34 @@ impl<'a> Lowerer<'a> {
 			// (Slice 4J, Task 1 Finding 3 fix) — `check_interface_default_body`
 			// (members.rs) checks it exactly once, generically, against
 			// `iface_generics` plus the method's own, never against any
-			// implementing struct/enum's generics (a default body materialized
+			// implementing struct/enum's generics (a default body lowered
 			// onto multiple types can't depend on which one it lands on).
 			//
-			// `materializing_onto_class` (stdlib body materialization slice,
+			// `lowering_onto_runtime_owner` (stdlib body lowering slice,
 			// gap a) is bumped for the DURATION of lowering this one default
 			// body: an inner dispatch it makes back through `this` must lower
 			// as an ordinary direct call on `this`, not attempt (gap b's)
-			// top-level mangled-function materialization — see that field's
+			// top-level mangled-function lowering — see that field's
 			// doc comment.
 			self
-				.materializing_onto_class
-				.set(self.materializing_onto_class.get() + 1);
+				.lowering_onto_runtime_owner
+				.set(self.lowering_onto_runtime_owner.get() + 1);
 			out.push(self.lower_method(iface_generics, meta, body));
 			self
-				.materializing_onto_class
-				.set(self.materializing_onto_class.get() - 1);
+				.lowering_onto_runtime_owner
+				.set(self.lowering_onto_runtime_owner.get() - 1);
 		}
 	}
 
-	/// Gap (b) of the stdlib body materialization slice: given a `Resolution`
+	/// Gap (b) of the stdlib body lowering slice: given a `Resolution`
 	/// tagged `DispatchKind::UserImplDefaultMethod`, decide whether the
 	/// prelude-origin impl/interface-default body it points at (via
-	/// `res.impl_span`) is one this compiler can actually materialize as a
+	/// `res.impl_span`) is one this compiler can actually lower as a
 	/// demand-driven top-level function — and if so, enqueue it (dedup'd) and
 	/// return the mangled name to call instead of panicking.
 	///
 	/// Two shapes of prelude impl reach here, each with its own match key
-	/// (this is the collections-materialization extension: originally this
+	/// (this is the collections-lowering extension: originally this
 	/// only scanned `Declaration::ImplFor` — an INTERFACE impl, matched by the
 	/// interface-ident span — because every stdlib operator/`Comparable`
 	/// method lived in one; every real stdlib COLLECTION method instead lives
@@ -1745,7 +1979,7 @@ impl<'a> Lowerer<'a> {
 	///   commits no `ImplDef`), so the match key here is `meta.name.1`, one
 	///   level deeper than the `ImplFor` branch's.
 	///
-	/// A dispatch stays unmaterializable (returns `None`, so every call site
+	/// A dispatch stays unlowerable (returns `None`, so every call site
 	/// keeps its existing loud panic) for any of:
 	/// - `res.impl_span` is `None` (a `BuiltinEager`/`BuiltinShortCircuit`/
 	///   `UserImpl` dispatch never reaches here at all, but kept total) or
@@ -1765,7 +1999,7 @@ impl<'a> Lowerer<'a> {
 	///   `Type::Reference` naming the impl's own generic parameter, e.g.
 	///   `Comparable`'s `minmax` or `Equals`'s blanket) and a named struct/enum
 	///   receiver — mirrors `push_impl_for_methods`'s V5 (blanket impls stay a
-	///   loud deferral, never materialized), for the identical reason: no
+	///   loud deferral, never lowered), for the identical reason: no
 	///   single self-type to tag the mangled function with cleanly.
 	/// - The matched member is itself `external`/`external(name)` (no real
 	///   Nymph body — an `ImplMember::ExternalFunc`, never
@@ -1788,20 +2022,20 @@ impl<'a> Lowerer<'a> {
 	/// tail (below): `true` only when the CALLER already established (via
 	/// `Self::is_this_receiver`) that this dispatch's own receiver expression
 	/// is literally `this` — mirroring `is_this_receiver`'s own doc comment
-	/// (written for the analogous gap-a `materializing_onto_class` fast path):
+	/// (written for the analogous gap-a `lowering_onto_runtime_owner` fast path):
 	/// a default body dispatching through some OTHER expression that merely
 	/// happens to satisfy the SAME interface bound (e.g. a second parameter
 	/// also bound to `SomeIface`) is a genuinely different receiver that may
 	/// be bound to a different concrete type than the one the OUTER
-	/// materialization is running for — trusting the frame's tag for it would
+	/// lowering is running for — trusting the frame's tag for it would
 	/// silently mangle a call to the WRONG concrete impl. Every call site
 	/// below always has a concrete receiver expression to check, so this is
 	/// never itself optional.
-	fn try_materialize_prelude_dispatch(
+	fn try_lower_runtime_dispatch(
 		&self,
 		res: &Resolution,
 		this_receiver: bool,
-	) -> Option<PreludeDispatch> {
+	) -> Option<RuntimeDispatch> {
 		use nymph_ast::ty::Type;
 
 		let span = res.impl_span?;
@@ -1819,8 +2053,8 @@ impl<'a> Lowerer<'a> {
 		// top-level declaration's (distinct source positions).
 		//
 		// Deliberately ENUM-only, never `Declaration::Struct`: unlike an enum
-		// (`materialize_prelude_enum`), there is no prelude-STRUCT
-		// materialization anywhere in this compiler — returning `OntoClass`
+		// (`lower_runtime_enum`), there is no prelude-STRUCT
+		// lowering anywhere in this compiler — returning `OntoClass`
 		// for a struct's inline method would promise a `recv.method()` call
 		// against a class this compiler never emits, exactly the
 		// silent-wrong-JS failure mode this compiler never accepts. A named
@@ -1847,7 +2081,7 @@ impl<'a> Lowerer<'a> {
 		// `LinkedList`/`Tree`/`Complex`, direct member OR nested `impl Iface { .. }`):
 		// the struct's class is emitted by the driver on that module's own turn, so a
 		// call to its method lowers as an ordinary `recv.method(..)` call on that class
-		// — `OntoClass`, with NO materialization demand (the body is already emitted).
+		// — `OntoClass`, with NO lowering demand (the body is already emitted).
 		for module in self.emitted_dep_modules {
 			for decl in &module.members {
 				if let Declaration::Struct { members, impls, .. } = decl {
@@ -1867,7 +2101,7 @@ impl<'a> Lowerer<'a> {
 									.any(|m| matches!(&m.0, ImplMember::Func { meta, .. } if meta.name.1 == span))
 						});
 					if hit {
-						return Some(PreludeDispatch::OntoClass {
+						return Some(RuntimeDispatch::OntoClass {
 							method: res.method.clone(),
 						});
 					}
@@ -1880,7 +2114,7 @@ impl<'a> Lowerer<'a> {
 		// `count`/`map` on `Mapped`). The struct's class is emitted on demand (task #24),
 		// and a default body is pure Nymph over the interface's surface (never the
 		// struct's own `external`/generic-operator members), so a plain `recv.method(..)`
-		// call is safe; record a demand so the class is materialized even when the struct
+		// call is safe; record a demand so the class is lowered even when the struct
 		// is reached ONLY through this call (no `HirExpr::New` for the body scan to find).
 		// Restricted to a method the struct's impl does NOT itself provide as a member —
 		// i.e. a pure INHERITED default (`fold`/`to_list`/…), never an abstract interface
@@ -1888,7 +2122,7 @@ impl<'a> Lowerer<'a> {
 		// transitively call an unlinked `external` (`Set::insert`) or use an erased-generic
 		// operator (`Range::contains`'s `this.start <= item`, ALSO reached through its
 		// interface span since `contains` is abstract in `RangeBounds`), neither of which
-		// is materializable — those keep the loud defer below.
+		// is lowerable — those keep the loud defer below.
 		for module in self.prelude_modules {
 			for decl in &module.members {
 				if let Declaration::Struct { name, impls, .. } = decl
@@ -1901,10 +2135,10 @@ impl<'a> Lowerer<'a> {
 								.any(|m| matches!(&m.0, ImplMember::Func { meta, .. } if meta.name.0 == res.method))
 					}) {
 					self
-						.pending_prelude_struct_demands
+						.runtime_struct_demands
 						.borrow_mut()
 						.insert(name.0.clone());
-					return Some(PreludeDispatch::OntoClass {
+					return Some(RuntimeDispatch::OntoClass {
 						method: res.method.clone(),
 					});
 				}
@@ -1931,6 +2165,20 @@ impl<'a> Lowerer<'a> {
 						// `offset_module`'s per-module offsetting), so every exit
 						// from here on is final; no need to keep scanning.
 						let iface_name: &Ident = &for_interface.0;
+						// An impl's own external member overrides an interface
+						// default exactly like an impl-owned Nymph body does. Check
+						// it before `resolve_impl_for_source`, which otherwise skips
+						// external members and falls back to the default body.
+						if let Some(marker) = members.iter().find_map(|m| match &m.0 {
+							ImplMember::ExternalFunc(_, marker, meta) if meta.name.0 == res.method => {
+								Some(marker)
+							}
+							_ => None,
+						}) {
+							let receiver_tag = inherent_self_type_tag(&type_.0, *mutable);
+							return nymph_hir::linkage::lookup(marker, receiver_tag.as_deref())
+								.map(RuntimeDispatch::LinkedExtern);
+						}
 						// The impl's own members first (mirrors `method_signature`'s
 						// preference order in `solve.rs`) — e.g. `Negate for int`'s
 						// own `negate`, or `Comparable for boolean`'s own
@@ -1944,39 +2192,16 @@ impl<'a> Lowerer<'a> {
 							generics.as_slice(),
 							&res.method,
 						) else {
-							// `external`/`external(name)` (no `ImplMember::Func`
-							// with a real body matched `res.method`) — Gap 3 (L2)
-							// extension: an `ImplFor` block's own `external(marker)`
-							// member (e.g. `Contains<Item=T> for #[T]`'s
-							// `external(contains) func contains(..)`, `Into<string>
-							// for #[T]`'s `external(to_string) func into(..)`) is just
-							// as linkable as an INHERENT `external` member — same
-							// registry, same receiver-tag disambiguation (`type_`/
-							// `mutable` are in scope here exactly like the
-							// `Declaration::Impl` arm below). Checked before falling
-							// through to "genuinely unmaterializable" so a linked
-							// interface-impl external doesn't panic loud forever.
-							let external_hit = members.iter().find_map(|m| match &m.0 {
-								ImplMember::ExternalFunc(_, marker, meta) if meta.name.0 == res.method => {
-									Some(marker)
-								}
-								_ => None,
-							});
-							if let Some(marker) = external_hit {
-								let receiver_tag = inherent_self_type_tag(&type_.0, *mutable);
-								return nymph_hir::linkage::lookup(marker, receiver_tag.as_deref())
-									.map(PreludeDispatch::LinkedExtern);
-							}
 							// The interface declares no default for it either (a
 							// `MethodSource` this compiler didn't expect for a
-							// concrete impl) — genuinely unmaterializable.
+							// concrete impl) — genuinely unlowerable.
 							return None;
 						};
 						if self.body_calls_unlinked_external(body) {
 							return None;
 						}
 						if let Some(tag) = inherent_self_type_tag(&type_.0, *mutable) {
-							return Some(self.finish_impl_for_materialization(
+							return Some(self.finish_runtime_impl_lowering(
 								&iface_name.0,
 								&tag,
 								members,
@@ -1989,7 +2214,7 @@ impl<'a> Lowerer<'a> {
 						}
 						// Not a primitive target — this slice's extension: a
 						// NAMED prelude enum (e.g. `impl<T> Unwrap<Output = T>
-						// for Option<T>`) materializes ONTO that enum's own
+						// for Option<T>`) lowers ONTO that enum's own
 						// class instead of a mangled top-level function. Guarded
 						// by `is_prelude_enum` (not just "is a bare
 						// `Type::Reference`") so a blanket impl's target (a
@@ -2038,11 +2263,11 @@ impl<'a> Lowerer<'a> {
 								// collection intrinsic (`list.push`/`get`/`length`/…,
 								// `map.get`/`insert`/`size`/…) lands here. Gap 3
 								// (L0/L1): if the marker IS in the linkage registry
-								// FOR THIS RECEIVER, it materializes as a
+								// FOR THIS RECEIVER, it lowers as a
 								// linked-external call instead of a loud defer — no
 								// JS binding is emitted for any OTHER `external`
 								// name/receiver pairing until it too gains a
-								// registry entry, so materializing a call to one of
+								// registry entry, so lowering a call to one of
 								// those would compile clean and throw at runtime.
 								// This IS the one place with both the marker AND the
 								// concrete receiver `type_` in scope, so it's the
@@ -2052,28 +2277,28 @@ impl<'a> Lowerer<'a> {
 								// `nymph_hir::linkage`'s own doc comment.
 								let receiver_tag = inherent_self_type_tag(&type_.0, *mutable);
 								return nymph_hir::linkage::lookup(marker, receiver_tag.as_deref())
-									.map(PreludeDispatch::LinkedExtern);
+									.map(RuntimeDispatch::LinkedExtern);
 							}
 						};
 						if let Some(tag) = inherent_self_type_tag(&type_.0, *mutable) {
 							let mangled: EcoString = format!("$std$${tag}${}", res.method).into();
-							if self.prelude_funcs_seen.borrow().contains(&mangled) {
-								return Some(PreludeDispatch::TopLevel(mangled));
+							if self.runtime_funcs_seen.borrow().contains(&mangled) {
+								return Some(RuntimeDispatch::TopLevel(mangled));
 							}
 							if self.body_calls_unlinked_external(body) {
 								// A real Nymph body that itself transitively calls an
 								// external instance method (e.g. `list`/`map`'s own
 								// `is_empty` calling `this.length()`/`this.size()`) is
-								// just as unmaterializable as if it were `external`
+								// just as unlowerable as if it were `external`
 								// itself — see `body_calls_unlinked_external`'s doc
 								// comment.
 								return None;
 							}
-							self.prelude_funcs_seen.borrow_mut().insert(mangled.clone());
+							self.runtime_funcs_seen.borrow_mut().insert(mangled.clone());
 							self
-								.pending_prelude_funcs
+								.runtime_func_demands
 								.borrow_mut()
-								.push(PendingPreludeFunc {
+								.push(RuntimeFuncDemand {
 									mangled: mangled.clone(),
 									owner_generics: generics.as_slice(),
 									meta,
@@ -2083,13 +2308,13 @@ impl<'a> Lowerer<'a> {
 									// routes correctly by span alone — no frame needed.
 									sibling_frame: None,
 								});
-							return Some(PreludeDispatch::TopLevel(mangled));
+							return Some(RuntimeDispatch::TopLevel(mangled));
 						}
 						// This slice's extension: a top-level inherent impl
 						// targeting a named prelude enum (e.g. `impl<T:
 						// Default> Option<T> { func unwrap_or_default() = .. }`,
 						// or convert.nym's `impl<T, E> Result<T, E> { func
-						// ok() = .. }`) materializes onto that enum's own
+						// ok() = .. }`) lowers onto that enum's own
 						// class, same as the `ImplFor` branch above.
 						if self.body_calls_unlinked_external(body) {
 							return None;
@@ -2109,7 +2334,7 @@ impl<'a> Lowerer<'a> {
 		}
 		// Gap 2: the span-scan above locates the exact `ImplFor`/`Impl` block a
 		// call resolves through only when `res.impl_span` names that block
-		// directly — which is true for the OUTER call to a materialized
+		// directly — which is true for the OUTER call to a lowered
 		// default (`for_interface`'s own span) and for any inherent-impl call
 		// (D1: a method's own name span IS its `impl_span`), but NOT for an
 		// INNER `this.<method>()` call written inside an interface default
@@ -2119,21 +2344,21 @@ impl<'a> Lowerer<'a> {
 		// inner call's `impl_span` always points at the interface's own name
 		// span — never at any concrete `impl .. for ..` block's span, no
 		// matter which concrete type the whole body is currently being
-		// materialized onto. `Lowerer::lower_prelude_func` pushes the OUTER
-		// materialization's own `(interface, tag, impl members/generics)`
-		// context onto `materializing_prelude_sibling` for exactly the body's
+		// lowered onto. `Lowerer::lower_runtime_func` pushes the OUTER
+		// lowering's own `(interface, tag, impl members/generics)`
+		// context onto `lowering_runtime_sibling` for exactly the body's
 		// lowering duration — fall back to that here, resolving the sibling
 		// directly against the SAME impl block the outer call already found,
 		// instead of failing. Gated on `this_receiver` (see this function's
 		// own doc comment) — a call through some OTHER expression that merely
 		// satisfies the same interface bound must NOT trust the frame's
 		// concrete tag. Empty (and this is skipped) everywhere else,
-		// including while materializing an inherent `Impl` body, which never
+		// including while lowering an inherent `Impl` body, which never
 		// pushes a frame in the first place (D1 needs none).
 		if !this_receiver {
 			return None;
 		}
-		let frame = self.materializing_prelude_sibling.borrow().last().map(|f| {
+		let frame = self.lowering_runtime_sibling.borrow().last().map(|f| {
 			(
 				f.iface_name.clone(),
 				f.tag.clone(),
@@ -2142,16 +2367,23 @@ impl<'a> Lowerer<'a> {
 			)
 		});
 		if let Some((iface_name, tag, members, impl_generics)) = frame {
+			if let Some(marker) = members.iter().find_map(|m| match &m.0 {
+				ImplMember::ExternalFunc(_, marker, meta) if meta.name.0 == res.method => Some(marker),
+				_ => None,
+			}) {
+				return nymph_hir::linkage::lookup(marker, Some(tag.as_str()))
+					.map(RuntimeDispatch::LinkedExtern);
+			}
 			let (owner_generics, meta, body) =
 				self.resolve_impl_for_source(&iface_name, members, impl_generics, &res.method)?;
 			if self.body_calls_unlinked_external(body) {
 				// A sibling that is itself external, or transitively calls an
 				// unlinked external, stays exactly as loud a defer as any
-				// other unmaterializable body (Gap 3 stays isolated) — never
-				// silently materialized.
+				// other unlowerable body (Gap 3 stays isolated) — never
+				// silently lowered.
 				return None;
 			}
-			return Some(self.finish_impl_for_materialization(
+			return Some(self.finish_runtime_impl_lowering(
 				&iface_name,
 				&tag,
 				members,
@@ -2168,13 +2400,13 @@ impl<'a> Lowerer<'a> {
 	/// Resolve `method` against an `ImplFor` block's own `members` first,
 	/// falling back to `iface_name`'s own interface-default body — exactly
 	/// `push_unoverridden_defaults`'s preference order. Shared by
-	/// `try_materialize_prelude_dispatch`'s `ImplFor` arm (the OUTER call) and
+	/// `try_lower_runtime_dispatch`'s `ImplFor` arm (the OUTER call) and
 	/// its Gap 2 sibling-frame fallback above (an INNER `this.<method>()`
-	/// call inside a materialized default body) so both resolve a method name
+	/// call inside a lowered default body) so both resolve a method name
 	/// against the identical impl the SAME way. Returns `None` for an
 	/// `external`/`external(name)` member (no `ImplMember::Func` with a real
 	/// body matched `method`) or when the interface declares no default for
-	/// it either — genuinely unmaterializable, same as before this slice.
+	/// it either — genuinely unlowerable, same as before this slice.
 	fn resolve_impl_for_source(
 		&self,
 		iface_name: &EcoString,
@@ -2212,12 +2444,12 @@ impl<'a> Lowerer<'a> {
 	}
 
 	/// Mangle `method` under the canonical `$std$<iface_name>$<tag>$<method>`
-	/// scheme, dedup via `prelude_funcs_seen`, and — unless already
-	/// seen/queued — enqueue `PendingPreludeFunc` (carrying a
-	/// `PreludeSiblingFrame` so `lower_prelude_func` can push Gap 2's own
+	/// scheme, dedup via `runtime_funcs_seen`, and — unless already
+	/// seen/queued — enqueue `RuntimeFuncDemand` (carrying a
+	/// `RuntimeSiblingFrame` so `lower_runtime_func` can push Gap 2's own
 	/// sibling-dispatch context while lowering IT), returning
-	/// `PreludeDispatch::TopLevel` either way. Shared by
-	/// `try_materialize_prelude_dispatch`'s `ImplFor` arm and Gap 2's
+	/// `RuntimeDispatch::TopLevel` either way. Shared by
+	/// `try_lower_runtime_dispatch`'s `ImplFor` arm and Gap 2's
 	/// sibling-frame fallback — both, by construction, only ever call this
 	/// AFTER `resolve_impl_for_source` + `body_calls_unlinked_external` have
 	/// already confirmed `meta`/`body` are real and external-free.
@@ -2226,11 +2458,11 @@ impl<'a> Lowerer<'a> {
 	// (and, before it, `members.rs`'s `commit_inherent`/`resolve_inherent`)
 	// for the identical reason: a single coherent operation whose parameters
 	// are each independently necessary (both mangling-scheme segments, the
-	// two DIFFERENT generic scopes `PendingPreludeFunc`/`PreludeSiblingFrame`
+	// two DIFFERENT generic scopes `RuntimeFuncDemand`/`RuntimeSiblingFrame`
 	// need, and the already-resolved `meta`/`body`), not a sign this should
 	// be split up.
 	#[allow(clippy::too_many_arguments)]
-	fn finish_impl_for_materialization(
+	fn finish_runtime_impl_lowering(
 		&self,
 		iface_name: &EcoString,
 		tag: &str,
@@ -2240,34 +2472,34 @@ impl<'a> Lowerer<'a> {
 		meta: &'a FuncDeclaration,
 		body: &'a Expr,
 		method: &EcoString,
-	) -> PreludeDispatch {
+	) -> RuntimeDispatch {
 		let mangled: EcoString = format!("$std${iface_name}${tag}${method}").into();
-		if self.prelude_funcs_seen.borrow().contains(&mangled) {
-			return PreludeDispatch::TopLevel(mangled);
+		if self.runtime_funcs_seen.borrow().contains(&mangled) {
+			return RuntimeDispatch::TopLevel(mangled);
 		}
-		self.prelude_funcs_seen.borrow_mut().insert(mangled.clone());
+		self.runtime_funcs_seen.borrow_mut().insert(mangled.clone());
 		self
-			.pending_prelude_funcs
+			.runtime_func_demands
 			.borrow_mut()
-			.push(PendingPreludeFunc {
+			.push(RuntimeFuncDemand {
 				mangled: mangled.clone(),
 				owner_generics,
 				meta,
 				body,
-				sibling_frame: Some(PreludeSiblingFrame {
+				sibling_frame: Some(RuntimeSiblingFrame {
 					iface_name: iface_name.clone(),
 					tag: tag.into(),
 					members,
 					impl_generics,
 				}),
 			});
-		PreludeDispatch::TopLevel(mangled)
+		RuntimeDispatch::TopLevel(mangled)
 	}
 
 	/// Whether `name` is a prelude ENUM's own declared name — used to gate
-	/// [`Self::try_materialize_prelude_dispatch`]'s named-type extension so it
-	/// only ever promises `PreludeDispatch::OntoClass` for a receiver this
-	/// compiler can actually materialize a class for (`materialize_prelude_enum`
+	/// [`Self::try_lower_runtime_dispatch`]'s named-type extension so it
+	/// only ever promises `RuntimeDispatch::OntoClass` for a receiver this
+	/// compiler can actually lower a class for (`lower_runtime_enum`
 	/// only ever handles `Declaration::Enum`; there is no prelude-STRUCT
 	/// equivalent). Also correctly excludes a blanket impl's target (a
 	/// `Type::Reference` naming the impl's OWN generic parameter) — a generic
@@ -2280,41 +2512,41 @@ impl<'a> Lowerer<'a> {
 		})
 	}
 
-	/// Record a materialization DEMAND for `method` onto prelude enum
-	/// `enum_name`'s class (`pending_prelude_enum_methods`) and return the
-	/// `PreludeDispatch::OntoClass` value every one of
-	/// [`Self::try_materialize_prelude_dispatch`]'s named-enum exits
+	/// Record a lowering DEMAND for `method` onto prelude enum
+	/// `enum_name`'s class (`runtime_enum_method_demands`) and return the
+	/// `RuntimeDispatch::OntoClass` value every one of
+	/// [`Self::try_lower_runtime_dispatch`]'s named-enum exits
 	/// constructs — centralizing the demand-recording here (rather than at
 	/// each of that function's three named-enum return sites, or at every
 	/// call site consuming its result) keeps "returning `OntoClass` always
 	/// means the demand is already recorded" a single invariant instead of a
 	/// convention every caller must remember.
-	fn demand_onto_class(&self, enum_name: EcoString, method: EcoString) -> PreludeDispatch {
+	fn demand_onto_class(&self, enum_name: EcoString, method: EcoString) -> RuntimeDispatch {
 		self
-			.pending_prelude_enum_methods
+			.runtime_enum_method_demands
 			.borrow_mut()
 			.entry(enum_name)
 			.or_default()
 			.insert(method.clone());
-		PreludeDispatch::OntoClass { method }
+		RuntimeDispatch::OntoClass { method }
 	}
 
-	/// While lowering a prelude enum's OWN method body — `materialize_prelude_enum`
-	/// bumped `materializing_onto_class` and pushed the enum's name onto
-	/// `current_materializing_enum` for the duration — an inner `this.method()`/
+	/// While lowering a prelude enum's OWN method body — `lower_runtime_enum`
+	/// bumped `lowering_onto_runtime_owner` and pushed the enum's name onto
+	/// `current_runtime_owner_lowering` for the duration — an inner `this.method()`/
 	/// `this as T`/`this op other` dispatch that falls through to the ordinary
-	/// class-method fast path (every `materializing_onto_class`-gated call site)
+	/// class-method fast path (every `lowering_onto_runtime_owner`-gated call site)
 	/// needs the SIBLING method's demand recorded too, so demand-only
-	/// `materialize_prelude_enum` knows to lower it (Sub-problem #1, inner
-	/// dispatch). A no-op when NOT currently materializing a prelude enum:
-	/// `push_unoverridden_defaults` materializing an interface default onto a
-	/// plain USER class leaves `current_materializing_enum` empty — that
-	/// class's methods are already fully, eagerly materialized, nothing to
+	/// `lower_runtime_enum` knows to lower it (Sub-problem #1, inner
+	/// dispatch). A no-op when NOT currently lowering a prelude enum:
+	/// `push_unoverridden_defaults` lowering an interface default onto a
+	/// plain USER class leaves `current_runtime_owner_lowering` empty — that
+	/// class's methods are already fully, eagerly lowered, nothing to
 	/// demand.
-	fn record_inner_prelude_demand(&self, method: &EcoString) {
-		if let Some(enum_name) = self.current_materializing_enum.borrow().last() {
+	fn record_inner_runtime_enum_method_demand(&self, method: &EcoString) {
+		if let Some(enum_name) = self.current_runtime_owner_lowering.borrow().last() {
 			self
-				.pending_prelude_enum_methods
+				.runtime_enum_method_demands
 				.borrow_mut()
 				.entry(enum_name.clone())
 				.or_default()
@@ -2323,8 +2555,8 @@ impl<'a> Lowerer<'a> {
 	}
 
 	/// Whether `body` — a candidate prelude impl/interface-default body
-	/// [`Self::try_materialize_prelude_dispatch`] is deciding whether to
-	/// materialize — itself calls an unlinked `external`/`external(name)`
+	/// [`Self::try_lower_runtime_dispatch`] is deciding whether to
+	/// lower — itself calls an unlinked `external`/`external(name)`
 	/// anywhere within it, either as a bare top-level function (e.g.
 	/// `Comparable for string`'s own `compare_to`, which calls the free
 	/// `external(compare_to_string) func compare_to_string(..)` declared at
@@ -2332,8 +2564,8 @@ impl<'a> Lowerer<'a> {
 	/// reached through `this`/a receiver (e.g. `stdlib/src/collections/
 	/// list.nym`'s `is_empty`, whose body is `this.length() == 0` and
 	/// `length` is itself `external(length)` in the SAME impl block — the
-	/// collections-materialization extension's addition, so a pure-Nymph body
-	/// one call deep from an intrinsic doesn't get materialized and then
+	/// collections-lowering extension's addition, so a pure-Nymph body
+	/// one call deep from an intrinsic doesn't get lowered and then
 	/// panic/throw mid-body instead of deferring cleanly here). Such a call
 	/// can never be emitted correctly by this lowering: an `external`
 	/// declaration is a checker-side intrinsic signature only — "stdlib
@@ -2346,14 +2578,14 @@ impl<'a> Lowerer<'a> {
 	/// throw a JS `ReferenceError` on the missing name at runtime — exactly
 	/// the silent-wrong-JS class of bug this compiler never accepts as a
 	/// substitute for a loud deferral (returning `false` here keeps
-	/// `try_materialize_prelude_dispatch` itself loud instead). Only
+	/// `try_lower_runtime_dispatch` itself loud instead). Only
 	/// `self.prelude_modules`' own top-level AND per-impl-member `external`
 	/// names are collected — the only ones a PRELUDE body could possibly
 	/// reach for un-qualified/through `this`; a user module never declares one
 	/// of its own into a prelude body's scope. Matching is by bare NAME, not
 	/// by receiver type (mirrors the pre-existing top-level-function
 	/// matching) — deliberately conservative: a false-positive-shaped name
-	/// collision only defers a MORE bodies loudly, never mis-materializes one.
+	/// collision only defers a MORE bodies loudly, never mis-lowers one.
 	///
 	/// Gap 3 (L0/L1) extension: a marker whose `external(MARKER)` is present
 	/// in [`nymph_hir::linkage::REGISTRY`] FOR THIS RECEIVER is skipped here —
@@ -2363,7 +2595,7 @@ impl<'a> Lowerer<'a> {
 	/// (`meta.name.0`) — they coincide for `length` today, but must not be
 	/// conflated in general (a future marker could differ from its method
 	/// name). The receiver tag matters here exactly as much as it does at the
-	/// `LinkedExtern` construction site (`try_materialize_prelude_dispatch`):
+	/// `LinkedExtern` construction site (`try_lower_runtime_dispatch`):
 	/// `map.nym`'s OWN `external(get)` must NOT be treated as linked just
 	/// because `list.nym`'s `get` is — a top-level `Declaration::ExternalFunc`
 	/// has no receiver at all (tag `None`, matching only an UNAMBIGUOUS
@@ -2412,12 +2644,12 @@ impl<'a> Lowerer<'a> {
 	/// into `methods_by_type` from top-level `impl <Name>`/`impl <Interface> for
 	/// <Name>` blocks, plus the type's own inner members (inherent `func`s,
 	/// `namespace func` statics, `mut func` methods) and its nested
-	/// `impl <Interface> { .. }` blocks, each materializing that interface's
+	/// `impl <Interface> { .. }` blocks, each lowering that interface's
 	/// un-overridden defaults, Slice 4C-b). Struct and enum bodies share the
 	/// identical `(members, impls)` AST shape, so this one path serves both
 	/// (Slice 4D, X2).
 	/// Returns `(instance methods, static/namespaced methods)`.
-	// `demand` (this slice, named-type prelude method materialization) is the
+	// `demand` (this slice, named-type prelude method lowering) is the
 	// 7th real parameter pushing this over clippy's default 7-argument
 	// threshold — mirrors the same `#[allow]` already on `members.rs`'s
 	// `commit_inherent`/`resolve_inherent` for the identical reason (a single
@@ -2447,12 +2679,12 @@ impl<'a> Lowerer<'a> {
 		// is checker-faithful for all three (it only lowers a `this` the body
 		// actually contains).
 		//
-		// `demand`, when `Some` (this slice, `materialize_prelude_enum` only —
+		// `demand`, when `Some` (this slice, `lower_runtime_enum` only —
 		// every OTHER caller passes `None`, meaning "lower every member
 		// eagerly", exactly the pre-existing behavior for a user-declared
 		// struct/enum), restricts this to DEMAND-ONLY lowering: skip any inline
-		// member not named in the demand set. See `pending_prelude_enum_methods`'s
-		// doc comment for why demand-only materialization is necessary at all
+		// member not named in the demand set. See `runtime_enum_method_demands`'s
+		// doc comment for why demand-only lowering is necessary at all
 		// (`Option`'s own `map_or_default`/`unwrap_or_default` have no
 		// compilable JS form and must not be lowered merely because `Option`
 		// itself was referenced).
@@ -2491,7 +2723,9 @@ impl<'a> Lowerer<'a> {
 				match &member.0 {
 					ImplMember::Func { meta, body, .. } => {
 						overridden.insert(meta.name.0.clone());
-						methods.push(self.lower_method(&combined, meta, body));
+						let method = self.lower_method(&combined, meta, body);
+						Self::push_protocol_impl_alias(&interface.0.0, &method, &mut methods);
+						methods.push(method);
 					}
 					other => panic!("slice-4b lowering does not yet handle impl member {other:?}"),
 				}
@@ -2499,7 +2733,7 @@ impl<'a> Lowerer<'a> {
 			self.push_unoverridden_defaults(&interface.0, &overridden, interfaces_by_name, &mut methods);
 		}
 		// V4: two interfaces (or an override and a same-named default)
-		// materializing the same method name on one type is a real ambiguity
+		// lowering the same method name on one type is a real ambiguity
 		// codegen cannot silently resolve (JS would just let the last one win) —
 		// panic loudly, naming the type and method.
 		self.assert_no_duplicate_methods(type_name, &methods);
@@ -2508,7 +2742,7 @@ impl<'a> Lowerer<'a> {
 	}
 
 	/// V4: panic loudly, naming the struct and the offending method, if two
-	/// materialized/overridden methods share a name on one class — two interfaces
+	/// lowered/overridden methods share a name on one class — two interfaces
 	/// both defaulting the same method name, an override colliding with the other
 	/// interface's default, or two overrides sharing a name. JS would let the last
 	/// one silently win; this compiler never miscompiles silently instead.
@@ -2582,7 +2816,7 @@ impl<'a> Lowerer<'a> {
 	/// the struct/enum's generics chained with a nested `impl Iface { .. }`
 	/// block's own (`collect_inner_impl`'s `combined`, iface.rs), a top-level
 	/// `impl<G> Type { .. }`/`impl<G> Iface for Type { .. }` block's own
-	/// generics, or an interface's own generics for a materialized default
+	/// generics, or an interface's own generics for a lowered default
 	/// body (`check_interface_default_body`'s `iface_generics`, members.rs).
 	/// Every caller must pass the SAME scope the checker used, or a namespaced
 	/// call through an owner-generic type parameter silently lowers to
@@ -2609,6 +2843,17 @@ impl<'a> Lowerer<'a> {
 			params,
 			body,
 		}
+	}
+
+	fn push_protocol_impl_alias(interface: &str, method: &HirMethod, out: &mut Vec<HirMethod>) {
+		let alias = match (interface, method.name.as_str()) {
+			("Display", "display") => "$nymph$display",
+			("Debug", "debug") => "$nymph$debug",
+			_ => return,
+		};
+		let mut protocol_method = method.clone();
+		protocol_method.name = alias.into();
+		out.push(protocol_method);
 	}
 
 	/// Lower a function/method body expression into the scope its params were
@@ -2732,8 +2977,8 @@ impl<'a> Lowerer<'a> {
 				// onto the stack (module-level funcs/classes/enums/top-level lets).
 				None => HirExpr::Local(self.resolve(&name.0)),
 			},
-			// While lowering a materialized prelude body as a top-level mangled
-			// function (stdlib body materialization slice, gap b), `this`
+			// While lowering a lowered prelude body as a top-level mangled
+			// function (stdlib body lowering slice, gap b), `this`
 			// substitutes to that function's own receiver param instead of the
 			// meaningless top-level `HirExpr::This` — see `this_sub`'s doc comment.
 			ExprKind::This => match self.this_sub.borrow().last() {
@@ -2791,7 +3036,7 @@ impl<'a> Lowerer<'a> {
 				// reads (`lower_operator`/`lower_prefix_op`) before trusting the method
 				// exists. `dispatch_kind_for_method_call` (`infer_expr.rs`) only ever
 				// tags a plain call `UserImplDefaultMethod` when the matched impl was
-				// cloned from an offset prelude module (never materialized by
+				// cloned from an offset prelude module (never lowered by
 				// `compile_with_prelude`, which lowers only the user's own AST) —
 				// unlike an operator, a still-generic (`GenericBound`) receiver is safe
 				// here (type erasure + duck typing: the emitted call needs only the
@@ -2803,25 +3048,25 @@ impl<'a> Lowerer<'a> {
 				else if let ExprKind::MemberAccess { parent, .. } = &func.kind
 					&& let Some(res) = self.annotations.resolution_of(expr.id)
 					&& res.dispatch == DispatchKind::UserImplDefaultMethod
-					// While materializing a default body ONTO A CONCRETE CLASS (gap
+					// While lowering a default body ONTO A CONCRETE CLASS (gap
 					// a), an inner `this.method(..)` call falls through to the
 					// ordinary `Field`+`Call` lowering below instead — see
-					// `materializing_onto_class`'s doc comment for why that's safe
+					// `lowering_onto_runtime_owner`'s doc comment for why that's safe
 					// and gap b's mangled-function path is the wrong shape here.
 					// Gated on the receiver actually BEING `this` (`is_this_receiver`)
 					// — a default body dispatching through its own non-`this`
 					// generic parameter (e.g. `other.plus(other)`) is NOT safe to
 					// treat as an ordinary class method call even while
-					// materializing onto a class, since that parameter may be bound
+					// lowering onto a class, since that parameter may be bound
 					// to a primitive with no such JS method at all.
-					&& self.materializing_onto_class.get() > 0
+					&& self.lowering_onto_runtime_owner.get() > 0
 					&& Self::is_this_receiver(parent)
 				{
-					// This slice: if we're additionally materializing a PRELUDE
+					// This slice: if we're additionally lowering a PRELUDE
 					// ENUM (not a plain user class), record a demand for the
-					// sibling method too — see `record_inner_prelude_demand`'s
+					// sibling method too — see `record_inner_runtime_enum_method_demand`'s
 					// doc comment.
-					self.record_inner_prelude_demand(&res.method);
+					self.record_inner_runtime_enum_method_demand(&res.method);
 					HirExpr::Call {
 						callee: Box::new(self.lower_expr(func)),
 						args: args.iter().map(|a| self.lower_expr(&a.0.value)).collect(),
@@ -2837,13 +3082,13 @@ impl<'a> Lowerer<'a> {
 					// is some concrete sub-expression (a field or parameter), NOT `this` —
 					// its type head is a type parameter (`S: Iterator`'s
 					// `this.source.next()`). There is no single concrete prelude impl to
-					// materialize, but none is needed: under type erasure the emitted JS is a
+					// lower, but none is needed: under type erasure the emitted JS is a
 					// plain `recv.method(args)` and the concrete object supplied at runtime
 					// carries the real method (duck typing) — exactly the "safe" case the
 					// operator-dispatch comment above describes. Emit the direct call rather
-					// than routing into the concrete-materialization path (which returns
+					// than routing into the concrete-lowering path (which returns
 					// `None` and panics). `this`-receivered sibling calls are EXCLUDED: while
-					// materializing a prelude default body onto a class or as a mangled
+					// lowering a prelude default body onto a class or as a mangled
 					// top-level function, `this` carries the synthetic `Self` param and must
 					// stay on the two branches around this one (they record the sibling
 					// demand / build the mangled call), not be short-circuited here.
@@ -2855,17 +3100,17 @@ impl<'a> Lowerer<'a> {
 					&& let Some(res) = self.annotations.resolution_of(expr.id)
 					&& res.dispatch == DispatchKind::UserImplDefaultMethod
 				{
-					// Stdlib body materialization slice, gap b: a prelude-origin
+					// Stdlib body lowering slice, gap b: a prelude-origin
 					// dispatch that lowers to real, self-contained Nymph code (not
 					// external/intrinsic, not a still-generic/blanket bound)
-					// rewrites to a call on the demand-materialized top-level
-					// mangled function (`PreludeDispatch::TopLevel`) or a plain
-					// method call on the demand-materialized named-enum class
-					// (`PreludeDispatch::OntoClass`, this slice) instead of
-					// panicking — see `try_materialize_prelude_dispatch`'s doc
+					// rewrites to a call on the demand-lowered top-level
+					// mangled function (`RuntimeDispatch::TopLevel`) or a plain
+					// method call on the demand-lowered named-enum class
+					// (`RuntimeDispatch::OntoClass`, this slice) instead of
+					// panicking — see `try_lower_runtime_dispatch`'s doc
 					// comment for exactly which bodies qualify.
-					match self.try_materialize_prelude_dispatch(res, Self::is_this_receiver(parent)) {
-						Some(PreludeDispatch::TopLevel(mangled)) => {
+					match self.try_lower_runtime_dispatch(res, Self::is_this_receiver(parent)) {
+						Some(RuntimeDispatch::TopLevel(mangled)) => {
 							let mut call_args = vec![self.lower_expr(parent)];
 							call_args.extend(args.iter().map(|a| self.lower_expr(&a.0.value)));
 							HirExpr::Call {
@@ -2873,15 +3118,15 @@ impl<'a> Lowerer<'a> {
 								args: call_args,
 							}
 						}
-						Some(PreludeDispatch::OntoClass { .. }) => HirExpr::Call {
+						Some(RuntimeDispatch::OntoClass { .. }) => HirExpr::Call {
 							callee: Box::new(self.lower_expr(func)),
 							args: args.iter().map(|a| self.lower_expr(&a.0.value)).collect(),
 						},
 						// Gap 3 (L0/L1): a call resolved through a LINKED external
 						// lowers to `HirExpr::ExternCall` instead of panicking —
-						// `$_this`-first, exactly the shape `PreludeDispatch::
+						// `$_this`-first, exactly the shape `RuntimeDispatch::
 						// TopLevel`'s mangled-call arm above already builds.
-						Some(PreludeDispatch::LinkedExtern(linked)) => {
+						Some(RuntimeDispatch::LinkedExtern(linked)) => {
 							let mut call_args = vec![self.lower_expr(parent)];
 							call_args.extend(args.iter().map(|a| self.lower_expr(&a.0.value)));
 							HirExpr::ExternCall {
@@ -2891,7 +3136,7 @@ impl<'a> Lowerer<'a> {
 							}
 						}
 						None => panic!(
-							"slice-stdlib-linkage lowering does not yet support dispatching a method call to a method resolved through a prelude-only impl (never materialized onto a class): `{}`",
+							"slice-stdlib-linkage lowering does not yet support dispatching a method call to a method resolved through a prelude-only impl (never lowered onto a class): `{}`",
 							res.method
 						),
 					}
@@ -3019,10 +3264,10 @@ impl<'a> Lowerer<'a> {
 				},
 				Some(res)
 					if res.dispatch == DispatchKind::UserImplDefaultMethod
-						&& self.materializing_onto_class.get() > 0
+						&& self.lowering_onto_runtime_owner.get() > 0
 						&& Self::is_this_receiver(lhs) =>
 				{
-					self.record_inner_prelude_demand(&res.method);
+					self.record_inner_runtime_enum_method_demand(&res.method);
 					HirExpr::Call {
 						callee: Box::new(HirExpr::Field {
 							recv: Box::new(self.lower_expr(lhs)),
@@ -3031,22 +3276,22 @@ impl<'a> Lowerer<'a> {
 						args: vec![],
 					}
 				}
-				// Stdlib body materialization slice: fixes a live silent-miscompile
+				// Stdlib body lowering slice: fixes a live silent-miscompile
 				// (`b as string` through the prelude's `Into for boolean` used to be
 				// misclassified `UserImpl` — see `check_cast`'s doc comment in
 				// `infer_expr.rs` — and compiled straight to `operand.into()`, a
 				// `TypeError` on a JS primitive with no such method). Now correctly
-				// tagged `UserImplDefaultMethod`; materialize the prelude `into` body
+				// tagged `UserImplDefaultMethod`; lower the prelude `into` body
 				// as a mangled top-level function, or a plain method call on a
-				// demand-materialized named-enum class (this slice), exactly like the
+				// demand-lowered named-enum class (this slice), exactly like the
 				// operator/method-call sites, or stay loud if it can't be.
 				Some(res) if res.dispatch == DispatchKind::UserImplDefaultMethod => {
-					match self.try_materialize_prelude_dispatch(res, Self::is_this_receiver(lhs)) {
-						Some(PreludeDispatch::TopLevel(mangled)) => HirExpr::Call {
+					match self.try_lower_runtime_dispatch(res, Self::is_this_receiver(lhs)) {
+						Some(RuntimeDispatch::TopLevel(mangled)) => HirExpr::Call {
 							callee: Box::new(HirExpr::Local(mangled)),
 							args: vec![self.lower_expr(lhs)],
 						},
-						Some(PreludeDispatch::OntoClass { method, .. }) => HirExpr::Call {
+						Some(RuntimeDispatch::OntoClass { method, .. }) => HirExpr::Call {
 							callee: Box::new(HirExpr::Field {
 								recv: Box::new(self.lower_expr(lhs)),
 								name: method,
@@ -3055,13 +3300,13 @@ impl<'a> Lowerer<'a> {
 						},
 						// Gap 3 (L0/L1): see the plain-method-call arm above for
 						// the same `LinkedExtern` shape.
-						Some(PreludeDispatch::LinkedExtern(linked)) => HirExpr::ExternCall {
+						Some(RuntimeDispatch::LinkedExtern(linked)) => HirExpr::ExternCall {
 							module: linked.module,
 							symbol: linked.symbol,
 							args: vec![self.lower_expr(lhs)],
 						},
 						None => panic!(
-							"slice-stdlib-linkage lowering does not yet support dispatching a cast to a method resolved through a prelude-only impl (never materialized anywhere): `{}`",
+							"slice-stdlib-linkage lowering does not yet support dispatching a cast to a method resolved through a prelude-only impl (never lowered anywhere): `{}`",
 							res.method
 						),
 					}
@@ -3223,7 +3468,7 @@ impl<'a> Lowerer<'a> {
 
 	/// Lower a checked `receiver[key]`: structural collections keep their
 	/// dedicated runtime operations, while custom `Index` implementations follow
-	/// the same dispatch/materialization paths as an explicit `.index(key)` call.
+	/// the same dispatch/lowering paths as an explicit `.index(key)` call.
 	fn lower_index_access(&self, id: nymph_ast::NodeId, parent: &Expr, index: &Expr) -> HirExpr {
 		let recv_ty = self
 			.annotations
@@ -3248,10 +3493,10 @@ impl<'a> Lowerer<'a> {
 				},
 				Some(res)
 					if res.dispatch == DispatchKind::UserImplDefaultMethod
-						&& self.materializing_onto_class.get() > 0
+						&& self.lowering_onto_runtime_owner.get() > 0
 						&& Self::is_this_receiver(parent) =>
 				{
-					self.record_inner_prelude_demand(&res.method);
+					self.record_inner_runtime_enum_method_demand(&res.method);
 					HirExpr::Call {
 						callee: Box::new(HirExpr::Field {
 							recv: Box::new(self.lower_expr(parent)),
@@ -3263,8 +3508,7 @@ impl<'a> Lowerer<'a> {
 				Some(res)
 					if res.dispatch == DispatchKind::UserImplDefaultMethod
 						&& !Self::is_this_receiver(parent)
-						&& self.receiver_is_still_generic(parent)
-						&& !self.method_is_externally_backed_in_prelude(&res.method) =>
+						&& self.receiver_is_still_generic(parent) =>
 				{
 					HirExpr::Call {
 						callee: Box::new(HirExpr::Field {
@@ -3275,19 +3519,19 @@ impl<'a> Lowerer<'a> {
 					}
 				}
 				Some(res) if res.dispatch == DispatchKind::UserImplDefaultMethod => {
-					match self.try_materialize_prelude_dispatch(res, Self::is_this_receiver(parent)) {
-						Some(PreludeDispatch::TopLevel(mangled)) => HirExpr::Call {
+					match self.try_lower_runtime_dispatch(res, Self::is_this_receiver(parent)) {
+						Some(RuntimeDispatch::TopLevel(mangled)) => HirExpr::Call {
 							callee: Box::new(HirExpr::Local(mangled)),
 							args: vec![self.lower_expr(parent), self.lower_expr(index)],
 						},
-						Some(PreludeDispatch::OntoClass { method, .. }) => HirExpr::Call {
+						Some(RuntimeDispatch::OntoClass { method, .. }) => HirExpr::Call {
 							callee: Box::new(HirExpr::Field {
 								recv: Box::new(self.lower_expr(parent)),
 								name: method,
 							}),
 							args: vec![self.lower_expr(index)],
 						},
-						Some(PreludeDispatch::LinkedExtern(linked)) => HirExpr::ExternCall {
+						Some(RuntimeDispatch::LinkedExtern(linked)) => HirExpr::ExternCall {
 							module: linked.module,
 							symbol: linked.symbol,
 							args: vec![self.lower_expr(parent), self.lower_expr(index)],
@@ -3310,60 +3554,46 @@ impl<'a> Lowerer<'a> {
 	/// Lower a string literal's parts (Slice 4H, BB1). Contiguous `Text`/
 	/// `EscapeSequence` runs cook into one `HirExpr::Str` segment (via
 	/// `push_cooked_escape`); each `InterpolatedExpr` boundary flushes the
-	/// pending buffer and lowers the interpoland normally (it's bound/annotated
-	/// like any other subexpression). Segments join left-associatively with JS
-	/// `+` (`BinOp::Add`). An all-text (or empty) string collapses to a single
-	/// `Str`. If the very FIRST part is an interpolation, an empty `Str("")` is
-	/// prepended so the chain always starts by concatenating onto a JS string —
-	/// forcing string coercion of a non-string interpoland (e.g. an `int`) even
-	/// when there's no literal text before it to anchor the `+` chain.
+	/// pending buffer and lowers the interpoland through the Display intrinsic.
+	/// Codegen unwraps each resulting NString, concatenates raw JS strings, and
+	/// boxes the completed interpolation exactly once.
 	fn lower_string_expr(&self, parts: &[Spanned<nymph_ast::expr::StringPart>]) -> HirExpr {
 		use nymph_ast::expr::StringPart;
 
-		let mut acc: Option<HirExpr> = None;
+		let mut segments = Vec::new();
 		let mut buf = EcoString::new();
-		let append = |acc: &mut Option<HirExpr>, expr: HirExpr| {
-			*acc = Some(match acc.take() {
-				None => expr,
-				Some(lhs) => HirExpr::Binary {
-					op: BinOp::Add,
-					result: BuiltinResult::Raw,
-					lhs: Box::new(lhs),
-					rhs: Box::new(expr),
-				},
-			});
-		};
+		let mut interpolated = false;
 		for part in parts {
 			match &part.0 {
 				StringPart::Text(t) => buf.push_str(t),
 				StringPart::EscapeSequence(esc) => push_cooked_escape(&mut buf, *esc),
 				StringPart::InterpolatedExpr(e) => {
-					if acc.is_none() && buf.is_empty() {
-						// The very first part is an interpolation: prepend `""` for
-						// coercion (see doc comment above).
-						append(&mut acc, HirExpr::Str(EcoString::new()));
-					} else if !buf.is_empty() {
-						append(&mut acc, HirExpr::Str(std::mem::take(&mut buf)));
+					interpolated = true;
+					if !buf.is_empty() {
+						segments.push(HirExpr::Str(std::mem::take(&mut buf)));
 					}
-					append(&mut acc, self.lower_expr(e));
+					segments.push(HirExpr::ExternCall {
+						module: "std/display",
+						symbol: "display",
+						args: vec![self.lower_expr(e)],
+					});
 				}
 			}
 		}
-		if !buf.is_empty() || acc.is_none() {
-			append(&mut acc, HirExpr::Str(buf));
+		if !interpolated {
+			return HirExpr::Str(buf);
 		}
-		acc.expect("slice-4h lowering: string literal must lower to at least one segment")
+		if !buf.is_empty() {
+			segments.push(HirExpr::Str(buf));
+		}
+		HirExpr::InterpolatedString(segments)
 	}
 
-	/// Desugar `for (<pat> in <src>) <body>` (SLICE: iterator for-loops).
-	/// Dispatches ranges separately, then routes every ordinary collection
-	/// through the iteration protocols selected by the checker.
+	/// Desugar `for (<pat> in <src>) <body>` through the iterator protocol.
+	/// Syntactic ranges are lowered as `NymphRange`; other collections use
+	/// the protocol selected by the checker.
 	///
-	/// - a SYNTACTIC range literal (`iterable.kind` is `ExprKind::Range`) keeps
-	///   the original counting-`while` fast path (`lower_for_range`, Slice 4H,
-	///   BB2), UNCHANGED — it's faster than the general protocol and the
-	///   checker never routes a range through the interfaces at all;
-	/// - anything else desugars to the `Iterator`/`Iterable` protocol
+	/// Ordinary collections desugar through `Iterator`/`Iterable`
 	///   (`lower_for_protocol`), reading back which of the two the checker
 	///   matched (`IterMode`, recorded on `iterable`'s own node id by
 	///   `resolve_iterable_source`).
@@ -3374,45 +3604,18 @@ impl<'a> Lowerer<'a> {
 		body: &Expr,
 	) -> HirExpr {
 		if let ExprKind::Range(kind) = &iterable.kind {
-			return self.lower_for_range(variable, kind, body);
+			return self.lower_for_range_protocol(variable, kind, body);
 		}
 		self.lower_for_protocol(variable, iterable, body)
 	}
 
-	/// Desugar `for (<pat> in <range>) <body>` into a `Block` running a `while`
-	/// loop over an explicit induction variable (Slice 4H, BB2). Only a plain
-	/// binding loop pattern and an `Exclusive`/`Inclusive` range source are
-	/// supported — everything else panics loudly rather than silently
-	/// miscompiling (a start-less `To`/`ToInclusive` source has no minimum to
-	/// start from; an unbounded `From` source has no maximum to stop at, and
-	/// nothing lowers `break` yet to ever escape it).
-	///
-	/// The checker's iterable special-case (`infer_iterable_element`) matches
-	/// `iterable.kind` directly against `ExprKind::Range` and returns before
-	/// `infer` ever runs on that node itself — so it carries no annotation
-	/// entry. This mirrors that exactly: the range's own `min`/`max`
-	/// subexpressions are individually bound/annotated as normal and lower via
-	/// `lower_expr`, but the `Range` node itself is destructured from
-	/// `iterable.kind` directly, never passed to `lower_expr` (which would hit
-	/// the loud value-position panic above).
-	///
-	/// `max` is hoisted into its own temp and evaluated exactly once, up front —
-	/// otherwise a call-bound source like `for (i in 0..limit())` would
-	/// re-evaluate `limit()` on every loop condition check.
-	fn lower_for_range(
+	fn lower_for_range_protocol(
 		&self,
 		variable: &Spanned<nymph_ast::expr::Pattern>,
 		kind: &nymph_ast::expr::RangeKind,
 		body: &Expr,
 	) -> HirExpr {
-		use nymph_ast::expr::{Pattern, RangeKind};
-
-		let name = match &variable.0 {
-			Pattern::Binding { name, inner } if matches!(inner.0, Pattern::Placeholder) => &name.0,
-			other => {
-				panic!("slice-4h lowering only supports a plain-binding for-loop pattern, got {other:?}")
-			}
-		};
+		use nymph_ast::expr::RangeKind;
 		let (min, max, inclusive) = match kind {
 			RangeKind::Exclusive { min, max } => (min, max, false),
 			RangeKind::Inclusive { min, max } => (min, max, true),
@@ -3423,102 +3626,34 @@ impl<'a> Lowerer<'a> {
 				panic!("slice-4h lowering does not support a start-less range as a for-loop source")
 			}
 		};
-		// The induction-variable desugar below increments with `$i + 1` and tests
-		// with `$i < $max` / `$i <= $max`, which are only correct for a numeric
-		// (int/float) element type. The checker's `infer_range_element` unifies
-		// `min`/`max` against a fresh, otherwise-unconstrained type variable — it
-		// accepts ANY element type as long as both bounds agree (e.g. a `char`
-		// range type-checks with zero diagnostics). A non-numeric element (char,
-		// string, struct, boolean, …) would silently miscompile: `$i + 1` becomes
-		// JS string concatenation for a char/string bound, so the loop condition
-		// can stay true forever. Panic loudly instead of ever emitting that.
-		//
-		// `min` may be wrapped in one or more `ExprKind::Grouped` layers (a
-		// parenthesized bound, e.g. `for (i in (1)..5)`). The checker's `check()`
-		// recurses through `Grouped` without ever recording an annotation for the
-		// `Grouped` node's own id, so looking the annotation up on `min` directly
-		// would see `None` for a parenthesized bound and panic on an otherwise
-		// perfectly valid program. Peel through to the innermost expression first.
 		let min_unwrapped = Self::peel_grouped(min);
-		let elem_is_numeric = self.annotations.get(min_unwrapped.id).is_some_and(|info| {
+		let integer = self.annotations.get(min_unwrapped.id).is_some_and(|info| {
 			matches!(
 				self.interner.kind(Self::peel_mut(self.interner, info.ty)),
-				TyKind::Int | TyKind::UInt | TyKind::Float
+				TyKind::Int | TyKind::UInt
 			)
 		});
-		if !elem_is_numeric {
-			panic!(
-				"slice-4h lowering only supports a numeric (int/float) range as a for-loop source, got element type {:?}",
-				self.annotations.get(min_unwrapped.id).map(|info| self
-					.interner
-					.kind(Self::peel_mut(self.interner, info.ty))
-					.clone())
-			);
-		}
-
-		let min = self.lower_expr(min);
-		let max = self.lower_expr(max);
-
-		// The whole for-loop is one JS scope, holding the induction variable and
-		// the hoisted upper bound.
-		self.push_scope();
-		let i_name = self.declare(&EcoString::from("$i"));
-		let max_name = self.declare(&EcoString::from("$max"));
-
-		// The per-iteration body gets its own nested scope: the pattern binding
-		// plus the (already scoped, via `lower_branch`) lowered body.
-		self.push_scope();
-		let pat_name = self.declare(name);
-		let body = self.lower_branch(body);
-		self.pop_scope();
-
-		let while_body = HirExpr::Block {
-			stmts: vec![
-				HirStmt::Let {
-					name: pat_name,
-					mutable: false,
-					value: HirExpr::Local(i_name.clone()),
-				},
-				HirStmt::Expr(body),
-				HirStmt::Expr(HirExpr::Assign {
-					target: Box::new(HirExpr::Local(i_name.clone())),
-					value: Box::new(HirExpr::Binary {
-						op: BinOp::Add,
-						result: BuiltinResult::Raw,
-						lhs: Box::new(HirExpr::Local(i_name.clone())),
-						rhs: Box::new(HirExpr::Num(1.0, NumKind::Raw)),
-					}),
-				}),
+		assert!(
+			integer,
+			"range lowering only supports `int` and `uint` bounds"
+		);
+		let source = HirExpr::New {
+			class: "NymphRange".into(),
+			fields: vec![
+				("start".into(), self.lower_expr(min)),
+				("end".into(), self.lower_expr(max)),
+				("inclusive".into(), HirExpr::Bool(inclusive)),
 			],
-			tail: None,
 		};
-		let while_expr = HirExpr::While {
-			cond: Box::new(HirExpr::Binary {
-				op: if inclusive { BinOp::Le } else { BinOp::Lt },
-				result: BuiltinResult::Raw,
-				lhs: Box::new(HirExpr::Local(i_name.clone())),
-				rhs: Box::new(HirExpr::Local(max_name.clone())),
-			}),
-			body: Box::new(while_body),
-		};
+		let it_value = Self::it_value_for(IterMode::ViaIter, source);
+		self.push_scope();
+		let stmts = self.drain_loop_stmts(it_value, |s| {
+			let pat = s.lower_pattern(variable);
+			let body = s.lower_branch(body);
+			(pat, body)
+		});
 		self.pop_scope();
-
-		HirExpr::Block {
-			stmts: vec![
-				HirStmt::Let {
-					name: i_name,
-					mutable: true,
-					value: min,
-				},
-				HirStmt::Let {
-					name: max_name,
-					mutable: false,
-					value: max,
-				},
-				HirStmt::Expr(while_expr),
-			],
-			tail: None,
-		}
+		HirExpr::Block { stmts, tail: None }
 	}
 
 	/// The general `Iterator`/`Iterable` protocol desugar (RR1/RR2): every
@@ -3539,16 +3674,14 @@ impl<'a> Lowerer<'a> {
 	/// }
 	/// ```
 	///
-	/// Unlike `lower_for_range` (which binds the loop pattern through a HIR `Let`,
-	/// so only a plain binding is supported — `Let` binds a
-	/// single name only), the loop pattern here is a genuine `match` arm
+	/// The loop pattern is a genuine `match` arm
 	/// pattern (`HirPat`, via the ordinary `lower_pattern`), so ANY pattern
 	/// shape the language supports is legal in this position, same as any other
 	/// `match` arm.
 	///
 	/// `.iter()`/`.next()` are ordinary `HirExpr::Call { callee: Field, args: [] }`
 	/// nodes — for a user ADT source these compile straight to real emitted
-	/// class methods (`recv.iter()` / `$it.next()`), no prelude-materialization
+	/// class methods (`recv.iter()` / `$it.next()`), no prelude-lowering
 	/// hook needed, the same way any other user method call already lowers.
 	fn lower_for_protocol(
 		&self,
@@ -3887,17 +4020,17 @@ impl<'a> Lowerer<'a> {
 	}
 
 	/// Whether `e` (after peeling any parens) is literally `this` — the ONLY
-	/// receiver shape for which `materializing_onto_class`'s fast path (an
+	/// receiver shape for which `lowering_onto_runtime_owner`'s fast path (an
 	/// ordinary `<recv>.method(args)` JS call, bypassing
-	/// `try_materialize_prelude_dispatch`/loud-panic entirely) is sound. See
-	/// `materializing_onto_class`'s own doc comment: it is nonzero for the
+	/// `try_lower_runtime_dispatch`/loud-panic entirely) is sound. See
+	/// `lowering_onto_runtime_owner`'s own doc comment: it is nonzero for the
 	/// FULL duration of lowering one interface default body onto a concrete
 	/// class, and that body's dispatches are safe to treat as "this method
 	/// exists on the class" only when the receiver actually IS `this` — a
 	/// default body dispatching through its OWN other generic parameter
 	/// (`Comparable<Other>`'s `Other`, say) is a completely different
 	/// receiver that may be bound to a primitive with no such JS method at
-	/// all, and must fall through to the same materialize-or-panic handling
+	/// all, and must fall through to the same lower-or-panic handling
 	/// gap (b) already applies everywhere else.
 	fn is_this_receiver(e: &Expr) -> bool {
 		matches!(Self::peel_grouped(e).kind, ExprKind::This)
@@ -4003,10 +4136,10 @@ impl<'a> Lowerer<'a> {
 					},
 					Some(res)
 						if res.dispatch == DispatchKind::UserImplDefaultMethod
-							&& self.materializing_onto_class.get() > 0
+							&& self.lowering_onto_runtime_owner.get() > 0
 							&& Self::is_this_receiver(rhs) =>
 					{
-						self.record_inner_prelude_demand(&res.method);
+						self.record_inner_runtime_enum_method_demand(&res.method);
 						HirExpr::Call {
 							callee: Box::new(HirExpr::Field {
 								recv: Box::new(self.lower_expr(rhs)),
@@ -4016,12 +4149,12 @@ impl<'a> Lowerer<'a> {
 						}
 					}
 					Some(res) if res.dispatch == DispatchKind::UserImplDefaultMethod => {
-						match self.try_materialize_prelude_dispatch(res, Self::is_this_receiver(rhs)) {
-							Some(PreludeDispatch::TopLevel(mangled)) => HirExpr::Call {
+						match self.try_lower_runtime_dispatch(res, Self::is_this_receiver(rhs)) {
+							Some(RuntimeDispatch::TopLevel(mangled)) => HirExpr::Call {
 								callee: Box::new(HirExpr::Local(mangled)),
 								args: vec![self.lower_expr(rhs), self.lower_expr(lhs)],
 							},
-							Some(PreludeDispatch::OntoClass { method, .. }) => HirExpr::Call {
+							Some(RuntimeDispatch::OntoClass { method, .. }) => HirExpr::Call {
 								callee: Box::new(HirExpr::Field {
 									recv: Box::new(self.lower_expr(rhs)),
 									name: method,
@@ -4029,9 +4162,9 @@ impl<'a> Lowerer<'a> {
 								args: vec![self.lower_expr(lhs)],
 							},
 							// Gap 3 (L0/L1): `in`/`!in`'s receiver is `rhs` (the
-							// collection); mirrors `PreludeDispatch::TopLevel`'s
+							// collection); mirrors `RuntimeDispatch::TopLevel`'s
 							// arg order above.
-							Some(PreludeDispatch::LinkedExtern(linked)) => HirExpr::ExternCall {
+							Some(RuntimeDispatch::LinkedExtern(linked)) => HirExpr::ExternCall {
 								module: linked.module,
 								symbol: linked.symbol,
 								args: vec![self.lower_expr(rhs), self.lower_expr(lhs)],
@@ -4065,10 +4198,10 @@ impl<'a> Lowerer<'a> {
 					},
 					Some(res)
 						if res.dispatch == DispatchKind::UserImplDefaultMethod
-							&& self.materializing_onto_class.get() > 0
+							&& self.lowering_onto_runtime_owner.get() > 0
 							&& Self::is_this_receiver(lhs) =>
 					{
-						self.record_inner_prelude_demand(&res.method);
+						self.record_inner_runtime_enum_method_demand(&res.method);
 						HirExpr::Call {
 							callee: Box::new(HirExpr::Field {
 								recv: Box::new(self.lower_expr(lhs)),
@@ -4078,12 +4211,12 @@ impl<'a> Lowerer<'a> {
 						}
 					}
 					Some(res) if res.dispatch == DispatchKind::UserImplDefaultMethod => {
-						match self.try_materialize_prelude_dispatch(res, Self::is_this_receiver(lhs)) {
-							Some(PreludeDispatch::TopLevel(mangled)) => HirExpr::Call {
+						match self.try_lower_runtime_dispatch(res, Self::is_this_receiver(lhs)) {
+							Some(RuntimeDispatch::TopLevel(mangled)) => HirExpr::Call {
 								callee: Box::new(HirExpr::Local(mangled)),
 								args: vec![self.lower_expr(lhs), self.lower_expr(rhs)],
 							},
-							Some(PreludeDispatch::OntoClass { method, .. }) => HirExpr::Call {
+							Some(RuntimeDispatch::OntoClass { method, .. }) => HirExpr::Call {
 								callee: Box::new(HirExpr::Field {
 									recv: Box::new(self.lower_expr(lhs)),
 									name: method,
@@ -4091,8 +4224,8 @@ impl<'a> Lowerer<'a> {
 								args: vec![self.lower_expr(rhs)],
 							},
 							// Gap 3 (L0/L1): `??`'s receiver is `lhs`; mirrors
-							// `PreludeDispatch::TopLevel`'s arg order above.
-							Some(PreludeDispatch::LinkedExtern(linked)) => HirExpr::ExternCall {
+							// `RuntimeDispatch::TopLevel`'s arg order above.
+							Some(RuntimeDispatch::LinkedExtern(linked)) => HirExpr::ExternCall {
 								module: linked.module,
 								symbol: linked.symbol,
 								args: vec![self.lower_expr(lhs), self.lower_expr(rhs)],
@@ -4124,7 +4257,7 @@ impl<'a> Lowerer<'a> {
 	/// operator for it); `UserImpl` dispatches to a method call on the lhs
 	/// (`lhs.method(rhs)`, mirroring how method calls elsewhere in this file lower
 	/// to `Call { callee: Field { .. }, .. }`). `UserImplDefaultMethod` and a missing
-	/// resolution both panic loudly — codegen cannot yet materialize interface
+	/// resolution both panic loudly — codegen cannot yet lower interface
 	/// default methods, and an unresolved node is a checker bug we want to see
 	/// immediately rather than silently miscompile. `missing_resolution_msg` lets
 	/// each call site name its own AST shape in that last panic.
@@ -4159,10 +4292,10 @@ impl<'a> Lowerer<'a> {
 			},
 			Some(res)
 				if res.dispatch == DispatchKind::UserImplDefaultMethod
-					&& self.materializing_onto_class.get() > 0
+					&& self.lowering_onto_runtime_owner.get() > 0
 					&& Self::is_this_receiver(lhs) =>
 			{
-				self.record_inner_prelude_demand(&res.method);
+				self.record_inner_runtime_enum_method_demand(&res.method);
 				HirExpr::Call {
 					callee: Box::new(HirExpr::Field {
 						recv: Box::new(self.lower_expr(lhs)),
@@ -4171,15 +4304,44 @@ impl<'a> Lowerer<'a> {
 					args: vec![self.lower_expr(rhs)],
 				}
 			}
-			// Stdlib body materialization slice, gap b: see
-			// `try_materialize_prelude_dispatch`'s doc comment.
+			Some(res)
+				if res.dispatch == DispatchKind::UserImplDefaultMethod
+					&& self.receiver_is_still_generic(lhs) =>
+			{
+				self.lower_bound_dispatch(res, lhs, rhs).unwrap_or_else(|| {
+					match self.try_lower_runtime_dispatch(res, false) {
+						Some(RuntimeDispatch::TopLevel(name)) => HirExpr::Call {
+							callee: Box::new(HirExpr::Local(name)),
+							args: vec![self.lower_expr(lhs), self.lower_expr(rhs)],
+						},
+						Some(RuntimeDispatch::LinkedExtern(linked)) => HirExpr::ExternCall {
+							module: linked.module,
+							symbol: linked.symbol,
+							args: vec![self.lower_expr(lhs), self.lower_expr(rhs)],
+						},
+						Some(RuntimeDispatch::OntoClass { method, .. }) => HirExpr::Call {
+							callee: Box::new(HirExpr::Field {
+								recv: Box::new(self.lower_expr(lhs)),
+								name: method,
+							}),
+							args: vec![self.lower_expr(rhs)],
+						},
+						None => panic!(
+							"lowering does not yet dispatch operator to interface default method `{}`",
+							res.method
+						),
+					}
+				})
+			}
+			// Stdlib body lowering slice, gap b: see
+			// `try_lower_runtime_dispatch`'s doc comment.
 			Some(res) if res.dispatch == DispatchKind::UserImplDefaultMethod => {
-				match self.try_materialize_prelude_dispatch(res, Self::is_this_receiver(lhs)) {
-					Some(PreludeDispatch::TopLevel(mangled)) => HirExpr::Call {
+				match self.try_lower_runtime_dispatch(res, Self::is_this_receiver(lhs)) {
+					Some(RuntimeDispatch::TopLevel(mangled)) => HirExpr::Call {
 						callee: Box::new(HirExpr::Local(mangled)),
 						args: vec![self.lower_expr(lhs), self.lower_expr(rhs)],
 					},
-					Some(PreludeDispatch::OntoClass { method, .. }) => HirExpr::Call {
+					Some(RuntimeDispatch::OntoClass { method, .. }) => HirExpr::Call {
 						callee: Box::new(HirExpr::Field {
 							recv: Box::new(self.lower_expr(lhs)),
 							name: method,
@@ -4187,8 +4349,8 @@ impl<'a> Lowerer<'a> {
 						args: vec![self.lower_expr(rhs)],
 					},
 					// Gap 3 (L0/L1): binary operator receiver is `lhs`; mirrors
-					// `PreludeDispatch::TopLevel`'s arg order above.
-					Some(PreludeDispatch::LinkedExtern(linked)) => HirExpr::ExternCall {
+					// `RuntimeDispatch::TopLevel`'s arg order above.
+					Some(RuntimeDispatch::LinkedExtern(linked)) => HirExpr::ExternCall {
 						module: linked.module,
 						symbol: linked.symbol,
 						args: vec![self.lower_expr(lhs), self.lower_expr(rhs)],
@@ -4218,7 +4380,7 @@ impl<'a> Lowerer<'a> {
 	/// `UserImplDefaultMethod`, `BuiltinShortCircuit` (never produced for a unary
 	/// operator — `&&`/`||` are the only short-circuiting operators and both are
 	/// binary), and a missing resolution all panic loudly — codegen cannot yet
-	/// materialize interface default methods, and an unresolved node is a checker
+	/// lower interface default methods, and an unresolved node is a checker
 	/// bug we want to see immediately rather than silently miscompile.
 	fn lower_prefix_op(&self, id: nymph_ast::NodeId, op: PrefixOperator, value: &Expr) -> HirExpr {
 		match self.annotations.resolution_of(id) {
@@ -4236,10 +4398,10 @@ impl<'a> Lowerer<'a> {
 			},
 			Some(res)
 				if res.dispatch == DispatchKind::UserImplDefaultMethod
-					&& self.materializing_onto_class.get() > 0
+					&& self.lowering_onto_runtime_owner.get() > 0
 					&& Self::is_this_receiver(value) =>
 			{
-				self.record_inner_prelude_demand(&res.method);
+				self.record_inner_runtime_enum_method_demand(&res.method);
 				HirExpr::Call {
 					callee: Box::new(HirExpr::Field {
 						recv: Box::new(self.lower_expr(value)),
@@ -4252,15 +4414,15 @@ impl<'a> Lowerer<'a> {
 				"slice-4c lowering: BuiltinShortCircuit is unreachable for a prefix operator (method {})",
 				res.method
 			),
-			// Stdlib body materialization slice, gap b: see
-			// `try_materialize_prelude_dispatch`'s doc comment.
+			// Stdlib body lowering slice, gap b: see
+			// `try_lower_runtime_dispatch`'s doc comment.
 			Some(res) if res.dispatch == DispatchKind::UserImplDefaultMethod => {
-				match self.try_materialize_prelude_dispatch(res, Self::is_this_receiver(value)) {
-					Some(PreludeDispatch::TopLevel(mangled)) => HirExpr::Call {
+				match self.try_lower_runtime_dispatch(res, Self::is_this_receiver(value)) {
+					Some(RuntimeDispatch::TopLevel(mangled)) => HirExpr::Call {
 						callee: Box::new(HirExpr::Local(mangled)),
 						args: vec![self.lower_expr(value)],
 					},
-					Some(PreludeDispatch::OntoClass { method, .. }) => HirExpr::Call {
+					Some(RuntimeDispatch::OntoClass { method, .. }) => HirExpr::Call {
 						callee: Box::new(HirExpr::Field {
 							recv: Box::new(self.lower_expr(value)),
 							name: method,
@@ -4269,7 +4431,7 @@ impl<'a> Lowerer<'a> {
 					},
 					// Gap 3 (L0/L1): a prefix operator's receiver is `value`, no
 					// extra args.
-					Some(PreludeDispatch::LinkedExtern(linked)) => HirExpr::ExternCall {
+					Some(RuntimeDispatch::LinkedExtern(linked)) => HirExpr::ExternCall {
 						module: linked.module,
 						symbol: linked.symbol,
 						args: vec![self.lower_expr(value)],
@@ -4571,12 +4733,12 @@ impl<'a> Lowerer<'a> {
 	/// mirroring `infer_variant_ctor`/`check_ctor_args`'s own "by label when
 	/// present else positionally" semantics (`infer_expr.rs`), which a
 	/// zero-diagnostic program is fully entitled to have used. This slice
-	/// (named-type prelude method materialization) needs it: convert.nym's
+	/// (named-type prelude method lowering) needs it: convert.nym's
 	/// `ok`/`err` (`impl<T, E> Result<T, E> { .. }`) build `Option.Some(value)`
 	/// positionally, unreachable before this slice (their enclosing methods
 	/// panicked at dispatch, never lowering the body at all) — 2C's original
 	/// "labeled fields only" restriction is otherwise unrelated to this slice's
-	/// prelude-materialization machinery, but blocks its `Result.ok()`/`.err()`
+	/// prelude-lowering machinery, but blocks its `Result.ok()`/`.err()`
 	/// payoff outright without this fix.
 	fn variant_new(
 		&self,
@@ -4802,6 +4964,11 @@ fn collect_locals(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 		| HirExpr::Char(_)
 		| HirExpr::This
 		| HirExpr::VariantRef { .. } => {}
+		HirExpr::InterpolatedString(segments) => {
+			for segment in segments {
+				collect_locals(segment, out);
+			}
+		}
 		HirExpr::Call { callee, args } => {
 			collect_locals(callee, out);
 			for a in args {
@@ -4814,6 +4981,12 @@ fn collect_locals(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 			for a in args {
 				collect_locals(a, out);
 			}
+		}
+		HirExpr::BoundDispatch {
+			receiver, argument, ..
+		} => {
+			collect_locals(receiver, out);
+			collect_locals(argument, out);
 		}
 		HirExpr::Array { items, .. } => {
 			for item in items {
@@ -4935,14 +5108,14 @@ fn collect_locals_stmt(stmt: &HirStmt, out: &mut FxHashSet<EcoString>) {
 }
 
 /// Collect every `HirExpr::VariantRef`'s `enum_name` reachable anywhere within
-/// `expr` into `out` (stdlib body materialization slice, gap a's enum half —
-/// see `Lowerer::materialize_referenced_prelude_enums`). Mirrors
+/// `expr` into `out` (stdlib body lowering slice, gap a's enum half —
+/// see `Lowerer::lower_demanded_runtime_enums`). Mirrors
 /// [`collect_locals`]'s exhaustive structural walk (kept exhaustive, no
 /// wildcard arm, for the identical reason: a future `HirExpr` shape that can
 /// hold a `VariantRef` must not silently go unwalked). Pattern-position
 /// variant refs (`HirPat::Variant`) are covered too, via
 /// [`collect_variant_ref_enums_pat`], even though none of `ops/mod.nym`'s
-/// materializable bodies happen to match on one today.
+/// lowerable bodies happen to match on one today.
 fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 	match expr {
 		HirExpr::VariantRef { enum_name, .. } => {
@@ -4954,6 +5127,11 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 		| HirExpr::Char(_)
 		| HirExpr::Local(_)
 		| HirExpr::This => {}
+		HirExpr::InterpolatedString(segments) => {
+			for segment in segments {
+				collect_variant_ref_enums(segment, out);
+			}
+		}
 		HirExpr::Call { callee, args } => {
 			collect_variant_ref_enums(callee, out);
 			for a in args {
@@ -4966,6 +5144,12 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 			for a in args {
 				collect_variant_ref_enums(a, out);
 			}
+		}
+		HirExpr::BoundDispatch {
+			receiver, argument, ..
+		} => {
+			collect_variant_ref_enums(receiver, out);
+			collect_variant_ref_enums(argument, out);
 		}
 		HirExpr::Array { items, .. } => {
 			for item in items {
@@ -5006,10 +5190,10 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 		}
 		HirExpr::New { class, fields } => {
 			// The constructed struct's own name is a type reference that may need
-			// prelude materialization (an ambient iterator adapter like `MapAdapter`,
+			// prelude lowering (an ambient iterator adapter like `MapAdapter`,
 			// emitted nowhere until demanded) — surfaced here alongside enum names;
-			// the enum-materialization loop ignores any name that isn't a prelude enum,
-			// and `materialize_referenced_prelude_structs` picks up the struct ones.
+			// the enum-lowering loop ignores any name that isn't a prelude enum,
+			// and `lower_demanded_runtime_classes` picks up the struct ones.
 			out.insert(class.clone());
 			for (_, v) in fields {
 				collect_variant_ref_enums(v, out);
@@ -5020,7 +5204,7 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 		// method call — must still register as "referenced": with no
 		// `HirExpr::VariantRef`/pattern anywhere, `enum_name` was the only trace
 		// this walk would otherwise ever see of it, and skipping it here would
-		// leave `Result`/`Option` unmaterialized while still constructing one of
+		// leave `Result`/`Option` unlowered while still constructing one of
 		// its variants — a runtime `ReferenceError` on the undefined enum object,
 		// not a loud compile-time panic (this fix predates any test exercising it
 		// directly, caught by inspection while auditing every `HirExpr` variant
@@ -5134,7 +5318,7 @@ fn collect_variant_ref_enums_pat(pat: &HirPat, out: &mut FxHashSet<EcoString>) {
 }
 
 /// Whether `expr` (a raw AST node, pre-lowering — used only on prelude
-/// bodies `try_materialize_prelude_dispatch` is vetting, via
+/// bodies `try_lower_runtime_dispatch` is vetting, via
 /// `Lowerer::body_calls_unlinked_external`) contains a `Call` naming anything
 /// in `names` anywhere within it, recursing through every sub-expression this
 /// AST can hold (block statements, closures, match arms/guards, string
@@ -5143,7 +5327,7 @@ fn collect_variant_ref_enums_pat(pat: &HirPat, out: &mut FxHashSet<EcoString>) {
 /// callee shapes count: a bare `Identifier` (`foo(..)`, a top-level
 /// `external` free function) AND a `MemberAccess` callee's OWN member name
 /// (`x.foo(..)`, an external INSTANCE method reached through a
-/// receiver/`this` — the collections-materialization extension's addition;
+/// receiver/`this` — the collections-lowering extension's addition;
 /// `body_calls_unlinked_external` now also collects per-impl-member
 /// `external` names into `names`, so e.g. `this.length()` inside `is_empty`'s
 /// body must be caught the same way a bare `external` call would be). Only
@@ -5579,7 +5763,7 @@ fn is_js_reserved_word(name: &str) -> bool {
 }
 
 /// The mangled-function self-type tag for a prelude impl's target `Type`
-/// (stdlib body materialization slice, gap b) — `Some` only for the primitive
+/// (stdlib body lowering slice, gap b) — `Some` only for the primitive
 /// types the AST represents as their OWN dedicated `Type` variant (never
 /// `Type::Reference`), which is exactly the set of concrete, non-blanket
 /// primitive impls `ops/mod.nym` provides (`int`/`uint`/`float`/`char`/
@@ -5588,7 +5772,7 @@ fn is_js_reserved_word(name: &str) -> bool {
 /// struct/enum (never how a PRELUDE impl targets a primitive; user impls
 /// never reach this function at all), or a structural type
 /// (`#()`/list/tuple/map/function) this slice's target inventory has no
-/// materializable body for anyway — `try_materialize_prelude_dispatch`
+/// lowerable body for anyway — `try_lower_runtime_dispatch`
 /// treats `None` as "stay loud", matching `push_impl_for_methods`'s existing
 /// V5 blanket-impl doctrine.
 fn primitive_type_tag(ty: &nymph_ast::ty::Type) -> Option<&'static str> {
@@ -5605,14 +5789,14 @@ fn primitive_type_tag(ty: &nymph_ast::ty::Type) -> Option<&'static str> {
 }
 
 /// The mangled-function self-type tag for a prelude INHERENT impl's target
-/// `Type` (`Declaration::Impl`, the collections-materialization extension of
-/// `try_materialize_prelude_dispatch`) — a superset of `primitive_type_tag`
+/// `Type` (`Declaration::Impl`, the collections-lowering extension of
+/// `try_lower_runtime_dispatch`) — a superset of `primitive_type_tag`
 /// that also covers the two STRUCTURAL types every real stdlib collection
 /// method is declared on: `List` (`impl<T> #[T] { .. }` / `impl<T> mut #[T]
 /// { .. }`) and `Map` (`impl<K,V> #{K:V} { .. }` / `impl<K,V> mut #{K:V} {
 /// .. }`). `primitive_type_tag` itself deliberately excludes these (its own
 /// doc comment: "a structural type this slice's target inventory has no
-/// materializable body for anyway") — this function IS that later inventory,
+/// lowerable body for anyway") — this function IS that later inventory,
 /// scoped narrowly to `List`/`Map` since that's the concrete, testable
 /// payoff (a named struct/enum receiver, or a blanket impl's own generic
 /// parameter, both still return `None` — no single JS class either shape can
@@ -5648,4 +5832,11 @@ fn inherent_self_type_tag(type_: &nymph_ast::ty::Type, mutable: bool) -> Option<
 	} else {
 		base.into()
 	})
+}
+
+fn runtime_type_tag(lowering_tag: &str) -> EcoString {
+	match lowering_tag {
+		"boolean" => "nymph.bool".into(),
+		other => format!("nymph.{other}").into(),
+	}
 }

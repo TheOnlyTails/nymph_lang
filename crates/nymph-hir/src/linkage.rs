@@ -89,10 +89,74 @@ pub struct Linked {
 ///   `into` entirely; see `nymph-compiler/tests/std_linkage.rs`).
 pub const REGISTRY: &[(&str, Linked)] = &[
 	(
+		"display",
+		Linked {
+			module: "std/display",
+			symbol: "display",
+			receiver_tag: None,
+		},
+	),
+	(
+		"debug",
+		Linked {
+			module: "std/display",
+			symbol: "debug",
+			receiver_tag: None,
+		},
+	),
+	(
+		"equals",
+		Linked {
+			module: "std/equality",
+			symbol: "equals",
+			receiver_tag: None,
+		},
+	),
+	(
+		"primitive_equals",
+		Linked {
+			module: "std/equality",
+			symbol: "primitive_equals",
+			receiver_tag: None,
+		},
+	),
+	(
+		"not_equals",
+		Linked {
+			module: "std/equality",
+			symbol: "not_equals",
+			receiver_tag: None,
+		},
+	),
+	(
 		"hash",
 		Linked {
 			module: "std/hash",
 			symbol: "hash",
+			receiver_tag: None,
+		},
+	),
+	(
+		"compare_number",
+		Linked {
+			module: "std/comparison",
+			symbol: "compare_number",
+			receiver_tag: None,
+		},
+	),
+	(
+		"compare_char",
+		Linked {
+			module: "std/comparison",
+			symbol: "compare_char",
+			receiver_tag: None,
+		},
+	),
+	(
+		"compare_string",
+		Linked {
+			module: "std/comparison",
+			symbol: "compare_string",
 			receiver_tag: None,
 		},
 	),
@@ -404,8 +468,9 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 	// `string.nym`'s ambient methods. `string` is a primitive, so its receiver
 	// tag (`inherent_self_type_tag` → `primitive_type_tag`) is `"string"`, which
 	// disambiguates the markers it shares with `list`/`map` (`contains`, `concat`,
-	// `reversed`, `drop`, `take`, `first`, `last`, `split`, `chars`). `symbol ==
-	// marker`; each maps to a `string.ts` export.
+	// `reversed`, `split`, `chars`). `symbol == marker`; each maps to a
+	// `string.ts` export. Convenience methods implemented in Nymph (`first`,
+	// `last`, `drop`, and `take`) deliberately have no registry entries.
 	(
 		"char_at",
 		Linked {
@@ -455,14 +520,6 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 		},
 	),
 	(
-		"drop",
-		Linked {
-			module: "std/string",
-			symbol: "drop",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
 		"ends_with",
 		Linked {
 			module: "std/string",
@@ -471,26 +528,10 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 		},
 	),
 	(
-		"first",
-		Linked {
-			module: "std/string",
-			symbol: "first",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
 		"index_of",
 		Linked {
 			module: "std/string",
 			symbol: "index_of",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
-		"last",
-		Linked {
-			module: "std/string",
-			symbol: "last",
 			receiver_tag: Some("string"),
 		},
 	),
@@ -579,14 +620,6 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 		Linked {
 			module: "std/string",
 			symbol: "substring",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
-		"take",
-		Linked {
-			module: "std/string",
-			symbol: "take",
 			receiver_tag: Some("string"),
 		},
 	),
@@ -780,6 +813,15 @@ mod tests {
 						"values",
 					]
 				),
+				(
+					"std/comparison",
+					vec!["compare_char", "compare_number", "compare_string"]
+				),
+				("std/display", vec!["debug", "display"]),
+				(
+					"std/equality",
+					vec!["equals", "not_equals", "primitive_equals"]
+				),
 				("std/hash", vec!["hash"]),
 				("std/io", vec!["print", "println"]),
 				(
@@ -791,11 +833,8 @@ mod tests {
 						"concat_chars",
 						"contains",
 						"contains_char",
-						"drop",
 						"ends_with",
-						"first",
 						"index_of",
-						"last",
 						"last_index_of",
 						"length",
 						"pad_end",
@@ -807,7 +846,6 @@ mod tests {
 						"split",
 						"starts_with",
 						"substring",
-						"take",
 						"to_lower",
 						"to_upper",
 						"trim",
@@ -824,6 +862,15 @@ mod tests {
 		let linked = lookup("hash", None).expect("`hash` must be linked");
 		assert_eq!(linked.module, "std/hash");
 		assert_eq!(linked.symbol, "hash");
+	}
+
+	#[test]
+	fn comparison_leaves_are_linked_host_primitives() {
+		for symbol in ["compare_number", "compare_char", "compare_string"] {
+			let linked = lookup(symbol, None).expect("comparison leaf must be linked");
+			assert_eq!(linked.module, "std/comparison");
+			assert_eq!(linked.symbol, symbol);
+		}
 	}
 
 	#[test]

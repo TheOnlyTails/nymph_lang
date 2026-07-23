@@ -163,7 +163,7 @@ if the block ends in a statement, not an expression). Blocks are how `func` bodi
 `for` bodies, and match arm bodies all get more than one step.
 
 ```nym
-func average_scaled(a: int, b: int, scale: int): int = {
+func average_scaled(a: int, b: int, scale: int): float = {
   let sum = a + b
   let scaled = sum * scale
   scaled / 2

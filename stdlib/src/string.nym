@@ -32,16 +32,17 @@ impl string {
   func is_blank() = this.trim().is_empty()
 
   /// Returns the first character, or `None` if empty.
-  external(first) func first(): Option<char>
+  func first(): Option<char> = this.char_at(0u)
 
   /// Returns the last character, or `None` if empty.
-  external(last) func last(): Option<char>
+  func last(): Option<char> =
+    if (this.is_empty()) None else this.char_at(this.length() - 1u)
 
   /// Returns a substring from `start` to the end.
-  external(drop) func drop(n: uint): string
+  func drop(n: uint): string = this.substring(n, this.length())
 
   /// Returns only the first `n` characters.
-  external(take) func take(n: uint): string
+  func take(n: uint): string = this.substring(0u, n)
 }
 
 impl Plus<Other = self, Output = self> for string {

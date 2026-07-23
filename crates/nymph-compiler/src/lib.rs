@@ -109,30 +109,27 @@ pub fn compile_entry(source: &str, path: &str) -> Result<String, Vec<Diagnostic>
 }
 
 fn compile_impl(source: &str, path: &str, entry: EntryMode) -> Result<String, Vec<Diagnostic>> {
+	// Preserve the standalone facade's diagnostic contract independently of
+	// project graph assembly: `path` is only a source/diagnostic anchor, and
+	// parser diagnostics precede checker (including entry-point) diagnostics.
 	let parsed = nymph_syntax::parse_module(source, path);
-	let mut diags: Vec<Diagnostic> = parsed
+	let mut diags: Vec<_> = parsed
 		.diagnostics
 		.iter()
-		.filter(|d| d.is_error())
+		.filter(|diag| diag.is_error())
 		.cloned()
 		.collect();
-
 	let prelude = prelude::core_prelude();
 	let checked = match entry {
 		EntryMode::Library => nymph_sema::check_module_with_prelude(&parsed.tree, prelude),
 		EntryMode::Entry => nymph_sema::check_module_entry_with_prelude(&parsed.tree, prelude),
 	};
-	diags.extend(checked.diags.iter().filter(|d| d.is_error()).cloned());
-
+	diags.extend(checked.diags.iter().filter(|diag| diag.is_error()).cloned());
 	if !diags.is_empty() {
 		return Err(diags);
 	}
 
-	Ok(nymph_codegen::emit(&nymph_sema::lower_hir_with_prelude(
-		&parsed.tree,
-		prelude,
-		&checked,
-	)))
+	project::compile_standalone(source, path, entry == EntryMode::Entry)
 }
 
 /// Parse and check Nymph `source`, returning every diagnostic produced.

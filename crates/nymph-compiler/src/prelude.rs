@@ -31,7 +31,10 @@
 
 use std::sync::OnceLock;
 
-use nymph_ast::decl::Module;
+use ecow::EcoString;
+use nymph_ast::decl::{Declaration, Module};
+use nymph_hir::hir::{HirClass, HirEnum, HirModule, HirVariant};
+use rustc_hash::FxHashMap;
 
 /// One core source file: its `std/…` display name (kept for span-scrub
 /// compatibility — see `nymph_sema::prelude::scrub_prelude_labels`) and its
@@ -81,6 +84,8 @@ const CORE_SOURCES: &[(&str, &str)] = &[
 ];
 
 static CORE_PRELUDE: OnceLock<Vec<Module>> = OnceLock::new();
+static CORE_RUNTIME_TYPE_OWNERS: OnceLock<FxHashMap<EcoString, &'static str>> = OnceLock::new();
+static CORE_RUNTIME_DECLARATION_SEEDS: OnceLock<HirModule> = OnceLock::new();
 
 /// Parse one embedded core source, panicking (via `debug_assert`, same as the
 /// prior single-module `ops_prelude`) if it fails to parse — every entry in
@@ -107,4 +112,164 @@ pub(crate) fn core_prelude() -> &'static [Module] {
 				.collect()
 		})
 		.as_slice()
+}
+
+/// The canonical source module for every runtime enum and struct in core.
+///
+/// Ownership comes from the top-level declaration's source, not from any
+/// separate `impl` that may add behavior to the type elsewhere in core.
+pub(crate) fn core_runtime_type_owners() -> &'static FxHashMap<EcoString, &'static str> {
+	CORE_RUNTIME_TYPE_OWNERS.get_or_init(|| {
+		let mut owners = FxHashMap::default();
+
+		for ((owner, _), module) in CORE_SOURCES.iter().zip(core_prelude()) {
+			for declaration in &module.members {
+				let name = match declaration {
+					Declaration::Enum { name, .. } | Declaration::Struct { name, .. } => &name.0,
+					_ => continue,
+				};
+
+				if let Some(previous_owner) = owners.insert(name.clone(), *owner) {
+					panic!(
+						"duplicate core runtime type declaration `{name}` in `{previous_owner}` and `{owner}`"
+					);
+				}
+			}
+		}
+
+		owners
+	})
+}
+
+pub(crate) fn core_interface_owners() -> FxHashMap<EcoString, &'static str> {
+	let mut owners = FxHashMap::default();
+	for ((owner, _), module) in CORE_SOURCES.iter().zip(core_prelude()) {
+		for declaration in &module.members {
+			if let Declaration::Interface { name, .. } = declaration {
+				owners.insert(name.0.clone(), *owner);
+			}
+		}
+	}
+	owners
+}
+
+pub(crate) fn core_function_owners() -> FxHashMap<EcoString, &'static str> {
+	let mut owners = FxHashMap::default();
+	for ((owner, _), module) in CORE_SOURCES.iter().zip(core_prelude()) {
+		for declaration in &module.members {
+			if let Declaration::Func { meta, .. } = declaration {
+				owners.insert(meta.name.0.clone(), *owner);
+			}
+		}
+	}
+	owners
+}
+
+/// Canonical declaration shapes derived directly from the parsed core source.
+/// Bodies are deliberately absent: consumer lowering supplies only demanded
+/// methods, while these seeds ensure an import-only demand still has its
+/// source-owned enum variants or struct fields available for emission.
+pub(crate) fn core_runtime_declaration_seeds() -> &'static HirModule {
+	CORE_RUNTIME_DECLARATION_SEEDS.get_or_init(|| {
+		let mut module = HirModule {
+			lets: Vec::new(),
+			funcs: Vec::new(),
+			classes: Vec::new(),
+			enums: Vec::new(),
+		};
+		for source in core_prelude() {
+			for declaration in &source.members {
+				match declaration {
+					Declaration::Enum { name, variants, .. } => module.enums.push(HirEnum {
+						name: name.0.clone(),
+						variants: variants
+							.iter()
+							.map(|variant| HirVariant {
+								name: variant.0.name.0.clone(),
+								fields: variant
+									.0
+									.fields
+									.iter()
+									.map(|field| field.0.name.0.clone())
+									.collect(),
+							})
+							.collect(),
+						methods: Vec::new(),
+						statics: Vec::new(),
+					}),
+					Declaration::Struct { name, fields, .. } => module.classes.push(HirClass {
+						name: name.0.clone(),
+						fields: fields.iter().map(|field| field.0.name.0.clone()).collect(),
+						methods: Vec::new(),
+						statics: Vec::new(),
+					}),
+					_ => {}
+				}
+			}
+		}
+		module
+	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{core_runtime_declaration_seeds, core_runtime_type_owners};
+
+	#[test]
+	fn core_runtime_declaration_seeds_preserve_source_variants_and_fields_only() {
+		let seeds = core_runtime_declaration_seeds();
+		let option = seeds
+			.enums
+			.iter()
+			.find(|item| item.name == "Option")
+			.expect("Option seed");
+		assert_eq!(
+			option
+				.variants
+				.iter()
+				.map(|variant| (variant.name.as_str(), variant.fields.len()))
+				.collect::<Vec<_>>(),
+			[("Some", 1), ("None", 0)]
+		);
+		assert!(option.methods.is_empty() && option.statics.is_empty());
+		let range = seeds
+			.classes
+			.iter()
+			.find(|item| item.name == "Range")
+			.expect("Range seed");
+		assert_eq!(
+			range
+				.fields
+				.iter()
+				.map(AsRef::as_ref)
+				.collect::<Vec<&str>>(),
+			["start", "end"]
+		);
+		assert!(range.methods.is_empty() && range.statics.is_empty());
+	}
+
+	#[test]
+	fn core_runtime_types_have_their_declaration_module_as_owner() {
+		let owners = core_runtime_type_owners();
+		let expected = [
+			("Order", "std/ops"),
+			("Option", "std/option"),
+			("Result", "std/result"),
+			("Mapped", "std/iter"),
+			("Filtered", "std/iter"),
+			("Take", "std/iter"),
+			("Drop", "std/iter"),
+			("ListIter", "std/iter/iterable"),
+			("Bound", "std/range"),
+			("Range", "std/range"),
+			("RangeFrom", "std/range"),
+			("RangeTo", "std/range"),
+			("RangeInclusive", "std/range"),
+			("RangeToInclusive", "std/range"),
+		];
+
+		for (type_name, owner) in expected {
+			assert_eq!(owners.get(type_name), Some(&owner), "owner for {type_name}");
+		}
+	}
 }

@@ -34,7 +34,7 @@ and evaluates to its last expression. `let` introduces an immutable local bindin
 along the way.
 
 ```nym
-func scaled_average(a: int, b: int, scale: int): int = {
+func scaled_average(a: int, b: int, scale: int): float = {
   let sum = a + b
   let scaled = sum * scale
   scaled / 2

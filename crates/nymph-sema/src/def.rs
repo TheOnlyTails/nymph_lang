@@ -148,7 +148,7 @@ pub fn build_def_map(module: &Module, diags: &mut Vec<Diagnostic>) -> DefMap {
 						redefined_span: name.1,
 						prev,
 					}
-					.into_diagnostic(name.1),
+					.as_diagnostic(name.1),
 				);
 			}
 			seen.insert(name.0.clone(), name.1);

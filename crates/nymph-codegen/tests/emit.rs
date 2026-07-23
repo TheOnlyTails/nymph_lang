@@ -1,7 +1,7 @@
 use nymph_codegen::emit;
 use nymph_hir::hir::{
-	BinOp, BuiltinResult, HirArm, HirEnum, HirExpr, HirFunc, HirLit, HirMethod, HirModule, HirPat,
-	HirStmt, HirVariant, NumKind,
+	BinOp, BuiltinResult, HirArm, HirBoundDispatchCase, HirBoundDispatchTarget, HirEnum, HirExpr,
+	HirFunc, HirLit, HirMethod, HirModule, HirPat, HirStmt, HirVariant, NumKind,
 };
 
 #[test]
@@ -20,6 +20,99 @@ fn emits_a_function_returning_a_number() {
 	// A single-expression body becomes an arrow-style function returning the value.
 	assert!(js.contains("answer"), "function name present: {js}");
 	assert!(js.contains("42"), "literal present: {js}");
+}
+
+#[test]
+fn display_protocol_call_includes_its_runtime_without_other_boxed_values() {
+	let module = HirModule {
+		lets: vec![],
+		funcs: vec![HirFunc {
+			name: "render".into(),
+			params: vec!["value".into()],
+			body: HirExpr::ExternCall {
+				module: "std/display",
+				symbol: "debug",
+				args: vec![HirExpr::Local("value".into())],
+			},
+		}],
+		classes: vec![],
+		enums: vec![],
+	};
+
+	let js = emit(&module);
+	assert!(
+		js.contains("function nymphProtocolDebug"),
+		"display protocol helper must be defined alongside its call: {js}"
+	);
+}
+
+#[test]
+fn bound_dispatch_evaluates_operands_once_and_falls_back_to_the_user_method() {
+	let module = HirModule {
+		lets: vec![],
+		funcs: vec![HirFunc {
+			name: "compare".into(),
+			params: vec!["make_left".into(), "make_right".into()],
+			body: HirExpr::BoundDispatch {
+				interface: "Comparable".into(),
+				method: "less_than".into(),
+				receiver: Box::new(HirExpr::Call {
+					callee: Box::new(HirExpr::Local("make_left".into())),
+					args: vec![],
+				}),
+				argument: Box::new(HirExpr::Call {
+					callee: Box::new(HirExpr::Local("make_right".into())),
+					args: vec![],
+				}),
+				cases: vec![HirBoundDispatchCase {
+					receiver_tag: "nymph.int".into(),
+					argument_tag: "nymph.int".into(),
+					target: HirBoundDispatchTarget::TopLevel {
+						module: "std/ops".into(),
+						name: "int_less_than".into(),
+					},
+				}],
+			},
+		}],
+		classes: vec![],
+		enums: vec![],
+	};
+
+	let js = emit(&module);
+	assert_eq!(js.matches("make_left()").count(), 1, "{js}");
+	assert_eq!(js.matches("make_right()").count(), 1, "{js}");
+	assert!(js.contains("Symbol.for(\"nymph.tag\")"), "{js}");
+	assert!(js.contains("Symbol.for(\"nymph.int\")"), "{js}");
+	assert!(js.contains("int_less_than"), "{js}");
+	assert!(js.contains(".less_than("), "{js}");
+}
+
+#[test]
+fn interpolation_emits_cooked_text_as_raw_strings() {
+	let module = HirModule {
+		lets: vec![],
+		funcs: vec![HirFunc {
+			name: "render".into(),
+			params: vec!["value".into()],
+			body: HirExpr::InterpolatedString(vec![
+				HirExpr::Str("value=".into()),
+				HirExpr::ExternCall {
+					module: "std/display",
+					symbol: "display",
+					args: vec![HirExpr::Local("value".into())],
+				},
+				HirExpr::Str("!".into()),
+			]),
+		}],
+		classes: vec![],
+		enums: vec![],
+	};
+
+	let js = emit(&module);
+	assert!(
+		!js.contains("new NString(\"value=\")") && !js.contains("new NString(\"!\")"),
+		"cooked interpolation segments must not allocate temporary NString boxes: {js}"
+	);
 }
 
 #[test]

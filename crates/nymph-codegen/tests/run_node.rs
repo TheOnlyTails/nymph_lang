@@ -61,7 +61,29 @@ fn compile_with_prelude(user_src: &str, prelude_src: &str) -> String {
 /// Append a driver that logs `call`, run the already-compiled `js` module under
 /// Node, and return trimmed stdout. Shared by [`run`] and [`run_with_prelude`].
 fn run_js(mut js: String, call: &str) -> String {
-	js.push_str(&format!("\nconsole.log({call});\n"));
+	// Nymph values are boxed at the generated-JS boundary. Most tests in this
+	// file assert a program's observable scalar result rather than its runtime
+	// representation, so unwrap boxes before handing the value to `console.log`.
+	// Tests that deliberately inspect representation still do so inside `call`
+	// (for example with `JSON.stringify` or `[TAG]`) and therefore pass a raw JS
+	// scalar/string through this helper unchanged.
+	js.push_str(&format!(
+		"\nfunction nymphTestValue(value) {{\n\
+		\tif (value == null || typeof value !== 'object') return value;\n\
+		\tif ('v' in value) {{\n\
+		\t\treturn nymphTestValue(value.v);\n\
+		\t}}\n\
+		\tif (Array.isArray(value)) return value.map(nymphTestValue);\n\
+		\tif (value instanceof Map) {{\n\
+		\t\treturn [...value].map(([key, item]) => [nymphTestValue(key), nymphTestValue(item)]);\n\
+		\t}}\n\
+		\tif (typeof value[Symbol.iterator] === 'function') return [...value].map(nymphTestValue);\n\
+		\tconst plain = {{}};\n\
+		\tfor (const [key, item] of Object.entries(value)) plain[key] = nymphTestValue(item);\n\
+		\treturn plain;\n\
+		}}\n\
+		console.log(nymphTestValue({call}));\n"
+	));
 
 	// `process::id()` alone is not a unique filename: all tests in this binary
 	// share one process and may run on parallel threads, racing on the same path.
@@ -106,7 +128,10 @@ fn run_with_prelude(user_src: &str, prelude_src: &str, call: &str) -> String {
 #[test]
 fn runs_arithmetic() {
 	// Pure scalar arithmetic (Task 3/4 already cover emit+lower; this asserts it RUNS).
-	let out = run("func add(a: int, b: int): int = a + b * 2", "add(3, 4)");
+	let out = run(
+		"func add(a: int, b: int): int = a + b * 2",
+		"add(new NInt(3), new NInt(4))",
+	);
 	assert_eq!(out, "11");
 }
 
@@ -119,7 +144,7 @@ fn runs_an_operator_inside_a_string_interpolation() {
 	// `${a + b}` (and a call/closure inside one) must run.
 	let out = run(
 		"func f(a: int, b: int): string = \"sum=${a + b}\"",
-		"f(3, 4)",
+		"f(new NInt(3), new NInt(4))",
 	);
 	assert_eq!(out, "sum=7");
 	let out2 = run(
@@ -151,9 +176,9 @@ fn runs_if_as_value() {
 			if (n > 0) { 1 }
 			else { if (n < 0) { -1 } else { 0 } }
 	"#;
-	assert_eq!(run(src, "sign(5)"), "1");
-	assert_eq!(run(src, "sign(-3)"), "-1");
-	assert_eq!(run(src, "sign(0)"), "0");
+	assert_eq!(run(src, "sign(new NInt(5))"), "1");
+	assert_eq!(run(src, "sign(new NInt(-3))"), "-1");
+	assert_eq!(run(src, "sign(new NInt(0))"), "0");
 }
 
 #[test]
@@ -170,7 +195,7 @@ fn runs_while_loop() {
 			total
 		}
 	"#;
-	assert_eq!(run(src, "sum_to(5)"), "15");
+	assert_eq!(run(src, "sum_to(new NInt(5))"), "15");
 }
 
 #[test]
@@ -198,7 +223,7 @@ fn runs_custom_index_impl() {
 fn runs_tuple_roundtrip() {
 	// A tuple emits as a JS array — `JSON.stringify` proves the shape survives.
 	let src = "func pair(): #(int, int) = #(1, 2)";
-	assert_eq!(run(src, "JSON.stringify(pair())"), "[1,2]");
+	assert_eq!(run(src, "JSON.stringify(nymphTestValue(pair()))"), "[1,2]");
 }
 
 #[test]
@@ -227,7 +252,10 @@ fn runs_struct_field_through_param() {
 		struct Point(x: int, y: int)
 		func sum(p: Point): int = p.x + p.y
 	"#;
-	assert_eq!(run(src, "sum(new Point({ x: 10, y: 20 }))"), "30");
+	assert_eq!(
+		run(src, "sum(new Point({ x: new NInt(10), y: new NInt(20) }))"),
+		"30"
+	);
 }
 
 #[test]
@@ -290,9 +318,9 @@ fn runs_match_literal_and_wildcard() {
 			_ -> 300,
 		}
 	"#;
-	assert_eq!(run(src, "classify(0)"), "100");
-	assert_eq!(run(src, "classify(1)"), "200");
-	assert_eq!(run(src, "classify(9)"), "300");
+	assert_eq!(run(src, "classify(new NInt(0))"), "100");
+	assert_eq!(run(src, "classify(new NInt(1))"), "200");
+	assert_eq!(run(src, "classify(new NInt(9))"), "300");
 }
 
 #[test]
@@ -323,9 +351,9 @@ fn runs_match_tuple_and_guard() {
 			#(x, _) -> 0,
 		}
 	"#;
-	assert_eq!(run(src, "f([0, 7])"), "7"); // first arm (literal 0 matches)
-	assert_eq!(run(src, "f([20, 1])"), "20"); // guard passes
-	assert_eq!(run(src, "f([5, 1])"), "0"); // guard fails → fall through
+	assert_eq!(run(src, "f(new NTuple([new NInt(0), new NInt(7)]))"), "7"); // first arm (literal 0 matches)
+	assert_eq!(run(src, "f(new NTuple([new NInt(20), new NInt(1)]))"), "20"); // guard passes
+	assert_eq!(run(src, "f(new NTuple([new NInt(5), new NInt(1)]))"), "0"); // guard fails → fall through
 }
 
 #[test]
@@ -337,7 +365,10 @@ fn runs_match_struct_pattern() {
 			Point(x = px, y = py) -> px + py,
 		}
 	"#;
-	assert_eq!(run(src, "f(new Point({ x: 3, y: 4 }))"), "7");
+	assert_eq!(
+		run(src, "f(new Point({ x: new NInt(3), y: new NInt(4) }))"),
+		"7"
+	);
 }
 
 #[test]
@@ -350,7 +381,7 @@ fn runs_match_as_subexpression() {
 			None -> 0,
 		}
 	"#;
-	assert_eq!(run(src, "f(Opt.Some({ value: 41 }))"), "42");
+	assert_eq!(run(src, "f(Opt.Some({ value: new NInt(41) }))"), "42");
 	assert_eq!(run(src, "f(Opt.None)"), "1");
 }
 
@@ -366,8 +397,14 @@ fn runs_match_list_patterns() {
 			_ -> 0,
 		}
 	"#;
-	assert_eq!(run(src, "head_or([])"), "-1"); // exact-length #[] arm
-	assert_eq!(run(src, "head_or([7, 8, 9])"), "7"); // spread arm binds head
+	assert_eq!(run(src, "head_or(new NList([]))"), "-1"); // exact-length #[] arm
+	assert_eq!(
+		run(
+			src,
+			"head_or(new NList([new NInt(7), new NInt(8), new NInt(9)]))"
+		),
+		"7"
+	); // spread arm binds head
 }
 
 #[test]
@@ -379,9 +416,18 @@ fn runs_match_list_rest_with_suffix() {
 			_ -> -1,
 		}
 	"#;
-	assert_eq!(run(src, "ends([10, 2, 3, 20])"), "30"); // a=10, b=20 (mid=[2,3])
-	assert_eq!(run(src, "ends([1, 9])"), "10"); // a=1, b=9, mid=[]
-	assert_eq!(run(src, "ends([5])"), "-1"); // length 1 < 2 → wildcard
+	assert_eq!(
+		run(
+			src,
+			"ends(new NList([new NInt(10), new NInt(2), new NInt(3), new NInt(20)]))"
+		),
+		"30"
+	); // a=10, b=20 (mid=[2,3])
+	assert_eq!(
+		run(src, "ends(new NList([new NInt(1), new NInt(9)]))"),
+		"10"
+	); // a=1, b=9, mid=[]
+	assert_eq!(run(src, "ends(new NList([new NInt(5)]))"), "-1"); // length 1 < 2 → wildcard
 }
 
 #[test]
@@ -393,7 +439,13 @@ fn runs_match_tuple_rest_with_suffix() {
 			#(a, ...mid, z) -> a + z,
 		}
 	"#;
-	assert_eq!(run(src, "ends([10, true, 'y', 20])"), "30");
+	assert_eq!(
+		run(
+			src,
+			"ends(new NTuple([new NInt(10), new NBool(true), new NString('y'), new NInt(20)]))"
+		),
+		"30"
+	);
 }
 
 #[test]
@@ -409,7 +461,10 @@ fn runs_tuple_rest_binds_middle_subtuple() {
 		}
 	"#;
 	assert_eq!(
-		run(src, "JSON.stringify(mid([1, true, 'x', 4]))"),
+		run(
+			src,
+			"JSON.stringify(nymphTestValue(mid(new NTuple([new NInt(1), new NBool(true), new NString('x'), new NInt(4)]))))"
+		),
 		r#"[true,"x"]"#
 	);
 }
@@ -423,8 +478,14 @@ fn runs_match_map_pattern() {
 			_ -> -1,
 		}
 	"#;
-	assert_eq!(run(src, "lookup(new Map([[1, 42]]))"), "42");
-	assert_eq!(run(src, "lookup(new Map([[2, 9]]))"), "-1");
+	assert_eq!(
+		run(src, "lookup(new NMap([[new NInt(1), new NInt(42)]]))"),
+		"42"
+	);
+	assert_eq!(
+		run(src, "lookup(new NMap([[new NInt(2), new NInt(9)]]))"),
+		"-1"
+	);
 }
 
 #[test]
@@ -440,13 +501,16 @@ fn runs_match_map_pattern_rest() {
 	assert_eq!(
 		run(
 			src,
-			"JSON.stringify([...without_one(new Map([[1, 10], [2, 20], [3, 30]]))])"
+			"JSON.stringify(nymphTestValue(without_one(new NMap([[new NInt(1), new NInt(10)], [new NInt(2), new NInt(20)], [new NInt(3), new NInt(30)]]))).sort(([a], [b]) => a - b))"
 		),
 		r#"[[2,20],[3,30]]"#
 	);
 	// The `1` key is absent, so the wildcard arm returns `m` unchanged.
 	assert_eq!(
-		run(src, "JSON.stringify([...without_one(new Map([[2, 20]]))])"),
+		run(
+			src,
+			"JSON.stringify(nymphTestValue(without_one(new NMap([[new NInt(2), new NInt(20)]]))).sort(([a], [b]) => a - b))"
+		),
 		r#"[[2,20]]"#
 	);
 }
@@ -486,9 +550,9 @@ fn runs_match_range_and_string() {
 			_ -> 3,
 		}
 	"#;
-	assert_eq!(run(n, "size(5)"), "1");
-	assert_eq!(run(n, "size(100)"), "2");
-	assert_eq!(run(n, "size(500)"), "3");
+	assert_eq!(run(n, "size(new NInt(5))"), "1");
+	assert_eq!(run(n, "size(new NInt(100))"), "2");
+	assert_eq!(run(n, "size(new NInt(500))"), "3");
 }
 
 #[test]
@@ -516,7 +580,10 @@ fn runs_struct_method_with_this() {
 		}
 		func total(p: Point): int = p.sum()
 	"#;
-	assert_eq!(run(src, "total(new Point({ x: 3, y: 4 }))"), "7");
+	assert_eq!(
+		run(src, "total(new Point({ x: new NInt(3), y: new NInt(4) }))"),
+		"7"
+	);
 }
 
 #[test]
@@ -529,7 +596,7 @@ fn runs_struct_method_with_args() {
 		}
 		func bump(c: Counter): int = c.add(10)
 	"#;
-	assert_eq!(run(src, "bump(new Counter({ n: 5 }))"), "15");
+	assert_eq!(run(src, "bump(new Counter({ n: new NInt(5) }))"), "15");
 }
 
 #[test]
@@ -555,7 +622,7 @@ fn runs_struct_method_calls_sibling_method() {
 			func doubled(): int = this.base() + this.base()
 		}
 	"#;
-	assert_eq!(run(src, "new Counter({ n: 21 }).doubled()"), "42");
+	assert_eq!(run(src, "new Counter({ n: new NInt(21) }).doubled()"), "42");
 }
 
 #[test]
@@ -566,7 +633,10 @@ fn runs_struct_inner_func() {
 			func sum(): int = this.x + this.y
 		}
 	"#;
-	assert_eq!(run(src, "new Point({ x: 10, y: 5 }).sum()"), "15");
+	assert_eq!(
+		run(src, "new Point({ x: new NInt(10), y: new NInt(5) }).sum()"),
+		"15"
+	);
 }
 
 #[test]
@@ -585,7 +655,7 @@ fn runs_operator_overload_via_nested_impl() {
 	assert_eq!(
 		run(
 			src,
-			"add(new Vec2({ x: 1, y: 2 }), new Vec2({ x: 3, y: 4 })).x"
+			"add(new Vec2({ x: new NInt(1), y: new NInt(2) }), new Vec2({ x: new NInt(3), y: new NInt(4) })).x"
 		),
 		"4"
 	);
@@ -606,7 +676,7 @@ fn runs_operator_overload_via_top_level_impl() {
 	assert_eq!(
 		run(
 			src,
-			"add(new Vec2({ x: 1, y: 2 }), new Vec2({ x: 3, y: 4 })).x"
+			"add(new Vec2({ x: new NInt(1), y: new NInt(2) }), new Vec2({ x: new NInt(3), y: new NInt(4) })).x"
 		),
 		"4"
 	);
@@ -628,7 +698,7 @@ fn runs_operator_inside_method_body_stays_native_but_outer_dispatches() {
 	assert_eq!(
 		run(
 			src,
-			"combine(new Vec2({ x: 1, y: 2 }), new Vec2({ x: 3, y: 4 }))"
+			"combine(new Vec2({ x: new NInt(1), y: new NInt(2) }), new Vec2({ x: new NInt(3), y: new NInt(4) }))"
 		),
 		"4"
 	);
@@ -639,7 +709,7 @@ fn runs_mixed_int_and_float_stays_native() {
 	// An `int` literal against a `float` operand widens rather than dispatching to
 	// an overload (no impl needed) — this stays a native JS `+`.
 	let src = "func bump(x: float): float = x + 1";
-	assert_eq!(run(src, "bump(2.5)"), "3.5");
+	assert_eq!(run(src, "bump(new NFloat(2.5))"), "3.5");
 }
 
 #[test]
@@ -662,14 +732,14 @@ fn runs_compound_assign_dispatches_user_operator() {
 	assert_eq!(
 		run(
 			src,
-			"combine(new Vec2({ x: 1, y: 2 }), new Vec2({ x: 3, y: 4 })).x"
+			"combine(new Vec2({ x: new NInt(1), y: new NInt(2) }), new Vec2({ x: new NInt(3), y: new NInt(4) })).x"
 		),
 		"4"
 	);
 	assert_eq!(
 		run(
 			src,
-			"combine(new Vec2({ x: 1, y: 2 }), new Vec2({ x: 3, y: 4 })).y"
+			"combine(new Vec2({ x: new NInt(1), y: new NInt(2) }), new Vec2({ x: new NInt(3), y: new NInt(4) })).y"
 		),
 		"6"
 	);
@@ -700,17 +770,29 @@ fn runs_prefix_negate_overload_dispatches_to_method() {
 		}
 		func flip(v: Vec2): Vec2 = -v
 	"#;
-	assert_eq!(run(src, "flip(new Vec2({ x: 1, y: 2 })).x"), "-1");
-	assert_eq!(run(src, "flip(new Vec2({ x: 1, y: 2 })).y"), "-2");
+	assert_eq!(
+		run(src, "flip(new Vec2({ x: new NInt(1), y: new NInt(2) })).x"),
+		"-1"
+	);
+	assert_eq!(
+		run(src, "flip(new Vec2({ x: new NInt(1), y: new NInt(2) })).y"),
+		"-2"
+	);
 }
 
 #[test]
 fn runs_prefix_bool_not_and_native_int_float_negate_stay_native() {
 	// `!boolean` and `-int`/`-float` stay native JS unary operators — no impl in
 	// scope, `BuiltinEager` resolution.
-	assert_eq!(run("func f(b: boolean): boolean = !b", "f(true)"), "false");
-	assert_eq!(run("func f(x: int): int = -x", "f(5)"), "-5");
-	assert_eq!(run("func f(x: float): float = -x", "f(2.5)"), "-2.5");
+	assert_eq!(
+		run("func f(b: boolean): boolean = !b", "f(new NBool(true))"),
+		"false"
+	);
+	assert_eq!(run("func f(x: int): int = -x", "f(new NInt(5))"), "-5");
+	assert_eq!(
+		run("func f(x: float): float = -x", "f(new NFloat(2.5))"),
+		"-2.5"
+	);
 }
 
 #[test]
@@ -726,15 +808,18 @@ fn runs_prefix_operator_inside_method_body_stays_native_but_outer_dispatches() {
 		}
 		func flip(v: Vec2): Vec2 = -v
 	"#;
-	assert_eq!(run(src, "flip(new Vec2({ x: 1, y: 2 })).x"), "-1");
+	assert_eq!(
+		run(src, "flip(new Vec2({ x: new NInt(1), y: new NInt(2) })).x"),
+		"-1"
+	);
 }
 
 #[test]
 fn runs_prefix_bit_not_native_on_int() {
 	// `~x` on a plain `int` stays a native JS bitwise-not — no impl in scope,
 	// `BuiltinEager` resolution.
-	assert_eq!(run("func f(x: int): int = ~x", "f(5)"), "-6");
-	assert_eq!(run("func f(x: int): int = ~x", "f(0)"), "-1");
+	assert_eq!(run("func f(x: int): int = ~x", "f(new NInt(5))"), "-6");
+	assert_eq!(run("func f(x: int): int = ~x", "f(new NInt(0))"), "-1");
 }
 
 #[test]
@@ -749,8 +834,14 @@ fn runs_prefix_bit_not_overload_dispatches_to_method() {
 		}
 		func flip(m: Mask): Mask = ~m
 	"#;
-	assert_eq!(run(src, "flip(new Mask({ a: 5, b: 0 })).a"), "-6");
-	assert_eq!(run(src, "flip(new Mask({ a: 5, b: 0 })).b"), "-1");
+	assert_eq!(
+		run(src, "flip(new Mask({ a: new NInt(5), b: new NInt(0) })).a"),
+		"-6"
+	);
+	assert_eq!(
+		run(src, "flip(new Mask({ a: new NInt(5), b: new NInt(0) })).b"),
+		"-1"
+	);
 }
 
 // ── Slice 4C-b: interface default method materialization ───────────────────
@@ -776,14 +867,14 @@ fn runs_interface_default_dispatches_via_operator() {
 	assert_eq!(
 		run(
 			src,
-			"lt(new Vec2({ x: 1, y: 0 }), new Vec2({ x: 2, y: 0 }))"
+			"lt(new Vec2({ x: new NInt(1), y: new NInt(0) }), new Vec2({ x: new NInt(2), y: new NInt(0) }))"
 		),
 		"true"
 	);
 	assert_eq!(
 		run(
 			src,
-			"lt(new Vec2({ x: 2, y: 0 }), new Vec2({ x: 1, y: 0 }))"
+			"lt(new Vec2({ x: new NInt(2), y: new NInt(0) }), new Vec2({ x: new NInt(1), y: new NInt(0) }))"
 		),
 		"false"
 	);
@@ -809,14 +900,14 @@ fn runs_interface_default_explicit_call() {
 	assert_eq!(
 		run(
 			src,
-			"lt(new Vec2({ x: 1, y: 0 }), new Vec2({ x: 2, y: 0 }))"
+			"lt(new Vec2({ x: new NInt(1), y: new NInt(0) }), new Vec2({ x: new NInt(2), y: new NInt(0) }))"
 		),
 		"true"
 	);
 	assert_eq!(
 		run(
 			src,
-			"lt(new Vec2({ x: 2, y: 0 }), new Vec2({ x: 1, y: 0 }))"
+			"lt(new Vec2({ x: new NInt(2), y: new NInt(0) }), new Vec2({ x: new NInt(1), y: new NInt(0) }))"
 		),
 		"false"
 	);
@@ -848,6 +939,22 @@ fn runs_interface_default_override_wins() {
 	);
 }
 
+#[test]
+fn runs_generic_bound_operator_with_user_override() {
+	let src = r#"
+		interface Comparable<Other> {
+			func less_than(other: Other): boolean = true
+		}
+		struct Vec2(x: int)
+		impl Comparable<Other = Vec2> for Vec2 {
+			func less_than(other: Vec2): boolean = false
+		}
+		func generic_lt<T: Comparable<Other = T>>(left: T, right: T): boolean = left < right
+		func demo(): boolean = generic_lt(Vec2(x = 1), Vec2(x = 2))
+	"#;
+	assert_eq!(run(src, "demo()"), "false");
+}
+
 // ── Slice 4C-c, Task 3: comparison/equality generics end-to-end ─────────────
 
 #[test]
@@ -872,11 +979,17 @@ fn runs_late_pinned_adt_comparison_dispatches_at_runtime() {
 		}
 	"#;
 	assert_eq!(
-		run(src, "f(new Vec2({ x: 1 }), new Vec2({ x: 2 }))"),
+		run(
+			src,
+			"f(new Vec2({ x: new NInt(1) }), new Vec2({ x: new NInt(2) }))"
+		),
 		"true"
 	);
 	assert_eq!(
-		run(src, "f(new Vec2({ x: 2 }), new Vec2({ x: 1 }))"),
+		run(
+			src,
+			"f(new Vec2({ x: new NInt(2) }), new Vec2({ x: new NInt(1) }))"
+		),
 		"false"
 	);
 }
@@ -887,34 +1000,42 @@ fn runs_native_int_and_float_comparison_unchanged() {
 	// comparisons still compile to a native JS `<`/`>`, not a dispatched call.
 	let src = "func lt(a: int, b: int): boolean = a < b
 	           func gt(a: float, b: float): boolean = a > b";
-	assert_eq!(run(src, "lt(1, 2)"), "true");
-	assert_eq!(run(src, "lt(2, 1)"), "false");
-	assert_eq!(run(src, "gt(2.5, 1.5)"), "true");
+	assert_eq!(run(src, "lt(new NInt(1), new NInt(2))"), "true");
+	assert_eq!(run(src, "lt(new NInt(2), new NInt(1))"), "false");
+	assert_eq!(run(src, "gt(new NFloat(2.5), new NFloat(1.5))"), "true");
 }
 
 #[test]
-fn runs_equals_on_user_struct_stays_native_reference_equality() {
-	// W2: `==` on a user struct stays `BuiltinEager` — native JS `===` (reference
-	// equality), even with a user `Equals` impl in scope (the ADT equality arm
-	// dispatches only for typing side-effects; codegen still emits `===`). Two
-	// structurally-equal but distinct `Vec2` instances are therefore *not* `==`,
-	// while a single instance compared against itself (the same object
-	// reference, passed twice) is. (A concrete, rather than blanket, `Equals`
-	// impl is used here — lowering a *blanket* impl is an unrelated, out-of-scope
-	// deferral, V5; `operator_resolutions.rs`'s `user_struct_equals_is_builtin_eager`
-	// already pins the blanket-impl checker case.)
+fn runs_equals_and_not_equals_on_a_user_struct() {
 	let src = r#"
-		interface Equals<Other> { func equals(other: Other): boolean }
+		interface Equals<Other> {
+			func equals(other: Other): boolean
+			func not_equals(other: Other): boolean = !this.equals(other)
+		}
 		struct Vec2(x: int)
 		impl Equals<Other = Vec2> for Vec2 { func equals(other: Vec2): boolean = true }
 		func same(a: Vec2, b: Vec2): boolean = a == b
 		func self_same(a: Vec2): boolean = a == a
+		func different(a: Vec2, b: Vec2): boolean = a != b
 	"#;
 	assert_eq!(
-		run(src, "same(new Vec2({ x: 1 }), new Vec2({ x: 1 }))"),
+		run(
+			src,
+			"same(new Vec2({ x: new NInt(1) }), new Vec2({ x: new NInt(1) })).v"
+		),
+		"true"
+	);
+	assert_eq!(
+		run(src, "self_same(new Vec2({ x: new NInt(1) })).v"),
+		"true"
+	);
+	assert_eq!(
+		run(
+			src,
+			"different(new Vec2({ x: new NInt(1) }), new Vec2({ x: new NInt(2) })).v"
+		),
 		"false"
 	);
-	assert_eq!(run(src, "self_same(new Vec2({ x: 1 }))"), "true");
 }
 
 #[test]
@@ -1036,9 +1157,9 @@ fn runs_early_return_with_value_inside_a_statement_position_if() {
 			0 - n
 		}
 	"#;
-	assert_eq!(run(src, "abs(5)"), "5");
-	assert_eq!(run(src, "abs(-3)"), "3");
-	assert_eq!(run(src, "abs(0)"), "0");
+	assert_eq!(run(src, "abs(new NInt(5))"), "5");
+	assert_eq!(run(src, "abs(new NInt(-3))"), "3");
+	assert_eq!(run(src, "abs(new NInt(0))"), "0");
 }
 
 #[test]
@@ -1070,8 +1191,20 @@ fn runs_return_inside_a_statement_position_while() {
 			result
 		}
 	"#;
-	assert_eq!(run(src, "first_over([1, 5, 9], 3)"), "5");
-	assert_eq!(run(src, "first_over([1, 2, 3], 100)"), "-1");
+	assert_eq!(
+		run(
+			src,
+			"first_over(new NList([new NInt(1), new NInt(5), new NInt(9)]), new NInt(3))"
+		),
+		"5"
+	);
+	assert_eq!(
+		run(
+			src,
+			"first_over(new NList([new NInt(1), new NInt(2), new NInt(3)]), new NInt(100))"
+		),
+		"-1"
+	);
 }
 
 #[test]
@@ -1089,8 +1222,8 @@ fn runs_return_inside_a_statement_position_match() {
 			n * 2
 		}
 	"#;
-	assert_eq!(run(src, "classify(0)"), "100");
-	assert_eq!(run(src, "classify(5)"), "10");
+	assert_eq!(run(src, "classify(new NInt(0))"), "100");
+	assert_eq!(run(src, "classify(new NInt(5))"), "10");
 }
 
 #[test]
@@ -1169,7 +1302,10 @@ fn runs_shadowed_name_inside_a_method_body() {
 			}
 		}
 	"#;
-	assert_eq!(run(src, "new Counter({ n: 10 }).bump(5)"), "15");
+	assert_eq!(
+		run(src, "new Counter({ n: new NInt(10) }).bump(new NInt(5))"),
+		"15"
+	);
 }
 
 #[test]
@@ -1303,8 +1439,8 @@ fn runs_bare_return_as_an_unbraced_while_body() {
 			0
 		}
 	"#;
-	assert_eq!(run(src, "f(5)"), "5");
-	assert_eq!(run(src, "f(0)"), "0");
+	assert_eq!(run(src, "f(new NInt(5))"), "5");
+	assert_eq!(run(src, "f(new NInt(0))"), "0");
 }
 
 #[test]
@@ -1315,8 +1451,8 @@ fn runs_bare_return_as_an_unbraced_if_then_branch() {
 			n
 		}
 	"#;
-	assert_eq!(run(src, "f(-3)"), "3");
-	assert_eq!(run(src, "f(3)"), "3");
+	assert_eq!(run(src, "f(new NInt(-3))"), "3");
+	assert_eq!(run(src, "f(new NInt(3))"), "3");
 }
 
 // ── Slice 4G: call-site bound enforcement ───────────────────────────────────
@@ -1336,7 +1472,7 @@ fn runs_bound_satisfying_call_both_spellings() {
 		func measure_sugar(shape: Area): int = shape.area()
 		func total(s: Square): int = measure_explicit(s) + measure_sugar(s)
 	"#;
-	assert_eq!(run(src, "total(new Square({ side: 4 }))"), "32");
+	assert_eq!(run(src, "total(new Square({ side: new NInt(4) }))"), "32");
 }
 
 // ── Slice 4H: string expressions ─────────────────────────────────────────────
@@ -1372,14 +1508,23 @@ fn runs_string_interpolation_with_a_non_string_interpoland() {
 fn runs_string_equality() {
 	// `==` on strings dispatches as `BuiltinEager` to native JS `===`.
 	let src = "func eq(a: string, b: string): boolean = a == b";
-	assert_eq!(run(src, r#"eq("x", "x")"#), "true");
-	assert_eq!(run(src, r#"eq("x", "y")"#), "false");
+	assert_eq!(
+		run(src, r#"eq(new NString("x"), new NString("x"))"#),
+		"true"
+	);
+	assert_eq!(
+		run(src, r#"eq(new NString("x"), new NString("y"))"#),
+		"false"
+	);
 }
 
 #[test]
 fn runs_string_concatenation() {
 	let src = "func cat(a: string, b: string): string = a + b";
-	assert_eq!(run(src, r#"cat("foo", "bar")"#), "foobar");
+	assert_eq!(
+		run(src, r#"cat(new NString("foo"), new NString("bar"))"#),
+		"foobar"
+	);
 }
 
 #[test]
@@ -1408,7 +1553,7 @@ fn runs_a_for_loop_over_an_exclusive_range() {
 		}
 	"#;
 	// 1..5 exclusive: 1 + 2 + 3 + 4 = 10.
-	assert_eq!(run(src, "sum_to(5)"), "10");
+	assert_eq!(run(src, "sum_to(new NInt(5))"), "10");
 }
 
 #[test]
@@ -1423,7 +1568,40 @@ fn runs_a_for_loop_over_an_inclusive_range() {
 		}
 	"#;
 	// 1..=5 inclusive: 1 + 2 + 3 + 4 + 5 = 15.
-	assert_eq!(run(src, "sum_to_inclusive(5)"), "15");
+	assert_eq!(run(src, "sum_to_inclusive(new NInt(5))"), "15");
+}
+
+#[test]
+fn runs_integer_range_protocol_edges() {
+	let src = r#"
+		func uint_sum(): uint = {
+			let mut total = 0u
+			for (i in 1u..4u) { total = total + i }
+			total
+		}
+		func equal_exclusive(): int = {
+			let mut count = 0
+			for (_ in 2..2) { count = count + 1 }
+			count
+		}
+		func equal_inclusive(): int = {
+			let mut count = 0
+			for (_ in 2..=2) { count = count + 1 }
+			count
+		}
+		func descending(): int = {
+			let mut count = 0
+			for (_ in 3..1) { count = count + 1 }
+			count
+		}
+	"#;
+	assert_eq!(
+		run(
+			src,
+			"[uint_sum().v, equal_exclusive().v, equal_inclusive().v, descending().v].join(',')"
+		),
+		"6,0,1,0"
+	);
 }
 
 #[test]
@@ -1441,7 +1619,7 @@ fn runs_a_for_loop_with_a_call_expression_upper_bound() {
 		}
 	"#;
 	// 1..4 exclusive: 1 + 2 + 3 = 6.
-	assert_eq!(run(src, "sum_to_call_bound()"), "6");
+	assert_eq!(run(src, "sum_to_call_bound().v"), "6");
 }
 
 #[test]
@@ -1469,9 +1647,15 @@ fn runs_a_for_loop_with_a_parenthesized_range_bound() {
 		}
 	"#;
 	// 1..5 exclusive: 1 + 2 + 3 + 4 = 10.
-	assert_eq!(run(src, "sum_paren_literal()"), "10");
+	assert_eq!(run(src, "sum_paren_literal().v"), "10");
 	// (1 + 2)..7 exclusive == 3..7: 3 + 4 + 5 + 6 = 18.
-	assert_eq!(run(src, "sum_paren_binary(1, 2, 7)"), "18");
+	assert_eq!(
+		run(
+			src,
+			"sum_paren_binary(new NInt(1), new NInt(2), new NInt(7)).v",
+		),
+		"18"
+	);
 }
 
 // ── Iterator for-loops (Tier 1, Track A) ─────────────────────────────────────
@@ -1591,6 +1775,32 @@ fn runs_a_for_loop_over_an_iterable_via_iter() {
 }
 
 #[test]
+fn runs_a_for_loop_over_a_generic_iterable_bound() {
+	let src = r#"
+		enum Option<T> { Some(value: T), None }
+		interface Iterator<Item> { mut func next(): Option<Item> }
+		interface Iterable<Item> { func iter(): Iterator<Item> }
+		struct Counter(n: int, max: int)
+		impl Iterator<int> for Counter {
+			mut func next(): Option<int> = if (this.n > this.max) { None } else {
+				let value = this.n
+				this.n = this.n + 1
+				Some(value = value)
+			}
+		}
+		struct Bag(max: int)
+		impl Iterable<int> for Bag { func iter(): Counter = Counter(n = 1, max = this.max) }
+		func sum<T: Iterable<Item = int>>(items: T): int = {
+			let mut total = 0
+			for (item in items) { total = total + item }
+			total
+		}
+		func demo(): int = sum(Bag(max = 4))
+	"#;
+	assert_eq!(run(src, "demo().v"), "10");
+}
+
+#[test]
 fn runs_a_for_loop_over_a_spread_param_bound_to_a_list() {
 	let src = r#"
 		func total<Item>(...from: #[Item]): int = {
@@ -1636,10 +1846,22 @@ fn runs_user_contains_impl_dispatches_in_and_not_in() {
 		func has(b: Bag, x: int): boolean = x in b
 		func lacks(b: Bag, x: int): boolean = x !in b
 	"#;
-	assert_eq!(run(src, "has(new Bag({ n: 5 }), 5)"), "true");
-	assert_eq!(run(src, "has(new Bag({ n: 5 }), 6)"), "false");
-	assert_eq!(run(src, "lacks(new Bag({ n: 5 }), 6)"), "true");
-	assert_eq!(run(src, "lacks(new Bag({ n: 5 }), 5)"), "false");
+	assert_eq!(
+		run(src, "has(new Bag({ n: new NInt(5) }), new NInt(5))"),
+		"true"
+	);
+	assert_eq!(
+		run(src, "has(new Bag({ n: new NInt(5) }), new NInt(6))"),
+		"false"
+	);
+	assert_eq!(
+		run(src, "lacks(new Bag({ n: new NInt(5) }), new NInt(6))"),
+		"true"
+	);
+	assert_eq!(
+		run(src, "lacks(new Bag({ n: new NInt(5) }), new NInt(5))"),
+		"false"
+	);
 }
 
 #[test]
@@ -1679,11 +1901,17 @@ fn runs_user_unwrap_impl_dispatches_eagerly() {
 		func get(m: MaybeInt, d: int): int = m ?? d
 	"#;
 	assert_eq!(
-		run(src, "get(new MaybeInt({ present: true, value: 7 }), 99)"),
+		run(
+			src,
+			"get(new MaybeInt({ present: { v: true }, value: { v: 7 } }), { v: 99 })"
+		),
 		"7"
 	);
 	assert_eq!(
-		run(src, "get(new MaybeInt({ present: false, value: 7 }), 99)"),
+		run(
+			src,
+			"get(new MaybeInt({ present: { v: false }, value: { v: 7 } }), { v: 99 })"
+		),
 		"99"
 	);
 }
@@ -1792,7 +2020,7 @@ fn runs_impl_mut_method_mutates_a_this_field() {
 			c.n
 		}
 	"#;
-	assert_eq!(run(src, "run_bump(new Counter({ n: 5 }))"), "6");
+	assert_eq!(run(src, "run_bump(new Counter({ n: new NInt(5) }))"), "6");
 }
 
 #[test]
@@ -1808,7 +2036,7 @@ fn runs_field_slot_reassignment_gated_on_a_mut_receiver() {
 			c.n
 		}
 	"#;
-	assert_eq!(run(src, "bump(new Counter({ n: 5 }))"), "6");
+	assert_eq!(run(src, "bump(new Counter({ n: new NInt(5) }))"), "6");
 }
 
 #[test]
@@ -1827,7 +2055,10 @@ fn runs_nested_mut_field_slot_reassignment_through_an_immutable_receiver() {
 		}
 	"#;
 	assert_eq!(
-		run(src, "bump(new Wrapper({ inner: new Counter({ n: 5 }) }))"),
+		run(
+			src,
+			"bump(new Wrapper({ inner: new Counter({ n: new NInt(5) }) }))"
+		),
 		"6"
 	);
 }
@@ -1863,7 +2094,10 @@ fn runs_list_index_assignment() {
 		}
 	"#;
 	assert_eq!(
-		run(src, "JSON.stringify(set([1, 2, 3], 1, 99))"),
+		run(
+			src,
+			"JSON.stringify(nymphTestValue(set({ v: [{ v: 1 }, { v: 2 }, { v: 3 }] }, { v: 1 }, { v: 99 })))"
+		),
 		"[1,99,3]"
 	);
 }
@@ -1888,15 +2122,15 @@ fn runs_map_index_assignment() {
 #[test]
 fn runs_is_matching_and_non_matching_literal_patterns() {
 	let src = "func f(x: int): boolean = x is 5";
-	assert_eq!(run(src, "f(5)"), "true");
-	assert_eq!(run(src, "f(6)"), "false");
+	assert_eq!(run(src, "f(new NInt(5))"), "true");
+	assert_eq!(run(src, "f(new NInt(6))"), "false");
 }
 
 #[test]
 fn runs_not_is_matching_and_non_matching_literal_patterns() {
 	let src = "func f(x: int): boolean = x !is 5";
-	assert_eq!(run(src, "f(5)"), "false");
-	assert_eq!(run(src, "f(6)"), "true");
+	assert_eq!(run(src, "f(new NInt(5))"), "false");
+	assert_eq!(run(src, "f(new NInt(6))"), "true");
 }
 
 #[test]
@@ -1909,15 +2143,15 @@ fn runs_is_with_a_variant_pattern_and_a_literal_field() {
 		func is_big_circle(s: Shape): boolean = s is Circle(radius = 20)
 	"#;
 	assert_eq!(
-		run(src, "is_big_circle(Shape.Circle({ radius: 20 }))"),
+		run(src, "is_big_circle(Shape.Circle({ radius: new NInt(20) }))"),
 		"true"
 	);
 	assert_eq!(
-		run(src, "is_big_circle(Shape.Circle({ radius: 5 }))"),
+		run(src, "is_big_circle(Shape.Circle({ radius: new NInt(5) }))"),
 		"false"
 	);
 	assert_eq!(
-		run(src, "is_big_circle(Shape.Square({ side: 20 }))"),
+		run(src, "is_big_circle(Shape.Square({ side: new NInt(20) }))"),
 		"false"
 	);
 }
@@ -2132,21 +2366,21 @@ fn namespaced_static_and_interface_impl_method_sharing_a_name_both_run() {
 	assert_eq!(
 		run(
 			src,
-			"JSON.stringify(via_static(new Vec2({ x: 1, y: 2 }), new Vec2({ x: 10, y: 20 })))"
+			"JSON.stringify(nymphTestValue(via_static(new Vec2({ x: new NInt(1), y: new NInt(2) }), new Vec2({ x: new NInt(10), y: new NInt(20) }))))"
 		),
 		r#"{"x":11,"y":22}"#
 	);
 	assert_eq!(
 		run(
 			src,
-			"JSON.stringify(via_instance(new Vec2({ x: 1, y: 2 }), new Vec2({ x: 10, y: 20 })))"
+			"JSON.stringify(nymphTestValue(via_instance(new Vec2({ x: new NInt(1), y: new NInt(2) }), new Vec2({ x: new NInt(10), y: new NInt(20) }))))"
 		),
 		r#"{"x":11,"y":22}"#
 	);
 	assert_eq!(
 		run(
 			src,
-			"JSON.stringify(via_operator(new Vec2({ x: 1, y: 2 }), new Vec2({ x: 10, y: 20 })))"
+			"JSON.stringify(nymphTestValue(via_operator(new Vec2({ x: new NInt(1), y: new NInt(2) }), new Vec2({ x: new NInt(10), y: new NInt(20) }))))"
 		),
 		r#"{"x":11,"y":22}"#
 	);
@@ -2174,7 +2408,7 @@ fn runs_bool_or_short_circuits_never_evaluating_the_rhs() {
 		func recurse(): boolean = recurse()
 		func f(a: boolean): boolean = a || recurse()
 	";
-	assert_eq!(run(src, "f(true)"), "true");
+	assert_eq!(run(src, "f({ v: true })"), "true");
 }
 
 // ── Closures (Slice 4L) ──────────────────────────────────────────────────────
@@ -2401,7 +2635,13 @@ fn runs_a_list_spread_over_a_native_list_source() {
 	let src = r#"
 		func f(xs: #[int]): #[int] = #[...xs, 4]
 	"#;
-	assert_eq!(run(src, "JSON.stringify(f([1, 2, 3]))"), "[1,2,3,4]");
+	assert_eq!(
+		run(
+			src,
+			"JSON.stringify(nymphTestValue(f(new NList([new NInt(1), new NInt(2), new NInt(3)]))))"
+		),
+		"[1,2,3,4]"
+	);
 }
 
 #[test]
@@ -2427,7 +2667,10 @@ fn runs_a_list_spread_over_a_user_iterator_source() {
 			#[...c, 99]
 		}
 	"#;
-	assert_eq!(run(src, "JSON.stringify(f())"), "[1,2,3,99]");
+	assert_eq!(
+		run(src, "JSON.stringify(nymphTestValue(f()))"),
+		"[1,2,3,99]"
+	);
 }
 
 #[test]
@@ -2457,7 +2700,7 @@ fn runs_a_list_spread_over_an_iterable_via_iter_source() {
 			#[0, ...b]
 		}
 	"#;
-	assert_eq!(run(src, "JSON.stringify(f())"), "[0,1,2,3]");
+	assert_eq!(run(src, "JSON.stringify(nymphTestValue(f()))"), "[0,1,2,3]");
 }
 
 #[test]
@@ -2466,7 +2709,13 @@ fn runs_a_mid_list_spread_preserves_order() {
 	let src = r#"
 		func f(xs: #[int]): #[int] = #[0, ...xs, 9]
 	"#;
-	assert_eq!(run(src, "JSON.stringify(f([1, 2, 3]))"), "[0,1,2,3,9]");
+	assert_eq!(
+		run(
+			src,
+			"JSON.stringify(nymphTestValue(f(new NList([new NInt(1), new NInt(2), new NInt(3)]))))"
+		),
+		"[0,1,2,3,9]"
+	);
 }
 
 #[test]
@@ -2479,7 +2728,7 @@ fn runs_a_map_spread_merge_with_later_key_wins() {
 	assert_eq!(
 		run(
 			src,
-			"JSON.stringify([...f(new Map([[1, 10], [2, 20], [3, 30]]))])"
+			"JSON.stringify(nymphTestValue(f(new Map([[new NInt(1), new NInt(10)], [new NInt(2), new NInt(20)], [new NInt(3), new NInt(30)]]))).sort(([a], [b]) => a - b))"
 		),
 		"[[1,100],[2,20],[3,30],[4,40]]"
 	);
@@ -2508,7 +2757,10 @@ fn runs_a_map_spread_over_a_non_map_iterable_of_pairs() {
 		}
 	"#;
 	assert_eq!(
-		run(src, "JSON.stringify([...f()])"),
+		run(
+			src,
+			"JSON.stringify(nymphTestValue(f()).sort(([a], [b]) => a - b))"
+		),
 		r#"[[1,"x"],[2,"x"],[3,"x"],[9,"z"]]"#
 	);
 }
@@ -2525,7 +2777,10 @@ fn runs_a_map_spread_over_a_native_list_of_pairs_source() {
 		}
 	"#;
 	assert_eq!(
-		run(src, "JSON.stringify([...f()])"),
+		run(
+			src,
+			"JSON.stringify(nymphTestValue(f()).sort(([a], [b]) => a - b))"
+		),
 		r#"[[1,"a"],[2,"b"],[9,"z"]]"#
 	);
 }
@@ -2547,9 +2802,9 @@ fn runs_a_map_spread_computed_key_eval_order() {
 		func f(m: #{int: int}, logger: mut Logger): #{int: int} = #{...m, logger.record(1): 999}
 	"#;
 	let mutation_check = r#"
-		const logger = new Logger({ count: 0 });
-		const result = f(new Map([[1, 10], [2, 20]]), logger);
-		return JSON.stringify([logger.count, [...result]]);
+		const logger = new Logger({ count: new NInt(0) });
+		const result = f(new Map([[new NInt(1), new NInt(10)], [new NInt(2), new NInt(20)]]), logger);
+		return JSON.stringify(nymphTestValue([logger.count, result]));
 	"#;
 	assert_eq!(
 		run(src, &format!("(() => {{ {mutation_check} }})()")),
@@ -2715,13 +2970,13 @@ fn mixed_int_uint_operators_run_under_node() {
 		func eq(a: int, b: uint): boolean = a == b\n\
 		func ne(a: int, b: uint): boolean = a != b";
 	let js = compile_against_real_stdlib(src);
-	assert_eq!(run_js(js.clone(), "add(3, 2)"), "5");
-	assert_eq!(run_js(js.clone(), "sub(2, 5)"), "-3");
-	assert_eq!(run_js(js.clone(), "mul(4, 3)"), "12");
-	assert_eq!(run_js(js.clone(), "div(7, 2)"), "3.5");
-	assert_eq!(run_js(js.clone(), "lt(3, 5)"), "true");
-	assert_eq!(run_js(js.clone(), "eq(4, 4)"), "true");
-	assert_eq!(run_js(js, "ne(4, 5)"), "true");
+	assert_eq!(run_js(js.clone(), "add(new NInt(3), new NUint(2))"), "5");
+	assert_eq!(run_js(js.clone(), "sub(new NInt(2), new NUint(5))"), "-3");
+	assert_eq!(run_js(js.clone(), "mul(new NInt(4), new NUint(3))"), "12");
+	assert_eq!(run_js(js.clone(), "div(new NInt(7), new NUint(2))"), "3.5");
+	assert_eq!(run_js(js.clone(), "lt(new NInt(3), new NUint(5))"), "true");
+	assert_eq!(run_js(js.clone(), "eq(new NInt(4), new NUint(4))"), "true");
+	assert_eq!(run_js(js, "ne(new NInt(4), new NUint(5))"), "true");
 }
 
 // FLIP (Gap 3, L0): `is_empty` (`this.length() == 0`) is real Nymph source,
@@ -2860,11 +3115,14 @@ fn real_option_is_some_and_is_none_materialize_onto_the_option_class_and_run() {
 		func check(o: Option<int>): #(boolean, boolean) = #(o.is_some(), o.is_none())
 	"#;
 	assert_eq!(
-		run_against_real_stdlib(user, "JSON.stringify(check(Option.Some({ value: 1 })))"),
+		run_against_real_stdlib(
+			user,
+			"JSON.stringify(nymphTestValue(check(Option.Some({ value: new NInt(1) }))))"
+		),
 		"[true,false]"
 	);
 	assert_eq!(
-		run_against_real_stdlib(user, "JSON.stringify(check(Option.None))"),
+		run_against_real_stdlib(user, "JSON.stringify(nymphTestValue(check(Option.None)))"),
 		"[false,true]"
 	);
 }
@@ -2898,7 +3156,7 @@ fn real_option_map_materializes_and_runs() {
 		func inc(o: Option<int>): Option<int> = o.map((x) -> x + 1)
 	"#;
 	assert_eq!(
-		run_against_real_stdlib(user, "inc(Option.Some({ value: 1 })).value"),
+		run_against_real_stdlib(user, "inc(Option.Some({ value: new NInt(1) })).value"),
 		"2"
 	);
 }
@@ -2981,27 +3239,17 @@ fn real_option_map_or_default_stays_a_loud_defer_even_on_demand() {
 }
 
 #[test]
-#[should_panic(
-	expected = "does not yet support dispatching a method call to a method resolved through a prelude-only impl"
-)]
-fn real_range_contains_stays_a_loud_defer_no_prelude_struct_materialization() {
-	// OUT OF SCOPE, documented (not a regression): `Range` is a generic
-	// STRUCT (`range/mod.nym`), not an enum, and this slice's materialization
-	// machinery — `materialize_referenced_prelude_enums`/`materialize_prelude_enum` —
-	// only ever handles a prelude `enum`. There is no prelude-STRUCT
-	// equivalent, so a named struct receiver (`Range`, or any other) must
-	// keep panicking exactly as before this slice, mirroring
-	// `nymph-sema/tests/prelude.rs`'s `inherent_prelude_struct_receiver_still_stays_a_loud_defer`.
-	// `contains`'s own body (`this.start <= item && this.end > item`) would
-	// ALSO hit the pre-existing erased-generic-operator limitation on `Idx`
-	// even if struct materialization existed — a separate, still-future slice.
+fn real_range_contains_emits_generic_comparison_dispatch() {
 	let user = r#"
 		func in_range(x: int): boolean = {
 			let r = Range(start = 0, end = 5)
 			r.contains(x)
 		}
 	"#;
-	let _ = compile_against_real_stdlib(user);
+	let js = compile_against_real_stdlib(user);
+	assert!(js.contains("Symbol.for(\"nymph.int\")"), "{js}");
+	assert!(js.contains("$std$Comparable$int$less_than_eq"), "{js}");
+	assert!(js.contains("$std$Comparable$int$greater_than"), "{js}");
 }
 
 // ── Structural-collection interface-impl materialization (`ImplFor` targeting
@@ -3074,7 +3322,7 @@ fn runs_prelude_interface_default_calling_sibling_method_on_list_materializes_an
 	// concrete `impl<T> SomeIface for #[T]` block — the ordinary span-scan
 	// in `try_materialize_prelude_dispatch` can never match it. Before the
 	// fix this panicked mid-materialization (`base` "not yet supported");
-	// now `lower_prelude_func` pushes a sibling-dispatch frame while
+	// now `lower_runtime_func` pushes a sibling-dispatch frame while
 	// lowering `doubled`'s own body, so the inner call resolves directly to
 	// `$std$SomeIface$list$base` — the SAME mangled name a direct outer call
 	// to `.base()` would produce — and `.doubled()` runs to `21 + 21 = 42`.
@@ -3197,8 +3445,8 @@ fn a_fresh_map_literal_at_a_mut_struct_ctor_field_is_mutated_and_read_back() {
 fn an_unannotated_inherent_method_with_an_if_block_body_runs_and_returns_the_branches_common_type()
 {
 	let user = "struct Wrapper(flag: boolean) {}\nimpl Wrapper {\n\tmut func toggle(cond: boolean) = if (cond) {\n\t\tthis.flag = true\n\t\ttrue\n\t} else false\n}\nfunc t(cond: boolean): boolean = {\n\tlet mut w = Wrapper(flag = false)\n\tw.toggle(cond)\n}";
-	assert_eq!(run(user, "t(true)"), "true");
-	assert_eq!(run(user, "t(false)"), "false");
+	assert_eq!(run(user, "t(new NBool(true))"), "true");
+	assert_eq!(run(user, "t(new NBool(false))"), "false");
 }
 
 // ── Mutable-field projection + still-generic bound dispatch (iterator-adapter

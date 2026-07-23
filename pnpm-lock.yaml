@@ -8,6 +8,9 @@ importers:
 
   .:
     devDependencies:
+      '@types/node':
+        specifier: 26.1.1
+        version: 26.1.1
       oxfmt:
         specifier: ^0.59.0
         version: 0.59.0
@@ -17,6 +20,9 @@ importers:
       oxlint-tsgolint:
         specifier: ^7.0.2001
         version: 7.0.2001
+      typescript:
+        specifier: 7.0.2
+        version: 7.0.2
 
   docs:
     devDependencies:

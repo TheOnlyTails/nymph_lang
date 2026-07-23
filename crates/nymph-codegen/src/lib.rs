@@ -9,7 +9,9 @@ mod strip;
 use nymph_diagnostics::Diagnostic;
 use nymph_hir::hir::HirModule;
 
-pub use box_rt::{BOX_MODULE_KEY, box_module_source, box_preamble};
+pub use box_rt::{
+	BOX_MODULE_DECLARATIONS, BOX_MODULE_KEY, box_module_declarations, box_module_source, box_preamble,
+};
 pub use strip::strip_ts_to_js;
 
 /// Emit an ES module string for `module`.

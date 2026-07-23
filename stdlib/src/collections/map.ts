@@ -1,5 +1,5 @@
-import { Option } from "../option";
-import { NBool, NList, NMap, NString, NTuple, NUint } from "../box";
+import { NBool, NList, NMap, NString, NTuple, NUint } from "std/box";
+import { Option } from "std/option";
 
 export const size = <K, V>($_this: NMap<K, V>) => new NUint($_this.size);
 export const get = <K, V>($_this: NMap<K, V>, key: K) =>

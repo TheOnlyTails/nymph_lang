@@ -87,14 +87,34 @@ fn relational_operators_rebox_as_nbool() {
 }
 
 #[test]
-fn non_primitive_equality_preserves_identity_until_value_equality_lands() {
-	let src = "interface Equals<Other> { func equals(other: Other): boolean }
+fn non_primitive_equality_dispatches_to_equals_and_not_equals() {
+	let src = "interface Equals<Other> {
+		func equals(other: Other): boolean
+		func not_equals(other: Other): boolean = !this.equals(other)
+	}
 		struct Point(x: int)
 		impl Equals<Other = Point> for Point { func equals(other: Point): boolean = true }
 		func distinct(): boolean = Point(x = 1) == Point(x = 1)
-		func identical(): boolean = { let p = Point(x = 1) p == p }";
-	assert_eq!(run(src, "distinct().v"), "false");
+		func identical(): boolean = { let p = Point(x = 1) p == p }
+		func different(): boolean = Point(x = 1) != Point(x = 2)";
+	assert_eq!(run(src, "distinct().v"), "true");
 	assert_eq!(run(src, "identical().v"), "true");
+	assert_eq!(run(src, "different().v"), "false");
+}
+
+#[test]
+fn explicit_not_equals_override_wins() {
+	let src = "interface Equals<Other> {
+		func equals(other: Other): boolean
+		func not_equals(other: Other): boolean = !this.equals(other)
+	}
+		struct Point(x: int)
+		impl Equals<Other = Point> for Point {
+			func equals(other: Point): boolean = true
+			func not_equals(other: Point): boolean = true
+		}
+		func different(): boolean = Point(x = 1) != Point(x = 1)";
+	assert_eq!(run(src, "different().v"), "true");
 }
 
 #[test]
@@ -110,6 +130,25 @@ fn late_resolved_primitive_equality_compares_payloads() {
 	assert!(
 		js.contains(").v === xs.index(") && js.contains(").v)"),
 		"late-resolved primitive equality compares boxed payloads: {js}"
+	);
+}
+
+#[test]
+fn late_resolved_adt_equality_dispatches_to_equals() {
+	let js = emit_js(
+		"interface Equals<Other> { func equals(other: Other): boolean }
+		struct Point(x: int)
+		impl Equals<Other = Point> for Point { func equals(other: Point): boolean = true }
+		func same(): boolean = {
+			let xs = #[]
+			let result = xs[0] == xs[0]
+			let pin: #[Point] = xs
+			result
+		}",
+	);
+	assert!(
+		js.contains("xs.index(") && js.contains(".equals(xs.index("),
+		"late-resolved ADT equality dispatches to Equals: {js}"
 	);
 }
 

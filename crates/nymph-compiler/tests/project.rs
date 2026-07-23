@@ -229,7 +229,7 @@ fn run_project(files: FxHashMap<&'static str, &'static str>, call_fn: &str, args
 	let call_symbol = compiled.entry_symbol(call_fn);
 	let mut js = compiled.js;
 	js.push_str(&format!("\n{}();\n", compiled.entry_main));
-	js.push_str(&format!("console.log({call_symbol}({args}));\n"));
+	js.push_str(&format!("console.log({call_symbol}({args}).v);\n"));
 	static COUNTER: AtomicU64 = AtomicU64::new(0);
 	let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
 	let dir = std::env::temp_dir();
@@ -493,6 +493,39 @@ fn a_with_name_colliding_with_a_namespace_name_is_a_diagnostic() {
 	assert!(
 		diags.iter().any(|d| d.diag.code.contains("COLLISION")),
 		"expected a with/namespace name-collision diagnostic, got: {diags:?}"
+	);
+}
+
+#[test]
+fn project_module_cannot_be_silently_replaced_by_a_runtime_module() {
+	let files = FxHashMap::from_iter([("std/option", "func main(): void = {}")]);
+	let diags = match compile_project("std/option", &loader(files)) {
+		Ok(_) => panic!("the canonical runtime module must not overwrite the project entry"),
+		Err(diags) => diags,
+	};
+	assert!(
+		diags
+			.iter()
+			.any(|d| d.diag.code.contains("RUNTIME-MODULE-COLLISION")),
+		"expected a runtime-module collision diagnostic, got: {diags:?}"
+	);
+}
+
+#[test]
+fn project_module_cannot_be_silently_replaced_by_an_intrinsic_module() {
+	let files = FxHashMap::from_iter([
+		("main", "import @/std/box\nfunc main(): void = {}"),
+		("std/box", "public func local(): int = 1"),
+	]);
+	let diags = match compile_project("main", &loader(files)) {
+		Ok(_) => panic!("an intrinsic runtime module must not overwrite a project dependency"),
+		Err(diags) => diags,
+	};
+	assert!(
+		diags
+			.iter()
+			.any(|d| d.diag.code.contains("RUNTIME-MODULE-COLLISION")),
+		"expected a runtime-module collision diagnostic, got: {diags:?}"
 	);
 }
 

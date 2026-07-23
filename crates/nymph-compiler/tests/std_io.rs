@@ -125,6 +125,139 @@ fn print_has_no_newline_and_println_does() {
 	);
 }
 
+#[test]
+fn display_and_debug_render_primitives_and_nested_collections() {
+	let entry = r#"import std/io with (println)
+func main(): void = {
+	println(1)
+	println(1.0)
+	println(true)
+	println('x')
+	println("hi")
+	println(#["a", "b"].debug())
+}"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &real_stdlib_provider)
+		.expect("Display/Debug values should compile through std/io");
+	let mut js = compiled.js;
+	js.push_str(&format!("\n{}();\n", compiled.entry_main));
+	assert_eq!(
+		run_node(&js, "display_debug"),
+		"1\n1.0\ntrue\nx\nhi\n#[\"a\", \"b\"]\n"
+	);
+}
+
+#[test]
+fn composite_display_and_debug_use_nested_debug_overrides() {
+	let entry = r#"import std/io with (println)
+struct Marker(v: int) {
+	impl Debug {
+		func debug(): string = "<marker>"
+	}
+}
+struct Holder(value: Marker, v: int)
+func main(): void = {
+	println(#[Marker(v = 1)].debug())
+	println(Holder(value = Marker(v = 1), v = 2).debug())
+	println(Holder(value = Marker(v = 1), v = 2))
+}"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &real_stdlib_provider)
+		.expect("nested Debug overrides should compile through composite Display/Debug");
+	let mut js = compiled.js;
+	js.push_str(&format!("\n{}();\n", compiled.entry_main));
+	assert_eq!(
+		run_node(&js, "nested_debug"),
+		"#[<marker>]\nHolder(value: <marker>, v: 2)\nHolder(value: <marker>, v: 2)\n"
+	);
+}
+
+#[test]
+fn debug_escapes_control_characters() {
+	let entry = r#"import std/io with (println)
+func main(): void = {
+	println('\n'.debug())
+	println('\r'.debug())
+	println('\t'.debug())
+}"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &real_stdlib_provider)
+		.expect("Debug should compile for escaped characters");
+	let mut js = compiled.js;
+	js.push_str(&format!("\n{}();\n", compiled.entry_main));
+	assert_eq!(run_node(&js, "debug_chars"), "'\\n'\n'\\r'\n'\\t'\n");
+}
+
+#[test]
+fn interpolation_uses_overridden_display_and_boxes_once() {
+	let entry = r#"import std/io with (println)
+struct Label(value: int) {
+	impl Display {
+		func display(): string = "label=${this.value}"
+	}
+}
+func rendered(): string = "value=${Label(value = 7)}!"
+func main(): void = println(rendered())"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &real_stdlib_provider)
+		.expect("interpolation should resolve Display and compile");
+	let mut js = compiled.js;
+	js.push_str(&format!("\n{}();\n", compiled.entry_main));
+	assert_eq!(run_node(&js, "interpolation_display"), "value=label=7!\n");
+}
+
+#[test]
+fn into_string_delegates_to_display() {
+	let entry = r#"import std/io with (println)
+struct Label(value: int) {
+	impl Display {
+		func display(): string = "label=${this.value}"
+	}
+}
+func main(): void = {
+	println(1 as string)
+	println(Label(value = 7) as string)
+}"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &real_stdlib_provider)
+		.expect("Into<string> should be available through the blanket Display implementation");
+	let mut js = compiled.js;
+	js.push_str(&format!("\n{}();\n", compiled.entry_main));
+	assert_eq!(run_node(&js, "display_into_string"), "1\nlabel=7\n");
+}
+
+#[test]
+fn unrelated_inherent_methods_do_not_override_display_protocols() {
+	let entry = r#"import std/io with (println)
+struct Coin() {
+	func display(): int = 7
+	func debug(): int = 8
+}
+func main(): void = {
+	println(Coin())
+	println(#[Coin()].debug())
+}"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &real_stdlib_provider)
+		.expect("unrelated inherent method names should not affect blanket Display/Debug");
+	let mut js = compiled.js;
+	js.push_str(&format!("\n{}();\n", compiled.entry_main));
+	assert_eq!(run_node(&js, "nominal_display"), "Coin\n#[Coin]\n");
+}
+
+#[test]
+fn println_accepts_void_through_blanket_display() {
+	let entry = r#"import std/io with (println)
+func noop(): void = {}
+func main(): void = println(noop())"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &real_stdlib_provider)
+		.expect("void should satisfy the blanket Display implementation");
+	let mut js = compiled.js;
+	js.push_str(&format!("\n{}();\n", compiled.entry_main));
+	assert_eq!(run_node(&js, "display_void"), "undefined\n");
+}
+
 /// A program that does NOT `import std/io` is completely unaffected — the
 /// free-function dispatch only ever consults `self.prelude_modules` (core
 /// plus whatever the entry module actually imports), so with no io import
@@ -150,7 +283,7 @@ fn a_program_without_importing_io_is_unaffected() {
 
 	let call = compiled.entry_symbol("demo");
 	let mut js = compiled.js;
-	js.push_str(&format!("\nconsole.log({call}());\n"));
+	js.push_str(&format!("\nconsole.log({call}().v);\n"));
 
 	assert_eq!(run_node(&js, "no_io").trim(), "5");
 }

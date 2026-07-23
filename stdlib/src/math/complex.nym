@@ -42,8 +42,8 @@ public struct Complex(real: float, imaginary: float) {
     )
   }
 
-  impl Into<string> {
-    func into() = if (this.real == 0 && this.imaginary == 0) {
+  impl Display {
+    func display() = if (this.real == 0 && this.imaginary == 0) {
       "0"
     } else if (this.imaginary == 0) {
       "${this.real}"

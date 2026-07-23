@@ -1,5 +1,5 @@
 import @/option with (Option)
-import @/ops with (Plus, Into, Contains, Equals)
+import @/ops with (Plus, Contains, Equals)
 
 impl<T> mut #[T] {
   external(length) func length(): uint
@@ -56,10 +56,6 @@ impl<T> #[T] {
 
 impl<T> Plus<Other = self, Output = self> for #[T] {
   external(concat) func plus(other: self): self
-}
-
-impl<T: Into<string>> Into<string> for #[T] {
-  external(to_string) func into(): string
 }
 
 impl<T: Equals<Other = T>> Contains<Item = T> for #[T] {

@@ -370,6 +370,20 @@ fn for_in_over_an_iterable_via_iter_types_the_element() {
 }
 
 #[test]
+fn for_in_over_generic_iterable_bound_types_the_element() {
+	assert_ok(
+		"enum Option<T> { Some(value: T), None }
+		 interface Iterator<Item> { mut func next(): Option<Item> }
+		 interface Iterable<Item> { func iter(): Iterator<Item> }
+		 func first_sum<T: Iterable<Item = int>>(items: T): int = {
+		   let mut total = 0
+		   for (item in items) { total = total + item }
+		   total
+		 }",
+	);
+}
+
+#[test]
 fn for_in_over_a_non_iterable_source_is_diagnosed() {
 	// RR1: a source that implements neither `Iterator` nor `Iterable` is a
 	// hard error now, not a silent `self.fresh()` accept that let the loop
@@ -395,6 +409,22 @@ fn for_in_over_an_unbounded_generic_param_is_diagnosed() {
 		   0
 		 }",
 		"not iterable",
+	);
+}
+
+#[test]
+fn float_ranges_are_diagnosed() {
+	assert_error_contains(
+		"func f(): void = { for (value in 0.5..2.5) { value } }",
+		"range bounds must be `int` or `uint`, not `float`",
+	);
+}
+
+#[test]
+fn char_ranges_are_diagnosed() {
+	assert_error_contains(
+		"func f(): void = { for (value in 'a'..'z') { value } }",
+		"range bounds must be `int` or `uint`, not `char`",
 	);
 }
 

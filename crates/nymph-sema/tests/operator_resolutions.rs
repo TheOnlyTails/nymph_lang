@@ -267,13 +267,13 @@ fn late_pinned_adt_less_than_dispatches_to_user_impl() {
 }
 
 #[test]
-fn unbounded_generic_equals_is_builtin_eager() {
-	// W2: equality stays `BuiltinEager` for every operand kind, including a
-	// generic parameter with no bound at all — `==`/`!=` is always native
-	// reference equality, never dispatched to a user `Equals` impl (D3, unchanged
-	// by this slice).
-	let res = resolution_for("func f<T>(a: T, b: T): boolean = a == b", "f");
-	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+
+fn unbounded_generic_equals_dispatches_through_the_prelude_blanket() {
+	// A generic operand is not statically known to be primitive, so equality
+	// must use the ambient blanket `Equals` implementation rather than silently
+	// choosing JS reference identity.
+	let res = binary_resolution_for_prelude("func f<T>(a: T, b: T): boolean = a == b", "f");
+	assert_eq!(res.dispatch, DispatchKind::UserImplDefaultMethod);
 	assert_eq!(res.method, "equals");
 }
 
@@ -497,19 +497,15 @@ fn late_resolved_infer_var_operand_is_builtin_eager() {
 }
 
 #[test]
-fn user_struct_equals_is_builtin_eager() {
-	// D3 defers `equals` dispatch to the stdlib slice: even with a user `Equals`
-	// impl in scope (here via the blanket `impl<T> Equals<Other = T> for T`),
-	// codegen still emits `===`, so this stays `BuiltinEager` rather than
-	// `UserImpl`.
+fn user_struct_equals_dispatches_to_the_concrete_impl() {
 	let res = resolution_for(
 		"interface Equals<Other> { func equals(other: Other): boolean }
-		 impl<T> Equals<Other = T> for T { func equals(other: T): boolean = true }
 		 struct P(x: int)
+		 impl Equals<Other = P> for P { func equals(other: P): boolean = true }
 		 func same(a: P, b: P): boolean = a == b",
 		"same",
 	);
-	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+	assert_eq!(res.dispatch, DispatchKind::UserImpl);
 	assert_eq!(res.method, "equals");
 }
 

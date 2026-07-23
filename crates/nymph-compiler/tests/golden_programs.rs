@@ -57,7 +57,21 @@ fn compile_ok(src: &str) -> String {
 /// not import from another crate's test files).
 fn run(src: &str, call: &str) -> String {
 	let mut js = compile_ok(src);
-	js.push_str(&format!("\nconsole.log({call});\n"));
+	js.push_str(&format!(
+		"\nfunction nymphTestValue(value) {{\n\
+		\tif (value == null || typeof value !== 'object') return value;\n\
+		\tif ('v' in value) return nymphTestValue(value.v);\n\
+		\tif (Array.isArray(value)) return value.map(nymphTestValue);\n\
+		\tif (value instanceof Map) {{\n\
+		\t\treturn [...value].map(([key, item]) => [nymphTestValue(key), nymphTestValue(item)]);\n\
+		\t}}\n\
+		\tif (typeof value[Symbol.iterator] === 'function') return [...value].map(nymphTestValue);\n\
+		\tconst plain = {{}};\n\
+		\tfor (const [key, item] of Object.entries(value)) plain[key] = nymphTestValue(item);\n\
+		\treturn plain;\n\
+		}}\n\
+		console.log(nymphTestValue({call}));\n"
+	));
 
 	// All tests in this binary share one process and may run on parallel
 	// threads; mix a counter into the temp filename to avoid races.
@@ -98,7 +112,7 @@ fn golden_arithmetic_blocks_and_mutation() {
 		r#"
 		func polynomial(x: int): int = x ** 3 + 2 * x ** 2 - x + 7
 
-		func average_scaled(a: int, b: int, scale: int): int = {
+		func average_scaled(a: int, b: int, scale: int): float = {
 			let sum = a + b
 			let scaled = sum * scale
 			scaled / 2
@@ -114,8 +128,8 @@ fn golden_arithmetic_blocks_and_mutation() {
 			total % 1000
 		}
 
-		func spread(lo: int, hi: int): int = {
-			let mut range = hi - lo
+		func spread(lo: int, hi: int): float = {
+			let mut range = (hi - lo) / 1
 			range *= 2
 			range -= 1
 			range /= 3
@@ -1266,14 +1280,14 @@ fn golden_run_vec2_operator_suite() {
 	assert_eq!(
 		run(
 			src,
-			"combine(new Vec2({ x: 1, y: 2 }), new Vec2({ x: 3, y: 4 })).x"
+			"combine(new Vec2({ x: new NInt(1), y: new NInt(2) }), new Vec2({ x: new NInt(3), y: new NInt(4) })).x"
 		),
 		"6"
 	);
 	assert_eq!(
 		run(
 			src,
-			"combine(new Vec2({ x: 1, y: 2 }), new Vec2({ x: 3, y: 4 })).y"
+			"combine(new Vec2({ x: new NInt(1), y: new NInt(2) }), new Vec2({ x: new NInt(3), y: new NInt(4) })).y"
 		),
 		"10"
 	);
@@ -1292,9 +1306,21 @@ fn golden_run_shape_area_match() {
 			Dot -> 0,
 		}
 	"#;
-	assert_eq!(run(src, "area(Shape.Circle({ r: 2 }))"), "12");
-	assert_eq!(run(src, "area(Shape.Rectangle({ w: 5, h: 5 }))"), "25");
-	assert_eq!(run(src, "area(Shape.Rectangle({ w: 2, h: 3 }))"), "6");
+	assert_eq!(run(src, "area(Shape.Circle({ r: new NInt(2) }))"), "12");
+	assert_eq!(
+		run(
+			src,
+			"area(Shape.Rectangle({ w: new NInt(5), h: new NInt(5) }))"
+		),
+		"25"
+	);
+	assert_eq!(
+		run(
+			src,
+			"area(Shape.Rectangle({ w: new NInt(2), h: new NInt(3) }))"
+		),
+		"6"
+	);
 	assert_eq!(run(src, "area(Shape.Dot)"), "0");
 }
 
@@ -1321,9 +1347,18 @@ fn golden_run_state_machine() {
 			state
 		}
 	"#;
-	assert_eq!(run(src, "step_n(Light.Red, 3) === Light.Red"), "true");
-	assert_eq!(run(src, "step_n(Light.Red, 1) === Light.Green"), "true");
-	assert_eq!(run(src, "step_n(Light.Red, 2) === Light.Yellow"), "true");
+	assert_eq!(
+		run(src, "step_n(Light.Red, new NInt(3)) === Light.Red"),
+		"true"
+	);
+	assert_eq!(
+		run(src, "step_n(Light.Red, new NInt(1)) === Light.Green"),
+		"true"
+	);
+	assert_eq!(
+		run(src, "step_n(Light.Red, new NInt(2)) === Light.Yellow"),
+		"true"
+	);
 }
 
 #[test]
@@ -1348,14 +1383,14 @@ fn golden_run_generic_bound_dispatch() {
 	assert_eq!(
 		run(
 			src,
-			"bigger(new Square({ side: 4 }), new Rect({ w: 3, h: 5 }))"
+			"bigger(new Square({ side: new NInt(4) }), new Rect({ w: new NInt(3), h: new NInt(5) }))"
 		),
 		"16"
 	);
 	assert_eq!(
 		run(
 			src,
-			"bigger(new Square({ side: 2 }), new Rect({ w: 3, h: 5 }))"
+			"bigger(new Square({ side: new NInt(2) }), new Rect({ w: new NInt(3), h: new NInt(5) }))"
 		),
 		"15"
 	);
@@ -1381,8 +1416,8 @@ fn golden_run_interface_default_method() {
 		func outdated(a: Version, b: Version): boolean = a < b
 		func explicit(a: Version, b: Version): boolean = a.less_than(b)
 	"#;
-	let v1 = "new Version({ major: 1, minor: 9 })";
-	let v2 = "new Version({ major: 2, minor: 0 })";
+	let v1 = "new Version({ major: new NInt(1), minor: new NInt(9) })";
+	let v2 = "new Version({ major: new NInt(2), minor: new NInt(0) })";
 	assert_eq!(run(src, &format!("outdated({v1}, {v2})")), "true");
 	assert_eq!(run(src, &format!("outdated({v2}, {v1})")), "false");
 	assert_eq!(run(src, &format!("explicit({v1}, {v2})")), "true");
@@ -1415,9 +1450,15 @@ fn golden_run_list_patterns() {
 			_ -> 0,
 		}
 	"#;
-	assert_eq!(run(src, "summarize([])"), "-1");
-	assert_eq!(run(src, "summarize([7])"), "700");
-	assert_eq!(run(src, "summarize([10, 5, 5, 20])"), "30");
+	assert_eq!(run(src, "summarize(new NList([]))"), "-1");
+	assert_eq!(run(src, "summarize(new NList([new NInt(7)]))"), "700");
+	assert_eq!(
+		run(
+			src,
+			"summarize(new NList([new NInt(10), new NInt(5), new NInt(5), new NInt(20)]))"
+		),
+		"30"
+	);
 }
 
 #[test]
@@ -1440,11 +1481,17 @@ fn golden_run_late_pinned_inference() {
 		}
 	"#;
 	assert_eq!(
-		run(src, "beats(new Card({ rank: 10 }), new Card({ rank: 3 }))"),
+		run(
+			src,
+			"beats(new Card({ rank: new NInt(10) }), new Card({ rank: new NInt(3) }))"
+		),
 		"true"
 	);
 	assert_eq!(
-		run(src, "beats(new Card({ rank: 3 }), new Card({ rank: 10 }))"),
+		run(
+			src,
+			"beats(new Card({ rank: new NInt(3) }), new Card({ rank: new NInt(10) }))"
+		),
 		"false"
 	);
 }
@@ -1458,10 +1505,10 @@ fn golden_run_recursion() {
 		func is_even(n: int): boolean = if (n == 0) { true } else { is_odd(n - 1) }
 		func is_odd(n: int): boolean = if (n == 0) { false } else { is_even(n - 1) }
 	"#;
-	assert_eq!(run(src, "fact(5)"), "120");
-	assert_eq!(run(src, "fib(10)"), "55");
-	assert_eq!(run(src, "is_even(8)"), "true");
-	assert_eq!(run(src, "is_odd(8)"), "false");
+	assert_eq!(run(src, "fact(new NInt(5))"), "120");
+	assert_eq!(run(src, "fib(new NInt(10))"), "55");
+	assert_eq!(run(src, "is_even(new NInt(8))"), "true");
+	assert_eq!(run(src, "is_odd(new NInt(8))"), "false");
 }
 
 #[test]
@@ -1476,12 +1523,12 @@ fn golden_run_match_ranges_and_unions() {
 			_ -> 4,
 		}
 	"#;
-	assert_eq!(run(src, "grade(95)"), "1");
-	assert_eq!(run(src, "grade(90)"), "1");
-	assert_eq!(run(src, "grade(85)"), "2");
-	assert_eq!(run(src, "grade(65)"), "3");
-	assert_eq!(run(src, "grade(1)"), "5");
-	assert_eq!(run(src, "grade(42)"), "4");
+	assert_eq!(run(src, "grade(new NInt(95))"), "1");
+	assert_eq!(run(src, "grade(new NInt(90))"), "1");
+	assert_eq!(run(src, "grade(new NInt(85))"), "2");
+	assert_eq!(run(src, "grade(new NInt(65))"), "3");
+	assert_eq!(run(src, "grade(new NInt(1))"), "5");
+	assert_eq!(run(src, "grade(new NInt(42))"), "4");
 }
 
 #[test]
@@ -1500,9 +1547,12 @@ fn golden_run_bit_manipulation() {
 			count
 		}
 	"#;
-	assert_eq!(run(src, "swap_nibbles(0xAB)"), "186"); // 0xAB -> 0xBA
-	assert_eq!(run(src, "clear_flag(0b1111, 0b0100)"), "11");
-	assert_eq!(run(src, "popcount(0b1011011)"), "5");
+	assert_eq!(run(src, "swap_nibbles(new NInt(0xAB))"), "186"); // 0xAB -> 0xBA
+	assert_eq!(
+		run(src, "clear_flag(new NInt(0b1111), new NInt(0b0100))"),
+		"11"
+	);
+	assert_eq!(run(src, "popcount(new NInt(0b1011011))"), "5");
 }
 
 #[test]
@@ -1537,9 +1587,9 @@ fn golden_run_inventory_program() {
 			penalty(check(stock, needed))
 		}
 	"#;
-	assert_eq!(run(src, "demo(3)"), "0"); // both items suffice
-	assert_eq!(run(src, "demo(5)"), "2"); // item 1 short by 2
-	assert_eq!(run(src, "demo(15)"), "36"); // short 12+6=18 > 10 → doubled
+	assert_eq!(run(src, "demo(new NInt(3))"), "0"); // both items suffice
+	assert_eq!(run(src, "demo(new NInt(5))"), "2"); // item 1 short by 2
+	assert_eq!(run(src, "demo(new NInt(15))"), "36"); // short 12+6=18 > 10 → doubled
 }
 
 #[test]
@@ -1556,7 +1606,10 @@ fn golden_run_enum_inherent_method_match_this() {
 		func total(a: Shape, b: Shape): int = a.area() + b.area()
 	"#;
 	assert_eq!(
-		run(src, "total(Shape.Circle({ r: 2 }), Shape.Square({ s: 3 }))"),
+		run(
+			src,
+			"total(Shape.Circle({ r: new NInt(2) }), Shape.Square({ s: new NInt(3) }))"
+		),
 		"21"
 	);
 }
@@ -1579,10 +1632,16 @@ fn golden_run_enum_operator_impl() {
 		func combine(a: Count, b: Count): Count = a + b
 	"#;
 	assert_eq!(
-		run(src, "combine(Count.Val({ n: 3 }), Count.Val({ n: 4 })).n"),
+		run(
+			src,
+			"combine(Count.Val({ n: new NInt(3) }), Count.Val({ n: new NInt(4) })).n"
+		),
 		"7"
 	);
-	assert_eq!(run(src, "combine(Count.Zero, Count.Val({ n: 5 })).n"), "5");
+	assert_eq!(
+		run(src, "combine(Count.Zero, Count.Val({ n: new NInt(5) })).n"),
+		"5"
+	);
 }
 
 #[test]
@@ -1664,7 +1723,10 @@ fn golden_run_interface_default_override_wins_at_runtime() {
 		func check(a: Weird, b: Weird): boolean = a < b
 	"#;
 	assert_eq!(
-		run(src, "check(new Weird({ v: 10 }), new Weird({ v: 3 }))"),
+		run(
+			src,
+			"check(new Weird({ v: new NInt(10) }), new Weird({ v: new NInt(3) }))"
+		),
 		"true"
 	);
 }
@@ -1698,11 +1760,17 @@ fn golden_run_method_own_generic_bound() {
 		func outer<T: Area>(b: Box, x: T): int = b.apply(x)
 	"#;
 	assert_eq!(
-		run(src, "total(new Box({ v: 1 }), new Square({ side: 4 }))"),
+		run(
+			src,
+			"total(new Box({ v: new NInt(1) }), new Square({ side: new NInt(4) }))"
+		),
 		"16"
 	);
 	assert_eq!(
-		run(src, "outer(new Box({ v: 1 }), new Square({ side: 3 }))"),
+		run(
+			src,
+			"outer(new Box({ v: new NInt(1) }), new Square({ side: new NInt(3) }))"
+		),
 		"9"
 	);
 }
@@ -1723,8 +1791,11 @@ fn golden_run_ctor_bounds_struct_and_enum() {
 			Empty -> 0,
 		}
 	"#;
-	assert_eq!(run(src, "demo(new Square({ side: 5 }))"), "25");
-	assert_eq!(run(src, "demo_enum(new Square({ side: 6 }))"), "36");
+	assert_eq!(run(src, "demo(new Square({ side: new NInt(5) }))"), "25");
+	assert_eq!(
+		run(src, "demo_enum(new Square({ side: new NInt(6) }))"),
+		"36"
+	);
 }
 
 #[test]
@@ -1746,13 +1817,25 @@ fn golden_run_strings_escapes_interpolation_and_patterns() {
 			_ -> 0,
 		}
 	"#;
-	assert_eq!(run(src, r#"greet("World", 5)"#), "Hello, World! n=5");
-	assert_eq!(run(src, r#"label("x", "y")"#), "x-y");
-	assert_eq!(run(src, r#"same("x", "x")"#), "true");
-	assert_eq!(run(src, r#"same("x", "y")"#), "false");
-	assert_eq!(run(src, r#"classify("a\nb")"#), "1");
-	assert_eq!(run(src, r#"classify("tab\there")"#), "2");
-	assert_eq!(run(src, r#"classify("nope")"#), "0");
+	assert_eq!(
+		run(src, r#"greet(new NString("World"), new NInt(5))"#),
+		"Hello, World! n=5"
+	);
+	assert_eq!(
+		run(src, r#"label(new NString("x"), new NString("y"))"#),
+		"x-y"
+	);
+	assert_eq!(
+		run(src, r#"same(new NString("x"), new NString("x"))"#),
+		"true"
+	);
+	assert_eq!(
+		run(src, r#"same(new NString("x"), new NString("y"))"#),
+		"false"
+	);
+	assert_eq!(run(src, r#"classify(new NString("a\nb"))"#), "1");
+	assert_eq!(run(src, r#"classify(new NString("tab\there"))"#), "2");
+	assert_eq!(run(src, r#"classify(new NString("nope"))"#), "0");
 }
 
 #[test]
@@ -1776,9 +1859,15 @@ fn golden_run_for_loop_ranges_all_shapes() {
 			total
 		}
 	"#;
-	assert_eq!(run(src, "sum_exclusive(5)"), "10"); // 1+2+3+4
-	assert_eq!(run(src, "sum_inclusive(5)"), "15"); // 1+2+3+4+5
-	assert_eq!(run(src, "sum_paren_binary(1, 1, 5)"), "9"); // 2+3+4
+	assert_eq!(run(src, "sum_exclusive(new NInt(5))"), "10"); // 1+2+3+4
+	assert_eq!(run(src, "sum_inclusive(new NInt(5))"), "15"); // 1+2+3+4+5
+	assert_eq!(
+		run(
+			src,
+			"sum_paren_binary(new NInt(1), new NInt(1), new NInt(5))"
+		),
+		"9"
+	); // 2+3+4
 }
 
 #[test]
@@ -1805,7 +1894,7 @@ fn golden_run_combo_enum_default_method_for_loop_string_builder() {
 			report
 		}
 	"#;
-	assert_eq!(run(src, "build_report(3)"), "[w0][w1][w2]");
+	assert_eq!(run(src, "build_report(new NInt(3))"), "[w0][w1][w2]");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1863,5 +1952,5 @@ fn golden_finding_impl_trait_param_rejects_concrete_argument() {
 		func measure(shape: Area): int = shape.area()
 		func total(s: Square): int = measure(s)
 		"#;
-	assert_eq!(run(src, "total(new Square({ side: 3 }))"), "9");
+	assert_eq!(run(src, "total(new Square({ side: new NInt(3) }))"), "9");
 }

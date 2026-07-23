@@ -18,7 +18,7 @@ func greet(name: string): string = "Hello, ${name}!"
 than one step is a block, whose last expression is the value the function returns:
 
 ```nym
-func average_scaled(a: int, b: int, scale: int): int = {
+func average_scaled(a: int, b: int, scale: int): float = {
   let sum = a + b
   let scaled = sum * scale
   scaled / 2

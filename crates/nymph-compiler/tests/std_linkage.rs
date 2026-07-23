@@ -6,9 +6,10 @@
 //! `bundle::bundle`), and RUNS under Node with every linked-external import
 //! resolved and inlined — L1 additionally proves the Option ABI seam: `get`'s
 //! `Some`/`None` (built by the injected, stripped `list.ts` intrinsic,
-//! importing the injected `std/option` virtual module) are recognized by the
-//! user PROGRAM's own inline `match`, because `nymph-codegen`'s `emit_enum`
-//! now tags every variant with a GLOBAL `Symbol.for(..)` discriminant.
+//! importing the project compiler's canonical, source-derived `std/option`
+//! module) are recognized by the user PROGRAM's own inline `match`, because
+//! `nymph-codegen`'s `emit_enum` tags every variant with a GLOBAL
+//! `Symbol.for(..)` discriminant.
 //!
 //! Deliberately synthetic, not the real on-disk `stdlib/src/collections/list.nym`
 //! — that file's own `import @/option`/`import @/ops` don't resolve when
@@ -20,6 +21,7 @@
 //! actually driven end-to-end through the bundle + Node.
 
 use nymph_compiler::compile_project_with_std;
+use nymph_compiler::project::compile_project_module_sources_with_std;
 
 /// The synthetic `std/collections/list` module: JUST enough to exercise
 /// linkage — `length`/`get` are `external(..)` (present in
@@ -161,9 +163,8 @@ fn transitively_linked_is_empty_compiles_bundles_and_runs() {
 
 /// L1's whole proof obligation: `xs.get(1)` — the Option-RETURNING linked
 /// external — compiles, bundles (the stripped `list.ts` intrinsic's own
-/// `import { Option } from "../option"` resolves against the injected
-/// `std/option` virtual module, per `nymph_codegen::strip_ts_to_js`'s
-/// `import_rewrites` and `nymph_compiler::intrinsics`), and RUNS under Node —
+/// `import { Option } from "../option"` resolves against the canonical
+/// source-derived `std/option` module), and RUNS under Node —
 /// with the intrinsic-BUILT `Some`/`None` recognized by the user PROGRAM's
 /// OWN inline `match`, because `nymph-codegen`'s `emit_enum` now tags every
 /// variant with the GLOBAL `Symbol.for(..)` discriminant (not a fresh,
@@ -196,12 +197,13 @@ fn linked_list_get_compiles_bundles_and_runs_the_option_round_trip() {
 
 	// Rolldown bundles the whole graph into ONE chunk (no `import` statement
 	// survives — that's the point), so the resolution proof is that the
-	// injected `std/option` virtual module's own source made it in at all
+	// canonical `std/option` module's own source made it in at all
 	// (rather than the bundle failing outright on `list.ts`'s originally
 	// unresolvable `"../option"` specifier).
 	assert!(
-		compiled.js.contains("//#region std/option") && compiled.js.contains("SOME_TAG"),
-		"expected the injected `std/option` virtual module to be bundled in \
+		compiled.js.contains("//#region std/option")
+			&& compiled.js.contains("Symbol.for(\"Option.Some\")"),
+		"expected the canonical `std/option` module to be bundled in \
 		 (proving its rewritten specifier resolved), got:\n{}",
 		compiled.js
 	);
@@ -227,10 +229,35 @@ fn linked_list_get_compiles_bundles_and_runs_the_option_round_trip() {
 	);
 }
 
+#[test]
+fn option_consumer_imports_the_canonical_runtime_before_bundling() {
+	let entry = "import std/collections/list\n\
+		func demo(xs: #[int]): int = match (xs.get(0)) {\n\
+		\tSome(value) -> value,\n\
+		\tNone -> -1,\n\
+		}\n\
+		func main(): void = {}\n";
+	let load = |key: &str| (key == "main").then(|| entry.to_string());
+	let sources = compile_project_module_sources_with_std("main", &load, &synth_std_provider)
+		.expect("project sources should assemble");
+	let main = sources
+		.get("main")
+		.expect("consumer source must be present");
+
+	assert!(
+		main.contains("import { Option } from \"std/option\";"),
+		"consumer must import its canonical runtime owner before bundling:\n{main}"
+	);
+	assert!(
+		!main.contains("class Option"),
+		"consumer must not inline the ambient Option declaration:\n{main}"
+	);
+}
+
 /// L3's whole proof obligation for the MAP surface: `get`/`insert`/`remove`/
 /// `size`/`keys` — all newly linked — compile, bundle (the stripped `map.ts`
 /// intrinsic's own `import { Option } from "../option"` resolves against the
-/// injected `std/option` virtual module, exactly like `list.ts`), and RUN
+/// canonical source-derived `std/option` module, exactly like `list.ts`), and RUN
 /// under Node. Exercises both `get`'s in-bounds/missing arms (proving the
 /// L3 ABI fix — `Option.Some({ value })`, not a bare positional value, round
 /// -trips through the user's own `match`), a mutation (`insert` then
@@ -480,6 +507,43 @@ fn ambient_index_bound_dispatches_generic_index_access() {
 }
 
 #[test]
+fn ambient_index_bound_accepts_a_builtin_list() {
+	let entry = r#"
+		func get<T: Index<Key = uint, Output = int>>(value: T): int = value[1]
+		func demo(): int = get(#[40, 42])
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("a list should satisfy the ambient Index bound");
+	let call = compiled.entry_symbol("demo");
+	let mut js = compiled.js;
+	js.push_str(&format!("\nconsole.log({call}().v);\n"));
+	assert_eq!(run_node(&js, "generic_list_index"), "42");
+}
+
+#[test]
+fn real_std_set_iterates_its_keys() {
+	let entry = r#"
+		import std/collections/set with (Set)
+		func demo(): int = {
+			let set = Set(inner = #{1: #(), 2: #(), 3: #()})
+			let mut total = 0
+			for (item in set) { total = total + item }
+			total
+		}
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &nymph_compiler::embedded_std_provider)
+		.expect("the real std Set should implement Iterable");
+	let call = compiled.entry_symbol("demo");
+	let mut js = compiled.js;
+	js.push_str(&format!("\nconsole.log({call}().v);\n"));
+	assert_eq!(run_node(&js, "set_iterable"), "6");
+}
+
+#[test]
 fn boxed_collection_intrinsics_preserve_value_semantics_and_nested_shapes() {
 	let entry = r#"
 		struct Key(id: int) {
@@ -521,6 +585,80 @@ fn boxed_collection_intrinsics_preserve_value_semantics_and_nested_shapes() {
 	assert_eq!(
 		run_node(&js, "boxed_collections"),
 		"true\n1\n3\n7\n99\n3,1,2"
+	);
+}
+
+#[test]
+fn blanket_equals_routes_non_primitive_operators_through_structural_equality() {
+	let entry = r#"
+		struct Point(x: int)
+		struct Pair(left: Point, right: Point)
+		struct AlwaysEqual(x: int)
+		impl Equals<Other = AlwaysEqual> for AlwaysEqual {
+			func equals(other: AlwaysEqual): boolean = true
+		}
+		func equal(): boolean = Point(x = 1) == Point(x = 1)
+		func unequal(): boolean = Point(x = 1) != Point(x = 2)
+		func nested(): boolean = Pair(left = Point(x = 1), right = Point(x = 2)) == Pair(left = Point(x = 1), right = Point(x = 2))
+		func generic_same<T>(left: T, right: T): boolean = left == right
+		func generic_different<T>(left: T, right: T): boolean = left != right
+		func generic(): boolean = generic_same(Point(x = 3), Point(x = 3))
+		func generic_custom_same(): boolean = generic_same(AlwaysEqual(x = 1), AlwaysEqual(x = 2))
+		func generic_custom_different(): boolean = generic_different(AlwaysEqual(x = 1), AlwaysEqual(x = 2))
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("the ambient blanket Equals implementation should compile for structs");
+	let equal = compiled.entry_symbol("equal");
+	let unequal = compiled.entry_symbol("unequal");
+	let nested = compiled.entry_symbol("nested");
+	let generic = compiled.entry_symbol("generic");
+	let generic_custom_same = compiled.entry_symbol("generic_custom_same");
+	let generic_custom_different = compiled.entry_symbol("generic_custom_different");
+	let mut js = compiled.js;
+	js.push_str(&format!("\nconsole.log({equal}().v);\n"));
+	js.push_str(&format!("console.log({unequal}().v);\n"));
+	js.push_str(&format!("console.log({nested}().v);\n"));
+	js.push_str(&format!("console.log({generic}().v);\n"));
+	js.push_str(&format!("console.log({generic_custom_same}().v);\n"));
+	js.push_str(&format!("console.log({generic_custom_different}().v);\n"));
+	assert_eq!(
+		run_node(&js, "blanket_equals"),
+		"true\ntrue\ntrue\ntrue\ntrue\nfalse"
+	);
+}
+
+#[test]
+fn mixed_primitive_equals_method_matches_the_operator_fast_path() {
+	let entry = r#"
+		func method_equal(left: int, right: uint): boolean = left.equals(right)
+		func reverse_method_equal(left: uint, right: int): boolean = left.equals(right)
+		func method_not_equal(left: int, right: uint): boolean = left.not_equals(right)
+		func reverse_method_not_equal(left: uint, right: int): boolean = left.not_equals(right)
+		func operator_equal(left: int, right: uint): boolean = left == right
+		func operator_not_equal(left: int, right: uint): boolean = left != right
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("mixed primitive Equals methods should link through payload equality");
+	let method_equal = compiled.entry_symbol("method_equal");
+	let reverse_method_equal = compiled.entry_symbol("reverse_method_equal");
+	let method_not_equal = compiled.entry_symbol("method_not_equal");
+	let reverse_method_not_equal = compiled.entry_symbol("reverse_method_not_equal");
+	let operator_equal = compiled.entry_symbol("operator_equal");
+	let operator_not_equal = compiled.entry_symbol("operator_not_equal");
+	let mut js = compiled.js;
+	js.push_str(&format!(
+		"\nconsole.log({method_equal}(new NInt(1), new NUint(1)).v, {reverse_method_equal}(new NUint(1), new NInt(1)).v, {operator_equal}(new NInt(1), new NUint(1)).v);\n"
+	));
+	js.push_str(&format!(
+		"console.log({method_not_equal}(new NInt(1), new NUint(2)).v, {reverse_method_not_equal}(new NUint(2), new NInt(1)).v, {operator_not_equal}(new NInt(1), new NUint(2)).v);\n"
+	));
+	assert_eq!(
+		run_node(&js, "mixed_primitive_equals"),
+		"true true true\ntrue true true"
 	);
 }
 
@@ -579,13 +717,307 @@ fn ambient_string_methods_link_and_run() {
 
 	let call = compiled.entry_symbol("demo");
 	let mut js = compiled.js;
-	js.push_str(&format!("\nconsole.log({call}());\n"));
+	js.push_str(&format!("\nconsole.log({call}().v);\n"));
 
 	assert_eq!(
 		run_node(&js, "string_methods"),
 		"HELLO olleH",
 		"expected `\"Hello\".to_upper().concat(\" \").concat(\"Hello\".reversed())`"
 	);
+}
+
+#[test]
+fn ambient_range_contains_dispatches_generic_comparison_defaults() {
+	let entry = r#"
+		func in_range(x: int): boolean = {
+			let range = Range(start = 0, end = 5)
+			range.contains(x)
+		}
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &|_| None).expect(
+		"ambient integral range containment should compile through generic comparison defaults",
+	);
+
+	let call = compiled.entry_symbol("in_range");
+	let mut js = compiled.js;
+	js.push_str(&format!(
+		"\nconsole.log({call}(new NInt(3)).v, {call}(new NInt(8)).v);\n"
+	));
+	assert_eq!(run_node(&js, "range_contains"), "true false");
+}
+
+#[test]
+fn ambient_string_convenience_methods_are_nymph_composition() {
+	let entry = r#"
+		func first_present(): char = "abc".first() ?? 'z'
+		func first_empty(): char = "".first() ?? 'z'
+		func last_present(): char = "abc".last() ?? 'z'
+		func last_empty(): char = "".last() ?? 'z'
+		func drop_middle(): string = "abcd".drop(2u)
+		func drop_past_end(): string = "abcd".drop(9u)
+		func take_middle(): string = "abcd".take(2u)
+		func take_past_end(): string = "abcd".take(9u)
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("ambient string convenience methods should compile from Nymph bodies");
+
+	assert!(
+		compiled.js.contains("i.v < $_this.v.length")
+			&& compiled.js.contains("$_this.v.slice(start.v, end.v)"),
+		"expected first/last/drop/take to compose the char_at and substring primitives:\n{}",
+		compiled.js
+	);
+
+	let calls = [
+		"first_present",
+		"first_empty",
+		"last_present",
+		"last_empty",
+		"drop_middle",
+		"drop_past_end",
+		"take_middle",
+		"take_past_end",
+	]
+	.map(|name| compiled.entry_symbol(name));
+	let mut js = compiled.js;
+	for call in calls {
+		js.push_str(&format!("\nconsole.log({call}().v);\n"));
+	}
+	assert_eq!(
+		run_node(&js, "string_nymph_composition"),
+		"a\nz\nc\nz\ncd\n\nab\nabcd"
+	);
+}
+
+#[test]
+fn ambient_string_intrinsics_preserve_the_boxed_abi() {
+	let entry = r#"
+		func length(): uint = "abc".length()
+		func contains(): boolean = "abc".contains("b")
+		func slice(): string = "abcd".substring(1u, 3u)
+		func index(): uint = "abcd".index_of("c") ?? 99u
+		func missing_index(): uint = "abcd".index_of("z") ?? 99u
+		func character(): char = "abcd".char_at(2u) ?? 'z'
+		func split_item(): string = "a,b".split(",")[1]
+		func chars_item(): char = "abc".chars()[1]
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("ambient string intrinsics should compile with boxed inputs and outputs");
+	let calls = [
+		"length",
+		"contains",
+		"slice",
+		"index",
+		"missing_index",
+		"character",
+		"split_item",
+		"chars_item",
+	]
+	.map(|name| compiled.entry_symbol(name));
+	let mut js = compiled.js;
+	for call in calls {
+		js.push_str(&format!("\nconsole.log({call}().v);\n"));
+	}
+	assert_eq!(
+		run_node(&js, "string_boxed_abi"),
+		"3\ntrue\nbc\n2\n99\nc\nb\nb"
+	);
+}
+
+#[test]
+fn canonical_option_unions_method_demands_across_modules() {
+	let modules = std::collections::HashMap::from([
+		(
+			"main",
+			r#"
+				import ./unwrap with (unwrap_value)
+				import ./inspect with (is_absent)
+				func unwrapped(): int = unwrap_value(Some(value = 7))
+				func absent(): boolean = is_absent(None)
+				func main(): void = {}
+			"#,
+		),
+		(
+			"unwrap",
+			"func unwrap_value(value: Option<int>): int = value.unwrap(-1)",
+		),
+		(
+			"inspect",
+			"func is_absent(value: Option<int>): boolean = value.is_none()",
+		),
+	]);
+	let load = |key: &str| modules.get(key).map(|source| (*source).to_string());
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("all project Option demands should merge into one canonical module");
+	assert_eq!(
+		compiled.js.matches("//#region std/option").count(),
+		1,
+		"Option must be emitted exactly once: {}",
+		compiled.js
+	);
+	let unwrapped = compiled.entry_symbol("unwrapped");
+	let absent = compiled.entry_symbol("absent");
+	let mut js = compiled.js;
+	js.push_str(&format!("\nconsole.log({unwrapped}().v, {absent}().v);\n"));
+	assert_eq!(run_node(&js, "canonical_option_union"), "7 true");
+}
+
+#[test]
+fn canonical_option_deduplicates_alpha_equivalent_method_demands() {
+	let modules = std::collections::HashMap::from([
+		(
+			"main",
+			"import ./a with (use_a)\nimport ./b with (use_b)\n\
+			 func first(): int = use_a(Some(value = 1))\n\
+			 func second(): int = use_b(Some(value = 2))\nfunc main(): void = {}",
+		),
+		(
+			"a",
+			"func noise(default: int): int = default\n\
+			 func use_a(value: Option<int>): int = value.unwrap(0)",
+		),
+		("b", "func use_b(value: Option<int>): int = value.unwrap(0)"),
+	]);
+	let load = |key: &str| modules.get(key).map(|source| (*source).to_string());
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("duplicate demands must not compare consumer-local generated names");
+	let first = compiled.entry_symbol("first");
+	let second = compiled.entry_symbol("second");
+	let mut js = compiled.js;
+	js.push_str(&format!("\nconsole.log({first}().v, {second}().v);\n"));
+	assert_eq!(run_node(&js, "canonical_option_dedup"), "1 2");
+}
+
+#[test]
+fn option_returning_intrinsic_resolves_without_a_value_level_option_operation() {
+	let entry = r#"
+		func character(): Option<char> = "x".char_at(0u)
+		func source_character(): Option<char> = Some(value = 'x')
+		func unwrapped_character(): char = "x".char_at(0u).unwrap('z')
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("an Option-returning intrinsic must always resolve its canonical module");
+	assert_eq!(
+		compiled.js.matches("//#region std/option").count(),
+		1,
+		"the intrinsic and its return type must share one Option owner: {}",
+		compiled.js
+	);
+	let character = compiled.entry_symbol("character");
+	let source_character = compiled.entry_symbol("source_character");
+	let unwrapped_character = compiled.entry_symbol("unwrapped_character");
+	let mut js = compiled.js;
+	js.push_str(&format!(
+		"\nconsole.log(\
+		 {character}()[Symbol.for(\"nymph.tag\")].description, \
+		 Object.getPrototypeOf({character}()) === Object.getPrototypeOf({source_character}()), \
+		 {unwrapped_character}().v);\n"
+	));
+	assert_eq!(
+		run_node(&js, "option_intrinsic_no_operation"),
+		"Option.Some true x"
+	);
+}
+
+#[test]
+fn ambient_order_has_one_factory_and_cross_module_identity() {
+	let modules = std::collections::HashMap::from([
+		(
+			"main",
+			"import ./a with (less)\nimport ./b with (also_less, equal)\n\
+			 func first(): Order = less()\n\
+			 func second(): Order = also_less()\n\
+			 func third(): Order = equal()\n\
+			 func main(): void = {}",
+		),
+		("a", "public func less(): Order = Order.LessThan"),
+		(
+			"b",
+			"public func also_less(): Order = Order.LessThan\n\
+			 public func equal(): Order = Order.Equal",
+		),
+	]);
+	let load = |key: &str| modules.get(key).map(|source| (*source).to_string());
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("ambient Order should have one canonical std/ops owner");
+	assert_eq!(compiled.js.matches("//#region std/ops").count(), 1);
+	assert_eq!(compiled.js.matches("const Order = (() =>").count(), 1);
+
+	let first = compiled.entry_symbol("first");
+	let second = compiled.entry_symbol("second");
+	let third = compiled.entry_symbol("third");
+	let mut js = compiled.js;
+	js.push_str(&format!(
+		"\nconst a = {first}(); const b = {second}(); const c = {third}();\n\
+		 console.log(a === b, Object.getPrototypeOf(a) === Object.getPrototypeOf(c));\n"
+	));
+	assert_eq!(run_node(&js, "canonical_order_identity"), "true true");
+}
+
+#[test]
+fn ambient_list_iterator_has_one_class_and_cross_module_identity() {
+	let modules = std::collections::HashMap::from([
+		(
+			"main",
+			"import ./a with (first_range)\nimport ./b with (second_range)\n\
+			 func first(): ListIter<int> = first_range()\n\
+			 func second(): ListIter<int> = second_range()\n\
+			 func main(): void = {}",
+		),
+		(
+			"a",
+			"public func first_range(): ListIter<int> = ListIter(items = #[1], index = 0u)",
+		),
+		(
+			"b",
+			"public func second_range(): ListIter<int> = ListIter(items = #[2], index = 0u)",
+		),
+	]);
+	let load = |key: &str| modules.get(key).map(|source| (*source).to_string());
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("ambient ListIter should have one canonical std/iter/iterable owner");
+	assert_eq!(
+		compiled.js.matches("//#region std/iter/iterable").count(),
+		1
+	);
+
+	let first = compiled.entry_symbol("first");
+	let second = compiled.entry_symbol("second");
+	let mut js = compiled.js;
+	js.push_str(&format!(
+		"\nconst a = {first}(); const b = {second}();\n\
+		 console.log(a.constructor === b.constructor, Object.getPrototypeOf(a) === Object.getPrototypeOf(b));\n"
+	));
+	assert_eq!(run_node(&js, "canonical_range_identity"), "true true");
+}
+
+#[test]
+fn canonical_option_and_result_are_distinct_cross_importing_owners() {
+	let entry = r#"
+		func option_to_result(): int = Some(value = 7).ok_or("missing").unwrap(-1)
+		func result_to_option(): int = Result.Ok(value = 9).ok().unwrap(-1)
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("canonical Option and Result should retain reciprocal conversion dependencies");
+	assert_eq!(compiled.js.matches("//#region std/option").count(), 1);
+	assert_eq!(compiled.js.matches("//#region std/result").count(), 1);
+	let option_to_result = compiled.entry_symbol("option_to_result");
+	let result_to_option = compiled.entry_symbol("result_to_option");
+	let mut js = compiled.js;
+	js.push_str(&format!(
+		"\nconsole.log({option_to_result}().v, {result_to_option}().v);\n"
+	));
+	assert_eq!(run_node(&js, "canonical_option_result_dependency"), "7 9");
 }
 
 /// `import std/io` resolves through the EMBEDDED std provider (the one the CLI

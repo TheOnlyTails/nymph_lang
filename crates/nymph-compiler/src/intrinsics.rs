@@ -16,25 +16,18 @@
 //! L1 extension (the Option ABI seam): `list.ts`'s `get`/`first`/`last`/`pop`
 //! all return `Option<T>`, built by calling the SAME `Option` their `.ts`
 //! source imports (`import { Option } from "../option"`). Two things make
-//! that import resolve, and resolve to something that INTEROPERATES with the
-//! compiler's own per-module Option class:
+//! that import resolve to the compiler's canonical, source-derived Option:
 //! 1. `IMPORT_REWRITES` tells `strip_ts_to_js` to keep that import (when a
 //!    kept export still references it) and rewrite its specifier to the bare
 //!    virtual key `"std/option"` — a real sources-map key `bundle::
 //!    VirtualFsPlugin` can resolve (unlike the raw relative `"../option"`,
 //!    which it can't — `resolve_id` only matches exact specifier strings).
-//! 2. [`OPTION_MODULE_JS`] is injected under that exact key, UNCONDITIONALLY
-//!    (see this function's own doc comment on why an unreferenced entry is
-//!    harmless). Its `Some`/`None` build the identical `{ [TAG]: <symbol>,
-//!    ..fields }` / frozen-`{ [TAG]: <symbol> }` shape `nymph-codegen`'s
-//!    `emit_enum` builds for every user-written `Option` — and, since
-//!    `emit_enum`'s per-variant discriminant is `Symbol.for(label)` (a
-//!    GLOBAL, not `Symbol(label)`), the exact same `Symbol.for("Option.Some")`
-//!    / `Symbol.for("Option.None")` values compare equal across every
-//!    independently-built Option, module boundaries included — see
-//!    `nymph-codegen::emit`'s `emit_enum` doc comment for the ABI itself.
+//! 2. `Driver::compile_all` emits the demanded `option.nym` implementation
+//!    once under that key. Intrinsics and source consumers therefore share
+//!    both global variant tags and the same method-bearing prototype.
 
 use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 
 /// One registry MODULE specifier's `include_str!`-embedded `.ts` source —
 /// mirrors `prelude.rs`'s `CORE_SOURCES` table one level down (runtime JS,
@@ -43,6 +36,18 @@ use rustc_hash::FxHashMap;
 /// — `intrinsic_module_sources` panics loudly (never silently skips) if one
 /// is missing.
 const INTRINSIC_TS_SOURCES: &[(&str, &str)] = &[
+	(
+		"std/display",
+		include_str!("../../../stdlib/src/display.ts"),
+	),
+	(
+		"std/equality",
+		include_str!("../../../stdlib/src/ops/equality.ts"),
+	),
+	(
+		"std/comparison",
+		include_str!("../../../stdlib/src/ops/comparison.ts"),
+	),
 	("std/hash", include_str!("../../../stdlib/src/hash.ts")),
 	(
 		"std/collections/list",
@@ -65,44 +70,15 @@ const INTRINSIC_TS_SOURCES: &[(&str, &str)] = &[
 /// Every relative import specifier an intrinsic `.ts` source might write,
 /// paired with the bare virtual module key it resolves to in the bundle
 /// graph — passed to `strip_ts_to_js` as `import_rewrites` for every module
-/// in [`INTRINSIC_TS_SOURCES`]. `"../option"` is `list.ts`'s own specifier
-/// for `stdlib/src/option.ts` (which doesn't exist as a real file — see
-/// [`OPTION_MODULE_JS`]); a future intrinsic module needing a different
-/// relative import would add its own row here.
+/// in [`INTRINSIC_TS_SOURCES`]. `"../option"` is `list.ts`'s own relative
+/// specifier; the project compiler supplies its source-derived runtime owner.
+/// A future intrinsic module needing a different relative import would add
+/// its own row here.
 const IMPORT_REWRITES: &[(&str, &str)] = &[
-	("../option", "std/option"),
-	// `string.ts` sits at the stdlib root, so its `Option` import is `./option`.
-	("./option", "std/option"),
-	("./box", "std/box"),
-	("../box", "std/box"),
+	("std/option", "std/option"),
+	("std/box", "std/box"),
+	("./display", "std/display"),
 ];
-
-/// The virtual `std/option` module every Option-returning `List` intrinsic
-/// (`get`/`first`/`last`/`pop`) imports as `import { Option } from
-/// "std/option"` once `strip_ts_to_js` rewrites its specifier (see
-/// [`IMPORT_REWRITES`]). Hand-written, not compiler-emitted from
-/// `stdlib/src/option.nym` — under the global (`Symbol.for`) discriminant ABI
-/// `nymph-codegen`'s `emit_enum` now uses, any independently-built `{ [TAG]:
-/// Symbol.for("Option.Some"), ...fields }` / `Object.freeze({ [TAG]:
-/// Symbol.for("Option.None") })` value interoperates with the compiler's OWN
-/// per-module `Option` class for `match`/tag-comparison purposes — full
-/// re-emission of `option.nym`'s inline methods (`is_some`/`map`/…) is not
-/// needed for THAT to hold. The one thing a value built here can't do is
-/// answer a METHOD call (`.is_some()`) directly, since it carries no
-/// prototype — not exercised by any linked `List` intrinsic today (each only
-/// ever CONSTRUCTS a `Some`/`None`, never calls a method on the result
-/// itself); the constructed value round-trips through a `match` in USER code
-/// exactly like any other `Option`, which is this slice's whole proof
-/// obligation (see `nymph-compiler/tests/std_linkage.rs`).
-const OPTION_MODULE_JS: &str = "\
-const TAG = Symbol.for(\"nymph.tag\");
-const SOME_TAG = Symbol.for(\"Option.Some\");
-const NONE_TAG = Symbol.for(\"Option.None\");
-export const Option = {
-\tSome: (fields) => ({ [TAG]: SOME_TAG, ...fields }),
-\tNone: Object.freeze({ [TAG]: NONE_TAG }),
-};
-";
 
 /// Build the virtual module sources every LINKED external's registry module
 /// needs: for each distinct module `nymph_hir::linkage::modules()` names, its
@@ -111,21 +87,15 @@ export const Option = {
 /// `nymph_codegen::strip_ts_to_js`'s doc comment for why injecting the whole
 /// file is fatal to bundling: an unrelated, still-unlinked `import` inside it
 /// would be a dangling specifier rolldown resolves eagerly, before
-/// tree-shaking ever gets a chance to drop it), PLUS the [`OPTION_MODULE_JS`]
-/// virtual module every Option-returning intrinsic's (rewritten) import
-/// resolves against.
+/// tree-shaking ever gets a chance to drop it). The project driver separately
+/// supplies the canonical `std/option` module referenced by rewritten imports.
 ///
 /// Keyed by the SAME module specifier the registry names (e.g.
 /// `"std/collections/list"`) — the specifier an emitted `import { .. } from
 /// ".."` line names, and what `bundle::VirtualFsPlugin` resolves module
 /// sources against. Callers merge this into the driver's own
-/// `module_sources` map before bundling. `"std/option"` is injected
-/// UNCONDITIONALLY (not gated on whether any linked module's stripped output
-/// actually references it) — mirrors `Driver::compile_all`'s own reasoning
-/// for injecting every registry module unconditionally: `VirtualFsPlugin`
-/// only loads a source when something actually imports it, and rolldown
-/// tree-shakes an unreferenced one away regardless, so an unused entry costs
-/// nothing.
+/// `module_sources` map before bundling. `VirtualFsPlugin` only loads a source
+/// when something imports it, and rolldown tree-shakes unreferenced entries.
 #[must_use]
 pub(crate) fn intrinsic_module_sources() -> FxHashMap<String, String> {
 	let mut sources: FxHashMap<String, String> = nymph_hir::linkage::modules()
@@ -148,10 +118,9 @@ pub(crate) fn intrinsic_module_sources() -> FxHashMap<String, String> {
 			)
 		})
 		.collect();
-	sources.insert("std/option".to_string(), OPTION_MODULE_JS.to_string());
 	// Uniform value boxing (slice #2): the importable `std/box` runtime module
 	// carrying the primitive wrapper classes (`NInt`/`NString`/…). Injected
-	// UNCONDITIONALLY, for the same reason as `std/option` above — `VirtualFsPlugin`
+	// UNCONDITIONALLY, like the registry modules above — `VirtualFsPlugin`
 	// only loads a source when something imports it, and rolldown tree-shakes an
 	// unreferenced one away. Slice #2's emit inlines the wrapper definitions per
 	// module (`nymph_codegen::box_preamble`) rather than importing them, so nothing
@@ -162,6 +131,65 @@ pub(crate) fn intrinsic_module_sources() -> FxHashMap<String, String> {
 		nymph_codegen::box_module_source(),
 	);
 	sources
+}
+
+/// Core runtime types named by imports retained in intrinsic JS. This is
+/// derived from stripped output rather than a handwritten Option/Result list,
+/// so adding another source-level intrinsic import automatically creates the
+/// corresponding canonical declaration demand.
+pub(crate) fn runtime_type_imports(
+	sources: &FxHashMap<String, String>,
+	owners: &FxHashMap<ecow::EcoString, &'static str>,
+) -> FxHashSet<ecow::EcoString> {
+	let mut demands = FxHashSet::default();
+	let canonical_specifiers: FxHashSet<_> = owners.values().copied().collect();
+	for source in sources.values() {
+		for line in source.lines() {
+			let line = line.trim();
+			let Some((_, quoted_specifier)) = line.rsplit_once(" from ") else {
+				continue;
+			};
+			let quoted_specifier = quoted_specifier.trim_end_matches(';');
+			let specifier = quoted_specifier
+				.strip_prefix('"')
+				.and_then(|specifier| specifier.strip_suffix('"'))
+				.or_else(|| {
+					quoted_specifier
+						.strip_prefix('\'')
+						.and_then(|specifier| specifier.strip_suffix('\''))
+				});
+			let Some(specifier) = specifier else {
+				continue;
+			};
+			if !canonical_specifiers.contains(specifier) {
+				continue;
+			}
+			if !(line.starts_with("import {") && line.ends_with("\";")) {
+				panic!("malformed retained canonical runtime import: `{line}`");
+			}
+			let Some((bindings, specifier)) = line.split_once("} from \"") else {
+				panic!("malformed retained canonical runtime import: `{line}`");
+			};
+			let specifier = specifier.trim_end_matches(';').trim_end_matches('"');
+			for binding in bindings
+				.trim_start()
+				.trim_start_matches("import {")
+				.split(',')
+			{
+				let name = binding.trim();
+				let Some((canonical, _)) = owners
+					.iter()
+					.find(|(candidate, owner)| candidate.as_str() == name && **owner == specifier)
+				else {
+					panic!(
+						"unsupported retained canonical runtime import binding `{name}` from `{specifier}`"
+					);
+				};
+				demands.insert((*canonical).clone());
+			}
+		}
+	}
+	demands
 }
 
 #[cfg(test)]
@@ -223,7 +251,7 @@ mod tests {
 			);
 		}
 		// `get`/`remove` both construct `Option.Some`/`Option.None` — the
-		// import must survive, rewritten to the injected virtual `std/option`
+		// import must survive, rewritten to the canonical `std/option`
 		// key (never the original, unresolvable `"../option"`).
 		assert!(
 			map_js.contains("import { Option } from \"std/option\";"),
@@ -261,16 +289,81 @@ mod tests {
 	}
 
 	#[test]
-	fn injects_the_option_module_with_globally_tagged_some_and_none() {
+	fn does_not_fabricate_the_canonical_option_module() {
 		let sources = intrinsic_module_sources();
-		let option_js = sources
-			.get("std/option")
-			.expect("expected a virtual `std/option` module to be injected");
 		assert!(
-			option_js.contains("Symbol.for(\"Option.Some\")")
-				&& option_js.contains("Symbol.for(\"Option.None\")"),
-			"expected globally-tagged (`Symbol.for`, not bare `Symbol`) variant \
-			 discriminants matching `nymph-codegen::emit_enum`'s own ABI, got:\n{option_js}"
+			!sources.contains_key("std/option"),
+			"the project compiler must be the sole owner of canonical std/option"
 		);
+	}
+
+	#[test]
+	#[should_panic(expected = "malformed retained canonical runtime import")]
+	fn malformed_retained_canonical_runtime_import_panics_loudly() {
+		let owners = crate::prelude::core_runtime_type_owners();
+		let sources = FxHashMap::from_iter([(
+			"intrinsic".to_string(),
+			"import { Option } from 'std/option';\n".to_string(),
+		)]);
+
+		let _ = runtime_type_imports(&sources, owners);
+	}
+
+	#[test]
+	#[should_panic(expected = "unsupported retained canonical runtime import binding")]
+	fn aliased_retained_canonical_runtime_import_panics_loudly() {
+		let owners = crate::prelude::core_runtime_type_owners();
+		let sources = FxHashMap::from_iter([(
+			"intrinsic".to_string(),
+			"import { Option as O } from \"std/option\";\n".to_string(),
+		)]);
+
+		let _ = runtime_type_imports(&sources, owners);
+	}
+
+	#[test]
+	#[should_panic(expected = "unsupported retained canonical runtime import binding")]
+	fn empty_retained_canonical_runtime_import_binding_panics_loudly() {
+		let owners = crate::prelude::core_runtime_type_owners();
+		let sources = FxHashMap::from_iter([(
+			"intrinsic".to_string(),
+			"import { Option, } from \"std/option\";\n".to_string(),
+		)]);
+
+		let _ = runtime_type_imports(&sources, owners);
+	}
+
+	#[test]
+	#[should_panic(expected = "unsupported retained canonical runtime import binding")]
+	fn unknown_retained_canonical_runtime_import_name_panics_loudly() {
+		let owners = crate::prelude::core_runtime_type_owners();
+		let sources = FxHashMap::from_iter([(
+			"intrinsic".to_string(),
+			"import { NotAType } from \"std/option\";\n".to_string(),
+		)]);
+
+		let _ = runtime_type_imports(&sources, owners);
+	}
+
+	#[test]
+	fn unsupported_noncanonical_intrinsic_import_is_ignored() {
+		let owners = crate::prelude::core_runtime_type_owners();
+		let sources = FxHashMap::from_iter([(
+			"intrinsic".to_string(),
+			"import { value as alias, } from \"ordinary/intrinsic\";\n".to_string(),
+		)]);
+
+		assert!(runtime_type_imports(&sources, owners).is_empty());
+	}
+
+	#[test]
+	fn malformed_noncanonical_import_containing_a_runtime_owner_is_ignored() {
+		let owners = crate::prelude::core_runtime_type_owners();
+		let sources = FxHashMap::from_iter([(
+			"intrinsic".to_string(),
+			"import { Option } from 'vendor/std/option';\n".to_string(),
+		)]);
+
+		assert!(runtime_type_imports(&sources, owners).is_empty());
 	}
 }

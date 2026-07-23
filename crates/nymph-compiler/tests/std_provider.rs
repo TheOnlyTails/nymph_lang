@@ -80,7 +80,7 @@ fn import_std_collections_tree_resolves_compiles_and_runs() {
 
 	let call = compiled.entry_symbol("demo");
 	let mut js = compiled.js;
-	js.push_str(&format!("\nconsole.log({call}());\n"));
+	js.push_str(&format!("\nconsole.log({call}().v);\n"));
 
 	let dir = std::env::temp_dir();
 	let path = dir.join(format!(
@@ -136,7 +136,7 @@ fn std_to_std_import_resolves_and_links() {
 		.expect("expected the std-to-std graph to compile");
 	let call = compiled.entry_symbol("demo");
 	let mut js = compiled.js;
-	js.push_str(&format!("\nconsole.log({call}());\n"));
+	js.push_str(&format!("\nconsole.log({call}().v);\n"));
 
 	let dir = std::env::temp_dir();
 	let path = dir.join(format!(
@@ -223,7 +223,7 @@ fn a_std_key_mangles_to_valid_runnable_js() {
 		.expect("expected a deep `std/collections/tree` key to compile to valid JS");
 	let call = compiled.entry_symbol("depth_one");
 	let mut js = compiled.js;
-	js.push_str(&format!("\nconsole.log({call}());\n"));
+	js.push_str(&format!("\nconsole.log({call}().v);\n"));
 
 	let dir = std::env::temp_dir();
 	let path = dir.join(format!(

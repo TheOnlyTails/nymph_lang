@@ -41,6 +41,27 @@ fn run(src: &str, call: &str) -> String {
 }
 
 #[test]
+fn standalone_intrinsic_and_source_options_share_one_runtime_prototype() {
+	let source = r#"
+		func intrinsic_option(): Option<char> = "x".char_at(0u)
+		func source_option(): Option<char> = Some(value = 'x')
+	"#;
+	let js = compile(source, "standalone_option_owner").expect("expected a clean compile");
+	assert_eq!(
+		js.matches("//#region std/option").count(),
+		1,
+		"the ambient Option owner must be emitted exactly once: {js}"
+	);
+	assert_eq!(
+		run(
+			source,
+			"Object.getPrototypeOf(intrinsic_option()) === Object.getPrototypeOf(source_option())",
+		),
+		"true"
+	);
+}
+
+#[test]
 fn check_now_resolves_a_bare_user_struct_plus_impl_via_the_prelude_default() {
 	// The payoff of the flip: `P` implements the stdlib's `Plus` interface
 	// directly, with no local `interface Plus` declaration and no opt-in
@@ -65,7 +86,13 @@ fn check_now_resolves_a_bare_user_struct_plus_impl_via_the_prelude_default() {
 		js.contains("class P") && js.contains("plus("),
 		"expected `P`'s `plus` method to be lowered/emitted:\n{js}"
 	);
-	assert_eq!(run(source, "add(new P({v: 2}), new P({v: 3})).v"), "5");
+	assert_eq!(
+		run(
+			source,
+			"add(new P({v: new NInt(2)}), new P({v: new NInt(3)})).v.v"
+		),
+		"5"
+	);
 }
 
 #[test]
@@ -95,7 +122,13 @@ fn compile_lowers_and_runs_cleanly_when_a_user_impl_targets_a_stdlib_interface()
 		compile(source, "test").is_ok(),
 		"expected compile to succeed now that a user impl of a stdlib interface lowers cleanly"
 	);
-	assert_eq!(run(source, "add(new P({v: 10}), new P({v: 32})).v"), "42");
+	assert_eq!(
+		run(
+			source,
+			"add(new P({v: new NInt(10)}), new P({v: new NInt(32)})).v.v"
+		),
+		"42"
+	);
 }
 
 #[test]
@@ -110,52 +143,30 @@ fn compile_resolves_mixed_float_int_arithmetic() {
 }
 
 #[test]
-fn compile_panics_loudly_on_a_generic_bound_through_a_stdlib_interface() {
-	// Honest-scope acceptance criterion: a generic function bounded by the
-	// prelude's `Plus` (a required method with no default body, and — unlike
-	// `Comparable`/`Equals` — no unbounded blanket impl to spuriously match a
-	// still-abstract type parameter) dispatches `+` through the bound itself
-	// (`MethodSource::GenericBound` -> `DispatchKind::UserImplDefaultMethod`):
-	// the concrete impl is only known once `T` is instantiated, which this
-	// type-erased-at-lowering compiler does not track. Lowering panics loudly
-	// rather than silently miscompiling — documented, expected behavior,
-	// pinned here so a future slice that fixes it does so deliberately.
+fn compile_panics_loudly_on_an_unlinked_generic_bound_operator() {
+	// Generic bound dispatch needs a canonical host/runtime target for each
+	// primitive case. Arithmetic remains native codegen rather than a linked
+	// stdlib leaf, so this unsupported case must stay loud instead of emitting
+	// the invalid type-erased fallback `a.plus(b)`.
 	let source = "func f<T: Plus<Other = T, Output = T>>(a: T, b: T): T = a + b";
 
-	// Checking alone is clean (no diagnostics) — the panic is purely a lowering
-	// limitation, not a type error.
 	let diags = check(source, "test");
 	assert!(
 		!diags.iter().any(|d| d.is_error()),
 		"expected `f` to typecheck cleanly via the prelude, got: {diags:?}"
 	);
-
 	let message = catch_panic_message(|| {
 		let _ = compile(source, "test");
 	})
-	.expect("expected lowering to panic on the generic-bound dispatch");
+	.expect("expected lowering to reject unlinked generic arithmetic dispatch");
 	assert!(
 		message.contains("does not yet dispatch operator to interface default method"),
-		"expected the documented `UserImplDefaultMethod` panic message, got: {message:?}"
+		"expected the documented generic-dispatch panic, got: {message:?}"
 	);
 }
 
 #[test]
-fn compile_panics_loudly_on_a_blanket_impl_only_method_call() {
-	// Finding 2 (stdlib linkage groundwork review): a struct satisfies `Equals`
-	// *solely* through the stdlib's unconstrained blanket impl
-	// (`impl<T> Equals<Other = self> for T`, `ops/mod.nym`) — no local `impl
-	// Equals for P` at all — so `check` reports zero diagnostics (the blanket
-	// impl really does provide `equals`, and `Equals`'s own default body
-	// provides `not_equals`). But `compile` lowers only `source`'s own AST,
-	// never the prelude — so neither `equals` nor `not_equals` is ever
-	// materialized onto `P`'s compiled class. Before this fix, a plain method
-	// call (`a.equals(b)`) never consulted the checker's resolution at all and
-	// unconditionally lowered to a bare `Call { callee: Field { .. }, .. }`,
-	// trusting a method that doesn't exist anywhere in the emitted JS —
-	// confirmed to throw `TypeError: a.equals is not a function` at runtime
-	// under Node. Lowering must now refuse loudly instead, exactly like the
-	// other honest-scope deferrals in this file.
+fn blanket_impl_only_equals_method_call_links_and_runs() {
 	let source = "struct P(v: int)
 		func eq(a: P, b: P): boolean = a.equals(b)";
 
@@ -165,24 +176,15 @@ fn compile_panics_loudly_on_a_blanket_impl_only_method_call() {
 		"expected `P.equals` to resolve cleanly via the prelude's blanket impl, got: {diags:?}"
 	);
 
-	let message = catch_panic_message(|| {
-		let _ = compile(source, "test");
-	})
-	.expect("expected lowering to panic rather than emit a call to an unmaterialized method");
+	let js = compile(source, "test").expect("blanket equals should lower to the linked intrinsic");
 	assert!(
-		message.contains("prelude-only impl"),
-		"expected the documented prelude-only-impl panic message, got: {message:?}"
+		js.contains("//#region std/equality") && js.contains("return equals(a, b)"),
+		"expected the blanket equals call to use linked equality: {js}"
 	);
 }
 
 #[test]
-fn compile_panics_loudly_on_a_blanket_interface_default_method_call() {
-	// The `not_equals` half of the same hazard: `Equals`'s own default body
-	// (`func not_equals(other: Other): boolean = !this.equals(other)`) is
-	// reached through the same blanket-only impl, so `MethodSource` here is
-	// `InterfaceDefault` rather than `ImplDirect` — a different source, but the
-	// matched impl is the same prelude-origin blanket impl, so it must be
-	// refused just as loudly (Finding 2).
+fn blanket_impl_only_not_equals_method_call_links_and_runs() {
 	let source = "struct P(v: int)
 		func neq(a: P, b: P): boolean = a.not_equals(b)";
 
@@ -192,13 +194,11 @@ fn compile_panics_loudly_on_a_blanket_interface_default_method_call() {
 		"expected `P.not_equals` to resolve cleanly via the prelude's blanket impl, got: {diags:?}"
 	);
 
-	let message = catch_panic_message(|| {
-		let _ = compile(source, "test");
-	})
-	.expect("expected lowering to panic rather than emit a call to an unmaterialized method");
+	let js =
+		compile(source, "test").expect("blanket not_equals should lower to the linked intrinsic");
 	assert!(
-		message.contains("prelude-only impl"),
-		"expected the documented prelude-only-impl panic message, got: {message:?}"
+		js.contains("//#region std/equality") && js.contains("return not_equals(a, b)"),
+		"expected the blanket not_equals call to use linked equality: {js}"
 	);
 }
 
@@ -237,18 +237,10 @@ fn compile_panics_loudly_on_a_generic_bound_plain_method_call_through_a_stdlib_i
 }
 
 #[test]
-fn compile_panics_loudly_when_an_interface_default_dispatches_on_its_own_generic_param() {
-	// Stdlib body materialization review, Finding 1: `materializing_onto_class`
-	// is set for the FULL duration of lowering one interface default body onto
-	// a concrete class (`Foo::combine` onto `Bar` here) — it must not be
-	// treated as a blanket "any dispatch reached while in here is an ordinary,
-	// trustworthy class method call" signal. `combine`'s own body dispatches
-	// `other + other` on `Other` (`Foo`'s OWN generic parameter, pinned to
-	// `int` by `Bar`'s impl), never on `this`. Before the fix this silently
-	// lowered to `other.plus(other)` in `Bar`'s emitted `combine` method — a
-	// runtime `TypeError` under Node, since a JS `number` has no `plus`
-	// method. The receiver not being `this` must keep this exactly as loud a
-	// lowering deferral as the other honest-scope cases in this file.
+fn compile_panics_loudly_when_an_interface_default_uses_unlinked_generic_arithmetic() {
+	// The generic receiver here is not `this`, and Plus has no linked primitive
+	// runtime target. Materializing the default must not silently emit
+	// `other.plus(other)` for an int.
 	let source = "interface Foo<Other: Plus<Other = Other, Output = Other>> {
 			func combine(other: Other): Other = other + other
 		}
@@ -261,31 +253,20 @@ fn compile_panics_loudly_when_an_interface_default_dispatches_on_its_own_generic
 		!diags.iter().any(|d| d.is_error()),
 		"expected `Bar`'s `Foo` impl to typecheck cleanly via the prelude's `Plus`, got: {diags:?}"
 	);
-
 	let message = catch_panic_message(|| {
 		let _ = compile(source, "test");
 	})
-	.expect(
-		"expected lowering to panic rather than silently emit `other.plus(other)` on a non-`this` receiver",
-	);
+	.expect("expected lowering to reject unlinked generic arithmetic in the default body");
 	assert!(
 		message.contains("does not yet dispatch operator to interface default method"),
-		"expected the documented `UserImplDefaultMethod` panic message, got: {message:?}"
+		"expected the documented generic-dispatch panic, got: {message:?}"
 	);
 }
 
 #[test]
-fn compile_panics_loudly_on_comparable_compare_to_for_string() {
-	// Stdlib body materialization review, Finding 2: `Comparable for string`'s
-	// own `compare_to` is a genuine Nymph body (not `external` itself), so
-	// `try_materialize_prelude_dispatch` used to accept it as materializable —
-	// but that body calls the free `external(compare_to_string) func
-	// compare_to_string(..)` (`stdlib/src/ops/mod.nym`), which "stdlib
-	// linkage" (a still-future slice) has not wired up anywhere in the
-	// emitted module. Before the fix this compiled clean and threw
-	// `ReferenceError: compare_to_string is not defined` under Node at the
-	// call site. Lowering must refuse loudly instead, exactly like the other
-	// honest-scope deferrals in this file.
+fn comparable_compare_to_for_string_links_and_runs() {
+	// Primitive comparison itself remains a host leaf, while the Comparable
+	// implementation and sign-to-Order composition are inspectable Nymph.
 	let source = "func f(a: string, b: string): Order = a.compare_to(b)";
 
 	let diags = check(source, "test");
@@ -293,14 +274,12 @@ fn compile_panics_loudly_on_comparable_compare_to_for_string() {
 		!diags.iter().any(|d| d.is_error()),
 		"expected `string.compare_to` to resolve cleanly via the prelude, got: {diags:?}"
 	);
-
-	let message = catch_panic_message(|| {
-		let _ = compile(source, "test");
-	})
-	.expect("expected lowering to panic rather than emit a call to an unlinked external function");
-	assert!(
-		message.contains("prelude-only impl"),
-		"expected the documented prelude-only-impl panic message, got: {message:?}"
+	assert_eq!(
+		run(
+			source,
+			"f(new NString('a'), new NString('b'))[Symbol.for('nymph.tag')].description"
+		),
+		"Order.LessThan"
 	);
 }
 

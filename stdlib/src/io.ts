@@ -1,2 +1,4 @@
-export const print = (x: string) => process.stdout.write(x);
-export const println = (x: string) => console.log(x);
+import { display } from "./display";
+
+export const print = (x: unknown) => process.stdout.write(display(x).v);
+export const println = (x: unknown) => console.log(display(x).v);

@@ -60,6 +60,22 @@ enum Order {
   GreaterThan,
 }
 
+external(compare_number) func compare_ints(first: int, second: int): int
+external(compare_number) func compare_uints(first: uint, second: uint): int
+external(compare_number) func compare_floats(first: float, second: float): int
+external(compare_number) func compare_int_uint(first: int, second: uint): int
+external(compare_number) func compare_uint_int(first: uint, second: int): int
+external(compare_char) func compare_chars(first: char, second: char): int
+external(compare_string) func compare_strings(first: string, second: string): int
+
+func order_from_sign(sign: int): Order = if (sign < 0) {
+  Order.LessThan
+} else if (sign > 0) {
+  Order.GreaterThan
+} else {
+  Order.Equal
+}
+
 interface Equals<Other> {
   func equals(other: Other): boolean
 
@@ -70,6 +86,14 @@ interface Hash: Equals<Other = self> {
   /// Equal values must return equal hashes. State used by `hash`/`equals` must
   /// not change while the value is stored as a map or set key.
   func hash(): int
+}
+
+interface Display {
+  func display(): string
+}
+
+interface Debug {
+  func debug(): string
 }
 
 interface Contains<Item: Equals<Other = Item>> {
@@ -84,6 +108,10 @@ interface Unwrap<Output> {
 
 interface Index<Key, Output> {
   func index(key: Key): Output
+}
+
+impl<T> Index<Key = uint, Output = T> for #[T] {
+  external func index(key: uint): T
 }
 
 interface Into<Other> {
@@ -240,17 +268,17 @@ impl Remainder<Other = int, Output = int> for uint {
 }
 
 impl Comparable<Other = uint> for int {
-  external(compare_to_int) func compare_to(other: uint): Order
+  func compare_to(other: uint): Order = order_from_sign(compare_int_uint(this, other))
 }
 impl Comparable<Other = int> for uint {
-  external(compare_to_int) func compare_to(other: int): Order
+  func compare_to(other: int): Order = order_from_sign(compare_uint_int(this, other))
 }
 
 impl Equals<Other = uint> for int {
-  external(equals) func equals(other: uint): boolean
+  external(primitive_equals) func equals(other: uint): boolean
 }
 impl Equals<Other = int> for uint {
-  external(equals) func equals(other: int): boolean
+  external(primitive_equals) func equals(other: int): boolean
 }
 
 // Power for uint -> float (no negative bases, but fractional results possible)
@@ -329,30 +357,22 @@ impl Not<Output = boolean> for boolean {
 
 // Comparable for int
 impl Comparable<Other = self> for int {
-  external(compare_to_int) func compare_to(other: self): Order
+  func compare_to(other: self): Order = order_from_sign(compare_ints(this, other))
 }
 
 // Comparable for float
 impl Comparable<Other = self> for float {
-  external(compare_to_float) func compare_to(other: self): Order
+  func compare_to(other: self): Order = order_from_sign(compare_floats(this, other))
 }
 
 // Comparable for char
 impl Comparable<Other = self> for char {
-  external(compare_to_char) func compare_to(other: self): Order
+  func compare_to(other: self): Order = order_from_sign(compare_chars(this, other))
 }
 
 // Comparable for string
-external(compare_to_string) func compare_to_string(first: string, second: string): int
-
 impl Comparable<Other = self> for string {
-  func compare_to(other: self) = {
-    let ordering = compare_to_string(this, other)
-
-    if (ordering < 0) Order.LessThan
-    else if (ordering > 0) Order.GreaterThan
-    else Order.Equal
-  }
+  func compare_to(other: self): Order = order_from_sign(compare_strings(this, other))
 }
 
 // Comparable for boolean
@@ -378,13 +398,21 @@ impl<T> Comparable<Other = T> for T {
 // Equals blanket impl
 impl<T> Equals<Other = self> for T {
   external(equals) func equals(other: self): boolean
+  external(not_equals) func not_equals(other: self): boolean
 }
 
 impl<T: Equals<Other = T>> Hash for T {
   external(hash) func hash(): int
 }
 
-// Into for boolean -> string
-impl Into<string> for boolean {
-  func into() = if (this) "true" else "false"
+impl<T> Display for T {
+  external(display) func display(): string
+}
+
+impl<T> Debug for T {
+  external(debug) func debug(): string
+}
+
+impl<T: Display> Into<string> for T {
+  external(display) func into(): string
 }

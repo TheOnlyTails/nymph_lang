@@ -23,14 +23,12 @@ pub fn error_code_derive(input: TokenStream) -> TokenStream {
 			};
 
 			if let Some(ident) = list.path.segments.first()
-				&& ident.ident.to_string() == "error_code"
+				&& ident.ident == "error_code"
+				&& let Ok(digit) = syn::parse::<LitInt>(list.tokens.clone().into())
+				&& let Ok(num) = digit.base10_parse::<u8>()
+				&& num <= 9
 			{
-				if let Ok(digit) = syn::parse::<LitInt>(list.tokens.clone().into())
-					&& let Ok(num) = digit.base10_parse::<u8>()
-					&& num <= 9
-				{
-					return Some(num);
-				}
+				return Some(num);
 			}
 
 			None

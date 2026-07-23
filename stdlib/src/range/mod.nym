@@ -9,14 +9,21 @@ public enum Bound<Idx> {
 public interface RangeBounds<Idx: Comparable<Idx>> : Contains<Idx> {
   func start_bound(): Bound<Idx>
   func end_bound(): Bound<Idx>
-  func contains(item: Idx): boolean
+  func contains(item: Idx): boolean = (match (this.start_bound()) {
+    Included(value) -> value <= item,
+    Excluded(value) -> value < item,
+    Unbounded -> true
+  }) && (match (this.end_bound()) {
+    Included(value) -> value >= item,
+    Excluded(value) -> value > item,
+    Unbounded -> true
+  })
 }
 
 public struct Range<Idx: Comparable<Idx>>(start: Idx, end: Idx) {
   impl RangeBounds<Idx> {
     func start_bound() = Bound.Included(value = this.start)
     func end_bound() = Bound.Excluded(value = this.end)
-    func contains(item: Idx) = this.start <= item && this.end > item
   }
 
   func is_empty() = this.start >= this.end
@@ -26,7 +33,6 @@ public struct RangeFrom<Idx: Comparable<Idx>>(start: Idx) {
   impl RangeBounds<Idx> {
     func start_bound() = Bound.Included(value = this.start)
     func end_bound() = Bound.Unbounded
-    func contains(item: Idx) = this.start <= item
   }
 }
 
@@ -34,7 +40,6 @@ public struct RangeTo<Idx: Comparable<Idx>>(end: Idx) {
   impl RangeBounds<Idx> {
     func start_bound() = Bound.Unbounded
     func end_bound() = Bound.Excluded(value = this.end)
-    func contains(item: Idx) = this.end > item
   }
 }
 
@@ -42,7 +47,6 @@ public struct RangeInclusive<Idx: Comparable<Idx>>(start: Idx, end: Idx) {
   impl RangeBounds<Idx> {
     func start_bound() = Bound.Included(value = this.start)
     func end_bound() = Bound.Included(value = this.end)
-    func contains(item: Idx) = this.start <= item && this.end >= item
   }
 
   func is_empty() = this.start > this.end
@@ -52,6 +56,5 @@ public struct RangeToInclusive<Idx: Comparable<Idx>>(end: Idx) {
   impl RangeBounds<Idx> {
     func start_bound() = Bound.Unbounded
     func end_bound() = Bound.Included(value = this.end)
-    func contains(item: Idx) = this.end >= item
   }
 }

@@ -6,9 +6,9 @@ use oxc::{
 };
 
 use nymph_hir::hir::{
-	BinOp, BuiltinResult, HirArrayElem, HirArrayKind, HirClass, HirEnum, HirExpr, HirFunc, HirLet,
-	HirLit, HirMapElem, HirMethod, HirModule, HirPat, HirRange, HirStmt, NumKind, ScalarCastKind,
-	UnOp,
+	BinOp, BuiltinResult, HirArrayElem, HirArrayKind, HirBoundDispatchCase, HirBoundDispatchTarget,
+	HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit, HirMapElem, HirMethod, HirModule, HirPat,
+	HirRange, HirStmt, NumKind, ScalarCastKind, UnOp,
 };
 
 use crate::box_rt;
@@ -122,7 +122,7 @@ pub struct Emitter<'a> {
 	/// other top-level statement. A `BTreeSet` (not a `HashSet`) so the
 	/// prepended import order — and therefore the emitted JS text — stays
 	/// stable across runs, which the golden/e2e tests rely on.
-	needed_imports: std::cell::RefCell<std::collections::BTreeSet<(&'static str, &'static str)>>,
+	needed_imports: std::cell::RefCell<std::collections::BTreeSet<(String, String)>>,
 	/// Set the first time [`Self::new_box`] emits a `new N…(…)` box construction
 	/// (uniform value boxing, slice #2). When set, [`Self::emit_module`] prepends
 	/// the inline [`box_rt::box_preamble`] class definitions so the module is
@@ -1062,6 +1062,68 @@ impl<'a> Emitter<'a> {
 		self.call1(arrow, operand)
 	}
 
+	fn emit_bound_dispatch(
+		&self,
+		method: &str,
+		receiver: &HirExpr,
+		argument: &HirExpr,
+		cases: &[HirBoundDispatchCase],
+	) -> Expression<'a> {
+		let receiver_param = self.gensym();
+		let receiver_param = self.ast.allocator.alloc_str(&receiver_param);
+		let argument_param = self.gensym();
+		let argument_param = self.ast.allocator.alloc_str(&argument_param);
+
+		let mut body = self.member_call(
+			self.ident(receiver_param),
+			method,
+			vec![self.ident(argument_param)],
+		);
+		for case in cases.iter().rev() {
+			let receiver_matches = self.strict_eq(
+				self.tag_read(self.ident(receiver_param), true),
+				self.global_symbol(&case.receiver_tag),
+			);
+			let argument_matches = self.strict_eq(
+				self.tag_read(self.ident(argument_param), true),
+				self.global_symbol(&case.argument_tag),
+			);
+			let test = Expression::new_logical_expression(
+				SPAN,
+				receiver_matches,
+				LogicalOperator::And,
+				argument_matches,
+				&self.ast,
+			);
+			let target_name = match &case.target {
+				HirBoundDispatchTarget::TopLevel { module, name } => {
+					self
+						.needed_imports
+						.borrow_mut()
+						.insert((module.to_string(), name.to_string()));
+					name.as_str()
+				}
+				HirBoundDispatchTarget::Extern { module, symbol } => {
+					self
+						.needed_imports
+						.borrow_mut()
+						.insert((module.to_string(), symbol.to_string()));
+					symbol
+				}
+			};
+			let target = self.ident(self.ast.allocator.alloc_str(target_name));
+			let mut args = ArenaVec::new_in(&self.ast);
+			args.push(Argument::from(self.ident(receiver_param)));
+			args.push(Argument::from(self.ident(argument_param)));
+			let dispatched =
+				Expression::new_call_expression(SPAN, target, oxc::ast::NONE, args, false, &self.ast);
+			body = Expression::new_conditional_expression(SPAN, test, dispatched, body, &self.ast);
+		}
+
+		let argument_iife = self.arrow_iife(argument_param, body, self.emit_expr(argument));
+		self.arrow_iife(receiver_param, argument_iife, self.emit_expr(receiver))
+	}
+
 	/// The saturating JS runtime mapping for a numeric `ScalarCast` (the change
 	/// that supersedes Slice 4K's plain `Math.trunc` passthrough): Nymph defines
 	/// its own float→int/uint semantics rather than inheriting JS's (`Math.trunc`
@@ -1141,6 +1203,30 @@ impl<'a> Emitter<'a> {
 			HirExpr::Str(s) => {
 				let raw =
 					Expression::new_string_literal(SPAN, self.ast.allocator.alloc_str(s), None, &self.ast);
+				self.new_box("NString", raw)
+			}
+			HirExpr::InterpolatedString(segments) => {
+				let mut segments = segments.iter().map(|segment| match segment {
+					HirExpr::Str(text) => Expression::new_string_literal(
+						SPAN,
+						self.ast.allocator.alloc_str(text),
+						None,
+						&self.ast,
+					),
+					other => self.unwrap_v(self.emit_expr(other)),
+				});
+				let first = segments
+					.next()
+					.unwrap_or_else(|| Expression::new_string_literal(SPAN, "", None, &self.ast));
+				let raw = segments.fold(first, |left, right| {
+					Expression::BinaryExpression(BinaryExpression::boxed(
+						SPAN,
+						left,
+						BinaryOperator::Addition,
+						right,
+						&self.ast,
+					))
+				});
 				self.new_box("NString", raw)
 			}
 			HirExpr::Bool(b) => {
@@ -1233,15 +1319,35 @@ impl<'a> Emitter<'a> {
 				symbol,
 				args,
 			} => {
-				self.needed_imports.borrow_mut().insert((*module, *symbol));
+				let callee_name = if *module == "std/display" {
+					self.used_box.set(true);
+					match *symbol {
+						"display" => "nymphProtocolDisplay",
+						"debug" => "nymphProtocolDebug",
+						_ => unreachable!("unknown display protocol intrinsic `{symbol}`"),
+					}
+				} else {
+					self
+						.needed_imports
+						.borrow_mut()
+						.insert((module.to_string(), symbol.to_string()));
+					symbol
+				};
 				let callee =
-					Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(symbol), &self.ast);
+					Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(callee_name), &self.ast);
 				let mut arguments = ArenaVec::new_in(&self.ast);
 				for arg in args {
 					arguments.push(Argument::from(self.emit_expr(arg)));
 				}
 				Expression::new_call_expression(SPAN, callee, oxc::ast::NONE, arguments, false, &self.ast)
 			}
+			HirExpr::BoundDispatch {
+				method,
+				receiver,
+				argument,
+				cases,
+				..
+			} => self.emit_bound_dispatch(method, receiver, argument, cases),
 			// Collection literals own a native array payload; compiler-internal
 			// accumulators remain raw arrays.
 			HirExpr::Array { kind, items } => {

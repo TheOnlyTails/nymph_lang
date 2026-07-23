@@ -1,5 +1,5 @@
 import @/option with (Option)
-import @/ops with (Plus, Into, Contains, Hash)
+import @/ops with (Plus, Contains, Hash)
 import @/iter with (Iterator)
 import @/iter/iterable with (Iterable)
 
@@ -32,10 +32,6 @@ impl<K: Hash, V> #{K: V} {
 
 impl<K: Hash, V> Plus<Other = self, Output = self> for #{K: V} {
   external(merge) func plus(other: self): self
-}
-
-impl<K: Hash + Into<string>, V: Into<string>> Into<string> for #{K: V} {
-  external(to_string) func into(): string
 }
 
 impl<K: Hash, V> Contains<Item = K> for #{K: V} {

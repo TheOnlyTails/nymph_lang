@@ -1,2 +1,2 @@
-public external(print) func print(x: string): void
-public external(println) func println(x: string): void
+public external(print) func print<T: Display>(x: T): void
+public external(println) func println<T: Display>(x: T): void
