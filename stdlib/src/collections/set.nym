@@ -10,7 +10,7 @@ public struct Set<Item: Hash>(inner: #{Item: #()}) {
     true
   } else false
 
-  namespace func new(...from: Item): Set<Item> = {
+  namespace func new(...from: #[Item]): Set<Item> = {
     let mut inner: #{Item: #()} = #{}
     for (item in from) {
       inner.insert(item, #())

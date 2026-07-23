@@ -2576,22 +2576,6 @@ impl<'m> Checker<'m> {
 		// Self`) is actually reachable, rather than permanently unmatched.
 		let resolved = self.shallow_resolve(ty);
 		let self_is_mut = matches!(self.interner.kind(resolved), TyKind::Mut(_));
-		// A bare, unbounded generic type parameter's iterability can't be
-		// resolved through the impl registry: `head_of` maps `Param` to `None`,
-		// so only a blanket `Iterator`/`Iterable` impl could ever match it (none
-		// exists yet), and there is no separate mechanism here (unlike
-		// `resolve_param_namespaced`'s namespaced-call path) for a for-loop
-		// source bound by an interface constraint declared on its own generic
-		// parameter — RR1 targets concrete ADT sources (per the plan), a bare
-		// `Param` is out of scope for this slice. Keep the pre-existing
-		// permissive fallback for exactly this shape rather than a new
-		// false-positive `NotIterable`. This also happens to be what keeps
-		// `stdlib_typechecks_cleanly` green for `collections/set.nym`'s
-		// `for (item in from)` over a `...from: Item` spread parameter: spread
-		// parameter typing doesn't yet wrap the body-visible type in a list
-		// (`#[Item]`) — it stays the bare element type `Item` — a distinct,
-		// out-of-footprint gap (spread/rest typing, the sibling track's
-		// territory) this slice does not touch.
 		if let TyKind::Param(idx) = self.interner.kind(stripped) {
 			let idx = *idx;
 			// A generic parameter's iterability can't be found through the impl registry
@@ -2610,10 +2594,6 @@ impl<'m> Checker<'m> {
 					.record_iter_mode(iterable.id, IterMode::Direct);
 				return item;
 			}
-			// A bare, unbounded `Param` (the `...from: Item` spread-parameter carve-out)
-			// records no `IterMode`; lowering keeps treating exactly that shape as
-			// list-like (its runtime value is an array).
-			return self.fresh();
 		}
 		if let Some(iterator) = self.defs.get("Iterator").filter(|&d| self.is_interface(d))
 			&& let Some(item_name) = self

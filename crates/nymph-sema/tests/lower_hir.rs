@@ -2646,18 +2646,10 @@ fn legal_return_in_a_statement_position_match_is_unaffected_by_a_sibling_closure
 }
 
 #[test]
-fn for_loop_over_a_spread_param_does_not_panic_in_lowering() {
-	// A bare, unbounded generic `Param` for-loop source (the checker's
-	// pre-existing permissive fallback in `resolve_iterable_source`, kept for
-	// exactly this shape: a `...from: Item` spread parameter, e.g.
-	// `collections/set.nym`'s `Set::new`) must not crash the compiler at
-	// lowering time just because the checker let it through. `lower_for`
-	// treats a bare-`Param`-typed source the same as a native list source
-	// (the list fast path, not the `Iterator`/`Iterable` protocol desugar,
-	// which has no `IterMode` recorded for this carve-out and would panic).
+fn for_loop_over_a_list_typed_spread_param_lowers_through_iterable() {
 	let hir = lower(
 		r#"
-		func make<Item>(...from: Item): int = {
+		func make<Item>(...from: #[Item]): int = {
 			let mut total = 0
 			for (item in from) {
 				total = total + 1
@@ -2667,6 +2659,22 @@ fn for_loop_over_a_spread_param_does_not_panic_in_lowering() {
 		"#,
 	);
 	assert_eq!(hir.funcs[0].name, "make");
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	let HirStmt::Expr(HirExpr::Block {
+		stmts: loop_stmts, ..
+	}) = &stmts[1]
+	else {
+		panic!("expected protocol loop block, got {:?}", stmts[1]);
+	};
+	assert!(matches!(
+		&loop_stmts[0],
+		HirStmt::Let {
+			value: HirExpr::Call { .. },
+			..
+		}
+	));
 }
 
 #[test]

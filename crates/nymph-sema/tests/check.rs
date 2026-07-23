@@ -386,22 +386,15 @@ fn for_in_over_a_non_iterable_source_is_diagnosed() {
 }
 
 #[test]
-fn for_in_over_an_unbounded_generic_param_is_still_permissive() {
-	// Known carve-out (see `resolve_iterable_source`): a bare, unbounded
-	// generic type parameter used as a for-loop source can't be resolved
-	// through the impl registry (`head_of` maps `Param` to `None`), and there
-	// is no bound-checking path for it here (RR1 targets concrete ADT
-	// sources) — this keeps the PRE-EXISTING permissive behavior instead of a
-	// new false-positive `NotIterable`, which would otherwise regress
-	// `collections/set.nym`'s `for (item in from)` over a `...from: Item`
-	// spread parameter (a distinct, out-of-footprint spread-typing gap).
-	assert_ok(
+fn for_in_over_an_unbounded_generic_param_is_diagnosed() {
+	assert_error_contains(
 		"func f<Item>(from: Item): int = {
 		   for (item in from) {
 		     item
 		   }
 		   0
 		 }",
+		"not iterable",
 	);
 }
 

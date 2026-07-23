@@ -3296,20 +3296,6 @@ impl<'a> Lowerer<'a> {
 	///   the original counting-`while` fast path (`lower_for_range`, Slice 4H,
 	///   BB2), UNCHANGED — it's faster than the general protocol and the
 	///   checker never routes a range through the interfaces at all;
-	/// - a bare, unbound generic `Param` source keeps a temporary raw-array path.
-	///   This mirrors `resolve_iterable_source`'s own pre-existing permissive
-	///   carve-out for exactly this shape (a `...from: Item` spread parameter,
-	///   e.g. `collections/set.nym`'s `Set::new` — spread-parameter typing
-	///   doesn't yet wrap the body-visible type in a list, so it stays the bare
-	///   element type `Item` rather than `#[Item]`; a distinct, out-of-footprint
-	///   gap this slice does not touch). The checker records no `IterMode` for
-	///   this carve-out (it can't know whether a bare `Param` is Iterator-like
-	///   or Iterable-like), so routing it through `lower_for_protocol` would hit
-	///   the `unwrap_or_else` panic below unconditionally. Treating it as
-	///   list-like instead matches the ONLY shape this carve-out is reachable
-	///   from today (a spread parameter, whose runtime value a JS caller
-	///   passing a single array argument already makes an actual array) and
-	///   never panics;
 	/// - anything else desugars to the `Iterator`/`Iterable` protocol
 	///   (`lower_for_protocol`), reading back which of the two the checker
 	///   matched (`IterMode`, recorded on `iterable`'s own node id by
@@ -3323,24 +3309,7 @@ impl<'a> Lowerer<'a> {
 		if let ExprKind::Range(kind) = &iterable.kind {
 			return self.lower_for_range(variable, kind, body);
 		}
-		let source_ty = self
-			.annotations
-			.get(iterable.id)
-			.map(|info| Self::peel_mut(self.interner, info.ty));
-		// A bare `Param` takes the raw-array path only for the spread-parameter
-		// carve-out where the checker recorded no
-		// `IterMode` (`resolve_iterable_source`); a `Param` bound by `Iterator`/`Iterable`
-		// records `IterMode::Direct`/`ViaIter` and must go through the protocol (calling
-		// `.next()`), not be mis-lowered as an array index walk.
-		let is_raw_spread_param = source_ty.is_some_and(|ty| {
-			matches!(self.interner.kind(ty), TyKind::Param(_))
-				&& self.annotations.iter_mode_of(iterable.id).is_none()
-		});
-		if is_raw_spread_param {
-			self.lower_for_raw_spread_param(variable, iterable, body)
-		} else {
-			self.lower_for_protocol(variable, iterable, body)
-		}
+		self.lower_for_protocol(variable, iterable, body)
 	}
 
 	/// Desugar `for (<pat> in <range>) <body>` into a `Block` running a `while`
@@ -3485,112 +3454,8 @@ impl<'a> Lowerer<'a> {
 		}
 	}
 
-	/// Temporary raw spread-parameter path: `for (<pat> in <param>) <body>` lowers to
-	/// the SAME index-counting `while` shape as the range fast path above, over
-	/// `$arr[$i]` instead of the induction variable itself. Type-free at the JS
-	/// level — `.length` is a real JS array property, not the stdlib's own
-	/// external `.length()` method — and needs no stdlib support at all: the
-	/// checker's `infer_iterable_element` already resolves a list source purely
-	/// by type inspection (`TyKind::List`), without ever consulting the
-	/// `Iterator`/`Iterable` interfaces, so lowering mirrors that here rather
-	/// than routing a list through the general protocol desugar
-	/// (`lower_for_protocol`) below. Only a plain-binding loop pattern is
-	/// supported, mirroring `lower_for_range`'s own restriction — HIR's `Let`
-	/// only binds a single name (`param_name`), so a `let` (unlike a `match`
-	/// arm) has no way to destructure a general pattern.
-	fn lower_for_raw_spread_param(
-		&self,
-		variable: &Spanned<nymph_ast::expr::Pattern>,
-		iterable: &Expr,
-		body: &Expr,
-	) -> HirExpr {
-		use nymph_ast::expr::Pattern;
-
-		let name = match &variable.0 {
-			Pattern::Binding { name, inner } if matches!(inner.0, Pattern::Placeholder) => &name.0,
-			other => panic!(
-				"iterator-for-loops lowering only supports a plain-binding for-loop pattern over a list source, got {other:?}"
-			),
-		};
-
-		let src = self.lower_expr(iterable);
-
-		// The whole for-loop is one JS scope, holding the hoisted array, its
-		// length, and the induction variable.
-		self.push_scope();
-		let arr_name = self.declare(&EcoString::from("$arr"));
-		let n_name = self.declare(&EcoString::from("$n"));
-		let i_name = self.declare(&EcoString::from("$i"));
-
-		// The per-iteration body gets its own nested scope: the pattern binding
-		// plus the (already scoped, via `lower_branch`) lowered body.
-		self.push_scope();
-		let pat_name = self.declare(name);
-		let body = self.lower_branch(body);
-		self.pop_scope();
-
-		let while_body = HirExpr::Block {
-			stmts: vec![
-				HirStmt::Let {
-					name: pat_name,
-					mutable: false,
-					value: HirExpr::RawIndex {
-						recv: Box::new(HirExpr::Local(arr_name.clone())),
-						index: Box::new(HirExpr::Local(i_name.clone())),
-					},
-				},
-				HirStmt::Expr(body),
-				HirStmt::Expr(HirExpr::Assign {
-					target: Box::new(HirExpr::Local(i_name.clone())),
-					value: Box::new(HirExpr::Binary {
-						op: BinOp::Add,
-						result: BuiltinResult::Raw,
-						lhs: Box::new(HirExpr::Local(i_name.clone())),
-						rhs: Box::new(HirExpr::Num(1.0, NumKind::Raw)),
-					}),
-				}),
-			],
-			tail: None,
-		};
-		let while_expr = HirExpr::While {
-			cond: Box::new(HirExpr::Binary {
-				op: BinOp::Lt,
-				result: BuiltinResult::Raw,
-				lhs: Box::new(HirExpr::Local(i_name.clone())),
-				rhs: Box::new(HirExpr::Local(n_name.clone())),
-			}),
-			body: Box::new(while_body),
-		};
-		self.pop_scope();
-
-		HirExpr::Block {
-			stmts: vec![
-				HirStmt::Let {
-					name: arr_name.clone(),
-					mutable: false,
-					value: src,
-				},
-				HirStmt::Let {
-					name: n_name,
-					mutable: false,
-					value: HirExpr::Field {
-						recv: Box::new(HirExpr::Local(arr_name)),
-						name: "length".into(),
-					},
-				},
-				HirStmt::Let {
-					name: i_name,
-					mutable: true,
-					value: HirExpr::Num(0.0, NumKind::Raw),
-				},
-				HirStmt::Expr(while_expr),
-			],
-			tail: None,
-		}
-	}
-
 	/// The general `Iterator`/`Iterable` protocol desugar (RR1/RR2): every
-	/// `for`-loop source that is neither a syntactic range nor the temporary raw spread parameter
+	/// `for`-loop source that is not a syntactic range
 	/// reaches here. HIR has no `Break`/`Continue` node, so the loop-exit signal
 	/// is a plain `mut` boolean flag rather than the more natural
 	/// `while (true) { match { .. -> break } }` shape:
@@ -3607,8 +3472,8 @@ impl<'a> Lowerer<'a> {
 	/// }
 	/// ```
 	///
-	/// Unlike `lower_for_range`/`lower_for_raw_spread_param` (which bind the loop pattern
-	/// through a HIR `Let`, so only a plain binding is supported — `Let` binds a
+	/// Unlike `lower_for_range` (which binds the loop pattern through a HIR `Let`,
+	/// so only a plain binding is supported — `Let` binds a
 	/// single name only), the loop pattern here is a genuine `match` arm
 	/// pattern (`HirPat`, via the ordinary `lower_pattern`), so ANY pattern
 	/// shape the language supports is legal in this position, same as any other
@@ -3822,9 +3687,7 @@ impl<'a> Lowerer<'a> {
 
 	/// Lower a spread source `e` (`#[...e]` list item, or a non-map `#{...e}`
 	/// map entry) to the JS-array-valued expression the spread splices: a boxed
-	/// list contributes its `.v` payload directly; a bare, unbound `Param` keeps
-	/// the SAME raw-array carve-out
-	/// `lower_for` uses for a spread-parameter source), else drained into a
+	/// list contributes its `.v` payload directly; anything else is drained into a
 	/// real array through the `Iterator`/`Iterable` protocol
 	/// ([`Self::drain_to_array`]), reading back which mode the checker matched
 	/// ([`IterMode`]) exactly like [`Self::lower_for_protocol`] does.
@@ -3844,9 +3707,6 @@ impl<'a> Lowerer<'a> {
 				recv: Box::new(self.lower_expr(e)),
 				name: "v".into(),
 			};
-		}
-		if source_ty.is_some_and(|ty| matches!(self.interner.kind(ty), TyKind::Param(_))) {
-			return self.lower_expr(e);
 		}
 		let mode = self.annotations.iter_mode_of(e.id).unwrap_or_else(|| {
 			panic!(
@@ -4917,7 +4777,7 @@ fn collect_locals(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 				}
 			}
 		}
-		HirExpr::Index { recv, index } | HirExpr::RawIndex { recv, index } => {
+		HirExpr::Index { recv, index } => {
 			collect_locals(recv, out);
 			collect_locals(index, out);
 		}
@@ -5069,7 +4929,7 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 				}
 			}
 		}
-		HirExpr::Index { recv, index } | HirExpr::RawIndex { recv, index } => {
+		HirExpr::Index { recv, index } => {
 			collect_variant_ref_enums(recv, out);
 			collect_variant_ref_enums(index, out);
 		}

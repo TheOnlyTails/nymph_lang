@@ -1578,26 +1578,17 @@ fn runs_a_for_loop_over_an_iterable_via_iter() {
 
 #[test]
 fn runs_a_for_loop_over_a_spread_param_bound_to_a_list() {
-	// A `for` loop over a `...from: Item` spread parameter (the shape
-	// `collections/set.nym`'s `Set::new` uses) must not panic in lowering
-	// (`lower_for` routes a bare, unbound generic `Param` source through the
-	// same list fast path as a native list, since the checker's own
-	// pre-existing permissive fallback records no `IterMode` for it). Spread
-	// parameters aren't collected into a real JS rest array yet (a separate,
-	// out-of-footprint Milestone B gap) — `from` is an ordinary parameter at
-	// the JS level — so calling with a single list ARGUMENT (rather than
-	// multiple positional arguments) exercises the exact runtime shape this
-	// fast path assumes and must sum correctly.
 	let src = r#"
-		func total<Item>(...from: Item): int = {
+		func total<Item>(...from: #[Item]): int = {
 			let mut total = 0
 			for (item in from) {
 				total = total + 1
 			}
 			total
 		}
+		func demo(): int = total(...#[1, 2, 3, 4, 5])
 	"#;
-	assert_eq!(run(src, "total([1, 2, 3, 4, 5]).v"), "5");
+	assert_eq!(run(src, "demo().v"), "5");
 }
 
 // ── Slice 4I: `|>`, `in`/`!in`, `??` (Task 2) ────────────────────────────────

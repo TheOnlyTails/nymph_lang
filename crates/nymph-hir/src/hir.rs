@@ -212,11 +212,6 @@ pub enum HirExpr {
 		recv: Box<HirExpr>,
 		index: Box<HirExpr>,
 	},
-	/// A compiler-internal subscript into a raw JS array.
-	RawIndex {
-		recv: Box<HirExpr>,
-		index: Box<HirExpr>,
-	},
 	/// A map lookup — emits as `recv.get(key)`.
 	MapGet {
 		recv: Box<HirExpr>,

@@ -1325,13 +1325,6 @@ impl<'a> Emitter<'a> {
 				let key = self.emit_expr(index);
 				self.member_call(object, "index", vec![key])
 			}
-			HirExpr::RawIndex { recv, index } => {
-				let object = self.emit_expr(recv);
-				let property = self.emit_expr(index);
-				Expression::ComputedMemberExpression(ComputedMemberExpression::boxed(
-					SPAN, object, property, false, &self.ast,
-				))
-			}
 			// Struct construction → `new <class>({ field: value, … })`.
 			HirExpr::New { class, fields } => {
 				let mut props = ArenaVec::new_in(&self.ast);
