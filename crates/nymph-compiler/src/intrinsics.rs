@@ -74,6 +74,7 @@ const IMPORT_REWRITES: &[(&str, &str)] = &[
 	// `string.ts` sits at the stdlib root, so its `Option` import is `./option`.
 	("./option", "std/option"),
 	("./box", "std/box"),
+	("../box", "std/box"),
 ];
 
 /// The virtual `std/option` module every Option-returning `List` intrinsic
@@ -190,6 +191,10 @@ mod tests {
 			!list_js.contains("\"../option\""),
 			"expected the original, unresolvable `../option` specifier to be gone, got:\n{list_js}"
 		);
+		assert!(
+			list_js.contains("from \"std/box\""),
+			"list results must use the canonical box module: {list_js}"
+		);
 	}
 
 	#[test]
@@ -227,6 +232,10 @@ mod tests {
 		assert!(
 			!map_js.contains("\"../option\""),
 			"expected the original, unresolvable `../option` specifier to be gone, got:\n{map_js}"
+		);
+		assert!(
+			map_js.contains("from \"std/box\""),
+			"map results must use the canonical box module: {map_js}"
 		);
 		// L3's ABI fix: `get`/`remove` must build `Option.Some({ value: .. })`
 		// — a named-field object, not a bare positional value — to

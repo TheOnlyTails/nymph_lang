@@ -111,15 +111,15 @@ fn linked_list_length_compiles_bundles_and_runs() {
 		compiled.js
 	);
 	assert!(
-		compiled.js.contains("$_this.length"),
+		compiled.js.contains("$_this.v.length"),
 		"expected the injected, stripped `list.ts` intrinsic body \
-		 (`$_this.length`) to be inlined into the bundle, got:\n{}",
+		 (`$_this.v.length`) to be inlined into the bundle, got:\n{}",
 		compiled.js
 	);
 
 	let call = compiled.entry_symbol("demo");
 	let mut js = compiled.js;
-	js.push_str(&format!("\nconsole.log({call}());\n"));
+	js.push_str(&format!("\nconsole.log({call}().v);\n"));
 
 	assert_eq!(run_node(&js, "length"), "3");
 }
@@ -150,7 +150,7 @@ fn transitively_linked_is_empty_compiles_bundles_and_runs() {
 	let call_empty = compiled.entry_symbol("demo_empty");
 	let mut js = compiled.js;
 	js.push_str(&format!(
-		"\nconsole.log({call}());\nconsole.log({call_empty}());\n"
+		"\nconsole.log({call}().v);\nconsole.log({call_empty}().v);\n"
 	));
 
 	let output = run_node(&js, "is_empty");
@@ -210,7 +210,7 @@ fn linked_list_get_compiles_bundles_and_runs_the_option_round_trip() {
 	let call_oob = compiled.entry_symbol("demo_out_of_bounds");
 	let mut js = compiled.js;
 	js.push_str(&format!(
-		"\nconsole.log({call}());\nconsole.log({call_oob}());\n"
+		"\nconsole.log({call}().v);\nconsole.log({call_oob}().v);\n"
 	));
 
 	let output = run_node(&js, "get");
@@ -291,7 +291,7 @@ fn linked_map_get_insert_remove_and_keys_compile_bundle_and_run() {
 	.map(|name| compiled.entry_symbol(name));
 	let mut js = compiled.js;
 	for call in &calls {
-		js.push_str(&format!("\nconsole.log({call}());\n"));
+		js.push_str(&format!("\nconsole.log({call}().v);\n"));
 	}
 
 	let output = run_node(&js, "map");
@@ -365,7 +365,7 @@ fn linked_map_merge_and_to_string_compile_bundle_and_run() {
 
 	let call_merge = compiled.entry_symbol("demo_merge_size");
 	let mut js = compiled.js;
-	js.push_str(&format!("\nconsole.log({call_merge}());\n"));
+	js.push_str(&format!("\nconsole.log({call_merge}().v);\n"));
 
 	let output = run_node(&js, "map_merge_to_string");
 	assert_eq!(
@@ -429,12 +429,57 @@ fn a_user_set_struct_backed_by_the_linked_map_inserts_removes_and_contains_round
 
 	let call = compiled.entry_symbol("demo");
 	let mut js = compiled.js;
-	js.push_str(&format!("\nconsole.log({call}());\n"));
+	js.push_str(&format!("\nconsole.log({call}().v);\n"));
 
 	assert_eq!(
 		run_node(&js, "set"),
 		"true",
 		"expected the Set insert/remove/contains round-trip to hold end to end"
+	);
+}
+
+#[test]
+fn boxed_collection_intrinsics_preserve_value_semantics_and_nested_shapes() {
+	let entry = r#"
+		struct Key(id: int) {
+			impl Equals<Other = Key> {
+				func equals(other: Key): boolean = true
+			}
+			impl Hash {
+				func hash(): int = 0
+			}
+		}
+
+		func custom_contains(): boolean = #[Key(id = 1)].contains(Key(id = 2))
+		func custom_distinct_len(): uint = #[Key(id = 1), Key(id = 2)].distinct().length()
+		func ordered_distinct(): #[int] = #[3, 1, 3, 2].distinct()
+		func nested_chunk(): int = #[1, 2, 3].chunked(2)[1][0]
+		func entries_key(): int = #{7: 70}.entries()[0][0]
+		func merge_right_wins(): int = #{1: 10}.plus(#{1: 99})[1]
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("boxed collection intrinsics should compile through the ambient prelude");
+	let calls = [
+		"custom_contains",
+		"custom_distinct_len",
+		"nested_chunk",
+		"entries_key",
+		"merge_right_wins",
+	]
+	.map(|name| compiled.entry_symbol(name));
+	let ordered_distinct = compiled.entry_symbol("ordered_distinct");
+	let mut js = compiled.js;
+	for call in &calls {
+		js.push_str(&format!("\nconsole.log({call}().v);\n"));
+	}
+	js.push_str(&format!(
+		"\nconsole.log({ordered_distinct}().v.map(value => value.v).join(','));\n"
+	));
+	assert_eq!(
+		run_node(&js, "boxed_collections"),
+		"true\n1\n3\n7\n99\n3,1,2"
 	);
 }
 

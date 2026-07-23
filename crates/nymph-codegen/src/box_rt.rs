@@ -306,7 +306,7 @@ fn class_defs(export: bool) -> String {
 	out.push_str("}\n");
 	out.push_str(HASH_MAP_RUNTIME);
 	if export {
-		out.push_str("export { nymphHash as structuralHash };\n");
+		out.push_str("export { nymphKeyEquals as protocolEquals, nymphHash as structuralHash };\n");
 	}
 	for (class, _) in BOX_CLASSES {
 		if *class == "NMap" {

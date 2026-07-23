@@ -1,8 +1,10 @@
 import { Option } from "../option";
+import { NBool, NList, NMap, NString, NUint, protocolEquals } from "../box";
 
-export const length = ($_this: any[]) => $_this.length;
-export const insert = <T>($_this: T[], i: number, element: T) =>
-	$_this.splice(i, 0, element);
+export const length = ($_this: NList) => new NUint($_this.v.length);
+export const insert = <T>($_this: NList<T>, i: NUint, element: T) => {
+	$_this.v.splice(i.v, 0, element);
+};
 // Gap 3 (L1): the compiler's own emitted `Option` ABI (`emit_enum`,
 // `nymph-codegen`) builds a field variant via `Object.assign(<tag>, fields)`
 // spreading a FIELDS OBJECT (`{ value: X }`) into the result — never a
@@ -11,40 +13,51 @@ export const insert = <T>($_this: T[], i: number, element: T) =>
 // `Option.Some(..)` call below must pass an object literal naming the field,
 // not the bare value, to interoperate with a `match` in the user's own
 // Nymph program.
-export const get = <T>($_this: T[], i: number) =>
-	i < $_this.length ? Option.Some({ value: $_this[i] }) : Option.None;
-export const remove = <T>($_this: T[], i: number) =>
-	i < $_this.length ? Option.Some({ value: $_this.splice(i, 1)[0] }) : Option.None;
-export const push = <T>($_this: T[], item: T) => {
-	$_this.push(item);
+export const get = <T>($_this: NList<T>, i: NUint) =>
+	i.v < $_this.v.length ? Option.Some({ value: $_this.v[i.v] }) : Option.None;
+export const remove = <T>($_this: NList<T>, i: NUint) =>
+	i.v < $_this.v.length ? Option.Some({ value: $_this.v.splice(i.v, 1)[0] }) : Option.None;
+export const push = <T>($_this: NList<T>, item: T) => {
+	$_this.v.push(item);
 };
-export const pop = <T>($_this: T[]) =>
-	$_this.length === 0 ? Option.None : Option.Some({ value: $_this.pop()! });
-export const first = <T>($_this: T[]) =>
-	$_this.length === 0 ? Option.None : Option.Some({ value: $_this[0] });
-export const last = <T>($_this: T[]) =>
-	$_this.length === 0 ? Option.None : Option.Some({ value: $_this[$_this.length - 1] });
-export const clear = ($_this: any[]) => {
-	$_this.length = 0;
+export const pop = <T>($_this: NList<T>) =>
+	$_this.v.length === 0 ? Option.None : Option.Some({ value: $_this.v.pop()! });
+export const first = <T>($_this: NList<T>) =>
+	$_this.v.length === 0 ? Option.None : Option.Some({ value: $_this.v[0] });
+export const last = <T>($_this: NList<T>) =>
+	$_this.v.length === 0 ? Option.None : Option.Some({ value: $_this.v[$_this.v.length - 1] });
+export const clear = ($_this: NList) => {
+	$_this.v.length = 0;
 };
-export const splice = <T>($_this: T[], start: number, end: number, replacement: T[]): T[] =>
-	$_this.splice(start, end - start, ...replacement);
-export const slice = <T>($_this: T[], start: number, end: number): T[] =>
-	$_this.slice(start, end);
-export const concat = <T>($_this: T[], other: T[]): T[] => $_this.concat(other);
-export const drop = <T>($_this: T[], n: number): T[] => $_this.slice(n);
-export const take = <T>($_this: T[], n: number): T[] => $_this.slice(0, n);
-export const reversed = <T>($_this: T[]): T[] => [...$_this].reverse();
-export const sorted = <T>($_this: T[]): T[] =>
-	[...$_this].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-export const chunked = <T>($_this: T[], size: number): T[][] => {
-	const result: T[][] = [];
-	if (size <= 0) return result;
-	for (let i = 0; i < $_this.length; i += size) {
-		result.push($_this.slice(i, i + size));
+export const splice = <T>($_this: NList<T>, start: NUint, end: NUint, replacement: NList<T>) =>
+	new NList($_this.v.splice(start.v, end.v - start.v, ...replacement.v));
+export const slice = <T>($_this: NList<T>, start: NUint, end: NUint) =>
+	new NList($_this.v.slice(start.v, end.v));
+export const concat = <T>($_this: NList<T>, other: NList<T>) => new NList($_this.v.concat(other.v));
+export const drop = <T>($_this: NList<T>, n: NUint) => new NList($_this.v.slice(n.v));
+export const take = <T>($_this: NList<T>, n: NUint) => new NList($_this.v.slice(0, n.v));
+export const reversed = <T>($_this: NList<T>) => new NList([...$_this.v].reverse());
+export const sorted = <T extends { v: unknown }>($_this: NList<T>) =>
+	new NList([...$_this.v].sort((a, b) => (a.v < b.v ? -1 : a.v > b.v ? 1 : 0)));
+export const chunked = <T>($_this: NList<T>, size: NUint) => {
+	const result: NList<T>[] = [];
+	if (size.v <= 0) return new NList(result);
+	for (let i = 0; i < $_this.v.length; i += size.v) {
+		result.push(new NList($_this.v.slice(i, i + size.v)));
 	}
-	return result;
+	return new NList(result);
 };
-export const distinct = <T>($_this: T[]): T[] => [...new Set($_this)];
-export const contains = <T>($_this: T[], item: T): boolean => $_this.includes(item);
-export const to_string = ($_this: unknown[]): string => `#[${$_this.join(", ")}]`;
+export const distinct = <T>($_this: NList<T>) => {
+	const seen = new NMap();
+	const result: T[] = [];
+	for (const item of $_this.v) {
+		if (!seen.has(item)) {
+			seen.set(item, true);
+			result.push(item);
+		}
+	}
+	return new NList(result);
+};
+export const contains = <T>($_this: NList<T>, item: T) =>
+	new NBool($_this.v.some((candidate) => protocolEquals(candidate, item)));
+export const to_string = ($_this: NList) => new NString(`#[${$_this.v.join(", ")}]`);
