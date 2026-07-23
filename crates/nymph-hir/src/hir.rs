@@ -199,10 +199,10 @@ pub enum HirExpr {
 	/// codegen. Tuple literals never produce this — tuple spread stays
 	/// deferred (untyped, element-wise) — only `ExprKind::List` does.
 	ArraySpread(Vec<HirArrayElem>),
-	/// A map literal — emits as `new Map([[k, v], …])`.
+	/// A map literal — emits as a boxed value-equality HAMT.
 	MapLit(Vec<(HirExpr, HirExpr)>),
 	/// A map literal (SS1) containing at least one spread entry
-	/// (`#{...m, k: v}`) — emits as `new Map([...])` with the spread entries'
+	/// (`#{...m, k: v}`) — emits as an `NMap` with the spread entries'
 	/// JS `...` syntax preserved in position (a Map merge, later-key-wins,
 	/// since the `Map` constructor processes its entries array in order). A
 	/// spread-free map still lowers to the plain [`HirExpr::MapLit`] above.
@@ -328,7 +328,7 @@ pub enum HirMapElem {
 	/// spliceable directly since a JS `Map` iterates as `[k, v]` pairs, or a
 	/// drain IIFE collecting a non-map `Iterator`/`Iterable<#(K, V)>` source
 	/// into one), so codegen always emits it with JS spread syntax inside the
-	/// `new Map([...])` entries array.
+	/// `NMap` entries array.
 	Spread(HirExpr),
 }
 
@@ -412,7 +412,7 @@ pub enum HirPat {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HirLit {
-	Num(f64),
+	Num(f64, NumKind),
 	Bool(bool),
 	Char(char),
 	Str(EcoString),

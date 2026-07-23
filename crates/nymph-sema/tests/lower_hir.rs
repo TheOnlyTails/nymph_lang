@@ -2221,7 +2221,7 @@ fn lowers_is_to_a_two_arm_boolean_match() {
 	};
 	assert!(matches!(scrutinee.as_ref(), HirExpr::Local(n) if n == "x"));
 	assert_eq!(arms.len(), 2);
-	assert_eq!(arms[0].pat, HirPat::Lit(HirLit::Num(5.0)));
+	assert_eq!(arms[0].pat, HirPat::Lit(HirLit::Num(5.0, NumKind::Int)));
 	assert!(arms[0].guard.is_none());
 	assert_eq!(arms[0].body, HirExpr::Bool(true));
 	assert_eq!(arms[1].pat, HirPat::Wildcard);

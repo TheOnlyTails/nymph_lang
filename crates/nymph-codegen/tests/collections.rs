@@ -94,3 +94,165 @@ fn map_spread_consumes_boxed_tuple_entries() {
 	js.push_str("\nconsole.log([...values().values()].map(x => x.v).join(','));\n");
 	assert_eq!(run_node(&js), "a,b");
 }
+
+#[test]
+fn separately_boxed_equal_map_key_retrieves_the_entry() {
+	let src = "func value(): int = #{1: 7}[1]";
+	let mut js = emit_js(src);
+	js.push_str("\nconsole.log(value().v);\n");
+	assert_eq!(run_node(&js), "7");
+}
+
+#[test]
+fn equal_map_key_overwrites_without_growing_the_map() {
+	let src = "func values(): #{int: int} = #{1: 7, 1: 9}";
+	let mut js = emit_js(src);
+	js.push_str("\nconst map = values(); console.log(map.size, map.get(new NInt(1)).v);\n");
+	assert_eq!(run_node(&js), "1 9");
+}
+
+#[test]
+fn separately_boxed_equal_tuple_key_retrieves_the_entry() {
+	let src = "func value(): int = #{#(1, 2): 7}[#(1, 2)]";
+	let mut js = emit_js(src);
+	js.push_str("\nconsole.log(value().v);\n");
+	assert_eq!(run_node(&js), "7");
+}
+
+#[test]
+fn hamt_collision_node_uses_key_equality() {
+	let mut js = nymph_codegen::box_module_source();
+	js.push_str(
+		r#"
+class CollisionKey extends NBox {
+	hash() { return new NInt(42); }
+	equals(other) { return new NBool(this.v === other.v); }
+}
+const map = new NMap([
+	[new CollisionKey("left"), new NInt(1)],
+	[new CollisionKey("right"), new NInt(2)],
+]);
+console.log(map.size, map.get(new CollisionKey("left")).v, map.get(new CollisionKey("right")).v);
+"#,
+	);
+	assert_eq!(run_node(&js), "2 1 2");
+}
+
+#[test]
+fn map_assignment_and_deletion_use_value_equal_keys() {
+	let mut js =
+		emit_js("func values(): #{int: int} = { let mut map = #{1: 7, 2: 8} map[1] = 9 map }");
+	js.push_str(
+		"\nconst map = values(); const removed = map.delete(new NInt(2)); console.log(map.get(new NInt(1)).v, removed, map.size);\n",
+	);
+	assert_eq!(run_node(&js), "9 true 1");
+}
+
+#[test]
+fn numeric_tags_keep_int_and_float_keys_distinct() {
+	let mut js = nymph_codegen::box_module_source();
+	js.push_str(
+		r#"
+const map = new NMap([
+	[new NInt(5), new NString("int")],
+	[new NFloat(5), new NString("float")],
+]);
+console.log(map.size, map.get(new NInt(5)).v, map.get(new NFloat(5)).v);
+"#,
+	);
+	assert_eq!(run_node(&js), "2 int float");
+}
+
+#[test]
+fn hamt_handles_deep_branching_and_in_place_deletion() {
+	let mut js = nymph_codegen::box_module_source();
+	js.push_str(
+		r#"
+const map = new NMap([]);
+for (let i = 0; i < 1000; i++) map.set(new NInt(i), new NInt(i * 3));
+let valid = map.size === 1000;
+for (let i = 0; i < 1000; i++) valid &&= map.get(new NInt(i)).v === i * 3;
+for (let i = 0; i < 1000; i += 2) valid &&= map.delete(new NInt(i));
+valid &&= map.size === 500;
+for (let i = 1; i < 1000; i += 2) valid &&= map.get(new NInt(i)).v === i * 3;
+console.log(valid ? "ok" : "failed");
+"#,
+	);
+	assert_eq!(run_node(&js), "ok");
+}
+
+#[test]
+fn map_pattern_uses_boxed_value_equal_keys() {
+	let src = r#"
+		func value(): int = match (#{1: 7, 2: 8}) {
+			#{1: found} -> found,
+			_ -> 0,
+		}
+	"#;
+	let mut js = emit_js(src);
+	js.push_str("\nconsole.log(value().v);\n");
+	assert_eq!(run_node(&js), "7");
+}
+
+#[test]
+fn map_pattern_preserves_uint_and_float_key_tags() {
+	let src = r#"
+		func uint_value(): int = match (#{1u: 7}) {
+			#{1u: found} -> found,
+			_ -> 0,
+		}
+		func float_value(): int = match (#{1.0: 9}) {
+			#{1.0: found} -> found,
+			_ -> 0,
+		}
+	"#;
+	let mut js = emit_js(src);
+	js.push_str("\nconsole.log(uint_value().v, float_value().v);\n");
+	assert_eq!(run_node(&js), "7 9");
+}
+
+#[test]
+fn separately_constructed_struct_and_enum_keys_use_structural_value_equality() {
+	let struct_src = "struct Point(x: int, y: int)\nfunc value(): int = #{Point(x = 1, y = 2): 7}[Point(x = 1, y = 2)]";
+	let mut struct_js = emit_js(struct_src);
+	struct_js.push_str("\nconsole.log(value().v);\n");
+	assert_eq!(run_node(&struct_js), "7");
+
+	let enum_src = "enum Key { Named(value: int), Empty }\nfunc value(): int = #{Key.Named(value = 1): 9}[Key.Named(value = 1)]";
+	let mut enum_js = emit_js(enum_src);
+	enum_js.push_str("\nconsole.log(value().v);\n");
+	assert_eq!(run_node(&enum_js), "9");
+}
+
+#[test]
+fn separately_constructed_equal_maps_can_be_map_keys() {
+	let mut js = nymph_codegen::box_module_source();
+	js.push_str(
+		r#"
+const inner = () => new NMap([
+	[new NInt(1), new NString("one")],
+	[new NInt(2), new NString("two")],
+]);
+const outer = new NMap([[inner(), new NInt(7)]]);
+console.log(outer.get(inner()).v);
+"#,
+	);
+	assert_eq!(run_node(&js), "7");
+}
+
+#[test]
+fn equal_maps_with_custom_equal_keys_have_equal_hashes() {
+	let mut js = nymph_codegen::box_module_source();
+	js.push_str(
+		r#"
+class CustomKey extends NBox {
+	hash() { return new NInt(42); }
+	equals(other) { return new NBool(other instanceof CustomKey); }
+}
+const inner = value => new NMap([[new CustomKey(value), new NInt(1)]]);
+const outer = new NMap([[inner("left"), new NInt(7)]]);
+console.log(outer.get(inner("right")).v);
+"#,
+	);
+	assert_eq!(run_node(&js), "7");
+}

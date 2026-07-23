@@ -1,4 +1,6 @@
-public struct Set<Item>(inner: #{Item: #()}) {
+import @/ops with (Hash)
+
+public struct Set<Item: Hash>(inner: #{Item: #()}) {
   /// Inserts an item into the set.
   /// Returns `true` if the set did not contain this item previously, and `false` if it did.
   mut func insert(item: Item): boolean = this.inner.insert(item, #())

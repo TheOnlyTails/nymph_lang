@@ -1,7 +1,7 @@
 import @/option with (Option)
-import @/ops with (Plus, Into, Contains)
+import @/ops with (Plus, Into, Contains, Hash)
 
-impl<K, V> mut #{K: V} {
+impl<K: Hash, V> mut #{K: V} {
   external(size) func size(): uint
   external(get) func get(key: K): Option<V>
   external(insert) func insert(key: K, value: V): boolean
@@ -14,7 +14,7 @@ impl<K, V> mut #{K: V} {
   func is_not_empty(): boolean = !this.is_empty()
 }
 
-impl<K, V> #{K: V} {
+impl<K: Hash, V> #{K: V} {
   /// Returns `true` if the map contains the given key.
   external(contains_key) func contains_key(key: K): boolean
 
@@ -28,14 +28,14 @@ impl<K, V> #{K: V} {
   external(entries) func entries(): #[#(K, V)]
 }
 
-impl<K, V> Plus<Other = self, Output = self> for #{K: V} {
+impl<K: Hash, V> Plus<Other = self, Output = self> for #{K: V} {
   external(merge) func plus(other: self): self
 }
 
-impl<K: Into<string>, V: Into<string>> Into<string> for #{K: V} {
+impl<K: Hash + Into<string>, V: Into<string>> Into<string> for #{K: V} {
   external(to_string) func into(): string
 }
 
-impl<K, V> Contains<Item = K> for #{K: V} {
+impl<K: Hash, V> Contains<Item = K> for #{K: V} {
   external(contains_key) func contains(item: K): boolean
 }

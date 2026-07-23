@@ -310,7 +310,7 @@ fn return_inside_a_nested_subexpression_match_within_a_closure_body_still_panics
 							scrutinee: Box::new(HirExpr::Local("x".into())),
 							arms: vec![
 								HirArm {
-									pat: HirPat::Lit(HirLit::Num(0.0)),
+									pat: HirPat::Lit(HirLit::Num(0.0, NumKind::Int)),
 									guard: None,
 									body: HirExpr::Block {
 										stmts: vec![HirStmt::Return(Some(HirExpr::Num(1.0, NumKind::Int)))],

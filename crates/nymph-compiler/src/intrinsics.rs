@@ -43,6 +43,7 @@ use rustc_hash::FxHashMap;
 /// — `intrinsic_module_sources` panics loudly (never silently skips) if one
 /// is missing.
 const INTRINSIC_TS_SOURCES: &[(&str, &str)] = &[
+	("std/hash", include_str!("../../../stdlib/src/hash.ts")),
 	(
 		"std/collections/list",
 		include_str!("../../../stdlib/src/collections/list.ts"),
@@ -72,6 +73,7 @@ const IMPORT_REWRITES: &[(&str, &str)] = &[
 	("../option", "std/option"),
 	// `string.ts` sits at the stdlib root, so its `Option` import is `./option`.
 	("./option", "std/option"),
+	("./box", "std/box"),
 ];
 
 /// The virtual `std/option` module every Option-returning `List` intrinsic
@@ -233,6 +235,19 @@ mod tests {
 		assert!(
 			map_js.contains("Option.Some({ value:") || map_js.contains("Option.Some({ value }"),
 			"expected `get`/`remove` to build a named-field `Option.Some`, got:\n{map_js}"
+		);
+	}
+
+	#[test]
+	fn injects_the_hash_intrinsic() {
+		let sources = intrinsic_module_sources();
+		let hash_js = sources
+			.get("std/hash")
+			.expect("expected the hash runtime module to be injected");
+		assert!(hash_js.contains("export const hash"), "{hash_js}");
+		assert!(
+			hash_js.contains("from \"std/box\""),
+			"hash must share the box runtime's structural implementation: {hash_js}"
 		);
 	}
 

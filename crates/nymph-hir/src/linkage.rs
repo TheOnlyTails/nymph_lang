@@ -89,6 +89,14 @@ pub struct Linked {
 ///   `into` entirely; see `nymph-compiler/tests/std_linkage.rs`).
 pub const REGISTRY: &[(&str, Linked)] = &[
 	(
+		"hash",
+		Linked {
+			module: "std/hash",
+			symbol: "hash",
+			receiver_tag: None,
+		},
+	),
+	(
 		"length",
 		Linked {
 			module: "std/collections/list",
@@ -772,6 +780,7 @@ mod tests {
 						"values",
 					]
 				),
+				("std/hash", vec!["hash"]),
 				("std/io", vec!["print", "println"]),
 				(
 					"std/string",
@@ -808,6 +817,13 @@ mod tests {
 				),
 			]
 		);
+	}
+
+	#[test]
+	fn hash_links_to_the_blanket_runtime_intrinsic() {
+		let linked = lookup("hash", None).expect("`hash` must be linked");
+		assert_eq!(linked.module, "std/hash");
+		assert_eq!(linked.symbol, "hash");
 	}
 
 	#[test]

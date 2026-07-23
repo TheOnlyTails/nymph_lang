@@ -14,6 +14,14 @@
 
 use nymph_compiler::{check, compile};
 
+#[test]
+fn ambient_hash_interface_lowers_to_the_boxed_runtime_intrinsic() {
+	let js = compile("func value(): int = 1.hash()", "hash_ambient")
+		.expect("Hash should be available from the ambient ops prelude");
+	assert!(js.contains("import { hash } from \"std/hash\";"), "{js}");
+	assert!(js.contains("hash(new NInt(1))"), "{js}");
+}
+
 /// Emit `src`, append a driver that logs `call`, run under Node, return
 /// trimmed stdout. Local copy of `golden_programs.rs`'s `run` helper (tests
 /// may not import from another crate's test files).

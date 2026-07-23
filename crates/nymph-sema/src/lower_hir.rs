@@ -4433,9 +4433,9 @@ impl<'a> Lowerer<'a> {
 		use nymph_ast::expr::{ListPatternEntry, Pattern};
 		match &pat.0 {
 			Pattern::Placeholder => HirPat::Wildcard,
-			Pattern::Int(v) => HirPat::Lit(HirLit::Num(v.0 as f64)),
-			Pattern::UInt(v) => HirPat::Lit(HirLit::Num(v.0 as f64)),
-			Pattern::Float(v) => HirPat::Lit(HirLit::Num(v.0.into_inner())),
+			Pattern::Int(v) => HirPat::Lit(HirLit::Num(v.0 as f64, NumKind::Int)),
+			Pattern::UInt(v) => HirPat::Lit(HirLit::Num(v.0 as f64, NumKind::UInt)),
+			Pattern::Float(v) => HirPat::Lit(HirLit::Num(v.0.into_inner(), NumKind::Float)),
 			Pattern::Boolean(b) => HirPat::Lit(HirLit::Bool(b.0)),
 			Pattern::Char(c) => HirPat::Lit(HirLit::Char(c.0)),
 			Pattern::String(parts) => HirPat::Lit(HirLit::Str(lower_string_pattern(parts))),
@@ -4755,12 +4755,12 @@ impl<'a> Lowerer<'a> {
 	/// SS1 (`HirExpr::MapLit`, zero behavior change). Any spread entry
 	/// (`#{...m, k: v}`) routes through [`HirExpr::MapSpread`] instead: each
 	/// plain entry lowers as usual, each spread source dispatches on its
-	/// recorded type — a native `Map` source lowers directly (`lower_expr`; a
-	/// JS `Map` iterates as `[k, v]` pairs, so it splices straight into the
-	/// `new Map([...])` entries array with no drain), anything else (a
+	/// recorded type — an `NMap` source lowers directly (`lower_expr`; it
+	/// iterates as `[k, v]` pairs, so it splices straight into the new map's
+	/// entries array with no drain), anything else (a
 	/// non-map `Iterator`/`Iterable<#(K, V)>` source) drains through
 	/// [`Self::lower_spread_source`] exactly like a list spread's non-native
-	/// case. `new Map(...)` processes its entries array in order, so entries
+	/// case. `NMap` processes its entries array in order, so entries
 	/// emit left-to-right in source order and a later duplicate key overwrites
 	/// an earlier one (SS4) with no extra handling needed here.
 	fn lower_map(&self, entries: &[nymph_ast::Spanned<MapEntry>]) -> HirExpr {
@@ -5455,9 +5455,9 @@ fn param_name(pattern: &nymph_ast::Spanned<nymph_ast::expr::Pattern>) -> ecow::E
 fn lower_lit_pattern(pat: &nymph_ast::Spanned<nymph_ast::expr::Pattern>) -> HirLit {
 	use nymph_ast::expr::Pattern;
 	match &pat.0 {
-		Pattern::Int(v) => HirLit::Num(v.0 as f64),
-		Pattern::UInt(v) => HirLit::Num(v.0 as f64),
-		Pattern::Float(v) => HirLit::Num(v.0.into_inner()),
+		Pattern::Int(v) => HirLit::Num(v.0 as f64, NumKind::Int),
+		Pattern::UInt(v) => HirLit::Num(v.0 as f64, NumKind::UInt),
+		Pattern::Float(v) => HirLit::Num(v.0.into_inner(), NumKind::Float),
 		Pattern::Boolean(b) => HirLit::Bool(b.0),
 		Pattern::Char(c) => HirLit::Char(c.0),
 		Pattern::String(parts) => HirLit::Str(lower_string_pattern(parts)),

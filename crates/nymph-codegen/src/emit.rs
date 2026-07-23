@@ -34,7 +34,7 @@ enum Subject {
 	/// (`end_from_end == 0` ⇒ `<base>.slice(<start>)`).
 	Slice(Box<Subject>, usize, usize),
 	/// The rest-of-map for a map pattern's `...rest` — a shallow copy of `<base>`
-	/// minus the named keys: `new Map(<base>)` when `keys` is empty, else an
+	/// minus the named keys: `new NMap(<base>)` when `keys` is empty, else an
 	/// IIFE that copies then deletes each key.
 	MapRest(Box<Subject>, Vec<HirLit>),
 }
@@ -1277,7 +1277,7 @@ impl<'a> Emitter<'a> {
 				let array = Expression::new_array_expression(SPAN, arr, &self.ast);
 				self.new_box("NList", array)
 			}
-			// A map literal → `new Map([[k, v], …])`.
+			// A map literal → a boxed value-equality HAMT.
 			HirExpr::MapLit(pairs) => {
 				let mut entries = ArenaVec::new_in(&self.ast);
 				for (k, v) in pairs {
@@ -1288,16 +1288,13 @@ impl<'a> Emitter<'a> {
 					entries.push(ArrayExpressionElement::from(arr));
 				}
 				let outer = Expression::new_array_expression(SPAN, entries, &self.ast);
-				let callee = Expression::new_identifier(SPAN, "Map", &self.ast);
-				let mut args = ArenaVec::new_in(&self.ast);
-				args.push(Argument::from(outer));
-				Expression::new_new_expression(SPAN, callee, oxc::ast::NONE, args, &self.ast)
+				self.new_box("NMap", outer)
 			}
-			// A map literal with at least one spread entry (SS1) → `new Map([...])`
+			// A map literal with at least one spread entry (SS1) → `new NMap([...])`
 			// merging the spread entries in, left-to-right (a later duplicate key
 			// wins — the `Map` constructor processes its entries array in order,
 			// SS4). Each `HirMapElem::Spread` payload is already an array of
-			// `[k, v]` pairs (a native `Map` — iterates as `[k, v]` pairs — or a
+			// `[k, v]` pairs (an `NMap` iterates as `[k, v]` pairs, or a
 			// `lower_spread_source` drain IIFE), so it always emits with JS spread
 			// syntax inside the entries array.
 			HirExpr::MapSpread(elems) => {
@@ -1320,10 +1317,7 @@ impl<'a> Emitter<'a> {
 					}
 				}
 				let outer = Expression::new_array_expression(SPAN, entries, &self.ast);
-				let callee = Expression::new_identifier(SPAN, "Map", &self.ast);
-				let mut args = ArenaVec::new_in(&self.ast);
-				args.push(Argument::from(outer));
-				Expression::new_new_expression(SPAN, callee, oxc::ast::NONE, args, &self.ast)
+				self.new_box("NMap", outer)
 			}
 			// A list/tuple subscript dispatches through its boxed wrapper.
 			HirExpr::Index { recv, index } => {
@@ -1904,7 +1898,7 @@ impl<'a> Emitter<'a> {
 			}
 			Subject::MapGet(base, key) => {
 				let map = self.emit_subject(base);
-				self.member_call(map, "get", vec![self.emit_lit(key)])
+				self.member_call(map, "get", vec![self.emit_boxed_lit(key)])
 			}
 			Subject::Slice(base, start, end_from_end) => {
 				let arr = self.emit_subject(base);
@@ -1944,20 +1938,17 @@ impl<'a> Emitter<'a> {
 			}
 			Subject::MapRest(base, keys) => {
 				let map_expr = self.emit_subject(base);
-				let callee = Expression::new_identifier(SPAN, "Map", &self.ast);
-				let mut args = ArenaVec::new_in(&self.ast);
-				args.push(Argument::from(map_expr));
-				let new_map = Expression::new_new_expression(SPAN, callee, oxc::ast::NONE, args, &self.ast);
+				let new_map = self.new_box("NMap", map_expr);
 				if keys.is_empty() {
 					return new_map;
 				}
-				// `(() => { const _tN = new Map(<base>); _tN.delete(<k1>); ...; return _tN; })()`
+				// `(() => { const _tN = new NMap(<base>); _tN.delete(<k1>); ...; return _tN; })()`
 				let tmp = self.ast.allocator.alloc_str(&self.gensym());
 				let mut stmts = ArenaVec::new_in(&self.ast);
 				stmts.push(self.const_decl(tmp, new_map));
 				for key in keys {
 					let m_ident = Expression::new_identifier(SPAN, tmp, &self.ast);
-					let del = self.member_call(m_ident, "delete", vec![self.emit_lit(key)]);
+					let del = self.member_call(m_ident, "delete", vec![self.emit_boxed_lit(key)]);
 					stmts.push(Statement::new_expression_statement(SPAN, del, &self.ast));
 				}
 				let value = JsValue {
@@ -1972,7 +1963,7 @@ impl<'a> Emitter<'a> {
 	/// A scalar pattern literal as a JS expression (for `=== <lit>` tests).
 	fn emit_lit(&self, lit: &HirLit) -> Expression<'a> {
 		match lit {
-			HirLit::Num(v) => {
+			HirLit::Num(v, _) => {
 				Expression::new_numeric_literal(SPAN, *v, None, NumberBase::Decimal, &self.ast)
 			}
 			HirLit::Bool(b) => Expression::new_boolean_literal(SPAN, *b, &self.ast),
@@ -1985,6 +1976,17 @@ impl<'a> Emitter<'a> {
 				Expression::new_string_literal(SPAN, s, None, &self.ast)
 			}
 		}
+	}
+
+	fn emit_boxed_lit(&self, lit: &HirLit) -> Expression<'a> {
+		let value = self.emit_lit(lit);
+		let class = match lit {
+			HirLit::Num(_, kind) => box_rt::num_box_class(*kind),
+			HirLit::Bool(_) => "NBool",
+			HirLit::Char(_) => "NChar",
+			HirLit::Str(_) => "NString",
+		};
+		self.new_box(class, value)
 	}
 
 	/// `<obj>[TAG]` (optional-chained when `optional`), reading the variant tag.
@@ -2147,7 +2149,11 @@ impl<'a> Emitter<'a> {
 				let mut test: Option<Expression<'a>> = None;
 				let mut binds = Vec::new();
 				for (key, vpat) in entries {
-					let has = self.member_call(self.emit_subject(subj), "has", vec![self.emit_lit(key)]);
+					let has = self.member_call(
+						self.emit_subject(subj),
+						"has",
+						vec![self.emit_boxed_lit(key)],
+					);
 					test = self.and_test(test, Some(has));
 					let val = Subject::MapGet(Box::new(subj.clone()), key.clone());
 					let (t, mut b) = self.compile_pat(vpat, &val);

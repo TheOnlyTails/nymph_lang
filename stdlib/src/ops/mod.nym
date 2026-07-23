@@ -66,6 +66,12 @@ interface Equals<Other> {
   func not_equals(other: Other): boolean = !this.equals(other)
 }
 
+interface Hash: Equals<Other = self> {
+  /// Equal values must return equal hashes. State used by `hash`/`equals` must
+  /// not change while the value is stored as a map or set key.
+  func hash(): int
+}
+
 interface Contains<Item: Equals<Other = Item>> {
   func contains(item: Item): boolean
 
@@ -372,6 +378,10 @@ impl<T> Comparable<Other = T> for T {
 // Equals blanket impl
 impl<T> Equals<Other = self> for T {
   external(equals) func equals(other: self): boolean
+}
+
+impl<T: Equals<Other = T>> Hash for T {
+  external(hash) func hash(): int
 }
 
 // Into for boolean -> string
