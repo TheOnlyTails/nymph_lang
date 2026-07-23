@@ -311,7 +311,7 @@ impl<'m> Checker<'m> {
 		arg_tys: &[Ty],
 		arg_lits: &[bool],
 		span: nymph_ast::Span,
-	) -> Option<(Ty, nymph_ast::Span)> {
+	) -> Option<(Vec<Ty>, Ty, nymph_ast::Span)> {
 		// See `resolve_method`'s matching comment: peel `mut` before matching
 		// against any impl's (never-`mut`) `Self` type.
 		let recv = self.strip_mut(recv);
@@ -332,8 +332,8 @@ impl<'m> Checker<'m> {
 			self.table.rollback_to(snapshot);
 			if matched {
 				let method_span = self.inherent.impls[idx].methods[name].meta.name.1;
-				let ret = self.commit_inherent(idx, recv, name, arg_tys, arg_lits, span, false);
-				return Some((ret, method_span));
+				let (params, ret) = self.commit_inherent(idx, recv, name, arg_tys, arg_lits, span, false);
+				return Some((params, ret, method_span));
 			}
 		}
 		None
@@ -358,7 +358,11 @@ impl<'m> Checker<'m> {
 				.is_some_and(|m| m.namespaced);
 			if has {
 				let placeholder = self.interner.error();
-				return Some(self.commit_inherent(idx, placeholder, name, arg_tys, arg_lits, span, true));
+				return Some(
+					self
+						.commit_inherent(idx, placeholder, name, arg_tys, arg_lits, span, true)
+						.1,
+				);
 			}
 		}
 		None
@@ -384,7 +388,7 @@ impl<'m> Checker<'m> {
 		arg_lits: &[bool],
 		span: nymph_ast::Span,
 		namespaced: bool,
-	) -> Ty {
+	) -> (Vec<Ty>, Ty) {
 		let def = &self.inherent.impls[idx];
 		let generics_len = def.generics_len;
 		let self_pattern = def.self_ty;
@@ -435,7 +439,7 @@ impl<'m> Checker<'m> {
 					found: arg_tys.len(),
 				},
 			);
-			return ret;
+			return (params, ret);
 		}
 		for (i, (param, arg)) in params.iter().zip(arg_tys).enumerate() {
 			self.unify_arg(
@@ -445,7 +449,7 @@ impl<'m> Checker<'m> {
 				span,
 			);
 		}
-		ret
+		(params, ret)
 	}
 
 	// ── Return-type generalisation ───────────────────────────────────────────
@@ -518,9 +522,12 @@ impl<'m> Checker<'m> {
 		let pending_mark = self.pending_operators.len();
 		let pending_bounds_mark = self.pending_bounds.len();
 		self.param_bounds.clear();
+		self.param_bound_details.clear();
+		self.push_params(build_param_scope(owner_generics));
 		self.record_param_bounds(owner_generics, 0);
-		self.record_param_bounds(&meta.generics, base);
+		self.pop_params();
 		self.push_params(scope);
+		self.record_param_bounds(&meta.generics, base);
 		self.push_scope();
 		// A `mut func`'s `this` is bound as `mut Self` — the smaller correct step
 		// short of full MT2 mut-func semantics (per-method mut availability, bound-
@@ -637,9 +644,12 @@ impl<'m> Checker<'m> {
 			scope.insert(g.0.name.0.clone(), ParamIdx((base + j) as u32));
 		}
 		self.param_bounds.clear();
+		self.param_bound_details.clear();
+		self.push_params(build_param_scope(owner_generics));
 		self.record_param_bounds(owner_generics, 0);
-		self.record_param_bounds(&meta.generics, base);
+		self.pop_params();
 		self.push_params(scope);
+		self.record_param_bounds(&meta.generics, base);
 		self.push_scope();
 		// See the matching comment in `infer_inherent_return`: a `mut func`'s
 		// `this` is bound as `mut Self`.
@@ -687,6 +697,7 @@ impl<'m> Checker<'m> {
 			};
 			self.push_params(build_param_scope(generics));
 			self.param_bounds.clear();
+			self.param_bound_details.clear();
 			self.record_param_bounds(generics, 0);
 			let self_ty = self.lower_type(type_);
 			self.check_interface_impl_members(self_ty, members);
@@ -723,9 +734,13 @@ impl<'m> Checker<'m> {
 				let impl_members = &m.0.members;
 				let combined: Vec<Spanned<GenericParam>> =
 					generics.iter().chain(impl_generics).cloned().collect();
-				self.push_params(build_param_scope(&combined));
 				self.param_bounds.clear();
-				self.record_param_bounds(&combined, 0);
+				self.param_bound_details.clear();
+				self.push_params(build_param_scope(generics));
+				self.record_param_bounds(generics, 0);
+				self.pop_params();
+				self.push_params(build_param_scope(&combined));
+				self.record_param_bounds(impl_generics, generics.len());
 				let owner_len = generics.len();
 				let positional: Vec<Ty> = (0..owner_len)
 					.map(|i| self.interner.mk_param(ParamIdx(i as u32)))
@@ -858,7 +873,11 @@ impl<'m> Checker<'m> {
 			scope.insert(g.0.name.0.clone(), ParamIdx((iface_len + j) as u32));
 		}
 		self.param_bounds.clear();
+		self.param_bound_details.clear();
+		self.push_params(build_param_scope(iface_generics));
 		self.record_param_bounds(iface_generics, 0);
+		self.pop_params();
+		self.push_params(scope);
 		self.record_param_bounds(&meta.generics, iface_len);
 		self
 			.param_bounds
@@ -866,7 +885,6 @@ impl<'m> Checker<'m> {
 			.or_default()
 			.push(iface_id);
 
-		self.push_params(scope);
 		self.push_scope();
 
 		// A `mut func` default binds `this` as `mut Self`, exactly as a `mut func` on a

@@ -93,6 +93,89 @@ fn lowers_collections_and_index() {
 }
 
 #[test]
+fn lowers_custom_index_access_to_the_resolved_method() {
+	let hir = lower(
+		r#"
+		interface Index<Key, Output> { func index(key: Key): Output }
+		struct Offset(base: int) {
+			impl Index<Key = int, Output = int> {
+				func index(key: int): int = this.base + key
+			}
+		}
+		func f(): int = Offset(base = 40)[2]
+		"#,
+	);
+	let f = hir.funcs.iter().find(|func| func.name == "f").expect("f");
+	assert!(matches!(
+		&f.body,
+		HirExpr::Call { callee, args }
+			if matches!(callee.as_ref(), HirExpr::Field { name, .. } if name == "index")
+				&& args.len() == 1
+	));
+}
+
+#[test]
+fn custom_index_widens_an_integer_literal_to_the_key_type() {
+	let hir = lower(
+		r#"
+		interface Index<Key, Output> { func index(key: Key): Output }
+		struct Echo {
+			impl Index<Key = uint, Output = uint> {
+				func index(key: uint): uint = key
+			}
+		}
+		func f(): uint = Echo()[2]
+		"#,
+	);
+	let f = hir.funcs.iter().find(|func| func.name == "f").expect("f");
+	assert!(matches!(
+		&f.body,
+		HirExpr::Call { args, .. } if args == &[HirExpr::Num(2.0, NumKind::UInt)]
+	));
+}
+
+#[test]
+fn custom_index_widens_keys_through_generic_substitution_and_bounds() {
+	let hir = lower(
+		r#"
+		interface Index<Key, Output> { func index(key: Key): Output }
+		struct Echo<T>(value: T) {
+			impl Index<Key = T, Output = T> {
+				func index(key: T): T = key
+			}
+		}
+		func concrete(): uint = Echo(value = 1u)[2]
+		func generic<T: Index<Key = uint, Output = uint>>(value: T): uint = value[3]
+		"#,
+	);
+	for (name, value) in [("concrete", 2.0), ("generic", 3.0)] {
+		let func = hir.funcs.iter().find(|func| func.name == name).expect(name);
+		assert!(matches!(
+			&func.body,
+			HirExpr::Call { args, .. }
+				if matches!(args.as_slice(), [HirExpr::Num(n, NumKind::UInt)] if *n == value)
+		));
+	}
+}
+
+#[test]
+fn inherent_index_widens_an_integer_literal_to_its_parameter_type() {
+	let hir = lower(
+		r#"
+		struct Echo {
+			func index(key: uint): uint = key
+		}
+		func f(): uint = Echo()[2]
+		"#,
+	);
+	let f = hir.funcs.iter().find(|func| func.name == "f").expect("f");
+	assert!(matches!(
+		&f.body,
+		HirExpr::Call { args, .. } if args == &[HirExpr::Num(2.0, NumKind::UInt)]
+	));
+}
+
+#[test]
 fn lowers_struct_decl_and_construction() {
 	let hir = lower(
 		r#"

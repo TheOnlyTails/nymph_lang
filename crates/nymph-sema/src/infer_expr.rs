@@ -140,8 +140,9 @@ impl<'m> Checker<'m> {
 		let sig = self.sigs.funcs[&id].clone();
 
 		self.param_bounds.clear();
-		self.record_param_bounds(&meta.generics, 0);
+		self.param_bound_details.clear();
 		self.push_params(build_param_scope(&meta.generics));
+		self.record_param_bounds(&meta.generics, 0);
 		self.push_scope();
 		for (param, psig) in meta.params.iter().zip(&sig.params) {
 			self.bind_pattern(&param.0.name, psig.ty, param.0.mutable);
@@ -521,6 +522,16 @@ impl<'m> Checker<'m> {
 			}
 			return ty;
 		}
+		// Custom indexing is method dispatch too. Record its selected `Index::index`
+		// implementation so lowering can honor prelude materialization and linkage.
+		if let ExprKind::IndexAccess { parent, index, .. } = &expr.kind {
+			let (ty, resolution) = self.infer_index_access(parent, index, expr.span);
+			self.record(expr.id, ty, None);
+			if let Some(resolution) = resolution {
+				self.annotations.record_resolution(expr.id, resolution);
+			}
+			return ty;
+		}
 		let ty = self.infer_kind(expr);
 		// Record the node's resolved type for the lowering pass. Zonking happens
 		// inside `record`. Returns the *raw* ty so callers can still unify against it.
@@ -655,42 +666,7 @@ impl<'m> Checker<'m> {
 			ExprKind::MemberAccess { parent, member, .. } => {
 				self.infer_member(parent, &member.0, member.1, expr.id)
 			}
-			ExprKind::IndexAccess { parent, index, .. } => {
-				// `a[i]` ≡ `a.index(i)` through the `Index` interface, but lists/maps/
-				// tuples are fast-pathed as built-ins so indexing them type-checks with
-				// no `Index` impl in scope.
-				let recv = self.infer(parent);
-				let key = self.infer(index);
-				let recv_r = self.strip_mut(recv);
-				// The key is itself an ordinary value being read here (not a place),
-				// so it's used mut-transparently too — `xs[i]` for a `let mut i` index
-				// must unify against `int` exactly like a plain `i` would.
-				let key = self.strip_mut(key);
-				match self.interner.kind(recv_r).clone() {
-					TyKind::List(elem) => {
-						let int = self.interner.int();
-						self.unify(key, int, span); // list index is an int
-						elem
-					}
-					TyKind::Tuple(elems) => {
-						// A tuple index yields a fresh var (heterogeneous; precise typing
-						// needs a const index and is deferred).
-						let _ = elems;
-						self.fresh()
-					}
-					TyKind::Map(k, v) => {
-						self.unify(key, k, span);
-						v
-					}
-					_ => {
-						let key_lit = matches!(index.kind, ExprKind::Int(_));
-						match self.resolve_method(recv, "index", &[key], &[key_lit], span) {
-							Some(res) => res.ty,
-							None => self.fresh(),
-						}
-					}
-				}
-			}
+			ExprKind::IndexAccess { parent, index, .. } => self.infer_index_access(parent, index, span).0,
 			ExprKind::Closure { .. } => self.infer_closure(expr),
 			ExprKind::PrefixOp { op, value } => {
 				// Unreachable in practice: `infer` intercepts `PrefixOp` before it gets
@@ -836,6 +812,71 @@ impl<'m> Checker<'m> {
 	}
 
 	// ── Identifiers & definitions ────────────────────────────────────────────
+	/// Infer `receiver[key]`. Structural collections use their built-in ABI;
+	/// every other receiver resolves the equivalent `receiver.index(key)` call.
+	fn infer_index_access(
+		&mut self,
+		parent: &Expr,
+		index: &Expr,
+		span: Span,
+	) -> (Ty, Option<Resolution>) {
+		let recv = self.infer(parent);
+		let key = self.infer(index);
+		let key = self.strip_mut(key);
+		let recv_r = self.strip_mut(recv);
+		match self.interner.kind(recv_r).clone() {
+			TyKind::Error => (self.interner.error(), None),
+			TyKind::List(elem) => {
+				let int = self.interner.int();
+				self.unify(key, int, span);
+				(elem, None)
+			}
+			TyKind::Tuple(_) => (self.fresh(), None),
+			TyKind::Map(k, v) => {
+				self.unify(key, k, span);
+				(v, None)
+			}
+			_ => {
+				let key_lit = matches!(index.kind, ExprKind::Int(_));
+				match self.resolve_method(recv, "index", &[key], &[key_lit], span) {
+					Some(res) => {
+						if key_lit && let Some(&expected) = res.params.first() {
+							let expected = self.shallow_resolve(expected);
+							if matches!(self.interner.kind(expected), TyKind::UInt | TyKind::Float) {
+								self.record(index.id, expected, None);
+							}
+						}
+						let resolution = Resolution {
+							method: "index".into(),
+							dispatch: dispatch_kind_for_method_call(&res),
+							impl_span: res.impl_span,
+						};
+						(res.ty, Some(resolution))
+					}
+					None => {
+						let ty = self.display(recv);
+						self.emit(
+							span,
+							TypeError::NoMethod {
+								method: "index".into(),
+								ty,
+							},
+						);
+						(self.interner.error(), None)
+					}
+				}
+			}
+		}
+	}
+
+	fn custom_index_value(&self, mut expr: &Expr) -> bool {
+		while let ExprKind::Grouped(inner) = &expr.kind {
+			expr = inner;
+		}
+		matches!(expr.kind, ExprKind::IndexAccess { .. })
+			&& self.annotations.resolution_of(expr.id).is_some()
+	}
+
 	fn infer_identifier(&mut self, name: &str, span: Span, id: NodeId) -> Ty {
 		if let Some(binding) = self.lookup_local(name) {
 			return binding.ty;
@@ -1128,7 +1169,9 @@ impl<'m> Checker<'m> {
 			// called directly on `a.map(f)` without an intermediate `let mut` binding.
 			let recv_dispatch = {
 				let resolved = self.shallow_resolve(recv);
-				if !expr_is_place(parent) && !matches!(self.interner.kind(resolved), TyKind::Mut(_)) {
+				if (!expr_is_place(parent) || self.custom_index_value(parent))
+					&& !matches!(self.interner.kind(resolved), TyKind::Mut(_))
+				{
 					self.interner.mk_mut(resolved)
 				} else {
 					recv
@@ -2423,7 +2466,30 @@ impl<'m> Checker<'m> {
 				}
 				self.member_ty_of(parent_ty, &member.0, member.1)
 			}
-			// An index target (`xs[i]`): its type is the place type.
+			ExprKind::IndexAccess { parent, .. } => {
+				let place_ty = self.infer(lhs);
+				let parent_ty = self
+					.annotations
+					.get(parent.id)
+					.map(|info| self.strip_mut(info.ty));
+				let stripped_place = self.strip_mut(place_ty);
+				let place_is_error = matches!(self.interner.kind(stripped_place), TyKind::Error);
+				if !place_is_error
+					&& !parent_ty.is_some_and(|ty| {
+						matches!(
+							self.interner.kind(ty),
+							TyKind::List(_) | TyKind::Tuple(_) | TyKind::Map(..) | TyKind::Error
+						)
+					}) {
+					self.emit(
+						lhs.span,
+						TypeError::CannotAssign {
+							name: "custom index access".into(),
+						},
+					);
+				}
+				place_ty
+			}
 			_ => self.infer(lhs),
 		};
 
@@ -2585,7 +2651,7 @@ impl<'m> Checker<'m> {
 			// exactly the way an ambient `Iterator` default method (`fold`/`to_list`/…)
 			// iterates its own `this`. Records `IterMode::Direct` so lowering emits the
 			// `.next()` protocol rather than the native-list index fast path.
-			if let Some((ret, iface)) = self.resolve_param_method(idx, "next", &[], &[], iterable.span)
+			if let Some((ret, iface, _)) = self.resolve_param_method(idx, "next", &[], &[], iterable.span)
 				&& let Some(item) = self.option_element(ret)
 			{
 				self.gate_mutating(iface, "next", self_is_mut, iterable.span);

@@ -49,6 +49,7 @@ pub(crate) enum MethodSource {
 /// method body actually lives.
 pub(crate) struct MethodResolution {
 	pub(crate) ty: Ty,
+	pub(crate) params: Vec<Ty>,
 	pub(crate) source: MethodSource,
 	/// The span of the matched impl's `interface … for …` header (`ImplDef::span`),
 	/// when resolution went through the impl index (`Inherent`/`GenericBound`
@@ -62,6 +63,25 @@ pub(crate) struct MethodResolution {
 }
 
 impl Checker<'_> {
+	fn param_interface_bounds(&self, param: ParamIdx) -> Vec<(DefId, Vec<(EcoString, Ty)>)> {
+		let mut bounds = Vec::new();
+		if let Some(interfaces) = self.param_bounds.get(&param) {
+			for &interface in interfaces {
+				let args = self
+					.param_bound_details
+					.get(&param)
+					.and_then(|details| details.iter().find(|bound| bound.interface == interface))
+					.map(|bound| bound.args.clone())
+					.unwrap_or_default();
+				bounds.push((interface, args));
+			}
+		}
+		if let Some(interfaces) = self.synthetic_bounds.get(&param) {
+			bounds.extend(interfaces.iter().map(|&interface| (interface, Vec::new())));
+		}
+		bounds
+	}
+
 	/// MT2 OO1/OO3: emit [`TypeError::MutMethodNeedsMutReceiver`] if `interface`'s
 	/// OWN declared kind for `name` (the source of truth — an impl's restatement
 	/// is checked to MATCH it at collection time, `iface.rs`'s OO2 check) is
@@ -273,8 +293,8 @@ impl Checker<'_> {
 		span: Span,
 	) -> Ty {
 		let param_ty = self.interner.mk_param(param);
-		let interfaces = self.param_bounds.get(&param).cloned().unwrap_or_default();
-		for iface_def in interfaces {
+		let interfaces = self.param_interface_bounds(param);
+		for (iface_def, bound_args) in interfaces {
 			let Some(iface) = self.interfaces.get(&iface_def).cloned() else {
 				continue;
 			};
@@ -283,8 +303,13 @@ impl Checker<'_> {
 			};
 			// Interface generics → fresh vars; `Self` → the parameter type.
 			let mut isubst: FxHashMap<ParamIdx, Ty> = FxHashMap::default();
-			for k in 0..iface.generics.len() {
-				isubst.insert(ParamIdx(k as u32), self.fresh());
+			for (k, generic) in iface.generics.iter().enumerate() {
+				let ty = bound_args
+					.iter()
+					.find(|(name, _)| name == generic)
+					.map(|(_, ty)| *ty)
+					.unwrap_or_else(|| self.fresh());
+				isubst.insert(ParamIdx(k as u32), ty);
 			}
 			// The method's own generics (`Param(iface_len + j)`) → fresh vars too.
 			for j in 0..method.generics.len() {
@@ -336,16 +361,9 @@ impl Checker<'_> {
 		arg_tys: &[Ty],
 		arg_lits: &[bool],
 		span: Span,
-	) -> Option<(Ty, DefId)> {
+	) -> Option<(Ty, DefId, Vec<Ty>)> {
 		let param_ty = self.interner.mk_param(param);
-		let mut ifaces: Vec<DefId> = Vec::new();
-		if let Some(bounds) = self.param_bounds.get(&param) {
-			ifaces.extend(bounds.iter().copied());
-		}
-		if let Some(bounds) = self.synthetic_bounds.get(&param) {
-			ifaces.extend(bounds.iter().copied());
-		}
-		for iface_def in ifaces {
+		for (iface_def, bound_args) in self.param_interface_bounds(param) {
 			let Some(iface) = self.interfaces.get(&iface_def).cloned() else {
 				continue;
 			};
@@ -354,8 +372,13 @@ impl Checker<'_> {
 			};
 			// Interface generics → fresh vars; `Self` → the parameter type.
 			let mut isubst: FxHashMap<ParamIdx, Ty> = FxHashMap::default();
-			for k in 0..iface.generics.len() {
-				isubst.insert(ParamIdx(k as u32), self.fresh());
+			for (k, generic) in iface.generics.iter().enumerate() {
+				let ty = bound_args
+					.iter()
+					.find(|(name, _)| name == generic)
+					.map(|(_, ty)| *ty)
+					.unwrap_or_else(|| self.fresh());
+				isubst.insert(ParamIdx(k as u32), ty);
 			}
 			// The method's own generics (`Param(iface_len + j)`) → fresh vars too.
 			for j in 0..method.generics.len() {
@@ -376,12 +399,12 @@ impl Checker<'_> {
 						found: arg_tys.len(),
 					},
 				);
-				return Some((ret, iface_def));
+				return Some((ret, iface_def, params));
 			}
 			for (i, (p, a)) in params.iter().zip(arg_tys).enumerate() {
 				self.unify_arg(*p, *a, arg_lits.get(i).copied().unwrap_or(false), span);
 			}
-			return Some((ret, iface_def));
+			return Some((ret, iface_def, params));
 		}
 		None
 	}
@@ -536,6 +559,7 @@ impl Checker<'_> {
 				);
 				return Some(MethodResolution {
 					ty: ret,
+					params,
 					source: MethodSource::GenericBound,
 					impl_span: Some(iface_span),
 				});
@@ -550,15 +574,19 @@ impl Checker<'_> {
 			}
 			return Some(MethodResolution {
 				ty: ret,
+				params,
 				source: MethodSource::GenericBound,
 				impl_span: Some(iface_span),
 			});
 		}
 
 		// Inherent methods take priority over interface methods.
-		if let Some((ret, method_span)) = self.resolve_inherent(recv, name, arg_tys, arg_lits, span) {
+		if let Some((params, ret, method_span)) =
+			self.resolve_inherent(recv, name, arg_tys, arg_lits, span)
+		{
 			return Some(MethodResolution {
 				ty: ret,
+				params,
 				source: MethodSource::Inherent,
 				impl_span: Some(method_span),
 			});
@@ -580,7 +608,8 @@ impl Checker<'_> {
 		// and broke exactly that case with a spurious "no method" error — this
 		// branch must never `return None` itself, only fall through.
 		if let crate::ty::TyKind::Param(idx) = *self.interner.kind(recv)
-			&& let Some((ty, iface_def)) = self.resolve_param_method(idx, name, arg_tys, arg_lits, span)
+			&& let Some((ty, iface_def, params)) =
+				self.resolve_param_method(idx, name, arg_tys, arg_lits, span)
 		{
 			// OO3 gate: `x.method()` where `x: T` (or `x: mut T`) and `T: A`
 			// resolved `method` through `A`'s bound — same gate as everywhere
@@ -588,6 +617,7 @@ impl Checker<'_> {
 			self.gate_mutating(iface_def, name, recv_is_mut, span);
 			return Some(MethodResolution {
 				ty,
+				params,
 				source: MethodSource::GenericBound,
 				impl_span: Some(self.defs.data(iface_def).span),
 			});
@@ -680,6 +710,7 @@ impl Checker<'_> {
 				// implying a (nonexistent) default-method body.
 				Some(MethodResolution {
 					ty: self.interner.error(),
+					params: Vec::new(),
 					source: MethodSource::ImplDirect,
 					impl_span: None,
 				})
@@ -697,6 +728,7 @@ impl Checker<'_> {
 				self.emit(span, TypeError::AmbiguousCall { name: name.into() });
 				Some(MethodResolution {
 					ty: self.interner.error(),
+					params: Vec::new(),
 					source: MethodSource::ImplDirect,
 					impl_span: None,
 				})
@@ -817,6 +849,7 @@ impl Checker<'_> {
 			// a wrong-but-safe error type instead of a panic mid-typecheck.
 			return MethodResolution {
 				ty: self.interner.error(),
+				params: Vec::new(),
 				source: MethodSource::ImplDirect,
 				impl_span: Some(def.span),
 			};
@@ -832,6 +865,7 @@ impl Checker<'_> {
 			);
 			return MethodResolution {
 				ty: ret,
+				params,
 				source,
 				impl_span: Some(def.span),
 			};
@@ -846,6 +880,7 @@ impl Checker<'_> {
 		}
 		MethodResolution {
 			ty: ret,
+			params,
 			source,
 			impl_span: Some(def.span),
 		}

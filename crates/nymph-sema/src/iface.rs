@@ -633,27 +633,20 @@ impl Checker<'_> {
 		for (i, g) in generics.iter().enumerate() {
 			if let Some(constraint) = &g.0.constraint {
 				let idx = crate::ids::ParamIdx((base + i) as u32);
-				let mut interfaces = Vec::new();
-				self.collect_bound_interfaces(constraint, &mut interfaces);
-				if !interfaces.is_empty() {
-					self.param_bounds.entry(idx).or_default().extend(interfaces);
-				}
+				let target = self.interner.mk_param(idx);
+				let mut bounds = Vec::new();
+				self.lower_bound_into(constraint, target, &mut bounds);
+				self
+					.param_bounds
+					.entry(idx)
+					.or_default()
+					.extend(bounds.iter().map(|bound| bound.interface));
+				self
+					.param_bound_details
+					.entry(idx)
+					.or_default()
+					.extend(bounds);
 			}
-		}
-	}
-
-	fn collect_bound_interfaces(&self, ty: &Spanned<Type>, out: &mut Vec<DefId>) {
-		match &ty.0 {
-			Type::Intersection(a, b) => {
-				self.collect_bound_interfaces(a, out);
-				self.collect_bound_interfaces(b, out);
-			}
-			Type::Reference { name, .. } => {
-				if let Some(interface) = self.defs.get(&name.0).filter(|&d| self.is_interface(d)) {
-					out.push(interface);
-				}
-			}
-			_ => {}
 		}
 	}
 

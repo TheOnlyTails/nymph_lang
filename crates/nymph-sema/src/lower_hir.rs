@@ -2954,26 +2954,7 @@ impl<'a> Lowerer<'a> {
 			ExprKind::List(items) => self.lower_list(items),
 			ExprKind::Map(entries) => self.lower_map(entries),
 			ExprKind::IndexAccess { parent, index, .. } => {
-				// Dispatch on the receiver's recorded type: Map → get, else subscript.
-				let recv = self.lower_expr(parent);
-				let index = self.lower_expr(index);
-				let recv_is_map = self.annotations.get(parent.id).is_some_and(|info| {
-					matches!(
-						self.interner.kind(Self::peel_mut(self.interner, info.ty)),
-						TyKind::Map(..)
-					)
-				});
-				if recv_is_map {
-					HirExpr::MapGet {
-						recv: Box::new(recv),
-						key: Box::new(index),
-					}
-				} else {
-					HirExpr::Index {
-						recv: Box::new(recv),
-						index: Box::new(index),
-					}
-				}
+				self.lower_index_access(expr.id, parent, index)
 			}
 			ExprKind::BinaryOp { lhs, op, rhs } => self.lower_binary(expr.id, lhs, *op, rhs),
 			ExprKind::PrefixOp { op, value } => self.lower_prefix_op(expr.id, *op, value),
@@ -3237,6 +3218,92 @@ impl<'a> Lowerer<'a> {
 				HirExpr::Local(self.resolve(&anon_param_name(idx.unwrap_or(0))))
 			}
 			other => panic!("slice-2a lowering does not yet handle {other:?}"),
+		}
+	}
+
+	/// Lower a checked `receiver[key]`: structural collections keep their
+	/// dedicated runtime operations, while custom `Index` implementations follow
+	/// the same dispatch/materialization paths as an explicit `.index(key)` call.
+	fn lower_index_access(&self, id: nymph_ast::NodeId, parent: &Expr, index: &Expr) -> HirExpr {
+		let recv_ty = self
+			.annotations
+			.get(parent.id)
+			.map(|info| Self::peel_mut(self.interner, info.ty));
+		match recv_ty.map(|ty| self.interner.kind(ty)) {
+			Some(TyKind::Map(..)) => HirExpr::MapGet {
+				recv: Box::new(self.lower_expr(parent)),
+				key: Box::new(self.lower_expr(index)),
+			},
+			Some(TyKind::List(_) | TyKind::Tuple(_)) => HirExpr::Index {
+				recv: Box::new(self.lower_expr(parent)),
+				index: Box::new(self.lower_expr(index)),
+			},
+			_ => match self.annotations.resolution_of(id) {
+				Some(res) if res.dispatch == DispatchKind::UserImpl => HirExpr::Call {
+					callee: Box::new(HirExpr::Field {
+						recv: Box::new(self.lower_expr(parent)),
+						name: res.method.clone(),
+					}),
+					args: vec![self.lower_expr(index)],
+				},
+				Some(res)
+					if res.dispatch == DispatchKind::UserImplDefaultMethod
+						&& self.materializing_onto_class.get() > 0
+						&& Self::is_this_receiver(parent) =>
+				{
+					self.record_inner_prelude_demand(&res.method);
+					HirExpr::Call {
+						callee: Box::new(HirExpr::Field {
+							recv: Box::new(self.lower_expr(parent)),
+							name: res.method.clone(),
+						}),
+						args: vec![self.lower_expr(index)],
+					}
+				}
+				Some(res)
+					if res.dispatch == DispatchKind::UserImplDefaultMethod
+						&& !Self::is_this_receiver(parent)
+						&& self.receiver_is_still_generic(parent)
+						&& !self.method_is_externally_backed_in_prelude(&res.method) =>
+				{
+					HirExpr::Call {
+						callee: Box::new(HirExpr::Field {
+							recv: Box::new(self.lower_expr(parent)),
+							name: res.method.clone(),
+						}),
+						args: vec![self.lower_expr(index)],
+					}
+				}
+				Some(res) if res.dispatch == DispatchKind::UserImplDefaultMethod => {
+					match self.try_materialize_prelude_dispatch(res, Self::is_this_receiver(parent)) {
+						Some(PreludeDispatch::TopLevel(mangled)) => HirExpr::Call {
+							callee: Box::new(HirExpr::Local(mangled)),
+							args: vec![self.lower_expr(parent), self.lower_expr(index)],
+						},
+						Some(PreludeDispatch::OntoClass { method, .. }) => HirExpr::Call {
+							callee: Box::new(HirExpr::Field {
+								recv: Box::new(self.lower_expr(parent)),
+								name: method,
+							}),
+							args: vec![self.lower_expr(index)],
+						},
+						Some(PreludeDispatch::LinkedExtern(linked)) => HirExpr::ExternCall {
+							module: linked.module,
+							symbol: linked.symbol,
+							args: vec![self.lower_expr(parent), self.lower_expr(index)],
+						},
+						None => panic!(
+							"lowering does not support the resolved custom index implementation `{}`",
+							res.method
+						),
+					}
+				}
+				Some(res) => unreachable!(
+					"custom index access resolved to non-method dispatch {:?}",
+					res.dispatch
+				),
+				None => panic!("lowering: no Index resolution recorded for custom index access"),
+			},
 		}
 	}
 

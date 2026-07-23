@@ -398,6 +398,71 @@ fn for_in_over_an_unbounded_generic_param_is_diagnosed() {
 	);
 }
 
+#[test]
+fn index_access_without_an_index_impl_is_diagnosed() {
+	assert_error_contains(
+		"struct Box(value: int)
+		 func f(): int = Box(value = 1)[0]",
+		"no method `index`",
+	);
+}
+
+#[test]
+fn assignment_through_a_custom_index_impl_is_diagnosed() {
+	assert_error_contains(
+		"interface Index<Key, Output> { func index(key: Key): Output }
+		 struct Box(value: int) {
+		   impl Index<Key = int, Output = int> {
+		     func index(key: int): int = this.value + key
+		   }
+		 }
+		 func f(): void = {
+		   let mut box = Box(value = 1)
+		   box[0] = 2
+		 }",
+		"cannot assign to `custom index access`",
+	);
+}
+
+#[test]
+fn mutating_method_on_a_custom_index_result_accepts_the_temporary() {
+	assert_ok(
+		"interface Index<Key, Output> { func index(key: Key): Output }
+		 struct Counter(value: int) {
+		   mut func increment(): int = { this.value = this.value + 1 this.value }
+		 }
+		 struct Store(value: Counter) {
+		   impl Index<Key = int, Output = Counter> {
+		     func index(key: int): Counter = this.value
+		   }
+		 }
+		 func f(): int = Store(value = Counter(value = 0))[0].increment()",
+	);
+}
+
+#[test]
+fn method_generic_shadowing_does_not_change_an_owner_bound() {
+	assert_ok(
+		"interface Echo<X> { func echo(value: X): X }
+		 struct Box<T: Echo<X = T>>(value: T) {
+		   func apply<T>() = this.value.echo(this.value)
+		 }",
+	);
+}
+
+#[test]
+fn nested_impl_generic_shadowing_does_not_change_an_owner_bound() {
+	assert_ok(
+		"interface Echo<X> { func echo(value: X): X }
+		 interface Marker { func apply(): boolean }
+		 struct Box<T: Echo<X = T>>(value: T) {
+		   impl<T> Marker {
+		     func apply(): boolean = { this.value.echo(this.value) true }
+		   }
+		 }",
+	);
+}
+
 // ── SS1: smart literal spread ───────────────────────────────────────────────
 
 #[test]

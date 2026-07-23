@@ -181,6 +181,20 @@ fn runs_list_and_index() {
 }
 
 #[test]
+fn runs_custom_index_impl() {
+	let src = r#"
+		interface Index<Key, Output> { func index(key: Key): Output }
+		struct Offset(base: int) {
+			impl Index<Key = int, Output = int> {
+				func index(key: int): int = this.base + key
+			}
+		}
+		func lookup(): int = Offset(base = 40)[2]
+	"#;
+	assert_eq!(run(src, "lookup().v"), "42");
+}
+
+#[test]
 fn runs_tuple_roundtrip() {
 	// A tuple emits as a JS array — `JSON.stringify` proves the shape survives.
 	let src = "func pair(): #(int, int) = #(1, 2)";

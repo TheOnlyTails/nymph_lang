@@ -66,6 +66,8 @@ pub struct Checker<'m> {
 	/// to resolve a namespaced call through a type parameter, e.g. `R.default()` where
 	/// `R: Default`.
 	pub(crate) param_bounds: FxHashMap<ParamIdx, Vec<DefId>>,
+	/// Declared bounds with their named interface arguments preserved.
+	pub(crate) param_bound_details: FxHashMap<ParamIdx, Vec<crate::iface::Bound>>,
 	/// The type `this`/`self` refers to inside the current method, if any.
 	pub(crate) self_ty: Option<Ty>,
 	/// The declared/expected return type of the function currently being checked.
@@ -312,6 +314,7 @@ impl<'m> Checker<'m> {
 			scopes: Vec::new(),
 			params: Vec::new(),
 			param_bounds: FxHashMap::default(),
+			param_bound_details: FxHashMap::default(),
 			self_ty: None,
 			ret_ty: None,
 			alias_depth: 0,

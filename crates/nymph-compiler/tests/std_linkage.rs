@@ -439,6 +439,47 @@ fn a_user_set_struct_backed_by_the_linked_map_inserts_removes_and_contains_round
 }
 
 #[test]
+fn ambient_index_interface_dispatches_custom_index_access() {
+	let entry = r#"
+		struct Offset(base: int) {
+			impl Index<Key = int, Output = int> {
+				func index(key: int): int = this.base + key
+			}
+		}
+		func demo(): int = Offset(base = 40)[2]
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("custom indexing should resolve through the ambient Index interface");
+	let call = compiled.entry_symbol("demo");
+	let mut js = compiled.js;
+	js.push_str(&format!("\nconsole.log({call}().v);\n"));
+	assert_eq!(run_node(&js, "custom_index"), "42");
+}
+
+#[test]
+fn ambient_index_bound_dispatches_generic_index_access() {
+	let entry = r#"
+		struct Offset(base: uint) {
+			impl Index<Key = uint, Output = uint> {
+				func index(key: uint): uint = this.base + key
+			}
+		}
+		func get<T: Index<Key = uint, Output = uint>>(value: T): uint = value[2]
+		func demo(): uint = get(Offset(base = 40u))
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("generic indexing should dispatch through the ambient Index bound");
+	let call = compiled.entry_symbol("demo");
+	let mut js = compiled.js;
+	js.push_str(&format!("\nconsole.log({call}().v);\n"));
+	assert_eq!(run_node(&js, "generic_custom_index"), "42");
+}
+
+#[test]
 fn boxed_collection_intrinsics_preserve_value_semantics_and_nested_shapes() {
 	let entry = r#"
 		struct Key(id: int) {
