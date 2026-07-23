@@ -5,9 +5,4 @@ packages:
 allowBuilds:
   '@vscode/vsce-sign': true
   esbuild: true
-
-catalog:
-  oxfmt: ^0.59.0
-  oxlint: ^1.74.0
-  oxlint-tsgolint: ^0.24.0
-  prettier: ^3.5.3
+  keytar: false
