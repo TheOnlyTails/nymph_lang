@@ -50,8 +50,9 @@ mod bundle;
 mod resolve;
 mod rewrite;
 
+use ecow::EcoString;
 use nymph_ast::decl::{Module, Visibility};
-use nymph_diagnostics::Diagnostic;
+use nymph_diagnostics::{Diagnostic, Label};
 use nymph_hir::hir::{HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirMethod, HirModule};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -352,11 +353,81 @@ impl Driver {
 
 		let mut diags: Vec<ProjectDiagnostic> = Vec::new();
 		let mut processed: FxHashMap<String, Module> = FxHashMap::default();
+		let mut static_attachments: FxHashMap<(String, EcoString, EcoString), nymph_ast::Span> =
+			FxHashMap::default();
 
 		for key in &order {
 			let raw = &modules[key];
 			let own_tag = tags[key];
 			let own_names: FxHashSet<_> = declared[key].iter().map(|d| d.name.clone()).collect();
+			let owned_types: FxHashSet<_> = raw
+				.tree
+				.members
+				.iter()
+				.filter_map(|decl| match decl {
+					nymph_ast::decl::Declaration::Struct { name, .. }
+					| nymph_ast::decl::Declaration::Enum { name, .. } => Some(name.0.clone()),
+					_ => None,
+				})
+				.collect();
+			for decl in &raw.tree.members {
+				let nymph_ast::decl::Declaration::Impl { type_, members, .. } = decl else {
+					continue;
+				};
+				let nymph_ast::ty::Type::Reference { name, .. } = &type_.0 else {
+					continue;
+				};
+				if !owned_types.contains(&name.0) {
+					diags.push(ProjectDiagnostic {
+						module: key.clone(),
+						diag: Diagnostic::error(
+							"INHERENT-IMPL-OWNER".into(),
+							format!(
+								"inherent impl for `{}` must be declared in the module that owns the type; extension attachments are not allowed",
+								name.0
+							),
+							name.1,
+						),
+					});
+				}
+				let canonical_owner = if owned_types.contains(&name.0) {
+					Some(key.clone())
+				} else {
+					raw.imports.iter().find_map(|import| {
+						import
+							.with_idents
+							.iter()
+							.any(|(imported, alias)| alias.as_ref().unwrap_or(imported).0 == name.0)
+							.then(|| import.target_key.clone())
+					})
+				};
+				let Some(canonical_owner) = canonical_owner else {
+					continue;
+				};
+				for member in members {
+					let nymph_ast::decl::ImplMember::Func { meta, .. } = &member.0 else {
+						continue;
+					};
+					if meta.kind != nymph_ast::decl::FuncKind::Namespace {
+						continue;
+					}
+					let identity = (canonical_owner.clone(), name.0.clone(), meta.name.0.clone());
+					if let Some(previous) = static_attachments.insert(identity, meta.name.1) {
+						diags.push(ProjectDiagnostic {
+							module: key.clone(),
+							diag: Diagnostic::error(
+								"2045".into(),
+								format!(
+									"`{}` is defined more than once on `{}`",
+									meta.name.0, name.0
+								),
+								meta.name.1,
+							)
+							.with_label(Label::new(previous, "previously defined here")),
+						});
+					}
+				}
+			}
 
 			// The entry module's own `main` is exempted from mangling: the checker's
 			// entry-point validation (`check_module_entry_with_prelude`) and the

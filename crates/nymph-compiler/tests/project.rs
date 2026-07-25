@@ -632,3 +632,111 @@ fn cross_module_enum_match_runs_under_node() {
 		String::from_utf8_lossy(&out.stderr)
 	);
 }
+
+#[test]
+fn unrelated_module_cannot_attach_a_static_to_an_imported_type() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/owner with (Token)\nimport @/extension\nfunc main(): void = {}",
+		),
+		("owner", "public struct Token(value: int)"),
+		(
+			"extension",
+			"import @/owner with (Token)\nimpl Token { namespace func forge(): Token = Token(value = 0) }",
+		),
+	]);
+	let diags = check_project("main", &loader(files));
+	assert!(
+		!diags.is_empty(),
+		"an unrelated module must not extend another module's type"
+	);
+}
+
+#[test]
+fn same_bare_type_name_in_different_modules_does_not_receive_another_owners_static() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/left\nimport @/right\nfunc main(): void = {}",
+		),
+		(
+			"left",
+			"public struct Token(value: int)\nimpl Token { namespace func left(): Token = Token(value = 1) }",
+		),
+		("right", "public struct Token(value: int)"),
+	]);
+	let sources = compile_project_module_sources_with_std("main", &loader(files), &|_| None)
+		.unwrap_or_else(|diags| {
+			panic!("same local type names should compile independently: {diags:?}")
+		});
+	assert_eq!(sources["left"].matches("static left(").count(), 1);
+	assert_eq!(sources["right"].matches("static left(").count(), 0);
+}
+
+#[test]
+fn duplicate_static_attachments_across_source_modules_are_diagnosed() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/owner with (Token)\nimport @/first\nimport @/second\nfunc main(): void = {}",
+		),
+		("owner", "public struct Token(value: int)"),
+		(
+			"first",
+			"import @/owner with (Token)\nimpl Token { namespace func make(): Token = Token(value = 1) }",
+		),
+		(
+			"second",
+			"import @/owner with (Token)\nimpl Token { namespace func make(): Token = Token(value = 2) }",
+		),
+	]);
+	let diags = check_project("main", &loader(files));
+	assert!(
+		diags.iter().any(|diag| diag.diag.code.contains("2045")),
+		"duplicate attachments must use the semantic duplicate diagnostic: {diags:?}"
+	);
+}
+
+#[test]
+fn multiple_consumers_share_one_canonical_generic_enum_static_attachment() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/left with (left_value)\nimport @/right with (right_value)\nfunc main(): void = {}\nfunc result(): int = left_value() + right_value()",
+		),
+		(
+			"owner",
+			"public enum Boxed<T> { Value(value: T) }\nimpl<T> Boxed<T> { namespace func wrap(value: T): Boxed<T> = Boxed.Value(value = value) }",
+		),
+		(
+			"left",
+			"import @/owner with (Boxed)\npublic func left_value(): int = match (Boxed.wrap(2)) { Value(value) -> value }",
+		),
+		(
+			"right",
+			"import @/owner with (Boxed)\npublic func right_value(): int = match (Boxed.wrap(3)) { Value(value) -> value }",
+		),
+	]);
+	let sources = compile_project_module_sources_with_std("main", &loader(files.clone()), &|_| None)
+		.unwrap_or_else(|diags| panic!("canonical static graph should compile: {diags:?}"));
+	assert_eq!(
+		sources["owner"].matches("\n\t\twrap(").count(),
+		1,
+		"{}",
+		sources["owner"]
+	);
+	assert_eq!(
+		sources["left"].matches("\n\t\twrap(").count(),
+		0,
+		"{}",
+		sources["left"]
+	);
+	assert_eq!(
+		sources["right"].matches("\n\t\twrap(").count(),
+		0,
+		"{}",
+		sources["right"]
+	);
+	assert_eq!(run_project(files, "result", ""), "5");
+}

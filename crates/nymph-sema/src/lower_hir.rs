@@ -1067,13 +1067,13 @@ impl<'a> Lowerer<'a> {
 		// field's doc comment for why.
 		let interfaces_by_name = &self.interfaces_by_name;
 
-		// First pass: collect instance methods from top-level `impl <Named>` blocks
+		// First pass: collect methods from top-level `impl <Named>` blocks
 		// (inherent, 4A) and top-level `impl <Interface> for <Named>` blocks
 		// (interface impls, 4B/D5, now also lowering un-overridden interface
 		// defaults per Slice 4C-b), keyed by the target type name. Non-`func`
-		// members (namespaced statics, nested impls, `mut func`) are deferred and
-		// panic loudly rather than silently disappearing.
+		// members are attached to the named type in the second pass.
 		let mut methods_by_type: FxHashMap<EcoString, Vec<HirMethod>> = FxHashMap::default();
+		let mut statics_by_type: FxHashMap<EcoString, Vec<HirMethod>> = FxHashMap::default();
 		for decl in &module.members {
 			match decl {
 				Declaration::Impl {
@@ -1086,23 +1086,21 @@ impl<'a> Lowerer<'a> {
 					// non-`Reference` target silently contributes nothing here, same as
 					// before Slice 4C-b — unchanged, out of this slice's scope.
 					if let Type::Reference { name, .. } = &type_.0 {
-						let entry = methods_by_type.entry(name.0.clone()).or_default();
 						for member in members {
 							match &member.0 {
 								ImplMember::Func { meta, body, .. } => {
-									// A `mut func` in a top-level `impl` block is an ordinary
-									// instance method (like a struct-body `mut func`). A
-									// `namespace func` static, however, has no channel from a
-									// top-level impl block into the class's `statics` yet — the
-									// checker models it as a static (members.rs), so lowering it
-									// as an instance method would be silent wrong-JS. Defer it
-									// loudly instead (statics belong in the type's own body).
-									assert!(
-										meta.kind != nymph_ast::decl::FuncKind::Namespace,
-										"lowering does not yet support a `namespace func` in a top-level `impl` block (declare the static in the type body instead): {}",
-										meta.name.0,
-									);
-									entry.push(self.lower_method(generics, meta, body));
+									let method = self.lower_method(generics, meta, body);
+									if meta.kind == nymph_ast::decl::FuncKind::Namespace {
+										statics_by_type
+											.entry(name.0.clone())
+											.or_default()
+											.push(method);
+									} else {
+										methods_by_type
+											.entry(name.0.clone())
+											.or_default()
+											.push(method);
+									}
 								}
 								other => panic!("slice-4b lowering does not yet handle impl member {other:?}"),
 							}
@@ -1187,6 +1185,12 @@ impl<'a> Lowerer<'a> {
 						&mut methods_by_type,
 						None,
 					);
+					let statics: Vec<HirMethod> = statics_by_type
+						.remove(&name.0)
+						.into_iter()
+						.flatten()
+						.chain(statics)
+						.collect();
 					classes.push(HirClass {
 						name: name.0.clone(),
 						fields: fields.iter().map(|f| f.0.name.0.clone()).collect(),
@@ -1215,6 +1219,12 @@ impl<'a> Lowerer<'a> {
 						&mut methods_by_type,
 						None,
 					);
+					let statics: Vec<HirMethod> = statics_by_type
+						.remove(&name.0)
+						.into_iter()
+						.flatten()
+						.chain(statics)
+						.collect();
 					let variants: Vec<HirVariant> = variants
 						.iter()
 						.map(|v| HirVariant {
@@ -1237,6 +1247,10 @@ impl<'a> Lowerer<'a> {
 			methods_by_type.is_empty(),
 			"slice-4d lowering does not yet support inherent or interface-impl methods on types that are neither struct nor enum; found impls for: {:?}",
 			methods_by_type.keys().collect::<Vec<_>>()
+		);
+		assert!(
+			statics_by_type.is_empty(),
+			"lowering does not support inherent statics on types that are neither struct nor enum"
 		);
 
 		// Gap (b), Pass 2 (stdlib body lowering slice): the module walk
@@ -1751,24 +1765,29 @@ impl<'a> Lowerer<'a> {
 	fn lower_runtime_enum(&self, name: &EcoString) -> Option<HirEnum> {
 		use nymph_ast::ty::Type;
 
-		let (generics, variants, members, impls) = self.prelude_modules.iter().find_map(|m| {
-			m.members.iter().find_map(|decl| match decl {
-				Declaration::Enum {
-					name: n,
-					generics,
-					variants,
-					members,
-					impls,
-					..
-				} if n.0 == *name => Some((
-					generics.as_slice(),
-					variants.as_slice(),
-					members.as_slice(),
-					impls.as_slice(),
-				)),
-				_ => None,
-			})
-		})?;
+		let (type_owner, generics, variants, members, impls) = self
+			.prelude_modules
+			.iter()
+			.enumerate()
+			.find_map(|(index, m)| {
+				m.members.iter().find_map(|decl| match decl {
+					Declaration::Enum {
+						name: n,
+						generics,
+						variants,
+						members,
+						impls,
+						..
+					} if n.0 == *name => Some((
+						self.prelude_owners[index].clone(),
+						generics.as_slice(),
+						variants.as_slice(),
+						members.as_slice(),
+						impls.as_slice(),
+					)),
+					_ => None,
+				})
+			})?;
 
 		// Snapshot the demand set NOW — any growth discovered WHILE lowering
 		// these bodies (inner dispatch demanding a sibling method) is caught
@@ -1816,7 +1835,8 @@ impl<'a> Lowerer<'a> {
 		// un-overridden `Unwrap` default — are NOT collected here: `Unwrap`
 		// itself declares none, so this is a real but so-far-harmless scope
 		// limit, not a silent gap this slice's payoff exercises.)
-		for module in self.prelude_modules {
+		for (module, owner) in self.prelude_modules.iter().zip(self.prelude_owners) {
+			let owns_type = owner == &type_owner;
 			for decl in &module.members {
 				match decl {
 					Declaration::ImplFor {
@@ -1838,6 +1858,7 @@ impl<'a> Lowerer<'a> {
 							impl_members,
 							&mut methods,
 							&mut statics,
+							owns_type,
 						);
 					}
 					Declaration::Impl {
@@ -1859,6 +1880,7 @@ impl<'a> Lowerer<'a> {
 							impl_members,
 							&mut methods,
 							&mut statics,
+							owns_type,
 						);
 					}
 					_ => {}
@@ -1993,31 +2015,36 @@ impl<'a> Lowerer<'a> {
 	/// `this.source.next().map(this.f)`) records its own demand for the enum pass that
 	/// runs next. Returns `None` when `name` isn't a prelude struct.
 	fn lower_runtime_struct(&self, name: &EcoString) -> Option<HirClass> {
-		let (generics, fields, members, impls) = self.prelude_modules.iter().find_map(|m| {
-			m.members.iter().find_map(|decl| match decl {
-				Declaration::Struct {
-					name: n,
-					generics,
-					fields,
-					members,
-					impls,
-					..
-				} if n.0 == *name => Some((
-					generics.as_slice(),
-					fields.as_slice(),
-					members.as_slice(),
-					impls.as_slice(),
-				)),
-				_ => None,
-			})
-		})?;
+		let (type_owner, generics, fields, members, impls) = self
+			.prelude_modules
+			.iter()
+			.enumerate()
+			.find_map(|(index, m)| {
+				m.members.iter().find_map(|decl| match decl {
+					Declaration::Struct {
+						name: n,
+						generics,
+						fields,
+						members,
+						impls,
+						..
+					} if n.0 == *name => Some((
+						self.prelude_owners[index].clone(),
+						generics.as_slice(),
+						fields.as_slice(),
+						members.as_slice(),
+						impls.as_slice(),
+					)),
+					_ => None,
+				})
+			})?;
 
 		self
 			.lowering_onto_runtime_owner
 			.set(self.lowering_onto_runtime_owner.get() + 1);
 
 		let mut methods_by_type: FxHashMap<EcoString, Vec<HirMethod>> = FxHashMap::default();
-		let (methods, statics) = self.collect_adt_methods(
+		let (mut methods, mut statics) = self.collect_adt_methods(
 			name,
 			generics,
 			members,
@@ -2026,6 +2053,40 @@ impl<'a> Lowerer<'a> {
 			&mut methods_by_type,
 			None,
 		);
+		for (module, owner) in self.prelude_modules.iter().zip(self.prelude_owners) {
+			let owns_type = owner == &type_owner;
+			for decl in &module.members {
+				let Declaration::Impl {
+					generics,
+					type_,
+					members,
+					..
+				} = decl
+				else {
+					continue;
+				};
+				let nymph_ast::ty::Type::Reference { name: target, .. } = &type_.0 else {
+					continue;
+				};
+				if target.0 != *name {
+					continue;
+				}
+				for member in members {
+					let ImplMember::Func { meta, body, .. } = &member.0 else {
+						continue;
+					};
+					if meta.kind == nymph_ast::decl::FuncKind::Namespace && !owns_type {
+						continue;
+					}
+					let method = self.lower_method(generics, meta, body);
+					if meta.kind == nymph_ast::decl::FuncKind::Namespace {
+						statics.push(method);
+					} else {
+						methods.push(method);
+					}
+				}
+			}
+		}
 
 		self
 			.lowering_onto_runtime_owner
@@ -2049,6 +2110,7 @@ impl<'a> Lowerer<'a> {
 	/// loop (instance vs. `namespace func` static, same demand-gating) — kept
 	/// as its own method (rather than a closure) purely to avoid borrowing
 	/// `methods`/`statics` mutably while also calling back into `self`.
+	#[allow(clippy::too_many_arguments)]
 	fn collect_top_level_impl_methods(
 		&self,
 		enum_name: &EcoString,
@@ -2057,6 +2119,7 @@ impl<'a> Lowerer<'a> {
 		impl_members: &[Spanned<nymph_ast::decl::ImplMember>],
 		methods: &mut Vec<HirMethod>,
 		statics: &mut Vec<HirMethod>,
+		owns_type: bool,
 	) {
 		use nymph_ast::decl::{FuncKind, ImplMember};
 
@@ -2071,7 +2134,9 @@ impl<'a> Lowerer<'a> {
 				continue;
 			}
 			if meta.kind == FuncKind::Namespace {
-				statics.push(self.lower_method(impl_generics, meta, body));
+				if owns_type {
+					statics.push(self.lower_method(impl_generics, meta, body));
+				}
 			} else {
 				methods.push(self.lower_method(impl_generics, meta, body));
 			}
@@ -3242,6 +3307,15 @@ impl<'a> Lowerer<'a> {
 			},
 			ExprKind::Grouped(inner) => self.lower_expr(inner),
 			ExprKind::Call { func, args, .. } => {
+				if let ExprKind::MemberAccess { parent, .. } = &func.kind
+					&& let ExprKind::Identifier(name) = &parent.kind
+					&& self.struct_names.contains(&name.0)
+				{
+					self
+						.runtime_struct_demands
+						.borrow_mut()
+						.insert(name.0.clone());
+				}
 				// A call the checker resolved to a variant is variant construction →
 				// `VariantNew` (bare `Some(…)` or qualified `Opt.Some(…)`).
 				if let Some(variant_new) = self.variant_new(expr.id, args) {

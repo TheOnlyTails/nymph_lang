@@ -118,6 +118,20 @@ fn top_level_inherent_impl() {
 }
 
 #[test]
+fn top_level_and_nested_inherent_members_share_collision_namespace() {
+	assert_error_contains(
+		"struct Point(x: int) { namespace func at(v: int): Point = Point(x = v) }
+		 impl Point { namespace func at(v: int): Point = Point(x = v) }",
+		"defined more than once",
+	);
+	assert_error_contains(
+		"struct Point(x: int) { func at(): int = this.x }
+		 impl Point { namespace func at(v: int): Point = Point(x = v) }",
+		"defined more than once",
+	);
+}
+
+#[test]
 fn namespaced_constructor() {
 	assert_ok(
 		"struct Point(x: int) {

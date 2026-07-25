@@ -211,6 +211,37 @@ impl<'m> Checker<'m> {
 		self.pop_params();
 
 		let head = head_of(&self.interner, self_ty);
+		if let Some(head) = head {
+			let previous = self
+				.inherent
+				.candidates(head)
+				.into_iter()
+				.filter(|&idx| self.inherent.impls[idx].self_ty == self_ty)
+				.flat_map(|idx| {
+					self.inherent.impls[idx]
+						.methods
+						.iter()
+						.filter_map(|(name, method)| {
+							methods
+								.get(name)
+								.filter(|new| new.namespaced || method.namespaced)
+								.map(|new| (new.meta.name.1, name.clone(), method.meta.name.1))
+						})
+				})
+				.collect::<Vec<_>>();
+			let ty = self.display(self_ty);
+			for (span, name, prev) in previous {
+				self.emit(
+					span,
+					TypeError::DuplicateMember {
+						name,
+						ty: ty.clone(),
+						redefined_span: span,
+						prev,
+					},
+				);
+			}
+		}
 		self.inherent.add(
 			head,
 			InherentImpl {

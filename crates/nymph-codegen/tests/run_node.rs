@@ -2060,6 +2060,27 @@ fn runs_struct_namespaced_static_called_from_a_js_driver() {
 }
 
 #[test]
+fn runs_top_level_inherent_statics_for_struct_enum_and_generics() {
+	let src = r#"
+		impl Point { namespace func at(v: int): Point = Point(x = v) }
+		struct Point(x: int)
+		enum Choice<T> { Some(value: T), None }
+		impl<T> Choice<T> { namespace func wrap(value: T): Choice<T> = Choice.Some(value = value) }
+		func result(): int = {
+			let number_choice: Choice<int> = Choice.wrap(5)
+			let flag_choice: Choice<boolean> = Choice.wrap(true)
+			let number = match (number_choice) { Some(value) -> value, None -> 0 }
+			let flag = match (flag_choice) { Some(value) -> if (value) 2 else 0, None -> 0 }
+			Point.at(7).x + number + flag
+		}
+	"#;
+	assert_eq!(run(src, "result()"), "14");
+	let js = compile(src);
+	assert_eq!(js.matches("static at(").count(), 1, "{js}");
+	assert_eq!(js.matches("wrap(value) {").count(), 1, "{js}");
+}
+
+#[test]
 fn runs_enum_namespaced_static_called_from_nymph() {
 	let src = r#"
 		enum Color {

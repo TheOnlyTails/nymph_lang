@@ -3,8 +3,8 @@ use nymph_hir::hir::{
 	HirStmt, NumKind, ScalarCastKind, UnOp,
 };
 use nymph_sema::{
-	check_module, check_module_with_prelude, lower_hir_with_prelude,
-	lower_hir_with_prelude_runtime_and_deps,
+	RuntimeOwner, check_module, check_module_with_prelude, lower_hir_with_prelude,
+	lower_hir_with_prelude_runtime_and_deps, lower_hir_with_prelude_runtime_and_deps_with_owners,
 };
 use nymph_syntax::parse_module;
 
@@ -3291,18 +3291,106 @@ fn mut_func_in_a_top_level_impl_lowers_as_an_instance_method() {
 }
 
 #[test]
-#[should_panic(expected = "namespace func` in a top-level `impl` block")]
-fn namespace_func_in_a_top_level_impl_panics_in_lowering() {
-	// The checker models a `namespace func` in a top-level impl block as a
-	// static, but there is no channel from a top-level impl into the class's
-	// `statics` yet — lowering it as an instance method would be silent
-	// wrong-JS, so lowering defers it loudly (statics belong in the type body).
-	lower(
-		"struct Counter(n: int)
-		 impl Counter {
-		   namespace func zero(): Counter = Counter(n = 0)
-		 }",
+fn namespace_funcs_in_top_level_impls_attach_to_structs_and_enums() {
+	let hir = lower(
+		"impl Counter { namespace func zero(): Counter = Counter(n = 0) }
+		 struct Counter(n: int)
+		 enum Choice<T> { Some(value: T), None }
+		 impl<T> Choice<T> { namespace func empty(): Choice<T> = Choice.None }",
 	);
+	let class = hir.classes.iter().find(|c| c.name == "Counter").unwrap();
+	assert_eq!(
+		class
+			.statics
+			.iter()
+			.map(|m| m.name.as_str())
+			.collect::<Vec<_>>(),
+		["zero"]
+	);
+	assert!(class.methods.is_empty());
+	let enum_ = hir.enums.iter().find(|e| e.name == "Choice").unwrap();
+	assert_eq!(
+		enum_
+			.statics
+			.iter()
+			.map(|m| m.name.as_str())
+			.collect::<Vec<_>>(),
+		["empty"]
+	);
+	assert!(enum_.methods.is_empty());
+}
+
+#[test]
+fn ambient_struct_static_attaches_across_prelude_sources() {
+	let owner = parse_module("struct Factory(value: int)", "owner");
+	let attachment = parse_module(
+		"impl Factory { namespace func make(value: int): Factory = Factory(value = value) }",
+		"attachment",
+	);
+	let user = parse_module("func make(): Factory = Factory.make(3)", "user");
+	let preludes = [owner.tree, attachment.tree];
+	let checked = check_module_with_prelude(&user.tree, &preludes);
+	assert!(
+		checked.diags.is_empty(),
+		"check failed: {:?}",
+		checked.diags
+	);
+	let canonical_owner = RuntimeOwner::Compiler("canonical".into());
+	let lowered = lower_hir_with_prelude_runtime_and_deps_with_owners(
+		&user.tree,
+		&preludes,
+		&[canonical_owner.clone(), canonical_owner],
+		2,
+		&checked,
+	);
+	let class = lowered
+		.prelude_runtime
+		.classes
+		.iter()
+		.find(|c| c.name == "Factory")
+		.unwrap();
+	assert_eq!(
+		class
+			.statics
+			.iter()
+			.map(|m| m.name.as_str())
+			.collect::<Vec<_>>(),
+		["make"]
+	);
+}
+
+#[test]
+fn ambient_static_from_a_different_owner_is_not_attached_by_bare_type_name() {
+	let owner = parse_module("struct Factory(value: int)", "owner");
+	let extension = parse_module(
+		"impl Factory { namespace func make(value: int): Factory = Factory(value = value) }",
+		"extension",
+	);
+	let user = parse_module("func make(): Factory = Factory.make(3)", "user");
+	let preludes = [owner.tree, extension.tree];
+	let checked = check_module_with_prelude(&user.tree, &preludes);
+	assert!(
+		checked.diags.is_empty(),
+		"check failed: {:?}",
+		checked.diags
+	);
+	let lowered = lower_hir_with_prelude_runtime_and_deps_with_owners(
+		&user.tree,
+		&preludes,
+		&[
+			RuntimeOwner::Compiler("owner".into()),
+			RuntimeOwner::Compiler("extension".into()),
+		],
+		2,
+		&checked,
+	);
+	let class = lowered
+		.prelude_runtime
+		.classes
+		.iter()
+		.find(|class| class.name == "Factory")
+		.unwrap();
+	assert!(class.statics.is_empty());
 }
 
 #[test]

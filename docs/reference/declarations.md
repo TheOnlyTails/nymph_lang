@@ -139,6 +139,8 @@ struct Square(side: int)
 // Inherent: adds a method with no interface involved.
 impl Square {
   func doubled_side(): int = this.side * 2
+
+  namespace func unit(): Square = Square(side = 1)
 }
 
 // Interface: satisfies `Area` for `Square`.
@@ -146,6 +148,11 @@ impl Area for Square {
   func area(): int = this.side * this.side
 }
 ```
+
+An inherent `namespace func` in a top-level `impl` is equivalent to declaring that static in the
+`struct` or `enum` body. It uses the same generic scope, visibility and member-collision rules, and
+is attached once to the type's canonical runtime object regardless of whether the `impl` appears
+before or after the type declaration.
 
 An inherent or interface impl can also be written **nested inside** the `struct`/`enum` body
 itself, which is equivalent to a separate top-level `impl` block:
