@@ -53,8 +53,8 @@ interface Iterator<Item> {
 ```
 
 `next` is a [mut func](./mutability#mut-func): producing the next value is inherently a mutation
-of the iterator's own state, so a binding used as a direct `Iterator` source must be declared
-`let mut`.
+of the iterator's own state, not necessarily of the collection it traverses. A binding used as a
+direct `Iterator` source must therefore be declared `let mut`.
 
 ```nym
 struct Counter(n: int, max: int)

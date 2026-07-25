@@ -7,15 +7,15 @@ native list.
 
 ```nymph
 public interface Iterator<Item> {
-  func next(): Option<Item>
+  mut func next(): Option<Item>
 }
 ```
 
 `next` is a [`mut func`](../mutability#mut-func): producing the next value is a mutation of the
-iterator's own position, so a binding used directly as a `for` source must be `let mut`. A `for`
-loop over a type implementing `Iterator<Item>` calls `next()` until it returns `None`, binding each
-`Some`'s payload to the loop pattern in turn. See [Iterators](../iteration#iterators) for a full
-worked implementation.
+iterator's own position, not necessarily a mutation of the collection it traverses. A binding used
+directly as a `for` source must therefore be `let mut`. A `for` loop over a type implementing
+`Iterator<Item>` calls `next()` until it returns `None`, binding each `Some`'s payload to the loop
+pattern in turn. See [Iterators](../iteration#iterators) for a full worked implementation.
 
 ## `Iterable`
 
