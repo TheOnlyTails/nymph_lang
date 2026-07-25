@@ -97,8 +97,8 @@ pub(crate) fn find_from(start: &Path) -> anyhow::Result<(NymphConfig, PathBuf)> 
 /// Not yet called anywhere: `build`/`run`/`check`'s project support
 /// (`crate::project_support::detect`) climbs from the FILE argument's own
 /// directory via `find_from` directly, since commands don't have access to
-/// `NymphCli`'s `--config` override today. Kept for the CLI subcommands
-/// (`add`, `install`, …) that will want the override-aware lookup.
+/// `NymphCli`'s `--config` override today. Kept for future commands that need
+/// override-aware lookup.
 #[allow(dead_code)]
 pub(crate) fn get_config_with_root(cli: &NymphCli) -> anyhow::Result<(NymphConfig, PathBuf)> {
 	match &cli.config {

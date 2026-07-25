@@ -183,7 +183,7 @@ func origin(): Point = Point(x = 0, y = 0)
 import @/math               // project-rooted
 import ./sibling             // relative to the current file
 import ../parent             // relative to the parent directory
-import pkg/name as aliased   // an external package, aliased
+import pkg/name as aliased   // future external-package syntax, aliased
 import @/math with (sin as sine, cos)
 ```
 

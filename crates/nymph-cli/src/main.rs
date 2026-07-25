@@ -5,9 +5,8 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::commands::{
-	add::AddCommand, build::BuildCommand, check::CheckCommand, doc::DocCommand,
-	format::FormatCommand, install::InstallCommand, new::NewCommand, remove::RemoveCommand,
-	repl::ReplCommand, run::RunCommand, search::SearchCommand,
+	build::BuildCommand, check::CheckCommand, doc::DocCommand, format::FormatCommand,
+	new::NewCommand, repl::ReplCommand, run::RunCommand,
 };
 
 mod commands;
@@ -34,33 +33,25 @@ pub(crate) struct NymphCli {
 
 #[derive(clap::Subcommand)]
 enum NymphCommands {
-	Add(AddCommand),
 	Build(BuildCommand),
 	Check(CheckCommand),
 	Doc(DocCommand),
 	Format(FormatCommand),
-	Install(InstallCommand),
 	New(NewCommand),
-	Remove(RemoveCommand),
 	Repl(ReplCommand),
 	Run(RunCommand),
-	Search(SearchCommand),
 }
 
 impl NymphCommands {
 	fn run(&self) -> i32 {
 		match self {
-			NymphCommands::Add(cmd) => cmd.run(),
 			NymphCommands::Build(cmd) => cmd.run(),
 			NymphCommands::Check(cmd) => cmd.run(),
 			NymphCommands::Doc(cmd) => cmd.run(),
 			NymphCommands::Format(cmd) => cmd.run(),
-			NymphCommands::Install(cmd) => cmd.run(),
 			NymphCommands::New(cmd) => cmd.run(),
-			NymphCommands::Remove(cmd) => cmd.run(),
 			NymphCommands::Repl(cmd) => cmd.run(),
 			NymphCommands::Run(cmd) => cmd.run(),
-			NymphCommands::Search(cmd) => cmd.run(),
 		}
 	}
 }

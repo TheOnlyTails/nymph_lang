@@ -1,6 +1,6 @@
 //! Integration tests: spawn the real `nymph` binary and assert on its
 //! observable behavior (exit code, stdout, stderr) for `check`, `build`,
-//! `run`, and the stub subcommands.
+//! `run`, and command-line parsing.
 
 use std::io::Write;
 use std::process::Command;
@@ -721,4 +721,35 @@ fn help_displays_nymph_as_the_program_name() {
 		"stdout was: {}",
 		out.stdout
 	);
+}
+
+#[test]
+fn help_omits_package_management_commands() {
+	let out = nymph(&["--help"]);
+
+	assert!(out.status.success());
+	for command in ["add", "install", "remove", "search"] {
+		assert!(
+			!out
+				.stdout
+				.lines()
+				.any(|line| line.trim_start().starts_with(command)),
+			"help unexpectedly advertised `{command}`:\n{}",
+			out.stdout
+		);
+	}
+}
+
+#[test]
+fn package_management_commands_are_unknown() {
+	for command in ["add", "install", "remove", "search"] {
+		let out = nymph(&[command]);
+
+		assert_eq!(out.status.code(), Some(2), "command: {command}");
+		assert!(
+			out.stderr.contains("unrecognized subcommand"),
+			"`{command}` should be unknown, stderr was: {}",
+			out.stderr
+		);
+	}
 }
