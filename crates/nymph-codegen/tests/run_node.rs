@@ -571,6 +571,46 @@ fn runs_match_union() {
 }
 
 #[test]
+fn bound_union_exposes_the_binding_and_evaluates_the_scrutinee_once() {
+	let src = r#"
+		struct Counter(n: int) {}
+		impl Counter {
+			mut func next(): int = {
+				this.n = this.n + 1
+				2
+			}
+		}
+		func capture(): #(int, int) = {
+			let mut counter = Counter(n = 0)
+			let selected = match (counter.next()) {
+				(x = 1 | x = 2) -> x,
+				_ -> 0,
+			}
+			#(selected, counter.n as int)
+		}
+	"#;
+	assert_eq!(run(src, "capture()"), "[ 2, 1 ]");
+}
+
+#[test]
+fn bound_union_selects_each_binding_from_the_matching_alternative() {
+	let src = r#"
+		func select(value: #(int, int)): #(int, int) = match (value) {
+			#(x = 1, y = 2) | #(y = 3, x = 4) -> #(x, y),
+			_ -> #(0, 0),
+		}
+	"#;
+	assert_eq!(
+		run(src, "select(new NTuple([new NInt(1), new NInt(2)]))"),
+		"[ 1, 2 ]"
+	);
+	assert_eq!(
+		run(src, "select(new NTuple([new NInt(3), new NInt(4)]))"),
+		"[ 4, 3 ]"
+	);
+}
+
+#[test]
 fn runs_struct_method_with_this() {
 	// An inherent method emits as a class method; `this` reads the instance's fields.
 	let src = r#"
@@ -3746,4 +3786,16 @@ fn positional_literal_and_binding_subpatterns_run() {
 	assert_eq!(run(src, "lit()"), "500");
 	assert_eq!(run(src, "bound()"), "8");
 	assert_eq!(run(src, "nil()"), "0");
+}
+
+#[test]
+fn pattern_binding_exposes_whole_value_and_nested_captures() {
+	let src = "func capture(value: #(int, int)): #(int, int, int) = match (value) {\n\twhole = #(left, right) -> #(whole[0], left, right),\n}\nfunc captured(): #(int, int, int) = capture(#(4, 7))";
+	assert_eq!(run(src, "captured()"), "[ 4, 4, 7 ]");
+}
+
+#[test]
+fn pattern_binding_evaluates_the_scrutinee_once() {
+	let src = "struct Counter(n: int) {}\nimpl Counter {\n\tmut func next(): #(int, int) = {\n\t\tthis.n = this.n + 1\n\t\t#(1, 7)\n\t}\n}\nfunc capture(): #(int, int, int) = {\n\tlet mut counter = Counter(n = 0)\n\tmatch (counter.next()) {\n\t\twhole = #(left, _) -> #(counter.n as int, whole[0], left),\n\t}\n}";
+	assert_eq!(run(src, "capture()"), "[ 1, 1, 1 ]");
 }

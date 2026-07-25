@@ -303,9 +303,18 @@ impl Parser<'_> {
 			return Spanned(Pattern::Struct { path, fields }, self.span_from(start));
 		}
 
-		// A plain binding. Its inner pattern is a wildcard. (The `name = pattern` form
-		// is not a top-level pattern; it only exists as a struct field, handled by
-		// `parse_struct_pattern_field`.)
+		if self.eat(&Token::Eq).is_some() {
+			let inner = self.parse_range_pattern();
+			return Spanned(
+				Pattern::Binding {
+					name: first,
+					inner: Box::new(inner),
+				},
+				self.span_from(start),
+			);
+		}
+
+		// A plain binding has an implicit wildcard sub-pattern.
 		let span = self.span_from(start);
 		Spanned(
 			Pattern::Binding {
@@ -354,5 +363,40 @@ impl Parser<'_> {
 	/// union or range (those only make sense in `match`).
 	pub(super) fn parse_binding_pattern(&mut self) -> Spanned<Pattern> {
 		self.parse_pattern_primary()
+	}
+
+	/// Parse the pattern before a `let` initializer. A bare `name = value` uses
+	/// that `=` as the initializer delimiter; `name = pattern = value` has a
+	/// second top-level `=` and therefore uses the first one as a subpattern.
+	pub(super) fn parse_let_binding_pattern(&mut self) -> Spanned<Pattern> {
+		if matches!(self.peek(), Some(Token::Identifier(_))) && self.peek_nth(1) == Some(&Token::Eq) {
+			let position = self.position();
+			let diagnostics = self.diagnostics.len();
+			let candidate = self.parse_binding_pattern();
+			if self.check(&Token::Eq) {
+				return candidate;
+			}
+			let candidate_end = self.position();
+			if self.eat(&Token::Colon).is_some() {
+				self.parse_type();
+				if self.check(&Token::Eq) {
+					self.cursor.restore(candidate_end);
+					self.diagnostics.truncate(diagnostics);
+					return candidate;
+				}
+			}
+			self.cursor.restore(position);
+			self.diagnostics.truncate(diagnostics);
+			let name = self.expect_ident();
+			let span = name.1;
+			return Spanned(
+				Pattern::Binding {
+					name,
+					inner: Box::new(Spanned(Pattern::Placeholder, span)),
+				},
+				span,
+			);
+		}
+		self.parse_binding_pattern()
 	}
 }

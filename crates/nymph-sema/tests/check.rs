@@ -48,6 +48,47 @@ fn simple_annotated_function() {
 }
 
 #[test]
+fn binding_subpattern_exposes_outer_and_nested_types() {
+	assert_ok(
+		"func sum(value: #(int, int)): int = match (value) {
+		   whole = #(left, right) -> whole[0] + left + right,
+		 }",
+	);
+}
+
+#[test]
+fn binding_subpattern_duplicate_names_are_rejected_recursively() {
+	assert_error_contains(
+		"func bad(value: #(int, int)): int = match (value) {
+		   same = #(same, _) -> 0,
+		 }",
+		"bound more than once",
+	);
+}
+
+#[test]
+fn binding_subpattern_union_requires_consistent_bindings() {
+	assert_error_contains(
+		"func bad(value: int): int = match (value) {
+		   (left = 1 | right = 2) -> 0,
+		   _ -> 1,
+		 }",
+		"same names",
+	);
+}
+
+#[test]
+fn binding_subpattern_union_requires_compatible_binding_types() {
+	assert_error_contains(
+		"enum Value { Number(value: int), Text(value: string) }
+		 func bad(value: Value): int = match (value) {
+		   Number(x) | Text(x) -> 0,
+		 }",
+		"mismatched types",
+	);
+}
+
+#[test]
 fn return_type_mismatch_is_reported() {
 	assert_error_contains("func bad(): int = true", "mismatched types");
 }

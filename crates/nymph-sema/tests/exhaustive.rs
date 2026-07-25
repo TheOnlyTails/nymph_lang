@@ -46,6 +46,22 @@ fn assert_error_contains(source: &str, needle: &str) {
 const OPT: &str = "enum Opt<T> { Some(value: T), None }\n";
 
 #[test]
+fn binding_subpatterns_are_transparent_to_exhaustiveness_and_refutability() {
+	assert_ok(
+		"func f(value: boolean): int = match (value) {
+		   whole = true -> 1,
+		   nested = false -> 0,
+		 }",
+	);
+	assert_error_contains(
+		"func f(value: boolean): int = match (value) {
+		   whole = true -> 1,
+		 }",
+		"non-exhaustive",
+	);
+}
+
+#[test]
 fn missing_enum_variant_is_non_exhaustive() {
 	let src = format!(
 		"{OPT}

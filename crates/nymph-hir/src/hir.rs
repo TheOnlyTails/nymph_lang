@@ -608,7 +608,7 @@ pub enum HirPat {
 	},
 	/// A range pattern over scalar bounds.
 	Range(HirRange),
-	/// `A | B` — matches if either side matches (3B: neither side binds).
+	/// `A | B` — matches if either side matches. Both sides bind the same names.
 	Or(Box<HirPat>, Box<HirPat>),
 }
 

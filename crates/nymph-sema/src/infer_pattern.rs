@@ -6,8 +6,7 @@
 //! and `is`) differ only in the mutability the introduced bindings get.
 //!
 //! Exhaustiveness of `match` is checked separately (`exhaustive.rs`), which is what
-//! lets codegen assume totality and drop the final arm's test. Checking that union
-//! arms bind identical names is still pending.
+//! lets codegen assume totality and drop the final arm's test.
 
 use nymph_ast::{
 	Ident, Span, Spanned,
@@ -19,6 +18,7 @@ use crate::def::DefKind;
 use crate::errors::TypeError;
 use crate::ids::DefId;
 use crate::ty::Ty;
+use rustc_hash::FxHashMap;
 
 /// What a struct/enum pattern's path resolved to.
 enum PatternTarget {
@@ -26,16 +26,128 @@ enum PatternTarget {
 	Variant(DefId, usize),
 }
 
+fn insert_pattern_binding(
+	name: &Ident,
+	bindings: &mut FxHashMap<ecow::EcoString, Span>,
+	emit: &mut impl FnMut(Span, TypeError),
+) {
+	if bindings.insert(name.0.clone(), name.1).is_some() {
+		emit(
+			name.1,
+			TypeError::DuplicatePatternBinding {
+				name: name.0.clone(),
+			},
+		);
+	}
+}
+
+fn collect_pattern_bindings(
+	pattern: &Spanned<Pattern>,
+	bindings: &mut FxHashMap<ecow::EcoString, Span>,
+	is_variant: &impl Fn(Span) -> bool,
+	emit: &mut impl FnMut(Span, TypeError),
+) {
+	match &pattern.0 {
+		Pattern::Binding { name, inner } => {
+			if !is_variant(pattern.1) {
+				insert_pattern_binding(name, bindings, emit);
+			}
+			collect_pattern_bindings(inner, bindings, is_variant, emit);
+		}
+		Pattern::List(entries) | Pattern::Tuple(entries) => {
+			for entry in entries {
+				match &entry.0 {
+					ListPatternEntry::Item(item) => {
+						collect_pattern_bindings(item, bindings, is_variant, emit);
+					}
+					ListPatternEntry::Rest(Some(name)) => {
+						insert_pattern_binding(name, bindings, emit);
+					}
+					ListPatternEntry::Rest(None) => {}
+				}
+			}
+		}
+		Pattern::Map(entries) => {
+			for entry in entries {
+				match &entry.0 {
+					MapPatternEntry::Entry(key, value) => {
+						collect_pattern_bindings(key, bindings, is_variant, emit);
+						collect_pattern_bindings(value, bindings, is_variant, emit);
+					}
+					MapPatternEntry::Rest(Some(name)) => {
+						insert_pattern_binding(name, bindings, emit);
+					}
+					MapPatternEntry::Rest(None) => {}
+				}
+			}
+		}
+		Pattern::Struct { fields, .. } => {
+			for field in fields {
+				match &field.0 {
+					StructPatternField::Value { value, .. } | StructPatternField::Positional(value) => {
+						collect_pattern_bindings(value, bindings, is_variant, emit);
+					}
+					StructPatternField::Named(name) => {
+						insert_pattern_binding(name, bindings, emit);
+					}
+					StructPatternField::Rest => {}
+				}
+			}
+		}
+		Pattern::Union(left, right) => {
+			let mut left_bindings = FxHashMap::default();
+			let mut right_bindings = FxHashMap::default();
+			collect_pattern_bindings(left, &mut left_bindings, is_variant, emit);
+			collect_pattern_bindings(right, &mut right_bindings, is_variant, emit);
+			if left_bindings.keys().collect::<rustc_hash::FxHashSet<_>>()
+				!= right_bindings.keys().collect::<rustc_hash::FxHashSet<_>>()
+			{
+				emit(pattern.1, TypeError::InconsistentUnionBindings);
+			}
+			for (name, span) in left_bindings {
+				if bindings.insert(name.clone(), span).is_some() {
+					emit(span, TypeError::DuplicatePatternBinding { name });
+				}
+			}
+		}
+		Pattern::Grouped(inner) => collect_pattern_bindings(inner, bindings, is_variant, emit),
+		Pattern::Int(_)
+		| Pattern::UInt(_)
+		| Pattern::Float(_)
+		| Pattern::Char(_)
+		| Pattern::String(_)
+		| Pattern::Boolean(_)
+		| Pattern::Range(_)
+		| Pattern::Placeholder => {}
+	}
+}
+
 impl Checker<'_> {
 	/// Check a pattern in a `let`/parameter position, introducing bindings with the
 	/// given mutability.
 	pub(crate) fn bind_pattern(&mut self, pattern: &Spanned<Pattern>, ty: Ty, mutable: bool) {
 		self.pattern(pattern, ty, mutable);
+		self.validate_pattern_bindings(pattern);
 	}
 
 	/// Check a pattern in a `match`/`is` position; bindings are immutable.
 	pub(crate) fn check_pattern(&mut self, pattern: &Spanned<Pattern>, ty: Ty) {
 		self.pattern(pattern, ty, false);
+		self.validate_pattern_bindings(pattern);
+	}
+
+	fn validate_pattern_bindings(&mut self, pattern: &Spanned<Pattern>) {
+		let mut bindings = FxHashMap::default();
+		let mut errors = Vec::new();
+		collect_pattern_bindings(
+			pattern,
+			&mut bindings,
+			&|span| self.annotations.pattern_variant_of(span).is_some(),
+			&mut |span, error| errors.push((span, error)),
+		);
+		for (span, error) in errors {
+			self.emit(span, error);
+		}
 	}
 
 	fn pattern(&mut self, pattern: &Spanned<Pattern>, ty: Ty, mutable: bool) {
@@ -90,10 +202,7 @@ impl Checker<'_> {
 				self.unify(shape, t, span);
 			}
 			Pattern::Grouped(inner) => self.pattern(inner, ty, mutable),
-			Pattern::Union(a, b) => {
-				self.pattern(a, ty, mutable);
-				self.pattern(b, ty, mutable);
-			}
+			Pattern::Union(left, right) => self.pattern_union(left, right, ty, mutable, span),
 			Pattern::Range(_) => {
 				// A range pattern constrains an ordered scrutinee; Milestone A leaves
 				// the type as-is (it is typically already known to be numeric).
@@ -210,6 +319,35 @@ impl Checker<'_> {
 				}
 			}
 			Pattern::Struct { path, fields } => self.pattern_struct(path, fields, shape, span, mutable),
+		}
+	}
+
+	fn pattern_union(
+		&mut self,
+		left: &Spanned<Pattern>,
+		right: &Spanned<Pattern>,
+		ty: Ty,
+		mutable: bool,
+		span: Span,
+	) {
+		self.push_scope();
+		self.pattern(left, ty, mutable);
+		let left_bindings = self.scopes.pop().unwrap_or_default();
+
+		self.push_scope();
+		self.pattern(right, ty, mutable);
+		let mut right_bindings = self.scopes.pop().unwrap_or_default();
+
+		// Each alternative is checked in isolation: a binding from one branch must
+		// neither overwrite the other branch's type nor leak into the enclosing
+		// pattern scope. Name-set validation remains in `collect_pattern_bindings`;
+		// here, merge the names common to both alternatives and require their types
+		// to agree before exposing one binding to the arm body.
+		for (name, left_binding) in left_bindings {
+			if let Some(right_binding) = right_bindings.remove(&name) {
+				self.unify(left_binding.ty, right_binding.ty, span);
+			}
+			self.define_local(name, left_binding.ty, mutable);
 		}
 	}
 

@@ -443,6 +443,72 @@ fn merged_bang_keywords_parse_in_outer_and_nested_interpolation() {
 }
 
 #[test]
+fn binding_subpattern_parses_in_every_pattern_position() {
+	let ExprKind::PatternOp { rhs, .. } = expr("value is whole = #(head, tail)").kind else {
+		panic!("expected pattern operator");
+	};
+	assert!(matches!(
+		rhs.0,
+		Pattern::Binding { ref name, ref inner }
+			if name.0 == "whole" && matches!(inner.0, Pattern::Tuple(_))
+	));
+
+	for source in [
+		"value is item = 1",
+		"value is #(pair = #(left, right), list = #[head, ...tail])",
+		"value is grouped = (1 | 2)",
+		"value is left = 1 | right = 2",
+		"match (value) { whole = 1 -> whole, _ -> 0 }",
+		"{ let whole = #(left, right) = #(1, 2) whole }",
+		"(whole = #(left, right)) -> left",
+	] {
+		let result = parse_expression(source);
+		assert!(
+			result.diagnostics.is_empty(),
+			"unexpected diagnostics for {source:?}: {:?}",
+			result.diagnostics
+		);
+	}
+
+	module_ok("struct Box(value: int)\nfunc get(whole = Box(value): Box): int = value");
+}
+
+#[test]
+fn annotated_let_binding_subpattern_is_disambiguated_from_the_initializer() {
+	for source in [
+		"let whole = #(a, b): #(int, int) = #(1, 2)",
+		"func f(value: #(int, int)): int = { let whole = #(a, b): #(int, int) = value a + b }",
+	] {
+		let result = parse_module(source, "test");
+		assert!(
+			result.diagnostics.is_empty(),
+			"unexpected diagnostics for {source:?}: {:?}",
+			result.diagnostics
+		);
+	}
+
+	// The first `=` remains the initializer delimiter for an ordinary annotated let.
+	module_ok("let whole: #(int, int) = #(1, 2)");
+}
+
+#[test]
+fn binding_subpattern_inside_struct_field_retains_field_selection() {
+	let ExprKind::PatternOp { rhs, .. } = expr("value is Box(value = captured = 1)").kind else {
+		panic!("expected pattern operator");
+	};
+	let Pattern::Struct { fields, .. } = rhs.0 else {
+		panic!("expected struct pattern");
+	};
+	assert!(matches!(
+		&fields[0].0,
+		nymph_ast::expr::StructPatternField::Value { name, value }
+			if name.0 == "value"
+				&& matches!(&value.0, Pattern::Binding { name, inner }
+					if name.0 == "captured" && matches!(inner.0, Pattern::Int(_)))
+	));
+}
+
+#[test]
 fn let_and_func_declarations() {
 	let members = module_ok("let x = 1\nfunc add(a: int, b: int): int = a + b");
 	assert_eq!(members.len(), 2);

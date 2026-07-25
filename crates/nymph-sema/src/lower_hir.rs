@@ -223,6 +223,8 @@ fn lower_hir_impl(
 		interfaces_by_name,
 		scopes: RefCell::new(Vec::new()),
 		rename_counters: RefCell::new(FxHashMap::default()),
+		pattern_declaration_records: RefCell::new(Vec::new()),
+		pattern_declaration_reuse: RefCell::new(Vec::new()),
 		generics_stack: RefCell::new(Vec::new()),
 		closure_depth: std::cell::Cell::new(0),
 		this_sub: RefCell::new(Vec::new()),
@@ -286,6 +288,11 @@ struct Lowerer<'a> {
 	/// same suffix an ancestor scope already renamed to would just reintroduce
 	/// the identical TDZ hazard one level deeper).
 	rename_counters: RefCell<FxHashMap<EcoString, u32>>,
+	/// Declaration mappings recorded while lowering the left side of a union,
+	/// then reused by its right side. Sema guarantees both alternatives bind the
+	/// same source names, so they must also share one emitted JS binding name.
+	pattern_declaration_records: RefCell<Vec<FxHashMap<EcoString, EcoString>>>,
+	pattern_declaration_reuse: RefCell<Vec<FxHashMap<EcoString, EcoString>>>,
 	/// The enclosing func/method's OWN generic type-parameter names, pushed
 	/// while lowering its body (Slice 4J, Task 1 Finding 3). Lowering is
 	/// type-free and has no representation for a namespaced call resolved
@@ -804,6 +811,25 @@ impl<'a> Lowerer<'a> {
 	/// would just reproduce the identical TDZ hazard one level deeper. Must be
 	/// called with at least one scope pushed.
 	fn declare(&self, name: &EcoString) -> EcoString {
+		if let Some(mapped) = self
+			.pattern_declaration_reuse
+			.borrow()
+			.last()
+			.and_then(|bindings| bindings.get(name))
+			.cloned()
+		{
+			self
+				.scopes
+				.borrow_mut()
+				.last_mut()
+				.expect("pattern declaration outside a scope")
+				.current
+				.insert(name.clone(), mapped.clone());
+			for record in self.pattern_declaration_records.borrow_mut().iter_mut() {
+				record.insert(name.clone(), mapped.clone());
+			}
+			return mapped;
+		}
 		let mut scopes = self.scopes.borrow_mut();
 		let shadows_active_binding = scopes.iter().any(|s| s.current.contains_key(name));
 		// Named-type prelude method lowering: a Nymph parameter/`let`
@@ -825,7 +851,7 @@ impl<'a> Lowerer<'a> {
 		let scope = scopes
 			.last_mut()
 			.expect("slice-4e lowering: declare() called outside any pushed scope");
-		if needs_rename {
+		let declared = if needs_rename {
 			let mut counters = self.rename_counters.borrow_mut();
 			let suffix = counters.entry(name.clone()).or_insert(0);
 			*suffix += 1;
@@ -835,7 +861,11 @@ impl<'a> Lowerer<'a> {
 		} else {
 			scope.current.insert(name.clone(), name.clone());
 			name.clone()
+		};
+		for record in self.pattern_declaration_records.borrow_mut().iter_mut() {
+			record.insert(name.clone(), declared.clone());
 		}
+		declared
 	}
 
 	/// Resolve an identifier reference through the JS-scope stack, innermost
@@ -4642,15 +4672,19 @@ impl<'a> Lowerer<'a> {
 			}
 			Pattern::Range(kind) => HirPat::Range(lower_range_pattern(kind)),
 			Pattern::Union(a, b) => {
-				// A union whose sides bind would need cross-branch consistent-name analysis
-				// (which the checker doesn't yet do); 3B rejects it here rather than in
-				// codegen so the failure is a clear lowering panic like every other deferral.
+				self
+					.pattern_declaration_records
+					.borrow_mut()
+					.push(FxHashMap::default());
 				let a = self.lower_pattern(a);
+				let bindings = self
+					.pattern_declaration_records
+					.borrow_mut()
+					.pop()
+					.expect("union declaration record was pushed");
+				self.pattern_declaration_reuse.borrow_mut().push(bindings);
 				let b = self.lower_pattern(b);
-				assert!(
-					!pat_binds(&a) && !pat_binds(&b),
-					"slice-3b lowering does not yet handle union patterns that bind"
-				);
+				self.pattern_declaration_reuse.borrow_mut().pop();
 				HirPat::Or(Box::new(a), Box::new(b))
 			}
 		}
@@ -5570,29 +5604,6 @@ fn lower_lit_pattern(pat: &nymph_ast::Spanned<nymph_ast::expr::Pattern>) -> HirL
 		Pattern::String(parts) => HirLit::Str(lower_string_pattern(parts)),
 		Pattern::Grouped(inner) => lower_lit_pattern(inner),
 		other => panic!("slice-3b expects a literal pattern (map key / range bound), got {other:?}"),
-	}
-}
-
-/// Whether a lowered pattern introduces any binding — used to reject binding
-/// unions, which 3B does not support.
-fn pat_binds(pat: &HirPat) -> bool {
-	match pat {
-		HirPat::Wildcard | HirPat::Lit(_) | HirPat::Range(_) => false,
-		HirPat::Binding { .. } => true,
-		HirPat::Variant { fields, .. } | HirPat::Struct { fields } => {
-			fields.iter().any(|(_, p)| pat_binds(p))
-		}
-		HirPat::Tuple(ps) => ps.iter().any(pat_binds),
-		HirPat::List {
-			prefix,
-			rest,
-			suffix,
-			..
-		} => matches!(rest, Some(Some(_))) || prefix.iter().chain(suffix).any(pat_binds),
-		HirPat::Map { entries, rest } => {
-			matches!(rest, Some(Some(_))) || entries.iter().any(|(_, p)| pat_binds(p))
-		}
-		HirPat::Or(a, b) => pat_binds(a) || pat_binds(b),
 	}
 }
 

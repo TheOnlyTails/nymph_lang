@@ -37,6 +37,13 @@ enum Subject {
 	/// minus the named keys: `new NMap(<base>)` when `keys` is empty, else an
 	/// IIFE that copies then deletes each key.
 	MapRest(Box<Subject>, Vec<HirLit>),
+	/// Select the subject bound by the matching side of a union pattern.
+	PatternSelect {
+		left_pattern: Box<HirPat>,
+		pattern_subject: Box<Subject>,
+		left: Box<Subject>,
+		right: Box<Subject>,
+	},
 }
 
 /// Intermediate representation for expression-valued code.
@@ -2101,6 +2108,24 @@ impl<'a> Emitter<'a> {
 				};
 				value.into_expression(self.ast)
 			}
+			Subject::PatternSelect {
+				left_pattern,
+				pattern_subject,
+				left,
+				right,
+			} => {
+				let (test, _) = self.compile_pat(left_pattern, pattern_subject);
+				match test {
+					Some(test) => Expression::new_conditional_expression(
+						SPAN,
+						test,
+						self.emit_subject(left),
+						self.emit_subject(right),
+						&self.ast,
+					),
+					None => self.emit_subject(left),
+				}
+			}
 		}
 	}
 
@@ -2341,15 +2366,29 @@ impl<'a> Emitter<'a> {
 			}
 			// A range pattern: bound comparisons against the subject.
 			HirPat::Range(range) => (Some(self.compile_range(range, subj)), Vec::new()),
-			// A union: matches if either side matches. 3B unions bind nothing.
+			// A union matches if either side matches. Sema/lowering guarantee both
+			// alternatives bind the same emitted names; select each value from the
+			// side whose test matched.
 			HirPat::Or(a, b) => {
 				let (ta, ba) = self.compile_pat(a, subj);
 				let (tb, bb) = self.compile_pat(b, subj);
-				// Lowering already rejects binding unions; this is a defensive check.
-				debug_assert!(
-					ba.is_empty() && bb.is_empty(),
-					"union patterns cannot bind (should be rejected in lowering)"
-				);
+				let mut right_by_name: std::collections::HashMap<_, _> = bb.into_iter().collect();
+				let binds = ba
+					.into_iter()
+					.map(|(name, left)| {
+						let right = right_by_name
+							.remove(&name)
+							.expect("union alternatives must bind the same names");
+						let selected = Subject::PatternSelect {
+							left_pattern: a.clone(),
+							pattern_subject: Box::new(subj.clone()),
+							left: Box::new(left),
+							right: Box::new(right),
+						};
+						(name, selected)
+					})
+					.collect();
+				debug_assert!(right_by_name.is_empty());
 				// A `None` sub-test means that side is irrefutable ⇒ the whole `Or` is.
 				let test = match (ta, tb) {
 					(Some(a), Some(b)) => Some(Expression::new_logical_expression(
@@ -2361,7 +2400,7 @@ impl<'a> Emitter<'a> {
 					)),
 					_ => None,
 				};
-				(test, Vec::new())
+				(test, binds)
 			}
 		}
 	}

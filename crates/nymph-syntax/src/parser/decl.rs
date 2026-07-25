@@ -193,7 +193,7 @@ impl Parser<'_> {
 		} else {
 			LetKind::Instance
 		};
-		let name = self.parse_binding_pattern();
+		let name = self.parse_let_binding_pattern();
 		let type_ = if self.eat(&Token::Colon).is_some() {
 			Some(self.parse_type())
 		} else {

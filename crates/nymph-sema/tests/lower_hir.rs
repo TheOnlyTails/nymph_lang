@@ -605,18 +605,41 @@ fn lowers_full_patterns_and_guards() {
 }
 
 #[test]
-#[should_panic(expected = "union patterns that bind")]
-fn binding_union_panics_in_lowering() {
-	// A union whose side binds (`A(n) | B`) type-checks but is deferred; lowering
-	// panics loudly rather than silently miscompiling. This pins that behavior.
-	lower(
-		r#"
-		enum E { A(n: int), B }
-		func f(e: E): int = match (e) {
-			A(n) | B -> 0,
-		}
-		"#,
+fn lowers_whole_and_nested_binding_subpatterns() {
+	let hir = lower(
+		"func f(value: #(int, int)): int = match (value) {
+		   whole = #(left, right) -> left + right,
+		 }",
 	);
+	let HirExpr::Match { arms, .. } = &hir.funcs[0].body else {
+		panic!("expected match");
+	};
+	assert!(matches!(
+		&arms[0].pat,
+		HirPat::Binding { name, sub: Some(sub) }
+			if name == "whole"
+				&& matches!(sub.as_ref(), HirPat::Tuple(items)
+					if matches!(&items[0], HirPat::Binding { name, .. } if name == "left")
+						&& matches!(&items[1], HirPat::Binding { name, .. } if name == "right"))
+	));
+}
+
+#[test]
+fn lowers_consistently_bound_union_patterns() {
+	let hir = lower(
+		"func f(value: int): int = match (value) {
+		   (x = 1 | x = 2) -> x,
+		   _ -> 0,
+		 }",
+	);
+	let HirExpr::Match { arms, .. } = &hir.funcs[0].body else {
+		panic!("expected match");
+	};
+	let HirPat::Or(left, right) = &arms[0].pat else {
+		panic!("expected union pattern");
+	};
+	assert!(matches!(left.as_ref(), HirPat::Binding { name, .. } if name == "x"));
+	assert!(matches!(right.as_ref(), HirPat::Binding { name, .. } if name == "x"));
 }
 
 #[test]

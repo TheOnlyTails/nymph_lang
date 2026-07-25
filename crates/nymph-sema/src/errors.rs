@@ -326,6 +326,11 @@ pub enum TypeError {
 	/// values. Floating-point and other `Comparable` values do not define that
 	/// progression. New variant appended at the enum's end (mints 2063).
 	InvalidRangeBound { ty: String },
+
+	/// One destructuring pattern binds the same local more than once.
+	DuplicatePatternBinding { name: EcoString },
+	/// The alternatives of a union pattern introduce different locals.
+	InconsistentUnionBindings,
 }
 
 impl IntoDiagnostic for TypeError {
@@ -458,6 +463,12 @@ impl IntoDiagnostic for TypeError {
 
 			E::DuplicateMember { name, ty, .. } => {
 				format!("`{name}` is defined more than once on `{ty}`").into()
+			}
+			E::DuplicatePatternBinding { name } => {
+				format!("`{name}` is bound more than once in this pattern").into()
+			}
+			E::InconsistentUnionBindings => {
+				"both sides of a union pattern must bind the same names".into()
 			}
 
 			E::MainMissing => "no `main` function found".into(),

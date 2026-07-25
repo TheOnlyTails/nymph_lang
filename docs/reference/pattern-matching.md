@@ -26,12 +26,30 @@ func classify(s: string): int = match (s) {
 ## Bindings and the wildcard
 
 A bare identifier binds the whole matched value under that name; `_` matches anything and binds
-nothing.
+nothing. `name = pattern` also binds the whole value to `name`, while requiring the nested pattern
+to match. Binding subpatterns can appear anywhere a pattern can, and can be nested to retain both a
+structured value and its parts.
 
 ```nym
 func first_or(xs: #[int], fallback: int): int = match (xs) {
   #[] -> fallback,
   n -> n[0],
+}
+```
+
+```nym
+func endpoints(pair: #(int, int)): int = match (pair) {
+  whole = #(first, last) -> whole[0] + first + last,
+}
+```
+
+Each name may be bound only once in a pattern. Both alternatives of a union must bind the same
+names; put a binding around a grouped union when both alternatives should capture the whole value:
+
+```nym
+func one_or_two(n: int): int = match (n) {
+  matched = (1 | 2) -> matched,
+  _ -> 0,
 }
 ```
 
@@ -91,6 +109,11 @@ func route(n: int, limit: int): int = match (n) {
 shorthand for binding it under its own name; `field = pattern` matches that field against a nested
 pattern (and is also how you bind it under a *different* name than its own). `...` matches the rest
 of the fields without binding them.
+
+Inside a struct or variant's field list, the name to the left of the first `=` selects the field;
+it is not a whole-value binding. A nested `name = pattern` on the right retains its general binding
+meaning: `Point(x = captured = 0, y = _)` selects `x`, binds that field value as `captured`, and
+requires it to equal `0`.
 
 ```nym
 struct Point(x: int, y: int)
