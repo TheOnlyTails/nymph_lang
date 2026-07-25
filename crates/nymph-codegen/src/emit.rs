@@ -13,6 +13,18 @@ use nymph_hir::hir::{
 
 use crate::box_rt;
 
+fn linked_local_name(module: &str, symbol: &str) -> String {
+	let module = module.strip_suffix("$intrinsics").unwrap_or(module);
+	let has_cross_module_collision = nymph_hir::linkage::REGISTRY
+		.iter()
+		.any(|(_, linked)| linked.symbol == symbol && linked.module != module);
+	if has_cross_module_collision {
+		format!("{symbol}${}", module.replace('/', "$"))
+	} else {
+		symbol.to_string()
+	}
+}
+
 /// A re-emittable reference to a sub-value of the scrutinee, used while compiling a
 /// pattern. oxc expression nodes are arena values that can't be cheaply cloned, so
 /// pattern bindings and tests carry a `Subject` (which re-emits a fresh expression
@@ -241,14 +253,15 @@ impl<'a> Emitter<'a> {
 		}
 	}
 
-	/// Build `import { <symbol> } from "<module_specifier>";` (Gap 3, L0).
+	/// Build `import { <symbol> as <local> } from "<module_specifier>";` (Gap 3, L0).
 	fn build_import_statement(&self, module_specifier: &str, symbol: &str) -> Statement<'a> {
 		let imported = ModuleExportName::IdentifierName(IdentifierName::new(
 			SPAN,
 			self.ast.allocator.alloc_str(symbol),
 			&self.ast,
 		));
-		let local = BindingIdentifier::new(SPAN, self.ast.allocator.alloc_str(symbol), &self.ast);
+		let local_name = linked_local_name(module_specifier, symbol);
+		let local = BindingIdentifier::new(SPAN, self.ast.allocator.alloc_str(&local_name), &self.ast);
 		let mut specifiers = ArenaVec::new_in(&self.ast);
 		specifiers.push(ImportDeclarationSpecifier::ImportSpecifier(
 			ImportSpecifier::boxed(SPAN, imported, local, ImportOrExportKind::Value, &self.ast),
@@ -1144,7 +1157,7 @@ impl<'a> Emitter<'a> {
 			.needed_imports
 			.borrow_mut()
 			.insert((import_module, symbol.to_string()));
-		symbol.to_string()
+		linked_local_name(module, symbol)
 	}
 
 	/// The saturating JS runtime mapping for a numeric `ScalarCast` (the change

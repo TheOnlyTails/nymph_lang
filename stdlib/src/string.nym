@@ -2,10 +2,18 @@ import @/option with (Option)
 import @/ops with (Plus, Into, Contains)
 
 impl string {
+  /// Returns the number of Unicode code points. Astral code points count once;
+  /// combining marks count separately.
   external(length) func length(): uint
+  /// Returns the code point at zero-based code-point offset `i`, or `None` when
+  /// `i` is outside the string.
   external(char_at) func char_at(i: uint): Option<char>
+  /// Returns the half-open code-point range `start..end`. Bounds beyond the end
+  /// are clamped and a reversed range is empty.
   external(substring) func substring(start: uint, end: uint): string
+  /// Returns the first matching code-point offset, or `None` when not found.
   external(index_of) func index_of(needle: string): Option<uint>
+  /// Returns the last matching code-point offset, or `None` when not found.
   external(last_index_of) func last_index_of(needle: string): Option<uint>
   external(contains) func contains(needle: string): boolean
   external(starts_with) func starts_with(prefix: string): boolean
@@ -23,7 +31,9 @@ impl string {
   external(concat) func concat(other: string): string
   external(concat_chars) func concat_chars(other: #[char]): string
   external(reversed) func reversed(): string
+  /// Pads on the left to `length` Unicode code points.
   external(pad_start) func pad_start(length: uint, pad: char): string
+  /// Pads on the right to `length` Unicode code points.
   external(pad_end) func pad_end(length: uint, pad: char): string
 
   func is_empty() = this.length() == 0
@@ -31,17 +41,17 @@ impl string {
 
   func is_blank() = this.trim().is_empty()
 
-  /// Returns the first character, or `None` if empty.
+  /// Returns the first Unicode code point, or `None` if empty.
   func first(): Option<char> = this.char_at(0u)
 
-  /// Returns the last character, or `None` if empty.
+  /// Returns the last Unicode code point, or `None` if empty.
   func last(): Option<char> =
     if (this.is_empty()) None else this.char_at(this.length() - 1u)
 
-  /// Returns a substring from `start` to the end.
+  /// Drops the first `n` Unicode code points.
   func drop(n: uint): string = this.substring(n, this.length())
 
-  /// Returns only the first `n` characters.
+  /// Returns only the first `n` Unicode code points.
   func take(n: uint): string = this.substring(0u, n)
 }
 

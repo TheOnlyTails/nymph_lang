@@ -3065,8 +3065,8 @@ fn mixed_int_uint_operators_run_under_node() {
 // that `length` is a LINKED external (Gap 3, L0's one seeded registry entry —
 // see `nymph_hir::linkage::REGISTRY`), `body_calls_unlinked_external` no
 // longer counts it as unlinked, so `is_empty` materializes: its `this.length()`
-// lowers to `HirExpr::ExternCall`, which emits a plain `length($_this)` call
-// plus a deduped `import { length } from "std/collections/list"`. This can't
+// lowers to `HirExpr::ExternCall`, which emits a module-qualified local call
+// plus a deduped import from `std/collections/list`. This can't
 // be RUN directly — `compile_against_real_stdlib` uses the bare `emit`
 // harness, which (per `run_node.rs`'s own module doc) never resolves imports,
 // only string-appends a trailing `console.log`; running an unresolved
@@ -3079,11 +3079,11 @@ fn real_list_is_empty_materializes_once_length_is_linked() {
 	let user = "func f(xs: #[int]): boolean = xs.is_empty()";
 	let js = compile_against_real_stdlib(user);
 	assert!(
-		js.contains("import { length } from \"std/collections/list\""),
+		js.contains("import { length as length$std$collections$list } from \"std/collections/list\""),
 		"expected a linked-external import for `length`, got:\n{js}"
 	);
 	assert!(
-		js.contains("length("),
+		js.contains("length$std$collections$list("),
 		"expected `is_empty`'s materialized body to call the linked `length`, got:\n{js}"
 	);
 	assert!(
@@ -3111,11 +3111,11 @@ fn real_list_get_materializes_once_get_is_linked() {
 	let user = "func f(xs: #[int]): Option<int> = xs.get(0)";
 	let js = compile_against_real_stdlib(user);
 	assert!(
-		js.contains("import { get } from \"std/collections/list\""),
+		js.contains("import { get as get$std$collections$list } from \"std/collections/list\""),
 		"expected a linked-external import for `get`, got:\n{js}"
 	);
 	assert!(
-		js.contains("get("),
+		js.contains("get$std$collections$list("),
 		"expected `f`'s materialized body to call the linked `get`, got:\n{js}"
 	);
 }
@@ -3137,11 +3137,11 @@ fn real_map_get_materializes_once_get_is_linked() {
 	let user = "func f(m: mut #{int: int}): Option<int> = m.get(1)";
 	let js = compile_against_real_stdlib(user);
 	assert!(
-		js.contains("import { get } from \"std/collections/map\""),
+		js.contains("import { get as get$std$collections$map } from \"std/collections/map\""),
 		"expected a linked-external import for `get`, got:\n{js}"
 	);
 	assert!(
-		js.contains("get("),
+		js.contains("get$std$collections$map("),
 		"expected `f`'s materialized body to call the linked `get`, got:\n{js}"
 	);
 }

@@ -24,9 +24,9 @@
 //! materialized prelude method's mangled name — `"list"`/`"mut_list"`/
 //! `"map"`/`"mut_map"`/… ) and an entry only matches when its own
 //! [`Linked::receiver_tag`] is either `None` (an UNAMBIGUOUS marker, safe
-//! against any receiver — `length`/`first`/`last`/`pop` today, each declared
-//! by exactly one collection) or exactly equal to the caller's tag (an
-//! AMBIGUOUS marker like `get`, disambiguated per receiver).
+//! against any receiver — `first`/`last`/`pop` today, each declared by exactly
+//! one collection) or exactly equal to the caller's tag (an AMBIGUOUS marker
+//! like `get` or `length`, disambiguated per receiver).
 //!
 //! `List`'s `mut #[T]` and plain `#[T]` impls both declare `get` against the
 //! SAME `list.ts` symbol (mutability doesn't change how reading an element
@@ -64,13 +64,13 @@ pub struct Linked {
 /// Option-returning `List` intrinsics (`get`/`first`/`last`/`pop`) now that
 /// the Option ABI seam is wired (see `nymph-codegen::strip_ts_to_js`'s
 /// `import_rewrites` and `nymph-compiler::intrinsics`'s injected
-/// `std/option` virtual module) — `get` alone needs `receiver_tag`
+/// `std/option` virtual module) — `get` and `length` need `receiver_tag`
 /// disambiguation (see this module's own doc comment); `first`/`last`/`pop`
 /// are `List`-only in the real stdlib today, so they stay unambiguous.
 ///
 /// L2 links the REST of `list.nym`'s markers. Non-`mut`, non-collision
 /// markers (`slice`/`chunked`/`distinct`/`splice`; `push` on the
-/// `mut` side) stay `receiver_tag: None`, exactly like `length` — no other
+/// `mut` side) stay `receiver_tag: None` — no other
 /// stdlib collection/primitive declares the same bare marker name today.
 /// Every OTHER new row needs `Some(tag)` because a second, DIFFERENT prelude
 /// impl declares the identical bare marker against a different JS
@@ -165,7 +165,15 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 		Linked {
 			module: "std/collections/list",
 			symbol: "length",
-			receiver_tag: None,
+			receiver_tag: Some("list"),
+		},
+	),
+	(
+		"length",
+		Linked {
+			module: "std/collections/list",
+			symbol: "length",
+			receiver_tag: Some("mut_list"),
 		},
 	),
 	(
@@ -712,14 +720,21 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn length_is_linked_to_list_ts_for_any_receiver() {
-		let linked = lookup("length", Some("list")).expect("`length` must be linked in L0");
-		assert_eq!(linked.module, "std/collections/list");
-		assert_eq!(linked.symbol, "length");
-		// Unambiguous marker — matches even a caller with no receiver context
-		// or an unrelated tag, exactly like before this slice.
-		assert!(lookup("length", None).is_some());
-		assert!(lookup("length", Some("map")).is_some());
+	fn length_links_to_the_canonical_module_for_each_supported_receiver() {
+		for receiver in ["list", "mut_list"] {
+			let linked =
+				lookup("length", Some(receiver)).expect("`length` must be linked for list receivers");
+			assert_eq!(linked.module, "std/collections/list");
+			assert_eq!(linked.symbol, "length");
+		}
+
+		let string =
+			lookup("length", Some("string")).expect("`length` must be linked for a string receiver");
+		assert_eq!(string.module, "std/string");
+		assert_eq!(string.symbol, "length");
+
+		assert!(lookup("length", None).is_none());
+		assert!(lookup("length", Some("map")).is_none());
 	}
 
 	#[test]

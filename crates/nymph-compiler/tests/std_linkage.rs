@@ -126,6 +126,34 @@ fn linked_list_length_compiles_bundles_and_runs() {
 	assert_eq!(run_node(&js, "length"), "3");
 }
 
+#[test]
+fn list_and_string_length_use_receiver_specific_canonical_runtime_symbols() {
+	let entry = r#"
+		func list_length(): uint = #[1, 2, 3].length()
+		func string_length(): uint = "A😀éB".length()
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("list and string length calls should compile together");
+
+	assert!(
+		compiled.js.contains("//#region std/collections/list")
+			&& compiled.js.contains("$_this.v.length")
+			&& compiled.js.contains("//#region std/string")
+			&& compiled.js.contains("Array.from($_this.v).length"),
+		"expected both canonical length runtime modules and implementations, got:\n{}",
+		compiled.js
+	);
+
+	let list_call = compiled.entry_symbol("list_length");
+	let string_call = compiled.entry_symbol("string_length");
+	let mut js = compiled.js;
+	js.push_str(&format!("\nconsole.log({list_call}().v);\n"));
+	js.push_str(&format!("\nconsole.log({string_call}().v);\n"));
+	assert_eq!(run_node(&js, "receiver_specific_lengths"), "3\n5");
+}
+
 /// `xs.is_empty()` — real Nymph source whose body transitively calls the
 /// LINKED `length` — now materializes (Gap 3's `body_calls_unlinked_external`
 /// registry subtraction) instead of loud-deferring, and the materialized
@@ -766,8 +794,10 @@ fn ambient_string_convenience_methods_are_nymph_composition() {
 		.expect("ambient string convenience methods should compile from Nymph bodies");
 
 	assert!(
-		compiled.js.contains("i.v < $_this.v.length")
-			&& compiled.js.contains("$_this.v.slice(start.v, end.v)"),
+		compiled.js.contains("Array.from($_this.v)[i.v]")
+			&& compiled
+				.js
+				.contains("Array.from($_this.v).slice(start.v, end.v).join"),
 		"expected first/last/drop/take to compose the char_at and substring primitives:\n{}",
 		compiled.js
 	);
@@ -827,6 +857,82 @@ fn ambient_string_intrinsics_preserve_the_boxed_abi() {
 	assert_eq!(
 		run_node(&js, "string_boxed_abi"),
 		"3\ntrue\nbc\n2\n99\nc\nb\nb"
+	);
+}
+
+/// Inventory of every language-level string API whose argument or result is a
+/// position/extent: `length`, `char_at`, `substring`, `index_of`,
+/// `last_index_of`, `pad_start`, `pad_end`, and the Nymph-derived `first`,
+/// `last`, `drop`, and `take`. Astral scalars count once, while a combining
+/// mark remains a separate code point.
+#[test]
+fn ambient_string_offsets_and_widths_count_unicode_code_points() {
+	let entry = r#"
+		func length(): uint = "A😀éB".length()
+		func empty_length(): uint = "".length()
+		func astral_char(): char = "A😀éB".char_at(1u) ?? 'z'
+		func combining_char(): char = "A😀éB".char_at(3u) ?? 'z'
+		func invalid_char(): char = "A😀éB".char_at(5u) ?? 'z'
+		func slice_mixed(): string = "A😀éB".substring(1u, 4u)
+		func slice_empty(): string = "A😀éB".substring(3u, 3u)
+		func slice_past_end(): string = "A😀éB".substring(4u, 99u)
+		func slice_reversed_bounds(): string = "A😀éB".substring(4u, 2u)
+		func index_astral(): uint = "A😀éB".index_of("😀") ?? 99u
+		func index_combining_sequence(): uint = "A😀éB".index_of("é") ?? 99u
+		func index_missing(): uint = "A😀éB".index_of("x") ?? 99u
+		func last_index_astral(): uint = "😀x😀".last_index_of("😀") ?? 99u
+		func last_index_empty(): uint = "A😀éB".last_index_of("") ?? 99u
+		func first(): char = "😀x".first() ?? 'z'
+		func first_empty(): char = "".first() ?? 'z'
+		func last(): char = "x😀".last() ?? 'z'
+		func last_empty(): char = "".last() ?? 'z'
+		func drop(): string = "A😀éB".drop(2u)
+		func drop_past_end(): string = "A😀éB".drop(99u)
+		func take(): string = "A😀éB".take(4u)
+		func take_past_end(): string = "A😀éB".take(99u)
+		func pad_start_astral(): string = "😀".pad_start(3u, '🚀')
+		func pad_end_astral(): string = "😀".pad_end(3u, '🚀')
+		func pad_combining(): string = "é".pad_start(3u, '.')
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("Unicode string offset inventory should compile");
+	let calls = [
+		"length",
+		"empty_length",
+		"astral_char",
+		"combining_char",
+		"invalid_char",
+		"slice_mixed",
+		"slice_empty",
+		"slice_past_end",
+		"slice_reversed_bounds",
+		"index_astral",
+		"index_combining_sequence",
+		"index_missing",
+		"last_index_astral",
+		"last_index_empty",
+		"first",
+		"first_empty",
+		"last",
+		"last_empty",
+		"drop",
+		"drop_past_end",
+		"take",
+		"take_past_end",
+		"pad_start_astral",
+		"pad_end_astral",
+		"pad_combining",
+	]
+	.map(|name| compiled.entry_symbol(name));
+	let mut js = compiled.js;
+	for call in calls {
+		js.push_str(&format!("\nconsole.log(JSON.stringify({call}().v));\n"));
+	}
+	assert_eq!(
+		run_node(&js, "string_code_point_offsets"),
+		"5\n0\n\"😀\"\n\"́\"\n\"z\"\n\"😀é\"\n\"\"\n\"B\"\n\"\"\n1\n2\n99\n2\n5\n\"😀\"\n\"z\"\n\"😀\"\n\"z\"\n\"éB\"\n\"\"\n\"A😀é\"\n\"A😀éB\"\n\"🚀🚀😀\"\n\"😀🚀🚀\"\n\".é\""
 	);
 }
 

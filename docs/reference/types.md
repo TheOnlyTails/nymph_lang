@@ -22,6 +22,15 @@ Basic types represent a very simple construct, which can be created using a [lit
 - `self`: a reference to the current type being implemented or defined. Invalid outside declarations.
 - Infer `_`: asks the compiler to attempt to fill in the missing type on its own.
 
+String lengths, indices, search offsets, slice bounds, and padding widths are measured in Unicode
+code points. For example, `"A😀".length()` is `2u`, even though the astral `😀` uses a surrogate pair
+in a JavaScript host. Combining marks are separate code points: `"é".length()` is `2u` when written
+as `e` followed by U+0301 COMBINING ACUTE ACCENT. These units are not grapheme clusters or display
+columns, and string operations never split an astral code point.
+
+This language-level rule does not change editor protocol coordinates: the Language Server Protocol
+uses UTF-16 code-unit columns, as required by its default position encoding.
+
 ## Container types
 
 Container types represent data structures containing references to other types, and may also be created
