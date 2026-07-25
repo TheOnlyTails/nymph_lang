@@ -18,8 +18,10 @@
 	"scripts": {
 		"vscode:prepublish": "npm run compile",
 		"compile": "tsc -p ./",
-		"test": "node --test test/*.test.cjs",
 		"watch": "tsc -watch -p ./",
+		"test": "pnpm run compile && node --test test/*.test.cjs && pnpm run test:configuration && pnpm run test:smoke",
+		"test:configuration": "node --test out/test/languageConfiguration.test.js",
+		"test:smoke": "node out/test/runTest.js",
 		"deploy": "vsce publish"
 	},
 	"dependencies": {
@@ -28,7 +30,9 @@
 	"devDependencies": {
 		"@types/node": "^26.1.1",
 		"@types/vscode": "1.100.0",
+		"@vscode/test-electron": "^2.5.2",
 		"@vscode/vsce": "^3.9.2",
+		"jsonc-parser": "^3.3.1",
 		"typescript": "^7.0.2"
 	},
 	"contributes": {
