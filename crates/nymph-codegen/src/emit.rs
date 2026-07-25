@@ -1218,6 +1218,69 @@ impl<'a> Emitter<'a> {
 		self.arrow_iife(param, body, operand)
 	}
 
+	fn numeric_to_char(&self, operand: Expression<'a>, truncate: bool) -> Expression<'a> {
+		let param = self.gensym();
+		let param = self.ast.allocator.alloc_str(&param);
+		let value = || {
+			if truncate {
+				self.math_call("trunc", self.ident(param))
+			} else {
+				self.ident(param)
+			}
+		};
+		let ge_zero = Expression::new_binary_expression(
+			SPAN,
+			value(),
+			BinaryOperator::GreaterEqualThan,
+			self.zero(),
+			&self.ast,
+		);
+		let le_max = Expression::new_binary_expression(
+			SPAN,
+			value(),
+			BinaryOperator::LessEqualThan,
+			self.i64_literal(0x10_FFFF),
+			&self.ast,
+		);
+		let below_surrogates = Expression::new_binary_expression(
+			SPAN,
+			value(),
+			BinaryOperator::LessThan,
+			self.i64_literal(0xD800),
+			&self.ast,
+		);
+		let above_surrogates = Expression::new_binary_expression(
+			SPAN,
+			value(),
+			BinaryOperator::GreaterThan,
+			self.i64_literal(0xDFFF),
+			&self.ast,
+		);
+		let in_range =
+			Expression::new_logical_expression(SPAN, ge_zero, LogicalOperator::And, le_max, &self.ast);
+		let outside_surrogates = Expression::new_logical_expression(
+			SPAN,
+			below_surrogates,
+			LogicalOperator::Or,
+			above_surrogates,
+			&self.ast,
+		);
+		let valid = Expression::new_logical_expression(
+			SPAN,
+			in_range,
+			LogicalOperator::And,
+			outside_surrogates,
+			&self.ast,
+		);
+		let string = || Expression::new_identifier(SPAN, "String", &self.ast);
+		let converted = self.member_call(string(), "fromCodePoint", vec![value()]);
+		// Use the host's canonical `RangeError: Invalid code point` path after our
+		// stricter Unicode-scalar check (JS itself accepts lone surrogates).
+		let rejected = self.member_call(string(), "fromCodePoint", vec![self.i64_literal(-1)]);
+		let body = Expression::new_conditional_expression(SPAN, valid, converted, rejected, &self.ast);
+		self.arrow_iife(param, body, operand)
+	}
+
 	fn emit_expr(&self, expr: &HirExpr) -> Expression<'a> {
 		match expr {
 			// A numeric literal → a boxed `new NInt/NUint/NFloat(<raw>)` (uniform
@@ -1642,24 +1705,41 @@ impl<'a> Emitter<'a> {
 			// nodes over a `Local("Math"/"String"/"Number")` (shadow-proofing a user
 			// local of that name).
 			HirExpr::ScalarCast { kind, operand } => {
-				let operand = self.emit_expr(operand);
+				let operand = self.unwrap_v(self.emit_expr(operand));
 				match kind {
-					ScalarCastKind::SaturatingToInt => self.saturating_scalar_cast(operand, false),
-					ScalarCastKind::SaturatingToUInt => self.saturating_scalar_cast(operand, true),
-					ScalarCastKind::CharToNum => {
+					ScalarCastKind::IdentityInt | ScalarCastKind::ToInt => self.new_box("NInt", operand),
+					ScalarCastKind::IdentityUInt => self.new_box("NUint", operand),
+					ScalarCastKind::IdentityFloat | ScalarCastKind::ToFloat => {
+						self.new_box("NFloat", operand)
+					}
+					ScalarCastKind::IdentityChar => self.new_box("NChar", operand),
+					ScalarCastKind::SaturatingToInt => {
+						let raw = self.saturating_scalar_cast(operand, false);
+						self.new_box("NInt", raw)
+					}
+					ScalarCastKind::SaturatingToUInt => {
+						let raw = self.saturating_scalar_cast(operand, true);
+						self.new_box("NUint", raw)
+					}
+					ScalarCastKind::CharToInt | ScalarCastKind::CharToUInt | ScalarCastKind::CharToFloat => {
 						let zero =
 							Expression::new_numeric_literal(SPAN, 0.0, None, NumberBase::Decimal, &self.ast);
-						self.member_call(operand, "codePointAt", vec![zero])
+						let raw = self.member_call(operand, "codePointAt", vec![zero]);
+						let class = match kind {
+							ScalarCastKind::CharToInt => "NInt",
+							ScalarCastKind::CharToUInt => "NUint",
+							ScalarCastKind::CharToFloat => "NFloat",
+							_ => unreachable!(),
+						};
+						self.new_box(class, raw)
 					}
 					ScalarCastKind::NumToChar => {
-						let string = Expression::new_identifier(SPAN, "String", &self.ast);
-						self.member_call(string, "fromCodePoint", vec![operand])
+						let raw = self.numeric_to_char(operand, false);
+						self.new_box("NChar", raw)
 					}
 					ScalarCastKind::FloatToChar => {
-						let math = Expression::new_identifier(SPAN, "Math", &self.ast);
-						let truncated = self.member_call(math, "trunc", vec![operand]);
-						let string = Expression::new_identifier(SPAN, "String", &self.ast);
-						self.member_call(string, "fromCodePoint", vec![truncated])
+						let raw = self.numeric_to_char(operand, true);
+						self.new_box("NChar", raw)
 					}
 				}
 			}

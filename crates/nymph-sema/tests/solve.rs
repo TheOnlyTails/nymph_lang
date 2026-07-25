@@ -891,6 +891,23 @@ fn cast_from_int_to_char_is_built_in() {
 }
 
 #[test]
+fn invalid_numeric_literals_cannot_be_cast_to_char() {
+	for literal in ["-1", "55296", "57343u", "1114112", "-1.9", "1114112.9"] {
+		assert_error_contains(
+			&format!("func f(): char = {literal} as char"),
+			"not a valid Unicode scalar value",
+		);
+	}
+}
+
+#[test]
+fn valid_numeric_literals_can_be_cast_to_char_after_truncation() {
+	for literal in ["0", "-0.9", "65.9", "55295", "57344", "128512", "1114111"] {
+		assert_ok(&format!("func f(): char = {literal} as char"));
+	}
+}
+
+#[test]
 fn identity_cast_needs_no_into_impl_even_without_into_in_scope() {
 	// `Foo as Foo` is the identity case (`src == target_r`) and short-circuits
 	// before the `Into` lookup entirely — no diagnostic even though this module

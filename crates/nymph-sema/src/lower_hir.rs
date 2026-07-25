@@ -4704,6 +4704,30 @@ impl<'a> Lowerer<'a> {
 		let src_ty = Self::peel_mut(self.interner, src_ty);
 		let target_ty = Self::peel_mut(self.interner, target_ty);
 		match (self.interner.kind(src_ty), self.interner.kind(target_ty)) {
+			(TyKind::Int, TyKind::Int) => HirExpr::ScalarCast {
+				kind: ScalarCastKind::IdentityInt,
+				operand: Box::new(operand),
+			},
+			(TyKind::UInt, TyKind::UInt) => HirExpr::ScalarCast {
+				kind: ScalarCastKind::IdentityUInt,
+				operand: Box::new(operand),
+			},
+			(TyKind::Float, TyKind::Float) => HirExpr::ScalarCast {
+				kind: ScalarCastKind::IdentityFloat,
+				operand: Box::new(operand),
+			},
+			(TyKind::Char, TyKind::Char) => HirExpr::ScalarCast {
+				kind: ScalarCastKind::IdentityChar,
+				operand: Box::new(operand),
+			},
+			(TyKind::UInt, TyKind::Int) => HirExpr::ScalarCast {
+				kind: ScalarCastKind::ToInt,
+				operand: Box::new(operand),
+			},
+			(TyKind::Int | TyKind::UInt, TyKind::Float) => HirExpr::ScalarCast {
+				kind: ScalarCastKind::ToFloat,
+				operand: Box::new(operand),
+			},
 			(TyKind::Float, TyKind::Int) => HirExpr::ScalarCast {
 				kind: ScalarCastKind::SaturatingToInt,
 				operand: Box::new(operand),
@@ -4716,8 +4740,16 @@ impl<'a> Lowerer<'a> {
 				kind: ScalarCastKind::SaturatingToUInt,
 				operand: Box::new(operand),
 			},
-			(TyKind::Char, TyKind::Int | TyKind::UInt | TyKind::Float) => HirExpr::ScalarCast {
-				kind: ScalarCastKind::CharToNum,
+			(TyKind::Char, TyKind::Int) => HirExpr::ScalarCast {
+				kind: ScalarCastKind::CharToInt,
+				operand: Box::new(operand),
+			},
+			(TyKind::Char, TyKind::UInt) => HirExpr::ScalarCast {
+				kind: ScalarCastKind::CharToUInt,
+				operand: Box::new(operand),
+			},
+			(TyKind::Char, TyKind::Float) => HirExpr::ScalarCast {
+				kind: ScalarCastKind::CharToFloat,
 				operand: Box::new(operand),
 			},
 			(TyKind::Int | TyKind::UInt, TyKind::Char) => HirExpr::ScalarCast {

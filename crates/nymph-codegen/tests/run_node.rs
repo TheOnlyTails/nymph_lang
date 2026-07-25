@@ -118,6 +118,20 @@ fn run(src: &str, call: &str) -> String {
 	run_js(compile(src), call)
 }
 
+fn run_failure(src: &str, call: &str) -> String {
+	let mut js = compile(src);
+	js.push_str(&format!("\n{call};\n"));
+	static COUNTER: AtomicU64 = AtomicU64::new(0);
+	let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+	let path =
+		std::env::temp_dir().join(format!("nymph_failure_{}_{unique}.mjs", std::process::id()));
+	std::fs::write(&path, js).unwrap();
+	let output = Command::new("node").arg(&path).output().expect("run node");
+	let _ = std::fs::remove_file(path);
+	assert!(!output.status.success(), "node unexpectedly succeeded");
+	String::from_utf8_lossy(&output.stderr).to_string()
+}
+
 /// Same as [`run`], but `user_src` is checked/lowered against `prelude_src` as a
 /// prelude module (`check_module_with_prelude`/`lower_hir_with_prelude`) — for
 /// driving the collections-materialization payoff under Node.
@@ -2210,24 +2224,24 @@ fn runs_int_to_uint_cast_saturates_via_abs() {
 	// takes `Math.abs` first — `int as uint` used to be a plain no-op (Slice 4K,
 	// HH2); the abs-first rule makes it a real runtime operation now.
 	let src = "func f(n: int): uint = n as uint";
-	assert_eq!(run(src, "f(5)"), "5");
-	assert_eq!(run(src, "f(-1)"), "1");
+	assert_eq!(run(src, "f(new NInt(5))"), "5");
+	assert_eq!(run(src, "f(new NInt(-1))"), "1");
 }
 
 #[test]
 fn runs_int_to_float_and_uint_to_float_casts_as_no_ops() {
 	let src = "func f(n: int): float = n as float\nfunc g(n: uint): float = n as float";
-	assert_eq!(run(src, "f(5)"), "5");
-	assert_eq!(run(src, "g(5)"), "5");
+	assert_eq!(run(src, "f(new NInt(5))"), "5");
+	assert_eq!(run(src, "g(new NUint(5))"), "5");
 }
 
 #[test]
 fn runs_float_to_int_cast_truncating_toward_zero() {
 	// Math.trunc semantics: truncate toward zero, not floor.
 	let src = "func f(x: float): int = x as int";
-	assert_eq!(run(src, "f(3.7)"), "3");
-	assert_eq!(run(src, "f(-3.7)"), "-3");
-	assert_eq!(run(src, "f(0.0)"), "0");
+	assert_eq!(run(src, "f(new NFloat(3.7))"), "3");
+	assert_eq!(run(src, "f(new NFloat(-3.7))"), "-3");
+	assert_eq!(run(src, "f(new NFloat(0.0))"), "0");
 }
 
 #[test]
@@ -2235,8 +2249,8 @@ fn runs_float_to_uint_cast_takes_abs_then_truncates_toward_zero() {
 	// `float as uint` takes `Math.abs` first, so a negative operand saturates to
 	// its absolute value rather than staying negative.
 	let src = "func f(x: float): uint = x as uint";
-	assert_eq!(run(src, "f(3.7)"), "3");
-	assert_eq!(run(src, "f(-3.7)"), "3");
+	assert_eq!(run(src, "f(new NFloat(3.7))"), "3");
+	assert_eq!(run(src, "f(new NFloat(-3.7))"), "3");
 }
 
 #[test]
@@ -2247,9 +2261,9 @@ fn float_to_int_cast_saturates_nan_and_infinity() {
 	// `0`, and `±Infinity` saturate to `i64::MAX`/`i64::MIN` (JS stores the
 	// former as `2^63`, the nearest `f64` to `2^63 - 1`).
 	let src = "func f(x: float): int = x as int";
-	assert_eq!(run(src, "f(NaN)"), "0");
-	assert_eq!(run(src, "f(Infinity)"), "9223372036854776000");
-	assert_eq!(run(src, "f(-Infinity)"), "-9223372036854776000");
+	assert_eq!(run(src, "f(new NFloat(NaN))"), "0");
+	assert_eq!(run(src, "f(new NFloat(Infinity))"), "9223372036854776000");
+	assert_eq!(run(src, "f(new NFloat(-Infinity))"), "-9223372036854776000");
 }
 
 #[test]
@@ -2258,12 +2272,12 @@ fn float_to_uint_cast_saturates_nan_and_both_infinities_to_the_same_max() {
 	// same `Infinity -> i64::MAX` branch as `+Infinity` — there's no negative
 	// saturation branch for an unsigned target.
 	let src = "func f(x: float): int = x as int\nfunc g(x: float): uint = x as uint";
-	assert_eq!(run(src, "g(NaN)"), "0");
-	assert_eq!(run(src, "g(Infinity)"), "9223372036854776000");
-	assert_eq!(run(src, "g(-Infinity)"), "9223372036854776000");
+	assert_eq!(run(src, "g(new NFloat(NaN))"), "0");
+	assert_eq!(run(src, "g(new NFloat(Infinity))"), "9223372036854776000");
+	assert_eq!(run(src, "g(new NFloat(-Infinity))"), "9223372036854776000");
 	// Sanity: the signed cast's `-Infinity` really is distinct from the unsigned
 	// cast's (both derived from the same source function above).
-	assert_eq!(run(src, "f(-Infinity)"), "-9223372036854776000");
+	assert_eq!(run(src, "f(new NFloat(-Infinity))"), "-9223372036854776000");
 }
 
 #[test]
@@ -2297,15 +2311,15 @@ fn saturating_scalar_cast_evaluates_its_operand_exactly_once() {
 #[test]
 fn runs_char_to_int_cast_via_code_point_of() {
 	let src = "func f(c: char): int = c as int";
-	assert_eq!(run(src, "f('A')"), "65");
-	assert_eq!(run(src, "f('0')"), "48");
+	assert_eq!(run(src, "f(new NChar('A'))"), "65");
+	assert_eq!(run(src, "f(new NChar('0'))"), "48");
 }
 
 #[test]
 fn runs_char_to_uint_and_char_to_float_casts_via_code_point_of() {
 	let src = "func f(c: char): uint = c as uint\nfunc g(c: char): float = c as float";
-	assert_eq!(run(src, "f('A')"), "65");
-	assert_eq!(run(src, "g('A')"), "65");
+	assert_eq!(run(src, "f(new NChar('A'))"), "65");
+	assert_eq!(run(src, "g(new NChar('A'))"), "65");
 }
 
 #[test]
@@ -2317,20 +2331,68 @@ fn runs_char_to_int_cast_uses_code_point_not_utf16_code_unit() {
 	// `call` is raw JS (appended after the compiled module), so this is a JS
 	// string literal — `\u{...}` (braced) is JS's astral-codepoint escape, unlike
 	// Nymph's own unbraced `\uXXXX` char-literal escape used elsewhere in `src`.
-	assert_eq!(run(src, "f('\\u{1F600}')"), "128512");
+	assert_eq!(run(src, "f(new NChar('\\u{1F600}'))"), "128512");
 }
 
 #[test]
 fn runs_int_to_char_and_uint_to_char_casts_via_string_from_code_point() {
 	let src = "func f(n: int): char = n as char\nfunc g(n: uint): char = n as char";
-	assert_eq!(run(src, "f(65)"), "A");
-	assert_eq!(run(src, "g(65)"), "A");
+	assert_eq!(run(src, "f(new NInt(65))"), "A");
+	assert_eq!(run(src, "g(new NUint(65))"), "A");
 }
 
 #[test]
 fn runs_float_to_char_cast_truncating_then_from_code_point() {
 	let src = "func f(x: float): char = x as char";
-	assert_eq!(run(src, "f(65.9)"), "A");
+	assert_eq!(run(src, "f(new NFloat(65.9))"), "A");
+}
+
+#[test]
+fn scalar_casts_use_the_canonical_destination_box() {
+	let src = "func i(n: int): int = n as int\nfunc f(n: int): float = n as float\nfunc u(n: uint): int = n as int\nfunc c(n: int): char = n as char";
+	assert_eq!(run(src, "i(new NInt(5)).constructor.name"), "NInt");
+	assert_eq!(run(src, "f(new NInt(5)).constructor.name"), "NFloat");
+	assert_eq!(run(src, "u(new NUint(5)).constructor.name"), "NInt");
+	assert_eq!(run(src, "c(new NInt(65)).constructor.name"), "NChar");
+}
+
+#[test]
+fn dynamic_numeric_to_char_rejects_non_scalars_deterministically() {
+	let src = "func i(n: int): char = n as char\nfunc f(n: float): char = n as char";
+	for (function, value) in [
+		("i", "new NInt(-1)"),
+		("i", "new NInt(55296)"),
+		("i", "new NInt(1114112)"),
+		("f", "new NFloat(NaN)"),
+		("f", "new NFloat(Infinity)"),
+	] {
+		let stderr = run_failure(src, &format!("{function}({value})"));
+		assert!(stderr.contains("Invalid code point"), "{stderr}");
+	}
+}
+
+#[test]
+fn numeric_to_char_accepts_boundaries_bmp_and_astral_values() {
+	let src = "func f(n: int): char = n as char";
+	for (value, expected) in [
+		(0, 0),
+		(55295, 55295),
+		(57344, 57344),
+		(128512, 128512),
+		(1114111, 1114111),
+	] {
+		assert_eq!(
+			run(src, &format!("f(new NInt({value})).v.codePointAt(0)")),
+			expected.to_string()
+		);
+	}
+}
+
+#[test]
+fn numeric_to_char_evaluates_its_operand_exactly_once() {
+	let src =
+		"func f(): int = {\nlet mut calls = 0\nlet c = ({\ncalls = calls + 1\n65\n}) as char\ncalls\n}";
+	assert_eq!(run(src, "f()"), "1");
 }
 
 #[test]

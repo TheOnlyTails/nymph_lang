@@ -2608,14 +2608,18 @@ fn identity_cast_lowers_to_the_bare_operand() {
 }
 
 #[test]
-fn int_to_float_cast_lowers_to_the_bare_operand() {
+fn int_to_float_cast_lowers_to_an_explicit_destination_cast() {
 	// `int`/`uint`/`float` share one JS `number` representation, so a cast that
 	// only ever widens or reinterprets among them (never crossing into `uint`,
 	// which now saturates via `Math.abs`) is a no-op too, not just same-type
 	// identity.
 	let hir = lower("func f(n: int): float = n as float");
 	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
-	assert!(matches!(&f.body, HirExpr::Local(n) if n == "n"));
+	assert!(matches!(
+		&f.body,
+		HirExpr::ScalarCast { kind: ScalarCastKind::ToFloat, operand }
+			if matches!(operand.as_ref(), HirExpr::Local(n) if n == "n")
+	));
 }
 
 #[test]
@@ -2660,7 +2664,7 @@ fn char_to_int_cast_lowers_to_a_code_point_of_scalar_cast() {
 	let HirExpr::ScalarCast { kind, .. } = &f.body else {
 		panic!("expected ScalarCast, got {:?}", f.body);
 	};
-	assert_eq!(*kind, ScalarCastKind::CharToNum);
+	assert_eq!(*kind, ScalarCastKind::CharToInt);
 }
 
 #[test]

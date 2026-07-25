@@ -214,6 +214,9 @@ pub enum TypeError {
 	/// appended at the enum's end (mints 2051; CastRequiresInto above kept its
 	/// existing 2050).
 	IntoInterfaceMalformed { from: String, to: String },
+	/// A literal numeric-to-`char` cast truncates to a value outside the Unicode
+	/// scalar-value range (including the surrogate interval).
+	InvalidCharCastLiteral,
 
 	/// A `&&`/`||` operand was not `boolean`. Logical operators are never
 	/// overloadable (copying Rust's design): whether the right-hand operand
@@ -489,6 +492,9 @@ impl IntoDiagnostic for TypeError {
 				 one zero-argument method"
 			)
 			.into(),
+			E::InvalidCharCastLiteral => {
+				"numeric literal is not a valid Unicode scalar value after truncation".into()
+			}
 			E::LogicalOperandNotBoolean { found } => {
 				format!("mismatched types: expected `boolean`, found `{found}`").into()
 			}

@@ -2251,8 +2251,30 @@ impl<'m> Checker<'m> {
 	) -> (Ty, Option<Resolution>) {
 		let src = self.infer(lhs);
 		let target = self.lower_type(rhs);
+		let target_r = self.strip_mut(target);
+		if matches!(self.interner.kind(target_r), TyKind::Char)
+			&& self.numeric_literal_value(lhs).is_some_and(|value| {
+				let value = value.trunc();
+				value < 0.0 || value > 0x10_FFFF as f64 || (0xD800 as f64..=0xDFFF as f64).contains(&value)
+			}) {
+			self.emit(span, TypeError::InvalidCharCastLiteral);
+			return (target, None);
+		}
 		let resolution = self.check_cast(src, target, span);
 		(target, resolution)
+	}
+
+	fn numeric_literal_value(&self, expr: &Expr) -> Option<f64> {
+		match &expr.kind {
+			ExprKind::Int(value) => Some(value.0 as f64),
+			ExprKind::UInt(value) => Some(value.0 as f64),
+			ExprKind::Float(value) => Some(value.0.into_inner()),
+			ExprKind::PrefixOp {
+				op: nymph_ast::ops::PrefixOperator::Negate,
+				value,
+			} => self.numeric_literal_value(value).map(|value| -value),
+			_ => None,
+		}
 	}
 
 	/// Check a `value as Target` cast, returning the `Resolution` lowering needs to

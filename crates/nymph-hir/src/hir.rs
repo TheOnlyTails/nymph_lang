@@ -534,6 +534,14 @@ pub enum HirMapElem {
 /// Which JS runtime conversion a [`HirExpr::ScalarCast`] compiles to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ScalarCastKind {
+	/// Rebox a scalar identity cast as the canonical destination representation.
+	IdentityInt,
+	IdentityUInt,
+	IdentityFloat,
+	IdentityChar,
+	/// Numeric widening/reinterpretation conversions that only change the box.
+	ToInt,
+	ToFloat,
 	/// `float as int` — Nymph defines its own float→int semantics rather than
 	/// inheriting `Math.trunc`'s JS passthrough: `NaN` saturates to `0`,
 	/// `Infinity`/`-Infinity` saturate to `i64::MAX`/`i64::MIN` (JS stores the
@@ -547,7 +555,9 @@ pub enum ScalarCastKind {
 	/// previously had no runtime effect at all — this makes it a real operation).
 	SaturatingToUInt,
 	/// `char as int`/`char as uint`/`char as float` — `operand.codePointAt(0)`.
-	CharToNum,
+	CharToInt,
+	CharToUInt,
+	CharToFloat,
 	/// `int as char`/`uint as char` — `String.fromCodePoint(operand)`.
 	NumToChar,
 	/// `float as char` — `String.fromCodePoint(Math.trunc(operand))`.

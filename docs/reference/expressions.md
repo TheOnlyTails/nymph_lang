@@ -262,7 +262,12 @@ func demo(): int = 10 |> ($ * 2) |> ($ + 1)
 
 `value as Type` casts `value` to `Type`. Between the built-in scalar types (`int`, `uint`, `float`,
 `char`) it runs Nymph's own defined conversion (see the [Cast semantics](./types) built into each
-pair); for a user type, it dispatches to an implementation of the ambient `Into<Other>` interface.
+pair) and always produces the canonical boxed representation of the destination type, including
+identity and widening casts. Numeric-to-`char` casts truncate floats toward zero, then require a
+Unicode scalar value (`0..=0x10FFFF`, excluding `0xD800..=0xDFFF`). Invalid literal casts are
+compile-time errors; invalid dynamic values fail deterministically at runtime. A cast evaluates its
+source exactly once. For a user type, it dispatches to an implementation of the ambient
+`Into<Other>` interface.
 `value is Pattern` / `value !is Pattern` tests `value` against a single [pattern](./pattern-matching)
 without a full `match` — it accepts the same pattern shapes a match arm does, just without a guard
 (guards are match-arm syntax, not part of a pattern).
