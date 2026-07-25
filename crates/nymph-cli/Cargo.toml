@@ -8,6 +8,10 @@ homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "nymph"
+path = "src/main.rs"
+
 [dependencies]
 nymph-compiler = { workspace = true }
 nymph-diagnostics = { workspace = true }

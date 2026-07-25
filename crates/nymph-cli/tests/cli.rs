@@ -1,4 +1,4 @@
-//! Integration tests: spawn the real `nymph-cli` binary and assert on its
+//! Integration tests: spawn the real `nymph` binary and assert on its
 //! observable behavior (exit code, stdout, stderr) for `check`, `build`,
 //! `run`, and the stub subcommands.
 
@@ -49,15 +49,15 @@ struct Output {
 	stderr: String,
 }
 
-/// Run `nymph-cli` with `args`, colors disabled so assertions on plain text
+/// Run `nymph` with `args`, colors disabled so assertions on plain text
 /// are stable regardless of the shell's ANSI settings.
 fn nymph(args: &[&str]) -> Output {
-	let out = Command::new(env!("CARGO_BIN_EXE_nymph-cli"))
+	let out = Command::new(env!("CARGO_BIN_EXE_nymph"))
 		.args(args)
 		.env("NO_COLOR", "1")
 		.env_remove("FORCE_COLOR")
 		.output()
-		.expect("spawn nymph-cli");
+		.expect("spawn nymph");
 	Output {
 		status: out.status,
 		stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -709,4 +709,16 @@ fn stub_subcommand_exits_nonzero_with_a_message() {
 fn bare_invocation_exits_nonzero() {
 	let out = nymph(&[]);
 	assert!(!out.status.success());
+}
+
+#[test]
+fn help_displays_nymph_as_the_program_name() {
+	let out = nymph(&["--help"]);
+
+	assert!(out.status.success());
+	assert!(
+		out.stdout.contains("Usage: nymph"),
+		"stdout was: {}",
+		out.stdout
+	);
 }
