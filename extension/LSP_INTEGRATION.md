@@ -27,7 +27,7 @@ Nymph Language Server (Rust)
 ### Configuration
 
 - **package.json** - VS Code extension manifest
-  - Declares `.nym` and `.nymph` file extensions
+  - Declares the `.nym` file extension
   - Adds `onLanguage:nymph` activation event
   - Specifies LSP server command and transport
   - Includes dependencies (vscode-languageclient)
@@ -91,7 +91,7 @@ Option A: Launch in VS Code
 
 1. Open the workspace root in VS Code
 2. Press `F5` to launch Extension Development Host
-3. Open a `.nym` or `.nymph` file
+3. Open a `.nym` file
 4. Features should work: hover, completion, symbols, etc.
 
 Option B: Manual testing
@@ -117,7 +117,7 @@ Option B: Manual testing
 ### Activation Flow
 
 1. **VS Code starts** - reads `package.json`
-2. **User opens .nymph file** - triggers `onLanguage:nymph` activation
+2. **User opens .nym file** - triggers `onLanguage:nymph` activation
 3. **activate()** function runs:
    - Resolves LSP server binary path from build output
    - Creates `LanguageClient` with stdio transport
@@ -158,13 +158,12 @@ Both are relative to the extension's directory.
 
 Supported extensions (from package.json):
 
-- `.nym` - Primary extension
-- `.nymph` - Alternative extension
+- `.nym` - Nymph source-file extension
 
 To add more, update the `extensions` array in `package.json`:
 
 ```json
-"extensions": [".nym", ".nymph", ".nx"]
+"extensions": [".nym", ".nx"]
 ```
 
 ### Language ID
@@ -208,7 +207,7 @@ Common causes:
 
 ### "No syntax highlighting"
 
-- Ensure you opened a `.nym` or `.nymph` file
+- Ensure you opened a `.nym` file
 - Check that `nymph.tmLanguage.json` exists in `syntaxes/`
 - Reload VS Code window (`Ctrl+Shift+P` → "Reload Window")
 

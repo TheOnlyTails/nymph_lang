@@ -327,15 +327,15 @@ mod tests {
 
 	#[test]
 	fn test_document_creation() {
-		let doc = Document::new("file:///test.nymph".to_string(), "let x = 5".to_string());
-		assert_eq!(doc.uri, "file:///test.nymph");
+		let doc = Document::new("file:///test.nym".to_string(), "let x = 5".to_string());
+		assert_eq!(doc.uri, "file:///test.nym");
 		assert_eq!(doc.content, "let x = 5");
 	}
 
 	#[test]
 	fn test_position_to_line_col() {
 		let doc = Document::new(
-			"file:///test.nymph".to_string(),
+			"file:///test.nym".to_string(),
 			"let x = 5\nlet y = 10".to_string(),
 		);
 		let (line, col) = doc.position_to_line_col(0);
@@ -350,7 +350,7 @@ mod tests {
 	#[test]
 	fn test_lsp_position_conversion_uses_utf16_columns() {
 		let doc = Document::new(
-			"file:///test.nymph".to_string(),
+			"file:///test.nym".to_string(),
 			"let 😀 = 1\nlet z = 2".to_string(),
 		);
 
@@ -366,7 +366,7 @@ mod tests {
 	#[test]
 	fn test_apply_lsp_change_replaces_full_range() {
 		let mut doc = Document::new(
-			"file:///test.nymph".to_string(),
+			"file:///test.nym".to_string(),
 			"let x = 5\nlet y = 10".to_string(),
 		);
 
@@ -390,7 +390,7 @@ mod tests {
 
 	#[test]
 	fn test_parse_errors_are_structured_diagnostics() {
-		let doc = Document::new("file:///test.nymph".to_string(), "let =".to_string());
+		let doc = Document::new("file:///test.nym".to_string(), "let =".to_string());
 
 		assert!(!doc.diagnostics.is_empty(), "expected compiler diagnostics");
 		assert_eq!(doc.diagnostics[0].source, "nymph-parse");

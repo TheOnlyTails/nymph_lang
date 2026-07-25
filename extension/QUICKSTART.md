@@ -24,7 +24,7 @@ cargo build --release --package nymph-lsp
 ### 4. Test in VS Code
 
 1. Press `F5` in VS Code (Extension Development Host)
-2. Create file: `test.nymph`
+2. Create file: `test.nym`
 3. Type:
 
 ```nymph
@@ -85,7 +85,7 @@ cd extension && vsce package
 
 ## File Extensions
 
-Both `.nym` and `.nymph` files are supported.
+Nymph source files use the `.nym` extension.
 
 ## Troubleshooting
 
@@ -98,7 +98,7 @@ Both `.nym` and `.nymph` files are supported.
 **"No syntax highlighting"**
 
 - Reload VS Code: Ctrl+Shift+P → "Reload Window"
-- Use `.nym` or `.nymph` extension
+- Use the `.nym` extension
 
 **"Hover shows nothing"**
 

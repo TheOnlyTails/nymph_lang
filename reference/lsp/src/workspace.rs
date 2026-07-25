@@ -104,7 +104,7 @@ mod tests {
 	fn test_workspace_open_document() {
 		smol::block_on(async {
 			let ws = Workspace::new();
-			ws.open_document("file:///test.nymph".to_string(), "let x = 5".to_string())
+			ws.open_document("file:///test.nym".to_string(), "let x = 5".to_string())
 				.await;
 
 			let count = ws.document_count().await;
@@ -116,11 +116,11 @@ mod tests {
 	fn test_workspace_get_document() {
 		smol::block_on(async {
 			let ws = Workspace::new();
-			ws.open_document("file:///test.nymph".to_string(), "let x = 5".to_string())
+			ws.open_document("file:///test.nym".to_string(), "let x = 5".to_string())
 				.await;
 
 			let content = ws
-				.get_document("file:///test.nymph", |doc| doc.content.clone())
+				.get_document("file:///test.nym", |doc| doc.content.clone())
 				.await;
 			assert_eq!(content, Some("let x = 5".to_string()));
 		});
@@ -130,13 +130,13 @@ mod tests {
 	fn test_workspace_update_document() {
 		smol::block_on(async {
 			let ws = Workspace::new();
-			ws.open_document("file:///test.nymph".to_string(), "let x = 5".to_string())
+			ws.open_document("file:///test.nym".to_string(), "let x = 5".to_string())
 				.await;
-			ws.update_document("file:///test.nymph".to_string(), "let x = 10".to_string())
+			ws.update_document("file:///test.nym".to_string(), "let x = 10".to_string())
 				.await;
 
 			let content = ws
-				.get_document("file:///test.nymph", |doc| doc.content.clone())
+				.get_document("file:///test.nym", |doc| doc.content.clone())
 				.await;
 			assert_eq!(content, Some("let x = 10".to_string()));
 		});
@@ -146,9 +146,9 @@ mod tests {
 	fn test_workspace_close_document() {
 		smol::block_on(async {
 			let ws = Workspace::new();
-			ws.open_document("file:///test.nymph".to_string(), "let x = 5".to_string())
+			ws.open_document("file:///test.nym".to_string(), "let x = 5".to_string())
 				.await;
-			ws.close_document("file:///test.nymph").await;
+			ws.close_document("file:///test.nym").await;
 
 			let count = ws.document_count().await;
 			assert_eq!(count, 0);
@@ -159,9 +159,9 @@ mod tests {
 	fn test_workspace_documents_snapshot() {
 		smol::block_on(async {
 			let ws = Workspace::new();
-			ws.open_document("file:///one.nymph".to_string(), "let x = 1".to_string())
+			ws.open_document("file:///one.nym".to_string(), "let x = 1".to_string())
 				.await;
-			ws.open_document("file:///two.nymph".to_string(), "let y = 2".to_string())
+			ws.open_document("file:///two.nym".to_string(), "let y = 2".to_string())
 				.await;
 
 			let docs = ws.documents().await;
