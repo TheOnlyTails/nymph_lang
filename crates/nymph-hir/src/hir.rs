@@ -363,12 +363,10 @@ pub enum HirExpr {
 impl HirExpr {
 	fn collect_runtime_type_references(&self, references: &mut FxHashSet<EcoString>) {
 		match self {
-			Self::Num(..)
-			| Self::Str(_)
-			| Self::Bool(_)
-			| Self::Char(_)
-			| Self::Local(_)
-			| Self::This => {}
+			Self::Num(..) | Self::Str(_) | Self::Bool(_) | Self::Char(_) | Self::This => {}
+			Self::Local(name) => {
+				references.insert(name.clone());
+			}
 			Self::InterpolatedString(items) => collect_exprs(items, references),
 			Self::Call { callee, args } => {
 				callee.collect_runtime_type_references(references);

@@ -1,4 +1,4 @@
-import { NBool, NBox, NList, NMap, NString, NUint, protocolEquals } from "std/box";
+import { NBool, NList, NMap, NString, NUint, protocolEquals } from "std/box";
 import { Option } from "std/option";
 
 export const length = ($_this: NList) => new NUint($_this.v.length);
@@ -37,8 +37,6 @@ export const concat = <T>($_this: NList<T>, other: NList<T>) => new NList($_this
 export const drop = <T>($_this: NList<T>, n: NUint) => new NList($_this.v.slice(n.v));
 export const take = <T>($_this: NList<T>, n: NUint) => new NList($_this.v.slice(0, n.v));
 export const reversed = <T>($_this: NList<T>) => new NList([...$_this.v].reverse());
-export const sorted = <T extends NBox<number | string | boolean>>($_this: NList<T>) =>
-	new NList([...$_this.v].sort((a, b) => (a.v < b.v ? -1 : a.v > b.v ? 1 : 0)));
 export const chunked = <T>($_this: NList<T>, size: NUint) => {
 	const result: NList<T>[] = [];
 	if (size.v <= 0) return new NList(result);

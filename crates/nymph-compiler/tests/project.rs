@@ -2,7 +2,9 @@
 //! (`nymph_compiler::project`): resolution, namespace/`with` binding,
 //! visibility, cycles, and collisions — over a virtual, filesystem-free
 //! project (an `FxHashMap<String, String>` keyed by canonical module path).
-use nymph_compiler::{check_project, compile_project};
+use nymph_compiler::{
+	check_project, compile_project, project::compile_project_module_sources_with_std,
+};
 use rustc_hash::FxHashMap;
 /// Build a `load` closure over a virtual project map.
 fn loader(files: FxHashMap<&'static str, &'static str>) -> impl Fn(&str) -> Option<String> {
@@ -527,6 +529,66 @@ fn project_module_cannot_be_silently_replaced_by_an_intrinsic_module() {
 			.any(|d| d.diag.code.contains("RUNTIME-MODULE-COLLISION")),
 		"expected a runtime-module collision diagnostic, got: {diags:?}"
 	);
+}
+
+#[test]
+fn canonical_runtime_functions_are_emitted_once_for_multiple_consumers() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/left with (left_values)\nimport @/right with (right_values)\nfunc main(): void = {}\nfunc result(): int = left_values()[0] + right_values()[0]",
+		),
+		("left", "public func left_values(): #[int] = #[2, 1].sort()"),
+		(
+			"right",
+			"public func right_values(): #[int] = #[4, 3].sort()",
+		),
+	]);
+	let sources = compile_project_module_sources_with_std("main", &loader(files.clone()), &|_| None)
+		.unwrap_or_else(|diags| panic!("canonical graph should compile: {diags:?}"));
+	let list = sources
+		.get("std/collections/list")
+		.expect("canonical list owner");
+	assert_eq!(
+		list.matches("function $std$$list$sort(").count(),
+		1,
+		"{list}"
+	);
+	assert_eq!(
+		sources["std/ops"]
+			.matches("function $std$Comparable$int$compare_to(")
+			.count(),
+		1,
+		"{}",
+		sources["std/ops"]
+	);
+	for consumer in ["left", "right"] {
+		assert!(
+			sources[consumer].contains("import { $std$$list$sort } from \"std/collections/list\";"),
+			"{consumer} must import sort from its canonical owner:\n{}",
+			sources[consumer]
+		);
+	}
+	assert!(
+		list.contains("from \"std/collections/list$intrinsics\""),
+		"canonical public owner must re-export intrinsic backing:\n{list}"
+	);
+	let out = run_project(
+		FxHashMap::from_iter([
+			(
+				"main",
+				"import @/left with (left_values)\nimport @/right with (right_values)\nfunc main(): void = {}\nfunc result(): int = left_values()[0] + right_values()[0]",
+			),
+			("left", "public func left_values(): #[int] = #[2, 1].sort()"),
+			(
+				"right",
+				"public func right_values(): #[int] = #[4, 3].sort()",
+			),
+		]),
+		"result",
+		"",
+	);
+	assert_eq!(out, "4");
 }
 
 #[test]

@@ -95,6 +95,22 @@ const SPAN_STRIDE: usize = 1 << 40;
 #[cfg(not(target_pointer_width = "64"))]
 const SPAN_STRIDE: usize = 1 << 24;
 
+/// Compare declaration identity across independently assembled prelude slices.
+/// The same source module can occupy a different slice index while checking a
+/// consumer and while lowering its canonical owner, so its synthetic stride is
+/// not part of source identity.
+pub(crate) fn same_source_span(left: Span, right: Span) -> bool {
+	fn relative(span: Span) -> Span {
+		if span.start < SPAN_BASE {
+			return span;
+		}
+		let start = (span.start - SPAN_BASE) % SPAN_STRIDE;
+		Span::new(start, start + (span.end - span.start))
+	}
+
+	relative(left) == relative(right)
+}
+
 /// The `NodeId` offset for the prelude module at `index` (its position in
 /// [`check_module_with_prelude`]'s `prelude` slice).
 fn node_base_for(index: usize) -> u32 {

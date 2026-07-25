@@ -69,7 +69,7 @@ pub struct Linked {
 /// are `List`-only in the real stdlib today, so they stay unambiguous.
 ///
 /// L2 links the REST of `list.nym`'s markers. Non-`mut`, non-collision
-/// markers (`slice`/`sorted`/`chunked`/`distinct`/`splice`; `push` on the
+/// markers (`slice`/`chunked`/`distinct`/`splice`; `push` on the
 /// `mut` side) stay `receiver_tag: None`, exactly like `length` — no other
 /// stdlib collection/primitive declares the same bare marker name today.
 /// Every OTHER new row needs `Some(tag)` because a second, DIFFERENT prelude
@@ -213,14 +213,6 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 		Linked {
 			module: "std/collections/list",
 			symbol: "slice",
-			receiver_tag: None,
-		},
-	),
-	(
-		"sorted",
-		Linked {
-			module: "std/collections/list",
-			symbol: "sorted",
 			receiver_tag: None,
 		},
 	),
@@ -790,7 +782,6 @@ mod tests {
 						"remove",
 						"reversed",
 						"slice",
-						"sorted",
 						"splice",
 						"take",
 						"to_string",

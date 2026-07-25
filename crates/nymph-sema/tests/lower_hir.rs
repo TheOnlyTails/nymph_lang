@@ -224,6 +224,33 @@ fn separates_demanded_runtime_top_level_function() {
 }
 
 #[test]
+fn demanded_runtime_function_carries_its_declaration_module_owner() {
+	let prelude = parse_module("impl #[int] { func second(): int = this[1] }", "list");
+	let user = parse_module("func read(xs: #[int]): int = xs.second()", "test");
+	let checked = check_module_with_prelude(&user.tree, std::slice::from_ref(&prelude.tree));
+	assert!(
+		checked.diags.is_empty(),
+		"check failed: {:?}",
+		checked.diags
+	);
+	let lowered = nymph_sema::lower_hir_with_prelude_runtime_and_deps_with_owners(
+		&user.tree,
+		std::slice::from_ref(&prelude.tree),
+		&[nymph_sema::RuntimeOwner::Project(
+			"std/collections/list".into(),
+		)],
+		1,
+		&checked,
+	);
+	assert_eq!(
+		lowered.runtime_func_owners.get("$std$$list$second"),
+		Some(&nymph_sema::RuntimeOwner::Project(
+			"std/collections/list".into()
+		))
+	);
+}
+
+#[test]
 fn lowers_a_function_with_arithmetic() {
 	let hir = lower("func f(a: int, b: int): int = a + b");
 	assert_eq!(hir.funcs.len(), 1);

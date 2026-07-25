@@ -136,6 +136,7 @@ pub struct Emitter<'a> {
 	/// self-contained under Node's single-file execution (no bundler to resolve a
 	/// `"std/box"` import). `Cell` keeps the emit methods `&self`.
 	used_box: std::cell::Cell<bool>,
+	current_module: Option<String>,
 }
 
 impl Default for Emitter<'_> {
@@ -157,7 +158,14 @@ impl<'a> Emitter<'a> {
 			in_iife_subexpr: std::cell::Cell::new(false),
 			needed_imports: std::cell::RefCell::new(std::collections::BTreeSet::new()),
 			used_box: std::cell::Cell::new(false),
+			current_module: None,
 		}
+	}
+
+	pub fn for_module(module: &str) -> Emitter<'static> {
+		let mut emitter = Self::new();
+		emitter.current_module = Some(module.to_string());
+		emitter
 	}
 
 	/// A fresh temporary variable name (`_t0`, `_t1`, …).
@@ -1104,21 +1112,13 @@ impl<'a> Emitter<'a> {
 			);
 			let target_name = match &case.target {
 				HirBoundDispatchTarget::TopLevel { module, name } => {
-					self
-						.needed_imports
-						.borrow_mut()
-						.insert((module.to_string(), name.to_string()));
-					name.as_str()
+					self.route_module_symbol(module, name, false)
 				}
 				HirBoundDispatchTarget::Extern { module, symbol } => {
-					self
-						.needed_imports
-						.borrow_mut()
-						.insert((module.to_string(), symbol.to_string()));
-					symbol
+					self.route_module_symbol(module, symbol, true)
 				}
 			};
-			let target = self.ident(self.ast.allocator.alloc_str(target_name));
+			let target = self.ident(self.ast.allocator.alloc_str(&target_name));
 			let mut args = ArenaVec::new_in(&self.ast);
 			args.push(Argument::from(self.ident(receiver_param)));
 			args.push(Argument::from(self.ident(argument_param)));
@@ -1129,6 +1129,22 @@ impl<'a> Emitter<'a> {
 
 		let argument_iife = self.arrow_iife(argument_param, body, self.emit_expr(argument));
 		self.arrow_iife(receiver_param, argument_iife, self.emit_expr(receiver))
+	}
+
+	fn route_module_symbol(&self, module: &str, symbol: &str, external: bool) -> String {
+		if self.current_module.as_deref() == Some(module) && !external {
+			return symbol.to_string();
+		}
+		let import_module = if self.current_module.as_deref() == Some(module) {
+			format!("{module}$intrinsics")
+		} else {
+			module.to_string()
+		};
+		self
+			.needed_imports
+			.borrow_mut()
+			.insert((import_module, symbol.to_string()));
+		symbol.to_string()
 	}
 
 	/// The saturating JS runtime mapping for a numeric `ScalarCast` (the change
@@ -1329,19 +1345,15 @@ impl<'a> Emitter<'a> {
 				let callee_name = if *module == "std/display" {
 					self.used_box.set(true);
 					match *symbol {
-						"display" => "nymphProtocolDisplay",
-						"debug" => "nymphProtocolDebug",
+						"display" => "nymphProtocolDisplay".to_string(),
+						"debug" => "nymphProtocolDebug".to_string(),
 						_ => unreachable!("unknown display protocol intrinsic `{symbol}`"),
 					}
 				} else {
-					self
-						.needed_imports
-						.borrow_mut()
-						.insert((module.to_string(), symbol.to_string()));
-					symbol
+					self.route_module_symbol(module, symbol, true)
 				};
 				let callee =
-					Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(callee_name), &self.ast);
+					Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(&callee_name), &self.ast);
 				let mut arguments = ArenaVec::new_in(&self.ast);
 				for arg in args {
 					arguments.push(Argument::from(self.emit_expr(arg)));

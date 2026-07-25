@@ -594,9 +594,21 @@ impl Driver {
 			// slots and everything after is an EMITTED dependency module — a call to
 			// one of those dep structs' methods lowers as a real class-method call
 			// rather than a (struct-unsupported) materialization.
-			let hir = nymph_sema::lower_hir_with_prelude_runtime_and_deps(
+			let prelude_owners = crate::prelude::core_runtime_module_owners()
+				.map(nymph_sema::RuntimeOwner::Compiler)
+				.chain(
+					self
+						.transitive_deps(key)
+						.iter()
+						.cloned()
+						.map(Into::into)
+						.map(nymph_sema::RuntimeOwner::Project),
+				)
+				.collect::<Vec<_>>();
+			let hir = nymph_sema::lower_hir_with_prelude_runtime_and_deps_with_owners(
 				module,
 				&prelude,
+				&prelude_owners,
 				crate::prelude::core_prelude().len(),
 				&checked,
 			);
@@ -611,11 +623,10 @@ impl Driver {
 		let intrinsic_type_demands =
 			crate::intrinsics::runtime_type_imports(&intrinsic_sources, owners);
 		let declaration_seeds = crate::prelude::core_runtime_declaration_seeds();
-		let interface_owners = crate::prelude::core_interface_owners();
-		let function_owners = crate::prelude::core_function_owners();
 		let mut runtime_enums: FxHashMap<String, Vec<HirEnum>> = FxHashMap::default();
 		let mut runtime_classes: FxHashMap<String, Vec<HirClass>> = FxHashMap::default();
 		let mut runtime_funcs: FxHashMap<String, Vec<HirFunc>> = FxHashMap::default();
+		let mut proven_project_runtime_owners = FxHashSet::default();
 		for seed in &declaration_seeds.enums {
 			if intrinsic_type_demands.contains(&seed.name) {
 				runtime_enums
@@ -639,18 +650,20 @@ impl Driver {
 				.append(&mut lowered.module.lets);
 			lowered.module.lets = std::mem::take(&mut lowered.prelude_runtime.lets);
 			for func in lowered.prelude_runtime.funcs.drain(..) {
-				// Keep a local copy for ordinary demand-generated call sites and
-				// additionally publish a canonical copy for bound dispatchers in
-				// other runtime-owner modules.
-				lowered.module.funcs.push(func.clone());
-				let owner = func
-					.name
-					.strip_prefix("$std$")
-					.and_then(|rest| rest.split('$').next())
-					.and_then(|interface| interface_owners.get(interface))
-					.or_else(|| function_owners.get(&func.name));
-				if let Some(owner) = owner {
-					let funcs = runtime_funcs.entry((*owner).to_string()).or_default();
+				let owner = lowered
+					.runtime_func_owners
+					.get(&func.name)
+					.unwrap_or_else(|| {
+						panic!(
+							"ambient runtime function `{}` has no canonical owner",
+							func.name
+						)
+					});
+				{
+					if let nymph_sema::RuntimeOwner::Project(owner) = owner {
+						proven_project_runtime_owners.insert(owner.to_string());
+					}
+					let funcs = runtime_funcs.entry(owner.key().to_string()).or_default();
 					if let Some(existing) = funcs.iter().find(|item| item.name == func.name) {
 						assert_eq!(
 							existing, &func,
@@ -693,15 +706,36 @@ impl Driver {
 					.values()
 					.flat_map(|classes| classes.iter().map(|class| class.name.clone())),
 			)
+			.chain(
+				runtime_funcs
+					.values()
+					.flat_map(|funcs| funcs.iter().map(|func| func.name.clone())),
+			)
 			.collect();
+		let mut runtime_symbol_owners: FxHashMap<_, String> = owners
+			.iter()
+			.map(|(name, owner)| (name.clone(), (*owner).to_string()))
+			.collect();
+		for (owner, funcs) in &runtime_funcs {
+			for func in funcs {
+				if let Some(previous) = runtime_symbol_owners.insert(func.name.clone(), owner.clone()) {
+					assert_eq!(
+						previous,
+						owner.as_str(),
+						"conflicting canonical owners for `{}`",
+						func.name
+					);
+				}
+			}
+		}
 		let imports_for = |hir: &HirModule, own_owner: Option<&str>| {
 			let mut imports: FxHashMap<String, Vec<String>> = FxHashMap::default();
 			for name in hir.runtime_type_references() {
 				if !runtime_names.contains(&name) {
 					continue;
 				}
-				let owner = owners[&name];
-				if own_owner == Some(owner) {
+				let owner = &runtime_symbol_owners[&name];
+				if own_owner == Some(owner.as_str()) {
 					continue;
 				}
 				imports
@@ -718,11 +752,77 @@ impl Driver {
 			imports
 		};
 
+		// Demand-generated declarations whose canonical owner is already a real
+		// project/dependency module belong to that HIR module. Emitting a second
+		// virtual module under the same key would collide rather than establish
+		// ownership.
+		let mut merged_runtime_exports: FxHashMap<String, Vec<String>> = FxHashMap::default();
+		for (key, lowered) in &mut lowered_modules {
+			if !proven_project_runtime_owners.contains(key) {
+				continue;
+			}
+			let funcs = runtime_funcs.remove(key).unwrap_or_default();
+			let classes = runtime_classes.remove(key).unwrap_or_default();
+			let enums = runtime_enums.remove(key).unwrap_or_default();
+			let exports = merged_runtime_exports.entry(key.clone()).or_default();
+			exports.extend(funcs.iter().map(|item| item.name.to_string()));
+			exports.extend(classes.iter().map(|item| item.name.to_string()));
+			exports.extend(enums.iter().map(|item| item.name.to_string()));
+			for func in funcs {
+				if let Some(existing) = lowered
+					.module
+					.funcs
+					.iter()
+					.find(|item| item.name == func.name)
+				{
+					assert_eq!(
+						existing, &func,
+						"conflicting canonical function `{}`",
+						func.name
+					);
+				} else {
+					lowered.module.funcs.push(func);
+				}
+			}
+			for class in classes {
+				if let Some(existing) = lowered
+					.module
+					.classes
+					.iter_mut()
+					.find(|item| item.name == class.name)
+				{
+					merge_canonical_class(existing, class);
+				} else {
+					lowered.module.classes.push(class);
+				}
+			}
+			for enum_ in enums {
+				if let Some(existing) = lowered
+					.module
+					.enums
+					.iter_mut()
+					.find(|item| item.name == enum_.name)
+				{
+					merge_canonical_enum(existing, enum_);
+				} else {
+					lowered.module.enums.push(enum_);
+				}
+			}
+		}
+
 		let mut module_sources: FxHashMap<String, String> = FxHashMap::default();
 		for (key, lowered) in lowered_modules {
-			let imports = imports_for(&lowered.module, None);
-			let body = nymph_codegen::emit(&lowered.module);
-			module_sources.insert(key.clone(), self.wrap_module_js(&key, &body, &imports));
+			let imports = imports_for(&lowered.module, Some(&key));
+			let body = nymph_codegen::emit_for_module(&lowered.module, &key);
+			let mut source = self.wrap_module_js(&key, &body, &imports);
+			if let Some(exports) = merged_runtime_exports.get_mut(&key)
+				&& !exports.is_empty()
+			{
+				exports.sort_unstable();
+				exports.dedup();
+				source.push_str(&format!("export {{ {} }};\n", exports.join(", ")));
+			}
+			module_sources.insert(key.clone(), source);
 		}
 		let runtime_owners: FxHashSet<_> = runtime_enums
 			.keys()
@@ -730,7 +830,7 @@ impl Driver {
 			.chain(runtime_funcs.keys())
 			.cloned()
 			.collect();
-		for owner in runtime_owners {
+		for owner in runtime_owners.clone() {
 			let mut enums = runtime_enums.remove(&owner).unwrap_or_default();
 			let mut classes = runtime_classes.remove(&owner).unwrap_or_default();
 			let mut funcs = runtime_funcs.remove(&owner).unwrap_or_default();
@@ -745,7 +845,7 @@ impl Driver {
 			};
 			let imports = imports_for(&hir, Some(&owner));
 			let mut source = runtime_import_lines(&imports);
-			source.push_str(&nymph_codegen::emit(&hir));
+			source.push_str(&nymph_codegen::emit_for_module(&hir, &owner));
 			let names = hir
 				.classes
 				.iter()
@@ -772,7 +872,18 @@ impl Driver {
 				key, "std/option",
 				"intrinsics must not replace the canonical Option module"
 			);
-			insert_runtime_module(&mut module_sources, key, source)?;
+			if module_sources.contains_key(&key)
+				&& (runtime_owners.contains(&key) || proven_project_runtime_owners.contains(&key))
+			{
+				let backing = format!("{key}$intrinsics");
+				insert_runtime_module(&mut module_sources, backing.clone(), source)?;
+				let public = module_sources
+					.get_mut(&key)
+					.expect("canonical owner exists");
+				public.push_str(&format!("export * from \"{backing}\";\n"));
+			} else {
+				insert_runtime_module(&mut module_sources, key, source)?;
+			}
 		}
 		Ok((module_sources, self.tags[&self.entry]))
 	}
@@ -858,7 +969,18 @@ impl Driver {
 		export_names.sort_unstable();
 
 		let mut out = String::new();
-		out.push_str(&runtime_import_lines(runtime_imports));
+		let runtime_imports = runtime_imports
+			.iter()
+			.filter_map(|(module, names)| {
+				let names = names
+					.iter()
+					.filter(|name| !body.contains(&format!("import {{ {name} }} from \"{module}\";")))
+					.cloned()
+					.collect::<Vec<_>>();
+				(!names.is_empty()).then(|| (module.clone(), names))
+			})
+			.collect::<Vec<_>>();
+		out.push_str(&runtime_import_lines(&runtime_imports));
 		for line in &import_lines {
 			out.push_str(line);
 			out.push('\n');

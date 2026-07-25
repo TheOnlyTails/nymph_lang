@@ -14,8 +14,8 @@ use std::cell::RefCell;
 
 use ecow::EcoString;
 use nymph_ast::{
-	Ident, Spanned,
-	decl::{Declaration, FuncDeclaration, ImplMember, InterfaceMember, Module},
+	Ident, Span, Spanned,
+	decl::{Declaration, FuncDeclaration, ImplMember, InterfaceElement, InterfaceMember, Module},
 	expr::{CallArg, Expr, ExprKind, ListItem, MapEntry, Statement},
 	ops::{AssignOperator, BinaryOperator, PatternOperator, PrefixOperator},
 	ty::{GenericArg, GenericParam},
@@ -41,10 +41,31 @@ use crate::{Annotations, Checked, DispatchKind, IterMode, Resolution};
 type InterfaceTable<'m> =
 	FxHashMap<EcoString, (&'m [Spanned<GenericParam>], &'m [Spanned<InterfaceMember>])>;
 
+/// Provenance for a prelude declaration's canonical runtime owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeOwner {
+	/// A compiler-created core/runtime module, never an emitted graph module.
+	Compiler(EcoString),
+	/// A module proven to come from the resolved project/dependency graph.
+	Project(EcoString),
+}
+
+impl RuntimeOwner {
+	#[must_use]
+	pub fn key(&self) -> &EcoString {
+		match self {
+			Self::Compiler(key) | Self::Project(key) => key,
+		}
+	}
+}
+
 /// Consumer declarations and the ambient prelude declarations their bodies demand.
 pub struct LoweredHir {
 	pub module: HirModule,
 	pub prelude_runtime: HirModule,
+	/// Canonical owner for every demanded runtime function. The function also
+	/// remains in `prelude_runtime.funcs` for compatibility with flat lowering.
+	pub runtime_func_owners: FxHashMap<EcoString, RuntimeOwner>,
 }
 
 impl LoweredHir {
@@ -66,7 +87,7 @@ impl LoweredHir {
 /// No prelude is fed — `interfaces_by_name` (below) sees only `module`'s own
 /// interfaces, exactly the pre-stdlib-lowering behavior.
 pub fn lower_hir(module: &Module, checked: &Checked) -> HirModule {
-	lower_hir_impl(module, &[], 0, checked).merged()
+	lower_hir_impl(module, &[], &[], 0, checked).merged()
 }
 
 /// Lower a checked module the SAME way [`check_module_with_prelude`]
@@ -138,18 +159,35 @@ pub fn lower_hir_with_prelude_runtime_and_deps(
 	dep_start: usize,
 	checked: &Checked,
 ) -> LoweredHir {
+	let owners = (0..prelude.len())
+		.map(|index| RuntimeOwner::Compiler(EcoString::from(format!("$prelude${index}"))))
+		.collect::<Vec<_>>();
+	lower_hir_with_prelude_runtime_and_deps_with_owners(module, prelude, &owners, dep_start, checked)
+}
+
+/// Project-aware split lowering. `prelude_owners` is parallel to `prelude` and
+/// records the module that canonically owns declarations demanded from it.
+pub fn lower_hir_with_prelude_runtime_and_deps_with_owners(
+	module: &Module,
+	prelude: &[Module],
+	prelude_owners: &[RuntimeOwner],
+	dep_start: usize,
+	checked: &Checked,
+) -> LoweredHir {
+	assert_eq!(prelude.len(), prelude_owners.len());
 	let offset_prelude: Vec<Module> = prelude
 		.iter()
 		.enumerate()
 		.map(|(index, p)| crate::prelude::offset_module(p, index))
 		.collect();
 	let dep_start = dep_start.min(offset_prelude.len());
-	lower_hir_impl(module, &offset_prelude, dep_start, checked)
+	lower_hir_impl(module, &offset_prelude, prelude_owners, dep_start, checked)
 }
 
 fn lower_hir_impl(
 	module: &Module,
 	prelude_modules: &[Module],
+	prelude_owners: &[RuntimeOwner],
 	dep_start: usize,
 	checked: &Checked,
 ) -> LoweredHir {
@@ -219,6 +257,7 @@ fn lower_hir_impl(
 		struct_names,
 		variant_fields,
 		prelude_modules,
+		prelude_owners,
 		emitted_dep_modules: &prelude_modules[dep_start..],
 		interfaces_by_name,
 		scopes: RefCell::new(Vec::new()),
@@ -229,9 +268,10 @@ fn lower_hir_impl(
 		closure_depth: std::cell::Cell::new(0),
 		this_sub: RefCell::new(Vec::new()),
 		lowering_runtime_sibling: RefCell::new(Vec::new()),
-		runtime_funcs_seen: RefCell::new(FxHashSet::default()),
+		runtime_funcs_seen: RefCell::new(FxHashMap::default()),
 		runtime_func_demands: RefCell::new(Vec::new()),
 		lowered_runtime_funcs: RefCell::new(Vec::new()),
+		runtime_func_owners: RefCell::new(FxHashMap::default()),
 		lowering_onto_runtime_owner: std::cell::Cell::new(0),
 		current_runtime_owner_lowering: RefCell::new(Vec::new()),
 		runtime_enum_method_demands: RefCell::new(FxHashMap::default()),
@@ -260,6 +300,7 @@ struct Lowerer<'a> {
 	/// to locate the AST of a prelude-origin impl/interface-default/enum a
 	/// `DispatchKind::UserImplDefaultMethod`/`VariantRef` needs lowered.
 	prelude_modules: &'a [Module],
+	prelude_owners: &'a [RuntimeOwner],
 	/// The subset of `prelude_modules` that are EMITTED dependency modules (a
 	/// project's imported `std/…`/`@/…` modules), as opposed to the ambient
 	/// `core` prelude (never emitted). A dep module's own class IS emitted by the
@@ -364,7 +405,9 @@ struct Lowerer<'a> {
 	/// inserted BEFORE the body is actually lowered (`try_lower_runtime_dispatch`),
 	/// guards against infinite recursion if a lowered body ever called
 	/// itself indirectly.
-	runtime_funcs_seen: RefCell<FxHashSet<EcoString>>,
+	/// Mangled function → (canonical owner, declaration span). Repeated demands
+	/// must agree on both identity components; a name alone is not identity.
+	runtime_funcs_seen: RefCell<FxHashMap<EcoString, (EcoString, Span)>>,
 	/// Work queue of prelude bodies discovered lowerable but not yet
 	/// lowered — Pass 2 of the demand-driven scheme (see `lower_hir_with_prelude`'s
 	/// doc comment): Pass 1 (the ordinary module walk) only rewrites call
@@ -379,6 +422,7 @@ struct Lowerer<'a> {
 	/// the order they were lowered — appended to `HirModule::funcs` once
 	/// `lower_module`'s own walk (and every prelude body it demanded) is done.
 	lowered_runtime_funcs: RefCell<Vec<HirFunc>>,
+	runtime_func_owners: RefCell<FxHashMap<EcoString, RuntimeOwner>>,
 	/// Nonzero while lowering an interface default body [`Self::push_unoverridden_defaults`]
 	/// lowers ONTO A CONCRETE STRUCT/ENUM CLASS (gap a) — as opposed to
 	/// [`Self::lower_runtime_func`] lowering one as a top-level mangled
@@ -497,6 +541,7 @@ enum RuntimeDispatch {
 struct RuntimeFuncDemand<'a> {
 	/// The mangled name to emit this body under (`$std$<Interface>$<SelfTypeTag>$<method>`).
 	mangled: EcoString,
+	canonical_owner: RuntimeOwner,
 	/// The owning impl's (or, for an interface-default fallback, the
 	/// interface's own) generic scope — mirrors `lower_method`'s
 	/// `owner_generics` parameter; see `push_unoverridden_defaults`'s doc
@@ -637,19 +682,49 @@ impl<'a> Lowerer<'a> {
 	) -> Option<HirExpr> {
 		use nymph_ast::ty::Type;
 
-		let interface_span = res.impl_span?;
+		let interface_span = res.impl_span.unwrap_or_else(|| {
+			panic!(
+				"generic-bound dispatch for `{}` has no source span",
+				res.method
+			)
+		});
 		let modules = self
 			.prelude_modules
 			.iter()
 			.chain(std::iter::once(self.module));
-		let (interface, interface_module) = modules.clone().find_map(|module| {
+		let interface = modules.clone().find_map(|module| {
 			match module.members.iter().find(
-				|decl| matches!(decl, Declaration::Interface { name, .. } if name.1 == interface_span),
+				|decl| matches!(decl, Declaration::Interface { name, .. } if crate::prelude::same_source_span(name.1, interface_span)),
 			) {
-				Some(Declaration::Interface { name, .. }) => Some((name.0.clone(), module.path.clone())),
+				Some(Declaration::Interface { name, .. }) => Some(name.0.clone()),
 				_ => None,
 			}
-		})?;
+		}).or_else(|| {
+			// Import rewriting preserves source identity but can rebuild a module in
+			// a differently assembled prelude graph. Fall back to the canonical
+			// method declaration; checker resolution guarantees this method belongs
+			// to the bound interface.
+			modules.clone().find_map(|module| {
+				module.members.iter().find_map(|decl| match decl {
+					Declaration::Interface { name, members, .. }
+						if members.iter().any(|member| matches!(
+							&member.0,
+							InterfaceMember::Element(element)
+								if matches!(&element.0, InterfaceElement::Func { meta, .. } if meta.name.0 == res.method)
+						)) => Some(name.0.clone()),
+					_ => None,
+				})
+			})
+		}).unwrap_or_else(|| {
+			panic!(
+				"generic-bound dispatch for `{}` has unknown interface span {interface_span:?}",
+				res.method
+			)
+		});
+		let interface_module = self.interface_owner(&interface);
+		if interface != "Comparable" && interface_module.key() != &self.module.path {
+			return None;
+		}
 
 		let mut cases: Vec<HirBoundDispatchCase> = Vec::new();
 		for decl in modules.flat_map(|module| module.members.iter()) {
@@ -684,21 +759,33 @@ impl<'a> Lowerer<'a> {
 			}) else {
 				continue;
 			};
+			// This lowering shape represents one still-generic type flowing as
+			// both receiver and argument. Heterogeneous `Comparable<Other>` impls
+			// belong to a different instantiation and, because runtime helper names
+			// are receiver-keyed, must not collide with the homogeneous case.
+			if receiver_tag != argument_tag {
+				continue;
+			}
 
 			let target = if let Some(marker) = members.iter().find_map(|member| match &member.0 {
 				ImplMember::ExternalFunc(_, marker, meta) if meta.name.0 == res.method => Some(marker),
 				_ => None,
 			}) {
-				let linked = nymph_hir::linkage::lookup(marker, Some(receiver_tag.as_str()))?;
+				let Some(linked) = nymph_hir::linkage::lookup(marker, Some(receiver_tag.as_str())) else {
+					continue;
+				};
 				HirBoundDispatchTarget::Extern {
 					module: linked.module,
 					symbol: linked.symbol,
 				}
 			} else {
-				let (owner_generics, meta, body) =
-					self.resolve_impl_for_source(&interface, members, generics, &res.method)?;
+				let Some((owner_generics, meta, body)) =
+					self.resolve_impl_for_source(&interface, members, generics, &res.method)
+				else {
+					continue;
+				};
 				if self.body_calls_unlinked_external(body) {
-					return None;
+					continue;
 				}
 				match self.finish_runtime_impl_lowering(
 					&interface,
@@ -711,7 +798,7 @@ impl<'a> Lowerer<'a> {
 					&res.method,
 				) {
 					RuntimeDispatch::TopLevel(name) => HirBoundDispatchTarget::TopLevel {
-						module: interface_module.clone(),
+						module: interface_module.key().clone(),
 						name,
 					},
 					RuntimeDispatch::LinkedExtern(linked) => HirBoundDispatchTarget::Extern {
@@ -881,6 +968,84 @@ impl<'a> Lowerer<'a> {
 			}
 		}
 		name.clone()
+	}
+
+	fn canonical_owner_of(&self, meta: &FuncDeclaration) -> RuntimeOwner {
+		for (module, owner) in self.prelude_modules.iter().zip(self.prelude_owners) {
+			let found = module.members.iter().any(|decl| match decl {
+				Declaration::Func {
+					meta: candidate, ..
+				} => candidate.name.1 == meta.name.1,
+				Declaration::Impl { members, .. } | Declaration::ImplFor { members, .. } => {
+					members.iter().any(|member| match &member.0 {
+						ImplMember::Func {
+							meta: candidate, ..
+						} => candidate.name.1 == meta.name.1,
+						_ => false,
+					})
+				}
+				Declaration::Interface { members, .. } => members.iter().any(|member| match &member.0 {
+					InterfaceMember::Element(element) => match &element.0 {
+						InterfaceElement::Func {
+							meta: candidate, ..
+						} => candidate.name.1 == meta.name.1,
+						_ => false,
+					},
+					_ => false,
+				}),
+				_ => false,
+			});
+			if found {
+				return owner.clone();
+			}
+		}
+		panic!(
+			"demanded runtime function `{}` has no canonical owner",
+			meta.name.0
+		)
+	}
+
+	fn interface_owner(&self, interface: &EcoString) -> RuntimeOwner {
+		self
+			.prelude_modules
+			.iter()
+			.zip(self.prelude_owners)
+			.find_map(|(module, owner)| {
+				module
+					.members
+					.iter()
+					.any(|decl| matches!(decl, Declaration::Interface { name, .. } if name.0 == *interface))
+					.then(|| owner.clone())
+			})
+			.or_else(|| {
+				self
+					.module
+					.members
+					.iter()
+					.any(|decl| matches!(decl, Declaration::Interface { name, .. } if name.0 == *interface))
+					.then(|| RuntimeOwner::Compiler(self.module.path.clone()))
+			})
+			.unwrap_or_else(|| panic!("interface `{interface}` has no canonical owner"))
+	}
+
+	fn register_runtime_func(
+		&self,
+		mangled: &EcoString,
+		owner: &RuntimeOwner,
+		meta: &FuncDeclaration,
+	) -> bool {
+		let identity = (owner.key().clone(), meta.name.1);
+		let mut seen = self.runtime_funcs_seen.borrow_mut();
+		if let Some(existing) = seen.get(mangled) {
+			assert_eq!(
+				existing, &identity,
+				"conflicting source identity for demanded runtime function `{mangled}`"
+			);
+			false
+		} else {
+			seen.insert(mangled.clone(), identity);
+			true
+		}
 	}
 
 	fn lower_module(&self, module: &Module) -> LoweredHir {
@@ -1146,6 +1311,7 @@ impl<'a> Lowerer<'a> {
 				classes: runtime_classes,
 				enums: runtime_enums,
 			},
+			runtime_func_owners: self.runtime_func_owners.borrow().clone(),
 		}
 	}
 
@@ -1306,6 +1472,11 @@ impl<'a> Lowerer<'a> {
 				break;
 			};
 			let f = self.lower_runtime_func(&pending);
+			let old = self
+				.runtime_func_owners
+				.borrow_mut()
+				.insert(f.name.clone(), pending.canonical_owner.clone());
+			assert!(old.is_none_or(|owner| owner == pending.canonical_owner));
 			self.lowered_runtime_funcs.borrow_mut().push(f);
 		}
 	}
@@ -1317,20 +1488,30 @@ impl<'a> Lowerer<'a> {
 			for func in funcs.iter() {
 				collect_locals(&func.body, &mut referenced);
 			}
-			let demanded = self.prelude_modules.iter().find_map(|module| {
-				module.members.iter().find_map(|decl| match decl {
-					Declaration::Func { meta, body, .. }
-						if referenced.contains(&meta.name.0) && !existing.contains(&meta.name.0) =>
-					{
-						Some((meta, body))
-					}
-					_ => None,
-				})
-			});
-			let Some((meta, body)) = demanded else {
+			let demanded = self
+				.prelude_modules
+				.iter()
+				.zip(self.prelude_owners)
+				.find_map(|(module, owner)| {
+					module.members.iter().find_map(|decl| match decl {
+						Declaration::Func { meta, body, .. }
+							if referenced.contains(&meta.name.0) && !existing.contains(&meta.name.0) =>
+						{
+							Some((meta, body, owner))
+						}
+						_ => None,
+					})
+				});
+			let Some((meta, body, owner)) = demanded else {
 				break;
 			};
-			funcs.push(self.lower_func(meta, body));
+			let func = self.lower_func(meta, body);
+			let old = self
+				.runtime_func_owners
+				.borrow_mut()
+				.insert(func.name.clone(), owner.clone());
+			assert!(old.is_none_or(|existing| existing == *owner));
+			funcs.push(func);
 			self.drain_runtime_func_demands();
 			funcs.extend(self.lowered_runtime_funcs.borrow_mut().drain(..));
 		}
@@ -2312,9 +2493,7 @@ impl<'a> Lowerer<'a> {
 						};
 						if let Some(tag) = inherent_self_type_tag(&type_.0, *mutable) {
 							let mangled: EcoString = format!("$std$${tag}${}", res.method).into();
-							if self.runtime_funcs_seen.borrow().contains(&mangled) {
-								return Some(RuntimeDispatch::TopLevel(mangled));
-							}
+							let owner = self.canonical_owner_of(meta);
 							if self.body_calls_unlinked_external(body) {
 								// A real Nymph body that itself transitively calls an
 								// external instance method (e.g. `list`/`map`'s own
@@ -2324,12 +2503,15 @@ impl<'a> Lowerer<'a> {
 								// comment.
 								return None;
 							}
-							self.runtime_funcs_seen.borrow_mut().insert(mangled.clone());
+							if !self.register_runtime_func(&mangled, &owner, meta) {
+								return Some(RuntimeDispatch::TopLevel(mangled));
+							}
 							self
 								.runtime_func_demands
 								.borrow_mut()
 								.push(RuntimeFuncDemand {
 									mangled: mangled.clone(),
+									canonical_owner: owner,
 									owner_generics: generics.as_slice(),
 									meta,
 									body,
@@ -2504,15 +2686,16 @@ impl<'a> Lowerer<'a> {
 		method: &EcoString,
 	) -> RuntimeDispatch {
 		let mangled: EcoString = format!("$std${iface_name}${tag}${method}").into();
-		if self.runtime_funcs_seen.borrow().contains(&mangled) {
+		let canonical_owner = self.interface_owner(iface_name);
+		if !self.register_runtime_func(&mangled, &canonical_owner, meta) {
 			return RuntimeDispatch::TopLevel(mangled);
 		}
-		self.runtime_funcs_seen.borrow_mut().insert(mangled.clone());
 		self
 			.runtime_func_demands
 			.borrow_mut()
 			.push(RuntimeFuncDemand {
 				mangled: mangled.clone(),
+				canonical_owner,
 				owner_generics,
 				meta,
 				body,
@@ -3101,6 +3284,23 @@ impl<'a> Lowerer<'a> {
 						callee: Box::new(self.lower_expr(func)),
 						args: args.iter().map(|a| self.lower_expr(&a.0.value)).collect(),
 					}
+				} else if let ExprKind::MemberAccess { parent, .. } = &func.kind
+					&& let Some(res) = self.annotations.resolution_of(expr.id)
+					&& matches!(
+						res.dispatch,
+						DispatchKind::UserImpl | DispatchKind::UserImplDefaultMethod
+					) && !Self::is_this_receiver(parent)
+					&& self.receiver_is_still_generic(parent)
+					&& let [argument] = args.as_slice()
+				{
+					self
+						.lower_bound_dispatch(res, parent, &argument.0.value)
+						.unwrap_or_else(|| {
+							panic!(
+								"cannot lower generic-bound dispatch for method `{}`",
+								res.method,
+							)
+						})
 				} else if let ExprKind::MemberAccess { parent, .. } = &func.kind
 					&& let Some(res) = self.annotations.resolution_of(expr.id)
 					&& res.dispatch == DispatchKind::UserImplDefaultMethod

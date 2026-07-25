@@ -229,10 +229,10 @@ fn compile_panics_loudly_on_a_generic_bound_plain_method_call_through_a_stdlib_i
 	let message = catch_panic_message(|| {
 		let _ = compile(source, "test");
 	})
-	.expect("expected lowering to panic on the generic-bound plain method-call dispatch");
+	.expect("expected lowering to reject unsupported generic-bound plain method dispatch");
 	assert!(
-		message.contains("prelude-only impl"),
-		"expected the documented prelude-only-impl panic message, got: {message:?}"
+		message.contains("cannot lower generic-bound dispatch"),
+		"expected a loud generic-bound dispatch panic, got: {message:?}"
 	);
 }
 
@@ -280,6 +280,112 @@ fn comparable_compare_to_for_string_links_and_runs() {
 			"f(new NString('a'), new NString('b'))[Symbol.for('nymph.tag')].description"
 		),
 		"Order.LessThan"
+	);
+}
+
+#[test]
+fn list_sort_orders_primitives_without_mutating_the_source() {
+	let source = r#"
+		func values(): #(#[int], #[int]) = {
+			let source = #[3, 1, 2]
+			#(source, source.sort())
+		}
+	"#;
+	assert_eq!(
+		run(
+			source,
+			"values().v.map(xs => xs.v.map(x => x.v).join(',')).join('|')"
+		),
+		"3,1,2|1,2,3"
+	);
+}
+
+#[test]
+fn list_sort_dispatches_comparable_for_user_structs() {
+	let source = r#"
+		struct Item(key: int)
+		impl Comparable<Other = Item> for Item {
+			func compare_to(other: Item): Order = this.key.compare_to(other.key)
+		}
+		func values(): #[Item] = #[Item(key = 3), Item(key = 1), Item(key = 2)].sort()
+	"#;
+	assert_eq!(
+		run(source, "values().v.map(item => item.key.v).join(',')"),
+		"1,2,3"
+	);
+}
+
+#[test]
+fn list_sort_uses_compare_to_when_less_than_override_disagrees() {
+	let source = r#"
+		struct Item(key: int)
+		impl Comparable<Other = Item> for Item {
+			func compare_to(other: Item): Order = this.key.compare_to(other.key)
+			func less_than(other: Item): boolean = this.key > other.key
+		}
+		func values(): #[Item] = #[Item(key = 3), Item(key = 1), Item(key = 2)].sort()
+	"#;
+	assert_eq!(
+		run(source, "values().v.map(item => item.key.v).join(',')"),
+		"1,2,3"
+	);
+}
+
+#[test]
+fn list_sort_is_stable_for_equal_keys() {
+	let source = r#"
+		struct Item(key: int, sequence: int)
+		impl Comparable<Other = Item> for Item {
+			func compare_to(other: Item): Order = this.key.compare_to(other.key)
+		}
+		func values(): #[Item] = #[
+			Item(key = 2, sequence = 0),
+			Item(key = 1, sequence = 1),
+			Item(key = 2, sequence = 2),
+			Item(key = 1, sequence = 3),
+		].sort()
+	"#;
+	assert_eq!(
+		run(source, "values().v.map(item => item.sequence.v).join(',')"),
+		"1,3,0,2"
+	);
+}
+
+#[test]
+fn list_sort_by_accepts_descending_order_comparator() {
+	let source = r#"
+		func values(): #[int] = #[1, 3, 2].sort_by((left, right) ->
+			if (left > right) { Order.LessThan }
+			else if (left < right) { Order.GreaterThan }
+			else { Order.Equal }
+		)
+	"#;
+	assert_eq!(run(source, "values().v.map(x => x.v).join(',')"), "3,2,1");
+}
+
+#[test]
+fn list_sort_by_preserves_source_and_equal_element_order() {
+	let source = r#"
+		struct Item(key: int, sequence: int)
+		func compare_items(left: Item, right: Item): Order =
+			if (left.key < right.key) { Order.LessThan }
+			else if (left.key > right.key) { Order.GreaterThan }
+			else { Order.Equal }
+		func values(): #(#[Item], #[Item]) = {
+			let source = #[
+				Item(key = 2, sequence = 0),
+				Item(key = 1, sequence = 1),
+				Item(key = 2, sequence = 2),
+			]
+			#(source, source.sort_by(compare_items))
+		}
+	"#;
+	assert_eq!(
+		run(
+			source,
+			"values().v.map(xs => xs.v.map(item => item.sequence.v).join(',')).join('|')"
+		),
+		"0,1,2|1,0,2"
 	);
 }
 

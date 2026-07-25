@@ -67,7 +67,7 @@ const CORE_SOURCES: &[(&str, &str)] = &[
 	),
 	("std/math", include_str!("../../../stdlib/src/math/mod.nym")),
 	// Methods on the built-in/primitive types are ambient too: `"…".length()`,
-	// `#[…].sorted()`, `#{…}.get()` must "just work" with no `import`, exactly
+	// `#[…].sort()`, `#{…}.get()` must "just work" with no `import`, exactly
 	// like arithmetic on `int`. Primitives (via `ops`/`math`/`string`) and the
 	// built-in literal collections (`#[T]` list, `#{K:V}` map) are ambient; NAMED
 	// types (`Set`, `LinkedList`, `Tree`, `Complex`) and io's free functions stay
@@ -86,6 +86,12 @@ const CORE_SOURCES: &[(&str, &str)] = &[
 static CORE_PRELUDE: OnceLock<Vec<Module>> = OnceLock::new();
 static CORE_RUNTIME_TYPE_OWNERS: OnceLock<FxHashMap<EcoString, &'static str>> = OnceLock::new();
 static CORE_RUNTIME_DECLARATION_SEEDS: OnceLock<HirModule> = OnceLock::new();
+
+pub(crate) fn core_runtime_module_owners() -> impl Iterator<Item = EcoString> {
+	CORE_SOURCES
+		.iter()
+		.map(|(owner, _)| EcoString::from(*owner))
+}
 
 /// Parse one embedded core source, panicking (via `debug_assert`, same as the
 /// prior single-module `ops_prelude`) if it fails to parse — every entry in
@@ -139,30 +145,6 @@ pub(crate) fn core_runtime_type_owners() -> &'static FxHashMap<EcoString, &'stat
 
 		owners
 	})
-}
-
-pub(crate) fn core_interface_owners() -> FxHashMap<EcoString, &'static str> {
-	let mut owners = FxHashMap::default();
-	for ((owner, _), module) in CORE_SOURCES.iter().zip(core_prelude()) {
-		for declaration in &module.members {
-			if let Declaration::Interface { name, .. } = declaration {
-				owners.insert(name.0.clone(), *owner);
-			}
-		}
-	}
-	owners
-}
-
-pub(crate) fn core_function_owners() -> FxHashMap<EcoString, &'static str> {
-	let mut owners = FxHashMap::default();
-	for ((owner, _), module) in CORE_SOURCES.iter().zip(core_prelude()) {
-		for declaration in &module.members {
-			if let Declaration::Func { meta, .. } = declaration {
-				owners.insert(meta.name.0.clone(), *owner);
-			}
-		}
-	}
-	owners
 }
 
 /// Canonical declaration shapes derived directly from the parsed core source.

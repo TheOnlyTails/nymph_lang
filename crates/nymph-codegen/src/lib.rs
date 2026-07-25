@@ -19,6 +19,14 @@ pub fn emit(module: &HirModule) -> String {
 	emit::Emitter::new().emit_module(module)
 }
 
+/// Emit an ES module with awareness of its canonical module key. Linked
+/// external calls targeting that same key import from its intrinsic backing
+/// module, while ordinary canonical self-references remain local identifiers.
+#[must_use]
+pub fn emit_for_module(module: &HirModule, module_key: &str) -> String {
+	emit::Emitter::for_module(module_key).emit_module(module)
+}
+
 /// Compile Nymph source to a JS module string, or return the diagnostics that
 /// prevented it. Runs the full pipeline — parse → check → lower → emit — and only
 /// lowers/emits when parsing and checking are error-free.

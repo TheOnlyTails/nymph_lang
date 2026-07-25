@@ -1,5 +1,5 @@
 import @/option with (Option)
-import @/ops with (Plus, Contains, Equals)
+import @/ops with (Plus, Comparable, Contains, Equals, Order)
 
 impl<T> mut #[T] {
   external(length) func length(): uint
@@ -38,9 +38,6 @@ impl<T> #[T] {
   /// Returns a new list with the elements in reverse order.
   external(reversed) func reversed(): #[T]
 
-  /// Returns a new sorted list.
-  external(sorted) func sorted(): #[T]
-
   /// Returns a list of sub-lists, each of the given `size` (the last chunk may be smaller).
   external(chunked) func chunked(size: uint): #[#[T]]
 
@@ -52,6 +49,30 @@ impl<T> #[T] {
 
   /// Returns a new list with only the first `n` elements.
   external(take) func take(n: uint): #[T]
+
+  /// Returns a new list stably ordered by `compare`; the source is unchanged.
+  func sort_by(compare: (T, T) -> Order): #[T] = {
+    let mut result = this.slice(0u, this.length())
+    let mut i = 1
+    while (i < result.length()) {
+      let mut j = i
+      while (j > 0 && compare(result[j], result[j - 1]) == Order.LessThan) {
+        let previous = result[j - 1]
+        result[j - 1] = result[j]
+        result[j] = previous
+        j = j - 1
+      }
+      i = i + 1
+    }
+    result
+  }
+}
+
+impl<T: Comparable<Other = T>> #[T] {
+  /// Returns a new stably sorted list using `Comparable`; the source is unchanged.
+  func sort(): #[T] = {
+    this.sort_by((left, right) -> left.compare_to(right))
+  }
 }
 
 impl<T> Plus<Other = self, Output = self> for #[T] {
