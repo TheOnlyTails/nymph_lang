@@ -48,7 +48,6 @@ declare module "std/box" {
 		keys(): IterableIterator<K>;
 		values(): IterableIterator<V>;
 		entries(): IterableIterator<[K, V]>;
-		iter(): NymphIterator<NTuple<K | V>>;
 		[Symbol.iterator](): IterableIterator<[K, V]>;
 	}
 

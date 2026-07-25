@@ -83,6 +83,10 @@ pub struct Checker<'m> {
 	/// are recorded once at mint time and persist, because the parameter is baked into a
 	/// stored signature and its bound must still resolve at every call site.
 	pub(crate) synthetic_bounds: FxHashMap<ParamIdx, Vec<DefId>>,
+	/// Full bounds for synthetic opaque interface types, including their generic
+	/// arguments. Used when checking that a concrete return value implements the
+	/// declared opaque interface with the exact associated arguments.
+	pub(crate) synthetic_bound_details: FxHashMap<ParamIdx, Vec<crate::iface::Bound>>,
 	/// Set only while checking an interface's own default-method body
 	/// (`check_interface_default_body`, Slice 4C-b): `(interface, this's ParamIdx)`.
 	/// `resolve_method` consults this to resolve a call to another method of *this
@@ -440,6 +444,7 @@ impl<'m> Checker<'m> {
 			alias_depth: 0,
 			synthetic_params: 0,
 			synthetic_bounds: FxHashMap::default(),
+			synthetic_bound_details: FxHashMap::default(),
 			checking_interface_default: None,
 			annotations: crate::annotate::Annotations::default(),
 			pending_operators: Vec::new(),

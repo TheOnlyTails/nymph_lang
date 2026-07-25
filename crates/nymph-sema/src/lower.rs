@@ -273,7 +273,7 @@ impl Checker<'_> {
 			// arguments were lowered above to validate them; the parameter itself stands in
 			// for "some type implementing it", and its bound is recorded so method calls on
 			// it resolve through the interface.
-			DefKind::Interface { .. } => self.mint_synthetic_param(def),
+			DefKind::Interface { .. } => self.mint_synthetic_param(def, positional, named),
 			_ => {
 				self.emit(
 					span,
@@ -290,15 +290,51 @@ impl Checker<'_> {
 	/// `interface` as its bound. Synthetic indices sit far above any declared generic so
 	/// they never collide within a signature (see `Checker::SYNTHETIC_PARAM_BASE`, which
 	/// callers instantiating a signature at a use site key off to freshen these too).
-	fn mint_synthetic_param(&mut self, interface: DefId) -> Ty {
+	fn mint_synthetic_param(
+		&mut self,
+		interface: DefId,
+		positional: Vec<Ty>,
+		named: Vec<(EcoString, Ty)>,
+	) -> Ty {
 		let idx = ParamIdx(Self::SYNTHETIC_PARAM_BASE + self.synthetic_params);
 		self.synthetic_params += 1;
+		let generic_names = self
+			.interfaces
+			.get(&interface)
+			.map(|definition| definition.generics.clone())
+			.unwrap_or_default();
+		let args = generic_names
+			.into_iter()
+			.enumerate()
+			.filter_map(|(position, name)| {
+				positional
+					.get(position)
+					.copied()
+					.or_else(|| {
+						named
+							.iter()
+							.find(|(label, _)| label == &name)
+							.map(|(_, ty)| *ty)
+					})
+					.map(|ty| (name, ty))
+			})
+			.collect();
 		self
 			.synthetic_bounds
 			.entry(idx)
 			.or_default()
 			.push(interface);
-		self.interner.mk_param(idx)
+		let ty = self.interner.mk_param(idx);
+		self
+			.synthetic_bound_details
+			.entry(idx)
+			.or_default()
+			.push(crate::iface::Bound {
+				ty,
+				interface,
+				args,
+			});
+		ty
 	}
 
 	fn expand_alias(

@@ -333,17 +333,6 @@ class NymphListIterator {
 	}
 }
 
-class NymphMapIterator {
-	constructor(entries) {
-		this.entries = entries;
-	}
-	next() {
-		const entry = this.entries.next();
-		if (entry.done) return NYMPH_OPTION_NONE;
-		return { [NYMPH_TAG]: NYMPH_OPTION_SOME, value: new NTuple(entry.value) };
-	}
-}
-
 class NymphRange {
 	constructor({ start, end, inclusive }) {
 		this.start = start;

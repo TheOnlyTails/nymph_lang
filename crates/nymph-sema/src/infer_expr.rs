@@ -2758,6 +2758,16 @@ impl<'m> Checker<'m> {
 			// (the iterator `iter()` returns is a distinct value, resolved and
 			// gated separately were it ever user-callable — out of scope here).
 			self.gate_mutating(iface, "iter", self_is_mut, iterable.span);
+			if let Some(method) = self.resolve_method(ty, "iter", &[], &[], iterable.span) {
+				self.annotations.record_iter_resolution(
+					iterable.id,
+					Resolution {
+						method: "iter".into(),
+						dispatch: dispatch_kind_for_method_call(&method),
+						impl_span: method.impl_span,
+					},
+				);
+			}
 			self
 				.annotations
 				.record_iter_mode(iterable.id, IterMode::ViaIter);

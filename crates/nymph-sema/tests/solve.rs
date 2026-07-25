@@ -546,15 +546,13 @@ fn two_impl_trait_parameters_of_the_same_interface_are_independent() {
 #[test]
 fn impl_trait_return_position_stays_rejected_when_it_disagrees_with_the_body() {
 	// A param-position and a return-position mention of the same interface
-	// name mint *different* synthetic `Param`s, so they never unify — the
-	// callee's own body-check rejects this regardless of any call site, and
-	// call-site instantiation (this slice) neither fixes nor breaks that: only
-	// synthetics occurring in parameter position are freshened at a use site,
-	// exactly like today's behavior kept return-position rigid.
+	// name mint *different* opaque types. The callee cannot promise one stable
+	// concrete return implementor by forwarding an arbitrary argument, so the
+	// body check rejects it through the opaque return's interface obligation.
 	assert_error_contains(
 		"interface Area { func area(): int }
 		 func id(x: Area): Area = x",
-		"mismatched types",
+		"does not implement `Area`",
 	);
 }
 

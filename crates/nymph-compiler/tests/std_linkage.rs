@@ -751,6 +751,46 @@ fn mixed_primitive_equals_method_matches_the_operator_fast_path() {
 #[test]
 fn boxed_lists_and_maps_iterate_through_the_uniform_protocol() {
 	let entry = r#"
+		func encode_entries(entries: #[#(int, int)]): int = {
+			let mut encoded = 0
+			for (#(key, value) in entries) encoded = encoded * 100 + key * 10 + value
+			encoded
+		}
+		func explicit_map_iteration(values: #{int: int}): int = {
+			let mut iterator = values.iter()
+			let mut encoded = 0
+			encoded = match (iterator.next()) {
+				Some(#(key, value)) -> encoded * 100 + key * 10 + value,
+				None -> -1,
+			}
+			encoded = match (iterator.next()) {
+				Some(#(key, value)) -> encoded * 100 + key * 10 + value,
+				None -> -1,
+			}
+			encoded = match (iterator.next()) {
+				Some(#(key, value)) -> encoded * 100 + key * 10 + value,
+				None -> -1,
+			}
+			match (iterator.next()) {
+				Some(_) -> -2,
+				None -> match (iterator.next()) {
+					Some(_) -> -3,
+					None -> encoded,
+				},
+			}
+		}
+		func for_map_iteration(values: #{int: int}): int = {
+			let mut encoded = 0
+			for (#(key, value) in values) encoded = encoded * 100 + key * 10 + value
+			encoded
+		}
+		struct MapFactory(calls: int)
+		impl mut MapFactory {
+			mut func make(): #{int: int} = {
+				this.calls = this.calls + 1
+				#{1: 2, 3: 4}
+			}
+		}
 		func list_sum(): int = {
 			let mut total = 0
 			for (value in #[1, 2, 3, 4]) total = total + value
@@ -771,6 +811,16 @@ fn boxed_lists_and_maps_iterate_through_the_uniform_protocol() {
 			for (#(1, value) in #{1: 10, 2: 20}) total = total + value
 			total
 		}
+		func map_iteration_contract(): #(int, int, int, int, int) = {
+			let values = #{1: 2, 3: 4, 5: 6}
+			let entries_sequence = encode_entries(values.entries())
+			let explicit = explicit_map_iteration(values)
+			let first_for = for_map_iteration(values)
+			let second_for = for_map_iteration(values)
+			let mut factory = MapFactory(calls = 0)
+			for (_ in factory.make()) {}
+			#(entries_sequence, explicit, first_for, second_for, factory.calls as int)
+		}
 		func main(): void = {}
 	"#;
 	let load = only_entry("main", entry);
@@ -779,11 +829,24 @@ fn boxed_lists_and_maps_iterate_through_the_uniform_protocol() {
 	let list_sum = compiled.entry_symbol("list_sum");
 	let map_sum = compiled.entry_symbol("map_sum");
 	let pattern_sum = compiled.entry_symbol("pattern_sum");
+	let map_iteration_contract = compiled.entry_symbol("map_iteration_contract");
 	let mut js = compiled.js;
 	js.push_str(&format!(
-		"\nconsole.log({list_sum}().v, {map_sum}().v, {pattern_sum}().v);\n"
+		"\nconsole.log({list_sum}().v, {map_sum}().v, {pattern_sum}().v);\n\
+		 console.log({map_iteration_contract}().v.map(value => value.v).join(' '));\n"
 	));
-	assert_eq!(run_node(&js, "boxed_iteration"), "10 33 90");
+	let output = run_node(&js, "boxed_iteration");
+	let mut lines = output.lines();
+	assert_eq!(lines.next(), Some("10 33 90"));
+	let contract: Vec<_> = lines.next().unwrap().split_whitespace().collect();
+	assert_eq!(contract.len(), 5);
+	assert_eq!(contract[0], contract[1], "entries and explicit iter differ");
+	assert_eq!(contract[1], contract[2], "explicit iter and for differ");
+	assert_eq!(
+		contract[2], contract[3],
+		"unchanged map iteration is unstable"
+	);
+	assert_eq!(contract[4], "1", "for source expression ran more than once");
 }
 
 /// The ambient `string` methods (now `core`, linked to `string.ts`): a program

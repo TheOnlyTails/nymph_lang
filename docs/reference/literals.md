@@ -188,6 +188,10 @@ and span multiple lines.
 Other [Iterators](./stdlib/iter#Iterator) may be spread into a map using the `...` operator,
 so long as their `Item` type is a tuple containing the key and value types of the map.
 
+Iterating a map yields `#(key, value)` tuples in the same sequence returned by `entries()`.
+Repeated iteration of an unchanged map instance preserves that sequence. The order is otherwise
+unspecified—including across separate map instances—and mutation may change it.
+
 ```nymph
 #{"apple": 1, "banana": 2, "cherry": 3}
 #{}

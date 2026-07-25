@@ -39,5 +39,5 @@ impl<K: Hash, V> Contains<Item = K> for #{K: V} {
 }
 
 impl<K: Hash, V> Iterable<#(K, V)> for #{K: V} {
-  external(iter) func iter(): Iterator<#(K, V)>
+  func iter(): Iterator<#(K, V)> = this.entries().iter()
 }

@@ -231,6 +231,18 @@ impl Checker<'_> {
 	pub(crate) fn subtype(&mut self, sub: Ty, sup: Ty, span: Span) {
 		let sub = self.shallow_resolve(sub);
 		let sup = self.shallow_resolve(sup);
+		if let TyKind::Param(idx) = self.interner.kind(sup)
+			&& let Some(bounds) = self.synthetic_bound_details.get(idx).cloned()
+		{
+			for bound in bounds {
+				if !self.holds(sub, bound.interface, &bound.args, 0) {
+					let ty = self.display(sub);
+					let interface = self.defs.data(bound.interface).name.clone();
+					self.emit(span, TypeError::BoundNotSatisfied { ty, interface });
+				}
+			}
+			return;
+		}
 		match (self.interner.kind(sub), self.interner.kind(sup)) {
 			(TyKind::Never, _) | (TyKind::Error, _) | (_, TyKind::Error) => {}
 			// `mut T <: mut U` iff `T <: U` (inner variance carries through).

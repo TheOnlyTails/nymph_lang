@@ -120,6 +120,12 @@ Note that `Bag` itself need not be bound `mut` — only the `Iterator` the loop 
 (`b.iter()`'s result, held internally) needs to be, and the loop's own desugaring takes care of
 that.
 
+Maps implement `Iterable<#(K, V)>` in ordinary Nymph by returning
+`this.entries().iter()`. Explicitly consuming a map's iterator and iterating it with `for` therefore
+yield the same key-value tuple sequence. Repeated iteration of an unchanged map instance is stable,
+but map order is otherwise unspecified: separate map instances need not have the same order, and
+mutation may change it. As with every `for` source, the map expression is evaluated exactly once.
+
 > [!NOTE] Real `Iterator`/`Iterable` come from the standard library
 > The stdlib defines the real `Iterator`/`Iterable` interfaces in
 > [`@/iter`](./stdlib/iter#Iterator) — the versions declared inline above are for illustration

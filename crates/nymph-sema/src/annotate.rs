@@ -101,6 +101,8 @@ pub struct Annotations {
 	positional_fields: FxHashMap<Span, EcoString>,
 	/// A `for` loop's iterable, keyed by its own `NodeId` — see [`IterMode`].
 	iter_modes: FxHashMap<NodeId, IterMode>,
+	/// Resolution of the implicit `.iter()` call inserted for an iterable source.
+	iter_resolutions: FxHashMap<NodeId, Resolution>,
 	/// NodeId of a committed anonymous-closure-parameter (`$N`) boundary → its
 	/// arity (Slice: `$N` anonymous closure params). Populated by the
 	/// checker's type-directed boundary search (`anon_closure.rs`) as each
@@ -182,6 +184,16 @@ impl Annotations {
 	/// The [`IterMode`] recorded for a `for` loop's iterable, if any.
 	pub fn iter_mode_of(&self, id: NodeId) -> Option<IterMode> {
 		self.iter_modes.get(&id).copied()
+	}
+
+	pub(crate) fn record_iter_resolution(&mut self, id: NodeId, resolution: Resolution) {
+		if id != NodeId::DUMMY {
+			self.iter_resolutions.insert(id, resolution);
+		}
+	}
+
+	pub fn iter_resolution_of(&self, id: NodeId) -> Option<&Resolution> {
+		self.iter_resolutions.get(&id)
 	}
 
 	/// Record `id` as a committed anonymous-closure-parameter boundary with

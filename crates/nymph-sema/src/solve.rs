@@ -77,7 +77,15 @@ impl Checker<'_> {
 			}
 		}
 		if let Some(interfaces) = self.synthetic_bounds.get(&param) {
-			bounds.extend(interfaces.iter().map(|&interface| (interface, Vec::new())));
+			for &interface in interfaces {
+				let args = self
+					.synthetic_bound_details
+					.get(&param)
+					.and_then(|details| details.iter().find(|bound| bound.interface == interface))
+					.map(|bound| bound.args.clone())
+					.unwrap_or_default();
+				bounds.push((interface, args));
+			}
 		}
 		bounds
 	}
@@ -917,7 +925,7 @@ impl Checker<'_> {
 				.iter()
 				.map(|t| self.subst(*t, subst, Some(recv)))
 				.collect();
-			let ret = self.subst(method.ret, subst, Some(recv));
+			let ret = self.instantiate_opaque_return(method.ret, subst, recv);
 			return Some((params, ret, MethodSource::ImplDirect));
 		}
 
@@ -946,7 +954,51 @@ impl Checker<'_> {
 			.iter()
 			.map(|t| self.subst(*t, &isubst, Some(recv)))
 			.collect();
-		let ret = self.subst(method.ret, &isubst, Some(recv));
+		let ret = self.instantiate_opaque_return(method.ret, &isubst, recv);
 		Some((params, ret, MethodSource::InterfaceDefault))
+	}
+
+	/// Instantiate an opaque interface return at the call site while retaining its
+	/// interface arguments. A rigid synthetic parameter belongs to the declaration's
+	/// generic scope; reusing it would leave arguments such as `#(K, V)` unsubstituted
+	/// when a caller invokes methods on the returned iterator.
+	fn instantiate_opaque_return(
+		&mut self,
+		ret: Ty,
+		subst: &FxHashMap<ParamIdx, Ty>,
+		recv: Ty,
+	) -> Ty {
+		let TyKind::Param(source) = self.interner.kind(ret) else {
+			return self.subst(ret, subst, Some(recv));
+		};
+		let source = *source;
+		let Some(details) = self.synthetic_bound_details.get(&source).cloned() else {
+			return self.subst(ret, subst, Some(recv));
+		};
+		let idx = ParamIdx(Self::SYNTHETIC_PARAM_BASE + self.synthetic_params);
+		self.synthetic_params += 1;
+		let ty = self.interner.mk_param(idx);
+		for bound in details {
+			let args = bound
+				.args
+				.into_iter()
+				.map(|(name, arg)| (name, self.subst(arg, subst, Some(recv))))
+				.collect();
+			self
+				.synthetic_bounds
+				.entry(idx)
+				.or_default()
+				.push(bound.interface);
+			self
+				.synthetic_bound_details
+				.entry(idx)
+				.or_default()
+				.push(crate::iface::Bound {
+					ty,
+					interface: bound.interface,
+					args,
+				});
+		}
+		ty
 	}
 }

@@ -31,6 +31,11 @@ cursor walking it — implements `Iterable<T>` instead. A `for` loop over an `It
 [Iterables](../iteration#iterables) for a full worked implementation, including why the source
 binding itself doesn't need to be `mut` even though the `Iterator` it produces does.
 
+For maps, `Iterable<#(K, V)>.iter()` is ordinary Nymph and delegates to
+`this.entries().iter()`. It consequently has the same entry sequence as map `for` iteration. That
+sequence is stable when the same map instance is iterated repeatedly without mutation, but its
+order is otherwise unspecified, including across distinct instances.
+
 > [!NOTE] Illustrative, not imported
 > Every sample on this page mirrors `@/iter`'s real declarations, but user programs can't `import`
 > stdlib modules yet — see the note on [Declarations](../declarations#imports). The

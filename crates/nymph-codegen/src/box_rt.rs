@@ -85,7 +85,7 @@ fn class_defs(export: bool) -> String {
 	for (class, _) in BOX_CLASSES {
 		if *class == "NMap" {
 			out.push_str(&format!(
-				"{kw}class {class} extends {BASE} {{\n\tconstructor(entries) {{\n\t\tsuper(new NymphHamt(entries));\n\t}}\n\tget size() {{ return this.v.size; }}\n\tget(key) {{ return this.v.get(key); }}\n\thas(key) {{ return this.v.has(key); }}\n\tset(key, value) {{ this.v.set(key, value); return this; }}\n\tdelete(key) {{ return this.v.delete(key); }}\n\tclear() {{ this.v.clear(); }}\n\tkeys() {{ return this.v.keys(); }}\n\tvalues() {{ return this.v.values(); }}\n\tentries() {{ return this.v.entries(); }}\n\titer() {{ return new NymphMapIterator(this.v.entries()); }}\n\t[Symbol.iterator]() {{ return this.v[Symbol.iterator](); }}\n}}\n"
+				"{kw}class {class} extends {BASE} {{\n\tconstructor(entries) {{\n\t\tsuper(new NymphHamt(entries));\n\t}}\n\tget size() {{ return this.v.size; }}\n\tget(key) {{ return this.v.get(key); }}\n\thas(key) {{ return this.v.has(key); }}\n\tset(key, value) {{ this.v.set(key, value); return this; }}\n\tdelete(key) {{ return this.v.delete(key); }}\n\tclear() {{ this.v.clear(); }}\n\tkeys() {{ return this.v.keys(); }}\n\tvalues() {{ return this.v.values(); }}\n\tentries() {{ return this.v.entries(); }}\n\t[Symbol.iterator]() {{ return this.v[Symbol.iterator](); }}\n}}\n"
 			));
 		} else if *class == "NTuple" {
 			// Native Map's constructor reads pair entries through numeric properties.

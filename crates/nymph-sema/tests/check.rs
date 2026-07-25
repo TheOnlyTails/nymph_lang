@@ -512,6 +512,38 @@ fn for_in_over_generic_iterable_bound_types_the_element() {
 }
 
 #[test]
+fn opaque_iterator_returns_accept_concrete_generic_implementors() {
+	assert_ok(
+		"interface Iterator<Item> { func item(): Item }
+		 struct ListIter<Item>(item: Item)
+		 impl<Item> Iterator<Item> for ListIter<Item> {
+		   func item(): Item = this.item
+		 }
+		 struct MapLike<K, V>(entry: #(K, V))
+		 impl<K, V> MapLike<K, V> {
+		   func iter(): Iterator<#(K, V)> = ListIter(item = this.entry)
+		 }
+		 struct SetLike<Item>(item: Item)
+		 impl<Item> SetLike<Item> {
+		   func iter(): Iterator<Item> = ListIter(item = this.item)
+		 }",
+	);
+}
+
+#[test]
+fn opaque_iterator_returns_preserve_interface_arguments() {
+	assert_error_contains(
+		"interface Iterator<Item> { func item(): Item }
+		 struct StringIter
+		 impl Iterator<string> for StringIter {
+		   func item(): string = \"wrong\"
+		 }
+		 func iter(): Iterator<int> = StringIter",
+		"does not implement `Iterator`",
+	);
+}
+
+#[test]
 fn for_in_over_a_non_iterable_source_is_diagnosed() {
 	// RR1: a source that implements neither `Iterator` nor `Iterable` is a
 	// hard error now, not a silent `self.fresh()` accept that let the loop

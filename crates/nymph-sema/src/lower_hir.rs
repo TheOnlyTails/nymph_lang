@@ -3988,7 +3988,7 @@ impl<'a> Lowerer<'a> {
 				("inclusive".into(), HirExpr::Bool(inclusive)),
 			],
 		};
-		let it_value = Self::it_value_for(IterMode::ViaIter, source);
+		let it_value = Self::direct_it_value_for(IterMode::ViaIter, source);
 		self.push_scope();
 		let stmts = self.drain_loop_stmts(it_value, |s| {
 			let pat = s.lower_pattern(variable);
@@ -4040,7 +4040,7 @@ impl<'a> Lowerer<'a> {
 		});
 
 		let src = self.lower_expr(iterable);
-		let it_value = Self::it_value_for(mode, src);
+		let it_value = self.it_value_for(mode, iterable, src);
 
 		// The whole for-loop is one JS scope, holding the iterator and the
 		// loop-continues flag (plus, via `drain_loop_stmts`, the loop pattern's
@@ -4060,7 +4060,27 @@ impl<'a> Lowerer<'a> {
 	/// and the SS1 spread drain (`lower_spread_source`) both feed their own
 	/// drain loop: `src` itself for [`IterMode::Direct`], `src.iter()` for
 	/// [`IterMode::ViaIter`].
-	fn it_value_for(mode: IterMode, src: HirExpr) -> HirExpr {
+	fn it_value_for(&self, mode: IterMode, iterable: &Expr, src: HirExpr) -> HirExpr {
+		match mode {
+			IterMode::Direct => src,
+			IterMode::ViaIter => {
+				if let Some(resolution) = self.annotations.iter_resolution_of(iterable.id)
+					&& resolution.dispatch == DispatchKind::UserImplDefaultMethod
+					&& let Some(RuntimeDispatch::TopLevel(mangled)) =
+						self.try_lower_runtime_dispatch(resolution, false)
+				{
+					HirExpr::Call {
+						callee: Box::new(HirExpr::Local(mangled)),
+						args: vec![src],
+					}
+				} else {
+					Self::direct_it_value_for(mode, src)
+				}
+			}
+		}
+	}
+
+	fn direct_it_value_for(mode: IterMode, src: HirExpr) -> HirExpr {
 		match mode {
 			IterMode::Direct => src,
 			IterMode::ViaIter => HirExpr::Call {
@@ -4258,7 +4278,7 @@ impl<'a> Lowerer<'a> {
 			)
 		});
 		let src = self.lower_expr(e);
-		let it_value = Self::it_value_for(mode, src);
+		let it_value = self.it_value_for(mode, e, src);
 		self.drain_to_array(it_value)
 	}
 
