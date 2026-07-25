@@ -1876,6 +1876,25 @@ fn lowers_string_interpolation_through_display() {
 }
 
 #[test]
+fn lowers_balanced_block_inside_string_interpolation() {
+	let hir = lower(r#"func f(): string = "value=${{ let n = 1 n }}""#);
+	let HirExpr::InterpolatedString(parts) = &hir.funcs[0].body else {
+		panic!("expected interpolated string");
+	};
+	assert_eq!(parts[0], HirExpr::Str("value=".into()));
+	let HirExpr::ExternCall {
+		module,
+		symbol,
+		args,
+	} = &parts[1]
+	else {
+		panic!("expected Display call for interpolated block");
+	};
+	assert_eq!((*module, *symbol), ("std/display", "display"));
+	assert!(matches!(args.as_slice(), [HirExpr::Block { .. }]));
+}
+
+#[test]
 fn lowers_leading_interpolation_without_a_coercion_prefix() {
 	let hir = lower(r#"func f(n: int): string = "${n}!""#);
 	assert_eq!(

@@ -292,17 +292,38 @@ fn string_interpolation_accepts_one_complete_expression() {
 }
 
 #[test]
-fn interpolation_brace_balancing_remains_out_of_scope() {
-	// Issue #20 validates the parser's exactly-one-expression rule. The lexer still
-	// stops at the first `}`, so brace-containing block and match expressions remain
-	// unsupported until issue #19 adds balanced interpolation delimiters.
+fn interpolation_parses_balanced_block_and_match_expressions() {
 	for source in [r#""${{ let x = 1 x }}""#, r#""${match (x) { _ -> x }}""#] {
 		let result = parse_expression(source);
 		assert!(
-			!result.diagnostics.is_empty(),
-			"brace-containing interpolation unexpectedly parsed: {source:?}"
+			result.diagnostics.is_empty(),
+			"brace-containing interpolation failed to parse: {source:?}: {:?}",
+			result.diagnostics
 		);
 	}
+}
+
+#[test]
+fn nested_string_interpolation_reaches_the_parser_with_absolute_spans() {
+	let source = r#""outer ${"inner ${{ 1 }}"} tail""#;
+	let result = parse_expression(source);
+	assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+	let ExprKind::String(parts) = result.tree.kind else {
+		panic!("expected outer string");
+	};
+	let StringPart::InterpolatedExpr(inner_string) = &parts[1].0 else {
+		panic!("expected outer interpolation");
+	};
+	assert_eq!(parts[1].1, Span::new(7, 26));
+	assert_eq!(inner_string.span, Span::new(9, 25));
+	let ExprKind::String(inner_parts) = &inner_string.kind else {
+		panic!("expected inner string");
+	};
+	let StringPart::InterpolatedExpr(block) = &inner_parts[1].0 else {
+		panic!("expected nested interpolation");
+	};
+	assert_eq!(inner_parts[1].1, Span::new(16, 24));
+	assert_eq!(block.span, Span::new(18, 23));
 }
 
 #[test]
@@ -402,6 +423,23 @@ fn pattern_operators() {
 		ExprKind::PatternOp { .. }
 	));
 	assert!(matches!(expr("x as float").kind, ExprKind::TypeOp { .. }));
+}
+
+#[test]
+fn merged_bang_keywords_parse_in_outer_and_nested_interpolation() {
+	for operator in ["!in", "!is"] {
+		for source in [
+			r#""${{x} OPERATOR y}""#.replace("OPERATOR", operator),
+			r#""${"nested ${{x} OPERATOR y}"}""#.replace("OPERATOR", operator),
+		] {
+			let result = parse_expression(&source);
+			assert!(
+				result.diagnostics.is_empty(),
+				"{operator} failed in {source:?}: {:?}",
+				result.diagnostics
+			);
+		}
+	}
 }
 
 #[test]

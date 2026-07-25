@@ -42,7 +42,7 @@ fn parse_f64(s: &str) -> f64 {
 pub fn lex(source: &str) -> LexResult {
 	let (output, errors) = lexer().parse(source).into_output_errors();
 	let mut tokens = output.unwrap_or_default();
-	merge_bang_keywords(&mut tokens);
+	normalize_tokens(&mut tokens);
 
 	let diagnostics = errors
 		.into_iter()
@@ -63,6 +63,20 @@ pub fn lex(source: &str) -> LexResult {
 		tokens,
 		diagnostics,
 	}
+}
+
+/// Apply post-lex normalization to this token stream and every interpolation nested in it.
+fn normalize_tokens(tokens: &mut Vec<Spanned<Token>>) {
+	for token in tokens.iter_mut() {
+		if let Token::Str(fragments) = &mut token.0 {
+			for fragment in fragments {
+				if let StrFragment::Interpolation(tokens) = &mut fragment.0 {
+					normalize_tokens(tokens);
+				}
+			}
+		}
+	}
+	merge_bang_keywords(tokens);
 }
 
 /// Merge an adjacent `!` and `in`/`is` keyword into a single `!in` / `!is` token.
@@ -222,14 +236,38 @@ fn string_literal<'src>(
 	))
 	.map(StrFragment::Escape);
 
-	// `${ ... }` — a nested run of tokens. The `and_is(!'}')` lookahead stops the
-	// repetition at the closing brace. (Nested `{}` inside interpolation is a known
-	// v1 limitation.)
-	let interpolation = token
-		.padded()
-		.and_is(just('}').not())
+	// Reuse the normal token parser inside interpolation. Only brace-delimited token
+	// groups are special here: consume each group recursively so its closing brace
+	// cannot be mistaken for the interpolation's closing brace. Strings, chars, and
+	// comments therefore retain exactly their ordinary lexing behavior, including
+	// recursively nested string interpolation.
+	let non_brace = token
+		.clone()
+		.filter(|token| !matches!(token.0, Token::LBrace | Token::HashLBrace | Token::RBrace));
+	let balanced_braces = recursive(|balanced| {
+		let opening = token
+			.clone()
+			.filter(|token| matches!(token.0, Token::LBrace | Token::HashLBrace));
+		let closing = token.clone().filter(|token| token.0 == Token::RBrace);
+		opening
+			.then(
+				choice((balanced, non_brace.clone().map(|token| vec![token])))
+					.repeated()
+					.collect::<Vec<Vec<Spanned<Token>>>>(),
+			)
+			.then(closing)
+			.map(|((opening, groups), closing)| {
+				let mut tokens = Vec::with_capacity(2 + groups.iter().map(Vec::len).sum::<usize>());
+				tokens.push(opening);
+				tokens.extend(groups.into_iter().flatten());
+				tokens.push(closing);
+				tokens
+			})
+	});
+	let interpolation = choice((balanced_braces, non_brace.map(|token| vec![token])))
 		.repeated()
-		.collect::<Vec<Spanned<Token>>>()
+		.collect::<Vec<Vec<Spanned<Token>>>>()
+		.map(|groups| groups.into_iter().flatten().collect())
 		.padded()
 		.map(StrFragment::Interpolation)
 		.delimited_by(just("${"), just('}'));
@@ -556,6 +594,96 @@ mod tests {
 			other => panic!("expected interpolation, got {other:?}"),
 		}
 		assert_eq!(frags[2].0, StrFragment::Text("!".into()));
+	}
+
+	#[test]
+	fn interpolation_balances_braces_with_absolute_spans() {
+		let result = lex(r#"prefix "${{ #{1: {2}} }}" suffix"#);
+		assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+		let Token::Str(fragments) = &result.tokens[1].0 else {
+			panic!("expected string");
+		};
+		let StrFragment::Interpolation(inner) = &fragments[0].0 else {
+			panic!("expected interpolation");
+		};
+		assert_eq!(fragments[0].1, Span::new(8, 24));
+		assert_eq!(
+			inner
+				.iter()
+				.map(|token| (&token.0, token.1))
+				.collect::<Vec<_>>(),
+			vec![
+				(&Token::LBrace, Span::new(10, 11)),
+				(&Token::HashLBrace, Span::new(12, 14)),
+				(&Token::Int(1), Span::new(14, 15)),
+				(&Token::Colon, Span::new(15, 16)),
+				(&Token::LBrace, Span::new(17, 18)),
+				(&Token::Int(2), Span::new(18, 19)),
+				(&Token::RBrace, Span::new(19, 20)),
+				(&Token::RBrace, Span::new(20, 21)),
+				(&Token::RBrace, Span::new(22, 23)),
+			]
+		);
+	}
+
+	#[test]
+	fn interpolation_ignores_braces_in_literals_comments_and_nested_interpolation() {
+		for source in [
+			r#""${f("}", '{', "${{ 1 }}")}""#,
+			r#""${{ /* } { */ 1 // }
+			}}""#,
+		] {
+			let result = lex(source);
+			assert!(
+				result.diagnostics.is_empty(),
+				"diagnostics for {source:?}: {:?}",
+				result.diagnostics
+			);
+		}
+	}
+
+	#[test]
+	fn escaped_interpolation_stays_literal_without_corrupting_brace_depth() {
+		let source = r#""${f("\${...}", { 1 })}""#;
+		let result = lex(source);
+		assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+		let Token::Str(outer) = &result.tokens[0].0 else {
+			panic!("expected outer string");
+		};
+		let StrFragment::Interpolation(tokens) = &outer[0].0 else {
+			panic!("expected outer interpolation");
+		};
+		let Token::Str(inner) = &tokens[2].0 else {
+			panic!("expected nested string");
+		};
+		assert_eq!(inner.len(), 2);
+		assert_eq!(inner[0].0, StrFragment::Escape(StringEscape::Interpolation));
+		assert_eq!(inner[1].0, StrFragment::Text("...}".into()));
+		assert!(
+			inner
+				.iter()
+				.all(|fragment| !matches!(fragment.0, StrFragment::Interpolation(_)))
+		);
+		assert_eq!(tokens.last().map(|token| &token.0), Some(&Token::RParen));
+	}
+
+	#[test]
+	fn unterminated_balanced_interpolation_reports_a_diagnostic() {
+		for source in [r#""${{ 1 }""#, r#""${"nested ${1}""#] {
+			let result = lex(source);
+			assert!(
+				!result.diagnostics.is_empty(),
+				"unterminated source produced no diagnostic: {source:?}"
+			);
+			assert!(
+				result
+					.diagnostics
+					.iter()
+					.all(|diagnostic| diagnostic.span.end <= source.len()),
+				"diagnostic spans escaped source: {:?}",
+				result.diagnostics
+			);
+		}
 	}
 
 	#[test]
