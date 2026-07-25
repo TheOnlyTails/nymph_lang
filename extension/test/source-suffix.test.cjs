@@ -23,7 +23,7 @@ void test(".nym is the extension's sole source suffix", () => {
 
 void test("maintained guidance rejects the legacy suffix without renaming nymph scopes", () => {
 	const roots = ["extension", ".vscode", "examples", "docs", "reference"];
-	const ignoredDirectories = new Set([".vscode-test", "node_modules", "out"]);
+	const ignoredDirectories = new Set([".vscode-test", "node_modules", "out", "server"]);
 	const scopeKeys = new Set(["contentName", "include", "name", "scopeName"]);
 	const recognizedScopes = new Set();
 	const manifest = JSON.parse(fs.readFileSync(path.join(extensionRoot, "package.json"), "utf8"));

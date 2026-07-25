@@ -1,24 +1,47 @@
-name: Publish VSCode Extension
+name: Package VSCode Extension
 on:
   workflow_dispatch:
+  pull_request:
+    paths: ["extension/**", ".github/workflows/vscode.yml"]
 
 jobs:
-  publish:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./extension
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { vscode: linux-x64, rust: x86_64-unknown-linux-gnu, runner: ubuntu-latest }
+          - { vscode: linux-arm64, rust: aarch64-unknown-linux-gnu, runner: ubuntu-latest }
+          - { vscode: win32-x64, rust: x86_64-pc-windows-gnu, runner: ubuntu-latest }
+          - { vscode: win32-arm64, rust: aarch64-pc-windows-gnullvm, runner: ubuntu-latest }
+          - { vscode: darwin-x64, rust: x86_64-apple-darwin, runner: macos-15 }
+          - { vscode: darwin-arm64, rust: aarch64-apple-darwin, runner: macos-15 }
+    runs-on: ${{ matrix.runner }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v6 # uses version from packageManager field
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
         with:
           run_install: true
-          package_json_file: ../package.json
-      - name: Check VS Code API floor
-        run: pnpm --dir .. check:vscode-api-floor
-      - name: Publish
-        run: pnpm run deploy
-        env:
-          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: ${{ matrix.rust }}
+      - uses: taiki-e/setup-cross-toolchain-action@v1
+        if: ${{ !startsWith(matrix.vscode, 'darwin-') }}
+        with:
+          target: ${{ matrix.rust }}
+      - name: Compile and run static extension tests
+        run: pnpm --filter nymph test:unit
+      - name: Cross-build language server
+        run: cargo build --release -p nymph-lsp --target ${{ matrix.rust }}
+      - name: Stage matching language server
+        run: pnpm --filter nymph stage:server ${{ matrix.vscode }} ../target/${{ matrix.rust }}/release/nymph-lsp${{ startsWith(matrix.vscode, 'win32-') && '.exe' || '' }}
+      - name: Package target VSIX
+        working-directory: extension
+        run: pnpm exec vsce package --no-dependencies --target ${{ matrix.vscode }} --out nymph-${{ matrix.vscode }}.vsix
+      - name: Verify VSIX contents
+        working-directory: extension
+        run: node scripts/verify-vsix.cjs nymph-${{ matrix.vscode }}.vsix ${{ matrix.vscode }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: nymph-${{ matrix.vscode }}
+          path: extension/nymph-${{ matrix.vscode }}.vsix

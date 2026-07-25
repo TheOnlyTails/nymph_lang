@@ -119,7 +119,7 @@ Option B: Manual testing
 1. **VS Code starts** - reads `package.json`
 2. **User opens .nym file** - triggers `onLanguage:nymph` activation
 3. **activate()** function runs:
-   - Resolves LSP server binary path from build output
+   - Resolves the bundled LSP server binary inside the extension
    - Creates `LanguageClient` with stdio transport
    - Calls `client.start()`
    - Server process launches with JSON-RPC protocol
@@ -147,12 +147,9 @@ Language Client -> VS Code UI
 
 ### Server Binary Discovery
 
-The extension looks for the LSP server at:
-
-1. **Release build** (preferred): `../target/release/nymph-lsp`
-2. **Debug build** (fallback): `../target/debug/nymph-lsp`
-
-Both are relative to the extension's directory.
+Target-specific packages contain `server/nymph-lsp` (`server/nymph-lsp.exe` on
+Windows). For development, `nymph.server.path` can explicitly select an
+absolute locally built executable.
 
 ### File Extensions
 
@@ -200,9 +197,9 @@ Check the extension's output panel:
 
 Common causes:
 
-- Binary not built: `cargo build --release --package nymph-lsp`
-- Binary missing: Check `target/release/nymph-lsp` exists
-- Binary not executable: `chmod +x target/release/nymph-lsp`
+- Bundled binary missing: reinstall the VSIX matching your platform.
+- Development override missing: rebuild it and check `nymph.server.path`.
+- Binary not executable: run `chmod +x` on the development override.
 - TypeScript not compiled: `npm run compile` in extension folder
 
 ### "No syntax highlighting"
@@ -225,23 +222,20 @@ Common causes:
 
 ## Publishing
 
-To publish the extension to VS Code Marketplace:
+CI cross-builds and packages one VSIX for each supported target. To package one
+target locally after building its release server:
 
 ```bash
-# Install vsce
-npm install -g @vscode/vsce
-
 # In extension directory
 cd extension
-vsce publish
+pnpm run stage:server linux-x64 ../target/x86_64-unknown-linux-gnu/release/nymph-lsp
+pnpm exec vsce package --target linux-x64
 ```
 
 This requires:
 
-1. Publisher account on VS Code Marketplace
-2. Personal Access Token (PAT) from Azure DevOps
-3. Updated version in `package.json`
-4. Compiled binary in `../target/release/nymph-lsp`
+Use the corresponding Rust triple, VS Code target, and `.exe` filename for the
+other five packages. The package must contain only that target's server.
 
 ## Advanced
 

@@ -14,14 +14,19 @@
 		"directory": "extension"
 	},
 	"publisher": "theonlytails",
-	"main": "./out/extension.js",
+	"main": "./dist/extension.js",
 	"scripts": {
-		"vscode:prepublish": "npm run compile",
+		"vscode:prepublish": "npm run compile && npm run bundle",
 		"compile": "tsc -p ./",
+		"bundle": "esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js",
 		"watch": "tsc -watch -p ./",
 		"test": "pnpm run compile && node --test test/*.test.cjs && pnpm run test:configuration && pnpm run test:smoke",
 		"test:configuration": "node --test out/test/languageConfiguration.test.js",
 		"test:smoke": "node out/test/runTest.js",
+		"test:unit": "pnpm run compile && node --test test/*.test.cjs",
+		"stage:server": "node scripts/stage-server.cjs",
+		"verify:vsix": "node scripts/verify-vsix.cjs",
+		"package:target": "vsce package",
 		"deploy": "vsce publish"
 	},
 	"dependencies": {
@@ -32,10 +37,22 @@
 		"@types/vscode": "1.100.0",
 		"@vscode/test-electron": "^2.5.2",
 		"@vscode/vsce": "^3.9.2",
+		"esbuild": "^0.28.1",
 		"jsonc-parser": "^3.3.1",
 		"typescript": "^7.0.2"
 	},
 	"contributes": {
+		"configuration": {
+			"title": "Nymph",
+			"properties": {
+				"nymph.server.path": {
+					"type": "string",
+					"default": "",
+					"scope": "machine",
+					"description": "Development-only absolute path override for nymph-lsp. Published packages use their bundled server by default."
+				}
+			}
+		},
 		"languages": [
 			{
 				"id": "nymph",

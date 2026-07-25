@@ -15,11 +15,15 @@ pnpm install
 npm run compile
 ```
 
-### 3. Build LSP server
+### 3. Build and stage the LSP server
 
 ```bash
 cargo build --release --package nymph-lsp
+pnpm run stage:server linux-x64 ../target/release/nymph-lsp
 ```
+
+Replace `linux-x64` with your supported VS Code target. During development you
+can instead set `nymph.server.path` to the absolute path of a local server.
 
 ### 4. Test in VS Code
 
@@ -79,8 +83,8 @@ cargo build --package nymph-lsp
 # Test extension in VS Code
 # Press F5 in VS Code
 
-# Package for distribution
-cd extension && vsce package
+# Package one target for distribution after staging its matching release server
+cd extension && pnpm exec vsce package --target linux-x64
 ```
 
 ## File Extensions
@@ -91,9 +95,9 @@ Nymph source files use the `.nym` extension.
 
 **"Server won't start"**
 
-- Build server: `cargo build --release --package nymph-lsp`
-- Check exists: `ls target/release/nymph-lsp`
-- Make executable: `chmod +x target/release/nymph-lsp`
+- Re-run the build and staging commands above.
+- Check that `extension/server/nymph-lsp` exists and is executable.
+- Alternatively, set `nymph.server.path` to an absolute local executable.
 
 **"No syntax highlighting"**
 
@@ -115,10 +119,8 @@ JSON-RPC
 LSP Server (Rust)
 ```
 
-Binary locations:
-
-- Release: `target/release/nymph-lsp` (13MB)
-- Debug: `target/debug/nymph-lsp` (50MB+)
+Published target-specific packages keep the matching executable at
+`extension/server/nymph-lsp` (`nymph-lsp.exe` on Windows).
 
 ## Next Steps
 
