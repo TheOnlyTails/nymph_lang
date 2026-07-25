@@ -124,6 +124,8 @@ pub enum Token {
 	At,
 	/// `,`
 	Comma,
+	/// `;` — not a statement separator, but retained so the parser can diagnose it.
+	Semicolon,
 	/// `:`
 	Colon,
 	/// `::`
@@ -296,6 +298,7 @@ impl Token {
 			Dot => "`.`",
 			At => "`@`",
 			Comma => "`,`",
+			Semicolon => "`;`",
 			Colon => "`:`",
 			ColonColon => "`::`",
 			Underscore => "`_`",

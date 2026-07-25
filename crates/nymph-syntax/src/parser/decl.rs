@@ -26,14 +26,6 @@ impl Parser<'_> {
 			}
 			// Guarantee forward progress even on unrecognised input.
 			if self.position() == before {
-				let span = self.current_span();
-				let found = self.peek().map_or("end of input", Token::describe);
-				self.emit(
-					span,
-					ParseError::ExpectedDeclaration {
-						found: found.into(),
-					},
-				);
 				self.advance();
 				self.recover_to_declaration();
 			}

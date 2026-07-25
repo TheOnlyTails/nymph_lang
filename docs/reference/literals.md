@@ -89,6 +89,11 @@ world!" // newline
 "Hello, \${name}!" // escaped interpolated expression
 ```
 
+Each `${...}` interpolation must contain exactly one complete expression. Empty interpolations and
+extra content after that expression are invalid. Grouped expressions, calls, and closures are
+supported, for example `${(a + b)}`, `${format(value)}`, and `${x -> x + 1}`. Interpolations that
+contain braces, such as block and `match` expressions, are not currently supported.
+
 ## Identifiers
 
 Identifiers are names for variables, functions, types, and other constructs.

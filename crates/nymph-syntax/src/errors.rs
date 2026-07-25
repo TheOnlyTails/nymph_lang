@@ -63,6 +63,10 @@ pub enum ParseError {
 	/// (`mut n: int`). Field mutability is expressed on the field's *type*
 	/// (`n: mut int`), not as a modifier on the field itself.
 	MutFieldModifier,
+	/// A string interpolation contained no expression.
+	EmptyInterpolation,
+	/// Tokens remained after the single expression in a string interpolation.
+	TrailingInterpolationContent,
 }
 
 impl IntoDiagnostic for ParseError {
@@ -99,6 +103,10 @@ impl IntoDiagnostic for ParseError {
 			E::MutFieldModifier => {
 				"a field's mutability is written on its type (`n: mut int`), not as a `mut` field modifier"
 					.into()
+			}
+			E::EmptyInterpolation => "string interpolation requires an expression".into(),
+			E::TrailingInterpolationContent => {
+				"unexpected trailing content in string interpolation".into()
 			}
 		}
 	}

@@ -531,7 +531,16 @@ impl Parser<'_> {
 					// resolution/type (e.g. the operator's dispatch, lost at lowering as "no
 					// operator resolution recorded").
 					sub.next_id = self.next_id;
-					let expr = sub.parse_expr();
+					let expr = if sub.at_end() {
+						sub.emit(fragment.1, ParseError::EmptyInterpolation);
+						sub.mk_expr(ExprKind::Tuple(Vec::new()), fragment.1)
+					} else {
+						let expr = sub.parse_expr();
+						if !sub.at_end() {
+							sub.emit(sub.current_span(), ParseError::TrailingInterpolationContent);
+						}
+						expr
+					};
 					self.next_id = sub.next_id;
 					self.diagnostics.extend(sub.diagnostics);
 					parts.push(Spanned(StringPart::InterpolatedExpr(expr), fragment.1));

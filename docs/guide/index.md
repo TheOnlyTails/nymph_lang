@@ -14,8 +14,8 @@ parameters, a return type, and a body that's a single expression.
 func greet(name: string): string = "Hello, ${name}!"
 ```
 
-`${…}` inside a string is interpolation — any expression goes between the braces. A body with more
-than one step is a block, whose last expression is the value the function returns:
+`${…}` inside a string is interpolation — exactly one complete expression goes between the braces.
+A body with more than one step is a block, whose last expression is the value the function returns:
 
 ```nym
 func average_scaled(a: int, b: int, scale: int): float = {

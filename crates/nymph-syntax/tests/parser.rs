@@ -2,8 +2,9 @@
 //! (lex → parse).
 
 use nymph_ast::{
+	Span,
 	decl::{Declaration, FuncDeclaration, FuncKind, ImplMember, LetKind},
-	expr::{Expr, ExprKind, RangeKind},
+	expr::{Expr, ExprKind, RangeKind, StringPart},
 	ops::BinaryOperator,
 	ty::Type,
 };
@@ -159,6 +160,158 @@ fn string_interpolation() {
 		parts[1].0,
 		nymph_ast::expr::StringPart::InterpolatedExpr(_)
 	));
+}
+
+#[test]
+fn empty_string_interpolation_has_a_focused_diagnostic() {
+	for source in [r#""${}""#, r#""${   }""#] {
+		let result = parse_expression(source);
+		assert_eq!(
+			result.diagnostics.len(),
+			1,
+			"diagnostics for {source:?}: {:?}",
+			result.diagnostics
+		);
+		let diagnostic = &result.diagnostics[0];
+		assert_eq!(
+			diagnostic.message,
+			"string interpolation requires an expression"
+		);
+		assert_eq!(diagnostic.span, nymph_ast::Span::new(1, source.len() - 1));
+	}
+}
+
+#[test]
+fn trailing_string_interpolation_content_has_a_focused_diagnostic() {
+	for (source, trailing_span) in [
+		(r#""${a b}""#, nymph_ast::Span::new(5, 6)),
+		(r#""${a; b}""#, nymph_ast::Span::new(4, 5)),
+	] {
+		let result = parse_expression(source);
+		assert_eq!(
+			result.diagnostics.len(),
+			1,
+			"diagnostics for {source:?}: {:?}",
+			result.diagnostics
+		);
+		let diagnostic = &result.diagnostics[0];
+		assert_eq!(
+			diagnostic.message,
+			"unexpected trailing content in string interpolation"
+		);
+		assert_eq!(diagnostic.span, trailing_span);
+	}
+}
+
+#[test]
+fn string_interpolation_accepts_one_complete_expression() {
+	for source in [
+		r#""${(a + b)}""#,
+		r#""${x -> x + 1}""#,
+		r#""${outer(inner(a + b))}""#,
+	] {
+		expr(source);
+	}
+}
+
+#[test]
+fn interpolation_brace_balancing_remains_out_of_scope() {
+	// Issue #20 validates the parser's exactly-one-expression rule. The lexer still
+	// stops at the first `}`, so brace-containing block and match expressions remain
+	// unsupported until issue #19 adds balanced interpolation delimiters.
+	for source in [r#""${{ let x = 1 x }}""#, r#""${match (x) { _ -> x }}""#] {
+		let result = parse_expression(source);
+		assert!(
+			!result.diagnostics.is_empty(),
+			"brace-containing interpolation unexpectedly parsed: {source:?}"
+		);
+	}
+}
+
+#[test]
+fn invalid_interpolation_recovers_to_later_string_fragments() {
+	let result = parse_expression(r#""${a b} text ${c d} tail""#);
+	assert_eq!(
+		result
+			.diagnostics
+			.iter()
+			.map(|diagnostic| (diagnostic.message.as_str(), diagnostic.span))
+			.collect::<Vec<_>>(),
+		vec![
+			(
+				"unexpected trailing content in string interpolation",
+				Span::new(5, 6)
+			),
+			(
+				"unexpected trailing content in string interpolation",
+				Span::new(17, 18)
+			),
+		]
+	);
+	let ExprKind::String(parts) = result.tree.kind else {
+		panic!("expected recovered string");
+	};
+	assert_eq!(
+		parts.len(),
+		4,
+		"all later fragments should survive recovery"
+	);
+
+	let StringPart::InterpolatedExpr(first) = &parts[0].0 else {
+		panic!("expected first interpolation, got {:?}", parts[0]);
+	};
+	assert!(matches!(&first.kind, ExprKind::Identifier(name) if name.0 == "a"));
+	assert_eq!(first.span, Span::new(3, 4));
+	assert_eq!(parts[0].1, Span::new(1, 7));
+
+	assert!(matches!(&parts[1].0, StringPart::Text(text) if text == " text "));
+	assert_eq!(parts[1].1, Span::new(7, 13));
+
+	let StringPart::InterpolatedExpr(second) = &parts[2].0 else {
+		panic!("expected second interpolation, got {:?}", parts[2]);
+	};
+	assert!(matches!(&second.kind, ExprKind::Identifier(name) if name.0 == "c"));
+	assert_eq!(second.span, Span::new(15, 16));
+	assert_eq!(parts[2].1, Span::new(13, 19));
+
+	assert!(matches!(&parts[3].0, StringPart::Text(text) if text == " tail"));
+	assert_eq!(parts[3].1, Span::new(19, 24));
+}
+
+#[test]
+fn semicolons_remain_rejected_outside_interpolation() {
+	let top_level = parse_expression("a; b");
+	assert_eq!(top_level.tree.span, Span::new(0, 1));
+	assert_eq!(top_level.diagnostics.len(), 1);
+	assert_eq!(
+		top_level.diagnostics[0].message,
+		"unexpected trailing tokens after expression"
+	);
+	assert_eq!(top_level.diagnostics[0].span, Span::new(1, 2));
+
+	let block = parse_expression("{ a; b }");
+	assert!(matches!(block.tree.kind, ExprKind::Block { .. }));
+	assert_eq!(
+		block
+			.diagnostics
+			.iter()
+			.map(|diagnostic| (diagnostic.message.as_str(), diagnostic.span))
+			.collect::<Vec<_>>(),
+		vec![("expected an expression, found `;`", Span::new(3, 4))]
+	);
+
+	let declaration = parse_module("let a = 1; let b = 2", "test");
+	assert_eq!(
+		declaration.tree.members.len(),
+		2,
+		"recovery should retain the later declaration"
+	);
+	assert_eq!(declaration.diagnostics.len(), 1);
+	assert_eq!(
+		declaration.diagnostics[0].message,
+		"expected a declaration, found `;`"
+	);
+	assert_eq!(declaration.diagnostics[0].span, Span::new(9, 10));
 }
 
 #[test]

@@ -230,6 +230,7 @@ fn string_literal<'src>(
 		.and_is(just('}').not())
 		.repeated()
 		.collect::<Vec<Spanned<Token>>>()
+		.padded()
 		.map(StrFragment::Interpolation)
 		.delimited_by(just("${"), just('}'));
 
@@ -386,6 +387,7 @@ fn operators<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> 
 		just("{").to(Token::LBrace),
 		just("}").to(Token::RBrace),
 		just(",").to(Token::Comma),
+		just(";").to(Token::Semicolon),
 		just("@").to(Token::At),
 	]);
 
