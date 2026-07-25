@@ -4,6 +4,7 @@
 	"private": true,
 	"description": "",
 	"scripts": {
+		"check:vscode-api-floor": "node scripts/check-vscode-api-floor.mjs",
 		"format": "oxfmt",
 		"lint": "oxlint --type-aware --type-check"
 	},

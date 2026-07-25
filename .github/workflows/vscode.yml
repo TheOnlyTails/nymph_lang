@@ -16,6 +16,8 @@ jobs:
         with:
           run_install: true
           package_json_file: ../package.json
+      - name: Check VS Code API floor
+        run: pnpm --dir .. check:vscode-api-floor
       - name: Publish
         run: pnpm run deploy
         env:
