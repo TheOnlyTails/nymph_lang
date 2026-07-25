@@ -596,14 +596,20 @@ impl<'m> Checker<'m> {
 				self.check_list(items, elem, span)
 			}
 			ExprKind::Tuple(items) => {
-				// Spreads in tuples are not statically sized in Milestone A; infer
-				// non-spread items positionally.
 				let mut tys = Vec::new();
 				for item in items {
 					match &item.0 {
 						ListItem::Expr(e) => tys.push(self.infer(e)),
 						ListItem::Spread(e) => {
-							self.infer(e);
+							let ty = self.infer(e);
+							let stripped = self.strip_mut(ty);
+							match self.interner.kind(stripped).clone() {
+								TyKind::Tuple(items) => tys.extend(items),
+								_ => {
+									let ty = self.display(stripped);
+									self.emit(e.span, TypeError::TupleSpreadRequiresStaticTuple { ty });
+								}
+							}
 						}
 					}
 				}

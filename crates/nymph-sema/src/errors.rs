@@ -331,6 +331,9 @@ pub enum TypeError {
 	DuplicatePatternBinding { name: EcoString },
 	/// The alternatives of a union pattern introduce different locals.
 	InconsistentUnionBindings,
+	/// A tuple spread operand does not have a concrete, statically known tuple
+	/// shape, so its elements cannot be incorporated into the result type.
+	TupleSpreadRequiresStaticTuple { ty: String },
 }
 
 impl IntoDiagnostic for TypeError {
@@ -527,6 +530,9 @@ impl IntoDiagnostic for TypeError {
 			}
 			E::InvalidRangeBound { ty } => {
 				format!("range bounds must be `int` or `uint`, not `{ty}`").into()
+			}
+			E::TupleSpreadRequiresStaticTuple { ty } => {
+				format!("tuple spread requires a statically shaped tuple, found `{ty}`").into()
 			}
 		}
 	}

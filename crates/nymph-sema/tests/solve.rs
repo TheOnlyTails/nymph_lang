@@ -37,6 +37,41 @@ fn assert_error_contains(source: &str, needle: &str) {
 	);
 }
 
+// ── Static tuple spreads ───────────────────────────────────────────────────
+
+#[test]
+fn tuple_spread_flattens_to_the_exact_result_type() {
+	assert_ok("func f(): #(int, boolean, string) = #(1, ...#(true, \"x\"))");
+}
+
+#[test]
+fn tuple_spread_supports_multiple_interleaved_and_empty_sources() {
+	assert_ok(
+		"func f(): #(int, boolean, string, uint) = #(1, ...#(), ...#(true, \"x\"), 2u, ...#())",
+	);
+}
+
+#[test]
+fn tuple_spread_preserves_nested_tuple_elements() {
+	assert_ok("func f(): #(#(int, boolean), string) = #(...#(#(1, true)), \"x\")");
+}
+
+#[test]
+fn tuple_spread_rejects_a_list_source_with_a_precise_diagnostic() {
+	assert_error_contains(
+		"func f(xs: #[int]): #() = #(...xs)",
+		"tuple spread requires a statically shaped tuple, found `#[int]`",
+	);
+}
+
+#[test]
+fn tuple_spread_rejects_a_dynamically_shaped_generic_source() {
+	assert_error_contains(
+		"func f<T>(xs: T): #() = #(...xs)",
+		"tuple spread requires a statically shaped tuple, found `T`",
+	);
+}
+
 const PLUS: &str = "interface Plus<Other, Output> { func plus(other: Other): Output }\n";
 
 #[test]

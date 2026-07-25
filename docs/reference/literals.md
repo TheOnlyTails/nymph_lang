@@ -158,8 +158,12 @@ Unlike lists, tuples may contain values of different types, and are fixed in siz
 They may include any number of items, including zero, as well as an optional trailing comma,
 and span multiple lines.
 
-Other tuples may be spread into a tuple using the `...` operator,
-so long as their structure matches the structure of the parent tuple.
+Statically shaped tuples may be spread into a tuple using the `...` operator.
+Their element types are flattened into the exact result tuple type; lists,
+generic values, and other dynamically sized sources cannot be spread into a tuple.
+Any number of tuple spreads may be interleaved with ordinary elements, including
+empty and nested tuples. Elements and spread source expressions are evaluated
+exactly once from left to right.
 
 ```nymph
 #(1, true, 'a')
@@ -169,6 +173,7 @@ so long as their structure matches the structure of the parent tuple.
   3,
 )
 #(1, ...a, 'c') // a : #(int, boolean) -> #(int, int, boolean, char)
+#(...#(), ...a, 2u)
 ```
 
 ## Maps

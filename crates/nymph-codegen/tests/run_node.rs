@@ -2669,6 +2669,45 @@ fn runs_an_enum_variant_constructor_field_as_a_closure_slot() {
 // ── SS1: smart literal spread ────────────────────────────────────────────────
 
 #[test]
+fn runs_static_tuple_spreads_as_a_canonical_boxed_tuple() {
+	let src = r#"
+		func f(): #(int, boolean, string, uint) = #(1, ...#(), ...#(true, "x"), 2u)
+	"#;
+	assert_eq!(
+		run(src, "JSON.stringify(nymphTestValue(f()))"),
+		r#"[1,true,"x",2]"#
+	);
+}
+
+#[test]
+fn tuple_spread_evaluates_every_item_and_source_once_left_to_right() {
+	let src = r#"
+		struct Logger(count: int, trace: string) {
+			mut func item(n: int): int = {
+				this.count = this.count + 1
+				this.trace = this.trace + "i"
+				n
+			}
+			mut func pair(): #(boolean, string) = {
+				this.count = this.count + 1
+				this.trace = this.trace + "s"
+				#(true, "x")
+			}
+		}
+		func f(logger: mut Logger): #(int, boolean, string, int) =
+			#(logger.item(1), ...logger.pair(), logger.item(2))
+	"#;
+	let js = r#"
+		(() => {
+			const logger = new Logger({ count: new NInt(0), trace: new NString("") });
+			const value = f(logger);
+			return JSON.stringify(nymphTestValue([value, logger.count, logger.trace]));
+		})()
+	"#;
+	assert_eq!(run(src, js), r#"[[1,true,"x",2],3,"isi"]"#);
+}
+
+#[test]
 fn runs_a_list_spread_over_a_native_list_source() {
 	// A native `#[T]` list source is already a JS array — `[...xs, y]`, no
 	// drain.

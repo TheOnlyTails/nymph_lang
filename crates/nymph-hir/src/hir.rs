@@ -251,15 +251,15 @@ pub enum HirExpr {
 		kind: HirArrayKind,
 		items: Vec<HirExpr>,
 	},
-	/// A list literal (SS1) containing at least one spread element
-	/// (`#[a, ...xs, b]`) — emits as a boxed list carrying an array with the spread
+	/// A list or tuple literal containing at least one spread element — emits as
+	/// the collection selected by `kind`, carrying an array with the spread
 	/// elements' JS `...` syntax preserved in position. A spread-free list
 	/// still lowers to the plain [`HirExpr::Array`] above (zero behavior
-	/// change for the common case); this variant exists only so a spread
-	/// element's shape (native splice vs. drained-then-spliced) is visible to
-	/// codegen. Tuple literals never produce this — tuple spread stays
-	/// deferred (untyped, element-wise) — only `ExprKind::List` does.
-	ArraySpread(Vec<HirArrayElem>),
+	/// change for the common case).
+	ArraySpread {
+		kind: HirArrayKind,
+		elems: Vec<HirArrayElem>,
+	},
 	/// A map literal — emits as a boxed value-equality HAMT.
 	MapLit(Vec<(HirExpr, HirExpr)>),
 	/// A map literal (SS1) containing at least one spread entry
@@ -380,8 +380,8 @@ impl HirExpr {
 				argument.collect_runtime_type_references(references);
 			}
 			Self::Array { items, .. } => collect_exprs(items, references),
-			Self::ArraySpread(items) => {
-				for item in items {
+			Self::ArraySpread { elems, .. } => {
+				for item in elems {
 					match item {
 						HirArrayElem::Item(expr) | HirArrayElem::Spread(expr) => {
 							expr.collect_runtime_type_references(references)

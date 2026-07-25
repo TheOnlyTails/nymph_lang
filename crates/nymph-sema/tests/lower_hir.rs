@@ -3042,13 +3042,16 @@ fn lowers_a_list_spread_over_a_native_list_source_to_a_native_splice() {
 	};
 	assert_eq!(
 		tail.as_deref(),
-		Some(&HirExpr::ArraySpread(vec![
-			HirArrayElem::Spread(HirExpr::Field {
-				recv: Box::new(HirExpr::Local("xs".into())),
-				name: "v".into(),
-			}),
-			HirArrayElem::Item(HirExpr::Num(4.0, NumKind::Int)),
-		]))
+		Some(&HirExpr::ArraySpread {
+			kind: HirArrayKind::List,
+			elems: vec![
+				HirArrayElem::Spread(HirExpr::Field {
+					recv: Box::new(HirExpr::Local("xs".into())),
+					name: "v".into(),
+				}),
+				HirArrayElem::Item(HirExpr::Num(4.0, NumKind::Int)),
+			],
+		})
 	);
 }
 
@@ -3086,7 +3089,7 @@ fn lowers_a_list_spread_over_a_user_iterator_source_to_a_drain() {
 		panic!("expected Block, got {:?}", f.body);
 	};
 	let tail = tail.as_deref().expect("a tail expression");
-	let HirExpr::ArraySpread(elems) = tail else {
+	let HirExpr::ArraySpread { elems, .. } = tail else {
 		panic!("expected ArraySpread, got {tail:?}");
 	};
 	assert_eq!(elems.len(), 2);
@@ -3230,17 +3233,38 @@ fn lowers_a_map_spread_over_a_non_map_iterable_of_pairs_to_a_drain() {
 }
 
 #[test]
-#[should_panic(expected = "does not yet handle spread tuple items")]
-fn tuple_spread_still_panics_in_lowering() {
-	// SS1 is list/map literal spread only — tuple spread stays deferred
-	// (untyped, element-wise; the checker only `infer`s and discards it).
-	lower(
+fn tuple_spread_lowers_with_kind_boundaries_and_source_order() {
+	let hir = lower(
 		r#"
-		func f(): #() = {
-			let xs = #[1, 2, 3]
-			#(...xs)
+		func f(): #(int, boolean, string, uint) = {
+			let xs = #(true, "x")
+			#(1, ...#(), ...xs, 2u)
 		}
 		"#,
+	);
+	let HirExpr::Block { tail, .. } = &hir.funcs[0].body else {
+		panic!("expected Block, got {:?}", hir.funcs[0].body);
+	};
+	assert_eq!(
+		tail.as_deref(),
+		Some(&HirExpr::ArraySpread {
+			kind: HirArrayKind::Tuple,
+			elems: vec![
+				HirArrayElem::Item(HirExpr::Num(1.0, NumKind::Int)),
+				HirArrayElem::Spread(HirExpr::Field {
+					recv: Box::new(HirExpr::Array {
+						kind: HirArrayKind::Tuple,
+						items: vec![],
+					}),
+					name: "v".into(),
+				}),
+				HirArrayElem::Spread(HirExpr::Field {
+					recv: Box::new(HirExpr::Local("xs".into())),
+					name: "v".into(),
+				}),
+				HirArrayElem::Item(HirExpr::Num(2.0, NumKind::UInt)),
+			],
+		})
 	);
 }
 

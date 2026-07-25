@@ -1386,7 +1386,7 @@ impl<'a> Emitter<'a> {
 			// `HirArrayElem::Spread` payload is already a JS-array-valued
 			// expression (a native source or a `lower_spread_source` drain IIFE),
 			// so it always emits with JS spread syntax.
-			HirExpr::ArraySpread(elems) => {
+			HirExpr::ArraySpread { kind, elems } => {
 				let mut arr = ArenaVec::new_in(&self.ast);
 				for elem in elems {
 					match elem {
@@ -1400,7 +1400,11 @@ impl<'a> Emitter<'a> {
 					}
 				}
 				let array = Expression::new_array_expression(SPAN, arr, &self.ast);
-				self.new_box("NList", array)
+				match kind {
+					HirArrayKind::List => self.new_box("NList", array),
+					HirArrayKind::Tuple => self.new_box("NTuple", array),
+					HirArrayKind::Raw => array,
+				}
 			}
 			// A map literal → a boxed value-equality HAMT.
 			HirExpr::MapLit(pairs) => {

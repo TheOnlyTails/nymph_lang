@@ -3422,10 +3422,7 @@ impl<'a> Lowerer<'a> {
 					},
 				}
 			}
-			ExprKind::Tuple(items) => HirExpr::Array {
-				kind: HirArrayKind::Tuple,
-				items: self.lower_items(items),
-			},
+			ExprKind::Tuple(items) => self.lower_tuple(items),
 			ExprKind::List(items) => self.lower_list(items),
 			ExprKind::Map(entries) => self.lower_map(entries),
 			ExprKind::IndexAccess { parent, index, .. } => {
@@ -5014,19 +5011,15 @@ impl<'a> Lowerer<'a> {
 		})
 	}
 
-	/// Lower a list/tuple literal's items — called by `ExprKind::Tuple` directly,
-	/// and by [`Self::lower_list`]'s own spread-free fast path (identical output
-	/// to before SS1). Tuple spread stays deferred here (a `ListItem::Spread`
-	/// reaching this function can only be a TUPLE spread post-SS1 — a list
-	/// spread now routes through `lower_list` instead): tuple spread is untyped,
-	/// element-wise (the checker only `infer`s and discards it, never sizing the
-	/// tuple), so there is no principled element count/shape to lower against.
+	/// Lower spread-free list/tuple items.
 	fn lower_items(&self, items: &[nymph_ast::Spanned<ListItem>]) -> Vec<HirExpr> {
 		items
 			.iter()
 			.map(|item| match &item.0 {
 				ListItem::Expr(e) => self.lower_expr(e),
-				ListItem::Spread(_) => panic!("slice-2a lowering does not yet handle spread tuple items"),
+				ListItem::Spread(_) => {
+					unreachable!("spread-bearing collections use their spread lowering path")
+				}
 			})
 			.collect()
 	}
@@ -5054,7 +5047,33 @@ impl<'a> Lowerer<'a> {
 				ListItem::Spread(e) => HirArrayElem::Spread(self.lower_spread_source(e)),
 			})
 			.collect();
-		HirExpr::ArraySpread(elems)
+		HirExpr::ArraySpread {
+			kind: HirArrayKind::List,
+			elems,
+		}
+	}
+
+	fn lower_tuple(&self, items: &[nymph_ast::Spanned<ListItem>]) -> HirExpr {
+		if !items.iter().any(|i| matches!(i.0, ListItem::Spread(_))) {
+			return HirExpr::Array {
+				kind: HirArrayKind::Tuple,
+				items: self.lower_items(items),
+			};
+		}
+		let elems = items
+			.iter()
+			.map(|item| match &item.0 {
+				ListItem::Expr(e) => HirArrayElem::Item(self.lower_expr(e)),
+				ListItem::Spread(e) => HirArrayElem::Spread(HirExpr::Field {
+					recv: Box::new(self.lower_expr(e)),
+					name: "v".into(),
+				}),
+			})
+			.collect();
+		HirExpr::ArraySpread {
+			kind: HirArrayKind::Tuple,
+			elems,
+		}
 	}
 
 	/// Lower a map literal's entries — the spread-free fast path both
@@ -5227,7 +5246,7 @@ fn collect_locals(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 				collect_locals(item, out);
 			}
 		}
-		HirExpr::ArraySpread(elems) => {
+		HirExpr::ArraySpread { elems, .. } => {
 			for elem in elems {
 				match elem {
 					HirArrayElem::Item(e) | HirArrayElem::Spread(e) => collect_locals(e, out),
@@ -5390,7 +5409,7 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 				collect_variant_ref_enums(item, out);
 			}
 		}
-		HirExpr::ArraySpread(elems) => {
+		HirExpr::ArraySpread { elems, .. } => {
 			for elem in elems {
 				match elem {
 					HirArrayElem::Item(e) | HirArrayElem::Spread(e) => collect_variant_ref_enums(e, out),
