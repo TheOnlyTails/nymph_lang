@@ -70,10 +70,8 @@ pub(crate) struct DeclaredName {
 	/// under `nymph_sema::lower_hir` — mirrors that module's per-module walk
 	/// EXACTLY: only `Func`/`Let`/`Struct`/`Enum` push into `funcs`/`lets`/
 	/// `classes`/`enums` and thus reach `nymph_codegen::emit`. `Namespace`,
-	/// `Interface`, `TypeAlias`, `ExternalFunc`, and `ExternalLet` all fall
-	/// through that walk's `_ => {}` arm and emit no top-level JS declaration
-	/// at all (an `external`/`external(name)` func or let is a declaration-only
-	/// intrinsic-linkage marker, never given its own JS body).
+	/// `Interface`, `TypeAlias`, and `ExternalFunc` emit no top-level binding.
+	/// `ExternalLet` does: lowering creates one immutable, marshalled binding.
 	///
 	/// `declared_names()` itself still lists every kind — this flag is
 	/// consulted ONLY where a declared name must correspond to a real JS
@@ -112,7 +110,7 @@ pub(crate) fn declared_names(module: &Module) -> Vec<DeclaredName> {
 			}
 			Declaration::ExternalLet(vis, _, meta) => {
 				if let Pattern::Binding { name, .. } = &meta.name.0 {
-					push(&name.0, *vis, false);
+					push(&name.0, *vis, true);
 				}
 			}
 			Declaration::Struct {

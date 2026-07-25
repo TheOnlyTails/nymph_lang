@@ -38,6 +38,8 @@
 //! `real_map_get_stays_a_loud_external_defer`.
 use rustc_hash::FxHashMap;
 
+use crate::hir::MarshalKind;
+
 /// Where an `external(name)` marker is actually implemented in real JS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Linked {
@@ -57,6 +59,46 @@ pub struct Linked {
 	/// `"list"`/`"mut_list"`/`"map"`/`"mut_map"`/the six primitive tags/…).
 	pub receiver_tag: Option<&'static str>,
 }
+
+/// Why an external marker could not be resolved for the requested declaration kind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkageError {
+	Missing { marker: String },
+	WrongKind { marker: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LinkedValue {
+	pub linked: Linked,
+	pub marshal: MarshalKind,
+}
+
+/// Immutable host-value linkages. Kept separate from callable linkages so a
+/// declaration can never accidentally import a function as a value (or vice versa).
+pub const VALUE_REGISTRY: &[(&str, LinkedValue)] = &[
+	(
+		"max_float",
+		LinkedValue {
+			linked: Linked {
+				module: "std/math/intrinsics",
+				symbol: "max_float",
+				receiver_tag: None,
+			},
+			marshal: MarshalKind::Float,
+		},
+	),
+	(
+		"min_float",
+		LinkedValue {
+			linked: Linked {
+				module: "std/math/intrinsics",
+				symbol: "min_float",
+				receiver_tag: None,
+			},
+			marshal: MarshalKind::Float,
+		},
+	),
+];
 
 /// The linkage table. L0 seeded `length` (`stdlib/src/collections/list.ts`'s
 /// `export const length = ($_this) => $_this.length`) — a plain `uint`/JS
@@ -687,6 +729,29 @@ pub fn lookup(name: &str, receiver_tag: Option<&str>) -> Option<&'static Linked>
 		.map(|(_, linked)| linked)
 }
 
+/// Resolve an immutable external value while preserving a structured
+/// distinction between an unknown marker and a marker registered as callable.
+pub fn lookup_value(name: &str) -> Result<&'static LinkedValue, LinkageError> {
+	if let Some((_, linked)) = VALUE_REGISTRY.iter().find(|(marker, _)| *marker == name) {
+		return Ok(linked);
+	}
+	// Registry markers are static compiler data. Recover the matching static
+	// spelling for the error rather than leaking the caller's borrowed string.
+	if let Some((marker, _)) = REGISTRY.iter().find(|(marker, _)| *marker == name) {
+		return Err(LinkageError::WrongKind {
+			marker: (*marker).to_string(),
+		});
+	}
+	Err(LinkageError::Missing {
+		marker: name.to_string(),
+	})
+}
+
+#[must_use]
+pub fn is_value_marker(name: &str) -> bool {
+	VALUE_REGISTRY.iter().any(|(marker, _)| *marker == name)
+}
+
 /// Every distinct registry MODULE, each paired with the DEDUPED symbols it
 /// must export — used by the driver (`nymph-compiler`) to know which virtual
 /// modules to inject into the bundle graph and which symbols each one needs
@@ -701,7 +766,11 @@ pub fn lookup(name: &str, receiver_tag: Option<&str>) -> Option<&'static Linked>
 #[must_use]
 pub fn modules() -> Vec<(&'static str, Vec<&'static str>)> {
 	let mut by_module: FxHashMap<&'static str, Vec<&'static str>> = FxHashMap::default();
-	for (_, linked) in REGISTRY {
+	for linked in REGISTRY
+		.iter()
+		.map(|(_, linked)| linked)
+		.chain(VALUE_REGISTRY.iter().map(|(_, value)| &value.linked))
+	{
 		let symbols = by_module.entry(linked.module).or_default();
 		if !symbols.contains(&linked.symbol) {
 			symbols.push(linked.symbol);
@@ -735,6 +804,22 @@ mod tests {
 
 		assert!(lookup("length", None).is_none());
 		assert!(lookup("length", Some("map")).is_none());
+	}
+
+	#[test]
+	fn external_values_are_kind_checked() {
+		let linked = lookup_value("max_float").expect("max_float must be linked as a value");
+		assert_eq!(linked.linked.module, "std/math/intrinsics");
+		assert_eq!(linked.linked.symbol, "max_float");
+		assert_eq!(linked.marshal, MarshalKind::Float);
+		assert!(matches!(
+			lookup_value("println"),
+			Err(LinkageError::WrongKind { .. })
+		));
+		assert!(matches!(
+			lookup_value("missing"),
+			Err(LinkageError::Missing { marker }) if marker == "missing"
+		));
 	}
 
 	#[test]
@@ -830,6 +915,7 @@ mod tests {
 				),
 				("std/hash", vec!["hash"]),
 				("std/io", vec!["print", "println"]),
+				("std/math/intrinsics", vec!["max_float", "min_float"]),
 				(
 					"std/string",
 					vec![

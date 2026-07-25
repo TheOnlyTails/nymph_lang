@@ -52,7 +52,7 @@ mod rewrite;
 
 use nymph_ast::decl::{Module, Visibility};
 use nymph_diagnostics::Diagnostic;
-use nymph_hir::hir::{HirClass, HirEnum, HirFunc, HirMethod, HirModule};
+use nymph_hir::hir::{HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirMethod, HirModule};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use resolve::{GraphBuilder, RawModule};
@@ -698,6 +698,44 @@ impl Driver {
 				}
 			}
 		}
+		// External host snapshots are owned once by the assembled project, not by
+		// whichever consumer happened to demand their ambient declarations.
+		let mut identities = std::collections::BTreeSet::new();
+		for (_, lowered) in &lowered_modules {
+			for let_ in &lowered.module.lets {
+				if let HirExpr::ExternValue {
+					module,
+					symbol,
+					marshal,
+				} = let_.value
+				{
+					identities.insert((module, symbol, marshal));
+				}
+			}
+		}
+		let canonical_names: std::collections::BTreeMap<_, _> = identities
+			.iter()
+			.enumerate()
+			.map(|(index, identity)| (*identity, format!("$nymph_external_value${index}")))
+			.collect();
+		let mut external_imports: FxHashMap<String, Vec<String>> = FxHashMap::default();
+		for (key, lowered) in &mut lowered_modules {
+			for let_ in &mut lowered.module.lets {
+				if let HirExpr::ExternValue {
+					module,
+					symbol,
+					marshal,
+				} = let_.value
+				{
+					let canonical = canonical_names[&(module, symbol, marshal)].clone();
+					let_.value = HirExpr::Local(canonical.clone().into());
+					external_imports
+						.entry(key.clone())
+						.or_default()
+						.push(canonical);
+				}
+			}
+		}
 		let runtime_names: FxHashSet<_> = runtime_enums
 			.values()
 			.flat_map(|enums| enums.iter().map(|enum_| enum_.name.clone()))
@@ -812,7 +850,12 @@ impl Driver {
 
 		let mut module_sources: FxHashMap<String, String> = FxHashMap::default();
 		for (key, lowered) in lowered_modules {
-			let imports = imports_for(&lowered.module, Some(&key));
+			let mut imports = imports_for(&lowered.module, Some(&key));
+			if let Some(mut names) = external_imports.remove(&key) {
+				names.sort_unstable();
+				names.dedup();
+				imports.push(("std/nymph/external-values".to_string(), names));
+			}
 			let body = nymph_codegen::emit_for_module(&lowered.module, &key);
 			let mut source = self.wrap_module_js(&key, &body, &imports);
 			if let Some(exports) = merged_runtime_exports.get_mut(&key)
@@ -823,6 +866,40 @@ impl Driver {
 				source.push_str(&format!("export {{ {} }};\n", exports.join(", ")));
 			}
 			module_sources.insert(key.clone(), source);
+		}
+		if !canonical_names.is_empty() {
+			let lets = canonical_names
+				.iter()
+				.map(|(&(module, symbol, marshal), name)| HirLet {
+					name: name.clone().into(),
+					mutable: false,
+					value: HirExpr::ExternValue {
+						module,
+						symbol,
+						marshal,
+					},
+				})
+				.collect();
+			let hir = HirModule {
+				lets,
+				funcs: Vec::new(),
+				classes: Vec::new(),
+				enums: Vec::new(),
+			};
+			let mut source = nymph_codegen::emit(&hir);
+			source.push_str(&format!(
+				"export {{ {} }};\n",
+				canonical_names
+					.values()
+					.cloned()
+					.collect::<Vec<_>>()
+					.join(", ")
+			));
+			insert_runtime_module(
+				&mut module_sources,
+				"std/nymph/external-values".to_string(),
+				source,
+			)?;
 		}
 		let runtime_owners: FxHashSet<_> = runtime_enums
 			.keys()

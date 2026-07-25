@@ -56,6 +56,7 @@ pub struct Checker<'m> {
 	pub(crate) inherent: crate::members::InherentRegistry<'m>,
 	pub(crate) table: UnifyTable,
 	pub(crate) diags: Vec<Diagnostic>,
+	pub(crate) external_value_marshals: FxHashMap<Span, nymph_hir::hir::MarshalKind>,
 
 	// ── Transient per-body state ─────────────────────────────────────────────
 	pub(crate) scopes: Vec<FxHashMap<EcoString, Binding>>,
@@ -216,6 +217,8 @@ pub(crate) fn check_module_impl(module: &Module, entry: EntryMode) -> Checked {
 	checker.generalize_returns();
 	checker.check_bodies();
 	checker.check_member_bodies();
+	checker.check_external_value_linkage();
+	checker.check_external_func_kinds();
 	if entry == EntryMode::Entry {
 		// Runs after every body has been checked, so its diagnostics append
 		// after body-checking diagnostics rather than interleaving with them.
@@ -248,6 +251,7 @@ pub(crate) fn check_module_impl(module: &Module, entry: EntryMode) -> Checked {
 	Checked {
 		diags: checker.diags,
 		annotations,
+		external_value_marshals: checker.external_value_marshals,
 		interner: checker.interner,
 	}
 }
@@ -300,6 +304,121 @@ pub fn check_program(modules: &[Module]) -> Checked {
 }
 
 impl<'m> Checker<'m> {
+	fn check_external_func_kinds(&mut self) {
+		fn check_members(
+			checker: &mut Checker<'_>,
+			members: &[nymph_ast::Spanned<nymph_ast::decl::ImplMember>],
+		) {
+			for member in members {
+				if let nymph_ast::decl::ImplMember::ExternalFunc(_, marker, meta) = &member.0
+					&& nymph_hir::linkage::is_value_marker(marker)
+				{
+					checker.emit(
+						meta.name.1,
+						TypeError::ExternalFunctionLinkageWrongKind {
+							marker: marker.clone(),
+						},
+					);
+				}
+			}
+		}
+		for decl in &self.module.members {
+			use nymph_ast::decl::Declaration;
+			match decl {
+				Declaration::ExternalFunc(_, marker, meta)
+					if nymph_hir::linkage::is_value_marker(marker) =>
+				{
+					self.emit(
+						meta.name.1,
+						TypeError::ExternalFunctionLinkageWrongKind {
+							marker: marker.clone(),
+						},
+					)
+				}
+				Declaration::Struct { members, impls, .. } | Declaration::Enum { members, impls, .. } => {
+					check_members(self, members);
+					for impl_ in impls {
+						check_members(self, &impl_.0.members);
+					}
+				}
+				Declaration::Namespace { members, .. }
+				| Declaration::Impl { members, .. }
+				| Declaration::ImplFor { members, .. } => check_members(self, members),
+				Declaration::Interface { members, .. } => {
+					for member in members {
+						if let nymph_ast::decl::InterfaceMember::Impl { members, .. } = &member.0 {
+							check_members(self, members);
+						}
+					}
+				}
+				_ => {}
+			}
+		}
+	}
+
+	fn check_external_value_linkage(&mut self) {
+		use nymph_ast::decl::Declaration;
+		for decl in &self.module.members {
+			let Declaration::ExternalLet(_, marker, meta) = decl else {
+				continue;
+			};
+			let span = meta.name.1;
+			let linked = match nymph_hir::linkage::lookup_value(marker) {
+				Ok(linked) => Some(linked),
+				Err(nymph_hir::linkage::LinkageError::Missing { .. }) => {
+					self.emit(
+						span,
+						TypeError::ExternalValueLinkageMissing {
+							marker: marker.clone(),
+						},
+					);
+					None
+				}
+				Err(nymph_hir::linkage::LinkageError::WrongKind { .. }) => {
+					self.emit(
+						span,
+						TypeError::ExternalLinkageWrongKind {
+							marker: marker.clone(),
+						},
+					);
+					None
+				}
+			};
+			let marshal = self
+				.defs
+				.get(&meta.name.0.as_binding().expect("external let binding").0)
+				.and_then(|def| self.sigs.lets.get(&def).copied())
+				.and_then(|ty| match self.interner.kind(ty) {
+					nymph_hir::ty::TyKind::Int => Some(nymph_hir::hir::MarshalKind::Int),
+					nymph_hir::ty::TyKind::UInt => Some(nymph_hir::hir::MarshalKind::UInt),
+					nymph_hir::ty::TyKind::Float => Some(nymph_hir::hir::MarshalKind::Float),
+					nymph_hir::ty::TyKind::Char => Some(nymph_hir::hir::MarshalKind::Char),
+					nymph_hir::ty::TyKind::String => Some(nymph_hir::hir::MarshalKind::String),
+					nymph_hir::ty::TyKind::Boolean => Some(nymph_hir::hir::MarshalKind::Boolean),
+					nymph_hir::ty::TyKind::List(_) => Some(nymph_hir::hir::MarshalKind::List),
+					nymph_hir::ty::TyKind::Tuple(_) => Some(nymph_hir::hir::MarshalKind::Tuple),
+					nymph_hir::ty::TyKind::Map(_, _) => Some(nymph_hir::hir::MarshalKind::Map),
+					_ => None,
+				});
+			if let Some(marshal) = marshal {
+				self.external_value_marshals.insert(span, marshal);
+			}
+			if marshal.is_none() {
+				self.emit(span, TypeError::ExternalValueTypeUnsupported);
+			} else if linked.is_some_and(|linked| Some(linked.marshal) != marshal) {
+				self.emit(
+					span,
+					TypeError::ExternalValueTypeMismatch {
+						marker: marker.clone(),
+					},
+				);
+			}
+			if meta.is_mutable() {
+				self.emit(span, TypeError::ExternalValueMutable);
+			}
+		}
+	}
+
 	fn new(module: &'m Module, defs: DefMap, diags: Vec<Diagnostic>) -> Self {
 		Self {
 			module,
@@ -311,6 +430,7 @@ impl<'m> Checker<'m> {
 			inherent: crate::members::InherentRegistry::default(),
 			table: UnifyTable::new(),
 			diags,
+			external_value_marshals: FxHashMap::default(),
 			scopes: Vec::new(),
 			params: Vec::new(),
 			param_bounds: FxHashMap::default(),

@@ -10,6 +10,7 @@ use rustc_hash::FxHashMap;
 
 use crate::Ty;
 use crate::ty::Interner;
+use nymph_hir::hir::MarshalKind;
 
 /// How a resolved binary operator must be emitted by codegen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -249,6 +250,9 @@ impl Annotations {
 pub struct Checked {
 	pub diags: Vec<Diagnostic>,
 	pub annotations: Annotations,
+	/// Resolved host marshalling ABI for each checked external-let declaration,
+	/// keyed by its binding span for consumption during HIR lowering.
+	pub external_value_marshals: FxHashMap<Span, MarshalKind>,
 	/// The interner that minted the types in `annotations`. A `Ty` is meaningless
 	/// without it, so it travels with the result for the lowering pass to consult.
 	pub interner: Interner,

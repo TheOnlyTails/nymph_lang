@@ -5,6 +5,93 @@
 use nymph_sema::check_module;
 use nymph_syntax::parse_module;
 
+#[test]
+fn external_let_linkage_errors_are_structured_diagnostics() {
+	for (source, message) in [
+		(
+			"external(missing_value) let value: float",
+			"is not registered",
+		),
+		(
+			"external(println) let value: float",
+			"registered as a function",
+		),
+		(
+			"external(max_float) let mut value: float",
+			"external lets are immutable",
+		),
+		(
+			"external(max_float) let value: boolean",
+			"incompatible declared type",
+		),
+		(
+			"external(max_float) func value(): float",
+			"registered as a value, not a function",
+		),
+	] {
+		let parsed = parse_module(source, "test");
+		let checked = nymph_sema::check_module(&parsed.tree);
+		assert!(
+			checked
+				.diags
+				.iter()
+				.any(|diag| diag.message.contains(message)),
+			"{source}: {:?}",
+			checked.diags
+		);
+	}
+}
+
+#[test]
+fn value_markers_are_rejected_for_external_functions_in_every_member_shape() {
+	for source in [
+		"struct S { external(max_float) func bad(): float }",
+		"enum E { A external(max_float) func bad(): float }",
+		"namespace N { external(max_float) namespace func bad(): float }",
+		"struct S {} impl S { external(max_float) func bad(): float }",
+		"interface I { func bad(): float } struct S {} impl I for S { external(max_float) func bad(): float }",
+	] {
+		let parsed = parse_module(source, "test");
+		assert!(
+			!parsed.diagnostics.iter().any(|diag| diag.is_error()),
+			"parse errors for {source}: {:?}",
+			parsed.diagnostics
+		);
+		let checked = check_module(&parsed.tree);
+		assert!(
+			checked.diags.iter().any(|diag| diag
+				.message
+				.contains("registered as a value, not a function")),
+			"{source}: {:?}",
+			checked.diags
+		);
+	}
+}
+
+#[test]
+fn external_let_linkage_uses_resolved_declaration_type() {
+	for source in [
+		"type Scalar = float\nexternal(max_float) let value: Scalar",
+		"external(max_float) let value: (float)",
+	] {
+		let parsed = parse_module(source, "test");
+		let checked = check_module(&parsed.tree);
+		assert!(checked.diags.is_empty(), "{source}: {:?}", checked.diags);
+	}
+
+	let source = "type Scalar = boolean\nexternal(max_float) let value: Scalar";
+	let parsed = parse_module(source, "test");
+	let checked = check_module(&parsed.tree);
+	assert!(
+		checked
+			.diags
+			.iter()
+			.any(|diag| diag.message.contains("incompatible declared type")),
+		"{source}: {:?}",
+		checked.diags
+	);
+}
+
 /// Parse and check `source`, returning the checker's error messages. Panics if the
 /// source fails to *parse* (these tests exercise the checker, not the parser).
 fn check(source: &str) -> Vec<String> {

@@ -5,6 +5,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use nymph_codegen::emit;
+use nymph_hir::hir::{HirExpr, HirLet, HirModule, MarshalKind};
 use nymph_sema::{check_module, check_module_with_prelude, lower_hir, lower_hir_with_prelude};
 use nymph_syntax::parse_module;
 
@@ -137,6 +138,40 @@ fn run_failure(src: &str, call: &str) -> String {
 /// driving the collections-materialization payoff under Node.
 fn run_with_prelude(user_src: &str, prelude_src: &str, call: &str) -> String {
 	run_js(compile_with_prelude(user_src, prelude_src), call)
+}
+
+#[test]
+fn duplicate_external_values_import_and_box_once_and_share_identity() {
+	let external = "data:text/javascript,export const value=1.5";
+	let module = HirModule {
+		lets: vec![
+			HirLet {
+				name: "first".into(),
+				mutable: false,
+				value: HirExpr::ExternValue {
+					module: external,
+					symbol: "value",
+					marshal: MarshalKind::Float,
+				},
+			},
+			HirLet {
+				name: "second".into(),
+				mutable: false,
+				value: HirExpr::ExternValue {
+					module: external,
+					symbol: "value",
+					marshal: MarshalKind::Float,
+				},
+			},
+		],
+		funcs: vec![],
+		classes: vec![],
+		enums: vec![],
+	};
+	let js = emit(&module);
+	assert_eq!(js.matches("data:text/javascript").count(), 1, "{js}");
+	assert_eq!(js.matches("new NFloat(").count(), 1, "{js}");
+	assert_eq!(run_js(js, "first === second"), "true");
 }
 
 #[test]
@@ -3086,7 +3121,7 @@ fn real_list_push_materializes_once_push_is_linked() {
 	let user = "func f(xs: mut #[int]): void = xs.push(1)";
 	let js = compile_against_real_stdlib(user);
 	assert!(
-		js.contains("import { push } from \"std/collections/list\""),
+		js.contains("import { push as $nymph_external$call$"),
 		"expected a linked-external import for `push`, got:\n{js}"
 	);
 	assert!(
@@ -3141,11 +3176,11 @@ fn real_list_is_empty_materializes_once_length_is_linked() {
 	let user = "func f(xs: #[int]): boolean = xs.is_empty()";
 	let js = compile_against_real_stdlib(user);
 	assert!(
-		js.contains("import { length as length$std$collections$list } from \"std/collections/list\""),
+		js.contains("import { length as $nymph_external$call$"),
 		"expected a linked-external import for `length`, got:\n{js}"
 	);
 	assert!(
-		js.contains("length$std$collections$list("),
+		js.matches("$nymph_external$call$").count() >= 2,
 		"expected `is_empty`'s materialized body to call the linked `length`, got:\n{js}"
 	);
 	assert!(
@@ -3173,11 +3208,11 @@ fn real_list_get_materializes_once_get_is_linked() {
 	let user = "func f(xs: #[int]): Option<int> = xs.get(0)";
 	let js = compile_against_real_stdlib(user);
 	assert!(
-		js.contains("import { get as get$std$collections$list } from \"std/collections/list\""),
+		js.contains("import { get as $nymph_external$call$"),
 		"expected a linked-external import for `get`, got:\n{js}"
 	);
 	assert!(
-		js.contains("get$std$collections$list("),
+		js.matches("$nymph_external$call$").count() >= 2,
 		"expected `f`'s materialized body to call the linked `get`, got:\n{js}"
 	);
 }
@@ -3199,11 +3234,11 @@ fn real_map_get_materializes_once_get_is_linked() {
 	let user = "func f(m: mut #{int: int}): Option<int> = m.get(1)";
 	let js = compile_against_real_stdlib(user);
 	assert!(
-		js.contains("import { get as get$std$collections$map } from \"std/collections/map\""),
+		js.contains("import { get as $nymph_external$call$"),
 		"expected a linked-external import for `get`, got:\n{js}"
 	);
 	assert!(
-		js.contains("get$std$collections$map("),
+		js.matches("$nymph_external$call$").count() >= 2,
 		"expected `f`'s materialized body to call the linked `get`, got:\n{js}"
 	);
 }
@@ -3218,7 +3253,7 @@ fn real_map_is_empty_materializes_once_size_is_linked() {
 	let user = "func f(m: #{int: int}): boolean = m.is_empty()";
 	let js = compile_against_real_stdlib(user);
 	assert!(
-		js.contains("import { size } from \"std/collections/map\""),
+		js.contains("import { size as $nymph_external$call$"),
 		"expected a linked-external import for `size`, got:\n{js}"
 	);
 	assert!(

@@ -15,6 +15,25 @@ let limit = 100
 func under_limit(n: int): boolean = n < limit
 ```
 
+### External lets
+
+An intrinsic may expose an immutable host value with `external let`. The
+optional marker names the linkage-registry entry; without one it defaults to
+the Nymph binding name.
+
+```nymph
+public external let max_float: float
+public external(min_float) let minimum: float
+```
+
+External lets differ from external functions: the generated module imports
+the host export once, marshals its raw value into the declared canonical boxed
+Nymph representation once, and stores that snapshot in one `const` binding.
+Every reference shares that binding and identity; the host export is not read
+or boxed again. `external let mut` is rejected. Ambient external lets are
+emitted only when demanded, preserving single canonical type emission and
+avoiding duplicate imports or initializers.
+
 The same `let [mut] name [: Type] = value` form is also how a local binding is introduced inside a
 block — see [Blocks](./expressions#blocks).
 

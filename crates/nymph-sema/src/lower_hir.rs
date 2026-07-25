@@ -254,6 +254,7 @@ fn lower_hir_impl(
 		module,
 		annotations: &checked.annotations,
 		interner: &checked.interner,
+		external_value_marshals: &checked.external_value_marshals,
 		struct_names,
 		variant_fields,
 		prelude_modules,
@@ -286,6 +287,7 @@ struct Lowerer<'a> {
 	module: &'a Module,
 	annotations: &'a Annotations,
 	interner: &'a Interner,
+	external_value_marshals: &'a FxHashMap<nymph_ast::Span, nymph_hir::hir::MarshalKind>,
 	struct_names: FxHashSet<EcoString>,
 	/// (Enum name, variant name) → that variant's declared field names, in
 	/// source order — every enum `module` or any prelude module declares,
@@ -1131,6 +1133,8 @@ impl<'a> Lowerer<'a> {
 		let mut funcs = Vec::new();
 		let mut classes = Vec::new();
 		let mut enums = Vec::new();
+		let mut external_values: std::collections::BTreeMap<_, EcoString> =
+			std::collections::BTreeMap::new();
 		for decl in &module.members {
 			match decl {
 				// A top-level `let`/`let mut` (Slice 4E, Y3). No scope is pushed while
@@ -1143,6 +1147,24 @@ impl<'a> Lowerer<'a> {
 					mutable: meta.is_mutable(),
 					value: self.lower_expr(value),
 				}),
+				Declaration::ExternalLet(_, marker, meta) => {
+					let mut let_ = self.lower_external_let(marker, meta);
+					let HirExpr::ExternValue {
+						module,
+						symbol,
+						marshal,
+					} = let_.value
+					else {
+						unreachable!()
+					};
+					let identity = (module, symbol, marshal);
+					if let Some(canonical) = external_values.get(&identity) {
+						let_.value = HirExpr::Local(canonical.clone());
+					} else {
+						external_values.insert(identity, let_.name.clone());
+					}
+					lets.push(let_);
+				}
 				Declaration::Func { meta, body, .. } => funcs.push(self.lower_func(meta, body)),
 				Declaration::Struct {
 					name,
@@ -1399,6 +1421,11 @@ impl<'a> Lowerer<'a> {
 	fn lower_runtime_let(&self, name: &EcoString) -> Option<HirLet> {
 		for module in self.prelude_modules {
 			for decl in &module.members {
+				if let Declaration::ExternalLet(_, marker, meta) = decl
+					&& param_name(&meta.name) == *name
+				{
+					return Some(self.lower_external_let(marker, meta));
+				}
 				if let Declaration::Let { meta, value, .. } = decl
 					&& param_name(&meta.name) == *name
 				{
@@ -1411,6 +1438,21 @@ impl<'a> Lowerer<'a> {
 			}
 		}
 		None
+	}
+
+	fn lower_external_let(&self, marker: &str, meta: &nymph_ast::decl::LetDeclaration) -> HirLet {
+		let value_link =
+			nymph_hir::linkage::lookup_value(marker).expect("checked external value linkage must lower");
+		let linked = &value_link.linked;
+		HirLet {
+			name: param_name(&meta.name),
+			mutable: false,
+			value: HirExpr::ExternValue {
+				module: linked.module,
+				symbol: linked.symbol,
+				marshal: self.external_value_marshals[&meta.name.1],
+			},
+		}
 	}
 
 	/// Locate a TOP-LEVEL `external` func declaration among
@@ -5247,6 +5289,7 @@ fn collect_locals(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 		| HirExpr::Str(_)
 		| HirExpr::Bool(_)
 		| HirExpr::Char(_)
+		| HirExpr::ExternValue { .. }
 		| HirExpr::This
 		| HirExpr::VariantRef { .. } => {}
 		HirExpr::InterpolatedString(segments) => {
@@ -5410,6 +5453,7 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 		| HirExpr::Str(_)
 		| HirExpr::Bool(_)
 		| HirExpr::Char(_)
+		| HirExpr::ExternValue { .. }
 		| HirExpr::Local(_)
 		| HirExpr::This => {}
 		HirExpr::InterpolatedString(segments) => {

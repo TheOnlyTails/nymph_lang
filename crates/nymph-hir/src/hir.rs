@@ -193,6 +193,20 @@ pub enum BuiltinResult {
 	Raw,
 }
 
+/// Raw-host-to-boxed-Nymph marshalling performed once for an external let.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MarshalKind {
+	Int,
+	UInt,
+	Float,
+	Char,
+	String,
+	Boolean,
+	List,
+	Tuple,
+	Map,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum HirExpr {
 	/// Any numeric literal (int/uint/float), tagged with the [`NumKind`] codegen
@@ -235,6 +249,13 @@ pub enum HirExpr {
 		module: &'static str,
 		symbol: &'static str,
 		args: Vec<HirExpr>,
+	},
+	/// A registry-resolved immutable host value. This expression occurs only as
+	/// a canonical module `HirLet` initializer, never at each reference site.
+	ExternValue {
+		module: &'static str,
+		symbol: &'static str,
+		marshal: MarshalKind,
 	},
 	/// A binary operator selected through a still-generic interface bound.
 	/// Canonical boxed tags select concrete prelude implementations; user
@@ -373,6 +394,7 @@ impl HirExpr {
 				collect_exprs(args, references);
 			}
 			Self::ExternCall { args, .. } => collect_exprs(args, references),
+			Self::ExternValue { .. } => {}
 			Self::BoundDispatch {
 				receiver, argument, ..
 			} => {

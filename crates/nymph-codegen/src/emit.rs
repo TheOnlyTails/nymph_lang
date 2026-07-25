@@ -5,6 +5,8 @@ use oxc::{
 	span::SPAN,
 };
 
+use ecow::EcoString;
+
 use nymph_hir::hir::{
 	BinOp, BuiltinResult, HirArrayElem, HirArrayKind, HirBoundDispatchCase, HirBoundDispatchTarget,
 	HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit, HirMapElem, HirMethod, HirModule, HirPat,
@@ -13,16 +15,17 @@ use nymph_hir::hir::{
 
 use crate::box_rt;
 
-fn linked_local_name(module: &str, symbol: &str) -> String {
-	let module = module.strip_suffix("$intrinsics").unwrap_or(module);
-	let has_cross_module_collision = nymph_hir::linkage::REGISTRY
-		.iter()
-		.any(|(_, linked)| linked.symbol == symbol && linked.module != module);
-	if has_cross_module_collision {
-		format!("{symbol}${}", module.replace('/', "$"))
-	} else {
-		symbol.to_string()
+fn external_alias(module: &str, symbol: &str, kind: &str) -> String {
+	fn encode(value: &str) -> String {
+		value
+			.as_bytes()
+			.iter()
+			.map(|byte| format!("{byte:02x}"))
+			.collect()
 	}
+	let module = encode(module);
+	let symbol = encode(symbol);
+	format!("$nymph_external${kind}${module}${symbol}")
 }
 
 /// A re-emittable reference to a sub-value of the scrutinee, used while compiling a
@@ -141,7 +144,7 @@ pub struct Emitter<'a> {
 	/// other top-level statement. A `BTreeSet` (not a `HashSet`) so the
 	/// prepended import order — and therefore the emitted JS text — stays
 	/// stable across runs, which the golden/e2e tests rely on.
-	needed_imports: std::cell::RefCell<std::collections::BTreeSet<(String, String)>>,
+	needed_imports: std::cell::RefCell<std::collections::BTreeSet<(String, String, String)>>,
 	/// Set the first time [`Self::new_box`] emits a `new N…(…)` box construction
 	/// (uniform value boxing, slice #2). When set, [`Self::emit_module`] prepends
 	/// the inline [`box_rt::box_preamble`] class definitions so the module is
@@ -205,8 +208,33 @@ impl<'a> Emitter<'a> {
 		// is TDZ, unlike a function declaration) and before functions (whose JS
 		// `function` declarations hoist, so a let calling one is safe regardless of
 		// relative placement). Kept in source order relative to each other.
+		let mut external_values: std::collections::BTreeMap<_, EcoString> =
+			std::collections::BTreeMap::new();
 		for let_ in &module.lets {
-			stmts.push(self.emit_module_let(let_));
+			if let HirExpr::ExternValue {
+				module,
+				symbol,
+				marshal,
+			} = let_.value
+				&& let Some(canonical) = external_values.get(&(module, symbol, marshal))
+			{
+				let alias = HirLet {
+					name: let_.name.clone(),
+					mutable: let_.mutable,
+					value: HirExpr::Local(canonical.clone()),
+				};
+				stmts.push(self.emit_module_let(&alias));
+			} else {
+				if let HirExpr::ExternValue {
+					module,
+					symbol,
+					marshal,
+				} = let_.value
+				{
+					external_values.insert((module, symbol, marshal), let_.name.clone());
+				}
+				stmts.push(self.emit_module_let(let_));
+			}
 		}
 		for func in &module.funcs {
 			stmts.push(self.emit_func(func));
@@ -222,8 +250,8 @@ impl<'a> Emitter<'a> {
 		let imports = self.needed_imports.borrow();
 		if !imports.is_empty() {
 			let mut with_imports = ArenaVec::new_in(&self.ast);
-			for (module_specifier, symbol) in imports.iter() {
-				with_imports.push(self.build_import_statement(module_specifier, symbol));
+			for (module_specifier, symbol, local) in imports.iter() {
+				with_imports.push(self.build_import_statement(module_specifier, symbol, local));
 			}
 			with_imports.extend(stmts);
 			stmts = with_imports;
@@ -254,14 +282,18 @@ impl<'a> Emitter<'a> {
 	}
 
 	/// Build `import { <symbol> as <local> } from "<module_specifier>";` (Gap 3, L0).
-	fn build_import_statement(&self, module_specifier: &str, symbol: &str) -> Statement<'a> {
+	fn build_import_statement(
+		&self,
+		module_specifier: &str,
+		symbol: &str,
+		local: &str,
+	) -> Statement<'a> {
 		let imported = ModuleExportName::IdentifierName(IdentifierName::new(
 			SPAN,
 			self.ast.allocator.alloc_str(symbol),
 			&self.ast,
 		));
-		let local_name = linked_local_name(module_specifier, symbol);
-		let local = BindingIdentifier::new(SPAN, self.ast.allocator.alloc_str(&local_name), &self.ast);
+		let local = BindingIdentifier::new(SPAN, self.ast.allocator.alloc_str(local), &self.ast);
 		let mut specifiers = ArenaVec::new_in(&self.ast);
 		specifiers.push(ImportDeclarationSpecifier::ImportSpecifier(
 			ImportSpecifier::boxed(SPAN, imported, local, ImportOrExportKind::Value, &self.ast),
@@ -1153,11 +1185,16 @@ impl<'a> Emitter<'a> {
 		} else {
 			module.to_string()
 		};
+		let local = if external {
+			external_alias(module, symbol, "call$")
+		} else {
+			symbol.to_string()
+		};
 		self
 			.needed_imports
 			.borrow_mut()
-			.insert((import_module, symbol.to_string()));
-		linked_local_name(module, symbol)
+			.insert((import_module, symbol.to_string(), local.clone()));
+		local
 	}
 
 	/// The saturating JS runtime mapping for a numeric `ScalarCast` (the change
@@ -1435,6 +1472,31 @@ impl<'a> Emitter<'a> {
 					arguments.push(Argument::from(self.emit_expr(arg)));
 				}
 				Expression::new_call_expression(SPAN, callee, oxc::ast::NONE, arguments, false, &self.ast)
+			}
+			HirExpr::ExternValue {
+				module,
+				symbol,
+				marshal,
+			} => {
+				let local = external_alias(module, symbol, "value$");
+				self.needed_imports.borrow_mut().insert((
+					module.to_string(),
+					symbol.to_string(),
+					local.clone(),
+				));
+				let raw = Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(&local), &self.ast);
+				let class = match marshal {
+					nymph_hir::hir::MarshalKind::Int => "NInt",
+					nymph_hir::hir::MarshalKind::UInt => "NUint",
+					nymph_hir::hir::MarshalKind::Float => "NFloat",
+					nymph_hir::hir::MarshalKind::Char => "NChar",
+					nymph_hir::hir::MarshalKind::String => "NString",
+					nymph_hir::hir::MarshalKind::Boolean => "NBool",
+					nymph_hir::hir::MarshalKind::List => "NList",
+					nymph_hir::hir::MarshalKind::Tuple => "NTuple",
+					nymph_hir::hir::MarshalKind::Map => "NMap",
+				};
+				self.new_box(class, raw)
 			}
 			HirExpr::BoundDispatch {
 				method,

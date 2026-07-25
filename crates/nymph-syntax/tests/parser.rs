@@ -857,6 +857,30 @@ fn external_funcs_carry_their_kind() {
 }
 
 #[test]
+fn external_lets_default_and_preserve_explicit_markers() {
+	let members = module_ok(
+		"public external let default_name: float\nprivate external(host_name) let explicit_name: float",
+	);
+	let markers: Vec<_> = members
+		.iter()
+		.map(|decl| match decl {
+			Declaration::ExternalLet(_, marker, meta) => (
+				marker.as_str(),
+				meta.name.0.as_binding().unwrap().0.as_str(),
+			),
+			other => panic!("expected an external let, got {other:?}"),
+		})
+		.collect();
+	assert_eq!(
+		markers,
+		[
+			("default_name", "default_name"),
+			("host_name", "explicit_name")
+		]
+	);
+}
+
+#[test]
 fn namespace_let_is_a_static_member_binding() {
 	let members = module_ok(
 		"struct Config(v: int) {

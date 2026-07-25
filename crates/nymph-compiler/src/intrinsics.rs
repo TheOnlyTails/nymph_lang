@@ -61,6 +61,10 @@ const INTRINSIC_TS_SOURCES: &[(&str, &str)] = &[
 	// `"print"`/`"println"` rows) — `io.ts` has no `import` of its own, so
 	// unlike `list.ts` it needs no `IMPORT_REWRITES` entry.
 	("std/io", include_str!("../../../stdlib/src/io.ts")),
+	(
+		"std/math/intrinsics",
+		include_str!("../../../stdlib/src/math/mod.ts"),
+	),
 	// The ambient `string` methods (linked so `"…".contains(…)` etc. lower to
 	// native JS). `string.ts` imports `Option` via `"./option"` (it sits at the
 	// stdlib root, so `./` not `../`) — see `IMPORT_REWRITES` below.

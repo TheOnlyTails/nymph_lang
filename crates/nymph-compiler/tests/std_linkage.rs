@@ -68,6 +68,10 @@ fn only_entry(entry_key: &'static str, entry_src: &'static str) -> impl Fn(&str)
 	move |key: &str| (key == entry_key).then(|| entry_src.to_string())
 }
 
+fn synth_std_math_provider(path: &str) -> Option<String> {
+	(path == "math").then(|| "public external(max_float) let max_float: float\n".to_string())
+}
+
 fn run_node(js: &str, tag: &str) -> String {
 	let dir = std::env::temp_dir();
 	let path = dir.join(format!(
@@ -152,6 +156,60 @@ fn list_and_string_length_use_receiver_specific_canonical_runtime_symbols() {
 	js.push_str(&format!("\nconsole.log({list_call}().v);\n"));
 	js.push_str(&format!("\nconsole.log({string_call}().v);\n"));
 	assert_eq!(run_node(&js, "receiver_specific_lengths"), "3\n5");
+}
+
+#[test]
+fn external_let_is_marshaled_once_and_shared_across_references() {
+	let entry = "import std/math with (max_float)\n\
+		func first(): float = max_float\n\
+		func second(): float = max_float\n\
+		func main(): void = {}\n";
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &synth_std_math_provider)
+		.expect("external let project should compile");
+	assert_eq!(
+		compiled.js.matches("max_float);").count(),
+		1,
+		"{}",
+		compiled.js
+	);
+	let first = compiled.entry_symbol("first");
+	let second = compiled.entry_symbol("second");
+	let mut js = compiled.js;
+	js.push_str(&format!(
+		"\nconsole.log({first}() === {second}(), {first}().v);\n"
+	));
+	assert!(run_node(&js, "external_let").starts_with("true "));
+}
+
+#[test]
+fn ambient_external_let_has_one_project_owner_across_consumers() {
+	let load = |key: &str| match key {
+		"main" => Some(
+			"import ./a with (from_a)\nimport ./b with (from_b)\n\
+			 func same(): boolean = from_a() == from_b()\nfunc main(): void = {}\n"
+				.to_string(),
+		),
+		"a" => Some(
+			"import std/math with (max_float)\npublic func from_a(): float = max_float\n".to_string(),
+		),
+		"b" => Some(
+			"import std/math with (max_float)\npublic func from_b(): float = max_float\n".to_string(),
+		),
+		_ => None,
+	};
+	let compiled = compile_project_with_std("main", &load, &synth_std_math_provider)
+		.expect("multi-consumer external let project should compile");
+	assert_eq!(
+		compiled.js.matches("max_float);").count(),
+		1,
+		"{}",
+		compiled.js
+	);
+	let same = compiled.entry_symbol("same");
+	let mut js = compiled.js;
+	js.push_str(&format!("\nconsole.log({same}().v);\n"));
+	assert_eq!(run_node(&js, "external_let_consumers"), "true");
 }
 
 /// `xs.is_empty()` — real Nymph source whose body transitively calls the

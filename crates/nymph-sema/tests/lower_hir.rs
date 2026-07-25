@@ -1169,6 +1169,7 @@ fn missing_resolution_still_panics_in_lowering() {
 	let stripped = nymph_sema::Checked {
 		diags: checked.diags,
 		annotations: nymph_sema::Annotations::default(),
+		external_value_marshals: checked.external_value_marshals,
 		interner: checked.interner,
 	};
 	nymph_sema::lower_hir(&parsed.tree, &stripped);
@@ -1306,6 +1307,7 @@ fn missing_prefix_resolution_still_panics_in_lowering() {
 	let stripped = nymph_sema::Checked {
 		diags: checked.diags,
 		annotations: nymph_sema::Annotations::default(),
+		external_value_marshals: checked.external_value_marshals,
 		interner: checked.interner,
 	};
 	nymph_sema::lower_hir(&parsed.tree, &stripped);
@@ -3301,4 +3303,74 @@ fn namespace_func_in_a_top_level_impl_panics_in_lowering() {
 		   namespace func zero(): Counter = Counter(n = 0)
 		 }",
 	);
+}
+
+#[test]
+fn external_let_lowers_once_and_references_share_its_binding() {
+	let hir = lower("external(max_float) let limit: float\nfunc pair() = #(limit, limit)");
+	assert_eq!(hir.lets.len(), 1);
+	assert!(matches!(
+		hir.lets[0].value,
+		HirExpr::ExternValue {
+			module: "std/math/intrinsics",
+			symbol: "max_float",
+			marshal: nymph_hir::hir::MarshalKind::Float,
+		}
+	));
+	let HirExpr::Array { items, .. } = &hir.funcs[0].body else {
+		panic!("expected tuple");
+	};
+	assert_eq!(
+		items,
+		&[
+			HirExpr::Local("limit".into()),
+			HirExpr::Local("limit".into())
+		]
+	);
+}
+
+#[test]
+fn duplicate_external_lets_lower_to_one_canonical_snapshot_and_a_local_alias() {
+	let hir = lower("external(max_float) let first: float\nexternal(max_float) let second: float");
+	assert_eq!(hir.lets.len(), 2);
+	assert!(matches!(hir.lets[0].value, HirExpr::ExternValue { .. }));
+	assert_eq!(hir.lets[1].name, "second");
+	assert_eq!(hir.lets[1].value, HirExpr::Local("first".into()));
+}
+
+#[test]
+fn external_let_marshal_uses_resolved_declaration_type() {
+	for source in [
+		"type Scalar = float\nexternal(max_float) let limit: Scalar",
+		"external(max_float) let limit: (float)",
+	] {
+		let hir = lower(source);
+		assert!(matches!(
+			hir.lets[0].value,
+			HirExpr::ExternValue {
+				marshal: nymph_hir::hir::MarshalKind::Float,
+				..
+			}
+		));
+	}
+}
+
+#[test]
+fn ambient_external_let_is_demand_collected_once() {
+	let prelude = parse_module("external(max_float) let limit: float", "prelude");
+	let user = parse_module("func pair() = #(limit, limit)", "test");
+	let checked = check_module_with_prelude(&user.tree, std::slice::from_ref(&prelude.tree));
+	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+	let lowered = lower_hir_with_prelude_runtime_and_deps(
+		&user.tree,
+		std::slice::from_ref(&prelude.tree),
+		1,
+		&checked,
+	);
+	assert!(lowered.module.lets.is_empty());
+	assert_eq!(lowered.prelude_runtime.lets.len(), 1);
+	assert!(matches!(
+		lowered.prelude_runtime.lets[0].value,
+		HirExpr::ExternValue { .. }
+	));
 }

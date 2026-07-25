@@ -337,6 +337,18 @@ pub enum TypeError {
 	/// A tuple spread operand does not have a concrete, statically known tuple
 	/// shape, so its elements cannot be incorporated into the result type.
 	TupleSpreadRequiresStaticTuple { ty: String },
+	/// An external let marker has no immutable-value registry entry.
+	ExternalValueLinkageMissing { marker: EcoString },
+	/// An external let marker is registered for a callable external instead.
+	ExternalLinkageWrongKind { marker: EcoString },
+	/// An external function marker is registered for an immutable value instead.
+	ExternalFunctionLinkageWrongKind { marker: EcoString },
+	/// The declared type has no raw-host marshalling ABI.
+	ExternalValueTypeUnsupported,
+	/// The declaration's marshal ABI differs from the registry contract.
+	ExternalValueTypeMismatch { marker: EcoString },
+	/// External host values are snapshots and cannot be mutable bindings.
+	ExternalValueMutable,
 }
 
 impl IntoDiagnostic for TypeError {
@@ -476,6 +488,22 @@ impl IntoDiagnostic for TypeError {
 			E::InconsistentUnionBindings => {
 				"both sides of a union pattern must bind the same names".into()
 			}
+			E::ExternalValueLinkageMissing { marker } => {
+				format!("external value marker `{marker}` is not registered").into()
+			}
+			E::ExternalLinkageWrongKind { marker } => {
+				format!("external marker `{marker}` is registered as a function, not a value").into()
+			}
+			E::ExternalFunctionLinkageWrongKind { marker } => {
+				format!("external marker `{marker}` is registered as a value, not a function").into()
+			}
+			E::ExternalValueTypeUnsupported => {
+				"external let type has no raw host-value marshalling ABI".into()
+			}
+			E::ExternalValueTypeMismatch { marker } => {
+				format!("external value marker `{marker}` has an incompatible declared type").into()
+			}
+			E::ExternalValueMutable => "external lets are immutable; remove `mut`".into(),
 
 			E::MainMissing => "no `main` function found".into(),
 			E::MainGeneric => "`main` cannot declare generic parameters".into(),

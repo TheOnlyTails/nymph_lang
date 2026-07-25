@@ -23,6 +23,118 @@ fn emits_a_function_returning_a_number() {
 }
 
 #[test]
+fn external_value_is_imported_marshaled_and_bound_once() {
+	let module = HirModule {
+		lets: vec![nymph_hir::hir::HirLet {
+			name: "limit".into(),
+			mutable: false,
+			value: HirExpr::ExternValue {
+				module: "host/limits",
+				symbol: "maximum",
+				marshal: nymph_hir::hir::MarshalKind::Float,
+			},
+		}],
+		funcs: vec![HirFunc {
+			name: "same".into(),
+			params: vec![],
+			body: HirExpr::Array {
+				kind: nymph_hir::hir::HirArrayKind::Raw,
+				items: vec![
+					HirExpr::Local("limit".into()),
+					HirExpr::Local("limit".into()),
+				],
+			},
+		}],
+		classes: vec![],
+		enums: vec![],
+	};
+	let js = emit(&module);
+	assert_eq!(js.matches("from \"host/limits\"").count(), 1, "{js}");
+	assert_eq!(
+		js.matches("new NFloat($nymph_external$value$").count(),
+		1,
+		"{js}"
+	);
+	assert!(js.contains("const limit ="), "{js}");
+	assert_eq!(js.matches("[limit, limit]").count(), 1, "{js}");
+}
+
+#[test]
+fn duplicate_external_value_declarations_share_one_import_and_box() {
+	let module = HirModule {
+		lets: vec![
+			nymph_hir::hir::HirLet {
+				name: "first".into(),
+				mutable: false,
+				value: HirExpr::ExternValue {
+					module: "host/limits",
+					symbol: "maximum",
+					marshal: nymph_hir::hir::MarshalKind::Float,
+				},
+			},
+			nymph_hir::hir::HirLet {
+				name: "second".into(),
+				mutable: false,
+				value: HirExpr::ExternValue {
+					module: "host/limits",
+					symbol: "maximum",
+					marshal: nymph_hir::hir::MarshalKind::Float,
+				},
+			},
+		],
+		funcs: vec![],
+		classes: vec![],
+		enums: vec![],
+	};
+	let js = emit(&module);
+	assert_eq!(js.matches("from \"host/limits\"").count(), 1, "{js}");
+	assert_eq!(js.matches("new NFloat(").count(), 1, "{js}");
+	assert!(js.contains("const second = first"), "{js}");
+}
+
+#[test]
+fn external_aliases_include_module_symbol_and_kind_identity() {
+	let module = HirModule {
+		lets: vec![nymph_hir::hir::HirLet {
+			name: "value".into(),
+			mutable: false,
+			value: HirExpr::ExternValue {
+				module: "host/a",
+				symbol: "same",
+				marshal: nymph_hir::hir::MarshalKind::Float,
+			},
+		}],
+		funcs: vec![HirFunc {
+			name: "calls".into(),
+			params: vec![],
+			body: HirExpr::Array {
+				kind: nymph_hir::hir::HirArrayKind::Raw,
+				items: vec![
+					HirExpr::ExternCall {
+						module: "host/a",
+						symbol: "same",
+						args: vec![],
+					},
+					HirExpr::ExternCall {
+						module: "host/b",
+						symbol: "same",
+						args: vec![],
+					},
+				],
+			},
+		}],
+		classes: vec![],
+		enums: vec![],
+	};
+	let js = emit(&module);
+	assert_eq!(js.matches("same as $nymph_external$").count(), 3, "{js}");
+	assert_eq!(js.matches("from \"host/a\"").count(), 2, "{js}");
+	assert_eq!(js.matches("from \"host/b\"").count(), 1, "{js}");
+	assert!(js.contains("$call$"), "{js}");
+	assert!(js.contains("$value$"), "{js}");
+}
+
+#[test]
 fn display_protocol_call_includes_its_runtime_without_other_boxed_values() {
 	let module = HirModule {
 		lets: vec![],
