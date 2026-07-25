@@ -28,6 +28,7 @@ pub mod document_store;
 pub mod document_symbols;
 pub mod hover;
 pub mod line_index;
+mod position;
 pub mod semantic_tokens;
 pub mod workspace;
 

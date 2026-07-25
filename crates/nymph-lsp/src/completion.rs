@@ -15,7 +15,9 @@ use std::collections::HashSet;
 use lsp_types::{CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse};
 use nymph_ast::decl::Declaration;
 
-use crate::{document_store::DocumentStore, line_index::LineIndex};
+use crate::{
+	document_store::DocumentStore, line_index::LineIndex, position::query_with_whitespace_left_bias,
+};
 
 /// Every keyword in the surface grammar (`nymph_syntax`'s `keyword_or_ident`
 /// lexer table). `_` is a pattern placeholder, not a keyword, so it's
@@ -89,7 +91,11 @@ pub fn completion(docs: &DocumentStore, params: &CompletionParams) -> Option<Com
 	let mut seen: HashSet<String> = HashSet::new();
 
 	// Locals/params in scope, innermost (nearest shadowing candidate) first.
-	for name in nymph_sema::query::scope_names_at(&parsed.tree, offset) {
+	let scope_names = query_with_whitespace_left_bias(&doc.text, offset, |candidate| {
+		nymph_sema::query::scope_names_at_exact(&parsed.tree, candidate)
+	})
+	.unwrap_or_default();
+	for name in scope_names {
 		if seen.insert(name.clone()) {
 			items.push(CompletionItem {
 				label: name,
@@ -262,6 +268,27 @@ mod tests {
 			!labels.contains(&"func".to_string()),
 			"keyword `func` doesn't start with `fi`"
 		);
+	}
+
+	#[test]
+	fn completion_left_biases_after_whitespace_but_not_punctuation_or_comments() {
+		let uri: Uri = "file:///complete_bias.nym".parse().unwrap();
+		for (tail, includes_parameter) in [
+			("parameter   ", true),
+			("parameter,   ", false),
+			("parameter // note", false),
+		] {
+			let text = format!("func main(parameter: int): int = {tail}");
+			let docs = docs_with(&uri, &text);
+			let character = text.encode_utf16().count() as u32;
+			let result = completion(&docs, &params(&uri, 0, character, None));
+			let labels = labels(result.expect("document is open"));
+			assert_eq!(
+				labels.contains(&"parameter".to_string()),
+				includes_parameter,
+				"tail {tail:?}: {labels:?}"
+			);
+		}
 	}
 
 	#[test]

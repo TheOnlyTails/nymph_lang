@@ -19,7 +19,9 @@ use lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 use nymph_ast::decl::Module;
 use nymph_sema::Checked;
 
-use crate::{document_store::DocumentStore, line_index::LineIndex};
+use crate::{
+	document_store::DocumentStore, line_index::LineIndex, position::query_with_whitespace_left_bias,
+};
 
 struct CacheEntry {
 	version: i32,
@@ -86,15 +88,18 @@ pub fn hover(docs: &DocumentStore, cache: &mut HoverCache, params: &HoverParams)
 	let index = LineIndex::new(&doc.text);
 	let offset = index.offset(&doc.text, position);
 
-	let value = if let Some(code) = nymph_sema::query::type_at(&entry.module, &entry.checked, offset)
-	{
+	let value = if let Some(code) = query_with_whitespace_left_bias(&doc.text, offset, |candidate| {
+		nymph_sema::query::type_at(&entry.module, &entry.checked, candidate)
+	}) {
 		format!(
 			r"```nymph
 {code}
 ```"
 		)
 	} else {
-		let kw_doc = nymph_sema::query::keyword_doc_at(&doc.text, offset)?;
+		let kw_doc = query_with_whitespace_left_bias(&doc.text, offset, |candidate| {
+			nymph_sema::query::keyword_doc_at(&doc.text, candidate)
+		})?;
 		kw_doc.to_string()
 	};
 
@@ -240,6 +245,23 @@ mod tests {
 		match hover.contents {
 			HoverContents::Markup(MarkupContent { value, .. }) => assert_eq!(value, code("int")),
 			other => panic!("expected plain-text markup, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn hover_left_biases_only_across_whitespace_with_utf16_positions() {
+		let uri: Uri = "file:///hover_bias.nym".parse().unwrap();
+		let cases = [
+			("func main(): string = \"𝔘\"   ", 29, true),
+			("func main(): string = \"𝔘\".   ", 30, false),
+			("func main(): string = \"𝔘\" // note   ", 37, false),
+		];
+
+		for (text, utf16_column, resolves) in cases {
+			let docs = docs_with(&uri, text);
+			let mut cache = HoverCache::default();
+			let result = hover(&docs, &mut cache, &params(&uri, 0, utf16_column));
+			assert_eq!(result.is_some(), resolves, "fixture {text:?}");
 		}
 	}
 

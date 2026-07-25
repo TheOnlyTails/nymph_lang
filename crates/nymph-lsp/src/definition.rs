@@ -13,7 +13,9 @@
 
 use lsp_types::{GotoDefinitionParams, GotoDefinitionResponse, Location};
 
-use crate::{document_store::DocumentStore, line_index::LineIndex};
+use crate::{
+	document_store::DocumentStore, line_index::LineIndex, position::query_with_whitespace_left_bias,
+};
 
 /// Answer a go-to-definition request: `None` when the document isn't open, or
 /// when nothing at the cursor resolves (whitespace, a comment, member/field
@@ -30,7 +32,9 @@ pub fn definition(
 	let index = LineIndex::new(&doc.text);
 	let offset = index.offset(&doc.text, position);
 
-	let span = nymph_sema::query::definition_at(&parsed.tree, offset)?;
+	let span = query_with_whitespace_left_bias(&doc.text, offset, |candidate| {
+		nymph_sema::query::definition_at(&parsed.tree, candidate)
+	})?;
 
 	Some(GotoDefinitionResponse::Scalar(Location {
 		uri: uri.clone(),
@@ -97,6 +101,18 @@ mod tests {
 		assert_eq!(loc.range.start.line, 0);
 		// `helper`'s name starts right after "func ".
 		assert_eq!(loc.range.start.character, 5);
+	}
+
+	#[test]
+	fn definition_left_biases_across_whitespace_but_not_punctuation() {
+		let uri: Uri = "file:///def_bias.nym".parse().unwrap();
+		for (suffix, resolves) in [("   ", true), (",   ", false), (" // note", false)] {
+			let text = format!("func f(a: int): int = a{suffix}");
+			let docs = docs_with(&uri, &text);
+			let character = text.encode_utf16().count() as u32;
+			let result = definition(&docs, &params(&uri, 0, character));
+			assert_eq!(result.is_some(), resolves, "suffix {suffix:?}");
+		}
 	}
 
 	#[test]

@@ -236,8 +236,14 @@ fn suppresses_hover(kind: &ExprKind) -> bool {
 	)
 }
 
+/// Whether `offset` lies in `span` under the semantic-query contract.
+///
+/// Source spans are strict half-open ranges: their start is included and
+/// their end is excluded. Empty or reversed spans therefore contain no
+/// offsets. Cursor conveniences such as whitespace left bias belong in the
+/// LSP layer and must not weaken this core rule.
 fn covers(span: Span, offset: usize) -> bool {
-	span.start <= offset && offset <= span.end
+	span.start <= offset && offset < span.end
 }
 
 /// Render a (already deeply-resolved — see `Checker::record`) type,
@@ -948,21 +954,45 @@ pub fn definition_at(module: &Module, offset: usize) -> Option<Span> {
 	defs.get(name.0.as_str()).map(|id| defs.data(id).span)
 }
 
-/// Every local/parameter binder whose scope encloses byte `offset` — NOT
+/// Every local/parameter binder whose semantic scope encloses byte `offset` —
+/// NOT
 /// top-level declarations, which callers can already read straight off the
 /// public `nymph_ast::decl::Module` (with a real `SymbolKind`/
 /// `CompletionItemKind`, which a bare `&str` can't carry). Used by
 /// `textDocument/completion`'s identifier suggestions — member completion
-/// after a `.` needs the checker and is not covered here.
+/// after a `.` needs the checker and is not covered here. Returns an empty
+/// vector when no expression scope applies at the exact offset.
 #[must_use]
 pub fn scope_names_at(module: &Module, offset: usize) -> Vec<String> {
-	let mut names = Vec::new();
+	collect_scope_names_at(module, offset).names
+}
+
+/// The same exact-offset scope query as [`scope_names_at`], preserving whether
+/// an expression scope applies. `None` means there is no scope at `offset`;
+/// `Some(Vec::new())` means a scope applies but has no local or parameter names.
+///
+/// This distinction lets cursor-oriented clients decide when a fallback query
+/// is appropriate without changing [`scope_names_at`]'s established API.
+#[must_use]
+pub fn scope_names_at_exact(module: &Module, offset: usize) -> Option<Vec<String>> {
+	let result = collect_scope_names_at(module, offset);
+	result.applicable.then_some(result.names)
+}
+
+fn collect_scope_names_at(module: &Module, offset: usize) -> ScopeNames {
+	let mut result = ScopeNames::default();
 
 	for decl in &module.members {
-		collect_decl_scope_names(decl, offset, &mut names);
+		collect_decl_scope_names(decl, offset, &mut result);
 	}
 
-	names
+	result
+}
+
+#[derive(Default)]
+struct ScopeNames {
+	applicable: bool,
+	names: Vec<String>,
 }
 
 /// The bound identifiers a pattern introduces, in left-to-right occurrence
@@ -3229,7 +3259,7 @@ fn collect_fallback_exprs(
 
 // ── In-scope names (for completion) ─────────────────────────────────────────
 
-fn collect_decl_scope_names(decl: &Declaration, offset: usize, out: &mut Vec<String>) {
+fn collect_decl_scope_names(decl: &Declaration, offset: usize, out: &mut ScopeNames) {
 	match decl {
 		Declaration::Import { .. }
 		| Declaration::ExternalLet(..)
@@ -3314,7 +3344,7 @@ fn collect_decl_scope_names(decl: &Declaration, offset: usize, out: &mut Vec<Str
 	}
 }
 
-fn collect_impl_member_scope_names(member: &ImplMember, offset: usize, out: &mut Vec<String>) {
+fn collect_impl_member_scope_names(member: &ImplMember, offset: usize, out: &mut ScopeNames) {
 	match member {
 		ImplMember::ExternalLet(..) | ImplMember::ExternalFunc(..) => {}
 		ImplMember::Func { meta, body, .. } => {
@@ -3343,13 +3373,16 @@ fn collect_expr_scope_names<'a>(
 	expr: &'a Expr,
 	offset: usize,
 	scopes: &mut Vec<(&'a str, Span)>,
-	out: &mut Vec<String>,
+	out: &mut ScopeNames,
 ) {
 	if !covers(expr.span, offset) {
 		return;
 	}
-	out.clear();
-	out.extend(scopes.iter().map(|(n, _)| (*n).to_string()));
+	out.applicable = true;
+	out.names.clear();
+	out
+		.names
+		.extend(scopes.iter().map(|(n, _)| (*n).to_string()));
 
 	match &expr.kind {
 		ExprKind::Int(_)
@@ -3502,24 +3535,30 @@ fn collect_expr_scope_names<'a>(
 							// the name is already bound at that point.
 							if !covers(value.span, offset) {
 								pattern_bindings(&meta.name.0, scopes);
-								out.clear();
-								out.extend(scopes.iter().map(|(n, _)| (*n).to_string()));
+								out.names.clear();
+								out
+									.names
+									.extend(scopes.iter().map(|(n, _)| (*n).to_string()));
 							}
 						}
 					}
 				} else {
 					// `offset` sits in the gap before this not-yet-reached
 					// statement: everything earlier has already applied.
-					out.clear();
-					out.extend(scopes.iter().map(|(n, _)| (*n).to_string()));
+					out.names.clear();
+					out
+						.names
+						.extend(scopes.iter().map(|(n, _)| (*n).to_string()));
 				}
 				handled = true;
 				break;
 			}
 			if !handled {
 				// `offset` is past every statement (trailing whitespace).
-				out.clear();
-				out.extend(scopes.iter().map(|(n, _)| (*n).to_string()));
+				out.names.clear();
+				out
+					.names
+					.extend(scopes.iter().map(|(n, _)| (*n).to_string()));
 			}
 			scopes.truncate(base);
 		}
@@ -3546,13 +3585,76 @@ mod definition_and_scope_tests {
 	}
 
 	#[test]
+	fn semantic_span_containment_is_strictly_half_open() {
+		let cases = [
+			("start", Span::new(4, 8), 4, true),
+			("interior", Span::new(4, 8), 7, true),
+			("end", Span::new(4, 8), 8, false),
+			("before", Span::new(4, 8), 3, false),
+			("empty", Span::new(4, 4), 4, false),
+			("reversed", Span::new(8, 4), 6, false),
+		];
+
+		for (name, span, offset, expected) in cases {
+			assert_eq!(covers(span, offset), expected, "case {name}");
+		}
+	}
+
+	#[test]
+	fn public_queries_use_exact_half_open_token_boundaries() {
+		let text = "func f(parameter: int): int = parameter";
+		let module = module_of(text);
+		let checked = crate::check_module(&module);
+		let use_start = text.rfind("parameter").unwrap();
+		let use_end = use_start + "parameter".len();
+		let keyword_start = text.find("func").unwrap();
+		let keyword_end = keyword_start + "func".len();
+
+		for offset in [use_start, use_start + 1] {
+			assert_eq!(type_at(&module, &checked, offset), Some("int".to_string()));
+			assert!(definition_at(&module, offset).is_some());
+			assert_eq!(
+				scope_names_at(&module, offset),
+				vec!["parameter".to_string()]
+			);
+		}
+		assert_eq!(type_at(&module, &checked, use_end), None);
+		assert_eq!(definition_at(&module, use_end), None);
+		assert_eq!(scope_names_at_exact(&module, use_end), None);
+
+		for offset in [keyword_start, keyword_start + 1] {
+			assert!(keyword_doc_at(text, offset).is_some());
+		}
+		assert_eq!(keyword_doc_at(text, keyword_end), None);
+	}
+
+	#[test]
+	fn scope_names_preserves_vec_api_while_exact_query_reports_applicability() {
+		let text = "func f(parameter: int): int = parameter";
+		let module = module_of(text);
+		let use_start = text.rfind("parameter").unwrap();
+		let use_end = use_start + "parameter".len();
+
+		assert_eq!(
+			scope_names_at(&module, use_start),
+			vec!["parameter".to_string()]
+		);
+		assert_eq!(
+			scope_names_at_exact(&module, use_start),
+			Some(vec!["parameter".to_string()])
+		);
+		assert_eq!(scope_names_at(&module, use_end), Vec::<String>::new());
+		assert_eq!(scope_names_at_exact(&module, use_end), None);
+	}
+
+	#[test]
 	fn definition_jumps_a_param_use_to_its_binder() {
 		let text = "func add(a: int, b: int): int = a + b";
 		let module = module_of(text);
 		// Occurrences of the substring "a": 0 = `add`'s own `a`, 1 = the
 		// param `a`, 2 = the `a` inside `a + b`.
-		let use_offset = nth_offset(text, "a", 2) + 1; // land inside the identifier
-		let binder_offset = nth_offset(text, "a", 1) + 1;
+		let use_offset = nth_offset(text, "a", 2);
+		let binder_offset = nth_offset(text, "a", 1);
 
 		let span = definition_at(&module, use_offset).expect("should resolve to the param binder");
 		assert!(
@@ -4363,7 +4465,7 @@ mod type_at_tests {
 		let text = "enum Option<T> { Some(v: T), None }\nfunc f(o: Option<int>): int = match (o) { Some(v) -> v, None -> 0 }";
 		let module = module_of(text);
 		let checked = check_module(&module);
-		let offset = text.find("Some(v) ->").unwrap() + "Some(".len() + 1;
+		let offset = text.find("Some(v) ->").unwrap() + "Some(".len();
 
 		assert_eq!(type_at(&module, &checked, offset), Some("int".to_string()));
 	}
@@ -4377,7 +4479,7 @@ mod type_at_tests {
 		let text = "enum Option<T> { Some(v: T), None }\nfunc f(o: Option<int>): int = match (o) { Some(v = r) -> r, None -> 0 }";
 		let module = module_of(text);
 		let checked = check_module(&module);
-		let offset = text.find("Some(v = r) ->").unwrap() + "Some(v = ".len() + 1;
+		let offset = text.find("Some(v = r) ->").unwrap() + "Some(v = ".len();
 
 		assert_eq!(type_at(&module, &checked, offset), Some("int".to_string()));
 	}
@@ -4404,8 +4506,8 @@ mod type_at_tests {
 			"struct Point(x: int, y: string)\nfunc f(p: Point): int = match (p) { Point(x, y) -> x }";
 		let module = module_of(text);
 		let checked = check_module(&module);
-		let x_offset = text.find("Point(x, y) ->").unwrap() + "Point(".len() + 1;
-		let y_offset = text.find("Point(x, y) ->").unwrap() + "Point(x, ".len() + 1;
+		let x_offset = text.find("Point(x, y) ->").unwrap() + "Point(".len();
+		let y_offset = text.find("Point(x, y) ->").unwrap() + "Point(x, ".len();
 
 		assert_eq!(
 			type_at(&module, &checked, x_offset),

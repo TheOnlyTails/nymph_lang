@@ -258,7 +258,7 @@ fn lexer_token_type(token: &Token) -> Option<u32> {
 		Str(_) | Char(_) => STRING,
 
 		LParen | RParen | LBracket | RBracket | LBrace | RBrace | HashLParen | HashLBracket
-		| HashLBrace | Comma | Colon | At | Underscore | Error => return None,
+		| HashLBrace | Comma | Semicolon | Colon | At | Underscore | Error => return None,
 
 		Identifier(_) | AnonymousParam(_) => return None,
 	})
@@ -881,7 +881,8 @@ fn collect_enum_variant_names(module: &Module) -> HashSet<&str> {
 /// unavailable for this exact node/span.
 fn is_unshadowed_variant(module: &Module, variant_names: &HashSet<&str>, name: &Ident) -> bool {
 	variant_names.contains(name.0.as_str())
-		&& !nymph_sema::query::scope_names_at(module, name.1.start)
+		&& !nymph_sema::query::scope_names_at_exact(module, name.1.start)
+			.unwrap_or_default()
 			.iter()
 			.any(|n| n == name.0.as_str())
 }
