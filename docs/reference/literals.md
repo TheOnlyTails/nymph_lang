@@ -198,7 +198,8 @@ so long as their `Item` type is a tuple containing the key and value types of th
 
 Ranges are not a literal type, but rather a special syntax for creating iterators.
 A range can be either exclusive (`..`) or inclusive (`..=`).
-Inclusive ranges may omit either bound, but exclusive ranges must include an upper bound.
+Either form may omit its lower bound. Only an exclusive range may omit its upper bound: `a..` is
+valid, but `a..=` is not, because an inclusive range requires an upper bound.
 
 Ranges can be created for any type that implements the [`Range`](./stdlib/cmp-comparison#Comparable) interface, which provides a way to order values.
 

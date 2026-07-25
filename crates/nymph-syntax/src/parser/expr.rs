@@ -48,6 +48,7 @@ impl Parser<'_> {
 			if l_bp < min_bp {
 				break;
 			}
+			let infix_span = self.current_span();
 			for _ in 0..consume {
 				self.advance();
 			}
@@ -119,7 +120,12 @@ impl Parser<'_> {
 					}
 				}
 				Infix::RangeInclusive => {
-					let max = self.parse_bp(r_bp);
+					let max = if self.can_start_expr() {
+						self.parse_bp(r_bp)
+					} else {
+						self.emit(infix_span, ParseError::MissingInclusiveRangeUpperBound);
+						self.mk_expr(ExprKind::Tuple(Vec::new()), self.current_span())
+					};
 					self.mk_expr(
 						ExprKind::Range(RangeKind::Inclusive {
 							min: Box::new(lhs),

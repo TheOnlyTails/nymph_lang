@@ -37,8 +37,9 @@ func first_or(xs: #[int], fallback: int): int = match (xs) {
 
 ## Ranges
 
-`a..b` (exclusive) and `a..=b` (inclusive) match anything the range would contain — same bounds
-rules as a [range expression](./literals#ranges).
+Range patterns use the same five valid forms as [range expressions](./literals#ranges): `a..`,
+`a..b`, `a..=b`, `..b`, and `..=b`. The spelling `a..=` is invalid because an inclusive range
+requires an upper bound. A range pattern matches anything the corresponding range would contain.
 
 ```nym
 func http_class(code: int): int = match (code) {

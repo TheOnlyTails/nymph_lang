@@ -4,7 +4,7 @@
 use nymph_ast::{
 	Span,
 	decl::{Declaration, FuncDeclaration, FuncKind, ImplMember, LetKind},
-	expr::{Expr, ExprKind, RangeKind, StringPart},
+	expr::{Expr, ExprKind, Pattern, RangeKind, RangePatternKind, StringPart},
 	ops::BinaryOperator,
 	ty::Type,
 };
@@ -105,6 +105,83 @@ fn collections_and_ranges() {
 		expr("..=10").kind,
 		ExprKind::Range(RangeKind::ToInclusive(_))
 	));
+}
+
+#[test]
+fn range_forms_parse_consistently_in_expression_and_pattern_contexts() {
+	let expression_forms = [
+		("1..", "from"),
+		("1..10", "exclusive"),
+		("1..=10", "inclusive"),
+		("..10", "to"),
+		("..=10", "to-inclusive"),
+	];
+	for (source, expected) in expression_forms {
+		let kind = expr(source).kind;
+		let matches = matches!(
+			(&kind, expected),
+			(ExprKind::Range(RangeKind::From(_)), "from")
+				| (ExprKind::Range(RangeKind::Exclusive { .. }), "exclusive")
+				| (ExprKind::Range(RangeKind::Inclusive { .. }), "inclusive")
+				| (ExprKind::Range(RangeKind::To(_)), "to")
+				| (ExprKind::Range(RangeKind::ToInclusive(_)), "to-inclusive")
+		);
+		assert!(matches, "unexpected range kind for {source:?}: {kind:?}");
+	}
+
+	let pattern_forms = [
+		("1..", "from"),
+		("1..10", "exclusive"),
+		("1..=10", "inclusive"),
+		("..10", "to"),
+		("..=10", "to-inclusive"),
+	];
+	for (range, expected) in pattern_forms {
+		let source = format!("value is {range}");
+		let ExprKind::PatternOp { rhs, .. } = expr(&source).kind else {
+			panic!("expected pattern operator for {source:?}");
+		};
+		let matches = matches!(
+			(&rhs.0, expected),
+			(Pattern::Range(RangePatternKind::From(_)), "from")
+				| (
+					Pattern::Range(RangePatternKind::Exclusive { .. }),
+					"exclusive"
+				) | (
+				Pattern::Range(RangePatternKind::Inclusive { .. }),
+				"inclusive"
+			) | (Pattern::Range(RangePatternKind::To(_)), "to")
+				| (
+					Pattern::Range(RangePatternKind::ToInclusive(_)),
+					"to-inclusive"
+				)
+		);
+		assert!(matches, "unexpected range pattern kind for {source:?}");
+	}
+}
+
+#[test]
+fn missing_inclusive_range_upper_bound_has_a_dedicated_diagnostic() {
+	for (source, expected_span) in [("1..=", (1, 4)), ("value is 1..=", (10, 13))] {
+		let result = parse_expression(source);
+		assert_eq!(
+			result.diagnostics.len(),
+			1,
+			"expected one diagnostic for {source:?}, got {:?}",
+			result.diagnostics
+		);
+		let diagnostic = &result.diagnostics[0];
+		assert_eq!(diagnostic.code, "1022", "wrong diagnostic for {source:?}");
+		assert_eq!(
+			diagnostic.message, "an inclusive range needs an upper bound",
+			"wrong diagnostic for {source:?}"
+		);
+		assert_eq!(
+			(diagnostic.span.start, diagnostic.span.end),
+			expected_span,
+			"wrong diagnostic span for {source:?}"
+		);
+	}
 }
 
 #[test]

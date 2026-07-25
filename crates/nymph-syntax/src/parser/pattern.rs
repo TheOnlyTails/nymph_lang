@@ -71,8 +71,13 @@ impl Parser<'_> {
 			);
 		}
 		if self.check(&Token::DotDotEq) {
-			self.advance();
-			let max = self.parse_pattern_primary();
+			let operator_span = self.advance().unwrap().1;
+			let max = if self.can_start_pattern() {
+				self.parse_pattern_primary()
+			} else {
+				self.emit(operator_span, ParseError::MissingInclusiveRangeUpperBound);
+				Spanned(Pattern::Placeholder, self.current_span())
+			};
 			return Spanned(
 				Pattern::Range(RangePatternKind::Inclusive {
 					min: Box::new(lhs),

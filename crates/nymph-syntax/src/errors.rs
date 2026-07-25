@@ -67,6 +67,8 @@ pub enum ParseError {
 	EmptyInterpolation,
 	/// Tokens remained after the single expression in a string interpolation.
 	TrailingInterpolationContent,
+	/// An inclusive range (`a..=`) omitted its required upper bound.
+	MissingInclusiveRangeUpperBound,
 }
 
 impl IntoDiagnostic for ParseError {
@@ -108,6 +110,7 @@ impl IntoDiagnostic for ParseError {
 			E::TrailingInterpolationContent => {
 				"unexpected trailing content in string interpolation".into()
 			}
+			E::MissingInclusiveRangeUpperBound => "an inclusive range needs an upper bound".into(),
 		}
 	}
 }

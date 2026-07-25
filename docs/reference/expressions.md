@@ -111,8 +111,9 @@ func set(xs: #[int], i: int, v: int): #[int] = {
 
 ## Ranges
 
-`a..b` and `a..=b` build a range value — see [Ranges](./literals#ranges) for the full literal
-syntax and [Iteration](./iteration#ranges) for using one as a `for` source.
+`a..`, `a..b`, `a..=b`, `..b`, and `..=b` build range values. The spelling `a..=` is invalid:
+inclusive ranges require an upper bound. See [Ranges](./literals#ranges) for the full syntax and
+[Iteration](./iteration#ranges) for using one as a `for` source.
 
 ```nym
 func sum_inclusive(n: int): int = {
