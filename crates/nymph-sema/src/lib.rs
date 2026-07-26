@@ -40,6 +40,7 @@ mod prelude;
 pub mod query;
 mod runtime;
 mod solve;
+mod stable_lowering;
 mod unify;
 
 pub use analysis::{
@@ -84,3 +85,4 @@ pub use runtime::{
 	RuntimeExtractionError, RuntimeIteration, RuntimePayload, RuntimePlacement, StableDispatch,
 	StableVariantField, StructShell, VariantExpressionMode, VariantPatternMode, runtime_definitions,
 };
+pub use stable_lowering::*;
