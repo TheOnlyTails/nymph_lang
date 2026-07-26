@@ -18,6 +18,7 @@ ecow = { workspace = true }
 ena = { workspace = true }
 ordered-float = { workspace = true }
 rustc-hash = { workspace = true }
+salsa = { workspace = true }
 
 [dev-dependencies]
 ecow = { workspace = true }

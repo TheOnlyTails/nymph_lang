@@ -182,7 +182,7 @@ pub(crate) type PendingBound = (Span, Ty, DefId, Vec<(EcoString, Ty)>);
 
 /// Whether [`check_module_impl`] should additionally validate the module's
 /// entry point (`main`) — see [`check_module`] vs [`check_module_entry`].
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, salsa::SalsaValue)]
 pub enum EntryMode {
 	/// Plain library-mode checking: no `main` requirement. Every existing
 	/// caller of `check_module` gets this and is unaffected by entry-point

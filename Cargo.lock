@@ -1419,6 +1419,7 @@ dependencies = [
  "nymph-syntax",
  "ordered-float",
  "rustc-hash",
+ "salsa",
 ]
 
 [[package]]

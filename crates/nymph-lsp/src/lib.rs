@@ -118,6 +118,40 @@ fn serve(
 	main_loop(&connection, &docs, &compiler)
 }
 
+fn prepare_if_current<T>(
+	docs: &Mutex<DocumentStore>,
+	uri: &lsp_types::Uri,
+	snapshot: &compiler_state::AnalysisSnapshot,
+	value: T,
+) -> Option<T> {
+	let mut prepared = None;
+	{
+		let docs = docs.lock().unwrap();
+		compiler_state::publish_if_current(&docs, uri, snapshot, value, |value| {
+			prepared = Some(value);
+		});
+	}
+	prepared
+}
+
+fn prepare_hover_response(
+	docs: &Mutex<DocumentStore>,
+	uri: &lsp_types::Uri,
+	snapshot: &compiler_state::AnalysisSnapshot,
+	value: Option<lsp_types::Hover>,
+) -> Option<Option<lsp_types::Hover>> {
+	prepare_if_current(docs, uri, snapshot, value)
+}
+
+fn prepare_semantic_tokens_response(
+	docs: &Mutex<DocumentStore>,
+	uri: &lsp_types::Uri,
+	snapshot: &compiler_state::AnalysisSnapshot,
+	value: Option<lsp_types::SemanticTokensResult>,
+) -> Option<Option<lsp_types::SemanticTokensResult>> {
+	prepare_if_current(docs, uri, snapshot, value)
+}
+
 fn main_loop(
 	connection: &Connection,
 	docs: &Arc<Mutex<DocumentStore>>,
@@ -131,17 +165,26 @@ fn main_loop(
 				}
 				if req.method == HoverRequest::METHOD {
 					let (id, params) = req.extract::<HoverParams>(HoverRequest::METHOD)?;
-					let result = compiler
+					let uri = &params.text_document_position_params.text_document.uri;
+					let snapshot = compiler
 						.lock()
 						.unwrap()
-						.analysis_for_uri(
-							&docs.lock().unwrap(),
-							&params.text_document_position_params.text_document.uri,
-						)
-						.and_then(|snapshot| hover::hover_snapshot(&snapshot, &params));
-					connection
-						.sender
-						.send(Message::Response(Response::new_ok(id, result)))?;
+						.analysis_for_uri(&docs.lock().unwrap(), uri);
+					let response = match snapshot {
+						Some(snapshot) => {
+							let result = hover::hover_snapshot(&snapshot, &params);
+							prepare_hover_response(docs, uri, &snapshot, result)
+						}
+						None => Some(None),
+					};
+					// This synchronous loop is the sole server-state mutator, so no
+					// document change can interleave between the final guard above and
+					// this send. The docs/compiler locks are both released before I/O.
+					if let Some(result) = response {
+						connection
+							.sender
+							.send(Message::Response(Response::new_ok(id, result)))?;
+					}
 				} else if req.method == DocumentSymbolRequest::METHOD {
 					let (id, params) = req.extract::<DocumentSymbolParams>(DocumentSymbolRequest::METHOD)?;
 					let result = document_symbols::document_symbols(&docs.lock().unwrap(), &params);
@@ -163,14 +206,23 @@ fn main_loop(
 				} else if req.method == SemanticTokensFullRequest::METHOD {
 					let (id, params) =
 						req.extract::<SemanticTokensParams>(SemanticTokensFullRequest::METHOD)?;
-					let result = compiler
+					let uri = &params.text_document.uri;
+					let snapshot = compiler
 						.lock()
 						.unwrap()
-						.analysis_for_uri(&docs.lock().unwrap(), &params.text_document.uri)
-						.and_then(|snapshot| semantic_tokens::semantic_tokens_snapshot(&snapshot, &params));
-					connection
-						.sender
-						.send(Message::Response(Response::new_ok(id, result)))?;
+						.analysis_for_uri(&docs.lock().unwrap(), uri);
+					let response = match snapshot {
+						Some(snapshot) => {
+							let result = semantic_tokens::semantic_tokens_snapshot(&snapshot, &params);
+							prepare_semantic_tokens_response(docs, uri, &snapshot, result)
+						}
+						None => Some(None),
+					};
+					if let Some(result) = response {
+						connection
+							.sender
+							.send(Message::Response(Response::new_ok(id, result)))?;
+					}
 				} else {
 					connection.sender.send(Message::Response(Response::new_err(
 						req.id,
@@ -235,6 +287,7 @@ fn handle_notification(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use compiler_state::CompilerState;
 	use lsp_server::{Notification, Request, RequestId};
 	use lsp_types::{
 		Position, PublishDiagnosticsParams, SemanticTokensParams, TextDocumentContentChangeEvent,
@@ -557,6 +610,22 @@ mod tests {
 			.unwrap();
 
 		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn stale_hover_and_semantic_token_responses_are_not_prepared_for_publication() {
+		let uri: lsp_types::Uri = "file:///wire_stale_analysis.nym".parse().unwrap();
+		let mut docs = DocumentStore::default();
+		let mut compiler = CompilerState::new();
+		compiler
+			.open(&mut docs, uri.clone(), "func f(): int = 1".into(), 1)
+			.unwrap();
+		let snapshot = compiler.analysis_for_uri(&docs, &uri).unwrap();
+		docs.change_full(&uri, "func f(): int = 2".into(), 2);
+		let docs = Mutex::new(docs);
+
+		assert!(prepare_hover_response(&docs, &uri, &snapshot, None).is_none());
+		assert!(prepare_semantic_tokens_response(&docs, &uri, &snapshot, None).is_none());
 	}
 
 	/// A round trip through the real `Connection::memory()` wire (not just a

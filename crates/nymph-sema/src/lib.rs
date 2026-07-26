@@ -25,9 +25,11 @@ mod def;
 mod entry;
 mod errors;
 mod exhaustive;
+mod identity;
 mod iface;
 mod infer_expr;
 mod infer_pattern;
+mod interface;
 mod lower;
 mod lower_hir;
 mod members;
@@ -39,6 +41,12 @@ mod unify;
 pub use annotate::{Annotations, Checked, DispatchKind, ExprInfo, IterMode, Resolution};
 pub use check::{EntryMode, check_module, check_module_entry, check_program};
 pub use errors::TypeError;
+pub use identity::{
+	BinderId, BinderScope, DeclarationCategory, DeclarationKey, DefinitionId, GenericParameterId,
+	HeaderBinder, HeaderConstraint, HeaderParameterId, HeaderType, ImplementationHeader,
+	ModuleIdentity, StableIdBuilder,
+};
+pub use interface::*;
 pub use lower_hir::{
 	LoweredHir, RuntimeOwner, lower_hir, lower_hir_with_prelude, lower_hir_with_prelude_and_deps,
 	lower_hir_with_prelude_runtime_and_deps, lower_hir_with_prelude_runtime_and_deps_with_owners,
