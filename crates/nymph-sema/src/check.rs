@@ -233,6 +233,15 @@ fn check_module_from_parts(
 	checker.collect_inner_impls();
 	checker.check_coherence();
 	checker.generalize_returns();
+	if let Some(identity) = checker.defs.defs.iter().find_map(|definition| {
+		definition
+			.stable
+			.as_ref()
+			.filter(|stable| stable.module.path == checker.module.path)
+			.map(|stable| stable.module.clone())
+	}) {
+		checker.assign_runtime_body_identities(&identity);
+	}
 	checker.check_bodies();
 	checker.check_member_bodies();
 	checker.check_external_value_linkage();
@@ -319,6 +328,7 @@ fn check_module_from_parts(
 		.impls
 		.iter()
 		.map(|implementation| crate::annotate::CheckedInherentImpl {
+			definition: implementation.definition.clone(),
 			generics: implementation.owner_generic_names.clone(),
 			self_ty: implementation.self_ty,
 			constraints: implementation.constraints.clone(),
@@ -335,6 +345,7 @@ fn check_module_from_parts(
 					(
 						name.clone(),
 						crate::annotate::CheckedMethod {
+							definition: method.definition.clone(),
 							params,
 							ret,
 							bounds: method.bounds.clone(),
@@ -366,6 +377,12 @@ fn check_module_from_parts(
 				has_explicit_local_ranges,
 			},
 		},
+	}
+}
+
+impl Checker<'_> {
+	pub(crate) fn assign_runtime_body_identities(&mut self, identity: &crate::ModuleIdentity) {
+		crate::interface_extract::assign_runtime_body_identities(self, identity);
 	}
 }
 
@@ -1070,6 +1087,68 @@ mod tests {
 		members::{InherentImpl, InherentMethod},
 	};
 	use nymph_syntax::parse_module;
+
+	#[test]
+	fn local_runtime_body_identities_are_assigned_before_body_checking() {
+		let module = parse_module(
+			"interface Show { func label(): string = this.extra()\nfunc extra(): string }\nstruct Item { func inherent(): string = this.label()\nnamespace func make(): Item = Item() }\nimpl Show for Item { func extra(): string = this.inherent() }",
+			"main.nym",
+		)
+		.tree;
+		let identity = ModuleIdentity {
+			origin: ModuleOrigin::Project("test".into()),
+			project: "test".into(),
+			path: "main.nym".into(),
+		};
+		let headers = crate::declared_headers(identity.clone(), &module);
+		let mut diagnostics = Vec::new();
+		let defs = build_def_map_on(&module, DefMap::default(), &mut diagnostics, Some(&headers));
+		let mut checker = Checker::new(&module, defs, diagnostics);
+		checker.lower_signatures();
+		checker.collect_interfaces();
+		checker.collect_inherent();
+		checker.collect_impls();
+		checker.collect_inner_impls();
+		checker.check_coherence();
+		checker.generalize_returns();
+		checker.assign_runtime_body_identities(&identity);
+
+		let interface = checker.interfaces.values().next().expect("local interface");
+		assert!(
+			interface
+				.methods
+				.values()
+				.all(|method| method.definition.is_some())
+		);
+		let implementation = checker.impls.impls.first().expect("local implementation");
+		assert!(implementation.definition.is_some());
+		assert!(
+			implementation
+				.methods
+				.values()
+				.all(|method| method.definition.is_some())
+		);
+		assert!(checker.inherent.impls.iter().all(|implementation| {
+			implementation.definition.is_some()
+				&& implementation
+					.methods
+					.values()
+					.all(|method| method.definition.is_some())
+		}));
+		checker.check_bodies();
+		checker.check_member_bodies();
+		let resolutions = checker
+			.annotations
+			.infos()
+			.filter_map(|(_, info)| info.resolution.as_ref())
+			.collect::<Vec<_>>();
+		assert!(!resolutions.is_empty());
+		assert!(
+			resolutions
+				.iter()
+				.all(|resolution| resolution.target.is_some())
+		);
+	}
 
 	#[test]
 	fn imported_definitions_are_not_treated_as_local_ast_jobs() {

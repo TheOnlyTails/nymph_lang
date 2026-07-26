@@ -474,7 +474,7 @@ fn checked_member_shape(
 		);
 	}
 	Ok(MemberShape {
-		id,
+		id: facts.definition.clone().unwrap_or(id),
 		name: meta.name.0.clone(),
 		visibility,
 		kind: match meta.kind {
@@ -802,6 +802,250 @@ fn header_type(ty: &InterfaceType, binders: &[GenericParameter]) -> HeaderType {
 	}
 }
 
+pub(crate) fn assign_runtime_body_identities(
+	checker: &mut crate::check::Checker<'_>,
+	identity: &ModuleIdentity,
+) {
+	let headers = DeclaredHeaders {
+		module: identity.clone(),
+		definitions: checker
+			.defs
+			.defs
+			.iter()
+			.filter_map(|definition| {
+				definition
+					.stable
+					.clone()
+					.map(|stable| (definition.name.clone(), stable))
+			})
+			.collect(),
+		checked_definitions: checker
+			.defs
+			.defs
+			.iter()
+			.filter_map(|definition| {
+				definition
+					.stable
+					.clone()
+					.map(|stable| (definition.name.clone(), stable))
+			})
+			.collect(),
+	};
+
+	for (&interface, definition) in &mut checker.interfaces {
+		let Some(owner) = checker.defs.stable(interface).cloned() else {
+			continue;
+		};
+		let mut ids = StableIdBuilder::new(identity.clone());
+		let names = checker
+			.module
+			.members
+			.iter()
+			.find_map(|declaration| match declaration {
+				Declaration::Interface { name, members, .. }
+					if checker.defs.get(&name.0) == Some(interface) =>
+				{
+					Some(
+						members
+							.iter()
+							.filter_map(|member| {
+								let nymph_ast::decl::InterfaceMember::Element(element) = &member.0 else {
+									return None;
+								};
+								let nymph_ast::decl::InterfaceElement::Func { meta, .. } = &element.0 else {
+									return None;
+								};
+								Some(meta.name.0.clone())
+							})
+							.collect::<Vec<_>>(),
+					)
+				}
+				_ => None,
+			})
+			.unwrap_or_default();
+		for name in names {
+			if let Some(method) = definition.methods.get_mut(&name) {
+				method.definition = Some(ids.allocate(DeclarationKey::member(
+					owner.clone(),
+					DeclarationCategory::Method,
+					name,
+				)));
+			}
+		}
+	}
+
+	let impl_mutability = checker
+		.module
+		.members
+		.iter()
+		.filter_map(|declaration| match declaration {
+			Declaration::ImplFor { mutable, .. } => Some(*mutable),
+			_ => None,
+		})
+		.chain(
+			checker
+				.module
+				.members
+				.iter()
+				.flat_map(|declaration| match declaration {
+					Declaration::Struct { impls, .. } | Declaration::Enum { impls, .. } => {
+						vec![false; impls.len()]
+					}
+					_ => Vec::new(),
+				}),
+		)
+		.collect::<Vec<_>>();
+	let mut implementation_ids = StableIdBuilder::new(identity.clone());
+	let snapshot = checker_snapshot(checker);
+	for (implementation, mutable) in checker
+		.impls
+		.impls
+		.iter_mut()
+		.filter(|implementation| implementation.definition.is_none())
+		.zip(impl_mutability)
+	{
+		let temporary = DefinitionId::new(
+			identity.clone(),
+			DeclarationKey::top_level(DeclarationCategory::Namespace, "$impl"),
+		);
+		let (context, binders) = definition_context(
+			&snapshot,
+			&headers,
+			&temporary,
+			implementation.generics.clone(),
+		);
+		let Ok(self_type) = canonicalize_type(&checker.interner, implementation.self_ty, &context)
+		else {
+			continue;
+		};
+		let Some(interface) = checker.defs.stable(implementation.interface).cloned() else {
+			continue;
+		};
+		let Ok(arguments) = implementation
+			.args
+			.iter()
+			.map(|(name, ty)| {
+				Ok((
+					name.clone(),
+					canonicalize_type(&checker.interner, *ty, &context)?,
+				))
+			})
+			.collect::<Result<Vec<_>, InterfaceConversionError>>()
+		else {
+			continue;
+		};
+		let Ok(constraints) =
+			checked_constraints(&implementation.constraints, &snapshot, &headers, &context)
+		else {
+			continue;
+		};
+		let id = implementation_ids.allocate(DeclarationKey::implementation(ImplementationHeader {
+			interface: Some(interface),
+			interface_arguments: arguments
+				.iter()
+				.map(|(name, ty)| (name.clone(), header_type(ty, &binders)))
+				.collect(),
+			self_type: header_type(&self_type, &binders),
+			mutable,
+			binders: (0..binders.len())
+				.map(|index| HeaderBinder {
+					parameter: HeaderParameterId(index as u32),
+				})
+				.collect(),
+			constraints: constraints
+				.iter()
+				.map(|constraint| crate::HeaderConstraint {
+					parameter: HeaderParameterId(
+						binders
+							.iter()
+							.position(|binder| binder.id == constraint.parameter)
+							.unwrap() as u32,
+					),
+					interface: constraint.interface.clone(),
+					positional: constraint
+						.positional
+						.iter()
+						.map(|ty| header_type(ty, &binders))
+						.collect(),
+					named: constraint
+						.named
+						.iter()
+						.map(|(name, ty)| (name.clone(), header_type(ty, &binders)))
+						.collect(),
+				})
+				.collect(),
+		}));
+		implementation.definition = Some(id.clone());
+		for (name, method) in &mut implementation.methods {
+			method.definition = Some(DefinitionId::new(
+				identity.clone(),
+				DeclarationKey::member(id.clone(), DeclarationCategory::Method, name.clone()),
+			));
+		}
+	}
+
+	// Inherent ADT groups are owned by the type. Standalone inherent blocks are
+	// implementation-owned; their exact canonical IDs are finalized below by the
+	// same extraction header machinery (and are not confused with the ADT owner).
+	let adt_groups = checker
+		.module
+		.members
+		.iter()
+		.filter(|declaration| {
+			matches!(
+				declaration,
+				Declaration::Struct { .. } | Declaration::Enum { .. }
+			)
+		})
+		.count();
+	for (index, implementation) in checker
+		.inherent
+		.impls
+		.iter_mut()
+		.filter(|implementation| !implementation.imported)
+		.enumerate()
+	{
+		let owner = (index < adt_groups)
+			.then(|| match checker.interner.kind(implementation.self_ty) {
+				nymph_hir::ty::TyKind::Adt(def, _) => checker.defs.stable(*def).cloned(),
+				_ => None,
+			})
+			.flatten();
+		if let Some(owner) = owner {
+			implementation.definition = Some(owner.clone());
+			for (name, method) in &mut implementation.methods {
+				method.definition = Some(DefinitionId::new(
+					identity.clone(),
+					DeclarationKey::member(owner.clone(), DeclarationCategory::Method, name.clone()),
+				));
+			}
+		}
+	}
+}
+
+fn checker_snapshot(checker: &crate::check::Checker<'_>) -> Checked {
+	Checked {
+		diags: Vec::new(),
+		facts: crate::CheckedFacts {
+			annotations: crate::Annotations::default(),
+			external_value_marshals: Default::default(),
+			interner: checker.interner.clone(),
+			semantic: crate::CheckedSemantic {
+				definitions: checker.defs.clone(),
+				signatures: checker.sigs.clone(),
+				interfaces: checker.interfaces.clone(),
+				implementations: checker.impls.clone(),
+				inherent: Vec::new(),
+				anonymous_bounds: checker.synthetic_bound_details.clone(),
+				local_definitions: 0..0,
+				local_implementations: 0..0,
+				local_inherent: 0..0,
+				has_explicit_local_ranges: false,
+			},
+		},
+	}
+}
+
 fn function_shape(
 	definition: &mut ExportedDefinition,
 	meta: &FuncDeclaration,
@@ -1122,6 +1366,7 @@ fn extract_definition(
 					if let nymph_ast::decl::InterfaceElement::Func { meta, body } = element {
 						let signature = &checked.semantic.interfaces[&def].methods[&meta.name.0];
 						let facts = crate::annotate::CheckedMethod {
+							definition: signature.definition.clone(),
 							params: signature.params.clone(),
 							ret: signature.ret,
 							bounds: signature.bounds.clone(),
@@ -1467,6 +1712,7 @@ fn extract_implementations(
 						.collect(),
 				}),
 			);
+			let id = implementation.definition.clone().unwrap_or(id);
 			let (context, binders) =
 				definition_context(checked, headers, &id, implementation.generics.clone());
 			let mut member_ids = StableIdBuilder::new(headers.module.clone());
@@ -1484,6 +1730,7 @@ fn extract_implementations(
 				.map(|(visibility, meta, external, body)| {
 					let signature = &implementation.methods[&meta.name.0];
 					let facts = crate::annotate::CheckedMethod {
+						definition: signature.definition.clone(),
 						params: signature.params.clone(),
 						ret: signature.ret,
 						bounds: signature.bounds.clone(),
@@ -1610,6 +1857,7 @@ fn extract_implementations(
 					.collect(),
 			}),
 		);
+		let id = implementation.definition.clone().unwrap_or(id);
 		let (impl_context, binders) =
 			definition_context(checked, headers, &id, implementation.generics.clone());
 		let mut member_ids = StableIdBuilder::new(headers.module.clone());

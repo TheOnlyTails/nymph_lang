@@ -33,6 +33,7 @@ pub struct CheckedSemantic {
 /// Owned, AST-independent facts for one checked inherent implementation.
 #[derive(Debug, Clone)]
 pub(crate) struct CheckedInherentImpl {
+	pub definition: Option<DefinitionId>,
 	pub generics: Vec<EcoString>,
 	pub self_ty: Ty,
 	pub constraints: Vec<crate::iface::Bound>,
@@ -42,6 +43,7 @@ pub(crate) struct CheckedInherentImpl {
 /// Owned method facts after return inference and constraint checking.
 #[derive(Debug, Clone)]
 pub(crate) struct CheckedMethod {
+	pub definition: Option<DefinitionId>,
 	pub params: Vec<Ty>,
 	pub ret: Ty,
 	pub bounds: Vec<crate::iface::Bound>,
