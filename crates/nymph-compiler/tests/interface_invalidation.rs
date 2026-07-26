@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use nymph_compiler::project::{
 	AmbientCoreModuleKey, BuiltinRuntimeOwnerShape, CompilerSession, ModulePath, ProjectId,
-	SemanticPipeline, SemanticQueryEvent, SourceVersion,
+	SemanticQueryEvent, SourceVersion,
 };
 use nymph_sema::{
 	EntryMode, InterfaceType, ModuleEnvironment, RecoveredDefinitionReference, RecoveredInterfaceType,
@@ -26,10 +26,9 @@ fn interface_event_session() -> (CompilerSession, Arc<Mutex<Vec<SemanticQueryEve
 	let events = Arc::new(Mutex::new(Vec::new()));
 	let sink = events.clone();
 	(
-		CompilerSession::with_detailed_event_callback_for_test(
-			SemanticPipeline::Interface,
-			move |event| sink.lock().unwrap().push(event),
-		),
+		CompilerSession::with_detailed_event_callback_for_test(move |event| {
+			sink.lock().unwrap().push(event)
+		}),
 		events,
 	)
 }
@@ -93,7 +92,7 @@ fn body_only_edit_preserves_compat_interface_value() {
 		SourceVersion(1),
 	);
 	let before = session
-		.compat_module_interface(
+		.module_interface(
 			project.clone(),
 			path.clone(),
 			path.clone(),
@@ -108,7 +107,7 @@ fn body_only_edit_preserves_compat_interface_value() {
 		SourceVersion(2),
 	);
 	let after = session
-		.compat_module_interface(project.clone(), path.clone(), path, EntryMode::Library)
+		.module_interface(project.clone(), path.clone(), path, EntryMode::Library)
 		.unwrap();
 	assert_eq!(before, after);
 	let observed = events.lock().unwrap();
@@ -146,7 +145,7 @@ fn interface_producer_is_backdated_after_body_only_edit() {
 		"private func helper(): int = 1\npublic func answer(): int = helper()".into(),
 		SourceVersion(1),
 	);
-	let _ = session.compat_module_interface(
+	let _ = session.module_interface(
 		project.clone(),
 		path.clone(),
 		path.clone(),
@@ -159,7 +158,7 @@ fn interface_producer_is_backdated_after_body_only_edit() {
 		"private func helper(): int = 2\npublic func answer(): int = helper()".into(),
 		SourceVersion(2),
 	);
-	let _ = session.compat_module_interface(
+	let _ = session.module_interface(
 		project.clone(),
 		path.clone(),
 		path.clone(),
@@ -173,7 +172,7 @@ fn interface_producer_is_backdated_after_body_only_edit() {
 	);
 	assert!(!first.iter().any(|event| event == "compat_module_interface"));
 	events.lock().unwrap().clear();
-	let _ = session.compat_module_interface(project, path.clone(), path, EntryMode::Library);
+	let _ = session.module_interface(project, path.clone(), path, EntryMode::Library);
 	assert!(
 		events.lock().unwrap().is_empty(),
 		"backdated value was recomputed"
@@ -192,7 +191,7 @@ fn recovered_environment_is_not_lowerable() {
 		SourceVersion(1),
 	);
 	let environment = session
-		.compat_module_environment(
+		.module_environment(
 			project.clone(),
 			path.clone(),
 			path.clone(),
@@ -202,7 +201,7 @@ fn recovered_environment_is_not_lowerable() {
 	assert!(matches!(&*environment, ModuleEnvironment::Recovered(_)));
 	assert!(
 		session
-			.compat_module_interface(
+			.module_interface(
 				project.clone(),
 				path.clone(),
 				path.clone(),
@@ -213,7 +212,7 @@ fn recovered_environment_is_not_lowerable() {
 	);
 	assert!(
 		session
-			.compat_environment_is_lowerable(project, path.clone(), path, EntryMode::Library)
+			.environment_is_lowerable(project, path.clone(), path, EntryMode::Library)
 			.is_err()
 	);
 }
@@ -230,7 +229,7 @@ fn diagnostic_text_and_span_changes_are_not_interface_identity() {
 		SourceVersion(1),
 	);
 	let before = session
-		.compat_module_environment(
+		.module_environment(
 			project.clone(),
 			path.clone(),
 			path.clone(),
@@ -244,7 +243,7 @@ fn diagnostic_text_and_span_changes_are_not_interface_identity() {
 		SourceVersion(2),
 	);
 	let after = session
-		.compat_module_environment(project, path.clone(), path, EntryMode::Library)
+		.module_environment(project, path.clone(), path, EntryMode::Library)
 		.unwrap();
 	assert_eq!(before, after);
 }
@@ -261,7 +260,7 @@ fn conversion_failure_is_a_separate_internal_diagnostic_and_blocks_lowering() {
 		SourceVersion(1),
 	);
 	let diagnostics = session
-		.compat_module_diagnostics(
+		.module_diagnostics(
 			project.clone(),
 			path.clone(),
 			path.clone(),
@@ -272,7 +271,7 @@ fn conversion_failure_is_a_separate_internal_diagnostic_and_blocks_lowering() {
 	assert_eq!(diagnostics[0].diag.code, "INTERNAL-INTERFACE-CONVERSION");
 	assert!(
 		session
-			.compat_environment_is_lowerable(project, path.clone(), path, EntryMode::Library)
+			.environment_is_lowerable(project, path.clone(), path, EntryMode::Library)
 			.is_err()
 	);
 }
@@ -342,7 +341,7 @@ fn every_public_interface_shape_edit_changes_the_interface() {
 			SourceVersion(1),
 		);
 		let before = session
-			.compat_module_interface(
+			.module_interface(
 				project.clone(),
 				path.clone(),
 				path.clone(),
@@ -356,7 +355,7 @@ fn every_public_interface_shape_edit_changes_the_interface() {
 			SourceVersion(2),
 		);
 		let after = session
-			.compat_module_interface(project, path.clone(), path, EntryMode::Library)
+			.module_interface(project, path.clone(), path, EntryMode::Library)
 			.expect("complete after interface");
 		assert_ne!(before, after, "case {index} did not change the interface");
 	}
@@ -389,7 +388,7 @@ fn compatibility_extraction_preserves_import_owner_ids_and_current_impl_facts() 
 	}
 	let main = ModulePath::new("main").unwrap();
 	let interface = session
-		.compat_module_interface(
+		.module_interface(
 			project.clone(),
 			main.clone(),
 			main.clone(),
@@ -399,7 +398,7 @@ fn compatibility_extraction_preserves_import_owner_ids_and_current_impl_facts() 
 	assert!(
 		!interface.exports.is_empty(),
 		"{:?}",
-		session.compat_module_diagnostics(project, main.clone(), main, EntryMode::Library)
+		session.module_diagnostics(project, main.clone(), main, EntryMode::Library)
 	);
 	let named_module = |name: &str| {
 		let export = interface
@@ -449,7 +448,7 @@ fn recovered_flattened_implementation_keeps_current_module_provenance_and_shape(
 	}
 	let main = ModulePath::new("main").unwrap();
 	let environment = session
-		.compat_module_environment(project, main.clone(), main, EntryMode::Library)
+		.module_environment(project, main.clone(), main, EntryMode::Library)
 		.unwrap();
 	let ModuleEnvironment::Recovered(environment) = &*environment else {
 		panic!("expected recovered environment")

@@ -47,7 +47,6 @@
 //!    fenced-off change to per-module name resolution in `nymph-sema`.
 
 mod bundle;
-mod compat;
 mod emission;
 mod metrics;
 mod queries;
@@ -64,7 +63,7 @@ pub use session::{
 pub use emission::StableEmittedProject;
 
 #[cfg(feature = "test-support")]
-pub use session::{SemanticPipeline, SemanticQueryEvent};
+pub use session::SemanticQueryEvent;
 
 #[cfg(feature = "test-support")]
 pub use metrics::{PhaseCounts, with_phase_counts};

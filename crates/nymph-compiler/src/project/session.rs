@@ -284,13 +284,6 @@ impl ModuleAnalysis {
 	}
 }
 
-#[cfg(feature = "test-support")]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SemanticPipeline {
-	CompatibilityFlattened,
-	Interface,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum RuntimeDefinitionError {
 	Recovered,
@@ -416,50 +409,47 @@ impl CompilerSession {
 		input.set_source(&mut self.db).to(Arc::from(source));
 	}
 
-	#[cfg(feature = "test-support")]
-	fn compat_input(
+	fn semantic_input(
 		&self,
 		project: &ProjectId,
 		module: &ModulePath,
-	) -> Option<super::compat::CompatModuleInput> {
+	) -> Option<SemanticModuleInput> {
 		self
 			.registry
 			.get(&(project.clone(), module.clone()))
-			.map(|record| super::compat::CompatModuleInput::Project(record.input))
+			.map(|record| SemanticModuleInput::Project(record.input))
 	}
 
 	#[must_use]
 	#[cfg(feature = "test-support")]
-	pub fn compat_module_interface(
+	pub fn module_interface(
 		&self,
 		project: ProjectId,
 		entry: ModulePath,
 		module: ModulePath,
 		mode: EntryMode,
 	) -> Option<Arc<nymph_sema::ModuleInterface>> {
-		let input = self.compat_input(&project, &module)?;
-		let key = self.project_key(project.clone(), entry, mode, true, true);
-		super::compat::compat_module_interface(&self.db, key, input)
+		let input = self.semantic_input(&project, &module)?;
+		let key = self.project_key(project, entry, mode, true, true);
+		queries::interface_module_interface(&self.db, key, input).ok()
 	}
 
 	#[must_use]
 	#[cfg(feature = "test-support")]
-	pub fn compat_module_environment(
+	pub fn module_environment(
 		&self,
 		project: ProjectId,
 		entry: ModulePath,
 		module: ModulePath,
 		mode: EntryMode,
 	) -> Option<Arc<nymph_sema::ModuleEnvironment>> {
-		let input = self.compat_input(&project, &module)?;
+		let input = self.semantic_input(&project, &module)?;
 		let key = self.project_key(project, entry, mode, true, true);
-		Some(super::compat::compat_module_environment(
-			&self.db, key, input,
-		))
+		Some(queries::interface_module_environment(&self.db, key, input))
 	}
 
 	#[cfg(feature = "test-support")]
-	pub fn compat_environment_is_lowerable(
+	pub fn environment_is_lowerable(
 		&self,
 		project: ProjectId,
 		entry: ModulePath,
@@ -467,7 +457,7 @@ impl CompilerSession {
 		mode: EntryMode,
 	) -> Result<(), &'static str> {
 		match &*self
-			.compat_module_environment(project, entry, module, mode)
+			.module_environment(project, entry, module, mode)
 			.ok_or("module is unavailable")?
 		{
 			nymph_sema::ModuleEnvironment::Complete(_) => Ok(()),
@@ -479,18 +469,21 @@ impl CompilerSession {
 
 	#[must_use]
 	#[cfg(feature = "test-support")]
-	pub fn compat_module_diagnostics(
+	pub fn module_diagnostics(
 		&self,
 		project: ProjectId,
 		entry: ModulePath,
 		module: ModulePath,
 		mode: EntryMode,
 	) -> Option<Arc<[ProjectDiagnostic]>> {
-		let input = self.compat_input(&project, &module)?;
+		let input = self.semantic_input(&project, &module)?;
 		let key = self.project_key(project, entry, mode, true, true);
-		Some(super::compat::compat_module_diagnostics(
-			&self.db, key, input,
-		))
+		Some(
+			queries::interface_module_analysis(&self.db, key, input)
+				.diagnostics
+				.0
+				.clone(),
+		)
 	}
 
 	#[must_use]
@@ -772,42 +765,6 @@ impl CompilerSession {
 			.collect()
 	}
 
-	/// Test-only stable projection of annotations for differential checking.
-	#[cfg(feature = "test-support")]
-	#[doc(hidden)]
-	pub fn stable_annotations_for_test(
-		&self,
-		project: ProjectId,
-		entry: ModulePath,
-		module: ModulePath,
-		mode: EntryMode,
-	) -> Option<nymph_sema::StableAnnotationView> {
-		let analysis = self.analyze_module(project.clone(), entry.clone(), module.clone(), mode)?;
-		let key = self.project_key(project.clone(), entry.clone(), mode, true, true);
-		let input = self.compat_input(&project, &module)?;
-		let headers = super::compat::compat_declared_headers(&self.db, key, input);
-		let mut interfaces = self
-			.graph_order(project.clone(), entry.clone(), mode)
-			.into_iter()
-			.filter_map(|dependency| {
-				self.compat_module_interface(project.clone(), entry.clone(), dependency, mode)
-			})
-			.collect::<Vec<_>>();
-		if !interfaces
-			.iter()
-			.any(|interface| interface.module == headers.module)
-			&& let Some(interface) =
-				self.compat_module_interface(project.clone(), entry.clone(), module, mode)
-		{
-			interfaces.push(interface);
-		}
-		Some(nymph_sema::stable_annotation_view(
-			&analysis.semantic.checked,
-			&headers.checked_definitions,
-			&interfaces,
-		))
-	}
-
 	/// Return tooling analysis under the same compatibility key used by
 	/// [`Self::tooling_diagnostics`].
 	#[doc(hidden)]
@@ -910,14 +867,7 @@ impl CompilerSession {
 
 	#[cfg(feature = "test-support")]
 	#[must_use]
-	pub fn with_semantic_pipeline_for_test(_pipeline: SemanticPipeline) -> Self {
-		Self::new()
-	}
-
-	#[cfg(feature = "test-support")]
-	#[must_use]
 	pub fn with_detailed_event_callback_for_test(
-		_pipeline: SemanticPipeline,
 		callback: impl Fn(SemanticQueryEvent) + Send + Sync + 'static,
 	) -> Self {
 		let callback: Arc<dyn Fn(SemanticQueryEvent) + Send + Sync> = Arc::new(callback);
@@ -950,7 +900,7 @@ impl CompilerSession {
 		mode: EntryMode,
 	) {
 		let key = self.project_key(project.clone(), entry, mode, true, true);
-		let Some(input) = self.compat_input(&project, &module) else {
+		let Some(input) = self.semantic_input(&project, &module) else {
 			return;
 		};
 		let graph = queries::project_graph(&self.db, key);
@@ -1022,7 +972,7 @@ impl CompilerSession {
 					let query = debug
 						.split_once('(')
 						.map_or(debug.as_str(), |(name, _)| name);
-					if query == "compat_parse_builtin" {
+					if query == "parse_builtin" {
 						// This private compiler-core bootstrap producer serves both importable builtins (historically
 						// observed as `parse`) and ambient-core registry entries. Preserve the
 						// established parse event while exposing the narrower Task 6 event. It
@@ -1034,18 +984,8 @@ impl CompilerSession {
 					}
 					let public_name = match query {
 						"parse" => Some("parse"),
-						"direct_imports" | "compat_builtin_direct_imports" => Some("direct_imports"),
+						"direct_imports" | "builtin_direct_imports" => Some("direct_imports"),
 						"project_graph" => Some("project_graph"),
-						"compat_symbol_map"
-						| "compat_rewritten_module"
-						| "compat_module_analysis"
-						| "compat_declared_headers"
-						| "compat_module_environment"
-						| "compat_module_interface"
-						| "compat_module_diagnostics"
-						| "compat_lowered_module"
-						| "compat_emitted_module"
-						| "compat_compiled_project" => Some(query),
 						"interface_module_analysis"
 						| "interface_module_interface"
 						| "interface_module_environment"

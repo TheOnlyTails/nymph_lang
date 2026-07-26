@@ -280,14 +280,14 @@ impl SemanticModuleInput {
 	pub(crate) fn parsed(self, db: &dyn Db) -> Arc<ParsedModule> {
 		match self {
 			Self::Project(module) => parse(db, module).clone(),
-			Self::Builtin(module) => compat_parse_builtin(db, module).clone(),
+			Self::Builtin(module) => parse_builtin(db, module).clone(),
 		}
 	}
 
 	pub(crate) fn imports(self, db: &dyn Db) -> Arc<DirectImports> {
 		match self {
 			Self::Project(module) => direct_imports(db, module).clone(),
-			Self::Builtin(module) => compat_builtin_direct_imports(db, module).clone(),
+			Self::Builtin(module) => builtin_direct_imports(db, module).clone(),
 		}
 	}
 
@@ -386,7 +386,7 @@ pub(crate) fn parse(db: &dyn Db, module: ModuleInput) -> Arc<ParsedModule> {
 }
 
 #[salsa::tracked]
-pub(crate) fn compat_parse_builtin(db: &dyn Db, module: BuiltinModuleInput) -> Arc<ParsedModule> {
+pub(crate) fn parse_builtin(db: &dyn Db, module: BuiltinModuleInput) -> Arc<ParsedModule> {
 	let key = module.key(db);
 	let prefix = match key.domain {
 		BuiltinModuleDomain::ImportableStd => "std",
@@ -409,12 +409,12 @@ pub(crate) fn direct_imports(db: &dyn Db, module: ModuleInput) -> Arc<DirectImpo
 }
 
 #[salsa::tracked]
-pub(crate) fn compat_builtin_direct_imports(
+pub(crate) fn builtin_direct_imports(
 	db: &dyn Db,
 	module: BuiltinModuleInput,
 ) -> Arc<DirectImports> {
 	collect_imports(
-		compat_parse_builtin(db, module),
+		parse_builtin(db, module),
 		&format!("std::{}", module.key(db).path),
 	)
 }
@@ -424,7 +424,7 @@ pub(crate) fn ambient_core_direct_imports(
 	db: &dyn Db,
 	module: BuiltinModuleInput,
 ) -> Arc<DirectImports> {
-	collect_imports(compat_parse_builtin(db, module), &module.key(db).path)
+	collect_imports(parse_builtin(db, module), &module.key(db).path)
 }
 
 #[salsa::tracked(returns(clone))]
@@ -536,7 +536,7 @@ pub(crate) fn ambient_core_analysis(
 		.filter(|input| *input != module)
 		.map(|input| ambient_core_environment(db, registry, input))
 		.collect::<Vec<_>>();
-	let parsed = compat_parse_builtin(db, module);
+	let parsed = parse_builtin(db, module);
 	let semantic_module = Arc::new(parsed.tree.clone());
 	let result = if graph.diagnostics.is_empty() {
 		let mut environment =
@@ -626,7 +626,7 @@ pub(crate) fn ambient_core_headers(
 ) -> Arc<nymph_sema::DeclaredHeaders> {
 	let own = nymph_sema::declared_headers(
 		ambient_identity(db, module),
-		&compat_parse_builtin(db, module).tree,
+		&parse_builtin(db, module).tree,
 	);
 	let dependency_definitions = ambient_core_graph(db, registry, module)
 		.order
@@ -636,7 +636,7 @@ pub(crate) fn ambient_core_headers(
 		.flat_map(|dependency| {
 			nymph_sema::declared_headers(
 				ambient_identity(db, dependency),
-				&compat_parse_builtin(db, dependency).tree,
+				&parse_builtin(db, dependency).tree,
 			)
 			.definitions
 		})
@@ -2133,7 +2133,7 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 			}
 
 			let parsed = builtin
-				.map(|module| compat_parse_builtin(self.db, module))
+				.map(|module| parse_builtin(self.db, module))
 				.unwrap_or_else(|| parse(self.db, project.unwrap()));
 			let mut ok = true;
 			for diag in parsed.diagnostics.iter().filter(|diag| diag.is_error()) {
@@ -2141,7 +2141,7 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 				ok = false;
 			}
 			let imports = builtin
-				.map(|module| compat_builtin_direct_imports(self.db, module))
+				.map(|module| builtin_direct_imports(self.db, module))
 				.unwrap_or_else(|| direct_imports(self.db, project.unwrap()));
 			let mut handles = Vec::new();
 			let mut semantic_handles = Vec::new();
@@ -2504,11 +2504,11 @@ mod tests {
 	}
 
 	#[test]
-	fn builtin_parse_uses_the_legacy_module_path_through_the_compat_query() {
+	fn builtin_parse_uses_the_legacy_module_path() {
 		let (db, key) = fixture(&[("main", "")], &[("custom", "public let answer = 42")]);
 		let builtin = key.builtin_registry(&db).modules(&db)[0];
 		assert_eq!(
-			compat_parse_builtin(&db, builtin).tree.path.as_str(),
+			parse_builtin(&db, builtin).tree.path.as_str(),
 			"std::custom.nym"
 		);
 	}
