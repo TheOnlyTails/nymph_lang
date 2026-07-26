@@ -56,7 +56,7 @@ mod session;
 
 pub use session::{
 	AmbientCoreModuleKey, BuiltinRuntimeOwnerArtifact, BuiltinRuntimeOwnerShape, CompilerSession,
-	ModuleAnalysis, ModulePath, ProjectDiagnostics, ProjectId, SourceVersion,
+	ModuleAnalysis, ModulePath, ProjectDiagnostics, ProjectId, RuntimeDefinitionError, SourceVersion,
 };
 
 #[cfg(feature = "test-support")]

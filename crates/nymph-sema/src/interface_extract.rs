@@ -167,7 +167,7 @@ fn visible(visibility: Option<Visibility>) -> bool {
 	!matches!(visibility, Some(Visibility::Private))
 }
 
-fn external_function_abi(marker: &EcoString) -> ExternalAbi {
+pub(crate) fn external_function_abi(marker: &EcoString) -> ExternalAbi {
 	let linked = nymph_hir::linkage::lookup(marker, None);
 	ExternalAbi {
 		marker: marker.clone(),
@@ -177,7 +177,7 @@ fn external_function_abi(marker: &EcoString) -> ExternalAbi {
 	}
 }
 
-fn external_value_abi(
+pub(crate) fn external_value_abi(
 	marker: &EcoString,
 	marshal: Option<nymph_hir::hir::MarshalKind>,
 ) -> ExternalAbi {
@@ -1653,10 +1653,18 @@ fn extract_implementations(
 				implementation.self_ty,
 				&temporary_context,
 			)?;
-			let interface = checked.semantic.definitions.data(implementation.interface);
-			let interface = headers
-				.id(&interface.name)
-				.expect("interface header exists");
+			let interface_name = &checked
+				.semantic
+				.definitions
+				.data(implementation.interface)
+				.name;
+			let interface = checked
+				.semantic
+				.definitions
+				.stable(implementation.interface)
+				.cloned()
+				.or_else(|| headers.id(interface_name))
+				.ok_or(InterfaceConversionError::ErrorType)?;
 			let arguments = implementation
 				.args
 				.iter()

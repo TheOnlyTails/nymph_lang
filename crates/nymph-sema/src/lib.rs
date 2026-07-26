@@ -38,6 +38,7 @@ mod lower_hir;
 mod members;
 mod prelude;
 pub mod query;
+mod runtime;
 mod solve;
 mod unify;
 
@@ -76,4 +77,10 @@ pub use nymph_hir::ty::{self, GenericArgs, Interner, Ty, TyKind};
 pub use prelude::{
 	CheckedModule, check_module_entry_with_prelude, check_module_entry_with_prelude_and_module,
 	check_module_with_prelude, check_module_with_prelude_and_module,
+};
+pub use runtime::{
+	BodyNodeId, BuiltinDispatch, CheckedRuntimeBody, DispatchMaterialization, EnumShell,
+	ExpressionVariant, PatternNodeId, PatternVariant, RuntimeAnnotations, RuntimeDefinition,
+	RuntimeExtractionError, RuntimeIteration, RuntimePayload, RuntimePlacement, StableDispatch,
+	StableVariantField, StructShell, VariantExpressionMode, VariantPatternMode, runtime_definitions,
 };

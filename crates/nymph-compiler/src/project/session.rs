@@ -190,6 +190,17 @@ impl Db for Database {
 			callback(SemanticQueryEvent {
 				query: query.to_string(),
 				module: Some(module_name),
+				definition: None,
+			});
+		}
+	}
+	#[cfg(feature = "test-support")]
+	fn runtime_query_will_execute(&self, query: &'static str, definition: &nymph_sema::DefinitionId) {
+		if let Some(callback) = &self.semantic_test_hook.lock().unwrap().callback {
+			callback(SemanticQueryEvent {
+				query: query.to_string(),
+				module: Some(definition.module.path.to_string()),
+				definition: Some(definition.clone()),
 			});
 		}
 	}
@@ -200,6 +211,7 @@ impl Db for Database {
 pub struct SemanticQueryEvent {
 	pub query: String,
 	pub module: Option<String>,
+	pub definition: Option<nymph_sema::DefinitionId>,
 }
 
 #[cfg(feature = "test-support")]
@@ -277,6 +289,15 @@ impl ModuleAnalysis {
 pub enum SemanticPipeline {
 	CompatibilityFlattened,
 	Interface,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub enum RuntimeDefinitionError {
+	Recovered,
+	Extraction(nymph_sema::RuntimeExtractionError),
+	OwnerNotFound,
+	DuplicateOwner,
+	DefinitionNotFound,
 }
 
 pub struct CompilerSession {
@@ -397,7 +418,7 @@ impl CompilerSession {
 		mode: EntryMode,
 	) -> Option<Arc<nymph_sema::ModuleInterface>> {
 		let input = self.compat_input(&project, &module)?;
-		let key = self.project_key(project, entry, mode, true, true);
+		let key = self.project_key(project.clone(), entry, mode, true, true);
 		super::compat::compat_module_interface(&self.db, key, input)
 	}
 
@@ -513,6 +534,160 @@ impl CompilerSession {
 		let input = self.registry.get(&(project.clone(), module))?.input;
 		let key = self.project_key(project.clone(), entry, mode, true, true);
 		self.module_analysis(project, input, key)
+	}
+
+	/// Resolve and read one exact runtime-bearing definition from its source
+	/// module. The owner comes from `DefinitionId`, never from placement metadata.
+	#[must_use]
+	pub fn runtime_definition(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		definition: nymph_sema::DefinitionId,
+		mode: EntryMode,
+	) -> Result<Arc<nymph_sema::RuntimeDefinition>, RuntimeDefinitionError> {
+		let owners = match definition.module.origin {
+			nymph_sema::ModuleOrigin::Project(_) if definition.module.project == project.as_str() => self
+				.registry
+				.iter()
+				.filter(|((found_project, path), _)| {
+					found_project == &project && path.as_str() == definition.module.path
+				})
+				.map(|(_, record)| SemanticModuleInput::Project(record.input))
+				.collect::<Vec<_>>(),
+			nymph_sema::ModuleOrigin::Compiler => self
+				.builtins
+				.iter()
+				.filter(|(key, _)| key.path.as_ref() == definition.module.path)
+				.map(|(_, input)| SemanticModuleInput::Builtin(*input))
+				.collect::<Vec<_>>(),
+			_ => Vec::new(),
+		};
+		let [owner] = owners.as_slice() else {
+			return Err(if owners.is_empty() {
+				RuntimeDefinitionError::OwnerNotFound
+			} else {
+				RuntimeDefinitionError::DuplicateOwner
+			});
+		};
+		let key = self.project_key(project, entry, mode, true, true);
+		queries::runtime_definition(&self.db, key, *owner, definition)
+	}
+
+	#[cfg(feature = "test-support")]
+	#[doc(hidden)]
+	#[must_use]
+	pub fn runtime_definition_consumer_for_test(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		definition: nymph_sema::DefinitionId,
+		mode: EntryMode,
+	) -> Result<Arc<nymph_sema::RuntimeDefinition>, RuntimeDefinitionError> {
+		let key = self.project_key(project.clone(), entry, mode, true, true);
+		let owners = match definition.module.origin {
+			nymph_sema::ModuleOrigin::Project(_) if definition.module.project == project.as_str() => self
+				.registry
+				.iter()
+				.filter(|((found_project, path), _)| {
+					found_project == &project && path.as_str() == definition.module.path
+				})
+				.map(|(_, record)| SemanticModuleInput::Project(record.input))
+				.collect::<Vec<_>>(),
+			nymph_sema::ModuleOrigin::Compiler => self
+				.builtins
+				.iter()
+				.filter(|(key, _)| key.path.as_ref() == definition.module.path)
+				.map(|(_, input)| SemanticModuleInput::Builtin(*input))
+				.collect::<Vec<_>>(),
+			_ => Vec::new(),
+		};
+		let [owner] = owners.as_slice() else {
+			return Err(RuntimeDefinitionError::OwnerNotFound);
+		};
+		queries::runtime_definition_consumer(&self.db, key, *owner, definition)
+	}
+
+	/// Inspect all exact runtime artifacts owned by one module in tests.
+	#[cfg(feature = "test-support")]
+	#[doc(hidden)]
+	pub fn runtime_definitions_for_test(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		mode: EntryMode,
+	) -> Option<Vec<Arc<nymph_sema::RuntimeDefinition>>> {
+		let input = self.registry.get(&(project.clone(), module))?.input;
+		let key = self.project_key(project, entry, mode, true, true);
+		Some(
+			queries::runtime_definition_index(&self.db, key, SemanticModuleInput::Project(input))
+				.iter()
+				.map(|entity| entity.value(&self.db))
+				.collect(),
+		)
+	}
+
+	#[cfg(feature = "test-support")]
+	#[doc(hidden)]
+	pub fn builtin_runtime_definitions_for_test(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: &str,
+		mode: EntryMode,
+	) -> Vec<Arc<nymph_sema::RuntimeDefinition>> {
+		let key = self.project_key(project, entry, mode, true, true);
+		self
+			.builtins
+			.iter()
+			.filter(|(builtin, _)| builtin.path.as_ref().contains(module))
+			.map(|(_, input)| input)
+			.flat_map(|input| {
+				queries::runtime_definition_index(&self.db, key, SemanticModuleInput::Builtin(*input))
+					.iter()
+					.map(|entity| entity.value(&self.db))
+					.collect::<Vec<_>>()
+			})
+			.collect()
+	}
+
+	#[cfg(feature = "test-support")]
+	#[doc(hidden)]
+	pub fn builtin_interface_member_ids_for_test(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: &str,
+		mode: EntryMode,
+	) -> Vec<nymph_sema::DefinitionId> {
+		let key = self.project_key(project, entry, mode, true, true);
+		self
+			.builtins
+			.iter()
+			.filter(|(builtin, _)| builtin.path.as_ref() == module)
+			.flat_map(|(_, input)| {
+				let environment = queries::interface_module_environment(
+					&self.db,
+					key,
+					SemanticModuleInput::Builtin(*input),
+				);
+				let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
+					return Vec::new();
+				};
+				interface
+					.implementations
+					.iter()
+					.filter(|implementation| implementation.interface.is_some())
+					.flat_map(|implementation| {
+						implementation
+							.members
+							.iter()
+							.map(|member| member.id.clone())
+					})
+					.collect()
+			})
+			.collect()
 	}
 
 	/// Test-only stable projection of annotations for differential checking.
@@ -682,6 +857,7 @@ impl CompilerSession {
 				public_callback(SemanticQueryEvent {
 					query: query.to_string(),
 					module: None,
+					definition: None,
 				});
 			}),
 			256,

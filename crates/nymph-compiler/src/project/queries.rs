@@ -20,6 +20,22 @@ use super::{
 pub(crate) trait Db: salsa::Database {
 	#[cfg(feature = "test-support")]
 	fn semantic_query_will_execute(&self, _query: &'static str, _module: SemanticModuleInput) {}
+	#[cfg(feature = "test-support")]
+	fn runtime_query_will_execute(
+		&self,
+		_query: &'static str,
+		_definition: &nymph_sema::DefinitionId,
+	) {
+	}
+}
+
+#[salsa::tracked]
+pub(crate) struct RuntimeDefinitionEntity<'db> {
+	#[returns(ref)]
+	pub definition: nymph_sema::DefinitionId,
+	#[tracked]
+	#[returns(clone)]
+	pub value: Arc<nymph_sema::RuntimeDefinition>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -496,6 +512,103 @@ fn checked_from_analysis(
 		diags: diagnostics.into_iter().collect(),
 		facts: analysis.semantic.checked.as_ref().clone(),
 	}
+}
+
+#[salsa::tracked]
+pub(crate) fn runtime_definition_index<'db>(
+	db: &'db dyn Db,
+	key: super::session::ProjectKey<'db>,
+	module: SemanticModuleInput,
+) -> Arc<[RuntimeDefinitionEntity<'db>]> {
+	#[cfg(feature = "test-support")]
+	db.semantic_query_will_execute("runtime_definition_index", module);
+	let environment = interface_module_environment(db, key, module);
+	let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
+		return Arc::new([]);
+	};
+	let analysis = interface_module_analysis(db, key, module);
+	let source = match module {
+		SemanticModuleInput::Project(input) => match input.source(db) {
+			Some(source) => source,
+			None => return Arc::new([]),
+		},
+		SemanticModuleInput::Builtin(input) => input.source(db),
+	};
+	let Ok(mut definitions) = nymph_sema::runtime_definitions(
+		&analysis.semantic.module,
+		&source,
+		&analysis.semantic.checked,
+		interface,
+	) else {
+		return Arc::new([]);
+	};
+	definitions.sort_by(|a, b| a.definition.cmp(&b.definition));
+	let mut seen = std::collections::BTreeSet::new();
+	definitions
+		.into_iter()
+		.map(|value| {
+			assert!(
+				seen.insert(value.definition.clone()),
+				"duplicate runtime definition identity: {:?}",
+				value.definition
+			);
+			RuntimeDefinitionEntity::new(db, value.definition.clone(), Arc::new(value))
+		})
+		.collect::<Vec<_>>()
+		.into()
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn runtime_definition<'db>(
+	db: &'db dyn Db,
+	key: super::session::ProjectKey<'db>,
+	module: SemanticModuleInput,
+	definition: nymph_sema::DefinitionId,
+) -> Result<Arc<nymph_sema::RuntimeDefinition>, super::session::RuntimeDefinitionError> {
+	#[cfg(feature = "test-support")]
+	db.runtime_query_will_execute("runtime_definition", &definition);
+	let environment = interface_module_environment(db, key, module);
+	if matches!(
+		environment.as_ref(),
+		nymph_sema::ModuleEnvironment::Recovered(_)
+	) {
+		return Err(super::session::RuntimeDefinitionError::Recovered);
+	}
+	let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
+		unreachable!()
+	};
+	let analysis = interface_module_analysis(db, key, module);
+	let source = match module {
+		SemanticModuleInput::Project(input) => input
+			.source(db)
+			.ok_or(super::session::RuntimeDefinitionError::OwnerNotFound)?,
+		SemanticModuleInput::Builtin(input) => input.source(db),
+	};
+	nymph_sema::runtime_definitions(
+		&analysis.semantic.module,
+		&source,
+		&analysis.semantic.checked,
+		interface,
+	)
+	.map_err(super::session::RuntimeDefinitionError::Extraction)?;
+	let entity = runtime_definition_index(db, key, module)
+		.iter()
+		.copied()
+		.find(|entity| entity.definition(db) == &definition)
+		.ok_or(super::session::RuntimeDefinitionError::DefinitionNotFound)?;
+	Ok(entity.value(db))
+}
+
+#[cfg(feature = "test-support")]
+#[salsa::tracked(returns(clone))]
+pub(crate) fn runtime_definition_consumer<'db>(
+	db: &'db dyn Db,
+	key: super::session::ProjectKey<'db>,
+	module: SemanticModuleInput,
+	definition: nymph_sema::DefinitionId,
+) -> Result<Arc<nymph_sema::RuntimeDefinition>, super::session::RuntimeDefinitionError> {
+	db.runtime_query_will_execute("runtime_definition_consumer", &definition);
+	runtime_definition(db, key, module, definition)
 }
 
 /// Check one module exclusively from its own tree and dependency interfaces.
