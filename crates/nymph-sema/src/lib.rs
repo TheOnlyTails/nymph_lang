@@ -49,7 +49,8 @@ pub use errors::TypeError;
 pub use identity::{
 	BinderId, BinderScope, DeclarationCategory, DeclarationKey, DefinitionId, GenericParameterId,
 	HeaderBinder, HeaderConstraint, HeaderParameterId, HeaderType, ImplementationHeader,
-	ModuleIdentity, StableIdBuilder,
+	ModuleIdentity, ModuleOrigin, RecoveredHeaderConstraint, RecoveredHeaderType,
+	RecoveredImplementationHeader, StableIdBuilder,
 };
 pub use interface::*;
 pub use interface_extract::*;

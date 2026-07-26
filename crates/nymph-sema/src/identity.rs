@@ -5,7 +5,14 @@ use std::collections::HashMap;
 use ecow::EcoString;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+pub enum ModuleOrigin {
+	Project(EcoString),
+	Compiler,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
 pub struct ModuleIdentity {
+	pub origin: ModuleOrigin,
 	pub project: EcoString,
 	pub path: EcoString,
 }
@@ -37,6 +44,7 @@ pub struct HeaderBinder {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
 pub enum HeaderType {
+	Poison,
 	Int,
 	UInt,
 	Float,
@@ -79,6 +87,98 @@ pub struct ImplementationHeader {
 	pub mutable: bool,
 	pub binders: Vec<HeaderBinder>,
 	pub constraints: Vec<HeaderConstraint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+pub struct RecoveredHeaderConstraint {
+	pub parameter: HeaderParameterId,
+	pub interface: EcoString,
+	pub positional: Vec<RecoveredHeaderType>,
+	pub named: Vec<(EcoString, RecoveredHeaderType)>,
+}
+
+/// Span-free source structure used only to stabilize malformed implementation IDs.
+/// Semantic recovered interface slots deliberately remain `Known | Poison`.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+pub enum RecoveredHeaderType {
+	Atom(EcoString),
+	List(Box<Self>),
+	Tuple(Vec<Self>),
+	Map(Box<Self>, Box<Self>),
+	Function {
+		parameters: Vec<Self>,
+		return_type: Box<Self>,
+	},
+	Reference {
+		name: EcoString,
+		positional: Vec<Self>,
+		named: Vec<(EcoString, Self)>,
+	},
+	Intersection(Vec<Self>),
+	Mutable(Box<Self>),
+	Generic(HeaderParameterId),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+pub struct RecoveredImplementationHeader {
+	pub interface: Option<EcoString>,
+	pub interface_arguments: Vec<(EcoString, RecoveredHeaderType)>,
+	pub self_type: RecoveredHeaderType,
+	pub mutable: bool,
+	pub binders: Vec<HeaderBinder>,
+	pub constraints: Vec<RecoveredHeaderConstraint>,
+}
+
+impl RecoveredImplementationHeader {
+	pub fn canonical(mut self) -> Self {
+		fn canonical_type(ty: &mut RecoveredHeaderType) {
+			match ty {
+				RecoveredHeaderType::List(inner) | RecoveredHeaderType::Mutable(inner) => {
+					canonical_type(inner)
+				}
+				RecoveredHeaderType::Tuple(items) => items.iter_mut().for_each(canonical_type),
+				RecoveredHeaderType::Map(key, value) => {
+					canonical_type(key);
+					canonical_type(value);
+				}
+				RecoveredHeaderType::Function {
+					parameters,
+					return_type,
+				} => {
+					parameters.iter_mut().for_each(canonical_type);
+					canonical_type(return_type);
+				}
+				RecoveredHeaderType::Reference {
+					positional, named, ..
+				} => {
+					positional.iter_mut().for_each(canonical_type);
+					for (_, ty) in &mut *named {
+						canonical_type(ty);
+					}
+					named.sort();
+				}
+				RecoveredHeaderType::Intersection(items) => {
+					items.iter_mut().for_each(canonical_type);
+					items.sort();
+				}
+				RecoveredHeaderType::Atom(_) | RecoveredHeaderType::Generic(_) => {}
+			}
+		}
+		for (_, ty) in &mut self.interface_arguments {
+			canonical_type(ty);
+		}
+		canonical_type(&mut self.self_type);
+		for constraint in &mut self.constraints {
+			constraint.positional.iter_mut().for_each(canonical_type);
+			for (_, ty) in &mut constraint.named {
+				canonical_type(ty);
+			}
+			constraint.named.sort();
+		}
+		self.interface_arguments.sort();
+		self.constraints.sort();
+		self
+	}
 }
 
 impl ImplementationHeader {
@@ -149,7 +249,8 @@ impl ImplementationHeader {
 					named.sort();
 				}
 				HeaderType::Generic(parameter) => rewrite_parameter(parameter),
-				HeaderType::Int
+				HeaderType::Poison
+				| HeaderType::Int
 				| HeaderType::UInt
 				| HeaderType::Float
 				| HeaderType::Char
@@ -200,6 +301,10 @@ pub enum DeclarationKey {
 		header: Box<ImplementationHeader>,
 		duplicate: u32,
 	},
+	RecoveredImplementation {
+		header: Box<RecoveredImplementationHeader>,
+		duplicate: u32,
+	},
 	MethodBody {
 		owner: Box<DefinitionId>,
 		name: EcoString,
@@ -236,6 +341,13 @@ impl DeclarationKey {
 		}
 	}
 
+	pub fn recovered_implementation(header: RecoveredImplementationHeader) -> Self {
+		Self::RecoveredImplementation {
+			header: Box::new(header.canonical()),
+			duplicate: 0,
+		}
+	}
+
 	pub fn method_body(owner: DefinitionId, name: impl Into<EcoString>) -> Self {
 		Self::MethodBody {
 			owner: Box::new(owner),
@@ -249,6 +361,7 @@ impl DeclarationKey {
 			Self::TopLevel { duplicate, .. }
 			| Self::Member { duplicate, .. }
 			| Self::Implementation { duplicate, .. }
+			| Self::RecoveredImplementation { duplicate, .. }
 			| Self::MethodBody { duplicate, .. } => *duplicate,
 		}
 	}
@@ -258,6 +371,7 @@ impl DeclarationKey {
 			Self::TopLevel { duplicate, .. }
 			| Self::Member { duplicate, .. }
 			| Self::Implementation { duplicate, .. }
+			| Self::RecoveredImplementation { duplicate, .. }
 			| Self::MethodBody { duplicate, .. } => *duplicate = value,
 		}
 		self

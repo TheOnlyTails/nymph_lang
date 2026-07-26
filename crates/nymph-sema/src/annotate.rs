@@ -21,6 +21,7 @@ pub struct CheckedSemantic {
 	pub(crate) interfaces: FxHashMap<crate::DefId, crate::iface::InterfaceDef>,
 	pub(crate) implementations: crate::iface::ImplRegistry,
 	pub(crate) inherent: Vec<CheckedInherentImpl>,
+	pub(crate) anonymous_bounds: FxHashMap<crate::ParamIdx, Vec<crate::iface::Bound>>,
 }
 
 /// Owned, AST-independent facts for one checked inherent implementation.

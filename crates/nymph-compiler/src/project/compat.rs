@@ -31,7 +31,7 @@ impl CompatModuleInput {
 	fn key(self, db: &dyn Db) -> String {
 		match self {
 			Self::Project(module) => module.path(db).to_string(),
-			Self::Builtin(module) => format!("std::{}", module.key(db).0),
+			Self::Builtin(module) => format!("std::{}", module.key(db).path),
 		}
 	}
 
@@ -104,7 +104,7 @@ fn handles(db: &dyn Db, key: ProjectKey<'_>) -> FxHashMap<String, CompatModuleIn
 	}
 	for module in key.builtin_registry(db).modules(db).iter().copied() {
 		out.insert(
-			format!("std::{}", module.key(db).0),
+			format!("std::{}", module.key(db).path),
 			CompatModuleInput::Builtin(module),
 		);
 	}
@@ -458,18 +458,11 @@ pub(crate) fn compat_checked_project<'db>(
 	if !diagnostics.is_empty() {
 		return diagnostics;
 	}
-	compat_symbol_map(db, key)
-		.order
-		.iter()
-		.flat_map(|module| {
-			compat_module_analysis(db, key, *module)
-				.diagnostics
-				.iter()
-				.cloned()
-				.collect::<Vec<_>>()
-		})
-		.collect::<Vec<_>>()
-		.into()
+	let mut diagnostics = Vec::new();
+	for module in compat_symbol_map(db, key).order.iter().copied() {
+		diagnostics.extend(compat_module_diagnostics(db, key, module).iter().cloned());
+	}
+	diagnostics.into()
 }
 
 #[salsa::tracked(returns(clone), no_eq)]
@@ -509,12 +502,14 @@ pub(crate) fn compat_module_analysis<'db>(
 fn compat_module_identity(db: &dyn Db, module: CompatModuleInput) -> nymph_sema::ModuleIdentity {
 	match module {
 		CompatModuleInput::Project(input) => nymph_sema::ModuleIdentity {
+			origin: nymph_sema::ModuleOrigin::Project(input.project(db).as_str().into()),
 			project: input.project(db).as_str().into(),
 			path: input.path(db).as_str().into(),
 		},
 		CompatModuleInput::Builtin(input) => nymph_sema::ModuleIdentity {
+			origin: nymph_sema::ModuleOrigin::Compiler,
 			project: "compiler".into(),
-			path: input.key(db).0.as_ref().into(),
+			path: input.key(db).path.as_ref().into(),
 		},
 	}
 }
@@ -525,11 +520,34 @@ pub(crate) fn compat_declared_headers<'db>(
 	key: ProjectKey<'db>,
 	module: CompatModuleInput,
 ) -> Arc<nymph_sema::DeclaredHeaders> {
-	let analysis = compat_module_analysis(db, key, module);
-	Arc::new(nymph_sema::declared_headers(
-		compat_module_identity(db, module),
-		&analysis.module,
-	))
+	let symbols = compat_symbol_map(db, key);
+	let own =
+		nymph_sema::declared_headers(compat_module_identity(db, module), &module.parsed(db).tree);
+	let mut checked_definitions = Vec::new();
+	if key.ambient_prelude(db) {
+		for builtin in crate::prelude::core_prelude() {
+			let identity = nymph_sema::ModuleIdentity {
+				origin: nymph_sema::ModuleOrigin::Compiler,
+				project: "compiler".into(),
+				path: builtin.path.clone(),
+			};
+			checked_definitions.extend(nymph_sema::declared_headers(identity, builtin).definitions);
+		}
+	}
+	for owner in symbols.order.iter().copied() {
+		let owner_headers =
+			nymph_sema::declared_headers(compat_module_identity(db, owner), &owner.parsed(db).tree);
+		let owner_symbols = &symbols.modules[&owner.key(db)];
+		for (source_name, id) in owner_headers.definitions {
+			let checked_name = owner_symbols
+				.renames
+				.get(&source_name)
+				.cloned()
+				.unwrap_or(source_name);
+			checked_definitions.push((checked_name, id));
+		}
+	}
+	Arc::new(own.with_checked_definitions(checked_definitions))
 }
 
 #[salsa::tracked(returns(clone))]
@@ -539,11 +557,14 @@ pub(crate) fn compat_module_environment<'db>(
 	module: CompatModuleInput,
 ) -> Arc<nymph_sema::ModuleEnvironment> {
 	let analysis = compat_module_analysis(db, key, module);
-	Arc::new(nymph_sema::recover_module_environment(
+	let facts =
+		nymph_sema::ExtractionFactSelection::current_module(&analysis.module, &analysis.checked);
+	Arc::new(nymph_sema::recover_module_environment_with_facts(
 		compat_module_identity(db, module),
 		&analysis.module,
 		&analysis.checked,
 		&compat_declared_headers(db, key, module),
+		&facts,
 	))
 }
 
@@ -552,16 +573,10 @@ pub(crate) fn compat_module_interface<'db>(
 	db: &'db dyn Db,
 	key: ProjectKey<'db>,
 	module: CompatModuleInput,
-) -> Arc<nymph_sema::ModuleInterface> {
+) -> Option<Arc<nymph_sema::ModuleInterface>> {
 	match &*compat_module_environment(db, key, module) {
-		nymph_sema::ModuleEnvironment::Complete(interface) => Arc::new(interface.clone()),
-		nymph_sema::ModuleEnvironment::Recovered(recovered) => Arc::new(nymph_sema::ModuleInterface {
-			module: recovered.module.clone(),
-			exports: Vec::new(),
-			support_definitions: Vec::new(),
-			implementations: Vec::new(),
-			fingerprint: 0,
-		}),
+		nymph_sema::ModuleEnvironment::Complete(interface) => Some(Arc::new(interface.clone())),
+		nymph_sema::ModuleEnvironment::Recovered(_) => None,
 	}
 }
 
@@ -575,11 +590,14 @@ pub(crate) fn compat_module_diagnostics<'db>(
 	let mut diagnostics = analysis.diagnostics.to_vec();
 	if diagnostics.is_empty() {
 		let headers = compat_declared_headers(db, key, module);
-		if let Err(error) = nymph_sema::extract_module_interface(
+		let facts =
+			nymph_sema::ExtractionFactSelection::current_module(&analysis.module, &analysis.checked);
+		if let Err(error) = nymph_sema::extract_module_interface_with_facts(
 			compat_module_identity(db, module),
 			&analysis.module,
 			&analysis.checked,
 			&headers,
+			&facts,
 		) {
 			diagnostics.push(ProjectDiagnostic {
 				module: module.key(db),
@@ -1176,7 +1194,8 @@ mod tests {
 	use super::*;
 	use crate::project::Driver;
 	use crate::project::session::{
-		BuiltinModuleKey, BuiltinRegistryInput, ModulePath, ProjectId, ProjectInput,
+		BuiltinModuleDomain, BuiltinModuleKey, BuiltinRegistryInput, ModulePath, ProjectId,
+		ProjectInput,
 	};
 
 	#[salsa::db]
@@ -1216,7 +1235,14 @@ mod tests {
 		let builtin_modules: Arc<[BuiltinModuleInput]> = builtins
 			.iter()
 			.map(|(path, source)| {
-				BuiltinModuleInput::new(&db, BuiltinModuleKey(Arc::from(*path)), Arc::from(*source))
+				BuiltinModuleInput::new(
+					&db,
+					BuiltinModuleKey {
+						domain: BuiltinModuleDomain::ImportableStd,
+						path: Arc::from(*path),
+					},
+					Arc::from(*source),
+				)
 			})
 			.collect::<Vec<_>>()
 			.into();

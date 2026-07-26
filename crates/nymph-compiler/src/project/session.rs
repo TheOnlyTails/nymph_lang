@@ -58,8 +58,31 @@ impl fmt::Display for ModulePath {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SourceVersion(pub i64);
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, salsa::SalsaValue)]
+pub(crate) enum BuiltinModuleDomain {
+	ImportableStd,
+	AmbientCore,
+}
+
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, salsa::SalsaValue)]
-pub(crate) struct BuiltinModuleKey(pub(crate) Arc<str>);
+pub(crate) struct BuiltinModuleKey {
+	pub(crate) domain: BuiltinModuleDomain,
+	pub(crate) path: Arc<str>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct AmbientCoreModuleKey(Arc<str>);
+
+impl AmbientCoreModuleKey {
+	pub fn new(value: impl AsRef<str>) -> Result<Self, &'static str> {
+		ModulePath::new(value.as_ref())?;
+		Ok(Self(Arc::from(value.as_ref())))
+	}
+	#[must_use]
+	pub fn as_str(&self) -> &str {
+		&self.0
+	}
+}
 
 #[salsa::input]
 #[derive(Debug)]
@@ -84,6 +107,13 @@ pub(crate) struct BuiltinModuleInput {
 #[salsa::input]
 #[derive(Debug)]
 pub(crate) struct BuiltinRegistryInput {
+	#[returns(clone)]
+	pub modules: Arc<[BuiltinModuleInput]>,
+}
+
+#[salsa::input]
+#[derive(Debug)]
+pub(crate) struct AmbientCoreRegistryInput {
 	#[returns(clone)]
 	pub modules: Arc<[BuiltinModuleInput]>,
 }
@@ -142,10 +172,22 @@ pub struct ModuleAnalysis {
 	pub(crate) checked_module: Arc<nymph_ast::decl::Module>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BuiltinRuntimeArtifact {
+/// Stable semantic owner information for runtime-bearing compiler definitions.
+///
+/// This ABI/interface runtime descriptor is an input to Task 8, not HIR and not
+/// a checked body. Task 8 owns checked-body/HIR projection and resolves `module`
+/// to the ambient semantic analysis before provenance-preserving lowering.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub struct BuiltinRuntimeOwnerArtifact {
 	pub definition: nymph_sema::DefinitionId,
-	pub checked_body: Arc<str>,
+	pub module: AmbientCoreModuleKey,
+	pub shape: BuiltinRuntimeOwnerShape,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub enum BuiltinRuntimeOwnerShape {
+	Definition(nymph_sema::ExportedDefinition),
+	Implementation(nymph_sema::ExportedImpl),
 }
 
 impl ModuleAnalysis {
@@ -167,6 +209,8 @@ pub struct CompilerSession {
 	builtin_sources: BTreeMap<Arc<str>, Arc<str>>,
 	builtins: BTreeMap<BuiltinModuleKey, BuiltinModuleInput>,
 	builtin_registry: BuiltinRegistryInput,
+	ambient_core: BTreeMap<BuiltinModuleKey, BuiltinModuleInput>,
+	ambient_core_registry: AmbientCoreRegistryInput,
 	tombstones: usize,
 	tombstone_threshold: usize,
 	event_callback: Arc<dyn Fn(&str) + Send + Sync>,
@@ -179,6 +223,81 @@ impl Default for CompilerSession {
 }
 
 impl CompilerSession {
+	fn ambient_core_input(&self, key: &AmbientCoreModuleKey) -> Option<BuiltinModuleInput> {
+		self
+			.ambient_core
+			.get(&BuiltinModuleKey {
+				domain: BuiltinModuleDomain::AmbientCore,
+				path: key.0.clone(),
+			})
+			.copied()
+	}
+
+	/// Enumerate canonical compiler-private ambient-core module keys.
+	#[must_use]
+	pub fn ambient_core_module_keys(&self) -> Vec<AmbientCoreModuleKey> {
+		self
+			.ambient_core
+			.keys()
+			.map(|key| AmbientCoreModuleKey(key.path.clone()))
+			.collect()
+	}
+
+	#[must_use]
+	pub fn ambient_core_module_interface(
+		&self,
+		key: AmbientCoreModuleKey,
+	) -> Option<Arc<nymph_sema::ModuleInterface>> {
+		let module = self.ambient_core_input(&key)?;
+		Some(queries::ambient_core_interface(
+			&self.db,
+			self.ambient_core_registry,
+			module,
+		))
+	}
+
+	#[must_use]
+	pub fn ambient_core_module_environment(
+		&self,
+		key: AmbientCoreModuleKey,
+	) -> Option<Arc<nymph_sema::ModuleEnvironment>> {
+		let module = self.ambient_core_input(&key)?;
+		Some(queries::ambient_core_environment(
+			&self.db,
+			self.ambient_core_registry,
+			module,
+		))
+	}
+
+	#[must_use]
+	pub fn ambient_core_module_diagnostics(
+		&self,
+		key: AmbientCoreModuleKey,
+	) -> Option<Arc<[nymph_diagnostics::Diagnostic]>> {
+		let module = self.ambient_core_input(&key)?;
+		Some(queries::ambient_core_diagnostics(
+			&self.db,
+			self.ambient_core_registry,
+			module,
+		))
+	}
+
+	/// Test-only mutation seam for proving ambient query invalidation. Ordinary
+	/// compiler clients cannot obtain or mutate ambient Salsa inputs directly.
+	#[doc(hidden)]
+	#[must_use]
+	pub fn ambient_core_source_for_test(&self, key: AmbientCoreModuleKey) -> Option<String> {
+		Some(self.ambient_core_input(&key)?.source(&self.db).to_string())
+	}
+
+	#[doc(hidden)]
+	pub fn set_ambient_core_source_for_test(&mut self, key: AmbientCoreModuleKey, source: String) {
+		let input = self
+			.ambient_core_input(&key)
+			.expect("test mutation must name an embedded ambient module");
+		input.set_source(&mut self.db).to(Arc::from(source));
+	}
+
 	fn compat_input(
 		&self,
 		project: &ProjectId,
@@ -200,7 +319,7 @@ impl CompilerSession {
 	) -> Option<Arc<nymph_sema::ModuleInterface>> {
 		let input = self.compat_input(&project, &module)?;
 		let key = self.project_key(project, entry, mode, true, true);
-		Some(super::compat::compat_module_interface(&self.db, key, input))
+		super::compat::compat_module_interface(&self.db, key, input)
 	}
 
 	#[must_use]
@@ -252,24 +371,21 @@ impl CompilerSession {
 	}
 
 	#[must_use]
-	pub fn builtin_runtime_artifacts(&self) -> Arc<[BuiltinRuntimeArtifact]> {
-		let mut artifacts = Vec::new();
-		for (key, input) in &self.builtins {
-			let parsed = queries::compat_parse_builtin(&self.db, *input);
-			let identity = nymph_sema::ModuleIdentity {
-				project: "compiler".into(),
-				path: key.0.as_ref().into(),
-			};
-			let headers = nymph_sema::declared_headers(identity, &parsed.tree);
-			for (_, definition) in headers.definitions {
-				artifacts.push(BuiltinRuntimeArtifact {
-					definition,
-					checked_body: input.source(&self.db),
-				});
-			}
-		}
-		artifacts.sort_by(|a, b| a.definition.cmp(&b.definition));
-		artifacts.into()
+	pub fn builtin_runtime_owner_artifacts(&self) -> Arc<[BuiltinRuntimeOwnerArtifact]> {
+		queries::ambient_runtime_owner_artifacts(&self.db, self.ambient_core_registry)
+	}
+
+	/// Resolve a canonical runtime owner without exposing Salsa identities.
+	#[must_use]
+	pub fn builtin_runtime_owner_artifact(
+		&self,
+		definition: &nymph_sema::DefinitionId,
+	) -> Option<BuiltinRuntimeOwnerArtifact> {
+		self
+			.builtin_runtime_owner_artifacts()
+			.binary_search_by(|artifact| artifact.definition.cmp(definition))
+			.ok()
+			.map(|index| self.builtin_runtime_owner_artifacts()[index].clone())
 	}
 	fn module_analysis(
 		&self,
@@ -390,6 +506,7 @@ impl CompilerSession {
 	) -> Self {
 		let db = Self::database(callback.clone());
 		let (builtins, builtin_registry) = Self::create_builtins(&db, &builtin_sources);
+		let (ambient_core, ambient_core_registry) = Self::create_ambient_core(&db);
 		Self {
 			db,
 			registry: BTreeMap::new(),
@@ -397,6 +514,8 @@ impl CompilerSession {
 			builtin_sources,
 			builtins,
 			builtin_registry,
+			ambient_core,
+			ambient_core_registry,
 			tombstones: 0,
 			tombstone_threshold: threshold.max(1),
 			event_callback: callback,
@@ -413,7 +532,10 @@ impl CompilerSession {
 		let builtins: BTreeMap<_, _> = sources
 			.iter()
 			.map(|(path, source)| {
-				let key = BuiltinModuleKey(path.clone());
+				let key = BuiltinModuleKey {
+					domain: BuiltinModuleDomain::ImportableStd,
+					path: path.clone(),
+				};
 				let input = BuiltinModuleInput::new(db, key.clone(), source.clone());
 				(key, input)
 			})
@@ -421,6 +543,27 @@ impl CompilerSession {
 		let registry =
 			BuiltinRegistryInput::new(db, builtins.values().copied().collect::<Vec<_>>().into());
 		(builtins, registry)
+	}
+
+	fn create_ambient_core(
+		db: &Database,
+	) -> (
+		BTreeMap<BuiltinModuleKey, BuiltinModuleInput>,
+		AmbientCoreRegistryInput,
+	) {
+		let modules: BTreeMap<_, _> = crate::prelude::core_sources()
+			.map(|(path, source)| {
+				let key = BuiltinModuleKey {
+					domain: BuiltinModuleDomain::AmbientCore,
+					path: Arc::from(path),
+				};
+				let input = BuiltinModuleInput::new(db, key.clone(), Arc::from(source));
+				(key, input)
+			})
+			.collect();
+		let registry =
+			AmbientCoreRegistryInput::new(db, modules.values().copied().collect::<Vec<_>>().into());
+		(modules, registry)
 	}
 
 	fn database(callback: Arc<dyn Fn(&str) + Send + Sync>) -> Database {
@@ -431,8 +574,18 @@ impl CompilerSession {
 					let query = debug
 						.split_once('(')
 						.map_or(debug.as_str(), |(name, _)| name);
+					if query == "compat_parse_builtin" {
+						// This private compiler-core bootstrap producer serves both importable builtins (historically
+						// observed as `parse`) and ambient-core registry entries. Preserve the
+						// established parse event while exposing the narrower Task 6 event. It
+						// never participates in public ProjectGraph/user flattened analysis;
+						// production compatibility flattening stays bounded here until Task 7.
+						callback("parse");
+						callback("ambient_core_parse");
+						return;
+					}
 					let public_name = match query {
-						"parse" | "compat_parse_builtin" => Some("parse"),
+						"parse" => Some("parse"),
 						"direct_imports" | "compat_builtin_direct_imports" => Some("direct_imports"),
 						"project_graph" => Some("project_graph"),
 						"compat_symbol_map"
@@ -445,6 +598,12 @@ impl CompilerSession {
 						| "compat_lowered_module"
 						| "compat_emitted_module"
 						| "compat_compiled_project" => Some(query),
+						"ambient_core_analysis"
+						| "ambient_core_headers"
+						| "ambient_core_environment"
+						| "ambient_core_interface"
+						| "ambient_core_diagnostics"
+						| "ambient_runtime_owner_artifacts" => Some(query),
 						_ => None,
 					};
 					if let Some(name) = public_name {
@@ -534,6 +693,7 @@ impl CompilerSession {
 	fn rebuild_database(&mut self) {
 		self.db = Self::database(self.event_callback.clone());
 		(self.builtins, self.builtin_registry) = Self::create_builtins(&self.db, &self.builtin_sources);
+		(self.ambient_core, self.ambient_core_registry) = Self::create_ambient_core(&self.db);
 		self
 			.projects
 			.get_mut()

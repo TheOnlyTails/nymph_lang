@@ -1,7 +1,11 @@
 use std::sync::{Arc, Mutex};
 
-use nymph_compiler::project::{CompilerSession, ModulePath, ProjectId, SourceVersion};
-use nymph_sema::{EntryMode, ModuleEnvironment};
+use nymph_compiler::project::{
+	BuiltinRuntimeOwnerShape, CompilerSession, ModulePath, ProjectId, SourceVersion,
+};
+use nymph_sema::{
+	EntryMode, InterfaceType, ModuleEnvironment, RecoveredDefinitionReference, RecoveredInterfaceType,
+};
 
 fn event_session() -> (CompilerSession, Arc<Mutex<Vec<String>>>) {
 	let events = Arc::new(Mutex::new(Vec::new()));
@@ -136,9 +140,51 @@ fn recovered_environment_is_not_lowerable() {
 	assert!(matches!(&*environment, ModuleEnvironment::Recovered(_)));
 	assert!(
 		session
+			.compat_module_interface(
+				project.clone(),
+				path.clone(),
+				path.clone(),
+				EntryMode::Library,
+			)
+			.is_none(),
+		"a recovered environment must not masquerade as an empty complete interface"
+	);
+	assert!(
+		session
 			.compat_environment_is_lowerable(project, path.clone(), path, EntryMode::Library)
 			.is_err()
 	);
+}
+
+#[test]
+fn diagnostic_text_and_span_changes_are_not_interface_identity() {
+	let mut session = CompilerSession::without_builtin_sources();
+	let project = ProjectId::new("diagnostic-equality");
+	let path = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		path.clone(),
+		"public func broken(value: Missing): int = 1".into(),
+		SourceVersion(1),
+	);
+	let before = session
+		.compat_module_environment(
+			project.clone(),
+			path.clone(),
+			path.clone(),
+			EntryMode::Library,
+		)
+		.unwrap();
+	session.set_source(
+		project.clone(),
+		path.clone(),
+		"\npublic func broken(value: Unknown): int = 1".into(),
+		SourceVersion(2),
+	);
+	let after = session
+		.compat_module_environment(project, path.clone(), path, EntryMode::Library)
+		.unwrap();
+	assert_eq!(before, after);
 }
 
 #[test]
@@ -172,20 +218,190 @@ fn conversion_failure_is_a_separate_internal_diagnostic_and_blocks_lowering() {
 #[test]
 fn compiler_builtins_have_private_identity_and_stable_runtime_owners() {
 	let session = CompilerSession::new();
-	let artifacts = session.builtin_runtime_artifacts();
+	let artifacts = session.builtin_runtime_owner_artifacts();
 	assert!(!artifacts.is_empty());
 	assert!(
 		artifacts
 			.iter()
 			.all(|artifact| artifact.definition.module.project == "compiler")
 	);
-	assert!(
-		artifacts
-			.iter()
-			.all(|artifact| !artifact.checked_body.is_empty())
-	);
+	assert!(artifacts.iter().all(|artifact| match &artifact.shape {
+		BuiltinRuntimeOwnerShape::Definition(definition) => {
+			definition.id == artifact.definition && definition.runtime_owner.is_some()
+		}
+		BuiltinRuntimeOwnerShape::Implementation(implementation) => {
+			implementation.id == artifact.definition && implementation.runtime_owner.is_some()
+		}
+	}));
 	assert_eq!(
 		artifacts,
-		CompilerSession::new().builtin_runtime_artifacts()
+		CompilerSession::new().builtin_runtime_owner_artifacts()
 	);
+	for artifact in artifacts.iter() {
+		assert_eq!(
+			session.builtin_runtime_owner_artifact(&artifact.definition),
+			Some(artifact.clone())
+		);
+	}
+}
+
+#[test]
+fn every_public_interface_shape_edit_changes_the_interface() {
+	let cases = [
+		(
+			"public func f(value: int): int = value",
+			"public func f(value: float): int = 1",
+		),
+		(
+			"public struct S(value: int) {}",
+			"public struct S(value: float) {}",
+		),
+		(
+			"public enum E { A(value: int) }",
+			"public enum E { A(value: float) }",
+		),
+		(
+			"public interface I { func f(): int }",
+			"public interface I { func f(): float }",
+		),
+		(
+			"public interface I {}\npublic struct S {}\npublic impl I for S {}",
+			"public interface I {}\npublic struct S {}\npublic impl I for int {}",
+		),
+	];
+	for (index, (before_source, after_source)) in cases.into_iter().enumerate() {
+		let mut session = CompilerSession::without_builtin_sources();
+		let project = ProjectId::new(format!("shape-{index}"));
+		let path = ModulePath::new("main").unwrap();
+		session.set_source(
+			project.clone(),
+			path.clone(),
+			before_source.into(),
+			SourceVersion(1),
+		);
+		let before = session
+			.compat_module_interface(
+				project.clone(),
+				path.clone(),
+				path.clone(),
+				EntryMode::Library,
+			)
+			.expect("complete before interface");
+		session.set_source(
+			project.clone(),
+			path.clone(),
+			after_source.into(),
+			SourceVersion(2),
+		);
+		let after = session
+			.compat_module_interface(project, path.clone(), path, EntryMode::Library)
+			.expect("complete after interface");
+		assert_ne!(before, after, "case {index} did not change the interface");
+	}
+}
+
+#[test]
+fn compatibility_extraction_preserves_import_owner_ids_and_current_impl_facts() {
+	let mut session = CompilerSession::without_builtin_sources();
+	let project = ProjectId::new("provenance");
+	for (path, source) in [
+		(
+			"a",
+			"public interface Mark { func mark(): int }\npublic struct Same(value: int) {}\npublic impl Mark for Same { func mark(): int = 1 }",
+		),
+		(
+			"b",
+			"public interface Mark { func mark(): int }\npublic struct Same(value: int) {}\npublic impl Mark for Same { func mark(): int = 2 }",
+		),
+		(
+			"main",
+			"import @/a with (Same as ASame)\nimport @/b with (Same as BSame)\npublic interface LocalMark { func local(): int }\npublic struct Same(value: int) {}\npublic func from_a(value: ASame): ASame = value\npublic func from_b(value: BSame): BSame = value\npublic impl LocalMark for Same { func local(): int = 3 }",
+		),
+	] {
+		session.set_source(
+			project.clone(),
+			ModulePath::new(path).unwrap(),
+			source.into(),
+			SourceVersion(1),
+		);
+	}
+	let main = ModulePath::new("main").unwrap();
+	let interface = session
+		.compat_module_interface(
+			project.clone(),
+			main.clone(),
+			main.clone(),
+			EntryMode::Library,
+		)
+		.unwrap();
+	assert!(
+		!interface.exports.is_empty(),
+		"{:?}",
+		session.compat_module_diagnostics(project, main.clone(), main, EntryMode::Library)
+	);
+	let named_module = |name: &str| {
+		let export = interface
+			.exports
+			.iter()
+			.find(|definition| definition.name == name)
+			.unwrap();
+		let InterfaceType::Named { definition, .. } = export.parameters[0].ty.clone() else {
+			panic!("expected named parameter")
+		};
+		definition.module.path
+	};
+	assert_eq!(named_module("from_a"), "a");
+	assert_eq!(named_module("from_b"), "b");
+	assert_eq!(interface.implementations.len(), 1);
+	assert_eq!(
+		interface.implementations[0]
+			.interface
+			.as_ref()
+			.unwrap()
+			.module
+			.path,
+		"main"
+	);
+}
+
+#[test]
+fn recovered_flattened_implementation_keeps_current_module_provenance_and_shape() {
+	let mut session = CompilerSession::without_builtin_sources();
+	let project = ProjectId::new("recovered-provenance");
+	for (path, source) in [
+		(
+			"dependency",
+			"public interface Mark { func mark(): int }\npublic struct Same {}\npublic impl Mark for Same { func mark(): int = 1 }",
+		),
+		(
+			"main",
+			"import @/dependency\npublic interface Mark { func local(): int }\npublic struct Same {}\npublic impl Mark for Same { func local(): Missing = panic(\"bad\") }",
+		),
+	] {
+		session.set_source(
+			project.clone(),
+			ModulePath::new(path).unwrap(),
+			source.into(),
+			SourceVersion(1),
+		);
+	}
+	let main = ModulePath::new("main").unwrap();
+	let environment = session
+		.compat_module_environment(project, main.clone(), main, EntryMode::Library)
+		.unwrap();
+	let ModuleEnvironment::Recovered(environment) = &*environment else {
+		panic!("expected recovered environment")
+	};
+	assert_eq!(environment.implementations.len(), 1);
+	let implementation = &environment.implementations[0];
+	let Some(RecoveredDefinitionReference::Known(interface)) = &implementation.interface else {
+		panic!("current interface should resolve")
+	};
+	assert_eq!(interface.module.path, "main");
+	assert_eq!(implementation.members.len(), 1);
+	assert_eq!(implementation.members[0].name, "local");
+	assert!(matches!(
+		implementation.members[0].return_type,
+		RecoveredInterfaceType::Poison
+	));
 }

@@ -10,6 +10,7 @@ use nymph_syntax::parse_module;
 
 fn module(path: &str) -> ModuleIdentity {
 	ModuleIdentity {
+		origin: nymph_sema::ModuleOrigin::Project("app".into()),
 		project: EcoString::from("app"),
 		path: EcoString::from(path),
 	}

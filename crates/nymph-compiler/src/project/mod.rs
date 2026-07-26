@@ -55,7 +55,8 @@ mod rewrite;
 mod session;
 
 pub use session::{
-	BuiltinRuntimeArtifact, CompilerSession, ModuleAnalysis, ModulePath, ProjectId, SourceVersion,
+	AmbientCoreModuleKey, BuiltinRuntimeOwnerArtifact, BuiltinRuntimeOwnerShape, CompilerSession,
+	ModuleAnalysis, ModulePath, ProjectId, SourceVersion,
 };
 
 #[cfg(feature = "test-support")]

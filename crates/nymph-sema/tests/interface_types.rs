@@ -17,6 +17,7 @@ use nymph_sema::{DefId, GenericArgs, InferVar, Interner, ModuleInterface, ParamI
 fn definition(name: &str) -> DefinitionId {
 	DefinitionId::new(
 		ModuleIdentity {
+			origin: nymph_sema::ModuleOrigin::Project("app".into()),
 			project: "app".into(),
 			path: "types".into(),
 		},
@@ -127,6 +128,7 @@ fn missing_definition_and_binder_mappings_are_errors_not_fabricated_types() {
 fn module_interface_equality_and_fingerprint_are_structural_and_deterministic() {
 	let interface = ModuleInterface {
 		module: ModuleIdentity {
+			origin: nymph_sema::ModuleOrigin::Project("app".into()),
 			project: "app".into(),
 			path: "main".into(),
 		},
@@ -206,8 +208,8 @@ fn complete_fixture() -> ModuleInterface {
 		return_type: InterfaceType::Boolean,
 		external: Some(ExternalAbi {
 			marker: "js".into(),
-			module: "host".into(),
-			symbol: "call".into(),
+			module: Some("host".into()),
+			symbol: Some("call".into()),
 			marshal: Some(MarshalKind::Int),
 		}),
 		runtime_owner: Some(owner.clone()),
@@ -245,6 +247,7 @@ fn complete_fixture() -> ModuleInterface {
 	};
 	ModuleInterface {
 		module: ModuleIdentity {
+			origin: nymph_sema::ModuleOrigin::Project("app".into()),
 			project: "app".into(),
 			path: "complete".into(),
 		},
@@ -337,6 +340,7 @@ fn recovered_fixture() -> RecoveredModuleInterface {
 	};
 	RecoveredModuleInterface {
 		module: ModuleIdentity {
+			origin: nymph_sema::ModuleOrigin::Project("app".into()),
 			project: "app".into(),
 			path: "recovered".into(),
 		},

@@ -10,7 +10,8 @@ use super::{
 	ProjectDiagnostic,
 	resolve::resolve_import_target,
 	session::{
-		BuiltinModuleInput, BuiltinModuleKey, ModuleInput, ModulePath, ProjectInput, ProjectKey,
+		AmbientCoreRegistryInput, BuiltinModuleDomain, BuiltinModuleInput, BuiltinModuleKey,
+		ModuleInput, ModulePath, ProjectInput, ProjectKey,
 	},
 };
 
@@ -51,7 +52,12 @@ pub(crate) fn parse(db: &dyn Db, module: ModuleInput) -> Arc<ParsedModule> {
 
 #[salsa::tracked]
 pub(crate) fn compat_parse_builtin(db: &dyn Db, module: BuiltinModuleInput) -> Arc<ParsedModule> {
-	parse_source(module.source(db), format!("std::{}.nym", module.key(db).0))
+	let key = module.key(db);
+	let prefix = match key.domain {
+		BuiltinModuleDomain::ImportableStd => "std",
+		BuiltinModuleDomain::AmbientCore => "core",
+	};
+	parse_source(module.source(db), format!("{prefix}::{}.nym", key.path))
 }
 
 fn parse_source(source: Arc<str>, path: String) -> Arc<ParsedModule> {
@@ -74,8 +80,223 @@ pub(crate) fn compat_builtin_direct_imports(
 ) -> Arc<DirectImports> {
 	collect_imports(
 		compat_parse_builtin(db, module),
-		&format!("std::{}", module.key(db).0),
+		&format!("std::{}", module.key(db).path),
 	)
+}
+
+#[salsa::tracked]
+pub(crate) fn ambient_core_direct_imports(
+	db: &dyn Db,
+	module: BuiltinModuleInput,
+) -> Arc<DirectImports> {
+	collect_imports(compat_parse_builtin(db, module), &module.key(db).path)
+}
+
+#[salsa::tracked(returns(clone))]
+fn ambient_core_graph(
+	db: &dyn Db,
+	registry: AmbientCoreRegistryInput,
+	root: BuiltinModuleInput,
+) -> Arc<[BuiltinModuleInput]> {
+	fn visit(
+		db: &dyn Db,
+		module: BuiltinModuleInput,
+		modules: &std::collections::BTreeMap<Arc<str>, BuiltinModuleInput>,
+		seen: &mut std::collections::BTreeSet<Arc<str>>,
+		order: &mut Vec<BuiltinModuleInput>,
+	) {
+		let path = module.key(db).path;
+		if !seen.insert(path.clone()) {
+			return;
+		}
+		for import in ambient_core_direct_imports(db, module).iter() {
+			if let Ok(target) = &import.target {
+				let child = modules.get(target.as_str()).unwrap_or_else(|| {
+					panic!("ambient core `{path}` imports missing core sibling `{target}`")
+				});
+				visit(db, *child, modules, seen, order);
+			}
+		}
+		order.push(module);
+	}
+	let modules = registry
+		.modules(db)
+		.iter()
+		.map(|module| (module.key(db).path, *module))
+		.collect();
+	let mut seen = std::collections::BTreeSet::new();
+	let mut order = Vec::new();
+	visit(db, root, &modules, &mut seen, &mut order);
+	order.into()
+}
+
+#[salsa::tracked(no_eq)]
+pub(crate) fn ambient_core_analysis(
+	db: &dyn Db,
+	registry: AmbientCoreRegistryInput,
+	module: BuiltinModuleInput,
+) -> Arc<super::session::ModuleAnalysis> {
+	// This private compatibility bootstrap temporarily flattens only the
+	// compiler-core dependency closure. It never enters the public ProjectGraph
+	// or user flattened analysis. Production compatibility flattening remains
+	// explicitly inside the Task 6 review boundary until Task 7 replaces it with
+	// interface-driven dependency checking.
+	let dependencies = registry
+		.modules(db)
+		.iter()
+		.filter(|input| **input != module)
+		.map(|input| compat_parse_builtin(db, *input).tree.clone())
+		.collect::<Vec<_>>();
+	let parsed = compat_parse_builtin(db, module);
+	let paired = nymph_sema::check_module_with_prelude_and_module(&parsed.tree, &dependencies);
+	Arc::new(super::session::ModuleAnalysis {
+		module: Arc::new(parsed.tree.clone()),
+		checked: Arc::new(paired.checked),
+		diagnostics: Arc::new([]),
+		checked_module: Arc::new(paired.module),
+	})
+}
+
+fn ambient_identity(db: &dyn Db, module: BuiltinModuleInput) -> nymph_sema::ModuleIdentity {
+	nymph_sema::ModuleIdentity {
+		origin: nymph_sema::ModuleOrigin::Compiler,
+		project: "compiler".into(),
+		path: module.key(db).path.as_ref().into(),
+	}
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn ambient_core_headers(
+	db: &dyn Db,
+	registry: AmbientCoreRegistryInput,
+	module: BuiltinModuleInput,
+) -> Arc<nymph_sema::DeclaredHeaders> {
+	let own = nymph_sema::declared_headers(
+		ambient_identity(db, module),
+		&compat_parse_builtin(db, module).tree,
+	);
+	let checked = registry
+		.modules(db)
+		.iter()
+		.flat_map(|input| {
+			nymph_sema::declared_headers(
+				ambient_identity(db, *input),
+				&compat_parse_builtin(db, *input).tree,
+			)
+			.definitions
+		})
+		.collect();
+	Arc::new(own.with_checked_definitions(checked))
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn ambient_core_environment(
+	db: &dyn Db,
+	registry: AmbientCoreRegistryInput,
+	module: BuiltinModuleInput,
+) -> Arc<nymph_sema::ModuleEnvironment> {
+	let analysis = ambient_core_analysis(db, registry, module);
+	let facts =
+		nymph_sema::ExtractionFactSelection::current_module(&analysis.module, &analysis.checked);
+	Arc::new(nymph_sema::recover_module_environment_with_facts(
+		ambient_identity(db, module),
+		&analysis.module,
+		&analysis.checked,
+		&ambient_core_headers(db, registry, module),
+		&facts,
+	))
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn ambient_core_interface(
+	db: &dyn Db,
+	registry: AmbientCoreRegistryInput,
+	module: BuiltinModuleInput,
+) -> Arc<nymph_sema::ModuleInterface> {
+	match &*ambient_core_environment(db, registry, module) {
+		nymph_sema::ModuleEnvironment::Complete(interface) => Arc::new(interface.clone()),
+		nymph_sema::ModuleEnvironment::Recovered(_) => panic!(
+			"embedded ambient core `{}` did not produce a complete interface",
+			module.key(db).path
+		),
+	}
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn ambient_core_diagnostics(
+	db: &dyn Db,
+	registry: AmbientCoreRegistryInput,
+	module: BuiltinModuleInput,
+) -> Arc<[nymph_diagnostics::Diagnostic]> {
+	let analysis = ambient_core_analysis(db, registry, module);
+	let mut diagnostics = analysis.checked.diags.clone();
+	if diagnostics.is_empty() {
+		let facts =
+			nymph_sema::ExtractionFactSelection::current_module(&analysis.module, &analysis.checked);
+		if let Err(error) = nymph_sema::extract_module_interface_with_facts(
+			ambient_identity(db, module),
+			&analysis.module,
+			&analysis.checked,
+			&ambient_core_headers(db, registry, module),
+			&facts,
+		) {
+			diagnostics.push(nymph_diagnostics::Diagnostic::error(
+				"INTERNAL-INTERFACE-CONVERSION".into(),
+				format!("internal interface conversion failed: {error:?}"),
+				Span::new(0, 0),
+			));
+		}
+	}
+	diagnostics.into()
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn ambient_runtime_owner_artifacts(
+	db: &dyn Db,
+	registry: AmbientCoreRegistryInput,
+) -> Arc<[super::session::BuiltinRuntimeOwnerArtifact]> {
+	use super::session::{
+		AmbientCoreModuleKey, BuiltinRuntimeOwnerArtifact, BuiltinRuntimeOwnerShape,
+	};
+	let mut artifacts = std::collections::BTreeMap::new();
+	for module in registry.modules(db).iter().copied() {
+		let environment = ambient_core_environment(db, registry, module);
+		let nymph_sema::ModuleEnvironment::Complete(interface) = &*environment else {
+			continue;
+		};
+		let key = AmbientCoreModuleKey::new(module.key(db).path.as_ref())
+			.expect("embedded core paths are canonical");
+		for definition in interface.exports.iter().chain(
+			interface
+				.support_definitions
+				.iter()
+				.map(|item| &item.definition),
+		) {
+			if let Some(owner) = &definition.runtime_owner {
+				artifacts.insert(
+					owner.clone(),
+					BuiltinRuntimeOwnerArtifact {
+						definition: owner.clone(),
+						module: key.clone(),
+						shape: BuiltinRuntimeOwnerShape::Definition(definition.clone()),
+					},
+				);
+			}
+		}
+		for implementation in &interface.implementations {
+			if let Some(owner) = &implementation.runtime_owner {
+				artifacts.insert(
+					owner.clone(),
+					BuiltinRuntimeOwnerArtifact {
+						definition: owner.clone(),
+						module: key.clone(),
+						shape: BuiltinRuntimeOwnerShape::Implementation(implementation.clone()),
+					},
+				);
+			}
+		}
+	}
+	artifacts.into_values().collect::<Vec<_>>().into()
 }
 
 fn collect_imports(parsed: &ParsedModule, importer: &str) -> Arc<DirectImports> {
@@ -165,7 +386,10 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 				.and_then(|stripped| {
 					self
 						.builtins
-						.get(&BuiltinModuleKey(Arc::from(stripped)))
+						.get(&BuiltinModuleKey {
+							domain: BuiltinModuleDomain::ImportableStd,
+							path: Arc::from(stripped),
+						})
 						.copied()
 				});
 			let project = ModulePath::new(path)
@@ -301,7 +525,14 @@ mod tests {
 		let builtin_modules: Arc<[BuiltinModuleInput]> = builtins
 			.iter()
 			.map(|(key, source)| {
-				BuiltinModuleInput::new(&db, BuiltinModuleKey(Arc::from(*key)), Arc::from(*source))
+				BuiltinModuleInput::new(
+					&db,
+					BuiltinModuleKey {
+						domain: BuiltinModuleDomain::ImportableStd,
+						path: Arc::from(*key),
+					},
+					Arc::from(*source),
+				)
 			})
 			.collect::<Vec<_>>()
 			.into();

@@ -83,6 +83,14 @@ const CORE_SOURCES: &[(&str, &str)] = &[
 	),
 ];
 
+/// Embedded ambient-core sources keyed in their compiler-private namespace.
+/// Keys are canonical, extension-less paths relative to the core root.
+pub(crate) fn core_sources() -> impl ExactSizeIterator<Item = (&'static str, &'static str)> {
+	CORE_SOURCES
+		.iter()
+		.map(|(display, source)| (display.strip_prefix("std/").unwrap(), *source))
+}
+
 static CORE_PRELUDE: OnceLock<Vec<Module>> = OnceLock::new();
 static CORE_RUNTIME_TYPE_OWNERS: OnceLock<FxHashMap<EcoString, &'static str>> = OnceLock::new();
 static CORE_RUNTIME_DECLARATION_SEEDS: OnceLock<HirModule> = OnceLock::new();

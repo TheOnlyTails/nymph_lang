@@ -279,25 +279,27 @@ pub struct GenericParameter {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
-pub struct ConstraintShape<T> {
+pub struct ConstraintShape<T, R = DefinitionId> {
 	pub parameter: GenericParameterId,
-	pub interface: DefinitionId,
+	pub interface: R,
 	pub positional: Vec<T>,
 	pub named: Vec<(EcoString, T)>,
 }
 pub type GenericConstraint = ConstraintShape<InterfaceType>;
-pub type RecoveredGenericConstraint = ConstraintShape<RecoveredInterfaceType>;
+pub type RecoveredGenericConstraint =
+	ConstraintShape<RecoveredInterfaceType, RecoveredDefinitionReference>;
 
 /// An instantiated superinterface constraining an interface's implicit `Self`.
 /// Unlike a generic constraint, it has no declared generic parameter identity.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
-pub struct SuperInterfaceShape<T> {
-	pub interface: DefinitionId,
+pub struct SuperInterfaceShape<T, R = DefinitionId> {
+	pub interface: R,
 	pub positional: Vec<T>,
 	pub named: Vec<(EcoString, T)>,
 }
 pub type SuperInterface = SuperInterfaceShape<InterfaceType>;
-pub type RecoveredSuperInterface = SuperInterfaceShape<RecoveredInterfaceType>;
+pub type RecoveredSuperInterface =
+	SuperInterfaceShape<RecoveredInterfaceType, RecoveredDefinitionReference>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct ParameterShape<T> {
@@ -322,19 +324,20 @@ pub struct VariantShape<T> {
 	pub fields: Vec<FieldShape<T>>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
-pub struct MemberShape<T> {
+pub struct MemberShape<T, R = DefinitionId> {
 	pub id: DefinitionId,
 	pub name: EcoString,
 	pub visibility: Option<Visibility>,
 	pub kind: MemberKind,
 	pub binders: Vec<GenericParameter>,
-	pub constraints: Vec<ConstraintShape<T>>,
+	pub constraints: Vec<ConstraintShape<T, R>>,
 	pub parameters: Vec<ParameterShape<T>>,
 	pub return_type: T,
 	pub external: Option<ExternalAbi>,
 	pub runtime_owner: Option<DefinitionId>,
 	pub has_default: bool,
 }
+pub type RecoveredMemberShape = MemberShape<RecoveredInterfaceType, RecoveredDefinitionReference>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum MemberKind {
 	Value,
@@ -347,8 +350,10 @@ pub enum MemberKind {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct ExternalAbi {
 	pub marker: EcoString,
-	pub module: EcoString,
-	pub symbol: EcoString,
+	/// Checked host linkage. `None` means the marker is intentionally deferred
+	/// rather than pretending it belongs to a fabricated `host` module.
+	pub module: Option<EcoString>,
+	pub symbol: Option<EcoString>,
 	pub marshal: Option<MarshalKind>,
 }
 
@@ -448,6 +453,11 @@ pub enum RecoveredInterfaceType {
 	Known(InterfaceType),
 	Poison,
 }
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+pub enum RecoveredDefinitionReference {
+	Known(DefinitionId),
+	Poison,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum SemanticAvailability {
 	Available,
@@ -467,7 +477,7 @@ pub struct RecoveredExportedDefinition {
 	pub ty: Option<RecoveredInterfaceType>,
 	pub fields: Vec<FieldShape<RecoveredInterfaceType>>,
 	pub variants: Vec<VariantShape<RecoveredInterfaceType>>,
-	pub members: Vec<MemberShape<RecoveredInterfaceType>>,
+	pub members: Vec<RecoveredMemberShape>,
 	pub super_interfaces: Vec<RecoveredSuperInterface>,
 	pub external: Option<ExternalAbi>,
 	pub runtime_owner: Option<DefinitionId>,
@@ -481,13 +491,13 @@ pub struct RecoveredExportedImpl {
 	pub id: DefinitionId,
 	pub visibility: Option<Visibility>,
 	pub availability: SemanticAvailability,
-	pub interface: Option<DefinitionId>,
+	pub interface: Option<RecoveredDefinitionReference>,
 	pub interface_arguments: Vec<(EcoString, RecoveredInterfaceType)>,
 	pub self_type: RecoveredInterfaceType,
 	pub mutable: bool,
 	pub binders: Vec<GenericParameter>,
 	pub constraints: Vec<RecoveredGenericConstraint>,
-	pub members: Vec<MemberShape<RecoveredInterfaceType>>,
+	pub members: Vec<RecoveredMemberShape>,
 	pub runtime_owner: Option<DefinitionId>,
 }
 #[derive(Clone, Debug, salsa::SalsaValue)]

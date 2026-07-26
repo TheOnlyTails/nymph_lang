@@ -252,6 +252,17 @@ pub(crate) fn check_module_impl(module: &Module, entry: EntryMode) -> Checked {
 	// still available so lowering never sees a stale `TyKind::Infer`.
 	let mut annotations = std::mem::take(&mut checker.annotations);
 	annotations.map_types(|ty| checker.resolve_deep(ty));
+	// Signatures are lowered before body inference, so their slots may still hold
+	// inference handles even after checking has solved them.  CheckedSemantic is
+	// the immutable completion boundary: publish the resolved forms, just as we
+	// already do for expression annotations, rather than making downstream
+	// consumers consult the checker's now-discarded unification table.
+	let let_ids = checker.sigs.lets.keys().copied().collect::<Vec<_>>();
+	for id in let_ids {
+		let ty = checker.sigs.lets[&id];
+		let resolved = checker.resolve_deep(ty);
+		checker.sigs.lets.insert(id, resolved);
+	}
 	let inherent = checker
 		.inherent
 		.impls
@@ -291,6 +302,7 @@ pub(crate) fn check_module_impl(module: &Module, entry: EntryMode) -> Checked {
 			interfaces: checker.interfaces,
 			implementations: checker.impls,
 			inherent,
+			anonymous_bounds: checker.synthetic_bound_details,
 		},
 	}
 }
