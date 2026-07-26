@@ -54,6 +54,7 @@ use ecow::EcoString;
 use nymph_ast::decl::{Module, Visibility};
 use nymph_diagnostics::{Diagnostic, Label};
 use nymph_hir::hir::{HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirMethod, HirModule};
+use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use resolve::{GraphBuilder, RawModule};
@@ -615,29 +616,34 @@ impl Driver {
 	/// like an ordinary project module for diagnostic purposes, with no
 	/// `std::`-key special-casing at all.
 	fn check_all(&self) -> Vec<ProjectDiagnostic> {
-		let mut diags = Vec::new();
-		for key in &self.order {
-			let prelude = self.prelude_slice(key);
-			let module = &self.processed[key];
-			let checked = if self.entry_mode && *key == self.entry {
-				nymph_sema::check_module_entry_with_prelude(module, &prelude)
-			} else {
-				nymph_sema::check_module_with_prelude(module, &prelude)
-			};
-			diags.extend(checked.diags.into_iter().map(|d| ProjectDiagnostic {
-				module: key.clone(),
-				diag: d,
-			}));
-		}
-		diags
+		self
+			.order
+			.par_iter()
+			.map(|key| {
+				let prelude = self.prelude_slice(key);
+				let module = &self.processed[key];
+				let checked = if self.entry_mode && *key == self.entry {
+					nymph_sema::check_module_entry_with_prelude(module, &prelude)
+				} else {
+					nymph_sema::check_module_with_prelude(module, &prelude)
+				};
+				checked
+					.diags
+					.into_iter()
+					.map(|diag| ProjectDiagnostic {
+						module: key.clone(),
+						diag,
+					})
+					.collect::<Vec<_>>()
+			})
+			.flatten()
+			.collect()
 	}
 
 	fn assemble_module_sources(
 		&self,
 	) -> Result<(FxHashMap<String, String>, usize), Vec<ProjectDiagnostic>> {
-		let mut diags = Vec::new();
-		let mut lowered_modules = Vec::new();
-		for key in &self.order {
+		let checked_modules = self.order.par_iter().map(|key| {
 			let prelude = self.prelude_slice(key);
 			let module = &self.processed[key];
 			let checked = if self.entry_mode && *key == self.entry {
@@ -645,20 +651,18 @@ impl Driver {
 			} else {
 				nymph_sema::check_module_with_prelude(module, &prelude)
 			};
-			let has_errors = checked.diags.iter().any(Diagnostic::is_error);
-			diags.extend(
-				checked
-					.diags
-					.iter()
-					.filter(|d| d.is_error())
-					.cloned()
-					.map(|d| ProjectDiagnostic {
-						module: key.clone(),
-						diag: d,
-					}),
-			);
-			if has_errors {
-				continue;
+			let diags = checked
+				.diags
+				.iter()
+				.filter(|d| d.is_error())
+				.cloned()
+				.map(|diag| ProjectDiagnostic {
+					module: key.clone(),
+					diag,
+				})
+				.collect::<Vec<_>>();
+			if !diags.is_empty() {
+				return (diags, None);
 			}
 			// `prelude` is `core_prelude() ++ transitive_deps` (see `prelude_slice`),
 			// so the ambient `core` modules occupy the leading `core_prelude().len()`
@@ -683,7 +687,13 @@ impl Driver {
 				crate::prelude::core_prelude().len(),
 				&checked,
 			);
-			lowered_modules.push((key.clone(), hir));
+			(Vec::new(), Some((key.clone(), hir)))
+		});
+		let mut diags = Vec::new();
+		let mut lowered_modules = Vec::new();
+		for (module_diags, lowered) in checked_modules.collect::<Vec<_>>() {
+			diags.extend(module_diags);
+			lowered_modules.extend(lowered);
 		}
 		if !diags.is_empty() {
 			return Err(diags);
@@ -927,7 +937,7 @@ impl Driver {
 				names.dedup();
 				imports.push(("std/nymph/external-values".to_string(), names));
 			}
-			let body = nymph_codegen::emit_for_module(&lowered.module, &key);
+			let body = nymph_codegen::emit_for_project_module(&lowered.module, &key);
 			let mut source = self.wrap_module_js(&key, &body, &imports);
 			if let Some(exports) = merged_runtime_exports.get_mut(&key)
 				&& !exports.is_empty()
@@ -993,7 +1003,7 @@ impl Driver {
 			};
 			let imports = imports_for(&hir, Some(&owner));
 			let mut source = runtime_import_lines(&imports);
-			source.push_str(&nymph_codegen::emit_for_module(&hir, &owner));
+			source.push_str(&nymph_codegen::emit_for_project_module(&hir, &owner));
 			let names = hir
 				.classes
 				.iter()

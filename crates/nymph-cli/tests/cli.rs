@@ -403,24 +403,13 @@ fn run_evaluates_boolean_bitwise_operators_to_booleans_not_numbers() {
 	// BuiltinEager fast path and emit native JS bitwise ops, which coerce
 	// booleans to numbers (`true & false` → 0). They now dispatch to the stdlib
 	// BitAnd/BitOr/BitXor impls (materialized) and produce real booleans.
-	for (expr, expected) in [
-		("true & false", "false"),
-		("true | false", "true"),
-		("true ^ true", "false"),
-	] {
-		let out = nymph(&["run", "-e", expr]);
-		assert!(
-			out.status.success(),
-			"`{expr}` should run; stderr: {}",
-			out.stderr
-		);
-		assert_eq!(
-			out.stdout.trim(),
-			expected,
-			"`{expr}` should print {expected}, got {:?}",
-			out.stdout
-		);
-	}
+	let out = nymph(&["run", "-e", "#(true & false, true | false, true ^ true)"]);
+	assert!(
+		out.status.success(),
+		"boolean bitwise expressions should run; stderr: {}",
+		out.stderr
+	);
+	assert_eq!(out.stdout.trim(), "#(false, true, false)");
 }
 
 #[test]

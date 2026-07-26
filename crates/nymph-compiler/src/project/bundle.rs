@@ -20,6 +20,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use oxc::{allocator::Allocator, parser::Parser, span::SourceType};
 use rolldown::plugin::{
 	HookLoadArgs, HookLoadOutput, HookLoadReturn, HookResolveIdArgs, HookResolveIdOutput,
 	HookResolveIdReturn, HookUsage, Plugin, PluginContext, SharedLoadPluginContext,
@@ -84,6 +85,13 @@ pub(crate) fn bundle(
 	entry_key: &str,
 	sources: FxHashMap<String, String>,
 ) -> Result<String, String> {
+	if let Some(entry) = sources.get(entry_key)
+		&& !entry.lines().any(|line| line.starts_with("import "))
+		&& is_valid_esm(entry)
+	{
+		return Ok(entry.clone());
+	}
+
 	let plugin: Arc<dyn rolldown::plugin::Pluginable> = Arc::new(VirtualFsPlugin { sources });
 
 	let options = BundlerOptions {
@@ -121,9 +129,35 @@ pub(crate) fn bundle(
 	Ok(String::from_utf8_lossy(chunk.content_as_bytes()).into_owned())
 }
 
+fn is_valid_esm(source: &str) -> bool {
+	let allocator = Allocator::default();
+	let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
+	!parsed.panicked && !parsed.diagnostics.has_errors()
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn self_contained_entry_is_returned_without_rebundling() {
+		let source = "function main() {}\nexport { main };\n";
+		let sources = FxHashMap::from_iter([("main".to_string(), source.to_string())]);
+
+		let js = bundle("main", sources).expect("self-contained entry should compile");
+
+		assert_eq!(js, source);
+	}
+
+	#[test]
+	fn invalid_self_contained_entry_still_reports_a_bundle_error() {
+		let source = "function default() {}\nexport { default };\n";
+		let sources = FxHashMap::from_iter([("main".to_string(), source.to_string())]);
+
+		let result = bundle("main", sources);
+
+		assert!(result.is_err(), "invalid ESM must not bypass validation");
+	}
 
 	// Regression pin (not a bug): a wave of review findings flagged rolldown's
 	// tree-shaking as a "silent wrong-JS" risk — a dependency's top-level code

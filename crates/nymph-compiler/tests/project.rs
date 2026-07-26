@@ -22,6 +22,31 @@ fn resolves_at_import_against_the_source_root() {
 	let diags = check_project("main", &loader(files));
 	assert!(diags.is_empty(), "expected a clean project, got: {diags:?}");
 }
+
+#[test]
+fn project_modules_import_one_shared_box_runtime_instead_of_inlining_it() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/helper with (value)\nfunc main(): void = { let result = value() }",
+		),
+		("helper", "public func value(): int = 1"),
+	]);
+
+	let sources = compile_project_module_sources_with_std("main", &loader(files), &|_| None)
+		.expect("project should compile");
+	let helper = &sources["helper"];
+
+	assert!(
+		helper.contains("import { NInt } from \"std/box\";"),
+		"boxed project values should import the canonical runtime: {helper}"
+	);
+	assert!(
+		!helper.contains("class NBox"),
+		"project modules must not inline a private box runtime copy: {helper}"
+	);
+}
+
 #[test]
 fn resolves_relative_current_and_parent_imports() {
 	let files = FxHashMap::from_iter([

@@ -109,9 +109,16 @@ pub fn compile_entry(source: &str, path: &str) -> Result<String, Vec<Diagnostic>
 }
 
 fn compile_impl(source: &str, path: &str, entry: EntryMode) -> Result<String, Vec<Diagnostic>> {
+	let driver_errors = match project::compile_standalone(source, path, entry == EntryMode::Entry) {
+		Ok(js) => return Ok(js),
+		Err(diags) => diags,
+	};
+
 	// Preserve the standalone facade's diagnostic contract independently of
 	// project graph assembly: `path` is only a source/diagnostic anchor, and
 	// parser diagnostics precede checker (including entry-point) diagnostics.
+	// This compatibility path only runs after the canonical driver fails, so
+	// successful compilations parse and check the source exactly once.
 	let parsed = nymph_syntax::parse_module(source, path);
 	let mut diags: Vec<_> = parsed
 		.diagnostics
@@ -125,11 +132,11 @@ fn compile_impl(source: &str, path: &str, entry: EntryMode) -> Result<String, Ve
 		EntryMode::Entry => nymph_sema::check_module_entry_with_prelude(&parsed.tree, prelude),
 	};
 	diags.extend(checked.diags.iter().filter(|diag| diag.is_error()).cloned());
-	if !diags.is_empty() {
-		return Err(diags);
+	if diags.is_empty() {
+		Err(driver_errors)
+	} else {
+		Err(diags)
 	}
-
-	project::compile_standalone(source, path, entry == EntryMode::Entry)
 }
 
 /// Parse and check Nymph `source`, returning every diagnostic produced.

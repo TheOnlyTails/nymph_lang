@@ -120,8 +120,6 @@ impl<'a> JsValue<'a> {
 
 pub struct Emitter<'a> {
 	ast: AstBuilder<'a>,
-	#[allow(dead_code)]
-	alloc: &'a Allocator,
 	/// Counter for fresh temporary names (result temporaries for value-position
 	/// control flow). `Cell` keeps the emit methods `&self`.
 	gensym: std::cell::Cell<u32>,
@@ -145,41 +143,36 @@ pub struct Emitter<'a> {
 	/// prepended import order — and therefore the emitted JS text — stays
 	/// stable across runs, which the golden/e2e tests rely on.
 	needed_imports: std::cell::RefCell<std::collections::BTreeSet<(String, String, String)>>,
-	/// Set the first time [`Self::new_box`] emits a `new N…(…)` box construction
-	/// (uniform value boxing, slice #2). When set, [`Self::emit_module`] prepends
-	/// the inline [`box_rt::box_preamble`] class definitions so the module is
-	/// self-contained under Node's single-file execution (no bundler to resolve a
-	/// `"std/box"` import). `Cell` keeps the emit methods `&self`.
-	used_box: std::cell::Cell<bool>,
+	/// Runtime bindings referenced by emitted code. Standalone emission prepends
+	/// the inline runtime when this is non-empty; project emission imports only
+	/// these bindings from the canonical `std/box` virtual module.
+	box_runtime_bindings: std::cell::RefCell<std::collections::BTreeSet<String>>,
+	import_box_runtime: bool,
 	current_module: Option<String>,
 }
 
-impl Default for Emitter<'_> {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
 impl<'a> Emitter<'a> {
-	pub fn new() -> Emitter<'static> {
-		// Leak an allocator for the lifetime of the emit call; the returned String
-		// outlives it. (A slice-1 simplification; a later slice can thread an
-		// externally-owned Allocator if allocation pressure matters.)
-		let alloc: &'static Allocator = Box::leak(Box::new(Allocator::default()));
+	pub fn new(alloc: &'a Allocator) -> Self {
 		Emitter {
 			ast: AstBuilder::new(alloc),
-			alloc,
 			gensym: std::cell::Cell::new(0),
 			in_iife_subexpr: std::cell::Cell::new(false),
 			needed_imports: std::cell::RefCell::new(std::collections::BTreeSet::new()),
-			used_box: std::cell::Cell::new(false),
+			box_runtime_bindings: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+			import_box_runtime: false,
 			current_module: None,
 		}
 	}
 
-	pub fn for_module(module: &str) -> Emitter<'static> {
-		let mut emitter = Self::new();
+	pub fn for_module(alloc: &'a Allocator, module: &str) -> Self {
+		let mut emitter = Self::new(alloc);
 		emitter.current_module = Some(module.to_string());
+		emitter
+	}
+
+	pub fn for_project_module(alloc: &'a Allocator, module: &str) -> Self {
+		let mut emitter = Self::for_module(alloc, module);
+		emitter.import_box_runtime = true;
 		emitter
 	}
 
@@ -267,17 +260,25 @@ impl<'a> Emitter<'a> {
 			&self.ast,
 		);
 		let code = Codegen::new().build(&program).code;
-		// Uniform value boxing (slice #2): if this module constructed any box,
-		// prepend the inline wrapper-class definitions so it is self-contained
-		// under Node's single-file execution. The classes are top-level and thus
-		// in scope for every `new N…(…)` in the body below them; `import`
-		// declarations emitted into `code` hoist regardless of textually
-		// following these class declarations (valid ESM). A module that
-		// constructs no box gets byte-identical output to before this slice.
-		if self.used_box.get() {
-			format!("{}{code}", box_rt::box_preamble())
-		} else {
+		// Uniform value boxing (slice #2): standalone modules carry the runtime
+		// inline for direct Node execution, while project modules import their
+		// exact bindings from the canonical virtual module. Modules that never
+		// reference the runtime remain byte-identical.
+		let box_runtime_bindings = self.box_runtime_bindings.borrow();
+		if box_runtime_bindings.is_empty() {
 			code
+		} else if self.import_box_runtime {
+			format!(
+				"import {{ {} }} from \"{}\";\n{code}",
+				box_runtime_bindings
+					.iter()
+					.cloned()
+					.collect::<Vec<_>>()
+					.join(", "),
+				box_rt::BOX_MODULE_KEY,
+			)
+		} else {
+			format!("{}{code}", box_rt::box_preamble())
 		}
 	}
 
@@ -923,10 +924,13 @@ impl<'a> Emitter<'a> {
 	/// `new <class>(<payload>)` — a boxed primitive value (uniform value boxing,
 	/// slice #2). `class` is a box wrapper name (`NInt`/`NString`/…); the wrapper
 	/// stores `payload` in `.v` and carries its type discriminant on its
-	/// prototype. Records that the module used a box so [`Self::emit_module`]
-	/// prepends the wrapper-class definitions.
+	/// prototype. Records the runtime binding so [`Self::emit_module`] can either
+	/// provide the inline runtime or import it from the project runtime module.
 	fn new_box(&self, class: &str, payload: Expression<'a>) -> Expression<'a> {
-		self.used_box.set(true);
+		self
+			.box_runtime_bindings
+			.borrow_mut()
+			.insert(class.to_string());
 		let callee = Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(class), &self.ast);
 		let mut args = ArenaVec::new_in(&self.ast);
 		args.push(Argument::from(payload));
@@ -1456,12 +1460,13 @@ impl<'a> Emitter<'a> {
 				args,
 			} => {
 				let callee_name = if *module == "std/display" {
-					self.used_box.set(true);
-					match *symbol {
+					let name = match *symbol {
 						"display" => "nymphProtocolDisplay".to_string(),
 						"debug" => "nymphProtocolDebug".to_string(),
 						_ => unreachable!("unknown display protocol intrinsic `{symbol}`"),
-					}
+					};
+					self.box_runtime_bindings.borrow_mut().insert(name.clone());
+					name
 				} else {
 					self.route_module_symbol(module, symbol, true)
 				};
@@ -1594,6 +1599,12 @@ impl<'a> Emitter<'a> {
 			}
 			// Struct construction → `new <class>({ field: value, … })`.
 			HirExpr::New { class, fields } => {
+				if class == "NymphRange" {
+					self
+						.box_runtime_bindings
+						.borrow_mut()
+						.insert(class.to_string());
+				}
 				let mut props = ArenaVec::new_in(&self.ast);
 				for (name, value) in fields {
 					let key =

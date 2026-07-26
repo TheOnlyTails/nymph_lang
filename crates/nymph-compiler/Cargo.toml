@@ -8,6 +8,9 @@ homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 nymph-syntax = { workspace = true }
 nymph-sema = { workspace = true }
@@ -16,10 +19,18 @@ nymph-diagnostics = { workspace = true }
 nymph-ast = { workspace = true }
 nymph-hir = { workspace = true }
 ecow = { workspace = true }
+oxc = { workspace = true }
+rayon = { workspace = true }
 rustc-hash = { workspace = true }
 rolldown = "1.2.0"
 tokio = { version = "1", features = ["rt"] }
 
+[dev-dependencies]
+criterion = "0.7.0"
 
 [lints.clippy]
 all = "warn"
+
+[[bench]]
+name = "incremental_project"
+harness = false

@@ -26,10 +26,22 @@ fn ambient_hash_interface_lowers_to_the_boxed_runtime_intrinsic() {
 /// trimmed stdout. Local copy of `golden_programs.rs`'s `run` helper (tests
 /// may not import from another crate's test files).
 fn run(src: &str, call: &str) -> String {
+	use std::collections::HashMap;
 	use std::io::Write;
 	use std::sync::atomic::{AtomicU64, Ordering};
+	use std::sync::{Mutex, OnceLock};
 
-	let mut js = compile(src, "core_prelude_ambient").expect("expected a clean compile");
+	static COMPILED: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+	let cache = COMPILED.get_or_init(|| Mutex::new(HashMap::new()));
+	let cached = cache.lock().unwrap().get(src).cloned();
+	let mut js = cached.unwrap_or_else(|| {
+		let compiled = compile(src, "core_prelude_ambient").expect("expected a clean compile");
+		cache
+			.lock()
+			.unwrap()
+			.insert(src.to_owned(), compiled.clone());
+		compiled
+	});
 	js.push_str(&format!("\nconsole.log(({call}).v);\n"));
 
 	static COUNTER: AtomicU64 = AtomicU64::new(0);

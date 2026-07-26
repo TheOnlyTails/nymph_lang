@@ -8,6 +8,7 @@ mod strip;
 
 use nymph_diagnostics::Diagnostic;
 use nymph_hir::hir::HirModule;
+use oxc::allocator::Allocator;
 
 pub use box_rt::{
 	BOX_MODULE_DECLARATIONS, BOX_MODULE_KEY, box_module_declarations, box_module_source, box_preamble,
@@ -16,7 +17,8 @@ pub use strip::strip_ts_to_js;
 
 /// Emit an ES module string for `module`.
 pub fn emit(module: &HirModule) -> String {
-	emit::Emitter::new().emit_module(module)
+	let allocator = Allocator::default();
+	emit::Emitter::new(&allocator).emit_module(module)
 }
 
 /// Emit an ES module with awareness of its canonical module key. Linked
@@ -24,7 +26,17 @@ pub fn emit(module: &HirModule) -> String {
 /// module, while ordinary canonical self-references remain local identifiers.
 #[must_use]
 pub fn emit_for_module(module: &HirModule, module_key: &str) -> String {
-	emit::Emitter::for_module(module_key).emit_module(module)
+	let allocator = Allocator::default();
+	emit::Emitter::for_module(&allocator, module_key).emit_module(module)
+}
+
+/// Emit a module for inclusion in a project bundle. Unlike standalone
+/// emission, generated box values import the shared `std/box` runtime instead
+/// of embedding a private copy in every source module.
+#[must_use]
+pub fn emit_for_project_module(module: &HirModule, module_key: &str) -> String {
+	let allocator = Allocator::default();
+	emit::Emitter::for_project_module(&allocator, module_key).emit_module(module)
 }
 
 /// Compile Nymph source to a JS module string, or return the diagnostics that

@@ -26,6 +26,8 @@
 //!    once under that key. Intrinsics and source consumers therefore share
 //!    both global variant tags and the same method-bearing prototype.
 
+use std::sync::OnceLock;
+
 use rustc_hash::FxHashMap;
 use rustc_hash::FxHashSet;
 
@@ -84,6 +86,8 @@ const IMPORT_REWRITES: &[(&str, &str)] = &[
 	("./display", "std/display"),
 ];
 
+static INTRINSIC_MODULE_SOURCES: OnceLock<FxHashMap<String, String>> = OnceLock::new();
+
 /// Build the virtual module sources every LINKED external's registry module
 /// needs: for each distinct module `nymph_hir::linkage::modules()` names, its
 /// embedded `.ts` source stripped of TypeScript syntax and FILTERED down to
@@ -102,6 +106,12 @@ const IMPORT_REWRITES: &[(&str, &str)] = &[
 /// when something imports it, and rolldown tree-shakes unreferenced entries.
 #[must_use]
 pub(crate) fn intrinsic_module_sources() -> FxHashMap<String, String> {
+	INTRINSIC_MODULE_SOURCES
+		.get_or_init(build_intrinsic_module_sources)
+		.clone()
+}
+
+fn build_intrinsic_module_sources() -> FxHashMap<String, String> {
 	let mut sources: FxHashMap<String, String> = nymph_hir::linkage::modules()
 		.into_iter()
 		.map(|(module, symbols)| {

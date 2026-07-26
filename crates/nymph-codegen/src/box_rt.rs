@@ -80,7 +80,7 @@ fn class_defs(export: bool) -> String {
 	out.push_str("}\n");
 	out.push_str(HASH_MAP_RUNTIME);
 	if export {
-		out.push_str("export { nymphKeyEquals as protocolEquals, nymphHash as structuralHash, nymphDisplay as structuralDisplay, nymphDebug as structuralDebug };\n");
+		out.push_str("export { NymphRange, nymphKeyEquals as protocolEquals, nymphHash as structuralHash, nymphDisplay as structuralDisplay, nymphDebug as structuralDebug, nymphProtocolDisplay, nymphProtocolDebug };\n");
 	}
 	for (class, _) in BOX_CLASSES {
 		if *class == "NMap" {

@@ -2,7 +2,10 @@
 
 use std::io::Write;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{
+	OnceLock,
+	atomic::{AtomicU64, Ordering},
+};
 
 use nymph_codegen::emit;
 use nymph_hir::hir::{HirExpr, HirLet, HirModule, MarshalKind};
@@ -3073,7 +3076,14 @@ fn runs_prelude_map_inherent_method_materializes_and_runs() {
 /// `check_module_with_prelude`, not resolved, so every transitively-named
 /// declaration must be supplied directly as a flattened prelude module,
 /// mirroring `stdlib_check.rs`'s whole-stdlib acceptance test).
-fn real_collections_prelude() -> Vec<nymph_ast::decl::Module> {
+fn real_collections_prelude() -> &'static [nymph_ast::decl::Module] {
+	static PRELUDE: OnceLock<Vec<nymph_ast::decl::Module>> = OnceLock::new();
+	PRELUDE
+		.get_or_init(load_real_collections_prelude)
+		.as_slice()
+}
+
+fn load_real_collections_prelude() -> Vec<nymph_ast::decl::Module> {
 	let stdlib_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 		.join("../../stdlib/src")
 		.canonicalize()
@@ -3116,7 +3126,7 @@ fn compile_against_real_stdlib(user_src: &str) -> String {
 		user.diagnostics
 	);
 	let prelude_modules = real_collections_prelude();
-	let checked = check_module_with_prelude(&user.tree, &prelude_modules);
+	let checked = check_module_with_prelude(&user.tree, prelude_modules);
 	assert!(
 		checked.diags.iter().all(|d| !d.is_error()),
 		"check errors: {:?}",
@@ -3124,7 +3134,7 @@ fn compile_against_real_stdlib(user_src: &str) -> String {
 	);
 	emit(&lower_hir_with_prelude(
 		&user.tree,
-		&prelude_modules,
+		prelude_modules,
 		&checked,
 	))
 }
