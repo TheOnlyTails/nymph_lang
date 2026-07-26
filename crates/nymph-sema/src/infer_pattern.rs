@@ -501,7 +501,7 @@ impl Checker<'_> {
 		match path {
 			[single] => {
 				if let Some(def) = self.defs.get(&single.0)
-					&& let DefKind::Struct { .. } = self.defs.data(def).kind
+					&& let DefKind::Struct = self.defs.data(def).kind
 				{
 					return Some(PatternTarget::Struct(def));
 				}
@@ -533,7 +533,7 @@ impl Checker<'_> {
 			}
 			[type_name, variant_name] => {
 				if let Some(def) = self.defs.get(&type_name.0)
-					&& let DefKind::Enum { .. } = self.defs.data(def).kind
+					&& let DefKind::Enum = self.defs.data(def).kind
 				{
 					let position = self.sigs.enums[&def]
 						.variants

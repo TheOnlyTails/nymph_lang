@@ -10,7 +10,7 @@
 //! [`type_at`]'s arguments MUST have the exact same declaration layout used
 //! for checking. Pointer identity is unnecessary and cloning the module is
 //! safe, but declaration filtering, order, and nesting must be identical:
-//! `DefId` and `DefKind::member` are assigned ordinally. For prelude-aware
+//! local `DefId` and `DefOrigin::Local::member` are assigned ordinally. For prelude-aware
 //! checks, use the [`crate::CheckedModule::module`] returned alongside its
 //! [`crate::CheckedModule::checked`].
 //!
@@ -102,7 +102,8 @@ pub fn type_at(module: &Module, checked: &Checked, offset: usize) -> Option<Stri
 		if let ExprKind::Identifier(name) = &smallest.kind
 			&& matches!(checked.interner.kind(info.ty), TyKind::Fn { .. })
 			&& let Some(id) = defs.get(name.0.as_str())
-			&& let def::DefKind::Func { member } = defs.data(id).kind
+			&& matches!(defs.data(id).kind, def::DefKind::Func)
+			&& let Some(member) = defs.local_member(id)
 			&& !is_shadowed_by_local(module, smallest.id)
 			&& let Some(meta) = func_decl_meta(&module.members[member])
 		{
@@ -187,9 +188,10 @@ fn render_variant_from_resolution(
 	res: &VariantResolution,
 ) -> Option<String> {
 	let enum_id = defs.get(res.enum_name.as_str())?;
-	let def::DefKind::Enum { member } = defs.data(enum_id).kind else {
+	let def::DefKind::Enum = defs.data(enum_id).kind else {
 		return None;
 	};
+	let member = defs.local_member(enum_id)?;
 	let Declaration::Enum { variants, .. } = &module.members[member] else {
 		return None;
 	};
@@ -1816,12 +1818,15 @@ fn generic_subst_from_adt(
 	args: &GenericArgs,
 ) -> FxHashMap<EcoString, String> {
 	let mut subst = FxHashMap::default();
+	let Some(member) = defs.local_member(def_id) else {
+		return subst;
+	};
 	let generics: &[Spanned<GenericParam>] = match defs.data(def_id).kind {
-		def::DefKind::Enum { member } => match &module.members[member] {
+		def::DefKind::Enum => match &module.members[member] {
 			Declaration::Enum { generics, .. } => generics,
 			_ => return subst,
 		},
-		def::DefKind::Struct { member } => match &module.members[member] {
+		def::DefKind::Struct => match &module.members[member] {
 			Declaration::Struct { generics, .. } => generics,
 			_ => return subst,
 		},
@@ -2319,9 +2324,10 @@ fn struct_field_types<'m>(
 ) -> Option<Vec<(&'m str, &'m Spanned<Type>)>> {
 	if let Some(res) = checked.annotations.pattern_variant_of(pattern.1) {
 		let enum_id = defs.get(res.enum_name.as_str())?;
-		let def::DefKind::Enum { member } = defs.data(enum_id).kind else {
+		let def::DefKind::Enum = defs.data(enum_id).kind else {
 			return None;
 		};
+		let member = defs.local_member(enum_id)?;
 		let Declaration::Enum { variants, .. } = &module.members[member] else {
 			return None;
 		};
@@ -2340,9 +2346,10 @@ fn struct_field_types<'m>(
 	};
 	let name = path.last()?;
 	let id = defs.get(name.0.as_str())?;
-	let def::DefKind::Struct { member } = defs.data(id).kind else {
+	let def::DefKind::Struct = defs.data(id).kind else {
 		return None;
 	};
+	let member = defs.local_member(id)?;
 	let Declaration::Struct { fields, .. } = &module.members[member] else {
 		return None;
 	};
@@ -2645,7 +2652,10 @@ fn push_variant_decl_candidate(
 	let Some(enum_id) = defs.get(res.enum_name.as_str()) else {
 		return;
 	};
-	let def::DefKind::Enum { member } = defs.data(enum_id).kind else {
+	let def::DefKind::Enum = defs.data(enum_id).kind else {
+		return;
+	};
+	let Some(member) = defs.local_member(enum_id) else {
 		return;
 	};
 	let Declaration::Enum { variants, .. } = &module.members[member] else {

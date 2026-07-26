@@ -19,12 +19,13 @@ use nymph_ast::{
 use nymph_diagnostics::{Diagnostic, IntoDiagnostic};
 use rustc_hash::FxHashMap;
 
-use crate::{DefId, Ty};
+use crate::{DefId, DefinitionId, ModuleIdentity, Ty};
 
 /// The resolved top-level items of a module.
 #[derive(Debug, Default, Clone)]
 pub struct DefMap {
 	pub defs: Vec<DefData>,
+	by_stable: FxHashMap<DefinitionId, DefId>,
 	/// Top-level names (types, functions, lets, namespaces) in a single value/type
 	/// namespace. Enum variants are *not* here — they live in [`DefMap::variants`], so
 	/// two enums may share a variant name and a struct may share a name with a variant.
@@ -43,38 +44,33 @@ pub struct DefData {
 	#[allow(dead_code)]
 	pub span: Span,
 	pub kind: DefKind,
+	pub origin: DefOrigin,
+	pub stable: Option<DefinitionId>,
 }
 
-/// What a [`DefId`] refers to. `member` is the index into `Module::members` of the
-/// declaration that introduced it, so lowering can read the original AST node.
+/// Where a definition entered this semantic map. Only local definitions may be used
+/// to schedule jobs that read the current module's AST.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DefOrigin {
+	Local { member: usize },
+	Imported { module: ModuleIdentity },
+}
+
+/// What a [`DefId`] refers to, independent of source-AST provenance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefKind {
-	Func {
-		member: usize,
-	},
-	Struct {
-		member: usize,
-	},
-	Enum {
-		member: usize,
-	},
+	Func,
+	Struct,
+	Enum,
 	/// An enum variant, referenced by bare name as a constructor/pattern.
 	Variant {
 		enum_def: DefId,
 		variant: usize,
 	},
-	Let {
-		member: usize,
-	},
-	TypeAlias {
-		member: usize,
-	},
-	Namespace {
-		member: usize,
-	},
-	Interface {
-		member: usize,
-	},
+	Let,
+	TypeAlias,
+	Namespace,
+	Interface,
 }
 
 impl DefMap {
@@ -86,25 +82,123 @@ impl DefMap {
 		&self.defs[def.0 as usize]
 	}
 
-	fn define(&mut self, name: EcoString, span: Span, kind: DefKind) -> DefId {
+	pub fn local_member(&self, def: DefId) -> Option<usize> {
+		match self.data(def).origin {
+			DefOrigin::Local { member } => Some(member),
+			DefOrigin::Imported { .. } => None,
+		}
+	}
+
+	pub fn is_local(&self, def: DefId) -> bool {
+		self.local_member(def).is_some()
+	}
+
+	pub fn stable(&self, def: DefId) -> Option<&DefinitionId> {
+		self.data(def).stable.as_ref()
+	}
+
+	pub fn by_stable(&self, stable: &DefinitionId) -> Option<DefId> {
+		self.by_stable.get(stable).copied()
+	}
+
+	fn define(
+		&mut self,
+		name: EcoString,
+		span: Span,
+		kind: DefKind,
+		origin: DefOrigin,
+		stable: Option<DefinitionId>,
+	) -> DefId {
 		let id = DefId(self.defs.len() as u32);
+		if let Some(stable) = &stable {
+			self.by_stable.insert(stable.clone(), id);
+		}
 		self.defs.push(DefData {
 			name: name.clone(),
 			span,
 			kind,
+			origin,
+			stable,
 		});
 		self.by_name.insert(name, id);
 		id
 	}
 
+	pub fn define_imported(
+		&mut self,
+		name: EcoString,
+		kind: DefKind,
+		module: ModuleIdentity,
+		stable: Option<DefinitionId>,
+	) -> DefId {
+		self.define(
+			name,
+			Span::new(0, 0),
+			kind,
+			DefOrigin::Imported { module },
+			stable,
+		)
+	}
+
+	/// Allocates an imported stable definition once, optionally exposing this occurrence's
+	/// name to compatibility bare-name lookup. Repeated stable IDs reuse their original
+	/// checker-local ID while each exported spelling participates in later-wins lookup.
+	pub(crate) fn allocate_imported(
+		&mut self,
+		name: EcoString,
+		kind: DefKind,
+		module: ModuleIdentity,
+		stable: DefinitionId,
+		bare_visible: bool,
+	) -> DefId {
+		if let Some(id) = self.by_stable(&stable) {
+			if bare_visible {
+				self.by_name.insert(name, id);
+			}
+			return id;
+		}
+		let id = DefId(self.defs.len() as u32);
+		self.by_stable.insert(stable.clone(), id);
+		self.defs.push(DefData {
+			name: name.clone(),
+			span: Span::new(0, 0),
+			kind,
+			origin: DefOrigin::Imported { module },
+			stable: Some(stable),
+		});
+		if bare_visible {
+			self.by_name.insert(name, id);
+		}
+		id
+	}
+
+	pub(crate) fn expose_imported_variant(&mut self, name: EcoString, id: DefId) {
+		let candidates = self.variants.entry(name).or_default();
+		if !candidates.contains(&id) {
+			candidates.push(id);
+		}
+	}
+
 	/// Define an enum variant: it gets a [`DefData`] and joins the bare-name → variants
 	/// multimap, but never the single `by_name` namespace (so variant names don't clash).
-	fn define_variant(&mut self, name: EcoString, span: Span, kind: DefKind) -> DefId {
+	fn define_variant(
+		&mut self,
+		name: EcoString,
+		span: Span,
+		kind: DefKind,
+		member: usize,
+		stable: Option<DefinitionId>,
+	) -> DefId {
 		let id = DefId(self.defs.len() as u32);
+		if let Some(stable) = &stable {
+			self.by_stable.insert(stable.clone(), id);
+		}
 		self.defs.push(DefData {
 			name: name.clone(),
 			span,
 			kind,
+			origin: DefOrigin::Local { member },
+			stable,
 		});
 		self.variants.entry(name).or_default().push(id);
 		id
@@ -136,41 +230,76 @@ fn binding_name(pattern: &Spanned<Pattern>) -> Option<&Ident> {
 /// Walk a module's members and assign a [`DefId`] to every top-level definition and
 /// enum variant. Duplicate names are reported and the later definition wins.
 pub fn build_def_map(module: &Module, diags: &mut Vec<Diagnostic>) -> DefMap {
-	let mut map = DefMap::default();
+	build_def_map_on(module, DefMap::default(), diags, None)
+}
+
+pub(crate) fn build_def_map_on(
+	module: &Module,
+	mut map: DefMap,
+	diags: &mut Vec<Diagnostic>,
+	headers: Option<&crate::DeclaredHeaders>,
+) -> DefMap {
 	let mut seen: FxHashMap<EcoString, Span> = FxHashMap::default();
 
-	let mut declare =
-		|map: &mut DefMap, diags: &mut Vec<Diagnostic>, name: &Ident, kind: DefKind| -> DefId {
-			if let Some(&prev) = seen.get(&name.0) {
-				diags.push(
-					TypeError::Redefinition {
-						name: name.0.clone(),
-						redefined_span: name.1,
-						prev,
-					}
-					.as_diagnostic(name.1),
-				);
-			}
-			seen.insert(name.0.clone(), name.1);
-			map.define(name.0.clone(), name.1, kind)
-		};
+	let mut declare = |map: &mut DefMap,
+	                   diags: &mut Vec<Diagnostic>,
+	                   name: &Ident,
+	                   kind: DefKind,
+	                   member: usize|
+	 -> DefId {
+		if let Some(&prev) = seen.get(&name.0) {
+			diags.push(
+				TypeError::Redefinition {
+					name: name.0.clone(),
+					redefined_span: name.1,
+					prev,
+				}
+				.as_diagnostic(name.1),
+			);
+		}
+		seen.insert(name.0.clone(), name.1);
+		let stable = headers.and_then(|headers| {
+			headers
+				.checked_definitions
+				.iter()
+				.find(|(candidate, _)| candidate == &name.0)
+				.map(|(_, id)| id.clone())
+		});
+		map.define(
+			name.0.clone(),
+			name.1,
+			kind,
+			DefOrigin::Local { member },
+			stable,
+		)
+	};
 
 	for (i, decl) in module.members.iter().enumerate() {
 		match decl {
 			Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => {
-				declare(&mut map, diags, &meta.name, DefKind::Func { member: i });
+				declare(&mut map, diags, &meta.name, DefKind::Func, i);
 			}
 			Declaration::Let { meta, .. } | Declaration::ExternalLet(_, _, meta) => {
 				if let Some(name) = binding_name(&meta.name) {
-					declare(&mut map, diags, name, DefKind::Let { member: i });
+					declare(&mut map, diags, name, DefKind::Let, i);
 				}
 			}
 			Declaration::Struct { name, .. } => {
-				declare(&mut map, diags, name, DefKind::Struct { member: i });
+				declare(&mut map, diags, name, DefKind::Struct, i);
 			}
 			Declaration::Enum { name, variants, .. } => {
-				let enum_def = declare(&mut map, diags, name, DefKind::Enum { member: i });
+				let enum_def = declare(&mut map, diags, name, DefKind::Enum, i);
 				for (v, variant) in variants.iter().enumerate() {
+					let stable = map.stable(enum_def).cloned().map(|owner| {
+						DefinitionId::new(
+							owner.module.clone(),
+							crate::DeclarationKey::member(
+								owner,
+								crate::DeclarationCategory::Variant,
+								variant.0.name.0.clone(),
+							),
+						)
+					});
 					// Variants share a separate namespace, so duplicates across enums are
 					// fine and are never reported as redefinitions.
 					map.define_variant(
@@ -180,22 +309,19 @@ pub fn build_def_map(module: &Module, diags: &mut Vec<Diagnostic>) -> DefMap {
 							enum_def,
 							variant: v,
 						},
+						i,
+						stable,
 					);
 				}
 			}
 			Declaration::TypeAlias { meta, .. } => {
-				declare(
-					&mut map,
-					diags,
-					&meta.name,
-					DefKind::TypeAlias { member: i },
-				);
+				declare(&mut map, diags, &meta.name, DefKind::TypeAlias, i);
 			}
 			Declaration::Namespace { name, .. } => {
-				declare(&mut map, diags, name, DefKind::Namespace { member: i });
+				declare(&mut map, diags, name, DefKind::Namespace, i);
 			}
 			Declaration::Interface { name, .. } => {
-				declare(&mut map, diags, name, DefKind::Interface { member: i });
+				declare(&mut map, diags, name, DefKind::Interface, i);
 			}
 			// Imports introduce no local name here; impl blocks are anonymous (their
 			// contents are collected separately in `iface.rs`).
@@ -216,6 +342,7 @@ pub type Generics = Vec<EcoString>;
 pub struct StructSig {
 	pub generics: Generics,
 	pub fields: Vec<(EcoString, Ty)>,
+	pub field_metadata: Vec<FieldSigMetadata>,
 	/// The interface bounds declared on this struct's own generics (Slice 4G-b),
 	/// e.g. `struct Range<Idx: Comparable<Idx>>` — one [`crate::iface::Bound`] per
 	/// bound, with `ty = Param(i)` in this signature's own `0..generics.len()` index
@@ -236,8 +363,29 @@ pub struct EnumSig {
 
 #[derive(Debug, Clone)]
 pub struct VariantSig {
+	pub target: Option<DefinitionId>,
 	pub name: EcoString,
 	pub fields: Vec<(EcoString, Ty)>,
+	pub field_metadata: Vec<FieldSigMetadata>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FieldSigMetadata {
+	pub target: Option<DefinitionId>,
+	pub mutable: bool,
+	pub has_default: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct OwnedMemberSig {
+	pub target: DefinitionId,
+	pub kind: crate::MemberKind,
+	pub generics: Generics,
+	pub bounds: Vec<crate::iface::Bound>,
+	pub params: Vec<FuncParamSig>,
+	pub ret: Ty,
+	pub has_default: bool,
+	pub external: Option<crate::ExternalAbi>,
 }
 
 #[derive(Debug, Clone)]
@@ -269,13 +417,56 @@ pub struct FuncSig {
 	pub bounds: Vec<crate::iface::Bound>,
 }
 
+/// An owned type-alias declaration. `target` uses this alias's generic parameter
+/// index space and can therefore be instantiated without retaining its AST.
+#[derive(Debug, Clone)]
+pub struct AliasSig {
+	pub generics: Generics,
+	pub target: Ty,
+	#[allow(dead_code)]
+	pub bounds: Vec<crate::iface::Bound>,
+}
+
+/// An owned top-level value signature. Keeping binders and bounds here makes
+/// generalized values importable without collapsing their parameter space.
+#[derive(Debug, Clone)]
+pub struct ValueSig {
+	pub generics: Generics,
+	pub ty: Ty,
+	pub bounds: Vec<crate::iface::Bound>,
+}
+
+/// An owned member of a top-level `namespace` declaration.
+#[derive(Debug, Clone)]
+pub enum NamespaceMemberSig {
+	Func {
+		#[allow(dead_code)]
+		target: Option<DefinitionId>,
+		sig: FuncSig,
+	},
+	Value {
+		#[allow(dead_code)]
+		target: Option<DefinitionId>,
+		ty: Ty,
+		#[allow(dead_code)]
+		mutable: bool,
+	},
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct NamespaceSig {
+	pub members: FxHashMap<EcoString, NamespaceMemberSig>,
+}
+
 /// The lowered signatures of every top-level definition. Built once, read-only
-/// during body inference. Type aliases are expanded on demand from the AST, so
-/// they need no stored signature here.
+/// during body inference. Alias and namespace declarations are owned here too:
+/// declaration AST is only consulted while collecting local signatures.
 #[derive(Debug, Default, Clone)]
 pub struct Signatures {
 	pub structs: FxHashMap<DefId, StructSig>,
 	pub enums: FxHashMap<DefId, EnumSig>,
 	pub funcs: FxHashMap<DefId, FuncSig>,
-	pub lets: FxHashMap<DefId, Ty>,
+	pub lets: FxHashMap<DefId, ValueSig>,
+	pub aliases: FxHashMap<DefId, AliasSig>,
+	pub namespaces: FxHashMap<DefId, NamespaceSig>,
 }

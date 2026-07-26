@@ -104,6 +104,25 @@ pub(crate) struct BuiltinModuleInput {
 	pub source: Arc<str>,
 }
 
+/// A module participating in AST-independent semantic interface queries.
+///
+/// Importable compiler modules share this handle with project modules, while
+/// their distinct identity domains prevent path collisions. Ambient core may
+/// be described by the handle but is never inserted into the public project
+/// semantic graph; it remains an explicit compiler-owned root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub(crate) enum SemanticModuleInput {
+	Project(ModuleInput),
+	Builtin(BuiltinModuleInput),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SemanticModuleDomain {
+	Project,
+	ImportableStd,
+	AmbientCore,
+}
+
 #[salsa::input]
 #[derive(Debug)]
 pub(crate) struct BuiltinRegistryInput {
@@ -133,6 +152,8 @@ pub(crate) struct ProjectKey<'db> {
 	pub project_input: ProjectInput,
 	#[returns(copy)]
 	pub builtin_registry: BuiltinRegistryInput,
+	#[returns(copy)]
+	pub ambient_core_registry: AmbientCoreRegistryInput,
 	#[returns(clone)]
 	pub entry: ModulePath,
 	#[returns(copy)]
@@ -146,12 +167,47 @@ pub(crate) struct ProjectKey<'db> {
 #[salsa::db]
 struct Database {
 	storage: salsa::Storage<Self>,
+	#[cfg(feature = "test-support")]
+	semantic_test_hook: Arc<Mutex<SemanticTestHook>>,
 }
 
 #[salsa::db]
 impl salsa::Database for Database {}
 #[salsa::db]
-impl Db for Database {}
+impl Db for Database {
+	#[cfg(feature = "test-support")]
+	fn semantic_query_will_execute(&self, query: &'static str, module: SemanticModuleInput) {
+		let hook = self.semantic_test_hook.lock().unwrap();
+		let module_name = module.display_key(self);
+		if let Some((project, allowed)) = &hook.body_guard
+			&& module.identity(self).project == project.as_str()
+			&& module_name != allowed.as_str()
+			&& query == "interface_module_analysis"
+		{
+			panic!("forbidden dependency AST/analysis access: {module_name}");
+		}
+		if let Some(callback) = &hook.callback {
+			callback(SemanticQueryEvent {
+				query: query.to_string(),
+				module: Some(module_name),
+			});
+		}
+	}
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SemanticQueryEvent {
+	pub query: String,
+	pub module: Option<String>,
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Default)]
+struct SemanticTestHook {
+	callback: Option<Arc<dyn Fn(SemanticQueryEvent) + Send + Sync>>,
+	body_guard: Option<(ProjectId, ModulePath)>,
+}
 
 type RegistryKey = (ProjectId, ModulePath);
 
@@ -166,10 +222,20 @@ struct SourceRecord {
 /// This intentionally exposes compiler values rather than Salsa inputs or a
 /// database handle, so tooling can safely retain the result between requests.
 pub struct ModuleAnalysis {
-	pub module: Arc<nymph_ast::decl::Module>,
-	pub checked: Arc<nymph_sema::Checked>,
-	pub diagnostics: Arc<[ProjectDiagnostic]>,
-	pub(crate) checked_module: Arc<nymph_ast::decl::Module>,
+	pub semantic: Arc<nymph_sema::SemanticAnalysis>,
+	pub diagnostics: ProjectDiagnostics,
+}
+
+/// Project diagnostics are deliberately separate from reusable semantic facts.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectDiagnostics(pub Arc<[ProjectDiagnostic]>);
+
+impl std::ops::Deref for ProjectDiagnostics {
+	type Target = [ProjectDiagnostic];
+
+	fn deref(&self) -> &Self::Target {
+		&self.0
+	}
 }
 
 /// Stable semantic owner information for runtime-bearing compiler definitions.
@@ -198,8 +264,19 @@ impl ModuleAnalysis {
 	/// public source/rewrite AST used by lowering and NodeId/span annotations.
 	#[must_use]
 	pub fn type_at(&self, offset: usize) -> Option<String> {
-		nymph_sema::query::type_at(&self.checked_module, &self.checked, offset)
+		let checked = nymph_sema::Checked {
+			diags: Vec::new(),
+			facts: self.semantic.checked.as_ref().clone(),
+		};
+		nymph_sema::query::type_at(&self.semantic.module, &checked, offset)
 	}
+}
+
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SemanticPipeline {
+	CompatibilityFlattened,
+	Interface,
 }
 
 pub struct CompilerSession {
@@ -214,6 +291,8 @@ pub struct CompilerSession {
 	tombstones: usize,
 	tombstone_threshold: usize,
 	event_callback: Arc<dyn Fn(&str) + Send + Sync>,
+	#[cfg(feature = "test-support")]
+	semantic_pipeline: SemanticPipeline,
 }
 
 impl Default for CompilerSession {
@@ -393,20 +472,32 @@ impl CompilerSession {
 		module: ModuleInput,
 		key: ProjectKey<'_>,
 	) -> Option<Arc<ModuleAnalysis>> {
-		(module.project(&self.db) == project
+		let common = module.project(&self.db) == project
 			&& key.project_input(&self.db).project(&self.db) == project
 			&& key
 				.project_input(&self.db)
 				.active_modules(&self.db)
-				.contains(&module)
+				.contains(&module);
+		#[cfg(feature = "test-support")]
+		if self.semantic_pipeline == SemanticPipeline::Interface {
+			let graph = queries::project_graph(&self.db, key);
+			return (common
+				&& graph.diagnostics.is_empty()
+				&& graph
+					.semantic_order
+					.contains(&SemanticModuleInput::Project(module)))
+			.then(|| {
+				queries::interface_module_analysis(&self.db, key, SemanticModuleInput::Project(module))
+			});
+		}
+		(common
 			&& super::compat::compat_project_module_is_reachable(&self.db, key, module)
 			&& super::compat::compat_precheck_diagnostics(&self.db, key).is_empty())
 		.then(|| {
-			super::compat::compat_module_analysis(
-				&self.db,
-				key,
-				super::compat::CompatModuleInput::Project(module),
-			)
+			let input = SemanticModuleInput::Project(module);
+			super::compat::compat_module_analysis(&self.db, key, input)
+				.analysis
+				.clone()
 		})
 	}
 
@@ -451,6 +542,12 @@ impl CompilerSession {
 		ambient_prelude: bool,
 	) -> Arc<[ProjectDiagnostic]> {
 		let key = self.tooling_key(project, entry, ambient_prelude);
+		#[cfg(feature = "test-support")]
+		if self.semantic_pipeline == SemanticPipeline::Interface {
+			return queries::interface_project_diagnostics(&self.db, key)
+				.0
+				.clone();
+		}
 		super::compat::compat_checked_project(&self.db, key)
 	}
 
@@ -519,7 +616,73 @@ impl CompilerSession {
 			tombstones: 0,
 			tombstone_threshold: threshold.max(1),
 			event_callback: callback,
+			#[cfg(feature = "test-support")]
+			semantic_pipeline: SemanticPipeline::CompatibilityFlattened,
 		}
+	}
+
+	#[cfg(feature = "test-support")]
+	#[must_use]
+	pub fn with_semantic_pipeline_for_test(pipeline: SemanticPipeline) -> Self {
+		let mut session = Self::new();
+		session.semantic_pipeline = pipeline;
+		session
+	}
+
+	#[cfg(feature = "test-support")]
+	#[must_use]
+	pub fn with_detailed_event_callback_for_test(
+		pipeline: SemanticPipeline,
+		callback: impl Fn(SemanticQueryEvent) + Send + Sync + 'static,
+	) -> Self {
+		let callback: Arc<dyn Fn(SemanticQueryEvent) + Send + Sync> = Arc::new(callback);
+		let public_callback = callback.clone();
+		let sources = crate::std_source::embedded_std_sources()
+			.map(|(path, source)| (Arc::from(path), Arc::from(source)))
+			.collect();
+		let mut session = Self::with_builtin_sources(
+			sources,
+			Arc::new(move |query| {
+				public_callback(SemanticQueryEvent {
+					query: query.to_string(),
+					module: None,
+				});
+			}),
+			256,
+		);
+		session.semantic_pipeline = pipeline;
+		session.db.semantic_test_hook.lock().unwrap().callback = Some(callback);
+		session
+	}
+
+	/// Warm dependency environments before enabling a structural body-access guard.
+	#[cfg(feature = "test-support")]
+	pub fn warm_interface_dependency_environments_for_test(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		mode: EntryMode,
+	) {
+		let key = self.project_key(project.clone(), entry, mode, true, true);
+		let Some(input) = self.compat_input(&project, &module) else {
+			return;
+		};
+		let graph = queries::project_graph(&self.db, key);
+		for dependency in graph.semantic_closure(input).iter().copied() {
+			queries::interface_module_environment(&self.db, key, dependency);
+		}
+	}
+
+	/// The closed interface boundary itself is the guard: dependency bodies can
+	/// only be reached by warming their own environment, never while consuming it.
+	#[cfg(feature = "test-support")]
+	pub fn panic_on_dependency_body_access_for_test(
+		&mut self,
+		project: ProjectId,
+		allowed_module: ModulePath,
+	) {
+		self.db.semantic_test_hook.lock().unwrap().body_guard = Some((project, allowed_module));
 	}
 
 	fn create_builtins(
@@ -598,6 +761,10 @@ impl CompilerSession {
 						| "compat_lowered_module"
 						| "compat_emitted_module"
 						| "compat_compiled_project" => Some(query),
+						"interface_module_analysis"
+						| "interface_module_interface"
+						| "interface_module_environment"
+						| "interface_project_diagnostics" => Some(query),
 						"ambient_core_analysis"
 						| "ambient_core_headers"
 						| "ambient_core_environment"
@@ -611,6 +778,8 @@ impl CompilerSession {
 					}
 				}
 			}))),
+			#[cfg(feature = "test-support")]
+			semantic_test_hook: Arc::new(Mutex::new(SemanticTestHook::default())),
 		}
 	}
 
@@ -740,6 +909,7 @@ impl CompilerSession {
 				&self.db,
 				input,
 				self.builtin_registry,
+				self.ambient_core_registry,
 				entry,
 				mode,
 				false,
@@ -770,6 +940,7 @@ impl CompilerSession {
 			&self.db,
 			input,
 			self.builtin_registry,
+			self.ambient_core_registry,
 			entry,
 			mode,
 			preserve_names,

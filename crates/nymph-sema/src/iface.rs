@@ -23,6 +23,7 @@ use rustc_hash::FxHashMap;
 
 use crate::check::Checker;
 use crate::def::DefKind;
+use crate::identity::DefinitionId;
 use crate::ids::{DefId, ParamIdx};
 use crate::lower::build_param_scope;
 use crate::ty::{GenericArgs, Interner, Ty, TyKind};
@@ -31,6 +32,8 @@ use crate::ty::{GenericArgs, Interner, Ty, TyKind};
 /// the owning interface's (or impl's) generic parameters; `SelfTy` to the receiver.
 #[derive(Debug, Clone)]
 pub struct IfaceMethod {
+	pub definition: Option<DefinitionId>,
+	pub has_default: bool,
 	pub params: Vec<Ty>,
 	pub ret: Ty,
 	/// The method's OWN generic parameter names (e.g. `map<R>` → `["R"]`), in
@@ -68,12 +71,13 @@ pub struct Bound {
 /// A collected `impl Interface<…> for Type { … }`.
 #[derive(Debug, Clone)]
 pub struct ImplDef {
+	pub definition: Option<DefinitionId>,
 	pub generics: Vec<EcoString>,
 	pub self_ty: Ty,
 	pub interface: DefId,
 	/// The span of the interface reference in the `impl … for …` header, used to
 	/// anchor a coherence (conflicting-impl) diagnostic.
-	pub span: Span,
+	pub legacy_span: Option<Span>,
 	/// Interface argument bindings (`Other = …`, `Output = …`), by parameter name,
 	/// with `self` already substituted to `self_ty`.
 	pub args: Vec<(EcoString, Ty)>,
@@ -139,7 +143,7 @@ pub struct ImplRegistry {
 }
 
 impl ImplRegistry {
-	fn add(&mut self, interner: &Interner, def: ImplDef) {
+	pub(crate) fn add(&mut self, interner: &Interner, def: ImplDef) {
 		let idx = self.impls.len();
 		match (def.blanket, head_of(interner, def.self_ty)) {
 			(false, Some(head)) => self
@@ -170,7 +174,7 @@ impl ImplRegistry {
 
 impl Checker<'_> {
 	pub(crate) fn is_interface(&self, def: DefId) -> bool {
-		matches!(self.defs.data(def).kind, DefKind::Interface { .. })
+		matches!(self.defs.data(def).kind, DefKind::Interface)
 	}
 
 	// ── Interface collection ─────────────────────────────────────────────────
@@ -181,9 +185,11 @@ impl Checker<'_> {
 			.defs
 			.iter()
 			.enumerate()
-			.filter_map(|(i, d)| match d.kind {
-				DefKind::Interface { member } => Some((DefId(i as u32), member)),
-				_ => None,
+			.filter_map(|(i, d)| {
+				let id = DefId(i as u32);
+				matches!(d.kind, DefKind::Interface)
+					.then(|| self.defs.local_member(id).map(|member| (id, member)))
+					.flatten()
 			})
 			.collect();
 
@@ -200,9 +206,10 @@ impl Checker<'_> {
 			for m in members {
 				use nymph_ast::decl::{InterfaceElement, InterfaceMember};
 				if let InterfaceMember::Element(element) = &m.0
-					&& let InterfaceElement::Func { meta, .. } = &element.0
+					&& let InterfaceElement::Func { meta, body } = &element.0
 				{
-					let sig = self.lower_method_sig(meta, generics.len());
+					let mut sig = self.lower_method_sig(meta, generics.len());
+					sig.has_default = body.is_some();
 					methods.insert(meta.name.0.clone(), sig);
 				}
 			}
@@ -277,9 +284,11 @@ impl Checker<'_> {
 			.defs
 			.iter()
 			.enumerate()
-			.filter_map(|(i, d)| match d.kind {
-				DefKind::Struct { member } | DefKind::Enum { member } => Some((DefId(i as u32), member)),
-				_ => None,
+			.filter_map(|(i, d)| {
+				let id = DefId(i as u32);
+				matches!(d.kind, DefKind::Struct | DefKind::Enum)
+					.then(|| self.defs.local_member(id).map(|member| (id, member)))
+					.flatten()
 			})
 			.collect();
 		for (def, member) in adts {
@@ -506,6 +515,8 @@ impl Checker<'_> {
 			methods.insert(
 				meta.name.0.clone(),
 				IfaceMethod {
+					definition: None,
+					has_default: false,
 					params,
 					ret,
 					generics: generic_names(&meta.generics),
@@ -517,10 +528,11 @@ impl Checker<'_> {
 
 		let blanket = matches!(self.interner.kind(self_ty), TyKind::Param(_));
 		let def = ImplDef {
+			definition: None,
 			generics: names,
 			self_ty,
 			interface,
-			span: iface_name.1,
+			legacy_span: Some(iface_name.1),
 			args,
 			methods,
 			constraints,
@@ -579,6 +591,8 @@ impl Checker<'_> {
 		let bounds = self.lower_constraints(&meta.generics, base);
 		self.pop_params();
 		IfaceMethod {
+			definition: None,
+			has_default: false,
 			params,
 			ret,
 			generics: generic_names(&meta.generics),

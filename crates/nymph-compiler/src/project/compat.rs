@@ -16,38 +16,18 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use super::metrics::{CompilerPhase, record_phase};
 use super::{
 	CompiledProject, ProjectDiagnostic, bundle,
-	queries::{self, Db, DirectImport, ParsedModule},
+	queries::{self, Db},
 	rewrite::{DeclaredName, NsInfo, RewriteCtx, declared_names, rewrite_module},
-	session::{BuiltinModuleInput, ModuleAnalysis, ModuleInput, ProjectKey},
+	session::{ModuleAnalysis, ModuleInput, ProjectKey, SemanticModuleInput},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
-pub(crate) enum CompatModuleInput {
-	Project(ModuleInput),
-	Builtin(BuiltinModuleInput),
-}
+pub(crate) type CompatModuleInput = SemanticModuleInput;
 
-impl CompatModuleInput {
-	fn key(self, db: &dyn Db) -> String {
-		match self {
-			Self::Project(module) => module.path(db).to_string(),
-			Self::Builtin(module) => format!("std::{}", module.key(db).path),
-		}
-	}
-
-	fn parsed(self, db: &dyn Db) -> Arc<ParsedModule> {
-		match self {
-			Self::Project(module) => queries::parse(db, module).clone(),
-			Self::Builtin(module) => queries::compat_parse_builtin(db, module).clone(),
-		}
-	}
-
-	fn imports(self, db: &dyn Db) -> Arc<[DirectImport]> {
-		match self {
-			Self::Project(module) => queries::direct_imports(db, module).clone(),
-			Self::Builtin(module) => queries::compat_builtin_direct_imports(db, module).clone(),
-		}
-	}
+#[derive(Clone)]
+pub(crate) struct CompatModuleAnalysis {
+	pub(crate) analysis: Arc<ModuleAnalysis>,
+	pub(crate) diagnostics: Arc<[ProjectDiagnostic]>,
+	pub(crate) own_module: Arc<Module>,
 }
 
 #[derive(Clone, Debug)]
@@ -118,7 +98,7 @@ fn visit_order(
 	seen: &mut FxHashSet<String>,
 	out: &mut Vec<CompatModuleInput>,
 ) {
-	let module_key = module.key(db);
+	let module_key = module.display_key(db);
 	if !seen.insert(module_key) {
 		return;
 	}
@@ -148,18 +128,23 @@ pub(crate) fn compat_symbol_map<'db>(
 	let tags: FxHashMap<_, _> = order
 		.iter()
 		.enumerate()
-		.map(|(tag, module)| (module.key(db), tag))
+		.map(|(tag, module)| (module.display_key(db), tag))
 		.collect();
 	let declared: Arc<FxHashMap<_, _>> = Arc::new(
 		order
 			.iter()
-			.map(|module| (module.key(db), declared_names(&module.parsed(db).tree)))
+			.map(|module| {
+				(
+					module.display_key(db),
+					declared_names(&module.parsed(db).tree),
+				)
+			})
 			.collect(),
 	);
 	let mut modules = FxHashMap::default();
 	let mut attachments: FxHashMap<(String, EcoString, EcoString), Span> = FxHashMap::default();
 	for module in &order {
-		let module_key = module.key(db);
+		let module_key = module.display_key(db);
 		let tree = &module.parsed(db).tree;
 		let own_tag = tags[&module_key];
 		let own_names: FxHashSet<_> = declared[&module_key]
@@ -341,7 +326,7 @@ pub(crate) fn compat_rewritten_module<'db>(
 	module: CompatModuleInput,
 ) -> Arc<CompatRewrittenModule> {
 	let symbols = compat_symbol_map(db, key);
-	let module_key = module.key(db);
+	let module_key = module.display_key(db);
 	let binding = &symbols.modules[&module_key];
 	let ctx = RewriteCtx {
 		renames: binding.renames.clone(),
@@ -470,32 +455,43 @@ pub(crate) fn compat_module_analysis<'db>(
 	db: &'db dyn Db,
 	key: ProjectKey<'db>,
 	module: CompatModuleInput,
-) -> Arc<ModuleAnalysis> {
+) -> Arc<CompatModuleAnalysis> {
 	let rewritten = compat_rewritten_module(db, key, module);
 	let dependencies = transitive_dependencies(db, key, module);
 	let prelude = prelude(db, key, &dependencies);
 	record_phase(CompilerPhase::Check);
-	let paired = if key.mode(db) == EntryMode::Entry && module.key(db) == key.entry(db).as_str() {
-		nymph_sema::check_module_entry_with_prelude_and_module(&rewritten.module, &prelude)
-	} else {
-		nymph_sema::check_module_with_prelude_and_module(&rewritten.module, &prelude)
-	};
-	let diagnostics = paired
+	let paired =
+		if key.mode(db) == EntryMode::Entry && module.display_key(db) == key.entry(db).as_str() {
+			nymph_sema::check_module_entry_with_prelude_and_module(&rewritten.module, &prelude)
+		} else {
+			nymph_sema::check_module_with_prelude_and_module(&rewritten.module, &prelude)
+		};
+	let diagnostics: Arc<[ProjectDiagnostic]> = paired
 		.checked
 		.diags
 		.iter()
 		.cloned()
 		.map(|diag| ProjectDiagnostic {
-			module: module.key(db),
+			module: module.display_key(db),
 			diag,
 		})
 		.collect::<Vec<_>>()
 		.into();
-	Arc::new(ModuleAnalysis {
-		module: rewritten.module.clone(),
-		checked: Arc::new(paired.checked),
+	let checked = Arc::new(paired.checked);
+	let semantic = Arc::new(nymph_sema::SemanticAnalysis {
+		module: Arc::new(paired.module),
+		checked: Arc::new(checked.facts.clone()),
+		annotations: Arc::new(nymph_sema::ModuleAnnotations::from(
+			checked.facts.annotations.clone(),
+		)),
+	});
+	Arc::new(CompatModuleAnalysis {
+		analysis: Arc::new(ModuleAnalysis {
+			semantic,
+			diagnostics: super::session::ProjectDiagnostics(diagnostics.clone()),
+		}),
 		diagnostics,
-		checked_module: Arc::new(paired.module),
+		own_module: rewritten.module.clone(),
 	})
 }
 
@@ -537,7 +533,7 @@ pub(crate) fn compat_declared_headers<'db>(
 	for owner in symbols.order.iter().copied() {
 		let owner_headers =
 			nymph_sema::declared_headers(compat_module_identity(db, owner), &owner.parsed(db).tree);
-		let owner_symbols = &symbols.modules[&owner.key(db)];
+		let owner_symbols = &symbols.modules[&owner.display_key(db)];
 		for (source_name, id) in owner_headers.definitions {
 			let checked_name = owner_symbols
 				.renames
@@ -557,12 +553,19 @@ pub(crate) fn compat_module_environment<'db>(
 	module: CompatModuleInput,
 ) -> Arc<nymph_sema::ModuleEnvironment> {
 	let analysis = compat_module_analysis(db, key, module);
-	let facts =
-		nymph_sema::ExtractionFactSelection::current_module(&analysis.module, &analysis.checked);
+	let checked = nymph_sema::Checked {
+		diags: analysis
+			.diagnostics
+			.iter()
+			.map(|item| item.diag.clone())
+			.collect(),
+		facts: analysis.analysis.semantic.checked.as_ref().clone(),
+	};
+	let facts = nymph_sema::ExtractionFactSelection::current_module(&analysis.own_module, &checked);
 	Arc::new(nymph_sema::recover_module_environment_with_facts(
 		compat_module_identity(db, module),
-		&analysis.module,
-		&analysis.checked,
+		&analysis.own_module,
+		&checked,
 		&compat_declared_headers(db, key, module),
 		&facts,
 	))
@@ -589,18 +592,21 @@ pub(crate) fn compat_module_diagnostics<'db>(
 	let analysis = compat_module_analysis(db, key, module);
 	let mut diagnostics = analysis.diagnostics.to_vec();
 	if diagnostics.is_empty() {
+		let checked = nymph_sema::Checked {
+			diags: Vec::new(),
+			facts: analysis.analysis.semantic.checked.as_ref().clone(),
+		};
 		let headers = compat_declared_headers(db, key, module);
-		let facts =
-			nymph_sema::ExtractionFactSelection::current_module(&analysis.module, &analysis.checked);
+		let facts = nymph_sema::ExtractionFactSelection::current_module(&analysis.own_module, &checked);
 		if let Err(error) = nymph_sema::extract_module_interface_with_facts(
 			compat_module_identity(db, module),
-			&analysis.module,
-			&analysis.checked,
+			&analysis.own_module,
+			&checked,
 			&headers,
 			&facts,
 		) {
 			diagnostics.push(ProjectDiagnostic {
-				module: module.key(db),
+				module: module.display_key(db),
 				diag: Diagnostic::error(
 					"INTERNAL-INTERFACE-CONVERSION".into(),
 					format!("internal interface conversion failed: {error:?}"),
@@ -626,15 +632,18 @@ pub(crate) fn compat_lowered_module<'db>(
 		.chain(
 			dependencies
 				.iter()
-				.map(|dependency| RuntimeOwner::Project(dependency.key(db).into())),
+				.map(|dependency| RuntimeOwner::Project(dependency.display_key(db).into())),
 		)
 		.collect::<Vec<_>>();
 	let lowered = nymph_sema::lower_hir_with_prelude_runtime_and_deps_with_owners(
-		&analysis.module,
+		&analysis.own_module,
 		&prelude,
 		&owners,
 		crate::prelude::core_prelude().len(),
-		&analysis.checked,
+		&nymph_sema::Checked {
+			diags: Vec::new(),
+			facts: analysis.analysis.semantic.checked.as_ref().clone(),
+		},
 	);
 	record_phase(CompilerPhase::Lower);
 	Arc::new(CompatLoweredModule {
@@ -791,7 +800,7 @@ pub(crate) fn compat_emitted_module<'db>(
 	let mut lowered_modules = Vec::new();
 	for module in symbols.order.iter() {
 		let lowered = compat_lowered_module(db, project, *module);
-		lowered_modules.push((module.key(db), lowered.lowered.as_ref().clone()));
+		lowered_modules.push((module.display_key(db), lowered.lowered.as_ref().clone()));
 	}
 	let module_sources = (|| {
 		let owners = crate::prelude::core_runtime_type_owners();
@@ -1193,6 +1202,7 @@ mod tests {
 
 	use super::*;
 	use crate::project::Driver;
+	use crate::project::session::BuiltinModuleInput;
 	use crate::project::session::{
 		BuiltinModuleDomain, BuiltinModuleKey, BuiltinRegistryInput, ModulePath, ProjectId,
 		ProjectInput,
@@ -1248,12 +1258,14 @@ mod tests {
 			.into();
 		let input = ProjectInput::new(&db, id, modules);
 		let registry = BuiltinRegistryInput::new(&db, builtin_modules);
+		let ambient = crate::project::session::AmbientCoreRegistryInput::new(&db, Arc::new([]));
 		// Test databases live for the duration of each test; Salsa keys do not
 		// actually borrow the database despite carrying its invariant lifetime.
 		let key = ProjectKey::new(
 			&db,
 			input,
 			registry,
+			ambient,
 			ModulePath::new(entry).unwrap(),
 			mode,
 			preserve_names,
@@ -1339,7 +1351,7 @@ mod tests {
 					let symbols = compat_symbol_map(&db, key);
 					assert_eq!(symbols.tags, driver.tags);
 					for module in symbols.order.iter() {
-						let module_key = module.key(&db);
+						let module_key = module.display_key(&db);
 						assert_eq!(
 							compat_rewritten_module(&db, key, *module).module.as_ref(),
 							&driver.processed[&module_key]
@@ -1368,7 +1380,7 @@ mod tests {
 			symbols
 				.order
 				.iter()
-				.map(|module| module.key(&db_a))
+				.map(|module| module.display_key(&db_a))
 				.collect::<Vec<_>>(),
 			["std::tool", "main"]
 		);
@@ -1391,6 +1403,7 @@ mod tests {
 			&db_a,
 			other_input,
 			key_a.builtin_registry(&db_a),
+			key_a.ambient_core_registry(&db_a),
 			ModulePath::new("main").unwrap(),
 			EntryMode::Entry,
 			false,
@@ -1403,6 +1416,7 @@ mod tests {
 			&db_a,
 			key_a.project_input(&db_a),
 			key_a.builtin_registry(&db_a),
+			key_a.ambient_core_registry(&db_a),
 			ModulePath::new("main").unwrap(),
 			EntryMode::Library,
 			false,
@@ -1422,7 +1436,7 @@ mod tests {
 			compat_symbol_map(&db_b, key_b)
 				.order
 				.iter()
-				.map(|module| module.key(&db_b))
+				.map(|module| module.display_key(&db_b))
 				.collect::<Vec<_>>(),
 			["other"]
 		);
@@ -1440,7 +1454,7 @@ mod tests {
 		assert_eq!(
 			transitive_dependencies(&db, key, main)
 				.iter()
-				.map(|module| module.key(&db))
+				.map(|module| module.display_key(&db))
 				.collect::<Vec<_>>(),
 			["a", "std::tool"]
 		);

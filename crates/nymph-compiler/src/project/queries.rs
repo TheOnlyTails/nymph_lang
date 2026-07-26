@@ -11,12 +11,15 @@ use super::{
 	resolve::resolve_import_target,
 	session::{
 		AmbientCoreRegistryInput, BuiltinModuleDomain, BuiltinModuleInput, BuiltinModuleKey,
-		ModuleInput, ModulePath, ProjectInput, ProjectKey,
+		ModuleInput, ModulePath, ProjectInput, ProjectKey, SemanticModuleDomain, SemanticModuleInput,
 	},
 };
 
 #[salsa::db]
-pub(crate) trait Db: salsa::Database {}
+pub(crate) trait Db: salsa::Database {
+	#[cfg(feature = "test-support")]
+	fn semantic_query_will_execute(&self, _query: &'static str, _module: SemanticModuleInput) {}
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParsedModule {
@@ -34,12 +37,122 @@ pub struct DirectImport {
 
 pub type DirectImports = [DirectImport];
 
+impl SemanticModuleInput {
+	pub(crate) fn domain(self, db: &dyn Db) -> SemanticModuleDomain {
+		match self {
+			Self::Project(_) => SemanticModuleDomain::Project,
+			Self::Builtin(module) => match module.key(db).domain {
+				BuiltinModuleDomain::ImportableStd => SemanticModuleDomain::ImportableStd,
+				BuiltinModuleDomain::AmbientCore => SemanticModuleDomain::AmbientCore,
+			},
+		}
+	}
+
+	pub(crate) fn display_key(self, db: &dyn Db) -> String {
+		match self {
+			Self::Project(module) => module.path(db).to_string(),
+			Self::Builtin(module) => format!("std::{}", module.key(db).path),
+		}
+	}
+
+	pub(crate) fn identity(self, db: &dyn Db) -> nymph_sema::ModuleIdentity {
+		match self {
+			Self::Project(module) => nymph_sema::ModuleIdentity {
+				origin: nymph_sema::ModuleOrigin::Project(module.project(db).as_str().into()),
+				project: module.project(db).as_str().into(),
+				path: module.path(db).as_str().into(),
+			},
+			Self::Builtin(module) => nymph_sema::ModuleIdentity {
+				origin: nymph_sema::ModuleOrigin::Compiler,
+				project: "compiler".into(),
+				path: module.key(db).path.as_ref().into(),
+			},
+		}
+	}
+
+	pub(crate) fn parsed(self, db: &dyn Db) -> Arc<ParsedModule> {
+		match self {
+			Self::Project(module) => parse(db, module).clone(),
+			Self::Builtin(module) => compat_parse_builtin(db, module).clone(),
+		}
+	}
+
+	pub(crate) fn imports(self, db: &dyn Db) -> Arc<DirectImports> {
+		match self {
+			Self::Project(module) => direct_imports(db, module).clone(),
+			Self::Builtin(module) => compat_builtin_direct_imports(db, module).clone(),
+		}
+	}
+
+	pub(crate) fn is_ambient_core(self, db: &dyn Db) -> bool {
+		self.domain(db) == SemanticModuleDomain::AmbientCore
+	}
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectGraph {
 	pub order: Arc<[ModuleInput]>,
 	#[allow(dead_code)]
 	pub direct: Arc<[(ModuleInput, Arc<[ModuleInput]>)]>,
+	pub(crate) semantic_order: Arc<[SemanticModuleInput]>,
+	pub(crate) semantic_direct: Arc<[(SemanticModuleInput, Arc<[SemanticModuleInput]>)]>,
 	pub diagnostics: Arc<[ProjectDiagnostic]>,
+}
+
+impl ProjectGraph {
+	pub(crate) fn semantic_direct_dependencies(
+		&self,
+		module: SemanticModuleInput,
+	) -> Arc<[SemanticModuleInput]> {
+		self
+			.semantic_direct
+			.iter()
+			.find_map(|(owner, dependencies)| (*owner == module).then(|| dependencies.clone()))
+			.unwrap_or_else(|| Arc::new([]))
+	}
+
+	pub(crate) fn semantic_direct_imports(
+		&self,
+		db: &dyn Db,
+		module: SemanticModuleInput,
+	) -> Arc<DirectImports> {
+		// A validated graph guarantees each successful import has a matching
+		// direct semantic edge. Keep the binding's namespace and `with` aliases
+		// in source order for the interface environment query.
+		if self
+			.semantic_direct
+			.iter()
+			.any(|(owner, _)| *owner == module)
+		{
+			module.imports(db)
+		} else {
+			Arc::new([])
+		}
+	}
+
+	pub(crate) fn semantic_closure(&self, root: SemanticModuleInput) -> Arc<[SemanticModuleInput]> {
+		use std::collections::HashSet;
+		fn visit(
+			graph: &ProjectGraph,
+			module: SemanticModuleInput,
+			seen: &mut HashSet<SemanticModuleInput>,
+		) {
+			for dependency in graph.semantic_direct_dependencies(module).iter().copied() {
+				if seen.insert(dependency) {
+					visit(graph, dependency, seen);
+				}
+			}
+		}
+		let mut seen = HashSet::new();
+		visit(self, root, &mut seen);
+		self
+			.semantic_order
+			.iter()
+			.copied()
+			.filter(|module| seen.contains(module))
+			.collect::<Vec<_>>()
+			.into()
+	}
 }
 
 #[salsa::tracked]
@@ -136,6 +249,11 @@ pub(crate) fn ambient_core_analysis(
 	registry: AmbientCoreRegistryInput,
 	module: BuiltinModuleInput,
 ) -> Arc<super::session::ModuleAnalysis> {
+	#[cfg(feature = "test-support")]
+	db.semantic_query_will_execute(
+		"ambient_core_analysis",
+		SemanticModuleInput::Builtin(module),
+	);
 	// This private compatibility bootstrap temporarily flattens only the
 	// compiler-core dependency closure. It never enters the public ProjectGraph
 	// or user flattened analysis. Production compatibility flattening remains
@@ -149,11 +267,16 @@ pub(crate) fn ambient_core_analysis(
 		.collect::<Vec<_>>();
 	let parsed = compat_parse_builtin(db, module);
 	let paired = nymph_sema::check_module_with_prelude_and_module(&parsed.tree, &dependencies);
+	let checked = Arc::new(paired.checked);
 	Arc::new(super::session::ModuleAnalysis {
-		module: Arc::new(parsed.tree.clone()),
-		checked: Arc::new(paired.checked),
-		diagnostics: Arc::new([]),
-		checked_module: Arc::new(paired.module),
+		semantic: Arc::new(nymph_sema::SemanticAnalysis {
+			module: Arc::new(parsed.tree.clone()),
+			checked: Arc::new(checked.facts.clone()),
+			annotations: Arc::new(nymph_sema::ModuleAnnotations::from(
+				checked.facts.annotations.clone(),
+			)),
+		}),
+		diagnostics: super::session::ProjectDiagnostics(Arc::new([])),
 	})
 }
 
@@ -195,13 +318,19 @@ pub(crate) fn ambient_core_environment(
 	registry: AmbientCoreRegistryInput,
 	module: BuiltinModuleInput,
 ) -> Arc<nymph_sema::ModuleEnvironment> {
+	#[cfg(feature = "test-support")]
+	db.semantic_query_will_execute(
+		"ambient_core_environment",
+		SemanticModuleInput::Builtin(module),
+	);
 	let analysis = ambient_core_analysis(db, registry, module);
+	let checked = checked_from_analysis(&analysis, []);
 	let facts =
-		nymph_sema::ExtractionFactSelection::current_module(&analysis.module, &analysis.checked);
+		nymph_sema::ExtractionFactSelection::current_module(&analysis.semantic.module, &checked);
 	Arc::new(nymph_sema::recover_module_environment_with_facts(
 		ambient_identity(db, module),
-		&analysis.module,
-		&analysis.checked,
+		&analysis.semantic.module,
+		&checked,
 		&ambient_core_headers(db, registry, module),
 		&facts,
 	))
@@ -213,6 +342,11 @@ pub(crate) fn ambient_core_interface(
 	registry: AmbientCoreRegistryInput,
 	module: BuiltinModuleInput,
 ) -> Arc<nymph_sema::ModuleInterface> {
+	#[cfg(feature = "test-support")]
+	db.semantic_query_will_execute(
+		"ambient_core_interface",
+		SemanticModuleInput::Builtin(module),
+	);
 	match &*ambient_core_environment(db, registry, module) {
 		nymph_sema::ModuleEnvironment::Complete(interface) => Arc::new(interface.clone()),
 		nymph_sema::ModuleEnvironment::Recovered(_) => panic!(
@@ -229,14 +363,20 @@ pub(crate) fn ambient_core_diagnostics(
 	module: BuiltinModuleInput,
 ) -> Arc<[nymph_diagnostics::Diagnostic]> {
 	let analysis = ambient_core_analysis(db, registry, module);
-	let mut diagnostics = analysis.checked.diags.clone();
+	let mut diagnostics = analysis
+		.diagnostics
+		.0
+		.iter()
+		.map(|item| item.diag.clone())
+		.collect::<Vec<_>>();
 	if diagnostics.is_empty() {
+		let checked = checked_from_analysis(&analysis, []);
 		let facts =
-			nymph_sema::ExtractionFactSelection::current_module(&analysis.module, &analysis.checked);
+			nymph_sema::ExtractionFactSelection::current_module(&analysis.semantic.module, &checked);
 		if let Err(error) = nymph_sema::extract_module_interface_with_facts(
 			ambient_identity(db, module),
-			&analysis.module,
-			&analysis.checked,
+			&analysis.semantic.module,
+			&checked,
 			&ambient_core_headers(db, registry, module),
 			&facts,
 		) {
@@ -330,6 +470,160 @@ fn collect_imports(parsed: &ParsedModule, importer: &str) -> Arc<DirectImports> 
 	imports.into()
 }
 
+fn checked_from_analysis(
+	analysis: &super::session::ModuleAnalysis,
+	diagnostics: impl IntoIterator<Item = Diagnostic>,
+) -> nymph_sema::Checked {
+	nymph_sema::Checked {
+		diags: diagnostics.into_iter().collect(),
+		facts: analysis.semantic.checked.as_ref().clone(),
+	}
+}
+
+/// Check one module exclusively from its own tree and dependency interfaces.
+#[salsa::tracked(returns(clone), no_eq)]
+pub(crate) fn interface_module_analysis<'db>(
+	db: &'db dyn Db,
+	key: super::session::ProjectKey<'db>,
+	module: SemanticModuleInput,
+) -> Arc<super::session::ModuleAnalysis> {
+	#[cfg(feature = "test-support")]
+	db.semantic_query_will_execute("interface_module_analysis", module);
+	let graph = project_graph(db, key);
+	let dependencies = graph
+		.semantic_closure(module)
+		.iter()
+		.copied()
+		.map(|dependency| interface_module_environment(db, key, dependency))
+		.collect::<Vec<_>>();
+	let mut roots = Vec::new();
+	if key.ambient_prelude(db) {
+		let registry = key.ambient_core_registry(db);
+		roots.extend(
+			registry
+				.modules(db)
+				.iter()
+				.copied()
+				.map(|root| ambient_core_environment(db, registry, root)),
+		);
+	}
+	roots.extend(dependencies);
+	let parsed = module.parsed(db);
+	let environment = nymph_sema::SemanticEnvironment::from_modules(module.identity(db), &roots)
+		.expect("validated interfaces form a deterministic semantic environment");
+	let result = nymph_sema::check_module_with_environment(
+		Arc::new(parsed.tree.clone()),
+		module.identity(db),
+		&environment,
+		if key.mode(db) == nymph_sema::EntryMode::Entry
+			&& module.display_key(db) == key.entry(db).as_str()
+		{
+			nymph_sema::EntryMode::Entry
+		} else {
+			nymph_sema::EntryMode::Library
+		},
+	);
+	let diagnostics = result
+		.diagnostics
+		.iter()
+		.cloned()
+		.map(|diag| ProjectDiagnostic {
+			module: module.display_key(db),
+			diag,
+		})
+		.collect::<Vec<_>>()
+		.into();
+	Arc::new(super::session::ModuleAnalysis {
+		semantic: result.analysis,
+		diagnostics: super::session::ProjectDiagnostics(diagnostics),
+	})
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn interface_module_interface<'db>(
+	db: &'db dyn Db,
+	key: super::session::ProjectKey<'db>,
+	module: SemanticModuleInput,
+) -> Result<Arc<nymph_sema::ModuleInterface>, Arc<nymph_sema::InterfaceConversionError>> {
+	#[cfg(feature = "test-support")]
+	db.semantic_query_will_execute("interface_module_interface", module);
+	let analysis = interface_module_analysis(db, key, module);
+	let checked = checked_from_analysis(&analysis, []);
+	let headers = nymph_sema::declared_headers(module.identity(db), &analysis.semantic.module);
+	let facts =
+		nymph_sema::ExtractionFactSelection::current_module(&analysis.semantic.module, &checked);
+	nymph_sema::extract_module_interface_with_facts(
+		module.identity(db),
+		&analysis.semantic.module,
+		&checked,
+		&headers,
+		&facts,
+	)
+	.map(Arc::new)
+	.map_err(Arc::new)
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn interface_module_environment<'db>(
+	db: &'db dyn Db,
+	key: super::session::ProjectKey<'db>,
+	module: SemanticModuleInput,
+) -> Arc<nymph_sema::ModuleEnvironment> {
+	#[cfg(feature = "test-support")]
+	db.semantic_query_will_execute("interface_module_environment", module);
+	let analysis = interface_module_analysis(db, key, module);
+	let diagnostics = interface_module_diagnostics(db, key, module);
+	if diagnostics.is_empty()
+		&& let Ok(interface) = interface_module_interface(db, key, module)
+	{
+		return Arc::new(nymph_sema::ModuleEnvironment::Complete(
+			(*interface).clone(),
+		));
+	}
+	let checked = checked_from_analysis(&analysis, diagnostics.iter().map(|item| item.diag.clone()));
+	let headers = nymph_sema::declared_headers(module.identity(db), &analysis.semantic.module);
+	let facts =
+		nymph_sema::ExtractionFactSelection::current_module(&analysis.semantic.module, &checked);
+	Arc::new(nymph_sema::recover_module_environment_with_facts(
+		module.identity(db),
+		&analysis.semantic.module,
+		&checked,
+		&headers,
+		&facts,
+	))
+}
+
+#[salsa::tracked(returns(clone))]
+fn interface_module_diagnostics<'db>(
+	db: &'db dyn Db,
+	key: super::session::ProjectKey<'db>,
+	module: SemanticModuleInput,
+) -> Arc<[ProjectDiagnostic]> {
+	let analysis = interface_module_analysis(db, key, module);
+	analysis.diagnostics.0.clone()
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn interface_project_diagnostics<'db>(
+	db: &'db dyn Db,
+	key: super::session::ProjectKey<'db>,
+) -> super::session::ProjectDiagnostics {
+	let graph = project_graph(db, key);
+	if !graph.diagnostics.is_empty() {
+		return super::session::ProjectDiagnostics(graph.diagnostics.clone());
+	}
+	let mut all = Vec::new();
+	for module in graph.semantic_order.iter().copied() {
+		all.extend(
+			interface_module_diagnostics(db, key, module)
+				.iter()
+				.cloned(),
+		);
+	}
+	let diagnostics = all.into();
+	super::session::ProjectDiagnostics(diagnostics)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Color {
 	Gray,
@@ -348,6 +642,8 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 		stack: Vec<String>,
 		order: Vec<ModuleInput>,
 		direct: Vec<(ModuleInput, Arc<[ModuleInput]>)>,
+		semantic_order: Vec<SemanticModuleInput>,
+		semantic_direct: Vec<(SemanticModuleInput, Arc<[SemanticModuleInput]>)>,
 		diagnostics: Vec<ProjectDiagnostic>,
 	}
 
@@ -422,9 +718,31 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 				.map(|module| compat_builtin_direct_imports(self.db, module))
 				.unwrap_or_else(|| direct_imports(self.db, project.unwrap()));
 			let mut handles = Vec::new();
+			let mut semantic_handles = Vec::new();
 			for import in imports.iter() {
 				match &import.target {
 					Ok(target) => {
+						let semantic_handle = target
+							.strip_prefix(super::resolve::STD_KEY_PREFIX)
+							.and_then(|path| {
+								self
+									.builtins
+									.get(&BuiltinModuleKey {
+										domain: BuiltinModuleDomain::ImportableStd,
+										path: Arc::from(path),
+									})
+									.copied()
+							})
+							.map(SemanticModuleInput::Builtin)
+							.or_else(|| {
+								ModulePath::new(target)
+									.ok()
+									.and_then(|path| self.active.get(&path).copied())
+									.map(SemanticModuleInput::Project)
+							});
+						if let Some(handle) = semantic_handle {
+							semantic_handles.push(handle);
+						}
 						if !target.starts_with(super::resolve::STD_KEY_PREFIX) {
 							let target_path =
 								ModulePath::new(target).expect("resolved local import is canonical");
@@ -444,10 +762,19 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 			if let Some(module) = project {
 				self.direct.push((module, handles.into()));
 			}
+			let semantic = builtin
+				.map(SemanticModuleInput::Builtin)
+				.unwrap_or_else(|| SemanticModuleInput::Project(project.unwrap()));
+			self
+				.semantic_direct
+				.push((semantic, semantic_handles.into()));
 			self.colors.insert(path.to_string(), Color::Black);
 			self.stack.pop();
-			if ok && let Some(module) = project {
-				self.order.push(module);
+			if ok {
+				self.semantic_order.push(semantic);
+				if let Some(module) = project {
+					self.order.push(module);
+				}
 			}
 			ok
 		}
@@ -473,12 +800,16 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 		stack: Vec::new(),
 		order: Vec::new(),
 		direct: Vec::new(),
+		semantic_order: Vec::new(),
+		semantic_direct: Vec::new(),
 		diagnostics: Vec::new(),
 	};
 	walker.visit(key.entry(db).as_str(), None);
 	Arc::new(ProjectGraph {
 		order: walker.order.into(),
 		direct: walker.direct.into(),
+		semantic_order: walker.semantic_order.into(),
+		semantic_direct: walker.semantic_direct.into(),
 		diagnostics: walker.diagnostics.into(),
 	})
 }
@@ -538,10 +869,12 @@ mod tests {
 			.into();
 		let input = ProjectInput::new(&db, project, modules);
 		let registry = BuiltinRegistryInput::new(&db, builtin_modules);
+		let ambient = AmbientCoreRegistryInput::new(&db, Arc::new([]));
 		let key = ProjectKey::new(
 			&db,
 			input,
 			registry,
+			ambient,
 			ModulePath::new("main").unwrap(),
 			EntryMode::Entry,
 			false,
@@ -636,6 +969,94 @@ mod tests {
 			["b", "a", "main"]
 		);
 		assert_eq!(graph.direct.len(), 3);
+	}
+
+	#[test]
+	fn semantic_graph_includes_importable_builtins_dependency_first_without_changing_project_order() {
+		let (db, key) = fixture(
+			&[
+				("main", "import @/a\nimport std/tool"),
+				("a", "import std/base"),
+			],
+			&[
+				("tool", "import ./base\npublic let tool = 1"),
+				("base", "public let base = 1"),
+			],
+		);
+		let graph = project_graph(&db, key);
+		assert!(graph.diagnostics.is_empty());
+		assert_eq!(
+			graph
+				.order
+				.iter()
+				.map(|module| module.path(&db).as_str().to_string())
+				.collect::<Vec<_>>(),
+			["a", "main"]
+		);
+		assert_eq!(
+			graph
+				.semantic_order
+				.iter()
+				.map(|module| module.display_key(&db))
+				.collect::<Vec<_>>(),
+			["std::base", "a", "std::tool", "main"]
+		);
+		let main = SemanticModuleInput::Project(
+			*graph
+				.order
+				.iter()
+				.find(|module| module.path(&db).as_str() == "main")
+				.unwrap(),
+		);
+		assert_eq!(
+			graph
+				.semantic_closure(main)
+				.iter()
+				.map(|module| module.display_key(&db))
+				.collect::<Vec<_>>(),
+			["std::base", "a", "std::tool"]
+		);
+		assert_eq!(
+			graph
+				.semantic_direct_dependencies(main)
+				.iter()
+				.map(|module| module.display_key(&db))
+				.collect::<Vec<_>>(),
+			["a", "std::tool"]
+		);
+		assert_eq!(graph.semantic_direct_imports(&db, main).len(), 2);
+	}
+
+	#[test]
+	fn semantic_module_identity_domains_do_not_collide_or_include_ambient_core() {
+		let (db, key) = fixture(
+			&[
+				("main", "import @/std/tool\nimport std/tool"),
+				("std/tool", ""),
+			],
+			&[("tool", "")],
+		);
+		let graph = project_graph(&db, key);
+		let identities = graph
+			.semantic_order
+			.iter()
+			.map(|module| module.identity(&db))
+			.collect::<std::collections::BTreeSet<_>>();
+		assert_eq!(identities.len(), 3);
+		assert!(graph.semantic_order.iter().any(|module| {
+			module.domain(&db) == SemanticModuleDomain::Project && module.display_key(&db) == "std/tool"
+		}));
+		assert!(graph.semantic_order.iter().any(|module| {
+			module.domain(&db) == SemanticModuleDomain::ImportableStd
+				&& module.display_key(&db) == "std::tool"
+		}));
+		assert!(
+			graph
+				.semantic_order
+				.iter()
+				.all(|module| !module.is_ambient_core(&db))
+		);
+		assert_eq!(graph.order.len(), 2);
 	}
 
 	#[test]

@@ -68,10 +68,7 @@ impl Checker<'_> {
 			// Structural types have finite constructor signatures the algorithm enumerates.
 			TyKind::Boolean | TyKind::Tuple(_) => self.usefulness_check(scrutinee, arms, span),
 			TyKind::Adt(def, _)
-				if matches!(
-					self.defs.data(*def).kind,
-					DefKind::Enum { .. } | DefKind::Struct { .. }
-				) =>
+				if matches!(self.defs.data(*def).kind, DefKind::Enum | DefKind::Struct) =>
 			{
 				self.usefulness_check(scrutinee, arms, span);
 			}
@@ -283,7 +280,7 @@ impl Checker<'_> {
 			Pattern::Boolean(v) => Head::Con(Ctor::Bool(v.0)),
 			Pattern::Tuple(_) => Head::Con(Ctor::Single),
 			Pattern::Struct { path, .. } => match self.interner.kind(ty) {
-				TyKind::Adt(def, _) if matches!(self.defs.data(*def).kind, DefKind::Struct { .. }) => {
+				TyKind::Adt(def, _) if matches!(self.defs.data(*def).kind, DefKind::Struct) => {
 					Head::Con(Ctor::Single)
 				}
 				_ => match self.classify_variant(path, ty) {
@@ -402,12 +399,12 @@ impl Checker<'_> {
 			TyKind::Boolean => Some(vec![Ctor::Bool(false), Ctor::Bool(true)]),
 			TyKind::Tuple(_) => Some(vec![Ctor::Single]),
 			TyKind::Adt(def, _) => match self.defs.data(*def).kind {
-				DefKind::Enum { .. } => Some(
+				DefKind::Enum => Some(
 					(0..self.sigs.enums[def].variants.len())
 						.map(Ctor::Variant)
 						.collect(),
 				),
-				DefKind::Struct { .. } => Some(vec![Ctor::Single]),
+				DefKind::Struct => Some(vec![Ctor::Single]),
 				_ => None,
 			},
 			_ => None,
@@ -467,7 +464,7 @@ impl Checker<'_> {
 		let TyKind::Adt(def, _) = self.interner.kind(ty) else {
 			return None;
 		};
-		if !matches!(self.defs.data(*def).kind, DefKind::Enum { .. }) {
+		if !matches!(self.defs.data(*def).kind, DefKind::Enum) {
 			return None;
 		}
 		self.sigs.enums[def]

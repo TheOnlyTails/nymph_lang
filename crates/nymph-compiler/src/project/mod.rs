@@ -56,8 +56,11 @@ mod session;
 
 pub use session::{
 	AmbientCoreModuleKey, BuiltinRuntimeOwnerArtifact, BuiltinRuntimeOwnerShape, CompilerSession,
-	ModuleAnalysis, ModulePath, ProjectId, SourceVersion,
+	ModuleAnalysis, ModulePath, ProjectDiagnostics, ProjectId, SourceVersion,
 };
+
+#[cfg(feature = "test-support")]
+pub use session::{SemanticPipeline, SemanticQueryEvent};
 
 #[cfg(feature = "test-support")]
 pub use metrics::{PhaseCounts, with_phase_counts};

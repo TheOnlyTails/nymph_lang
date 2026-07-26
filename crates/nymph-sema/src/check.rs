@@ -13,8 +13,8 @@ use nymph_ast::{NodeId, Span, decl::Declaration, decl::Module};
 use nymph_diagnostics::Diagnostic;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::annotate::{Checked, CheckedSemantic};
-use crate::def::{DefMap, Signatures, build_def_map};
+use crate::annotate::{Checked, CheckedFacts, CheckedSemantic};
+use crate::def::{DefMap, Signatures, build_def_map, build_def_map_on};
 use crate::ids::{DefId, InferVar, ParamIdx};
 use crate::ty::fold::occurs;
 use crate::ty::{Interner, Ty, TyKind};
@@ -53,7 +53,9 @@ pub struct Checker<'m> {
 	pub(crate) impls: crate::iface::ImplRegistry,
 	/// Inherent methods and statics (methods not attached to an interface), indexed
 	/// by the implementing type's head constructor.
-	pub(crate) inherent: crate::members::InherentRegistry<'m>,
+	pub(crate) inherent: crate::members::InherentRegistry,
+	/// Current-module syntax work, intentionally separate from the owned registry.
+	pub(crate) inherent_body_jobs: Vec<crate::members::InherentBodyJob<'m>>,
 	pub(crate) table: UnifyTable,
 	pub(crate) diags: Vec<Diagnostic>,
 	pub(crate) external_value_marshals: FxHashMap<Span, nymph_hir::hir::MarshalKind>,
@@ -73,8 +75,9 @@ pub struct Checker<'m> {
 	pub(crate) self_ty: Option<Ty>,
 	/// The declared/expected return type of the function currently being checked.
 	pub(crate) ret_ty: Option<Ty>,
-	/// Recursion guard for on-demand type-alias expansion.
-	pub(crate) alias_depth: u32,
+	/// Explicit DFS state used only while local aliases are collected.
+	pub(crate) alias_states: FxHashMap<DefId, AliasLowerState>,
+	pub(crate) collecting_signatures: bool,
 	/// Counter minting anonymous generic parameters for `impl Interface` used in type
 	/// position (an interface reference desugars to a fresh generic bounded by it).
 	pub(crate) synthetic_params: u32,
@@ -204,7 +207,18 @@ pub enum EntryMode {
 pub(crate) fn check_module_impl(module: &Module, entry: EntryMode) -> Checked {
 	let mut diags = Vec::new();
 	let defs = build_def_map(module, &mut diags);
-	let mut checker = Checker::new(module, defs, diags);
+	let checker = Checker::new(module, defs, diags);
+	check_module_from_parts(entry, checker, 0, 0, 0, false)
+}
+
+fn check_module_from_parts(
+	entry: EntryMode,
+	mut checker: Checker<'_>,
+	definition_start: usize,
+	implementation_start: usize,
+	inherent_start: usize,
+	has_explicit_local_ranges: bool,
+) -> Checked {
 	checker.lower_signatures();
 	checker.collect_interfaces();
 	// Inherent methods (struct/enum body `func`s, top-level inherent `impl Type {
@@ -259,20 +273,16 @@ pub(crate) fn check_module_impl(module: &Module, entry: EntryMode) -> Checked {
 	// consumers consult the checker's now-discarded unification table.
 	let let_ids = checker.sigs.lets.keys().copied().collect::<Vec<_>>();
 	for id in let_ids {
-		let ty = checker.sigs.lets[&id];
+		let ty = checker.sigs.lets[&id].ty;
 		let resolved = checker.resolve_deep(ty);
-		checker.sigs.lets.insert(id, resolved);
+		checker.sigs.lets.get_mut(&id).unwrap().ty = resolved;
 	}
-	let inherent = checker
+	let inherent: Vec<_> = checker
 		.inherent
 		.impls
 		.iter()
 		.map(|implementation| crate::annotate::CheckedInherentImpl {
-			generics: implementation
-				.owner_generics
-				.iter()
-				.map(|generic| generic.0.name.0.clone())
-				.collect(),
+			generics: implementation.owner_generic_names.clone(),
 			self_ty: implementation.self_ty,
 			constraints: implementation.constraints.clone(),
 			methods: implementation
@@ -291,19 +301,77 @@ pub(crate) fn check_module_impl(module: &Module, entry: EntryMode) -> Checked {
 				.collect(),
 		})
 		.collect();
+	let implementation_end = checker.impls.impls.len();
+	let inherent_end = inherent.len();
+	let definition_end = checker.defs.defs.len();
 	Checked {
 		diags: checker.diags,
-		annotations,
-		external_value_marshals: checker.external_value_marshals,
-		interner: checker.interner,
-		semantic: CheckedSemantic {
-			definitions: checker.defs,
-			signatures: checker.sigs,
-			interfaces: checker.interfaces,
-			implementations: checker.impls,
-			inherent,
-			anonymous_bounds: checker.synthetic_bound_details,
+		facts: CheckedFacts {
+			annotations,
+			external_value_marshals: checker.external_value_marshals,
+			interner: checker.interner,
+			semantic: CheckedSemantic {
+				definitions: checker.defs,
+				signatures: checker.sigs,
+				interfaces: checker.interfaces,
+				implementations: checker.impls,
+				inherent,
+				anonymous_bounds: checker.synthetic_bound_details,
+				local_definitions: definition_start..definition_end,
+				local_implementations: implementation_start..implementation_end,
+				local_inherent: inherent_start..inherent_end,
+				has_explicit_local_ranges,
+			},
 		},
+	}
+}
+
+pub fn check_module_with_environment(
+	module: std::sync::Arc<Module>,
+	identity: crate::ModuleIdentity,
+	environment: &crate::SemanticEnvironment,
+	mode: EntryMode,
+) -> crate::SemanticCheckResult {
+	let mut diagnostics = Vec::new();
+	let headers = crate::declared_headers(identity, &module);
+	let definition_start = environment.imported.defs.defs.len();
+	let implementation_start = environment.imported.implementations.impls.len();
+	let inherent_start = environment.imported.inherent.impls.len();
+	let defs = build_def_map_on(
+		&module,
+		environment.imported.defs.clone(),
+		&mut diagnostics,
+		Some(&headers),
+	);
+	let mut checker = Checker::new(&module, defs, diagnostics);
+	checker.interner = environment.interner.clone();
+	checker.sigs = environment.imported.signatures.clone();
+	checker.interfaces = environment.imported.interfaces.clone();
+	checker.impls = environment.imported.implementations.clone();
+	checker.inherent = environment.imported.inherent.clone();
+	let checked = check_module_from_parts(
+		mode,
+		checker,
+		definition_start,
+		implementation_start,
+		inherent_start,
+		true,
+	);
+	let diagnostics: std::sync::Arc<[Diagnostic]> = checked.diags.into();
+	let facts = std::sync::Arc::new(checked.facts);
+	let annotations = std::sync::Arc::new(crate::ModuleAnnotations::from(facts.annotations.clone()));
+	let lowerable = !environment.contains_recovery
+		&& !diagnostics
+			.iter()
+			.any(nymph_diagnostics::Diagnostic::is_error);
+	crate::SemanticCheckResult {
+		analysis: std::sync::Arc::new(crate::SemanticAnalysis {
+			module,
+			checked: facts,
+			annotations,
+		}),
+		diagnostics,
+		lowerable,
 	}
 }
 
@@ -438,7 +506,7 @@ impl<'m> Checker<'m> {
 			let marshal = self
 				.defs
 				.get(&meta.name.0.as_binding().expect("external let binding").0)
-				.and_then(|def| self.sigs.lets.get(&def).copied())
+				.and_then(|def| self.sigs.lets.get(&def).map(|sig| sig.ty))
 				.and_then(|ty| match self.interner.kind(ty) {
 					nymph_hir::ty::TyKind::Int => Some(nymph_hir::hir::MarshalKind::Int),
 					nymph_hir::ty::TyKind::UInt => Some(nymph_hir::hir::MarshalKind::UInt),
@@ -479,6 +547,7 @@ impl<'m> Checker<'m> {
 			interfaces: FxHashMap::default(),
 			impls: crate::iface::ImplRegistry::default(),
 			inherent: crate::members::InherentRegistry::default(),
+			inherent_body_jobs: Vec::new(),
 			table: UnifyTable::new(),
 			diags,
 			external_value_marshals: FxHashMap::default(),
@@ -488,7 +557,8 @@ impl<'m> Checker<'m> {
 			param_bound_details: FxHashMap::default(),
 			self_ty: None,
 			ret_ty: None,
-			alias_depth: 0,
+			alias_states: FxHashMap::default(),
+			collecting_signatures: false,
 			synthetic_params: 0,
 			synthetic_bounds: FxHashMap::default(),
 			synthetic_bound_details: FxHashMap::default(),
@@ -616,7 +686,7 @@ impl<'m> Checker<'m> {
 		let TyKind::Adt(def, _) = self.interner.kind(ty).clone() else {
 			return None;
 		};
-		if !matches!(self.defs.data(def).kind, crate::def::DefKind::Enum { .. }) {
+		if !matches!(self.defs.data(def).kind, crate::def::DefKind::Enum) {
 			return None;
 		}
 		let idx = self
@@ -938,5 +1008,395 @@ impl<'m> Checker<'m> {
 			}
 			TyKind::Mut(inner) => format!("mut {}", self.display_resolved(*inner)),
 		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AliasLowerState {
+	Lowering,
+	Lowered,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{
+		DeclarationCategory, DeclarationKey, DefinitionId, ModuleIdentity, ModuleOrigin,
+		def::{AliasSig, DefKind, FuncSig, NamespaceMemberSig, NamespaceSig},
+		iface::{IfaceMethod, ImplDef, InterfaceDef},
+		members::{InherentImpl, InherentMethod},
+	};
+	use nymph_syntax::parse_module;
+
+	#[test]
+	fn imported_definitions_are_not_treated_as_local_ast_jobs() {
+		let module = Module {
+			members: Vec::new(),
+			path: "consumer.nymph".into(),
+		};
+		let dependency = ModuleIdentity {
+			origin: ModuleOrigin::Project("test".into()),
+			project: "test".into(),
+			path: "dependency.nymph".into(),
+		};
+		let mut defs = DefMap::default();
+		for (name, category, kind) in [
+			("function", DeclarationCategory::Function, DefKind::Func),
+			("Record", DeclarationCategory::Struct, DefKind::Struct),
+			("Choice", DeclarationCategory::Enum, DefKind::Enum),
+			("Alias", DeclarationCategory::TypeAlias, DefKind::TypeAlias),
+			("Api", DeclarationCategory::Interface, DefKind::Interface),
+		] {
+			let stable = DefinitionId::new(
+				dependency.clone(),
+				DeclarationKey::top_level(category, name),
+			);
+			let id = defs.define_imported(name.into(), kind, dependency.clone(), Some(stable.clone()));
+			assert!(!defs.is_local(id));
+			assert_eq!(defs.stable(id), Some(&stable));
+			assert_eq!(defs.by_stable(&stable), Some(id));
+		}
+
+		let mut checker = Checker::new(&module, defs, Vec::new());
+		checker.lower_signatures();
+		checker.collect_interfaces();
+		checker.collect_inherent();
+		checker.collect_inner_impls();
+		checker.check_bodies();
+
+		assert!(checker.sigs.funcs.is_empty());
+		assert!(checker.sigs.structs.is_empty());
+		assert!(checker.sigs.enums.is_empty());
+		assert!(checker.interfaces.is_empty());
+		assert!(checker.diags.is_empty());
+	}
+
+	#[test]
+	fn seeded_owned_inherent_methods_resolve_without_local_body_jobs() {
+		let module = Module {
+			members: Vec::new(),
+			path: "consumer.nymph".into(),
+		};
+		let dependency = ModuleIdentity {
+			origin: ModuleOrigin::Project("test".into()),
+			project: "test".into(),
+			path: "dependency.nymph".into(),
+		};
+		let mut defs = DefMap::default();
+		let record = defs.define_imported("Record".into(), DefKind::Struct, dependency, None);
+		let mut checker = Checker::new(&module, defs, Vec::new());
+		let self_ty = checker.interner.mk_adt(record, crate::GenericArgs::none());
+		let int = checker.interner.int();
+		let mut methods = FxHashMap::default();
+		methods.insert(
+			"get".into(),
+			InherentMethod {
+				definition: None,
+				local_span: None,
+				generic_names: Vec::new(),
+				params: Vec::new(),
+				ret: int,
+				bounds: Vec::new(),
+				namespaced: false,
+				mutating: false,
+				external: false,
+			},
+		);
+		methods.insert(
+			"make".into(),
+			InherentMethod {
+				definition: None,
+				local_span: None,
+				generic_names: Vec::new(),
+				params: Vec::new(),
+				ret: self_ty,
+				bounds: Vec::new(),
+				namespaced: true,
+				mutating: false,
+				external: false,
+			},
+		);
+		checker.inherent.add(
+			crate::iface::head_of(&checker.interner, self_ty),
+			InherentImpl {
+				definition: None,
+				owner_generic_names: Vec::new(),
+				self_ty,
+				methods,
+				constraints: Vec::new(),
+				imported: true,
+			},
+		);
+
+		let span = Span::new(0, 0);
+		let (_, resolved, _, _, defining_span) = checker
+			.resolve_inherent(self_ty, "get", &[], &[], span)
+			.expect("imported instance method should resolve");
+		assert_eq!(resolved, int);
+		assert_eq!(defining_span, None);
+		assert_eq!(
+			checker.resolve_namespaced(record, "make", &[], &[], span),
+			Some(self_ty)
+		);
+		checker.generalize_returns();
+		checker.check_member_bodies();
+		assert!(checker.inherent_body_jobs.is_empty());
+		assert!(checker.diags.is_empty());
+	}
+
+	#[test]
+	fn seeded_method_facts_propagate_stable_resolution_provenance() {
+		let module = Module {
+			members: Vec::new(),
+			path: "consumer.nym".into(),
+		};
+		let dependency = ModuleIdentity {
+			origin: ModuleOrigin::Project("test".into()),
+			project: "test".into(),
+			path: "dependency.nym".into(),
+		};
+		let stable = |category, name| {
+			DefinitionId::new(
+				dependency.clone(),
+				DeclarationKey::top_level(category, name),
+			)
+		};
+		let inherent_impl = stable(DeclarationCategory::Implementation, "inherent impl");
+		let inherent_method = DefinitionId::new(
+			dependency.clone(),
+			DeclarationKey::member(
+				inherent_impl.clone(),
+				DeclarationCategory::Method,
+				"inherent",
+			),
+		);
+		let direct_interface_id = stable(DeclarationCategory::Interface, "Direct");
+		let default_interface_id = stable(DeclarationCategory::Interface, "Default");
+		let direct_impl = stable(DeclarationCategory::Implementation, "direct impl");
+		let default_impl = stable(DeclarationCategory::Implementation, "default impl");
+		let direct_member = DefinitionId::new(
+			dependency.clone(),
+			DeclarationKey::member(direct_impl.clone(), DeclarationCategory::Method, "direct"),
+		);
+		let default_member = DefinitionId::new(
+			dependency.clone(),
+			DeclarationKey::member(
+				default_interface_id.clone(),
+				DeclarationCategory::Method,
+				"defaulted",
+			),
+		);
+
+		let mut defs = DefMap::default();
+		let record = defs.define_imported("Record".into(), DefKind::Struct, dependency.clone(), None);
+		let direct_iface = defs.define_imported(
+			"Direct".into(),
+			DefKind::Interface,
+			dependency.clone(),
+			Some(direct_interface_id),
+		);
+		let default_iface = defs.define_imported(
+			"Default".into(),
+			DefKind::Interface,
+			dependency,
+			Some(default_interface_id),
+		);
+		let mut checker = Checker::new(&module, defs, Vec::new());
+		let self_ty = checker.interner.mk_adt(record, crate::GenericArgs::none());
+		let int = checker.interner.int();
+		let signature = |definition, has_default| IfaceMethod {
+			definition: Some(definition),
+			has_default,
+			params: Vec::new(),
+			ret: int,
+			generics: Vec::new(),
+			bounds: Vec::new(),
+			mutating: false,
+		};
+		checker.interfaces.insert(
+			direct_iface,
+			InterfaceDef {
+				generics: Vec::new(),
+				methods: FxHashMap::from_iter([("direct".into(), signature(direct_member.clone(), false))]),
+			},
+		);
+		checker.interfaces.insert(
+			default_iface,
+			InterfaceDef {
+				generics: Vec::new(),
+				methods: FxHashMap::from_iter([(
+					"defaulted".into(),
+					signature(default_member.clone(), true),
+				)]),
+			},
+		);
+		for (definition, interface, method) in [
+			(
+				direct_impl.clone(),
+				direct_iface,
+				Some(("direct".into(), signature(direct_member.clone(), false))),
+			),
+			(default_impl.clone(), default_iface, None),
+		] {
+			checker.impls.add(
+				&checker.interner,
+				ImplDef {
+					definition: Some(definition),
+					generics: Vec::new(),
+					self_ty,
+					interface,
+					legacy_span: None,
+					args: Vec::new(),
+					methods: method.into_iter().collect(),
+					constraints: Vec::new(),
+					blanket: false,
+				},
+			);
+		}
+		let mut methods = FxHashMap::default();
+		methods.insert(
+			"inherent".into(),
+			InherentMethod {
+				definition: Some(inherent_method.clone()),
+				local_span: None,
+				generic_names: Vec::new(),
+				params: Vec::new(),
+				ret: int,
+				bounds: Vec::new(),
+				namespaced: false,
+				mutating: false,
+				external: false,
+			},
+		);
+		checker.inherent.add(
+			crate::iface::head_of(&checker.interner, self_ty),
+			InherentImpl {
+				definition: Some(inherent_impl.clone()),
+				owner_generic_names: Vec::new(),
+				self_ty,
+				methods,
+				constraints: Vec::new(),
+				imported: true,
+			},
+		);
+
+		let span = Span::new(0, 0);
+		let inherent = checker
+			.resolve_method(self_ty, "inherent", &[], &[], span)
+			.unwrap();
+		assert_eq!(
+			(inherent.target, inherent.implementation),
+			(Some(inherent_method), Some(inherent_impl))
+		);
+		let direct = checker
+			.resolve_method(self_ty, "direct", &[], &[], span)
+			.unwrap();
+		assert_eq!(
+			(direct.target, direct.implementation),
+			(Some(direct_member), Some(direct_impl))
+		);
+		let defaulted = checker
+			.resolve_method(self_ty, "defaulted", &[], &[], span)
+			.unwrap();
+		assert_eq!(
+			(defaulted.target, defaulted.implementation),
+			(Some(default_member.clone()), Some(default_impl))
+		);
+
+		checker
+			.param_bounds
+			.insert(ParamIdx(0), vec![default_iface]);
+		let param = checker.interner.mk_param(ParamIdx(0));
+		let bounded = checker
+			.resolve_method(param, "defaulted", &[], &[], span)
+			.unwrap();
+		assert_eq!(
+			(bounded.target, bounded.implementation),
+			(Some(default_member), None)
+		);
+	}
+
+	#[test]
+	fn seeded_generic_alias_is_usable_without_its_declaration_ast() {
+		let module = parse_module(
+			"func identity(value: Remote<int>): int = value",
+			"consumer.nym",
+		)
+		.tree;
+		let dependency = ModuleIdentity {
+			origin: ModuleOrigin::Project("test".into()),
+			project: "test".into(),
+			path: "dependency.nym".into(),
+		};
+		let mut diagnostics = Vec::new();
+		let mut defs = build_def_map(&module, &mut diagnostics);
+		let alias = defs.define_imported("Remote".into(), DefKind::TypeAlias, dependency, None);
+		let mut checker = Checker::new(&module, defs, diagnostics);
+		let parameter = checker.interner.mk_param(ParamIdx(0));
+		checker.sigs.aliases.insert(
+			alias,
+			AliasSig {
+				generics: vec!["T".into()],
+				target: parameter,
+				bounds: Vec::new(),
+			},
+		);
+
+		checker.lower_signatures();
+		checker.check_bodies();
+
+		assert!(checker.diags.is_empty(), "{:?}", checker.diags);
+	}
+
+	#[test]
+	fn seeded_namespace_function_and_value_are_usable_without_declaration_ast() {
+		let module = parse_module(
+			"func call(): int = Remote.answer()\nfunc read(): int = Remote.value",
+			"consumer.nym",
+		)
+		.tree;
+		let dependency = ModuleIdentity {
+			origin: ModuleOrigin::Project("test".into()),
+			project: "test".into(),
+			path: "dependency.nym".into(),
+		};
+		let mut diagnostics = Vec::new();
+		let mut defs = build_def_map(&module, &mut diagnostics);
+		let namespace = defs.define_imported("Remote".into(), DefKind::Namespace, dependency, None);
+		let mut checker = Checker::new(&module, defs, diagnostics);
+		let int = checker.interner.int();
+		checker.sigs.namespaces.insert(
+			namespace,
+			NamespaceSig {
+				members: FxHashMap::from_iter([
+					(
+						"answer".into(),
+						NamespaceMemberSig::Func {
+							target: None,
+							sig: FuncSig {
+								generics: Vec::new(),
+								params: Vec::new(),
+								ret: int,
+								has_self: false,
+								bounds: Vec::new(),
+							},
+						},
+					),
+					(
+						"value".into(),
+						NamespaceMemberSig::Value {
+							target: None,
+							ty: int,
+							mutable: false,
+						},
+					),
+				]),
+			},
+		);
+
+		checker.lower_signatures();
+		checker.check_bodies();
+
+		assert!(checker.diags.is_empty(), "{:?}", checker.diags);
 	}
 }

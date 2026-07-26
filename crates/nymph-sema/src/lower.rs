@@ -10,13 +10,16 @@ use crate::errors::TypeError;
 use ecow::EcoString;
 use nymph_ast::{
 	Span, Spanned,
-	decl::Declaration,
+	decl::{Declaration, ImplMember},
 	ty::{GenericArg, GenericParam, Type},
 };
 use rustc_hash::FxHashMap;
 
-use crate::check::Checker;
-use crate::def::{DefKind, EnumSig, FuncParamSig, FuncSig, StructSig, VariantSig};
+use crate::check::{AliasLowerState, Checker};
+use crate::def::{
+	AliasSig, DefKind, EnumSig, FuncParamSig, FuncSig, NamespaceMemberSig, NamespaceSig, StructSig,
+	ValueSig, VariantSig,
+};
 use crate::ids::{DefId, ParamIdx};
 use crate::ty::{GenericArgs, Ty};
 
@@ -39,18 +42,25 @@ fn generic_names(generics: &[Spanned<GenericParam>]) -> Vec<EcoString> {
 impl Checker<'_> {
 	/// Lower every top-level definition's signature into semantic types.
 	pub(crate) fn lower_signatures(&mut self) {
+		self.collecting_signatures = true;
 		let module = self.module;
-		let defs: Vec<(DefId, DefKind)> = self
+		let defs: Vec<(DefId, DefKind, usize)> = self
 			.defs
 			.defs
 			.iter()
 			.enumerate()
-			.map(|(i, d)| (DefId(i as u32), d.kind))
+			.filter_map(|(i, d)| {
+				let id = DefId(i as u32);
+				self
+					.defs
+					.local_member(id)
+					.map(|member| (id, d.kind, member))
+			})
 			.collect();
 
-		for (id, kind) in defs {
+		for (id, kind, member) in defs {
 			match kind {
-				DefKind::Struct { member } => {
+				DefKind::Struct => {
 					let Declaration::Struct {
 						generics, fields, ..
 					} = &module.members[member]
@@ -64,6 +74,24 @@ impl Checker<'_> {
 						.iter()
 						.map(|f| (f.0.name.0.clone(), self.lower_type(&f.0.type_)))
 						.collect();
+					let owner = self.defs.stable(id).cloned();
+					let field_metadata = fields
+						.iter()
+						.map(|(name, _)| crate::def::FieldSigMetadata {
+							target: owner.clone().map(|owner| {
+								crate::DefinitionId::new(
+									owner.module.clone(),
+									crate::DeclarationKey::member(
+										owner,
+										crate::DeclarationCategory::Field,
+										name.clone(),
+									),
+								)
+							}),
+							mutable: false,
+							has_default: false,
+						})
+						.collect();
 					// Lower the struct's own generics' bounds while their param scope is
 					// still active (Slice 4G-b), so `Bound::ty`/`args` land in the same
 					// `Param` index space as `fields` above.
@@ -74,11 +102,12 @@ impl Checker<'_> {
 						StructSig {
 							generics: names,
 							fields,
+							field_metadata,
 							bounds,
 						},
 					);
 				}
-				DefKind::Enum { member } => {
+				DefKind::Enum => {
 					let Declaration::Enum {
 						generics, variants, ..
 					} = &module.members[member]
@@ -90,14 +119,46 @@ impl Checker<'_> {
 					self.push_params(scope);
 					let variants: Vec<VariantSig> = variants
 						.iter()
-						.map(|v| VariantSig {
-							name: v.0.name.0.clone(),
-							fields: v
+						.enumerate()
+						.map(|(variant_index, v)| {
+							let target = self.defs.defs.iter().find_map(|data| match data.kind {
+								DefKind::Variant { enum_def, variant }
+									if enum_def == id && variant == variant_index =>
+								{
+									data.stable.clone()
+								}
+								_ => None,
+							});
+							let field_metadata = v
 								.0
 								.fields
 								.iter()
-								.map(|f| (f.0.name.0.clone(), self.lower_type(&f.0.type_)))
-								.collect(),
+								.map(|field| crate::def::FieldSigMetadata {
+									target: target.clone().map(|owner| {
+										crate::DefinitionId::new(
+											owner.module.clone(),
+											crate::DeclarationKey::member(
+												owner,
+												crate::DeclarationCategory::Field,
+												field.0.name.0.clone(),
+											),
+										)
+									}),
+									mutable: false,
+									has_default: false,
+								})
+								.collect();
+							VariantSig {
+								target,
+								name: v.0.name.0.clone(),
+								fields: v
+									.0
+									.fields
+									.iter()
+									.map(|f| (f.0.name.0.clone(), self.lower_type(&f.0.type_)))
+									.collect(),
+								field_metadata,
+							}
 						})
 						.collect();
 					// Lower the enum's own generics' bounds while their param scope is
@@ -113,7 +174,7 @@ impl Checker<'_> {
 						},
 					);
 				}
-				DefKind::Func { member } => {
+				DefKind::Func => {
 					let meta = match &module.members[member] {
 						Declaration::Func { meta, .. } => meta,
 						Declaration::ExternalFunc(_, _, meta) => meta,
@@ -152,7 +213,7 @@ impl Checker<'_> {
 						},
 					);
 				}
-				DefKind::Let { member } => {
+				DefKind::Let => {
 					let meta = match &module.members[member] {
 						Declaration::Let { meta, .. } => meta,
 						Declaration::ExternalLet(_, _, meta) => meta,
@@ -162,17 +223,23 @@ impl Checker<'_> {
 						Some(ty) => self.lower_type(ty),
 						None => self.fresh(),
 					};
-					self.sigs.lets.insert(id, ty);
+					self.sigs.lets.insert(
+						id,
+						ValueSig {
+							generics: vec![],
+							ty,
+							bounds: vec![],
+						},
+					);
 				}
-				// Type aliases are expanded on demand from the AST (see `expand_alias`),
-				// so they need no pre-lowered signature. Variants are lowered with
-				// their enum; namespaces are Milestone B.
-				DefKind::TypeAlias { .. }
-				| DefKind::Variant { .. }
-				| DefKind::Namespace { .. }
-				| DefKind::Interface { .. } => {}
+				DefKind::TypeAlias => {
+					self.lower_alias_signature(id, member, self.defs.data(id).span);
+				}
+				DefKind::Namespace => self.lower_namespace_signature(id, member),
+				DefKind::Variant { .. } | DefKind::Interface => {}
 			}
 		}
+		self.collecting_signatures = false;
 	}
 
 	/// Lower a surface type annotation to a semantic type under the active scopes.
@@ -263,17 +330,25 @@ impl Checker<'_> {
 		};
 
 		match self.defs.data(def).kind {
-			DefKind::Struct { .. } | DefKind::Enum { .. } => {
+			DefKind::Struct | DefKind::Enum => {
 				let args = GenericArgs::new(positional, named);
 				self.interner.mk_adt(def, args)
 			}
-			DefKind::TypeAlias { member } => self.expand_alias(def, member, positional, named, span),
+			DefKind::TypeAlias => {
+				if !self.sigs.aliases.contains_key(&def)
+					&& self.collecting_signatures
+					&& let Some(member) = self.defs.local_member(def)
+				{
+					self.lower_alias_signature(def, member, span);
+				}
+				self.expand_alias(def, positional, named, span)
+			}
 			// `impl Interface` in type position desugars to a fresh anonymous generic
 			// parameter bounded by the interface (like Rust's `impl Trait`). The interface
 			// arguments were lowered above to validate them; the parameter itself stands in
 			// for "some type implementing it", and its bound is recorded so method calls on
 			// it resolve through the interface.
-			DefKind::Interface { .. } => self.mint_synthetic_param(def, positional, named),
+			DefKind::Interface => self.mint_synthetic_param(def, positional, named),
 			_ => {
 				self.emit(
 					span,
@@ -337,23 +412,111 @@ impl Checker<'_> {
 		ty
 	}
 
-	fn expand_alias(
-		&mut self,
-		_def: DefId,
-		member: usize,
-		positional: Vec<Ty>,
-		named: Vec<(EcoString, Ty)>,
-		span: Span,
-	) -> Ty {
-		if self.alias_depth > 64 {
-			self.emit(span, TypeError::RecursiveTypeAlias);
-			return self.interner.error();
+	fn lower_alias_signature(&mut self, def: DefId, member: usize, use_span: Span) {
+		match self.alias_states.get(&def) {
+			Some(AliasLowerState::Lowered) => return,
+			Some(AliasLowerState::Lowering) => {
+				self.emit(use_span, TypeError::RecursiveTypeAlias);
+				return;
+			}
+			None => {}
 		}
+		self.alias_states.insert(def, AliasLowerState::Lowering);
 		let module = self.module;
 		let Declaration::TypeAlias { meta, value, .. } = &module.members[member] else {
+			return;
+		};
+		let scope = build_param_scope(&meta.generics);
+		let generics = generic_names(&meta.generics);
+		self.push_params(scope);
+		let target = self.lower_type(value);
+		let bounds = self.lower_constraints(&meta.generics, 0);
+		self.pop_params();
+		self.sigs.aliases.insert(
+			def,
+			AliasSig {
+				generics,
+				target,
+				bounds,
+			},
+		);
+		self.alias_states.insert(def, AliasLowerState::Lowered);
+	}
+
+	fn lower_namespace_signature(&mut self, def: DefId, member: usize) {
+		let module = self.module;
+		let Declaration::Namespace { members, .. } = &module.members[member] else {
+			return;
+		};
+		let mut owned = NamespaceSig::default();
+		for member in members {
+			match &member.0 {
+				ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => {
+					let scope = build_param_scope(&meta.generics);
+					let generics = generic_names(&meta.generics);
+					self.push_params(scope);
+					let params = meta
+						.params
+						.iter()
+						.map(|param| FuncParamSig {
+							label: param.0.name.0.as_binding().map(|name| name.0.clone()),
+							ty: self.lower_type(&param.0.type_),
+							spread: param.0.spread,
+						})
+						.collect();
+					let ret = match &meta.return_type {
+						Some(ty) => self.lower_type(ty),
+						None => self.fresh(),
+					};
+					let bounds = self.lower_constraints(&meta.generics, 0);
+					self.pop_params();
+					owned.members.insert(
+						meta.name.0.clone(),
+						NamespaceMemberSig::Func {
+							target: None,
+							sig: FuncSig {
+								generics,
+								params,
+								ret,
+								has_self: false,
+								bounds,
+							},
+						},
+					);
+				}
+				ImplMember::Let { meta, .. } | ImplMember::ExternalLet(_, _, meta) => {
+					let Some(name) = meta.name.0.as_binding() else {
+						continue;
+					};
+					let ty = match &meta.type_ {
+						Some(ty) => self.lower_type(ty),
+						None => self.fresh(),
+					};
+					owned.members.insert(
+						name.0.clone(),
+						NamespaceMemberSig::Value {
+							target: None,
+							ty,
+							mutable: meta.is_mutable(),
+						},
+					);
+				}
+			}
+		}
+		self.sigs.namespaces.insert(def, owned);
+	}
+
+	fn expand_alias(
+		&mut self,
+		def: DefId,
+		positional: Vec<Ty>,
+		named: Vec<(EcoString, Ty)>,
+		_span: Span,
+	) -> Ty {
+		let Some(sig) = self.sigs.aliases.get(&def).cloned() else {
 			return self.interner.error();
 		};
-		let arity = meta.generics.len();
+		let arity = sig.generics.len();
 		let mut subst: FxHashMap<ParamIdx, Ty> = FxHashMap::default();
 		for (i, ty) in positional.iter().enumerate() {
 			if i < arity {
@@ -361,7 +524,7 @@ impl Checker<'_> {
 			}
 		}
 		for (label, ty) in &named {
-			if let Some(i) = meta.generics.iter().position(|g| &g.0.name.0 == label) {
+			if let Some(i) = sig.generics.iter().position(|name| name == label) {
 				subst.insert(ParamIdx(i as u32), *ty);
 			}
 		}
@@ -370,14 +533,6 @@ impl Checker<'_> {
 				.entry(ParamIdx(i as u32))
 				.or_insert_with(|| self.fresh());
 		}
-
-		let scope = build_param_scope(&meta.generics);
-		self.push_params(scope);
-		self.alias_depth += 1;
-		let target = self.lower_type(value);
-		self.alias_depth -= 1;
-		self.pop_params();
-
-		self.subst(target, &subst, None)
+		self.subst(sig.target, &subst, None)
 	}
 }

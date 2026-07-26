@@ -7,8 +7,10 @@ use ecow::EcoString;
 use nymph_ast::{NodeId, Span};
 use nymph_diagnostics::Diagnostic;
 use rustc_hash::FxHashMap;
+use std::ops::Deref;
 
 use crate::Ty;
+use crate::identity::DefinitionId;
 use crate::ty::Interner;
 use nymph_hir::hir::MarshalKind;
 
@@ -22,6 +24,10 @@ pub struct CheckedSemantic {
 	pub(crate) implementations: crate::iface::ImplRegistry,
 	pub(crate) inherent: Vec<CheckedInherentImpl>,
 	pub(crate) anonymous_bounds: FxHashMap<crate::ParamIdx, Vec<crate::iface::Bound>>,
+	pub local_definitions: std::ops::Range<usize>,
+	pub local_implementations: std::ops::Range<usize>,
+	pub local_inherent: std::ops::Range<usize>,
+	pub(crate) has_explicit_local_ranges: bool,
 }
 
 /// Owned, AST-independent facts for one checked inherent implementation.
@@ -58,6 +64,10 @@ impl CheckedSemantic {
 	pub fn inherent_implementation_count(&self) -> usize {
 		self.inherent.len()
 	}
+	#[must_use]
+	pub fn stable_definition(&self, id: crate::DefId) -> Option<&DefinitionId> {
+		self.definitions.stable(id)
+	}
 }
 
 /// How a resolved binary operator must be emitted by codegen.
@@ -87,6 +97,10 @@ pub struct Resolution {
 	/// to build a `Call { callee: Field { .. }, .. }`.
 	pub method: EcoString,
 	pub dispatch: DispatchKind,
+	/// Stable semantic identity of the selected method declaration/member.
+	pub target: Option<DefinitionId>,
+	/// Stable semantic identity of the selected concrete impl, when known.
+	pub implementation: Option<DefinitionId>,
 	/// The defining span of whatever provided `method` — an impl's own `impl
 	/// Interface … for …`/nested `impl Interface { .. }` header (the `Ident`
 	/// naming the interface, `solve::ImplDef::span`), or an interface's own
@@ -116,6 +130,10 @@ pub struct ExprInfo {
 pub struct VariantResolution {
 	pub enum_name: ecow::EcoString,
 	pub variant: ecow::EcoString,
+	/// Stable identity of the enum declaration, independent of checker allocation.
+	pub enum_target: Option<DefinitionId>,
+	/// Stable identity of the selected variant declaration.
+	pub variant_target: Option<DefinitionId>,
 }
 
 /// How a `for` loop's source was proven iterable, once the syntactic-range and
@@ -138,6 +156,7 @@ pub enum IterMode {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Annotations {
 	infos: FxHashMap<NodeId, ExprInfo>,
+	definition_targets: FxHashMap<NodeId, DefinitionId>,
 	variants: FxHashMap<NodeId, VariantResolution>,
 	/// Variant *patterns*, keyed by span — patterns carry no `NodeId`, but each
 	/// written pattern has a unique source span.
@@ -163,6 +182,55 @@ pub struct Annotations {
 }
 
 impl Annotations {
+	/// Iterate expression annotations in stable source-node order.
+	///
+	/// This is primarily useful to consumers which need to compare semantic
+	/// results produced by independent checker allocations. The returned type
+	/// handles must still be interpreted with the [`CheckedFacts::interner`]
+	/// that owns this annotation set.
+	pub fn infos(&self) -> impl Iterator<Item = (NodeId, &ExprInfo)> {
+		let mut entries = self
+			.infos
+			.iter()
+			.map(|(id, info)| (*id, info))
+			.collect::<Vec<_>>();
+		entries.sort_unstable_by_key(|(id, _)| *id);
+		entries.into_iter()
+	}
+
+	/// Iterate stable declaration targets in source-node order.
+	pub fn definition_targets(&self) -> impl Iterator<Item = (NodeId, &DefinitionId)> {
+		let mut entries = self
+			.definition_targets
+			.iter()
+			.map(|(id, target)| (*id, target))
+			.collect::<Vec<_>>();
+		entries.sort_unstable_by_key(|(id, _)| *id);
+		entries.into_iter()
+	}
+
+	/// Iterate variant-expression resolutions in source-node order.
+	pub fn variants(&self) -> impl Iterator<Item = (NodeId, &VariantResolution)> {
+		let mut entries = self
+			.variants
+			.iter()
+			.map(|(id, item)| (*id, item))
+			.collect::<Vec<_>>();
+		entries.sort_unstable_by_key(|(id, _)| *id);
+		entries.into_iter()
+	}
+
+	/// Iterate variant-pattern resolutions in source-span order.
+	pub fn pattern_variants(&self) -> impl Iterator<Item = (Span, &VariantResolution)> {
+		let mut entries = self
+			.pattern_variants
+			.iter()
+			.map(|(span, item)| (*span, item))
+			.collect::<Vec<_>>();
+		entries.sort_unstable_by_key(|(span, _)| (span.start, span.end));
+		entries.into_iter()
+	}
+
 	pub fn get(&self, id: NodeId) -> Option<ExprInfo> {
 		self.infos.get(&id).cloned()
 	}
@@ -187,6 +255,20 @@ impl Annotations {
 		for info in self.infos.values_mut() {
 			info.ty = map(info.ty);
 		}
+	}
+
+	/// Record the stable declaration referenced by a source node.
+	pub(crate) fn record_definition_target(&mut self, id: NodeId, target: Option<&DefinitionId>) {
+		if id != NodeId::DUMMY
+			&& let Some(target) = target
+		{
+			self.definition_targets.insert(id, target.clone());
+		}
+	}
+
+	/// The stable declaration referenced by `id`, if this node denotes one.
+	pub fn definition_target_of(&self, id: NodeId) -> Option<&DefinitionId> {
+		self.definition_targets.get(&id)
 	}
 
 	/// Record which `(enum, variant)` a variant construction/reference resolved to.
@@ -304,11 +386,9 @@ impl Annotations {
 	}
 }
 
-/// The full result of checking: diagnostics plus the annotation side-table. When
-/// `diags` contains errors, `annotations` may be incomplete and lowering is skipped.
-#[derive(Debug)]
-pub struct Checked {
-	pub diags: Vec<Diagnostic>,
+/// Diagnostic-free facts produced by checking and consumed by extraction/lowering.
+#[derive(Clone, Debug)]
+pub struct CheckedFacts {
 	pub annotations: Annotations,
 	/// Resolved host marshalling ABI for each checked external-let declaration,
 	/// keyed by its binding span for consumption during HIR lowering.
@@ -319,4 +399,19 @@ pub struct Checked {
 	/// Owned declaration-level facts. This is an immutable extraction boundary;
 	/// the stateful checker itself never escapes checking.
 	pub semantic: CheckedSemantic,
+}
+
+/// Legacy checker result. Fact field access remains compatible through dereferencing.
+#[derive(Clone, Debug)]
+pub struct Checked {
+	pub diags: Vec<Diagnostic>,
+	pub facts: CheckedFacts,
+}
+
+impl Deref for Checked {
+	type Target = CheckedFacts;
+
+	fn deref(&self) -> &Self::Target {
+		&self.facts
+	}
 }

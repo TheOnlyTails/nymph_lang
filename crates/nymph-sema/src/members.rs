@@ -21,14 +21,19 @@ use rustc_hash::FxHashMap;
 
 use crate::check::Checker;
 use crate::def::DefKind;
+use crate::identity::DefinitionId;
 use crate::ids::{DefId, ParamIdx};
 use crate::iface::{Bound, Head, head_of};
 use crate::lower::build_param_scope;
 use crate::ty::{GenericArgs, Ty};
 
-/// One inherent method's signature plus the AST needed to check its body.
-pub struct InherentMethod<'m> {
-	pub own_generics: usize,
+/// Owned semantic facts for one inherent method. Local syntax is kept separately in
+/// [`InherentBodyJob`], so imported methods cannot accidentally become body jobs.
+#[derive(Debug, Clone)]
+pub struct InherentMethod {
+	pub definition: Option<DefinitionId>,
+	pub local_span: Option<nymph_ast::Span>,
+	pub generic_names: Vec<EcoString>,
 	pub params: Vec<Ty>,
 	pub ret: Ty,
 	/// The interface bounds declared on this method's own generics (Slice 4G-b),
@@ -38,36 +43,46 @@ pub struct InherentMethod<'m> {
 	/// subst covers), so a call site can substitute them exactly like `params`/`ret`.
 	pub bounds: Vec<Bound>,
 	pub namespaced: bool,
-	pub meta: &'m FuncDeclaration,
-	pub body: Option<&'m Expr>,
+	pub mutating: bool,
+	pub external: bool,
 }
 
 /// A set of inherent methods sharing a self type (a `struct`/`enum` body, or a
 /// top-level inherent `impl`).
-pub struct InherentImpl<'m> {
-	/// The owning type's generic parameters (for building the body's param scope).
-	pub owner_generics: &'m [Spanned<GenericParam>],
-	/// Number of owner generics; the self type's `Param`s are `0..generics_len`.
-	pub generics_len: usize,
+#[derive(Debug, Clone)]
+pub struct InherentImpl {
+	pub definition: Option<DefinitionId>,
+	pub owner_generic_names: Vec<EcoString>,
 	pub self_ty: Ty,
-	pub methods: FxHashMap<EcoString, InherentMethod<'m>>,
+	pub methods: FxHashMap<EcoString, InherentMethod>,
 	pub constraints: Vec<Bound>,
+	pub imported: bool,
+}
+
+/// Current-module syntax required to infer/generalise and check a local method body.
+pub(crate) struct InherentBodyJob<'m> {
+	pub implementation: usize,
+	pub method: EcoString,
+	pub owner_generics: &'m [Spanned<GenericParam>],
+	pub meta: &'m FuncDeclaration,
+	pub body: &'m Expr,
 }
 
 /// Inherent impls indexed by the self type's head constructor.
-#[derive(Default)]
-pub struct InherentRegistry<'m> {
-	pub impls: Vec<InherentImpl<'m>>,
+#[derive(Debug, Default, Clone)]
+pub struct InherentRegistry {
+	pub impls: Vec<InherentImpl>,
 	by_head: FxHashMap<Head, Vec<usize>>,
 }
 
-impl<'m> InherentRegistry<'m> {
-	fn add(&mut self, head: Option<Head>, def: InherentImpl<'m>) {
+impl InherentRegistry {
+	pub(crate) fn add(&mut self, head: Option<Head>, def: InherentImpl) -> usize {
 		let idx = self.impls.len();
 		if let Some(head) = head {
 			self.by_head.entry(head).or_default().push(idx);
 		}
 		self.impls.push(def);
+		idx
 	}
 
 	fn candidates(&self, head: Head) -> Vec<usize> {
@@ -97,7 +112,7 @@ impl<'m> InherentRegistry<'m> {
 				.methods
 				.get(name)
 				.filter(|m| !m.namespaced)
-				.map(|m| m.meta.name.1)
+				.and_then(|m| m.local_span)
 		})
 	}
 }
@@ -113,9 +128,11 @@ impl<'m> Checker<'m> {
 			.defs
 			.iter()
 			.enumerate()
-			.filter_map(|(i, d)| match d.kind {
-				DefKind::Struct { member } | DefKind::Enum { member } => Some((DefId(i as u32), member)),
-				_ => None,
+			.filter_map(|(i, d)| {
+				let id = DefId(i as u32);
+				matches!(d.kind, DefKind::Struct | DefKind::Enum)
+					.then(|| self.defs.local_member(id).map(|member| (id, member)))
+					.flatten()
 			})
 			.collect();
 		for (def, member) in adts {
@@ -156,6 +173,7 @@ impl<'m> Checker<'m> {
 		// Nested interface impls live in the separate `impls` field and are
 		// Milestone-B-later, so this inherent pass never sees them.
 		let mut methods = FxHashMap::default();
+		let mut body_jobs = Vec::new();
 		for m in members {
 			let namespaced = match &m.0 {
 				ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => {
@@ -163,21 +181,42 @@ impl<'m> Checker<'m> {
 				}
 				_ => false,
 			};
-			self.collect_impl_member(&m.0, generics_len, namespaced, self_ty, &mut methods);
+			self.collect_impl_member(
+				&m.0,
+				generics_len,
+				namespaced,
+				self_ty,
+				&mut methods,
+				&mut body_jobs,
+			);
 		}
 		self.pop_params();
 
 		let head = head_of(&self.interner, self_ty);
-		self.inherent.add(
+		let implementation = self.inherent.add(
 			head,
 			InherentImpl {
-				owner_generics: generics,
-				generics_len,
+				definition: self.defs.stable(def).cloned(),
+				owner_generic_names: generics.iter().map(|g| g.0.name.0.clone()).collect(),
 				self_ty,
 				methods,
 				constraints: Vec::new(),
+				imported: false,
 			},
 		);
+		self
+			.inherent_body_jobs
+			.extend(
+				body_jobs
+					.into_iter()
+					.map(|(method, meta, body)| InherentBodyJob {
+						implementation,
+						method,
+						owner_generics: generics,
+						meta,
+						body,
+					}),
+			);
 	}
 
 	fn collect_impl_inherent(&mut self, member: usize) {
@@ -195,6 +234,7 @@ impl<'m> Checker<'m> {
 		self.push_params(build_param_scope(generics));
 		let self_ty = self.lower_type(type_);
 		let mut methods = FxHashMap::default();
+		let mut body_jobs = Vec::new();
 		for m in members {
 			// Same kind-driven namespacing as a struct/enum body: a `namespace func`
 			// in an `impl Type { … }` block is a static. (Its lowering is a loud
@@ -205,7 +245,14 @@ impl<'m> Checker<'m> {
 				}
 				_ => false,
 			};
-			self.collect_impl_member(&m.0, generics_len, namespaced, self_ty, &mut methods);
+			self.collect_impl_member(
+				&m.0,
+				generics_len,
+				namespaced,
+				self_ty,
+				&mut methods,
+				&mut body_jobs,
+			);
 		}
 		let constraints = self.lower_constraints(generics, 0);
 		self.pop_params();
@@ -225,7 +272,10 @@ impl<'m> Checker<'m> {
 							methods
 								.get(name)
 								.filter(|new| new.namespaced || method.namespaced)
-								.map(|new| (new.meta.name.1, name.clone(), method.meta.name.1))
+								.and_then(|new| {
+									let span = new.local_span?;
+									Some((span, name.clone(), method.local_span.unwrap_or(span)))
+								})
 						})
 				})
 				.collect::<Vec<_>>();
@@ -242,16 +292,30 @@ impl<'m> Checker<'m> {
 				);
 			}
 		}
-		self.inherent.add(
+		let implementation = self.inherent.add(
 			head,
 			InherentImpl {
-				owner_generics: generics,
-				generics_len,
+				definition: None,
+				owner_generic_names: generics.iter().map(|g| g.0.name.0.clone()).collect(),
 				self_ty,
 				methods,
 				constraints,
+				imported: false,
 			},
 		);
+		self
+			.inherent_body_jobs
+			.extend(
+				body_jobs
+					.into_iter()
+					.map(|(method, meta, body)| InherentBodyJob {
+						implementation,
+						method,
+						owner_generics: generics,
+						meta,
+						body,
+					}),
+			);
 	}
 
 	fn collect_impl_member(
@@ -260,7 +324,8 @@ impl<'m> Checker<'m> {
 		base: usize,
 		namespaced: bool,
 		self_ty: Ty,
-		out: &mut FxHashMap<EcoString, InherentMethod<'m>>,
+		out: &mut FxHashMap<EcoString, InherentMethod>,
+		body_jobs: &mut Vec<(EcoString, &'m FuncDeclaration, &'m Expr)>,
 	) {
 		let (meta, body): (&'m FuncDeclaration, Option<&'m Expr>) = match member {
 			ImplMember::Func { meta, body, .. } => (meta, Some(body)),
@@ -286,11 +351,12 @@ impl<'m> Checker<'m> {
 					name: meta.name.0.clone(),
 					ty,
 					redefined_span: meta.name.1,
-					prev: prev.meta.name.1,
+					prev: prev
+						.local_span
+						.expect("only local methods share this collection map"),
 				},
 			);
 		}
-		let own_generics = meta.generics.len();
 		let mut scope = FxHashMap::default();
 		for (j, g) in meta.generics.iter().enumerate() {
 			scope.insert(g.0.name.0.clone(), ParamIdx((base + j) as u32));
@@ -313,15 +379,20 @@ impl<'m> Checker<'m> {
 		out.insert(
 			meta.name.0.clone(),
 			InherentMethod {
-				own_generics,
+				definition: None,
+				local_span: Some(meta.name.1),
+				generic_names: meta.generics.iter().map(|g| g.0.name.0.clone()).collect(),
 				params,
 				ret,
 				bounds,
 				namespaced,
-				meta,
-				body,
+				mutating: meta.kind == FuncKind::Mut,
+				external: body.is_none(),
 			},
 		);
+		if let Some(body) = body {
+			body_jobs.push((meta.name.0.clone(), meta, body));
+		}
 	}
 
 	// ── Resolution ───────────────────────────────────────────────────────────
@@ -342,7 +413,13 @@ impl<'m> Checker<'m> {
 		arg_tys: &[Ty],
 		arg_lits: &[bool],
 		span: nymph_ast::Span,
-	) -> Option<(Vec<Ty>, Ty, nymph_ast::Span)> {
+	) -> Option<(
+		Vec<Ty>,
+		Ty,
+		Option<DefinitionId>,
+		Option<DefinitionId>,
+		Option<nymph_ast::Span>,
+	)> {
 		// See `resolve_method`'s matching comment: peel `mut` before matching
 		// against any impl's (never-`mut`) `Self` type.
 		let recv = self.strip_mut(recv);
@@ -362,9 +439,12 @@ impl<'m> Checker<'m> {
 			let matched = self.inherent_receiver_matches(idx, recv);
 			self.table.rollback_to(snapshot);
 			if matched {
-				let method_span = self.inherent.impls[idx].methods[name].meta.name.1;
+				let implementation = self.inherent.impls[idx].definition.clone();
+				let method = &self.inherent.impls[idx].methods[name];
+				let target = method.definition.clone();
+				let method_span = method.local_span;
 				let (params, ret) = self.commit_inherent(idx, recv, name, arg_tys, arg_lits, span, false);
-				return Some((params, ret, method_span));
+				return Some((params, ret, target, implementation, method_span));
 			}
 		}
 		None
@@ -401,7 +481,7 @@ impl<'m> Checker<'m> {
 
 	fn inherent_receiver_matches(&mut self, idx: usize, recv: Ty) -> bool {
 		let def = &self.inherent.impls[idx];
-		let generics_len = def.generics_len;
+		let generics_len = def.owner_generic_names.len();
 		let self_ty = def.self_ty;
 		let constraints = def.constraints.clone();
 		let subst = self.fresh_subst(generics_len);
@@ -421,10 +501,10 @@ impl<'m> Checker<'m> {
 		namespaced: bool,
 	) -> (Vec<Ty>, Ty) {
 		let def = &self.inherent.impls[idx];
-		let generics_len = def.generics_len;
+		let generics_len = def.owner_generic_names.len();
 		let self_pattern = def.self_ty;
 		let method = def.methods.get(name).expect("checked by caller");
-		let own = method.own_generics;
+		let own = method.generic_names.len();
 		let params = method.params.clone();
 		let ret = method.ret;
 		let bounds = method.bounds.clone();
@@ -494,17 +574,10 @@ impl<'m> Checker<'m> {
 	pub(crate) fn generalize_returns(&mut self) {
 		for _ in 0..4 {
 			let targets: Vec<(usize, EcoString)> = self
-				.inherent
-				.impls
+				.inherent_body_jobs
 				.iter()
-				.enumerate()
-				.flat_map(|(i, imp)| {
-					imp
-						.methods
-						.iter()
-						.filter(|(_, m)| m.body.is_some() && m.meta.return_type.is_none())
-						.map(move |(n, _)| (i, n.clone()))
-				})
+				.filter(|job| job.meta.return_type.is_none())
+				.map(|job| (job.implementation, job.method.clone()))
 				.collect();
 
 			let mut changed = false;
@@ -529,14 +602,17 @@ impl<'m> Checker<'m> {
 	/// unification bindings and any diagnostics are discarded.
 	fn infer_inherent_return(&mut self, i: usize, name: &str) -> Option<Ty> {
 		let (owner_generics, self_ty, meta, body, params, namespaced) = {
+			let job = self
+				.inherent_body_jobs
+				.iter()
+				.find(|job| job.implementation == i && job.method == name)?;
 			let imp = &self.inherent.impls[i];
 			let method = imp.methods.get(name)?;
-			let body = method.body?;
 			(
-				imp.owner_generics,
+				job.owner_generics,
 				imp.self_ty,
-				method.meta,
-				body,
+				job.meta,
+				job.body,
 				method.params.clone(),
 				method.namespaced,
 			)
@@ -618,22 +694,23 @@ impl<'m> Checker<'m> {
 			ret: Ty,
 			namespaced: bool,
 		}
-		let mut jobs: Vec<Job<'m>> = Vec::new();
-		for imp in &self.inherent.impls {
-			for method in imp.methods.values() {
-				if let Some(body) = method.body {
-					jobs.push(Job {
-						owner_generics: imp.owner_generics,
-						self_ty: imp.self_ty,
-						meta: method.meta,
-						body,
-						params: method.params.clone(),
-						ret: method.ret,
-						namespaced: method.namespaced,
-					});
+		let jobs: Vec<Job<'m>> = self
+			.inherent_body_jobs
+			.iter()
+			.map(|body_job| {
+				let imp = &self.inherent.impls[body_job.implementation];
+				let method = &imp.methods[&body_job.method];
+				Job {
+					owner_generics: body_job.owner_generics,
+					self_ty: imp.self_ty,
+					meta: body_job.meta,
+					body: body_job.body,
+					params: method.params.clone(),
+					ret: method.ret,
+					namespaced: method.namespaced,
 				}
-			}
-		}
+			})
+			.collect();
 
 		for job in jobs {
 			self.check_method_body(
@@ -744,9 +821,11 @@ impl<'m> Checker<'m> {
 			.defs
 			.iter()
 			.enumerate()
-			.filter_map(|(i, d)| match d.kind {
-				DefKind::Struct { member } | DefKind::Enum { member } => Some((DefId(i as u32), member)),
-				_ => None,
+			.filter_map(|(i, d)| {
+				let id = DefId(i as u32);
+				matches!(d.kind, DefKind::Struct | DefKind::Enum)
+					.then(|| self.defs.local_member(id).map(|member| (id, member)))
+					.flatten()
 			})
 			.collect();
 		for (def, member) in adts {
@@ -842,9 +921,11 @@ impl<'m> Checker<'m> {
 			.defs
 			.iter()
 			.enumerate()
-			.filter_map(|(i, d)| match d.kind {
-				DefKind::Interface { member } => Some((DefId(i as u32), member)),
-				_ => None,
+			.filter_map(|(i, d)| {
+				let id = DefId(i as u32);
+				matches!(d.kind, DefKind::Interface)
+					.then(|| self.defs.local_member(id).map(|member| (id, member)))
+					.flatten()
 			})
 			.collect();
 		for (iface_id, member) in ifaces {

@@ -6,6 +6,33 @@ use nymph_sema::check_module;
 use nymph_syntax::parse_module;
 
 #[test]
+fn forward_generic_alias_substitutes_its_owned_target() {
+	let parsed = parse_module(
+		"func identity(value: Later<int>): int = value\ntype Later<T> = T",
+		"test",
+	);
+	let checked = check_module(&parsed.tree);
+	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+}
+
+#[test]
+fn recursive_alias_keeps_the_recursive_reference_span() {
+	let source = "type Loop = Loop\nfunc use(value: Loop): void = {}";
+	let parsed = parse_module(source, "test");
+	let checked = check_module(&parsed.tree);
+	let recursive = checked
+		.diags
+		.iter()
+		.find(|diagnostic| {
+			diagnostic
+				.message
+				.contains("type alias expands recursively")
+		})
+		.expect("expected recursive alias diagnostic");
+	assert_eq!(recursive.span.start, source.find("Loop\nfunc").unwrap());
+}
+
+#[test]
 fn external_let_linkage_errors_are_structured_diagnostics() {
 	for (source, message) in [
 		(

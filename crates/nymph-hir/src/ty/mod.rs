@@ -107,7 +107,7 @@ impl GenericArgs {
 
 /// Interns [`TyKind`]s into cheap [`Ty`] handles, de-duplicating structurally equal
 /// types. Common primitives are pre-interned so hot paths never hash.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Interner {
 	kinds: Vec<TyKind>,
 	dedup: FxHashMap<TyKind, Ty>,

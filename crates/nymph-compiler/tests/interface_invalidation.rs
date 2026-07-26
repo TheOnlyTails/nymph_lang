@@ -1,7 +1,10 @@
+#![cfg(feature = "test-support")]
+
 use std::sync::{Arc, Mutex};
 
 use nymph_compiler::project::{
-	BuiltinRuntimeOwnerShape, CompilerSession, ModulePath, ProjectId, SourceVersion,
+	BuiltinRuntimeOwnerShape, CompilerSession, ModulePath, ProjectId, SemanticPipeline,
+	SemanticQueryEvent, SourceVersion,
 };
 use nymph_sema::{
 	EntryMode, InterfaceType, ModuleEnvironment, RecoveredDefinitionReference, RecoveredInterfaceType,
@@ -17,6 +20,25 @@ fn event_session() -> (CompilerSession, Arc<Mutex<Vec<String>>>) {
 		),
 		events,
 	)
+}
+
+fn interface_event_session() -> (CompilerSession, Arc<Mutex<Vec<SemanticQueryEvent>>>) {
+	let events = Arc::new(Mutex::new(Vec::new()));
+	let sink = events.clone();
+	(
+		CompilerSession::with_detailed_event_callback_for_test(
+			SemanticPipeline::Interface,
+			move |event| sink.lock().unwrap().push(event),
+		),
+		events,
+	)
+}
+
+fn count(events: &[SemanticQueryEvent], query: &str, module: &str) -> usize {
+	events
+		.iter()
+		.filter(|event| event.query == query && event.module.as_deref() == Some(module))
+		.count()
 }
 
 #[test]
@@ -404,4 +426,189 @@ fn recovered_flattened_implementation_keeps_current_module_provenance_and_shape(
 		implementation.members[0].return_type,
 		RecoveredInterfaceType::Poison
 	));
+}
+
+fn install_chain(session: &mut CompilerSession, project: &ProjectId) {
+	for (module, source) in [
+		("leaf", "public func value(): int = 1"),
+		(
+			"middle",
+			"import @/leaf with (value)\npublic func forwarded(): int = value()",
+		),
+		(
+			"main",
+			"import @/middle with (forwarded)\nfunc main(): int = forwarded()",
+		),
+	] {
+		session.set_source(
+			project.clone(),
+			ModulePath::new(module).unwrap(),
+			source.into(),
+			SourceVersion(1),
+		);
+	}
+}
+
+#[test]
+fn private_leaf_body_edit_backdates_before_consumers_execute() {
+	let (mut session, events) = interface_event_session();
+	let project = ProjectId::new("interface-private");
+	install_chain(&mut session, &project);
+	let main = ModulePath::new("main").unwrap();
+	assert!(
+		session
+			.analyze_module(
+				project.clone(),
+				main.clone(),
+				main.clone(),
+				EntryMode::Entry
+			)
+			.is_some()
+	);
+	events.lock().unwrap().clear();
+	session.set_source(
+		project.clone(),
+		ModulePath::new("leaf").unwrap(),
+		"public func value(): int = 2".into(),
+		SourceVersion(2),
+	);
+	assert!(
+		session
+			.analyze_module(project, main.clone(), main, EntryMode::Entry)
+			.is_some()
+	);
+	let observed = events.lock().unwrap();
+	assert_eq!(count(&observed, "interface_module_analysis", "leaf"), 1);
+	assert_eq!(count(&observed, "interface_module_interface", "leaf"), 1);
+	assert_eq!(count(&observed, "interface_module_environment", "leaf"), 1);
+	assert_eq!(count(&observed, "interface_module_analysis", "middle"), 0);
+	assert_eq!(count(&observed, "interface_module_analysis", "main"), 0);
+}
+
+#[test]
+fn public_leaf_signature_edit_invalidates_only_reachable_consumers() {
+	let (mut session, events) = interface_event_session();
+	let project = ProjectId::new("interface-public");
+	install_chain(&mut session, &project);
+	let unrelated_project = ProjectId::new("interface-unrelated");
+	let unrelated = ModulePath::new("main").unwrap();
+	session.set_source(
+		unrelated_project.clone(),
+		unrelated.clone(),
+		"func main(): int = 0".into(),
+		SourceVersion(1),
+	);
+	let main = ModulePath::new("main").unwrap();
+	assert!(
+		session
+			.analyze_module(
+				project.clone(),
+				main.clone(),
+				main.clone(),
+				EntryMode::Entry
+			)
+			.is_some()
+	);
+	assert!(
+		session
+			.analyze_module(
+				unrelated_project.clone(),
+				unrelated.clone(),
+				unrelated.clone(),
+				EntryMode::Entry
+			)
+			.is_some()
+	);
+	events.lock().unwrap().clear();
+	session.set_source(
+		project.clone(),
+		ModulePath::new("leaf").unwrap(),
+		"public func value(): int = 1\npublic func added(): float = 1.0".into(),
+		SourceVersion(2),
+	);
+	let _ = session.analyze_module(project, main.clone(), main, EntryMode::Entry);
+	let _ = session.analyze_module(
+		unrelated_project,
+		unrelated.clone(),
+		unrelated,
+		EntryMode::Entry,
+	);
+	let observed = events.lock().unwrap();
+	for module in ["leaf", "middle", "main"] {
+		assert_eq!(
+			count(&observed, "interface_module_analysis", module),
+			1,
+			"{module}"
+		);
+	}
+	assert_eq!(
+		count(
+			&observed,
+			"interface_module_analysis",
+			"interface-unrelated:main"
+		),
+		0
+	);
+}
+
+#[test]
+fn equal_intermediate_interface_stops_transitive_invalidation() {
+	let (mut session, events) = interface_event_session();
+	let project = ProjectId::new("interface-stop");
+	install_chain(&mut session, &project);
+	let main = ModulePath::new("main").unwrap();
+	let _ = session.analyze_module(
+		project.clone(),
+		main.clone(),
+		main.clone(),
+		EntryMode::Entry,
+	);
+	events.lock().unwrap().clear();
+	session.set_source(
+		project.clone(),
+		ModulePath::new("middle").unwrap(),
+		"import @/leaf with (value)\nprivate func detail(): int = 2\npublic func forwarded(): int = value()".into(),
+		SourceVersion(2),
+	);
+	let _ = session.analyze_module(project, main.clone(), main, EntryMode::Entry);
+	let observed = events.lock().unwrap();
+	assert_eq!(count(&observed, "interface_module_analysis", "middle"), 1);
+	assert_eq!(count(&observed, "interface_module_interface", "middle"), 1);
+	assert_eq!(count(&observed, "interface_module_analysis", "main"), 0);
+}
+
+#[test]
+fn importable_and_ambient_roots_stay_in_the_closed_interface_family() {
+	let (mut session, events) = interface_event_session();
+	let project = ProjectId::new("interface-roots");
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"import std/io\nfunc main(): int = 0".into(),
+		SourceVersion(1),
+	);
+	assert!(
+		session
+			.analyze_module(project, main.clone(), main, EntryMode::Entry)
+			.is_some()
+	);
+	let observed = events.lock().unwrap();
+	assert!(observed.iter().any(|event| {
+		event.query == "interface_module_environment"
+			&& event
+				.module
+				.as_deref()
+				.is_some_and(|module| module.ends_with("io"))
+	}));
+	assert!(
+		observed
+			.iter()
+			.any(|event| event.query == "ambient_core_environment")
+	);
+	assert!(
+		!observed
+			.iter()
+			.any(|event| event.query.starts_with("compat_"))
+	);
 }

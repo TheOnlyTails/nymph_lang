@@ -4,7 +4,7 @@ use std::{ops::Deref, sync::Arc};
 
 use nymph_ast::decl::Module;
 
-use crate::Annotations;
+use crate::{Annotations, CheckedFacts};
 
 /// Owned semantic annotations for one module.
 ///
@@ -31,11 +31,18 @@ impl Deref for ModuleAnnotations {
 
 /// Owned semantic analysis of a source module, excluding diagnostics.
 ///
-/// Task 7 will add the environment-check result after that payload is separated
-/// from [`crate::Checked::diags`]. Storing `Checked` here in the meantime would
-/// violate the diagnostic-free boundary this type establishes.
-#[derive(Clone, Debug, PartialEq)]
+/// Checked facts and annotations are owned independently from the diagnostics in
+/// [`SemanticCheckResult`].
+#[derive(Clone, Debug)]
 pub struct SemanticAnalysis {
-	pub source: Arc<Module>,
-	pub annotations: ModuleAnnotations,
+	pub module: Arc<Module>,
+	pub checked: Arc<CheckedFacts>,
+	pub annotations: Arc<ModuleAnnotations>,
+}
+
+#[derive(Clone, Debug)]
+pub struct SemanticCheckResult {
+	pub analysis: Arc<SemanticAnalysis>,
+	pub diagnostics: Arc<[nymph_diagnostics::Diagnostic]>,
+	pub lowerable: bool,
 }

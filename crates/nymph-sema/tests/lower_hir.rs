@@ -1166,13 +1166,8 @@ fn missing_resolution_still_panics_in_lowering() {
 		"check failed: {:?}",
 		checked.diags
 	);
-	let stripped = nymph_sema::Checked {
-		diags: checked.diags,
-		annotations: nymph_sema::Annotations::default(),
-		external_value_marshals: checked.external_value_marshals,
-		interner: checked.interner,
-		semantic: checked.semantic,
-	};
+	let mut stripped = checked;
+	stripped.facts.annotations = nymph_sema::Annotations::default();
 	nymph_sema::lower_hir(&parsed.tree, &stripped);
 }
 
@@ -1305,13 +1300,8 @@ fn missing_prefix_resolution_still_panics_in_lowering() {
 		"check failed: {:?}",
 		checked.diags
 	);
-	let stripped = nymph_sema::Checked {
-		diags: checked.diags,
-		annotations: nymph_sema::Annotations::default(),
-		external_value_marshals: checked.external_value_marshals,
-		interner: checked.interner,
-		semantic: checked.semantic,
-	};
+	let mut stripped = checked;
+	stripped.facts.annotations = nymph_sema::Annotations::default();
 	nymph_sema::lower_hir(&parsed.tree, &stripped);
 }
 

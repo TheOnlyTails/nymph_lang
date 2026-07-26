@@ -14,6 +14,7 @@ use nymph_ast::Span;
 use rustc_hash::FxHashMap;
 
 use crate::check::Checker;
+use crate::identity::DefinitionId;
 use crate::ids::{DefId, ParamIdx};
 use crate::iface::head_of;
 use crate::ty::{Ty, TyKind};
@@ -51,6 +52,8 @@ pub(crate) struct MethodResolution {
 	pub(crate) ty: Ty,
 	pub(crate) params: Vec<Ty>,
 	pub(crate) source: MethodSource,
+	pub(crate) target: Option<DefinitionId>,
+	pub(crate) implementation: Option<DefinitionId>,
 	/// The span of the matched impl's `interface … for …` header (`ImplDef::span`),
 	/// when resolution went through the impl index (`Inherent`/`GenericBound`
 	/// don't: neither commits a specific `impl` block, see their construction
@@ -451,7 +454,9 @@ impl Checker<'_> {
 				}
 				if self.impls_overlap(&a, &b) {
 					let iface = self.defs.data(a.interface).name.clone();
-					self.emit(b.span, TypeError::ConflictingImpls { iface });
+					if let Some(span) = b.legacy_span {
+						self.emit(span, TypeError::ConflictingImpls { iface });
+					}
 				}
 			}
 		}
@@ -583,6 +588,8 @@ impl Checker<'_> {
 					ty: ret,
 					params,
 					source: MethodSource::GenericBound,
+					target: method.definition.clone(),
+					implementation: None,
 					impl_span: Some(iface_span),
 				});
 			}
@@ -598,19 +605,23 @@ impl Checker<'_> {
 				ty: ret,
 				params,
 				source: MethodSource::GenericBound,
+				target: method.definition,
+				implementation: None,
 				impl_span: Some(iface_span),
 			});
 		}
 
 		// Inherent methods take priority over interface methods.
-		if let Some((params, ret, method_span)) =
+		if let Some((params, ret, target, implementation, method_span)) =
 			self.resolve_inherent(recv, name, arg_tys, arg_lits, span)
 		{
 			return Some(MethodResolution {
 				ty: ret,
 				params,
 				source: MethodSource::Inherent,
-				impl_span: Some(method_span),
+				target,
+				implementation,
+				impl_span: method_span,
 			});
 		}
 
@@ -641,6 +652,8 @@ impl Checker<'_> {
 				ty,
 				params,
 				source: MethodSource::GenericBound,
+				target: self.interfaces[&iface_def].methods[name].definition.clone(),
+				implementation: None,
 				impl_span: Some(self.defs.data(iface_def).span),
 			});
 		}
@@ -734,6 +747,8 @@ impl Checker<'_> {
 					ty: self.interner.error(),
 					params: Vec::new(),
 					source: MethodSource::ImplDirect,
+					target: None,
+					implementation: None,
 					impl_span: None,
 				})
 			}
@@ -752,6 +767,8 @@ impl Checker<'_> {
 					ty: self.interner.error(),
 					params: Vec::new(),
 					source: MethodSource::ImplDirect,
+					target: None,
+					implementation: None,
 					impl_span: None,
 				})
 			}
@@ -860,6 +877,17 @@ impl Checker<'_> {
 		let subst = self.fresh_subst(def.generics.len());
 		let impl_self = self.subst(def.self_ty, &subst, None);
 		self.unify_self(recv, impl_self, span);
+		let target = def
+			.methods
+			.get(name)
+			.or_else(|| {
+				self
+					.interfaces
+					.get(&def.interface)
+					.and_then(|iface| iface.methods.get(name))
+			})
+			.and_then(|method| method.definition.clone());
+		let implementation = def.definition.clone();
 
 		let Some((params, ret, source)) = self.method_signature(&def, &subst, recv, name) else {
 			// Unreachable in practice: `candidates` was assembled from interfaces whose
@@ -871,7 +899,9 @@ impl Checker<'_> {
 				ty: self.interner.error(),
 				params: Vec::new(),
 				source: MethodSource::ImplDirect,
-				impl_span: Some(def.span),
+				target,
+				implementation,
+				impl_span: def.legacy_span,
 			};
 		};
 		if params.len() != arg_tys.len() {
@@ -887,7 +917,9 @@ impl Checker<'_> {
 				ty: ret,
 				params,
 				source,
-				impl_span: Some(def.span),
+				target,
+				implementation,
+				impl_span: def.legacy_span,
 			};
 		}
 		for (i, (param, arg)) in params.iter().zip(arg_tys).enumerate() {
@@ -902,7 +934,9 @@ impl Checker<'_> {
 			ty: ret,
 			params,
 			source,
-			impl_span: Some(def.span),
+			target,
+			implementation,
+			impl_span: def.legacy_span,
 		}
 	}
 

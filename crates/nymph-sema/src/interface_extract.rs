@@ -39,13 +39,23 @@ pub struct ExtractionFactSelection {
 impl ExtractionFactSelection {
 	#[must_use]
 	pub fn current_module(module: &Module, checked: &Checked) -> Self {
+		if checked.semantic.has_explicit_local_ranges {
+			return Self {
+				implementations: checked.semantic.local_implementations.clone(),
+				inherent: checked.semantic.local_inherent.clone(),
+			};
+		}
 		let current_implementations = checked
 			.semantic
 			.implementations
 			.impls
 			.iter()
 			.enumerate()
-			.filter(|(_, implementation)| implementation.span.start < crate::prelude::SPAN_BASE)
+			.filter(|(_, implementation)| {
+				implementation
+					.legacy_span
+					.is_some_and(|span| span.start < crate::prelude::SPAN_BASE)
+			})
 			.map(|(index, _)| index)
 			.collect::<Vec<_>>();
 		let inherent = module
@@ -881,7 +891,7 @@ fn extract_definition(
 			);
 			shape.ty = Some(canonicalize_type(
 				&checked.interner,
-				checked.semantic.signatures.lets[&def],
+				checked.semantic.signatures.lets[&def].ty,
 				context,
 			)?);
 			if let Declaration::ExternalLet(_, marker, meta) = declaration {

@@ -145,7 +145,11 @@ pub(crate) fn semantic_tokens_snapshot(
 ) -> Option<SemanticTokensResult> {
 	let _ = params;
 	let text = snapshot.source.as_ref();
-	let roles = build_role_map(&snapshot.analysis.module, &snapshot.analysis.checked);
+	let checked = nymph_sema::Checked {
+		diags: Vec::new(),
+		facts: snapshot.analysis.semantic.checked.as_ref().clone(),
+	};
+	let roles = build_role_map(&snapshot.analysis.semantic.module, &checked);
 	Some(semantic_tokens_for_source(text, &roles))
 }
 
