@@ -843,6 +843,16 @@ pub fn offset_module(module: &Module, index: usize) -> Module {
 
 // ── The facade itself ────────────────────────────────────────────────────────
 
+/// The exact module/check result pair produced by a prelude-aware check.
+///
+/// Tooling queries that rebuild ordinal declaration metadata must use this
+/// module rather than the unflattened source module.
+#[doc(hidden)]
+pub struct CheckedModule {
+	pub module: Module,
+	pub checked: Checked,
+}
+
 /// Replace any label pointing into a prelude clone (`span.start >= SPAN_BASE`)
 /// with a note instead of dropping the diagnostic outright — used for a
 /// user-anchored diagnostic (e.g. `Redefinition`) whose secondary label would
@@ -880,6 +890,12 @@ fn scrub_prelude_labels(mut diag: Diagnostic) -> Diagnostic {
 /// additionally requires the combined module to declare a valid top-level
 /// `main` (mirrors [`crate::check_module_entry`]).
 pub fn check_module_with_prelude(module: &Module, prelude: &[Module]) -> Checked {
+	check_module_with_prelude_and_module(module, prelude).checked
+}
+
+/// Prelude-aware library check retaining the exact combined module checked.
+#[doc(hidden)]
+pub fn check_module_with_prelude_and_module(module: &Module, prelude: &[Module]) -> CheckedModule {
 	check_module_with_prelude_impl(module, prelude, EntryMode::Library)
 }
 
@@ -889,6 +905,15 @@ pub fn check_module_with_prelude(module: &Module, prelude: &[Module]) -> Checked
 /// `main`. The prelude itself declares no `main`, so this is satisfied
 /// precisely when `module` declares one, exactly as in the prelude-less case.
 pub fn check_module_entry_with_prelude(module: &Module, prelude: &[Module]) -> Checked {
+	check_module_entry_with_prelude_and_module(module, prelude).checked
+}
+
+/// Prelude-aware entry check retaining the exact combined module checked.
+#[doc(hidden)]
+pub fn check_module_entry_with_prelude_and_module(
+	module: &Module,
+	prelude: &[Module],
+) -> CheckedModule {
 	check_module_with_prelude_impl(module, prelude, EntryMode::Entry)
 }
 
@@ -896,7 +921,7 @@ fn check_module_with_prelude_impl(
 	module: &Module,
 	prelude: &[Module],
 	entry: EntryMode,
-) -> Checked {
+) -> CheckedModule {
 	let mut members = Vec::new();
 
 	for (index, p) in prelude.iter().enumerate() {
@@ -945,7 +970,10 @@ fn check_module_with_prelude_impl(
 		.filter(|d| d.span.start < SPAN_BASE)
 		.map(scrub_prelude_labels)
 		.collect();
-	checked
+	CheckedModule {
+		module: combined,
+		checked,
+	}
 }
 
 #[cfg(test)]

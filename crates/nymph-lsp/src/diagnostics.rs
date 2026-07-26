@@ -6,10 +6,7 @@
 //! Project mode (Task 3) is layered in on top for documents that do sit
 //! inside a discovered project.
 
-use std::{
-	collections::BTreeMap,
-	sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use lsp_server::Connection;
 use lsp_types::{
@@ -18,7 +15,7 @@ use lsp_types::{
 };
 use nymph_diagnostics::{Diagnostic, Severity};
 
-use crate::{document_store::DocumentStore, line_index::LineIndex, workspace};
+use crate::{compiler_state::CompilerState, document_store::DocumentStore, line_index::LineIndex};
 
 /// Re-check `uri`'s current text and publish its full diagnostic set
 /// (replacing whatever was previously published for it, so a fix clears
@@ -31,93 +28,49 @@ use crate::{document_store::DocumentStore, line_index::LineIndex, workspace};
 /// [`nymph_compiler::check_project_library`]'s doc comment on that limit) is
 /// checked, and every touched module's diagnostics are republished against
 /// its own file. Otherwise `uri` is checked standalone (loose mode).
+pub fn check_and_publish_state(
+	connection: &Connection,
+	docs: &Arc<Mutex<DocumentStore>>,
+	compiler: &Arc<Mutex<CompilerState>>,
+	uri: &Uri,
+) -> anyhow::Result<()> {
+	// Copy the document table first, then release its mutex before entering the
+	// compiler. Publication below holds neither mutex.
+	let docs_snapshot = docs.lock().unwrap().clone();
+	let snapshot = compiler
+		.lock()
+		.unwrap()
+		.diagnostics_snapshot(&docs_snapshot, uri);
+	let Some(snapshot) = snapshot else {
+		return Ok(());
+	};
+	// This is deliberately the final state read before any send: if the root
+	// changed while analysis ran, publish no partial project result.
+	if docs.lock().unwrap().version(uri) != Some(snapshot.requested_version) {
+		return Ok(());
+	}
+	for module in snapshot.modules {
+		publish(
+			connection,
+			&module.uri,
+			&module.source,
+			&module.diagnostics,
+			module.version,
+		)?;
+	}
+	Ok(())
+}
+
+#[cfg(test)]
 pub fn check_and_publish(
 	connection: &Connection,
 	docs: &Arc<Mutex<DocumentStore>>,
 	uri: &Uri,
 ) -> anyhow::Result<()> {
-	let text = {
-		let docs = docs.lock().unwrap();
-		match docs.get(uri) {
-			Some(doc) => doc.text.clone(),
-			None => return Ok(()),
-		}
-	};
-
-	let file_path = workspace::uri_to_path(uri);
-
-	// A stdlib SOURCE file (e.g. `stdlib/src/ops/mod.nym`) must never be checked
-	// against the ambient `core` prelude: `check` always injects a fresh parse of
-	// `core_prelude()` ahead of the checked module, and for a file that IS part of
-	// that very prelude, that injects a second copy of itself right next to the
-	// real one — every declaration collides with its own ambient copy. Short-
-	// circuit BEFORE `workspace::detect` (rather than only in the loose-mode `None`
-	// arm below) so the fix holds regardless of whether the file resolves loose or
-	// project mode; a normal user file never matches this and is unaffected.
-	if nymph_compiler::is_stdlib_source_path(&file_path) {
-		let diags = nymph_compiler::check_without_prelude(&text, uri.path().as_str());
-		return publish(connection, uri, &text, &diags);
-	}
-
-	match workspace::detect(&file_path) {
-		Some(project) => check_and_publish_project(connection, &project, &text, docs),
-		None => {
-			let diags = nymph_compiler::check(&text, uri.path().as_str());
-			publish(connection, uri, &text, &diags)
-		}
-	}
-}
-
-/// Project-mode branch of [`check_and_publish`]: whole-graph check rooted
-/// at `project.entry_key`, diagnostics grouped by module and republished
-/// per file. The check runs against a BUFFER-AWARE loader: the entry module
-/// (the file the client is editing) and any other OPEN module are checked
-/// against their live editor buffers — not the on-disk copies — so unsaved
-/// edits produce diagnostics immediately; modules that are not open fall back
-/// to disk. Diagnostics are then rendered against the same buffer text.
-fn check_and_publish_project(
-	connection: &Connection,
-	project: &workspace::Project,
-	text: &str,
-	docs: &Arc<Mutex<DocumentStore>>,
-) -> anyhow::Result<()> {
-	let disk = workspace::fs_loader(project.src_root.clone());
-	let loader = |key: &str| -> Option<String> {
-		// The entry is special-cased against `text` directly (rather than via
-		// `key_to_uri` → store lookup) so a URI-canonicalization mismatch can
-		// never fall the file the client is editing back to its stale disk copy.
-		if key == project.entry_key {
-			return Some(text.to_string());
-		}
-		if let Some(uri) = workspace::key_to_uri(&project.src_root, key)
-			&& let Some(doc) = docs.lock().unwrap().get(&uri)
-		{
-			return Some(doc.text.clone());
-		}
-		disk(key)
-	};
-	let project_diags = nymph_compiler::check_project_library(&project.entry_key, &loader);
-
-	let mut by_module: BTreeMap<String, Vec<Diagnostic>> = BTreeMap::new();
-	// Ensure the entry module (the file the client just edited) is always
-	// republished, even with zero diagnostics, so a fix clears stale marks.
-	by_module.entry(project.entry_key.clone()).or_default();
-	for d in project_diags {
-		by_module.entry(d.module).or_default().push(d.diag);
-	}
-
-	for (module, diags) in by_module {
-		let Some(module_uri) = workspace::key_to_uri(&project.src_root, &module) else {
-			continue;
-		};
-		let source = if module == project.entry_key {
-			text.to_string()
-		} else {
-			loader(&module).unwrap_or_default()
-		};
-		publish(connection, &module_uri, &source, &diags)?;
-	}
-	Ok(())
+	let mut state = CompilerState::new();
+	let docs_snapshot = docs.lock().unwrap().clone();
+	state.synchronize_open_document(&docs_snapshot, uri)?;
+	check_and_publish_state(connection, docs, &Arc::new(Mutex::new(state)), uri)
 }
 
 /// Publish `diags` (already anchored against `text`) for `uri`.
@@ -126,13 +79,14 @@ fn publish(
 	uri: &Uri,
 	text: &str,
 	diags: &[Diagnostic],
+	version: Option<i32>,
 ) -> anyhow::Result<()> {
 	let index = LineIndex::new(text);
 	let lsp_diags: Vec<LspDiagnostic> = diags.iter().map(|d| to_lsp(d, text, &index)).collect();
 	let params = PublishDiagnosticsParams {
 		uri: uri.clone(),
 		diagnostics: lsp_diags,
-		version: None,
+		version,
 	};
 	connection.sender.send(lsp_server::Message::Notification(
 		lsp_server::Notification::new(
@@ -361,6 +315,76 @@ mod tests {
 			"expected exactly one diagnostic on b.nym, got {b_diags:?}"
 		);
 		assert_eq!(b_diags[0].severity, Some(DiagnosticSeverity::ERROR));
+	}
+
+	#[test]
+	fn fixed_dependency_is_republished_with_empty_diagnostics() {
+		let tmp = TempDir::new();
+		std::fs::write(
+			tmp.0.join("nymph.toml"),
+			"[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+		)
+		.unwrap();
+		std::fs::create_dir_all(tmp.0.join("src")).unwrap();
+		let importer_path = tmp.0.join("src/importer.nym");
+		let dependency_path = tmp.0.join("src/dependency.nym");
+		let importer_text = "import @/dependency with (value)\nfunc use(): int = value()\n";
+		std::fs::write(&importer_path, importer_text).unwrap();
+		std::fs::write(&dependency_path, "public func value(): int = true\n").unwrap();
+		let importer_uri = crate::workspace::path_to_uri(&importer_path).unwrap();
+		let dependency_uri = crate::workspace::path_to_uri(&dependency_path).unwrap();
+		let docs = Arc::new(Mutex::new(DocumentStore::default()));
+		let compiler = Arc::new(Mutex::new(CompilerState::new()));
+		compiler
+			.lock()
+			.unwrap()
+			.open(
+				&mut docs.lock().unwrap(),
+				importer_uri.clone(),
+				importer_text.into(),
+				1,
+			)
+			.unwrap();
+		let (server, client) = Connection::memory();
+
+		check_and_publish_state(&server, &docs, &compiler, &importer_uri).unwrap();
+		for _ in 0..2 {
+			client.receiver.recv().unwrap();
+		}
+		compiler
+			.lock()
+			.unwrap()
+			.open(
+				&mut docs.lock().unwrap(),
+				dependency_uri.clone(),
+				"public func value(): int = 1\n".into(),
+				1,
+			)
+			.unwrap();
+		compiler
+			.lock()
+			.unwrap()
+			.change(
+				&mut docs.lock().unwrap(),
+				&importer_uri,
+				importer_text.into(),
+				2,
+			)
+			.unwrap();
+
+		check_and_publish_state(&server, &docs, &compiler, &importer_uri).unwrap();
+
+		let mut dependency_clear = None;
+		for message in client.receiver.try_iter() {
+			let Message::Notification(notification) = message else {
+				panic!("expected diagnostics notification")
+			};
+			let params: PublishDiagnosticsParams = serde_json::from_value(notification.params).unwrap();
+			if params.uri == dependency_uri {
+				dependency_clear = Some(params.diagnostics);
+			}
+		}
+		assert_eq!(dependency_clear, Some(Vec::new()));
 	}
 
 	#[test]

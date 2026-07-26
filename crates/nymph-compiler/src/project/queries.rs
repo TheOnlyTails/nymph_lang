@@ -314,6 +314,7 @@ mod tests {
 			ModulePath::new("main").unwrap(),
 			EntryMode::Entry,
 			false,
+			true,
 		);
 		// Test databases outlive each key in these tests; Salsa's key does not
 		// contain an actual reference despite its invariant database lifetime.
@@ -386,7 +387,7 @@ mod tests {
 	fn graph_ignores_unreachable_errors_and_preserves_clean_public_contracts() {
 		let (db, key) = fixture(
 			&[
-				("main", "import @/a"),
+				("main", "import @/a\nimport std/tool"),
 				("a", "import @/b"),
 				("b", "let value = 1"),
 				("unreachable", "import @/missing"),

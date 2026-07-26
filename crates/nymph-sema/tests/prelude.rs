@@ -16,7 +16,8 @@ use nymph_ast::{
 	expr::{Expr, ExprKind, Statement},
 };
 use nymph_sema::{
-	DispatchKind, check_module, check_module_with_prelude, lower_hir, lower_hir_with_prelude,
+	DispatchKind, check_module, check_module_with_prelude, check_module_with_prelude_and_module,
+	lower_hir, lower_hir_with_prelude,
 };
 use nymph_syntax::parse_module;
 
@@ -46,6 +47,32 @@ fn parse(source: &str) -> Module {
 		parsed.diagnostics
 	);
 	parsed.tree
+}
+
+#[test]
+fn paired_prelude_check_returns_the_exact_checked_layout() {
+	let prelude = parse("import @/ignored\nfunc ambient(): int = 1");
+	let user = parse("import @/also_ignored\nfunc value(): int = 2");
+	let user_func_id = match &user.members[1] {
+		Declaration::Func { body, .. } => body.id,
+		other => panic!("expected user function, got {other:?}"),
+	};
+
+	let paired = check_module_with_prelude_and_module(&user, &[prelude]);
+	assert_eq!(paired.module.members.len(), 2, "imports must be filtered");
+	assert!(
+		matches!(&paired.module.members[0], Declaration::Func { meta, .. } if meta.name.0 == "ambient")
+	);
+	assert!(
+		matches!(&paired.module.members[1], Declaration::Func { meta, body, .. } if meta.name.0 == "value" && body.id == user_func_id)
+	);
+
+	let cloned = paired.module.clone();
+	let offset = "import @/also_ignored\nfunc value(): int = ".len();
+	assert_eq!(
+		nymph_sema::query::type_at(&cloned, &paired.checked, offset).as_deref(),
+		Some("int")
+	);
 }
 
 /// Find the `NodeId` of the (single, top-level) `BinaryOp` inside `func_name`'s

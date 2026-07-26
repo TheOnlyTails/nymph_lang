@@ -21,6 +21,7 @@
 //! independent of the TextMate grammar (see [`semantic_tokens`]).
 //! Incremental sync, formatting, and rename are deliberately out of scope.
 
+pub mod compiler_state;
 pub mod completion;
 pub mod definition;
 pub mod diagnostics;
@@ -35,7 +36,6 @@ pub mod workspace;
 use std::sync::{Arc, Mutex};
 
 use document_store::DocumentStore;
-use hover::HoverCache;
 use lsp_server::{Connection, Message, Notification as ServerNotification, Response};
 use lsp_types::{
 	CompletionOptions, CompletionParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
@@ -88,7 +88,7 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
 	serve(
 		connection,
 		Arc::new(Mutex::new(DocumentStore::default())),
-		Arc::new(Mutex::new(HoverCache::default())),
+		Arc::new(Mutex::new(compiler_state::CompilerState::new())),
 	)
 }
 
@@ -101,7 +101,7 @@ pub fn run(connection: Connection) -> anyhow::Result<()> {
 fn serve(
 	connection: Connection,
 	docs: Arc<Mutex<DocumentStore>>,
-	hover_cache: Arc<Mutex<HoverCache>>,
+	compiler: Arc<Mutex<compiler_state::CompilerState>>,
 ) -> anyhow::Result<()> {
 	let (id, params) = connection.initialize_start()?;
 	let _init_params: InitializeParams = serde_json::from_value(params)?;
@@ -115,13 +115,13 @@ fn serve(
 	};
 	connection.initialize_finish(id, serde_json::to_value(init_result)?)?;
 
-	main_loop(&connection, &docs, &hover_cache)
+	main_loop(&connection, &docs, &compiler)
 }
 
 fn main_loop(
 	connection: &Connection,
 	docs: &Arc<Mutex<DocumentStore>>,
-	hover_cache: &Arc<Mutex<HoverCache>>,
+	compiler: &Arc<Mutex<compiler_state::CompilerState>>,
 ) -> anyhow::Result<()> {
 	for msg in &connection.receiver {
 		match msg {
@@ -131,11 +131,14 @@ fn main_loop(
 				}
 				if req.method == HoverRequest::METHOD {
 					let (id, params) = req.extract::<HoverParams>(HoverRequest::METHOD)?;
-					let result = hover::hover(
-						&docs.lock().unwrap(),
-						&mut hover_cache.lock().unwrap(),
-						&params,
-					);
+					let result = compiler
+						.lock()
+						.unwrap()
+						.analysis_for_uri(
+							&docs.lock().unwrap(),
+							&params.text_document_position_params.text_document.uri,
+						)
+						.and_then(|snapshot| hover::hover_snapshot(&snapshot, &params));
 					connection
 						.sender
 						.send(Message::Response(Response::new_ok(id, result)))?;
@@ -160,7 +163,11 @@ fn main_loop(
 				} else if req.method == SemanticTokensFullRequest::METHOD {
 					let (id, params) =
 						req.extract::<SemanticTokensParams>(SemanticTokensFullRequest::METHOD)?;
-					let result = semantic_tokens::semantic_tokens_full(&docs.lock().unwrap(), &params);
+					let result = compiler
+						.lock()
+						.unwrap()
+						.analysis_for_uri(&docs.lock().unwrap(), &params.text_document.uri)
+						.and_then(|snapshot| semantic_tokens::semantic_tokens_snapshot(&snapshot, &params));
 					connection
 						.sender
 						.send(Message::Response(Response::new_ok(id, result)))?;
@@ -172,7 +179,7 @@ fn main_loop(
 					)))?;
 				}
 			}
-			Message::Notification(not) => handle_notification(connection, docs, not)?,
+			Message::Notification(not) => handle_notification(connection, docs, compiler, not)?,
 			Message::Response(_) => {}
 		}
 	}
@@ -182,34 +189,43 @@ fn main_loop(
 fn handle_notification(
 	connection: &Connection,
 	docs: &Arc<Mutex<DocumentStore>>,
+	compiler: &Arc<Mutex<compiler_state::CompilerState>>,
 	not: ServerNotification,
 ) -> anyhow::Result<()> {
 	match not.method.as_str() {
 		m if m == DidOpenTextDocument::METHOD => {
 			let params: DidOpenTextDocumentParams = serde_json::from_value(not.params)?;
 			let uri = params.text_document.uri.clone();
-			{
-				let mut docs = docs.lock().unwrap();
-				docs.open(
-					params.text_document.uri,
-					params.text_document.text,
-					params.text_document.version,
-				);
-			}
-			diagnostics::check_and_publish(connection, docs, &uri)?;
+			compiler.lock().unwrap().open(
+				&mut docs.lock().unwrap(),
+				params.text_document.uri,
+				params.text_document.text,
+				params.text_document.version,
+			)?;
+			diagnostics::check_and_publish_state(connection, docs, compiler, &uri)?;
 		}
 		m if m == DidChangeTextDocument::METHOD => {
 			let params: DidChangeTextDocumentParams = serde_json::from_value(not.params)?;
 			let uri = params.text_document.uri.clone();
 			if let Some(change) = params.content_changes.into_iter().last() {
-				let mut docs = docs.lock().unwrap();
-				docs.change_full(&uri, change.text, params.text_document.version);
+				compiler.lock().unwrap().change(
+					&mut docs.lock().unwrap(),
+					&uri,
+					change.text,
+					params.text_document.version,
+				)?;
 			}
-			diagnostics::check_and_publish(connection, docs, &uri)?;
+			diagnostics::check_and_publish_state(connection, docs, compiler, &uri)?;
 		}
 		m if m == DidCloseTextDocument::METHOD => {
 			let params: DidCloseTextDocumentParams = serde_json::from_value(not.params)?;
-			docs.lock().unwrap().close(&params.text_document.uri);
+			let affected = compiler
+				.lock()
+				.unwrap()
+				.close(&mut docs.lock().unwrap(), &params.text_document.uri)?;
+			for uri in affected {
+				diagnostics::check_and_publish_state(connection, docs, compiler, &uri)?;
+			}
 		}
 		_ => {}
 	}
@@ -221,8 +237,11 @@ mod tests {
 	use super::*;
 	use lsp_server::{Notification, Request, RequestId};
 	use lsp_types::{
-		TextDocumentContentChangeEvent, TextDocumentItem, Uri, VersionedTextDocumentIdentifier,
+		Position, PublishDiagnosticsParams, SemanticTokensParams, TextDocumentContentChangeEvent,
+		TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Uri,
+		VersionedTextDocumentIdentifier, WorkDoneProgressParams,
 	};
+	use std::sync::atomic::{AtomicUsize, Ordering};
 
 	fn handshake(client: &Connection) {
 		client
@@ -268,6 +287,225 @@ mod tests {
 			}
 		}
 		handle.join().unwrap().unwrap();
+	}
+
+	fn recv_response(client: &Connection, expected_id: i32) -> Response {
+		loop {
+			if let Message::Response(response) = client.receiver.recv().unwrap() {
+				assert_eq!(response.id, RequestId::from(expected_id));
+				return response;
+			}
+		}
+	}
+
+	fn recv_diagnostics(client: &Connection) -> PublishDiagnosticsParams {
+		loop {
+			if let Message::Notification(notification) = client.receiver.recv().unwrap()
+				&& notification.method == lsp_types::notification::PublishDiagnostics::METHOD
+			{
+				return serde_json::from_value(notification.params).unwrap();
+			}
+		}
+	}
+
+	fn recv_diagnostics_for(client: &Connection, uri: &Uri) -> PublishDiagnosticsParams {
+		loop {
+			let diagnostics = recv_diagnostics(client);
+			if diagnostics.uri == *uri {
+				return diagnostics;
+			}
+		}
+	}
+
+	#[test]
+	fn production_handlers_reuse_analysis_until_document_version_changes() {
+		let parse = Arc::new(AtomicUsize::new(0));
+		let analysis = Arc::new(AtomicUsize::new(0));
+		let parse_events = parse.clone();
+		let analysis_events = analysis.clone();
+		let compiler = compiler_state::CompilerState::with_event_callback(move |event| match event {
+			"parse" => _ = parse_events.fetch_add(1, Ordering::Relaxed),
+			"compat_module_analysis" => _ = analysis_events.fetch_add(1, Ordering::Relaxed),
+			_ => {}
+		});
+		let (server, client) = Connection::memory();
+		let docs = Arc::new(Mutex::new(DocumentStore::default()));
+		let compiler = Arc::new(Mutex::new(compiler));
+		let handle = std::thread::spawn(move || serve(server, docs, compiler));
+		handshake(&client);
+		let uri: Uri = "file:///wire_incremental.nym".parse().unwrap();
+		let send_open_or_change = |version, open: bool, text: &str| {
+			let notification = if open {
+				Notification::new(
+					DidOpenTextDocument::METHOD.to_string(),
+					serde_json::to_value(DidOpenTextDocumentParams {
+						text_document: TextDocumentItem {
+							uri: uri.clone(),
+							language_id: "nymph".into(),
+							version,
+							text: text.into(),
+						},
+					})
+					.unwrap(),
+				)
+			} else {
+				Notification::new(
+					DidChangeTextDocument::METHOD.to_string(),
+					serde_json::to_value(DidChangeTextDocumentParams {
+						text_document: VersionedTextDocumentIdentifier {
+							uri: uri.clone(),
+							version,
+						},
+						content_changes: vec![TextDocumentContentChangeEvent {
+							range: None,
+							range_length: None,
+							text: text.into(),
+						}],
+					})
+					.unwrap(),
+				)
+			};
+			client
+				.sender
+				.send(Message::Notification(notification))
+				.unwrap();
+		};
+		send_open_or_change(1, true, "func value(): int = 1");
+		assert_eq!(recv_diagnostics(&client).version, Some(1));
+
+		for id in [10, 11] {
+			client
+				.sender
+				.send(Message::Request(Request::new(
+					RequestId::from(id),
+					HoverRequest::METHOD.into(),
+					serde_json::to_value(HoverParams {
+						text_document_position_params: TextDocumentPositionParams {
+							text_document: TextDocumentIdentifier { uri: uri.clone() },
+							position: Position {
+								line: 0,
+								character: 20,
+							},
+						},
+						work_done_progress_params: WorkDoneProgressParams::default(),
+					})
+					.unwrap(),
+				)))
+				.unwrap();
+			recv_response(&client, id);
+		}
+		let semantic_request = |id| {
+			client
+				.sender
+				.send(Message::Request(Request::new(
+					RequestId::from(id),
+					SemanticTokensFullRequest::METHOD.into(),
+					serde_json::to_value(SemanticTokensParams {
+						text_document: TextDocumentIdentifier { uri: uri.clone() },
+						work_done_progress_params: WorkDoneProgressParams::default(),
+						partial_result_params: Default::default(),
+					})
+					.unwrap(),
+				)))
+				.unwrap();
+			recv_response(&client, id);
+		};
+		semantic_request(12);
+		assert_eq!(
+			(
+				parse.load(Ordering::Relaxed),
+				analysis.load(Ordering::Relaxed)
+			),
+			(1, 1)
+		);
+
+		send_open_or_change(2, false, "func value(): int = 2");
+		assert_eq!(recv_diagnostics(&client).version, Some(2));
+		semantic_request(13);
+		assert_eq!(
+			(
+				parse.load(Ordering::Relaxed),
+				analysis.load(Ordering::Relaxed)
+			),
+			(2, 2)
+		);
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn closing_dirty_dependency_republishes_open_importer_after_restore_and_delete() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='wire-close'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let importer_path = temp.path().join("src/importer.nym");
+		let dependency_path = temp.path().join("src/dependency.nym");
+		let importer_text = "import @/dependency with (value)\nfunc use(): int = value()";
+		let disk_dependency = "public func value(): int = 1";
+		std::fs::write(&importer_path, importer_text).unwrap();
+		std::fs::write(&dependency_path, disk_dependency).unwrap();
+		let importer_uri = workspace::path_to_uri(&importer_path).unwrap();
+		let dependency_uri = workspace::path_to_uri(&dependency_path).unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		handshake(&client);
+		let open = |uri: Uri, version, text: &str| {
+			client
+				.sender
+				.send(Message::Notification(Notification::new(
+					DidOpenTextDocument::METHOD.into(),
+					serde_json::to_value(DidOpenTextDocumentParams {
+						text_document: TextDocumentItem {
+							uri,
+							language_id: "nymph".into(),
+							version,
+							text: text.into(),
+						},
+					})
+					.unwrap(),
+				)))
+				.unwrap();
+		};
+		let close = |uri: Uri| {
+			client
+				.sender
+				.send(Message::Notification(Notification::new(
+					DidCloseTextDocument::METHOD.into(),
+					serde_json::to_value(DidCloseTextDocumentParams {
+						text_document: TextDocumentIdentifier { uri },
+					})
+					.unwrap(),
+				)))
+				.unwrap();
+		};
+
+		open(importer_uri.clone(), 1, importer_text);
+		recv_diagnostics_for(&client, &importer_uri);
+		open(dependency_uri.clone(), 1, "public func value(): int = true");
+		recv_diagnostics_for(&client, &dependency_uri);
+		close(dependency_uri.clone());
+		assert!(
+			recv_diagnostics_for(&client, &importer_uri)
+				.diagnostics
+				.is_empty()
+		);
+
+		open(dependency_uri.clone(), 2, "public func value(): int = true");
+		recv_diagnostics_for(&client, &dependency_uri);
+		std::fs::remove_file(&dependency_path).unwrap();
+		close(dependency_uri);
+		let importer = recv_diagnostics_for(&client, &importer_uri);
+		assert_eq!(importer.diagnostics.len(), 1);
+		assert_eq!(
+			importer.diagnostics[0].code,
+			Some(lsp_types::NumberOrString::String(
+				"IMPORT-UNRESOLVED".into()
+			))
+		);
+		shutdown(&client, handle);
 	}
 
 	#[test]
@@ -546,7 +784,7 @@ mod tests {
 		handshake(&client);
 
 		let uri: Uri = "file:///wire_semtok.nym".parse().unwrap();
-		let text = "func f(): int = match 1 { _ -> 1 }";
+		let text = "func f(): int = match (1) { _ -> 1 }";
 		client
 			.sender
 			.send(Message::Notification(Notification::new(
@@ -657,8 +895,8 @@ mod tests {
 		let (server, client) = Connection::memory();
 		let docs = Arc::new(Mutex::new(DocumentStore::default()));
 		let docs_for_server = docs.clone();
-		let hover_cache = Arc::new(Mutex::new(HoverCache::default()));
-		let handle = std::thread::spawn(move || serve(server, docs_for_server, hover_cache));
+		let compiler = Arc::new(Mutex::new(compiler_state::CompilerState::new()));
+		let handle = std::thread::spawn(move || serve(server, docs_for_server, compiler));
 
 		handshake(&client);
 

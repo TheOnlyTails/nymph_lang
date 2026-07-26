@@ -45,4 +45,7 @@ pub use lower_hir::{
 };
 pub use nymph_hir::ids::{self, DefId, InferVar, ParamIdx};
 pub use nymph_hir::ty::{self, GenericArgs, Interner, Ty, TyKind};
-pub use prelude::{check_module_entry_with_prelude, check_module_with_prelude};
+pub use prelude::{
+	CheckedModule, check_module_entry_with_prelude, check_module_entry_with_prelude_and_module,
+	check_module_with_prelude, check_module_with_prelude_and_module,
+};

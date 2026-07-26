@@ -1,66 +1,16 @@
 //! `textDocument/hover`: the type of the smallest checked expression under
 //! the cursor.
 //!
-//! Diagnostics (see [`crate::diagnostics`]) go through the prelude-aware
-//! facade (`nymph_compiler::check`/`check_project_library`), which never
-//! hands back the `Checked` annotations a type-at-position query needs — so
-//! hover runs its own, separate check directly against `nymph_sema`
-//! (`nymph_sema::check_module`, no prelude; see
-//! `nymph_sema::query::type_at`'s doc comment for exactly what that trades
-//! away: operator-only expressions relying on the prelude, e.g. bare
-//! `1 + 2`, may under-resolve, while every literal, binding, and
-//! user-declared ADT still resolves correctly). [`HoverCache`] keeps that
-//! check's result around per document version so repeated hovers over the
-//! same unchanged buffer don't re-check it.
-
-use std::collections::HashMap;
+//! Hover consumes the compiler session's immutable analysis snapshot. The
+//! compiler-owned `ModuleAnalysis::type_at` seam pairs annotations with the
+//! exact flattened module that produced their ordinal semantic identities.
 
 use lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
-use nymph_ast::decl::Module;
-use nymph_sema::Checked;
 
 use crate::{
-	document_store::DocumentStore, line_index::LineIndex, position::query_with_whitespace_left_bias,
+	compiler_state::AnalysisSnapshot, line_index::LineIndex,
+	position::query_with_whitespace_left_bias,
 };
-
-struct CacheEntry {
-	version: i32,
-	module: Module,
-	checked: Checked,
-}
-
-/// A one-entry-per-document cache of the last `(version, parse, check)`, so
-/// a hover request re-checks a document only when its text actually
-/// changed since the last hover.
-#[derive(Default)]
-pub struct HoverCache {
-	entries: HashMap<String, CacheEntry>,
-}
-
-impl HoverCache {
-	fn get_or_check(&mut self, uri_key: &str, version: i32, text: &str, path: &str) -> &CacheEntry {
-		let stale = match self.entries.get(uri_key) {
-			Some(entry) => entry.version != version,
-			None => true,
-		};
-		if stale {
-			let parsed = nymph_syntax::parse_module(text, path);
-			let checked = nymph_sema::check_module(&parsed.tree);
-			self.entries.insert(
-				uri_key.to_string(),
-				CacheEntry {
-					version,
-					module: parsed.tree,
-					checked,
-				},
-			);
-		}
-		self
-			.entries
-			.get(uri_key)
-			.expect("just inserted or already present")
-	}
-}
 
 /// Answer a hover request: `None` when the document isn't open, or when
 /// neither a checked expression/declaration (see
@@ -77,19 +27,18 @@ impl HoverCache {
 /// some other hoverable node — impossible in practice, since a keyword and
 /// an expression/declaration never occupy the same span — never loses its
 /// code hover to a doc.
-pub fn hover(docs: &DocumentStore, cache: &mut HoverCache, params: &HoverParams) -> Option<Hover> {
-	let uri = &params.text_document_position_params.text_document.uri;
+pub fn hover(snapshot: &AnalysisSnapshot, params: &HoverParams) -> Option<Hover> {
+	hover_snapshot(snapshot, params)
+}
+
+pub(crate) fn hover_snapshot(snapshot: &AnalysisSnapshot, params: &HoverParams) -> Option<Hover> {
 	let position = params.text_document_position_params.position;
-	let doc = docs.get(uri)?;
+	let text = snapshot.source.as_ref();
+	let index = LineIndex::new(text);
+	let offset = index.offset(text, position);
 
-	let uri_key = uri.as_str().to_string();
-	let entry = cache.get_or_check(&uri_key, doc.version, &doc.text, uri.path().as_str());
-
-	let index = LineIndex::new(&doc.text);
-	let offset = index.offset(&doc.text, position);
-
-	let value = if let Some(code) = query_with_whitespace_left_bias(&doc.text, offset, |candidate| {
-		nymph_sema::query::type_at(&entry.module, &entry.checked, candidate)
+	let value = if let Some(code) = query_with_whitespace_left_bias(text, offset, |candidate| {
+		snapshot.analysis.type_at(candidate)
 	}) {
 		format!(
 			r"```nymph
@@ -97,8 +46,8 @@ pub fn hover(docs: &DocumentStore, cache: &mut HoverCache, params: &HoverParams)
 ```"
 		)
 	} else {
-		let kw_doc = query_with_whitespace_left_bias(&doc.text, offset, |candidate| {
-			nymph_sema::query::keyword_doc_at(&doc.text, candidate)
+		let kw_doc = query_with_whitespace_left_bias(text, offset, |candidate| {
+			nymph_sema::query::keyword_doc_at(text, candidate)
 		})?;
 		kw_doc.to_string()
 	};
@@ -113,8 +62,30 @@ pub fn hover(docs: &DocumentStore, cache: &mut HoverCache, params: &HoverParams)
 }
 
 #[cfg(test)]
+fn hover_fixture(
+	docs: &crate::document_store::DocumentStore,
+	state: &mut crate::compiler_state::CompilerState,
+	params: &HoverParams,
+) -> Option<Hover> {
+	let uri = &params.text_document_position_params.text_document.uri;
+	let document = docs.get(uri)?;
+	let mut owned_docs = docs.clone();
+	state
+		.open(
+			&mut owned_docs,
+			uri.clone(),
+			document.text.clone(),
+			document.version,
+		)
+		.ok()?;
+	let snapshot = state.analysis_for_uri(&owned_docs, uri)?;
+	hover_snapshot(&snapshot, params)
+}
+
+#[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::document_store::DocumentStore;
 	use lsp_types::{
 		Position, TextDocumentIdentifier, TextDocumentPositionParams, Uri, WorkDoneProgressParams,
 	};
@@ -150,13 +121,13 @@ mod tests {
 		let uri: Uri = "file:///hover.nym".parse().unwrap();
 		let text = "func main(): void = {\n  let x: int = 1\n}";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
 		// The `1` initializer sits on line 1 (0-based), at column 15 — see
 		// the layout comment below.
 		//   "  let x: int = 1"
 		//    0123456789012345
-		let result = hover(&docs, &mut cache, &params(&uri, 1, 15));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, 1, 15));
 		let hover = result.expect("hovering a literal should resolve a type");
 		match hover.contents {
 			HoverContents::Markup(MarkupContent { value, .. }) => assert_eq!(value, code("int")),
@@ -169,7 +140,7 @@ mod tests {
 		let uri: Uri = "file:///hover_ws.nym".parse().unwrap();
 		let text = "func main(): void = {\n  let x: int = 1\n}";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
 		// Column 12 on line 0 is the single space between `:` and `void` in
 		// the return-type annotation — `:` is not a keyword (so
@@ -178,7 +149,7 @@ mod tests {
 		// it either).
 		//   "func main(): void = {"
 		//    0123456789012345678901
-		let result = hover(&docs, &mut cache, &params(&uri, 0, 12));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, 0, 12));
 		assert!(
 			result.is_none(),
 			"expected no hover over the function signature's whitespace, got {result:?}"
@@ -190,9 +161,9 @@ mod tests {
 		let uri: Uri = "file:///hover_comment.nym".parse().unwrap();
 		let text = "// just a comment\nfunc main(): void = {}";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
-		let result = hover(&docs, &mut cache, &params(&uri, 0, 5));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, 0, 5));
 		assert!(
 			result.is_none(),
 			"expected no hover over a comment, got {result:?}"
@@ -210,11 +181,11 @@ mod tests {
 		let uri: Uri = "file:///hover_let_kw.nym".parse().unwrap();
 		let text = "func main(): int = {\n  let x: int = 1\n  x\n}";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
 		//   "  let x: int = 1"
 		//    0123456789012345
-		let result = hover(&docs, &mut cache, &params(&uri, 1, 3));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, 1, 3));
 		let hover = result.expect("hovering the `let` keyword should resolve its own doc");
 		match hover.contents {
 			HoverContents::Markup(MarkupContent { value, .. }) => {
@@ -236,11 +207,11 @@ mod tests {
 		let uri: Uri = "file:///hover_var.nym".parse().unwrap();
 		let text = "func main(): int = {\n  let x: int = 1\n  x\n}";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
 		//   "  x"
 		//    012
-		let result = hover(&docs, &mut cache, &params(&uri, 2, 2));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, 2, 2));
 		let hover = result.expect("hovering a var use should resolve a type");
 		match hover.contents {
 			HoverContents::Markup(MarkupContent { value, .. }) => assert_eq!(value, code("int")),
@@ -259,8 +230,8 @@ mod tests {
 
 		for (text, utf16_column, resolves) in cases {
 			let docs = docs_with(&uri, text);
-			let mut cache = HoverCache::default();
-			let result = hover(&docs, &mut cache, &params(&uri, 0, utf16_column));
+			let mut cache = crate::compiler_state::CompilerState::new();
+			let result = hover_fixture(&docs, &mut cache, &params(&uri, 0, utf16_column));
 			assert_eq!(result.is_some(), resolves, "fixture {text:?}");
 		}
 	}
@@ -273,13 +244,13 @@ mod tests {
 		let uri: Uri = "file:///hover_call.nym".parse().unwrap();
 		let text = "func helper(): int = 1\nfunc main(): int = helper()";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
 		//   "func main(): int = helper()"
 		//    0123456789012345678901234567
 		// Column 26 is the `)` — covered by the `Call` but not by the
 		// `helper` `Identifier` (which ends at column 25).
-		let result = hover(&docs, &mut cache, &params(&uri, 1, 26));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, 1, 26));
 		assert!(
 			result.is_none(),
 			"expected None hovering a call's closing paren, got {result:?}"
@@ -293,10 +264,10 @@ mod tests {
 		let uri: Uri = "file:///hover_call_callee.nym".parse().unwrap();
 		let text = "func helper(): int = 1\nfunc main(): int = helper()";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
 		// Column 21 lands inside `helper`, the callee identifier itself.
-		let result = hover(&docs, &mut cache, &params(&uri, 1, 21));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, 1, 21));
 		let hover = result.expect("hovering the callee should resolve its function type");
 		match hover.contents {
 			HoverContents::Markup(MarkupContent { value, .. }) => {
@@ -312,11 +283,11 @@ mod tests {
 		let uri: Uri = "file:///hover_generic.nym".parse().unwrap();
 		let text = "func id<V>(v: V): V = v";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
 		//   "func id<V>(v: V): V = v"
 		//    01234567890123456789012
-		let result = hover(&docs, &mut cache, &params(&uri, 0, 22));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, 0, 22));
 		let hover = result.expect("hovering the returned `v` should resolve a type");
 		match hover.contents {
 			HoverContents::Markup(MarkupContent { value, .. }) => assert_eq!(value, code("V")),
@@ -331,11 +302,11 @@ mod tests {
 		let uri: Uri = "file:///hover_struct.nym".parse().unwrap();
 		let text = "struct Point(x: int, y: int)\nfunc main(): void = {}";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
 		let offset = text.find("Point").unwrap() + 1;
 		let (line, character) = line_col(text, offset);
-		let result = hover(&docs, &mut cache, &params(&uri, line, character));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, line, character));
 		let hover = result.expect("hovering the struct decl name should resolve");
 		match hover.contents {
 			HoverContents::Markup(MarkupContent { value, .. }) => {
@@ -350,11 +321,11 @@ mod tests {
 		let uri: Uri = "file:///hover_enum.nym".parse().unwrap();
 		let text = "enum Shape { Circle(radius: int), Square }\nfunc main(): void = {}";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
 		let offset = text.find("Shape").unwrap() + 1;
 		let (line, character) = line_col(text, offset);
-		let result = hover(&docs, &mut cache, &params(&uri, line, character));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, line, character));
 		let hover = result.expect("hovering the enum decl name should resolve");
 		match hover.contents {
 			HoverContents::Markup(MarkupContent { value, .. }) => {
@@ -369,11 +340,11 @@ mod tests {
 		let uri: Uri = "file:///hover_func_sig.nym".parse().unwrap();
 		let text = "func add(a: int, b: int): int = a + b";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
 		let offset = text.find("add").unwrap() + 1;
 		let (line, character) = line_col(text, offset);
-		let result = hover(&docs, &mut cache, &params(&uri, line, character));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, line, character));
 		let hover = result.expect("hovering the func decl name should resolve");
 		match hover.contents {
 			HoverContents::Markup(MarkupContent { value, .. }) => {
@@ -388,11 +359,11 @@ mod tests {
 		let uri: Uri = "file:///hover_generic_bound.nym".parse().unwrap();
 		let text = "interface Area {}\nfunc measure<T: Area>(t: T): int = 1";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
 		let offset = text.find("T: Area").unwrap(); // the param's own `T`
 		let (line, character) = line_col(text, offset);
-		let result = hover(&docs, &mut cache, &params(&uri, line, character));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, line, character));
 		let hover = result.expect("hovering the generic param decl should resolve");
 		match hover.contents {
 			HoverContents::Markup(MarkupContent { value, .. }) => {
@@ -407,13 +378,13 @@ mod tests {
 	#[test]
 	fn hovering_the_for_keyword_shows_its_doc_as_prose_not_a_leaked_type() {
 		let uri: Uri = "file:///hover_for_kw.nym".parse().unwrap();
-		let text = "func main(): void = {\n  for i in 1..3 { }\n}";
+		let text = "func main(): void = {\n  for (i in 1..3) { }\n}";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
 		let offset = text.find("for").unwrap() + 1;
 		let (line, character) = line_col(text, offset);
-		let result = hover(&docs, &mut cache, &params(&uri, line, character));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, line, character));
 		let hover = result.expect("hovering the `for` keyword should resolve its doc");
 		match hover.contents {
 			HoverContents::Markup(MarkupContent { value, .. }) => {
@@ -439,11 +410,11 @@ mod tests {
 		let uri: Uri = "file:///hover_operator.nym".parse().unwrap();
 		let text = "func main(): int = 1 + 2";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
 		let offset = text.find('+').unwrap();
 		let (line, character) = line_col(text, offset);
-		let result = hover(&docs, &mut cache, &params(&uri, line, character));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, line, character));
 		assert!(
 			result.is_none(),
 			"expected no hover over an operator, got {result:?}"
@@ -457,11 +428,11 @@ mod tests {
 		let uri: Uri = "file:///hover_pattern_variant.nym".parse().unwrap();
 		let text = "enum Shape { Circle(radius: int) }\nfunc f(s: Shape): int = match (s) { Circle(radius) -> radius }";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
 		let offset = text.find("Circle(radius) ->").unwrap() + 1;
 		let (line, character) = line_col(text, offset);
-		let result = hover(&docs, &mut cache, &params(&uri, line, character));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, line, character));
 		let hover = result.expect("hovering the arm's variant name should resolve");
 		match hover.contents {
 			HoverContents::Markup(MarkupContent { value, .. }) => {
@@ -476,11 +447,11 @@ mod tests {
 		let uri: Uri = "file:///hover_pattern_binder.nym".parse().unwrap();
 		let text = "enum Shape { Circle(radius: int) }\nfunc f(s: Shape): int = match (s) { Circle(radius) -> radius }";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
 		let offset = text.find("Circle(radius) ->").unwrap() + "Circle(".len() + 1;
 		let (line, character) = line_col(text, offset);
-		let result = hover(&docs, &mut cache, &params(&uri, line, character));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, line, character));
 		let hover = result.expect("hovering the arm's field binder should resolve");
 		match hover.contents {
 			HoverContents::Markup(MarkupContent { value, .. }) => {
@@ -493,13 +464,13 @@ mod tests {
 	#[test]
 	fn hovering_a_for_loop_binder_shows_the_element_type() {
 		let uri: Uri = "file:///hover_for_binder.nym".parse().unwrap();
-		let text = "func main(): int = {\n  let xs = #[1, 2, 3]\n  for x in xs { x }\n  0\n}";
+		let text = "func main(): int = {\n  let xs = #[1, 2, 3]\n  for (x in xs) { x }\n  0\n}";
 		let docs = docs_with(&uri, text);
-		let mut cache = HoverCache::default();
+		let mut cache = crate::compiler_state::CompilerState::new();
 
-		let offset = text.find("for x in").unwrap() + "for ".len();
+		let offset = text.find("for (x in").unwrap() + "for (".len();
 		let (line, character) = line_col(text, offset);
-		let result = hover(&docs, &mut cache, &params(&uri, line, character));
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, line, character));
 		let hover = result.expect("hovering the for-loop binder should resolve");
 		match hover.contents {
 			HoverContents::Markup(MarkupContent { value, .. }) => {

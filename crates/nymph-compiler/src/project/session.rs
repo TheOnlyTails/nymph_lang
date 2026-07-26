@@ -105,6 +105,8 @@ pub(crate) struct ProjectKey<'db> {
 	pub mode: EntryMode,
 	#[returns(copy)]
 	pub preserve_names: bool,
+	#[returns(copy)]
+	pub ambient_prelude: bool,
 }
 
 #[salsa::db]
@@ -125,10 +127,27 @@ struct SourceRecord {
 	version: SourceVersion,
 }
 
-pub(crate) struct ModuleAnalysis {
+/// Immutable parse/check result for one module in a session project.
+///
+/// This intentionally exposes compiler values rather than Salsa inputs or a
+/// database handle, so tooling can safely retain the result between requests.
+pub struct ModuleAnalysis {
 	pub module: Arc<nymph_ast::decl::Module>,
 	pub checked: Arc<nymph_sema::Checked>,
 	pub diagnostics: Arc<[ProjectDiagnostic]>,
+	pub(crate) checked_module: Arc<nymph_ast::decl::Module>,
+}
+
+impl ModuleAnalysis {
+	/// Query the checked type at a source offset.
+	///
+	/// This is the safe tooling seam: the private module has the exact flattened
+	/// declaration layout that produced `checked`, while `module` remains the
+	/// public source/rewrite AST used by lowering and NodeId/span annotations.
+	#[must_use]
+	pub fn type_at(&self, offset: usize) -> Option<String> {
+		nymph_sema::query::type_at(&self.checked_module, &self.checked, offset)
+	}
 }
 
 pub struct CompilerSession {
@@ -150,8 +169,7 @@ impl Default for CompilerSession {
 }
 
 impl CompilerSession {
-	#[allow(dead_code)]
-	pub(crate) fn module_analysis(
+	fn module_analysis(
 		&self,
 		project: ProjectId,
 		module: ModuleInput,
@@ -174,6 +192,50 @@ impl CompilerSession {
 		})
 	}
 
+	/// Return the shared immutable analysis for a reachable project module.
+	#[must_use]
+	pub fn analyze_module(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		mode: EntryMode,
+	) -> Option<Arc<ModuleAnalysis>> {
+		let input = self.registry.get(&(project.clone(), module))?.input;
+		let key = self.project_key(project.clone(), entry, mode, true, true);
+		self.module_analysis(project, input, key)
+	}
+
+	/// Return tooling analysis under the same compatibility key used by
+	/// [`Self::tooling_diagnostics`].
+	#[doc(hidden)]
+	#[must_use]
+	pub fn tooling_analyze_module(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		ambient_prelude: bool,
+	) -> Option<Arc<ModuleAnalysis>> {
+		let input = self.registry.get(&(project.clone(), module))?.input;
+		let key = self.tooling_key(project.clone(), entry, ambient_prelude);
+		self.module_analysis(project, input, key)
+	}
+
+	/// Check a tooling project with the exact key used by
+	/// [`Self::tooling_analyze_module`].
+	#[doc(hidden)]
+	#[must_use]
+	pub fn tooling_diagnostics(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		ambient_prelude: bool,
+	) -> Arc<[ProjectDiagnostic]> {
+		let key = self.tooling_key(project, entry, ambient_prelude);
+		super::compat::compat_checked_project(&self.db, key)
+	}
+
 	#[must_use]
 	pub fn new() -> Self {
 		Self::with_builtin_sources(
@@ -183,6 +245,17 @@ impl CompilerSession {
 			Arc::new(|_| {}),
 			256,
 		)
+	}
+
+	/// Create a session without the ambient embedded standard library.
+	///
+	/// Tooling uses this when checking the standard-library sources themselves,
+	/// where injecting the same sources as a prelude would duplicate every
+	/// declaration.
+	#[doc(hidden)]
+	#[must_use]
+	pub fn without_builtin_sources() -> Self {
+		Self::with_builtin_sources(BTreeMap::new(), Arc::new(|_| {}), 256)
 	}
 
 	pub(crate) fn from_builtin_sources(sources: BTreeMap<String, String>) -> Self {
@@ -397,7 +470,15 @@ impl CompilerSession {
 		});
 		queries::project_graph(
 			&self.db,
-			ProjectKey::new(&self.db, input, self.builtin_registry, entry, mode, false),
+			ProjectKey::new(
+				&self.db,
+				input,
+				self.builtin_registry,
+				entry,
+				mode,
+				false,
+				true,
+			),
 		)
 		.clone()
 	}
@@ -408,6 +489,7 @@ impl CompilerSession {
 		entry: ModulePath,
 		mode: EntryMode,
 		preserve_names: bool,
+		ambient_prelude: bool,
 	) -> ProjectKey<'_> {
 		let mut projects = self
 			.projects
@@ -425,7 +507,17 @@ impl CompilerSession {
 			entry,
 			mode,
 			preserve_names,
+			ambient_prelude,
 		)
+	}
+
+	fn tooling_key(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		ambient_prelude: bool,
+	) -> ProjectKey<'_> {
+		self.project_key(project, entry, EntryMode::Library, true, ambient_prelude)
 	}
 
 	#[must_use]
@@ -435,7 +527,19 @@ impl CompilerSession {
 		entry: ModulePath,
 		mode: EntryMode,
 	) -> Arc<[ProjectDiagnostic]> {
-		let key = self.project_key(project, entry, mode, false);
+		let key = self.project_key(project, entry, mode, false, true);
+		super::compat::compat_checked_project(&self.db, key)
+	}
+
+	#[doc(hidden)]
+	#[must_use]
+	pub fn check_project_without_prelude(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		mode: EntryMode,
+	) -> Arc<[ProjectDiagnostic]> {
+		let key = self.project_key(project, entry, mode, false, false);
 		super::compat::compat_checked_project(&self.db, key)
 	}
 
@@ -455,7 +559,7 @@ impl CompilerSession {
 		mode: EntryMode,
 		preserve_names: bool,
 	) -> Result<Arc<CompiledProject>, Arc<[ProjectDiagnostic]>> {
-		let key = self.project_key(project, entry, mode, preserve_names);
+		let key = self.project_key(project, entry, mode, preserve_names, true);
 		match super::compat::compat_compiled_project(&self.db, key).as_ref() {
 			super::compat::CompatCompiledProject::Compiled(compiled) => Ok(compiled.clone()),
 			super::compat::CompatCompiledProject::Diagnostics(diagnostics) => Err(diagnostics.clone()),
@@ -481,7 +585,7 @@ impl CompilerSession {
 		mode: EntryMode,
 		preserve_names: bool,
 	) -> Result<(std::collections::HashMap<String, String>, usize), Arc<[ProjectDiagnostic]>> {
-		let key = self.project_key(project, entry, mode, preserve_names);
+		let key = self.project_key(project, entry, mode, preserve_names, true);
 		let emitted = super::compat::compat_emitted_module(&self.db, key);
 		match &emitted.module_sources {
 			Ok(sources) => Ok((sources.clone().into_iter().collect(), emitted.entry_tag)),

@@ -7,17 +7,12 @@
 //!
 //! # Contract
 //!
-//! [`type_at`]'s `checked` argument MUST have come from
-//! [`crate::check_module`] run over this *same* `module` value (no
-//! prelude). `DefId`s are assigned by [`crate::def::build_def_map`] in
-//! declaration-encounter order, which is deterministic for a given module —
-//! but only line up with `checked.annotations`'s `DefId`s when both were
-//! computed from the identical AST. In particular, a prelude-flattened
-//! check (`check_module_with_prelude`) shifts every `DefId` by the
-//! prelude's own declaration count, so `type_at` must NOT be paired with
-//! it. This means operator-only expressions relying on the prelude
-//! (`Plus`, `Comparable`, …) may under-resolve; every literal, binding, and
-//! user-declared ADT still resolves correctly.
+//! [`type_at`]'s arguments MUST have the exact same declaration layout used
+//! for checking. Pointer identity is unnecessary and cloning the module is
+//! safe, but declaration filtering, order, and nesting must be identical:
+//! `DefId` and `DefKind::member` are assigned ordinally. For prelude-aware
+//! checks, use the [`crate::CheckedModule::module`] returned alongside its
+//! [`crate::CheckedModule::checked`].
 //!
 //! Only [`nymph_ast::expr::Expr`] nodes carry a [`nymph_ast::NodeId`] and
 //! get annotated — patterns (including a `let` binder's own name), types,

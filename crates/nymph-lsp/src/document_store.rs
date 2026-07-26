@@ -16,7 +16,7 @@ pub struct Document {
 	pub version: i32,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct DocumentStore {
 	docs: HashMap<Uri, Document>,
 }
@@ -48,5 +48,14 @@ impl DocumentStore {
 	#[must_use]
 	pub fn get(&self, uri: &Uri) -> Option<&Document> {
 		self.docs.get(uri)
+	}
+
+	#[must_use]
+	pub fn version(&self, uri: &Uri) -> Option<i32> {
+		self.docs.get(uri).map(|document| document.version)
+	}
+
+	pub fn iter(&self) -> impl Iterator<Item = (&Uri, &Document)> {
+		self.docs.iter()
 	}
 }

@@ -54,7 +54,7 @@ mod resolve;
 mod rewrite;
 mod session;
 
-pub use session::{CompilerSession, ModulePath, ProjectId, SourceVersion};
+pub use session::{CompilerSession, ModuleAnalysis, ModulePath, ProjectId, SourceVersion};
 
 #[cfg(feature = "test-support")]
 pub use metrics::{PhaseCounts, with_phase_counts};

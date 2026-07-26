@@ -68,7 +68,7 @@ use nymph_ast::{
 };
 use nymph_sema::Checked;
 
-use crate::{document_store::DocumentStore, line_index::LineIndex};
+use crate::{compiler_state::AnalysisSnapshot, line_index::LineIndex};
 
 // ── Legend (fixed index order — the classifier below must never reference
 // an index outside this table) ──────────────────────────────────────────
@@ -131,29 +131,32 @@ pub fn legend() -> SemanticTokensLegend {
 /// document isn't open, matching [`crate::definition::definition`] and
 /// [`crate::document_symbols::document_symbols`].
 #[must_use]
+#[cfg(not(test))]
 pub fn semantic_tokens_full(
-	docs: &DocumentStore,
+	snapshot: &AnalysisSnapshot,
 	params: &SemanticTokensParams,
 ) -> Option<SemanticTokensResult> {
-	let uri = &params.text_document.uri;
-	let doc = docs.get(uri)?;
-	let text = doc.text.as_str();
+	semantic_tokens_snapshot(snapshot, params)
+}
 
+pub(crate) fn semantic_tokens_snapshot(
+	snapshot: &AnalysisSnapshot,
+	params: &SemanticTokensParams,
+) -> Option<SemanticTokensResult> {
+	let _ = params;
+	let text = snapshot.source.as_ref();
+	let roles = build_role_map(&snapshot.analysis.module, &snapshot.analysis.checked);
+	Some(semantic_tokens_for_source(text, &roles))
+}
+
+fn semantic_tokens_for_source(text: &str, roles: &RoleMap) -> SemanticTokensResult {
 	let index = LineIndex::new(text);
 	let lexed = nymph_syntax::lex(text);
-	let parsed = nymph_syntax::parse_module(text, uri.path().as_str());
-	// A self-contained check, mirroring `hover.rs`'s uncached path (no
-	// prelude — see `nymph_sema::query::type_at`'s doc comment for what that
-	// trades away). Tolerant of partial/erroring input: `check_module`
-	// simply annotates less, which `build_role_map`'s use-site resolution
-	// treats as "fall back to `variable`", never a panic.
-	let checked = nymph_sema::check_module(&parsed.tree);
-	let roles = build_role_map(&parsed.tree, &checked);
 
 	let mut items: Vec<(Span, u32, u32)> = Vec::new();
 
 	for spanned in &lexed.tokens {
-		push_token(spanned, &roles, &mut items);
+		push_token(spanned, roles, &mut items);
 	}
 
 	for span in comment_spans(text, &lexed.tokens) {
@@ -169,10 +172,36 @@ pub fn semantic_tokens_full(
 		}
 	}
 
-	Some(SemanticTokensResult::Tokens(SemanticTokens {
+	SemanticTokensResult::Tokens(SemanticTokens {
 		result_id: None,
 		data: encode(pieces),
-	}))
+	})
+}
+
+#[cfg(test)]
+pub fn semantic_tokens_full(
+	docs: &crate::document_store::DocumentStore,
+	params: &SemanticTokensParams,
+) -> Option<SemanticTokensResult> {
+	let uri = &params.text_document.uri;
+	let document = docs.get(uri)?;
+	let mut owned_docs = docs.clone();
+	let mut state = crate::compiler_state::CompilerState::new();
+	state
+		.open(
+			&mut owned_docs,
+			uri.clone(),
+			document.text.clone(),
+			document.version,
+		)
+		.ok()?;
+	match state.analysis_for_uri(&owned_docs, uri) {
+		Some(snapshot) => semantic_tokens_snapshot(&snapshot, params),
+		None => Some(semantic_tokens_for_source(
+			&document.text,
+			&RoleMap::default(),
+		)),
+	}
 }
 
 /// Classify one lexed token and push its piece(s) into `items`. Identifiers
@@ -1308,6 +1337,7 @@ fn walk_pattern_uses(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::document_store::DocumentStore;
 	use lsp_types::{PartialResultParams, TextDocumentIdentifier, Uri, WorkDoneProgressParams};
 
 	fn docs_with(uri: &Uri, text: &str) -> DocumentStore {
@@ -1417,7 +1447,7 @@ mod tests {
 		let text = "\
 struct Point(x: int)
 enum Color { Red }
-func f(p: Point): int = match p { _ -> 1 } // c
+func f(p: Point): int = match (p) { _ -> 1 } // c
 ";
 		let decoded = tokens_for(text);
 		assert_sorted_and_non_overlapping(&decoded);
@@ -1461,9 +1491,9 @@ func f(p: Point): int = match p { _ -> 1 } // c
 		// `match` keyword.
 		assert_eq!(find(&decoded, 2, 24).type_name, "keyword");
 		// the match arm's `->` — the arrow the bug report is about.
-		assert_eq!(find(&decoded, 2, 36).type_name, "operator");
+		assert_eq!(find(&decoded, 2, 38).type_name, "operator");
 		// the trailing `// c` line comment.
-		assert_eq!(find(&decoded, 2, 43).type_name, "comment");
+		assert_eq!(find(&decoded, 2, 45).type_name, "comment");
 	}
 
 	#[test]

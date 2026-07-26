@@ -402,8 +402,11 @@ fn transitive_dependencies(
 }
 
 fn prelude(db: &dyn Db, key: ProjectKey<'_>, dependencies: &[CompatModuleInput]) -> Vec<Module> {
-	crate::prelude::core_prelude()
-		.iter()
+	key
+		.ambient_prelude(db)
+		.then(crate::prelude::core_prelude)
+		.into_iter()
+		.flatten()
 		.cloned()
 		.chain(dependencies.iter().map(|module| {
 			compat_rewritten_module(db, key, *module)
@@ -479,12 +482,13 @@ pub(crate) fn compat_module_analysis<'db>(
 	let dependencies = transitive_dependencies(db, key, module);
 	let prelude = prelude(db, key, &dependencies);
 	record_phase(CompilerPhase::Check);
-	let checked = if key.mode(db) == EntryMode::Entry && module.key(db) == key.entry(db).as_str() {
-		nymph_sema::check_module_entry_with_prelude(&rewritten.module, &prelude)
+	let paired = if key.mode(db) == EntryMode::Entry && module.key(db) == key.entry(db).as_str() {
+		nymph_sema::check_module_entry_with_prelude_and_module(&rewritten.module, &prelude)
 	} else {
-		nymph_sema::check_module_with_prelude(&rewritten.module, &prelude)
+		nymph_sema::check_module_with_prelude_and_module(&rewritten.module, &prelude)
 	};
-	let diagnostics = checked
+	let diagnostics = paired
+		.checked
 		.diags
 		.iter()
 		.cloned()
@@ -496,8 +500,9 @@ pub(crate) fn compat_module_analysis<'db>(
 		.into();
 	Arc::new(ModuleAnalysis {
 		module: rewritten.module.clone(),
-		checked: Arc::new(checked),
+		checked: Arc::new(paired.checked),
 		diagnostics,
+		checked_module: Arc::new(paired.module),
 	})
 }
 
@@ -1138,6 +1143,7 @@ mod tests {
 			ModulePath::new(entry).unwrap(),
 			mode,
 			preserve_names,
+			true,
 		);
 		let key = unsafe { std::mem::transmute::<ProjectKey<'_>, ProjectKey<'static>>(key) };
 		(db, key)
@@ -1274,6 +1280,7 @@ mod tests {
 			ModulePath::new("main").unwrap(),
 			EntryMode::Entry,
 			false,
+			true,
 		);
 		assert!(!Arc::ptr_eq(&symbols, &compat_symbol_map(&db_a, other_key)));
 		let main = symbols.handles["main"];
@@ -1285,6 +1292,7 @@ mod tests {
 			ModulePath::new("main").unwrap(),
 			EntryMode::Library,
 			false,
+			true,
 		);
 		assert!(!Arc::ptr_eq(
 			&entry_analysis,

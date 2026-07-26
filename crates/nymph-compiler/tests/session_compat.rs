@@ -23,6 +23,40 @@ fn session(files: &FxHashMap<&str, &str>) -> (CompilerSession, ProjectId) {
 }
 
 #[test]
+fn module_analysis_type_at_handles_complex_pattern_binders() {
+	for (source, needle, expected) in [
+		(
+			"enum Shape { Circle(radius: int) }\nfunc f(s: Shape): int = match (s) { Circle(radius) -> radius }",
+			"Circle(radius) ->",
+			"Shape.Circle(radius: int)",
+		),
+		(
+			"enum Shape { Circle(radius: int) }\nfunc f(s: Shape): int = match (s) { Circle(radius) -> radius }",
+			"radius) ->",
+			"int",
+		),
+		(
+			"func main(): int = {\n  let xs = #[1, 2, 3]\n  for (x in xs) { x }\n  0\n}",
+			"x in xs",
+			"int",
+		),
+	] {
+		let files = FxHashMap::from_iter([("main", source)]);
+		let (session, project) = session(&files);
+		let diagnostics = session.check_project(project.clone(), path("main"), EntryMode::Library);
+		assert!(
+			diagnostics.is_empty(),
+			"unexpected diagnostics: {diagnostics:?}"
+		);
+		let analysis = session
+			.analyze_module(project, path("main"), path("main"), EntryMode::Library)
+			.unwrap();
+		let offset = source.find(needle).unwrap() + usize::from(!needle.starts_with("x in"));
+		assert_eq!(analysis.type_at(offset).as_deref(), Some(expected));
+	}
+}
+
+#[test]
 fn session_checks_and_compiles_a_representative_project() {
 	let files = FxHashMap::from_iter([
 		(
