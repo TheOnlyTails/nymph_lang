@@ -47,8 +47,19 @@
 //!    fenced-off change to per-module name resolution in `nymph-sema`.
 
 mod bundle;
+mod metrics;
+mod queries;
 mod resolve;
 mod rewrite;
+mod session;
+
+pub use session::{CompilerSession, ModulePath, ProjectId, SourceVersion};
+
+#[cfg(feature = "test-support")]
+pub use metrics::{PhaseCounts, with_phase_counts};
+
+#[cfg(feature = "test-support")]
+pub use test_support::{GraphFixture, GraphShape};
 
 use ecow::EcoString;
 use nymph_ast::decl::{Module, Visibility};
@@ -57,13 +68,150 @@ use nymph_hir::hir::{HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirMethod, Hir
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use metrics::{CompilerPhase, capture_collector, install_collector, record_phase};
 use resolve::{GraphBuilder, RawModule};
 use rewrite::{DeclaredName, NsInfo, RewriteCtx, declared_names, rewrite_module};
+
+#[cfg(feature = "test-support")]
+mod test_support {
+	use std::collections::BTreeMap;
+
+	#[derive(Clone, Copy, Debug)]
+	pub enum GraphShape {
+		Wide { leaves: usize },
+		Deep { depth: usize },
+		Mixed { width: usize, depth: usize },
+	}
+
+	#[derive(Clone, Debug)]
+	pub struct GraphFixture {
+		entry: String,
+		sources: BTreeMap<String, String>,
+		leaves: Vec<String>,
+	}
+
+	impl GraphShape {
+		#[must_use]
+		pub fn generate(self) -> GraphFixture {
+			let mut fixture = GraphFixture {
+				entry: "main".to_string(),
+				sources: BTreeMap::new(),
+				leaves: Vec::new(),
+			};
+			let entry_imports: Vec<String> = match self {
+				Self::Wide { leaves } => (0..leaves)
+					.map(|index| {
+						let key = format!("wide/leaf_{index:03}");
+						fixture.add_module(&key, None, index);
+						fixture.leaves.push(key.clone());
+						key
+					})
+					.collect(),
+				Self::Deep { depth } => {
+					let mut parent = None;
+					for index in (0..depth).rev() {
+						let key = format!("deep/level_{index:03}");
+						fixture.add_module(&key, parent.as_deref(), index);
+						if parent.is_none() {
+							fixture.leaves.push(key.clone());
+						}
+						parent = Some(key);
+					}
+					parent.into_iter().collect()
+				}
+				Self::Mixed { width, depth } => (0..width)
+					.map(|branch| {
+						let mut child = None;
+						for level in (1..depth).rev() {
+							let key = format!("mixed/branch_{branch:03}/level_{level:03}");
+							fixture.add_module(&key, child.as_deref(), branch * depth + level);
+							if child.is_none() {
+								fixture.leaves.push(key.clone());
+							}
+							child = Some(key);
+						}
+						let head = format!("mixed/branch_{branch:03}");
+						fixture.add_module(&head, child.as_deref(), branch * depth);
+						head
+					})
+					.collect(),
+			};
+			let imports = entry_imports
+				.iter()
+				.map(|key| format!("import @/{key}"))
+				.collect::<Vec<_>>()
+				.join("\n");
+			fixture.sources.insert(
+				"main".to_string(),
+				format!("{imports}\npublic func root_value(): int = 0\n"),
+			);
+			fixture
+		}
+	}
+
+	impl GraphFixture {
+		fn add_module(&mut self, key: &str, child: Option<&str>, value: usize) {
+			let import = child.map_or_else(String::new, |child| format!("import @/{child}\n"));
+			self.sources.insert(
+				key.to_string(),
+				format!("{import}public func value_{value}(): int = {value}\n"),
+			);
+		}
+
+		#[must_use]
+		pub fn entry(&self) -> &str {
+			&self.entry
+		}
+		#[must_use]
+		pub fn sources(&self) -> &BTreeMap<String, String> {
+			&self.sources
+		}
+		#[must_use]
+		pub fn load(&self, key: &str) -> Option<String> {
+			self.sources.get(key).cloned()
+		}
+		#[must_use]
+		pub fn unresolved_imports(&self) -> Vec<String> {
+			self
+				.sources
+				.iter()
+				.flat_map(|(_, source)| source.lines())
+				.filter_map(|line| line.strip_prefix("import @/"))
+				.filter(|target| !self.sources.contains_key(*target))
+				.map(str::to_string)
+				.collect()
+		}
+		#[must_use]
+		pub fn retained_bytes(&self) -> usize {
+			self
+				.sources
+				.iter()
+				.map(|(key, source)| key.len() + source.len())
+				.sum()
+		}
+		pub fn replace_private_leaf_body(&mut self) {
+			let leaf = &self.leaves[0];
+			self
+				.sources
+				.get_mut(leaf)
+				.expect("leaf exists")
+				.push_str("let private_change = 1\n");
+		}
+		pub fn replace_public_leaf_signature(&mut self) {
+			let leaf = &self.leaves[0];
+			let source = self.sources.get_mut(leaf).expect("leaf exists");
+			*source =
+				source
+					.replacen("(): int", "(input: int): int", 1)
+					.replacen(" = ", " = input + ", 1);
+		}
+	}
+}
 
 /// A diagnostic attributed to one module of the project, keyed by its
 /// canonical path (e.g. `"main"`, `"geometry/vec"`) — the same key `load` was
 /// asked for. Render against `"<module>.nym"` and that module's own source.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ProjectDiagnostic {
 	pub module: String,
 	pub diag: Diagnostic,
@@ -342,6 +490,10 @@ impl Driver {
 
 		let order = builder.order;
 		let modules = builder.modules;
+		for _ in &modules {
+			record_phase(CompilerPhase::Parse);
+		}
+		record_phase(CompilerPhase::Graph);
 		let tags: FxHashMap<String, usize> = order
 			.iter()
 			.enumerate()
@@ -535,6 +687,7 @@ impl Driver {
 				declared: &declared,
 				diags: std::cell::RefCell::new(Vec::new()),
 			};
+			record_phase(CompilerPhase::Rewrite);
 			let rewritten = rewrite_module(&raw.tree, &ctx);
 			diags.extend(
 				ctx
@@ -616,25 +769,30 @@ impl Driver {
 	/// like an ordinary project module for diagnostic purposes, with no
 	/// `std::`-key special-casing at all.
 	fn check_all(&self) -> Vec<ProjectDiagnostic> {
+		let collector = capture_collector();
 		self
 			.order
 			.par_iter()
 			.map(|key| {
-				let prelude = self.prelude_slice(key);
-				let module = &self.processed[key];
-				let checked = if self.entry_mode && *key == self.entry {
-					nymph_sema::check_module_entry_with_prelude(module, &prelude)
-				} else {
-					nymph_sema::check_module_with_prelude(module, &prelude)
-				};
-				checked
-					.diags
-					.into_iter()
-					.map(|diag| ProjectDiagnostic {
-						module: key.clone(),
-						diag,
-					})
-					.collect::<Vec<_>>()
+				let collector = collector.clone();
+				install_collector(collector, || {
+					record_phase(CompilerPhase::Check);
+					let prelude = self.prelude_slice(key);
+					let module = &self.processed[key];
+					let checked = if self.entry_mode && *key == self.entry {
+						nymph_sema::check_module_entry_with_prelude(module, &prelude)
+					} else {
+						nymph_sema::check_module_with_prelude(module, &prelude)
+					};
+					checked
+						.diags
+						.into_iter()
+						.map(|diag| ProjectDiagnostic {
+							module: key.clone(),
+							diag,
+						})
+						.collect::<Vec<_>>()
+				})
 			})
 			.flatten()
 			.collect()
@@ -643,51 +801,57 @@ impl Driver {
 	fn assemble_module_sources(
 		&self,
 	) -> Result<(FxHashMap<String, String>, usize), Vec<ProjectDiagnostic>> {
+		let collector = capture_collector();
 		let checked_modules = self.order.par_iter().map(|key| {
-			let prelude = self.prelude_slice(key);
-			let module = &self.processed[key];
-			let checked = if self.entry_mode && *key == self.entry {
-				nymph_sema::check_module_entry_with_prelude(module, &prelude)
-			} else {
-				nymph_sema::check_module_with_prelude(module, &prelude)
-			};
-			let diags = checked
-				.diags
-				.iter()
-				.filter(|d| d.is_error())
-				.cloned()
-				.map(|diag| ProjectDiagnostic {
-					module: key.clone(),
-					diag,
-				})
-				.collect::<Vec<_>>();
-			if !diags.is_empty() {
-				return (diags, None);
-			}
-			// `prelude` is `core_prelude() ++ transitive_deps` (see `prelude_slice`),
-			// so the ambient `core` modules occupy the leading `core_prelude().len()`
-			// slots and everything after is an EMITTED dependency module — a call to
-			// one of those dep structs' methods lowers as a real class-method call
-			// rather than a (struct-unsupported) materialization.
-			let prelude_owners = crate::prelude::core_runtime_module_owners()
-				.map(nymph_sema::RuntimeOwner::Compiler)
-				.chain(
-					self
-						.transitive_deps(key)
-						.iter()
-						.cloned()
-						.map(Into::into)
-						.map(nymph_sema::RuntimeOwner::Project),
-				)
-				.collect::<Vec<_>>();
-			let hir = nymph_sema::lower_hir_with_prelude_runtime_and_deps_with_owners(
-				module,
-				&prelude,
-				&prelude_owners,
-				crate::prelude::core_prelude().len(),
-				&checked,
-			);
-			(Vec::new(), Some((key.clone(), hir)))
+			let collector = collector.clone();
+			install_collector(collector, || {
+				record_phase(CompilerPhase::Check);
+				let prelude = self.prelude_slice(key);
+				let module = &self.processed[key];
+				let checked = if self.entry_mode && *key == self.entry {
+					nymph_sema::check_module_entry_with_prelude(module, &prelude)
+				} else {
+					nymph_sema::check_module_with_prelude(module, &prelude)
+				};
+				let diags = checked
+					.diags
+					.iter()
+					.filter(|d| d.is_error())
+					.cloned()
+					.map(|diag| ProjectDiagnostic {
+						module: key.clone(),
+						diag,
+					})
+					.collect::<Vec<_>>();
+				if !diags.is_empty() {
+					return (diags, None);
+				}
+				// `prelude` is `core_prelude() ++ transitive_deps` (see `prelude_slice`),
+				// so the ambient `core` modules occupy the leading `core_prelude().len()`
+				// slots and everything after is an EMITTED dependency module — a call to
+				// one of those dep structs' methods lowers as a real class-method call
+				// rather than a (struct-unsupported) materialization.
+				let prelude_owners = crate::prelude::core_runtime_module_owners()
+					.map(nymph_sema::RuntimeOwner::Compiler)
+					.chain(
+						self
+							.transitive_deps(key)
+							.iter()
+							.cloned()
+							.map(Into::into)
+							.map(nymph_sema::RuntimeOwner::Project),
+					)
+					.collect::<Vec<_>>();
+				let hir = nymph_sema::lower_hir_with_prelude_runtime_and_deps_with_owners(
+					module,
+					&prelude,
+					&prelude_owners,
+					crate::prelude::core_prelude().len(),
+					&checked,
+				);
+				record_phase(CompilerPhase::Lower);
+				(Vec::new(), Some((key.clone(), hir)))
+			})
 		});
 		let mut diags = Vec::new();
 		let mut lowered_modules = Vec::new();
@@ -931,6 +1095,7 @@ impl Driver {
 
 		let mut module_sources: FxHashMap<String, String> = FxHashMap::default();
 		for (key, lowered) in lowered_modules {
+			record_phase(CompilerPhase::Emit);
 			let mut imports = imports_for(&lowered.module, Some(&key));
 			if let Some(mut names) = external_imports.remove(&key) {
 				names.sort_unstable();
@@ -1048,6 +1213,7 @@ impl Driver {
 
 	fn compile_all(&self) -> Result<CompiledProject, Vec<ProjectDiagnostic>> {
 		let (module_sources, entry_tag) = self.assemble_module_sources()?;
+		record_phase(CompilerPhase::Bundle);
 		let js = bundle::bundle(&self.entry, module_sources).map_err(|msg| {
 			vec![ProjectDiagnostic {
 				module: self.entry.clone(),

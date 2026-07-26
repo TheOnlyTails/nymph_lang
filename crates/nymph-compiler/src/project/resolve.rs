@@ -47,7 +47,7 @@ pub(crate) struct RawModule {
 
 /// The directory segments containing `key` (drops `key`'s own last segment —
 /// its file name). `"geometry/vec"` → `["geometry"]`; `"main"` → `[]`.
-fn dir_segments(key: &str) -> Vec<String> {
+pub(crate) fn dir_segments(key: &str) -> Vec<String> {
 	let mut segs: Vec<String> = key.split('/').map(String::from).collect();
 	segs.pop();
 	segs
@@ -72,7 +72,7 @@ fn dir_segments(key: &str) -> Vec<String> {
 /// `::`). [`GraphBuilder::visit_inner`] recognizes this prefix and loads the
 /// module through the driver's `std_provider` instead of `load`.
 #[allow(clippy::result_large_err)]
-fn resolve_import_target(
+pub(crate) fn resolve_import_target(
 	root: &ImportRoot,
 	path: &[Ident],
 	importer_key: &str,
@@ -104,16 +104,33 @@ fn resolve_import_target(
 				span,
 			));
 		}
+		// `@/` always denotes the caller-owned project root, including in
+		// compiler-owned sources. Only relative imports inherit `std::`.
 		ImportRoot::Project => Vec::new(),
-		ImportRoot::Current => dir_segments(importer_key),
+		ImportRoot::Current => {
+			let (builtin, key) = importer_key
+				.strip_prefix(STD_KEY_PREFIX)
+				.map_or((false, importer_key), |key| (true, key));
+			let mut segments = dir_segments(key);
+			if builtin {
+				segments.insert(0, STD_KEY_PREFIX.to_string());
+			}
+			segments
+		}
 		ImportRoot::Parent => {
-			let mut d = dir_segments(importer_key);
+			let (builtin, key) = importer_key
+				.strip_prefix(STD_KEY_PREFIX)
+				.map_or((false, importer_key), |key| (true, key));
+			let mut d = dir_segments(key);
 			if d.pop().is_none() {
 				return Err(Diagnostic::error(
 					"IMPORT-ESCAPES-ROOT".into(),
 					"this import escapes the source root (too many `../`)",
 					span,
 				));
+			}
+			if builtin {
+				d.insert(0, STD_KEY_PREFIX.to_string());
 			}
 			d
 		}
@@ -128,7 +145,8 @@ fn resolve_import_target(
 			span,
 		));
 	}
-	Ok(segs.join("/"))
+	let resolved = segs.join("/");
+	Ok(resolved.replacen("std::/", STD_KEY_PREFIX, 1))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -321,5 +339,35 @@ impl<'a> GraphBuilder<'a> {
 			self.order.push(key.to_string());
 		}
 		ok
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use nymph_ast::decl::Declaration;
+
+	use super::*;
+
+	fn resolve(source: &str, importer: &str) -> String {
+		let parsed = nymph_syntax::parse_module(source, "test.nym");
+		let Declaration::Import { root, path, .. } = &parsed.tree.members[0] else {
+			panic!("expected import declaration");
+		};
+		resolve_import_target(root, path, importer, Span::new(0, 0)).unwrap()
+	}
+
+	#[test]
+	fn builtin_relative_imports_remain_in_the_builtin_namespace() {
+		assert_eq!(resolve("import ./x", "std::io"), "std::x");
+		assert_eq!(
+			resolve("import ./x", "std::collections/tree"),
+			"std::collections/x"
+		);
+		assert_eq!(resolve("import ../x", "std::collections/tree"), "std::x");
+	}
+
+	#[test]
+	fn project_root_import_in_builtin_source_keeps_project_root_semantics() {
+		assert_eq!(resolve("import @/x", "std::collections/tree"), "x");
 	}
 }

@@ -1357,6 +1357,7 @@ dependencies = [
  "rayon",
  "rolldown",
  "rustc-hash",
+ "salsa",
  "tokio",
 ]
 

@@ -37,7 +37,7 @@ mod solve;
 mod unify;
 
 pub use annotate::{Annotations, Checked, DispatchKind, ExprInfo, IterMode, Resolution};
-pub use check::{check_module, check_module_entry, check_program};
+pub use check::{EntryMode, check_module, check_module_entry, check_program};
 pub use errors::TypeError;
 pub use lower_hir::{
 	LoweredHir, RuntimeOwner, lower_hir, lower_hir_with_prelude, lower_hir_with_prelude_and_deps,

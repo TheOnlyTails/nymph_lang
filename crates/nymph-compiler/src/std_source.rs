@@ -34,6 +34,10 @@ const STD_SOURCES: &[(&str, &str)] = &[
 	),
 ];
 
+pub(crate) fn embedded_std_sources() -> impl Iterator<Item = (&'static str, &'static str)> {
+	STD_SOURCES.iter().copied()
+}
+
 /// A std-source provider over the embedded `std` tree — pass to
 /// [`crate::compile_project_with_std`] / [`crate::check_project_with_std`].
 /// Given the provider path (`"io"`, `"collections/tree"`, …), returns the

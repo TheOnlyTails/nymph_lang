@@ -10,9 +10,8 @@ fn assert_baseline(shape: GraphShape) {
 	assert_eq!(fixture.unresolved_imports(), Vec::<String>::new());
 
 	let module_count = fixture.sources().len() as u64;
-	let (diags, counts) = with_phase_counts(|| {
-		check_project_library(fixture.entry(), &|key| fixture.load(key))
-	});
+	let (diags, counts) =
+		with_phase_counts(|| check_project_library(fixture.entry(), &|key| fixture.load(key)));
 	assert!(diags.is_empty(), "fixture should check cleanly: {diags:?}");
 	assert_eq!(counts.graph, 1);
 	assert_eq!(counts.rewrite, module_count);
@@ -42,8 +41,18 @@ fn generated_sources_compile_to_nonempty_output() {
 		GraphShape::Mixed { width: 4, depth: 4 },
 	] {
 		let fixture = shape.generate();
-		let compiled = compile_project_library(fixture.entry(), &|key| fixture.load(key))
-			.unwrap_or_else(|diags| panic!("fixture should compile cleanly: {diags:?}"));
+		let module_count = fixture.sources().len() as u64;
+		let (compiled, counts) =
+			with_phase_counts(|| compile_project_library(fixture.entry(), &|key| fixture.load(key)));
+		let compiled =
+			compiled.unwrap_or_else(|diags| panic!("fixture should compile cleanly: {diags:?}"));
 		assert!(!compiled.js.is_empty());
+		assert_eq!(counts.parse, module_count);
+		assert_eq!(counts.graph, 1);
+		assert_eq!(counts.rewrite, module_count);
+		assert_eq!(counts.check, module_count);
+		assert_eq!(counts.lower, module_count);
+		assert_eq!(counts.emit, module_count);
+		assert_eq!(counts.bundle, 1);
 	}
 }

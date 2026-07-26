@@ -56,20 +56,17 @@ use std::path::{Path, PathBuf};
 
 pub use nymph_diagnostics::{Diagnostic, Severity};
 pub use project::{
-	CompiledProject, ProjectDiagnostic, check_project, check_project_library,
-	check_project_library_with_std, check_project_with_std, compile_project, compile_project_library,
-	compile_project_library_with_std, compile_project_with_std,
+	CompiledProject, CompilerSession, ModulePath, ProjectDiagnostic, ProjectId, SourceVersion,
+	check_project, check_project_library, check_project_library_with_std, check_project_with_std,
+	compile_project, compile_project_library, compile_project_library_with_std,
+	compile_project_with_std,
 };
 pub use std_source::embedded_std_provider;
 
 /// Whether a compile/check pass should additionally require a valid
 /// top-level `main` entry point ([`nymph_sema::check_module_entry`]) or run
 /// as a plain library module ([`nymph_sema::check_module`]).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum EntryMode {
-	Library,
-	Entry,
-}
+use nymph_sema::EntryMode;
 
 /// Compile Nymph `source` to a JavaScript module string.
 ///
