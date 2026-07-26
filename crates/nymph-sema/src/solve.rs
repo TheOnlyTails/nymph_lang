@@ -877,17 +877,25 @@ impl Checker<'_> {
 		let subst = self.fresh_subst(def.generics.len());
 		let impl_self = self.subst(def.self_ty, &subst, None);
 		self.unify_self(recv, impl_self, span);
+		let implementation = def.definition.clone();
 		let target = def
 			.methods
 			.get(name)
+			.and_then(|method| method.definition.clone())
 			.or_else(|| {
-				self
+				let implementation = implementation.clone()?;
+				let interface_member = self
 					.interfaces
-					.get(&def.interface)
-					.and_then(|iface| iface.methods.get(name))
-			})
-			.and_then(|method| method.definition.clone());
-		let implementation = def.definition.clone();
+					.get(&def.interface)?
+					.methods
+					.get(name)?
+					.definition
+					.clone()?;
+				Some(DefinitionId::new(
+					implementation.module.clone(),
+					crate::DeclarationKey::materialized_interface_member(implementation, interface_member),
+				))
+			});
 
 		let Some((params, ret, source)) = self.method_signature(&def, &subst, recv, name) else {
 			// Unreachable in practice: `candidates` was assembled from interfaces whose

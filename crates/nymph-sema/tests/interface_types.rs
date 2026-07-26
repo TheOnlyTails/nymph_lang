@@ -269,6 +269,7 @@ fn complete_fixture() -> ModuleInterface {
 			binders: vec![binder],
 			constraints: vec![constraint],
 			members: vec![member],
+			member_slots: vec![],
 			runtime_owner: Some(owner),
 		}],
 		fingerprint: 7,

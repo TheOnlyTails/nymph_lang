@@ -577,6 +577,36 @@ pub(crate) fn runtime_definition<'db>(
 	let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
 		unreachable!()
 	};
+	if matches!(
+		definition.key,
+		nymph_sema::DeclarationKey::MaterializedInterfaceMember { .. }
+	) {
+		let slot = interface
+			.implementations
+			.iter()
+			.flat_map(|implementation| &implementation.member_slots)
+			.find(|slot| slot.member_id == definition)
+			.ok_or(super::session::RuntimeDefinitionError::ImplementationMemberMappingNotFound)?;
+		if slot.source != nymph_sema::ImplementationMemberSource::InheritedDefault
+			|| slot.implementation_id != slot.placement_owner
+		{
+			return Err(super::session::RuntimeDefinitionError::Extraction(
+				nymph_sema::RuntimeExtractionError::CorruptImplementationMemberMapping(definition),
+			));
+		}
+		return Ok(Arc::new(nymph_sema::RuntimeDefinition {
+			definition: slot.member_id.clone(),
+			source_owner: slot.body_definition_id.module.clone(),
+			placement: nymph_sema::RuntimePlacement::Attached {
+				owner: slot.placement_owner.clone(),
+				name: slot.name.clone(),
+			},
+			payload: nymph_sema::RuntimePayload::MaterializedInterfaceMember {
+				body_definition: slot.body_definition_id.clone(),
+				interface_member: slot.interface_member_id.clone(),
+			},
+		}));
+	}
 	let analysis = interface_module_analysis(db, key, module);
 	let source = match module {
 		SemanticModuleInput::Project(input) => input

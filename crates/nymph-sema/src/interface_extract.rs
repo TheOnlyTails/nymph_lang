@@ -1777,6 +1777,7 @@ fn extract_implementations(
 				binders,
 				constraints: checked_constraints(&implementation.constraints, checked, headers, &context)?,
 				members,
+				member_slots: Vec::new(),
 				runtime_owner: Some(id),
 			})
 		})
@@ -1909,6 +1910,7 @@ fn extract_implementations(
 				&impl_context,
 			)?,
 			members,
+			member_slots: Vec::new(),
 			runtime_owner: Some(id),
 		});
 	}
@@ -1969,7 +1971,104 @@ pub fn extract_module_interface_with_facts(
 			private.insert(definition.id.clone(), definition);
 		}
 	}
-	let implementations = extract_implementations(module, checked, headers, facts)?;
+	let mut implementations = extract_implementations(module, checked, headers, facts)?;
+	for implementation in &mut implementations {
+		let Some(interface_id) = &implementation.interface else {
+			continue;
+		};
+		let interface_shape = exports
+			.iter()
+			.chain(private.values())
+			.find(|definition| &definition.id == interface_id);
+		let imported_members = interface_shape
+			.is_none()
+			.then(|| {
+				let semantic_impl = checked
+					.semantic
+					.implementations
+					.impls
+					.iter()
+					.find(|candidate| candidate.definition.as_ref() == Some(&implementation.id))?;
+				let semantic_interface = checked.semantic.interfaces.get(&semantic_impl.interface)?;
+				Some(
+					semantic_interface
+						.methods
+						.iter()
+						.filter_map(|(name, member)| {
+							Some((
+								member.definition.clone()?,
+								name.clone(),
+								if member.mutating {
+									crate::MemberKind::MutatingFunction
+								} else {
+									crate::MemberKind::Function
+								},
+								member.has_default,
+							))
+						})
+						.collect::<Vec<_>>(),
+				)
+			})
+			.flatten();
+		let members = interface_shape
+			.map(|shape| {
+				shape
+					.members
+					.iter()
+					.map(|member| {
+						(
+							member.id.clone(),
+							member.name.clone(),
+							member.kind,
+							member.has_default,
+						)
+					})
+					.collect::<Vec<_>>()
+			})
+			.or(imported_members)
+			.unwrap_or_default();
+		implementation.member_slots = members
+			.iter()
+			.filter_map(
+				|(interface_member_id, interface_member_name, interface_member_kind, has_default)| {
+					let override_member = implementation.members.iter().find(|member| {
+						member.name == *interface_member_name && member.kind == *interface_member_kind
+					});
+					if let Some(member) = override_member {
+						return Some(crate::ImplementationMemberSlot {
+							implementation_id: implementation.id.clone(),
+							interface_member_id: interface_member_id.clone(),
+							member_id: member.id.clone(),
+							body_definition_id: member.id.clone(),
+							placement_owner: implementation.id.clone(),
+							kind: *interface_member_kind,
+							name: interface_member_name.clone(),
+							source: crate::ImplementationMemberSource::Override,
+						});
+					}
+					(*has_default).then(|| {
+						let member_id = DefinitionId::new(
+							implementation.id.module.clone(),
+							DeclarationKey::materialized_interface_member(
+								implementation.id.clone(),
+								interface_member_id.clone(),
+							),
+						);
+						crate::ImplementationMemberSlot {
+							implementation_id: implementation.id.clone(),
+							interface_member_id: interface_member_id.clone(),
+							member_id,
+							body_definition_id: interface_member_id.clone(),
+							placement_owner: implementation.id.clone(),
+							kind: *interface_member_kind,
+							name: interface_member_name.clone(),
+							source: crate::ImplementationMemberSource::InheritedDefault,
+						}
+					})
+				},
+			)
+			.collect();
+	}
 	let mut needed = HashSet::new();
 	for export in &exports {
 		referenced_definition_shape(export, &mut needed);
@@ -2463,6 +2562,7 @@ fn recover_implementations(
 				binders: binders.clone(),
 				constraints: recover_generic_constraints(generics, &binders, headers),
 				members: recover_members(members, &id, headers, &binders, &mut member_ids),
+				member_slots: Vec::new(),
 				runtime_owner: Some(id),
 			})
 		})
@@ -2509,6 +2609,7 @@ fn recover_implementations(
 			binders: binders.clone(),
 			constraints: recover_generic_constraints(generics, &binders, headers),
 			members: recover_members(members, &id, headers, &binders, &mut member_ids),
+			member_slots: Vec::new(),
 			runtime_owner: Some(id),
 		});
 	}
@@ -2655,6 +2756,7 @@ fn recover_implementations(
 					&binders,
 					&mut member_ids,
 				),
+				member_slots: Vec::new(),
 				runtime_owner: Some(id),
 			});
 		}
@@ -2981,7 +3083,7 @@ pub fn recover_module_environment_with_facts(
 		}
 	}
 	let context = context(checked, headers);
-	let exports = module
+	let exports: Vec<RecoveredExportedDefinition> = module
 		.members
 		.iter()
 		.filter_map(|declaration| {
@@ -3001,7 +3103,60 @@ pub fn recover_module_environment_with_facts(
 		.filter(|definition| !visible(definition.visibility))
 		.map(|definition| (definition.id.clone(), definition))
 		.collect::<HashMap<_, _>>();
-	let implementations = recover_implementations(module, checked, headers, facts);
+	let mut implementations = recover_implementations(module, checked, headers, facts);
+	for implementation in &mut implementations {
+		let Some(crate::RecoveredDefinitionReference::Known(interface_id)) = &implementation.interface
+		else {
+			continue;
+		};
+		let Some(interface_shape) = exports
+			.iter()
+			.chain(private.values())
+			.find(|definition| &definition.id == interface_id)
+		else {
+			continue;
+		};
+		implementation.member_slots = interface_shape
+			.members
+			.iter()
+			.filter_map(|interface_member| {
+				let override_member = implementation.members.iter().find(|member| {
+					member.name == interface_member.name && member.kind == interface_member.kind
+				});
+				let (member_id, body_definition_id, source) = if let Some(member) = override_member {
+					(
+						member.id.clone(),
+						member.id.clone(),
+						crate::ImplementationMemberSource::Override,
+					)
+				} else if interface_member.has_default {
+					(
+						DefinitionId::new(
+							implementation.id.module.clone(),
+							DeclarationKey::materialized_interface_member(
+								implementation.id.clone(),
+								interface_member.id.clone(),
+							),
+						),
+						interface_member.id.clone(),
+						crate::ImplementationMemberSource::InheritedDefault,
+					)
+				} else {
+					return None;
+				};
+				Some(crate::ImplementationMemberSlot {
+					implementation_id: implementation.id.clone(),
+					interface_member_id: interface_member.id.clone(),
+					member_id,
+					body_definition_id,
+					placement_owner: implementation.id.clone(),
+					kind: interface_member.kind,
+					name: interface_member.name.clone(),
+					source,
+				})
+			})
+			.collect();
+	}
 	let mut needed = HashSet::new();
 	for definition in &exports {
 		referenced_recovered_definition_shape(definition, &mut needed);

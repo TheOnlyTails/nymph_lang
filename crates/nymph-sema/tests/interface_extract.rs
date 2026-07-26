@@ -4,10 +4,89 @@ use nymph_hir::hir::MarshalKind;
 use nymph_sema::{
 	DeclarationCategory, DeclarationKey, DefinitionId, DefinitionShapeKind, EntryMode,
 	ExportedDefinition, InterfaceType, ModuleEnvironment, ModuleIdentity, ModuleInterface,
-	RecoveredDefinitionReference, RecoveredInterfaceType, SemanticEnvironment, check_module,
-	check_module_with_environment, declared_headers, extract_module_interface,
+	ModuleOrigin, RecoveredDefinitionReference, RecoveredInterfaceType, SemanticEnvironment,
+	check_module, check_module_with_environment, declared_headers, extract_module_interface,
 	extract_module_interface_with_facts, recover_module_environment,
 };
+
+#[test]
+fn implementation_member_slots_materialize_defaults_structurally() {
+	let source = r#"
+interface Pair {
+	func left(): int = this.right()
+	func right(): int = 2
+}
+struct A
+struct B
+impl Pair for A { func right(): int = 3 }
+impl Pair for B {}
+"#;
+	let parsed = nymph_syntax::parse_module(source, "slots.nym");
+	assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+	let module = Arc::new(parsed.tree);
+	let identity = ModuleIdentity {
+		origin: ModuleOrigin::Project("slots".into()),
+		project: "slots".into(),
+		path: "main".into(),
+	};
+	let environment = nymph_sema::SemanticEnvironment::from_modules(identity.clone(), &[]).unwrap();
+	let result = nymph_sema::check_module_with_environment(
+		module.clone(),
+		identity.clone(),
+		&environment,
+		nymph_sema::EntryMode::Library,
+	);
+	assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+	let checked = nymph_sema::Checked {
+		diags: vec![],
+		facts: result.analysis.checked.as_ref().clone(),
+	};
+	let headers = nymph_sema::declared_headers(identity.clone(), &module);
+	let interface =
+		nymph_sema::extract_module_interface(identity, &module, &checked, &headers).unwrap();
+	let pair = interface
+		.exports
+		.iter()
+		.find(|item| item.name == "Pair")
+		.unwrap();
+	let left = pair
+		.members
+		.iter()
+		.find(|member| member.name == "left")
+		.unwrap();
+	let right = pair
+		.members
+		.iter()
+		.find(|member| member.name == "right")
+		.unwrap();
+	let a = &interface.implementations[0];
+	let b = &interface.implementations[1];
+	let a_left = a
+		.member_slots
+		.iter()
+		.find(|slot| slot.interface_member_id == left.id)
+		.unwrap();
+	let a_right = a
+		.member_slots
+		.iter()
+		.find(|slot| slot.interface_member_id == right.id)
+		.unwrap();
+	let b_left = b
+		.member_slots
+		.iter()
+		.find(|slot| slot.interface_member_id == left.id)
+		.unwrap();
+	assert_eq!(a_right.member_id, a_right.body_definition_id);
+	assert_eq!(
+		a_right.source,
+		nymph_sema::ImplementationMemberSource::Override
+	);
+	assert_eq!(a_left.body_definition_id, left.id);
+	assert_eq!(b_left.body_definition_id, left.id);
+	assert_ne!(a_left.member_id, b_left.member_id);
+	assert_eq!(a_left.implementation_id, a.id);
+	assert_eq!(a_left.placement_owner, a.id);
+}
 
 fn parse(source: &str) -> nymph_ast::decl::Module {
 	let parsed = nymph_syntax::parse_module(source, "fixture.nym");

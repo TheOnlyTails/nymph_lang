@@ -312,6 +312,7 @@ fn id_name(id: &DefinitionId) -> EcoString {
 		DeclarationKey::Implementation { .. } | DeclarationKey::RecoveredImplementation { .. } => {
 			"<impl>".into()
 		}
+		DeclarationKey::MaterializedInterfaceMember { .. } => "<materialized>".into(),
 	}
 }
 

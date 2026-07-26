@@ -400,7 +400,26 @@ pub struct ExportedImpl {
 	pub binders: Vec<GenericParameter>,
 	pub constraints: Vec<GenericConstraint>,
 	pub members: Vec<MemberShape<InterfaceType>>,
+	pub member_slots: Vec<ImplementationMemberSlot>,
 	pub runtime_owner: Option<DefinitionId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub enum ImplementationMemberSource {
+	Override,
+	InheritedDefault,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub struct ImplementationMemberSlot {
+	pub implementation_id: DefinitionId,
+	pub interface_member_id: DefinitionId,
+	pub member_id: DefinitionId,
+	pub body_definition_id: DefinitionId,
+	pub placement_owner: DefinitionId,
+	pub kind: MemberKind,
+	pub name: EcoString,
+	pub source: ImplementationMemberSource,
 }
 
 #[derive(Clone, Debug, salsa::SalsaValue)]
@@ -498,6 +517,7 @@ pub struct RecoveredExportedImpl {
 	pub binders: Vec<GenericParameter>,
 	pub constraints: Vec<RecoveredGenericConstraint>,
 	pub members: Vec<RecoveredMemberShape>,
+	pub member_slots: Vec<ImplementationMemberSlot>,
 	pub runtime_owner: Option<DefinitionId>,
 }
 #[derive(Clone, Debug, salsa::SalsaValue)]

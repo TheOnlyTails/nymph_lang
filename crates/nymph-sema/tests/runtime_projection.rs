@@ -50,6 +50,28 @@ func generic<T: Value>(item: T): T = { let x = 1 + 2
 }
 "#;
 	let first = project(body);
+	let materialized = first
+		.iter()
+		.find(|artifact| {
+			matches!(
+				artifact.payload,
+				RuntimePayload::MaterializedInterfaceMember { .. }
+			)
+		})
+		.expect("default implementation publishes a materialized artifact");
+	let RuntimePayload::MaterializedInterfaceMember {
+		body_definition,
+		interface_member,
+	} = &materialized.payload
+	else {
+		unreachable!()
+	};
+	assert_eq!(body_definition, interface_member);
+	assert_eq!(materialized.source_owner, body_definition.module);
+	assert!(matches!(
+		materialized.definition.key,
+		nymph_sema::DeclarationKey::MaterializedInterfaceMember { .. }
+	));
 	let shifted = project(&format!("func unrelated(): int = 99\n{body}"));
 	let find = |items: &[nymph_sema::RuntimeDefinition]| {
 		items
@@ -73,6 +95,17 @@ func generic<T: Value>(item: T): T = { let x = 1 + 2
 			.types
 			.iter()
 			.any(|(_, ty)| matches!(ty, InterfaceType::Generic(_)))
+	);
+	assert!(
+		body
+			.annotations
+			.dispatches
+			.iter()
+			.any(|(_, dispatch)| matches!(
+				dispatch,
+				StableDispatch::InterfaceDefault { member, .. }
+					if matches!(member.key, nymph_sema::DeclarationKey::MaterializedInterfaceMember { .. })
+			))
 	);
 	assert!(
 		body
@@ -140,4 +173,42 @@ fn inconsistent_checked_interface_reports_typed_missing_stable_identity() {
 			"MissingShape".into()
 		)),
 	);
+}
+
+#[test]
+fn implementation_projection_uses_checker_identity_not_export_shape_order() {
+	let source = r#"
+interface Show { func show(): int }
+struct Left
+struct Right
+impl Show for Left { func show(): int = 1 }
+impl Show for Right { func show(): int = 2 }
+"#;
+	let parsed = nymph_syntax::parse_module(source, "fixture.nym");
+	assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+	let module = std::sync::Arc::new(parsed.tree);
+	let identity = ModuleIdentity {
+		origin: ModuleOrigin::Project("runtime-projection".into()),
+		project: "runtime-projection".into(),
+		path: "main".into(),
+	};
+	let environment = SemanticEnvironment::from_modules(identity.clone(), &[]).unwrap();
+	let result = check_module_with_environment(
+		module.clone(),
+		identity.clone(),
+		&environment,
+		EntryMode::Library,
+	);
+	assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+	let checked = nymph_sema::Checked {
+		diags: Vec::new(),
+		facts: result.analysis.checked.as_ref().clone(),
+	};
+	let headers = declared_headers(identity.clone(), &module);
+	let interface = extract_module_interface(identity, &module, &checked, &headers).unwrap();
+	let expected = runtime_definitions(&module, source, &checked.facts, &interface).unwrap();
+	let mut reordered = interface.clone();
+	reordered.implementations.reverse();
+	let actual = runtime_definitions(&module, source, &checked.facts, &reordered).unwrap();
+	assert_eq!(actual, expected);
 }

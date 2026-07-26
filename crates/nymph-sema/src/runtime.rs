@@ -172,6 +172,10 @@ pub struct EnumShell {
 #[derive(Clone, Debug, PartialEq, Eq, salsa::SalsaValue)]
 pub enum RuntimePayload {
 	NymphBody(CheckedRuntimeBody),
+	MaterializedInterfaceMember {
+		body_definition: DefinitionId,
+		interface_member: DefinitionId,
+	},
 	External(crate::ExternalAbi),
 	Struct(StructShell),
 	Enum(EnumShell),
@@ -203,7 +207,7 @@ pub fn runtime_definitions(
 	let shape = |category, name: &str| {
 		shapes.iter().copied().find(|shape| matches!(&shape.id.key, crate::DeclarationKey::TopLevel { category: found, .. } if *found == category) && shape.name == name)
 	};
-	let mut used_implementations = std::collections::BTreeSet::new();
+	let implementation_bindings = implementation_bindings(module, checked)?;
 	for declaration in &module.members {
 		match declaration {
 			nymph_ast::decl::Declaration::Func { meta, body, .. } => {
@@ -304,12 +308,8 @@ pub fn runtime_definitions(
 				});
 				extract_members(&mut result, members, &item.members, source, checked)?;
 				for nested in impls {
-					let implementation = implementation_for_members(
-						interface,
-						&nested.0.members,
-						Some(&item.id),
-						&mut used_implementations,
-					)?;
+					let implementation =
+						required_implementation(interface, &implementation_bindings, &nested.0.members)?;
 					extract_implementation_members(
 						&mut result,
 						&nested.0.members,
@@ -326,8 +326,7 @@ pub fn runtime_definitions(
 			}
 			nymph_ast::decl::Declaration::Impl { members, .. }
 			| nymph_ast::decl::Declaration::ImplFor { members, .. } => {
-				let implementation =
-					implementation_for_members(interface, members, None, &mut used_implementations)?;
+				let implementation = required_implementation(interface, &implementation_bindings, members)?;
 				extract_implementation_members(&mut result, members, implementation, source, checked)?;
 			}
 			nymph_ast::decl::Declaration::Interface { name, members, .. } => {
@@ -369,12 +368,8 @@ pub fn runtime_definitions(
 							}
 						}
 						InterfaceMember::Impl { members, .. } => {
-							let implementation = implementation_for_members(
-								interface,
-								members,
-								Some(&item.id),
-								&mut used_implementations,
-							)?;
+							let implementation =
+								required_implementation(interface, &implementation_bindings, members)?;
 							extract_implementation_members(
 								&mut result,
 								members,
@@ -387,6 +382,41 @@ pub fn runtime_definitions(
 				}
 			}
 			_ => {}
+		}
+	}
+	for implementation in &interface.implementations {
+		for slot in &implementation.member_slots {
+			if slot.implementation_id != implementation.id
+				|| slot.placement_owner != implementation.id
+				|| slot.member_id.module != implementation.id.module
+			{
+				return Err(RuntimeExtractionError::CorruptImplementationMemberMapping(
+					slot.member_id.clone(),
+				));
+			}
+			if slot.source != crate::ImplementationMemberSource::InheritedDefault {
+				continue;
+			}
+			if result
+				.iter()
+				.any(|artifact| artifact.definition == slot.member_id)
+			{
+				return Err(RuntimeExtractionError::CorruptImplementationMemberMapping(
+					slot.member_id.clone(),
+				));
+			}
+			result.push(RuntimeDefinition {
+				definition: slot.member_id.clone(),
+				source_owner: slot.body_definition_id.module.clone(),
+				placement: RuntimePlacement::Attached {
+					owner: slot.placement_owner.clone(),
+					name: slot.name.clone(),
+				},
+				payload: RuntimePayload::MaterializedInterfaceMember {
+					body_definition: slot.body_definition_id.clone(),
+					interface_member: slot.interface_member_id.clone(),
+				},
+			});
 		}
 	}
 	Ok(result)
@@ -402,6 +432,7 @@ pub enum RuntimeExtractionError {
 	IncompleteDispatchTarget(EcoString),
 	IncompleteVariantTarget(EcoString),
 	MissingIterationProtocol,
+	CorruptImplementationMemberMapping(DefinitionId),
 }
 
 fn required_top_level(
@@ -490,44 +521,60 @@ fn extract_members(
 	Ok(())
 }
 
-fn implementation_for_members<'a>(
+fn required_implementation<'a>(
 	interface: &'a crate::ModuleInterface,
-	syntax: &[nymph_ast::Spanned<ImplMember>],
-	runtime_owner: Option<&DefinitionId>,
-	used: &mut std::collections::BTreeSet<DefinitionId>,
+	bindings: &std::collections::BTreeMap<usize, DefinitionId>,
+	members: &Vec<nymph_ast::Spanned<ImplMember>>,
 ) -> Result<&'a crate::ExportedImpl, RuntimeExtractionError> {
-	let names = syntax
-		.iter()
-		.filter_map(|member| match &member.0 {
-			ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => {
-				Some(meta.name.0.as_str())
-			}
-			ImplMember::Let { .. } | ImplMember::ExternalLet(..) => None,
-		})
-		.collect::<Vec<_>>();
-	let matches = interface
+	let id = bindings
+		.get(&(members as *const Vec<_> as usize))
+		.ok_or(RuntimeExtractionError::MissingImplementation)?;
+	interface
 		.implementations
 		.iter()
-		.filter(|implementation| {
-			!used.contains(&implementation.id)
-				&& runtime_owner.is_none_or(|owner| {
-					implementation.runtime_owner.as_ref() == Some(owner)
-						|| matches!(&implementation.self_type, InterfaceType::Named { definition, .. } if definition == owner)
-				})
-				&& implementation.members.len() == names.len()
-				&& implementation
-					.members
-					.iter()
-					.map(|member| member.name.as_str())
-					.eq(names.iter().copied())
+		.find(|implementation| &implementation.id == id)
+		.ok_or(RuntimeExtractionError::MissingImplementation)
+}
+
+/// Associates source declarations with the exact identities assigned before
+/// body checking. The ordering here mirrors collection, but projection retains
+/// only declaration-address → stable-ID facts; it never compares member shapes.
+fn implementation_bindings(
+	module: &nymph_ast::decl::Module,
+	checked: &crate::CheckedFacts,
+) -> Result<std::collections::BTreeMap<usize, DefinitionId>, RuntimeExtractionError> {
+	let mut syntax = module
+		.members
+		.iter()
+		.filter_map(|declaration| match declaration {
+			nymph_ast::decl::Declaration::ImplFor { members, .. } => Some(members),
+			_ => None,
 		})
+		.chain(module.members.iter().flat_map(|declaration| {
+			match declaration {
+				nymph_ast::decl::Declaration::Struct { impls, .. }
+				| nymph_ast::decl::Declaration::Enum { impls, .. } => impls
+					.iter()
+					.map(|implementation| &implementation.0.members)
+					.collect::<Vec<_>>(),
+				_ => Vec::new(),
+			}
+		}))
 		.collect::<Vec<_>>();
-	let implementation = matches
-		.first()
-		.copied()
-		.ok_or(RuntimeExtractionError::MissingImplementation)?;
-	used.insert(implementation.id.clone());
-	Ok(implementation)
+	let implementations =
+		&checked.semantic.implementations.impls[checked.semantic.local_implementations.clone()];
+	if syntax.len() != implementations.len() {
+		return Err(RuntimeExtractionError::MissingImplementation);
+	}
+	let mut result = std::collections::BTreeMap::new();
+	for (members, implementation) in syntax.drain(..).zip(implementations) {
+		let id = implementation
+			.definition
+			.clone()
+			.ok_or(RuntimeExtractionError::MissingImplementation)?;
+		result.insert(members as *const _ as usize, id);
+	}
+	Ok(result)
 }
 
 fn extract_implementation_members(
@@ -546,19 +593,9 @@ fn extract_implementation_members(
 			.members
 			.iter()
 			.find(|member| member.name == name);
-		let definition = existing.map_or_else(
-			|| {
-				DefinitionId::new(
-					implementation.id.module.clone(),
-					crate::DeclarationKey::member(
-						implementation.id.clone(),
-						crate::DeclarationCategory::Method,
-						name,
-					),
-				)
-			},
-			|member| member.id.clone(),
-		);
+		let definition = existing
+			.map(|member| member.id.clone())
+			.ok_or(RuntimeExtractionError::MissingImplementation)?;
 		let placement = RuntimePlacement::Attached {
 			owner: implementation.id.clone(),
 			name: name.into(),
@@ -701,24 +738,24 @@ fn runtime_annotations(
 			dispatches.push((id, stable_dispatch(checked, resolution)?));
 		}
 	}
-	let definition_targets = checked
+	let mut definition_targets = checked
 		.annotations
 		.definition_targets()
 		.filter_map(|(id, target)| local.get(&id).map(|id| (*id, target.clone())))
 		.collect::<Vec<_>>();
-	let variants = checked
+	let mut variants = checked
 		.annotations
 		.variants()
 		.filter_map(|(id, variant)| local.get(&id).map(|id| (*id, variant)))
 		.map(|(id, variant)| Ok((id, expression_variant(checked, variant)?)))
 		.collect::<Result<Vec<_>, RuntimeExtractionError>>()?;
-	let pattern_variants = checked
+	let mut pattern_variants = checked
 		.annotations
 		.pattern_variants()
 		.filter_map(|(span, variant)| patterns.get(&span).map(|id| (*id, variant)))
 		.map(|(id, variant)| Ok((id, pattern_variant(checked, variant)?)))
 		.collect::<Result<Vec<_>, RuntimeExtractionError>>()?;
-	let positional_fields = patterns
+	let mut positional_fields = patterns
 		.iter()
 		.filter_map(|(span, id)| {
 			checked
@@ -776,7 +813,11 @@ fn runtime_annotations(
 		}
 	}
 	types.sort_by_key(|item| item.0);
+	definition_targets.sort_by_key(|item| item.0);
 	dispatches.sort_by_key(|item| item.0);
+	variants.sort_by_key(|item| item.0);
+	pattern_variants.sort_by_key(|item| item.0);
+	positional_fields.sort_by_key(|item| item.0);
 	iterations.sort_by_key(|item| item.0);
 	anonymous_closures.sort_by_key(|item| item.0);
 	let mut external_marshals = Vec::new();
@@ -813,16 +854,9 @@ fn stable_dispatch(
 		}),
 		kind => {
 			if let Some(implementation) = resolution.implementation.clone() {
-				let member = resolution.target.clone().unwrap_or_else(|| {
-					DefinitionId::new(
-						implementation.module.clone(),
-						crate::DeclarationKey::member(
-							implementation.clone(),
-							crate::DeclarationCategory::Method,
-							resolution.method.clone(),
-						),
-					)
-				});
+				let member = resolution.target.clone().ok_or_else(|| {
+					RuntimeExtractionError::IncompleteDispatchTarget(resolution.method.clone())
+				})?;
 				let interface = match &implementation.key {
 					crate::DeclarationKey::Implementation { header, .. } => header.interface.clone(),
 					_ => None,
@@ -925,16 +959,7 @@ fn stable_interface_member(
 		.filter_map(|(id, interface)| {
 			let method = interface.methods.get(&resolution.method)?;
 			let owner = checked.semantic.definitions.stable(*id)?.clone();
-			let member = method.definition.clone().unwrap_or_else(|| {
-				DefinitionId::new(
-					owner.module.clone(),
-					crate::DeclarationKey::member(
-						owner.clone(),
-						crate::DeclarationCategory::Method,
-						resolution.method.clone(),
-					),
-				)
-			});
+			let member = method.definition.clone()?;
 			Some((owner, member))
 		})
 		.collect::<Vec<_>>();

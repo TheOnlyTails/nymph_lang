@@ -310,6 +310,10 @@ pub enum DeclarationKey {
 		name: EcoString,
 		duplicate: u32,
 	},
+	MaterializedInterfaceMember {
+		implementation: Box<DefinitionId>,
+		interface_member: Box<DefinitionId>,
+	},
 }
 
 impl DeclarationKey {
@@ -356,6 +360,16 @@ impl DeclarationKey {
 		}
 	}
 
+	pub fn materialized_interface_member(
+		implementation: DefinitionId,
+		interface_member: DefinitionId,
+	) -> Self {
+		Self::MaterializedInterfaceMember {
+			implementation: Box::new(implementation),
+			interface_member: Box::new(interface_member),
+		}
+	}
+
 	pub fn duplicate(&self) -> u32 {
 		match self {
 			Self::TopLevel { duplicate, .. }
@@ -363,6 +377,7 @@ impl DeclarationKey {
 			| Self::Implementation { duplicate, .. }
 			| Self::RecoveredImplementation { duplicate, .. }
 			| Self::MethodBody { duplicate, .. } => *duplicate,
+			Self::MaterializedInterfaceMember { .. } => 0,
 		}
 	}
 
@@ -373,6 +388,12 @@ impl DeclarationKey {
 			| Self::Implementation { duplicate, .. }
 			| Self::RecoveredImplementation { duplicate, .. }
 			| Self::MethodBody { duplicate, .. } => *duplicate = value,
+			Self::MaterializedInterfaceMember { .. } => {
+				assert_eq!(
+					value, 0,
+					"structural materialized member IDs cannot have duplicates"
+				);
+			}
 		}
 		self
 	}

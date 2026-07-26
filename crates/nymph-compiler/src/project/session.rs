@@ -298,6 +298,7 @@ pub enum RuntimeDefinitionError {
 	OwnerNotFound,
 	DuplicateOwner,
 	DefinitionNotFound,
+	ImplementationMemberMappingNotFound,
 }
 
 pub struct CompilerSession {

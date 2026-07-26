@@ -245,6 +245,7 @@ fn recovered_dependency_poison_suppresses_cascades_without_hiding_independent_er
 		binders: vec![],
 		constraints: vec![],
 		members: vec![],
+		member_slots: vec![],
 		runtime_owner: None,
 	};
 	let recovered = Arc::new(ModuleEnvironment::Recovered(RecoveredModuleInterface {

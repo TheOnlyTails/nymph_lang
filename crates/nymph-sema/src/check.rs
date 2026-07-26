@@ -233,11 +233,10 @@ fn check_module_from_parts(
 	checker.collect_inner_impls();
 	checker.check_coherence();
 	checker.generalize_returns();
-	if let Some(identity) = checker.defs.defs.iter().find_map(|definition| {
+	if let Some(identity) = checker.defs.defs.iter().rev().find_map(|definition| {
 		definition
 			.stable
 			.as_ref()
-			.filter(|stable| stable.module.path == checker.module.path)
 			.map(|stable| stable.module.clone())
 	}) {
 		checker.assign_runtime_body_identities(&identity);
@@ -1422,7 +1421,16 @@ mod tests {
 			.unwrap();
 		assert_eq!(
 			(defaulted.target, defaulted.implementation),
-			(Some(default_member.clone()), Some(default_impl))
+			(
+				Some(DefinitionId::new(
+					default_impl.module.clone(),
+					crate::DeclarationKey::materialized_interface_member(
+						default_impl.clone(),
+						default_member.clone(),
+					),
+				)),
+				Some(default_impl),
+			)
 		);
 
 		checker
