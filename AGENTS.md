@@ -281,6 +281,16 @@ Default five-role vocabulary, each label string equal to its name. See `docs/age
 
 Single-context: `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
 
+### Commit discipline
+
+Commit completed work in coherent, reviewable units aligned with the GitHub
+issues being implemented. Each commit must represent one whole logical unit of
+work: do not combine unrelated issues in one commit, and do not split a single
+behavioral change into commits that are incomplete or fail their relevant
+checks on their own. If an issue is too large for one commit, split it only at
+explicit, independently valid implementation boundaries and identify the issue
+in every commit message.
+
 ### Standard library ownership
 
 Prefer implementing standard-library behavior in Nymph whenever doing so is
