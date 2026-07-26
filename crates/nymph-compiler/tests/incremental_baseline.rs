@@ -7,8 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use nymph_compiler::project::{
-	CompilerSession, GraphShape, ModulePath, ProjectId, SemanticPipeline, SemanticQueryEvent,
-	SourceVersion,
+	CompilerSession, GraphShape, ModulePath, ProjectId, SemanticQueryEvent, SourceVersion,
 };
 use nymph_sema::{DefinitionId, EntryMode};
 
@@ -91,10 +90,9 @@ fn assert_baseline(shape: GraphShape, project_name: &str, changed_leaf: &str) {
 	let module_count = modules.len();
 	let events = Arc::new(Mutex::new(Vec::<SemanticQueryEvent>::new()));
 	let sink = events.clone();
-	let mut session = CompilerSession::with_detailed_event_callback_for_test(
-		SemanticPipeline::Interface,
-		move |event| sink.lock().unwrap().push(event),
-	);
+	let mut session = CompilerSession::with_detailed_event_callback_for_test(move |event| {
+		sink.lock().unwrap().push(event)
+	});
 	let project = ProjectId::new(project_name);
 	let entry = ModulePath::new(fixture.entry()).unwrap();
 	install_sources(&mut session, &project, &sources, SourceVersion(1));

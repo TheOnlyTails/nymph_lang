@@ -10,18 +10,6 @@ use nymph_sema::{
 	EntryMode, InterfaceType, ModuleEnvironment, RecoveredDefinitionReference, RecoveredInterfaceType,
 };
 
-fn event_session() -> (CompilerSession, Arc<Mutex<Vec<String>>>) {
-	let events = Arc::new(Mutex::new(Vec::new()));
-	let sink = events.clone();
-	(
-		CompilerSession::with_event_callback_and_tombstone_threshold(
-			move |name| sink.lock().unwrap().push(name.to_string()),
-			256,
-		),
-		events,
-	)
-}
-
 fn interface_event_session() -> (CompilerSession, Arc<Mutex<Vec<SemanticQueryEvent>>>) {
 	let events = Arc::new(Mutex::new(Vec::new()));
 	let sink = events.clone();
@@ -78,105 +66,6 @@ fn importable_set_interface_preserves_exact_export_and_nested_iterable_implement
 	assert_eq!(iterable.member_slots.len(), 1);
 	assert_eq!(iterable.member_slots[0].implementation_id, iterable.id);
 	assert_eq!(iterable.member_slots[0].member_id, iterable.members[0].id);
-}
-
-#[test]
-fn body_only_edit_preserves_compat_interface_value() {
-	let (mut session, events) = event_session();
-	let project = ProjectId::new("oracle");
-	let path = ModulePath::new("main").unwrap();
-	session.set_source(
-		project.clone(),
-		path.clone(),
-		"public func answer(): int = 1".into(),
-		SourceVersion(1),
-	);
-	let before = session
-		.module_interface(
-			project.clone(),
-			path.clone(),
-			path.clone(),
-			EntryMode::Library,
-		)
-		.unwrap();
-	events.lock().unwrap().clear();
-	session.set_source(
-		project.clone(),
-		path.clone(),
-		"public func answer(): int = 2".into(),
-		SourceVersion(2),
-	);
-	let after = session
-		.module_interface(project.clone(), path.clone(), path, EntryMode::Library)
-		.unwrap();
-	assert_eq!(before, after);
-	let observed = events.lock().unwrap();
-	assert!(
-		observed
-			.iter()
-			.any(|event| event == "compat_module_analysis")
-	);
-	assert!(
-		observed
-			.iter()
-			.any(|event| event == "compat_declared_headers")
-	);
-	assert!(
-		observed
-			.iter()
-			.any(|event| event == "compat_module_environment")
-	);
-	assert!(
-		!observed
-			.iter()
-			.any(|event| event == "compat_module_interface"),
-		"equal environment should backdate the interface producer"
-	);
-}
-
-#[test]
-fn interface_producer_is_backdated_after_body_only_edit() {
-	let (mut session, events) = event_session();
-	let project = ProjectId::new("backdating");
-	let path = ModulePath::new("main").unwrap();
-	session.set_source(
-		project.clone(),
-		path.clone(),
-		"private func helper(): int = 1\npublic func answer(): int = helper()".into(),
-		SourceVersion(1),
-	);
-	let _ = session.module_interface(
-		project.clone(),
-		path.clone(),
-		path.clone(),
-		EntryMode::Library,
-	);
-	events.lock().unwrap().clear();
-	session.set_source(
-		project.clone(),
-		path.clone(),
-		"private func helper(): int = 2\npublic func answer(): int = helper()".into(),
-		SourceVersion(2),
-	);
-	let _ = session.module_interface(
-		project.clone(),
-		path.clone(),
-		path.clone(),
-		EntryMode::Library,
-	);
-	let first = events.lock().unwrap().clone();
-	assert!(
-		first
-			.iter()
-			.any(|event| event == "compat_module_environment")
-	);
-	assert!(!first.iter().any(|event| event == "compat_module_interface"));
-	events.lock().unwrap().clear();
-	let _ = session.module_interface(project, path.clone(), path, EntryMode::Library);
-	assert!(
-		events.lock().unwrap().is_empty(),
-		"backdated value was recomputed"
-	);
 }
 
 #[test]
@@ -246,34 +135,6 @@ fn diagnostic_text_and_span_changes_are_not_interface_identity() {
 		.module_environment(project, path.clone(), path, EntryMode::Library)
 		.unwrap();
 	assert_eq!(before, after);
-}
-
-#[test]
-fn conversion_failure_is_a_separate_internal_diagnostic_and_blocks_lowering() {
-	let mut session = CompilerSession::without_builtin_sources();
-	let project = ProjectId::new("conversion");
-	let path = ModulePath::new("main").unwrap();
-	session.set_source(
-		project.clone(),
-		path.clone(),
-		"public type Mystery = _".into(),
-		SourceVersion(1),
-	);
-	let diagnostics = session
-		.module_diagnostics(
-			project.clone(),
-			path.clone(),
-			path.clone(),
-			EntryMode::Library,
-		)
-		.unwrap();
-	assert_eq!(diagnostics.len(), 1);
-	assert_eq!(diagnostics[0].diag.code, "INTERNAL-INTERFACE-CONVERSION");
-	assert!(
-		session
-			.environment_is_lowerable(project, path.clone(), path, EntryMode::Library)
-			.is_err()
-	);
 }
 
 #[test]
@@ -359,70 +220,6 @@ fn every_public_interface_shape_edit_changes_the_interface() {
 			.expect("complete after interface");
 		assert_ne!(before, after, "case {index} did not change the interface");
 	}
-}
-
-#[test]
-fn compatibility_extraction_preserves_import_owner_ids_and_current_impl_facts() {
-	let mut session = CompilerSession::without_builtin_sources();
-	let project = ProjectId::new("provenance");
-	for (path, source) in [
-		(
-			"a",
-			"public interface Mark { func mark(): int }\npublic struct Same(value: int) {}\npublic impl Mark for Same { func mark(): int = 1 }",
-		),
-		(
-			"b",
-			"public interface Mark { func mark(): int }\npublic struct Same(value: int) {}\npublic impl Mark for Same { func mark(): int = 2 }",
-		),
-		(
-			"main",
-			"import @/a with (Same as ASame)\nimport @/b with (Same as BSame)\npublic interface LocalMark { func local(): int }\npublic struct Same(value: int) {}\npublic func from_a(value: ASame): ASame = value\npublic func from_b(value: BSame): BSame = value\npublic impl LocalMark for Same { func local(): int = 3 }",
-		),
-	] {
-		session.set_source(
-			project.clone(),
-			ModulePath::new(path).unwrap(),
-			source.into(),
-			SourceVersion(1),
-		);
-	}
-	let main = ModulePath::new("main").unwrap();
-	let interface = session
-		.module_interface(
-			project.clone(),
-			main.clone(),
-			main.clone(),
-			EntryMode::Library,
-		)
-		.unwrap();
-	assert!(
-		!interface.exports.is_empty(),
-		"{:?}",
-		session.module_diagnostics(project, main.clone(), main, EntryMode::Library)
-	);
-	let named_module = |name: &str| {
-		let export = interface
-			.exports
-			.iter()
-			.find(|definition| definition.name == name)
-			.unwrap();
-		let InterfaceType::Named { definition, .. } = export.parameters[0].ty.clone() else {
-			panic!("expected named parameter")
-		};
-		definition.module.path
-	};
-	assert_eq!(named_module("from_a"), "a");
-	assert_eq!(named_module("from_b"), "b");
-	assert_eq!(interface.implementations.len(), 1);
-	assert_eq!(
-		interface.implementations[0]
-			.interface
-			.as_ref()
-			.unwrap()
-			.module
-			.path,
-		"main"
-	);
 }
 
 #[test]

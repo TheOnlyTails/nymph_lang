@@ -3,8 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use nymph_compiler::project::{
-	CompilerSession, ModulePath, ProjectId, RuntimeDefinitionError, SemanticPipeline,
-	SemanticQueryEvent, SourceVersion,
+	CompilerSession, ModulePath, ProjectId, RuntimeDefinitionError, SemanticQueryEvent, SourceVersion,
 };
 use nymph_sema::{DeclarationCategory, DeclarationKey, DefinitionId, EntryMode, RuntimePayload};
 
@@ -23,10 +22,9 @@ fn session() -> (CompilerSession, Arc<Mutex<Vec<SemanticQueryEvent>>>) {
 	let events = Arc::new(Mutex::new(Vec::new()));
 	let sink = events.clone();
 	(
-		CompilerSession::with_detailed_event_callback_for_test(
-			SemanticPipeline::Interface,
-			move |event| sink.lock().unwrap().push(event),
-		),
+		CompilerSession::with_detailed_event_callback_for_test(move |event| {
+			sink.lock().unwrap().push(event)
+		}),
 		events,
 	)
 }

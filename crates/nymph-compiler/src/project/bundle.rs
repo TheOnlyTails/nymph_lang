@@ -1,13 +1,4 @@
-//! Bundling the driver's per-module ES sources into one runnable JS string
-//! (Slice IB2).
-//!
-//! [`super::mod`]'s `compile_all` synthesizes a real ES module (`import` /
-//! `export`) for every processed Nymph module, over the SAME `$m{tag}$`
-//! mangled names IB1 already renders every declaration and reference to (see
-//! `rewrite.rs`) — so every reference site and its declaration share one
-//! globally-unique identifier and rolldown never has to rename anything, only
-//! link the graph. This module feeds that in-memory source map into
-//! `rolldown` and returns the single bundled chunk's code.
+//! Bundle an in-memory ES module graph into one runnable JavaScript string.
 //!
 //! Bundling never touches disk: `VirtualFsPlugin` resolves and loads
 //! canonical module keys straight out of the map the driver already built, so

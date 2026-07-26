@@ -3,8 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use nymph_compiler::project::{
-	AmbientCoreModuleKey, CompilerSession, ModulePath, ProjectId, SemanticPipeline,
-	SemanticQueryEvent, SourceVersion,
+	AmbientCoreModuleKey, CompilerSession, ModulePath, ProjectId, SemanticQueryEvent, SourceVersion,
 };
 use nymph_sema::{
 	DeclarationCategory, DeclarationKey, DefinitionId, EntryMode, InterfaceType, ModuleIdentity,
@@ -174,10 +173,9 @@ fn compiler_lowers_one_exact_runtime_definition() {
 fn editing_one_definition_only_reexecutes_its_exact_lowering_consumer() {
 	let events = Arc::new(Mutex::new(Vec::<SemanticQueryEvent>::new()));
 	let sink = events.clone();
-	let mut session = CompilerSession::with_detailed_event_callback_for_test(
-		SemanticPipeline::Interface,
-		move |event| sink.lock().unwrap().push(event),
-	);
+	let mut session = CompilerSession::with_detailed_event_callback_for_test(move |event| {
+		sink.lock().unwrap().push(event)
+	});
 	let project = ProjectId::new("lower-invalidation");
 	let main = ModulePath::new("main").unwrap();
 	let a = id("lower-invalidation", "a");
