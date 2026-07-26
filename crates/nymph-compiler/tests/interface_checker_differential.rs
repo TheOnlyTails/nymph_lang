@@ -23,10 +23,10 @@ struct MatrixFixture {
 	mode: EntryMode,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Outcome {
 	diagnostics: Vec<(String, String, String, String, usize, usize)>,
-	types: Vec<(usize, String)>,
+	types: Vec<(u32, String)>,
 	definition_targets: Vec<(u32, String)>,
 	resolutions: Vec<(u32, String, String, Option<String>, Option<String>)>,
 	variants: Vec<(u32, String)>,
@@ -58,48 +58,64 @@ fn run_matrix_fixture(case: &MatrixFixture, pipeline: SemanticPipeline) -> Outco
 			)
 		})
 		.collect();
-	let source = case
+	let _analysis = session
+		.analyze_module(
+			project.clone(),
+			path(case.entry),
+			path(case.entry),
+			case.mode,
+		)
+		.unwrap_or_else(|| {
+			panic!(
+				"matrix entry `{}` must be reachable in {pipeline:?}; diagnostics: {diagnostics:?}",
+				case.category
+			)
+		});
+	let stable = session
+		.stable_annotations_for_test(
+			project.clone(),
+			path(case.entry),
+			path(case.entry),
+			case.mode,
+		)
+		.expect("matrix entry has a stable annotation projection");
+	let types = stable
+		.types
+		.iter()
+		.map(|(id, ty)| (id.0, format!("{ty:?}")))
+		.collect();
+	let entry_source_len = case
 		.modules
 		.iter()
-		.find(|(name, _)| *name == case.entry)
-		.unwrap()
-		.1;
-	let analysis = session
-		.analyze_module(project, path(case.entry), path(case.entry), case.mode)
-		.expect("matrix entry must be reachable");
-	let types = (0..=source.len())
-		.filter_map(|offset| analysis.type_at(offset).map(|ty| (offset, ty)))
-		.collect();
-	let annotations = &analysis.semantic.annotations;
-	let definition_targets = annotations
-		.definition_targets()
+		.find_map(|(module, source)| (*module == case.entry).then_some(source.len()))
+		.expect("matrix entry source exists");
+	let definition_targets = stable
+		.definition_targets
+		.iter()
 		.map(|(id, target)| (id.0, format!("{target:?}")))
 		.collect();
-	let resolutions = annotations
-		.infos()
-		.filter(|(id, _)| id.0 < 1 << 30)
-		.filter_map(|(id, info)| {
-			info.resolution.as_ref().map(|resolution| {
-				(
-					id.0,
-					resolution.method.to_string(),
-					format!("{:?}", resolution.dispatch),
-					resolution.target.as_ref().map(|item| format!("{item:?}")),
-					resolution
-						.implementation
-						.as_ref()
-						.map(|item| format!("{item:?}")),
-				)
-			})
+	let resolutions = stable
+		.resolutions
+		.iter()
+		.map(|(id, method, dispatch, target, implementation)| {
+			(
+				id.0,
+				method.to_string(),
+				format!("{dispatch:?}"),
+				target.as_ref().map(|item| format!("{item:?}")),
+				implementation.as_ref().map(|item| format!("{item:?}")),
+			)
 		})
 		.collect();
-	let variants = annotations
-		.variants()
-		.filter(|(id, _)| id.0 < 1 << 30)
+	let variants = stable
+		.variants
+		.iter()
 		.map(|(id, variant)| (id.0, format!("{variant:?}")))
 		.collect();
-	let pattern_variants = annotations
-		.pattern_variants()
+	let pattern_variants = stable
+		.pattern_variants
+		.iter()
+		.filter(|(span, _)| span.end <= entry_source_len)
 		.map(|(span, variant)| (span.start, span.end, format!("{variant:?}")))
 		.collect();
 	Outcome {
@@ -118,14 +134,17 @@ fn full_differential_fixture_matrix() {
 		MatrixFixture {
 			category: "direct-transitive-complete-visibility",
 			modules: &[
-				("c", "public func answer(): int = 42"),
+				(
+					"c",
+					"public struct Answer(value: int) { func get(): int = this.value }",
+				),
 				(
 					"b",
-					"import @/c with (answer)\npublic func b_answer(): int = answer()",
+					"import @/c with (Answer)\npublic func make_answer(): Answer = Answer(value = 42)",
 				),
 				(
 					"main",
-					"import @/b with (b_answer)\nfunc main(): int = c.answer() + b_answer()",
+					"import @/b with (make_answer)\nfunc main(): int = make_answer().get()",
 				),
 			],
 			entry: "main",
@@ -167,7 +186,7 @@ fn full_differential_fixture_matrix() {
 				),
 				(
 					"main",
-					"import @/dep\nfunc main(): int { let p = Point(x = 1); let c = Choice.One(value = p.x); match c { Choice.One(value = n) => n, Choice.None => 0 } }",
+					"import @/dep\nfunc qualified(): int = { let p = Point(x = 1)\nlet c = Choice.One(value = p.x)\nmatch (c) { Choice.One(value = n) -> n, Choice.None -> 0 } }\nfunc bare(): int = { let c = One(value = 2)\nmatch (c) { One(value = n) -> n, None -> 0 } }\nfunc main(): int = qualified() + bare()",
 				),
 			],
 			entry: "main",
@@ -197,7 +216,7 @@ fn full_differential_fixture_matrix() {
 				),
 				(
 					"main",
-					"import @/dep\nfunc main(): int = Cell(value = 2).read()",
+					"import @/dep\nfunc main(): int = Cell(value = 2).read() + Cell(value = 3).twice()",
 				),
 			],
 			entry: "main",
@@ -269,13 +288,244 @@ fn full_differential_fixture_matrix() {
 			entry: "main",
 			mode: EntryMode::Library,
 		},
+		MatrixFixture {
+			category: "stable-definition-targets",
+			modules: &[
+				("dep", "public struct Remote(value: int)"),
+				(
+					"main",
+					"import @/dep with (Remote)\nstruct Left(value: int)\nstruct Right(value: int)\nfunc helper(): int = 4\nfunc main(): int = Remote(value = 1).value + Left(value = 2).value + Right(value = 3).value + helper()",
+				),
+			],
+			entry: "main",
+			mode: EntryMode::Entry,
+		},
 	];
 
 	for case in cases {
+		let compatibility = run_matrix_fixture(&case, SemanticPipeline::CompatibilityFlattened);
+		let interface = run_matrix_fixture(&case, SemanticPipeline::Interface);
+		if case.category == "visibility-import-alias-namespace" {
+			let mut compatibility_without_stable_targets = compatibility.clone();
+			let mut interface_without_stable_targets = interface.clone();
+			compatibility_without_stable_targets
+				.definition_targets
+				.clear();
+			interface_without_stable_targets.definition_targets.clear();
+			assert_eq!(
+				compatibility_without_stable_targets,
+				interface_without_stable_targets
+			);
+			assert!(
+				interface.definition_targets.iter().any(|(_, target)| {
+					target.contains("path: \"dep\"") && target.contains("name: \"shown\"")
+				}),
+				"namespace and with references retain dep's stable shown target",
+			);
+			continue;
+		}
 		assert_eq!(
-			run_matrix_fixture(&case, SemanticPipeline::CompatibilityFlattened),
-			run_matrix_fixture(&case, SemanticPipeline::Interface),
+			compatibility, interface,
 			"differential category `{}` diverged",
+			case.category,
+		);
+		if case.category == "direct-transitive-complete-visibility" {
+			let (_, call_target) = interface
+				.definition_targets
+				.iter()
+				.find(|(_, target)| target.contains("name: \"make_answer\""))
+				.expect("category 1 records the direct B function call");
+			assert!(
+				call_target.contains("path: \"b\""),
+				"make_answer call target must be owned by B: {call_target:?}",
+			);
+			let (_, _, _, method_target, implementation) = interface
+				.resolutions
+				.iter()
+				.find(|(_, method, _, _, _)| method == "get")
+				.expect("category 1 records the inherent C method call");
+			assert!(
+				method_target
+					.as_ref()
+					.is_some_and(|target| target.contains("path: \"c\"")),
+				"get method target must be owned by C: {method_target:?}",
+			);
+			assert!(
+				implementation
+					.as_ref()
+					.is_some_and(|target| target.contains("path: \"c\"")),
+				"get implementation provenance must be owned by C: {implementation:?}",
+			);
+		}
+		if case.category == "interfaces-associated-direct-default" {
+			let read = interface
+				.resolutions
+				.iter()
+				.find(|(_, method, _, _, _)| method == "read")
+				.expect("category 6 records the direct impl method call");
+			assert_eq!(read.2, "UserImpl");
+			assert!(read.3.as_ref().is_some_and(|target| {
+				target.contains("key: Implementation") && target.contains("name: \"read\"")
+			}));
+			assert!(
+				read
+					.4
+					.as_ref()
+					.is_some_and(|implementation| implementation.contains("key: Implementation"))
+			);
+			let twice = interface
+				.resolutions
+				.iter()
+				.find(|(_, method, _, _, _)| method == "twice")
+				.expect("category 6 records the selected interface default call");
+			assert_eq!(twice.2, "UserImplDefaultMethod");
+			assert!(twice.3.as_ref().is_some_and(|target| {
+				target.contains("category: Method") && target.contains("name: \"twice\"")
+			}));
+			assert_eq!(twice.4, read.4);
+			assert!(
+				interface.types.iter().filter(|(_, ty)| ty == "Int").count() >= 3,
+				"both associated-output method calls and their sum have int type"
+			);
+		}
+	}
+}
+
+#[test]
+fn stable_definition_targets_are_exact_and_owner_sensitive() {
+	let case = MatrixFixture {
+		category: "stable-definition-targets-exact",
+		modules: &[
+			("dep", "public struct Remote(value: int)"),
+			(
+				"main",
+				"import @/dep with (Remote)\nstruct Left(value: int)\nstruct Right(value: int)\nfunc helper(): int = 4\nfunc main(): int = Remote(value = 1).value + Left(value = 2).value + Right(value = 3).value + helper()",
+			),
+		],
+		entry: "main",
+		mode: EntryMode::Entry,
+	};
+	let compatibility = run_matrix_fixture(&case, SemanticPipeline::CompatibilityFlattened);
+	let interface = run_matrix_fixture(&case, SemanticPipeline::Interface);
+	assert_eq!(compatibility, interface);
+	for owner in ["Remote", "Left", "Right"] {
+		assert!(interface.definition_targets.iter().any(|(_, target)| {
+			target.contains("category: Field")
+				&& target.contains("name: \"value\"")
+				&& target.contains(&format!("name: \"{owner}\""))
+		}));
+	}
+	assert!(interface.definition_targets.iter().any(|(_, target)| {
+		target.contains("category: Function") && target.contains("name: \"helper\"")
+	}));
+}
+
+#[test]
+fn lexical_import_visibility_category_matches_compatibility() {
+	let cases = [
+		MatrixFixture {
+			category: "no-with-direct-bare-and-default-namespace",
+			modules: &[
+				("dep", "public func shown(): int = 2"),
+				(
+					"main",
+					"import @/dep\nfunc main(): int = shown() + dep.shown()",
+				),
+			],
+			entry: "main",
+			mode: EntryMode::Entry,
+		},
+		MatrixFixture {
+			category: "no-with-does-not-expose-transitive-name",
+			modules: &[
+				("c", "public func transitive(): int = 1"),
+				("b", "import @/c\npublic func direct(): int = transitive()"),
+				(
+					"main",
+					"import @/b\nfunc main(): int = direct() + transitive()",
+				),
+			],
+			entry: "main",
+			mode: EntryMode::Entry,
+		},
+		MatrixFixture {
+			category: "namespace-with-hidden",
+			modules: &[
+				(
+					"dep",
+					"func hidden(): int = 1\npublic func shown(): int = 2",
+				),
+				(
+					"main",
+					"import @/dep as d with (shown)\nfunc main(): int = d.shown() + shown() + hidden()",
+				),
+			],
+			entry: "main",
+			mode: EntryMode::Entry,
+		},
+		MatrixFixture {
+			category: "with-alias",
+			modules: &[
+				("dep", "public func shown(): int = 2"),
+				(
+					"main",
+					"import @/dep with (shown as local)\nfunc main(): int = local()",
+				),
+			],
+			entry: "main",
+			mode: EntryMode::Entry,
+		},
+		MatrixFixture {
+			category: "default-namespace",
+			modules: &[
+				("dep", "public func shown(): int = 2"),
+				("main", "import @/dep\nfunc main(): int = dep.shown()"),
+			],
+			entry: "main",
+			mode: EntryMode::Entry,
+		},
+		MatrixFixture {
+			category: "no-transitive-bare-name",
+			modules: &[
+				("c", "public func transitive(): int = 1"),
+				(
+					"b",
+					"import @/c with (transitive)\npublic func direct(): int = transitive()",
+				),
+				(
+					"main",
+					"import @/b with (direct)\nfunc main(): int = direct() + transitive()",
+				),
+			],
+			entry: "main",
+			mode: EntryMode::Entry,
+		},
+	];
+	for case in cases {
+		let compatibility = run_matrix_fixture(&case, SemanticPipeline::CompatibilityFlattened);
+		let interface = run_matrix_fixture(&case, SemanticPipeline::Interface);
+		assert_eq!(
+			compatibility.diagnostics, interface.diagnostics,
+			"{}",
+			case.category
+		);
+		assert_eq!(compatibility.types, interface.types, "{}", case.category);
+		if case.category == "no-with-direct-bare-and-default-namespace" {
+			assert!(interface.diagnostics.is_empty());
+			assert!(interface.definition_targets.iter().any(|(_, target)| {
+				target.contains("path: \"dep\"") && target.contains("name: \"shown\"")
+			}));
+		}
+		if case.category == "no-with-does-not-expose-transitive-name" {
+			assert!(interface.diagnostics.iter().any(|(_, code, message, ..)| {
+				code == "2000" && message == "cannot find `transitive` in this scope"
+			}));
+		}
+		assert!(
+			interface.definition_targets.iter().all(|(_, target)| {
+				!target.contains("name: \"hidden\"") && !target.contains("name: \"transitive\"")
+			}),
+			"{} leaked a non-lexical stable target",
 			case.category,
 		);
 	}

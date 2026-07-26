@@ -2357,6 +2357,21 @@ impl<'a> Lowerer<'a> {
 	) -> Option<RuntimeDispatch> {
 		use nymph_ast::ty::Type;
 
+		// Stable semantic provenance owns the project/core distinction. A default
+		// selected through a project-owned impl is materialized onto that nominal
+		// type's emitted class (whether the impl is local or imported), so it must
+		// remain an ordinary method call. Its legacy `impl_span` may point into the
+		// reconstructed prelude AST and is not an ownership signal.
+		if res.implementation.as_ref().is_some_and(|implementation| {
+			matches!(
+				implementation.module.origin,
+				crate::ModuleOrigin::Project(_)
+			)
+		}) {
+			return Some(RuntimeDispatch::OntoClass {
+				method: res.method.clone(),
+			});
+		}
 		let span = res.impl_span?;
 		if self.prelude_modules.is_empty() {
 			return None;

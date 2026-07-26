@@ -515,6 +515,42 @@ impl CompilerSession {
 		self.module_analysis(project, input, key)
 	}
 
+	/// Test-only stable projection of annotations for differential checking.
+	#[cfg(feature = "test-support")]
+	#[doc(hidden)]
+	pub fn stable_annotations_for_test(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		mode: EntryMode,
+	) -> Option<nymph_sema::StableAnnotationView> {
+		let analysis = self.analyze_module(project.clone(), entry.clone(), module.clone(), mode)?;
+		let key = self.project_key(project.clone(), entry.clone(), mode, true, true);
+		let input = self.compat_input(&project, &module)?;
+		let headers = super::compat::compat_declared_headers(&self.db, key, input);
+		let mut interfaces = self
+			.graph_order(project.clone(), entry.clone(), mode)
+			.into_iter()
+			.filter_map(|dependency| {
+				self.compat_module_interface(project.clone(), entry.clone(), dependency, mode)
+			})
+			.collect::<Vec<_>>();
+		if !interfaces
+			.iter()
+			.any(|interface| interface.module == headers.module)
+			&& let Some(interface) =
+				self.compat_module_interface(project.clone(), entry.clone(), module, mode)
+		{
+			interfaces.push(interface);
+		}
+		Some(nymph_sema::stable_annotation_view(
+			&analysis.semantic.checked,
+			&headers.checked_definitions,
+			&interfaces,
+		))
+	}
+
 	/// Return tooling analysis under the same compatibility key used by
 	/// [`Self::tooling_diagnostics`].
 	#[doc(hidden)]

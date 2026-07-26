@@ -1,14 +1,84 @@
+use std::sync::Arc;
+
 use nymph_hir::hir::MarshalKind;
 use nymph_sema::{
-	DeclarationKey, DefinitionId, DefinitionShapeKind, InterfaceType, ModuleEnvironment,
-	ModuleIdentity, RecoveredDefinitionReference, RecoveredInterfaceType, check_module,
-	declared_headers, extract_module_interface, recover_module_environment,
+	DeclarationCategory, DeclarationKey, DefinitionId, DefinitionShapeKind, EntryMode,
+	ExportedDefinition, InterfaceType, ModuleEnvironment, ModuleIdentity, ModuleInterface,
+	RecoveredDefinitionReference, RecoveredInterfaceType, SemanticEnvironment, check_module,
+	check_module_with_environment, declared_headers, extract_module_interface,
+	extract_module_interface_with_facts, recover_module_environment,
 };
 
 fn parse(source: &str) -> nymph_ast::decl::Module {
 	let parsed = nymph_syntax::parse_module(source, "fixture.nym");
 	assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
 	parsed.tree
+}
+
+#[test]
+fn extraction_preserves_transitive_imported_nominal_return_identity() {
+	let owner = ModuleIdentity {
+		origin: nymph_sema::ModuleOrigin::Project("test".into()),
+		project: "test".into(),
+		path: "c".into(),
+	};
+	let answer = DefinitionId::new(
+		owner.clone(),
+		DeclarationKey::top_level(DeclarationCategory::Struct, "Answer"),
+	);
+	let dependency = Arc::new(ModuleEnvironment::Complete(ModuleInterface {
+		module: owner,
+		exports: vec![ExportedDefinition {
+			id: answer.clone(),
+			name: "Answer".into(),
+			visibility: None,
+			kind: DefinitionShapeKind::Struct,
+			binders: vec![],
+			constraints: vec![],
+			parameters: vec![],
+			return_type: None,
+			ty: None,
+			fields: vec![],
+			variants: vec![],
+			members: vec![],
+			super_interfaces: vec![],
+			external: None,
+			runtime_owner: None,
+		}],
+		support_definitions: vec![],
+		implementations: vec![],
+		fingerprint: 0,
+	}));
+	let current = ModuleIdentity {
+		origin: nymph_sema::ModuleOrigin::Project("test".into()),
+		project: "test".into(),
+		path: "b".into(),
+	};
+	let environment = SemanticEnvironment::from_modules(current.clone(), &[dependency]).unwrap();
+	let module = Arc::new(parse("public func make_answer(): Answer = Answer()"));
+	let result = check_module_with_environment(
+		module.clone(),
+		current.clone(),
+		&environment,
+		EntryMode::Library,
+	);
+	assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+	let checked = nymph_sema::Checked {
+		diags: vec![],
+		facts: result.analysis.checked.as_ref().clone(),
+	};
+	let headers = declared_headers(current.clone(), &module);
+	let facts = nymph_sema::ExtractionFactSelection::current_module(&module, &checked);
+	let interface = extract_module_interface_with_facts(current, &module, &checked, &headers, &facts)
+		.expect("an imported nominal remains canonicalizable by stable identity");
+	assert_eq!(
+		interface.exports[0].return_type,
+		Some(InterfaceType::Named {
+			definition: answer,
+			positional: vec![],
+			named: vec![],
+		})
+	);
 }
 
 #[test]
@@ -90,6 +160,23 @@ public func read(): int = answer
 		.find(|item| item.name == "answer")
 		.unwrap();
 	assert_eq!(answer.ty, Some(InterfaceType::Int));
+}
+
+#[test]
+fn extraction_uses_deeply_finalized_inferred_function_return_type() {
+	let module = parse("public func bits() = #(true, false, true)");
+	let checked = check_module(&module);
+	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+	let headers = declared_headers(identity(), &module);
+	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();
+	assert_eq!(
+		interface.exports[0].return_type,
+		Some(InterfaceType::Tuple(vec![
+			InterfaceType::Boolean,
+			InterfaceType::Boolean,
+			InterfaceType::Boolean,
+		]))
+	);
 }
 
 #[test]

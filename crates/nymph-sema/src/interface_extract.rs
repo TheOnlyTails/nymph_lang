@@ -223,8 +223,10 @@ fn context(checked: &Checked, headers: &DeclaredHeaders) -> CanonicalizationCont
 		.iter()
 		.enumerate()
 		.filter_map(|(index, data)| {
-			headers
-				.id(&data.name)
+			data
+				.stable
+				.clone()
+				.or_else(|| headers.id(&data.name))
 				.map(|stable| (crate::DefId(index as u32), stable))
 		})
 		.collect::<HashMap<_, _>>();
@@ -244,8 +246,10 @@ fn definition_context(
 		.iter()
 		.enumerate()
 		.filter_map(|(index, data)| {
-			headers
-				.id(&data.name)
+			data
+				.stable
+				.clone()
+				.or_else(|| headers.id(&data.name))
 				.map(|stable| (crate::DefId(index as u32), stable))
 		})
 		.collect();

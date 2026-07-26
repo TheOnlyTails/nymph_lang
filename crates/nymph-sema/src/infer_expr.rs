@@ -46,7 +46,23 @@ use crate::ty::{GenericArgs, Ty, TyKind};
 /// while staying `false` for every ordinary user-declared method/interface
 /// (whose span is always well below `SPAN_BASE`).
 fn impl_is_unmaterialized(res: &MethodResolution) -> bool {
-	res.impl_span.is_some_and(|span| span.start >= SPAN_BASE)
+	if let Some(implementation) = &res.implementation {
+		return matches!(implementation.module.origin, crate::ModuleOrigin::Compiler);
+	}
+	if res.source == MethodSource::GenericBound
+		&& res
+			.target
+			.as_ref()
+			.is_some_and(|target| matches!(target.module.origin, crate::ModuleOrigin::Compiler))
+	{
+		return true;
+	}
+	// Legacy single-module prelude checking predates stable imported identities.
+	// Keep that isolated API's offset provenance as a compatibility fallback;
+	// interface-environment checking always takes one of the stable paths above.
+	res.implementation.is_none()
+		&& res.target.is_none()
+		&& res.impl_span.is_some_and(|span| span.start >= SPAN_BASE)
 }
 
 /// The `DispatchKind` a resolved *operator* desugaring (Slice 4B) must be lowered
@@ -911,6 +927,10 @@ impl<'m> Checker<'m> {
 	}
 
 	fn type_of_def(&mut self, def: DefId, span: Span, id: NodeId) -> Ty {
+		self.annotations.record_checked_definition_target(
+			id,
+			crate::annotate::CheckedDefinitionTarget::Definition(def),
+		);
 		self
 			.annotations
 			.record_definition_target(id, self.defs.stable(def));
@@ -1099,6 +1119,14 @@ impl<'m> Checker<'m> {
 			if let Some(def) = self.defs.get(&name.0)
 				&& let DefKind::Struct = self.defs.data(def).kind
 			{
+				self.annotations.record_checked_definition_target(
+					id,
+					crate::annotate::CheckedDefinitionTarget::Definition(def),
+				);
+				self.annotations.record_checked_definition_target(
+					func.id,
+					crate::annotate::CheckedDefinitionTarget::Definition(def),
+				);
 				self
 					.annotations
 					.record_definition_target(id, self.defs.stable(def));
@@ -1149,6 +1177,13 @@ impl<'m> Checker<'m> {
 							.annotations
 							.record_definition_target(func.id, target.as_ref());
 						let callee = self.namespace_func_type(&sig, member.1);
+						self.annotations.record(
+							func.id,
+							crate::ExprInfo {
+								ty: callee,
+								resolution: None,
+							},
+						);
 						return (self.check_direct_call(callee, args, span), None);
 					}
 				}
@@ -1541,6 +1576,14 @@ impl<'m> Checker<'m> {
 						.find(|(_, (n, _))| n == member)
 					{
 						if let Some(id) = id {
+							self.annotations.record_checked_definition_target(
+								id,
+								crate::annotate::CheckedDefinitionTarget::Field {
+									owner: def,
+									index: field_index,
+									name: member.into(),
+								},
+							);
 							self.annotations.record_definition_target(
 								id,
 								sig

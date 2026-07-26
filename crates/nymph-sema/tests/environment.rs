@@ -152,10 +152,9 @@ fn complete_interfaces_and_impls_populate_owned_dispatch_registries() {
 		env.interner.kind(implementation.args[0].1),
 		TyKind::String
 	));
-	assert!(implementation.methods["project"].has_default);
-	assert_eq!(
-		implementation.methods["project"].definition.as_ref(),
-		Some(&default_method.id)
+	assert!(
+		!implementation.methods.contains_key("project"),
+		"interface defaults remain interface-owned so solver dispatch cannot mistake them for overrides"
 	);
 	assert_eq!(env.imported.inherent.impls.len(), 1);
 	let inherent = &env.imported.inherent.impls[0];

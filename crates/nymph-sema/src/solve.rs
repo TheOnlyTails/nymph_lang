@@ -453,7 +453,7 @@ impl Checker<'_> {
 					continue;
 				}
 				if self.impls_overlap(&a, &b) {
-					let iface = self.defs.data(a.interface).name.clone();
+					let iface = self.defs.diagnostic_name(a.interface).clone();
 					if let Some(span) = b.legacy_span {
 						self.emit(span, TypeError::ConflictingImpls { iface });
 					}

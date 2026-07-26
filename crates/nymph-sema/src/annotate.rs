@@ -157,6 +157,9 @@ pub enum IterMode {
 pub struct Annotations {
 	infos: FxHashMap<NodeId, ExprInfo>,
 	definition_targets: FxHashMap<NodeId, DefinitionId>,
+	/// Checker-local provenance used only to project stable identities when the
+	/// compatibility checker was built from definitions without stable IDs.
+	checked_definition_targets: FxHashMap<NodeId, CheckedDefinitionTarget>,
 	variants: FxHashMap<NodeId, VariantResolution>,
 	/// Variant *patterns*, keyed by span — patterns carry no `NodeId`, but each
 	/// written pattern has a unique source span.
@@ -179,6 +182,16 @@ pub struct Annotations {
 	/// which nodes must be wrapped as a synthesized `HirExpr::Closure` rather
 	/// than lowered as their own expression kind.
 	anon_boundaries: FxHashMap<NodeId, u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CheckedDefinitionTarget {
+	Definition(crate::DefId),
+	Field {
+		owner: crate::DefId,
+		index: usize,
+		name: EcoString,
+	},
 }
 
 impl Annotations {
@@ -269,6 +282,25 @@ impl Annotations {
 	/// The stable declaration referenced by `id`, if this node denotes one.
 	pub fn definition_target_of(&self, id: NodeId) -> Option<&DefinitionId> {
 		self.definition_targets.get(&id)
+	}
+
+	pub(crate) fn record_checked_definition_target(
+		&mut self,
+		id: NodeId,
+		target: CheckedDefinitionTarget,
+	) {
+		if id != NodeId::DUMMY {
+			self.checked_definition_targets.insert(id, target);
+		}
+	}
+
+	pub(crate) fn checked_definition_targets(
+		&self,
+	) -> impl Iterator<Item = (NodeId, CheckedDefinitionTarget)> + '_ {
+		self
+			.checked_definition_targets
+			.iter()
+			.map(|(id, target)| (*id, target.clone()))
 	}
 
 	/// Record which `(enum, variant)` a variant construction/reference resolved to.

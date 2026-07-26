@@ -39,6 +39,10 @@ pub struct DefMap {
 #[derive(Debug, Clone)]
 pub struct DefData {
 	pub name: EcoString,
+	/// Checker-compatibility spelling used only by diagnostics which historically
+	/// exposed rewritten project symbols. Semantic identity and lookup always use
+	/// [`Self::name`] and [`Self::stable`].
+	pub diagnostic_display_name: Option<EcoString>,
 	/// The defining occurrence's span. Reserved for go-to-definition (LSP) and
 	/// richer diagnostics; not read by Milestone-A checking itself.
 	#[allow(dead_code)]
@@ -74,12 +78,39 @@ pub enum DefKind {
 }
 
 impl DefMap {
+	pub(crate) fn clear_lexical_imports(&mut self) {
+		self.by_name.clear();
+		self.variants.clear();
+	}
+
+	pub(crate) fn expose_name(&mut self, name: EcoString, id: DefId) {
+		self.by_name.insert(name, id);
+	}
+
 	pub fn get(&self, name: &str) -> Option<DefId> {
 		self.by_name.get(name).copied()
 	}
 
 	pub fn data(&self, def: DefId) -> &DefData {
 		&self.defs[def.0 as usize]
+	}
+
+	pub fn diagnostic_name(&self, def: DefId) -> &EcoString {
+		let data = self.data(def);
+		data.diagnostic_display_name.as_ref().unwrap_or(&data.name)
+	}
+
+	pub(crate) fn set_imported_diagnostic_module_tags(
+		&mut self,
+		tags: &FxHashMap<ModuleIdentity, usize>,
+	) {
+		for data in &mut self.defs {
+			if let DefOrigin::Imported { module } = &data.origin
+				&& let Some(tag) = tags.get(module)
+			{
+				data.diagnostic_display_name = Some(format!("$m{tag}${}", data.name).into());
+			}
+		}
 	}
 
 	pub fn local_member(&self, def: DefId) -> Option<usize> {
@@ -115,6 +146,7 @@ impl DefMap {
 		}
 		self.defs.push(DefData {
 			name: name.clone(),
+			diagnostic_display_name: None,
 			span,
 			kind,
 			origin,
@@ -161,6 +193,7 @@ impl DefMap {
 		self.by_stable.insert(stable.clone(), id);
 		self.defs.push(DefData {
 			name: name.clone(),
+			diagnostic_display_name: None,
 			span: Span::new(0, 0),
 			kind,
 			origin: DefOrigin::Imported { module },
@@ -195,6 +228,7 @@ impl DefMap {
 		}
 		self.defs.push(DefData {
 			name: name.clone(),
+			diagnostic_display_name: None,
 			span,
 			kind,
 			origin: DefOrigin::Local { member },

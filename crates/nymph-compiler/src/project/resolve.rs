@@ -32,6 +32,7 @@ pub(crate) struct ParsedImport {
 	pub target_key: String,
 	pub ns_name: EcoString,
 	pub ns_span: Span,
+	pub has_with_list: bool,
 	pub with_idents: Vec<(Ident, Option<Ident>)>,
 }
 
@@ -317,6 +318,7 @@ impl<'a> GraphBuilder<'a> {
 							target_key,
 							ns_name,
 							ns_span: span,
+							has_with_list: idents.is_some(),
 							with_idents: idents.clone().unwrap_or_default(),
 						});
 					}

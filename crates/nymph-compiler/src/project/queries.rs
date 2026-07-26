@@ -5,6 +5,7 @@ use nymph_ast::{
 	decl::{Declaration, Module},
 };
 use nymph_diagnostics::Diagnostic;
+use rustc_hash::FxHashMap;
 
 use super::{
 	ProjectDiagnostic,
@@ -32,6 +33,7 @@ pub struct DirectImport {
 	pub target: Result<String, Diagnostic>,
 	pub span: Span,
 	pub namespace: Ident,
+	pub has_with_list: bool,
 	pub with_idents: Vec<(Ident, Option<Ident>)>,
 }
 
@@ -100,6 +102,21 @@ pub struct ProjectGraph {
 }
 
 impl ProjectGraph {
+	/// Deterministic project symbol tags shared by independent semantic pipelines.
+	/// This is graph data, not a compatibility-analysis or symbol-map query.
+	pub(crate) fn semantic_module_tags(
+		&self,
+		db: &dyn Db,
+	) -> FxHashMap<nymph_sema::ModuleIdentity, usize> {
+		self
+			.semantic_order
+			.iter()
+			.copied()
+			.enumerate()
+			.map(|(tag, module)| (module.identity(db), tag))
+			.collect()
+	}
+
 	pub(crate) fn semantic_direct_dependencies(
 		&self,
 		module: SemanticModuleInput,
@@ -463,6 +480,7 @@ fn collect_imports(parsed: &ParsedModule, importer: &str) -> Arc<DirectImports> 
 				target,
 				span,
 				namespace,
+				has_with_list: idents.is_some(),
 				with_idents: idents.clone().unwrap_or_default(),
 			});
 		}
@@ -509,8 +527,59 @@ pub(crate) fn interface_module_analysis<'db>(
 	}
 	roots.extend(dependencies);
 	let parsed = module.parsed(db);
-	let environment = nymph_sema::SemanticEnvironment::from_modules(module.identity(db), &roots)
+	let mut environment = nymph_sema::SemanticEnvironment::from_modules(module.identity(db), &roots)
 		.expect("validated interfaces form a deterministic semantic environment");
+	environment.set_diagnostic_module_tags(&graph.semantic_module_tags(db));
+	let mut bindings = FxHashMap::default();
+	if key.ambient_prelude(db) {
+		let registry = key.ambient_core_registry(db);
+		for root in registry.modules(db).iter().copied() {
+			let identity = SemanticModuleInput::Builtin(root).identity(db);
+			if let Some(exports) = environment.module_exports.get(&identity) {
+				for (name, stable) in &exports.by_name {
+					bindings.insert(
+						name.clone(),
+						nymph_sema::ResolvedImportBinding::Definition(stable.clone()),
+					);
+				}
+			}
+		}
+	}
+	let direct = graph.semantic_direct_dependencies(module);
+	for import in graph.semantic_direct_imports(db, module).iter() {
+		let Ok(target_key) = &import.target else {
+			continue;
+		};
+		let Some(target) = direct
+			.iter()
+			.copied()
+			.find(|candidate| candidate.display_key(db) == *target_key)
+		else {
+			continue;
+		};
+		let identity = target.identity(db);
+		bindings.insert(
+			import.namespace.0.clone(),
+			nymph_sema::ResolvedImportBinding::Namespace(identity.clone()),
+		);
+		if let Some(exports) = environment.module_exports.get(&identity) {
+			let selected = import
+				.with_idents
+				.iter()
+				.map(|(source, alias)| (alias.as_ref().unwrap_or(source).0.clone(), source.0.clone()))
+				.collect::<Vec<_>>();
+			for (local, source) in selected {
+				let binding = exports
+					.by_name
+					.get(&source)
+					.cloned()
+					.map(nymph_sema::ResolvedImportBinding::Definition)
+					.unwrap_or(nymph_sema::ResolvedImportBinding::Poison);
+				bindings.insert(local, binding);
+			}
+		}
+	}
+	environment.set_resolved_imports(bindings);
 	let result = nymph_sema::check_module_with_environment(
 		Arc::new(parsed.tree.clone()),
 		module.identity(db),

@@ -271,14 +271,51 @@ fn check_module_from_parts(
 	// the immutable completion boundary: publish the resolved forms, just as we
 	// already do for expression annotations, rather than making downstream
 	// consumers consult the checker's now-discarded unification table.
-	let let_ids = checker.sigs.lets.keys().copied().collect::<Vec<_>>();
-	for id in let_ids {
-		let ty = checker.sigs.lets[&id].ty;
-		let resolved = checker.resolve_deep(ty);
-		checker.sigs.lets.get_mut(&id).unwrap().ty = resolved;
+	let mut signatures = std::mem::take(&mut checker.sigs);
+	for signature in signatures.funcs.values_mut() {
+		for parameter in &mut signature.params {
+			parameter.ty = checker.resolve_deep(parameter.ty);
+		}
+		signature.ret = checker.resolve_deep(signature.ret);
 	}
-	let inherent: Vec<_> = checker
-		.inherent
+	for signature in signatures.lets.values_mut() {
+		signature.ty = checker.resolve_deep(signature.ty);
+	}
+	for signature in signatures.structs.values_mut() {
+		for (_, ty) in &mut signature.fields {
+			*ty = checker.resolve_deep(*ty);
+		}
+	}
+	for signature in signatures.enums.values_mut() {
+		for variant in &mut signature.variants {
+			for (_, ty) in &mut variant.fields {
+				*ty = checker.resolve_deep(*ty);
+			}
+		}
+	}
+	checker.sigs = signatures;
+	let mut interfaces = std::mem::take(&mut checker.interfaces);
+	for interface in interfaces.values_mut() {
+		for method in interface.methods.values_mut() {
+			for parameter in &mut method.params {
+				*parameter = checker.resolve_deep(*parameter);
+			}
+			method.ret = checker.resolve_deep(method.ret);
+		}
+	}
+	checker.interfaces = interfaces;
+	let mut implementations = std::mem::take(&mut checker.impls);
+	for implementation in &mut implementations.impls {
+		for method in implementation.methods.values_mut() {
+			for parameter in &mut method.params {
+				*parameter = checker.resolve_deep(*parameter);
+			}
+			method.ret = checker.resolve_deep(method.ret);
+		}
+	}
+	checker.impls = implementations;
+	let inherent_registry = std::mem::take(&mut checker.inherent);
+	let inherent: Vec<_> = inherent_registry
 		.impls
 		.iter()
 		.map(|implementation| crate::annotate::CheckedInherentImpl {
@@ -289,11 +326,17 @@ fn check_module_from_parts(
 				.methods
 				.iter()
 				.map(|(name, method)| {
+					let params = method
+						.params
+						.iter()
+						.map(|&parameter| checker.resolve_deep(parameter))
+						.collect();
+					let ret = checker.resolve_deep(method.ret);
 					(
 						name.clone(),
 						crate::annotate::CheckedMethod {
-							params: method.params.clone(),
-							ret: method.ret,
+							params,
+							ret,
 							bounds: method.bounds.clone(),
 						},
 					)

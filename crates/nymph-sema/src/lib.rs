@@ -41,7 +41,10 @@ pub mod query;
 mod solve;
 mod unify;
 
-pub use analysis::{ModuleAnnotations, SemanticAnalysis, SemanticCheckResult};
+pub use analysis::{
+	ModuleAnnotations, SemanticAnalysis, SemanticCheckResult, StableAnnotationView,
+	stable_annotation_view,
+};
 pub use annotate::{
 	Annotations, Checked, CheckedFacts, CheckedSemantic, DispatchKind, ExprInfo, IterMode, Resolution,
 };

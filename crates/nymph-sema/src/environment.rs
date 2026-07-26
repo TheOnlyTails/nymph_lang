@@ -68,6 +68,12 @@ pub struct SemanticEnvironment {
 }
 
 impl SemanticEnvironment {
+	/// Assigns compatibility-visible checker spellings without changing semantic names,
+	/// stable identities, or lexical lookup.
+	pub fn set_diagnostic_module_tags(&mut self, tags: &FxHashMap<ModuleIdentity, usize>) {
+		self.imported.defs.set_imported_diagnostic_module_tags(tags);
+	}
+
 	/// Allocates dependency identities in the caller's dependency-first graph order.
 	/// Export name overlays intentionally use insertion order, preserving compatibility's
 	/// complete-transitive visibility and deterministic later-wins behavior.
@@ -170,6 +176,76 @@ impl SemanticEnvironment {
 			resolved_imports: FxHashMap::default(),
 			contains_recovery,
 		})
+	}
+
+	/// Replaces compatibility's transitive bare-name overlay with the lexical bindings
+	/// resolved for the module currently being checked. All imported definitions remain
+	/// allocated and stable-addressable for transported types and dispatch.
+	pub fn set_resolved_imports(&mut self, bindings: FxHashMap<EcoString, ResolvedImportBinding>) {
+		self.imported.defs.clear_lexical_imports();
+		for (local, binding) in &bindings {
+			match binding {
+				ResolvedImportBinding::Definition(stable) => {
+					if let Some(def) = self.imported.defs.by_stable(stable) {
+						self.imported.defs.expose_name(local.clone(), def);
+						if let Some(enum_sig) = self.imported.signatures.enums.get(&def) {
+							for variant in &enum_sig.variants {
+								let Some(target) = variant
+									.target
+									.as_ref()
+									.and_then(|target| self.imported.defs.by_stable(target))
+								else {
+									continue;
+								};
+								self
+									.imported
+									.defs
+									.expose_imported_variant(variant.name.clone(), target);
+							}
+						}
+					}
+				}
+				ResolvedImportBinding::Namespace(module) => {
+					let def = self.imported.defs.define_imported(
+						local.clone(),
+						DefKind::Namespace,
+						module.clone(),
+						None,
+					);
+					let mut namespace = NamespaceSig::default();
+					if let Some(index) = self.module_exports.get(module) {
+						for (name, stable) in &index.by_name {
+							let Some(target) = self.imported.defs.by_stable(stable) else {
+								continue;
+							};
+							let member = if let Some(sig) = self.imported.signatures.funcs.get(&target) {
+								Some(NamespaceMemberSig::Func {
+									target: Some(stable.clone()),
+									sig: sig.clone(),
+								})
+							} else {
+								self
+									.imported
+									.signatures
+									.lets
+									.get(&target)
+									.map(|sig| NamespaceMemberSig::Value {
+										target: Some(stable.clone()),
+										ty: sig.ty,
+										mutable: false,
+									})
+							};
+							if let Some(member) = member {
+								namespace.members.insert(name.clone(), member);
+							}
+						}
+					}
+					self.imported.signatures.namespaces.insert(def, namespace);
+				}
+				ResolvedImportBinding::Poison => {}
+			}
+		}
+		self.resolved_imports = bindings;
 	}
 }
 
@@ -983,16 +1059,6 @@ fn instantiate_complete_impl(
 			.defs
 			.by_stable(interface_id)
 			.ok_or_else(|| EnvironmentConstructionError::MissingKnownIdentity(interface_id.clone()))?;
-		let mut methods = methods;
-		if let Some(definition) = facts.interfaces.get(&interface) {
-			for (name, method) in &definition.methods {
-				if method.has_default {
-					methods
-						.entry(name.clone())
-						.or_insert_with(|| method.clone());
-				}
-			}
-		}
 		let args = implementation
 			.interface_arguments
 			.iter()
@@ -1476,16 +1542,6 @@ fn instantiate_recovered_impl(
 				.defs
 				.by_stable(interface_id)
 				.ok_or_else(|| EnvironmentConstructionError::MissingKnownIdentity(interface_id.clone()))?;
-			let mut methods = methods;
-			if let Some(definition) = facts.interfaces.get(&interface) {
-				for (name, method) in &definition.methods {
-					if method.has_default {
-						methods
-							.entry(name.clone())
-							.or_insert_with(|| method.clone());
-					}
-				}
-			}
 			let args = implementation
 				.interface_arguments
 				.iter()
