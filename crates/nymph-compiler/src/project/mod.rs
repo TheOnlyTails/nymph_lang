@@ -47,6 +47,7 @@
 //!    fenced-off change to per-module name resolution in `nymph-sema`.
 
 mod bundle;
+mod compat;
 mod metrics;
 mod queries;
 mod resolve;
@@ -61,15 +62,26 @@ pub use metrics::{PhaseCounts, with_phase_counts};
 #[cfg(feature = "test-support")]
 pub use test_support::{GraphFixture, GraphShape};
 
+#[cfg(test)]
 use ecow::EcoString;
+#[cfg(test)]
 use nymph_ast::decl::{Module, Visibility};
-use nymph_diagnostics::{Diagnostic, Label};
-use nymph_hir::hir::{HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirMethod, HirModule};
+use nymph_diagnostics::Diagnostic;
+#[cfg(test)]
+use nymph_diagnostics::Label;
+#[cfg(test)]
+use nymph_hir::hir::{HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirModule};
+#[cfg(test)]
 use rayon::prelude::*;
+#[cfg(test)]
 use rustc_hash::{FxHashMap, FxHashSet};
 
+#[cfg(test)]
 use metrics::{CompilerPhase, capture_collector, install_collector, record_phase};
-use resolve::{GraphBuilder, RawModule};
+use resolve::GraphBuilder;
+#[cfg(test)]
+use resolve::RawModule;
+#[cfg(test)]
 use rewrite::{DeclaredName, NsInfo, RewriteCtx, declared_names, rewrite_module};
 
 #[cfg(feature = "test-support")]
@@ -217,21 +229,30 @@ pub struct ProjectDiagnostic {
 	pub diag: Diagnostic,
 }
 
-fn merge_canonical_enum(target: &mut HirEnum, incoming: HirEnum) {
+#[cfg(test)]
+fn merge_canonical_enum(target: &mut nymph_hir::hir::HirEnum, incoming: nymph_hir::hir::HirEnum) {
 	assert_eq!(target.name, incoming.name);
 	assert_eq!(target.variants, incoming.variants);
 	merge_canonical_methods(&mut target.methods, incoming.methods);
 	merge_canonical_methods(&mut target.statics, incoming.statics);
 }
 
-fn merge_canonical_class(target: &mut HirClass, incoming: HirClass) {
+#[cfg(test)]
+fn merge_canonical_class(
+	target: &mut nymph_hir::hir::HirClass,
+	incoming: nymph_hir::hir::HirClass,
+) {
 	assert_eq!(target.name, incoming.name);
 	assert_eq!(target.fields, incoming.fields);
 	merge_canonical_methods(&mut target.methods, incoming.methods);
 	merge_canonical_methods(&mut target.statics, incoming.statics);
 }
 
-fn merge_canonical_methods(target: &mut Vec<HirMethod>, incoming: Vec<HirMethod>) {
+#[cfg(test)]
+fn merge_canonical_methods(
+	target: &mut Vec<nymph_hir::hir::HirMethod>,
+	incoming: Vec<nymph_hir::hir::HirMethod>,
+) {
 	for method in incoming {
 		// Prelude methods are lowered independently in each consumer. Their
 		// generated local names can differ with that consumer's rename counters,
@@ -244,6 +265,7 @@ fn merge_canonical_methods(target: &mut Vec<HirMethod>, incoming: Vec<HirMethod>
 	}
 }
 
+#[cfg(test)]
 fn runtime_import_lines(imports: &[(String, Vec<String>)]) -> String {
 	let mut out = String::new();
 	for (specifier, names) in imports {
@@ -255,6 +277,7 @@ fn runtime_import_lines(imports: &[(String, Vec<String>)]) -> String {
 	out
 }
 
+#[cfg(test)]
 fn insert_runtime_module(
 	sources: &mut FxHashMap<String, String>,
 	key: String,
@@ -281,6 +304,7 @@ fn insert_runtime_module(
 /// [`Self::entry_symbol`]), so `entry_main` is always the literal `"main"`
 /// and a caller can append `main();` exactly like the single-module facade
 /// (`compile`/`compile_entry`) already does.
+#[derive(Clone)]
 pub struct CompiledProject {
 	pub js: String,
 	pub entry_main: String,
@@ -305,6 +329,49 @@ impl CompiledProject {
 	}
 }
 
+const FACADE_PROJECT: &str = "__nymph_internal_facade_project__";
+
+fn facade_session(
+	entry: &str,
+	load: &dyn Fn(&str) -> Option<String>,
+	std_provider: &dyn Fn(&str) -> Option<String>,
+) -> (CompilerSession, ProjectId, ModulePath) {
+	use std::{cell::RefCell, collections::BTreeMap};
+
+	let project_sources = RefCell::new(BTreeMap::new());
+	let builtin_sources = RefCell::new(BTreeMap::new());
+	let capture_project = |key: &str| {
+		load(key).inspect(|source| {
+			project_sources
+				.borrow_mut()
+				.entry(key.to_string())
+				.or_insert_with(|| source.clone());
+		})
+	};
+	let capture_builtin = |key: &str| {
+		std_provider(key).inspect(|source| {
+			builtin_sources
+				.borrow_mut()
+				.entry(key.to_string())
+				.or_insert_with(|| source.clone());
+		})
+	};
+	GraphBuilder::new(&capture_project, &capture_builtin).visit(entry);
+
+	let project = ProjectId::new(FACADE_PROJECT);
+	let mut session = CompilerSession::from_builtin_sources(builtin_sources.into_inner());
+	for (path, source) in project_sources.into_inner() {
+		session.set_source(
+			project.clone(),
+			ModulePath::new(path).expect("legacy discovery produced a canonical module path"),
+			source,
+			SourceVersion(1),
+		);
+	}
+	let entry = ModulePath::new(entry).expect("project entry must be a canonical module path");
+	(session, project, entry)
+}
+
 /// Resolve, parse, bind, and type-check every module reachable from `entry`,
 /// requiring `entry` to declare a valid top-level `main`, and returning every
 /// diagnostic produced (empty ⇒ the whole project is clean). Does not lower
@@ -326,10 +393,12 @@ pub fn check_project_with_std(
 	load: &dyn Fn(&str) -> Option<String>,
 	std_provider: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<ProjectDiagnostic> {
-	match Driver::resolve_and_bind(entry, load, std_provider, true, false) {
-		Err(diags) => diags,
-		Ok(driver) => driver.check_all(),
-	}
+	let (session, project, entry) = facade_session(entry, load, std_provider);
+	session
+		.check_project(project, entry, nymph_sema::EntryMode::Entry)
+		.iter()
+		.cloned()
+		.collect()
 }
 
 /// Library-mode counterpart of [`check_project`]: `entry` is not required to
@@ -351,10 +420,12 @@ pub fn check_project_library_with_std(
 	load: &dyn Fn(&str) -> Option<String>,
 	std_provider: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<ProjectDiagnostic> {
-	match Driver::resolve_and_bind(entry, load, std_provider, false, false) {
-		Err(diags) => diags,
-		Ok(driver) => driver.check_all(),
-	}
+	let (session, project, entry) = facade_session(entry, load, std_provider);
+	session
+		.check_project(project, entry, nymph_sema::EntryMode::Library)
+		.iter()
+		.cloned()
+		.collect()
 }
 
 /// Compile the whole project reachable from `entry` to one runnable JS
@@ -386,8 +457,11 @@ pub fn compile_project_with_std(
 	load: &dyn Fn(&str) -> Option<String>,
 	std_provider: &dyn Fn(&str) -> Option<String>,
 ) -> Result<CompiledProject, Vec<ProjectDiagnostic>> {
-	let driver = Driver::resolve_and_bind(entry, load, std_provider, true, false)?;
-	driver.compile_all()
+	let (session, project, entry) = facade_session(entry, load, std_provider);
+	session
+		.compile_project(project, entry, nymph_sema::EntryMode::Entry)
+		.map(|compiled| compiled.as_ref().clone())
+		.map_err(|diagnostics| diagnostics.iter().cloned().collect())
 }
 
 /// Compile one standalone source through the canonical virtual-module
@@ -398,13 +472,28 @@ pub(crate) fn compile_standalone(
 	entry_mode: bool,
 ) -> Result<String, Vec<Diagnostic>> {
 	const STANDALONE_ENTRY: &str = "__nymph_internal_standalone_entry__";
-	let load = |key: &str| (key == STANDALONE_ENTRY).then(|| source.to_string());
-	let driver = Driver::resolve_and_bind(STANDALONE_ENTRY, &load, &|_| None, entry_mode, true)
-		.map_err(|diags| diags.into_iter().map(|item| item.diag).collect::<Vec<_>>())?;
-	driver
-		.compile_all()
-		.map(|compiled| compiled.js)
-		.map_err(|diags| diags.into_iter().map(|item| item.diag).collect())
+	let project = ProjectId::new(FACADE_PROJECT);
+	let path = ModulePath::new(STANDALONE_ENTRY).expect("standalone key is canonical");
+	let mut session = CompilerSession::from_builtin_sources(Default::default());
+	session.set_source(
+		project.clone(),
+		path.clone(),
+		source.to_string(),
+		SourceVersion(1),
+	);
+	session
+		.compile_project_with_options(
+			project,
+			path,
+			if entry_mode {
+				nymph_sema::EntryMode::Entry
+			} else {
+				nymph_sema::EntryMode::Library
+			},
+			true,
+		)
+		.map(|compiled| compiled.js.clone())
+		.map_err(|diags| diags.iter().map(|item| item.diag.clone()).collect())
 }
 
 /// Internal inspection seam for regressions that must assert the exact ES
@@ -415,9 +504,11 @@ pub fn compile_project_module_sources_with_std(
 	load: &dyn Fn(&str) -> Option<String>,
 	std_provider: &dyn Fn(&str) -> Option<String>,
 ) -> Result<std::collections::HashMap<String, String>, Vec<ProjectDiagnostic>> {
-	let driver = Driver::resolve_and_bind(entry, load, std_provider, true, false)?;
-	let (sources, _) = driver.assemble_module_sources()?;
-	Ok(sources.into_iter().collect())
+	let (session, project, entry) = facade_session(entry, load, std_provider);
+	session
+		.inspect_emitted_project(project, entry, nymph_sema::EntryMode::Entry)
+		.map(|(sources, _)| sources)
+		.map_err(|diagnostics| diagnostics.iter().cloned().collect())
 }
 
 /// Library-mode counterpart of [`compile_project`]: `entry` is not required
@@ -446,13 +537,17 @@ pub fn compile_project_library_with_std(
 	load: &dyn Fn(&str) -> Option<String>,
 	std_provider: &dyn Fn(&str) -> Option<String>,
 ) -> Result<CompiledProject, Vec<ProjectDiagnostic>> {
-	let driver = Driver::resolve_and_bind(entry, load, std_provider, false, false)?;
-	driver.compile_all()
+	let (session, project, entry) = facade_session(entry, load, std_provider);
+	session
+		.compile_project(project, entry, nymph_sema::EntryMode::Library)
+		.map(|compiled| compiled.as_ref().clone())
+		.map_err(|diagnostics| diagnostics.iter().cloned().collect())
 }
 
 /// Owns everything phase 2/3 need once the module graph is resolved: the raw
 /// parsed modules, their dependency-first order, per-module stable tags, and
 /// every module's declared-name table (for cross-module visibility checks).
+#[cfg(test)]
 struct Driver {
 	entry: String,
 	/// Whether `entry` must declare a valid top-level `main` — see
@@ -470,6 +565,7 @@ struct Driver {
 	declared: FxHashMap<String, Vec<DeclaredName>>,
 }
 
+#[cfg(test)]
 impl Driver {
 	/// Phase 1 (resolve + parse) and phase 2 (bind + rewrite). Returns every
 	/// diagnostic collected in either phase, aborting before any type

@@ -8,7 +8,7 @@ use nymph_sema::EntryMode;
 use salsa::Setter;
 
 use super::{
-	ProjectDiagnostic,
+	CompiledProject, ProjectDiagnostic,
 	queries::{self, Db},
 };
 
@@ -125,14 +125,17 @@ struct SourceRecord {
 	version: SourceVersion,
 }
 
-/// Placeholder for the compatibility analysis introduced by the next migration task.
-#[allow(dead_code)]
-pub(crate) struct ModuleAnalysis;
+pub(crate) struct ModuleAnalysis {
+	pub module: Arc<nymph_ast::decl::Module>,
+	pub checked: Arc<nymph_sema::Checked>,
+	pub diagnostics: Arc<[ProjectDiagnostic]>,
+}
 
 pub struct CompilerSession {
 	db: Database,
 	registry: BTreeMap<RegistryKey, SourceRecord>,
 	projects: Mutex<BTreeMap<ProjectId, ProjectInput>>,
+	builtin_sources: BTreeMap<Arc<str>, Arc<str>>,
 	builtins: BTreeMap<BuiltinModuleKey, BuiltinModuleInput>,
 	builtin_registry: BuiltinRegistryInput,
 	tombstones: usize,
@@ -150,16 +153,47 @@ impl CompilerSession {
 	#[allow(dead_code)]
 	pub(crate) fn module_analysis(
 		&self,
-		_project: ProjectId,
-		_module: ModuleInput,
-		_key: ProjectKey<'_>,
+		project: ProjectId,
+		module: ModuleInput,
+		key: ProjectKey<'_>,
 	) -> Option<Arc<ModuleAnalysis>> {
-		None
+		(module.project(&self.db) == project
+			&& key.project_input(&self.db).project(&self.db) == project
+			&& key
+				.project_input(&self.db)
+				.active_modules(&self.db)
+				.contains(&module)
+			&& super::compat::compat_project_module_is_reachable(&self.db, key, module)
+			&& super::compat::compat_precheck_diagnostics(&self.db, key).is_empty())
+		.then(|| {
+			super::compat::compat_module_analysis(
+				&self.db,
+				key,
+				super::compat::CompatModuleInput::Project(module),
+			)
+		})
 	}
 
 	#[must_use]
 	pub fn new() -> Self {
-		Self::with_event_callback_and_tombstone_threshold(|_| {}, 256)
+		Self::with_builtin_sources(
+			crate::std_source::embedded_std_sources()
+				.map(|(path, source)| (Arc::from(path), Arc::from(source)))
+				.collect(),
+			Arc::new(|_| {}),
+			256,
+		)
+	}
+
+	pub(crate) fn from_builtin_sources(sources: BTreeMap<String, String>) -> Self {
+		Self::with_builtin_sources(
+			sources
+				.into_iter()
+				.map(|(path, source)| (Arc::from(path), Arc::from(source)))
+				.collect(),
+			Arc::new(|_| {}),
+			256,
+		)
 	}
 
 	#[doc(hidden)]
@@ -168,12 +202,24 @@ impl CompilerSession {
 		threshold: usize,
 	) -> Self {
 		let callback: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(callback);
+		let sources = crate::std_source::embedded_std_sources()
+			.map(|(path, source)| (Arc::from(path), Arc::from(source)))
+			.collect();
+		Self::with_builtin_sources(sources, callback, threshold)
+	}
+
+	fn with_builtin_sources(
+		builtin_sources: BTreeMap<Arc<str>, Arc<str>>,
+		callback: Arc<dyn Fn(&str) + Send + Sync>,
+		threshold: usize,
+	) -> Self {
 		let db = Self::database(callback.clone());
-		let (builtins, builtin_registry) = Self::create_builtins(&db);
+		let (builtins, builtin_registry) = Self::create_builtins(&db, &builtin_sources);
 		Self {
 			db,
 			registry: BTreeMap::new(),
 			projects: Mutex::new(BTreeMap::new()),
+			builtin_sources,
 			builtins,
 			builtin_registry,
 			tombstones: 0,
@@ -184,14 +230,16 @@ impl CompilerSession {
 
 	fn create_builtins(
 		db: &Database,
+		sources: &BTreeMap<Arc<str>, Arc<str>>,
 	) -> (
 		BTreeMap<BuiltinModuleKey, BuiltinModuleInput>,
 		BuiltinRegistryInput,
 	) {
-		let builtins: BTreeMap<_, _> = crate::std_source::embedded_std_sources()
+		let builtins: BTreeMap<_, _> = sources
+			.iter()
 			.map(|(path, source)| {
-				let key = BuiltinModuleKey(Arc::from(path));
-				let input = BuiltinModuleInput::new(db, key.clone(), Arc::from(source));
+				let key = BuiltinModuleKey(path.clone());
+				let input = BuiltinModuleInput::new(db, key.clone(), source.clone());
 				(key, input)
 			})
 			.collect();
@@ -209,9 +257,15 @@ impl CompilerSession {
 						.split_once('(')
 						.map_or(debug.as_str(), |(name, _)| name);
 					let public_name = match query {
-						"parse" | "parse_builtin" => Some("parse"),
-						"direct_imports" | "builtin_direct_imports" => Some("direct_imports"),
+						"parse" | "compat_parse_builtin" => Some("parse"),
+						"direct_imports" | "compat_builtin_direct_imports" => Some("direct_imports"),
 						"project_graph" => Some("project_graph"),
+						"compat_symbol_map"
+						| "compat_rewritten_module"
+						| "compat_module_analysis"
+						| "compat_lowered_module"
+						| "compat_emitted_module"
+						| "compat_compiled_project" => Some(query),
 						_ => None,
 					};
 					if let Some(name) = public_name {
@@ -300,7 +354,7 @@ impl CompilerSession {
 
 	fn rebuild_database(&mut self) {
 		self.db = Self::database(self.event_callback.clone());
-		(self.builtins, self.builtin_registry) = Self::create_builtins(&self.db);
+		(self.builtins, self.builtin_registry) = Self::create_builtins(&self.db, &self.builtin_sources);
 		self
 			.projects
 			.get_mut()
@@ -348,6 +402,32 @@ impl CompilerSession {
 		.clone()
 	}
 
+	fn project_key(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		mode: EntryMode,
+		preserve_names: bool,
+	) -> ProjectKey<'_> {
+		let mut projects = self
+			.projects
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		let input = projects.get(&project).copied().unwrap_or_else(|| {
+			let input = ProjectInput::new(&self.db, project.clone(), Arc::new([]));
+			projects.insert(project, input);
+			input
+		});
+		ProjectKey::new(
+			&self.db,
+			input,
+			self.builtin_registry,
+			entry,
+			mode,
+			preserve_names,
+		)
+	}
+
 	#[must_use]
 	pub fn check_project(
 		&self,
@@ -355,26 +435,58 @@ impl CompilerSession {
 		entry: ModulePath,
 		mode: EntryMode,
 	) -> Arc<[ProjectDiagnostic]> {
-		let graph = self.graph(project.clone(), entry.clone(), mode);
-		if !graph.diagnostics.is_empty() {
-			return graph.diagnostics.clone();
+		let key = self.project_key(project, entry, mode, false);
+		super::compat::compat_checked_project(&self.db, key)
+	}
+
+	pub fn compile_project(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		mode: EntryMode,
+	) -> Result<Arc<CompiledProject>, Arc<[ProjectDiagnostic]>> {
+		self.compile_project_with_options(project, entry, mode, false)
+	}
+
+	pub(crate) fn compile_project_with_options(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		mode: EntryMode,
+		preserve_names: bool,
+	) -> Result<Arc<CompiledProject>, Arc<[ProjectDiagnostic]>> {
+		let key = self.project_key(project, entry, mode, preserve_names);
+		match super::compat::compat_compiled_project(&self.db, key).as_ref() {
+			super::compat::CompatCompiledProject::Compiled(compiled) => Ok(compiled.clone()),
+			super::compat::CompatCompiledProject::Diagnostics(diagnostics) => Err(diagnostics.clone()),
 		}
-		let load = |path: &str| {
-			self
-				.registry
-				.get(&(project.clone(), ModulePath::new(path).ok()?))
-				.and_then(|record| record.source.as_ref())
-				.map(ToString::to_string)
-		};
-		let diagnostics = match mode {
-			EntryMode::Entry => {
-				super::check_project_with_std(entry.as_str(), &load, &crate::embedded_std_provider)
-			}
-			EntryMode::Library => {
-				super::check_project_library_with_std(entry.as_str(), &load, &crate::embedded_std_provider)
-			}
-		};
-		diagnostics.into()
+	}
+
+	/// Returns the exact ES-module graph before bundling, together with the
+	/// entry module's compatibility tag.
+	#[doc(hidden)]
+	pub fn inspect_emitted_project(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		mode: EntryMode,
+	) -> Result<(std::collections::HashMap<String, String>, usize), Arc<[ProjectDiagnostic]>> {
+		self.inspect_emitted_project_with_options(project, entry, mode, false)
+	}
+
+	pub(crate) fn inspect_emitted_project_with_options(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		mode: EntryMode,
+		preserve_names: bool,
+	) -> Result<(std::collections::HashMap<String, String>, usize), Arc<[ProjectDiagnostic]>> {
+		let key = self.project_key(project, entry, mode, preserve_names);
+		let emitted = super::compat::compat_emitted_module(&self.db, key);
+		match &emitted.module_sources {
+			Ok(sources) => Ok((sources.clone().into_iter().collect(), emitted.entry_tag)),
+			Err(diagnostics) => Err(diagnostics.clone().into()),
+		}
 	}
 
 	#[doc(hidden)]
@@ -412,5 +524,47 @@ impl CompilerSession {
 			.registry
 			.get(&(project, module))
 			.is_some_and(|record| record.source.is_some())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn database_rebuild_preserves_exact_custom_builtins() {
+		let mut session = CompilerSession::from_builtin_sources(BTreeMap::from([(
+			"custom".to_string(),
+			"public func answer(): int = 42".to_string(),
+		)]));
+		session.tombstone_threshold = 1;
+		let project = ProjectId::new("custom-rebuild");
+		let main = ModulePath::new("main").unwrap();
+		let temporary = ModulePath::new("temporary").unwrap();
+		session.set_source(
+			project.clone(),
+			main.clone(),
+			"import std/custom with (answer)\nfunc main(): void = {}\nfunc value(): int = answer()"
+				.into(),
+			SourceVersion(1),
+		);
+		session.set_source(
+			project.clone(),
+			temporary.clone(),
+			"let unused = 0".into(),
+			SourceVersion(1),
+		);
+		assert!(
+			session
+				.check_project(project.clone(), main.clone(), EntryMode::Entry)
+				.is_empty()
+		);
+		session.remove_source(project.clone(), temporary);
+		assert!(
+			session
+				.check_project(project, main, EntryMode::Entry)
+				.is_empty()
+		);
+		assert_eq!(session.builtin_sources.len(), 1);
 	}
 }

@@ -27,6 +27,7 @@ use super::ProjectDiagnostic;
 /// One `import` statement, resolved to its target module key and carrying
 /// everything phase 2 (binding) needs: the namespace it's always bound under
 /// (the `as` alias, or the last path segment) and any `with (...)` names.
+#[allow(dead_code)]
 pub(crate) struct ParsedImport {
 	pub target_key: String,
 	pub ns_name: EcoString,
@@ -40,6 +41,7 @@ pub(crate) struct ParsedImport {
 /// (see [`super::ProjectDiagnostic`]); rendering it against source text is
 /// the caller's job — re-fetch it through the same `load` closure, since
 /// that's exactly what this driver used to get it in the first place.
+#[allow(dead_code)]
 pub(crate) struct RawModule {
 	pub tree: Module,
 	pub imports: Vec<ParsedImport>,

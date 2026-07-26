@@ -203,6 +203,26 @@ fn an_unresolvable_std_path_is_import_unresolved() {
 	);
 }
 
+#[test]
+fn custom_provider_has_no_embedded_std_fallback() {
+	let entry = "import std/io with (println)\nfunc main(): void = {}";
+	let load = only_entry("main", entry);
+	let requested = std::cell::RefCell::new(Vec::new());
+
+	let diags = check_project_with_std("main", &load, &|path| {
+		requested.borrow_mut().push(path.to_string());
+		None
+	});
+
+	assert_eq!(requested.into_inner(), ["io"]);
+	assert!(
+		diags
+			.iter()
+			.any(|diag| diag.diag.code == "IMPORT-UNRESOLVED"),
+		"an absent custom builtin must not fall back to embedded std: {diags:?}"
+	);
+}
+
 /// The `std::`-prefixed module key mangles to valid, runnable JS: Slice B's
 /// design note is that the mangle scheme (`$m{numeric-tag}$name`) never
 /// embeds the module KEY string at all, so a `::` in the key is inert — this

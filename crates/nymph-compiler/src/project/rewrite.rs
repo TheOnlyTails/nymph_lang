@@ -62,7 +62,7 @@ use rustc_hash::FxHashMap;
 /// `Internal`) visibility, computed from its RAW (pre-rewrite) AST. Consulted
 /// whenever some OTHER module imports this one, to validate a `with`-name or
 /// a namespace member access.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct DeclaredName {
 	pub name: EcoString,
 	pub vis: Visibility,
@@ -135,6 +135,7 @@ pub(crate) fn declared_names(module: &Module) -> Vec<DeclaredName> {
 }
 
 /// Where an import's namespace name (`math`, or its `as` alias) points.
+#[derive(Clone, Debug)]
 pub(crate) struct NsInfo {
 	pub target_key: String,
 	pub target_tag: usize,

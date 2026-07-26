@@ -60,6 +60,7 @@ impl RuntimeOwner {
 }
 
 /// Consumer declarations and the ambient prelude declarations their bodies demand.
+#[derive(Clone)]
 pub struct LoweredHir {
 	pub module: HirModule,
 	pub prelude_runtime: HirModule,
