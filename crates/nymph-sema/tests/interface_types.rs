@@ -9,8 +9,8 @@ use nymph_sema::{
 	FieldShape, GenericParameter, GenericParameterId, InstantiationContext, InterfaceConversionError,
 	InterfaceType, MemberKind, MemberShape, ModuleIdentity, ParameterShape,
 	RecoveredExportedDefinition, RecoveredInterfaceType, RecoveredModuleInterface,
-	RecoveredSupportDefinition, SemanticAvailability, SupportDefinition, VariantShape,
-	canonicalize_type, instantiate_interface_type,
+	RecoveredSupportDefinition, SemanticAvailability, SuperInterfaceShape, SupportDefinition,
+	VariantShape, canonicalize_type, instantiate_interface_type,
 };
 use nymph_sema::{DefId, GenericArgs, InferVar, Interner, ModuleInterface, ParamIdx};
 
@@ -235,7 +235,11 @@ fn complete_fixture() -> ModuleInterface {
 			fields: vec![field],
 		}],
 		members: vec![member.clone()],
-		super_interfaces: vec![constraint.clone()],
+		super_interfaces: vec![SuperInterfaceShape {
+			interface: definition("Bound"),
+			positional: vec![InterfaceType::Int],
+			named: vec![("Output".into(), InterfaceType::String)],
+		}],
 		external: member.external.clone(),
 		runtime_owner: Some(owner.clone()),
 	};

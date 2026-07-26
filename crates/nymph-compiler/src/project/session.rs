@@ -20,6 +20,10 @@ impl ProjectId {
 	pub fn new(value: impl Into<Arc<str>>) -> Self {
 		Self(value.into())
 	}
+	#[must_use]
+	pub fn as_str(&self) -> &str {
+		&self.0
+	}
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, salsa::SalsaValue)]
@@ -138,6 +142,12 @@ pub struct ModuleAnalysis {
 	pub(crate) checked_module: Arc<nymph_ast::decl::Module>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BuiltinRuntimeArtifact {
+	pub definition: nymph_sema::DefinitionId,
+	pub checked_body: Arc<str>,
+}
+
 impl ModuleAnalysis {
 	/// Query the checked type at a source offset.
 	///
@@ -169,6 +179,98 @@ impl Default for CompilerSession {
 }
 
 impl CompilerSession {
+	fn compat_input(
+		&self,
+		project: &ProjectId,
+		module: &ModulePath,
+	) -> Option<super::compat::CompatModuleInput> {
+		self
+			.registry
+			.get(&(project.clone(), module.clone()))
+			.map(|record| super::compat::CompatModuleInput::Project(record.input))
+	}
+
+	#[must_use]
+	pub fn compat_module_interface(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		mode: EntryMode,
+	) -> Option<Arc<nymph_sema::ModuleInterface>> {
+		let input = self.compat_input(&project, &module)?;
+		let key = self.project_key(project, entry, mode, true, true);
+		Some(super::compat::compat_module_interface(&self.db, key, input))
+	}
+
+	#[must_use]
+	pub fn compat_module_environment(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		mode: EntryMode,
+	) -> Option<Arc<nymph_sema::ModuleEnvironment>> {
+		let input = self.compat_input(&project, &module)?;
+		let key = self.project_key(project, entry, mode, true, true);
+		Some(super::compat::compat_module_environment(
+			&self.db, key, input,
+		))
+	}
+
+	pub fn compat_environment_is_lowerable(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		mode: EntryMode,
+	) -> Result<(), &'static str> {
+		match &*self
+			.compat_module_environment(project, entry, module, mode)
+			.ok_or("module is unavailable")?
+		{
+			nymph_sema::ModuleEnvironment::Complete(_) => Ok(()),
+			nymph_sema::ModuleEnvironment::Recovered(_) => {
+				Err("reachable module environment is recovered")
+			}
+		}
+	}
+
+	#[must_use]
+	pub fn compat_module_diagnostics(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		mode: EntryMode,
+	) -> Option<Arc<[ProjectDiagnostic]>> {
+		let input = self.compat_input(&project, &module)?;
+		let key = self.project_key(project, entry, mode, true, true);
+		Some(super::compat::compat_module_diagnostics(
+			&self.db, key, input,
+		))
+	}
+
+	#[must_use]
+	pub fn builtin_runtime_artifacts(&self) -> Arc<[BuiltinRuntimeArtifact]> {
+		let mut artifacts = Vec::new();
+		for (key, input) in &self.builtins {
+			let parsed = queries::compat_parse_builtin(&self.db, *input);
+			let identity = nymph_sema::ModuleIdentity {
+				project: "compiler".into(),
+				path: key.0.as_ref().into(),
+			};
+			let headers = nymph_sema::declared_headers(identity, &parsed.tree);
+			for (_, definition) in headers.definitions {
+				artifacts.push(BuiltinRuntimeArtifact {
+					definition,
+					checked_body: input.source(&self.db),
+				});
+			}
+		}
+		artifacts.sort_by(|a, b| a.definition.cmp(&b.definition));
+		artifacts.into()
+	}
 	fn module_analysis(
 		&self,
 		project: ProjectId,
@@ -336,6 +438,10 @@ impl CompilerSession {
 						"compat_symbol_map"
 						| "compat_rewritten_module"
 						| "compat_module_analysis"
+						| "compat_declared_headers"
+						| "compat_module_environment"
+						| "compat_module_interface"
+						| "compat_module_diagnostics"
 						| "compat_lowered_module"
 						| "compat_emitted_module"
 						| "compat_compiled_project" => Some(query),

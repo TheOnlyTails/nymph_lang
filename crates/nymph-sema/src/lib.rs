@@ -17,6 +17,7 @@
 //! Milestone B (interface solving, operator overloading, associated generics, and
 //! match exhaustiveness) is layered on top later.
 
+mod analysis;
 mod annotate;
 mod anon_closure;
 mod check;
@@ -30,6 +31,7 @@ mod iface;
 mod infer_expr;
 mod infer_pattern;
 mod interface;
+mod interface_extract;
 mod lower;
 mod lower_hir;
 mod members;
@@ -38,7 +40,10 @@ pub mod query;
 mod solve;
 mod unify;
 
-pub use annotate::{Annotations, Checked, DispatchKind, ExprInfo, IterMode, Resolution};
+pub use analysis::{ModuleAnnotations, SemanticAnalysis};
+pub use annotate::{
+	Annotations, Checked, CheckedSemantic, DispatchKind, ExprInfo, IterMode, Resolution,
+};
 pub use check::{EntryMode, check_module, check_module_entry, check_program};
 pub use errors::TypeError;
 pub use identity::{
@@ -47,6 +52,7 @@ pub use identity::{
 	ModuleIdentity, StableIdBuilder,
 };
 pub use interface::*;
+pub use interface_extract::*;
 pub use lower_hir::{
 	LoweredHir, RuntimeOwner, lower_hir, lower_hir_with_prelude, lower_hir_with_prelude_and_deps,
 	lower_hir_with_prelude_runtime_and_deps, lower_hir_with_prelude_runtime_and_deps_with_owners,

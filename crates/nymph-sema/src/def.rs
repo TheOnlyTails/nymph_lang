@@ -22,7 +22,7 @@ use rustc_hash::FxHashMap;
 use crate::{DefId, Ty};
 
 /// The resolved top-level items of a module.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct DefMap {
 	pub defs: Vec<DefData>,
 	/// Top-level names (types, functions, lets, namespaces) in a single value/type
@@ -272,7 +272,7 @@ pub struct FuncSig {
 /// The lowered signatures of every top-level definition. Built once, read-only
 /// during body inference. Type aliases are expanded on demand from the AST, so
 /// they need no stored signature here.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Signatures {
 	pub structs: FxHashMap<DefId, StructSig>,
 	pub enums: FxHashMap<DefId, EnumSig>,

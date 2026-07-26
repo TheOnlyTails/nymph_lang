@@ -1171,6 +1171,7 @@ fn missing_resolution_still_panics_in_lowering() {
 		annotations: nymph_sema::Annotations::default(),
 		external_value_marshals: checked.external_value_marshals,
 		interner: checked.interner,
+		semantic: checked.semantic,
 	};
 	nymph_sema::lower_hir(&parsed.tree, &stripped);
 }
@@ -1309,6 +1310,7 @@ fn missing_prefix_resolution_still_panics_in_lowering() {
 		annotations: nymph_sema::Annotations::default(),
 		external_value_marshals: checked.external_value_marshals,
 		interner: checked.interner,
+		semantic: checked.semantic,
 	};
 	nymph_sema::lower_hir(&parsed.tree, &stripped);
 }

@@ -13,7 +13,7 @@ use nymph_ast::{NodeId, Span, decl::Declaration, decl::Module};
 use nymph_diagnostics::Diagnostic;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::annotate::Checked;
+use crate::annotate::{Checked, CheckedSemantic};
 use crate::def::{DefMap, Signatures, build_def_map};
 use crate::ids::{DefId, InferVar, ParamIdx};
 use crate::ty::fold::occurs;
@@ -252,11 +252,46 @@ pub(crate) fn check_module_impl(module: &Module, entry: EntryMode) -> Checked {
 	// still available so lowering never sees a stale `TyKind::Infer`.
 	let mut annotations = std::mem::take(&mut checker.annotations);
 	annotations.map_types(|ty| checker.resolve_deep(ty));
+	let inherent = checker
+		.inherent
+		.impls
+		.iter()
+		.map(|implementation| crate::annotate::CheckedInherentImpl {
+			generics: implementation
+				.owner_generics
+				.iter()
+				.map(|generic| generic.0.name.0.clone())
+				.collect(),
+			self_ty: implementation.self_ty,
+			constraints: implementation.constraints.clone(),
+			methods: implementation
+				.methods
+				.iter()
+				.map(|(name, method)| {
+					(
+						name.clone(),
+						crate::annotate::CheckedMethod {
+							params: method.params.clone(),
+							ret: method.ret,
+							bounds: method.bounds.clone(),
+						},
+					)
+				})
+				.collect(),
+		})
+		.collect();
 	Checked {
 		diags: checker.diags,
 		annotations,
 		external_value_marshals: checker.external_value_marshals,
 		interner: checker.interner,
+		semantic: CheckedSemantic {
+			definitions: checker.defs,
+			signatures: checker.sigs,
+			interfaces: checker.interfaces,
+			implementations: checker.impls,
+			inherent,
+		},
 	}
 }
 

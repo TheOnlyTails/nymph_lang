@@ -12,6 +12,53 @@ use crate::Ty;
 use crate::ty::Interner;
 use nymph_hir::hir::MarshalKind;
 
+/// Immutable, owned declaration-level checker output used for interface extraction.
+/// Diagnostics and transient inference state are deliberately not included.
+#[derive(Debug, Clone)]
+pub struct CheckedSemantic {
+	pub(crate) definitions: crate::def::DefMap,
+	pub(crate) signatures: crate::def::Signatures,
+	pub(crate) interfaces: FxHashMap<crate::DefId, crate::iface::InterfaceDef>,
+	pub(crate) implementations: crate::iface::ImplRegistry,
+	pub(crate) inherent: Vec<CheckedInherentImpl>,
+}
+
+/// Owned, AST-independent facts for one checked inherent implementation.
+#[derive(Debug, Clone)]
+pub(crate) struct CheckedInherentImpl {
+	pub generics: Vec<EcoString>,
+	pub self_ty: Ty,
+	pub constraints: Vec<crate::iface::Bound>,
+	pub methods: FxHashMap<EcoString, CheckedMethod>,
+}
+
+/// Owned method facts after return inference and constraint checking.
+#[derive(Debug, Clone)]
+pub(crate) struct CheckedMethod {
+	pub params: Vec<Ty>,
+	pub ret: Ty,
+	pub bounds: Vec<crate::iface::Bound>,
+}
+
+impl CheckedSemantic {
+	#[must_use]
+	pub fn definition_count(&self) -> usize {
+		self.definitions.defs.len()
+	}
+	#[must_use]
+	pub fn interface_count(&self) -> usize {
+		self.interfaces.len()
+	}
+	#[must_use]
+	pub fn implementation_count(&self) -> usize {
+		self.implementations.impls.len()
+	}
+	#[must_use]
+	pub fn inherent_implementation_count(&self) -> usize {
+		self.inherent.len()
+	}
+}
+
 /// How a resolved binary operator must be emitted by codegen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DispatchKind {
@@ -55,7 +102,7 @@ pub struct Resolution {
 }
 
 /// What the checker learned about one expression node.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExprInfo {
 	pub ty: Ty,
 	pub resolution: Option<Resolution>,
@@ -64,7 +111,7 @@ pub struct ExprInfo {
 /// The resolved `(enum, variant)` names behind a variant construction or
 /// reference. Recorded so lowering can emit the Symbol-tag ABI without
 /// re-resolving ambiguous bare variant names (`None`, `Some`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VariantResolution {
 	pub enum_name: ecow::EcoString,
 	pub variant: ecow::EcoString,
@@ -87,7 +134,7 @@ pub enum IterMode {
 
 /// A [`NodeId`]-keyed map of [`ExprInfo`] plus variant resolutions, produced by
 /// checking and consumed by lowering.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Annotations {
 	infos: FxHashMap<NodeId, ExprInfo>,
 	variants: FxHashMap<NodeId, VariantResolution>,
@@ -268,4 +315,7 @@ pub struct Checked {
 	/// The interner that minted the types in `annotations`. A `Ty` is meaningless
 	/// without it, so it travels with the result for the lowering pass to consult.
 	pub interner: Interner,
+	/// Owned declaration-level facts. This is an immutable extraction boundary;
+	/// the stateful checker itself never escapes checking.
+	pub semantic: CheckedSemantic,
 }

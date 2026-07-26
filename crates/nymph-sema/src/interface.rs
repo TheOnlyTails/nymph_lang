@@ -69,6 +69,10 @@ impl CanonicalizationContext {
 			parameters,
 		}
 	}
+
+	pub(crate) fn definitions(&self) -> HashMap<DefId, DefinitionId> {
+		self.definitions.clone()
+	}
 }
 
 #[derive(Default)]
@@ -284,6 +288,17 @@ pub struct ConstraintShape<T> {
 pub type GenericConstraint = ConstraintShape<InterfaceType>;
 pub type RecoveredGenericConstraint = ConstraintShape<RecoveredInterfaceType>;
 
+/// An instantiated superinterface constraining an interface's implicit `Self`.
+/// Unlike a generic constraint, it has no declared generic parameter identity.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+pub struct SuperInterfaceShape<T> {
+	pub interface: DefinitionId,
+	pub positional: Vec<T>,
+	pub named: Vec<(EcoString, T)>,
+}
+pub type SuperInterface = SuperInterfaceShape<InterfaceType>;
+pub type RecoveredSuperInterface = SuperInterfaceShape<RecoveredInterfaceType>;
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct ParameterShape<T> {
 	pub name: Option<EcoString>,
@@ -361,7 +376,7 @@ pub struct ExportedDefinition {
 	pub fields: Vec<FieldShape<InterfaceType>>,
 	pub variants: Vec<VariantShape<InterfaceType>>,
 	pub members: Vec<MemberShape<InterfaceType>>,
-	pub super_interfaces: Vec<GenericConstraint>,
+	pub super_interfaces: Vec<SuperInterface>,
 	pub external: Option<ExternalAbi>,
 	pub runtime_owner: Option<DefinitionId>,
 }
@@ -453,7 +468,7 @@ pub struct RecoveredExportedDefinition {
 	pub fields: Vec<FieldShape<RecoveredInterfaceType>>,
 	pub variants: Vec<VariantShape<RecoveredInterfaceType>>,
 	pub members: Vec<MemberShape<RecoveredInterfaceType>>,
-	pub super_interfaces: Vec<RecoveredGenericConstraint>,
+	pub super_interfaces: Vec<RecoveredSuperInterface>,
 	pub external: Option<ExternalAbi>,
 	pub runtime_owner: Option<DefinitionId>,
 }

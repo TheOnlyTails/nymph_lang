@@ -506,6 +506,94 @@ pub(crate) fn compat_module_analysis<'db>(
 	})
 }
 
+fn compat_module_identity(db: &dyn Db, module: CompatModuleInput) -> nymph_sema::ModuleIdentity {
+	match module {
+		CompatModuleInput::Project(input) => nymph_sema::ModuleIdentity {
+			project: input.project(db).as_str().into(),
+			path: input.path(db).as_str().into(),
+		},
+		CompatModuleInput::Builtin(input) => nymph_sema::ModuleIdentity {
+			project: "compiler".into(),
+			path: input.key(db).0.as_ref().into(),
+		},
+	}
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn compat_declared_headers<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	module: CompatModuleInput,
+) -> Arc<nymph_sema::DeclaredHeaders> {
+	let analysis = compat_module_analysis(db, key, module);
+	Arc::new(nymph_sema::declared_headers(
+		compat_module_identity(db, module),
+		&analysis.module,
+	))
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn compat_module_environment<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	module: CompatModuleInput,
+) -> Arc<nymph_sema::ModuleEnvironment> {
+	let analysis = compat_module_analysis(db, key, module);
+	Arc::new(nymph_sema::recover_module_environment(
+		compat_module_identity(db, module),
+		&analysis.module,
+		&analysis.checked,
+		&compat_declared_headers(db, key, module),
+	))
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn compat_module_interface<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	module: CompatModuleInput,
+) -> Arc<nymph_sema::ModuleInterface> {
+	match &*compat_module_environment(db, key, module) {
+		nymph_sema::ModuleEnvironment::Complete(interface) => Arc::new(interface.clone()),
+		nymph_sema::ModuleEnvironment::Recovered(recovered) => Arc::new(nymph_sema::ModuleInterface {
+			module: recovered.module.clone(),
+			exports: Vec::new(),
+			support_definitions: Vec::new(),
+			implementations: Vec::new(),
+			fingerprint: 0,
+		}),
+	}
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn compat_module_diagnostics<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	module: CompatModuleInput,
+) -> Arc<[ProjectDiagnostic]> {
+	let analysis = compat_module_analysis(db, key, module);
+	let mut diagnostics = analysis.diagnostics.to_vec();
+	if diagnostics.is_empty() {
+		let headers = compat_declared_headers(db, key, module);
+		if let Err(error) = nymph_sema::extract_module_interface(
+			compat_module_identity(db, module),
+			&analysis.module,
+			&analysis.checked,
+			&headers,
+		) {
+			diagnostics.push(ProjectDiagnostic {
+				module: module.key(db),
+				diag: Diagnostic::error(
+					"INTERNAL-INTERFACE-CONVERSION".into(),
+					format!("internal interface conversion failed: {error:?}"),
+					Span::new(0, 0),
+				),
+			});
+		}
+	}
+	diagnostics.into()
+}
+
 #[salsa::tracked(returns(clone), no_eq)]
 pub(crate) fn compat_lowered_module<'db>(
 	db: &'db dyn Db,

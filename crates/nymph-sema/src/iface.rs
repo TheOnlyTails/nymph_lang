@@ -40,6 +40,7 @@ pub struct IfaceMethod {
 	/// Empty for the common no-generics method. Call sites read this to allocate a
 	/// fresh inference variable per method generic when instantiating the signature.
 	pub generics: Vec<EcoString>,
+	pub bounds: Vec<Bound>,
 	/// Whether this method is declared `mut func` (needs a `mut` receiver) rather
 	/// than plain `func`. On an [`InterfaceDef`]'s copy this is the SOURCE OF
 	/// TRUTH (MT2, OO1) that every call-site gate (`solve.rs`) consults; on an
@@ -130,7 +131,7 @@ pub fn head_of(interner: &Interner, ty: Ty) -> Option<Head> {
 
 /// The impl index: impls keyed by `(interface, head)`, plus a blanket bucket per
 /// interface.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ImplRegistry {
 	pub impls: Vec<ImplDef>,
 	keyed: FxHashMap<(DefId, Head), Vec<usize>>,
@@ -453,6 +454,12 @@ impl Checker<'_> {
 					);
 				}
 			}
+			let base = names.len();
+			let mut method_scope = FxHashMap::default();
+			for (index, generic) in meta.generics.iter().enumerate() {
+				method_scope.insert(generic.0.name.0.clone(), ParamIdx((base + index) as u32));
+			}
+			self.push_params(method_scope);
 			let params = meta
 				.params
 				.iter()
@@ -462,6 +469,8 @@ impl Checker<'_> {
 				Some(ty) => self.lower_type(ty),
 				None => self.interface_method_ret(interface, &meta.name.0, &isubst, self_ty),
 			};
+			let bounds = self.lower_constraints(&meta.generics, base);
+			self.pop_params();
 			let mutating = meta.kind == FuncKind::Mut;
 			// OO2 (MT2): a plain-target impl (`impl A for B`, not `for mut B`)
 			// restates each method's `mut func`/`func` kind and it must MATCH the
@@ -500,6 +509,7 @@ impl Checker<'_> {
 					params,
 					ret,
 					generics: generic_names(&meta.generics),
+					bounds,
 					mutating,
 				},
 			);
@@ -566,11 +576,13 @@ impl Checker<'_> {
 			Some(ty) => self.lower_type(ty),
 			None => self.interner.void(),
 		};
+		let bounds = self.lower_constraints(&meta.generics, base);
 		self.pop_params();
 		IfaceMethod {
 			params,
 			ret,
 			generics: generic_names(&meta.generics),
+			bounds,
 			mutating: meta.kind == FuncKind::Mut,
 		}
 	}
