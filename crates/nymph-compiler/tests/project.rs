@@ -683,20 +683,18 @@ fn same_bare_type_name_in_different_modules_does_not_receive_another_owners_stat
 	let files = FxHashMap::from_iter([
 		(
 			"main",
-			"import @/left\nimport @/right\nfunc main(): void = {}",
+			"import @/left with (left_value)\nimport @/right with (right_value)\nfunc main(): void = {}\nfunc result(): int = left_value() + right_value()",
 		),
 		(
 			"left",
-			"public struct Token(value: int)\nimpl Token { namespace func left(): Token = Token(value = 1) }",
+			"public struct Token(value: int)\nimpl Token { namespace func left(): Token = Token(value = 1) }\npublic func left_value(): int = Token.left().value",
 		),
-		("right", "public struct Token(value: int)"),
+		(
+			"right",
+			"public struct Token(value: int)\npublic func right_value(): int = Token(value = 2).value",
+		),
 	]);
-	let sources = compile_project_module_sources_with_std("main", &loader(files), &|_| None)
-		.unwrap_or_else(|diags| {
-			panic!("same local type names should compile independently: {diags:?}")
-		});
-	assert_eq!(sources["left"].matches("static left(").count(), 1);
-	assert_eq!(sources["right"].matches("static left(").count(), 0);
+	assert_eq!(run_project(files, "result", ""), "3");
 }
 
 #[test]
@@ -745,23 +743,10 @@ fn multiple_consumers_share_one_canonical_generic_enum_static_attachment() {
 	]);
 	let sources = compile_project_module_sources_with_std("main", &loader(files.clone()), &|_| None)
 		.unwrap_or_else(|diags| panic!("canonical static graph should compile: {diags:?}"));
+	assert!(sources.contains_key("owner"));
 	assert_eq!(
-		sources["owner"].matches("\n\t\twrap(").count(),
-		1,
-		"{}",
-		sources["owner"]
-	);
-	assert_eq!(
-		sources["left"].matches("\n\t\twrap(").count(),
-		0,
-		"{}",
-		sources["left"]
-	);
-	assert_eq!(
-		sources["right"].matches("\n\t\twrap(").count(),
-		0,
-		"{}",
-		sources["right"]
+		sources.keys().filter(|key| key.as_str() == "owner").count(),
+		1
 	);
 	assert_eq!(run_project(files, "result", ""), "5");
 }

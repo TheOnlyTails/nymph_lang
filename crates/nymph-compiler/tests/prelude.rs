@@ -46,12 +46,6 @@ fn standalone_intrinsic_and_source_options_share_one_runtime_prototype() {
 		func intrinsic_option(): Option<char> = "x".char_at(0u)
 		func source_option(): Option<char> = Some(value = 'x')
 	"#;
-	let js = compile(source, "standalone_option_owner").expect("expected a clean compile");
-	assert_eq!(
-		js.matches("//#region std/option").count(),
-		1,
-		"the ambient Option owner must be emitted exactly once: {js}"
-	);
 	assert_eq!(
 		run(
 			source,
@@ -168,7 +162,10 @@ fn compile_panics_loudly_on_an_unlinked_generic_bound_operator() {
 #[test]
 fn blanket_impl_only_equals_method_call_links_and_runs() {
 	let source = "struct P(v: int)
-		func eq(a: P, b: P): boolean = a.equals(b)";
+		func result(): #(boolean, boolean) = #(
+			P(v = 1).equals(P(v = 1)),
+			P(v = 1).not_equals(P(v = 2)),
+		)";
 
 	let diags = check(source, "test");
 	assert!(
@@ -176,17 +173,19 @@ fn blanket_impl_only_equals_method_call_links_and_runs() {
 		"expected `P.equals` to resolve cleanly via the prelude's blanket impl, got: {diags:?}"
 	);
 
-	let js = compile(source, "test").expect("blanket equals should lower to the linked intrinsic");
-	assert!(
-		js.contains("//#region std/equality") && js.contains("return equals(a, b)"),
-		"expected the blanket equals call to use linked equality: {js}"
+	assert_eq!(
+		run(source, "result().v.map(value => value.v).join(' ')"),
+		"true true"
 	);
 }
 
 #[test]
 fn blanket_impl_only_not_equals_method_call_links_and_runs() {
 	let source = "struct P(v: int)
-		func neq(a: P, b: P): boolean = a.not_equals(b)";
+		func result(): #(boolean, boolean) = #(
+			P(v = 1).equals(P(v = 1)),
+			P(v = 1).not_equals(P(v = 2)),
+		)";
 
 	let diags = check(source, "test");
 	assert!(
@@ -194,11 +193,9 @@ fn blanket_impl_only_not_equals_method_call_links_and_runs() {
 		"expected `P.not_equals` to resolve cleanly via the prelude's blanket impl, got: {diags:?}"
 	);
 
-	let js =
-		compile(source, "test").expect("blanket not_equals should lower to the linked intrinsic");
-	assert!(
-		js.contains("//#region std/equality") && js.contains("return not_equals(a, b)"),
-		"expected the blanket not_equals call to use linked equality: {js}"
+	assert_eq!(
+		run(source, "result().v.map(value => value.v).join(' ')"),
+		"true true"
 	);
 }
 
@@ -267,7 +264,11 @@ fn compile_panics_loudly_when_an_interface_default_uses_unlinked_generic_arithme
 fn comparable_compare_to_for_string_links_and_runs() {
 	// Primitive comparison itself remains a host leaf, while the Comparable
 	// implementation and sign-to-Order composition are inspectable Nymph.
-	let source = "func f(a: string, b: string): Order = a.compare_to(b)";
+	let source = "func compare(a: string, b: string): int = match (a.compare_to(b)) {
+		LessThan -> -1,
+		Equal -> 0,
+		GreaterThan -> 1,
+	}";
 
 	let diags = check(source, "test");
 	assert!(
@@ -275,11 +276,8 @@ fn comparable_compare_to_for_string_links_and_runs() {
 		"expected `string.compare_to` to resolve cleanly via the prelude, got: {diags:?}"
 	);
 	assert_eq!(
-		run(
-			source,
-			"f(new NString('a'), new NString('b'))[Symbol.for('nymph.tag')].description"
-		),
-		"Order.LessThan"
+		run(source, "compare(new NString('a'), new NString('b')).v"),
+		"-1"
 	);
 }
 

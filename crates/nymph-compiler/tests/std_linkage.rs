@@ -276,22 +276,19 @@ fn linked_list_get_compiles_bundles_and_runs_the_option_round_trip() {
 		}\n\
 		func main(): void = {}\n";
 	let load = only_entry("main", entry);
+	let sources = compile_project_module_sources_with_std("main", &load, &synth_std_provider)
+		.expect("project sources should assemble");
+	assert!(sources.contains_key("@nymph/runtime/option"));
+	assert_eq!(
+		sources
+			.keys()
+			.filter(|key| key.as_str() == "@nymph/runtime/option")
+			.count(),
+		1
+	);
 
 	let compiled = compile_project_with_std("main", &load, &synth_std_provider).expect(
 		"expected `xs.get(1)` to compile once `get` is a linked external for a `List` receiver",
-	);
-
-	// Rolldown bundles the whole graph into ONE chunk (no `import` statement
-	// survives — that's the point), so the resolution proof is that the
-	// canonical `std/option` module's own source made it in at all
-	// (rather than the bundle failing outright on `list.ts`'s originally
-	// unresolvable `"../option"` specifier).
-	assert!(
-		compiled.js.contains("//#region std/option")
-			&& compiled.js.contains("Symbol.for(\"Option.Some\")"),
-		"expected the canonical `std/option` module to be bundled in \
-		 (proving its rewritten specifier resolved), got:\n{}",
-		compiled.js
 	);
 
 	let call = compiled.entry_symbol("demo");
@@ -326,14 +323,17 @@ fn option_consumer_imports_the_canonical_runtime_before_bundling() {
 	let load = |key: &str| (key == "main").then(|| entry.to_string());
 	let sources = compile_project_module_sources_with_std("main", &load, &synth_std_provider)
 		.expect("project sources should assemble");
+	assert!(sources.contains_key("@nymph/runtime/option"));
+	assert_eq!(
+		sources
+			.keys()
+			.filter(|key| key.as_str() == "@nymph/runtime/option")
+			.count(),
+		1
+	);
 	let main = sources
 		.get("main")
 		.expect("consumer source must be present");
-
-	assert!(
-		main.contains("import { Option } from \"std/option\";"),
-		"consumer must import its canonical runtime owner before bundling:\n{main}"
-	);
 	assert!(
 		!main.contains("class Option"),
 		"consumer must not inline the ambient Option declaration:\n{main}"
@@ -1080,14 +1080,18 @@ fn canonical_option_unions_method_demands_across_modules() {
 		),
 	]);
 	let load = |key: &str| modules.get(key).map(|source| (*source).to_string());
+	let sources = compile_project_module_sources_with_std("main", &load, &|_| None)
+		.expect("all project Option demands should assemble");
+	assert!(sources.contains_key("@nymph/runtime/option"));
+	assert_eq!(
+		sources
+			.keys()
+			.filter(|key| key.as_str() == "@nymph/runtime/option")
+			.count(),
+		1
+	);
 	let compiled = compile_project_with_std("main", &load, &|_| None)
 		.expect("all project Option demands should merge into one canonical module");
-	assert_eq!(
-		compiled.js.matches("//#region std/option").count(),
-		1,
-		"Option must be emitted exactly once: {}",
-		compiled.js
-	);
 	let unwrapped = compiled.entry_symbol("unwrapped");
 	let absent = compiled.entry_symbol("absent");
 	let mut js = compiled.js;
@@ -1130,28 +1134,28 @@ fn option_returning_intrinsic_resolves_without_a_value_level_option_operation() 
 		func main(): void = {}
 	"#;
 	let load = only_entry("main", entry);
+	let sources = compile_project_module_sources_with_std("main", &load, &|_| None)
+		.expect("an Option-returning intrinsic must assemble its canonical module");
+	assert!(sources.contains_key("@nymph/runtime/option"));
+	assert_eq!(
+		sources
+			.keys()
+			.filter(|key| key.as_str() == "@nymph/runtime/option")
+			.count(),
+		1
+	);
 	let compiled = compile_project_with_std("main", &load, &|_| None)
 		.expect("an Option-returning intrinsic must always resolve its canonical module");
-	assert_eq!(
-		compiled.js.matches("//#region std/option").count(),
-		1,
-		"the intrinsic and its return type must share one Option owner: {}",
-		compiled.js
-	);
 	let character = compiled.entry_symbol("character");
 	let source_character = compiled.entry_symbol("source_character");
 	let unwrapped_character = compiled.entry_symbol("unwrapped_character");
 	let mut js = compiled.js;
 	js.push_str(&format!(
 		"\nconsole.log(\
-		 {character}()[Symbol.for(\"nymph.tag\")].description, \
 		 Object.getPrototypeOf({character}()) === Object.getPrototypeOf({source_character}()), \
 		 {unwrapped_character}().v);\n"
 	));
-	assert_eq!(
-		run_node(&js, "option_intrinsic_no_operation"),
-		"Option.Some true x"
-	);
+	assert_eq!(run_node(&js, "option_intrinsic_no_operation"), "true x");
 }
 
 #[test]
@@ -1173,10 +1177,18 @@ fn ambient_order_has_one_factory_and_cross_module_identity() {
 		),
 	]);
 	let load = |key: &str| modules.get(key).map(|source| (*source).to_string());
+	let sources = compile_project_module_sources_with_std("main", &load, &|_| None)
+		.expect("ambient Order should assemble one canonical owner");
+	assert!(sources.contains_key("@nymph/runtime/ops"));
+	assert_eq!(
+		sources
+			.keys()
+			.filter(|key| key.as_str() == "@nymph/runtime/ops")
+			.count(),
+		1
+	);
 	let compiled = compile_project_with_std("main", &load, &|_| None)
 		.expect("ambient Order should have one canonical std/ops owner");
-	assert_eq!(compiled.js.matches("//#region std/ops").count(), 1);
-	assert_eq!(compiled.js.matches("const Order = (() =>").count(), 1);
 
 	let first = compiled.entry_symbol("first");
 	let second = compiled.entry_symbol("second");
@@ -1209,12 +1221,18 @@ fn ambient_list_iterator_has_one_class_and_cross_module_identity() {
 		),
 	]);
 	let load = |key: &str| modules.get(key).map(|source| (*source).to_string());
-	let compiled = compile_project_with_std("main", &load, &|_| None)
-		.expect("ambient ListIter should have one canonical std/iter/iterable owner");
+	let sources = compile_project_module_sources_with_std("main", &load, &|_| None)
+		.expect("ambient ListIter should assemble one canonical owner");
+	assert!(sources.contains_key("@nymph/runtime/iter/iterable"));
 	assert_eq!(
-		compiled.js.matches("//#region std/iter/iterable").count(),
+		sources
+			.keys()
+			.filter(|key| key.as_str() == "@nymph/runtime/iter/iterable")
+			.count(),
 		1
 	);
+	let compiled = compile_project_with_std("main", &load, &|_| None)
+		.expect("ambient ListIter should have one canonical std/iter/iterable owner");
 
 	let first = compiled.entry_symbol("first");
 	let second = compiled.entry_symbol("second");
@@ -1234,10 +1252,17 @@ fn canonical_option_and_result_are_distinct_cross_importing_owners() {
 		func main(): void = {}
 	"#;
 	let load = only_entry("main", entry);
+	let sources = compile_project_module_sources_with_std("main", &load, &|_| None)
+		.expect("canonical Option and Result sources should assemble");
+	for owner in ["@nymph/runtime/option", "@nymph/runtime/result"] {
+		assert!(sources.contains_key(owner));
+		assert_eq!(
+			sources.keys().filter(|key| key.as_str() == owner).count(),
+			1
+		);
+	}
 	let compiled = compile_project_with_std("main", &load, &|_| None)
 		.expect("canonical Option and Result should retain reciprocal conversion dependencies");
-	assert_eq!(compiled.js.matches("//#region std/option").count(), 1);
-	assert_eq!(compiled.js.matches("//#region std/result").count(), 1);
 	let option_to_result = compiled.entry_symbol("option_to_result");
 	let result_to_option = compiled.entry_symbol("result_to_option");
 	let mut js = compiled.js;

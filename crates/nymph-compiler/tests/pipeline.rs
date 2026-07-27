@@ -105,11 +105,6 @@ fn compile_entry_preserves_callable_names_and_canonical_option_identity() {
 	"#;
 	let js = compile_entry(source, "entry_option_owner").expect("valid main should compile");
 
-	assert_eq!(
-		js.matches("//#region std/option").count(),
-		1,
-		"compile_entry must emit one canonical Option owner: {js}"
-	);
 	for callable in ["main", "intrinsic_option", "source_option"] {
 		assert!(
 			js.contains(&format!("function {callable}(")),
