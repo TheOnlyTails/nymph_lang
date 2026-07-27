@@ -966,6 +966,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			}
 			ExprKind::Identifier(name) => {
 				if let Some(variant) = self.variant(expr) {
+					self.demand_external(&variant.enum_definition)?;
 					return Ok(HirExpr::VariantRef {
 						enum_name: self
 							.context
@@ -1083,6 +1084,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				optional: _,
 			} => {
 				if let Some(variant) = self.variant(expr) {
+					self.demand_external(&variant.enum_definition)?;
 					return Ok(HirExpr::VariantRef {
 						enum_name: self
 							.context
@@ -1112,6 +1114,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			} => {
 				let _ = generics;
 				if let Some(variant) = self.variant(expr) {
+					self.demand_external(&variant.enum_definition)?;
 					let fields = args
 						.iter()
 						.enumerate()
@@ -1311,7 +1314,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			ExprKind::Continue { .. } => {
 				return Err(self.unsupported(expr, "continue (HIR has no jump node)"));
 			}
-			ExprKind::IndexAccess { parent, index, .. } => match self.ty(parent)? {
+			ExprKind::IndexAccess { parent, index, .. } => match peel_mut(self.ty(parent)?) {
 				InterfaceType::Map(..) => HirExpr::MapGet {
 					recv: Box::new(self.lower(parent)?),
 					key: Box::new(self.lower(index)?),
@@ -1904,6 +1907,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		variant: &crate::PatternVariant,
 		fields: Vec<(EcoString, HirPat)>,
 	) -> Result<HirPat, StableLoweringError> {
+		self.demand_external(&variant.enum_definition)?;
 		Ok(HirPat::Variant {
 			enum_name: self
 				.context
@@ -1917,6 +1921,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				.into(),
 			fields,
 		})
+	}
+
+	fn demand_external(&self, definition: &DefinitionId) -> Result<(), StableLoweringError> {
+		if definition.module != self.artifact.definition.module {
+			self.context.module_specifier(&definition.module)?;
+			self.demands.borrow_mut().insert(definition.clone());
+		}
+		Ok(())
 	}
 	fn lower_for(
 		&self,

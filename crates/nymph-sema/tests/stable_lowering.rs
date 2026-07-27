@@ -830,13 +830,14 @@ fn lowers_struct_and_enum_construction_and_variant_patterns_from_stable_facts() 
 
 #[test]
 fn lowers_native_index_access_and_assignment_without_protocol_fallback() {
-	let list = lower_fixture("func update(xs: #[int]): int = { xs[0] = 2\nxs[0] }");
+	let list = lower_fixture("func update(xs: mut #[int]): int = { xs[0] = 2\nxs[0] }");
 	assert!(matches!(
 		list.fragment(),
 		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
 			if matches!(function.body, nymph_hir::hir::HirExpr::Block { tail: Some(ref tail), .. }
 				if matches!(**tail, nymph_hir::hir::HirExpr::Index { .. }))
 	));
+	assert_eq!(list.demands(), []);
 	let map = lower_fixture("func lookup(xs: #{string: int}): int = xs[\"one\"]");
 	assert!(matches!(
 		map.fragment(),

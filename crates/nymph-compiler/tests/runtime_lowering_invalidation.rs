@@ -94,11 +94,31 @@ fn native_list_and_bounded_ranges_lower_with_real_ambient_protocol_facts() {
 	session.set_source(
 		project.clone(),
 		main.clone(),
-		r#"func list_sum(): int = { let mut total = 0 for (x in #[1, 2, 3]) { total = total + x } total }
+		r#"func list_sum(xs: mut #[int]): int = { xs[0] = xs[0] + 1 let mut total = 0 for (x in xs) { total = total + x } total }
 func exclusive(): int = { let mut total = 0 for (x in 1..4) { total = total + x } total }
 func inclusive(): int = { let mut total = 0 for (x in 1..=4) { total = total + x } total }"#.into(),
 		SourceVersion(1),
 	);
+	let list = session
+		.lower_runtime_definition(
+			project.clone(),
+			main.clone(),
+			id("ambient-iteration", "list_sum"),
+			EntryMode::Library,
+		)
+		.expect("native List update and iteration lower through exact ambient facts");
+	assert!(matches!(
+		list.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
+			if matches!(&function.body, nymph_hir::hir::HirExpr::Block { stmts, .. }
+				if matches!(&stmts[0], nymph_hir::hir::HirStmt::Expr(nymph_hir::hir::HirExpr::Assign { target, .. })
+					if matches!(target.as_ref(), nymph_hir::hir::HirExpr::Index { .. }))
+				&& matches!(&stmts[2], nymph_hir::hir::HirStmt::Expr(nymph_hir::hir::HirExpr::Block { stmts, .. })
+					if matches!(&stmts[0], nymph_hir::hir::HirStmt::Let { value: nymph_hir::hir::HirExpr::Call { callee, .. }, .. }
+						if matches!(callee.as_ref(), nymph_hir::hir::HirExpr::Field { name, .. } if name == "iter"))
+					&& matches!(&stmts[2], nymph_hir::hir::HirStmt::Expr(nymph_hir::hir::HirExpr::While { .. }))))
+	));
+	assert_eq!(list.demands(), []);
 	for name in ["list_sum", "exclusive", "inclusive"] {
 		session
 			.lower_runtime_definition(
