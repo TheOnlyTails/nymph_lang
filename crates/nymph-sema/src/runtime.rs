@@ -911,6 +911,22 @@ fn stable_dispatch(
 				});
 			}
 			if kind == DispatchKind::UserImplDefaultMethod
+				&& let Some(member) = resolution.target.clone()
+				&& let crate::DeclarationKey::MaterializedInterfaceMember {
+					implementation,
+					interface_member: _,
+				} = &member.key
+				&& let crate::DeclarationKey::Implementation { header, .. } = &implementation.key
+				&& let Some(interface) = header.interface.clone()
+			{
+				return Ok(StableDispatch::InterfaceDefault {
+					interface,
+					member: member.clone(),
+					implementation: (**implementation).clone(),
+					materialization: DispatchMaterialization::CanonicalBody,
+				});
+			}
+			if kind == DispatchKind::UserImplDefaultMethod
 				&& let Some(span) = resolution.impl_span
 				&& let Some(implementation) = checked
 					.semantic
@@ -943,14 +959,6 @@ fn stable_dispatch(
 					));
 				}
 			};
-			if kind == DispatchKind::UserImplDefaultMethod {
-				return Ok(StableDispatch::InterfaceDefault {
-					interface: interface.clone(),
-					member,
-					implementation: interface,
-					materialization: DispatchMaterialization::CanonicalBody,
-				});
-			}
 			if matches!(
 				interface.key,
 				crate::DeclarationKey::TopLevel {

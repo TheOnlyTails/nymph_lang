@@ -35,7 +35,10 @@ fn body_projection_is_structural_and_records_exact_dispatch_variant_pattern_mars
  {
 	let body = r#"
 external(max_float) let host: float
-interface Value { func value(): int = 7 }
+interface Value {
+	func value(): int = 7
+	func plus(other: self): self = other
+}
 struct Box(value: int) { func own(): int = this.value }
 impl Value for Box { }
 enum Choice { Some(value: int), None }
@@ -45,8 +48,9 @@ func generic<T: Value>(item: T): T = { let x = 1 + 2
 	let direct = Box(value = read).own()
 	let defaulted = Box(value = direct).value()
 	let bounded = item.value()
+	let sum = item + item
 	let host_value = host
-	item
+	sum
 }
 "#;
 	let first = project(body);
@@ -106,6 +110,18 @@ func generic<T: Value>(item: T): T = { let x = 1 + 2
 				StableDispatch::InterfaceDefault { member, .. }
 					if matches!(member.key, nymph_sema::DeclarationKey::MaterializedInterfaceMember { .. })
 			))
+	);
+	assert!(
+		body.annotations.dispatches.iter().all(|(_, dispatch)| {
+			let StableDispatch::InterfaceDefault { implementation, .. } = dispatch else {
+				return true;
+			};
+			matches!(
+				implementation.key,
+				nymph_sema::DeclarationKey::Implementation { .. }
+			)
+		}),
+		"a stable default dispatch must retain the exact selected implementation ID"
 	);
 	assert!(
 		body

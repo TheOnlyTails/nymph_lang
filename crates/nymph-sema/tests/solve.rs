@@ -430,6 +430,21 @@ fn argument_directed_overloads_do_not_conflict() {
 }
 
 #[test]
+fn partial_implementation_cannot_supply_an_unimplemented_required_member() {
+	assert_error_contains(
+		"interface Comparable<Other> {
+		   func compare_to(other: Other): int
+		   func minmax(other: Other): int = 0
+		 }
+		 impl<T> Comparable<Other = T> for T {
+		   func minmax(other: T): int = 1
+		 }
+		 func compare(value: int): int = value.compare_to(value)",
+		"no method `compare_to` found",
+	);
+}
+
+#[test]
 fn method_resolves_through_generic_bound() {
 	// `t.show()` has no `Show` impl to assemble against, but `T`'s declared bound provides
 	// the method signature.

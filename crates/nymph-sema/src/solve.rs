@@ -672,6 +672,7 @@ impl Checker<'_> {
 		}
 		candidates.sort_unstable();
 		candidates.dedup();
+		candidates.retain(|&idx| self.implementation_supplies_method(idx, name));
 
 		// Phase 1: impls whose receiver (and constraints) match.
 		let mut receiver_matches: Vec<usize> = Vec::new();
@@ -787,6 +788,16 @@ impl Checker<'_> {
 		} else {
 			concrete
 		}
+	}
+
+	fn implementation_supplies_method(&self, idx: usize, name: &str) -> bool {
+		let implementation = &self.impls.impls[idx];
+		implementation.methods.contains_key(name)
+			|| self
+				.interfaces
+				.get(&implementation.interface)
+				.and_then(|interface| interface.methods.get(name))
+				.is_some_and(|method| method.has_default)
 	}
 
 	/// Trial-unify a receiver against an impl's (subst'ed) self type, honoring a
@@ -974,6 +985,9 @@ impl Checker<'_> {
 		// Interface default method: map interface Param(k) → this impl's arg bindings.
 		let interface = self.interfaces.get(&def.interface).cloned()?;
 		let method = interface.methods.get(name).cloned()?;
+		if !method.has_default {
+			return None;
+		}
 		let mut isubst: FxHashMap<ParamIdx, Ty> = FxHashMap::default();
 		for (k, param_name) in interface.generics.iter().enumerate() {
 			let value = def
