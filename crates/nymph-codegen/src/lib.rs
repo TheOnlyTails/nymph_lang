@@ -11,7 +11,8 @@ use nymph_hir::hir::HirModule;
 use oxc::allocator::Allocator;
 
 pub use box_rt::{
-	BOX_MODULE_DECLARATIONS, BOX_MODULE_KEY, box_module_declarations, box_module_source, box_preamble,
+	BOX_MODULE_DECLARATIONS, BOX_MODULE_KEY, box_module_declarations, box_module_source,
+	box_module_source_with_option_enum, box_preamble,
 };
 pub use strip::strip_ts_to_js;
 

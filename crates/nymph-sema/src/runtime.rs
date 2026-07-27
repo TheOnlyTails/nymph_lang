@@ -145,6 +145,7 @@ pub struct RuntimeAnnotations {
 	pub positional_fields: Arc<[(PatternNodeId, StableVariantField)]>,
 	pub iterations: Arc<[(BodyNodeId, RuntimeIteration)]>,
 	pub anonymous_closures: Arc<[(BodyNodeId, u8)]>,
+	pub generic_namespaced_calls: Arc<[BodyNodeId]>,
 	pub external_marshals: Arc<[(BodyNodeId, nymph_hir::hir::MarshalKind)]>,
 }
 
@@ -786,6 +787,7 @@ fn runtime_annotations(
 		.collect::<Result<Vec<_>, RuntimeExtractionError>>()?;
 	let mut iterations = Vec::new();
 	let mut anonymous_closures = Vec::new();
+	let mut generic_namespaced_calls = Vec::new();
 	for (&source, &id) in local {
 		if let Some(mode) = checked.annotations.iter_mode_of(source).or_else(|| {
 			native_range_nodes
@@ -818,6 +820,9 @@ fn runtime_annotations(
 		if let Some(arity) = checked.annotations.anon_boundary_arity(source) {
 			anonymous_closures.push((id, arity));
 		}
+		if checked.annotations.is_generic_namespaced_call(source) {
+			generic_namespaced_calls.push(id);
+		}
 	}
 	types.sort_by_key(|item| item.0);
 	definition_targets.sort_by_key(|item| item.0);
@@ -827,6 +832,7 @@ fn runtime_annotations(
 	positional_fields.sort_by_key(|item| item.0);
 	iterations.sort_by_key(|item| item.0);
 	anonymous_closures.sort_by_key(|item| item.0);
+	generic_namespaced_calls.sort_unstable();
 	let mut external_marshals = Vec::new();
 	for (id, target) in &definition_targets {
 		if let Some(marshal) = external_marshal(checked, target) {
@@ -842,6 +848,7 @@ fn runtime_annotations(
 		positional_fields: positional_fields.into(),
 		iterations: iterations.into(),
 		anonymous_closures: anonymous_closures.into(),
+		generic_namespaced_calls: generic_namespaced_calls.into(),
 		external_marshals: external_marshals.into(),
 	})
 }

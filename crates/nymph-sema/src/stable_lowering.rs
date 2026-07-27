@@ -1210,8 +1210,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							}
 						}
 						self.demands.borrow_mut().insert(target.clone());
-					} else if target.module != self.artifact.definition.module {
-						self.context.module_specifier(&target.module)?;
+					} else if target != &self.artifact.definition {
+						if target.module != self.artifact.definition.module {
+							self.context.module_specifier(&target.module)?;
+						}
 						self.demands.borrow_mut().insert(target.clone());
 					}
 					HirExpr::Local(emitted.as_str().into())
@@ -1408,9 +1410,17 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						args.iter().map(|arg| &arg.0.value).collect(),
 					);
 				}
+				if self
+					.annotations
+					.generic_namespaced_calls
+					.contains(&self.id(expr))
+				{
+					return Err(self.unsupported(expr, "namespaced call through a generic type parameter"));
+				}
 				if let Some(target) = self.target(func) {
 					let target_artifact = self.context.runtime_definition(target)?;
 					if let crate::RuntimePayload::External(abi) = &target_artifact.payload {
+						self.demands.borrow_mut().insert(target.clone());
 						let module = external_module(target, abi)?;
 						let symbol = external_symbol(target, abi)?;
 						return Ok(HirExpr::ExternCall {

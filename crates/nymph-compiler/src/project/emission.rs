@@ -14,6 +14,7 @@ use super::{CompiledProject, ProjectDiagnostic, bundle, queries};
 pub struct StableEmittedProject {
 	pub module_sources: FxHashMap<String, String>,
 	pub entry_tag: usize,
+	compiler_option_binding: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -35,6 +36,58 @@ fn module_specifier(module: &nymph_sema::ModuleIdentity) -> String {
 		format!("@nymph/runtime/{}", module.path)
 	} else {
 		module.path.to_string()
+	}
+}
+
+fn compiler_option_definition<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+) -> Result<nymph_sema::DefinitionId, String> {
+	let dependency = crate::intrinsics::OPTION_RUNTIME_DEPENDENCY;
+	let module = key
+		.ambient_core_registry(db)
+		.modules(db)
+		.iter()
+		.copied()
+		.find(|module| module.key(db).path.as_ref() == dependency.ambient_module)
+		.ok_or_else(|| "compiler Option module is unavailable".to_string())?;
+	queries::runtime_definition_ids(db, key, SemanticModuleInput::Builtin(module))
+		.map_err(|error| format!("compiler Option definitions are unavailable: {error:?}"))?
+		.iter()
+		.find(|definition| {
+			matches!(
+				&definition.key,
+				nymph_sema::DeclarationKey::TopLevel {
+					category: nymph_sema::DeclarationCategory::Enum,
+					name,
+					..
+				} if name == dependency.enum_name
+			)
+		})
+		.cloned()
+		.ok_or_else(|| "compiler Option definition is unavailable".to_string())
+}
+
+fn prepend_external_aliases<'a>(
+	source: &mut String,
+	externals: impl Iterator<Item = (&'a nymph_sema::ExternalAbi, &'a str)>,
+) {
+	let mut imports = externals
+		.filter_map(|(abi, name)| {
+			Some((
+				abi.module.as_ref()?.to_string(),
+				abi.symbol.as_ref()?.to_string(),
+				name.to_string(),
+			))
+		})
+		.collect::<Vec<_>>();
+	imports.sort_unstable();
+	imports.dedup();
+	for (module, symbol, name) in imports.into_iter().rev() {
+		source.insert_str(
+			0,
+			&format!("import {{ {symbol} as {name} }} from \"{module}\";\n"),
+		);
 	}
 }
 
@@ -100,6 +153,20 @@ pub(crate) fn emitted_interface_module<'db>(
 		&stable.hir,
 		&stable.module.path,
 	));
+	prepend_external_aliases(
+		&mut source,
+		stable.fragments.iter().filter_map(|fragment| {
+			if fragment.definition().module != stable.module {
+				return None;
+			}
+			match fragment.fragment() {
+				nymph_sema::LoweredHirFragment::TopLevelExternal { name, abi } => {
+					Some((abi, name.as_str()))
+				}
+				_ => None,
+			}
+		}),
+	);
 
 	let environment = queries::interface_module_environment(db, key, module);
 	let public: FxHashSet<_> = match environment.as_ref() {
@@ -121,13 +188,20 @@ pub(crate) fn emitted_interface_module<'db>(
 	let mut exports = Vec::new();
 	for fragment in &stable.fragments {
 		let definition = fragment.definition();
-		if definition.module != stable.module || (!preserve && !public.contains(definition)) {
+		let external_abi = matches!(
+			fragment.fragment(),
+			nymph_sema::LoweredHirFragment::TopLevelExternal { .. }
+		);
+		if definition.module != stable.module
+			|| (!external_abi && !preserve && !public.contains(definition))
+		{
 			continue;
 		}
 		if matches!(
 			fragment.fragment(),
 			nymph_sema::LoweredHirFragment::TopLevelFunction(_)
 				| nymph_sema::LoweredHirFragment::TopLevelValue(_)
+				| nymph_sema::LoweredHirFragment::TopLevelExternal { .. }
 				| nymph_sema::LoweredHirFragment::StructShell(_)
 				| nymph_sema::LoweredHirFragment::EnumShell(_)
 		) {
@@ -158,6 +232,26 @@ pub(crate) fn emitted_interface_project<'db>(
 		return StableEmissionResult::Diagnostics(diagnostics.0);
 	}
 	let graph = queries::project_graph(db, key);
+	let compiler_option = match compiler_option_definition(db, key) {
+		Ok(definition) => definition,
+		Err(message) => {
+			return StableEmissionResult::Diagnostics(internal_diagnostic(
+				key.entry(db).as_str(),
+				"STABLE-INTRINSIC-DEPENDENCY",
+				message,
+			));
+		}
+	};
+	let compiler_option_binding = match queries::binding_name(db, key, compiler_option.clone()) {
+		Ok(name) => name.as_str().to_string(),
+		Err(error) => {
+			return StableEmissionResult::Diagnostics(internal_diagnostic(
+				key.entry(db).as_str(),
+				"STABLE-INTRINSIC-DEPENDENCY",
+				format!("cannot name compiler Option definition: {error:?}"),
+			));
+		}
+	};
 	let mut sources = FxHashMap::default();
 	let mut virtual_fragments = std::collections::BTreeMap::new();
 	let mut option_requested = false;
@@ -259,21 +353,17 @@ pub(crate) fn emitted_interface_project<'db>(
 				"selected intrinsic requires the compiler Option definition".to_string(),
 			));
 		};
-		let name = match queries::binding_name(db, key, option) {
-			Ok(name) => name,
-			Err(error) => {
-				return StableEmissionResult::Diagnostics(internal_diagnostic(
-					key.entry(db).as_str(),
-					"STABLE-INTRINSIC-DEPENDENCY",
-					format!("cannot name compiler Option definition: {error:?}"),
-				));
-			}
-		};
+		if option != compiler_option {
+			return StableEmissionResult::Diagnostics(internal_diagnostic(
+				key.entry(db).as_str(),
+				"STABLE-INTRINSIC-DEPENDENCY",
+				"assembled Option definition does not match the compiler Option".to_string(),
+			));
+		}
 		let dependency = crate::intrinsics::OPTION_RUNTIME_DEPENDENCY;
 		let shim = format!(
 			"export {{ {} as Option }} from \"@nymph/runtime/{}\";\n",
-			name.as_str(),
-			dependency.ambient_module
+			compiler_option_binding, dependency.ambient_module
 		);
 		if sources
 			.insert(dependency.import_specifier.to_string(), shim)
@@ -300,6 +390,7 @@ pub(crate) fn emitted_interface_project<'db>(
 	StableEmissionResult::Value(Arc::new(StableEmittedProject {
 		module_sources: sources,
 		entry_tag,
+		compiler_option_binding,
 	}))
 }
 
@@ -396,24 +487,17 @@ fn emit_virtual_runtime_module(
 	for (module, name) in runtime_imports.into_iter().rev() {
 		source.insert_str(0, &format!("import {{ {name} }} from \"{module}\";\n"));
 	}
-	let mut external_imports = fragments
-		.iter()
-		.filter_map(|fragment| match fragment.fragment.fragment() {
-			nymph_sema::LoweredHirFragment::TopLevelExternal { name, abi } => Some((
-				abi.module.as_ref()?.to_string(),
-				abi.symbol.as_ref()?.to_string(),
-				name.as_str().to_string(),
-			)),
-			_ => None,
-		})
-		.collect::<Vec<_>>();
-	external_imports.sort_unstable();
-	for (module, symbol, name) in external_imports.into_iter().rev() {
-		source.insert_str(
-			0,
-			&format!("import {{ {symbol} as {name} }} from \"{module}\";\n"),
-		);
-	}
+	prepend_external_aliases(
+		&mut source,
+		fragments
+			.iter()
+			.filter_map(|fragment| match fragment.fragment.fragment() {
+				nymph_sema::LoweredHirFragment::TopLevelExternal { name, abi } => {
+					Some((abi, name.as_str()))
+				}
+				_ => None,
+			}),
+	);
 	let mut exports = fragments
 		.iter()
 		.filter_map(|fragment| match fragment.fragment.fragment() {
@@ -449,7 +533,9 @@ pub(crate) fn compiled_interface_project<'db>(
 		}
 	};
 	let mut module_sources = emitted.module_sources.clone();
-	for (module, source) in crate::intrinsics::intrinsic_module_sources() {
+	for (module, source) in
+		crate::intrinsics::intrinsic_module_sources_with_option_enum(&emitted.compiler_option_binding)
+	{
 		if module_sources.insert(module.clone(), source).is_some() {
 			return StableEmissionResult::Diagnostics(internal_diagnostic(
 				&module,

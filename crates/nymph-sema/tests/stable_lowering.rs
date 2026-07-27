@@ -520,6 +520,47 @@ fn top_level_external_value_lowers_to_exact_marshaled_binding() {
 }
 
 #[test]
+fn same_module_identifier_records_its_exact_definition_demand() {
+	let (artifacts, _, context) =
+		materialized_fixture("let answer: int = 42\nfunc read(): int = answer");
+	let answer = artifacts
+		.iter()
+		.find(|artifact| source_name(&artifact.definition) == "answer")
+		.unwrap()
+		.definition
+		.clone();
+	let read = artifacts
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "read")
+		.unwrap();
+
+	let lowered = lower_runtime_definition(&context, Arc::new(read)).unwrap();
+
+	assert_eq!(lowered.demands(), [answer]);
+}
+
+#[test]
+fn direct_external_call_records_its_exact_definition_demand() {
+	let (artifacts, _, context) = materialized_fixture(
+		"external(compare_number) func compare(first: int, second: int): int\nfunc sign(): int = compare(1, 2)",
+	);
+	let compare = artifacts
+		.iter()
+		.find(|artifact| source_name(&artifact.definition) == "compare")
+		.unwrap()
+		.definition
+		.clone();
+	let sign = artifacts
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "sign")
+		.unwrap();
+
+	let lowered = lower_runtime_definition(&context, Arc::new(sign)).unwrap();
+
+	assert_eq!(lowered.demands(), [compare]);
+}
+
+#[test]
 fn top_level_external_values_preserve_every_stable_marshal_kind() {
 	let (artifacts, _, _) = materialized_fixture("external(max_float) let maximum: float");
 	let template = artifacts.into_iter().next().unwrap();
@@ -753,6 +794,28 @@ fn generic_bound_dispatch_is_direct_and_has_no_concrete_runtime_demand() {
 		}
 	);
 	assert_eq!(item.demands(), []);
+}
+
+#[test]
+fn namespaced_call_through_generic_parameter_is_a_typed_unsupported_error() {
+	let (artifacts, _, context) = materialized_fixture(
+		"interface Default { func default(): self }\nfunc make<T: Default>(): T = T.default()",
+	);
+	let make = artifacts
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "make")
+		.unwrap();
+
+	let result = lower_runtime_definition(&context, Arc::new(make));
+
+	assert!(
+		matches!(
+			&result,
+			Err(nymph_sema::StableLoweringError::Unsupported { feature, .. })
+				if feature == "namespaced call through a generic type parameter"
+		),
+		"{result:?}"
+	);
 }
 
 #[test]

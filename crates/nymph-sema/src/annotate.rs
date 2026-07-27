@@ -6,7 +6,7 @@
 use ecow::EcoString;
 use nymph_ast::{NodeId, Span};
 use nymph_diagnostics::Diagnostic;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::ops::Deref;
 
 use crate::Ty;
@@ -184,6 +184,10 @@ pub struct Annotations {
 	/// which nodes must be wrapped as a synthesized `HirExpr::Closure` rather
 	/// than lowered as their own expression kind.
 	anon_boundaries: FxHashMap<NodeId, u8>,
+	/// Calls proven to be namespaced dispatch through a generic type parameter.
+	/// The parameter identifier has no runtime binding, so stable lowering must
+	/// reject these rather than emitting an undefined local.
+	generic_namespaced_calls: FxHashSet<NodeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -386,6 +390,16 @@ impl Annotations {
 	/// rebuild the synthesized closure.
 	pub fn anon_boundary_arity(&self, id: NodeId) -> Option<u8> {
 		self.anon_boundaries.get(&id).copied()
+	}
+
+	pub(crate) fn record_generic_namespaced_call(&mut self, id: NodeId) {
+		if id != NodeId::DUMMY {
+			self.generic_namespaced_calls.insert(id);
+		}
+	}
+
+	pub fn is_generic_namespaced_call(&self, id: NodeId) -> bool {
+		self.generic_namespaced_calls.contains(&id)
 	}
 
 	/// Attach a `Resolution` to a node, preserving its already-recorded type. Used

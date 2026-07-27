@@ -110,6 +110,17 @@ pub(crate) fn intrinsic_module_sources() -> FxHashMap<String, String> {
 		.clone()
 }
 
+pub(crate) fn intrinsic_module_sources_with_option_enum(
+	option_enum_name: &str,
+) -> FxHashMap<String, String> {
+	let mut sources = intrinsic_module_sources();
+	sources.insert(
+		nymph_codegen::BOX_MODULE_KEY.to_string(),
+		nymph_codegen::box_module_source_with_option_enum(option_enum_name),
+	);
+	sources
+}
+
 fn build_intrinsic_module_sources() -> FxHashMap<String, String> {
 	let mut sources: FxHashMap<String, String> = nymph_hir::linkage::modules()
 		.into_iter()

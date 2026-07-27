@@ -67,7 +67,7 @@ const BOX_CLASSES: &[(&str, &str)] = &[
 /// (not via a `const TAG` binding) so the block is self-contained — it never
 /// collides with, nor depends on, a module's own `const TAG` (emitted for
 /// enums) and never trips `wrap_module_js`'s used-but-undeclared `[TAG]` probe.
-fn class_defs(export: bool) -> String {
+fn class_defs(export: bool, option_enum_name: &str) -> String {
 	let kw = if export { "export " } else { "" };
 	let mut out = String::new();
 	out.push_str(&format!("{kw}class {BASE} {{\n"));
@@ -78,6 +78,9 @@ fn class_defs(export: bool) -> String {
 	out.push_str("\tdebug() {\n\t\treturn new NString(nymphDebug(this));\n\t}\n");
 	out.push_str("\ttoString() {\n\t\treturn this.debug().v;\n\t}\n");
 	out.push_str("}\n");
+	out.push_str(&format!(
+		"const NYMPH_OPTION_ENUM_NAME = \"{option_enum_name}\";\n"
+	));
 	out.push_str(HASH_MAP_RUNTIME);
 	if export {
 		out.push_str("export { NymphRange, nymphKeyEquals as protocolEquals, nymphHash as structuralHash, nymphDisplay as structuralDisplay, nymphDebug as structuralDebug, nymphProtocolDisplay, nymphProtocolDebug };\n");
@@ -85,7 +88,7 @@ fn class_defs(export: bool) -> String {
 	for (class, _) in BOX_CLASSES {
 		if *class == "NMap" {
 			out.push_str(&format!(
-				"{kw}class {class} extends {BASE} {{\n\tconstructor(entries) {{\n\t\tsuper(new NymphHamt(entries));\n\t}}\n\tget size() {{ return this.v.size; }}\n\tget(key) {{ return this.v.get(key); }}\n\thas(key) {{ return this.v.has(key); }}\n\tset(key, value) {{ this.v.set(key, value); return this; }}\n\tdelete(key) {{ return this.v.delete(key); }}\n\tclear() {{ this.v.clear(); }}\n\tkeys() {{ return this.v.keys(); }}\n\tvalues() {{ return this.v.values(); }}\n\tentries() {{ return this.v.entries(); }}\n\t[Symbol.iterator]() {{ return this.v[Symbol.iterator](); }}\n}}\n"
+				"{kw}class {class} extends {BASE} {{\n\tconstructor(entries) {{\n\t\tsuper(new NymphHamt(entries));\n\t}}\n\tget size() {{ return this.v.size; }}\n\tget(key) {{ return this.v.get(key); }}\n\thas(key) {{ return this.v.has(key); }}\n\tset(key, value) {{ this.v.set(key, value); return this; }}\n\tdelete(key) {{ return this.v.delete(key); }}\n\tclear() {{ this.v.clear(); }}\n\tkeys() {{ return this.v.keys(); }}\n\tvalues() {{ return this.v.values(); }}\n\tentries() {{ return this.v.entries(); }}\n\titer() {{ return new NymphMapIterator(this.v.entries()); }}\n\t[Symbol.iterator]() {{ return this.v[Symbol.iterator](); }}\n}}\n"
 			));
 		} else if *class == "NTuple" {
 			// Native Map's constructor reads pair entries through numeric properties.
@@ -113,14 +116,21 @@ fn class_defs(export: bool) -> String {
 /// emitted module that constructs a box (see the module docs and [`crate::emit`]).
 #[must_use]
 pub fn box_preamble() -> String {
-	class_defs(false)
+	class_defs(false, "Option")
 }
 
 /// The `export`ed `std/box` runtime module source, injected into the bundle
 /// graph under [`BOX_MODULE_KEY`] (see the module docs).
 #[must_use]
 pub fn box_module_source() -> String {
-	class_defs(true)
+	class_defs(true, "Option")
+}
+
+/// The importable box runtime using the exact emitted compiler-Option binding
+/// as its native iterator discriminant namespace.
+#[must_use]
+pub fn box_module_source_with_option_enum(option_enum_name: &str) -> String {
+	class_defs(true, option_enum_name)
 }
 
 /// The declaration source paired with [`box_module_source`].

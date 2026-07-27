@@ -585,7 +585,7 @@ fn stable_native_map_runtime_is_exact_collision_safe_and_runs_after_dependency_w
 		.compile_interface_project_for_test(project, main, EntryMode::Entry)
 		.expect("stable emission links only the native Map runtime closure");
 	assert_eq!(
-		compiled.js.matches("from \"std/collections/map\"").count(),
+		compiled.js.matches("//#region std/collections/map").count(),
 		1,
 		"{}",
 		compiled.js
@@ -607,18 +607,8 @@ fn stable_native_map_runtime_is_exact_collision_safe_and_runs_after_dependency_w
 		compiled.js
 	);
 
-	let js = compiled
-		.js
-		.replace(
-			"import { get as $m8$map$get, insert as $m8$map$insert, size as $m8$map$size } from \"std/collections/map\";",
-			"const $m8$map$get = (xs, key) => { const value = xs.get(key); return value === undefined ? { [Symbol.for('nymph.tag')]: Symbol.for('$m15$Option.None') } : { [Symbol.for('nymph.tag')]: Symbol.for('$m15$Option.Some'), value }; }; const $m8$map$insert = (xs, key, value) => { const fresh = xs.get(key) === undefined; xs.set(key, value); return new NBool(fresh); }; const $m8$map$size = (xs) => new NInt(xs.entries.length);",
-		)
-		.replace(
-			"import { NBool, NInt, NMap } from \"std/box\";",
-			"class NBool { constructor(v) { this.v = v; } } class NInt { constructor(v) { this.v = v; } } class NMap { constructor(entries) { this.entries = entries; } find(key) { return this.entries.find(([item]) => item.v === key.v); } get(key) { return this.find(key)?.[1]; } set(key, value) { const entry = this.find(key); if (entry) entry[1] = value; else this.entries.push([key, value]); } iter() { let index = 0; const entries = this.entries; return { next() { return index < entries.length ? { [Symbol.for('nymph.tag')]: Symbol.for('$m15$Option.Some'), value: { v: entries[index++] } } : { [Symbol.for('nymph.tag')]: Symbol.for('$m15$Option.None') }; } }; } }",
-		);
 	let exercise = compiled.entry_symbol("exercise");
-	let script = format!("{js}\nconsole.log({exercise}().v);\n");
+	let script = format!("{}\nconsole.log({exercise}().v);\n", compiled.js);
 	let path = std::env::temp_dir().join(format!("nymph-stable-map-{}.mjs", std::process::id()));
 	std::fs::write(&path, script).unwrap();
 	let output = std::process::Command::new("node")
@@ -709,12 +699,8 @@ fn stable_native_range_runtime_is_exact_collision_safe_and_runs_after_dependency
 		compiled.js
 	);
 
-	let js = compiled.js.replace(
-		"import { NBool, NInt, NUint, NymphRange } from \"std/box\";",
-		"class NBool { constructor(v) { this.v = v; } } class NInt { constructor(v) { this.v = v; } } class NUint { constructor(v) { this.v = v; } } const tag = Symbol.for('nymph.tag'); const none = { [tag]: Symbol.for('$m15$Option.None') }; class NymphRange { constructor({ start, end, inclusive }) { this.start = start; this.end = end; this.inclusive = inclusive; } iter() { let current = this.start; const end = this.end.v; const inclusive = this.inclusive.v; return { next() { if (inclusive ? current.v > end : current.v >= end) return none; const value = current; current = new current.constructor(current.v + 1); return { [tag]: Symbol.for('$m15$Option.Some'), value }; } }; } }",
-	);
 	let exercise = compiled.entry_symbol("exercise");
-	let script = format!("{js}\nconsole.log({exercise}().v);\n");
+	let script = format!("{}\nconsole.log({exercise}().v);\n", compiled.js);
 	let path = std::env::temp_dir().join(format!("nymph-stable-range-{}.mjs", std::process::id()));
 	std::fs::write(&path, script).unwrap();
 	let output = std::process::Command::new("node")
@@ -790,6 +776,164 @@ fn stable_emission_links_exact_ambient_math_demands_once_and_runs() {
 		String::from_utf8_lossy(&output.stdout),
 		"3.141592653589793 4 4\n"
 	);
+}
+
+#[test]
+fn stable_compare_to_closes_same_module_runtime_demands_and_runs() {
+	let mut session = CompilerSession::new();
+	let project = ProjectId::new("stable-compare-to-runtime");
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"func compare() = 1.compare_to(2)\npublic func main(): void = {}".into(),
+		SourceVersion(1),
+	);
+
+	let compiled = session
+		.compile_interface_project_for_test(project, main, EntryMode::Entry)
+		.expect("compare_to links its same-module order_from_sign helper");
+	assert_eq!(
+		compiled
+			.js
+			.lines()
+			.filter(|line| line.starts_with("function ") && line.contains("order_from_sign("))
+			.count(),
+		1,
+		"{}",
+		compiled.js
+	);
+	assert_eq!(
+		compiled.js.matches("order_from_sign(").count(),
+		2,
+		"{}",
+		compiled.js
+	);
+	let compare = compiled.entry_symbol("compare");
+	let js = compiled.js.replace(
+		"import { NInt } from \"std/box\";",
+		"class NInt { constructor(v) { this.v = v; } }",
+	);
+	let script = format!("{js}\nconsole.log({compare}()[Symbol.for('nymph.tag')].description);\n");
+	let path = std::env::temp_dir().join(format!("nymph-stable-compare-{}.mjs", std::process::id()));
+	std::fs::write(&path, script).unwrap();
+	let output = std::process::Command::new("node")
+		.arg(&path)
+		.output()
+		.unwrap();
+	let _ = std::fs::remove_file(path);
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert!(String::from_utf8_lossy(&output.stdout).contains("Order.LessThan"));
+}
+
+#[test]
+fn stable_project_module_exports_first_class_external_alias_and_runs() {
+	let mut session = CompilerSession::new();
+	let project = ProjectId::new("stable-project-external-value");
+	let provider = ModulePath::new("provider").unwrap();
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		provider,
+		"public external(println) func println<T: Display>(value: T): void".into(),
+		SourceVersion(1),
+	);
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"import @/provider with (println as host_println)\nfunc value(): int = { let f = host_println f(1) 0 }\npublic func main(): void = {}".into(),
+		SourceVersion(1),
+	);
+
+	let emitted = session
+		.emit_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
+		.expect("ordinary module emits its external ABI alias");
+	assert!(emitted.module_sources["provider"].contains(" as $m0$println"));
+	assert!(emitted.module_sources["provider"].contains("export { $m0$println };"));
+	assert!(emitted.module_sources["main"].contains("import { $m0$println } from \"provider\";"));
+	let compiled = session
+		.compile_interface_project_for_test(project, main, EntryMode::Entry)
+		.expect("consumer imports the external alias as a first-class value");
+	let value = compiled.entry_symbol("value");
+	let js = compiled.js.replace(
+		"import { NInt } from \"std/box\";",
+		"class NInt { constructor(v) { this.v = v; } }",
+	);
+	let path = std::env::temp_dir().join(format!(
+		"nymph-stable-external-value-{}.mjs",
+		std::process::id()
+	));
+	std::fs::write(&path, format!("{js}\nconsole.log({value}().v);\n")).unwrap();
+	let output = std::process::Command::new("node")
+		.arg(&path)
+		.output()
+		.unwrap();
+	let _ = std::fs::remove_file(path);
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n0\n");
+}
+
+#[test]
+fn stable_importable_module_emits_demanded_external_member_alias() {
+	let mut session = CompilerSession::new();
+	let project = ProjectId::new("stable-importable-external-member");
+	let provider = ModulePath::new("provider").unwrap();
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		provider,
+		"impl int { external(display) func rendered(): string }".into(),
+		SourceVersion(1),
+	);
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"import @/provider\nfunc value(): string = (1).rendered()\npublic func main(): void = {}"
+			.into(),
+		SourceVersion(1),
+	);
+
+	let emitted = session
+		.emit_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
+		.expect("importable module emits a demanded external member alias");
+	let provider = &emitted.module_sources["provider"];
+	assert!(provider.contains(" as $m0$int$rendered"), "{provider}");
+	assert!(provider.contains("export { $m0$int$rendered"), "{provider}");
+	assert!(
+		emitted.module_sources["main"].contains("import { $m0$int$rendered } from \"provider\";")
+	);
+	let compiled = session
+		.compile_interface_project_for_test(project, main, EntryMode::Entry)
+		.expect("consumer bundles the importable external member");
+	let value = compiled.entry_symbol("value");
+	let path = std::env::temp_dir().join(format!(
+		"nymph-stable-importable-external-member-{}.mjs",
+		std::process::id()
+	));
+	std::fs::write(
+		&path,
+		format!("{}\nconsole.log({value}().v);\n", compiled.js),
+	)
+	.unwrap();
+	let output = std::process::Command::new("node")
+		.arg(&path)
+		.output()
+		.unwrap();
+	let _ = std::fs::remove_file(path);
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n");
 }
 
 #[test]

@@ -74,10 +74,8 @@ fn run(src: &str, call: &str) -> String {
 /// `match`), `Result`, `convert.nym`'s `Option`/`Result` conversions
 /// (`.ok_or(..)`, `.ok()`), and a `for`-over-list — all with **no `import`
 /// anywhere** — compiles clean and runs under Node with the right values.
-/// `Default`'s `T.default()` is deliberately NOT exercised here as a running
-/// case — see `default_type_checks_via_the_ambient_prelude_but_lowering_still_
-/// panics_on_the_generic_bound` below for why (an honest, pre-existing
-/// lowering deferral, unrelated to this slice's injection work).
+/// `Default`'s `T.default()` is exercised separately below so its unsupported
+/// generic namespaced dispatch has a focused diagnostic regression.
 #[test]
 fn ambient_core_option_result_convert_and_for_over_list_run_with_no_import() {
 	let src = r#"
@@ -222,20 +220,12 @@ fn ambient_math_constants_run_with_no_import() {
 	assert_eq!(run(src, "get_min_int()"), min_int.to_string());
 }
 
-/// `Default` is ambient too (no `import` needed to name it as a bound), and a
-/// generic function bounded by it type-checks cleanly via the prelude — but
-/// calling `T.default()` through that still-generic `T` is the SAME honest,
-/// pre-existing lowering deferral as any other bounded-generic dispatch
-/// through a stdlib interface (see `tests/prelude.rs`'s
-/// `compile_panics_loudly_on_a_generic_bound_through_a_stdlib_interface`, and
-/// this slice's own review finding on `Option::map_or_default`): the concrete
-/// `impl Default for int` is only known once `T` is instantiated, which this
-/// type-erased-at-lowering compiler does not track. This is not a regression
-/// from Slice A's injection — `Default` was reachable before only via an
-/// explicit (never-landed) opt-in; now it's ambient, so the SAME deferral is
-/// reachable with no `import` at all, and must panic exactly as loudly.
+/// `Default` is ambient too (no `import` needed to name it as a bound), but a
+/// namespaced call through a generic parameter cannot select a concrete
+/// implementation in the current type-erased runtime. It must return one
+/// exact typed diagnostic and no JavaScript rather than emit an unbound `T`.
 #[test]
-fn default_generic_bound_compiles_or_returns_a_typed_diagnostic_without_panicking() {
+fn default_generic_bound_returns_one_exact_typed_diagnostic_and_no_js() {
 	let source = "func make<T: Default>(): T = T.default()\nfunc use_it(): int = make()";
 
 	let diags = check(source, "test");
@@ -243,15 +233,15 @@ fn default_generic_bound_compiles_or_returns_a_typed_diagnostic_without_panickin
 		!diags.iter().any(|d| d.is_error()),
 		"expected `make` to typecheck cleanly via the ambient `Default`, got: {diags:?}"
 	);
-
-	let result = std::panic::catch_unwind(|| compile(source, "test"));
-	assert!(
-		result.is_ok(),
-		"stable generic Default dispatch must not panic"
+	let diagnostics = compile(source, "test")
+		.expect_err("unsupported generic namespaced dispatch must not emit JavaScript");
+	assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+	assert_eq!(diagnostics[0].code, "STABLE-EMISSION-LINK");
+	assert_eq!(diagnostics[0].severity, nymph_compiler::Severity::Error);
+	assert_eq!(
+		diagnostics[0].message,
+		"stable runtime linking failed: Lowering(Unsupported { definition: DefinitionId { module: ModuleIdentity { origin: Project(\"__nymph_internal_facade_project__\"), project: \"__nymph_internal_facade_project__\", path: \"__nymph_internal_standalone_entry__\" }, key: TopLevel { category: Function, name: \"make\", duplicate: 0 } }, node: Some(BodyNodeId(0)), feature: \"namespaced call through a generic type parameter\" })"
 	);
-	if let Err(diagnostics) = result.unwrap() {
-		assert!(diagnostics.iter().any(|diagnostic| diagnostic.is_error()));
-	}
 }
 
 /// A user redefinition of an ambient core name (`Option`, here — not `ops`)

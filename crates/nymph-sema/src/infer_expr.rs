@@ -1245,6 +1245,7 @@ impl<'m> Checker<'m> {
 			&& let Some(pidx) = self.lookup_param(&pname.0)
 		{
 			let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
+			self.annotations.record_generic_namespaced_call(id);
 			return (
 				self.resolve_param_namespaced(pidx, &member.0, &arg_tys, member.1),
 				None,

@@ -319,8 +319,10 @@ class NymphHamt {
 	}
 }
 
-const NYMPH_OPTION_SOME = Symbol.for("Option.Some");
-const NYMPH_OPTION_NONE = Object.freeze({ [NYMPH_TAG]: Symbol.for("Option.None") });
+const NYMPH_OPTION_SOME = Symbol.for(`${NYMPH_OPTION_ENUM_NAME}.Some`);
+const NYMPH_OPTION_NONE = Object.freeze({
+	[NYMPH_TAG]: Symbol.for(`${NYMPH_OPTION_ENUM_NAME}.None`),
+});
 
 class NymphListIterator {
 	constructor(items) {
@@ -330,6 +332,17 @@ class NymphListIterator {
 	next() {
 		if (this.index >= this.items.length) return NYMPH_OPTION_NONE;
 		return { [NYMPH_TAG]: NYMPH_OPTION_SOME, value: this.items[this.index++] };
+	}
+}
+
+class NymphMapIterator {
+	constructor(entries) {
+		this.entries = entries;
+	}
+	next() {
+		const entry = this.entries.next();
+		if (entry.done) return NYMPH_OPTION_NONE;
+		return { [NYMPH_TAG]: NYMPH_OPTION_SOME, value: new NTuple(entry.value) };
 	}
 }
 
