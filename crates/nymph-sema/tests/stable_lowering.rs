@@ -72,9 +72,7 @@ impl StableNameLookup for Context {
 		&self,
 		module: &ModuleIdentity,
 	) -> Result<CanonicalModuleSpecifier, StableNameLookupError> {
-		Err(StableNameLookupError::MissingModule {
-			module: module.clone(),
-		})
+		Ok(CanonicalModuleSpecifier::Project(module.path.clone()))
 	}
 }
 
@@ -128,39 +126,15 @@ fn source_name(id: &DefinitionId) -> &str {
 }
 
 fn lower_named(source: &str, wanted: &str) -> nymph_sema::LoweredRuntimeDefinition {
-	let item = artifacts(source)
+	let (items, _, mut context) = materialized_fixture(source);
+	let item = items
 		.into_iter()
 		.find(|item| source_name(&item.definition) == wanted)
 		.unwrap_or_else(|| panic!("missing runtime artifact {wanted}"));
-	let mut context = Context::default();
 	context.names.insert(
 		item.definition.clone(),
 		EmittedBindingName::new(source_name(&item.definition)),
 	);
-	let nymph_sema::RuntimePayload::NymphBody(body) = &item.payload else {
-		panic!("{wanted} is not a body")
-	};
-	for (_, target) in body.annotations.definition_targets.iter() {
-		context
-			.names
-			.insert(target.clone(), EmittedBindingName::new(source_name(target)));
-		context
-			.members
-			.insert(target.clone(), EmittedMemberName::new(source_name(target)));
-	}
-	for (_, dispatch) in body.annotations.dispatches.iter() {
-		let member = match dispatch {
-			nymph_sema::StableDispatch::Builtin { .. } => continue,
-			nymph_sema::StableDispatch::Direct { member, .. }
-			| nymph_sema::StableDispatch::SelectedImplementation { member, .. }
-			| nymph_sema::StableDispatch::InterfaceDefault { member, .. }
-			| nymph_sema::StableDispatch::GenericBound { member, .. }
-			| nymph_sema::StableDispatch::External { member, .. } => member,
-		};
-		context
-			.members
-			.insert(member.clone(), EmittedMemberName::new(source_name(member)));
-	}
 	lower_runtime_definition(&context, Arc::new(item)).unwrap()
 }
 
@@ -224,6 +198,36 @@ fn materialized_fixture(
 			context.members.insert(
 				slot.member_id.clone(),
 				EmittedMemberName::new(slot.name.clone()),
+			);
+		}
+	}
+	for definition in interface.exports.iter().chain(
+		interface
+			.support_definitions
+			.iter()
+			.map(|item| &item.definition),
+	) {
+		if definition.kind == nymph_sema::DefinitionShapeKind::Interface {
+			for member in &definition.members {
+				context.members.insert(
+					member.id.clone(),
+					EmittedMemberName::new(member.name.clone()),
+				);
+			}
+			context.shapes.insert(
+				StableShapeRequest::InterfaceShell(definition.id.clone()),
+				StableShapeFact::InterfaceShell(definition.clone()),
+			);
+			context.shapes.insert(
+				StableShapeRequest::ImplementationsForInterface(definition.id.clone()),
+				StableShapeFact::Implementations(
+					interface
+						.implementations
+						.iter()
+						.filter(|implementation| implementation.interface.as_ref() == Some(&definition.id))
+						.cloned()
+						.collect(),
+				),
 			);
 		}
 	}
@@ -494,7 +498,7 @@ fn selected_override_dispatch_has_exact_call_and_placement_demand() {
 	assert_eq!(item.demands().len(), 1);
 	assert!(matches!(
 		item.demands()[0].key,
-		DeclarationKey::Implementation { .. }
+		DeclarationKey::Member { .. }
 	));
 }
 
@@ -518,7 +522,7 @@ fn inherited_interface_default_dispatch_has_exact_call_and_materialization_deman
 	assert_eq!(item.demands().len(), 1);
 	assert!(matches!(
 		item.demands()[0].key,
-		DeclarationKey::Implementation { .. }
+		DeclarationKey::MaterializedInterfaceMember { .. }
 	));
 }
 
@@ -582,4 +586,51 @@ fn missing_dispatched_member_name_is_a_typed_error() {
 			StableNameLookupError::MissingMember { .. }
 		))
 	));
+}
+
+#[test]
+fn generic_bound_with_two_primitive_implementations_lowers_to_stable_multi_case_dispatch() {
+	let source = "interface Same<Other, Output> { func same(other: Other): Output }\nimpl Same<Other = int, Output = int> for int { func same(other: int): int = other }\nimpl Same<Other = string, Output = string> for string { func same(other: string): string = other }\nfunc choose<T: Same<Other = T, Output = T>>(a: T, b: T): T = a.same(b)";
+	let (artifacts, interface, context) = materialized_fixture(source);
+	let artifact = artifacts
+		.into_iter()
+		.find(|item| source_name(&item.definition) == "choose")
+		.unwrap();
+	let lowered = lower_runtime_definition(&context, Arc::new(artifact)).unwrap();
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("unexpected fragment: {:?}", lowered.fragment())
+	};
+	let expected_targets = interface
+		.implementations
+		.iter()
+		.map(|implementation| implementation.member_slots[0].body_definition_id.clone())
+		.collect::<Vec<_>>();
+	assert_eq!(
+		function.body,
+		nymph_hir::hir::HirExpr::BoundDispatch {
+			interface: "Same".into(),
+			method: "same".into(),
+			receiver: Box::new(nymph_hir::hir::HirExpr::Local("a".into())),
+			argument: Box::new(nymph_hir::hir::HirExpr::Local("b".into())),
+			cases: vec![
+				nymph_hir::hir::HirBoundDispatchCase {
+					receiver_tag: "nymph.int".into(),
+					argument_tag: "nymph.int".into(),
+					target: nymph_hir::hir::HirBoundDispatchTarget::TopLevel {
+						module: "main".into(),
+						name: source_name(&expected_targets[0]).into(),
+					},
+				},
+				nymph_hir::hir::HirBoundDispatchCase {
+					receiver_tag: "nymph.string".into(),
+					argument_tag: "nymph.string".into(),
+					target: nymph_hir::hir::HirBoundDispatchTarget::TopLevel {
+						module: "main".into(),
+						name: source_name(&expected_targets[1]).into(),
+					},
+				},
+			],
+		}
+	);
+	assert_eq!(lowered.demands(), expected_targets);
 }

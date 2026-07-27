@@ -19,9 +19,9 @@ use nymph_ast::{
 	ops::{AssignOperator, BinaryOperator, PatternOperator, PrefixOperator},
 };
 use nymph_hir::hir::{
-	BinOp, BuiltinResult, HirArm, HirArrayElem, HirArrayKind, HirClass, HirEnum, HirExpr, HirFunc,
-	HirLet, HirLit, HirMapElem, HirMethod, HirPat, HirRange, HirStmt, HirVariant, NumKind,
-	ScalarCastKind, UnOp,
+	BinOp, BuiltinResult, HirArm, HirArrayElem, HirArrayKind, HirBoundDispatchCase,
+	HirBoundDispatchTarget, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit, HirMapElem,
+	HirMethod, HirPat, HirRange, HirStmt, HirVariant, NumKind, ScalarCastKind, UnOp,
 };
 
 use crate::{
@@ -56,6 +56,7 @@ pub enum StableShapeRequest {
 	TypeShell(DefinitionId),
 	Member(DefinitionId),
 	Implementation(DefinitionId),
+	ImplementationsForInterface(DefinitionId),
 	InterfaceShell(DefinitionId),
 	ExternalAbi(DefinitionId),
 }
@@ -66,6 +67,7 @@ impl StableShapeRequest {
 			Self::TypeShell(id)
 			| Self::Member(id)
 			| Self::Implementation(id)
+			| Self::ImplementationsForInterface(id)
 			| Self::InterfaceShell(id)
 			| Self::ExternalAbi(id) => id,
 		}
@@ -83,6 +85,7 @@ pub enum StableShapeFact {
 	TypeShell(StableTypeShell),
 	Member(MemberShape<InterfaceType>),
 	Implementation(ExportedImpl),
+	Implementations(Vec<ExportedImpl>),
 	InterfaceShell(ExportedDefinition),
 	ExternalAbi(ExternalAbi),
 }
@@ -275,6 +278,16 @@ pub enum StableLoweringError {
 		implementation: DefinitionId,
 		member: DefinitionId,
 	},
+	MissingInterfaceMember {
+		interface: DefinitionId,
+		member: DefinitionId,
+	},
+	AmbiguousDispatchCase {
+		interface: DefinitionId,
+		member: DefinitionId,
+		receiver_tag: EcoString,
+		argument_tag: EcoString,
+	},
 	MismatchedImplementationPlacement {
 		definition: DefinitionId,
 		expected: DefinitionId,
@@ -449,6 +462,27 @@ fn invalid(definition: &DefinitionId, reason: &str) -> StableLoweringError {
 		reason: reason.into(),
 	}
 }
+
+fn stable_runtime_tag(ty: &InterfaceType) -> Option<EcoString> {
+	let tag = match ty {
+		InterfaceType::Int => "int",
+		InterfaceType::UInt => "uint",
+		InterfaceType::Float => "float",
+		InterfaceType::Char => "char",
+		InterfaceType::String => "string",
+		InterfaceType::Boolean => "bool",
+		InterfaceType::Void => "void",
+		InterfaceType::List(_) | InterfaceType::Tuple(_) => "list",
+		InterfaceType::Map(..) => "map",
+		InterfaceType::Mutable(inner) => {
+			return stable_runtime_tag(inner)
+				.map(|tag| EcoString::from(format!("nymph.mut_{}", &tag[6..])));
+		}
+		_ => return None,
+	};
+	Some(EcoString::from(format!("nymph.{tag}")))
+}
+
 fn attached_owner(artifact: &RuntimeDefinition) -> Result<DefinitionId, StableLoweringError> {
 	match &artifact.placement {
 		crate::RuntimePlacement::Attached { owner, .. } => Ok(owner.clone()),
@@ -1137,6 +1171,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		receiver: &Expr,
 		arguments: Vec<&Expr>,
 	) -> Result<HirExpr, StableLoweringError> {
+		if let crate::StableDispatch::GenericBound { interface, member } = dispatch {
+			if self
+				.implementation_slots
+				.is_none_or(|slots| !slots.iter().any(|slot| slot.interface_member_id == *member))
+			{
+				return self.lower_generic_bound(interface, member, receiver, arguments);
+			}
+		}
 		let (member, demand, external) = match dispatch {
 			crate::StableDispatch::Builtin { method, .. } => {
 				return Ok(HirExpr::Call {
@@ -1154,7 +1196,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				member,
 				implementation,
 				..
-			} => (member, Some(implementation), false),
+			} => (member.clone(), Some(implementation.clone()), false),
 			crate::StableDispatch::SelectedImplementation {
 				member,
 				implementation,
@@ -1164,30 +1206,44 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				member,
 				implementation,
 				..
-			} => (member, Some(implementation), false),
-			crate::StableDispatch::GenericBound { member, .. } => (member, None, false),
+			} => {
+				let request = StableShapeRequest::Implementation(implementation.clone());
+				let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
+					return Err(StableShapeLookupError::WrongFact { request }.into());
+				};
+				let slot = shape
+					.member_slots
+					.iter()
+					.find(|slot| slot.interface_member_id == *member || slot.member_id == *member)
+					.ok_or_else(|| StableLoweringError::MissingImplementationSlot {
+						implementation: implementation.clone(),
+						member: member.clone(),
+					})?;
+				(slot.member_id.clone(), Some(slot.member_id.clone()), false)
+			}
+			crate::StableDispatch::GenericBound { member, .. } => (member.clone(), None, false),
 			crate::StableDispatch::External {
 				member,
 				implementation,
 				..
-			} => (member, Some(implementation), true),
+			} => (member.clone(), Some(implementation.clone()), true),
 		};
 		let materialized_member = self.implementation_slots.and_then(|slots| {
 			slots
 				.iter()
-				.find(|slot| slot.interface_member_id == *member)
+				.find(|slot| slot.interface_member_id == member)
 				.map(|slot| &slot.member_id)
 		});
-		let member = materialized_member.unwrap_or(member);
+		let member = materialized_member.cloned().unwrap_or(member);
 		let demand = if materialized_member.is_some() {
-			Some(member)
+			Some(member.clone())
 		} else {
 			demand
 		};
 		if let Some(demand) = demand {
-			self.demands.borrow_mut().insert(demand.clone());
+			self.demands.borrow_mut().insert(demand);
 		}
-		let name: EcoString = self.context.member_name(member)?.as_str().into();
+		let name: EcoString = self.context.member_name(&member)?.as_str().into();
 		if external {
 			let fact = self
 				.context
@@ -1230,6 +1286,150 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				.into_iter()
 				.map(|arg| self.lower(arg))
 				.collect::<Result<_, _>>()?,
+		})
+	}
+
+	fn lower_generic_bound(
+		&self,
+		interface: &DefinitionId,
+		member: &DefinitionId,
+		receiver: &Expr,
+		arguments: Vec<&Expr>,
+	) -> Result<HirExpr, StableLoweringError> {
+		let interface_request = StableShapeRequest::InterfaceShell(interface.clone());
+		let StableShapeFact::InterfaceShell(interface_shape) =
+			self.context.stable_shape(&interface_request)?
+		else {
+			return Err(
+				StableShapeLookupError::WrongFact {
+					request: interface_request,
+				}
+				.into(),
+			);
+		};
+		if !interface_shape
+			.members
+			.iter()
+			.any(|shape| shape.id == *member)
+		{
+			return Err(StableLoweringError::MissingInterfaceMember {
+				interface: interface.clone(),
+				member: member.clone(),
+			});
+		}
+		let method: EcoString = self.context.member_name(member)?.as_str().into();
+		if arguments.len() != 1 {
+			return Ok(HirExpr::Call {
+				callee: Box::new(HirExpr::Field {
+					recv: Box::new(self.lower(receiver)?),
+					name: method,
+				}),
+				args: arguments
+					.into_iter()
+					.map(|argument| self.lower(argument))
+					.collect::<Result<_, _>>()?,
+			});
+		}
+
+		let request = StableShapeRequest::ImplementationsForInterface(interface.clone());
+		let StableShapeFact::Implementations(implementations) = self.context.stable_shape(&request)?
+		else {
+			return Err(StableShapeLookupError::WrongFact { request }.into());
+		};
+		let mut cases = Vec::new();
+		for implementation in implementations {
+			if implementation.interface.as_ref() != Some(interface) {
+				return Err(invalid(
+					&self.artifact.definition,
+					"generic dispatch implementation belongs to another interface",
+				));
+			}
+			let Some(receiver_tag) = stable_runtime_tag(&implementation.self_type) else {
+				continue;
+			};
+			let argument_type = implementation
+				.interface_arguments
+				.iter()
+				.find(|(name, _)| name == "Other")
+				.map(|(_, ty)| ty)
+				.unwrap_or(&implementation.self_type);
+			let Some(argument_tag) = stable_runtime_tag(argument_type) else {
+				continue;
+			};
+			if receiver_tag != argument_tag {
+				continue;
+			}
+			let slot = implementation
+				.member_slots
+				.iter()
+				.find(|slot| slot.interface_member_id == *member)
+				.ok_or_else(|| StableLoweringError::MissingImplementationSlot {
+					implementation: implementation.id.clone(),
+					member: member.clone(),
+				})?;
+			let body = self.context.runtime_definition(&slot.body_definition_id)?;
+			let target =
+				match &body.payload {
+					crate::RuntimePayload::External(abi) => {
+						let module = abi.module.as_ref().ok_or_else(|| {
+							invalid(&body.definition, "generic dispatch external has no module")
+						})?;
+						let symbol = abi.symbol.as_ref().ok_or_else(|| {
+							invalid(&body.definition, "generic dispatch external has no symbol")
+						})?;
+						HirBoundDispatchTarget::Extern {
+							module: Box::leak(module.to_string().into_boxed_str()),
+							symbol: Box::leak(symbol.to_string().into_boxed_str()),
+						}
+					}
+					crate::RuntimePayload::NymphBody(_) => {
+						let module = self.context.module_specifier(&body.definition.module)?;
+						let module = match module {
+							CanonicalModuleSpecifier::Project(module)
+							| CanonicalModuleSpecifier::Importable(module)
+							| CanonicalModuleSpecifier::CompilerRuntime(module) => module,
+						};
+						HirBoundDispatchTarget::TopLevel {
+							module,
+							name: self.context.binding_name(&body.definition)?.as_str().into(),
+						}
+					}
+					_ => {
+						return Err(invalid(
+							&body.definition,
+							"generic dispatch body is not callable",
+						));
+					}
+				};
+			if cases.iter().any(|case: &HirBoundDispatchCase| {
+				case.receiver_tag == receiver_tag && case.argument_tag == argument_tag
+			}) {
+				return Err(StableLoweringError::AmbiguousDispatchCase {
+					interface: interface.clone(),
+					member: member.clone(),
+					receiver_tag,
+					argument_tag,
+				});
+			}
+			self
+				.demands
+				.borrow_mut()
+				.insert(slot.body_definition_id.clone());
+			cases.push(HirBoundDispatchCase {
+				receiver_tag,
+				argument_tag,
+				target,
+			});
+		}
+		cases.sort_by(|left, right| {
+			(&left.receiver_tag, &left.argument_tag).cmp(&(&right.receiver_tag, &right.argument_tag))
+		});
+		Ok(HirExpr::BoundDispatch {
+			interface: interface_shape.name,
+			method,
+			receiver: Box::new(self.lower(receiver)?),
+			argument: Box::new(self.lower(arguments[0])?),
+			cases,
 		})
 	}
 	fn lower_spread(&self, value: &Expr) -> Result<HirExpr, StableLoweringError> {
