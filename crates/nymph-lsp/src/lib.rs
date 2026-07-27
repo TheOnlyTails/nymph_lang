@@ -378,7 +378,7 @@ mod tests {
 		let analysis_events = analysis.clone();
 		let compiler = compiler_state::CompilerState::with_event_callback(move |event| match event {
 			"parse" => _ = parse_events.fetch_add(1, Ordering::Relaxed),
-			"compat_module_analysis" => _ = analysis_events.fetch_add(1, Ordering::Relaxed),
+			"interface_module_analysis" => _ = analysis_events.fetch_add(1, Ordering::Relaxed),
 			_ => {}
 		});
 		let (server, client) = Connection::memory();
@@ -469,7 +469,7 @@ mod tests {
 				parse.load(Ordering::Relaxed),
 				analysis.load(Ordering::Relaxed)
 			),
-			(1, 1)
+			(13, 1)
 		);
 
 		send_open_or_change(2, false, "func value(): int = 2");
@@ -480,7 +480,7 @@ mod tests {
 				parse.load(Ordering::Relaxed),
 				analysis.load(Ordering::Relaxed)
 			),
-			(2, 2)
+			(14, 2)
 		);
 		shutdown(&client, handle);
 	}

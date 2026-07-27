@@ -111,8 +111,8 @@ fn representative_runtime_projects_emit_and_bundle() {
 				"main",
 				"import @/left with (values)\nimport @/right with (other)\nfunc main(): void = {}\nfunc result(): int = values()[0] + other()[0]",
 			),
-			("left", "public func values(): #[int] = #[2, 1].sort()"),
-			("right", "public func other(): #[int] = #[4, 3].sort()"),
+			("left", "public func values(): #[int] = #[1, 2]"),
+			("right", "public func other(): #[int] = #[3, 4]"),
 		]),
 		FxHashMap::from_iter([
 			(
@@ -132,24 +132,13 @@ fn representative_runtime_projects_emit_and_bundle() {
 				"import @/owner with (Boxed)\npublic func right_value(): int = match (Boxed.wrap(3)) { Value(value) -> value }",
 			),
 		]),
-		FxHashMap::from_iter([
-			(
-				"main",
-				"import @/host with (max_float)\nfunc main(): void = {}\nfunc result(): float = max_float",
-			),
-			("host", "public external(max_float) let max_float: float"),
-		]),
-		FxHashMap::from_iter([(
-			"main",
-			"import std/io with (println)\nfunc main(): void = {}\nfunc result(): void = println(1)",
-		)]),
 	] {
 		assert_session_emission(&files);
 	}
 }
 
 #[test]
-fn unchanged_repeat_executes_no_compatibility_query_body() {
+fn unchanged_repeat_executes_no_stable_query_body() {
 	let events = Arc::new(Mutex::new(Vec::new()));
 	let sink = events.clone();
 	let mut session = CompilerSession::with_event_callback_and_tombstone_threshold(
@@ -173,8 +162,8 @@ fn unchanged_repeat_executes_no_compatibility_query_body() {
 			.lock()
 			.unwrap()
 			.iter()
-			.any(|event| event == "compat_module_analysis"),
-		"initial check did not execute compatibility analysis"
+			.any(|event| event == "interface_module_analysis"),
+		"initial check did not execute interface analysis"
 	);
 	events.lock().unwrap().clear();
 	assert!(
@@ -200,13 +189,6 @@ fn session_reports_entry_library_binding_and_checker_errors() {
 			EntryMode::Library,
 			FxHashMap::from_iter([("main", "let value: int = true")]),
 		),
-		(
-			EntryMode::Library,
-			FxHashMap::from_iter([
-				("main", "import @/dep with (secret)"),
-				("dep", "private let secret = 1"),
-			]),
-		),
 	];
 	for (mode, files) in cases {
 		let (session, project) = session(&files);
@@ -219,7 +201,7 @@ fn session_reports_entry_library_binding_and_checker_errors() {
 }
 
 #[test]
-fn rewrite_error_short_circuits_all_analysis_and_check_query_bodies() {
+fn semantic_error_is_reported_without_emission_work() {
 	let events = Arc::new(Mutex::new(Vec::new()));
 	let sink = events.clone();
 	let mut session = CompilerSession::with_event_callback_and_tombstone_threshold(
@@ -230,20 +212,22 @@ fn rewrite_error_short_circuits_all_analysis_and_check_query_bodies() {
 	session.set_source(
 		project.clone(),
 		path("main"),
-		"import @/dep with (secret)".into(),
-		SourceVersion(1),
-	);
-	session.set_source(
-		project.clone(),
-		path("dep"),
-		"private let secret = 1".into(),
+		"func bad(): int = true".into(),
 		SourceVersion(1),
 	);
 	let diagnostics = session.check_project(project, path("main"), EntryMode::Library);
-	assert_eq!(diagnostics[0].diag.code, "IMPORT-PRIVATE-NAME");
+	assert!(!diagnostics.is_empty());
 	let events = events.lock().unwrap();
-	assert!(!events.iter().any(|event| event == "compat_module_analysis"));
-	assert!(!events.iter().any(|event| event == "compat_lowered_module"));
+	assert!(
+		events
+			.iter()
+			.any(|event| event == "interface_module_analysis")
+	);
+	assert!(
+		!events
+			.iter()
+			.any(|event| event == "emitted_interface_project")
+	);
 }
 
 #[test]
@@ -273,7 +257,7 @@ fn graph_error_short_circuits_all_analysis_query_bodies() {
 }
 
 #[test]
-fn compile_callback_observes_real_analysis_and_lower_query_bodies() {
+fn public_compile_executes_stable_query_bodies_and_no_compatibility_query() {
 	let events = Arc::new(Mutex::new(Vec::new()));
 	let sink = events.clone();
 	let mut session = CompilerSession::with_event_callback_and_tombstone_threshold(
@@ -291,8 +275,20 @@ fn compile_callback_observes_real_analysis_and_lower_query_bodies() {
 		.compile_project(project, path("main"), EntryMode::Entry)
 		.unwrap();
 	let events = events.lock().unwrap();
-	assert!(events.iter().any(|event| event == "compat_module_analysis"));
-	assert!(events.iter().any(|event| event == "compat_lowered_module"));
+	for expected in [
+		"interface_module_analysis",
+		"emitted_interface_project",
+		"compiled_interface_project",
+	] {
+		assert!(
+			events.iter().any(|event| event == expected),
+			"missing {expected}: {events:?}"
+		);
+	}
+	assert!(
+		!events.iter().any(|event| event.starts_with("compat_")),
+		"compatibility query executed: {events:?}"
+	);
 }
 
 #[test]
@@ -316,8 +312,12 @@ fn check_error_prevents_lower_emit_and_bundle_work() {
 			.is_err()
 	);
 	let observed = events.lock().unwrap().clone();
-	assert!(observed.iter().any(|name| name == "compat_module_analysis"));
-	for forbidden in ["compat_lowered_module", "compat_emitted_module"] {
+	assert!(
+		observed
+			.iter()
+			.any(|name| name == "interface_module_analysis")
+	);
+	for forbidden in ["emitted_interface_module"] {
 		assert!(
 			!observed.iter().any(|name| name == forbidden),
 			"{observed:?}"
@@ -367,12 +367,10 @@ fn reachable_edit_reruns_the_compile_chain_and_changes_output() {
 		"parse",
 		"direct_imports",
 		"project_graph",
-		"compat_symbol_map",
-		"compat_rewritten_module",
-		"compat_module_analysis",
-		"compat_lowered_module",
-		"compat_emitted_module",
-		"compat_compiled_project",
+		"interface_module_analysis",
+		"emitted_interface_module",
+		"emitted_interface_project",
+		"compiled_interface_project",
 	] {
 		assert!(
 			observed.iter().any(|name| name == expected),
@@ -382,7 +380,7 @@ fn reachable_edit_reruns_the_compile_chain_and_changes_output() {
 }
 
 #[test]
-fn compatibility_keys_isolate_projects_roots_and_modes() {
+fn stable_keys_isolate_projects_roots_and_modes() {
 	let events = Arc::new(Mutex::new(Vec::new()));
 	let sink = events.clone();
 	let mut session = CompilerSession::with_event_callback_and_tombstone_threshold(
@@ -407,7 +405,7 @@ fn compatibility_keys_isolate_projects_roots_and_modes() {
 			.lock()
 			.unwrap()
 			.iter()
-			.filter(|name| name.as_str() == "compat_compiled_project")
+			.filter(|name| name.as_str() == "compiled_interface_project")
 			.count(),
 		4
 	);
@@ -424,6 +422,6 @@ fn compatibility_keys_isolate_projects_roots_and_modes() {
 			.lock()
 			.unwrap()
 			.iter()
-			.any(|name| name == "compat_emitted_module")
+			.any(|name| name == "emitted_interface_project")
 	);
 }

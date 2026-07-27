@@ -381,7 +381,15 @@ pub(crate) fn compiled_interface_project<'db>(
 			return StableEmissionResult::Diagnostics(diagnostics);
 		}
 	};
-	match bundle::bundle(key.entry(db).as_str(), emitted.module_sources.clone()) {
+	let mut module_sources = emitted.module_sources.clone();
+	if key.builtin_registry(db).modules(db).is_empty()
+		&& let Some(source) = crate::intrinsics::intrinsic_module_sources().remove("std/box")
+	{
+		module_sources
+			.entry("std/box".to_string())
+			.or_insert(source);
+	}
+	match bundle::bundle(key.entry(db).as_str(), module_sources) {
 		Ok(js) => StableEmissionResult::Value(Arc::new(CompiledProject {
 			js,
 			entry_main: "main".to_string(),

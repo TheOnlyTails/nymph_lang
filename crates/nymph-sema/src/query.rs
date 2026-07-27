@@ -1862,7 +1862,13 @@ fn adt_generic_subst(
 	let TyKind::Adt(def_id, args) = checked.interner.kind(ty) else {
 		return FxHashMap::default();
 	};
-	generic_subst_from_adt(&checked.interner, defs, module, params, *def_id, args)
+	let local = checked.semantic.local_definitions.clone();
+	let def_id = if local.contains(&(def_id.0 as usize)) {
+		DefId(def_id.0 - local.start as u32)
+	} else {
+		*def_id
+	};
+	generic_subst_from_adt(&checked.interner, defs, module, params, def_id, args)
 }
 
 /// The surface keyword prefix for a declaration's [`Visibility`] (`"public

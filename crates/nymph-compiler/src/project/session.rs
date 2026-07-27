@@ -313,8 +313,6 @@ pub struct CompilerSession {
 	tombstones: usize,
 	tombstone_threshold: usize,
 	event_callback: Arc<dyn Fn(&str) + Send + Sync>,
-	#[cfg(feature = "test-support")]
-	semantic_pipeline: SemanticPipeline,
 }
 
 impl Default for CompilerSession {
@@ -500,26 +498,14 @@ impl CompilerSession {
 				.project_input(&self.db)
 				.active_modules(&self.db)
 				.contains(&module);
-		#[cfg(feature = "test-support")]
-		if self.semantic_pipeline == SemanticPipeline::Interface {
-			let graph = queries::project_graph(&self.db, key);
-			return (common
-				&& graph.diagnostics.is_empty()
-				&& graph
-					.semantic_order
-					.contains(&SemanticModuleInput::Project(module)))
-			.then(|| {
-				queries::interface_module_analysis(&self.db, key, SemanticModuleInput::Project(module))
-			});
-		}
+		let graph = queries::project_graph(&self.db, key);
 		(common
-			&& super::compat::compat_project_module_is_reachable(&self.db, key, module)
-			&& super::compat::compat_precheck_diagnostics(&self.db, key).is_empty())
+			&& graph.diagnostics.is_empty()
+			&& graph
+				.semantic_order
+				.contains(&SemanticModuleInput::Project(module)))
 		.then(|| {
-			let input = SemanticModuleInput::Project(module);
-			super::compat::compat_module_analysis(&self.db, key, input)
-				.analysis
-				.clone()
+			queries::interface_module_analysis(&self.db, key, SemanticModuleInput::Project(module))
 		})
 	}
 
@@ -797,13 +783,9 @@ impl CompilerSession {
 		ambient_prelude: bool,
 	) -> Arc<[ProjectDiagnostic]> {
 		let key = self.tooling_key(project, entry, ambient_prelude);
-		#[cfg(feature = "test-support")]
-		if self.semantic_pipeline == SemanticPipeline::Interface {
-			return queries::interface_project_diagnostics(&self.db, key)
-				.0
-				.clone();
-		}
-		super::compat::compat_checked_project(&self.db, key)
+		queries::interface_project_diagnostics(&self.db, key)
+			.0
+			.clone()
 	}
 
 	#[must_use]
@@ -871,23 +853,19 @@ impl CompilerSession {
 			tombstones: 0,
 			tombstone_threshold: threshold.max(1),
 			event_callback: callback,
-			#[cfg(feature = "test-support")]
-			semantic_pipeline: SemanticPipeline::CompatibilityFlattened,
 		}
 	}
 
 	#[cfg(feature = "test-support")]
 	#[must_use]
-	pub fn with_semantic_pipeline_for_test(pipeline: SemanticPipeline) -> Self {
-		let mut session = Self::new();
-		session.semantic_pipeline = pipeline;
-		session
+	pub fn with_semantic_pipeline_for_test(_pipeline: SemanticPipeline) -> Self {
+		Self::new()
 	}
 
 	#[cfg(feature = "test-support")]
 	#[must_use]
 	pub fn with_detailed_event_callback_for_test(
-		pipeline: SemanticPipeline,
+		_pipeline: SemanticPipeline,
 		callback: impl Fn(SemanticQueryEvent) + Send + Sync + 'static,
 	) -> Self {
 		let callback: Arc<dyn Fn(SemanticQueryEvent) + Send + Sync> = Arc::new(callback);
@@ -895,7 +873,7 @@ impl CompilerSession {
 		let sources = crate::std_source::embedded_std_sources()
 			.map(|(path, source)| (Arc::from(path), Arc::from(source)))
 			.collect();
-		let mut session = Self::with_builtin_sources(
+		let session = Self::with_builtin_sources(
 			sources,
 			Arc::new(move |query| {
 				public_callback(SemanticQueryEvent {
@@ -906,7 +884,6 @@ impl CompilerSession {
 			}),
 			256,
 		);
-		session.semantic_pipeline = pipeline;
 		session.db.semantic_test_hook.lock().unwrap().callback = Some(callback);
 		session
 	}
@@ -1224,7 +1201,9 @@ impl CompilerSession {
 		mode: EntryMode,
 	) -> Arc<[ProjectDiagnostic]> {
 		let key = self.project_key(project, entry, mode, false, true);
-		super::compat::compat_checked_project(&self.db, key)
+		queries::interface_project_diagnostics(&self.db, key)
+			.0
+			.clone()
 	}
 
 	#[doc(hidden)]
@@ -1236,7 +1215,9 @@ impl CompilerSession {
 		mode: EntryMode,
 	) -> Arc<[ProjectDiagnostic]> {
 		let key = self.project_key(project, entry, mode, false, false);
-		super::compat::compat_checked_project(&self.db, key)
+		queries::interface_project_diagnostics(&self.db, key)
+			.0
+			.clone()
 	}
 
 	pub fn compile_project(
@@ -1256,9 +1237,9 @@ impl CompilerSession {
 		preserve_names: bool,
 	) -> Result<Arc<CompiledProject>, Arc<[ProjectDiagnostic]>> {
 		let key = self.project_key(project, entry, mode, preserve_names, true);
-		match super::compat::compat_compiled_project(&self.db, key).as_ref() {
-			super::compat::CompatCompiledProject::Compiled(compiled) => Ok(compiled.clone()),
-			super::compat::CompatCompiledProject::Diagnostics(diagnostics) => Err(diagnostics.clone()),
+		match super::emission::compiled_interface_project(&self.db, key) {
+			super::emission::StableEmissionResult::Value(compiled) => Ok(compiled),
+			super::emission::StableEmissionResult::Diagnostics(diagnostics) => Err(diagnostics),
 		}
 	}
 
@@ -1282,10 +1263,12 @@ impl CompilerSession {
 		preserve_names: bool,
 	) -> Result<(std::collections::HashMap<String, String>, usize), Arc<[ProjectDiagnostic]>> {
 		let key = self.project_key(project, entry, mode, preserve_names, true);
-		let emitted = super::compat::compat_emitted_module(&self.db, key);
-		match &emitted.module_sources {
-			Ok(sources) => Ok((sources.clone().into_iter().collect(), emitted.entry_tag)),
-			Err(diagnostics) => Err(diagnostics.clone().into()),
+		match super::emission::emitted_interface_project(&self.db, key) {
+			super::emission::StableEmissionResult::Value(emitted) => Ok((
+				emitted.module_sources.clone().into_iter().collect(),
+				emitted.entry_tag,
+			)),
+			super::emission::StableEmissionResult::Diagnostics(diagnostics) => Err(diagnostics),
 		}
 	}
 
