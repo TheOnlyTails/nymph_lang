@@ -188,6 +188,12 @@ fn materialized_fixture(
 			artifact.definition.clone(),
 			EmittedMemberName::new(source_name(&artifact.definition)),
 		);
+		if let nymph_sema::RuntimePayload::External(abi) = &artifact.payload {
+			context.shapes.insert(
+				StableShapeRequest::ExternalAbi(artifact.definition.clone()),
+				StableShapeFact::ExternalAbi(abi.clone()),
+			);
+		}
 	}
 	for implementation in &interface.implementations {
 		context.shapes.insert(
@@ -420,6 +426,138 @@ fn lowers_one_canonical_function_and_value_without_a_module() {
 	assert!(
 		matches!(lowered[1].fragment(), nymph_sema::LoweredHirFragment::TopLevelValue(value) if value.value == nymph_hir::hir::HirExpr::Num(42.0, nymph_hir::hir::NumKind::Int))
 	);
+}
+
+#[test]
+fn top_level_external_value_lowers_to_exact_marshaled_binding() {
+	let (artifacts, _, mut context) = materialized_fixture("external(max_float) let maximum: float");
+	let artifact = artifacts.into_iter().next().unwrap();
+	context.names.insert(
+		artifact.definition.clone(),
+		EmittedBindingName::new("canonical$maximum"),
+	);
+	let lowered = lower_runtime_definition(&context, Arc::new(artifact)).unwrap();
+	assert!(matches!(
+		lowered.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelValue(nymph_hir::hir::HirLet {
+			name,
+			mutable: false,
+			value: nymph_hir::hir::HirExpr::ExternValue {
+				module: "std/math/intrinsics",
+				symbol: "max_float",
+				marshal: nymph_hir::hir::MarshalKind::Float,
+			},
+		}) if name == "canonical$maximum"
+	));
+	assert_eq!(lowered.demands(), []);
+}
+
+#[test]
+fn top_level_external_values_preserve_every_stable_marshal_kind() {
+	let (artifacts, _, _) = materialized_fixture("external(max_float) let maximum: float");
+	let template = artifacts.into_iter().next().unwrap();
+	for marshal in [
+		nymph_hir::hir::MarshalKind::Int,
+		nymph_hir::hir::MarshalKind::UInt,
+		nymph_hir::hir::MarshalKind::Float,
+		nymph_hir::hir::MarshalKind::Char,
+		nymph_hir::hir::MarshalKind::String,
+		nymph_hir::hir::MarshalKind::Boolean,
+		nymph_hir::hir::MarshalKind::List,
+		nymph_hir::hir::MarshalKind::Tuple,
+		nymph_hir::hir::MarshalKind::Map,
+	] {
+		let mut artifact = template.clone();
+		let nymph_sema::RuntimePayload::External(abi) = &mut artifact.payload else {
+			unreachable!()
+		};
+		abi.marshal = Some(marshal);
+		let mut context = Context::default();
+		context.names.insert(
+			artifact.definition.clone(),
+			EmittedBindingName::new("maximum"),
+		);
+		context.shapes.insert(
+			StableShapeRequest::ExternalAbi(artifact.definition.clone()),
+			StableShapeFact::ExternalAbi(abi.clone()),
+		);
+		let lowered = lower_runtime_definition(&context, Arc::new(artifact)).unwrap();
+		assert!(matches!(
+			lowered.fragment(),
+			nymph_sema::LoweredHirFragment::TopLevelValue(nymph_hir::hir::HirLet {
+				value: nymph_hir::hir::HirExpr::ExternValue { marshal: found, .. },
+				..
+			}) if *found == marshal
+		));
+	}
+}
+
+#[test]
+fn malformed_external_artifacts_return_distinct_typed_errors() {
+	let (artifacts, _, mut context) = materialized_fixture("external(max_float) let maximum: float");
+	let artifact = artifacts.into_iter().next().unwrap();
+	let mut missing_module = artifact.clone();
+	let nymph_sema::RuntimePayload::External(abi) = &mut missing_module.payload else {
+		unreachable!()
+	};
+	abi.module = None;
+	context.shapes.insert(
+		StableShapeRequest::ExternalAbi(missing_module.definition.clone()),
+		StableShapeFact::ExternalAbi(abi.clone()),
+	);
+	assert!(matches!(
+		lower_runtime_definition(&context, Arc::new(missing_module)),
+		Err(nymph_sema::StableLoweringError::MissingExternalModule { .. })
+	));
+
+	let mut missing_marshal = artifact.clone();
+	let nymph_sema::RuntimePayload::External(abi) = &mut missing_marshal.payload else {
+		unreachable!()
+	};
+	abi.marshal = None;
+	context.shapes.insert(
+		StableShapeRequest::ExternalAbi(missing_marshal.definition.clone()),
+		StableShapeFact::ExternalAbi(abi.clone()),
+	);
+	assert!(matches!(
+		lower_runtime_definition(&context, Arc::new(missing_marshal)),
+		Err(nymph_sema::StableLoweringError::MissingExternalMarshal { .. })
+	));
+
+	context.shapes.insert(
+		StableShapeRequest::ExternalAbi(artifact.definition.clone()),
+		StableShapeFact::ExternalAbi(nymph_sema::ExternalAbi {
+			marker: "different".into(),
+			module: Some("elsewhere".into()),
+			symbol: Some("different".into()),
+			marshal: Some(nymph_hir::hir::MarshalKind::Float),
+		}),
+	);
+	assert!(matches!(
+		lower_runtime_definition(&context, Arc::new(artifact)),
+		Err(nymph_sema::StableLoweringError::MismatchedExternalAbi { .. })
+	));
+}
+
+#[test]
+fn external_value_reference_requires_its_body_local_stable_marshal_annotation() {
+	let (mut artifacts, _, context) = materialized_fixture(
+		"external(max_float) let maximum: float\nfunc pair(): #(float, float) = #(maximum, maximum)",
+	);
+	let mut pair = artifacts
+		.drain(..)
+		.find(|artifact| source_name(&artifact.definition) == "pair")
+		.unwrap();
+	let nymph_sema::RuntimePayload::NymphBody(body) = &mut pair.payload else {
+		unreachable!()
+	};
+	assert_eq!(body.annotations.external_marshals.len(), 2);
+	body.annotations.external_marshals = Arc::new([]);
+	assert!(matches!(
+		lower_runtime_definition(&context, Arc::new(pair)),
+		Err(nymph_sema::StableLoweringError::MissingAnnotation { channel, .. })
+			if channel == "external marshal"
+	));
 }
 
 #[test]

@@ -176,7 +176,10 @@ impl<T> StableLoweringContext for T where
 pub enum LoweredHirFragment {
 	TopLevelFunction(HirFunc),
 	TopLevelValue(HirLet),
-	TopLevelExternal(ExternalAbi),
+	TopLevelExternal {
+		name: EmittedBindingName,
+		abi: ExternalAbi,
+	},
 	StructShell(HirClass),
 	EnumShell(HirEnum),
 	AttachedInstance {
@@ -274,6 +277,27 @@ pub enum StableLoweringError {
 		node: crate::BodyNodeId,
 		channel: EcoString,
 	},
+	MissingExternalModule {
+		definition: DefinitionId,
+	},
+	MissingExternalSymbol {
+		definition: DefinitionId,
+	},
+	MissingExternalMarshal {
+		definition: DefinitionId,
+	},
+	MismatchedExternalAbi {
+		definition: DefinitionId,
+	},
+	MismatchedExternalMarshal {
+		definition: DefinitionId,
+		expected: nymph_hir::hir::MarshalKind,
+		actual: nymph_hir::hir::MarshalKind,
+	},
+	MismatchedExternalMember {
+		member: DefinitionId,
+		implementation: DefinitionId,
+	},
 	MissingImplementationSlot {
 		implementation: DefinitionId,
 		member: DefinitionId,
@@ -326,14 +350,40 @@ pub fn lower_runtime_definition(
 	let mut demands = StableDemandSet::new();
 	let fragment = match &artifact.payload {
 		crate::RuntimePayload::External(abi) => {
-			context.binding_name(&definition)?;
-			if abi.module.is_some() != abi.symbol.is_some() {
-				return Err(invalid(
-					&definition,
-					"external ABI must provide both module and symbol",
-				));
+			let name = context.binding_name(&definition)?;
+			let exact = external_abi(context, &definition)?;
+			if exact != *abi {
+				return Err(StableLoweringError::MismatchedExternalAbi { definition });
 			}
-			LoweredHirFragment::TopLevelExternal(abi.clone())
+			let module = external_module(&definition, abi)?;
+			let symbol = external_symbol(&definition, abi)?;
+			if matches!(
+				&definition.key,
+				crate::DeclarationKey::TopLevel {
+					category: crate::DeclarationCategory::Let,
+					..
+				}
+			) {
+				let marshal = abi
+					.marshal
+					.ok_or_else(|| StableLoweringError::MissingExternalMarshal {
+						definition: definition.clone(),
+					})?;
+				LoweredHirFragment::TopLevelValue(HirLet {
+					name: name.as_str().into(),
+					mutable: false,
+					value: HirExpr::ExternValue {
+						module,
+						symbol,
+						marshal,
+					},
+				})
+			} else {
+				LoweredHirFragment::TopLevelExternal {
+					name,
+					abi: abi.clone(),
+				}
+			}
 		}
 		crate::RuntimePayload::Struct(shell) => {
 			let name = context.binding_name(&definition)?;
@@ -461,6 +511,43 @@ fn invalid(definition: &DefinitionId, reason: &str) -> StableLoweringError {
 		definition: definition.clone(),
 		reason: reason.into(),
 	}
+}
+
+fn external_abi(
+	context: &impl StableShapeLookup,
+	definition: &DefinitionId,
+) -> Result<ExternalAbi, StableLoweringError> {
+	let request = StableShapeRequest::ExternalAbi(definition.clone());
+	let StableShapeFact::ExternalAbi(abi) = context.stable_shape(&request)? else {
+		return Err(StableShapeLookupError::WrongFact { request }.into());
+	};
+	Ok(abi)
+}
+
+fn external_module(
+	definition: &DefinitionId,
+	abi: &ExternalAbi,
+) -> Result<&'static str, StableLoweringError> {
+	abi
+		.module
+		.as_ref()
+		.map(|module| Box::leak(module.to_string().into_boxed_str()) as &'static str)
+		.ok_or_else(|| StableLoweringError::MissingExternalModule {
+			definition: definition.clone(),
+		})
+}
+
+fn external_symbol(
+	definition: &DefinitionId,
+	abi: &ExternalAbi,
+) -> Result<&'static str, StableLoweringError> {
+	abi
+		.symbol
+		.as_ref()
+		.map(|symbol| Box::leak(symbol.to_string().into_boxed_str()) as &'static str)
+		.ok_or_else(|| StableLoweringError::MissingExternalSymbol {
+			definition: definition.clone(),
+		})
 }
 
 fn stable_runtime_tag(ty: &InterfaceType) -> Option<EcoString> {
@@ -718,6 +805,23 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.find(|(found, _)| *found == id)
 			.map(|(_, target)| target)
 	}
+	fn external_marshal(
+		&self,
+		expr: &Expr,
+	) -> Result<nymph_hir::hir::MarshalKind, StableLoweringError> {
+		let node = self.id(expr);
+		self
+			.annotations
+			.external_marshals
+			.iter()
+			.find(|(id, _)| *id == node)
+			.map(|(_, marshal)| *marshal)
+			.ok_or_else(|| StableLoweringError::MissingAnnotation {
+				definition: self.artifact.definition.clone(),
+				node,
+				channel: "external marshal".into(),
+			})
+	}
 	fn ty(&self, expr: &Expr) -> Result<&InterfaceType, StableLoweringError> {
 		let node = self.id(expr);
 		self
@@ -822,7 +926,30 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				}
 				if let Some(target) = self.target(expr) {
 					let emitted = self.context.binding_name(target)?;
-					if target.module != self.artifact.definition.module {
+					let target_artifact = self.context.runtime_definition(target)?;
+					if let crate::RuntimePayload::External(payload_abi) = &target_artifact.payload {
+						let abi = external_abi(self.context, target)?;
+						if abi != *payload_abi {
+							return Err(StableLoweringError::MismatchedExternalAbi {
+								definition: target.clone(),
+							});
+						}
+						let expected =
+							abi
+								.marshal
+								.ok_or_else(|| StableLoweringError::MissingExternalMarshal {
+									definition: target.clone(),
+								})?;
+						let actual = self.external_marshal(expr)?;
+						if expected != actual {
+							return Err(StableLoweringError::MismatchedExternalMarshal {
+								definition: target.clone(),
+								expected,
+								actual,
+							});
+						}
+						self.demands.borrow_mut().insert(target.clone());
+					} else if target.module != self.artifact.definition.module {
 						self.context.module_specifier(&target.module)?;
 						self.demands.borrow_mut().insert(target.clone());
 					}
@@ -1226,7 +1353,21 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				member,
 				implementation,
 				..
-			} => (member.clone(), Some(implementation.clone()), true),
+			} => {
+				let request = StableShapeRequest::Implementation(implementation.clone());
+				let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
+					return Err(StableShapeLookupError::WrongFact { request }.into());
+				};
+				let slot = shape
+					.member_slots
+					.iter()
+					.find(|slot| slot.interface_member_id == *member || slot.member_id == *member)
+					.ok_or_else(|| StableLoweringError::MismatchedExternalMember {
+						member: member.clone(),
+						implementation: implementation.clone(),
+					})?;
+				(slot.member_id.clone(), Some(slot.member_id.clone()), true)
+			}
 		};
 		let materialized_member = self.implementation_slots.and_then(|slots| {
 			slots
@@ -1243,7 +1384,6 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		if let Some(demand) = demand {
 			self.demands.borrow_mut().insert(demand);
 		}
-		let name: EcoString = self.context.member_name(&member)?.as_str().into();
 		if external {
 			let fact = self
 				.context
@@ -1277,6 +1417,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				args,
 			});
 		}
+		let name: EcoString = self.context.member_name(&member)?.as_str().into();
 		Ok(HirExpr::Call {
 			callee: Box::new(HirExpr::Field {
 				recv: Box::new(self.lower(receiver)?),

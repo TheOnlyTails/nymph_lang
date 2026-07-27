@@ -246,12 +246,15 @@ fn lowered_fragments_encode_placement_and_ordered_deduplicated_demands() {
 		body: HirExpr::Bool(false),
 	};
 	let variants = [
-		LoweredHirFragment::TopLevelExternal(ExternalAbi {
-			marker: "host".into(),
-			module: None,
-			symbol: None,
-			marshal: None,
-		}),
+		LoweredHirFragment::TopLevelExternal {
+			name: EmittedBindingName::new("host"),
+			abi: ExternalAbi {
+				marker: "host".into(),
+				module: None,
+				symbol: None,
+				marshal: None,
+			},
+		},
 		LoweredHirFragment::StructShell(HirClass {
 			name: "Counter".into(),
 			fields: vec![],
