@@ -314,6 +314,23 @@ fn namespace_and_with_together_run_under_node() {
 	let out = run_project(files, "result", "");
 	assert_eq!(out, "20");
 }
+
+#[test]
+fn imported_direct_and_default_interface_methods_run_under_node() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/dep with (Cell)\nfunc main(): void = {}\nfunc result(): int = Cell(value = 2).read() + Cell(value = 3).twice()",
+		),
+		(
+			"dep",
+			"public interface Read<Output> { func read(): Output\nfunc twice(): Output = this.read() }\npublic struct Cell(value: int) { impl Read<Output = int> { func read(): int = this.value } }",
+		),
+	]);
+
+	assert_eq!(run_project(files, "result", ""), "5");
+}
+
 #[test]
 fn imported_struct_construction_lowers_to_new_not_a_plain_call() {
 	// Regression pin for the cross-module `struct_names` gap `lower_hir.rs`

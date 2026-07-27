@@ -1165,7 +1165,8 @@ fn golden_string_pattern_match_with_escapes() {
 		r#"
 		func classify(s: string): int = match (s) {
 			"a\nb" -> 1,
-			"tab\there" -> 2,
+			"a\\nb" -> 2,
+			"tab\there" -> 3,
 			_ -> 0,
 		}
 		"#,
@@ -1804,6 +1805,8 @@ fn golden_run_strings_escapes_interpolation_and_patterns() {
 	// append, and a string PATTERN with escapes, all executed under Node.
 	let src = r#"
 		func greet(name: string, n: int): string = "Hello, ${name}! n=${n}\n"
+		func newline(): string = "line\nfeed"
+		func backslash_n(): string = "line\\nfeed"
 		func label(a: string, b: string): string = {
 			let mut s = a
 			s += "-"
@@ -1813,7 +1816,8 @@ fn golden_run_strings_escapes_interpolation_and_patterns() {
 		func same(a: string, b: string): boolean = a == b
 		func classify(s: string): int = match (s) {
 			"a\nb" -> 1,
-			"tab\there" -> 2,
+			"a\\nb" -> 2,
+			"tab\there" -> 3,
 			_ -> 0,
 		}
 	"#;
@@ -1821,6 +1825,8 @@ fn golden_run_strings_escapes_interpolation_and_patterns() {
 		run(src, r#"greet(new NString("World"), new NInt(5))"#),
 		"Hello, World! n=5"
 	);
+	assert_eq!(run(src, "newline()"), "line\nfeed");
+	assert_eq!(run(src, "backslash_n()"), r"line\nfeed");
 	assert_eq!(
 		run(src, r#"label(new NString("x"), new NString("y"))"#),
 		"x-y"
@@ -1833,8 +1839,16 @@ fn golden_run_strings_escapes_interpolation_and_patterns() {
 		run(src, r#"same(new NString("x"), new NString("y"))"#),
 		"false"
 	);
-	assert_eq!(run(src, r#"classify(new NString("a\nb"))"#), "1");
-	assert_eq!(run(src, r#"classify(new NString("tab\there"))"#), "2");
+	assert_eq!(
+		run(
+			src,
+			r#"classify(new NString(`a
+b`))"#
+		),
+		"1"
+	);
+	assert_eq!(run(src, r#"classify(new NString(String.raw`a\nb`))"#), "2");
+	assert_eq!(run(src, "classify(new NString(`tab\there`))"), "3");
 	assert_eq!(run(src, r#"classify(new NString("nope"))"#), "0");
 }
 

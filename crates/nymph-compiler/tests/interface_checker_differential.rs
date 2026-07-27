@@ -5,7 +5,10 @@ use std::sync::{Arc, Mutex};
 use nymph_compiler::project::{
 	CompilerSession, ModulePath, ProjectId, SemanticPipeline, SemanticQueryEvent, SourceVersion,
 };
-use nymph_sema::EntryMode;
+use nymph_sema::{
+	DeclarationCategory, DeclarationKey, DefinitionId, DispatchKind, EntryMode, InterfaceType,
+	StableDispatch,
+};
 
 fn path(value: &str) -> ModulePath {
 	ModulePath::new(value).unwrap()
@@ -31,6 +34,13 @@ struct Outcome {
 	resolutions: Vec<(u32, String, String, Option<String>, Option<String>)>,
 	variants: Vec<(u32, String)>,
 	pattern_variants: Vec<(usize, usize, String)>,
+	exact_types: Vec<(u32, InterfaceType)>,
+	exact_resolutions: Vec<(
+		u32,
+		DispatchKind,
+		Option<DefinitionId>,
+		Option<DefinitionId>,
+	)>,
 }
 
 fn run_matrix_fixture(case: &MatrixFixture, pipeline: SemanticPipeline) -> Outcome {
@@ -84,6 +94,11 @@ fn run_matrix_fixture(case: &MatrixFixture, pipeline: SemanticPipeline) -> Outco
 		.iter()
 		.map(|(id, ty)| (id.0, format!("{ty:?}")))
 		.collect();
+	let exact_types = stable
+		.types
+		.iter()
+		.map(|(id, ty)| (id.0, ty.clone()))
+		.collect();
 	let entry_source_len = case
 		.modules
 		.iter()
@@ -107,6 +122,13 @@ fn run_matrix_fixture(case: &MatrixFixture, pipeline: SemanticPipeline) -> Outco
 			)
 		})
 		.collect();
+	let exact_resolutions = stable
+		.resolutions
+		.iter()
+		.map(|(id, _, dispatch, target, implementation)| {
+			(id.0, *dispatch, target.clone(), implementation.clone())
+		})
+		.collect();
 	let variants = stable
 		.variants
 		.iter()
@@ -125,6 +147,155 @@ fn run_matrix_fixture(case: &MatrixFixture, pipeline: SemanticPipeline) -> Outco
 		resolutions,
 		variants,
 		pattern_variants,
+		exact_types,
+		exact_resolutions,
+	}
+}
+
+fn assert_category_6_exact_semantics(case: &MatrixFixture) {
+	let mut session = fixture(SemanticPipeline::Interface);
+	let project = ProjectId::new(format!("differential-{}", case.category));
+	for (index, (module, source)) in case.modules.iter().enumerate() {
+		session.set_source(
+			project.clone(),
+			path(module),
+			(*source).into(),
+			SourceVersion(index as i64 + 1),
+		);
+	}
+	let interface = session
+		.compat_module_interface(project, path(case.entry), path("dep"), case.mode)
+		.expect("category 6 dependency interface exists");
+	let read_interface = DefinitionId::new(
+		interface.module.clone(),
+		DeclarationKey::top_level(DeclarationCategory::Interface, "Read"),
+	);
+	let cell = DefinitionId::new(
+		interface.module.clone(),
+		DeclarationKey::top_level(DeclarationCategory::Struct, "Cell"),
+	);
+	let read = DefinitionId::new(
+		interface.module.clone(),
+		DeclarationKey::member(read_interface.clone(), DeclarationCategory::Method, "read"),
+	);
+	let twice = DefinitionId::new(
+		interface.module.clone(),
+		DeclarationKey::member(read_interface.clone(), DeclarationCategory::Method, "twice"),
+	);
+	let implementation = interface
+		.implementations
+		.iter()
+		.find(|implementation| {
+			implementation.interface.as_ref() == Some(&read_interface)
+				&& matches!(
+					&implementation.self_type,
+					InterfaceType::Named { definition, .. } if definition == &cell
+				)
+		})
+		.expect("exact Cell Read implementation exists");
+	assert!(
+		implementation
+			.interface_arguments
+			.iter()
+			.any(|(name, ty)| name == "Output" && ty == &InterfaceType::Int)
+	);
+	let read_body = implementation
+		.member_slots
+		.iter()
+		.find(|slot| slot.interface_member_id == read)
+		.expect("exact Read.read slot exists")
+		.clone();
+	let twice_body = implementation
+		.member_slots
+		.iter()
+		.find(|slot| slot.interface_member_id == twice)
+		.expect("exact Read.twice slot exists")
+		.clone();
+	assert_eq!(
+		read_body.source,
+		nymph_sema::ImplementationMemberSource::Override
+	);
+	assert_eq!(
+		twice_body.source,
+		nymph_sema::ImplementationMemberSource::InheritedDefault
+	);
+	let read_lowered = session
+		.lower_runtime_definition(
+			ProjectId::new(format!("differential-{}", case.category)),
+			path(case.entry),
+			read_body.member_id.clone(),
+			case.mode,
+		)
+		.expect("exact direct implementation member lowers");
+	let twice_lowered = session
+		.lower_runtime_definition(
+			ProjectId::new(format!("differential-{}", case.category)),
+			path(case.entry),
+			twice_body.member_id.clone(),
+			case.mode,
+		)
+		.expect("exact inherited default member lowers");
+	assert_eq!(
+		read_lowered.placement(),
+		&nymph_sema::RuntimeAssemblyPlacement::Shell(cell.clone())
+	);
+	assert_eq!(
+		twice_lowered.placement(),
+		&nymph_sema::RuntimeAssemblyPlacement::Shell(cell)
+	);
+	assert!(matches!(
+		twice_lowered.fragment(),
+		nymph_sema::LoweredHirFragment::MaterializedDefault {
+			implementation: found,
+			interface_member,
+			..
+		} if found == &implementation.id && interface_member == &twice
+	));
+	let runtimes = session
+		.runtime_definitions_for_test(
+			ProjectId::new(format!("differential-{}", case.category)),
+			path(case.entry),
+			path(case.entry),
+			case.mode,
+		)
+		.expect("category 6 entry runtime definitions exist");
+	let runtime = runtimes
+		.iter()
+		.find(|runtime| matches!(&runtime.definition.key, DeclarationKey::TopLevel { category: DeclarationCategory::Function, name, .. } if name == "result"))
+		.unwrap_or_else(|| panic!("category 6 result runtime body exists: {runtimes:?}"));
+	let nymph_sema::RuntimePayload::NymphBody(body) = &runtime.payload else {
+		panic!("category 6 result must have a Nymph body");
+	};
+	let read_node = body
+		.annotations
+		.dispatches
+		.iter()
+		.find_map(|(node, dispatch)| {
+			matches!(dispatch, StableDispatch::SelectedImplementation { member, implementation: found, .. }
+				if member == &read_body.member_id && found == &implementation.id)
+			.then_some(*node)
+		})
+		.expect("exact read implementation call node exists");
+	let twice_node = body
+		.annotations
+		.dispatches
+		.iter()
+		.find_map(|(node, dispatch)| {
+			matches!(dispatch, StableDispatch::InterfaceDefault { member, implementation: found, .. }
+				if member == &twice_body.member_id && found == &implementation.id)
+			.then_some(*node)
+		})
+		.expect("exact twice implementation call node exists");
+	for node in [nymph_sema::BodyNodeId(0), read_node, twice_node] {
+		assert_eq!(
+			body
+				.annotations
+				.types
+				.iter()
+				.find(|(found, _)| *found == node)
+				.map(|(_, ty)| ty),
+			Some(&InterfaceType::Int),
+		);
 	}
 }
 
@@ -216,7 +387,7 @@ fn full_differential_fixture_matrix() {
 				),
 				(
 					"main",
-					"import @/dep\nfunc main(): int = Cell(value = 2).read() + Cell(value = 3).twice()",
+					"import @/dep with (Cell)\nfunc main(): void = {}\nfunc result(): int = Cell(value = 2).read() + Cell(value = 3).twice()",
 				),
 			],
 			entry: "main",
@@ -358,35 +529,7 @@ fn full_differential_fixture_matrix() {
 			);
 		}
 		if case.category == "interfaces-associated-direct-default" {
-			let read = interface
-				.resolutions
-				.iter()
-				.find(|(_, method, _, _, _)| method == "read")
-				.expect("category 6 records the direct impl method call");
-			assert_eq!(read.2, "UserImpl");
-			assert!(read.3.as_ref().is_some_and(|target| {
-				target.contains("key: Implementation") && target.contains("name: \"read\"")
-			}));
-			assert!(
-				read
-					.4
-					.as_ref()
-					.is_some_and(|implementation| implementation.contains("key: Implementation"))
-			);
-			let twice = interface
-				.resolutions
-				.iter()
-				.find(|(_, method, _, _, _)| method == "twice")
-				.expect("category 6 records the selected interface default call");
-			assert_eq!(twice.2, "UserImplDefaultMethod");
-			assert!(twice.3.as_ref().is_some_and(|target| {
-				target.contains("category: Method") && target.contains("name: \"twice\"")
-			}));
-			assert_eq!(twice.4, read.4);
-			assert!(
-				interface.types.iter().filter(|(_, ty)| ty == "Int").count() >= 3,
-				"both associated-output method calls and their sum have int type"
-			);
+			assert_category_6_exact_semantics(&case);
 		}
 	}
 }

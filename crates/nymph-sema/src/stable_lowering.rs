@@ -1154,7 +1154,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						.iter()
 						.map(|part| match &part.0 {
 							StringPart::Text(text) => text.to_string(),
-							StringPart::EscapeSequence(escape) => escape.to_string(),
+							StringPart::EscapeSequence(escape) => cooked_escape(*escape),
 							_ => unreachable!(),
 						})
 						.collect::<String>()
@@ -1976,7 +1976,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		for part in parts {
 			match &part.0 {
 				StringPart::Text(value) => text.push_str(value),
-				StringPart::EscapeSequence(value) => text.push_str(&value.to_string()),
+				StringPart::EscapeSequence(value) => text.push_str(&cooked_escape(*value)),
 				StringPart::InterpolatedExpr(value) => {
 					interpolated = true;
 					if !text.is_empty() {
@@ -2550,6 +2550,12 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 	}
 }
 
+fn cooked_escape(escape: nymph_ast::expr::StringEscape) -> String {
+	escape
+		.to_char()
+		.map_or_else(|| "${".to_string(), |character| character.to_string())
+}
+
 fn binop(op: BinaryOperator) -> Option<BinOp> {
 	Some(match op {
 		BinaryOperator::Plus => BinOp::Add,
@@ -2694,7 +2700,7 @@ fn string_pattern(parts: &[nymph_ast::Spanned<nymph_ast::expr::StringPatternPart
 		match &part.0 {
 			nymph_ast::expr::StringPatternPart::Text(text) => result.push_str(text),
 			nymph_ast::expr::StringPatternPart::EscapeSequence(escape) => {
-				result.push_str(&escape.to_string())
+				result.push_str(&cooked_escape(*escape))
 			}
 		}
 	}

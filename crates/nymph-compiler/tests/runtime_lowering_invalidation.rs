@@ -3,11 +3,79 @@
 use std::sync::{Arc, Mutex};
 
 use nymph_compiler::project::{
-	CompilerSession, ModulePath, ProjectId, SemanticPipeline, SemanticQueryEvent, SourceVersion,
+	AmbientCoreModuleKey, CompilerSession, ModulePath, ProjectId, SemanticPipeline,
+	SemanticQueryEvent, SourceVersion,
 };
 use nymph_sema::{
-	DeclarationCategory, DeclarationKey, DefinitionId, EntryMode, ModuleIdentity, ModuleOrigin,
+	DeclarationCategory, DeclarationKey, DefinitionId, EntryMode, InterfaceType, ModuleIdentity,
+	ModuleInterface, ModuleOrigin,
 };
+
+fn hir_contains(
+	expr: &nymph_hir::hir::HirExpr,
+	predicate: &impl Fn(&nymph_hir::hir::HirExpr) -> bool,
+) -> bool {
+	use nymph_hir::hir::{HirArrayElem, HirExpr, HirMapElem, HirStmt};
+
+	if predicate(expr) {
+		return true;
+	}
+	let contains = |expr| hir_contains(expr, predicate);
+	match expr {
+		HirExpr::InterpolatedString(items) | HirExpr::Array { items, .. } => items.iter().any(contains),
+		HirExpr::Call { callee, args } => contains(callee) || args.iter().any(contains),
+		HirExpr::ExternCall { args, .. } => args.iter().any(contains),
+		HirExpr::BoundDispatch {
+			receiver, argument, ..
+		} => contains(receiver) || contains(argument),
+		HirExpr::ArraySpread { elems, .. } => elems.iter().any(|elem| match elem {
+			HirArrayElem::Item(expr) | HirArrayElem::Spread(expr) => contains(expr),
+		}),
+		HirExpr::MapLit(entries) => entries
+			.iter()
+			.any(|(key, value)| contains(key) || contains(value)),
+		HirExpr::MapSpread(entries) => entries.iter().any(|entry| match entry {
+			HirMapElem::Entry(key, value) => contains(key) || contains(value),
+			HirMapElem::Spread(expr) => contains(expr),
+		}),
+		HirExpr::Index { recv, index } => contains(recv) || contains(index),
+		HirExpr::MapGet { recv, key } => contains(recv) || contains(key),
+		HirExpr::New { fields, .. } | HirExpr::VariantNew { fields, .. } => {
+			fields.iter().any(|(_, value)| contains(value))
+		}
+		HirExpr::Field { recv, .. } => contains(recv),
+		HirExpr::Binary { lhs, rhs, .. } => contains(lhs) || contains(rhs),
+		HirExpr::Unary { operand, .. } | HirExpr::ScalarCast { operand, .. } => contains(operand),
+		HirExpr::Assign { target, value } => contains(target) || contains(value),
+		HirExpr::Block { stmts, tail } => {
+			stmts.iter().any(|stmt| match stmt {
+				HirStmt::Let { value, .. } | HirStmt::Expr(value) => contains(value),
+				HirStmt::Return(value) => value.as_ref().is_some_and(contains),
+			}) || tail.as_ref().is_some_and(|tail| contains(tail))
+		}
+		HirExpr::If {
+			cond,
+			then,
+			otherwise,
+		} => contains(cond) || contains(then) || otherwise.as_ref().is_some_and(|expr| contains(expr)),
+		HirExpr::While { cond, body } => contains(cond) || contains(body),
+		HirExpr::Match { scrutinee, arms } => {
+			contains(scrutinee)
+				|| arms
+					.iter()
+					.any(|arm| arm.guard.as_ref().is_some_and(contains) || contains(&arm.body))
+		}
+		HirExpr::Closure { body, .. } => contains(body),
+		HirExpr::Num(..)
+		| HirExpr::Str(_)
+		| HirExpr::Bool(_)
+		| HirExpr::Char(_)
+		| HirExpr::Local(_)
+		| HirExpr::This
+		| HirExpr::ExternValue { .. }
+		| HirExpr::VariantRef { .. } => false,
+	}
+}
 
 fn id(project: &str, name: &str) -> DefinitionId {
 	DefinitionId::new(
@@ -18,6 +86,70 @@ fn id(project: &str, name: &str) -> DefinitionId {
 		},
 		DeclarationKey::top_level(DeclarationCategory::Function, name),
 	)
+}
+
+fn top_level(
+	interface: &ModuleInterface,
+	category: DeclarationCategory,
+	name: &str,
+) -> DefinitionId {
+	DefinitionId::new(
+		interface.module.clone(),
+		DeclarationKey::top_level(category, name),
+	)
+}
+
+fn member(owner: &DefinitionId, name: &str) -> DefinitionId {
+	DefinitionId::new(
+		owner.module.clone(),
+		DeclarationKey::member(owner.clone(), DeclarationCategory::Method, name),
+	)
+}
+
+fn ambient_iteration_demands(session: &CompilerSession) -> [DefinitionId; 2] {
+	let iterator_module = session
+		.ambient_core_module_interface(AmbientCoreModuleKey::new("iter").unwrap())
+		.expect("Iterator ambient interface exists");
+	let iterator = top_level(&iterator_module, DeclarationCategory::Interface, "Iterator");
+	let next = member(&iterator, "next");
+	let iterable_module = session
+		.ambient_core_module_interface(AmbientCoreModuleKey::new("iter/iterable").unwrap())
+		.expect("Iterable ambient interface exists");
+	let iterable = top_level(&iterable_module, DeclarationCategory::Interface, "Iterable");
+	let iter = member(&iterable, "iter");
+	let list_iter = top_level(&iterable_module, DeclarationCategory::Struct, "ListIter");
+	let next_body = iterable_module
+		.implementations
+		.iter()
+		.find(|implementation| {
+			implementation.interface.as_ref() == Some(&iterator)
+				&& matches!(
+					&implementation.self_type,
+					InterfaceType::Named { definition, .. } if definition == &list_iter
+				)
+		})
+		.expect("exact ListIter Iterator implementation exists")
+		.member_slots
+		.iter()
+		.find(|slot| slot.interface_member_id == next)
+		.expect("exact Iterator.next slot exists")
+		.member_id
+		.clone();
+	let iter_body = iterable_module
+		.implementations
+		.iter()
+		.find(|implementation| {
+			implementation.interface.as_ref() == Some(&iterable)
+				&& matches!(&implementation.self_type, InterfaceType::List(_))
+		})
+		.expect("exact List Iterable implementation exists")
+		.member_slots
+		.iter()
+		.find(|slot| slot.interface_member_id == iter)
+		.expect("exact Iterable.iter slot exists")
+		.member_id
+		.clone();
+	[next_body, iter_body]
 }
 
 #[test]
@@ -107,20 +239,33 @@ func inclusive(): int = { let mut total = 0 for (x in 1..=4) { total = total + x
 			EntryMode::Library,
 		)
 		.expect("native List update and iteration lower through exact ambient facts");
-	assert!(matches!(
-		list.fragment(),
-		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
-			if matches!(&function.body, nymph_hir::hir::HirExpr::Block { stmts, .. }
-				if matches!(&stmts[0], nymph_hir::hir::HirStmt::Expr(nymph_hir::hir::HirExpr::Assign { target, .. })
-					if matches!(target.as_ref(), nymph_hir::hir::HirExpr::Index { .. }))
-				&& matches!(&stmts[2], nymph_hir::hir::HirStmt::Expr(nymph_hir::hir::HirExpr::Block { stmts, .. })
-					if matches!(&stmts[0], nymph_hir::hir::HirStmt::Let { value: nymph_hir::hir::HirExpr::Call { callee, .. }, .. }
-						if matches!(callee.as_ref(), nymph_hir::hir::HirExpr::Field { name, .. } if name == "iter"))
-					&& matches!(&stmts[2], nymph_hir::hir::HirStmt::Expr(nymph_hir::hir::HirExpr::While { .. }))))
-	));
-	assert_eq!(list.demands(), []);
-	for name in ["list_sum", "exclusive", "inclusive"] {
-		session
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = list.fragment() else {
+		panic!("list_sum must lower to a top-level function");
+	};
+	let iter_body = ambient_iteration_demands(&session)[1].clone();
+	let iter_binding = session
+		.binding_name_for_test(project.clone(), main.clone(), iter_body, EntryMode::Library)
+		.expect("selected List.iter body has an authoritative binding name");
+	assert!(hir_contains(&function.body, &|expr| matches!(
+		expr,
+		nymph_hir::hir::HirExpr::Assign { target, .. }
+			if matches!(target.as_ref(), nymph_hir::hir::HirExpr::Index { .. })
+	)));
+	assert!(hir_contains(&function.body, &|expr| matches!(
+		expr,
+		nymph_hir::hir::HirExpr::Call { callee, args }
+			if args.len() == 1 && matches!(
+				callee.as_ref(),
+				nymph_hir::hir::HirExpr::Local(name) if name == iter_binding.as_str()
+			)
+	)));
+	assert!(hir_contains(&function.body, &|expr| matches!(
+		expr,
+		nymph_hir::hir::HirExpr::While { .. }
+	)));
+	assert_eq!(list.demands(), ambient_iteration_demands(&session));
+	for name in ["exclusive", "inclusive"] {
+		let lowered = session
 			.lower_runtime_definition(
 				project.clone(),
 				main.clone(),
@@ -128,6 +273,18 @@ func inclusive(): int = { let mut total = 0 for (x in 1..=4) { total = total + x
 				EntryMode::Library,
 			)
 			.unwrap_or_else(|error| panic!("{name} must lower through exact ambient facts: {error:?}"));
+		let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+			panic!("{name} must lower to a top-level function");
+		};
+		assert!(hir_contains(&function.body, &|expr| matches!(
+			expr,
+			nymph_hir::hir::HirExpr::While { .. }
+		)));
+		assert_eq!(
+			lowered.demands(),
+			[],
+			"{name} has no runtime definition demands"
+		);
 	}
 }
 
