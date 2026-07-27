@@ -48,6 +48,7 @@
 
 mod bundle;
 mod compat;
+mod emission;
 mod metrics;
 mod queries;
 mod resolve;
@@ -58,6 +59,9 @@ pub use session::{
 	AmbientCoreModuleKey, BuiltinRuntimeOwnerArtifact, BuiltinRuntimeOwnerShape, CompilerSession,
 	ModuleAnalysis, ModulePath, ProjectDiagnostics, ProjectId, RuntimeDefinitionError, SourceVersion,
 };
+
+#[cfg(feature = "test-support")]
+pub use emission::StableEmittedProject;
 
 #[cfg(feature = "test-support")]
 pub use session::{SemanticPipeline, SemanticQueryEvent};

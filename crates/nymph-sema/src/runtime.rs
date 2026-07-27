@@ -207,8 +207,7 @@ pub fn runtime_definitions(
 	let shape = |category, name: &str| {
 		shapes.iter().copied().find(|shape| matches!(&shape.id.key, crate::DeclarationKey::TopLevel { category: found, .. } if *found == category) && shape.name == name)
 	};
-	let implementation_bindings = implementation_bindings(module, checked)?;
-	for declaration in &module.members {
+	for (declaration_index, declaration) in module.members.iter().enumerate() {
 		match declaration {
 			nymph_ast::decl::Declaration::Func { meta, body, .. } => {
 				let definition = required_top_level(checked, &meta.name.0)?;
@@ -307,15 +306,19 @@ pub fn runtime_definitions(
 					payload,
 				});
 				extract_members(&mut result, members, &item.members, source, checked)?;
-				for nested in impls {
-					let implementation =
-						required_implementation(interface, &implementation_bindings, &nested.0.members)?;
+				for (nested_index, nested) in impls.iter().enumerate() {
+					let path = crate::annotate::ImplementationSourcePath {
+						declaration: declaration_index as u32,
+						nested: Some(nested_index as u32),
+					};
+					let implementation = required_implementation(interface, checked, path)?;
 					extract_implementation_members(
 						&mut result,
 						&nested.0.members,
 						implementation,
 						source,
 						checked,
+						path,
 					)?;
 				}
 			}
@@ -326,14 +329,25 @@ pub fn runtime_definitions(
 			}
 			nymph_ast::decl::Declaration::Impl { members, .. }
 			| nymph_ast::decl::Declaration::ImplFor { members, .. } => {
-				let implementation = required_implementation(interface, &implementation_bindings, members)?;
-				extract_implementation_members(&mut result, members, implementation, source, checked)?;
+				let path = crate::annotate::ImplementationSourcePath {
+					declaration: declaration_index as u32,
+					nested: None,
+				};
+				let implementation = required_implementation(interface, checked, path)?;
+				extract_implementation_members(
+					&mut result,
+					members,
+					implementation,
+					source,
+					checked,
+					path,
+				)?;
 			}
 			nymph_ast::decl::Declaration::Interface { name, members, .. } => {
 				let item = shape(crate::DeclarationCategory::Interface, &name.0)
 					.ok_or_else(|| RuntimeExtractionError::MissingStableId(name.0.clone()))?;
 				let mut defaults = item.members.iter();
-				for member in members {
+				for (interface_member_index, member) in members.iter().enumerate() {
 					match &member.0 {
 						InterfaceMember::Element(element) => {
 							let member = defaults
@@ -368,14 +382,18 @@ pub fn runtime_definitions(
 							}
 						}
 						InterfaceMember::Impl { members, .. } => {
-							let implementation =
-								required_implementation(interface, &implementation_bindings, members)?;
+							let path = crate::annotate::ImplementationSourcePath {
+								declaration: declaration_index as u32,
+								nested: Some(interface_member_index as u32),
+							};
+							let implementation = required_implementation(interface, checked, path)?;
 							extract_implementation_members(
 								&mut result,
 								members,
 								implementation,
 								source,
 								checked,
+								path,
 							)?;
 						}
 					}
@@ -428,6 +446,7 @@ pub enum RuntimeExtractionError {
 	IncompleteCanonicalType,
 	MissingStableId(EcoString),
 	MissingImplementation,
+	MissingSourceIdentity,
 	MissingExternalAbi,
 	IncompleteDispatchTarget(EcoString),
 	IncompleteVariantTarget(EcoString),
@@ -523,58 +542,19 @@ fn extract_members(
 
 fn required_implementation<'a>(
 	interface: &'a crate::ModuleInterface,
-	bindings: &std::collections::BTreeMap<usize, DefinitionId>,
-	members: &Vec<nymph_ast::Spanned<ImplMember>>,
+	checked: &crate::CheckedFacts,
+	path: crate::annotate::ImplementationSourcePath,
 ) -> Result<&'a crate::ExportedImpl, RuntimeExtractionError> {
-	let id = bindings
-		.get(&(members as *const Vec<_> as usize))
-		.ok_or(RuntimeExtractionError::MissingImplementation)?;
+	let id = checked
+		.source_identities
+		.implementations
+		.get(&path)
+		.ok_or(RuntimeExtractionError::MissingSourceIdentity)?;
 	interface
 		.implementations
 		.iter()
 		.find(|implementation| &implementation.id == id)
 		.ok_or(RuntimeExtractionError::MissingImplementation)
-}
-
-/// Associates source declarations with the exact identities assigned before
-/// body checking. The ordering here mirrors collection, but projection retains
-/// only declaration-address → stable-ID facts; it never compares member shapes.
-fn implementation_bindings(
-	module: &nymph_ast::decl::Module,
-	checked: &crate::CheckedFacts,
-) -> Result<std::collections::BTreeMap<usize, DefinitionId>, RuntimeExtractionError> {
-	let mut syntax = module
-		.members
-		.iter()
-		.filter_map(|declaration| match declaration {
-			nymph_ast::decl::Declaration::ImplFor { members, .. } => Some(members),
-			_ => None,
-		})
-		.chain(module.members.iter().flat_map(|declaration| {
-			match declaration {
-				nymph_ast::decl::Declaration::Struct { impls, .. }
-				| nymph_ast::decl::Declaration::Enum { impls, .. } => impls
-					.iter()
-					.map(|implementation| &implementation.0.members)
-					.collect::<Vec<_>>(),
-				_ => Vec::new(),
-			}
-		}))
-		.collect::<Vec<_>>();
-	let implementations =
-		&checked.semantic.implementations.impls[checked.semantic.local_implementations.clone()];
-	if syntax.len() != implementations.len() {
-		return Err(RuntimeExtractionError::MissingImplementation);
-	}
-	let mut result = std::collections::BTreeMap::new();
-	for (members, implementation) in syntax.drain(..).zip(implementations) {
-		let id = implementation
-			.definition
-			.clone()
-			.ok_or(RuntimeExtractionError::MissingImplementation)?;
-		result.insert(members as *const _ as usize, id);
-	}
-	Ok(result)
 }
 
 fn extract_implementation_members(
@@ -583,19 +563,31 @@ fn extract_implementation_members(
 	implementation: &crate::ExportedImpl,
 	source: &str,
 	checked: &crate::CheckedFacts,
+	path: crate::annotate::ImplementationSourcePath,
 ) -> Result<(), RuntimeExtractionError> {
-	for syntax in syntax {
+	for (member_index, syntax) in syntax.iter().enumerate() {
 		let name = match &syntax.0 {
 			ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => meta.name.0.as_str(),
 			ImplMember::Let { meta, .. } | ImplMember::ExternalLet(_, _, meta) => binding_name(meta)?,
 		};
-		let existing = implementation
+		let definition = checked
+			.source_identities
+			.members
+			.get(&crate::annotate::ImplementationMemberSourcePath {
+				implementation: path,
+				member: member_index as u32,
+			})
+			.cloned()
+			.ok_or(RuntimeExtractionError::MissingSourceIdentity)?;
+		if !implementation
 			.members
 			.iter()
-			.find(|member| member.name == name);
-		let definition = existing
-			.map(|member| member.id.clone())
-			.ok_or(RuntimeExtractionError::MissingImplementation)?;
+			.any(|member| member.id == definition)
+		{
+			return Err(RuntimeExtractionError::CorruptImplementationMemberMapping(
+				definition,
+			));
+		}
 		let placement = RuntimePlacement::Attached {
 			owner: implementation.id.clone(),
 			name: name.into(),

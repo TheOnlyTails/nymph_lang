@@ -5,6 +5,7 @@ use nymph_ast::{
 	decl::{Declaration, Module},
 };
 use nymph_diagnostics::Diagnostic;
+use nymph_sema::StableShapeLookup;
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -561,6 +562,44 @@ pub(crate) fn runtime_definition_index<'db>(
 		.into()
 }
 
+/// Runtime-bearing identities owned by `module`, in language output order.
+/// This is intentionally distinct from lookup: module assembly depends on the
+/// identities, then requests each body through its exact per-definition query.
+#[salsa::tracked(returns(clone))]
+pub(crate) fn runtime_definition_ids<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	module: SemanticModuleInput,
+) -> Result<Arc<[nymph_sema::DefinitionId]>, super::session::RuntimeDefinitionError> {
+	#[cfg(feature = "test-support")]
+	db.semantic_query_will_execute("runtime_definition_ids", module);
+	let environment = interface_module_environment(db, key, module);
+	let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
+		return Err(super::session::RuntimeDefinitionError::Recovered);
+	};
+	let analysis = interface_module_analysis(db, key, module);
+	let source = match module {
+		SemanticModuleInput::Project(input) => match input.source(db) {
+			Some(source) => source,
+			None => return Err(super::session::RuntimeDefinitionError::OwnerNotFound),
+		},
+		SemanticModuleInput::Builtin(input) => input.source(db),
+	};
+	Ok(
+		nymph_sema::runtime_definitions(
+			&analysis.semantic.module,
+			&source,
+			&analysis.semantic.checked,
+			interface,
+		)
+		.map_err(super::session::RuntimeDefinitionError::Extraction)?
+		.into_iter()
+		.map(|artifact| artifact.definition)
+		.collect::<Vec<_>>()
+		.into(),
+	)
+}
+
 #[salsa::tracked(returns(clone))]
 pub(crate) fn runtime_definition<'db>(
 	db: &'db dyn Db,
@@ -794,7 +833,7 @@ fn declaration_name(definition: &nymph_sema::DefinitionId) -> Option<&str> {
 }
 
 #[salsa::tracked(returns(clone))]
-fn binding_name<'db>(
+pub(crate) fn binding_name<'db>(
 	db: &'db dyn Db,
 	key: ProjectKey<'db>,
 	definition: nymph_sema::DefinitionId,
@@ -837,7 +876,7 @@ fn member_name<'db>(
 }
 
 #[salsa::tracked(returns(clone))]
-fn module_specifier<'db>(
+pub(crate) fn module_specifier<'db>(
 	db: &'db dyn Db,
 	key: ProjectKey<'db>,
 	module: nymph_sema::ModuleIdentity,
@@ -951,6 +990,223 @@ pub(crate) fn lower_runtime_definition<'db>(
 	})?;
 	let context = CompilerStableContext { db, key };
 	nymph_sema::lower_runtime_definition(&context, artifact).map(Arc::new)
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn lower_interface_module<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	module: SemanticModuleInput,
+) -> Result<Arc<nymph_sema::StableHirModule>, nymph_sema::StableModuleAssemblyError> {
+	#[cfg(feature = "test-support")]
+	db.semantic_query_will_execute("lower_interface_module", module);
+	let graph = project_graph(db, key);
+	let mut environments = vec![module];
+	environments.extend(graph.semantic_closure(module).iter().copied());
+	for reachable in environments {
+		let environment = match reachable {
+			SemanticModuleInput::Builtin(input)
+				if input.key(db).domain == BuiltinModuleDomain::AmbientCore =>
+			{
+				ambient_core_environment(db, key.ambient_core_registry(db), input)
+			}
+			_ => interface_module_environment(db, key, reachable),
+		};
+		if matches!(
+			environment.as_ref(),
+			nymph_sema::ModuleEnvironment::Recovered(_)
+		) {
+			return Err(
+				nymph_sema::StableModuleAssemblyError::RecoveredEnvironment {
+					module: reachable.identity(db),
+				},
+			);
+		}
+	}
+
+	let own = runtime_definition_ids(db, key, module).map_err(|error| match error {
+		super::session::RuntimeDefinitionError::Extraction(error) => {
+			nymph_sema::StableModuleAssemblyError::RuntimeExtraction(error)
+		}
+		_ => nymph_sema::StableModuleAssemblyError::RecoveredEnvironment {
+			module: module.identity(db),
+		},
+	})?;
+	let mut queue = std::collections::VecDeque::from(own.to_vec());
+	let mut seen = std::collections::HashSet::new();
+	let mut lowered = Vec::new();
+	while let Some(definition) = queue.pop_front() {
+		if !seen.insert(definition.clone()) {
+			continue;
+		}
+		let fragment =
+			lower_runtime_definition(db, key, definition.clone()).map_err(|error| match &error {
+				nymph_sema::StableLoweringError::Runtime(
+					nymph_sema::RuntimeDefinitionLookupError::Missing { .. },
+				) => nymph_sema::StableModuleAssemblyError::UnresolvedDemand {
+					definition: definition.clone(),
+				},
+				nymph_sema::StableLoweringError::Runtime(
+					nymph_sema::RuntimeDefinitionLookupError::Recovered { .. },
+				) => nymph_sema::StableModuleAssemblyError::RecoveredDemand {
+					definition: definition.clone(),
+				},
+				_ => error.into(),
+			})?;
+		queue.extend(fragment.demands().iter().cloned());
+		lowered.push(fragment.as_ref().clone());
+	}
+
+	let context = CompilerStableContext { db, key };
+	let mut hir = nymph_hir::hir::HirModule {
+		lets: vec![],
+		funcs: vec![],
+		classes: vec![],
+		enums: vec![],
+	};
+	let mut shell_indices = std::collections::HashMap::new();
+	for fragment in &lowered {
+		if fragment.definition().module != module.identity(db) {
+			continue;
+		}
+		match fragment.fragment() {
+			nymph_sema::LoweredHirFragment::StructShell(class) => {
+				shell_indices.insert(fragment.definition().clone(), (true, hir.classes.len()));
+				hir.classes.push(class.clone());
+			}
+			nymph_sema::LoweredHirFragment::EnumShell(enum_) => {
+				shell_indices.insert(fragment.definition().clone(), (false, hir.enums.len()));
+				hir.enums.push(enum_.clone());
+			}
+			_ => {}
+		}
+	}
+	let mut attachments = std::collections::HashSet::new();
+	for fragment in &lowered {
+		let fragment_owner = match fragment.fragment() {
+			nymph_sema::LoweredHirFragment::AttachedInstance { owner, .. }
+			| nymph_sema::LoweredHirFragment::AttachedStatic { owner, .. }
+			| nymph_sema::LoweredHirFragment::AttachedMember { owner, .. }
+			| nymph_sema::LoweredHirFragment::MaterializedDefault { owner, .. } => owner.module.clone(),
+			_ => fragment.definition().module.clone(),
+		};
+		if fragment_owner != module.identity(db) {
+			continue;
+		}
+		use nymph_sema::LoweredHirFragment as Fragment;
+		match fragment.fragment() {
+			Fragment::TopLevelFunction(func) => hir.funcs.push(func.clone()),
+			Fragment::TopLevelValue(value) => hir.lets.push(value.clone()),
+			Fragment::AttachedInstance { owner, method }
+			| Fragment::AttachedMember { owner, method }
+			| Fragment::MaterializedDefault { owner, method, .. } => {
+				attach_method(
+					&context,
+					&mut hir,
+					&shell_indices,
+					&mut attachments,
+					fragment.definition(),
+					owner,
+					method,
+					false,
+				)?;
+			}
+			Fragment::AttachedStatic { owner, method } => {
+				attach_method(
+					&context,
+					&mut hir,
+					&shell_indices,
+					&mut attachments,
+					fragment.definition(),
+					owner,
+					method,
+					true,
+				)?;
+			}
+			Fragment::TopLevelExternal { .. } | Fragment::StructShell(_) | Fragment::EnumShell(_) => {}
+		}
+	}
+	let imports = lowered
+		.iter()
+		.filter(|item| {
+			item.definition().module != module.identity(db)
+				&& !matches!(
+					item.definition().module.origin,
+					nymph_sema::ModuleOrigin::Compiler
+				)
+		})
+		.map(|item| item.definition().clone())
+		.collect();
+	let virtual_runtime = lowered
+		.iter()
+		.filter(|item| {
+			matches!(
+				item.definition().module.origin,
+				nymph_sema::ModuleOrigin::Compiler
+			)
+		})
+		.map(|item| nymph_sema::VirtualRuntimeFragment {
+			owner: item.definition().module.clone(),
+			definition: item.definition().clone(),
+			fragment: item.clone(),
+		})
+		.collect();
+	Ok(Arc::new(nymph_sema::StableHirModule {
+		module: module.identity(db),
+		hir,
+		own_definitions: own.to_vec(),
+		fragments: lowered,
+		imports,
+		virtual_runtime,
+	}))
+}
+
+fn attach_method(
+	context: &CompilerStableContext<'_>,
+	hir: &mut nymph_hir::hir::HirModule,
+	shells: &std::collections::HashMap<nymph_sema::DefinitionId, (bool, usize)>,
+	seen: &mut std::collections::HashSet<(nymph_sema::DefinitionId, ecow::EcoString, bool)>,
+	definition: &nymph_sema::DefinitionId,
+	owner: &nymph_sema::DefinitionId,
+	method: &nymph_hir::hir::HirMethod,
+	static_: bool,
+) -> Result<(), nymph_sema::StableModuleAssemblyError> {
+	let shell = if let Some(shell) = shells.get(owner) {
+		Some((owner.clone(), *shell))
+	} else {
+		let request = nymph_sema::StableShapeRequest::Implementation(owner.clone());
+		match context.stable_shape(&request) {
+			Ok(nymph_sema::StableShapeFact::Implementation(shape)) => shape
+				.runtime_owner
+				.and_then(|id| shells.get(&id).copied().map(|shell| (id, shell))),
+			_ => None,
+		}
+	}
+	.ok_or_else(
+		|| nymph_sema::StableModuleAssemblyError::MissingOwnerShell {
+			owner: owner.clone(),
+		},
+	)?;
+	if !seen.insert((shell.0.clone(), method.name.clone(), static_)) {
+		return Err(nymph_sema::StableModuleAssemblyError::DuplicateAttachment {
+			owner: shell.0,
+			name: method.name.clone(),
+		});
+	}
+	let list = if shell.1.0 {
+		if static_ {
+			&mut hir.classes[shell.1.1].statics
+		} else {
+			&mut hir.classes[shell.1.1].methods
+		}
+	} else if static_ {
+		&mut hir.enums[shell.1.1].statics
+	} else {
+		&mut hir.enums[shell.1.1].methods
+	};
+	let _ = definition;
+	list.push(method.clone());
+	Ok(())
 }
 
 /// Check one module exclusively from its own tree and dependency interfaces.

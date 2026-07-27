@@ -168,7 +168,17 @@ public interface Producer<T> { func next(): T }
 public interface Stream<T> { func stream(): Producer<T> }
 "#,
 	);
-	let checked = check_module(&module);
+	let environment = SemanticEnvironment::from_modules(identity(), &[]).unwrap();
+	let result = check_module_with_environment(
+		Arc::new(module.clone()),
+		identity(),
+		&environment,
+		EntryMode::Library,
+	);
+	let checked = nymph_sema::Checked {
+		diags: result.diagnostics.to_vec(),
+		facts: result.analysis.checked.as_ref().clone(),
+	};
 	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
 	let headers = declared_headers(identity(), &module);
 	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();
@@ -271,7 +281,17 @@ public impl<T> Show<T = T> for Choice<T> {
 }
 "#,
 	);
-	let checked = check_module(&module);
+	let environment = SemanticEnvironment::from_modules(identity(), &[]).unwrap();
+	let result = check_module_with_environment(
+		Arc::new(module.clone()),
+		identity(),
+		&environment,
+		EntryMode::Library,
+	);
+	let checked = nymph_sema::Checked {
+		diags: result.diagnostics.to_vec(),
+		facts: result.analysis.checked.as_ref().clone(),
+	};
 	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
 	let headers = declared_headers(identity(), &module);
 	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();
@@ -455,7 +475,17 @@ public impl<T: Marker<T = Secret>> Box<T> {
 }
 "#,
 	);
-	let checked = check_module(&module);
+	let environment = SemanticEnvironment::from_modules(identity(), &[]).unwrap();
+	let result = check_module_with_environment(
+		Arc::new(module.clone()),
+		identity(),
+		&environment,
+		EntryMode::Library,
+	);
+	let checked = nymph_sema::Checked {
+		diags: result.diagnostics.to_vec(),
+		facts: result.analysis.checked.as_ref().clone(),
+	};
 	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
 	let headers = declared_headers(identity(), &module);
 	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();

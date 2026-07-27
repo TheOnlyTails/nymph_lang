@@ -433,6 +433,26 @@ pub struct CheckedFacts {
 	/// Owned declaration-level facts. This is an immutable extraction boundary;
 	/// the stateful checker itself never escapes checking.
 	pub semantic: CheckedSemantic,
+	/// Exact source-local declaration paths to canonical runtime identities.
+	pub source_identities: SourceIdentities,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SourceIdentities {
+	pub implementations: std::collections::BTreeMap<ImplementationSourcePath, DefinitionId>,
+	pub members: std::collections::BTreeMap<ImplementationMemberSourcePath, DefinitionId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ImplementationSourcePath {
+	pub declaration: u32,
+	pub nested: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ImplementationMemberSourcePath {
+	pub implementation: ImplementationSourcePath,
+	pub member: u32,
 }
 
 /// Legacy checker result. Fact field access remains compatible through dereferencing.

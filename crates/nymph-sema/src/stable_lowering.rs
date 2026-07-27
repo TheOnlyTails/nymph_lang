@@ -21,7 +21,7 @@ use nymph_ast::{
 use nymph_hir::hir::{
 	BinOp, BuiltinResult, HirArm, HirArrayElem, HirArrayKind, HirBoundDispatchCase,
 	HirBoundDispatchTarget, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit, HirMapElem,
-	HirMethod, HirPat, HirRange, HirStmt, HirVariant, NumKind, ScalarCastKind, UnOp,
+	HirMethod, HirModule, HirPat, HirRange, HirStmt, HirVariant, NumKind, ScalarCastKind, UnOp,
 };
 
 use crate::{
@@ -200,6 +200,61 @@ pub enum LoweredHirFragment {
 		interface_member: DefinitionId,
 		method: HirMethod,
 	},
+}
+
+/// Exact, location-free result of assembling one semantic module. Dependency
+/// declarations are never copied into `hir`; their identities remain explicit
+/// in `imports`, while compiler-owned runtime fragments remain separately typed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StableHirModule {
+	pub module: ModuleIdentity,
+	pub hir: HirModule,
+	pub own_definitions: Vec<DefinitionId>,
+	pub fragments: Vec<LoweredRuntimeDefinition>,
+	pub imports: Vec<DefinitionId>,
+	pub virtual_runtime: Vec<VirtualRuntimeFragment>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct VirtualRuntimeFragment {
+	pub owner: ModuleIdentity,
+	pub definition: DefinitionId,
+	pub fragment: LoweredRuntimeDefinition,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StableModuleAssemblyError {
+	RuntimeExtraction(crate::RuntimeExtractionError),
+	RecoveredEnvironment {
+		module: ModuleIdentity,
+	},
+	Lowering(StableLoweringError),
+	DuplicateAttachment {
+		owner: DefinitionId,
+		name: EcoString,
+	},
+	MissingOwnerShell {
+		owner: DefinitionId,
+	},
+	MismatchedPlacement {
+		definition: DefinitionId,
+		owner: DefinitionId,
+	},
+	UnresolvedDemand {
+		definition: DefinitionId,
+	},
+	RecoveredDemand {
+		definition: DefinitionId,
+	},
+	DemandCycle {
+		definition: DefinitionId,
+	},
+}
+
+impl From<StableLoweringError> for StableModuleAssemblyError {
+	fn from(error: StableLoweringError) -> Self {
+		Self::Lowering(error)
+	}
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -208,7 +208,7 @@ pub(crate) fn check_module_impl(module: &Module, entry: EntryMode) -> Checked {
 	let mut diags = Vec::new();
 	let defs = build_def_map(module, &mut diags);
 	let checker = Checker::new(module, defs, diags);
-	check_module_from_parts(entry, checker, 0, 0, 0, false)
+	check_module_from_parts(entry, checker, 0, 0, 0, false, None)
 }
 
 fn check_module_from_parts(
@@ -218,6 +218,7 @@ fn check_module_from_parts(
 	implementation_start: usize,
 	inherent_start: usize,
 	has_explicit_local_ranges: bool,
+	module_identity: Option<&crate::ModuleIdentity>,
 ) -> Checked {
 	checker.lower_signatures();
 	checker.collect_interfaces();
@@ -233,14 +234,17 @@ fn check_module_from_parts(
 	checker.collect_inner_impls();
 	checker.check_coherence();
 	checker.generalize_returns();
-	if let Some(identity) = checker.defs.defs.iter().rev().find_map(|definition| {
+	let inferred_identity = checker.defs.defs.iter().rev().find_map(|definition| {
 		definition
 			.stable
 			.as_ref()
 			.map(|stable| stable.module.clone())
-	}) {
-		checker.assign_runtime_body_identities(&identity);
-	}
+	});
+	let source_identities = if let Some(identity) = module_identity.or(inferred_identity.as_ref()) {
+		checker.assign_runtime_body_identities(identity)
+	} else {
+		Default::default()
+	};
 	checker.check_bodies();
 	checker.check_member_bodies();
 	checker.check_external_value_linkage();
@@ -375,13 +379,17 @@ fn check_module_from_parts(
 				local_inherent: inherent_start..inherent_end,
 				has_explicit_local_ranges,
 			},
+			source_identities,
 		},
 	}
 }
 
 impl Checker<'_> {
-	pub(crate) fn assign_runtime_body_identities(&mut self, identity: &crate::ModuleIdentity) {
-		crate::interface_extract::assign_runtime_body_identities(self, identity);
+	pub(crate) fn assign_runtime_body_identities(
+		&mut self,
+		identity: &crate::ModuleIdentity,
+	) -> crate::annotate::SourceIdentities {
+		crate::interface_extract::assign_runtime_body_identities(self, identity)
 	}
 }
 
@@ -392,7 +400,7 @@ pub fn check_module_with_environment(
 	mode: EntryMode,
 ) -> crate::SemanticCheckResult {
 	let mut diagnostics = Vec::new();
-	let headers = crate::declared_headers(identity, &module);
+	let headers = crate::declared_headers(identity.clone(), &module);
 	let definition_start = environment.imported.defs.defs.len();
 	let implementation_start = environment.imported.implementations.impls.len();
 	let inherent_start = environment.imported.inherent.impls.len();
@@ -415,6 +423,7 @@ pub fn check_module_with_environment(
 		implementation_start,
 		inherent_start,
 		true,
+		Some(&identity),
 	);
 	let diagnostics: std::sync::Arc<[Diagnostic]> = checked.diags.into();
 	let facts = std::sync::Arc::new(checked.facts);

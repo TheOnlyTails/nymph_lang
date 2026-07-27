@@ -212,3 +212,62 @@ impl Show for Right { func show(): int = 2 }
 	let actual = runtime_definitions(&module, source, &checked.facts, &reordered).unwrap();
 	assert_eq!(actual, expected);
 }
+
+#[test]
+fn missing_authoritative_implementation_identity_is_a_typed_error() {
+	let source = "struct Box\nimpl Box { func answer(): int = 42 }";
+	let parsed = nymph_syntax::parse_module(source, "fixture.nym");
+	let module = std::sync::Arc::new(parsed.tree);
+	let identity = ModuleIdentity {
+		origin: ModuleOrigin::Project("runtime-projection".into()),
+		project: "runtime-projection".into(),
+		path: "main".into(),
+	};
+	let environment = SemanticEnvironment::from_modules(identity.clone(), &[]).unwrap();
+	let result = check_module_with_environment(
+		module.clone(),
+		identity.clone(),
+		&environment,
+		EntryMode::Library,
+	);
+	let mut facts = result.analysis.checked.as_ref().clone();
+	let checked = nymph_sema::Checked {
+		diags: vec![],
+		facts: facts.clone(),
+	};
+	let headers = declared_headers(identity.clone(), &module);
+	let interface = extract_module_interface(identity, &module, &checked, &headers).unwrap();
+	facts.source_identities.implementations.clear();
+	assert_eq!(
+		runtime_definitions(&module, source, &facts, &interface),
+		Err(RuntimeExtractionError::MissingSourceIdentity),
+	);
+}
+
+#[test]
+fn standalone_inherent_members_have_exact_authoritative_identities() {
+	let source = r#"
+struct Box
+impl Box {
+	func answer(): int = 42
+	let value: int = 7
+	external(host_value) let host: int
+}
+"#;
+	let artifacts = project(source);
+	assert_eq!(
+		artifacts
+			.iter()
+			.filter(|artifact| matches!(
+				artifact.placement,
+				nymph_sema::RuntimePlacement::Attached { .. }
+			))
+			.count(),
+		3,
+	);
+	let ids = artifacts
+		.iter()
+		.map(|artifact| artifact.definition.clone())
+		.collect::<std::collections::HashSet<_>>();
+	assert_eq!(ids.len(), artifacts.len());
+}

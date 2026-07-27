@@ -564,6 +564,64 @@ impl CompilerSession {
 		queries::lower_runtime_definition(&self.db, key, definition)
 	}
 
+	/// Assemble one module exclusively from exact stable runtime fragments.
+	#[cfg(feature = "test-support")]
+	#[doc(hidden)]
+	#[must_use]
+	pub fn lower_interface_module_for_test(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		mode: EntryMode,
+	) -> Result<Arc<nymph_sema::StableHirModule>, nymph_sema::StableModuleAssemblyError> {
+		let input = self
+			.registry
+			.get(&(project.clone(), module))
+			.map(|record| record.input)
+			.ok_or_else(
+				|| nymph_sema::StableModuleAssemblyError::RecoveredEnvironment {
+					module: nymph_sema::ModuleIdentity {
+						origin: nymph_sema::ModuleOrigin::Project(project.as_str().into()),
+						project: project.as_str().into(),
+						path: "<missing>".into(),
+					},
+				},
+			)?;
+		let key = self.project_key(project, entry, mode, false, true);
+		queries::lower_interface_module(&self.db, key, SemanticModuleInput::Project(input))
+	}
+
+	#[cfg(feature = "test-support")]
+	#[doc(hidden)]
+	pub fn emit_interface_project_for_test(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		mode: EntryMode,
+	) -> Result<Arc<super::emission::StableEmittedProject>, Arc<[ProjectDiagnostic]>> {
+		let key = self.project_key(project, entry, mode, false, true);
+		match super::emission::emitted_interface_project(&self.db, key) {
+			super::emission::StableEmissionResult::Value(value) => Ok(value),
+			super::emission::StableEmissionResult::Diagnostics(diagnostics) => Err(diagnostics),
+		}
+	}
+
+	#[cfg(feature = "test-support")]
+	#[doc(hidden)]
+	pub fn compile_interface_project_for_test(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		mode: EntryMode,
+	) -> Result<Arc<CompiledProject>, Arc<[ProjectDiagnostic]>> {
+		let key = self.project_key(project, entry, mode, false, true);
+		match super::emission::compiled_interface_project(&self.db, key) {
+			super::emission::StableEmissionResult::Value(value) => Ok(value),
+			super::emission::StableEmissionResult::Diagnostics(diagnostics) => Err(diagnostics),
+		}
+	}
+
 	#[cfg(feature = "test-support")]
 	#[doc(hidden)]
 	#[must_use]
@@ -946,7 +1004,10 @@ impl CompilerSession {
 						"interface_module_analysis"
 						| "interface_module_interface"
 						| "interface_module_environment"
-						| "interface_project_diagnostics" => Some(query),
+						| "interface_project_diagnostics"
+						| "emitted_interface_module"
+						| "emitted_interface_project"
+						| "compiled_interface_project" => Some(query),
 						"ambient_core_analysis"
 						| "ambient_core_headers"
 						| "ambient_core_environment"
