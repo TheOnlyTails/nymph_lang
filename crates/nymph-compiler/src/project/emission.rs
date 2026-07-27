@@ -256,6 +256,19 @@ pub(crate) fn emitted_interface_project<'db>(
 	let mut virtual_fragments = std::collections::BTreeMap::new();
 	let mut option_requested = false;
 	let mut option_definition = None;
+	let reserved_runtime = crate::intrinsics::OPTION_RUNTIME_DEPENDENCY.import_specifier;
+	if graph.semantic_order.iter().copied().any(|module| {
+		module.domain(db) != SemanticModuleDomain::AmbientCore
+			&& module.identity(db).path.as_str() == reserved_runtime
+	}) {
+		return StableEmissionResult::Diagnostics(internal_diagnostic(
+			reserved_runtime,
+			"STABLE-RUNTIME-MODULE-COLLISION",
+			format!(
+				"canonical runtime module `{reserved_runtime}` collides with project module `{reserved_runtime}`"
+			),
+		));
+	}
 	for module in graph
 		.semantic_order
 		.iter()
@@ -334,7 +347,18 @@ pub(crate) fn emitted_interface_project<'db>(
 	for (owner, fragments) in by_owner {
 		match emit_virtual_runtime_module(db, key, &owner, &fragments, &module_bindings) {
 			Ok(source) => {
-				sources.insert(module_specifier(&owner), source);
+				let specifier = module_specifier(&owner);
+				if sources.contains_key(&specifier) {
+					return StableEmissionResult::Diagnostics(internal_diagnostic(
+						&specifier,
+						"STABLE-RUNTIME-MODULE-COLLISION",
+						format!(
+							"runtime module `{specifier}` owned by `{}` collides with project module `{specifier}`",
+							owner.path
+						),
+					));
+				}
+				sources.insert(specifier, source);
 			}
 			Err(message) => {
 				return StableEmissionResult::Diagnostics(internal_diagnostic(

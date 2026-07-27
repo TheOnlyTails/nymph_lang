@@ -1167,13 +1167,16 @@ impl<'m> Checker<'m> {
 		{
 			match self.defs.data(def).kind {
 				DefKind::Namespace => {
-					let member_sig = self
-						.sigs
-						.namespaces
-						.get(&def)
+					let namespace_module = match &self.defs.data(def).origin {
+						crate::DefOrigin::Imported { module } => Some(module.clone()),
+						crate::DefOrigin::Local { .. } => None,
+					};
+					let namespace = self.sigs.namespaces.get(&def);
+					let member_sig = namespace
 						.and_then(|namespace| namespace.members.get(&member.0))
 						.cloned();
 					if let Some(NamespaceMemberSig::Func { target, sig }) = member_sig {
+						self.annotations.record_direct_namespace_member(func.id);
 						self
 							.annotations
 							.record_definition_target(id, target.as_ref());
@@ -1189,6 +1192,12 @@ impl<'m> Checker<'m> {
 							},
 						);
 						return (self.check_direct_call(callee, args, span), None);
+					}
+					if let Some(module) = namespace_module {
+						self
+							.annotations
+							.record_unresolved_qualified_access(module, member.0.clone(), member.1);
+						return (self.interner.error(), None);
 					}
 				}
 				DefKind::Enum => {
@@ -1473,18 +1482,27 @@ impl<'m> Checker<'m> {
 				.cloned()
 			{
 				Some(NamespaceMemberSig::Value { target, ty, .. }) => {
+					self.annotations.record_direct_namespace_member(id);
 					self
 						.annotations
 						.record_definition_target(id, target.as_ref());
 					ty
 				}
 				Some(NamespaceMemberSig::Func { target, sig }) => {
+					self.annotations.record_direct_namespace_member(id);
 					self
 						.annotations
 						.record_definition_target(id, target.as_ref());
 					self.namespace_func_type(&sig, span)
 				}
 				None => {
+					if let crate::DefOrigin::Imported { module } = &self.defs.data(def).origin {
+						self.annotations.record_unresolved_qualified_access(
+							module.clone(),
+							member.into(),
+							span,
+						);
+					}
 					self.emit(
 						span,
 						TypeError::NoField {

@@ -2379,6 +2379,48 @@ pub fn extract_module_interface_with_facts(
 	Ok(interface)
 }
 
+/// Exact private top-level identities retained solely for lexical import diagnostics.
+///
+/// These facts deliberately remain separate from [`ModuleInterface`]: they are not
+/// type/runtime support and changing a private body must not change public shapes.
+pub fn extract_lexical_private_definitions(
+	module: &Module,
+	checked: &Checked,
+	headers: &DeclaredHeaders,
+) -> Result<Vec<(EcoString, DefinitionId)>, InterfaceConversionError> {
+	let context = context(checked, headers);
+	let definitions = module
+		.members
+		.iter()
+		.map(|declaration| extract_definition(declaration, checked, headers, &context))
+		.collect::<Result<Vec<_>, _>>()?;
+	let mut private = module
+		.members
+		.iter()
+		.zip(definitions)
+		.filter_map(|(declaration, definition)| {
+			let visibility = match declaration {
+				Declaration::Func { visibility, .. }
+				| Declaration::Let { visibility, .. }
+				| Declaration::Struct { visibility, .. }
+				| Declaration::Enum { visibility, .. }
+				| Declaration::TypeAlias { visibility, .. }
+				| Declaration::Interface { visibility, .. }
+				| Declaration::Namespace { visibility, .. }
+				| Declaration::ExternalFunc(visibility, ..)
+				| Declaration::ExternalLet(visibility, ..) => *visibility,
+				_ => return None,
+			};
+			(!visible(visibility))
+				.then_some(definition)
+				.flatten()
+				.map(|definition| (definition.name, definition.id))
+		})
+		.collect::<Vec<_>>();
+	private.sort_by(|left, right| left.1.cmp(&right.1));
+	Ok(private)
+}
+
 fn poison_binders(
 	owner: DefinitionId,
 	generics: &[nymph_ast::Spanned<nymph_ast::ty::GenericParam>],

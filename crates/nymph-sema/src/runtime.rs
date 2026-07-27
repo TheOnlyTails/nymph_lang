@@ -139,6 +139,7 @@ pub enum RuntimePlacement {
 pub struct RuntimeAnnotations {
 	pub types: Arc<[(BodyNodeId, InterfaceType)]>,
 	pub definition_targets: Arc<[(BodyNodeId, DefinitionId)]>,
+	pub direct_namespace_members: Arc<[BodyNodeId]>,
 	pub dispatches: Arc<[(BodyNodeId, StableDispatch)]>,
 	pub variants: Arc<[(BodyNodeId, ExpressionVariant)]>,
 	pub pattern_variants: Arc<[(PatternNodeId, PatternVariant)]>,
@@ -833,6 +834,12 @@ fn runtime_annotations(
 	iterations.sort_by_key(|item| item.0);
 	anonymous_closures.sort_by_key(|item| item.0);
 	generic_namespaced_calls.sort_unstable();
+	let mut direct_namespace_members = checked
+		.annotations
+		.direct_namespace_members()
+		.filter_map(|source| local.get(&source).copied())
+		.collect::<Vec<_>>();
+	direct_namespace_members.sort_unstable();
 	let mut external_marshals = Vec::new();
 	for (id, target) in &definition_targets {
 		if let Some(marshal) = external_marshal(checked, target) {
@@ -842,6 +849,7 @@ fn runtime_annotations(
 	Ok(RuntimeAnnotations {
 		types: types.into(),
 		definition_targets: definition_targets.into(),
+		direct_namespace_members: direct_namespace_members.into(),
 		dispatches: dispatches.into(),
 		variants: variants.into(),
 		pattern_variants: pattern_variants.into(),

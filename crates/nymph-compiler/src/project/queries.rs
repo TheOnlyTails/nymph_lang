@@ -55,6 +55,192 @@ pub struct DirectImport {
 
 pub type DirectImports = [DirectImport];
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ResolvedModuleImports {
+	pub bindings: FxHashMap<ecow::EcoString, nymph_sema::ResolvedImportBinding>,
+	pub namespaces: Vec<(ecow::EcoString, nymph_sema::ModuleIdentity)>,
+	pub diagnostics: Arc<[ProjectDiagnostic]>,
+}
+
+#[salsa::tracked(returns(clone))]
+fn interface_module_lexical_private_definitions<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	module: SemanticModuleInput,
+) -> Arc<[(ecow::EcoString, nymph_sema::DefinitionId)]> {
+	let analysis = interface_module_analysis(db, key, module);
+	let checked = checked_from_analysis(&analysis, []);
+	let headers = nymph_sema::declared_headers(module.identity(db), &analysis.semantic.module);
+	nymph_sema::extract_lexical_private_definitions(&analysis.semantic.module, &checked, &headers)
+		.unwrap_or_default()
+		.into()
+}
+
+fn local_declaration_name(declaration: &Declaration) -> Option<Ident> {
+	match declaration {
+		Declaration::Let { meta, .. } | Declaration::ExternalLet(_, _, meta) => match &meta.name.0 {
+			nymph_ast::expr::Pattern::Binding { name, .. } => Some(name.clone()),
+			_ => None,
+		},
+		Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => {
+			Some(meta.name.clone())
+		}
+		Declaration::TypeAlias { meta, .. } => Some(meta.name.clone()),
+		Declaration::Struct { name, .. }
+		| Declaration::Enum { name, .. }
+		| Declaration::Namespace { name, .. }
+		| Declaration::Interface { name, .. } => Some(name.clone()),
+		_ => None,
+	}
+}
+
+fn insert_import_binding(
+	bindings: &mut FxHashMap<ecow::EcoString, nymph_sema::ResolvedImportBinding>,
+	locals: &FxHashMap<ecow::EcoString, Span>,
+	diagnostics: &mut Vec<ProjectDiagnostic>,
+	owner: &str,
+	local: ecow::EcoString,
+	span: Span,
+	binding: nymph_sema::ResolvedImportBinding,
+) -> bool {
+	if bindings.contains_key(&local) || locals.contains_key(&local) {
+		diagnostics.push(ProjectDiagnostic {
+			module: owner.to_string(),
+			diag: Diagnostic::error(
+				"IMPORT-NAME-COLLISION".into(),
+				format!("import name `{local}` collides with another lexical binding"),
+				span,
+			),
+		});
+		return false;
+	}
+	bindings.insert(local, binding);
+	true
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn resolved_module_imports<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	module: SemanticModuleInput,
+) -> Arc<ResolvedModuleImports> {
+	let graph = project_graph(db, key);
+	let direct = graph.semantic_direct_dependencies(module);
+	let locals = module
+		.parsed(db)
+		.tree
+		.members
+		.iter()
+		.filter_map(local_declaration_name)
+		.map(|name| (name.0.clone(), name.1))
+		.collect::<FxHashMap<_, _>>();
+	let mut bindings = FxHashMap::default();
+	let mut namespaces = Vec::new();
+	let mut diagnostics = Vec::new();
+	let owner = module.display_key(db);
+	for import in graph.semantic_direct_imports(db, module).iter() {
+		let Ok(target_key) = &import.target else {
+			continue;
+		};
+		let Some(target) = direct
+			.iter()
+			.copied()
+			.find(|candidate| candidate.display_key(db) == *target_key)
+		else {
+			continue;
+		};
+		let identity = target.identity(db);
+		let interface = match interface_module_interface(db, key, target) {
+			Ok(interface) => interface,
+			Err(_) => continue,
+		};
+		let namespace = import.namespace.0.clone();
+		let namespace_matches_export = interface
+			.exports
+			.iter()
+			.any(|definition| definition.name == namespace)
+			&& (!import.has_with_list
+				|| import.with_idents.iter().any(|(source, alias)| {
+					source.0 == namespace && alias.as_ref().unwrap_or(source).0 == namespace
+				}));
+		if !namespace_matches_export
+			&& insert_import_binding(
+				&mut bindings,
+				&locals,
+				&mut diagnostics,
+				&owner,
+				namespace.clone(),
+				import.namespace.1,
+				nymph_sema::ResolvedImportBinding::Namespace(identity.clone()),
+			) {
+			namespaces.push((namespace, identity));
+		}
+		let selected = if import.has_with_list {
+			import
+				.with_idents
+				.iter()
+				.map(|(source, alias)| {
+					(
+						source.0.clone(),
+						alias.as_ref().unwrap_or(source).0.clone(),
+						source.1,
+					)
+				})
+				.collect::<Vec<_>>()
+		} else {
+			interface
+				.exports
+				.iter()
+				.map(|definition| {
+					(
+						definition.name.clone(),
+						definition.name.clone(),
+						import.namespace.1,
+					)
+				})
+				.collect::<Vec<_>>()
+		};
+		for (source, local, span) in selected {
+			if let Some(definition) = interface.exports.iter().find(|item| item.name == source) {
+				insert_import_binding(
+					&mut bindings,
+					&locals,
+					&mut diagnostics,
+					&owner,
+					local,
+					span,
+					nymph_sema::ResolvedImportBinding::Definition(definition.id.clone()),
+				);
+			} else {
+				let target_private = interface_module_lexical_private_definitions(db, key, target);
+				let private = target_private.iter().any(|(name, _)| *name == source);
+				diagnostics.push(ProjectDiagnostic {
+					module: owner.clone(),
+					diag: Diagnostic::error(
+						if private {
+							"IMPORT-PRIVATE-NAME"
+						} else {
+							"IMPORT-UNRESOLVED-NAME"
+						}
+						.into(),
+						if private {
+							format!("`{source}` is private and cannot be imported")
+						} else {
+							format!("imported module has no exported name `{source}`")
+						},
+						span,
+					),
+				});
+			}
+		}
+	}
+	Arc::new(ResolvedModuleImports {
+		bindings,
+		namespaces,
+		diagnostics: diagnostics.into(),
+	})
+}
+
 impl SemanticModuleInput {
 	pub(crate) fn domain(self, db: &dyn Db) -> SemanticModuleDomain {
 		match self {
@@ -1542,40 +1728,13 @@ pub(crate) fn interface_module_analysis<'db>(
 			}
 		}
 	}
-	let direct = graph.semantic_direct_dependencies(module);
-	for import in graph.semantic_direct_imports(db, module).iter() {
-		let Ok(target_key) = &import.target else {
-			continue;
-		};
-		let Some(target) = direct
+	let resolved = resolved_module_imports(db, key, module);
+	bindings.extend(
+		resolved
+			.bindings
 			.iter()
-			.copied()
-			.find(|candidate| candidate.display_key(db) == *target_key)
-		else {
-			continue;
-		};
-		let identity = target.identity(db);
-		bindings.insert(
-			import.namespace.0.clone(),
-			nymph_sema::ResolvedImportBinding::Namespace(identity.clone()),
-		);
-		if let Some(exports) = environment.module_exports.get(&identity) {
-			let selected = import
-				.with_idents
-				.iter()
-				.map(|(source, alias)| (alias.as_ref().unwrap_or(source).0.clone(), source.0.clone()))
-				.collect::<Vec<_>>();
-			for (local, source) in selected {
-				let binding = exports
-					.by_name
-					.get(&source)
-					.cloned()
-					.map(nymph_sema::ResolvedImportBinding::Definition)
-					.unwrap_or(nymph_sema::ResolvedImportBinding::Poison);
-				bindings.insert(local, binding);
-			}
-		}
-	}
+			.map(|(name, binding)| (name.clone(), binding.clone())),
+	);
 	environment.set_resolved_imports(bindings);
 	let result = nymph_sema::check_module_with_environment(
 		Arc::new(parsed.tree.clone()),
@@ -1589,20 +1748,81 @@ pub(crate) fn interface_module_analysis<'db>(
 			nymph_sema::EntryMode::Library
 		},
 	);
-	let diagnostics = result
-		.diagnostics
+	let private_accesses = result
+		.analysis
+		.annotations
+		.unresolved_qualified_accesses()
 		.iter()
-		.cloned()
-		.map(|diag| ProjectDiagnostic {
-			module: module.display_key(db),
-			diag,
+		.filter_map(|access| {
+			let dependency = graph
+				.semantic_closure(module)
+				.iter()
+				.copied()
+				.find(|dependency| dependency.identity(db) == access.module)?;
+			interface_module_lexical_private_definitions(db, key, dependency)
+				.iter()
+				.any(|(name, _)| *name == access.member)
+				.then_some(access)
 		})
-		.collect::<Vec<_>>()
-		.into();
+		.collect::<Vec<_>>();
+	let mut diagnostics = resolved.diagnostics.iter().cloned().collect::<Vec<_>>();
+	diagnostics.extend(
+		result
+			.diagnostics
+			.iter()
+			.filter(|diag| {
+				!private_accesses.iter().any(|access| {
+					is_missing_diagnostic_for_qualified_access(diag, access.span, access.member.as_str())
+				})
+			})
+			.cloned()
+			.map(|diag| ProjectDiagnostic {
+				module: module.display_key(db),
+				diag,
+			})
+			.collect::<Vec<_>>(),
+	);
+	for access in private_accesses {
+		diagnostics.push(ProjectDiagnostic {
+			module: module.display_key(db),
+			diag: Diagnostic::error(
+				"IMPORT-PRIVATE-NAME".into(),
+				"private imported namespace member cannot be accessed".to_string(),
+				access.span,
+			),
+		});
+	}
+	for (target, span) in result.analysis.checked.local_inherent_owners() {
+		if target.module != module.identity(db) {
+			diagnostics.push(ProjectDiagnostic {
+				module: module.display_key(db),
+				diag: Diagnostic::error(
+					"INHERENT-IMPL-OWNER".into(),
+					format!(
+						"inherent impl must be declared in its owning module `{}`",
+						target.module.path
+					),
+					span,
+				),
+			});
+		}
+	}
 	Arc::new(super::session::ModuleAnalysis {
 		semantic: result.analysis,
-		diagnostics: super::session::ProjectDiagnostics(diagnostics),
+		diagnostics: super::session::ProjectDiagnostics(diagnostics.into()),
 	})
+}
+
+fn is_missing_diagnostic_for_qualified_access(
+	diagnostic: &Diagnostic,
+	span: Span,
+	member: &str,
+) -> bool {
+	diagnostic.code == "2022"
+		&& diagnostic.span == span
+		&& diagnostic
+			.message
+			.starts_with(&format!("no field `{member}` on `"))
 }
 
 #[salsa::tracked(returns(clone))]
@@ -1902,6 +2122,8 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 mod tests {
 	use std::collections::BTreeMap;
 
+	use nymph_ast::Span;
+	use nymph_diagnostics::Diagnostic;
 	use nymph_sema::EntryMode;
 
 	use super::*;
@@ -1919,6 +2141,22 @@ mod tests {
 	impl salsa::Database for TestDb {}
 	#[salsa::db]
 	impl Db for TestDb {}
+
+	#[test]
+	fn private_access_conversion_preserves_unrelated_diagnostic_at_same_span() {
+		let span = Span::new(10, 16);
+		let missing_member = Diagnostic::error("2022".into(), "no field `helper` on `math`", span);
+		let unrelated = Diagnostic::error("2999".into(), "unrelated", span);
+
+		assert!(is_missing_diagnostic_for_qualified_access(
+			&missing_member,
+			span,
+			"helper"
+		));
+		assert!(!is_missing_diagnostic_for_qualified_access(
+			&unrelated, span, "helper"
+		));
+	}
 
 	fn fixture(files: &[(&str, &str)], builtins: &[(&str, &str)]) -> (TestDb, ProjectKey<'static>) {
 		let db = TestDb {

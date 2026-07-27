@@ -327,11 +327,16 @@ fn check_module_from_parts(
 	}
 	checker.impls = implementations;
 	let inherent_registry = std::mem::take(&mut checker.inherent);
-	let inherent: Vec<_> = inherent_registry
+	let mut inherent: Vec<_> = inherent_registry
 		.impls
 		.iter()
 		.map(|implementation| crate::annotate::CheckedInherentImpl {
 			definition: implementation.definition.clone(),
+			owner: match checker.interner.kind(implementation.self_ty) {
+				nymph_hir::ty::TyKind::Adt(definition, _) => checker.defs.stable(*definition).cloned(),
+				_ => None,
+			},
+			source_span: None,
 			generics: implementation.owner_generic_names.clone(),
 			self_ty: implementation.self_ty,
 			constraints: implementation.constraints.clone(),
@@ -358,6 +363,22 @@ fn check_module_from_parts(
 				.collect(),
 		})
 		.collect();
+	for (implementation, span) in
+		inherent[inherent_start..]
+			.iter_mut()
+			.zip(
+				checker
+					.module
+					.members
+					.iter()
+					.filter_map(|declaration| match declaration {
+						nymph_ast::decl::Declaration::Impl { type_, .. } => Some(type_.1),
+						_ => None,
+					}),
+			)
+	{
+		implementation.source_span = Some(span);
+	}
 	let implementation_end = checker.impls.impls.len();
 	let inherent_end = inherent.len();
 	let definition_end = checker.defs.defs.len();

@@ -429,7 +429,7 @@ fn full_differential_fixture_matrix() {
 				("dep", "public func broken(): Missing = nope"),
 				(
 					"main",
-					"import @/dep\nfunc main(): int { broken(1); independent }",
+					"import @/dep\nfunc main(): int = { broken(1) independent }",
 				),
 			],
 			entry: "main",

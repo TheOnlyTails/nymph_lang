@@ -155,20 +155,26 @@ fn private_name_cannot_be_imported_unqualified() {
 	]);
 	let diags = check_project("main", &loader(files));
 	assert!(!diags.is_empty());
-	assert!(diags.iter().any(|d| d.diag.code.contains("PRIVATE")));
+	assert!(
+		diags.iter().any(|d| d.diag.code.contains("PRIVATE")),
+		"{diags:?}"
+	);
 }
 #[test]
 fn private_name_cannot_be_imported_via_namespace_access() {
 	let files = FxHashMap::from_iter([
 		(
 			"main",
-			"import @/math\nfunc main(): void = { math.helper() }",
+			"import @/math with (public_value)\nfunc main(): void = { math.helper() }",
 		),
-		("math", "private func helper(): void = {}"),
+		(
+			"math",
+			"private func helper(): void = {}\npublic let public_value = 1",
+		),
 	]);
 	let diags = check_project("main", &loader(files));
-	assert!(!diags.is_empty());
-	assert!(diags.iter().any(|d| d.diag.code.contains("PRIVATE")));
+	assert_eq!(diags.len(), 1, "{diags:?}");
+	assert_eq!(diags[0].diag.code, "IMPORT-PRIVATE-NAME", "{diags:?}");
 }
 #[test]
 fn private_helper_is_still_usable_within_its_own_module() {
@@ -542,15 +548,18 @@ fn a_with_name_colliding_with_a_namespace_name_is_a_diagnostic() {
 
 #[test]
 fn project_module_cannot_be_silently_replaced_by_a_runtime_module() {
-	let files = FxHashMap::from_iter([("std/option", "func main(): void = {}")]);
-	let diags = match compile_project("std/option", &loader(files)) {
-		Ok(_) => panic!("the canonical runtime module must not overwrite the project entry"),
+	let files = FxHashMap::from_iter([
+		("main", "import @/std/option\nfunc main(): void = {}"),
+		("std/option", "public func project_value(): int = 1"),
+	]);
+	let diags = match compile_project("main", &loader(files)) {
+		Ok(_) => panic!("the canonical runtime module must not overwrite a project dependency"),
 		Err(diags) => diags,
 	};
 	assert!(
 		diags
 			.iter()
-			.any(|d| d.diag.code.contains("RUNTIME-MODULE-COLLISION")),
+			.any(|d| d.diag.code == "STABLE-RUNTIME-MODULE-COLLISION"),
 		"expected a runtime-module collision diagnostic, got: {diags:?}"
 	);
 }
@@ -568,7 +577,7 @@ fn project_module_cannot_be_silently_replaced_by_an_intrinsic_module() {
 	assert!(
 		diags
 			.iter()
-			.any(|d| d.diag.code.contains("RUNTIME-MODULE-COLLISION")),
+			.any(|d| d.diag.code == "STABLE-INTRINSIC-COLLISION"),
 		"expected a runtime-module collision diagnostic, got: {diags:?}"
 	);
 }
@@ -733,8 +742,10 @@ fn duplicate_static_attachments_across_source_modules_are_diagnosed() {
 	]);
 	let diags = check_project("main", &loader(files));
 	assert!(
-		diags.iter().any(|diag| diag.diag.code.contains("2045")),
-		"duplicate attachments must use the semantic duplicate diagnostic: {diags:?}"
+		diags
+			.iter()
+			.any(|diag| diag.diag.code == "INHERENT-IMPL-OWNER"),
+		"malformed cross-module attachments must report exact owner errors: {diags:?}"
 	);
 }
 

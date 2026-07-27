@@ -10,7 +10,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::ops::Deref;
 
 use crate::Ty;
-use crate::identity::DefinitionId;
+use crate::identity::{DefinitionId, ModuleIdentity};
 use crate::ty::Interner;
 use nymph_hir::hir::MarshalKind;
 
@@ -34,6 +34,8 @@ pub struct CheckedSemantic {
 #[derive(Debug, Clone)]
 pub(crate) struct CheckedInherentImpl {
 	pub definition: Option<DefinitionId>,
+	pub owner: Option<DefinitionId>,
+	pub source_span: Option<Span>,
 	pub generics: Vec<EcoString>,
 	pub self_ty: Ty,
 	pub constraints: Vec<crate::iface::Bound>,
@@ -153,11 +155,20 @@ pub enum IterMode {
 	ViaIter,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnresolvedQualifiedAccess {
+	pub module: ModuleIdentity,
+	pub member: EcoString,
+	pub span: Span,
+}
+
 /// A [`NodeId`]-keyed map of [`ExprInfo`] plus variant resolutions, produced by
 /// checking and consumed by lowering.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Annotations {
 	infos: FxHashMap<NodeId, ExprInfo>,
+	unresolved_qualified_accesses: Vec<UnresolvedQualifiedAccess>,
+	direct_namespace_members: FxHashSet<NodeId>,
 	definition_targets: FxHashMap<NodeId, DefinitionId>,
 	/// Checker-local provenance used only to project stable identities when the
 	/// compatibility checker was built from definitions without stable IDs.
@@ -188,6 +199,35 @@ pub struct Annotations {
 	/// The parameter identifier has no runtime binding, so stable lowering must
 	/// reject these rather than emitting an undefined local.
 	generic_namespaced_calls: FxHashSet<NodeId>,
+}
+
+impl Annotations {
+	pub fn record_unresolved_qualified_access(
+		&mut self,
+		module: ModuleIdentity,
+		member: EcoString,
+		span: Span,
+	) {
+		self
+			.unresolved_qualified_accesses
+			.push(UnresolvedQualifiedAccess {
+				module,
+				member,
+				span,
+			});
+	}
+
+	pub fn unresolved_qualified_accesses(&self) -> &[UnresolvedQualifiedAccess] {
+		&self.unresolved_qualified_accesses
+	}
+
+	pub(crate) fn record_direct_namespace_member(&mut self, id: NodeId) {
+		self.direct_namespace_members.insert(id);
+	}
+
+	pub(crate) fn direct_namespace_members(&self) -> impl Iterator<Item = NodeId> + '_ {
+		self.direct_namespace_members.iter().copied()
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -449,6 +489,17 @@ pub struct CheckedFacts {
 	pub semantic: CheckedSemantic,
 	/// Exact source-local declaration paths to canonical runtime identities.
 	pub source_identities: SourceIdentities,
+}
+
+impl CheckedFacts {
+	/// Exact resolved ADT owner of each source inherent implementation.
+	pub fn local_inherent_owners(&self) -> impl Iterator<Item = (&DefinitionId, Span)> {
+		self.semantic.inherent[self.semantic.local_inherent.clone()]
+			.iter()
+			.filter_map(|implementation| {
+				Some((implementation.owner.as_ref()?, implementation.source_span?))
+			})
+	}
 }
 
 #[derive(Clone, Debug, Default)]

@@ -1309,6 +1309,18 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							.into(),
 					});
 				}
+				if self
+					.annotations
+					.direct_namespace_members
+					.contains(&self.id(expr))
+					&& let Some(target) = self.target(expr)
+					&& matches!(target.key, crate::DeclarationKey::TopLevel { .. })
+				{
+					self.demand_external(target)?;
+					return Ok(HirExpr::Local(
+						self.context.binding_name(target)?.as_str().into(),
+					));
+				}
 				HirExpr::Field {
 					recv: Box::new(self.lower(parent)?),
 					name: if let Some(target) = self.target(expr) {
