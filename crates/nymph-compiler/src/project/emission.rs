@@ -38,7 +38,7 @@ fn module_specifier(module: &nymph_sema::ModuleIdentity) -> String {
 	}
 }
 
-#[salsa::tracked(returns(clone), no_eq)]
+#[salsa::tracked(returns(clone))]
 pub(crate) fn emitted_interface_module<'db>(
 	db: &'db dyn Db,
 	key: ProjectKey<'db>,
@@ -144,7 +144,7 @@ pub(crate) fn emitted_interface_module<'db>(
 	StableEmissionResult::Value(Arc::new(source))
 }
 
-#[salsa::tracked(returns(clone), no_eq)]
+#[salsa::tracked(returns(clone))]
 pub(crate) fn emitted_interface_project<'db>(
 	db: &'db dyn Db,
 	key: ProjectKey<'db>,
@@ -370,7 +370,7 @@ fn attachment_shell_owner(
 	}
 }
 
-#[salsa::tracked(returns(clone), no_eq)]
+#[salsa::tracked(returns(clone))]
 pub(crate) fn compiled_interface_project<'db>(
 	db: &'db dyn Db,
 	key: ProjectKey<'db>,

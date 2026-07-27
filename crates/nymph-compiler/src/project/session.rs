@@ -601,6 +601,14 @@ impl CompilerSession {
 		mode: EntryMode,
 	) -> Result<Arc<super::emission::StableEmittedProject>, Arc<[ProjectDiagnostic]>> {
 		let key = self.project_key(project, entry, mode, false, true);
+		let diagnostics = queries::interface_project_diagnostics(&self.db, key);
+		if diagnostics
+			.0
+			.iter()
+			.any(|diagnostic| diagnostic.diag.is_error())
+		{
+			return Err(diagnostics.0);
+		}
 		match super::emission::emitted_interface_project(&self.db, key) {
 			super::emission::StableEmissionResult::Value(value) => Ok(value),
 			super::emission::StableEmissionResult::Diagnostics(diagnostics) => Err(diagnostics),
@@ -616,6 +624,14 @@ impl CompilerSession {
 		mode: EntryMode,
 	) -> Result<Arc<CompiledProject>, Arc<[ProjectDiagnostic]>> {
 		let key = self.project_key(project, entry, mode, false, true);
+		let diagnostics = queries::interface_project_diagnostics(&self.db, key);
+		if diagnostics
+			.0
+			.iter()
+			.any(|diagnostic| diagnostic.diag.is_error())
+		{
+			return Err(diagnostics.0);
+		}
 		match super::emission::compiled_interface_project(&self.db, key) {
 			super::emission::StableEmissionResult::Value(value) => Ok(value),
 			super::emission::StableEmissionResult::Diagnostics(diagnostics) => Err(diagnostics),

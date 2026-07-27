@@ -314,7 +314,7 @@ fn insert_runtime_module(
 /// [`Self::entry_symbol`]), so `entry_main` is always the literal `"main"`
 /// and a caller can append `main();` exactly like the single-module facade
 /// (`compile`/`compile_entry`) already does.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CompiledProject {
 	pub js: String,
 	pub entry_main: String,

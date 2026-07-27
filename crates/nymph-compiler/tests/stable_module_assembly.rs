@@ -1,7 +1,29 @@
 #![cfg(feature = "test-support")]
 
-use nymph_compiler::project::{CompilerSession, ModulePath, ProjectId, SourceVersion};
+use std::sync::{Arc, Mutex};
+
+use nymph_compiler::project::{
+	CompilerSession, ModulePath, ProjectId, SemanticPipeline, SemanticQueryEvent, SourceVersion,
+};
 use nymph_sema::EntryMode;
+
+fn event_session() -> (CompilerSession, Arc<Mutex<Vec<SemanticQueryEvent>>>) {
+	let events = Arc::new(Mutex::new(Vec::new()));
+	let sink = events.clone();
+	(
+		CompilerSession::with_detailed_event_callback_for_test(
+			SemanticPipeline::Interface,
+			move |event| sink.lock().unwrap().push(event),
+		),
+		events,
+	)
+}
+
+fn executed(events: &[SemanticQueryEvent], query: &str, module: Option<&str>) -> bool {
+	events.iter().any(|event| {
+		event.query == query && module.is_none_or(|module| event.module.as_deref() == Some(module))
+	})
+}
 
 #[test]
 fn assembles_source_order_shells_values_functions_and_members() {
@@ -74,6 +96,150 @@ fn stable_emission_links_exact_project_modules_and_bundles() {
 	assert_eq!(compiled.entry_main, "main");
 	assert_eq!(compiled.entry_symbol("value"), "$m1$value");
 	assert!(compiled.js.contains("42"), "{}", compiled.js);
+}
+
+#[test]
+fn body_edit_reexecutes_only_the_changed_modules_stable_chain() {
+	let (mut session, events) = event_session();
+	let project = ProjectId::new("stable-emission-invalidation");
+	let main = ModulePath::new("main").unwrap();
+	let sibling = ModulePath::new("sibling").unwrap();
+	session.set_source(
+		project.clone(),
+		sibling,
+		"public func sibling(): int = 7".into(),
+		SourceVersion(1),
+	);
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"import @/sibling with (sibling)\nfunc answer(): int = 41\npublic func main(): void = { let result = answer() + sibling() }".into(),
+		SourceVersion(1),
+	);
+	session
+		.compile_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
+		.expect("initial stable compilation succeeds");
+	events.lock().unwrap().clear();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"import @/sibling with (sibling)\nfunc answer(): int = 42\npublic func main(): void = { let result = answer() + sibling() }".into(),
+		SourceVersion(2),
+	);
+	session
+		.compile_interface_project_for_test(project, main, EntryMode::Entry)
+		.expect("stable recompilation succeeds");
+	let observed = events.lock().unwrap();
+	for query in [
+		"runtime_definition_index",
+		"runtime_definition_ids",
+		"lower_runtime_definition",
+		"lower_interface_module",
+		"emitted_interface_module",
+	] {
+		assert!(
+			executed(&observed, query, Some("main")),
+			"{query}: {observed:#?}"
+		);
+		assert!(
+			!executed(&observed, query, Some("sibling")),
+			"{query}: {observed:#?}"
+		);
+	}
+	assert!(executed(&observed, "emitted_interface_project", None));
+	assert!(executed(&observed, "compiled_interface_project", None));
+}
+
+#[test]
+fn recompiling_without_edits_executes_no_stable_query_bodies() {
+	let (mut session, events) = event_session();
+	let project = ProjectId::new("stable-emission-clean");
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"public func main(): void = {}".into(),
+		SourceVersion(1),
+	);
+	session
+		.compile_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
+		.unwrap();
+	events.lock().unwrap().clear();
+	session
+		.compile_interface_project_for_test(project, main, EntryMode::Entry)
+		.unwrap();
+	let observed = events.lock().unwrap();
+	assert!(
+		observed.is_empty(),
+		"a clean stable compile should be fully memoized: {observed:#?}"
+	);
+}
+
+#[test]
+fn failed_semantic_checking_prevents_stable_lowering_emission_and_bundling() {
+	let (mut session, events) = event_session();
+	let project = ProjectId::new("stable-emission-errors");
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"public func main(): int = missing".into(),
+		SourceVersion(1),
+	);
+	assert!(
+		session
+			.compile_interface_project_for_test(project, main, EntryMode::Entry)
+			.is_err()
+	);
+	let observed = events.lock().unwrap();
+	for query in [
+		"lower_interface_module",
+		"emitted_interface_module",
+		"emitted_interface_project",
+		"compiled_interface_project",
+	] {
+		assert!(!executed(&observed, query, None), "{query}: {observed:#?}");
+	}
+}
+
+#[test]
+fn equal_emitted_module_stops_project_and_bundle_invalidation() {
+	let (mut session, events) = event_session();
+	let project = ProjectId::new("stable-emission-backdating");
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"func unused(value: int): void = {}\npublic func main(): void = {}".into(),
+		SourceVersion(1),
+	);
+	let before = session
+		.compile_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
+		.unwrap();
+	events.lock().unwrap().clear();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"func unused(value: float): void = {}\npublic func main(): void = {}".into(),
+		SourceVersion(2),
+	);
+	let after = session
+		.compile_interface_project_for_test(project, main, EntryMode::Entry)
+		.unwrap();
+	assert_eq!(before.js, after.js);
+	let observed = events.lock().unwrap();
+	assert!(
+		executed(&observed, "emitted_interface_module", Some("main")),
+		"{observed:#?}"
+	);
+	assert!(
+		!executed(&observed, "emitted_interface_project", None),
+		"{observed:#?}"
+	);
+	assert!(
+		!executed(&observed, "compiled_interface_project", None),
+		"{observed:#?}"
+	);
 }
 
 #[test]
