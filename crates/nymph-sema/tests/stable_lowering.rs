@@ -405,6 +405,10 @@ fn each_implementation_gets_distinct_materialized_defaults_and_its_own_sibling()
 			materialized.demands(),
 			[owner.clone(), sibling.member_id.clone()]
 		);
+		assert_eq!(
+			materialized.placement(),
+			&nymph_sema::RuntimeAssemblyPlacement::Shell(owner.clone())
+		);
 	}
 }
 
@@ -483,6 +487,12 @@ fn lowers_one_canonical_function_and_value_without_a_module() {
 	assert!(
 		matches!(lowered[1].fragment(), nymph_sema::LoweredHirFragment::TopLevelValue(value) if value.value == nymph_hir::hir::HirExpr::Num(42.0, nymph_hir::hir::NumKind::Int))
 	);
+	for item in &lowered {
+		assert_eq!(
+			item.placement(),
+			&nymph_sema::RuntimeAssemblyPlacement::Module(item.definition().module.clone())
+		);
+	}
 }
 
 #[test]

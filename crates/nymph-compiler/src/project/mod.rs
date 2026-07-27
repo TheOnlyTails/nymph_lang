@@ -513,25 +513,8 @@ pub(crate) fn compile_standalone(
 	let (session, project, path) = standalone_session(source);
 	session
 		.compile_project_with_options(project, path, entry_mode, true)
-		.map(|compiled| standalone_javascript(&compiled.js))
+		.map(|compiled| compiled.js.clone())
 		.map_err(|diags| diags.iter().map(|item| item.diag.clone()).collect())
-}
-
-fn standalone_javascript(javascript: &str) -> String {
-	let mut javascript =
-		javascript.replace("//#region @nymph/runtime/option", "//#region std/option");
-	if let Some(option_name) = javascript.lines().find_map(|line| {
-		line
-			.strip_prefix("const ")?
-			.split_once("$Option =")
-			.map(|(name, _)| format!("{name}$Option"))
-	}) {
-		javascript = javascript
-			.replace("import { Option } from \"std/option\";\n", "")
-			.replace("? Option.", &format!("? {option_name}."))
-			.replace(": Option.", &format!(": {option_name}."));
-	}
-	javascript
 }
 
 /// Internal inspection seam for regressions that must assert the exact ES
@@ -999,8 +982,7 @@ impl Driver {
 
 		let owners = crate::prelude::core_runtime_type_owners();
 		let intrinsic_sources = crate::intrinsics::intrinsic_module_sources();
-		let intrinsic_type_demands =
-			crate::intrinsics::runtime_type_imports(&intrinsic_sources, owners);
+		let intrinsic_type_demands = crate::intrinsics::runtime_type_imports(intrinsic_sources.keys());
 		let declaration_seeds = crate::prelude::core_runtime_declaration_seeds();
 		let mut runtime_enums: FxHashMap<String, Vec<HirEnum>> = FxHashMap::default();
 		let mut runtime_classes: FxHashMap<String, Vec<HirClass>> = FxHashMap::default();

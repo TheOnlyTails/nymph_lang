@@ -808,8 +808,7 @@ pub(crate) fn compat_emitted_module<'db>(
 	let module_sources = (|| {
 		let owners = crate::prelude::core_runtime_type_owners();
 		let intrinsic_sources = crate::intrinsics::intrinsic_module_sources();
-		let intrinsic_type_demands =
-			crate::intrinsics::runtime_type_imports(&intrinsic_sources, owners);
+		let intrinsic_type_demands = crate::intrinsics::runtime_type_imports(intrinsic_sources.keys());
 		let declaration_seeds = crate::prelude::core_runtime_declaration_seeds();
 		let mut runtime_enums: FxHashMap<String, Vec<HirEnum>> = FxHashMap::default();
 		let mut runtime_classes: FxHashMap<String, Vec<HirClass>> = FxHashMap::default();

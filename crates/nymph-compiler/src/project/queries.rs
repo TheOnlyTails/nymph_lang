@@ -5,7 +5,6 @@ use nymph_ast::{
 	decl::{Declaration, Module},
 };
 use nymph_diagnostics::Diagnostic;
-use nymph_sema::StableShapeLookup;
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -1304,11 +1303,46 @@ pub(crate) fn lower_interface_module<'db>(
 				},
 				_ => error.into(),
 			})?;
+		if let nymph_sema::LoweredHirFragment::TopLevelExternal { abi, .. } = fragment.fragment()
+			&& let Some(module) = abi.module.as_deref()
+			&& let Some(dependency) = crate::intrinsics::runtime_dependency(module)
+		{
+			let option_module = key
+				.ambient_core_registry(db)
+				.modules(db)
+				.iter()
+				.copied()
+				.find(|module| module.key(db).path.as_ref() == dependency.ambient_module)
+				.ok_or_else(|| nymph_sema::StableModuleAssemblyError::UnresolvedDemand {
+					definition: definition.clone(),
+				})?;
+			let option = runtime_definition_ids(db, key, SemanticModuleInput::Builtin(option_module))
+				.map_err(
+					|_| nymph_sema::StableModuleAssemblyError::UnresolvedDemand {
+						definition: definition.clone(),
+					},
+				)?
+				.iter()
+				.find(|candidate| {
+					matches!(
+						&candidate.key,
+						nymph_sema::DeclarationKey::TopLevel {
+							category: nymph_sema::DeclarationCategory::Enum,
+							name,
+							..
+						} if name == dependency.enum_name
+					)
+				})
+				.cloned()
+				.ok_or_else(|| nymph_sema::StableModuleAssemblyError::UnresolvedDemand {
+					definition: definition.clone(),
+				})?;
+			queue.push_back(option);
+		}
 		queue.extend(fragment.demands().iter().cloned());
 		lowered.push(fragment.as_ref().clone());
 	}
 
-	let context = CompilerStableContext { db, key };
 	let mut hir = nymph_hir::hir::HirModule {
 		lets: vec![],
 		funcs: vec![],
@@ -1317,7 +1351,7 @@ pub(crate) fn lower_interface_module<'db>(
 	};
 	let mut shell_indices = std::collections::HashMap::new();
 	for fragment in &lowered {
-		if fragment.definition().module != module.identity(db) {
+		if fragment.placement() != &nymph_sema::RuntimeAssemblyPlacement::Module(module.identity(db)) {
 			continue;
 		}
 		match fragment.fragment() {
@@ -1334,42 +1368,43 @@ pub(crate) fn lower_interface_module<'db>(
 	}
 	let mut attachments = std::collections::HashSet::new();
 	for fragment in &lowered {
-		let fragment_owner = match fragment.fragment() {
-			nymph_sema::LoweredHirFragment::AttachedInstance { owner, .. }
-			| nymph_sema::LoweredHirFragment::AttachedStatic { owner, .. }
-			| nymph_sema::LoweredHirFragment::AttachedMember { owner, .. }
-			| nymph_sema::LoweredHirFragment::MaterializedDefault { owner, .. } => owner.module.clone(),
-			_ => fragment.definition().module.clone(),
+		let placement_module = match fragment.placement() {
+			nymph_sema::RuntimeAssemblyPlacement::Module(owner) => owner,
+			nymph_sema::RuntimeAssemblyPlacement::Shell(owner) => &owner.module,
+			nymph_sema::RuntimeAssemblyPlacement::Template => {
+				return Err(nymph_sema::StableModuleAssemblyError::MismatchedPlacement {
+					definition: fragment.definition().clone(),
+					owner: fragment.definition().clone(),
+				});
+			}
 		};
-		if fragment_owner != module.identity(db) {
+		if placement_module != &module.identity(db) {
 			continue;
 		}
 		use nymph_sema::LoweredHirFragment as Fragment;
 		match fragment.fragment() {
 			Fragment::TopLevelFunction(func) => hir.funcs.push(func.clone()),
 			Fragment::TopLevelValue(value) => hir.lets.push(value.clone()),
-			Fragment::AttachedInstance { owner, method }
-			| Fragment::AttachedMember { owner, method }
-			| Fragment::MaterializedDefault { owner, method, .. } => {
+			Fragment::AttachedInstance { method, .. }
+			| Fragment::AttachedMember { method, .. }
+			| Fragment::MaterializedDefault { method, .. } => {
 				attach_method(
-					&context,
 					&mut hir,
 					&shell_indices,
 					&mut attachments,
 					fragment.definition(),
-					owner,
+					fragment.placement(),
 					method,
 					false,
 				)?;
 			}
-			Fragment::AttachedStatic { owner, method } => {
+			Fragment::AttachedStatic { method, .. } => {
 				attach_method(
-					&context,
 					&mut hir,
 					&shell_indices,
 					&mut attachments,
 					fragment.definition(),
-					owner,
+					fragment.placement(),
 					method,
 					true,
 				)?;
@@ -1390,14 +1425,16 @@ pub(crate) fn lower_interface_module<'db>(
 		.collect();
 	let virtual_runtime = lowered
 		.iter()
-		.filter(|item| {
-			matches!(
-				item.definition().module.origin,
-				nymph_sema::ModuleOrigin::Compiler
-			)
+		.filter_map(|item| {
+			let owner = match item.placement() {
+				nymph_sema::RuntimeAssemblyPlacement::Module(owner) => owner.clone(),
+				nymph_sema::RuntimeAssemblyPlacement::Shell(shell) => shell.module.clone(),
+				nymph_sema::RuntimeAssemblyPlacement::Template => return None,
+			};
+			matches!(owner.origin, nymph_sema::ModuleOrigin::Compiler).then_some((item, owner))
 		})
-		.map(|item| nymph_sema::VirtualRuntimeFragment {
-			owner: item.definition().module.clone(),
+		.map(|(item, owner)| nymph_sema::VirtualRuntimeFragment {
+			owner,
 			definition: item.definition().clone(),
 			fragment: item.clone(),
 		})
@@ -1413,38 +1450,29 @@ pub(crate) fn lower_interface_module<'db>(
 }
 
 fn attach_method(
-	context: &CompilerStableContext<'_>,
 	hir: &mut nymph_hir::hir::HirModule,
 	shells: &std::collections::HashMap<nymph_sema::DefinitionId, (bool, usize)>,
 	seen: &mut std::collections::HashSet<(nymph_sema::DefinitionId, ecow::EcoString, bool)>,
 	definition: &nymph_sema::DefinitionId,
-	owner: &nymph_sema::DefinitionId,
+	placement: &nymph_sema::RuntimeAssemblyPlacement,
 	method: &nymph_hir::hir::HirMethod,
 	static_: bool,
 ) -> Result<(), nymph_sema::StableModuleAssemblyError> {
-	let shell = if let Some(shell) = shells.get(owner) {
-		Some((owner.clone(), *shell))
-	} else {
-		let request = nymph_sema::StableShapeRequest::Implementation(owner.clone());
-		match context.stable_shape(&request) {
-			Ok(nymph_sema::StableShapeFact::Implementation(shape)) => shape
-				.runtime_owner
-				.and_then(|id| shells.get(&id).copied().map(|shell| (id, shell)))
-				.or_else(|| match shape.self_type {
-					nymph_sema::InterfaceType::Named { definition, .. } => shells
-						.get(&definition)
-						.copied()
-						.map(|shell| (definition, shell)),
-					_ => None,
-				}),
-			_ => None,
-		}
-	}
-	.ok_or_else(
-		|| nymph_sema::StableModuleAssemblyError::MissingOwnerShell {
-			owner: owner.clone(),
-		},
-	)?;
+	let nymph_sema::RuntimeAssemblyPlacement::Shell(owner) = placement else {
+		return Err(nymph_sema::StableModuleAssemblyError::MismatchedPlacement {
+			definition: definition.clone(),
+			owner: definition.clone(),
+		});
+	};
+	let shell = shells
+		.get(owner)
+		.copied()
+		.map(|shell| (owner.clone(), shell))
+		.ok_or_else(
+			|| nymph_sema::StableModuleAssemblyError::MissingOwnerShell {
+				owner: owner.clone(),
+			},
+		)?;
 	if !seen.insert((shell.0.clone(), method.name.clone(), static_)) {
 		return Err(nymph_sema::StableModuleAssemblyError::DuplicateAttachment {
 			owner: shell.0,

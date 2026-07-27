@@ -285,6 +285,14 @@ pub struct LoweredRuntimeDefinition {
 	definition: DefinitionId,
 	fragment: LoweredHirFragment,
 	demands: StableDemandSet,
+	placement: RuntimeAssemblyPlacement,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeAssemblyPlacement {
+	Module(ModuleIdentity),
+	Shell(DefinitionId),
+	Template,
 }
 
 impl LoweredRuntimeDefinition {
@@ -292,11 +300,13 @@ impl LoweredRuntimeDefinition {
 		definition: DefinitionId,
 		fragment: LoweredHirFragment,
 		demands: StableDemandSet,
+		placement: RuntimeAssemblyPlacement,
 	) -> Self {
 		Self {
 			definition,
 			fragment,
 			demands,
+			placement,
 		}
 	}
 	pub fn definition(&self) -> &DefinitionId {
@@ -307,6 +317,9 @@ impl LoweredRuntimeDefinition {
 	}
 	pub fn demands(&self) -> &[DefinitionId] {
 		self.demands.as_slice()
+	}
+	pub fn placement(&self) -> &RuntimeAssemblyPlacement {
+		&self.placement
 	}
 }
 
@@ -371,6 +384,10 @@ pub enum StableLoweringError {
 		definition: DefinitionId,
 		expected: DefinitionId,
 		actual: DefinitionId,
+	},
+	MissingAttachmentShell {
+		definition: DefinitionId,
+		owner: DefinitionId,
 	},
 	Unsupported {
 		definition: DefinitionId,
@@ -561,7 +578,80 @@ pub fn lower_runtime_definition(
 			}
 		}
 	};
-	Ok(LoweredRuntimeDefinition::new(definition, fragment, demands))
+	let placement = runtime_assembly_placement(context, &definition, &fragment)?;
+	if let RuntimeAssemblyPlacement::Shell(shell) = &placement {
+		demands.insert(shell.clone());
+	}
+	Ok(LoweredRuntimeDefinition::new(
+		definition, fragment, demands, placement,
+	))
+}
+
+fn runtime_assembly_placement(
+	context: &impl StableShapeLookup,
+	definition: &DefinitionId,
+	fragment: &LoweredHirFragment,
+) -> Result<RuntimeAssemblyPlacement, StableLoweringError> {
+	use LoweredHirFragment as Fragment;
+	match fragment {
+		Fragment::TopLevelFunction(_)
+		| Fragment::TopLevelValue(_)
+		| Fragment::TopLevelExternal { .. }
+		| Fragment::StructShell(_)
+		| Fragment::EnumShell(_) => Ok(RuntimeAssemblyPlacement::Module(definition.module.clone())),
+		Fragment::MaterializedDefault { implementation, .. } => {
+			attachment_shell(context, definition, implementation)
+		}
+		Fragment::AttachedInstance { owner, .. }
+		| Fragment::AttachedStatic { owner, .. }
+		| Fragment::AttachedMember { owner, .. } => match &owner.key {
+			crate::DeclarationKey::TopLevel {
+				category: crate::DeclarationCategory::Interface,
+				..
+			} => Ok(RuntimeAssemblyPlacement::Template),
+			_ => attachment_shell(context, definition, owner),
+		},
+	}
+}
+
+fn attachment_shell(
+	context: &impl StableShapeLookup,
+	definition: &DefinitionId,
+	owner: &DefinitionId,
+) -> Result<RuntimeAssemblyPlacement, StableLoweringError> {
+	let shell = match &owner.key {
+		crate::DeclarationKey::TopLevel {
+			category: crate::DeclarationCategory::Struct | crate::DeclarationCategory::Enum,
+			..
+		} => owner.clone(),
+		crate::DeclarationKey::Implementation { .. } => {
+			let request = StableShapeRequest::Implementation(owner.clone());
+			let StableShapeFact::Implementation(shape) = context.stable_shape(&request)? else {
+				return Err(StableShapeLookupError::WrongFact { request }.into());
+			};
+			let InterfaceType::Named { definition, .. } = shape.self_type else {
+				return Err(StableLoweringError::MissingAttachmentShell {
+					definition: definition.clone(),
+					owner: owner.clone(),
+				});
+			};
+			definition
+		}
+		_ => {
+			return Err(StableLoweringError::MissingAttachmentShell {
+				definition: definition.clone(),
+				owner: owner.clone(),
+			});
+		}
+	};
+	let request = StableShapeRequest::TypeShell(shell.clone());
+	if !matches!(
+		context.stable_shape(&request)?,
+		StableShapeFact::TypeShell(_)
+	) {
+		return Err(StableShapeLookupError::WrongFact { request }.into());
+	}
+	Ok(RuntimeAssemblyPlacement::Shell(shell))
 }
 
 fn invalid(definition: &DefinitionId, reason: &str) -> StableLoweringError {

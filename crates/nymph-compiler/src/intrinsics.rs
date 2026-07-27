@@ -29,7 +29,6 @@
 use std::sync::OnceLock;
 
 use rustc_hash::FxHashMap;
-use rustc_hash::FxHashSet;
 
 /// One registry MODULE specifier's `include_str!`-embedded `.ts` source —
 /// mirrors `prelude.rs`'s `CORE_SOURCES` table one level down (runtime JS,
@@ -147,63 +146,36 @@ fn build_intrinsic_module_sources() -> FxHashMap<String, String> {
 	sources
 }
 
-/// Core runtime types named by imports retained in intrinsic JS. This is
-/// derived from stripped output rather than a handwritten Option/Result list,
-/// so adding another source-level intrinsic import automatically creates the
-/// corresponding canonical declaration demand.
-pub(crate) fn runtime_type_imports(
-	sources: &FxHashMap<String, String>,
-	owners: &FxHashMap<ecow::EcoString, &'static str>,
-) -> FxHashSet<ecow::EcoString> {
-	let mut demands = FxHashSet::default();
-	let canonical_specifiers: FxHashSet<_> = owners.values().copied().collect();
-	for source in sources.values() {
-		for line in source.lines() {
-			let line = line.trim();
-			let Some((_, quoted_specifier)) = line.rsplit_once(" from ") else {
-				continue;
-			};
-			let quoted_specifier = quoted_specifier.trim_end_matches(';');
-			let specifier = quoted_specifier
-				.strip_prefix('"')
-				.and_then(|specifier| specifier.strip_suffix('"'))
-				.or_else(|| {
-					quoted_specifier
-						.strip_prefix('\'')
-						.and_then(|specifier| specifier.strip_suffix('\''))
-				});
-			let Some(specifier) = specifier else {
-				continue;
-			};
-			if !canonical_specifiers.contains(specifier) {
-				continue;
-			}
-			if !(line.starts_with("import {") && line.ends_with("\";")) {
-				panic!("malformed retained canonical runtime import: `{line}`");
-			}
-			let Some((bindings, specifier)) = line.split_once("} from \"") else {
-				panic!("malformed retained canonical runtime import: `{line}`");
-			};
-			let specifier = specifier.trim_end_matches(';').trim_end_matches('"');
-			for binding in bindings
-				.trim_start()
-				.trim_start_matches("import {")
-				.split(',')
-			{
-				let name = binding.trim();
-				let Some((canonical, _)) = owners
-					.iter()
-					.find(|(candidate, owner)| candidate.as_str() == name && **owner == specifier)
-				else {
-					panic!(
-						"unsupported retained canonical runtime import binding `{name}` from `{specifier}`"
-					);
-				};
-				demands.insert((*canonical).clone());
-			}
-		}
-	}
-	demands
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct IntrinsicRuntimeDependency {
+	pub import_specifier: &'static str,
+	pub ambient_module: &'static str,
+	pub enum_name: &'static str,
+}
+
+pub(crate) const OPTION_RUNTIME_DEPENDENCY: IntrinsicRuntimeDependency =
+	IntrinsicRuntimeDependency {
+		import_specifier: "std/option",
+		ambient_module: "option",
+		enum_name: "Option",
+	};
+
+pub(crate) fn runtime_dependency(module: &str) -> Option<IntrinsicRuntimeDependency> {
+	matches!(
+		module,
+		"std/collections/list" | "std/collections/map" | "std/string"
+	)
+	.then_some(OPTION_RUNTIME_DEPENDENCY)
+}
+
+pub(crate) fn runtime_type_imports<'a>(
+	modules: impl IntoIterator<Item = &'a String>,
+) -> rustc_hash::FxHashSet<ecow::EcoString> {
+	modules
+		.into_iter()
+		.filter_map(|module| runtime_dependency(module))
+		.map(|dependency| ecow::EcoString::from(dependency.enum_name))
+		.collect()
 }
 
 #[cfg(test)]
@@ -312,72 +284,12 @@ mod tests {
 	}
 
 	#[test]
-	#[should_panic(expected = "malformed retained canonical runtime import")]
-	fn malformed_retained_canonical_runtime_import_panics_loudly() {
-		let owners = crate::prelude::core_runtime_type_owners();
-		let sources = FxHashMap::from_iter([(
-			"intrinsic".to_string(),
-			"import { Option } from 'std/option';\n".to_string(),
-		)]);
-
-		let _ = runtime_type_imports(&sources, owners);
-	}
-
-	#[test]
-	#[should_panic(expected = "unsupported retained canonical runtime import binding")]
-	fn aliased_retained_canonical_runtime_import_panics_loudly() {
-		let owners = crate::prelude::core_runtime_type_owners();
-		let sources = FxHashMap::from_iter([(
-			"intrinsic".to_string(),
-			"import { Option as O } from \"std/option\";\n".to_string(),
-		)]);
-
-		let _ = runtime_type_imports(&sources, owners);
-	}
-
-	#[test]
-	#[should_panic(expected = "unsupported retained canonical runtime import binding")]
-	fn empty_retained_canonical_runtime_import_binding_panics_loudly() {
-		let owners = crate::prelude::core_runtime_type_owners();
-		let sources = FxHashMap::from_iter([(
-			"intrinsic".to_string(),
-			"import { Option, } from \"std/option\";\n".to_string(),
-		)]);
-
-		let _ = runtime_type_imports(&sources, owners);
-	}
-
-	#[test]
-	#[should_panic(expected = "unsupported retained canonical runtime import binding")]
-	fn unknown_retained_canonical_runtime_import_name_panics_loudly() {
-		let owners = crate::prelude::core_runtime_type_owners();
-		let sources = FxHashMap::from_iter([(
-			"intrinsic".to_string(),
-			"import { NotAType } from \"std/option\";\n".to_string(),
-		)]);
-
-		let _ = runtime_type_imports(&sources, owners);
-	}
-
-	#[test]
-	fn unsupported_noncanonical_intrinsic_import_is_ignored() {
-		let owners = crate::prelude::core_runtime_type_owners();
-		let sources = FxHashMap::from_iter([(
-			"intrinsic".to_string(),
-			"import { value as alias, } from \"ordinary/intrinsic\";\n".to_string(),
-		)]);
-
-		assert!(runtime_type_imports(&sources, owners).is_empty());
-	}
-
-	#[test]
-	fn malformed_noncanonical_import_containing_a_runtime_owner_is_ignored() {
-		let owners = crate::prelude::core_runtime_type_owners();
-		let sources = FxHashMap::from_iter([(
-			"intrinsic".to_string(),
-			"import { Option } from 'vendor/std/option';\n".to_string(),
-		)]);
-
-		assert!(runtime_type_imports(&sources, owners).is_empty());
+	fn option_dependency_is_structured_and_module_specific() {
+		for module in ["std/collections/list", "std/collections/map", "std/string"] {
+			assert_eq!(runtime_dependency(module), Some(OPTION_RUNTIME_DEPENDENCY));
+		}
+		for module in ["std/hash", "std/display", "std/io", "std/math/intrinsics"] {
+			assert_eq!(runtime_dependency(module), None);
+		}
 	}
 }

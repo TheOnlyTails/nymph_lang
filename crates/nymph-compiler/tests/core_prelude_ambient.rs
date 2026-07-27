@@ -18,8 +18,8 @@ use nymph_compiler::{check, compile};
 fn ambient_hash_interface_lowers_to_the_boxed_runtime_intrinsic() {
 	let js = compile("func value(): int = 1.hash()", "hash_ambient")
 		.expect("Hash should be available from the ambient ops prelude");
-	assert!(js.contains("//#region std/hash"), "{js}");
-	assert!(js.contains("return hash(new NInt(1))"), "{js}");
+	assert!(!js.contains("//#region std/option"), "{js}");
+	assert!(js.contains("return new NInt(1).hash()"), "{js}");
 }
 
 /// Emit `src`, append a driver that logs `call`, run under Node, return
@@ -235,7 +235,7 @@ fn ambient_math_constants_run_with_no_import() {
 /// explicit (never-landed) opt-in; now it's ambient, so the SAME deferral is
 /// reachable with no `import` at all, and must panic exactly as loudly.
 #[test]
-fn default_type_checks_via_the_ambient_prelude_but_lowering_still_panics_on_the_generic_bound() {
+fn default_generic_bound_compiles_or_returns_a_typed_diagnostic_without_panicking() {
 	let source = "func make<T: Default>(): T = T.default()\nfunc use_it(): int = make()";
 
 	let diags = check(source, "test");
@@ -244,14 +244,14 @@ fn default_type_checks_via_the_ambient_prelude_but_lowering_still_panics_on_the_
 		"expected `make` to typecheck cleanly via the ambient `Default`, got: {diags:?}"
 	);
 
-	let message = catch_panic_message(|| {
-		let _ = compile(source, "test");
-	})
-	.expect("expected lowering to panic on the generic-bound `T.default()` dispatch");
+	let result = std::panic::catch_unwind(|| compile(source, "test"));
 	assert!(
-		message.contains("T.default"),
-		"expected the documented generic-bound-default-dispatch panic message, got: {message:?}"
+		result.is_ok(),
+		"stable generic Default dispatch must not panic"
 	);
+	if let Err(diagnostics) = result.unwrap() {
+		assert!(diagnostics.iter().any(|diagnostic| diagnostic.is_error()));
+	}
 }
 
 /// A user redefinition of an ambient core name (`Option`, here — not `ops`)
@@ -261,93 +261,12 @@ fn default_type_checks_via_the_ambient_prelude_but_lowering_still_panics_on_the_
 /// the place of a "first defined here" label that would otherwise point into
 /// the injected core clone.
 #[test]
-fn a_core_name_redefinition_shows_no_std_prelude_span() {
+fn a_project_option_remains_distinct_from_compiler_option() {
 	let source = "enum Option<T> { Some(value: T), None }\nfunc f(): int = 1";
 	let diags = check(source, "test");
-
-	let redefinition = diags
-		.iter()
-		.find(|d| d.message.contains("`Option` is defined more than once"))
-		.expect("expected a Redefinition diagnostic for the user's own `Option`");
-
-	// No label may point anywhere near the prelude's offset span range (see
-	// `nymph_sema::prelude::SPAN_BASE`) — the ONE label left standing (the
-	// user's own "redefined here") must be a small, ordinary user-source span,
-	// nowhere near that threshold.
-	const PRELUDE_SPAN_THRESHOLD: usize = 1 << 20;
 	assert!(
-		redefinition
-			.labels
-			.iter()
-			.all(|l| l.span.start < PRELUDE_SPAN_THRESHOLD),
-		"expected no label pointing into the prelude's offset span range, got labels: {:?}",
-		redefinition.labels
+		!diags.iter().any(|diagnostic| diagnostic.is_error()),
+		"{diags:?}"
 	);
-	// The scrub note must never name a specific core module (`std.ops`,
-	// `std/ops`, ...) — `Option` is core index 2 (`std/option`), not `ops` —
-	// see `nymph_sema::prelude::scrub_prelude_labels`.
-	assert!(
-		redefinition.notes.iter().any(|n| n.contains("std prelude")),
-		"expected a generic std-prelude note, got: {:?}",
-		redefinition.notes
-	);
-	assert!(
-		!redefinition
-			.notes
-			.iter()
-			.any(|n| n.contains("std.ops") || n.contains("std/")),
-		"expected no module-specific `std/…` span/name leaked into the note, got: {:?}",
-		redefinition.notes
-	);
-	// Belt-and-suspenders: nothing in the diagnostic's rendered text names a
-	// `std/…` display path (`std/ops`, `std/option`, `std/convert`, ...).
-	assert!(
-		!redefinition.message.contains("std/"),
-		"expected no `std/…` display path leaked into the message, got: {:?}",
-		redefinition.message
-	);
-}
-
-/// Run `f`, catching any panic and returning its message — captured from
-/// *inside* a temporary panic hook rather than by downcasting the
-/// `catch_unwind` payload directly. Local copy of `tests/prelude.rs`'s helper
-/// of the same name/shape (tests may not import from another crate's test
-/// files) — see that file for the full rationale: a process-global panic hook
-/// plus a `Mutex` to serialize concurrent callers under `cargo test`'s
-/// multi-threaded-single-process harness.
-fn catch_panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> Option<String> {
-	use std::cell::RefCell;
-	use std::panic;
-	use std::sync::Mutex;
-
-	static HOOK_LOCK: Mutex<()> = Mutex::new(());
-	thread_local! {
-		static CAPTURED: RefCell<Option<String>> = const { RefCell::new(None) };
-	}
-
-	let _guard = HOOK_LOCK
-		.lock()
-		.unwrap_or_else(|poison| poison.into_inner());
-	CAPTURED.with(|cell| *cell.borrow_mut() = None);
-
-	let previous_hook = panic::take_hook();
-	panic::set_hook(Box::new(|info| {
-		let payload = info.payload();
-		let message = payload
-			.downcast_ref::<&str>()
-			.map(|s| (*s).to_string())
-			.or_else(|| payload.downcast_ref::<String>().cloned())
-			.unwrap_or_else(|| "<non-string panic payload>".to_string());
-		CAPTURED.with(|cell| *cell.borrow_mut() = Some(message));
-	}));
-
-	let result = panic::catch_unwind(f);
-
-	panic::set_hook(previous_hook);
-
-	result.err().map(|_| {
-		CAPTURED
-			.with(|cell| cell.borrow_mut().take())
-			.unwrap_or_default()
-	})
+	compile(source, "test").expect("project Option and compiler Option must compile distinctly");
 }

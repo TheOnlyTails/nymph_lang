@@ -5,10 +5,10 @@ use nymph_hir::hir::{HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirMethod};
 use nymph_sema::{
 	CanonicalModuleSpecifier, DeclarationCategory, DeclarationKey, DefinitionId, EmittedBindingName,
 	EmittedMemberName, ExternalAbi, LoweredHirFragment, LoweredRuntimeDefinition, ModuleIdentity,
-	ModuleOrigin, RuntimeDefinition, RuntimeDefinitionLookup, RuntimeDefinitionLookupError,
-	RuntimePayload, RuntimePlacement, StableDemandSet, StableLoweringContext, StableNameLookup,
-	StableNameLookupError, StableShapeFact, StableShapeLookup, StableShapeLookupError,
-	StableShapeRequest,
+	ModuleOrigin, RuntimeAssemblyPlacement, RuntimeDefinition, RuntimeDefinitionLookup,
+	RuntimeDefinitionLookupError, RuntimePayload, RuntimePlacement, StableDemandSet,
+	StableLoweringContext, StableNameLookup, StableNameLookupError, StableShapeFact,
+	StableShapeLookup, StableShapeLookupError, StableShapeRequest,
 };
 
 fn module(origin: ModuleOrigin, project: &str, path: &str) -> ModuleIdentity {
@@ -232,9 +232,14 @@ fn lowered_fragments_encode_placement_and_ordered_deduplicated_demands() {
 			body: HirExpr::Bool(false),
 		}),
 		demands,
+		RuntimeAssemblyPlacement::Module(owner.module.clone()),
 	);
 	assert_eq!(lowered.definition(), &owner);
 	assert_eq!(lowered.demands(), &[first, second]);
+	assert_eq!(
+		lowered.placement(),
+		&RuntimeAssemblyPlacement::Module(owner.module.clone())
+	);
 
 	let _value = LoweredHirFragment::TopLevelValue(HirLet {
 		name: "answer".into(),
