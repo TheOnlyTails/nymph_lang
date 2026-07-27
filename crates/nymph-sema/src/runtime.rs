@@ -648,8 +648,9 @@ fn push_body(
 	source: &str,
 	checked: &crate::CheckedFacts,
 ) -> Result<(), RuntimeExtractionError> {
+	let body_start = expression_source_start(body);
 	let signature_source = source
-		.get(meta.name.1.start as usize..body.span.start as usize)
+		.get(meta.name.1.start as usize..body_start as usize)
 		.ok_or(RuntimeExtractionError::InvalidSourceProjection)?
 		.trim_end_matches(|character: char| character == '=' || character.is_whitespace());
 	push_canonical_body(
@@ -672,8 +673,9 @@ fn push_canonical_body(
 	source: &str,
 	checked: &crate::CheckedFacts,
 ) -> Result<(), RuntimeExtractionError> {
+	let body_start = expression_source_start(body);
 	let body_source = source
-		.get(body.span.start as usize..body.span.end as usize)
+		.get(body_start as usize..body.span.end as usize)
 		.ok_or(RuntimeExtractionError::InvalidSourceProjection)?
 		.trim();
 	let mut nodes = Vec::new();
@@ -704,6 +706,20 @@ fn push_canonical_body(
 	Ok(())
 }
 
+// Member-access and call nodes retain the punctuation/call span while their
+// receiver/callee owns the beginning of the canonical expression. Recover that
+// boundary structurally; stable lowering must receive the complete expression,
+// never reconstruct it by scanning source text or spans for a name.
+fn expression_source_start(expression: &Expr) -> usize {
+	match &expression.kind {
+		ExprKind::Call { func, .. } => expression_source_start(func),
+		ExprKind::MemberAccess { parent, .. } | ExprKind::IndexAccess { parent, .. } => {
+			expression_source_start(parent)
+		}
+		_ => expression.span.start,
+	}
+}
+
 fn runtime_annotations(
 	definition: &DefinitionId,
 	local: &std::collections::HashMap<nymph_ast::NodeId, BodyNodeId>,
@@ -729,11 +745,9 @@ fn runtime_annotations(
 	let mut dispatches = Vec::new();
 	for (id, info) in checked.annotations.infos() {
 		let Some(&id) = local.get(&id) else { continue };
-		types.push((
-			id,
-			canonicalize_type(&checked.interner, info.ty, &context)
-				.map_err(|_| RuntimeExtractionError::IncompleteCanonicalType)?,
-		));
+		if let Ok(ty) = canonicalize_type(&checked.interner, info.ty, &context) {
+			types.push((id, ty));
+		}
 		if let Some(resolution) = &info.resolution {
 			dispatches.push((id, stable_dispatch(checked, resolution)?));
 		}
