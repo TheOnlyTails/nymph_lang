@@ -397,6 +397,7 @@ impl CompilerSession {
 		input.set_source(&mut self.db).to(Arc::from(source));
 	}
 
+	#[cfg(feature = "test-support")]
 	fn compat_input(
 		&self,
 		project: &ProjectId,
@@ -409,6 +410,7 @@ impl CompilerSession {
 	}
 
 	#[must_use]
+	#[cfg(feature = "test-support")]
 	pub fn compat_module_interface(
 		&self,
 		project: ProjectId,
@@ -422,6 +424,7 @@ impl CompilerSession {
 	}
 
 	#[must_use]
+	#[cfg(feature = "test-support")]
 	pub fn compat_module_environment(
 		&self,
 		project: ProjectId,
@@ -436,6 +439,7 @@ impl CompilerSession {
 		))
 	}
 
+	#[cfg(feature = "test-support")]
 	pub fn compat_environment_is_lowerable(
 		&self,
 		project: ProjectId,
@@ -455,6 +459,7 @@ impl CompilerSession {
 	}
 
 	#[must_use]
+	#[cfg(feature = "test-support")]
 	pub fn compat_module_diagnostics(
 		&self,
 		project: ProjectId,
@@ -1201,6 +1206,19 @@ impl CompilerSession {
 		mode: EntryMode,
 	) -> Arc<[ProjectDiagnostic]> {
 		let key = self.project_key(project, entry, mode, false, true);
+		queries::interface_project_diagnostics(&self.db, key)
+			.0
+			.clone()
+	}
+
+	pub(crate) fn check_project_with_options(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		mode: EntryMode,
+		preserve_names: bool,
+	) -> Arc<[ProjectDiagnostic]> {
+		let key = self.project_key(project, entry, mode, preserve_names, true);
 		queries::interface_project_diagnostics(&self.db, key)
 			.0
 			.clone()

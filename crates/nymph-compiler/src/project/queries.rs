@@ -1648,7 +1648,25 @@ pub(crate) fn interface_project_diagnostics<'db>(
 ) -> super::session::ProjectDiagnostics {
 	let graph = project_graph(db, key);
 	if !graph.diagnostics.is_empty() {
-		return super::session::ProjectDiagnostics(graph.diagnostics.clone());
+		let mut diagnostics = graph.diagnostics.iter().cloned().collect::<Vec<_>>();
+		// A name-preserving project is the standalone facade. Preserve its
+		// long-standing recovery contract by checking the parser's recovered AST
+		// after reporting parse diagnostics, rather than aborting at graph build.
+		if key.preserve_names(db)
+			&& key.project_input(db).project(db).as_str() == super::FACADE_PROJECT
+			&& let Some(entry) = key
+				.project_input(db)
+				.active_modules(db)
+				.iter()
+				.find(|module| module.path(db) == key.entry(db))
+		{
+			diagnostics.extend(
+				interface_module_diagnostics(db, key, SemanticModuleInput::Project(*entry))
+					.iter()
+					.cloned(),
+			);
+		}
+		return super::session::ProjectDiagnostics(diagnostics.into());
 	}
 	let mut all = Vec::new();
 	for module in graph.semantic_order.iter().copied() {

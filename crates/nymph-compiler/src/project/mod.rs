@@ -339,7 +339,7 @@ impl CompiledProject {
 	}
 }
 
-const FACADE_PROJECT: &str = "__nymph_internal_facade_project__";
+pub(crate) const FACADE_PROJECT: &str = "__nymph_internal_facade_project__";
 
 fn facade_session(
 	entry: &str,
@@ -476,11 +476,7 @@ pub fn compile_project_with_std(
 
 /// Compile one standalone source through the canonical virtual-module
 /// assembly while retaining the facade's unmangled top-level names.
-pub(crate) fn compile_standalone(
-	source: &str,
-	_path: &str,
-	entry_mode: bool,
-) -> Result<String, Vec<Diagnostic>> {
+fn standalone_session(source: &str) -> (CompilerSession, ProjectId, ModulePath) {
 	const STANDALONE_ENTRY: &str = "__nymph_internal_standalone_entry__";
 	let project = ProjectId::new(FACADE_PROJECT);
 	let path = ModulePath::new(STANDALONE_ENTRY).expect("standalone key is canonical");
@@ -491,19 +487,51 @@ pub(crate) fn compile_standalone(
 		source.to_string(),
 		SourceVersion(1),
 	);
+	(session, project, path)
+}
+
+pub(crate) fn check_standalone(
+	source: &str,
+	_path: &str,
+	entry_mode: nymph_sema::EntryMode,
+	ambient_prelude: bool,
+) -> Vec<Diagnostic> {
+	let (session, project, path) = standalone_session(source);
+	let diagnostics = if ambient_prelude {
+		session.check_project_with_options(project, path, entry_mode, true)
+	} else {
+		session.check_project_without_prelude(project, path, entry_mode)
+	};
+	diagnostics.iter().map(|item| item.diag.clone()).collect()
+}
+
+pub(crate) fn compile_standalone(
+	source: &str,
+	_path: &str,
+	entry_mode: nymph_sema::EntryMode,
+) -> Result<String, Vec<Diagnostic>> {
+	let (session, project, path) = standalone_session(source);
 	session
-		.compile_project_with_options(
-			project,
-			path,
-			if entry_mode {
-				nymph_sema::EntryMode::Entry
-			} else {
-				nymph_sema::EntryMode::Library
-			},
-			true,
-		)
-		.map(|compiled| compiled.js.clone())
+		.compile_project_with_options(project, path, entry_mode, true)
+		.map(|compiled| standalone_javascript(&compiled.js))
 		.map_err(|diags| diags.iter().map(|item| item.diag.clone()).collect())
+}
+
+fn standalone_javascript(javascript: &str) -> String {
+	let mut javascript =
+		javascript.replace("//#region @nymph/runtime/option", "//#region std/option");
+	if let Some(option_name) = javascript.lines().find_map(|line| {
+		line
+			.strip_prefix("const ")?
+			.split_once("$Option =")
+			.map(|(name, _)| format!("{name}$Option"))
+	}) {
+		javascript = javascript
+			.replace("import { Option } from \"std/option\";\n", "")
+			.replace("? Option.", &format!("? {option_name}."))
+			.replace(": Option.", &format!(": {option_name}."));
+	}
+	javascript
 }
 
 /// Internal inspection seam for regressions that must assert the exact ES

@@ -2,25 +2,10 @@
 //! crates (`nymph-syntax`, `nymph-sema`, `nymph-codegen`) that exposes the
 //! top-level API for parsing, checking, and compiling Nymph source.
 //!
-//! The pipeline runs in four stages:
-//!
-//! 1. **Parse** ([`nymph_syntax::parse_module`]) — source text to an AST
-//!    ([`nymph_ast::decl::Module`]), plus any lex/parse diagnostics.
-//! 2. **Check** ([`nymph_sema::check_module_with_prelude`]) — name resolution
-//!    and type checking over the AST, with the stdlib operator-interface
-//!    prelude (`std/ops`: `Plus`, `Comparable`, `Equals`, …) flattened ahead of
-//!    it (see [`prelude`]), producing diagnostics and type annotations.
-//! 3. **Lower** ([`nymph_sema::lower_hir_with_prelude`]) — the checked AST to
-//!    HIR. `prelude` is passed through unchanged (the same raw slice `check`
-//!    fed the checker) so lowering can re-offset it itself and, per the
-//!    stdlib body materialization slice, both (a) resolve a user `impl
-//!    <PreludeInterface> for <Type>` (the interface's own declaration lives
-//!    in the prelude, invisible to a lowering that only ever walked the
-//!    user's own AST) and (b) demand-materialize a prelude-owned body
-//!    (a primitive/blanket impl, or an interface default reached through
-//!    one) as a top-level mangled function when it's real, self-contained
-//!    Nymph code — see [`nymph_sema::lower_hir_with_prelude`]'s doc comment.
-//! 4. **Emit** ([`nymph_codegen::emit`]) — HIR to a JavaScript module string.
+//! The public standalone and project facades both construct a project-backed
+//! [`CompilerSession`] and run the stable Salsa semantic, lowering, and
+//! emission queries. Standalone source is represented as a single virtual
+//! module while its caller-supplied path remains a diagnostic anchor.
 //!
 //! [`compile`] runs the full pipeline and only lowers/emits when parsing and
 //! checking are error-free. [`check`] runs just the parse and check stages
@@ -107,34 +92,7 @@ pub fn compile_entry(source: &str, path: &str) -> Result<String, Vec<Diagnostic>
 }
 
 fn compile_impl(source: &str, path: &str, entry: EntryMode) -> Result<String, Vec<Diagnostic>> {
-	let driver_errors = match project::compile_standalone(source, path, entry == EntryMode::Entry) {
-		Ok(js) => return Ok(js),
-		Err(diags) => diags,
-	};
-
-	// Preserve the standalone facade's diagnostic contract independently of
-	// project graph assembly: `path` is only a source/diagnostic anchor, and
-	// parser diagnostics precede checker (including entry-point) diagnostics.
-	// This compatibility path only runs after the canonical driver fails, so
-	// successful compilations parse and check the source exactly once.
-	let parsed = nymph_syntax::parse_module(source, path);
-	let mut diags: Vec<_> = parsed
-		.diagnostics
-		.iter()
-		.filter(|diag| diag.is_error())
-		.cloned()
-		.collect();
-	let prelude = prelude::core_prelude();
-	let checked = match entry {
-		EntryMode::Library => nymph_sema::check_module_with_prelude(&parsed.tree, prelude),
-		EntryMode::Entry => nymph_sema::check_module_entry_with_prelude(&parsed.tree, prelude),
-	};
-	diags.extend(checked.diags.iter().filter(|diag| diag.is_error()).cloned());
-	if diags.is_empty() {
-		Err(driver_errors)
-	} else {
-		Err(diags)
-	}
+	project::compile_standalone(source, path, entry)
 }
 
 /// Parse and check Nymph `source`, returning every diagnostic produced.
@@ -161,17 +119,7 @@ pub fn check_entry(source: &str, path: &str) -> Vec<Diagnostic> {
 }
 
 fn check_impl(source: &str, path: &str, entry: EntryMode) -> Vec<Diagnostic> {
-	let parsed = nymph_syntax::parse_module(source, path);
-	let mut diags = parsed.diagnostics;
-
-	let prelude = prelude::core_prelude();
-	let checked = match entry {
-		EntryMode::Library => nymph_sema::check_module_with_prelude(&parsed.tree, prelude),
-		EntryMode::Entry => nymph_sema::check_module_entry_with_prelude(&parsed.tree, prelude),
-	};
-	diags.extend(checked.diags);
-
-	diags
+	project::check_standalone(source, path, entry, true)
 }
 
 /// Parse and check Nymph `source` with **no ambient prelude** — the `core`
@@ -197,13 +145,7 @@ fn check_impl(source: &str, path: &str, entry: EntryMode) -> Vec<Diagnostic> {
 ///
 /// `path` is used only to anchor diagnostics, exactly as in [`check`].
 pub fn check_without_prelude(source: &str, path: &str) -> Vec<Diagnostic> {
-	let parsed = nymph_syntax::parse_module(source, path);
-	let mut diags = parsed.diagnostics;
-
-	let checked = nymph_sema::check_module(&parsed.tree);
-	diags.extend(checked.diags);
-
-	diags
+	project::check_standalone(source, path, EntryMode::Library, false)
 }
 
 /// The filesystem root of the `stdlib/src` tree embedded (via `include_str!`)

@@ -382,12 +382,13 @@ pub(crate) fn compiled_interface_project<'db>(
 		}
 	};
 	let mut module_sources = emitted.module_sources.clone();
-	if key.builtin_registry(db).modules(db).is_empty()
-		&& let Some(source) = crate::intrinsics::intrinsic_module_sources().remove("std/box")
-	{
-		module_sources
-			.entry("std/box".to_string())
-			.or_insert(source);
+	if key.builtin_registry(db).modules(db).is_empty() {
+		let mut intrinsics = crate::intrinsics::intrinsic_module_sources();
+		for module in ["std/box", "std/string"] {
+			if let Some(source) = intrinsics.remove(module) {
+				module_sources.entry(module.to_string()).or_insert(source);
+			}
+		}
 	}
 	match bundle::bundle(key.entry(db).as_str(), module_sources) {
 		Ok(js) => StableEmissionResult::Value(Arc::new(CompiledProject {
