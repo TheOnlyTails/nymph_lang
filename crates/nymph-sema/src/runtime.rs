@@ -151,9 +151,17 @@ pub struct RuntimeAnnotations {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, salsa::SalsaValue)]
+pub enum RuntimeBodyKind {
+	Value,
+	InstanceFunction,
+	StaticFunction,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, salsa::SalsaValue)]
 pub struct CheckedRuntimeBody {
 	/// Canonical, declaration-local source forms. Neither contains parser identity
 	/// or absolute locations.
+	pub kind: RuntimeBodyKind,
 	pub signature: Arc<str>,
 	pub expression: Arc<str>,
 	pub annotations: RuntimeAnnotations,
@@ -309,7 +317,7 @@ pub fn runtime_definitions(
 					placement: RuntimePlacement::TopLevel,
 					payload,
 				});
-				extract_members(&mut result, members, &item.members, source, checked)?;
+				extract_members(&mut result, members, &item.members, false, source, checked)?;
 				for (nested_index, nested) in impls.iter().enumerate() {
 					let path = crate::annotate::ImplementationSourcePath {
 						declaration: declaration_index as u32,
@@ -329,7 +337,7 @@ pub fn runtime_definitions(
 			nymph_ast::decl::Declaration::Namespace { name, members, .. } => {
 				let item = shape(crate::DeclarationCategory::Namespace, &name.0)
 					.ok_or_else(|| RuntimeExtractionError::MissingStableId(name.0.clone()))?;
-				extract_members(&mut result, members, &item.members, source, checked)?;
+				extract_members(&mut result, members, &item.members, true, source, checked)?;
 			}
 			nymph_ast::decl::Declaration::Impl { members, .. }
 			| nymph_ast::decl::Declaration::ImplFor { members, .. } => {
@@ -493,6 +501,7 @@ fn extract_members(
 	result: &mut Vec<RuntimeDefinition>,
 	syntax: &[nymph_ast::Spanned<ImplMember>],
 	shapes: &[crate::MemberShape<InterfaceType>],
+	module_placed: bool,
 	source: &str,
 	checked: &crate::CheckedFacts,
 ) -> Result<(), RuntimeExtractionError> {
@@ -500,11 +509,18 @@ fn extract_members(
 		return Err(RuntimeExtractionError::MissingImplementation);
 	}
 	for (syntax, shape) in syntax.iter().zip(shapes) {
+		let placement = || {
+			if module_placed {
+				RuntimePlacement::TopLevel
+			} else {
+				attached(shape)
+			}
+		};
 		match &syntax.0 {
 			ImplMember::Func { meta, body, .. } => push_body(
 				result,
 				shape.id.clone(),
-				attached(shape),
+				placement(),
 				meta,
 				body,
 				source,
@@ -513,7 +529,7 @@ fn extract_members(
 			ImplMember::Let { meta, value, .. } => push_value(
 				result,
 				shape.id.clone(),
-				attached(shape),
+				placement(),
 				meta,
 				value,
 				source,
@@ -522,7 +538,7 @@ fn extract_members(
 			ImplMember::ExternalFunc(..) | ImplMember::ExternalLet(..) => push_external(
 				result,
 				shape.id.clone(),
-				attached(shape),
+				placement(),
 				shape.external.clone(),
 			)?,
 		}
@@ -613,7 +629,16 @@ fn push_value(
 	checked: &crate::CheckedFacts,
 ) -> Result<(), RuntimeExtractionError> {
 	let name = binding_name(meta)?;
-	push_canonical_body(result, definition, placement, name, value, source, checked)
+	push_canonical_body(
+		result,
+		definition,
+		placement,
+		RuntimeBodyKind::Value,
+		name,
+		value,
+		source,
+		checked,
+	)
 }
 
 fn push_body(
@@ -634,6 +659,11 @@ fn push_body(
 		result,
 		definition,
 		placement,
+		if meta.kind == nymph_ast::decl::FuncKind::Namespace {
+			RuntimeBodyKind::StaticFunction
+		} else {
+			RuntimeBodyKind::InstanceFunction
+		},
 		signature_source,
 		body,
 		source,
@@ -645,6 +675,7 @@ fn push_canonical_body(
 	result: &mut Vec<RuntimeDefinition>,
 	definition: DefinitionId,
 	placement: RuntimePlacement,
+	kind: RuntimeBodyKind,
 	signature_source: &str,
 	body: &Expr,
 	source: &str,
@@ -693,6 +724,7 @@ fn push_canonical_body(
 		definition,
 		placement,
 		payload: RuntimePayload::NymphBody(CheckedRuntimeBody {
+			kind,
 			signature: Arc::from(signature_source),
 			expression: Arc::from(body_source),
 			annotations,

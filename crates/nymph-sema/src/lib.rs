@@ -81,8 +81,9 @@ pub use prelude::{
 };
 pub use runtime::{
 	BodyNodeId, BuiltinDispatch, CheckedRuntimeBody, DispatchMaterialization, EnumShell,
-	ExpressionVariant, PatternNodeId, PatternVariant, RuntimeAnnotations, RuntimeDefinition,
-	RuntimeExtractionError, RuntimeIteration, RuntimePayload, RuntimePlacement, StableDispatch,
-	StableVariantField, StructShell, VariantExpressionMode, VariantPatternMode, runtime_definitions,
+	ExpressionVariant, PatternNodeId, PatternVariant, RuntimeAnnotations, RuntimeBodyKind,
+	RuntimeDefinition, RuntimeExtractionError, RuntimeIteration, RuntimePayload, RuntimePlacement,
+	StableDispatch, StableVariantField, StructShell, VariantExpressionMode, VariantPatternMode,
+	runtime_definitions,
 };
 pub use stable_lowering::*;

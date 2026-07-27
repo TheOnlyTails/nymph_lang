@@ -792,7 +792,7 @@ fn lower_body(
 	demands: &mut StableDemandSet,
 	implementation_slots: Option<&[crate::ImplementationMemberSlot]>,
 ) -> Result<LoweredHirFragment, StableLoweringError> {
-	let is_function = body.signature.contains('(');
+	let is_function = body.kind != crate::RuntimeBodyKind::Value;
 	let source = if is_function {
 		format!("func {} = {}", body.signature, body.expression)
 	} else {
@@ -893,7 +893,7 @@ fn lower_body(
 					params,
 					body: lowered_body,
 				};
-				if meta.kind == nymph_ast::decl::FuncKind::Namespace {
+				if body.kind == crate::RuntimeBodyKind::StaticFunction {
 					Ok(LoweredHirFragment::AttachedStatic {
 						owner: owner.clone(),
 						method,

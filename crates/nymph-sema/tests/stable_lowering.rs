@@ -334,7 +334,38 @@ fn imported_external_reference_has_exact_stable_marshal_annotation() {
 fn materialized_fixture(
 	source: &str,
 ) -> (Vec<RuntimeDefinition>, nymph_sema::ModuleInterface, Context) {
-	let (artifacts, interface) = artifacts_and_interface(source);
+	materialized_fixture_in(source, "main")
+}
+
+fn materialized_fixture_in(
+	source: &str,
+	path: &str,
+) -> (Vec<RuntimeDefinition>, nymph_sema::ModuleInterface, Context) {
+	let parsed = nymph_syntax::parse_module(source, "fixture.nym");
+	assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+	let module = Arc::new(parsed.tree);
+	let identity = ModuleIdentity {
+		origin: ModuleOrigin::Project("test".into()),
+		project: "test".into(),
+		path: path.into(),
+	};
+	let environment = nymph_sema::SemanticEnvironment::from_modules(identity.clone(), &[]).unwrap();
+	let checked = nymph_sema::check_module_with_environment(
+		module.clone(),
+		identity.clone(),
+		&environment,
+		nymph_sema::EntryMode::Library,
+	);
+	assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);
+	let facts = nymph_sema::Checked {
+		diags: vec![],
+		facts: checked.analysis.checked.as_ref().clone(),
+	};
+	let headers = nymph_sema::declared_headers(identity.clone(), &module);
+	let interface =
+		nymph_sema::extract_module_interface(identity, &module, &facts, &headers).unwrap();
+	let artifacts =
+		nymph_sema::runtime_definitions(&module, source, &facts.facts, &interface).unwrap();
 	let mut context = Context::default();
 	for artifact in &artifacts {
 		context
@@ -653,6 +684,111 @@ fn lowers_one_canonical_function_and_value_without_a_module() {
 			&nymph_sema::RuntimeAssemblyPlacement::Module(item.definition().module.clone())
 		);
 	}
+}
+
+#[test]
+fn namespace_container_members_are_exact_module_runtime_definitions() {
+	let (artifacts, _, context) = materialized_fixture("namespace Tools { func answer(): int = 42 }");
+	let artifact = artifacts
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "answer")
+		.expect("namespace member runtime definition");
+	let definition = artifact.definition.clone();
+	assert!(matches!(definition.key, DeclarationKey::Member { .. }));
+	assert_eq!(artifact.placement, nymph_sema::RuntimePlacement::TopLevel);
+
+	let lowered = lower_runtime_definition(&context, Arc::new(artifact)).unwrap();
+	assert_eq!(lowered.definition(), &definition);
+	assert!(matches!(
+		lowered.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(_)
+	));
+	assert_eq!(
+		lowered.placement(),
+		&nymph_sema::RuntimeAssemblyPlacement::Module(definition.module)
+	);
+}
+
+#[test]
+fn namespace_callable_kind_survives_canonical_body_extraction() {
+	let (artifacts, interface, context) = materialized_fixture(
+		"struct Token(value: int)\nimpl Token { namespace func make(): Token = Token(value = 1) }",
+	);
+	let implementation = &interface.implementations[0];
+	let artifact = artifacts
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "make")
+		.expect("static implementation member");
+	assert!(matches!(
+		&artifact.payload,
+		nymph_sema::RuntimePayload::NymphBody(body)
+			if body.kind == nymph_sema::RuntimeBodyKind::StaticFunction
+	));
+
+	let lowered = lower_runtime_definition(&context, Arc::new(artifact)).unwrap();
+	let InterfaceType::Named { definition, .. } = &implementation.self_type else {
+		panic!("implementation owner must be nominal")
+	};
+	assert!(matches!(
+		lowered.fragment(),
+		nymph_sema::LoweredHirFragment::AttachedStatic { owner, .. }
+			if owner == &implementation.id
+	));
+	assert_eq!(
+		lowered.placement(),
+		&nymph_sema::RuntimeAssemblyPlacement::Shell(definition.clone())
+	);
+}
+
+#[test]
+fn same_named_nominal_statics_keep_distinct_exact_shell_ids() {
+	let source =
+		"struct Token(value: int)\nimpl Token { namespace func make(): Token = Token(value = 1) }";
+	let lowered = ["left", "right"].map(|path| {
+		let (artifacts, _, context) = materialized_fixture_in(source, path);
+		let artifact = artifacts
+			.into_iter()
+			.find(|artifact| source_name(&artifact.definition) == "make")
+			.unwrap();
+		lower_runtime_definition(&context, Arc::new(artifact)).unwrap()
+	});
+	let [
+		nymph_sema::RuntimeAssemblyPlacement::Shell(left),
+		nymph_sema::RuntimeAssemblyPlacement::Shell(right),
+	] = [lowered[0].placement(), lowered[1].placement()]
+	else {
+		panic!("both statics must attach to nominal shells")
+	};
+	assert_eq!(source_name(left), "Token");
+	assert_eq!(source_name(right), "Token");
+	assert_ne!(left, right);
+	assert_ne!(left.module, right.module);
+}
+
+#[test]
+fn malformed_namespace_shell_owner_is_rejected_without_name_fallback() {
+	let (artifacts, interface, context) =
+		materialized_fixture("namespace Token { func value(): int = 1 }\nstruct Holder(value: int)");
+	let namespace = interface
+		.exports
+		.iter()
+		.find(|shape| shape.name == "Token")
+		.unwrap()
+		.id
+		.clone();
+	let mut artifact = artifacts
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "value")
+		.unwrap();
+	artifact.placement = nymph_sema::RuntimePlacement::Attached {
+		owner: namespace.clone(),
+		name: "value".into(),
+	};
+	assert!(matches!(
+		lower_runtime_definition(&context, Arc::new(artifact)),
+		Err(nymph_sema::StableLoweringError::MissingAttachmentShell { owner, .. })
+			if owner == namespace
+	));
 }
 
 #[test]
