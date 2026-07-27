@@ -1038,12 +1038,20 @@ pub(crate) fn assign_runtime_body_identities(
 			)
 		})
 		.count();
-	for (index, implementation) in checker
+	let inherent_mutability =
+		std::iter::repeat_n(false, adt_groups).chain(checker.module.members.iter().filter_map(
+			|declaration| match declaration {
+				Declaration::Impl { mutable, .. } => Some(*mutable),
+				_ => None,
+			},
+		));
+	for ((index, implementation), mutable) in checker
 		.inherent
 		.impls
 		.iter_mut()
 		.filter(|implementation| !implementation.imported)
 		.enumerate()
+		.zip(inherent_mutability)
 	{
 		let owner = (index < adt_groups)
 			.then(|| match checker.interner.kind(implementation.self_ty) {
@@ -1077,7 +1085,7 @@ pub(crate) fn assign_runtime_body_identities(
 						interface: None,
 						interface_arguments: Vec::new(),
 						self_type: header_type(&self_type, &binders),
-						mutable: false,
+						mutable,
 						binders: (0..binders.len())
 							.map(|index| HeaderBinder {
 								parameter: HeaderParameterId(index as u32),
@@ -2024,6 +2032,7 @@ fn extract_implementations(
 		.filter_map(|(declaration, item)| match item {
 			Declaration::Impl {
 				visibility,
+				mutable,
 				members,
 				..
 			} => Some((
@@ -2032,6 +2041,7 @@ fn extract_implementations(
 					nested: None,
 				},
 				*visibility,
+				*mutable,
 				members,
 			)),
 			_ => None,
@@ -2050,7 +2060,7 @@ fn extract_implementations(
 				})
 				.count(),
 		);
-	for ((path, visibility, members), ordered_implementation) in
+	for ((path, visibility, mutable, members), ordered_implementation) in
 		top_level_inherent.zip(inherent_facts)
 	{
 		let implementation = checked
@@ -2090,7 +2100,7 @@ fn extract_implementations(
 				interface: None,
 				interface_arguments: Vec::new(),
 				self_type: header_type(&self_type, &temporary_binders),
-				mutable: false,
+				mutable,
 				binders: (0..temporary_binders.len())
 					.map(|index| HeaderBinder {
 						parameter: HeaderParameterId(index as u32),

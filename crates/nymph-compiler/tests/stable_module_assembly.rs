@@ -310,6 +310,117 @@ fn stable_native_list_runtime_is_exact_collision_safe_and_runs_after_dependency_
 }
 
 #[test]
+fn stable_native_map_runtime_is_exact_collision_safe_and_runs_after_dependency_warmup() {
+	let mut session = CompilerSession::new();
+	let project = ProjectId::new("stable-map-runtime");
+	let main = ModulePath::new("main").unwrap();
+	let dependency = ModulePath::new("collections/map").unwrap();
+	session.set_source(
+		project.clone(),
+		dependency.clone(),
+		"public func values(): mut #{int: int} = #{1: 10, 2: 20}".into(),
+		SourceVersion(1),
+	);
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"import @/collections/map with (values)\nfunc exercise(): int = {\n  let mut items = values()\n  let before = match (items.get(1)) { Some(value) -> value, None -> 0 }\n  let indexed = items[2]\n  items.insert(3, 30)\n  items.insert(2, 7)\n  items[3] = 4\n  let mut total = 0\n  for (#(key, value) in items) { total = total + key + value }\n  before + indexed + items[2] + items[3] + items.size() + total\n}\npublic func main(): void = {}"
+			.into(),
+		SourceVersion(1),
+	);
+
+	session
+		.lower_interface_module_for_test(project.clone(), main.clone(), dependency, EntryMode::Entry)
+		.expect("dependency stable runtime facts warm successfully");
+	session.panic_on_dependency_body_access_for_test(project.clone(), main.clone());
+	let emitted = session
+		.emit_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
+		.expect("stable Map modules emit");
+	assert_eq!(
+		emitted.module_sources["main"]
+			.matches("from \"@nymph/runtime/collections/map\"")
+			.count(),
+		1
+	);
+	assert_eq!(
+		emitted.module_sources["main"]
+			.matches("from \"@nymph/runtime/option\"")
+			.count(),
+		1
+	);
+	assert_eq!(
+		emitted.module_sources["main"]
+			.matches("from \"@nymph/runtime/iter/iterable\"")
+			.count(),
+		1
+	);
+	assert!(emitted.module_sources.contains_key("collections/map"));
+	assert!(
+		emitted
+			.module_sources
+			.contains_key("@nymph/runtime/collections/map")
+	);
+	assert!(emitted.module_sources.contains_key("@nymph/runtime/option"));
+	assert!(
+		emitted
+			.module_sources
+			.contains_key("@nymph/runtime/iter/iterable")
+	);
+	assert!(!emitted.module_sources.contains_key("@nymph/runtime/result"));
+	let compiled = session
+		.compile_interface_project_for_test(project, main, EntryMode::Entry)
+		.expect("stable emission links only the native Map runtime closure");
+	assert_eq!(
+		compiled.js.matches("from \"std/collections/map\"").count(),
+		1,
+		"{}",
+		compiled.js
+	);
+	assert_eq!(
+		compiled
+			.js
+			.matches("//#region @nymph/runtime/option")
+			.count(),
+		1,
+		"{}",
+		compiled.js
+	);
+	assert_eq!(compiled.js.matches("//#region collections/map").count(), 1);
+	assert!(!compiled.js.contains("collections/list"), "{}", compiled.js);
+	assert!(
+		!compiled.js.contains("@nymph/runtime/result"),
+		"{}",
+		compiled.js
+	);
+
+	let js = compiled
+		.js
+		.replace(
+			"import { get as $m8$map$get, insert as $m8$map$insert, size as $m8$map$size } from \"std/collections/map\";",
+			"const $m8$map$get = (xs, key) => { const value = xs.get(key); return value === undefined ? { [Symbol.for('nymph.tag')]: Symbol.for('$m15$Option.None') } : { [Symbol.for('nymph.tag')]: Symbol.for('$m15$Option.Some'), value }; }; const $m8$map$insert = (xs, key, value) => { const fresh = xs.get(key) === undefined; xs.set(key, value); return new NBool(fresh); }; const $m8$map$size = (xs) => new NInt(xs.entries.length);",
+		)
+		.replace(
+			"import { NBool, NInt, NMap } from \"std/box\";",
+			"class NBool { constructor(v) { this.v = v; } } class NInt { constructor(v) { this.v = v; } } class NMap { constructor(entries) { this.entries = entries; } find(key) { return this.entries.find(([item]) => item.v === key.v); } get(key) { return this.find(key)?.[1]; } set(key, value) { const entry = this.find(key); if (entry) entry[1] = value; else this.entries.push([key, value]); } iter() { let index = 0; const entries = this.entries; return { next() { return index < entries.length ? { [Symbol.for('nymph.tag')]: Symbol.for('$m15$Option.Some'), value: { v: entries[index++] } } : { [Symbol.for('nymph.tag')]: Symbol.for('$m15$Option.None') }; } }; } }",
+		);
+	let exercise = compiled.entry_symbol("exercise");
+	let script = format!("{js}\nconsole.log({exercise}().v);\n");
+	let path = std::env::temp_dir().join(format!("nymph-stable-map-{}.mjs", std::process::id()));
+	std::fs::write(&path, script).unwrap();
+	let output = std::process::Command::new("node")
+		.arg(&path)
+		.output()
+		.unwrap();
+	let _ = std::fs::remove_file(path);
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(String::from_utf8_lossy(&output.stdout), "71\n");
+}
+
+#[test]
 fn stable_emission_links_exact_ambient_math_demands_once_and_runs() {
 	let mut session = CompilerSession::new();
 	let project = ProjectId::new("stable-math-runtime");
