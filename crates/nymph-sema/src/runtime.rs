@@ -672,6 +672,7 @@ fn push_canonical_body(
 		})
 		.filter_map(|expr| local.get(&expr.id).copied())
 		.collect::<std::collections::HashSet<_>>();
+	let required_type_nodes = required_type_nodes(&nodes, checked);
 	let mut patterns = Vec::new();
 	walk_body_patterns(body, &mut patterns);
 	let patterns = patterns
@@ -679,8 +680,14 @@ fn push_canonical_body(
 		.enumerate()
 		.map(|(index, pattern)| (pattern.1, PatternNodeId(index as u32)))
 		.collect::<std::collections::HashMap<_, _>>();
-	let annotations =
-		runtime_annotations(&definition, &local, &patterns, &native_range_nodes, checked)?;
+	let annotations = runtime_annotations(
+		&definition,
+		&local,
+		&patterns,
+		&native_range_nodes,
+		&required_type_nodes,
+		checked,
+	)?;
 	result.push(RuntimeDefinition {
 		source_owner: definition.module.clone(),
 		definition,
@@ -713,6 +720,7 @@ fn runtime_annotations(
 	local: &std::collections::HashMap<nymph_ast::NodeId, BodyNodeId>,
 	patterns: &std::collections::HashMap<nymph_ast::Span, PatternNodeId>,
 	native_range_nodes: &std::collections::HashSet<BodyNodeId>,
+	required_type_nodes: &std::collections::HashSet<nymph_ast::NodeId>,
 	checked: &crate::CheckedFacts,
 ) -> Result<RuntimeAnnotations, RuntimeExtractionError> {
 	let definitions = checked
@@ -728,14 +736,18 @@ fn runtime_annotations(
 				.map(|stable| (crate::DefId(index as u32), stable))
 		})
 		.collect();
-	let parameters = body_parameters(definition, checked);
-	let context = CanonicalizationContext::new(definitions, parameters);
+	let context = CanonicalizationContext::new(definitions, body_parameters(definition, checked));
 	let mut types = Vec::new();
 	let mut dispatches = Vec::new();
-	for (id, info) in checked.annotations.infos() {
-		let Some(&id) = local.get(&id) else { continue };
-		if let Ok(ty) = canonicalize_type(&checked.interner, info.ty, &context) {
-			types.push((id, ty));
+	for (node, info) in checked.annotations.infos() {
+		let Some(&id) = local.get(&node) else {
+			continue;
+		};
+		if required_type_nodes.contains(&node) {
+			types.push((
+				id,
+				required_canonical_type(&checked.interner, info.ty, &context)?,
+			));
 		}
 		if let Some(resolution) = &info.resolution {
 			dispatches.push((id, stable_dispatch(checked, resolution)?));
@@ -859,6 +871,94 @@ fn runtime_annotations(
 		generic_namespaced_calls: generic_namespaced_calls.into(),
 		external_marshals: external_marshals.into(),
 	})
+}
+
+fn required_canonical_type(
+	interner: &crate::ty::Interner,
+	ty: crate::Ty,
+	context: &CanonicalizationContext,
+) -> Result<InterfaceType, RuntimeExtractionError> {
+	canonicalize_type(interner, ty, context)
+		.map_err(|_| RuntimeExtractionError::IncompleteCanonicalType)
+}
+
+fn required_type_nodes(
+	nodes: &[&Expr],
+	checked: &crate::CheckedFacts,
+) -> std::collections::HashSet<nymph_ast::NodeId> {
+	let mut required = std::collections::HashSet::new();
+	for expression in nodes {
+		match &expression.kind {
+			ExprKind::IndexAccess { parent, .. } => {
+				required.insert(parent.id);
+			}
+			ExprKind::List(items) | ExprKind::Tuple(items) => {
+				for item in items {
+					if let ListItem::Spread(value) = &item.0 {
+						required.insert(value.id);
+					}
+				}
+			}
+			ExprKind::Map(entries) => {
+				for entry in entries {
+					if let MapEntry::Spread(value) = &entry.0 {
+						required.insert(value.id);
+					}
+				}
+			}
+			ExprKind::TypeOp { lhs, .. }
+				if checked
+					.annotations
+					.get(expression.id)
+					.and_then(|info| info.resolution)
+					.is_some_and(|resolution| {
+						matches!(
+							resolution.dispatch,
+							DispatchKind::BuiltinEager | DispatchKind::BuiltinShortCircuit
+						)
+					}) =>
+			{
+				required.insert(expression.id);
+				required.insert(lhs.id);
+			}
+			ExprKind::For { iterable, .. }
+				if checked.annotations.iter_mode_of(iterable.id) == Some(crate::IterMode::ViaIter) =>
+			{
+				required.insert(iterable.id);
+			}
+			_ => {}
+		}
+	}
+	required
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{InterfaceConversionError, ParamIdx, ty::Interner};
+
+	#[test]
+	fn required_type_canonicalization_errors_are_loud() {
+		let mut interner = Interner::new();
+		let missing_binder = interner.mk_param(ParamIdx(7));
+
+		assert_eq!(
+			required_canonical_type(
+				&interner,
+				missing_binder,
+				&CanonicalizationContext::default()
+			),
+			Err(RuntimeExtractionError::IncompleteCanonicalType)
+		);
+		assert_eq!(
+			canonicalize_type(
+				&interner,
+				missing_binder,
+				&CanonicalizationContext::default()
+			),
+			Err(InterfaceConversionError::UnknownBinder(ParamIdx(7)))
+		);
+	}
 }
 
 fn stable_dispatch(
@@ -1093,8 +1193,9 @@ fn body_parameters(
 	checked: &crate::CheckedFacts,
 ) -> std::collections::HashMap<crate::ParamIdx, crate::GenericParameterId> {
 	// Rigid parameter indices are body-local and allocated in declaration order.
-	// Stable binder IDs in all extracted declarations use that same order.
-	let count = checked
+	// Implementation-header binders are allocated before member-local binders,
+	// matching interface extraction's owner-then-member canonicalization context.
+	let member_count = checked
 		.semantic
 		.definitions
 		.defs
@@ -1108,19 +1209,49 @@ fn body_parameters(
 				.get(&crate::DefId(index as u32))
 		})
 		.map_or(0, |signature| signature.generics.len());
-	let scope = if matches!(definition.key, crate::DeclarationKey::TopLevel { .. }) {
+	let owner = implementation_owner(definition);
+	let owner_count = owner
+		.and_then(|owner| match &owner.key {
+			crate::DeclarationKey::Implementation { header, .. } => Some(header.binders.len()),
+			_ => None,
+		})
+		.unwrap_or(0);
+	let owner_parameters = owner.into_iter().flat_map(|owner| {
+		(0..owner_count).map(move |index| {
+			(
+				crate::ParamIdx(index as u32),
+				crate::GenericParameterId::new(
+					owner.binder(crate::BinderScope::Definition, 0),
+					index as u32,
+				),
+			)
+		})
+	});
+	let member_scope = if matches!(definition.key, crate::DeclarationKey::TopLevel { .. }) {
 		crate::BinderScope::Definition
 	} else {
 		crate::BinderScope::Member
 	};
-	(0..count)
-		.map(|index| {
+	owner_parameters
+		.chain((0..member_count).map(|index| {
 			(
-				crate::ParamIdx(index as u32),
-				crate::GenericParameterId::new(definition.binder(scope, 0), index as u32),
+				crate::ParamIdx((owner_count + index) as u32),
+				crate::GenericParameterId::new(definition.binder(member_scope, 0), index as u32),
 			)
-		})
+		}))
 		.collect()
+}
+
+fn implementation_owner(definition: &DefinitionId) -> Option<&DefinitionId> {
+	match &definition.key {
+		crate::DeclarationKey::Member { owner, .. }
+		| crate::DeclarationKey::MethodBody { owner, .. }
+			if matches!(owner.key, crate::DeclarationKey::Implementation { .. }) =>
+		{
+			Some(owner)
+		}
+		_ => None,
+	}
 }
 
 fn iteration_protocol(
@@ -1181,13 +1312,19 @@ fn external_marshal(
 	checked: &crate::CheckedFacts,
 	target: &DefinitionId,
 ) -> Option<nymph_hir::hir::MarshalKind> {
-	checked
-		.semantic
-		.definitions
-		.defs
-		.iter()
-		.find(|item| item.stable.as_ref() == Some(target))
-		.and_then(|item| checked.external_value_marshals.get(&item.span).copied())
+	let definition = checked.semantic.definitions.by_stable(target)?;
+	if checked.semantic.definitions.is_local(definition) {
+		checked
+			.external_value_marshals
+			.get(&checked.semantic.definitions.data(definition).span)
+			.copied()
+	} else {
+		checked
+			.semantic
+			.external_abis
+			.get(&definition)
+			.and_then(|abi| abi.marshal)
+	}
 }
 
 fn walk_expr<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {

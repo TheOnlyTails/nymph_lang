@@ -21,6 +21,7 @@ pub struct CheckedSemantic {
 	pub(crate) definitions: crate::def::DefMap,
 	pub(crate) signatures: crate::def::Signatures,
 	pub(crate) interfaces: FxHashMap<crate::DefId, crate::iface::InterfaceDef>,
+	pub(crate) external_abis: FxHashMap<crate::DefId, crate::ExternalAbi>,
 	pub(crate) implementations: crate::iface::ImplRegistry,
 	pub(crate) inherent: Vec<CheckedInherentImpl>,
 	pub(crate) anonymous_bounds: FxHashMap<crate::ParamIdx, Vec<crate::iface::Bound>>,

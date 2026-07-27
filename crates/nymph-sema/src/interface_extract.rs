@@ -1238,6 +1238,7 @@ fn checker_snapshot(checker: &crate::check::Checker<'_>) -> Checked {
 				definitions: checker.defs.clone(),
 				signatures: checker.sigs.clone(),
 				interfaces: checker.interfaces.clone(),
+				external_abis: Default::default(),
 				implementations: checker.impls.clone(),
 				inherent: Vec::new(),
 				anonymous_bounds: checker.synthetic_bound_details.clone(),

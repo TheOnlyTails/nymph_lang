@@ -1,10 +1,12 @@
 use std::{collections::HashMap, sync::Arc};
 
 use nymph_sema::{
-	CanonicalModuleSpecifier, DeclarationKey, DefinitionId, EmittedBindingName, EmittedMemberName,
-	InterfaceType, ModuleIdentity, ModuleOrigin, RuntimeDefinition, RuntimeDefinitionLookup,
-	RuntimeDefinitionLookupError, StableNameLookup, StableNameLookupError, StableShapeFact,
-	StableShapeLookup, StableShapeLookupError, StableShapeRequest, lower_runtime_definition,
+	BodyNodeId, CanonicalModuleSpecifier, DeclarationCategory, DeclarationKey, DefinitionId,
+	DefinitionShapeKind, EmittedBindingName, EmittedMemberName, ExportedDefinition, ExternalAbi,
+	InterfaceType, ModuleEnvironment, ModuleIdentity, ModuleInterface, ModuleOrigin,
+	RuntimeDefinition, RuntimeDefinitionLookup, RuntimeDefinitionLookupError, StableNameLookup,
+	StableNameLookupError, StableShapeFact, StableShapeLookup, StableShapeLookupError,
+	StableShapeRequest, lower_runtime_definition,
 };
 
 #[derive(Default)]
@@ -143,6 +145,13 @@ fn artifacts(source: &str) -> Vec<RuntimeDefinition> {
 }
 
 fn artifacts_and_interface(source: &str) -> (Vec<RuntimeDefinition>, nymph_sema::ModuleInterface) {
+	artifacts_and_interface_with_dependencies(source, &[])
+}
+
+fn artifacts_and_interface_with_dependencies(
+	source: &str,
+	dependencies: &[Arc<ModuleEnvironment>],
+) -> (Vec<RuntimeDefinition>, nymph_sema::ModuleInterface) {
 	let parsed = nymph_syntax::parse_module(source, "fixture.nym");
 	assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
 	let module = Arc::new(parsed.tree);
@@ -151,7 +160,8 @@ fn artifacts_and_interface(source: &str) -> (Vec<RuntimeDefinition>, nymph_sema:
 		project: "test".into(),
 		path: "main".into(),
 	};
-	let environment = nymph_sema::SemanticEnvironment::from_modules(identity.clone(), &[]).unwrap();
+	let environment =
+		nymph_sema::SemanticEnvironment::from_modules(identity.clone(), dependencies).unwrap();
 	let checked = nymph_sema::check_module_with_environment(
 		module.clone(),
 		identity.clone(),
@@ -169,6 +179,156 @@ fn artifacts_and_interface(source: &str) -> (Vec<RuntimeDefinition>, nymph_sema:
 	let artifacts =
 		nymph_sema::runtime_definitions(&module, source, &facts.facts, &interface).unwrap();
 	(artifacts, interface)
+}
+
+#[test]
+fn implementation_header_generic_body_receiver_has_canonical_type_annotation() {
+	let source = "impl<T> #[T] { func first(): T = { let result = this\nresult[0] } }";
+	let (artifacts, interface) = artifacts_and_interface(source);
+	let implementation = &interface.implementations[0];
+	let expected = InterfaceType::List(Box::new(InterfaceType::Generic(
+		implementation.binders[0].id.clone(),
+	)));
+	let first = artifacts
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "first")
+		.unwrap();
+	let nymph_sema::RuntimePayload::NymphBody(body) = first.payload else {
+		unreachable!()
+	};
+	let parsed_body = nymph_syntax::parse_module(
+		&format!("func fixture(): void = {}", body.expression),
+		"body.nym",
+	);
+	assert!(
+		parsed_body.diagnostics.is_empty(),
+		"{:?}",
+		parsed_body.diagnostics
+	);
+	let nymph_ast::decl::Declaration::Func {
+		body: parsed_body, ..
+	} = &parsed_body.tree.members[0]
+	else {
+		unreachable!()
+	};
+	let nymph_ast::expr::ExprKind::Block {
+		body: statements, ..
+	} = &parsed_body.kind
+	else {
+		unreachable!()
+	};
+	let nymph_ast::expr::Statement::Expr(index_access) = &statements.last().unwrap().0 else {
+		unreachable!()
+	};
+	let nymph_ast::expr::ExprKind::IndexAccess {
+		parent: receiver, ..
+	} = &index_access.kind
+	else {
+		unreachable!()
+	};
+	let receiver = fixture_body_node_id(parsed_body, receiver.id);
+
+	assert_eq!(
+		body
+			.annotations
+			.types
+			.iter()
+			.find(|(node, _)| *node == receiver),
+		Some(&(receiver, expected))
+	);
+}
+
+fn fixture_body_node_id(body: &nymph_ast::expr::Expr, target: nymph_ast::NodeId) -> BodyNodeId {
+	fn visit(
+		expression: &nymph_ast::expr::Expr,
+		target: nymph_ast::NodeId,
+		next: &mut u32,
+	) -> Option<BodyNodeId> {
+		let current = BodyNodeId(*next);
+		*next += 1;
+		if expression.id == target {
+			return Some(current);
+		}
+		match &expression.kind {
+			nymph_ast::expr::ExprKind::Block { body, .. } => body.iter().find_map(|statement| {
+				let expression = match &statement.0 {
+					nymph_ast::expr::Statement::Expr(expression)
+					| nymph_ast::expr::Statement::Let {
+						value: expression, ..
+					} => expression,
+				};
+				visit(expression, target, next)
+			}),
+			nymph_ast::expr::ExprKind::IndexAccess { parent, index, .. } => {
+				visit(parent, target, next).or_else(|| visit(index, target, next))
+			}
+			_ => None,
+		}
+	}
+
+	visit(body, target, &mut 0).expect("index receiver must have a canonical body node")
+}
+
+#[test]
+fn imported_external_reference_has_exact_stable_marshal_annotation() {
+	let dependency_identity = ModuleIdentity {
+		origin: ModuleOrigin::Project("test".into()),
+		project: "test".into(),
+		path: "dependency".into(),
+	};
+	let external = DefinitionId::new(
+		dependency_identity.clone(),
+		DeclarationKey::top_level(DeclarationCategory::Let, "maximum"),
+	);
+	let dependency = Arc::new(ModuleEnvironment::Complete(ModuleInterface {
+		module: dependency_identity,
+		exports: vec![ExportedDefinition {
+			id: external.clone(),
+			name: "maximum".into(),
+			visibility: None,
+			kind: DefinitionShapeKind::Let,
+			binders: vec![],
+			constraints: vec![],
+			parameters: vec![],
+			return_type: None,
+			ty: Some(InterfaceType::Float),
+			fields: vec![],
+			variants: vec![],
+			members: vec![],
+			super_interfaces: vec![],
+			external: Some(ExternalAbi {
+				marker: "max_float".into(),
+				module: Some("std/math/intrinsics".into()),
+				symbol: Some("max_float".into()),
+				marshal: Some(nymph_hir::hir::MarshalKind::Float),
+			}),
+			runtime_owner: None,
+		}],
+		support_definitions: vec![],
+		implementations: vec![],
+		fingerprint: 0,
+	}));
+	let (artifacts, _) =
+		artifacts_and_interface_with_dependencies("func read(): float = maximum", &[dependency]);
+	let read = artifacts
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "read")
+		.unwrap();
+	let nymph_sema::RuntimePayload::NymphBody(body) = read.payload else {
+		unreachable!()
+	};
+	let (node, target) = &body.annotations.definition_targets[0];
+
+	assert_eq!(target, &external);
+	assert!(
+		body
+			.annotations
+			.external_marshals
+			.iter()
+			.any(|(candidate, marshal)| {
+				candidate == node && *marshal == nymph_hir::hir::MarshalKind::Float
+			})
+	);
 }
 
 fn materialized_fixture(

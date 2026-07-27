@@ -208,7 +208,7 @@ pub(crate) fn check_module_impl(module: &Module, entry: EntryMode) -> Checked {
 	let mut diags = Vec::new();
 	let defs = build_def_map(module, &mut diags);
 	let checker = Checker::new(module, defs, diags);
-	check_module_from_parts(entry, checker, 0, 0, 0, false, None)
+	check_module_from_parts(entry, checker, 0, 0, 0, false, None, FxHashMap::default())
 }
 
 fn check_module_from_parts(
@@ -219,6 +219,7 @@ fn check_module_from_parts(
 	inherent_start: usize,
 	has_explicit_local_ranges: bool,
 	module_identity: Option<&crate::ModuleIdentity>,
+	external_abis: FxHashMap<crate::DefId, crate::ExternalAbi>,
 ) -> Checked {
 	checker.lower_signatures();
 	checker.collect_interfaces();
@@ -392,6 +393,7 @@ fn check_module_from_parts(
 				definitions: checker.defs,
 				signatures: checker.sigs,
 				interfaces: checker.interfaces,
+				external_abis,
 				implementations: checker.impls,
 				inherent,
 				anonymous_bounds: checker.synthetic_bound_details,
@@ -445,6 +447,7 @@ pub fn check_module_with_environment(
 		inherent_start,
 		true,
 		Some(&identity),
+		environment.imported.external_abis.clone(),
 	);
 	let diagnostics: std::sync::Arc<[Diagnostic]> = checked.diags.into();
 	let facts = std::sync::Arc::new(checked.facts);
