@@ -1016,7 +1016,7 @@ fn assert_protocol_for(fragment: &nymph_sema::LoweredHirFragment, inclusive: boo
 
 #[test]
 fn range_for_support_matches_legacy_for_startless_endless_and_unbounded_forms() {
-	for range in ["..3", "1.."] {
+	for range in ["..3", "..=3", "1.."] {
 		let (items, _, context) = materialized_fixture(&format!(
 			"enum Option<T> {{ Some(value: T), None }}\ninterface Iterator<Item> {{ mut func next(): Option<Item> }}\ninterface Iterable<Item> {{ func iter(): Iterator<Item> }}\nfunc each(): void = for (_ in {range}) {{ 0 }}"
 		));
@@ -1035,6 +1035,27 @@ fn range_for_support_matches_legacy_for_startless_endless_and_unbounded_forms() 
 			"{range}: {error:?}"
 		);
 	}
+}
+
+#[test]
+fn bounded_range_in_value_position_remains_typed_unsupported() {
+	let (items, _, context) = materialized_fixture(
+		"enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nfunc value(): void = { let range = 1..3 }",
+	);
+	let error = lower_runtime_definition(
+		&context,
+		Arc::new(
+			items
+				.into_iter()
+				.find(|item| source_name(&item.definition) == "value")
+				.unwrap(),
+		),
+	)
+	.unwrap_err();
+	assert!(
+		matches!(error, nymph_sema::StableLoweringError::Unsupported { ref feature, .. } if feature == "range/protocol"),
+		"{error:?}"
+	);
 }
 
 #[test]

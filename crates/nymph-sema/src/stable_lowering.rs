@@ -2082,6 +2082,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		iterable: &Expr,
 		body: &Expr,
 	) -> Result<HirExpr, StableLoweringError> {
+		let native_range = matches!(
+			iterable.kind,
+			ExprKind::Range(RangeKind::Exclusive { .. } | RangeKind::Inclusive { .. })
+		);
 		let source = if let ExprKind::Range(
 			RangeKind::Exclusive { min, max } | RangeKind::Inclusive { min, max },
 		) = &iterable.kind
@@ -2115,7 +2119,20 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				channel: "iteration".into(),
 			})?;
 		let (it, next, option) = match iteration {
-			crate::RuntimeIteration::Direct { next, option, .. } => (source, next, option),
+			crate::RuntimeIteration::Direct { next, option, .. } => {
+				let source = if native_range {
+					HirExpr::Call {
+						callee: Box::new(HirExpr::Field {
+							recv: Box::new(source),
+							name: "iter".into(),
+						}),
+						args: vec![],
+					}
+				} else {
+					source
+				};
+				(source, next, option)
+			}
 			crate::RuntimeIteration::ViaIter {
 				iter,
 				iterable_interface,

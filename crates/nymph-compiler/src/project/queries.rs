@@ -1264,7 +1264,26 @@ pub(crate) fn lower_interface_module<'db>(
 			module: module.identity(db),
 		},
 	})?;
-	let mut queue = std::collections::VecDeque::from(own.to_vec());
+	// Interface default bodies are canonical templates, not independently
+	// emitted methods. Only a demanded materialized implementation may lower
+	// and attach one to a concrete runtime owner.
+	let mut queue = own
+		.iter()
+		.filter(|definition| {
+			!matches!(
+				&definition.key,
+				nymph_sema::DeclarationKey::Member { owner, .. }
+					if matches!(
+						owner.key,
+						nymph_sema::DeclarationKey::TopLevel {
+							category: nymph_sema::DeclarationCategory::Interface,
+							..
+						}
+					)
+			)
+		})
+		.cloned()
+		.collect::<std::collections::VecDeque<_>>();
 	let mut seen = std::collections::HashSet::new();
 	let mut lowered = Vec::new();
 	while let Some(definition) = queue.pop_front() {
@@ -1410,7 +1429,14 @@ fn attach_method(
 		match context.stable_shape(&request) {
 			Ok(nymph_sema::StableShapeFact::Implementation(shape)) => shape
 				.runtime_owner
-				.and_then(|id| shells.get(&id).copied().map(|shell| (id, shell))),
+				.and_then(|id| shells.get(&id).copied().map(|shell| (id, shell)))
+				.or_else(|| match shape.self_type {
+					nymph_sema::InterfaceType::Named { definition, .. } => shells
+						.get(&definition)
+						.copied()
+						.map(|shell| (definition, shell)),
+					_ => None,
+				}),
 			_ => None,
 		}
 	}

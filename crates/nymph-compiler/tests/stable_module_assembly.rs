@@ -77,6 +77,54 @@ fn stable_emission_links_exact_project_modules_and_bundles() {
 }
 
 #[test]
+fn stable_importable_std_identity_is_distinct_from_colliding_project_names_and_runs() {
+	let mut session = CompilerSession::new();
+	let project = ProjectId::new("stable-importable-identity");
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"import std/collections/tree with (Tree as StdTree)\nstruct Option(value: int)\nstruct List(value: int)\nstruct Range(value: int)\nstruct Tree(value: int)\nlet pi = 42\nfunc answer(): int = { let local = Option(value = pi) let foreign = StdTree.Leaf(value = local.value) match (foreign) { Leaf(value) -> value, Node(...) -> 0 } }\npublic func main(): void = {}".into(),
+		SourceVersion(1),
+	);
+
+	let emitted = session
+		.emit_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
+		.expect("stable identities keep project declarations separate from std and ambient owners");
+	let source = &emitted.module_sources["main"];
+	assert_eq!(
+		source.matches("from \"collections/tree\"").count(),
+		1,
+		"{source}"
+	);
+	assert!(emitted.module_sources.contains_key("collections/tree"));
+	let compiled = session
+		.compile_interface_project_for_test(project, main, EntryMode::Entry)
+		.expect("stable importable std module bundles");
+	let answer = compiled.entry_symbol("answer");
+	let js = compiled.js.replace(
+		"import { NInt } from \"std/box\";",
+		"class NInt { constructor(v) { this.v = v; } }",
+	);
+	let path = std::env::temp_dir().join(format!(
+		"nymph-stable-importable-{}.mjs",
+		std::process::id()
+	));
+	std::fs::write(&path, format!("{js}\nconsole.log({answer}().v);\n")).unwrap();
+	let output = std::process::Command::new("node")
+		.arg(&path)
+		.output()
+		.unwrap();
+	let _ = std::fs::remove_file(path);
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+}
+
+#[test]
 fn stable_emission_links_demanded_ambient_option_runtime() {
 	let mut session = CompilerSession::new();
 	let project = ProjectId::new("stable-option-runtime");
@@ -418,6 +466,102 @@ fn stable_native_map_runtime_is_exact_collision_safe_and_runs_after_dependency_w
 		String::from_utf8_lossy(&output.stderr)
 	);
 	assert_eq!(String::from_utf8_lossy(&output.stdout), "71\n");
+}
+
+#[test]
+fn stable_native_range_runtime_is_exact_collision_safe_and_runs_after_dependency_warmup() {
+	let mut session = CompilerSession::new();
+	let project = ProjectId::new("stable-range-runtime");
+	let main = ModulePath::new("main").unwrap();
+	let dependency = ModulePath::new("ranges/source").unwrap();
+	session.set_source(
+		project.clone(),
+		dependency.clone(),
+		"public func int_start(): int = 1\npublic func uint_start(): uint = 2u".into(),
+		SourceVersion(1),
+	);
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"import @/ranges/source with (int_start, uint_start)\ninterface Plus<Other, Output> { func plus(other: Other): Output func plus_default(other: Other): Output = this.plus(other) }\nstruct Box<T>(value: T)\nimpl<T> Plus<Other = Box<T>, Output = T> for Box<T> { func plus(other: Box<T>): T = other.value }\nfunc exercise(): int = {\n  let mut total = 0\n  for (value in int_start()..4) { total = total + value }\n  for (value in int_start()..=3) { total = total + value }\n  for (value in uint_start()..5u) { total = total + (value as int) }\n  for (value in uint_start()..=4u) { total = total + (value as int) }\n  Box(value = 0).plus_default(Box(value = total + 1))\n}\npublic func main(): void = {}"
+			.into(),
+		SourceVersion(1),
+	);
+
+	session
+		.lower_interface_module_for_test(project.clone(), main.clone(), dependency, EntryMode::Entry)
+		.expect("dependency stable runtime facts warm successfully");
+	session.panic_on_dependency_body_access_for_test(project.clone(), main.clone());
+	let emitted = session
+		.emit_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
+		.expect("stable Range and operator modules emit");
+	let source = &emitted.module_sources["main"];
+	assert_eq!(source.matches("from \"std/box\"").count(), 1);
+	assert_eq!(source.matches("new NymphRange").count(), 4);
+	assert!(!source.contains("@nymph/runtime/option"));
+	assert!(!source.contains("@nymph/runtime/iter"));
+	assert!(!source.contains("@nymph/runtime/collections/list"));
+	assert!(!source.contains("@nymph/runtime/collections/map"));
+	assert!(!source.contains("@nymph/runtime/result"));
+	assert!(emitted.module_sources.contains_key("ranges/source"));
+	assert!(!emitted.module_sources.contains_key("@nymph/runtime/option"));
+	assert!(!emitted.module_sources.contains_key("@nymph/runtime/iter"));
+	assert!(
+		!emitted
+			.module_sources
+			.contains_key("@nymph/runtime/collections/list")
+	);
+	assert!(
+		!emitted
+			.module_sources
+			.contains_key("@nymph/runtime/collections/map")
+	);
+	assert!(!emitted.module_sources.contains_key("@nymph/runtime/result"));
+
+	let compiled = session
+		.compile_interface_project_for_test(project, main, EntryMode::Entry)
+		.expect("stable emission links only the Range, iterator, Option, and operator closure");
+	assert_eq!(
+		compiled.js.matches("NymphRange").count(),
+		5,
+		"{}",
+		compiled.js
+	);
+	assert!(!compiled.js.contains("//#region @nymph/runtime/option"));
+	assert!(!compiled.js.contains("//#region @nymph/runtime/iter"));
+	assert_eq!(
+		compiled.js.matches("plus_default(").count(),
+		2,
+		"{}",
+		compiled.js
+	);
+	assert!(!compiled.js.contains("collections/list"), "{}", compiled.js);
+	assert!(!compiled.js.contains("collections/map"), "{}", compiled.js);
+	assert!(
+		!compiled.js.contains("@nymph/runtime/result"),
+		"{}",
+		compiled.js
+	);
+
+	let js = compiled.js.replace(
+		"import { NBool, NInt, NUint, NymphRange } from \"std/box\";",
+		"class NBool { constructor(v) { this.v = v; } } class NInt { constructor(v) { this.v = v; } } class NUint { constructor(v) { this.v = v; } } const tag = Symbol.for('nymph.tag'); const none = { [tag]: Symbol.for('$m15$Option.None') }; class NymphRange { constructor({ start, end, inclusive }) { this.start = start; this.end = end; this.inclusive = inclusive; } iter() { let current = this.start; const end = this.end.v; const inclusive = this.inclusive.v; return { next() { if (inclusive ? current.v > end : current.v >= end) return none; const value = current; current = new current.constructor(current.v + 1); return { [tag]: Symbol.for('$m15$Option.Some'), value }; } }; } }",
+	);
+	let exercise = compiled.entry_symbol("exercise");
+	let script = format!("{js}\nconsole.log({exercise}().v);\n");
+	let path = std::env::temp_dir().join(format!("nymph-stable-range-{}.mjs", std::process::id()));
+	std::fs::write(&path, script).unwrap();
+	let output = std::process::Command::new("node")
+		.arg(&path)
+		.output()
+		.unwrap();
+	let _ = std::fs::remove_file(path);
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(String::from_utf8_lossy(&output.stdout), "31\n");
 }
 
 #[test]
