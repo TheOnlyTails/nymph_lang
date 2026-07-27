@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use nymph_sema::{
 	CanonicalModuleSpecifier, DeclarationKey, DefinitionId, EmittedBindingName, EmittedMemberName,
-	ModuleIdentity, ModuleOrigin, RuntimeDefinition, RuntimeDefinitionLookup,
+	InterfaceType, ModuleIdentity, ModuleOrigin, RuntimeDefinition, RuntimeDefinitionLookup,
 	RuntimeDefinitionLookupError, StableNameLookup, StableNameLookupError, StableShapeFact,
 	StableShapeLookup, StableShapeLookupError, StableShapeRequest, lower_runtime_definition,
 };
@@ -308,7 +308,13 @@ fn materialized_default_is_placed_in_implementation_and_dispatches_to_materializ
 	assert!(
 		matches!(lowered.fragment(), nymph_sema::LoweredHirFragment::MaterializedDefault { owner, implementation: found, interface_member, method } if owner == &implementation.id && found == &implementation.id && interface_member == &first.interface_member_id && matches!(&method.body, nymph_hir::hir::HirExpr::Call { callee, args } if args.is_empty() && matches!(&**callee, nymph_hir::hir::HirExpr::Field { name, .. } if name == "second")))
 	);
-	assert_eq!(lowered.demands(), [second.member_id.clone()]);
+	let InterfaceType::Named {
+		definition: owner, ..
+	} = &implementation.self_type
+	else {
+		panic!("materialized default must target a named owner")
+	};
+	assert_eq!(lowered.demands(), [owner.clone(), second.member_id.clone()]);
 }
 
 #[test]
@@ -342,8 +348,14 @@ fn materialized_default_dispatches_to_source_override_sibling() {
 		.find(|artifact| artifact.definition == first.member_id)
 		.unwrap();
 	let lowered = lower_runtime_definition(&context, Arc::new(artifact.clone())).unwrap();
-	assert_eq!(lowered.demands(), [second.member_id.clone()]);
-	assert_ne!(lowered.demands(), [materialized_second]);
+	let InterfaceType::Named {
+		definition: owner, ..
+	} = &implementation.self_type
+	else {
+		panic!("materialized default must target a named owner")
+	};
+	assert_eq!(lowered.demands(), [owner.clone(), second.member_id.clone()]);
+	assert!(!lowered.demands().contains(&materialized_second));
 }
 
 #[test]
@@ -381,8 +393,19 @@ fn each_implementation_gets_distinct_materialized_defaults_and_its_own_sibling()
 		lowered[0].0.body_definition_id,
 		lowered[1].0.body_definition_id
 	);
-	assert_eq!(lowered[0].2.demands(), [lowered[0].1.member_id.clone()]);
-	assert_eq!(lowered[1].2.demands(), [lowered[1].1.member_id.clone()]);
+	for (implementation, (_, sibling, materialized)) in interface.implementations.iter().zip(&lowered)
+	{
+		let InterfaceType::Named {
+			definition: owner, ..
+		} = &implementation.self_type
+		else {
+			panic!("materialized default must target a named owner")
+		};
+		assert_eq!(
+			materialized.demands(),
+			[owner.clone(), sibling.member_id.clone()]
+		);
+	}
 }
 
 #[test]
