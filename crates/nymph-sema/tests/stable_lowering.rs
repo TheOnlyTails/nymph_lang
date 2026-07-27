@@ -630,7 +630,7 @@ fn lowers_interpolation_compound_assignment_and_closure_shadowing() {
 }
 
 #[test]
-fn inherent_member_dispatch_has_exact_call_fragment_and_implementation_demand() {
+fn inherent_member_dispatch_has_exact_call_fragment_and_member_demand() {
 	let source = "struct Box(value: int) { func get(): int = this.value }\nfunc read(value: Box): int = value.get()";
 	let item = lower_named(source, "read");
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = item.fragment() else {
@@ -647,7 +647,11 @@ fn inherent_member_dispatch_has_exact_call_fragment_and_implementation_demand() 
 		}
 	);
 	assert_eq!(item.demands().len(), 1);
-	assert_eq!(source_name(&item.demands()[0]), "Box");
+	assert_eq!(source_name(&item.demands()[0]), "get");
+	assert!(matches!(
+		item.demands()[0].key,
+		DeclarationKey::Member { .. }
+	));
 }
 
 #[test]

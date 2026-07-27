@@ -3,14 +3,14 @@ import @/ops with (Plus, Comparable, Contains, Equals, Order)
 
 impl<T> mut #[T] {
   external(length) func length(): uint
-  external(insert) func insert(i: uint, item: T)
+  external(insert) func insert(i: uint, item: T): void
   external(get) func get(i: uint): Option<T>
   external(remove) func remove(i: uint): Option<T>
-  external(clear) func clear()
+  external(clear) func clear(): void
   external(splice) func splice(start: uint, end: uint, replacement: #[T]): #[T]
 
   /// Appends an item to the end of the list.
-  external(push) func push(item: T)
+  external(push) func push(item: T): void
 
   /// Removes and returns the last element, or `None` if empty.
   external(pop) func pop(): Option<T>

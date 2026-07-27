@@ -113,12 +113,14 @@ pub enum RuntimeIteration {
 	Direct {
 		iterator_interface: DefinitionId,
 		next: DefinitionId,
+		option: DefinitionId,
 	},
 	ViaIter {
 		iterable_interface: DefinitionId,
 		iter: StableDispatch,
 		iterator_interface: DefinitionId,
 		next: DefinitionId,
+		option: DefinitionId,
 	},
 }
 
@@ -579,15 +581,13 @@ fn extract_implementation_members(
 			})
 			.cloned()
 			.ok_or(RuntimeExtractionError::MissingSourceIdentity)?;
-		if !implementation
+		let member_shape = implementation
 			.members
 			.iter()
-			.any(|member| member.id == definition)
-		{
-			return Err(RuntimeExtractionError::CorruptImplementationMemberMapping(
-				definition,
-			));
-		}
+			.find(|member| member.id == definition)
+			.ok_or_else(|| {
+				RuntimeExtractionError::CorruptImplementationMemberMapping(definition.clone())
+			})?;
 		let placement = RuntimePlacement::Attached {
 			owner: implementation.id.clone(),
 			name: name.into(),
@@ -599,12 +599,9 @@ fn extract_implementation_members(
 			ImplMember::Let { meta, value, .. } => {
 				push_value(result, definition, placement, meta, value, source, checked)?
 			}
-			ImplMember::ExternalFunc(_, marker, _) => push_external(
-				result,
-				definition,
-				placement,
-				Some(crate::interface_extract::external_function_abi(marker)),
-			)?,
+			ImplMember::ExternalFunc(..) => {
+				push_external(result, definition, placement, member_shape.external.clone())?
+			}
 			ImplMember::ExternalLet(_, marker, meta) => push_external(
 				result,
 				definition,
@@ -814,6 +811,7 @@ fn runtime_annotations(
 				crate::IterMode::Direct => RuntimeIteration::Direct {
 					iterator_interface: protocols.2.clone(),
 					next: protocols.3.clone(),
+					option: protocols.4.clone(),
 				},
 				crate::IterMode::ViaIter => RuntimeIteration::ViaIter {
 					iterable_interface: protocols.0.clone(),
@@ -826,6 +824,7 @@ fn runtime_annotations(
 					)?,
 					iterator_interface: protocols.2.clone(),
 					next: protocols.3.clone(),
+					option: protocols.4.clone(),
 				},
 			};
 			iterations.push((id, iteration));
@@ -1117,7 +1116,16 @@ fn body_parameters(
 
 fn iteration_protocol(
 	checked: &crate::CheckedFacts,
-) -> Result<(DefinitionId, DefinitionId, DefinitionId, DefinitionId), RuntimeExtractionError> {
+) -> Result<
+	(
+		DefinitionId,
+		DefinitionId,
+		DefinitionId,
+		DefinitionId,
+		DefinitionId,
+	),
+	RuntimeExtractionError,
+> {
 	let find = |interface_name: &str, method_name: &str| {
 		let (id, stable) = checked
 			.semantic
@@ -1149,7 +1157,15 @@ fn iteration_protocol(
 		find("Iterable", "iter").ok_or(RuntimeExtractionError::MissingIterationProtocol)?;
 	let (iterator, next) =
 		find("Iterator", "next").ok_or(RuntimeExtractionError::MissingIterationProtocol)?;
-	Ok((iterable, iter, iterator, next))
+	let option = checked
+		.semantic
+		.definitions
+		.defs
+		.iter()
+		.find(|item| item.name == "Option")
+		.and_then(|item| item.stable.clone())
+		.ok_or(RuntimeExtractionError::MissingIterationProtocol)?;
+	Ok((iterable, iter, iterator, next, option))
 }
 
 fn external_marshal(

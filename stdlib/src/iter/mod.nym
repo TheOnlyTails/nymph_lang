@@ -1,4 +1,5 @@
 import @/option with (Option)
+import @/collections/list
 
 /// The iterator surface: `next` advances the iterator, so it is a `mut func`
 /// (producing the next value mutates the iterator's own state).

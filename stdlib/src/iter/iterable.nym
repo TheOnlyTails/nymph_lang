@@ -1,5 +1,6 @@
 import @/iter with (Iterator)
 import @/option with (Option)
+import @/collections/list
 
 /// An object which is able to be iterated over, for example by a `for` loop, by turning it into
 /// an iterator.

@@ -247,37 +247,89 @@ fn ambient_core_graph(
 	db: &dyn Db,
 	registry: AmbientCoreRegistryInput,
 	root: BuiltinModuleInput,
-) -> Arc<[BuiltinModuleInput]> {
+) -> Arc<AmbientCoreGraph> {
+	#[derive(Clone, Copy, PartialEq, Eq)]
+	enum Mark {
+		Visiting,
+		Visited,
+	}
 	fn visit(
 		db: &dyn Db,
 		module: BuiltinModuleInput,
 		modules: &std::collections::BTreeMap<Arc<str>, BuiltinModuleInput>,
-		seen: &mut std::collections::BTreeSet<Arc<str>>,
+		marks: &mut std::collections::BTreeMap<Arc<str>, Mark>,
+		stack: &mut Vec<Arc<str>>,
 		order: &mut Vec<BuiltinModuleInput>,
-	) {
+		diagnostics: &mut Vec<Diagnostic>,
+	) -> bool {
 		let path = module.key(db).path;
-		if !seen.insert(path.clone()) {
-			return;
+		match marks.get(&path) {
+			Some(Mark::Visited) => return true,
+			Some(Mark::Visiting) => {
+				let start = stack.iter().position(|item| item == &path).unwrap_or(0);
+				let mut cycle = stack[start..].to_vec();
+				cycle.push(path.clone());
+				diagnostics.push(Diagnostic::error(
+					"CORE-IMPORT-CYCLE".into(),
+					format!("ambient core import cycle: {}", cycle.join(" -> ")),
+					Span::new(0, 0),
+				));
+				return false;
+			}
+			None => {}
 		}
+		marks.insert(path.clone(), Mark::Visiting);
+		stack.push(path.clone());
+		let mut valid = true;
 		for import in ambient_core_direct_imports(db, module).iter() {
 			if let Ok(target) = &import.target {
-				let child = modules.get(target.as_str()).unwrap_or_else(|| {
-					panic!("ambient core `{path}` imports missing core sibling `{target}`")
-				});
-				visit(db, *child, modules, seen, order);
+				if let Some(child) = modules.get(target.as_str()) {
+					valid &= visit(db, *child, modules, marks, stack, order, diagnostics);
+				} else {
+					diagnostics.push(Diagnostic::error(
+						"CORE-IMPORT-UNRESOLVED".into(),
+						format!("ambient core `{path}` imports missing module `{target}`"),
+						import.span,
+					));
+					valid = false;
+				}
 			}
 		}
-		order.push(module);
+		stack.pop();
+		marks.insert(path, Mark::Visited);
+		if valid {
+			order.push(module);
+		}
+		valid
 	}
 	let modules = registry
 		.modules(db)
 		.iter()
 		.map(|module| (module.key(db).path, *module))
 		.collect();
-	let mut seen = std::collections::BTreeSet::new();
+	let mut marks = std::collections::BTreeMap::new();
+	let mut stack = Vec::new();
 	let mut order = Vec::new();
-	visit(db, root, &modules, &mut seen, &mut order);
-	order.into()
+	let mut diagnostics = Vec::new();
+	visit(
+		db,
+		root,
+		&modules,
+		&mut marks,
+		&mut stack,
+		&mut order,
+		&mut diagnostics,
+	);
+	Arc::new(AmbientCoreGraph {
+		order: order.into(),
+		diagnostics: diagnostics.into(),
+	})
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct AmbientCoreGraph {
+	order: Arc<[BuiltinModuleInput]>,
+	diagnostics: Arc<[Diagnostic]>,
 }
 
 #[salsa::tracked(no_eq)]
@@ -291,29 +343,85 @@ pub(crate) fn ambient_core_analysis(
 		"ambient_core_analysis",
 		SemanticModuleInput::Builtin(module),
 	);
-	// This private compatibility bootstrap temporarily flattens only the
-	// compiler-core dependency closure. It never enters the public ProjectGraph
-	// or user flattened analysis. Production compatibility flattening remains
-	// explicitly inside the Task 6 review boundary until Task 7 replaces it with
-	// interface-driven dependency checking.
-	let dependencies = registry
-		.modules(db)
+	let graph = ambient_core_graph(db, registry, module);
+	let dependencies = graph
+		.order
 		.iter()
-		.filter(|input| **input != module)
-		.map(|input| compat_parse_builtin(db, *input).tree.clone())
+		.copied()
+		.filter(|input| *input != module)
+		.map(|input| ambient_core_environment(db, registry, input))
 		.collect::<Vec<_>>();
 	let parsed = compat_parse_builtin(db, module);
-	let paired = nymph_sema::check_module_with_prelude_and_module(&parsed.tree, &dependencies);
-	let checked = Arc::new(paired.checked);
+	let semantic_module = Arc::new(parsed.tree.clone());
+	let result = if graph.diagnostics.is_empty() {
+		let mut environment =
+			nymph_sema::SemanticEnvironment::from_modules(ambient_identity(db, module), &dependencies)
+				.expect("ambient dependency interfaces have deterministic identities");
+		let mut bindings = FxHashMap::default();
+		for import in ambient_core_direct_imports(db, module).iter() {
+			let Ok(target) = &import.target else { continue };
+			let Some(dependency) = graph
+				.order
+				.iter()
+				.copied()
+				.find(|input| input.key(db).path.as_ref() == target.as_str())
+			else {
+				continue;
+			};
+			let identity = ambient_identity(db, dependency);
+			bindings.insert(
+				import.namespace.0.clone(),
+				nymph_sema::ResolvedImportBinding::Namespace(identity.clone()),
+			);
+			if let Some(exports) = environment.module_exports.get(&identity) {
+				for (source, alias) in &import.with_idents {
+					let local = alias.as_ref().unwrap_or(source).0.clone();
+					let binding = exports
+						.by_name
+						.get(&source.0)
+						.cloned()
+						.map(nymph_sema::ResolvedImportBinding::Definition)
+						.unwrap_or(nymph_sema::ResolvedImportBinding::Poison);
+					bindings.insert(local, binding);
+				}
+			}
+		}
+		environment.set_resolved_imports(bindings);
+		nymph_sema::check_module_with_environment(
+			semantic_module.clone(),
+			ambient_identity(db, module),
+			&environment,
+			nymph_sema::EntryMode::Library,
+		)
+	} else {
+		let environment =
+			nymph_sema::SemanticEnvironment::from_modules(ambient_identity(db, module), &[])
+				.expect("empty environment is valid");
+		let mut result = nymph_sema::check_module_with_environment(
+			semantic_module.clone(),
+			ambient_identity(db, module),
+			&environment,
+			nymph_sema::EntryMode::Library,
+		);
+		let mut diagnostics = graph.diagnostics.to_vec();
+		diagnostics.extend(result.diagnostics.iter().cloned());
+		result.diagnostics = diagnostics.into();
+		result
+	};
 	Arc::new(super::session::ModuleAnalysis {
-		semantic: Arc::new(nymph_sema::SemanticAnalysis {
-			module: Arc::new(parsed.tree.clone()),
-			checked: Arc::new(checked.facts.clone()),
-			annotations: Arc::new(nymph_sema::ModuleAnnotations::from(
-				checked.facts.annotations.clone(),
-			)),
-		}),
-		diagnostics: super::session::ProjectDiagnostics(Arc::new([])),
+		semantic: result.analysis,
+		diagnostics: super::session::ProjectDiagnostics(
+			result
+				.diagnostics
+				.iter()
+				.cloned()
+				.map(|diag| ProjectDiagnostic {
+					module: module.key(db).path.to_string(),
+					diag,
+				})
+				.collect::<Vec<_>>()
+				.into(),
+		),
 	})
 }
 
@@ -335,18 +443,20 @@ pub(crate) fn ambient_core_headers(
 		ambient_identity(db, module),
 		&compat_parse_builtin(db, module).tree,
 	);
-	let checked = registry
-		.modules(db)
+	let dependency_definitions = ambient_core_graph(db, registry, module)
+		.order
 		.iter()
-		.flat_map(|input| {
+		.copied()
+		.filter(|dependency| *dependency != module)
+		.flat_map(|dependency| {
 			nymph_sema::declared_headers(
-				ambient_identity(db, *input),
-				&compat_parse_builtin(db, *input).tree,
+				ambient_identity(db, dependency),
+				&compat_parse_builtin(db, dependency).tree,
 			)
 			.definitions
 		})
 		.collect();
-	Arc::new(own.with_checked_definitions(checked))
+	Arc::new(own.with_checked_definitions(dependency_definitions))
 }
 
 #[salsa::tracked(returns(clone))]
@@ -518,6 +628,48 @@ fn checked_from_analysis(
 	}
 }
 
+#[salsa::tracked(returns(clone))]
+fn ambient_runtime_definition_index<'db>(
+	db: &'db dyn Db,
+	registry: AmbientCoreRegistryInput,
+	module: BuiltinModuleInput,
+) -> Arc<[RuntimeDefinitionEntity<'db>]> {
+	let environment = ambient_core_environment(db, registry, module);
+	let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
+		return Arc::new([]);
+	};
+	let analysis = ambient_core_analysis(db, registry, module);
+	let Ok(mut definitions) = nymph_sema::runtime_definitions(
+		&analysis.semantic.module,
+		&module.source(db),
+		&analysis.semantic.checked,
+		interface,
+	) else {
+		return Arc::new([]);
+	};
+	definitions.sort_by(|a, b| a.definition.cmp(&b.definition));
+	definitions
+		.into_iter()
+		.map(|value| RuntimeDefinitionEntity::new(db, value.definition.clone(), Arc::new(value)))
+		.collect::<Vec<_>>()
+		.into()
+}
+
+fn exact_module_environment<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	module: SemanticModuleInput,
+) -> Arc<nymph_sema::ModuleEnvironment> {
+	match module {
+		SemanticModuleInput::Builtin(input)
+			if input.key(db).domain == BuiltinModuleDomain::AmbientCore =>
+		{
+			ambient_core_environment(db, key.ambient_core_registry(db), input)
+		}
+		_ => interface_module_environment(db, key, module),
+	}
+}
+
 #[salsa::tracked]
 pub(crate) fn runtime_definition_index<'db>(
 	db: &'db dyn Db,
@@ -526,6 +678,11 @@ pub(crate) fn runtime_definition_index<'db>(
 ) -> Arc<[RuntimeDefinitionEntity<'db>]> {
 	#[cfg(feature = "test-support")]
 	db.semantic_query_will_execute("runtime_definition_index", module);
+	if let SemanticModuleInput::Builtin(input) = module
+		&& input.key(db).domain == BuiltinModuleDomain::AmbientCore
+	{
+		return ambient_runtime_definition_index(db, key.ambient_core_registry(db), input);
+	}
 	let environment = interface_module_environment(db, key, module);
 	let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
 		return Arc::new([]);
@@ -573,11 +730,18 @@ pub(crate) fn runtime_definition_ids<'db>(
 ) -> Result<Arc<[nymph_sema::DefinitionId]>, super::session::RuntimeDefinitionError> {
 	#[cfg(feature = "test-support")]
 	db.semantic_query_will_execute("runtime_definition_ids", module);
-	let environment = interface_module_environment(db, key, module);
+	let environment = exact_module_environment(db, key, module);
 	let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
 		return Err(super::session::RuntimeDefinitionError::Recovered);
 	};
-	let analysis = interface_module_analysis(db, key, module);
+	let analysis = match module {
+		SemanticModuleInput::Builtin(input)
+			if input.key(db).domain == BuiltinModuleDomain::AmbientCore =>
+		{
+			ambient_core_analysis(db, key.ambient_core_registry(db), input).clone()
+		}
+		_ => interface_module_analysis(db, key, module),
+	};
 	let source = match module {
 		SemanticModuleInput::Project(input) => match input.source(db) {
 			Some(source) => source,
@@ -609,7 +773,7 @@ pub(crate) fn runtime_definition<'db>(
 	#[cfg(feature = "test-support")]
 	db.runtime_query_will_execute("runtime_definition", &definition);
 	let module = runtime_owner(db, key, &definition)?;
-	let environment = interface_module_environment(db, key, module);
+	let environment = exact_module_environment(db, key, module);
 	if matches!(
 		environment.as_ref(),
 		nymph_sema::ModuleEnvironment::Recovered(_)
@@ -649,7 +813,14 @@ pub(crate) fn runtime_definition<'db>(
 			},
 		}));
 	}
-	let analysis = interface_module_analysis(db, key, module);
+	let analysis = match module {
+		SemanticModuleInput::Builtin(input)
+			if input.key(db).domain == BuiltinModuleDomain::AmbientCore =>
+		{
+			ambient_core_analysis(db, key.ambient_core_registry(db), input).clone()
+		}
+		_ => interface_module_analysis(db, key, module),
+	};
 	let source = match module {
 		SemanticModuleInput::Project(input) => input
 			.source(db)
@@ -718,7 +889,7 @@ fn complete_interface<'db>(
 			request: nymph_sema::StableShapeRequest::InterfaceShell(definition.clone()),
 		}
 	})?;
-	let environment = interface_module_environment(db, key, module);
+	let environment = exact_module_environment(db, key, module);
 	if matches!(
 		environment.as_ref(),
 		nymph_sema::ModuleEnvironment::Recovered(_)
@@ -731,7 +902,7 @@ fn complete_interface<'db>(
 }
 
 #[salsa::tracked(returns(clone))]
-fn stable_shape<'db>(
+pub(crate) fn stable_shape<'db>(
 	db: &'db dyn Db,
 	key: ProjectKey<'db>,
 	request: nymph_sema::StableShapeRequest,
@@ -784,14 +955,34 @@ fn stable_shape<'db>(
 			.find(|implementation| implementation.id == *id)
 			.cloned()
 			.map(Fact::Implementation),
-		Request::ImplementationsForInterface(id) => Some(Fact::Implementations(
-			interface
-				.implementations
+		Request::ImplementationsForInterface(id) => {
+			let graph = project_graph(db, key);
+			let builtins = key.builtin_registry(db).modules(db);
+			let ambient = key.ambient_core_registry(db).modules(db);
+			let modules = graph
+				.semantic_order
 				.iter()
-				.filter(|implementation| implementation.interface.as_ref() == Some(id))
-				.cloned()
-				.collect(),
-		)),
+				.copied()
+				.chain(builtins.iter().copied().map(SemanticModuleInput::Builtin))
+				.chain(ambient.iter().copied().map(SemanticModuleInput::Builtin));
+			let mut implementations = Vec::new();
+			for module in modules {
+				let environment = exact_module_environment(db, key, module);
+				let nymph_sema::ModuleEnvironment::Complete(candidate) = environment.as_ref() else {
+					continue;
+				};
+				implementations.extend(
+					candidate
+						.implementations
+						.iter()
+						.filter(|implementation| implementation.interface.as_ref() == Some(id))
+						.cloned(),
+				);
+			}
+			implementations.sort_by(|left, right| left.id.cmp(&right.id));
+			implementations.dedup_by(|left, right| left.id == right.id);
+			Some(Fact::Implementations(implementations))
+		}
 		Request::InterfaceShell(id) => definitions
 			.clone()
 			.find(|definition| definition.id == *id)
@@ -844,10 +1035,23 @@ pub(crate) fn binding_name<'db>(
 		}
 	})?;
 	let graph = project_graph(db, key);
-	let tag = graph
+	let project_tag = graph
 		.semantic_order
 		.iter()
-		.position(|module| module.identity(db) == definition.module)
+		.position(|module| module.identity(db) == definition.module);
+	let importable = key.builtin_registry(db).modules(db);
+	let importable_tag = importable
+		.iter()
+		.position(|module| SemanticModuleInput::Builtin(*module).identity(db) == definition.module)
+		.map(|index| graph.semantic_order.len() + index);
+	let ambient = key.ambient_core_registry(db).modules(db);
+	let ambient_tag = ambient
+		.iter()
+		.position(|module| ambient_identity(db, *module) == definition.module)
+		.map(|index| graph.semantic_order.len() + importable.len() + index);
+	let tag = project_tag
+		.or(importable_tag)
+		.or(ambient_tag)
 		.ok_or_else(|| nymph_sema::StableNameLookupError::MissingBinding {
 			definition: definition.clone(),
 		})?;
@@ -855,13 +1059,41 @@ pub(crate) fn binding_name<'db>(
 	let entry_main = key.mode(db) == nymph_sema::EntryMode::Entry
 		&& definition.module.path == key.entry(db).as_str()
 		&& name == "main";
+	let receiver = match &definition.key {
+		nymph_sema::DeclarationKey::Member { owner, .. } => match &owner.key {
+			nymph_sema::DeclarationKey::Implementation { header, .. } => {
+				primitive_header_tag(&header.self_type)
+			}
+			_ => None,
+		},
+		_ => None,
+	};
 	Ok(nymph_sema::EmittedBindingName::new(
 		if preserve || entry_main {
 			name.to_owned()
+		} else if let Some(receiver) = receiver {
+			format!("$m{tag}${receiver}${name}")
 		} else {
 			format!("$m{tag}${name}")
 		},
 	))
+}
+
+fn primitive_header_tag(ty: &nymph_sema::HeaderType) -> Option<&'static str> {
+	use nymph_sema::HeaderType;
+	match ty {
+		HeaderType::Int => Some("int"),
+		HeaderType::UInt => Some("uint"),
+		HeaderType::Float => Some("float"),
+		HeaderType::Char => Some("char"),
+		HeaderType::String => Some("string"),
+		HeaderType::Boolean => Some("bool"),
+		HeaderType::Void => Some("void"),
+		HeaderType::List(_) | HeaderType::Tuple(_) => Some("list"),
+		HeaderType::Map(..) => Some("map"),
+		HeaderType::Mutable(inner) => primitive_header_tag(inner),
+		_ => None,
+	}
 }
 
 #[salsa::tracked(returns(clone))]

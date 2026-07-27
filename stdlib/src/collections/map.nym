@@ -8,7 +8,7 @@ impl<K: Hash, V> mut #{K: V} {
   external(get) func get(key: K): Option<V>
   external(insert) func insert(key: K, value: V): boolean
   external(remove) func remove(key: K): Option<V>
-  external(clear) func clear()
+  external(clear) func clear(): void
   external(get_or_insert) func get_or_insert(key: K, default: V): V
 
   /// Returns `true` if the map contains no entries.

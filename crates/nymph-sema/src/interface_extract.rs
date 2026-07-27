@@ -168,12 +168,47 @@ fn visible(visibility: Option<Visibility>) -> bool {
 }
 
 pub(crate) fn external_function_abi(marker: &EcoString) -> ExternalAbi {
-	let linked = nymph_hir::linkage::lookup(marker, None);
+	external_function_abi_for_receiver(marker, None)
+}
+
+fn external_function_abi_for_receiver(
+	marker: &EcoString,
+	receiver_tag: Option<&str>,
+) -> ExternalAbi {
+	let linked = nymph_hir::linkage::lookup(marker, receiver_tag);
 	ExternalAbi {
 		marker: marker.clone(),
 		module: linked.map(|linkage| linkage.module.into()),
 		symbol: linked.map(|linkage| linkage.symbol.into()),
 		marshal: None,
+	}
+}
+
+fn implementation_receiver_tag(owner: &DefinitionId) -> Option<&'static str> {
+	let DeclarationKey::Implementation { header, .. } = &owner.key else {
+		return None;
+	};
+	let mut mutable = header.mutable;
+	let mut self_type = &header.self_type;
+	while let HeaderType::Mutable(inner) = self_type {
+		mutable = true;
+		self_type = inner;
+	}
+	let base = match self_type {
+		HeaderType::List(_) => "list",
+		HeaderType::Map(_, _) => "map",
+		HeaderType::Int => "int",
+		HeaderType::UInt => "uint",
+		HeaderType::Float => "float",
+		HeaderType::Char => "char",
+		HeaderType::String => "string",
+		HeaderType::Boolean => "boolean",
+		_ => return None,
+	};
+	match (mutable, base) {
+		(true, "list") => Some("mut_list"),
+		(true, "map") => Some("mut_map"),
+		_ => Some(base),
 	}
 }
 
@@ -501,7 +536,8 @@ fn checked_member_shape(
 			})
 			.collect::<Result<_, InterfaceConversionError>>()?,
 		return_type: canonicalize_type(&checked.interner, facts.ret, &member_context)?,
-		external: external_symbol.map(external_function_abi),
+		external: external_symbol
+			.map(|symbol| external_function_abi_for_receiver(symbol, implementation_receiver_tag(owner))),
 		runtime_owner: Some(owner.clone()),
 		has_default: false,
 	})
@@ -636,7 +672,10 @@ fn member_shape(
 				.transpose()?
 				.unwrap_or(InterfaceType::Void);
 			let external = match member {
-				ImplMember::ExternalFunc(_, symbol, _) => Some(external_function_abi(symbol)),
+				ImplMember::ExternalFunc(_, symbol, _) => Some(external_function_abi_for_receiver(
+					symbol,
+					implementation_receiver_tag(owner),
+				)),
 				_ => None,
 			};
 			(

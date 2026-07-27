@@ -1,3 +1,5 @@
+import @/ops with (Power)
+
 /// The ratio between a circle's circumference and its diameter.
 public let pi = 3.14159265358979323846
 /// The ratio between a circle's circumference and its radius, or 2π.

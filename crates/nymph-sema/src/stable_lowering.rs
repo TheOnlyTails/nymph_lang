@@ -517,6 +517,9 @@ pub fn lower_runtime_definition(
 			else {
 				return Err(StableShapeLookupError::WrongFact { request }.into());
 			};
+			if let crate::InterfaceType::Named { definition, .. } = &implementation_shape.self_type {
+				demands.insert(definition.clone());
+			}
 			let slot = implementation_shape
 				.member_slots
 				.iter()
@@ -625,6 +628,45 @@ fn stable_runtime_tag(ty: &InterfaceType) -> Option<EcoString> {
 	Some(EcoString::from(format!("nymph.{tag}")))
 }
 
+fn primitive_extension_owner(
+	context: &impl StableShapeLookup,
+	owner: &DefinitionId,
+) -> Result<bool, StableLoweringError> {
+	if !matches!(owner.key, crate::DeclarationKey::Implementation { .. }) {
+		return Ok(false);
+	}
+	let request = StableShapeRequest::Implementation(owner.clone());
+	let StableShapeFact::Implementation(shape) = context.stable_shape(&request)? else {
+		return Err(StableShapeLookupError::WrongFact { request }.into());
+	};
+	Ok(stable_runtime_tag(&shape.self_type).is_some())
+}
+
+fn primitive_extension_member(
+	context: &impl StableLoweringContext,
+	member: &DefinitionId,
+	implementation: &DefinitionId,
+) -> Result<bool, StableLoweringError> {
+	if !primitive_extension_owner(context, implementation)? {
+		return Ok(false);
+	}
+	let artifact = context.runtime_definition(member)?;
+	let crate::RuntimePlacement::Attached { owner, .. } = &artifact.placement else {
+		return Err(invalid(
+			member,
+			"primitive extension member has top-level placement",
+		));
+	};
+	if owner != implementation {
+		return Err(StableLoweringError::MismatchedImplementationPlacement {
+			definition: member.clone(),
+			expected: implementation.clone(),
+			actual: owner.clone(),
+		});
+	}
+	Ok(true)
+}
+
 fn attached_owner(artifact: &RuntimeDefinition) -> Result<DefinitionId, StableLoweringError> {
 	match &artifact.placement {
 		crate::RuntimePlacement::Attached { owner, .. } => Ok(owner.clone()),
@@ -697,6 +739,10 @@ fn lower_body(
 		.enumerate()
 		.map(|(index, pattern)| (pattern.1, crate::PatternNodeId(index as u32)))
 		.collect();
+	let primitive_extension = match &artifact.placement {
+		crate::RuntimePlacement::Attached { owner, .. } => primitive_extension_owner(context, owner)?,
+		crate::RuntimePlacement::TopLevel => false,
+	};
 	for id in body
 		.annotations
 		.types
@@ -721,7 +767,11 @@ fn lower_body(
 		counters: RefCell::new(HashMap::new()),
 		demands: RefCell::new(demands),
 		implementation_slots,
+		receiver_binding: primitive_extension.then(|| EcoString::from("$self")),
 	};
+	if primitive_extension {
+		lowerer.scopes.borrow_mut()[0].insert("this".into(), "$self".into());
+	}
 	let emitted: EcoString = context.binding_name(&artifact.definition)?.as_str().into();
 	if let Some(meta) = meta {
 		let params = meta
@@ -732,9 +782,18 @@ fn lower_body(
 		let lowered_body = lowerer.lower_function_body(expression)?;
 		let function = HirFunc {
 			name: emitted.clone(),
-			params: params.clone(),
+			params: if primitive_extension {
+				std::iter::once(EcoString::from("$self"))
+					.chain(params.iter().cloned())
+					.collect()
+			} else {
+				params.clone()
+			},
 			body: lowered_body.clone(),
 		};
+		if primitive_extension {
+			return Ok(LoweredHirFragment::TopLevelFunction(function));
+		}
 		match &artifact.placement {
 			crate::RuntimePlacement::TopLevel => Ok(LoweredHirFragment::TopLevelFunction(function)),
 			crate::RuntimePlacement::Attached { owner, .. } => {
@@ -808,6 +867,52 @@ struct StableBodyLowerer<'a, C> {
 	counters: RefCell<HashMap<EcoString, u32>>,
 	demands: RefCell<&'a mut StableDemandSet>,
 	implementation_slots: Option<&'a [crate::ImplementationMemberSlot]>,
+	receiver_binding: Option<EcoString>,
+}
+fn js_reserved_word(name: &str) -> bool {
+	matches!(
+		name,
+		"await"
+			| "break"
+			| "case"
+			| "catch"
+			| "class"
+			| "const"
+			| "continue"
+			| "debugger"
+			| "default"
+			| "delete"
+			| "do"
+			| "else"
+			| "enum"
+			| "export"
+			| "extends"
+			| "false"
+			| "finally"
+			| "for"
+			| "function"
+			| "if"
+			| "import"
+			| "in"
+			| "instanceof"
+			| "let"
+			| "new"
+			| "null"
+			| "return"
+			| "static"
+			| "super"
+			| "switch"
+			| "this"
+			| "throw"
+			| "true"
+			| "try"
+			| "typeof"
+			| "var"
+			| "void"
+			| "while"
+			| "with"
+			| "yield"
+	)
 }
 impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 	fn id(&self, expr: &Expr) -> crate::BodyNodeId {
@@ -826,7 +931,9 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.borrow()
 			.iter()
 			.any(|scope| scope.contains_key(name));
-		let emitted = if collision {
+		let emitted = if js_reserved_word(name) {
+			format!("${name}").into()
+		} else if collision {
 			let mut counters = self.counters.borrow_mut();
 			let count = counters.entry(name.clone()).or_default();
 			*count += 1;
@@ -1017,7 +1124,11 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			ExprKind::AnonymousParam(index) => {
 				HirExpr::Local(self.resolve(&crate::anon_closure::anon_param_name(index.unwrap_or(0))))
 			}
-			ExprKind::This => HirExpr::This,
+			ExprKind::This => self
+				.receiver_binding
+				.clone()
+				.map(HirExpr::Local)
+				.unwrap_or(HirExpr::This),
 			ExprKind::Grouped(inner) => self.lower(inner)?,
 			ExprKind::List(items) | ExprKind::Tuple(items) => {
 				let kind = if matches!(expr.kind, ExprKind::List(_)) {
@@ -1160,6 +1271,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					if let StableShapeFact::TypeShell(crate::StableTypeShell::Struct(shell)) =
 						self.context.stable_shape(&request)?
 					{
+						self.demand_external(target)?;
 						let fields = args
 							.iter()
 							.enumerate()
@@ -1401,7 +1513,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				return self.lower_generic_bound(interface, member, receiver, arguments);
 			}
 		}
-		let (member, demand, external) = match dispatch {
+		let (member, demand, external, implementation) = match dispatch {
 			crate::StableDispatch::Builtin { method, .. } => {
 				return Ok(HirExpr::Call {
 					callee: Box::new(HirExpr::Field {
@@ -1418,7 +1530,12 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				member,
 				implementation,
 				..
-			} => (member.clone(), Some(implementation.clone()), false),
+			} => (
+				member.clone(),
+				Some(member.clone()),
+				false,
+				Some(implementation.clone()),
+			),
 			crate::StableDispatch::SelectedImplementation {
 				member,
 				implementation,
@@ -1441,9 +1558,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						implementation: implementation.clone(),
 						member: member.clone(),
 					})?;
-				(slot.member_id.clone(), Some(slot.member_id.clone()), false)
+				(
+					slot.member_id.clone(),
+					Some(slot.member_id.clone()),
+					false,
+					Some(implementation.clone()),
+				)
 			}
-			crate::StableDispatch::GenericBound { member, .. } => (member.clone(), None, false),
+			crate::StableDispatch::GenericBound { member, .. } => (member.clone(), None, false, None),
 			crate::StableDispatch::External {
 				member,
 				implementation,
@@ -1461,7 +1583,12 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						member: member.clone(),
 						implementation: implementation.clone(),
 					})?;
-				(slot.member_id.clone(), Some(slot.member_id.clone()), true)
+				(
+					slot.member_id.clone(),
+					Some(slot.member_id.clone()),
+					true,
+					Some(implementation.clone()),
+				)
 			}
 		};
 		let materialized_member = self.implementation_slots.and_then(|slots| {
@@ -1509,6 +1636,23 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			return Ok(HirExpr::ExternCall {
 				module,
 				symbol,
+				args,
+			});
+		}
+		if let Some(implementation) = implementation
+			&& primitive_extension_member(self.context, &member, &implementation)?
+		{
+			let mut args = vec![self.lower(receiver)?];
+			args.extend(
+				arguments
+					.into_iter()
+					.map(|arg| self.lower(arg))
+					.collect::<Result<Vec<_>, _>>()?,
+			);
+			return Ok(HirExpr::Call {
+				callee: Box::new(HirExpr::Local(
+					self.context.binding_name(&member)?.as_str().into(),
+				)),
 				args,
 			});
 		}
@@ -1926,6 +2070,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 	fn demand_external(&self, definition: &DefinitionId) -> Result<(), StableLoweringError> {
 		if definition.module != self.artifact.definition.module {
 			self.context.module_specifier(&definition.module)?;
+		}
+		if definition != &self.artifact.definition {
 			self.demands.borrow_mut().insert(definition.clone());
 		}
 		Ok(())
@@ -1968,10 +2114,54 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				node: self.id(iterable),
 				channel: "iteration".into(),
 			})?;
-		let (it, next) = match iteration {
-			crate::RuntimeIteration::Direct { next, .. } => (source, next),
-			crate::RuntimeIteration::ViaIter { iter, next, .. } => {
-				(self.lower_dispatch_value(iter, source)?, next)
+		let (it, next, option) = match iteration {
+			crate::RuntimeIteration::Direct { next, option, .. } => (source, next, option),
+			crate::RuntimeIteration::ViaIter {
+				iter,
+				iterable_interface,
+				iterator_interface,
+				next,
+				option,
+				..
+			} => {
+				self.demand_concrete_iteration_next(iter, iterable_interface, iterator_interface, next)?;
+				let lowered = if matches!(peel_mut(self.ty(iterable)?), InterfaceType::List(_)) {
+					let request = StableShapeRequest::ImplementationsForInterface(iterable_interface.clone());
+					let StableShapeFact::Implementations(implementations) =
+						self.context.stable_shape(&request)?
+					else {
+						return Err(StableShapeLookupError::WrongFact { request }.into());
+					};
+					let implementation = implementations
+						.into_iter()
+						.find(|implementation| matches!(implementation.self_type, InterfaceType::List(_)))
+						.ok_or_else(|| {
+							invalid(
+								&self.artifact.definition,
+								"native List has no exact Iterable implementation",
+							)
+						})?;
+					let member = &implementation
+						.member_slots
+						.first()
+						.ok_or_else(|| {
+							invalid(
+								&self.artifact.definition,
+								"native List Iterable implementation has no iter slot",
+							)
+						})?
+						.member_id;
+					self.demand_external(member)?;
+					HirExpr::Call {
+						callee: Box::new(HirExpr::Local(
+							self.context.binding_name(member)?.as_str().into(),
+						)),
+						args: vec![source],
+					}
+				} else {
+					self.lower_dispatch_value(iter, source)?
+				};
+				(lowered, next, option)
 			}
 		};
 		self.scopes.borrow_mut().push(HashMap::new());
@@ -1987,6 +2177,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			}),
 			args: vec![],
 		};
+		let option_name: EcoString = self.context.binding_name(option)?.as_str().into();
 		Ok(HirExpr::Block {
 			stmts: vec![
 				HirStmt::Let {
@@ -2006,7 +2197,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						arms: vec![
 							HirArm {
 								pat: HirPat::Variant {
-									enum_name: "Option".into(),
+									enum_name: option_name.clone(),
 									variant: "Some".into(),
 									fields: vec![("value".into(), pat)],
 								},
@@ -2015,7 +2206,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							},
 							HirArm {
 								pat: HirPat::Variant {
-									enum_name: "Option".into(),
+									enum_name: option_name,
 									variant: "None".into(),
 									fields: vec![],
 								},
@@ -2031,6 +2222,98 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			],
 			tail: None,
 		})
+	}
+
+	fn demand_concrete_iteration_next(
+		&self,
+		iter: &crate::StableDispatch,
+		iterable_interface: &DefinitionId,
+		iterator_interface: &DefinitionId,
+		next: &DefinitionId,
+	) -> Result<(), StableLoweringError> {
+		let selected = match iter {
+			crate::StableDispatch::SelectedImplementation { implementation, .. }
+			| crate::StableDispatch::InterfaceDefault { implementation, .. }
+			| crate::StableDispatch::Direct { implementation, .. } => Some(implementation.clone()),
+			crate::StableDispatch::Builtin { .. } => {
+				let request = StableShapeRequest::ImplementationsForInterface(iterable_interface.clone());
+				let StableShapeFact::Implementations(implementations) =
+					self.context.stable_shape(&request)?
+				else {
+					return Err(StableShapeLookupError::WrongFact { request }.into());
+				};
+				implementations
+					.into_iter()
+					.find(|implementation| matches!(implementation.self_type, InterfaceType::List(_)))
+					.map(|implementation| implementation.id)
+			}
+			_ => None,
+		};
+		let Some(implementation) = selected else {
+			return Ok(());
+		};
+		let request = StableShapeRequest::Implementation(implementation.clone());
+		let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
+			return Err(StableShapeLookupError::WrongFact { request }.into());
+		};
+		let iter_member = match iter {
+			crate::StableDispatch::SelectedImplementation { member, .. }
+			| crate::StableDispatch::InterfaceDefault { member, .. }
+			| crate::StableDispatch::Direct { member, .. } => member,
+			crate::StableDispatch::Builtin { .. } => shape
+				.member_slots
+				.first()
+				.map(|slot| &slot.interface_member_id)
+				.ok_or_else(|| StableLoweringError::MissingImplementationSlot {
+					implementation: implementation.clone(),
+					member: next.clone(),
+				})?,
+			_ => return Ok(()),
+		};
+		let slot = shape
+			.member_slots
+			.iter()
+			.find(|slot| slot.interface_member_id == *iter_member || slot.member_id == *iter_member)
+			.ok_or_else(|| StableLoweringError::MissingImplementationSlot {
+				implementation: implementation.clone(),
+				member: iter_member.clone(),
+			})?;
+		let request = StableShapeRequest::Member(slot.member_id.clone());
+		let StableShapeFact::Member(member) = self.context.stable_shape(&request)? else {
+			return Err(StableShapeLookupError::WrongFact { request }.into());
+		};
+		let InterfaceType::Named {
+			definition: iterator,
+			..
+		} = &member.return_type
+		else {
+			return Ok(());
+		};
+		let request = StableShapeRequest::ImplementationsForInterface(iterator_interface.clone());
+		let StableShapeFact::Implementations(implementations) = self.context.stable_shape(&request)?
+		else {
+			return Err(StableShapeLookupError::WrongFact { request }.into());
+		};
+		let mut found = false;
+		for implementation in &implementations {
+			if matches!(peel_mut(&implementation.self_type), InterfaceType::Named { definition, .. } if definition == iterator)
+				&& let Some(slot) = implementation
+					.member_slots
+					.iter()
+					.find(|slot| slot.interface_member_id == *next)
+			{
+				self.demand_external(&slot.member_id)?;
+				found = true;
+				break;
+			}
+		}
+		if !found {
+			return Err(invalid(
+				&self.artifact.definition,
+				"native List iterator has no exact next implementation",
+			));
+		}
+		Ok(())
 	}
 	fn lower_dispatch_value(
 		&self,
@@ -2053,6 +2336,31 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				});
 			}
 		};
+		let concrete = match dispatch {
+			crate::StableDispatch::Direct { implementation, .. }
+			| crate::StableDispatch::SelectedImplementation { implementation, .. }
+			| crate::StableDispatch::InterfaceDefault { implementation, .. } => {
+				let request = StableShapeRequest::Implementation(implementation.clone());
+				let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
+					return Err(StableShapeLookupError::WrongFact { request }.into());
+				};
+				shape
+					.member_slots
+					.iter()
+					.find(|slot| slot.interface_member_id == *member)
+					.map(|slot| slot.member_id.clone())
+			}
+			_ => None,
+		};
+		self.demand_external(concrete.as_ref().unwrap_or(member))?;
+		if let Some(concrete) = concrete {
+			return Ok(HirExpr::Call {
+				callee: Box::new(HirExpr::Local(
+					self.context.binding_name(&concrete)?.as_str().into(),
+				)),
+				args: vec![receiver],
+			});
+		}
 		Ok(HirExpr::Call {
 			callee: Box::new(HirExpr::Field {
 				recv: Box::new(receiver),
