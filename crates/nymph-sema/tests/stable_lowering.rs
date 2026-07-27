@@ -188,6 +188,20 @@ fn materialized_fixture(
 			artifact.definition.clone(),
 			EmittedMemberName::new(source_name(&artifact.definition)),
 		);
+		if let nymph_sema::RuntimePayload::NymphBody(body) = &artifact.payload {
+			for (_, variant) in body.annotations.variants.iter() {
+				context.members.insert(
+					variant.variant_definition.clone(),
+					EmittedMemberName::new(variant.variant_name.clone()),
+				);
+			}
+			for (_, variant) in body.annotations.pattern_variants.iter() {
+				context.members.insert(
+					variant.variant_definition.clone(),
+					EmittedMemberName::new(variant.variant_name.clone()),
+				);
+			}
+		}
 		if let nymph_sema::RuntimePayload::External(abi) = &artifact.payload {
 			context.shapes.insert(
 				StableShapeRequest::ExternalAbi(artifact.definition.clone()),
@@ -213,13 +227,33 @@ fn materialized_fixture(
 			.iter()
 			.map(|item| &item.definition),
 	) {
-		if definition.kind == nymph_sema::DefinitionShapeKind::Interface {
-			for member in &definition.members {
-				context.members.insert(
-					member.id.clone(),
-					EmittedMemberName::new(member.name.clone()),
+		for member in &definition.members {
+			context.members.insert(
+				member.id.clone(),
+				EmittedMemberName::new(member.name.clone()),
+			);
+		}
+		if let Some(artifact) = artifacts
+			.iter()
+			.find(|artifact| artifact.definition == definition.id)
+		{
+			let shell = match &artifact.payload {
+				nymph_sema::RuntimePayload::Struct(shell) => {
+					Some(nymph_sema::StableTypeShell::Struct(shell.clone()))
+				}
+				nymph_sema::RuntimePayload::Enum(shell) => {
+					Some(nymph_sema::StableTypeShell::Enum(shell.clone()))
+				}
+				_ => None,
+			};
+			if let Some(shell) = shell {
+				context.shapes.insert(
+					StableShapeRequest::TypeShell(definition.id.clone()),
+					StableShapeFact::TypeShell(shell),
 				);
 			}
+		}
+		if definition.kind == nymph_sema::DefinitionShapeKind::Interface {
 			context.shapes.insert(
 				StableShapeRequest::InterfaceShell(definition.id.clone()),
 				StableShapeFact::InterfaceShell(definition.clone()),
@@ -771,4 +805,263 @@ fn generic_bound_with_two_primitive_implementations_lowers_to_stable_multi_case_
 		}
 	);
 	assert_eq!(lowered.demands(), expected_targets);
+}
+
+#[test]
+fn lowers_struct_and_enum_construction_and_variant_patterns_from_stable_facts() {
+	let source = "struct Point(x: int, y: int)\nenum Choice { Pair(left: int, right: int), None }\nfunc point(): Point = Point(x = 1, y = 2)\nfunc choose(value: Choice): int = match (value) { Choice.Pair(left = left, right = right) if (left < right) -> right, Choice.Pair(left = left, right = _) -> left, Choice.None -> 0 }";
+	let point = lower_named(source, "point");
+	assert!(matches!(
+		point.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
+			if matches!(&function.body, nymph_hir::hir::HirExpr::New { class, fields }
+				if class == "Point" && fields.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>() == ["x", "y"])
+	));
+	let choice = lower_named(source, "choose");
+	assert!(matches!(
+		choice.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
+			if matches!(&function.body, nymph_hir::hir::HirExpr::Match { arms, .. }
+				if matches!(&arms[0].pat, nymph_hir::hir::HirPat::Variant { enum_name, variant, fields }
+					if enum_name == "Choice" && variant == "Pair" && fields.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>() == ["left", "right"])
+				&& arms[0].guard.is_some())
+	));
+}
+
+#[test]
+fn lowers_native_index_access_and_assignment_without_protocol_fallback() {
+	let list = lower_fixture("func update(xs: #[int]): int = { xs[0] = 2\nxs[0] }");
+	assert!(matches!(
+		list.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
+			if matches!(function.body, nymph_hir::hir::HirExpr::Block { tail: Some(ref tail), .. }
+				if matches!(**tail, nymph_hir::hir::HirExpr::Index { .. }))
+	));
+	let map = lower_fixture("func lookup(xs: #{string: int}): int = xs[\"one\"]");
+	assert!(matches!(
+		map.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
+			if matches!(function.body, nymph_hir::hir::HirExpr::MapGet { .. })
+	));
+}
+
+#[test]
+fn lowers_tuple_spread_without_protocol_demands() {
+	let tuple = lower_fixture("func copy_tuple(xs: #(int, int)): #(int, int, int) = #(0, ...xs)");
+	assert!(
+		matches!(tuple.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if matches!(function.body, nymph_hir::hir::HirExpr::ArraySpread { .. }))
+	);
+	assert_eq!(tuple.demands(), []);
+}
+
+#[test]
+fn lowers_custom_user_index_access_with_exact_method_and_implementation_demand() {
+	let source = "interface Index<Key, Output> { func index(key: Key): Output }\nstruct Offset(base: int) { impl Index<Key = int, Output = int> { func index(key: int): int = this.base + key } }\nfunc read(value: Offset): int = value[2]";
+	let (items, interface, context) = materialized_fixture(source);
+	let item = items
+		.into_iter()
+		.find(|item| source_name(&item.definition) == "read")
+		.unwrap();
+	let index = interface.implementations[0].member_slots[0]
+		.body_definition_id
+		.clone();
+	let lowered = lower_runtime_definition(&context, Arc::new(item)).unwrap();
+	assert_eq!(
+		lowered.fragment(),
+		&nymph_sema::LoweredHirFragment::TopLevelFunction(nymph_hir::hir::HirFunc {
+			name: "read".into(),
+			params: vec!["value".into()],
+			body: nymph_hir::hir::HirExpr::Call {
+				callee: Box::new(nymph_hir::hir::HirExpr::Field {
+					recv: Box::new(nymph_hir::hir::HirExpr::Local("value".into())),
+					name: "index".into(),
+				}),
+				args: vec![nymph_hir::hir::HirExpr::Num(
+					2.0,
+					nymph_hir::hir::NumKind::Int
+				)],
+			},
+		})
+	);
+	assert_eq!(lowered.demands(), [index]);
+}
+
+#[test]
+fn custom_index_assignment_and_compound_assignment_are_rejected_by_the_checker() {
+	for assignment in ["value[0] = 1", "value[0] += 1"] {
+		let source = format!(
+			"interface Index<Key, Output> {{ func index(key: Key): Output }}\nstruct Value {{ impl Index<Key = int, Output = int> {{ func index(key: int): int = key }} }}\nfunc write(value: Value): void = {assignment}"
+		);
+		let parsed = nymph_syntax::parse_module(&source, "fixture.nym");
+		let identity = ModuleIdentity {
+			origin: ModuleOrigin::Project("test".into()),
+			project: "test".into(),
+			path: "main".into(),
+		};
+		let environment = nymph_sema::SemanticEnvironment::from_modules(identity.clone(), &[]).unwrap();
+		let checked = nymph_sema::check_module_with_environment(
+			Arc::new(parsed.tree),
+			identity,
+			&environment,
+			nymph_sema::EntryMode::Library,
+		);
+		assert!(
+			checked.diagnostics.iter().any(|diagnostic| diagnostic
+				.message
+				.contains("cannot assign to `custom index access`")),
+			"{assignment}: {:?}",
+			checked.diagnostics
+		);
+	}
+}
+
+#[test]
+fn lowers_native_map_and_user_iterator_spreads_with_exact_ordered_demands() {
+	let native = lower_named(
+		"func merge(value: #{int: int}): #{int: int} = #{...value, 2: 3}",
+		"merge",
+	);
+	assert!(
+		matches!(native.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if matches!(&function.body, nymph_hir::hir::HirExpr::MapSpread(items) if matches!(&items[0], nymph_hir::hir::HirMapElem::Spread(nymph_hir::hir::HirExpr::Local(name)) if name == "value")))
+	);
+	assert_eq!(native.demands(), []);
+
+	let source = "enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nstruct Values\nimpl Iterator<int> for Values { mut func next(): Option<int> = None }\nstruct Pairs\nimpl Iterator<#(int, int)> for Pairs { mut func next(): Option<#(int, int)> = None }\nfunc list(value: mut Values): #[int] = #[...value]\nfunc map(value: mut Pairs): #{int: int} = #{...value}";
+	let (items, interface, context) = materialized_fixture(source);
+	let expected = interface
+		.implementations
+		.iter()
+		.map(|implementation| implementation.member_slots[0].body_definition_id.clone())
+		.collect::<Vec<_>>();
+	for (name, map) in [("list", false), ("map", true)] {
+		let item = items
+			.iter()
+			.find(|item| source_name(&item.definition) == name)
+			.unwrap()
+			.clone();
+		let lowered = lower_runtime_definition(&context, Arc::new(item)).unwrap();
+		assert!(if map {
+			matches!(lowered.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if matches!(&function.body, nymph_hir::hir::HirExpr::MapSpread(items) if matches!(&items[0], nymph_hir::hir::HirMapElem::Spread(nymph_hir::hir::HirExpr::Block { .. }))))
+		} else {
+			matches!(lowered.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if matches!(&function.body, nymph_hir::hir::HirExpr::ArraySpread { elems, .. } if matches!(&elems[0], nymph_hir::hir::HirArrayElem::Spread(nymph_hir::hir::HirExpr::Block { .. }))))
+		});
+		let _resolved_implementation = if map { &expected[1] } else { &expected[0] };
+		assert_eq!(lowered.demands(), []);
+	}
+}
+
+#[test]
+fn lowers_for_over_native_list_user_iterator_and_bounded_ranges_with_exact_modes() {
+	let source = "enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nstruct Values\nimpl Iterator<int> for Values { mut func next(): Option<int> = None }\nfunc each(xs: mut Values): void = for (x in xs) { x }";
+	let (items, interface, context) = materialized_fixture(source);
+	let item = items
+		.into_iter()
+		.find(|item| source_name(&item.definition) == "each")
+		.unwrap();
+	let lowered = lower_runtime_definition(&context, Arc::new(item)).unwrap();
+	assert_protocol_for(lowered.fragment(), false);
+	let _resolved_implementation = &interface.implementations[0].member_slots[0].body_definition_id;
+	assert_eq!(lowered.demands(), []);
+}
+
+fn assert_protocol_for(fragment: &nymph_sema::LoweredHirFragment, inclusive: bool) {
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = fragment else {
+		panic!("expected function")
+	};
+	let nymph_hir::hir::HirExpr::Block { stmts, .. } = &function.body else {
+		panic!("expected protocol block: {:?}", function.body)
+	};
+	let nymph_hir::hir::HirStmt::Let { name, value, .. } = &stmts[0] else {
+		panic!("expected iterator binding")
+	};
+	assert_eq!(name, "$it");
+	if inclusive {
+		assert!(matches!(value, nymph_hir::hir::HirExpr::Call { callee, .. }
+			if matches!(callee.as_ref(), nymph_hir::hir::HirExpr::Field { name, recv }
+				if name == "iter" && matches!(recv.as_ref(), nymph_hir::hir::HirExpr::New { fields, .. }
+					if fields[2].1 == nymph_hir::hir::HirExpr::Bool(true)))));
+	}
+	assert!(
+		matches!(&stmts[2], nymph_hir::hir::HirStmt::Expr(nymph_hir::hir::HirExpr::While { body, .. }) if matches!(body.as_ref(), nymph_hir::hir::HirExpr::Match { arms, .. } if matches!(&arms[0].pat, nymph_hir::hir::HirPat::Variant { variant, fields, .. } if variant == "Some" && fields.len() == 1)))
+	);
+}
+
+#[test]
+fn range_for_support_matches_legacy_for_startless_endless_and_unbounded_forms() {
+	for range in ["..3", "1.."] {
+		let (items, _, context) = materialized_fixture(&format!(
+			"enum Option<T> {{ Some(value: T), None }}\ninterface Iterator<Item> {{ mut func next(): Option<Item> }}\ninterface Iterable<Item> {{ func iter(): Iterator<Item> }}\nfunc each(): void = for (_ in {range}) {{ 0 }}"
+		));
+		let error = lower_runtime_definition(
+			&context,
+			Arc::new(
+				items
+					.into_iter()
+					.find(|item| source_name(&item.definition) == "each")
+					.unwrap(),
+			),
+		)
+		.unwrap_err();
+		assert!(
+			matches!(error, nymph_sema::StableLoweringError::Unsupported { ref feature, .. } if feature == "range/protocol"),
+			"{range}: {error:?}"
+		);
+	}
+}
+
+#[test]
+fn missing_index_dispatch_iteration_mode_and_iteration_resolution_are_distinct_typed_errors() {
+	let mut item = artifacts("interface Index<Key, Output> { func index(key: Key): Output }\nstruct Value { impl Index<Key = int, Output = int> { func index(key: int): int = key } }\nfunc read(value: Value): int = value[0]").into_iter().find(|item| source_name(&item.definition) == "read").unwrap();
+	let nymph_sema::RuntimePayload::NymphBody(body) = &mut item.payload else {
+		unreachable!()
+	};
+	body.annotations.dispatches = Arc::from([]);
+	let mut context = Context::default();
+	context
+		.names
+		.insert(item.definition.clone(), EmittedBindingName::new("read"));
+	assert!(
+		matches!(lower_runtime_definition(&context, Arc::new(item)), Err(nymph_sema::StableLoweringError::MissingAnnotation { channel, .. }) if channel == "dispatch")
+	);
+
+	let (items, _, context) = materialized_fixture(
+		"enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nstruct Values\nimpl Iterator<int> for Values { mut func next(): Option<int> = None }\nfunc each(xs: mut Values): void = for (x in xs) { x }",
+	);
+	let mut item = items
+		.into_iter()
+		.find(|item| source_name(&item.definition) == "each")
+		.unwrap();
+	let nymph_sema::RuntimePayload::NymphBody(body) = &mut item.payload else {
+		unreachable!()
+	};
+	body.annotations.iterations = Arc::from([]);
+	assert!(
+		matches!(lower_runtime_definition(&context, Arc::new(item)), Err(nymph_sema::StableLoweringError::MissingAnnotation { channel, .. }) if channel == "iteration")
+	);
+}
+
+#[test]
+fn body_local_pattern_facts_survive_unrelated_earlier_declarations() {
+	let body = "enum Choice { Pair(left: int, right: int) }\nfunc choose(value: Choice): int = match (value) { Choice.Pair(left, right) -> left + right }";
+	let before = artifacts(body)
+		.into_iter()
+		.find(|item| source_name(&item.definition) == "choose")
+		.unwrap();
+	let after = artifacts(&format!("let unrelated = 1\n{body}"))
+		.into_iter()
+		.find(|item| source_name(&item.definition) == "choose")
+		.unwrap();
+	let (nymph_sema::RuntimePayload::NymphBody(before), nymph_sema::RuntimePayload::NymphBody(after)) =
+		(&before.payload, &after.payload)
+	else {
+		unreachable!()
+	};
+	assert_eq!(
+		before.annotations.pattern_variants,
+		after.annotations.pattern_variants
+	);
+	assert_eq!(
+		before.annotations.positional_fields,
+		after.annotations.positional_fields
+	);
 }

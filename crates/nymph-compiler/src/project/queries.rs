@@ -81,7 +81,10 @@ impl SemanticModuleInput {
 				path: module.path(db).as_str().into(),
 			},
 			Self::Builtin(module) => nymph_sema::ModuleIdentity {
-				origin: nymph_sema::ModuleOrigin::Compiler,
+				origin: match module.key(db).domain {
+					BuiltinModuleDomain::ImportableStd => nymph_sema::ModuleOrigin::ImportableStd,
+					BuiltinModuleDomain::AmbientCore => nymph_sema::ModuleOrigin::Compiler,
+				},
 				project: "compiler".into(),
 				path: module.key(db).path.as_ref().into(),
 			},
@@ -562,11 +565,11 @@ pub(crate) fn runtime_definition_index<'db>(
 pub(crate) fn runtime_definition<'db>(
 	db: &'db dyn Db,
 	key: super::session::ProjectKey<'db>,
-	module: SemanticModuleInput,
 	definition: nymph_sema::DefinitionId,
 ) -> Result<Arc<nymph_sema::RuntimeDefinition>, super::session::RuntimeDefinitionError> {
 	#[cfg(feature = "test-support")]
 	db.runtime_query_will_execute("runtime_definition", &definition);
+	let module = runtime_owner(db, key, &definition)?;
 	let environment = interface_module_environment(db, key, module);
 	if matches!(
 		environment.as_ref(),
@@ -634,11 +637,320 @@ pub(crate) fn runtime_definition<'db>(
 pub(crate) fn runtime_definition_consumer<'db>(
 	db: &'db dyn Db,
 	key: super::session::ProjectKey<'db>,
-	module: SemanticModuleInput,
 	definition: nymph_sema::DefinitionId,
 ) -> Result<Arc<nymph_sema::RuntimeDefinition>, super::session::RuntimeDefinitionError> {
 	db.runtime_query_will_execute("runtime_definition_consumer", &definition);
-	runtime_definition(db, key, module, definition)
+	runtime_definition(db, key, definition)
+}
+
+fn runtime_owner<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	definition: &nymph_sema::DefinitionId,
+) -> Result<SemanticModuleInput, super::session::RuntimeDefinitionError> {
+	let graph = project_graph(db, key);
+	let importable = key.builtin_registry(db).modules(db);
+	let ambient = key.ambient_core_registry(db).modules(db);
+	let owners = graph
+		.semantic_order
+		.iter()
+		.copied()
+		.chain(importable.iter().copied().map(SemanticModuleInput::Builtin))
+		.chain(ambient.iter().copied().map(SemanticModuleInput::Builtin))
+		.filter(|module| module.identity(db) == definition.module)
+		.collect::<std::collections::HashSet<_>>();
+	let mut owners = owners.into_iter();
+	let Some(owner) = owners.next() else {
+		return Err(super::session::RuntimeDefinitionError::OwnerNotFound);
+	};
+	if owners.next().is_some() {
+		return Err(super::session::RuntimeDefinitionError::DuplicateOwner);
+	}
+	Ok(owner)
+}
+
+fn complete_interface<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	definition: &nymph_sema::DefinitionId,
+) -> Result<Arc<nymph_sema::ModuleEnvironment>, nymph_sema::StableShapeLookupError> {
+	let module = runtime_owner(db, key, definition).map_err(|_| {
+		nymph_sema::StableShapeLookupError::Missing {
+			request: nymph_sema::StableShapeRequest::InterfaceShell(definition.clone()),
+		}
+	})?;
+	let environment = interface_module_environment(db, key, module);
+	if matches!(
+		environment.as_ref(),
+		nymph_sema::ModuleEnvironment::Recovered(_)
+	) {
+		return Err(nymph_sema::StableShapeLookupError::Recovered {
+			definition: definition.clone(),
+		});
+	}
+	Ok(environment)
+}
+
+#[salsa::tracked(returns(clone))]
+fn stable_shape<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	request: nymph_sema::StableShapeRequest,
+) -> Result<nymph_sema::StableShapeFact, nymph_sema::StableShapeLookupError> {
+	#[cfg(feature = "test-support")]
+	db.runtime_query_will_execute("stable_shape", request.definition());
+	use nymph_sema::{StableShapeFact as Fact, StableShapeRequest as Request};
+	if let Request::TypeShell(definition) = &request {
+		let artifact = runtime_definition(db, key, definition.clone()).map_err(|_| {
+			nymph_sema::StableShapeLookupError::Missing {
+				request: request.clone(),
+			}
+		})?;
+		return match &artifact.payload {
+			nymph_sema::RuntimePayload::Struct(shell) => Ok(Fact::TypeShell(
+				nymph_sema::StableTypeShell::Struct(shell.clone()),
+			)),
+			nymph_sema::RuntimePayload::Enum(shell) => Ok(Fact::TypeShell(
+				nymph_sema::StableTypeShell::Enum(shell.clone()),
+			)),
+			_ => Err(nymph_sema::StableShapeLookupError::Missing { request }),
+		};
+	}
+	let environment = complete_interface(db, key, request.definition())?;
+	let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
+		unreachable!()
+	};
+	let definitions = interface.exports.iter().chain(
+		interface
+			.support_definitions
+			.iter()
+			.map(|item| &item.definition),
+	);
+	let result = match &request {
+		Request::Member(id) => definitions
+			.clone()
+			.flat_map(|definition| &definition.members)
+			.chain(
+				interface
+					.implementations
+					.iter()
+					.flat_map(|implementation| &implementation.members),
+			)
+			.find(|member| member.id == *id)
+			.cloned()
+			.map(Fact::Member),
+		Request::Implementation(id) => interface
+			.implementations
+			.iter()
+			.find(|implementation| implementation.id == *id)
+			.cloned()
+			.map(Fact::Implementation),
+		Request::ImplementationsForInterface(id) => Some(Fact::Implementations(
+			interface
+				.implementations
+				.iter()
+				.filter(|implementation| implementation.interface.as_ref() == Some(id))
+				.cloned()
+				.collect(),
+		)),
+		Request::InterfaceShell(id) => definitions
+			.clone()
+			.find(|definition| definition.id == *id)
+			.cloned()
+			.map(Fact::InterfaceShell),
+		Request::ExternalAbi(id) => definitions
+			.clone()
+			.find(|definition| definition.id == *id)
+			.and_then(|definition| definition.external.clone())
+			.or_else(|| {
+				definitions
+					.clone()
+					.flat_map(|definition| &definition.members)
+					.chain(
+						interface
+							.implementations
+							.iter()
+							.flat_map(|implementation| &implementation.members),
+					)
+					.find(|member| member.id == *id)
+					.and_then(|member| member.external.clone())
+			})
+			.map(Fact::ExternalAbi),
+		Request::TypeShell(_) => unreachable!(),
+	};
+	result.ok_or(nymph_sema::StableShapeLookupError::Missing { request })
+}
+
+fn declaration_name(definition: &nymph_sema::DefinitionId) -> Option<&str> {
+	match &definition.key {
+		nymph_sema::DeclarationKey::TopLevel { name, .. }
+		| nymph_sema::DeclarationKey::Member { name, .. }
+		| nymph_sema::DeclarationKey::MethodBody { name, .. } => Some(name),
+		nymph_sema::DeclarationKey::MaterializedInterfaceMember {
+			interface_member, ..
+		} => declaration_name(interface_member),
+		_ => None,
+	}
+}
+
+#[salsa::tracked(returns(clone))]
+fn binding_name<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	definition: nymph_sema::DefinitionId,
+) -> Result<nymph_sema::EmittedBindingName, nymph_sema::StableNameLookupError> {
+	let name = declaration_name(&definition).ok_or_else(|| {
+		nymph_sema::StableNameLookupError::MissingBinding {
+			definition: definition.clone(),
+		}
+	})?;
+	let graph = project_graph(db, key);
+	let tag = graph
+		.semantic_order
+		.iter()
+		.position(|module| module.identity(db) == definition.module)
+		.ok_or_else(|| nymph_sema::StableNameLookupError::MissingBinding {
+			definition: definition.clone(),
+		})?;
+	let preserve = key.preserve_names(db) && definition.module.path == key.entry(db).as_str();
+	let entry_main = key.mode(db) == nymph_sema::EntryMode::Entry
+		&& definition.module.path == key.entry(db).as_str()
+		&& name == "main";
+	Ok(nymph_sema::EmittedBindingName::new(
+		if preserve || entry_main {
+			name.to_owned()
+		} else {
+			format!("$m{tag}${name}")
+		},
+	))
+}
+
+#[salsa::tracked(returns(clone))]
+fn member_name<'db>(
+	_db: &'db dyn Db,
+	_key: ProjectKey<'db>,
+	definition: nymph_sema::DefinitionId,
+) -> Result<nymph_sema::EmittedMemberName, nymph_sema::StableNameLookupError> {
+	declaration_name(&definition)
+		.map(nymph_sema::EmittedMemberName::new)
+		.ok_or(nymph_sema::StableNameLookupError::MissingMember { definition })
+}
+
+#[salsa::tracked(returns(clone))]
+fn module_specifier<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	module: nymph_sema::ModuleIdentity,
+) -> Result<nymph_sema::CanonicalModuleSpecifier, nymph_sema::StableNameLookupError> {
+	let owner = runtime_owner(
+		db,
+		key,
+		&nymph_sema::DefinitionId::new(
+			module.clone(),
+			nymph_sema::DeclarationKey::top_level(nymph_sema::DeclarationCategory::Namespace, "<module>"),
+		),
+	)
+	.map_err(|_| nymph_sema::StableNameLookupError::MissingModule {
+		module: module.clone(),
+	})?;
+	Ok(match owner.domain(db) {
+		SemanticModuleDomain::Project => nymph_sema::CanonicalModuleSpecifier::Project(module.path),
+		SemanticModuleDomain::ImportableStd => {
+			nymph_sema::CanonicalModuleSpecifier::Importable(module.path)
+		}
+		SemanticModuleDomain::AmbientCore => {
+			nymph_sema::CanonicalModuleSpecifier::CompilerRuntime(module.path)
+		}
+	})
+}
+
+struct CompilerStableContext<'db> {
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+}
+
+impl nymph_sema::RuntimeDefinitionLookup for CompilerStableContext<'_> {
+	fn runtime_definition(
+		&self,
+		definition: &nymph_sema::DefinitionId,
+	) -> Result<Arc<nymph_sema::RuntimeDefinition>, nymph_sema::RuntimeDefinitionLookupError> {
+		runtime_definition(self.db, self.key, definition.clone()).map_err(|error| match error {
+			super::session::RuntimeDefinitionError::Recovered => {
+				nymph_sema::RuntimeDefinitionLookupError::Recovered {
+					definition: definition.clone(),
+				}
+			}
+			super::session::RuntimeDefinitionError::DefinitionNotFound
+			| super::session::RuntimeDefinitionError::OwnerNotFound => {
+				nymph_sema::RuntimeDefinitionLookupError::Missing {
+					definition: definition.clone(),
+				}
+			}
+			other => nymph_sema::RuntimeDefinitionLookupError::Unavailable {
+				definition: definition.clone(),
+				reason: format!("{other:?}").into(),
+			},
+		})
+	}
+}
+
+impl nymph_sema::StableShapeLookup for CompilerStableContext<'_> {
+	fn stable_shape(
+		&self,
+		request: &nymph_sema::StableShapeRequest,
+	) -> Result<nymph_sema::StableShapeFact, nymph_sema::StableShapeLookupError> {
+		stable_shape(self.db, self.key, request.clone())
+	}
+}
+
+impl nymph_sema::StableNameLookup for CompilerStableContext<'_> {
+	fn binding_name(
+		&self,
+		definition: &nymph_sema::DefinitionId,
+	) -> Result<nymph_sema::EmittedBindingName, nymph_sema::StableNameLookupError> {
+		binding_name(self.db, self.key, definition.clone())
+	}
+	fn member_name(
+		&self,
+		definition: &nymph_sema::DefinitionId,
+	) -> Result<nymph_sema::EmittedMemberName, nymph_sema::StableNameLookupError> {
+		member_name(self.db, self.key, definition.clone())
+	}
+	fn module_specifier(
+		&self,
+		module: &nymph_sema::ModuleIdentity,
+	) -> Result<nymph_sema::CanonicalModuleSpecifier, nymph_sema::StableNameLookupError> {
+		module_specifier(self.db, self.key, module.clone())
+	}
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn lower_runtime_definition<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	definition: nymph_sema::DefinitionId,
+) -> Result<Arc<nymph_sema::LoweredRuntimeDefinition>, nymph_sema::StableLoweringError> {
+	#[cfg(feature = "test-support")]
+	db.runtime_query_will_execute("lower_runtime_definition", &definition);
+	let artifact = runtime_definition(db, key, definition.clone()).map_err(|error| match error {
+		super::session::RuntimeDefinitionError::Recovered => {
+			nymph_sema::RuntimeDefinitionLookupError::Recovered {
+				definition: definition.clone(),
+			}
+		}
+		super::session::RuntimeDefinitionError::DefinitionNotFound
+		| super::session::RuntimeDefinitionError::OwnerNotFound => {
+			nymph_sema::RuntimeDefinitionLookupError::Missing {
+				definition: definition.clone(),
+			}
+		}
+		other => nymph_sema::RuntimeDefinitionLookupError::Unavailable {
+			definition: definition.clone(),
+			reason: format!("{other:?}").into(),
+		},
+	})?;
+	let context = CompilerStableContext { db, key };
+	nymph_sema::lower_runtime_definition(&context, artifact).map(Arc::new)
 }
 
 /// Check one module exclusively from its own tree and dependency interfaces.

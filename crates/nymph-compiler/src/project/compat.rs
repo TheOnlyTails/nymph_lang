@@ -18,7 +18,7 @@ use super::{
 	CompiledProject, ProjectDiagnostic, bundle,
 	queries::{self, Db},
 	rewrite::{DeclaredName, NsInfo, RewriteCtx, declared_names, rewrite_module},
-	session::{ModuleAnalysis, ModuleInput, ProjectKey, SemanticModuleInput},
+	session::{BuiltinModuleDomain, ModuleAnalysis, ModuleInput, ProjectKey, SemanticModuleInput},
 };
 
 pub(crate) type CompatModuleInput = SemanticModuleInput;
@@ -503,7 +503,10 @@ fn compat_module_identity(db: &dyn Db, module: CompatModuleInput) -> nymph_sema:
 			path: input.path(db).as_str().into(),
 		},
 		CompatModuleInput::Builtin(input) => nymph_sema::ModuleIdentity {
-			origin: nymph_sema::ModuleOrigin::Compiler,
+			origin: match input.key(db).domain {
+				BuiltinModuleDomain::ImportableStd => nymph_sema::ModuleOrigin::ImportableStd,
+				BuiltinModuleDomain::AmbientCore => nymph_sema::ModuleOrigin::Compiler,
+			},
 			project: "compiler".into(),
 			path: input.key(db).path.as_ref().into(),
 		},

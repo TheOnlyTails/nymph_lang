@@ -685,6 +685,16 @@ fn push_canonical_body(
 		.enumerate()
 		.map(|(index, expr)| (expr.id, BodyNodeId(index as u32)))
 		.collect::<std::collections::HashMap<_, _>>();
+	let native_range_nodes = nodes
+		.iter()
+		.filter(|expr| {
+			matches!(
+				expr.kind,
+				ExprKind::Range(RangeKind::Exclusive { .. } | RangeKind::Inclusive { .. })
+			)
+		})
+		.filter_map(|expr| local.get(&expr.id).copied())
+		.collect::<std::collections::HashSet<_>>();
 	let mut patterns = Vec::new();
 	walk_body_patterns(body, &mut patterns);
 	let patterns = patterns
@@ -692,7 +702,8 @@ fn push_canonical_body(
 		.enumerate()
 		.map(|(index, pattern)| (pattern.1, PatternNodeId(index as u32)))
 		.collect::<std::collections::HashMap<_, _>>();
-	let annotations = runtime_annotations(&definition, &local, &patterns, checked)?;
+	let annotations =
+		runtime_annotations(&definition, &local, &patterns, &native_range_nodes, checked)?;
 	result.push(RuntimeDefinition {
 		source_owner: definition.module.clone(),
 		definition,
@@ -724,6 +735,7 @@ fn runtime_annotations(
 	definition: &DefinitionId,
 	local: &std::collections::HashMap<nymph_ast::NodeId, BodyNodeId>,
 	patterns: &std::collections::HashMap<nymph_ast::Span, PatternNodeId>,
+	native_range_nodes: &std::collections::HashSet<BodyNodeId>,
 	checked: &crate::CheckedFacts,
 ) -> Result<RuntimeAnnotations, RuntimeExtractionError> {
 	let definitions = checked
@@ -800,7 +812,11 @@ fn runtime_annotations(
 	let mut iterations = Vec::new();
 	let mut anonymous_closures = Vec::new();
 	for (&source, &id) in local {
-		if let Some(mode) = checked.annotations.iter_mode_of(source) {
+		if let Some(mode) = checked.annotations.iter_mode_of(source).or_else(|| {
+			native_range_nodes
+				.contains(&id)
+				.then_some(crate::IterMode::Direct)
+		}) {
 			let protocols = iteration_protocol(checked)?;
 			let iteration = match mode {
 				crate::IterMode::Direct => RuntimeIteration::Direct {

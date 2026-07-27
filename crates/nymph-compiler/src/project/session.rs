@@ -547,32 +547,21 @@ impl CompilerSession {
 		definition: nymph_sema::DefinitionId,
 		mode: EntryMode,
 	) -> Result<Arc<nymph_sema::RuntimeDefinition>, RuntimeDefinitionError> {
-		let owners = match definition.module.origin {
-			nymph_sema::ModuleOrigin::Project(_) if definition.module.project == project.as_str() => self
-				.registry
-				.iter()
-				.filter(|((found_project, path), _)| {
-					found_project == &project && path.as_str() == definition.module.path
-				})
-				.map(|(_, record)| SemanticModuleInput::Project(record.input))
-				.collect::<Vec<_>>(),
-			nymph_sema::ModuleOrigin::Compiler => self
-				.builtins
-				.iter()
-				.filter(|(key, _)| key.path.as_ref() == definition.module.path)
-				.map(|(_, input)| SemanticModuleInput::Builtin(*input))
-				.collect::<Vec<_>>(),
-			_ => Vec::new(),
-		};
-		let [owner] = owners.as_slice() else {
-			return Err(if owners.is_empty() {
-				RuntimeDefinitionError::OwnerNotFound
-			} else {
-				RuntimeDefinitionError::DuplicateOwner
-			});
-		};
-		let key = self.project_key(project, entry, mode, true, true);
-		queries::runtime_definition(&self.db, key, *owner, definition)
+		let key = self.project_key(project, entry, mode, false, true);
+		queries::runtime_definition(&self.db, key, definition)
+	}
+
+	/// Lower exactly one checked runtime definition through the stable semantic context.
+	#[must_use]
+	pub fn lower_runtime_definition(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		definition: nymph_sema::DefinitionId,
+		mode: EntryMode,
+	) -> Result<Arc<nymph_sema::LoweredRuntimeDefinition>, nymph_sema::StableLoweringError> {
+		let key = self.project_key(project, entry, mode, false, true);
+		queries::lower_runtime_definition(&self.db, key, definition)
 	}
 
 	#[cfg(feature = "test-support")]
@@ -585,28 +574,8 @@ impl CompilerSession {
 		definition: nymph_sema::DefinitionId,
 		mode: EntryMode,
 	) -> Result<Arc<nymph_sema::RuntimeDefinition>, RuntimeDefinitionError> {
-		let key = self.project_key(project.clone(), entry, mode, true, true);
-		let owners = match definition.module.origin {
-			nymph_sema::ModuleOrigin::Project(_) if definition.module.project == project.as_str() => self
-				.registry
-				.iter()
-				.filter(|((found_project, path), _)| {
-					found_project == &project && path.as_str() == definition.module.path
-				})
-				.map(|(_, record)| SemanticModuleInput::Project(record.input))
-				.collect::<Vec<_>>(),
-			nymph_sema::ModuleOrigin::Compiler => self
-				.builtins
-				.iter()
-				.filter(|(key, _)| key.path.as_ref() == definition.module.path)
-				.map(|(_, input)| SemanticModuleInput::Builtin(*input))
-				.collect::<Vec<_>>(),
-			_ => Vec::new(),
-		};
-		let [owner] = owners.as_slice() else {
-			return Err(RuntimeDefinitionError::OwnerNotFound);
-		};
-		queries::runtime_definition_consumer(&self.db, key, *owner, definition)
+		let key = self.project_key(project.clone(), entry, mode, false, true);
+		queries::runtime_definition_consumer(&self.db, key, definition)
 	}
 
 	/// Inspect all exact runtime artifacts owned by one module in tests.

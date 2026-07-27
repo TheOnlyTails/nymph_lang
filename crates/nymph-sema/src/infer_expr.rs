@@ -47,14 +47,18 @@ use crate::ty::{GenericArgs, Ty, TyKind};
 /// (whose span is always well below `SPAN_BASE`).
 fn impl_is_unmaterialized(res: &MethodResolution) -> bool {
 	if let Some(implementation) = &res.implementation {
-		return matches!(implementation.module.origin, crate::ModuleOrigin::Compiler);
+		return matches!(
+			implementation.module.origin,
+			crate::ModuleOrigin::Compiler | crate::ModuleOrigin::ImportableStd
+		);
 	}
 	if res.source == MethodSource::GenericBound
-		&& res
-			.target
-			.as_ref()
-			.is_some_and(|target| matches!(target.module.origin, crate::ModuleOrigin::Compiler))
-	{
+		&& res.target.as_ref().is_some_and(|target| {
+			matches!(
+				target.module.origin,
+				crate::ModuleOrigin::Compiler | crate::ModuleOrigin::ImportableStd
+			)
+		}) {
 		return true;
 	}
 	// Legacy single-module prelude checking predates stable imported identities.

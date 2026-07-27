@@ -1090,6 +1090,43 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						fields,
 					});
 				}
+				if let Some(target) = self.target(func)
+					&& matches!(
+						target.key,
+						crate::DeclarationKey::TopLevel {
+							category: crate::DeclarationCategory::Struct,
+							..
+						}
+					) {
+					let request = StableShapeRequest::TypeShell(target.clone());
+					if let StableShapeFact::TypeShell(crate::StableTypeShell::Struct(shell)) =
+						self.context.stable_shape(&request)?
+					{
+						let fields = args
+							.iter()
+							.enumerate()
+							.map(|(index, argument)| {
+								let name = argument
+									.0
+									.name
+									.as_ref()
+									.map(|name| name.0.clone())
+									.or_else(|| shell.fields.get(index).map(|field| field.name.clone()))
+									.ok_or_else(|| {
+										invalid(
+											&self.artifact.definition,
+											"struct argument has no exact field",
+										)
+									})?;
+								Ok((name, self.lower(&argument.0.value)?))
+							})
+							.collect::<Result<_, StableLoweringError>>()?;
+						return Ok(HirExpr::New {
+							class: self.context.binding_name(target)?.as_str().into(),
+							fields,
+						});
+					}
+				}
 				if let ExprKind::MemberAccess { parent, .. } = &func.kind
 					&& let Some((_, dispatch)) = self
 						.annotations
@@ -1580,7 +1617,28 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				name: "v".into(),
 			}),
 			InterfaceType::Map(..) => self.lower(value),
-			_ => Err(self.unsupported(value, "non-native collection spread")),
+			_ => {
+				let iteration = self
+					.annotations
+					.iterations
+					.iter()
+					.find(|(id, _)| *id == self.id(value))
+					.map(|(_, value)| value)
+					.ok_or_else(|| StableLoweringError::MissingAnnotation {
+						definition: self.artifact.definition.clone(),
+						node: self.id(value),
+						channel: "spread iteration".into(),
+					})?;
+				let source = self.lower(value)?;
+				let (it, next) = match iteration {
+					crate::RuntimeIteration::Direct { next, .. } => (source, next),
+					crate::RuntimeIteration::ViaIter { iter, next, .. } => {
+						(self.lower_dispatch_value(iter, source)?, next)
+					}
+				};
+				let next = self.context.member_name(next)?.as_str().into();
+				Ok(drain_spread(it, next))
+			}
 		}
 	}
 	fn lower_string(
@@ -2031,6 +2089,83 @@ fn assign_binop(op: AssignOperator) -> Option<BinaryOperator> {
 		_ => return None,
 	})
 }
+
+fn drain_spread(iterator: HirExpr, next: EcoString) -> HirExpr {
+	let acc: EcoString = "$acc".into();
+	let it: EcoString = "$it".into();
+	let go: EcoString = "$go".into();
+	let value: EcoString = "$x".into();
+	let next_call = HirExpr::Call {
+		callee: Box::new(HirExpr::Field {
+			recv: Box::new(HirExpr::Local(it.clone())),
+			name: next,
+		}),
+		args: vec![],
+	};
+	let some = HirArm {
+		pat: HirPat::Variant {
+			enum_name: "Option".into(),
+			variant: "Some".into(),
+			fields: vec![(
+				"value".into(),
+				HirPat::Binding {
+					name: value.clone(),
+					sub: None,
+				},
+			)],
+		},
+		guard: None,
+		body: HirExpr::Call {
+			callee: Box::new(HirExpr::Field {
+				recv: Box::new(HirExpr::Local(acc.clone())),
+				name: "push".into(),
+			}),
+			args: vec![HirExpr::Local(value)],
+		},
+	};
+	let none = HirArm {
+		pat: HirPat::Variant {
+			enum_name: "Option".into(),
+			variant: "None".into(),
+			fields: vec![],
+		},
+		guard: None,
+		body: HirExpr::Assign {
+			target: Box::new(HirExpr::Local(go.clone())),
+			value: Box::new(HirExpr::Bool(false)),
+		},
+	};
+	HirExpr::Block {
+		stmts: vec![
+			HirStmt::Let {
+				name: acc.clone(),
+				mutable: false,
+				value: HirExpr::Array {
+					kind: HirArrayKind::Raw,
+					items: vec![],
+				},
+			},
+			HirStmt::Let {
+				name: it,
+				mutable: false,
+				value: iterator,
+			},
+			HirStmt::Let {
+				name: go.clone(),
+				mutable: true,
+				value: HirExpr::Bool(true),
+			},
+			HirStmt::Expr(HirExpr::While {
+				cond: Box::new(HirExpr::Local(go)),
+				body: Box::new(HirExpr::Match {
+					scrutinee: Box::new(next_call),
+					arms: vec![some, none],
+				}),
+			}),
+		],
+		tail: Some(Box::new(HirExpr::Local(acc))),
+	}
+}
 fn peel_mut(ty: &InterfaceType) -> &InterfaceType {
 	if let InterfaceType::Mutable(inner) = ty {
 		inner
@@ -2280,8 +2415,14 @@ fn walk<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 				}
 			}
 		}
-		ExprKind::Range(_)
-		| ExprKind::Int(_)
+		ExprKind::Range(range) => match range {
+			RangeKind::From(value) | RangeKind::To(value) | RangeKind::ToInclusive(value) => child(value),
+			RangeKind::Exclusive { min, max } | RangeKind::Inclusive { min, max } => {
+				child(min);
+				child(max);
+			}
+		},
+		ExprKind::Int(_)
 		| ExprKind::UInt(_)
 		| ExprKind::Float(_)
 		| ExprKind::Char(_)

@@ -82,6 +82,7 @@ impl StableNameLookup for FakeLookup {
 	) -> Result<CanonicalModuleSpecifier, StableNameLookupError> {
 		Ok(match &module.origin {
 			ModuleOrigin::Compiler => CanonicalModuleSpecifier::CompilerRuntime(module.path.clone()),
+			ModuleOrigin::ImportableStd => CanonicalModuleSpecifier::Importable(module.path.clone()),
 			ModuleOrigin::Project(project) if project == "app" => {
 				CanonicalModuleSpecifier::Project(module.path.clone())
 			}

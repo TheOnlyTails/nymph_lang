@@ -7,6 +7,9 @@ use ecow::EcoString;
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
 pub enum ModuleOrigin {
 	Project(EcoString),
+	/// An explicitly importable standard-library module.
+	ImportableStd,
+	/// Ambient compiler-core/runtime definitions which are never imported.
 	Compiler,
 }
 
