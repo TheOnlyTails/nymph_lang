@@ -424,8 +424,13 @@ fn checked_constraints(
 			};
 			Ok(crate::ConstraintShape {
 				parameter,
-				interface: headers
-					.id(&checked.semantic.definitions.data(bound.interface).name)
+				interface: checked
+					.semantic
+					.definitions
+					.data(bound.interface)
+					.stable
+					.clone()
+					.or_else(|| headers.id(&checked.semantic.definitions.data(bound.interface).name))
 					.ok_or(InterfaceConversionError::UnknownDefinition(bound.interface))?,
 				positional: Vec::new(),
 				named: bound
@@ -1136,12 +1141,12 @@ pub(crate) fn assign_runtime_body_identities(
 			_ => Vec::new(),
 		});
 	let interface_paths = top_paths.chain(nested_paths).collect::<Vec<_>>();
-	let local_start = checker
-		.impls
-		.impls
-		.len()
-		.saturating_sub(interface_paths.len());
-	let local_impls = checker.impls.impls[local_start..].iter();
+	let local_impls = checker.impls.impls.iter().filter(|implementation| {
+		implementation
+			.definition
+			.as_ref()
+			.is_some_and(|definition| definition.module == *identity)
+	});
 	for (path, implementation) in interface_paths.into_iter().zip(local_impls) {
 		if let Some(id) = &implementation.definition {
 			source_identities.implementations.insert(path, id.clone());
@@ -1321,7 +1326,8 @@ fn extract_definition(
 				headers,
 			)?;
 			shape.binders = binders;
-			shape.constraints = generic_constraints(&meta.generics, headers, &shape.binders)?;
+			shape.constraints =
+				checked_constraints(&signature.bounds, checked, headers, &generic_context)?;
 			shape.constraints.extend(anonymous_constraints);
 			function_shape(&mut shape, meta, def, checked, &generic_context)?;
 			shape.runtime_owner = Some(shape.id.clone());

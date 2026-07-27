@@ -1097,19 +1097,27 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 								definition: target.clone(),
 							});
 						}
-						let expected =
-							abi
-								.marshal
-								.ok_or_else(|| StableLoweringError::MissingExternalMarshal {
+						if matches!(
+							&target.key,
+							crate::DeclarationKey::TopLevel {
+								category: crate::DeclarationCategory::Let,
+								..
+							}
+						) {
+							let expected =
+								abi
+									.marshal
+									.ok_or_else(|| StableLoweringError::MissingExternalMarshal {
+										definition: target.clone(),
+									})?;
+							let actual = self.external_marshal(expr)?;
+							if expected != actual {
+								return Err(StableLoweringError::MismatchedExternalMarshal {
 									definition: target.clone(),
-								})?;
-						let actual = self.external_marshal(expr)?;
-						if expected != actual {
-							return Err(StableLoweringError::MismatchedExternalMarshal {
-								definition: target.clone(),
-								expected,
-								actual,
-							});
+									expected,
+									actual,
+								});
+							}
 						}
 						self.demands.borrow_mut().insert(target.clone());
 					} else if target.module != self.artifact.definition.module {
@@ -1309,6 +1317,21 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						parent,
 						args.iter().map(|arg| &arg.0.value).collect(),
 					);
+				}
+				if let Some(target) = self.target(func) {
+					let target_artifact = self.context.runtime_definition(target)?;
+					if let crate::RuntimePayload::External(abi) = &target_artifact.payload {
+						let module = external_module(target, abi)?;
+						let symbol = external_symbol(target, abi)?;
+						return Ok(HirExpr::ExternCall {
+							module,
+							symbol,
+							args: args
+								.iter()
+								.map(|arg| self.lower(&arg.0.value))
+								.collect::<Result<_, _>>()?,
+						});
+					}
 				}
 				HirExpr::Call {
 					callee: Box::new(self.lower(func)?),

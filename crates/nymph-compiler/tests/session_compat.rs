@@ -132,6 +132,10 @@ fn representative_runtime_projects_emit_and_bundle() {
 				"import @/owner with (Boxed)\npublic func right_value(): int = match (Boxed.wrap(3)) { Value(value) -> value }",
 			),
 		]),
+		FxHashMap::from_iter([(
+			"main",
+			"import std/io with (println)\nfunc main(): void = {}\nfunc result(): void = println(1)",
+		)]),
 	] {
 		assert_session_emission(&files);
 	}

@@ -349,7 +349,7 @@ pub fn runtime_definitions(
 				let item = shape(crate::DeclarationCategory::Interface, &name.0)
 					.ok_or_else(|| RuntimeExtractionError::MissingStableId(name.0.clone()))?;
 				let mut defaults = item.members.iter();
-				for (interface_member_index, member) in members.iter().enumerate() {
+				for member in members {
 					match &member.0 {
 						InterfaceMember::Element(element) => {
 							let member = defaults
@@ -383,21 +383,7 @@ pub fn runtime_definitions(
 								_ => {}
 							}
 						}
-						InterfaceMember::Impl { members, .. } => {
-							let path = crate::annotate::ImplementationSourcePath {
-								declaration: declaration_index as u32,
-								nested: Some(interface_member_index as u32),
-							};
-							let implementation = required_implementation(interface, checked, path)?;
-							extract_implementation_members(
-								&mut result,
-								members,
-								implementation,
-								source,
-								checked,
-								path,
-							)?;
-						}
+						InterfaceMember::Impl { .. } => {}
 					}
 				}
 			}

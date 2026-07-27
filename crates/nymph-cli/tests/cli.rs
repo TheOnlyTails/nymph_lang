@@ -243,8 +243,10 @@ fn build_reports_a_readable_error_for_an_unsupported_language_feature_instead_of
 		out.stderr
 	);
 	assert!(
-		out.stderr.contains("error:"),
-		"stderr should carry a readable error message:\n{}",
+		out.stderr.contains("STABLE-EMISSION-LINK")
+			&& out.stderr.contains("stable runtime linking failed")
+			&& out.stderr.contains("range/protocol"),
+		"stderr should carry the typed stable lowering diagnostic:\n{}",
 		out.stderr
 	);
 	assert!(
@@ -549,8 +551,10 @@ fn run_reports_a_readable_error_for_an_unsupported_language_feature_instead_of_a
 		out.stderr
 	);
 	assert!(
-		out.stderr.contains("error:"),
-		"stderr should carry a readable error message:\n{}",
+		out.stderr.contains("STABLE-EMISSION-LINK")
+			&& out.stderr.contains("stable runtime linking failed")
+			&& out.stderr.contains("range/protocol"),
+		"stderr should carry the typed stable lowering diagnostic:\n{}",
 		out.stderr
 	);
 	assert!(
