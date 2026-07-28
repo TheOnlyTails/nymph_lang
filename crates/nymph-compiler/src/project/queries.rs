@@ -1282,14 +1282,77 @@ fn primitive_header_tag(ty: &nymph_sema::HeaderType) -> Option<&'static str> {
 }
 
 #[salsa::tracked(returns(clone))]
-fn member_name<'db>(
-	_db: &'db dyn Db,
-	_key: ProjectKey<'db>,
+pub(crate) fn member_name<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
 	definition: nymph_sema::DefinitionId,
 ) -> Result<nymph_sema::EmittedMemberName, nymph_sema::StableNameLookupError> {
+	let protocol_slots = nominal_protocol_member_slots(db, key);
+	let selected_interface_member = match &definition.key {
+		nymph_sema::DeclarationKey::Member { owner, .. }
+			if matches!(owner.key, nymph_sema::DeclarationKey::Implementation { .. }) =>
+		{
+			match stable_shape(
+				db,
+				key,
+				nymph_sema::StableShapeRequest::Implementation((**owner).clone()),
+			) {
+				Ok(nymph_sema::StableShapeFact::Implementation(shape)) => shape
+					.member_slots
+					.iter()
+					.find(|slot| slot.member_id == definition)
+					.map(|slot| slot.interface_member_id.clone()),
+				_ => None,
+			}
+		}
+		_ => Some(definition.clone()),
+	};
+	if selected_interface_member.as_ref() == protocol_slots.display.as_ref() {
+		return Ok(nymph_sema::EmittedMemberName::new("$nymph$display"));
+	}
+	if selected_interface_member.as_ref() == protocol_slots.debug.as_ref() {
+		return Ok(nymph_sema::EmittedMemberName::new("$nymph$debug"));
+	}
 	declaration_name(&definition)
 		.map(nymph_sema::EmittedMemberName::new)
 		.ok_or(nymph_sema::StableNameLookupError::MissingMember { definition })
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct NominalProtocolMemberSlots {
+	display: Option<nymph_sema::DefinitionId>,
+	debug: Option<nymph_sema::DefinitionId>,
+}
+
+#[salsa::tracked(returns(clone))]
+fn nominal_protocol_member_slots(
+	db: &dyn Db,
+	key: ProjectKey<'_>,
+) -> Arc<NominalProtocolMemberSlots> {
+	let mut slots = NominalProtocolMemberSlots::default();
+	for module in key.ambient_core_registry(db).modules(db).iter().copied() {
+		let nymph_sema::ModuleEnvironment::Complete(interface) =
+			&*ambient_core_environment(db, key.ambient_core_registry(db), module)
+		else {
+			continue;
+		};
+		for definition in &interface.exports {
+			if definition.kind != nymph_sema::DefinitionShapeKind::Interface {
+				continue;
+			}
+			let target = match definition.name.as_str() {
+				"Display" => (&mut slots.display, "display"),
+				"Debug" => (&mut slots.debug, "debug"),
+				_ => continue,
+			};
+			*target.0 = definition
+				.members
+				.iter()
+				.find(|member| member.name == target.1)
+				.map(|member| member.id.clone());
+		}
+	}
+	Arc::new(slots)
 }
 
 #[salsa::tracked(returns(clone))]

@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use nymph_compiler::project::{
 	CompilerSession, ModulePath, ProjectId, SemanticPipeline, SemanticQueryEvent, SourceVersion,
 };
-use nymph_sema::EntryMode;
+use nymph_sema::{
+	DeclarationCategory, DeclarationKey, DefinitionId, EntryMode, ModuleIdentity, ModuleOrigin,
+};
 
 fn event_session() -> (CompilerSession, Arc<Mutex<Vec<SemanticQueryEvent>>>) {
 	let events = Arc::new(Mutex::new(Vec::new()));
@@ -23,6 +25,68 @@ fn executed(events: &[SemanticQueryEvent], query: &str, module: Option<&str>) ->
 	events.iter().any(|event| {
 		event.query == query && module.is_none_or(|module| event.module.as_deref() == Some(module))
 	})
+}
+
+#[test]
+fn member_names_reserve_only_exact_ambient_display_and_debug_slots() {
+	let mut session = CompilerSession::without_builtin_sources();
+	let project = ProjectId::new("protocol-member-names");
+	let main = ModulePath::new("main").unwrap();
+	let unrelated_module = ModulePath::new("unrelated").unwrap();
+	session.set_source(
+		project.clone(),
+		unrelated_module,
+		"interface Display { func display(): string }\ninterface Debug { func debug(): string }".into(),
+		SourceVersion(1),
+	);
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"public func main(): void = {}".into(),
+		SourceVersion(1),
+	);
+	let member = |module: ModuleIdentity, interface: &str, name: &str| {
+		let owner = DefinitionId::new(
+			module.clone(),
+			DeclarationKey::top_level(DeclarationCategory::Interface, interface),
+		);
+		DefinitionId::new(
+			module,
+			DeclarationKey::member(owner, DeclarationCategory::Method, name),
+		)
+	};
+	let ambient = ModuleIdentity {
+		origin: ModuleOrigin::Compiler,
+		project: "compiler".into(),
+		path: "ops".into(),
+	};
+	let unrelated = ModuleIdentity {
+		origin: ModuleOrigin::Project("protocol-member-names".into()),
+		project: "protocol-member-names".into(),
+		path: "unrelated".into(),
+	};
+	for (definition, expected) in [
+		(
+			member(ambient.clone(), "Display", "display"),
+			"$nymph$display",
+		),
+		(member(ambient, "Debug", "debug"), "$nymph$debug"),
+		(member(unrelated.clone(), "Display", "display"), "display"),
+		(member(unrelated, "Debug", "debug"), "debug"),
+	] {
+		assert_eq!(
+			session
+				.member_name_for_test(
+					project.clone(),
+					main.clone(),
+					definition,
+					EntryMode::Library
+				)
+				.unwrap()
+				.as_str(),
+			expected
+		);
+	}
 }
 
 #[test]

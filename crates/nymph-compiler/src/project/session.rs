@@ -676,6 +676,20 @@ impl CompilerSession {
 		queries::binding_name(&self.db, key, definition)
 	}
 
+	/// Return the authoritative emitted member name for one exact stable definition.
+	#[cfg(feature = "test-support")]
+	#[doc(hidden)]
+	pub fn member_name_for_test(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		definition: nymph_sema::DefinitionId,
+		mode: EntryMode,
+	) -> Result<nymph_sema::EmittedMemberName, nymph_sema::StableNameLookupError> {
+		let key = self.project_key(project, entry, mode, false, true);
+		queries::member_name(&self.db, key, definition)
+	}
+
 	/// Inspect all exact runtime artifacts owned by one module in tests.
 	#[cfg(feature = "test-support")]
 	#[doc(hidden)]
