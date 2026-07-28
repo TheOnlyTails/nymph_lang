@@ -5,22 +5,40 @@
 //! themselves flatten `std/ops` ahead of the user module (see `pipeline.rs`
 //! for programs whose behavior is prelude-invariant either way).
 
-use nymph_compiler::{check, compile};
+use nymph_compiler::{check, compile, compile_project_library};
 
 /// Emit `src`, append a driver that logs `call`, run under Node, return
 /// trimmed stdout. Local copy of `golden_programs.rs`'s `run` helper (tests
 /// may not import from another crate's test files).
 fn run(src: &str, call: &str) -> String {
-	use std::io::Write;
-	use std::sync::atomic::{AtomicU64, Ordering};
-
 	let mut js = compile(src, "test").expect("expected a clean compile");
 	js.push_str(&format!("\nconsole.log({call});\n"));
+	run_emitted_js(js)
+}
+
+/// Compile a one-module library project and execute the exact emitted symbol
+/// for a zero-argument function returning an `int`.
+fn run_int_entry(src: &str, entry: &str) -> String {
+	let load = |path: &str| (path == "test").then(|| src.to_string());
+	let compiled = compile_project_library("test", &load)
+		.unwrap_or_else(|diagnostics| panic!("expected a clean compile, got: {diagnostics:?}"));
+	let call = compiled.entry_symbol(entry);
+	let mut js = compiled.js;
+	js.push_str(&format!("\nconsole.log({call}().v);\n"));
+	run_emitted_js(js)
+}
+
+fn run_emitted_js(js: String) -> String {
+	use std::io::Write;
+	use std::sync::atomic::{AtomicU64, Ordering};
 
 	static COUNTER: AtomicU64 = AtomicU64::new(0);
 	let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
 	let dir = std::env::temp_dir();
-	let path = dir.join(format!("nymph_prelude_{}_{unique}.mjs", std::process::id()));
+	let path = dir.join(format!(
+		"nymph_prelude_project_{}_{unique}.mjs",
+		std::process::id()
+	));
 	let mut file = std::fs::File::create(&path).unwrap();
 	file.write_all(js.as_bytes()).unwrap();
 
@@ -137,26 +155,16 @@ fn compile_resolves_mixed_float_int_arithmetic() {
 }
 
 #[test]
-fn compile_panics_loudly_on_an_unlinked_generic_bound_operator() {
-	// Generic bound dispatch needs a canonical host/runtime target for each
-	// primitive case. Arithmetic remains native codegen rather than a linked
-	// stdlib leaf, so this unsupported case must stay loud instead of emitting
-	// the invalid type-erased fallback `a.plus(b)`.
-	let source = "func f<T: Plus<Other = T, Output = T>>(a: T, b: T): T = a + b";
+fn generic_bound_operator_executes_through_the_stable_protocol() {
+	let source = "func add<T: Plus<Other = T, Output = T>>(a: T, b: T): T = a + b
+		func result(): int = add(20, 22)";
 
 	let diags = check(source, "test");
 	assert!(
 		!diags.iter().any(|d| d.is_error()),
-		"expected `f` to typecheck cleanly via the prelude, got: {diags:?}"
+		"expected `add` to typecheck cleanly via the prelude, got: {diags:?}"
 	);
-	let message = catch_panic_message(|| {
-		let _ = compile(source, "test");
-	})
-	.expect("expected lowering to reject unlinked generic arithmetic dispatch");
-	assert!(
-		message.contains("does not yet dispatch operator to interface default method"),
-		"expected the documented generic-dispatch panic, got: {message:?}"
-	);
+	assert_eq!(run_int_entry(source, "result"), "42");
 }
 
 #[test]
@@ -200,64 +208,34 @@ fn blanket_impl_only_not_equals_method_call_links_and_runs() {
 }
 
 #[test]
-fn compile_panics_loudly_on_a_generic_bound_plain_method_call_through_a_stdlib_interface() {
-	// Findings 1 & 3 (stdlib linkage groundwork review, round 2): the plain
-	// dot-call twin of `compile_panics_loudly_on_a_generic_bound_through_a_stdlib_interface`
-	// above. `dispatch_kind_for_method_call` (`infer_expr.rs`) used to treat
-	// every `MethodSource::GenericBound` resolution as safe for a plain
-	// `receiver.method(args…)` call (type erasure + duck typing lets whichever
-	// concrete type instantiates `T` supply its own compiled method) — true
-	// when the bound is satisfied by a *user* impl (that impl is lowered
-	// along with the rest of the user's module), but false here: `T`'s `Plus`
-	// bound is only known to be satisfiable through the stdlib prelude's own
-	// impls, which `compile` never lowers. Before the fix, `check` reported
-	// zero diagnostics and `compile` silently emitted
-	// `function f(a, b) { return a.plus(b); }` — confirmed to throw
-	// `TypeError: a.plus is not a function` under Node for e.g. `f(1, 2)`.
-	// Lowering must now refuse loudly instead, mirroring the operator case.
-	let source = "func f<T: Plus<Other = T, Output = T>>(a: T, b: T): T = a.plus(b)";
+fn generic_bound_plain_method_executes_through_the_stable_protocol() {
+	let source = "func add<T: Plus<Other = T, Output = T>>(a: T, b: T): T = a.plus(b)
+		func result(): int = add(20, 22)";
 
 	let diags = check(source, "test");
 	assert!(
 		!diags.iter().any(|d| d.is_error()),
-		"expected `f` to typecheck cleanly via the prelude, got: {diags:?}"
+		"expected `add` to typecheck cleanly via the prelude, got: {diags:?}"
 	);
-
-	let message = catch_panic_message(|| {
-		let _ = compile(source, "test");
-	})
-	.expect("expected lowering to reject unsupported generic-bound plain method dispatch");
-	assert!(
-		message.contains("cannot lower generic-bound dispatch"),
-		"expected a loud generic-bound dispatch panic, got: {message:?}"
-	);
+	assert_eq!(run_int_entry(source, "result"), "42");
 }
 
 #[test]
-fn compile_panics_loudly_when_an_interface_default_uses_unlinked_generic_arithmetic() {
-	// The generic receiver here is not `this`, and Plus has no linked primitive
-	// runtime target. Materializing the default must not silently emit
-	// `other.plus(other)` for an int.
+fn interface_default_generic_arithmetic_executes_through_the_stable_protocol() {
 	let source = "interface Foo<Other: Plus<Other = Other, Output = Other>> {
 			func combine(other: Other): Other = other + other
 		}
 		struct Bar()
 		impl Foo<Other = int> for Bar {}
-		func combine_it(b: Bar, x: int): int = b.combine(x)";
+		func combine_it(b: Bar, x: int): int = b.combine(x)
+		func result(): int = combine_it(Bar(), 21)";
 
 	let diags = check(source, "test");
 	assert!(
 		!diags.iter().any(|d| d.is_error()),
 		"expected `Bar`'s `Foo` impl to typecheck cleanly via the prelude's `Plus`, got: {diags:?}"
 	);
-	let message = catch_panic_message(|| {
-		let _ = compile(source, "test");
-	})
-	.expect("expected lowering to reject unlinked generic arithmetic in the default body");
-	assert!(
-		message.contains("does not yet dispatch operator to interface default method"),
-		"expected the documented generic-dispatch panic, got: {message:?}"
-	);
+	assert_eq!(run_int_entry(source, "result"), "42");
 }
 
 #[test]
@@ -385,63 +363,4 @@ fn list_sort_by_preserves_source_and_equal_element_order() {
 		),
 		"0,1,2|1,0,2"
 	);
-}
-
-/// Run `f`, catching any panic and returning its message — captured from
-/// *inside* a temporary panic hook rather than by downcasting the
-/// `catch_unwind` payload directly, mirroring `nymph-cli`'s
-/// `compile_guard::compile_guarded`: with this pipeline's dependency stack, a
-/// panic's payload can arrive at `catch_unwind`'s `Err` already repackaged
-/// into some other `Any` type by the time it gets there (observed: a panic
-/// the hook sees as a plain formatted `String` shows up at the
-/// `catch_unwind` boundary as a value that downcasts as neither `&str` nor
-/// `String`), whereas the hook always sees the original payload at the
-/// moment the panic is raised. Also suppresses the default hook's stderr
-/// backtrace dump for the duration of the call. Returns `None` if `f` didn't
-/// panic.
-///
-/// `panic::set_hook`/`take_hook` are *process-global*, not per-thread, so two
-/// of this file's tests calling this helper concurrently (the default
-/// multi-threaded `cargo test` harness runs tests in one process across
-/// several threads — unlike `cargo nextest`, which isolates one test per
-/// process) would otherwise race: one thread's `set_hook` can install over,
-/// or get clobbered by, another's mid-call (observed directly: an
-/// intermittent empty captured message under `cargo test`). A single
-/// process-wide [`Mutex`] serializes the hook-swap-catch-restore critical
-/// section so concurrent callers queue instead of racing.
-fn catch_panic_message(f: impl FnOnce() + std::panic::UnwindSafe) -> Option<String> {
-	use std::cell::RefCell;
-	use std::panic;
-	use std::sync::Mutex;
-
-	static HOOK_LOCK: Mutex<()> = Mutex::new(());
-	thread_local! {
-		static CAPTURED: RefCell<Option<String>> = const { RefCell::new(None) };
-	}
-
-	let _guard = HOOK_LOCK
-		.lock()
-		.unwrap_or_else(|poison| poison.into_inner());
-	CAPTURED.with(|cell| *cell.borrow_mut() = None);
-
-	let previous_hook = panic::take_hook();
-	panic::set_hook(Box::new(|info| {
-		let payload = info.payload();
-		let message = payload
-			.downcast_ref::<&str>()
-			.map(|s| (*s).to_string())
-			.or_else(|| payload.downcast_ref::<String>().cloned())
-			.unwrap_or_else(|| "<non-string panic payload>".to_string());
-		CAPTURED.with(|cell| *cell.borrow_mut() = Some(message));
-	}));
-
-	let result = panic::catch_unwind(f);
-
-	panic::set_hook(previous_hook);
-
-	result.err().map(|_| {
-		CAPTURED
-			.with(|cell| cell.borrow_mut().take())
-			.unwrap_or_default()
-	})
 }
