@@ -1813,6 +1813,40 @@ pub(crate) fn interface_module_analysis<'db>(
 	})
 }
 
+#[salsa::tracked(returns(clone))]
+fn interface_declared_headers<'db>(
+	db: &'db dyn Db,
+	key: super::session::ProjectKey<'db>,
+	module: SemanticModuleInput,
+) -> Arc<nymph_sema::DeclaredHeaders> {
+	let own = nymph_sema::declared_headers(module.identity(db), &module.parsed(db).tree);
+	let mut checked_definitions = own.checked_definitions.clone();
+	checked_definitions.extend(
+		resolved_module_imports(db, key, module)
+			.bindings
+			.iter()
+			.filter_map(|(name, binding)| match binding {
+				nymph_sema::ResolvedImportBinding::Definition(definition) => {
+					Some((name.clone(), definition.clone()))
+				}
+				_ => None,
+			})
+			.collect::<Vec<_>>(),
+	);
+	if key.ambient_prelude(db) {
+		let registry = key.ambient_core_registry(db);
+		for root in registry.modules(db).iter().copied() {
+			checked_definitions.extend(
+				ambient_core_interface(db, registry, root)
+					.exports
+					.iter()
+					.map(|definition| (definition.name.clone(), definition.id.clone())),
+			);
+		}
+	}
+	Arc::new(own.with_checked_definitions(checked_definitions))
+}
+
 fn is_missing_diagnostic_for_qualified_access(
 	diagnostic: &Diagnostic,
 	span: Span,
@@ -1835,7 +1869,7 @@ pub(crate) fn interface_module_interface<'db>(
 	db.semantic_query_will_execute("interface_module_interface", module);
 	let analysis = interface_module_analysis(db, key, module);
 	let checked = checked_from_analysis(&analysis, []);
-	let headers = nymph_sema::declared_headers(module.identity(db), &analysis.semantic.module);
+	let headers = interface_declared_headers(db, key, module);
 	let facts =
 		nymph_sema::ExtractionFactSelection::current_module(&analysis.semantic.module, &checked);
 	nymph_sema::extract_module_interface_with_facts(
@@ -1867,7 +1901,7 @@ pub(crate) fn interface_module_environment<'db>(
 		));
 	}
 	let checked = checked_from_analysis(&analysis, diagnostics.iter().map(|item| item.diag.clone()));
-	let headers = nymph_sema::declared_headers(module.identity(db), &analysis.semantic.module);
+	let headers = interface_declared_headers(db, key, module);
 	let facts =
 		nymph_sema::ExtractionFactSelection::current_module(&analysis.semantic.module, &checked);
 	Arc::new(nymph_sema::recover_module_environment_with_facts(

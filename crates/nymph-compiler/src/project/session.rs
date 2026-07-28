@@ -381,6 +381,25 @@ impl CompilerSession {
 		))
 	}
 
+	#[cfg(feature = "test-support")]
+	pub fn importable_std_module_environment_for_test(
+		&self,
+		path: &str,
+	) -> Option<Arc<nymph_sema::ModuleEnvironment>> {
+		let module = self.builtins.iter().find_map(|(key, module)| {
+			(key.domain == BuiltinModuleDomain::ImportableStd && key.path.as_ref() == path)
+				.then_some(*module)
+		})?;
+		let project = ProjectId::new("stdlib-interface-test");
+		let entry = ModulePath::new(path).ok()?;
+		let key = self.project_key(project, entry, EntryMode::Library, true, true);
+		Some(queries::interface_module_environment(
+			&self.db,
+			key,
+			SemanticModuleInput::Builtin(module),
+		))
+	}
+
 	/// Test-only mutation seam for proving ambient query invalidation. Ordinary
 	/// compiler clients cannot obtain or mutate ambient Salsa inputs directly.
 	#[doc(hidden)]

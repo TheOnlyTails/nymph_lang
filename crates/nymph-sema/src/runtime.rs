@@ -1241,11 +1241,34 @@ fn body_parameters(
 				.get(&crate::DefId(index as u32))
 		})
 		.map_or(0, |signature| signature.generics.len());
-	let owner = implementation_owner(definition);
+	let owner = definition_owner(definition);
 	let owner_count = owner
-		.and_then(|owner| match &owner.key {
-			crate::DeclarationKey::Implementation { header, .. } => Some(header.binders.len()),
-			_ => None,
+		.map(|owner| match &owner.key {
+			crate::DeclarationKey::Implementation { header, .. } => header.binders.len(),
+			_ => checked
+				.semantic
+				.definitions
+				.defs
+				.iter()
+				.position(|item| item.stable.as_ref() == Some(owner))
+				.map(|index| crate::DefId(index as u32))
+				.and_then(|owner| {
+					checked
+						.semantic
+						.signatures
+						.structs
+						.get(&owner)
+						.map(|signature| signature.generics.len())
+						.or_else(|| {
+							checked
+								.semantic
+								.signatures
+								.enums
+								.get(&owner)
+								.map(|signature| signature.generics.len())
+						})
+				})
+				.unwrap_or(0),
 		})
 		.unwrap_or(0);
 	let owner_parameters = owner.into_iter().flat_map(|owner| {
@@ -1274,14 +1297,10 @@ fn body_parameters(
 		.collect()
 }
 
-fn implementation_owner(definition: &DefinitionId) -> Option<&DefinitionId> {
+fn definition_owner(definition: &DefinitionId) -> Option<&DefinitionId> {
 	match &definition.key {
 		crate::DeclarationKey::Member { owner, .. }
-		| crate::DeclarationKey::MethodBody { owner, .. }
-			if matches!(owner.key, crate::DeclarationKey::Implementation { .. }) =>
-		{
-			Some(owner)
-		}
+		| crate::DeclarationKey::MethodBody { owner, .. } => Some(owner),
 		_ => None,
 	}
 }

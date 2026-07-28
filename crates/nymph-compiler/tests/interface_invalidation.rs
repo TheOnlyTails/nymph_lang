@@ -3,8 +3,8 @@
 use std::sync::{Arc, Mutex};
 
 use nymph_compiler::project::{
-	BuiltinRuntimeOwnerShape, CompilerSession, ModulePath, ProjectId, SemanticPipeline,
-	SemanticQueryEvent, SourceVersion,
+	AmbientCoreModuleKey, BuiltinRuntimeOwnerShape, CompilerSession, ModulePath, ProjectId,
+	SemanticPipeline, SemanticQueryEvent, SourceVersion,
 };
 use nymph_sema::{
 	EntryMode, InterfaceType, ModuleEnvironment, RecoveredDefinitionReference, RecoveredInterfaceType,
@@ -39,6 +39,46 @@ fn count(events: &[SemanticQueryEvent], query: &str, module: &str) -> usize {
 		.iter()
 		.filter(|event| event.query == query && event.module.as_deref() == Some(module))
 		.count()
+}
+
+#[test]
+fn importable_set_interface_preserves_exact_export_and_nested_iterable_implementation() {
+	let session = CompilerSession::new();
+	let iterable_id = session
+		.ambient_core_module_interface(AmbientCoreModuleKey::new("iter/iterable").unwrap())
+		.unwrap()
+		.exports
+		.iter()
+		.find(|definition| definition.name == "Iterable")
+		.unwrap()
+		.id
+		.clone();
+	let environment = session
+		.importable_std_module_environment_for_test("collections/set")
+		.expect("embedded Set environment");
+	let ModuleEnvironment::Complete(interface) = &*environment else {
+		panic!("the importable Set module must produce a complete interface")
+	};
+	let set = interface
+		.exports
+		.iter()
+		.find(|definition| definition.name == "Set")
+		.expect("exact public Set export");
+	let iterable = interface
+		.implementations
+		.iter()
+		.find(|implementation| {
+			matches!(
+				&implementation.self_type,
+				InterfaceType::Named { definition, .. } if definition == &set.id
+			) && implementation.interface.as_ref() == Some(&iterable_id)
+		})
+		.expect("exact nested Iterable implementation");
+	assert_eq!(iterable.binders[0].name, "Item");
+	assert_eq!(iterable.members[0].name, "iter");
+	assert_eq!(iterable.member_slots.len(), 1);
+	assert_eq!(iterable.member_slots[0].implementation_id, iterable.id);
+	assert_eq!(iterable.member_slots[0].member_id, iterable.members[0].id);
 }
 
 #[test]
