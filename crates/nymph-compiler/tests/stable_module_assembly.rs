@@ -227,7 +227,6 @@ fn body_edit_reexecutes_only_the_changed_modules_stable_chain() {
 	let observed = events.lock().unwrap();
 	for query in [
 		"runtime_definition_index",
-		"runtime_definition_ids",
 		"lower_runtime_definition",
 		"lower_interface_module",
 		"emitted_interface_module",
@@ -241,6 +240,10 @@ fn body_edit_reexecutes_only_the_changed_modules_stable_chain() {
 			"{query}: {observed:#?}"
 		);
 	}
+	assert!(
+		!executed(&observed, "runtime_definition_ids", None),
+		"a body-only edit must preserve the source-ordered identity projection: {observed:#?}"
+	);
 	assert!(executed(&observed, "emitted_interface_project", None));
 	assert!(executed(&observed, "compiled_interface_project", None));
 }
@@ -951,6 +954,36 @@ fn stable_compare_to_closes_same_module_runtime_demands_and_runs() {
 		String::from_utf8_lossy(&output.stderr)
 	);
 	assert!(String::from_utf8_lossy(&output.stdout).contains("Order.LessThan"));
+}
+
+#[test]
+fn runtime_projection_extracts_each_owning_module_once() {
+	let (mut session, events) = event_session();
+	let project = ProjectId::new("runtime-projection-count");
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"func compare() = 1.compare_to(2)\npublic func main(): void = {}".into(),
+		SourceVersion(1),
+	);
+
+	session
+		.compile_interface_project_for_test(project, main, EntryMode::Entry)
+		.expect("compare_to compiles through exact runtime definitions");
+	let events = events.lock().unwrap();
+	for module in ["main", "std::ops"] {
+		assert_eq!(
+			events
+				.iter()
+				.filter(|event| {
+					event.query == "runtime_definition_extraction" && event.module.as_deref() == Some(module)
+				})
+				.count(),
+			1,
+			"runtime projection repeated for {module}: {events:#?}"
+		);
+	}
 }
 
 #[test]

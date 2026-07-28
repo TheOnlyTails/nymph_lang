@@ -818,26 +818,39 @@ fn ambient_runtime_definition_index<'db>(
 	db: &'db dyn Db,
 	registry: AmbientCoreRegistryInput,
 	module: BuiltinModuleInput,
-) -> Arc<[RuntimeDefinitionEntity<'db>]> {
+) -> Result<Arc<[RuntimeDefinitionEntity<'db>]>, super::session::RuntimeDefinitionError> {
 	let environment = ambient_core_environment(db, registry, module);
 	let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
-		return Arc::new([]);
+		return Err(super::session::RuntimeDefinitionError::Recovered);
 	};
 	let analysis = ambient_core_analysis(db, registry, module);
-	let Ok(mut definitions) = nymph_sema::runtime_definitions(
+	#[cfg(feature = "test-support")]
+	db.semantic_query_will_execute(
+		"runtime_definition_extraction",
+		SemanticModuleInput::Builtin(module),
+	);
+	let definitions = nymph_sema::runtime_definitions(
 		&analysis.semantic.module,
 		&module.source(db),
 		&analysis.semantic.checked,
 		interface,
-	) else {
-		return Arc::new([]);
-	};
-	definitions.sort_by(|a, b| a.definition.cmp(&b.definition));
-	definitions
-		.into_iter()
-		.map(|value| RuntimeDefinitionEntity::new(db, value.definition.clone(), Arc::new(value)))
-		.collect::<Vec<_>>()
-		.into()
+	)
+	.map_err(super::session::RuntimeDefinitionError::Extraction)?;
+	let mut seen = std::collections::BTreeSet::new();
+	Ok(
+		definitions
+			.into_iter()
+			.map(|value| {
+				assert!(
+					seen.insert(value.definition.clone()),
+					"duplicate runtime definition identity: {:?}",
+					value.definition
+				);
+				RuntimeDefinitionEntity::new(db, value.definition.clone(), Arc::new(value))
+			})
+			.collect::<Vec<_>>()
+			.into(),
+	)
 }
 
 fn exact_module_environment<'db>(
@@ -855,12 +868,12 @@ fn exact_module_environment<'db>(
 	}
 }
 
-#[salsa::tracked]
+#[salsa::tracked(returns(clone))]
 pub(crate) fn runtime_definition_index<'db>(
 	db: &'db dyn Db,
 	key: super::session::ProjectKey<'db>,
 	module: SemanticModuleInput,
-) -> Arc<[RuntimeDefinitionEntity<'db>]> {
+) -> Result<Arc<[RuntimeDefinitionEntity<'db>]>, super::session::RuntimeDefinitionError> {
 	#[cfg(feature = "test-support")]
 	db.semantic_query_will_execute("runtime_definition_index", module);
 	if let SemanticModuleInput::Builtin(input) = module
@@ -870,38 +883,40 @@ pub(crate) fn runtime_definition_index<'db>(
 	}
 	let environment = interface_module_environment(db, key, module);
 	let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
-		return Arc::new([]);
+		return Err(super::session::RuntimeDefinitionError::Recovered);
 	};
 	let analysis = interface_module_analysis(db, key, module);
 	let source = match module {
 		SemanticModuleInput::Project(input) => match input.source(db) {
 			Some(source) => source,
-			None => return Arc::new([]),
+			None => return Err(super::session::RuntimeDefinitionError::OwnerNotFound),
 		},
 		SemanticModuleInput::Builtin(input) => input.source(db),
 	};
-	let Ok(mut definitions) = nymph_sema::runtime_definitions(
+	#[cfg(feature = "test-support")]
+	db.semantic_query_will_execute("runtime_definition_extraction", module);
+	let definitions = nymph_sema::runtime_definitions(
 		&analysis.semantic.module,
 		&source,
 		&analysis.semantic.checked,
 		interface,
-	) else {
-		return Arc::new([]);
-	};
-	definitions.sort_by(|a, b| a.definition.cmp(&b.definition));
+	)
+	.map_err(super::session::RuntimeDefinitionError::Extraction)?;
 	let mut seen = std::collections::BTreeSet::new();
-	definitions
-		.into_iter()
-		.map(|value| {
-			assert!(
-				seen.insert(value.definition.clone()),
-				"duplicate runtime definition identity: {:?}",
-				value.definition
-			);
-			RuntimeDefinitionEntity::new(db, value.definition.clone(), Arc::new(value))
-		})
-		.collect::<Vec<_>>()
-		.into()
+	Ok(
+		definitions
+			.into_iter()
+			.map(|value| {
+				assert!(
+					seen.insert(value.definition.clone()),
+					"duplicate runtime definition identity: {:?}",
+					value.definition
+				);
+				RuntimeDefinitionEntity::new(db, value.definition.clone(), Arc::new(value))
+			})
+			.collect::<Vec<_>>()
+			.into(),
+	)
 }
 
 /// Runtime-bearing identities owned by `module`, in language output order.
@@ -915,37 +930,13 @@ pub(crate) fn runtime_definition_ids<'db>(
 ) -> Result<Arc<[nymph_sema::DefinitionId]>, super::session::RuntimeDefinitionError> {
 	#[cfg(feature = "test-support")]
 	db.semantic_query_will_execute("runtime_definition_ids", module);
-	let environment = exact_module_environment(db, key, module);
-	let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
-		return Err(super::session::RuntimeDefinitionError::Recovered);
-	};
-	let analysis = match module {
-		SemanticModuleInput::Builtin(input)
-			if input.key(db).domain == BuiltinModuleDomain::AmbientCore =>
-		{
-			ambient_core_analysis(db, key.ambient_core_registry(db), input).clone()
-		}
-		_ => interface_module_analysis(db, key, module),
-	};
-	let source = match module {
-		SemanticModuleInput::Project(input) => match input.source(db) {
-			Some(source) => source,
-			None => return Err(super::session::RuntimeDefinitionError::OwnerNotFound),
-		},
-		SemanticModuleInput::Builtin(input) => input.source(db),
-	};
 	Ok(
-		nymph_sema::runtime_definitions(
-			&analysis.semantic.module,
-			&source,
-			&analysis.semantic.checked,
-			interface,
-		)
-		.map_err(super::session::RuntimeDefinitionError::Extraction)?
-		.into_iter()
-		.map(|artifact| artifact.definition)
-		.collect::<Vec<_>>()
-		.into(),
+		runtime_definition_index(db, key, module)?
+			.iter()
+			.map(|entity| entity.definition(db).clone())
+			.into_iter()
+			.collect::<Vec<_>>()
+			.into(),
 	)
 }
 
@@ -998,28 +989,7 @@ pub(crate) fn runtime_definition<'db>(
 			},
 		}));
 	}
-	let analysis = match module {
-		SemanticModuleInput::Builtin(input)
-			if input.key(db).domain == BuiltinModuleDomain::AmbientCore =>
-		{
-			ambient_core_analysis(db, key.ambient_core_registry(db), input).clone()
-		}
-		_ => interface_module_analysis(db, key, module),
-	};
-	let source = match module {
-		SemanticModuleInput::Project(input) => input
-			.source(db)
-			.ok_or(super::session::RuntimeDefinitionError::OwnerNotFound)?,
-		SemanticModuleInput::Builtin(input) => input.source(db),
-	};
-	nymph_sema::runtime_definitions(
-		&analysis.semantic.module,
-		&source,
-		&analysis.semantic.checked,
-		interface,
-	)
-	.map_err(super::session::RuntimeDefinitionError::Extraction)?;
-	let entity = runtime_definition_index(db, key, module)
+	let entity = runtime_definition_index(db, key, module)?
 		.iter()
 		.copied()
 		.find(|entity| entity.definition(db) == &definition)

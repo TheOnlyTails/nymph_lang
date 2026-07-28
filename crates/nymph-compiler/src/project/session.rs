@@ -697,6 +697,7 @@ impl CompilerSession {
 		let key = self.project_key(project, entry, mode, true, true);
 		Some(
 			queries::runtime_definition_index(&self.db, key, SemanticModuleInput::Project(input))
+				.ok()?
 				.iter()
 				.map(|entity| entity.value(&self.db))
 				.collect(),
@@ -720,6 +721,7 @@ impl CompilerSession {
 			.map(|(_, input)| input)
 			.flat_map(|input| {
 				queries::runtime_definition_index(&self.db, key, SemanticModuleInput::Builtin(*input))
+					.expect("embedded builtin runtime definitions are valid")
 					.iter()
 					.map(|entity| entity.value(&self.db))
 					.collect::<Vec<_>>()
