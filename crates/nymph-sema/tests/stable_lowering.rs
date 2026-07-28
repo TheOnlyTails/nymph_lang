@@ -1025,6 +1025,31 @@ fn inherent_member_dispatch_has_exact_call_fragment_and_member_demand() {
 }
 
 #[test]
+fn inherent_static_dispatch_uses_exact_owner_binding_and_member_demand() {
+	let source = "struct Box(value: int)\nimpl Box { namespace func make(): Box = Box(value = 1) }\nfunc read(): Box = Box.make()";
+	let item = lower_named(source, "read");
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = item.fragment() else {
+		panic!("unexpected fragment: {:?}", item.fragment())
+	};
+	assert_eq!(
+		function.body,
+		nymph_hir::hir::HirExpr::Call {
+			callee: Box::new(nymph_hir::hir::HirExpr::Field {
+				recv: Box::new(nymph_hir::hir::HirExpr::Local("Box".into())),
+				name: "make".into(),
+			}),
+			args: vec![],
+		}
+	);
+	assert_eq!(item.demands().len(), 1);
+	assert_eq!(source_name(&item.demands()[0]), "make");
+	assert!(matches!(
+		item.demands()[0].key,
+		DeclarationKey::Member { .. }
+	));
+}
+
+#[test]
 fn selected_override_dispatch_has_exact_call_and_placement_demand() {
 	let source = "interface Plus<Other, Output> { func plus(other: Other): Output }\nstruct Vec(value: int)\nimpl Plus<Other = Vec, Output = Vec> for Vec { func plus(other: Vec): Vec = other }\nfunc add(a: Vec, b: Vec): Vec = a + b";
 	let item = lower_named(source, "add");

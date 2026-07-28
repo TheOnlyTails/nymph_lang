@@ -1314,12 +1314,47 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.direct_namespace_members
 					.contains(&self.id(expr))
 					&& let Some(target) = self.target(expr)
-					&& matches!(target.key, crate::DeclarationKey::TopLevel { .. })
 				{
-					self.demand_external(target)?;
-					return Ok(HirExpr::Local(
-						self.context.binding_name(target)?.as_str().into(),
-					));
+					if matches!(target.key, crate::DeclarationKey::TopLevel { .. }) {
+						self.demand_external(target)?;
+						return Ok(HirExpr::Local(
+							self.context.binding_name(target)?.as_str().into(),
+						));
+					}
+					if matches!(target.key, crate::DeclarationKey::Member { .. }) {
+						let runtime = self.context.runtime_definition(target)?;
+						let crate::RuntimePlacement::Attached { owner, .. } = &runtime.placement else {
+							return Err(invalid(
+								&self.artifact.definition,
+								"static member target is not attached to an owner",
+							));
+						};
+						let StableShapeFact::Implementation(implementation) = self
+							.context
+							.stable_shape(&StableShapeRequest::Implementation(owner.clone()))?
+						else {
+							return Err(invalid(
+								&self.artifact.definition,
+								"static member owner has no implementation shape",
+							));
+						};
+						let crate::InterfaceType::Named {
+							definition: shell, ..
+						} = implementation.self_type
+						else {
+							return Err(invalid(
+								&self.artifact.definition,
+								"static member owner has no nominal shell",
+							));
+						};
+						self.demand_external(target)?;
+						return Ok(HirExpr::Field {
+							recv: Box::new(HirExpr::Local(
+								self.context.binding_name(&shell)?.as_str().into(),
+							)),
+							name: self.context.member_name(target)?.as_str().into(),
+						});
+					}
 				}
 				HirExpr::Field {
 					recv: Box::new(self.lower(parent)?),

@@ -1213,8 +1213,16 @@ impl<'m> Checker<'m> {
 					}
 					let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
 					let arg_lits = arg_int_lits(args);
-					if let Some(ret) = self.resolve_namespaced(def, &member.0, &arg_tys, &arg_lits, member.1)
+					if let Some((ret, target)) =
+						self.resolve_namespaced(def, &member.0, &arg_tys, &arg_lits, member.1)
 					{
+						self.annotations.record_direct_namespace_member(func.id);
+						self
+							.annotations
+							.record_definition_target(id, target.as_ref());
+						self
+							.annotations
+							.record_definition_target(func.id, target.as_ref());
 						return (ret, None);
 					}
 					self.emit(
@@ -1229,8 +1237,16 @@ impl<'m> Checker<'m> {
 				DefKind::Struct => {
 					let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
 					let arg_lits = arg_int_lits(args);
-					if let Some(ret) = self.resolve_namespaced(def, &member.0, &arg_tys, &arg_lits, member.1)
+					if let Some((ret, target)) =
+						self.resolve_namespaced(def, &member.0, &arg_tys, &arg_lits, member.1)
 					{
+						self.annotations.record_direct_namespace_member(func.id);
+						self
+							.annotations
+							.record_definition_target(id, target.as_ref());
+						self
+							.annotations
+							.record_definition_target(func.id, target.as_ref());
 						return (ret, None);
 					}
 					self.emit(

@@ -1,8 +1,22 @@
 use nymph_sema::{
-	BuiltinDispatch, EntryMode, InterfaceType, ModuleIdentity, ModuleOrigin, RuntimeExtractionError,
-	RuntimePayload, SemanticEnvironment, StableDispatch, check_module_with_environment,
-	declared_headers, extract_module_interface, runtime_definitions,
+	BuiltinDispatch, DeclarationKey, EntryMode, InterfaceType, ModuleIdentity, ModuleOrigin,
+	RuntimeExtractionError, RuntimePayload, SemanticEnvironment, StableDispatch,
+	check_module_with_environment, declared_headers, extract_module_interface, runtime_definitions,
 };
+
+fn source_name(definition: &nymph_sema::DefinitionId) -> &str {
+	match &definition.key {
+		DeclarationKey::TopLevel { name, .. }
+		| DeclarationKey::Member { name, .. }
+		| DeclarationKey::MethodBody { name, .. } => name,
+		DeclarationKey::MaterializedInterfaceMember {
+			interface_member, ..
+		} => source_name(interface_member),
+		DeclarationKey::Implementation { .. } | DeclarationKey::RecoveredImplementation { .. } => {
+			"implementation"
+		}
+	}
+}
 
 fn project(source: &str) -> Vec<nymph_sema::RuntimeDefinition> {
 	let parsed = nymph_syntax::parse_module(source, "fixture.nym");
@@ -286,4 +300,32 @@ impl Box {
 		.map(|artifact| artifact.definition.clone())
 		.collect::<std::collections::HashSet<_>>();
 	assert_eq!(ids.len(), artifacts.len());
+}
+
+#[test]
+fn inherent_static_call_annotations_preserve_the_exact_member_identity() {
+	let source = "struct Box(value: int)\nimpl Box { namespace func make(): Box = Box(value = 1) }\nfunc read(): Box = Box.make()";
+	let artifacts = project(source);
+	let read = artifacts
+		.iter()
+		.find(|artifact| source_name(&artifact.definition) == "read")
+		.expect("read runtime definition");
+	let make = artifacts
+		.iter()
+		.find(|artifact| source_name(&artifact.definition) == "make")
+		.expect("make runtime definition");
+	let nymph_sema::RuntimePayload::NymphBody(body) = &read.payload else {
+		panic!("read must have a Nymph body")
+	};
+	assert_eq!(
+		body
+			.annotations
+			.definition_targets
+			.iter()
+			.filter(|(_, target)| target == &make.definition)
+			.count(),
+		2,
+		"the call and its static member receiver must retain the selected member ID"
+	);
+	assert!(matches!(make.definition.key, DeclarationKey::Member { .. }));
 }

@@ -1290,7 +1290,7 @@ mod tests {
 		assert_eq!(defining_span, None);
 		assert_eq!(
 			checker.resolve_namespaced(record, "make", &[], &[], span),
-			Some(self_ty)
+			Some((self_ty, None))
 		);
 		checker.generalize_returns();
 		checker.check_member_bodies();

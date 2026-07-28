@@ -458,22 +458,24 @@ impl<'m> Checker<'m> {
 		arg_tys: &[Ty],
 		arg_lits: &[bool],
 		span: nymph_ast::Span,
-	) -> Option<Ty> {
+	) -> Option<(Ty, Option<crate::DefinitionId>)> {
 		let candidates = self.inherent.candidates(Head::Adt(type_def));
 		for idx in candidates {
-			let has = self
+			let target = self
 				.inherent
 				.impls
 				.get(idx)
 				.and_then(|i| i.methods.get(name))
-				.is_some_and(|m| m.namespaced);
-			if has {
+				.filter(|method| method.namespaced)
+				.map(|method| method.definition.clone());
+			if let Some(target) = target {
 				let placeholder = self.interner.error();
-				return Some(
+				return Some((
 					self
 						.commit_inherent(idx, placeholder, name, arg_tys, arg_lits, span, true)
 						.1,
-				);
+					target,
+				));
 			}
 		}
 		None
