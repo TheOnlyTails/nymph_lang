@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use nymph_ast::decl::Declaration;
-use nymph_ast::expr::ExprKind;
+use nymph_ast::expr::{ExprKind, Statement};
 use nymph_sema::{
-	DeclarationCategory, DeclarationKey, DefinitionId, DefinitionShapeKind, EntryMode,
+	BinderScope, DeclarationCategory, DeclarationKey, DefinitionId, DefinitionShapeKind, EntryMode,
 	ExportedDefinition, InterfaceType, ModuleAnnotations, ModuleEnvironment, ModuleIdentity,
 	ModuleInterface, ModuleOrigin, RecoveredDefinitionReference, RecoveredExportedDefinition,
 	RecoveredExportedImpl, RecoveredInterfaceType, RecoveredModuleInterface, SemanticAnalysis,
 	SemanticAvailability, SemanticEnvironment, TyKind, check_module, check_module_with_environment,
+	declared_headers, extract_module_interface,
 };
 use nymph_syntax::parse_module;
 
@@ -130,6 +131,174 @@ fn environment_check_uses_imported_function_without_mutating_environment() {
 			current,
 			DeclarationKey::top_level(DeclarationCategory::Function, "local"),
 		))
+	);
+}
+
+#[test]
+fn imported_opaque_method_return_retains_its_exact_interface_bound() {
+	let dependency_identity = identity("iterable.nymph");
+	let parsed = parse_module(
+		"public enum Option<T> { Some(value: T), None }\n\
+		 public interface Iterator<Item> { mut func next(): Option<Item> }\n\
+		 public interface Iterable<Item> { func iter(): Iterator<Item> }\n\
+		 public struct ListIter<Item>(item: Item) {\n\
+		   impl Iterator<Item> { mut func next(): Option<Item> = Some(this.item) }\n\
+		 }\n\
+		 public struct Values<Item>(item: Item) {\n\
+		   impl Iterable<Item> { func iter(): Iterator<Item> = ListIter(item = this.item) }\n\
+		 }",
+		"iterable.nymph",
+	);
+	assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+	let module = Arc::new(parsed.tree);
+	let dependency_environment =
+		SemanticEnvironment::from_modules(dependency_identity.clone(), &[]).unwrap();
+	let checked = check_module_with_environment(
+		module.clone(),
+		dependency_identity.clone(),
+		&dependency_environment,
+		EntryMode::Library,
+	);
+	assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);
+	let facts = nymph_sema::Checked {
+		diags: vec![],
+		facts: checked.analysis.checked.as_ref().clone(),
+	};
+	let headers = declared_headers(dependency_identity.clone(), &module);
+	let interface =
+		extract_module_interface(dependency_identity.clone(), &module, &facts, &headers).unwrap();
+	let iterator_id = interface
+		.exports
+		.iter()
+		.find(|definition| definition.name == "Iterator")
+		.unwrap()
+		.id
+		.clone();
+	let implementation = interface
+		.implementations
+		.iter()
+		.find(|implementation| {
+			matches!(
+				&implementation.self_type,
+				InterfaceType::Named { definition, .. }
+					if matches!(&definition.key, DeclarationKey::TopLevel { name, .. } if name == "Values")
+			)
+		})
+		.unwrap();
+	let iter_implementation_id = implementation.id.clone();
+	let iter = implementation
+		.members
+		.iter()
+		.find(|member| member.name == "iter")
+		.unwrap();
+	let opaque_return = iter
+		.binders
+		.last()
+		.expect("iter has an opaque return binder");
+	assert_eq!(opaque_return.id.binder.owner, iter.id);
+	assert_eq!(opaque_return.id.binder.scope, BinderScope::Member);
+	assert_eq!(
+		iter.return_type,
+		InterfaceType::Generic(opaque_return.id.clone())
+	);
+	let producer_bound = &iter.constraints[0];
+	assert_eq!(producer_bound.parameter, opaque_return.id);
+	assert_eq!(producer_bound.interface, iterator_id);
+	assert_eq!(
+		producer_bound.named,
+		[(
+			"Item".into(),
+			InterfaceType::Generic(implementation.binders[0].id.clone())
+		)]
+	);
+
+	let consumer_identity = identity("consumer.nymph");
+	let environment = SemanticEnvironment::from_modules(
+		consumer_identity.clone(),
+		&[Arc::new(ModuleEnvironment::Complete(interface.clone()))],
+	)
+	.unwrap();
+	let iterator_local = environment.imported.defs.by_stable(&iterator_id).unwrap();
+	let imported_implementation = environment
+		.imported
+		.implementations
+		.impls
+		.iter()
+		.find(|implementation| implementation.definition.as_ref() == Some(&iter_implementation_id))
+		.unwrap();
+	let imported_iter = &imported_implementation.methods["iter"];
+	let TyKind::Param(imported_opaque_return) = environment.interner.kind(imported_iter.ret) else {
+		panic!("imported iter return is not its method-owned opaque binder")
+	};
+	let imported_bound = &imported_iter.bounds[0];
+	assert_eq!(
+		environment.interner.kind(imported_bound.ty),
+		&TyKind::Param(*imported_opaque_return)
+	);
+	assert_eq!(imported_bound.interface, iterator_local);
+	let imported_item_argument = imported_bound
+		.args
+		.iter()
+		.find(|(name, _)| name == "Item")
+		.expect("imported Iterator bound has its Item argument")
+		.1;
+	let TyKind::Param(imported_item) = environment.interner.kind(imported_item_argument) else {
+		panic!("imported Iterator.Item does not reference the implementation owner binder")
+	};
+	let TyKind::Adt(_, owner_args) = environment.interner.kind(imported_implementation.self_ty)
+	else {
+		panic!("imported implementation self type is not Values<Item>")
+	};
+	let TyKind::Param(imported_owner_item) = environment.interner.kind(owner_args.positional[0])
+	else {
+		panic!("imported Values argument is not its owner binder")
+	};
+	assert_eq!(imported_item, imported_owner_item);
+
+	let consumer = parse_module(
+			"func advance(values: Values<int>): Option<int> = { let mut iterator = values.iter() iterator.next() }",
+			"consumer.nymph",
+		)
+		.tree;
+	let next_call = match &consumer.members[0] {
+		Declaration::Func { body, .. } => match &body.kind {
+			ExprKind::Block { body, .. } => match &body.last().unwrap().0 {
+				Statement::Expr(expression) => expression.id,
+				other => panic!("expected trailing next expression, got {other:?}"),
+			},
+			other => panic!("expected function block, got {other:?}"),
+		},
+		other => panic!("expected function, got {other:?}"),
+	};
+	let result = check_module_with_environment(
+		Arc::new(consumer),
+		consumer_identity,
+		&environment,
+		EntryMode::Library,
+	);
+	assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+	let next_ty = result.analysis.annotations.get(next_call).unwrap().ty;
+	let TyKind::Adt(option, arguments) = result.analysis.checked.interner.kind(next_ty) else {
+		panic!("next() did not resolve to Option<int>")
+	};
+	let option_id = interface
+		.exports
+		.iter()
+		.find(|definition| definition.name == "Option")
+		.unwrap()
+		.id
+		.clone();
+	assert_eq!(
+		result.analysis.checked.semantic.stable_definition(*option),
+		Some(&option_id)
+	);
+	assert_eq!(
+		result
+			.analysis
+			.checked
+			.interner
+			.kind(arguments.positional[0]),
+		&TyKind::Int
 	);
 }
 

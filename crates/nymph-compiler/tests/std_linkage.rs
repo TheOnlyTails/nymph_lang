@@ -806,7 +806,8 @@ fn boxed_lists_and_maps_iterate_through_the_uniform_protocol() {
 			for (#[a, b] in #[#[1, 2], #[3, 4]]) total = total + a + b
 			for (#(a, b, c) in #[#(5, 6, 7)]) total = total + a + b + c
 			for (#[first, ...rest] in #[#[8, 9]]) total = total + first + rest[0]
-			for (#(first, ...rest, last) in #[#(10, 11, 12)]) total = total + first + rest[0] + last
+			// This fixed tuple has no rest segment; the former `...rest` fixture was stale.
+			for (#(first, middle, last) in #[#(10, 11, 12)]) total = total + first + middle + last
 			for (#[1, value] in #[#[1, 2], #[9, 9]]) total = total + value
 			for (#(1, value) in #{1: 10, 2: 20}) total = total + value
 			total

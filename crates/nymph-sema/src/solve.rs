@@ -978,7 +978,7 @@ impl Checker<'_> {
 				.iter()
 				.map(|t| self.subst(*t, subst, Some(recv)))
 				.collect();
-			let ret = self.instantiate_opaque_return(method.ret, subst, recv);
+			let ret = self.instantiate_opaque_return(method.ret, &method.bounds, subst, recv);
 			return Some((params, ret, MethodSource::ImplDirect));
 		}
 
@@ -1010,7 +1010,7 @@ impl Checker<'_> {
 			.iter()
 			.map(|t| self.subst(*t, &isubst, Some(recv)))
 			.collect();
-		let ret = self.instantiate_opaque_return(method.ret, &isubst, recv);
+		let ret = self.instantiate_opaque_return(method.ret, &method.bounds, &isubst, recv);
 		Some((params, ret, MethodSource::InterfaceDefault))
 	}
 
@@ -1021,6 +1021,7 @@ impl Checker<'_> {
 	fn instantiate_opaque_return(
 		&mut self,
 		ret: Ty,
+		method_bounds: &[crate::iface::Bound],
 		subst: &FxHashMap<ParamIdx, Ty>,
 		recv: Ty,
 	) -> Ty {
@@ -1028,9 +1029,23 @@ impl Checker<'_> {
 			return self.subst(ret, subst, Some(recv));
 		};
 		let source = *source;
-		let Some(details) = self.synthetic_bound_details.get(&source).cloned() else {
-			return self.subst(ret, subst, Some(recv));
+		let details = method_bounds
+			.iter()
+			.filter(|bound| matches!(self.interner.kind(bound.ty), TyKind::Param(idx) if *idx == source))
+			.cloned()
+			.collect::<Vec<_>>();
+		let details = if details.is_empty() {
+			self
+				.synthetic_bound_details
+				.get(&source)
+				.cloned()
+				.unwrap_or_default()
+		} else {
+			details
 		};
+		if details.is_empty() {
+			return self.subst(ret, subst, Some(recv));
+		}
 		let idx = ParamIdx(Self::SYNTHETIC_PARAM_BASE + self.synthetic_params);
 		self.synthetic_params += 1;
 		let ty = self.interner.mk_param(idx);
