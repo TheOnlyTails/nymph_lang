@@ -444,33 +444,137 @@ fn exact_runtime_entities_backdate_unchanged_siblings() {
 
 #[test]
 fn declaration_insertion_does_not_change_exact_artifact() {
-	let mut session = CompilerSession::without_builtin_sources();
+	let (mut session, events) = session();
 	let project = ProjectId::new("stable");
 	let main = ModulePath::new("main").unwrap();
 	let a = id("stable", "a");
 	session.set_source(
 		project.clone(),
 		main.clone(),
-		"public func a(): int = 1".into(),
+		"public func a(value: int): boolean = value == 1".into(),
 		SourceVersion(1),
 	);
 	let before = session
-		.runtime_definition(project.clone(), main.clone(), a.clone(), EntryMode::Library)
+		.runtime_definition_consumer_for_test(
+			project.clone(),
+			main.clone(),
+			a.clone(),
+			EntryMode::Library,
+		)
 		.unwrap();
 	let RuntimePayload::NymphBody(before_body) = &before.payload else {
 		panic!("function body payload");
 	};
 	assert!(!before_body.annotations.types.is_empty());
+	events.lock().unwrap().clear();
 	session.set_source(
 		project.clone(),
 		main.clone(),
-		"private func unrelated(): int = 0\npublic func a(): int = 1".into(),
+		"private func unrelated(): int = 0\npublic func a(value: int): boolean = value == 1".into(),
 		SourceVersion(2),
 	);
 	let after = session
-		.runtime_definition(project, main, a, EntryMode::Library)
+		.runtime_definition_consumer_for_test(project, main, a.clone(), EntryMode::Library)
 		.unwrap();
 	assert_eq!(before, after);
+	assert!(!events.lock().unwrap().iter().any(|event| {
+		event.query == "runtime_definition_consumer" && event.definition.as_ref() == Some(&a)
+	}));
+	events.lock().unwrap().clear();
+	session.set_source(
+		ProjectId::new("stable"),
+		ModulePath::new("main").unwrap(),
+		"public func a(value: int): boolean = value == 1\nprivate func unrelated(): int = 0".into(),
+		SourceVersion(3),
+	);
+	let reordered = session
+		.runtime_definition_consumer_for_test(
+			ProjectId::new("stable"),
+			ModulePath::new("main").unwrap(),
+			a.clone(),
+			EntryMode::Library,
+		)
+		.unwrap();
+	assert_eq!(before, reordered);
+	assert!(!events.lock().unwrap().iter().any(|event| {
+		event.query == "runtime_definition_consumer" && event.definition.as_ref() == Some(&a)
+	}));
+}
+
+#[test]
+fn import_target_change_updates_exact_runtime_annotations() {
+	let (mut session, events) = session();
+	let project = ProjectId::new("import-change");
+	let main = ModulePath::new("main").unwrap();
+	for dependency in ["left", "right"] {
+		session.set_source(
+			project.clone(),
+			ModulePath::new(dependency).unwrap(),
+			"public func answer(): int = 1".into(),
+			SourceVersion(1),
+		);
+	}
+	let definition = id("import-change", "forwarded");
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"import @/left with (answer)\npublic func forwarded(): int = answer()".into(),
+		SourceVersion(1),
+	);
+	let before = session
+		.runtime_definition_consumer_for_test(
+			project.clone(),
+			main.clone(),
+			definition.clone(),
+			EntryMode::Library,
+		)
+		.unwrap();
+	events.lock().unwrap().clear();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"import @/right with (answer)\npublic func forwarded(): int = answer()".into(),
+		SourceVersion(2),
+	);
+	let after = session
+		.runtime_definition_consumer_for_test(project, main, definition.clone(), EntryMode::Library)
+		.unwrap();
+	assert_ne!(before, after);
+	let target_module = |artifact: &nymph_sema::RuntimeDefinition| {
+		let RuntimePayload::NymphBody(body) = &artifact.payload else {
+			panic!("function body payload");
+		};
+		body.annotations.definition_targets[0].1.module.path.clone()
+	};
+	assert_eq!(target_module(&before), "left");
+	assert_eq!(target_module(&after), "right");
+	assert!(events.lock().unwrap().iter().any(|event| {
+		event.query == "runtime_definition_consumer" && event.definition.as_ref() == Some(&definition)
+	}));
+}
+
+#[test]
+fn member_local_generic_types_are_preserved_in_exact_runtime_annotations() {
+	let mut session = CompilerSession::without_builtin_sources();
+	let project = ProjectId::new("member-generics");
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"interface Items<T> { func first<U>(values: #[U]): U = values[0] }".into(),
+		SourceVersion(1),
+	);
+	let definitions = session
+		.runtime_definitions_for_test(project, main.clone(), main, EntryMode::Library)
+		.expect("member-local generic types must canonicalize into the exact runtime artifact");
+	let body = definitions
+		.iter()
+		.find_map(|definition| match &definition.payload {
+			RuntimePayload::NymphBody(body) => Some(body),
+			_ => None,
+		})
+		.expect("generic default body artifact");
+	assert!(!body.annotations.types.is_empty());
 }
 
 #[test]
