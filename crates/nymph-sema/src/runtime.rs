@@ -8,12 +8,17 @@ use std::sync::Arc;
 
 use ecow::EcoString;
 use nymph_ast::{
-	decl::{FuncDeclaration, ImplMember, InterfaceElement, InterfaceMember, LetDeclaration},
-	expr::{
-		Expr, ExprKind, ListItem, ListPatternEntry, MapEntry, MapPatternEntry, Pattern, RangeKind,
-		RangePatternKind, Statement, StringPart, StructPatternField,
+	decl::{
+		FuncDeclaration, FuncParam, ImplMember, InterfaceElement, InterfaceMember, LetDeclaration,
 	},
-	ops::BinaryOperator,
+	expr::{
+		CallArg, ClosureParam, Expr, ExprKind, ListItem, ListPatternEntry, MapEntry, MapPatternEntry,
+		Pattern, RangeKind, RangePatternKind, Statement, StringEscape, StringPart, StringPatternPart,
+		StructPatternField,
+	},
+	ops::{
+		AssignOperator, BinaryOperator, PatternOperator, PostfixOperator, PrefixOperator, TypeOperator,
+	},
 };
 
 use crate::{
@@ -26,6 +31,250 @@ pub struct BodyNodeId(pub u32);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
 pub struct PatternNodeId(pub u32);
+
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub struct StableBody {
+	pub params: Arc<[StableParameter]>,
+	pub root: StableExpr,
+}
+
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub struct StableParameter {
+	pub pattern: StablePattern,
+	pub mutable: bool,
+	pub spread: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub struct StableExpr {
+	pub id: BodyNodeId,
+	pub kind: StableExprKind,
+}
+
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub enum StableExprKind {
+	Int(u64),
+	UInt(u64),
+	Float(ordered_float::OrderedFloat<f64>),
+	Char(char),
+	String(Arc<[StableStringPart]>),
+	Boolean(bool),
+	Identifier(EcoString),
+	AnonymousParam(Option<u8>),
+	List(Arc<[StableListItem]>),
+	Tuple(Arc<[StableListItem]>),
+	Map(Arc<[StableMapEntry]>),
+	Range(StableRange),
+	Call {
+		func: Box<StableExpr>,
+		args: Arc<[StableCallArg]>,
+	},
+	MemberAccess {
+		parent: Box<StableExpr>,
+		member: EcoString,
+		optional: bool,
+	},
+	IndexAccess {
+		parent: Box<StableExpr>,
+		index: Box<StableExpr>,
+		optional: bool,
+	},
+	Closure {
+		params: Arc<[StableParameter]>,
+		body: Box<StableExpr>,
+	},
+	PrefixOp {
+		op: PrefixOperator,
+		value: Box<StableExpr>,
+	},
+	PostfixOp {
+		op: PostfixOperator,
+		value: Box<StableExpr>,
+	},
+	BinaryOp {
+		lhs: Box<StableExpr>,
+		op: BinaryOperator,
+		rhs: Box<StableExpr>,
+	},
+	TypeOp {
+		lhs: Box<StableExpr>,
+		op: TypeOperator,
+	},
+	PatternOp {
+		lhs: Box<StableExpr>,
+		op: PatternOperator,
+		rhs: StablePattern,
+	},
+	AssignOp {
+		lhs: Box<StableExpr>,
+		op: AssignOperator,
+		rhs: Box<StableExpr>,
+	},
+	Return {
+		value: Option<Box<StableExpr>>,
+		label: Option<EcoString>,
+	},
+	Break {
+		value: Option<Box<StableExpr>>,
+		label: Option<EcoString>,
+	},
+	Continue {
+		label: Option<EcoString>,
+	},
+	While {
+		condition: Box<StableExpr>,
+		body: Box<StableExpr>,
+		label: Option<EcoString>,
+	},
+	For {
+		variable: StablePattern,
+		iterable: Box<StableExpr>,
+		body: Box<StableExpr>,
+		label: Option<EcoString>,
+	},
+	If {
+		condition: Box<StableExpr>,
+		then: Box<StableExpr>,
+		otherwise: Option<Box<StableExpr>>,
+	},
+	Match {
+		value: Box<StableExpr>,
+		arms: Arc<[StableMatchArm]>,
+	},
+	This,
+	Block {
+		body: Arc<[StableStatement]>,
+		label: Option<EcoString>,
+	},
+	Grouped(Box<StableExpr>),
+}
+
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub enum StableStringPart {
+	Text(EcoString),
+	Escape(StringEscape),
+	Expr(StableExpr),
+}
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub enum StableListItem {
+	Expr(StableExpr),
+	Spread(StableExpr),
+}
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub enum StableMapEntry {
+	Entry(StableExpr, StableExpr),
+	Spread(StableExpr),
+}
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub struct StableCallArg {
+	pub value: StableExpr,
+	pub name: Option<EcoString>,
+	pub spread: bool,
+}
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub enum StableRange {
+	From(Box<StableExpr>),
+	To(Box<StableExpr>),
+	Exclusive {
+		min: Box<StableExpr>,
+		max: Box<StableExpr>,
+	},
+	ToInclusive(Box<StableExpr>),
+	Inclusive {
+		min: Box<StableExpr>,
+		max: Box<StableExpr>,
+	},
+}
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub enum StableStatement {
+	Expr(StableExpr),
+	Let {
+		pattern: StablePattern,
+		mutable: bool,
+		value: StableExpr,
+	},
+}
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub struct StableMatchArm {
+	pub pattern: StablePattern,
+	pub guard: Option<StableExpr>,
+	pub body: StableExpr,
+}
+
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub struct StablePattern {
+	pub id: PatternNodeId,
+	pub kind: StablePatternKind,
+}
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub enum StablePatternKind {
+	Int(i64),
+	UInt(u64),
+	Float(ordered_float::OrderedFloat<f64>),
+	Char(char),
+	String(Arc<[StableStringPatternPart]>),
+	Boolean(bool),
+	Binding {
+		name: EcoString,
+		inner: Box<StablePattern>,
+	},
+	List(Arc<[StableListPatternEntry]>),
+	Tuple(Arc<[StableListPatternEntry]>),
+	Map(Arc<[StableMapPatternEntry]>),
+	Range(StablePatternRange),
+	Struct {
+		path: Arc<[EcoString]>,
+		fields: Arc<[StableStructPatternField]>,
+	},
+	Placeholder,
+	Union(Box<StablePattern>, Box<StablePattern>),
+	Grouped(Box<StablePattern>),
+}
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub enum StableStringPatternPart {
+	Text(EcoString),
+	Escape(StringEscape),
+}
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub enum StableListPatternEntry {
+	Item(StablePattern),
+	Rest(Option<EcoString>),
+}
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub enum StableMapPatternEntry {
+	Entry(StablePattern, StablePattern),
+	Rest(Option<EcoString>),
+}
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub enum StableStructPatternField {
+	Value {
+		name: EcoString,
+		value: StablePattern,
+	},
+	Named {
+		id: PatternNodeId,
+		name: EcoString,
+	},
+	Positional {
+		id: PatternNodeId,
+		pattern: StablePattern,
+	},
+	Rest,
+}
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub enum StablePatternRange {
+	From(Box<StablePattern>),
+	To(Box<StablePattern>),
+	Exclusive {
+		min: Box<StablePattern>,
+		max: Box<StablePattern>,
+	},
+	ToInclusive(Box<StablePattern>),
+	Inclusive {
+		min: Box<StablePattern>,
+		max: Box<StablePattern>,
+	},
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum BuiltinDispatch {
@@ -158,15 +407,19 @@ pub enum RuntimeBodyKind {
 	StaticFunction,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, salsa::SalsaValue)]
+#[derive(Clone, Debug, salsa::SalsaValue)]
 pub struct CheckedRuntimeBody {
-	/// Canonical, declaration-local source forms. Neither contains parser identity
-	/// or absolute locations.
 	pub kind: RuntimeBodyKind,
-	pub signature: Arc<str>,
-	pub expression: Arc<str>,
+	pub stable: StableBody,
 	pub annotations: RuntimeAnnotations,
 }
+
+impl PartialEq for CheckedRuntimeBody {
+	fn eq(&self, other: &Self) -> bool {
+		self.kind == other.kind && self.stable == other.stable && self.annotations == other.annotations
+	}
+}
+impl Eq for CheckedRuntimeBody {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct StructShell {
@@ -207,7 +460,6 @@ pub struct RuntimeDefinition {
 /// production lowering in the next #79 unit; no compatibility lookup is used.
 pub fn runtime_definitions(
 	module: &nymph_ast::decl::Module,
-	source: &str,
 	checked: &crate::CheckedFacts,
 	interface: &crate::ModuleInterface,
 ) -> Result<Vec<RuntimeDefinition>, RuntimeExtractionError> {
@@ -230,7 +482,6 @@ pub fn runtime_definitions(
 					RuntimePlacement::TopLevel,
 					meta,
 					body,
-					source,
 					checked,
 				)?;
 			}
@@ -240,9 +491,7 @@ pub fn runtime_definitions(
 					&mut result,
 					required_top_level(checked, name)?,
 					RuntimePlacement::TopLevel,
-					meta,
 					value,
-					source,
 					checked,
 				)?;
 			}
@@ -318,7 +567,7 @@ pub fn runtime_definitions(
 					placement: RuntimePlacement::TopLevel,
 					payload,
 				});
-				extract_members(&mut result, members, &item.members, false, source, checked)?;
+				extract_members(&mut result, members, &item.members, false, checked)?;
 				for (nested_index, nested) in impls.iter().enumerate() {
 					let path = crate::annotate::ImplementationSourcePath {
 						declaration: declaration_index as u32,
@@ -329,7 +578,6 @@ pub fn runtime_definitions(
 						&mut result,
 						&nested.0.members,
 						implementation,
-						source,
 						checked,
 						path,
 					)?;
@@ -338,7 +586,7 @@ pub fn runtime_definitions(
 			nymph_ast::decl::Declaration::Namespace { name, members, .. } => {
 				let item = shape(crate::DeclarationCategory::Namespace, &name.0)
 					.ok_or_else(|| RuntimeExtractionError::MissingStableId(name.0.clone()))?;
-				extract_members(&mut result, members, &item.members, true, source, checked)?;
+				extract_members(&mut result, members, &item.members, true, checked)?;
 			}
 			nymph_ast::decl::Declaration::Impl { members, .. }
 			| nymph_ast::decl::Declaration::ImplFor { members, .. } => {
@@ -347,14 +595,7 @@ pub fn runtime_definitions(
 					nested: None,
 				};
 				let implementation = required_implementation(interface, checked, path)?;
-				extract_implementation_members(
-					&mut result,
-					members,
-					implementation,
-					source,
-					checked,
-					path,
-				)?;
+				extract_implementation_members(&mut result, members, implementation, checked, path)?;
 			}
 			nymph_ast::decl::Declaration::Interface { name, members, .. } => {
 				let item = shape(crate::DeclarationCategory::Interface, &name.0)
@@ -376,19 +617,16 @@ pub fn runtime_definitions(
 									attached(member),
 									meta,
 									body,
-									source,
 									checked,
 								)?,
 								InterfaceElement::Let {
-									meta,
+									meta: _,
 									value: Some(value),
 								} => push_value(
 									&mut result,
 									member.id.clone(),
 									attached(member),
-									meta,
 									value,
-									source,
 									checked,
 								)?,
 								_ => {}
@@ -441,7 +679,6 @@ pub fn runtime_definitions(
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum RuntimeExtractionError {
-	InvalidSourceProjection,
 	IncompleteCanonicalType,
 	MissingStableId(EcoString),
 	MissingImplementation,
@@ -451,6 +688,7 @@ pub enum RuntimeExtractionError {
 	IncompleteVariantTarget(EcoString),
 	MissingIterationProtocol,
 	CorruptImplementationMemberMapping(DefinitionId),
+	MissingBodyExpressionIdentity,
 }
 
 fn required_top_level(
@@ -503,7 +741,6 @@ fn extract_members(
 	syntax: &[nymph_ast::Spanned<ImplMember>],
 	shapes: &[crate::MemberShape<InterfaceType>],
 	module_placed: bool,
-	source: &str,
 	checked: &crate::CheckedFacts,
 ) -> Result<(), RuntimeExtractionError> {
 	if syntax.len() != shapes.len() {
@@ -518,24 +755,12 @@ fn extract_members(
 			}
 		};
 		match &syntax.0 {
-			ImplMember::Func { meta, body, .. } => push_body(
-				result,
-				shape.id.clone(),
-				placement(),
-				meta,
-				body,
-				source,
-				checked,
-			)?,
-			ImplMember::Let { meta, value, .. } => push_value(
-				result,
-				shape.id.clone(),
-				placement(),
-				meta,
-				value,
-				source,
-				checked,
-			)?,
+			ImplMember::Func { meta, body, .. } => {
+				push_body(result, shape.id.clone(), placement(), meta, body, checked)?
+			}
+			ImplMember::Let { value, .. } => {
+				push_value(result, shape.id.clone(), placement(), value, checked)?
+			}
 			ImplMember::ExternalFunc(..) | ImplMember::ExternalLet(..) => push_external(
 				result,
 				shape.id.clone(),
@@ -568,7 +793,6 @@ fn extract_implementation_members(
 	result: &mut Vec<RuntimeDefinition>,
 	syntax: &[nymph_ast::Spanned<ImplMember>],
 	implementation: &crate::ExportedImpl,
-	source: &str,
 	checked: &crate::CheckedFacts,
 	path: crate::annotate::ImplementationSourcePath,
 ) -> Result<(), RuntimeExtractionError> {
@@ -599,11 +823,9 @@ fn extract_implementation_members(
 		};
 		match &syntax.0 {
 			ImplMember::Func { meta, body, .. } => {
-				push_body(result, definition, placement, meta, body, source, checked)?
+				push_body(result, definition, placement, meta, body, checked)?
 			}
-			ImplMember::Let { meta, value, .. } => {
-				push_value(result, definition, placement, meta, value, source, checked)?
-			}
+			ImplMember::Let { value, .. } => push_value(result, definition, placement, value, checked)?,
 			ImplMember::ExternalFunc(..) => {
 				push_external(result, definition, placement, member_shape.external.clone())?
 			}
@@ -624,20 +846,16 @@ fn push_value(
 	result: &mut Vec<RuntimeDefinition>,
 	definition: DefinitionId,
 	placement: RuntimePlacement,
-	meta: &LetDeclaration,
 	value: &Expr,
-	source: &str,
 	checked: &crate::CheckedFacts,
 ) -> Result<(), RuntimeExtractionError> {
-	let name = binding_name(meta)?;
 	push_canonical_body(
 		result,
 		definition,
 		placement,
 		RuntimeBodyKind::Value,
-		name,
+		&[],
 		value,
-		source,
 		checked,
 	)
 }
@@ -648,14 +866,8 @@ fn push_body(
 	placement: RuntimePlacement,
 	meta: &FuncDeclaration,
 	body: &Expr,
-	source: &str,
 	checked: &crate::CheckedFacts,
 ) -> Result<(), RuntimeExtractionError> {
-	let body_start = expression_source_start(body);
-	let signature_source = source
-		.get(meta.name.1.start as usize..body_start as usize)
-		.ok_or(RuntimeExtractionError::InvalidSourceProjection)?
-		.trim_end_matches(|character: char| character == '=' || character.is_whitespace());
 	push_canonical_body(
 		result,
 		definition,
@@ -665,9 +877,8 @@ fn push_body(
 		} else {
 			RuntimeBodyKind::InstanceFunction
 		},
-		signature_source,
+		&meta.params,
 		body,
-		source,
 		checked,
 	)
 }
@@ -677,16 +888,10 @@ fn push_canonical_body(
 	definition: DefinitionId,
 	placement: RuntimePlacement,
 	kind: RuntimeBodyKind,
-	signature_source: &str,
+	params: &[nymph_ast::Spanned<FuncParam>],
 	body: &Expr,
-	source: &str,
 	checked: &crate::CheckedFacts,
 ) -> Result<(), RuntimeExtractionError> {
-	let body_start = expression_source_start(body);
-	let body_source = source
-		.get(body_start as usize..body.span.end as usize)
-		.ok_or(RuntimeExtractionError::InvalidSourceProjection)?
-		.trim();
 	let mut nodes = Vec::new();
 	walk_expr(body, &mut nodes);
 	let local = nodes
@@ -705,17 +910,15 @@ fn push_canonical_body(
 		.filter_map(|expr| local.get(&expr.id).copied())
 		.collect::<std::collections::HashSet<_>>();
 	let required_type_nodes = required_type_nodes(&nodes, checked);
-	let mut patterns = Vec::new();
-	walk_body_patterns(body, &mut patterns);
-	let patterns = patterns
-		.into_iter()
-		.enumerate()
-		.map(|(index, pattern)| (pattern.1, PatternNodeId(index as u32)))
-		.collect::<std::collections::HashMap<_, _>>();
+	let builder = StableBodyBuilder::new(&local);
+	let stable = builder.body(params, body)?;
+	let pattern_sites = builder.pattern_sites.into_inner();
+	let positional_sites = builder.positional_sites.into_inner();
 	let annotations = runtime_annotations(
 		&definition,
 		&local,
-		&patterns,
+		&pattern_sites,
+		&positional_sites,
 		&native_range_nodes,
 		&required_type_nodes,
 		checked,
@@ -726,32 +929,408 @@ fn push_canonical_body(
 		placement,
 		payload: RuntimePayload::NymphBody(CheckedRuntimeBody {
 			kind,
-			signature: Arc::from(signature_source),
-			expression: Arc::from(body_source),
+			stable,
 			annotations,
 		}),
 	});
 	Ok(())
 }
 
-// Member-access and call nodes retain the punctuation/call span while their
-// receiver/callee owns the beginning of the canonical expression. Recover that
-// boundary structurally; stable lowering must receive the complete expression,
-// never reconstruct it by scanning source text or spans for a name.
-fn expression_source_start(expression: &Expr) -> usize {
-	match &expression.kind {
-		ExprKind::Call { func, .. } => expression_source_start(func),
-		ExprKind::MemberAccess { parent, .. } | ExprKind::IndexAccess { parent, .. } => {
-			expression_source_start(parent)
+struct StableBodyBuilder<'a> {
+	expressions: &'a std::collections::HashMap<nymph_ast::NodeId, BodyNodeId>,
+	next_pattern: std::cell::Cell<u32>,
+	pattern_sites: std::cell::RefCell<std::collections::HashMap<nymph_ast::Span, PatternNodeId>>,
+	positional_sites: std::cell::RefCell<std::collections::HashMap<nymph_ast::Span, PatternNodeId>>,
+}
+
+impl<'a> StableBodyBuilder<'a> {
+	fn new(expressions: &'a std::collections::HashMap<nymph_ast::NodeId, BodyNodeId>) -> Self {
+		Self {
+			expressions,
+			next_pattern: std::cell::Cell::new(0),
+			pattern_sites: std::cell::RefCell::new(std::collections::HashMap::new()),
+			positional_sites: std::cell::RefCell::new(std::collections::HashMap::new()),
 		}
-		_ => expression.span.start,
+	}
+	fn next_pattern_id(&self) -> PatternNodeId {
+		let next = self.next_pattern.get();
+		self.next_pattern.set(next + 1);
+		PatternNodeId(next)
+	}
+	fn body(
+		&self,
+		params: &[nymph_ast::Spanned<FuncParam>],
+		root: &Expr,
+	) -> Result<StableBody, RuntimeExtractionError> {
+		Ok(StableBody {
+			params: params
+				.iter()
+				.map(|p| self.func_param(&p.0))
+				.collect::<Result<_, _>>()?,
+			root: self.expr(root)?,
+		})
+	}
+	fn func_param(&self, param: &FuncParam) -> Result<StableParameter, RuntimeExtractionError> {
+		Ok(StableParameter {
+			pattern: self.pattern_param(&param.name)?,
+			mutable: param.mutable,
+			spread: param.spread,
+		})
+	}
+	fn closure_param(&self, param: &ClosureParam) -> Result<StableParameter, RuntimeExtractionError> {
+		Ok(StableParameter {
+			pattern: self.pattern_param(&param.name)?,
+			mutable: param.mutable,
+			spread: param.spread,
+		})
+	}
+	fn pattern_param(
+		&self,
+		pattern: &nymph_ast::Spanned<Pattern>,
+	) -> Result<StablePattern, RuntimeExtractionError> {
+		self.pattern(pattern)
+	}
+	fn pattern(
+		&self,
+		pattern: &nymph_ast::Spanned<Pattern>,
+	) -> Result<StablePattern, RuntimeExtractionError> {
+		let id = self.next_pattern_id();
+		self
+			.pattern_sites
+			.borrow_mut()
+			.entry(pattern.1)
+			.or_insert(id);
+		self.pattern_with_id(pattern, id)
+	}
+	fn pattern_with_id(
+		&self,
+		pattern: &nymph_ast::Spanned<Pattern>,
+		id: PatternNodeId,
+	) -> Result<StablePattern, RuntimeExtractionError> {
+		let kind = match &pattern.0 {
+			Pattern::Int(v) => StablePatternKind::Int(v.0),
+			Pattern::UInt(v) => StablePatternKind::UInt(v.0),
+			Pattern::Float(v) => StablePatternKind::Float(v.0),
+			Pattern::Char(v) => StablePatternKind::Char(v.0),
+			Pattern::Boolean(v) => StablePatternKind::Boolean(v.0),
+			Pattern::String(parts) => StablePatternKind::String(
+				parts
+					.iter()
+					.map(|p| {
+						Ok(match &p.0 {
+							StringPatternPart::Text(v) => StableStringPatternPart::Text(v.clone()),
+							StringPatternPart::EscapeSequence(v) => StableStringPatternPart::Escape(*v),
+						})
+					})
+					.collect::<Result<_, _>>()?,
+			),
+			Pattern::Binding { name, inner } => StablePatternKind::Binding {
+				name: name.0.clone(),
+				inner: Box::new(self.pattern(inner)?),
+			},
+			Pattern::List(v) => StablePatternKind::List(
+				v.iter()
+					.map(|e| self.list_pattern(&e.0))
+					.collect::<Result<_, _>>()?,
+			),
+			Pattern::Tuple(v) => StablePatternKind::Tuple(
+				v.iter()
+					.map(|e| self.list_pattern(&e.0))
+					.collect::<Result<_, _>>()?,
+			),
+			Pattern::Map(v) => StablePatternKind::Map(
+				v.iter()
+					.map(|e| {
+						Ok(match &e.0 {
+							MapPatternEntry::Entry(k, v) => {
+								StableMapPatternEntry::Entry(self.pattern(k)?, self.pattern(v)?)
+							}
+							MapPatternEntry::Rest(n) => {
+								StableMapPatternEntry::Rest(n.as_ref().map(|n| n.0.clone()))
+							}
+						})
+					})
+					.collect::<Result<_, _>>()?,
+			),
+			Pattern::Range(v) => StablePatternKind::Range(self.pattern_range(v)?),
+			Pattern::Struct { path, fields } => StablePatternKind::Struct {
+				path: path.iter().map(|n| n.0.clone()).collect(),
+				fields: fields
+					.iter()
+					.map(|f| {
+						Ok(match &f.0 {
+							StructPatternField::Value { name, value } => StableStructPatternField::Value {
+								name: name.0.clone(),
+								value: self.pattern(value)?,
+							},
+							StructPatternField::Named(n) => {
+								let id = self.next_pattern_id();
+								self.pattern_sites.borrow_mut().insert(f.1, id);
+								self.positional_sites.borrow_mut().insert(f.1, id);
+								StableStructPatternField::Named {
+									id,
+									name: n.0.clone(),
+								}
+							}
+							StructPatternField::Positional(v) => {
+								let id = self.next_pattern_id();
+								self.positional_sites.borrow_mut().insert(f.1, id);
+								let pattern = self.pattern(v)?;
+								StableStructPatternField::Positional { id, pattern }
+							}
+							StructPatternField::Rest => StableStructPatternField::Rest,
+						})
+					})
+					.collect::<Result<_, _>>()?,
+			},
+			Pattern::Placeholder => StablePatternKind::Placeholder,
+			Pattern::Union(a, b) => {
+				StablePatternKind::Union(Box::new(self.pattern(a)?), Box::new(self.pattern(b)?))
+			}
+			Pattern::Grouped(v) => StablePatternKind::Grouped(Box::new(self.pattern(v)?)),
+		};
+		Ok(StablePattern { id, kind })
+	}
+	fn list_pattern(
+		&self,
+		entry: &ListPatternEntry,
+	) -> Result<StableListPatternEntry, RuntimeExtractionError> {
+		Ok(match entry {
+			ListPatternEntry::Item(v) => StableListPatternEntry::Item(self.pattern(v)?),
+			ListPatternEntry::Rest(n) => StableListPatternEntry::Rest(n.as_ref().map(|n| n.0.clone())),
+		})
+	}
+	fn pattern_range(
+		&self,
+		range: &RangePatternKind,
+	) -> Result<StablePatternRange, RuntimeExtractionError> {
+		Ok(match range {
+			RangePatternKind::From(v) => StablePatternRange::From(Box::new(self.pattern(v)?)),
+			RangePatternKind::To(v) => StablePatternRange::To(Box::new(self.pattern(v)?)),
+			RangePatternKind::Exclusive { min, max } => StablePatternRange::Exclusive {
+				min: Box::new(self.pattern(min)?),
+				max: Box::new(self.pattern(max)?),
+			},
+			RangePatternKind::ToInclusive(v) => {
+				StablePatternRange::ToInclusive(Box::new(self.pattern(v)?))
+			}
+			RangePatternKind::Inclusive { min, max } => StablePatternRange::Inclusive {
+				min: Box::new(self.pattern(min)?),
+				max: Box::new(self.pattern(max)?),
+			},
+		})
+	}
+	fn expr(&self, expr: &Expr) -> Result<StableExpr, RuntimeExtractionError> {
+		let id = self
+			.expressions
+			.get(&expr.id)
+			.copied()
+			.ok_or(RuntimeExtractionError::MissingBodyExpressionIdentity)?;
+		let boxed = |v: &Expr| self.expr(v).map(Box::new);
+		let label = |v: &Option<nymph_ast::Ident>| v.as_ref().map(|n| n.0.clone());
+		let kind = match &expr.kind {
+			ExprKind::Int(v) => StableExprKind::Int(v.0),
+			ExprKind::UInt(v) => StableExprKind::UInt(v.0),
+			ExprKind::Float(v) => StableExprKind::Float(v.0),
+			ExprKind::Char(v) => StableExprKind::Char(v.0),
+			ExprKind::Boolean(v) => StableExprKind::Boolean(v.0),
+			ExprKind::Identifier(v) => StableExprKind::Identifier(v.0.clone()),
+			ExprKind::AnonymousParam(v) => StableExprKind::AnonymousParam(*v),
+			ExprKind::This => StableExprKind::This,
+			ExprKind::String(v) => StableExprKind::String(
+				v.iter()
+					.map(|p| {
+						Ok(match &p.0 {
+							StringPart::Text(v) => StableStringPart::Text(v.clone()),
+							StringPart::EscapeSequence(v) => StableStringPart::Escape(*v),
+							StringPart::InterpolatedExpr(v) => StableStringPart::Expr(self.expr(v)?),
+						})
+					})
+					.collect::<Result<_, _>>()?,
+			),
+			ExprKind::List(v) => StableExprKind::List(
+				v.iter()
+					.map(|v| self.list_item(&v.0))
+					.collect::<Result<_, _>>()?,
+			),
+			ExprKind::Tuple(v) => StableExprKind::Tuple(
+				v.iter()
+					.map(|v| self.list_item(&v.0))
+					.collect::<Result<_, _>>()?,
+			),
+			ExprKind::Map(v) => StableExprKind::Map(
+				v.iter()
+					.map(|v| {
+						Ok(match &v.0 {
+							MapEntry::Entry(k, v) => StableMapEntry::Entry(self.expr(k)?, self.expr(v)?),
+							MapEntry::Spread(v) => StableMapEntry::Spread(self.expr(v)?),
+						})
+					})
+					.collect::<Result<_, _>>()?,
+			),
+			ExprKind::Range(v) => StableExprKind::Range(match v {
+				RangeKind::From(v) => StableRange::From(boxed(v)?),
+				RangeKind::To(v) => StableRange::To(boxed(v)?),
+				RangeKind::Exclusive { min, max } => StableRange::Exclusive {
+					min: boxed(min)?,
+					max: boxed(max)?,
+				},
+				RangeKind::ToInclusive(v) => StableRange::ToInclusive(boxed(v)?),
+				RangeKind::Inclusive { min, max } => StableRange::Inclusive {
+					min: boxed(min)?,
+					max: boxed(max)?,
+				},
+			}),
+			ExprKind::Call { func, args, .. } => StableExprKind::Call {
+				func: boxed(func)?,
+				args: args
+					.iter()
+					.map(|a| self.call_arg(&a.0))
+					.collect::<Result<_, _>>()?,
+			},
+			ExprKind::MemberAccess {
+				parent,
+				member,
+				optional,
+			} => StableExprKind::MemberAccess {
+				parent: boxed(parent)?,
+				member: member.0.clone(),
+				optional: *optional,
+			},
+			ExprKind::IndexAccess {
+				parent,
+				index,
+				optional,
+			} => StableExprKind::IndexAccess {
+				parent: boxed(parent)?,
+				index: boxed(index)?,
+				optional: *optional,
+			},
+			ExprKind::Closure { params, body, .. } => StableExprKind::Closure {
+				params: params
+					.iter()
+					.map(|p| self.closure_param(&p.0))
+					.collect::<Result<_, _>>()?,
+				body: boxed(body)?,
+			},
+			ExprKind::PrefixOp { op, value } => StableExprKind::PrefixOp {
+				op: *op,
+				value: boxed(value)?,
+			},
+			ExprKind::PostfixOp { op, value } => StableExprKind::PostfixOp {
+				op: *op,
+				value: boxed(value)?,
+			},
+			ExprKind::BinaryOp { lhs, op, rhs } => StableExprKind::BinaryOp {
+				lhs: boxed(lhs)?,
+				op: *op,
+				rhs: boxed(rhs)?,
+			},
+			ExprKind::TypeOp { lhs, op, .. } => StableExprKind::TypeOp {
+				lhs: boxed(lhs)?,
+				op: *op,
+			},
+			ExprKind::PatternOp { lhs, op, rhs } => StableExprKind::PatternOp {
+				lhs: boxed(lhs)?,
+				op: *op,
+				rhs: self.pattern(rhs)?,
+			},
+			ExprKind::AssignOp { lhs, op, rhs } => StableExprKind::AssignOp {
+				lhs: boxed(lhs)?,
+				op: *op,
+				rhs: boxed(rhs)?,
+			},
+			ExprKind::Return { value, label: l } => StableExprKind::Return {
+				value: value.as_deref().map(boxed).transpose()?,
+				label: label(l),
+			},
+			ExprKind::Break { value, label: l } => StableExprKind::Break {
+				value: value.as_deref().map(boxed).transpose()?,
+				label: label(l),
+			},
+			ExprKind::Continue { label: l } => StableExprKind::Continue { label: label(l) },
+			ExprKind::While {
+				condition,
+				body,
+				label: l,
+			} => StableExprKind::While {
+				condition: boxed(condition)?,
+				body: boxed(body)?,
+				label: label(l),
+			},
+			ExprKind::For {
+				variable,
+				iterable,
+				body,
+				label: l,
+			} => StableExprKind::For {
+				variable: self.pattern(variable)?,
+				iterable: boxed(iterable)?,
+				body: boxed(body)?,
+				label: label(l),
+			},
+			ExprKind::If {
+				condition,
+				then,
+				otherwise,
+			} => StableExprKind::If {
+				condition: boxed(condition)?,
+				then: boxed(then)?,
+				otherwise: otherwise.as_deref().map(boxed).transpose()?,
+			},
+			ExprKind::Match { value, arms } => StableExprKind::Match {
+				value: boxed(value)?,
+				arms: arms
+					.iter()
+					.map(|a| {
+						Ok(StableMatchArm {
+							pattern: self.pattern(&a.pattern)?,
+							guard: a.guard.as_ref().map(|v| self.expr(v)).transpose()?,
+							body: self.expr(&a.body)?,
+						})
+					})
+					.collect::<Result<_, _>>()?,
+			},
+			ExprKind::Block { body, label: l } => StableExprKind::Block {
+				body: body
+					.iter()
+					.map(|s| {
+						Ok(match &s.0 {
+							Statement::Expr(v) => StableStatement::Expr(self.expr(v)?),
+							Statement::Let { meta, value } => StableStatement::Let {
+								pattern: self.pattern(&meta.name)?,
+								mutable: meta.is_mutable(),
+								value: self.expr(value)?,
+							},
+						})
+					})
+					.collect::<Result<_, _>>()?,
+				label: label(l),
+			},
+			ExprKind::Grouped(v) => StableExprKind::Grouped(boxed(v)?),
+		};
+		Ok(StableExpr { id, kind })
+	}
+	fn list_item(&self, item: &ListItem) -> Result<StableListItem, RuntimeExtractionError> {
+		Ok(match item {
+			ListItem::Expr(v) => StableListItem::Expr(self.expr(v)?),
+			ListItem::Spread(v) => StableListItem::Spread(self.expr(v)?),
+		})
+	}
+	fn call_arg(&self, arg: &CallArg) -> Result<StableCallArg, RuntimeExtractionError> {
+		Ok(StableCallArg {
+			value: self.expr(&arg.value)?,
+			name: arg.name.as_ref().map(|n| n.0.clone()),
+			spread: arg.spread,
+		})
 	}
 }
 
 fn runtime_annotations(
 	definition: &DefinitionId,
 	local: &std::collections::HashMap<nymph_ast::NodeId, BodyNodeId>,
-	patterns: &std::collections::HashMap<nymph_ast::Span, PatternNodeId>,
+	pattern_sites: &std::collections::HashMap<nymph_ast::Span, PatternNodeId>,
+	positional_sites: &std::collections::HashMap<nymph_ast::Span, PatternNodeId>,
 	native_range_nodes: &std::collections::HashSet<BodyNodeId>,
 	required_type_nodes: &std::collections::HashSet<nymph_ast::NodeId>,
 	checked: &crate::CheckedFacts,
@@ -816,35 +1395,27 @@ fn runtime_annotations(
 	let mut pattern_variants = checked
 		.annotations
 		.pattern_variants()
-		.filter_map(|(span, variant)| patterns.get(&span).map(|id| (*id, variant)))
+		.filter_map(|(span, variant)| pattern_sites.get(&span).map(|id| (*id, variant)))
 		.map(|(id, variant)| Ok((id, pattern_variant(checked, variant)?)))
 		.collect::<Result<Vec<_>, RuntimeExtractionError>>()?;
-	let mut positional_fields = patterns
+	let mut positional_fields = positional_sites
 		.iter()
 		.filter_map(|(span, id)| {
-			checked
-				.annotations
-				.positional_field_of(*span)
-				.map(|name| (*id, *span, name))
-		})
-		.map(|(id, span, name)| {
-			let variant = checked
-				.annotations
-				.pattern_variant_of(span)
-				.or_else(|| {
-					checked
-						.annotations
-						.pattern_variants()
-						.filter(|(candidate, _)| candidate.start <= span.start && candidate.end >= span.end)
-						.min_by_key(|(candidate, _)| candidate.end - candidate.start)
-						.map(|(_, variant)| variant)
-				})
-				.ok_or_else(|| RuntimeExtractionError::IncompleteVariantTarget(name.clone()))?;
-			let exact = variant_fields(checked, variant)?
-				.into_iter()
-				.find(|field| field.name == *name)
-				.ok_or_else(|| RuntimeExtractionError::IncompleteVariantTarget(name.clone()))?;
-			Ok((id, exact))
+			checked.annotations.positional_field_of(*span).map(|field| {
+				field
+					.definition
+					.clone()
+					.ok_or_else(|| RuntimeExtractionError::IncompleteVariantTarget(field.name.clone()))
+					.map(|definition| {
+						(
+							*id,
+							StableVariantField {
+								name: field.name.clone(),
+								definition,
+							},
+						)
+					})
+			})
 		})
 		.collect::<Result<Vec<_>, RuntimeExtractionError>>()?;
 	let mut iterations = Vec::new();
@@ -1533,91 +2104,5 @@ fn walk_expr<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 		| ExprKind::AnonymousParam(_)
 		| ExprKind::This
 		| ExprKind::Continue { .. } => {}
-	}
-}
-
-fn walk_body_patterns<'a>(expr: &'a Expr, out: &mut Vec<&'a nymph_ast::Spanned<Pattern>>) {
-	let mut expressions = Vec::new();
-	walk_expr(expr, &mut expressions);
-	for expression in expressions {
-		match &expression.kind {
-			ExprKind::Closure { params, .. } => {
-				for parameter in params {
-					walk_pattern(&parameter.0.name, out);
-				}
-			}
-			ExprKind::For { variable, .. } => walk_pattern(variable, out),
-			ExprKind::Match { arms, .. } => {
-				for arm in arms {
-					walk_pattern(&arm.pattern, out);
-				}
-			}
-			ExprKind::Block { body, .. } => {
-				for statement in body {
-					if let Statement::Let { meta, .. } = &statement.0 {
-						walk_pattern(&meta.name, out);
-					}
-				}
-			}
-			_ => {}
-		}
-	}
-}
-
-fn walk_pattern<'a>(
-	pattern: &'a nymph_ast::Spanned<Pattern>,
-	out: &mut Vec<&'a nymph_ast::Spanned<Pattern>>,
-) {
-	out.push(pattern);
-	match &pattern.0 {
-		Pattern::Binding { inner, .. } | Pattern::Grouped(inner) => walk_pattern(inner, out),
-		Pattern::List(entries) | Pattern::Tuple(entries) => {
-			for entry in entries {
-				if let ListPatternEntry::Item(pattern) = &entry.0 {
-					walk_pattern(pattern, out);
-				}
-			}
-		}
-		Pattern::Map(entries) => {
-			for entry in entries {
-				match &entry.0 {
-					MapPatternEntry::Entry(key, value) => {
-						walk_pattern(key, out);
-						walk_pattern(value, out);
-					}
-					MapPatternEntry::Rest(_) => {}
-				}
-			}
-		}
-		Pattern::Range(range) => match range {
-			RangePatternKind::From(value)
-			| RangePatternKind::To(value)
-			| RangePatternKind::ToInclusive(value) => walk_pattern(value, out),
-			RangePatternKind::Exclusive { min, max } | RangePatternKind::Inclusive { min, max } => {
-				walk_pattern(min, out);
-				walk_pattern(max, out);
-			}
-		},
-		Pattern::Struct { fields, .. } => {
-			for field in fields {
-				match &field.0 {
-					StructPatternField::Value { value, .. } | StructPatternField::Positional(value) => {
-						walk_pattern(value, out)
-					}
-					StructPatternField::Named(_) | StructPatternField::Rest => {}
-				}
-			}
-		}
-		Pattern::Union(left, right) => {
-			walk_pattern(left, out);
-			walk_pattern(right, out);
-		}
-		Pattern::Int(_)
-		| Pattern::UInt(_)
-		| Pattern::Float(_)
-		| Pattern::Char(_)
-		| Pattern::String(_)
-		| Pattern::Boolean(_)
-		| Pattern::Placeholder => {}
 	}
 }

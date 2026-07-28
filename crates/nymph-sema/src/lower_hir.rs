@@ -5089,7 +5089,7 @@ impl<'a> Lowerer<'a> {
 					// then a nullary-variant pattern or a plain binding (as in `lower_pattern`'s
 					// `Binding` arm), not a field shorthand.
 					match self.annotations.positional_field_of(f.1).cloned() {
-						Some(fname) => {
+						Some(field) => {
 							let sub = match self.annotations.pattern_variant_of(f.1).cloned() {
 								Some(res) => HirPat::Variant {
 									enum_name: res.enum_name.clone(),
@@ -5101,7 +5101,7 @@ impl<'a> Lowerer<'a> {
 									sub: None,
 								},
 							};
-							Some((fname, sub))
+							Some((field.name, sub))
 						}
 						None => Some((
 							name.0.clone(),
@@ -5118,7 +5118,7 @@ impl<'a> Lowerer<'a> {
 				StructPatternField::Positional(value) => self
 					.annotations
 					.positional_field_of(f.1)
-					.map(|fname| (fname.clone(), self.lower_pattern(value))),
+					.map(|field| (field.name.clone(), self.lower_pattern(value))),
 				StructPatternField::Rest => None,
 			})
 			.collect()

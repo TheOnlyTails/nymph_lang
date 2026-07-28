@@ -502,6 +502,42 @@ fn declaration_insertion_does_not_change_exact_artifact() {
 }
 
 #[test]
+fn formatting_only_body_edits_backdate_the_runtime_consumer() {
+	let (mut session, events) = session();
+	let project = ProjectId::new("formatted-runtime");
+	let main = ModulePath::new("main").unwrap();
+	let a = id("formatted-runtime", "a");
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"public func a(value: int): int = { let result = value + 1\n result }".into(),
+		SourceVersion(1),
+	);
+	let before = session
+		.runtime_definition_consumer_for_test(
+			project.clone(),
+			main.clone(),
+			a.clone(),
+			EntryMode::Library,
+		)
+		.unwrap();
+	events.lock().unwrap().clear();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"public func a( value: int ): int = {\n // formatting is not runtime identity\n let result = value + 1\n\n result\n}".into(),
+		SourceVersion(2),
+	);
+	let after = session
+		.runtime_definition_consumer_for_test(project, main, a.clone(), EntryMode::Library)
+		.unwrap();
+	assert_eq!(before, after);
+	assert!(!events.lock().unwrap().iter().any(|event| {
+		event.query == "runtime_definition_consumer" && event.definition.as_ref() == Some(&a)
+	}));
+}
+
+#[test]
 fn import_target_change_updates_exact_runtime_annotations() {
 	let (mut session, events) = session();
 	let project = ProjectId::new("import-change");
@@ -578,7 +614,7 @@ fn member_local_generic_types_are_preserved_in_exact_runtime_annotations() {
 }
 
 #[test]
-fn signature_changes_are_part_of_exact_runtime_payload_equality() {
+fn hir_erased_signature_changes_do_not_change_the_owned_runtime_body() {
 	let mut session = CompilerSession::without_builtin_sources();
 	let project = ProjectId::new("signature-runtime");
 	let main = ModulePath::new("main").unwrap();
@@ -592,10 +628,49 @@ fn signature_changes_are_part_of_exact_runtime_payload_equality() {
 	let before = session
 		.runtime_definition(project.clone(), main.clone(), a.clone(), EntryMode::Library)
 		.unwrap();
+	let lowered_before = session
+		.runtime_definition_consumer_for_test(
+			project.clone(),
+			main.clone(),
+			a.clone(),
+			EntryMode::Library,
+		)
+		.unwrap();
 	session.set_source(
 		project.clone(),
 		main.clone(),
 		"public func a(value: uint): uint = value".into(),
+		SourceVersion(2),
+	);
+	let after = session
+		.runtime_definition(project.clone(), main.clone(), a.clone(), EntryMode::Library)
+		.unwrap();
+	let lowered_after = session
+		.runtime_definition_consumer_for_test(project, main, a, EntryMode::Library)
+		.unwrap();
+	assert_eq!(before, after);
+	assert_eq!(lowered_before, lowered_after);
+}
+
+#[test]
+fn signature_changes_that_select_different_lowering_annotations_change_the_runtime_body() {
+	let mut session = CompilerSession::without_builtin_sources();
+	let project = ProjectId::new("annotated-signature-runtime");
+	let main = ModulePath::new("main").unwrap();
+	let a = id("annotated-signature-runtime", "a");
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"public func a(value: int): char = value as char".into(),
+		SourceVersion(1),
+	);
+	let before = session
+		.runtime_definition(project.clone(), main.clone(), a.clone(), EntryMode::Library)
+		.unwrap();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"public func a(value: float): char = value as char".into(),
 		SourceVersion(2),
 	);
 	let after = session

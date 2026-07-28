@@ -83,7 +83,10 @@ pub use runtime::{
 	BodyNodeId, BuiltinDispatch, CheckedRuntimeBody, DispatchMaterialization, EnumShell,
 	ExpressionVariant, PatternNodeId, PatternVariant, RuntimeAnnotations, RuntimeBodyKind,
 	RuntimeDefinition, RuntimeExtractionError, RuntimeIteration, RuntimePayload, RuntimePlacement,
-	StableDispatch, StableVariantField, StructShell, VariantExpressionMode, VariantPatternMode,
-	runtime_definitions,
+	StableBody, StableCallArg, StableDispatch, StableExpr, StableExprKind, StableListItem,
+	StableListPatternEntry, StableMapEntry, StableMapPatternEntry, StableMatchArm, StableParameter,
+	StablePattern, StablePatternKind, StablePatternRange, StableRange, StableStatement,
+	StableStringPart, StableStringPatternPart, StableStructPatternField, StableVariantField,
+	StructShell, VariantExpressionMode, VariantPatternMode, runtime_definitions,
 };
 pub use stable_lowering::*;

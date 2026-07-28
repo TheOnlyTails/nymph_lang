@@ -1,12 +1,12 @@
 use std::{collections::HashMap, sync::Arc};
 
 use nymph_sema::{
-	BodyNodeId, CanonicalModuleSpecifier, DeclarationCategory, DeclarationKey, DefinitionId,
-	DefinitionShapeKind, EmittedBindingName, EmittedMemberName, ExportedDefinition, ExternalAbi,
-	InterfaceType, ModuleEnvironment, ModuleIdentity, ModuleInterface, ModuleOrigin,
-	RuntimeDefinition, RuntimeDefinitionLookup, RuntimeDefinitionLookupError, StableNameLookup,
-	StableNameLookupError, StableShapeFact, StableShapeLookup, StableShapeLookupError,
-	StableShapeRequest, lower_runtime_definition,
+	CanonicalModuleSpecifier, DeclarationCategory, DeclarationKey, DefinitionId, DefinitionShapeKind,
+	EmittedBindingName, EmittedMemberName, ExportedDefinition, ExternalAbi, InterfaceType,
+	ModuleEnvironment, ModuleIdentity, ModuleInterface, ModuleOrigin, RuntimeDefinition,
+	RuntimeDefinitionLookup, RuntimeDefinitionLookupError, StableNameLookup, StableNameLookupError,
+	StableShapeFact, StableShapeLookup, StableShapeLookupError, StableShapeRequest,
+	lower_runtime_definition,
 };
 
 #[derive(Default)]
@@ -176,9 +176,22 @@ fn artifacts_and_interface_with_dependencies(
 	let headers = nymph_sema::declared_headers(identity.clone(), &module);
 	let interface =
 		nymph_sema::extract_module_interface(identity, &module, &facts, &headers).unwrap();
-	let artifacts =
-		nymph_sema::runtime_definitions(&module, source, &facts.facts, &interface).unwrap();
+	let artifacts = nymph_sema::runtime_definitions(&module, &facts.facts, &interface).unwrap();
 	(artifacts, interface)
+}
+
+#[test]
+fn stable_lowering_is_identical_across_body_formatting() {
+	let compact = lower_fixture("func answer(): int = { let value = 1\nvalue }");
+	let formatted = lower_fixture(
+		"func answer( ): int = {\n\
+		 // Formatting is absent from the owned body.\n\
+		 let value = 1\n\n\
+		 value\n\
+		 }",
+	);
+
+	assert_eq!(compact, formatted);
 }
 
 #[test]
@@ -196,37 +209,22 @@ fn implementation_header_generic_body_receiver_has_canonical_type_annotation() {
 	let nymph_sema::RuntimePayload::NymphBody(body) = first.payload else {
 		unreachable!()
 	};
-	let parsed_body = nymph_syntax::parse_module(
-		&format!("func fixture(): void = {}", body.expression),
-		"body.nym",
-	);
-	assert!(
-		parsed_body.diagnostics.is_empty(),
-		"{:?}",
-		parsed_body.diagnostics
-	);
-	let nymph_ast::decl::Declaration::Func {
-		body: parsed_body, ..
-	} = &parsed_body.tree.members[0]
-	else {
-		unreachable!()
-	};
-	let nymph_ast::expr::ExprKind::Block {
+	let nymph_sema::StableExprKind::Block {
 		body: statements, ..
-	} = &parsed_body.kind
+	} = &body.stable.root.kind
 	else {
 		unreachable!()
 	};
-	let nymph_ast::expr::Statement::Expr(index_access) = &statements.last().unwrap().0 else {
+	let nymph_sema::StableStatement::Expr(index_access) = statements.last().unwrap() else {
 		unreachable!()
 	};
-	let nymph_ast::expr::ExprKind::IndexAccess {
+	let nymph_sema::StableExprKind::IndexAccess {
 		parent: receiver, ..
 	} = &index_access.kind
 	else {
 		unreachable!()
 	};
-	let receiver = fixture_body_node_id(parsed_body, receiver.id);
+	let receiver = receiver.id;
 
 	assert_eq!(
 		body
@@ -236,37 +234,6 @@ fn implementation_header_generic_body_receiver_has_canonical_type_annotation() {
 			.find(|(node, _)| *node == receiver),
 		Some(&(receiver, expected))
 	);
-}
-
-fn fixture_body_node_id(body: &nymph_ast::expr::Expr, target: nymph_ast::NodeId) -> BodyNodeId {
-	fn visit(
-		expression: &nymph_ast::expr::Expr,
-		target: nymph_ast::NodeId,
-		next: &mut u32,
-	) -> Option<BodyNodeId> {
-		let current = BodyNodeId(*next);
-		*next += 1;
-		if expression.id == target {
-			return Some(current);
-		}
-		match &expression.kind {
-			nymph_ast::expr::ExprKind::Block { body, .. } => body.iter().find_map(|statement| {
-				let expression = match &statement.0 {
-					nymph_ast::expr::Statement::Expr(expression)
-					| nymph_ast::expr::Statement::Let {
-						value: expression, ..
-					} => expression,
-				};
-				visit(expression, target, next)
-			}),
-			nymph_ast::expr::ExprKind::IndexAccess { parent, index, .. } => {
-				visit(parent, target, next).or_else(|| visit(index, target, next))
-			}
-			_ => None,
-		}
-	}
-
-	visit(body, target, &mut 0).expect("index receiver must have a canonical body node")
 }
 
 #[test]
@@ -366,8 +333,7 @@ fn materialized_fixture_in(
 	let headers = nymph_sema::declared_headers(identity.clone(), &module);
 	let interface =
 		nymph_sema::extract_module_interface(identity, &module, &facts, &headers).unwrap();
-	let artifacts =
-		nymph_sema::runtime_definitions(&module, source, &facts.facts, &interface).unwrap();
+	let artifacts = nymph_sema::runtime_definitions(&module, &facts.facts, &interface).unwrap();
 	let mut context = Context::default();
 	for artifact in &artifacts {
 		context
@@ -1325,6 +1291,28 @@ fn lowers_tuple_spread_without_protocol_demands() {
 		matches!(tuple.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if matches!(function.body, nymph_hir::hir::HirExpr::ArraySpread { .. }))
 	);
 	assert_eq!(tuple.demands(), []);
+}
+
+#[test]
+fn positional_variant_binding_uses_the_checker_selected_field() {
+	let lowered = lower_named(
+		"enum Choice { Some(value: int), None }\nfunc read(choice: Choice): int = match (choice) { Choice.Some(item) -> item, Choice.None -> 0 }",
+		"read",
+	);
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("read function")
+	};
+	let nymph_hir::hir::HirExpr::Match { arms, .. } = &function.body else {
+		panic!("read body must be a match: {:?}", function.body)
+	};
+	let nymph_hir::hir::HirPat::Variant { fields, .. } = &arms[0].pat else {
+		panic!("first arm must be a variant: {:?}", arms[0].pat)
+	};
+	assert!(matches!(
+		fields.as_slice(),
+		[(name, nymph_hir::hir::HirPat::Binding { name: binding, sub: None })]
+			if name == "value" && binding == "item"
+	));
 }
 
 #[test]

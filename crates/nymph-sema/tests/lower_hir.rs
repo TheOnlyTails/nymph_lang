@@ -632,6 +632,25 @@ fn lowers_full_patterns_and_guards() {
 }
 
 #[test]
+fn compatibility_lowering_preserves_positional_variant_field_selection() {
+	let hir = lower(
+		"enum Choice { Some(value: int), None }\n\
+		 func named(choice: Choice): int = match (choice) { Choice.Some(item) -> item, Choice.None -> 0 }\n\
+		 func explicit(choice: Choice): int = match (choice) { Choice.Some(_) -> 1, Choice.None -> 0 }",
+	);
+	for function in &hir.funcs {
+		let HirExpr::Match { arms, .. } = &function.body else {
+			panic!("{} must lower to a match", function.name)
+		};
+		let HirPat::Variant { fields, .. } = &arms[0].pat else {
+			panic!("{} first arm must be a variant", function.name)
+		};
+		assert_eq!(fields.len(), 1);
+		assert_eq!(fields[0].0, "value");
+	}
+}
+
+#[test]
 fn lowers_whole_and_nested_binding_subpatterns() {
 	let hir = lower(
 		"func f(value: #(int, int)): int = match (value) {

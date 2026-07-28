@@ -1,7 +1,7 @@
 //! Stable, semantic-only contracts for per-definition HIR lowering.
 //!
 //! Its inputs are exact stable identities and owned semantic artifacts, so lowering
-//! not need compiler queries, parser identities, source locations, or module ASTs.
+//! does not need compiler queries, parser identities, source locations, or module ASTs.
 
 use std::{
 	cell::RefCell,
@@ -10,14 +10,7 @@ use std::{
 };
 
 use ecow::EcoString;
-use nymph_ast::{
-	decl::{Declaration, LetKind},
-	expr::{
-		Expr, ExprKind, ListItem, ListPatternEntry, MapEntry, MapPatternEntry, Pattern, RangeKind,
-		RangePatternKind, Statement, StringPart, StructPatternField,
-	},
-	ops::{AssignOperator, BinaryOperator, PatternOperator, PrefixOperator},
-};
+use nymph_ast::ops::{AssignOperator, BinaryOperator, PatternOperator, PrefixOperator};
 use nymph_hir::hir::{
 	BinOp, BuiltinResult, HirArm, HirArrayElem, HirArrayKind, HirBoundDispatchCase,
 	HirBoundDispatchTarget, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit, HirMapElem,
@@ -26,7 +19,10 @@ use nymph_hir::hir::{
 
 use crate::{
 	DefinitionId, EnumShell, ExportedDefinition, ExportedImpl, ExternalAbi, InterfaceType,
-	MemberShape, ModuleIdentity, RuntimeDefinition, StructShell,
+	MemberShape, ModuleIdentity, RuntimeDefinition, StableExpr, StableExprKind, StableListItem,
+	StableListPatternEntry, StableMapEntry, StableMapPatternEntry, StablePattern, StablePatternKind,
+	StablePatternRange, StableRange, StableStatement, StableStringPart, StableStringPatternPart,
+	StableStructPatternField, StructShell,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -942,66 +938,15 @@ fn lower_body(
 	implementation_slots: Option<&[crate::ImplementationMemberSlot]>,
 ) -> Result<LoweredHirFragment, StableLoweringError> {
 	let is_function = body.kind != crate::RuntimeBodyKind::Value;
-	let source = if is_function {
-		format!("func {} = {}", body.signature, body.expression)
-	} else {
-		format!("let {} = {}", body.signature, body.expression)
-	};
-	let parsed = nymph_syntax::parse_module(&source, "$stable-lowering.nym");
-	if !parsed.diagnostics.is_empty() {
-		return Err(StableLoweringError::Parse {
-			definition: artifact.definition.clone(),
-			reason: format!("{:?}", parsed.diagnostics).into(),
-		});
-	}
-	let (meta, expression) = match parsed.tree.members.as_slice() {
-		[Declaration::Func { meta, body, .. }] if is_function => (Some(meta), body),
-		[Declaration::Let { meta: _, value, .. }] if !is_function => (None, value),
-		_ => {
-			return Err(StableLoweringError::ShapeDrift {
-				definition: artifact.definition.clone(),
-				reason: "canonical source reconstructed a different declaration shape".into(),
-			});
-		}
-	};
-	let mut nodes = vec![];
-	walk(expression, &mut nodes);
-	let node_ids: HashMap<_, _> = nodes
-		.iter()
-		.enumerate()
-		.map(|(index, expr)| (expr.id, crate::BodyNodeId(index as u32)))
-		.collect();
-	let mut patterns = vec![];
-	walk_body_patterns(expression, &mut patterns);
-	let pattern_ids = patterns
-		.into_iter()
-		.enumerate()
-		.map(|(index, pattern)| (pattern.1, crate::PatternNodeId(index as u32)))
-		.collect();
+	let stable = &body.stable;
 	let primitive_extension = match &artifact.placement {
 		crate::RuntimePlacement::Attached { owner, .. } => primitive_extension_owner(context, owner)?,
 		crate::RuntimePlacement::TopLevel => false,
 	};
-	for id in body
-		.annotations
-		.types
-		.iter()
-		.map(|(id, _)| id)
-		.chain(body.annotations.definition_targets.iter().map(|(id, _)| id))
-	{
-		if id.0 as usize >= nodes.len() {
-			return Err(StableLoweringError::ShapeDrift {
-				definition: artifact.definition.clone(),
-				reason: format!("annotation node {} exceeds reconstructed preorder", id.0).into(),
-			});
-		}
-	}
 	let lowerer = StableBodyLowerer {
 		context,
 		artifact,
 		annotations: &body.annotations,
-		node_ids,
-		pattern_ids,
 		scopes: RefCell::new(vec![HashMap::new()]),
 		counters: RefCell::new(HashMap::new()),
 		demands: RefCell::new(demands),
@@ -1015,13 +960,13 @@ fn lower_body(
 		lowerer.scopes.borrow_mut()[0].insert("this".into(), "$self".into());
 	}
 	let emitted: EcoString = context.binding_name(&artifact.definition)?.as_str().into();
-	if let Some(meta) = meta {
-		let params = meta
+	if is_function {
+		let params = stable
 			.params
 			.iter()
-			.map(|param| pattern_name(&param.0.name).map(|name| lowerer.declare(name)))
+			.map(|param| pattern_name(&param.pattern).map(|name| lowerer.declare(name)))
 			.collect::<Result<Vec<_>, StableLoweringError>>()?;
-		let lowered_body = lowerer.lower_function_body(expression)?;
+		let lowered_body = lowerer.lower_function_body(&stable.root)?;
 		let function = HirFunc {
 			name: emitted.clone(),
 			params: if primitive_extension {
@@ -1059,7 +1004,7 @@ fn lower_body(
 			}
 		}
 	} else {
-		let value = lowerer.lower(expression)?;
+		let value = lowerer.lower(&stable.root)?;
 		match &artifact.placement {
 			crate::RuntimePlacement::TopLevel => Ok(LoweredHirFragment::TopLevelValue(HirLet {
 				name: emitted,
@@ -1078,10 +1023,10 @@ fn lower_body(
 	}
 }
 
-fn pattern_name(pattern: &nymph_ast::Spanned<Pattern>) -> Result<&EcoString, StableLoweringError> {
-	match &pattern.0 {
-		Pattern::Binding { name, .. } => Ok(&name.0),
-		Pattern::Placeholder => {
+fn pattern_name(pattern: &StablePattern) -> Result<&EcoString, StableLoweringError> {
+	match &pattern.kind {
+		StablePatternKind::Binding { name, .. } => Ok(name),
+		StablePatternKind::Placeholder => {
 			static PLACEHOLDER: std::sync::LazyLock<EcoString> = std::sync::LazyLock::new(|| "_".into());
 			Ok(&PLACEHOLDER)
 		}
@@ -1107,8 +1052,6 @@ struct StableBodyLowerer<'a, C> {
 	context: &'a C,
 	artifact: &'a RuntimeDefinition,
 	annotations: &'a crate::RuntimeAnnotations,
-	node_ids: HashMap<nymph_ast::NodeId, crate::BodyNodeId>,
-	pattern_ids: HashMap<nymph_ast::Span, crate::PatternNodeId>,
 	scopes: RefCell<Vec<HashMap<EcoString, EcoString>>>,
 	counters: RefCell<HashMap<EcoString, u32>>,
 	demands: RefCell<&'a mut StableDemandSet>,
@@ -1164,10 +1107,10 @@ fn js_reserved_word(name: &str) -> bool {
 	)
 }
 impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
-	fn id(&self, expr: &Expr) -> crate::BodyNodeId {
-		self.node_ids[&expr.id]
+	fn id(&self, expr: &StableExpr) -> crate::BodyNodeId {
+		expr.id
 	}
-	fn unsupported(&self, expr: &Expr, feature: &str) -> StableLoweringError {
+	fn unsupported(&self, expr: &StableExpr, feature: &str) -> StableLoweringError {
 		StableLoweringError::Unsupported {
 			definition: self.artifact.definition.clone(),
 			node: Some(self.id(expr)),
@@ -1207,7 +1150,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.find_map(|scope| scope.get(name).cloned())
 			.unwrap_or_else(|| name.clone())
 	}
-	fn target(&self, expr: &Expr) -> Option<&DefinitionId> {
+	fn target(&self, expr: &StableExpr) -> Option<&DefinitionId> {
 		let id = self.id(expr);
 		self
 			.annotations
@@ -1218,7 +1161,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 	}
 	fn external_marshal(
 		&self,
-		expr: &Expr,
+		expr: &StableExpr,
 	) -> Result<nymph_hir::hir::MarshalKind, StableLoweringError> {
 		let node = self.id(expr);
 		self
@@ -1233,7 +1176,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				channel: "external marshal".into(),
 			})
 	}
-	fn ty(&self, expr: &Expr) -> Result<InterfaceType, StableLoweringError> {
+	fn ty(&self, expr: &StableExpr) -> Result<InterfaceType, StableLoweringError> {
 		let node = self.id(expr);
 		let ty = self
 			.annotations
@@ -1251,7 +1194,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			|self_type| substitute_self_type(ty, self_type),
 		))
 	}
-	fn dispatch(&self, expr: &Expr) -> Result<&crate::StableDispatch, StableLoweringError> {
+	fn dispatch(&self, expr: &StableExpr) -> Result<&crate::StableDispatch, StableLoweringError> {
 		let node = self.id(expr);
 		self
 			.annotations
@@ -1265,7 +1208,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				channel: "dispatch".into(),
 			})
 	}
-	fn variant(&self, expr: &Expr) -> Option<&crate::ExpressionVariant> {
+	fn variant(&self, expr: &StableExpr) -> Option<&crate::ExpressionVariant> {
 		self
 			.annotations
 			.variants
@@ -1273,14 +1216,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.find(|(id, _)| *id == self.id(expr))
 			.map(|(_, variant)| variant)
 	}
-	fn lower_function_body(&self, expr: &Expr) -> Result<HirExpr, StableLoweringError> {
-		if let ExprKind::Block { body, .. } = &expr.kind {
+	fn lower_function_body(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
+		if let StableExprKind::Block { body, .. } = &expr.kind {
 			self.lower_block(body, false)
 		} else {
 			self.lower(expr)
 		}
 	}
-	fn lower(&self, expr: &Expr) -> Result<HirExpr, StableLoweringError> {
+	fn lower(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
 		if let Some((_, arity)) = self
 			.annotations
 			.anonymous_closures
@@ -1300,31 +1243,31 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		}
 		self.lower_inner(expr)
 	}
-	fn lower_inner(&self, expr: &Expr) -> Result<HirExpr, StableLoweringError> {
+	fn lower_inner(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
 		Ok(match &expr.kind {
-			ExprKind::Int(value) => HirExpr::Num(value.0 as f64, NumKind::Int),
-			ExprKind::UInt(value) => HirExpr::Num(value.0 as f64, NumKind::UInt),
-			ExprKind::Float(value) => HirExpr::Num(value.0.into_inner(), NumKind::Float),
-			ExprKind::Boolean(value) => HirExpr::Bool(value.0),
-			ExprKind::Char(value) => HirExpr::Char(value.0),
-			ExprKind::String(parts)
+			StableExprKind::Int(value) => HirExpr::Num(*value as f64, NumKind::Int),
+			StableExprKind::UInt(value) => HirExpr::Num(*value as f64, NumKind::UInt),
+			StableExprKind::Float(value) => HirExpr::Num(value.into_inner(), NumKind::Float),
+			StableExprKind::Boolean(value) => HirExpr::Bool(*value),
+			StableExprKind::Char(value) => HirExpr::Char(*value),
+			StableExprKind::String(parts)
 				if parts
 					.iter()
-					.all(|part| !matches!(part.0, StringPart::InterpolatedExpr(_))) =>
+					.all(|part| !matches!(part, StableStringPart::Expr(_))) =>
 			{
 				HirExpr::Str(
 					parts
 						.iter()
-						.map(|part| match &part.0 {
-							StringPart::Text(text) => text.to_string(),
-							StringPart::EscapeSequence(escape) => cooked_escape(*escape),
+						.map(|part| match part {
+							StableStringPart::Text(text) => text.to_string(),
+							StableStringPart::Escape(escape) => cooked_escape(*escape),
 							_ => unreachable!(),
 						})
 						.collect::<String>()
 						.into(),
 				)
 			}
-			ExprKind::Identifier(name) => {
+			StableExprKind::Identifier(name) => {
 				if let Some(variant) = self.variant(expr) {
 					self.demand_external(&variant.enum_definition)?;
 					return Ok(HirExpr::VariantRef {
@@ -1381,35 +1324,35 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					}
 					HirExpr::Local(emitted.as_str().into())
 				} else {
-					HirExpr::Local(self.resolve(&name.0))
+					HirExpr::Local(self.resolve(&name))
 				}
 			}
-			ExprKind::AnonymousParam(index) => {
+			StableExprKind::AnonymousParam(index) => {
 				HirExpr::Local(self.resolve(&crate::anon_closure::anon_param_name(index.unwrap_or(0))))
 			}
-			ExprKind::This => self
+			StableExprKind::This => self
 				.receiver_binding
 				.clone()
 				.map(HirExpr::Local)
 				.unwrap_or(HirExpr::This),
-			ExprKind::Grouped(inner) => self.lower(inner)?,
-			ExprKind::List(items) | ExprKind::Tuple(items) => {
-				let kind = if matches!(expr.kind, ExprKind::List(_)) {
+			StableExprKind::Grouped(inner) => self.lower(inner)?,
+			StableExprKind::List(items) | StableExprKind::Tuple(items) => {
+				let kind = if matches!(expr.kind, StableExprKind::List(_)) {
 					HirArrayKind::List
 				} else {
 					HirArrayKind::Tuple
 				};
 				if items
 					.iter()
-					.any(|item| matches!(item.0, ListItem::Spread(_)))
+					.any(|item| matches!(*item, StableListItem::Spread(_)))
 				{
 					return Ok(HirExpr::ArraySpread {
 						kind,
 						elems: items
 							.iter()
-							.map(|item| match &item.0 {
-								ListItem::Expr(value) => self.lower(value).map(HirArrayElem::Item),
-								ListItem::Spread(value) => self.lower_spread(value).map(HirArrayElem::Spread),
+							.map(|item| match item {
+								StableListItem::Expr(value) => self.lower(value).map(HirArrayElem::Item),
+								StableListItem::Spread(value) => self.lower_spread(value).map(HirArrayElem::Spread),
 							})
 							.collect::<Result<_, _>>()?,
 					});
@@ -1418,26 +1361,26 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					kind,
 					items: items
 						.iter()
-						.map(|item| match &item.0 {
-							ListItem::Expr(item) => self.lower(item),
+						.map(|item| match item {
+							StableListItem::Expr(item) => self.lower(item),
 							_ => unreachable!(),
 						})
 						.collect::<Result<_, _>>()?,
 				}
 			}
-			ExprKind::Map(entries) => {
+			StableExprKind::Map(entries) => {
 				if entries
 					.iter()
-					.any(|entry| matches!(entry.0, MapEntry::Spread(_)))
+					.any(|entry| matches!(*entry, StableMapEntry::Spread(_)))
 				{
 					return Ok(HirExpr::MapSpread(
 						entries
 							.iter()
-							.map(|entry| match &entry.0 {
-								MapEntry::Entry(key, value) => {
+							.map(|entry| match entry {
+								StableMapEntry::Entry(key, value) => {
 									Ok(HirMapElem::Entry(self.lower(key)?, self.lower(value)?))
 								}
-								MapEntry::Spread(value) => self.lower_spread(value).map(HirMapElem::Spread),
+								StableMapEntry::Spread(value) => self.lower_spread(value).map(HirMapElem::Spread),
 							})
 							.collect::<Result<_, StableLoweringError>>()?,
 					));
@@ -1445,14 +1388,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				HirExpr::MapLit(
 					entries
 						.iter()
-						.map(|entry| match &entry.0 {
-							MapEntry::Entry(key, value) => Ok((self.lower(key)?, self.lower(value)?)),
+						.map(|entry| match entry {
+							StableMapEntry::Entry(key, value) => Ok((self.lower(key)?, self.lower(value)?)),
 							_ => unreachable!(),
 						})
 						.collect::<Result<_, StableLoweringError>>()?,
 				)
 			}
-			ExprKind::MemberAccess {
+			StableExprKind::MemberAccess {
 				parent,
 				member,
 				optional: _,
@@ -1524,16 +1467,11 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					name: if let Some(target) = self.target(expr) {
 						self.context.member_name(target)?.as_str().into()
 					} else {
-						member.0.clone()
+						member.clone()
 					},
 				}
 			}
-			ExprKind::Call {
-				func,
-				generics,
-				args,
-			} => {
-				let _ = generics;
+			StableExprKind::Call { func, args } => {
 				if let Some(variant) = self.variant(expr) {
 					self.demand_external(&variant.enum_definition)?;
 					let fields = args
@@ -1541,10 +1479,9 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						.enumerate()
 						.map(|(index, arg)| {
 							let field = arg
-								.0
 								.name
 								.as_ref()
-								.map(|name| name.0.clone())
+								.map(|name| name.clone())
 								.or_else(|| variant.fields.get(index).map(|field| field.name.clone()))
 								.ok_or_else(|| {
 									invalid(
@@ -1552,7 +1489,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 										"variant positional argument has no exact field",
 									)
 								})?;
-							Ok((field, self.lower(&arg.0.value)?))
+							Ok((field, self.lower(&arg.value)?))
 						})
 						.collect::<Result<_, StableLoweringError>>()?;
 					return Ok(HirExpr::VariantNew {
@@ -1587,10 +1524,9 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							.enumerate()
 							.map(|(index, argument)| {
 								let field = argument
-									.0
 									.name
 									.as_ref()
-									.and_then(|name| shell.fields.iter().find(|field| field.name == name.0))
+									.and_then(|name| shell.fields.iter().find(|field| field.name == *name))
 									.or_else(|| shell.fields.get(index))
 									.ok_or_else(|| {
 										invalid(
@@ -1598,7 +1534,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 											"struct argument has no exact field",
 										)
 									})?;
-								Ok((field.id.clone(), self.lower(&argument.0.value)?))
+								Ok((field.id.clone(), self.lower(&argument.value)?))
 							})
 							.collect::<Result<Vec<_>, StableLoweringError>>()?;
 						let fields = shell
@@ -1617,7 +1553,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						});
 					}
 				}
-				if let ExprKind::MemberAccess { parent, .. } = &func.kind
+				if let StableExprKind::MemberAccess { parent, .. } = &func.kind
 					&& let Some((_, dispatch)) = self
 						.annotations
 						.dispatches
@@ -1627,7 +1563,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					return self.lower_dispatch(
 						dispatch,
 						parent,
-						args.iter().map(|arg| &arg.0.value).collect(),
+						args.iter().map(|arg| &arg.value).collect(),
 					);
 				}
 				if self
@@ -1648,7 +1584,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							symbol,
 							args: args
 								.iter()
-								.map(|arg| self.lower(&arg.0.value))
+								.map(|arg| self.lower(&arg.value))
 								.collect::<Result<_, _>>()?,
 						});
 					}
@@ -1657,11 +1593,11 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					callee: Box::new(self.lower(func)?),
 					args: args
 						.iter()
-						.map(|arg| self.lower(&arg.0.value))
+						.map(|arg| self.lower(&arg.value))
 						.collect::<Result<_, _>>()?,
 				}
 			}
-			ExprKind::BinaryOp { lhs, op, rhs } => {
+			StableExprKind::BinaryOp { lhs, op, rhs } => {
 				if *op == BinaryOperator::Pipe {
 					return Ok(HirExpr::Call {
 						callee: Box::new(self.lower(rhs)?),
@@ -1696,7 +1632,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					rhs: Box::new(self.lower(rhs)?),
 				}
 			}
-			ExprKind::PrefixOp { op, value } => {
+			StableExprKind::PrefixOp { op, value } => {
 				let dispatch = self.dispatch(expr)?;
 				if !matches!(dispatch, crate::StableDispatch::Builtin { .. }) {
 					return self.lower_dispatch(dispatch, value, vec![]);
@@ -1715,7 +1651,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					operand: Box::new(self.lower(value)?),
 				}
 			}
-			ExprKind::AssignOp {
+			StableExprKind::AssignOp {
 				lhs,
 				op: AssignOperator::Assign,
 				rhs,
@@ -1723,7 +1659,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				target: Box::new(self.lower(lhs)?),
 				value: Box::new(self.lower(rhs)?),
 			},
-			ExprKind::AssignOp { lhs, op, rhs } => {
+			StableExprKind::AssignOp { lhs, op, rhs } => {
 				let binary =
 					assign_binop(*op).ok_or_else(|| self.unsupported(expr, "assignment operator"))?;
 				let value = match self.dispatch(expr)? {
@@ -1740,8 +1676,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					value: Box::new(value),
 				}
 			}
-			ExprKind::Block { body, .. } => self.lower_block(body, true)?,
-			ExprKind::If {
+			StableExprKind::Block { body, .. } => self.lower_block(body, true)?,
+			StableExprKind::If {
 				condition,
 				then,
 				otherwise,
@@ -1753,7 +1689,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.map(|value| self.lower(value).map(Box::new))
 					.transpose()?,
 			},
-			ExprKind::While {
+			StableExprKind::While {
 				condition,
 				body,
 				label: None,
@@ -1761,11 +1697,11 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				cond: Box::new(self.lower(condition)?),
 				body: Box::new(self.lower(body)?),
 			},
-			ExprKind::Closure { params, body, .. } => {
+			StableExprKind::Closure { params, body, .. } => {
 				self.scopes.borrow_mut().push(HashMap::new());
 				let params = params
 					.iter()
-					.map(|param| pattern_name(&param.0.name).map(|name| self.declare(name)))
+					.map(|param| pattern_name(&param.pattern).map(|name| self.declare(name)))
 					.collect::<Result<_, _>>()?;
 				let body = self.lower_function_body(body)?;
 				self.scopes.borrow_mut().pop();
@@ -1774,14 +1710,16 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					body: Box::new(body),
 				}
 			}
-			ExprKind::Return { .. } => {
+			StableExprKind::Return { .. } => {
 				return Err(self.unsupported(expr, "return outside block statement"));
 			}
-			ExprKind::Break { .. } => return Err(self.unsupported(expr, "break (HIR has no jump node)")),
-			ExprKind::Continue { .. } => {
+			StableExprKind::Break { .. } => {
+				return Err(self.unsupported(expr, "break (HIR has no jump node)"));
+			}
+			StableExprKind::Continue { .. } => {
 				return Err(self.unsupported(expr, "continue (HIR has no jump node)"));
 			}
-			ExprKind::IndexAccess { parent, index, .. } => match peel_mut(&self.ty(parent)?) {
+			StableExprKind::IndexAccess { parent, index, .. } => match peel_mut(&self.ty(parent)?) {
 				InterfaceType::Map(..) => HirExpr::MapGet {
 					recv: Box::new(self.lower(parent)?),
 					key: Box::new(self.lower(index)?),
@@ -1792,14 +1730,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				},
 				_ => self.lower_dispatch(self.dispatch(expr)?, parent, vec![index])?,
 			},
-			ExprKind::For {
+			StableExprKind::For {
 				variable,
 				iterable,
 				body,
 				label: None,
 			} => self.lower_for(variable, iterable, body)?,
-			ExprKind::Range(_) => return Err(self.unsupported(expr, "range/protocol")),
-			ExprKind::Match { value, arms } => HirExpr::Match {
+			StableExprKind::Range(_) => return Err(self.unsupported(expr, "range/protocol")),
+			StableExprKind::Match { value, arms } => HirExpr::Match {
 				scrutinee: Box::new(self.lower(value)?),
 				arms: arms
 					.iter()
@@ -1819,7 +1757,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					})
 					.collect::<Result<_, StableLoweringError>>()?,
 			},
-			ExprKind::PatternOp { lhs, op, rhs } => {
+			StableExprKind::PatternOp { lhs, op, rhs } => {
 				let pat = self.lower_pattern(rhs)?;
 				let (yes, no) = if *op == PatternOperator::Is {
 					(true, false)
@@ -1842,23 +1780,23 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					],
 				}
 			}
-			ExprKind::PostfixOp { value, .. } => {
+			StableExprKind::PostfixOp { value, .. } => {
 				self.lower_dispatch(self.dispatch(expr)?, value, vec![])?
 			}
-			ExprKind::TypeOp { lhs, .. } => match self.dispatch(expr)? {
+			StableExprKind::TypeOp { lhs, .. } => match self.dispatch(expr)? {
 				crate::StableDispatch::Builtin { .. } => self.lower_cast(expr, lhs)?,
 				dispatch => self.lower_dispatch(dispatch, lhs, vec![])?,
 			},
-			ExprKind::String(parts) => self.lower_string(parts)?,
-			ExprKind::While { .. } => return Err(self.unsupported(expr, "labeled while")),
-			ExprKind::For { .. } => return Err(self.unsupported(expr, "labeled for")),
+			StableExprKind::String(parts) => self.lower_string(parts)?,
+			StableExprKind::While { .. } => return Err(self.unsupported(expr, "labeled while")),
+			StableExprKind::For { .. } => return Err(self.unsupported(expr, "labeled for")),
 		})
 	}
 	fn lower_dispatch(
 		&self,
 		dispatch: &crate::StableDispatch,
-		receiver: &Expr,
-		arguments: Vec<&Expr>,
+		receiver: &StableExpr,
+		arguments: Vec<&StableExpr>,
 	) -> Result<HirExpr, StableLoweringError> {
 		if let crate::StableDispatch::GenericBound { interface, member } = dispatch {
 			if self
@@ -2099,8 +2037,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		&self,
 		interface: &DefinitionId,
 		member: &DefinitionId,
-		receiver: &Expr,
-		arguments: Vec<&Expr>,
+		receiver: &StableExpr,
+		arguments: Vec<&StableExpr>,
 	) -> Result<HirExpr, StableLoweringError> {
 		let interface_request = StableShapeRequest::InterfaceShell(interface.clone());
 		let StableShapeFact::InterfaceShell(interface_shape) =
@@ -2292,7 +2230,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			cases,
 		})
 	}
-	fn lower_spread(&self, value: &Expr) -> Result<HirExpr, StableLoweringError> {
+	fn lower_spread(&self, value: &StableExpr) -> Result<HirExpr, StableLoweringError> {
 		match self.ty(value)? {
 			InterfaceType::List(_) | InterfaceType::Tuple(_) => Ok(HirExpr::Field {
 				recv: Box::new(self.lower(value)?),
@@ -2323,18 +2261,15 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			}
 		}
 	}
-	fn lower_string(
-		&self,
-		parts: &[nymph_ast::Spanned<StringPart>],
-	) -> Result<HirExpr, StableLoweringError> {
+	fn lower_string(&self, parts: &[StableStringPart]) -> Result<HirExpr, StableLoweringError> {
 		let mut result = vec![];
 		let mut text = EcoString::new();
 		let mut interpolated = false;
 		for part in parts {
-			match &part.0 {
-				StringPart::Text(value) => text.push_str(value),
-				StringPart::EscapeSequence(value) => text.push_str(&cooked_escape(*value)),
-				StringPart::InterpolatedExpr(value) => {
+			match part {
+				StableStringPart::Text(value) => text.push_str(value),
+				StableStringPart::Escape(value) => text.push_str(&cooked_escape(*value)),
+				StableStringPart::Expr(value) => {
 					interpolated = true;
 					if !text.is_empty() {
 						result.push(HirExpr::Str(std::mem::take(&mut text)));
@@ -2355,7 +2290,11 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		}
 		Ok(HirExpr::InterpolatedString(result))
 	}
-	fn lower_cast(&self, expr: &Expr, lhs: &Expr) -> Result<HirExpr, StableLoweringError> {
+	fn lower_cast(
+		&self,
+		expr: &StableExpr,
+		lhs: &StableExpr,
+	) -> Result<HirExpr, StableLoweringError> {
 		let source_type = self.ty(lhs)?;
 		let target_type = self.ty(expr)?;
 		let source = peel_mut(&source_type);
@@ -2388,11 +2327,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			operand: Box::new(operand),
 		}))
 	}
-	fn lower_pattern(
-		&self,
-		pattern: &nymph_ast::Spanned<Pattern>,
-	) -> Result<HirPat, StableLoweringError> {
-		let id = self.pattern_ids.get(&pattern.1).copied();
+	fn lower_pattern(&self, pattern: &StablePattern) -> Result<HirPat, StableLoweringError> {
+		let id = Some(pattern.id);
 		let variant = id.and_then(|id| {
 			self
 				.annotations
@@ -2401,23 +2337,23 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				.find(|(found, _)| *found == id)
 				.map(|(_, value)| value)
 		});
-		Ok(match &pattern.0 {
-			Pattern::Placeholder => HirPat::Wildcard,
-			Pattern::Int(v) => HirPat::Lit(HirLit::Num(v.0 as f64, NumKind::Int)),
-			Pattern::UInt(v) => HirPat::Lit(HirLit::Num(v.0 as f64, NumKind::UInt)),
-			Pattern::Float(v) => HirPat::Lit(HirLit::Num(v.0.into_inner(), NumKind::Float)),
-			Pattern::Boolean(v) => HirPat::Lit(HirLit::Bool(v.0)),
-			Pattern::Char(v) => HirPat::Lit(HirLit::Char(v.0)),
-			Pattern::String(parts) => HirPat::Lit(HirLit::Str(string_pattern(parts))),
-			Pattern::Grouped(inner) => self.lower_pattern(inner)?,
-			Pattern::Binding { name, inner } if variant.is_none() => HirPat::Binding {
-				name: self.declare(&name.0),
-				sub: (!matches!(inner.0, Pattern::Placeholder))
+		Ok(match &pattern.kind {
+			StablePatternKind::Placeholder => HirPat::Wildcard,
+			StablePatternKind::Int(v) => HirPat::Lit(HirLit::Num(*v as f64, NumKind::Int)),
+			StablePatternKind::UInt(v) => HirPat::Lit(HirLit::Num(*v as f64, NumKind::UInt)),
+			StablePatternKind::Float(v) => HirPat::Lit(HirLit::Num(v.into_inner(), NumKind::Float)),
+			StablePatternKind::Boolean(v) => HirPat::Lit(HirLit::Bool(*v)),
+			StablePatternKind::Char(v) => HirPat::Lit(HirLit::Char(*v)),
+			StablePatternKind::String(parts) => HirPat::Lit(HirLit::Str(string_pattern(parts))),
+			StablePatternKind::Grouped(inner) => self.lower_pattern(inner)?,
+			StablePatternKind::Binding { name, inner } if variant.is_none() => HirPat::Binding {
+				name: self.declare(&name),
+				sub: (!matches!(inner.kind, StablePatternKind::Placeholder))
 					.then(|| self.lower_pattern(inner).map(Box::new))
 					.transpose()?,
 			},
-			Pattern::Binding { .. } => self.variant_pattern(variant.unwrap(), vec![])?,
-			Pattern::Struct { fields, .. } => {
+			StablePatternKind::Binding { .. } => self.variant_pattern(variant.unwrap(), vec![])?,
+			StablePatternKind::Struct { fields, .. } => {
 				let fields = self.lower_struct_pattern_fields(fields)?;
 				if let Some(variant) = variant {
 					self.variant_pattern(variant, fields)?
@@ -2425,11 +2361,11 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					HirPat::Struct { fields }
 				}
 			}
-			Pattern::Tuple(items) => HirPat::Tuple(
+			StablePatternKind::Tuple(items) => HirPat::Tuple(
 				items
 					.iter()
 					.filter_map(|item| {
-						if let ListPatternEntry::Item(value) = &item.0 {
+						if let StableListPatternEntry::Item(value) = item {
 							Some(self.lower_pattern(value))
 						} else {
 							None
@@ -2437,21 +2373,21 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					})
 					.collect::<Result<_, _>>()?,
 			),
-			Pattern::List(items) => {
+			StablePatternKind::List(items) => {
 				let mut prefix = vec![];
 				let mut suffix = vec![];
 				let mut rest = None;
-				for item in items {
-					match &item.0 {
-						ListPatternEntry::Item(value) => {
+				for item in items.iter() {
+					match item {
+						StableListPatternEntry::Item(value) => {
 							if rest.is_none() {
 								prefix.push(self.lower_pattern(value)?)
 							} else {
 								suffix.push(self.lower_pattern(value)?)
 							}
 						}
-						ListPatternEntry::Rest(name) => {
-							rest = Some(name.as_ref().map(|name| self.declare(&name.0)))
+						StableListPatternEntry::Rest(name) => {
+							rest = Some(name.as_ref().map(|name| self.declare(&name)))
 						}
 					}
 				}
@@ -2462,23 +2398,23 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					suffix,
 				}
 			}
-			Pattern::Map(items) => {
+			StablePatternKind::Map(items) => {
 				let mut entries = vec![];
 				let mut rest = None;
-				for item in items {
-					match &item.0 {
-						MapPatternEntry::Entry(key, value) => {
+				for item in items.iter() {
+					match item {
+						StableMapPatternEntry::Entry(key, value) => {
 							entries.push((literal_pattern(key)?, self.lower_pattern(value)?))
 						}
-						MapPatternEntry::Rest(name) => {
-							rest = Some(name.as_ref().map(|name| self.declare(&name.0)))
+						StableMapPatternEntry::Rest(name) => {
+							rest = Some(name.as_ref().map(|name| self.declare(&name)))
 						}
 					}
 				}
 				HirPat::Map { entries, rest }
 			}
-			Pattern::Range(range) => HirPat::Range(range_pattern(range)?),
-			Pattern::Union(left, right) => HirPat::Or(
+			StablePatternKind::Range(range) => HirPat::Range(range_pattern(range)?),
+			StablePatternKind::Union(left, right) => HirPat::Or(
 				Box::new(self.lower_pattern(left)?),
 				Box::new(self.lower_pattern(right)?),
 			),
@@ -2486,28 +2422,36 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 	}
 	fn lower_struct_pattern_fields(
 		&self,
-		fields: &[nymph_ast::Spanned<StructPatternField>],
+		fields: &[StableStructPatternField],
 	) -> Result<Vec<(EcoString, HirPat)>, StableLoweringError> {
 		let mut result = vec![];
 		for field in fields {
-			match &field.0 {
-				StructPatternField::Value { name, value } => {
-					result.push((name.0.clone(), self.lower_pattern(value)?))
+			match field {
+				StableStructPatternField::Value { name, value } => {
+					result.push((name.clone(), self.lower_pattern(value)?))
 				}
-				StructPatternField::Named(name) => result.push((
-					name.0.clone(),
-					HirPat::Binding {
-						name: self.declare(&name.0),
-						sub: None,
-					},
-				)),
-				StructPatternField::Positional(value) => {
-					let pid = self.pattern_ids.get(&field.1).ok_or_else(|| {
-						invalid(
-							&self.artifact.definition,
-							"missing positional pattern identity",
-						)
-					})?;
+				StableStructPatternField::Named { id, name } => {
+					let pattern = self
+						.annotations
+						.pattern_variants
+						.iter()
+						.find(|(found, _)| found == id)
+						.map(|(_, variant)| self.variant_pattern(variant, vec![]))
+						.transpose()?
+						.unwrap_or_else(|| HirPat::Binding {
+							name: self.declare(name),
+							sub: None,
+						});
+					let exact = self
+						.annotations
+						.positional_fields
+						.iter()
+						.find(|(found, _)| found == id)
+						.map(|(_, field)| field.name.clone())
+						.unwrap_or_else(|| name.clone());
+					result.push((exact, pattern));
+				}
+				StableStructPatternField::Positional { id: pid, pattern } => {
 					let exact = self
 						.annotations
 						.positional_fields
@@ -2521,9 +2465,9 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						.1
 						.name
 						.clone();
-					result.push((exact, self.lower_pattern(value)?));
+					result.push((exact, self.lower_pattern(pattern)?));
 				}
-				StructPatternField::Rest => {}
+				StableStructPatternField::Rest => {}
 			}
 		}
 		Ok(result)
@@ -2564,16 +2508,16 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 	}
 	fn lower_for(
 		&self,
-		variable: &nymph_ast::Spanned<Pattern>,
-		iterable: &Expr,
-		body: &Expr,
+		variable: &StablePattern,
+		iterable: &StableExpr,
+		body: &StableExpr,
 	) -> Result<HirExpr, StableLoweringError> {
 		let native_range = matches!(
 			iterable.kind,
-			ExprKind::Range(RangeKind::Exclusive { .. } | RangeKind::Inclusive { .. })
+			StableExprKind::Range(StableRange::Exclusive { .. } | StableRange::Inclusive { .. })
 		);
-		let source = if let ExprKind::Range(
-			RangeKind::Exclusive { min, max } | RangeKind::Inclusive { min, max },
+		let source = if let StableExprKind::Range(
+			StableRange::Exclusive { min, max } | StableRange::Inclusive { min, max },
 		) = &iterable.kind
 		{
 			HirExpr::New {
@@ -2585,7 +2529,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						"inclusive".into(),
 						HirExpr::Bool(matches!(
 							iterable.kind,
-							ExprKind::Range(RangeKind::Inclusive { .. })
+							StableExprKind::Range(StableRange::Inclusive { .. })
 						)),
 					),
 				],
@@ -2872,7 +2816,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 	}
 	fn lower_block(
 		&self,
-		body: &[nymph_ast::Spanned<Statement>],
+		body: &[StableStatement],
 		new_scope: bool,
 	) -> Result<HirExpr, StableLoweringError> {
 		if new_scope {
@@ -2882,26 +2826,30 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		let mut tail = None;
 		for (index, statement) in body.iter().enumerate() {
 			let last = index + 1 == body.len();
-			match &statement.0 {
-				Statement::Let { meta, value } => {
+			match statement {
+				StableStatement::Let {
+					pattern,
+					mutable,
+					value,
+				} => {
 					let value = self.lower(value)?;
-					let name = self.declare(pattern_name(&meta.name)?);
+					let name = self.declare(pattern_name(pattern)?);
 					stmts.push(HirStmt::Let {
 						name,
-						mutable: meta.kind == LetKind::Mut,
+						mutable: *mutable,
 						value,
 					});
 				}
-				Statement::Expr(expr) if matches!(expr.kind, ExprKind::Return { .. }) => {
-					let ExprKind::Return { value, label: None } = &expr.kind else {
+				StableStatement::Expr(expr) if matches!(expr.kind, StableExprKind::Return { .. }) => {
+					let StableExprKind::Return { value, label: None } = &expr.kind else {
 						return Err(self.unsupported(expr, "labeled return"));
 					};
 					stmts.push(HirStmt::Return(
 						value.as_ref().map(|value| self.lower(value)).transpose()?,
 					));
 				}
-				Statement::Expr(expr) if last => tail = Some(Box::new(self.lower(expr)?)),
-				Statement::Expr(expr) => stmts.push(HirStmt::Expr(self.lower(expr)?)),
+				StableStatement::Expr(expr) if last => tail = Some(Box::new(self.lower(expr)?)),
+				StableStatement::Expr(expr) => stmts.push(HirStmt::Expr(self.lower(expr)?)),
 			}
 		}
 		if new_scope {
@@ -3055,26 +3003,24 @@ fn peel_mut(ty: &InterfaceType) -> &InterfaceType {
 		ty
 	}
 }
-fn string_pattern(parts: &[nymph_ast::Spanned<nymph_ast::expr::StringPatternPart>]) -> EcoString {
+fn string_pattern(parts: &[StableStringPatternPart]) -> EcoString {
 	let mut result = EcoString::new();
 	for part in parts {
-		match &part.0 {
-			nymph_ast::expr::StringPatternPart::Text(text) => result.push_str(text),
-			nymph_ast::expr::StringPatternPart::EscapeSequence(escape) => {
-				result.push_str(&cooked_escape(*escape))
-			}
+		match part {
+			StableStringPatternPart::Text(text) => result.push_str(text),
+			StableStringPatternPart::Escape(escape) => result.push_str(&cooked_escape(*escape)),
 		}
 	}
 	result
 }
-fn literal_pattern(pattern: &nymph_ast::Spanned<Pattern>) -> Result<HirLit, StableLoweringError> {
-	Ok(match &pattern.0 {
-		Pattern::Int(v) => HirLit::Num(v.0 as f64, NumKind::Int),
-		Pattern::UInt(v) => HirLit::Num(v.0 as f64, NumKind::UInt),
-		Pattern::Float(v) => HirLit::Num(v.0.into_inner(), NumKind::Float),
-		Pattern::Boolean(v) => HirLit::Bool(v.0),
-		Pattern::Char(v) => HirLit::Char(v.0),
-		Pattern::String(parts) => HirLit::Str(string_pattern(parts)),
+fn literal_pattern(pattern: &StablePattern) -> Result<HirLit, StableLoweringError> {
+	Ok(match &pattern.kind {
+		StablePatternKind::Int(v) => HirLit::Num(*v as f64, NumKind::Int),
+		StablePatternKind::UInt(v) => HirLit::Num(*v as f64, NumKind::UInt),
+		StablePatternKind::Float(v) => HirLit::Num(v.into_inner(), NumKind::Float),
+		StablePatternKind::Boolean(v) => HirLit::Bool(*v),
+		StablePatternKind::Char(v) => HirLit::Char(*v),
+		StablePatternKind::String(parts) => HirLit::Str(string_pattern(parts)),
 		_ => {
 			return Err(StableLoweringError::Unsupported {
 				definition: dummy_id(),
@@ -3084,234 +3030,18 @@ fn literal_pattern(pattern: &nymph_ast::Spanned<Pattern>) -> Result<HirLit, Stab
 		}
 	})
 }
-fn range_pattern(range: &RangePatternKind) -> Result<HirRange, StableLoweringError> {
+fn range_pattern(range: &StablePatternRange) -> Result<HirRange, StableLoweringError> {
 	Ok(match range {
-		RangePatternKind::From(value) => HirRange::From(literal_pattern(value)?),
-		RangePatternKind::To(value) => HirRange::To(literal_pattern(value)?),
-		RangePatternKind::ToInclusive(value) => HirRange::ToInclusive(literal_pattern(value)?),
-		RangePatternKind::Exclusive { min, max } => HirRange::Exclusive {
+		StablePatternRange::From(value) => HirRange::From(literal_pattern(value)?),
+		StablePatternRange::To(value) => HirRange::To(literal_pattern(value)?),
+		StablePatternRange::ToInclusive(value) => HirRange::ToInclusive(literal_pattern(value)?),
+		StablePatternRange::Exclusive { min, max } => HirRange::Exclusive {
 			min: literal_pattern(min)?,
 			max: literal_pattern(max)?,
 		},
-		RangePatternKind::Inclusive { min, max } => HirRange::Inclusive {
+		StablePatternRange::Inclusive { min, max } => HirRange::Inclusive {
 			min: literal_pattern(min)?,
 			max: literal_pattern(max)?,
 		},
 	})
-}
-
-fn walk_body_patterns<'a>(expr: &'a Expr, out: &mut Vec<&'a nymph_ast::Spanned<Pattern>>) {
-	match &expr.kind {
-		ExprKind::Closure { params, .. } => {
-			for param in params {
-				walk_pattern(&param.0.name, out)
-			}
-		}
-		ExprKind::For { variable, .. } => walk_pattern(variable, out),
-		ExprKind::Match { arms, .. } => {
-			for arm in arms {
-				walk_pattern(&arm.pattern, out)
-			}
-		}
-		ExprKind::PatternOp { rhs, .. } => walk_pattern(rhs, out),
-		ExprKind::Block { body, .. } => {
-			for statement in body {
-				if let Statement::Let { meta, .. } = &statement.0 {
-					walk_pattern(&meta.name, out)
-				}
-			}
-		}
-		_ => {}
-	}
-	let mut expressions = vec![];
-	walk(expr, &mut expressions);
-	for child in expressions.into_iter().skip(1) {
-		match &child.kind {
-			ExprKind::Closure { params, .. } => {
-				for param in params {
-					walk_pattern(&param.0.name, out)
-				}
-			}
-			ExprKind::For { variable, .. } => walk_pattern(variable, out),
-			ExprKind::Match { arms, .. } => {
-				for arm in arms {
-					walk_pattern(&arm.pattern, out)
-				}
-			}
-			ExprKind::PatternOp { rhs, .. } => walk_pattern(rhs, out),
-			ExprKind::Block { body, .. } => {
-				for statement in body {
-					if let Statement::Let { meta, .. } = &statement.0 {
-						walk_pattern(&meta.name, out)
-					}
-				}
-			}
-			_ => {}
-		}
-	}
-}
-fn walk_pattern<'a>(
-	pattern: &'a nymph_ast::Spanned<Pattern>,
-	out: &mut Vec<&'a nymph_ast::Spanned<Pattern>>,
-) {
-	out.push(pattern);
-	match &pattern.0 {
-		Pattern::Binding { inner, .. } | Pattern::Grouped(inner) => walk_pattern(inner, out),
-		Pattern::List(items) | Pattern::Tuple(items) => {
-			for item in items {
-				if let ListPatternEntry::Item(value) = &item.0 {
-					walk_pattern(value, out)
-				}
-			}
-		}
-		Pattern::Map(items) => {
-			for item in items {
-				if let MapPatternEntry::Entry(key, value) = &item.0 {
-					walk_pattern(key, out);
-					walk_pattern(value, out)
-				}
-			}
-		}
-		Pattern::Range(range) => match range {
-			RangePatternKind::From(v) | RangePatternKind::To(v) | RangePatternKind::ToInclusive(v) => {
-				walk_pattern(v, out)
-			}
-			RangePatternKind::Exclusive { min, max } | RangePatternKind::Inclusive { min, max } => {
-				walk_pattern(min, out);
-				walk_pattern(max, out)
-			}
-		},
-		Pattern::Struct { fields, .. } => {
-			for field in fields {
-				match &field.0 {
-					StructPatternField::Value { value, .. } | StructPatternField::Positional(value) => {
-						walk_pattern(value, out)
-					}
-					_ => {}
-				}
-			}
-		}
-		Pattern::Union(a, b) => {
-			walk_pattern(a, out);
-			walk_pattern(b, out)
-		}
-		_ => {}
-	}
-}
-
-fn walk<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
-	out.push(expr);
-	let mut child = |value| walk(value, out);
-	match &expr.kind {
-		ExprKind::String(parts) => {
-			for part in parts {
-				if let StringPart::InterpolatedExpr(value) = &part.0 {
-					child(value);
-				}
-			}
-		}
-		ExprKind::List(items) | ExprKind::Tuple(items) => {
-			for item in items {
-				match &item.0 {
-					ListItem::Expr(value) | ListItem::Spread(value) => child(value),
-				}
-			}
-		}
-		ExprKind::Map(entries) => {
-			for entry in entries {
-				match &entry.0 {
-					MapEntry::Entry(key, value) => {
-						child(key);
-						child(value);
-					}
-					MapEntry::Spread(value) => child(value),
-				}
-			}
-		}
-		ExprKind::Call { func, args, .. } => {
-			child(func);
-			for arg in args {
-				child(&arg.0.value);
-			}
-		}
-		ExprKind::MemberAccess { parent, .. } => child(parent),
-		ExprKind::IndexAccess { parent, index, .. }
-		| ExprKind::BinaryOp {
-			lhs: parent,
-			rhs: index,
-			..
-		}
-		| ExprKind::AssignOp {
-			lhs: parent,
-			rhs: index,
-			..
-		} => {
-			child(parent);
-			child(index);
-		}
-		ExprKind::Closure { body, .. }
-		| ExprKind::PrefixOp { value: body, .. }
-		| ExprKind::PostfixOp { value: body, .. }
-		| ExprKind::Grouped(body)
-		| ExprKind::TypeOp { lhs: body, .. }
-		| ExprKind::PatternOp { lhs: body, .. } => child(body),
-		ExprKind::Return { value, .. } | ExprKind::Break { value, .. } => {
-			if let Some(value) = value {
-				child(value);
-			}
-		}
-		ExprKind::While {
-			condition, body, ..
-		} => {
-			child(condition);
-			child(body);
-		}
-		ExprKind::For { iterable, body, .. } => {
-			child(iterable);
-			child(body);
-		}
-		ExprKind::If {
-			condition,
-			then,
-			otherwise,
-		} => {
-			child(condition);
-			child(then);
-			if let Some(value) = otherwise {
-				child(value);
-			}
-		}
-		ExprKind::Match { value, arms } => {
-			child(value);
-			for arm in arms {
-				if let Some(guard) = &arm.guard {
-					child(guard);
-				}
-				child(&arm.body);
-			}
-		}
-		ExprKind::Block { body, .. } => {
-			for statement in body {
-				match &statement.0 {
-					Statement::Expr(value) | Statement::Let { value, .. } => child(value),
-				}
-			}
-		}
-		ExprKind::Range(range) => match range {
-			RangeKind::From(value) | RangeKind::To(value) | RangeKind::ToInclusive(value) => child(value),
-			RangeKind::Exclusive { min, max } | RangeKind::Inclusive { min, max } => {
-				child(min);
-				child(max);
-			}
-		},
-		ExprKind::Int(_)
-		| ExprKind::UInt(_)
-		| ExprKind::Float(_)
-		| ExprKind::Char(_)
-		| ExprKind::Boolean(_)
-		| ExprKind::Identifier(_)
-		| ExprKind::AnonymousParam(_)
-		| ExprKind::This
-		| ExprKind::Continue { .. } => {}
-	}
 }

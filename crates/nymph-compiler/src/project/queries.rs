@@ -831,7 +831,6 @@ fn ambient_runtime_definition_index<'db>(
 	);
 	let definitions = nymph_sema::runtime_definitions(
 		&analysis.semantic.module,
-		&module.source(db),
 		&analysis.semantic.checked,
 		interface,
 	)
@@ -886,18 +885,17 @@ pub(crate) fn runtime_definition_index<'db>(
 		return Err(super::session::RuntimeDefinitionError::Recovered);
 	};
 	let analysis = interface_module_analysis(db, key, module);
-	let source = match module {
+	match module {
 		SemanticModuleInput::Project(input) => match input.source(db) {
-			Some(source) => source,
+			Some(_) => {}
 			None => return Err(super::session::RuntimeDefinitionError::OwnerNotFound),
 		},
-		SemanticModuleInput::Builtin(input) => input.source(db),
+		SemanticModuleInput::Builtin(_) => {}
 	};
 	#[cfg(feature = "test-support")]
 	db.semantic_query_will_execute("runtime_definition_extraction", module);
 	let definitions = nymph_sema::runtime_definitions(
 		&analysis.semantic.module,
-		&source,
 		&analysis.semantic.checked,
 		interface,
 	)

@@ -182,7 +182,7 @@ pub struct Annotations {
 	/// that sub-pattern's span. A positional field carries no name in the AST, but the
 	/// checker resolves it to the constructor's sole field; lowering reads this back to
 	/// emit the field access, having no type access of its own.
-	positional_fields: FxHashMap<Span, EcoString>,
+	positional_fields: FxHashMap<Span, PositionalFieldResolution>,
 	/// A `for` loop's iterable, keyed by its own `NodeId` — see [`IterMode`].
 	iter_modes: FxHashMap<NodeId, IterMode>,
 	/// Resolution of the implicit `.iter()` call inserted for an iterable source.
@@ -200,6 +200,12 @@ pub struct Annotations {
 	/// The parameter identifier has no runtime binding, so stable lowering must
 	/// reject these rather than emitting an undefined local.
 	generic_namespaced_calls: FxHashSet<NodeId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PositionalFieldResolution {
+	pub name: EcoString,
+	pub definition: Option<DefinitionId>,
 }
 
 impl Annotations {
@@ -373,11 +379,11 @@ impl Annotations {
 		self.pattern_variants.get(&span)
 	}
 
-	pub(crate) fn record_positional_field(&mut self, span: Span, field: EcoString) {
+	pub(crate) fn record_positional_field(&mut self, span: Span, field: PositionalFieldResolution) {
 		self.positional_fields.insert(span, field);
 	}
 
-	pub fn positional_field_of(&self, span: Span) -> Option<&EcoString> {
+	pub fn positional_field_of(&self, span: Span) -> Option<&PositionalFieldResolution> {
 		self.positional_fields.get(&span)
 	}
 

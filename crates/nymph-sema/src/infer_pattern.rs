@@ -368,7 +368,14 @@ impl Checker<'_> {
 				sig
 					.fields
 					.iter()
-					.map(|(n, t)| (n.clone(), self.subst(*t, &subst, None)))
+					.zip(&sig.field_metadata)
+					.map(|((n, t), metadata)| {
+						(
+							n.clone(),
+							self.subst(*t, &subst, None),
+							metadata.target.clone(),
+						)
+					})
 					.collect::<Vec<_>>()
 			}
 			Some(PatternTarget::Variant(enum_def, variant)) => {
@@ -381,7 +388,14 @@ impl Checker<'_> {
 				vsig
 					.fields
 					.iter()
-					.map(|(n, t)| (n.clone(), self.subst(*t, &subst, None)))
+					.zip(&vsig.field_metadata)
+					.map(|((n, t), metadata)| {
+						(
+							n.clone(),
+							self.subst(*t, &subst, None),
+							metadata.target.clone(),
+						)
+					})
 					.collect::<Vec<_>>()
 			}
 			None => return,
@@ -390,8 +404,8 @@ impl Checker<'_> {
 		for field in fields {
 			match &field.0 {
 				StructPatternField::Value { name, value } => {
-					match field_tys.iter().find(|(n, _)| n == &name.0) {
-						Some((_, fty)) => self.pattern(value, *fty, mutable),
+					match field_tys.iter().find(|(n, _, _)| n == &name.0) {
+						Some((_, fty, _)) => self.pattern(value, *fty, mutable),
 						None => self.emit(
 							name.1,
 							TypeError::UnknownField {
@@ -400,8 +414,8 @@ impl Checker<'_> {
 						),
 					}
 				}
-				StructPatternField::Named(name) => match field_tys.iter().find(|(n, _)| n == &name.0) {
-					Some((_, fty)) => self.define_local(name.0.clone(), *fty, mutable),
+				StructPatternField::Named(name) => match field_tys.iter().find(|(n, _, _)| n == &name.0) {
+					Some((_, fty, _)) => self.define_local(name.0.clone(), *fty, mutable),
 					// Not a field of this constructor. On a SINGLE-field constructor a bare
 					// identifier is a positional sub-pattern against that sole field — a plain
 					// binding (`Ok(command)`) or a nullary-variant pattern (`Ok(None)`). Reuse
@@ -410,12 +424,18 @@ impl Checker<'_> {
 					// access. (A multi-field constructor keeps the by-name error — there is no
 					// single field to attach an un-named identifier to.)
 					None if field_tys.len() == 1 => {
-						let (fname, fty) = &field_tys[0];
+						let (fname, fty, target) = &field_tys[0];
 						let (fname, fty) = (fname.clone(), *fty);
 						// Key both this record and the synthesized pattern's own span on the
 						// FIELD's span, which is what lowering looks the field name and any
 						// nullary-variant resolution back up under.
-						self.annotations.record_positional_field(field.1, fname);
+						self.annotations.record_positional_field(
+							field.1,
+							crate::annotate::PositionalFieldResolution {
+								name: fname,
+								definition: target.clone(),
+							},
+						);
 						let synth = Spanned(
 							Pattern::Binding {
 								name: name.clone(),
@@ -437,12 +457,16 @@ impl Checker<'_> {
 				// single field to attach it to); named `field = pattern` is the way to
 				// destructure a multi-field constructor.
 				StructPatternField::Positional(pat) => {
-					if let [(fname, fty)] = field_tys.as_slice() {
+					if let [(fname, fty, target)] = field_tys.as_slice() {
 						// Record which field this positional sub-pattern resolved to, so
 						// lowering (no type access) can emit the field access.
-						self
-							.annotations
-							.record_positional_field(field.1, fname.clone());
+						self.annotations.record_positional_field(
+							field.1,
+							crate::annotate::PositionalFieldResolution {
+								name: fname.clone(),
+								definition: target.clone(),
+							},
+						);
 						self.pattern(pat, *fty, mutable);
 					} else {
 						self.emit(
