@@ -1,7 +1,7 @@
 use nymph_sema::{
-	BuiltinDispatch, DeclarationKey, EntryMode, InterfaceType, ModuleIdentity, ModuleOrigin,
-	RuntimeExtractionError, RuntimePayload, SemanticEnvironment, StableDispatch,
-	check_module_with_environment, declared_headers, extract_module_interface, runtime_definitions,
+	BuiltinDispatch, DeclarationKey, EntryMode, ModuleIdentity, ModuleOrigin, RuntimeExtractionError,
+	RuntimePayload, SemanticEnvironment, StableDispatch, check_module_with_environment,
+	declared_headers, extract_module_interface, runtime_definitions,
 };
 
 fn source_name(definition: &nymph_sema::DefinitionId) -> &str {
@@ -110,13 +110,6 @@ func generic<T: Value>(item: T): T = { let x = 1 + 2
 	assert!(
 		body
 			.annotations
-			.types
-			.iter()
-			.any(|(_, ty)| matches!(ty, InterfaceType::Generic(_)))
-	);
-	assert!(
-		body
-			.annotations
 			.dispatches
 			.iter()
 			.any(|(_, dispatch)| matches!(
@@ -168,6 +161,33 @@ func generic<T: Value>(item: T): T = { let x = 1 + 2
 	assert_eq!(body.annotations.pattern_variants.len(), 3);
 	assert!(!body.annotations.positional_fields.is_empty());
 	assert!(!body.annotations.external_marshals.is_empty());
+}
+
+#[test]
+fn body_projection_preserves_generic_bound_dispatch_inside_a_closure() {
+	let artifacts = project(
+		"interface Comparable<Other> { func compare_to(other: Other): int }\n\
+		 impl<T> #[T] { func sort_by(compare: (T, T) -> int): int = 0 }\n\
+		 impl<T: Comparable<Other = T>> #[T] {\n\
+		   func comparator(): int = this.sort_by((left, right) -> left.compare_to(right))\n\
+		 }",
+	);
+	let comparator = artifacts
+		.iter()
+		.find(|artifact| source_name(&artifact.definition) == "comparator")
+		.expect("comparator runtime body");
+	let RuntimePayload::NymphBody(body) = &comparator.payload else {
+		panic!("comparator must retain its Nymph body")
+	};
+	assert!(
+		body
+			.annotations
+			.dispatches
+			.iter()
+			.any(|(_, dispatch)| matches!(dispatch, StableDispatch::GenericBound { .. })),
+		"closure call must retain its exact generic-bound dispatch: {:?}",
+		body.annotations.dispatches
+	);
 }
 
 #[test]

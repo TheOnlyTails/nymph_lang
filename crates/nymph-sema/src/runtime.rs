@@ -13,6 +13,7 @@ use nymph_ast::{
 		Expr, ExprKind, ListItem, ListPatternEntry, MapEntry, MapPatternEntry, Pattern, RangeKind,
 		RangePatternKind, Statement, StringPart, StructPatternField,
 	},
+	ops::BinaryOperator,
 };
 
 use crate::{
@@ -755,7 +756,7 @@ fn runtime_annotations(
 	required_type_nodes: &std::collections::HashSet<nymph_ast::NodeId>,
 	checked: &crate::CheckedFacts,
 ) -> Result<RuntimeAnnotations, RuntimeExtractionError> {
-	let definitions = checked
+	let definitions: std::collections::HashMap<crate::DefId, DefinitionId> = checked
 		.semantic
 		.definitions
 		.defs
@@ -768,7 +769,23 @@ fn runtime_annotations(
 				.map(|stable| (crate::DefId(index as u32), stable))
 		})
 		.collect();
-	let context = CanonicalizationContext::new(definitions, body_parameters(definition, checked));
+	let parameters = body_parameters(definition, checked);
+	let self_parameter = definition_owner(definition).is_some_and(|owner| {
+		matches!(
+			&owner.key,
+			crate::DeclarationKey::TopLevel {
+				category: crate::DeclarationCategory::Interface,
+				..
+			}
+		)
+	});
+	let self_parameter = self_parameter.then(|| crate::ParamIdx(parameters.len() as u32));
+	let context = CanonicalizationContext::new(definitions, parameters);
+	let context = if let Some(parameter) = self_parameter {
+		context.with_self_parameter(parameter)
+	} else {
+		context
+	};
 	let mut types = Vec::new();
 	let mut dispatches = Vec::new();
 	for (node, info) in checked.annotations.infos() {
@@ -924,6 +941,17 @@ fn required_type_nodes(
 			ExprKind::IndexAccess { parent, .. } => {
 				required.insert(parent.id);
 			}
+			ExprKind::BinaryOp { lhs, op, .. }
+				if matches!(op, BinaryOperator::Equals | BinaryOperator::NotEquals) =>
+			{
+				if checked
+					.annotations
+					.get(lhs.id)
+					.is_some_and(|info| !matches!(checked.interner.kind(info.ty), crate::TyKind::Error))
+				{
+					required.insert(lhs.id);
+				}
+			}
 			ExprKind::List(items) | ExprKind::Tuple(items) => {
 				for item in items {
 					if let ListItem::Spread(value) = &item.0 {
@@ -1022,6 +1050,18 @@ fn stable_dispatch(
 					.iter()
 					.find(|candidate| candidate.definition.as_ref() == Some(&implementation))
 					.is_some_and(|candidate| !candidate.methods.contains_key(&resolution.method));
+				let external = checked
+					.semantic
+					.definitions
+					.by_stable(&member)
+					.and_then(|definition| checked.semantic.external_abis.get(&definition));
+				if let Some(abi) = external {
+					return Ok(StableDispatch::External {
+						member,
+						implementation,
+						marshal: abi.marshal,
+					});
+				}
 				return Ok(match (kind, interface) {
 					(_, Some(interface)) if uses_default => StableDispatch::InterfaceDefault {
 						interface,
@@ -1266,6 +1306,13 @@ fn body_parameters(
 								.enums
 								.get(&owner)
 								.map(|signature| signature.generics.len())
+								.or_else(|| {
+									checked
+										.semantic
+										.interfaces
+										.get(&owner)
+										.map(|interface| interface.generics.len())
+								})
 						})
 				})
 				.unwrap_or(0),

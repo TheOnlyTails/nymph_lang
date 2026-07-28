@@ -38,7 +38,7 @@
 //! `real_map_get_stays_a_loud_external_defer`.
 use rustc_hash::FxHashMap;
 
-use crate::hir::MarshalKind;
+use crate::hir::{BinOp, BuiltinResult, MarshalKind, UnOp};
 
 /// Where an `external(name)` marker is actually implemented in real JS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +58,20 @@ pub struct Linked {
 	/// is exactly `tag` (mirrors `nymph-sema`'s `inherent_self_type_tag`:
 	/// `"list"`/`"mut_list"`/`"map"`/`"mut_map"`/the six primitive tags/…).
 	pub receiver_tag: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum NativeExternal {
+	Binary { op: BinOp, result: BuiltinResult },
+	Unary { op: UnOp, result: BuiltinResult },
+	Index,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalCallable {
+	Linked(Linked),
+	Native(NativeExternal),
+	Deferred,
 }
 
 /// Why an external marker could not be resolved for the requested declaration kind.
@@ -729,6 +743,83 @@ pub fn lookup(name: &str, receiver_tag: Option<&str>) -> Option<&'static Linked>
 		.map(|(_, linked)| linked)
 }
 
+#[must_use]
+pub fn resolve(
+	name: &str,
+	receiver_tag: Option<&str>,
+	explicit_arity: Option<usize>,
+	result: Option<BuiltinResult>,
+) -> ExternalCallable {
+	if let Some(linked) = lookup(name, receiver_tag) {
+		return ExternalCallable::Linked(*linked);
+	}
+	let primitive = matches!(
+		receiver_tag,
+		Some("int" | "uint" | "float" | "char" | "boolean")
+	);
+	let native = match (name, primitive, result) {
+		("index", _, _) if receiver_tag == Some("list") && explicit_arity == Some(1) => {
+			Some(NativeExternal::Index)
+		}
+		("plus", true, Some(result)) | ("plus_char_int", true, Some(result))
+			if explicit_arity == Some(1) =>
+		{
+			Some(NativeExternal::Binary {
+				op: BinOp::Add,
+				result,
+			})
+		}
+		("minus", true, Some(result)) if explicit_arity == Some(1) => Some(NativeExternal::Binary {
+			op: BinOp::Sub,
+			result,
+		}),
+		("times", true, Some(result)) if explicit_arity == Some(1) => Some(NativeExternal::Binary {
+			op: BinOp::Mul,
+			result,
+		}),
+		("divide", true, Some(result)) if explicit_arity == Some(1) => Some(NativeExternal::Binary {
+			op: BinOp::Div,
+			result,
+		}),
+		("remainder", true, Some(result)) if explicit_arity == Some(1) => {
+			Some(NativeExternal::Binary {
+				op: BinOp::Rem,
+				result,
+			})
+		}
+		("power", true, Some(result)) if explicit_arity == Some(1) => Some(NativeExternal::Binary {
+			op: BinOp::Pow,
+			result,
+		}),
+		("bit_and", true, Some(result)) if explicit_arity == Some(1) => Some(NativeExternal::Binary {
+			op: BinOp::BitAnd,
+			result,
+		}),
+		("bit_or", true, Some(result)) if explicit_arity == Some(1) => Some(NativeExternal::Binary {
+			op: BinOp::BitOr,
+			result,
+		}),
+		("bit_xor", true, Some(result)) if explicit_arity == Some(1) => Some(NativeExternal::Binary {
+			op: BinOp::BitXor,
+			result,
+		}),
+		("shl", true, Some(result)) if explicit_arity == Some(1) => Some(NativeExternal::Binary {
+			op: BinOp::Shl,
+			result,
+		}),
+		("shr", true, Some(result)) if explicit_arity == Some(1) => Some(NativeExternal::Binary {
+			op: BinOp::Shr,
+			result,
+		}),
+		("bit_not", true, Some(result)) if explicit_arity == Some(0) => Some(NativeExternal::Unary {
+			op: UnOp::BitNot,
+			result,
+		}),
+		_ => None,
+	};
+	native.map_or(ExternalCallable::Deferred, ExternalCallable::Native)
+}
+
 /// Resolve an immutable external value while preserving a structured
 /// distinction between an unknown marker and a marker registered as callable.
 pub fn lookup_value(name: &str) -> Result<&'static LinkedValue, LinkageError> {
@@ -963,6 +1054,45 @@ mod tests {
 			assert_eq!(linked.module, "std/comparison");
 			assert_eq!(linked.symbol, symbol);
 		}
+	}
+
+	#[test]
+	fn external_resolution_distinguishes_native_linked_and_deferred_calls() {
+		assert_eq!(
+			resolve("plus", Some("int"), Some(1), Some(BuiltinResult::Int)),
+			ExternalCallable::Native(NativeExternal::Binary {
+				op: crate::hir::BinOp::Add,
+				result: crate::hir::BuiltinResult::Int,
+			})
+		);
+		assert_eq!(
+			resolve("plus", Some("int"), Some(1), Some(BuiltinResult::Float)),
+			ExternalCallable::Native(NativeExternal::Binary {
+				op: crate::hir::BinOp::Add,
+				result: crate::hir::BuiltinResult::Float,
+			})
+		);
+		assert!(matches!(
+			resolve("equals", None, None, None),
+			ExternalCallable::Linked(Linked {
+				module: "std/equality",
+				symbol: "equals",
+				..
+			})
+		));
+		assert_eq!(
+			resolve(
+				"not_registered",
+				Some("int"),
+				Some(1),
+				Some(BuiltinResult::Int)
+			),
+			ExternalCallable::Deferred
+		);
+		assert_eq!(
+			resolve("plus", Some("int"), Some(0), Some(BuiltinResult::Int)),
+			ExternalCallable::Deferred
+		);
 	}
 
 	#[test]

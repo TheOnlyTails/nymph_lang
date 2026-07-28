@@ -177,7 +177,7 @@ pub enum NumKind {
 /// The checker-resolved result representation of a built-in operator. User
 /// operators lower to method calls instead; this marker exists so codegen can
 /// re-box a native-JS fast-path result without re-deriving type information.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BuiltinResult {
 	Int,
 	UInt,
@@ -711,7 +711,7 @@ pub enum HirRange {
 }
 
 /// Binary operators that map directly to a JS operator (primitive fast-path).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum BinOp {
 	Add,
 	Sub,
@@ -734,7 +734,7 @@ pub enum BinOp {
 	Shr,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum UnOp {
 	Neg,
 	Not,

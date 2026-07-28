@@ -40,6 +40,20 @@ pub fn emit_for_project_module(module: &HirModule, module_key: &str) -> String {
 	emit::Emitter::for_project_module(&allocator, module_key).emit_module(module)
 }
 
+/// Emit a project module while coalescing exact imports already required by the
+/// project assembler with imports discovered structurally during HIR emission.
+#[must_use]
+pub fn emit_for_project_module_with_imports(
+	module: &HirModule,
+	module_key: &str,
+	imports: &[(String, String, String)],
+) -> String {
+	let allocator = Allocator::default();
+	emit::Emitter::for_project_module(&allocator, module_key)
+		.with_needed_imports(imports)
+		.emit_module(module)
+}
+
 /// Compile Nymph source to a JS module string, or return the diagnostics that
 /// prevented it. Runs the full pipeline — parse → check → lower → emit — and only
 /// lowers/emits when parsing and checking are error-free.

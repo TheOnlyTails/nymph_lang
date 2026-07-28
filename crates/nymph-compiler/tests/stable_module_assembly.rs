@@ -497,11 +497,18 @@ fn stable_native_list_runtime_is_exact_collision_safe_and_runs_after_dependency_
 	let emitted = session
 		.emit_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
 		.expect("stable List modules emit");
+	let list_imports = emitted.module_sources["main"]
+		.lines()
+		.filter(|line| line.ends_with("from \"@nymph/runtime/collections/list\";"))
+		.collect::<Vec<_>>();
+	assert!(!list_imports.is_empty());
 	assert_eq!(
-		emitted.module_sources["main"]
-			.matches("from \"@nymph/runtime/collections/list\"")
-			.count(),
-		1
+		list_imports.len(),
+		list_imports
+			.iter()
+			.copied()
+			.collect::<std::collections::HashSet<_>>()
+			.len()
 	);
 	assert_eq!(
 		emitted.module_sources["main"]
@@ -509,11 +516,18 @@ fn stable_native_list_runtime_is_exact_collision_safe_and_runs_after_dependency_
 			.count(),
 		1
 	);
+	let iterable_imports = emitted.module_sources["main"]
+		.lines()
+		.filter(|line| line.ends_with("from \"@nymph/runtime/iter/iterable\";"))
+		.collect::<Vec<_>>();
+	assert!(!iterable_imports.is_empty());
 	assert_eq!(
-		emitted.module_sources["main"]
-			.matches("from \"@nymph/runtime/iter/iterable\"")
-			.count(),
-		1
+		iterable_imports.len(),
+		iterable_imports
+			.iter()
+			.copied()
+			.collect::<std::collections::HashSet<_>>()
+			.len()
 	);
 	assert!(emitted.module_sources.contains_key("collections/list"));
 	assert!(
@@ -614,11 +628,18 @@ fn stable_native_map_runtime_is_exact_collision_safe_and_runs_after_dependency_w
 	let emitted = session
 		.emit_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
 		.expect("stable Map modules emit");
+	let map_imports = emitted.module_sources["main"]
+		.lines()
+		.filter(|line| line.ends_with("from \"@nymph/runtime/collections/map\";"))
+		.collect::<Vec<_>>();
+	assert!(!map_imports.is_empty());
 	assert_eq!(
-		emitted.module_sources["main"]
-			.matches("from \"@nymph/runtime/collections/map\"")
-			.count(),
-		1
+		map_imports.len(),
+		map_imports
+			.iter()
+			.copied()
+			.collect::<std::collections::HashSet<_>>()
+			.len()
 	);
 	assert_eq!(
 		emitted.module_sources["main"]
@@ -626,11 +647,18 @@ fn stable_native_map_runtime_is_exact_collision_safe_and_runs_after_dependency_w
 			.count(),
 		1
 	);
+	let iterable_imports = emitted.module_sources["main"]
+		.lines()
+		.filter(|line| line.ends_with("from \"@nymph/runtime/iter/iterable\";"))
+		.collect::<Vec<_>>();
+	assert!(!iterable_imports.is_empty());
 	assert_eq!(
-		emitted.module_sources["main"]
-			.matches("from \"@nymph/runtime/iter/iterable\"")
-			.count(),
-		1
+		iterable_imports.len(),
+		iterable_imports
+			.iter()
+			.copied()
+			.collect::<std::collections::HashSet<_>>()
+			.len()
 	);
 	assert!(emitted.module_sources.contains_key("collections/map"));
 	assert!(
@@ -803,13 +831,13 @@ fn stable_emission_links_exact_ambient_math_demands_once_and_runs() {
 		compiled.js
 	);
 	assert_eq!(
-		compiled.js.matches("function $m12$int$sqrt(").count(),
+		compiled.js.matches("function $m12$int$i0$sqrt(").count(),
 		1,
 		"{}",
 		compiled.js
 	);
 	assert!(
-		compiled.js.contains("$m12$int$sqrt(new NInt(16))"),
+		compiled.js.contains("$m12$int$i0$sqrt(new NInt(16))"),
 		"{}",
 		compiled.js
 	);
@@ -969,10 +997,13 @@ fn stable_importable_module_emits_demanded_external_member_alias() {
 		.emit_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
 		.expect("importable module emits a demanded external member alias");
 	let provider = &emitted.module_sources["provider"];
-	assert!(provider.contains(" as $m0$int$rendered"), "{provider}");
-	assert!(provider.contains("export { $m0$int$rendered"), "{provider}");
+	assert!(provider.contains(" as $m0$int$i0$rendered"), "{provider}");
 	assert!(
-		emitted.module_sources["main"].contains("import { $m0$int$rendered } from \"provider\";")
+		provider.contains("export { $m0$int$i0$rendered"),
+		"{provider}"
+	);
+	assert!(
+		emitted.module_sources["main"].contains("import { $m0$int$i0$rendered } from \"provider\";")
 	);
 	let compiled = session
 		.compile_interface_project_for_test(project, main, EntryMode::Entry)

@@ -289,6 +289,39 @@ func inclusive(): int = { let mut total = 0 for (x in 1..=4) { total = total + x
 }
 
 #[test]
+fn exact_ambient_binding_is_stable_when_an_unrelated_project_implementation_is_added() {
+	let mut session = CompilerSession::new();
+	let project = ProjectId::new("binding-stability");
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"func value(): int = 1".into(),
+		SourceVersion(1),
+	);
+	let exact = ambient_iteration_demands(&session)[1].clone();
+	let before = session
+		.binding_name_for_test(
+			project.clone(),
+			main.clone(),
+			exact.clone(),
+			EntryMode::Library,
+		)
+		.expect("exact ambient binding before unrelated implementation");
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"interface Local { func value(): int }\nstruct Added()\nimpl Local for Added { func value(): int = 2 }"
+			.into(),
+		SourceVersion(2),
+	);
+	let after = session
+		.binding_name_for_test(project, main, exact, EntryMode::Library)
+		.expect("exact ambient binding after unrelated implementation");
+	assert_eq!(before, after);
+}
+
+#[test]
 fn lowering_an_import_consumer_never_executes_dependency_body_queries_after_warmup() {
 	let mut session = CompilerSession::without_builtin_sources();
 	let project = ProjectId::new("body-guard");

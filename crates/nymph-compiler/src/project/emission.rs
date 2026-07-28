@@ -74,11 +74,8 @@ fn prepend_external_aliases<'a>(
 ) {
 	let mut imports = externals
 		.filter_map(|(abi, name)| {
-			Some((
-				abi.module.as_ref()?.to_string(),
-				abi.symbol.as_ref()?.to_string(),
-				name.to_string(),
-			))
+			let (module, symbol) = abi.linked()?;
+			Some((module.to_string(), symbol.to_string(), name.to_string()))
 		})
 		.collect::<Vec<_>>();
 	imports.sort_unstable();
@@ -109,9 +106,22 @@ pub(crate) fn emitted_interface_module<'db>(
 			));
 		}
 	};
-	let mut grouped: FxHashMap<String, Vec<String>> = FxHashMap::default();
+	let mut predeclared_imports = Vec::new();
+	let routed_demands = stable
+		.fragments
+		.iter()
+		.flat_map(|fragment| fragment.routed_demands().iter().cloned())
+		.collect::<FxHashSet<_>>();
+	let direct_demands = stable
+		.fragments
+		.iter()
+		.flat_map(|fragment| fragment.direct_demands().iter().cloned())
+		.collect::<FxHashSet<_>>();
 	for fragment in &stable.fragments {
 		let definition = fragment.definition();
+		if routed_demands.contains(definition) && !direct_demands.contains(definition) {
+			continue;
+		}
 		if definition.module == stable.module
 			|| !matches!(
 				fragment.fragment(),
@@ -133,26 +143,13 @@ pub(crate) fn emitted_interface_module<'db>(
 				));
 			}
 		};
-		grouped
-			.entry(module_specifier(&definition.module))
-			.or_default()
-			.push(name);
+		predeclared_imports.push((module_specifier(&definition.module), name.clone(), name));
 	}
-	let mut imports: Vec<_> = grouped.into_iter().collect();
-	imports.sort_unstable_by(|left, right| left.0.cmp(&right.0));
-	let mut source = String::new();
-	for (specifier, names) in &mut imports {
-		names.sort_unstable();
-		names.dedup();
-		source.push_str(&format!(
-			"import {{ {} }} from \"{specifier}\";\n",
-			names.join(", ")
-		));
-	}
-	source.push_str(&nymph_codegen::emit_for_project_module(
+	let mut source = nymph_codegen::emit_for_project_module_with_imports(
 		&stable.hir,
 		&stable.module.path,
-	));
+		&predeclared_imports,
+	);
 	prepend_external_aliases(
 		&mut source,
 		stable.fragments.iter().filter_map(|fragment| {
@@ -287,7 +284,7 @@ pub(crate) fn emitted_interface_project<'db>(
 		};
 		option_requested |= stable.fragments.iter().any(|fragment| {
 			matches!(fragment.fragment(), nymph_sema::LoweredHirFragment::TopLevelExternal { abi, .. }
-				if abi.module.as_deref().and_then(crate::intrinsics::runtime_dependency).is_some())
+				if abi.linked().and_then(|(module, _)| crate::intrinsics::runtime_dependency(module)).is_some())
 		});
 		for fragment in &stable.virtual_runtime {
 			if matches!(
@@ -494,10 +491,10 @@ fn emit_virtual_runtime_module(
 			Fragment::TopLevelExternal { .. } | Fragment::StructShell(_) | Fragment::EnumShell(_) => {}
 		}
 	}
-	let mut source = nymph_codegen::emit_for_project_module(&hir, &owner.path);
+	let current_module = module_specifier(owner);
 	let mut runtime_imports = fragments
 		.iter()
-		.flat_map(|fragment| fragment.fragment.demands())
+		.flat_map(|fragment| fragment.fragment.direct_demands().iter())
 		.filter(|demand| demand.module != *owner)
 		.filter(|demand| module_bindings.contains(*demand))
 		.filter_map(|demand| {
@@ -508,9 +505,12 @@ fn emit_virtual_runtime_module(
 		.collect::<Vec<_>>();
 	runtime_imports.sort_unstable();
 	runtime_imports.dedup();
-	for (module, name) in runtime_imports.into_iter().rev() {
-		source.insert_str(0, &format!("import {{ {name} }} from \"{module}\";\n"));
-	}
+	let runtime_imports = runtime_imports
+		.into_iter()
+		.map(|(module, name)| (module, name.clone(), name))
+		.collect::<Vec<_>>();
+	let mut source =
+		nymph_codegen::emit_for_project_module_with_imports(&hir, &current_module, &runtime_imports);
 	prepend_external_aliases(
 		&mut source,
 		fragments

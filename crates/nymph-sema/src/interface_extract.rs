@@ -168,18 +168,44 @@ fn visible(visibility: Option<Visibility>) -> bool {
 }
 
 pub(crate) fn external_function_abi(marker: &EcoString) -> ExternalAbi {
-	external_function_abi_for_receiver(marker, None)
+	external_function_abi_for_receiver(marker, None, None, None)
 }
 
 fn external_function_abi_for_receiver(
 	marker: &EcoString,
 	receiver_tag: Option<&str>,
+	explicit_arity: Option<usize>,
+	return_type: Option<&InterfaceType>,
 ) -> ExternalAbi {
-	let linked = nymph_hir::linkage::lookup(marker, receiver_tag);
+	let result = return_type.and_then(|return_type| match return_type {
+		InterfaceType::Int => Some(nymph_hir::hir::BuiltinResult::Int),
+		InterfaceType::UInt => Some(nymph_hir::hir::BuiltinResult::UInt),
+		InterfaceType::Float => Some(nymph_hir::hir::BuiltinResult::Float),
+		InterfaceType::Char => Some(nymph_hir::hir::BuiltinResult::Char),
+		InterfaceType::String => Some(nymph_hir::hir::BuiltinResult::String),
+		InterfaceType::Boolean => Some(nymph_hir::hir::BuiltinResult::Boolean),
+		InterfaceType::SelfType => match receiver_tag {
+			Some("int") => Some(nymph_hir::hir::BuiltinResult::Int),
+			Some("uint") => Some(nymph_hir::hir::BuiltinResult::UInt),
+			Some("float") => Some(nymph_hir::hir::BuiltinResult::Float),
+			Some("char") => Some(nymph_hir::hir::BuiltinResult::Char),
+			Some("string") => Some(nymph_hir::hir::BuiltinResult::String),
+			Some("boolean") => Some(nymph_hir::hir::BuiltinResult::Boolean),
+			_ => None,
+		},
+		_ => None,
+	});
+	let callable = match nymph_hir::linkage::resolve(marker, receiver_tag, explicit_arity, result) {
+		nymph_hir::linkage::ExternalCallable::Linked(linked) => crate::ExternalCallable::Linked {
+			module: linked.module.into(),
+			symbol: linked.symbol.into(),
+		},
+		nymph_hir::linkage::ExternalCallable::Native(native) => crate::ExternalCallable::Native(native),
+		nymph_hir::linkage::ExternalCallable::Deferred => crate::ExternalCallable::Deferred,
+	};
 	ExternalAbi {
 		marker: marker.clone(),
-		module: linked.map(|linkage| linkage.module.into()),
-		symbol: linked.map(|linkage| linkage.symbol.into()),
+		callable,
 		marshal: None,
 	}
 }
@@ -219,8 +245,12 @@ pub(crate) fn external_value_abi(
 	let linked = nymph_hir::linkage::lookup_value(marker).ok();
 	ExternalAbi {
 		marker: marker.clone(),
-		module: linked.map(|linkage| linkage.linked.module.into()),
-		symbol: linked.map(|linkage| linkage.linked.symbol.into()),
+		callable: linked.map_or(crate::ExternalCallable::Deferred, |linkage| {
+			crate::ExternalCallable::Linked {
+				module: linkage.linked.module.into(),
+				symbol: linkage.linked.symbol.into(),
+			}
+		}),
 		marshal,
 	}
 }
@@ -513,6 +543,7 @@ fn checked_member_shape(
 				.unwrap_or_default(),
 		);
 	}
+	let return_type = canonicalize_type(&checked.interner, facts.ret, &member_context)?;
 	Ok(MemberShape {
 		id: facts.definition.clone().unwrap_or(id),
 		name: meta.name.0.clone(),
@@ -540,9 +571,15 @@ fn checked_member_shape(
 				})
 			})
 			.collect::<Result<_, InterfaceConversionError>>()?,
-		return_type: canonicalize_type(&checked.interner, facts.ret, &member_context)?,
-		external: external_symbol
-			.map(|symbol| external_function_abi_for_receiver(symbol, implementation_receiver_tag(owner))),
+		return_type: return_type.clone(),
+		external: external_symbol.map(|symbol| {
+			external_function_abi_for_receiver(
+				symbol,
+				implementation_receiver_tag(owner),
+				Some(facts.params.len()),
+				Some(&return_type),
+			)
+		}),
 		runtime_owner: Some(owner.clone()),
 		has_default: false,
 	})
@@ -655,7 +692,7 @@ fn member_shape(
 			visibility, meta, ..
 		}
 		| ImplMember::ExternalFunc(visibility, _, meta) => {
-			let parameters = meta
+			let parameters: Vec<ParameterShape<InterfaceType>> = meta
 				.params
 				.iter()
 				.map(|p| {
@@ -680,6 +717,8 @@ fn member_shape(
 				ImplMember::ExternalFunc(_, symbol, _) => Some(external_function_abi_for_receiver(
 					symbol,
 					implementation_receiver_tag(owner),
+					Some(parameters.len()),
+					Some(&ret),
 				)),
 				_ => None,
 			};
@@ -2007,6 +2046,24 @@ fn extract_implementations(
 					}
 				})
 				.collect::<Result<_, InterfaceConversionError>>()?;
+			let interface_generics = &checked.semantic.interfaces[&implementation.interface].generics;
+			let interface_argument_bindings = implementation
+				.args
+				.iter()
+				.map(|(name, ty)| {
+					let index = interface_generics
+						.iter()
+						.position(|generic| generic == name)
+						.ok_or_else(|| InterfaceConversionError::UnknownInterfaceArgument {
+							interface: interface.clone(),
+							name: name.clone(),
+						})?;
+					Ok((
+						GenericParameterId::new(interface.binder(BinderScope::Definition, 0), index as u32),
+						canonicalize_type(&checked.interner, *ty, &context)?,
+					))
+				})
+				.collect::<Result<_, InterfaceConversionError>>()?;
 			Ok(ExportedImpl {
 				id: id.clone(),
 				visibility,
@@ -2021,6 +2078,7 @@ fn extract_implementations(
 						))
 					})
 					.collect::<Result<_, InterfaceConversionError>>()?,
+				interface_argument_bindings,
 				self_type: canonicalize_type(&checked.interner, implementation.self_ty, &context)?,
 				mutable,
 				binders,
@@ -2178,6 +2236,7 @@ fn extract_implementations(
 			visibility,
 			interface: None,
 			interface_arguments: Vec::new(),
+			interface_argument_bindings: Vec::new(),
 			self_type: canonicalize_type(&checked.interner, implementation.self_ty, &impl_context)?,
 			mutable: false,
 			binders,

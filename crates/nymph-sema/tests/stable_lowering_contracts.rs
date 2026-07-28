@@ -148,8 +148,10 @@ fn shape_requests_cover_exact_lowering_facts_and_recovery() {
 	let request = StableShapeRequest::ExternalAbi(id.clone());
 	let abi = ExternalAbi {
 		marker: "clock".into(),
-		module: Some("runtime/time".into()),
-		symbol: Some("clock".into()),
+		callable: nymph_sema::ExternalCallable::Linked {
+			module: "runtime/time".into(),
+			symbol: "clock".into(),
+		},
 		marshal: None,
 	};
 	let mut lookup = FakeLookup::default();
@@ -256,8 +258,7 @@ fn lowered_fragments_encode_placement_and_ordered_deduplicated_demands() {
 			name: EmittedBindingName::new("host"),
 			abi: ExternalAbi {
 				marker: "host".into(),
-				module: None,
-				symbol: None,
+				callable: nymph_sema::ExternalCallable::Deferred,
 				marshal: None,
 			},
 		},

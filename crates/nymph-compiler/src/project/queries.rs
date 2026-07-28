@@ -1244,13 +1244,38 @@ pub(crate) fn binding_name<'db>(
 	let entry_main = key.mode(db) == nymph_sema::EntryMode::Entry
 		&& definition.module.path == key.entry(db).as_str()
 		&& name == "main";
+	let implementation_receiver = |implementation: &nymph_sema::DefinitionId| {
+		let nymph_sema::DeclarationKey::Implementation { header, .. } = &implementation.key else {
+			return Ok(None);
+		};
+		let Some(receiver) = primitive_header_tag(&header.self_type) else {
+			return Ok(None);
+		};
+		let environment = complete_interface(db, key, implementation).map_err(|_| {
+			nymph_sema::StableNameLookupError::MissingBinding {
+				definition: implementation.clone(),
+			}
+		})?;
+		let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
+			unreachable!("complete_interface rejects recovered module environments")
+		};
+		let local_ordinal = interface
+			.implementations
+			.iter()
+			.position(|shape| shape.id == *implementation)
+			.ok_or_else(|| nymph_sema::StableNameLookupError::MissingBinding {
+				definition: implementation.clone(),
+			})?;
+		Ok(Some(format!("{receiver}$i{local_ordinal}")))
+	};
 	let receiver = match &definition.key {
 		nymph_sema::DeclarationKey::Member { owner, .. } => match &owner.key {
-			nymph_sema::DeclarationKey::Implementation { header, .. } => {
-				primitive_header_tag(&header.self_type)
-			}
+			nymph_sema::DeclarationKey::Implementation { .. } => implementation_receiver(owner)?,
 			_ => None,
 		},
+		nymph_sema::DeclarationKey::MaterializedInterfaceMember { implementation, .. } => {
+			implementation_receiver(implementation)?
+		}
 		_ => None,
 	};
 	Ok(nymph_sema::EmittedBindingName::new(
@@ -1377,9 +1402,9 @@ pub(crate) fn module_specifier<'db>(
 		SemanticModuleDomain::ImportableStd => {
 			nymph_sema::CanonicalModuleSpecifier::Importable(module.path)
 		}
-		SemanticModuleDomain::AmbientCore => {
-			nymph_sema::CanonicalModuleSpecifier::CompilerRuntime(module.path)
-		}
+		SemanticModuleDomain::AmbientCore => nymph_sema::CanonicalModuleSpecifier::CompilerRuntime(
+			format!("@nymph/runtime/{}", module.path).into(),
+		),
 	})
 }
 
@@ -1553,7 +1578,7 @@ pub(crate) fn lower_interface_module<'db>(
 				_ => error.into(),
 			})?;
 		if let nymph_sema::LoweredHirFragment::TopLevelExternal { abi, .. } = fragment.fragment()
-			&& let Some(module) = abi.module.as_deref()
+			&& let Some((module, _)) = abi.linked()
 			&& let Some(dependency) = crate::intrinsics::runtime_dependency(module)
 		{
 			let option_module = key

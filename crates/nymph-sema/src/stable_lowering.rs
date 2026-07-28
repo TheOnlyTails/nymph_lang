@@ -285,6 +285,8 @@ pub struct LoweredRuntimeDefinition {
 	definition: DefinitionId,
 	fragment: LoweredHirFragment,
 	demands: StableDemandSet,
+	direct_demands: StableDemandSet,
+	routed_demands: StableDemandSet,
 	placement: RuntimeAssemblyPlacement,
 }
 
@@ -302,10 +304,13 @@ impl LoweredRuntimeDefinition {
 		demands: StableDemandSet,
 		placement: RuntimeAssemblyPlacement,
 	) -> Self {
+		let direct_demands = demands.clone();
 		Self {
 			definition,
 			fragment,
 			demands,
+			direct_demands,
+			routed_demands: StableDemandSet::new(),
 			placement,
 		}
 	}
@@ -317,6 +322,12 @@ impl LoweredRuntimeDefinition {
 	}
 	pub fn demands(&self) -> &[DefinitionId] {
 		self.demands.as_slice()
+	}
+	pub fn direct_demands(&self) -> &[DefinitionId] {
+		self.direct_demands.as_slice()
+	}
+	pub fn routed_demands(&self) -> &[DefinitionId] {
+		self.routed_demands.as_slice()
 	}
 	pub fn placement(&self) -> &RuntimeAssemblyPlacement {
 		&self.placement
@@ -420,6 +431,8 @@ pub fn lower_runtime_definition(
 ) -> Result<LoweredRuntimeDefinition, StableLoweringError> {
 	let definition = artifact.definition.clone();
 	let mut demands = StableDemandSet::new();
+	let mut direct_demands = StableDemandSet::new();
+	let mut routed_demands = StableDemandSet::new();
 	let fragment = match &artifact.payload {
 		crate::RuntimePayload::External(abi) => {
 			let name = context.binding_name(&definition)?;
@@ -427,8 +440,6 @@ pub fn lower_runtime_definition(
 			if exact != *abi {
 				return Err(StableLoweringError::MismatchedExternalAbi { definition });
 			}
-			let module = external_module(&definition, abi)?;
-			let symbol = external_symbol(&definition, abi)?;
 			if matches!(
 				&definition.key,
 				crate::DeclarationKey::TopLevel {
@@ -436,6 +447,8 @@ pub fn lower_runtime_definition(
 					..
 				}
 			) {
+				let module = external_module(&definition, abi)?;
+				let symbol = external_symbol(&definition, abi)?;
 				let marshal = abi
 					.marshal
 					.ok_or_else(|| StableLoweringError::MissingExternalMarshal {
@@ -450,7 +463,41 @@ pub fn lower_runtime_definition(
 						marshal,
 					},
 				})
+			} else if let crate::ExternalCallable::Native(native) = abi.callable {
+				let (params, body) = match native {
+					nymph_hir::linkage::NativeExternal::Binary { op, result } => (
+						vec![EcoString::from("$self"), EcoString::from("other")],
+						HirExpr::Binary {
+							op,
+							result,
+							lhs: Box::new(HirExpr::Local("$self".into())),
+							rhs: Box::new(HirExpr::Local("other".into())),
+						},
+					),
+					nymph_hir::linkage::NativeExternal::Unary { op, result } => (
+						vec![EcoString::from("$self")],
+						HirExpr::Unary {
+							op,
+							result,
+							operand: Box::new(HirExpr::Local("$self".into())),
+						},
+					),
+					nymph_hir::linkage::NativeExternal::Index => (
+						vec![EcoString::from("$self"), EcoString::from("key")],
+						HirExpr::Index {
+							recv: Box::new(HirExpr::Local("$self".into())),
+							index: Box::new(HirExpr::Local("key".into())),
+						},
+					),
+				};
+				LoweredHirFragment::TopLevelFunction(HirFunc {
+					name: name.as_str().into(),
+					params,
+					body,
+				})
 			} else {
+				external_module(&definition, abi)?;
+				external_symbol(&definition, abi)?;
 				LoweredHirFragment::TopLevelExternal {
 					name,
 					abi: abi.clone(),
@@ -502,9 +549,16 @@ pub fn lower_runtime_definition(
 				statics: vec![],
 			})
 		}
-		crate::RuntimePayload::NymphBody(body) => {
-			lower_body(context, &artifact, body, &mut demands, None)?
-		}
+		crate::RuntimePayload::NymphBody(body) => lower_body(
+			context,
+			&artifact,
+			body,
+			&mut demands,
+			&mut direct_demands,
+			&mut routed_demands,
+			None,
+			None,
+		)?,
 		crate::RuntimePayload::MaterializedInterfaceMember {
 			body_definition,
 			interface_member,
@@ -536,6 +590,7 @@ pub fn lower_runtime_definition(
 			};
 			if let crate::InterfaceType::Named { definition, .. } = &implementation_shape.self_type {
 				demands.insert(definition.clone());
+				direct_demands.insert(definition.clone());
 			}
 			let slot = implementation_shape
 				.member_slots
@@ -567,24 +622,33 @@ pub fn lower_runtime_definition(
 				&artifact,
 				checked,
 				&mut demands,
+				&mut direct_demands,
+				&mut routed_demands,
+				Some(&implementation_shape.self_type),
 				Some(&implementation_shape.member_slots),
 			)?;
-			let method = fragment_method(lowered)?;
-			LoweredHirFragment::MaterializedDefault {
-				owner,
-				implementation,
-				interface_member: interface_member.clone(),
-				method,
+			if matches!(lowered, LoweredHirFragment::TopLevelFunction(_)) {
+				lowered
+			} else {
+				let method = fragment_method(lowered)?;
+				LoweredHirFragment::MaterializedDefault {
+					owner,
+					implementation,
+					interface_member: interface_member.clone(),
+					method,
+				}
 			}
 		}
 	};
 	let placement = runtime_assembly_placement(context, &definition, &fragment)?;
 	if let RuntimeAssemblyPlacement::Shell(shell) = &placement {
 		demands.insert(shell.clone());
+		direct_demands.insert(shell.clone());
 	}
-	Ok(LoweredRuntimeDefinition::new(
-		definition, fragment, demands, placement,
-	))
+	let mut lowered = LoweredRuntimeDefinition::new(definition, fragment, demands, placement);
+	lowered.direct_demands = direct_demands;
+	lowered.routed_demands = routed_demands;
+	Ok(lowered)
 }
 
 fn runtime_assembly_placement(
@@ -677,8 +741,8 @@ fn external_module(
 	abi: &ExternalAbi,
 ) -> Result<&'static str, StableLoweringError> {
 	abi
-		.module
-		.as_ref()
+		.linked()
+		.map(|(module, _)| module)
 		.map(|module| Box::leak(module.to_string().into_boxed_str()) as &'static str)
 		.ok_or_else(|| StableLoweringError::MissingExternalModule {
 			definition: definition.clone(),
@@ -690,8 +754,8 @@ fn external_symbol(
 	abi: &ExternalAbi,
 ) -> Result<&'static str, StableLoweringError> {
 	abi
-		.symbol
-		.as_ref()
+		.linked()
+		.map(|(_, symbol)| symbol)
 		.map(|symbol| Box::leak(symbol.to_string().into_boxed_str()) as &'static str)
 		.ok_or_else(|| StableLoweringError::MissingExternalSymbol {
 			definition: definition.clone(),
@@ -718,6 +782,60 @@ fn stable_runtime_tag(ty: &InterfaceType) -> Option<EcoString> {
 	Some(EcoString::from(format!("nymph.{tag}")))
 }
 
+fn substitute_self_type(ty: &InterfaceType, self_type: &InterfaceType) -> InterfaceType {
+	match ty {
+		InterfaceType::SelfType => self_type.clone(),
+		InterfaceType::List(inner) => {
+			InterfaceType::List(Box::new(substitute_self_type(inner, self_type)))
+		}
+		InterfaceType::Tuple(items) => InterfaceType::Tuple(
+			items
+				.iter()
+				.map(|item| substitute_self_type(item, self_type))
+				.collect(),
+		),
+		InterfaceType::Map(key, value) => InterfaceType::Map(
+			Box::new(substitute_self_type(key, self_type)),
+			Box::new(substitute_self_type(value, self_type)),
+		),
+		InterfaceType::Function {
+			parameters,
+			return_type,
+		} => InterfaceType::Function {
+			parameters: parameters
+				.iter()
+				.map(|parameter| substitute_self_type(parameter, self_type))
+				.collect(),
+			return_type: Box::new(substitute_self_type(return_type, self_type)),
+		},
+		InterfaceType::Named {
+			definition,
+			positional,
+			named,
+		} => InterfaceType::Named {
+			definition: definition.clone(),
+			positional: positional
+				.iter()
+				.map(|argument| substitute_self_type(argument, self_type))
+				.collect(),
+			named: named
+				.iter()
+				.map(|(name, argument)| (name.clone(), substitute_self_type(argument, self_type)))
+				.collect(),
+		},
+		InterfaceType::Intersection(items) => InterfaceType::Intersection(
+			items
+				.iter()
+				.map(|item| substitute_self_type(item, self_type))
+				.collect(),
+		),
+		InterfaceType::Mutable(inner) => {
+			InterfaceType::Mutable(Box::new(substitute_self_type(inner, self_type)))
+		}
+		_ => ty.clone(),
+	}
+}
+
 fn primitive_extension_owner(
 	context: &impl StableShapeLookup,
 	owner: &DefinitionId,
@@ -730,6 +848,34 @@ fn primitive_extension_owner(
 		return Err(StableShapeLookupError::WrongFact { request }.into());
 	};
 	Ok(stable_runtime_tag(&shape.self_type).is_some())
+}
+
+fn exact_implementation_slot<'a>(
+	implementation: &'a crate::ExportedImpl,
+	member: &DefinitionId,
+) -> Option<&'a crate::ImplementationMemberSlot> {
+	match &member.key {
+		crate::DeclarationKey::MaterializedInterfaceMember {
+			implementation: owner,
+			..
+		} if **owner == implementation.id => implementation
+			.member_slots
+			.iter()
+			.find(|slot| slot.member_id == *member),
+		crate::DeclarationKey::Member { owner, .. } if **owner == implementation.id => implementation
+			.member_slots
+			.iter()
+			.find(|slot| slot.member_id == *member),
+		crate::DeclarationKey::Member { owner, .. }
+			if implementation.interface.as_ref() == Some(owner.as_ref()) =>
+		{
+			implementation
+				.member_slots
+				.iter()
+				.find(|slot| slot.interface_member_id == *member)
+		}
+		_ => None,
+	}
 }
 
 fn primitive_extension_member(
@@ -790,6 +936,9 @@ fn lower_body(
 	artifact: &RuntimeDefinition,
 	body: &crate::CheckedRuntimeBody,
 	demands: &mut StableDemandSet,
+	direct_demands: &mut StableDemandSet,
+	routed_demands: &mut StableDemandSet,
+	self_type: Option<&InterfaceType>,
 	implementation_slots: Option<&[crate::ImplementationMemberSlot]>,
 ) -> Result<LoweredHirFragment, StableLoweringError> {
 	let is_function = body.kind != crate::RuntimeBodyKind::Value;
@@ -856,6 +1005,9 @@ fn lower_body(
 		scopes: RefCell::new(vec![HashMap::new()]),
 		counters: RefCell::new(HashMap::new()),
 		demands: RefCell::new(demands),
+		direct_demands: RefCell::new(direct_demands),
+		routed_demands: RefCell::new(routed_demands),
+		self_type,
 		implementation_slots,
 		receiver_binding: primitive_extension.then(|| EcoString::from("$self")),
 	};
@@ -929,6 +1081,10 @@ fn lower_body(
 fn pattern_name(pattern: &nymph_ast::Spanned<Pattern>) -> Result<&EcoString, StableLoweringError> {
 	match &pattern.0 {
 		Pattern::Binding { name, .. } => Ok(&name.0),
+		Pattern::Placeholder => {
+			static PLACEHOLDER: std::sync::LazyLock<EcoString> = std::sync::LazyLock::new(|| "_".into());
+			Ok(&PLACEHOLDER)
+		}
 		_ => Err(StableLoweringError::Unsupported {
 			definition: dummy_id(),
 			node: None,
@@ -956,6 +1112,9 @@ struct StableBodyLowerer<'a, C> {
 	scopes: RefCell<Vec<HashMap<EcoString, EcoString>>>,
 	counters: RefCell<HashMap<EcoString, u32>>,
 	demands: RefCell<&'a mut StableDemandSet>,
+	direct_demands: RefCell<&'a mut StableDemandSet>,
+	routed_demands: RefCell<&'a mut StableDemandSet>,
+	self_type: Option<&'a InterfaceType>,
 	implementation_slots: Option<&'a [crate::ImplementationMemberSlot]>,
 	receiver_binding: Option<EcoString>,
 }
@@ -1074,9 +1233,9 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				channel: "external marshal".into(),
 			})
 	}
-	fn ty(&self, expr: &Expr) -> Result<&InterfaceType, StableLoweringError> {
+	fn ty(&self, expr: &Expr) -> Result<InterfaceType, StableLoweringError> {
 		let node = self.id(expr);
-		self
+		let ty = self
 			.annotations
 			.types
 			.iter()
@@ -1086,7 +1245,11 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				definition: self.artifact.definition.clone(),
 				node,
 				channel: "type".into(),
-			})
+			})?;
+		Ok(self.self_type.map_or_else(
+			|| ty.clone(),
+			|self_type| substitute_self_type(ty, self_type),
+		))
 	}
 	fn dispatch(&self, expr: &Expr) -> Result<&crate::StableDispatch, StableLoweringError> {
 		let node = self.id(expr);
@@ -1209,12 +1372,12 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 								});
 							}
 						}
-						self.demands.borrow_mut().insert(target.clone());
+						self.demand_direct(target);
 					} else if target != &self.artifact.definition {
 						if target.module != self.artifact.definition.module {
 							self.context.module_specifier(&target.module)?;
 						}
-						self.demands.borrow_mut().insert(target.clone());
+						self.demand_direct(target);
 					}
 					HirExpr::Local(emitted.as_str().into())
 				} else {
@@ -1477,7 +1640,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				if let Some(target) = self.target(func) {
 					let target_artifact = self.context.runtime_definition(target)?;
 					if let crate::RuntimePayload::External(abi) = &target_artifact.payload {
-						self.demands.borrow_mut().insert(target.clone());
+						self.demand_direct(target);
 						let module = external_module(target, abi)?;
 						let symbol = external_symbol(target, abi)?;
 						return Ok(HirExpr::ExternCall {
@@ -1503,6 +1666,18 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					return Ok(HirExpr::Call {
 						callee: Box::new(self.lower(rhs)?),
 						args: vec![self.lower(lhs)?],
+					});
+				}
+				if matches!(op, BinaryOperator::Equals | BinaryOperator::NotEquals)
+					&& matches!(
+						peel_mut(&self.ty(lhs)?),
+						InterfaceType::Named { .. } | InterfaceType::Generic(_)
+					) {
+					return Ok(HirExpr::Binary {
+						op: binop(*op).expect("equality operators have builtin identity HIR"),
+						result: BuiltinResult::IdentityBoolean,
+						lhs: Box::new(self.lower(lhs)?),
+						rhs: Box::new(self.lower(rhs)?),
 					});
 				}
 				let dispatch = self.dispatch(expr)?;
@@ -1606,7 +1781,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			ExprKind::Continue { .. } => {
 				return Err(self.unsupported(expr, "continue (HIR has no jump node)"));
 			}
-			ExprKind::IndexAccess { parent, index, .. } => match peel_mut(self.ty(parent)?) {
+			ExprKind::IndexAccess { parent, index, .. } => match peel_mut(&self.ty(parent)?) {
 				InterfaceType::Map(..) => HirExpr::MapGet {
 					recv: Box::new(self.lower(parent)?),
 					key: Box::new(self.lower(index)?),
@@ -1710,12 +1885,40 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				member,
 				implementation,
 				..
-			} => (
-				member.clone(),
-				Some(member.clone()),
-				false,
-				Some(implementation.clone()),
-			),
+			} => {
+				if !matches!(
+					&implementation.key,
+					crate::DeclarationKey::Implementation { header, .. } if header.interface.is_some()
+				) {
+					(
+						member.clone(),
+						Some(member.clone()),
+						false,
+						Some(implementation.clone()),
+					)
+				} else {
+					let request = StableShapeRequest::Implementation(implementation.clone());
+					let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
+						return Err(StableShapeLookupError::WrongFact { request }.into());
+					};
+					let exact = exact_implementation_slot(&shape, member)
+						.map(|slot| slot.member_id.clone())
+						.ok_or_else(|| StableLoweringError::MissingImplementationSlot {
+							implementation: implementation.clone(),
+							member: member.clone(),
+						})?;
+					let external = matches!(
+						self.context.runtime_definition(&exact)?.payload,
+						crate::RuntimePayload::External(_)
+					);
+					(
+						exact.clone(),
+						Some(exact),
+						external,
+						Some(implementation.clone()),
+					)
+				}
+			}
 			crate::StableDispatch::SelectedImplementation {
 				member,
 				implementation,
@@ -1730,14 +1933,12 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
 					return Err(StableShapeLookupError::WrongFact { request }.into());
 				};
-				let slot = shape
-					.member_slots
-					.iter()
-					.find(|slot| slot.interface_member_id == *member || slot.member_id == *member)
-					.ok_or_else(|| StableLoweringError::MissingImplementationSlot {
+				let slot = exact_implementation_slot(&shape, member).ok_or_else(|| {
+					StableLoweringError::MissingImplementationSlot {
 						implementation: implementation.clone(),
 						member: member.clone(),
-					})?;
+					}
+				})?;
 				(
 					slot.member_id.clone(),
 					Some(slot.member_id.clone()),
@@ -1745,7 +1946,31 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					Some(implementation.clone()),
 				)
 			}
-			crate::StableDispatch::GenericBound { member, .. } => (member.clone(), None, false, None),
+			crate::StableDispatch::GenericBound { member, .. } => {
+				let slot = self
+					.implementation_slots
+					.and_then(|slots| {
+						slots
+							.iter()
+							.find(|slot| slot.interface_member_id == *member)
+					})
+					.ok_or_else(|| {
+						invalid(
+							&self.artifact.definition,
+							"missing exact generic-bound slot",
+						)
+					})?;
+				let external = matches!(
+					self.context.runtime_definition(&slot.member_id)?.payload,
+					crate::RuntimePayload::External(_)
+				);
+				(
+					slot.member_id.clone(),
+					Some(slot.member_id.clone()),
+					external,
+					Some(slot.implementation_id.clone()),
+				)
+			}
 			crate::StableDispatch::External {
 				member,
 				implementation,
@@ -1755,14 +1980,12 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
 					return Err(StableShapeLookupError::WrongFact { request }.into());
 				};
-				let slot = shape
-					.member_slots
-					.iter()
-					.find(|slot| slot.interface_member_id == *member || slot.member_id == *member)
-					.ok_or_else(|| StableLoweringError::MismatchedExternalMember {
+				let slot = exact_implementation_slot(&shape, member).ok_or_else(|| {
+					StableLoweringError::MismatchedExternalMember {
 						member: member.clone(),
 						implementation: implementation.clone(),
-					})?;
+					}
+				})?;
 				(
 					slot.member_id.clone(),
 					Some(slot.member_id.clone()),
@@ -1784,7 +2007,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			demand
 		};
 		if let Some(demand) = demand {
-			self.demands.borrow_mut().insert(demand);
+			self.demand_direct(&demand);
 		}
 		if external {
 			let fact = self
@@ -1798,14 +2021,6 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.into(),
 				);
 			};
-			let module = abi
-				.module
-				.ok_or_else(|| invalid(&self.artifact.definition, "external dispatch has no module"))?;
-			let symbol = abi
-				.symbol
-				.ok_or_else(|| invalid(&self.artifact.definition, "external dispatch has no symbol"))?;
-			let module: &'static str = Box::leak(module.to_string().into_boxed_str());
-			let symbol: &'static str = Box::leak(symbol.to_string().into_boxed_str());
 			let mut args = vec![self.lower(receiver)?];
 			args.extend(
 				arguments
@@ -1813,11 +2028,42 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.map(|arg| self.lower(arg))
 					.collect::<Result<Vec<_>, _>>()?,
 			);
-			return Ok(HirExpr::ExternCall {
-				module,
-				symbol,
-				args,
-			});
+			return match abi.callable {
+				crate::ExternalCallable::Linked { module, symbol } => Ok(HirExpr::ExternCall {
+					module: Box::leak(module.to_string().into_boxed_str()),
+					symbol: Box::leak(symbol.to_string().into_boxed_str()),
+					args,
+				}),
+				crate::ExternalCallable::Native(native) => match (native, args.as_slice()) {
+					(nymph_hir::linkage::NativeExternal::Binary { op, result }, [lhs, rhs]) => {
+						Ok(HirExpr::Binary {
+							op,
+							result,
+							lhs: Box::new(lhs.clone()),
+							rhs: Box::new(rhs.clone()),
+						})
+					}
+					(nymph_hir::linkage::NativeExternal::Unary { op, result }, [operand]) => {
+						Ok(HirExpr::Unary {
+							op,
+							result,
+							operand: Box::new(operand.clone()),
+						})
+					}
+					(nymph_hir::linkage::NativeExternal::Index, [receiver, index]) => Ok(HirExpr::Index {
+						recv: Box::new(receiver.clone()),
+						index: Box::new(index.clone()),
+					}),
+					_ => Err(invalid(
+						&self.artifact.definition,
+						"native external dispatch arity does not match its exact ABI",
+					)),
+				},
+				crate::ExternalCallable::Deferred => Err(invalid(
+					&self.artifact.definition,
+					"external dispatch target is deferred",
+				)),
+			};
 		}
 		if let Some(implementation) = implementation
 			&& primitive_extension_member(self.context, &member, &implementation)?
@@ -1907,13 +2153,35 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			let Some(receiver_tag) = stable_runtime_tag(&implementation.self_type) else {
 				continue;
 			};
-			let argument_type = implementation
-				.interface_arguments
+			let interface_member = interface_shape
+				.members
 				.iter()
-				.find(|(name, _)| name == "Other")
-				.map(|(_, ty)| ty)
-				.unwrap_or(&implementation.self_type);
-			let Some(argument_tag) = stable_runtime_tag(argument_type) else {
+				.find(|shape| shape.id == *member)
+				.ok_or_else(|| StableLoweringError::MissingInterfaceMember {
+					interface: interface.clone(),
+					member: member.clone(),
+				})?;
+			let parameter_type = interface_member.parameters.first().ok_or_else(|| {
+				invalid(
+					&self.artifact.definition,
+					"single-argument generic dispatch member has no exact parameter shape",
+				)
+			})?;
+			let argument_type = match &parameter_type.ty {
+				InterfaceType::Generic(parameter) => implementation
+					.interface_argument_bindings
+					.iter()
+					.find(|(candidate, _)| candidate == parameter)
+					.map(|(_, ty)| ty.clone())
+					.ok_or_else(|| {
+						invalid(
+							&implementation.id,
+							"generic dispatch implementation is missing its exact interface argument binding",
+						)
+					})?,
+				other => substitute_self_type(other, &implementation.self_type),
+			};
+			let Some(argument_tag) = stable_runtime_tag(&argument_type) else {
 				continue;
 			};
 			if receiver_tag != argument_tag {
@@ -1927,23 +2195,15 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					implementation: implementation.id.clone(),
 					member: member.clone(),
 				})?;
-			let body = self.context.runtime_definition(&slot.body_definition_id)?;
-			let target =
-				match &body.payload {
-					crate::RuntimePayload::External(abi) => {
-						let module = abi.module.as_ref().ok_or_else(|| {
-							invalid(&body.definition, "generic dispatch external has no module")
-						})?;
-						let symbol = abi.symbol.as_ref().ok_or_else(|| {
-							invalid(&body.definition, "generic dispatch external has no symbol")
-						})?;
-						HirBoundDispatchTarget::Extern {
-							module: Box::leak(module.to_string().into_boxed_str()),
-							symbol: Box::leak(symbol.to_string().into_boxed_str()),
-						}
-					}
-					crate::RuntimePayload::NymphBody(_) => {
-						let module = self.context.module_specifier(&body.definition.module)?;
+			let body = self.context.runtime_definition(&slot.member_id)?;
+			let target = match &body.payload {
+				crate::RuntimePayload::External(abi) => match &abi.callable {
+					crate::ExternalCallable::Linked { module, symbol } => HirBoundDispatchTarget::Extern {
+						module: Box::leak(module.to_string().into_boxed_str()),
+						symbol: Box::leak(symbol.to_string().into_boxed_str()),
+					},
+					crate::ExternalCallable::Native(_) => {
+						let module = self.context.module_specifier(&slot.member_id.module)?;
 						let module = match module {
 							CanonicalModuleSpecifier::Project(module)
 							| CanonicalModuleSpecifier::Importable(module)
@@ -1951,16 +2211,55 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						};
 						HirBoundDispatchTarget::TopLevel {
 							module,
-							name: self.context.binding_name(&body.definition)?.as_str().into(),
+							name: self.context.binding_name(&slot.member_id)?.as_str().into(),
 						}
 					}
-					_ => {
+					crate::ExternalCallable::Deferred => {
 						return Err(invalid(
 							&body.definition,
-							"generic dispatch body is not callable",
+							"generic dispatch target is deferred",
 						));
 					}
-				};
+				},
+				crate::RuntimePayload::NymphBody(_) => {
+					let module = self.context.module_specifier(&body.definition.module)?;
+					let module = match module {
+						CanonicalModuleSpecifier::Project(module)
+						| CanonicalModuleSpecifier::Importable(module)
+						| CanonicalModuleSpecifier::CompilerRuntime(module) => module,
+					};
+					HirBoundDispatchTarget::TopLevel {
+						module,
+						name: self.context.binding_name(&body.definition)?.as_str().into(),
+					}
+				}
+				crate::RuntimePayload::MaterializedInterfaceMember { .. }
+					if stable_runtime_tag(&implementation.self_type).is_some() =>
+				{
+					let module = self.context.module_specifier(&slot.member_id.module)?;
+					let module = match module {
+						CanonicalModuleSpecifier::Project(module)
+						| CanonicalModuleSpecifier::Importable(module)
+						| CanonicalModuleSpecifier::CompilerRuntime(module) => module,
+					};
+					HirBoundDispatchTarget::TopLevel {
+						module,
+						name: self.context.binding_name(&slot.member_id)?.as_str().into(),
+					}
+				}
+				crate::RuntimePayload::MaterializedInterfaceMember { .. } => {
+					return Err(invalid(
+						&body.definition,
+						"nominal materialized default cannot be a primitive generic dispatch case",
+					));
+				}
+				_ => {
+					return Err(invalid(
+						&body.definition,
+						"generic dispatch body is not callable",
+					));
+				}
+			};
 			if cases.iter().any(|case: &HirBoundDispatchCase| {
 				case.receiver_tag == receiver_tag && case.argument_tag == argument_tag
 			}) {
@@ -1971,10 +2270,11 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					argument_tag,
 				});
 			}
+			self.demands.borrow_mut().insert(slot.member_id.clone());
 			self
-				.demands
+				.routed_demands
 				.borrow_mut()
-				.insert(slot.body_definition_id.clone());
+				.insert(slot.member_id.clone());
 			cases.push(HirBoundDispatchCase {
 				receiver_tag,
 				argument_tag,
@@ -2056,8 +2356,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		Ok(HirExpr::InterpolatedString(result))
 	}
 	fn lower_cast(&self, expr: &Expr, lhs: &Expr) -> Result<HirExpr, StableLoweringError> {
-		let source = peel_mut(self.ty(lhs)?);
-		let target = peel_mut(self.ty(expr)?);
+		let source_type = self.ty(lhs)?;
+		let target_type = self.ty(expr)?;
+		let source = peel_mut(&source_type);
+		let target = peel_mut(&target_type);
 		let operand = self.lower(lhs)?;
 		let kind = match (source, target) {
 			(InterfaceType::Int, InterfaceType::Int) => Some(ScalarCastKind::IdentityInt),
@@ -2252,9 +2554,13 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			self.context.module_specifier(&definition.module)?;
 		}
 		if definition != &self.artifact.definition {
-			self.demands.borrow_mut().insert(definition.clone());
+			self.demand_direct(definition);
 		}
 		Ok(())
+	}
+	fn demand_direct(&self, definition: &DefinitionId) {
+		self.demands.borrow_mut().insert(definition.clone());
+		self.direct_demands.borrow_mut().insert(definition.clone());
 	}
 	fn lower_for(
 		&self,
@@ -2322,7 +2628,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				..
 			} => {
 				self.demand_concrete_iteration_next(iter, iterable_interface, iterator_interface, next)?;
-				let lowered = if matches!(peel_mut(self.ty(iterable)?), InterfaceType::List(_)) {
+				let lowered = if matches!(peel_mut(&self.ty(iterable)?), InterfaceType::List(_)) {
 					let request = StableShapeRequest::ImplementationsForInterface(iterable_interface.clone());
 					let StableShapeFact::Implementations(implementations) =
 						self.context.stable_shape(&request)?
@@ -2467,14 +2773,12 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				})?,
 			_ => return Ok(()),
 		};
-		let slot = shape
-			.member_slots
-			.iter()
-			.find(|slot| slot.interface_member_id == *iter_member || slot.member_id == *iter_member)
-			.ok_or_else(|| StableLoweringError::MissingImplementationSlot {
+		let slot = exact_implementation_slot(&shape, iter_member).ok_or_else(|| {
+			StableLoweringError::MissingImplementationSlot {
 				implementation: implementation.clone(),
 				member: iter_member.clone(),
-			})?;
+			}
+		})?;
 		let request = StableShapeRequest::Member(slot.member_id.clone());
 		let StableShapeFact::Member(member) = self.context.stable_shape(&request)? else {
 			return Err(StableShapeLookupError::WrongFact { request }.into());

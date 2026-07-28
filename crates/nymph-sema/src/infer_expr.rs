@@ -1300,6 +1300,11 @@ impl<'m> Checker<'m> {
 			let arg_lits = arg_int_lits(args);
 			return match self.resolve_method(recv_dispatch, &member.0, &arg_tys, &arg_lits, member.1) {
 				Some(res) => {
+					for (argument, expected) in args.iter().zip(&res.params) {
+						if matches!(argument.0.value.kind, ExprKind::Closure { .. }) {
+							self.check_closure(&argument.0.value, *expected);
+						}
+					}
 					let dispatch = dispatch_kind_for_method_call(&res);
 					let resolution = Resolution {
 						method: member.0.clone(),
@@ -3263,8 +3268,12 @@ impl<'m> Checker<'m> {
 		}
 	}
 
-	/// Infer a `receiver.method(args…)` call argument's type for `resolve_method`,
-	/// wrapping a fresh `#{…}`/`#[…]` literal argument's inferred type in `Mut` so
+	/// Infer a `receiver.method(args…)` call argument's shape for `resolve_method`.
+	/// Closure bodies are deferred until the selected method supplies their exact
+	/// contextual function type; collection literals retain the existing owned-`Mut`
+	/// coercion described below.
+	///
+	/// Wraps a fresh `#{…}`/`#[…]` literal argument's inferred type in `Mut` so
 	/// it can satisfy a `mut`-typed method parameter (Confirmed defect 2: unlike
 	/// free-function calls — `check_call_arg` — and ctor/block/if/match positions
 	/// — `check_dispatch`'s own hook — a method call has no parameter type to
@@ -3283,7 +3292,30 @@ impl<'m> Checker<'m> {
 	/// so the existing one-way `mut T <: T` invariant — a plain-typed named
 	/// argument still can't satisfy a `mut` parameter — is unaffected.
 	fn infer_method_call_arg(&mut self, expr: &Expr) -> Ty {
-		let ty = self.infer(expr);
+		let ty = if let ExprKind::Closure {
+			params,
+			generics,
+			return_type,
+			..
+		} = &expr.kind
+		{
+			self.push_params(build_param_scope(generics));
+			let params = params
+				.iter()
+				.map(|parameter| match &parameter.0.type_ {
+					Some(annotation) => self.lower_type(annotation),
+					None => self.fresh(),
+				})
+				.collect();
+			let return_type = match return_type {
+				Some(annotation) => self.lower_type(annotation),
+				None => self.fresh(),
+			};
+			self.pop_params();
+			self.interner.mk_fn(params, return_type)
+		} else {
+			self.infer(expr)
+		};
 		if matches!(expr.kind, ExprKind::Map(_) | ExprKind::List(_)) {
 			self.interner.mk_mut(ty)
 		} else {

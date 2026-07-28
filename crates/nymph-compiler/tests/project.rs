@@ -598,31 +598,41 @@ fn canonical_runtime_functions_are_emitted_once_for_multiple_consumers() {
 	let sources = compile_project_module_sources_with_std("main", &loader(files.clone()), &|_| None)
 		.unwrap_or_else(|diags| panic!("canonical graph should compile: {diags:?}"));
 	let list = sources
-		.get("std/collections/list")
+		.get("@nymph/runtime/collections/list")
 		.expect("canonical list owner");
-	assert_eq!(
-		list.matches("function $std$$list$sort(").count(),
-		1,
-		"{list}"
-	);
-	assert_eq!(
-		sources["std/ops"]
-			.matches("function $std$Comparable$int$compare_to(")
-			.count(),
-		1,
-		"{}",
-		sources["std/ops"]
-	);
+	let sort_declarations = list
+		.lines()
+		.filter(|line| {
+			line.starts_with("function ") && line.contains("$list$i") && line.contains("$sort(")
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(sort_declarations.len(), 1, "{list}");
+	let sort_binding = sort_declarations[0]
+		.trim_start_matches("function ")
+		.split_once('(')
+		.unwrap()
+		.0;
+	let ops = &sources["@nymph/runtime/ops"];
+	let compare_declarations = ops
+		.lines()
+		.filter(|line| {
+			line.starts_with("function ") && line.contains("$int$i") && line.contains("$compare_to(")
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(compare_declarations.len(), 1, "{ops}");
 	for consumer in ["left", "right"] {
+		let list_import = sources[consumer].lines().find(|line| {
+			line.ends_with("from \"@nymph/runtime/collections/list\";") && line.contains(sort_binding)
+		});
 		assert!(
-			sources[consumer].contains("import { $std$$list$sort } from \"std/collections/list\";"),
-			"{consumer} must import sort from its canonical owner:\n{}",
+			list_import.is_some(),
+			"{consumer} must import exact {sort_binding} from its canonical owner:\n{}",
 			sources[consumer]
 		);
 	}
 	assert!(
-		list.contains("from \"std/collections/list$intrinsics\""),
-		"canonical public owner must re-export intrinsic backing:\n{list}"
+		list.contains("from \"std/collections/list\""),
+		"canonical Nymph owner must link its host-only leaf explicitly:\n{list}"
 	);
 	let out = run_project(
 		FxHashMap::from_iter([
@@ -640,6 +650,60 @@ fn canonical_runtime_functions_are_emitted_once_for_multiple_consumers() {
 		"",
 	);
 	assert_eq!(out, "4");
+}
+
+#[test]
+fn native_generic_dispatch_members_are_declared_once_by_exact_identity() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"func add<T: Plus<Other = T, Output = T>>(left: T, right: T): T = if (1.plus(1) == 2) left + right else left\n\
+		 func result(): int = add(20, 22)\nfunc main(): void = {}",
+	)]);
+	let sources = compile_project_module_sources_with_std("main", &loader(files.clone()), &|_| None)
+		.unwrap_or_else(|diags| panic!("native generic dispatch should assemble: {diags:?}"));
+	let plus_declarations = sources
+		.iter()
+		.flat_map(|(module, source)| {
+			source
+				.lines()
+				.filter(|line| line.starts_with("function ") && line.contains("$plus("))
+				.map(move |line| (module.as_str(), line))
+		})
+		.collect::<Vec<_>>();
+	let unique = plus_declarations
+		.iter()
+		.map(|(_, declaration)| *declaration)
+		.collect::<std::collections::HashSet<_>>();
+	assert!(!plus_declarations.is_empty(), "{sources:#?}");
+	assert_eq!(
+		plus_declarations.len(),
+		unique.len(),
+		"{plus_declarations:#?}"
+	);
+	let main = &sources["main"];
+	let plus_imports = main
+		.lines()
+		.filter(|line| line.starts_with("import ") && line.contains("$plus"))
+		.flat_map(|line| {
+			line
+				.split_once('{')
+				.unwrap()
+				.1
+				.split_once('}')
+				.unwrap()
+				.0
+				.split(',')
+				.map(str::trim)
+				.filter(|name| name.contains("$plus"))
+		})
+		.collect::<Vec<_>>();
+	let unique_imports = plus_imports
+		.iter()
+		.copied()
+		.collect::<std::collections::HashSet<_>>();
+	assert!(!plus_imports.is_empty(), "{main}");
+	assert_eq!(plus_imports.len(), unique_imports.len(), "{main}");
+	assert_eq!(run_project(files, "result", ""), "42");
 }
 
 #[test]

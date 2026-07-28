@@ -208,8 +208,10 @@ fn complete_fixture() -> ModuleInterface {
 		return_type: InterfaceType::Boolean,
 		external: Some(ExternalAbi {
 			marker: "js".into(),
-			module: Some("host".into()),
-			symbol: Some("call".into()),
+			callable: nymph_sema::ExternalCallable::Linked {
+				module: "host".into(),
+				symbol: "call".into(),
+			},
 			marshal: Some(MarshalKind::Int),
 		}),
 		runtime_owner: Some(owner.clone()),
@@ -260,6 +262,7 @@ fn complete_fixture() -> ModuleInterface {
 			visibility: Some(Visibility::Private),
 			interface: Some(definition("Bound")),
 			interface_arguments: vec![("Output".into(), InterfaceType::String)],
+			interface_argument_bindings: vec![],
 			self_type: InterfaceType::Named {
 				definition: owner.clone(),
 				positional: vec![InterfaceType::Int],

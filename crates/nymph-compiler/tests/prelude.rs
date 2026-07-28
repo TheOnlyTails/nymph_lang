@@ -239,6 +239,25 @@ fn interface_default_generic_arithmetic_executes_through_the_stable_protocol() {
 }
 
 #[test]
+fn materialized_self_equality_substitutes_primitive_and_nominal_receivers() {
+	let source = "interface IdentityDefault { func same(other: self): boolean = this == other }\n\
+		struct Box(value: int)\n\
+		impl IdentityDefault for int {}\n\
+		impl IdentityDefault for Box {}\n\
+		func result(): #(boolean, boolean) = #(21.same(21), Box(value = 1).same(Box(value = 1)))";
+
+	let diags = check(source, "test");
+	assert!(
+		!diags.iter().any(|d| d.is_error()),
+		"expected materialized SelfType equality defaults to compile cleanly, got: {diags:?}"
+	);
+	assert_eq!(
+		run(source, "result().v.map(value => value.v).join(' ')"),
+		"true false"
+	);
+}
+
+#[test]
 fn comparable_compare_to_for_string_links_and_runs() {
 	// Primitive comparison itself remains a host leaf, while the Comparable
 	// implementation and sign-to-Order composition are inspectable Nymph.

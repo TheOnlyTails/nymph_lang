@@ -51,12 +51,17 @@ pub enum InterfaceConversionError {
 	UnknownBinder(ParamIdx),
 	UnknownStableDefinition(DefinitionId),
 	UnknownGenericParameter(GenericParameterId),
+	UnknownInterfaceArgument {
+		interface: DefinitionId,
+		name: EcoString,
+	},
 }
 
 #[derive(Default)]
 pub struct CanonicalizationContext {
 	definitions: HashMap<DefId, DefinitionId>,
 	parameters: HashMap<ParamIdx, GenericParameterId>,
+	self_parameter: Option<ParamIdx>,
 }
 
 impl CanonicalizationContext {
@@ -67,7 +72,12 @@ impl CanonicalizationContext {
 		Self {
 			definitions,
 			parameters,
+			self_parameter: None,
 		}
+	}
+	pub(crate) fn with_self_parameter(mut self, parameter: ParamIdx) -> Self {
+		self.self_parameter = Some(parameter);
+		self
 	}
 
 	pub(crate) fn definitions(&self) -> HashMap<DefId, DefinitionId> {
@@ -158,6 +168,7 @@ pub fn canonicalize_type(
 				InterfaceType::Intersection(items)
 			}
 			TyKind::Mut(inner) => InterfaceType::Mutable(Box::new(go(interner, *inner, context)?)),
+			TyKind::Param(idx) if context.self_parameter == Some(*idx) => InterfaceType::SelfType,
 			TyKind::Param(idx) => InterfaceType::Generic(
 				context
 					.parameters
@@ -348,13 +359,30 @@ pub enum MemberKind {
 	StaticFunction,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub enum ExternalCallable {
+	Linked {
+		module: EcoString,
+		symbol: EcoString,
+	},
+	Native(nymph_hir::linkage::NativeExternal),
+	Deferred,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct ExternalAbi {
 	pub marker: EcoString,
-	/// Checked host linkage. `None` means the marker is intentionally deferred
-	/// rather than pretending it belongs to a fabricated `host` module.
-	pub module: Option<EcoString>,
-	pub symbol: Option<EcoString>,
+	pub callable: ExternalCallable,
 	pub marshal: Option<MarshalKind>,
+}
+
+impl ExternalAbi {
+	#[must_use]
+	pub fn linked(&self) -> Option<(&EcoString, &EcoString)> {
+		match &self.callable {
+			ExternalCallable::Linked { module, symbol } => Some((module, symbol)),
+			ExternalCallable::Native(_) | ExternalCallable::Deferred => None,
+		}
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
@@ -395,6 +423,7 @@ pub struct ExportedImpl {
 	pub visibility: Option<Visibility>,
 	pub interface: Option<DefinitionId>,
 	pub interface_arguments: Vec<(EcoString, InterfaceType)>,
+	pub interface_argument_bindings: Vec<(GenericParameterId, InterfaceType)>,
 	pub self_type: InterfaceType,
 	pub mutable: bool,
 	pub binders: Vec<GenericParameter>,

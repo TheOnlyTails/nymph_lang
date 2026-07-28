@@ -121,6 +121,7 @@ fn complete_interfaces_and_impls_populate_owned_dispatch_registries() {
 		visibility: None,
 		interface: Some(iface_id.clone()),
 		interface_arguments: vec![("Output".into(), InterfaceType::String)],
+		interface_argument_bindings: vec![],
 		self_type: InterfaceType::Named {
 			definition: type_id.clone(),
 			positional: vec![],
@@ -270,6 +271,7 @@ fn impl_only_referenced_identity_is_allocated_in_pass_a() {
 		visibility: None,
 		interface: None,
 		interface_arguments: vec![],
+		interface_argument_bindings: vec![],
 		self_type: InterfaceType::Named {
 			definition: hidden.clone(),
 			positional: vec![],
@@ -548,8 +550,10 @@ fn recovered_definitions_retain_every_independently_known_owned_fact() {
 		super_interfaces: vec![],
 		external: Some(ExternalAbi {
 			marker: "host".into(),
-			module: Some("runtime".into()),
-			symbol: Some("value".into()),
+			callable: nymph_sema::ExternalCallable::Linked {
+				module: "runtime".into(),
+				symbol: "value".into(),
+			},
 			marshal: Some(nymph_hir::hir::MarshalKind::Int),
 		}),
 		runtime_owner: None,

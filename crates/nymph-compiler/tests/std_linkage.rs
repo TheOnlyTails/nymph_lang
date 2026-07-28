@@ -675,7 +675,7 @@ fn boxed_collection_intrinsics_preserve_value_semantics_and_nested_shapes() {
 }
 
 #[test]
-fn blanket_equals_routes_non_primitive_operators_through_structural_equality() {
+fn nominal_equality_operators_use_identity_without_changing_explicit_equals() {
 	let entry = r#"
 		struct Point(x: int)
 		struct Pair(left: Point, right: Point)
@@ -691,6 +691,8 @@ fn blanket_equals_routes_non_primitive_operators_through_structural_equality() {
 		func generic(): boolean = generic_same(Point(x = 3), Point(x = 3))
 		func generic_custom_same(): boolean = generic_same(AlwaysEqual(x = 1), AlwaysEqual(x = 2))
 		func generic_custom_different(): boolean = generic_different(AlwaysEqual(x = 1), AlwaysEqual(x = 2))
+		func explicit_custom_same(): boolean = AlwaysEqual(x = 1).equals(AlwaysEqual(x = 2))
+		func explicit_custom_different(): boolean = AlwaysEqual(x = 1).not_equals(AlwaysEqual(x = 2))
 		func main(): void = {}
 	"#;
 	let load = only_entry("main", entry);
@@ -702,6 +704,8 @@ fn blanket_equals_routes_non_primitive_operators_through_structural_equality() {
 	let generic = compiled.entry_symbol("generic");
 	let generic_custom_same = compiled.entry_symbol("generic_custom_same");
 	let generic_custom_different = compiled.entry_symbol("generic_custom_different");
+	let explicit_custom_same = compiled.entry_symbol("explicit_custom_same");
+	let explicit_custom_different = compiled.entry_symbol("explicit_custom_different");
 	let mut js = compiled.js;
 	js.push_str(&format!("\nconsole.log({equal}().v);\n"));
 	js.push_str(&format!("console.log({unequal}().v);\n"));
@@ -709,9 +713,11 @@ fn blanket_equals_routes_non_primitive_operators_through_structural_equality() {
 	js.push_str(&format!("console.log({generic}().v);\n"));
 	js.push_str(&format!("console.log({generic_custom_same}().v);\n"));
 	js.push_str(&format!("console.log({generic_custom_different}().v);\n"));
+	js.push_str(&format!("console.log({explicit_custom_same}().v);\n"));
+	js.push_str(&format!("console.log({explicit_custom_different}().v);\n"));
 	assert_eq!(
 		run_node(&js, "blanket_equals"),
-		"true\ntrue\ntrue\ntrue\ntrue\nfalse"
+		"false\ntrue\nfalse\nfalse\nfalse\ntrue\ntrue\nfalse"
 	);
 }
 

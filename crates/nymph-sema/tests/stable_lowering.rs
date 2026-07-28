@@ -298,8 +298,10 @@ fn imported_external_reference_has_exact_stable_marshal_annotation() {
 			super_interfaces: vec![],
 			external: Some(ExternalAbi {
 				marker: "max_float".into(),
-				module: Some("std/math/intrinsics".into()),
-				symbol: Some("max_float".into()),
+				callable: nymph_sema::ExternalCallable::Linked {
+					module: "std/math/intrinsics".into(),
+					symbol: "max_float".into(),
+				},
 				marshal: Some(nymph_hir::hir::MarshalKind::Float),
 			}),
 			runtime_owner: None,
@@ -904,7 +906,7 @@ fn malformed_external_artifacts_return_distinct_typed_errors() {
 	let nymph_sema::RuntimePayload::External(abi) = &mut missing_module.payload else {
 		unreachable!()
 	};
-	abi.module = None;
+	abi.callable = nymph_sema::ExternalCallable::Deferred;
 	context.shapes.insert(
 		StableShapeRequest::ExternalAbi(missing_module.definition.clone()),
 		StableShapeFact::ExternalAbi(abi.clone()),
@@ -932,8 +934,10 @@ fn malformed_external_artifacts_return_distinct_typed_errors() {
 		StableShapeRequest::ExternalAbi(artifact.definition.clone()),
 		StableShapeFact::ExternalAbi(nymph_sema::ExternalAbi {
 			marker: "different".into(),
-			module: Some("elsewhere".into()),
-			symbol: Some("different".into()),
+			callable: nymph_sema::ExternalCallable::Linked {
+				module: "elsewhere".into(),
+				symbol: "different".into(),
+			},
 			marshal: Some(nymph_hir::hir::MarshalKind::Float),
 		}),
 	);
@@ -1196,7 +1200,7 @@ fn generic_bound_with_two_primitive_implementations_lowers_to_stable_multi_case_
 	let expected_targets = interface
 		.implementations
 		.iter()
-		.map(|implementation| implementation.member_slots[0].body_definition_id.clone())
+		.map(|implementation| implementation.member_slots[0].member_id.clone())
 		.collect::<Vec<_>>();
 	assert_eq!(
 		function.body,
@@ -1226,6 +1230,53 @@ fn generic_bound_with_two_primitive_implementations_lowers_to_stable_multi_case_
 		}
 	);
 	assert_eq!(lowered.demands(), expected_targets);
+	assert!(lowered.direct_demands().is_empty());
+	assert_eq!(lowered.routed_demands(), expected_targets);
+}
+
+#[test]
+fn generic_bound_dispatch_uses_the_exact_interface_argument_parameter() {
+	let source = "interface Same<Rhs> { func same(other: Rhs): int }\n\
+		impl Same<Rhs = uint> for int { func same(other: uint): int = other as int }\n\
+		func choose<T: Same<Rhs = T>>(a: T, b: T): int = a.same(b)";
+	let (artifacts, _, context) = materialized_fixture(source);
+	let artifact = artifacts
+		.into_iter()
+		.find(|item| source_name(&item.definition) == "choose")
+		.unwrap();
+	let lowered = lower_runtime_definition(&context, Arc::new(artifact)).unwrap();
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("unexpected fragment: {:?}", lowered.fragment())
+	};
+
+	assert!(matches!(
+		&function.body,
+		nymph_hir::hir::HirExpr::BoundDispatch { cases, .. } if cases.is_empty()
+	));
+	assert!(lowered.demands().is_empty());
+}
+
+#[test]
+fn one_body_preserves_independent_direct_and_routed_roles_for_the_same_exact_member() {
+	let source = "interface Same<Other, Output> { func same(other: Other): Output }\n\
+		impl Same<Other = int, Output = int> for int { func same(other: int): int = other }\n\
+		func choose<T: Same<Other = T, Output = T>>(a: T, b: T): T = {\n\
+			let ignored = 1.same(2)\n\
+			a.same(b)\n\
+		}";
+	let (artifacts, interface, context) = materialized_fixture(source);
+	let artifact = artifacts
+		.into_iter()
+		.find(|item| source_name(&item.definition) == "choose")
+		.unwrap();
+	let lowered = lower_runtime_definition(&context, Arc::new(artifact)).unwrap();
+	let exact = interface.implementations[0].member_slots[0]
+		.member_id
+		.clone();
+
+	assert!(lowered.demands().contains(&exact));
+	assert!(lowered.direct_demands().contains(&exact));
+	assert!(lowered.routed_demands().contains(&exact));
 }
 
 #[test]

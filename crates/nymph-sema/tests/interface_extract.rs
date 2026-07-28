@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use nymph_hir::hir::MarshalKind;
+use nymph_hir::{
+	hir::{BinOp, BuiltinResult, MarshalKind},
+	linkage::NativeExternal,
+};
 use nymph_sema::{
 	DeclarationCategory, DeclarationKey, DefinitionId, DefinitionShapeKind, EntryMode,
 	ExportedDefinition, InterfaceType, ModuleEnvironment, ModuleIdentity, ModuleInterface,
@@ -320,8 +323,7 @@ public impl<T> Show<T = T> for Choice<T> {
 		.unwrap();
 	let abi = external.external.as_ref().unwrap();
 	assert_eq!(abi.marker, "host_print");
-	assert_eq!(abi.module, None);
-	assert_eq!(abi.symbol, None);
+	assert_eq!(abi.callable, nymph_sema::ExternalCallable::Deferred);
 	assert_eq!(interface.implementations.len(), 1);
 	assert_eq!(interface.implementations[0].members.len(), 1);
 }
@@ -788,7 +790,50 @@ fn extraction_uses_checked_external_value_linkage_and_marshal() {
 	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();
 	let abi = interface.exports[0].external.as_ref().unwrap();
 	assert_eq!(abi.marker, "max_float");
-	assert_eq!(abi.module.as_deref(), Some("std/math/intrinsics"));
-	assert_eq!(abi.symbol.as_deref(), Some("max_float"));
+	assert_eq!(
+		abi.callable,
+		nymph_sema::ExternalCallable::Linked {
+			module: "std/math/intrinsics".into(),
+			symbol: "max_float".into(),
+		}
+	);
 	assert_eq!(abi.marshal, Some(MarshalKind::Float));
+}
+
+#[test]
+fn extraction_preserves_native_primitive_external_semantics() {
+	let module = parse(
+		"interface Plus<Other, Output> { func plus(other: Other): Output }\n\
+		 impl Plus<Other = self, Output = self> for int { external func plus(other: self): self }",
+	);
+	let checked = check_module(&module);
+	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+	let headers = declared_headers(identity(), &module);
+	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();
+	let abi = interface.implementations[0].members[0]
+		.external
+		.as_ref()
+		.unwrap();
+	assert_eq!(
+		abi.callable,
+		nymph_sema::ExternalCallable::Native(NativeExternal::Binary {
+			op: BinOp::Add,
+			result: BuiltinResult::Int,
+		})
+	);
+}
+
+#[test]
+fn native_external_classification_requires_the_exact_checked_arity() {
+	let module = parse("impl int { external func plus(): int }");
+	let checked = check_module(&module);
+	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+	let headers = declared_headers(identity(), &module);
+	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();
+	let abi = interface.implementations[0].members[0]
+		.external
+		.as_ref()
+		.unwrap();
+
+	assert_eq!(abi.callable, nymph_sema::ExternalCallable::Deferred);
 }

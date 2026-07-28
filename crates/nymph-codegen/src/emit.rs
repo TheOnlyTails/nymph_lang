@@ -176,6 +176,14 @@ impl<'a> Emitter<'a> {
 		emitter
 	}
 
+	pub(crate) fn with_needed_imports(mut self, imports: &[(String, String, String)]) -> Self {
+		self
+			.needed_imports
+			.get_mut()
+			.extend(imports.iter().cloned());
+		self
+	}
+
 	/// A fresh temporary variable name (`_t0`, `_t1`, …).
 	fn gensym(&self) -> String {
 		let n = self.gensym.get();
