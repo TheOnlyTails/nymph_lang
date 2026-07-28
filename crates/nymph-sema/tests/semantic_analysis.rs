@@ -226,6 +226,18 @@ fn imported_opaque_method_return_retains_its_exact_interface_bound() {
 		.iter()
 		.find(|implementation| implementation.definition.as_ref() == Some(&iter_implementation_id))
 		.unwrap();
+	let imported_iterable_member =
+		environment.imported.interfaces[&imported_implementation.interface].methods["iter"]
+			.definition
+			.as_ref()
+			.unwrap();
+	assert!(
+		imported_implementation
+			.member_catalog
+			.target(imported_iterable_member)
+			.is_some(),
+		"imported implementation catalog must use the imported interface's exact member ID"
+	);
 	let imported_iter = &imported_implementation.methods["iter"];
 	let TyKind::Param(imported_opaque_return) = environment.interner.kind(imported_iter.ret) else {
 		panic!("imported iter return is not its method-owned opaque binder")
@@ -414,7 +426,7 @@ fn recovered_dependency_poison_suppresses_cascades_without_hiding_independent_er
 		binders: vec![],
 		constraints: vec![],
 		members: vec![],
-		member_slots: vec![],
+		member_slots: vec![].into(),
 		runtime_owner: None,
 	};
 	let recovered = Arc::new(ModuleEnvironment::Recovered(RecoveredModuleInterface {

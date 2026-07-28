@@ -54,6 +54,7 @@ pub(crate) struct MethodResolution {
 	pub(crate) source: MethodSource,
 	pub(crate) target: Option<DefinitionId>,
 	pub(crate) implementation: Option<DefinitionId>,
+	pub(crate) resolved_target: Option<crate::annotate::ResolvedMethodTarget>,
 	/// The span of the matched impl's `interface … for …` header (`ImplDef::span`),
 	/// when resolution went through the impl index (`Inherent`/`GenericBound`
 	/// don't: neither commits a specific `impl` block, see their construction
@@ -66,6 +67,167 @@ pub(crate) struct MethodResolution {
 }
 
 impl Checker<'_> {
+	/// Resolve a method as a first-class callable from receiver facts alone.
+	/// Unlike a call, a stored method has no argument expressions with which to
+	/// disambiguate overloads, so multiple receiver-applicable candidates are an
+	/// explicit ambiguity rather than an invitation to invent argument types.
+	pub(crate) fn resolve_method_value(
+		&mut self,
+		recv: Ty,
+		name: &str,
+		span: Span,
+	) -> Option<MethodResolution> {
+		let resolved = self.shallow_resolve(recv);
+		let receiver_is_mut = matches!(self.interner.kind(resolved), TyKind::Mut(_));
+		let receiver = self.strip_mut(resolved);
+
+		if let Some((params, ty, target, implementation, method_span)) =
+			self.resolve_inherent_value(receiver, name, span)
+		{
+			let resolved_target =
+				target
+					.clone()
+					.zip(implementation.clone())
+					.map(
+						|(member, implementation)| crate::annotate::ResolvedMethodTarget::Inherent {
+							member,
+							implementation,
+						},
+					);
+			return Some(MethodResolution {
+				ty,
+				params,
+				source: MethodSource::Inherent,
+				target,
+				implementation,
+				resolved_target,
+				impl_span: method_span,
+			});
+		}
+
+		if let TyKind::Param(parameter) = *self.interner.kind(receiver)
+			&& let Some(resolution) =
+				self.resolve_param_method_value(parameter, receiver_is_mut, name, span)
+		{
+			return Some(resolution);
+		}
+
+		let head = head_of(&self.interner, receiver);
+		let interfaces = self
+			.interfaces
+			.iter()
+			.filter(|(_, definition)| definition.methods.contains_key(name))
+			.map(|(interface, _)| *interface)
+			.collect::<Vec<_>>();
+		let mut candidates = Vec::new();
+		for interface in interfaces {
+			candidates.extend(self.impls.candidates(interface, head));
+		}
+		candidates.sort_unstable();
+		candidates.dedup();
+		candidates.retain(|index| self.implementation_supplies_method(*index, name));
+		let mut receiver_matches = Vec::new();
+		for index in candidates {
+			let snapshot = self.table.snapshot();
+			let matched = self.method_matches_receiver(index, receiver, receiver_is_mut);
+			self.table.rollback_to(snapshot);
+			if matched {
+				receiver_matches.push(index);
+			}
+		}
+		let receiver_matches = self.most_specific(&receiver_matches);
+		if receiver_matches.len() != 1 {
+			if receiver_matches.len() > 1 {
+				self.emit(span, TypeError::AmbiguousCall { name: name.into() });
+				return Some(self.error_method_resolution());
+			}
+			return None;
+		}
+		let index = receiver_matches[0];
+		self.gate_mutating(
+			self.impls.impls[index].interface,
+			name,
+			receiver_is_mut,
+			span,
+		);
+		Some(self.commit_method(index, receiver, name, None, span))
+	}
+
+	fn resolve_param_method_value(
+		&mut self,
+		parameter: ParamIdx,
+		receiver_is_mut: bool,
+		name: &str,
+		span: Span,
+	) -> Option<MethodResolution> {
+		let receiver = self.interner.mk_param(parameter);
+		let mut candidates = Vec::new();
+		for (interface, bound_args) in self.param_interface_bounds(parameter) {
+			let Some(definition) = self.interfaces.get(&interface).cloned() else {
+				continue;
+			};
+			let Some(method) = definition.methods.get(name).cloned() else {
+				continue;
+			};
+			candidates.push((interface, bound_args, definition, method));
+		}
+		if candidates.len() > 1 {
+			self.emit(span, TypeError::AmbiguousCall { name: name.into() });
+			return Some(self.error_method_resolution());
+		}
+		let (interface, bound_args, definition, method) = candidates.pop()?;
+		self.gate_mutating(interface, name, receiver_is_mut, span);
+		let mut substitution = FxHashMap::default();
+		for (index, generic) in definition.generics.iter().enumerate() {
+			let ty = bound_args
+				.iter()
+				.find(|(name, _)| name == generic)
+				.map(|(_, ty)| *ty)
+				.unwrap_or_else(|| self.fresh());
+			substitution.insert(ParamIdx(index as u32), ty);
+		}
+		let (params, ty) = self.instantiate_iface_method_signature(
+			&method,
+			substitution,
+			definition.generics.len(),
+			receiver,
+			span,
+		);
+		let target = method.definition;
+		let resolved_target = self
+			.defs
+			.stable(interface)
+			.cloned()
+			.zip(target.clone())
+			.map(
+				|(interface, interface_member)| crate::annotate::ResolvedMethodTarget::GenericBound {
+					interface,
+					interface_member,
+				},
+			);
+		Some(MethodResolution {
+			ty,
+			params,
+			source: MethodSource::GenericBound,
+			target,
+			implementation: None,
+			resolved_target,
+			impl_span: Some(self.defs.data(interface).span),
+		})
+	}
+
+	fn error_method_resolution(&self) -> MethodResolution {
+		MethodResolution {
+			ty: self.interner.error(),
+			params: Vec::new(),
+			source: MethodSource::ImplDirect,
+			target: None,
+			implementation: None,
+			resolved_target: None,
+			impl_span: None,
+		}
+	}
+
 	fn param_interface_bounds(&self, param: ParamIdx) -> Vec<(DefId, Vec<(EcoString, Ty)>)> {
 		let mut bounds = Vec::new();
 		if let Some(interfaces) = self.param_bounds.get(&param) {
@@ -242,6 +404,19 @@ impl Checker<'_> {
 		arg_name: &str,
 		depth: u32,
 	) -> Option<Ty> {
+		self
+			.resolve_iface_arg_with_implementation(self_ty, self_is_mut, interface, arg_name, depth)
+			.map(|(ty, _)| ty)
+	}
+
+	pub(crate) fn resolve_iface_arg_with_implementation(
+		&mut self,
+		self_ty: Ty,
+		self_is_mut: bool,
+		interface: DefId,
+		arg_name: &str,
+		depth: u32,
+	) -> Option<(Ty, usize)> {
 		if depth > MAX_DEPTH {
 			return None;
 		}
@@ -250,7 +425,7 @@ impl Checker<'_> {
 		for idx in self.impls.candidates(interface, head) {
 			let snapshot = self.table.snapshot();
 			match self.try_impl_arg(idx, self_ty, self_is_mut, arg_name, depth) {
-				Some(ty) => return Some(ty),
+				Some(ty) => return Some((ty, idx)),
 				None => self.table.rollback_to(snapshot),
 			}
 		}
@@ -336,16 +511,13 @@ impl Checker<'_> {
 					.unwrap_or_else(|| self.fresh());
 				isubst.insert(ParamIdx(k as u32), ty);
 			}
-			// The method's own generics (`Param(iface_len + j)`) → fresh vars too.
-			for j in 0..method.generics.len() {
-				isubst.insert(ParamIdx((iface.generics.len() + j) as u32), self.fresh());
-			}
-			let params: Vec<Ty> = method
-				.params
-				.iter()
-				.map(|t| self.subst(*t, &isubst, Some(param_ty)))
-				.collect();
-			let ret = self.subst(method.ret, &isubst, Some(param_ty));
+			let (params, ret) = self.instantiate_iface_method_signature(
+				&method,
+				isubst,
+				iface.generics.len(),
+				param_ty,
+				span,
+			);
 			if params.len() != arg_tys.len() {
 				self.emit(
 					span,
@@ -405,16 +577,13 @@ impl Checker<'_> {
 					.unwrap_or_else(|| self.fresh());
 				isubst.insert(ParamIdx(k as u32), ty);
 			}
-			// The method's own generics (`Param(iface_len + j)`) → fresh vars too.
-			for j in 0..method.generics.len() {
-				isubst.insert(ParamIdx((iface.generics.len() + j) as u32), self.fresh());
-			}
-			let params: Vec<Ty> = method
-				.params
-				.iter()
-				.map(|t| self.subst(*t, &isubst, Some(param_ty)))
-				.collect();
-			let ret = self.subst(method.ret, &isubst, Some(param_ty));
+			let (params, ret) = self.instantiate_iface_method_signature(
+				&method,
+				isubst,
+				iface.generics.len(),
+				param_ty,
+				span,
+			);
 			if params.len() != arg_tys.len() {
 				self.emit(
 					span,
@@ -560,13 +729,14 @@ impl Checker<'_> {
 			// (`mut func`) method of the same interface on `this` needs `this` to
 			// be `mut` too — mirrors every other call-site gate below.
 			self.gate_mutating(iface_id, name, recv_is_mut, span);
-			let empty = FxHashMap::default();
-			let params: Vec<Ty> = method
-				.params
-				.iter()
-				.map(|t| self.subst(*t, &empty, Some(recv)))
-				.collect();
-			let ret = self.subst(method.ret, &empty, Some(recv));
+			let owner_generics = self.interfaces[&iface_id].generics.len();
+			let (params, ret) = self.instantiate_iface_method_signature(
+				&method,
+				FxHashMap::default(),
+				owner_generics,
+				recv,
+				span,
+			);
 			// `iface_id`'s own `DefData::span` doubles as the prelude-origin marker
 			// `impl_is_unmaterialized` (`infer_expr.rs`) reads (Finding 1/3, stdlib
 			// linkage groundwork review round 2): an interface declared inside an
@@ -575,6 +745,17 @@ impl Checker<'_> {
 			// correctly flagged as unmaterialized too, exactly like every other
 			// `GenericBound` construction site below.
 			let iface_span = self.defs.data(iface_id).span;
+			let resolved_target = self
+				.defs
+				.stable(iface_id)
+				.cloned()
+				.zip(method.definition.clone())
+				.map(
+					|(interface, interface_member)| crate::annotate::ResolvedMethodTarget::GenericBound {
+						interface,
+						interface_member,
+					},
+				);
 			if params.len() != arg_tys.len() {
 				self.emit(
 					span,
@@ -590,6 +771,7 @@ impl Checker<'_> {
 					source: MethodSource::GenericBound,
 					target: method.definition.clone(),
 					implementation: None,
+					resolved_target: resolved_target.clone(),
 					impl_span: Some(iface_span),
 				});
 			}
@@ -607,6 +789,7 @@ impl Checker<'_> {
 				source: MethodSource::GenericBound,
 				target: method.definition,
 				implementation: None,
+				resolved_target,
 				impl_span: Some(iface_span),
 			});
 		}
@@ -615,12 +798,23 @@ impl Checker<'_> {
 		if let Some((params, ret, target, implementation, method_span)) =
 			self.resolve_inherent(recv, name, arg_tys, arg_lits, span)
 		{
+			let resolved_target =
+				target
+					.clone()
+					.zip(implementation.clone())
+					.map(
+						|(member, implementation)| crate::annotate::ResolvedMethodTarget::Inherent {
+							member,
+							implementation,
+						},
+					);
 			return Some(MethodResolution {
 				ty: ret,
 				params,
 				source: MethodSource::Inherent,
 				target,
 				implementation,
+				resolved_target,
 				impl_span: method_span,
 			});
 		}
@@ -648,12 +842,25 @@ impl Checker<'_> {
 			// resolved `method` through `A`'s bound — same gate as everywhere
 			// else, keyed off the interface the bound was satisfied through.
 			self.gate_mutating(iface_def, name, recv_is_mut, span);
+			let target = self.interfaces[&iface_def].methods[name].definition.clone();
+			let resolved_target = self
+				.defs
+				.stable(iface_def)
+				.cloned()
+				.zip(target.clone())
+				.map(
+					|(interface, interface_member)| crate::annotate::ResolvedMethodTarget::GenericBound {
+						interface,
+						interface_member,
+					},
+				);
 			return Some(MethodResolution {
 				ty,
 				params,
 				source: MethodSource::GenericBound,
-				target: self.interfaces[&iface_def].methods[name].definition.clone(),
+				target,
 				implementation: None,
+				resolved_target,
 				impl_span: Some(self.defs.data(iface_def).span),
 			});
 		}
@@ -701,7 +908,13 @@ impl Checker<'_> {
 				recv_is_mut,
 				span,
 			);
-			return Some(self.commit_method(receiver_matches[0], recv, name, arg_tys, arg_lits, span));
+			return Some(self.commit_method(
+				receiver_matches[0],
+				recv,
+				name,
+				Some((arg_tys, arg_lits)),
+				span,
+			));
 		}
 
 		// Phase 2: several impls share the receiver — disambiguate by argument types over
@@ -750,6 +963,7 @@ impl Checker<'_> {
 					source: MethodSource::ImplDirect,
 					target: None,
 					implementation: None,
+					resolved_target: None,
 					impl_span: None,
 				})
 			}
@@ -760,7 +974,7 @@ impl Checker<'_> {
 					recv_is_mut,
 					span,
 				);
-				Some(self.commit_method(chosen[0], recv, name, arg_tys, arg_lits, span))
+				Some(self.commit_method(chosen[0], recv, name, Some((arg_tys, arg_lits)), span))
 			}
 			_ => {
 				self.emit(span, TypeError::AmbiguousCall { name: name.into() });
@@ -770,6 +984,7 @@ impl Checker<'_> {
 					source: MethodSource::ImplDirect,
 					target: None,
 					implementation: None,
+					resolved_target: None,
 					impl_span: None,
 				})
 			}
@@ -792,12 +1007,18 @@ impl Checker<'_> {
 
 	fn implementation_supplies_method(&self, idx: usize, name: &str) -> bool {
 		let implementation = &self.impls.impls[idx];
-		implementation.methods.contains_key(name)
-			|| self
-				.interfaces
-				.get(&implementation.interface)
-				.and_then(|interface| interface.methods.get(name))
-				.is_some_and(|method| method.has_default)
+		let method = self
+			.interfaces
+			.get(&implementation.interface)
+			.and_then(|interface| interface.methods.get(name));
+		match method.and_then(|method| method.definition.as_ref()) {
+			Some(member) => implementation.member_catalog.target(member).is_some(),
+			None => {
+				// Identity-less `check_module` is a diagnostics-only compatibility API.
+				// Preserve type checking there, but never fabricate a stable target.
+				implementation.methods.contains_key(name) || method.is_some_and(|method| method.has_default)
+			}
+		}
 	}
 
 	/// Trial-unify a receiver against an impl's (subst'ed) self type, honoring a
@@ -860,7 +1081,7 @@ impl Checker<'_> {
 		{
 			return None;
 		}
-		let (params, ret, _source) = self.method_signature(&def, &subst, recv, name)?;
+		let (params, ret, _source) = self.method_signature(&def, &subst, recv, name, None)?;
 		if params.len() != arg_tys.len() {
 			return None;
 		}
@@ -880,8 +1101,7 @@ impl Checker<'_> {
 		idx: usize,
 		recv: Ty,
 		name: &str,
-		arg_tys: &[Ty],
-		arg_lits: &[bool],
+		arguments: Option<(&[Ty], &[bool])>,
 		span: Span,
 	) -> MethodResolution {
 		let def = self.impls.impls[idx].clone();
@@ -889,26 +1109,23 @@ impl Checker<'_> {
 		let impl_self = self.subst(def.self_ty, &subst, None);
 		self.unify_self(recv, impl_self, span);
 		let implementation = def.definition.clone();
-		let target = def
-			.methods
-			.get(name)
-			.and_then(|method| method.definition.clone())
-			.or_else(|| {
-				let implementation = implementation.clone()?;
-				let interface_member = self
-					.interfaces
-					.get(&def.interface)?
-					.methods
-					.get(name)?
-					.definition
-					.clone()?;
-				Some(DefinitionId::new(
-					implementation.module.clone(),
-					crate::DeclarationKey::materialized_interface_member(implementation, interface_member),
-				))
-			});
+		let interface = self.defs.stable(def.interface).cloned();
+		let interface_member = self
+			.interfaces
+			.get(&def.interface)
+			.and_then(|interface| interface.methods.get(name))
+			.and_then(|method| method.definition.clone());
+		let slot = interface_member
+			.as_ref()
+			.and_then(|member| def.member_catalog.target(member))
+			.cloned();
+		let target = slot.as_ref().map(|slot| slot.member_id.clone());
+		let resolved_target = interface.zip(slot).map(|(interface, slot)| {
+			crate::annotate::ResolvedMethodTarget::InterfaceImplementation { interface, slot }
+		});
 
-		let Some((params, ret, source)) = self.method_signature(&def, &subst, recv, name) else {
+		let Some((params, ret, source)) = self.method_signature(&def, &subst, recv, name, Some(span))
+		else {
 			// Unreachable in practice: `candidates` was assembled from interfaces whose
 			// `methods` map already contains `name`, so `method_signature` always finds
 			// either the impl's own method or the interface's default. Kept total rather
@@ -920,34 +1137,38 @@ impl Checker<'_> {
 				source: MethodSource::ImplDirect,
 				target,
 				implementation,
+				resolved_target,
 				impl_span: def.legacy_span,
 			};
 		};
-		if params.len() != arg_tys.len() {
-			self.emit(
-				span,
-				TypeError::NamedWrongArgCount {
-					name: name.into(),
-					expected: params.len(),
-					found: arg_tys.len(),
-				},
-			);
-			return MethodResolution {
-				ty: ret,
-				params,
-				source,
-				target,
-				implementation,
-				impl_span: def.legacy_span,
-			};
-		}
-		for (i, (param, arg)) in params.iter().zip(arg_tys).enumerate() {
-			self.unify_arg(
-				*param,
-				*arg,
-				arg_lits.get(i).copied().unwrap_or(false),
-				span,
-			);
+		if let Some((arg_tys, arg_lits)) = arguments {
+			if params.len() != arg_tys.len() {
+				self.emit(
+					span,
+					TypeError::NamedWrongArgCount {
+						name: name.into(),
+						expected: params.len(),
+						found: arg_tys.len(),
+					},
+				);
+				return MethodResolution {
+					ty: ret,
+					params,
+					source,
+					target,
+					implementation,
+					resolved_target,
+					impl_span: def.legacy_span,
+				};
+			}
+			for (i, (param, arg)) in params.iter().zip(arg_tys).enumerate() {
+				self.unify_arg(
+					*param,
+					*arg,
+					arg_lits.get(i).copied().unwrap_or(false),
+					span,
+				);
+			}
 		}
 		MethodResolution {
 			ty: ret,
@@ -955,39 +1176,50 @@ impl Checker<'_> {
 			source,
 			target,
 			implementation,
+			resolved_target,
 			impl_span: def.legacy_span,
 		}
 	}
 
-	/// The instantiated `(params, ret, source)` of `name` for impl `def` under
-	/// substitution `subst` and receiver `recv`. Prefers the impl's own signature
-	/// (`source: ImplDirect`), else the interface's (default) method with interface
-	/// parameters mapped to impl args (`source: InterfaceDefault`) — this is the
-	/// seam Slice 4B's operator dispatch reads to decide whether codegen can compile
-	/// a direct method call or must defer.
+	/// The instantiated `(params, ret, source)` selected by `def`'s exact member
+	/// catalog. The catalog, rather than another name/default check, owns whether
+	/// the implementation override or interface default supplies the body.
 	fn method_signature(
 		&mut self,
 		def: &crate::iface::ImplDef,
 		subst: &FxHashMap<ParamIdx, Ty>,
 		recv: Ty,
 		name: &str,
+		obligation_span: Option<Span>,
 	) -> Option<(Vec<Ty>, Ty, MethodSource)> {
-		if let Some(method) = def.methods.get(name) {
-			let params = method
-				.params
-				.iter()
-				.map(|t| self.subst(*t, subst, Some(recv)))
-				.collect();
-			let ret = self.instantiate_opaque_return(method.ret, &method.bounds, subst, recv);
+		let interface = self.interfaces.get(&def.interface).cloned()?;
+		let interface_method = interface.methods.get(name).cloned()?;
+		let source = if let Some(interface_member) = interface_method.definition.as_ref() {
+			def.member_catalog.target(interface_member)?.source
+		} else if def.methods.contains_key(name) {
+			crate::ImplementationMemberSource::Override
+		} else if interface_method.has_default {
+			crate::ImplementationMemberSource::InheritedDefault
+		} else {
+			return None;
+		};
+		if source == crate::ImplementationMemberSource::Override {
+			let method = def.methods.get(name)?;
+			let (params, ret) = self.instantiate_iface_method_signature(
+				method,
+				subst.clone(),
+				def.generics.len(),
+				recv,
+				obligation_span,
+			);
 			return Some((params, ret, MethodSource::ImplDirect));
 		}
 
 		// Interface default method: map interface Param(k) → this impl's arg bindings.
-		let interface = self.interfaces.get(&def.interface).cloned()?;
-		let method = interface.methods.get(name).cloned()?;
-		if !method.has_default {
+		if source != crate::ImplementationMemberSource::InheritedDefault {
 			return None;
 		}
+		let method = interface_method;
 		let mut isubst: FxHashMap<ParamIdx, Ty> = FxHashMap::default();
 		for (k, param_name) in interface.generics.iter().enumerate() {
 			let value = def
@@ -998,20 +1230,41 @@ impl Checker<'_> {
 				.unwrap_or_else(|| self.fresh());
 			isubst.insert(ParamIdx(k as u32), value);
 		}
-		// The method's OWN generics sit at `Param(iface_len + j)` (see `lower_method_sig`);
-		// instantiate each to a fresh inference variable so a call like `it.map(f)` infers
-		// them from the arguments instead of leaking the rigid parameter.
 		let iface_len = interface.generics.len();
-		for j in 0..method.generics.len() {
-			isubst.insert(ParamIdx((iface_len + j) as u32), self.fresh());
+		let (params, ret) =
+			self.instantiate_iface_method_signature(&method, isubst, iface_len, recv, obligation_span);
+		Some((params, ret, MethodSource::InterfaceDefault))
+	}
+
+	fn instantiate_iface_method_signature(
+		&mut self,
+		method: &crate::iface::IfaceMethod,
+		mut subst: FxHashMap<ParamIdx, Ty>,
+		owner_generics: usize,
+		recv: Ty,
+		obligation_span: impl Into<Option<Span>>,
+	) -> (Vec<Ty>, Ty) {
+		for index in 0..method.generics.len() {
+			subst.insert(ParamIdx((owner_generics + index) as u32), self.fresh());
+		}
+		if let Some(span) = obligation_span.into() {
+			for bound in &method.bounds {
+				let ty = self.subst(bound.ty, &subst, Some(recv));
+				let args = bound
+					.args
+					.iter()
+					.map(|(name, ty)| (name.clone(), self.subst(*ty, &subst, Some(recv))))
+					.collect();
+				self.pending_bounds.push((span, ty, bound.interface, args));
+			}
 		}
 		let params = method
 			.params
 			.iter()
-			.map(|t| self.subst(*t, &isubst, Some(recv)))
+			.map(|ty| self.subst(*ty, &subst, Some(recv)))
 			.collect();
-		let ret = self.instantiate_opaque_return(method.ret, &method.bounds, &isubst, recv);
-		Some((params, ret, MethodSource::InterfaceDefault))
+		let ret = self.instantiate_opaque_return(method.ret, &method.bounds, &subst, recv);
+		(params, ret)
 	}
 
 	/// Instantiate an opaque interface return at the call site while retaining its

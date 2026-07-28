@@ -880,6 +880,18 @@ fn instantiate_complete_definition(
 		DefinitionShapeKind::Interface => {
 			let mut interface = InterfaceDef {
 				generics,
+				runtime_members: definition
+					.members
+					.iter()
+					.map(|member| crate::iface::RuntimeMemberDef {
+						definition: Some(member.id.clone()),
+						name: member.name.clone(),
+						kind: member.kind,
+						has_default: member.has_default,
+						external: member.external.is_some(),
+						marshal: member.external.as_ref().and_then(|abi| abi.marshal),
+					})
+					.collect(),
 				methods: FxHashMap::default(),
 			};
 			for member in &definition.members {
@@ -1070,6 +1082,19 @@ fn instantiate_complete_impl(
 			interner,
 			ImplDef {
 				definition: Some(implementation.id.clone()),
+				member_catalog: implementation.member_slots.clone(),
+				runtime_members: implementation
+					.members
+					.iter()
+					.map(|member| crate::iface::RuntimeMemberDef {
+						definition: Some(member.id.clone()),
+						name: member.name.clone(),
+						kind: member.kind,
+						has_default: member.has_default,
+						external: member.external.is_some(),
+						marshal: member.external.as_ref().and_then(|abi| abi.marshal),
+					})
+					.collect(),
 				generics: implementation
 					.binders
 					.iter()
@@ -1365,6 +1390,19 @@ fn instantiate_recovered_definition(
 		DefinitionShapeKind::Interface => {
 			let mut interface = InterfaceDef {
 				generics,
+				runtime_members: definition
+					.members
+					.iter()
+					.zip(&facts.definition_members[&def])
+					.map(|(shape, member)| crate::iface::RuntimeMemberDef {
+						definition: Some(member.target.clone()),
+						name: shape.name.clone(),
+						kind: member.kind,
+						has_default: member.has_default,
+						external: shape.external.is_some(),
+						marshal: shape.external.as_ref().and_then(|abi| abi.marshal),
+					})
+					.collect(),
 				methods: FxHashMap::default(),
 			};
 			for (shape, member) in definition
@@ -1553,6 +1591,19 @@ fn instantiate_recovered_impl(
 				interner,
 				ImplDef {
 					definition: Some(implementation.id.clone()),
+					member_catalog: implementation.member_slots.clone(),
+					runtime_members: implementation
+						.members
+						.iter()
+						.map(|member| crate::iface::RuntimeMemberDef {
+							definition: Some(member.id.clone()),
+							name: member.name.clone(),
+							kind: member.kind,
+							has_default: member.has_default,
+							external: member.external.is_some(),
+							marshal: member.external.as_ref().and_then(|abi| abi.marshal),
+						})
+						.collect(),
 					generics: implementation
 						.binders
 						.iter()

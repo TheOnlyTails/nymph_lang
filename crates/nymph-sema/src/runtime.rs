@@ -367,6 +367,7 @@ pub enum RuntimeIteration {
 	},
 	ViaIter {
 		iterable_interface: DefinitionId,
+		iter_interface_member: DefinitionId,
 		iter: StableDispatch,
 		iterator_interface: DefinitionId,
 		next: DefinitionId,
@@ -829,15 +830,9 @@ fn extract_implementation_members(
 			ImplMember::ExternalFunc(..) => {
 				push_external(result, definition, placement, member_shape.external.clone())?
 			}
-			ImplMember::ExternalLet(_, marker, meta) => push_external(
-				result,
-				definition,
-				placement,
-				Some(crate::interface_extract::external_value_abi(
-					marker,
-					checked.external_value_marshals.get(&meta.name.1).copied(),
-				)),
-			)?,
+			ImplMember::ExternalLet(..) => {
+				push_external(result, definition, placement, member_shape.external.clone())?
+			}
 		}
 	}
 	Ok(())
@@ -1430,23 +1425,36 @@ fn runtime_annotations(
 			let protocols = iteration_protocol(checked)?;
 			let iteration = match mode {
 				crate::IterMode::Direct => RuntimeIteration::Direct {
-					iterator_interface: protocols.2.clone(),
-					next: protocols.3.clone(),
-					option: protocols.4.clone(),
+					iterator_interface: protocols.0.clone(),
+					next: protocols.1.clone(),
+					option: protocols.2.clone(),
 				},
-				crate::IterMode::ViaIter => RuntimeIteration::ViaIter {
-					iterable_interface: protocols.0.clone(),
-					iter: stable_dispatch(
-						checked,
-						checked
-							.annotations
-							.iter_resolution_of(source)
-							.ok_or(RuntimeExtractionError::MissingIterationProtocol)?,
-					)?,
-					iterator_interface: protocols.2.clone(),
-					next: protocols.3.clone(),
-					option: protocols.4.clone(),
-				},
+				crate::IterMode::ViaIter => {
+					let resolution = checked
+						.annotations
+						.iter_resolution_of(source)
+						.ok_or(RuntimeExtractionError::MissingIterationProtocol)?;
+					let (iterable_interface, iter_interface_member) =
+						match resolution.resolved_target.as_ref() {
+							Some(crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
+								interface,
+								slot,
+							}) => (interface.clone(), slot.interface_member_id.clone()),
+							Some(crate::annotate::ResolvedMethodTarget::GenericBound {
+								interface,
+								interface_member,
+							}) => (interface.clone(), interface_member.clone()),
+							_ => return Err(RuntimeExtractionError::MissingIterationProtocol),
+						};
+					RuntimeIteration::ViaIter {
+						iterable_interface,
+						iter_interface_member,
+						iter: stable_dispatch(checked, resolution)?,
+						iterator_interface: protocols.0.clone(),
+						next: protocols.1.clone(),
+						option: protocols.2.clone(),
+					}
+				}
 			};
 			iterations.push((id, iteration));
 		}
@@ -1509,6 +1517,15 @@ fn required_type_nodes(
 	let mut required = std::collections::HashSet::new();
 	for expression in nodes {
 		match &expression.kind {
+			ExprKind::MemberAccess { .. }
+				if checked
+					.annotations
+					.get(expression.id)
+					.and_then(|info| info.resolution)
+					.is_some() =>
+			{
+				required.insert(expression.id);
+			}
 			ExprKind::IndexAccess { parent, .. } => {
 				required.insert(parent.id);
 			}
@@ -1596,147 +1613,107 @@ fn stable_dispatch(
 	checked: &crate::CheckedFacts,
 	resolution: &crate::annotate::Resolution,
 ) -> Result<StableDispatch, RuntimeExtractionError> {
-	match resolution.dispatch {
-		DispatchKind::BuiltinEager => Ok(StableDispatch::Builtin {
-			method: resolution.method.clone(),
-			category: BuiltinDispatch::Eager,
-		}),
-		DispatchKind::BuiltinShortCircuit => Ok(StableDispatch::Builtin {
-			method: resolution.method.clone(),
-			category: BuiltinDispatch::ShortCircuit,
-		}),
-		kind => {
-			if let Some(implementation) = resolution.implementation.clone() {
-				let member = resolution.target.clone().ok_or_else(|| {
-					RuntimeExtractionError::IncompleteDispatchTarget(resolution.method.clone())
-				})?;
-				let interface = match &implementation.key {
-					crate::DeclarationKey::Implementation { header, .. } => header.interface.clone(),
-					_ => None,
-				};
-				let uses_default = checked
-					.semantic
-					.implementations
-					.impls
-					.iter()
-					.find(|candidate| candidate.definition.as_ref() == Some(&implementation))
-					.is_some_and(|candidate| !candidate.methods.contains_key(&resolution.method));
-				let external = checked
-					.semantic
-					.definitions
-					.by_stable(&member)
-					.and_then(|definition| checked.semantic.external_abis.get(&definition));
-				if let Some(abi) = external {
-					return Ok(StableDispatch::External {
-						member,
-						implementation,
-						marshal: abi.marshal,
-					});
-				}
-				return Ok(match (kind, interface) {
-					(_, Some(interface)) if uses_default => StableDispatch::InterfaceDefault {
-						interface,
-						member,
-						implementation,
-						materialization: DispatchMaterialization::CanonicalBody,
-					},
-					(DispatchKind::UserImpl, Some(interface)) => StableDispatch::SelectedImplementation {
-						interface,
-						member,
-						implementation,
-						materialization: DispatchMaterialization::Attached,
-					},
-					_ => StableDispatch::Direct {
-						member,
-						implementation,
-						materialization: DispatchMaterialization::Attached,
-					},
-				});
-			}
-			if kind == DispatchKind::UserImplDefaultMethod
-				&& let Some(member) = resolution.target.clone()
-				&& let crate::DeclarationKey::MaterializedInterfaceMember {
-					implementation,
-					interface_member: _,
-				} = &member.key
-				&& let crate::DeclarationKey::Implementation { header, .. } = &implementation.key
-				&& let Some(interface) = header.interface.clone()
-			{
-				return Ok(StableDispatch::InterfaceDefault {
-					interface,
+	let category = match resolution.dispatch {
+		DispatchKind::BuiltinEager => BuiltinDispatch::Eager,
+		DispatchKind::BuiltinShortCircuit => BuiltinDispatch::ShortCircuit,
+		DispatchKind::UserImpl | DispatchKind::UserImplDefaultMethod => {
+			return exact_method_dispatch(checked, resolution);
+		}
+	};
+	Ok(StableDispatch::Builtin {
+		method: resolution.method.clone(),
+		category,
+	})
+}
+
+fn exact_method_dispatch(
+	checked: &crate::CheckedFacts,
+	resolution: &crate::annotate::Resolution,
+) -> Result<StableDispatch, RuntimeExtractionError> {
+	let target = resolution
+		.resolved_target
+		.as_ref()
+		.ok_or_else(|| RuntimeExtractionError::IncompleteDispatchTarget(resolution.method.clone()))?;
+	match target {
+		crate::annotate::ResolvedMethodTarget::Inherent {
+			member,
+			implementation,
+		} => {
+			let inherent_external = checked.semantic.inherent.iter().any(|inherent| {
+				inherent
+					.methods
+					.values()
+					.any(|method| method.definition.as_ref() == Some(member) && method.external)
+			});
+			if inherent_external {
+				return Ok(StableDispatch::External {
 					member: member.clone(),
-					implementation: (**implementation).clone(),
-					materialization: DispatchMaterialization::CanonicalBody,
+					implementation: implementation.clone(),
+					marshal: None,
 				});
 			}
-			if kind == DispatchKind::UserImplDefaultMethod
-				&& let Some(span) = resolution.impl_span
-				&& let Some(implementation) = checked
-					.semantic
-					.implementations
-					.impls
-					.iter()
-					.find(|implementation| implementation.legacy_span == Some(span))
-					.and_then(|implementation| implementation.definition.clone())
-				&& let Some((interface, member)) = stable_interface_member(checked, resolution)
+			if let Some(abi) = checked
+				.semantic
+				.definitions
+				.by_stable(member)
+				.and_then(|definition| checked.semantic.external_abis.get(&definition))
 			{
-				return Ok(StableDispatch::InterfaceDefault {
-					interface,
-					member,
-					implementation,
-					materialization: DispatchMaterialization::CanonicalBody,
-				});
-			}
-			let member = resolution
-				.target
-				.clone()
-				.or_else(|| stable_interface_member(checked, resolution).map(|(_, member)| member))
-				.ok_or_else(|| {
-					RuntimeExtractionError::IncompleteDispatchTarget(resolution.method.clone())
-				})?;
-			let interface = match &member.key {
-				crate::DeclarationKey::Member { owner, .. } => (**owner).clone(),
-				_ => {
-					return Err(RuntimeExtractionError::IncompleteDispatchTarget(
-						resolution.method.clone(),
-					));
-				}
-			};
-			if matches!(
-				interface.key,
-				crate::DeclarationKey::TopLevel {
-					category: crate::DeclarationCategory::Interface,
-					..
-				}
-			) {
-				Ok(StableDispatch::GenericBound { interface, member })
+				Ok(StableDispatch::External {
+					member: member.clone(),
+					implementation: implementation.clone(),
+					marshal: abi.marshal,
+				})
 			} else {
 				Ok(StableDispatch::Direct {
-					member,
-					implementation: interface,
+					member: member.clone(),
+					implementation: implementation.clone(),
 					materialization: DispatchMaterialization::Attached,
 				})
 			}
 		}
+		crate::annotate::ResolvedMethodTarget::InterfaceImplementation { interface, slot } => {
+			if slot.external {
+				return Ok(StableDispatch::External {
+					member: slot.member_id.clone(),
+					implementation: slot.implementation_id.clone(),
+					marshal: None,
+				});
+			}
+			if let Some(abi) = checked
+				.semantic
+				.definitions
+				.by_stable(&slot.member_id)
+				.and_then(|definition| checked.semantic.external_abis.get(&definition))
+			{
+				return Ok(StableDispatch::External {
+					member: slot.member_id.clone(),
+					implementation: slot.implementation_id.clone(),
+					marshal: abi.marshal,
+				});
+			}
+			Ok(match slot.source {
+				crate::ImplementationMemberSource::Override => StableDispatch::SelectedImplementation {
+					interface: interface.clone(),
+					member: slot.member_id.clone(),
+					implementation: slot.implementation_id.clone(),
+					materialization: DispatchMaterialization::Attached,
+				},
+				crate::ImplementationMemberSource::InheritedDefault => StableDispatch::InterfaceDefault {
+					interface: interface.clone(),
+					member: slot.member_id.clone(),
+					implementation: slot.implementation_id.clone(),
+					materialization: DispatchMaterialization::CanonicalBody,
+				},
+			})
+		}
+		crate::annotate::ResolvedMethodTarget::GenericBound {
+			interface,
+			interface_member,
+		} => Ok(StableDispatch::GenericBound {
+			interface: interface.clone(),
+			member: interface_member.clone(),
+		}),
 	}
-}
-
-fn stable_interface_member(
-	checked: &crate::CheckedFacts,
-	resolution: &crate::annotate::Resolution,
-) -> Option<(DefinitionId, DefinitionId)> {
-	let matches = checked
-		.semantic
-		.interfaces
-		.iter()
-		.filter_map(|(id, interface)| {
-			let method = interface.methods.get(&resolution.method)?;
-			let owner = checked.semantic.definitions.stable(*id)?.clone();
-			let member = method.definition.clone()?;
-			Some((owner, member))
-		})
-		.collect::<Vec<_>>();
-	(matches.len() == 1).then(|| matches[0].clone())
 }
 
 fn variant_parts(
@@ -1925,16 +1902,7 @@ fn definition_owner(definition: &DefinitionId) -> Option<&DefinitionId> {
 
 fn iteration_protocol(
 	checked: &crate::CheckedFacts,
-) -> Result<
-	(
-		DefinitionId,
-		DefinitionId,
-		DefinitionId,
-		DefinitionId,
-		DefinitionId,
-	),
-	RuntimeExtractionError,
-> {
+) -> Result<(DefinitionId, DefinitionId, DefinitionId), RuntimeExtractionError> {
 	let find = |interface_name: &str, method_name: &str| {
 		let (id, stable) = checked
 			.semantic
@@ -1962,8 +1930,6 @@ fn iteration_protocol(
 			.clone()?;
 		Some((stable, method))
 	};
-	let (iterable, iter) =
-		find("Iterable", "iter").ok_or(RuntimeExtractionError::MissingIterationProtocol)?;
 	let (iterator, next) =
 		find("Iterator", "next").ok_or(RuntimeExtractionError::MissingIterationProtocol)?;
 	let option = checked
@@ -1974,7 +1940,7 @@ fn iteration_protocol(
 		.find(|item| item.name == "Option")
 		.and_then(|item| item.stable.clone())
 		.ok_or(RuntimeExtractionError::MissingIterationProtocol)?;
-	Ok((iterable, iter, iterator, next, option))
+	Ok((iterator, next, option))
 }
 
 fn external_marshal(

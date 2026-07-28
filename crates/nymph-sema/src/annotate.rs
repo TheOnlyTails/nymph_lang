@@ -50,6 +50,7 @@ pub(crate) struct CheckedMethod {
 	pub params: Vec<Ty>,
 	pub ret: Ty,
 	pub bounds: Vec<crate::iface::Bound>,
+	pub external: bool,
 }
 
 impl CheckedSemantic {
@@ -93,6 +94,23 @@ pub enum DispatchKind {
 	UserImplDefaultMethod,
 }
 
+/// Exact semantic target selected for a resolved method use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedMethodTarget {
+	Inherent {
+		member: DefinitionId,
+		implementation: DefinitionId,
+	},
+	InterfaceImplementation {
+		interface: DefinitionId,
+		slot: crate::ImplementationMemberSlot,
+	},
+	GenericBound {
+		interface: DefinitionId,
+		interface_member: DefinitionId,
+	},
+}
+
 /// How a binary operator at a specific node must be compiled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolution {
@@ -106,6 +124,10 @@ pub struct Resolution {
 	pub target: Option<DefinitionId>,
 	/// Stable semantic identity of the selected concrete impl, when known.
 	pub implementation: Option<DefinitionId>,
+	/// Exact checker-owned dispatch result. This is the authoritative channel
+	/// for stable runtime projection; the legacy optional fields above remain
+	/// temporarily while lowering consumers migrate.
+	pub resolved_target: Option<ResolvedMethodTarget>,
 	/// The defining span of whatever provided `method` — an impl's own `impl
 	/// Interface … for …`/nested `impl Interface { .. }` header (the `Ident`
 	/// naming the interface, `solve::ImplDef::span`), or an interface's own

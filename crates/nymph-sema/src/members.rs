@@ -85,7 +85,7 @@ impl InherentRegistry {
 		idx
 	}
 
-	fn candidates(&self, head: Head) -> Vec<usize> {
+	pub(crate) fn candidates(&self, head: Head) -> Vec<usize> {
 		self.by_head.get(&head).cloned().unwrap_or_default()
 	}
 
@@ -330,7 +330,12 @@ impl<'m> Checker<'m> {
 		let (meta, body): (&'m FuncDeclaration, Option<&'m Expr>) = match member {
 			ImplMember::Func { meta, body, .. } => (meta, Some(body)),
 			ImplMember::ExternalFunc(_, _, meta) => (meta, None),
-			ImplMember::Let { .. } | ImplMember::ExternalLet(..) => return,
+			ImplMember::ExternalLet(_, marker, meta) => {
+				let ty = meta.type_.as_ref().map(|ty| self.lower_type(ty));
+				self.check_external_value(marker, meta.name.1, meta.is_mutable(), ty);
+				return;
+			}
+			ImplMember::Let { .. } => return,
 		};
 		// A struct/enum inner member of ANY kind (instance `func`, `namespace func`
 		// static, `mut func` method) shares this one per-type map keyed
@@ -443,11 +448,55 @@ impl<'m> Checker<'m> {
 				let method = &self.inherent.impls[idx].methods[name];
 				let target = method.definition.clone();
 				let method_span = method.local_span;
-				let (params, ret) = self.commit_inherent(idx, recv, name, arg_tys, arg_lits, span, false);
+				let (params, ret) =
+					self.commit_inherent(idx, recv, name, Some((arg_tys, arg_lits)), span, false);
 				return Some((params, ret, target, implementation, method_span));
 			}
 		}
 		None
+	}
+
+	pub(crate) fn resolve_inherent_value(
+		&mut self,
+		recv: Ty,
+		name: &str,
+		span: nymph_ast::Span,
+	) -> Option<(
+		Vec<Ty>,
+		Ty,
+		Option<DefinitionId>,
+		Option<DefinitionId>,
+		Option<nymph_ast::Span>,
+	)> {
+		let recv = self.strip_mut(recv);
+		let head = head_of(&self.interner, recv)?;
+		let mut matches = Vec::new();
+		for idx in self.inherent.candidates(head) {
+			let Some(_) = self.inherent.impls[idx]
+				.methods
+				.get(name)
+				.filter(|method| !method.namespaced)
+			else {
+				continue;
+			};
+			let snapshot = self.table.snapshot();
+			let matched = self.inherent_receiver_matches(idx, recv);
+			self.table.rollback_to(snapshot);
+			if matched {
+				matches.push(idx);
+			}
+		}
+		if matches.len() > 1 {
+			self.emit(span, TypeError::AmbiguousCall { name: name.into() });
+			return Some((Vec::new(), self.interner.error(), None, None, None));
+		}
+		let idx = matches.pop()?;
+		let method = &self.inherent.impls[idx].methods[name];
+		let target = method.definition.clone();
+		let method_span = method.local_span;
+		let implementation = self.inherent.impls[idx].definition.clone();
+		let (params, ret) = self.commit_inherent(idx, recv, name, None, span, false);
+		Some((params, ret, target, implementation, method_span))
 	}
 
 	/// Resolve a namespaced function `Type.name(args)`.
@@ -472,7 +521,14 @@ impl<'m> Checker<'m> {
 				let placeholder = self.interner.error();
 				return Some((
 					self
-						.commit_inherent(idx, placeholder, name, arg_tys, arg_lits, span, true)
+						.commit_inherent(
+							idx,
+							placeholder,
+							name,
+							Some((arg_tys, arg_lits)),
+							span,
+							true,
+						)
 						.1,
 					target,
 				));
@@ -497,8 +553,7 @@ impl<'m> Checker<'m> {
 		idx: usize,
 		recv: Ty,
 		name: &str,
-		arg_tys: &[Ty],
-		arg_lits: &[bool],
+		arguments: Option<(&[Ty], &[bool])>,
 		span: nymph_ast::Span,
 		namespaced: bool,
 	) -> (Vec<Ty>, Ty) {
@@ -543,24 +598,26 @@ impl<'m> Checker<'m> {
 			.collect();
 		let ret = self.subst(ret, &subst, Some(self_concrete));
 
-		if params.len() != arg_tys.len() {
-			self.emit(
-				span,
-				TypeError::NamedWrongArgCount {
-					name: name.into(),
-					expected: params.len(),
-					found: arg_tys.len(),
-				},
-			);
-			return (params, ret);
-		}
-		for (i, (param, arg)) in params.iter().zip(arg_tys).enumerate() {
-			self.unify_arg(
-				*param,
-				*arg,
-				arg_lits.get(i).copied().unwrap_or(false),
-				span,
-			);
+		if let Some((arg_tys, arg_lits)) = arguments {
+			if params.len() != arg_tys.len() {
+				self.emit(
+					span,
+					TypeError::NamedWrongArgCount {
+						name: name.into(),
+						expected: params.len(),
+						found: arg_tys.len(),
+					},
+				);
+				return (params, ret);
+			}
+			for (i, (param, arg)) in params.iter().zip(arg_tys).enumerate() {
+				self.unify_arg(
+					*param,
+					*arg,
+					arg_lits.get(i).copied().unwrap_or(false),
+					span,
+				);
+			}
 		}
 		(params, ret)
 	}

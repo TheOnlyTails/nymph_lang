@@ -558,6 +558,15 @@ impl<'m> Checker<'m> {
 			}
 			return ty;
 		}
+		if let ExprKind::MemberAccess { parent, member, .. } = &expr.kind {
+			let (ty, resolution) =
+				self.infer_member_with_resolution(parent, &member.0, member.1, expr.id);
+			self.record(expr.id, ty, None);
+			if let Some(resolution) = resolution {
+				self.annotations.record_resolution(expr.id, resolution);
+			}
+			return ty;
+		}
 		let ty = self.infer_kind(expr);
 		// Record the node's resolved type for the lowering pass. Zonking happens
 		// inside `record`. Returns the *raw* ty so callers can still unify against it.
@@ -883,6 +892,7 @@ impl<'m> Checker<'m> {
 							dispatch: dispatch_kind_for_method_call(&res),
 							target: res.target.clone(),
 							implementation: res.implementation.clone(),
+							resolved_target: res.resolved_target.clone(),
 							impl_span: res.impl_span,
 						};
 						(res.ty, Some(resolution))
@@ -1311,6 +1321,7 @@ impl<'m> Checker<'m> {
 						dispatch,
 						target: res.target.clone(),
 						implementation: res.implementation.clone(),
+						resolved_target: res.resolved_target.clone(),
 						impl_span: res.impl_span,
 					};
 					(res.ty, Some(resolution))
@@ -1490,6 +1501,53 @@ impl<'m> Checker<'m> {
 	}
 
 	// ── Member access ────────────────────────────────────────────────────────
+	fn infer_member_with_resolution(
+		&mut self,
+		parent: &Expr,
+		member: &str,
+		span: Span,
+		id: NodeId,
+	) -> (Ty, Option<Resolution>) {
+		if let ExprKind::Identifier(name) = &parent.kind
+			&& let Some(definition) = self.defs.get(&name.0)
+			&& matches!(
+				self.defs.data(definition).kind,
+				DefKind::Namespace | DefKind::Enum
+			) {
+			return (self.infer_member(parent, member, span, id), None);
+		}
+		let parent_ty = self.infer(parent);
+		let resolved_parent = self.shallow_resolve(parent_ty);
+		let nominal = self.strip_mut(resolved_parent);
+		let has_field = match self.interner.kind(nominal) {
+			TyKind::Adt(definition, _) if matches!(self.defs.data(*definition).kind, DefKind::Struct) => {
+				self.sigs.structs[definition]
+					.fields
+					.iter()
+					.any(|(name, _)| name == member)
+			}
+			_ => false,
+		};
+		if !has_field && let Some(resolution) = self.resolve_method_value(parent_ty, member, span) {
+			let ty = self
+				.interner
+				.mk_fn(resolution.params.clone(), resolution.ty);
+			let dispatch = dispatch_kind_for_method_call(&resolution);
+			return (
+				ty,
+				Some(Resolution {
+					method: member.into(),
+					dispatch,
+					target: resolution.target,
+					implementation: resolution.implementation,
+					resolved_target: resolution.resolved_target,
+					impl_span: resolution.impl_span,
+				}),
+			);
+		}
+		(self.member_ty_of(parent_ty, member, span, Some(id)), None)
+	}
+
 	fn infer_member(&mut self, parent: &Expr, member: &str, span: Span, id: NodeId) -> Ty {
 		if let ExprKind::Identifier(name) = &parent.kind
 			&& let Some(def) = self.defs.get(&name.0)
@@ -1824,12 +1882,13 @@ impl<'m> Checker<'m> {
 							dispatch: DispatchKind::BuiltinEager,
 							target: None,
 							implementation: None,
+							resolved_target: None,
 							impl_span: None,
 						}),
 						None,
 					)
 				} else {
-					let (ty, dispatch, target, implementation, impl_span) =
+					let (ty, dispatch, target, implementation, resolved_target, impl_span) =
 						self.dispatch_operator(operand, "not", &[], span);
 					(
 						ty,
@@ -1838,6 +1897,7 @@ impl<'m> Checker<'m> {
 							dispatch,
 							target,
 							implementation,
+							resolved_target,
 							impl_span,
 						}),
 						None,
@@ -1854,6 +1914,7 @@ impl<'m> Checker<'m> {
 							dispatch: DispatchKind::BuiltinEager,
 							target: None,
 							implementation: None,
+							resolved_target: None,
 							impl_span: None,
 						}),
 						None,
@@ -1864,7 +1925,7 @@ impl<'m> Checker<'m> {
 				} {
 					// A resolved ADT or generic-parameter operand dispatches through the
 					// solver immediately, exactly like `infer_binary`'s equivalent branch.
-					let (ty, dispatch, target, implementation, impl_span) =
+					let (ty, dispatch, target, implementation, resolved_target, impl_span) =
 						self.dispatch_operator(operand, method, &[], span);
 					(
 						ty,
@@ -1873,6 +1934,7 @@ impl<'m> Checker<'m> {
 							dispatch,
 							target,
 							implementation,
+							resolved_target,
 							impl_span,
 						}),
 						None,
@@ -1910,6 +1972,7 @@ impl<'m> Checker<'m> {
 					dispatch: DispatchKind::BuiltinEager,
 					target: None,
 					implementation: None,
+					resolved_target: None,
 					impl_span: None,
 				},
 			));
@@ -1921,7 +1984,7 @@ impl<'m> Checker<'m> {
 		) {
 			return None;
 		}
-		let (result_ty, dispatch, target, implementation, impl_span) =
+		let (result_ty, dispatch, target, implementation, resolved_target, impl_span) =
 			self.dispatch_operator(ty, method, &[], span);
 		Some((
 			result_ty,
@@ -1930,6 +1993,7 @@ impl<'m> Checker<'m> {
 				dispatch,
 				target,
 				implementation,
+				resolved_target,
 				impl_span,
 			},
 		))
@@ -2006,6 +2070,7 @@ impl<'m> Checker<'m> {
 				dispatch: DispatchKind::BuiltinEager,
 				target: None,
 				implementation: None,
+				resolved_target: None,
 				impl_span: None,
 			})
 		};
@@ -2026,7 +2091,7 @@ impl<'m> Checker<'m> {
 				(Some(a), Some(b)) if a == b => {
 					self.unify(l, r, span);
 					if matches!(a, TyKind::Boolean) {
-						let (ty, dispatch, target, implementation, impl_span) =
+						let (ty, dispatch, target, implementation, resolved_target, impl_span) =
 							self.dispatch_operator(l, binary_method(op), &[r], span);
 						(
 							ty,
@@ -2035,6 +2100,7 @@ impl<'m> Checker<'m> {
 								dispatch,
 								target,
 								implementation,
+								resolved_target,
 								impl_span,
 							}),
 							None,
@@ -2061,7 +2127,7 @@ impl<'m> Checker<'m> {
 					} else if matches!(lhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(r) {
 						(r, eager(binary_method(op)), None)
 					} else {
-						let (ty, _, _, _, _) = self.dispatch_operator(l, binary_method(op), &[r], span);
+						let (ty, _, _, _, _, _) = self.dispatch_operator(l, binary_method(op), &[r], span);
 						(ty, eager(binary_method(op)), None)
 					}
 				}
@@ -2079,7 +2145,7 @@ impl<'m> Checker<'m> {
 					matches!(self.interner.kind(resolved), TyKind::Param(_))
 				} =>
 				{
-					let (ty, dispatch, target, implementation, impl_span) =
+					let (ty, dispatch, target, implementation, resolved_target, impl_span) =
 						self.dispatch_operator(l, binary_method(op), &[r], span);
 					(
 						ty,
@@ -2088,6 +2154,7 @@ impl<'m> Checker<'m> {
 							dispatch,
 							target,
 							implementation,
+							resolved_target,
 							impl_span,
 						}),
 						None,
@@ -2145,7 +2212,7 @@ impl<'m> Checker<'m> {
 						if matches!(self.interner.kind(resolved), TyKind::Error) {
 							return (boolean, eager(method), None);
 						}
-						let (_, dispatch, target, implementation, impl_span) =
+						let (_, dispatch, target, implementation, resolved_target, impl_span) =
 							self.dispatch_operator(l, method, &[r], span);
 						(
 							boolean,
@@ -2154,6 +2221,7 @@ impl<'m> Checker<'m> {
 								dispatch,
 								target,
 								implementation,
+								resolved_target,
 								impl_span,
 							}),
 							None,
@@ -2204,7 +2272,7 @@ impl<'m> Checker<'m> {
 						matches!(self.interner.kind(resolved), TyKind::Param(_))
 					} =>
 					{
-						let (_, dispatch, target, implementation, impl_span) =
+						let (_, dispatch, target, implementation, resolved_target, impl_span) =
 							self.dispatch_operator(l, method, &[r], span);
 						(
 							boolean,
@@ -2213,6 +2281,7 @@ impl<'m> Checker<'m> {
 								dispatch,
 								target,
 								implementation,
+								resolved_target,
 								impl_span,
 							}),
 							None,
@@ -2246,6 +2315,7 @@ impl<'m> Checker<'m> {
 						dispatch: DispatchKind::BuiltinShortCircuit,
 						target: None,
 						implementation: None,
+						resolved_target: None,
 						impl_span: None,
 					}),
 					None,
@@ -2269,7 +2339,7 @@ impl<'m> Checker<'m> {
 				// operator is left for a future slice; such a RHS reaches
 				// `dispatch_operator` directly and gets whatever diagnostic that produces.)
 				let method = if op == In { "contains" } else { "not_contains" };
-				let (_, dispatch, target, implementation, impl_span) =
+				let (_, dispatch, target, implementation, resolved_target, impl_span) =
 					self.dispatch_operator(r, method, &[l], span);
 				(
 					boolean,
@@ -2278,6 +2348,7 @@ impl<'m> Checker<'m> {
 						dispatch,
 						target,
 						implementation,
+						resolved_target,
 						impl_span,
 					}),
 					None,
@@ -2290,7 +2361,7 @@ impl<'m> Checker<'m> {
 			// an unresolvable receiver is a `NotImplemented` diagnostic, exactly like any
 			// other operator with no matching impl (`dispatch_operator`'s `None` arm).
 			Unwrap => {
-				let (ty, dispatch, target, implementation, impl_span) =
+				let (ty, dispatch, target, implementation, resolved_target, impl_span) =
 					self.dispatch_operator(l, "unwrap", &[r], span);
 				(
 					ty,
@@ -2299,6 +2370,7 @@ impl<'m> Checker<'m> {
 						dispatch,
 						target,
 						implementation,
+						resolved_target,
 						impl_span,
 					}),
 					None,
@@ -2366,6 +2438,7 @@ impl<'m> Checker<'m> {
 					dispatch: DispatchKind::BuiltinEager,
 					target: None,
 					implementation: None,
+					resolved_target: None,
 					impl_span: None,
 				},
 			));
@@ -2377,7 +2450,7 @@ impl<'m> Checker<'m> {
 		) {
 			return None;
 		}
-		let (dispatch_ty, dispatch, target, implementation, impl_span) =
+		let (dispatch_ty, dispatch, target, implementation, resolved_target, impl_span) =
 			self.dispatch_operator(ty, method, &[ty], span);
 		let result_ty = if is_comparison || is_equality {
 			self.interner.boolean()
@@ -2391,6 +2464,7 @@ impl<'m> Checker<'m> {
 				dispatch,
 				target,
 				implementation,
+				resolved_target,
 				impl_span,
 			},
 		))
@@ -2457,6 +2531,7 @@ impl<'m> Checker<'m> {
 		DispatchKind,
 		Option<crate::DefinitionId>,
 		Option<crate::DefinitionId>,
+		Option<crate::annotate::ResolvedMethodTarget>,
 		Option<Span>,
 	) {
 		// Operator operands are already typed; literal widening on them is handled on the
@@ -2481,6 +2556,7 @@ impl<'m> Checker<'m> {
 					dispatch,
 					res.target,
 					res.implementation,
+					res.resolved_target,
 					res.impl_span,
 				)
 			}
@@ -2518,6 +2594,7 @@ impl<'m> Checker<'m> {
 				(
 					self.interner.error(),
 					DispatchKind::UserImpl,
+					None,
 					None,
 					None,
 					None,
@@ -2598,6 +2675,7 @@ impl<'m> Checker<'m> {
 				dispatch: DispatchKind::BuiltinEager,
 				target: None,
 				implementation: None,
+				resolved_target: None,
 				impl_span: None,
 			});
 		}
@@ -2662,6 +2740,7 @@ impl<'m> Checker<'m> {
 						dispatch: dispatch_kind_for_method_call(&res),
 						target: res.target.clone(),
 						implementation: res.implementation.clone(),
+						resolved_target: res.resolved_target.clone(),
 						impl_span: res.impl_span,
 					}),
 					// `holds` already proved an impl exists; `resolve_method` failing
@@ -3013,6 +3092,25 @@ impl<'m> Checker<'m> {
 				&& let Some(item) = self.resolve_param_iface_arg(idx, iface, &item_name)
 			{
 				self.gate_mutating(iface, "iter", self_is_mut, iterable.span);
+				if let (Some(interface), Some(interface_member)) = (
+					self.defs.stable(iface).cloned(),
+					self.interfaces[&iface].methods["iter"].definition.clone(),
+				) {
+					self.annotations.record_iter_resolution(
+						iterable.id,
+						Resolution {
+							method: "iter".into(),
+							dispatch: DispatchKind::UserImpl,
+							target: Some(interface_member.clone()),
+							implementation: None,
+							resolved_target: Some(crate::annotate::ResolvedMethodTarget::GenericBound {
+								interface,
+								interface_member,
+							}),
+							impl_span: Some(self.defs.data(iface).span),
+						},
+					);
+				}
 				self
 					.annotations
 					.record_iter_mode(iterable.id, IterMode::ViaIter);
@@ -3043,7 +3141,8 @@ impl<'m> Checker<'m> {
 				.interfaces
 				.get(&iface)
 				.and_then(|i| i.generics.first().cloned())
-			&& let Some(elem) = self.resolve_iface_arg(stripped, self_is_mut, iface, &t_name, 0)
+			&& let Some((elem, implementation_index)) =
+				self.resolve_iface_arg_with_implementation(stripped, self_is_mut, iface, &t_name, 0)
 		{
 			// Same reasoning as the `Direct` gate above, but for the `.iter()` hop
 			// the desugar calls on this source (`IterMode::ViaIter`): gate it
@@ -3051,15 +3150,39 @@ impl<'m> Checker<'m> {
 			// (the iterator `iter()` returns is a distinct value, resolved and
 			// gated separately were it ever user-callable — out of scope here).
 			self.gate_mutating(iface, "iter", self_is_mut, iterable.span);
-			if let Some(method) = self.resolve_method(ty, "iter", &[], &[], iterable.span) {
+			let implementation = self.impls.impls[implementation_index].clone();
+			let resolution = self
+				.defs
+				.stable(iface)
+				.cloned()
+				.zip(self.interfaces[&iface].methods["iter"].definition.clone())
+				.and_then(|(interface, interface_member)| {
+					let slot = implementation
+						.member_catalog
+						.target(&interface_member)?
+						.clone();
+					Some((interface, slot))
+				});
+			if let Some((interface, slot)) = resolution {
+				let dispatch = if matches!(
+					slot.implementation_id.module.origin,
+					crate::ModuleOrigin::Compiler | crate::ModuleOrigin::ImportableStd
+				) {
+					DispatchKind::UserImplDefaultMethod
+				} else {
+					DispatchKind::UserImpl
+				};
 				self.annotations.record_iter_resolution(
 					iterable.id,
 					Resolution {
 						method: "iter".into(),
-						dispatch: dispatch_kind_for_method_call(&method),
-						target: method.target.clone(),
-						implementation: method.implementation.clone(),
-						impl_span: method.impl_span,
+						dispatch,
+						target: Some(slot.member_id.clone()),
+						implementation: Some(slot.implementation_id.clone()),
+						resolved_target: Some(
+							crate::annotate::ResolvedMethodTarget::InterfaceImplementation { interface, slot },
+						),
+						impl_span: implementation.legacy_span,
 					},
 				);
 			}

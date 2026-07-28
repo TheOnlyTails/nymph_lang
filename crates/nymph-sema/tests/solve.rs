@@ -455,6 +455,52 @@ fn method_resolves_through_generic_bound() {
 }
 
 #[test]
+fn bare_method_value_is_ambiguous_across_receiver_applicable_bounds_despite_arity() {
+	assert_error_contains(
+		"interface A { func m(): int }
+		 interface B { func m(value: int): int }
+		 func f<T: A + B>(value: T): int = { let m = value.m m() }",
+		"ambiguous call",
+	);
+}
+
+#[test]
+fn bare_generic_inherent_method_value_instantiates_and_remains_callable() {
+	assert_ok(
+		"struct Box(value: int) { func keep<T>(value: T): T = value }
+		 func f(box: Box): string = { let keep = box.keep keep(\"ok\") }",
+	);
+}
+
+#[test]
+fn bare_generic_bound_method_value_instantiates_and_remains_callable() {
+	assert_ok(
+		"interface Keep { func keep<T>(value: T): T }
+		 func f<K: Keep>(keeper: K): string = { let keep = keeper.keep keep(\"ok\") }",
+	);
+}
+
+#[test]
+fn bare_inherited_generic_default_method_value_instantiates_and_remains_callable() {
+	assert_ok(
+		"interface Keep { func keep<T>(value: T): T = value }
+		 struct Box(value: int)
+		 impl Keep for Box {}
+		 func f(box: Box): string = { let keep = box.keep keep(\"ok\") }",
+	);
+}
+
+#[test]
+fn bare_bounded_generic_inherent_method_value_enforces_its_obligation() {
+	assert_error_contains(
+		"interface Area { func area(): int }
+		 struct Box(value: int) { func apply<T: Area>(value: T): int = value.area() }
+		 func f(box: Box): int = { let apply = box.apply apply(1) }",
+		"does not implement `Area`",
+	);
+}
+
+#[test]
 fn mut_typed_argument_is_accepted_through_an_interface_impl_method_call() {
 	// `commit_method` (the interface-impl dispatch path) checks arguments via
 	// `unify_arg`, same as the inherent-method path — NN3's one-way `mut T <:
@@ -481,6 +527,25 @@ fn mut_typed_argument_is_accepted_through_a_generic_bound_method_call() {
 		   let mut n = 1
 		   t.plus(n)
 		 }",
+	);
+}
+
+#[test]
+fn generic_bound_method_call_enforces_method_owned_bound() {
+	assert_error_contains(
+		"interface Area { func area(): int }
+		 interface Mapper { func apply<T: Area>(value: T): int }
+		 func f<M: Mapper>(mapper: M): int = mapper.apply(1)",
+		"does not implement `Area`",
+	);
+}
+
+#[test]
+fn generic_bound_method_call_opaque_return_retains_exact_bound() {
+	assert_ok(
+		"interface Area { func area(): int }
+		 interface Factory { func make(): Area }
+		 func f<F: Factory>(factory: F): int = factory.make().area()",
 	);
 }
 

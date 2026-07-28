@@ -358,6 +358,7 @@ fn check_module_from_parts(
 							params,
 							ret,
 							bounds: method.bounds.clone(),
+							external: method.external,
 						},
 					)
 				})
@@ -573,60 +574,69 @@ impl<'m> Checker<'m> {
 			let Declaration::ExternalLet(_, marker, meta) = decl else {
 				continue;
 			};
-			let span = meta.name.1;
-			let linked = match nymph_hir::linkage::lookup_value(marker) {
-				Ok(linked) => Some(linked),
-				Err(nymph_hir::linkage::LinkageError::Missing { .. }) => {
-					self.emit(
-						span,
-						TypeError::ExternalValueLinkageMissing {
-							marker: marker.clone(),
-						},
-					);
-					None
-				}
-				Err(nymph_hir::linkage::LinkageError::WrongKind { .. }) => {
-					self.emit(
-						span,
-						TypeError::ExternalLinkageWrongKind {
-							marker: marker.clone(),
-						},
-					);
-					None
-				}
-			};
-			let marshal = self
+			let ty = self
 				.defs
 				.get(&meta.name.0.as_binding().expect("external let binding").0)
-				.and_then(|def| self.sigs.lets.get(&def).map(|sig| sig.ty))
-				.and_then(|ty| match self.interner.kind(ty) {
-					nymph_hir::ty::TyKind::Int => Some(nymph_hir::hir::MarshalKind::Int),
-					nymph_hir::ty::TyKind::UInt => Some(nymph_hir::hir::MarshalKind::UInt),
-					nymph_hir::ty::TyKind::Float => Some(nymph_hir::hir::MarshalKind::Float),
-					nymph_hir::ty::TyKind::Char => Some(nymph_hir::hir::MarshalKind::Char),
-					nymph_hir::ty::TyKind::String => Some(nymph_hir::hir::MarshalKind::String),
-					nymph_hir::ty::TyKind::Boolean => Some(nymph_hir::hir::MarshalKind::Boolean),
-					nymph_hir::ty::TyKind::List(_) => Some(nymph_hir::hir::MarshalKind::List),
-					nymph_hir::ty::TyKind::Tuple(_) => Some(nymph_hir::hir::MarshalKind::Tuple),
-					nymph_hir::ty::TyKind::Map(_, _) => Some(nymph_hir::hir::MarshalKind::Map),
-					_ => None,
-				});
-			if let Some(marshal) = marshal {
-				self.external_value_marshals.insert(span, marshal);
-			}
-			if marshal.is_none() {
-				self.emit(span, TypeError::ExternalValueTypeUnsupported);
-			} else if linked.is_some_and(|linked| Some(linked.marshal) != marshal) {
+				.and_then(|def| self.sigs.lets.get(&def).map(|sig| sig.ty));
+			self.check_external_value(marker, meta.name.1, meta.is_mutable(), ty);
+		}
+	}
+
+	pub(crate) fn check_external_value(
+		&mut self,
+		marker: &ecow::EcoString,
+		span: Span,
+		mutable: bool,
+		ty: Option<Ty>,
+	) {
+		let linked = match nymph_hir::linkage::lookup_value(marker) {
+			Ok(linked) => Some(linked),
+			Err(nymph_hir::linkage::LinkageError::Missing { .. }) => {
 				self.emit(
 					span,
-					TypeError::ExternalValueTypeMismatch {
+					TypeError::ExternalValueLinkageMissing {
 						marker: marker.clone(),
 					},
 				);
+				None
 			}
-			if meta.is_mutable() {
-				self.emit(span, TypeError::ExternalValueMutable);
+			Err(nymph_hir::linkage::LinkageError::WrongKind { .. }) => {
+				self.emit(
+					span,
+					TypeError::ExternalLinkageWrongKind {
+						marker: marker.clone(),
+					},
+				);
+				None
 			}
+		};
+		let marshal = ty.and_then(|ty| match self.interner.kind(ty) {
+			nymph_hir::ty::TyKind::Int => Some(nymph_hir::hir::MarshalKind::Int),
+			nymph_hir::ty::TyKind::UInt => Some(nymph_hir::hir::MarshalKind::UInt),
+			nymph_hir::ty::TyKind::Float => Some(nymph_hir::hir::MarshalKind::Float),
+			nymph_hir::ty::TyKind::Char => Some(nymph_hir::hir::MarshalKind::Char),
+			nymph_hir::ty::TyKind::String => Some(nymph_hir::hir::MarshalKind::String),
+			nymph_hir::ty::TyKind::Boolean => Some(nymph_hir::hir::MarshalKind::Boolean),
+			nymph_hir::ty::TyKind::List(_) => Some(nymph_hir::hir::MarshalKind::List),
+			nymph_hir::ty::TyKind::Tuple(_) => Some(nymph_hir::hir::MarshalKind::Tuple),
+			nymph_hir::ty::TyKind::Map(_, _) => Some(nymph_hir::hir::MarshalKind::Map),
+			_ => None,
+		});
+		if let Some(marshal) = marshal {
+			self.external_value_marshals.insert(span, marshal);
+		}
+		if marshal.is_none() {
+			self.emit(span, TypeError::ExternalValueTypeUnsupported);
+		} else if linked.is_some_and(|linked| Some(linked.marshal) != marshal) {
+			self.emit(
+				span,
+				TypeError::ExternalValueTypeMismatch {
+					marker: marker.clone(),
+				},
+			);
+		}
+		if mutable {
+			self.emit(span, TypeError::ExternalValueMutable);
 		}
 	}
 
@@ -1160,6 +1170,20 @@ mod tests {
 				.values()
 				.all(|method| method.definition.is_some())
 		);
+		let interface = checker.interfaces.get(&implementation.interface).unwrap();
+		let label = interface.methods["label"].definition.as_ref().unwrap();
+		let extra = interface.methods["extra"].definition.as_ref().unwrap();
+		assert_eq!(implementation.member_catalog.len(), 2);
+		assert_eq!(implementation.member_catalog[0].interface_member_id, *label);
+		assert_eq!(implementation.member_catalog[1].interface_member_id, *extra);
+		assert_eq!(
+			implementation.member_catalog.target(label).unwrap().source,
+			crate::ImplementationMemberSource::InheritedDefault
+		);
+		assert_eq!(
+			implementation.member_catalog.target(extra).unwrap().source,
+			crate::ImplementationMemberSource::Override
+		);
 		assert!(checker.inherent.impls.iter().all(|implementation| {
 			implementation.definition.is_some()
 				&& implementation
@@ -1178,7 +1202,7 @@ mod tests {
 		assert!(
 			resolutions
 				.iter()
-				.all(|resolution| resolution.target.is_some())
+				.all(|resolution| resolution.resolved_target.is_some())
 		);
 	}
 
@@ -1371,6 +1395,14 @@ mod tests {
 			direct_iface,
 			InterfaceDef {
 				generics: Vec::new(),
+				runtime_members: vec![crate::iface::RuntimeMemberDef {
+					definition: Some(direct_member.clone()),
+					name: "direct".into(),
+					kind: crate::MemberKind::Function,
+					has_default: false,
+					external: false,
+					marshal: None,
+				}],
 				methods: FxHashMap::from_iter([("direct".into(), signature(direct_member.clone(), false))]),
 			},
 		);
@@ -1378,6 +1410,14 @@ mod tests {
 			default_iface,
 			InterfaceDef {
 				generics: Vec::new(),
+				runtime_members: vec![crate::iface::RuntimeMemberDef {
+					definition: Some(default_member.clone()),
+					name: "defaulted".into(),
+					kind: crate::MemberKind::Function,
+					has_default: true,
+					external: false,
+					marshal: None,
+				}],
 				methods: FxHashMap::from_iter([(
 					"defaulted".into(),
 					signature(default_member.clone(), true),
@@ -1390,12 +1430,58 @@ mod tests {
 				direct_iface,
 				Some(("direct".into(), signature(direct_member.clone(), false))),
 			),
-			(default_impl.clone(), default_iface, None),
+			(
+				default_impl.clone(),
+				default_iface,
+				None::<(ecow::EcoString, crate::iface::IfaceMethod)>,
+			),
 		] {
+			let implementation_members = method
+				.iter()
+				.filter_map(|(name, method)| {
+					Some((
+						method.definition.clone()?,
+						name.clone(),
+						crate::MemberKind::Function,
+						false,
+					))
+				})
+				.collect::<Vec<_>>();
+			let interface_members = checker.interfaces[&interface]
+				.runtime_members
+				.iter()
+				.filter_map(|member| {
+					Some((
+						member.definition.clone()?,
+						member.name.clone(),
+						member.kind,
+						member.has_default,
+					))
+				})
+				.collect::<Vec<_>>();
+			let member_catalog = crate::interface::project_implementation_member_catalog(
+				&definition,
+				interface_members,
+				implementation_members.clone(),
+			);
 			checker.impls.add(
 				&checker.interner,
 				ImplDef {
 					definition: Some(definition),
+					member_catalog,
+					runtime_members: implementation_members
+						.into_iter()
+						.map(
+							|(definition, name, kind, external)| crate::iface::RuntimeMemberDef {
+								definition: Some(definition),
+								name,
+								kind,
+								has_default: false,
+								external,
+								marshal: None,
+							},
+						)
+						.collect(),
 					generics: Vec::new(),
 					self_ty,
 					interface,

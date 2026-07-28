@@ -429,7 +429,7 @@ pub struct ExportedImpl {
 	pub binders: Vec<GenericParameter>,
 	pub constraints: Vec<GenericConstraint>,
 	pub members: Vec<MemberShape<InterfaceType>>,
-	pub member_slots: Vec<ImplementationMemberSlot>,
+	pub member_slots: ImplementationMemberCatalog,
 	pub runtime_owner: Option<DefinitionId>,
 }
 
@@ -449,6 +449,110 @@ pub struct ImplementationMemberSlot {
 	pub kind: MemberKind,
 	pub name: EcoString,
 	pub source: ImplementationMemberSource,
+	pub external: bool,
+}
+
+/// Final checker-owned relation from an implementation and exact interface
+/// member identity to the one runtime target selected for that pair.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub struct ImplementationMemberCatalog {
+	slots: Vec<ImplementationMemberSlot>,
+}
+
+impl ImplementationMemberCatalog {
+	#[must_use]
+	pub fn target(&self, interface_member: &DefinitionId) -> Option<&ImplementationMemberSlot> {
+		self
+			.slots
+			.iter()
+			.find(|slot| &slot.interface_member_id == interface_member)
+	}
+
+	pub fn retain(&mut self, mut predicate: impl FnMut(&ImplementationMemberSlot) -> bool) {
+		self.slots.retain(|slot| predicate(slot));
+	}
+}
+
+impl std::ops::Deref for ImplementationMemberCatalog {
+	type Target = [ImplementationMemberSlot];
+
+	fn deref(&self) -> &Self::Target {
+		&self.slots
+	}
+}
+
+impl<'a> IntoIterator for &'a ImplementationMemberCatalog {
+	type Item = &'a ImplementationMemberSlot;
+	type IntoIter = std::slice::Iter<'a, ImplementationMemberSlot>;
+
+	fn into_iter(self) -> Self::IntoIter {
+		self.slots.iter()
+	}
+}
+
+impl FromIterator<ImplementationMemberSlot> for ImplementationMemberCatalog {
+	fn from_iter<T: IntoIterator<Item = ImplementationMemberSlot>>(iter: T) -> Self {
+		Self {
+			slots: iter.into_iter().collect(),
+		}
+	}
+}
+
+impl From<Vec<ImplementationMemberSlot>> for ImplementationMemberCatalog {
+	fn from(slots: Vec<ImplementationMemberSlot>) -> Self {
+		Self { slots }
+	}
+}
+
+pub(crate) fn project_implementation_member_catalog(
+	implementation: &DefinitionId,
+	interface_members: impl IntoIterator<Item = (DefinitionId, EcoString, MemberKind, bool)>,
+	implementation_members: impl IntoIterator<Item = (DefinitionId, EcoString, MemberKind, bool)>,
+) -> ImplementationMemberCatalog {
+	let implementation_members = implementation_members.into_iter().collect::<Vec<_>>();
+	interface_members
+		.into_iter()
+		.filter_map(|(interface_member_id, name, kind, has_default)| {
+			if let Some((member_id, _, _, external)) =
+				implementation_members
+					.iter()
+					.find(|(_, candidate_name, candidate_kind, _)| {
+						*candidate_name == name && *candidate_kind == kind
+					}) {
+				return Some(ImplementationMemberSlot {
+					implementation_id: implementation.clone(),
+					interface_member_id,
+					member_id: member_id.clone(),
+					body_definition_id: member_id.clone(),
+					placement_owner: implementation.clone(),
+					kind,
+					name,
+					source: ImplementationMemberSource::Override,
+					external: *external,
+				});
+			}
+			has_default.then(|| {
+				let member_id = DefinitionId::new(
+					implementation.module.clone(),
+					crate::DeclarationKey::materialized_interface_member(
+						implementation.clone(),
+						interface_member_id.clone(),
+					),
+				);
+				ImplementationMemberSlot {
+					implementation_id: implementation.clone(),
+					interface_member_id: interface_member_id.clone(),
+					member_id,
+					body_definition_id: interface_member_id,
+					placement_owner: implementation.clone(),
+					kind,
+					name,
+					source: ImplementationMemberSource::InheritedDefault,
+					external: false,
+				}
+			})
+		})
+		.collect()
 }
 
 #[derive(Clone, Debug, salsa::SalsaValue)]
@@ -546,7 +650,7 @@ pub struct RecoveredExportedImpl {
 	pub binders: Vec<GenericParameter>,
 	pub constraints: Vec<RecoveredGenericConstraint>,
 	pub members: Vec<RecoveredMemberShape>,
-	pub member_slots: Vec<ImplementationMemberSlot>,
+	pub member_slots: ImplementationMemberCatalog,
 	pub runtime_owner: Option<DefinitionId>,
 }
 #[derive(Clone, Debug, salsa::SalsaValue)]

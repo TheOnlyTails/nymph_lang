@@ -154,101 +154,34 @@ pub fn stable_annotation_view(
 		let Some(resolution) = &info.resolution else {
 			continue;
 		};
-		let mut target = resolution.target.clone();
-		let mut implementation = resolution.implementation.clone();
-		let selected_catalog_impl = resolution.impl_span.and_then(|span| {
-			let selected = facts
-				.semantic
-				.implementations
-				.impls
-				.iter()
-				.find(|implementation| {
-					implementation.legacy_span == Some(span)
-						&& (implementation.methods.contains_key(&resolution.method)
-							|| facts
-								.semantic
-								.interfaces
-								.get(&implementation.interface)
-								.and_then(|interface| interface.methods.get(&resolution.method))
-								.is_some_and(|method| method.has_default))
-				})?;
-			let selected_interface = definitions.get(&selected.interface)?;
-			interfaces
-				.iter()
-				.flat_map(|interface| interface.implementations.iter())
-				.filter(|candidate| candidate.interface.as_ref() == Some(selected_interface))
-				.filter(|candidate| {
-					let parameters = candidate
-						.binders
-						.iter()
-						.enumerate()
-						.map(|(index, binder)| (crate::ParamIdx(index as u32), binder.id.clone()))
-						.collect();
-					let context = CanonicalizationContext::new(definitions.clone(), parameters);
-					canonicalize_type(&facts.interner, selected.self_ty, &context).ok()
-						== Some(candidate.self_type.clone())
-						&& selected.args.len() == candidate.interface_arguments.len()
-						&& selected.args.iter().all(|(name, ty)| {
-							candidate
-								.interface_arguments
-								.iter()
-								.any(|(candidate_name, candidate_ty)| {
-									candidate_name == name
-										&& canonicalize_type(&facts.interner, *ty, &context)
-											.ok()
-											.as_ref() == Some(candidate_ty)
-								})
-						})
-				})
-				.collect::<Vec<_>>()
-				.as_slice()
-				.first()
-				.copied()
-		});
-		if let Some(selected) = selected_catalog_impl {
-			implementation = Some(selected.id.clone());
-			if let Some(member) = selected
-				.members
-				.iter()
-				.find(|member| member.name == resolution.method)
-			{
-				target = Some(member.id.clone());
-			}
-		}
-		if target.is_none() {
-			let matches = interfaces
-				.iter()
-				.flat_map(|interface| interface.exports.iter())
-				.flat_map(|owner| owner.members.iter().map(move |member| (owner, member)))
-				.filter(|(_, member)| member.name == resolution.method)
-				.collect::<Vec<_>>();
-			if let [(owner, member)] = matches.as_slice() {
-				target = Some(member.id.clone());
-				implementation.get_or_insert_with(|| owner.id.clone());
-			}
-		}
-		let dispatch = if implementation.as_ref().is_some_and(|implementation| {
-			matches!(
-				implementation.key,
-				DeclarationKey::TopLevel {
-					category: DeclarationCategory::Struct | DeclarationCategory::Enum,
-					..
-				}
-			)
-		}) {
-			DispatchKind::UserImpl
-		} else if let Some(implementation) = selected_catalog_impl {
-			if implementation
-				.members
-				.iter()
-				.any(|member| member.name == resolution.method)
-			{
-				DispatchKind::UserImpl
-			} else {
-				DispatchKind::UserImplDefaultMethod
-			}
-		} else {
-			resolution.dispatch
+		let (dispatch, target, implementation) = match &resolution.resolved_target {
+			Some(crate::annotate::ResolvedMethodTarget::Inherent {
+				member,
+				implementation,
+			}) => (
+				DispatchKind::UserImpl,
+				Some(member.clone()),
+				Some(implementation.clone()),
+			),
+			Some(crate::annotate::ResolvedMethodTarget::InterfaceImplementation { slot, .. }) => (
+				match slot.source {
+					crate::ImplementationMemberSource::Override => DispatchKind::UserImpl,
+					crate::ImplementationMemberSource::InheritedDefault => {
+						DispatchKind::UserImplDefaultMethod
+					}
+				},
+				Some(slot.member_id.clone()),
+				Some(slot.implementation_id.clone()),
+			),
+			Some(crate::annotate::ResolvedMethodTarget::GenericBound {
+				interface,
+				interface_member,
+			}) => (
+				DispatchKind::UserImplDefaultMethod,
+				Some(interface_member.clone()),
+				Some(interface.clone()),
+			),
+			None => (resolution.dispatch, None, None),
 		};
 		resolutions.push((
 			id,

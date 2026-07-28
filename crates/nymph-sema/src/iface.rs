@@ -16,7 +16,11 @@ use crate::errors::TypeError;
 use ecow::EcoString;
 use nymph_ast::{
 	Ident, Span, Spanned,
-	decl::{Declaration, FuncDeclaration, FuncKind, ImplMember, StructImpl},
+	decl::{
+		Declaration, FuncDeclaration, FuncKind, ImplMember, InterfaceElement, InterfaceMember, LetKind,
+		StructImpl,
+	},
+	expr::Pattern,
 	ty::{GenericArg, GenericParam, Type},
 };
 use rustc_hash::FxHashMap;
@@ -53,10 +57,22 @@ pub struct IfaceMethod {
 	pub mutating: bool,
 }
 
+#[derive(Debug, Clone)]
+pub struct RuntimeMemberDef {
+	pub definition: Option<DefinitionId>,
+	pub name: EcoString,
+	pub kind: crate::MemberKind,
+	pub has_default: bool,
+	pub external: bool,
+	pub marshal: Option<nymph_hir::hir::MarshalKind>,
+}
+
 /// A collected `interface`.
 #[derive(Debug, Clone, Default)]
 pub struct InterfaceDef {
 	pub generics: Vec<EcoString>,
+	/// All runtime-bearing interface members in declaration order.
+	pub runtime_members: Vec<RuntimeMemberDef>,
 	pub methods: FxHashMap<EcoString, IfaceMethod>,
 }
 
@@ -72,6 +88,11 @@ pub struct Bound {
 #[derive(Debug, Clone)]
 pub struct ImplDef {
 	pub definition: Option<DefinitionId>,
+	/// Final exact interface-member dispatch relation. Local catalogs are filled
+	/// after stable identities are assigned and before any body is checked;
+	/// imported catalogs are copied from their module interface.
+	pub member_catalog: crate::ImplementationMemberCatalog,
+	pub runtime_members: Vec<RuntimeMemberDef>,
 	pub generics: Vec<EcoString>,
 	pub self_ty: Ty,
 	pub interface: DefId,
@@ -202,15 +223,37 @@ impl Checker<'_> {
 			};
 			let names = generic_names(generics);
 			self.push_params(build_param_scope(generics));
+			let mut runtime_members = Vec::new();
 			let mut methods = FxHashMap::default();
 			for m in members {
-				use nymph_ast::decl::{InterfaceElement, InterfaceMember};
-				if let InterfaceMember::Element(element) = &m.0
-					&& let InterfaceElement::Func { meta, body } = &element.0
-				{
-					let mut sig = self.lower_method_sig(meta, generics.len());
-					sig.has_default = body.is_some();
-					methods.insert(meta.name.0.clone(), sig);
+				if let InterfaceMember::Element(element) = &m.0 {
+					match &element.0 {
+						InterfaceElement::Func { meta, body } => {
+							let mut sig = self.lower_method_sig(meta, generics.len());
+							sig.has_default = body.is_some();
+							runtime_members.push(RuntimeMemberDef {
+								definition: None,
+								name: meta.name.0.clone(),
+								kind: func_member_kind(meta.kind.clone()),
+								has_default: body.is_some(),
+								external: false,
+								marshal: None,
+							});
+							methods.insert(meta.name.0.clone(), sig);
+						}
+						InterfaceElement::Let { meta, value } => {
+							if let Pattern::Binding { name, .. } = &meta.name.0 {
+								runtime_members.push(RuntimeMemberDef {
+									definition: None,
+									name: name.0.clone(),
+									kind: let_member_kind(meta.kind),
+									has_default: value.is_some(),
+									external: false,
+									marshal: None,
+								});
+							}
+						}
+					}
 				}
 			}
 			self.pop_params();
@@ -218,6 +261,7 @@ impl Checker<'_> {
 				id,
 				InterfaceDef {
 					generics: names,
+					runtime_members,
 					methods,
 				},
 			);
@@ -526,9 +570,28 @@ impl Checker<'_> {
 			);
 		}
 
+		for member in members {
+			if let ImplMember::ExternalLet(_, marker, meta) = &member.0 {
+				let ty = meta.type_.as_ref().map(|ty| self.lower_type(ty));
+				self.check_external_value(marker, meta.name.1, meta.is_mutable(), ty);
+			}
+		}
+
 		let blanket = matches!(self.interner.kind(self_ty), TyKind::Param(_));
+		let runtime_members = members
+			.iter()
+			.filter_map(|member| {
+				runtime_member_def(
+					&member.0,
+					self.interfaces.get(&interface),
+					&self.external_value_marshals,
+				)
+			})
+			.collect();
 		let def = ImplDef {
 			definition: None,
+			member_catalog: Default::default(),
+			runtime_members,
 			generics: names,
 			self_ty,
 			interface,
@@ -695,6 +758,62 @@ impl Checker<'_> {
 			_ => {}
 		}
 	}
+}
+
+fn func_member_kind(kind: FuncKind) -> crate::MemberKind {
+	match kind {
+		FuncKind::Instance => crate::MemberKind::Function,
+		FuncKind::Mut => crate::MemberKind::MutatingFunction,
+		FuncKind::Namespace => crate::MemberKind::StaticFunction,
+	}
+}
+
+fn let_member_kind(kind: LetKind) -> crate::MemberKind {
+	match kind {
+		LetKind::Instance => crate::MemberKind::Value,
+		LetKind::Mut => crate::MemberKind::MutableValue,
+		LetKind::Namespace => crate::MemberKind::StaticValue,
+	}
+}
+
+fn runtime_member_def(
+	member: &ImplMember,
+	interface: Option<&InterfaceDef>,
+	external_value_marshals: &FxHashMap<Span, nymph_hir::hir::MarshalKind>,
+) -> Option<RuntimeMemberDef> {
+	let (name, source_kind) = match member {
+		ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => {
+			(meta.name.0.clone(), func_member_kind(meta.kind.clone()))
+		}
+		ImplMember::Let { meta, .. } | ImplMember::ExternalLet(_, _, meta) => {
+			let Pattern::Binding { name, .. } = &meta.name.0 else {
+				return None;
+			};
+			(name.0.clone(), let_member_kind(meta.kind))
+		}
+	};
+	let kind = interface
+		.and_then(|interface| {
+			interface
+				.runtime_members
+				.iter()
+				.find(|candidate| candidate.name == name)
+		})
+		.map_or(source_kind, |member| member.kind);
+	Some(RuntimeMemberDef {
+		definition: None,
+		name,
+		kind,
+		has_default: false,
+		external: matches!(
+			member,
+			ImplMember::ExternalFunc(..) | ImplMember::ExternalLet(..)
+		),
+		marshal: match member {
+			ImplMember::ExternalLet(_, _, meta) => external_value_marshals.get(&meta.name.1).copied(),
+			_ => None,
+		},
+	})
 }
 
 fn generic_names(generics: &[Spanned<nymph_ast::ty::GenericParam>]) -> Vec<EcoString> {

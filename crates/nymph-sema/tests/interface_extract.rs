@@ -7,9 +7,9 @@ use nymph_hir::{
 use nymph_sema::{
 	DeclarationCategory, DeclarationKey, DefinitionId, DefinitionShapeKind, EntryMode,
 	ExportedDefinition, InterfaceType, ModuleEnvironment, ModuleIdentity, ModuleInterface,
-	ModuleOrigin, RecoveredDefinitionReference, RecoveredInterfaceType, SemanticEnvironment,
-	check_module, check_module_with_environment, declared_headers, extract_module_interface,
-	extract_module_interface_with_facts, recover_module_environment,
+	ModuleOrigin, RecoveredDefinitionReference, RecoveredInterfaceType, SemanticAvailability,
+	SemanticEnvironment, check_module, check_module_with_environment, declared_headers,
+	extract_module_interface, extract_module_interface_with_facts, recover_module_environment,
 };
 
 #[test]
@@ -18,10 +18,12 @@ fn implementation_member_slots_materialize_defaults_structurally() {
 interface Pair {
 	func left(): int = this.right()
 	func right(): int = 2
+	let seed: int = 1
 }
 struct A
 struct B
-impl Pair for A { func right(): int = 3 }
+impl Pair for A { func right(): int = 3
+	let seed: int = 4 }
 impl Pair for B {}
 "#;
 	let parsed = nymph_syntax::parse_module(source, "slots.nym");
@@ -62,6 +64,11 @@ impl Pair for B {}
 		.iter()
 		.find(|member| member.name == "right")
 		.unwrap();
+	let seed = pair
+		.members
+		.iter()
+		.find(|member| member.name == "seed")
+		.unwrap();
 	let a = &interface.implementations[0];
 	let b = &interface.implementations[1];
 	let a_left = a
@@ -79,7 +86,24 @@ impl Pair for B {}
 		.iter()
 		.find(|slot| slot.interface_member_id == left.id)
 		.unwrap();
+	let a_seed = a.member_slots.target(&seed.id).unwrap();
+	let b_seed = b.member_slots.target(&seed.id).unwrap();
+	assert_eq!(
+		a.member_slots.target(&left.id),
+		Some(a_left),
+		"the interface member ID must be the sole dispatch key"
+	);
 	assert_eq!(a_right.member_id, a_right.body_definition_id);
+	assert_eq!(a_seed.member_id, a_seed.body_definition_id);
+	assert_eq!(b_seed.body_definition_id, seed.id);
+	assert_eq!(
+		a_seed.source,
+		nymph_sema::ImplementationMemberSource::Override
+	);
+	assert_eq!(
+		b_seed.source,
+		nymph_sema::ImplementationMemberSource::InheritedDefault
+	);
 	assert_eq!(
 		a_right.source,
 		nymph_sema::ImplementationMemberSource::Override
@@ -567,6 +591,11 @@ public struct Pair<T>(left: int, right: Missing) {
 	assert!(matches!(pair.fields[1].ty, RecoveredInterfaceType::Poison));
 	assert_eq!(pair.members.len(), 2);
 	assert_eq!(environment.implementations.len(), 1);
+	assert_eq!(
+		environment.implementations[0].availability,
+		SemanticAvailability::StructureUnavailable
+	);
+	assert!(environment.implementations[0].member_slots.is_empty());
 }
 
 #[test]
@@ -801,15 +830,61 @@ fn extraction_uses_checked_external_value_linkage_and_marshal() {
 }
 
 #[test]
+fn implementation_value_shapes_project_checker_owned_kind_and_marshal() {
+	let module = Arc::new(parse(
+		"type Scalar = float\ninterface Limit { let mut maximum: Scalar }\nstruct Box {}\nimpl Limit for Box { external(max_float) let maximum: Scalar }",
+	));
+	let module_identity = identity();
+	let environment = SemanticEnvironment::from_modules(module_identity.clone(), &[]).unwrap();
+	let result = check_module_with_environment(
+		module.clone(),
+		module_identity.clone(),
+		&environment,
+		EntryMode::Library,
+	);
+	assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+	let checked = nymph_sema::Checked {
+		diags: Vec::new(),
+		facts: result.analysis.checked.as_ref().clone(),
+	};
+	let headers = declared_headers(module_identity.clone(), &module);
+	let interface = extract_module_interface(module_identity, &module, &checked, &headers).unwrap();
+	let member = &interface.implementations[0].members[0];
+	assert_eq!(member.kind, nymph_sema::MemberKind::MutableValue);
+	assert_eq!(
+		member.external.as_ref().and_then(|abi| abi.marshal),
+		Some(MarshalKind::Float)
+	);
+	let slot = interface.implementations[0]
+		.member_slots
+		.iter()
+		.next()
+		.unwrap();
+	assert_eq!(slot.kind, member.kind);
+	assert_eq!(slot.member_id, member.id);
+}
+
+#[test]
 fn extraction_preserves_native_primitive_external_semantics() {
-	let module = parse(
+	let module = Arc::new(parse(
 		"interface Plus<Other, Output> { func plus(other: Other): Output }\n\
 		 impl Plus<Other = self, Output = self> for int { external func plus(other: self): self }",
+	));
+	let module_identity = identity();
+	let environment = SemanticEnvironment::from_modules(module_identity.clone(), &[]).unwrap();
+	let result = check_module_with_environment(
+		module.clone(),
+		module_identity.clone(),
+		&environment,
+		EntryMode::Library,
 	);
-	let checked = check_module(&module);
-	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
-	let headers = declared_headers(identity(), &module);
-	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();
+	assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+	let checked = nymph_sema::Checked {
+		diags: Vec::new(),
+		facts: result.analysis.checked.as_ref().clone(),
+	};
+	let headers = declared_headers(module_identity.clone(), &module);
+	let interface = extract_module_interface(module_identity, &module, &checked, &headers).unwrap();
 	let abi = interface.implementations[0].members[0]
 		.external
 		.as_ref()

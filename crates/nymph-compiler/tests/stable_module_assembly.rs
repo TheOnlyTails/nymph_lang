@@ -726,7 +726,20 @@ fn stable_native_map_runtime_is_exact_collision_safe_and_runs_after_dependency_w
 		compiled.js
 	);
 	assert_eq!(compiled.js.matches("//#region collections/map").count(), 1);
-	assert!(!compiled.js.contains("collections/list"), "{}", compiled.js);
+	assert_eq!(
+		compiled
+			.js
+			.matches("//#region std/collections/list")
+			.count(),
+		1,
+		"{}",
+		compiled.js
+	);
+	assert!(
+		!compiled.js.contains("//#region collections/list"),
+		"{}",
+		compiled.js
+	);
 	assert!(
 		!compiled.js.contains("@nymph/runtime/result"),
 		"{}",

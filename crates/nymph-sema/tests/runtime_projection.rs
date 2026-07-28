@@ -44,6 +44,92 @@ fn project(source: &str) -> Vec<nymph_sema::RuntimeDefinition> {
 	runtime_definitions(&module, &checked.facts, &interface).unwrap()
 }
 
+#[test]
+fn generic_iterable_iteration_preserves_the_exact_iter_member() {
+	let definitions = project(
+		"enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nfunc each<T: Iterable<Item = int>>(items: T): void = for (_ in items) { 0 }",
+	);
+	let each = definitions
+		.iter()
+		.find(|definition| source_name(&definition.definition) == "each")
+		.unwrap();
+	let RuntimePayload::NymphBody(body) = &each.payload else {
+		panic!("expected checked function body")
+	};
+	let (_, iteration) = body.annotations.iterations.first().unwrap();
+	let nymph_sema::RuntimeIteration::ViaIter {
+		iterable_interface,
+		iter_interface_member,
+		iter,
+		..
+	} = iteration
+	else {
+		panic!("expected Iterable::iter dispatch")
+	};
+	assert!(matches!(
+		iter,
+		StableDispatch::GenericBound { interface, member }
+			if interface == iterable_interface && member == iter_interface_member
+	));
+}
+
+#[test]
+fn first_class_interface_method_preserves_the_exact_selected_slot() {
+	let definitions = project(
+		"interface Read { func read(value: int): int }\ninterface Unrelated { func read(left: int, right: int): int }\nstruct Box(value: int)\nimpl Read for Box { func read(value: int): int = this.value + value }\nfunc apply(box: Box): int = { let read = box.read read(1) }",
+	);
+	let apply = definitions
+		.iter()
+		.find(|definition| source_name(&definition.definition) == "apply")
+		.unwrap();
+	let RuntimePayload::NymphBody(body) = &apply.payload else {
+		panic!("expected checked function body")
+	};
+	let dispatch = body
+		.annotations
+		.dispatches
+		.iter()
+		.map(|(_, dispatch)| dispatch)
+		.find(|dispatch| matches!(dispatch, StableDispatch::SelectedImplementation { .. }))
+		.expect("first-class method access retains its exact implementation slot");
+	let StableDispatch::SelectedImplementation {
+		member,
+		implementation,
+		..
+	} = dispatch
+	else {
+		unreachable!()
+	};
+	let selected = definitions
+		.iter()
+		.find(|definition| &definition.definition == member)
+		.expect("selected method has a runtime definition");
+	assert!(matches!(
+		&selected.placement,
+		nymph_sema::RuntimePlacement::Attached { owner, .. } if owner == implementation
+	));
+}
+
+#[test]
+fn first_class_inherent_method_preserves_its_exact_member_and_owner() {
+	let definitions = project(
+		"struct Box(value: int)\nimpl Box { func add(value: int): int = this.value + value }\nfunc apply(box: Box): int = { let add = box.add add(1) }",
+	);
+	let apply = definitions
+		.iter()
+		.find(|definition| source_name(&definition.definition) == "apply")
+		.unwrap();
+	let RuntimePayload::NymphBody(body) = &apply.payload else {
+		panic!("expected checked function body")
+	};
+	assert!(body.annotations.dispatches.iter().any(|(_, dispatch)| matches!(
+		dispatch,
+		StableDispatch::Direct { member, implementation, .. }
+			if definitions.iter().any(|definition| definition.definition == *member
+				&& matches!(&definition.placement, nymph_sema::RuntimePlacement::Attached { owner, .. } if owner == implementation))
+	)));
+}
+
 fn collect_pattern_ids(
 	pattern: &nymph_sema::StablePattern,
 	ids: &mut Vec<nymph_sema::PatternNodeId>,
@@ -613,7 +699,7 @@ struct Box
 impl Box {
 	func answer(): int = 42
 	let value: int = 7
-	external(host_value) let host: int
+	external(max_float) let host: float
 }
 "#;
 	let artifacts = project(source);

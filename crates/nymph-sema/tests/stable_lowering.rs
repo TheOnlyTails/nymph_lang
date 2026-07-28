@@ -373,6 +373,12 @@ fn materialized_fixture_in(
 			StableShapeRequest::Implementation(implementation.id.clone()),
 			StableShapeFact::Implementation(implementation.clone()),
 		);
+		for member in &implementation.members {
+			context.shapes.insert(
+				StableShapeRequest::Member(member.id.clone()),
+				StableShapeFact::Member(member.clone()),
+			);
+		}
 		for slot in &implementation.member_slots {
 			context.members.insert(
 				slot.member_id.clone(),
@@ -387,6 +393,10 @@ fn materialized_fixture_in(
 			.map(|item| &item.definition),
 	) {
 		for member in &definition.members {
+			context.shapes.insert(
+				StableShapeRequest::Member(member.id.clone()),
+				StableShapeFact::Member(member.clone()),
+			);
 			context.members.insert(
 				member.id.clone(),
 				EmittedMemberName::new(member.name.clone()),
@@ -784,6 +794,156 @@ fn top_level_external_value_lowers_to_exact_marshaled_binding() {
 }
 
 #[test]
+fn nominal_external_members_preserve_their_exact_attachment_placement() {
+	let (artifacts, _, context) = materialized_fixture(
+		"type Scalar = float\nstruct Box {}\nimpl Box { external(display) func rendered(): string external(max_float) let maximum: Scalar }",
+	);
+	for name in ["rendered", "maximum"] {
+		let artifact = artifacts
+			.iter()
+			.find(|artifact| source_name(&artifact.definition) == name)
+			.unwrap();
+		let expected_owner = match &artifact.placement {
+			nymph_sema::RuntimePlacement::Attached { owner, .. } => owner,
+			nymph_sema::RuntimePlacement::TopLevel => {
+				panic!("member must retain its implementation owner")
+			}
+		};
+		let lowered = lower_runtime_definition(&context, Arc::new(artifact.clone())).unwrap();
+		assert!(matches!(
+			lowered.placement(),
+			nymph_sema::RuntimeAssemblyPlacement::Shell(_)
+		));
+		assert!(matches!(
+			(lowered.fragment(), name),
+			(nymph_sema::LoweredHirFragment::AttachedInstance { owner, .. }, "rendered")
+				| (nymph_sema::LoweredHirFragment::AttachedMember { owner, .. }, "maximum")
+					if owner == expected_owner
+		));
+	}
+}
+
+#[test]
+fn first_class_interface_method_lowers_as_an_exact_receiver_bound_closure() {
+	let lowered = lower_named(
+		"interface Read { func read(value: int): int }\nstruct Box(value: int)\nimpl Read for Box { func read(value: int): int = this.value + value }\nfunc apply(box: Box): int = { let read = box.read read(1) }",
+		"apply",
+	);
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("apply must lower as a function")
+	};
+	let nymph_hir::hir::HirExpr::Block { stmts, .. } = &function.body else {
+		panic!("apply must retain its block")
+	};
+	let nymph_hir::hir::HirStmt::Let { value, .. } = &stmts[0] else {
+		panic!("method value must initialize its binding")
+	};
+	assert!(matches!(
+		value,
+		nymph_hir::hir::HirExpr::Call { callee, args }
+			if args.len() == 1
+				&& matches!(&**callee, nymph_hir::hir::HirExpr::Closure { params, body }
+					if params == &["$receiver"]
+						&& matches!(&**body, nymph_hir::hir::HirExpr::Closure { params, .. } if params == &["$arg0"]))
+	));
+}
+
+#[test]
+fn first_class_generic_bound_method_uses_the_exact_interface_member() {
+	let lowered = lower_named(
+		"interface Read { func read(value: int): int }\nstruct Box(value: int)\nimpl Read for Box { func read(value: int): int = this.value + value }\nfunc apply<T: Read>(box: T): int = { let read = box.read read(1) }",
+		"apply",
+	);
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("apply must lower as a function")
+	};
+	let nymph_hir::hir::HirExpr::Block { stmts, .. } = &function.body else {
+		panic!("apply must retain its block")
+	};
+	let nymph_hir::hir::HirStmt::Let { value, .. } = &stmts[0] else {
+		panic!("method value must initialize its binding")
+	};
+	assert!(matches!(value, nymph_hir::hir::HirExpr::Call { callee, .. }
+		if matches!(&**callee, nymph_hir::hir::HirExpr::Closure { body, .. }
+			if matches!(&**body, nymph_hir::hir::HirExpr::Closure { body, .. }
+				if matches!(&**body, nymph_hir::hir::HirExpr::Call { callee, .. }
+					if matches!(&**callee, nymph_hir::hir::HirExpr::Field { name, .. } if name == "read"))))));
+}
+
+#[test]
+fn first_class_external_method_uses_the_catalog_selected_abi() {
+	let lowered = lower_named(
+		"interface Render { func render(): string }\nstruct Box {}\nimpl Render for Box { external(display) func render(): string }\nfunc apply(box: Box): string = { let render = box.render render() }",
+		"apply",
+	);
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("apply must lower as a function")
+	};
+	let nymph_hir::hir::HirExpr::Block { stmts, .. } = &function.body else {
+		panic!("apply must retain its block")
+	};
+	let nymph_hir::hir::HirStmt::Let { value, .. } = &stmts[0] else {
+		panic!("method value must initialize its binding")
+	};
+	assert!(
+		matches!(value, nymph_hir::hir::HirExpr::Call { callee, .. }
+		if matches!(&**callee, nymph_hir::hir::HirExpr::Closure { body, .. }
+			if matches!(&**body, nymph_hir::hir::HirExpr::Closure { body, .. }
+				if matches!(&**body, nymph_hir::hir::HirExpr::ExternCall { module, symbol, args }
+					if *module == "std/display" && *symbol == "display" && args.len() == 1)))),
+		"{value:#?}"
+	);
+}
+
+#[test]
+fn inherent_external_method_calls_and_values_use_the_exact_member_abi() {
+	let source = "struct Box { external(display) func render(): string }\nfunc call(box: Box): string = box.render()\nfunc value(box: Box): string = { let render = box.render render() }";
+	for function in ["call", "value"] {
+		let lowered = lower_named(source, function);
+		let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+			panic!("{function} must lower as a function")
+		};
+		let rendered = format!("{:#?}", function.body);
+		assert!(rendered.contains("ExternCall"), "{rendered}");
+		assert!(rendered.contains("std/display"), "{rendered}");
+		assert!(rendered.contains("display"), "{rendered}");
+	}
+}
+
+#[test]
+fn first_class_external_method_rejects_runtime_and_shape_abi_drift() {
+	let (artifacts, _, mut context) = materialized_fixture(
+		"interface Render { func render(): string }\nstruct Box {}\nimpl Render for Box { external(display) func render(): string }\nfunc apply(box: Box): string = { let render = box.render render() }",
+	);
+	let render = artifacts
+		.iter()
+		.find(|artifact| source_name(&artifact.definition) == "render")
+		.unwrap()
+		.definition
+		.clone();
+	context.shapes.insert(
+		StableShapeRequest::ExternalAbi(render.clone()),
+		StableShapeFact::ExternalAbi(ExternalAbi {
+			marker: "println".into(),
+			callable: nymph_sema::ExternalCallable::Linked {
+				module: "std/io".into(),
+				symbol: "println".into(),
+			},
+			marshal: None,
+		}),
+	);
+	let apply = artifacts
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "apply")
+		.unwrap();
+	assert!(matches!(
+		lower_runtime_definition(&context, Arc::new(apply)),
+		Err(nymph_sema::StableLoweringError::MismatchedExternalAbi { definition })
+			if definition == render
+	));
+}
+
+#[test]
 fn same_module_identifier_records_its_exact_definition_demand() {
 	let (artifacts, _, context) =
 		materialized_fixture("let answer: int = 42\nfunc read(): int = answer");
@@ -822,6 +982,69 @@ fn direct_external_call_records_its_exact_definition_demand() {
 	let lowered = lower_runtime_definition(&context, Arc::new(sign)).unwrap();
 
 	assert_eq!(lowered.demands(), [compare]);
+}
+
+#[test]
+fn direct_external_call_rejects_runtime_and_shape_abi_drift() {
+	let (artifacts, _, mut context) = materialized_fixture(
+		"external(compare_number) func compare(first: int, second: int): int\nfunc sign(): int = compare(1, 2)",
+	);
+	let compare = artifacts
+		.iter()
+		.find(|artifact| source_name(&artifact.definition) == "compare")
+		.unwrap()
+		.definition
+		.clone();
+	context.shapes.insert(
+		StableShapeRequest::ExternalAbi(compare.clone()),
+		StableShapeFact::ExternalAbi(ExternalAbi {
+			marker: "display".into(),
+			callable: nymph_sema::ExternalCallable::Linked {
+				module: "std/display".into(),
+				symbol: "display".into(),
+			},
+			marshal: None,
+		}),
+	);
+	let sign = artifacts
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "sign")
+		.unwrap();
+
+	assert!(matches!(
+		lower_runtime_definition(&context, Arc::new(sign)),
+		Err(nymph_sema::StableLoweringError::MismatchedExternalAbi { definition })
+			if definition == compare
+	));
+}
+
+#[test]
+fn external_dispatch_rejects_a_missing_persisted_marshal() {
+	let (mut artifacts, _, context) = materialized_fixture(
+		"interface Render { func render(): string }\nstruct Box {}\nimpl Render for Box { external(display) func render(): string }\nfunc read(box: Box): string = box.render()",
+	);
+	let mut read = artifacts
+		.drain(..)
+		.find(|artifact| source_name(&artifact.definition) == "read")
+		.unwrap();
+	let nymph_sema::RuntimePayload::NymphBody(body) = &mut read.payload else {
+		unreachable!()
+	};
+	let dispatches = Arc::make_mut(&mut body.annotations.dispatches);
+	let nymph_sema::StableDispatch::External {
+		member, marshal, ..
+	} = &mut dispatches[0].1
+	else {
+		unreachable!()
+	};
+	let member = member.clone();
+	*marshal = Some(nymph_hir::hir::MarshalKind::String);
+
+	assert!(matches!(
+		lower_runtime_definition(&context, Arc::new(read)),
+		Err(nymph_sema::StableLoweringError::MissingExternalMarshal { definition })
+			if definition == member
+	));
 }
 
 #[test]

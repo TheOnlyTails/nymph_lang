@@ -119,6 +119,34 @@ fn external_let_linkage_uses_resolved_declaration_type() {
 	);
 }
 
+#[test]
+fn implementation_external_let_linkage_uses_resolved_member_type() {
+	for source in [
+		"type Scalar = float\nstruct Box {}\nimpl Box { external(max_float) let value: Scalar }",
+		"type Scalar = float\ninterface Limit { let value: float }\nstruct Box {}\nimpl Limit for Box { external(max_float) let value: Scalar }",
+	] {
+		let parsed = parse_module(source, "test");
+		let checked = check_module(&parsed.tree);
+		assert!(checked.diags.is_empty(), "{source}: {:?}", checked.diags);
+	}
+
+	for source in [
+		"type Scalar = boolean\nstruct Box {}\nimpl Box { external(max_float) let value: Scalar }",
+		"type Scalar = boolean\ninterface Limit { let value: boolean }\nstruct Box {}\nimpl Limit for Box { external(max_float) let value: Scalar }",
+	] {
+		let parsed = parse_module(source, "test");
+		let checked = check_module(&parsed.tree);
+		assert!(
+			checked
+				.diags
+				.iter()
+				.any(|diag| diag.message.contains("incompatible declared type")),
+			"{source}: {:?}",
+			checked.diags
+		);
+	}
+}
+
 /// Parse and check `source`, returning the checker's error messages. Panics if the
 /// source fails to *parse* (these tests exercise the checker, not the parser).
 fn check(source: &str) -> Vec<String> {

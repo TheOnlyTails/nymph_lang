@@ -131,7 +131,7 @@ fn complete_interfaces_and_impls_populate_owned_dispatch_registries() {
 		binders: vec![],
 		constraints: vec![],
 		members: vec![],
-		member_slots: vec![],
+		member_slots: vec![].into(),
 		runtime_owner: Some(impl_id.clone()),
 	};
 	let input = Arc::new(ModuleEnvironment::Complete(ModuleInterface {
@@ -281,7 +281,7 @@ fn impl_only_referenced_identity_is_allocated_in_pass_a() {
 		binders: vec![],
 		constraints: vec![],
 		members: vec![],
-		member_slots: vec![],
+		member_slots: vec![].into(),
 		runtime_owner: None,
 	};
 	let input = Arc::new(ModuleEnvironment::Complete(ModuleInterface {
@@ -333,7 +333,7 @@ fn recovery_taints_without_fabricating_poison_ids() {
 		binders: vec![],
 		constraints: vec![],
 		members: vec![],
-		member_slots: vec![],
+		member_slots: vec![].into(),
 		runtime_owner: None,
 	};
 	let input = Arc::new(ModuleEnvironment::Recovered(RecoveredModuleInterface {
