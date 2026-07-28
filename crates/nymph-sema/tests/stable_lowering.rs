@@ -1230,13 +1230,13 @@ fn generic_bound_with_two_primitive_implementations_lowers_to_stable_multi_case_
 
 #[test]
 fn lowers_struct_and_enum_construction_and_variant_patterns_from_stable_facts() {
-	let source = "struct Point(x: int, y: int)\nenum Choice { Pair(left: int, right: int), None }\nfunc point(): Point = Point(x = 1, y = 2)\nfunc choose(value: Choice): int = match (value) { Choice.Pair(left = left, right = right) if (left < right) -> right, Choice.Pair(left = left, right = _) -> left, Choice.None -> 0 }";
+	let source = "struct Point(value: int, v: int)\nenum Choice { Pair(left: int, right: int), None }\nfunc point(): Point = Point(v = 2, value = 1)\nfunc choose(value: Choice): int = match (value) { Choice.Pair(left = left, right = right) if (left < right) -> right, Choice.Pair(left = left, right = _) -> left, Choice.None -> 0 }";
 	let point = lower_named(source, "point");
 	assert!(matches!(
 		point.fragment(),
 		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
 			if matches!(&function.body, nymph_hir::hir::HirExpr::New { class, fields }
-				if class == "Point" && fields.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>() == ["x", "y"])
+				if class == "Point" && fields.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>() == ["value", "v"])
 	));
 	let choice = lower_named(source, "choose");
 	assert!(matches!(

@@ -1419,25 +1419,35 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						self.context.stable_shape(&request)?
 					{
 						self.demand_external(target)?;
-						let fields = args
+						let resolved = args
 							.iter()
 							.enumerate()
 							.map(|(index, argument)| {
-								let name = argument
+								let field = argument
 									.0
 									.name
 									.as_ref()
-									.map(|name| name.0.clone())
-									.or_else(|| shell.fields.get(index).map(|field| field.name.clone()))
+									.and_then(|name| shell.fields.iter().find(|field| field.name == name.0))
+									.or_else(|| shell.fields.get(index))
 									.ok_or_else(|| {
 										invalid(
 											&self.artifact.definition,
 											"struct argument has no exact field",
 										)
 									})?;
-								Ok((name, self.lower(&argument.0.value)?))
+								Ok((field.id.clone(), self.lower(&argument.0.value)?))
 							})
-							.collect::<Result<_, StableLoweringError>>()?;
+							.collect::<Result<Vec<_>, StableLoweringError>>()?;
+						let fields = shell
+							.fields
+							.iter()
+							.filter_map(|field| {
+								resolved
+									.iter()
+									.find(|(definition, _)| definition == &field.id)
+									.map(|(_, value)| (field.name.clone(), value.clone()))
+							})
+							.collect();
 						return Ok(HirExpr::New {
 							class: self.context.binding_name(target)?.as_str().into(),
 							fields,

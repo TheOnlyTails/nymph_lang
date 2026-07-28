@@ -158,8 +158,8 @@ struct Marker(v: int) {
 struct Holder(value: Marker, v: int)
 func main(): void = {
 	println(#[Marker(v = 1)].debug())
-	println(Holder(value = Marker(v = 1), v = 2).debug())
-	println(Holder(value = Marker(v = 1), v = 2))
+	println(Holder(v = 2, value = Marker(v = 1)).debug())
+	println(Holder(v = 2, value = Marker(v = 1)))
 }"#;
 	let load = only_entry("main", entry);
 	let compiled = compile_project_with_std("main", &load, &real_stdlib_provider)
