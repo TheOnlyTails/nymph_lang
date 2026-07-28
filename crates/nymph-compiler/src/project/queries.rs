@@ -1625,6 +1625,16 @@ pub(crate) fn lower_interface_module<'db>(
 	};
 	let mut shell_indices = std::collections::HashMap::new();
 	for fragment in &lowered {
+		if own.contains(fragment.definition())
+			&& let nymph_sema::RuntimeAssemblyPlacement::Shell(owner) = fragment.placement()
+			&& owner.module != module.identity(db)
+			&& !matches!(owner.module.origin, nymph_sema::ModuleOrigin::Compiler)
+		{
+			return Err(nymph_sema::StableModuleAssemblyError::MismatchedPlacement {
+				definition: fragment.definition().clone(),
+				owner: owner.clone(),
+			});
+		}
 		if fragment.placement() != &nymph_sema::RuntimeAssemblyPlacement::Module(module.identity(db)) {
 			continue;
 		}

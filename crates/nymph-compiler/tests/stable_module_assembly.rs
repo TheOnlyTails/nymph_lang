@@ -7,6 +7,7 @@ use nymph_compiler::project::{
 };
 use nymph_sema::{
 	DeclarationCategory, DeclarationKey, DefinitionId, EntryMode, ModuleIdentity, ModuleOrigin,
+	StableModuleAssemblyError,
 };
 
 fn event_session() -> (CompilerSession, Arc<Mutex<Vec<SemanticQueryEvent>>>) {
@@ -108,6 +109,37 @@ fn assembles_source_order_shells_values_functions_and_members() {
 	assert_eq!(module.hir.lets.len(), 1);
 	assert_eq!(module.hir.funcs.len(), 1);
 	assert_eq!(module.own_definitions.len(), 4);
+}
+
+#[test]
+fn foreign_shell_attachment_is_not_silently_dropped() {
+	let mut session = CompilerSession::without_builtin_sources();
+	let project = ProjectId::new("foreign-shell");
+	let types = ModulePath::new("types").unwrap();
+	let extensions = ModulePath::new("extensions").unwrap();
+	session.set_source(
+		project.clone(),
+		types,
+		"public struct Token {}".into(),
+		SourceVersion(1),
+	);
+	session.set_source(
+		project.clone(),
+		extensions.clone(),
+		"import @/types with (Token)\npublic interface Local { func value(): int }\npublic impl Local for Token { func value(): int = 1 }"
+			.into(),
+		SourceVersion(1),
+	);
+	let error = session
+		.lower_interface_module_for_test(project, extensions.clone(), extensions, EntryMode::Library)
+		.expect_err(
+			"an exact attachment owned by another project module must fail until it can be routed",
+		);
+	assert!(matches!(
+		error,
+		StableModuleAssemblyError::MismatchedPlacement { definition, owner }
+			if definition.module.path == "extensions" && owner.module.path == "types"
+	));
 }
 
 #[test]
