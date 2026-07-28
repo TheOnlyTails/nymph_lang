@@ -25,8 +25,11 @@
 //! `nymph`-tagged illustrative fragments) is not extracted at all — it is
 //! simply not checked.
 
-use nymph_compiler::check;
+use nymph_compiler::{CompilerSession, Diagnostic, ModulePath, ProjectId, SourceVersion};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+const SAMPLES_PER_SESSION: usize = 32;
 
 // ── markdown fence extraction ───────────────────────────────────────────────
 
@@ -189,9 +192,33 @@ fn line_of_offset(source: &str, offset: usize) -> usize {
 // ── per-fence verdict ────────────────────────────────────────────────────────
 
 /// Check one extracted fence, returning `Err(reason)` on failure.
-fn check_fence(file: &Path, fence: &Fence) -> Result<(), String> {
+fn check_fence(
+	session: &mut CompilerSession,
+	sample_index: usize,
+	file: &Path,
+	fence: &Fence,
+) -> Result<(), String> {
 	let label = format!("{}:{}", file.display(), fence.line);
 	let (stripped, marked_lines) = strip_markers(&fence.body);
+	let check = |session: &mut CompilerSession, source: &str| -> Vec<Diagnostic> {
+		// Replace the one fixture module between samples so source state cannot
+		// leak, while retaining immutable ambient-core and project query results.
+		// The first sample still covers cold-session behavior; later samples use
+		// the compiler's normal, separately tested source-version invalidation.
+		let project = ProjectId::new("docs-samples");
+		let module = ModulePath::new("sample").expect("static doc-sample module path is canonical");
+		session.set_source(
+			project.clone(),
+			module.clone(),
+			source.to_owned(),
+			SourceVersion(sample_index as i64 + 1),
+		);
+		session
+			.tooling_diagnostics(project, module, true)
+			.iter()
+			.map(|item| item.diag.clone())
+			.collect()
+	};
 
 	if marked_lines.is_empty() {
 		// Compile-clean case. A bare expression needs the same throwaway-func
@@ -203,7 +230,7 @@ fn check_fence(file: &Path, fence: &Fence) -> Result<(), String> {
 		} else {
 			format!("func __nymph_repl() = {{\n{stripped}\n}}\n")
 		};
-		let diags = check(&checked, &label);
+		let diags = check(session, &checked);
 		let errs: Vec<_> = diags.iter().filter(|d| d.is_error()).collect();
 		if errs.is_empty() {
 			Ok(())
@@ -214,7 +241,7 @@ fn check_fence(file: &Path, fence: &Fence) -> Result<(), String> {
 		// Expected-error case: every marked sample in the docs today is a
 		// full program, and wrapping would shift line numbers, so this path
 		// never wraps.
-		let diags = check(&stripped, &label);
+		let diags = check(session, &stripped);
 		let errs: Vec<_> = diags.iter().filter(|d| d.is_error()).collect();
 		if errs.is_empty() {
 			return Err(format!(
@@ -243,8 +270,11 @@ fn check_fence(file: &Path, fence: &Fence) -> Result<(), String> {
 
 #[test]
 fn every_doc_sample_is_covered() {
+	let started = Instant::now();
 	let docs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
 	assert!(docs_dir.is_dir(), "expected {docs_dir:?} to exist");
+	let mut session = CompilerSession::without_builtin_sources();
+	let mut session_count = 1;
 
 	let mut md_files = Vec::new();
 	collect_md_files(&docs_dir, &mut md_files);
@@ -256,24 +286,34 @@ fn every_doc_sample_is_covered() {
 	let mut clean_count = 0;
 	let mut error_marked_count = 0;
 	let mut failures = Vec::new();
+	let mut sample_index = 0;
 
 	for file in &md_files {
 		let markdown = std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
 		for fence in extract_nym_fences(&markdown) {
+			if sample_index > 0 && sample_index % SAMPLES_PER_SESSION == 0 {
+				// Bound retained incremental state while still amortizing ambient-core
+				// analysis across a useful, deterministic fixture scope.
+				session = CompilerSession::without_builtin_sources();
+				session_count += 1;
+			}
 			if fence.body.lines().any(has_error_marker) {
 				error_marked_count += 1;
 			} else {
 				clean_count += 1;
 			}
-			if let Err(reason) = check_fence(file, &fence) {
+			if let Err(reason) = check_fence(&mut session, sample_index, file, &fence) {
 				failures.push(reason);
 			}
+			sample_index += 1;
 		}
 	}
 
 	eprintln!(
-		"doc samples: {clean_count} compile-clean, {error_marked_count} error-marked (total {})",
-		clean_count + error_marked_count
+		"doc samples: {clean_count} compile-clean, {error_marked_count} error-marked (total {}); \
+		 sessions={session_count}; elapsed_ms={}",
+		clean_count + error_marked_count,
+		started.elapsed().as_millis(),
 	);
 
 	assert!(
