@@ -509,13 +509,11 @@ fn checked_member_shape(
 	}
 	let mut anonymous = anonymous.into_iter().collect::<Vec<_>>();
 	anonymous.sort_by_key(|parameter| parameter.0);
-	for (index, parameter) in anonymous.iter().enumerate() {
+	for index in 0..anonymous.len() {
+		let binder_index = meta.generics.len() + index;
 		binders.push(GenericParameter {
-			id: GenericParameterId::new(
-				id.binder(BinderScope::Member, 0),
-				(meta.generics.len() + index) as u32,
-			),
-			name: format!("$anonymous{}", parameter.0).into(),
+			id: GenericParameterId::new(id.binder(BinderScope::Member, 0), binder_index as u32),
+			name: format!("$anonymous{binder_index}").into(),
 		});
 	}
 	let parameters = owner_binders
@@ -650,13 +648,14 @@ fn definition_anonymous_context(
 	// conversion strict instead of fabricating an unconstrained public generic.
 	anonymous.retain(|parameter| checked.semantic.anonymous_bounds.contains_key(parameter));
 	let declared_len = binders.len();
-	for (index, parameter) in anonymous.iter().enumerate() {
+	for index in 0..anonymous.len() {
+		let binder_index = declared_len + index;
 		binders.push(GenericParameter {
 			id: GenericParameterId::new(
 				owner.binder(BinderScope::Definition, 0),
-				(declared_len + index) as u32,
+				binder_index as u32,
 			),
-			name: format!("$anonymous{}", parameter.0).into(),
+			name: format!("$anonymous{binder_index}").into(),
 		});
 	}
 	let parameters = binders

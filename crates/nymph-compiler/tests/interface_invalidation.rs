@@ -223,6 +223,53 @@ fn every_public_interface_shape_edit_changes_the_interface() {
 }
 
 #[test]
+fn unrelated_anonymous_binder_insertion_does_not_change_public_interface() {
+	let mut session = CompilerSession::without_builtin_sources();
+	let project = ProjectId::new("anonymous-binder-stability");
+	let main = ModulePath::new("main").unwrap();
+	let public = "public interface Area { func area(): int }\npublic interface Consumer { func measure(shape: Area): int }\npublic func measure(shape: Area): int = shape.area()";
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		public.into(),
+		SourceVersion(1),
+	);
+	let before = session
+		.module_interface(
+			project.clone(),
+			main.clone(),
+			main.clone(),
+			EntryMode::Library,
+		)
+		.expect("complete interface before insertion");
+	let top_level = before
+		.exports
+		.iter()
+		.find(|definition| definition.name == "measure")
+		.expect("top-level measure export");
+	let member = before
+		.exports
+		.iter()
+		.find(|definition| definition.name == "Consumer")
+		.expect("Consumer export")
+		.members
+		.first()
+		.expect("Consumer.measure member");
+	assert_eq!(top_level.binders[0].name, "$anonymous0");
+	assert_eq!(member.binders[0].name, "$anonymous0");
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		format!("private func unrelated(shape: Area): int = shape.area()\n{public}"),
+		SourceVersion(2),
+	);
+	let after = session
+		.module_interface(project, main.clone(), main, EntryMode::Library)
+		.expect("complete interface after insertion");
+	assert_eq!(before, after);
+}
+
+#[test]
 fn recovered_flattened_implementation_keeps_current_module_provenance_and_shape() {
 	let mut session = CompilerSession::without_builtin_sources();
 	let project = ProjectId::new("recovered-provenance");
