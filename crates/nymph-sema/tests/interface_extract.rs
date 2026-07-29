@@ -8,8 +8,8 @@ use nymph_sema::{
 	DeclarationCategory, DeclarationKey, DefinitionId, DefinitionShapeKind, EntryMode,
 	ExportedDefinition, InterfaceType, ModuleEnvironment, ModuleIdentity, ModuleInterface,
 	ModuleOrigin, RecoveredDefinitionReference, RecoveredInterfaceType, SemanticAvailability,
-	SemanticEnvironment, check_module, check_module_with_environment, declared_headers,
-	extract_module_interface, extract_module_interface_with_facts, recover_module_environment,
+	SemanticEnvironment, check_module_with_environment, declared_headers, extract_module_interface,
+	extract_module_interface_with_facts, recover_module_environment,
 };
 
 #[test]
@@ -115,10 +115,270 @@ impl Pair for B {}
 	assert_eq!(a_left.placement_owner, a.id);
 }
 
+#[test]
+fn recovered_known_implementation_projects_the_complete_exact_catalog() {
+	let valid = r#"
+interface Limit {
+	let mut maximum: float
+	func render(): string
+	func fallback(): int = 1
+}
+struct Box {}
+impl Limit for Box {
+	external(max_float) let maximum: float
+	external(display) func render(): string
+}
+"#;
+	let recovered = format!("{valid}\nfunc broken(value: Missing): Missing = value\n");
+	let project = |source: &str| {
+		let module = Arc::new(parse(source));
+		let module_identity = identity();
+		let environment = SemanticEnvironment::from_modules(module_identity.clone(), &[]).unwrap();
+		let result = check_module_with_environment(
+			module.clone(),
+			module_identity.clone(),
+			&environment,
+			EntryMode::Library,
+		);
+		let checked = nymph_sema::Checked {
+			diags: result.diagnostics.to_vec(),
+			facts: result.analysis.checked.as_ref().clone(),
+		};
+		let headers = declared_headers(module_identity.clone(), &module);
+		(module_identity, module, checked, headers)
+	};
+	let (complete_identity, complete_module, complete_checked, complete_headers) = project(valid);
+	assert!(
+		complete_checked.diags.is_empty(),
+		"{:?}",
+		complete_checked.diags
+	);
+	let complete = extract_module_interface(
+		complete_identity,
+		&complete_module,
+		&complete_checked,
+		&complete_headers,
+	)
+	.unwrap();
+	let (_, recovered_module, recovered_checked, recovered_headers) = project(&recovered);
+	assert!(
+		recovered_checked
+			.diags
+			.iter()
+			.any(nymph_diagnostics::Diagnostic::is_error)
+	);
+	let ModuleEnvironment::Recovered(recovered) = recover_module_environment(
+		identity(),
+		&recovered_module,
+		&recovered_checked,
+		&recovered_headers,
+	) else {
+		panic!("expected recovered environment")
+	};
+	let complete = &complete.implementations[0];
+	let recovered = recovered
+		.implementations
+		.iter()
+		.find(|implementation| implementation.id == complete.id)
+		.expect("known recovered implementation retains its exact ID");
+	assert_eq!(recovered.availability, SemanticAvailability::Available);
+	assert_eq!(recovered.member_slots, complete.member_slots);
+	assert_eq!(recovered.members.len(), complete.members.len());
+	for (recovered, complete) in recovered.members.iter().zip(&complete.members) {
+		assert_eq!(recovered.id, complete.id);
+		assert_eq!(recovered.external, complete.external);
+	}
+	let maximum = complete
+		.member_slots
+		.iter()
+		.find(|slot| slot.name == "maximum")
+		.unwrap();
+	let fallback = complete
+		.member_slots
+		.iter()
+		.find(|slot| slot.name == "fallback")
+		.unwrap();
+	assert!(maximum.external);
+	assert_eq!(maximum.member_id, maximum.body_definition_id);
+	assert_eq!(maximum.placement_owner, complete.id);
+	assert_eq!(
+		fallback.source,
+		nymph_sema::ImplementationMemberSource::InheritedDefault
+	);
+	assert_eq!(fallback.body_definition_id, fallback.interface_member_id);
+	assert_eq!(fallback.placement_owner, complete.id);
+}
+
+#[test]
+fn recovered_known_nested_empty_catalog_is_available_with_exact_identity() {
+	let valid = "interface Marker {}\npublic struct Box { impl Marker {} }\n";
+	let project = |source: &str| {
+		let module = Arc::new(parse(source));
+		let module_identity = identity();
+		let environment = SemanticEnvironment::from_modules(module_identity.clone(), &[]).unwrap();
+		let result = check_module_with_environment(
+			module.clone(),
+			module_identity.clone(),
+			&environment,
+			EntryMode::Library,
+		);
+		let checked = nymph_sema::Checked {
+			diags: result.diagnostics.to_vec(),
+			facts: result.analysis.checked.as_ref().clone(),
+		};
+		let headers = declared_headers(module_identity.clone(), &module);
+		(module, checked, headers)
+	};
+	let (complete_module, complete_checked, complete_headers) = project(valid);
+	let complete = extract_module_interface(
+		identity(),
+		&complete_module,
+		&complete_checked,
+		&complete_headers,
+	)
+	.unwrap();
+	let complete = &complete.implementations[0];
+	assert!(complete.member_slots.is_empty());
+
+	let (recovered_module, recovered_checked, recovered_headers) = project(&format!(
+		"{valid}func broken(value: Missing): Missing = value\n"
+	));
+	let ModuleEnvironment::Recovered(recovered) = recover_module_environment(
+		identity(),
+		&recovered_module,
+		&recovered_checked,
+		&recovered_headers,
+	) else {
+		panic!("expected recovered environment")
+	};
+	let recovered = recovered
+		.implementations
+		.iter()
+		.find(|implementation| implementation.id == complete.id)
+		.expect("nested implementation retains its checker-owned identity");
+	assert_eq!(recovered.availability, SemanticAvailability::Available);
+	assert!(recovered.member_slots.is_empty());
+}
+
+#[test]
+fn recovered_inherent_externals_use_checked_alias_abi_facts() {
+	let valid = r#"
+type Scalar = int
+type Number = float
+impl int {
+	external(plus) func add(other: int): Scalar
+	external(plus) func add_self(other: int): self
+	external(max_float) let maximum: Number
+}
+"#;
+	let project = |source: &str| {
+		let module = Arc::new(parse(source));
+		let module_identity = identity();
+		let environment = SemanticEnvironment::from_modules(module_identity.clone(), &[]).unwrap();
+		let result = check_module_with_environment(
+			module.clone(),
+			module_identity.clone(),
+			&environment,
+			EntryMode::Library,
+		);
+		let checked = nymph_sema::Checked {
+			diags: result.diagnostics.to_vec(),
+			facts: result.analysis.checked.as_ref().clone(),
+		};
+		let headers = declared_headers(module_identity.clone(), &module);
+		(module, checked, headers)
+	};
+	let (complete_module, complete_checked, complete_headers) = project(valid);
+	assert!(
+		complete_checked.diags.is_empty(),
+		"{:?}",
+		complete_checked.diags
+	);
+	let complete = extract_module_interface(
+		identity(),
+		&complete_module,
+		&complete_checked,
+		&complete_headers,
+	)
+	.unwrap();
+	let complete = &complete.implementations[0];
+
+	let (recovered_module, recovered_checked, recovered_headers) = project(&format!(
+		"{valid}func broken(value: Missing): Missing = value\n"
+	));
+	let ModuleEnvironment::Recovered(recovered) = recover_module_environment(
+		identity(),
+		&recovered_module,
+		&recovered_checked,
+		&recovered_headers,
+	) else {
+		panic!("expected recovered environment")
+	};
+	let recovered = recovered
+		.implementations
+		.iter()
+		.find(|implementation| implementation.id == complete.id)
+		.expect("recovered inherent implementation retains its exact identity");
+	assert_eq!(recovered.availability, SemanticAvailability::Available);
+	for (recovered, complete) in recovered.members.iter().zip(&complete.members) {
+		assert_eq!(recovered.id, complete.id);
+		assert_eq!(recovered.external, complete.external);
+	}
+}
+
+#[test]
+fn recovered_poison_interface_member_constraint_makes_catalog_unavailable() {
+	let module = parse(
+		r#"
+public interface Action {
+	func run<T: Constraint<Other = Missing>>(): int = 1
+}
+public interface Constraint<Other> {}
+public struct Box {}
+impl Action for Box {}
+func broken(value: Unknown): Unknown = value
+"#,
+	);
+	let checked = check(&module);
+	assert!(
+		checked
+			.diags
+			.iter()
+			.any(nymph_diagnostics::Diagnostic::is_error)
+	);
+	let headers = declared_headers(identity(), &module);
+	let ModuleEnvironment::Recovered(environment) =
+		recover_module_environment(identity(), &module, &checked, &headers)
+	else {
+		panic!("expected recovered environment")
+	};
+	assert_eq!(environment.implementations.len(), 1);
+	assert_eq!(
+		environment.implementations[0].availability,
+		SemanticAvailability::StructureUnavailable
+	);
+	assert!(environment.implementations[0].member_slots.is_empty());
+}
+
 fn parse(source: &str) -> nymph_ast::decl::Module {
 	let parsed = nymph_syntax::parse_module(source, "fixture.nym");
 	assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
 	parsed.tree
+}
+
+fn check(module: &nymph_ast::decl::Module) -> nymph_sema::Checked {
+	let identity = identity();
+	let environment = SemanticEnvironment::from_modules(identity.clone(), &[]).unwrap();
+	let result = check_module_with_environment(
+		Arc::new(module.clone()),
+		identity,
+		&environment,
+		EntryMode::Library,
+	);
+	nymph_sema::Checked {
+		diags: result.diagnostics.to_vec(),
+		facts: result.analysis.checked.as_ref().clone(),
+	}
 }
 
 #[test]
@@ -233,7 +493,7 @@ public interface Area { func area(): int }
 public func measure(shape: Area): int = shape.area()
 "#,
 	);
-	let checked = check_module(&module);
+	let checked = check(&module);
 	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
 	let headers = declared_headers(identity(), &module);
 	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();
@@ -266,7 +526,7 @@ public let answer = 42
 public func read(): int = answer
 "#,
 	);
-	let checked = check_module(&module);
+	let checked = check(&module);
 	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
 	let headers = declared_headers(identity(), &module);
 	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();
@@ -281,7 +541,7 @@ public func read(): int = answer
 #[test]
 fn extraction_uses_deeply_finalized_inferred_function_return_type() {
 	let module = parse("public func bits() = #(true, false, true)");
-	let checked = check_module(&module);
+	let checked = check(&module);
 	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
 	let headers = declared_headers(identity(), &module);
 	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();
@@ -374,7 +634,7 @@ public struct Box<T: Parent<T = int>>(value: T = 1) {
 }
 "#,
 	);
-	let checked = check_module(&module);
+	let checked = check(&module);
 	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
 	let headers = declared_headers(identity(), &module);
 	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();
@@ -433,7 +693,7 @@ public func expose(value: Secret): Wrapper = Wrapper(value)
 private func helper(): int = 1
 "#,
 	);
-	let checked = check_module(&module);
+	let checked = check(&module);
 	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
 	let headers = declared_headers(identity(), &module);
 	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();
@@ -460,7 +720,7 @@ public func broken(value: Missing): Missing = value
 public func valid(value: int): int = value
 "#,
 	);
-	let checked = check_module(&module);
+	let checked = check(&module);
 	assert!(
 		checked
 			.diags
@@ -565,7 +825,7 @@ public struct Pair<T>(left: int, right: Missing) {
 }
 "#,
 	);
-	let checked = check_module(&module);
+	let checked = check(&module);
 	assert!(
 		checked
 			.diags
@@ -618,7 +878,7 @@ public impl Bound<T = int> for Missing {
 }
 "#,
 	);
-	let checked = check_module(&module);
+	let checked = check(&module);
 	assert!(
 		checked
 			.diags
@@ -726,7 +986,7 @@ public impl<T: Missing<ConstraintOnly, Item = ConstraintOnly>> Public {
 }
 "#,
 	);
-	let checked = check_module(&module);
+	let checked = check(&module);
 	let headers = declared_headers(identity(), &module);
 	let ModuleEnvironment::Recovered(environment) =
 		recover_module_environment(identity(), &module, &checked, &headers)
@@ -747,7 +1007,7 @@ public impl<T: Missing<ConstraintOnly, Item = ConstraintOnly>> Public {
 fn malformed_impl_identity_uses_source_structure_and_is_reorder_stable() {
 	fn malformed_id(source: &str, self_name: &str) -> DefinitionId {
 		let module = parse(source);
-		let checked = check_module(&module);
+		let checked = check(&module);
 		let headers = declared_headers(identity(), &module);
 		let ModuleEnvironment::Recovered(environment) =
 			recover_module_environment(identity(), &module, &checked, &headers)
@@ -798,7 +1058,7 @@ fn nested_impl_constraints_participate_in_recovered_identity() {
 		let module = parse(&format!(
 			"public struct Box<T> {{ impl<U: {bound}<T>> Missing {{}} }}"
 		));
-		let checked = check_module(&module);
+		let checked = check(&module);
 		let headers = declared_headers(identity(), &module);
 		let ModuleEnvironment::Recovered(environment) =
 			recover_module_environment(identity(), &module, &checked, &headers)
@@ -813,7 +1073,7 @@ fn nested_impl_constraints_participate_in_recovered_identity() {
 #[test]
 fn extraction_uses_checked_external_value_linkage_and_marshal() {
 	let module = parse("public external(max_float) let maximum: float");
-	let checked = check_module(&module);
+	let checked = check(&module);
 	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
 	let headers = declared_headers(identity(), &module);
 	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();
@@ -901,7 +1161,7 @@ fn extraction_preserves_native_primitive_external_semantics() {
 #[test]
 fn native_external_classification_requires_the_exact_checked_arity() {
 	let module = parse("impl int { external func plus(): int }");
-	let checked = check_module(&module);
+	let checked = check(&module);
 	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
 	let headers = declared_headers(identity(), &module);
 	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();

@@ -184,17 +184,18 @@ fn external_function_abi_for_receiver(
 		InterfaceType::Char => Some(nymph_hir::hir::BuiltinResult::Char),
 		InterfaceType::String => Some(nymph_hir::hir::BuiltinResult::String),
 		InterfaceType::Boolean => Some(nymph_hir::hir::BuiltinResult::Boolean),
-		InterfaceType::SelfType => match receiver_tag {
-			Some("int") => Some(nymph_hir::hir::BuiltinResult::Int),
-			Some("uint") => Some(nymph_hir::hir::BuiltinResult::UInt),
-			Some("float") => Some(nymph_hir::hir::BuiltinResult::Float),
-			Some("char") => Some(nymph_hir::hir::BuiltinResult::Char),
-			Some("string") => Some(nymph_hir::hir::BuiltinResult::String),
-			Some("boolean") => Some(nymph_hir::hir::BuiltinResult::Boolean),
-			_ => None,
-		},
+		InterfaceType::SelfType => receiver_builtin_result(receiver_tag),
 		_ => None,
 	});
+	external_function_abi_with_result(marker, receiver_tag, explicit_arity, result)
+}
+
+fn external_function_abi_with_result(
+	marker: &EcoString,
+	receiver_tag: Option<&str>,
+	explicit_arity: Option<usize>,
+	result: Option<nymph_hir::hir::BuiltinResult>,
+) -> ExternalAbi {
 	let callable = match nymph_hir::linkage::resolve(marker, receiver_tag, explicit_arity, result) {
 		nymph_hir::linkage::ExternalCallable::Linked(linked) => crate::ExternalCallable::Linked {
 			module: linked.module.into(),
@@ -208,6 +209,39 @@ fn external_function_abi_for_receiver(
 		callable,
 		marshal: None,
 	}
+}
+
+fn receiver_builtin_result(receiver_tag: Option<&str>) -> Option<nymph_hir::hir::BuiltinResult> {
+	match receiver_tag {
+		Some("int") => Some(nymph_hir::hir::BuiltinResult::Int),
+		Some("uint") => Some(nymph_hir::hir::BuiltinResult::UInt),
+		Some("float") => Some(nymph_hir::hir::BuiltinResult::Float),
+		Some("char") => Some(nymph_hir::hir::BuiltinResult::Char),
+		Some("string") => Some(nymph_hir::hir::BuiltinResult::String),
+		Some("boolean") => Some(nymph_hir::hir::BuiltinResult::Boolean),
+		_ => None,
+	}
+}
+
+fn checked_external_function_abi(
+	marker: &EcoString,
+	owner: &DefinitionId,
+	explicit_arity: usize,
+	return_type: crate::Ty,
+	interner: &crate::ty::Interner,
+) -> ExternalAbi {
+	let receiver_tag = implementation_receiver_tag(owner);
+	let result = match interner.kind(return_type) {
+		nymph_hir::ty::TyKind::Int => Some(nymph_hir::hir::BuiltinResult::Int),
+		nymph_hir::ty::TyKind::UInt => Some(nymph_hir::hir::BuiltinResult::UInt),
+		nymph_hir::ty::TyKind::Float => Some(nymph_hir::hir::BuiltinResult::Float),
+		nymph_hir::ty::TyKind::Char => Some(nymph_hir::hir::BuiltinResult::Char),
+		nymph_hir::ty::TyKind::String => Some(nymph_hir::hir::BuiltinResult::String),
+		nymph_hir::ty::TyKind::Boolean => Some(nymph_hir::hir::BuiltinResult::Boolean),
+		nymph_hir::ty::TyKind::SelfTy => receiver_builtin_result(receiver_tag),
+		_ => None,
+	};
+	external_function_abi_with_result(marker, receiver_tag, Some(explicit_arity), result)
 }
 
 fn implementation_receiver_tag(owner: &DefinitionId) -> Option<&'static str> {
@@ -804,8 +838,8 @@ fn member_shape(
 	})
 }
 
-fn project_checked_runtime_member_facts(
-	members: &mut [MemberShape<InterfaceType>],
+fn project_checked_runtime_member_facts<T, R>(
+	members: &mut [MemberShape<T, R>],
 	runtime_members: &[crate::iface::RuntimeMemberDef],
 ) -> Result<(), InterfaceConversionError> {
 	for member in members {
@@ -822,6 +856,27 @@ fn project_checked_runtime_member_facts(
 		}
 	}
 	Ok(())
+}
+
+fn project_checked_implementation_facts<T, R>(
+	implementation_id: &DefinitionId,
+	members: &mut [MemberShape<T, R>],
+	implementation: &crate::iface::ImplDef,
+) -> Result<crate::ImplementationMemberCatalog, InterfaceConversionError> {
+	if implementation.definition.as_ref() != Some(implementation_id) {
+		return Err(InterfaceConversionError::UnknownStableDefinition(
+			implementation_id.clone(),
+		));
+	}
+	project_checked_runtime_member_facts(members, &implementation.runtime_members)?;
+	if !implementation
+		.member_catalog
+		.iter()
+		.all(|slot| &slot.implementation_id == implementation_id)
+	{
+		return Err(InterfaceConversionError::ErrorType);
+	}
+	Ok(implementation.member_catalog.clone())
 }
 
 fn project_checked_external_value_marshals(
@@ -1968,37 +2023,19 @@ fn extract_implementations(
 		.collect::<Vec<_>>();
 	let implementations = declarations
 		.iter()
-		.map(|(path, _, _, members)| {
-			let position = if let Some(id) = checked.source_identities.implementations.get(path) {
-				remaining
-					.iter()
-					.position(|implementation| implementation.definition.as_ref() == Some(id))
-					.expect("checked implementation identity")
-			} else {
-				// Compatibility extraction for legacy identity-less `check_module` facts.
-				// Runtime projection only accepts the authoritative branch above.
-				let names = members
-					.iter()
-					.filter_map(|member| match &member.0 {
-						ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => {
-							Some(&meta.name.0)
-						}
-						_ => None,
-					})
-					.collect::<HashSet<_>>();
-				remaining
-					.iter()
-					.position(|implementation| {
-						implementation.methods.len() == names.len()
-							&& names
-								.iter()
-								.all(|name| implementation.methods.contains_key(*name))
-					})
-					.expect("legacy checked implementation")
-			};
-			remaining.remove(position)
+		.map(|(path, _, _, _)| {
+			let id = checked
+				.source_identities
+				.implementations
+				.get(path)
+				.ok_or(InterfaceConversionError::ErrorType)?;
+			let position = remaining
+				.iter()
+				.position(|implementation| implementation.definition.as_ref() == Some(id))
+				.ok_or_else(|| InterfaceConversionError::UnknownStableDefinition(id.clone()))?;
+			Ok(remaining.remove(position))
 		})
-		.collect::<Vec<_>>();
+		.collect::<Result<Vec<_>, InterfaceConversionError>>()?;
 	let mut extracted = declarations
 		.into_iter()
 		.zip(implementations)
@@ -2139,7 +2176,7 @@ fn extract_implementations(
 					}
 				})
 				.collect::<Result<Vec<_>, InterfaceConversionError>>()?;
-			project_checked_runtime_member_facts(&mut members, &implementation.runtime_members)?;
+			let member_slots = project_checked_implementation_facts(&id, &mut members, implementation)?;
 			let interface_generics = &checked.semantic.interfaces[&implementation.interface].generics;
 			let interface_argument_bindings = implementation
 				.args
@@ -2178,7 +2215,7 @@ fn extract_implementations(
 				binders,
 				constraints: checked_constraints(&implementation.constraints, checked, headers, &context)?,
 				members,
-				member_slots: implementation.member_catalog.clone(),
+				member_slots,
 				runtime_owner: Some(id),
 			})
 		})
@@ -2205,91 +2242,16 @@ fn extract_implementations(
 			)),
 			_ => None,
 		});
-	let inherent_facts = checked.semantic.inherent[facts.inherent.clone()]
-		.iter()
-		.skip(
-			module
-				.members
-				.iter()
-				.filter(|declaration| {
-					matches!(
-						declaration,
-						Declaration::Struct { .. } | Declaration::Enum { .. }
-					)
-				})
-				.count(),
-		);
-	for ((path, visibility, mutable, members), ordered_implementation) in
-		top_level_inherent.zip(inherent_facts)
-	{
-		let implementation = checked
+	for (path, visibility, _mutable, members) in top_level_inherent {
+		let id = checked
 			.source_identities
 			.implementations
 			.get(&path)
-			.and_then(|id| {
-				checked.semantic.inherent[facts.inherent.clone()]
-					.iter()
-					.find(|implementation| implementation.definition.as_ref() == Some(id))
-			})
-			.unwrap_or(ordered_implementation);
-		let temporary_scope = DefinitionId::new(
-			headers.module.clone(),
-			DeclarationKey::top_level(DeclarationCategory::Namespace, "$inherent"),
-		);
-		let (temporary_context, temporary_binders) = definition_context(
-			checked,
-			headers,
-			&temporary_scope,
-			implementation.generics.clone(),
-		);
-		let self_type = canonicalize_type(
-			&checked.interner,
-			implementation.self_ty,
-			&temporary_context,
-		)?;
-		let header_constraints = checked_constraints(
-			&implementation.constraints,
-			checked,
-			headers,
-			&temporary_context,
-		)?;
-		let id = DefinitionId::new(
-			headers.module.clone(),
-			DeclarationKey::implementation(ImplementationHeader {
-				interface: None,
-				interface_arguments: Vec::new(),
-				self_type: header_type(&self_type, &temporary_binders),
-				mutable,
-				binders: (0..temporary_binders.len())
-					.map(|index| HeaderBinder {
-						parameter: HeaderParameterId(index as u32),
-					})
-					.collect(),
-				constraints: header_constraints
-					.iter()
-					.map(|constraint| crate::HeaderConstraint {
-						parameter: HeaderParameterId(
-							temporary_binders
-								.iter()
-								.position(|binder| binder.id == constraint.parameter)
-								.expect("constraint binder exists") as u32,
-						),
-						interface: constraint.interface.clone(),
-						positional: constraint
-							.positional
-							.iter()
-							.map(|ty| header_type(ty, &temporary_binders))
-							.collect(),
-						named: constraint
-							.named
-							.iter()
-							.map(|(name, ty)| (name.clone(), header_type(ty, &temporary_binders)))
-							.collect(),
-					})
-					.collect(),
-			}),
-		);
-		let id = implementation.definition.clone().unwrap_or(id);
+			.ok_or(InterfaceConversionError::ErrorType)?;
+		let implementation = checked.semantic.inherent[facts.inherent.clone()]
+			.iter()
+			.find(|implementation| implementation.definition.as_ref() == Some(id))
+			.ok_or_else(|| InterfaceConversionError::UnknownStableDefinition(id.clone()))?;
 		let (impl_context, binders) =
 			definition_context(checked, headers, &id, implementation.generics.clone());
 		let mut member_ids = StableIdBuilder::new(headers.module.clone());
@@ -2344,7 +2306,7 @@ fn extract_implementations(
 			)?,
 			members,
 			member_slots: Default::default(),
-			runtime_owner: Some(id),
+			runtime_owner: Some(id.clone()),
 		});
 	}
 	Ok(extracted)
@@ -2599,6 +2561,66 @@ fn recovered_known(ty: &RecoveredInterfaceType) -> Option<&InterfaceType> {
 	}
 }
 
+fn recovered_constraints_are_known(constraints: &[crate::RecoveredGenericConstraint]) -> bool {
+	constraints.iter().all(|constraint| {
+		matches!(
+			constraint.interface,
+			crate::RecoveredDefinitionReference::Known(_)
+		) && constraint
+			.positional
+			.iter()
+			.all(|ty| recovered_known(ty).is_some())
+			&& constraint
+				.named
+				.iter()
+				.all(|(_, ty)| recovered_known(ty).is_some())
+	})
+}
+
+fn recovered_implementation_structure_is_known(implementation: &RecoveredExportedImpl) -> bool {
+	!matches!(implementation.self_type, RecoveredInterfaceType::Poison)
+		&& !matches!(
+			implementation.interface,
+			Some(crate::RecoveredDefinitionReference::Poison)
+		) && implementation
+		.interface_arguments
+		.iter()
+		.all(|(_, ty)| recovered_known(ty).is_some())
+		&& recovered_constraints_are_known(&implementation.constraints)
+		&& implementation.members.iter().all(|member| {
+			member
+				.parameters
+				.iter()
+				.all(|parameter| recovered_known(&parameter.ty).is_some())
+				&& recovered_known(&member.return_type).is_some()
+				&& recovered_constraints_are_known(&member.constraints)
+		})
+}
+
+fn recovered_interface_structure_is_known(interface: &RecoveredExportedDefinition) -> bool {
+	recovered_constraints_are_known(&interface.constraints)
+		&& interface.members.iter().all(|member| {
+			member
+				.parameters
+				.iter()
+				.all(|parameter| recovered_known(&parameter.ty).is_some())
+				&& recovered_known(&member.return_type).is_some()
+				&& recovered_constraints_are_known(&member.constraints)
+		}) && interface.super_interfaces.iter().all(|super_interface| {
+		matches!(
+			super_interface.interface,
+			crate::RecoveredDefinitionReference::Known(_)
+		) && super_interface
+			.positional
+			.iter()
+			.all(|ty| recovered_known(ty).is_some())
+			&& super_interface
+				.named
+				.iter()
+				.all(|(_, ty)| recovered_known(ty).is_some())
+	})
+}
+
 fn recover_generic_constraints(
 	generics: &[nymph_ast::Spanned<nymph_ast::ty::GenericParam>],
 	binders: &[GenericParameter],
@@ -2653,6 +2675,7 @@ fn recover_generic_constraints_with_types(
 fn recover_func_member(
 	meta: &FuncDeclaration,
 	visibility: Option<Visibility>,
+	external_marker: Option<&EcoString>,
 	owner: &DefinitionId,
 	headers: &DeclaredHeaders,
 	owner_binders: &[GenericParameter],
@@ -2678,6 +2701,22 @@ fn recover_func_member(
 		.chain(&binders)
 		.cloned()
 		.collect::<Vec<_>>();
+	let return_type = meta
+		.return_type
+		.as_ref()
+		.map(|ty| recover_ast_type(&ty.0, headers, &all))
+		.unwrap_or(RecoveredInterfaceType::Poison);
+	let external = external_marker.map(|marker| {
+		external_function_abi_for_receiver(
+			marker,
+			implementation_receiver_tag(owner),
+			Some(meta.params.len()),
+			match &return_type {
+				RecoveredInterfaceType::Known(ty) => Some(ty),
+				RecoveredInterfaceType::Poison => None,
+			},
+		)
+	});
 	MemberShape {
 		id,
 		name: meta.name.0.clone(),
@@ -2702,12 +2741,8 @@ fn recover_func_member(
 				spread: parameter.0.spread,
 			})
 			.collect(),
-		return_type: meta
-			.return_type
-			.as_ref()
-			.map(|ty| recover_ast_type(&ty.0, headers, &all))
-			.unwrap_or(RecoveredInterfaceType::Poison),
-		external: None,
+		return_type,
+		external,
 		runtime_owner: Some(owner.clone()),
 		has_default,
 	}
@@ -2721,11 +2756,11 @@ fn recover_value_member(
 	ids: &mut StableIdBuilder,
 	has_default: bool,
 ) -> crate::RecoveredMemberShape {
-	let (visibility, meta) = match member {
+	let (visibility, external_marker, meta) = match member {
 		ImplMember::Let {
 			visibility, meta, ..
-		}
-		| ImplMember::ExternalLet(visibility, _, meta) => (*visibility, meta),
+		} => (*visibility, None, meta),
+		ImplMember::ExternalLet(visibility, marker, meta) => (*visibility, Some(marker), meta),
 		_ => unreachable!(),
 	};
 	let Pattern::Binding { name, .. } = &meta.name.0 else {
@@ -2752,7 +2787,7 @@ fn recover_value_member(
 			.as_ref()
 			.map(|ty| recover_ast_type(&ty.0, headers, binders))
 			.unwrap_or(RecoveredInterfaceType::Poison),
-		external: None,
+		external: external_marker.map(|marker| external_value_abi(marker, None)),
 		runtime_owner: Some(owner.clone()),
 		has_default,
 	}
@@ -2770,18 +2805,101 @@ fn recover_members(
 		.map(|member| match &member.0 {
 			ImplMember::Func {
 				visibility, meta, ..
-			}
-			| ImplMember::ExternalFunc(visibility, _, meta) => {
-				recover_func_member(meta, *visibility, owner, headers, binders, ids, true)
-			}
+			} => recover_func_member(meta, *visibility, None, owner, headers, binders, ids, true),
+			ImplMember::ExternalFunc(visibility, marker, meta) => recover_func_member(
+				meta,
+				*visibility,
+				Some(marker),
+				owner,
+				headers,
+				binders,
+				ids,
+				true,
+			),
 			value => recover_value_member(value, owner, headers, binders, ids, true),
 		})
 		.collect()
 }
 
+fn recover_implementation_members(
+	members: &[nymph_ast::Spanned<ImplMember>],
+	owner: &DefinitionId,
+	path: crate::annotate::ImplementationSourcePath,
+	checked: &Checked,
+	headers: &DeclaredHeaders,
+	binders: &[GenericParameter],
+	ids: &mut StableIdBuilder,
+) -> Vec<crate::RecoveredMemberShape> {
+	let mut recovered = recover_members(members, owner, headers, binders, ids);
+	for (index, (member, source)) in recovered.iter_mut().zip(members).enumerate() {
+		let member_path = crate::annotate::ImplementationMemberSourcePath {
+			implementation: path,
+			member: index as u32,
+		};
+		if let Some(id) = checked.source_identities.members.get(&member_path) {
+			member.id = id.clone();
+			member.runtime_owner = Some(owner.clone());
+		}
+		match &source.0 {
+			ImplMember::ExternalFunc(_, marker, meta) => {
+				let return_type = checked
+					.semantic
+					.implementations
+					.impls
+					.iter()
+					.find(|implementation| implementation.definition.as_ref() == Some(owner))
+					.and_then(|implementation| {
+						implementation
+							.methods
+							.values()
+							.find(|method| method.definition.as_ref() == Some(&member.id))
+					})
+					.map(|method| method.ret)
+					.or_else(|| {
+						checked
+							.semantic
+							.inherent
+							.iter()
+							.find(|implementation| implementation.definition.as_ref() == Some(owner))
+							.and_then(|implementation| {
+								implementation
+									.methods
+									.values()
+									.find(|method| method.definition.as_ref() == Some(&member.id))
+							})
+							.map(|method| method.ret)
+					});
+				if let Some(return_type) = return_type {
+					member.external = Some(checked_external_function_abi(
+						marker,
+						owner,
+						meta.params.len(),
+						return_type,
+						&checked.interner,
+					));
+				} else {
+					member.external = None;
+					member.return_type = RecoveredInterfaceType::Poison;
+				}
+			}
+			ImplMember::ExternalLet(_, marker, meta) => {
+				let marshal = checked.external_value_marshals.get(&meta.name.1).copied();
+				if marshal.is_some() {
+					member.external = Some(external_value_abi(marker, marshal));
+				} else {
+					member.external = None;
+					member.return_type = RecoveredInterfaceType::Poison;
+				}
+			}
+			_ => {}
+		}
+	}
+	recovered
+}
+
 fn recover_implementations(
 	module: &Module,
-	_checked: &Checked,
+	checked: &Checked,
 	headers: &DeclaredHeaders,
 	_facts: &ExtractionFactSelection,
 ) -> Vec<RecoveredExportedImpl> {
@@ -2789,7 +2907,8 @@ fn recover_implementations(
 	let mut recovered = module
 		.members
 		.iter()
-		.filter_map(|declaration| {
+		.enumerate()
+		.filter_map(|(declaration_index, declaration)| {
 			let Declaration::ImplFor {
 				visibility,
 				generics,
@@ -2905,7 +3024,16 @@ fn recover_implementations(
 			let key = complete_header
 				.map(DeclarationKey::implementation)
 				.unwrap_or_else(|| DeclarationKey::recovered_implementation(recovered_header));
-			let id = ids.allocate(key);
+			let path = crate::annotate::ImplementationSourcePath {
+				declaration: declaration_index as u32,
+				nested: None,
+			};
+			let id = checked
+				.source_identities
+				.implementations
+				.get(&path)
+				.cloned()
+				.unwrap_or_else(|| ids.allocate(key));
 			let binders = poison_binders(id.clone(), generics);
 			let self_type = recover_ast_type(&type_.0, headers, &binders);
 			let interface_arguments = source_arguments
@@ -2939,13 +3067,21 @@ fn recover_implementations(
 				mutable: *mutable,
 				binders: binders.clone(),
 				constraints: recover_generic_constraints(generics, &binders, headers),
-				members: recover_members(members, &id, headers, &binders, &mut member_ids),
+				members: recover_implementation_members(
+					members,
+					&id,
+					path,
+					checked,
+					headers,
+					&binders,
+					&mut member_ids,
+				),
 				member_slots: Default::default(),
 				runtime_owner: Some(id),
 			})
 		})
 		.collect::<Vec<_>>();
-	for declaration in &module.members {
+	for (declaration_index, declaration) in module.members.iter().enumerate() {
 		let Declaration::Impl {
 			visibility,
 			generics,
@@ -2973,7 +3109,16 @@ fn recover_implementations(
 				.collect(),
 			constraints: recovered_source_header_constraints(generics, &temporary_binders, 0),
 		};
-		let id = ids.allocate(DeclarationKey::recovered_implementation(header));
+		let path = crate::annotate::ImplementationSourcePath {
+			declaration: declaration_index as u32,
+			nested: None,
+		};
+		let id = checked
+			.source_identities
+			.implementations
+			.get(&path)
+			.cloned()
+			.unwrap_or_else(|| ids.allocate(DeclarationKey::recovered_implementation(header)));
 		let binders = poison_binders(id.clone(), generics);
 		let mut member_ids = StableIdBuilder::new(headers.module.clone());
 		recovered.push(RecoveredExportedImpl {
@@ -2986,12 +3131,20 @@ fn recover_implementations(
 			mutable: *mutable,
 			binders: binders.clone(),
 			constraints: recover_generic_constraints(generics, &binders, headers),
-			members: recover_members(members, &id, headers, &binders, &mut member_ids),
+			members: recover_implementation_members(
+				members,
+				&id,
+				path,
+				checked,
+				headers,
+				&binders,
+				&mut member_ids,
+			),
 			member_slots: Default::default(),
 			runtime_owner: Some(id),
 		});
 	}
-	for declaration in &module.members {
+	for (declaration_index, declaration) in module.members.iter().enumerate() {
 		let (name, owner_generics, nested) = match declaration {
 			Declaration::Struct {
 				name,
@@ -3010,7 +3163,7 @@ fn recover_implementations(
 		let Some(owner_id) = headers.id(&name.0) else {
 			continue;
 		};
-		for implementation in nested {
+		for (nested_index, implementation) in nested.iter().enumerate() {
 			let temporary_owner = DefinitionId::new(
 				headers.module.clone(),
 				DeclarationKey::top_level(DeclarationCategory::Namespace, "$recovered_nested_impl"),
@@ -3027,7 +3180,7 @@ fn recover_implementations(
 					name: generic.0.name.0.clone(),
 				})
 				.collect::<Vec<_>>();
-			let id = ids.allocate(DeclarationKey::recovered_implementation(
+			let fallback_id = ids.allocate(DeclarationKey::recovered_implementation(
 				crate::RecoveredImplementationHeader {
 					interface: Some(implementation.0.interface.0.0.clone()),
 					interface_arguments: implementation
@@ -3072,6 +3225,16 @@ fn recover_implementations(
 					),
 				},
 			));
+			let path = crate::annotate::ImplementationSourcePath {
+				declaration: declaration_index as u32,
+				nested: Some(nested_index as u32),
+			};
+			let id = checked
+				.source_identities
+				.implementations
+				.get(&path)
+				.cloned()
+				.unwrap_or(fallback_id);
 			let binders = owner_generics
 				.iter()
 				.chain(&implementation.0.generics)
@@ -3127,9 +3290,11 @@ fn recover_implementations(
 					&binders[owner_generics.len()..],
 					headers,
 				),
-				members: recover_members(
+				members: recover_implementation_members(
 					&implementation.0.members,
 					&id,
+					path,
+					checked,
 					headers,
 					&binders,
 					&mut member_ids,
@@ -3309,6 +3474,7 @@ fn poison_definition(
 					nymph_ast::decl::InterfaceElement::Func { meta, body } => recover_func_member(
 						meta,
 						None,
+						None,
 						&owner,
 						headers,
 						&binders,
@@ -3481,11 +3647,29 @@ pub fn recover_module_environment_with_facts(
 		.filter(|definition| !visible(definition.visibility))
 		.map(|definition| (definition.id.clone(), definition))
 		.collect::<HashMap<_, _>>();
+	let unavailable_interfaces = exports
+		.iter()
+		.chain(private.values())
+		.filter(|definition| definition.kind == DefinitionShapeKind::Interface)
+		.filter(|definition| !recovered_interface_structure_is_known(definition))
+		.map(|definition| definition.id.clone())
+		.collect::<HashSet<_>>();
 	let mut implementations = recover_implementations(module, checked, headers, facts);
 	for implementation in &mut implementations {
-		let Some(crate::RecoveredDefinitionReference::Known(_)) = &implementation.interface else {
+		if !recovered_implementation_structure_is_known(implementation) {
+			implementation.member_slots = Default::default();
+			implementation.availability = SemanticAvailability::StructureUnavailable;
+			continue;
+		}
+		let Some(crate::RecoveredDefinitionReference::Known(interface_id)) = &implementation.interface
+		else {
 			continue;
 		};
+		if unavailable_interfaces.contains(interface_id) {
+			implementation.member_slots = Default::default();
+			implementation.availability = SemanticAvailability::StructureUnavailable;
+			continue;
+		}
 		if let Some(semantic) = checked
 			.semantic
 			.implementations
@@ -3493,8 +3677,19 @@ pub fn recover_module_environment_with_facts(
 			.iter()
 			.find(|candidate| candidate.definition.as_ref() == Some(&implementation.id))
 		{
-			implementation.member_slots = semantic.member_catalog.clone();
+			match project_checked_implementation_facts(
+				&implementation.id,
+				&mut implementation.members,
+				semantic,
+			) {
+				Ok(member_slots) => implementation.member_slots = member_slots,
+				Err(_) => {
+					implementation.member_slots = Default::default();
+					implementation.availability = SemanticAvailability::StructureUnavailable;
+				}
+			}
 		} else {
+			implementation.member_slots = Default::default();
 			implementation.availability = SemanticAvailability::StructureUnavailable;
 		}
 	}
