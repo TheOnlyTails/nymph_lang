@@ -291,7 +291,6 @@ pub enum RuntimeDefinitionError {
 	OwnerNotFound,
 	DuplicateOwner,
 	DefinitionNotFound,
-	ImplementationMemberMappingNotFound,
 }
 
 pub struct CompilerSession {
@@ -696,8 +695,9 @@ impl CompilerSession {
 		let input = self.registry.get(&(project.clone(), module))?.input;
 		let key = self.project_key(project, entry, mode, true, true);
 		Some(
-			queries::runtime_definition_index(&self.db, key, SemanticModuleInput::Project(input))
+			queries::runtime_manifest(&self.db, key, SemanticModuleInput::Project(input))
 				.ok()?
+				.definitions()
 				.iter()
 				.map(|entity| entity.value(&self.db))
 				.collect(),
@@ -720,8 +720,9 @@ impl CompilerSession {
 			.filter(|(builtin, _)| builtin.path.as_ref().contains(module))
 			.map(|(_, input)| input)
 			.flat_map(|input| {
-				queries::runtime_definition_index(&self.db, key, SemanticModuleInput::Builtin(*input))
+				queries::runtime_manifest(&self.db, key, SemanticModuleInput::Builtin(*input))
 					.expect("embedded builtin runtime definitions are valid")
+					.definitions()
 					.iter()
 					.map(|entity| entity.value(&self.db))
 					.collect::<Vec<_>>()

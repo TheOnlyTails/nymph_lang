@@ -226,7 +226,7 @@ fn body_edit_reexecutes_only_the_changed_modules_stable_chain() {
 		.expect("stable recompilation succeeds");
 	let observed = events.lock().unwrap();
 	for query in [
-		"runtime_definition_index",
+		"runtime_manifest",
 		"lower_runtime_definition",
 		"lower_interface_module",
 		"emitted_interface_module",

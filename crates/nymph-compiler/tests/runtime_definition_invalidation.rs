@@ -223,6 +223,75 @@ func fourth(): int = 4 }"#
 }
 
 #[test]
+fn materialized_default_lookup_uses_the_authoritative_runtime_manifest() {
+	let project = ProjectId::new("materialized-manifest");
+	let main = ModulePath::new("main").unwrap();
+	let source =
+		"interface Defaults { func value(): int = 7 }\nstruct Item\nimpl Defaults for Item {}";
+	let mut discovery = CompilerSession::without_builtin_sources();
+	discovery.set_source(
+		project.clone(),
+		main.clone(),
+		source.into(),
+		SourceVersion(1),
+	);
+	let materialized = discovery
+		.runtime_definitions_for_test(
+			project.clone(),
+			main.clone(),
+			main.clone(),
+			EntryMode::Library,
+		)
+		.unwrap()
+		.into_iter()
+		.find(|definition| {
+			matches!(
+				definition.payload,
+				RuntimePayload::MaterializedInterfaceMember { .. }
+			)
+		})
+		.expect("default implementation has one materialized runtime definition");
+
+	let (mut session, events) = session();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		source.into(),
+		SourceVersion(1),
+	);
+	let exact = session
+		.runtime_definition(
+			project,
+			main.clone(),
+			materialized.definition.clone(),
+			EntryMode::Library,
+		)
+		.expect("materialized default is served by the module manifest");
+	assert_eq!(exact, materialized);
+	let events = events.lock().unwrap();
+	assert_eq!(
+		events
+			.iter()
+			.filter(|event| {
+				event.query == "runtime_manifest" && event.module.as_deref() == Some("main")
+			})
+			.count(),
+		1,
+		"exact lookup must execute the one authoritative manifest producer: {events:#?}"
+	);
+	assert_eq!(
+		events
+			.iter()
+			.filter(|event| {
+				event.query == "runtime_definition_extraction" && event.module.as_deref() == Some("main")
+			})
+			.count(),
+		1,
+		"materialized defaults must not bypass extraction: {events:#?}"
+	);
+}
+
+#[test]
 fn struct_shell_isolated_from_method_body_and_signature_invalidation() {
 	let (mut session, events) = session();
 	let project = ProjectId::new("shell-isolation");

@@ -689,6 +689,7 @@ pub enum RuntimeExtractionError {
 	IncompleteVariantTarget(EcoString),
 	MissingIterationProtocol,
 	CorruptImplementationMemberMapping(DefinitionId),
+	DuplicateRuntimeDefinition(DefinitionId),
 	MissingBodyExpressionIdentity,
 }
 

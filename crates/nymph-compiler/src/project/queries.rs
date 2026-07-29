@@ -38,6 +38,55 @@ pub(crate) struct RuntimeDefinitionEntity<'db> {
 	pub value: Arc<nymph_sema::RuntimeDefinition>,
 }
 
+/// Source-ordered runtime inventory for one semantic module. Artifact payloads
+/// remain tracked independently so consumers of an unchanged definition can
+/// backdate even when another manifest entry changes.
+#[derive(Clone, PartialEq, Eq, salsa::SalsaValue)]
+pub(crate) struct RuntimeManifest<'db> {
+	definitions: Arc<[RuntimeDefinitionEntity<'db>]>,
+}
+
+impl<'db> RuntimeManifest<'db> {
+	fn new(
+		db: &'db dyn Db,
+		definitions: impl IntoIterator<Item = nymph_sema::RuntimeDefinition>,
+	) -> Result<Self, nymph_sema::RuntimeExtractionError> {
+		let mut seen = std::collections::BTreeSet::new();
+		let definitions = definitions.into_iter().collect::<Vec<_>>();
+		for definition in &definitions {
+			if !seen.insert(definition.definition.clone()) {
+				return Err(
+					nymph_sema::RuntimeExtractionError::DuplicateRuntimeDefinition(
+						definition.definition.clone(),
+					),
+				);
+			}
+		}
+		let definitions = definitions
+			.into_iter()
+			.map(|value| RuntimeDefinitionEntity::new(db, value.definition.clone(), Arc::new(value)))
+			.collect::<Vec<_>>()
+			.into();
+		Ok(Self { definitions })
+	}
+
+	pub(crate) fn definitions(&self) -> &[RuntimeDefinitionEntity<'db>] {
+		&self.definitions
+	}
+
+	fn definition(
+		&self,
+		db: &'db dyn Db,
+		definition: &nymph_sema::DefinitionId,
+	) -> Option<RuntimeDefinitionEntity<'db>> {
+		self
+			.definitions
+			.iter()
+			.copied()
+			.find(|entity| entity.definition(db) == definition)
+	}
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParsedModule {
 	pub tree: Module,
@@ -814,11 +863,11 @@ fn checked_from_analysis(
 }
 
 #[salsa::tracked(returns(clone))]
-fn ambient_runtime_definition_index<'db>(
+fn ambient_runtime_manifest<'db>(
 	db: &'db dyn Db,
 	registry: AmbientCoreRegistryInput,
 	module: BuiltinModuleInput,
-) -> Result<Arc<[RuntimeDefinitionEntity<'db>]>, super::session::RuntimeDefinitionError> {
+) -> Result<RuntimeManifest<'db>, super::session::RuntimeDefinitionError> {
 	let environment = ambient_core_environment(db, registry, module);
 	let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
 		return Err(super::session::RuntimeDefinitionError::Recovered);
@@ -835,21 +884,7 @@ fn ambient_runtime_definition_index<'db>(
 		interface,
 	)
 	.map_err(super::session::RuntimeDefinitionError::Extraction)?;
-	let mut seen = std::collections::BTreeSet::new();
-	Ok(
-		definitions
-			.into_iter()
-			.map(|value| {
-				assert!(
-					seen.insert(value.definition.clone()),
-					"duplicate runtime definition identity: {:?}",
-					value.definition
-				);
-				RuntimeDefinitionEntity::new(db, value.definition.clone(), Arc::new(value))
-			})
-			.collect::<Vec<_>>()
-			.into(),
-	)
+	RuntimeManifest::new(db, definitions).map_err(super::session::RuntimeDefinitionError::Extraction)
 }
 
 fn exact_module_environment<'db>(
@@ -868,17 +903,17 @@ fn exact_module_environment<'db>(
 }
 
 #[salsa::tracked(returns(clone))]
-pub(crate) fn runtime_definition_index<'db>(
+pub(crate) fn runtime_manifest<'db>(
 	db: &'db dyn Db,
 	key: super::session::ProjectKey<'db>,
 	module: SemanticModuleInput,
-) -> Result<Arc<[RuntimeDefinitionEntity<'db>]>, super::session::RuntimeDefinitionError> {
+) -> Result<RuntimeManifest<'db>, super::session::RuntimeDefinitionError> {
 	#[cfg(feature = "test-support")]
-	db.semantic_query_will_execute("runtime_definition_index", module);
+	db.semantic_query_will_execute("runtime_manifest", module);
 	if let SemanticModuleInput::Builtin(input) = module
 		&& input.key(db).domain == BuiltinModuleDomain::AmbientCore
 	{
-		return ambient_runtime_definition_index(db, key.ambient_core_registry(db), input);
+		return ambient_runtime_manifest(db, key.ambient_core_registry(db), input);
 	}
 	let environment = interface_module_environment(db, key, module);
 	let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
@@ -900,21 +935,7 @@ pub(crate) fn runtime_definition_index<'db>(
 		interface,
 	)
 	.map_err(super::session::RuntimeDefinitionError::Extraction)?;
-	let mut seen = std::collections::BTreeSet::new();
-	Ok(
-		definitions
-			.into_iter()
-			.map(|value| {
-				assert!(
-					seen.insert(value.definition.clone()),
-					"duplicate runtime definition identity: {:?}",
-					value.definition
-				);
-				RuntimeDefinitionEntity::new(db, value.definition.clone(), Arc::new(value))
-			})
-			.collect::<Vec<_>>()
-			.into(),
-	)
+	RuntimeManifest::new(db, definitions).map_err(super::session::RuntimeDefinitionError::Extraction)
 }
 
 /// Runtime-bearing identities owned by `module`, in language output order.
@@ -929,10 +950,10 @@ pub(crate) fn runtime_definition_ids<'db>(
 	#[cfg(feature = "test-support")]
 	db.semantic_query_will_execute("runtime_definition_ids", module);
 	Ok(
-		runtime_definition_index(db, key, module)?
+		runtime_manifest(db, key, module)?
+			.definitions()
 			.iter()
 			.map(|entity| entity.definition(db).clone())
-			.into_iter()
 			.collect::<Vec<_>>()
 			.into(),
 	)
@@ -947,50 +968,8 @@ pub(crate) fn runtime_definition<'db>(
 	#[cfg(feature = "test-support")]
 	db.runtime_query_will_execute("runtime_definition", &definition);
 	let module = runtime_owner(db, key, &definition)?;
-	let environment = exact_module_environment(db, key, module);
-	if matches!(
-		environment.as_ref(),
-		nymph_sema::ModuleEnvironment::Recovered(_)
-	) {
-		return Err(super::session::RuntimeDefinitionError::Recovered);
-	}
-	let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
-		unreachable!()
-	};
-	if matches!(
-		definition.key,
-		nymph_sema::DeclarationKey::MaterializedInterfaceMember { .. }
-	) {
-		let slot = interface
-			.implementations
-			.iter()
-			.flat_map(|implementation| &implementation.member_slots)
-			.find(|slot| slot.member_id == definition)
-			.ok_or(super::session::RuntimeDefinitionError::ImplementationMemberMappingNotFound)?;
-		if slot.source != nymph_sema::ImplementationMemberSource::InheritedDefault
-			|| slot.implementation_id != slot.placement_owner
-		{
-			return Err(super::session::RuntimeDefinitionError::Extraction(
-				nymph_sema::RuntimeExtractionError::CorruptImplementationMemberMapping(definition),
-			));
-		}
-		return Ok(Arc::new(nymph_sema::RuntimeDefinition {
-			definition: slot.member_id.clone(),
-			source_owner: slot.body_definition_id.module.clone(),
-			placement: nymph_sema::RuntimePlacement::Attached {
-				owner: slot.placement_owner.clone(),
-				name: slot.name.clone(),
-			},
-			payload: nymph_sema::RuntimePayload::MaterializedInterfaceMember {
-				body_definition: slot.body_definition_id.clone(),
-				interface_member: slot.interface_member_id.clone(),
-			},
-		}));
-	}
-	let entity = runtime_definition_index(db, key, module)?
-		.iter()
-		.copied()
-		.find(|entity| entity.definition(db) == &definition)
+	let entity = runtime_manifest(db, key, module)?
+		.definition(db, &definition)
 		.ok_or(super::session::RuntimeDefinitionError::DefinitionNotFound)?;
 	Ok(entity.value(db))
 }
@@ -2241,6 +2220,37 @@ mod tests {
 	impl salsa::Database for TestDb {}
 	#[salsa::db]
 	impl Db for TestDb {}
+
+	#[test]
+	fn runtime_manifest_rejects_duplicate_exact_identities_with_a_typed_error() {
+		let db = TestDb {
+			storage: salsa::Storage::default(),
+		};
+		let definition = nymph_sema::DefinitionId::new(
+			nymph_sema::ModuleIdentity {
+				origin: nymph_sema::ModuleOrigin::Project("manifest-duplicate".into()),
+				project: "manifest-duplicate".into(),
+				path: "main".into(),
+			},
+			nymph_sema::DeclarationKey::top_level(nymph_sema::DeclarationCategory::Struct, "Item"),
+		);
+		let artifact = nymph_sema::RuntimeDefinition {
+			definition: definition.clone(),
+			source_owner: definition.module.clone(),
+			placement: nymph_sema::RuntimePlacement::TopLevel,
+			payload: nymph_sema::RuntimePayload::Struct(nymph_sema::StructShell {
+				binders: Vec::new(),
+				constraints: Vec::new(),
+				fields: Vec::new(),
+			}),
+		};
+
+		assert!(matches!(
+			RuntimeManifest::new(&db, [artifact.clone(), artifact]),
+			Err(nymph_sema::RuntimeExtractionError::DuplicateRuntimeDefinition(found))
+				if found == definition
+		));
+	}
 
 	#[test]
 	fn private_access_conversion_preserves_unrelated_diagnostic_at_same_span() {
