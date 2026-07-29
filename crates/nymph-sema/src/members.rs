@@ -542,9 +542,14 @@ impl<'m> Checker<'m> {
 		let generics_len = def.owner_generic_names.len();
 		let self_ty = def.self_ty;
 		let constraints = def.constraints.clone();
-		let subst = self.fresh_subst(generics_len);
-		let impl_self = self.subst(self_ty, &subst, None);
-		self.try_unify(recv, impl_self) && self.constraints_hold(&constraints, &subst, 0)
+		let inst = self.instantiate(
+			self_ty,
+			&constraints,
+			(0..generics_len).map(|index| ParamIdx(index as u32)),
+			FxHashMap::default(),
+			None,
+		);
+		self.try_unify(recv, inst.ty) && self.instantiated_constraints_hold(&inst.obligations, 0)
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -566,13 +571,17 @@ impl<'m> Checker<'m> {
 		let ret = method.ret;
 		let bounds = method.bounds.clone();
 
-		let mut subst = self.fresh_subst(generics_len);
-		let impl_self = self.subst(self_pattern, &subst, None);
+		let owner = self.instantiate(
+			self_pattern,
+			&[],
+			(0..generics_len).map(|index| ParamIdx(index as u32)),
+			FxHashMap::default(),
+			None,
+		);
+		let mut subst = owner.substitution;
+		let impl_self = owner.ty;
 		if !namespaced {
 			self.unify(recv, impl_self, span);
-		}
-		for j in 0..own {
-			subst.insert(ParamIdx((generics_len + j) as u32), self.fresh());
 		}
 		let self_concrete = impl_self;
 		// Defer one `pending_bounds` obligation per bound on the method's own
@@ -583,20 +592,20 @@ impl<'m> Checker<'m> {
 		// `inherent_receiver_matches`'s `constraints_hold` call for instance
 		// receivers, and namespaced methods only exist in ADT bodies (whose
 		// `constraints` is always empty).
-		for bound in &bounds {
-			let ty = self.subst(bound.ty, &subst, Some(self_concrete));
-			let args: Vec<(EcoString, Ty)> = bound
-				.args
-				.iter()
-				.map(|(name, t)| (name.clone(), self.subst(*t, &subst, Some(self_concrete))))
-				.collect();
-			self.pending_bounds.push((span, ty, bound.interface, args));
-		}
+		let method_inst = self.instantiate(
+			ret,
+			&bounds,
+			(0..own).map(|j| ParamIdx((generics_len + j) as u32)),
+			subst,
+			Some(self_concrete),
+		);
+		self.defer_obligations(span, method_inst.obligations.iter().cloned());
+		subst = method_inst.substitution;
 		let params: Vec<Ty> = params
 			.iter()
 			.map(|t| self.subst(*t, &subst, Some(self_concrete)))
 			.collect();
-		let ret = self.subst(ret, &subst, Some(self_concrete));
+		let ret = method_inst.ty;
 
 		if let Some((arg_tys, arg_lits)) = arguments {
 			if params.len() != arg_tys.len() {
@@ -687,6 +696,7 @@ impl<'m> Checker<'m> {
 		let diag_mark = self.diags.len();
 		let pending_mark = self.pending_operators.len();
 		let pending_bounds_mark = self.pending_bounds.len();
+		let pending_mut_snapshot = self.pending_bound_arg_mut.clone();
 		self.param_bounds.clear();
 		self.param_bound_details.clear();
 		self.push_params(build_param_scope(owner_generics));
@@ -733,6 +743,7 @@ impl<'m> Checker<'m> {
 		// Same discard for any bound obligation this trial deferred (Slice 4G) —
 		// see the comment just above.
 		self.pending_bounds.truncate(pending_bounds_mark);
+		self.pending_bound_arg_mut = pending_mut_snapshot;
 
 		// Accept the inferred type only if it is fully generalised.
 		if self.has_infer(ret) { None } else { Some(ret) }

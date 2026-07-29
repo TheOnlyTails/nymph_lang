@@ -176,12 +176,26 @@ pub struct Checker<'m> {
 	pub(crate) anon_consumed: FxHashSet<NodeId>,
 }
 
-/// One deferred call-site bound obligation: the call/reference span, the
-/// (possibly still-unresolved) minted variable, the required interface, and
-/// its argument bindings (substituted through the same call-site map as the
-/// variable itself — empty for a synthetic `impl Trait` param, which carries
-/// no argument fidelity). See [`Checker::pending_bounds`].
-pub(crate) type PendingBound = (Span, Ty, DefId, Vec<(EcoString, Ty)>);
+/// One bound instantiated through the same exact substitution as its scheme.
+#[derive(Clone, Debug)]
+pub(crate) struct InstantiatedObligation {
+	pub(crate) ty: Ty,
+	pub(crate) interface: DefId,
+	pub(crate) args: Vec<(EcoString, Ty)>,
+}
+
+/// A committed body obligation waiting for its instantiated type to resolve.
+#[derive(Clone, Debug)]
+pub(crate) struct PendingBound {
+	pub(crate) site: Span,
+	pub(crate) obligation: InstantiatedObligation,
+}
+
+pub(crate) struct Instantiation {
+	pub(crate) ty: Ty,
+	pub(crate) substitution: FxHashMap<ParamIdx, Ty>,
+	pub(crate) obligations: Vec<InstantiatedObligation>,
+}
 
 /// Whether [`check_module_impl`] should additionally validate the module's
 /// entry point (`main`) — see [`check_module`] vs [`check_module_entry`].
@@ -966,12 +980,52 @@ impl<'m> Checker<'m> {
 		}
 	}
 
-	/// Build a substitution mapping a signature's generic parameters `0..n` to fresh
-	/// inference variables, to be solved from the use site.
-	pub(crate) fn fresh_subst(&mut self, count: usize) -> FxHashMap<ParamIdx, Ty> {
-		(0..count)
-			.map(|i| (ParamIdx(i as u32), self.fresh()))
-			.collect()
+	/// Instantiate one checker-local generic scheme without interpreting or
+	/// renumbering its parameter indices. The caller supplies every exact index,
+	/// including owner+method offsets and high synthetic indices, plus any seeded
+	/// owner/interface bindings. Instantiation is pure with respect to the current
+	/// body's pending queue: committed callers explicitly defer returned obligations,
+	/// while pattern and solver-trial callers intentionally do not.
+	pub(crate) fn instantiate(
+		&mut self,
+		ty: Ty,
+		bounds: &[crate::iface::Bound],
+		indices: impl IntoIterator<Item = ParamIdx>,
+		mut substitution: FxHashMap<ParamIdx, Ty>,
+		self_ty: Option<Ty>,
+	) -> Instantiation {
+		for index in indices {
+			substitution.entry(index).or_insert_with(|| self.fresh());
+		}
+		let obligations = bounds
+			.iter()
+			.map(|bound| InstantiatedObligation {
+				ty: self.subst(bound.ty, &substitution, self_ty),
+				interface: bound.interface,
+				args: bound
+					.args
+					.iter()
+					.map(|(name, ty)| (name.clone(), self.subst(*ty, &substitution, self_ty)))
+					.collect(),
+			})
+			.collect::<Vec<_>>();
+		Instantiation {
+			ty: self.subst(ty, &substitution, self_ty),
+			substitution,
+			obligations,
+		}
+	}
+
+	pub(crate) fn defer_obligations(
+		&mut self,
+		site: Span,
+		obligations: impl IntoIterator<Item = InstantiatedObligation>,
+	) {
+		self.pending_bounds.extend(
+			obligations
+				.into_iter()
+				.map(|obligation| PendingBound { site, obligation }),
+		);
 	}
 
 	/// The offset above which a `ParamIdx` is *synthetic*: minted by

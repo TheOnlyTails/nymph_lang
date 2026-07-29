@@ -357,8 +357,9 @@ impl Checker<'_> {
 		depth: u32,
 	) -> bool {
 		let def = self.impls.impls[idx].clone();
-		let subst = self.fresh_subst(def.generics.len());
-		let impl_self = self.subst(def.self_ty, &subst, None);
+		let inst = self.instantiate_impl_scheme(&def);
+		let subst = inst.substitution;
+		let impl_self = inst.ty;
 		if !self.try_unify_self(self_ty, impl_self, self_is_mut) {
 			return false;
 		}
@@ -374,7 +375,7 @@ impl Checker<'_> {
 				return false;
 			}
 		}
-		self.constraints_hold(&def.constraints, &subst, depth)
+		self.instantiated_constraints_hold(&inst.obligations, depth)
 	}
 
 	/// Does `self_ty` implement `interface`, and if so what is it bound to for
@@ -445,12 +446,13 @@ impl Checker<'_> {
 		depth: u32,
 	) -> Option<Ty> {
 		let def = self.impls.impls[idx].clone();
-		let subst = self.fresh_subst(def.generics.len());
-		let impl_self = self.subst(def.self_ty, &subst, None);
+		let inst = self.instantiate_impl_scheme(&def);
+		let subst = inst.substitution;
+		let impl_self = inst.ty;
 		if !self.try_unify_self(self_ty, impl_self, self_is_mut) {
 			return None;
 		}
-		if !self.constraints_hold(&def.constraints, &subst, depth) {
+		if !self.instantiated_constraints_hold(&inst.obligations, depth) {
 			return None;
 		}
 		def
@@ -460,24 +462,27 @@ impl Checker<'_> {
 			.map(|(_, ty)| self.subst(*ty, &subst, None))
 	}
 
-	pub(crate) fn constraints_hold(
+	pub(crate) fn instantiated_constraints_hold(
 		&mut self,
-		constraints: &[crate::iface::Bound],
-		subst: &FxHashMap<ParamIdx, Ty>,
+		constraints: &[crate::check::InstantiatedObligation],
 		depth: u32,
 	) -> bool {
-		for bound in constraints {
-			let ty = self.subst(bound.ty, subst, None);
-			let args: Vec<(EcoString, Ty)> = bound
-				.args
-				.iter()
-				.map(|(name, t)| (name.clone(), self.subst(*t, subst, None)))
-				.collect();
-			if !self.holds(ty, bound.interface, &args, depth + 1) {
-				return false;
-			}
-		}
-		true
+		constraints
+			.iter()
+			.all(|bound| self.holds(bound.ty, bound.interface, &bound.args, depth + 1))
+	}
+
+	fn instantiate_impl_scheme(
+		&mut self,
+		def: &crate::iface::ImplDef,
+	) -> crate::check::Instantiation {
+		self.instantiate(
+			def.self_ty,
+			&def.constraints,
+			(0..def.generics.len()).map(|index| ParamIdx(index as u32)),
+			FxHashMap::default(),
+			None,
+		)
 	}
 
 	/// Resolve a namespaced interface function reached through a generic parameter's
@@ -635,18 +640,18 @@ impl Checker<'_> {
 	/// rolled back before returning.
 	fn impls_overlap(&mut self, a: &crate::iface::ImplDef, b: &crate::iface::ImplDef) -> bool {
 		let snapshot = self.table.snapshot();
-		let a_subst = self.fresh_subst(a.generics.len());
-		let b_subst = self.fresh_subst(b.generics.len());
+		let a_inst = self.instantiate_impl_scheme(a);
+		let b_inst = self.instantiate_impl_scheme(b);
+		let a_subst = a_inst.substitution;
+		let b_subst = b_inst.substitution;
 		// Peel `mut` off both self types (MT2 OO4/OO5): `impl A for B` (self `B`)
 		// and `impl A for mut B` (self `Mut(B)`) both apply to a `mut B` receiver,
 		// so they OVERLAP and coherence must reject them at declaration — otherwise
 		// a `mut`-receiver call finds both applicable and falls through to a
 		// confusing `AmbiguousCall`. Without the peel, `try_unify(B, Mut(B))` fails
 		// (it has only a `(Mut, Mut)` arm) and the conflict slips through.
-		let a_self = self.subst(a.self_ty, &a_subst, None);
-		let a_self = self.strip_mut(a_self);
-		let b_self = self.subst(b.self_ty, &b_subst, None);
-		let b_self = self.strip_mut(b_self);
+		let a_self = self.strip_mut(a_inst.ty);
+		let b_self = self.strip_mut(b_inst.ty);
 		let mut overlap = self.try_unify(a_self, b_self);
 		if overlap {
 			for (name, a_ty) in &a.args {
@@ -1053,10 +1058,10 @@ impl Checker<'_> {
 	/// Does impl `idx`'s receiver type (and its constraints) match `recv`?
 	fn method_matches_receiver(&mut self, idx: usize, recv: Ty, recv_is_mut: bool) -> bool {
 		let def = self.impls.impls[idx].clone();
-		let subst = self.fresh_subst(def.generics.len());
-		let impl_self = self.subst(def.self_ty, &subst, None);
+		let inst = self.instantiate_impl_scheme(&def);
+		let impl_self = inst.ty;
 		self.try_unify_self(recv, impl_self, recv_is_mut)
-			&& self.constraints_hold(&def.constraints, &subst, 0)
+			&& self.instantiated_constraints_hold(&inst.obligations, 0)
 	}
 
 	/// Trial (arg-aware): does impl `idx` provide `name` applicable to `recv(args)`?
@@ -1074,10 +1079,11 @@ impl Checker<'_> {
 		arg_lits: &[bool],
 	) -> Option<(Ty, bool)> {
 		let def = self.impls.impls[idx].clone();
-		let subst = self.fresh_subst(def.generics.len());
-		let impl_self = self.subst(def.self_ty, &subst, None);
+		let inst = self.instantiate_impl_scheme(&def);
+		let subst = inst.substitution;
+		let impl_self = inst.ty;
 		if !self.try_unify_self(recv, impl_self, recv_is_mut)
-			|| !self.constraints_hold(&def.constraints, &subst, 0)
+			|| !self.instantiated_constraints_hold(&inst.obligations, 0)
 		{
 			return None;
 		}
@@ -1105,8 +1111,9 @@ impl Checker<'_> {
 		span: Span,
 	) -> MethodResolution {
 		let def = self.impls.impls[idx].clone();
-		let subst = self.fresh_subst(def.generics.len());
-		let impl_self = self.subst(def.self_ty, &subst, None);
+		let inst = self.instantiate_impl_scheme(&def);
+		let subst = inst.substitution;
+		let impl_self = inst.ty;
 		self.unify_self(recv, impl_self, span);
 		let implementation = def.definition.clone();
 		let interface = self.defs.stable(def.interface).cloned();
@@ -1244,20 +1251,18 @@ impl Checker<'_> {
 		recv: Ty,
 		obligation_span: impl Into<Option<Span>>,
 	) -> (Vec<Ty>, Ty) {
-		for index in 0..method.generics.len() {
-			subst.insert(ParamIdx((owner_generics + index) as u32), self.fresh());
+		let site = obligation_span.into();
+		let inst = self.instantiate(
+			method.ret,
+			&method.bounds,
+			(0..method.generics.len()).map(|index| ParamIdx((owner_generics + index) as u32)),
+			subst,
+			Some(recv),
+		);
+		if let Some(site) = site {
+			self.defer_obligations(site, inst.obligations.iter().cloned());
 		}
-		if let Some(span) = obligation_span.into() {
-			for bound in &method.bounds {
-				let ty = self.subst(bound.ty, &subst, Some(recv));
-				let args = bound
-					.args
-					.iter()
-					.map(|(name, ty)| (name.clone(), self.subst(*ty, &subst, Some(recv))))
-					.collect();
-				self.pending_bounds.push((span, ty, bound.interface, args));
-			}
-		}
+		subst = inst.substitution;
 		let params = method
 			.params
 			.iter()

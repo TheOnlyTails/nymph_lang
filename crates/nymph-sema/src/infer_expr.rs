@@ -19,7 +19,7 @@ use nymph_ast::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::annotate::{DispatchKind, IterMode, Resolution};
-use crate::check::Checker;
+use crate::check::{Checker, InstantiatedObligation, PendingBound};
 use crate::def::{DefKind, FuncSig, NamespaceMemberSig};
 use crate::errors::TypeError;
 use crate::ids::{DefId, ParamIdx};
@@ -130,6 +130,15 @@ fn expr_is_place(expr: &Expr) -> bool {
 		ExprKind::Grouped(inner) => expr_is_place(inner),
 		_ => false,
 	}
+}
+
+/// Recovery disposition for a deferred bound after its target is resolved.
+/// Underdetermined and poisoned obligations intentionally remain silent; Stage 4
+/// makes that distinction explicit without tightening either case.
+enum BoundFinalizationDisposition {
+	Underdetermined,
+	Poisoned,
+	Check(TyKind),
 }
 
 impl<'m> Checker<'m> {
@@ -1001,28 +1010,28 @@ impl<'m> Checker<'m> {
 		if matches!(self.interner.kind(sig.ret), TyKind::Error) {
 			return self.interner.error();
 		}
-		let mut subst = self.fresh_subst(sig.generics.len());
 		let mut synthetics = FxHashSet::default();
 		for p in &sig.params {
 			self.synthetic_params_in(p.ty, &mut synthetics);
 		}
-		for &idx in &synthetics {
-			subst.entry(idx).or_insert_with(|| self.fresh());
-		}
-		for bound in &sig.bounds {
-			let ty = self.subst(bound.ty, &subst, None);
-			let args: Vec<(EcoString, Ty)> = bound
-				.args
-				.iter()
-				.map(|(name, t)| (name.clone(), self.subst(*t, &subst, None)))
-				.collect();
-			self.pending_bounds.push((span, ty, bound.interface, args));
-		}
+		let indices = (0..sig.generics.len())
+			.map(|i| ParamIdx(i as u32))
+			.chain(synthetics.iter().copied());
+		let inst = self.instantiate(sig.ret, &sig.bounds, indices, FxHashMap::default(), None);
+		self.defer_obligations(span, inst.obligations.iter().cloned());
+		let subst = inst.substitution;
 		for idx in &synthetics {
 			if let Some(interfaces) = self.synthetic_bounds.get(idx).cloned() {
 				let ty = subst[idx];
 				for interface in interfaces {
-					self.pending_bounds.push((span, ty, interface, Vec::new()));
+					self.pending_bounds.push(PendingBound {
+						site: span,
+						obligation: InstantiatedObligation {
+							ty,
+							interface,
+							args: Vec::new(),
+						},
+					});
 				}
 			}
 		}
@@ -1064,26 +1073,12 @@ impl<'m> Checker<'m> {
 				.annotations
 				.record_definition_target(id, res.variant_target.as_ref());
 			self.annotations.record_variant(id, res);
-			let (adt, subst) = self.instantiate_enum(enum_def);
-			// Defer one `pending_bounds` obligation per bound on the enum's own
-			// generics (Slice 4G-b) — a nullary variant reference still
-			// instantiates them (see `instantiate_enum` above), so it needs the
-			// same enforcement as a labeled construction. Not pushed inside
-			// `instantiate_enum` itself: `infer_pattern.rs` calls that same
-			// function for match-arm patterns, which must NOT get obligations
-			// (CC3 — a pattern destructures an already-constructed value).
-			let bounds = self.sigs.enums[&enum_def].bounds.clone();
-			for bound in &bounds {
-				let ty = self.subst(bound.ty, &subst, None);
-				let bound_args: Vec<(EcoString, Ty)> = bound
-					.args
-					.iter()
-					.map(|(name, t)| (name.clone(), self.subst(*t, &subst, None)))
-					.collect();
-				self
-					.pending_bounds
-					.push((span, ty, bound.interface, bound_args));
-			}
+			let inst = self.instantiate_enum(enum_def);
+			self.defer_obligations(span, inst.obligations.iter().cloned());
+			let adt = inst.ty;
+			// A nullary value commits the enum scheme's obligations. Pattern
+			// callers instantiate the same scheme but deliberately do not defer
+			// its returned obligations (CC3: they only destructure a value).
 			adt
 		} else {
 			self.emit(span, TypeError::FieldVariantAsValue { variant: name });
@@ -1091,24 +1086,40 @@ impl<'m> Checker<'m> {
 		}
 	}
 
-	pub(crate) fn instantiate_enum(&mut self, enum_def: DefId) -> (Ty, FxHashMap<ParamIdx, Ty>) {
+	pub(crate) fn instantiate_enum(&mut self, enum_def: DefId) -> crate::check::Instantiation {
 		let arity = self.sigs.enums[&enum_def].generics.len();
-		let subst = self.fresh_subst(arity);
-		let positional = (0..arity).map(|i| subst[&ParamIdx(i as u32)]).collect();
-		let adt = self
+		let positional = (0..arity)
+			.map(|i| self.interner.mk_param(ParamIdx(i as u32)))
+			.collect();
+		let canonical = self
 			.interner
 			.mk_adt(enum_def, GenericArgs::new(positional, Vec::new()));
-		(adt, subst)
+		let bounds = self.sigs.enums[&enum_def].bounds.clone();
+		self.instantiate(
+			canonical,
+			&bounds,
+			(0..arity).map(|i| ParamIdx(i as u32)),
+			FxHashMap::default(),
+			None,
+		)
 	}
 
-	pub(crate) fn instantiate_struct(&mut self, struct_def: DefId) -> (Ty, FxHashMap<ParamIdx, Ty>) {
+	pub(crate) fn instantiate_struct(&mut self, struct_def: DefId) -> crate::check::Instantiation {
 		let arity = self.sigs.structs[&struct_def].generics.len();
-		let subst = self.fresh_subst(arity);
-		let positional = (0..arity).map(|i| subst[&ParamIdx(i as u32)]).collect();
-		let adt = self
+		let positional = (0..arity)
+			.map(|i| self.interner.mk_param(ParamIdx(i as u32)))
+			.collect();
+		let canonical = self
 			.interner
 			.mk_adt(struct_def, GenericArgs::new(positional, Vec::new()));
-		(adt, subst)
+		let bounds = self.sigs.structs[&struct_def].bounds.clone();
+		self.instantiate(
+			canonical,
+			&bounds,
+			(0..arity).map(|i| ParamIdx(i as u32)),
+			FxHashMap::default(),
+			None,
+		)
 	}
 
 	// ── Calls & construction ─────────────────────────────────────────────────
@@ -1380,24 +1391,13 @@ impl<'m> Checker<'m> {
 	}
 
 	fn infer_struct_ctor(&mut self, def: DefId, args: &[Spanned<CallArg>], span: Span) -> Ty {
-		let (adt, subst) = self.instantiate_struct(def);
+		let inst = self.instantiate_struct(def);
+		self.defer_obligations(span, inst.obligations.iter().cloned());
+		let (adt, subst) = (inst.ty, inst.substitution);
 		let sig = self.sigs.structs[&def].clone();
-		// Defer one `pending_bounds` obligation per bound on the struct's own
-		// generics (Slice 4G-b), substituted through the same `subst` as `fields`
-		// below so it lands on the freshly-minted variable — mirrors
-		// `fn_type_of`'s treatment of `FuncSig::bounds`. Not pushed inside
-		// `instantiate_struct` itself: see the comment in `variant_value`.
-		for bound in &sig.bounds {
-			let ty = self.subst(bound.ty, &subst, None);
-			let bound_args: Vec<(EcoString, Ty)> = bound
-				.args
-				.iter()
-				.map(|(name, t)| (name.clone(), self.subst(*t, &subst, None)))
-				.collect();
-			self
-				.pending_bounds
-				.push((span, ty, bound.interface, bound_args));
-		}
+		// Construction commits the exact obligations returned with the same
+		// substitution used for the fields below. Pattern callers intentionally
+		// leave those obligations undeferred.
 		let fields: Vec<(EcoString, Ty)> = sig
 			.fields
 			.iter()
@@ -1433,23 +1433,14 @@ impl<'m> Checker<'m> {
 			.annotations
 			.record_definition_target(id, res.variant_target.as_ref());
 		self.annotations.record_variant(id, res);
-		let (adt, subst) = self.instantiate_enum(enum_def);
+		let inst = self.instantiate_enum(enum_def);
+		self.defer_obligations(span, inst.obligations.iter().cloned());
+		let (adt, subst) = (inst.ty, inst.substitution);
 		if let Some(expected) = expected {
 			self.unify(adt, expected, span);
 		}
 		let sig = self.sigs.enums[&enum_def].clone();
 		// Same reasoning as `infer_struct_ctor` above, for the enum's own bounds.
-		for bound in &sig.bounds {
-			let ty = self.subst(bound.ty, &subst, None);
-			let bound_args: Vec<(EcoString, Ty)> = bound
-				.args
-				.iter()
-				.map(|(name, t)| (name.clone(), self.subst(*t, &subst, None)))
-				.collect();
-			self
-				.pending_bounds
-				.push((span, ty, bound.interface, bound_args));
-		}
 		let vsig = sig.variants[variant].clone();
 		let fields: Vec<(EcoString, Ty)> = vsig
 			.fields
@@ -1617,18 +1608,15 @@ impl<'m> Checker<'m> {
 	}
 
 	fn namespace_func_type(&mut self, sig: &FuncSig, span: Span) -> Ty {
-		let subst: FxHashMap<ParamIdx, Ty> = (0..sig.generics.len())
-			.map(|index| (ParamIdx(index as u32), self.fresh()))
-			.collect();
-		for bound in &sig.bounds {
-			let ty = self.subst(bound.ty, &subst, None);
-			let args = bound
-				.args
-				.iter()
-				.map(|(name, ty)| (name.clone(), self.subst(*ty, &subst, None)))
-				.collect();
-			self.pending_bounds.push((span, ty, bound.interface, args));
-		}
+		let inst = self.instantiate(
+			sig.ret,
+			&sig.bounds,
+			(0..sig.generics.len()).map(|index| ParamIdx(index as u32)),
+			FxHashMap::default(),
+			None,
+		);
+		self.defer_obligations(span, inst.obligations.iter().cloned());
+		let subst = inst.substitution;
 		let params = sig
 			.params
 			.iter()
@@ -3326,12 +3314,27 @@ impl<'m> Checker<'m> {
 	pub(crate) fn finalize_pending_bounds(&mut self) {
 		let pending = std::mem::take(&mut self.pending_bounds);
 		let arg_mut = std::mem::take(&mut self.pending_bound_arg_mut);
-		for (span, ty, interface, args) in pending {
+		for obligation in pending {
+			let PendingBound {
+				site: span,
+				obligation,
+			} = obligation;
+			let InstantiatedObligation {
+				ty,
+				interface,
+				args,
+			} = obligation;
 			let resolved = self.shallow_resolve(ty);
-			let kind = self.interner.kind(resolved).clone();
-			let satisfied = match kind {
-				TyKind::Infer(_) | TyKind::Error => true,
-				TyKind::Param(p) => {
+			let disposition = match self.interner.kind(resolved).clone() {
+				TyKind::Infer(_) => BoundFinalizationDisposition::Underdetermined,
+				TyKind::Error => BoundFinalizationDisposition::Poisoned,
+				kind => BoundFinalizationDisposition::Check(kind),
+			};
+			let satisfied = match disposition {
+				BoundFinalizationDisposition::Underdetermined | BoundFinalizationDisposition::Poisoned => {
+					true
+				}
+				BoundFinalizationDisposition::Check(TyKind::Param(p)) => {
 					let bounded = self
 						.param_bounds
 						.get(&p)
@@ -3347,7 +3350,7 @@ impl<'m> Checker<'m> {
 				// this obligation's variable) — `pending_bound_arg_mut`, keyed by
 				// the SAME un-resolved `ty` `fn_type_of` pushed this obligation
 				// with, is the side channel that survived that cancellation.
-				_ => match arg_mut.get(&ty).copied() {
+				BoundFinalizationDisposition::Check(_) => match arg_mut.get(&ty).copied() {
 					// One contributing argument was `mut`, another wasn't. This is
 					// NOT automatically an error: if the bound is satisfied by the
 					// PLAIN type (an ordinary `impl A for B`, no mut-only impl), both

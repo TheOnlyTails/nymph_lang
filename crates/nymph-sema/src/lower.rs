@@ -199,7 +199,7 @@ impl Checker<'_> {
 					// Lower the generics' own bounds while their param scope is still
 					// active (Slice 4G), so `Bound::ty`/`args` land in the same `Param`
 					// index space as `params`/`ret` above and a call site can substitute
-					// them with the identical `fresh_subst` map.
+					// them with the scheme's identical instantiation map.
 					let bounds = self.lower_constraints(&meta.generics, 0);
 					self.pop_params();
 					self.sigs.funcs.insert(

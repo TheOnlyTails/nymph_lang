@@ -884,11 +884,23 @@ fn pattern_position_does_not_enforce_ctor_bounds() {
 	// unbounded `Holder`.
 	assert_ok(
 		"interface Area { func area(): int }
-		 enum Holder<T> { Some(value: T), Empty }
+		 enum Holder<T: Area> { Some(value: T), Empty }
 		 func peek<T>(h: Holder<T>): int = match (h) {
 		   Some(value) -> 1,
 		   Empty -> 0,
 		 }",
+	);
+}
+
+#[test]
+fn unapplied_constrained_function_value_may_remain_underdetermined() {
+	// Representation-parity test for Stage 4: merely taking a constrained generic
+	// function as a value leaves its fresh type variable underdetermined. Finalizing
+	// that typed obligation must preserve the existing silent recovery behavior.
+	assert_ok(
+		"interface Area { func area(): int }
+		 func measure<T: Area>(shape: T): int = shape.area()
+		 func keep(): void = { let unapplied = measure }",
 	);
 }
 

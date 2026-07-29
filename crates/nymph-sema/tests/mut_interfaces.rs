@@ -484,6 +484,20 @@ fn an_unannotated_inherent_method_with_an_if_block_body_infers_the_branches_comm
 	);
 }
 
+#[test]
+fn omitted_return_trials_do_not_leak_bound_argument_mutability() {
+	assert_ok(
+		"interface A { func touch(): int }
+		 struct B(n: int)
+		 impl A for mut B { func touch(): int = 1 }
+		 func require<T: A>(value: T): int = value.touch()
+		 struct Calls {
+		   func generic<T: A>(value: T) = require(value)
+		   func mutable(value: mut B) = require(value)
+		 }",
+	);
+}
+
 // ── Nested owned-literal → `mut` coercion misses a free-function-call argument
 // whose OWN top-level type isn't `mut` but contains a nested `mut`-expected
 // element/value (Confirmed defect 1) ────────────────────────────────────────
