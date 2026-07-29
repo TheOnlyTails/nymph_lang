@@ -29,6 +29,7 @@ pub struct CheckedSemantic {
 	pub local_implementations: std::ops::Range<usize>,
 	pub local_inherent: std::ops::Range<usize>,
 	pub(crate) has_explicit_local_ranges: bool,
+	pub compiler_runtime_roles: crate::CompilerRuntimeRoles,
 }
 
 /// Owned, AST-independent facts for one checked inherent implementation.

@@ -392,6 +392,17 @@ fn materialized_fixture_in(
 			.iter()
 			.map(|item| &item.definition),
 	) {
+		for variant in &definition.variants {
+			context.members.insert(
+				variant.id.clone(),
+				EmittedMemberName::new(variant.name.clone()),
+			);
+			for field in &variant.fields {
+				context
+					.members
+					.insert(field.id.clone(), EmittedMemberName::new(field.name.clone()));
+			}
+		}
 		for member in &definition.members {
 			context.shapes.insert(
 				StableShapeRequest::Member(member.id.clone()),

@@ -50,14 +50,20 @@ fn impl_is_unmaterialized(res: &MethodResolution) -> bool {
 		return matches!(
 			implementation.module.origin,
 			crate::ModuleOrigin::Compiler | crate::ModuleOrigin::ImportableStd
-		);
+		) || matches!(
+			&implementation.module.origin,
+			crate::ModuleOrigin::Project(project) if project == "standalone"
+		) && res.impl_span.is_some_and(|span| span.start >= SPAN_BASE);
 	}
 	if res.source == MethodSource::GenericBound
 		&& res.target.as_ref().is_some_and(|target| {
 			matches!(
 				target.module.origin,
 				crate::ModuleOrigin::Compiler | crate::ModuleOrigin::ImportableStd
-			)
+			) || matches!(
+				&target.module.origin,
+				crate::ModuleOrigin::Project(project) if project == "standalone"
+			) && res.impl_span.is_some_and(|span| span.start >= SPAN_BASE)
 		}) {
 		return true;
 	}
@@ -3012,7 +3018,7 @@ impl<'m> Checker<'m> {
 		// body escapes type-checking.
 		let stripped = self.strip_mut(ty);
 		if let TyKind::List(elem) = self.interner.kind(stripped)
-			&& self.defs.get("Iterable").is_none()
+			&& self.runtime_roles.iterable.is_none()
 		{
 			let elem = *elem;
 			self
@@ -3063,27 +3069,33 @@ impl<'m> Checker<'m> {
 			// exactly the way an ambient `Iterator` default method (`fold`/`to_list`/…)
 			// iterates its own `this`. Records `IterMode::Direct` so lowering emits the
 			// `.next()` protocol rather than the native-list index fast path.
-			if let Some((ret, iface, _)) = self.resolve_param_method(idx, "next", &[], &[], iterable.span)
+			if let Some((iterator, next)) = self.runtime_roles.iterator.clone()
+				&& let Some(ret) = self.resolve_param_exact_method(idx, iterator, &next, iterable.span)
 				&& let Some(item) = self.option_element(ret)
 			{
-				self.gate_mutating(iface, "next", self_is_mut, iterable.span);
+				let Some(next_name) = self.runtime_role_member_name(iterator, &next) else {
+					return self.interner.error();
+				};
+				self.gate_mutating(iterator, &next_name, self_is_mut, iterable.span);
 				self
 					.annotations
 					.record_iter_mode(iterable.id, IterMode::Direct);
 				return item;
 			}
-			if let Some(iface) = self.defs.get("Iterable").filter(|&d| self.is_interface(d))
+			if let Some((iface, iter)) = self.runtime_roles.iterable.clone()
 				&& let Some(item_name) = self
 					.interfaces
 					.get(&iface)
 					.and_then(|i| i.generics.first().cloned())
 				&& let Some(item) = self.resolve_param_iface_arg(idx, iface, &item_name)
 			{
-				self.gate_mutating(iface, "iter", self_is_mut, iterable.span);
-				if let (Some(interface), Some(interface_member)) = (
-					self.defs.stable(iface).cloned(),
-					self.interfaces[&iface].methods["iter"].definition.clone(),
-				) {
+				let Some(iter_name) = self.runtime_role_member_name(iface, &iter) else {
+					return self.interner.error();
+				};
+				self.gate_mutating(iface, &iter_name, self_is_mut, iterable.span);
+				if let (Some(interface), Some(interface_member)) =
+					(self.defs.stable(iface).cloned(), Some(iter.clone()))
+				{
 					self.annotations.record_iter_resolution(
 						iterable.id,
 						Resolution {
@@ -3105,7 +3117,7 @@ impl<'m> Checker<'m> {
 				return item;
 			}
 		}
-		if let Some(iterator) = self.defs.get("Iterator").filter(|&d| self.is_interface(d))
+		if let Some((iterator, next)) = self.runtime_roles.iterator.clone()
 			&& let Some(item_name) = self
 				.interfaces
 				.get(&iterator)
@@ -3118,13 +3130,16 @@ impl<'m> Checker<'m> {
 			// `resolve_method`, or a non-`mut` receiver's fields get mutated
 			// through the loop with no diagnostic at all (MutMethodNeedsMutReceiver
 			// bypassed).
-			self.gate_mutating(iterator, "next", self_is_mut, iterable.span);
+			let Some(next_name) = self.runtime_role_member_name(iterator, &next) else {
+				return self.interner.error();
+			};
+			self.gate_mutating(iterator, &next_name, self_is_mut, iterable.span);
 			self
 				.annotations
 				.record_iter_mode(iterable.id, IterMode::Direct);
 			return item;
 		}
-		if let Some(iface) = self.defs.get("Iterable").filter(|&d| self.is_interface(d))
+		if let Some((iface, iter)) = self.runtime_roles.iterable.clone()
 			&& let Some(t_name) = self
 				.interfaces
 				.get(&iface)
@@ -3137,13 +3152,16 @@ impl<'m> Checker<'m> {
 			// against `Iterable::iter`'s own declared mutability, not `Iterator::next`'s
 			// (the iterator `iter()` returns is a distinct value, resolved and
 			// gated separately were it ever user-callable — out of scope here).
-			self.gate_mutating(iface, "iter", self_is_mut, iterable.span);
+			let Some(iter_name) = self.runtime_role_member_name(iface, &iter) else {
+				return self.interner.error();
+			};
+			self.gate_mutating(iface, &iter_name, self_is_mut, iterable.span);
 			let implementation = self.impls.impls[implementation_index].clone();
 			let resolution = self
 				.defs
 				.stable(iface)
 				.cloned()
-				.zip(self.interfaces[&iface].methods["iter"].definition.clone())
+				.zip(Some(iter.clone()))
 				.and_then(|(interface, interface_member)| {
 					let slot = implementation
 						.member_catalog
@@ -3191,11 +3209,24 @@ impl<'m> Checker<'m> {
 			TyKind::Adt(def, args) => (*def, args.positional.first().copied()),
 			_ => return None,
 		};
-		if self.defs.get("Option") == Some(def) {
+		if self.runtime_roles.option == Some(def) {
 			first
 		} else {
 			None
 		}
+	}
+
+	fn runtime_role_member_name(
+		&self,
+		interface: DefId,
+		member: &crate::DefinitionId,
+	) -> Option<EcoString> {
+		self
+			.interfaces
+			.get(&interface)?
+			.methods
+			.iter()
+			.find_map(|(name, method)| (method.definition.as_ref() == Some(member)).then(|| name.clone()))
 	}
 
 	fn infer_range_element(&mut self, kind: &RangeKind) -> Ty {

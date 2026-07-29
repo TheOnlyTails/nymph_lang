@@ -363,7 +363,7 @@ pub enum RuntimeIteration {
 	Direct {
 		iterator_interface: DefinitionId,
 		next: DefinitionId,
-		option: DefinitionId,
+		option: crate::OptionRuntimeRole,
 	},
 	ViaIter {
 		iterable_interface: DefinitionId,
@@ -371,7 +371,7 @@ pub enum RuntimeIteration {
 		iter: StableDispatch,
 		iterator_interface: DefinitionId,
 		next: DefinitionId,
-		option: DefinitionId,
+		option: crate::OptionRuntimeRole,
 	},
 }
 
@@ -1903,45 +1903,24 @@ fn definition_owner(definition: &DefinitionId) -> Option<&DefinitionId> {
 
 fn iteration_protocol(
 	checked: &crate::CheckedFacts,
-) -> Result<(DefinitionId, DefinitionId, DefinitionId), RuntimeExtractionError> {
-	let find = |interface_name: &str, method_name: &str| {
-		let (id, stable) = checked
-			.semantic
-			.definitions
-			.defs
-			.iter()
-			.enumerate()
-			.find_map(|(index, item)| {
-				(item.name == interface_name)
-					.then(|| {
-						item
-							.stable
-							.clone()
-							.map(|stable| (crate::DefId(index as u32), stable))
-					})
-					.flatten()
-			})?;
-		let method = checked
-			.semantic
-			.interfaces
-			.get(&id)?
-			.methods
-			.get(method_name)?
-			.definition
-			.clone()?;
-		Some((stable, method))
-	};
-	let (iterator, next) =
-		find("Iterator", "next").ok_or(RuntimeExtractionError::MissingIterationProtocol)?;
+) -> Result<(DefinitionId, DefinitionId, crate::OptionRuntimeRole), RuntimeExtractionError> {
+	let iterator = checked
+		.semantic
+		.compiler_runtime_roles
+		.iterator
+		.as_ref()
+		.ok_or(RuntimeExtractionError::MissingIterationProtocol)?;
 	let option = checked
 		.semantic
-		.definitions
-		.defs
-		.iter()
-		.find(|item| item.name == "Option")
-		.and_then(|item| item.stable.clone())
+		.compiler_runtime_roles
+		.option
+		.as_ref()
 		.ok_or(RuntimeExtractionError::MissingIterationProtocol)?;
-	Ok((iterator, next, option))
+	Ok((
+		iterator.interface.clone(),
+		iterator.member.clone(),
+		option.clone(),
+	))
 }
 
 fn external_marshal(

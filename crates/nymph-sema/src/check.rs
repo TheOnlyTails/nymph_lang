@@ -14,7 +14,7 @@ use nymph_diagnostics::Diagnostic;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::annotate::{Checked, CheckedFacts, CheckedSemantic};
-use crate::def::{DefMap, Signatures, build_def_map, build_def_map_on};
+use crate::def::{DefMap, Signatures, build_def_map_on};
 use crate::ids::{DefId, InferVar, ParamIdx};
 use crate::ty::fold::occurs;
 use crate::ty::{Interner, Ty, TyKind};
@@ -59,6 +59,9 @@ pub struct Checker<'m> {
 	pub(crate) table: UnifyTable,
 	pub(crate) diags: Vec<Diagnostic>,
 	pub(crate) external_value_marshals: FxHashMap<Span, nymph_hir::hir::MarshalKind>,
+	pub(crate) runtime_roles: crate::environment::LocalCompilerRuntimeRoles,
+	pub(crate) stable_runtime_roles: crate::CompilerRuntimeRoles,
+	pub(crate) runtime_role_provenance: crate::environment::RuntimeRoleProvenance,
 
 	// ── Transient per-body state ─────────────────────────────────────────────
 	pub(crate) scopes: Vec<FxHashMap<EcoString, Binding>>,
@@ -220,9 +223,24 @@ pub enum EntryMode {
 /// mode) and [`check_module_entry`] (entry mode) — see [`EntryMode`].
 pub(crate) fn check_module_impl(module: &Module, entry: EntryMode) -> Checked {
 	let mut diags = Vec::new();
-	let defs = build_def_map(module, &mut diags);
+	let identity = crate::ModuleIdentity {
+		origin: crate::ModuleOrigin::Project("standalone".into()),
+		project: "standalone".into(),
+		path: "fixture".into(),
+	};
+	let headers = crate::declared_headers(identity.clone(), module);
+	let defs = build_def_map_on(module, Default::default(), &mut diags, Some(&headers));
 	let checker = Checker::new(module, defs, diags);
-	check_module_from_parts(entry, checker, 0, 0, 0, false, None, FxHashMap::default())
+	check_module_from_parts(
+		entry,
+		checker,
+		0,
+		0,
+		0,
+		false,
+		Some(&identity),
+		FxHashMap::default(),
+	)
 }
 
 fn check_module_from_parts(
@@ -237,6 +255,85 @@ fn check_module_from_parts(
 ) -> Checked {
 	checker.lower_signatures();
 	checker.collect_interfaces();
+	// Interface member identities are collected before protocol registration. The
+	// later call also assigns implementation/body identities and deliberately skips
+	// these already-exact facts.
+	if checker.runtime_role_provenance == crate::environment::RuntimeRoleProvenance::StandaloneFixture
+		&& let Some(identity) = module_identity
+	{
+		checker.assign_runtime_body_identities(identity);
+	}
+	// Standalone sema callers have no compiler ambient registry. Register their
+	// source-local protocol fixture once at this boundary so inference still consumes
+	// exact identities rather than rediscovering names at each use site.
+	if checker.runtime_role_provenance == crate::environment::RuntimeRoleProvenance::StandaloneFixture
+	{
+		let interface_role = |checker: &Checker<'_>, interface: &str, member: &str| {
+			let def = checker.defs.get(interface)?;
+			let interface = checker.defs.stable(def)?.clone();
+			let exact_member = checker
+				.interfaces
+				.get(&def)?
+				.runtime_members
+				.iter()
+				.find(|fact| fact.name == member)?
+				.definition
+				.clone()?;
+			Some(crate::InterfaceRuntimeRole {
+				member: exact_member,
+				interface,
+			})
+		};
+		checker.stable_runtime_roles.iterable = interface_role(&checker, "Iterable", "iter");
+		checker.stable_runtime_roles.iterator = interface_role(&checker, "Iterator", "next");
+		checker.runtime_roles.iterable =
+			checker
+				.stable_runtime_roles
+				.iterable
+				.as_ref()
+				.and_then(|role| {
+					Some((
+						checker.defs.by_stable(&role.interface)?,
+						role.member.clone(),
+					))
+				});
+		checker.runtime_roles.iterator =
+			checker
+				.stable_runtime_roles
+				.iterator
+				.as_ref()
+				.and_then(|role| {
+					Some((
+						checker.defs.by_stable(&role.interface)?,
+						role.member.clone(),
+					))
+				});
+		checker.runtime_roles.option = checker.defs.get("Option");
+		if let Some(option) = checker.runtime_roles.option
+			&& let Some(stable) = checker.defs.stable(option).cloned()
+			&& let Some(signature) = checker.sigs.enums.get(&option)
+			&& signature.generics.len() == 1
+			&& let Some(some) = signature
+				.variants
+				.iter()
+				.find(|variant| variant.name == "Some" && variant.fields.len() == 1)
+			&& let Some(none) = signature
+				.variants
+				.iter()
+				.find(|variant| variant.name == "None" && variant.fields.is_empty())
+			&& let (Some(some_id), Some(value_id), Some(none_id)) = (
+				some.target.clone(),
+				some.field_metadata[0].target.clone(),
+				none.target.clone(),
+			) {
+			checker.stable_runtime_roles.option = Some(crate::OptionRuntimeRole {
+				option: stable,
+				some: some_id,
+				some_value: value_id,
+				none: none_id,
+			});
+		}
+	}
 	// Inherent methods (struct/enum body `func`s, top-level inherent `impl Type {
 	// .. }`) must be collected before interface impls (below) so `finish_interface_impl`
 	// (iface.rs) can cross-check an interface-impl method against the owning type's
@@ -416,6 +513,7 @@ fn check_module_from_parts(
 				local_implementations: implementation_start..implementation_end,
 				local_inherent: inherent_start..inherent_end,
 				has_explicit_local_ranges,
+				compiler_runtime_roles: checker.stable_runtime_roles,
 			},
 			source_identities,
 		},
@@ -454,6 +552,31 @@ pub fn check_module_with_environment(
 	checker.interfaces = environment.imported.interfaces.clone();
 	checker.impls = environment.imported.implementations.clone();
 	checker.inherent = environment.imported.inherent.clone();
+	let map_interface = |role: &crate::InterfaceRuntimeRole| {
+		Some((
+			checker.defs.by_stable(&role.interface)?,
+			role.member.clone(),
+		))
+	};
+	checker.runtime_roles = crate::environment::LocalCompilerRuntimeRoles {
+		iterable: environment
+			.compiler_runtime_roles
+			.iterable
+			.as_ref()
+			.and_then(map_interface),
+		iterator: environment
+			.compiler_runtime_roles
+			.iterator
+			.as_ref()
+			.and_then(map_interface),
+		option: environment
+			.compiler_runtime_roles
+			.option
+			.as_ref()
+			.and_then(|role| checker.defs.by_stable(&role.option)),
+	};
+	checker.stable_runtime_roles = environment.compiler_runtime_roles.clone();
+	checker.runtime_role_provenance = environment.runtime_role_provenance;
 	let checked = check_module_from_parts(
 		mode,
 		checker,
@@ -667,6 +790,9 @@ impl<'m> Checker<'m> {
 			table: UnifyTable::new(),
 			diags,
 			external_value_marshals: FxHashMap::default(),
+			runtime_roles: Default::default(),
+			stable_runtime_roles: Default::default(),
+			runtime_role_provenance: crate::environment::RuntimeRoleProvenance::StandaloneFixture,
 			scopes: Vec::new(),
 			params: Vec::new(),
 			param_bounds: FxHashMap::default(),
@@ -1632,7 +1758,7 @@ mod tests {
 			path: "dependency.nym".into(),
 		};
 		let mut diagnostics = Vec::new();
-		let mut defs = build_def_map(&module, &mut diagnostics);
+		let mut defs = crate::def::build_def_map(&module, &mut diagnostics);
 		let alias = defs.define_imported("Remote".into(), DefKind::TypeAlias, dependency, None);
 		let mut checker = Checker::new(&module, defs, diagnostics);
 		let parameter = checker.interner.mk_param(ParamIdx(0));
@@ -1664,7 +1790,7 @@ mod tests {
 			path: "dependency.nym".into(),
 		};
 		let mut diagnostics = Vec::new();
-		let mut defs = build_def_map(&module, &mut diagnostics);
+		let mut defs = crate::def::build_def_map(&module, &mut diagnostics);
 		let namespace = defs.define_imported("Remote".into(), DefKind::Namespace, dependency, None);
 		let mut checker = Checker::new(&module, defs, diagnostics);
 		let int = checker.interner.int();

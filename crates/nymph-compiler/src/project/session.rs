@@ -373,6 +373,12 @@ impl CompilerSession {
 		))
 	}
 
+	#[must_use]
+	#[cfg(feature = "test-support")]
+	pub fn compiler_runtime_roles_for_test(&self) -> nymph_sema::CompilerRuntimeRoles {
+		(*queries::compiler_runtime_roles(&self.db, self.ambient_core_registry)).clone()
+	}
+
 	#[cfg(feature = "test-support")]
 	pub fn importable_std_module_environment_for_test(
 		&self,

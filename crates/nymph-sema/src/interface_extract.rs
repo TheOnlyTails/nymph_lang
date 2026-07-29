@@ -1374,6 +1374,7 @@ fn checker_snapshot(checker: &crate::check::Checker<'_>) -> Checked {
 				local_implementations: 0..0,
 				local_inherent: 0..0,
 				has_explicit_local_ranges: false,
+				compiler_runtime_roles: checker.stable_runtime_roles.clone(),
 			},
 			source_identities: Default::default(),
 		},

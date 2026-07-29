@@ -608,6 +608,46 @@ impl Checker<'_> {
 		None
 	}
 
+	/// Resolve one compiler protocol slot through precisely the requested bound.
+	/// Unlike ordinary source method lookup this never lets an earlier, same-named
+	/// bound capture protocol lowering.
+	pub(crate) fn resolve_param_exact_method(
+		&mut self,
+		param: ParamIdx,
+		interface: DefId,
+		member: &DefinitionId,
+		span: Span,
+	) -> Option<Ty> {
+		let param_ty = self.interner.mk_param(param);
+		let (_, bound_args) = self
+			.param_interface_bounds(param)
+			.into_iter()
+			.find(|(bound, _)| *bound == interface)?;
+		let iface = self.interfaces.get(&interface).cloned()?;
+		let method = iface
+			.methods
+			.values()
+			.find(|method| method.definition.as_ref() == Some(member))?
+			.clone();
+		let mut substitution: FxHashMap<ParamIdx, Ty> = FxHashMap::default();
+		for (index, generic) in iface.generics.iter().enumerate() {
+			let ty = bound_args
+				.iter()
+				.find(|(name, _)| name == generic)
+				.map(|(_, ty)| *ty)
+				.unwrap_or_else(|| self.fresh());
+			substitution.insert(ParamIdx(index as u32), ty);
+		}
+		let (parameters, ret) = self.instantiate_iface_method_signature(
+			&method,
+			substitution,
+			iface.generics.len(),
+			param_ty,
+			span,
+		);
+		parameters.is_empty().then_some(ret)
+	}
+
 	/// Reject overlapping impls of the same interface.
 	///
 	/// Two concrete (non-blanket) impls of one interface conflict when their headers can

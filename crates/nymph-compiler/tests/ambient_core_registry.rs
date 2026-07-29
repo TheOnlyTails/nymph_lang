@@ -159,6 +159,126 @@ fn ambient_list_iterator_uses_the_imported_iterator_next_identity() {
 }
 
 #[test]
+fn compiler_runtime_roles_are_the_exact_ambient_definition_ids() {
+	let session = CompilerSession::new();
+	let roles = session.compiler_runtime_roles_for_test();
+	for (module, interface_name, member_name, role) in [
+		("ops", "Display", "display", roles.display.as_ref().unwrap()),
+		("ops", "Debug", "debug", roles.debug.as_ref().unwrap()),
+		("iter", "Iterator", "next", roles.iterator.as_ref().unwrap()),
+		(
+			"iter/iterable",
+			"Iterable",
+			"iter",
+			roles.iterable.as_ref().unwrap(),
+		),
+	] {
+		let interface = session.ambient_core_module_interface(key(module)).unwrap();
+		let definition = interface
+			.exports
+			.iter()
+			.find(|definition| definition.name == interface_name)
+			.unwrap();
+		assert_eq!(role.interface, definition.id);
+		assert_eq!(
+			role.member,
+			definition
+				.members
+				.iter()
+				.find(|member| member.name == member_name)
+				.unwrap()
+				.id
+		);
+	}
+	let option = session
+		.ambient_core_module_interface(key("option"))
+		.unwrap();
+	let definition = option
+		.exports
+		.iter()
+		.find(|item| item.name == "Option")
+		.unwrap();
+	let role = roles.option.unwrap();
+	assert_eq!(role.option, definition.id);
+	let some = definition
+		.variants
+		.iter()
+		.find(|variant| variant.name == "Some")
+		.unwrap();
+	assert_eq!(role.some, some.id);
+	assert_eq!(role.some_value, some.fields[0].id);
+	assert_eq!(
+		role.none,
+		definition
+			.variants
+			.iter()
+			.find(|variant| variant.name == "None")
+			.unwrap()
+			.id
+	);
+}
+
+#[test]
+fn local_option_collision_cannot_replace_the_ambient_iteration_role() {
+	let mut session = CompilerSession::new();
+	let project = ProjectId::new("iteration-role-collision");
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"enum Option<T> { Bogus(value: T) }
+		 func consume<T: Iterator<Item = int>>(items: mut T): void = {
+		   for (_item in items) {}
+		 }"
+		.into(),
+		SourceVersion(1),
+	);
+	let diagnostics = session
+		.module_diagnostics(project, main.clone(), main, nymph_sema::EntryMode::Library)
+		.expect("module diagnostics");
+	assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn same_named_method_on_an_earlier_bound_cannot_replace_iterator_next() {
+	let mut session = CompilerSession::new();
+	let project = ProjectId::new("iteration-member-role-collision");
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"interface Pretender { mut func next(): Option<string> }
+		 func consume<T: Pretender + Iterator<Item = int>>(items: mut T): int = {
+		   let mut result = 0
+		   for (item in items) { result = item }
+		   result
+		 }"
+		.into(),
+		SourceVersion(1),
+	);
+	let diagnostics = session
+		.module_diagnostics(project, main.clone(), main, nymph_sema::EntryMode::Library)
+		.expect("module diagnostics");
+	assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+#[test]
+fn malformed_ambient_role_is_explicitly_unavailable() {
+	let mut session = CompilerSession::new();
+	let source = session.ambient_core_source_for_test(key("option")).unwrap();
+	let edited = source.replacen("enum Option", "enum Maybe", 1);
+	assert_ne!(
+		source, edited,
+		"fixture must remove the registered declaration"
+	);
+	session.set_ambient_core_source_for_test(key("option"), edited);
+	assert!(
+		session.compiler_runtime_roles_for_test().option.is_none(),
+		"missing Option must remain unavailable rather than becoming a fabricated ID"
+	);
+}
+
+#[test]
 fn core_ids_are_collision_free_deterministic_and_survive_rebuild() {
 	let first = CompilerSession::new();
 	let expected = first
@@ -262,12 +382,18 @@ fn ambient_body_edit_invalidates_producers_but_backdates_equal_owner_descriptors
 		move |event| sink.lock().unwrap().push(event.to_string()),
 		256,
 	);
+	let before_roles = session.compiler_runtime_roles_for_test();
 	let before = session.builtin_runtime_owner_artifacts();
 	events.lock().unwrap().clear();
 	let source = session.ambient_core_source_for_test(key("option")).unwrap();
 	let edited = source.replacen("None -> false", "None -> !true", 1);
 	assert_ne!(source, edited, "fixture must perform a body-only edit");
 	session.set_ambient_core_source_for_test(key("option"), edited);
+	assert_eq!(
+		before_roles,
+		session.compiler_runtime_roles_for_test(),
+		"a body-only edit must preserve the exact role inventory"
+	);
 	let after = session.builtin_runtime_owner_artifacts();
 	assert_eq!(before, after);
 	let events = events.lock().unwrap();

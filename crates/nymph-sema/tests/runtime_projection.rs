@@ -23,22 +23,12 @@ fn project(source: &str) -> Vec<nymph_sema::RuntimeDefinition> {
 	assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
 	let module = std::sync::Arc::new(parsed.tree);
 	let identity = ModuleIdentity {
-		origin: ModuleOrigin::Project("annotations".into()),
-		project: "annotations".into(),
-		path: "main".into(),
+		origin: ModuleOrigin::Project("standalone".into()),
+		project: "standalone".into(),
+		path: "fixture".into(),
 	};
-	let environment = SemanticEnvironment::from_modules(identity.clone(), &[]).unwrap();
-	let result = check_module_with_environment(
-		module.clone(),
-		identity.clone(),
-		&environment,
-		EntryMode::Library,
-	);
-	assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
-	let checked = nymph_sema::Checked {
-		diags: Vec::new(),
-		facts: result.analysis.checked.as_ref().clone(),
-	};
+	let checked = nymph_sema::check_module(&module);
+	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
 	let headers = declared_headers(identity.clone(), &module);
 	let interface = extract_module_interface(identity, &module, &checked, &headers).unwrap();
 	runtime_definitions(&module, &checked.facts, &interface).unwrap()

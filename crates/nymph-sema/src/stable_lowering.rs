@@ -2930,14 +2930,25 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						channel: "spread iteration".into(),
 					})?;
 				let source = self.lower(value)?;
-				let (it, next) = match iteration {
-					crate::RuntimeIteration::Direct { next, .. } => (source, next),
-					crate::RuntimeIteration::ViaIter { iter, next, .. } => {
-						(self.lower_dispatch_value(iter, source)?, next)
-					}
+				let (it, next, option) = match iteration {
+					crate::RuntimeIteration::Direct { next, option, .. } => (source, next, option),
+					crate::RuntimeIteration::ViaIter {
+						iter, next, option, ..
+					} => (self.lower_dispatch_value(iter, source)?, next, option),
 				};
 				let next = self.context.member_name(next)?.as_str().into();
-				Ok(drain_spread(it, next))
+				Ok(drain_spread(
+					it,
+					next,
+					self.context.binding_name(&option.option)?.as_str().into(),
+					self.context.member_name(&option.some)?.as_str().into(),
+					self
+						.context
+						.member_name(&option.some_value)?
+						.as_str()
+						.into(),
+					self.context.member_name(&option.none)?.as_str().into(),
+				))
 			}
 		}
 	}
@@ -3330,7 +3341,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			}),
 			args: vec![],
 		};
-		let option_name: EcoString = self.context.binding_name(option)?.as_str().into();
+		let option_name: EcoString = self.context.binding_name(&option.option)?.as_str().into();
+		let some_name: EcoString = self.context.member_name(&option.some)?.as_str().into();
+		let value_name: EcoString = self
+			.context
+			.member_name(&option.some_value)?
+			.as_str()
+			.into();
+		let none_name: EcoString = self.context.member_name(&option.none)?.as_str().into();
 		Ok(HirExpr::Block {
 			stmts: vec![
 				HirStmt::Let {
@@ -3351,8 +3369,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							HirArm {
 								pat: HirPat::Variant {
 									enum_name: option_name.clone(),
-									variant: "Some".into(),
-									fields: vec![("value".into(), pat)],
+									variant: some_name,
+									fields: vec![(value_name, pat)],
 								},
 								guard: None,
 								body,
@@ -3360,7 +3378,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							HirArm {
 								pat: HirPat::Variant {
 									enum_name: option_name,
-									variant: "None".into(),
+									variant: none_name,
 									fields: vec![],
 								},
 								guard: None,
@@ -3718,7 +3736,14 @@ fn assign_binop(op: AssignOperator) -> Option<BinaryOperator> {
 	})
 }
 
-fn drain_spread(iterator: HirExpr, next: EcoString) -> HirExpr {
+fn drain_spread(
+	iterator: HirExpr,
+	next: EcoString,
+	option: EcoString,
+	some_name: EcoString,
+	value_name: EcoString,
+	none_name: EcoString,
+) -> HirExpr {
 	let acc: EcoString = "$acc".into();
 	let it: EcoString = "$it".into();
 	let go: EcoString = "$go".into();
@@ -3732,10 +3757,10 @@ fn drain_spread(iterator: HirExpr, next: EcoString) -> HirExpr {
 	};
 	let some = HirArm {
 		pat: HirPat::Variant {
-			enum_name: "Option".into(),
-			variant: "Some".into(),
+			enum_name: option.clone(),
+			variant: some_name,
 			fields: vec![(
-				"value".into(),
+				value_name,
 				HirPat::Binding {
 					name: value.clone(),
 					sub: None,
@@ -3753,8 +3778,8 @@ fn drain_spread(iterator: HirExpr, next: EcoString) -> HirExpr {
 	};
 	let none = HirArm {
 		pat: HirPat::Variant {
-			enum_name: "Option".into(),
-			variant: "None".into(),
+			enum_name: option,
+			variant: none_name,
 			fields: vec![],
 		},
 		guard: None,

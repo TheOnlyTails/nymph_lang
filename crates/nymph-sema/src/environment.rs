@@ -25,6 +25,48 @@ use crate::{
 	RecoveredInterfaceType, Signatures, VariantShape, instantiate_interface_type,
 };
 
+/// Exact stable identities assigned by the compiler to declarations with runtime
+/// protocol meaning. `None` is an explicit unavailable fact; semantic recovery must
+/// not replace it with a same-named declaration.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct CompilerRuntimeRoles {
+	pub display: Option<InterfaceRuntimeRole>,
+	pub debug: Option<InterfaceRuntimeRole>,
+	pub iterable: Option<InterfaceRuntimeRole>,
+	pub iterator: Option<InterfaceRuntimeRole>,
+	pub option: Option<OptionRuntimeRole>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceRuntimeRole {
+	pub interface: DefinitionId,
+	pub member: DefinitionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct OptionRuntimeRole {
+	pub option: DefinitionId,
+	pub some: DefinitionId,
+	pub some_value: DefinitionId,
+	pub none: DefinitionId,
+}
+
+/// Records why protocol roles are present or absent. In particular, an explicitly
+/// empty compiler inventory must not be mistaken for the standalone compatibility
+/// fixture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeRoleProvenance {
+	StandaloneFixture,
+	CompilerSupplied,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(crate) struct LocalCompilerRuntimeRoles {
+	pub iterable: Option<(DefId, DefinitionId)>,
+	pub iterator: Option<(DefId, DefinitionId)>,
+	pub option: Option<DefId>,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ImportedFacts {
 	pub defs: DefMap,
@@ -65,6 +107,8 @@ pub struct SemanticEnvironment {
 	pub module_exports: FxHashMap<ModuleIdentity, ModuleExportIndex>,
 	pub resolved_imports: FxHashMap<EcoString, ResolvedImportBinding>,
 	pub contains_recovery: bool,
+	pub compiler_runtime_roles: CompilerRuntimeRoles,
+	pub(crate) runtime_role_provenance: RuntimeRoleProvenance,
 }
 
 impl SemanticEnvironment {
@@ -80,6 +124,17 @@ impl SemanticEnvironment {
 	pub fn from_modules(
 		current: ModuleIdentity,
 		modules: &[Arc<ModuleEnvironment>],
+	) -> Result<Self, EnvironmentConstructionError> {
+		let mut environment =
+			Self::from_modules_with_runtime_roles(current, modules, CompilerRuntimeRoles::default())?;
+		environment.runtime_role_provenance = RuntimeRoleProvenance::StandaloneFixture;
+		Ok(environment)
+	}
+
+	pub fn from_modules_with_runtime_roles(
+		current: ModuleIdentity,
+		modules: &[Arc<ModuleEnvironment>],
+		compiler_runtime_roles: CompilerRuntimeRoles,
 	) -> Result<Self, EnvironmentConstructionError> {
 		let mut imported = ImportedFacts::default();
 		let mut module_exports: FxHashMap<ModuleIdentity, ModuleExportIndex> = FxHashMap::default();
@@ -175,6 +230,8 @@ impl SemanticEnvironment {
 			module_exports,
 			resolved_imports: FxHashMap::default(),
 			contains_recovery,
+			compiler_runtime_roles,
+			runtime_role_provenance: RuntimeRoleProvenance::CompilerSupplied,
 		})
 	}
 

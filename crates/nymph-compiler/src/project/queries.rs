@@ -87,6 +87,210 @@ impl<'db> RuntimeManifest<'db> {
 	}
 }
 
+#[salsa::tracked(returns(clone))]
+fn ambient_runtime_role_inventory(
+	db: &dyn Db,
+	module: BuiltinModuleInput,
+) -> Arc<nymph_sema::CompilerRuntimeRoles> {
+	use nymph_ast::decl::{Declaration, InterfaceElement, InterfaceMember};
+	use nymph_ast::ty::{GenericArg, Type};
+	use nymph_sema::{DeclarationCategory as Category, DeclarationKey, DefinitionId};
+	let parsed = parse_builtin(db, module);
+	if !parsed.diagnostics.is_empty() {
+		return Arc::new(Default::default());
+	}
+	let identity = ambient_identity(db, module);
+	let headers = nymph_sema::declared_headers(identity.clone(), &parsed.tree);
+	let exact_top = |name: &str, expected: Category| {
+		let mut matches = headers
+			.definitions
+			.iter()
+			.filter(|(candidate, _)| candidate == name);
+		let result = matches.next()?.1.clone();
+		(matches.next().is_none()
+			&& matches!(
+				result.key,
+				DeclarationKey::TopLevel { category, .. } if category == expected
+			))
+		.then_some(result)
+	};
+	let references_generic = |ty: &Type, target: &str, generic: &str| {
+		let Type::Reference { name, generics } = ty else {
+			return false;
+		};
+		name.0 == target
+			&& matches!(
+				generics.as_slice(),
+				[argument]
+					if argument.0.name.is_none()
+						&& matches!(
+							&argument.0,
+							GenericArg { value, .. }
+								if matches!(&value.0, Type::Reference { name, generics } if name.0 == generic && generics.is_empty())
+						)
+			)
+	};
+	let interface = |name: &str, member_name: &str| {
+		let owner = exact_top(name, Category::Interface)?;
+		let mut declarations = parsed
+			.tree
+			.members
+			.iter()
+			.filter_map(|declaration| match declaration {
+				Declaration::Interface {
+					name: candidate,
+					generics,
+					members,
+					..
+				} if candidate.0 == name => Some((generics, members)),
+				_ => None,
+			});
+		let (generics, members) = declarations.next()?;
+		if declarations.next().is_some() {
+			return None;
+		}
+		let mut methods = members.iter().filter_map(|member| {
+			let InterfaceMember::Element(element) = &member.0 else {
+				return None;
+			};
+			let InterfaceElement::Func { meta, .. } = &element.0 else {
+				return None;
+			};
+			(meta.name.0 == member_name).then_some(meta)
+		});
+		let method = methods.next()?;
+		if methods.next().is_some() {
+			return None;
+		}
+		let valid_shape = method.params.is_empty()
+			&& match name {
+				"Display" | "Debug" => {
+					generics.is_empty()
+						&& matches!(
+							method.return_type.as_ref().map(|ty| &ty.0),
+							Some(Type::String)
+						)
+				}
+				"Iterator" => {
+					matches!(generics.as_slice(), [generic] if generic.0.name.0 == "Item")
+						&& method
+							.return_type
+							.as_ref()
+							.is_some_and(|ty| references_generic(&ty.0, "Option", &generics[0].0.name.0))
+				}
+				"Iterable" => {
+					matches!(generics.as_slice(), [generic] if generic.0.name.0 == "T")
+						&& method
+							.return_type
+							.as_ref()
+							.is_some_and(|ty| references_generic(&ty.0, "Iterator", &generics[0].0.name.0))
+				}
+				_ => false,
+			};
+		if !valid_shape {
+			return None;
+		}
+		Some(nymph_sema::InterfaceRuntimeRole {
+			interface: owner.clone(),
+			member: DefinitionId::new(
+				identity.clone(),
+				DeclarationKey::member(owner, Category::Method, member_name),
+			),
+		})
+	};
+	let option = (|| {
+		let owner = exact_top("Option", Category::Enum)?;
+		let mut enums = parsed
+			.tree
+			.members
+			.iter()
+			.filter_map(|declaration| match declaration {
+				Declaration::Enum {
+					name,
+					generics,
+					variants,
+					..
+				} if name.0 == "Option" => Some((generics, variants)),
+				_ => None,
+			});
+		let (generics, variants) = enums.next()?;
+		if enums.next().is_some() {
+			return None;
+		}
+		let [generic] = generics.as_slice() else {
+			return None;
+		};
+		let mut some = variants.iter().filter(|variant| variant.0.name.0 == "Some");
+		let some_shape = some.next()?;
+		if some.next().is_some()
+			|| some_shape.0.fields.len() != 1
+			|| some_shape.0.fields[0].0.name.0 != "value"
+			|| !matches!(
+				&some_shape.0.fields[0].0.type_.0,
+				Type::Reference { name, generics }
+					if name.0 == generic.0.name.0 && generics.is_empty()
+			) {
+			return None;
+		}
+		let mut none = variants.iter().filter(|variant| variant.0.name.0 == "None");
+		let none_shape = none.next()?;
+		if none.next().is_some() || !none_shape.0.fields.is_empty() {
+			return None;
+		}
+		let some = DefinitionId::new(
+			identity.clone(),
+			DeclarationKey::member(owner.clone(), Category::Variant, "Some"),
+		);
+		Some(nymph_sema::OptionRuntimeRole {
+			option: owner.clone(),
+			some_value: DefinitionId::new(
+				identity.clone(),
+				DeclarationKey::member(some.clone(), Category::Field, "value"),
+			),
+			some,
+			none: DefinitionId::new(
+				identity.clone(),
+				DeclarationKey::member(owner, Category::Variant, "None"),
+			),
+		})
+	})();
+	Arc::new(nymph_sema::CompilerRuntimeRoles {
+		display: interface("Display", "display"),
+		debug: interface("Debug", "debug"),
+		iterable: interface("Iterable", "iter"),
+		iterator: interface("Iterator", "next"),
+		option,
+	})
+}
+
+#[salsa::tracked(returns(clone))]
+pub(crate) fn compiler_runtime_roles(
+	db: &dyn Db,
+	registry: AmbientCoreRegistryInput,
+) -> Arc<nymph_sema::CompilerRuntimeRoles> {
+	let module = |path: &str| {
+		registry
+			.modules(db)
+			.iter()
+			.copied()
+			.find(|module| module.key(db).path.as_ref() == path)
+	};
+	let interface =
+		|path: &str,
+		 select: fn(&nymph_sema::CompilerRuntimeRoles) -> &Option<nymph_sema::InterfaceRuntimeRole>| {
+			select(&ambient_runtime_role_inventory(db, module(path)?)).clone()
+		};
+	let option =
+		module("option").and_then(|module| ambient_runtime_role_inventory(db, module).option.clone());
+	Arc::new(nymph_sema::CompilerRuntimeRoles {
+		display: interface("ops", |roles| &roles.display),
+		debug: interface("ops", |roles| &roles.debug),
+		iterable: interface("iter/iterable", |roles| &roles.iterable),
+		iterator: interface("iter", |roles| &roles.iterator),
+		option,
+	})
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParsedModule {
 	pub tree: Module,
@@ -588,9 +792,12 @@ pub(crate) fn ambient_core_analysis(
 	let parsed = parse_builtin(db, module);
 	let semantic_module = Arc::new(parsed.tree.clone());
 	let result = if graph.diagnostics.is_empty() {
-		let mut environment =
-			nymph_sema::SemanticEnvironment::from_modules(ambient_identity(db, module), &dependencies)
-				.expect("ambient dependency interfaces have deterministic identities");
+		let mut environment = nymph_sema::SemanticEnvironment::from_modules_with_runtime_roles(
+			ambient_identity(db, module),
+			&dependencies,
+			(*compiler_runtime_roles(db, registry)).clone(),
+		)
+		.expect("ambient dependency interfaces have deterministic identities");
 		let mut bindings = FxHashMap::default();
 		for import in ambient_core_direct_imports(db, module).iter() {
 			let Ok(target) = &import.target else { continue };
@@ -628,9 +835,12 @@ pub(crate) fn ambient_core_analysis(
 			nymph_sema::EntryMode::Library,
 		)
 	} else {
-		let environment =
-			nymph_sema::SemanticEnvironment::from_modules(ambient_identity(db, module), &[])
-				.expect("empty environment is valid");
+		let environment = nymph_sema::SemanticEnvironment::from_modules_with_runtime_roles(
+			ambient_identity(db, module),
+			&[],
+			(*compiler_runtime_roles(db, registry)).clone(),
+		)
+		.expect("empty environment is valid");
 		let mut result = nymph_sema::check_module_with_environment(
 			semantic_module.clone(),
 			ambient_identity(db, module),
@@ -1259,10 +1469,37 @@ pub(crate) fn member_name<'db>(
 	key: ProjectKey<'db>,
 	definition: nymph_sema::DefinitionId,
 ) -> Result<nymph_sema::EmittedMemberName, nymph_sema::StableNameLookupError> {
-	let protocol_slots = nominal_protocol_member_slots(db, key);
+	let protocol_slots = compiler_runtime_roles(db, key.ambient_core_registry(db));
 	let selected_interface_member = match &definition.key {
+		nymph_sema::DeclarationKey::MaterializedInterfaceMember {
+			implementation,
+			interface_member,
+		} => match stable_shape(
+			db,
+			key,
+			nymph_sema::StableShapeRequest::Implementation((**implementation).clone()),
+		) {
+			Ok(nymph_sema::StableShapeFact::Implementation(shape))
+				if shape
+					.member_slots
+					.target(interface_member)
+					.is_some_and(|slot| {
+						slot.member_id == definition
+							&& slot.source == nymph_sema::ImplementationMemberSource::InheritedDefault
+							&& slot.implementation_id == **implementation
+							&& slot.placement_owner == **implementation
+					}) =>
+			{
+				Some((**interface_member).clone())
+			}
+			_ => return Err(nymph_sema::StableNameLookupError::MissingMember { definition }),
+		},
 		nymph_sema::DeclarationKey::Member { owner, .. }
-			if matches!(owner.key, nymph_sema::DeclarationKey::Implementation { .. }) =>
+			if matches!(
+				owner.key,
+				nymph_sema::DeclarationKey::Implementation { ref header, .. }
+					if header.interface.is_some()
+			) =>
 		{
 			match stable_shape(
 				db,
@@ -1279,52 +1516,27 @@ pub(crate) fn member_name<'db>(
 		}
 		_ => Some(definition.clone()),
 	};
-	if selected_interface_member.as_ref() == protocol_slots.display.as_ref() {
-		return Ok(nymph_sema::EmittedMemberName::new("$nymph$display"));
-	}
-	if selected_interface_member.as_ref() == protocol_slots.debug.as_ref() {
-		return Ok(nymph_sema::EmittedMemberName::new("$nymph$debug"));
-	}
-	declaration_name(&definition)
-		.map(nymph_sema::EmittedMemberName::new)
-		.ok_or(nymph_sema::StableNameLookupError::MissingMember { definition })
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct NominalProtocolMemberSlots {
-	display: Option<nymph_sema::DefinitionId>,
-	debug: Option<nymph_sema::DefinitionId>,
-}
-
-#[salsa::tracked(returns(clone))]
-fn nominal_protocol_member_slots(
-	db: &dyn Db,
-	key: ProjectKey<'_>,
-) -> Arc<NominalProtocolMemberSlots> {
-	let mut slots = NominalProtocolMemberSlots::default();
-	for module in key.ambient_core_registry(db).modules(db).iter().copied() {
-		let nymph_sema::ModuleEnvironment::Complete(interface) =
-			&*ambient_core_environment(db, key.ambient_core_registry(db), module)
-		else {
-			continue;
-		};
-		for definition in &interface.exports {
-			if definition.kind != nymph_sema::DefinitionShapeKind::Interface {
-				continue;
-			}
-			let target = match definition.name.as_str() {
-				"Display" => (&mut slots.display, "display"),
-				"Debug" => (&mut slots.debug, "debug"),
-				_ => continue,
-			};
-			*target.0 = definition
-				.members
-				.iter()
-				.find(|member| member.name == target.1)
-				.map(|member| member.id.clone());
+	if let Some(selected) = selected_interface_member.as_ref() {
+		if protocol_slots
+			.display
+			.as_ref()
+			.is_some_and(|role| selected == &role.member)
+		{
+			return Ok(nymph_sema::EmittedMemberName::new("$nymph$display"));
+		}
+		if protocol_slots
+			.debug
+			.as_ref()
+			.is_some_and(|role| selected == &role.member)
+		{
+			return Ok(nymph_sema::EmittedMemberName::new("$nymph$debug"));
 		}
 	}
-	Arc::new(slots)
+	selected_interface_member
+		.as_ref()
+		.and_then(declaration_name)
+		.map(nymph_sema::EmittedMemberName::new)
+		.ok_or(nymph_sema::StableNameLookupError::MissingMember { definition })
 }
 
 #[salsa::tracked(returns(clone))]
@@ -1755,8 +1967,12 @@ pub(crate) fn interface_module_analysis<'db>(
 	}
 	roots.extend(dependencies);
 	let parsed = module.parsed(db);
-	let mut environment = nymph_sema::SemanticEnvironment::from_modules(module.identity(db), &roots)
-		.expect("validated interfaces form a deterministic semantic environment");
+	let mut environment = nymph_sema::SemanticEnvironment::from_modules_with_runtime_roles(
+		module.identity(db),
+		&roots,
+		(*compiler_runtime_roles(db, key.ambient_core_registry(db))).clone(),
+	)
+	.expect("validated interfaces form a deterministic semantic environment");
 	environment.set_diagnostic_module_tags(&graph.semantic_module_tags(db));
 	let mut bindings = FxHashMap::default();
 	if key.ambient_prelude(db) {
