@@ -275,9 +275,18 @@ pub(crate) fn emitted_interface_project<'db>(
 			if fragment.definition == compiler_option {
 				option_definition = Some(fragment.definition.clone());
 			}
-			virtual_fragments
-				.entry(fragment.definition.clone())
-				.or_insert_with(|| fragment.clone());
+			if let Err(conflict) =
+				super::assembly::insert_exact_virtual_fragment(&mut virtual_fragments, fragment.clone())
+			{
+				return StableEmissionResult::Diagnostics(internal_diagnostic(
+					&module.display_key(db),
+					"STABLE-VIRTUAL-FRAGMENT-CONFLICT",
+					format!(
+						"conflicting virtual runtime fragments share exact definition ID `{:?}`",
+						conflict.definition
+					),
+				));
+			}
 		}
 		match emitted_interface_module(db, key, module) {
 			StableEmissionResult::Value(source) => {
@@ -395,87 +404,25 @@ fn emit_virtual_runtime_module(
 	fragments: &[nymph_sema::VirtualRuntimeFragment],
 	module_bindings: &FxHashSet<nymph_sema::DefinitionId>,
 ) -> Result<String, String> {
-	let mut hir = nymph_hir::hir::HirModule {
-		lets: vec![],
-		funcs: vec![],
-		classes: vec![],
-		enums: vec![],
-	};
-	let mut shells = FxHashMap::default();
-	for fragment in fragments {
-		match fragment.fragment.fragment() {
-			nymph_sema::LoweredHirFragment::StructShell(value) => {
-				shells.insert(fragment.definition.clone(), (true, hir.classes.len()));
-				hir.classes.push(value.clone());
-			}
-			nymph_sema::LoweredHirFragment::EnumShell(value) => {
-				shells.insert(fragment.definition.clone(), (false, hir.enums.len()));
-				hir.enums.push(value.clone());
-			}
-			_ => {}
-		}
-	}
-	for fragment in fragments {
-		use nymph_sema::LoweredHirFragment as Fragment;
-		match fragment.fragment.fragment() {
-			Fragment::TopLevelFunction(value) => hir.funcs.push(value.clone()),
-			Fragment::TopLevelValue(value) => hir.lets.push(value.clone()),
-			Fragment::AttachedInstance { owner, method }
-			| Fragment::AttachedMember { owner, method }
-			| Fragment::MaterializedDefault { owner, method, .. } => {
-				let nymph_sema::RuntimeAssemblyPlacement::Shell(shell_owner) =
-					fragment.fragment.placement()
-				else {
-					return Err(format!(
-						"non-shell attachment placement for {:?}",
-						fragment.definition
-					));
-				};
-				let Some((class, index)) = shells.get(&shell_owner).copied() else {
-					return Err(format!(
-						"missing exact owner shell for {owner:?}; available: {:?}",
-						shells.keys()
-					));
-				};
-				if class {
-					hir.classes[index].methods.push(method.clone());
-				} else {
-					hir.enums[index].methods.push(method.clone());
-				}
-			}
-			Fragment::AttachedStatic { owner, method } => {
-				let nymph_sema::RuntimeAssemblyPlacement::Shell(shell_owner) =
-					fragment.fragment.placement()
-				else {
-					return Err(format!(
-						"non-shell attachment placement for {:?}",
-						fragment.definition
-					));
-				};
-				let Some((class, index)) = shells.get(shell_owner).copied() else {
-					return Err(format!("missing exact owner shell for {owner:?}"));
-				};
-				if class {
-					hir.classes[index].statics.push(method.clone());
-				} else {
-					hir.enums[index].statics.push(method.clone());
-				}
-			}
-			Fragment::TopLevelExternal { .. } | Fragment::StructShell(_) | Fragment::EnumShell(_) => {}
-		}
-	}
+	let hir = super::assembly::assemble_runtime_module(
+		owner,
+		fragments
+			.iter()
+			.map(|fragment| (fragment.definition.clone(), &fragment.fragment)),
+	)
+	.map_err(|error| format!("runtime assembly failed: {error:?}"))?;
 	let current_module = module_specifier(owner);
 	let mut runtime_imports = fragments
 		.iter()
 		.flat_map(|fragment| fragment.fragment.direct_demands().iter())
 		.filter(|demand| demand.module != *owner)
 		.filter(|demand| module_bindings.contains(*demand))
-		.filter_map(|demand| {
+		.map(|demand| {
 			queries::binding_name(db, key, demand.clone())
-				.ok()
 				.map(|name| (module_specifier(&demand.module), name.as_str().to_string()))
+				.map_err(|error| format!("runtime import name lookup failed: {error:?}"))
 		})
-		.collect::<Vec<_>>();
+		.collect::<Result<Vec<_>, _>>()?;
 	runtime_imports.sort_unstable();
 	runtime_imports.dedup();
 	let runtime_imports = runtime_imports
@@ -497,18 +444,21 @@ fn emit_virtual_runtime_module(
 	);
 	let mut exports = fragments
 		.iter()
-		.filter_map(|fragment| match fragment.fragment.fragment() {
+		.map(|fragment| match fragment.fragment.fragment() {
 			nymph_sema::LoweredHirFragment::TopLevelFunction(_)
 			| nymph_sema::LoweredHirFragment::TopLevelValue(_)
 			| nymph_sema::LoweredHirFragment::TopLevelExternal { .. }
 			| nymph_sema::LoweredHirFragment::StructShell(_)
 			| nymph_sema::LoweredHirFragment::EnumShell(_) => {
 				queries::binding_name(db, key, fragment.definition.clone())
-					.ok()
-					.map(|name| name.as_str().to_string())
+					.map(|name| Some(name.as_str().to_string()))
+					.map_err(|error| format!("runtime export name lookup failed: {error:?}"))
 			}
-			_ => None,
+			_ => Ok(None),
 		})
+		.collect::<Result<Vec<_>, String>>()?
+		.into_iter()
+		.flatten()
 		.collect::<Vec<_>>();
 	exports.sort_unstable();
 	exports.dedup();

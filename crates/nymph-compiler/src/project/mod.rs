@@ -4,6 +4,7 @@
 //! loaders, populate a [`CompilerSession`], and delegate checking, lowering,
 //! emission, and inspection to the canonical query pipeline.
 
+mod assembly;
 mod bundle;
 mod emission;
 mod metrics;

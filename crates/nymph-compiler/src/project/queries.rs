@@ -1760,17 +1760,14 @@ pub(crate) fn lower_interface_module<'db>(
 		lowered.push(fragment.as_ref().clone());
 	}
 
-	let mut hir = nymph_hir::hir::HirModule {
-		lets: vec![],
-		funcs: vec![],
-		classes: vec![],
-		enums: vec![],
-	};
-	let mut shell_indices = std::collections::HashMap::new();
+	let target = module.identity(db);
+	for fragment in &lowered {
+		super::assembly::validate_fragment_intrinsic(fragment).map_err(map_runtime_assembly_error)?;
+	}
 	for fragment in &lowered {
 		if own.contains(fragment.definition())
 			&& let nymph_sema::RuntimeAssemblyPlacement::Shell(owner) = fragment.placement()
-			&& owner.module != module.identity(db)
+			&& owner.module != target
 			&& !matches!(owner.module.origin, nymph_sema::ModuleOrigin::Compiler)
 		{
 			return Err(nymph_sema::StableModuleAssemblyError::MismatchedPlacement {
@@ -1778,67 +1775,19 @@ pub(crate) fn lower_interface_module<'db>(
 				owner: owner.clone(),
 			});
 		}
-		if fragment.placement() != &nymph_sema::RuntimeAssemblyPlacement::Module(module.identity(db)) {
-			continue;
-		}
-		match fragment.fragment() {
-			nymph_sema::LoweredHirFragment::StructShell(class) => {
-				shell_indices.insert(fragment.definition().clone(), (true, hir.classes.len()));
-				hir.classes.push(class.clone());
-			}
-			nymph_sema::LoweredHirFragment::EnumShell(enum_) => {
-				shell_indices.insert(fragment.definition().clone(), (false, hir.enums.len()));
-				hir.enums.push(enum_.clone());
-			}
-			_ => {}
-		}
 	}
-	let mut attachments = std::collections::HashSet::new();
-	for fragment in &lowered {
-		let placement_module = match fragment.placement() {
-			nymph_sema::RuntimeAssemblyPlacement::Module(owner) => owner,
-			nymph_sema::RuntimeAssemblyPlacement::Shell(owner) => &owner.module,
-			nymph_sema::RuntimeAssemblyPlacement::Template => {
-				return Err(nymph_sema::StableModuleAssemblyError::MismatchedPlacement {
-					definition: fragment.definition().clone(),
-					owner: fragment.definition().clone(),
-				});
-			}
-		};
-		if placement_module != &module.identity(db) {
-			continue;
-		}
-		use nymph_sema::LoweredHirFragment as Fragment;
-		match fragment.fragment() {
-			Fragment::TopLevelFunction(func) => hir.funcs.push(func.clone()),
-			Fragment::TopLevelValue(value) => hir.lets.push(value.clone()),
-			Fragment::AttachedInstance { method, .. }
-			| Fragment::AttachedMember { method, .. }
-			| Fragment::MaterializedDefault { method, .. } => {
-				attach_method(
-					&mut hir,
-					&shell_indices,
-					&mut attachments,
-					fragment.definition(),
-					fragment.placement(),
-					method,
-					false,
-				)?;
-			}
-			Fragment::AttachedStatic { method, .. } => {
-				attach_method(
-					&mut hir,
-					&shell_indices,
-					&mut attachments,
-					fragment.definition(),
-					fragment.placement(),
-					method,
-					true,
-				)?;
-			}
-			Fragment::TopLevelExternal { .. } | Fragment::StructShell(_) | Fragment::EnumShell(_) => {}
-		}
-	}
+	let local_fragments = lowered
+		.iter()
+		.filter(|fragment| match fragment.placement() {
+			nymph_sema::RuntimeAssemblyPlacement::Module(owner) => owner == &target,
+			nymph_sema::RuntimeAssemblyPlacement::Shell(owner) => owner.module == target,
+			nymph_sema::RuntimeAssemblyPlacement::Template => true,
+		});
+	let hir = super::assembly::assemble_runtime_module(
+		&target,
+		local_fragments.map(|fragment| (fragment.definition().clone(), fragment)),
+	)
+	.map_err(map_runtime_assembly_error)?;
 	let imports = lowered
 		.iter()
 		.filter(|item| {
@@ -1876,50 +1825,44 @@ pub(crate) fn lower_interface_module<'db>(
 	}))
 }
 
-fn attach_method(
-	hir: &mut nymph_hir::hir::HirModule,
-	shells: &std::collections::HashMap<nymph_sema::DefinitionId, (bool, usize)>,
-	seen: &mut std::collections::HashSet<(nymph_sema::DefinitionId, ecow::EcoString, bool)>,
-	definition: &nymph_sema::DefinitionId,
-	placement: &nymph_sema::RuntimeAssemblyPlacement,
-	method: &nymph_hir::hir::HirMethod,
-	static_: bool,
-) -> Result<(), nymph_sema::StableModuleAssemblyError> {
-	let nymph_sema::RuntimeAssemblyPlacement::Shell(owner) = placement else {
-		return Err(nymph_sema::StableModuleAssemblyError::MismatchedPlacement {
-			definition: definition.clone(),
-			owner: definition.clone(),
-		});
-	};
-	let shell = shells
-		.get(owner)
-		.copied()
-		.map(|shell| (owner.clone(), shell))
-		.ok_or_else(
-			|| nymph_sema::StableModuleAssemblyError::MissingOwnerShell {
-				owner: owner.clone(),
-			},
-		)?;
-	if !seen.insert((shell.0.clone(), method.name.clone(), static_)) {
-		return Err(nymph_sema::StableModuleAssemblyError::DuplicateAttachment {
-			owner: shell.0,
-			name: method.name.clone(),
-		});
-	}
-	let list = if shell.1.0 {
-		if static_ {
-			&mut hir.classes[shell.1.1].statics
-		} else {
-			&mut hir.classes[shell.1.1].methods
+fn map_runtime_assembly_error(
+	error: super::assembly::RuntimeAssemblyError,
+) -> nymph_sema::StableModuleAssemblyError {
+	use super::assembly::RuntimeAssemblyError as Error;
+	match error {
+		Error::DuplicateAttachment { owner, name } => {
+			nymph_sema::StableModuleAssemblyError::DuplicateAttachment { owner, name }
 		}
-	} else if static_ {
-		&mut hir.enums[shell.1.1].statics
-	} else {
-		&mut hir.enums[shell.1.1].methods
-	};
-	let _ = definition;
-	list.push(method.clone());
-	Ok(())
+		Error::MissingOwnerShell { owner } => {
+			nymph_sema::StableModuleAssemblyError::MissingOwnerShell { owner }
+		}
+		Error::MismatchedShell {
+			definition,
+			placement_owner,
+			..
+		} => nymph_sema::StableModuleAssemblyError::MismatchedPlacement {
+			definition,
+			owner: placement_owner,
+		},
+		Error::DefinitionMismatch { supplied, lowered } => {
+			nymph_sema::StableModuleAssemblyError::MismatchedPlacement {
+				definition: supplied,
+				owner: lowered,
+			}
+		}
+		Error::DuplicateShell { owner } | Error::Template { definition: owner } => {
+			nymph_sema::StableModuleAssemblyError::MismatchedPlacement {
+				definition: owner.clone(),
+				owner,
+			}
+		}
+		Error::MismatchedModule { definition, .. } => {
+			nymph_sema::StableModuleAssemblyError::MismatchedPlacement {
+				owner: definition.clone(),
+				definition,
+			}
+		}
+	}
 }
 
 /// Check one module exclusively from its own tree and dependency interfaces.
