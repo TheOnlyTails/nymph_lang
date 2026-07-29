@@ -119,7 +119,7 @@ pub const VALUE_REGISTRY: &[(&str, LinkedValue)] = &[
 /// `number` return needing no `Option`/`Result` runtime ABI. L1 adds the
 /// Option-returning `List` intrinsics (`get`/`first`/`last`/`pop`) now that
 /// the Option ABI seam is wired (see `nymph-codegen::strip_ts_to_js`'s
-/// `import_rewrites` and `nymph-compiler::intrinsics`'s injected
+/// `import_rewrites` and `nymph-compiler::host_runtime`'s injected
 /// `std/option` virtual module) — `get` and `length` need `receiver_tag`
 /// disambiguation (see this module's own doc comment); `first`/`last`/`pop`
 /// are `List`-only in the real stdlib today, so they stay unambiguous.

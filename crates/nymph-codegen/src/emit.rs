@@ -686,7 +686,7 @@ impl<'a> Emitter<'a> {
 	/// already treats them as the identical type. `Symbol.for` fixes this:
 	/// the same string always resolves to the same global symbol, so any two
 	/// independently-emitted (or independently hand-built, see
-	/// `nymph-compiler::intrinsics`'s injected `std/option` virtual module)
+	/// `nymph-compiler`'s `HostRuntimeGraph`-injected `std/option` virtual module)
 	/// values of "the same" enum variant compare equal by construction. The
 	/// TAG KEY itself (`emit_tag_const`, above) was already global via
 	/// `Symbol.for("nymph.tag")` — only the per-variant discriminant VALUE

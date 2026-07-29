@@ -43,28 +43,10 @@ fn compiler_option_definition<'db>(
 	db: &'db dyn Db,
 	key: ProjectKey<'db>,
 ) -> Result<nymph_sema::DefinitionId, String> {
-	let dependency = crate::intrinsics::OPTION_RUNTIME_DEPENDENCY;
-	let module = key
-		.ambient_core_registry(db)
-		.modules(db)
-		.iter()
-		.copied()
-		.find(|module| module.key(db).path.as_ref() == dependency.ambient_module)
-		.ok_or_else(|| "compiler Option module is unavailable".to_string())?;
-	queries::runtime_definition_ids(db, key, SemanticModuleInput::Builtin(module))
-		.map_err(|error| format!("compiler Option definitions are unavailable: {error:?}"))?
-		.iter()
-		.find(|definition| {
-			matches!(
-				&definition.key,
-				nymph_sema::DeclarationKey::TopLevel {
-					category: nymph_sema::DeclarationCategory::Enum,
-					name,
-					..
-				} if name == dependency.enum_name
-			)
-		})
-		.cloned()
+	queries::compiler_runtime_roles(db, key.ambient_core_registry(db))
+		.option
+		.as_ref()
+		.map(|role| role.option.clone())
 		.ok_or_else(|| "compiler Option definition is unavailable".to_string())
 }
 
@@ -253,7 +235,10 @@ pub(crate) fn emitted_interface_project<'db>(
 	let mut virtual_fragments = std::collections::BTreeMap::new();
 	let mut option_requested = false;
 	let mut option_definition = None;
-	let reserved_runtime = crate::intrinsics::OPTION_RUNTIME_DEPENDENCY.import_specifier;
+	let host_runtime = crate::host_runtime::HostRuntimeGraph::compiler_facts();
+	let reserved_runtime = crate::host_runtime::HostRuntimeGraph::role_import_specifier(
+		crate::host_runtime::CompilerRuntimeRole::Option,
+	);
 	if graph.semantic_order.iter().copied().any(|module| {
 		module.domain(db) != SemanticModuleDomain::AmbientCore
 			&& module.identity(db).path.as_str() == reserved_runtime
@@ -284,18 +269,10 @@ pub(crate) fn emitted_interface_project<'db>(
 		};
 		option_requested |= stable.fragments.iter().any(|fragment| {
 			matches!(fragment.fragment(), nymph_sema::LoweredHirFragment::TopLevelExternal { abi, .. }
-				if abi.linked().and_then(|(module, _)| crate::intrinsics::runtime_dependency(module)).is_some())
+				if abi.linked().is_some_and(|(module, _)| host_runtime.semantic_dependencies(module).next().is_some()))
 		});
 		for fragment in &stable.virtual_runtime {
-			if matches!(
-				&fragment.definition.key,
-				nymph_sema::DeclarationKey::TopLevel {
-					category: nymph_sema::DeclarationCategory::Enum,
-					name,
-					..
-				} if name == crate::intrinsics::OPTION_RUNTIME_DEPENDENCY.enum_name
-			) && fragment.owner.path == crate::intrinsics::OPTION_RUNTIME_DEPENDENCY.ambient_module
-			{
+			if fragment.definition == compiler_option {
 				option_definition = Some(fragment.definition.clone());
 			}
 			virtual_fragments
@@ -381,17 +358,13 @@ pub(crate) fn emitted_interface_project<'db>(
 				"assembled Option definition does not match the compiler Option".to_string(),
 			));
 		}
-		let dependency = crate::intrinsics::OPTION_RUNTIME_DEPENDENCY;
 		let shim = format!(
 			"export {{ {} as Option }} from \"@nymph/runtime/{}\";\n",
-			compiler_option_binding, dependency.ambient_module
+			compiler_option_binding, compiler_option.module.path
 		);
-		if sources
-			.insert(dependency.import_specifier.to_string(), shim)
-			.is_some()
-		{
+		if sources.insert(reserved_runtime.to_string(), shim).is_some() {
 			return StableEmissionResult::Diagnostics(internal_diagnostic(
-				dependency.import_specifier,
+				reserved_runtime,
 				"STABLE-INTRINSIC-COLLISION",
 				"compiler Option shim collides with a project module".to_string(),
 			));
@@ -557,8 +530,8 @@ pub(crate) fn compiled_interface_project<'db>(
 		}
 	};
 	let mut module_sources = emitted.module_sources.clone();
-	for (module, source) in
-		crate::intrinsics::intrinsic_module_sources_with_option_enum(&emitted.compiler_option_binding)
+	for (module, source) in crate::host_runtime::HostRuntimeGraph::compiler_facts()
+		.module_sources(&emitted.compiler_option_binding)
 	{
 		if module_sources.insert(module.clone(), source).is_some() {
 			return StableEmissionResult::Diagnostics(internal_diagnostic(

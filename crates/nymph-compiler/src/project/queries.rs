@@ -1738,39 +1738,23 @@ pub(crate) fn lower_interface_module<'db>(
 			})?;
 		if let nymph_sema::LoweredHirFragment::TopLevelExternal { abi, .. } = fragment.fragment()
 			&& let Some((module, _)) = abi.linked()
-			&& let Some(dependency) = crate::intrinsics::runtime_dependency(module)
 		{
-			let option_module = key
-				.ambient_core_registry(db)
-				.modules(db)
-				.iter()
-				.copied()
-				.find(|module| module.key(db).path.as_ref() == dependency.ambient_module)
+			for role in
+				crate::host_runtime::HostRuntimeGraph::compiler_facts().semantic_dependencies(module)
+			{
+				let dependency = match role {
+					crate::host_runtime::CompilerRuntimeRole::Option => {
+						compiler_runtime_roles(db, key.ambient_core_registry(db))
+							.option
+							.as_ref()
+							.map(|role| role.option.clone())
+					}
+				}
 				.ok_or_else(|| nymph_sema::StableModuleAssemblyError::UnresolvedDemand {
 					definition: definition.clone(),
 				})?;
-			let option = runtime_definition_ids(db, key, SemanticModuleInput::Builtin(option_module))
-				.map_err(
-					|_| nymph_sema::StableModuleAssemblyError::UnresolvedDemand {
-						definition: definition.clone(),
-					},
-				)?
-				.iter()
-				.find(|candidate| {
-					matches!(
-						&candidate.key,
-						nymph_sema::DeclarationKey::TopLevel {
-							category: nymph_sema::DeclarationCategory::Enum,
-							name,
-							..
-						} if name == dependency.enum_name
-					)
-				})
-				.cloned()
-				.ok_or_else(|| nymph_sema::StableModuleAssemblyError::UnresolvedDemand {
-					definition: definition.clone(),
-				})?;
-			queue.push_back(option);
+				queue.push_back(dependency);
+			}
 		}
 		queue.extend(fragment.demands().iter().cloned());
 		lowered.push(fragment.as_ref().clone());

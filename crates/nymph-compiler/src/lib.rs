@@ -32,7 +32,7 @@
 //! prelude would collide with itself (KK2) — real stdlib compilation arrives
 //! with import binding.
 
-mod intrinsics;
+mod host_runtime;
 mod prelude;
 pub mod project;
 mod std_source;

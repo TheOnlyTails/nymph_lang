@@ -8,7 +8,7 @@
 //!
 //! * [`BOX_MODULE_SOURCE`] — an `export`ed ES module, injected into the bundle
 //!   graph under [`BOX_MODULE_KEY`] exactly like the intrinsic runtime modules
-//!   (`nymph-compiler::intrinsics`). This is slice #7's "boxes must be importable
+//!   (`nymph-compiler::HostRuntimeGraph`). This is slice #7's "boxes must be importable
 //!   modules" seam: a later slice's emitted code will `import { NInt } from
 //!   "std/box"` instead of relying on the inline preamble.
 //! * [`BOX_PREAMBLE`] — the identical class definitions WITHOUT `export`,

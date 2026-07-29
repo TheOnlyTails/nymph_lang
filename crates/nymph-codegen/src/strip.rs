@@ -26,7 +26,7 @@
 //! before). `import_rewrites` names which source specifiers are resolvable
 //! virtual modules at all (e.g. `"../option"` → `"std/option"`, the bare key
 //! `bundle::VirtualFsPlugin` serves an injected `std/option` module under —
-//! see `nymph-compiler`'s `intrinsics` module); an import whose specifier
+//! see `nymph-compiler`'s `HostRuntimeGraph`); an import whose specifier
 //! isn't in this map is dropped unconditionally, exactly like L0, since
 //! nothing would resolve it in the bundle graph anyway. An import whose
 //! specifier IS in the map is kept — with its specifier rewritten to the
@@ -41,6 +41,68 @@ use oxc::semantic::SemanticBuilder;
 use oxc::span::SourceType;
 use oxc::transformer::{TransformOptions, Transformer};
 use std::path::Path;
+
+/// The narrow top-level source facts supported by host runtime modules.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddedModuleInspection {
+	pub imports: Vec<String>,
+	pub unsupported_imports: Vec<String>,
+	pub exported_bindings: Vec<String>,
+}
+
+/// Inspect actual named imports and `export const` bindings in embedded TS.
+/// Duplicate entries are intentionally retained for consistency validation.
+#[must_use]
+pub fn inspect_embedded_module(source: &str) -> EmbeddedModuleInspection {
+	let allocator = Allocator::default();
+	let parsed = Parser::new(&allocator, source, SourceType::ts()).parse();
+	assert!(
+		!parsed.panicked && !parsed.diagnostics.has_errors(),
+		"inspect_embedded_module: failed to parse embedded stdlib TS source: {:?}",
+		parsed.diagnostics
+	);
+	let mut imports = Vec::new();
+	let mut unsupported_imports = Vec::new();
+	let mut exported_bindings = Vec::new();
+	for statement in &parsed.program.body {
+		match statement {
+			Statement::ImportDeclaration(import) => {
+				// The stripping contract reconstructs ordinary named imports. Reject
+				// every other shape rather than silently dropping or changing it.
+				let supported = import.specifiers.as_ref().is_some_and(|specifiers| {
+					!specifiers.is_empty()
+						&& specifiers.iter().all(|specifier| {
+							matches!(
+								specifier,
+								ImportDeclarationSpecifier::ImportSpecifier(named)
+									if named.imported.name().as_ref() == named.local.name.as_str()
+							)
+						})
+				});
+				if supported {
+					imports.push(import.source.value.to_string());
+				} else {
+					unsupported_imports.push(import.source.value.to_string());
+				}
+			}
+			Statement::ExportNamedDeclaration(export) => {
+				if let Some(Declaration::VariableDeclaration(variable)) = &export.declaration {
+					for declaration in &variable.declarations {
+						if let Some(binding) = declaration.id.get_binding_identifier() {
+							exported_bindings.push(binding.name.to_string());
+						}
+					}
+				}
+			}
+			_ => {}
+		}
+	}
+	EmbeddedModuleInspection {
+		imports,
+		unsupported_imports,
+		exported_bindings,
+	}
+}
 
 /// Strip `source` (TypeScript) down to plain JavaScript, then filter its
 /// top-level body to only the `export const <name> = ..` declarations whose
