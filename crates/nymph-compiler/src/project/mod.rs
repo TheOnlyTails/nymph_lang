@@ -7,6 +7,7 @@
 mod assembly;
 mod bundle;
 mod emission;
+mod link_plan;
 mod metrics;
 mod queries;
 mod resolve;

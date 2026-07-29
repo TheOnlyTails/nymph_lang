@@ -4,11 +4,11 @@ use std::sync::Arc;
 
 use nymph_ast::{Span, decl::Visibility};
 use nymph_diagnostics::Diagnostic;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use super::queries::Db;
 use super::session::{ProjectKey, SemanticModuleDomain, SemanticModuleInput};
-use super::{CompiledProject, ProjectDiagnostic, bundle, queries};
+use super::{CompiledProject, ProjectDiagnostic, bundle, link_plan, queries};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StableEmittedProject {
@@ -50,23 +50,53 @@ fn compiler_option_definition<'db>(
 		.ok_or_else(|| "compiler Option definition is unavailable".to_string())
 }
 
-fn prepend_external_aliases<'a>(
-	source: &mut String,
-	externals: impl Iterator<Item = (&'a nymph_sema::ExternalAbi, &'a str)>,
-) {
-	let mut imports = externals
-		.filter_map(|(abi, name)| {
-			let (module, symbol) = abi.linked()?;
-			Some((module.to_string(), symbol.to_string(), name.to_string()))
-		})
-		.collect::<Vec<_>>();
-	imports.sort_unstable();
-	imports.dedup();
-	for (module, symbol, name) in imports.into_iter().rev() {
+fn prepend_external_aliases(source: &mut String, aliases: &[link_plan::LinkedExternalAlias]) {
+	for alias in aliases.iter().rev() {
+		let (module, symbol) = alias
+			.abi
+			.linked()
+			.expect("link plans deliver linked ABIs only");
 		source.insert_str(
 			0,
-			&format!("import {{ {symbol} as {name} }} from \"{module}\";\n"),
+			&format!(
+				"import {{ {symbol} as {} }} from \"{module}\";\n",
+				alias.binding.as_str()
+			),
 		);
+	}
+}
+
+struct QueryLinkResolver<'db> {
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+}
+
+impl link_plan::LinkNameResolver for QueryLinkResolver<'_> {
+	fn binding_name(
+		&mut self,
+		definition: &nymph_sema::DefinitionId,
+	) -> Result<nymph_sema::EmittedBindingName, nymph_sema::StableNameLookupError> {
+		queries::binding_name(self.db, self.key, definition.clone())
+	}
+
+	fn module_specifier(
+		&mut self,
+		module: &nymph_sema::ModuleIdentity,
+	) -> Result<nymph_sema::CanonicalModuleSpecifier, nymph_sema::StableNameLookupError> {
+		queries::module_specifier(self.db, self.key, module.clone())
+	}
+}
+
+fn link_artifact(fragment: &nymph_sema::LoweredHirFragment) -> link_plan::LinkArtifact<'_> {
+	match fragment {
+		nymph_sema::LoweredHirFragment::TopLevelFunction(_)
+		| nymph_sema::LoweredHirFragment::TopLevelValue(_)
+		| nymph_sema::LoweredHirFragment::StructShell(_)
+		| nymph_sema::LoweredHirFragment::EnumShell(_) => link_plan::LinkArtifact::TopLevel,
+		nymph_sema::LoweredHirFragment::TopLevelExternal { abi, .. } => {
+			link_plan::LinkArtifact::External(abi)
+		}
+		_ => link_plan::LinkArtifact::Attached,
 	}
 }
 
@@ -88,67 +118,8 @@ pub(crate) fn emitted_interface_module<'db>(
 			));
 		}
 	};
-	let mut predeclared_imports = Vec::new();
-	let routed_demands = stable
-		.fragments
-		.iter()
-		.flat_map(|fragment| fragment.routed_demands().iter().cloned())
-		.collect::<FxHashSet<_>>();
-	let direct_demands = stable
-		.fragments
-		.iter()
-		.flat_map(|fragment| fragment.direct_demands().iter().cloned())
-		.collect::<FxHashSet<_>>();
-	for fragment in &stable.fragments {
-		let definition = fragment.definition();
-		if routed_demands.contains(definition) && !direct_demands.contains(definition) {
-			continue;
-		}
-		if definition.module == stable.module
-			|| !matches!(
-				fragment.fragment(),
-				nymph_sema::LoweredHirFragment::TopLevelFunction(_)
-					| nymph_sema::LoweredHirFragment::TopLevelValue(_)
-					| nymph_sema::LoweredHirFragment::TopLevelExternal { .. }
-					| nymph_sema::LoweredHirFragment::StructShell(_)
-					| nymph_sema::LoweredHirFragment::EnumShell(_)
-			) {
-			continue;
-		}
-		let name = match queries::binding_name(db, key, definition.clone()) {
-			Ok(name) => name.as_str().to_string(),
-			Err(error) => {
-				return StableEmissionResult::Diagnostics(internal_diagnostic(
-					&module.display_key(db),
-					"STABLE-EMISSION-LINK",
-					format!("stable import naming failed: {error:?}"),
-				));
-			}
-		};
-		predeclared_imports.push((module_specifier(&definition.module), name.clone(), name));
-	}
-	let mut source = nymph_codegen::emit_for_project_module_with_imports(
-		&stable.hir,
-		&stable.module.path,
-		&predeclared_imports,
-	);
-	prepend_external_aliases(
-		&mut source,
-		stable.fragments.iter().filter_map(|fragment| {
-			if fragment.definition().module != stable.module {
-				return None;
-			}
-			match fragment.fragment() {
-				nymph_sema::LoweredHirFragment::TopLevelExternal { name, abi } => {
-					Some((abi, name.as_str()))
-				}
-				_ => None,
-			}
-		}),
-	);
-
 	let environment = queries::interface_module_environment(db, key, module);
-	let public: FxHashSet<_> = match environment.as_ref() {
+	let public: std::collections::HashSet<_> = match environment.as_ref() {
 		nymph_sema::ModuleEnvironment::Complete(interface) => interface
 			.exports
 			.iter()
@@ -164,35 +135,57 @@ pub(crate) fn emitted_interface_module<'db>(
 		}
 	};
 	let preserve = key.preserve_names(db) && stable.module.path == key.entry(db).as_str();
-	let mut exports = Vec::new();
-	for fragment in &stable.fragments {
-		let definition = fragment.definition();
-		let external_abi = matches!(
-			fragment.fragment(),
-			nymph_sema::LoweredHirFragment::TopLevelExternal { .. }
-		);
-		if definition.module != stable.module
-			|| (!external_abi && !preserve && !public.contains(definition))
-		{
-			continue;
+	let fragments = stable
+		.fragments
+		.iter()
+		.map(|fragment| link_plan::LinkFragment {
+			definition: fragment.definition(),
+			artifact: link_artifact(fragment.fragment()),
+			direct_demands: fragment.direct_demands(),
+			routed_demands: fragment.routed_demands(),
+		})
+		.collect::<Vec<_>>();
+	let plan = match link_plan::plan_project_module(
+		&stable.module,
+		&fragments,
+		&public,
+		preserve,
+		&mut QueryLinkResolver { db, key },
+	) {
+		Ok(plan) => plan,
+		Err(error) => {
+			return StableEmissionResult::Diagnostics(internal_diagnostic(
+				&module.display_key(db),
+				"STABLE-EMISSION-LINK",
+				format!("stable module link planning failed: {error:?}"),
+			));
 		}
-		if matches!(
-			fragment.fragment(),
-			nymph_sema::LoweredHirFragment::TopLevelFunction(_)
-				| nymph_sema::LoweredHirFragment::TopLevelValue(_)
-				| nymph_sema::LoweredHirFragment::TopLevelExternal { .. }
-				| nymph_sema::LoweredHirFragment::StructShell(_)
-				| nymph_sema::LoweredHirFragment::EnumShell(_)
-		) {
-			if let Ok(name) = queries::binding_name(db, key, definition.clone()) {
-				exports.push(name.as_str().to_string());
-			}
-		}
-	}
-	exports.sort_unstable();
-	exports.dedup();
-	if !exports.is_empty() {
-		source.push_str(&format!("export {{ {} }};\n", exports.join(", ")));
+	};
+	let imports = plan
+		.imports
+		.iter()
+		.map(|import| {
+			let name = import.binding.as_str().to_string();
+			(
+				link_plan::specifier_str(&import.specifier).to_string(),
+				name.clone(),
+				name,
+			)
+		})
+		.collect::<Vec<_>>();
+	let mut source =
+		nymph_codegen::emit_for_project_module_with_imports(&stable.hir, &stable.module.path, &imports);
+	prepend_external_aliases(&mut source, &plan.external_aliases);
+	if !plan.exports.is_empty() {
+		source.push_str(&format!(
+			"export {{ {} }};\n",
+			plan
+				.exports
+				.iter()
+				.map(nymph_sema::EmittedBindingName::as_str)
+				.collect::<Vec<_>>()
+				.join(", ")
+		));
 	}
 	StableEmissionResult::Value(Arc::new(source))
 }
@@ -320,7 +313,7 @@ pub(crate) fn emitted_interface_project<'db>(
 			)
 		})
 		.map(|fragment| fragment.definition.clone())
-		.collect::<FxHashSet<_>>();
+		.collect::<std::collections::HashSet<_>>();
 	for fragment in virtual_fragments.into_values() {
 		by_owner
 			.entry(fragment.owner.clone())
@@ -402,7 +395,7 @@ fn emit_virtual_runtime_module(
 	key: ProjectKey<'_>,
 	owner: &nymph_sema::ModuleIdentity,
 	fragments: &[nymph_sema::VirtualRuntimeFragment],
-	module_bindings: &FxHashSet<nymph_sema::DefinitionId>,
+	module_bindings: &std::collections::HashSet<nymph_sema::DefinitionId>,
 ) -> Result<String, String> {
 	let hir = super::assembly::assemble_runtime_module(
 		owner,
@@ -412,58 +405,47 @@ fn emit_virtual_runtime_module(
 	)
 	.map_err(|error| format!("runtime assembly failed: {error:?}"))?;
 	let current_module = module_specifier(owner);
-	let mut runtime_imports = fragments
+	let link_fragments = fragments
 		.iter()
-		.flat_map(|fragment| fragment.fragment.direct_demands().iter())
-		.filter(|demand| demand.module != *owner)
-		.filter(|demand| module_bindings.contains(*demand))
-		.map(|demand| {
-			queries::binding_name(db, key, demand.clone())
-				.map(|name| (module_specifier(&demand.module), name.as_str().to_string()))
-				.map_err(|error| format!("runtime import name lookup failed: {error:?}"))
+		.map(|fragment| link_plan::LinkFragment {
+			definition: &fragment.definition,
+			artifact: link_artifact(fragment.fragment.fragment()),
+			direct_demands: fragment.fragment.direct_demands(),
+			routed_demands: fragment.fragment.routed_demands(),
 		})
-		.collect::<Result<Vec<_>, _>>()?;
-	runtime_imports.sort_unstable();
-	runtime_imports.dedup();
-	let runtime_imports = runtime_imports
-		.into_iter()
-		.map(|(module, name)| (module, name.clone(), name))
+		.collect::<Vec<_>>();
+	let plan = link_plan::plan_virtual_module(
+		owner,
+		&link_fragments,
+		module_bindings,
+		&mut QueryLinkResolver { db, key },
+	)
+	.map_err(|error| format!("runtime link planning failed: {error:?}"))?;
+	let runtime_imports = plan
+		.imports
+		.iter()
+		.map(|import| {
+			let name = import.binding.as_str().to_string();
+			(
+				link_plan::specifier_str(&import.specifier).to_string(),
+				name.clone(),
+				name,
+			)
+		})
 		.collect::<Vec<_>>();
 	let mut source =
 		nymph_codegen::emit_for_project_module_with_imports(&hir, &current_module, &runtime_imports);
-	prepend_external_aliases(
-		&mut source,
-		fragments
-			.iter()
-			.filter_map(|fragment| match fragment.fragment.fragment() {
-				nymph_sema::LoweredHirFragment::TopLevelExternal { name, abi } => {
-					Some((abi, name.as_str()))
-				}
-				_ => None,
-			}),
-	);
-	let mut exports = fragments
-		.iter()
-		.map(|fragment| match fragment.fragment.fragment() {
-			nymph_sema::LoweredHirFragment::TopLevelFunction(_)
-			| nymph_sema::LoweredHirFragment::TopLevelValue(_)
-			| nymph_sema::LoweredHirFragment::TopLevelExternal { .. }
-			| nymph_sema::LoweredHirFragment::StructShell(_)
-			| nymph_sema::LoweredHirFragment::EnumShell(_) => {
-				queries::binding_name(db, key, fragment.definition.clone())
-					.map(|name| Some(name.as_str().to_string()))
-					.map_err(|error| format!("runtime export name lookup failed: {error:?}"))
-			}
-			_ => Ok(None),
-		})
-		.collect::<Result<Vec<_>, String>>()?
-		.into_iter()
-		.flatten()
-		.collect::<Vec<_>>();
-	exports.sort_unstable();
-	exports.dedup();
-	if !exports.is_empty() {
-		source.push_str(&format!("export {{ {} }};\n", exports.join(", ")));
+	prepend_external_aliases(&mut source, &plan.external_aliases);
+	if !plan.exports.is_empty() {
+		source.push_str(&format!(
+			"export {{ {} }};\n",
+			plan
+				.exports
+				.iter()
+				.map(nymph_sema::EmittedBindingName::as_str)
+				.collect::<Vec<_>>()
+				.join(", ")
+		));
 	}
 	Ok(source)
 }
