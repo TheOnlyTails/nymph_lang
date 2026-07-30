@@ -73,6 +73,50 @@ fn run_root_value(mut js: String, root_symbol: &str) {
 	assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0");
 }
 
+#[test]
+fn tiny_check_records_cold_query_demand_and_fully_backdates() {
+	let fixture = GraphShape::Single.generate();
+	let events = Arc::new(Mutex::new(Vec::<SemanticQueryEvent>::new()));
+	let sink = events.clone();
+	let mut session = CompilerSession::with_detailed_event_callback_for_test(move |event| {
+		sink.lock().unwrap().push(event)
+	});
+	let project = ProjectId::new("incremental-single-check");
+	let entry = ModulePath::new(fixture.entry()).unwrap();
+	install_sources(&mut session, &project, fixture.sources(), SourceVersion(1));
+
+	events.lock().unwrap().clear();
+	let diagnostics = session.check_project(project.clone(), entry.clone(), EntryMode::Library);
+	assert!(diagnostics.is_empty(), "tiny check: {diagnostics:?}");
+	let first_events = events.lock().unwrap().clone();
+	assert_eq!(
+		count(&first_events, "interface_module_analysis", Some("main")),
+		1
+	);
+	assert_eq!(count(&first_events, "lower_interface_module", None), 0);
+	assert_eq!(count(&first_events, "emitted_interface_module", None), 0);
+	let ambient_counts = [
+		"ambient_core_parse",
+		"ambient_core_analysis",
+		"ambient_core_headers",
+		"ambient_core_environment",
+		"ambient_core_interface",
+		"ambient_core_diagnostics",
+		"ambient_runtime_owner_artifacts",
+	]
+	.map(|query| (query, count(&first_events, query, None)));
+	eprintln!("tiny check ambient-core query counts: {ambient_counts:?}");
+
+	events.lock().unwrap().clear();
+	let diagnostics = session.check_project(project, entry, EntryMode::Library);
+	assert!(diagnostics.is_empty(), "warm tiny check: {diagnostics:?}");
+	let second_events = events.lock().unwrap();
+	assert!(
+		second_events.is_empty(),
+		"identical second check produced events: {second_events:#?}"
+	);
+}
+
 fn assert_baseline(shape: GraphShape, project_name: &str, changed_leaf: &str) {
 	let fixture = shape.generate();
 	assert_eq!(fixture.unresolved_imports(), Vec::<String>::new());

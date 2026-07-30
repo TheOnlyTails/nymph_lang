@@ -137,44 +137,33 @@ fn throughput(case: Case, shape: GraphShape) -> Throughput {
 }
 
 fn incremental_project(c: &mut Criterion) {
-	for (shape_name, shape) in [
-		("wide-16", GraphShape::Wide { leaves: 16 }),
-		("deep-16", GraphShape::Deep { depth: 16 }),
-		("mixed-4x4", GraphShape::Mixed { width: 4, depth: 4 }),
+	for (shape_name, shape, cases) in [
+		(
+			"single",
+			GraphShape::Single,
+			&[
+				Case {
+					name: "fresh-check",
+					operation: check,
+					setup: fresh,
+				},
+				Case {
+					name: "fresh-compile",
+					operation: compile,
+					setup: fresh,
+				},
+			][..],
+		),
+		("wide-16", GraphShape::Wide { leaves: 16 }, &CASES[..]),
+		("deep-16", GraphShape::Deep { depth: 16 }, &CASES[..]),
+		(
+			"mixed-4x4",
+			GraphShape::Mixed { width: 4, depth: 4 },
+			&CASES[..],
+		),
 	] {
 		let mut group = c.benchmark_group(shape_name);
-		for case in [
-			Case {
-				name: "fresh-check",
-				operation: check,
-				setup: fresh,
-			},
-			Case {
-				name: "fresh-compile",
-				operation: compile,
-				setup: fresh,
-			},
-			Case {
-				name: "unchanged-check",
-				operation: check,
-				setup: prime_check,
-			},
-			Case {
-				name: "unchanged-compile",
-				operation: compile,
-				setup: prime_compile,
-			},
-			Case {
-				name: "private-leaf-body",
-				operation: compile,
-				setup: prime_then_replace_private,
-			},
-			Case {
-				name: "public-leaf-signature",
-				operation: compile,
-				setup: prime_then_replace_public,
-			},
-		] {
+		for &case in cases {
 			print_baseline(&format!("{shape_name}/{}", case.name), case, shape);
 			group.throughput(throughput(case, shape));
 			group.bench_with_input(
@@ -192,6 +181,39 @@ fn incremental_project(c: &mut Criterion) {
 		group.finish();
 	}
 }
+
+const CASES: [Case; 6] = [
+	Case {
+		name: "fresh-check",
+		operation: check,
+		setup: fresh,
+	},
+	Case {
+		name: "fresh-compile",
+		operation: compile,
+		setup: fresh,
+	},
+	Case {
+		name: "unchanged-check",
+		operation: check,
+		setup: prime_check,
+	},
+	Case {
+		name: "unchanged-compile",
+		operation: compile,
+		setup: prime_compile,
+	},
+	Case {
+		name: "private-leaf-body",
+		operation: compile,
+		setup: prime_then_replace_private,
+	},
+	Case {
+		name: "public-leaf-signature",
+		operation: compile,
+		setup: prime_then_replace_public,
+	},
+];
 
 criterion_group!(benches, incremental_project);
 criterion_main!(benches);

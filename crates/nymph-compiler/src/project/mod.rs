@@ -38,6 +38,7 @@ mod test_support {
 
 	#[derive(Clone, Copy, Debug)]
 	pub enum GraphShape {
+		Single,
 		Wide { leaves: usize },
 		Deep { depth: usize },
 		Mixed { width: usize, depth: usize },
@@ -58,7 +59,15 @@ mod test_support {
 				sources: BTreeMap::new(),
 				leaves: Vec::new(),
 			};
+			if matches!(self, Self::Single) {
+				fixture.sources.insert(
+					"main".to_string(),
+					"public func root_value(): int = 0".to_string(),
+				);
+				return fixture;
+			}
 			let entry_imports: Vec<String> = match self {
+				Self::Single => unreachable!("single fixture returned above"),
 				Self::Wide { leaves } => (0..leaves)
 					.map(|index| {
 						let key = format!("wide/leaf_{index:03}");

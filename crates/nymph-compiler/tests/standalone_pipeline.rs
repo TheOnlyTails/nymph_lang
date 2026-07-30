@@ -1,9 +1,22 @@
 #![cfg(feature = "test-support")]
 
+use nymph_compiler::project::GraphShape;
 use nymph_compiler::{check, check_entry, check_without_prelude, compile, compile_entry};
 
 fn assert_one_stable_check<T>(run: impl FnOnce() -> T) -> T {
 	run()
+}
+
+#[test]
+fn single_graph_fixture_is_exact_and_has_no_imports() {
+	let fixture = GraphShape::Single.generate();
+	assert_eq!(fixture.entry(), "main");
+	assert_eq!(fixture.sources().len(), 1);
+	assert_eq!(
+		fixture.sources().get("main").map(String::as_str),
+		Some("public func root_value(): int = 0")
+	);
+	assert!(fixture.unresolved_imports().is_empty());
 }
 
 #[test]
