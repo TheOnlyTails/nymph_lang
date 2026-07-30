@@ -295,7 +295,13 @@ impl CompilerState {
 					.file_stem()
 					.and_then(|name| name.to_str())
 					.unwrap_or("loose");
-				(root, ModulePath::new(module).unwrap(), false)
+				let module = ModulePath::new(module).map_err(|reason| {
+					anyhow::anyhow!(
+						"cannot use loose source file `{}`: {reason}",
+						path.display()
+					)
+				})?;
+				(root, module, false)
 			}
 		};
 		let root = std::path::absolute(root)?;
@@ -379,13 +385,8 @@ fn nymph_files(root: &std::path::Path) -> anyhow::Result<Vec<(PathBuf, ModulePat
 			if path.is_dir() {
 				visit(root, &path, out)?;
 			} else if path.extension().and_then(|ext| ext.to_str()) == Some("nym") {
-				let rel = path.strip_prefix(root).unwrap().with_extension("");
-				let key = rel
-					.iter()
-					.map(|part| part.to_string_lossy())
-					.collect::<Vec<_>>()
-					.join("/");
-				if let Ok(module) = ModulePath::new(key) {
+				let rel = path.strip_prefix(root).unwrap();
+				if let Ok(module) = ModulePath::from_source_file(rel) {
 					out.push((path, module));
 				}
 			}
@@ -427,5 +428,17 @@ mod tests {
 		let sent = Cell::new(false);
 		publish_if_current(&docs, &uri, &snapshot, (), |_| sent.set(true));
 		assert!(!sent.get());
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn noncanonical_loose_source_name_returns_an_error() {
+		let uri: Uri = "file:///tmp/loose%3Afile.nym".parse().unwrap();
+		let mut docs = DocumentStore::default();
+		let mut state = CompilerState::new();
+		let error = state
+			.open(&mut docs, uri, "let value = 1".into(), 1)
+			.expect_err("a noncanonical loose source name must not panic or enter the session");
+		assert!(error.to_string().contains("cannot use loose source file"));
 	}
 }

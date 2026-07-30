@@ -32,7 +32,10 @@ pub(crate) fn detect(file: &Path) -> Option<Project> {
 	let (config, root) = config::find_from(start_dir).ok()?;
 	let src_root = config.src_root(&root);
 	let rel = file_abs.strip_prefix(&src_root).ok()?;
-	let entry_key = module_key_from_relative_path(rel)?;
+	let entry_key = nymph_compiler::ModulePath::from_source_file(rel)
+		.ok()?
+		.as_str()
+		.to_string();
 
 	Some(Project {
 		src_root,
@@ -49,34 +52,23 @@ pub(crate) fn single_file(file: &Path) -> Option<Project> {
 	let file_abs = std::path::absolute(file).ok()?;
 	let src_root = file_abs.parent()?.to_path_buf();
 	let rel = file_abs.strip_prefix(&src_root).ok()?;
-	let entry_key = module_key_from_relative_path(rel)?;
+	let entry_key = nymph_compiler::ModulePath::from_source_file(rel)
+		.ok()?
+		.as_str()
+		.to_string();
 	Some(Project {
 		src_root,
 		entry_key,
 	})
 }
 
-/// Turn a source-root-relative file path into the driver's canonical module
-/// key: `/`-separated, `.nym` extension stripped (`geometry/vec.nym` →
-/// `"geometry/vec"`).
-fn module_key_from_relative_path(rel: &Path) -> Option<String> {
-	let without_ext = rel.with_extension("");
-	let mut segs = Vec::new();
-	for component in without_ext.components() {
-		segs.push(component.as_os_str().to_str()?.to_string());
-	}
-	if segs.is_empty() {
-		None
-	} else {
-		Some(segs.join("/"))
-	}
-}
-
 /// Build the FS-backed `load` closure a `src_root`'s project driver call
 /// needs: a canonical key `"a/b"` maps to `<src_root>/a/b.nym`.
 pub(crate) fn fs_loader(src_root: PathBuf) -> impl Fn(&str) -> Option<String> {
 	move |key: &str| {
-		let path = src_root.join(format!("{key}.nym"));
+		let path = nymph_compiler::ModulePath::new(key)
+			.ok()?
+			.source_file(&src_root);
 		std::fs::read_to_string(path).ok()
 	}
 }

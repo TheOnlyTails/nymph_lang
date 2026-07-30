@@ -36,6 +36,7 @@ impl ModulePath {
 		if value.is_empty()
 			|| value.starts_with('/')
 			|| value.ends_with(".nym")
+			|| value.contains(['\\', ':'])
 			|| value
 				.split('/')
 				.any(|segment| segment.is_empty() || segment == "." || segment == "..")
@@ -47,6 +48,37 @@ impl ModulePath {
 	#[must_use]
 	pub fn as_str(&self) -> &str {
 		&self.0
+	}
+
+	pub fn from_source_file(path: &std::path::Path) -> Result<Self, &'static str> {
+		if path.extension().and_then(std::ffi::OsStr::to_str) != Some("nym") {
+			return Err("source path must have the .nym extension");
+		}
+		let path_text = path.to_str().ok_or("source path must be valid UTF-8")?;
+		if path_text
+			.split(std::path::is_separator)
+			.any(|segment| segment.is_empty() || segment == "." || segment == "..")
+		{
+			return Err("source path must be relative and normalized");
+		}
+		let without_extension = path.with_extension("");
+		let mut key = String::new();
+		for component in without_extension.components() {
+			let std::path::Component::Normal(segment) = component else {
+				return Err("source path must be relative and normalized");
+			};
+			let segment = segment.to_str().ok_or("source path must be valid UTF-8")?;
+			if !key.is_empty() {
+				key.push('/');
+			}
+			key.push_str(segment);
+		}
+		Self::new(key)
+	}
+
+	#[must_use]
+	pub fn source_file(&self, root: &std::path::Path) -> std::path::PathBuf {
+		root.join(format!("{}.nym", self.as_str()))
 	}
 }
 
@@ -1389,6 +1421,24 @@ mod tests {
 	use std::{cell::RefCell, collections::HashMap};
 
 	use super::*;
+
+	#[test]
+	fn module_path_round_trips_nested_source_files() {
+		let module = ModulePath::from_source_file(std::path::Path::new("geometry/vector.nym"))
+			.expect("relative source path is canonicalizable");
+		assert_eq!(module.as_str(), "geometry/vector");
+		assert_eq!(
+			module.source_file(std::path::Path::new("src")),
+			std::path::Path::new("src/geometry/vector.nym")
+		);
+		assert!(ModulePath::from_source_file(std::path::Path::new("")).is_err());
+		assert!(ModulePath::from_source_file(std::path::Path::new("main")).is_err());
+		assert!(ModulePath::from_source_file(std::path::Path::new("main.rs")).is_err());
+		assert!(ModulePath::from_source_file(std::path::Path::new("/main.nym")).is_err());
+		assert!(ModulePath::from_source_file(std::path::Path::new("nested//main.nym")).is_err());
+		assert!(ModulePath::from_source_file(std::path::Path::new("nested/./main.nym")).is_err());
+		assert!(ModulePath::new(r"nested\main").is_err());
+	}
 
 	#[test]
 	fn loader_source_acquisition_preserves_recovered_dfs_and_provider_routing() {

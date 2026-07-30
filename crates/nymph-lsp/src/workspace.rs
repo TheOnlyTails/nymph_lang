@@ -69,7 +69,10 @@ pub fn detect(file: &Path) -> Option<Project> {
 	let (config, root) = find_nymph_toml(start_dir)?;
 	let src_root = root.join(&config.package.src);
 	let rel = file_abs.strip_prefix(&src_root).ok()?;
-	let entry_key = module_key_from_relative_path(rel)?;
+	let entry_key = nymph_compiler::ModulePath::from_source_file(rel)
+		.ok()?
+		.as_str()
+		.to_string();
 
 	Some(Project {
 		src_root,
@@ -77,27 +80,13 @@ pub fn detect(file: &Path) -> Option<Project> {
 	})
 }
 
-/// Turn a source-root-relative file path into the driver's canonical module
-/// key: `/`-separated, `.nym` extension stripped (`geometry/vec.nym` ->
-/// `"geometry/vec"`).
-fn module_key_from_relative_path(rel: &Path) -> Option<String> {
-	let without_ext = rel.with_extension("");
-	let mut segs = Vec::new();
-	for component in without_ext.components() {
-		segs.push(component.as_os_str().to_str()?.to_string());
-	}
-	if segs.is_empty() {
-		None
-	} else {
-		Some(segs.join("/"))
-	}
-}
-
 /// Build the FS-backed `load` closure a `src_root`'s project driver call
 /// needs: a canonical key `"a/b"` maps to `<src_root>/a/b.nym`.
 pub fn fs_loader(src_root: PathBuf) -> impl Fn(&str) -> Option<String> {
 	move |key: &str| {
-		let path = src_root.join(format!("{key}.nym"));
+		let path = nymph_compiler::ModulePath::new(key)
+			.ok()?
+			.source_file(&src_root);
 		std::fs::read_to_string(path).ok()
 	}
 }
@@ -108,7 +97,11 @@ pub fn fs_loader(src_root: PathBuf) -> impl Fn(&str) -> Option<String> {
 /// published against.
 #[must_use]
 pub fn key_to_uri(src_root: &Path, key: &str) -> Option<Uri> {
-	path_to_uri(&src_root.join(format!("{key}.nym")))
+	path_to_uri(
+		&nymph_compiler::ModulePath::new(key)
+			.ok()?
+			.source_file(src_root),
+	)
 }
 
 /// Characters that must be percent-encoded in a `file://` URI's path
