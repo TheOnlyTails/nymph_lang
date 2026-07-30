@@ -745,32 +745,6 @@ impl CompilerSession {
 
 	#[cfg(feature = "test-support")]
 	#[doc(hidden)]
-	pub fn builtin_runtime_definitions_for_test(
-		&self,
-		project: ProjectId,
-		entry: ModulePath,
-		module: &str,
-		mode: EntryMode,
-	) -> Vec<Arc<nymph_sema::RuntimeDefinition>> {
-		let key = self.project_key(project, entry, mode, true, true);
-		self
-			.builtins
-			.iter()
-			.filter(|(builtin, _)| builtin.path.as_ref().contains(module))
-			.map(|(_, input)| input)
-			.flat_map(|input| {
-				queries::runtime_manifest(&self.db, key, SemanticModuleInput::Builtin(*input))
-					.expect("embedded builtin runtime definitions are valid")
-					.definitions()
-					.iter()
-					.map(|entity| entity.value(&self.db))
-					.collect::<Vec<_>>()
-			})
-			.collect()
-	}
-
-	#[cfg(feature = "test-support")]
-	#[doc(hidden)]
 	pub fn builtin_interface_member_ids_for_test(
 		&self,
 		project: ProjectId,
