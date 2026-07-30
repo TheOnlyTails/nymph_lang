@@ -3,6 +3,7 @@
 use std::{
 	collections::HashMap,
 	hash::{Hash, Hasher},
+	sync::Arc,
 };
 
 use ecow::EcoString;
@@ -121,13 +122,23 @@ impl CanonicalizationContext {
 
 #[derive(Default)]
 pub struct InstantiationContext {
-	definitions: HashMap<DefinitionId, DefId>,
+	definitions: Arc<HashMap<DefinitionId, DefId>>,
 	parameters: HashMap<GenericParameterId, ParamIdx>,
 }
 
 impl InstantiationContext {
 	pub fn new(
 		definitions: HashMap<DefinitionId, DefId>,
+		parameters: HashMap<GenericParameterId, ParamIdx>,
+	) -> Self {
+		Self {
+			definitions: Arc::new(definitions),
+			parameters,
+		}
+	}
+
+	pub(crate) fn with_shared_definitions(
+		definitions: Arc<HashMap<DefinitionId, DefId>>,
 		parameters: HashMap<GenericParameterId, ParamIdx>,
 	) -> Self {
 		Self {

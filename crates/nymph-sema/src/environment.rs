@@ -180,6 +180,7 @@ impl SemanticEnvironment {
 
 		// Pass B starts only now: every complete/recovered Known stable identity has a
 		// checker-local allocation, so conversion can never allocate on demand.
+		let definitions = Arc::new(definition_map(&imported.defs));
 		let mut interner = Interner::new();
 		for module in modules {
 			match module.as_ref() {
@@ -190,7 +191,12 @@ impl SemanticEnvironment {
 							.iter()
 							.map(|support| &support.definition),
 					) {
-						instantiate_complete_definition(&mut imported, &mut interner, definition)?;
+						instantiate_complete_definition(
+							&mut imported,
+							&mut interner,
+							definition,
+							&definitions,
+						)?;
 					}
 				}
 				ModuleEnvironment::Recovered(interface) => {
@@ -200,7 +206,12 @@ impl SemanticEnvironment {
 							.iter()
 							.map(|support| &support.definition),
 					) {
-						instantiate_recovered_definition(&mut imported, &mut interner, definition)?;
+						instantiate_recovered_definition(
+							&mut imported,
+							&mut interner,
+							definition,
+							&definitions,
+						)?;
 					}
 				}
 			}
@@ -212,12 +223,12 @@ impl SemanticEnvironment {
 			match module.as_ref() {
 				ModuleEnvironment::Complete(interface) => {
 					for implementation in &interface.implementations {
-						instantiate_complete_impl(&mut imported, &mut interner, implementation)?;
+						instantiate_complete_impl(&mut imported, &mut interner, implementation, &definitions)?;
 					}
 				}
 				ModuleEnvironment::Recovered(interface) => {
 					for implementation in &interface.implementations {
-						instantiate_recovered_impl(&mut imported, &mut interner, implementation)?;
+						instantiate_recovered_impl(&mut imported, &mut interner, implementation, &definitions)?;
 					}
 				}
 			}
@@ -625,9 +636,12 @@ fn definition_map(defs: &DefMap) -> HashMap<DefinitionId, DefId> {
 		.collect()
 }
 
-fn context(defs: &DefMap, binders: &[GenericParameter]) -> InstantiationContext {
-	InstantiationContext::new(
-		definition_map(defs),
+fn context(
+	definitions: &Arc<HashMap<DefinitionId, DefId>>,
+	binders: &[GenericParameter],
+) -> InstantiationContext {
+	InstantiationContext::with_shared_definitions(
+		Arc::clone(definitions),
 		binders
 			.iter()
 			.enumerate()
@@ -641,8 +655,9 @@ fn bounds(
 	interner: &mut Interner,
 	binders: &[GenericParameter],
 	constraints: &[crate::GenericConstraint],
+	definitions: &Arc<HashMap<DefinitionId, DefId>>,
 ) -> Result<Vec<Bound>, EnvironmentConstructionError> {
-	let ctx = context(defs, binders);
+	let ctx = context(definitions, binders);
 	constraints
 		.iter()
 		.map(|constraint| {
@@ -687,8 +702,9 @@ fn func_sig(
 	constraints: &[crate::GenericConstraint],
 	parameters: &[crate::ParameterShape<InterfaceType>],
 	ret: &InterfaceType,
+	definitions: &Arc<HashMap<DefinitionId, DefId>>,
 ) -> Result<FuncSig, EnvironmentConstructionError> {
-	let ctx = context(defs, binders);
+	let ctx = context(definitions, binders);
 	let params = parameters
 		.iter()
 		.map(|parameter| FuncParamSig {
@@ -703,7 +719,7 @@ fn func_sig(
 		params,
 		ret,
 		has_self: false,
-		bounds: bounds(defs, interner, binders, constraints)?,
+		bounds: bounds(defs, interner, binders, constraints, definitions)?,
 	})
 }
 
@@ -712,6 +728,7 @@ fn owned_member(
 	interner: &mut Interner,
 	owner_binders: &[GenericParameter],
 	member: &MemberShape<InterfaceType>,
+	definitions: &Arc<HashMap<DefinitionId, DefId>>,
 ) -> Result<OwnedMemberSig, EnvironmentConstructionError> {
 	let mut binders = owner_binders.to_vec();
 	binders.extend(member.binders.clone());
@@ -722,6 +739,7 @@ fn owned_member(
 		&member.constraints,
 		&member.parameters,
 		&member.return_type,
+		definitions,
 	)?;
 	Ok(OwnedMemberSig {
 		target: member.id.clone(),
@@ -740,15 +758,16 @@ fn recovered_owned_member(
 	interner: &mut Interner,
 	owner_binders: &[GenericParameter],
 	member: &crate::RecoveredMemberShape,
+	definitions: &Arc<HashMap<DefinitionId, DefId>>,
 ) -> Result<OwnedMemberSig, EnvironmentConstructionError> {
 	let mut binders = owner_binders.to_vec();
 	binders.extend(member.binders.clone());
-	let ctx = context(defs, &binders);
+	let ctx = context(definitions, &binders);
 	Ok(OwnedMemberSig {
 		target: member.id.clone(),
 		kind: member.kind,
 		generics: binders.iter().map(|binder| binder.name.clone()).collect(),
-		bounds: recovered_bounds(defs, interner, &binders, &member.constraints)?,
+		bounds: recovered_bounds(defs, interner, &binders, &member.constraints, definitions)?,
 		params: member
 			.parameters
 			.iter()
@@ -768,12 +787,13 @@ fn instantiate_complete_definition(
 	facts: &mut ImportedFacts,
 	interner: &mut Interner,
 	definition: &ExportedDefinition,
+	definitions: &Arc<HashMap<DefinitionId, DefId>>,
 ) -> Result<(), EnvironmentConstructionError> {
 	let def = facts
 		.defs
 		.by_stable(&definition.id)
 		.ok_or_else(|| EnvironmentConstructionError::MissingKnownIdentity(definition.id.clone()))?;
-	let ctx = context(&facts.defs, &definition.binders);
+	let ctx = context(definitions, &definition.binders);
 	let generics = definition
 		.binders
 		.iter()
@@ -784,11 +804,20 @@ fn instantiate_complete_definition(
 		interner,
 		&definition.binders,
 		&definition.constraints,
+		definitions,
 	)?;
 	let owned_members = definition
 		.members
 		.iter()
-		.map(|member| owned_member(&facts.defs, interner, &definition.binders, member))
+		.map(|member| {
+			owned_member(
+				&facts.defs,
+				interner,
+				&definition.binders,
+				member,
+				definitions,
+			)
+		})
 		.collect::<Result<Vec<_>, _>>()?;
 	facts.definition_members.insert(def, owned_members);
 	match definition.kind {
@@ -806,6 +835,7 @@ fn instantiate_complete_definition(
 					&definition.constraints,
 					&definition.parameters,
 					ret,
+					definitions,
 				)?,
 			);
 		}
@@ -908,7 +938,7 @@ fn instantiate_complete_definition(
 			for member in &definition.members {
 				let mut member_binders = definition.binders.clone();
 				member_binders.extend(member.binders.clone());
-				let member_ctx = context(&facts.defs, &member_binders);
+				let member_ctx = context(definitions, &member_binders);
 				let target = Some(member.id.clone());
 				let value = match member.kind {
 					MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction => {
@@ -921,6 +951,7 @@ fn instantiate_complete_definition(
 								&[],
 								&member.parameters,
 								&member.return_type,
+								definitions,
 							)?,
 						}
 					}
@@ -965,6 +996,7 @@ fn instantiate_complete_definition(
 						&[],
 						&member.parameters,
 						&member.return_type,
+						definitions,
 					)?;
 					interface.methods.insert(
 						member.name.clone(),
@@ -990,7 +1022,7 @@ fn instantiate_complete_definition(
 		definition.kind,
 		DefinitionShapeKind::Struct | DefinitionShapeKind::Enum
 	) {
-		instantiate_definition_inherent(facts, interner, definition)?;
+		instantiate_definition_inherent(facts, interner, definition, definitions)?;
 	}
 	Ok(())
 }
@@ -1000,8 +1032,9 @@ fn complete_inherent_method(
 	interner: &mut Interner,
 	owner_binders: &[GenericParameter],
 	member: &MemberShape<InterfaceType>,
+	definitions: &Arc<HashMap<DefinitionId, DefId>>,
 ) -> Result<InherentMethod, EnvironmentConstructionError> {
-	let owned = owned_member(&facts.defs, interner, owner_binders, member)?;
+	let owned = owned_member(&facts.defs, interner, owner_binders, member, definitions)?;
 	Ok(InherentMethod {
 		definition: Some(owned.target),
 		local_span: None,
@@ -1030,8 +1063,9 @@ fn instantiate_definition_inherent(
 	facts: &mut ImportedFacts,
 	interner: &mut Interner,
 	definition: &ExportedDefinition,
+	definitions: &Arc<HashMap<DefinitionId, DefId>>,
 ) -> Result<(), EnvironmentConstructionError> {
-	let ctx = context(&facts.defs, &definition.binders);
+	let ctx = context(definitions, &definition.binders);
 	let self_ty = instantiate_interface_type(
 		interner,
 		&InterfaceType::Named {
@@ -1057,7 +1091,7 @@ fn instantiate_definition_inherent(
 		.map(|member| {
 			Ok((
 				member.name.clone(),
-				complete_inherent_method(facts, interner, &definition.binders, member)?,
+				complete_inherent_method(facts, interner, &definition.binders, member, definitions)?,
 			))
 		})
 		.collect::<Result<_, EnvironmentConstructionError>>()?;
@@ -1078,6 +1112,7 @@ fn instantiate_definition_inherent(
 					interner,
 					&definition.binders,
 					&definition.constraints,
+					definitions,
 				)?,
 				imported: true,
 			},
@@ -1090,14 +1125,16 @@ fn instantiate_complete_impl(
 	facts: &mut ImportedFacts,
 	interner: &mut Interner,
 	implementation: &ExportedImpl,
+	definitions: &Arc<HashMap<DefinitionId, DefId>>,
 ) -> Result<(), EnvironmentConstructionError> {
-	let ctx = context(&facts.defs, &implementation.binders);
+	let ctx = context(definitions, &implementation.binders);
 	let self_ty = instantiate_interface_type(interner, &implementation.self_type, &ctx);
 	let constraints = bounds(
 		&facts.defs,
 		interner,
 		&implementation.binders,
 		&implementation.constraints,
+		definitions,
 	)?;
 	let methods = implementation
 		.members
@@ -1109,7 +1146,13 @@ fn instantiate_complete_impl(
 			)
 		})
 		.map(|member| {
-			let method = complete_inherent_method(facts, interner, &implementation.binders, member)?;
+			let method = complete_inherent_method(
+				facts,
+				interner,
+				&implementation.binders,
+				member,
+				definitions,
+			)?;
 			Ok((
 				member.name.clone(),
 				crate::iface::IfaceMethod {
@@ -1179,7 +1222,13 @@ fn instantiate_complete_impl(
 			.map(|member| {
 				Ok((
 					member.name.clone(),
-					complete_inherent_method(facts, interner, &implementation.binders, member)?,
+					complete_inherent_method(
+						facts,
+						interner,
+						&implementation.binders,
+						member,
+						definitions,
+					)?,
 				))
 			})
 			.collect::<Result<_, EnvironmentConstructionError>>()?;
@@ -1218,8 +1267,9 @@ fn recovered_bounds(
 	interner: &mut Interner,
 	binders: &[GenericParameter],
 	constraints: &[crate::RecoveredGenericConstraint],
+	definitions: &Arc<HashMap<DefinitionId, DefId>>,
 ) -> Result<Vec<Bound>, EnvironmentConstructionError> {
-	let ctx = context(defs, binders);
+	let ctx = context(definitions, binders);
 	constraints
 		.iter()
 		.filter_map(|constraint| {
@@ -1263,12 +1313,13 @@ fn instantiate_recovered_definition(
 	facts: &mut ImportedFacts,
 	interner: &mut Interner,
 	definition: &RecoveredExportedDefinition,
+	definitions: &Arc<HashMap<DefinitionId, DefId>>,
 ) -> Result<(), EnvironmentConstructionError> {
 	let def = facts
 		.defs
 		.by_stable(&definition.id)
 		.ok_or_else(|| EnvironmentConstructionError::MissingKnownIdentity(definition.id.clone()))?;
-	let ctx = context(&facts.defs, &definition.binders);
+	let ctx = context(definitions, &definition.binders);
 	let generics = definition
 		.binders
 		.iter()
@@ -1277,7 +1328,15 @@ fn instantiate_recovered_definition(
 	let owned_members = definition
 		.members
 		.iter()
-		.map(|member| recovered_owned_member(&facts.defs, interner, &definition.binders, member))
+		.map(|member| {
+			recovered_owned_member(
+				&facts.defs,
+				interner,
+				&definition.binders,
+				member,
+				definitions,
+			)
+		})
 		.collect::<Result<Vec<_>, _>>()?;
 	facts.definition_members.insert(def, owned_members);
 	match definition.kind {
@@ -1291,6 +1350,7 @@ fn instantiate_recovered_definition(
 				interner,
 				&definition.binders,
 				&definition.constraints,
+				definitions,
 			)?;
 			facts.signatures.lets.insert(
 				def,
@@ -1316,6 +1376,7 @@ fn instantiate_recovered_definition(
 						interner,
 						&definition.binders,
 						&definition.constraints,
+						definitions,
 					)?,
 				},
 			);
@@ -1344,6 +1405,7 @@ fn instantiate_recovered_definition(
 						interner,
 						&definition.binders,
 						&definition.constraints,
+						definitions,
 					)?,
 				},
 			);
@@ -1380,6 +1442,7 @@ fn instantiate_recovered_definition(
 						interner,
 						&definition.binders,
 						&definition.constraints,
+						definitions,
 					)?,
 				},
 			);
@@ -1410,6 +1473,7 @@ fn instantiate_recovered_definition(
 						interner,
 						&definition.binders,
 						&definition.constraints,
+						definitions,
 					)?,
 				},
 			);
@@ -1513,7 +1577,13 @@ fn instantiate_recovered_definition(
 				)
 			})
 			.map(|member| {
-				let owned = recovered_owned_member(&facts.defs, interner, &definition.binders, member)?;
+				let owned = recovered_owned_member(
+					&facts.defs,
+					interner,
+					&definition.binders,
+					member,
+					definitions,
+				)?;
 				Ok((
 					member.name.clone(),
 					InherentMethod {
@@ -1547,6 +1617,7 @@ fn instantiate_recovered_definition(
 				interner,
 				&definition.binders,
 				&definition.constraints,
+				definitions,
 			)?;
 			facts.inherent.add(
 				head_of(interner, self_ty),
@@ -1572,6 +1643,7 @@ fn instantiate_recovered_impl(
 	facts: &mut ImportedFacts,
 	interner: &mut Interner,
 	implementation: &RecoveredExportedImpl,
+	definitions: &Arc<HashMap<DefinitionId, DefId>>,
 ) -> Result<(), EnvironmentConstructionError> {
 	if implementation.availability == crate::SemanticAvailability::StructureUnavailable
 		|| matches!(implementation.self_type, RecoveredInterfaceType::Poison)
@@ -1591,13 +1663,14 @@ fn instantiate_recovered_impl(
 	}) {
 		return Ok(());
 	}
-	let ctx = context(&facts.defs, &implementation.binders);
+	let ctx = context(definitions, &implementation.binders);
 	let self_ty = recovered_ty(interner, &implementation.self_type, &ctx);
 	let constraints = recovered_bounds(
 		&facts.defs,
 		interner,
 		&implementation.binders,
 		&implementation.constraints,
+		definitions,
 	)?;
 	let methods = implementation
 		.members
@@ -1609,7 +1682,13 @@ fn instantiate_recovered_impl(
 			)
 		})
 		.map(|member| {
-			let owned = recovered_owned_member(&facts.defs, interner, &implementation.binders, member)?;
+			let owned = recovered_owned_member(
+				&facts.defs,
+				interner,
+				&implementation.binders,
+				member,
+				definitions,
+			)?;
 			Ok((
 				member.name.clone(),
 				crate::iface::IfaceMethod {
