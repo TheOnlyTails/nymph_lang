@@ -176,6 +176,20 @@ fn private_name_cannot_be_imported_via_namespace_access() {
 	assert_eq!(diags.len(), 1, "{diags:?}");
 	assert_eq!(diags[0].diag.code, "IMPORT-PRIVATE-NAME", "{diags:?}");
 }
+
+#[test]
+fn missing_imported_namespace_member_has_a_structured_import_diagnostic() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/math with (public_value)\nfunc read(): int = math.missing()\nfunc main(): void = { let ignored = read() }",
+		),
+		("math", "public let public_value: int = 1"),
+	]);
+	let diags = check_project("main", &loader(files));
+	assert_eq!(diags.len(), 1, "{diags:?}");
+	assert_eq!(diags[0].diag.code, "IMPORT-UNRESOLVED-NAME", "{diags:?}");
+}
 #[test]
 fn private_helper_is_still_usable_within_its_own_module() {
 	// A private decl stays fully usable *inside* its own module — only the

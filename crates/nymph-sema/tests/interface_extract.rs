@@ -382,6 +382,158 @@ fn check(module: &nymph_ast::decl::Module) -> nymph_sema::Checked {
 }
 
 #[test]
+fn namespace_summary_is_body_independent_and_covers_lexical_declaration_forms() {
+	let source = r#"
+private func hidden(): int = 1
+public let shown: int = 2
+private external(max_float) let maximum: float
+private type Alias = Missing
+private struct Record(value: Missing) {}
+private enum Choice { One }
+private interface Marker {}
+private namespace Tools { func value(): int = 1 }
+impl Record {}
+"#;
+	let edited = source.replace("hidden(): int = 1", "hidden(): int = 99");
+	let module_identity = identity();
+	let summary = nymph_sema::namespace_summary(module_identity.clone(), &parse(source));
+	let edited_summary = nymph_sema::namespace_summary(module_identity.clone(), &parse(&edited));
+	assert_eq!(summary, edited_summary);
+	assert_eq!(summary.module, module_identity);
+	assert_eq!(
+		summary
+			.declarations
+			.iter()
+			.map(|declaration| declaration.name.as_str())
+			.collect::<Vec<_>>(),
+		[
+			"hidden", "shown", "maximum", "Alias", "Record", "Choice", "Marker", "Tools"
+		]
+	);
+	assert_eq!(
+		summary.declaration("shown").unwrap().visibility,
+		nymph_sema::NamespaceVisibility::Importable
+	);
+	for name in [
+		"hidden", "maximum", "Alias", "Record", "Choice", "Marker", "Tools",
+	] {
+		assert_eq!(
+			summary.declaration(name).unwrap().visibility,
+			nymph_sema::NamespaceVisibility::Private,
+			"{name}"
+		);
+	}
+	let headers = declared_headers(identity(), &parse(source));
+	assert_eq!(
+		summary
+			.declarations
+			.iter()
+			.map(|declaration| declaration.definition.clone())
+			.collect::<Vec<_>>(),
+		headers
+			.definitions
+			.into_iter()
+			.map(|(_, definition)| definition)
+			.collect::<Vec<_>>()
+	);
+}
+
+#[test]
+fn namespace_summary_preserves_duplicate_occurrence_ids_and_selects_the_lexical_winner() {
+	let module =
+		parse("private func same(): int = 1\npublic func same(): int = 2\nprivate struct same {}");
+	let headers = declared_headers(identity(), &module);
+	let summary = nymph_sema::namespace_summary(identity(), &module);
+	assert_eq!(summary.declarations.len(), 3);
+	assert_eq!(
+		summary
+			.declarations
+			.iter()
+			.map(|declaration| declaration.definition.clone())
+			.collect::<Vec<_>>(),
+		headers
+			.definitions
+			.iter()
+			.map(|(_, definition)| definition.clone())
+			.collect::<Vec<_>>()
+	);
+	assert_eq!(headers.definitions[0].1.key.duplicate(), 0);
+	assert_eq!(headers.definitions[1].1.key.duplicate(), 1);
+	assert!(matches!(
+		headers.definitions[2].1.key,
+		DeclarationKey::TopLevel {
+			category: DeclarationCategory::Struct,
+			..
+		}
+	));
+	let selected = summary.declaration("same").unwrap();
+	assert_eq!(selected.definition, headers.definitions[2].1);
+	assert_eq!(
+		selected.visibility,
+		nymph_sema::NamespaceVisibility::Private
+	);
+}
+
+#[test]
+fn recovered_environment_contains_the_exact_importable_duplicate_winner() {
+	let module = parse(
+		"private func same(): int = 1\npublic func same(): int = 2\nfunc broken(value: Missing): int = 0",
+	);
+	let headers = declared_headers(identity(), &module);
+	let summary = nymph_sema::namespace_summary(identity(), &module);
+	let winner = summary.declaration("same").unwrap();
+	assert_eq!(winner.definition, headers.definitions[1].1);
+	let checked = check(&module);
+	let ModuleEnvironment::Recovered(environment) =
+		recover_module_environment(identity(), &module, &checked, &headers)
+	else {
+		panic!("expected recovered environment")
+	};
+	assert!(
+		environment
+			.exports
+			.iter()
+			.any(|definition| definition.id == winner.definition),
+		"selected exact namespace identity must be available to consumers"
+	);
+	assert_eq!(
+		environment
+			.exports
+			.iter()
+			.filter(|definition| definition.name == "same")
+			.count(),
+		1
+	);
+}
+
+#[test]
+fn recovered_environment_respects_private_and_mixed_kind_duplicate_winners() {
+	for source in [
+		"public func same(): int = 1\nprivate func same(): int = 2\nfunc broken(value: Missing): int = 0",
+		"public func same(): int = 1\nprivate struct same {}\nfunc broken(value: Missing): int = 0",
+	] {
+		let module = parse(source);
+		let headers = declared_headers(identity(), &module);
+		let summary = nymph_sema::namespace_summary(identity(), &module);
+		let winner = summary.declaration("same").unwrap();
+		assert_eq!(winner.visibility, nymph_sema::NamespaceVisibility::Private);
+		let checked = check(&module);
+		let ModuleEnvironment::Recovered(environment) =
+			recover_module_environment(identity(), &module, &checked, &headers)
+		else {
+			panic!("expected recovered environment")
+		};
+		assert!(
+			environment
+				.exports
+				.iter()
+				.all(|definition| definition.name != "same"),
+			"a shadowed public declaration must not leak the private winner"
+		);
+	}
+}
+
+#[test]
 fn extraction_preserves_transitive_imported_nominal_return_identity() {
 	let owner = ModuleIdentity {
 		origin: nymph_sema::ModuleOrigin::Project("test".into()),

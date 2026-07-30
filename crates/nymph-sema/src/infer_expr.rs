@@ -1578,6 +1578,7 @@ impl<'m> Checker<'m> {
 							member.into(),
 							span,
 						);
+						return self.interner.error();
 					}
 					self.emit(
 						span,

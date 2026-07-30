@@ -24,6 +24,8 @@ use crate::{
 pub struct DeclaredHeaders {
 	pub module: ModuleIdentity,
 	pub definitions: Vec<(EcoString, DefinitionId)>,
+	/// Exact identities keyed by their source module-member index.
+	pub member_definitions: Vec<(usize, DefinitionId)>,
 	/// Exact checker-visible names, including compatibility rewrite prefixes.
 	/// This is deliberately separate from source headers: imported definitions
 	/// may share a source name with an item owned by this module.
@@ -94,10 +96,19 @@ impl ExtractionFactSelection {
 impl DeclaredHeaders {
 	fn id(&self, name: &str) -> Option<DefinitionId> {
 		self
-			.checked_definitions
+			.definitions
 			.iter()
+			.rev()
 			.find(|(n, _)| n == name)
-			.or_else(|| self.definitions.iter().find(|(n, _)| n == name))
+			.or_else(|| self.checked_definitions.iter().find(|(n, _)| n == name))
+			.map(|(_, id)| id.clone())
+	}
+
+	pub(crate) fn member_id(&self, member: usize) -> Option<DefinitionId> {
+		self
+			.member_definitions
+			.iter()
+			.find(|(candidate, _)| *candidate == member)
 			.map(|(_, id)| id.clone())
 	}
 }
@@ -122,20 +133,30 @@ fn source_name(name: &str) -> &str {
 
 pub fn declared_headers(identity: ModuleIdentity, module: &Module) -> DeclaredHeaders {
 	let mut ids = StableIdBuilder::new(identity.clone());
-	let definitions: Vec<(EcoString, DefinitionId)> = module
+	let allocated: Vec<(usize, EcoString, DefinitionId)> = module
 		.members
 		.iter()
-		.filter_map(|declaration| {
+		.enumerate()
+		.filter_map(|(member, declaration)| {
 			let (category, name) = declaration_identity(declaration)?;
 			let source_name: EcoString = source_name(name).into();
 			Some((
+				member,
 				source_name.clone(),
 				ids.allocate(DeclarationKey::top_level(category, source_name)),
 			))
 		})
 		.collect();
+	let definitions = allocated
+		.iter()
+		.map(|(_, name, id)| (name.clone(), id.clone()))
+		.collect::<Vec<_>>();
 	DeclaredHeaders {
 		module: identity,
+		member_definitions: allocated
+			.into_iter()
+			.map(|(member, _, id)| (member, id))
+			.collect(),
 		checked_definitions: definitions.clone(),
 		definitions,
 	}
@@ -160,6 +181,16 @@ fn declaration_identity(declaration: &Declaration) -> Option<(DeclarationCategor
 		Declaration::Import { .. } | Declaration::Impl { .. } | Declaration::ImplFor { .. } => {
 			return None;
 		}
+	})
+}
+
+fn lexical_winner(module: &Module, member: usize, declaration: &Declaration) -> bool {
+	let Some((_, name)) = declaration_identity(declaration) else {
+		return true;
+	};
+	let name = source_name(name);
+	!module.members[member + 1..].iter().any(|later| {
+		declaration_identity(later).is_some_and(|(_, later_name)| source_name(later_name) == name)
 	})
 }
 
@@ -1009,6 +1040,7 @@ pub(crate) fn assign_runtime_body_identities(
 	let mut source_identities = crate::annotate::SourceIdentities::default();
 	let headers = DeclaredHeaders {
 		module: identity.clone(),
+		member_definitions: Vec::new(),
 		definitions: checker
 			.defs
 			.defs
@@ -1466,6 +1498,7 @@ fn function_shape(
 }
 
 fn extract_definition(
+	member: usize,
 	declaration: &Declaration,
 	checked: &Checked,
 	headers: &DeclaredHeaders,
@@ -1474,12 +1507,14 @@ fn extract_definition(
 	let Some((_, name)) = declaration_identity(declaration) else {
 		return Ok(None);
 	};
-	let id = headers.id(name).expect("declared header exists");
+	let id = headers
+		.member_id(member)
+		.expect("declared source member has an exact header");
 	let source_name: EcoString = source_name(name).into();
 	let def = checked
 		.semantic
 		.definitions
-		.get(name)
+		.by_stable(&id)
 		.expect("checked definition exists");
 	let mut result = match declaration {
 		Declaration::Func {
@@ -2338,7 +2373,14 @@ pub fn extract_module_interface_with_facts(
 	let all = module
 		.members
 		.iter()
-		.map(|declaration| extract_definition(declaration, checked, headers, &context))
+		.enumerate()
+		.map(|(member, declaration)| {
+			if lexical_winner(module, member, declaration) {
+				extract_definition(member, declaration, checked, headers, &context)
+			} else {
+				Ok(None)
+			}
+		})
 		.collect::<Result<Vec<_>, _>>()?;
 	let mut exports = Vec::new();
 	let mut private = HashMap::new();
@@ -2400,26 +2442,17 @@ pub fn extract_module_interface_with_facts(
 	Ok(interface)
 }
 
-/// Exact private top-level identities retained solely for lexical import diagnostics.
-///
-/// These facts deliberately remain separate from [`ModuleInterface`]: they are not
-/// type/runtime support and changing a private body must not change public shapes.
-pub fn extract_lexical_private_definitions(
-	module: &Module,
-	checked: &Checked,
-	headers: &DeclaredHeaders,
-) -> Result<Vec<(EcoString, DefinitionId)>, InterfaceConversionError> {
-	let context = context(checked, headers);
-	let definitions = module
+/// Project exact lexical declaration identities without checking declaration bodies.
+#[must_use]
+pub fn namespace_summary(identity: ModuleIdentity, module: &Module) -> crate::NamespaceSummary {
+	let headers = declared_headers(identity.clone(), module);
+	let declarations = module
 		.members
 		.iter()
-		.map(|declaration| extract_definition(declaration, checked, headers, &context))
-		.collect::<Result<Vec<_>, _>>()?;
-	let mut private = module
-		.members
-		.iter()
-		.zip(definitions)
-		.filter_map(|(declaration, definition)| {
+		.enumerate()
+		.filter_map(|declaration| {
+			let (member, declaration) = declaration;
+			let (_, name) = declaration_identity(declaration)?;
 			let visibility = match declaration {
 				Declaration::Func { visibility, .. }
 				| Declaration::Let { visibility, .. }
@@ -2432,14 +2465,27 @@ pub fn extract_lexical_private_definitions(
 				| Declaration::ExternalLet(visibility, ..) => *visibility,
 				_ => return None,
 			};
-			(!visible(visibility))
-				.then_some(definition)
-				.flatten()
-				.map(|definition| (definition.name, definition.id))
+			Some((member, source_name(name), visibility))
 		})
-		.collect::<Vec<_>>();
-	private.sort_by(|left, right| left.1.cmp(&right.1));
-	Ok(private)
+		.map(|(member, name, visibility)| {
+			let definition = headers
+				.member_id(member)
+				.expect("every lexical declaration has an exact declared header");
+			crate::NamespaceDeclaration {
+				name: name.into(),
+				definition,
+				visibility: if visible(visibility) {
+					crate::NamespaceVisibility::Importable
+				} else {
+					crate::NamespaceVisibility::Private
+				},
+			}
+		})
+		.collect();
+	crate::NamespaceSummary {
+		module: identity,
+		declarations,
+	}
 }
 
 fn poison_binders(
@@ -3308,10 +3354,12 @@ fn recover_implementations(
 }
 
 fn poison_definition(
+	member: usize,
 	declaration: &Declaration,
 	headers: &DeclaredHeaders,
 ) -> Option<RecoveredExportedDefinition> {
 	let (_, name) = declaration_identity(declaration)?;
+	let id = headers.member_id(member)?;
 	let visibility = match declaration {
 		Declaration::Func { visibility, .. }
 		| Declaration::Let { visibility, .. }
@@ -3327,7 +3375,7 @@ fn poison_definition(
 	let (kind, binders, parameters, return_type, ty, fields, variants, members) = match declaration {
 		Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => (
 			DefinitionShapeKind::Function,
-			poison_binders(headers.id(name)?, &meta.generics),
+			poison_binders(id.clone(), &meta.generics),
 			meta
 				.params
 				.iter()
@@ -3356,7 +3404,7 @@ fn poison_definition(
 		),
 		Declaration::TypeAlias { meta, .. } => (
 			DefinitionShapeKind::TypeAlias,
-			poison_binders(headers.id(name)?, &meta.generics),
+			poison_binders(id.clone(), &meta.generics),
 			Vec::new(),
 			None,
 			Some(RecoveredInterfaceType::Poison),
@@ -3370,7 +3418,7 @@ fn poison_definition(
 			members,
 			..
 		} => {
-			let owner = headers.id(name)?;
+			let owner = id.clone();
 			let mut ids = StableIdBuilder::new(headers.module.clone());
 			(
 				DefinitionShapeKind::Struct,
@@ -3413,7 +3461,7 @@ fn poison_definition(
 			members,
 			..
 		} => {
-			let owner = headers.id(name)?;
+			let owner = id.clone();
 			let binders = poison_binders(owner.clone(), generics);
 			let mut ids = StableIdBuilder::new(headers.module.clone());
 			let variants = variants
@@ -3461,7 +3509,7 @@ fn poison_definition(
 		Declaration::Interface {
 			generics, members, ..
 		} => {
-			let owner = headers.id(name)?;
+			let owner = id.clone();
 			let binders = poison_binders(owner.clone(), generics);
 			let mut ids = StableIdBuilder::new(headers.module.clone());
 			let elements = members
@@ -3516,7 +3564,7 @@ fn poison_definition(
 			)
 		}
 		Declaration::Namespace { members, .. } => {
-			let owner = headers.id(name)?;
+			let owner = id.clone();
 			let mut ids = StableIdBuilder::new(headers.module.clone());
 			(
 				DefinitionShapeKind::Namespace,
@@ -3534,7 +3582,7 @@ fn poison_definition(
 		}
 	};
 	let mut recovered = RecoveredExportedDefinition {
-		id: headers.id(name)?,
+		id,
 		name: name.clone(),
 		visibility,
 		kind,
@@ -3630,20 +3678,24 @@ pub fn recover_module_environment_with_facts(
 	let exports: Vec<RecoveredExportedDefinition> = module
 		.members
 		.iter()
-		.filter_map(|declaration| {
-			extract_definition(declaration, checked, headers, &context)
+		.enumerate()
+		.filter(|(member, declaration)| lexical_winner(module, *member, declaration))
+		.filter_map(|(member, declaration)| {
+			extract_definition(member, declaration, checked, headers, &context)
 				.ok()
 				.flatten()
 				.filter(|d| visible(d.visibility))
 				.map(RecoveredExportedDefinition::from)
-				.or_else(|| poison_definition(declaration, headers))
+				.or_else(|| poison_definition(member, declaration, headers))
 				.filter(|definition| visible(definition.visibility))
 		})
 		.collect();
 	let mut private = module
 		.members
 		.iter()
-		.filter_map(|declaration| poison_definition(declaration, headers))
+		.enumerate()
+		.filter(|(member, declaration)| lexical_winner(module, *member, declaration))
+		.filter_map(|(member, declaration)| poison_definition(member, declaration, headers))
 		.filter(|definition| !visible(definition.visibility))
 		.map(|definition| (definition.id.clone(), definition))
 		.collect::<HashMap<_, _>>();

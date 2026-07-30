@@ -315,18 +315,81 @@ pub(crate) struct ResolvedModuleImports {
 	pub diagnostics: Arc<[ProjectDiagnostic]>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ImportDiagnosticCause {
+	NameCollision {
+		local: ecow::EcoString,
+		span: Span,
+	},
+	PrivateName {
+		declaration: nymph_sema::NamespaceDeclaration,
+		span: Span,
+	},
+	MissingName {
+		name: ecow::EcoString,
+		span: Span,
+	},
+	PrivateNamespaceMember {
+		declaration: nymph_sema::NamespaceDeclaration,
+		span: Span,
+	},
+	MissingNamespaceMember {
+		member: ecow::EcoString,
+		span: Span,
+	},
+}
+
+impl ImportDiagnosticCause {
+	fn render(self, module: &str) -> ProjectDiagnostic {
+		let (code, message, span) = match self {
+			Self::NameCollision { local, span } => (
+				"IMPORT-NAME-COLLISION",
+				format!("import name `{local}` collides with another lexical binding"),
+				span,
+			),
+			Self::PrivateName { declaration, span } => (
+				"IMPORT-PRIVATE-NAME",
+				format!("`{}` is private and cannot be imported", declaration.name),
+				span,
+			),
+			Self::MissingName { name, span } => (
+				"IMPORT-UNRESOLVED-NAME",
+				format!("imported module has no exported name `{name}`"),
+				span,
+			),
+			Self::PrivateNamespaceMember { declaration, span } => (
+				"IMPORT-PRIVATE-NAME",
+				format!(
+					"private imported namespace member `{}` cannot be accessed",
+					declaration.name
+				),
+				span,
+			),
+			Self::MissingNamespaceMember { member, span } => (
+				"IMPORT-UNRESOLVED-NAME",
+				format!("imported namespace has no member `{member}`"),
+				span,
+			),
+		};
+		ProjectDiagnostic {
+			module: module.to_string(),
+			diag: Diagnostic::error(code.into(), message, span),
+		}
+	}
+}
+
 #[salsa::tracked(returns(clone))]
-fn interface_module_lexical_private_definitions<'db>(
+fn namespace_summary<'db>(
 	db: &'db dyn Db,
-	key: ProjectKey<'db>,
+	_key: ProjectKey<'db>,
 	module: SemanticModuleInput,
-) -> Arc<[(ecow::EcoString, nymph_sema::DefinitionId)]> {
-	let analysis = interface_module_analysis(db, key, module);
-	let checked = checked_from_analysis(&analysis, []);
-	let headers = nymph_sema::declared_headers(module.identity(db), &analysis.semantic.module);
-	nymph_sema::extract_lexical_private_definitions(&analysis.semantic.module, &checked, &headers)
-		.unwrap_or_default()
-		.into()
+) -> Arc<nymph_sema::NamespaceSummary> {
+	#[cfg(feature = "test-support")]
+	db.semantic_query_will_execute("namespace_summary", module);
+	Arc::new(nymph_sema::namespace_summary(
+		module.identity(db),
+		&module.parsed(db).tree,
+	))
 }
 
 fn local_declaration_name(declaration: &Declaration) -> Option<Ident> {
@@ -350,21 +413,13 @@ fn local_declaration_name(declaration: &Declaration) -> Option<Ident> {
 fn insert_import_binding(
 	bindings: &mut FxHashMap<ecow::EcoString, nymph_sema::ResolvedImportBinding>,
 	locals: &FxHashMap<ecow::EcoString, Span>,
-	diagnostics: &mut Vec<ProjectDiagnostic>,
-	owner: &str,
+	diagnostic_causes: &mut Vec<ImportDiagnosticCause>,
 	local: ecow::EcoString,
 	span: Span,
 	binding: nymph_sema::ResolvedImportBinding,
 ) -> bool {
 	if bindings.contains_key(&local) || locals.contains_key(&local) {
-		diagnostics.push(ProjectDiagnostic {
-			module: owner.to_string(),
-			diag: Diagnostic::error(
-				"IMPORT-NAME-COLLISION".into(),
-				format!("import name `{local}` collides with another lexical binding"),
-				span,
-			),
-		});
+		diagnostic_causes.push(ImportDiagnosticCause::NameCollision { local, span });
 		return false;
 	}
 	bindings.insert(local, binding);
@@ -377,6 +432,8 @@ pub(crate) fn resolved_module_imports<'db>(
 	key: ProjectKey<'db>,
 	module: SemanticModuleInput,
 ) -> Arc<ResolvedModuleImports> {
+	#[cfg(feature = "test-support")]
+	db.semantic_query_will_execute("resolved_module_imports", module);
 	let graph = project_graph(db, key);
 	let direct = graph.semantic_direct_dependencies(module);
 	let locals = module
@@ -389,7 +446,7 @@ pub(crate) fn resolved_module_imports<'db>(
 		.collect::<FxHashMap<_, _>>();
 	let mut bindings = FxHashMap::default();
 	let mut namespaces = Vec::new();
-	let mut diagnostics = Vec::new();
+	let mut diagnostic_causes = Vec::new();
 	let owner = module.display_key(db);
 	for import in graph.semantic_direct_imports(db, module).iter() {
 		let Ok(target_key) = &import.target else {
@@ -403,25 +460,19 @@ pub(crate) fn resolved_module_imports<'db>(
 			continue;
 		};
 		let identity = target.identity(db);
-		let interface = match interface_module_interface(db, key, target) {
-			Ok(interface) => interface,
-			Err(_) => continue,
-		};
+		let summary = namespace_summary(db, key, target);
 		let namespace = import.namespace.0.clone();
-		let namespace_matches_export = interface
-			.exports
-			.iter()
-			.any(|definition| definition.name == namespace)
-			&& (!import.has_with_list
-				|| import.with_idents.iter().any(|(source, alias)| {
-					source.0 == namespace && alias.as_ref().unwrap_or(source).0 == namespace
-				}));
+		let namespace_matches_export = summary.declaration(&namespace).is_some_and(|declaration| {
+			declaration.visibility == nymph_sema::NamespaceVisibility::Importable
+		}) && (!import.has_with_list
+			|| import.with_idents.iter().any(|(source, alias)| {
+				source.0 == namespace && alias.as_ref().unwrap_or(source).0 == namespace
+			}));
 		if !namespace_matches_export
 			&& insert_import_binding(
 				&mut bindings,
 				&locals,
-				&mut diagnostics,
-				&owner,
+				&mut diagnostic_causes,
 				namespace.clone(),
 				import.namespace.1,
 				nymph_sema::ResolvedImportBinding::Namespace(identity.clone()),
@@ -441,56 +492,57 @@ pub(crate) fn resolved_module_imports<'db>(
 				})
 				.collect::<Vec<_>>()
 		} else {
-			interface
-				.exports
+			summary
+				.declarations
 				.iter()
-				.map(|definition| {
+				.enumerate()
+				.filter(|(index, declaration)| {
+					declaration.visibility == nymph_sema::NamespaceVisibility::Importable
+						&& !summary.declarations[index + 1..]
+							.iter()
+							.any(|later| later.name == declaration.name)
+				})
+				.map(|(_, declaration)| {
 					(
-						definition.name.clone(),
-						definition.name.clone(),
+						declaration.name.clone(),
+						declaration.name.clone(),
 						import.namespace.1,
 					)
 				})
 				.collect::<Vec<_>>()
 		};
 		for (source, local, span) in selected {
-			if let Some(definition) = interface.exports.iter().find(|item| item.name == source) {
-				insert_import_binding(
-					&mut bindings,
-					&locals,
-					&mut diagnostics,
-					&owner,
-					local,
-					span,
-					nymph_sema::ResolvedImportBinding::Definition(definition.id.clone()),
-				);
-			} else {
-				let target_private = interface_module_lexical_private_definitions(db, key, target);
-				let private = target_private.iter().any(|(name, _)| *name == source);
-				diagnostics.push(ProjectDiagnostic {
-					module: owner.clone(),
-					diag: Diagnostic::error(
-						if private {
-							"IMPORT-PRIVATE-NAME"
-						} else {
-							"IMPORT-UNRESOLVED-NAME"
-						}
-						.into(),
-						if private {
-							format!("`{source}` is private and cannot be imported")
-						} else {
-							format!("imported module has no exported name `{source}`")
-						},
+			match summary.declaration(&source) {
+				Some(declaration)
+					if declaration.visibility == nymph_sema::NamespaceVisibility::Importable =>
+				{
+					insert_import_binding(
+						&mut bindings,
+						&locals,
+						&mut diagnostic_causes,
+						local,
 						span,
-					),
-				});
+						nymph_sema::ResolvedImportBinding::Definition(declaration.definition.clone()),
+					);
+				}
+				Some(declaration) => {
+					diagnostic_causes.push(ImportDiagnosticCause::PrivateName {
+						declaration: declaration.clone(),
+						span,
+					});
+				}
+				None => diagnostic_causes.push(ImportDiagnosticCause::MissingName { name: source, span }),
 			}
 		}
 	}
 	Arc::new(ResolvedModuleImports {
 		bindings,
 		namespaces,
-		diagnostics: diagnostics.into(),
+		diagnostics: diagnostic_causes
+			.into_iter()
+			.map(|cause| cause.render(&owner))
+			.collect::<Vec<_>>()
+			.into(),
 	})
 }
 
@@ -1936,7 +1988,7 @@ pub(crate) fn interface_module_analysis<'db>(
 			nymph_sema::EntryMode::Library
 		},
 	);
-	let private_accesses = result
+	let qualified_access_causes = result
 		.analysis
 		.annotations
 		.unresolved_qualified_accesses()
@@ -1947,10 +1999,19 @@ pub(crate) fn interface_module_analysis<'db>(
 				.iter()
 				.copied()
 				.find(|dependency| dependency.identity(db) == access.module)?;
-			interface_module_lexical_private_definitions(db, key, dependency)
-				.iter()
-				.any(|(name, _)| *name == access.member)
-				.then_some(access)
+			let summary = namespace_summary(db, key, dependency);
+			Some(match summary.declaration(&access.member) {
+				Some(declaration) if declaration.visibility == nymph_sema::NamespaceVisibility::Private => {
+					ImportDiagnosticCause::PrivateNamespaceMember {
+						declaration: declaration.clone(),
+						span: access.span,
+					}
+				}
+				_ => ImportDiagnosticCause::MissingNamespaceMember {
+					member: access.member.clone(),
+					span: access.span,
+				},
+			})
 		})
 		.collect::<Vec<_>>();
 	let mut diagnostics = resolved.diagnostics.iter().cloned().collect::<Vec<_>>();
@@ -1958,11 +2019,6 @@ pub(crate) fn interface_module_analysis<'db>(
 		result
 			.diagnostics
 			.iter()
-			.filter(|diag| {
-				!private_accesses.iter().any(|access| {
-					is_missing_diagnostic_for_qualified_access(diag, access.span, access.member.as_str())
-				})
-			})
 			.cloned()
 			.map(|diag| ProjectDiagnostic {
 				module: module.display_key(db),
@@ -1970,16 +2026,11 @@ pub(crate) fn interface_module_analysis<'db>(
 			})
 			.collect::<Vec<_>>(),
 	);
-	for access in private_accesses {
-		diagnostics.push(ProjectDiagnostic {
-			module: module.display_key(db),
-			diag: Diagnostic::error(
-				"IMPORT-PRIVATE-NAME".into(),
-				"private imported namespace member cannot be accessed".to_string(),
-				access.span,
-			),
-		});
-	}
+	diagnostics.extend(
+		qualified_access_causes
+			.into_iter()
+			.map(|cause| cause.render(&module.display_key(db))),
+	);
 	for (target, span) in result.analysis.checked.local_inherent_owners() {
 		if target.module != module.identity(db) {
 			diagnostics.push(ProjectDiagnostic {
@@ -2033,18 +2084,6 @@ fn interface_declared_headers<'db>(
 		}
 	}
 	Arc::new(own.with_checked_definitions(checked_definitions))
-}
-
-fn is_missing_diagnostic_for_qualified_access(
-	diagnostic: &Diagnostic,
-	span: Span,
-	member: &str,
-) -> bool {
-	diagnostic.code == "2022"
-		&& diagnostic.span == span
-		&& diagnostic
-			.message
-			.starts_with(&format!("no field `{member}` on `"))
 }
 
 #[salsa::tracked(returns(clone))]
@@ -2345,7 +2384,6 @@ mod tests {
 	use std::collections::BTreeMap;
 
 	use nymph_ast::Span;
-	use nymph_diagnostics::Diagnostic;
 	use nymph_sema::EntryMode;
 
 	use super::*;
@@ -2396,19 +2434,29 @@ mod tests {
 	}
 
 	#[test]
-	fn private_access_conversion_preserves_unrelated_diagnostic_at_same_span() {
+	fn private_access_cause_renders_without_inspecting_other_diagnostics() {
 		let span = Span::new(10, 16);
-		let missing_member = Diagnostic::error("2022".into(), "no field `helper` on `math`", span);
-		let unrelated = Diagnostic::error("2999".into(), "unrelated", span);
-
-		assert!(is_missing_diagnostic_for_qualified_access(
-			&missing_member,
+		let definition = nymph_sema::DefinitionId::new(
+			nymph_sema::ModuleIdentity {
+				origin: nymph_sema::ModuleOrigin::Project("privacy".into()),
+				project: "privacy".into(),
+				path: "dependency".into(),
+			},
+			nymph_sema::DeclarationKey::top_level(nymph_sema::DeclarationCategory::Function, "helper"),
+		);
+		let diagnostic = ImportDiagnosticCause::PrivateNamespaceMember {
+			declaration: nymph_sema::NamespaceDeclaration {
+				name: "helper".into(),
+				definition,
+				visibility: nymph_sema::NamespaceVisibility::Private,
+			},
 			span,
-			"helper"
-		));
-		assert!(!is_missing_diagnostic_for_qualified_access(
-			&unrelated, span, "helper"
-		));
+		}
+		.render("main");
+
+		assert_eq!(diagnostic.module, "main");
+		assert_eq!(diagnostic.diag.code, "IMPORT-PRIVATE-NAME");
+		assert_eq!(diagnostic.diag.span, span);
 	}
 
 	fn fixture(files: &[(&str, &str)], builtins: &[(&str, &str)]) -> (TestDb, ProjectKey<'static>) {

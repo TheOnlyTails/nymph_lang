@@ -369,6 +369,184 @@ fn private_leaf_body_edit_backdates_before_consumers_execute() {
 }
 
 #[test]
+fn private_namespace_body_edit_recomputes_only_the_dependency_summary() {
+	let (mut session, events) = interface_event_session();
+	let project = ProjectId::new("namespace-summary-body");
+	let leaf = ModulePath::new("leaf").unwrap();
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		leaf.clone(),
+		"private func helper(): int = 1\npublic func value(): int = 1".into(),
+		SourceVersion(1),
+	);
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"import @/leaf with (value)\nfunc read(): int = leaf.helper()\nfunc main(): void = { let ignored = read() }"
+			.into(),
+		SourceVersion(1),
+	);
+	let _ = session.analyze_module(
+		project.clone(),
+		main.clone(),
+		main.clone(),
+		EntryMode::Entry,
+	);
+	events.lock().unwrap().clear();
+	session.set_source(
+		project.clone(),
+		leaf,
+		"private func helper(): int = 2\npublic func value(): int = 1".into(),
+		SourceVersion(2),
+	);
+	let _ = session.analyze_module(project, main.clone(), main, EntryMode::Entry);
+	let observed = events.lock().unwrap();
+	assert_eq!(count(&observed, "namespace_summary", "leaf"), 1);
+	assert_eq!(count(&observed, "resolved_module_imports", "main"), 0);
+	assert_eq!(count(&observed, "interface_module_analysis", "main"), 0);
+}
+
+#[test]
+fn private_namespace_name_edit_revalidates_the_consumer_privacy_decision() {
+	let (mut session, events) = interface_event_session();
+	let project = ProjectId::new("namespace-summary-private-name");
+	let leaf = ModulePath::new("leaf").unwrap();
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		leaf.clone(),
+		"private func helper(): int = 1\npublic func value(): int = 1".into(),
+		SourceVersion(1),
+	);
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"import @/leaf with (value)\nfunc main(): int = leaf.helper()".into(),
+		SourceVersion(1),
+	);
+	let initial = session
+		.analyze_module(
+			project.clone(),
+			main.clone(),
+			main.clone(),
+			EntryMode::Entry,
+		)
+		.unwrap();
+	assert!(
+		initial
+			.diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.diag.code == "IMPORT-PRIVATE-NAME")
+	);
+	events.lock().unwrap().clear();
+	session.set_source(
+		project.clone(),
+		leaf,
+		"private func renamed(): int = 1\npublic func value(): int = 1".into(),
+		SourceVersion(2),
+	);
+	let changed = session
+		.analyze_module(project, main.clone(), main, EntryMode::Entry)
+		.unwrap();
+	assert!(
+		changed
+			.diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.diag.code == "IMPORT-UNRESOLVED-NAME")
+	);
+	let observed = events.lock().unwrap();
+	assert_eq!(count(&observed, "namespace_summary", "leaf"), 1);
+	assert_eq!(count(&observed, "interface_module_analysis", "main"), 1);
+}
+
+#[test]
+fn private_to_public_edit_revalidates_and_allows_namespace_access() {
+	let (mut session, events) = interface_event_session();
+	let project = ProjectId::new("namespace-summary-visibility");
+	let leaf = ModulePath::new("leaf").unwrap();
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		leaf.clone(),
+		"private func helper(): int = 1\npublic func value(): int = 1".into(),
+		SourceVersion(1),
+	);
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"import @/leaf with (value)\nfunc read(): int = leaf.helper()\nfunc main(): void = { let ignored = read() }"
+			.into(),
+		SourceVersion(1),
+	);
+	let _ = session.analyze_module(
+		project.clone(),
+		main.clone(),
+		main.clone(),
+		EntryMode::Entry,
+	);
+	events.lock().unwrap().clear();
+	session.set_source(
+		project.clone(),
+		leaf,
+		"public func helper(): int = 1\npublic func value(): int = 1".into(),
+		SourceVersion(2),
+	);
+	let changed = session
+		.analyze_module(project, main.clone(), main, EntryMode::Entry)
+		.unwrap();
+	assert!(changed.diagnostics.is_empty(), "{:?}", changed.diagnostics);
+	let observed = events.lock().unwrap();
+	assert_eq!(count(&observed, "namespace_summary", "leaf"), 1);
+	assert_eq!(count(&observed, "interface_module_analysis", "main"), 1);
+}
+
+#[test]
+fn recovery_to_complete_reclassifies_private_namespace_access() {
+	let (mut session, events) = interface_event_session();
+	let project = ProjectId::new("namespace-summary-recovery");
+	let leaf = ModulePath::new("leaf").unwrap();
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		leaf.clone(),
+		"private func helper(): int = 1\npublic func value(input: Missing): int = 1".into(),
+		SourceVersion(1),
+	);
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"import @/leaf\nfunc main(): int = leaf.helper()".into(),
+		SourceVersion(1),
+	);
+	let _ = session.analyze_module(
+		project.clone(),
+		main.clone(),
+		main.clone(),
+		EntryMode::Entry,
+	);
+	events.lock().unwrap().clear();
+	session.set_source(
+		project.clone(),
+		leaf,
+		"private func helper(): int = 1\npublic func value(input: int): int = input".into(),
+		SourceVersion(2),
+	);
+	let changed = session
+		.analyze_module(project, main.clone(), main, EntryMode::Entry)
+		.unwrap();
+	assert!(
+		changed
+			.diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.diag.code == "IMPORT-PRIVATE-NAME")
+	);
+	let observed = events.lock().unwrap();
+	assert_eq!(count(&observed, "namespace_summary", "leaf"), 1);
+	assert_eq!(count(&observed, "interface_module_analysis", "main"), 1);
+}
+
+#[test]
 fn public_leaf_signature_edit_invalidates_only_reachable_consumers() {
 	let (mut session, events) = interface_event_session();
 	let project = ProjectId::new("interface-public");

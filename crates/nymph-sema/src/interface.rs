@@ -15,6 +15,40 @@ use nymph_hir::{
 
 use crate::{DefinitionId, GenericParameterId, ModuleIdentity};
 
+/// Body-independent lexical declarations owned by one semantic module.
+///
+/// This is deliberately separate from [`ModuleInterface`]: private declarations
+/// participate in import/privacy decisions but never become semantic exports.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub struct NamespaceSummary {
+	pub module: ModuleIdentity,
+	pub declarations: Vec<NamespaceDeclaration>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub struct NamespaceDeclaration {
+	pub name: EcoString,
+	pub definition: DefinitionId,
+	pub visibility: NamespaceVisibility,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub enum NamespaceVisibility {
+	Importable,
+	Private,
+}
+
+impl NamespaceSummary {
+	#[must_use]
+	pub fn declaration(&self, name: &str) -> Option<&NamespaceDeclaration> {
+		self
+			.declarations
+			.iter()
+			.rev()
+			.find(|declaration| declaration.name == name)
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
 pub enum InterfaceType {
 	Int,

@@ -292,13 +292,7 @@ pub(crate) fn build_def_map_on(
 			);
 		}
 		seen.insert(name.0.clone(), name.1);
-		let stable = headers.and_then(|headers| {
-			headers
-				.checked_definitions
-				.iter()
-				.find(|(candidate, _)| candidate == &name.0)
-				.map(|(_, id)| id.clone())
-		});
+		let stable = headers.and_then(|headers| headers.member_id(member));
 		map.define(
 			name.0.clone(),
 			name.1,
