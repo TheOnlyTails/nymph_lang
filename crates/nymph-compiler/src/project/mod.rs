@@ -31,7 +31,6 @@ pub use metrics::{PhaseCounts, with_phase_counts};
 pub use test_support::{GraphFixture, GraphShape};
 
 use nymph_diagnostics::Diagnostic;
-use resolve::GraphBuilder;
 
 #[cfg(feature = "test-support")]
 mod test_support {
@@ -217,38 +216,8 @@ fn facade_session(
 	load: &dyn Fn(&str) -> Option<String>,
 	std_provider: &dyn Fn(&str) -> Option<String>,
 ) -> (CompilerSession, ProjectId, ModulePath) {
-	use std::{cell::RefCell, collections::BTreeMap};
-
-	let project_sources = RefCell::new(BTreeMap::new());
-	let builtin_sources = RefCell::new(BTreeMap::new());
-	let capture_project = |key: &str| {
-		load(key).inspect(|source| {
-			project_sources
-				.borrow_mut()
-				.entry(key.to_string())
-				.or_insert_with(|| source.clone());
-		})
-	};
-	let capture_builtin = |key: &str| {
-		std_provider(key).inspect(|source| {
-			builtin_sources
-				.borrow_mut()
-				.entry(key.to_string())
-				.or_insert_with(|| source.clone());
-		})
-	};
-	GraphBuilder::new(&capture_project, &capture_builtin).visit(entry);
-
 	let project = ProjectId::new(FACADE_PROJECT);
-	let mut session = CompilerSession::from_builtin_sources(builtin_sources.into_inner());
-	for (path, source) in project_sources.into_inner() {
-		session.set_source(
-			project.clone(),
-			ModulePath::new(path).expect("legacy discovery produced a canonical module path"),
-			source,
-			SourceVersion(1),
-		);
-	}
+	let session = CompilerSession::from_source_loaders(project.clone(), entry, load, std_provider);
 	let entry = ModulePath::new(entry).expect("project entry must be a canonical module path");
 	(session, project, entry)
 }

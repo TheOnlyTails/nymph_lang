@@ -1,9 +1,10 @@
 use std::{
-	collections::BTreeMap,
+	collections::{BTreeMap, BTreeSet},
 	fmt,
 	sync::{Arc, Mutex},
 };
 
+use nymph_ast::decl::Declaration;
 use nymph_sema::EntryMode;
 use salsa::Setter;
 
@@ -839,6 +840,65 @@ impl CompilerSession {
 		)
 	}
 
+	pub(crate) fn from_source_loaders(
+		project: ProjectId,
+		entry: &str,
+		load: &dyn Fn(&str) -> Option<String>,
+		std_provider: &dyn Fn(&str) -> Option<String>,
+	) -> Self {
+		let mut project_sources = BTreeMap::new();
+		let mut builtin_sources = BTreeMap::new();
+		let mut seen = BTreeSet::new();
+		let mut pending = vec![entry.to_string()];
+		while let Some(key) = pending.pop() {
+			if !seen.insert(key.clone()) {
+				continue;
+			}
+			let source = if let Some(path) = key.strip_prefix(super::resolve::STD_KEY_PREFIX) {
+				std_provider(path)
+			} else {
+				load(&key)
+			};
+			let Some(source) = source else {
+				continue;
+			};
+			let parsed = nymph_syntax::parse_module(&source, &format!("{key}.nym"));
+			let mut imports = Vec::new();
+			for declaration in &parsed.tree.members {
+				let Declaration::Import {
+					root, path, alias, ..
+				} = declaration
+				else {
+					continue;
+				};
+				if path.is_empty() && alias.is_none() {
+					continue;
+				}
+				if let Ok(target) =
+					super::resolve::resolve_import_target(root, path, &key, nymph_ast::Span::new(0, 0))
+				{
+					imports.push(target);
+				}
+			}
+			pending.extend(imports.into_iter().rev());
+			if let Some(path) = key.strip_prefix(super::resolve::STD_KEY_PREFIX) {
+				builtin_sources.insert(path.to_string(), source);
+			} else {
+				project_sources.insert(key, source);
+			}
+		}
+		let mut session = Self::from_builtin_sources(builtin_sources);
+		for (path, source) in project_sources {
+			session.set_source(
+				project.clone(),
+				ModulePath::new(path).expect("resolved source key is canonical"),
+				source,
+				SourceVersion(1),
+			);
+		}
+		session
+	}
+
 	#[doc(hidden)]
 	pub fn with_event_callback_and_tombstone_threshold(
 		callback: impl Fn(&str) + Send + Sync + 'static,
@@ -1326,7 +1386,75 @@ impl CompilerSession {
 
 #[cfg(test)]
 mod tests {
+	use std::{cell::RefCell, collections::HashMap};
+
 	use super::*;
+
+	#[test]
+	fn loader_source_acquisition_preserves_recovered_dfs_and_provider_routing() {
+		let calls = RefCell::new(Vec::new());
+		let project_sources = HashMap::from([
+			(
+				"main",
+				"import @/a\nimport @/missing\nimport @/missing\nimport std/root\nfunc broken(: int = 1",
+			),
+			("a", "import @/main"),
+			("project", "public let value = 1"),
+		]);
+		let builtin_sources = HashMap::from([
+			("root", "import ./child\nimport @/project"),
+			("child", "public let value = 1"),
+		]);
+		let load = |key: &str| {
+			calls.borrow_mut().push(format!("project:{key}"));
+			project_sources.get(key).map(ToString::to_string)
+		};
+		let std_provider = |key: &str| {
+			calls.borrow_mut().push(format!("std:{key}"));
+			builtin_sources.get(key).map(ToString::to_string)
+		};
+
+		let _ = CompilerSession::from_source_loaders(
+			ProjectId::new("loader-acquisition"),
+			"main",
+			&load,
+			&std_provider,
+		);
+
+		assert_eq!(
+			calls.into_inner(),
+			[
+				"project:main",
+				"project:a",
+				"project:missing",
+				"std:root",
+				"std:child",
+				"project:project",
+			]
+		);
+	}
+
+	#[test]
+	fn malformed_empty_relative_import_does_not_load_a_directory_key() {
+		let calls = RefCell::new(Vec::new());
+		let load = |key: &str| {
+			calls.borrow_mut().push(key.to_string());
+			match key {
+				"dir/main" => Some("import ./".to_string()),
+				"dir" => Some("public let unintended = 1".to_string()),
+				_ => None,
+			}
+		};
+
+		let _ = CompilerSession::from_source_loaders(
+			ProjectId::new("malformed-import"),
+			"dir/main",
+			&load,
+			&|_| None,
+		);
+
+		assert_eq!(calls.into_inner(), ["dir/main"]);
+	}
 
 	#[test]
 	fn database_rebuild_preserves_exact_custom_builtins() {

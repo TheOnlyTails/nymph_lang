@@ -2381,16 +2381,11 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 
 #[cfg(test)]
 mod tests {
-	use std::collections::BTreeMap;
-
 	use nymph_ast::Span;
 	use nymph_sema::EntryMode;
 
 	use super::*;
-	use crate::project::{
-		resolve::GraphBuilder,
-		session::{BuiltinRegistryInput, ProjectId},
-	};
+	use crate::project::session::{BuiltinRegistryInput, ProjectId};
 
 	#[salsa::db]
 	#[derive(Clone)]
@@ -2526,20 +2521,14 @@ mod tests {
 			.collect()
 	}
 
-	fn assert_graph_matches_legacy(files: &[(&str, &str)]) -> Vec<DiagnosticTuple> {
-		let sources: BTreeMap<_, _> = files.iter().copied().collect();
-		let load = |key: &str| sources.get(key).map(ToString::to_string);
-		let mut legacy = GraphBuilder::new(&load, &|_| None);
-		assert!(!legacy.visit("main"));
-		let expected = tuples(&legacy.diags);
+	fn graph_diagnostics(files: &[(&str, &str)]) -> Vec<DiagnosticTuple> {
 		let (db, key) = fixture(files, &[]);
-		assert_eq!(tuples(&project_graph(&db, key).diagnostics), expected);
-		expected
+		tuples(&project_graph(&db, key).diagnostics)
 	}
 
 	#[test]
-	fn graph_diagnostics_exactly_match_legacy_dfs_order_and_deduplication() {
-		let cycle = assert_graph_matches_legacy(&[
+	fn graph_diagnostics_preserve_dfs_order_and_deduplication() {
+		let cycle = graph_diagnostics(&[
 			("main", "import @/a"),
 			("a", "import @/b"),
 			("b", "import @/a"),
@@ -2548,19 +2537,18 @@ mod tests {
 		assert_eq!(cycle[0].1, "IMPORT-CYCLE");
 		assert_eq!(cycle[0].2, "import cycle detected: a -> b -> a");
 
-		let recovered =
-			assert_graph_matches_legacy(&[("main", "import @/missing\nfunc broken(: int = 1")]);
+		let recovered = graph_diagnostics(&[("main", "import @/missing\nfunc broken(: int = 1")]);
 		assert!(recovered.len() >= 2);
 		assert_ne!(recovered[0].1, "IMPORT-UNRESOLVED");
 		assert_eq!(recovered.last().unwrap().1, "IMPORT-UNRESOLVED");
 
-		let mixed = assert_graph_matches_legacy(&[("main", "import pkg/nope\nimport @/missing")]);
+		let mixed = graph_diagnostics(&[("main", "import pkg/nope\nimport @/missing")]);
 		assert_eq!(
 			mixed.iter().map(|item| item.1.as_str()).collect::<Vec<_>>(),
 			["IMPORT-PACKAGE-UNSUPPORTED", "IMPORT-UNRESOLVED"]
 		);
 
-		let duplicate = assert_graph_matches_legacy(&[("main", "import @/missing\nimport @/missing")]);
+		let duplicate = graph_diagnostics(&[("main", "import @/missing\nimport @/missing")]);
 		assert_eq!(
 			duplicate
 				.iter()
