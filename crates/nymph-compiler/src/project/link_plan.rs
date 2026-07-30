@@ -1,6 +1,6 @@
 //! Pure, typed planning for the names and modules delivered to code generation.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use nymph_sema::{
 	CanonicalModuleSpecifier, DefinitionId, EmittedBindingName, ExternalAbi, ModuleIdentity,
@@ -22,6 +22,12 @@ pub(crate) struct LinkFragment<'a> {
 	pub routed_demands: &'a [DefinitionId],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VirtualDemandDelivery {
+	Binding,
+	Attached,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlannedImport {
 	pub definition: DefinitionId,
@@ -37,10 +43,16 @@ pub(crate) struct LinkedExternalAlias {
 	pub abi: ExternalAbi,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PlannedExport {
+	pub definition: DefinitionId,
+	pub binding: EmittedBindingName,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ModuleLinkPlan {
 	pub imports: Vec<PlannedImport>,
-	pub exports: Vec<EmittedBindingName>,
+	pub exports: Vec<PlannedExport>,
 	pub external_aliases: Vec<LinkedExternalAlias>,
 }
 
@@ -53,6 +65,14 @@ pub(crate) enum ModuleLinkPlanError {
 	Module {
 		module: ModuleIdentity,
 		source: StableNameLookupError,
+	},
+	UnresolvedDemand {
+		definition: DefinitionId,
+	},
+	BindingCollision {
+		binding: EmittedBindingName,
+		first: DefinitionId,
+		second: DefinitionId,
 	},
 }
 
@@ -107,29 +127,37 @@ pub(crate) fn plan_project_module(
 					|| preserve_names
 					|| public.contains(fragment.definition))
 			{
-				plan
-					.exports
-					.push(resolve_binding(fragment.definition, resolver)?);
+				plan.exports.push(PlannedExport {
+					definition: fragment.definition.clone(),
+					binding: resolve_binding(fragment.definition, resolver)?,
+				});
 			}
 		}
 	}
-	finish(&mut plan);
+	finish(&mut plan)?;
 	Ok(plan)
 }
 
 pub(crate) fn plan_virtual_module(
 	owner: &ModuleIdentity,
 	fragments: &[LinkFragment<'_>],
-	module_bindings: &HashSet<DefinitionId>,
+	deliveries: &HashMap<DefinitionId, VirtualDemandDelivery>,
 	resolver: &mut impl LinkNameResolver,
 ) -> Result<ModuleLinkPlan, ModuleLinkPlanError> {
 	let mut plan = ModuleLinkPlan::default();
 	for demand in fragments
 		.iter()
 		.flat_map(|fragment| fragment.direct_demands)
-		.filter(|demand| demand.module != *owner && module_bindings.contains(*demand))
+		.filter(|demand| demand.module != *owner)
 	{
-		plan.imports.push(resolve_import(demand, resolver)?);
+		let Some(delivery) = deliveries.get(demand) else {
+			return Err(ModuleLinkPlanError::UnresolvedDemand {
+				definition: demand.clone(),
+			});
+		};
+		if *delivery == VirtualDemandDelivery::Binding {
+			plan.imports.push(resolve_import(demand, resolver)?);
+		}
 	}
 	for fragment in fragments {
 		if let LinkArtifact::External(abi) = fragment.artifact {
@@ -142,12 +170,13 @@ pub(crate) fn plan_virtual_module(
 			}
 		}
 		if !matches!(fragment.artifact, LinkArtifact::Attached) {
-			plan
-				.exports
-				.push(resolve_binding(fragment.definition, resolver)?);
+			plan.exports.push(PlannedExport {
+				definition: fragment.definition.clone(),
+				binding: resolve_binding(fragment.definition, resolver)?,
+			});
 		}
 	}
-	finish(&mut plan);
+	finish(&mut plan)?;
 	Ok(plan)
 }
 
@@ -184,16 +213,24 @@ fn resolve_import(
 	})
 }
 
-fn finish(plan: &mut ModuleLinkPlan) {
+fn finish(plan: &mut ModuleLinkPlan) -> Result<(), ModuleLinkPlanError> {
 	plan.imports.sort_by(|left, right| {
 		(specifier_str(&left.specifier), left.binding.as_str())
 			.cmp(&(specifier_str(&right.specifier), right.binding.as_str()))
 	});
+	validate_and_dedup_by_binding(
+		&mut plan.imports,
+		|item| (&item.definition, &item.binding),
+		|left, right| left.specifier == right.specifier && left.binding == right.binding,
+	)?;
 	plan
-		.imports
-		.dedup_by(|left, right| left.specifier == right.specifier && left.binding == right.binding);
-	plan.exports.sort();
-	plan.exports.dedup();
+		.exports
+		.sort_by(|left, right| left.binding.cmp(&right.binding));
+	validate_and_dedup_by_binding(
+		&mut plan.exports,
+		|item| (&item.definition, &item.binding),
+		|left, right| left.binding == right.binding,
+	)?;
 	plan.external_aliases.sort_by(|left, right| {
 		let (left_module, left_symbol) = left.abi.linked().expect("plans contain linked ABIs only");
 		let (right_module, right_symbol) = right.abi.linked().expect("plans contain linked ABIs only");
@@ -203,9 +240,37 @@ fn finish(plan: &mut ModuleLinkPlan) {
 			right.binding.as_str(),
 		))
 	});
-	plan.external_aliases.dedup_by(|left, right| {
-		left.abi.linked() == right.abi.linked() && left.binding == right.binding
-	});
+	validate_and_dedup_by_binding(
+		&mut plan.external_aliases,
+		|item| (&item.definition, &item.binding),
+		|left, right| left.abi.linked() == right.abi.linked() && left.binding == right.binding,
+	)?;
+	Ok(())
+}
+
+fn validate_and_dedup_by_binding<T>(
+	items: &mut Vec<T>,
+	identity: impl Fn(&T) -> (&DefinitionId, &EmittedBindingName),
+	same_output: impl Fn(&T, &T) -> bool,
+) -> Result<(), ModuleLinkPlanError> {
+	let mut index = 1;
+	while index < items.len() {
+		if !same_output(&items[index - 1], &items[index]) {
+			index += 1;
+			continue;
+		}
+		let (left_definition, left_binding) = identity(&items[index - 1]);
+		let (right_definition, _) = identity(&items[index]);
+		if left_definition != right_definition {
+			return Err(ModuleLinkPlanError::BindingCollision {
+				binding: left_binding.clone(),
+				first: left_definition.clone(),
+				second: right_definition.clone(),
+			});
+		}
+		items.remove(index);
+	}
+	Ok(())
 }
 
 pub(crate) fn specifier_str(specifier: &CanonicalModuleSpecifier) -> &str {
@@ -353,34 +418,79 @@ mod tests {
 	}
 
 	#[test]
-	fn virtual_imports_direct_only_and_sorts_and_deduplicates() {
+	fn virtual_imports_reject_unavailable_direct_demands() {
 		let own = module("runtime");
 		let dep = module("dep");
 		let a = definition(&dep, "a");
 		let b = definition(&dep, "b");
 		let unavailable = definition(&dep, "unavailable");
 		let routed = definition(&dep, "routed");
-		let colliding = DefinitionId::new(
-			dep.clone(),
-			DeclarationKey::top_level(DeclarationCategory::Let, "unavailable"),
-		);
 		let root = definition(&own, "root");
 		let fragments = [LinkFragment {
 			definition: &root,
 			artifact: LinkArtifact::TopLevel,
-			direct_demands: &[b.clone(), unavailable, a.clone(), b.clone()],
+			direct_demands: &[b.clone(), unavailable.clone(), a.clone(), b.clone()],
 			routed_demands: std::slice::from_ref(&routed),
 		}];
-		let bindings = HashSet::from([a.clone(), b.clone(), colliding, routed.clone()]);
-		let plan = plan_virtual_module(&own, &fragments, &bindings, &mut resolver()).unwrap();
-		assert_eq!(
-			plan
+		let deliveries = HashMap::from([
+			(a, VirtualDemandDelivery::Binding),
+			(b, VirtualDemandDelivery::Binding),
+			(routed.clone(), VirtualDemandDelivery::Binding),
+		]);
+		assert!(matches!(
+			plan_virtual_module(&own, &fragments, &deliveries, &mut resolver()),
+			Err(ModuleLinkPlanError::UnresolvedDemand { definition }) if definition == unavailable
+		));
+	}
+
+	#[test]
+	fn virtual_imports_validate_but_do_not_import_attached_demands() {
+		let own = module("runtime");
+		let dep = module("dep");
+		let attached = definition(&dep, "attached");
+		let root = definition(&own, "root");
+		let fragments = [LinkFragment {
+			definition: &root,
+			artifact: LinkArtifact::TopLevel,
+			direct_demands: std::slice::from_ref(&attached),
+			routed_demands: &[],
+		}];
+		let deliveries = HashMap::from([(attached.clone(), VirtualDemandDelivery::Attached)]);
+		assert!(
+			plan_virtual_module(&own, &fragments, &deliveries, &mut resolver())
+				.unwrap()
 				.imports
-				.iter()
-				.map(|item| item.definition.clone())
-				.collect::<Vec<_>>(),
-			vec![a, b]
+				.is_empty()
 		);
+	}
+
+	#[test]
+	fn distinct_exact_definitions_cannot_collapse_to_one_export() {
+		let own = module("runtime");
+		let function = definition(&own, "same");
+		let value = DefinitionId::new(
+			own.clone(),
+			DeclarationKey::top_level(DeclarationCategory::Let, "same"),
+		);
+		let fragments = [
+			LinkFragment {
+				definition: &function,
+				artifact: LinkArtifact::TopLevel,
+				direct_demands: &[],
+				routed_demands: &[],
+			},
+			LinkFragment {
+				definition: &value,
+				artifact: LinkArtifact::TopLevel,
+				direct_demands: &[],
+				routed_demands: &[],
+			},
+		];
+		assert!(matches!(
+			plan_virtual_module(&own, &fragments, &HashMap::new(), &mut resolver()),
+			Err(ModuleLinkPlanError::BindingCollision { first, second, .. })
+				if first == function && second == value
+		));
 	}
 
 	#[test]
@@ -447,7 +557,7 @@ mod tests {
 			.unwrap()
 			.exports
 			.into_iter()
-			.map(|name| name.as_str().to_string())
+			.map(|export| export.binding.as_str().to_string())
 			.collect::<Vec<_>>()
 		};
 		assert_eq!(exports(false), ["external", "public"]);
@@ -479,12 +589,12 @@ mod tests {
 				routed_demands: &[],
 			},
 		];
-		let plan = plan_virtual_module(&own, &fragments, &HashSet::new(), &mut resolver()).unwrap();
+		let plan = plan_virtual_module(&own, &fragments, &HashMap::new(), &mut resolver()).unwrap();
 		assert_eq!(
 			plan
 				.exports
 				.iter()
-				.map(EmittedBindingName::as_str)
+				.map(|export| export.binding.as_str())
 				.collect::<Vec<_>>(),
 			vec!["a", "b"]
 		);

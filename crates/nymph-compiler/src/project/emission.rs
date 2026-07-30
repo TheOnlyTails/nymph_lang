@@ -182,7 +182,7 @@ pub(crate) fn emitted_interface_module<'db>(
 			plan
 				.exports
 				.iter()
-				.map(nymph_sema::EmittedBindingName::as_str)
+				.map(|export| export.binding.as_str())
 				.collect::<Vec<_>>()
 				.join(", ")
 		));
@@ -294,26 +294,27 @@ pub(crate) fn emitted_interface_project<'db>(
 		}
 	}
 	let mut by_owner: std::collections::BTreeMap<_, Vec<_>> = std::collections::BTreeMap::new();
-	let module_bindings = virtual_fragments
+	let virtual_deliveries = virtual_fragments
 		.values()
-		.filter(|fragment| {
-			matches!(
+		.map(|fragment| {
+			let delivery = if matches!(
 				fragment.fragment.placement(),
 				nymph_sema::RuntimeAssemblyPlacement::Module(_)
-			)
-		})
-		.filter(|fragment| {
-			matches!(
+			) && matches!(
 				fragment.fragment.fragment(),
 				nymph_sema::LoweredHirFragment::TopLevelFunction(_)
 					| nymph_sema::LoweredHirFragment::TopLevelValue(_)
 					| nymph_sema::LoweredHirFragment::TopLevelExternal { .. }
 					| nymph_sema::LoweredHirFragment::StructShell(_)
 					| nymph_sema::LoweredHirFragment::EnumShell(_)
-			)
+			) {
+				link_plan::VirtualDemandDelivery::Binding
+			} else {
+				link_plan::VirtualDemandDelivery::Attached
+			};
+			(fragment.definition.clone(), delivery)
 		})
-		.map(|fragment| fragment.definition.clone())
-		.collect::<std::collections::HashSet<_>>();
+		.collect::<std::collections::HashMap<_, _>>();
 	for fragment in virtual_fragments.into_values() {
 		by_owner
 			.entry(fragment.owner.clone())
@@ -321,7 +322,7 @@ pub(crate) fn emitted_interface_project<'db>(
 			.push(fragment);
 	}
 	for (owner, fragments) in by_owner {
-		match emit_virtual_runtime_module(db, key, &owner, &fragments, &module_bindings) {
+		match emit_virtual_runtime_module(db, key, &owner, &fragments, &virtual_deliveries) {
 			Ok(source) => {
 				let specifier = module_specifier(&owner);
 				if sources.contains_key(&specifier) {
@@ -395,7 +396,10 @@ fn emit_virtual_runtime_module(
 	key: ProjectKey<'_>,
 	owner: &nymph_sema::ModuleIdentity,
 	fragments: &[nymph_sema::VirtualRuntimeFragment],
-	module_bindings: &std::collections::HashSet<nymph_sema::DefinitionId>,
+	virtual_deliveries: &std::collections::HashMap<
+		nymph_sema::DefinitionId,
+		link_plan::VirtualDemandDelivery,
+	>,
 ) -> Result<String, String> {
 	let hir = super::assembly::assemble_runtime_module(
 		owner,
@@ -417,7 +421,7 @@ fn emit_virtual_runtime_module(
 	let plan = link_plan::plan_virtual_module(
 		owner,
 		&link_fragments,
-		module_bindings,
+		virtual_deliveries,
 		&mut QueryLinkResolver { db, key },
 	)
 	.map_err(|error| format!("runtime link planning failed: {error:?}"))?;
@@ -442,7 +446,7 @@ fn emit_virtual_runtime_module(
 			plan
 				.exports
 				.iter()
-				.map(nymph_sema::EmittedBindingName::as_str)
+				.map(|export| export.binding.as_str())
 				.collect::<Vec<_>>()
 				.join(", ")
 		));
