@@ -16,7 +16,7 @@ use std::io::Write;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nymph_codegen::compile;
+use nymph_compiler::compile;
 
 /// Compile a Nymph source module to its JS, panicking on any diagnostic.
 fn emit_js(src: &str) -> String {
