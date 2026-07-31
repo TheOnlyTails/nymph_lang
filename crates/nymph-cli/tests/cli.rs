@@ -256,12 +256,9 @@ fn build_failure_does_not_touch_an_unrelated_file_at_the_output_path() {
 }
 
 #[test]
-fn build_reports_a_readable_error_for_an_unsupported_language_feature_instead_of_a_panic() {
-	// Fix 2: a lowering `panic!` for a deferred-but-type-checked feature must
-	// surface as a readable CLI error, not a raw Rust panic/backtrace, and
-	// must not leave anything at the output path.
+fn build_supports_first_class_range_values() {
 	let path = write_source("func main(): void = {\n  let r = 1..5\n}");
-	let output_path = unique_temp_path("nymph_cli_panic_build", "mjs");
+	let output_path = unique_temp_path("nymph_cli_range_build", "mjs");
 	let _ = std::fs::remove_file(&output_path);
 
 	let out = nymph(&[
@@ -272,28 +269,16 @@ fn build_reports_a_readable_error_for_an_unsupported_language_feature_instead_of
 	]);
 	let _ = std::fs::remove_file(&path);
 
-	assert_eq!(
-		out.status.code(),
-		Some(1),
-		"expected a normal exit 1, not a raw panic's 101\nstderr: {}",
+	assert!(
+		out.status.success(),
+		"first-class ranges should build successfully:\n{}",
 		out.stderr
 	);
 	assert!(
-		out.stderr.contains("STABLE-EMISSION-LINK")
-			&& out.stderr.contains("stable runtime linking failed")
-			&& out.stderr.contains("range/protocol"),
-		"stderr should carry the typed stable lowering diagnostic:\n{}",
-		out.stderr
+		output_path.exists(),
+		"a successful range build must write the requested output"
 	);
-	assert!(
-		!out.stderr.contains("panicked at") && !out.stderr.contains("RUST_BACKTRACE"),
-		"stderr must not contain a raw Rust panic dump:\n{}",
-		out.stderr
-	);
-	assert!(
-		!output_path.exists(),
-		"a panicking build must not write anything to the output path"
-	);
+	let _ = std::fs::remove_file(&output_path);
 }
 
 #[test]
@@ -575,27 +560,14 @@ fn run_with_main_declaring_a_non_void_return_type_errors() {
 }
 
 #[test]
-fn run_reports_a_readable_error_for_an_unsupported_language_feature_instead_of_a_panic() {
+fn run_supports_first_class_range_values() {
 	let path = write_source("func main(): void = {\n  let r = 1..5\n}");
 	let out = nymph(&["run", path.to_str().unwrap()]);
 	let _ = std::fs::remove_file(&path);
 
-	assert_eq!(
-		out.status.code(),
-		Some(1),
-		"expected a normal exit 1, not a raw panic's 101\nstderr: {}",
-		out.stderr
-	);
 	assert!(
-		out.stderr.contains("STABLE-EMISSION-LINK")
-			&& out.stderr.contains("stable runtime linking failed")
-			&& out.stderr.contains("range/protocol"),
-		"stderr should carry the typed stable lowering diagnostic:\n{}",
-		out.stderr
-	);
-	assert!(
-		!out.stderr.contains("panicked at") && !out.stderr.contains("RUST_BACKTRACE"),
-		"stderr must not contain a raw Rust panic dump:\n{}",
+		out.status.success(),
+		"first-class ranges should run successfully:\n{}",
 		out.stderr
 	);
 }
