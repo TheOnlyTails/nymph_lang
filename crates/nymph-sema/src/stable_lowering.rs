@@ -2027,17 +2027,35 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 								"static member target is not attached to an owner",
 							));
 						};
-						let StableShapeFact::Implementation(implementation) = self
-							.context
-							.stable_shape(&StableShapeRequest::Implementation(owner.clone()))?
-						else {
-							return Err(invalid(
-								&self.artifact.definition,
-								"static member owner has no implementation shape",
-							));
+						let shell = match &owner.key {
+							crate::DeclarationKey::TopLevel {
+								category: crate::DeclarationCategory::Struct | crate::DeclarationCategory::Enum,
+								..
+							} => Some(owner.clone()),
+							crate::DeclarationKey::Implementation { .. } => {
+								let request = StableShapeRequest::Implementation(owner.clone());
+								let StableShapeFact::Implementation(implementation) =
+									self.context.stable_shape(&request)?
+								else {
+									return Err(StableShapeLookupError::WrongFact { request }.into());
+								};
+								if implementation.id != *owner {
+									return Err(invalid(
+										&self.artifact.definition,
+										"static member owner disagrees with its exact implementation shape",
+									));
+								}
+								nominal_attachment_shell(&implementation.self_type).cloned()
+							}
+							_ => {
+								return Err(invalid(
+									&self.artifact.definition,
+									"static member owner has no nominal or implementation shell",
+								));
+							}
 						};
 						self.demand_external(target)?;
-						let Some(shell) = nominal_attachment_shell(&implementation.self_type) else {
+						let Some(shell) = shell else {
 							return Ok(HirExpr::Local(
 								self.context.binding_name(target)?.as_str().into(),
 							));

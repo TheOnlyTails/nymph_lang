@@ -1495,6 +1495,45 @@ fn inherent_static_dispatch_uses_exact_owner_binding_and_member_demand() {
 }
 
 #[test]
+fn nested_static_dispatch_uses_the_exact_nominal_owner() {
+	for source in [
+		"struct Box(value: int) { namespace func make(): Box = Box(value = 1) }\nfunc read(): Box = Box.make()",
+		"enum Choice { A namespace func make(): Choice = Choice.A }\nfunc read(): Choice = Choice.make()",
+	] {
+		let (artifacts, _, context) = materialized_fixture(source);
+		let static_artifact = artifacts
+			.iter()
+			.find(|artifact| source_name(&artifact.definition) == "make")
+			.unwrap();
+		let static_definition = static_artifact.definition.clone();
+		let nymph_sema::RuntimePlacement::Attached { owner, .. } = &static_artifact.placement else {
+			panic!("nested static must have an attached owner")
+		};
+		let owner_name = context.binding_name(owner).unwrap();
+		let member_name = context.member_name(&static_definition).unwrap();
+		let read = artifacts
+			.into_iter()
+			.find(|artifact| source_name(&artifact.definition) == "read")
+			.unwrap();
+		let item = lower_runtime_definition(&context, Arc::new(read)).unwrap();
+		let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = item.fragment() else {
+			panic!("unexpected fragment: {:?}", item.fragment())
+		};
+		assert_eq!(
+			function.body,
+			nymph_hir::hir::HirExpr::Call {
+				callee: Box::new(nymph_hir::hir::HirExpr::Field {
+					recv: Box::new(nymph_hir::hir::HirExpr::Local(owner_name.as_str().into())),
+					name: member_name.as_str().into(),
+				}),
+				args: vec![],
+			}
+		);
+		assert_eq!(item.demands(), [static_definition]);
+	}
+}
+
+#[test]
 fn selected_override_dispatch_has_exact_call_and_placement_demand() {
 	let source = "interface Plus<Other, Output> { func plus(other: Other): Output }\nstruct Vec(value: int)\nimpl Plus<Other = Vec, Output = Vec> for Vec { func plus(other: Vec): Vec = other }\nfunc add(a: Vec, b: Vec): Vec = a + b";
 	let item = lower_named(source, "add");
