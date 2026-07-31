@@ -9,8 +9,77 @@ use nymph_sema::{
 	ExportedDefinition, InterfaceType, ModuleEnvironment, ModuleIdentity, ModuleInterface,
 	ModuleOrigin, RecoveredDefinitionReference, RecoveredInterfaceType, SemanticAvailability,
 	SemanticEnvironment, check_module_with_environment, declared_headers, extract_module_interface,
-	extract_module_interface_with_facts, recover_module_environment,
+	extract_module_interface_from_facts_with_selection, extract_module_interface_with_facts,
+	recover_module_environment,
 };
+
+#[test]
+fn checked_wrapper_and_borrowed_facts_extraction_have_exact_parity() {
+	let module = Arc::new(parse("public func answer(): int = 42"));
+	let identity = identity();
+	let environment = SemanticEnvironment::from_modules(identity.clone(), &[]).unwrap();
+	let result = check_module_with_environment(
+		module.clone(),
+		identity.clone(),
+		&environment,
+		EntryMode::Library,
+	);
+	assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+	let checked = nymph_sema::Checked {
+		diags: Vec::new(),
+		facts: result.analysis.checked.as_ref().clone(),
+	};
+	let headers = declared_headers(identity.clone(), &module);
+	let selected = nymph_sema::ExtractionFactSelection::current_module(&module, &checked);
+	let selected_from_facts =
+		nymph_sema::ExtractionFactSelection::current_module_from_facts(&module, &checked.facts);
+	assert_eq!(
+		extract_module_interface_with_facts(identity.clone(), &module, &checked, &headers, &selected,),
+		extract_module_interface_from_facts_with_selection(
+			identity.clone(),
+			&module,
+			&checked.facts,
+			&headers,
+			&selected_from_facts,
+		),
+	);
+
+	let erroneous_module = Arc::new(parse("public func broken(): Missing = missing"));
+	let erroneous_result = check_module_with_environment(
+		erroneous_module.clone(),
+		identity.clone(),
+		&environment,
+		EntryMode::Library,
+	);
+	assert!(!erroneous_result.diagnostics.is_empty());
+	let erroneous_checked = nymph_sema::Checked {
+		diags: erroneous_result.diagnostics.to_vec(),
+		facts: erroneous_result.analysis.checked.as_ref().clone(),
+	};
+	let erroneous_headers = declared_headers(identity.clone(), &erroneous_module);
+	let selected =
+		nymph_sema::ExtractionFactSelection::current_module(&erroneous_module, &erroneous_checked);
+	let selected_from_facts = nymph_sema::ExtractionFactSelection::current_module_from_facts(
+		&erroneous_module,
+		&erroneous_checked.facts,
+	);
+	assert_eq!(
+		extract_module_interface_with_facts(
+			identity.clone(),
+			&erroneous_module,
+			&erroneous_checked,
+			&erroneous_headers,
+			&selected,
+		),
+		extract_module_interface_from_facts_with_selection(
+			identity,
+			&erroneous_module,
+			&erroneous_checked.facts,
+			&erroneous_headers,
+			&selected_from_facts,
+		),
+	);
+}
 
 #[test]
 fn implementation_member_slots_materialize_defaults_structurally() {
@@ -587,8 +656,22 @@ fn extraction_preserves_transitive_imported_nominal_return_identity() {
 	};
 	let headers = declared_headers(current.clone(), &module);
 	let facts = nymph_sema::ExtractionFactSelection::current_module(&module, &checked);
-	let interface = extract_module_interface_with_facts(current, &module, &checked, &headers, &facts)
-		.expect("an imported nominal remains canonicalizable by stable identity");
+	let interface =
+		extract_module_interface_with_facts(current.clone(), &module, &checked, &headers, &facts)
+			.expect("an imported nominal remains canonicalizable by stable identity");
+	let borrowed_facts =
+		nymph_sema::ExtractionFactSelection::current_module_from_facts(&module, &checked.facts);
+	assert_eq!(
+		interface,
+		extract_module_interface_from_facts_with_selection(
+			current,
+			&module,
+			&checked.facts,
+			&headers,
+			&borrowed_facts,
+		)
+		.unwrap()
+	);
 	assert_eq!(
 		interface.exports[0].return_type,
 		Some(InterfaceType::Named {

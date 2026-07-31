@@ -11,11 +11,11 @@ use nymph_ast::{
 };
 
 use crate::{
-	BinderScope, CanonicalizationContext, Checked, DeclarationCategory, DeclarationKey, DefinitionId,
-	DefinitionShapeKind, ExportedDefinition, ExportedImpl, ExternalAbi, FieldShape, GenericParameter,
-	GenericParameterId, HeaderBinder, HeaderParameterId, HeaderType, ImplementationHeader,
-	InterfaceConversionError, InterfaceType, MemberKind, MemberShape, ModuleEnvironment,
-	ModuleIdentity, ModuleInterface, ParameterShape, RecoveredExportedDefinition,
+	BinderScope, CanonicalizationContext, Checked, CheckedFacts, DeclarationCategory, DeclarationKey,
+	DefinitionId, DefinitionShapeKind, ExportedDefinition, ExportedImpl, ExternalAbi, FieldShape,
+	GenericParameter, GenericParameterId, HeaderBinder, HeaderParameterId, HeaderType,
+	ImplementationHeader, InterfaceConversionError, InterfaceType, MemberKind, MemberShape,
+	ModuleEnvironment, ModuleIdentity, ModuleInterface, ParameterShape, RecoveredExportedDefinition,
 	RecoveredExportedImpl, RecoveredInterfaceType, RecoveredModuleInterface, SemanticAvailability,
 	StableIdBuilder, SuperInterfaceShape, SupportDefinition, VariantShape, canonicalize_type,
 };
@@ -41,6 +41,11 @@ pub struct ExtractionFactSelection {
 impl ExtractionFactSelection {
 	#[must_use]
 	pub fn current_module(module: &Module, checked: &Checked) -> Self {
+		Self::current_module_from_facts(module, checked)
+	}
+
+	#[must_use]
+	pub fn current_module_from_facts(module: &Module, checked: &CheckedFacts) -> Self {
 		if checked.semantic.has_explicit_local_ranges {
 			return Self {
 				implementations: checked.semantic.local_implementations.clone(),
@@ -85,7 +90,7 @@ impl ExtractionFactSelection {
 		}
 	}
 
-	fn all(checked: &Checked) -> Self {
+	fn all(checked: &CheckedFacts) -> Self {
 		Self {
 			implementations: 0..checked.semantic.implementations.impls.len(),
 			inherent: 0..checked.semantic.inherent.len(),
@@ -361,7 +366,7 @@ fn empty_definition(
 	}
 }
 
-fn context(checked: &Checked, headers: &DeclaredHeaders) -> CanonicalizationContext {
+fn context(checked: &CheckedFacts, headers: &DeclaredHeaders) -> CanonicalizationContext {
 	let definitions = checked
 		.semantic
 		.definitions
@@ -380,7 +385,7 @@ fn context(checked: &Checked, headers: &DeclaredHeaders) -> CanonicalizationCont
 }
 
 fn definition_context(
-	checked: &Checked,
+	checked: &CheckedFacts,
 	headers: &DeclaredHeaders,
 	id: &DefinitionId,
 	generic_names: impl IntoIterator<Item = EcoString>,
@@ -521,7 +526,7 @@ fn generic_constraints(
 
 fn checked_constraints(
 	bounds: &[crate::iface::Bound],
-	checked: &Checked,
+	checked: &CheckedFacts,
 	headers: &DeclaredHeaders,
 	context: &CanonicalizationContext,
 ) -> Result<Vec<crate::GenericConstraint>, InterfaceConversionError> {
@@ -566,7 +571,7 @@ fn checked_member_shape(
 	facts: &crate::annotate::CheckedMethod,
 	owner: &DefinitionId,
 	owner_binders: &[GenericParameter],
-	checked: &Checked,
+	checked: &CheckedFacts,
 	headers: &DeclaredHeaders,
 	ids: &mut StableIdBuilder,
 ) -> Result<MemberShape<InterfaceType>, InterfaceConversionError> {
@@ -708,7 +713,7 @@ fn definition_anonymous_context(
 	owner: &DefinitionId,
 	mut binders: Vec<GenericParameter>,
 	types: impl IntoIterator<Item = crate::Ty>,
-	checked: &Checked,
+	checked: &CheckedFacts,
 	headers: &DeclaredHeaders,
 ) -> Result<
 	(
@@ -940,7 +945,7 @@ fn definition_members(
 	def: crate::DefId,
 	owner: &DefinitionId,
 	owner_binders: &[GenericParameter],
-	checked: &Checked,
+	checked: &CheckedFacts,
 	headers: &DeclaredHeaders,
 	ids: &mut StableIdBuilder,
 ) -> Result<Vec<MemberShape<InterfaceType>>, InterfaceConversionError> {
@@ -1472,7 +1477,7 @@ fn function_shape(
 	definition: &mut ExportedDefinition,
 	meta: &FuncDeclaration,
 	def: crate::DefId,
-	checked: &Checked,
+	checked: &CheckedFacts,
 	context: &CanonicalizationContext,
 ) -> Result<(), InterfaceConversionError> {
 	let signature = &checked.semantic.signatures.funcs[&def];
@@ -1500,7 +1505,7 @@ fn function_shape(
 fn extract_definition(
 	member: usize,
 	declaration: &Declaration,
-	checked: &Checked,
+	checked: &CheckedFacts,
 	headers: &DeclaredHeaders,
 	context: &CanonicalizationContext,
 ) -> Result<Option<ExportedDefinition>, InterfaceConversionError> {
@@ -2010,7 +2015,7 @@ fn referenced_impl_shape(implementation: &ExportedImpl, out: &mut HashSet<Defini
 
 fn extract_implementations(
 	module: &Module,
-	checked: &Checked,
+	checked: &CheckedFacts,
 	headers: &DeclaredHeaders,
 	facts: &ExtractionFactSelection,
 ) -> Result<Vec<ExportedImpl>, InterfaceConversionError> {
@@ -2323,7 +2328,7 @@ fn extract_implementations(
 				}
 			})
 			.collect::<Result<Vec<_>, _>>()?;
-		project_checked_external_value_marshals(&mut members, source_members, &checked.facts)?;
+		project_checked_external_value_marshals(&mut members, source_members, checked)?;
 		extracted.push(ExportedImpl {
 			id: id.clone(),
 			visibility,
@@ -2353,7 +2358,7 @@ pub fn extract_module_interface(
 	checked: &Checked,
 	headers: &DeclaredHeaders,
 ) -> Result<ModuleInterface, InterfaceConversionError> {
-	extract_module_interface_with_facts(
+	extract_module_interface_from_facts_with_selection(
 		module_identity,
 		module,
 		checked,
@@ -2366,6 +2371,22 @@ pub fn extract_module_interface_with_facts(
 	module_identity: ModuleIdentity,
 	module: &Module,
 	checked: &Checked,
+	headers: &DeclaredHeaders,
+	facts: &ExtractionFactSelection,
+) -> Result<ModuleInterface, InterfaceConversionError> {
+	extract_module_interface_from_facts_with_selection(
+		module_identity,
+		module,
+		checked,
+		headers,
+		facts,
+	)
+}
+
+pub fn extract_module_interface_from_facts_with_selection(
+	module_identity: ModuleIdentity,
+	module: &Module,
+	checked: &CheckedFacts,
 	headers: &DeclaredHeaders,
 	facts: &ExtractionFactSelection,
 ) -> Result<ModuleInterface, InterfaceConversionError> {

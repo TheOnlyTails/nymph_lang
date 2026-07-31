@@ -102,8 +102,8 @@ cases above. Both received the exact 17-module Mixed 4×4 fixture.
 
 | Operation | Reproduced `abcbd4b` | Before coherence partitioning | Coherence partitioning only | Module prewarming | Ambient-root prewarming | Current | Current / baseline |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Diagnostics | 110.75 ms (110.18–111.27 ms) | 1.0328 s (1.0264–1.0404 s) | 352.19 ms (351.31–353.12 ms) | 293.67 ms (291.04–296.63 ms) | 191.22 ms (188.96–193.56 ms) | 148.32 ms (146.09–151.06 ms) | 1.34× |
-| Full compile | 137.73 ms (137.11–138.45 ms) | 1.0705 s (1.0512–1.0991 s) | 362.90 ms (361.76–364.04 ms) | 302.31 ms (299.84–305.15 ms) | 199.29 ms (197.27–201.47 ms) | 167.27 ms (161.88–173.90 ms) | 1.21× |
+| Diagnostics | 110.75 ms (110.18–111.27 ms) | 1.0328 s (1.0264–1.0404 s) | 352.19 ms (351.31–353.12 ms) | 293.67 ms (291.04–296.63 ms) | 191.22 ms (188.96–193.56 ms) | 141.43 ms (139.34–144.10 ms) | 1.28× |
+| Full compile | 137.73 ms (137.11–138.45 ms) | 1.0705 s (1.0512–1.0991 s) | 362.90 ms (361.76–364.04 ms) | 302.31 ms (299.84–305.15 ms) | 199.29 ms (197.27–201.47 ms) | 148.28 ms (147.68–149.01 ms) | 1.08× |
 
 Profiling attributed the largest regression to coherence checking: each project
 module received 93 visible implementations and exhaustively trial-unified every
@@ -128,9 +128,13 @@ environments now move their exact interner-relative fact arenas into the checker
 instead of cloning them once before use. The longer follow-up measurement put
 diagnostics another 8.5% below the canonical-parse result; full compile remained
 statistically indistinguishable under a wide, outlier-heavy interval, so no
-compile improvement is attributed to that ownership change. The remaining 1.34×
-diagnostics and 1.21× full-build regressions are still open; these results are
-observability, not acceptance of the remaining difference.
+compile improvement is attributed to that ownership change. Clean interface
+extraction now borrows the analysis's exact checked facts instead of deep-cloning
+their interner and identity-rich semantic registries. Recovery retains the owned,
+diagnostic-bearing path. The follow-up measurement reduced diagnostics by 4.6%
+and full compile by 11.4% from the documented ownership result. The remaining
+1.28× diagnostics and 1.08× full-build regressions are still open; these results
+are observability, not acceptance of the remaining difference.
 
 ### Retained-session acceptance results (2026-07-31)
 

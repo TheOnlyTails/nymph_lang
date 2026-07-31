@@ -1028,13 +1028,14 @@ pub(crate) fn ambient_core_diagnostics(
 		.map(|item| item.diag.clone())
 		.collect::<Vec<_>>();
 	if diagnostics.is_empty() {
-		let checked = checked_from_analysis(&analysis, []);
-		let facts =
-			nymph_sema::ExtractionFactSelection::current_module(&analysis.semantic.module, &checked);
-		if let Err(error) = nymph_sema::extract_module_interface_with_facts(
+		let facts = nymph_sema::ExtractionFactSelection::current_module_from_facts(
+			&analysis.semantic.module,
+			&analysis.semantic.checked,
+		);
+		if let Err(error) = nymph_sema::extract_module_interface_from_facts_with_selection(
 			ambient_identity(db, module),
 			&analysis.semantic.module,
-			&checked,
+			&analysis.semantic.checked,
 			&ambient_core_headers(db, registry, module),
 			&facts,
 		) {
@@ -2158,14 +2159,15 @@ pub(crate) fn interface_module_interface<'db>(
 	#[cfg(feature = "test-support")]
 	db.semantic_query_will_execute("interface_module_interface", module);
 	let analysis = interface_module_analysis(db, key, module);
-	let checked = checked_from_analysis(&analysis, []);
 	let headers = interface_declared_headers(db, key, module);
-	let facts =
-		nymph_sema::ExtractionFactSelection::current_module(&analysis.semantic.module, &checked);
-	nymph_sema::extract_module_interface_with_facts(
+	let facts = nymph_sema::ExtractionFactSelection::current_module_from_facts(
+		&analysis.semantic.module,
+		&analysis.semantic.checked,
+	);
+	nymph_sema::extract_module_interface_from_facts_with_selection(
 		module.identity(db),
 		&analysis.semantic.module,
-		&checked,
+		&analysis.semantic.checked,
 		&headers,
 		&facts,
 	)
