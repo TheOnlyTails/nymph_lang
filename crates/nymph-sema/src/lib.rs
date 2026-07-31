@@ -43,10 +43,7 @@ mod solve;
 mod stable_lowering;
 mod unify;
 
-pub use analysis::{
-	ModuleAnnotations, SemanticAnalysis, SemanticCheckResult, StableAnnotationView,
-	stable_annotation_view,
-};
+pub use analysis::{ModuleAnnotations, SemanticAnalysis, SemanticCheckResult};
 pub use annotate::{
 	Annotations, Checked, CheckedFacts, CheckedSemantic, DispatchKind, ExprInfo, IterMode, Resolution,
 };

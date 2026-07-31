@@ -9,7 +9,7 @@ fn path(value: &str) -> ModulePath {
 }
 
 fn session(files: &FxHashMap<&str, &str>) -> (CompilerSession, ProjectId) {
-	let project = ProjectId::new("compat");
+	let project = ProjectId::new("pipeline");
 	let mut session = CompilerSession::new();
 	for (module, source) in files {
 		session.set_source(
@@ -256,12 +256,12 @@ fn graph_error_short_circuits_all_analysis_query_bodies() {
 			.lock()
 			.unwrap()
 			.iter()
-			.any(|event| event == "compat_module_analysis")
+			.any(|event| event == "interface_module_analysis")
 	);
 }
 
 #[test]
-fn public_compile_executes_stable_query_bodies_and_no_compatibility_query() {
+fn public_compile_executes_stable_query_bodies() {
 	let events = Arc::new(Mutex::new(Vec::new()));
 	let sink = events.clone();
 	let mut session = CompilerSession::with_event_callback_and_tombstone_threshold(
@@ -289,10 +289,6 @@ fn public_compile_executes_stable_query_bodies_and_no_compatibility_query() {
 			"missing {expected}: {events:?}"
 		);
 	}
-	assert!(
-		!events.iter().any(|event| event.starts_with("compat_")),
-		"compatibility query executed: {events:?}"
-	);
 }
 
 #[test]

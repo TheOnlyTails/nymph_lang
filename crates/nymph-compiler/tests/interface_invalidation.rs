@@ -667,9 +667,4 @@ fn importable_and_ambient_roots_stay_in_the_closed_interface_family() {
 			.iter()
 			.any(|event| event.query == "ambient_core_environment")
 	);
-	assert!(
-		!observed
-			.iter()
-			.any(|event| event.query.starts_with("compat_"))
-	);
 }

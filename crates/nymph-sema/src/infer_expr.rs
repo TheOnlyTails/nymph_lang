@@ -956,10 +956,6 @@ impl<'m> Checker<'m> {
 	}
 
 	fn type_of_def(&mut self, def: DefId, span: Span, id: NodeId) -> Ty {
-		self.annotations.record_checked_definition_target(
-			id,
-			crate::annotate::CheckedDefinitionTarget::Definition(def),
-		);
 		self
 			.annotations
 			.record_definition_target(id, self.defs.stable(def));
@@ -1150,14 +1146,6 @@ impl<'m> Checker<'m> {
 			if let Some(def) = self.defs.get(&name.0)
 				&& let DefKind::Struct = self.defs.data(def).kind
 			{
-				self.annotations.record_checked_definition_target(
-					id,
-					crate::annotate::CheckedDefinitionTarget::Definition(def),
-				);
-				self.annotations.record_checked_definition_target(
-					func.id,
-					crate::annotate::CheckedDefinitionTarget::Definition(def),
-				);
 				self
 					.annotations
 					.record_definition_target(id, self.defs.stable(def));
@@ -1673,14 +1661,6 @@ impl<'m> Checker<'m> {
 						.find(|(_, (n, _))| n == member)
 					{
 						if let Some(id) = id {
-							self.annotations.record_checked_definition_target(
-								id,
-								crate::annotate::CheckedDefinitionTarget::Field {
-									owner: def,
-									index: field_index,
-									name: member.into(),
-								},
-							);
 							self.annotations.record_definition_target(
 								id,
 								sig

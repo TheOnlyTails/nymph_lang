@@ -781,7 +781,7 @@ impl CompilerSession {
 			.collect()
 	}
 
-	/// Return tooling analysis under the same compatibility key used by
+	/// Return tooling analysis under the same request key used by
 	/// [`Self::tooling_diagnostics`].
 	#[doc(hidden)]
 	#[must_use]
@@ -1048,11 +1048,10 @@ impl CompilerSession {
 						.split_once('(')
 						.map_or(debug.as_str(), |(name, _)| name);
 					if query == "parse_builtin" {
-						// This private compiler-core bootstrap producer serves both importable builtins (historically
-						// observed as `parse`) and ambient-core registry entries. Preserve the
-						// established parse event while exposing the narrower Task 6 event. It
-						// never participates in public ProjectGraph/user flattened analysis;
-						// production compatibility flattening stays bounded here until Task 7.
+						// This private compiler-core bootstrap producer serves both importable
+						// builtins (observed as `parse`) and ambient-core registry entries.
+						// Preserve the established parse event while also exposing the narrower
+						// ambient-core event.
 						callback("parse");
 						callback("ambient_core_parse");
 						return;
@@ -1324,7 +1323,7 @@ impl CompilerSession {
 	}
 
 	/// Returns the exact ES-module graph before bundling, together with the
-	/// entry module's compatibility tag.
+	/// entry module's stable module tag.
 	#[doc(hidden)]
 	pub fn inspect_emitted_project(
 		&self,

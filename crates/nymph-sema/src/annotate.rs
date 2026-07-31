@@ -194,9 +194,6 @@ pub struct Annotations {
 	unresolved_qualified_accesses: Vec<UnresolvedQualifiedAccess>,
 	direct_namespace_members: FxHashSet<NodeId>,
 	definition_targets: FxHashMap<NodeId, DefinitionId>,
-	/// Checker-local provenance used only to project stable identities when the
-	/// compatibility checker was built from definitions without stable IDs.
-	checked_definition_targets: FxHashMap<NodeId, CheckedDefinitionTarget>,
 	variants: FxHashMap<NodeId, VariantResolution>,
 	/// Variant *patterns*, keyed by span — patterns carry no `NodeId`, but each
 	/// written pattern has a unique source span.
@@ -259,23 +256,10 @@ impl Annotations {
 		self.direct_namespace_members.iter().copied()
 	}
 }
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum CheckedDefinitionTarget {
-	Definition(crate::DefId),
-	Field {
-		owner: crate::DefId,
-		index: usize,
-		name: EcoString,
-	},
-}
-
 impl Annotations {
 	/// Iterate expression annotations in stable source-node order.
 	///
-	/// This is primarily useful to consumers which need to compare semantic
-	/// results produced by independent checker allocations. The returned type
-	/// handles must still be interpreted with the [`CheckedFacts::interner`]
+	/// Returned type handles must be interpreted with the [`CheckedFacts::interner`]
 	/// that owns this annotation set.
 	pub fn infos(&self) -> impl Iterator<Item = (NodeId, &ExprInfo)> {
 		let mut entries = self
@@ -358,25 +342,6 @@ impl Annotations {
 	/// The stable declaration referenced by `id`, if this node denotes one.
 	pub fn definition_target_of(&self, id: NodeId) -> Option<&DefinitionId> {
 		self.definition_targets.get(&id)
-	}
-
-	pub(crate) fn record_checked_definition_target(
-		&mut self,
-		id: NodeId,
-		target: CheckedDefinitionTarget,
-	) {
-		if id != NodeId::DUMMY {
-			self.checked_definition_targets.insert(id, target);
-		}
-	}
-
-	pub(crate) fn checked_definition_targets(
-		&self,
-	) -> impl Iterator<Item = (NodeId, CheckedDefinitionTarget)> + '_ {
-		self
-			.checked_definition_targets
-			.iter()
-			.map(|(id, target)| (*id, target.clone()))
 	}
 
 	/// Record which `(enum, variant)` a variant construction/reference resolved to.
