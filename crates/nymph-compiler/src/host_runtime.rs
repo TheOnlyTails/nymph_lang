@@ -1,7 +1,6 @@
-//! The `HostRuntimeGraph` for every LINKED external (Gap 3, L0/L1) —
-//! the runtime-source counterpart of `prelude.rs`'s embedded `.nym` checker
-//! prelude, but for the real `.ts`/JS implementation a linked external's
-//! emitted call actually resolves against at bundle time.
+//! The `HostRuntimeGraph` for every linked external: the runtime-source
+//! counterpart of the embedded `.nym` checker prelude, containing the real
+//! `.ts`/JS implementations that emitted calls resolve against at bundle time.
 //!
 //! `nymph_hir::linkage::REGISTRY` (a leaf-crate table both the sema gate and
 //! codegen emit already consult) decides WHICH `external(name)` markers link,
@@ -10,8 +9,7 @@
 //! not `include_str!` the stdlib tree. This module is the other half: it
 //! supplies the actual embedded `.ts` source for each distinct module the
 //! registry names, and strips + filters it (via `nymph_codegen::strip_ts_to_js`)
-//! into the virtual sources [`Driver::compile_all`] injects into the bundle
-//! graph alongside every real project/std module.
+//! into virtual sources merged with the stable emitted project before bundling.
 //!
 //! L1 extension (the Option ABI seam): `list.ts`'s `get`/`first`/`last`/`pop`
 //! all return `Option<T>`, built by calling the SAME `Option` their `.ts`
@@ -22,9 +20,10 @@
 //!    virtual key `"std/option"` — a real sources-map key `bundle::
 //!    VirtualFsPlugin` can resolve (unlike the raw relative `"../option"`,
 //!    which it can't — `resolve_id` only matches exact specifier strings).
-//! 2. `Driver::compile_all` emits the demanded `option.nym` implementation
-//!    once under that key. Intrinsics and source consumers therefore share
-//!    both global variant tags and the same method-bearing prototype.
+//! 2. Stable per-definition lowering emits the demanded compiler-owned Option
+//!    implementation once under that key. Host modules and source consumers
+//!    therefore share both global variant tags and the same method-bearing
+//!    prototype.
 
 use std::sync::OnceLock;
 
@@ -35,8 +34,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 /// mirrors `prelude.rs`'s `CORE_SOURCES` table one level down (runtime JS,
 /// not checker-facing Nymph source). Add an entry here whenever
 /// `nymph_hir::linkage::REGISTRY` gains a module this table doesn't cover yet
-/// — `intrinsic_module_sources` panics loudly (never silently skips) if one
-/// is missing.
+/// — graph construction fails loudly (never silently skips) if one is missing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SourceProvider {
 	EmbeddedTs(&'static str),
@@ -222,14 +220,15 @@ static HOST_RUNTIME_GRAPH: OnceLock<HostRuntimeGraph> = OnceLock::new();
 /// `nymph_codegen::strip_ts_to_js`'s doc comment for why injecting the whole
 /// file is fatal to bundling: an unrelated, still-unlinked `import` inside it
 /// would be a dangling specifier rolldown resolves eagerly, before
-/// tree-shaking ever gets a chance to drop it). The project driver separately
-/// supplies the canonical `std/option` module referenced by rewritten imports.
+/// tree-shaking ever gets a chance to drop it). Stable project emission
+/// separately supplies the canonical `std/option` module referenced by
+/// rewritten imports.
 ///
 /// Keyed by the SAME module specifier the registry names (e.g.
 /// `"std/collections/list"`) — the specifier an emitted `import { .. } from
 /// ".."` line names, and what `bundle::VirtualFsPlugin` resolves module
-/// sources against. Callers merge this into the driver's own
-/// `module_sources` map before bundling. `VirtualFsPlugin` only loads a source
+/// sources against. Callers merge this into the stable emitted project's
+/// module sources before bundling. `VirtualFsPlugin` only loads a source
 /// when something imports it, and rolldown tree-shakes unreferenced entries.
 impl HostRuntimeGraph {
 	pub(crate) fn compiler_facts() -> &'static Self {
@@ -406,31 +405,6 @@ impl HostRuntimeGraph {
 		}
 	}
 
-	#[cfg(test)]
-	fn rewrite(&self, module: &str, source: &str) -> Option<&'static str> {
-		self
-			.descriptors
-			.get(module)?
-			.dependencies
-			.iter()
-			.find(|dependency| dependency.source == source)
-			.map(|dependency| dependency.destination)
-	}
-
-	#[cfg(test)]
-	fn runtime_type_imports<'a>(
-		&self,
-		modules: impl IntoIterator<Item = &'a String>,
-	) -> FxHashSet<ecow::EcoString> {
-		modules
-			.into_iter()
-			.flat_map(|module| self.semantic_dependencies(module))
-			.map(|role| match role {
-				CompilerRuntimeRole::Option => ecow::EcoString::from("Option"),
-			})
-			.collect()
-	}
-
 	pub(crate) fn module_sources(&self, option_enum_name: &str) -> FxHashMap<String, String> {
 		let mut symbols: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
 		for &(module, symbol) in self.exports.keys() {
@@ -532,24 +506,13 @@ mod tests {
 	}
 
 	#[test]
-	fn graph_dependencies_and_rewrites_are_module_local_and_exact() {
-		let graph = HostRuntimeGraph::compiler_facts();
-		assert_eq!(
-			graph
-				.semantic_dependencies("std/collections/list")
-				.collect::<Vec<_>>(),
-			vec![CompilerRuntimeRole::Option]
-		);
-		assert_eq!(
-			graph.rewrite("std/collections/list", "std/option"),
-			Some("std/option")
-		);
-		assert_eq!(
-			graph.rewrite("std/string", "std/option"),
-			Some("std/option")
-		);
-		assert_eq!(graph.rewrite("std/io", "./display"), Some("std/display"));
-		assert_eq!(graph.rewrite("std/hash", "./display"), None);
+	fn generated_io_source_uses_the_canonical_display_specifier() {
+		let sources = HostRuntimeGraph::compiler_facts().module_sources("Option");
+		let io_js = sources
+			.get("std/io")
+			.expect("expected the linked I/O runtime module to be injected");
+		assert!(io_js.contains("from \"std/display\""), "{io_js}");
+		assert!(!io_js.contains("from \"./display\""), "{io_js}");
 	}
 
 	#[test]
@@ -705,15 +668,6 @@ mod tests {
 			HostRuntimeGraph::build(&duplicate_export, &[test_export("std/a", "x")]),
 			Err(HostRuntimeGraphError::DuplicateSourceExport { .. })
 		));
-	}
-
-	#[test]
-	fn runtime_type_imports_are_projected_from_module_dependencies() {
-		let modules = vec!["std/hash".to_string(), "std/string".to_string()];
-		assert_eq!(
-			HostRuntimeGraph::compiler_facts().runtime_type_imports(&modules),
-			FxHashSet::from_iter([ecow::EcoString::from("Option")])
-		);
 	}
 
 	#[test]
