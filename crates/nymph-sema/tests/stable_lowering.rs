@@ -1281,8 +1281,9 @@ fn first_class_external_method_rejects_runtime_and_shape_abi_drift() {
 
 #[test]
 fn same_module_identifier_records_its_exact_definition_demand() {
-	let (artifacts, _, context) =
-		materialized_fixture("let answer: int = 42\nfunc read(): int = answer");
+	let (artifacts, _, context) = materialized_fixture(
+		"let answer: int = 42\nfunc read(): int = answer\nfunc call(): int = read()",
+	);
 	let answer = artifacts
 		.iter()
 		.find(|artifact| source_name(&artifact.definition) == "answer")
@@ -1290,13 +1291,24 @@ fn same_module_identifier_records_its_exact_definition_demand() {
 		.definition
 		.clone();
 	let read = artifacts
-		.into_iter()
+		.iter()
 		.find(|artifact| source_name(&artifact.definition) == "read")
-		.unwrap();
+		.unwrap()
+		.clone();
 
 	let lowered = lower_runtime_definition(&context, Arc::new(read)).unwrap();
 
-	assert_eq!(lowered.demands(), [answer]);
+	assert_eq!(lowered.demands(), [answer.clone()]);
+	assert_eq!(lowered.immediate_reads(), [answer]);
+	assert!(lowered.immediate_calls().is_empty());
+
+	let read = lowered.definition().clone();
+	let call = artifacts
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "call")
+		.unwrap();
+	let lowered = lower_runtime_definition(&context, Arc::new(call)).unwrap();
+	assert_eq!(lowered.immediate_calls(), [read]);
 }
 
 #[test]
@@ -1526,6 +1538,15 @@ fn lowers_interpolation_compound_assignment_and_closure_shadowing() {
 	assert!(
 		matches!(closure.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(f) if matches!(f.body, nymph_hir::hir::HirExpr::Closure { ref params, ref body } if params == &["x$1"] && **body == nymph_hir::hir::HirExpr::Local("x$1".into())))
 	);
+	let (artifacts, _, context) =
+		materialized_fixture("let later: int = 5\nfunc delayed(): () -> int = () -> later");
+	let delayed = artifacts
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "delayed")
+		.unwrap();
+	let lowered = lower_runtime_definition(&context, Arc::new(delayed)).unwrap();
+	assert!(lowered.immediate_reads().is_empty());
+	assert!(lowered.immediate_calls().is_empty());
 }
 
 #[test]
@@ -1635,6 +1656,7 @@ fn selected_override_dispatch_has_exact_call_and_placement_demand() {
 		}
 	);
 	assert_eq!(item.demands().len(), 1);
+	assert_eq!(item.immediate_calls(), item.demands());
 	assert!(matches!(
 		item.demands()[0].key,
 		DeclarationKey::Member { .. }

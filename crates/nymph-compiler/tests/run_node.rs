@@ -8,24 +8,13 @@ use std::sync::{
 };
 
 use nymph_codegen::emit;
-use nymph_sema::{check_module, check_module_with_prelude, lower_hir, lower_hir_with_prelude};
+use nymph_sema::{check_module_with_prelude, lower_hir_with_prelude};
 use nymph_syntax::parse_module;
 
 /// Compile a Nymph source module to a JS module string.
 fn compile(src: &str) -> String {
-	let parsed = parse_module(src, "test");
-	assert!(
-		!parsed.diagnostics.iter().any(|d| d.is_error()),
-		"parse errors in test source: {:?}",
-		parsed.diagnostics
-	);
-	let checked = check_module(&parsed.tree);
-	assert!(
-		checked.diags.is_empty(),
-		"check errors: {:?}",
-		checked.diags
-	);
-	emit(&lower_hir(&parsed.tree, &checked))
+	nymph_compiler::compile(src, "test")
+		.unwrap_or_else(|diagnostics| panic!("compile errors: {diagnostics:?}"))
 }
 
 /// Compile `user_src` against `prelude_src` (a single prelude module, checked and
@@ -1063,7 +1052,7 @@ fn runs_native_int_and_float_comparison_unchanged() {
 }
 
 #[test]
-fn runs_equals_and_not_equals_on_a_user_struct() {
+fn user_struct_operators_use_identity_while_explicit_equals_dispatches() {
 	let src = r#"
 		interface Equals<Other> {
 			func equals(other: Other): boolean
@@ -1074,13 +1063,15 @@ fn runs_equals_and_not_equals_on_a_user_struct() {
 		func same(a: Vec2, b: Vec2): boolean = a == b
 		func self_same(a: Vec2): boolean = a == a
 		func different(a: Vec2, b: Vec2): boolean = a != b
+		func protocol_same(a: Vec2, b: Vec2): boolean = a.equals(b)
+		func protocol_different(a: Vec2, b: Vec2): boolean = a.not_equals(b)
 	"#;
 	assert_eq!(
 		run(
 			src,
 			"same(new Vec2({ x: new NInt(1) }), new Vec2({ x: new NInt(1) })).v"
 		),
-		"true"
+		"false"
 	);
 	assert_eq!(
 		run(src, "self_same(new Vec2({ x: new NInt(1) })).v"),
@@ -1090,6 +1081,20 @@ fn runs_equals_and_not_equals_on_a_user_struct() {
 		run(
 			src,
 			"different(new Vec2({ x: new NInt(1) }), new Vec2({ x: new NInt(2) })).v"
+		),
+		"true"
+	);
+	assert_eq!(
+		run(
+			src,
+			"protocol_same(new Vec2({ x: new NInt(1) }), new Vec2({ x: new NInt(2) })).v"
+		),
+		"true"
+	);
+	assert_eq!(
+		run(
+			src,
+			"protocol_different(new Vec2({ x: new NInt(1) }), new Vec2({ x: new NInt(2) })).v"
 		),
 		"false"
 	);
@@ -1189,13 +1194,13 @@ fn runs_enum_with_methods_preserves_tag_identity() {
 #[test]
 fn compile_reports_check_errors() {
 	// A type error surfaces as diagnostics, not JS.
-	let result = nymph_codegen::compile("func f(): int = true", "test");
+	let result = nymph_compiler::compile("func f(): int = true", "test");
 	assert!(result.is_err(), "type error should not produce JS");
 }
 
 #[test]
 fn compile_produces_runnable_js() {
-	let result = nymph_codegen::compile("func double(n: int): int = n * 2", "test");
+	let result = nymph_compiler::compile("func double(n: int): int = n * 2", "test");
 	assert!(
 		result.is_ok(),
 		"well-typed program should compile: {result:?}"
@@ -1444,6 +1449,89 @@ fn runs_top_level_let_via_a_function_reading_a_later_let() {
 		let b = 5
 	"#;
 	assert_eq!(run(src, "a"), "5");
+}
+
+#[test]
+fn runs_top_level_let_via_an_attached_method_reading_a_later_let() {
+	let src = r#"
+		struct Reader { func read(): int = later }
+		let result = Reader().read()
+		let later = 5
+	"#;
+	assert_eq!(run(src, "result"), "5");
+}
+
+#[test]
+fn runs_top_level_let_via_a_static_method_reading_a_later_let() {
+	let src = r#"
+		struct Reader { namespace func read(): int = later }
+		let result = Reader.read()
+		let later = 5
+	"#;
+	assert_eq!(run(src, "result"), "5");
+}
+
+#[test]
+fn top_level_initializer_self_cycles_are_compile_errors() {
+	let result = nymph_compiler::compile("let value: int = value", "test");
+	let diagnostics = result.expect_err("self-cycle must not produce JavaScript");
+	assert!(
+		diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.message.contains("InitializerCycle")),
+		"{diagnostics:?}"
+	);
+}
+
+#[test]
+fn function_mediated_top_level_initializer_self_cycles_are_compile_errors() {
+	let src = "let value: int = read()\nfunc read(): int = value";
+	let result = nymph_compiler::compile(src, "test");
+	let diagnostics = result.expect_err("function-mediated self-cycle must not produce JavaScript");
+	assert!(
+		diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.message.contains("InitializerCycle")),
+		"{diagnostics:?}"
+	);
+}
+
+#[test]
+fn unresolved_callable_value_initializer_calls_are_compile_errors() {
+	let src = "let callback = () -> later\nlet result = callback()\nlet later = 5";
+	let result = nymph_compiler::compile(src, "test");
+	let diagnostics = result.expect_err("dynamic initializer call must not produce JavaScript");
+	assert!(
+		diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.message.contains("UnresolvedInitializerCall")),
+		"{diagnostics:?}"
+	);
+}
+
+#[test]
+fn interpolation_runtime_dispatch_in_an_initializer_is_a_compile_error() {
+	let src = "let rendered = \"value: ${1}\"";
+	let result = nymph_compiler::compile(src, "test");
+	let diagnostics = result.expect_err("opaque display dispatch must not produce JavaScript");
+	assert!(
+		diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.message.contains("UnresolvedInitializerCall")),
+		"{diagnostics:?}"
+	);
+}
+
+#[test]
+fn top_level_initializer_order_uses_exact_bindings_not_shadowed_parameter_names() {
+	let src = r#"
+		let a = fa(1)
+		let b = fb(2)
+		func fa(b: int): int = b
+		func fb(a: int): int = a
+		func sum(): int = a + b
+	"#;
+	assert_eq!(run(src, "sum()"), "3");
 }
 
 #[test]
@@ -1764,8 +1852,6 @@ fn runs_a_for_loop_over_an_iterator_directly() {
 	// it directly (`IterMode::Direct`), and that call is gated exactly like an
 	// explicit `c.next()` would be (`MutMethodNeedsMutReceiver`).
 	let src = r#"
-		enum Option<T> { Some(value: T), None }
-		interface Iterator<Item> { mut func next(): Option<Item> }
 		struct Counter(n: int, max: int)
 		impl Iterator<int> for Counter {
 			mut func next(): Option<int> = if (this.n > this.max) {
@@ -1801,9 +1887,6 @@ fn runs_a_for_loop_over_an_iterable_via_iter() {
 	// as its return type), so nothing about `iter()`'s return type actually
 	// participates in resolving `T`.
 	let src = r#"
-		enum Option<T> { Some(value: T), None }
-		interface Iterator<Item> { mut func next(): Option<Item> }
-		interface Iterable<T> { func iter(): Iterator<T> }
 		struct Counter(n: int, max: int)
 		impl Iterator<int> for Counter {
 			mut func next(): Option<int> = if (this.n > this.max) {
@@ -1834,9 +1917,6 @@ fn runs_a_for_loop_over_an_iterable_via_iter() {
 #[test]
 fn runs_a_for_loop_over_a_generic_iterable_bound() {
 	let src = r#"
-		enum Option<T> { Some(value: T), None }
-		interface Iterator<Item> { mut func next(): Option<Item> }
-		interface Iterable<Item> { func iter(): Iterator<Item> }
 		struct Counter(n: int, max: int)
 		impl Iterator<int> for Counter {
 			mut func next(): Option<int> = if (this.n > this.max) { None } else {
@@ -1847,7 +1927,7 @@ fn runs_a_for_loop_over_a_generic_iterable_bound() {
 		}
 		struct Bag(max: int)
 		impl Iterable<int> for Bag { func iter(): Counter = Counter(n = 1, max = this.max) }
-		func sum<T: Iterable<Item = int>>(items: T): int = {
+		func sum<T: Iterable<T = int>>(items: T): int = {
 			let mut total = 0
 			for (item in items) { total = total + item }
 			total
@@ -2815,8 +2895,6 @@ fn runs_a_list_spread_over_a_user_iterator_source() {
 	// `.next()`/`Option` protocol before splicing — no `Symbol.iterator`
 	// involved.
 	let src = r#"
-		enum Option<T> { Some(value: T), None }
-		interface Iterator<Item> { mut func next(): Option<Item> }
 		struct Counter(n: int, max: int)
 		impl Iterator<int> for Counter {
 			mut func next(): Option<int> = if (this.n > this.max) {
@@ -2843,9 +2921,6 @@ fn runs_a_list_spread_over_an_iterable_via_iter_source() {
 	// The `Iterable<T>` (not `Iterator` itself) half of the protocol, via
 	// `.iter()`, also drains correctly for a spread source.
 	let src = r#"
-		enum Option<T> { Some(value: T), None }
-		interface Iterator<Item> { mut func next(): Option<Item> }
-		interface Iterable<T> { func iter(): Iterator<T> }
 		struct Counter(n: int, max: int)
 		impl Iterator<int> for Counter {
 			mut func next(): Option<int> = if (this.n > this.max) {
@@ -2901,11 +2976,9 @@ fn runs_a_map_spread_merge_with_later_key_wins() {
 
 #[test]
 fn runs_a_map_spread_over_a_non_map_iterable_of_pairs() {
-	// `Map` has no stdlib `Iterable` impl, so a non-map spread source must be a
-	// user `Iterator`/`Iterable<#(K, V)>` of entry pairs — drained then merged.
+	// A non-map spread source may be a user `Iterator<#(K, V)>` of entry pairs,
+	// which is drained and then merged.
 	let src = r#"
-		enum Option<T> { Some(value: T), None }
-		interface Iterator<Item> { mut func next(): Option<Item> }
 		struct Pairs(n: int, max: int)
 		impl Iterator<#(int, string)> for Pairs {
 			mut func next(): Option<#(int, string)> = if (this.n > this.max) {

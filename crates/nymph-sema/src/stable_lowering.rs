@@ -4,7 +4,7 @@
 //! does not need compiler queries, parser identities, source locations, or module ASTs.
 
 use std::{
-	cell::RefCell,
+	cell::{Cell, RefCell},
 	collections::{HashMap, HashSet},
 	sync::Arc,
 };
@@ -245,6 +245,18 @@ pub enum StableModuleAssemblyError {
 	DemandCycle {
 		definition: DefinitionId,
 	},
+	MissingExecutionBody {
+		caller: DefinitionId,
+		callee: DefinitionId,
+	},
+	InitializerCycle {
+		cycle: Vec<DefinitionId>,
+	},
+	UnresolvedInitializerCall {
+		initializer: DefinitionId,
+		body: DefinitionId,
+		call: UnresolvedRuntimeCall,
+	},
 }
 
 impl From<StableLoweringError> for StableModuleAssemblyError {
@@ -276,6 +288,40 @@ impl StableDemandSet {
 	}
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeExecutionSummary {
+	immediate_reads: StableDemandSet,
+	immediate_calls: StableDemandSet,
+	unresolved_calls: Vec<UnresolvedRuntimeCall>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum UnresolvedRuntimeCall {
+	DynamicCallee,
+	CallableValue(DefinitionId),
+	OpaqueExternal(DefinitionId),
+	GenericDispatch {
+		interface: DefinitionId,
+		member: DefinitionId,
+	},
+	IteratorNext {
+		interface: DefinitionId,
+		member: DefinitionId,
+	},
+}
+
+impl RuntimeExecutionSummary {
+	pub fn immediate_reads(&self) -> &[DefinitionId] {
+		self.immediate_reads.as_slice()
+	}
+	pub fn immediate_calls(&self) -> &[DefinitionId] {
+		self.immediate_calls.as_slice()
+	}
+	pub fn unresolved_calls(&self) -> &[UnresolvedRuntimeCall] {
+		&self.unresolved_calls
+	}
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LoweredRuntimeDefinition {
 	definition: DefinitionId,
@@ -283,6 +329,7 @@ pub struct LoweredRuntimeDefinition {
 	demands: StableDemandSet,
 	direct_demands: StableDemandSet,
 	routed_demands: StableDemandSet,
+	execution: RuntimeExecutionSummary,
 	placement: RuntimeAssemblyPlacement,
 }
 
@@ -307,6 +354,7 @@ impl LoweredRuntimeDefinition {
 			demands,
 			direct_demands,
 			routed_demands: StableDemandSet::new(),
+			execution: RuntimeExecutionSummary::default(),
 			placement,
 		}
 	}
@@ -324,6 +372,15 @@ impl LoweredRuntimeDefinition {
 	}
 	pub fn routed_demands(&self) -> &[DefinitionId] {
 		self.routed_demands.as_slice()
+	}
+	pub fn immediate_reads(&self) -> &[DefinitionId] {
+		self.execution.immediate_reads()
+	}
+	pub fn immediate_calls(&self) -> &[DefinitionId] {
+		self.execution.immediate_calls()
+	}
+	pub fn unresolved_calls(&self) -> &[UnresolvedRuntimeCall] {
+		self.execution.unresolved_calls()
 	}
 	pub fn placement(&self) -> &RuntimeAssemblyPlacement {
 		&self.placement
@@ -429,6 +486,7 @@ pub fn lower_runtime_definition(
 	let mut demands = StableDemandSet::new();
 	let mut direct_demands = StableDemandSet::new();
 	let mut routed_demands = StableDemandSet::new();
+	let mut execution = RuntimeExecutionSummary::default();
 	let fragment = match &artifact.payload {
 		crate::RuntimePayload::External(abi) => lower_external(context, &artifact, abi)?,
 		crate::RuntimePayload::Struct(shell) => {
@@ -489,6 +547,7 @@ pub fn lower_runtime_definition(
 				&mut demands,
 				&mut direct_demands,
 				&mut routed_demands,
+				&mut execution,
 				implementation.map(|implementation| &implementation.self_type),
 				implementation.map(|implementation| &implementation.member_slots),
 				implementation_member
@@ -588,6 +647,7 @@ pub fn lower_runtime_definition(
 				&mut demands,
 				&mut direct_demands,
 				&mut routed_demands,
+				&mut execution,
 				Some(&implementation_shape.self_type),
 				Some(&implementation_shape.member_slots),
 				Some(member_shape.kind),
@@ -613,6 +673,7 @@ pub fn lower_runtime_definition(
 	let mut lowered = LoweredRuntimeDefinition::new(definition, fragment, demands, placement);
 	lowered.direct_demands = direct_demands;
 	lowered.routed_demands = routed_demands;
+	lowered.execution = execution;
 	Ok(lowered)
 }
 
@@ -1465,6 +1526,7 @@ fn lower_body(
 	demands: &mut StableDemandSet,
 	direct_demands: &mut StableDemandSet,
 	routed_demands: &mut StableDemandSet,
+	execution: &mut RuntimeExecutionSummary,
 	self_type: Option<&InterfaceType>,
 	implementation_slots: Option<&crate::ImplementationMemberCatalog>,
 	member_kind: Option<crate::MemberKind>,
@@ -1498,6 +1560,8 @@ fn lower_body(
 		demands: RefCell::new(demands),
 		direct_demands: RefCell::new(direct_demands),
 		routed_demands: RefCell::new(routed_demands),
+		execution: RefCell::new(execution),
+		deferred_depth: Cell::new(0),
 		self_type,
 		implementation_slots,
 		receiver_binding: has_receiver.then(|| EcoString::from("$self")),
@@ -1620,6 +1684,8 @@ struct StableBodyLowerer<'a, C> {
 	demands: RefCell<&'a mut StableDemandSet>,
 	direct_demands: RefCell<&'a mut StableDemandSet>,
 	routed_demands: RefCell<&'a mut StableDemandSet>,
+	execution: RefCell<&'a mut RuntimeExecutionSummary>,
+	deferred_depth: Cell<u32>,
 	self_type: Option<&'a InterfaceType>,
 	implementation_slots: Option<&'a crate::ImplementationMemberCatalog>,
 	receiver_binding: Option<EcoString>,
@@ -1743,6 +1809,65 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.find(|(found, _)| *found == id)
 			.map(|(_, target)| target)
 	}
+	fn record_read(&self, target: &DefinitionId) {
+		if self.deferred_depth.get() == 0 {
+			self
+				.execution
+				.borrow_mut()
+				.immediate_reads
+				.insert(target.clone());
+		}
+	}
+	fn record_call(&self, target: &DefinitionId) -> Result<bool, StableLoweringError> {
+		if self.deferred_depth.get() != 0 {
+			return Ok(false);
+		}
+		let artifact = self.context.runtime_definition(target)?;
+		let callable = match &artifact.payload {
+			crate::RuntimePayload::NymphBody(body) => body.kind != crate::RuntimeBodyKind::Value,
+			crate::RuntimePayload::MaterializedInterfaceMember { .. } => true,
+			crate::RuntimePayload::External(_) => !matches!(
+				target.key,
+				crate::DeclarationKey::TopLevel {
+					category: crate::DeclarationCategory::Let,
+					..
+				}
+			),
+			crate::RuntimePayload::Struct(_) | crate::RuntimePayload::Enum(_) => false,
+		};
+		if callable {
+			self
+				.execution
+				.borrow_mut()
+				.immediate_calls
+				.insert(target.clone());
+			if matches!(
+				artifact.payload,
+				crate::RuntimePayload::External(crate::ExternalAbi {
+					callable: crate::ExternalCallable::Linked { .. },
+					..
+				})
+			) {
+				self.record_unresolved_call(UnresolvedRuntimeCall::OpaqueExternal(target.clone()));
+			}
+		}
+		Ok(callable)
+	}
+	fn record_unresolved_call(&self, call: UnresolvedRuntimeCall) {
+		if self.deferred_depth.get() == 0 && !self.execution.borrow().unresolved_calls.contains(&call) {
+			self.execution.borrow_mut().unresolved_calls.push(call);
+		}
+	}
+	fn lower_deferred<T>(
+		&self,
+		lower: impl FnOnce() -> Result<T, StableLoweringError>,
+	) -> Result<T, StableLoweringError> {
+		let depth = self.deferred_depth.get();
+		self.deferred_depth.set(depth + 1);
+		let result = lower();
+		self.deferred_depth.set(depth);
+		result
+	}
 	fn external_marshal(
 		&self,
 		expr: &StableExpr,
@@ -1857,7 +1982,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			let params = (0..*arity)
 				.map(|i| self.declare(&crate::anon_closure::anon_param_name(i)))
 				.collect();
-			let body = self.lower_inner(expr)?;
+			let body = self.lower_deferred(|| self.lower_inner(expr))?;
 			self.scopes.borrow_mut().pop();
 			return Ok(HirExpr::Closure {
 				params,
@@ -1907,6 +2032,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					});
 				}
 				if let Some(target) = self.target(expr) {
+					self.record_read(target);
 					let emitted = self.context.binding_name(target)?;
 					let target_artifact = self.context.runtime_definition(target)?;
 					if matches!(target_artifact.payload, crate::RuntimePayload::External(_)) {
@@ -2216,6 +2342,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				if let Some(target) = self.target(func) {
 					let target_artifact = self.context.runtime_definition(target)?;
 					if matches!(target_artifact.payload, crate::RuntimePayload::External(_)) {
+						let _ = self.record_call(target)?;
 						self.demand_direct(target);
 						let abi = exact_external_abi(self.context, target, None)?;
 						let module = external_module(target, &abi)?;
@@ -2229,6 +2356,11 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 								.collect::<Result<_, _>>()?,
 						});
 					}
+					if !self.record_call(target)? {
+						self.record_unresolved_call(UnresolvedRuntimeCall::CallableValue(target.clone()));
+					}
+				} else {
+					self.record_unresolved_call(UnresolvedRuntimeCall::DynamicCallee);
 				}
 				HirExpr::Call {
 					callee: Box::new(self.lower(func)?),
@@ -2240,6 +2372,13 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			}
 			StableExprKind::BinaryOp { lhs, op, rhs } => {
 				if *op == BinaryOperator::Pipe {
+					if let Some(target) = self.target(rhs) {
+						if !self.record_call(target)? {
+							self.record_unresolved_call(UnresolvedRuntimeCall::CallableValue(target.clone()));
+						}
+					} else {
+						self.record_unresolved_call(UnresolvedRuntimeCall::DynamicCallee);
+					}
 					return Ok(HirExpr::Call {
 						callee: Box::new(self.lower(rhs)?),
 						args: vec![self.lower(lhs)?],
@@ -2340,7 +2479,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.iter()
 					.map(|param| pattern_name(&param.pattern).map(|name| self.declare(name)))
 					.collect::<Result<_, _>>()?;
-				let body = self.lower_function_body(body)?;
+				let body = self.lower_deferred(|| self.lower_function_body(body))?;
 				self.scopes.borrow_mut().pop();
 				HirExpr::Closure {
 					params,
@@ -2666,6 +2805,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		if let Some(demand) = demand {
 			self.demand_direct(&demand);
 		}
+		let _ = self.record_call(&member)?;
 		if external {
 			let abi = exact_external_abi(self.context, &member, persisted_marshal)?;
 			let mut args = vec![self.lower(receiver)?];
@@ -2989,6 +3129,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		}
 		let method: EcoString = self.context.member_name(member)?.as_str().into();
 		if arguments.len() != 1 {
+			self.record_unresolved_call(UnresolvedRuntimeCall::GenericDispatch {
+				interface: interface.clone(),
+				member: member.clone(),
+			});
 			return Ok(HirExpr::Call {
 				callee: Box::new(HirExpr::Field {
 					recv: Box::new(self.lower(receiver)?),
@@ -3015,6 +3159,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				member: member.clone(),
 			})?;
 		let mut cases = Vec::new();
+		let mut has_nominal_fallback = false;
 		for implementation in implementations {
 			if implementation.interface.as_ref() != Some(interface) {
 				return Err(invalid(
@@ -3053,6 +3198,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				exact_external_abi(self.context, &slot.member_id, None)?;
 			}
 			let Some(receiver_tag) = stable_runtime_tag(&implementation.self_type) else {
+				has_nominal_fallback = true;
 				continue;
 			};
 			let parameter_type = interface_member.parameters.first().ok_or_else(|| {
@@ -3081,6 +3227,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			if receiver_tag != argument_tag {
 				continue;
 			}
+			let _ = self.record_call(&slot.member_id)?;
 			let body = self.context.runtime_definition(&slot.member_id)?;
 			let target = match &body.payload {
 				crate::RuntimePayload::External(abi) => match &abi.callable {
@@ -3170,6 +3317,12 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		cases.sort_by(|left, right| {
 			(&left.receiver_tag, &left.argument_tag).cmp(&(&right.receiver_tag, &right.argument_tag))
 		});
+		if has_nominal_fallback {
+			self.record_unresolved_call(UnresolvedRuntimeCall::GenericDispatch {
+				interface: interface.clone(),
+				member: member.clone(),
+			});
+		}
 		Ok(HirExpr::BoundDispatch {
 			interface: interface_shape.name,
 			method,
@@ -3199,10 +3352,34 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					})?;
 				let source = self.lower(value)?;
 				let (it, next, option) = match iteration {
-					crate::RuntimeIteration::Direct { next, option, .. } => (source, next, option),
+					crate::RuntimeIteration::Direct {
+						iterator_interface,
+						next,
+						option,
+					} => {
+						self.record_unresolved_call(UnresolvedRuntimeCall::IteratorNext {
+							interface: iterator_interface.clone(),
+							member: next.clone(),
+						});
+						(source, next, option)
+					}
 					crate::RuntimeIteration::ViaIter {
-						iter, next, option, ..
-					} => (self.lower_dispatch_value(iter, source)?, next, option),
+						iter,
+						iterable_interface,
+						iter_interface_member,
+						iterator_interface,
+						next,
+						option,
+					} => {
+						self.demand_concrete_iteration_next(
+							iter,
+							iterable_interface,
+							iter_interface_member,
+							iterator_interface,
+							next,
+						)?;
+						(self.lower_dispatch_value(iter, source)?, next, option)
+					}
 				};
 				let next = self.context.member_name(next)?.as_str().into();
 				Ok(drain_spread(
@@ -3229,6 +3406,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				StableStringPart::Text(value) => text.push_str(value),
 				StableStringPart::Escape(value) => text.push_str(&cooked_escape(*value)),
 				StableStringPart::Expr(value) => {
+					self.record_unresolved_call(UnresolvedRuntimeCall::DynamicCallee);
 					interpolated = true;
 					if !text.is_empty() {
 						result.push(HirExpr::Str(std::mem::take(&mut text)));
@@ -3532,7 +3710,17 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				channel: "iteration".into(),
 			})?;
 		let (it, next, option) = match iteration {
-			crate::RuntimeIteration::Direct { next, option, .. } => {
+			crate::RuntimeIteration::Direct {
+				iterator_interface,
+				next,
+				option,
+			} => {
+				if !native_range {
+					self.record_unresolved_call(UnresolvedRuntimeCall::IteratorNext {
+						interface: iterator_interface.clone(),
+						member: next.clone(),
+					});
+				}
 				let source = if native_range {
 					HirExpr::Call {
 						callee: Box::new(HirExpr::Field {
@@ -3608,6 +3796,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						materialization,
 					)?;
 					self.demand_external(member)?;
+					let _ = self.record_call(member)?;
 					HirExpr::Call {
 						callee: Box::new(HirExpr::Local(
 							self.context.binding_name(member)?.as_str().into(),
@@ -3726,6 +3915,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			_ => None,
 		};
 		let Some(implementation) = selected else {
+			self.record_unresolved_call(UnresolvedRuntimeCall::IteratorNext {
+				interface: iterator_interface.clone(),
+				member: next.clone(),
+			});
 			return Ok(());
 		};
 		let request = StableShapeRequest::Implementation(implementation.clone());
@@ -3818,8 +4011,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			return Err(StableShapeLookupError::WrongFact { request }.into());
 		};
 		let concrete_iterator = match &member.return_type {
-			InterfaceType::Named { definition, .. } => Some(definition),
-			_ => None,
+			InterfaceType::Named { definition, .. } if definition != iterator_interface => definition,
+			_ => {
+				self.record_unresolved_call(UnresolvedRuntimeCall::IteratorNext {
+					interface: iterator_interface.clone(),
+					member: next.clone(),
+				});
+				return Ok(());
+			}
 		};
 		let request = StableShapeRequest::ImplementationsForInterface(iterator_interface.clone());
 		let StableShapeFact::Implementations(implementations) = self.context.stable_shape(&request)?
@@ -3828,9 +4027,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		};
 		let mut found = false;
 		for implementation in &implementations {
-			if concrete_iterator.is_some_and(|iterator| {
-				!matches!(peel_mut(&implementation.self_type), InterfaceType::Named { definition, .. } if definition == iterator)
-			}) {
+			if !matches!(peel_mut(&implementation.self_type), InterfaceType::Named { definition, .. } if definition == concrete_iterator)
+			{
 				continue;
 			}
 			let Some(slot) = implementation.member_slots.target(next) else {
@@ -3852,10 +4050,9 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				materialization,
 			)?;
 			self.demand_external(&slot.member_id)?;
+			let _ = self.record_call(&slot.member_id)?;
 			found = true;
-			if concrete_iterator.is_some() {
-				break;
-			}
+			break;
 		}
 		if !found {
 			return Err(invalid(
@@ -3865,6 +4062,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		}
 		Ok(())
 	}
+
 	fn lower_dispatch_value(
 		&self,
 		dispatch: &crate::StableDispatch,
@@ -3946,6 +4144,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.implementation_slots
 					.and_then(|slots| slots.target(member))
 				else {
+					self.record_unresolved_call(UnresolvedRuntimeCall::GenericDispatch {
+						interface: interface.clone(),
+						member: member.clone(),
+					});
 					return Ok(HirExpr::Call {
 						callee: Box::new(HirExpr::Field {
 							recv: Box::new(receiver),
@@ -3981,6 +4183,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		if concrete.is_some() || !matches!(dispatch, crate::StableDispatch::GenericBound { .. }) {
 			self.demand_external(target)?;
 		}
+		let _ = self.record_call(target)?;
 		let shellless = match dispatch {
 			crate::StableDispatch::Direct { implementation, .. }
 			| crate::StableDispatch::SelectedImplementation { implementation, .. }

@@ -1863,10 +1863,15 @@ pub(crate) fn lower_interface_module<'db>(
 			nymph_sema::RuntimeAssemblyPlacement::Module(owner) => owner == &target,
 			nymph_sema::RuntimeAssemblyPlacement::Shell(owner) => owner.module == target,
 			nymph_sema::RuntimeAssemblyPlacement::Template => true,
-		});
-	let hir = super::assembly::assemble_runtime_module(
+		})
+		.collect::<Vec<_>>();
+	let execution_bodies = lowered.iter();
+	let hir = super::assembly::assemble_runtime_module_with_execution(
 		&target,
-		local_fragments.map(|fragment| (fragment.definition().clone(), fragment)),
+		local_fragments
+			.into_iter()
+			.map(|fragment| (fragment.definition().clone(), fragment)),
+		execution_bodies,
 	)
 	.map_err(map_runtime_assembly_error)?;
 	let imports = lowered
@@ -1943,6 +1948,21 @@ fn map_runtime_assembly_error(
 				definition,
 			}
 		}
+		Error::MissingExecutionBody { caller, callee } => {
+			nymph_sema::StableModuleAssemblyError::MissingExecutionBody { caller, callee }
+		}
+		Error::InitializerCycle { cycle } => {
+			nymph_sema::StableModuleAssemblyError::InitializerCycle { cycle }
+		}
+		Error::UnresolvedInitializerCall {
+			initializer,
+			body,
+			call,
+		} => nymph_sema::StableModuleAssemblyError::UnresolvedInitializerCall {
+			initializer,
+			body,
+			call,
+		},
 	}
 }
 

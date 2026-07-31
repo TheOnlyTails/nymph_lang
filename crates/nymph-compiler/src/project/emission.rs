@@ -315,6 +315,7 @@ pub(crate) fn emitted_interface_project<'db>(
 			(fragment.definition.clone(), delivery)
 		})
 		.collect::<std::collections::HashMap<_, _>>();
+	let execution_fragments = virtual_fragments.values().cloned().collect::<Vec<_>>();
 	for fragment in virtual_fragments.into_values() {
 		by_owner
 			.entry(fragment.owner.clone())
@@ -322,7 +323,14 @@ pub(crate) fn emitted_interface_project<'db>(
 			.push(fragment);
 	}
 	for (owner, fragments) in by_owner {
-		match emit_virtual_runtime_module(db, key, &owner, &fragments, &virtual_deliveries) {
+		match emit_virtual_runtime_module(
+			db,
+			key,
+			&owner,
+			&fragments,
+			&execution_fragments,
+			&virtual_deliveries,
+		) {
 			Ok(source) => {
 				let specifier = module_specifier(&owner);
 				if sources.contains_key(&specifier) {
@@ -396,16 +404,20 @@ fn emit_virtual_runtime_module(
 	key: ProjectKey<'_>,
 	owner: &nymph_sema::ModuleIdentity,
 	fragments: &[nymph_sema::VirtualRuntimeFragment],
+	execution_fragments: &[nymph_sema::VirtualRuntimeFragment],
 	virtual_deliveries: &std::collections::HashMap<
 		nymph_sema::DefinitionId,
 		link_plan::VirtualDemandDelivery,
 	>,
 ) -> Result<String, String> {
-	let hir = super::assembly::assemble_runtime_module(
+	let hir = super::assembly::assemble_runtime_module_with_execution(
 		owner,
 		fragments
 			.iter()
 			.map(|fragment| (fragment.definition.clone(), &fragment.fragment)),
+		execution_fragments
+			.iter()
+			.map(|fragment| &fragment.fragment),
 	)
 	.map_err(|error| format!("runtime assembly failed: {error:?}"))?;
 	let current_module = module_specifier(owner);

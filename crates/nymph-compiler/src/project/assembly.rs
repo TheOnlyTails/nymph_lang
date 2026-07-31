@@ -56,13 +56,47 @@ pub(crate) enum RuntimeAssemblyError {
 	Template {
 		definition: DefinitionId,
 	},
+	MissingExecutionBody {
+		caller: DefinitionId,
+		callee: DefinitionId,
+	},
+	InitializerCycle {
+		cycle: Vec<DefinitionId>,
+	},
+	UnresolvedInitializerCall {
+		initializer: DefinitionId,
+		body: DefinitionId,
+		call: nymph_sema::UnresolvedRuntimeCall,
+	},
 }
 
-pub(crate) fn assemble_runtime_module<'a>(
+#[cfg(test)]
+fn assemble_runtime_module<'a>(
 	target: &ModuleIdentity,
 	fragments: impl IntoIterator<Item = (DefinitionId, &'a LoweredRuntimeDefinition)>,
 ) -> Result<HirModule, RuntimeAssemblyError> {
 	let fragments = fragments.into_iter().collect::<Vec<_>>();
+	let execution_bodies = fragments.iter().map(|(_, lowered)| *lowered).collect();
+	assemble_runtime_module_with_collected(target, fragments, execution_bodies)
+}
+
+pub(crate) fn assemble_runtime_module_with_execution<'a>(
+	target: &ModuleIdentity,
+	fragments: impl IntoIterator<Item = (DefinitionId, &'a LoweredRuntimeDefinition)>,
+	execution_bodies: impl IntoIterator<Item = &'a LoweredRuntimeDefinition>,
+) -> Result<HirModule, RuntimeAssemblyError> {
+	assemble_runtime_module_with_collected(
+		target,
+		fragments.into_iter().collect(),
+		execution_bodies.into_iter().collect(),
+	)
+}
+
+fn assemble_runtime_module_with_collected(
+	target: &ModuleIdentity,
+	fragments: Vec<(DefinitionId, &LoweredRuntimeDefinition)>,
+	execution_bodies: Vec<&LoweredRuntimeDefinition>,
+) -> Result<HirModule, RuntimeAssemblyError> {
 	for (supplied, lowered) in &fragments {
 		if supplied != lowered.definition() {
 			return Err(RuntimeAssemblyError::DefinitionMismatch {
@@ -72,6 +106,7 @@ pub(crate) fn assemble_runtime_module<'a>(
 		}
 		validate_fragment_intrinsic(lowered)?;
 	}
+	let value_order = order_top_level_values(&fragments, &execution_bodies)?;
 	let mut hir = HirModule {
 		lets: vec![],
 		funcs: vec![],
@@ -113,6 +148,7 @@ pub(crate) fn assemble_runtime_module<'a>(
 		}
 	}
 	let mut attachments = HashSet::new();
+	let mut top_level_values = HashMap::new();
 	for (_, lowered) in fragments {
 		use LoweredHirFragment as Fragment;
 		match lowered.fragment() {
@@ -122,7 +158,7 @@ pub(crate) fn assemble_runtime_module<'a>(
 			}
 			Fragment::TopLevelValue(value) => {
 				validate_module(target, lowered)?;
-				hir.lets.push(value.clone());
+				top_level_values.insert(lowered.definition().clone(), value.clone());
 			}
 			Fragment::TopLevelExternal { .. } => validate_module(target, lowered)?,
 			Fragment::AttachedInstance { owner, method }
@@ -150,7 +186,156 @@ pub(crate) fn assemble_runtime_module<'a>(
 			Fragment::StructShell(_) | Fragment::EnumShell(_) => {}
 		}
 	}
+	hir.lets = value_order
+		.into_iter()
+		.map(|definition| {
+			top_level_values
+				.remove(&definition)
+				.expect("ordered top-level value must exist")
+		})
+		.collect();
 	Ok(hir)
+}
+
+fn order_top_level_values(
+	fragments: &[(DefinitionId, &LoweredRuntimeDefinition)],
+	execution_bodies: &[&LoweredRuntimeDefinition],
+) -> Result<Vec<DefinitionId>, RuntimeAssemblyError> {
+	let by_definition = execution_bodies
+		.iter()
+		.map(|lowered| (lowered.definition().clone(), *lowered))
+		.collect::<HashMap<_, _>>();
+	let values = fragments
+		.iter()
+		.filter(|(_, lowered)| matches!(lowered.fragment(), LoweredHirFragment::TopLevelValue(_)))
+		.map(|(definition, _)| definition.clone())
+		.collect::<Vec<_>>();
+	let value_set = values.iter().cloned().collect::<HashSet<_>>();
+	let mut prerequisites = HashMap::<DefinitionId, HashSet<DefinitionId>>::new();
+	for value in &values {
+		let Some(root) = by_definition.get(value).copied() else {
+			return Err(RuntimeAssemblyError::MissingExecutionBody {
+				caller: value.clone(),
+				callee: value.clone(),
+			});
+		};
+		if let Some(call) = root.unresolved_calls().first() {
+			return Err(RuntimeAssemblyError::UnresolvedInitializerCall {
+				initializer: value.clone(),
+				body: value.clone(),
+				call: call.clone(),
+			});
+		}
+		let required = prerequisites.entry(value.clone()).or_default();
+		required.extend(
+			root
+				.immediate_reads()
+				.iter()
+				.filter(|read| value_set.contains(*read))
+				.cloned(),
+		);
+		let mut calls = root.immediate_calls().to_vec();
+		let mut visited = HashSet::new();
+		while let Some(callee) = calls.pop() {
+			if !visited.insert(callee.clone()) {
+				continue;
+			}
+			let Some(body) = by_definition.get(&callee).copied() else {
+				return Err(RuntimeAssemblyError::MissingExecutionBody {
+					caller: value.clone(),
+					callee,
+				});
+			};
+			if let Some(call) = body.unresolved_calls().first() {
+				return Err(RuntimeAssemblyError::UnresolvedInitializerCall {
+					initializer: value.clone(),
+					body: callee,
+					call: call.clone(),
+				});
+			}
+			required.extend(
+				body
+					.immediate_reads()
+					.iter()
+					.filter(|read| value_set.contains(*read))
+					.cloned(),
+			);
+			calls.extend(body.immediate_calls().iter().cloned());
+		}
+	}
+
+	let mut ordered = Vec::with_capacity(values.len());
+	let mut emitted = HashSet::new();
+	let mut remaining = values;
+	while !remaining.is_empty() {
+		let Some(index) = remaining.iter().position(|definition| {
+			prerequisites[definition]
+				.iter()
+				.all(|dependency| emitted.contains(dependency))
+		}) else {
+			let cycle = initializer_cycle_witness(&remaining, &prerequisites)
+				.expect("stalled initializer graph must contain a cycle");
+			return Err(RuntimeAssemblyError::InitializerCycle { cycle });
+		};
+		let definition = remaining.remove(index);
+		emitted.insert(definition.clone());
+		ordered.push(definition);
+	}
+	Ok(ordered)
+}
+
+fn initializer_cycle_witness(
+	remaining: &[DefinitionId],
+	prerequisites: &HashMap<DefinitionId, HashSet<DefinitionId>>,
+) -> Option<Vec<DefinitionId>> {
+	fn visit(
+		definition: &DefinitionId,
+		remaining: &[DefinitionId],
+		prerequisites: &HashMap<DefinitionId, HashSet<DefinitionId>>,
+		states: &mut HashMap<DefinitionId, u8>,
+		stack: &mut Vec<DefinitionId>,
+	) -> Option<Vec<DefinitionId>> {
+		states.insert(definition.clone(), 1);
+		stack.push(definition.clone());
+		for dependency in remaining
+			.iter()
+			.filter(|candidate| prerequisites[definition].contains(*candidate))
+		{
+			match states.get(dependency).copied().unwrap_or_default() {
+				0 => {
+					if let Some(cycle) = visit(dependency, remaining, prerequisites, states, stack) {
+						return Some(cycle);
+					}
+				}
+				1 => {
+					let start = stack.iter().position(|item| item == dependency).unwrap();
+					let mut cycle = stack[start..].to_vec();
+					cycle.push(dependency.clone());
+					return Some(cycle);
+				}
+				_ => {}
+			}
+		}
+		stack.pop();
+		states.insert(definition.clone(), 2);
+		None
+	}
+
+	let mut states = HashMap::new();
+	let mut stack = Vec::new();
+	for definition in remaining {
+		if states.get(definition).copied().unwrap_or_default() == 0
+			&& let Some(cycle) = visit(
+				definition,
+				remaining,
+				prerequisites,
+				&mut states,
+				&mut stack,
+			) {
+			return Some(cycle);
+		}
+	}
+	None
 }
 
 fn validate_module(
@@ -319,6 +504,8 @@ fn attach(
 
 #[cfg(test)]
 mod tests {
+	use std::collections::{HashMap, HashSet};
+
 	use nymph_hir::hir::{HirClass, HirExpr, HirMethod};
 	use nymph_sema::{
 		DeclarationCategory, DeclarationKey, DefinitionId, HeaderType, ImplementationHeader,
@@ -326,7 +513,10 @@ mod tests {
 		RuntimeAssemblyPlacement, StableDemandSet,
 	};
 
-	use super::{RuntimeAssemblyError, assemble_runtime_module, insert_exact_virtual_fragment};
+	use super::{
+		RuntimeAssemblyError, assemble_runtime_module, assemble_runtime_module_with_execution,
+		initializer_cycle_witness, insert_exact_virtual_fragment,
+	};
 
 	fn module(path: &str) -> ModuleIdentity {
 		ModuleIdentity {
@@ -367,6 +557,49 @@ mod tests {
 			params: vec![],
 			body: HirExpr::Bool(true),
 		}
+	}
+
+	#[test]
+	fn initializer_cycle_witness_excludes_acyclic_dependents() {
+		let target = module("target");
+		let a = definition(&target, DeclarationCategory::Let, "a");
+		let b = definition(&target, DeclarationCategory::Let, "b");
+		let blocked = definition(&target, DeclarationCategory::Let, "blocked");
+		let prerequisites = HashMap::from([
+			(a.clone(), HashSet::from([b.clone()])),
+			(b.clone(), HashSet::from([a.clone()])),
+			(blocked.clone(), HashSet::from([a.clone()])),
+		]);
+
+		assert_eq!(
+			initializer_cycle_witness(&[blocked, a.clone(), b.clone()], &prerequisites),
+			Some(vec![a.clone(), b, a])
+		);
+	}
+
+	#[test]
+	fn missing_initializer_execution_body_is_a_typed_error() {
+		let target = module("target");
+		let value = definition(&target, DeclarationCategory::Let, "value");
+		let fragment = lowered(
+			value.clone(),
+			LoweredHirFragment::TopLevelValue(nymph_hir::hir::HirLet {
+				name: "value".into(),
+				mutable: false,
+				value: HirExpr::Bool(true),
+			}),
+			RuntimeAssemblyPlacement::Module(target.clone()),
+		);
+
+		assert!(matches!(
+			assemble_runtime_module_with_execution(
+				&target,
+				[(value.clone(), &fragment)],
+				std::iter::empty(),
+			),
+			Err(RuntimeAssemblyError::MissingExecutionBody { caller, callee })
+				if caller == value && callee == value
+		));
 	}
 
 	#[test]
