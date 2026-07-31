@@ -661,11 +661,24 @@ impl Checker<'_> {
 		let count = self.impls.impls.len();
 		for i in 0..count {
 			for j in (i + 1)..count {
-				let a = self.impls.impls[i].clone();
-				let b = self.impls.impls[j].clone();
+				let a = &self.impls.impls[i];
+				let b = &self.impls.impls[j];
 				if a.interface != b.interface || a.blanket || b.blanket {
 					continue;
 				}
+				// Concrete types with distinct head constructors cannot unify. This is
+				// the same semantic partition used by `ImplRegistry` candidate lookup;
+				// retaining the full overlap check when either head is unavailable keeps
+				// inference-variable/intersection recovery conservative.
+				if let (Some(a_head), Some(b_head)) = (
+					head_of(&self.interner, a.self_ty),
+					head_of(&self.interner, b.self_ty),
+				) && a_head != b_head
+				{
+					continue;
+				}
+				let a = a.clone();
+				let b = b.clone();
 				if self.impls_overlap(&a, &b) {
 					let iface = self.defs.diagnostic_name(a.interface).clone();
 					// Imported implementations deliberately carry no foreign source span.

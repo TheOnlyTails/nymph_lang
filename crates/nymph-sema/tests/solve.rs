@@ -415,6 +415,45 @@ fn duplicate_impl_is_a_coherence_error() {
 }
 
 #[test]
+fn coherence_skips_distinct_heads_without_hiding_same_head_conflicts() {
+	let errors = check(
+		"interface Show { func show(): string }
+		 type Number = int
+		 impl Show for Number { func show(): string = \"number\" }
+		 impl Show for string { func show(): string = \"string\" }
+		 impl Show for int { func show(): string = \"int\" }
+		 impl Show for boolean { func show(): string = \"boolean\" }
+		 impl Show for string { func show(): string = \"other string\" }",
+	);
+	let conflicts = errors
+		.iter()
+		.filter(|error| error.contains("conflicting implementations"))
+		.count();
+	assert_eq!(conflicts, 2, "expected exactly two conflicts: {errors:?}");
+}
+
+#[test]
+fn coherence_checks_an_unknown_head_against_a_concrete_head() {
+	assert_error_contains(
+		"interface Show { func show(): string }
+		 impl Show for _ { func show(): string = \"unknown\" }
+		 impl Show for int { func show(): string = \"int\" }",
+		"conflicting implementations",
+	);
+}
+
+#[test]
+fn coherence_checks_matching_generic_nominal_heads() {
+	assert_error_contains(
+		"interface Show { func show(): string }
+		 struct Box<T>(value: T)
+		 impl<T> Show for Box<T> { func show(): string = \"generic\" }
+		 impl Show for Box<int> { func show(): string = \"int\" }",
+		"conflicting implementations",
+	);
+}
+
+#[test]
 fn argument_directed_overloads_do_not_conflict() {
 	// Same self type (`int`), same interface, but disjoint `Other` bindings — these are
 	// legitimate overloads, not a coherence violation.

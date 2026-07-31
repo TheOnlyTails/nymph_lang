@@ -6,8 +6,10 @@ use std::{
 
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use nymph_compiler::project::{
-	CompilerSession, GraphShape, ModulePath, ProjectId, SemanticQueryEvent, SourceVersion,
+	CompilerSession, GraphFixture, GraphShape, ModulePath, ProjectId, SemanticQueryEvent,
+	SourceVersion,
 };
+use nymph_compiler::{check_project_library, compile_project_library};
 use nymph_sema::{DeclarationKey, DefinitionId, EntryMode};
 
 type Events = Arc<Mutex<Vec<SemanticQueryEvent>>>;
@@ -409,6 +411,22 @@ fn audit_preflight() {
 	);
 }
 
+fn baseline_compatible_clean_compile(fixture: &GraphFixture) -> usize {
+	compile_project_library(fixture.entry(), &|key| fixture.load(key))
+		.unwrap_or_else(|diagnostics| panic!("historical fixture failed: {diagnostics:?}"))
+		.js
+		.len()
+}
+
+fn baseline_compatible_clean_check(fixture: &GraphFixture) -> usize {
+	let diagnostics = check_project_library(fixture.entry(), &|key| fixture.load(key));
+	assert!(
+		diagnostics.is_empty(),
+		"historical fixture failed: {diagnostics:?}"
+	);
+	diagnostics.len()
+}
+
 fn incremental_project(c: &mut Criterion) {
 	audit_preflight();
 	let cases: &[(&str, fn() -> RetainedState, Request)] = &[
@@ -479,6 +497,26 @@ fn incremental_project(c: &mut Criterion) {
 		});
 	}
 	group.finish();
+
+	// Preserve the exact historical Mixed 4×4 fixture and stateless facade
+	// operation boundary solely for clean-build regression comparison. It is
+	// intentionally not an incremental acceptance case.
+	let mut historical = c.benchmark_group("baseline-compatible");
+	historical.bench_function("mixed-4x4/diagnostics", |b| {
+		b.iter_batched(
+			|| GraphShape::Mixed { width: 4, depth: 4 }.generate(),
+			|fixture| black_box(baseline_compatible_clean_check(black_box(&fixture))),
+			BatchSize::SmallInput,
+		);
+	});
+	historical.bench_function("mixed-4x4/full-compile", |b| {
+		b.iter_batched(
+			|| GraphShape::Mixed { width: 4, depth: 4 }.generate(),
+			|fixture| black_box(baseline_compatible_clean_compile(black_box(&fixture))),
+			BatchSize::SmallInput,
+		);
+	});
+	historical.finish();
 }
 
 criterion_group!(benches, incremental_project);

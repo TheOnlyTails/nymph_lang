@@ -85,7 +85,34 @@ The old phase counters and allocator peak deltas above remain informational
 pre-Salsa observations; they are not current acceptance metrics. In particular,
 the current `full-compile/fresh` case is not directly comparable to that
 historical baseline. A clean, exact baseline-compatible full-build comparison
-is still outstanding.
+uses the `baseline-compatible/mixed-4x4/{diagnostics,full-compile}` cases, which
+retain the historical Mixed 4×4 source fixture, stateless facade, setup boundary,
+and Criterion batch mode. Keeping the diagnostics and full-compile operations
+separate attributes semantic work independently from lowering, emission, and
+bundling. Both remain separate from retained-session acceptance labels.
+
+### Same-orb clean-build comparison (2026-07-31)
+
+Commit `abcbd4b` and the current compiler were measured alternately in the same
+Amp Linux orb with the same pinned toolchain, `CARGO_BUILD_JOBS=2`,
+`CARGO_INCREMENTAL=0`, 20 samples, a 5-second warm-up, and a requested 15-second
+measurement window. The historical checkout used its original `fresh-check` and
+`fresh-compile` operations; the current checkout used the baseline-compatible
+cases above. Both received the exact 17-module Mixed 4×4 fixture.
+
+| Operation | Reproduced `abcbd4b` | Before coherence partitioning | Current | Current / baseline |
+|---|---:|---:|---:|---:|
+| Diagnostics | 110.75 ms (110.18–111.27 ms) | 1.0328 s (1.0264–1.0404 s) | 352.19 ms (351.31–353.12 ms) | 3.18× |
+| Full compile | 137.73 ms (137.11–138.45 ms) | 1.0705 s (1.0512–1.0991 s) | 362.90 ms (361.76–364.04 ms) | 2.63× |
+
+Profiling attributed the largest regression to coherence checking: each project
+module received 93 visible implementations and exhaustively trial-unified every
+same-interface pair, even when concrete self-type head constructors differed.
+Partitioning impossible overlaps by the existing `(interface, head)` semantic
+index reduced diagnostics by 65.9% and full compile by 66.1% without changing
+coherence diagnostics. The remaining 3.18× diagnostics and 2.63× full-build
+regressions are still open; these results are observability, not acceptance of
+the remaining difference.
 
 ### Retained-session acceptance results (2026-07-31)
 
