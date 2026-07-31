@@ -1,3 +1,5 @@
+#![cfg(feature = "test-support")]
+
 use nymph_compiler::{AmbientCoreModuleKey, CompilerSession, ModulePath, ProjectId, SourceVersion};
 use nymph_sema::ModuleEnvironment;
 use std::sync::{Arc, Mutex};
