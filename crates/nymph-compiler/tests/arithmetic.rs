@@ -6,7 +6,7 @@ use std::io::Write;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nymph_codegen::compile;
+use nymph_compiler::compile;
 
 fn emit_js(src: &str) -> String {
 	compile(src, "test").unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"))
@@ -87,33 +87,28 @@ fn relational_operators_rebox_as_nbool() {
 }
 
 #[test]
-fn non_primitive_equality_dispatches_to_equals_and_not_equals() {
-	let src = "interface Equals<Other> {
-		func equals(other: Other): boolean
-		func not_equals(other: Other): boolean = !this.equals(other)
-	}
-		struct Point(x: int)
+fn non_primitive_equality_uses_identity() {
+	let src = "struct Point(x: int)
 		impl Equals<Other = Point> for Point { func equals(other: Point): boolean = true }
 		func distinct(): boolean = Point(x = 1) == Point(x = 1)
 		func identical(): boolean = { let p = Point(x = 1) p == p }
 		func different(): boolean = Point(x = 1) != Point(x = 2)";
-	assert_eq!(run(src, "distinct().v"), "true");
+	assert_eq!(run(src, "distinct().v"), "false");
 	assert_eq!(run(src, "identical().v"), "true");
-	assert_eq!(run(src, "different().v"), "false");
+	assert_eq!(run(src, "different().v"), "true");
 }
 
 #[test]
-fn explicit_not_equals_override_wins() {
-	let src = "interface Equals<Other> {
-		func equals(other: Other): boolean
-		func not_equals(other: Other): boolean = !this.equals(other)
-	}
-		struct Point(x: int)
+fn explicit_not_equals_call_uses_the_override() {
+	let src = "struct Point(x: int)
 		impl Equals<Other = Point> for Point {
 			func equals(other: Point): boolean = true
 			func not_equals(other: Point): boolean = true
 		}
-		func different(): boolean = Point(x = 1) != Point(x = 1)";
+		func different(): boolean = {
+			let point = Point(x = 1)
+			point.not_equals(point)
+		}";
 	assert_eq!(run(src, "different().v"), "true");
 }
 
@@ -134,10 +129,9 @@ fn late_resolved_primitive_equality_compares_payloads() {
 }
 
 #[test]
-fn late_resolved_adt_equality_dispatches_to_equals() {
+fn late_resolved_adt_equality_uses_identity() {
 	let js = emit_js(
-		"interface Equals<Other> { func equals(other: Other): boolean }
-		struct Point(x: int)
+		"struct Point(x: int)
 		impl Equals<Other = Point> for Point { func equals(other: Point): boolean = true }
 		func same(): boolean = {
 			let xs = #[]
@@ -147,8 +141,8 @@ fn late_resolved_adt_equality_dispatches_to_equals() {
 		}",
 	);
 	assert!(
-		js.contains("xs.index(") && js.contains(".equals(xs.index("),
-		"late-resolved ADT equality dispatches to Equals: {js}"
+		js.contains("xs.index(") && js.contains(" === xs.index("),
+		"late-resolved ADT equality compares identity: {js}"
 	);
 }
 
@@ -171,6 +165,17 @@ fn compound_assignment_uses_the_target_type_for_reboxing() {
 	let js = emit_js(src);
 	assert!(
 		js.contains("x = new NInt(x.v + new NInt(3).v)"),
+		"compound assignment reboxes its inner operation as the target type: {js}"
+	);
+	assert_eq!(run(src, "f().v"), "5");
+}
+
+#[test]
+fn compound_assignment_preserves_the_checker_selected_uint_type() {
+	let src = "func f(): uint = { let mut x = 2u x += 3u x }";
+	let js = emit_js(src);
+	assert!(
+		js.contains("x = new NUint(x.v + new NUint(3).v)"),
 		"compound assignment reboxes its inner operation as the target type: {js}"
 	);
 	assert_eq!(run(src, "f().v"), "5");
