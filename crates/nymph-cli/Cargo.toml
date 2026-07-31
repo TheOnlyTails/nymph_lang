@@ -14,12 +14,10 @@ path = "src/main.rs"
 
 [dependencies]
 nymph-compiler = { workspace = true }
+nymph-project = { workspace = true }
 nymph-diagnostics = { workspace = true }
 ecow = { workspace = true }
 clap = { workspace = true }
-serde = { workspace = true }
-semver = { workspace = true }
 inquire = "0.9.4"
 owo-colors = "4.3.0"
-toml = { workspace = true }
 anyhow = { workspace = true }

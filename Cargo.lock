@@ -1491,10 +1491,8 @@ dependencies = [
  "inquire",
  "nymph-compiler",
  "nymph-diagnostics",
+ "nymph-project",
  "owo-colors",
- "semver",
- "serde",
- "toml",
 ]
 
 [[package]]
@@ -1570,12 +1568,23 @@ dependencies = [
  "nymph-ast",
  "nymph-compiler",
  "nymph-diagnostics",
+ "nymph-project",
  "nymph-sema",
  "nymph-syntax",
  "percent-encoding",
- "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "nymph-project"
+version = "0.1.0"
+dependencies = [
+ "nymph-compiler",
+ "semver",
+ "serde",
+ "tempfile",
+ "thiserror",
  "toml",
 ]
 

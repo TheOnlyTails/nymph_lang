@@ -384,11 +384,10 @@ fn nymph_files(root: &std::path::Path) -> anyhow::Result<Vec<(PathBuf, ModulePat
 			let path = entry?.path();
 			if path.is_dir() {
 				visit(root, &path, out)?;
-			} else if path.extension().and_then(|ext| ext.to_str()) == Some("nym") {
-				let rel = path.strip_prefix(root).unwrap();
-				if let Ok(module) = ModulePath::from_source_file(rel) {
-					out.push((path, module));
-				}
+			} else if path.extension().and_then(|ext| ext.to_str()) == Some("nym")
+				&& let Ok(module) = nymph_project::module_from_file(root, &path)
+			{
+				out.push((path, module));
 			}
 		}
 		Ok(())

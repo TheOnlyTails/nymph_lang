@@ -1,5 +1,7 @@
 # Language Reference
 
+- [Projects and `nymph.toml`](./projects.md)
+
 This reference acts as a pseudo-specification for the Nymph programming language,
 a document that describes the syntax and expected behavior of the language.
 

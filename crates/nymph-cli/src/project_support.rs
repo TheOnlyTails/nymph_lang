@@ -10,8 +10,6 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config;
-
 /// An open project: its source root directory and a canonical key
 /// identifying which file to treat as the driver's graph root.
 pub(crate) struct Project {
@@ -29,10 +27,10 @@ pub(crate) fn detect(file: &Path) -> Option<Project> {
 	let file_abs = std::path::absolute(file).ok()?;
 	let start_dir = file_abs.parent()?;
 
-	let (config, root) = config::find_from(start_dir).ok()?;
-	let src_root = config.src_root(&root);
-	let rel = file_abs.strip_prefix(&src_root).ok()?;
-	let entry_key = nymph_compiler::ModulePath::from_source_file(rel)
+	let project = nymph_project::discover(start_dir).ok()?;
+	let src_root = project.source_root();
+	let entry_key = project
+		.module_for_file(&file_abs)
 		.ok()?
 		.as_str()
 		.to_string();
@@ -51,8 +49,7 @@ pub(crate) fn detect(file: &Path) -> Option<Project> {
 pub(crate) fn single_file(file: &Path) -> Option<Project> {
 	let file_abs = std::path::absolute(file).ok()?;
 	let src_root = file_abs.parent()?.to_path_buf();
-	let rel = file_abs.strip_prefix(&src_root).ok()?;
-	let entry_key = nymph_compiler::ModulePath::from_source_file(rel)
+	let entry_key = nymph_project::module_from_file(&src_root, &file_abs)
 		.ok()?
 		.as_str()
 		.to_string();
@@ -65,12 +62,7 @@ pub(crate) fn single_file(file: &Path) -> Option<Project> {
 /// Build the FS-backed `load` closure a `src_root`'s project driver call
 /// needs: a canonical key `"a/b"` maps to `<src_root>/a/b.nym`.
 pub(crate) fn fs_loader(src_root: PathBuf) -> impl Fn(&str) -> Option<String> {
-	move |key: &str| {
-		let path = nymph_compiler::ModulePath::new(key)
-			.ok()?
-			.source_file(&src_root);
-		std::fs::read_to_string(path).ok()
-	}
+	nymph_project::fs_loader(src_root)
 }
 
 /// Render a batch of project diagnostics, each against its own module's

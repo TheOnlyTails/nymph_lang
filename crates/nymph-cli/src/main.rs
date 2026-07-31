@@ -11,7 +11,6 @@ use crate::commands::{
 
 mod commands;
 mod compile_guard;
-pub mod config;
 mod project_support;
 
 pub(crate) trait NymphCommand {

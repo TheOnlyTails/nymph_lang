@@ -10,6 +10,7 @@ members = [
 	"crates/nymph-codegen",
 	# Added layer by layer as each crate is built:
 	"crates/nymph-compiler",
+	"crates/nymph-project",
 	"crates/nymph-cli",
 	"crates/nymph-lsp",
 	"crates/nymph-wasm",
@@ -33,6 +34,7 @@ nymph-hir = { path = "crates/nymph-hir" }
 nymph-sema = { path = "crates/nymph-sema" }
 nymph-codegen = { path = "crates/nymph-codegen" }
 nymph-compiler = { path = "crates/nymph-compiler" }
+nymph-project = { path = "crates/nymph-project" }
 
 # Shared external dependencies (proven set carried over from the previous implementation)
 anyhow = "1.0.104"

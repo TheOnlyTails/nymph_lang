@@ -1,3 +1,4 @@
+[package]
 name = "shapes"
 version = "0.1.0"
 description = "Enums, interfaces, generics, and exhaustive matching."

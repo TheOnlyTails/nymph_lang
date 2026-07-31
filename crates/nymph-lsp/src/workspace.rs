@@ -1,6 +1,4 @@
-//! `nymph.toml` project detection, mirroring the CLI's own project support
-//! (`nymph-cli/src/{config,project_support}.rs` — replicated here rather
-//! than reused, since neither module is public from that binary crate).
+//! LSP adaptation around the shared `nymph-project` filesystem policy.
 //!
 //! A project is a `nymph.toml` file plus a source root (`<root>/<src>`,
 //! `src` defaulting to `"src"`); a canonical module *key* is that root-
@@ -12,22 +10,6 @@ use std::path::{Path, PathBuf};
 
 use lsp_types::Uri;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
-use serde::Deserialize;
-
-#[derive(Debug, Clone, Deserialize)]
-struct NymphToml {
-	package: Package,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct Package {
-	#[serde(default = "default_src")]
-	src: String,
-}
-
-fn default_src() -> String {
-	"src".to_string()
-}
 
 /// An open project: its source root directory and the canonical module key
 /// of the file that triggered detection (the driver's graph root — see
@@ -37,22 +19,6 @@ fn default_src() -> String {
 pub struct Project {
 	pub src_root: PathBuf,
 	pub entry_key: String,
-}
-
-/// Climb from `start` looking for the nearest `nymph.toml`, parsing it if
-/// found. Returns the config and the directory containing it (the project
-/// root).
-fn find_nymph_toml(start: &Path) -> Option<(NymphToml, PathBuf)> {
-	let mut dir = start.to_path_buf();
-	loop {
-		let candidate = dir.join("nymph.toml");
-		if candidate.is_file() {
-			let contents = std::fs::read_to_string(&candidate).ok()?;
-			let config: NymphToml = toml::from_str(&contents).ok()?;
-			return Some((config, dir));
-		}
-		dir = dir.parent()?.to_path_buf();
-	}
 }
 
 /// Climb from `file`'s directory looking for the nearest `nymph.toml`; if
@@ -66,10 +32,10 @@ pub fn detect(file: &Path) -> Option<Project> {
 	let file_abs = std::path::absolute(file).ok()?;
 	let start_dir = file_abs.parent()?;
 
-	let (config, root) = find_nymph_toml(start_dir)?;
-	let src_root = root.join(&config.package.src);
-	let rel = file_abs.strip_prefix(&src_root).ok()?;
-	let entry_key = nymph_compiler::ModulePath::from_source_file(rel)
+	let project = nymph_project::discover(start_dir).ok()?;
+	let src_root = project.source_root();
+	let entry_key = project
+		.module_for_file(&file_abs)
 		.ok()?
 		.as_str()
 		.to_string();
@@ -83,12 +49,7 @@ pub fn detect(file: &Path) -> Option<Project> {
 /// Build the FS-backed `load` closure a `src_root`'s project driver call
 /// needs: a canonical key `"a/b"` maps to `<src_root>/a/b.nym`.
 pub fn fs_loader(src_root: PathBuf) -> impl Fn(&str) -> Option<String> {
-	move |key: &str| {
-		let path = nymph_compiler::ModulePath::new(key)
-			.ok()?
-			.source_file(&src_root);
-		std::fs::read_to_string(path).ok()
-	}
+	nymph_project::fs_loader(src_root)
 }
 
 /// The inverse of [`module_key_from_relative_path`]: the file `Uri` a
@@ -97,11 +58,10 @@ pub fn fs_loader(src_root: PathBuf) -> impl Fn(&str) -> Option<String> {
 /// published against.
 #[must_use]
 pub fn key_to_uri(src_root: &Path, key: &str) -> Option<Uri> {
-	path_to_uri(
-		&nymph_compiler::ModulePath::new(key)
-			.ok()?
-			.source_file(src_root),
-	)
+	path_to_uri(&nymph_project::file_for_module(
+		src_root,
+		&nymph_compiler::ModulePath::new(key).ok()?,
+	))
 }
 
 /// Characters that must be percent-encoded in a `file://` URI's path
