@@ -1518,6 +1518,12 @@ fn required_type_nodes(
 	let mut required = std::collections::HashSet::new();
 	for expression in nodes {
 		match &expression.kind {
+			// An unsuffixed integer literal can be contextually retyped to `uint`
+			// or `float`. Stable lowering must use the checker's decision rather
+			// than the token's syntactic kind when selecting its runtime box.
+			ExprKind::Int(_) => {
+				required.insert(expression.id);
+			}
 			ExprKind::MemberAccess { .. }
 				if checked
 					.annotations

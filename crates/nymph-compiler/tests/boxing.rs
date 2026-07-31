@@ -15,7 +15,7 @@ use std::io::Write;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nymph_codegen::compile;
+use nymph_compiler::compile;
 
 /// Compile a Nymph source module to its JS, panicking on any diagnostic.
 fn emit_js(src: &str) -> String {
@@ -59,7 +59,7 @@ fn boxes_an_int_literal_as_new_nint_with_the_classes_inlined() {
 	);
 	// The wrapper-class definitions travel inline in the single-module facade.
 	assert!(
-		js.contains("class NInt extends NBox"),
+		js.contains("NInt = class extends NBox"),
 		"box classes inlined so the module is self-contained: {js}"
 	);
 }

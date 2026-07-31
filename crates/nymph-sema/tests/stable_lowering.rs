@@ -195,6 +195,35 @@ fn stable_lowering_is_identical_across_body_formatting() {
 }
 
 #[test]
+fn stable_lowering_preserves_contextual_integer_literal_kinds() {
+	for (source, expected) in [
+		("func value(): uint = 5", nymph_hir::hir::NumKind::UInt),
+		("func value(): float = 5", nymph_hir::hir::NumKind::Float),
+	] {
+		let lowered = lower_named(source, "value");
+		assert!(matches!(
+			lowered.fragment(),
+			nymph_sema::LoweredHirFragment::TopLevelFunction(nymph_hir::hir::HirFunc {
+				body: nymph_hir::hir::HirExpr::Num(5.0, kind),
+				..
+			}) if *kind == expected
+		));
+	}
+
+	let lowered = lower_named(
+		"func identity(value: float): float = value\nfunc caller(): float = identity(5)",
+		"caller",
+	);
+	assert!(matches!(
+		lowered.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(nymph_hir::hir::HirFunc {
+			body: nymph_hir::hir::HirExpr::Call { args, .. },
+			..
+		}) if matches!(args.as_slice(), [nymph_hir::hir::HirExpr::Num(5.0, nymph_hir::hir::NumKind::Float)])
+	));
+}
+
+#[test]
 fn implementation_header_generic_body_receiver_has_canonical_type_annotation() {
 	let source = "impl<T> #[T] { func first(): T = { let result = this\nresult[0] } }";
 	let (artifacts, interface) = artifacts_and_interface(source);

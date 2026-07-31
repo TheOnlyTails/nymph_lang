@@ -1764,6 +1764,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			_ => Err(self.unsupported(expr, "built-in operator result type")),
 		}
 	}
+	fn int_literal_kind(&self, expr: &StableExpr) -> Result<NumKind, StableLoweringError> {
+		match peel_mut(&self.ty(expr)?) {
+			InterfaceType::Int => Ok(NumKind::Int),
+			InterfaceType::UInt => Ok(NumKind::UInt),
+			InterfaceType::Float => Ok(NumKind::Float),
+			_ => Err(self.unsupported(expr, "integer literal type")),
+		}
+	}
 	fn dispatch(&self, expr: &StableExpr) -> Result<&crate::StableDispatch, StableLoweringError> {
 		let node = self.id(expr);
 		self
@@ -1815,7 +1823,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 	}
 	fn lower_inner(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
 		Ok(match &expr.kind {
-			StableExprKind::Int(value) => HirExpr::Num(*value as f64, NumKind::Int),
+			StableExprKind::Int(value) => HirExpr::Num(*value as f64, self.int_literal_kind(expr)?),
 			StableExprKind::UInt(value) => HirExpr::Num(*value as f64, NumKind::UInt),
 			StableExprKind::Float(value) => HirExpr::Num(value.into_inner(), NumKind::Float),
 			StableExprKind::Boolean(value) => HirExpr::Bool(*value),
