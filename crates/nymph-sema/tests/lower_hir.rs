@@ -2895,46 +2895,45 @@ fn closure_captures_a_shadow_renamed_outer_binding() {
 }
 
 #[test]
-#[should_panic(expected = "return` inside a closure body is not supported")]
-fn return_inside_closure_block_body_panics_in_lowering() {
-	// P13's unsound-acceptance shape: the closure infers `(boolean) -> boolean`
-	// (its tail is `true`) yet its body does `if (b) { return 1 }` — the
-	// checker types that `return`'s value against the ENCLOSING function's
-	// `int` return type, not the closure's own inferred `boolean` signature
-	// (neither `infer_closure` nor `check_closure` ever touch `self.ret_ty`).
-	// An arrow-emitted `return 1` would silently make `g` return an `int`
-	// where the call site expects a `boolean` — lowering panics loudly instead
-	// (Slice 4L, JJ2) rather than ever emit that unsound arrow.
-	lower(
+fn return_inside_closure_block_body_lowers_to_the_closure() {
+	let hir = lower(
 		r#"
 		func f(): int = {
-			let g = (b: boolean) -> { if (b) { return 1 }  true }
+			let g: (boolean) -> int = (b: boolean) -> { if (b) { return 1 }  2 }
 			g(true)
-			1
 		}
 		"#,
 	);
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected function block");
+	};
+	let HirStmt::Let {
+		value: HirExpr::Closure { body, .. },
+		..
+	} = &stmts[0]
+	else {
+		panic!("expected closure binding");
+	};
+	let HirExpr::Block { stmts, .. } = body.as_ref() else {
+		panic!("expected closure block");
+	};
+	assert!(matches!(
+		stmts.as_slice(),
+		[HirStmt::Expr(HirExpr::If { .. })]
+	));
 }
 
 #[test]
-#[should_panic(expected = "return` inside a closure body is not supported")]
-fn return_inside_a_nested_subexpression_match_within_a_closure_body_panics_in_lowering() {
-	// The `closure_depth` guard must catch a `return` ANYWHERE lexically
-	// inside the closure body, not just ones directly at the body's own
-	// statement level — including one nested inside a subexpression-position
-	// construct (here, a `match` used as a `let` initializer) within the
-	// closure.
+#[should_panic(expected = "return` inside an anonymous closure body is not supported")]
+fn return_inside_anonymous_closure_body_retains_the_lowering_guard() {
 	lower(
 		r#"
 		func f(): int = {
-			let g = (n: int) -> {
-				let y = match (n) {
-					0 -> { return 1 },
-					_ -> n,
-				}
-				y
+			let g: (int) -> boolean = {
+				if ($0 > 0) { return 1 }
+				true
 			}
-			g(2)
+			if (g(1)) 1 else 0
 		}
 		"#,
 	);

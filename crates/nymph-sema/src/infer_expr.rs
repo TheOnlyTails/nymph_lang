@@ -1745,13 +1745,19 @@ impl<'m> Checker<'m> {
 		let ret = match return_type {
 			Some(annot) => {
 				let rt = self.lower_type(annot);
+				let outer_ret = self.ret_ty.replace(rt);
 				self.resolve_anon(body, Some(rt));
 				self.check(body, rt);
+				self.ret_ty = outer_ret;
 				rt
 			}
 			None => {
-				self.resolve_anon(body, None);
-				self.infer(body)
+				let rt = self.fresh();
+				let outer_ret = self.ret_ty.replace(rt);
+				self.resolve_anon(body, Some(rt));
+				self.check(body, rt);
+				self.ret_ty = outer_ret;
+				rt
 			}
 		};
 		self.pop_scope();
@@ -1796,18 +1802,26 @@ impl<'m> Checker<'m> {
 		let ret = match (return_type, exp_ret) {
 			(Some(annot), _) => {
 				let rt = self.lower_type(annot);
+				let outer_ret = self.ret_ty.replace(rt);
 				self.resolve_anon(body, Some(rt));
 				self.check(body, rt);
+				self.ret_ty = outer_ret;
 				rt
 			}
 			(None, Some(rt)) => {
+				let outer_ret = self.ret_ty.replace(rt);
 				self.resolve_anon(body, Some(rt));
 				self.check(body, rt);
+				self.ret_ty = outer_ret;
 				rt
 			}
 			(None, None) => {
-				self.resolve_anon(body, None);
-				self.infer(body)
+				let rt = self.fresh();
+				let outer_ret = self.ret_ty.replace(rt);
+				self.resolve_anon(body, Some(rt));
+				self.check(body, rt);
+				self.ret_ty = outer_ret;
+				rt
 			}
 		};
 		self.pop_scope();

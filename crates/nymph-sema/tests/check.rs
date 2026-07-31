@@ -236,6 +236,21 @@ fn return_type_mismatch_is_reported() {
 }
 
 #[test]
+fn closure_return_is_checked_against_the_closure_not_the_outer_function() {
+	assert_error_contains(
+		"func f(): int = { let g: (boolean) -> boolean = (b: boolean) -> { if (b) { return 1 } true } 1 }",
+		"mismatched types",
+	);
+}
+
+#[test]
+fn nested_closure_return_contexts_restore_to_the_nearest_callable() {
+	assert_ok(
+		"func f(): int = { let outer: (boolean) -> string = (b: boolean) -> { let inner: () -> boolean = () -> { return true } if (b) { return \"outer\" } \"tail\" } return 7 }",
+	);
+}
+
+#[test]
 fn wrong_argument_type_is_reported() {
 	assert_error_contains(
 		"func takes_int(x: int): int = x

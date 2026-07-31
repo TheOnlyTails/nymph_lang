@@ -110,6 +110,13 @@ fn run(src: &str, call: &str) -> String {
 	run_js(compile(src), call)
 }
 
+#[test]
+fn inferred_explicit_closure_return_exits_the_closure_not_its_creator() {
+	let src = "func choose(flag: boolean): int = {\n\tlet pick = (flag: boolean) -> { if (flag) { return 7 } 9 }\n\tlet value = pick(flag)\n\treturn value + 1\n}";
+	assert_eq!(run(src, "choose(new NBool(true))"), "8");
+	assert_eq!(run(src, "choose(new NBool(false))"), "10");
+}
+
 fn run_failure(src: &str, call: &str) -> String {
 	let mut js = compile(src);
 	js.push_str(&format!("\n{call};\n"));

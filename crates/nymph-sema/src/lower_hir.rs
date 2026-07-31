@@ -351,18 +351,9 @@ struct Lowerer<'a> {
 	/// merged with `scopes`, which is JS-scope/shadowing bookkeeping, not
 	/// type-parameter bookkeeping).
 	generics_stack: RefCell<Vec<FxHashSet<EcoString>>>,
-	/// Depth of closure-body nesting currently being lowered (Slice 4L, JJ2).
-	/// Zero everywhere except while lowering a `HirExpr::Closure`'s `body`. The
-	/// checker types a closure body's `return` against the ENCLOSING
-	/// function's `ret_ty`, not the closure's own inferred signature (it never
-	/// touches `self.ret_ty` in `infer_closure`/`check_closure`), and probing
-	/// confirms this accepts type-unsound programs an arrow-emitted `return`
-	/// would silently miscompile (e.g. a closure inferred `(bool) -> bool`
-	/// whose body does `if (b) { return 1 } true` typechecks with zero
-	/// diagnostics against an enclosing `int`-returning function). Rather than
-	/// give closures their own `return` target (which the checker's types
-	/// don't actually support), every `return` sink checks this counter and
-	/// panics loudly instead of ever emitting an arrow-scoped `return`.
+	/// Depth of anonymous `$N` closure-body nesting currently being lowered.
+	/// Anonymous closures do not yet establish the explicit-closure return
+	/// context implemented for issue #22, so their existing guard remains.
 	closure_depth: std::cell::Cell<u32>,
 	/// Stack of receiver-param names currently substituting for `this` while
 	/// lowering a prelude body as a top-level mangled function (stdlib body
@@ -3225,12 +3216,10 @@ impl<'a> Lowerer<'a> {
 	/// namespaced-call guard and silently emit unbound JS instead of the loud
 	/// panic it exists to give.
 	///
-	/// `closure_depth` is bumped around the body lowering so every `return` sink
-	/// (`lower_block`'s statement interception, `lower_branch`'s unbraced wrap,
-	/// and `lower_expr`'s own subexpression-position `Return` arm, which already
-	/// panics unconditionally) panics rather than silently emitting a `return`
-	/// the checker never actually typed against this closure (see the
-	/// `closure_depth` field doc for why).
+	/// A statement-position `return` lowers into the arrow's own body. The checker
+	/// establishes a closure-local return context, so it cannot target the
+	/// enclosing function. Arbitrary expression-position returns remain outside
+	/// this lowering boundary.
 	fn lower_closure(
 		&self,
 		params: &[Spanned<nymph_ast::expr::ClosureParam>],
@@ -3247,9 +3236,12 @@ impl<'a> Lowerer<'a> {
 			.iter()
 			.map(|p| self.declare(&param_name(&p.0.name)))
 			.collect();
-		self.closure_depth.set(self.closure_depth.get() + 1);
+		// An explicit closure establishes a supported callable boundary even when
+		// it is nested inside an anonymous `$N` closure. Suspend the anonymous
+		// guard while lowering this body, then restore it for the outer boundary.
+		let outer_closure_depth = self.closure_depth.replace(0);
 		let body = self.lower_func_body(body);
-		self.closure_depth.set(self.closure_depth.get() - 1);
+		self.closure_depth.set(outer_closure_depth);
 		self.pop_scope();
 		HirExpr::Closure {
 			params,
@@ -4440,12 +4432,9 @@ impl<'a> Lowerer<'a> {
 				label.is_none(),
 				"slice-4e lowering does not yet support labeled `return`"
 			);
-			// Slice 4L, JJ2: same closure-body guard as `lower_block`'s statement
-			// interception above — an unbraced branch (`if (cond) return n`) hits
-			// this arm instead, so it needs the identical check.
 			assert!(
 				self.closure_depth.get() == 0,
-				"slice-4l lowering: `return` inside a closure body is not supported"
+				"slice-4l lowering: `return` inside an anonymous closure body is not supported"
 			);
 			let value = value.as_ref().map(|v| self.lower_expr(v));
 			HirExpr::Block {
@@ -5354,12 +5343,9 @@ impl<'a> Lowerer<'a> {
 						label.is_none(),
 						"slice-4e lowering does not yet support labeled `return`"
 					);
-					// Slice 4L, JJ2: a `return` lexically inside a closure body is
-					// rejected here rather than lowered — see the `closure_depth`
-					// field doc for why an arrow-emitted `return` would be unsound.
 					assert!(
 						self.closure_depth.get() == 0,
-						"slice-4l lowering: `return` inside a closure body is not supported"
+						"slice-4l lowering: `return` inside an anonymous closure body is not supported"
 					);
 					let value = value.as_ref().map(|v| self.lower_expr(v));
 					stmts.push(HirStmt::Return(value));

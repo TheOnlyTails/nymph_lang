@@ -199,11 +199,10 @@ func demo(): int = {
 }
 ```
 
-> [!NOTE] `return` inside a closure body
-> A closure body is compiled to a JS arrow function, but the type checker types a `return` against
-> the *enclosing function*, not the closure — so a `return` reachable from inside a closure body
-> would be silently wrong once lowered. Don't put `return` inside a closure; just end the body in
-> the value you want.
+`return` exits the nearest enclosing callable. Inside an explicit closure it therefore exits that
+closure, and its value must match the closure's return type; it does not return from the function
+that created the closure. As elsewhere, `return` is currently supported in statement positions
+(including statement-position control-flow branches), not arbitrary value-expression positions.
 
 ## Anonymous closure parameters
 
