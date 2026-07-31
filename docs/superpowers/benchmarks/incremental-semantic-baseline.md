@@ -86,3 +86,23 @@ pre-Salsa observations; they are not current acceptance metrics. In particular,
 the current `full-compile/fresh` case is not directly comparable to that
 historical baseline. A clean, exact baseline-compatible full-build comparison
 is still outstanding.
+
+### Retained-session acceptance results (2026-07-31)
+
+Captured in one process in the Amp Linux orb with 50 samples, a 5-second
+warm-up, and a requested 15-second measurement window. Criterion extended each
+case to collect all 50 heavyweight per-iteration states. Point-estimate ratios
+use the middle estimate from each confidence interval.
+
+| Acceptance pair | Fresh estimate | Retained estimate | Fresh / retained | Required |
+|---|---:|---:|---:|---:|
+| Diagnostics | 1.0208 s (1.0117–1.0319 s) | 7.4488 µs (6.8055–8.6100 µs) | 137,047× | ≥10× |
+| Analysis + `type_at` | 1.0066 s (1.0015–1.0124 s) | 1.0740 ms (1.0605–1.0873 ms) | 937× | ≥10× |
+| Private body edit | 1.0276 s (1.0252–1.0300 s) | 48.355 ms (47.997–48.717 ms) | 21.3× | ≥3× |
+
+The strict untimed audit passed in the same executable: unchanged diagnostics
+and analysis executed no queries; the private edit reanalyzed only its source
+module and reran `runtime_definition` plus `lower_runtime_definition` exactly
+once for the unchanged `private_work` `DefinitionId`; and the public signature
+edit rechecked exactly `api`, `direct`, `transitive`, and `main`, excluding both
+installed unrelated modules.
