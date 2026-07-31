@@ -713,10 +713,28 @@ impl<'m> Checker<'m> {
 				self.interner.mk_map(key, value)
 			}
 			ExprKind::Range(kind) => {
-				self.infer_range_element(kind);
-				// A range value's own type (an iterable) is Milestone B; for now it
-				// is an opaque hole, while `for` extracts the element directly.
-				self.fresh()
+				let elem = self.infer_range_element(kind);
+				let name = match kind {
+					RangeKind::Exclusive { .. } => "Range",
+					RangeKind::From(_) => "RangeFrom",
+					RangeKind::To(_) => "RangeTo",
+					RangeKind::Inclusive { .. } => "RangeInclusive",
+					RangeKind::ToInclusive(_) => "RangeToInclusive",
+				};
+				let Some(def) = self.defs.get(name) else {
+					return self.interner.error();
+				};
+				self
+					.annotations
+					.record_definition_target(expr.id, self.defs.stable(def));
+				let inst = self.instantiate_struct(def);
+				if let TyKind::Adt(_, args) = self.interner.kind(inst.ty).clone()
+					&& let Some(parameter) = args.positional.first()
+				{
+					self.unify(*parameter, elem, span);
+				}
+				self.defer_obligations(span, inst.obligations.iter().cloned());
+				inst.ty
 			}
 			ExprKind::Call { func, args, .. } => self.infer_call(func, args, span, expr.id).0,
 			ExprKind::MemberAccess { parent, member, .. } => {

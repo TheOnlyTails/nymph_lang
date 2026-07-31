@@ -8,7 +8,10 @@ or any type implementing one of the two iteration interfaces, [Iterator](#iterat
 ## Ranges
 
 Iterating a [range](./literals#Ranges) is the fastest path: the compiler lowers it directly to a
-counting loop, with no allocation and no interface dispatch.
+counting loop, with no range-value allocation and no interface dispatch. This specialization only
+applies when the range expression is the direct `for` source. Storing or passing the expression
+first constructs its canonical standard-library range value; iteration of escaped range values is
+reserved for the future `Step`/range-iteration work.
 
 ```nym
 func sum(): int = {
@@ -20,12 +23,9 @@ func sum(): int = {
 }
 ```
 
-Only a range with both a lower and an upper bound (`1..10` or `1..=4`) can be used as a `for`
-source today. `1..` (unbounded above) and `..10` / `..=10` (no lower bound) type-check as
-iterable — the checker doesn't yet reject them — but the compiler currently cannot lower any of
-those three shapes to a loop; using one as a `for` source is a compiler bug (a crash), not a
-supported "iterate forever" or a diagnosed rejection. Stick to a fully-bounded range until that's
-fixed — see [Ranges](./literals#Ranges).
+Only a range with both a lower and an upper bound (`1..10` or `1..=4`) has this direct-loop
+behavior today. The other three forms are ordinary values, not supported "iterate forever"
+sources. General range-value iteration belongs to the future `Step` work.
 
 ## Lists
 

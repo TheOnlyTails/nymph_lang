@@ -2512,7 +2512,29 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				body,
 				label: None,
 			} => self.lower_for(variable, iterable, body)?,
-			StableExprKind::Range(_) => return Err(self.unsupported(expr, "range/protocol")),
+			StableExprKind::Range(range) => {
+				let definition = self.target(expr).ok_or_else(|| {
+					invalid(
+						&self.artifact.definition,
+						"range has no canonical nominal target",
+					)
+				})?;
+				self.demand_external(definition)?;
+				let fields = match range {
+					StableRange::From(start) => vec![("start".into(), self.lower(start)?)],
+					StableRange::To(end) | StableRange::ToInclusive(end) => {
+						vec![("end".into(), self.lower(end)?)]
+					}
+					StableRange::Exclusive { min, max } | StableRange::Inclusive { min, max } => vec![
+						("start".into(), self.lower(min)?),
+						("end".into(), self.lower(max)?),
+					],
+				};
+				HirExpr::New {
+					class: self.context.binding_name(definition)?.as_str().into(),
+					fields,
+				}
+			}
 			StableExprKind::Match { value, arms } => HirExpr::Match {
 				scrutinee: Box::new(self.lower(value)?),
 				arms: arms
@@ -3673,6 +3695,91 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		iterable: &StableExpr,
 		body: &StableExpr,
 	) -> Result<HirExpr, StableLoweringError> {
+		if let StableExprKind::Range(
+			StableRange::Exclusive { min, max } | StableRange::Inclusive { min, max },
+		) = &iterable.kind
+		{
+			let inclusive = matches!(
+				iterable.kind,
+				StableExprKind::Range(StableRange::Inclusive { .. })
+			);
+			let min_type = self
+				.annotations
+				.types
+				.iter()
+				.find(|(id, _)| *id == self.id(min))
+				.map(|(_, ty)| ty);
+			let number = if matches!(min.kind, StableExprKind::UInt(_))
+				|| matches!(min_type, Some(InterfaceType::UInt))
+			{
+				BuiltinResult::UInt
+			} else {
+				BuiltinResult::Int
+			};
+			self.scopes.borrow_mut().push(HashMap::new());
+			let current = self.declare(&"$range_current".into());
+			let end = self.declare(&"$range_end".into());
+			let pat = self.lower_pattern(variable)?;
+			let body = self.lower(body)?;
+			self.scopes.borrow_mut().pop();
+			let current_expr = || HirExpr::Local(current.clone());
+			let end_expr = || HirExpr::Local(end.clone());
+			return Ok(HirExpr::Block {
+				stmts: vec![
+					HirStmt::Let {
+						name: current.clone(),
+						mutable: true,
+						value: self.lower(min)?,
+					},
+					HirStmt::Let {
+						name: end.clone(),
+						mutable: false,
+						value: self.lower(max)?,
+					},
+					HirStmt::Expr(HirExpr::While {
+						cond: Box::new(HirExpr::Binary {
+							op: if inclusive { BinOp::Le } else { BinOp::Lt },
+							result: BuiltinResult::Boolean,
+							lhs: Box::new(current_expr()),
+							rhs: Box::new(end_expr()),
+						}),
+						body: Box::new(HirExpr::Block {
+							stmts: vec![
+								HirStmt::Expr(HirExpr::Match {
+									scrutinee: Box::new(current_expr()),
+									arms: vec![HirArm {
+										pat,
+										guard: None,
+										body,
+									}],
+								}),
+								HirStmt::Expr(HirExpr::Assign {
+									target: Box::new(current_expr()),
+									value: Box::new(HirExpr::Binary {
+										op: BinOp::Add,
+										result: number,
+										lhs: Box::new(current_expr()),
+										rhs: Box::new(HirExpr::Num(
+											1.0,
+											if number == BuiltinResult::UInt {
+												NumKind::UInt
+											} else {
+												NumKind::Int
+											},
+										)),
+									}),
+								}),
+							],
+							tail: None,
+						}),
+					}),
+				],
+				tail: None,
+			});
+		}
+		if matches!(iterable.kind, StableExprKind::Range(_)) {
+			return Err(self.unsupported(iterable, "range/protocol"));
+		}
 		let native_range = matches!(
 			iterable.kind,
 			StableExprKind::Range(StableRange::Exclusive { .. } | StableRange::Inclusive { .. })

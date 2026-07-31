@@ -792,7 +792,8 @@ fn stable_native_range_runtime_is_exact_collision_safe_and_runs_after_dependency
 		.expect("stable Range and operator modules emit");
 	let source = &emitted.module_sources["main"];
 	assert_eq!(source.matches("from \"std/box\"").count(), 1);
-	assert_eq!(source.matches("new NymphRange").count(), 4);
+	assert_eq!(source.matches("new NymphRange").count(), 0);
+	assert_eq!(source.matches("while (").count(), 4);
 	assert!(!source.contains("@nymph/runtime/option"));
 	assert!(!source.contains("@nymph/runtime/iter"));
 	assert!(!source.contains("@nymph/runtime/collections/list"));
@@ -818,7 +819,7 @@ fn stable_native_range_runtime_is_exact_collision_safe_and_runs_after_dependency
 		.expect("stable emission links only the Range, iterator, Option, and operator closure");
 	assert_eq!(
 		compiled.js.matches("NymphRange").count(),
-		5,
+		1,
 		"{}",
 		compiled.js
 	);
