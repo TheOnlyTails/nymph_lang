@@ -1503,10 +1503,7 @@ version = "0.1.0"
 dependencies = [
  "ecow",
  "nymph-ast",
- "nymph-diagnostics",
  "nymph-hir",
- "nymph-sema",
- "nymph-syntax",
  "oxc",
 ]
 
