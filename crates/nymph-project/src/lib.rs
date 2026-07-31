@@ -201,7 +201,13 @@ pub fn discover(start: &Path) -> Result<Project, DiscoverError> {
 	let mut dir = start.to_path_buf();
 	loop {
 		let path = dir.join(MANIFEST_FILE);
-		if path.is_file() {
+		let found = path.try_exists().map_err(|source| {
+			DiscoverError::Manifest(ManifestError::Read {
+				path: path.clone(),
+				source,
+			})
+		})?;
+		if found {
 			return Ok(Project {
 				manifest: Manifest::read(&path)?,
 				manifest_path: path,
@@ -311,6 +317,58 @@ mod tests {
 			project.module_for_file(&temp.path().join("other.nym")),
 			Err(PathError::OutsideSourceRoot { .. })
 		));
+	}
+
+	#[test]
+	fn discovery_distinguishes_absent_and_found_valid_manifests() {
+		let temp = tempfile::tempdir().unwrap();
+		let nested = temp.path().join("src/nested");
+		std::fs::create_dir_all(&nested).unwrap();
+		assert!(matches!(
+			discover(&nested),
+			Err(DiscoverError::NotFound { .. })
+		));
+
+		let manifest_path = temp.path().join(MANIFEST_FILE);
+		std::fs::write(&manifest_path, "[package]\nname='x'\nversion='1.0.0'").unwrap();
+		assert_eq!(discover(&nested).unwrap().manifest_path(), manifest_path);
+	}
+
+	#[test]
+	fn discovery_reports_found_unreadable_content_with_its_path() {
+		let temp = tempfile::tempdir().unwrap();
+		let manifest_path = temp.path().join(MANIFEST_FILE);
+		std::fs::create_dir(&manifest_path).unwrap();
+		let error = discover(temp.path()).unwrap_err();
+		assert!(matches!(
+			&error,
+			DiscoverError::Manifest(ManifestError::Read { path, .. }) if path == &manifest_path
+		));
+		assert!(
+			error
+				.to_string()
+				.contains(&manifest_path.display().to_string())
+		);
+	}
+
+	#[test]
+	fn discovery_reports_invalid_utf8_toml_and_schema_with_their_path() {
+		let temp = tempfile::tempdir().unwrap();
+		let manifest_path = temp.path().join(MANIFEST_FILE);
+		for (contents, expected) in [
+			(vec![0xff], "read"),
+			(b"not = [toml".to_vec(), "TOML"),
+			(b"name='x'".to_vec(), "schema"),
+		] {
+			std::fs::write(&manifest_path, contents).unwrap();
+			let error = discover(temp.path()).unwrap_err();
+			assert!(error.to_string().contains(expected), "{error}");
+			assert!(
+				error
+					.to_string()
+					.contains(&manifest_path.display().to_string())
+			);
+		}
 	}
 
 	#[test]

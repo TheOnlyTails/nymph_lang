@@ -43,6 +43,15 @@ fn write_main_source(source: &str) -> std::path::PathBuf {
 	path
 }
 
+fn write_manifest_fixture(manifest: &[u8], source: &str) -> std::path::PathBuf {
+	let dir = unique_temp_path("nymph_cli_manifest", "dir");
+	std::fs::create_dir_all(dir.join("src")).unwrap();
+	std::fs::write(dir.join("nymph.toml"), manifest).unwrap();
+	let source_path = dir.join("src/main.nym");
+	std::fs::write(&source_path, source).unwrap();
+	source_path
+}
+
 struct Output {
 	status: std::process::ExitStatus,
 	stdout: String,
@@ -79,6 +88,33 @@ fn check_reports_ok_for_a_well_typed_program() {
 		out.stderr
 	);
 	assert!(out.stdout.contains("ok"), "stdout was: {}", out.stdout);
+}
+
+#[test]
+fn run_build_and_check_reject_a_found_invalid_manifest_without_loose_retry() {
+	let source = write_manifest_fixture(b"not = [toml", "func main(): void = {}\n");
+	let manifest = source
+		.parent()
+		.unwrap()
+		.parent()
+		.unwrap()
+		.join("nymph.toml");
+	for command in ["run", "build", "check"] {
+		let out = nymph(&[command, source.to_str().unwrap()]);
+		assert_eq!(out.status.code(), Some(1), "{command}: {}", out.stderr);
+		assert!(
+			out.stderr.contains("malformed TOML"),
+			"{command}: {}",
+			out.stderr
+		);
+		assert!(
+			out.stderr.contains(&manifest.display().to_string()),
+			"{command}: {}",
+			out.stderr
+		);
+	}
+	assert!(!source.with_extension("mjs").exists());
+	std::fs::remove_dir_all(source.parent().unwrap().parent().unwrap()).unwrap();
 }
 
 #[test]

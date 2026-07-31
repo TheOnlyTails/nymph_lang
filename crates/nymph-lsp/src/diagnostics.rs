@@ -37,10 +37,17 @@ pub fn check_and_publish_state(
 	// Copy the document table first, then release its mutex before entering the
 	// compiler. Publication below holds neither mutex.
 	let docs_snapshot = docs.lock().unwrap().clone();
-	let snapshot = compiler
-		.lock()
-		.unwrap()
-		.diagnostics_snapshot(&docs_snapshot, uri);
+	let mut compiler = compiler.lock().unwrap();
+	if let Some(message) = compiler.manifest_error_for_uri(uri).map(str::to_owned) {
+		drop(compiler);
+		let Some(document) = docs_snapshot.get(uri) else {
+			return Ok(());
+		};
+		publish_manifest_error(connection, uri, &message, document.version)?;
+		return Ok(());
+	}
+	let snapshot = compiler.diagnostics_snapshot(&docs_snapshot, uri);
+	drop(compiler);
 	let Some(snapshot) = snapshot else {
 		return Ok(());
 	};
@@ -58,6 +65,34 @@ pub fn check_and_publish_state(
 			module.version,
 		)?;
 	}
+	Ok(())
+}
+
+fn publish_manifest_error(
+	connection: &Connection,
+	uri: &Uri,
+	message: &str,
+	version: i32,
+) -> anyhow::Result<()> {
+	let diagnostic = LspDiagnostic {
+		range: Default::default(),
+		severity: Some(DiagnosticSeverity::ERROR),
+		code: Some(NumberOrString::String("MANIFEST".to_string())),
+		source: Some("nymph".to_string()),
+		message: message.to_string(),
+		..Default::default()
+	};
+	let params = PublishDiagnosticsParams {
+		uri: uri.clone(),
+		diagnostics: vec![diagnostic],
+		version: Some(version),
+	};
+	connection.sender.send(lsp_server::Message::Notification(
+		lsp_server::Notification::new(
+			PublishDiagnostics::METHOD.to_string(),
+			serde_json::to_value(params)?,
+		),
+	))?;
 	Ok(())
 }
 
@@ -233,6 +268,36 @@ mod tests {
 		};
 		let params: PublishDiagnosticsParams = serde_json::from_value(not.params).unwrap();
 		assert_eq!(params.diagnostics, Vec::new());
+	}
+
+	#[test]
+	fn a_found_invalid_manifest_publishes_a_manifest_diagnostic_not_source_analysis() {
+		let tmp = TempDir::new();
+		let manifest = tmp.0.join("nymph.toml");
+		std::fs::write(&manifest, "not = [toml").unwrap();
+		std::fs::create_dir_all(tmp.0.join("src")).unwrap();
+		let source_path = tmp.0.join("src/main.nym");
+		let uri = crate::workspace::path_to_uri(&source_path).unwrap();
+		let docs = open_doc(&uri, "this is also invalid Nymph");
+		let (server, client) = Connection::memory();
+
+		check_and_publish(&server, &docs, &uri).unwrap();
+
+		let Message::Notification(notification) = client.receiver.recv().unwrap() else {
+			panic!("expected diagnostics notification")
+		};
+		let params: PublishDiagnosticsParams = serde_json::from_value(notification.params).unwrap();
+		assert_eq!(params.diagnostics.len(), 1);
+		assert_eq!(
+			params.diagnostics[0].code,
+			Some(NumberOrString::String("MANIFEST".to_string()))
+		);
+		assert!(params.diagnostics[0].message.contains("malformed TOML"));
+		assert!(
+			params.diagnostics[0]
+				.message
+				.contains(&manifest.display().to_string())
+		);
 	}
 
 	/// A scratch directory under the system temp dir, removed on drop —
