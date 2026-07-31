@@ -668,9 +668,15 @@ impl Checker<'_> {
 				}
 				if self.impls_overlap(&a, &b) {
 					let iface = self.defs.diagnostic_name(a.interface).clone();
-					if let Some(span) = b.legacy_span {
-						self.emit(span, TypeError::ConflictingImpls { iface });
-					}
+					// Imported implementations deliberately carry no foreign source span.
+					// When two dependencies introduce the conflict, anchor the diagnostic
+					// at the consuming module rather than silently accepting incoherence or
+					// reconstructing provenance from dependency syntax.
+					let span = b
+						.legacy_span
+						.or(a.legacy_span)
+						.unwrap_or_else(|| Span::new(0, 0));
+					self.emit(span, TypeError::ConflictingImpls { iface });
 				}
 			}
 		}

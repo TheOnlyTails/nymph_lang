@@ -526,6 +526,47 @@ fn type_alias_only_dependency_module_bundles_successfully() {
 }
 
 #[test]
+fn imported_type_alias_participates_in_consumer_type_checking() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/aliases with (MyInt)\nfunc main(): void = {}\nfunc identity(value: MyInt): MyInt = value",
+		),
+		("aliases", "public type MyInt = int"),
+	]);
+	let diags = check_project("main", &loader(files));
+	assert!(diags.is_empty(), "expected a clean project, got: {diags:?}");
+}
+
+#[test]
+fn conflicting_implementations_from_distinct_dependencies_are_diagnosed() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/first\nimport @/second\nfunc main(): void = {}",
+		),
+		("protocol", "public interface Show { func show(): string }"),
+		("model", "public struct Item(value: int)"),
+		(
+			"first",
+			"import @/protocol with (Show)\nimport @/model with (Item)\nimpl Show for Item { func show(): string = \"first\" }",
+		),
+		(
+			"second",
+			"import @/protocol with (Show)\nimport @/model with (Item)\nimpl Show for Item { func show(): string = \"second\" }",
+		),
+	]);
+	let diags = check_project("main", &loader(files));
+	assert!(
+		diags.iter().any(|diagnostic| diagnostic
+			.diag
+			.message
+			.contains("conflicting implementations")),
+		"expected an imported coherence diagnostic, got: {diags:?}"
+	);
+}
+
+#[test]
 fn namespace_only_dependency_module_bundles_successfully() {
 	// A top-level `namespace` also never lowers to a JS binding today — same
 	// hazard as interface/type-alias.
