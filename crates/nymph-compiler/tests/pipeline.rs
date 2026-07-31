@@ -1,7 +1,7 @@
 //! Integration tests for the `nymph-compiler` facade: `compile` and `check`,
 //! plus their entry-mode counterparts `compile_entry` and `check_entry`.
 
-use nymph_compiler::{check, check_entry, compile, compile_entry};
+use nymph_compiler::{Severity, check, check_entry, compile, compile_entry, compile_report};
 
 fn run_node(js: &str, call: &str) -> String {
 	use std::io::Write;
@@ -59,6 +59,34 @@ fn check_returns_all_diagnostics() {
 fn check_is_clean_for_a_valid_program() {
 	let diags = check("func double(n: int): int = n * 2", "test");
 	assert!(!diags.iter().any(|d| d.is_error()));
+}
+
+#[test]
+fn compile_report_preserves_warnings_with_javascript() {
+	let report = compile_report("func f(): int = 9007199254740992", "test");
+	assert!(report.js.is_some());
+	assert!(
+		report
+			.diagnostics
+			.iter()
+			.any(|d| d.severity == Severity::Warning)
+	);
+}
+
+#[test]
+fn compile_report_omits_javascript_on_errors() {
+	let report = compile_report("func f(): int = true", "test");
+	assert!(report.js.is_none());
+	assert!(report.diagnostics.iter().any(|d| d.is_error()));
+}
+
+#[test]
+fn compile_report_clean_output_is_stable() {
+	let source = "func f(): int = 1";
+	let first = compile_report(source, "first");
+	let second = compile_report(source, "second");
+	assert!(first.diagnostics.is_empty());
+	assert_eq!(first.js, second.js);
 }
 
 // ── Entry mode (`check_entry` / `compile_entry`) ────────────────────────────

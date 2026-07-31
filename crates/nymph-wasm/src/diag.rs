@@ -1,13 +1,13 @@
 //! The playground-facing diagnostic and result shapes, plus the byte-offset
 //! → line/col index used to fill them in.
 
-use nymph_diagnostics::{Diagnostic, Severity};
+use nymph_compiler::{Diagnostic, Severity};
 use serde::Serialize;
 
 /// A single diagnostic, shaped for a JS/TS consumer (a playground UI).
 ///
 /// `start`/`end` are byte offsets into the source (matching
-/// [`nymph_ast::Span`]); `start_line`/`start_col`/`end_line`/`end_col` are
+/// compiler spans); `start_line`/`start_col`/`end_line`/`end_col` are
 /// 1-based, precomputed here so the playground doesn't need to re-derive them
 /// from the raw offsets.
 #[derive(Clone, Debug, Serialize)]

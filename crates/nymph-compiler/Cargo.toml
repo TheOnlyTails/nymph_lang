@@ -9,6 +9,17 @@ repository.workspace = true
 authors.workspace = true
 
 [features]
+default = ["bundler-rolldown"]
+bundler-rolldown = ["dep:oxc", "dep:rolldown", "dep:tokio"]
+bundler-swc = [
+	"dep:anyhow",
+	"dep:swc_bundler",
+	"dep:swc_common",
+	"dep:swc_ecma_ast",
+	"dep:swc_ecma_codegen",
+	"dep:swc_ecma_loader",
+	"dep:swc_ecma_parser",
+]
 test-support = []
 
 [dependencies]
@@ -19,12 +30,21 @@ nymph-diagnostics = { workspace = true }
 nymph-ast = { workspace = true }
 nymph-hir = { workspace = true }
 ecow = { workspace = true }
-oxc = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
 salsa = { workspace = true }
-rolldown = "1.2.0"
-tokio = { version = "1", features = ["rt"] }
+anyhow = { version = "1", optional = true }
+swc_bundler = { version = "54.0.0", optional = true }
+swc_common = { version = "24.0.0", optional = true }
+swc_ecma_ast = { version = "27.0.0", optional = true }
+swc_ecma_codegen = { version = "30.0.0", optional = true }
+swc_ecma_loader = { version = "25.0.0", optional = true }
+swc_ecma_parser = { version = "43.0.0", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+oxc = { workspace = true, optional = true }
+rolldown = { version = "1.2.0", optional = true }
+tokio = { version = "1", features = ["rt"], optional = true }
 
 [dev-dependencies]
 criterion = "0.7.0"

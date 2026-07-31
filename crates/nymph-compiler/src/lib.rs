@@ -49,6 +49,19 @@ pub use project::{
 };
 pub use std_source::embedded_std_provider;
 
+/// JavaScript and the complete diagnostics from one standalone compiler session.
+#[derive(Clone, Debug)]
+pub struct StandaloneCompileReport {
+	pub js: Option<String>,
+	pub diagnostics: Vec<Diagnostic>,
+}
+
+/// Compile standalone source while retaining warnings alongside successful output.
+#[must_use]
+pub fn compile_report(source: &str, path: &str) -> StandaloneCompileReport {
+	project::compile_standalone_report(source, path, EntryMode::Library)
+}
+
 /// Whether a compile/check pass should additionally require a valid
 /// top-level `main` entry point ([`nymph_sema::check_module_entry`]) or run
 /// as a plain library module ([`nymph_sema::check_module`]).

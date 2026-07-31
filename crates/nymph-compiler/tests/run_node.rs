@@ -2125,7 +2125,11 @@ fn runs_top_level_inherent_statics_for_struct_enum_and_generics() {
 	assert_eq!(run(src, "result()"), "14");
 	let js = compile(src);
 	assert_eq!(js.matches("static at(").count(), 1, "{js}");
-	assert_eq!(js.matches("wrap(value) {").count(), 1, "{js}");
+	assert_eq!(
+		js.matches("wrap(value) {").count() + js.matches("wrap (value) {").count(),
+		1,
+		"{js}"
+	);
 }
 
 #[test]

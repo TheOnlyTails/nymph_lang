@@ -366,6 +366,31 @@ pub(crate) fn compile_standalone(
 		.map_err(|diags| diags.iter().map(|item| item.diag.clone()).collect())
 }
 
+pub(crate) fn compile_standalone_report(
+	source: &str,
+	_path: &str,
+	entry_mode: nymph_sema::EntryMode,
+) -> crate::StandaloneCompileReport {
+	let (session, project, path) = standalone_session(source);
+	let mut diagnostics = session
+		.check_project_with_options(project.clone(), path.clone(), entry_mode, true)
+		.iter()
+		.map(|item| item.diag.clone())
+		.collect::<Vec<_>>();
+	let js = if diagnostics.iter().any(Diagnostic::is_error) {
+		None
+	} else {
+		match session.compile_project_with_options(project, path, entry_mode, true) {
+			Ok(compiled) => Some(compiled.js.clone()),
+			Err(failed) => {
+				diagnostics.extend(failed.iter().map(|item| item.diag.clone()));
+				None
+			}
+		}
+	};
+	crate::StandaloneCompileReport { js, diagnostics }
+}
+
 /// Internal inspection seam for regressions that must assert the exact ES
 /// module graph assembled before rolldown transforms it.
 #[doc(hidden)]

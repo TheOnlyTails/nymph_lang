@@ -8,14 +8,20 @@
 //! `"[name].js"` (no content hash), so a given set of module sources always
 //! produces byte-identical output — required for the golden/e2e tests and for
 //! `nymph build` to be reproducible.
-use std::borrow::Cow;
-use std::sync::Arc;
+#[cfg(all(target_arch = "wasm32", not(feature = "bundler-swc")))]
+compile_error!("nymph-compiler requires the `bundler-swc` feature on wasm32");
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "bundler-rolldown"))]
+use std::{borrow::Cow, sync::Arc};
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "bundler-rolldown"))]
 use oxc::{allocator::Allocator, parser::Parser, span::SourceType};
+#[cfg(all(not(target_arch = "wasm32"), feature = "bundler-rolldown"))]
 use rolldown::plugin::{
 	HookLoadArgs, HookLoadOutput, HookLoadReturn, HookResolveIdArgs, HookResolveIdOutput,
 	HookResolveIdReturn, HookUsage, Plugin, PluginContext, SharedLoadPluginContext,
 };
+#[cfg(all(not(target_arch = "wasm32"), feature = "bundler-rolldown"))]
 use rolldown::{Bundler, BundlerOptions, InputItem, OutputFormat};
 use rustc_hash::FxHashMap;
 
@@ -23,10 +29,12 @@ use rustc_hash::FxHashMap;
 /// keyed by the driver's own canonical module keys (`"main"`,
 /// `"geometry/vec"`, ...) — never the filesystem.
 #[derive(Debug)]
+#[cfg(all(not(target_arch = "wasm32"), feature = "bundler-rolldown"))]
 struct VirtualFsPlugin {
 	sources: FxHashMap<String, String>,
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "bundler-rolldown"))]
 impl Plugin for VirtualFsPlugin {
 	fn name(&self) -> Cow<'static, str> {
 		"nymph-virtual-fs".into()
@@ -76,6 +84,21 @@ pub(crate) fn bundle(
 	entry_key: &str,
 	sources: FxHashMap<String, String>,
 ) -> Result<String, String> {
+	#[cfg(all(not(target_arch = "wasm32"), feature = "bundler-rolldown"))]
+	return bundle_rolldown(entry_key, sources);
+
+	#[cfg(all(
+		feature = "bundler-swc",
+		any(target_arch = "wasm32", not(feature = "bundler-rolldown"))
+	))]
+	return swc::bundle(entry_key, sources);
+
+	#[allow(unreachable_code)]
+	Err("nymph-compiler requires a bundler backend feature".to_string())
+}
+
+#[cfg(all(not(target_arch = "wasm32"), feature = "bundler-rolldown"))]
+fn bundle_rolldown(entry_key: &str, sources: FxHashMap<String, String>) -> Result<String, String> {
 	if let Some(entry) = sources.get(entry_key)
 		&& !entry.lines().any(|line| line.starts_with("import "))
 		&& is_valid_esm(entry)
@@ -120,10 +143,152 @@ pub(crate) fn bundle(
 	Ok(String::from_utf8_lossy(chunk.content_as_bytes()).into_owned())
 }
 
+#[cfg(all(not(target_arch = "wasm32"), feature = "bundler-rolldown"))]
 fn is_valid_esm(source: &str) -> bool {
 	let allocator = Allocator::default();
 	let parsed = Parser::new(&allocator, source, SourceType::mjs()).parse();
 	!parsed.panicked && !parsed.diagnostics.has_errors()
+}
+
+#[cfg(all(
+	feature = "bundler-swc",
+	any(target_arch = "wasm32", not(feature = "bundler-rolldown"))
+))]
+mod swc {
+	use std::collections::HashMap;
+
+	use anyhow::{Context, bail};
+	use rustc_hash::FxHashMap;
+	use swc_bundler::{BundleKind, Bundler, Config, Hook, Load, ModuleData, ModuleRecord};
+	use swc_common::{FileName, GLOBALS, Globals, SourceMap, sync::Lrc};
+	use swc_ecma_ast::{EsVersion, KeyValueProp};
+	use swc_ecma_codegen::{Emitter, text_writer::JsWriter};
+	use swc_ecma_loader::resolve::{Resolution, Resolve};
+	use swc_ecma_parser::{Syntax, parse_file_as_module};
+
+	struct MemoryModules {
+		sources: FxHashMap<String, String>,
+		cm: Lrc<SourceMap>,
+	}
+
+	impl Resolve for MemoryModules {
+		fn resolve(&self, base: &FileName, specifier: &str) -> anyhow::Result<Resolution> {
+			if self.sources.contains_key(specifier) {
+				return Ok(Resolution {
+					filename: FileName::Custom(specifier.into()),
+					slug: None,
+				});
+			}
+			bail!("unresolved in-memory module {specifier:?} imported by {base:?}")
+		}
+	}
+
+	impl Load for MemoryModules {
+		fn load(&self, file: &FileName) -> anyhow::Result<ModuleData> {
+			let FileName::Custom(key) = file else {
+				bail!("non-virtual SWC module: {file}")
+			};
+			let source = self
+				.sources
+				.get(key)
+				.with_context(|| format!("missing module {key:?}"))?;
+			let fm = self
+				.cm
+				.new_source_file(Lrc::new(file.clone()), source.clone());
+			let mut diagnostics = vec![];
+			let module = parse_file_as_module(
+				&fm,
+				Syntax::Es(Default::default()),
+				EsVersion::latest(),
+				None,
+				&mut diagnostics,
+			)
+			.map_err(|error| anyhow::anyhow!("failed to parse {key:?}: {error:?}"))?;
+			if !diagnostics.is_empty() {
+				bail!("failed to parse {key:?}: {diagnostics:?}");
+			}
+			Ok(ModuleData {
+				fm,
+				module,
+				helpers: Default::default(),
+			})
+		}
+	}
+
+	struct NoopHook;
+	impl Hook for NoopHook {
+		fn get_import_meta_props(
+			&self,
+			_: swc_common::Span,
+			_: &ModuleRecord,
+		) -> Result<Vec<KeyValueProp>, anyhow::Error> {
+			Ok(vec![])
+		}
+	}
+
+	pub(super) fn bundle(entry: &str, sources: FxHashMap<String, String>) -> Result<String, String> {
+		if !sources.contains_key(entry) {
+			return Err(format!("bundle entry {entry:?} is missing"));
+		}
+		let cm: Lrc<SourceMap> = Default::default();
+		let modules = MemoryModules {
+			sources,
+			cm: cm.clone(),
+		};
+		let globals = Globals::new();
+		GLOBALS.set(&globals, || {
+			let resolver = MemoryModules {
+				sources: modules.sources.clone(),
+				cm: cm.clone(),
+			};
+			let mut bundler = Bundler::new(
+				&globals,
+				cm.clone(),
+				modules,
+				resolver,
+				Config {
+					require: false,
+					..Default::default()
+				},
+				Box::new(NoopHook),
+			);
+			let bundles = bundler
+				.bundle(HashMap::from([(
+					"main".into(),
+					FileName::Custom(entry.into()),
+				)]))
+				.map_err(|error| format!("SWC bundling failed: {error:?}"))?;
+			emit(cm, bundles).map_err(|error| format!("SWC emission failed: {error:#}"))
+		})
+	}
+
+	fn emit(cm: Lrc<SourceMap>, mut bundles: Vec<swc_bundler::Bundle>) -> anyhow::Result<String> {
+		if bundles.len() != 1 {
+			bail!(
+				"SWC produced {} output bundles instead of one",
+				bundles.len()
+			);
+		}
+		let bundle = bundles.pop().expect("one SWC bundle was checked above");
+		if bundle.kind
+			!= (BundleKind::Named {
+				name: "main".into(),
+			}) {
+			bail!(
+				"SWC produced unexpected output bundle kind: {:?}",
+				bundle.kind
+			);
+		}
+		let mut output = vec![];
+		let mut emitter = Emitter {
+			cfg: Default::default(),
+			cm: cm.clone(),
+			comments: None,
+			wr: JsWriter::new(cm, "\n", &mut output, None),
+		};
+		emitter.emit_module(&bundle.module)?;
+		String::from_utf8(output).context("SWC emitted non-UTF-8 JavaScript")
+	}
 }
 
 #[cfg(test)]
@@ -137,7 +302,10 @@ mod tests {
 
 		let js = bundle("main", sources).expect("self-contained entry should compile");
 
+		#[cfg(all(not(target_arch = "wasm32"), feature = "bundler-rolldown"))]
 		assert_eq!(js, source);
+		#[cfg(any(target_arch = "wasm32", not(feature = "bundler-rolldown")))]
+		assert!(js.contains("function main()"));
 	}
 
 	#[test]
@@ -182,5 +350,47 @@ mod tests {
 			js.contains("console.log(\"helper loaded\")"),
 			"expected the genuinely side-effecting (unreferenced) export to survive bundling, got:\n{js}"
 		);
+	}
+
+	#[test]
+	fn aliases_and_reexports_bundle_deterministically() {
+		let sources = || {
+			FxHashMap::from_iter([
+				(
+					"main".into(),
+					"import { renamed } from \"api\";\nexport { renamed as result };\n".into(),
+				),
+				(
+					"api".into(),
+					"export { value as renamed } from \"dep\";\n".into(),
+				),
+				(
+					"dep".into(),
+					"const value = 42;\nexport { value };\n".into(),
+				),
+			])
+		};
+		let first = bundle("main", sources()).expect("alias graph should bundle");
+		let second = bundle("main", sources()).expect("alias graph should bundle repeatedly");
+		assert_eq!(first, second);
+		assert!(first.contains("42"));
+		assert!(!first.contains("from \"api\""));
+		assert!(!first.contains("from \"dep\""));
+	}
+
+	#[cfg(all(
+		feature = "bundler-swc",
+		any(target_arch = "wasm32", not(feature = "bundler-rolldown"))
+	))]
+	#[test]
+	fn swc_rejects_noncanonical_relative_imports() {
+		let sources = FxHashMap::from_iter([
+			(
+				"main".into(),
+				"import { value } from \"./dep\";\nexport { value };\n".into(),
+			),
+			("dep".into(), "export const value = 42;\n".into()),
+		]);
+		assert!(bundle("main", sources).is_err());
 	}
 }

@@ -3,20 +3,15 @@
 //! playground.
 //!
 //! This is the frontend twin of the native CLI/LSP — it shares the compiler
-//! crates (`nymph-syntax`, `nymph-sema`, `nymph-codegen`, `nymph-diagnostics`,
-//! `nymph-ast`), not `nymph-compiler` itself (which pulls a native bundler +
-//! async runtime that don't target `wasm32-unknown-unknown`; see
-//! [`pipeline`]). The pipeline is a faithful replication of
-//! `nymph_compiler::compile`/`check` in library mode (no top-level `main`
-//! required — the right default for a playground compiling arbitrary
-//! snippets).
+//! stable `nymph-compiler` session pipeline in library mode (no top-level
+//! `main` required — the right default for a playground compiling arbitrary
+//! snippets). Its in-memory SWC backend supports browser WASM synchronously.
 //!
 //! The two exported bindings, [`compile`] and [`check`], return a
 //! [`diag::CompileResult`] serialized to a `JsValue` via `serde-wasm-bindgen`.
 
 mod diag;
 mod pipeline;
-mod prelude;
 
 use wasm_bindgen::prelude::*;
 

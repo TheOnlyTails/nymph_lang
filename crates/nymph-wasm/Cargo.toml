@@ -12,11 +12,7 @@ authors.workspace = true
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-nymph-ast = { workspace = true }
-nymph-diagnostics = { workspace = true }
-nymph-syntax = { workspace = true }
-nymph-sema = { workspace = true }
-nymph-codegen = { workspace = true }
+nymph-compiler = { path = "../nymph-compiler", default-features = false, features = ["bundler-swc"] }
 serde = { workspace = true }
 wasm-bindgen = "0.2.126"
 serde-wasm-bindgen = "0.6.5"
