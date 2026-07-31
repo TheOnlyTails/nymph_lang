@@ -100,10 +100,10 @@ measurement window. The historical checkout used its original `fresh-check` and
 `fresh-compile` operations; the current checkout used the baseline-compatible
 cases above. Both received the exact 17-module Mixed 4×4 fixture.
 
-| Operation | Reproduced `abcbd4b` | Before coherence partitioning | Coherence partitioning only | Current | Current / baseline |
-|---|---:|---:|---:|---:|---:|
-| Diagnostics | 110.75 ms (110.18–111.27 ms) | 1.0328 s (1.0264–1.0404 s) | 352.19 ms (351.31–353.12 ms) | 293.67 ms (291.04–296.63 ms) | 2.65× |
-| Full compile | 137.73 ms (137.11–138.45 ms) | 1.0705 s (1.0512–1.0991 s) | 362.90 ms (361.76–364.04 ms) | 302.31 ms (299.84–305.15 ms) | 2.19× |
+| Operation | Reproduced `abcbd4b` | Before coherence partitioning | Coherence partitioning only | Module prewarming | Current | Current / baseline |
+|---|---:|---:|---:|---:|---:|---:|
+| Diagnostics | 110.75 ms (110.18–111.27 ms) | 1.0328 s (1.0264–1.0404 s) | 352.19 ms (351.31–353.12 ms) | 293.67 ms (291.04–296.63 ms) | 191.22 ms (188.96–193.56 ms) | 1.73× |
+| Full compile | 137.73 ms (137.11–138.45 ms) | 1.0705 s (1.0512–1.0991 s) | 362.90 ms (361.76–364.04 ms) | 302.31 ms (299.84–305.15 ms) | 199.29 ms (197.27–201.47 ms) | 1.45× |
 
 Profiling attributed the largest regression to coherence checking: each project
 module received 93 visible implementations and exhaustively trial-unified every
@@ -112,10 +112,16 @@ Partitioning impossible overlaps by the existing `(interface, head)` semantic
 index reduced diagnostics by 65.9% and full compile by 66.1% without changing
 coherence diagnostics. Native cold diagnostics then prewarm independent module
 queries on cloned Salsa handles before the authoritative serial, graph-ordered
-diagnostic fold; this reduced both operations by a further 16.6–16.7% while
-preserving dependency registration and warm backdating. The remaining 2.65×
-diagnostics and 2.19× full-build regressions are still open; these results are
-observability, not acceptance of the remaining difference.
+diagnostic fold; this reduced both operations by a further 16.6–16.7%. The
+prewarmer now schedules the independent ambient semantic roots first, avoiding
+a convoy in which every project worker initially requested the same ordered
+ambient root. That reduced diagnostics by another 34.9% and full compile by
+34.1%. The scheduling is native-only; wasm retains the serial path. Exact Salsa
+query keys and semantic identities are unchanged, and the serial fold remains
+authoritative for aggregate dependency registration, deterministic diagnostic
+ordering, and warm backdating. The remaining 1.73× diagnostics and 1.45×
+full-build regressions are still open; these results are observability, not
+acceptance of the remaining difference.
 
 ### Retained-session acceptance results (2026-07-31)
 

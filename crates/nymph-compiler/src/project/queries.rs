@@ -2208,16 +2208,24 @@ fn interface_module_diagnostics<'db>(
 fn prewarm_interface_module_diagnostics(
 	db: &dyn Db,
 	key: super::session::ProjectKey<'_>,
+	ambient: Option<(AmbientCoreRegistryInput, Vec<BuiltinModuleInput>)>,
 	modules: Vec<SemanticModuleInput>,
 ) {
-	if modules.len() < 2 {
+	let ambient_len = ambient.as_ref().map_or(0, |(_, modules)| modules.len());
+	if modules.len() < 2 && ambient_len < 2 {
 		return;
 	}
 	static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
-	let workers = modules
+	let module_workers = modules
 		.iter()
 		.map(|_| db.parallel_clone())
 		.collect::<Vec<_>>();
+	let ambient_workers = ambient.as_ref().map(|(_, modules)| {
+		modules
+			.iter()
+			.map(|_| db.parallel_clone())
+			.collect::<Vec<_>>()
+	});
 	// Salsa Storage clones share memo tables but have distinct local query stacks.
 	// The coordinator prevents the aggregate-query caller from helping this private
 	// pool and therefore from switching databases while its query stack is active.
@@ -2232,7 +2240,15 @@ fn prewarm_interface_module_diagnostics(
 							.expect("build diagnostics worker pool")
 					})
 					.install(|| {
-						workers
+						if let (Some((registry, modules)), Some(workers)) = (ambient, ambient_workers) {
+							workers
+								.into_par_iter()
+								.zip(modules.into_par_iter())
+								.for_each(|(worker, module)| {
+									ambient_core_environment(worker.as_ref(), registry, module);
+								});
+						}
+						module_workers
 							.into_par_iter()
 							.zip(modules.into_par_iter())
 							.for_each(|(worker, module)| {
@@ -2278,7 +2294,13 @@ pub(crate) fn interface_project_diagnostics<'db>(
 	// The serial fold remains authoritative for dependency registration and graph-order
 	// diagnostics. Non-threaded wasm skips prewarming and executes this fold directly.
 	#[cfg(not(target_arch = "wasm32"))]
-	prewarm_interface_module_diagnostics(db, key, graph.semantic_order.to_vec());
+	{
+		let ambient = key.ambient_prelude(db).then(|| {
+			let registry = key.ambient_core_registry(db);
+			(registry, registry.modules(db).to_vec())
+		});
+		prewarm_interface_module_diagnostics(db, key, ambient, graph.semantic_order.to_vec());
+	}
 	let mut all = Vec::new();
 	for module in graph.semantic_order.iter().copied() {
 		all.extend(

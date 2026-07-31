@@ -321,6 +321,15 @@ fn parallel_diamond_check_executes_each_module_once_and_preserves_diagnostic_ord
 				"module {module} executed more than once: {cold:#?}"
 			);
 		}
+		for module in session.ambient_core_module_keys() {
+			let module_name = format!("std::{}", module.as_str());
+			assert_eq!(
+				count(&cold, "ambient_core_environment", Some(&module_name)),
+				1,
+				"ambient module {} executed more than once: {cold:#?}",
+				module.as_str()
+			);
+		}
 
 		events.lock().unwrap().clear();
 		let warm = session.check_project(project, entry, EntryMode::Library);
@@ -376,5 +385,67 @@ fn parallel_diagnostic_fold_tracks_child_query_changes() {
 	assert!(
 		events.lock().unwrap().is_empty(),
 		"identical post-edit check was not fully cached"
+	);
+}
+
+#[test]
+fn parallel_diagnostic_fold_tracks_ambient_interface_changes() {
+	let sources = BTreeMap::from([
+		(
+			"leaf".into(),
+			"public func make(): Option<int> = None\n".into(),
+		),
+		(
+			"main".into(),
+			"import @/leaf with (make)\npublic func value(): Option<int> = make()\n".into(),
+		),
+	]);
+	let events = Arc::new(Mutex::new(Vec::<SemanticQueryEvent>::new()));
+	let sink = events.clone();
+	let mut session = CompilerSession::with_detailed_event_callback_for_test(move |event| {
+		sink.lock().unwrap().push(event)
+	});
+	let project = ProjectId::new("parallel-ambient-dependencies");
+	let entry = ModulePath::new("main").unwrap();
+	install_sources(&mut session, &project, &sources, SourceVersion(1));
+	assert!(
+		session
+			.check_project(project.clone(), entry.clone(), EntryMode::Library)
+			.is_empty()
+	);
+
+	let option = nymph_compiler::AmbientCoreModuleKey::new("option").unwrap();
+	let original = session
+		.ambient_core_source_for_test(option.clone())
+		.unwrap();
+	let edited = format!("{original}\npublic func ambient_probe(): int = 1\n");
+	assert_ne!(original, edited);
+	session.set_ambient_core_source_for_test(option.clone(), edited);
+	events.lock().unwrap().clear();
+	let diagnostics = session.check_project(project.clone(), entry.clone(), EntryMode::Library);
+	assert!(
+		diagnostics.is_empty(),
+		"valid ambient interface edit changed project diagnostics: {diagnostics:?}"
+	);
+	let edited_events = events.lock().unwrap().clone();
+	assert_eq!(
+		count(
+			&edited_events,
+			"ambient_core_environment",
+			Some("std::option")
+		),
+		1,
+		"edited ambient owner did not execute exactly once: {edited_events:#?}"
+	);
+
+	session.set_ambient_core_source_for_test(option, original);
+	let restored = session.check_project(project.clone(), entry.clone(), EntryMode::Library);
+	assert!(restored.is_empty(), "restored ambient core: {restored:?}");
+	events.lock().unwrap().clear();
+	let warm = session.check_project(project, entry, EntryMode::Library);
+	assert!(warm.is_empty());
+	assert!(
+		events.lock().unwrap().is_empty(),
+		"identical post-restore check was not fully cached"
 	);
 }
