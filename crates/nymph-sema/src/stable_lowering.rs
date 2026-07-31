@@ -1753,6 +1753,17 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			|self_type| substitute_self_type(ty, self_type),
 		))
 	}
+	fn builtin_result(&self, expr: &StableExpr) -> Result<BuiltinResult, StableLoweringError> {
+		match peel_mut(&self.ty(expr)?) {
+			InterfaceType::Int => Ok(BuiltinResult::Int),
+			InterfaceType::UInt => Ok(BuiltinResult::UInt),
+			InterfaceType::Float => Ok(BuiltinResult::Float),
+			InterfaceType::Char => Ok(BuiltinResult::Char),
+			InterfaceType::String => Ok(BuiltinResult::String),
+			InterfaceType::Boolean => Ok(BuiltinResult::Boolean),
+			_ => Err(self.unsupported(expr, "built-in operator result type")),
+		}
+	}
 	fn dispatch(&self, expr: &StableExpr) -> Result<&crate::StableDispatch, StableLoweringError> {
 		let node = self.id(expr);
 		self
@@ -2186,7 +2197,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				}
 				HirExpr::Binary {
 					op: binop(*op).ok_or_else(|| self.unsupported(expr, "protocol binary operator"))?,
-					result: result_for(*op),
+					result: self.builtin_result(expr)?,
 					lhs: Box::new(self.lower(lhs)?),
 					rhs: Box::new(self.lower(rhs)?),
 				}
@@ -2202,11 +2213,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						PrefixOperator::BoolNot => UnOp::Not,
 						PrefixOperator::BitNot => UnOp::BitNot,
 					},
-					result: if *op == PrefixOperator::BoolNot {
-						BuiltinResult::Boolean
-					} else {
-						BuiltinResult::Int
-					},
+					result: self.builtin_result(expr)?,
 					operand: Box::new(self.lower(value)?),
 				}
 			}
@@ -2224,7 +2231,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				let value = match self.dispatch(expr)? {
 					crate::StableDispatch::Builtin { .. } => HirExpr::Binary {
 						op: binop(binary).unwrap(),
-						result: result_for(binary),
+						result: self.builtin_result(lhs)?,
 						lhs: Box::new(self.lower(lhs)?),
 						rhs: Box::new(self.lower(rhs)?),
 					},
@@ -3904,20 +3911,6 @@ fn binop(op: BinaryOperator) -> Option<BinOp> {
 		_ => return None,
 	})
 }
-fn result_for(op: BinaryOperator) -> BuiltinResult {
-	match op {
-		BinaryOperator::Equals
-		| BinaryOperator::NotEquals
-		| BinaryOperator::LessThan
-		| BinaryOperator::LessThanEquals
-		| BinaryOperator::GreaterThan
-		| BinaryOperator::GreaterThanEquals
-		| BinaryOperator::BoolAnd
-		| BinaryOperator::BoolOr => BuiltinResult::Boolean,
-		_ => BuiltinResult::Int,
-	}
-}
-
 fn assign_binop(op: AssignOperator) -> Option<BinaryOperator> {
 	Some(match op {
 		AssignOperator::PlusAssign => BinaryOperator::Plus,

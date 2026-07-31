@@ -1547,6 +1547,39 @@ fn primitive_eager_and_short_circuit_dispatch_stay_native_without_demands() {
 }
 
 #[test]
+fn primitive_operator_result_uses_the_checker_selected_type() {
+	let division = lower_named("func divide(a: int, b: int): float = a / b", "divide");
+	assert!(matches!(
+		division.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
+			if matches!(
+				function.body,
+				nymph_hir::hir::HirExpr::Binary {
+					op: nymph_hir::hir::BinOp::Div,
+					result: nymph_hir::hir::BuiltinResult::Float,
+					..
+				}
+			)
+	));
+	assert_eq!(division.demands(), []);
+
+	let negate = lower_named("func negate(value: float): float = -value", "negate");
+	assert!(matches!(
+		negate.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
+			if matches!(
+				function.body,
+				nymph_hir::hir::HirExpr::Unary {
+					op: nymph_hir::hir::UnOp::Neg,
+					result: nymph_hir::hir::BuiltinResult::Float,
+					..
+				}
+			)
+	));
+	assert_eq!(negate.demands(), []);
+}
+
+#[test]
 fn missing_dispatched_member_name_is_a_typed_error() {
 	let item = artifacts(
 		"struct Box(value: int) { func get(): int = this.value }\nfunc read(value: Box): int = value.get()",

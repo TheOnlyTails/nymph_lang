@@ -1530,16 +1530,57 @@ fn required_type_nodes(
 			ExprKind::IndexAccess { parent, .. } => {
 				required.insert(parent.id);
 			}
-			ExprKind::BinaryOp { lhs, op, .. }
-				if matches!(op, BinaryOperator::Equals | BinaryOperator::NotEquals) =>
-			{
+			ExprKind::BinaryOp { lhs, op, .. } => {
+				if matches!(op, BinaryOperator::Equals | BinaryOperator::NotEquals) {
+					if checked
+						.annotations
+						.get(lhs.id)
+						.is_some_and(|info| !matches!(checked.interner.kind(info.ty), crate::TyKind::Error))
+					{
+						required.insert(lhs.id);
+					}
+				}
 				if checked
 					.annotations
-					.get(lhs.id)
-					.is_some_and(|info| !matches!(checked.interner.kind(info.ty), crate::TyKind::Error))
-				{
-					required.insert(lhs.id);
+					.get(expression.id)
+					.and_then(|info| info.resolution)
+					.is_some_and(|resolution| {
+						matches!(
+							resolution.dispatch,
+							DispatchKind::BuiltinEager | DispatchKind::BuiltinShortCircuit
+						)
+					}) {
+					required.insert(expression.id);
 				}
+			}
+			ExprKind::PrefixOp { .. }
+				if checked
+					.annotations
+					.get(expression.id)
+					.and_then(|info| info.resolution)
+					.is_some_and(|resolution| {
+						matches!(
+							resolution.dispatch,
+							DispatchKind::BuiltinEager | DispatchKind::BuiltinShortCircuit
+						)
+					}) =>
+			{
+				required.insert(expression.id);
+			}
+			ExprKind::AssignOp { lhs, op, .. }
+				if *op != AssignOperator::Assign
+					&& checked
+						.annotations
+						.get(expression.id)
+						.and_then(|info| info.resolution)
+						.is_some_and(|resolution| {
+							matches!(
+								resolution.dispatch,
+								DispatchKind::BuiltinEager | DispatchKind::BuiltinShortCircuit
+							)
+						}) =>
+			{
+				required.insert(lhs.id);
 			}
 			ExprKind::List(items) | ExprKind::Tuple(items) => {
 				for item in items {
