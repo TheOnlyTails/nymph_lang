@@ -1493,6 +1493,8 @@ fn lower_body(
 		annotations: &body.annotations,
 		scopes: RefCell::new(vec![HashMap::new()]),
 		counters: RefCell::new(HashMap::new()),
+		pattern_declaration_records: RefCell::new(vec![]),
+		pattern_declaration_reuse: RefCell::new(vec![]),
 		demands: RefCell::new(demands),
 		direct_demands: RefCell::new(direct_demands),
 		routed_demands: RefCell::new(routed_demands),
@@ -1613,6 +1615,8 @@ struct StableBodyLowerer<'a, C> {
 	annotations: &'a crate::RuntimeAnnotations,
 	scopes: RefCell<Vec<HashMap<EcoString, EcoString>>>,
 	counters: RefCell<HashMap<EcoString, u32>>,
+	pattern_declaration_records: RefCell<Vec<HashMap<EcoString, EcoString>>>,
+	pattern_declaration_reuse: RefCell<Vec<HashMap<EcoString, EcoString>>>,
 	demands: RefCell<&'a mut StableDemandSet>,
 	direct_demands: RefCell<&'a mut StableDemandSet>,
 	routed_demands: RefCell<&'a mut StableDemandSet>,
@@ -1677,6 +1681,24 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		}
 	}
 	fn declare(&self, name: &EcoString) -> EcoString {
+		if let Some(emitted) = self
+			.pattern_declaration_reuse
+			.borrow()
+			.last()
+			.and_then(|bindings| bindings.get(name))
+			.cloned()
+		{
+			self
+				.scopes
+				.borrow_mut()
+				.last_mut()
+				.unwrap()
+				.insert(name.clone(), emitted.clone());
+			for record in self.pattern_declaration_records.borrow_mut().iter_mut() {
+				record.insert(name.clone(), emitted.clone());
+			}
+			return emitted;
+		}
 		let collision = self
 			.scopes
 			.borrow()
@@ -1698,6 +1720,9 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.last_mut()
 			.unwrap()
 			.insert(name.clone(), emitted.clone());
+		for record in self.pattern_declaration_records.borrow_mut().iter_mut() {
+			record.insert(name.clone(), emitted.clone());
+		}
 		emitted
 	}
 	fn resolve(&self, name: &EcoString) -> EcoString {
@@ -1765,7 +1790,16 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		}
 	}
 	fn int_literal_kind(&self, expr: &StableExpr) -> Result<NumKind, StableLoweringError> {
-		match peel_mut(&self.ty(expr)?) {
+		let Some(ty) = self
+			.annotations
+			.types
+			.iter()
+			.find(|(id, _)| *id == self.id(expr))
+			.map(|(_, ty)| ty)
+		else {
+			return Ok(NumKind::Int);
+		};
+		match peel_mut(ty) {
 			InterfaceType::Int => Ok(NumKind::Int),
 			InterfaceType::UInt => Ok(NumKind::UInt),
 			InterfaceType::Float => Ok(NumKind::Float),
@@ -3319,10 +3353,19 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				HirPat::Map { entries, rest }
 			}
 			StablePatternKind::Range(range) => HirPat::Range(range_pattern(range)?),
-			StablePatternKind::Union(left, right) => HirPat::Or(
-				Box::new(self.lower_pattern(left)?),
-				Box::new(self.lower_pattern(right)?),
-			),
+			StablePatternKind::Union(left, right) => {
+				self
+					.pattern_declaration_records
+					.borrow_mut()
+					.push(HashMap::new());
+				let left = self.lower_pattern(left);
+				let bindings = self.pattern_declaration_records.borrow_mut().pop().unwrap();
+				let left = left?;
+				self.pattern_declaration_reuse.borrow_mut().push(bindings);
+				let right = self.lower_pattern(right);
+				self.pattern_declaration_reuse.borrow_mut().pop();
+				HirPat::Or(Box::new(left), Box::new(right?))
+			}
 		})
 	}
 	fn lower_list_pattern(

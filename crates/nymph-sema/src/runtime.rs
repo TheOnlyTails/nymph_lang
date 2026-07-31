@@ -1518,10 +1518,17 @@ fn required_type_nodes(
 	let mut required = std::collections::HashSet::new();
 	for expression in nodes {
 		match &expression.kind {
-			// An unsuffixed integer literal can be contextually retyped to `uint`
-			// or `float`. Stable lowering must use the checker's decision rather
-			// than the token's syntactic kind when selecting its runtime box.
-			ExprKind::Int(_) => {
+			// Persist only a contextual widening. A plain `int` literal already
+			// carries its runtime kind syntactically and some recovered declaration
+			// paths do not annotate that redundant fact.
+			ExprKind::Int(_)
+				if checked.annotations.get(expression.id).is_some_and(|info| {
+					matches!(
+						checked.interner.kind(info.ty),
+						crate::TyKind::UInt | crate::TyKind::Float
+					)
+				}) =>
+			{
 				required.insert(expression.id);
 			}
 			ExprKind::MemberAccess { .. }

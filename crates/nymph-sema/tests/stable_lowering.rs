@@ -197,6 +197,24 @@ fn stable_lowering_is_identical_across_body_formatting() {
 #[test]
 fn stable_lowering_preserves_contextual_integer_literal_kinds() {
 	for (source, expected) in [
+		("func value(): int = 5", None),
+		("func value(): uint = 5", Some(InterfaceType::UInt)),
+		("func value(): float = 5", Some(InterfaceType::Float)),
+	] {
+		let artifact = artifacts(source).remove(0);
+		let nymph_sema::RuntimePayload::NymphBody(body) = artifact.payload else {
+			panic!("expected Nymph body")
+		};
+		let actual = body
+			.annotations
+			.types
+			.iter()
+			.find(|(id, _)| *id == body.stable.root.id)
+			.map(|(_, ty)| ty.clone());
+		assert_eq!(actual, expected);
+	}
+
+	for (source, expected) in [
 		("func value(): uint = 5", nymph_hir::hir::NumKind::UInt),
 		("func value(): float = 5", nymph_hir::hir::NumKind::Float),
 	] {
@@ -279,6 +297,45 @@ fn stable_lowering_preserves_tuple_pattern_rest_relationships() {
 		arms[0].body,
 		nymph_hir::hir::HirExpr::Local("middle".into())
 	);
+}
+
+#[test]
+fn stable_lowering_reuses_exact_bindings_across_union_alternatives() {
+	let lowered = lower_named(
+		"func select(value: #(int, int)): #(int, int) = match (value) { #(x = 1, y = 2) | #(y = 3, x = 4) -> #(x, y), _ -> #(0, 0) }",
+		"select",
+	);
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("expected function fragment")
+	};
+	let nymph_hir::hir::HirExpr::Match { arms, .. } = &function.body else {
+		panic!("expected match body")
+	};
+	let nymph_hir::hir::HirPat::Or(left, right) = &arms[0].pat else {
+		panic!("expected union pattern")
+	};
+	let bindings = |pattern: &nymph_hir::hir::HirPat| {
+		let nymph_hir::hir::HirPat::Tuple(items) = pattern else {
+			panic!("expected tuple alternative")
+		};
+		items
+			.iter()
+			.map(|item| match item {
+				nymph_hir::hir::HirPat::Binding { name, .. } => name.clone(),
+				_ => panic!("expected bound item"),
+			})
+			.collect::<Vec<_>>()
+	};
+	assert_eq!(bindings(left), ["x", "y"]);
+	assert_eq!(bindings(right), ["y", "x"]);
+	assert!(matches!(
+		&arms[0].body,
+		nymph_hir::hir::HirExpr::Array { items, .. }
+			if matches!(items.as_slice(), [
+				nymph_hir::hir::HirExpr::Local(x),
+				nymph_hir::hir::HirExpr::Local(y),
+			] if x == "x" && y == "y")
+	));
 }
 
 #[test]
