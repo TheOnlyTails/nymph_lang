@@ -255,6 +255,33 @@ fn stable_lowering_accepts_unbraced_return_branches() {
 }
 
 #[test]
+fn stable_lowering_preserves_tuple_pattern_rest_relationships() {
+	let lowered = lower_named(
+		"func middle(value: #(int, boolean, string, int)): #(boolean, string) = match (value) { #(first, ...middle, last) -> middle }",
+		"middle",
+	);
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("expected function fragment")
+	};
+	let nymph_hir::hir::HirExpr::Match { arms, .. } = &function.body else {
+		panic!("expected match body")
+	};
+	assert!(matches!(
+		&arms[0].pat,
+		nymph_hir::hir::HirPat::List {
+			kind: nymph_hir::hir::HirArrayKind::Tuple,
+			prefix,
+			rest: Some(Some(rest)),
+			suffix,
+		} if prefix.len() == 1 && rest == "middle" && suffix.len() == 1
+	));
+	assert_eq!(
+		arms[0].body,
+		nymph_hir::hir::HirExpr::Local("middle".into())
+	);
+}
+
+#[test]
 fn implementation_header_generic_body_receiver_has_canonical_type_annotation() {
 	let source = "impl<T> #[T] { func first(): T = { let result = this\nresult[0] } }";
 	let (artifacts, interface) = artifacts_and_interface(source);

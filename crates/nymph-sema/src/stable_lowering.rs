@@ -3286,43 +3286,23 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					HirPat::Struct { fields }
 				}
 			}
+			StablePatternKind::Tuple(items)
+				if items
+					.iter()
+					.any(|item| matches!(item, StableListPatternEntry::Rest(_))) =>
+			{
+				self.lower_list_pattern(items, HirArrayKind::Tuple)?
+			}
 			StablePatternKind::Tuple(items) => HirPat::Tuple(
 				items
 					.iter()
-					.filter_map(|item| {
-						if let StableListPatternEntry::Item(value) = item {
-							Some(self.lower_pattern(value))
-						} else {
-							None
-						}
+					.map(|item| match item {
+						StableListPatternEntry::Item(value) => self.lower_pattern(value),
+						StableListPatternEntry::Rest(_) => unreachable!(),
 					})
 					.collect::<Result<_, _>>()?,
 			),
-			StablePatternKind::List(items) => {
-				let mut prefix = vec![];
-				let mut suffix = vec![];
-				let mut rest = None;
-				for item in items.iter() {
-					match item {
-						StableListPatternEntry::Item(value) => {
-							if rest.is_none() {
-								prefix.push(self.lower_pattern(value)?)
-							} else {
-								suffix.push(self.lower_pattern(value)?)
-							}
-						}
-						StableListPatternEntry::Rest(name) => {
-							rest = Some(name.as_ref().map(|name| self.declare(&name)))
-						}
-					}
-				}
-				HirPat::List {
-					kind: HirArrayKind::List,
-					prefix,
-					rest,
-					suffix,
-				}
-			}
+			StablePatternKind::List(items) => self.lower_list_pattern(items, HirArrayKind::List)?,
 			StablePatternKind::Map(items) => {
 				let mut entries = vec![];
 				let mut rest = None;
@@ -3343,6 +3323,41 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				Box::new(self.lower_pattern(left)?),
 				Box::new(self.lower_pattern(right)?),
 			),
+		})
+	}
+	fn lower_list_pattern(
+		&self,
+		items: &[StableListPatternEntry],
+		kind: HirArrayKind,
+	) -> Result<HirPat, StableLoweringError> {
+		let mut prefix = vec![];
+		let mut suffix = vec![];
+		let mut rest = None;
+		for item in items {
+			match item {
+				StableListPatternEntry::Item(value) => {
+					if rest.is_none() {
+						prefix.push(self.lower_pattern(value)?)
+					} else {
+						suffix.push(self.lower_pattern(value)?)
+					}
+				}
+				StableListPatternEntry::Rest(name) => {
+					if rest.is_some() {
+						return Err(invalid(
+							&self.artifact.definition,
+							"list-shaped pattern has more than one rest entry",
+						));
+					}
+					rest = Some(name.as_ref().map(|name| self.declare(&name)));
+				}
+			}
+		}
+		Ok(HirPat::List {
+			kind,
+			prefix,
+			rest,
+			suffix,
 		})
 	}
 	fn lower_struct_pattern_fields(
