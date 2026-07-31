@@ -24,26 +24,37 @@ pub struct Project {
 /// Climb from `file`'s directory looking for the nearest `nymph.toml`; if
 /// found, and `file` (canonicalized) lies under that project's resolved
 /// source root, return the project and `file`'s own canonical module key.
-/// Returns `None` for a bare, project-less file (or one outside the
-/// resolved source root) — the caller should fall back to loose single-file
-/// checking in that case.
+/// Returns `None` only for a bare, project-less file. Discovery and source-
+/// path errors are authoritative and must be surfaced instead of selecting
+/// loose-file checking.
 #[must_use]
-pub fn detect(file: &Path) -> Option<Project> {
-	let file_abs = std::path::absolute(file).ok()?;
-	let start_dir = file_abs.parent()?;
+pub fn detect(file: &Path) -> anyhow::Result<Option<Project>> {
+	let file_abs = std::path::absolute(file)?;
+	let start_dir = file_abs
+		.parent()
+		.ok_or_else(|| anyhow::anyhow!("source file has no parent: {}", file.display()))?;
 
-	let project = nymph_project::discover(start_dir).ok()?;
+	let project = match nymph_project::discover(start_dir) {
+		Ok(project) => project,
+		Err(nymph_project::DiscoverError::NotFound { .. }) => return Ok(None),
+		Err(error) => return Err(error.into()),
+	};
 	let src_root = project.source_root();
 	let entry_key = project
 		.module_for_file(&file_abs)
-		.ok()?
+		.map_err(|error| {
+			anyhow::anyhow!(
+				"invalid source path for manifest {}: {error}",
+				project.manifest_path().display()
+			)
+		})?
 		.as_str()
 		.to_string();
 
-	Some(Project {
+	Ok(Some(Project {
 		src_root,
 		entry_key,
-	})
+	}))
 }
 
 /// Build the FS-backed `load` closure a `src_root`'s project driver call
@@ -151,7 +162,9 @@ mod tests {
 		std::fs::create_dir_all(tmp.path().join("src/sub")).unwrap();
 		std::fs::write(tmp.path().join("src/sub/b.nym"), "func b(): void = {}").unwrap();
 
-		let project = detect(&tmp.path().join("src/sub/b.nym")).expect("should detect a project");
+		let project = detect(&tmp.path().join("src/sub/b.nym"))
+			.unwrap()
+			.expect("should detect a project");
 		assert_eq!(project.entry_key, "sub/b");
 		assert_eq!(
 			std::path::absolute(project.src_root).unwrap(),
@@ -163,7 +176,7 @@ mod tests {
 	fn a_file_outside_any_project_is_not_detected() {
 		let tmp = TempDir::new();
 		std::fs::write(tmp.path().join("loose.nym"), "func f(): void = {}").unwrap();
-		assert!(detect(&tmp.path().join("loose.nym")).is_none());
+		assert!(detect(&tmp.path().join("loose.nym")).unwrap().is_none());
 	}
 
 	#[test]
@@ -221,8 +234,9 @@ mod tests {
 		.unwrap();
 		std::fs::write(root.join("src/sub/b.nym"), "func b(): void = {}").unwrap();
 
-		let project =
-			detect(&root.join("src/sub/b.nym")).expect("should detect a project despite the space");
+		let project = detect(&root.join("src/sub/b.nym"))
+			.unwrap()
+			.expect("should detect a project despite the space");
 		assert_eq!(project.entry_key, "sub/b");
 	}
 

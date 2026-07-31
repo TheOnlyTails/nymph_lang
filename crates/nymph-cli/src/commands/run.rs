@@ -60,9 +60,15 @@ impl NymphCommand for RunCommand {
 		// A file inside a `nymph.toml` project resolves imports across the whole
 		// project; a bare file is compiled as its own single-file project (rooted
 		// at its own directory) so it can still `import std/…` and import siblings.
-		if let Some(project) =
-			project_support::detect(file).or_else(|| project_support::single_file(file))
-		{
+		let project = match project_support::detect(file) {
+			Ok(Some(project)) => Some(project),
+			Ok(None) => project_support::single_file(file),
+			Err(error) => {
+				eprintln!("error: {error}");
+				return 1;
+			}
+		};
+		if let Some(project) = project {
 			let load = fs_loader(project.src_root);
 			return match guarded(|| {
 				nymph_compiler::compile_project_with_std(

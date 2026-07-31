@@ -3,10 +3,8 @@
 //! the `nymph_compiler::project` loader closure over real files, and maps a
 //! given `.nym` file argument to the canonical module key the driver expects.
 //!
-//! A file with no discoverable `nymph.toml` project (or one that lies
-//! outside its resolved source root) falls back to the existing
-//! single-file `compile_guarded` path unchanged — this module only adds
-//! cross-module import resolution on top of what's already there.
+//! A file falls back to loose mode only when discovery reports that no
+//! `nymph.toml` exists. A found but unusable manifest is authoritative.
 
 use std::path::{Path, PathBuf};
 
@@ -20,25 +18,35 @@ pub(crate) struct Project {
 /// Climb from `file`'s directory looking for the nearest `nymph.toml` (see
 /// [`config::find_from`]); if found, and `file` (canonicalized) lies under
 /// that project's resolved source root, return the project and `file`'s own
-/// canonical module key. Returns `None` for a bare, project-less file (or one
-/// outside the resolved source root) — the caller should fall back to
-/// single-file compilation in that case.
-pub(crate) fn detect(file: &Path) -> Option<Project> {
-	let file_abs = std::path::absolute(file).ok()?;
-	let start_dir = file_abs.parent()?;
+/// canonical module key. Returns `None` only for a bare, project-less file.
+/// Discovery and source-path errors are authoritative and name the manifest.
+pub(crate) fn detect(file: &Path) -> anyhow::Result<Option<Project>> {
+	let file_abs = std::path::absolute(file)?;
+	let start_dir = file_abs
+		.parent()
+		.ok_or_else(|| anyhow::anyhow!("source file has no parent: {}", file.display()))?;
 
-	let project = nymph_project::discover(start_dir).ok()?;
+	let project = match nymph_project::discover(start_dir) {
+		Ok(project) => project,
+		Err(nymph_project::DiscoverError::NotFound { .. }) => return Ok(None),
+		Err(error) => return Err(error.into()),
+	};
 	let src_root = project.source_root();
 	let entry_key = project
 		.module_for_file(&file_abs)
-		.ok()?
+		.map_err(|error| {
+			anyhow::anyhow!(
+				"invalid source path for manifest {}: {error}",
+				project.manifest_path().display()
+			)
+		})?
 		.as_str()
 		.to_string();
 
-	Some(Project {
+	Ok(Some(Project {
 		src_root,
 		entry_key,
-	})
+	}))
 }
 
 /// Treat a bare, project-less `.nym` file as its own single-file project:

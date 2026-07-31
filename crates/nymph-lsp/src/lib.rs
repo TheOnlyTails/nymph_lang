@@ -271,10 +271,13 @@ fn handle_notification(
 		}
 		m if m == DidCloseTextDocument::METHOD => {
 			let params: DidCloseTextDocumentParams = serde_json::from_value(not.params)?;
-			let affected = compiler
-				.lock()
-				.unwrap()
-				.close(&mut docs.lock().unwrap(), &params.text_document.uri)?;
+			let mut compiler_state = compiler.lock().unwrap();
+			let had_manifest_error = compiler_state.has_manifest_error(&params.text_document.uri);
+			let affected = compiler_state.close(&mut docs.lock().unwrap(), &params.text_document.uri)?;
+			drop(compiler_state);
+			if had_manifest_error {
+				diagnostics::clear(connection, &params.text_document.uri)?;
+			}
 			for uri in affected {
 				diagnostics::check_and_publish_state(connection, docs, compiler, &uri)?;
 			}
@@ -558,6 +561,48 @@ mod tests {
 				"IMPORT-UNRESOLVED".into()
 			))
 		);
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn closing_a_document_with_a_manifest_error_clears_its_diagnostic() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(temp.path().join("nymph.toml"), "not = [toml").unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let source_path = temp.path().join("src/main.nym");
+		let uri = workspace::path_to_uri(&source_path).unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		handshake(&client);
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidOpenTextDocument::METHOD.into(),
+				serde_json::to_value(DidOpenTextDocumentParams {
+					text_document: TextDocumentItem {
+						uri: uri.clone(),
+						language_id: "nymph".into(),
+						version: 1,
+						text: "func main(): void = {}".into(),
+					},
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		assert_eq!(recv_diagnostics_for(&client, &uri).diagnostics.len(), 1);
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidCloseTextDocument::METHOD.into(),
+				serde_json::to_value(DidCloseTextDocumentParams {
+					text_document: TextDocumentIdentifier { uri: uri.clone() },
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		let cleared = recv_diagnostics_for(&client, &uri);
+		assert!(cleared.diagnostics.is_empty());
+		assert_eq!(cleared.version, None);
 		shutdown(&client, handle);
 	}
 

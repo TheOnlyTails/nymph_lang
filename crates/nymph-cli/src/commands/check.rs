@@ -25,7 +25,14 @@ impl NymphCommand for CheckCommand {
 	fn run(&self) -> i32 {
 		let is_entry = self.file.file_stem() == Some(std::ffi::OsStr::new("main"));
 
-		if let Some(project) = project_support::detect(&self.file) {
+		let project = match project_support::detect(&self.file) {
+			Ok(project) => project,
+			Err(error) => {
+				eprintln!("error: {error}");
+				return 1;
+			}
+		};
+		if let Some(project) = project {
 			let load = fs_loader(project.src_root);
 			let diagnostics = if is_entry {
 				nymph_compiler::check_project(&project.entry_key, &load)

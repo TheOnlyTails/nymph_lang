@@ -29,9 +29,15 @@ impl NymphCommand for BuildCommand {
 		// A bare file compiles as its own single-file project (rooted at its own
 		// directory), so it can `import std/…` and import siblings without a
 		// `nymph.toml` — see `project_support::single_file`.
-		if let Some(project) =
-			project_support::detect(&self.file).or_else(|| project_support::single_file(&self.file))
-		{
+		let project = match project_support::detect(&self.file) {
+			Ok(Some(project)) => Some(project),
+			Ok(None) => project_support::single_file(&self.file),
+			Err(error) => {
+				eprintln!("error: {error}");
+				return 1;
+			}
+		};
+		if let Some(project) = project {
 			let load = fs_loader(project.src_root);
 			let result = guarded(|| {
 				if is_entry {

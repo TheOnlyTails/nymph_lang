@@ -49,6 +49,7 @@ pub struct CompilerState {
 	synchronized_roots: HashSet<PathBuf>,
 	documents: HashMap<Uri, DocumentIdentity>,
 	sources: HashMap<Uri, Arc<str>>,
+	manifest_errors: HashMap<Uri, String>,
 	diagnostic_targets: HashMap<String, HashSet<String>>,
 }
 
@@ -77,6 +78,7 @@ impl CompilerState {
 			synchronized_roots: HashSet::new(),
 			documents: HashMap::new(),
 			sources: HashMap::new(),
+			manifest_errors: HashMap::new(),
 			diagnostic_targets: HashMap::new(),
 		}
 	}
@@ -105,6 +107,7 @@ impl CompilerState {
 
 	pub fn close(&mut self, docs: &mut DocumentStore, uri: &Uri) -> anyhow::Result<Vec<Uri>> {
 		docs.close(uri);
+		self.manifest_errors.remove(uri);
 		let Some(identity) = self.documents.remove(uri) else {
 			return Ok(Vec::new());
 		};
@@ -170,6 +173,24 @@ impl CompilerState {
 			identity.entry.clone(),
 			!identity.without_prelude,
 		))
+	}
+
+	#[must_use]
+	pub fn has_manifest_error(&self, uri: &Uri) -> bool {
+		self.manifest_errors.contains_key(uri)
+	}
+
+	pub fn manifest_error_snapshot(&mut self, uri: &Uri) -> Option<(String, Vec<Uri>)> {
+		let message = self.manifest_errors.get(uri)?.clone();
+		let stale_targets = self
+			.diagnostic_targets
+			.remove(uri.as_str())
+			.into_iter()
+			.flatten()
+			.filter(|target| target != uri.as_str())
+			.filter_map(|target| target.parse().ok())
+			.collect();
+		Some((message, stale_targets))
 	}
 
 	pub fn diagnostics_snapshot(
@@ -281,12 +302,17 @@ impl CompilerState {
 		// not events; opening a file still overlays or adds its live source.
 		let path = workspace::uri_to_path(uri);
 		let (root, module, scan_disk) = match workspace::detect(&path) {
-			Some(project) => (
+			Err(error) => {
+				self.documents.remove(uri);
+				self.manifest_errors.insert(uri.clone(), error.to_string());
+				return Ok(());
+			}
+			Ok(Some(project)) => (
 				project.src_root,
 				ModulePath::new(project.entry_key).unwrap(),
 				true,
 			),
-			None => {
+			Ok(None) => {
 				let root = path
 					.parent()
 					.unwrap_or_else(|| std::path::Path::new("/"))
@@ -304,6 +330,7 @@ impl CompilerState {
 				(root, module, false)
 			}
 		};
+		self.manifest_errors.remove(uri);
 		let root = std::path::absolute(root)?;
 		let without_prelude = nymph_compiler::is_stdlib_source_path(&path);
 		let project = self
