@@ -897,10 +897,9 @@ pub(crate) fn ambient_core_analysis(
 			}
 		}
 		environment.set_resolved_imports(bindings);
-		nymph_sema::check_module_with_environment(
+		nymph_sema::check_module_with_owned_environment(
 			semantic_module.clone(),
-			ambient_identity(db, module),
-			&environment,
+			environment,
 			nymph_sema::EntryMode::Library,
 		)
 	} else {
@@ -910,10 +909,9 @@ pub(crate) fn ambient_core_analysis(
 			(*compiler_runtime_roles(db, registry)).clone(),
 		)
 		.expect("empty environment is valid");
-		let mut result = nymph_sema::check_module_with_environment(
+		let mut result = nymph_sema::check_module_with_owned_environment(
 			semantic_module.clone(),
-			ambient_identity(db, module),
-			&environment,
+			environment,
 			nymph_sema::EntryMode::Library,
 		);
 		let mut diagnostics = graph.diagnostics.to_vec();
@@ -2042,10 +2040,9 @@ pub(crate) fn interface_module_analysis<'db>(
 			.map(|(name, binding)| (name.clone(), binding.clone())),
 	);
 	environment.set_resolved_imports(bindings);
-	let result = nymph_sema::check_module_with_environment(
+	let result = nymph_sema::check_module_with_owned_environment(
 		Arc::new(parsed.tree.clone()),
-		module.identity(db),
-		&environment,
+		environment,
 		if key.mode(db) == nymph_sema::EntryMode::Entry
 			&& module.display_key(db) == key.entry(db).as_str()
 		{

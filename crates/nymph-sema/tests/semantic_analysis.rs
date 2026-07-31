@@ -8,7 +8,7 @@ use nymph_sema::{
 	ModuleInterface, ModuleOrigin, RecoveredDefinitionReference, RecoveredExportedDefinition,
 	RecoveredExportedImpl, RecoveredInterfaceType, RecoveredModuleInterface, SemanticAnalysis,
 	SemanticAvailability, SemanticEnvironment, TyKind, check_module, check_module_with_environment,
-	declared_headers, extract_module_interface,
+	check_module_with_owned_environment, declared_headers, extract_module_interface,
 };
 use nymph_syntax::parse_module;
 
@@ -102,15 +102,36 @@ fn environment_check_uses_imported_function_without_mutating_environment() {
 		},
 		other => panic!("expected function, got {other:?}"),
 	};
+	let module = Arc::new(parsed.tree);
 	let result = check_module_with_environment(
-		Arc::new(parsed.tree),
+		module.clone(),
 		current.clone(),
 		&environment,
 		EntryMode::Library,
 	);
+	assert_eq!(format!("{environment:?}"), before);
+	let owned = check_module_with_owned_environment(module, environment, EntryMode::Library);
 
 	assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
 	assert!(result.lowerable);
+	assert_eq!(result.diagnostics, owned.diagnostics);
+	assert_eq!(result.lowerable, owned.lowerable);
+	assert_eq!(
+		result.analysis.checked.semantic.local_definitions,
+		owned.analysis.checked.semantic.local_definitions
+	);
+	assert_eq!(
+		result.analysis.checked.semantic.local_implementations,
+		owned.analysis.checked.semantic.local_implementations
+	);
+	assert_eq!(
+		result.analysis.checked.semantic.local_inherent,
+		owned.analysis.checked.semantic.local_inherent
+	);
+	assert_eq!(
+		result.analysis.checked.semantic.compiler_runtime_roles,
+		owned.analysis.checked.semantic.compiler_runtime_roles
+	);
 	assert_eq!(
 		result
 			.analysis
@@ -118,7 +139,13 @@ fn environment_check_uses_imported_function_without_mutating_environment() {
 			.definition_target_of(answer_node),
 		Some(&function_id),
 	);
-	assert_eq!(format!("{environment:?}"), before);
+	assert_eq!(
+		result
+			.analysis
+			.annotations
+			.definition_target_of(answer_node),
+		owned.analysis.annotations.definition_target_of(answer_node)
+	);
 	assert_eq!(result.analysis.checked.semantic.local_definitions.start, 1);
 	assert_eq!(result.analysis.checked.semantic.local_definitions.end, 2);
 	assert_eq!(

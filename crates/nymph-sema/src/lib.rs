@@ -48,7 +48,8 @@ pub use annotate::{
 	Annotations, Checked, CheckedFacts, CheckedSemantic, DispatchKind, ExprInfo, IterMode, Resolution,
 };
 pub use check::{
-	EntryMode, check_module, check_module_entry, check_module_with_environment, check_program,
+	EntryMode, check_module, check_module_entry, check_module_with_environment,
+	check_module_with_owned_environment, check_program,
 };
 pub use def::{
 	AliasSig, DefData, DefKind, DefMap, DefOrigin, FieldSigMetadata, NamespaceMemberSig,

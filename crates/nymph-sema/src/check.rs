@@ -535,23 +535,96 @@ pub fn check_module_with_environment(
 	environment: &crate::SemanticEnvironment,
 	mode: EntryMode,
 ) -> crate::SemanticCheckResult {
+	check_module_with_environment_parts(
+		module,
+		identity,
+		environment.interner.clone(),
+		environment.imported.defs.clone(),
+		environment.imported.signatures.clone(),
+		environment.imported.interfaces.clone(),
+		environment.imported.implementations.clone(),
+		environment.imported.inherent.clone(),
+		environment.imported.external_abis.clone(),
+		environment.contains_recovery,
+		environment.compiler_runtime_roles.clone(),
+		environment.runtime_role_provenance,
+		mode,
+	)
+}
+
+/// Checks a module while consuming a freshly constructed semantic environment.
+///
+/// Unlike [`check_module_with_environment`], this moves the imported semantic fact
+/// arena into the checker instead of cloning it.
+pub fn check_module_with_owned_environment(
+	module: std::sync::Arc<Module>,
+	environment: crate::SemanticEnvironment,
+	mode: EntryMode,
+) -> crate::SemanticCheckResult {
+	let crate::SemanticEnvironment {
+		current: identity,
+		interner,
+		imported,
+		module_exports: _,
+		resolved_imports: _,
+		contains_recovery,
+		compiler_runtime_roles,
+		runtime_role_provenance,
+	} = environment;
+	let crate::ImportedFacts {
+		defs,
+		signatures,
+		interfaces,
+		implementations,
+		inherent,
+		external_abis,
+		definition_members: _,
+	} = imported;
+	check_module_with_environment_parts(
+		module,
+		identity,
+		interner,
+		defs,
+		signatures,
+		interfaces,
+		implementations,
+		inherent,
+		external_abis,
+		contains_recovery,
+		compiler_runtime_roles,
+		runtime_role_provenance,
+		mode,
+	)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_module_with_environment_parts(
+	module: std::sync::Arc<Module>,
+	identity: crate::ModuleIdentity,
+	interner: Interner,
+	imported_defs: DefMap,
+	imported_signatures: Signatures,
+	imported_interfaces: FxHashMap<DefId, crate::iface::InterfaceDef>,
+	imported_implementations: crate::iface::ImplRegistry,
+	imported_inherent: crate::members::InherentRegistry,
+	external_abis: FxHashMap<DefId, crate::ExternalAbi>,
+	contains_recovery: bool,
+	compiler_runtime_roles: crate::CompilerRuntimeRoles,
+	runtime_role_provenance: crate::environment::RuntimeRoleProvenance,
+	mode: EntryMode,
+) -> crate::SemanticCheckResult {
 	let mut diagnostics = Vec::new();
 	let headers = crate::declared_headers(identity.clone(), &module);
-	let definition_start = environment.imported.defs.defs.len();
-	let implementation_start = environment.imported.implementations.impls.len();
-	let inherent_start = environment.imported.inherent.impls.len();
-	let defs = build_def_map_on(
-		&module,
-		environment.imported.defs.clone(),
-		&mut diagnostics,
-		Some(&headers),
-	);
+	let definition_start = imported_defs.defs.len();
+	let implementation_start = imported_implementations.impls.len();
+	let inherent_start = imported_inherent.impls.len();
+	let defs = build_def_map_on(&module, imported_defs, &mut diagnostics, Some(&headers));
 	let mut checker = Checker::new(&module, defs, diagnostics);
-	checker.interner = environment.interner.clone();
-	checker.sigs = environment.imported.signatures.clone();
-	checker.interfaces = environment.imported.interfaces.clone();
-	checker.impls = environment.imported.implementations.clone();
-	checker.inherent = environment.imported.inherent.clone();
+	checker.interner = interner;
+	checker.sigs = imported_signatures;
+	checker.interfaces = imported_interfaces;
+	checker.impls = imported_implementations;
+	checker.inherent = imported_inherent;
 	let map_interface = |role: &crate::InterfaceRuntimeRole| {
 		Some((
 			checker.defs.by_stable(&role.interface)?,
@@ -559,24 +632,21 @@ pub fn check_module_with_environment(
 		))
 	};
 	checker.runtime_roles = crate::environment::LocalCompilerRuntimeRoles {
-		iterable: environment
-			.compiler_runtime_roles
+		iterable: compiler_runtime_roles
 			.iterable
 			.as_ref()
 			.and_then(map_interface),
-		iterator: environment
-			.compiler_runtime_roles
+		iterator: compiler_runtime_roles
 			.iterator
 			.as_ref()
 			.and_then(map_interface),
-		option: environment
-			.compiler_runtime_roles
+		option: compiler_runtime_roles
 			.option
 			.as_ref()
 			.and_then(|role| checker.defs.by_stable(&role.option)),
 	};
-	checker.stable_runtime_roles = environment.compiler_runtime_roles.clone();
-	checker.runtime_role_provenance = environment.runtime_role_provenance;
+	checker.stable_runtime_roles = compiler_runtime_roles;
+	checker.runtime_role_provenance = runtime_role_provenance;
 	let checked = check_module_from_parts(
 		mode,
 		checker,
@@ -585,12 +655,12 @@ pub fn check_module_with_environment(
 		inherent_start,
 		true,
 		Some(&identity),
-		environment.imported.external_abis.clone(),
+		external_abis,
 	);
 	let diagnostics: std::sync::Arc<[Diagnostic]> = checked.diags.into();
 	let facts = std::sync::Arc::new(checked.facts);
 	let annotations = std::sync::Arc::new(crate::ModuleAnnotations::from(facts.annotations.clone()));
-	let lowerable = !environment.contains_recovery
+	let lowerable = !contains_recovery
 		&& !diagnostics
 			.iter()
 			.any(nymph_diagnostics::Diagnostic::is_error);
