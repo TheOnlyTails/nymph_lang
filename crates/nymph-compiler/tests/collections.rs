@@ -5,7 +5,7 @@ use std::io::Write;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nymph_codegen::compile;
+use nymph_compiler::compile;
 
 fn emit_js(src: &str) -> String {
 	compile(src, "test").unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"))
