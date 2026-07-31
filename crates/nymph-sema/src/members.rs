@@ -866,7 +866,9 @@ impl<'m> Checker<'m> {
 		for i in 0..module.members.len() {
 			let Declaration::ImplFor {
 				generics,
+				mutable,
 				type_,
+				for_interface,
 				members,
 				..
 			} = &module.members[i]
@@ -878,6 +880,39 @@ impl<'m> Checker<'m> {
 			self.param_bound_details.clear();
 			self.record_param_bounds(generics, 0);
 			let self_ty = self.lower_type(type_);
+			let self_ty = if *mutable {
+				self.interner.mk_mut(self_ty)
+			} else {
+				self_ty
+			};
+			let bound_ty = self.strip_mut(self_ty);
+			if let crate::ty::TyKind::Param(param) = *self.interner.kind(bound_ty) {
+				let (interface_name, interface_args) = for_interface;
+				if let Some(interface) = self
+					.defs
+					.get(&interface_name.0)
+					.filter(|&definition| self.is_interface(definition))
+				{
+					let args = self
+						.align_args(interface, interface_args)
+						.into_iter()
+						.map(|(name, ty)| (name, self.subst(ty, &FxHashMap::default(), Some(self_ty))))
+						.collect();
+					self
+						.param_bounds
+						.entry(param)
+						.or_default()
+						.insert(0, interface);
+					self.param_bound_details.entry(param).or_default().insert(
+						0,
+						crate::iface::Bound {
+							ty: bound_ty,
+							interface,
+							args,
+						},
+					);
+				}
+			}
 			self.check_interface_impl_members(self_ty, members);
 			self.pop_params();
 		}

@@ -666,7 +666,11 @@ impl Checker<'_> {
 
 	/// Align an interface reference's generic arguments to the interface's parameter
 	/// names, lowering each argument type.
-	fn align_args(&mut self, interface: DefId, args: &[Spanned<GenericArg>]) -> Vec<(EcoString, Ty)> {
+	pub(crate) fn align_args(
+		&mut self,
+		interface: DefId,
+		args: &[Spanned<GenericArg>],
+	) -> Vec<(EcoString, Ty)> {
 		let names = self
 			.interfaces
 			.get(&interface)

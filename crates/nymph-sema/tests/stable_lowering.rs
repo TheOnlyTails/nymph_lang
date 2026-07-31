@@ -835,6 +835,187 @@ fn nominal_external_members_preserve_their_exact_attachment_placement() {
 }
 
 #[test]
+fn generic_blanket_external_lowers_to_its_exact_module_binding() {
+	let (artifacts, _, context) = materialized_fixture(
+		"interface Hash { func hash(): int }\nimpl<T> Hash for T { external(hash) func hash(): int }",
+	);
+	let artifact = artifacts
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "hash")
+		.expect("generic blanket external");
+	let definition = artifact.definition.clone();
+	let lowered = lower_runtime_definition(&context, Arc::new(artifact)).unwrap();
+	assert_eq!(lowered.definition(), &definition);
+	assert!(matches!(
+		lowered.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelExternal { abi, .. }
+			if matches!(&abi.callable, nymph_sema::ExternalCallable::Linked { module, symbol }
+				if module == "std/hash" && symbol == "hash")
+	));
+	assert_eq!(
+		lowered.placement(),
+		&nymph_sema::RuntimeAssemblyPlacement::Module(definition.module)
+	);
+}
+
+#[test]
+fn generic_blanket_body_and_dispatch_use_the_exact_module_binding() {
+	let (artifacts, interface, context) = materialized_fixture(
+		"interface Blanket { func target(): int\nfunc wrapper(): int }\nimpl<T> Blanket for T { func target(): int = 23\nfunc wrapper(): int = this.target() }\nfunc read(): int = 1.wrapper()",
+	);
+	let implementation = &interface.implementations[0];
+	let target = implementation
+		.member_slots
+		.iter()
+		.find(|slot| slot.name == "target")
+		.expect("target slot")
+		.member_id
+		.clone();
+	let wrapper = implementation
+		.member_slots
+		.iter()
+		.find(|slot| slot.name == "wrapper")
+		.expect("wrapper slot")
+		.member_id
+		.clone();
+	let artifact = artifacts
+		.iter()
+		.find(|artifact| artifact.definition == wrapper)
+		.expect("generic blanket body");
+	let lowered = lower_runtime_definition(&context, Arc::new(artifact.clone())).unwrap();
+	assert_eq!(lowered.definition(), &wrapper);
+	assert!(lowered.demands().contains(&target));
+	assert!(matches!(
+		lowered.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
+			if function.params == ["$self"]
+				&& matches!(&function.body, nymph_hir::hir::HirExpr::Call { callee, args }
+					if args.len() == 1
+						&& matches!(&**callee, nymph_hir::hir::HirExpr::Local(name) if name == "target"))
+	));
+	assert_eq!(
+		lowered.placement(),
+		&nymph_sema::RuntimeAssemblyPlacement::Module(wrapper.module.clone())
+	);
+
+	let read = artifacts
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "read")
+		.expect("blanket dispatch consumer");
+	let lowered = lower_runtime_definition(&context, Arc::new(read)).unwrap();
+	assert!(lowered.demands().contains(&wrapper));
+	assert!(matches!(
+		lowered.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
+			if matches!(&function.body, nymph_hir::hir::HirExpr::Call { callee, args }
+				if args.len() == 1
+					&& matches!(&**callee, nymph_hir::hir::HirExpr::Local(name) if name == "wrapper"))
+	));
+}
+
+#[test]
+fn generic_interface_extension_body_keeps_exact_identity_and_skips_absent_dispatch_case() {
+	let (artifacts, interface, context) = materialized_fixture(
+		"interface Comparable<Other> { func compare_to(other: Other): int }\nimpl<T> Comparable<Other = T> for T { func minmax(other: T): int = this.compare_to(other) }",
+	);
+	let implementation = &interface.implementations[0];
+	assert!(implementation.member_slots.is_empty());
+	let artifact = artifacts
+		.iter()
+		.find(|artifact| source_name(&artifact.definition) == "minmax")
+		.expect("generic interface extension body");
+	let definition = artifact.definition.clone();
+	let lowered = lower_runtime_definition(&context, Arc::new(artifact.clone())).unwrap();
+	assert_eq!(lowered.definition(), &definition);
+	assert!(matches!(
+		lowered.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
+			if function.params == ["$self", "other"]
+	));
+	assert_eq!(
+		lowered.placement(),
+		&nymph_sema::RuntimeAssemblyPlacement::Module(definition.module)
+	);
+}
+
+#[test]
+fn generic_interface_external_extension_keeps_exact_module_binding() {
+	let (artifacts, interface, context) = materialized_fixture(
+		"interface Hash { func hash(): int }\nimpl<T> Hash for T { external(hash) func fingerprint(): int }",
+	);
+	assert!(interface.implementations[0].member_slots.is_empty());
+	let artifact = artifacts
+		.iter()
+		.find(|artifact| source_name(&artifact.definition) == "fingerprint")
+		.expect("generic interface external extension");
+	let definition = artifact.definition.clone();
+	let lowered = lower_runtime_definition(&context, Arc::new(artifact.clone())).unwrap();
+	assert_eq!(lowered.definition(), &definition);
+	assert!(matches!(
+		lowered.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelExternal { abi, .. }
+			if matches!(&abi.callable, nymph_sema::ExternalCallable::Linked { module, symbol }
+				if module == "std/hash" && symbol == "hash")
+	));
+	assert_eq!(
+		lowered.placement(),
+		&nymph_sema::RuntimeAssemblyPlacement::Module(definition.module)
+	);
+}
+
+#[test]
+fn generic_blanket_materialized_default_uses_the_exact_module_binding() {
+	let (artifacts, interface, context) = materialized_fixture(
+		"interface Blanket { func blanket(): int = 23 }\nimpl<T> Blanket for T {}",
+	);
+	let member = interface.implementations[0].member_slots[0]
+		.member_id
+		.clone();
+	let artifact = artifacts
+		.iter()
+		.find(|artifact| artifact.definition == member)
+		.expect("materialized generic blanket default");
+	let lowered = lower_runtime_definition(&context, Arc::new(artifact.clone())).unwrap();
+	assert_eq!(lowered.definition(), &member);
+	assert!(matches!(
+		lowered.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
+			if function.params == ["$self"]
+	));
+	assert_eq!(
+		lowered.placement(),
+		&nymph_sema::RuntimeAssemblyPlacement::Module(member.module)
+	);
+}
+
+#[test]
+fn mutable_nominal_implementation_spellings_retain_the_exact_shell() {
+	for source in [
+		"interface Read { func read(): int }\nstruct Box(value: int)\nimpl Read for mut Box { func read(): int = 1 }",
+		"interface Read { func read(): int }\nstruct Box(value: int)\nimpl mut Read for Box { func read(): int = 1 }",
+	] {
+		let (artifacts, interface, context) = materialized_fixture(source);
+		let implementation = &interface.implementations[0];
+		let member = implementation.member_slots[0].member_id.clone();
+		let artifact = artifacts
+			.iter()
+			.find(|artifact| artifact.definition == member)
+			.expect("mutable nominal implementation member");
+		let lowered = lower_runtime_definition(&context, Arc::new(artifact.clone())).unwrap();
+		let InterfaceType::Mutable(inner) = &implementation.self_type else {
+			panic!("mutable implementation self type")
+		};
+		let InterfaceType::Named { definition, .. } = inner.as_ref() else {
+			panic!("mutable nominal implementation owner")
+		};
+		assert_eq!(
+			lowered.placement(),
+			&nymph_sema::RuntimeAssemblyPlacement::Shell(definition.clone())
+		);
+	}
+}
+
+#[test]
 fn first_class_interface_method_lowers_as_an_exact_receiver_bound_closure() {
 	let lowered = lower_named(
 		"interface Read { func read(value: int): int }\nstruct Box(value: int)\nimpl Read for Box { func read(value: int): int = this.value + value }\nfunc apply(box: Box): int = { let read = box.read read(1) }",
@@ -1657,6 +1838,45 @@ fn lowers_for_over_native_list_user_iterator_and_bounded_ranges_with_exact_modes
 	assert_protocol_for(lowered.fragment(), false);
 	let _resolved_implementation = &interface.implementations[0].member_slots[0].body_definition_id;
 	assert_eq!(lowered.demands(), []);
+}
+
+#[test]
+fn nominal_iterable_for_calls_the_attached_iter_member_on_its_receiver() {
+	let source = "enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nstruct Cursor\nimpl Iterator<int> for Cursor { mut func next(): Option<int> = None }\nstruct Values(cursor: Cursor)\nimpl Iterable<int> for Values { func iter(): Cursor = this.cursor }\nfunc each(values: Values): void = for (_ in values) { 0 }";
+	let (items, interface, context) = materialized_fixture(source);
+	let iter = interface
+		.implementations
+		.iter()
+		.flat_map(|implementation| implementation.member_slots.iter())
+		.find(|slot| slot.name == "iter")
+		.expect("Values Iterable::iter slot")
+		.member_id
+		.clone();
+	let each = items
+		.into_iter()
+		.find(|item| source_name(&item.definition) == "each")
+		.expect("each body");
+	let lowered = lower_runtime_definition(&context, Arc::new(each)).unwrap();
+	assert!(lowered.demands().contains(&iter));
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("expected each function")
+	};
+	let nymph_hir::hir::HirExpr::Block { stmts, .. } = &function.body else {
+		panic!("expected lowered for block")
+	};
+	assert!(matches!(
+		&stmts[0],
+		nymph_hir::hir::HirStmt::Let {
+			value: nymph_hir::hir::HirExpr::Call { callee, args },
+			..
+		} if args.is_empty()
+			&& matches!(
+				callee.as_ref(),
+				nymph_hir::hir::HirExpr::Field { recv, name }
+					if name == "iter"
+						&& matches!(recv.as_ref(), nymph_hir::hir::HirExpr::Local(value) if value == "values")
+			)
+	));
 }
 
 fn assert_protocol_for(fragment: &nymph_sema::LoweredHirFragment, inclusive: bool) {

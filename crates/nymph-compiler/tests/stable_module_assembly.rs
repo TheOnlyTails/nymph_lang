@@ -1134,3 +1134,47 @@ fn primitive_extension_bindings_do_not_collide_between_int_and_float() {
 	assert_ne!(helpers[0].name, helpers[1].name);
 	assert!(helpers.iter().all(|function| function.params[0] == "$self"));
 }
+
+#[test]
+fn generic_implementation_binding_does_not_collide_with_a_top_level_function() {
+	let mut session = CompilerSession::without_builtin_sources();
+	let project = ProjectId::new("generic-implementation-binding-collision");
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"interface Marker { func marker(): int }\nimpl<T> Marker for T { func helper(): int = 1 }\nfunc helper(): int = 2"
+			.into(),
+		SourceVersion(1),
+	);
+	let definitions = session
+		.runtime_definitions_for_test(
+			project.clone(),
+			main.clone(),
+			main.clone(),
+			EntryMode::Library,
+		)
+		.expect("generic implementation and top-level artifacts");
+	let helpers = definitions
+		.iter()
+		.filter(|artifact| match &artifact.definition.key {
+			DeclarationKey::TopLevel { name, .. } | DeclarationKey::Member { name, .. } => {
+				name == "helper"
+			}
+			_ => false,
+		})
+		.map(|artifact| {
+			session
+				.binding_name_for_test(
+					project.clone(),
+					main.clone(),
+					artifact.definition.clone(),
+					EntryMode::Library,
+				)
+				.expect("exact helper binding")
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(helpers.len(), 2);
+	assert_ne!(helpers[0], helpers[1]);
+	assert!(helpers.iter().any(|name| name.as_str().contains("$impl$i")));
+}

@@ -19,7 +19,11 @@ fn ambient_hash_interface_lowers_to_the_boxed_runtime_intrinsic() {
 	let js = compile("func value(): int = 1.hash()", "hash_ambient")
 		.expect("Hash should be available from the ambient ops prelude");
 	assert!(!js.contains("//#region std/option"), "{js}");
-	assert!(js.contains("return new NInt(1).hash()"), "{js}");
+	assert!(js.contains("return hash(new NInt(1))"), "{js}");
+	assert_eq!(
+		run("func value(): int = 1.hash()", "value()"),
+		"-1852055280"
+	);
 }
 
 /// Emit `src`, append a driver that logs `call`, run under Node, return

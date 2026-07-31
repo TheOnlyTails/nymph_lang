@@ -753,6 +753,36 @@ fn argful_bound_satisfying_argument_stays_clean() {
 	);
 }
 
+#[test]
+fn generic_impl_body_uses_its_implemented_interface_bound() {
+	assert_ok(
+		"interface Comparable<Other> { func compare_to(other: Other): int }
+		 impl<T> Comparable<Other = T> for T {
+		   func minmax(other: T): int = this.compare_to(other)
+		 }",
+	);
+}
+
+#[test]
+fn implemented_interface_bound_precedes_a_same_interface_constraint() {
+	assert_ok(
+		"interface Comparable<Other> { func compare_to(other: Other): int }
+		 impl<T: Comparable<Other = int>> Comparable<Other = T> for T {
+		   func minmax(other: T): int = this.compare_to(other)
+		 }",
+	);
+}
+
+#[test]
+fn generic_impl_body_substitutes_self_in_implemented_interface_arguments() {
+	assert_ok(
+		"interface Comparable<Other> { func compare_to(other: Other): int }
+		 impl<T> Comparable<Other = self> for T {
+		   func minmax(other: T): int = this.compare_to(other)
+		 }",
+	);
+}
+
 // ── Slice 4G-b: method own-generic & constructor bound enforcement ─────────
 //
 // Closes the remaining holes 4G's ledger documented: an inherent method's own

@@ -1457,9 +1457,6 @@ pub(crate) fn binding_name<'db>(
 		let nymph_sema::DeclarationKey::Implementation { header, .. } = &implementation.key else {
 			return Ok(None);
 		};
-		let Some(receiver) = primitive_header_tag(&header.self_type) else {
-			return Ok(None);
-		};
 		let environment = complete_interface(db, key, implementation).map_err(|_| {
 			nymph_sema::StableNameLookupError::MissingBinding {
 				definition: implementation.clone(),
@@ -1475,6 +1472,7 @@ pub(crate) fn binding_name<'db>(
 			.ok_or_else(|| nymph_sema::StableNameLookupError::MissingBinding {
 				definition: implementation.clone(),
 			})?;
+		let receiver = primitive_header_tag(&header.self_type).unwrap_or("impl");
 		Ok(Some(format!("{receiver}$i{local_ordinal}")))
 	};
 	let receiver = match &definition.key {
@@ -1488,7 +1486,7 @@ pub(crate) fn binding_name<'db>(
 		_ => None,
 	};
 	Ok(nymph_sema::EmittedBindingName::new(
-		if preserve || entry_main {
+		if (preserve || entry_main) && receiver.is_none() {
 			name.to_owned()
 		} else if let Some(receiver) = receiver {
 			format!("$m{tag}${receiver}${name}")
@@ -1559,10 +1557,41 @@ pub(crate) fn member_name<'db>(
 				nymph_sema::StableShapeRequest::Implementation((**owner).clone()),
 			) {
 				Ok(nymph_sema::StableShapeFact::Implementation(shape)) => shape
-					.member_slots
+					.members
 					.iter()
-					.find(|slot| slot.member_id == definition)
-					.map(|slot| slot.interface_member_id.clone()),
+					.find(|member| member.id == definition)
+					.and_then(|member| {
+						let interface = shape.interface.as_ref()?;
+						let Ok(nymph_sema::StableShapeFact::InterfaceShell(shell)) = stable_shape(
+							db,
+							key,
+							nymph_sema::StableShapeRequest::InterfaceShell(interface.clone()),
+						) else {
+							return None;
+						};
+						match shell
+							.members
+							.iter()
+							.find(|interface_member| interface_member.name == member.name)
+						{
+							Some(interface_member) if interface_member.kind == member.kind => shape
+								.member_slots
+								.iter()
+								.find(|slot| slot.member_id == definition)
+								.filter(|slot| slot.interface_member_id == interface_member.id)
+								.map(|_| interface_member.id.clone()),
+							Some(_) => None,
+							None
+								if shape
+									.member_slots
+									.iter()
+									.all(|slot| slot.member_id != definition) =>
+							{
+								Some(definition.clone())
+							}
+							None => None,
+						}
+					}),
 				_ => None,
 			}
 		}
