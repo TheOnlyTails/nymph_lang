@@ -2057,6 +2057,67 @@ fn lowers_for_over_native_list_user_iterator_and_bounded_ranges_with_exact_modes
 }
 
 #[test]
+fn generic_iterable_for_retains_member_dispatch_without_a_template_runtime_demand() {
+	let source = "enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\nstruct Cursor\nimpl Iterator<int> for Cursor { mut func next(): Option<int> = None }\ninterface Iterable<Item> { func iter(): Cursor = Cursor() }\nfunc each<T: Iterable<Item = int>>(values: T): void = for (_ in values) { 0 }";
+	let (items, _, context) = materialized_fixture(source);
+	let iter = items
+		.iter()
+		.find(|item| source_name(&item.definition) == "iter")
+		.expect("template iter body");
+	let template = lower_runtime_definition(&context, Arc::new(iter.clone())).unwrap();
+	assert!(matches!(
+		template.placement(),
+		nymph_sema::RuntimeAssemblyPlacement::Template
+	));
+	let mut each = items
+		.into_iter()
+		.find(|item| source_name(&item.definition) == "each")
+		.expect("each body");
+	let lowered = lower_runtime_definition(&context, Arc::new(each.clone())).unwrap();
+	assert!(lowered.demands().is_empty());
+	assert!(lowered.direct_demands().is_empty());
+	assert!(lowered.routed_demands().is_empty());
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("expected each function")
+	};
+	let nymph_hir::hir::HirExpr::Block { stmts, .. } = &function.body else {
+		panic!("expected lowered for block")
+	};
+	assert!(matches!(
+		&stmts[0],
+		nymph_hir::hir::HirStmt::Let {
+			value: nymph_hir::hir::HirExpr::Call { callee, args },
+			..
+		} if args.is_empty()
+			&& matches!(
+				callee.as_ref(),
+				nymph_hir::hir::HirExpr::Field { recv, name }
+					if name == "iter"
+						&& matches!(recv.as_ref(), nymph_hir::hir::HirExpr::Local(value) if value == "values")
+			)
+	));
+	let nymph_sema::RuntimePayload::NymphBody(body) = &mut each.payload else {
+		panic!("expected checked each body")
+	};
+	let mut iterations = body.annotations.iterations.to_vec();
+	let nymph_sema::RuntimeIteration::ViaIter {
+		iter_interface_member,
+		next,
+		..
+	} = &mut iterations[0].1
+	else {
+		panic!("expected generic Iterable iteration")
+	};
+	*iter_interface_member = next.clone();
+	body.annotations.iterations = iterations.into();
+	assert!(matches!(
+		lower_runtime_definition(&context, Arc::new(each)),
+		Err(nymph_sema::StableLoweringError::InvalidArtifact { reason, .. })
+			if reason == "generic-bound iteration identities disagree"
+	));
+}
+
+#[test]
 fn nominal_iterable_for_calls_the_attached_iter_member_on_its_receiver() {
 	let source = "enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nstruct Cursor\nimpl Iterator<int> for Cursor { mut func next(): Option<int> = None }\nstruct Values(cursor: Cursor)\nimpl Iterable<int> for Values { func iter(): Cursor = this.cursor }\nfunc each(values: Values): void = for (_ in values) { 0 }";
 	let (items, interface, context) = materialized_fixture(source);

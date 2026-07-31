@@ -3695,10 +3695,22 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		iterator_interface: &DefinitionId,
 		next: &DefinitionId,
 	) -> Result<(), StableLoweringError> {
+		if let crate::StableDispatch::GenericBound { interface, member } = iter
+			&& (interface != iterable_interface || member != iter_interface_member)
+		{
+			return Err(invalid(
+				&self.artifact.definition,
+				"generic-bound iteration identities disagree",
+			));
+		}
 		let selected = match iter {
 			crate::StableDispatch::SelectedImplementation { implementation, .. }
 			| crate::StableDispatch::InterfaceDefault { implementation, .. }
 			| crate::StableDispatch::Direct { implementation, .. } => Some(implementation.clone()),
+			crate::StableDispatch::GenericBound { member, .. } => self
+				.implementation_slots
+				.and_then(|slots| slots.target(member))
+				.map(|slot| slot.implementation_id.clone()),
 			crate::StableDispatch::Builtin { .. } => {
 				let request = StableShapeRequest::ImplementationsForInterface(iterable_interface.clone());
 				let StableShapeFact::Implementations(implementations) =
@@ -3770,6 +3782,32 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					iterable_interface,
 					&slot.member_id,
 					slot.source,
+					materialization,
+				)?;
+			}
+			crate::StableDispatch::GenericBound { interface, member } => {
+				let selected = self
+					.implementation_slots
+					.and_then(|slots| slots.target(member))
+					.ok_or_else(|| {
+						invalid(
+							&self.artifact.definition,
+							"missing exact generic-bound iteration slot",
+						)
+					})?;
+				let materialization = if selected.external {
+					crate::DispatchMaterialization::ExternalAbi
+				} else if selected.source == crate::ImplementationMemberSource::InheritedDefault {
+					crate::DispatchMaterialization::CanonicalBody
+				} else {
+					crate::DispatchMaterialization::Attached
+				};
+				validate_dispatch_slot(
+					self.context,
+					&shape,
+					interface,
+					&slot.member_id,
+					selected.source,
 					materialization,
 				)?;
 			}
@@ -3903,15 +3941,61 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				)?;
 				Some(slot.member_id.clone())
 			}
+			crate::StableDispatch::GenericBound { interface, member } => {
+				let Some(slot) = self
+					.implementation_slots
+					.and_then(|slots| slots.target(member))
+				else {
+					return Ok(HirExpr::Call {
+						callee: Box::new(HirExpr::Field {
+							recv: Box::new(receiver),
+							name: self.context.member_name(member)?.as_str().into(),
+						}),
+						args: vec![],
+					});
+				};
+				let request = StableShapeRequest::Implementation(slot.implementation_id.clone());
+				let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
+					return Err(StableShapeLookupError::WrongFact { request }.into());
+				};
+				let materialization = if slot.external {
+					crate::DispatchMaterialization::ExternalAbi
+				} else if slot.source == crate::ImplementationMemberSource::InheritedDefault {
+					crate::DispatchMaterialization::CanonicalBody
+				} else {
+					crate::DispatchMaterialization::Attached
+				};
+				validate_dispatch_slot(
+					self.context,
+					&shape,
+					interface,
+					&slot.member_id,
+					slot.source,
+					materialization,
+				)?;
+				Some(slot.member_id.clone())
+			}
 			_ => None,
 		};
 		let target = concrete.as_ref().unwrap_or(member);
-		self.demand_external(target)?;
+		if concrete.is_some() || !matches!(dispatch, crate::StableDispatch::GenericBound { .. }) {
+			self.demand_external(target)?;
+		}
 		let shellless = match dispatch {
 			crate::StableDispatch::Direct { implementation, .. }
 			| crate::StableDispatch::SelectedImplementation { implementation, .. }
 			| crate::StableDispatch::InterfaceDefault { implementation, .. } => {
 				shellless_implementation_member(self.context, target, implementation)?
+			}
+			crate::StableDispatch::GenericBound { member, .. } => {
+				if let Some(slot) = self
+					.implementation_slots
+					.and_then(|slots| slots.target(member))
+				{
+					shellless_implementation_member(self.context, target, &slot.implementation_id)?
+				} else {
+					false
+				}
 			}
 			_ => false,
 		};
