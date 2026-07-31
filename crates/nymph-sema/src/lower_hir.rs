@@ -3787,19 +3787,41 @@ impl<'a> Lowerer<'a> {
 				body,
 				..
 			} => self.lower_for(variable, iterable, body),
-			// A range reached HERE is in ordinary VALUE position — not consumed
-			// directly as a `for`-loop source (that shape is special-cased inside
-			// `lower_for`, which destructures the iterable's `ExprKind::Range`
-			// itself before ever calling `lower_expr` on it). Nothing in the
-			// language can consume a first-class range value today (Slice 4H
-			// investigation: match-range patterns test bounds against the
-			// scrutinee, never a range object; the checker types a value-position
-			// range as an unconstrained fresh inference variable that unifies with
-			// anything, so miscompiling it silently is the worst possible
-			// outcome). Panic loudly rather than invent an unused object ABI.
-			ExprKind::Range(_) => panic!(
-				"slice-4h lowering: range expressions are only supported as for-loop sources, not as a general value"
-			),
+			// Direct `for` sources are handled by `lower_for`; every other range
+			// expression constructs the corresponding canonical stdlib value.
+			ExprKind::Range(kind) => {
+				use nymph_ast::expr::RangeKind;
+				let (class, fields) = match kind {
+					RangeKind::From(start) => ("RangeFrom", vec![("start".into(), self.lower_expr(start))]),
+					RangeKind::To(end) => ("RangeTo", vec![("end".into(), self.lower_expr(end))]),
+					RangeKind::ToInclusive(end) => (
+						"RangeToInclusive",
+						vec![("end".into(), self.lower_expr(end))],
+					),
+					RangeKind::Exclusive { min, max } => (
+						"Range",
+						vec![
+							("start".into(), self.lower_expr(min)),
+							("end".into(), self.lower_expr(max)),
+						],
+					),
+					RangeKind::Inclusive { min, max } => (
+						"RangeInclusive",
+						vec![
+							("start".into(), self.lower_expr(min)),
+							("end".into(), self.lower_expr(max)),
+						],
+					),
+				};
+				self
+					.runtime_struct_demands
+					.borrow_mut()
+					.insert(class.into());
+				HirExpr::New {
+					class: class.into(),
+					fields,
+				}
+			}
 			// A closure expression (Slice 4L, JJ1). `generics` is always empty (both
 			// parse paths — the paren form and the single-ident form — hardcode
 			// `Vec::new()` for it), and `return_type` is consumed only by the
