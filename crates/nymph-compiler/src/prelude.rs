@@ -7,12 +7,11 @@
 //! (`Plus`, `Comparable`, `Equals`, …, plus the inline `Order` enum),
 //! `Default`, `Option`, `Result`, the `Option`/`Result` conversions
 //! (`convert.nym`), `Iterator`, `Iterable`, and the `Range` family. Each of
-//! these `stdlib/src/**` files is embedded into the binary via `include_str!`
-//! and parsed once, lazily, behind a [`OnceLock`]; every call to
-//! [`crate::check`]/[`crate::compile`] (and their entry-mode counterparts, and
-//! the project driver's per-module prelude slice) reuses the same parsed
-//! `Vec<Module>` (checking clones and offsets each entry per call — see
-//! `nymph_sema::check_module_with_prelude` — so sharing the parse is safe).
+//! these `stdlib/src/**` files is embedded into the binary via `include_str!`.
+//! The project driver keeps each ambient module as its own Salsa input and
+//! query key, while exact canonical source bytes reuse an independently cached
+//! immutable parse. The legacy flattened-prelude path retains its own parsed
+//! `Vec<Module>` cache.
 //!
 //! `nymph-sema` deliberately does *not* depend on `nymph-syntax` (a heavyweight
 //! parser dependency an otherwise dependency-light checker crate has no other
@@ -80,12 +79,26 @@ const CORE_SOURCES: &[(&str, &str)] = &[
 	),
 ];
 
+pub(crate) const CORE_SOURCE_COUNT: usize = CORE_SOURCES.len();
+
 /// Embedded ambient-core sources keyed in their compiler-private namespace.
 /// Keys are canonical, extension-less paths relative to the core root.
 pub(crate) fn core_sources() -> impl ExactSizeIterator<Item = (&'static str, &'static str)> {
 	CORE_SOURCES
 		.iter()
 		.map(|(display, source)| (display.strip_prefix("std/").unwrap(), *source))
+}
+
+/// Return the stable slot and exact embedded bytes for one canonical ambient
+/// module. Callers must compare the bytes before reusing canonical derived data:
+/// test support can replace an ambient source while retaining the same key.
+pub(crate) fn core_source(path: &str) -> Option<(usize, &'static str)> {
+	CORE_SOURCES
+		.iter()
+		.enumerate()
+		.find_map(|(index, (display, source))| {
+			(display.strip_prefix("std/") == Some(path)).then_some((index, *source))
+		})
 }
 
 static CORE_PRELUDE: OnceLock<Vec<Module>> = OnceLock::new();

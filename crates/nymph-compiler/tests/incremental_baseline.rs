@@ -106,6 +106,11 @@ fn tiny_check_records_cold_query_demand_and_fully_backdates() {
 	]
 	.map(|query| (query, count(&first_events, query, None)));
 	eprintln!("tiny check ambient-core query counts: {ambient_counts:?}");
+	assert_eq!(
+		count(&first_events, "ambient_core_parse", None),
+		session.ambient_core_module_keys().len(),
+		"canonical parse reuse must preserve one Salsa parse query per ambient module"
+	);
 
 	events.lock().unwrap().clear();
 	let diagnostics = session.check_project(project, entry, EntryMode::Library);

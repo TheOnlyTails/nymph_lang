@@ -698,11 +698,23 @@ pub(crate) fn parse(db: &dyn Db, module: ModuleInput) -> Arc<ParsedModule> {
 #[salsa::tracked]
 pub(crate) fn parse_builtin(db: &dyn Db, module: BuiltinModuleInput) -> Arc<ParsedModule> {
 	let key = module.key(db);
-	let prefix = match key.domain {
-		BuiltinModuleDomain::ImportableStd => "std",
-		BuiltinModuleDomain::AmbientCore => "core",
-	};
-	parse_source(module.source(db), format!("{prefix}::{}.nym", key.path))
+	let source = module.source(db);
+	match key.domain {
+		BuiltinModuleDomain::ImportableStd => parse_source(source, format!("std::{}.nym", key.path)),
+		BuiltinModuleDomain::AmbientCore => {
+			let path = format!("core::{}.nym", key.path);
+			if let Some((index, canonical)) = crate::prelude::core_source(&key.path)
+				&& source.as_ref() == canonical
+			{
+				static PARSED: [std::sync::OnceLock<Arc<ParsedModule>>; crate::prelude::CORE_SOURCE_COUNT] =
+					[const { std::sync::OnceLock::new() }; crate::prelude::CORE_SOURCE_COUNT];
+				return PARSED[index]
+					.get_or_init(|| parse_source(Arc::from(canonical), path))
+					.clone();
+			}
+			parse_source(source, path)
+		}
+	}
 }
 
 fn parse_source(source: Arc<str>, path: String) -> Arc<ParsedModule> {
@@ -2507,6 +2519,7 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 mod tests {
 	use nymph_ast::Span;
 	use nymph_sema::EntryMode;
+	use salsa::Setter;
 
 	use super::*;
 	use crate::project::session::{BuiltinRegistryInput, ProjectId};
@@ -2807,5 +2820,51 @@ mod tests {
 			parse_builtin(&db, builtin).tree.path.as_str(),
 			"std::custom.nym"
 		);
+	}
+
+	#[test]
+	fn canonical_ambient_parse_is_shared_but_mutations_fall_back() {
+		fn option_input(db: &TestDb, source: Arc<str>) -> BuiltinModuleInput {
+			BuiltinModuleInput::new(
+				db,
+				BuiltinModuleKey {
+					domain: BuiltinModuleDomain::AmbientCore,
+					path: Arc::from("option"),
+				},
+				source,
+			)
+		}
+
+		let (_, canonical_source) = crate::prelude::core_source("option").unwrap();
+		let db_a = TestDb {
+			storage: salsa::Storage::default(),
+		};
+		let input_a = option_input(&db_a, Arc::from(canonical_source));
+		let canonical_a = parse_builtin(&db_a, input_a).clone();
+		assert_eq!(
+			canonical_a,
+			parse_source(Arc::from(canonical_source), "core::option.nym".into())
+		);
+
+		let mut db_b = TestDb {
+			storage: salsa::Storage::default(),
+		};
+		let input_b = option_input(&db_b, Arc::from(canonical_source));
+		let canonical_b = parse_builtin(&db_b, input_b).clone();
+		assert!(Arc::ptr_eq(&canonical_a, &canonical_b));
+
+		let malformed: Arc<str> = Arc::from("public enum Option<T> {");
+		input_b.set_source(&mut db_b).to(malformed.clone());
+		let changed = parse_builtin(&db_b, input_b).clone();
+		assert!(!Arc::ptr_eq(&canonical_a, &changed));
+		assert_eq!(changed, parse_source(malformed, "core::option.nym".into()));
+		assert!(!changed.diagnostics.is_empty());
+		assert_eq!(changed.tree.path.as_str(), "core::option.nym");
+
+		input_b
+			.set_source(&mut db_b)
+			.to(Arc::from(canonical_source));
+		let restored = parse_builtin(&db_b, input_b).clone();
+		assert!(Arc::ptr_eq(&canonical_a, &restored));
 	}
 }
