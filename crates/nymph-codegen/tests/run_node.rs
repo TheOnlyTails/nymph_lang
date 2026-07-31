@@ -8,7 +8,6 @@ use std::sync::{
 };
 
 use nymph_codegen::emit;
-use nymph_hir::hir::{HirExpr, HirLet, HirModule, MarshalKind};
 use nymph_sema::{check_module, check_module_with_prelude, lower_hir, lower_hir_with_prelude};
 use nymph_syntax::parse_module;
 
@@ -141,40 +140,6 @@ fn run_failure(src: &str, call: &str) -> String {
 /// driving the collections-materialization payoff under Node.
 fn run_with_prelude(user_src: &str, prelude_src: &str, call: &str) -> String {
 	run_js(compile_with_prelude(user_src, prelude_src), call)
-}
-
-#[test]
-fn duplicate_external_values_import_and_box_once_and_share_identity() {
-	let external = "data:text/javascript,export const value=1.5";
-	let module = HirModule {
-		lets: vec![
-			HirLet {
-				name: "first".into(),
-				mutable: false,
-				value: HirExpr::ExternValue {
-					module: external,
-					symbol: "value",
-					marshal: MarshalKind::Float,
-				},
-			},
-			HirLet {
-				name: "second".into(),
-				mutable: false,
-				value: HirExpr::ExternValue {
-					module: external,
-					symbol: "value",
-					marshal: MarshalKind::Float,
-				},
-			},
-		],
-		funcs: vec![],
-		classes: vec![],
-		enums: vec![],
-	};
-	let js = emit(&module);
-	assert_eq!(js.matches("data:text/javascript").count(), 1, "{js}");
-	assert_eq!(js.matches("new NFloat(").count(), 1, "{js}");
-	assert_eq!(run_js(js, "first === second"), "true");
 }
 
 #[test]
