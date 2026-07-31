@@ -1801,6 +1801,17 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			self.lower(expr)
 		}
 	}
+	fn lower_branch(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
+		if let StableExprKind::Return { value, label: None } = &expr.kind {
+			return Ok(HirExpr::Block {
+				stmts: vec![HirStmt::Return(
+					value.as_ref().map(|value| self.lower(value)).transpose()?,
+				)],
+				tail: None,
+			});
+		}
+		self.lower(expr)
+	}
 	fn lower(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
 		if let Some((_, arity)) = self
 			.annotations
@@ -2257,10 +2268,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				otherwise,
 			} => HirExpr::If {
 				cond: Box::new(self.lower(condition)?),
-				then: Box::new(self.lower(then)?),
+				then: Box::new(self.lower_branch(then)?),
 				otherwise: otherwise
 					.as_ref()
-					.map(|value| self.lower(value).map(Box::new))
+					.map(|value| self.lower_branch(value).map(Box::new))
 					.transpose()?,
 			},
 			StableExprKind::While {
@@ -2269,7 +2280,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				label: None,
 			} => HirExpr::While {
 				cond: Box::new(self.lower(condition)?),
-				body: Box::new(self.lower(body)?),
+				body: Box::new(self.lower_branch(body)?),
 			},
 			StableExprKind::Closure { params, body, .. } => {
 				self.scopes.borrow_mut().push(HashMap::new());

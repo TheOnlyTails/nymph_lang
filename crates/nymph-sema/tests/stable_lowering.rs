@@ -224,6 +224,37 @@ fn stable_lowering_preserves_contextual_integer_literal_kinds() {
 }
 
 #[test]
+fn stable_lowering_accepts_unbraced_return_branches() {
+	for source in [
+		"func value(flag: boolean): int = { if (flag) return 1\n2 }",
+		"func value(flag: boolean): int = { while (flag) return 1\n2 }",
+	] {
+		let lowered = lower_named(source, "value");
+		let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+			panic!("expected function fragment")
+		};
+		let nymph_hir::hir::HirExpr::Block { stmts, .. } = &function.body else {
+			panic!("expected function block")
+		};
+		let nymph_hir::hir::HirStmt::Expr(branch) = &stmts[0] else {
+			panic!("expected branch statement")
+		};
+		let body = match branch {
+			nymph_hir::hir::HirExpr::If { then, .. } => then.as_ref(),
+			nymph_hir::hir::HirExpr::While { body, .. } => body.as_ref(),
+			_ => panic!("expected if or while branch"),
+		};
+		assert!(matches!(
+			body,
+			nymph_hir::hir::HirExpr::Block {
+				stmts,
+				tail: None,
+			} if matches!(stmts.as_slice(), [nymph_hir::hir::HirStmt::Return(Some(_))])
+		));
+	}
+}
+
+#[test]
 fn implementation_header_generic_body_receiver_has_canonical_type_annotation() {
 	let source = "impl<T> #[T] { func first(): T = { let result = this\nresult[0] } }";
 	let (artifacts, interface) = artifacts_and_interface(source);
