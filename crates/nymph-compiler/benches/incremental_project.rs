@@ -1,219 +1,485 @@
 use std::{
-	alloc::{GlobalAlloc, Layout, System},
+	collections::{BTreeMap, BTreeSet, HashSet},
 	hint::black_box,
-	sync::atomic::{AtomicUsize, Ordering},
+	sync::{Arc, Mutex},
 };
 
-use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use nymph_compiler::{
-	check_project_library, compile_project_library,
-	project::{GraphFixture, GraphShape, PhaseCounts, with_phase_counts},
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
+use nymph_compiler::project::{
+	CompilerSession, GraphShape, ModulePath, ProjectId, SemanticQueryEvent, SourceVersion,
 };
+use nymph_sema::{DeclarationKey, DefinitionId, EntryMode};
 
-struct CountingAllocator;
-static RETAINED: AtomicUsize = AtomicUsize::new(0);
-static PEAK: AtomicUsize = AtomicUsize::new(0);
+type Events = Arc<Mutex<Vec<SemanticQueryEvent>>>;
+const PRIVATE_MODULE: &str = "mixed/branch_000/level_003";
 
-fn add_allocation(size: usize) {
-	let retained = RETAINED.fetch_add(size, Ordering::Relaxed) + size;
-	PEAK.fetch_max(retained, Ordering::Relaxed);
+#[derive(Clone, Copy, Debug)]
+enum Request {
+	Diagnostics,
+	AnalysisTypeAt,
+	EmitProject,
+	FullCompile,
 }
 
-unsafe impl GlobalAlloc for CountingAllocator {
-	unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-		let pointer = unsafe { System.alloc(layout) };
-		if !pointer.is_null() {
-			add_allocation(layout.size());
+struct RetainedState {
+	session: CompilerSession,
+	project: ProjectId,
+	entry: ModulePath,
+	target: ModulePath,
+	type_offset: usize,
+	sources: BTreeMap<String, String>,
+}
+
+fn ordinary_sources() -> BTreeMap<String, String> {
+	let mut sources = GraphShape::Mixed { width: 4, depth: 4 }
+		.generate()
+		.sources()
+		.clone();
+	sources
+		.get_mut(PRIVATE_MODULE)
+		.unwrap()
+		.push_str("private func private_work(): int = 1\n");
+	sources
+}
+
+fn private_post_edit_sources() -> BTreeMap<String, String> {
+	let mut sources = ordinary_sources();
+	apply_private_edit(&mut sources);
+	sources
+}
+
+fn apply_private_edit(sources: &mut BTreeMap<String, String>) -> String {
+	let source = sources.get_mut(PRIVATE_MODULE).unwrap();
+	let after = source.replace(
+		"private func private_work(): int = 1",
+		"private func private_work(): int = 2",
+	);
+	assert_ne!(
+		*source, after,
+		"private edit marker must occur exactly once"
+	);
+	*source = after.clone();
+	after
+}
+
+// A real forwarding chain. Selective imports ensure each edge is semantically
+// consumed; inferred return types make the API signature edit propagate.
+fn public_edit_sources() -> BTreeMap<String, String> {
+	BTreeMap::from([
+		("api".into(), "public func value() = 1\n".into()),
+		(
+			"direct".into(),
+			"import @/api with (value)\npublic func direct() = value()\n".into(),
+		),
+		(
+			"transitive".into(),
+			"import @/direct with (direct)\npublic func transitive() = direct()\n".into(),
+		),
+		(
+			"main".into(),
+			"import @/transitive with (transitive)\npublic func root_value() = transitive()\n".into(),
+		),
+		("unrelated_a".into(), "public func a(): int = 1\n".into()),
+		(
+			"unrelated_b".into(),
+			"import @/unrelated_a with (a)\npublic func b() = a()\n".into(),
+		),
+	])
+}
+
+fn install_with(sources: BTreeMap<String, String>, session: CompilerSession) -> RetainedState {
+	let mut state = RetainedState {
+		session,
+		project: ProjectId::new("incremental-project-benchmark"),
+		entry: ModulePath::new("main").unwrap(),
+		target: ModulePath::new("main").unwrap(),
+		type_offset: 0,
+		sources,
+	};
+	for (path, source) in &state.sources {
+		state.session.set_source(
+			state.project.clone(),
+			ModulePath::new(path).unwrap(),
+			source.clone(),
+			SourceVersion(1),
+		);
+	}
+	let marker = "root_value(): int = 0";
+	state.type_offset = state.sources["main"]
+		.find(marker)
+		.map_or(0, |start| start + marker.rfind('0').unwrap());
+	state
+}
+
+fn install(sources: BTreeMap<String, String>) -> RetainedState {
+	// Timed states deliberately have no event callback: callback locking and
+	// event allocation must not contaminate Criterion measurements.
+	install_with(sources, CompilerSession::new())
+}
+
+fn instrumented(sources: BTreeMap<String, String>) -> (RetainedState, Events) {
+	let events = Arc::new(Mutex::new(Vec::new()));
+	let sink = events.clone();
+	let session = CompilerSession::with_detailed_event_callback_for_test(move |event| {
+		sink.lock().unwrap().push(event);
+	});
+	(install_with(sources, session), events)
+}
+
+fn request(state: &RetainedState, request: Request) -> usize {
+	match request {
+		Request::Diagnostics => {
+			let diagnostics = state.session.check_project(
+				state.project.clone(),
+				state.entry.clone(),
+				EntryMode::Library,
+			);
+			assert!(
+				diagnostics.is_empty(),
+				"benchmark fixture failed: {diagnostics:?}"
+			);
+			diagnostics.len()
 		}
-		pointer
-	}
-	unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-		RETAINED.fetch_sub(layout.size(), Ordering::Relaxed);
-		unsafe { System.dealloc(pointer, layout) }
-	}
-	unsafe fn realloc(&self, pointer: *mut u8, old: Layout, new_size: usize) -> *mut u8 {
-		let replacement = unsafe { System.realloc(pointer, old, new_size) };
-		if !replacement.is_null() {
-			if new_size >= old.size() {
-				add_allocation(new_size - old.size());
-			} else {
-				RETAINED.fetch_sub(old.size() - new_size, Ordering::Relaxed);
-			}
+		Request::AnalysisTypeAt => {
+			let analysis = state
+				.session
+				.analyze_module(
+					state.project.clone(),
+					state.entry.clone(),
+					state.target.clone(),
+					EntryMode::Library,
+				)
+				.expect("target must be reachable");
+			let ty = analysis.type_at(state.type_offset);
+			assert_eq!(ty.as_deref(), Some("int"));
+			ty.unwrap().len()
 		}
-		replacement
+		Request::EmitProject => state
+			.session
+			.emit_interface_project_for_test(
+				state.project.clone(),
+				state.entry.clone(),
+				EntryMode::Library,
+			)
+			.unwrap_or_else(|d| panic!("benchmark fixture failed: {d:?}"))
+			.module_sources
+			.len(),
+		Request::FullCompile => state
+			.session
+			.compile_interface_project_for_test(
+				state.project.clone(),
+				state.entry.clone(),
+				EntryMode::Library,
+			)
+			.unwrap_or_else(|d| panic!("benchmark fixture failed: {d:?}"))
+			.js
+			.len(),
 	}
 }
 
-#[global_allocator]
-static ALLOCATOR: CountingAllocator = CountingAllocator;
-
-fn check(fixture: &GraphFixture) -> usize {
-	let diags = check_project_library(fixture.entry(), &|key| fixture.load(key));
-	assert!(diags.is_empty(), "benchmark fixture failed: {diags:?}");
-	0
+fn fresh(_: Request) -> RetainedState {
+	install(ordinary_sources())
 }
 
-fn compile(fixture: &GraphFixture) -> usize {
-	compile_project_library(fixture.entry(), &|key| fixture.load(key))
-		.unwrap_or_else(|diags| panic!("benchmark fixture failed: {diags:?}"))
-		.js
-		.len()
+fn warm(kind: Request) -> RetainedState {
+	let state = install(ordinary_sources());
+	black_box(request(&state, kind));
+	state
 }
 
-fn measured(f: impl FnOnce() -> usize) -> (usize, usize) {
-	let baseline = RETAINED.load(Ordering::Relaxed);
-	PEAK.store(baseline, Ordering::Relaxed);
-	let generated = f();
-	let peak = PEAK.load(Ordering::Relaxed).saturating_sub(baseline);
-	black_box((generated, peak))
+fn private_edit() -> RetainedState {
+	let mut state = install(ordinary_sources());
+	black_box(request(&state, Request::FullCompile));
+	let after = apply_private_edit(&mut state.sources);
+	state.session.set_source(
+		state.project.clone(),
+		ModulePath::new(PRIVATE_MODULE).unwrap(),
+		after,
+		SourceVersion(2),
+	);
+	state
 }
 
-#[derive(Clone, Copy)]
-struct Case {
-	name: &'static str,
-	operation: fn(&GraphFixture) -> usize,
-	setup: fn(GraphShape) -> GraphFixture,
+fn fresh_private_post_edit() -> RetainedState {
+	install(private_post_edit_sources())
 }
 
-fn fresh(shape: GraphShape) -> GraphFixture {
-	shape.generate()
+fn public_edit() -> RetainedState {
+	let mut state = install(public_edit_sources());
+	black_box(request(&state, Request::Diagnostics));
+	let after = "public func value() = 1.0\n".to_string();
+	state.sources.insert("api".into(), after.clone());
+	state.session.set_source(
+		state.project.clone(),
+		ModulePath::new("api").unwrap(),
+		after,
+		SourceVersion(2),
+	);
+	state
 }
 
-fn prime_check(shape: GraphShape) -> GraphFixture {
-	let fixture = shape.generate();
-	check(&fixture);
-	fixture
+fn clear(events: &Events) {
+	events.lock().unwrap().clear();
 }
 
-fn prime_compile(shape: GraphShape) -> GraphFixture {
-	let fixture = shape.generate();
-	compile(&fixture);
-	fixture
+fn scoped_events(events: &[SemanticQueryEvent]) -> impl Iterator<Item = &SemanticQueryEvent> {
+	events.iter().filter(|event| event.module.is_some())
 }
 
-// This setup seam deliberately models replacement as prime -> mutate -> compile.
-// A later incremental session can be retained here without changing the measured closure.
-fn prime_then_replace_private(shape: GraphShape) -> GraphFixture {
-	let mut fixture = prime_compile(shape);
-	fixture.replace_private_leaf_body();
-	fixture
-}
-
-fn prime_then_replace_public(shape: GraphShape) -> GraphFixture {
-	let mut fixture = prime_compile(shape);
-	fixture.replace_public_leaf_signature();
-	fixture
-}
-
-fn median_peak(case: Case, shape: GraphShape) -> usize {
-	const SAMPLES: usize = 21;
-	let mut peaks = Vec::with_capacity(SAMPLES);
-	for _ in 0..SAMPLES {
-		let fixture = (case.setup)(shape);
-		let (_, peak) = measured(|| (case.operation)(&fixture));
-		peaks.push(peak);
+fn print_events(label: &str, events: &[SemanticQueryEvent]) {
+	for (scope, scoped) in [("scoped", true), ("global", false)] {
+		let mut summary = BTreeMap::<(String, String, String), usize>::new();
+		for event in events
+			.iter()
+			.filter(|event| event.module.is_some() == scoped)
+		{
+			let definition = event
+				.definition
+				.as_ref()
+				.map_or_else(|| "-".into(), |id| format!("{id:?}"));
+			*summary
+				.entry((
+					event.query.clone(),
+					event.module.clone().unwrap_or_else(|| "<global>".into()),
+					definition,
+				))
+				.or_default() += 1;
+		}
+		for ((query, module, definition), count) in summary {
+			eprintln!(
+				"AUDIT {label} scope={scope} query={query} module={module} definition={definition} count={count}"
+			);
+		}
 	}
-	peaks.sort_unstable();
-	peaks[SAMPLES / 2]
 }
 
-fn print_baseline(label: &str, case: Case, shape: GraphShape) {
-	let fixture = (case.setup)(shape);
-	let (generated, counts): (usize, PhaseCounts) = with_phase_counts(|| (case.operation)(&fixture));
-	let median_peak = median_peak(case, shape);
-	eprintln!(
-		"BASELINE {label}: generated_bytes={generated} retained_source_bytes={} median_peak_retained_bytes={median_peak} peak_samples=21 counts={counts:?}",
-		fixture.retained_bytes()
+fn audit_preflight() {
+	// Warm diagnostics and analysis must be fully backdated.
+	for kind in [Request::Diagnostics, Request::AnalysisTypeAt] {
+		let (state, events) = instrumented(ordinary_sources());
+		request(&state, kind);
+		clear(&events);
+		request(&state, kind);
+		let observed = events.lock().unwrap().clone();
+		print_events(&format!("warm-{kind:?}"), &observed);
+		assert!(
+			observed.is_empty(),
+			"warm {kind:?} executed queries: {observed:#?}"
+		);
+	}
+
+	// The fresh and retained post-edit cases share the exact source constructor,
+	// and must produce identical prebundle and bundled output.
+	let fresh = install(private_post_edit_sources());
+	let mut retained = install(ordinary_sources());
+	request(&retained, Request::FullCompile);
+	let after = apply_private_edit(&mut retained.sources);
+	retained.session.set_source(
+		retained.project.clone(),
+		ModulePath::new(PRIVATE_MODULE).unwrap(),
+		after,
+		SourceVersion(2),
+	);
+	assert_eq!(fresh.sources, retained.sources);
+	let fresh_emit = fresh
+		.session
+		.emit_interface_project_for_test(
+			fresh.project.clone(),
+			fresh.entry.clone(),
+			EntryMode::Library,
+		)
+		.unwrap();
+	let retained_emit = retained
+		.session
+		.emit_interface_project_for_test(
+			retained.project.clone(),
+			retained.entry.clone(),
+			EntryMode::Library,
+		)
+		.unwrap();
+	assert_eq!(fresh_emit.module_sources, retained_emit.module_sources);
+	let fresh_bundle = fresh
+		.session
+		.compile_interface_project_for_test(
+			fresh.project.clone(),
+			fresh.entry.clone(),
+			EntryMode::Library,
+		)
+		.unwrap();
+	let retained_bundle = retained
+		.session
+		.compile_interface_project_for_test(
+			retained.project.clone(),
+			retained.entry.clone(),
+			EntryMode::Library,
+		)
+		.unwrap();
+	assert_eq!(fresh_bundle.js, retained_bundle.js);
+
+	// Audit private invalidation using the same exact-definition pattern as the
+	// incremental_baseline tests.
+	let (mut private, private_events) = instrumented(ordinary_sources());
+	request(&private, Request::FullCompile);
+	let initial = private_events.lock().unwrap().clone();
+	let target_definition = scoped_events(&initial)
+		.filter(|event| {
+			event.query == "runtime_definition"
+				&& event.module.as_deref() == Some(PRIVATE_MODULE)
+				&& matches!(
+					&event.definition,
+					Some(DefinitionId {
+						key: DeclarationKey::TopLevel { name, .. },
+						..
+					}) if name == "private_work"
+				)
+		})
+		.filter_map(|event| event.definition.clone())
+		.collect::<HashSet<_>>();
+	assert_eq!(
+		target_definition.len(),
+		1,
+		"initial compile must identify exactly one private_work definition: {initial:#?}"
+	);
+	let target_definition = target_definition.into_iter().next().unwrap();
+	let project_modules = private.sources.keys().cloned().collect::<HashSet<_>>();
+	clear(&private_events);
+	let after = apply_private_edit(&mut private.sources);
+	private.session.set_source(
+		private.project.clone(),
+		ModulePath::new(PRIVATE_MODULE).unwrap(),
+		after,
+		SourceVersion(2),
+	);
+	request(&private, Request::FullCompile);
+	let edited = private_events.lock().unwrap().clone();
+	print_events("private-edit", &edited);
+	let analyzed = scoped_events(&edited)
+		.filter(|event| event.query == "interface_module_analysis")
+		.filter_map(|event| event.module.clone())
+		.collect::<BTreeSet<_>>();
+	assert_eq!(
+		analyzed,
+		BTreeSet::from([PRIVATE_MODULE.to_string()]),
+		"only the edited private module may rerun analysis: {edited:#?}"
+	);
+	for query in ["runtime_definition", "lower_runtime_definition"] {
+		let rerun = scoped_events(&edited)
+			.filter(|event| {
+				event.query == query
+					&& event
+						.module
+						.as_ref()
+						.is_some_and(|module| project_modules.contains(module))
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(
+			rerun.len(),
+			1,
+			"expected only private_work to rerun {query}: {edited:#?}"
+		);
+		assert_eq!(rerun[0].definition.as_ref(), Some(&target_definition));
+	}
+
+	let (mut public, public_events) = instrumented(public_edit_sources());
+	request(&public, Request::Diagnostics);
+	clear(&public_events);
+	let after = "public func value() = 1.0\n".to_string();
+	public.sources.insert("api".into(), after.clone());
+	public.session.set_source(
+		public.project.clone(),
+		ModulePath::new("api").unwrap(),
+		after,
+		SourceVersion(2),
+	);
+	request(&public, Request::Diagnostics);
+	let observed = public_events.lock().unwrap().clone();
+	print_events("public-signature", &observed);
+	let rechecked = scoped_events(&observed)
+		.filter(|e| e.query == "interface_module_analysis")
+		.filter_map(|e| e.module.clone())
+		.collect::<BTreeSet<_>>();
+	assert_eq!(
+		rechecked,
+		BTreeSet::from([
+			"api".into(),
+			"direct".into(),
+			"main".into(),
+			"transitive".into()
+		])
 	);
 }
 
-fn throughput(case: Case, shape: GraphShape) -> Throughput {
-	if case.name.contains("compile") || case.name.contains("leaf") {
-		let fixture = (case.setup)(shape);
-		Throughput::Bytes((case.operation)(&fixture) as u64)
-	} else {
-		Throughput::Elements(1)
-	}
-}
-
 fn incremental_project(c: &mut Criterion) {
-	for (shape_name, shape, cases) in [
+	audit_preflight();
+	let cases: &[(&str, fn() -> RetainedState, Request)] = &[
 		(
-			"single",
-			GraphShape::Single,
-			&[
-				Case {
-					name: "fresh-check",
-					operation: check,
-					setup: fresh,
-				},
-				Case {
-					name: "fresh-compile",
-					operation: compile,
-					setup: fresh,
-				},
-			][..],
+			"diagnostics/fresh",
+			|| fresh(Request::Diagnostics),
+			Request::Diagnostics,
 		),
-		("wide-16", GraphShape::Wide { leaves: 16 }, &CASES[..]),
-		("deep-16", GraphShape::Deep { depth: 16 }, &CASES[..]),
 		(
-			"mixed-4x4",
-			GraphShape::Mixed { width: 4, depth: 4 },
-			&CASES[..],
+			"diagnostics/warm",
+			|| warm(Request::Diagnostics),
+			Request::Diagnostics,
 		),
-	] {
-		let mut group = c.benchmark_group(shape_name);
-		for &case in cases {
-			print_baseline(&format!("{shape_name}/{}", case.name), case, shape);
-			group.throughput(throughput(case, shape));
-			group.bench_with_input(
-				BenchmarkId::new(case.name, shape_name),
-				&shape,
-				|b, shape| {
-					b.iter_batched(
-						|| (case.setup)(*shape),
-						|fixture| (case.operation)(black_box(&fixture)),
-						BatchSize::SmallInput,
-					);
-				},
+		(
+			"analysis-type-at/fresh",
+			|| fresh(Request::AnalysisTypeAt),
+			Request::AnalysisTypeAt,
+		),
+		(
+			"analysis-type-at/warm",
+			|| warm(Request::AnalysisTypeAt),
+			Request::AnalysisTypeAt,
+		),
+		(
+			"emit-project/fresh",
+			|| fresh(Request::EmitProject),
+			Request::EmitProject,
+		),
+		(
+			"emit-project/warm",
+			|| warm(Request::EmitProject),
+			Request::EmitProject,
+		),
+		(
+			"full-compile/fresh",
+			|| fresh(Request::FullCompile),
+			Request::FullCompile,
+		),
+		(
+			"full-compile/warm",
+			|| warm(Request::FullCompile),
+			Request::FullCompile,
+		),
+		(
+			"private-body/fresh-post-edit",
+			fresh_private_post_edit,
+			Request::FullCompile,
+		),
+		(
+			"private-body/incremental",
+			private_edit,
+			Request::FullCompile,
+		),
+		(
+			"public-signature/incremental-diagnostics",
+			public_edit,
+			Request::Diagnostics,
+		),
+	];
+	let mut group = c.benchmark_group("retained-session");
+	for &(label, setup, kind) in cases {
+		group.bench_function(BenchmarkId::from_parameter(label), |b| {
+			b.iter_batched_ref(
+				setup,
+				|state| black_box(request(black_box(state), kind)),
+				BatchSize::PerIteration,
 			);
-		}
-		group.finish();
+		});
 	}
+	group.finish();
 }
-
-const CASES: [Case; 6] = [
-	Case {
-		name: "fresh-check",
-		operation: check,
-		setup: fresh,
-	},
-	Case {
-		name: "fresh-compile",
-		operation: compile,
-		setup: fresh,
-	},
-	Case {
-		name: "unchanged-check",
-		operation: check,
-		setup: prime_check,
-	},
-	Case {
-		name: "unchanged-compile",
-		operation: compile,
-		setup: prime_compile,
-	},
-	Case {
-		name: "private-leaf-body",
-		operation: compile,
-		setup: prime_then_replace_private,
-	},
-	Case {
-		name: "public-leaf-signature",
-		operation: compile,
-		setup: prime_then_replace_public,
-	},
-];
 
 criterion_group!(benches, incremental_project);
 criterion_main!(benches);

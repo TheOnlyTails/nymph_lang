@@ -1,5 +1,9 @@
 # Incremental semantic baseline (pre-Salsa)
 
+> **Historical data only.** These numbers used stateless project facades and
+> cannot demonstrate retained-session incremental acceptance. Do not compare
+> their “unchanged” labels directly with the current benchmark.
+
 Captured 2026-07-25 with:
 
 ```text
@@ -43,3 +47,42 @@ Phase counts use `P/G/R/C/L/E/B` for parse, graph, rewrite, check, lower, emit, 
 | Mixed 4×4 | public leaf signature | 219.14 ms | 12,368 | 1,476 | 17,366,244 | 17/1/17/17/17/17/1 |
 
 The allocator measurement is process-wide rather than caller-thread-only, so allocations made by compiler work installed on Rayon workers are included. Each sample resets the counter to the current live-byte level immediately before the compiler operation; fixture creation, cloning, priming, and mutation are untimed setup and excluded from both timing and peak deltas. Replacement cases always prime the original state, mutate it, then compile the post-replacement state.
+
+## Current retained-session methodology (GitHub #80)
+
+`incremental_project` now keeps one `CompilerSession`, `ProjectId`, stable
+`ModulePath`s, deterministic source map, and `type_at` offset in every measured
+state. Timed sessions are ordinary sessions without callbacks; separate untimed
+instrumented states enforce the event audit. Setup/source edits and state drops
+are untimed (`iter_batched_ref` with `PerIteration`),
+and the exact request is primed before warm measurements. No measured warm or
+edit path calls a stateless facade.
+
+Labels are paired as `diagnostics/{fresh,warm}` and
+`analysis-type-at/{fresh,warm}`. Emission is split into
+`emit-project/{fresh,warm}` (prebundle graph) and
+`full-compile/{fresh,warm}` (including bundling). The private-body acceptance
+pair is `private-body/{fresh-post-edit,incremental}`: both receive byte-identical
+post-edit source, while only the latter retains and edits the original session.
+`public-signature/incremental-diagnostics` uses an explicit api → direct →
+transitive → main chain plus two installed unrelated modules.
+
+Before timing, strict assertions audit warm backdating, fresh/incremental source
+and output parity, exact private-definition runtime/lowering reruns, and the
+public-signature recheck set. Deterministically sorted scoped and global event
+summaries are printed separately and remain outside Criterion timing. Run paired
+labels in one process. Acceptance ratios are **fresh / warm >= 10** and
+**fresh-post-edit / incremental >= 3**, rather than comparing absolute values
+across machines:
+
+```sh
+CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo bench -p nymph-compiler \
+  --features test-support --bench incremental_project -- \
+  'retained-session/(diagnostics|analysis-type-at|emit-project|full-compile|private-body)'
+```
+
+The old phase counters and allocator peak deltas above remain informational
+pre-Salsa observations; they are not current acceptance metrics. In particular,
+the current `full-compile/fresh` case is not directly comparable to that
+historical baseline. A clean, exact baseline-compatible full-build comparison
+is still outstanding.
