@@ -706,6 +706,10 @@ fn stable_native_map_runtime_is_exact_collision_safe_and_runs_after_dependency_w
 			.module_sources
 			.contains_key("@nymph/runtime/iter/iterable")
 	);
+	assert!(
+		emitted.module_sources["@nymph/runtime/iter/iterable"].contains("next()"),
+		"the exact concrete iterator next attachment must survive dependency warmup"
+	);
 	assert!(!emitted.module_sources.contains_key("@nymph/runtime/result"));
 	let compiled = session
 		.compile_interface_project_for_test(project, main, EntryMode::Entry)
@@ -816,10 +820,10 @@ fn stable_native_range_runtime_is_exact_collision_safe_and_runs_after_dependency
 
 	let compiled = session
 		.compile_interface_project_for_test(project, main, EntryMode::Entry)
-		.expect("stable emission links only the Range, iterator, Option, and operator closure");
+		.expect("stable emission links only the direct Range loop and operator closure");
 	assert_eq!(
 		compiled.js.matches("NymphRange").count(),
-		1,
+		0,
 		"{}",
 		compiled.js
 	);

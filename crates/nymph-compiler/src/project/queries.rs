@@ -1814,7 +1814,7 @@ pub(crate) fn lower_interface_module<'db>(
 		.cloned()
 		.collect::<std::collections::VecDeque<_>>();
 	let mut seen = std::collections::HashSet::new();
-	let mut lowered = Vec::new();
+	let mut lowered: Vec<nymph_sema::LoweredRuntimeDefinition> = Vec::new();
 	while let Some(definition) = queue.pop_front() {
 		if !seen.insert(definition.clone()) {
 			continue;
@@ -1854,6 +1854,35 @@ pub(crate) fn lower_interface_module<'db>(
 			}
 		}
 		queue.extend(fragment.demands().iter().cloned());
+		// An Iterable implementation may intentionally erase its concrete return
+		// type behind Iterator. Once its body demands the exact iterator shell,
+		// resolve any deferred `next` call against that shell rather than widening
+		// the closure to every Iterator implementation.
+		for call in lowered
+			.iter()
+			.flat_map(|item| item.unresolved_calls())
+			.chain(fragment.unresolved_calls())
+		{
+			let nymph_sema::UnresolvedRuntimeCall::IteratorNext { interface, member } = call else {
+				continue;
+			};
+			let request = nymph_sema::StableShapeRequest::ImplementationsForInterface(interface.clone());
+			let Ok(nymph_sema::StableShapeFact::Implementations(implementations)) =
+				stable_shape(db, key, request)
+			else {
+				continue;
+			};
+			for implementation in implementations {
+				if matches!(
+					&implementation.self_type,
+					nymph_sema::InterfaceType::Named { definition: owner, .. }
+						if owner == &definition
+				) && let Some(slot) = implementation.member_slots.target(&member)
+				{
+					queue.push_back(slot.member_id.clone());
+				}
+			}
+		}
 		lowered.push(fragment.as_ref().clone());
 	}
 
