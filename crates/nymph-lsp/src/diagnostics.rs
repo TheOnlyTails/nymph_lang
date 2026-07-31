@@ -38,11 +38,14 @@ pub fn check_and_publish_state(
 	// compiler. Publication below holds neither mutex.
 	let docs_snapshot = docs.lock().unwrap().clone();
 	let mut compiler = compiler.lock().unwrap();
-	if let Some(message) = compiler.manifest_error_for_uri(uri).map(str::to_owned) {
+	if let Some((message, stale_targets)) = compiler.manifest_error_snapshot(uri) {
 		drop(compiler);
 		let Some(document) = docs_snapshot.get(uri) else {
 			return Ok(());
 		};
+		for stale_uri in stale_targets {
+			clear(connection, &stale_uri)?;
+		}
 		publish_manifest_error(connection, uri, &message, document.version)?;
 		return Ok(());
 	}
@@ -66,6 +69,10 @@ pub fn check_and_publish_state(
 		)?;
 	}
 	Ok(())
+}
+
+pub fn clear(connection: &Connection, uri: &Uri) -> anyhow::Result<()> {
+	publish(connection, uri, "", &[], None)
 }
 
 fn publish_manifest_error(

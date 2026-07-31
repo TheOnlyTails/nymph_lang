@@ -176,8 +176,21 @@ impl CompilerState {
 	}
 
 	#[must_use]
-	pub fn manifest_error_for_uri(&self, uri: &Uri) -> Option<&str> {
-		self.manifest_errors.get(uri).map(String::as_str)
+	pub fn has_manifest_error(&self, uri: &Uri) -> bool {
+		self.manifest_errors.contains_key(uri)
+	}
+
+	pub fn manifest_error_snapshot(&mut self, uri: &Uri) -> Option<(String, Vec<Uri>)> {
+		let message = self.manifest_errors.get(uri)?.clone();
+		let stale_targets = self
+			.diagnostic_targets
+			.remove(uri.as_str())
+			.into_iter()
+			.flatten()
+			.filter(|target| target != uri.as_str())
+			.filter_map(|target| target.parse().ok())
+			.collect();
+		Some((message, stale_targets))
 	}
 
 	pub fn diagnostics_snapshot(
