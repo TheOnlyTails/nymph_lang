@@ -204,10 +204,26 @@ struct Database {
 	semantic_test_hook: Arc<Mutex<SemanticTestHook>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl Clone for Database {
+	fn clone(&self) -> Self {
+		Self {
+			storage: self.storage.clone(),
+			#[cfg(feature = "test-support")]
+			semantic_test_hook: self.semantic_test_hook.clone(),
+		}
+	}
+}
+
 #[salsa::db]
 impl salsa::Database for Database {}
 #[salsa::db]
 impl Db for Database {
+	#[cfg(not(target_arch = "wasm32"))]
+	fn parallel_clone(&self) -> Box<dyn Db> {
+		Box::new(self.clone())
+	}
+
 	#[cfg(feature = "test-support")]
 	fn semantic_query_will_execute(&self, query: &'static str, module: SemanticModuleInput) {
 		let hook = self.semantic_test_hook.lock().unwrap();

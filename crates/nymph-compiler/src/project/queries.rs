@@ -5,6 +5,8 @@ use nymph_ast::{
 	decl::{Declaration, Module},
 };
 use nymph_diagnostics::Diagnostic;
+#[cfg(not(target_arch = "wasm32"))]
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use super::{
@@ -18,6 +20,9 @@ use super::{
 
 #[salsa::db]
 pub(crate) trait Db: salsa::Database {
+	#[cfg(not(target_arch = "wasm32"))]
+	fn parallel_clone(&self) -> Box<dyn Db>;
+
 	#[cfg(feature = "test-support")]
 	fn semantic_query_will_execute(&self, _query: &'static str, _module: SemanticModuleInput) {}
 	#[cfg(feature = "test-support")]
@@ -2199,6 +2204,49 @@ fn interface_module_diagnostics<'db>(
 	analysis.diagnostics.0.clone()
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+fn prewarm_interface_module_diagnostics(
+	db: &dyn Db,
+	key: super::session::ProjectKey<'_>,
+	modules: Vec<SemanticModuleInput>,
+) {
+	if modules.len() < 2 {
+		return;
+	}
+	static POOL: std::sync::OnceLock<rayon::ThreadPool> = std::sync::OnceLock::new();
+	let workers = modules
+		.iter()
+		.map(|_| db.parallel_clone())
+		.collect::<Vec<_>>();
+	// Salsa Storage clones share memo tables but have distinct local query stacks.
+	// The coordinator prevents the aggregate-query caller from helping this private
+	// pool and therefore from switching databases while its query stack is active.
+	let result = std::thread::scope(|scope| {
+		scope
+			.spawn(move || {
+				POOL
+					.get_or_init(|| {
+						rayon::ThreadPoolBuilder::new()
+							.thread_name(|index| format!("nymph-diagnostics-{index}"))
+							.build()
+							.expect("build diagnostics worker pool")
+					})
+					.install(|| {
+						workers
+							.into_par_iter()
+							.zip(modules.into_par_iter())
+							.for_each(|(worker, module)| {
+								interface_module_diagnostics(worker.as_ref(), key, module);
+							});
+					});
+			})
+			.join()
+	});
+	if let Err(payload) = result {
+		std::panic::resume_unwind(payload);
+	}
+}
+
 #[salsa::tracked(returns(clone))]
 pub(crate) fn interface_project_diagnostics<'db>(
 	db: &'db dyn Db,
@@ -2226,6 +2274,11 @@ pub(crate) fn interface_project_diagnostics<'db>(
 		}
 		return super::session::ProjectDiagnostics(diagnostics.into());
 	}
+	// Native cold builds evaluate independent branches through cloned Salsa handles.
+	// The serial fold remains authoritative for dependency registration and graph-order
+	// diagnostics. Non-threaded wasm skips prewarming and executes this fold directly.
+	#[cfg(not(target_arch = "wasm32"))]
+	prewarm_interface_module_diagnostics(db, key, graph.semantic_order.to_vec());
 	let mut all = Vec::new();
 	for module in graph.semantic_order.iter().copied() {
 		all.extend(
@@ -2444,7 +2497,12 @@ mod tests {
 	#[salsa::db]
 	impl salsa::Database for TestDb {}
 	#[salsa::db]
-	impl Db for TestDb {}
+	impl Db for TestDb {
+		#[cfg(not(target_arch = "wasm32"))]
+		fn parallel_clone(&self) -> Box<dyn Db> {
+			Box::new(self.clone())
+		}
+	}
 
 	#[test]
 	fn runtime_manifest_rejects_duplicate_exact_identities_with_a_typed_error() {

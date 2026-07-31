@@ -270,3 +270,111 @@ fn mixed_graph_has_stable_query_invalidation_and_output() {
 		"mixed/branch_000/level_003",
 	);
 }
+
+#[test]
+fn parallel_diamond_check_executes_each_module_once_and_preserves_diagnostic_order() {
+	let pool = rayon::ThreadPoolBuilder::new()
+		// The caller must not be recruited into the compiler's private diagnostics
+		// pool while its original Salsa query stack is attached.
+		.num_threads(1)
+		.build()
+		.unwrap();
+	pool.install(|| {
+		let sources = BTreeMap::from([
+			("leaf".into(), "public func leaf(): int = 1\n".into()),
+			(
+				"left".into(),
+				"import @/leaf with (leaf)\npublic func left(): int = \"left\"\n".into(),
+			),
+			(
+				"right".into(),
+				"import @/leaf with (leaf)\npublic func right(): int = \"right\"\n".into(),
+			),
+			(
+				"main".into(),
+				"import @/left with (left)\nimport @/right with (right)\npublic func value(): int = \"main\"\n"
+					.into(),
+			),
+		]);
+		let events = Arc::new(Mutex::new(Vec::<SemanticQueryEvent>::new()));
+		let sink = events.clone();
+		let mut session = CompilerSession::with_detailed_event_callback_for_test(move |event| {
+			sink.lock().unwrap().push(event)
+		});
+		let project = ProjectId::new("parallel-diamond");
+		let entry = ModulePath::new("main").unwrap();
+		install_sources(&mut session, &project, &sources, SourceVersion(1));
+
+		events.lock().unwrap().clear();
+		let diagnostics = session.check_project(project.clone(), entry.clone(), EntryMode::Library);
+		let error_modules = diagnostics
+			.iter()
+			.filter(|diagnostic| diagnostic.diag.is_error())
+			.map(|diagnostic| diagnostic.module.as_str())
+			.collect::<Vec<_>>();
+		assert_eq!(error_modules, ["left", "right", "main"]);
+		let cold = events.lock().unwrap().clone();
+		for module in ["leaf", "left", "right", "main"] {
+			assert_eq!(
+				count(&cold, "interface_module_analysis", Some(module)),
+				1,
+				"module {module} executed more than once: {cold:#?}"
+			);
+		}
+
+		events.lock().unwrap().clear();
+		let warm = session.check_project(project, entry, EntryMode::Library);
+		assert_eq!(*diagnostics, *warm);
+		assert!(
+			events.lock().unwrap().is_empty(),
+			"identical parallel check was not fully cached"
+		);
+	});
+}
+
+#[test]
+fn parallel_diagnostic_fold_tracks_child_query_changes() {
+	let sources = BTreeMap::from([
+		("leaf".into(), "public func leaf(): int = 1\n".into()),
+		(
+			"main".into(),
+			"import @/leaf with (leaf)\npublic func value(): int = leaf()\n".into(),
+		),
+	]);
+	let events = Arc::new(Mutex::new(Vec::<SemanticQueryEvent>::new()));
+	let sink = events.clone();
+	let mut session = CompilerSession::with_detailed_event_callback_for_test(move |event| {
+		sink.lock().unwrap().push(event)
+	});
+	let project = ProjectId::new("parallel-diagnostic-dependencies");
+	let entry = ModulePath::new("main").unwrap();
+	install_sources(&mut session, &project, &sources, SourceVersion(1));
+	assert!(
+		session
+			.check_project(project.clone(), entry.clone(), EntryMode::Library)
+			.is_empty()
+	);
+
+	session.set_source(
+		project.clone(),
+		ModulePath::new("leaf").unwrap(),
+		"public func leaf(): int = \"bad\"\n".into(),
+		SourceVersion(2),
+	);
+	events.lock().unwrap().clear();
+	let diagnostics = session.check_project(project.clone(), entry.clone(), EntryMode::Library);
+	assert!(
+		diagnostics.iter().any(|diagnostic| {
+			diagnostic.module == "leaf" && diagnostic.diag.message.contains("mismatched types")
+		}),
+		"edited child diagnostic was not observed: {diagnostics:?}"
+	);
+
+	events.lock().unwrap().clear();
+	let warm = session.check_project(project, entry, EntryMode::Library);
+	assert_eq!(*diagnostics, *warm);
+	assert!(
+		events.lock().unwrap().is_empty(),
+		"identical post-edit check was not fully cached"
+	);
+}

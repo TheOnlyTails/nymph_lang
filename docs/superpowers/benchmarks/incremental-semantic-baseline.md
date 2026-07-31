@@ -100,19 +100,22 @@ measurement window. The historical checkout used its original `fresh-check` and
 `fresh-compile` operations; the current checkout used the baseline-compatible
 cases above. Both received the exact 17-module Mixed 4×4 fixture.
 
-| Operation | Reproduced `abcbd4b` | Before coherence partitioning | Current | Current / baseline |
-|---|---:|---:|---:|---:|
-| Diagnostics | 110.75 ms (110.18–111.27 ms) | 1.0328 s (1.0264–1.0404 s) | 352.19 ms (351.31–353.12 ms) | 3.18× |
-| Full compile | 137.73 ms (137.11–138.45 ms) | 1.0705 s (1.0512–1.0991 s) | 362.90 ms (361.76–364.04 ms) | 2.63× |
+| Operation | Reproduced `abcbd4b` | Before coherence partitioning | Coherence partitioning only | Current | Current / baseline |
+|---|---:|---:|---:|---:|---:|
+| Diagnostics | 110.75 ms (110.18–111.27 ms) | 1.0328 s (1.0264–1.0404 s) | 352.19 ms (351.31–353.12 ms) | 293.67 ms (291.04–296.63 ms) | 2.65× |
+| Full compile | 137.73 ms (137.11–138.45 ms) | 1.0705 s (1.0512–1.0991 s) | 362.90 ms (361.76–364.04 ms) | 302.31 ms (299.84–305.15 ms) | 2.19× |
 
 Profiling attributed the largest regression to coherence checking: each project
 module received 93 visible implementations and exhaustively trial-unified every
 same-interface pair, even when concrete self-type head constructors differed.
 Partitioning impossible overlaps by the existing `(interface, head)` semantic
 index reduced diagnostics by 65.9% and full compile by 66.1% without changing
-coherence diagnostics. The remaining 3.18× diagnostics and 2.63× full-build
-regressions are still open; these results are observability, not acceptance of
-the remaining difference.
+coherence diagnostics. Native cold diagnostics then prewarm independent module
+queries on cloned Salsa handles before the authoritative serial, graph-ordered
+diagnostic fold; this reduced both operations by a further 16.6–16.7% while
+preserving dependency registration and warm backdating. The remaining 2.65×
+diagnostics and 2.19× full-build regressions are still open; these results are
+observability, not acceptance of the remaining difference.
 
 ### Retained-session acceptance results (2026-07-31)
 
