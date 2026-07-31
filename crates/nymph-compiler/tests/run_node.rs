@@ -1810,6 +1810,31 @@ fn runs_a_for_loop_with_a_parenthesized_range_bound() {
 	);
 }
 
+#[test]
+fn range_expressions_are_canonical_values_and_evaluate_bounds_once_in_order() {
+	let src = r#"
+func pass(value: Range<int>): int = value.start * 10 + value.end
+func returned(): RangeInclusive<int> = 3..=4
+func exercise(): int = {
+  let mut order = 0
+  let endpoint = (value: int) -> { order = order * 10 + value value }
+  let stored = endpoint(1)..endpoint(2)
+  let from = (endpoint(3))..
+  let to = ..endpoint(4)
+  let inclusive = endpoint(5)..=endpoint(6)
+  let to_inclusive = ..=endpoint(7)
+  order * 10000000
+    + pass(stored) * 100000
+    + from.start * 10000
+    + to.end * 1000
+    + inclusive.start * 100
+    + returned().end * 10
+    + to_inclusive.end
+}
+"#;
+	assert_eq!(run(src, "exercise()"), "12345671234547");
+}
+
 // ── Iterator for-loops (Tier 1, Track A) ─────────────────────────────────────
 
 #[test]

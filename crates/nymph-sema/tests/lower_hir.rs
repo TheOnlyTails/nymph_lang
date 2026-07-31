@@ -2210,18 +2210,32 @@ fn lowers_a_for_loop_with_a_parenthesized_range_bound() {
 }
 
 #[test]
-#[should_panic(expected = "for-loop sources")]
-fn range_in_value_position_panics_in_lowering() {
-	// A value-position range types as an unconstrained fresh variable (the
-	// checker's documented "opaque hole") and has no consumer anywhere in the
-	// language — a loud panic is mandatory rather than risking silent wrong JS.
-	lower(
-		r#"
-		func f(): int = {
-			let r = 1..=10
-			r
-		}
-		"#,
+fn range_values_lower_to_canonical_structs_in_compatibility_pipeline() {
+	let hir = lower(
+		"struct Range<T>(start: T, end: T)\nstruct RangeFrom<T>(start: T)\nstruct RangeTo<T>(end: T)\nstruct RangeInclusive<T>(start: T, end: T)\nstruct RangeToInclusive<T>(end: T)\nfunc values(): void = { let a = 1..2\nlet b = 3..\nlet c = ..4\nlet d = 5..=6\nlet e = ..=7 }",
+	);
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected block")
+	};
+	let classes = stmts
+		.iter()
+		.map(|stmt| match stmt {
+			HirStmt::Let {
+				value: HirExpr::New { class, .. },
+				..
+			} => class.as_str(),
+			other => panic!("expected canonical range construction, got {other:?}"),
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(
+		classes,
+		[
+			"Range",
+			"RangeFrom",
+			"RangeTo",
+			"RangeInclusive",
+			"RangeToInclusive"
+		]
 	);
 }
 

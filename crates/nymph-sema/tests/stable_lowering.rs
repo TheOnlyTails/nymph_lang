@@ -2204,7 +2204,7 @@ fn assert_protocol_for(fragment: &nymph_sema::LoweredHirFragment, inclusive: boo
 fn range_for_support_matches_legacy_for_startless_endless_and_unbounded_forms() {
 	for range in ["..3", "..=3", "1.."] {
 		let (items, _, context) = materialized_fixture(&format!(
-			"enum Option<T> {{ Some(value: T), None }}\ninterface Iterator<Item> {{ mut func next(): Option<Item> }}\ninterface Iterable<Item> {{ func iter(): Iterator<Item> }}\nfunc each(): void = for (_ in {range}) {{ 0 }}"
+			"enum Option<T> {{ Some(value: T), None }}\ninterface Iterator<Item> {{ mut func next(): Option<Item> }}\ninterface Iterable<Item> {{ func iter(): Iterator<Item> }}\nstruct Range<T>(start: T, end: T)\nstruct RangeFrom<T>(start: T)\nstruct RangeTo<T>(end: T)\nstruct RangeInclusive<T>(start: T, end: T)\nstruct RangeToInclusive<T>(end: T)\nfunc each(): void = for (_ in {range}) {{ 0 }}"
 		));
 		let error = lower_runtime_definition(
 			&context,
@@ -2224,23 +2224,40 @@ fn range_for_support_matches_legacy_for_startless_endless_and_unbounded_forms() 
 }
 
 #[test]
-fn bounded_range_in_value_position_remains_typed_unsupported() {
-	let (items, _, context) = materialized_fixture(
-		"enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nfunc value(): void = { let range = 1..3 }",
-	);
-	let error = lower_runtime_definition(
-		&context,
-		Arc::new(
-			items
-				.into_iter()
-				.find(|item| source_name(&item.definition) == "value")
-				.unwrap(),
-		),
-	)
-	.unwrap_err();
-	assert!(
-		matches!(error, nymph_sema::StableLoweringError::Unsupported { ref feature, .. } if feature == "range/protocol"),
-		"{error:?}"
+fn range_values_lower_to_their_canonical_structs_with_source_order_fields() {
+	let source = "enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nstruct Range<T>(start: T, end: T)\nstruct RangeFrom<T>(start: T)\nstruct RangeTo<T>(end: T)\nstruct RangeInclusive<T>(start: T, end: T)\nstruct RangeToInclusive<T>(end: T)\nfunc values(): void = { let a = 1..2\nlet b = 3..\nlet c = ..4\nlet d = 5..=6\nlet e = ..=7 }";
+	let lowered = lower_named(source, "values");
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("expected function")
+	};
+	let nymph_hir::hir::HirExpr::Block { stmts, .. } = &function.body else {
+		panic!("expected block")
+	};
+	let actual = stmts
+		.iter()
+		.map(|stmt| match stmt {
+			nymph_hir::hir::HirStmt::Let {
+				value: nymph_hir::hir::HirExpr::New { class, fields },
+				..
+			} => (
+				class.as_str(),
+				fields
+					.iter()
+					.map(|(name, _)| name.as_str())
+					.collect::<Vec<_>>(),
+			),
+			other => panic!("expected canonical construction, got {other:?}"),
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(
+		actual,
+		[
+			("Range", vec!["start", "end"]),
+			("RangeFrom", vec!["start"]),
+			("RangeTo", vec!["end"]),
+			("RangeInclusive", vec!["start", "end"]),
+			("RangeToInclusive", vec!["end"]),
+		]
 	);
 }
 

@@ -205,19 +205,28 @@ unspecified—including across separate map instances—and mutation may change 
 
 ## Ranges
 
-Ranges are not a literal type, but rather a special syntax for creating iterators.
-A range can be either exclusive (`..`) or inclusive (`..=`).
+Range expressions create values of the canonical standard-library range structs.
+A range can be either exclusive (`..`) or inclusive (`..=`):
+
+| Syntax | Value type and fields |
+| --- | --- |
+| `start..end` | `Range { start, end }` |
+| `start..` | `RangeFrom { start }` |
+| `..end` | `RangeTo { end }` |
+| `start..=end` | `RangeInclusive { start, end }` |
+| `..=end` | `RangeToInclusive { end }` |
+
+Supplied endpoints are evaluated exactly once, from left to right. Range values can be stored,
+passed, returned, and inspected like values constructed from those structs directly.
 Either form may omit its lower bound. Only an exclusive range may omit its upper bound: `a..` is
 valid, but `a..=` is not, because an inclusive range requires an upper bound.
 
-Ranges can be created for any type that implements the [`Range`](./stdlib/cmp-comparison#Comparable) interface, which provides a way to order values.
+Range endpoints currently must be `int` or `uint`; both satisfy the canonical structs'
+[`Comparable`](./stdlib/cmp-comparison#Comparable) bound.
 
 Ranges which do not contain a lower bound are "max-only" ranges, and ranges which do not contain
-an upper bound are "min-only" ranges; both are intended to be usable only for checking inclusion
-(using the [`in`](./expressions#Inclusion) operator), not for iterating in a `for` loop — a
-fully-bounded range (`1..10` or `1..=10`) is the only shape a `for` loop can iterate over today.
-The checker doesn't yet reject a max- or min-only range as a `for` source, so using one there is a
-compiler bug (a crash), not a supported behavior.
+an upper bound are "min-only" ranges. A fully-bounded range (`1..10` or `1..=10`) is the only
+shape supported directly as a `for` source today.
 
 See [Iteration](./iteration#ranges) for how ranges behave inside a `for` loop.
 

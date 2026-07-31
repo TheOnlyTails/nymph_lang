@@ -659,6 +659,14 @@ fn char_ranges_are_diagnosed() {
 }
 
 #[test]
+fn all_range_forms_have_their_canonical_nominal_types() {
+	let source = "struct Range<T>(start: T, end: T)\nstruct RangeFrom<T>(start: T)\nstruct RangeTo<T>(end: T)\nstruct RangeInclusive<T>(start: T, end: T)\nstruct RangeToInclusive<T>(end: T)\nfunc a(): Range<int> = 1..2\nfunc b(): RangeFrom<int> = 1..\nfunc c(): RangeTo<int> = ..2\nfunc d(): RangeInclusive<int> = 1..=2\nfunc e(): RangeToInclusive<int> = ..=2";
+	let parsed = parse_module(source, "test");
+	let checked = check_module(&parsed.tree);
+	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+}
+
+#[test]
 fn index_access_without_an_index_impl_is_diagnosed() {
 	assert_error_contains(
 		"struct Box(value: int)
