@@ -186,6 +186,26 @@ fn target_matrix_loose_explicit_file_works_for_every_command() {
 }
 
 #[test]
+fn target_matrix_loose_explicit_file_resolves_sibling_imports_for_every_command() {
+	let path =
+		write_source("import @/helper with (value)\nfunc main(): void = { let result = value() }\n");
+	let helper = path.parent().unwrap().join("helper.nym");
+	std::fs::write(&helper, "public func value(): int = 1\n").unwrap();
+	for command in ["run", "check", "build"] {
+		let out = nymph(&[command, path.to_str().unwrap()]);
+		assert!(
+			out.status.success(),
+			"{command} should resolve a loose target's sibling imports; stdout: {} stderr: {}",
+			out.stdout,
+			out.stderr
+		);
+	}
+	let _ = std::fs::remove_file(path.with_extension("mjs"));
+	std::fs::remove_file(helper).unwrap();
+	std::fs::remove_file(path).unwrap();
+}
+
+#[test]
 fn target_matrix_without_project_or_file_errors_actionably() {
 	let root = unique_temp_path("nymph_cli_empty", "dir");
 	std::fs::create_dir_all(&root).unwrap();

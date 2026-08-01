@@ -57,7 +57,7 @@ impl NymphCommand for RunCommand {
 				return 1;
 			}
 		};
-		let load = fs_loader(target.src_root);
+		let load = fs_loader(target.src_root.clone());
 		match guarded(|| {
 			nymph_compiler::compile_project_with_std(
 				&target.entry_key,
@@ -67,7 +67,10 @@ impl NymphCommand for RunCommand {
 		}) {
 			Ok(Ok(compiled)) => execute(&format!("{}\n{}();\n", compiled.js, compiled.entry_main)),
 			Ok(Err(diags)) => {
-				eprint!("{}", render_project_diagnostics(&diags, &load));
+				eprint!(
+					"{}",
+					render_project_diagnostics(&diags, &target.src_root, &load)
+				);
 				1
 			}
 			Err(payload) => {

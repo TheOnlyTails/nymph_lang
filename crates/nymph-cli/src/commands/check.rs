@@ -1,9 +1,7 @@
 use std::path::PathBuf;
 
 use crate::NymphCommand;
-use crate::project_support::{
-	self, TargetIntent, TargetKind, fs_loader, render_project_diagnostics,
-};
+use crate::project_support::{self, TargetIntent, fs_loader, render_project_diagnostics};
 
 /// `nymph check [file]` — parse and type-check a Nymph source file. Prints
 /// "ok" and exits 0 when there are no diagnostics; otherwise renders every
@@ -29,44 +27,27 @@ impl NymphCommand for CheckCommand {
 				return 1;
 			}
 		};
-		if target.kind == TargetKind::Project {
-			let load = fs_loader(target.src_root);
-			let diagnostics = match target.intent {
-				TargetIntent::Entry => nymph_compiler::check_project(&target.entry_key, &load),
-				TargetIntent::Library => nymph_compiler::check_project_library(&target.entry_key, &load),
-			};
-			if diagnostics.is_empty() {
-				println!("ok");
-				return 0;
-			}
-			eprint!("{}", render_project_diagnostics(&diagnostics, &load));
-			return i32::from(diagnostics.iter().any(|d| d.diag.is_error()));
-		}
-
-		let source = match std::fs::read_to_string(&target.file) {
-			Ok(source) => source,
-			Err(err) => {
-				eprintln!("error: could not read {}: {err}", target.file.display());
-				return 1;
-			}
-		};
-
-		let path = target.file.display().to_string();
+		let load = fs_loader(target.src_root.clone());
 		let diagnostics = match target.intent {
-			TargetIntent::Entry => nymph_compiler::check_entry(&source, &path),
-			TargetIntent::Library => nymph_compiler::check(&source, &path),
+			TargetIntent::Entry => nymph_compiler::check_project_with_std(
+				&target.entry_key,
+				&load,
+				&nymph_compiler::embedded_std_provider,
+			),
+			TargetIntent::Library => nymph_compiler::check_project_library_with_std(
+				&target.entry_key,
+				&load,
+				&nymph_compiler::embedded_std_provider,
+			),
 		};
-
 		if diagnostics.is_empty() {
 			println!("ok");
 			return 0;
 		}
-
 		eprint!(
 			"{}",
-			nymph_diagnostics::render(&path, &source, &diagnostics)
+			render_project_diagnostics(&diagnostics, &target.src_root, &load)
 		);
-
-		i32::from(diagnostics.iter().any(nymph_compiler::Diagnostic::is_error))
+		i32::from(diagnostics.iter().any(|d| d.diag.is_error()))
 	}
 }

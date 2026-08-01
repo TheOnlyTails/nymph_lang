@@ -29,7 +29,7 @@ impl NymphCommand for BuildCommand {
 			.output
 			.clone()
 			.unwrap_or_else(|| target.file.with_extension("mjs"));
-		let load = fs_loader(target.src_root);
+		let load = fs_loader(target.src_root.clone());
 		let result = guarded(|| match target.intent {
 			TargetIntent::Entry => nymph_compiler::compile_project_with_std(
 				&target.entry_key,
@@ -51,7 +51,10 @@ impl NymphCommand for BuildCommand {
 				}
 			},
 			Ok(Err(diags)) => {
-				eprint!("{}", render_project_diagnostics(&diags, &load));
+				eprint!(
+					"{}",
+					render_project_diagnostics(&diags, &target.src_root, &load)
+				);
 				1
 			}
 			Err(payload) => {

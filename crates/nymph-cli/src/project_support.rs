@@ -9,12 +9,6 @@
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TargetKind {
-	Project,
-	Loose,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TargetIntent {
 	Entry,
 	Library,
@@ -25,7 +19,6 @@ pub(crate) struct ResolvedTarget {
 	pub file: PathBuf,
 	pub src_root: PathBuf,
 	pub entry_key: String,
-	pub kind: TargetKind,
 	pub intent: TargetIntent,
 }
 
@@ -77,7 +70,6 @@ pub(crate) fn resolve(file: Option<&Path>) -> anyhow::Result<ResolvedTarget> {
 				file,
 				src_root,
 				entry_key: module.as_str().to_string(),
-				kind: TargetKind::Project,
 				intent,
 			})
 		}
@@ -99,7 +91,6 @@ pub(crate) fn resolve(file: Option<&Path>) -> anyhow::Result<ResolvedTarget> {
 				file,
 				src_root,
 				entry_key,
-				kind: TargetKind::Loose,
 				intent: TargetIntent::Library,
 			})
 		}
@@ -122,16 +113,23 @@ pub(crate) fn fs_loader(src_root: PathBuf) -> impl Fn(&str) -> Option<String> {
 }
 
 /// Render a batch of project diagnostics, each against its own module's
-/// source (re-read through `load` — cheap, and keeps this driver
-/// filesystem-agnostic; see `nymph_compiler::project`'s doc comment).
+/// filesystem path and source (re-read through `load`).
 pub(crate) fn render_project_diagnostics(
 	diags: &[nymph_compiler::ProjectDiagnostic],
+	src_root: &Path,
 	load: &dyn Fn(&str) -> Option<String>,
 ) -> String {
 	let mut out = String::new();
 	for d in diags {
 		let source = load(&d.module).unwrap_or_default();
-		let filename = format!("{}.nym", d.module);
+		let filename = nymph_compiler::ModulePath::new(&d.module).map_or_else(
+			|_| format!("{}.nym", d.module),
+			|module| {
+				nymph_project::file_for_module(src_root, &module)
+					.display()
+					.to_string()
+			},
+		);
 		out.push_str(&nymph_diagnostics::render(
 			&filename,
 			&source,
