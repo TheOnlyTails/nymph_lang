@@ -43,24 +43,11 @@ thread_local! {
 	static CAPTURED_PANIC_MESSAGE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
-/// Whether [`compile_guarded`] should require the source to declare a valid
-/// top-level `main` (the program's entry point) or compile it as a plain
-/// library module. Mirrors [`nymph_compiler`]'s `compile`/`compile_entry`
-/// split.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Entry {
-	Library,
-	Entry,
-}
-
 /// Compile `source` (anchored at `path` for diagnostics), catching any panic
 /// from inside the pipeline and reporting it as data instead of unwinding
-/// into the caller.
-///
-/// `entry` selects `nymph_compiler::compile` (`Entry::Library`) vs
-/// `nymph_compiler::compile_entry` (`Entry::Entry`, which additionally
-/// requires a valid top-level `main`) — see [`Entry`].
-pub(crate) fn compile_guarded(source: &str, path: &str, entry: Entry) -> CompileOutcome {
+/// into the caller. This single-module path compiles a library; entry builds
+/// use the project compiler through [`guarded`].
+pub(crate) fn compile_guarded(source: &str, path: &str) -> CompileOutcome {
 	CAPTURED_PANIC_MESSAGE.with(|cell| *cell.borrow_mut() = None);
 
 	// The default hook prints "thread '...' panicked at ...:LINE:COL:\n<msg>\n
@@ -75,10 +62,7 @@ pub(crate) fn compile_guarded(source: &str, path: &str, entry: Entry) -> Compile
 		CAPTURED_PANIC_MESSAGE.with(|cell| *cell.borrow_mut() = Some(message));
 	}));
 
-	let result = panic::catch_unwind(AssertUnwindSafe(|| match entry {
-		Entry::Library => nymph_compiler::compile(source, path),
-		Entry::Entry => nymph_compiler::compile_entry(source, path),
-	}));
+	let result = panic::catch_unwind(AssertUnwindSafe(|| nymph_compiler::compile(source, path)));
 
 	panic::set_hook(previous_hook);
 

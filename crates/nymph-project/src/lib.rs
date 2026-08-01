@@ -228,10 +228,30 @@ pub enum PathError {
 	InvalidSourceFile(PathBuf),
 }
 
+/// Make a path absolute and lexically normalize `.` and `..` components.
+/// This deliberately does not require the path to exist or resolve symlinks,
+/// so editor overlays and prospective source paths remain representable.
+pub fn normalize_path(path: impl AsRef<Path>) -> io::Result<PathBuf> {
+	let absolute = std::path::absolute(path)?;
+	let mut normalized = PathBuf::new();
+	for component in absolute.components() {
+		match component {
+			Component::CurDir => {}
+			Component::ParentDir => {
+				normalized.pop();
+			}
+			Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+				normalized.push(component.as_os_str());
+			}
+		}
+	}
+	Ok(normalized)
+}
+
 pub fn module_from_file(source_root: &Path, file: &Path) -> Result<ModulePath, PathError> {
-	let root = std::path::absolute(source_root)
-		.map_err(|_| PathError::InvalidSourceFile(source_root.into()))?;
-	let file = std::path::absolute(file).map_err(|_| PathError::InvalidSourceFile(file.into()))?;
+	let root =
+		normalize_path(source_root).map_err(|_| PathError::InvalidSourceFile(source_root.into()))?;
+	let file = normalize_path(file).map_err(|_| PathError::InvalidSourceFile(file.into()))?;
 	let relative = file
 		.strip_prefix(&root)
 		.map_err(|_| PathError::OutsideSourceRoot {
@@ -317,6 +337,17 @@ mod tests {
 			project.module_for_file(&temp.path().join("other.nym")),
 			Err(PathError::OutsideSourceRoot { .. })
 		));
+	}
+
+	#[test]
+	fn source_paths_are_lexically_normalized_before_mapping() {
+		let temp = tempfile::tempdir().unwrap();
+		let source_root = temp.path().join("src");
+		let file = source_root.join("nested/../main.nym");
+		assert_eq!(
+			module_from_file(&source_root, &file).unwrap().as_str(),
+			"main"
+		);
 	}
 
 	#[test]
