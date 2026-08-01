@@ -643,18 +643,17 @@ fn for_in_over_an_unbounded_generic_param_is_diagnosed() {
 }
 
 #[test]
-fn float_ranges_are_diagnosed() {
+fn canonical_range_bound_rejects_an_element_without_its_capability() {
 	assert_error_contains(
-		"func f(): void = { for (value in 0.5..2.5) { value } }",
-		"range bounds must be `int` or `uint`, not `float`",
+		"interface Step {}\nstruct Range<T: Step>(start: T, end: T)\nfunc f(): Range<float> = 0.5..2.5",
+		"does not implement `Step`",
 	);
 }
 
 #[test]
-fn char_ranges_are_diagnosed() {
-	assert_error_contains(
-		"func f(): void = { for (value in 'a'..'z') { value } }",
-		"range bounds must be `int` or `uint`, not `char`",
+fn canonical_range_bound_accepts_a_step_element() {
+	assert_ok(
+		"interface Step {}\nimpl Step for char {}\nstruct Range<T: Step>(start: T, end: T)\nfunc f(): Range<char> = 'a'..'z'",
 	);
 }
 

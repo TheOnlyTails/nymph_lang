@@ -267,6 +267,15 @@ pub enum HirExpr {
 		argument: Box<HirExpr>,
 		cases: Vec<HirBoundDispatchCase>,
 	},
+	/// A zero-argument method selected through a still-generic interface bound.
+	/// Like `BoundDispatch`, but dispatch depends only on the receiver's boxed
+	/// runtime tag.
+	UnaryBoundDispatch {
+		interface: EcoString,
+		method: EcoString,
+		receiver: Box<HirExpr>,
+		cases: Vec<HirBoundDispatchCase>,
+	},
 	/// A tuple, list, or compiler-internal raw array.
 	Array {
 		kind: HirArrayKind,
@@ -400,6 +409,9 @@ impl HirExpr {
 			} => {
 				receiver.collect_runtime_type_references(references);
 				argument.collect_runtime_type_references(references);
+			}
+			Self::UnaryBoundDispatch { receiver, .. } => {
+				receiver.collect_runtime_type_references(references);
 			}
 			Self::Array { items, .. } => collect_exprs(items, references),
 			Self::ArraySpread { elems, .. } => {

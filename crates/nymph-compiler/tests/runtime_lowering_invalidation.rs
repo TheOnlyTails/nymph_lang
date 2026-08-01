@@ -27,6 +27,7 @@ fn hir_contains(
 		HirExpr::BoundDispatch {
 			receiver, argument, ..
 		} => contains(receiver) || contains(argument),
+		HirExpr::UnaryBoundDispatch { receiver, .. } => contains(receiver),
 		HirExpr::ArraySpread { elems, .. } => elems.iter().any(|elem| match elem {
 			HirArrayElem::Item(expr) | HirArrayElem::Spread(expr) => contains(expr),
 		}),

@@ -221,12 +221,13 @@ passed, returned, and inspected like values constructed from those structs direc
 Either form may omit its lower bound. Only an exclusive range may omit its upper bound: `a..` is
 valid, but `a..=` is not, because an inclusive range requires an upper bound.
 
-Range endpoints currently must be `int` or `uint`; both satisfy the canonical structs'
-[`Comparable`](./stdlib/cmp-comparison#Comparable) bound.
+Range endpoints must implement the fallible [`Step`](./stdlib/iter#Step) contract. The standard
+library provides `Step` for `int`, `uint`, and `char`.
 
 Ranges which do not contain a lower bound are "max-only" ranges, and ranges which do not contain
-an upper bound are "min-only" ranges. A fully-bounded range (`1..10` or `1..=10`) is the only
-shape supported directly as a `for` source today.
+an upper bound are "min-only" ranges. Max-only ranges become iterable only through explicit
+`.reversed()`; min-only ranges iterate forward until control flow, an adapter, or `Step.None`
+stops them.
 
 See [Iteration](./iteration#ranges) for how ranges behave inside a `for` loop.
 

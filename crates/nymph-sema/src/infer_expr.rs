@@ -3021,9 +3021,6 @@ impl<'m> Checker<'m> {
 
 	// ── Iteration ────────────────────────────────────────────────────────────
 	fn infer_iterable_element(&mut self, iterable: &Expr) -> Ty {
-		if let ExprKind::Range(kind) = &iterable.kind {
-			return self.infer_range_element(kind);
-		}
 		let ty = self.infer(iterable);
 		// `mut` is transparent to iteration: `for x in xs` over a `mut #[int]`
 		// yields `int` elements, same as an immutable list. Peel it, else the
@@ -3245,24 +3242,14 @@ impl<'m> Checker<'m> {
 	fn infer_range_element(&mut self, kind: &RangeKind) -> Ty {
 		let elem = self.fresh();
 		let bound = |checker: &mut Self, e: &Expr| checker.check(e, elem);
-		let span = match kind {
+		match kind {
 			RangeKind::From(a) | RangeKind::To(a) | RangeKind::ToInclusive(a) => {
 				bound(self, a);
-				a.span
 			}
 			RangeKind::Exclusive { min, max } | RangeKind::Inclusive { min, max } => {
 				bound(self, min);
 				bound(self, max);
-				min.span.to(max.span)
 			}
-		};
-		let resolved = self.shallow_resolve(elem);
-		if !matches!(
-			self.interner.kind(resolved),
-			TyKind::Int | TyKind::UInt | TyKind::Error
-		) {
-			let ty = self.display(resolved);
-			self.emit(span, TypeError::InvalidRangeBound { ty });
 		}
 		elem
 	}

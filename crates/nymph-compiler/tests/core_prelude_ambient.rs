@@ -15,6 +15,38 @@
 use nymph_compiler::{check, compile};
 
 #[test]
+fn ambient_step_and_directional_range_capabilities_check() {
+	let accepted = r#"
+func generic_step<T: Step>(value: T): #(Option<T>, Option<T>) =
+  #(value.next(), value.previous())
+func generic_range<T: Step>(start: T, end: T): Range<T> = start..end
+func ranges(): void = {
+  for (_ in 1..3) {}
+  for (_ in 1..=3) {}
+  for (_ in 1..) { return }
+  for (_ in (..3).reversed()) { return }
+  for (_ in (..=3).reversed()) { return }
+  for (_ in 'a'..='c') {}
+}
+"#;
+	let diagnostics = check(accepted, "directional_ranges");
+	assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+	for source in [
+		"func bad(): void = for (_ in ..3) {}",
+		"func bad(): void = for (_ in ..=3) {}",
+	] {
+		let diagnostics = check(source, "forward_startless_range");
+		assert!(
+			diagnostics
+				.iter()
+				.any(|diagnostic| diagnostic.message.contains("not iterable")),
+			"{source}: {diagnostics:?}"
+		);
+	}
+}
+
+#[test]
 fn ambient_hash_interface_lowers_to_the_boxed_runtime_intrinsic() {
 	let js = compile("func value(): int = 1.hash()", "hash_ambient")
 		.expect("Hash should be available from the ambient ops prelude");
