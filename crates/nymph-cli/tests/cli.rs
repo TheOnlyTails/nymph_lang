@@ -93,6 +93,122 @@ fn write_project(entry: &str, source: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn manifest_is_a_global_flag_before_or_after_the_subcommand() {
+	let root = write_project("main.nym", "func main(): void = {}\n");
+	let manifest = root.join("nymph.toml");
+	let outside = unique_temp_path("nymph_cli_outside", "dir");
+	std::fs::create_dir_all(&outside).unwrap();
+
+	for args in [
+		vec!["--manifest", manifest.to_str().unwrap(), "check"],
+		vec!["check", "--manifest", manifest.to_str().unwrap()],
+	] {
+		let out = nymph_in(&args, &outside);
+		assert!(
+			out.status.success(),
+			"global manifest placement should work; stdout: {} stderr: {}",
+			out.stdout,
+			out.stderr
+		);
+	}
+
+	std::fs::remove_dir_all(root).unwrap();
+	std::fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
+fn explicit_manifest_has_command_parity_and_bases_fields_on_its_directory() {
+	let root = unique_temp_path("nymph_cli_selected_project", "dir");
+	let manifest = root.join("metadata/project.toml");
+	let source = root.join("metadata/code/bin/start.nym");
+	std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+	std::fs::write(
+		&manifest,
+		"[package]\nname='fixture'\nversion='1.0.0'\nsrc='code'\n[build]\nentry='bin/start.nym'\n",
+	)
+	.unwrap();
+	std::fs::write(&source, "func main(): void = {}\n").unwrap();
+	let outside = unique_temp_path("nymph_cli_outside", "dir");
+	std::fs::create_dir_all(&outside).unwrap();
+	let relative_manifest = std::path::Path::new("..")
+		.join(root.file_name().unwrap())
+		.join("metadata/project.toml");
+
+	for command in ["run", "check", "build"] {
+		let out = nymph_in(
+			&["--manifest", relative_manifest.to_str().unwrap(), command],
+			&outside,
+		);
+		assert!(
+			out.status.success(),
+			"{command} should use the selected manifest outside its root; stdout: {} stderr: {}",
+			out.stdout,
+			out.stderr
+		);
+	}
+	assert!(source.with_extension("mjs").is_file());
+
+	std::fs::remove_dir_all(root).unwrap();
+	std::fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
+fn explicit_manifest_missing_and_invalid_paths_are_authoritative() {
+	let root = write_project("main.nym", "func main(): void = {}\n");
+	let missing = root.join("missing.toml");
+	let invalid = root.join("invalid.toml");
+	std::fs::write(&invalid, "not = [toml").unwrap();
+
+	for command in ["run", "check", "build"] {
+		let missing_out = nymph_in(&["--manifest", missing.to_str().unwrap(), command], &root);
+		assert_eq!(missing_out.status.code(), Some(1), "{command}");
+		assert!(
+			missing_out.stderr.contains("could not read manifest")
+				&& missing_out.stderr.contains(&missing.display().to_string()),
+			"{command} must not fall back to the valid nymph.toml: {}",
+			missing_out.stderr
+		);
+
+		let invalid_out = nymph_in(&["--manifest", invalid.to_str().unwrap(), command], &root);
+		assert_eq!(invalid_out.status.code(), Some(1), "{command}");
+		assert!(
+			invalid_out.stderr.contains("malformed TOML")
+				&& invalid_out.stderr.contains(&invalid.display().to_string()),
+			"{command} must report the selected invalid path: {}",
+			invalid_out.stderr
+		);
+	}
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn explicit_manifest_never_discovers_from_an_explicit_source() {
+	let selected = write_project("main.nym", "func main(): void = {}\n");
+	let other = write_project("main.nym", "func main(): void = {}\n");
+	let other_source = other.join("src/main.nym");
+	let out = nymph_in(
+		&[
+			"--manifest",
+			selected.join("nymph.toml").to_str().unwrap(),
+			"check",
+			other_source.to_str().unwrap(),
+		],
+		&other,
+	);
+
+	assert_eq!(out.status.code(), Some(1));
+	assert!(
+		out.stderr.contains("outside source root"),
+		"the source's nearby manifest must not replace the selected one: {}",
+		out.stderr
+	);
+
+	std::fs::remove_dir_all(selected).unwrap();
+	std::fs::remove_dir_all(other).unwrap();
+}
+
+#[test]
 fn target_matrix_project_without_file_uses_manifest_entry_relative_to_src() {
 	let root = write_project("bin/start.nym", "func main(): void = {}\n");
 	for command in ["run", "check", "build"] {
@@ -881,6 +997,34 @@ fn help_displays_nymph_as_the_program_name() {
 		out.stdout.contains("Usage: nymph"),
 		"stdout was: {}",
 		out.stdout
+	);
+	assert!(out.stdout.contains("--manifest <PATH>"));
+	assert!(!out.stdout.contains("--config"));
+}
+
+#[test]
+fn config_flag_is_rejected_without_an_alias() {
+	let out = nymph(&["--config", "nymph.toml", "check"]);
+
+	assert_eq!(out.status.code(), Some(2));
+	assert!(
+		out.stderr.contains("unexpected argument '--config'"),
+		"stderr was: {}",
+		out.stderr
+	);
+}
+
+#[test]
+fn manifest_flag_requires_a_path() {
+	let out = nymph(&["check", "--manifest"]);
+
+	assert_eq!(out.status.code(), Some(2));
+	assert!(
+		out
+			.stderr
+			.contains("a value is required for '--manifest <PATH>'"),
+		"stderr was: {}",
+		out.stderr
 	);
 }
 

@@ -3,7 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::NymphCommand;
 use crate::compile_guard::{guarded, unsupported_feature_message};
-use crate::project_support::{self, TargetIntent, fs_loader, render_project_diagnostics};
+use crate::project_support::{
+	self, ManifestSelection, TargetIntent, fs_loader, render_project_diagnostics,
+};
 
 /// compile a Nymph source file to a JavaScript module.
 #[derive(clap::Args)]
@@ -17,8 +19,8 @@ pub(crate) struct BuildCommand {
 }
 
 impl NymphCommand for BuildCommand {
-	fn run(&self) -> i32 {
-		let target = match project_support::resolve(self.file.as_deref()) {
+	fn run(&self, manifest: &ManifestSelection) -> i32 {
+		let target = match project_support::resolve(self.file.as_deref(), manifest) {
 			Ok(target) => target,
 			Err(error) => {
 				eprintln!("error: {error}");

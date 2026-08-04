@@ -167,6 +167,23 @@ pub struct Project {
 }
 
 impl Project {
+	/// Load a project from exactly `manifest_path`.
+	///
+	/// Unlike [`discover`], this never searches ancestors or substitutes the
+	/// conventional manifest filename. Relative manifest fields are resolved
+	/// from the directory containing the selected file.
+	pub fn load(manifest_path: &Path) -> Result<Self, ManifestError> {
+		let root = manifest_path
+			.parent()
+			.filter(|path| !path.as_os_str().is_empty())
+			.unwrap_or_else(|| Path::new("."));
+		Ok(Self {
+			manifest: Manifest::read(manifest_path)?,
+			manifest_path: manifest_path.into(),
+			root: root.into(),
+		})
+	}
+
 	#[must_use]
 	pub fn manifest_path(&self) -> &Path {
 		&self.manifest_path
@@ -208,11 +225,7 @@ pub fn discover(start: &Path) -> Result<Project, DiscoverError> {
 			})
 		})?;
 		if found {
-			return Ok(Project {
-				manifest: Manifest::read(&path)?,
-				manifest_path: path,
-				root: dir,
-			});
+			return Project::load(&path).map_err(DiscoverError::Manifest);
 		}
 		if !dir.pop() {
 			return Err(DiscoverError::NotFound { start: original });
@@ -363,6 +376,43 @@ mod tests {
 		let manifest_path = temp.path().join(MANIFEST_FILE);
 		std::fs::write(&manifest_path, "[package]\nname='x'\nversion='1.0.0'").unwrap();
 		assert_eq!(discover(&nested).unwrap().manifest_path(), manifest_path);
+	}
+
+	#[test]
+	fn explicit_loading_uses_the_exact_path_and_its_directory_as_root() {
+		let temp = tempfile::tempdir().unwrap();
+		let selected = temp.path().join("selected/project.toml");
+		std::fs::create_dir_all(selected.parent().unwrap().join("code/bin")).unwrap();
+		std::fs::write(
+			&selected,
+			"[package]\nname='x'\nversion='1.0.0'\nsrc='code'\n[build]\nentry='bin/start.nym'",
+		)
+		.unwrap();
+
+		let project = Project::load(&selected).unwrap();
+		assert_eq!(project.manifest_path(), selected);
+		assert_eq!(project.root(), temp.path().join("selected"));
+		assert_eq!(project.source_root(), temp.path().join("selected/code"));
+		assert_eq!(
+			file_for_module(&project.source_root(), &project.entry_module().unwrap()),
+			temp.path().join("selected/code/bin/start.nym")
+		);
+	}
+
+	#[test]
+	fn explicit_loading_does_not_fall_back_to_a_conventional_manifest() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join(MANIFEST_FILE),
+			"[package]\nname='x'\nversion='1.0.0'",
+		)
+		.unwrap();
+		let selected = temp.path().join("missing.toml");
+
+		assert!(matches!(
+			Project::load(&selected),
+			Err(ManifestError::Read { path, .. }) if path == selected
+		));
 	}
 
 	#[test]
