@@ -2072,6 +2072,13 @@ impl<'a> Emitter<'a> {
 				let value_expr = value.as_ref().map(|v| self.emit_expr(v));
 				Statement::new_return_statement(SPAN, value_expr, &self.ast)
 			}
+			HirStmt::Break => {
+				assert!(
+					!self.in_iife_subexpr.get(),
+					"`break` inside an expression-position block/if/match cannot target its enclosing loop"
+				);
+				Statement::new_break_statement(SPAN, None, &self.ast)
+			}
 		}
 	}
 

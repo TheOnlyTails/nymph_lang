@@ -5553,6 +5553,7 @@ fn collect_locals_stmt(stmt: &HirStmt, out: &mut FxHashSet<EcoString>) {
 				collect_locals(v, out);
 			}
 		}
+		HirStmt::Break => {}
 	}
 }
 
@@ -5690,6 +5691,7 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 							collect_variant_ref_enums(v, out);
 						}
 					}
+					HirStmt::Break => {}
 				}
 			}
 			if let Some(t) = tail {

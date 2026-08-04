@@ -148,6 +148,8 @@ pub enum HirStmt {
 	/// block/if/match, where a JS `return` would target the IIFE rather than the
 	/// enclosing function (Slice 4E, Y1).
 	Return(Option<HirExpr>),
+	/// An unlabeled, valueless `break`; valid only in loop statement position.
+	Break,
 }
 
 /// The runtime numeric type a boxed numeric value carries — the one piece of
@@ -479,6 +481,7 @@ impl HirExpr {
 								value.collect_runtime_type_references(references);
 							}
 						}
+						HirStmt::Break => {}
 					}
 				}
 				if let Some(tail) = tail {

@@ -1562,6 +1562,7 @@ fn lower_body(
 		routed_demands: RefCell::new(routed_demands),
 		execution: RefCell::new(execution),
 		deferred_depth: Cell::new(0),
+		loop_depth: Cell::new(0),
 		self_type,
 		implementation_slots,
 		receiver_binding: has_receiver.then(|| EcoString::from("$self")),
@@ -1686,6 +1687,7 @@ struct StableBodyLowerer<'a, C> {
 	routed_demands: RefCell<&'a mut StableDemandSet>,
 	execution: RefCell<&'a mut RuntimeExecutionSummary>,
 	deferred_depth: Cell<u32>,
+	loop_depth: Cell<u32>,
 	self_type: Option<&'a InterfaceType>,
 	implementation_slots: Option<&'a crate::ImplementationMemberCatalog>,
 	receiver_binding: Option<EcoString>,
@@ -1969,7 +1971,27 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				tail: None,
 			});
 		}
+		if let StableExprKind::Break {
+			value: None,
+			label: None,
+		} = &expr.kind
+		{
+			if self.loop_depth.get() == 0 {
+				return Err(self.unsupported(expr, "break outside a loop"));
+			}
+			return Ok(HirExpr::Block {
+				stmts: vec![HirStmt::Break],
+				tail: None,
+			});
+		}
 		self.lower(expr)
+	}
+	fn lower_loop_branch(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
+		let depth = self.loop_depth.get();
+		self.loop_depth.set(depth + 1);
+		let result = self.lower_branch(expr);
+		self.loop_depth.set(depth);
+		result
 	}
 	fn lower(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
 		if let Some((_, arity)) = self
@@ -1982,7 +2004,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			let params = (0..*arity)
 				.map(|i| self.declare(&crate::anon_closure::anon_param_name(i)))
 				.collect();
-			let body = self.lower_deferred(|| self.lower_inner(expr))?;
+			let loop_depth = self.loop_depth.replace(0);
+			let body = self.lower_deferred(|| self.lower_inner(expr));
+			self.loop_depth.set(loop_depth);
+			let body = body?;
 			self.scopes.borrow_mut().pop();
 			return Ok(HirExpr::Closure {
 				params,
@@ -2471,7 +2496,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				label: None,
 			} => HirExpr::While {
 				cond: Box::new(self.lower(condition)?),
-				body: Box::new(self.lower_branch(body)?),
+				body: Box::new(self.lower_loop_branch(body)?),
 			},
 			StableExprKind::Closure { params, body, .. } => {
 				self.scopes.borrow_mut().push(HashMap::new());
@@ -2479,7 +2504,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.iter()
 					.map(|param| pattern_name(&param.pattern).map(|name| self.declare(name)))
 					.collect::<Result<_, _>>()?;
-				let body = self.lower_deferred(|| self.lower_function_body(body))?;
+				let loop_depth = self.loop_depth.replace(0);
+				let body = self.lower_deferred(|| self.lower_function_body(body));
+				self.loop_depth.set(loop_depth);
+				let body = body?;
 				self.scopes.borrow_mut().pop();
 				HirExpr::Closure {
 					params,
@@ -3774,7 +3802,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			let end = self.declare(&"$range_end".into());
 			let done = self.declare(&"$range_done".into());
 			let pat = self.lower_pattern(variable)?;
-			let body = self.lower(body)?;
+			let body = self.lower_loop_branch(body)?;
 			self.scopes.borrow_mut().pop();
 			let current_expr = || HirExpr::Local(current.clone());
 			let end_expr = || HirExpr::Local(end.clone());
@@ -4012,7 +4040,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		let it_name = self.declare(&"$it".into());
 		let go = self.declare(&"$go".into());
 		let pat = self.lower_pattern(variable)?;
-		let body = self.lower(body)?;
+		let body = self.lower_loop_branch(body)?;
 		self.scopes.borrow_mut().pop();
 		let call = HirExpr::Call {
 			callee: Box::new(HirExpr::Field {
@@ -4451,7 +4479,27 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						value.as_ref().map(|value| self.lower(value)).transpose()?,
 					));
 				}
-				StableStatement::Expr(expr) if last => tail = Some(Box::new(self.lower(expr)?)),
+				StableStatement::Expr(expr) if matches!(expr.kind, StableExprKind::Break { .. }) => {
+					let StableExprKind::Break {
+						value: None,
+						label: None,
+					} = &expr.kind
+					else {
+						return Err(self.unsupported(expr, "valued or labeled break"));
+					};
+					if self.loop_depth.get() == 0 {
+						return Err(self.unsupported(expr, "break outside a loop"));
+					}
+					stmts.push(HirStmt::Break);
+				}
+				StableStatement::Expr(expr) if last => {
+					let lowered = self.lower(expr)?;
+					if contains_break(&lowered) {
+						stmts.push(HirStmt::Expr(lowered));
+					} else {
+						tail = Some(Box::new(lowered));
+					}
+				}
 				StableStatement::Expr(expr) => stmts.push(HirStmt::Expr(self.lower(expr)?)),
 			}
 		}
@@ -4459,6 +4507,24 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			self.scopes.borrow_mut().pop();
 		}
 		Ok(HirExpr::Block { stmts, tail })
+	}
+}
+
+fn contains_break(expr: &HirExpr) -> bool {
+	match expr {
+		HirExpr::Block { stmts, tail } => {
+			stmts.iter().any(|stmt| match stmt {
+				HirStmt::Break => true,
+				HirStmt::Expr(expr) => contains_break(expr),
+				HirStmt::Let { .. } | HirStmt::Return(_) => false,
+			}) || tail.as_deref().is_some_and(contains_break)
+		}
+		HirExpr::If {
+			then, otherwise, ..
+		} => contains_break(then) || otherwise.as_deref().is_some_and(contains_break),
+		HirExpr::While { .. } => false,
+		HirExpr::Match { arms, .. } => arms.iter().any(|arm| contains_break(&arm.body)),
+		_ => false,
 	}
 }
 

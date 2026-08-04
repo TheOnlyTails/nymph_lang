@@ -1926,6 +1926,57 @@ func direct_and_stored_boundary(): int = {
 	);
 }
 
+#[test]
+fn break_terminates_open_direct_and_stored_ranges() {
+	let src = r#"
+func exercise(): int = {
+  let mut result = 0
+  for (value in 7..) {
+    result = value
+    break
+  }
+  result
+}
+
+func bounded_direct(): int = {
+  let mut result = 0
+  for (value in 1..=5) {
+    result = result * 10 + value
+    if (value == 3) { break }
+  }
+  result
+}
+
+func bounded_stored(): int = {
+  let range = 1..=5
+  let mut result = 0
+  for (value in range) {
+    result = result * 10 + value
+    if (value == 3) { break }
+  }
+  result
+}
+"#;
+	assert_eq!(run(src, "exercise()"), "7");
+	assert_eq!(run(src, "bounded_direct()"), "123");
+	assert_eq!(run(src, "bounded_stored()"), "123");
+	for diagnostics in [
+		nymph_compiler::compile("func invalid(): void = { break }", "invalid").unwrap_err(),
+		nymph_compiler::compile(
+			"func invalid(): void = for (_ in 1..) { let stop = () -> { break } stop() }",
+			"invalid_closure",
+		)
+		.unwrap_err(),
+	] {
+		assert!(
+			diagnostics
+				.iter()
+				.any(|diagnostic| diagnostic.message.contains("break outside a loop")),
+			"{diagnostics:?}"
+		);
+	}
+}
+
 // ── Iterator for-loops (Tier 1, Track A) ─────────────────────────────────────
 
 #[test]
