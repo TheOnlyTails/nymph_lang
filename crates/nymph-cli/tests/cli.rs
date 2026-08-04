@@ -61,8 +61,13 @@ struct Output {
 /// Run `nymph` with `args`, colors disabled so assertions on plain text
 /// are stable regardless of the shell's ANSI settings.
 fn nymph(args: &[&str]) -> Output {
+	nymph_in(args, std::env::current_dir().unwrap())
+}
+
+fn nymph_in(args: &[&str], current_dir: impl AsRef<std::path::Path>) -> Output {
 	let out = Command::new(env!("CARGO_BIN_EXE_nymph"))
 		.args(args)
+		.current_dir(current_dir)
 		.env("NO_COLOR", "1")
 		.env_remove("FORCE_COLOR")
 		.output()
@@ -72,6 +77,178 @@ fn nymph(args: &[&str]) -> Output {
 		stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
 		stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
 	}
+}
+
+fn write_project(entry: &str, source: &str) -> std::path::PathBuf {
+	let root = unique_temp_path("nymph_cli_project", "dir");
+	let entry_path = root.join("src").join(entry);
+	std::fs::create_dir_all(entry_path.parent().unwrap()).unwrap();
+	std::fs::write(
+		root.join("nymph.toml"),
+		format!("[package]\nname='fixture'\nversion='1.0.0'\n[build]\nentry='{entry}'\n"),
+	)
+	.unwrap();
+	std::fs::write(&entry_path, source).unwrap();
+	root
+}
+
+#[test]
+fn target_matrix_project_without_file_uses_manifest_entry_relative_to_src() {
+	let root = write_project("bin/start.nym", "func main(): void = {}\n");
+	for command in ["run", "check", "build"] {
+		let out = nymph_in(&[command], &root);
+		assert!(
+			out.status.success(),
+			"{command} should use build.entry; stdout: {} stderr: {}",
+			out.stdout,
+			out.stderr
+		);
+	}
+	assert!(root.join("src/bin/start.mjs").is_file());
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn target_matrix_project_explicit_file_is_resolved_from_the_same_project() {
+	let root = write_project("bin/start.nym", "func main(): void = {}\n");
+	let explicit = root.join("src/tools/task.nym");
+	std::fs::create_dir_all(explicit.parent().unwrap()).unwrap();
+	std::fs::write(&explicit, "func main(): void = {}\n").unwrap();
+	for command in ["run", "check", "build"] {
+		let out = nymph_in(&[command, explicit.to_str().unwrap()], &root);
+		assert!(
+			out.status.success(),
+			"{command} should accept an explicit project file; stdout: {} stderr: {}",
+			out.stdout,
+			out.stderr
+		);
+	}
+	assert!(explicit.with_extension("mjs").is_file());
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn explicit_relative_target_is_normalized_before_project_discovery() {
+	let root = write_project("main.nym", "func main(): void = {}\n");
+	let nested = root.join("src/nested");
+	std::fs::create_dir_all(&nested).unwrap();
+	std::fs::write(nested.join("nymph.toml"), "not = [toml").unwrap();
+
+	let out = nymph_in(&["check", "../main.nym"], &nested);
+	assert!(
+		out.status.success(),
+		"the normalized target belongs to the outer project, not the nested manifest: {}",
+		out.stderr
+	);
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn manifest_entry_replaces_filename_stem_entry_policy() {
+	let root = write_project("bin/start.nym", "func helper(): int = 1\n");
+	let named_main = root.join("src/main.nym");
+	std::fs::write(&named_main, "func helper(): int = 1\n").unwrap();
+
+	for command in ["check", "build"] {
+		let entry_out = nymph_in(&[command], &root);
+		assert!(
+			entry_out.stderr.contains("no `main` function found"),
+			"{command} should treat custom build.entry as the entry module: {}",
+			entry_out.stderr
+		);
+
+		let library_out = nymph_in(&[command, named_main.to_str().unwrap()], &root);
+		assert!(
+			library_out.status.success(),
+			"{command} must not infer entry mode from the main.nym filename: {}",
+			library_out.stderr
+		);
+	}
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn target_matrix_loose_explicit_file_works_for_every_command() {
+	let path = write_source("func main(): void = {}\n");
+	for command in ["run", "check", "build"] {
+		let out = nymph(&[command, path.to_str().unwrap()]);
+		assert!(
+			out.status.success(),
+			"{command} should accept a loose file; stdout: {} stderr: {}",
+			out.stdout,
+			out.stderr
+		);
+	}
+	let _ = std::fs::remove_file(path.with_extension("mjs"));
+	std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn target_matrix_loose_explicit_file_resolves_sibling_imports_for_every_command() {
+	let path =
+		write_source("import @/helper with (value)\nfunc main(): void = { let result = value() }\n");
+	let helper = path.parent().unwrap().join("helper.nym");
+	std::fs::write(&helper, "public func value(): int = 1\n").unwrap();
+	for command in ["run", "check", "build"] {
+		let out = nymph(&[command, path.to_str().unwrap()]);
+		assert!(
+			out.status.success(),
+			"{command} should resolve a loose target's sibling imports; stdout: {} stderr: {}",
+			out.stdout,
+			out.stderr
+		);
+	}
+	let _ = std::fs::remove_file(path.with_extension("mjs"));
+	std::fs::remove_file(helper).unwrap();
+	std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn target_matrix_without_project_or_file_errors_actionably() {
+	let root = unique_temp_path("nymph_cli_empty", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	for command in ["run", "check", "build"] {
+		let out = nymph_in(&[command], &root);
+		assert_eq!(out.status.code(), Some(1), "{command}: {}", out.stderr);
+		assert!(
+			out.stderr.contains("no nymph.toml found"),
+			"{command}: {}",
+			out.stderr
+		);
+		assert!(
+			out.stderr.contains("pass a .nym file"),
+			"{command}: {}",
+			out.stderr
+		);
+	}
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn target_matrix_rejects_missing_and_outside_project_sources() {
+	let root = write_project("start.nym", "func main(): void = {}\n");
+	let missing = root.join("src/missing.nym");
+	let outside = root.join("outside.nym");
+	std::fs::write(&outside, "func main(): void = {}\n").unwrap();
+	for command in ["run", "check", "build"] {
+		let missing_out = nymph_in(&[command, missing.to_str().unwrap()], &root);
+		assert!(
+			missing_out
+				.stderr
+				.contains("target source file does not exist"),
+			"{command}: {}",
+			missing_out.stderr
+		);
+		let outside_out = nymph_in(&[command, outside.to_str().unwrap()], &root);
+		assert!(
+			outside_out.stderr.contains("outside source root"),
+			"{command}: {}",
+			outside_out.stderr
+		);
+	}
+	std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -572,29 +749,18 @@ fn run_supports_first_class_range_values() {
 	);
 }
 
-// ── `check`/`build` entry mode via the `main` file stem ─────────────────────
-//
-// `check`/`build` engage entry mode (requiring a valid top-level `main`) iff
-// the input file's stem is literally `main` (see `commands::check::CheckCommand`
-// / `commands::build::BuildCommand`'s "TODO: manifest-configurable" comment).
-// All the `check`/`build` tests above use `write_source`, whose stems never
-// equal `main`, so they stay library-mode and are unaffected by this; these
-// tests specifically exercise the `main` stem.
+// ── `check`/`build` entry mode via manifest metadata ────────────────────────
 
 #[test]
-fn check_requires_a_valid_main_only_when_the_file_stem_is_main() {
+fn check_treats_a_loose_main_dot_nym_as_a_library() {
 	let path = write_main_source("func add(a: int, b: int): int = a + b");
 	let out = nymph(&["check", path.to_str().unwrap()]);
 	let dir = path.parent().unwrap().to_path_buf();
 	let _ = std::fs::remove_dir_all(&dir);
 
 	assert!(
-		!out.status.success(),
-		"expected a `main.nym` with no `main` function to fail entry-mode check"
-	);
-	assert!(
-		out.stderr.contains("no `main` function found"),
-		"stderr should carry the checker's missing-main diagnostic:\n{}",
+		out.status.success(),
+		"a filename alone must not select entry mode; stderr: {}",
 		out.stderr
 	);
 }
@@ -615,9 +781,7 @@ fn check_passes_a_valid_main_dot_nym() {
 }
 
 #[test]
-fn check_does_not_require_main_for_a_non_main_file_stem() {
-	// The exact same source that fails entry-mode check as `main.nym` (above)
-	// passes as a plain library module under any other file stem.
+fn check_does_not_require_main_for_a_loose_file() {
 	let path = write_source("func add(a: int, b: int): int = a + b");
 	let out = nymph(&["check", path.to_str().unwrap()]);
 	let _ = std::fs::remove_file(&path);
@@ -630,7 +794,7 @@ fn check_does_not_require_main_for_a_non_main_file_stem() {
 }
 
 #[test]
-fn build_requires_a_valid_main_only_when_the_file_stem_is_main() {
+fn build_treats_a_loose_main_dot_nym_as_a_library() {
 	let path = write_main_source("func add(a: int, b: int): int = a + b");
 	let output_path = path.with_extension("mjs");
 	let out = nymph(&["build", path.to_str().unwrap()]);
@@ -641,16 +805,12 @@ fn build_requires_a_valid_main_only_when_the_file_stem_is_main() {
 	let _ = std::fs::remove_dir_all(&dir);
 
 	assert!(
-		!succeeded,
-		"expected a `main.nym` with no `main` function to fail entry-mode build"
+		succeeded,
+		"a filename alone must not select entry mode; stderr: {stderr}"
 	);
 	assert!(
-		stderr.contains("no `main` function found"),
-		"stderr should carry the checker's missing-main diagnostic:\n{stderr}"
-	);
-	assert!(
-		!output_exists,
-		"no output file should be written when entry-mode build fails"
+		output_exists,
+		"a loose library build should write its output"
 	);
 }
 

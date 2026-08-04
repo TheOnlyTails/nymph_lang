@@ -25,10 +25,12 @@ todo-cli/
     main.nym        # func main() = { … }
 ```
 
-Run one (once the toolchain supports it) with:
+Run one from its project directory with:
 
 ```sh
-nymph run            # from inside the project directory
+nymph check           # selects build.entry from nymph.toml
+nymph build
+nymph run
 ```
 
 ## The examples

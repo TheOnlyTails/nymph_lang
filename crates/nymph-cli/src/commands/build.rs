@@ -2,16 +2,14 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::NymphCommand;
-use crate::compile_guard::{
-	CompileOutcome, Entry, compile_guarded, guarded, unsupported_feature_message,
-};
-use crate::project_support::{self, fs_loader, render_project_diagnostics};
+use crate::compile_guard::{guarded, unsupported_feature_message};
+use crate::project_support::{self, TargetIntent, fs_loader, render_project_diagnostics};
 
 /// compile a Nymph source file to a JavaScript module.
 #[derive(clap::Args)]
 pub(crate) struct BuildCommand {
-	/// Path to the `.nym` source file to build.
-	file: PathBuf,
+	/// Path to the `.nym` source file to build (defaults to project build.entry).
+	file: Option<PathBuf>,
 
 	/// Output path for the emitted JavaScript (defaults to `<input>.mjs`)
 	#[arg(short, long, value_name = "FILE")]
@@ -20,90 +18,46 @@ pub(crate) struct BuildCommand {
 
 impl NymphCommand for BuildCommand {
 	fn run(&self) -> i32 {
-		let output_path = self
-			.output
-			.clone()
-			.unwrap_or_else(|| self.file.with_extension("mjs"));
-		let is_entry = self.file.file_stem() == Some(std::ffi::OsStr::new("main"));
-
-		// A bare file compiles as its own single-file project (rooted at its own
-		// directory), so it can `import std/…` and import siblings without a
-		// `nymph.toml` — see `project_support::single_file`.
-		let project = match project_support::detect(&self.file) {
-			Ok(Some(project)) => Some(project),
-			Ok(None) => project_support::single_file(&self.file),
+		let target = match project_support::resolve(self.file.as_deref()) {
+			Ok(target) => target,
 			Err(error) => {
 				eprintln!("error: {error}");
 				return 1;
 			}
 		};
-		if let Some(project) = project {
-			let load = fs_loader(project.src_root);
-			let result = guarded(|| {
-				if is_entry {
-					nymph_compiler::compile_project_with_std(
-						&project.entry_key,
-						&load,
-						&nymph_compiler::embedded_std_provider,
-					)
-				} else {
-					nymph_compiler::compile_project_library_with_std(
-						&project.entry_key,
-						&load,
-						&nymph_compiler::embedded_std_provider,
-					)
-				}
-			});
-			return match result {
-				Ok(Ok(compiled)) => match write_output_atomically(&output_path, &compiled.js) {
-					Ok(()) => 0,
-					Err(err) => {
-						eprintln!("error: could not write {}: {err}", output_path.display());
-						1
-					}
-				},
-				Ok(Err(diags)) => {
-					eprint!("{}", render_project_diagnostics(&diags, &load));
-					1
-				}
-				Err(payload) => {
-					eprintln!("{}", unsupported_feature_message(&payload));
-					1
-				}
-			};
-		}
-
-		let source = match std::fs::read_to_string(&self.file) {
-			Ok(source) => source,
-			Err(err) => {
-				eprintln!("error: could not read {}: {err}", self.file.display());
-				return 1;
-			}
-		};
-
-		let path = self.file.display().to_string();
-		let entry = if is_entry {
-			Entry::Entry
-		} else {
-			Entry::Library
-		};
-
-		match compile_guarded(&source, &path, entry) {
-			CompileOutcome::Ok(js) => match write_output_atomically(&output_path, &js) {
+		let output_path = self
+			.output
+			.clone()
+			.unwrap_or_else(|| target.file.with_extension("mjs"));
+		let load = fs_loader(target.src_root.clone());
+		let result = guarded(|| match target.intent {
+			TargetIntent::Entry => nymph_compiler::compile_project_with_std(
+				&target.entry_key,
+				&load,
+				&nymph_compiler::embedded_std_provider,
+			),
+			TargetIntent::Library => nymph_compiler::compile_project_library_with_std(
+				&target.entry_key,
+				&load,
+				&nymph_compiler::embedded_std_provider,
+			),
+		});
+		match result {
+			Ok(Ok(compiled)) => match write_output_atomically(&output_path, &compiled.js) {
 				Ok(()) => 0,
 				Err(err) => {
 					eprintln!("error: could not write {}: {err}", output_path.display());
 					1
 				}
 			},
-			CompileOutcome::Diagnostics(diagnostics) => {
+			Ok(Err(diags)) => {
 				eprint!(
 					"{}",
-					nymph_diagnostics::render(&path, &source, &diagnostics)
+					render_project_diagnostics(&diags, &target.src_root, &load)
 				);
 				1
 			}
-			CompileOutcome::Panicked(payload) => {
+			Err(payload) => {
 				eprintln!("{}", unsupported_feature_message(&payload));
 				1
 			}

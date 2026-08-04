@@ -3,21 +3,19 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::NymphCommand;
-use crate::compile_guard::{
-	CompileOutcome, Entry, compile_guarded, guarded, unsupported_feature_message,
-};
+use crate::compile_guard::{CompileOutcome, compile_guarded, guarded, unsupported_feature_message};
 use crate::project_support::{self, fs_loader, render_project_diagnostics};
 
-/// `nymph run <file>` — compile a Nymph source file and execute it under
+/// `nymph run [file]` — compile a Nymph source file and execute it under
 /// `node`, forwarding stdout/stderr live and propagating node's exit status.
+/// With no file, the nearest project's manifest `build.entry` is used.
 ///
 /// The program's entry point is its top-level `main`: a parameterless,
 /// non-generic function declaring no return type other than `void`. `run`
-/// appends a bare `main();` call after the emitted module (the module itself
-/// stays a self-contained ES module with no self-executing code) and invokes
-/// it. The run file is always compiled in *entry mode*
-/// (`nymph_compiler::compile_entry`, via [`compile_guarded`]'s
-/// [`Entry::Entry`]): a missing or mis-shaped `main` — missing entirely,
+/// appends a call to the emitted entry function after the emitted module (the
+/// module itself stays a self-contained ES module with no self-executing code)
+/// and invokes it. The run file is always compiled in *entry mode*: a missing
+/// or mis-shaped `main` — missing entirely,
 /// generic, taking parameters, or declaring a non-`void` return type — is
 /// reported as an ordinary type-checker diagnostic (via
 /// [`CompileOutcome::Diagnostics`]) alongside any other parse/type errors in
@@ -37,8 +35,8 @@ use crate::project_support::{self, fs_loader, render_project_diagnostics};
 /// message to stderr and exits nonzero without invoking node.
 #[derive(clap::Args)]
 pub(crate) struct RunCommand {
-	/// Path to the `.nym` source file to run.
-	#[arg(required_unless_present = "expr", conflicts_with = "expr")]
+	/// Path to the `.nym` source file to run (defaults to project build.entry).
+	#[arg(conflicts_with = "expr")]
 	file: Option<PathBuf>,
 
 	/// An expression to evaluate and print.
@@ -52,68 +50,34 @@ impl NymphCommand for RunCommand {
 			return run_inline_expr(expr);
 		}
 
-		let file = self
-			.file
-			.as_ref()
-			.expect("clap requires a file when --expr is absent");
-
-		// A file inside a `nymph.toml` project resolves imports across the whole
-		// project; a bare file is compiled as its own single-file project (rooted
-		// at its own directory) so it can still `import std/…` and import siblings.
-		let project = match project_support::detect(file) {
-			Ok(Some(project)) => Some(project),
-			Ok(None) => project_support::single_file(file),
+		let target = match project_support::resolve(self.file.as_deref()) {
+			Ok(target) => target,
 			Err(error) => {
 				eprintln!("error: {error}");
 				return 1;
 			}
 		};
-		if let Some(project) = project {
-			let load = fs_loader(project.src_root);
-			return match guarded(|| {
-				nymph_compiler::compile_project_with_std(
-					&project.entry_key,
-					&load,
-					&nymph_compiler::embedded_std_provider,
-				)
-			}) {
-				Ok(Ok(compiled)) => execute(&format!("{}\n{}();\n", compiled.js, compiled.entry_main)),
-				Ok(Err(diags)) => {
-					eprint!("{}", render_project_diagnostics(&diags, &load));
-					1
-				}
-				Err(payload) => {
-					eprintln!("{}", unsupported_feature_message(&payload));
-					1
-				}
-			};
-		}
-
-		let source = match std::fs::read_to_string(file) {
-			Ok(source) => source,
-			Err(err) => {
-				eprintln!("error: could not read {}: {err}", file.display());
-				return 1;
-			}
-		};
-		let path = file.display().to_string();
-
-		let js = match compile_guarded(&source, &path, Entry::Entry) {
-			CompileOutcome::Ok(js) => js,
-			CompileOutcome::Diagnostics(diagnostics) => {
+		let load = fs_loader(target.src_root.clone());
+		match guarded(|| {
+			nymph_compiler::compile_project_with_std(
+				&target.entry_key,
+				&load,
+				&nymph_compiler::embedded_std_provider,
+			)
+		}) {
+			Ok(Ok(compiled)) => execute(&format!("{}\n{}();\n", compiled.js, compiled.entry_main)),
+			Ok(Err(diags)) => {
 				eprint!(
 					"{}",
-					nymph_diagnostics::render(&path, &source, &diagnostics)
+					render_project_diagnostics(&diags, &target.src_root, &load)
 				);
-				return 1;
+				1
 			}
-			CompileOutcome::Panicked(payload) => {
+			Err(payload) => {
 				eprintln!("{}", unsupported_feature_message(&payload));
-				return 1;
+				1
 			}
-		};
-
-		execute(&format!("{js}\nmain();\n"))
+		}
 	}
 }
 
@@ -129,7 +93,7 @@ fn run_inline_expr(expr: &str) -> i32 {
 	);
 	let path = "<expr>";
 
-	let js = match compile_guarded(&source, path, Entry::Library) {
+	let js = match compile_guarded(&source, path) {
 		CompileOutcome::Ok(js) => js,
 		CompileOutcome::Diagnostics(diagnostics) => {
 			// Spans point into the synthesized wrapper, so render against it —
