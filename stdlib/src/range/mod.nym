@@ -1,4 +1,68 @@
 import @/ops with (Comparable, Contains)
+import @/option with (Option)
+import @/iter with (Iterator)
+import @/iter/iterable with (Iterable)
+
+/// A value with a finite, fallible successor and predecessor operation.
+///
+/// Returning `None` at a representation boundary lets range iterators stop
+/// without manufacturing an invalid value or wrapping around.
+public interface Step: Comparable<Other = self> {
+  func next(): Option<self>
+  func previous(): Option<self>
+}
+
+impl Step for int {
+  func next(): Option<int> = if (this >= -9007199254740991 && this < 9007199254740991) {
+    Option.Some(value = this + 1)
+  } else {
+    Option.None
+  }
+
+  func previous(): Option<int> = if (this > -9007199254740991 && this <= 9007199254740991) {
+    Option.Some(value = this - 1)
+  } else {
+    Option.None
+  }
+}
+
+impl Step for uint {
+  func next(): Option<uint> = if (this < 9007199254740991u) {
+    Option.Some(value = this + 1u)
+  } else {
+    Option.None
+  }
+
+  func previous(): Option<uint> = if (this > 0u && this <= 9007199254740991u) {
+    Option.Some(value = this - 1u)
+  } else {
+    Option.None
+  }
+}
+
+impl Step for char {
+  func next(): Option<char> = {
+    let point = this as int
+    if (point == 1114111) {
+      Option.None
+    } else if (point == 55295) {
+      Option.Some(value = 57344 as char)
+    } else {
+      Option.Some(value = (point + 1) as char)
+    }
+  }
+
+  func previous(): Option<char> = {
+    let point = this as int
+    if (point == 0) {
+      Option.None
+    } else if (point == 57344) {
+      Option.Some(value = 55295 as char)
+    } else {
+      Option.Some(value = (point - 1) as char)
+    }
+  }
+}
 
 public enum Bound<Idx> {
   Included(value: Idx),
@@ -20,7 +84,7 @@ public interface RangeBounds<Idx: Comparable<Idx>> : Contains<Idx> {
   })
 }
 
-public struct Range<Idx: Comparable<Idx>>(start: Idx, end: Idx) {
+public struct Range<Idx: Step>(start: Idx, end: Idx) {
   impl RangeBounds<Idx> {
     func start_bound() = Bound.Included(value = this.start)
     func end_bound() = Bound.Excluded(value = this.end)
@@ -29,21 +93,21 @@ public struct Range<Idx: Comparable<Idx>>(start: Idx, end: Idx) {
   func is_empty() = this.start >= this.end
 }
 
-public struct RangeFrom<Idx: Comparable<Idx>>(start: Idx) {
+public struct RangeFrom<Idx: Step>(start: Idx) {
   impl RangeBounds<Idx> {
     func start_bound() = Bound.Included(value = this.start)
     func end_bound() = Bound.Unbounded
   }
 }
 
-public struct RangeTo<Idx: Comparable<Idx>>(end: Idx) {
+public struct RangeTo<Idx: Step>(end: Idx) {
   impl RangeBounds<Idx> {
     func start_bound() = Bound.Unbounded
     func end_bound() = Bound.Excluded(value = this.end)
   }
 }
 
-public struct RangeInclusive<Idx: Comparable<Idx>>(start: Idx, end: Idx) {
+public struct RangeInclusive<Idx: Step>(start: Idx, end: Idx) {
   impl RangeBounds<Idx> {
     func start_bound() = Bound.Included(value = this.start)
     func end_bound() = Bound.Included(value = this.end)
@@ -52,9 +116,110 @@ public struct RangeInclusive<Idx: Comparable<Idx>>(start: Idx, end: Idx) {
   func is_empty() = this.start > this.end
 }
 
-public struct RangeToInclusive<Idx: Comparable<Idx>>(end: Idx) {
+public struct RangeToInclusive<Idx: Step>(end: Idx) {
   impl RangeBounds<Idx> {
     func start_bound() = Bound.Unbounded
     func end_bound() = Bound.Included(value = this.end)
   }
+}
+
+struct ForwardRangeIter<Idx: Step>(current: Option<Idx>, end: Idx, inclusive: boolean) {
+  impl Iterator<Idx> {
+    mut func next(): Option<Idx> = match (this.current) {
+      Some(value) if value < this.end || (this.inclusive && !(this.end < value)) -> {
+        this.current = if (value < this.end) value.next() else Option.None
+        Option.Some(value = value)
+      },
+      _ -> {
+        this.current = Option.None
+        Option.None
+      },
+    }
+  }
+}
+
+struct OpenRangeIter<Idx: Step>(current: Option<Idx>, reversed: boolean) {
+  impl Iterator<Idx> {
+    mut func next(): Option<Idx> = match (this.current) {
+      Some(value) -> {
+        this.current = if (this.reversed) value.previous() else value.next()
+        Option.Some(value = value)
+      },
+      None -> Option.None,
+    }
+  }
+}
+
+struct ReversedRangeIter<Idx: Step>(current: Option<Idx>, end: Idx) {
+  impl Iterator<Idx> {
+    mut func next(): Option<Idx> = match (this.current) {
+      Some(value) if value >= this.end -> {
+        this.current = if (this.end < value) value.previous() else Option.None
+        Option.Some(value = value)
+      },
+      _ -> {
+        this.current = Option.None
+        Option.None
+      },
+    }
+  }
+}
+
+public struct ReversedRange<Idx: Step>(start: Idx, end: Idx) {
+  impl Iterable<Idx> {
+    func iter(): ReversedRangeIter<Idx> =
+      ReversedRangeIter(current = this.end.previous(), end = this.start)
+  }
+}
+
+public struct ReversedRangeInclusive<Idx: Step>(start: Idx, end: Idx) {
+  impl Iterable<Idx> {
+    func iter(): ReversedRangeIter<Idx> =
+      ReversedRangeIter(current = Option.Some(value = this.end), end = this.start)
+  }
+}
+
+public struct ReversedRangeTo<Idx: Step>(end: Idx) {
+  impl Iterable<Idx> {
+    func iter(): OpenRangeIter<Idx> = OpenRangeIter(current = this.end.previous(), reversed = true)
+  }
+}
+
+public struct ReversedRangeToInclusive<Idx: Step>(end: Idx) {
+  impl Iterable<Idx> {
+    func iter(): OpenRangeIter<Idx> =
+      OpenRangeIter(current = Option.Some(value = this.end), reversed = true)
+  }
+}
+
+impl<Idx: Step> Iterable<Idx> for Range<Idx> {
+  func iter(): ForwardRangeIter<Idx> =
+    ForwardRangeIter(current = Option.Some(value = this.start), end = this.end, inclusive = false)
+}
+
+impl<Idx: Step> Iterable<Idx> for RangeInclusive<Idx> {
+  func iter(): ForwardRangeIter<Idx> =
+    ForwardRangeIter(current = Option.Some(value = this.start), end = this.end, inclusive = true)
+}
+
+impl<Idx: Step> Iterable<Idx> for RangeFrom<Idx> {
+  func iter(): OpenRangeIter<Idx> =
+    OpenRangeIter(current = Option.Some(value = this.start), reversed = false)
+}
+
+impl<Idx: Step> Range<Idx> {
+  func reversed(): ReversedRange<Idx> = ReversedRange(start = this.start, end = this.end)
+}
+
+impl<Idx: Step> RangeInclusive<Idx> {
+  func reversed(): ReversedRangeInclusive<Idx> =
+    ReversedRangeInclusive(start = this.start, end = this.end)
+}
+
+impl<Idx: Step> RangeTo<Idx> {
+  func reversed(): ReversedRangeTo<Idx> = ReversedRangeTo(end = this.end)
+}
+
+impl<Idx: Step> RangeToInclusive<Idx> {
+  func reversed(): ReversedRangeToInclusive<Idx> = ReversedRangeToInclusive(end = this.end)
 }

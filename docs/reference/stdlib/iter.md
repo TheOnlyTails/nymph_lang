@@ -1,7 +1,25 @@
 # `@/iter`
 
-The two interfaces behind every [`for` loop](../iteration) over something that isn't a range or a
-native list.
+The interfaces behind [`for` loops](../iteration), including the fallible stepping contract used
+by canonical ranges.
+
+## `Step`
+
+```nymph
+public interface Step: Comparable<Other = self> {
+  func next(): Option<self>
+  func previous(): Option<self>
+}
+```
+
+`Step` is bidirectional and fallible. Its `int` and `uint` implementations return `None` rather
+than crossing the exactly representable integer boundary or wrapping below zero. Its `char`
+implementation skips UTF-16 surrogate code points in both directions and returns `None` before
+crossing `U+0000` or `U+10FFFF`.
+
+`Range`, `RangeInclusive`, and `RangeFrom` use `next` for forward iteration. Explicit reversed
+views of bounded ranges, plus reversed `RangeTo` and `RangeToInclusive` views, use `previous`.
+See [Ranges](../iteration#ranges) for endpoint and direction rules.
 
 ## `Iterator`
 

@@ -7,11 +7,14 @@ or any type implementing one of the two iteration interfaces, [Iterator](#iterat
 
 ## Ranges
 
-Iterating a [range](./literals#Ranges) is the fastest path: the compiler lowers it directly to a
-counting loop, with no range-value allocation and no interface dispatch. This specialization only
-applies when the range expression is the direct `for` source. Storing or passing the expression
-first constructs its canonical standard-library range value; iteration of escaped range values is
-reserved for the future `Step`/range-iteration work.
+Ranges advance through the fallible `Step` interface. `Step.next()` and `Step.previous()` return
+`Option<Self>`, so an iterator stops at a representation boundary instead of wrapping or producing
+an invalid value. The standard library implements `Step` for `int`, `uint`, and `char`; character
+stepping skips the UTF-16 surrogate interval and stops at the Unicode scalar boundaries.
+
+`Range`, `RangeInclusive`, and `RangeFrom` are forward `Iterable` values. A bounded range whose
+start is greater than its end is empty; endpoint order never selects an implicit descending loop.
+Call `.reversed()` explicitly for descending traversal:
 
 ```nym
 func sum(): int = {
@@ -21,11 +24,29 @@ func sum(): int = {
   }
   total
 }
+
+func countdown(): int = {
+  let mut digits = 0
+  for (i in (1..4).reversed()) {
+    digits = digits * 10 + i
+  }
+  digits // 321
+}
 ```
 
-Only a range with both a lower and an upper bound (`1..10` or `1..=4`) has this direct-loop
-behavior today. The other three forms are ordinary values, not supported "iterate forever"
-sources. General range-value iteration belongs to the future `Step` work.
+`RangeTo` and `RangeToInclusive` have no starting value and therefore are not forward iterable.
+Their explicit reversed views are iterable: `(..4).reversed()` begins at `3`, while
+`(..=4).reversed()` begins at `4`. `RangeFrom` is open-ended in the other direction. Open-ended
+iteration must be stopped by control flow or an iterator adapter, and also stops cleanly if `Step`
+returns `None`.
+
+Exclusive and inclusive endpoints are symmetric after reversal. For example, `(1..4).reversed()`
+yields `3, 2, 1`, and `(1..=4).reversed()` yields `4, 3, 2, 1`.
+
+A direct bounded `int` or `uint` range remains an allocation-free compiler specialization. Stored,
+passed, or returned ranges use the canonical standard-library value and the ordinary
+`Iterable`/`Iterator` protocol. Both paths have the same direction, endpoint, emptiness, and
+boundary behavior.
 
 ## Lists
 

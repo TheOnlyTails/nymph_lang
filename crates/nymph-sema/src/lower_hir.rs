@@ -5436,6 +5436,7 @@ fn collect_locals(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 			collect_locals(receiver, out);
 			collect_locals(argument, out);
 		}
+		HirExpr::UnaryBoundDispatch { receiver, .. } => collect_locals(receiver, out),
 		HirExpr::Array { items, .. } => {
 			for item in items {
 				collect_locals(item, out);
@@ -5552,6 +5553,7 @@ fn collect_locals_stmt(stmt: &HirStmt, out: &mut FxHashSet<EcoString>) {
 				collect_locals(v, out);
 			}
 		}
+		HirStmt::Break => {}
 	}
 }
 
@@ -5599,6 +5601,9 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 		} => {
 			collect_variant_ref_enums(receiver, out);
 			collect_variant_ref_enums(argument, out);
+		}
+		HirExpr::UnaryBoundDispatch { receiver, .. } => {
+			collect_variant_ref_enums(receiver, out);
 		}
 		HirExpr::Array { items, .. } => {
 			for item in items {
@@ -5686,6 +5691,7 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 							collect_variant_ref_enums(v, out);
 						}
 					}
+					HirStmt::Break => {}
 				}
 			}
 			if let Some(t) = tail {

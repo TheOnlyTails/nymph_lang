@@ -1562,6 +1562,7 @@ fn lower_body(
 		routed_demands: RefCell::new(routed_demands),
 		execution: RefCell::new(execution),
 		deferred_depth: Cell::new(0),
+		loop_depth: Cell::new(0),
 		self_type,
 		implementation_slots,
 		receiver_binding: has_receiver.then(|| EcoString::from("$self")),
@@ -1686,6 +1687,7 @@ struct StableBodyLowerer<'a, C> {
 	routed_demands: RefCell<&'a mut StableDemandSet>,
 	execution: RefCell<&'a mut RuntimeExecutionSummary>,
 	deferred_depth: Cell<u32>,
+	loop_depth: Cell<u32>,
 	self_type: Option<&'a InterfaceType>,
 	implementation_slots: Option<&'a crate::ImplementationMemberCatalog>,
 	receiver_binding: Option<EcoString>,
@@ -1969,7 +1971,27 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				tail: None,
 			});
 		}
+		if let StableExprKind::Break {
+			value: None,
+			label: None,
+		} = &expr.kind
+		{
+			if self.loop_depth.get() == 0 {
+				return Err(self.unsupported(expr, "break outside a loop"));
+			}
+			return Ok(HirExpr::Block {
+				stmts: vec![HirStmt::Break],
+				tail: None,
+			});
+		}
 		self.lower(expr)
+	}
+	fn lower_loop_branch(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
+		let depth = self.loop_depth.get();
+		self.loop_depth.set(depth + 1);
+		let result = self.lower_branch(expr);
+		self.loop_depth.set(depth);
+		result
 	}
 	fn lower(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
 		if let Some((_, arity)) = self
@@ -1982,7 +2004,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			let params = (0..*arity)
 				.map(|i| self.declare(&crate::anon_closure::anon_param_name(i)))
 				.collect();
-			let body = self.lower_deferred(|| self.lower_inner(expr))?;
+			let loop_depth = self.loop_depth.replace(0);
+			let body = self.lower_deferred(|| self.lower_inner(expr));
+			self.loop_depth.set(loop_depth);
+			let body = body?;
 			self.scopes.borrow_mut().pop();
 			return Ok(HirExpr::Closure {
 				params,
@@ -2471,7 +2496,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				label: None,
 			} => HirExpr::While {
 				cond: Box::new(self.lower(condition)?),
-				body: Box::new(self.lower_branch(body)?),
+				body: Box::new(self.lower_loop_branch(body)?),
 			},
 			StableExprKind::Closure { params, body, .. } => {
 				self.scopes.borrow_mut().push(HashMap::new());
@@ -2479,7 +2504,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.iter()
 					.map(|param| pattern_name(&param.pattern).map(|name| self.declare(name)))
 					.collect::<Result<_, _>>()?;
-				let body = self.lower_deferred(|| self.lower_function_body(body))?;
+				let loop_depth = self.loop_depth.replace(0);
+				let body = self.lower_deferred(|| self.lower_function_body(body));
+				self.loop_depth.set(loop_depth);
+				let body = body?;
 				self.scopes.borrow_mut().pop();
 				HirExpr::Closure {
 					params,
@@ -2926,6 +2954,36 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.cloned()
 			.map(HirExpr::Local)
 			.collect::<Vec<_>>();
+		if let crate::StableDispatch::GenericBound { interface, member } = dispatch
+			&& params.is_empty()
+			&& self
+				.implementation_slots
+				.and_then(|slots| slots.target(member))
+				.is_none()
+		{
+			let mut body = self.lower_generic_bound(interface, member, receiver, vec![])?;
+			let HirExpr::UnaryBoundDispatch {
+				receiver: dispatched_receiver,
+				..
+			} = &mut body
+			else {
+				return Err(invalid(
+					&self.artifact.definition,
+					"zero-argument generic method value did not lower to unary dispatch",
+				));
+			};
+			*dispatched_receiver = Box::new(receiver_value);
+			return Ok(HirExpr::Call {
+				callee: Box::new(HirExpr::Closure {
+					params: vec![receiver_name],
+					body: Box::new(HirExpr::Closure {
+						params,
+						body: Box::new(body),
+					}),
+				}),
+				args: vec![self.lower(receiver)?],
+			});
+		}
 		let (member, implementation, external) = match dispatch {
 			crate::StableDispatch::Direct {
 				member,
@@ -3150,7 +3208,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			});
 		}
 		let method: EcoString = self.context.member_name(member)?.as_str().into();
-		if arguments.len() != 1 {
+		if arguments.len() > 1 {
 			self.record_unresolved_call(UnresolvedRuntimeCall::GenericDispatch {
 				interface: interface.clone(),
 				member: member.clone(),
@@ -3223,28 +3281,33 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				has_nominal_fallback = true;
 				continue;
 			};
-			let parameter_type = interface_member.parameters.first().ok_or_else(|| {
-				invalid(
-					&self.artifact.definition,
-					"single-argument generic dispatch member has no exact parameter shape",
-				)
-			})?;
-			let argument_type = match &parameter_type.ty {
-				InterfaceType::Generic(parameter) => implementation
-					.interface_argument_bindings
-					.iter()
-					.find(|(candidate, _)| candidate == parameter)
-					.map(|(_, ty)| ty.clone())
-					.ok_or_else(|| {
-						invalid(
-							&implementation.id,
-							"generic dispatch implementation is missing its exact interface argument binding",
-						)
-					})?,
-				other => substitute_self_type(other, &implementation.self_type),
-			};
-			let Some(argument_tag) = stable_runtime_tag(&argument_type) else {
-				continue;
+			let argument_tag = if arguments.is_empty() {
+				receiver_tag.clone()
+			} else {
+				let parameter_type = interface_member.parameters.first().ok_or_else(|| {
+					invalid(
+						&self.artifact.definition,
+						"single-argument generic dispatch member has no exact parameter shape",
+					)
+				})?;
+				let argument_type = match &parameter_type.ty {
+					InterfaceType::Generic(parameter) => implementation
+						.interface_argument_bindings
+						.iter()
+						.find(|(candidate, _)| candidate == parameter)
+						.map(|(_, ty)| ty.clone())
+						.ok_or_else(|| {
+							invalid(
+								&implementation.id,
+								"generic dispatch implementation is missing its exact interface argument binding",
+							)
+						})?,
+					other => substitute_self_type(other, &implementation.self_type),
+				};
+				let Some(argument_tag) = stable_runtime_tag(&argument_type) else {
+					continue;
+				};
+				argument_tag
 			};
 			if receiver_tag != argument_tag {
 				continue;
@@ -3345,13 +3408,22 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				member: member.clone(),
 			});
 		}
-		Ok(HirExpr::BoundDispatch {
-			interface: interface_shape.name,
-			method,
-			receiver: Box::new(self.lower(receiver)?),
-			argument: Box::new(self.lower(arguments[0])?),
-			cases,
-		})
+		if arguments.is_empty() {
+			Ok(HirExpr::UnaryBoundDispatch {
+				interface: interface_shape.name,
+				method,
+				receiver: Box::new(self.lower(receiver)?),
+				cases,
+			})
+		} else {
+			Ok(HirExpr::BoundDispatch {
+				interface: interface_shape.name,
+				method,
+				receiver: Box::new(self.lower(receiver)?),
+				argument: Box::new(self.lower(arguments[0])?),
+				cases,
+			})
+		}
 	}
 	fn lower_spread(&self, value: &StableExpr) -> Result<HirExpr, StableLoweringError> {
 		match self.ty(value)? {
@@ -3698,7 +3770,16 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		if let StableExprKind::Range(
 			StableRange::Exclusive { min, max } | StableRange::Inclusive { min, max },
 		) = &iterable.kind
-		{
+			&& (matches!(min.kind, StableExprKind::Int(_) | StableExprKind::UInt(_))
+				|| matches!(
+					self
+						.annotations
+						.types
+						.iter()
+						.find(|(id, _)| *id == self.id(min))
+						.map(|(_, ty)| ty),
+					Some(InterfaceType::Int | InterfaceType::UInt)
+				)) {
 			let inclusive = matches!(
 				iterable.kind,
 				StableExprKind::Range(StableRange::Inclusive { .. })
@@ -3719,92 +3800,131 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			self.scopes.borrow_mut().push(HashMap::new());
 			let current = self.declare(&"$range_current".into());
 			let end = self.declare(&"$range_end".into());
+			let done = self.declare(&"$range_done".into());
 			let pat = self.lower_pattern(variable)?;
-			let body = self.lower(body)?;
+			let body = self.lower_loop_branch(body)?;
 			self.scopes.borrow_mut().pop();
 			let current_expr = || HirExpr::Local(current.clone());
 			let end_expr = || HirExpr::Local(end.clone());
-			return Ok(HirExpr::Block {
-				stmts: vec![
-					HirStmt::Let {
-						name: current.clone(),
-						mutable: true,
-						value: self.lower(min)?,
+			let advance = HirExpr::Assign {
+				target: Box::new(current_expr()),
+				value: Box::new(HirExpr::Binary {
+					op: BinOp::Add,
+					result: number,
+					lhs: Box::new(current_expr()),
+					rhs: Box::new(HirExpr::Num(
+						1.0,
+						if number == BuiltinResult::UInt {
+							NumKind::UInt
+						} else {
+							NumKind::Int
+						},
+					)),
+				}),
+			};
+			let upper_boundary = HirExpr::Binary {
+				op: BinOp::Ge,
+				result: BuiltinResult::Boolean,
+				lhs: Box::new(current_expr()),
+				rhs: Box::new(HirExpr::Num(
+					9007199254740991.0,
+					if number == BuiltinResult::UInt {
+						NumKind::UInt
+					} else {
+						NumKind::Int
 					},
-					HirStmt::Let {
-						name: end.clone(),
-						mutable: false,
-						value: self.lower(max)?,
-					},
-					HirStmt::Expr(HirExpr::While {
-						cond: Box::new(HirExpr::Binary {
+				)),
+			};
+			let step_boundary = if number == BuiltinResult::Int {
+				HirExpr::Binary {
+					op: BinOp::Or,
+					result: BuiltinResult::Boolean,
+					lhs: Box::new(upper_boundary),
+					rhs: Box::new(HirExpr::Binary {
+						op: BinOp::Lt,
+						result: BuiltinResult::Boolean,
+						lhs: Box::new(current_expr()),
+						rhs: Box::new(HirExpr::Num(-9007199254740991.0, NumKind::Int)),
+					}),
+				}
+			} else {
+				upper_boundary
+			};
+			let stop_after_current = if inclusive {
+				HirExpr::Binary {
+					op: BinOp::Or,
+					result: BuiltinResult::Boolean,
+					lhs: Box::new(HirExpr::Binary {
+						op: BinOp::Eq,
+						result: BuiltinResult::Boolean,
+						lhs: Box::new(current_expr()),
+						rhs: Box::new(end_expr()),
+					}),
+					rhs: Box::new(step_boundary),
+				}
+			} else {
+				step_boundary
+			};
+			let update = HirExpr::If {
+				cond: Box::new(stop_after_current),
+				then: Box::new(HirExpr::Assign {
+					target: Box::new(HirExpr::Local(done.clone())),
+					value: Box::new(HirExpr::Bool(true)),
+				}),
+				otherwise: Some(Box::new(advance)),
+			};
+			let stmts = vec![
+				HirStmt::Let {
+					name: current.clone(),
+					mutable: true,
+					value: self.lower(min)?,
+				},
+				HirStmt::Let {
+					name: end.clone(),
+					mutable: false,
+					value: self.lower(max)?,
+				},
+				HirStmt::Let {
+					name: done.clone(),
+					mutable: true,
+					value: HirExpr::Bool(false),
+				},
+				HirStmt::Expr(HirExpr::While {
+					cond: Box::new(HirExpr::Binary {
+						op: BinOp::And,
+						result: BuiltinResult::Boolean,
+						lhs: Box::new(HirExpr::Unary {
+							op: UnOp::Not,
+							result: BuiltinResult::Boolean,
+							operand: Box::new(HirExpr::Local(done)),
+						}),
+						rhs: Box::new(HirExpr::Binary {
 							op: if inclusive { BinOp::Le } else { BinOp::Lt },
 							result: BuiltinResult::Boolean,
 							lhs: Box::new(current_expr()),
 							rhs: Box::new(end_expr()),
 						}),
-						body: Box::new(HirExpr::Block {
-							stmts: vec![
-								HirStmt::Expr(HirExpr::Match {
-									scrutinee: Box::new(current_expr()),
-									arms: vec![HirArm {
-										pat,
-										guard: None,
-										body,
-									}],
-								}),
-								HirStmt::Expr(HirExpr::Assign {
-									target: Box::new(current_expr()),
-									value: Box::new(HirExpr::Binary {
-										op: BinOp::Add,
-										result: number,
-										lhs: Box::new(current_expr()),
-										rhs: Box::new(HirExpr::Num(
-											1.0,
-											if number == BuiltinResult::UInt {
-												NumKind::UInt
-											} else {
-												NumKind::Int
-											},
-										)),
-									}),
-								}),
-							],
-							tail: None,
-						}),
 					}),
-				],
-				tail: None,
-			});
+					body: Box::new(HirExpr::Block {
+						stmts: vec![
+							HirStmt::Expr(HirExpr::Match {
+								scrutinee: Box::new(current_expr()),
+								arms: vec![HirArm {
+									pat,
+									guard: None,
+									body,
+								}],
+							}),
+							HirStmt::Expr(update),
+						],
+						tail: None,
+					}),
+				}),
+			];
+			return Ok(HirExpr::Block { stmts, tail: None });
 		}
-		if matches!(iterable.kind, StableExprKind::Range(_)) {
-			return Err(self.unsupported(iterable, "range/protocol"));
-		}
-		let native_range = matches!(
-			iterable.kind,
-			StableExprKind::Range(StableRange::Exclusive { .. } | StableRange::Inclusive { .. })
-		);
-		let source = if let StableExprKind::Range(
-			StableRange::Exclusive { min, max } | StableRange::Inclusive { min, max },
-		) = &iterable.kind
-		{
-			HirExpr::New {
-				class: "NymphRange".into(),
-				fields: vec![
-					("start".into(), self.lower(min)?),
-					("end".into(), self.lower(max)?),
-					(
-						"inclusive".into(),
-						HirExpr::Bool(matches!(
-							iterable.kind,
-							StableExprKind::Range(StableRange::Inclusive { .. })
-						)),
-					),
-				],
-			}
-		} else {
-			self.lower(iterable)?
-		};
+		let native_range = false;
+		let source = self.lower(iterable)?;
 		let iteration = self
 			.annotations
 			.iterations
@@ -3920,7 +4040,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		let it_name = self.declare(&"$it".into());
 		let go = self.declare(&"$go".into());
 		let pat = self.lower_pattern(variable)?;
-		let body = self.lower(body)?;
+		let body = self.lower_loop_branch(body)?;
 		self.scopes.borrow_mut().pop();
 		let call = HirExpr::Call {
 			callee: Box::new(HirExpr::Field {
@@ -4359,7 +4479,27 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						value.as_ref().map(|value| self.lower(value)).transpose()?,
 					));
 				}
-				StableStatement::Expr(expr) if last => tail = Some(Box::new(self.lower(expr)?)),
+				StableStatement::Expr(expr) if matches!(expr.kind, StableExprKind::Break { .. }) => {
+					let StableExprKind::Break {
+						value: None,
+						label: None,
+					} = &expr.kind
+					else {
+						return Err(self.unsupported(expr, "valued or labeled break"));
+					};
+					if self.loop_depth.get() == 0 {
+						return Err(self.unsupported(expr, "break outside a loop"));
+					}
+					stmts.push(HirStmt::Break);
+				}
+				StableStatement::Expr(expr) if last => {
+					let lowered = self.lower(expr)?;
+					if contains_break(&lowered) {
+						stmts.push(HirStmt::Expr(lowered));
+					} else {
+						tail = Some(Box::new(lowered));
+					}
+				}
 				StableStatement::Expr(expr) => stmts.push(HirStmt::Expr(self.lower(expr)?)),
 			}
 		}
@@ -4367,6 +4507,24 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			self.scopes.borrow_mut().pop();
 		}
 		Ok(HirExpr::Block { stmts, tail })
+	}
+}
+
+fn contains_break(expr: &HirExpr) -> bool {
+	match expr {
+		HirExpr::Block { stmts, tail } => {
+			stmts.iter().any(|stmt| match stmt {
+				HirStmt::Break => true,
+				HirStmt::Expr(expr) => contains_break(expr),
+				HirStmt::Let { .. } | HirStmt::Return(_) => false,
+			}) || tail.as_deref().is_some_and(contains_break)
+		}
+		HirExpr::If {
+			then, otherwise, ..
+		} => contains_break(then) || otherwise.as_deref().is_some_and(contains_break),
+		HirExpr::While { .. } => false,
+		HirExpr::Match { arms, .. } => arms.iter().any(|arm| contains_break(&arm.body)),
+		_ => false,
 	}
 }
 

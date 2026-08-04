@@ -1835,6 +1835,148 @@ func exercise(): int = {
 	assert_eq!(run(src, "exercise()"), "12345671234547");
 }
 
+#[test]
+fn runs_fallible_steps_and_directional_canonical_ranges() {
+	let src = r#"
+func push_digit(acc: int, value: int): int = acc * 10 + value
+
+func direct_and_stored(): int = {
+  let mut direct = 0
+  for (value in 1..=3) { direct = push_digit(direct, value) }
+  let stored = 1..=3
+  let mut indirect = 0
+  for (value in stored) { indirect = push_digit(indirect, value) }
+  direct * 1000 + indirect
+}
+
+func reversed_ranges(): int = {
+  let mut result = 0
+  for (value in (1..4).reversed()) { result = push_digit(result, value) }
+  for (value in (1..=4).reversed()) { result = push_digit(result, value) }
+  for (value in (4..1).reversed()) { result = push_digit(result, value) }
+  result
+}
+
+func reversed_startless(): int = {
+  for (value in (..4).reversed()) {
+    return value * 10 + inclusive_start()
+  }
+  0
+}
+
+func inclusive_start(): int = {
+  for (value in (..=3).reversed()) {
+    return value
+  }
+  0
+}
+
+func open_forward(): int = {
+  for (value in 7..) {
+    return value
+  }
+  0
+}
+
+func char_points(): int = {
+  let mut result = 0
+  for (value in '\uD7FE'..='\uE001') {
+    let point = value as int
+    result = result * 10 + if (point == 55294) 1 else if (point == 55295) 2 else if (point == 57344) 3 else 4
+  }
+  result
+}
+
+func first_class_next<T: Step>(value: T): Option<T> = {
+  let next = value.next
+  next()
+}
+
+func step_edges(): #(boolean, boolean, boolean, boolean, boolean, boolean, boolean, boolean, int, int) = #(
+  9007199254740991.next().is_none(),
+  (-9007199254740991).previous().is_none(),
+  0u.previous().is_none(),
+  (1114111 as char).next().is_none(),
+  (0 as char).previous().is_none(),
+  (-9007199254740992).next().is_none(),
+  9007199254740992u.previous().is_none(),
+  first_class_next(9007199254740991).is_none(),
+  match ('\uD7FF'.next()) { Some(value) -> value as int, None -> -1 },
+  match ('\uE000'.previous()) { Some(value) -> value as int, None -> -1 },
+)
+
+func direct_and_stored_boundary(): int = {
+  let mut direct = 0
+  for (_ in 9007199254740991..9007199254740994) { direct = direct + 1 }
+  let stored = 9007199254740991..9007199254740994
+  let mut indirect = 0
+  for (_ in stored) { indirect = indirect + 1 }
+  direct * 10 + indirect
+}
+"#;
+	assert_eq!(run(src, "direct_and_stored()"), "123123");
+	assert_eq!(run(src, "reversed_ranges()"), "3214321");
+	assert_eq!(run(src, "reversed_startless()"), "33");
+	assert_eq!(run(src, "open_forward()"), "7");
+	assert_eq!(run(src, "char_points()"), "1234");
+	assert_eq!(run(src, "direct_and_stored_boundary()"), "11");
+	assert_eq!(
+		run(src, "JSON.stringify(nymphTestValue(step_edges()))"),
+		"[true,true,true,true,true,true,true,true,57344,55295]"
+	);
+}
+
+#[test]
+fn break_terminates_open_direct_and_stored_ranges() {
+	let src = r#"
+func exercise(): int = {
+  let mut result = 0
+  for (value in 7..) {
+    result = value
+    break
+  }
+  result
+}
+
+func bounded_direct(): int = {
+  let mut result = 0
+  for (value in 1..=5) {
+    result = result * 10 + value
+    if (value == 3) { break }
+  }
+  result
+}
+
+func bounded_stored(): int = {
+  let range = 1..=5
+  let mut result = 0
+  for (value in range) {
+    result = result * 10 + value
+    if (value == 3) { break }
+  }
+  result
+}
+"#;
+	assert_eq!(run(src, "exercise()"), "7");
+	assert_eq!(run(src, "bounded_direct()"), "123");
+	assert_eq!(run(src, "bounded_stored()"), "123");
+	for diagnostics in [
+		nymph_compiler::compile("func invalid(): void = { break }", "invalid").unwrap_err(),
+		nymph_compiler::compile(
+			"func invalid(): void = for (_ in 1..) { let stop = () -> { break } stop() }",
+			"invalid_closure",
+		)
+		.unwrap_err(),
+	] {
+		assert!(
+			diagnostics
+				.iter()
+				.any(|diagnostic| diagnostic.message.contains("break outside a loop")),
+			"{diagnostics:?}"
+		);
+	}
+}
+
 // ── Iterator for-loops (Tier 1, Track A) ─────────────────────────────────────
 
 #[test]

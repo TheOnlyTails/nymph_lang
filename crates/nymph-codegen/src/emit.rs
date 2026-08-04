@@ -1188,6 +1188,38 @@ impl<'a> Emitter<'a> {
 		self.arrow_iife(receiver_param, argument_iife, self.emit_expr(receiver))
 	}
 
+	fn emit_unary_bound_dispatch(
+		&self,
+		method: &str,
+		receiver: &HirExpr,
+		cases: &[HirBoundDispatchCase],
+	) -> Expression<'a> {
+		let receiver_param = self.gensym();
+		let receiver_param = self.ast.allocator.alloc_str(&receiver_param);
+		let mut body = self.member_call(self.ident(receiver_param), method, vec![]);
+		for case in cases.iter().rev() {
+			let test = self.strict_eq(
+				self.tag_read(self.ident(receiver_param), true),
+				self.global_symbol(&case.receiver_tag),
+			);
+			let target_name = match &case.target {
+				HirBoundDispatchTarget::TopLevel { module, name } => {
+					self.route_module_symbol(module, name, false)
+				}
+				HirBoundDispatchTarget::Extern { module, symbol } => {
+					self.route_module_symbol(module, symbol, true)
+				}
+			};
+			let target = self.ident(self.ast.allocator.alloc_str(&target_name));
+			let mut args = ArenaVec::new_in(&self.ast);
+			args.push(Argument::from(self.ident(receiver_param)));
+			let dispatched =
+				Expression::new_call_expression(SPAN, target, oxc::ast::NONE, args, false, &self.ast);
+			body = Expression::new_conditional_expression(SPAN, test, dispatched, body, &self.ast);
+		}
+		self.arrow_iife(receiver_param, body, self.emit_expr(receiver))
+	}
+
 	fn route_module_symbol(&self, module: &str, symbol: &str, external: bool) -> String {
 		if self.current_module.as_deref() == Some(module) && !external {
 			return symbol.to_string();
@@ -1518,6 +1550,12 @@ impl<'a> Emitter<'a> {
 				cases,
 				..
 			} => self.emit_bound_dispatch(method, receiver, argument, cases),
+			HirExpr::UnaryBoundDispatch {
+				method,
+				receiver,
+				cases,
+				..
+			} => self.emit_unary_bound_dispatch(method, receiver, cases),
 			// Collection literals own a native array payload; compiler-internal
 			// accumulators remain raw arrays.
 			HirExpr::Array { kind, items } => {
@@ -2033,6 +2071,13 @@ impl<'a> Emitter<'a> {
 				);
 				let value_expr = value.as_ref().map(|v| self.emit_expr(v));
 				Statement::new_return_statement(SPAN, value_expr, &self.ast)
+			}
+			HirStmt::Break => {
+				assert!(
+					!self.in_iife_subexpr.get(),
+					"`break` inside an expression-position block/if/match cannot target its enclosing loop"
+				);
+				Statement::new_break_statement(SPAN, None, &self.ast)
 			}
 		}
 	}

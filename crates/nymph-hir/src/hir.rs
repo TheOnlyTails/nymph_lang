@@ -148,6 +148,8 @@ pub enum HirStmt {
 	/// block/if/match, where a JS `return` would target the IIFE rather than the
 	/// enclosing function (Slice 4E, Y1).
 	Return(Option<HirExpr>),
+	/// An unlabeled, valueless `break`; valid only in loop statement position.
+	Break,
 }
 
 /// The runtime numeric type a boxed numeric value carries — the one piece of
@@ -265,6 +267,15 @@ pub enum HirExpr {
 		method: EcoString,
 		receiver: Box<HirExpr>,
 		argument: Box<HirExpr>,
+		cases: Vec<HirBoundDispatchCase>,
+	},
+	/// A zero-argument method selected through a still-generic interface bound.
+	/// Like `BoundDispatch`, but dispatch depends only on the receiver's boxed
+	/// runtime tag.
+	UnaryBoundDispatch {
+		interface: EcoString,
+		method: EcoString,
+		receiver: Box<HirExpr>,
 		cases: Vec<HirBoundDispatchCase>,
 	},
 	/// A tuple, list, or compiler-internal raw array.
@@ -401,6 +412,9 @@ impl HirExpr {
 				receiver.collect_runtime_type_references(references);
 				argument.collect_runtime_type_references(references);
 			}
+			Self::UnaryBoundDispatch { receiver, .. } => {
+				receiver.collect_runtime_type_references(references);
+			}
 			Self::Array { items, .. } => collect_exprs(items, references),
 			Self::ArraySpread { elems, .. } => {
 				for item in elems {
@@ -467,6 +481,7 @@ impl HirExpr {
 								value.collect_runtime_type_references(references);
 							}
 						}
+						HirStmt::Break => {}
 					}
 				}
 				if let Some(tail) = tail {

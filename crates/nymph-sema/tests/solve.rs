@@ -494,6 +494,27 @@ fn method_resolves_through_generic_bound() {
 }
 
 #[test]
+fn fallible_bidirectional_step_signatures_preserve_self() {
+	assert_ok(
+		"enum Option<T> { Some(value: T), None }
+		 interface Step { func next(): Option<self> func previous(): Option<self> }
+		 func both<T: Step>(value: T): #(Option<T>, Option<T>) =
+		   #(value.next(), value.previous())",
+	);
+	assert_error_contains(
+		"enum Option<T> { Some(value: T), None }
+		 interface Step { func next(): Option<self> func previous(): Option<self> }
+		 struct Bad
+		 impl Step for Bad {
+		   func next(): Option<int> = Option.None
+		   func previous(): Option<Bad> = Option.None
+		 }
+		 func use(value: Bad): Option<Bad> = value.next()",
+		"mismatched types",
+	);
+}
+
+#[test]
 fn bare_method_value_is_ambiguous_across_receiver_applicable_bounds_despite_arity() {
 	assert_error_contains(
 		"interface A { func m(): int }

@@ -1688,7 +1688,7 @@ fn inherited_interface_default_dispatch_has_exact_call_and_materialization_deman
 }
 
 #[test]
-fn generic_bound_dispatch_is_direct_and_has_no_concrete_runtime_demand() {
+fn generic_bound_unary_dispatch_has_no_concrete_runtime_demand() {
 	let source = "interface Named { func name(): string }\nfunc get_name<T: Named>(value: T): string = value.name()";
 	let item = lower_named(source, "get_name");
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = item.fragment() else {
@@ -1696,12 +1696,11 @@ fn generic_bound_dispatch_is_direct_and_has_no_concrete_runtime_demand() {
 	};
 	assert_eq!(
 		function.body,
-		nymph_hir::hir::HirExpr::Call {
-			callee: Box::new(nymph_hir::hir::HirExpr::Field {
-				recv: Box::new(nymph_hir::hir::HirExpr::Local("value".into())),
-				name: "name".into(),
-			}),
-			args: vec![],
+		nymph_hir::hir::HirExpr::UnaryBoundDispatch {
+			interface: "Named".into(),
+			method: "name".into(),
+			receiver: Box::new(nymph_hir::hir::HirExpr::Local("value".into())),
+			cases: vec![],
 		}
 	);
 	assert_eq!(item.demands(), []);
@@ -2201,26 +2200,16 @@ fn assert_protocol_for(fragment: &nymph_sema::LoweredHirFragment, inclusive: boo
 }
 
 #[test]
-fn range_for_support_matches_legacy_for_startless_endless_and_unbounded_forms() {
-	for range in ["..3", "..=3", "1.."] {
-		let (items, _, context) = materialized_fixture(&format!(
-			"enum Option<T> {{ Some(value: T), None }}\ninterface Iterator<Item> {{ mut func next(): Option<Item> }}\ninterface Iterable<Item> {{ func iter(): Iterator<Item> }}\nstruct Range<T>(start: T, end: T)\nstruct RangeFrom<T>(start: T)\nstruct RangeTo<T>(end: T)\nstruct RangeInclusive<T>(start: T, end: T)\nstruct RangeToInclusive<T>(end: T)\nfunc each(): void = for (_ in {range}) {{ 0 }}"
-		));
-		let error = lower_runtime_definition(
-			&context,
-			Arc::new(
-				items
-					.into_iter()
-					.find(|item| source_name(&item.definition) == "each")
-					.unwrap(),
-			),
-		)
-		.unwrap_err();
-		assert!(
-			matches!(error, nymph_sema::StableLoweringError::Unsupported { ref feature, .. } if feature == "range/protocol"),
-			"{range}: {error:?}"
-		);
-	}
+fn range_from_for_uses_the_iterable_protocol() {
+	let source = "enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nstruct OpenIter(value: int)\nimpl Iterator<int> for OpenIter { mut func next(): Option<int> = Option.None }\nstruct Range<T>(start: T, end: T)\nstruct RangeFrom<T>(start: T)\nstruct RangeTo<T>(end: T)\nstruct RangeInclusive<T>(start: T, end: T)\nstruct RangeToInclusive<T>(end: T)\nimpl Iterable<int> for RangeFrom<int> { func iter(): OpenIter = OpenIter(value = this.start) }\nfunc each(): void = for (_ in 1..) { 0 }";
+	let lowered = lower_named(source, "each");
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("expected function")
+	};
+	assert!(matches!(
+		function.body,
+		nymph_hir::hir::HirExpr::Block { .. }
+	));
 }
 
 #[test]
