@@ -1317,11 +1317,19 @@ fn return_inside_a_subexpression_position_match_arm_targets_the_function() {
 fn return_works_across_general_expression_positions_and_preserves_evaluation() {
 	let src = r#"
 func id(value: int): int = value
+func direct_operand(): int = 1 + return 25
 func operand(): int = 1 + if (true) return 2 else 0
 func lazy_and(): int = { false && return 3
 4 }
 func lazy_or(): int = { true || return 5
 6 }
+func lazy_taken(): int = { true && return 26
+0 }
+func prefix_operand(): int = -(return 27)
+func cast_operand(): int = (return 28) as int
+func compound_operand(): int = { let mut value = 1
+value += return 29
+value }
 func callee(): int = (return 7)()
 func argument(): int = id(return 8)
 func member(): int = (return 9).field
@@ -1377,9 +1385,14 @@ interface DefaultValue {
 impl DefaultValue for Value {}
 "#;
 	for (call, expected) in [
+		("direct_operand()", "25"),
 		("operand()", "2"),
 		("lazy_and()", "4"),
 		("lazy_or()", "6"),
+		("lazy_taken()", "26"),
+		("prefix_operand()", "27"),
+		("cast_operand()", "28"),
+		("compound_operand()", "29"),
 		("callee()", "7"),
 		("argument()", "8"),
 		("member()", "9"),

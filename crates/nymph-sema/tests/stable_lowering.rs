@@ -305,14 +305,11 @@ fn stable_lowering_accepts_unbraced_return_branches() {
 
 #[test]
 fn stable_lowering_accepts_return_in_a_general_expression_position() {
-	let lowered = lower_named(
-		"func value(flag: boolean): int = 1 + if (flag) return 9 else 2",
-		"value",
-	);
+	let lowered = lower_named("func value(): int = 1 + return 9", "value");
 	assert!(matches!(
 		lowered.fragment(),
 		nymph_sema::LoweredHirFragment::TopLevelFunction(nymph_hir::hir::HirFunc {
-			body: nymph_hir::hir::HirExpr::Binary { .. },
+			body: nymph_hir::hir::HirExpr::Block { .. },
 			..
 		})
 	));

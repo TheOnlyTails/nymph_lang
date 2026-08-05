@@ -3576,6 +3576,12 @@ impl<'a> Lowerer<'a> {
 			ExprKind::BinaryOp { lhs, op, rhs } => self.lower_binary(expr.id, lhs, *op, rhs),
 			ExprKind::PrefixOp { op, value } => self.lower_prefix_op(expr.id, *op, value),
 			ExprKind::AssignOp { lhs, op, rhs } => {
+				if assign_binop(*op).is_some() && definitely_transfers(rhs) {
+					return HirExpr::Assign {
+						target: Box::new(self.lower_expr(lhs)),
+						value: Box::new(self.lower_expr(rhs)),
+					};
+				}
 				// A compound assignment `a op= b` desugars to `a = a op b`, dispatched
 				// per its recorded `Resolution` just like a `BinaryOp` node (Finding 1);
 				// a plain `=` (or `~=`, which has no binary form) assigns the value
@@ -3623,6 +3629,7 @@ impl<'a> Lowerer<'a> {
 			// diagnosed by the checker, e.g. `TypeError::CastRequiresInto`/
 			// `CannotCast`/`IntoInterfaceMalformed`), panics loudly rather than
 			// silently emitting the bare operand — never a lowering deferral.
+			ExprKind::TypeOp { lhs, .. } if definitely_transfers(lhs) => self.lower_expr(lhs),
 			ExprKind::TypeOp { lhs, .. } => match self.annotations.resolution_of(expr.id) {
 				Some(res) if res.dispatch == DispatchKind::BuiltinEager => {
 					self.lower_scalar_cast(expr.id, lhs)
@@ -4529,6 +4536,16 @@ impl<'a> Lowerer<'a> {
 		op: BinaryOperator,
 		rhs: &Expr,
 	) -> HirExpr {
+		if definitely_transfers(lhs) {
+			return self.lower_expr(lhs);
+		}
+		if !matches!(op, BinaryOperator::BoolAnd | BinaryOperator::BoolOr) && definitely_transfers(rhs)
+		{
+			return HirExpr::Block {
+				stmts: vec![HirStmt::Expr(self.lower_expr(lhs))],
+				tail: Some(Box::new(self.lower_expr(rhs))),
+			};
+		}
 		match op {
 			// DD1: `x |> f` lowers structurally to a `Call` — the checker already
 			// type-checked every hazardous callee shape away (a bare variant/struct
@@ -4815,6 +4832,9 @@ impl<'a> Lowerer<'a> {
 	/// lower interface default methods, and an unresolved node is a checker
 	/// bug we want to see immediately rather than silently miscompile.
 	fn lower_prefix_op(&self, id: nymph_ast::NodeId, op: PrefixOperator, value: &Expr) -> HirExpr {
+		if definitely_transfers(value) {
+			return self.lower_expr(value);
+		}
 		match self.annotations.resolution_of(id) {
 			Some(res) if res.dispatch == DispatchKind::BuiltinEager => HirExpr::Unary {
 				op: lower_prefix(op),
@@ -5917,6 +5937,34 @@ fn expr_calls_any_name(expr: &Expr, names: &FxHashSet<&EcoString>) -> bool {
 		| ExprKind::AnonymousParam(_)
 		| ExprKind::Continue { .. }
 		| ExprKind::This => false,
+	}
+}
+
+/// Whether evaluating this expression necessarily performs a control transfer.
+/// Strict operator shells with a `never` operand have no checker dispatch; lowering
+/// erases those unreachable shells while preserving evaluation of earlier operands.
+fn definitely_transfers(expr: &Expr) -> bool {
+	match &expr.kind {
+		ExprKind::Return { .. } | ExprKind::Break { .. } | ExprKind::Continue { .. } => true,
+		ExprKind::Grouped(value) => definitely_transfers(value),
+		ExprKind::Block { body, .. } => body.iter().any(|statement| match &statement.0 {
+			Statement::Let { value, .. } | Statement::Expr(value) => definitely_transfers(value),
+		}),
+		ExprKind::If {
+			condition,
+			then,
+			otherwise,
+		} => {
+			definitely_transfers(condition)
+				|| otherwise
+					.as_deref()
+					.is_some_and(|otherwise| definitely_transfers(then) && definitely_transfers(otherwise))
+		}
+		ExprKind::Match { value, arms } => {
+			definitely_transfers(value)
+				|| (!arms.is_empty() && arms.iter().all(|arm| definitely_transfers(&arm.body)))
+		}
+		_ => false,
 	}
 }
 

@@ -1430,6 +1430,19 @@ fn lowers_return_as_an_unbraced_match_arm_body() {
 }
 
 #[test]
+fn lowers_return_as_a_direct_eager_operand_without_operator_dispatch() {
+	let hir = lower("func value(): int = 1 + return 9");
+	assert!(matches!(
+		&hir.funcs[0].body,
+		HirExpr::Block { stmts, tail: Some(tail) }
+			if matches!(stmts.as_slice(), [HirStmt::Expr(HirExpr::Num(1.0, NumKind::Int))])
+				&& matches!(tail.as_ref(), HirExpr::Block { stmts, tail: None }
+					if matches!(stmts.as_slice(), [HirStmt::Return(Some(HirExpr::Num(9.0, NumKind::Int)))])
+				)
+	));
+}
+
+#[test]
 fn lowers_same_scope_let_shadow_with_a_rename() {
 	// `let x = 1; let x = x + 1` redeclares `x` in the SAME JS scope — the second
 	// binding renames to `x$1`; the RHS reads the PRIOR `x`, and the tail

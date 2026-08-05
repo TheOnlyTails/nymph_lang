@@ -2504,6 +2504,12 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				value: Box::new(self.lower(rhs)?),
 			},
 			StableExprKind::AssignOp { lhs, op, rhs } => {
+				if definitely_transfers(rhs) {
+					return Ok(HirExpr::Assign {
+						target: Box::new(self.lower(lhs)?),
+						value: Box::new(self.lower(rhs)?),
+					});
+				}
 				let binary =
 					assign_binop(*op).ok_or_else(|| self.unsupported(expr, "assignment operator"))?;
 				let value = match self.dispatch(expr)? {
@@ -4613,12 +4619,14 @@ fn cooked_escape(escape: nymph_ast::expr::StringEscape) -> String {
 		.map_or_else(|| "${".to_string(), |character| character.to_string())
 }
 
-/// Whether evaluating this expression necessarily performs a loop transfer.
+/// Whether evaluating this expression necessarily performs a control transfer.
 /// Used only to erase strict enclosing operations that can never execute after
 /// their operand; it is intentionally narrower than the lexical break scan.
 fn definitely_transfers(expr: &StableExpr) -> bool {
 	match &expr.kind {
-		StableExprKind::Break { .. } | StableExprKind::Continue { .. } => true,
+		StableExprKind::Return { .. }
+		| StableExprKind::Break { .. }
+		| StableExprKind::Continue { .. } => true,
 		StableExprKind::Grouped(value) => definitely_transfers(value),
 		StableExprKind::Block { body, .. } => body.iter().any(|statement| {
 			definitely_transfers(match statement {
