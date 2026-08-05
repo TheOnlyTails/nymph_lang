@@ -52,10 +52,11 @@ enum Subject {
 	/// minus the named keys: `new NMap(<base>)` when `keys` is empty, else an
 	/// IIFE that copies then deletes each key.
 	MapRest(Box<Subject>, Vec<HirLit>),
-	/// Select the subject bound by the matching side of a union pattern.
+	/// Select the subject bound by the matching side of a union pattern. The
+	/// decision is assigned while testing the union and shared by every binding,
+	/// so neither the test nor either extraction plan is repeated.
 	PatternSelect {
-		left_pattern: Box<HirPat>,
-		pattern_subject: Box<Subject>,
+		decision: String,
 		left: Box<Subject>,
 		right: Box<Subject>,
 	},
@@ -70,6 +71,13 @@ enum Subject {
 struct JsValue<'a> {
 	stmts: ArenaVec<'a, Statement<'a>>,
 	expr: Expression<'a>,
+}
+
+struct MatchArmControl<'a> {
+	guard: Option<Expression<'a>>,
+	test: Option<Expression<'a>>,
+	selection: Option<Expression<'a>>,
+	label: Option<&'a str>,
 }
 
 impl<'a> JsValue<'a> {
@@ -196,11 +204,12 @@ impl<'a> Emitter<'a> {
 		self
 	}
 
-	/// A fresh temporary variable name (`_t0`, `_t1`, …).
+	/// A fresh compiler-reserved temporary name. `$` is not valid in a Nymph
+	/// identifier, so generated bindings cannot collide with source locals.
 	fn gensym(&self) -> String {
 		let n = self.gensym.get();
 		self.gensym.set(n + 1);
-		format!("_t{n}")
+		format!("$nymph$temp${n}")
 	}
 
 	fn completion_name(&self) -> String {
@@ -2467,7 +2476,7 @@ impl<'a> Emitter<'a> {
 			// (post Slice 4E, Y1) trip the `return`-inside-IIFE guard for a
 			// statement-position `if`/`while`/`match` that legitimately contains a
 			// `return`. The `BlockStatement` still gives it its own JS scope
-			// (unaffected by Y2 shadowing) and keeps any gensym `let _tN` temps
+			// (unaffected by Y2 shadowing) and keeps any gensym `let $nymph$temp$N` temps
 			// scoped to it, same as before.
 			HirStmt::Expr(
 				e @ (HirExpr::Block { .. }
@@ -2758,7 +2767,7 @@ impl<'a> Emitter<'a> {
 				let mut body = ArenaVec::new_in(&self.ast);
 				for (i, arm) in arms.iter().enumerate() {
 					let is_last = i + 1 == arms.len();
-					let (test, binds) = self.compile_pat(&arm.pat, &subj);
+					let (test, binds, decisions) = self.compile_pat(&arm.pat, &subj);
 					// The pattern `test` is a compiler-INTERNAL raw JS boolean built by
 					// `compile_pat` and stays raw. The `guard`, by contrast, is the lone
 					// user-`boolean` slot inside `match`, so it reads `.v` like any other
@@ -2767,9 +2776,32 @@ impl<'a> Emitter<'a> {
 					// An unguarded last arm is the guaranteed fallback (exhaustiveness) → no
 					// test, no break. Any other arm commits then breaks, guarded by its test.
 					if is_last && arm.guard.is_none() {
-						body.push(self.match_arm(r, &binds, &arm.body, None, None, None));
+						let selection = (!decisions.is_empty()).then_some(test).flatten();
+						body.push(self.match_arm(
+							r,
+							&binds,
+							&decisions,
+							&arm.body,
+							MatchArmControl {
+								guard: None,
+								test: None,
+								selection,
+								label: None,
+							},
+						));
 					} else {
-						body.push(self.match_arm(r, &binds, &arm.body, guard, test, Some(label)));
+						body.push(self.match_arm(
+							r,
+							&binds,
+							&decisions,
+							&arm.body,
+							MatchArmControl {
+								guard,
+								test,
+								selection: None,
+								label: Some(label),
+							},
+						));
 					}
 				}
 				let block = Statement::new_block_statement(SPAN, body, &self.ast);
@@ -2944,23 +2976,16 @@ impl<'a> Emitter<'a> {
 				value.into_expression(self.ast)
 			}
 			Subject::PatternSelect {
-				left_pattern,
-				pattern_subject,
+				decision,
 				left,
 				right,
-			} => {
-				let (test, _) = self.compile_pat(left_pattern, pattern_subject);
-				match test {
-					Some(test) => Expression::new_conditional_expression(
-						SPAN,
-						test,
-						self.emit_subject(left),
-						self.emit_subject(right),
-						&self.ast,
-					),
-					None => self.emit_subject(left),
-				}
-			}
+			} => Expression::new_conditional_expression(
+				SPAN,
+				Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(decision), &self.ast),
+				self.emit_subject(left),
+				self.emit_subject(right),
+				&self.ast,
+			),
 		}
 	}
 
@@ -3031,20 +3056,20 @@ impl<'a> Emitter<'a> {
 		&self,
 		pat: &HirPat,
 		subj: &Subject,
-	) -> (Option<Expression<'a>>, Vec<(String, Subject)>) {
+	) -> (Option<Expression<'a>>, Vec<(String, Subject)>, Vec<String>) {
 		match pat {
-			HirPat::Wildcard => (None, Vec::new()),
+			HirPat::Wildcard => (None, Vec::new(), Vec::new()),
 			HirPat::Binding { name, sub } => {
 				let mut binds = vec![(name.to_string(), subj.clone())];
-				let test = match sub {
-					None => None,
+				let (test, decisions) = match sub {
+					None => (None, Vec::new()),
 					Some(sub) => {
-						let (t, mut b) = self.compile_pat(sub, subj);
+						let (t, mut b, decisions) = self.compile_pat(sub, subj);
 						binds.append(&mut b);
-						t
+						(t, decisions)
 					}
 				};
-				(test, binds)
+				(test, binds, decisions)
 			}
 			HirPat::Lit(lit) => {
 				let subject = self.unwrap_v(self.emit_subject(subj));
@@ -3056,7 +3081,7 @@ impl<'a> Emitter<'a> {
 					value,
 					&self.ast,
 				);
-				(Some(test), Vec::new())
+				(Some(test), Vec::new(), Vec::new())
 			}
 			HirPat::Variant {
 				enum_name,
@@ -3074,41 +3099,47 @@ impl<'a> Emitter<'a> {
 					&self.ast,
 				);
 				let mut binds = Vec::new();
+				let mut decisions = Vec::new();
 				for (field, sub) in fields {
 					let field_subj = Subject::Field(Box::new(subj.clone()), field.to_string());
-					let (t, mut b) = self.compile_pat(sub, &field_subj);
+					let (t, mut b, mut d) = self.compile_pat(sub, &field_subj);
 					binds.append(&mut b);
+					decisions.append(&mut d);
 					if let Some(t) = t {
 						test =
 							Expression::new_logical_expression(SPAN, test, LogicalOperator::And, t, &self.ast);
 					}
 				}
-				(Some(test), binds)
+				(Some(test), binds, decisions)
 			}
 			// A struct pattern is irrefutable at its own level (nominal type guarantees
 			// the shape); a field sub-pattern may still contribute a test.
 			HirPat::Struct { fields } => {
 				let mut test: Option<Expression<'a>> = None;
 				let mut binds = Vec::new();
+				let mut decisions = Vec::new();
 				for (field, sub) in fields {
 					let field_subj = Subject::Field(Box::new(subj.clone()), field.to_string());
-					let (t, mut b) = self.compile_pat(sub, &field_subj);
+					let (t, mut b, mut d) = self.compile_pat(sub, &field_subj);
 					binds.append(&mut b);
+					decisions.append(&mut d);
 					test = self.and_test(test, t);
 				}
-				(test, binds)
+				(test, binds, decisions)
 			}
 			// A tuple pattern binds by index; irrefutable at its own level.
 			HirPat::Tuple(elems) => {
 				let mut test: Option<Expression<'a>> = None;
 				let mut binds = Vec::new();
+				let mut decisions = Vec::new();
 				for (i, sub) in elems.iter().enumerate() {
 					let elem_subj = Subject::Index(Box::new(subj.clone()), i);
-					let (t, mut b) = self.compile_pat(sub, &elem_subj);
+					let (t, mut b, mut d) = self.compile_pat(sub, &elem_subj);
 					binds.append(&mut b);
+					decisions.append(&mut d);
 					test = self.and_test(test, t);
 				}
-				(test, binds)
+				(test, binds, decisions)
 			}
 			// A list pattern: a length test (exact or `>=`), element bindings by index
 			// (prefix from the front, suffix from the end), and an optional rest slice.
@@ -3155,31 +3186,35 @@ impl<'a> Emitter<'a> {
 					))
 				};
 				let mut binds = Vec::new();
+				let mut decisions = Vec::new();
 				for (i, sub) in prefix.iter().enumerate() {
 					let elem = Subject::Index(Box::new(subj.clone()), i);
-					let (t, mut b) = self.compile_pat(sub, &elem);
+					let (t, mut b, mut d) = self.compile_pat(sub, &elem);
 					binds.append(&mut b);
+					decisions.append(&mut d);
 					test = self.and_test(test, t);
 				}
 				let suf_len = suffix.len();
 				for (j, sub) in suffix.iter().enumerate() {
 					// The j-th suffix element is `suf_len - j` from the end.
 					let elem = Subject::IndexFromEnd(Box::new(subj.clone()), suf_len - j);
-					let (t, mut b) = self.compile_pat(sub, &elem);
+					let (t, mut b, mut d) = self.compile_pat(sub, &elem);
 					binds.append(&mut b);
+					decisions.append(&mut d);
 					test = self.and_test(test, t);
 				}
 				if let Some(Some(name)) = rest {
 					let slice = Subject::Slice(Box::new(subj.clone()), prefix.len(), suffix.len(), *kind);
 					binds.push((name.to_string(), slice));
 				}
-				(test, binds)
+				(test, binds, decisions)
 			}
 			// A map pattern: for each `key: vpat`, test `_s.has(key)` and match `vpat`
 			// against `_s.get(key)`; an optional `...rest` binds the rest-of-map.
 			HirPat::Map { entries, rest } => {
 				let mut test: Option<Expression<'a>> = None;
 				let mut binds = Vec::new();
+				let mut decisions = Vec::new();
 				for (key, vpat) in entries {
 					let has = self.member_call(
 						self.emit_subject(subj),
@@ -3188,8 +3223,9 @@ impl<'a> Emitter<'a> {
 					);
 					test = self.and_test(test, Some(has));
 					let val = Subject::MapGet(Box::new(subj.clone()), key.clone());
-					let (t, mut b) = self.compile_pat(vpat, &val);
+					let (t, mut b, mut d) = self.compile_pat(vpat, &val);
 					binds.append(&mut b);
+					decisions.append(&mut d);
 					test = self.and_test(test, t);
 				}
 				if let Some(Some(name)) = rest {
@@ -3197,45 +3233,86 @@ impl<'a> Emitter<'a> {
 					let rest_subj = Subject::MapRest(Box::new(subj.clone()), keys);
 					binds.push((name.to_string(), rest_subj));
 				}
-				(test, binds)
+				(test, binds, decisions)
 			}
 			// A range pattern: bound comparisons against the subject.
-			HirPat::Range(range) => (Some(self.compile_range(range, subj)), Vec::new()),
+			HirPat::Range(range) => (
+				Some(self.compile_range(range, subj)),
+				Vec::new(),
+				Vec::new(),
+			),
 			// A union matches if either side matches. Sema/lowering guarantee both
 			// alternatives bind the same emitted names; select each value from the
 			// side whose test matched.
 			HirPat::Or(a, b) => {
-				let (ta, ba) = self.compile_pat(a, subj);
-				let (tb, bb) = self.compile_pat(b, subj);
+				let (ta, ba, mut decisions) = self.compile_pat(a, subj);
+				let (tb, bb, mut right_decisions) = self.compile_pat(b, subj);
+				decisions.append(&mut right_decisions);
 				let mut right_by_name: std::collections::HashMap<_, _> = bb.into_iter().collect();
+				if ba.is_empty() {
+					debug_assert!(right_by_name.is_empty());
+					let test = match (ta, tb) {
+						(Some(a), Some(b)) => Some(Expression::new_logical_expression(
+							SPAN,
+							a,
+							LogicalOperator::Or,
+							b,
+							&self.ast,
+						)),
+						(None, _) => None,
+						(Some(a), None) => Some(Expression::new_logical_expression(
+							SPAN,
+							a,
+							LogicalOperator::Or,
+							Expression::new_boolean_literal(SPAN, true, &self.ast),
+							&self.ast,
+						)),
+					};
+					return (test, Vec::new(), decisions);
+				}
+
+				let Some(left_test) = ta else {
+					// The left side is irrefutable, so source-order short-circuiting means
+					// the right extraction plan is unreachable.
+					return (None, ba, decisions);
+				};
+				let decision = self.gensym();
+				let decision_name = self.ast.allocator.alloc_str(&decision);
+				let assigned_left = Expression::new_assignment_expression(
+					SPAN,
+					AssignmentOperator::Assign,
+					self.assign_target(decision_name),
+					left_test,
+					&self.ast,
+				);
+				let right_test =
+					tb.unwrap_or_else(|| Expression::new_boolean_literal(SPAN, true, &self.ast));
+				let test = Some(Expression::new_logical_expression(
+					SPAN,
+					assigned_left,
+					LogicalOperator::Or,
+					right_test,
+					&self.ast,
+				));
 				let binds = ba
 					.into_iter()
 					.map(|(name, left)| {
 						let right = right_by_name
 							.remove(&name)
 							.expect("union alternatives must bind the same names");
-						let selected = Subject::PatternSelect {
-							left_pattern: a.clone(),
-							pattern_subject: Box::new(subj.clone()),
-							left: Box::new(left),
-							right: Box::new(right),
-						};
-						(name, selected)
+						(
+							name,
+							Subject::PatternSelect {
+								decision: decision.clone(),
+								left: Box::new(left),
+								right: Box::new(right),
+							},
+						)
 					})
 					.collect();
 				debug_assert!(right_by_name.is_empty());
-				// A `None` sub-test means that side is irrefutable ⇒ the whole `Or` is.
-				let test = match (ta, tb) {
-					(Some(a), Some(b)) => Some(Expression::new_logical_expression(
-						SPAN,
-						a,
-						LogicalOperator::Or,
-						b,
-						&self.ast,
-					)),
-					_ => None,
-				};
-				(test, binds)
+				decisions.push(decision);
+				(test, binds, decisions)
 			}
 		}
 	}
@@ -3307,10 +3384,9 @@ impl<'a> Emitter<'a> {
 		&self,
 		result: &'a str,
 		binds: &[(String, Subject)],
+		decisions: &[String],
 		body: &HirExpr,
-		guard: Option<Expression<'a>>,
-		test: Option<Expression<'a>>,
-		label: Option<&'a str>,
+		control: MatchArmControl<'a>,
 	) -> Statement<'a> {
 		// commit: `<result> = <body>;` then `break <label>;` (unless this is the tail arm).
 		let mut commit = ArenaVec::new_in(&self.ast);
@@ -3324,14 +3400,14 @@ impl<'a> Emitter<'a> {
 			&self.ast,
 		);
 		commit.push(Statement::new_expression_statement(SPAN, assign, &self.ast));
-		if let Some(label) = label {
+		if let Some(label) = control.label {
 			commit.push(Statement::new_break_statement(
 				SPAN,
 				Some(LabelIdentifier::new(SPAN, label, &self.ast)),
 				&self.ast,
 			));
 		}
-		let committed = match guard {
+		let committed = match control.guard {
 			Some(guard) => {
 				let commit_block = Statement::new_block_statement(SPAN, commit, &self.ast);
 				Statement::new_if_statement(SPAN, guard, commit_block, None, &self.ast)
@@ -3346,10 +3422,24 @@ impl<'a> Emitter<'a> {
 		}
 		block.push(committed);
 		let block = Statement::new_block_statement(SPAN, block, &self.ast);
-		match test {
+		let arm = match control.test {
 			Some(test) => Statement::new_if_statement(SPAN, test, block, None, &self.ast),
 			None => block,
+		};
+		if decisions.is_empty() {
+			return arm;
 		}
+		let mut scoped = ArenaVec::new_in(&self.ast);
+		for decision in decisions {
+			scoped.push(self.let_uninit(self.ast.allocator.alloc_str(decision)));
+		}
+		if let Some(selection) = control.selection {
+			scoped.push(Statement::new_expression_statement(
+				SPAN, selection, &self.ast,
+			));
+		}
+		scoped.push(arm);
+		Statement::new_block_statement(SPAN, scoped, &self.ast)
 	}
 
 	fn emit_binary(

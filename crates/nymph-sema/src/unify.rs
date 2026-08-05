@@ -104,6 +104,11 @@ impl UnifyTable {
 		self.table.snapshot()
 	}
 
+	/// Keep every binding made since `snapshot` and close the trial.
+	pub fn commit(&mut self, snapshot: UnifySnapshot) {
+		self.table.commit(snapshot);
+	}
+
 	/// Discard every binding made since `snapshot`.
 	pub fn rollback_to(&mut self, snapshot: UnifySnapshot) {
 		self.table.rollback_to(snapshot);

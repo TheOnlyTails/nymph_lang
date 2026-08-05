@@ -88,7 +88,11 @@ fn collect_pattern_bindings(
 						collect_pattern_bindings(value, bindings, is_variant, emit);
 					}
 					StructPatternField::Named(name) => {
-						insert_pattern_binding(name, bindings, emit);
+						// A bare name in the sole positional field can resolve to a
+						// nullary variant pattern rather than a shorthand binding.
+						if !is_variant(field.1) {
+							insert_pattern_binding(name, bindings, emit);
+						}
 					}
 					StructPatternField::Rest => {}
 				}
@@ -345,7 +349,31 @@ impl Checker<'_> {
 		// to agree before exposing one binding to the arm body.
 		for (name, left_binding) in left_bindings {
 			if let Some(right_binding) = right_bindings.remove(&name) {
-				self.unify(left_binding.ty, right_binding.ty, span);
+				// Binding mutability is inherited from the enclosing pattern today, but
+				// keep it part of the checked contract rather than relying on that AST
+				// restriction in lowering/codegen.
+				if left_binding.mutable != right_binding.mutable {
+					self.emit(
+						span,
+						TypeError::InconsistentUnionBindingMutability { name: name.clone() },
+					);
+				}
+				let snapshot = self.table.snapshot();
+				if self.try_unify(left_binding.ty, right_binding.ty) {
+					self.table.commit(snapshot);
+				} else {
+					self.table.rollback_to(snapshot);
+					let left = self.display(left_binding.ty);
+					let right = self.display(right_binding.ty);
+					self.emit(
+						span,
+						TypeError::InconsistentUnionBindingType {
+							name: name.clone(),
+							left,
+							right,
+						},
+					);
+				}
 			}
 			self.define_local(name, left_binding.ty, mutable);
 		}

@@ -239,7 +239,53 @@ fn binding_subpattern_union_requires_compatible_binding_types() {
 		 func bad(value: Value): int = match (value) {
 		   Number(x) | Text(x) -> 0,
 		 }",
-		"mismatched types",
+		"mismatched types for union pattern binding `x`",
+	);
+	assert_error_contains(
+		"enum Value { Mutable(value: mut #[int]), Immutable(value: #[int]) }
+		 func bad(value: Value): int = match (value) {
+		   Mutable(x) | Immutable(x) -> 0,
+		 }",
+		"mismatched types for union pattern binding `x`",
+	);
+}
+
+#[test]
+fn binding_subpattern_union_accepts_reordered_and_nested_shared_bindings() {
+	assert_ok(
+		"func select(value: #(int, int)): #(int, int) = match (value) {
+		   (#(x = 1, y) | #(y, x = 2)) | #(x, y = 3) -> #(x, y),
+		   _ -> #(0, 0),
+		 }",
+	);
+}
+
+#[test]
+fn binding_subpattern_nested_union_rejects_missing_and_duplicate_names() {
+	assert_error_contains(
+		"func bad(value: #(int, int)): int = match (value) {
+		   (#(x, y) | #(x, y)) | #(x, _) -> 0,
+		   _ -> 1,
+		 }",
+		"same names",
+	);
+	assert_error_contains(
+		"func bad(value: #(int, int)): int = match (value) {
+		   (#(x, x) | #(x, _)) -> 0,
+		   _ -> 1,
+		 }",
+		"bound more than once",
+	);
+}
+
+#[test]
+fn positional_nullary_variant_unions_bind_no_names() {
+	assert_ok(
+		"enum Inner { None, Zero }
+		 enum Outer { Wrap(value: Inner) }
+		 func classify(value: Outer): int = match (value) {
+		   Wrap(None) | Wrap(Zero) -> 1,
+		 }",
 	);
 }
 
