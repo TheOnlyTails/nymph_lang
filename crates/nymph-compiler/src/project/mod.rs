@@ -3,6 +3,12 @@
 //! The public convenience functions discover sources through caller-provided
 //! loaders, populate a [`CompilerSession`], and delegate checking, lowering,
 //! emission, and inspection to the canonical query pipeline.
+//!
+//! `CompilerSession` is the sole owner of project/module identity, source
+//! inputs, Salsa storage, and the semantic graph. A CLI facade creates one
+//! session per invocation; long-lived tools retain one and update source
+//! inputs. Forward dependencies come from tracked import resolution and the
+//! reverse-importer relation is derived from that same graph.
 
 mod assembly;
 mod bundle;

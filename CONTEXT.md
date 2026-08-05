@@ -27,3 +27,25 @@ _Avoid_: builtin.
 **Marshalling**:
 Converting a boxed value to a raw value, or the reverse, at the JavaScript-interop boundary.
 _Avoid_: conversion, casting (a cast is a Nymph-level `as` between types).
+
+## Compiler architecture
+
+**Compiler session**:
+The compiler-owned, in-process lifetime for incremental analysis. `nymph-compiler` exclusively owns `CompilerSession`, `ProjectId`, `ModulePath`, Salsa inputs/storage, semantic identities, and the project graph. A CLI request creates a short-lived session; the LSP retains one across document notifications. State is never persisted across processes.
+_Avoid_: putting semantic IDs or Salsa state in `nymph-project`, or maintaining a frontend analysis cache alongside the session.
+
+**Project filesystem policy**:
+Manifest discovery/schema and lexical filesystem path conversion owned by `nymph-project`. It converts files to the compiler's canonical `ModulePath`, but does not define semantic identity, acquire live editor text, or own compiler state. CLI and LSP adapters may retain only command/protocol-specific selection and URI behavior.
+_Avoid_: duplicating manifest discovery or module/file conversion in a frontend.
+
+**Effective source input**:
+The source text currently installed for a `(ProjectId, ModulePath)`. The LSP initially installs disk sources, replaces one with open-document text on open/change, and restores the latest disk text (or removes the module if absent) on close. Document versions are publication guards and metadata, not Salsa identity.
+_Avoid_: keying analysis by source text, URI, or LSP version.
+
+**Incremental query graph**:
+The tracked parse, import, semantic-analysis, diagnostics, lowering, and emission queries rooted in a `CompilerSession`. Resolved imports form the forward project graph; reverse importers are derived from those same edges rather than synchronized separately. Salsa invalidation follows query dependencies, allowing unchanged and unrelated results to be reused.
+_Avoid_: eagerly invalidating every module in a project or storing a second reverse-dependency cache.
+
+**One-shot compiler facade**:
+The public standalone/project check and compile functions. These create and populate a temporary `CompilerSession`, then call the same canonical queries used by retained clients; they are compatibility adapters, not a second compiler pipeline.
+_Avoid_: implementing separate one-shot parsing, checking, or emission semantics.

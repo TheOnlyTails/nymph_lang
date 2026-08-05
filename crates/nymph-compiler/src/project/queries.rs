@@ -617,6 +617,23 @@ pub struct ProjectGraph {
 }
 
 impl ProjectGraph {
+	pub(crate) fn direct_dependencies(&self, module: ModuleInput) -> Arc<[ModuleInput]> {
+		self
+			.direct
+			.iter()
+			.find_map(|(owner, dependencies)| (*owner == module).then(|| dependencies.clone()))
+			.unwrap_or_else(|| Arc::new([]))
+	}
+
+	pub(crate) fn reverse_importers(&self, module: ModuleInput) -> Arc<[ModuleInput]> {
+		self
+			.direct
+			.iter()
+			.filter_map(|(importer, dependencies)| dependencies.contains(&module).then_some(*importer))
+			.collect::<Vec<_>>()
+			.into()
+	}
+
 	/// Deterministic project symbol tags shared by independent semantic pipelines.
 	/// This is graph data, not a compatibility-analysis or symbol-map query.
 	pub(crate) fn semantic_module_tags(
