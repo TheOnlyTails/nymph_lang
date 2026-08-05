@@ -6,6 +6,19 @@ use nymph_sema::check_module;
 use nymph_syntax::parse_module;
 
 #[test]
+fn anonymous_closure_returns_are_checked_against_the_closure_result() {
+	let parsed = parse_module(
+		"func value(): int = { let closure: (int) -> boolean = { if ($0 > 0) { return 1 } true }\nif (closure(1)) 1 else 0 }",
+		"test",
+	);
+	let checked = check_module(&parsed.tree);
+	assert!(
+		!checked.diags.is_empty(),
+		"a return from the anonymous closure was checked against the enclosing function"
+	);
+}
+
+#[test]
 fn forward_generic_alias_substitutes_its_owned_target() {
 	let parsed = parse_module(
 		"func identity(value: Later<int>): int = value\ntype Later<T> = T",

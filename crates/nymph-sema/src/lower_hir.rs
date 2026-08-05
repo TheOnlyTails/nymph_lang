@@ -3576,7 +3576,7 @@ impl<'a> Lowerer<'a> {
 			ExprKind::BinaryOp { lhs, op, rhs } => self.lower_binary(expr.id, lhs, *op, rhs),
 			ExprKind::PrefixOp { op, value } => self.lower_prefix_op(expr.id, *op, value),
 			ExprKind::AssignOp { lhs, op, rhs } => {
-				if assign_binop(*op).is_some() && definitely_transfers(rhs) {
+				if assign_binop(*op).is_some() && self.definitely_transfers(rhs) {
 					return HirExpr::Assign {
 						target: Box::new(self.lower_expr(lhs)),
 						value: Box::new(self.lower_expr(rhs)),
@@ -3629,7 +3629,7 @@ impl<'a> Lowerer<'a> {
 			// diagnosed by the checker, e.g. `TypeError::CastRequiresInto`/
 			// `CannotCast`/`IntoInterfaceMalformed`), panics loudly rather than
 			// silently emitting the bare operand — never a lowering deferral.
-			ExprKind::TypeOp { lhs, .. } if definitely_transfers(lhs) => self.lower_expr(lhs),
+			ExprKind::TypeOp { lhs, .. } if self.definitely_transfers(lhs) => self.lower_expr(lhs),
 			ExprKind::TypeOp { lhs, .. } => match self.annotations.resolution_of(expr.id) {
 				Some(res) if res.dispatch == DispatchKind::BuiltinEager => {
 					self.lower_scalar_cast(expr.id, lhs)
@@ -3898,6 +3898,15 @@ impl<'a> Lowerer<'a> {
 	/// dedicated runtime operations, while custom `Index` implementations follow
 	/// the same dispatch/lowering paths as an explicit `.index(key)` call.
 	fn lower_index_access(&self, id: nymph_ast::NodeId, parent: &Expr, index: &Expr) -> HirExpr {
+		if self.definitely_transfers(parent) {
+			return self.lower_expr(parent);
+		}
+		if self.definitely_transfers(index) {
+			return HirExpr::Block {
+				stmts: vec![HirStmt::Expr(self.lower_expr(parent))],
+				tail: Some(Box::new(self.lower_expr(index))),
+			};
+		}
 		let recv_ty = self
 			.annotations
 			.get(parent.id)
@@ -4536,10 +4545,11 @@ impl<'a> Lowerer<'a> {
 		op: BinaryOperator,
 		rhs: &Expr,
 	) -> HirExpr {
-		if definitely_transfers(lhs) {
+		if self.definitely_transfers(lhs) {
 			return self.lower_expr(lhs);
 		}
-		if !matches!(op, BinaryOperator::BoolAnd | BinaryOperator::BoolOr) && definitely_transfers(rhs)
+		if !matches!(op, BinaryOperator::BoolAnd | BinaryOperator::BoolOr)
+			&& self.definitely_transfers(rhs)
 		{
 			return HirExpr::Block {
 				stmts: vec![HirStmt::Expr(self.lower_expr(lhs))],
@@ -4553,29 +4563,36 @@ impl<'a> Lowerer<'a> {
 			// lowering ever runs), so no special-casing of `rhs`'s shape is needed
 			// here, unlike `ExprKind::Call`'s variant-factory/`New` special cases.
 			//
-			// Evaluation order: JS evaluates a call's callee before its arguments,
-			// so `lhsFn() |> rhsFn()` runs `rhsFn` FIRST — reversed from source
-			// order. Nymph documents no evaluation-order guarantee, and hoisting
-			// the LHS into a temp would cost an IIFE per pipe (HIR has no sequence
-			// expression), so RHS-first is the accepted semantics — the same
-			// ruling as `in`/`!in`'s receiver swap below. Revisit if HIR ever
-			// grows a let/sequence expression.
+			// JS evaluates a call's callee before its arguments, opposite the
+			// source order of `lhs |> rhs`. Hoist the lhs into a block-local once so
+			// a return while evaluating rhs cannot skip or duplicate it.
 			BinaryOperator::Pipe => {
-				return HirExpr::Call {
-					callee: Box::new(self.lower_expr(rhs)),
-					args: vec![self.lower_expr(lhs)],
+				self.push_scope();
+				let lhs_name = self.declare(&EcoString::from("$pipe"));
+				let lhs = self.lower_expr(lhs);
+				let rhs = self.lower_expr(rhs);
+				self.pop_scope();
+				return HirExpr::Block {
+					stmts: vec![HirStmt::Let {
+						name: lhs_name.clone(),
+						mutable: false,
+						value: lhs,
+					}],
+					tail: Some(Box::new(HirExpr::Call {
+						callee: Box::new(rhs),
+						args: vec![HirExpr::Local(lhs_name)],
+					})),
 				};
 			}
 			// DD2: `a in c` / `a !in c` ≡ `c.contains(a)` / `c.not_contains(a)` — the
 			// RHS is the receiver, the LHS the sole argument, swapped relative to
-			// every other binary operator. This changes evaluation order (the RHS
-			// collection is evaluated before the LHS item); Nymph has no documented
-			// left-to-right evaluation guarantee for `in` (the reference docs are a
-			// stub) and HIR has no let/sequence expression to preserve source order
-			// cheaply (only `Block`, which would cost an IIFE), so RHS-before-LHS is
-			// accepted and documented here rather than engineered around.
+			// every other binary operator. Hoist the lhs before evaluating the RHS
+			// receiver so source order and exactly-once evaluation survive the swap.
 			BinaryOperator::In | BinaryOperator::NotIn => {
-				return match self.annotations.resolution_of(id) {
+				self.push_scope();
+				let lhs_name = self.declare(&EcoString::from("$member"));
+				let lhs_value = self.lower_expr(lhs);
+				let mut operation = match self.annotations.resolution_of(id) {
 					Some(res) if res.dispatch == DispatchKind::UserImpl => HirExpr::Call {
 						callee: Box::new(HirExpr::Field {
 							recv: Box::new(self.lower_expr(rhs)),
@@ -4629,6 +4646,16 @@ impl<'a> Lowerer<'a> {
 						res.method
 					),
 					None => panic!("slice-4i lowering: no operator resolution recorded for binary op {op:?}"),
+				};
+				Self::replace_dispatch_argument(&mut operation, HirExpr::Local(lhs_name.clone()));
+				self.pop_scope();
+				return HirExpr::Block {
+					stmts: vec![HirStmt::Let {
+						name: lhs_name,
+						mutable: false,
+						value: lhs_value,
+					}],
+					tail: Some(Box::new(operation)),
 				};
 			}
 			// DD3: Nymph has no optional runtime representation (no `T?` syntax, no
@@ -4832,7 +4859,7 @@ impl<'a> Lowerer<'a> {
 	/// lower interface default methods, and an unresolved node is a checker
 	/// bug we want to see immediately rather than silently miscompile.
 	fn lower_prefix_op(&self, id: nymph_ast::NodeId, op: PrefixOperator, value: &Expr) -> HirExpr {
-		if definitely_transfers(value) {
+		if self.definitely_transfers(value) {
 			return self.lower_expr(value);
 		}
 		match self.annotations.resolution_of(id) {
@@ -4899,6 +4926,58 @@ impl<'a> Lowerer<'a> {
 				res.dispatch, res.method
 			),
 			None => panic!("slice-4c lowering: no operator resolution recorded for prefix op {op:?}"),
+		}
+	}
+
+	/// Whether this checked expression has the semantic `never` type and therefore
+	/// cannot complete normally. Anonymous `$N` boundaries are callable values even
+	/// when their underlying body expression is `never`, so they must be tested first.
+	fn definitely_transfers(&self, expr: &Expr) -> bool {
+		if self.annotations.anon_boundary_arity(expr.id).is_some() {
+			return false;
+		}
+		if self.annotations.get(expr.id).is_some_and(|info| {
+			matches!(
+				self.interner.kind(Self::peel_mut(self.interner, info.ty)),
+				TyKind::Never
+			)
+		}) {
+			return true;
+		}
+		match &expr.kind {
+			ExprKind::Return { .. } | ExprKind::Break { .. } | ExprKind::Continue { .. } => true,
+			ExprKind::Grouped(value) => self.definitely_transfers(value),
+			ExprKind::Block { body, .. } => body.iter().any(|statement| match &statement.0 {
+				Statement::Let { value, .. } | Statement::Expr(value) => self.definitely_transfers(value),
+			}),
+			ExprKind::If {
+				condition,
+				then,
+				otherwise,
+			} => {
+				self.definitely_transfers(condition)
+					|| otherwise.as_deref().is_some_and(|otherwise| {
+						self.definitely_transfers(then) && self.definitely_transfers(otherwise)
+					})
+			}
+			ExprKind::Match { value, arms } => {
+				self.definitely_transfers(value)
+					|| (!arms.is_empty() && arms.iter().all(|arm| self.definitely_transfers(&arm.body)))
+			}
+			_ => false,
+		}
+	}
+
+	fn replace_dispatch_argument(expr: &mut HirExpr, argument: HirExpr) {
+		match expr {
+			HirExpr::Call { args, .. } | HirExpr::ExternCall { args, .. } => {
+				*args.last_mut().expect("binary dispatch has an argument") = argument;
+			}
+			HirExpr::BoundDispatch {
+				argument: found, ..
+			} => **found = argument,
+			HirExpr::Binary { rhs, .. } => **rhs = argument,
+			other => panic!("binary dispatch lowered to an unexpected HIR shape: {other:?}"),
 		}
 	}
 
@@ -5937,34 +6016,6 @@ fn expr_calls_any_name(expr: &Expr, names: &FxHashSet<&EcoString>) -> bool {
 		| ExprKind::AnonymousParam(_)
 		| ExprKind::Continue { .. }
 		| ExprKind::This => false,
-	}
-}
-
-/// Whether evaluating this expression necessarily performs a control transfer.
-/// Strict operator shells with a `never` operand have no checker dispatch; lowering
-/// erases those unreachable shells while preserving evaluation of earlier operands.
-fn definitely_transfers(expr: &Expr) -> bool {
-	match &expr.kind {
-		ExprKind::Return { .. } | ExprKind::Break { .. } | ExprKind::Continue { .. } => true,
-		ExprKind::Grouped(value) => definitely_transfers(value),
-		ExprKind::Block { body, .. } => body.iter().any(|statement| match &statement.0 {
-			Statement::Let { value, .. } | Statement::Expr(value) => definitely_transfers(value),
-		}),
-		ExprKind::If {
-			condition,
-			then,
-			otherwise,
-		} => {
-			definitely_transfers(condition)
-				|| otherwise
-					.as_deref()
-					.is_some_and(|otherwise| definitely_transfers(then) && definitely_transfers(otherwise))
-		}
-		ExprKind::Match { value, arms } => {
-			definitely_transfers(value)
-				|| (!arms.is_empty() && arms.iter().all(|arm| definitely_transfers(&arm.body)))
-		}
-		_ => false,
 	}
 }
 

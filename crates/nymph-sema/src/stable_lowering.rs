@@ -1909,6 +1909,55 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			|self_type| substitute_self_type(ty, self_type),
 		))
 	}
+	/// Whether this checked expression cannot complete normally. An anonymous
+	/// closure annotation turns the underlying expression into a callable value,
+	/// so its body's `never` type must not erase an enclosing operation.
+	fn definitely_transfers(&self, expr: &StableExpr) -> bool {
+		let node = self.id(expr);
+		if self
+			.annotations
+			.anonymous_closures
+			.iter()
+			.any(|(id, _)| *id == node)
+		{
+			return false;
+		}
+		if self
+			.annotations
+			.types
+			.iter()
+			.find(|(id, _)| *id == node)
+			.is_some_and(|(_, ty)| matches!(peel_mut(ty), InterfaceType::Never))
+		{
+			return true;
+		}
+		match &expr.kind {
+			StableExprKind::Return { .. }
+			| StableExprKind::Break { .. }
+			| StableExprKind::Continue { .. } => true,
+			StableExprKind::Grouped(value) => self.definitely_transfers(value),
+			StableExprKind::Block { body, .. } => body.iter().any(|statement| {
+				self.definitely_transfers(match statement {
+					StableStatement::Let { value, .. } | StableStatement::Expr(value) => value,
+				})
+			}),
+			StableExprKind::If {
+				condition,
+				then,
+				otherwise,
+			} => {
+				self.definitely_transfers(condition)
+					|| otherwise.as_deref().is_some_and(|otherwise| {
+						self.definitely_transfers(then) && self.definitely_transfers(otherwise)
+					})
+			}
+			StableExprKind::Match { value, arms } => {
+				self.definitely_transfers(value)
+					|| (!arms.is_empty() && arms.iter().all(|arm| self.definitely_transfers(&arm.body)))
+			}
+			_ => false,
+		}
+	}
 	fn builtin_result(&self, expr: &StableExpr) -> Result<BuiltinResult, StableLoweringError> {
 		match peel_mut(&self.ty(expr)?) {
 			InterfaceType::Int => Ok(BuiltinResult::Int),
@@ -2192,7 +2241,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				member,
 				optional: _,
 			} => {
-				if definitely_transfers(parent) {
+				if self.definitely_transfers(parent) {
 					return self.lower(parent);
 				}
 				if let Some((_, dispatch)) = self
@@ -2289,7 +2338,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				}
 			}
 			StableExprKind::Call { func, args } => {
-				if definitely_transfers(func) {
+				if self.definitely_transfers(func) {
 					return self.lower(func);
 				}
 				if let Some(variant) = self.variant(expr) {
@@ -2339,7 +2388,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						self.context.stable_shape(&request)?
 					{
 						self.demand_external(target)?;
-						let resolved = args
+						let fields = args
 							.iter()
 							.enumerate()
 							.map(|(index, argument)| {
@@ -2354,19 +2403,9 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 											"struct argument has no exact field",
 										)
 									})?;
-								Ok((field.id.clone(), self.lower(&argument.value)?))
+								Ok((field.name.clone(), self.lower(&argument.value)?))
 							})
 							.collect::<Result<Vec<_>, StableLoweringError>>()?;
-						let fields = shell
-							.fields
-							.iter()
-							.filter_map(|field| {
-								resolved
-									.iter()
-									.find(|(definition, _)| definition == &field.id)
-									.map(|(_, value)| (field.name.clone(), value.clone()))
-							})
-							.collect();
 						return Ok(HirExpr::New {
 							class: self.context.binding_name(target)?.as_str().into(),
 							fields,
@@ -2425,11 +2464,11 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				}
 			}
 			StableExprKind::BinaryOp { lhs, op, rhs } => {
-				if definitely_transfers(lhs) {
+				if self.definitely_transfers(lhs) {
 					return self.lower(lhs);
 				}
 				if !matches!(op, BinaryOperator::BoolAnd | BinaryOperator::BoolOr)
-					&& definitely_transfers(rhs)
+					&& self.definitely_transfers(rhs)
 				{
 					return Ok(HirExpr::Block {
 						stmts: vec![HirStmt::Expr(self.lower(lhs)?)],
@@ -2444,9 +2483,21 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					} else {
 						self.record_unresolved_call(UnresolvedRuntimeCall::DynamicCallee);
 					}
-					return Ok(HirExpr::Call {
-						callee: Box::new(self.lower(rhs)?),
-						args: vec![self.lower(lhs)?],
+					self.scopes.borrow_mut().push(HashMap::new());
+					let lhs_name = self.declare(&EcoString::from("$pipe"));
+					let lhs = self.lower(lhs)?;
+					let rhs = self.lower(rhs)?;
+					self.scopes.borrow_mut().pop();
+					return Ok(HirExpr::Block {
+						stmts: vec![HirStmt::Let {
+							name: lhs_name.clone(),
+							mutable: false,
+							value: lhs,
+						}],
+						tail: Some(Box::new(HirExpr::Call {
+							callee: Box::new(rhs),
+							args: vec![HirExpr::Local(lhs_name)],
+						})),
 					});
 				}
 				if matches!(op, BinaryOperator::Equals | BinaryOperator::NotEquals)
@@ -2462,6 +2513,22 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					});
 				}
 				let dispatch = self.dispatch(expr)?;
+				if matches!(op, BinaryOperator::In | BinaryOperator::NotIn) {
+					self.scopes.borrow_mut().push(HashMap::new());
+					let lhs_name = self.declare(&EcoString::from("$member"));
+					let lhs_value = self.lower(lhs)?;
+					let mut operation = self.lower_dispatch(dispatch, rhs, vec![lhs])?;
+					Self::replace_dispatch_argument(&mut operation, HirExpr::Local(lhs_name.clone()));
+					self.scopes.borrow_mut().pop();
+					return Ok(HirExpr::Block {
+						stmts: vec![HirStmt::Let {
+							name: lhs_name,
+							mutable: false,
+							value: lhs_value,
+						}],
+						tail: Some(Box::new(operation)),
+					});
+				}
 				if !matches!(dispatch, crate::StableDispatch::Builtin { .. }) {
 					let (receiver, argument) = if matches!(op, BinaryOperator::In | BinaryOperator::NotIn) {
 						(rhs.as_ref(), lhs.as_ref())
@@ -2478,7 +2545,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				}
 			}
 			StableExprKind::PrefixOp { op, value } => {
-				if definitely_transfers(value) {
+				if self.definitely_transfers(value) {
 					return self.lower(value);
 				}
 				let dispatch = self.dispatch(expr)?;
@@ -2504,7 +2571,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				value: Box::new(self.lower(rhs)?),
 			},
 			StableExprKind::AssignOp { lhs, op, rhs } => {
-				if definitely_transfers(rhs) {
+				if self.definitely_transfers(rhs) {
 					return Ok(HirExpr::Assign {
 						target: Box::new(self.lower(lhs)?),
 						value: Box::new(self.lower(rhs)?),
@@ -2606,10 +2673,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			| StableExprKind::Continue { label: Some(_) } => {
 				return Err(self.unsupported(expr, "labeled loop control"));
 			}
-			StableExprKind::IndexAccess { parent, index, .. } if definitely_transfers(parent) => {
+			StableExprKind::IndexAccess { parent, index, .. } if self.definitely_transfers(parent) => {
 				self.lower(parent)?
 			}
-			StableExprKind::IndexAccess { parent, index, .. } if definitely_transfers(index) => {
+			StableExprKind::IndexAccess { parent, index, .. } if self.definitely_transfers(index) => {
 				HirExpr::Block {
 					stmts: vec![HirStmt::Expr(self.lower(parent)?)],
 					tail: Some(Box::new(self.lower(index)?)),
@@ -2698,13 +2765,13 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					],
 				}
 			}
-			StableExprKind::PostfixOp { value, .. } if definitely_transfers(value) => {
+			StableExprKind::PostfixOp { value, .. } if self.definitely_transfers(value) => {
 				self.lower(value)?
 			}
 			StableExprKind::PostfixOp { value, .. } => {
 				self.lower_dispatch(self.dispatch(expr)?, value, vec![])?
 			}
-			StableExprKind::TypeOp { lhs, .. } if definitely_transfers(lhs) => self.lower(lhs)?,
+			StableExprKind::TypeOp { lhs, .. } if self.definitely_transfers(lhs) => self.lower(lhs)?,
 			StableExprKind::TypeOp { lhs, .. } => match self.dispatch(expr)? {
 				crate::StableDispatch::Builtin { .. } => self.lower_cast(expr, lhs)?,
 				dispatch => self.lower_dispatch(dispatch, lhs, vec![])?,
@@ -2713,6 +2780,18 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			StableExprKind::While { .. } => return Err(self.unsupported(expr, "labeled while")),
 			StableExprKind::For { .. } => return Err(self.unsupported(expr, "labeled for")),
 		})
+	}
+	fn replace_dispatch_argument(expr: &mut HirExpr, argument: HirExpr) {
+		match expr {
+			HirExpr::Call { args, .. } | HirExpr::ExternCall { args, .. } => {
+				*args.last_mut().expect("binary dispatch has an argument") = argument;
+			}
+			HirExpr::BoundDispatch {
+				argument: found, ..
+			} => **found = argument,
+			HirExpr::Binary { rhs, .. } => **rhs = argument,
+			other => panic!("binary dispatch lowered to an unexpected HIR shape: {other:?}"),
+		}
 	}
 	fn lower_dispatch(
 		&self,
@@ -4617,38 +4696,6 @@ fn cooked_escape(escape: nymph_ast::expr::StringEscape) -> String {
 	escape
 		.to_char()
 		.map_or_else(|| "${".to_string(), |character| character.to_string())
-}
-
-/// Whether evaluating this expression necessarily performs a control transfer.
-/// Used only to erase strict enclosing operations that can never execute after
-/// their operand; it is intentionally narrower than the lexical break scan.
-fn definitely_transfers(expr: &StableExpr) -> bool {
-	match &expr.kind {
-		StableExprKind::Return { .. }
-		| StableExprKind::Break { .. }
-		| StableExprKind::Continue { .. } => true,
-		StableExprKind::Grouped(value) => definitely_transfers(value),
-		StableExprKind::Block { body, .. } => body.iter().any(|statement| {
-			definitely_transfers(match statement {
-				StableStatement::Let { value, .. } | StableStatement::Expr(value) => value,
-			})
-		}),
-		StableExprKind::If {
-			condition,
-			then,
-			otherwise,
-		} => {
-			definitely_transfers(condition)
-				|| otherwise
-					.as_deref()
-					.is_some_and(|otherwise| definitely_transfers(then) && definitely_transfers(otherwise))
-		}
-		StableExprKind::Match { value, arms } => {
-			definitely_transfers(value)
-				|| (!arms.is_empty() && arms.iter().all(|arm| definitely_transfers(&arm.body)))
-		}
-		_ => false,
-	}
 }
 
 fn binop(op: BinaryOperator) -> Option<BinOp> {

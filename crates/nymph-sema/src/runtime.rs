@@ -1519,6 +1519,18 @@ fn required_type_nodes(
 ) -> std::collections::HashSet<nymph_ast::NodeId> {
 	let mut required = std::collections::HashSet::new();
 	for expression in nodes {
+		// Lowering must erase strict shells whose checked operand cannot complete.
+		// Those shells intentionally have no dispatch annotation, so retain the
+		// semantic `never` fact even when this expression shape otherwise needs no
+		// runtime type metadata. Do not retain `Error`: recovered programs must not
+		// silently masquerade as control transfer.
+		if checked
+			.annotations
+			.get(expression.id)
+			.is_some_and(|info| matches!(checked.interner.kind(info.ty), crate::TyKind::Never))
+		{
+			required.insert(expression.id);
+		}
 		match &expression.kind {
 			ExprKind::While { .. } => {
 				required.insert(expression.id);

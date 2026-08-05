@@ -1330,6 +1330,8 @@ func cast_operand(): int = (return 28) as int
 func compound_operand(): int = { let mut value = 1
 value += return 29
 value }
+func anonymous_boundary(): int = ({ return 30
+$0 })(1)
 func callee(): int = (return 7)()
 func argument(): int = id(return 8)
 func member(): int = (return 9).field
@@ -1359,6 +1361,23 @@ func ordered(flag: boolean): int = {
 	value }
 	let result = id(mark(1)) + if (flag) return seen * 10 + 2 else mark(2)
 	result * 10 + seen
+}
+
+func pipe_order(flag: boolean): int = {
+	let mut seen = 0
+	let mark = (value: int) -> { seen = seen * 10 + value
+	value }
+	let id = (value: int) -> value
+	let result = mark(1) |> (if (flag) return seen else id)
+	result * 10 + seen
+}
+
+func membership_order(flag: boolean): int = {
+	let mut seen = 0
+	let mark = (value: int) -> { seen = seen * 10 + value
+	value }
+	let found = mark(1) in (if (flag) return seen else #[1])
+	if (found) seen else 0
 }
 
 func loop_completion(flag: boolean): int = {
@@ -1393,6 +1412,7 @@ impl DefaultValue for Value {}
 		("prefix_operand()", "27"),
 		("cast_operand()", "28"),
 		("compound_operand()", "29"),
+		("anonymous_boundary()", "30"),
 		("callee()", "7"),
 		("argument()", "8"),
 		("member()", "9"),
@@ -1412,6 +1432,10 @@ impl DefaultValue for Value {}
 		("arm(new NBool(false))", "19"),
 		("ordered(new NBool(true))", "12"),
 		("ordered(new NBool(false))", "42"),
+		("pipe_order(new NBool(true))", "1"),
+		("pipe_order(new NBool(false))", "11"),
+		("membership_order(new NBool(true))", "1"),
+		("membership_order(new NBool(false))", "1"),
 		("loop_completion(new NBool(true))", "20"),
 		("loop_completion(new NBool(false))", "3"),
 		("closure_boundary()", "22"),
