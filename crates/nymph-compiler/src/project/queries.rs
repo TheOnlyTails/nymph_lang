@@ -617,6 +617,23 @@ pub struct ProjectGraph {
 }
 
 impl ProjectGraph {
+	pub(crate) fn direct_dependencies(&self, module: ModuleInput) -> Arc<[ModuleInput]> {
+		self
+			.direct
+			.iter()
+			.find_map(|(owner, dependencies)| (*owner == module).then(|| dependencies.clone()))
+			.unwrap_or_else(|| Arc::new([]))
+	}
+
+	pub(crate) fn reverse_importers(&self, module: ModuleInput) -> Arc<[ModuleInput]> {
+		self
+			.direct
+			.iter()
+			.filter_map(|(importer, dependencies)| dependencies.contains(&module).then_some(*importer))
+			.collect::<Vec<_>>()
+			.into()
+	}
+
 	/// Deterministic project symbol tags shared by independent semantic pipelines.
 	/// This is graph data, not a compatibility-analysis or symbol-map query.
 	pub(crate) fn semantic_module_tags(
@@ -2469,13 +2486,17 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 									.and_then(|path| self.active.get(&path).copied())
 									.map(SemanticModuleInput::Project)
 							});
-						if let Some(handle) = semantic_handle {
+						if let Some(handle) = semantic_handle
+							&& !semantic_handles.contains(&handle)
+						{
 							semantic_handles.push(handle);
 						}
 						if !target.starts_with(super::resolve::STD_KEY_PREFIX) {
 							let target_path =
 								ModulePath::new(target).expect("resolved local import is canonical");
-							if let Some(handle) = self.active.get(&target_path) {
+							if let Some(handle) = self.active.get(&target_path)
+								&& !handles.contains(handle)
+							{
 								handles.push(*handle);
 							}
 						}

@@ -1382,6 +1382,61 @@ impl CompilerSession {
 			.map(|module| module.path(&self.db))
 			.collect()
 	}
+
+	/// Return the reachable project modules imported directly by `module`.
+	///
+	/// Dependency relations are scoped to the graph rooted at `entry`; imports
+	/// outside that transitive closure are intentionally absent.
+	#[must_use]
+	pub fn direct_dependencies(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		mode: EntryMode,
+	) -> Vec<ModulePath> {
+		let graph = self.graph(project.clone(), entry, mode);
+		let Some(module) = self
+			.registry
+			.get(&(project, module))
+			.map(|record| record.input)
+		else {
+			return Vec::new();
+		};
+		graph
+			.direct_dependencies(module)
+			.iter()
+			.map(|dependency| dependency.path(&self.db))
+			.collect()
+	}
+
+	/// Return reachable project modules that import `module` directly.
+	///
+	/// This reverse relation is derived from the same tracked forward graph;
+	/// it is not a separately synchronized cache.
+	#[must_use]
+	pub fn reverse_importers(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		mode: EntryMode,
+	) -> Vec<ModulePath> {
+		let graph = self.graph(project.clone(), entry, mode);
+		let Some(module) = self
+			.registry
+			.get(&(project, module))
+			.map(|record| record.input)
+		else {
+			return Vec::new();
+		};
+		graph
+			.reverse_importers(module)
+			.iter()
+			.map(|importer| importer.path(&self.db))
+			.collect()
+	}
+
 	#[doc(hidden)]
 	#[must_use]
 	pub fn tombstone_count(&self) -> usize {

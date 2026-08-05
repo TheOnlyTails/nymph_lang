@@ -247,27 +247,30 @@ fn handle_notification(
 	match not.method.as_str() {
 		m if m == DidOpenTextDocument::METHOD => {
 			let params: DidOpenTextDocumentParams = serde_json::from_value(not.params)?;
-			let uri = params.text_document.uri.clone();
-			compiler.lock().unwrap().open(
+			let affected = compiler.lock().unwrap().open(
 				&mut docs.lock().unwrap(),
 				params.text_document.uri,
 				params.text_document.text,
 				params.text_document.version,
 			)?;
-			diagnostics::check_and_publish_state(connection, docs, compiler, &uri)?;
+			for affected_uri in affected {
+				diagnostics::check_and_publish_state(connection, docs, compiler, &affected_uri)?;
+			}
 		}
 		m if m == DidChangeTextDocument::METHOD => {
 			let params: DidChangeTextDocumentParams = serde_json::from_value(not.params)?;
 			let uri = params.text_document.uri.clone();
 			if let Some(change) = params.content_changes.into_iter().last() {
-				compiler.lock().unwrap().change(
+				let affected = compiler.lock().unwrap().change(
 					&mut docs.lock().unwrap(),
 					&uri,
 					change.text,
 					params.text_document.version,
 				)?;
+				for affected_uri in affected {
+					diagnostics::check_and_publish_state(connection, docs, compiler, &affected_uri)?;
+				}
 			}
-			diagnostics::check_and_publish_state(connection, docs, compiler, &uri)?;
 		}
 		m if m == DidCloseTextDocument::METHOD => {
 			let params: DidCloseTextDocumentParams = serde_json::from_value(not.params)?;
@@ -542,6 +545,7 @@ mod tests {
 		recv_diagnostics_for(&client, &importer_uri);
 		open(dependency_uri.clone(), 1, "public func value(): int = true");
 		recv_diagnostics_for(&client, &dependency_uri);
+		recv_diagnostics_for(&client, &importer_uri);
 		close(dependency_uri.clone());
 		assert!(
 			recv_diagnostics_for(&client, &importer_uri)
@@ -551,6 +555,7 @@ mod tests {
 
 		open(dependency_uri.clone(), 2, "public func value(): int = true");
 		recv_diagnostics_for(&client, &dependency_uri);
+		recv_diagnostics_for(&client, &importer_uri);
 		std::fs::remove_file(&dependency_path).unwrap();
 		close(dependency_uri);
 		let importer = recv_diagnostics_for(&client, &importer_uri);
@@ -560,6 +565,82 @@ mod tests {
 			Some(lsp_types::NumberOrString::String(
 				"IMPORT-UNRESOLVED".into()
 			))
+		);
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn dependency_overlay_notifications_republish_transitive_importer_diagnostics() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='wire-transitive'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let main_path = temp.path().join("src/main.nym");
+		let middle_path = temp.path().join("src/middle.nym");
+		let leaf_path = temp.path().join("src/leaf.nym");
+		let main = "import @/middle with (middle)\nfunc use(): int = middle()";
+		let middle = "import @/leaf with (value)\npublic func middle(): int = value()";
+		let leaf = "public func value(): int = 1";
+		std::fs::write(&main_path, main).unwrap();
+		std::fs::write(&middle_path, middle).unwrap();
+		std::fs::write(&leaf_path, leaf).unwrap();
+		let main_uri = workspace::path_to_uri(&main_path).unwrap();
+		let middle_uri = workspace::path_to_uri(&middle_path).unwrap();
+		let leaf_uri = workspace::path_to_uri(&leaf_path).unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		handshake(&client);
+
+		let open = |uri: Uri, version, text: &str| {
+			client
+				.sender
+				.send(Message::Notification(Notification::new(
+					DidOpenTextDocument::METHOD.into(),
+					serde_json::to_value(DidOpenTextDocumentParams {
+						text_document: TextDocumentItem {
+							uri,
+							language_id: "nymph".into(),
+							version,
+							text: text.into(),
+						},
+					})
+					.unwrap(),
+				)))
+				.unwrap();
+		};
+		open(main_uri.clone(), 1, main);
+		assert!(
+			recv_diagnostics_for(&client, &main_uri)
+				.diagnostics
+				.is_empty()
+		);
+
+		open(leaf_uri.clone(), 2, "public func value(): float = 1.0");
+		assert!(
+			!recv_diagnostics_for(&client, &middle_uri)
+				.diagnostics
+				.is_empty(),
+			"opening a dependency overlay did not republish its transitive importer diagnostics"
+		);
+
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidCloseTextDocument::METHOD.into(),
+				serde_json::to_value(DidCloseTextDocumentParams {
+					text_document: TextDocumentIdentifier { uri: leaf_uri },
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		assert!(
+			recv_diagnostics_for(&client, &middle_uri)
+				.diagnostics
+				.is_empty(),
+			"closing the overlay did not republish diagnostics from restored disk source"
 		);
 		shutdown(&client, handle);
 	}

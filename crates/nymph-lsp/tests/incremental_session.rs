@@ -219,3 +219,82 @@ fn loose_file_identity_is_stable_and_uses_library_mode() {
 			.is_empty()
 	);
 }
+
+#[test]
+fn transitive_importers_follow_overlay_and_close_while_unrelated_analysis_is_reused() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='x'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let files = [
+		(
+			"main",
+			"import @/middle with (middle)\nfunc use(): int = middle()",
+		),
+		(
+			"middle",
+			"import @/leaf with (value)\npublic func middle(): int = value()",
+		),
+		("leaf", "public func value(): int = 1"),
+		("unrelated", "func stable(): int = 0"),
+	];
+	for (module, source) in files {
+		fs::write(temp.path().join(format!("src/{module}.nym")), source).unwrap();
+	}
+	let main_uri = uri(&temp.path().join("src/main.nym"));
+	let leaf_uri = uri(&temp.path().join("src/leaf.nym"));
+	let unrelated_uri = uri(&temp.path().join("src/unrelated.nym"));
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+
+	compiler
+		.open(&mut docs, main_uri.clone(), files[0].1.into(), 1)
+		.unwrap();
+	compiler
+		.open(&mut docs, unrelated_uri.clone(), files[3].1.into(), 1)
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.is_empty()
+	);
+	let unrelated_before = compiler.analysis_for_uri(&docs, &unrelated_uri).unwrap();
+
+	compiler
+		.open(
+			&mut docs,
+			leaf_uri.clone(),
+			"public func value(): float = 1.0".into(),
+			2,
+		)
+		.unwrap();
+	let diagnostics = compiler.diagnostics_for_uri(&docs, &main_uri).unwrap();
+	assert!(
+		diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.module == "middle" && diagnostic.diag.is_error()),
+		"leaf overlay did not invalidate its transitive importer chain: {diagnostics:?}"
+	);
+	let unrelated_after = compiler.analysis_for_uri(&docs, &unrelated_uri).unwrap();
+	assert!(
+		Arc::ptr_eq(&unrelated_before.analysis, &unrelated_after.analysis),
+		"an unrelated rooted analysis was recomputed after the leaf overlay"
+	);
+
+	compiler.close(&mut docs, &leaf_uri).unwrap();
+	assert_eq!(
+		compiler.source_for_uri(&leaf_uri).as_deref(),
+		Some(files[2].1)
+	);
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.is_empty(),
+		"closing the overlay did not reveal the valid disk source"
+	);
+}

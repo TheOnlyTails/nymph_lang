@@ -313,3 +313,120 @@ fn branching_graph_order_is_deterministic_across_repeated_requests() {
 		expected
 	);
 }
+
+#[test]
+fn dependency_relations_deduplicate_repeated_imports_in_source_order() {
+	let mut session = CompilerSession::new();
+	let project = ProjectId::new("deduplicated-dependencies");
+	for (module, source) in [
+		(
+			"main",
+			"import @/b\nimport @/a\nimport @/b\nimport @/missing",
+		),
+		("a", "let a = 1"),
+		("b", "let b = 1"),
+	] {
+		session.set_source(
+			project.clone(),
+			path(module),
+			source.into(),
+			SourceVersion(1),
+		);
+	}
+
+	assert_eq!(
+		session.direct_dependencies(
+			project.clone(),
+			path("main"),
+			path("main"),
+			EntryMode::Library,
+		),
+		[path("b"), path("a")]
+	);
+	assert_eq!(
+		session.reverse_importers(project, path("main"), path("b"), EntryMode::Library),
+		[path("main")]
+	);
+}
+
+#[test]
+fn dependency_relations_track_import_edits_without_reparsing_unrelated_modules() {
+	let events = Arc::new(Mutex::new(Vec::new()));
+	let sink = events.clone();
+	let mut session = CompilerSession::with_event_callback_and_tombstone_threshold(
+		move |name| sink.lock().unwrap().push(name.to_string()),
+		256,
+	);
+	let project = ProjectId::new("dependency-relations");
+	for (module, source) in [
+		("main", "import @/left"),
+		("left", "import @/leaf"),
+		("right", "import @/leaf"),
+		("leaf", "let value = 1"),
+		("unrelated", "let untouched = 1"),
+	] {
+		session.set_source(
+			project.clone(),
+			path(module),
+			source.into(),
+			SourceVersion(1),
+		);
+	}
+
+	assert_eq!(
+		session.direct_dependencies(
+			project.clone(),
+			path("main"),
+			path("main"),
+			EntryMode::Library,
+		),
+		[path("left")]
+	);
+	assert_eq!(
+		session.reverse_importers(
+			project.clone(),
+			path("main"),
+			path("leaf"),
+			EntryMode::Library,
+		),
+		[path("left")]
+	);
+
+	events.lock().unwrap().clear();
+	session.set_source(
+		project.clone(),
+		path("main"),
+		"import @/right".into(),
+		SourceVersion(2),
+	);
+	assert_eq!(
+		session.direct_dependencies(
+			project.clone(),
+			path("main"),
+			path("main"),
+			EntryMode::Library,
+		),
+		[path("right")]
+	);
+	assert_eq!(
+		session.reverse_importers(project, path("main"), path("leaf"), EntryMode::Library,),
+		[path("right")]
+	);
+	let observed = events.lock().unwrap();
+	for (query, expected) in [("parse", 2), ("direct_imports", 2), ("project_graph", 1)] {
+		assert_eq!(
+			observed
+				.iter()
+				.filter(|event| event.as_str() == query)
+				.count(),
+			expected,
+			"import edit should execute {query} only for the changed root and newly reachable branch: {observed:?}"
+		);
+	}
+	assert!(
+		!observed
+			.iter()
+			.any(|event| event == "interface_module_analysis"),
+		"dependency inspection must not trigger semantic checking: {observed:?}"
+	);
+}
