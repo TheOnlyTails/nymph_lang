@@ -106,6 +106,7 @@ pub enum ResolvedMethodTarget {
 	InterfaceImplementation {
 		interface: DefinitionId,
 		slot: crate::ImplementationMemberSlot,
+		implementation_arguments: Vec<Ty>,
 	},
 	GenericBound {
 		interface: DefinitionId,

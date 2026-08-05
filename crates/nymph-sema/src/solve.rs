@@ -1193,8 +1193,15 @@ impl Checker<'_> {
 			.and_then(|member| def.member_catalog.target(member))
 			.cloned();
 		let target = slot.as_ref().map(|slot| slot.member_id.clone());
+		let implementation_arguments = (0..def.generics.len())
+			.map(|index| self.shallow_resolve(subst[&ParamIdx(index as u32)]))
+			.collect::<Vec<_>>();
 		let resolved_target = interface.zip(slot).map(|(interface, slot)| {
-			crate::annotate::ResolvedMethodTarget::InterfaceImplementation { interface, slot }
+			crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
+				interface,
+				slot,
+				implementation_arguments: implementation_arguments.clone(),
+			}
 		});
 
 		let Some((params, ret, source, type_arguments)) =

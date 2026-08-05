@@ -1738,6 +1738,30 @@ fn lower_body(
 	} else {
 		false
 	};
+	let blanket_implementation_shape = if shellless_implementation {
+		let crate::RuntimePlacement::Attached { owner, .. } = &artifact.placement else {
+			unreachable!()
+		};
+		let request = StableShapeRequest::Implementation(owner.clone());
+		let StableShapeFact::Implementation(implementation) = context.stable_shape(&request)? else {
+			return Err(StableShapeLookupError::WrongFact { request }.into());
+		};
+		matches!(implementation.self_type, InterfaceType::Generic(_)).then_some(implementation)
+	} else {
+		None
+	};
+	let blanket_implementation = blanket_implementation_shape.is_some();
+	let implementation_type_parameters = blanket_implementation_shape
+		.as_ref()
+		.map(|implementation| {
+			implementation
+				.binders
+				.iter()
+				.map(|binder| binder.id.clone())
+				.collect::<Vec<_>>()
+		})
+		.unwrap_or_default();
+	let implementation_hidden = implementation_type_parameters.len();
 	let exact_parameterized_implementation = if let (
 		Some(InterfaceType::Named {
 			positional, named, ..
@@ -1775,23 +1799,38 @@ fn lower_body(
 					| crate::MemberKind::MutableValue
 			)
 		)) || (exact_parameterized_implementation && instance_member);
-	let type_parameters = body
+	let mut type_parameters = implementation_type_parameters.clone();
+	type_parameters.extend(
+		body
+			.type_parameters
+			.iter()
+			.filter(|parameter| {
+				(!instance_member
+					|| blanket_implementation
+					|| parameter.binder.scope == crate::BinderScope::Member)
+					&& !type_substitutions
+						.iter()
+						.any(|(candidate, _)| candidate == *parameter)
+			})
+			.cloned()
+			.filter(|parameter| !type_parameters.contains(parameter))
+			.collect::<Vec<_>>(),
+	);
+	let mut all_type_parameters = implementation_type_parameters;
+	let remaining_type_parameters = body
 		.type_parameters
 		.iter()
-		.filter(|parameter| {
-			(!instance_member || parameter.binder.scope == crate::BinderScope::Member)
-				&& !type_substitutions
-					.iter()
-					.any(|(candidate, _)| candidate == *parameter)
-		})
+		.filter(|parameter| !all_type_parameters.contains(parameter))
 		.cloned()
 		.collect::<Vec<_>>();
+	all_type_parameters.extend(remaining_type_parameters);
 	let lowerer = StableBodyLowerer {
 		context,
 		artifact,
 		annotations: &body.annotations,
 		type_parameters: &type_parameters,
-		all_type_parameters: &body.type_parameters,
+		all_type_parameters: &all_type_parameters,
+		implementation_hidden,
 		instance_member,
 		type_substitutions,
 		scopes: RefCell::new(vec![HashMap::new()]),
@@ -2003,6 +2042,7 @@ struct StableBodyLowerer<'a, C> {
 	annotations: &'a crate::RuntimeAnnotations,
 	type_parameters: &'a [crate::GenericParameterId],
 	all_type_parameters: &'a [crate::GenericParameterId],
+	implementation_hidden: usize,
 	instance_member: bool,
 	type_substitutions: &'a [(crate::GenericParameterId, InterfaceType)],
 	scopes: RefCell<Vec<HashMap<EcoString, EcoString>>>,
@@ -3414,6 +3454,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				member,
 				implementation,
 				materialization,
+				..
 			} => {
 				let request = StableShapeRequest::Implementation(implementation.clone());
 				let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
@@ -3440,6 +3481,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				member,
 				implementation,
 				materialization,
+				..
 			} => {
 				let request = StableShapeRequest::Implementation(implementation.clone());
 				let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
@@ -3623,6 +3665,52 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.map(|arg| self.lower(arg))
 					.collect::<Result<Vec<_>, _>>()?,
 			);
+			let implementation_arguments = match dispatch {
+				crate::StableDispatch::SelectedImplementation {
+					implementation_arguments,
+					..
+				}
+				| crate::StableDispatch::InterfaceDefault {
+					implementation_arguments,
+					..
+				} => implementation_arguments.as_ref(),
+				_ => &[],
+			};
+			let required = self.required_receiverless_slots(&member)?;
+			if implementation_arguments
+				.iter()
+				.enumerate()
+				.any(|(index, argument)| {
+					required.contains(&index)
+						&& matches!(argument, crate::runtime::RuntimeTypeArgument::Erased)
+				}) {
+				return Err(StableLoweringError::Unsupported {
+					definition: self.artifact.definition.clone(),
+					node: Some(self.id(receiver)),
+					feature: "erased implementation type argument required by receiverless dispatch".into(),
+				});
+			}
+			args.extend(
+				implementation_arguments
+					.iter()
+					.map(|argument| match argument {
+						crate::runtime::RuntimeTypeArgument::Canonical(type_) => {
+							self.runtime_type_object(type_)
+						}
+						crate::runtime::RuntimeTypeArgument::Erased => Ok(HirExpr::Undefined),
+					})
+					.collect::<Result<Vec<_>, _>>()?,
+			);
+			if matches!(dispatch, crate::StableDispatch::GenericBound { .. }) {
+				args.extend(
+					self
+						.type_parameters
+						.iter()
+						.take(self.implementation_hidden)
+						.enumerate()
+						.map(|(index, _)| HirExpr::Local(format!("$type${index}").into())),
+				);
+			}
 			return Ok(HirExpr::Call {
 				callee: Box::new(HirExpr::Local(
 					self.context.binding_name(&member)?.as_str().into(),
@@ -3721,6 +3809,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				member,
 				implementation,
 				materialization,
+				..
 			} => {
 				let request = StableShapeRequest::Implementation(implementation.clone());
 				let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
@@ -3741,6 +3830,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				member,
 				implementation,
 				materialization,
+				..
 			} => {
 				let request = StableShapeRequest::Implementation(implementation.clone());
 				let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
@@ -3863,6 +3953,12 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		{
 			let mut args = vec![receiver_value];
 			args.extend(arguments);
+			self.append_selected_implementation_arguments(
+				dispatch,
+				&member,
+				Some(self.id(expr)),
+				&mut args,
+			)?;
 			HirExpr::Call {
 				callee: Box::new(HirExpr::Local(
 					self.context.binding_name(&member)?.as_str().into(),
@@ -3888,6 +3984,49 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			}),
 			args: vec![self.lower(receiver)?],
 		})
+	}
+
+	fn append_selected_implementation_arguments(
+		&self,
+		dispatch: &crate::StableDispatch,
+		member: &DefinitionId,
+		node: Option<crate::BodyNodeId>,
+		args: &mut Vec<HirExpr>,
+	) -> Result<(), StableLoweringError> {
+		let implementation_arguments = match dispatch {
+			crate::StableDispatch::SelectedImplementation {
+				implementation_arguments,
+				..
+			}
+			| crate::StableDispatch::InterfaceDefault {
+				implementation_arguments,
+				..
+			} => implementation_arguments.as_ref(),
+			_ => return Ok(()),
+		};
+		let required = self.required_receiverless_slots(member)?;
+		if implementation_arguments
+			.iter()
+			.enumerate()
+			.any(|(index, argument)| {
+				required.contains(&index) && matches!(argument, crate::runtime::RuntimeTypeArgument::Erased)
+			}) {
+			return Err(StableLoweringError::Unsupported {
+				definition: self.artifact.definition.clone(),
+				node,
+				feature: "erased implementation type argument required by receiverless dispatch".into(),
+			});
+		}
+		args.extend(
+			implementation_arguments
+				.iter()
+				.map(|argument| match argument {
+					crate::runtime::RuntimeTypeArgument::Canonical(type_) => self.runtime_type_object(type_),
+					crate::runtime::RuntimeTypeArgument::Erased => Ok(HirExpr::Undefined),
+				})
+				.collect::<Result<Vec<_>, _>>()?,
+		);
+		Ok(())
 	}
 
 	fn lower_generic_bound(
@@ -4663,28 +4802,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		else {
 			return Err(StableShapeLookupError::WrongFact { request }.into());
 		};
-		let mut skipped_matching_slot = false;
-		let mut demanded_exact_slot = false;
 		for implementation in implementations {
-			// #15 owns blanket/generic implementation body emission. #14 only
-			// installs exact concrete implementation members on canonical objects.
-			if !implementation.binders.is_empty()
-				|| matches!(implementation.self_type, InterfaceType::Generic(_))
-			{
-				skipped_matching_slot |= implementation.member_slots.target(member).is_some();
-				continue;
-			}
 			if let Some(slot) = implementation.member_slots.target(member) {
 				self.demand_direct(&slot.member_id);
-				demanded_exact_slot = true;
 			}
-		}
-		if skipped_matching_slot && !demanded_exact_slot {
-			return Err(StableLoweringError::Unsupported {
-				definition: self.artifact.definition.clone(),
-				node: None,
-				feature: "receiverless dispatch is reachable only through a generic implementation whose emission belongs to #15".into(),
-			});
 		}
 		Ok(())
 	}
@@ -4709,14 +4830,15 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			self.demand_direct(&slot.member_id);
 			return Ok(());
 		}
-		if implementations.iter().any(|implementation| {
-			!implementation.binders.is_empty() && implementation.member_slots.target(member).is_some()
-		}) {
-			return Err(StableLoweringError::Unsupported {
-				definition: self.artifact.definition.clone(),
-				node: None,
-				feature: "receiverless dispatch for this concrete type requires generic implementation emission owned by #15".into(),
-			});
+		if let Some(slot) = implementations
+			.iter()
+			.filter(|implementation| {
+				!implementation.binders.is_empty()
+					|| matches!(implementation.self_type, InterfaceType::Generic(_))
+			})
+			.find_map(|implementation| implementation.member_slots.target(member))
+		{
+			self.demand_direct(&slot.member_id);
 		}
 		Ok(())
 	}
@@ -5717,11 +5839,13 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			_ => false,
 		};
 		if shellless {
+			let mut args = vec![receiver];
+			self.append_selected_implementation_arguments(dispatch, target, None, &mut args)?;
 			return Ok(HirExpr::Call {
 				callee: Box::new(HirExpr::Local(
 					self.context.binding_name(target)?.as_str().into(),
 				)),
-				args: vec![receiver],
+				args,
 			});
 		}
 		Ok(HirExpr::Call {

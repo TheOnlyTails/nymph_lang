@@ -10,7 +10,10 @@
 //! a `Lowerer` so later slices can add further type-directed lowering without another
 //! signature change.
 
-use std::cell::RefCell;
+use std::{
+	cell::RefCell,
+	hash::{DefaultHasher, Hash, Hasher},
+};
 
 use ecow::EcoString;
 use nymph_ast::{
@@ -552,6 +555,9 @@ struct RuntimeFuncDemand<'a> {
 	/// `owner_generics` parameter; see `push_unoverridden_defaults`'s doc
 	/// comment for why the CALLER must pass the same scope the checker used.
 	owner_generics: &'a [Spanned<GenericParam>],
+	/// Implementation-binder runtime type objects in the canonical ABI.
+	/// They follow source parameters and precede method-generic objects.
+	implementation_hidden: usize,
 	meta: &'a FuncDeclaration,
 	body: &'a Expr,
 	/// Gap 2 (sibling-interface-method dispatch inside a lowered
@@ -811,6 +817,7 @@ impl<'a> Lowerer<'a> {
 					meta,
 					body,
 					&res.method,
+					None,
 				) {
 					RuntimeDispatch::TopLevel(name) => HirBoundDispatchTarget::TopLevel {
 						module: interface_module.key().clone(),
@@ -1042,6 +1049,24 @@ impl<'a> Lowerer<'a> {
 					.then(|| RuntimeOwner::Compiler(self.module.path.clone()))
 			})
 			.unwrap_or_else(|| panic!("interface `{interface}` has no canonical owner"))
+	}
+
+	fn implementation_owner(&self, implementation: &crate::DefinitionId) -> RuntimeOwner {
+		self
+			.prelude_modules
+			.iter()
+			.zip(self.prelude_owners)
+			.find_map(|(module, owner)| {
+				(module.path == implementation.module.path).then(|| owner.clone())
+			})
+			.unwrap_or_else(|| match implementation.module.origin {
+				crate::ModuleOrigin::Project(_) => {
+					RuntimeOwner::Project(implementation.module.path.clone())
+				}
+				crate::ModuleOrigin::Compiler | crate::ModuleOrigin::ImportableStd => {
+					RuntimeOwner::Compiler(implementation.module.path.clone())
+				}
+			})
 	}
 
 	fn register_runtime_func(
@@ -1447,7 +1472,11 @@ impl<'a> Lowerer<'a> {
 	/// kept bare (a prelude top-level name is never renamed, exactly like a
 	/// module's own).
 	fn lower_runtime_let(&self, name: &EcoString) -> Option<HirLet> {
-		for module in self.prelude_modules {
+		for module in self
+			.prelude_modules
+			.iter()
+			.chain(std::iter::once(self.module))
+		{
 			for decl in &module.members {
 				if let Declaration::ExternalLet(_, marker, meta) = decl
 					&& param_name(&meta.name) == *name
@@ -1600,7 +1629,11 @@ impl<'a> Lowerer<'a> {
 	/// top-level function instead of a class method.
 	fn lower_runtime_func(&self, pending: &RuntimeFuncDemand<'a>) -> HirFunc {
 		self.push_scope();
-		self.push_generics(pending.owner_generics, &pending.meta.generics, false);
+		self.push_generics(
+			pending.owner_generics,
+			&pending.meta.generics,
+			pending.implementation_hidden > 0,
+		);
 		let self_param = self.declare(&EcoString::from("$self"));
 		let mut params = vec![self_param.clone()];
 		params.extend(
@@ -1609,6 +1642,10 @@ impl<'a> Lowerer<'a> {
 				.params
 				.iter()
 				.map(|p| self.declare(&param_name(&p.0.name))),
+		);
+		params.extend(
+			(0..pending.implementation_hidden + pending.meta.generics.len())
+				.map(|index| EcoString::from(format!("$type${index}"))),
 		);
 		self.this_sub.borrow_mut().push(self_param);
 		// Gap 2: while lowering an `ImplFor`-lowered default body, push
@@ -2197,15 +2234,13 @@ impl<'a> Lowerer<'a> {
 		};
 
 		// A blanket impl (`impl<T> Iface for T`) parses its target as a bare
-		// `Type::Reference` naming the impl's own generic parameter. Left
-		// unchecked, that name could coincide with an unrelated real struct in the
-		// module and silently attach the blanket's methods to it; refuse instead
-		// (V5: blanket impls stay a loud deferral, never lowered).
+		// `Type::Reference` naming the impl's own generic parameter. It must not
+		// enter this class/prototype table: selected blanket bodies are emitted once
+		// as canonical top-level functions by `try_lower_runtime_dispatch`.
 		if generics.iter().any(|g| g.0.name.0 == name.0) {
-			panic!(
-				"slice-4c-b lowering does not yet support blanket impls (`impl<{0}> {1} for {0}`)",
-				name.0, for_interface.0.0
-			);
+			// Blanket members are canonical demand-driven top-level functions;
+			// attaching one to a class would create receiver-specific copies.
+			return;
 		}
 
 		let entry = methods_by_type.entry(name.0.clone()).or_default();
@@ -2403,22 +2438,36 @@ impl<'a> Lowerer<'a> {
 		// nominal type's emitted class. The isolated flattened-prelude compatibility
 		// API assigns a deterministic `standalone` identity to all declarations, so
 		// it still needs its offset span to distinguish its prelude-owned methods.
-		if res.implementation.as_ref().is_some_and(|implementation| {
-			matches!(
-				&implementation.module.origin,
-				crate::ModuleOrigin::Project(project)
-					if project != "standalone"
-						|| res.impl_span.is_none_or(|span| span.start < crate::prelude::SPAN_BASE)
-			)
-		}) {
+		let selected_is_blanket = res.impl_span.is_some_and(|span| {
+			self
+				.prelude_modules
+				.iter()
+				.chain(std::iter::once(self.module))
+				.flat_map(|module| &module.members)
+				.any(|declaration| {
+					matches!(
+						declaration,
+						Declaration::ImplFor { generics, type_, for_interface, .. }
+							if for_interface.0.1 == span
+								&& matches!(&type_.0, Type::Reference { name, .. }
+									if generics.iter().any(|generic| generic.0.name.0 == name.0))
+					)
+				})
+		});
+		if !selected_is_blanket
+			&& res.implementation.as_ref().is_some_and(|implementation| {
+				matches!(
+					&implementation.module.origin,
+					crate::ModuleOrigin::Project(project)
+						if project != "standalone"
+							|| res.impl_span.is_none_or(|span| span.start < crate::prelude::SPAN_BASE)
+				)
+			}) {
 			return Some(RuntimeDispatch::OntoClass {
 				method: res.method.clone(),
 			});
 		}
 		let span = res.impl_span?;
-		if self.prelude_modules.is_empty() {
-			return None;
-		}
 		// This slice's extension: an INLINE method declared directly inside a
 		// prelude `enum` body (`Option`'s own `is_some`, `is_none`, `map`, …)
 		// resolves through `resolve_inherent` with `impl_span` = the method's
@@ -2437,7 +2486,11 @@ impl<'a> Lowerer<'a> {
 		// silent-wrong-JS failure mode this compiler never accepts. A named
 		// struct receiver must keep panicking exactly as before this slice
 		// (pinned by `inherent_prelude_struct_receiver_still_stays_a_loud_defer`).
-		for module in self.prelude_modules {
+		for module in self
+			.prelude_modules
+			.iter()
+			.chain(std::iter::once(self.module))
+		{
 			for decl in &module.members {
 				if let Declaration::Enum {
 					name: enum_name,
@@ -2500,7 +2553,11 @@ impl<'a> Lowerer<'a> {
 		// operator (`Range::contains`'s `this.start <= item`, ALSO reached through its
 		// interface span since `contains` is abstract in `RangeBounds`), neither of which
 		// is lowerable — those keep the loud defer below.
-		for module in self.prelude_modules {
+		for module in self
+			.prelude_modules
+			.iter()
+			.chain(std::iter::once(self.module))
+		{
 			for decl in &module.members {
 				if let Declaration::Struct { name, impls, .. } = decl
 					&& impls.iter().any(|si| {
@@ -2521,7 +2578,11 @@ impl<'a> Lowerer<'a> {
 				}
 			}
 		}
-		for module in self.prelude_modules {
+		for module in self
+			.prelude_modules
+			.iter()
+			.chain(std::iter::once(self.module))
+		{
 			for decl in &module.members {
 				match decl {
 					Declaration::ImplFor {
@@ -2532,8 +2593,25 @@ impl<'a> Lowerer<'a> {
 						members,
 						..
 					} => {
-						if for_interface.0.1 != span {
+						if !crate::prelude::same_source_span(for_interface.0.1, span) {
 							continue;
+						}
+						let blanket = matches!(&type_.0, Type::Reference { name, .. }
+							if generics.iter().any(|generic| generic.0.name.0 == name.0));
+						// Concrete project implementations are emitted as class
+						// methods and must win over canonical blanket dispatch.
+						if !blanket
+							&& res.implementation.as_ref().is_some_and(|implementation| {
+								matches!(
+									&implementation.module.origin,
+									crate::ModuleOrigin::Project(project)
+										if project != "standalone"
+											|| span.start < crate::prelude::SPAN_BASE
+								)
+							}) {
+							return Some(RuntimeDispatch::OntoClass {
+								method: res.method.clone(),
+							});
 						}
 						// Found the exact impl the checker resolved through —
 						// definitive either way (a `Span` is a unique source
@@ -2577,6 +2655,26 @@ impl<'a> Lowerer<'a> {
 						if self.body_calls_unlinked_external(body) {
 							return None;
 						}
+						if blanket {
+							let implementation = res
+								.implementation
+								.as_ref()
+								.expect("blanket dispatch has stable implementation identity");
+							let mut hasher = DefaultHasher::new();
+							implementation.hash(&mut hasher);
+							let tag = format!("blanket{:x}", hasher.finish());
+							return Some(self.finish_runtime_impl_lowering(
+								&iface_name.0,
+								&tag,
+								members,
+								generics.as_slice(),
+								owner_generics,
+								meta,
+								body,
+								&res.method,
+								Some(self.implementation_owner(implementation)),
+							));
+						}
 						if let Some(tag) = inherent_self_type_tag(&type_.0, *mutable) {
 							return Some(self.finish_runtime_impl_lowering(
 								&iface_name.0,
@@ -2587,6 +2685,7 @@ impl<'a> Lowerer<'a> {
 								meta,
 								body,
 								&res.method,
+								None,
 							));
 						}
 						// Not a primitive target — this slice's extension: a
@@ -2679,6 +2778,7 @@ impl<'a> Lowerer<'a> {
 									mangled: mangled.clone(),
 									canonical_owner: owner,
 									owner_generics: generics.as_slice(),
+									implementation_hidden: 0,
 									meta,
 									body,
 									// D1: an inherent method's own name span IS its
@@ -2770,6 +2870,7 @@ impl<'a> Lowerer<'a> {
 				meta,
 				body,
 				&res.method,
+				None,
 			));
 		}
 		None
@@ -2850,9 +2951,10 @@ impl<'a> Lowerer<'a> {
 		meta: &'a FuncDeclaration,
 		body: &'a Expr,
 		method: &EcoString,
+		canonical_owner: Option<RuntimeOwner>,
 	) -> RuntimeDispatch {
 		let mangled: EcoString = format!("$std${iface_name}${tag}${method}").into();
-		let canonical_owner = self.interface_owner(iface_name);
+		let canonical_owner = canonical_owner.unwrap_or_else(|| self.interface_owner(iface_name));
 		if !self.register_runtime_func(&mangled, &canonical_owner, meta) {
 			return RuntimeDispatch::TopLevel(mangled);
 		}
@@ -2863,6 +2965,7 @@ impl<'a> Lowerer<'a> {
 				mangled: mangled.clone(),
 				canonical_owner,
 				owner_generics,
+				implementation_hidden: impl_generics.len(),
 				meta,
 				body,
 				sibling_frame: Some(RuntimeSiblingFrame {
@@ -3652,6 +3755,10 @@ impl<'a> Lowerer<'a> {
 						Some(RuntimeDispatch::TopLevel(mangled)) => {
 							let mut call_args = vec![self.lower_expr(parent)];
 							call_args.extend(args.iter().map(|a| self.lower_expr(&a.0.value)));
+							// Preserve source evaluation order, then append the
+							// selected implementation's binder objects before method
+							// generic objects (`append_hidden_call_arguments`).
+							self.append_implementation_arguments(res, &mut call_args);
 							self.append_hidden_call_arguments(
 								expr.id,
 								HirExpr::Call {
@@ -3743,10 +3850,30 @@ impl<'a> Lowerer<'a> {
 						variant: res.variant.clone(),
 						prototype: self.construction_prototype(expr.id),
 					},
-					None => HirExpr::Field {
-						recv: Box::new(self.lower_expr(parent)),
-						name: member.0.clone(),
-					},
+					None => {
+						if let Some(res) = self.annotations.resolution_of(expr.id)
+							&& matches!(
+								res.dispatch,
+								DispatchKind::UserImpl | DispatchKind::UserImplDefaultMethod
+							) && let Some(RuntimeDispatch::TopLevel(mangled)) =
+							self.try_lower_runtime_dispatch(res, Self::is_this_receiver(parent))
+						{
+							let mut bound = vec![HirExpr::Undefined, self.lower_expr(parent)];
+							self.append_implementation_arguments(res, &mut bound);
+							HirExpr::Call {
+								callee: Box::new(HirExpr::Field {
+									recv: Box::new(HirExpr::Local(mangled)),
+									name: "bind".into(),
+								}),
+								args: bound,
+							}
+						} else {
+							HirExpr::Field {
+								recv: Box::new(self.lower_expr(parent)),
+								name: member.0.clone(),
+							}
+						}
+					}
 				}
 			}
 			ExprKind::Tuple(items) => self.with_construction_prototype(expr.id, self.lower_tuple(items)),
@@ -4323,6 +4450,28 @@ impl<'a> Lowerer<'a> {
 			arguments.extend(hidden.iter().map(|type_| self.runtime_type_object(*type_)));
 		}
 		call
+	}
+
+	fn append_implementation_arguments(&self, res: &Resolution, arguments: &mut Vec<HirExpr>) {
+		if let Some(crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
+			implementation_arguments,
+			..
+		}) = &res.resolved_target
+		{
+			arguments.extend(
+				implementation_arguments
+					.iter()
+					.map(|type_| self.runtime_type_object(*type_)),
+			);
+			if implementation_arguments.is_empty()
+				&& let Some(frame) = self.lowering_runtime_sibling.borrow().last()
+			{
+				arguments.extend(
+					(0..frame.impl_generics.len())
+						.map(|index| HirExpr::Local(format!("$type${index}").into())),
+				);
+			}
+		}
 	}
 
 	fn generic_callable_adapter(&self, id: NodeId, callee: HirExpr) -> HirExpr {

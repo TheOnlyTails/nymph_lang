@@ -2798,6 +2798,67 @@ fn compatibility_lowering_captures_hidden_arguments_for_generic_callable_values(
 }
 
 #[test]
+fn compatibility_blanket_method_is_one_canonical_function_with_explicit_hidden_abi() {
+	let hir = lower(
+		"interface Seed { func seed(value: int): int }
+		 impl<T> Seed for T { func seed(value: int): int = 7 }
+		 func from_int(): int = 0.seed(1)
+		 func from_string(): int = \"\".seed(1)",
+	);
+	let blanket = hir
+		.funcs
+		.iter()
+		.filter(|function| {
+			function.name.starts_with("$std$Seed$blanket") && function.name.ends_with("$seed")
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(blanket.len(), 1, "blanket body must be emitted once");
+	assert_eq!(blanket[0].params, ["$self", "value", "$type$0"]);
+	for caller in ["from_int", "from_string"] {
+		let body = &hir
+			.funcs
+			.iter()
+			.find(|function| function.name == caller)
+			.unwrap()
+			.body;
+		assert!(matches!(body, HirExpr::Call { args, .. } if args.len() == 3));
+	}
+	assert!(
+		hir
+			.classes
+			.iter()
+			.all(|class| class.methods.iter().all(|method| method.name != "seed"))
+	);
+}
+
+#[test]
+fn compatibility_blanket_method_value_binds_the_canonical_function() {
+	let hir = lower(
+		"interface Seed { func seed(value: int): int }
+		 impl<T> Seed for T { func seed(value: int): int = value }
+		 func apply(): int = { let seed = 0.seed seed(7) }",
+	);
+	let apply = hir
+		.funcs
+		.iter()
+		.find(|function| function.name == "apply")
+		.unwrap();
+	let HirExpr::Block { stmts, .. } = &apply.body else {
+		panic!("apply body")
+	};
+	let HirStmt::Let { value, .. } = &stmts[0] else {
+		panic!("method value binding")
+	};
+	assert!(matches!(
+		value,
+		HirExpr::Call { callee, args }
+			if args.len() == 3
+				&& matches!(&**callee, HirExpr::Field { recv, name }
+					if name == "bind" && matches!(&**recv, HirExpr::Local(function) if function.starts_with("$std$Seed$blanket")))
+	));
+}
+
+#[test]
 fn namespaced_call_through_a_struct_owned_generic_lowers_hidden_type_object() {
 	// Confirmed defect (code review, Slice 4J): `push_generics` used to track
 	// only the CURRENT func/method's OWN generics, never the OWNING struct/

@@ -4856,25 +4856,70 @@ func answer(): void = {
 }
 
 #[test]
-fn receiverless_dispatch_does_not_partially_emit_blanket_implementations() {
+fn receiverless_dispatch_demands_one_canonical_blanket_implementation() {
 	let source = r#"
 interface Seed { func seed(): int }
 impl Seed for int { func seed(): int = 1 }
 
+impl<T> Seed for T { func seed(): int = 2 }
 struct Box<T>(value: T)
-impl<T> Seed for Box<T> { func seed(): int = 2 }
 
-func direct<T: Seed>(marker: T): int = T.seed()
-func answer(): int = direct(Box(value = 0))
+func answer(): int = 0.seed() + Box(value = 0).seed()
 "#;
-	let diagnostics = nymph_compiler::compile(source, "test")
-		.expect_err("blanket receiverless body emission belongs to #15");
+	let js = nymph_compiler::compile(source, "test").expect("blanket implementation lowers");
 	assert!(
-		diagnostics.iter().any(|diagnostic| diagnostic
-			.message
-			.contains("generic implementation emission owned by #15")),
-		"{diagnostics:?}"
+		js.contains("function $m0$impl$i1$seed($self, $type$0)"),
+		"blanket member must be one canonical top-level function: {js}"
 	);
+	assert!(
+		!js.contains(
+			"class {\n\tconstructor(fields) {\n\t\tObject.assign(this, fields);\n\t}\n\tseed()"
+		)
+	);
+	assert_eq!(run(source, "answer()"), "3");
+}
+
+#[test]
+fn blanket_body_forwards_implementation_arguments_before_nested_generic_arguments() {
+	let source = r#"
+interface Seed { func seed(): int }
+impl Seed for int { func seed(): int = 1 }
+impl Seed for string { func seed(): int = 10 }
+impl Seed for boolean { func seed(): int = 100 }
+
+interface Probe { func probe(): int }
+func combine<T: Seed, U: Seed>(left: T, right: U): int = T.seed() + U.seed()
+impl<T: Seed> Probe for T {
+  func probe(): int = combine(this, true)
+}
+
+func answer(): int = "".probe()
+"#;
+	let js = nymph_compiler::compile(source, "test").expect("generic implementation lowers");
+	assert!(
+		js.contains("combine($self, new NBool(true), $type$0, NBool.prototype)"),
+		"nested call must carry its source arguments before implementation and nested generic runtime objects: {js}"
+	);
+	assert_eq!(run(source, "answer()"), "110");
+}
+
+#[test]
+fn blanket_materialized_default_forwards_implementation_arguments_to_override() {
+	let source = r#"
+interface Seed { func seed(): int }
+impl Seed for int { func seed(): int = 1 }
+
+interface Probe {
+  func target(): int
+  func probe(): int = this.target()
+}
+impl<T: Seed> Probe for T {
+  func target(): int = T.seed()
+}
+
+func answer(): int = 0.probe()
+"#;
+	assert_eq!(run(source, "answer()"), "1");
 }
 
 #[test]

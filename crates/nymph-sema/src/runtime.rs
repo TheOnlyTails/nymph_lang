@@ -308,12 +308,14 @@ pub enum StableDispatch {
 		member: DefinitionId,
 		implementation: DefinitionId,
 		materialization: DispatchMaterialization,
+		implementation_arguments: Arc<[RuntimeTypeArgument]>,
 	},
 	InterfaceDefault {
 		interface: DefinitionId,
 		member: DefinitionId,
 		implementation: DefinitionId,
 		materialization: DispatchMaterialization,
+		implementation_arguments: Arc<[RuntimeTypeArgument]>,
 	},
 	GenericBound {
 		interface: DefinitionId,
@@ -1437,7 +1439,7 @@ fn runtime_annotations(
 			types.push((id, type_));
 		}
 		if let Some(resolution) = &info.resolution {
-			dispatches.push((id, stable_dispatch(checked, resolution)?));
+			dispatches.push((id, stable_dispatch(checked, resolution, &context)?));
 		}
 	}
 	let mut definition_targets = checked
@@ -1519,6 +1521,7 @@ fn runtime_annotations(
 							Some(crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
 								interface,
 								slot,
+								..
 							}) => (interface.clone(), slot.interface_member_id.clone()),
 							Some(crate::annotate::ResolvedMethodTarget::GenericBound {
 								interface,
@@ -1529,7 +1532,7 @@ fn runtime_annotations(
 					RuntimeIteration::ViaIter {
 						iterable_interface,
 						iter_interface_member,
-						iter: stable_dispatch(checked, resolution)?,
+						iter: stable_dispatch(checked, resolution, &context)?,
 						iterator_interface: protocols.0.clone(),
 						next: protocols.1.clone(),
 						option: protocols.2.clone(),
@@ -1875,12 +1878,13 @@ mod tests {
 fn stable_dispatch(
 	checked: &crate::CheckedFacts,
 	resolution: &crate::annotate::Resolution,
+	context: &CanonicalizationContext,
 ) -> Result<StableDispatch, RuntimeExtractionError> {
 	let category = match resolution.dispatch {
 		DispatchKind::BuiltinEager => BuiltinDispatch::Eager,
 		DispatchKind::BuiltinShortCircuit => BuiltinDispatch::ShortCircuit,
 		DispatchKind::UserImpl | DispatchKind::UserImplDefaultMethod => {
-			return exact_method_dispatch(checked, resolution);
+			return exact_method_dispatch(checked, resolution, context);
 		}
 	};
 	Ok(StableDispatch::Builtin {
@@ -1892,6 +1896,7 @@ fn stable_dispatch(
 fn exact_method_dispatch(
 	checked: &crate::CheckedFacts,
 	resolution: &crate::annotate::Resolution,
+	context: &CanonicalizationContext,
 ) -> Result<StableDispatch, RuntimeExtractionError> {
 	let target = resolution
 		.resolved_target
@@ -1934,7 +1939,25 @@ fn exact_method_dispatch(
 				})
 			}
 		}
-		crate::annotate::ResolvedMethodTarget::InterfaceImplementation { interface, slot } => {
+		crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
+			interface,
+			slot,
+			implementation_arguments,
+		} => {
+			let implementation_arguments = implementation_arguments
+				.iter()
+				.map(
+					|argument| match required_canonical_type(&checked.interner, *argument, context) {
+						Ok(type_) if runtime_type_object_supported(&type_) => {
+							Ok(RuntimeTypeArgument::Canonical(type_))
+						}
+						Ok(_) | Err(RuntimeExtractionError::IncompleteCanonicalType) => {
+							Ok(RuntimeTypeArgument::Erased)
+						}
+						Err(error) => Err(error),
+					},
+				)
+				.collect::<Result<Arc<[_]>, _>>()?;
 			if slot.external {
 				return Ok(StableDispatch::External {
 					member: slot.member_id.clone(),
@@ -1960,12 +1983,14 @@ fn exact_method_dispatch(
 					member: slot.member_id.clone(),
 					implementation: slot.implementation_id.clone(),
 					materialization: DispatchMaterialization::Attached,
+					implementation_arguments,
 				},
 				crate::ImplementationMemberSource::InheritedDefault => StableDispatch::InterfaceDefault {
 					interface: interface.clone(),
 					member: slot.member_id.clone(),
 					implementation: slot.implementation_id.clone(),
 					materialization: DispatchMaterialization::CanonicalBody,
+					implementation_arguments,
 				},
 			})
 		}

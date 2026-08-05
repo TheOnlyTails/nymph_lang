@@ -51,6 +51,17 @@ use crate::ty::{GenericArgs, Ty, TyKind};
 /// (whose span is always well below `SPAN_BASE`).
 fn impl_is_unmaterialized(res: &MethodResolution) -> bool {
 	if let Some(implementation) = &res.implementation {
+		// Generic implementations have one canonical method body and cannot be
+		// materialized correctly as receiver-specific prototype methods. Stable
+		// implementation identity is authoritative here, including project-local
+		// implementations whose spans are not in the offset prelude range.
+		if matches!(
+			&implementation.key,
+			crate::DeclarationKey::Implementation { header, .. }
+				if matches!(header.self_type, crate::HeaderType::Generic(_))
+		) {
+			return true;
+		}
 		return matches!(
 			implementation.module.origin,
 			crate::ModuleOrigin::Compiler | crate::ModuleOrigin::ImportableStd
@@ -3549,7 +3560,11 @@ impl<'m> Checker<'m> {
 						target: Some(slot.member_id.clone()),
 						implementation: Some(slot.implementation_id.clone()),
 						resolved_target: Some(
-							crate::annotate::ResolvedMethodTarget::InterfaceImplementation { interface, slot },
+							crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
+								interface,
+								slot,
+								implementation_arguments: Vec::new(),
+							},
 						),
 						impl_span: implementation.legacy_span,
 					},
