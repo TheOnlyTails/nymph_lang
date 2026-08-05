@@ -1,12 +1,12 @@
 //! Integration tests for the core/std split, Slice B: `import std/…` now
 //! resolves through a pluggable `std_provider` closure threaded through
-//! `check_project_with_std`/`check_project_library_with_std`/
+//! `check_project_with_std`/`check_project_library_with_std` and their
+//! embedded-provider convenience counterparts, plus
 //! `compile_project_with_std`/`compile_project_library_with_std` (the
 //! `_with_std`-suffixed siblings of the pre-existing, `std_provider`-free
 //! `check_project`/`check_project_library`/`compile_project`/
-//! `compile_project_library`, so every caller that has no std support to
-//! offer yet — the CLI, the LSP, every pre-existing project test — keeps its
-//! original 2-argument call sites untouched), joining the SAME module graph
+//! `compile_project_library`, so callers can either supply a provider or use
+//! the compiler's shipped std source tree), joining the SAME module graph
 //! as ordinary `@/`/`./`/`../` project imports (cycle detection, topological
 //! order, `with`-list binding, visibility — all unchanged, all still
 //! enforced).
@@ -29,7 +29,8 @@
 use std::path::PathBuf;
 
 use nymph_compiler::{
-	check_project_library_with_std, check_project_with_std, compile_project_with_std,
+	check_project_library_with_embedded_std, check_project_library_with_std,
+	check_project_with_embedded_std, check_project_with_std, compile_project_with_std,
 };
 
 fn stdlib_src_root() -> PathBuf {
@@ -105,6 +106,27 @@ fn import_std_collections_tree_resolves_compiles_and_runs() {
 		String::from_utf8_lossy(&output.stdout).trim(),
 		"42",
 		"expected `Tree.Leaf(value = 42)` matched back out as `42`"
+	);
+}
+
+#[test]
+fn embedded_std_check_facades_serve_entry_and_library_projects() {
+	let entry = "import std/collections/tree with (Tree)\n\
+		func main(): void = { let tree = Tree.Leaf(value = 1) }\n";
+	let entry_load = only_entry("app", entry);
+	let entry_diags = check_project_with_embedded_std("app", &entry_load);
+	assert!(
+		entry_diags.is_empty(),
+		"embedded entry check should resolve std: {entry_diags:?}"
+	);
+
+	let library = "import std/collections/tree with (Tree)\n\
+		public func leaf(): Tree<int> = Tree.Leaf(value = 1)\n";
+	let library_load = only_entry("library", library);
+	let library_diags = check_project_library_with_embedded_std("library", &library_load);
+	assert!(
+		library_diags.is_empty(),
+		"embedded library check should resolve std without requiring main: {library_diags:?}"
 	);
 }
 

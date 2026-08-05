@@ -24,11 +24,9 @@ fn write_source(source: &str) -> std::path::PathBuf {
 }
 
 /// Write `source` to a fresh temp *directory* under a file literally named
-/// `main.nym`, and return its path. `write_source`'s stems (`nymph_cli_src_
-/// <pid>_<n>`) can never equal `main`, so `check`/`build`'s stem-based entry
-/// detection needs a helper that can actually produce that stem — a unique
-/// directory keeps concurrent test threads from colliding on the shared
-/// `main.nym` name.
+/// `main.nym`, and return its path. A unique directory keeps concurrent test
+/// threads from colliding on the shared filename; tests use this to prove that
+/// the filename itself has no effect on entry/library intent.
 fn write_main_source(source: &str) -> std::path::PathBuf {
 	static COUNTER: AtomicU64 = AtomicU64::new(0);
 	let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -347,6 +345,128 @@ fn target_matrix_loose_explicit_file_resolves_sibling_imports_for_every_command(
 	let _ = std::fs::remove_file(path.with_extension("mjs"));
 	std::fs::remove_file(helper).unwrap();
 	std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn check_matches_build_and_run_for_project_imports_and_embedded_std() {
+	let root = write_project(
+		"bin/start.nym",
+		"import @/support with (answer)\n\
+		 import std/collections/tree with (Tree)\n\
+		 func main(): void = {\n\
+		   let value = match (Tree.Leaf(value = answer())) {\n\
+		     Tree.Leaf(value) -> value,\n\
+		     Tree.Node(...) -> 0,\n\
+		   }\n\
+		 }\n",
+	);
+	std::fs::write(
+		root.join("src/support.nym"),
+		"public func answer(): int = 42\n",
+	)
+	.unwrap();
+
+	for command in ["check", "build", "run"] {
+		let out = nymph_in(&[command], &root);
+		assert!(
+			out.status.success(),
+			"{command} should accept the same project/std graph; stdout: {} stderr: {}",
+			out.stdout,
+			out.stderr
+		);
+	}
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn check_attributes_imported_module_diagnostics_to_the_source_path() {
+	let root = write_project(
+		"main.nym",
+		"import @/nested/helper with (answer)\nfunc main(): void = { let value = answer() }\n",
+	);
+	let helper = root.join("src/nested/helper.nym");
+	std::fs::create_dir_all(helper.parent().unwrap()).unwrap();
+	std::fs::write(&helper, "public func answer(): int = true\n").unwrap();
+
+	let out = nymph_in(&["check"], &root);
+	assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+	assert!(
+		out.stderr.contains(&format!("{}:1:", helper.display())),
+		"diagnostic should point to the imported module's source path: {}",
+		out.stderr
+	);
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn check_explicit_project_and_loose_targets_use_std_without_emitting_js() {
+	let root = write_project(
+		"main.nym",
+		"import std/io with (println)\nfunc main(): void = println(\"executed\")\n",
+	);
+	let entry_output = root.join("src/main.mjs");
+	let entry_check = nymph_in(&["check"], &root);
+	assert!(
+		entry_check.status.success(),
+		"project entry should check with embedded std: {}",
+		entry_check.stderr
+	);
+	assert_eq!(
+		entry_check.stdout, "ok\n",
+		"check must not execute the selected entry"
+	);
+	assert!(
+		!entry_output.exists(),
+		"check must not emit {}",
+		entry_output.display()
+	);
+
+	let project_library = root.join("src/lib/tree.nym");
+	std::fs::create_dir_all(project_library.parent().unwrap()).unwrap();
+	std::fs::write(
+		&project_library,
+		"import std/collections/tree with (Tree)\n\
+		 public func leaf(): Tree<int> = Tree.Leaf(value = 1)\n",
+	)
+	.unwrap();
+	let project_output = project_library.with_extension("mjs");
+	let project_check = nymph_in(&["check", project_library.to_str().unwrap()], &root);
+	assert!(
+		project_check.status.success(),
+		"explicit project library should check with embedded std: {}",
+		project_check.stderr
+	);
+	assert!(
+		!project_output.exists(),
+		"check must not emit {}",
+		project_output.display()
+	);
+
+	let loose = write_source(
+		"import std/collections/tree with (Tree)\n\
+		 func leaf(): Tree<int> = Tree.Leaf(value = 1)\n",
+	);
+	let loose_output = loose.with_extension("mjs");
+	let loose_check = nymph(&["check", loose.to_str().unwrap()]);
+	assert!(
+		loose_check.status.success(),
+		"loose library should check with embedded std: {}",
+		loose_check.stderr
+	);
+	assert_eq!(
+		loose_check.stdout, "ok\n",
+		"successful loose check should print only its status"
+	);
+	assert!(
+		!loose_output.exists(),
+		"check must not emit {}",
+		loose_output.display()
+	);
+
+	std::fs::remove_dir_all(root).unwrap();
+	std::fs::remove_file(loose).unwrap();
 }
 
 #[test]

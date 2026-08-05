@@ -260,6 +260,17 @@ pub fn check_project_with_std(
 		.collect()
 }
 
+/// Check an entry-mode project against the compiler's embedded standard
+/// library. This is the check-only counterpart to calling
+/// [`compile_project_with_std`] with [`crate::embedded_std_provider`]: it uses
+/// the same project graph and shipped std sources, but never lowers or emits.
+pub fn check_project_with_embedded_std(
+	entry: &str,
+	load: &dyn Fn(&str) -> Option<String>,
+) -> Vec<ProjectDiagnostic> {
+	check_project_with_std(entry, load, &crate::embedded_std_provider)
+}
+
 /// Library-mode counterpart of [`check_project`]: `entry` is not required to
 /// declare a `main` — mirrors [`crate::check`] one level up. Used to check a
 /// project graph rooted at a non-entry module (e.g. `nymph build` on a file
@@ -285,6 +296,16 @@ pub fn check_project_library_with_std(
 		.iter()
 		.cloned()
 		.collect()
+}
+
+/// Library-mode counterpart of [`check_project_with_embedded_std`]. The root
+/// module is not required to declare `main`, while imports and ambient core/std
+/// availability remain identical to an embedded-std project compile.
+pub fn check_project_library_with_embedded_std(
+	entry: &str,
+	load: &dyn Fn(&str) -> Option<String>,
+) -> Vec<ProjectDiagnostic> {
+	check_project_library_with_std(entry, load, &crate::embedded_std_provider)
 }
 
 /// Compile the whole project reachable from `entry` to one runnable JS
