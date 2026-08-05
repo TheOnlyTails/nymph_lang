@@ -91,8 +91,8 @@ world!" // newline
 
 Each `${...}` interpolation must contain exactly one complete expression. Empty interpolations and
 extra content after that expression are invalid. Grouped expressions, calls, and closures are
-supported, for example `${(a + b)}`, `${format(value)}`, and `${x -> x + 1}`. Interpolations that
-contain braces, such as block and `match` expressions, are not currently supported.
+supported, for example `${(a + b)}`, `${format(value)}`, and `${x -> x + 1}`. Balanced braces are
+supported too, including block and `match` expressions.
 
 ## Identifiers
 
@@ -208,13 +208,13 @@ unspecified—including across separate map instances—and mutation may change 
 Range expressions create values of the canonical standard-library range structs.
 A range can be either exclusive (`..`) or inclusive (`..=`):
 
-| Syntax | Value type and fields |
-| --- | --- |
-| `start..end` | `Range { start, end }` |
-| `start..` | `RangeFrom { start }` |
-| `..end` | `RangeTo { end }` |
+| Syntax        | Value type and fields           |
+| ------------- | ------------------------------- |
+| `start..end`  | `Range { start, end }`          |
+| `start..`     | `RangeFrom { start }`           |
+| `..end`       | `RangeTo { end }`               |
 | `start..=end` | `RangeInclusive { start, end }` |
-| `..=end` | `RangeToInclusive { end }` |
+| `..=end`      | `RangeToInclusive { end }`      |
 
 Supplied endpoints are evaluated exactly once, from left to right. Range values can be stored,
 passed, returned, and inspected like values constructed from those structs directly.

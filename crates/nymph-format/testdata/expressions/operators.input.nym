@@ -1,0 +1,6 @@
+func f(a:int,b:int,c:int)=((a+b*c))
+func g(x:int)=foo ( x, named=1,...rest)?.member?.[0]?
+func ranges()=#[1..10,1..=10,1..,..10,..=10]
+func closure()=label@( mut x:int,...rest)->label@{return@label x}
+func assign()={let mut x=1 x+=2 x}
+func long_binary()=first_identifier_with_a_very_long_name+second_identifier_with_a_very_long_name+third_identifier_with_a_very_long_name

@@ -1,0 +1,13 @@
+import   @/zeta with( Zed as Z ,Alpha )
+import ./local as l
+public struct  Pair<T>(public first:T,second:T=first)
+internal enum Choice<T>{None,Some(value:T),}
+private type Alias<T> =#(T,#[T])
+interface Show<T>: Base<T>{func show(value:T):string}
+namespace Util{func id<T>(value:T):T=value}
+impl<T> Pair<T>{func first():T=this.first}
+impl<T> Show<T> for Pair<T>{func show(value:T):string="pair"}
+external(host_value) let host:int
+external(host_call) func call(value:int):int
+let mut count:int=0
+func identity<T>(value:T):T=value

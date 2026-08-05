@@ -56,6 +56,7 @@ export default defineConfig({
 				base: "/reference",
 				items: [
 					{ text: "Introduction", link: "/" },
+					{ text: "Formatting", link: "/formatting/" },
 					{ text: "Literals", link: "/literals/" },
 					{ text: "Expressions", link: "/expressions/" },
 					{ text: "Declarations", link: "/declarations/" },

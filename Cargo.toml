@@ -5,6 +5,7 @@ members = [
 	"crates/nymph-diagnostics",
 	"crates/nymph-errorcode",
 	"crates/nymph-syntax",
+	"crates/nymph-format",
 	"crates/nymph-hir",
 	"crates/nymph-sema",
 	"crates/nymph-codegen",
@@ -30,6 +31,7 @@ nymph-ast = { path = "crates/nymph-ast" }
 nymph-diagnostics = { path = "crates/nymph-diagnostics" }
 nymph-errorcode = { path = "crates/nymph-errorcode" }
 nymph-syntax = { path = "crates/nymph-syntax" }
+nymph-format = { path = "crates/nymph-format" }
 nymph-hir = { path = "crates/nymph-hir" }
 nymph-sema = { path = "crates/nymph-sema" }
 nymph-codegen = { path = "crates/nymph-codegen" }

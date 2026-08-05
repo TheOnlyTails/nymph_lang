@@ -1,0 +1,8 @@
+func flow(xs: #[int]) = outer@{
+	while@loop (true) if (x > 0) break@loop x else continue@loop
+	for@scan (x in xs) return@outer x
+	match (xs) {
+		#[] -> 0,
+		_ -> 1,
+	}
+}

@@ -1491,6 +1491,7 @@ dependencies = [
  "inquire",
  "nymph-compiler",
  "nymph-diagnostics",
+ "nymph-format",
  "nymph-project",
  "owo-colors",
 ]
@@ -1551,6 +1552,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nymph-format"
+version = "0.1.0"
+dependencies = [
+ "nymph-ast",
+ "nymph-diagnostics",
+ "nymph-syntax",
+ "thiserror",
+]
+
+[[package]]
 name = "nymph-hir"
 version = "0.1.0"
 dependencies = [
@@ -1568,6 +1579,7 @@ dependencies = [
  "nymph-ast",
  "nymph-compiler",
  "nymph-diagnostics",
+ "nymph-format",
  "nymph-project",
  "nymph-sema",
  "nymph-syntax",

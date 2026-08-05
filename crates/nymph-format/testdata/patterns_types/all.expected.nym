@@ -1,0 +1,12 @@
+type Shapes<A, B> = #(#[A], #{string: B}, (A) -> B, A + B, mut A)
+func destructure(value: #(int, int)) = {
+	let whole = #(left, right): #(int, int) = value
+	match (value) {
+		whole = #(a, b) -> a,
+		#[head, ...tail] -> head,
+		#{"x": x, ...rest} -> x,
+		Box(value = captured = 1) -> captured,
+		1..=10 -> 1,
+		_ | None -> 0,
+	}
+}

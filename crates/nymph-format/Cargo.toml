@@ -1,0 +1,18 @@
+[package]
+name = "nymph-format"
+description = "Canonical, reusable formatter for the Nymph language."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nymph-ast = { workspace = true }
+nymph-diagnostics = { workspace = true }
+nymph-syntax = { workspace = true }
+thiserror = { workspace = true }
+
+[lints.clippy]
+all = "warn"
