@@ -19,6 +19,7 @@ nymph-sema = { workspace = true }
 nymph-syntax = { workspace = true }
 nymph-diagnostics = { workspace = true }
 nymph-ast = { workspace = true }
+nymph-format = { path = "../nymph-format" }
 anyhow = { workspace = true }
 serde_json = "1.0.150"
 lsp-server = "0.10.0"

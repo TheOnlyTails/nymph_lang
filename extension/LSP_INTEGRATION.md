@@ -92,7 +92,7 @@ Option A: Launch in VS Code
 1. Open the workspace root in VS Code
 2. Press `F5` to launch Extension Development Host
 3. Open a `.nym` file
-4. Features should work: hover, completion, symbols, etc.
+4. Features should work: hover, completion, symbols, formatting, etc.
 
 Option B: Manual testing
 
@@ -144,6 +144,16 @@ Language Client -> VS Code UI
 ```
 
 ## Configuration
+
+### Formatting
+
+The server advertises full-document and selected-range formatting. VS Code's
+**Format Document** and **Format Selection** actions use the current unsaved
+editor buffer and return text edits; the server never writes source files.
+Formatting options such as tab size do not override Nymph's canonical style.
+Malformed input safely produces no edits, leaving the editor contents intact.
+You can enable ordinary VS Code format-on-save for the `nymph` language if
+desired.
 
 ### Server Binary Discovery
 

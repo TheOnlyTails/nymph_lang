@@ -42,6 +42,7 @@ fn hello() {
    - **Hover** over `fn` keyword
    - **Ctrl+Space** for completions
    - **Ctrl+Shift+O** for symbols
+   - **Format Document** or select code and choose **Format Selection**
 
 ## Development Mode
 
@@ -64,6 +65,11 @@ cargo watch -x 'build --release --package nymph-lsp'
 ✅ Code completion (keywords)
 ✅ Document symbols/outline
 ✅ Multi-file workspace
+✅ Full-document and selected-range formatting
+
+Formatting operates on the open editor buffer (including unsaved changes) and
+never writes files directly. Invalid/incomplete source is left unchanged. The
+standard VS Code `editor.formatOnSave` setting can be enabled for Nymph files.
 
 ## Useful Commands
 

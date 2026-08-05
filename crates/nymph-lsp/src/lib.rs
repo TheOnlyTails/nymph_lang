@@ -19,7 +19,8 @@
 //! module doc comment); `textDocument/semanticTokens/full` classifies every
 //! token from the compiler's own lexer + AST, so highlighting stays correct
 //! independent of the TextMate grammar (see [`semantic_tokens`]).
-//! Incremental sync, formatting, and rename are deliberately out of scope.
+//! Incremental sync and rename are deliberately out of scope. Document and
+//! range formatting use the canonical formatter against the open buffer.
 
 pub mod compiler_state;
 pub mod completion;
@@ -27,6 +28,7 @@ pub mod definition;
 pub mod diagnostics;
 pub mod document_store;
 pub mod document_symbols;
+pub mod formatting;
 pub mod hover;
 pub mod line_index;
 mod position;
@@ -39,16 +41,17 @@ use document_store::DocumentStore;
 use lsp_server::{Connection, Message, Notification as ServerNotification, Response};
 use lsp_types::{
 	CompletionOptions, CompletionParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-	DidOpenTextDocumentParams, DocumentSymbolParams, GotoDefinitionParams, HoverParams,
-	HoverProviderCapability, InitializeParams, InitializeResult, OneOf, SemanticTokensFullOptions,
-	SemanticTokensOptions, SemanticTokensParams, SemanticTokensServerCapabilities,
-	ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind,
+	DidOpenTextDocumentParams, DocumentFormattingParams, DocumentRangeFormattingParams,
+	DocumentSymbolParams, GotoDefinitionParams, HoverParams, HoverProviderCapability,
+	InitializeParams, InitializeResult, OneOf, SemanticTokensFullOptions, SemanticTokensOptions,
+	SemanticTokensParams, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
+	TextDocumentSyncCapability, TextDocumentSyncKind,
 	notification::{
 		DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _,
 	},
 	request::{
-		Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, Request as _,
-		SemanticTokensFullRequest,
+		Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, RangeFormatting,
+		Request as _, SemanticTokensFullRequest,
 	},
 };
 
@@ -63,6 +66,8 @@ pub fn server_capabilities() -> ServerCapabilities {
 		text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
 		hover_provider: Some(HoverProviderCapability::Simple(true)),
 		document_symbol_provider: Some(OneOf::Left(true)),
+		document_formatting_provider: Some(OneOf::Left(true)),
+		document_range_formatting_provider: Some(OneOf::Left(true)),
 		definition_provider: Some(OneOf::Left(true)),
 		completion_provider: Some(CompletionOptions {
 			trigger_characters: Some(vec![".".to_string()]),
@@ -185,6 +190,19 @@ fn main_loop(
 							.sender
 							.send(Message::Response(Response::new_ok(id, result)))?;
 					}
+				} else if req.method == Formatting::METHOD {
+					let (id, params) = req.extract::<DocumentFormattingParams>(Formatting::METHOD)?;
+					let result = formatting::document_formatting(&docs.lock().unwrap(), &params);
+					connection
+						.sender
+						.send(Message::Response(Response::new_ok(id, result)))?;
+				} else if req.method == RangeFormatting::METHOD {
+					let (id, params) =
+						req.extract::<DocumentRangeFormattingParams>(RangeFormatting::METHOD)?;
+					let result = formatting::document_range_formatting(&docs.lock().unwrap(), &params);
+					connection
+						.sender
+						.send(Message::Response(Response::new_ok(id, result)))?;
 				} else if req.method == DocumentSymbolRequest::METHOD {
 					let (id, params) = req.extract::<DocumentSymbolParams>(DocumentSymbolRequest::METHOD)?;
 					let result = document_symbols::document_symbols(&docs.lock().unwrap(), &params);
@@ -718,6 +736,14 @@ mod tests {
 			Some(OneOf::Left(true))
 		);
 		assert_eq!(
+			result.capabilities.document_formatting_provider,
+			Some(OneOf::Left(true))
+		);
+		assert_eq!(
+			result.capabilities.document_range_formatting_provider,
+			Some(OneOf::Left(true))
+		);
+		assert_eq!(
 			result.capabilities.definition_provider,
 			Some(OneOf::Left(true))
 		);
@@ -1136,5 +1162,75 @@ mod tests {
 		let doc = docs.get(&uri).expect("document should be open");
 		assert_eq!(doc.text, "func main() = 1");
 		assert_eq!(doc.version, 2);
+	}
+
+	#[test]
+	fn document_and_range_formatting_requests_round_trip_through_the_wire() {
+		use lsp_types::{
+			TextEdit,
+			request::{Formatting, RangeFormatting},
+		};
+
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		handshake(&client);
+		let uri: Uri = "file:///wire-format.nym".parse().unwrap();
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidOpenTextDocument::METHOD.to_string(),
+				serde_json::to_value(DidOpenTextDocumentParams {
+					text_document: TextDocumentItem {
+						uri: uri.clone(),
+						language_id: "nymph".into(),
+						version: 1,
+						text: "let λ=alpha+beta\n".into(),
+					},
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		let _ = recv_diagnostics_for(&client, &uri);
+
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(41),
+				Formatting::METHOD.into(),
+				serde_json::json!({
+					"textDocument": { "uri": uri.as_str() },
+					"options": { "tabSize": 8, "insertSpaces": true }
+				}),
+			)))
+			.unwrap();
+		let response = recv_response(&client, 41);
+		let edits: Option<Vec<TextEdit>> =
+			serde_json::from_value(response.response_result.unwrap()).unwrap();
+		assert_eq!(edits.unwrap()[0].new_text, "let λ = alpha + beta\n");
+
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(42),
+				RangeFormatting::METHOD.into(),
+				serde_json::json!({
+					"textDocument": { "uri": uri.as_str() },
+					"range": {
+						"start": { "line": 0, "character": 11 },
+						"end": { "line": 0, "character": 12 }
+					},
+					"options": { "tabSize": 4, "insertSpaces": true }
+				}),
+			)))
+			.unwrap();
+		let response = recv_response(&client, 42);
+		let edits: Option<Vec<TextEdit>> =
+			serde_json::from_value(response.response_result.unwrap()).unwrap();
+		let edits = edits.unwrap();
+		let edit = &edits[0];
+		assert_eq!(edit.new_text, "alpha + beta");
+		assert_eq!(edit.range.start.character, 6);
+
+		shutdown(&client, handle);
 	}
 }
