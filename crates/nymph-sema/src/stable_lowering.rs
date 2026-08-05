@@ -2015,10 +2015,26 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 	fn lower_function_body(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
 		let outer_loops = self.loop_targets.replace(Vec::new());
 		let outer_blocks = self.block_targets.replace(Vec::new());
-		let lowered = if let StableExprKind::Block { body, .. } = &expr.kind {
-			self.lower_block(body, false)
-		} else {
-			self.lower(expr)
+		let lowered = match &expr.kind {
+			StableExprKind::Block { body, label: None } => self.lower_block(body, false),
+			StableExprKind::Block {
+				body,
+				label: Some(_),
+			} => {
+				let target = self.next_block_target.get();
+				self.next_block_target.set(target + 1);
+				self
+					.block_targets
+					.borrow_mut()
+					.push((self.id(expr), target));
+				let body = self.lower_block(body, false);
+				self.block_targets.borrow_mut().pop();
+				body.map(|body| HirExpr::LabeledBlock {
+					target,
+					body: Box::new(body),
+				})
+			}
+			_ => self.lower(expr),
 		};
 		self.block_targets.replace(outer_blocks);
 		self.loop_targets.replace(outer_loops);
@@ -2053,12 +2069,15 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.control_targets
 			.iter()
 			.find_map(|(candidate, target)| (*candidate == jump).then_some(*target));
+		let Some(crate::runtime::RuntimeControlTarget::Block(resolved)) = resolved else {
+			return nymph_hir::hir::HirReturnTarget::Callable;
+		};
 		self
 			.block_targets
 			.borrow()
 			.iter()
 			.rev()
-			.find(|(source, _)| Some(*source) == resolved)
+			.find(|(source, _)| *source == resolved)
 			.map_or(nymph_hir::hir::HirReturnTarget::Callable, |(_, target)| {
 				nymph_hir::hir::HirReturnTarget::Block(*target)
 			})
@@ -2721,7 +2740,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							.annotations
 							.control_targets
 							.iter()
-							.any(|(jump, target)| *jump == self.id(expr) && target == source)
+							.any(|(jump, target)| {
+								*jump == self.id(expr)
+									&& matches!(target, crate::runtime::RuntimeControlTarget::Loop(id) if id == source)
+							})
 					})
 					.map(|(_, target)| *target)
 					.ok_or_else(|| self.unsupported(expr, "break outside a loop"))?,
@@ -2747,7 +2769,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							.annotations
 							.control_targets
 							.iter()
-							.any(|(jump, target)| *jump == self.id(expr) && target == source)
+							.any(|(jump, target)| {
+								*jump == self.id(expr)
+									&& matches!(target, crate::runtime::RuntimeControlTarget::Loop(id) if id == source)
+							})
 					})
 					.map(|(_, target)| *target)
 					.ok_or_else(|| self.unsupported(expr, "continue outside a loop"))?,

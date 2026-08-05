@@ -49,26 +49,24 @@ fn compatibility_lowering_preserves_loop_control_targets_and_option_results() {
 
 #[test]
 fn compatibility_lowering_preserves_resolved_labeled_block_returns() {
-	let hir = lower("func choose(): int = { result@{ return@result 7 } }");
+	let hir = lower(
+		"func choose(flag: boolean): int = result@{ if (flag) { return@choose 1 } return@result 7 }",
+	);
 	assert!(matches!(
 		&hir.funcs[0].body,
-		HirExpr::Block {
-			tail: Some(tail),
-			..
-		} if matches!(tail.as_ref(),
-			HirExpr::LabeledBlock {
-				target,
-				body,
-			} if matches!(body.as_ref(),
-				HirExpr::Block {
-					stmts,
-					..
-				} if matches!(stmts.as_slice(), [HirStmt::Return {
-					target: nymph_hir::hir::HirReturnTarget::Block(return_target),
-					..
-				}] if return_target == target)
+		HirExpr::LabeledBlock { target, body }
+			if matches!(body.as_ref(), HirExpr::Block { stmts, .. }
+				if matches!(stmts.last(), Some(HirStmt::Return {
+					target: nymph_hir::hir::HirReturnTarget::Block(return_target), ..
+				}) if return_target == target)
+					&& matches!(stmts.first(), Some(HirStmt::Expr(HirExpr::If { then, .. }))
+						if matches!(then.as_ref(), HirExpr::Block { stmts, .. }
+							if matches!(stmts.as_slice(), [HirStmt::Return {
+								target: nymph_hir::hir::HirReturnTarget::Callable, ..
+							}])
+						)
+					)
 			)
-		)
 	));
 }
 

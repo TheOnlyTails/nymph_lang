@@ -521,7 +521,7 @@ fn function_return_crosses_a_generated_iife_without_losing_sibling_values() {
 	};
 	let js = emit(&module);
 	assert!(
-		js.contains("throw ["),
+		js.contains("throw $nymph$completion$"),
 		"return crosses the generated IIFE: {js}"
 	);
 	assert!(
@@ -580,7 +580,10 @@ fn return_inside_a_nested_subexpression_uses_the_closure_completion_target() {
 		enums: vec![],
 	};
 	let js = emit(&module);
-	assert!(js.contains("throw ["), "return completion is thrown: {js}");
+	assert!(
+		js.contains("throw $nymph$completion$"),
+		"return completion is thrown: {js}"
+	);
 	assert!(
 		js.contains("catch ("),
 		"closure catches its completion: {js}"

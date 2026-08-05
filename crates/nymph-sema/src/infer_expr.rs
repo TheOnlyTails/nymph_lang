@@ -18,7 +18,9 @@ use nymph_ast::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::annotate::{DispatchKind, IterMode, Resolution};
+use crate::annotate::{
+	DispatchKind, IterMode, Resolution, ResolvedControlTarget, ResolvedControlTargetKind,
+};
 use crate::check::{
 	Checker, ControlLabel, ControlLabelKind, InstantiatedObligation, LoopBreakKind, PendingBound,
 };
@@ -227,7 +229,18 @@ impl<'m> Checker<'m> {
 			);
 			return None;
 		}
-		self.annotations.record_control_target(expr.id, target.id);
+		let kind = match target.kind {
+			ControlLabelKind::Loop => ResolvedControlTargetKind::Loop,
+			ControlLabelKind::Block => ResolvedControlTargetKind::Block,
+			ControlLabelKind::Callable => ResolvedControlTargetKind::Callable,
+		};
+		self.annotations.record_control_target(
+			expr.id,
+			ResolvedControlTarget {
+				source: target.id,
+				kind,
+			},
+		);
 		Some(target)
 	}
 
@@ -3924,6 +3937,22 @@ impl Checker<'_> {
 			LoopBreakKind::Bare => self.interner.mk_tuple(vec![]),
 			LoopBreakKind::Valued(ty) => ty,
 		};
+		let element = self.shallow_resolve(element);
+		let unresolved = match self.interner.kind(element) {
+			TyKind::Infer(var) => Some(*var),
+			_ => None,
+		};
+		let element = if let Some(var) = unresolved {
+			// A syntactically valued break whose value always transfers control
+			// (for example `break (break@outer 1)`) never constrains its loop's
+			// element variable. The loop still has the valued Option shape required
+			// by the syntax scan; complete that otherwise-unsolved type as `never`.
+			let never = self.interner.never();
+			self.table.assign(var, never);
+			never
+		} else {
+			element
+		};
 		let Some(option) = self.runtime_roles.option else {
 			return self.interner.error();
 		};
@@ -3960,14 +3989,19 @@ impl Checker<'_> {
 				})
 			};
 			match &expr.kind {
-				ExprKind::Break { value, label }
+				ExprKind::Break { value, label } => {
+					let nested = value
+						.as_deref()
+						.and_then(|value| walk(checker, value, target));
 					if match (label, target.0) {
 						(None, _) => target.1,
 						(Some(a), Some(b)) => a.0 == b.0,
 						_ => false,
-					} =>
-				{
-					Some(value.is_some())
+					} {
+						merge(Some(value.is_some()), nested)
+					} else {
+						nested
+					}
 				}
 				ExprKind::Closure { .. } => None,
 				ExprKind::While {

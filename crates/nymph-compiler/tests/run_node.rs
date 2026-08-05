@@ -4393,11 +4393,60 @@ func callable_iife(): int = {
 func callable_iife_fallthrough(): int = {
   let value = block@{ if (false) { return@callable_iife_fallthrough 13 } 3 }
   value + 4
+}
+func direct_body(flag: boolean): int = result@{
+  if (flag) { return@direct_body 17 }
+  return@result 19
 }"#;
 	assert_eq!(run(src, "block()"), "8");
 	assert_eq!(run(src, "nested()"), "11");
 	assert_eq!(run(src, "callable_iife_fallthrough()"), "7");
 	assert_eq!(run(src, "callable_iife()"), "13");
+	assert_eq!(run(src, "direct_body(new NBool(true))"), "17");
+	assert_eq!(run(src, "direct_body(new NBool(false))"), "19");
+}
+
+#[test]
+fn explicitly_outer_breaks_inside_nested_break_values_count_and_execute() {
+	let src = r#"func nested(): int = match (while@outer (true) {
+	while (true) { break (break@outer 7) }
+}) { Some(value) -> value, None -> 0 }"#;
+	assert_eq!(run(src, "nested()"), "7");
+}
+
+#[test]
+fn completion_packets_cannot_shadow_user_bindings_or_inspect_user_exceptions() {
+	let src = r#"func preserve(_t1: int): int = {
+  let value = block@{ return@block _t1 }
+  value
+}
+func invoke(callback: () -> int): int = {
+  let value = block@{
+    callback()
+    if (true) { return@invoke 1 }
+    2
+  }
+  value
+}
+func loop_invoke(callback: () -> int): Option<int> = while (true) {
+  callback()
+  break 1
+}"#;
+	assert_eq!(run(src, "preserve(new NInt(7))"), "7");
+	assert_eq!(
+		run(
+			src,
+			"(() => { const sentinel = new Proxy([], { get() { throw new Error('inspected') } }); try { invoke(() => { throw sentinel }) } catch (error) { return error === sentinel } return false })()",
+		),
+		"true"
+	);
+	assert_eq!(
+		run(
+			src,
+			"(() => { const sentinel = new Proxy([], { get() { throw new Error('inspected') } }); try { loop_invoke(() => { throw sentinel }) } catch (error) { return error === sentinel } return false })()",
+		),
+		"true"
+	);
 }
 
 #[test]

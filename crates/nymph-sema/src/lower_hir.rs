@@ -3197,7 +3197,24 @@ impl<'a> Lowerer<'a> {
 		let outer_loops = self.loop_targets.replace(Vec::new());
 		let outer_blocks = self.block_targets.replace(Vec::new());
 		let lowered = match &body.kind {
-			ExprKind::Block { body: stmts, .. } => self.lower_block(stmts, false),
+			ExprKind::Block {
+				body: stmts,
+				label: None,
+			} => self.lower_block(stmts, false),
+			ExprKind::Block {
+				body: stmts,
+				label: Some(_),
+			} => {
+				let target = self.next_block_target.get();
+				self.next_block_target.set(target + 1);
+				self.block_targets.borrow_mut().push((body.id, target));
+				let body = self.lower_block(stmts, false);
+				self.block_targets.borrow_mut().pop();
+				HirExpr::LabeledBlock {
+					target,
+					body: Box::new(body),
+				}
+			}
 			_ => self.lower_expr(body),
 		};
 		self.block_targets.replace(outer_blocks);
@@ -3277,12 +3294,20 @@ impl<'a> Lowerer<'a> {
 
 	fn return_target(&self, jump: NodeId) -> nymph_hir::hir::HirReturnTarget {
 		let resolved = self.annotations.control_target_of(jump);
+		if !resolved.is_some_and(|target| {
+			matches!(
+				target.kind,
+				crate::annotate::ResolvedControlTargetKind::Block
+			)
+		}) {
+			return nymph_hir::hir::HirReturnTarget::Callable;
+		}
 		self
 			.block_targets
 			.borrow()
 			.iter()
 			.rev()
-			.find(|(source, _)| Some(*source) == resolved)
+			.find(|(source, _)| resolved.is_some_and(|target| target.source == *source))
 			.map_or(nymph_hir::hir::HirReturnTarget::Callable, |(_, target)| {
 				nymph_hir::hir::HirReturnTarget::Block(*target)
 			})
@@ -3867,7 +3892,12 @@ impl<'a> Lowerer<'a> {
 					.borrow()
 					.iter()
 					.rev()
-					.find(|(source, _)| Some(*source) == self.annotations.control_target_of(expr.id))
+					.find(|(source, _)| {
+						self
+							.annotations
+							.control_target_of(expr.id)
+							.is_some_and(|target| target.source == *source)
+					})
 					.map(|(_, target)| *target)
 					.expect("checked break has an active loop target"),
 				value: Box::new(value.as_deref().map_or_else(
@@ -3884,7 +3914,12 @@ impl<'a> Lowerer<'a> {
 					.borrow()
 					.iter()
 					.rev()
-					.find(|(source, _)| Some(*source) == self.annotations.control_target_of(expr.id))
+					.find(|(source, _)| {
+						self
+							.annotations
+							.control_target_of(expr.id)
+							.is_some_and(|target| target.source == *source)
+					})
 					.map(|(_, target)| *target)
 					.expect("checked continue has an active loop target"),
 			},

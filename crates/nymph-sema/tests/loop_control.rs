@@ -46,6 +46,16 @@ fn labels_resolve_by_kind_and_do_not_cross_callables() {
 			.iter()
 			.any(|m| m.contains("wrong kind"))
 	);
+	for source in [
+		"func f(): void = outer@{ continue@outer }",
+		"func f(): void = { break@f }",
+		"func f(): void = { continue@f }",
+	] {
+		assert!(
+			messages(source).iter().any(|m| m.contains("wrong kind")),
+			"{source}"
+		);
+	}
 	assert!(
 		messages("func f(): void = while@outer (true) { return@outer }")
 			.iter()
@@ -57,6 +67,27 @@ fn labels_resolve_by_kind_and_do_not_cross_callables() {
 			.any(|m| m.contains("unknown"))
 	);
 	assert!(messages("func f(): int = { return@f 3 }").is_empty());
+}
+
+#[test]
+fn duplicate_active_labels_are_ambiguous_but_names_can_repeat_across_callables() {
+	let source = "func f(): int = outer@{ while@outer (true) { return@outer 1 } 2 }";
+	let parsed = parse_module(source, "test");
+	assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+	let checked = check_module(&parsed.tree);
+	let duplicate = checked
+		.diags
+		.iter()
+		.find(|diagnostic| diagnostic.message.contains("already active"))
+		.expect("expected duplicate-label diagnostic");
+	assert_eq!(&source[duplicate.span.start..duplicate.span.end], "outer");
+	assert_eq!(duplicate.labels.len(), 1);
+	assert_eq!(
+		&source[duplicate.labels[0].span.start..duplicate.labels[0].span.end],
+		"outer"
+	);
+
+	assert!(messages("func f(): int = outer@{ 1 }\nfunc g(): int = outer@{ 2 }").is_empty());
 }
 
 #[test]
@@ -157,6 +188,7 @@ fn loop_result_contracts_type_check() {
 		"func member(): Option<int> = while (true) { (break 1).field }",
 		"func index(): Option<int> = while (true) { #[0][break 1] }",
 		"func cast(): Option<int> = while (true) { (break 1) as int }",
+		"func outer_in_nested_break_value(): Option<int> = while@outer (true) { while (true) { break (break@outer 7) } }",
 	] {
 		let found = messages(source);
 		assert!(found.is_empty(), "{source}: {found:?}");

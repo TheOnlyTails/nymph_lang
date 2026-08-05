@@ -228,7 +228,7 @@ fn stable_lowering_preserves_loop_targets_and_canonical_option_abi() {
 #[test]
 fn stable_lowering_preserves_resolved_labeled_block_returns() {
 	let lowered = lower_named(
-		"func choose(): int = { result@{ return@result 7 } }",
+		"func choose(flag: boolean): int = result@{ if (flag) { return@choose 1 } return@result 7 }",
 		"choose",
 	);
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
@@ -236,23 +236,19 @@ fn stable_lowering_preserves_resolved_labeled_block_returns() {
 	};
 	assert!(matches!(
 		&function.body,
-		nymph_hir::hir::HirExpr::Block {
-			tail: Some(tail),
-			..
-		} if matches!(tail.as_ref(),
-			nymph_hir::hir::HirExpr::LabeledBlock {
-				target,
-				body,
-			} if matches!(body.as_ref(),
-				nymph_hir::hir::HirExpr::Block {
-					stmts,
-					..
-				} if matches!(stmts.as_slice(), [nymph_hir::hir::HirStmt::Return {
-					target: nymph_hir::hir::HirReturnTarget::Block(return_target),
-					..
-				}] if return_target == target)
+		nymph_hir::hir::HirExpr::LabeledBlock { target, body }
+			if matches!(body.as_ref(), nymph_hir::hir::HirExpr::Block { stmts, .. }
+				if matches!(stmts.last(), Some(nymph_hir::hir::HirStmt::Return {
+					target: nymph_hir::hir::HirReturnTarget::Block(return_target), ..
+				}) if return_target == target)
+					&& matches!(stmts.first(), Some(nymph_hir::hir::HirStmt::Expr(nymph_hir::hir::HirExpr::If { then, .. }))
+						if matches!(then.as_ref(), nymph_hir::hir::HirExpr::Block { stmts, .. }
+							if matches!(stmts.as_slice(), [nymph_hir::hir::HirStmt::Return {
+								target: nymph_hir::hir::HirReturnTarget::Callable, ..
+							}])
+						)
+					)
 			)
-		)
 	));
 }
 

@@ -400,8 +400,15 @@ pub struct RuntimeAnnotations {
 	pub anonymous_closures: Arc<[(BodyNodeId, u8)]>,
 	pub generic_namespaced_calls: Arc<[BodyNodeId]>,
 	pub external_marshals: Arc<[(BodyNodeId, nymph_hir::hir::MarshalKind)]>,
-	/// Resolved jump node → lexical target node, projected to stable body ids.
-	pub control_targets: Arc<[(BodyNodeId, BodyNodeId)]>,
+	/// Resolved jump node → typed lexical target, projected to stable body ids.
+	pub control_targets: Arc<[(BodyNodeId, RuntimeControlTarget)]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, salsa::SalsaValue)]
+pub enum RuntimeControlTarget {
+	Loop(BodyNodeId),
+	Block(BodyNodeId),
+	Callable(BodyNodeId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, salsa::SalsaValue)]
@@ -1423,7 +1430,18 @@ fn runtime_annotations(
 	let mut control_targets = checked
 		.annotations
 		.control_targets()
-		.filter_map(|(jump, target)| Some((*local.get(&jump)?, *local.get(&target)?)))
+		.filter_map(|(jump, target)| {
+			let jump = *local.get(&jump)?;
+			let target_id = *local.get(&target.source)?;
+			let target = match target.kind {
+				crate::annotate::ResolvedControlTargetKind::Loop => RuntimeControlTarget::Loop(target_id),
+				crate::annotate::ResolvedControlTargetKind::Block => RuntimeControlTarget::Block(target_id),
+				crate::annotate::ResolvedControlTargetKind::Callable => {
+					RuntimeControlTarget::Callable(target_id)
+				}
+			};
+			Some((jump, target))
+		})
 		.collect::<Vec<_>>();
 	for (&source, &id) in local {
 		if let Some(mode) = checked.annotations.iter_mode_of(source).or_else(|| {
