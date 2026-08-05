@@ -494,6 +494,7 @@ fn check_module_from_parts(
 						name.clone(),
 						crate::annotate::CheckedMethod {
 							definition: method.definition.clone(),
+							generic_count: method.generic_names.len(),
 							params,
 							ret,
 							bounds: method.bounds.clone(),
@@ -1588,14 +1589,14 @@ mod tests {
 		);
 
 		let span = Span::new(0, 0);
-		let (_, resolved, _, _, defining_span) = checker
+		let (_, resolved, _, _, defining_span, _) = checker
 			.resolve_inherent(self_ty, "get", &[], &[], span)
 			.expect("imported instance method should resolve");
 		assert_eq!(resolved, int);
 		assert_eq!(defining_span, None);
 		assert_eq!(
 			checker.resolve_namespaced(record, "make", &[], &[], span),
-			Some((self_ty, None))
+			Some((self_ty, None, Vec::new()))
 		);
 		checker.generalize_returns();
 		checker.check_member_bodies();

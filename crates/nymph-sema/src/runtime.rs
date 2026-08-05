@@ -398,10 +398,19 @@ pub struct RuntimeAnnotations {
 	pub positional_fields: Arc<[(PatternNodeId, StableVariantField)]>,
 	pub iterations: Arc<[(BodyNodeId, RuntimeIteration)]>,
 	pub anonymous_closures: Arc<[(BodyNodeId, u8)]>,
-	pub generic_namespaced_calls: Arc<[BodyNodeId]>,
+	pub generic_namespaced_calls: Arc<[(BodyNodeId, u32, DefinitionId, DefinitionId)]>,
+	pub generic_call_arguments: Arc<[(BodyNodeId, Arc<[RuntimeTypeArgument]>)]>,
+	/// Generic-call site → exact directly invoked definition.
+	pub generic_call_targets: Arc<[(BodyNodeId, DefinitionId)]>,
 	pub external_marshals: Arc<[(BodyNodeId, nymph_hir::hir::MarshalKind)]>,
 	/// Resolved jump node → typed lexical target, projected to stable body ids.
 	pub control_targets: Arc<[(BodyNodeId, RuntimeControlTarget)]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub enum RuntimeTypeArgument {
+	Canonical(InterfaceType),
+	Erased,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, salsa::SalsaValue)]
@@ -421,13 +430,18 @@ pub enum RuntimeBodyKind {
 #[derive(Clone, Debug, salsa::SalsaValue)]
 pub struct CheckedRuntimeBody {
 	pub kind: RuntimeBodyKind,
+	/// Declared hidden type-object parameters, in canonical binder order.
+	pub type_parameters: Arc<[crate::GenericParameterId]>,
 	pub stable: StableBody,
 	pub annotations: RuntimeAnnotations,
 }
 
 impl PartialEq for CheckedRuntimeBody {
 	fn eq(&self, other: &Self) -> bool {
-		self.kind == other.kind && self.stable == other.stable && self.annotations == other.annotations
+		self.kind == other.kind
+			&& self.type_parameters == other.type_parameters
+			&& self.stable == other.stable
+			&& self.annotations == other.annotations
 	}
 }
 impl Eq for CheckedRuntimeBody {}
@@ -922,6 +936,7 @@ fn push_canonical_body(
 	let positional_sites = builder.positional_sites.into_inner();
 	let annotations = runtime_annotations(
 		&definition,
+		&nodes,
 		&local,
 		&pattern_sites,
 		&positional_sites,
@@ -929,12 +944,20 @@ fn push_canonical_body(
 		&required_type_nodes,
 		checked,
 	)?;
+	let mut type_parameters = body_parameters(&definition, checked)
+		.into_iter()
+		.collect::<Vec<_>>();
+	type_parameters.sort_by_key(|(index, _)| index.0);
 	result.push(RuntimeDefinition {
 		source_owner: definition.module.clone(),
 		definition,
 		placement,
 		payload: RuntimePayload::NymphBody(CheckedRuntimeBody {
 			kind,
+			type_parameters: type_parameters
+				.into_iter()
+				.map(|(_, parameter)| parameter)
+				.collect(),
 			stable,
 			annotations,
 		}),
@@ -1334,6 +1357,7 @@ impl<'a> StableBodyBuilder<'a> {
 
 fn runtime_annotations(
 	definition: &DefinitionId,
+	nodes: &[&Expr],
 	local: &std::collections::HashMap<nymph_ast::NodeId, BodyNodeId>,
 	pattern_sites: &std::collections::HashMap<nymph_ast::Span, PatternNodeId>,
 	positional_sites: &std::collections::HashMap<nymph_ast::Span, PatternNodeId>,
@@ -1373,6 +1397,30 @@ fn runtime_annotations(
 	};
 	let mut types = Vec::new();
 	let mut dispatches = Vec::new();
+	let construction_type_nodes = nodes
+		.iter()
+		.filter_map(|expression| {
+			let required = match &expression.kind {
+				ExprKind::List(_) | ExprKind::Tuple(_) | ExprKind::Map(_) | ExprKind::Range(_) => true,
+				ExprKind::Call { func, .. } => {
+					checked
+						.annotations
+						.definition_target_of(func.id)
+						.is_some_and(|target| {
+							matches!(
+								target.key,
+								crate::DeclarationKey::TopLevel {
+									category: crate::DeclarationCategory::Struct,
+									..
+								}
+							)
+						}) || checked.annotations.variant_of(expression.id).is_some()
+				}
+				_ => checked.annotations.variant_of(expression.id).is_some(),
+			};
+			required.then_some(expression.id)
+		})
+		.collect::<std::collections::HashSet<_>>();
 	for (node, info) in checked.annotations.infos() {
 		let Some(&id) = local.get(&node) else {
 			continue;
@@ -1382,6 +1430,11 @@ fn runtime_annotations(
 				id,
 				required_canonical_type(&checked.interner, info.ty, &context)?,
 			));
+		} else if construction_type_nodes.contains(&node)
+			&& let Ok(type_) = required_canonical_type(&checked.interner, info.ty, &context)
+			&& runtime_type_object_supported(&type_)
+		{
+			types.push((id, type_));
 		}
 		if let Some(resolution) = &info.resolution {
 			dispatches.push((id, stable_dispatch(checked, resolution)?));
@@ -1488,10 +1541,87 @@ fn runtime_annotations(
 		if let Some(arity) = checked.annotations.anon_boundary_arity(source) {
 			anonymous_closures.push((id, arity));
 		}
-		if checked.annotations.is_generic_namespaced_call(source) {
-			generic_namespaced_calls.push(id);
+		if let Some(call) = checked.annotations.generic_namespaced_call(source) {
+			generic_namespaced_calls.push((
+				id,
+				call.parameter.0,
+				call.interface.clone(),
+				call.member.clone(),
+			));
 		}
 	}
+	let mut generic_call_arguments = checked
+		.annotations
+		.generic_call_arguments()
+		.filter_map(|(source, arguments)| local.get(&source).map(|id| (*id, arguments)))
+		.map(|(id, arguments)| {
+			let arguments = arguments
+				.iter()
+				.map(
+					|ty| match required_canonical_type(&checked.interner, *ty, &context) {
+						Ok(type_) if runtime_type_object_supported(&type_) => {
+							Ok(RuntimeTypeArgument::Canonical(type_))
+						}
+						Ok(_) => Ok(RuntimeTypeArgument::Erased),
+						// Preserve the declared slot so later concrete arguments do not
+						// shift when an unrelated inferred generic remains erased.
+						Err(RuntimeExtractionError::IncompleteCanonicalType) => Ok(RuntimeTypeArgument::Erased),
+						Err(error) => Err(error),
+					},
+				)
+				.collect::<Result<Vec<_>, _>>()?;
+			Ok((id, arguments.into()))
+		})
+		.collect::<Result<Vec<_>, RuntimeExtractionError>>()?;
+	let generic_argument_sites = generic_call_arguments
+		.iter()
+		.map(|(id, _)| *id)
+		.collect::<std::collections::HashSet<_>>();
+	let mut generic_call_targets = nodes
+		.iter()
+		.filter_map(|expr| {
+			let id = *local.get(&expr.id)?;
+			if !generic_argument_sites.contains(&id) {
+				return None;
+			}
+			let mut source = *expr;
+			while let ExprKind::Grouped(inner) = &source.kind {
+				source = inner;
+			}
+			let source_id = *local.get(&source.id)?;
+			let target_node = match &source.kind {
+				ExprKind::Call { func, .. } => func.id,
+				_ => source.id,
+			};
+			let direct = checked
+				.annotations
+				.definition_targets()
+				.find_map(|(candidate, target)| (candidate == target_node).then(|| target.clone()))
+				.or_else(|| {
+					let resolution = checked.annotations.resolution_of(source.id)?;
+					match resolution.resolved_target.as_ref()? {
+						crate::annotate::ResolvedMethodTarget::Inherent { member, .. } => Some(member.clone()),
+						crate::annotate::ResolvedMethodTarget::InterfaceImplementation { slot, .. } => {
+							Some(slot.member_id.clone())
+						}
+						crate::annotate::ResolvedMethodTarget::GenericBound { .. } => None,
+					}
+				})
+				.or_else(|| {
+					let (_, dispatch) = dispatches
+						.iter()
+						.find(|(candidate, _)| *candidate == source_id)?;
+					match dispatch {
+						StableDispatch::Direct { member, .. }
+						| StableDispatch::SelectedImplementation { member, .. }
+						| StableDispatch::InterfaceDefault { member, .. }
+						| StableDispatch::GenericBound { member, .. } => Some(member.clone()),
+						StableDispatch::Builtin { .. } | StableDispatch::External { .. } => None,
+					}
+				});
+			direct.map(|target| (id, target))
+		})
+		.collect::<Vec<_>>();
 	types.sort_by_key(|item| item.0);
 	definition_targets.sort_by_key(|item| item.0);
 	dispatches.sort_by_key(|item| item.0);
@@ -1501,6 +1631,8 @@ fn runtime_annotations(
 	iterations.sort_by_key(|item| item.0);
 	anonymous_closures.sort_by_key(|item| item.0);
 	generic_namespaced_calls.sort_unstable();
+	generic_call_arguments.sort_by_key(|item| item.0);
+	generic_call_targets.sort_by_key(|item| item.0);
 	control_targets.sort_unstable();
 	let mut direct_namespace_members = checked
 		.annotations
@@ -1526,9 +1658,40 @@ fn runtime_annotations(
 		iterations: iterations.into(),
 		anonymous_closures: anonymous_closures.into(),
 		generic_namespaced_calls: generic_namespaced_calls.into(),
+		generic_call_arguments: generic_call_arguments.into(),
+		generic_call_targets: generic_call_targets.into(),
 		external_marshals: external_marshals.into(),
 		control_targets: control_targets.into(),
 	})
+}
+
+fn runtime_type_object_supported(ty: &InterfaceType) -> bool {
+	match ty {
+		InterfaceType::Int
+		| InterfaceType::UInt
+		| InterfaceType::Float
+		| InterfaceType::Char
+		| InterfaceType::String
+		| InterfaceType::Boolean
+		| InterfaceType::SelfType
+		| InterfaceType::Generic(_) => true,
+		InterfaceType::List(argument) | InterfaceType::Mutable(argument) => {
+			runtime_type_object_supported(argument)
+		}
+		InterfaceType::Tuple(arguments) => arguments.iter().all(runtime_type_object_supported),
+		InterfaceType::Map(key, value) => {
+			runtime_type_object_supported(key) && runtime_type_object_supported(value)
+		}
+		InterfaceType::Named {
+			positional, named, ..
+		} => {
+			positional.iter().all(runtime_type_object_supported)
+				&& named
+					.iter()
+					.all(|(_, argument)| runtime_type_object_supported(argument))
+		}
+		_ => false,
+	}
 }
 
 fn required_canonical_type(
@@ -1928,7 +2091,26 @@ fn body_parameters(
 				.funcs
 				.get(&crate::DefId(index as u32))
 		})
-		.map_or(0, |signature| signature.generics.len());
+		.map(|signature| signature.generics.len())
+		.or_else(|| {
+			checked
+				.semantic
+				.inherent
+				.iter()
+				.flat_map(|implementation| implementation.methods.values())
+				.find(|method| method.definition.as_ref() == Some(definition))
+				.map(|method| method.generic_count)
+		})
+		.or_else(|| {
+			checked
+				.semantic
+				.interfaces
+				.values()
+				.flat_map(|interface| interface.methods.values())
+				.find(|method| method.definition.as_ref() == Some(definition))
+				.map(|method| method.generics.len())
+		})
+		.unwrap_or(0);
 	let owner = definition_owner(definition);
 	let owner_count = owner
 		.map(|owner| match &owner.key {

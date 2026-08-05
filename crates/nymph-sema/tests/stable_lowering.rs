@@ -445,11 +445,12 @@ fn stable_lowering_reuses_exact_bindings_across_union_alternatives() {
 	assert_eq!(bindings(right), ["y", "x"]);
 	assert!(matches!(
 		&arms[0].body,
-		nymph_hir::hir::HirExpr::Array { items, .. }
+		nymph_hir::hir::HirExpr::WithPrototype { value, .. }
+			if matches!(value.as_ref(), nymph_hir::hir::HirExpr::Array { items, .. }
 			if matches!(items.as_slice(), [
 				nymph_hir::hir::HirExpr::Local(x),
 				nymph_hir::hir::HirExpr::Local(y),
-			] if x == "x" && y == "y")
+			] if x == "x" && y == "y"))
 	));
 }
 
@@ -921,7 +922,7 @@ fn lowers_one_canonical_function_and_value_without_a_module() {
 		.map(|item| lower_runtime_definition(&context, Arc::new(item)).unwrap())
 		.collect::<Vec<_>>();
 	assert!(
-		matches!(lowered[0].fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if function.params == ["x"] && function.body == nymph_hir::hir::HirExpr::Local("x".into()))
+		matches!(lowered[0].fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if function.params == ["x", "$type$0"] && function.body == nymph_hir::hir::HirExpr::Local("x".into()))
 	);
 	assert!(
 		matches!(lowered[1].fragment(), nymph_sema::LoweredHirFragment::TopLevelValue(value) if value.value == nymph_hir::hir::HirExpr::Num(42.0, nymph_hir::hir::NumKind::Int))
@@ -1635,7 +1636,7 @@ fn missing_name_is_a_typed_error() {
 fn lowers_list_and_map_spreads_to_spread_hir() {
 	let list = lower_fixture("func spread(xs: #(int, int)): #(int, int, int) = #(0, ...xs)");
 	assert!(
-		matches!(list.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(f) if matches!(f.body, nymph_hir::hir::HirExpr::ArraySpread { .. }))
+		matches!(list.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(f) if matches!(&f.body, nymph_hir::hir::HirExpr::WithPrototype { value, .. } if matches!(value.as_ref(), nymph_hir::hir::HirExpr::ArraySpread { .. })))
 	);
 }
 
@@ -1815,6 +1816,7 @@ fn generic_bound_unary_dispatch_has_no_concrete_runtime_demand() {
 			interface: "Named".into(),
 			method: "name".into(),
 			receiver: Box::new(nymph_hir::hir::HirExpr::Local("value".into())),
+			hidden_arguments: vec![],
 			cases: vec![],
 		}
 	);
@@ -1822,7 +1824,7 @@ fn generic_bound_unary_dispatch_has_no_concrete_runtime_demand() {
 }
 
 #[test]
-fn namespaced_call_through_generic_parameter_is_a_typed_unsupported_error() {
+fn namespaced_call_through_generic_parameter_uses_hidden_type_object() {
 	let (artifacts, _, context) = materialized_fixture(
 		"interface Default { func default(): self }\nfunc make<T: Default>(): T = T.default()",
 	);
@@ -1833,14 +1835,18 @@ fn namespaced_call_through_generic_parameter_is_a_typed_unsupported_error() {
 
 	let result = lower_runtime_definition(&context, Arc::new(make));
 
-	assert!(
-		matches!(
-			&result,
-			Err(nymph_sema::StableLoweringError::Unsupported { feature, .. })
-				if feature == "namespaced call through a generic type parameter"
-		),
-		"{result:?}"
-	);
+	let lowered = result.expect("generic receiverless call lowers");
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("unexpected fragment: {:?}", lowered.fragment())
+	};
+	assert_eq!(function.params, ["$type$0"]);
+	assert!(matches!(
+		&function.body,
+		nymph_hir::hir::HirExpr::Call { callee, args }
+			if args.is_empty()
+				&& matches!(callee.as_ref(), nymph_hir::hir::HirExpr::Field { recv, name }
+					if name == "default" && matches!(recv.as_ref(), nymph_hir::hir::HirExpr::Local(local) if local == "$type$0"))
+	));
 }
 
 #[test]
@@ -1942,6 +1948,7 @@ fn generic_bound_with_two_primitive_implementations_lowers_to_stable_multi_case_
 			method: "same".into(),
 			receiver: Box::new(nymph_hir::hir::HirExpr::Local("a".into())),
 			argument: Box::new(nymph_hir::hir::HirExpr::Local("b".into())),
+			hidden_arguments: vec![],
 			cases: vec![
 				nymph_hir::hir::HirBoundDispatchCase {
 					receiver_tag: "nymph.int".into(),
@@ -2020,7 +2027,7 @@ fn lowers_struct_and_enum_construction_and_variant_patterns_from_stable_facts() 
 		point.fragment(),
 		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
 			if matches!(&function.body, nymph_hir::hir::HirExpr::Block { stmts, tail: Some(tail) }
-				if stmts.len() == 2 && matches!(tail.as_ref(), nymph_hir::hir::HirExpr::New { class, fields }
+				if stmts.len() == 2 && matches!(tail.as_ref(), nymph_hir::hir::HirExpr::New { class, fields, .. }
 					if class == "Point" && fields.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>() == ["value", "v"]))
 	));
 	let choice = lower_named(source, "choose");
@@ -2056,7 +2063,7 @@ fn lowers_native_index_access_and_assignment_without_protocol_fallback() {
 fn lowers_tuple_spread_without_protocol_demands() {
 	let tuple = lower_fixture("func copy_tuple(xs: #(int, int)): #(int, int, int) = #(0, ...xs)");
 	assert!(
-		matches!(tuple.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if matches!(function.body, nymph_hir::hir::HirExpr::ArraySpread { .. }))
+		matches!(tuple.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if matches!(&function.body, nymph_hir::hir::HirExpr::WithPrototype { value, .. } if matches!(value.as_ref(), nymph_hir::hir::HirExpr::ArraySpread { .. })))
 	);
 	assert_eq!(tuple.demands(), []);
 }
@@ -2151,7 +2158,7 @@ fn lowers_native_map_and_user_iterator_spreads_with_exact_ordered_demands() {
 		"merge",
 	);
 	assert!(
-		matches!(native.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if matches!(&function.body, nymph_hir::hir::HirExpr::MapSpread(items) if matches!(&items[0], nymph_hir::hir::HirMapElem::Spread(nymph_hir::hir::HirExpr::Local(name)) if name == "value")))
+		matches!(native.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if matches!(&function.body, nymph_hir::hir::HirExpr::WithPrototype { value, .. } if matches!(value.as_ref(), nymph_hir::hir::HirExpr::MapSpread(items) if matches!(&items[0], nymph_hir::hir::HirMapElem::Spread(nymph_hir::hir::HirExpr::Local(name)) if name == "value"))))
 	);
 	assert_eq!(native.demands(), []);
 
@@ -2170,9 +2177,9 @@ fn lowers_native_map_and_user_iterator_spreads_with_exact_ordered_demands() {
 			.clone();
 		let lowered = lower_runtime_definition(&context, Arc::new(item)).unwrap();
 		assert!(if map {
-			matches!(lowered.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if matches!(&function.body, nymph_hir::hir::HirExpr::MapSpread(items) if matches!(&items[0], nymph_hir::hir::HirMapElem::Spread(nymph_hir::hir::HirExpr::Block { .. }))))
+			matches!(lowered.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if matches!(&function.body, nymph_hir::hir::HirExpr::WithPrototype { value, .. } if matches!(value.as_ref(), nymph_hir::hir::HirExpr::MapSpread(items) if matches!(&items[0], nymph_hir::hir::HirMapElem::Spread(nymph_hir::hir::HirExpr::Block { .. })))))
 		} else {
-			matches!(lowered.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if matches!(&function.body, nymph_hir::hir::HirExpr::ArraySpread { elems, .. } if matches!(&elems[0], nymph_hir::hir::HirArrayElem::Spread(nymph_hir::hir::HirExpr::Block { .. }))))
+			matches!(lowered.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if matches!(&function.body, nymph_hir::hir::HirExpr::WithPrototype { value, .. } if matches!(value.as_ref(), nymph_hir::hir::HirExpr::ArraySpread { elems, .. } if matches!(&elems[0], nymph_hir::hir::HirArrayElem::Spread(nymph_hir::hir::HirExpr::Block { .. })))))
 		});
 		let _resolved_implementation = if map { &expected[1] } else { &expected[0] };
 		assert_eq!(lowered.demands(), []);
@@ -2342,7 +2349,7 @@ fn range_values_lower_to_their_canonical_structs_with_source_order_fields() {
 		.iter()
 		.map(|stmt| match stmt {
 			nymph_hir::hir::HirStmt::Let {
-				value: nymph_hir::hir::HirExpr::New { class, fields },
+				value: nymph_hir::hir::HirExpr::New { class, fields, .. },
 				..
 			} => (
 				class.as_str(),

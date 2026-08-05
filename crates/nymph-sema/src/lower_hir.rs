@@ -255,6 +255,7 @@ fn lower_hir_impl(
 		module,
 		annotations: &checked.annotations,
 		interner: &checked.interner,
+		definitions: &checked.semantic.definitions,
 		external_value_marshals: &checked.external_value_marshals,
 		struct_names,
 		variant_fields,
@@ -267,6 +268,9 @@ fn lower_hir_impl(
 		pattern_declaration_records: RefCell::new(Vec::new()),
 		pattern_declaration_reuse: RefCell::new(Vec::new()),
 		generics_stack: RefCell::new(Vec::new()),
+		hidden_generic_offsets: RefCell::new(Vec::new()),
+		materialized_interface_types: RefCell::new(Vec::new()),
+		materialized_self_types: RefCell::new(Vec::new()),
 		loop_targets: RefCell::new(Vec::new()),
 		next_loop_target: std::cell::Cell::new(0),
 		block_targets: RefCell::new(Vec::new()),
@@ -291,6 +295,7 @@ struct Lowerer<'a> {
 	module: &'a Module,
 	annotations: &'a Annotations,
 	interner: &'a Interner,
+	definitions: &'a crate::def::DefMap,
 	external_value_marshals: &'a FxHashMap<nymph_ast::Span, nymph_hir::hir::MarshalKind>,
 	struct_names: FxHashSet<EcoString>,
 	/// (Enum name, variant name) → that variant's declared field names, in
@@ -353,7 +358,10 @@ struct Lowerer<'a> {
 	/// generics and panic loudly instead. One entry per func/method body (not
 	/// merged with `scopes`, which is JS-scope/shadowing bookkeeping, not
 	/// type-parameter bookkeeping).
-	generics_stack: RefCell<Vec<FxHashSet<EcoString>>>,
+	generics_stack: RefCell<Vec<Vec<EcoString>>>,
+	hidden_generic_offsets: RefCell<Vec<usize>>,
+	materialized_interface_types: RefCell<Vec<Vec<HirExpr>>>,
+	materialized_self_types: RefCell<Vec<HirExpr>>,
 	loop_targets: RefCell<Vec<(NodeId, nymph_hir::hir::LoopTarget)>>,
 	next_loop_target: std::cell::Cell<nymph_hir::hir::LoopTarget>,
 	block_targets: RefCell<Vec<(NodeId, nymph_hir::hir::BlockTarget)>>,
@@ -632,6 +640,7 @@ impl<'a> Lowerer<'a> {
 		&self,
 		owner_generics: &[Spanned<GenericParam>],
 		generics: &[Spanned<GenericParam>],
+		include_owner_hidden: bool,
 	) {
 		let names = owner_generics
 			.iter()
@@ -639,11 +648,20 @@ impl<'a> Lowerer<'a> {
 			.map(|g| g.0.name.0.clone())
 			.collect();
 		self.generics_stack.borrow_mut().push(names);
+		self
+			.hidden_generic_offsets
+			.borrow_mut()
+			.push(if include_owner_hidden {
+				0
+			} else {
+				owner_generics.len()
+			});
 	}
 
 	/// Pop the innermost generics frame.
 	fn pop_generics(&self) {
 		self.generics_stack.borrow_mut().pop();
+		self.hidden_generic_offsets.borrow_mut().pop();
 	}
 
 	/// Is `name` one of the CURRENT (innermost) func/method's own generic
@@ -830,6 +848,7 @@ impl<'a> Lowerer<'a> {
 			method: res.method.clone(),
 			receiver: Box::new(self.lower_expr(receiver)),
 			argument: Box::new(self.lower_expr(argument)),
+			hidden_arguments: vec![],
 			cases,
 		})
 	}
@@ -1581,7 +1600,7 @@ impl<'a> Lowerer<'a> {
 	/// top-level function instead of a class method.
 	fn lower_runtime_func(&self, pending: &RuntimeFuncDemand<'a>) -> HirFunc {
 		self.push_scope();
-		self.push_generics(pending.owner_generics, &pending.meta.generics);
+		self.push_generics(pending.owner_generics, &pending.meta.generics, false);
 		let self_param = self.declare(&EcoString::from("$self"));
 		let mut params = vec![self_param.clone()];
 		params.extend(
@@ -2202,7 +2221,15 @@ impl<'a> Lowerer<'a> {
 				other => panic!("slice-4b lowering does not yet handle impl member {other:?}"),
 			}
 		}
-		self.push_unoverridden_defaults(&for_interface.0, &overridden, interfaces_by_name, entry);
+		self.push_unoverridden_defaults(
+			&for_interface.0,
+			&for_interface.1,
+			&name.0,
+			generics,
+			&overridden,
+			interfaces_by_name,
+			entry,
+		);
 	}
 
 	/// Append `iface_name`'s default-bodied methods that aren't in `overridden` to
@@ -2216,6 +2243,9 @@ impl<'a> Lowerer<'a> {
 	fn push_unoverridden_defaults(
 		&self,
 		iface_name: &Ident,
+		iface_arguments: &[Spanned<GenericArg>],
+		owner_name: &EcoString,
+		owner_generics: &[Spanned<GenericParam>],
 		overridden: &FxHashSet<EcoString>,
 		interfaces_by_name: &InterfaceTable,
 		out: &mut Vec<HirMethod>,
@@ -2231,6 +2261,13 @@ impl<'a> Lowerer<'a> {
 				iface_name.0
 			);
 		};
+		let interface_types: Vec<HirExpr> = iface_arguments
+			.iter()
+			.map(|argument| {
+				self.surface_runtime_type_object(&argument.0.value.0, owner_name, owner_generics)
+			})
+			.collect();
+		let self_type = self.materialized_self_type(owner_name, owner_generics);
 		for m in *members {
 			let InterfaceMember::Element(element) = &m.0 else {
 				continue;
@@ -2261,7 +2298,17 @@ impl<'a> Lowerer<'a> {
 			self
 				.lowering_onto_runtime_owner
 				.set(self.lowering_onto_runtime_owner.get() + 1);
+			self
+				.materialized_interface_types
+				.borrow_mut()
+				.push(interface_types.clone());
+			self
+				.materialized_self_types
+				.borrow_mut()
+				.push(self_type.clone());
 			out.push(self.lower_method(iface_generics, meta, body));
+			self.materialized_self_types.borrow_mut().pop();
+			self.materialized_interface_types.borrow_mut().pop();
 			self
 				.lowering_onto_runtime_owner
 				.set(self.lowering_onto_runtime_owner.get() - 1);
@@ -3062,7 +3109,15 @@ impl<'a> Lowerer<'a> {
 					other => panic!("slice-4b lowering does not yet handle impl member {other:?}"),
 				}
 			}
-			self.push_unoverridden_defaults(&interface.0, &overridden, interfaces_by_name, &mut methods);
+			self.push_unoverridden_defaults(
+				&interface.0,
+				&interface.1,
+				type_name,
+				owner_generics,
+				&overridden,
+				interfaces_by_name,
+				&mut methods,
+			);
 		}
 		// V4: two interfaces (or an override and a same-named default)
 		// lowering the same method name on one type is a real ambiguity
@@ -3120,11 +3175,12 @@ impl<'a> Lowerer<'a> {
 		// seed it with the params, then lower the body into that same scope rather
 		// than letting it push its own (Slice 4E, Y2).
 		self.push_scope();
-		self.push_generics(&[], &meta.generics);
+		self.push_generics(&[], &meta.generics, true);
 		let params = meta
 			.params
 			.iter()
 			.map(|p| self.declare(&param_name(&p.0.name)))
+			.chain((0..meta.generics.len()).map(|index| EcoString::from(format!("$type${index}"))))
 			.collect();
 		let body = self.lower_func_body(body);
 		self.pop_generics();
@@ -3161,11 +3217,20 @@ impl<'a> Lowerer<'a> {
 		body: &Expr,
 	) -> HirMethod {
 		self.push_scope();
-		self.push_generics(owner_generics, &meta.generics);
+		let include_owner_hidden = meta.kind == nymph_ast::decl::FuncKind::Namespace;
+		self.push_generics(owner_generics, &meta.generics, include_owner_hidden);
 		let params = meta
 			.params
 			.iter()
 			.map(|p| self.declare(&param_name(&p.0.name)))
+			.chain(
+				(0..if include_owner_hidden {
+					owner_generics.len() + meta.generics.len()
+				} else {
+					meta.generics.len()
+				})
+					.map(|index| EcoString::from(format!("$type${index}"))),
+			)
 			.collect();
 		let body = self.lower_func_body(body);
 		self.pop_generics();
@@ -3375,12 +3440,13 @@ impl<'a> Lowerer<'a> {
 				Some(res) => HirExpr::VariantRef {
 					enum_name: res.enum_name.clone(),
 					variant: res.variant.clone(),
+					prototype: self.construction_prototype(expr.id),
 				},
 				// A plain local reference resolves through the JS-scope stack (Slice
 				// 4E, Y2) — itself unless it's currently shadowed by a same-scope
 				// rename; falls through to the bare name for anything never pushed
 				// onto the stack (module-level funcs/classes/enums/top-level lets).
-				None => HirExpr::Local(self.resolve(&name.0)),
+				None => self.generic_callable_adapter(expr.id, HirExpr::Local(self.resolve(&name.0))),
 			},
 			// While lowering a lowered prelude body as a top-level mangled
 			// function (stdlib body lowering slice, gap b), `this`
@@ -3390,7 +3456,9 @@ impl<'a> Lowerer<'a> {
 				Some(name) => HirExpr::Local(name.clone()),
 				None => HirExpr::This,
 			},
-			ExprKind::Grouped(inner) => self.lower_expr(inner),
+			ExprKind::Grouped(inner) => {
+				self.append_hidden_call_arguments(expr.id, self.lower_expr(inner))
+			}
 			ExprKind::Call { func, args, .. } => {
 				if let ExprKind::MemberAccess { parent, .. } = &func.kind
 					&& let ExprKind::Identifier(name) = &parent.kind
@@ -3424,6 +3492,7 @@ impl<'a> Lowerer<'a> {
 					HirExpr::New {
 						class: name.0.clone(),
 						fields,
+						prototype: self.construction_prototype(expr.id),
 					}
 				}
 				// A namespaced/static call (`Type.func(..)`) through a generic type
@@ -3439,10 +3508,48 @@ impl<'a> Lowerer<'a> {
 					&& let ExprKind::Identifier(name) = &parent.kind
 					&& self.is_current_generic(&name.0)
 				{
-					panic!(
-						"slice-4j lowering does not yet support a namespaced call through a generic type parameter (`{}.{}(..)`) — `{}` has no JS binding",
-						name.0, member.0, name.0
-					)
+					let parameter = self
+						.annotations
+						.generic_namespaced_call(expr.id)
+						.expect("generic namespaced call has checker metadata")
+						.parameter;
+					let offset = self
+						.hidden_generic_offsets
+						.borrow()
+						.last()
+						.copied()
+						.expect("generic hidden ABI is active");
+					let receiver = if parameter.0 as usize >= offset {
+						HirExpr::Local(EcoString::from(format!(
+							"$type${}",
+							parameter.0 as usize - offset
+						)))
+					} else {
+						HirExpr::RuntimeTypeProjection {
+							receiver: Box::new(HirExpr::This),
+							path: vec![parameter.0 as usize],
+						}
+					};
+					HirExpr::Call {
+						callee: Box::new(HirExpr::Field {
+							recv: Box::new(receiver),
+							name: member.0.clone(),
+						}),
+						args: {
+							let mut lowered = args
+								.iter()
+								.map(|arg| self.lower_expr(&arg.0.value))
+								.collect::<Vec<_>>();
+							if let Some(hidden) = self
+								.annotations
+								.generic_call_arguments()
+								.find_map(|(id, arguments)| (id == expr.id).then_some(arguments))
+							{
+								lowered.extend(hidden.iter().map(|type_| self.runtime_type_object(*type_)));
+							}
+							lowered
+						},
+					}
 				}
 				// A plain method call (`receiver.method(args…)`) the checker resolved
 				// through the interface solver (Finding 2, stdlib linkage groundwork):
@@ -3494,14 +3601,15 @@ impl<'a> Lowerer<'a> {
 					&& self.receiver_is_still_generic(parent)
 					&& let [argument] = args.as_slice()
 				{
-					self
+					let dispatch = self
 						.lower_bound_dispatch(res, parent, &argument.0.value)
 						.unwrap_or_else(|| {
 							panic!(
 								"cannot lower generic-bound dispatch for method `{}`",
 								res.method,
 							)
-						})
+						});
+					self.append_hidden_call_arguments(expr.id, dispatch)
 				} else if let ExprKind::MemberAccess { parent, .. } = &func.kind
 					&& let Some(res) = self.annotations.resolution_of(expr.id)
 					&& res.dispatch == DispatchKind::UserImplDefaultMethod
@@ -3544,15 +3652,21 @@ impl<'a> Lowerer<'a> {
 						Some(RuntimeDispatch::TopLevel(mangled)) => {
 							let mut call_args = vec![self.lower_expr(parent)];
 							call_args.extend(args.iter().map(|a| self.lower_expr(&a.0.value)));
-							HirExpr::Call {
-								callee: Box::new(HirExpr::Local(mangled)),
-								args: call_args,
-							}
+							self.append_hidden_call_arguments(
+								expr.id,
+								HirExpr::Call {
+									callee: Box::new(HirExpr::Local(mangled)),
+									args: call_args,
+								},
+							)
 						}
-						Some(RuntimeDispatch::OntoClass { .. }) => HirExpr::Call {
-							callee: Box::new(self.lower_expr(func)),
-							args: args.iter().map(|a| self.lower_expr(&a.0.value)).collect(),
-						},
+						Some(RuntimeDispatch::OntoClass { .. }) => self.append_hidden_call_arguments(
+							expr.id,
+							HirExpr::Call {
+								callee: Box::new(self.lower_expr(func)),
+								args: args.iter().map(|a| self.lower_expr(&a.0.value)).collect(),
+							},
+						),
 						// Gap 3 (L0/L1): a call resolved through a LINKED external
 						// lowers to `HirExpr::ExternCall` instead of panicking —
 						// `$_this`-first, exactly the shape `RuntimeDispatch::
@@ -3604,9 +3718,20 @@ impl<'a> Lowerer<'a> {
 						),
 					}
 				} else {
+					let mut lowered_args = args
+						.iter()
+						.map(|argument| self.lower_expr(&argument.0.value))
+						.collect::<Vec<_>>();
+					if let Some(hidden) = self
+						.annotations
+						.generic_call_arguments()
+						.find_map(|(id, arguments)| (id == expr.id).then_some(arguments))
+					{
+						lowered_args.extend(hidden.iter().map(|type_| self.runtime_type_object(*type_)));
+					}
 					HirExpr::Call {
 						callee: Box::new(self.lower_expr(func)),
-						args: args.iter().map(|a| self.lower_expr(&a.0.value)).collect(),
+						args: lowered_args,
 					}
 				}
 			}
@@ -3616,6 +3741,7 @@ impl<'a> Lowerer<'a> {
 					Some(res) => HirExpr::VariantRef {
 						enum_name: res.enum_name.clone(),
 						variant: res.variant.clone(),
+						prototype: self.construction_prototype(expr.id),
 					},
 					None => HirExpr::Field {
 						recv: Box::new(self.lower_expr(parent)),
@@ -3623,9 +3749,9 @@ impl<'a> Lowerer<'a> {
 					},
 				}
 			}
-			ExprKind::Tuple(items) => self.lower_tuple(items),
-			ExprKind::List(items) => self.lower_list(items),
-			ExprKind::Map(entries) => self.lower_map(entries),
+			ExprKind::Tuple(items) => self.with_construction_prototype(expr.id, self.lower_tuple(items)),
+			ExprKind::List(items) => self.with_construction_prototype(expr.id, self.lower_list(items)),
+			ExprKind::Map(entries) => self.with_construction_prototype(expr.id, self.lower_map(entries)),
 			ExprKind::IndexAccess { parent, index, .. } => {
 				self.lower_index_access(expr.id, parent, index)
 			}
@@ -3956,6 +4082,7 @@ impl<'a> Lowerer<'a> {
 				HirExpr::New {
 					class: class.into(),
 					fields,
+					prototype: self.construction_prototype(expr.id),
 				}
 			}
 			// A closure expression (Slice 4L, JJ1). `generics` is always empty (both
@@ -3974,6 +4101,259 @@ impl<'a> Lowerer<'a> {
 				HirExpr::Local(self.resolve(&anon_param_name(idx.unwrap_or(0))))
 			}
 			other => panic!("slice-2a lowering does not yet handle {other:?}"),
+		}
+	}
+
+	fn runtime_type_object(&self, type_: Ty) -> HirExpr {
+		let (binding, box_runtime, is_enum, argument_types): (EcoString, bool, bool, Vec<Ty>) =
+			match self.interner.kind(type_) {
+				TyKind::Int => ("NInt".into(), true, false, vec![]),
+				TyKind::UInt => ("NUint".into(), true, false, vec![]),
+				TyKind::Float => ("NFloat".into(), true, false, vec![]),
+				TyKind::Char => ("NChar".into(), true, false, vec![]),
+				TyKind::String => ("NString".into(), true, false, vec![]),
+				TyKind::Boolean => ("NBool".into(), true, false, vec![]),
+				TyKind::List(argument) => ("NList".into(), true, false, vec![*argument]),
+				TyKind::Tuple(arguments) => ("NTuple".into(), true, false, arguments.clone()),
+				TyKind::Map(key, value) => ("NMap".into(), true, false, vec![*key, *value]),
+				TyKind::Mut(inner) => return self.runtime_type_object(*inner),
+				TyKind::Param(parameter) => {
+					if let Some(types) = self.materialized_interface_types.borrow().last()
+						&& let Some(type_) = types.get(parameter.0 as usize)
+					{
+						return type_.clone();
+					}
+					if self.materialized_interface_types.borrow().last().is_some()
+						&& parameter.0 as usize >= self.generics_stack.borrow().last().map_or(0, Vec::len)
+					{
+						return self
+							.materialized_self_types
+							.borrow()
+							.last()
+							.cloned()
+							.unwrap_or(HirExpr::Undefined);
+					}
+					let offset = self
+						.hidden_generic_offsets
+						.borrow()
+						.last()
+						.copied()
+						.unwrap_or(0);
+					return if parameter.0 as usize >= offset {
+						HirExpr::Local(EcoString::from(format!(
+							"$type${}",
+							parameter.0 as usize - offset
+						)))
+					} else {
+						HirExpr::RuntimeTypeProjection {
+							receiver: Box::new(HirExpr::This),
+							path: vec![parameter.0 as usize],
+						}
+					};
+				}
+				TyKind::SelfTy => {
+					return self
+						.materialized_self_types
+						.borrow()
+						.last()
+						.cloned()
+						.unwrap_or(HirExpr::RuntimeTypeProjection {
+							receiver: Box::new(HirExpr::This),
+							path: vec![],
+						});
+				}
+				TyKind::Adt(definition, arguments) => {
+					let data = self.definitions.data(*definition);
+					let arguments = arguments
+						.positional
+						.iter()
+						.chain(arguments.named.iter().map(|(_, type_)| type_))
+						.copied()
+						.collect();
+					(
+						data.name.clone(),
+						false,
+						data.kind == crate::def::DefKind::Enum,
+						arguments,
+					)
+				}
+				_ => return HirExpr::Undefined,
+			};
+		HirExpr::RuntimeTypeObject {
+			binding,
+			box_runtime,
+			is_enum,
+			arguments: argument_types
+				.into_iter()
+				.map(|argument| self.runtime_type_object(argument))
+				.collect(),
+		}
+	}
+
+	fn materialized_self_type(
+		&self,
+		owner_name: &EcoString,
+		owner_generics: &[Spanned<GenericParam>],
+	) -> HirExpr {
+		HirExpr::RuntimeTypeObject {
+			binding: owner_name.clone(),
+			box_runtime: false,
+			is_enum: false,
+			arguments: owner_generics
+				.iter()
+				.enumerate()
+				.map(|(index, _)| HirExpr::RuntimeTypeProjection {
+					receiver: Box::new(HirExpr::This),
+					path: vec![index],
+				})
+				.collect(),
+		}
+	}
+
+	fn surface_runtime_type_object(
+		&self,
+		type_: &nymph_ast::ty::Type,
+		owner_name: &EcoString,
+		owner_generics: &[Spanned<GenericParam>],
+	) -> HirExpr {
+		use nymph_ast::ty::Type;
+		let nominal = |binding: &str, box_runtime, arguments| HirExpr::RuntimeTypeObject {
+			binding: binding.into(),
+			box_runtime,
+			is_enum: false,
+			arguments,
+		};
+		match type_ {
+			Type::Int => nominal("NInt", true, vec![]),
+			Type::UInt => nominal("NUint", true, vec![]),
+			Type::Float => nominal("NFloat", true, vec![]),
+			Type::Char => nominal("NChar", true, vec![]),
+			Type::String => nominal("NString", true, vec![]),
+			Type::Boolean => nominal("NBool", true, vec![]),
+			Type::SelfType => self.materialized_self_type(owner_name, owner_generics),
+			Type::List(argument) => nominal(
+				"NList",
+				true,
+				vec![self.surface_runtime_type_object(&argument.0, owner_name, owner_generics)],
+			),
+			Type::Tuple(arguments) => nominal(
+				"NTuple",
+				true,
+				arguments
+					.iter()
+					.map(|argument| self.surface_runtime_type_object(&argument.0, owner_name, owner_generics))
+					.collect(),
+			),
+			Type::Map(key, value) => nominal(
+				"NMap",
+				true,
+				vec![
+					self.surface_runtime_type_object(&key.0, owner_name, owner_generics),
+					self.surface_runtime_type_object(&value.0, owner_name, owner_generics),
+				],
+			),
+			Type::Grouped(inner) | Type::Mut(inner) => {
+				self.surface_runtime_type_object(&inner.0, owner_name, owner_generics)
+			}
+			Type::Reference { name, generics } => {
+				if let Some(index) = owner_generics
+					.iter()
+					.position(|parameter| parameter.0.name.0 == name.0)
+				{
+					HirExpr::RuntimeTypeProjection {
+						receiver: Box::new(HirExpr::This),
+						path: vec![index],
+					}
+				} else {
+					nominal(
+						&name.0,
+						false,
+						generics
+							.iter()
+							.map(|argument| {
+								self.surface_runtime_type_object(&argument.0.value.0, owner_name, owner_generics)
+							})
+							.collect(),
+					)
+				}
+			}
+			_ => HirExpr::Undefined,
+		}
+	}
+
+	fn construction_prototype(&self, id: NodeId) -> Option<Box<HirExpr>> {
+		let type_ = self.annotations.get(id)?.ty;
+		(matches!(
+			self.interner.kind(type_),
+			TyKind::Adt(_, arguments)
+				if !arguments.positional.is_empty() || !arguments.named.is_empty()
+		) || matches!(
+			self.interner.kind(type_),
+			TyKind::List(_) | TyKind::Tuple(_) | TyKind::Map(_, _)
+		))
+		.then(|| Box::new(self.runtime_type_object(type_)))
+	}
+
+	fn with_construction_prototype(&self, id: NodeId, value: HirExpr) -> HirExpr {
+		match self.construction_prototype(id) {
+			Some(prototype) => HirExpr::WithPrototype {
+				value: Box::new(value),
+				prototype,
+			},
+			None => value,
+		}
+	}
+
+	fn append_hidden_call_arguments(&self, id: NodeId, mut call: HirExpr) -> HirExpr {
+		if let Some(hidden) = self
+			.annotations
+			.generic_call_arguments()
+			.find_map(|(call_id, arguments)| (call_id == id).then_some(arguments))
+		{
+			let arguments = match &mut call {
+				HirExpr::Call { args, .. } => args,
+				HirExpr::BoundDispatch {
+					hidden_arguments, ..
+				}
+				| HirExpr::UnaryBoundDispatch {
+					hidden_arguments, ..
+				} => hidden_arguments,
+				_ => return call,
+			};
+			arguments.extend(hidden.iter().map(|type_| self.runtime_type_object(*type_)));
+		}
+		call
+	}
+
+	fn generic_callable_adapter(&self, id: NodeId, callee: HirExpr) -> HirExpr {
+		let Some(hidden) = self
+			.annotations
+			.generic_call_arguments()
+			.find_map(|(call_id, arguments)| (call_id == id).then_some(arguments))
+		else {
+			return callee;
+		};
+		let Some(info) = self.annotations.get(id) else {
+			return callee;
+		};
+		let TyKind::Fn { params, .. } = self.interner.kind(info.ty) else {
+			return callee;
+		};
+		let params = (0..params.len())
+			.map(|index| EcoString::from(format!("$arg${index}")))
+			.collect::<Vec<_>>();
+		let args = params
+			.iter()
+			.cloned()
+			.map(HirExpr::Local)
+			.chain(hidden.iter().map(|type_| self.runtime_type_object(*type_)))
+			.collect();
+		HirExpr::Closure {
+			params,
+			body: Box::new(HirExpr::Call {
+				callee: Box::new(callee),
+				args,
+			}),
 		}
 	}
 
@@ -4170,6 +4550,7 @@ impl<'a> Lowerer<'a> {
 				("end".into(), self.lower_expr(max)),
 				("inclusive".into(), HirExpr::Bool(inclusive)),
 			],
+			prototype: None,
 		};
 		let it_value = Self::direct_it_value_for(IterMode::ViaIter, source);
 		self.push_scope();
@@ -4655,18 +5036,26 @@ impl<'a> Lowerer<'a> {
 				self.push_scope();
 				let lhs_name = self.declare(&EcoString::from("$pipe"));
 				let lhs = self.lower_expr(lhs);
-				let rhs = self.lower_expr(rhs);
+				let lowered_rhs = self.lower_expr(rhs);
 				self.pop_scope();
+				let mut call = HirExpr::Call {
+					callee: Box::new(lowered_rhs),
+					args: vec![HirExpr::Local(lhs_name.clone())],
+				};
+				let mut metadata_source = rhs;
+				while let ExprKind::Grouped(inner) = &metadata_source.kind {
+					metadata_source = inner;
+				}
+				if !matches!(metadata_source.kind, ExprKind::Call { .. }) {
+					call = self.append_hidden_call_arguments(rhs.id, call);
+				}
 				return HirExpr::Block {
 					stmts: vec![HirStmt::Let {
 						name: lhs_name.clone(),
 						mutable: false,
 						value: lhs,
 					}],
-					tail: Some(Box::new(HirExpr::Call {
-						callee: Box::new(rhs),
-						args: vec![HirExpr::Local(lhs_name)],
-					})),
+					tail: Some(Box::new(call)),
 				};
 			}
 			// DD2: `a in c` / `a !in c` ≡ `c.contains(a)` / `c.not_contains(a)` — the
@@ -5429,6 +5818,7 @@ impl<'a> Lowerer<'a> {
 			enum_name: res.enum_name.clone(),
 			variant: res.variant.clone(),
 			fields,
+			prototype: self.construction_prototype(id),
 		})
 	}
 
@@ -5626,8 +6016,26 @@ fn collect_locals(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 		| HirExpr::Bool(_)
 		| HirExpr::Char(_)
 		| HirExpr::ExternValue { .. }
+		| HirExpr::Undefined
 		| HirExpr::This
 		| HirExpr::VariantRef { .. } => {}
+		HirExpr::RuntimeTypeObject {
+			binding, arguments, ..
+		} => {
+			out.insert(binding.clone());
+			for argument in arguments {
+				collect_locals(argument, out);
+			}
+		}
+		HirExpr::RuntimeTypeProjection { receiver, .. } => collect_locals(receiver, out),
+		HirExpr::WithPrototype { value, prototype } => {
+			collect_locals(value, out);
+			collect_locals(prototype, out);
+		}
+		HirExpr::RuntimeTypeAttachment { object, method } => {
+			collect_locals(object, out);
+			collect_locals(&method.body, out);
+		}
 		HirExpr::InterpolatedString(segments) => {
 			for segment in segments {
 				collect_locals(segment, out);
@@ -5647,12 +6055,27 @@ fn collect_locals(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 			}
 		}
 		HirExpr::BoundDispatch {
-			receiver, argument, ..
+			receiver,
+			argument,
+			hidden_arguments,
+			..
 		} => {
 			collect_locals(receiver, out);
 			collect_locals(argument, out);
+			for argument in hidden_arguments {
+				collect_locals(argument, out);
+			}
 		}
-		HirExpr::UnaryBoundDispatch { receiver, .. } => collect_locals(receiver, out),
+		HirExpr::UnaryBoundDispatch {
+			receiver,
+			hidden_arguments,
+			..
+		} => {
+			collect_locals(receiver, out);
+			for argument in hidden_arguments {
+				collect_locals(argument, out);
+			}
+		}
 		HirExpr::Array { items, .. } => {
 			for item in items {
 				collect_locals(item, out);
@@ -5795,7 +6218,22 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 		| HirExpr::Char(_)
 		| HirExpr::ExternValue { .. }
 		| HirExpr::Local(_)
+		| HirExpr::Undefined
 		| HirExpr::This => {}
+		HirExpr::RuntimeTypeObject { arguments, .. } => {
+			for argument in arguments {
+				collect_variant_ref_enums(argument, out);
+			}
+		}
+		HirExpr::RuntimeTypeProjection { receiver, .. } => collect_variant_ref_enums(receiver, out),
+		HirExpr::WithPrototype { value, prototype } => {
+			collect_variant_ref_enums(value, out);
+			collect_variant_ref_enums(prototype, out);
+		}
+		HirExpr::RuntimeTypeAttachment { object, method } => {
+			collect_variant_ref_enums(object, out);
+			collect_variant_ref_enums(&method.body, out);
+		}
 		HirExpr::InterpolatedString(segments) => {
 			for segment in segments {
 				collect_variant_ref_enums(segment, out);
@@ -5815,13 +6253,26 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 			}
 		}
 		HirExpr::BoundDispatch {
-			receiver, argument, ..
+			receiver,
+			argument,
+			hidden_arguments,
+			..
 		} => {
 			collect_variant_ref_enums(receiver, out);
 			collect_variant_ref_enums(argument, out);
+			for argument in hidden_arguments {
+				collect_variant_ref_enums(argument, out);
+			}
 		}
-		HirExpr::UnaryBoundDispatch { receiver, .. } => {
+		HirExpr::UnaryBoundDispatch {
+			receiver,
+			hidden_arguments,
+			..
+		} => {
 			collect_variant_ref_enums(receiver, out);
+			for argument in hidden_arguments {
+				collect_variant_ref_enums(argument, out);
+			}
 		}
 		HirExpr::Array { items, .. } => {
 			for item in items {
@@ -5860,7 +6311,11 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 			collect_variant_ref_enums(recv, out);
 			collect_variant_ref_enums(key, out);
 		}
-		HirExpr::New { class, fields } => {
+		HirExpr::New {
+			class,
+			fields,
+			prototype,
+		} => {
 			// The constructed struct's own name is a type reference that may need
 			// prelude lowering (an ambient iterator adapter like `MapAdapter`,
 			// emitted nowhere until demanded) — surfaced here alongside enum names;
@@ -5869,6 +6324,9 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 			out.insert(class.clone());
 			for (_, v) in fields {
 				collect_variant_ref_enums(v, out);
+			}
+			if let Some(prototype) = prototype {
+				collect_variant_ref_enums(prototype, out);
 			}
 		}
 		// A prelude enum referenced ONLY through construction (`Some(value = 1)`,

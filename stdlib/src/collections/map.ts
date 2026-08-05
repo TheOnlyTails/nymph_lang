@@ -1,4 +1,13 @@
-import { NBool, NList, NMap, NString, NTuple, NUint } from "std/box";
+import {
+	NBool,
+	NList,
+	NMap,
+	NString,
+	NTuple,
+	NUint,
+	nymphType,
+	nymphTypeProjection,
+} from "std/box";
 import { Option } from "std/option";
 
 export const size = <K, V>($_this: NMap<K, V>) => new NUint($_this.size);
@@ -25,11 +34,31 @@ export const get_or_insert = <K, V>($_this: NMap<K, V>, key: K, defaultValue: V)
 	return $_this.get(key)!;
 };
 export const contains_key = <K, V>($_this: NMap<K, V>, key: K) => new NBool($_this.has(key));
-export const keys = <K, V>($_this: NMap<K, V>) => new NList([...$_this.keys()]);
-export const values = <K, V>($_this: NMap<K, V>) => new NList([...$_this.values()]);
-export const entries = <K, V>($_this: NMap<K, V>) =>
-	new NList([...$_this.entries()].map((entry) => new NTuple(entry)));
+export const keys = <K, V>($_this: NMap<K, V>) =>
+	Object.setPrototypeOf(
+		new NList([...$_this.keys()]),
+		nymphType(NList.prototype, [nymphTypeProjection($_this, [0])]),
+	);
+export const values = <K, V>($_this: NMap<K, V>) =>
+	Object.setPrototypeOf(
+		new NList([...$_this.values()]),
+		nymphType(NList.prototype, [nymphTypeProjection($_this, [1])]),
+	);
+export const entries = <K, V>($_this: NMap<K, V>) => {
+	const key = nymphTypeProjection($_this, [0]);
+	const value = nymphTypeProjection($_this, [1]);
+	const tuple = nymphType(NTuple.prototype, [key, value]);
+	return Object.setPrototypeOf(
+		new NList(
+			[...$_this.entries()].map((entry) => Object.setPrototypeOf(new NTuple(entry), tuple)),
+		),
+		nymphType(NList.prototype, [tuple]),
+	);
+};
 export const merge = <K, V>($_this: NMap<K, V>, other: NMap<K, V>) =>
-	new NMap([...$_this.entries(), ...other.entries()]);
+	Object.setPrototypeOf(
+		new NMap([...$_this.entries(), ...other.entries()]),
+		Object.getPrototypeOf($_this),
+	);
 export const to_string = ($_this: NMap<unknown, unknown>) =>
 	new NString(`#{${[...$_this.entries()].map(([key, value]) => `${key}: ${value}`).join(", ")}}`);

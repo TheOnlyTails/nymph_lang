@@ -23,6 +23,41 @@ fn lower(src: &str) -> HirModule {
 	nymph_sema::lower_hir(&parsed.tree, &checked)
 }
 
+fn value_with_runtime_prototype<'a>(
+	expr: &'a HirExpr,
+	binding: &str,
+	arguments: &[&str],
+) -> &'a HirExpr {
+	let HirExpr::WithPrototype { value, prototype } = expr else {
+		panic!("expected WithPrototype, got {expr:?}");
+	};
+	let HirExpr::RuntimeTypeObject {
+		binding: actual_binding,
+		box_runtime,
+		is_enum,
+		arguments: actual_arguments,
+	} = prototype.as_ref()
+	else {
+		panic!("expected canonical runtime type object, got {prototype:?}");
+	};
+	assert_eq!(actual_binding, binding);
+	assert!(*box_runtime);
+	assert!(!is_enum);
+	assert_eq!(actual_arguments.len(), arguments.len());
+	for (actual, expected_binding) in actual_arguments.iter().zip(arguments) {
+		assert!(matches!(
+			actual,
+			HirExpr::RuntimeTypeObject {
+				binding,
+				box_runtime: true,
+				is_enum: false,
+				arguments,
+			} if binding == expected_binding && arguments.is_empty()
+		));
+	}
+	value
+}
+
 #[test]
 fn compatibility_lowering_preserves_loop_control_targets_and_option_results() {
 	let hir = lower(
@@ -343,8 +378,8 @@ fn lowers_a_call_and_int_literal() {
 fn lowers_collections_and_index() {
 	let hir = lower("func f(): #[int] = #[1, 2, 3]");
 	assert_eq!(
-		hir.funcs[0].body,
-		HirExpr::Array {
+		value_with_runtime_prototype(&hir.funcs[0].body, "NList", &["NInt"]),
+		&HirExpr::Array {
 			kind: HirArrayKind::List,
 			items: vec![
 				HirExpr::Num(1.0, NumKind::Int),
@@ -474,7 +509,7 @@ fn lowers_struct_decl_and_construction() {
 		.iter()
 		.find(|f| f.name == "origin")
 		.expect("origin");
-	let HirExpr::New { class, fields } = &f.body else {
+	let HirExpr::New { class, fields, .. } = &f.body else {
 		panic!("expected New, got {:?}", f.body);
 	};
 	assert_eq!(class, "Point");
@@ -2185,7 +2220,7 @@ fn assert_range_protocol(stmts: &[HirStmt], inclusive: bool) {
 		panic!("expected `.iter` field call, got {callee:?}");
 	};
 	assert_eq!(name, "iter");
-	let HirExpr::New { class, fields } = recv.as_ref() else {
+	let HirExpr::New { class, fields, .. } = recv.as_ref() else {
 		panic!("expected NymphRange construction, got {recv:?}");
 	};
 	assert_eq!(class, "NymphRange");
@@ -2633,24 +2668,103 @@ fn lowers_impl_mut_methods_as_ordinary_instance_methods() {
 }
 
 #[test]
-#[should_panic(
-	expected = "does not yet support a namespaced call through a generic type parameter"
-)]
-fn namespaced_call_through_a_generic_parameter_panics_in_lowering() {
-	// Pre-existing silent-wrong-JS hole (Slice 4J, Task 1 Finding 3): `T` is a
-	// type parameter, not a struct/enum — it has no JS binding at all, so
-	// `T.default()` cannot lower to anything but a loud panic.
-	lower(
+fn namespaced_call_through_a_generic_parameter_lowers_hidden_type_object() {
+	let hir = lower(
 		"interface Default { func default(): self }
 		 func make<T: Default>(): T = T.default()",
 	);
+	let make = hir
+		.funcs
+		.iter()
+		.find(|function| function.name == "make")
+		.unwrap();
+	assert_eq!(make.params, ["$type$0"]);
+	assert!(matches!(
+		&make.body,
+		HirExpr::Call { callee, args }
+			if args.is_empty()
+				&& matches!(callee.as_ref(), HirExpr::Field { recv, name }
+					if name == "default" && matches!(recv.as_ref(), HirExpr::Local(local) if local == "$type$0"))
+	));
 }
 
 #[test]
-#[should_panic(
-	expected = "does not yet support a namespaced call through a generic type parameter"
-)]
-fn namespaced_call_through_a_struct_owned_generic_panics_in_lowering() {
+fn compatibility_receiverless_lowering_uses_the_checker_selected_shadowed_parameter() {
+	let hir = lower(
+		"interface Default { func default(): self }
+		 struct Box<T: Default> {
+		   namespace func make<T: Default>(): T = T.default()
+		 }",
+	);
+	let make = hir.classes[0]
+		.statics
+		.iter()
+		.find(|method| method.name == "make")
+		.unwrap();
+	assert_eq!(make.params, ["$type$0", "$type$1"]);
+	assert!(matches!(
+		&make.body,
+		HirExpr::Call { callee, args }
+			if args.is_empty()
+				&& matches!(callee.as_ref(), HirExpr::Field { recv, name }
+					if name == "default" && matches!(recv.as_ref(), HirExpr::Local(local) if local == "$type$1"))
+	));
+}
+
+#[test]
+fn compatibility_lowering_appends_forwarded_hidden_arguments_after_source_arguments() {
+	let hir = lower(
+		"interface Default { func default(): self }
+		 func inner<T: Default>(value: T): T = T.default()
+		 func outer<U: Default>(value: U): U = inner(value)",
+	);
+	let outer = hir
+		.funcs
+		.iter()
+		.find(|function| function.name == "outer")
+		.unwrap();
+	assert_eq!(outer.params, ["value", "$type$0"]);
+	assert!(matches!(
+		&outer.body,
+		HirExpr::Call { callee, args }
+			if matches!(callee.as_ref(), HirExpr::Local(name) if name == "inner")
+				&& matches!(args.as_slice(), [HirExpr::Local(value), HirExpr::Local(hidden)] if value == "value" && hidden == "$type$0")
+	));
+}
+
+#[test]
+fn compatibility_lowering_captures_hidden_arguments_for_generic_callable_values() {
+	let hir = lower(
+		"interface Default { func default(): self }
+		 func make<T: Default>(value: T): T = T.default()
+		 func alias<T: Default>(value: T): T = {
+		   let callable = make
+		   callable(value)
+		 }",
+	);
+	let alias = hir
+		.funcs
+		.iter()
+		.find(|function| function.name == "alias")
+		.unwrap();
+	let HirExpr::Block { stmts, .. } = &alias.body else {
+		panic!("expected block, got {:?}", alias.body);
+	};
+	assert!(matches!(
+		&stmts[0],
+		HirStmt::Let {
+			value: HirExpr::Closure { params, body },
+			..
+		} if params == &["$arg$0"]
+			&& matches!(body.as_ref(), HirExpr::Call { callee, args }
+				if matches!(callee.as_ref(), HirExpr::Local(name) if name == "make")
+					&& matches!(args.as_slice(), [HirExpr::Local(value), HirExpr::Local(hidden)]
+						if value == "$arg$0" && hidden == "$type$0"))
+	));
+}
+
+#[test]
+fn namespaced_call_through_a_struct_owned_generic_lowers_hidden_type_object() {
 	// Confirmed defect (code review, Slice 4J): `push_generics` used to track
 	// only the CURRENT func/method's OWN generics, never the OWNING struct/
 	// enum's — so a namespaced call through a struct-owned generic type
@@ -2670,20 +2784,41 @@ fn namespaced_call_through_a_struct_owned_generic_panics_in_lowering() {
 }
 
 #[test]
-#[should_panic(
-	expected = "does not yet support a namespaced call through a generic type parameter"
-)]
-fn namespaced_call_through_an_enum_owned_generic_panics_in_lowering() {
+fn namespaced_call_through_an_enum_owned_generic_lowers_hidden_type_object() {
 	// Same defect, enum-owned generic reached from an ordinary inherent method
 	// (not just a `namespace` static) — `push_generics` must also see the
 	// enum's own generics while lowering its inherent method bodies.
-	lower(
+	let hir = lower(
 		"interface Default { func default(): self }
 		 enum Box<T: Default> {
 		   Empty
 
 		   func make(): T = T.default()
 		 }",
+	);
+	let box_ = hir
+		.enums
+		.iter()
+		.find(|item| item.name == "Box")
+		.expect("Box");
+	let make = box_
+		.methods
+		.iter()
+		.find(|method| method.name == "make")
+		.expect("make");
+	let HirExpr::Call { callee, .. } = &make.body else {
+		panic!("expected call, got {:?}", make.body);
+	};
+	let HirExpr::Field { recv, name } = callee.as_ref() else {
+		panic!("expected field callee, got {callee:?}");
+	};
+	assert_eq!(name, "default");
+	assert_eq!(
+		recv.as_ref(),
+		&HirExpr::RuntimeTypeProjection {
+			receiver: Box::new(HirExpr::This),
+			path: vec![0],
+		}
 	);
 }
 
@@ -3188,8 +3323,12 @@ fn lowers_a_list_spread_over_a_native_list_source_to_a_native_splice() {
 		panic!("expected Block, got {:?}", hir.funcs[0].body);
 	};
 	assert_eq!(
-		tail.as_deref(),
-		Some(&HirExpr::ArraySpread {
+		value_with_runtime_prototype(
+			tail.as_deref().expect("a tail expression"),
+			"NList",
+			&["NInt"]
+		),
+		&HirExpr::ArraySpread {
 			kind: HirArrayKind::List,
 			elems: vec![
 				HirArrayElem::Spread(HirExpr::Field {
@@ -3198,7 +3337,7 @@ fn lowers_a_list_spread_over_a_native_list_source_to_a_native_splice() {
 				}),
 				HirArrayElem::Item(HirExpr::Num(4.0, NumKind::Int)),
 			],
-		})
+		}
 	);
 }
 
@@ -3236,6 +3375,7 @@ fn lowers_a_list_spread_over_a_user_iterator_source_to_a_drain() {
 		panic!("expected Block, got {:?}", f.body);
 	};
 	let tail = tail.as_deref().expect("a tail expression");
+	let tail = value_with_runtime_prototype(tail, "NList", &["NInt"]);
 	let HirExpr::ArraySpread { elems, .. } = tail else {
 		panic!("expected ArraySpread, got {tail:?}");
 	};
@@ -3298,11 +3438,15 @@ fn lowers_a_map_spread_over_a_native_map_source_to_a_native_merge() {
 		panic!("expected Block, got {:?}", hir.funcs[0].body);
 	};
 	assert_eq!(
-		tail.as_deref(),
-		Some(&HirExpr::MapSpread(vec![
+		value_with_runtime_prototype(
+			tail.as_deref().expect("a tail expression"),
+			"NMap",
+			&["NInt", "NString"]
+		),
+		&HirExpr::MapSpread(vec![
 			HirMapElem::Spread(HirExpr::Local("m".into())),
 			HirMapElem::Entry(HirExpr::Num(2.0, NumKind::Int), HirExpr::Str("b".into())),
-		]))
+		])
 	);
 }
 
@@ -3322,14 +3466,18 @@ fn lowers_a_map_spread_over_a_native_list_of_pairs_source_directly() {
 		panic!("expected Block, got {:?}", hir.funcs[0].body);
 	};
 	assert_eq!(
-		tail.as_deref(),
-		Some(&HirExpr::MapSpread(vec![
+		value_with_runtime_prototype(
+			tail.as_deref().expect("a tail expression"),
+			"NMap",
+			&["NInt", "NString"]
+		),
+		&HirExpr::MapSpread(vec![
 			HirMapElem::Spread(HirExpr::Field {
 				recv: Box::new(HirExpr::Local("pairs".into())),
 				name: "v".into(),
 			}),
 			HirMapElem::Entry(HirExpr::Num(9.0, NumKind::Int), HirExpr::Str("z".into())),
-		]))
+		])
 	);
 }
 
@@ -3364,6 +3512,7 @@ fn lowers_a_map_spread_over_a_non_map_iterable_of_pairs_to_a_drain() {
 		panic!("expected Block, got {:?}", f.body);
 	};
 	let tail = tail.as_deref().expect("a tail expression");
+	let tail = value_with_runtime_prototype(tail, "NMap", &["NInt", "NString"]);
 	let HirExpr::MapSpread(elems) = tail else {
 		panic!("expected MapSpread, got {tail:?}");
 	};
@@ -3392,26 +3541,40 @@ fn tuple_spread_lowers_with_kind_boundaries_and_source_order() {
 	let HirExpr::Block { tail, .. } = &hir.funcs[0].body else {
 		panic!("expected Block, got {:?}", hir.funcs[0].body);
 	};
+	let spread = value_with_runtime_prototype(
+		tail.as_deref().expect("a tail expression"),
+		"NTuple",
+		&["NInt", "NBool", "NString", "NUint"],
+	);
+	let HirExpr::ArraySpread { kind, elems } = spread else {
+		panic!("expected ArraySpread, got {spread:?}");
+	};
+	assert_eq!(*kind, HirArrayKind::Tuple);
+	assert_eq!(elems.len(), 4);
 	assert_eq!(
-		tail.as_deref(),
-		Some(&HirExpr::ArraySpread {
+		elems[0],
+		HirArrayElem::Item(HirExpr::Num(1.0, NumKind::Int))
+	);
+	let HirArrayElem::Spread(HirExpr::Field { recv, name }) = &elems[1] else {
+		panic!("expected empty tuple spread, got {:?}", elems[1]);
+	};
+	assert_eq!(name, "v");
+	assert_eq!(
+		value_with_runtime_prototype(recv, "NTuple", &[]),
+		&HirExpr::Array {
 			kind: HirArrayKind::Tuple,
-			elems: vec![
-				HirArrayElem::Item(HirExpr::Num(1.0, NumKind::Int)),
-				HirArrayElem::Spread(HirExpr::Field {
-					recv: Box::new(HirExpr::Array {
-						kind: HirArrayKind::Tuple,
-						items: vec![],
-					}),
-					name: "v".into(),
-				}),
-				HirArrayElem::Spread(HirExpr::Field {
-					recv: Box::new(HirExpr::Local("xs".into())),
-					name: "v".into(),
-				}),
-				HirArrayElem::Item(HirExpr::Num(2.0, NumKind::UInt)),
-			],
-		})
+			items: vec![],
+		}
+	);
+	assert_eq!(
+		&elems[2..],
+		&[
+			HirArrayElem::Spread(HirExpr::Field {
+				recv: Box::new(HirExpr::Local("xs".into())),
+				name: "v".into(),
+			}),
+			HirArrayElem::Item(HirExpr::Num(2.0, NumKind::UInt)),
+		]
 	);
 }
 
@@ -3546,7 +3709,9 @@ fn external_let_lowers_once_and_references_share_its_binding() {
 			marshal: nymph_hir::hir::MarshalKind::Float,
 		}
 	));
-	let HirExpr::Array { items, .. } = &hir.funcs[0].body else {
+	let HirExpr::Array { items, .. } =
+		value_with_runtime_prototype(&hir.funcs[0].body, "NTuple", &["NFloat", "NFloat"])
+	else {
 		panic!("expected tuple");
 	};
 	assert_eq!(

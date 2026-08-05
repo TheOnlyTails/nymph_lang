@@ -337,6 +337,21 @@ fn three_module_project_runs_under_node() {
 	let out = run_project(files, "result", "");
 	assert_eq!(out, "12");
 }
+
+#[test]
+fn imported_generic_callable_alias_captures_its_hidden_type_object() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/seed with (direct)\nfunc main(): void = {}\nfunc answer(): int = { let alias = direct\n alias(0, 40) }",
+		),
+		(
+			"seed",
+			"interface Seed { func seed(value: int): int }\nimpl Seed for int { func seed(value: int): int = value + 1 }\npublic func direct<T: Seed>(marker: T, value: int): int = T.seed(value)",
+		),
+	]);
+	assert_eq!(run_project(files, "answer", ""), "41");
+}
 #[test]
 fn namespace_and_with_together_run_under_node() {
 	let files = FxHashMap::from_iter([

@@ -1981,6 +1981,9 @@ fn map_runtime_assembly_error(
 		Error::DuplicateAttachment { owner, name } => {
 			nymph_sema::StableModuleAssemblyError::DuplicateAttachment { owner, name }
 		}
+		Error::DuplicateRuntimeTypeAttachment { object, name } => {
+			nymph_sema::StableModuleAssemblyError::DuplicateRuntimeTypeAttachment { object, name }
+		}
 		Error::MissingOwnerShell { owner } => {
 			nymph_sema::StableModuleAssemblyError::MissingOwnerShell { owner }
 		}

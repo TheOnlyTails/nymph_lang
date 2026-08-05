@@ -1799,6 +1799,7 @@ fn extract_definition(
 						let signature = &checked.semantic.interfaces[&def].methods[&meta.name.0];
 						let facts = crate::annotate::CheckedMethod {
 							definition: signature.definition.clone(),
+							generic_count: signature.generics.len(),
 							params: signature.params.clone(),
 							ret: signature.ret,
 							bounds: signature.bounds.clone(),
@@ -2172,6 +2173,7 @@ fn extract_implementations(
 						let signature = &implementation.methods[&meta.name.0];
 						let facts = crate::annotate::CheckedMethod {
 							definition: signature.definition.clone(),
+							generic_count: meta.generics.len(),
 							params: signature.params.clone(),
 							ret: signature.ret,
 							bounds: signature.bounds.clone(),
@@ -2195,6 +2197,7 @@ fn extract_implementations(
 						let signature = &implementation.methods[&meta.name.0];
 						let facts = crate::annotate::CheckedMethod {
 							definition: signature.definition.clone(),
+							generic_count: meta.generics.len(),
 							params: signature.params.clone(),
 							ret: signature.ret,
 							bounds: signature.bounds.clone(),

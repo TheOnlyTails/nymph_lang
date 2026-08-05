@@ -48,6 +48,7 @@ pub(crate) struct CheckedInherentImpl {
 #[derive(Debug, Clone)]
 pub(crate) struct CheckedMethod {
 	pub definition: Option<DefinitionId>,
+	pub generic_count: usize,
 	pub params: Vec<Ty>,
 	pub ret: Ty,
 	pub bounds: Vec<crate::iface::Bound>,
@@ -186,6 +187,13 @@ pub struct UnresolvedQualifiedAccess {
 	pub span: Span,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GenericNamespacedCall {
+	pub parameter: crate::ParamIdx,
+	pub interface: DefinitionId,
+	pub member: DefinitionId,
+}
+
 /// A [`NodeId`]-keyed map of [`ExprInfo`] plus variant resolutions, produced by
 /// checking and consumed by lowering.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -219,7 +227,11 @@ pub struct Annotations {
 	/// Calls proven to be namespaced dispatch through a generic type parameter.
 	/// The parameter identifier has no runtime binding, so stable lowering must
 	/// reject these rather than emitting an undefined local.
-	generic_namespaced_calls: FxHashSet<NodeId>,
+	generic_namespaced_calls: FxHashMap<NodeId, GenericNamespacedCall>,
+	/// Instantiated declared generic arguments for a callable reference. The
+	/// solver variables are deliberately retained until runtime extraction,
+	/// after call argument unification has fixed their concrete types.
+	generic_call_arguments: FxHashMap<NodeId, Vec<Ty>>,
 	/// Checker-resolved lexical control target for each jump expression. Both
 	/// endpoints are source identities; the kind disambiguates constructs which
 	/// share a source node (notably a callable and its directly labeled body).
@@ -362,6 +374,11 @@ impl Annotations {
 		for info in self.infos.values_mut() {
 			info.ty = map(info.ty);
 		}
+		for arguments in self.generic_call_arguments.values_mut() {
+			for argument in arguments {
+				*argument = map(*argument);
+			}
+		}
 	}
 
 	/// Record the stable declaration referenced by a source node.
@@ -461,14 +478,33 @@ impl Annotations {
 		self.anon_boundaries.get(&id).copied()
 	}
 
-	pub(crate) fn record_generic_namespaced_call(&mut self, id: NodeId) {
+	pub(crate) fn record_generic_namespaced_call(&mut self, id: NodeId, call: GenericNamespacedCall) {
 		if id != NodeId::DUMMY {
-			self.generic_namespaced_calls.insert(id);
+			self.generic_namespaced_calls.insert(id, call);
 		}
 	}
 
-	pub fn is_generic_namespaced_call(&self, id: NodeId) -> bool {
-		self.generic_namespaced_calls.contains(&id)
+	pub fn generic_namespaced_call(&self, id: NodeId) -> Option<&GenericNamespacedCall> {
+		self.generic_namespaced_calls.get(&id)
+	}
+
+	pub(crate) fn record_generic_call_arguments(&mut self, id: NodeId, arguments: Vec<Ty>) {
+		if id != NodeId::DUMMY && !arguments.is_empty() {
+			self.generic_call_arguments.insert(id, arguments);
+		}
+	}
+
+	pub(crate) fn move_generic_call_arguments(&mut self, from: NodeId, to: NodeId) {
+		if let Some(arguments) = self.generic_call_arguments.remove(&from) {
+			self.record_generic_call_arguments(to, arguments);
+		}
+	}
+
+	pub fn generic_call_arguments(&self) -> impl Iterator<Item = (NodeId, &[Ty])> {
+		self
+			.generic_call_arguments
+			.iter()
+			.map(|(id, arguments)| (*id, arguments.as_slice()))
 	}
 
 	/// Attach a `Resolution` to a node, preserving its already-recorded type. Used

@@ -256,28 +256,25 @@ fn ambient_math_constants_run_with_no_import() {
 	assert_eq!(run(src, "get_min_int()"), min_int.to_string());
 }
 
-/// `Default` is ambient too (no `import` needed to name it as a bound), but a
-/// namespaced call through a generic parameter cannot select a concrete
-/// implementation in the current type-erased runtime. It must return one
-/// exact typed diagnostic and no JavaScript rather than emit an unbound `T`.
+/// `Default` is ambient too (no `import` needed to name it as a bound), and its
+/// concrete implementation is reached through the hidden canonical type object.
 #[test]
-fn default_generic_bound_returns_one_exact_typed_diagnostic_and_no_js() {
-	let source = "func make<T: Default>(): T = T.default()\nfunc use_it(): int = make()";
+fn default_generic_bound_executes_through_the_ambient_canonical_type_object() {
+	let source = r#"
+func make<T: Default>(): T = T.default()
+func use_it(): int = make()
+func map_none(): int = Option.None.map_or_default((value: int) -> value)
+func map_some(): int = Option.Some(value = 7).map_or_default((value: int) -> value)
+"#;
 
 	let diags = check(source, "test");
 	assert!(
 		!diags.iter().any(|d| d.is_error()),
 		"expected `make` to typecheck cleanly via the ambient `Default`, got: {diags:?}"
 	);
-	let diagnostics = compile(source, "test")
-		.expect_err("unsupported generic namespaced dispatch must not emit JavaScript");
-	assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-	assert_eq!(diagnostics[0].code, "STABLE-EMISSION-LINK");
-	assert_eq!(diagnostics[0].severity, nymph_compiler::Severity::Error);
-	assert_eq!(
-		diagnostics[0].message,
-		"stable runtime linking failed: Lowering(Unsupported { definition: DefinitionId { module: ModuleIdentity { origin: Project(\"__nymph_internal_facade_project__\"), project: \"__nymph_internal_facade_project__\", path: \"__nymph_internal_standalone_entry__\" }, key: TopLevel { category: Function, name: \"make\", duplicate: 0 } }, node: Some(BodyNodeId(0)), feature: \"namespaced call through a generic type parameter\" })"
-	);
+	assert_eq!(run(source, "use_it()"), "0");
+	assert_eq!(run(source, "map_none()"), "0");
+	assert_eq!(run(source, "map_some()"), "7");
 }
 
 /// A user redefinition of an ambient core name (`Option`, here — not `ops`)

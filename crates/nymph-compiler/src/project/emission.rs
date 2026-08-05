@@ -90,6 +90,7 @@ impl link_plan::LinkNameResolver for QueryLinkResolver<'_> {
 fn link_artifact(fragment: &nymph_sema::LoweredHirFragment) -> link_plan::LinkArtifact<'_> {
 	match fragment {
 		nymph_sema::LoweredHirFragment::TopLevelFunction(_)
+		| nymph_sema::LoweredHirFragment::RuntimeTypeAttachment { .. }
 		| nymph_sema::LoweredHirFragment::TopLevelValue(_)
 		| nymph_sema::LoweredHirFragment::StructShell(_)
 		| nymph_sema::LoweredHirFragment::EnumShell(_) => link_plan::LinkArtifact::TopLevel,
@@ -119,7 +120,7 @@ pub(crate) fn emitted_interface_module<'db>(
 		}
 	};
 	let environment = queries::interface_module_environment(db, key, module);
-	let public: std::collections::HashSet<_> = match environment.as_ref() {
+	let mut public: std::collections::HashSet<_> = match environment.as_ref() {
 		nymph_sema::ModuleEnvironment::Complete(interface) => interface
 			.exports
 			.iter()
@@ -134,6 +135,13 @@ pub(crate) fn emitted_interface_module<'db>(
 			));
 		}
 	};
+	public.extend(stable.fragments.iter().filter_map(|fragment| {
+		matches!(
+			fragment.fragment(),
+			nymph_sema::LoweredHirFragment::RuntimeTypeAttachment { .. }
+		)
+		.then(|| fragment.definition().clone())
+	}));
 	let preserve = key.preserve_names(db) && stable.module.path == key.entry(db).as_str();
 	let fragments = stable
 		.fragments
@@ -303,6 +311,7 @@ pub(crate) fn emitted_interface_project<'db>(
 			) && matches!(
 				fragment.fragment.fragment(),
 				nymph_sema::LoweredHirFragment::TopLevelFunction(_)
+					| nymph_sema::LoweredHirFragment::RuntimeTypeAttachment { .. }
 					| nymph_sema::LoweredHirFragment::TopLevelValue(_)
 					| nymph_sema::LoweredHirFragment::TopLevelExternal { .. }
 					| nymph_sema::LoweredHirFragment::StructShell(_)

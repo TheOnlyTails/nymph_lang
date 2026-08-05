@@ -176,6 +176,10 @@ fn bound_dispatch_evaluates_operands_once_and_falls_back_to_the_user_method() {
 					callee: Box::new(HirExpr::Local("make_right".into())),
 					args: vec![],
 				}),
+				hidden_arguments: vec![HirExpr::Call {
+					callee: Box::new(HirExpr::Local("make_hidden".into())),
+					args: vec![],
+				}],
 				cases: vec![HirBoundDispatchCase {
 					receiver_tag: "nymph.int".into(),
 					argument_tag: "nymph.int".into(),
@@ -193,6 +197,14 @@ fn bound_dispatch_evaluates_operands_once_and_falls_back_to_the_user_method() {
 	let js = emit(&module);
 	assert_eq!(js.matches("make_left()").count(), 1, "{js}");
 	assert_eq!(js.matches("make_right()").count(), 1, "{js}");
+	assert_eq!(js.matches("make_hidden()").count(), 1, "{js}");
+	// Nested IIFEs print inner arguments first, so this textual order proves
+	// runtime evaluation is receiver, source argument, then hidden argument.
+	assert!(
+		js.find("make_hidden()").unwrap() < js.find("make_right()").unwrap()
+			&& js.find("make_right()").unwrap() < js.find("make_left()").unwrap(),
+		"{js}"
+	);
 	assert!(js.contains("Symbol.for(\"nymph.tag\")"), "{js}");
 	assert!(js.contains("Symbol.for(\"nymph.int\")"), "{js}");
 	assert!(js.contains("int_less_than"), "{js}");
@@ -281,9 +293,9 @@ fn emits_call_and_string() {
 }
 
 #[test]
-fn emits_method_less_enum_without_a_prototype() {
-	// X1: a method-less enum must keep today's exact shape — no `proto`, no
-	// `Object.create` — regardless of the new methodful codepath existing.
+fn emits_method_less_enum_with_a_canonical_prototype() {
+	// The canonical runtime type object exists for every enum, and variants use
+	// it even when the source enum declares no instance methods.
 	let module = HirModule {
 		lets: vec![],
 		funcs: vec![],
@@ -305,8 +317,14 @@ fn emits_method_less_enum_without_a_prototype() {
 		}],
 	};
 	let js = emit(&module);
-	assert!(!js.contains("proto"), "no prototype object: {js}");
-	assert!(!js.contains("Object.create"), "no Object.create: {js}");
+	assert!(
+		js.contains("const proto = {}"),
+		"canonical prototype object: {js}"
+	);
+	assert!(
+		js.contains("Object.create(proto)"),
+		"variants use canonical prototype: {js}"
+	);
 	assert!(js.contains("Object.freeze"), "nullary stays frozen: {js}");
 	assert!(
 		js.contains("Object.assign"),
