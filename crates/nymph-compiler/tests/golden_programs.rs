@@ -1916,7 +1916,7 @@ fn golden_run_combo_enum_default_method_for_loop_string_builder() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn golden_finding_return_statement_ices_in_lowering() {
+fn golden_return_statement_lowers() {
 	// (`0 - n` rather than a line-leading `-n`, which would continue the previous
 	// expression as a binary minus — the parse gotcha, not the finding.)
 	compile_ok(

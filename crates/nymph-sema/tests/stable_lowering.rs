@@ -304,6 +304,51 @@ fn stable_lowering_accepts_unbraced_return_branches() {
 }
 
 #[test]
+fn stable_lowering_accepts_return_in_a_general_expression_position() {
+	let lowered = lower_named("func value(): int = 1 + return 9", "value");
+	assert!(matches!(
+		lowered.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(nymph_hir::hir::HirFunc {
+			body: nymph_hir::hir::HirExpr::Block { .. },
+			..
+		})
+	));
+}
+
+#[test]
+fn stable_lowering_accepts_semantic_never_operands_without_dispatch() {
+	let source = "func stop(): never = stop()\nfunc binary(): int = 1 + stop()\nfunc prefix(): int = -(stop())\nfunc cast(): int = stop() as int\nfunc index(): int = stop()[0]\nfunc compound(): int = { let mut value = 1\nvalue += stop()\nvalue }";
+	for name in ["binary", "prefix", "cast", "index", "compound"] {
+		let lowered = lower_named(source, name);
+		assert!(matches!(
+			lowered.fragment(),
+			nymph_sema::LoweredHirFragment::TopLevelFunction(_)
+		));
+	}
+}
+
+#[test]
+fn stable_lowering_preserves_labeled_constructor_argument_order() {
+	let lowered = lower_named(
+		"struct Pair(a: int, b: int)\nfunc value(): Pair = Pair(b = 2, a = 1)",
+		"value",
+	);
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("expected function fragment");
+	};
+	let nymph_hir::hir::HirExpr::New { fields, .. } = &function.body else {
+		panic!("expected struct construction");
+	};
+	assert_eq!(
+		fields
+			.iter()
+			.map(|(name, _)| name.as_str())
+			.collect::<Vec<_>>(),
+		["b", "a"]
+	);
+}
+
+#[test]
 fn stable_lowering_preserves_tuple_pattern_rest_relationships() {
 	let lowered = lower_named(
 		"func middle(value: #(int, boolean, string, int)): #(boolean, string) = match (value) { #(first, ...middle, last) -> middle }",
@@ -1936,7 +1981,7 @@ fn lowers_struct_and_enum_construction_and_variant_patterns_from_stable_facts() 
 		point.fragment(),
 		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
 			if matches!(&function.body, nymph_hir::hir::HirExpr::New { class, fields }
-				if class == "Point" && fields.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>() == ["value", "v"])
+				if class == "Point" && fields.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>() == ["v", "value"])
 	));
 	let choice = lower_named(source, "choose");
 	assert!(matches!(

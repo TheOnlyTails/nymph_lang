@@ -201,8 +201,9 @@ func demo(): int = {
 
 `return` exits the nearest enclosing callable. Inside an explicit closure it therefore exits that
 closure, and its value must match the closure's return type; it does not return from the function
-that created the closure. As elsewhere, `return` is currently supported in statement positions
-(including statement-position control-flow branches), not arbitrary value-expression positions.
+that created the closure. It can occur in any grammar-valid expression position. Compiler-generated
+helpers used to evaluate expression-valued control flow are transparent: they neither capture nor
+retarget a source `return`.
 
 ## Anonymous closure parameters
 

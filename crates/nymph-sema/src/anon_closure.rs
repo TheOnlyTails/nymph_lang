@@ -199,25 +199,27 @@ impl<'m> Checker<'m> {
 
 	/// Form the closure hypothesized/committed at `expr` (a node id
 	/// [`crate::annotate::Annotations::anon_boundary_arity`] maps to `arity`):
-	/// push a fresh param-type frame onto [`Checker::anon_ctx`], dispatch
-	/// `expr`'s OWN kind through it (exactly the shape `$N` reads back out of,
-	/// via `ExprKind::AnonymousParam`'s arm in `infer_dispatch`), and return the
+	/// push a fresh param-type frame onto [`Checker::anon_ctx`], establish a
+	/// fresh closure-local return type, dispatch `expr`'s OWN kind through it
+	/// (exactly the shape `$N` reads back out of, via
+	/// `ExprKind::AnonymousParam`'s arm in `infer_dispatch`), and return the
 	/// resulting `(fresh params) -> body_ty` function type — mirroring
 	/// `infer_closure`'s shape (minus a `generics_stack` frame: an anonymous
 	/// closure never declares generics, exactly like an explicit one never
 	/// does either).
 	///
-	/// Always runs the body in INFER mode regardless of whether the boundary
-	/// is being checked or inferred: confirmed by probe that an unannotated
-	/// param (a fresh `Infer` var) resolves cleanly through ordinary operators
-	/// in EITHER mode, so `check`'s caller subtyping the resulting `Fn` type
-	/// against its own expected type afterward is enough to pin the params —
-	/// no separate check-mode variant of this is needed.
+	/// The body's inferred fallthrough and every return are constrained to the
+	/// same fresh result type before the caller applies any expected function
+	/// type, matching explicit closure boundaries.
 	pub(crate) fn form_anon_closure(&mut self, expr: &Expr, arity: u8) -> Ty {
 		let param_tys: Vec<Ty> = (0..arity).map(|_| self.fresh()).collect();
 		self.anon_ctx.push(param_tys.clone());
 		let outer_loops = std::mem::take(&mut self.loop_controls);
-		let body_ty = self.infer_dispatch(expr);
+		let body_ty = self.fresh();
+		let outer_ret = self.ret_ty.replace(body_ty);
+		let inferred = self.infer_dispatch(expr);
+		self.subtype(inferred, body_ty, expr.span);
+		self.ret_ty = outer_ret;
 		self.loop_controls = outer_loops;
 		self.anon_ctx.pop();
 		self.interner.mk_fn(param_tys, body_ty)

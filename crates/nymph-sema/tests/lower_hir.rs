@@ -1410,12 +1410,8 @@ fn lowers_bare_return_in_a_void_function() {
 }
 
 #[test]
-#[should_panic(expected = "only supported in statement position")]
-fn return_as_an_unbraced_match_arm_body_panics_in_lowering() {
-	// `return` reached in genuine expression position (an unbraced match-arm
-	// body) has no HIR representation — lowering panics loudly rather than
-	// silently dropping or misplacing it (Slice 4E, Y1).
-	lower(
+fn lowers_return_as_an_unbraced_match_arm_body() {
+	let hir = lower(
 		r#"
 		func f(n: int): int = match (n) {
 			0 -> return 7,
@@ -1423,6 +1419,42 @@ fn return_as_an_unbraced_match_arm_body_panics_in_lowering() {
 		}
 		"#,
 	);
+	let HirExpr::Match { arms, .. } = &hir.funcs[0].body else {
+		panic!("expected match body");
+	};
+	assert!(matches!(
+		&arms[0].body,
+		HirExpr::Block { stmts, tail: None }
+			if matches!(stmts.as_slice(), [HirStmt::Return(Some(HirExpr::Num(7.0, NumKind::Int)))])
+	));
+}
+
+#[test]
+fn lowers_return_as_a_direct_eager_operand_without_operator_dispatch() {
+	let hir = lower("func value(): int = 1 + return 9");
+	assert!(matches!(
+		&hir.funcs[0].body,
+		HirExpr::Block { stmts, tail: Some(tail) }
+			if matches!(stmts.as_slice(), [HirStmt::Expr(HirExpr::Num(1.0, NumKind::Int))])
+				&& matches!(tail.as_ref(), HirExpr::Block { stmts, tail: None }
+					if matches!(stmts.as_slice(), [HirStmt::Return(Some(HirExpr::Num(9.0, NumKind::Int)))])
+				)
+	));
+}
+
+#[test]
+fn lowers_semantic_never_operands_without_operator_annotations() {
+	let hir = lower(
+		"func stop(): never = stop()\nfunc binary(): int = 1 + stop()\nfunc prefix(): int = -(stop())\nfunc cast(): int = stop() as int\nfunc index(): int = stop()[0]",
+	);
+	for function in &hir.funcs[1..] {
+		assert!(
+			matches!(function.body, HirExpr::Call { .. } | HirExpr::Block { .. }),
+			"{} retained a shell around its never operand: {:?}",
+			function.name,
+			function.body
+		);
+	}
 }
 
 #[test]
@@ -2320,12 +2352,20 @@ fn lowers_pipe_to_a_structural_call() {
 		"#,
 	);
 	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
-	let HirExpr::Call { callee, args } = &f.body else {
-		panic!("expected Call, got {:?}", f.body);
+	let HirExpr::Block {
+		stmts,
+		tail: Some(tail),
+	} = &f.body
+	else {
+		panic!("expected sequenced pipe, got {:?}", f.body);
+	};
+	assert!(matches!(stmts.as_slice(), [HirStmt::Let { value: HirExpr::Local(n), .. }] if n == "a"));
+	let HirExpr::Call { callee, args } = tail.as_ref() else {
+		panic!("expected pipe call");
 	};
 	assert!(matches!(callee.as_ref(), HirExpr::Local(n) if n == "double"));
 	assert_eq!(args.len(), 1);
-	assert!(matches!(&args[0], HirExpr::Local(n) if n == "a"));
+	assert!(matches!(&args[0], HirExpr::Local(n) if n == "$pipe"));
 }
 
 #[test]
@@ -2340,21 +2380,28 @@ fn lowers_chained_pipe_left_associatively() {
 		"#,
 	);
 	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
-	let HirExpr::Call { callee, args } = &f.body else {
-		panic!("expected outer Call, got {:?}", f.body);
+	let HirExpr::Block {
+		stmts,
+		tail: Some(tail),
+	} = &f.body
+	else {
+		panic!("expected outer pipe block, got {:?}", f.body);
+	};
+	let [
+		HirStmt::Let {
+			value: HirExpr::Block { .. },
+			..
+		},
+	] = stmts.as_slice()
+	else {
+		panic!("expected the inner pipe to initialize the outer temporary");
+	};
+	let HirExpr::Call { callee, args } = tail.as_ref() else {
+		panic!("expected outer pipe call");
 	};
 	assert!(matches!(callee.as_ref(), HirExpr::Local(n) if n == "inc"));
 	assert_eq!(args.len(), 1);
-	let HirExpr::Call {
-		callee: inner_callee,
-		args: inner_args,
-	} = &args[0]
-	else {
-		panic!("expected inner Call, got {:?}", args[0]);
-	};
-	assert!(matches!(inner_callee.as_ref(), HirExpr::Local(n) if n == "double"));
-	assert_eq!(inner_args.len(), 1);
-	assert_eq!(inner_args[0], HirExpr::Num(10.0, NumKind::Int));
+	assert!(matches!(&args[0], HirExpr::Local(n) if n == "$pipe"));
 }
 
 #[test]
@@ -2372,8 +2419,16 @@ fn lowers_in_operator_with_swapped_receiver() {
 		"#,
 	);
 	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
-	let HirExpr::Call { callee, args } = &f.body else {
-		panic!("expected Call, got {:?}", f.body);
+	let HirExpr::Block {
+		stmts,
+		tail: Some(tail),
+	} = &f.body
+	else {
+		panic!("expected sequenced membership, got {:?}", f.body);
+	};
+	assert!(matches!(stmts.as_slice(), [HirStmt::Let { value: HirExpr::Local(n), .. }] if n == "x"));
+	let HirExpr::Call { callee, args } = tail.as_ref() else {
+		panic!("expected membership call");
 	};
 	let HirExpr::Field { recv, name } = callee.as_ref() else {
 		panic!("expected Field callee, got {callee:?}");
@@ -2381,7 +2436,7 @@ fn lowers_in_operator_with_swapped_receiver() {
 	assert_eq!(name, "contains");
 	assert!(matches!(recv.as_ref(), HirExpr::Local(n) if n == "b"));
 	assert_eq!(args.len(), 1);
-	assert!(matches!(&args[0], HirExpr::Local(n) if n == "x"));
+	assert!(matches!(&args[0], HirExpr::Local(n) if n == "$member"));
 }
 
 #[test]
@@ -2401,8 +2456,16 @@ fn lowers_not_in_operator_to_not_contains() {
 		"#,
 	);
 	let f = hir.funcs.iter().find(|f| f.name == "f").expect("f");
-	let HirExpr::Call { callee, args } = &f.body else {
-		panic!("expected Call, got {:?}", f.body);
+	let HirExpr::Block {
+		stmts,
+		tail: Some(tail),
+	} = &f.body
+	else {
+		panic!("expected sequenced membership, got {:?}", f.body);
+	};
+	assert!(matches!(stmts.as_slice(), [HirStmt::Let { value: HirExpr::Local(n), .. }] if n == "x"));
+	let HirExpr::Call { callee, args } = tail.as_ref() else {
+		panic!("expected membership call");
 	};
 	let HirExpr::Field { recv, name } = callee.as_ref() else {
 		panic!("expected Field callee, got {callee:?}");
@@ -2410,7 +2473,7 @@ fn lowers_not_in_operator_to_not_contains() {
 	assert_eq!(name, "not_contains");
 	assert!(matches!(recv.as_ref(), HirExpr::Local(n) if n == "b"));
 	assert_eq!(args.len(), 1);
-	assert!(matches!(&args[0], HirExpr::Local(n) if n == "x"));
+	assert!(matches!(&args[0], HirExpr::Local(n) if n == "$member"));
 }
 
 #[test]
@@ -2828,21 +2891,15 @@ fn lowers_a_single_ident_closure_as_a_pipe_rhs() {
 	// is the (lowered) RHS, so the single-ident closure form becomes the
 	// callee here.
 	let hir = lower("func f(): int = 10 |> x -> x * 2");
-	assert_eq!(
-		hir.funcs[0].body,
-		HirExpr::Call {
-			callee: Box::new(HirExpr::Closure {
-				params: vec!["x".into()],
-				body: Box::new(HirExpr::Binary {
-					op: BinOp::Mul,
-					result: BuiltinResult::Int,
-					lhs: Box::new(HirExpr::Local("x".into())),
-					rhs: Box::new(HirExpr::Num(2.0, NumKind::Int)),
-				}),
-			}),
-			args: vec![HirExpr::Num(10.0, NumKind::Int)],
-		}
-	);
+	assert!(matches!(
+		&hir.funcs[0].body,
+		HirExpr::Block { stmts, tail: Some(tail) }
+			if matches!(stmts.as_slice(), [HirStmt::Let { value: HirExpr::Num(10.0, NumKind::Int), .. }])
+				&& matches!(tail.as_ref(), HirExpr::Call { callee, args }
+					if matches!(callee.as_ref(), HirExpr::Closure { params, .. }
+						if matches!(params.as_slice(), [name] if name == "x"))
+						&& matches!(args.as_slice(), [HirExpr::Local(name)] if name == "$pipe"))
+	));
 }
 
 #[test]
@@ -2962,31 +3019,24 @@ fn return_inside_closure_block_body_lowers_to_the_closure() {
 }
 
 #[test]
-#[should_panic(expected = "return` inside an anonymous closure body is not supported")]
-fn return_inside_anonymous_closure_body_retains_the_lowering_guard() {
-	lower(
+fn return_inside_anonymous_closure_body_lowers_to_that_callable() {
+	let hir = lower(
 		r#"
 		func f(): int = {
-			let g: (int) -> boolean = {
+			let g: (int) -> int = {
 				if ($0 > 0) { return 1 }
-				true
+				0
 			}
-			if (g(1)) 1 else 0
+			g(1)
 		}
 		"#,
 	);
+	assert!(matches!(hir.funcs[0].body, HirExpr::Block { .. }));
 }
 
 #[test]
-#[should_panic(expected = "only supported in statement position")]
-fn return_inside_an_unbraced_closure_body_panics_in_lowering() {
-	// P22: `(x) -> return x` typechecks (the checker permits a closure whose
-	// entire body is a bare `return`, inferring the closure's own return type
-	// as `never`). The body here is never a `Block`, so `lower_func_body`
-	// routes it straight to `lower_expr`, which panics unconditionally on a
-	// subexpression-position `Return` (Slice 4E, Y1) — belt-and-braces
-	// alongside the `closure_depth` guard above.
-	lower(
+fn return_inside_an_unbraced_closure_body_lowers() {
+	let hir = lower(
 		r#"
 		func f(): int = {
 			let g = (x: int) -> return x
@@ -2994,14 +3044,22 @@ fn return_inside_an_unbraced_closure_body_panics_in_lowering() {
 		}
 		"#,
 	);
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected function block");
+	};
+	assert!(matches!(
+		stmts[0],
+		HirStmt::Let {
+			value: HirExpr::Closure { .. },
+			..
+		}
+	));
 }
 
 #[test]
 fn legal_return_in_a_statement_position_match_is_unaffected_by_a_sibling_closure() {
 	// Regression guard: an unrelated closure elsewhere in the same function
-	// body (with no `return` of its own) must not leak `closure_depth` state —
-	// a genuinely legal `return` inside a STATEMENT-position match, later in
-	// the same function, must still lower fine.
+	// body must not affect a return inside a later statement-position match.
 	let hir = lower(
 		r#"
 		func f(n: int): int = {

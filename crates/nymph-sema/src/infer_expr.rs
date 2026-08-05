@@ -3025,7 +3025,9 @@ impl<'m> Checker<'m> {
 			// must be assignable back into the place.
 			Some(binop) => {
 				let (result, res, pend) = self.infer_binary(lhs, binop, rhs, span);
-				self.unify(result, expected, span);
+				if !matches!(self.interner.kind(result), TyKind::Never) {
+					self.unify(result, expected, span);
+				}
 				resolution = res;
 				pending = pend.map(|ty| (binop, ty, result));
 			}

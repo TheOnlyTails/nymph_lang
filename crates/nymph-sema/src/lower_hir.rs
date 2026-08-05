@@ -267,7 +267,6 @@ fn lower_hir_impl(
 		pattern_declaration_records: RefCell::new(Vec::new()),
 		pattern_declaration_reuse: RefCell::new(Vec::new()),
 		generics_stack: RefCell::new(Vec::new()),
-		closure_depth: std::cell::Cell::new(0),
 		loop_targets: RefCell::new(Vec::new()),
 		next_loop_target: std::cell::Cell::new(0),
 		this_sub: RefCell::new(Vec::new()),
@@ -353,10 +352,6 @@ struct Lowerer<'a> {
 	/// merged with `scopes`, which is JS-scope/shadowing bookkeeping, not
 	/// type-parameter bookkeeping).
 	generics_stack: RefCell<Vec<FxHashSet<EcoString>>>,
-	/// Depth of anonymous `$N` closure-body nesting currently being lowered.
-	/// Anonymous closures do not yet establish the explicit-closure return
-	/// context implemented for issue #22, so their existing guard remains.
-	closure_depth: std::cell::Cell<u32>,
 	loop_targets: RefCell<Vec<nymph_hir::hir::LoopTarget>>,
 	next_loop_target: std::cell::Cell<nymph_hir::hir::LoopTarget>,
 	/// Stack of receiver-param names currently substituting for `this` while
@@ -368,7 +363,7 @@ struct Lowerer<'a> {
 	/// lowered default body can itself call another lowered body
 	/// (e.g. `Comparable`'s `less_than` default calling `this.compare_to(o)`)
 	/// — each nested lowering pushes its OWN receiver name and pops it
-	/// on the way out, exactly like `generics_stack`/`closure_depth`. Empty
+	/// on the way out, exactly like `generics_stack`. Empty
 	/// everywhere else, including while lowering an ordinary inherent/impl
 	/// method (`this` there stays `HirExpr::This`, unaffected).
 	this_sub: RefCell<Vec<EcoString>>,
@@ -3220,10 +3215,8 @@ impl<'a> Lowerer<'a> {
 	/// namespaced-call guard and silently emit unbound JS instead of the loud
 	/// panic it exists to give.
 	///
-	/// A statement-position `return` lowers into the arrow's own body. The checker
-	/// establishes a closure-local return context, so it cannot target the
-	/// enclosing function. Arbitrary expression-position returns remain outside
-	/// this lowering boundary.
+	/// The checker establishes a closure-local return context, so returns in the
+	/// body target this closure even when they cross generated expression helpers.
 	fn lower_closure(
 		&self,
 		params: &[Spanned<nymph_ast::expr::ClosureParam>],
@@ -3240,14 +3233,9 @@ impl<'a> Lowerer<'a> {
 			.iter()
 			.map(|p| self.declare(&param_name(&p.0.name)))
 			.collect();
-		// An explicit closure establishes a supported callable boundary even when
-		// it is nested inside an anonymous `$N` closure. Suspend the anonymous
-		// guard while lowering this body, then restore it for the outer boundary.
-		let outer_closure_depth = self.closure_depth.replace(0);
 		let outer_loop_targets = self.loop_targets.replace(Vec::new());
 		let body = self.lower_func_body(body);
 		self.loop_targets.replace(outer_loop_targets);
-		self.closure_depth.set(outer_closure_depth);
 		self.pop_scope();
 		HirExpr::Closure {
 			params,
@@ -3299,10 +3287,8 @@ impl<'a> Lowerer<'a> {
 
 	/// Lower the closure committed at `expr` (see [`Self::lower_expr`]):
 	/// mirrors [`Self::lower_closure`] exactly — one fresh JS scope seeded
-	/// with `arity` synthesized `anon$0`, `anon$1`, … params, `closure_depth`
-	/// bumped around the body (so a stray `return` inside still panics loudly
-	/// rather than silently emit an arrow-scoped one — see that field's doc
-	/// comment), then `expr` itself lowered as the closure's body through
+	/// with `arity` synthesized `anon$0`, `anon$1`, … params, then `expr` itself
+	/// lowered as the closure's body through
 	/// `lower_expr_inner` (its OWN kind, e.g. the `BinaryOp` a boundary like
 	/// `$ % 2 == 0` actually is) rather than through `lower_expr` again.
 	fn lower_anon_closure(&self, expr: &Expr, arity: u8) -> HirExpr {
@@ -3310,11 +3296,9 @@ impl<'a> Lowerer<'a> {
 		let params = (0..arity)
 			.map(|i| self.declare(&anon_param_name(i)))
 			.collect();
-		self.closure_depth.set(self.closure_depth.get() + 1);
 		let outer_loop_targets = self.loop_targets.replace(Vec::new());
 		let body = self.lower_expr_inner(expr);
 		self.loop_targets.replace(outer_loop_targets);
-		self.closure_depth.set(self.closure_depth.get() - 1);
 		self.pop_scope();
 		HirExpr::Closure {
 			params,
@@ -3592,6 +3576,12 @@ impl<'a> Lowerer<'a> {
 			ExprKind::BinaryOp { lhs, op, rhs } => self.lower_binary(expr.id, lhs, *op, rhs),
 			ExprKind::PrefixOp { op, value } => self.lower_prefix_op(expr.id, *op, value),
 			ExprKind::AssignOp { lhs, op, rhs } => {
+				if assign_binop(*op).is_some() && self.definitely_transfers(rhs) {
+					return HirExpr::Assign {
+						target: Box::new(self.lower_expr(lhs)),
+						value: Box::new(self.lower_expr(rhs)),
+					};
+				}
 				// A compound assignment `a op= b` desugars to `a = a op b`, dispatched
 				// per its recorded `Resolution` just like a `BinaryOp` node (Finding 1);
 				// a plain `=` (or `~=`, which has no binary form) assigns the value
@@ -3639,6 +3629,7 @@ impl<'a> Lowerer<'a> {
 			// diagnosed by the checker, e.g. `TypeError::CastRequiresInto`/
 			// `CannotCast`/`IntoInterfaceMalformed`), panics loudly rather than
 			// silently emitting the bare operand — never a lowering deferral.
+			ExprKind::TypeOp { lhs, .. } if self.definitely_transfers(lhs) => self.lower_expr(lhs),
 			ExprKind::TypeOp { lhs, .. } => match self.annotations.resolution_of(expr.id) {
 				Some(res) if res.dispatch == DispatchKind::BuiltinEager => {
 					self.lower_scalar_cast(expr.id, lhs)
@@ -3750,21 +3741,21 @@ impl<'a> Lowerer<'a> {
 			// which `lower_func_body` lowers directly via `lower_block(_, false)`
 			// into the scope its params already seeded (Slice 4E, Y2).
 			ExprKind::Block { body, .. } => self.lower_block(body, true),
-			ExprKind::Return { value: _, label } => {
-				// `return` is statement-flavored (`HirStmt::Return`); reaching it HERE
-				// means it showed up in genuine expression position — an unbraced
-				// match-arm body, an if/let-init operand, etc. — which lowering has no
-				// representation for. `lower_block` intercepts every `Statement::Expr`
-				// wrapping a `Return` before it ever reaches `lower_expr`, so the only
-				// way here is a subexpression position; panic loudly rather than
-				// silently drop or misplace it (Slice 4E, Y1).
+			ExprKind::Return { value, label } => {
+				// HIR keeps return statement-flavored, so an expression-position return
+				// is represented by a block containing exactly that statement. Codegen
+				// propagates it across any synthetic expression IIFEs to the nearest
+				// real callable boundary.
 				assert!(
 					label.is_none(),
 					"slice-4e lowering does not yet support labeled `return`"
 				);
-				panic!(
-					"slice-4e lowering: `return` is only supported in statement position (inside a block), not as a subexpression"
-				);
+				HirExpr::Block {
+					stmts: vec![HirStmt::Return(
+						value.as_ref().map(|value| self.lower_expr(value)),
+					)],
+					tail: None,
+				}
 			}
 			ExprKind::If {
 				condition,
@@ -3907,6 +3898,15 @@ impl<'a> Lowerer<'a> {
 	/// dedicated runtime operations, while custom `Index` implementations follow
 	/// the same dispatch/lowering paths as an explicit `.index(key)` call.
 	fn lower_index_access(&self, id: nymph_ast::NodeId, parent: &Expr, index: &Expr) -> HirExpr {
+		if self.definitely_transfers(parent) {
+			return self.lower_expr(parent);
+		}
+		if self.definitely_transfers(index) {
+			return HirExpr::Block {
+				stmts: vec![HirStmt::Expr(self.lower_expr(parent))],
+				tail: Some(Box::new(self.lower_expr(index))),
+			};
+		}
 		let recv_ty = self
 			.annotations
 			.get(parent.id)
@@ -4519,41 +4519,9 @@ impl<'a> Lowerer<'a> {
 		matches!(Self::peel_grouped(e).kind, ExprKind::This)
 	}
 
-	/// Lower an `if`/`while` branch expression (`then`/`otherwise`/`body`),
-	/// special-casing a directly-unbraced `return` (Slice 4E, Y1 follow-up): the
-	/// parser accepts a bare `return` as the whole then-branch/while-body with no
-	/// surrounding `{ .. }` (unbraced if/while branches are ordinary expression
-	/// positions — see the parser's `control_flow_expressions` tests), but
-	/// `lower_block`'s statement-level interception only ever sees a `Return`
-	/// that is itself a full statement of SOME block's own statement list. An
-	/// unbraced branch never reaches `lower_block` at all, so without this it
-	/// falls through to `lower_expr`'s subexpression-position `Return` arm and
-	/// panics unconditionally, even though the corpus's already-supported braced
-	/// shape (`if (cond) { return n }`) lowers this exact same branch fine.
-	/// Wrapping it in a single-statement `Block` (mirroring what `lower_block`
-	/// already produces for the braced form) makes the two shapes lower
-	/// identically. This does NOT relax the Y1 scope guard: emit's
-	/// `in_iife_subexpr` check still panics loudly if the enclosing if/while
-	/// itself ends up in a genuine subexpression (IIFE-wrapped) position — that
-	/// check is orthogonal to how the branch was lowered.
+	/// Lower an `if`/`while` branch expression (`then`/`otherwise`/`body`).
 	fn lower_branch(&self, e: &Expr) -> HirExpr {
-		if let ExprKind::Return { value, label } = &e.kind {
-			assert!(
-				label.is_none(),
-				"slice-4e lowering does not yet support labeled `return`"
-			);
-			assert!(
-				self.closure_depth.get() == 0,
-				"slice-4l lowering: `return` inside an anonymous closure body is not supported"
-			);
-			let value = value.as_ref().map(|v| self.lower_expr(v));
-			HirExpr::Block {
-				stmts: vec![HirStmt::Return(value)],
-				tail: None,
-			}
-		} else {
-			self.lower_expr(e)
-		}
+		self.lower_expr(e)
 	}
 
 	/// Lower a `BinaryOp` node per its recorded [`crate::Resolution`] (Slice 4B, D4).
@@ -4577,6 +4545,17 @@ impl<'a> Lowerer<'a> {
 		op: BinaryOperator,
 		rhs: &Expr,
 	) -> HirExpr {
+		if self.definitely_transfers(lhs) {
+			return self.lower_expr(lhs);
+		}
+		if !matches!(op, BinaryOperator::BoolAnd | BinaryOperator::BoolOr)
+			&& self.definitely_transfers(rhs)
+		{
+			return HirExpr::Block {
+				stmts: vec![HirStmt::Expr(self.lower_expr(lhs))],
+				tail: Some(Box::new(self.lower_expr(rhs))),
+			};
+		}
 		match op {
 			// DD1: `x |> f` lowers structurally to a `Call` — the checker already
 			// type-checked every hazardous callee shape away (a bare variant/struct
@@ -4584,29 +4563,36 @@ impl<'a> Lowerer<'a> {
 			// lowering ever runs), so no special-casing of `rhs`'s shape is needed
 			// here, unlike `ExprKind::Call`'s variant-factory/`New` special cases.
 			//
-			// Evaluation order: JS evaluates a call's callee before its arguments,
-			// so `lhsFn() |> rhsFn()` runs `rhsFn` FIRST — reversed from source
-			// order. Nymph documents no evaluation-order guarantee, and hoisting
-			// the LHS into a temp would cost an IIFE per pipe (HIR has no sequence
-			// expression), so RHS-first is the accepted semantics — the same
-			// ruling as `in`/`!in`'s receiver swap below. Revisit if HIR ever
-			// grows a let/sequence expression.
+			// JS evaluates a call's callee before its arguments, opposite the
+			// source order of `lhs |> rhs`. Hoist the lhs into a block-local once so
+			// a return while evaluating rhs cannot skip or duplicate it.
 			BinaryOperator::Pipe => {
-				return HirExpr::Call {
-					callee: Box::new(self.lower_expr(rhs)),
-					args: vec![self.lower_expr(lhs)],
+				self.push_scope();
+				let lhs_name = self.declare(&EcoString::from("$pipe"));
+				let lhs = self.lower_expr(lhs);
+				let rhs = self.lower_expr(rhs);
+				self.pop_scope();
+				return HirExpr::Block {
+					stmts: vec![HirStmt::Let {
+						name: lhs_name.clone(),
+						mutable: false,
+						value: lhs,
+					}],
+					tail: Some(Box::new(HirExpr::Call {
+						callee: Box::new(rhs),
+						args: vec![HirExpr::Local(lhs_name)],
+					})),
 				};
 			}
 			// DD2: `a in c` / `a !in c` ≡ `c.contains(a)` / `c.not_contains(a)` — the
 			// RHS is the receiver, the LHS the sole argument, swapped relative to
-			// every other binary operator. This changes evaluation order (the RHS
-			// collection is evaluated before the LHS item); Nymph has no documented
-			// left-to-right evaluation guarantee for `in` (the reference docs are a
-			// stub) and HIR has no let/sequence expression to preserve source order
-			// cheaply (only `Block`, which would cost an IIFE), so RHS-before-LHS is
-			// accepted and documented here rather than engineered around.
+			// every other binary operator. Hoist the lhs before evaluating the RHS
+			// receiver so source order and exactly-once evaluation survive the swap.
 			BinaryOperator::In | BinaryOperator::NotIn => {
-				return match self.annotations.resolution_of(id) {
+				self.push_scope();
+				let lhs_name = self.declare(&EcoString::from("$member"));
+				let lhs_value = self.lower_expr(lhs);
+				let mut operation = match self.annotations.resolution_of(id) {
 					Some(res) if res.dispatch == DispatchKind::UserImpl => HirExpr::Call {
 						callee: Box::new(HirExpr::Field {
 							recv: Box::new(self.lower_expr(rhs)),
@@ -4660,6 +4646,16 @@ impl<'a> Lowerer<'a> {
 						res.method
 					),
 					None => panic!("slice-4i lowering: no operator resolution recorded for binary op {op:?}"),
+				};
+				Self::replace_dispatch_argument(&mut operation, HirExpr::Local(lhs_name.clone()));
+				self.pop_scope();
+				return HirExpr::Block {
+					stmts: vec![HirStmt::Let {
+						name: lhs_name,
+						mutable: false,
+						value: lhs_value,
+					}],
+					tail: Some(Box::new(operation)),
 				};
 			}
 			// DD3: Nymph has no optional runtime representation (no `T?` syntax, no
@@ -4863,6 +4859,9 @@ impl<'a> Lowerer<'a> {
 	/// lower interface default methods, and an unresolved node is a checker
 	/// bug we want to see immediately rather than silently miscompile.
 	fn lower_prefix_op(&self, id: nymph_ast::NodeId, op: PrefixOperator, value: &Expr) -> HirExpr {
+		if self.definitely_transfers(value) {
+			return self.lower_expr(value);
+		}
 		match self.annotations.resolution_of(id) {
 			Some(res) if res.dispatch == DispatchKind::BuiltinEager => HirExpr::Unary {
 				op: lower_prefix(op),
@@ -4927,6 +4926,58 @@ impl<'a> Lowerer<'a> {
 				res.dispatch, res.method
 			),
 			None => panic!("slice-4c lowering: no operator resolution recorded for prefix op {op:?}"),
+		}
+	}
+
+	/// Whether this checked expression has the semantic `never` type and therefore
+	/// cannot complete normally. Anonymous `$N` boundaries are callable values even
+	/// when their underlying body expression is `never`, so they must be tested first.
+	fn definitely_transfers(&self, expr: &Expr) -> bool {
+		if self.annotations.anon_boundary_arity(expr.id).is_some() {
+			return false;
+		}
+		if self.annotations.get(expr.id).is_some_and(|info| {
+			matches!(
+				self.interner.kind(Self::peel_mut(self.interner, info.ty)),
+				TyKind::Never
+			)
+		}) {
+			return true;
+		}
+		match &expr.kind {
+			ExprKind::Return { .. } | ExprKind::Break { .. } | ExprKind::Continue { .. } => true,
+			ExprKind::Grouped(value) => self.definitely_transfers(value),
+			ExprKind::Block { body, .. } => body.iter().any(|statement| match &statement.0 {
+				Statement::Let { value, .. } | Statement::Expr(value) => self.definitely_transfers(value),
+			}),
+			ExprKind::If {
+				condition,
+				then,
+				otherwise,
+			} => {
+				self.definitely_transfers(condition)
+					|| otherwise.as_deref().is_some_and(|otherwise| {
+						self.definitely_transfers(then) && self.definitely_transfers(otherwise)
+					})
+			}
+			ExprKind::Match { value, arms } => {
+				self.definitely_transfers(value)
+					|| (!arms.is_empty() && arms.iter().all(|arm| self.definitely_transfers(&arm.body)))
+			}
+			_ => false,
+		}
+	}
+
+	fn replace_dispatch_argument(expr: &mut HirExpr, argument: HirExpr) {
+		match expr {
+			HirExpr::Call { args, .. } | HirExpr::ExternCall { args, .. } => {
+				*args.last_mut().expect("binary dispatch has an argument") = argument;
+			}
+			HirExpr::BoundDispatch {
+				argument: found, ..
+			} => **found = argument,
+			HirExpr::Binary { rhs, .. } => **rhs = argument,
+			other => panic!("binary dispatch lowered to an unexpected HIR shape: {other:?}"),
 		}
 	}
 
@@ -5440,11 +5491,9 @@ impl<'a> Lowerer<'a> {
 						value,
 					});
 				}
-				// `return` is statement-flavored regardless of source position (last
-				// statement or not): it never becomes a block's tail EXPRESSION, even
-				// when it's the block's last statement — the exact corpus shape (an
-				// if-branch block whose only statement is `return n`), since emit has
-				// no way to represent "return" as a value (Slice 4E, Y1).
+				// Keep a source return that is already a complete block statement in
+				// the direct statement form. Subexpression returns use the identical
+				// statement inside a synthetic HIR block in `lower_expr`.
 				Statement::Expr(e) if matches!(e.kind, ExprKind::Return { .. }) => {
 					let ExprKind::Return { value, label } = &e.kind else {
 						unreachable!("matched above");
@@ -5453,12 +5502,9 @@ impl<'a> Lowerer<'a> {
 						label.is_none(),
 						"slice-4e lowering does not yet support labeled `return`"
 					);
-					assert!(
-						self.closure_depth.get() == 0,
-						"slice-4l lowering: `return` inside an anonymous closure body is not supported"
-					);
-					let value = value.as_ref().map(|v| self.lower_expr(v));
-					stmts.push(HirStmt::Return(value));
+					stmts.push(HirStmt::Return(
+						value.as_ref().map(|value| self.lower_expr(value)),
+					));
 				}
 				Statement::Expr(e) => {
 					if is_last {

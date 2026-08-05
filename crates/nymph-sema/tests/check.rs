@@ -6,6 +6,19 @@ use nymph_sema::check_module;
 use nymph_syntax::parse_module;
 
 #[test]
+fn anonymous_closure_returns_are_checked_against_the_closure_result() {
+	let parsed = parse_module(
+		"func value(): int = { let closure: (int) -> boolean = { if ($0 > 0) { return 1 } true }\nif (closure(1)) 1 else 0 }",
+		"test",
+	);
+	let checked = check_module(&parsed.tree);
+	assert!(
+		!checked.diags.is_empty(),
+		"a return from the anonymous closure was checked against the enclosing function"
+	);
+}
+
+#[test]
 fn forward_generic_alias_substitutes_its_owned_target() {
 	let parsed = parse_module(
 		"func identity(value: Later<int>): int = value\ntype Later<T> = T",
@@ -247,6 +260,23 @@ fn closure_return_is_checked_against_the_closure_not_the_outer_function() {
 fn nested_closure_return_contexts_restore_to_the_nearest_callable() {
 	assert_ok(
 		"func f(): int = { let outer: (boolean) -> string = (b: boolean) -> { let inner: () -> boolean = () -> { return true } if (b) { return \"outer\" } \"tail\" } return 7 }",
+	);
+}
+
+#[test]
+fn return_typechecks_in_general_expression_positions_and_callable_kinds() {
+	assert_ok(
+		r#"
+		func id(value: int): int = value
+		func positions(flag: boolean): int = id(1 + if (flag) return 2 else #[3][0])
+		struct Value(value: int) {
+			func get(flag: boolean): int = this.value + if (flag) return 4 else 1
+		}
+		interface DefaultValue {
+			func default_value(flag: boolean): int = 1 + if (flag) return 5 else 2
+		}
+		impl DefaultValue for Value {}
+		"#,
 	);
 }
 
