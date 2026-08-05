@@ -89,9 +89,10 @@ impl CompilerState {
 		uri: Uri,
 		text: String,
 		version: i32,
-	) -> anyhow::Result<()> {
+	) -> anyhow::Result<Vec<Uri>> {
 		docs.open(uri.clone(), text, version);
-		self.synchronize(docs, &uri)
+		self.synchronize(docs, &uri)?;
+		Ok(self.open_project_documents(docs, &uri))
 	}
 
 	pub fn change(
@@ -100,9 +101,10 @@ impl CompilerState {
 		uri: &Uri,
 		text: String,
 		version: i32,
-	) -> anyhow::Result<()> {
+	) -> anyhow::Result<Vec<Uri>> {
 		docs.change_full(uri, text, version);
-		self.synchronize(docs, uri)
+		self.synchronize(docs, uri)?;
+		Ok(self.open_project_documents(docs, uri))
 	}
 
 	pub fn close(&mut self, docs: &mut DocumentStore, uri: &Uri) -> anyhow::Result<Vec<Uri>> {
@@ -131,16 +133,30 @@ impl CompilerState {
 			}
 			Err(error) => return Err(error.into()),
 		}
-		Ok(
-			self
-				.documents
-				.iter()
-				.filter(|(open_uri, open_identity)| {
-					open_identity.project == identity.project && docs.get(open_uri).is_some()
-				})
-				.map(|(open_uri, _)| open_uri.clone())
-				.collect(),
+		Ok(self.open_project_documents_for(docs, &identity.project))
+	}
+
+	fn open_project_documents(&self, docs: &DocumentStore, uri: &Uri) -> Vec<Uri> {
+		self.documents.get(uri).map_or_else(
+			|| vec![uri.clone()],
+			|identity| {
+				let mut affected = self.open_project_documents_for(docs, &identity.project);
+				affected.retain(|affected_uri| affected_uri != uri);
+				affected.insert(0, uri.clone());
+				affected
+			},
 		)
+	}
+
+	fn open_project_documents_for(&self, docs: &DocumentStore, project: &ProjectId) -> Vec<Uri> {
+		let mut documents: Vec<_> = self
+			.documents
+			.iter()
+			.filter(|(open_uri, identity)| &identity.project == project && docs.get(open_uri).is_some())
+			.map(|(open_uri, _)| open_uri.clone())
+			.collect();
+		documents.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+		documents
 	}
 
 	pub fn analysis_for_uri(&self, docs: &DocumentStore, uri: &Uri) -> Option<AnalysisSnapshot> {

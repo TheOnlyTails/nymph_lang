@@ -2486,13 +2486,17 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 									.and_then(|path| self.active.get(&path).copied())
 									.map(SemanticModuleInput::Project)
 							});
-						if let Some(handle) = semantic_handle {
+						if let Some(handle) = semantic_handle
+							&& !semantic_handles.contains(&handle)
+						{
 							semantic_handles.push(handle);
 						}
 						if !target.starts_with(super::resolve::STD_KEY_PREFIX) {
 							let target_path =
 								ModulePath::new(target).expect("resolved local import is canonical");
-							if let Some(handle) = self.active.get(&target_path) {
+							if let Some(handle) = self.active.get(&target_path)
+								&& !handles.contains(handle)
+							{
 								handles.push(*handle);
 							}
 						}

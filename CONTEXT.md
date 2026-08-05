@@ -31,7 +31,7 @@ _Avoid_: conversion, casting (a cast is a Nymph-level `as` between types).
 ## Compiler architecture
 
 **Compiler session**:
-The compiler-owned, in-process lifetime for incremental analysis. `nymph-compiler` exclusively owns `CompilerSession`, `ProjectId`, `ModulePath`, Salsa inputs/storage, semantic identities, and the project graph. A CLI request creates a short-lived session; the LSP retains one across document notifications. State is never persisted across processes.
+The compiler-owned, in-process lifetime for incremental analysis. `nymph-compiler` exclusively owns `CompilerSession`, `ProjectId`, `ModulePath`, Salsa inputs/storage, semantic identities, and the project graph. A CLI request creates a short-lived session; the LSP retains compiler sessions across document notifications (including a separate no-prelude session for standard-library sources). State is never persisted across processes.
 _Avoid_: putting semantic IDs or Salsa state in `nymph-project`, or maintaining a frontend analysis cache alongside the session.
 
 **Project filesystem policy**:
