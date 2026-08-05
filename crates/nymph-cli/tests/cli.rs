@@ -208,6 +208,34 @@ fn explicit_manifest_never_discovers_from_an_explicit_source() {
 	std::fs::remove_dir_all(other).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn explicit_manifest_rejects_a_source_symlink_that_escapes_its_source_root() {
+	let selected = write_project("main.nym", "func main(): void = {}\n");
+	let outside = write_source("func main(): void = {}\n");
+	let selected_source = selected.join("src/main.nym");
+	std::fs::remove_file(&selected_source).unwrap();
+	std::os::unix::fs::symlink(&outside, &selected_source).unwrap();
+
+	for command in ["run", "check", "build"] {
+		for target in [None, Some(selected_source.to_str().unwrap())] {
+			let manifest = selected.join("nymph.toml");
+			let mut args = vec!["--manifest", manifest.to_str().unwrap(), command];
+			args.extend(target);
+			let out = nymph_in(&args, &selected);
+			assert_eq!(out.status.code(), Some(1), "{command}: {}", out.stderr);
+			assert!(
+				out.stderr.contains("outside source root"),
+				"{command} must not follow the selected target outside its source root: {}",
+				out.stderr
+			);
+		}
+	}
+
+	std::fs::remove_dir_all(selected).unwrap();
+	std::fs::remove_file(outside).unwrap();
+}
+
 #[test]
 fn target_matrix_project_without_file_uses_manifest_entry_relative_to_src() {
 	let root = write_project("bin/start.nym", "func main(): void = {}\n");

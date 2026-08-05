@@ -89,6 +89,7 @@ pub(crate) fn resolve(
 				),
 			};
 			ensure_source_file(&file)?;
+			ensure_source_within_root(&file, &src_root)?;
 			let intent = if module == entry_module {
 				TargetIntent::Entry
 			} else {
@@ -130,6 +131,20 @@ fn ensure_source_file(file: &Path) -> anyhow::Result<()> {
 		Ok(())
 	} else {
 		anyhow::bail!("target source file does not exist: {}", file.display())
+	}
+}
+
+fn ensure_source_within_root(file: &Path, src_root: &Path) -> anyhow::Result<()> {
+	let canonical_file = std::fs::canonicalize(file)?;
+	let canonical_root = std::fs::canonicalize(src_root)?;
+	if canonical_file.starts_with(canonical_root) {
+		Ok(())
+	} else {
+		anyhow::bail!(
+			"source file {} is outside source root {}",
+			file.display(),
+			src_root.display()
+		)
 	}
 }
 
