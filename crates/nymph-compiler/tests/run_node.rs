@@ -1296,13 +1296,10 @@ fn runs_return_inside_a_statement_position_match() {
 }
 
 #[test]
-#[should_panic(expected = "would return from the emitted IIFE")]
-fn return_inside_a_subexpression_position_match_arm_panics_in_emit() {
+fn return_inside_a_subexpression_position_match_arm_targets_the_function() {
 	// A braced match-arm body used as a SUBEXPRESSION (here, a `let` initializer)
-	// IS wrapped in an IIFE by emit — a `return` there would return from that
-	// IIFE, not the enclosing function. Lowering accepts it (the arm body is a
-	// block whose last statement is `return`), so this panics later, in emit,
-	// via the scope guard (Slice 4E, Y1).
+	// is wrapped in an IIFE by emit. The private callable completion carries its
+	// return across that generated boundary to the enclosing function.
 	let src = r#"
 		func f(n: int): int = {
 			let x = match (n) {
@@ -1312,7 +1309,8 @@ fn return_inside_a_subexpression_position_match_arm_panics_in_emit() {
 			x
 		}
 	"#;
-	run(src, "f(0)");
+	assert_eq!(run(src, "f(new NInt(0))"), "7");
+	assert_eq!(run(src, "f(new NInt(3))"), "3");
 }
 
 #[test]
@@ -4278,4 +4276,54 @@ func eager_positions(): int = {
 	assert_eq!(run(src, "match_arm()"), "8");
 	assert_eq!(run(src, "short_circuit()"), "22");
 	assert_eq!(run(src, "eager_positions()"), "15");
+}
+
+#[test]
+fn return_crosses_option_loop_expression_iife_in_both_lowering_paths() {
+	let src = r#"
+func choose(flag: boolean): int = {
+	let result = while (true) {
+		if (flag) { return 9 }
+		break 4
+	}
+	match (result) { Some(value) -> value, None -> 0 }
+}
+
+func nested(): int = {
+	let choose = (flag: boolean) -> {
+		let result = while (true) {
+			if (flag) { return 8 }
+			break 3
+		}
+		match (result) { Some(value) -> value, None -> 0 }
+	}
+	choose(true) * 10 + choose(false)
+}
+"#;
+	assert_eq!(run(src, "choose(new NBool(true))"), "9");
+	assert_eq!(run(src, "choose(new NBool(false))"), "4");
+	assert_eq!(run(src, "nested()"), "83");
+
+	let prelude = "enum Option<T> { Some(value: T), None }";
+	assert_eq!(
+		run_with_prelude(src, prelude, "choose(new NBool(true))"),
+		"9"
+	);
+	assert_eq!(
+		run_with_prelude(src, prelude, "choose(new NBool(false))"),
+		"4"
+	);
+	assert_eq!(run_with_prelude(src, prelude, "nested()"), "83");
+}
+
+#[test]
+fn loop_completion_does_not_swallow_user_exceptions() {
+	let src = r#"
+func invoke(callback: () -> int): Option<int> = while (true) {
+	callback()
+	break 1
+}
+"#;
+	let stderr = run_failure(src, "invoke(() => { throw new Error('user boom') })");
+	assert!(stderr.contains("user boom"), "{stderr}");
 }
