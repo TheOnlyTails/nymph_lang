@@ -120,7 +120,7 @@ pub(crate) fn emitted_interface_module<'db>(
 		}
 	};
 	let environment = queries::interface_module_environment(db, key, module);
-	let public: std::collections::HashSet<_> = match environment.as_ref() {
+	let mut public: std::collections::HashSet<_> = match environment.as_ref() {
 		nymph_sema::ModuleEnvironment::Complete(interface) => interface
 			.exports
 			.iter()
@@ -135,6 +135,13 @@ pub(crate) fn emitted_interface_module<'db>(
 			));
 		}
 	};
+	public.extend(stable.fragments.iter().filter_map(|fragment| {
+		matches!(
+			fragment.fragment(),
+			nymph_sema::LoweredHirFragment::RuntimeTypeAttachment { .. }
+		)
+		.then(|| fragment.definition().clone())
+	}));
 	let preserve = key.preserve_names(db) && stable.module.path == key.entry(db).as_str();
 	let fragments = stable
 		.fragments

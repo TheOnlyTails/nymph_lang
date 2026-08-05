@@ -2733,6 +2733,37 @@ fn compatibility_lowering_appends_forwarded_hidden_arguments_after_source_argume
 }
 
 #[test]
+fn compatibility_lowering_captures_hidden_arguments_for_generic_callable_values() {
+	let hir = lower(
+		"interface Default { func default(): self }
+		 func make<T: Default>(value: T): T = T.default()
+		 func alias<T: Default>(value: T): T = {
+		   let callable = make
+		   callable(value)
+		 }",
+	);
+	let alias = hir
+		.funcs
+		.iter()
+		.find(|function| function.name == "alias")
+		.unwrap();
+	let HirExpr::Block { stmts, .. } = &alias.body else {
+		panic!("expected block, got {:?}", alias.body);
+	};
+	assert!(matches!(
+		&stmts[0],
+		HirStmt::Let {
+			value: HirExpr::Closure { params, body },
+			..
+		} if params == &["$arg$0"]
+			&& matches!(body.as_ref(), HirExpr::Call { callee, args }
+				if matches!(callee.as_ref(), HirExpr::Local(name) if name == "make")
+					&& matches!(args.as_slice(), [HirExpr::Local(value), HirExpr::Local(hidden)]
+						if value == "$arg$0" && hidden == "$type$0"))
+	));
+}
+
+#[test]
 fn namespaced_call_through_a_struct_owned_generic_lowers_hidden_type_object() {
 	// Confirmed defect (code review, Slice 4J): `push_generics` used to track
 	// only the CURRENT func/method's OWN generics, never the OWNING struct/

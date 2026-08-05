@@ -4777,6 +4777,28 @@ func answer(): void = {
 }
 
 #[test]
+fn receiverless_dispatch_does_not_partially_emit_blanket_implementations() {
+	let source = r#"
+interface Seed { func seed(): int }
+impl Seed for int { func seed(): int = 1 }
+
+struct Box<T>(value: T)
+impl<T> Seed for Box<T> { func seed(): int = 2 }
+
+func direct<T: Seed>(marker: T): int = T.seed()
+func answer(): int = direct(Box(value = 0))
+"#;
+	let diagnostics = nymph_compiler::compile(source, "test")
+		.expect_err("blanket receiverless body emission belongs to #15");
+	assert!(
+		diagnostics.iter().any(|diagnostic| diagnostic
+			.message
+			.contains("generic implementation emission owned by #15")),
+		"{diagnostics:?}"
+	);
+}
+
+#[test]
 fn generic_bound_method_forwards_its_hidden_arguments() {
 	let source = r#"
 interface Seed { func seed(value: int): int }
@@ -4850,6 +4872,28 @@ func factory<T: Seed>(marker: T): () -> int = () -> T.seed(40)
 func answer(): int = (factory(0))()
 "#;
 	assert_eq!(run(source, "answer()"), "41");
+}
+
+#[test]
+fn generic_callable_values_capture_hidden_type_objects() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl Seed for int { func seed(value: int) = value + 1 }
+
+func direct<T: Seed>(marker: T, value: int): int = T.seed(value)
+func invoke(callback: (int, int) -> int): int = callback(0, 40)
+func through_alias(): int = {
+  let alias = direct
+  alias(0, 40)
+}
+func through_callback(): int = invoke(direct)
+func recursive<T: Seed>(marker: T, value: int): int = {
+  let again = recursive
+  if (value == 0) { T.seed(40) } else { again(marker, value - 1) }
+}
+func answer(): int = through_alias() + through_callback() + recursive(0, 1)
+"#;
+	assert_eq!(run(source, "answer()"), "123");
 }
 
 #[test]

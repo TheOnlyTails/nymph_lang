@@ -2536,9 +2536,9 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						}
 						self.demand_direct(target);
 					}
-					HirExpr::Local(emitted.as_str().into())
+					self.generic_callable_adapter(self.id(expr), HirExpr::Local(emitted.as_str().into()))?
 				} else {
-					HirExpr::Local(self.resolve(&name))
+					self.generic_callable_adapter(self.id(expr), HirExpr::Local(self.resolve(&name)))?
 				}
 			}
 			StableExprKind::AnonymousParam(index) => {
@@ -2848,48 +2848,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						parent,
 						args.iter().map(|arg| &arg.value).collect(),
 					)?;
-					if let Some((_, hidden)) = self
-						.annotations
-						.generic_call_arguments
-						.iter()
-						.find(|(id, _)| *id == self.id(expr))
-					{
-						let target = match &mut lowered {
-							HirExpr::Call { args, .. } => args,
-							HirExpr::BoundDispatch {
-								hidden_arguments, ..
-							}
-							| HirExpr::UnaryBoundDispatch {
-								hidden_arguments, ..
-							} => hidden_arguments,
-							_ => return Ok(lowered),
-						};
-						let required_hidden = self
-							.annotations
-							.generic_call_targets
-							.iter()
-							.find_map(|(id, target)| (*id == self.id(expr)).then_some(target))
-							.map(|target| self.required_receiverless_slots(target))
-							.transpose()?
-							.unwrap_or_default();
-						for (index, argument) in hidden.iter().enumerate() {
-							if matches!(argument, crate::runtime::RuntimeTypeArgument::Erased)
-								&& required_hidden.contains(&index)
-							{
-								return Err(StableLoweringError::Unsupported {
-									definition: self.artifact.definition.clone(),
-									node: Some(self.id(expr)),
-									feature: "erased runtime type argument required by receiverless dispatch".into(),
-								});
-							}
-							target.push(match argument {
-								crate::runtime::RuntimeTypeArgument::Canonical(type_) => {
-									self.runtime_type_object(type_)?
-								}
-								crate::runtime::RuntimeTypeArgument::Erased => HirExpr::Undefined,
-							});
-						}
-					}
+					lowered = self.append_hidden_arguments(self.id(expr), lowered)?;
 					return Ok(lowered);
 				}
 				if let Some((_, parameter, interface, member_definition)) = self
@@ -2967,43 +2926,17 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				} else {
 					self.record_unresolved_call(UnresolvedRuntimeCall::DynamicCallee);
 				}
-				let mut lowered_args = args
+				let lowered_args = args
 					.iter()
 					.map(|arg| self.lower(&arg.value))
 					.collect::<Result<Vec<_>, _>>()?;
-				let required_hidden = self
-					.target(func)
-					.map(|target| self.required_receiverless_slots(target))
-					.transpose()?
-					.unwrap_or_default();
-				if let Some((_, hidden)) = self
-					.annotations
-					.generic_call_arguments
-					.iter()
-					.find(|(id, _)| *id == self.id(expr))
-				{
-					for (index, argument) in hidden.iter().enumerate() {
-						if matches!(argument, crate::runtime::RuntimeTypeArgument::Erased)
-							&& required_hidden.contains(&index)
-						{
-							return Err(StableLoweringError::Unsupported {
-								definition: self.artifact.definition.clone(),
-								node: Some(self.id(expr)),
-								feature: "erased runtime type argument required by receiverless dispatch".into(),
-							});
-						}
-						lowered_args.push(match argument {
-							crate::runtime::RuntimeTypeArgument::Canonical(type_) => {
-								self.runtime_type_object(type_)?
-							}
-							crate::runtime::RuntimeTypeArgument::Erased => HirExpr::Undefined,
-						});
-					}
-				}
-				HirExpr::Call {
-					callee: Box::new(self.lower(func)?),
-					args: lowered_args,
-				}
+				self.append_hidden_arguments(
+					self.id(expr),
+					HirExpr::Call {
+						callee: Box::new(self.lower(func)?),
+						args: lowered_args,
+					},
+				)?
 			}
 			StableExprKind::BinaryOp { lhs, op, rhs } => {
 				if self.definitely_transfers(lhs) {
@@ -4533,7 +4466,6 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		self.demands.borrow_mut().insert(definition.clone());
 		self.direct_demands.borrow_mut().insert(definition.clone());
 	}
-
 	fn runtime_type_object(&self, type_: &InterfaceType) -> Result<HirExpr, StableLoweringError> {
 		let resolved = substitute_type_parameters(type_, self.type_substitutions);
 		let type_ = &resolved;
@@ -5034,6 +4966,53 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			});
 		}
 		Ok(lowered)
+	}
+
+	fn generic_callable_adapter(
+		&self,
+		node: crate::BodyNodeId,
+		callee: HirExpr,
+	) -> Result<HirExpr, StableLoweringError> {
+		if !self
+			.annotations
+			.generic_call_arguments
+			.iter()
+			.any(|(id, _)| *id == node)
+		{
+			return Ok(callee);
+		}
+		let Some(target) = self
+			.annotations
+			.generic_call_targets
+			.iter()
+			.find_map(|(id, target)| (*id == node).then_some(target))
+		else {
+			return Err(StableLoweringError::Unsupported {
+				definition: self.artifact.definition.clone(),
+				node: Some(node),
+				feature: "generic callable value without an exact runtime target".into(),
+			});
+		};
+		let target_artifact = self.context.runtime_definition(target)?;
+		let crate::RuntimePayload::NymphBody(target_body) = &target_artifact.payload else {
+			return Err(StableLoweringError::Unsupported {
+				definition: self.artifact.definition.clone(),
+				node: Some(node),
+				feature: "generic callable value without a Nymph runtime body".into(),
+			});
+		};
+		let params = (0..target_body.stable.params.len())
+			.map(|index| EcoString::from(format!("$arg${index}")))
+			.collect::<Vec<_>>();
+		let call = HirExpr::Call {
+			callee: Box::new(callee),
+			args: params.iter().cloned().map(HirExpr::Local).collect(),
+		};
+		let call = self.append_hidden_arguments(node, call)?;
+		Ok(HirExpr::Closure {
+			params,
+			body: Box::new(call),
+		})
 	}
 
 	fn lower_for(

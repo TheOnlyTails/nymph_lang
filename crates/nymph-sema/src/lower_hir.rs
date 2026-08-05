@@ -3446,7 +3446,7 @@ impl<'a> Lowerer<'a> {
 				// 4E, Y2) — itself unless it's currently shadowed by a same-scope
 				// rename; falls through to the bare name for anything never pushed
 				// onto the stack (module-level funcs/classes/enums/top-level lets).
-				None => HirExpr::Local(self.resolve(&name.0)),
+				None => self.generic_callable_adapter(expr.id, HirExpr::Local(self.resolve(&name.0))),
 			},
 			// While lowering a lowered prelude body as a top-level mangled
 			// function (stdlib body lowering slice, gap b), `this`
@@ -4323,6 +4323,38 @@ impl<'a> Lowerer<'a> {
 			arguments.extend(hidden.iter().map(|type_| self.runtime_type_object(*type_)));
 		}
 		call
+	}
+
+	fn generic_callable_adapter(&self, id: NodeId, callee: HirExpr) -> HirExpr {
+		let Some(hidden) = self
+			.annotations
+			.generic_call_arguments()
+			.find_map(|(call_id, arguments)| (call_id == id).then_some(arguments))
+		else {
+			return callee;
+		};
+		let Some(info) = self.annotations.get(id) else {
+			return callee;
+		};
+		let TyKind::Fn { params, .. } = self.interner.kind(info.ty) else {
+			return callee;
+		};
+		let params = (0..params.len())
+			.map(|index| EcoString::from(format!("$arg${index}")))
+			.collect::<Vec<_>>();
+		let args = params
+			.iter()
+			.cloned()
+			.map(HirExpr::Local)
+			.chain(hidden.iter().map(|type_| self.runtime_type_object(*type_)))
+			.collect();
+		HirExpr::Closure {
+			params,
+			body: Box::new(HirExpr::Call {
+				callee: Box::new(callee),
+				args,
+			}),
+		}
 	}
 
 	/// Lower a checked `receiver[key]`: structural collections keep their
