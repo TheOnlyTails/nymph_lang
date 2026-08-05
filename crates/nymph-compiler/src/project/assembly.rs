@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, btree_map::Entry};
 
 use ecow::EcoString;
-use nymph_hir::hir::{HirMethod, HirModule};
+use nymph_hir::hir::{HirExpr, HirLet, HirMethod, HirModule};
 use nymph_sema::{
 	DeclarationCategory, DeclarationKey, DefinitionId, HeaderType, LoweredHirFragment,
 	LoweredRuntimeDefinition, ModuleIdentity, RuntimeAssemblyPlacement,
@@ -48,6 +48,10 @@ pub(crate) enum RuntimeAssemblyError {
 	},
 	DuplicateAttachment {
 		owner: DefinitionId,
+		name: EcoString,
+	},
+	DuplicateRuntimeTypeAttachment {
+		object: EcoString,
 		name: EcoString,
 	},
 	MissingOwnerShell {
@@ -148,6 +152,8 @@ fn assemble_runtime_module_with_collected(
 		}
 	}
 	let mut attachments = HashSet::new();
+	let mut runtime_type_attachments = Vec::new();
+	let mut runtime_type_attachment_selectors = HashSet::new();
 	let mut top_level_values = HashMap::new();
 	for (_, lowered) in fragments {
 		use LoweredHirFragment as Fragment;
@@ -161,6 +167,32 @@ fn assemble_runtime_module_with_collected(
 				top_level_values.insert(lowered.definition().clone(), value.clone());
 			}
 			Fragment::TopLevelExternal { .. } => validate_module(target, lowered)?,
+			Fragment::RuntimeTypeAttachment {
+				object,
+				function,
+				method,
+			} => {
+				validate_module(target, lowered)?;
+				let selector = (format!("{object:?}"), method.name.clone());
+				if !runtime_type_attachment_selectors.insert(selector.clone()) {
+					return Err(RuntimeAssemblyError::DuplicateRuntimeTypeAttachment {
+						object: selector.0.into(),
+						name: selector.1,
+					});
+				}
+				if let Some(function) = function {
+					hir.funcs.push(function.clone());
+				}
+				let attachment_index = runtime_type_attachments.len();
+				runtime_type_attachments.push(HirLet {
+					name: format!("$attach${attachment_index}").into(),
+					mutable: false,
+					value: HirExpr::RuntimeTypeAttachment {
+						object: Box::new(object.clone()),
+						method: Box::new(method.clone()),
+					},
+				});
+			}
 			Fragment::AttachedInstance { owner, method }
 			| Fragment::AttachedMember { owner, method }
 			| Fragment::MaterializedDefault { owner, method, .. } => attach(
@@ -186,14 +218,17 @@ fn assemble_runtime_module_with_collected(
 			Fragment::StructShell(_) | Fragment::EnumShell(_) => {}
 		}
 	}
-	hir.lets = value_order
-		.into_iter()
-		.map(|definition| {
-			top_level_values
-				.remove(&definition)
-				.expect("ordered top-level value must exist")
-		})
-		.collect();
+	hir.lets = runtime_type_attachments;
+	hir.lets.extend(
+		value_order
+			.into_iter()
+			.map(|definition| {
+				top_level_values
+					.remove(&definition)
+					.expect("ordered top-level value must exist")
+			})
+			.collect::<Vec<_>>(),
+	);
 	Ok(hir)
 }
 
@@ -364,7 +399,8 @@ pub(crate) fn validate_fragment_intrinsic(
 		| Fragment::TopLevelValue(_)
 		| Fragment::TopLevelExternal { .. }
 		| Fragment::StructShell(_)
-		| Fragment::EnumShell(_) => match lowered.placement() {
+		| Fragment::EnumShell(_)
+		| Fragment::RuntimeTypeAttachment { .. } => match lowered.placement() {
 			RuntimeAssemblyPlacement::Module(actual) if actual == &lowered.definition().module => Ok(()),
 			_ => placement_error(lowered),
 		},

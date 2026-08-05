@@ -1106,7 +1106,13 @@ impl<'m> Checker<'m> {
 					result
 				}
 			}
-			ExprKind::Grouped(inner) => self.infer(inner),
+			ExprKind::Grouped(inner) => {
+				let ty = self.infer(inner);
+				self
+					.annotations
+					.move_generic_call_arguments(inner.id, expr.id);
+				ty
+			}
 		}
 	}
 
@@ -1228,7 +1234,13 @@ impl<'m> Checker<'m> {
 				.get(&def)
 				.map(|sig| sig.ty)
 				.unwrap_or_else(|| self.fresh()),
-			DefKind::Func => self.fn_type_of(def, span),
+			DefKind::Func => {
+				let (ty, arguments) = self.fn_type_of(def, span);
+				self
+					.annotations
+					.record_generic_call_arguments(id, arguments);
+				ty
+			}
 			DefKind::Variant { enum_def, variant } => self.variant_value(enum_def, variant, id, span),
 			DefKind::Struct => {
 				self.emit(span, TypeError::StructTypeAsValue);
@@ -1264,7 +1276,7 @@ impl<'m> Checker<'m> {
 	/// interface's own arguments before minting the synthetic param). `span` is
 	/// the call/reference site, so a violated bound diagnoses there rather than
 	/// at the callee's declaration.
-	fn fn_type_of(&mut self, def: DefId, span: Span) -> Ty {
+	fn fn_type_of(&mut self, def: DefId, span: Span) -> (Ty, Vec<Ty>) {
 		let sig = self.sigs.funcs[&def].clone();
 		// A recovered dependency may preserve a function's name/header while its
 		// result slot is poisoned. Treat the exported value itself as poison so a
@@ -1272,7 +1284,7 @@ impl<'m> Checker<'m> {
 		// signature. `Error` remains checker-local and permissive; the environment's
 		// recovery bit is what prevents this result from reaching lowering.
 		if matches!(self.interner.kind(sig.ret), TyKind::Error) {
-			return self.interner.error();
+			return (self.interner.error(), Vec::new());
 		}
 		let mut synthetics = FxHashSet::default();
 		for p in &sig.params {
@@ -1305,7 +1317,10 @@ impl<'m> Checker<'m> {
 			.map(|p| self.subst(p.ty, &subst, None))
 			.collect();
 		let ret = self.subst(sig.ret, &subst, None);
-		self.interner.mk_fn(params, ret)
+		let arguments = (0..sig.generics.len())
+			.map(|index| subst[&ParamIdx(index as u32)])
+			.collect();
+		(self.interner.mk_fn(params, ret), arguments)
 	}
 
 	/// Build the `(enum, variant)` resolution recorded for lowering.
@@ -1460,7 +1475,10 @@ impl<'m> Checker<'m> {
 						self
 							.annotations
 							.record_definition_target(func.id, target.as_ref());
-						let callee = self.namespace_func_type(&sig, member.1);
+						let (callee, type_arguments) = self.namespace_func_type(&sig, member.1);
+						self
+							.annotations
+							.record_generic_call_arguments(id, type_arguments);
 						self.annotations.record(
 							func.id,
 							crate::ExprInfo {
@@ -1490,9 +1508,12 @@ impl<'m> Checker<'m> {
 					}
 					let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
 					let arg_lits = arg_int_lits(args);
-					if let Some((ret, target)) =
+					if let Some((ret, target, type_arguments)) =
 						self.resolve_namespaced(def, &member.0, &arg_tys, &arg_lits, member.1)
 					{
+						self
+							.annotations
+							.record_generic_call_arguments(id, type_arguments);
 						self.annotations.record_direct_namespace_member(func.id);
 						self
 							.annotations
@@ -1514,9 +1535,12 @@ impl<'m> Checker<'m> {
 				DefKind::Struct => {
 					let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
 					let arg_lits = arg_int_lits(args);
-					if let Some((ret, target)) =
+					if let Some((ret, target, type_arguments)) =
 						self.resolve_namespaced(def, &member.0, &arg_tys, &arg_lits, member.1)
 					{
+						self
+							.annotations
+							.record_generic_call_arguments(id, type_arguments);
 						self.annotations.record_direct_namespace_member(func.id);
 						self
 							.annotations
@@ -1547,11 +1571,22 @@ impl<'m> Checker<'m> {
 			&& let Some(pidx) = self.lookup_param(&pname.0)
 		{
 			let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
-			self.annotations.record_generic_namespaced_call(id);
-			return (
-				self.resolve_param_namespaced(pidx, &member.0, &arg_tys, member.1),
-				None,
-			);
+			let (result, target, type_arguments) =
+				self.resolve_param_namespaced(pidx, &member.0, &arg_tys, member.1);
+			self
+				.annotations
+				.record_generic_call_arguments(id, type_arguments);
+			if let Some((interface, member)) = target {
+				self.annotations.record_generic_namespaced_call(
+					id,
+					crate::annotate::GenericNamespacedCall {
+						parameter: pidx,
+						interface,
+						member,
+					},
+				);
+			}
+			return (result, None);
 		}
 
 		// Method call: `receiver.method(args…)` resolves through the interface solver.
@@ -1577,6 +1612,9 @@ impl<'m> Checker<'m> {
 			let arg_lits = arg_int_lits(args);
 			return match self.resolve_method(recv_dispatch, &member.0, &arg_tys, &arg_lits, member.1) {
 				Some(res) => {
+					self
+						.annotations
+						.record_generic_call_arguments(id, res.type_arguments.clone());
 					for (argument, expected) in args.iter().zip(&res.params) {
 						if matches!(argument.0.value.kind, ExprKind::Closure { .. }) {
 							self.check_closure(&argument.0.value, *expected);
@@ -1608,6 +1646,20 @@ impl<'m> Checker<'m> {
 		}
 
 		let callee = self.infer(func);
+		// Hidden ABI metadata belongs to the call expression, not to a callee
+		// reference which may be grouped or otherwise reused by lowering. A call
+		// used as a callee keeps its own metadata: `factory(value)()` must pass the
+		// hidden arguments to `factory`, not to the callable it returns.
+		let mut metadata_source = func;
+		while let ExprKind::Grouped(inner) = &metadata_source.kind {
+			metadata_source = inner;
+		}
+		if matches!(
+			metadata_source.kind,
+			ExprKind::Identifier(_) | ExprKind::MemberAccess { .. }
+		) {
+			self.annotations.move_generic_call_arguments(func.id, id);
+		}
 		if matches!(self.interner.kind(callee), TyKind::Never) {
 			return (self.interner.never(), None);
 		}
@@ -1825,7 +1877,11 @@ impl<'m> Checker<'m> {
 					self
 						.annotations
 						.record_definition_target(id, target.as_ref());
-					self.namespace_func_type(&sig, span)
+					let (ty, type_arguments) = self.namespace_func_type(&sig, span);
+					self
+						.annotations
+						.record_generic_call_arguments(id, type_arguments);
+					ty
 				}
 				None => {
 					if let crate::DefOrigin::Imported { module } = &self.defs.data(def).origin {
@@ -1870,7 +1926,7 @@ impl<'m> Checker<'m> {
 		self.member_ty_of(parent_ty, member, span, Some(id))
 	}
 
-	fn namespace_func_type(&mut self, sig: &FuncSig, span: Span) -> Ty {
+	fn namespace_func_type(&mut self, sig: &FuncSig, span: Span) -> (Ty, Vec<Ty>) {
 		let inst = self.instantiate(
 			sig.ret,
 			&sig.bounds,
@@ -1886,7 +1942,10 @@ impl<'m> Checker<'m> {
 			.map(|param| self.subst(param.ty, &subst, None))
 			.collect();
 		let ret = self.subst(sig.ret, &subst, None);
-		self.interner.mk_fn(params, ret)
+		let arguments = (0..sig.generics.len())
+			.map(|index| subst[&ParamIdx(index as u32)])
+			.collect();
+		(self.interner.mk_fn(params, ret), arguments)
 	}
 
 	fn check_direct_call(&mut self, callee: Ty, args: &[Spanned<CallArg>], span: Span) -> Ty {
@@ -3372,7 +3431,7 @@ impl<'m> Checker<'m> {
 			// iterates its own `this`. Records `IterMode::Direct` so lowering emits the
 			// `.next()` protocol rather than the native-list index fast path.
 			if let Some((iterator, next)) = self.runtime_roles.iterator.clone()
-				&& let Some(ret) = self.resolve_param_exact_method(idx, iterator, &next, iterable.span)
+				&& let Some((ret, _)) = self.resolve_param_exact_method(idx, iterator, &next, iterable.span)
 				&& let Some(item) = self.option_element(ret)
 			{
 				let Some(next_name) = self.runtime_role_member_name(iterator, &next) else {
@@ -3390,6 +3449,7 @@ impl<'m> Checker<'m> {
 					.get(&iface)
 					.and_then(|i| i.generics.first().cloned())
 				&& let Some(item) = self.resolve_param_iface_arg(idx, iface, &item_name)
+				&& let Some((_ret, _)) = self.resolve_param_exact_method(idx, iface, &iter, iterable.span)
 			{
 				let Some(iter_name) = self.runtime_role_member_name(iface, &iter) else {
 					return self.interner.error();
@@ -3424,7 +3484,8 @@ impl<'m> Checker<'m> {
 				.interfaces
 				.get(&iterator)
 				.and_then(|i| i.generics.first().cloned())
-			&& let Some(item) = self.resolve_iface_arg(stripped, self_is_mut, iterator, &item_name, 0)
+			&& let Some((item, _)) =
+				self.resolve_iface_arg_with_implementation(stripped, self_is_mut, iterator, &item_name, 0)
 		{
 			// The desugar (`lower_for_protocol`) invokes `next()` on this exact
 			// source directly (`IterMode::Direct`: `let $it = <src>`) — gate it

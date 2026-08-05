@@ -424,6 +424,7 @@ impl<'m> Checker<'m> {
 		Option<DefinitionId>,
 		Option<DefinitionId>,
 		Option<nymph_ast::Span>,
+		Vec<Ty>,
 	)> {
 		// See `resolve_method`'s matching comment: peel `mut` before matching
 		// against any impl's (never-`mut`) `Self` type.
@@ -448,9 +449,16 @@ impl<'m> Checker<'m> {
 				let method = &self.inherent.impls[idx].methods[name];
 				let target = method.definition.clone();
 				let method_span = method.local_span;
-				let (params, ret) =
+				let (params, ret, type_arguments) =
 					self.commit_inherent(idx, recv, name, Some((arg_tys, arg_lits)), span, false);
-				return Some((params, ret, target, implementation, method_span));
+				return Some((
+					params,
+					ret,
+					target,
+					implementation,
+					method_span,
+					type_arguments,
+				));
 			}
 		}
 		None
@@ -495,7 +503,7 @@ impl<'m> Checker<'m> {
 		let target = method.definition.clone();
 		let method_span = method.local_span;
 		let implementation = self.inherent.impls[idx].definition.clone();
-		let (params, ret) = self.commit_inherent(idx, recv, name, None, span, false);
+		let (params, ret, _) = self.commit_inherent(idx, recv, name, None, span, false);
 		Some((params, ret, target, implementation, method_span))
 	}
 
@@ -507,7 +515,7 @@ impl<'m> Checker<'m> {
 		arg_tys: &[Ty],
 		arg_lits: &[bool],
 		span: nymph_ast::Span,
-	) -> Option<(Ty, Option<crate::DefinitionId>)> {
+	) -> Option<(Ty, Option<crate::DefinitionId>, Vec<Ty>)> {
 		let candidates = self.inherent.candidates(Head::Adt(type_def));
 		for idx in candidates {
 			let target = self
@@ -519,19 +527,15 @@ impl<'m> Checker<'m> {
 				.map(|method| method.definition.clone());
 			if let Some(target) = target {
 				let placeholder = self.interner.error();
-				return Some((
-					self
-						.commit_inherent(
-							idx,
-							placeholder,
-							name,
-							Some((arg_tys, arg_lits)),
-							span,
-							true,
-						)
-						.1,
-					target,
-				));
+				let (_, ret, type_arguments) = self.commit_inherent(
+					idx,
+					placeholder,
+					name,
+					Some((arg_tys, arg_lits)),
+					span,
+					true,
+				);
+				return Some((ret, target, type_arguments));
 			}
 		}
 		None
@@ -561,7 +565,7 @@ impl<'m> Checker<'m> {
 		arguments: Option<(&[Ty], &[bool])>,
 		span: nymph_ast::Span,
 		namespaced: bool,
-	) -> (Vec<Ty>, Ty) {
+	) -> (Vec<Ty>, Ty, Vec<Ty>) {
 		let def = &self.inherent.impls[idx];
 		let generics_len = def.owner_generic_names.len();
 		let self_pattern = def.self_ty;
@@ -617,7 +621,11 @@ impl<'m> Checker<'m> {
 						found: arg_tys.len(),
 					},
 				);
-				return (params, ret);
+				let start = if namespaced { 0 } else { generics_len };
+				let type_arguments = (start..generics_len + own)
+					.map(|index| subst[&ParamIdx(index as u32)])
+					.collect();
+				return (params, ret, type_arguments);
 			}
 			for (i, (param, arg)) in params.iter().zip(arg_tys).enumerate() {
 				self.unify_arg(
@@ -628,7 +636,11 @@ impl<'m> Checker<'m> {
 				);
 			}
 		}
-		(params, ret)
+		let start = if namespaced { 0 } else { generics_len };
+		let type_arguments = (start..generics_len + own)
+			.map(|index| subst[&ParamIdx(index as u32)])
+			.collect();
+		(params, ret, type_arguments)
 	}
 
 	// ── Return-type generalisation ───────────────────────────────────────────

@@ -190,6 +190,11 @@ pub enum LoweredHirFragment {
 		owner: DefinitionId,
 		method: HirMethod,
 	},
+	RuntimeTypeAttachment {
+		object: HirExpr,
+		function: Option<HirFunc>,
+		method: HirMethod,
+	},
 	MaterializedDefault {
 		owner: DefinitionId,
 		implementation: DefinitionId,
@@ -227,6 +232,10 @@ pub enum StableModuleAssemblyError {
 	Lowering(StableLoweringError),
 	DuplicateAttachment {
 		owner: DefinitionId,
+		name: EcoString,
+	},
+	DuplicateRuntimeTypeAttachment {
+		object: EcoString,
 		name: EcoString,
 	},
 	MissingOwnerShell {
@@ -553,6 +562,7 @@ pub fn lower_runtime_definition(
 				implementation_member
 					.as_ref()
 					.map(|(_, member)| member.kind),
+				&[],
 			)?
 		}
 		crate::RuntimePayload::MaterializedInterfaceMember {
@@ -651,8 +661,12 @@ pub fn lower_runtime_definition(
 				Some(&implementation_shape.self_type),
 				Some(&implementation_shape.member_slots),
 				Some(member_shape.kind),
+				&implementation_shape.interface_argument_bindings,
 			)?;
-			if matches!(lowered, LoweredHirFragment::TopLevelFunction(_)) {
+			if matches!(
+				lowered,
+				LoweredHirFragment::TopLevelFunction(_) | LoweredHirFragment::RuntimeTypeAttachment { .. }
+			) {
 				lowered
 			} else {
 				let method = fragment_method(lowered)?;
@@ -909,7 +923,10 @@ fn runtime_assembly_placement(
 		| Fragment::TopLevelValue(_)
 		| Fragment::TopLevelExternal { .. }
 		| Fragment::StructShell(_)
-		| Fragment::EnumShell(_) => Ok(RuntimeAssemblyPlacement::Module(definition.module.clone())),
+		| Fragment::EnumShell(_)
+		| Fragment::RuntimeTypeAttachment { .. } => {
+			Ok(RuntimeAssemblyPlacement::Module(definition.module.clone()))
+		}
 		Fragment::MaterializedDefault { implementation, .. } => {
 			attachment_shell(context, definition, implementation)
 		}
@@ -1056,7 +1073,8 @@ fn stable_runtime_tag(ty: &InterfaceType) -> Option<EcoString> {
 		InterfaceType::String => "string",
 		InterfaceType::Boolean => "bool",
 		InterfaceType::Void => "void",
-		InterfaceType::List(_) | InterfaceType::Tuple(_) => "list",
+		InterfaceType::List(_) => "list",
+		InterfaceType::Tuple(_) => "tuple",
 		InterfaceType::Map(..) => "map",
 		InterfaceType::Mutable(inner) => {
 			return stable_runtime_tag(inner)
@@ -1065,6 +1083,43 @@ fn stable_runtime_tag(ty: &InterfaceType) -> Option<EcoString> {
 		_ => return None,
 	};
 	Some(EcoString::from(format!("nymph.{tag}")))
+}
+
+fn primitive_box_binding(tag: EcoString) -> Option<&'static str> {
+	match tag.as_str().strip_prefix("nymph.").unwrap_or(tag.as_str()) {
+		"int" => Some("NInt"),
+		"uint" => Some("NUint"),
+		"float" => Some("NFloat"),
+		"char" => Some("NChar"),
+		"bool" | "boolean" => Some("NBool"),
+		"string" => Some("NString"),
+		"list" => Some("NList"),
+		"tuple" => Some("NTuple"),
+		"map" => Some("NMap"),
+		_ => None,
+	}
+}
+
+fn is_concrete_runtime_type(ty: &InterfaceType) -> bool {
+	match ty {
+		InterfaceType::Generic(_) => false,
+		InterfaceType::List(argument) | InterfaceType::Mutable(argument) => {
+			is_concrete_runtime_type(argument)
+		}
+		InterfaceType::Tuple(arguments) => arguments.iter().all(is_concrete_runtime_type),
+		InterfaceType::Map(key, value) => {
+			is_concrete_runtime_type(key) && is_concrete_runtime_type(value)
+		}
+		InterfaceType::Named {
+			positional, named, ..
+		} => {
+			positional.iter().all(is_concrete_runtime_type)
+				&& named
+					.iter()
+					.all(|(_, argument)| is_concrete_runtime_type(argument))
+		}
+		_ => true,
+	}
 }
 
 fn substitute_self_type(ty: &InterfaceType, self_type: &InterfaceType) -> InterfaceType {
@@ -1116,6 +1171,137 @@ fn substitute_self_type(ty: &InterfaceType, self_type: &InterfaceType) -> Interf
 		),
 		InterfaceType::Mutable(inner) => {
 			InterfaceType::Mutable(Box::new(substitute_self_type(inner, self_type)))
+		}
+		_ => ty.clone(),
+	}
+}
+
+fn owner_parameter_path(
+	type_: &InterfaceType,
+	parameter: &crate::GenericParameterId,
+) -> Option<Vec<usize>> {
+	fn visit(
+		type_: &InterfaceType,
+		parameter: &crate::GenericParameterId,
+		path: &mut Vec<usize>,
+	) -> bool {
+		match type_ {
+			InterfaceType::Generic(candidate) => candidate == parameter,
+			InterfaceType::List(argument) => {
+				path.push(0);
+				if visit(argument, parameter, path) {
+					true
+				} else {
+					path.pop();
+					false
+				}
+			}
+			InterfaceType::Tuple(arguments) => arguments.iter().enumerate().any(|(index, argument)| {
+				path.push(index);
+				if visit(argument, parameter, path) {
+					true
+				} else {
+					path.pop();
+					false
+				}
+			}),
+			InterfaceType::Map(key, value) => {
+				[key.as_ref(), value.as_ref()]
+					.into_iter()
+					.enumerate()
+					.any(|(index, argument)| {
+						path.push(index);
+						if visit(argument, parameter, path) {
+							true
+						} else {
+							path.pop();
+							false
+						}
+					})
+			}
+			InterfaceType::Named {
+				positional, named, ..
+			} => positional
+				.iter()
+				.chain(named.iter().map(|(_, argument)| argument))
+				.enumerate()
+				.any(|(index, argument)| {
+					path.push(index);
+					if visit(argument, parameter, path) {
+						true
+					} else {
+						path.pop();
+						false
+					}
+				}),
+			InterfaceType::Mutable(argument) => visit(argument, parameter, path),
+			_ => false,
+		}
+	}
+	let mut path = Vec::new();
+	visit(type_, parameter, &mut path).then_some(path)
+}
+
+fn substitute_type_parameters(
+	ty: &InterfaceType,
+	substitutions: &[(crate::GenericParameterId, InterfaceType)],
+) -> InterfaceType {
+	match ty {
+		InterfaceType::Generic(parameter) => substitutions
+			.iter()
+			.find_map(|(candidate, ty)| (candidate == parameter).then(|| ty.clone()))
+			.unwrap_or_else(|| ty.clone()),
+		InterfaceType::List(inner) => {
+			InterfaceType::List(Box::new(substitute_type_parameters(inner, substitutions)))
+		}
+		InterfaceType::Tuple(items) => InterfaceType::Tuple(
+			items
+				.iter()
+				.map(|item| substitute_type_parameters(item, substitutions))
+				.collect(),
+		),
+		InterfaceType::Map(key, value) => InterfaceType::Map(
+			Box::new(substitute_type_parameters(key, substitutions)),
+			Box::new(substitute_type_parameters(value, substitutions)),
+		),
+		InterfaceType::Function {
+			parameters,
+			return_type,
+		} => InterfaceType::Function {
+			parameters: parameters
+				.iter()
+				.map(|parameter| substitute_type_parameters(parameter, substitutions))
+				.collect(),
+			return_type: Box::new(substitute_type_parameters(return_type, substitutions)),
+		},
+		InterfaceType::Named {
+			definition,
+			positional,
+			named,
+		} => InterfaceType::Named {
+			definition: definition.clone(),
+			positional: positional
+				.iter()
+				.map(|argument| substitute_type_parameters(argument, substitutions))
+				.collect(),
+			named: named
+				.iter()
+				.map(|(name, argument)| {
+					(
+						name.clone(),
+						substitute_type_parameters(argument, substitutions),
+					)
+				})
+				.collect(),
+		},
+		InterfaceType::Intersection(items) => InterfaceType::Intersection(
+			items
+				.iter()
+				.map(|item| substitute_type_parameters(item, substitutions))
+				.collect(),
+		),
+		InterfaceType::Mutable(inner) => {
+			InterfaceType::Mutable(Box::new(substitute_type_parameters(inner, substitutions)))
 		}
 		_ => ty.clone(),
 	}
@@ -1530,6 +1716,7 @@ fn lower_body(
 	self_type: Option<&InterfaceType>,
 	implementation_slots: Option<&crate::ImplementationMemberCatalog>,
 	member_kind: Option<crate::MemberKind>,
+	type_substitutions: &[(crate::GenericParameterId, InterfaceType)],
 ) -> Result<LoweredHirFragment, StableLoweringError> {
 	let is_function = body.kind != crate::RuntimeBodyKind::Value;
 	let stable = &body.stable;
@@ -1539,7 +1726,46 @@ fn lower_body(
 		}
 		crate::RuntimePlacement::TopLevel => false,
 	};
-	let has_receiver = shellless_implementation
+	let exact_shellless_implementation = if shellless_implementation {
+		let crate::RuntimePlacement::Attached { owner, .. } = &artifact.placement else {
+			unreachable!()
+		};
+		let request = StableShapeRequest::Implementation(owner.clone());
+		let StableShapeFact::Implementation(implementation) = context.stable_shape(&request)? else {
+			return Err(StableShapeLookupError::WrongFact { request }.into());
+		};
+		implementation.binders.is_empty()
+	} else {
+		false
+	};
+	let exact_parameterized_implementation = if let (
+		Some(InterfaceType::Named {
+			positional, named, ..
+		}),
+		crate::RuntimePlacement::Attached { owner, .. },
+	) = (self_type, &artifact.placement)
+	{
+		if (!positional.is_empty() || !named.is_empty())
+			&& is_concrete_runtime_type(self_type.expect("checked self type"))
+			&& matches!(owner.key, crate::DeclarationKey::Implementation { .. })
+		{
+			let request = StableShapeRequest::Implementation(owner.clone());
+			let StableShapeFact::Implementation(implementation) = context.stable_shape(&request)? else {
+				return Err(StableShapeLookupError::WrongFact { request }.into());
+			};
+			implementation.binders.is_empty()
+		} else {
+			false
+		}
+	} else {
+		false
+	};
+	let instance_member = body.kind == crate::RuntimeBodyKind::InstanceFunction
+		&& matches!(
+			artifact.definition.key,
+			crate::DeclarationKey::Member { .. }
+		);
+	let has_receiver = (shellless_implementation
 		&& matches!(
 			member_kind,
 			Some(
@@ -1548,11 +1774,26 @@ fn lower_body(
 					| crate::MemberKind::Value
 					| crate::MemberKind::MutableValue
 			)
-		);
+		)) || (exact_parameterized_implementation && instance_member);
+	let type_parameters = body
+		.type_parameters
+		.iter()
+		.filter(|parameter| {
+			(!instance_member || parameter.binder.scope == crate::BinderScope::Member)
+				&& !type_substitutions
+					.iter()
+					.any(|(candidate, _)| candidate == *parameter)
+		})
+		.cloned()
+		.collect::<Vec<_>>();
 	let lowerer = StableBodyLowerer {
 		context,
 		artifact,
 		annotations: &body.annotations,
+		type_parameters: &type_parameters,
+		all_type_parameters: &body.type_parameters,
+		instance_member,
+		type_substitutions,
 		scopes: RefCell::new(vec![HashMap::new()]),
 		counters: RefCell::new(HashMap::new()),
 		pattern_declaration_records: RefCell::new(vec![]),
@@ -1582,18 +1823,54 @@ fn lower_body(
 			.map(|param| pattern_name(&param.pattern).map(|name| lowerer.declare(name)))
 			.collect::<Result<Vec<_>, StableLoweringError>>()?;
 		let lowered_body = lowerer.lower_function_body(&stable.root)?;
+		let hidden = (0..type_parameters.len()).map(|index| EcoString::from(format!("$type${index}")));
 		let function = HirFunc {
 			name: emitted.clone(),
 			params: if has_receiver {
 				std::iter::once(EcoString::from("$self"))
 					.chain(params.iter().cloned())
+					.chain(hidden)
 					.collect()
 			} else {
-				params.clone()
+				params.iter().cloned().chain(hidden).collect()
 			},
 			body: lowered_body.clone(),
 		};
 		if shellless_implementation {
+			if self_type
+				.filter(|ty| is_concrete_runtime_type(ty))
+				.and_then(stable_runtime_tag)
+				.and_then(primitive_box_binding)
+				.is_some()
+				&& exact_shellless_implementation
+			{
+				let hidden_params = (0..type_parameters.len())
+					.map(|index| EcoString::from(format!("$type${index}")))
+					.collect::<Vec<_>>();
+				let method_args = params
+					.iter()
+					.chain(&hidden_params)
+					.cloned()
+					.map(HirExpr::Local)
+					.collect::<Vec<_>>();
+				let forwarded_args = has_receiver
+					.then_some(HirExpr::Undefined)
+					.into_iter()
+					.chain(method_args)
+					.collect();
+				return Ok(LoweredHirFragment::RuntimeTypeAttachment {
+					object: lowerer.runtime_type_object(self_type.expect("primitive self type"))?,
+					function: Some(function.clone()),
+					method: HirMethod {
+						name: context.member_name(&artifact.definition)?.as_str().into(),
+						params: params.into_iter().chain(hidden_params).collect(),
+						body: HirExpr::Call {
+							callee: Box::new(HirExpr::Local(emitted)),
+							args: forwarded_args,
+						},
+					},
+				});
+			}
 			return Ok(LoweredHirFragment::TopLevelFunction(function));
 		}
 		match &artifact.placement {
@@ -1602,9 +1879,51 @@ fn lower_body(
 				let name = context.member_name(&artifact.definition)?.as_str().into();
 				let method = HirMethod {
 					name,
-					params,
+					params: params
+						.iter()
+						.cloned()
+						.chain(
+							(0..type_parameters.len()).map(|index| EcoString::from(format!("$type${index}"))),
+						)
+						.collect(),
 					body: lowered_body,
 				};
+				if let Some(InterfaceType::Named {
+					positional, named, ..
+				}) = self_type
+					&& (!positional.is_empty() || !named.is_empty())
+					&& is_concrete_runtime_type(self_type.expect("checked self type"))
+					&& matches!(owner.key, crate::DeclarationKey::Implementation { .. })
+				{
+					let request = StableShapeRequest::Implementation(owner.clone());
+					let StableShapeFact::Implementation(implementation) = context.stable_shape(&request)?
+					else {
+						return Err(StableShapeLookupError::WrongFact { request }.into());
+					};
+					if implementation.binders.is_empty() {
+						let hidden_params = (0..type_parameters.len())
+							.map(|index| EcoString::from(format!("$type${index}")))
+							.collect::<Vec<_>>();
+						let method_params = method.params.clone();
+						let forwarded = has_receiver
+							.then_some(HirExpr::This)
+							.into_iter()
+							.chain(method_params.iter().cloned().map(HirExpr::Local))
+							.collect();
+						return Ok(LoweredHirFragment::RuntimeTypeAttachment {
+							object: lowerer.runtime_type_object(self_type.expect("checked self type"))?,
+							function: Some(function),
+							method: HirMethod {
+								name: method.name,
+								params: params.into_iter().chain(hidden_params).collect(),
+								body: HirExpr::Call {
+									callee: Box::new(HirExpr::Local(emitted)),
+									args: forwarded,
+								},
+							},
+						});
+					}
+				}
 				if body.kind == crate::RuntimeBodyKind::StaticFunction {
 					Ok(LoweredHirFragment::AttachedStatic {
 						owner: owner.clone(),
@@ -1682,6 +2001,10 @@ struct StableBodyLowerer<'a, C> {
 	context: &'a C,
 	artifact: &'a RuntimeDefinition,
 	annotations: &'a crate::RuntimeAnnotations,
+	type_parameters: &'a [crate::GenericParameterId],
+	all_type_parameters: &'a [crate::GenericParameterId],
+	instance_member: bool,
+	type_substitutions: &'a [(crate::GenericParameterId, InterfaceType)],
 	scopes: RefCell<Vec<HashMap<EcoString, EcoString>>>,
 	counters: RefCell<HashMap<EcoString, u32>>,
 	pattern_declaration_records: RefCell<Vec<HashMap<EcoString, EcoString>>>,
@@ -1908,10 +2231,11 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				node,
 				channel: "type".into(),
 			})?;
-		Ok(self.self_type.map_or_else(
+		let ty = self.self_type.map_or_else(
 			|| ty.clone(),
 			|self_type| substitute_self_type(ty, self_type),
-		))
+		);
+		Ok(substitute_type_parameters(&ty, self.type_substitutions))
 	}
 	/// Whether this checked expression cannot complete normally. An anonymous
 	/// closure annotation turns the underlying expression into a callable value,
@@ -2174,6 +2498,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							.member_name(&variant.variant_definition)?
 							.as_str()
 							.into(),
+						prototype: self.construction_prototype(expr)?,
 					});
 				}
 				if let Some(target) = self.target(expr) {
@@ -2224,18 +2549,21 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				.clone()
 				.map(HirExpr::Local)
 				.unwrap_or(HirExpr::This),
-			StableExprKind::Grouped(inner) => self.lower(inner)?,
+			StableExprKind::Grouped(inner) => {
+				let lowered = self.lower(inner)?;
+				self.append_hidden_arguments(self.id(expr), lowered)?
+			}
 			StableExprKind::List(items) | StableExprKind::Tuple(items) => {
 				let kind = if matches!(expr.kind, StableExprKind::List(_)) {
 					HirArrayKind::List
 				} else {
 					HirArrayKind::Tuple
 				};
-				if items
+				let value = if items
 					.iter()
 					.any(|item| matches!(*item, StableListItem::Spread(_)))
 				{
-					return Ok(HirExpr::ArraySpread {
+					HirExpr::ArraySpread {
 						kind,
 						elems: items
 							.iter()
@@ -2244,25 +2572,33 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 								StableListItem::Spread(value) => self.lower_spread(value).map(HirArrayElem::Spread),
 							})
 							.collect::<Result<_, _>>()?,
-					});
-				}
-				HirExpr::Array {
-					kind,
-					items: items
-						.iter()
-						.map(|item| match item {
-							StableListItem::Expr(item) => self.lower(item),
-							_ => unreachable!(),
-						})
-						.collect::<Result<_, _>>()?,
+					}
+				} else {
+					HirExpr::Array {
+						kind,
+						items: items
+							.iter()
+							.map(|item| match item {
+								StableListItem::Expr(item) => self.lower(item),
+								_ => unreachable!(),
+							})
+							.collect::<Result<_, _>>()?,
+					}
+				};
+				match self.construction_prototype(expr)? {
+					Some(prototype) => HirExpr::WithPrototype {
+						value: Box::new(value),
+						prototype,
+					},
+					None => value,
 				}
 			}
 			StableExprKind::Map(entries) => {
-				if entries
+				let value = if entries
 					.iter()
 					.any(|entry| matches!(*entry, StableMapEntry::Spread(_)))
 				{
-					return Ok(HirExpr::MapSpread(
+					HirExpr::MapSpread(
 						entries
 							.iter()
 							.map(|entry| match entry {
@@ -2272,17 +2608,25 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 								StableMapEntry::Spread(value) => self.lower_spread(value).map(HirMapElem::Spread),
 							})
 							.collect::<Result<_, StableLoweringError>>()?,
-					));
+					)
+				} else {
+					HirExpr::MapLit(
+						entries
+							.iter()
+							.map(|entry| match entry {
+								StableMapEntry::Entry(key, value) => Ok((self.lower(key)?, self.lower(value)?)),
+								_ => unreachable!(),
+							})
+							.collect::<Result<_, StableLoweringError>>()?,
+					)
+				};
+				match self.construction_prototype(expr)? {
+					Some(prototype) => HirExpr::WithPrototype {
+						value: Box::new(value),
+						prototype,
+					},
+					None => value,
 				}
-				HirExpr::MapLit(
-					entries
-						.iter()
-						.map(|entry| match entry {
-							StableMapEntry::Entry(key, value) => Ok((self.lower(key)?, self.lower(value)?)),
-							_ => unreachable!(),
-						})
-						.collect::<Result<_, StableLoweringError>>()?,
-				)
 			}
 			StableExprKind::MemberAccess {
 				parent,
@@ -2313,6 +2657,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							.member_name(&variant.variant_definition)?
 							.as_str()
 							.into(),
+						prototype: self.construction_prototype(expr)?,
 					});
 				}
 				if self
@@ -2352,6 +2697,16 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 										&self.artifact.definition,
 										"static member owner disagrees with its exact implementation shape",
 									));
+								}
+								if implementation.binders.is_empty()
+									&& is_concrete_runtime_type(&implementation.self_type)
+									&& matches!(&implementation.self_type, InterfaceType::Named { positional, named, .. } if !positional.is_empty() || !named.is_empty())
+								{
+									self.demand_external(target)?;
+									return Ok(HirExpr::Field {
+										recv: Box::new(self.runtime_type_object(&implementation.self_type)?),
+										name: self.context.member_name(target)?.as_str().into(),
+									});
 								}
 								nominal_attachment_shell(&implementation.self_type).cloned()
 							}
@@ -2421,6 +2776,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							.as_str()
 							.into(),
 						fields,
+						prototype: self.construction_prototype(expr)?,
 					});
 				}
 				if let Some(target) = self.target(func)
@@ -2475,6 +2831,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							tail: Some(Box::new(HirExpr::New {
 								class: self.context.binding_name(target)?.as_str().into(),
 								fields,
+								prototype: self.construction_prototype(expr)?,
 							})),
 						});
 					}
@@ -2486,18 +2843,106 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						.iter()
 						.find(|(id, _)| *id == self.id(expr))
 				{
-					return self.lower_dispatch(
+					let mut lowered = self.lower_dispatch(
 						dispatch,
 						parent,
 						args.iter().map(|arg| &arg.value).collect(),
-					);
+					)?;
+					if let Some((_, hidden)) = self
+						.annotations
+						.generic_call_arguments
+						.iter()
+						.find(|(id, _)| *id == self.id(expr))
+					{
+						let target = match &mut lowered {
+							HirExpr::Call { args, .. } => args,
+							HirExpr::BoundDispatch {
+								hidden_arguments, ..
+							}
+							| HirExpr::UnaryBoundDispatch {
+								hidden_arguments, ..
+							} => hidden_arguments,
+							_ => return Ok(lowered),
+						};
+						let required_hidden = self
+							.annotations
+							.generic_call_targets
+							.iter()
+							.find_map(|(id, target)| (*id == self.id(expr)).then_some(target))
+							.map(|target| self.required_receiverless_slots(target))
+							.transpose()?
+							.unwrap_or_default();
+						for (index, argument) in hidden.iter().enumerate() {
+							if matches!(argument, crate::runtime::RuntimeTypeArgument::Erased)
+								&& required_hidden.contains(&index)
+							{
+								return Err(StableLoweringError::Unsupported {
+									definition: self.artifact.definition.clone(),
+									node: Some(self.id(expr)),
+									feature: "erased runtime type argument required by receiverless dispatch".into(),
+								});
+							}
+							target.push(match argument {
+								crate::runtime::RuntimeTypeArgument::Canonical(type_) => {
+									self.runtime_type_object(type_)?
+								}
+								crate::runtime::RuntimeTypeArgument::Erased => HirExpr::Undefined,
+							});
+						}
+					}
+					return Ok(lowered);
 				}
-				if self
+				if let Some((_, parameter, interface, member_definition)) = self
 					.annotations
 					.generic_namespaced_calls
-					.contains(&self.id(expr))
+					.iter()
+					.find(|(id, ..)| *id == self.id(expr))
+					&& let StableExprKind::MemberAccess { member, .. } = &func.kind
 				{
-					return Err(self.unsupported(expr, "namespaced call through a generic type parameter"));
+					self.demand_receiverless_implementations(interface, member_definition)?;
+					let mut lowered_args = args
+						.iter()
+						.map(|arg| self.lower(&arg.value))
+						.collect::<Result<Vec<_>, _>>()?;
+					if let Some((_, hidden)) = self
+						.annotations
+						.generic_call_arguments
+						.iter()
+						.find(|(id, _)| *id == self.id(expr))
+					{
+						for argument in hidden.iter() {
+							lowered_args.push(match argument {
+								crate::runtime::RuntimeTypeArgument::Canonical(type_) => {
+									self.runtime_type_object(type_)?
+								}
+								crate::runtime::RuntimeTypeArgument::Erased => {
+									return Err(StableLoweringError::Unsupported {
+										definition: self.artifact.definition.clone(),
+										node: Some(self.id(expr)),
+										feature: "erased runtime type argument required by receiverless dispatch"
+											.into(),
+									});
+								}
+							});
+						}
+					}
+					let parameter = self
+						.all_type_parameters
+						.get(*parameter as usize)
+						.ok_or_else(|| {
+							invalid(
+								&self.artifact.definition,
+								"receiverless generic slot is out of bounds",
+							)
+						})?;
+					let receiver = self.runtime_type_object(&InterfaceType::Generic(parameter.clone()))?;
+					return Ok(HirExpr::Call {
+						callee: Box::new(HirExpr::Field {
+							recv: Box::new(receiver),
+							name: member.clone(),
+						}),
+						args: lowered_args,
+					});
 				}
 				if let Some(target) = self.target(func) {
 					let target_artifact = self.context.runtime_definition(target)?;
@@ -2522,12 +2967,42 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				} else {
 					self.record_unresolved_call(UnresolvedRuntimeCall::DynamicCallee);
 				}
+				let mut lowered_args = args
+					.iter()
+					.map(|arg| self.lower(&arg.value))
+					.collect::<Result<Vec<_>, _>>()?;
+				let required_hidden = self
+					.target(func)
+					.map(|target| self.required_receiverless_slots(target))
+					.transpose()?
+					.unwrap_or_default();
+				if let Some((_, hidden)) = self
+					.annotations
+					.generic_call_arguments
+					.iter()
+					.find(|(id, _)| *id == self.id(expr))
+				{
+					for (index, argument) in hidden.iter().enumerate() {
+						if matches!(argument, crate::runtime::RuntimeTypeArgument::Erased)
+							&& required_hidden.contains(&index)
+						{
+							return Err(StableLoweringError::Unsupported {
+								definition: self.artifact.definition.clone(),
+								node: Some(self.id(expr)),
+								feature: "erased runtime type argument required by receiverless dispatch".into(),
+							});
+						}
+						lowered_args.push(match argument {
+							crate::runtime::RuntimeTypeArgument::Canonical(type_) => {
+								self.runtime_type_object(type_)?
+							}
+							crate::runtime::RuntimeTypeArgument::Erased => HirExpr::Undefined,
+						});
+					}
+				}
 				HirExpr::Call {
 					callee: Box::new(self.lower(func)?),
-					args: args
-						.iter()
-						.map(|arg| self.lower(&arg.value))
-						.collect::<Result<_, _>>()?,
+					args: lowered_args,
 				}
 			}
 			StableExprKind::BinaryOp { lhs, op, rhs } => {
@@ -2553,18 +3028,29 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					self.scopes.borrow_mut().push(HashMap::new());
 					let lhs_name = self.declare(&EcoString::from("$pipe"));
 					let lhs = self.lower(lhs)?;
-					let rhs = self.lower(rhs)?;
+					let lowered_rhs = self.lower(rhs)?;
 					self.scopes.borrow_mut().pop();
+					let call_args = vec![HirExpr::Local(lhs_name.clone())];
+					let mut metadata_source = rhs;
+					while let StableExprKind::Grouped(inner) = &metadata_source.kind {
+						metadata_source = inner;
+					}
+					let call = HirExpr::Call {
+						callee: Box::new(lowered_rhs),
+						args: call_args,
+					};
+					let call = if matches!(metadata_source.kind, StableExprKind::Call { .. }) {
+						call
+					} else {
+						self.append_hidden_arguments(self.id(rhs), call)?
+					};
 					return Ok(HirExpr::Block {
 						stmts: vec![HirStmt::Let {
 							name: lhs_name.clone(),
 							mutable: false,
 							value: lhs,
 						}],
-						tail: Some(Box::new(HirExpr::Call {
-							callee: Box::new(rhs),
-							args: vec![HirExpr::Local(lhs_name)],
-						})),
+						tail: Some(Box::new(call)),
 					});
 				}
 				if matches!(op, BinaryOperator::Equals | BinaryOperator::NotEquals)
@@ -2830,6 +3316,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				HirExpr::New {
 					class: self.context.binding_name(definition)?.as_str().into(),
 					fields,
+					prototype: self.construction_prototype(expr)?,
 				}
 			}
 			StableExprKind::Match { value, arms } => HirExpr::Match {
@@ -3696,6 +4183,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				interface: interface_shape.name,
 				method,
 				receiver: Box::new(self.lower(receiver)?),
+				hidden_arguments: vec![],
 				cases,
 			})
 		} else {
@@ -3704,6 +4192,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				method,
 				receiver: Box::new(self.lower(receiver)?),
 				argument: Box::new(self.lower(arguments[0])?),
+				hidden_arguments: vec![],
 				cases,
 			})
 		}
@@ -4044,6 +4533,509 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		self.demands.borrow_mut().insert(definition.clone());
 		self.direct_demands.borrow_mut().insert(definition.clone());
 	}
+
+	fn runtime_type_object(&self, type_: &InterfaceType) -> Result<HirExpr, StableLoweringError> {
+		let resolved = substitute_type_parameters(type_, self.type_substitutions);
+		let type_ = &resolved;
+		let (binding, box_runtime, is_enum, argument_types): (
+			EcoString,
+			bool,
+			bool,
+			Vec<&InterfaceType>,
+		) = match type_ {
+			InterfaceType::Int => ("NInt".into(), true, false, vec![]),
+			InterfaceType::UInt => ("NUint".into(), true, false, vec![]),
+			InterfaceType::Float => ("NFloat".into(), true, false, vec![]),
+			InterfaceType::Char => ("NChar".into(), true, false, vec![]),
+			InterfaceType::String => ("NString".into(), true, false, vec![]),
+			InterfaceType::Boolean => ("NBool".into(), true, false, vec![]),
+			InterfaceType::List(argument) => ("NList".into(), true, false, vec![argument.as_ref()]),
+			InterfaceType::Tuple(arguments) => ("NTuple".into(), true, false, arguments.iter().collect()),
+			InterfaceType::Map(key, value) => ("NMap".into(), true, false, vec![key, value]),
+			InterfaceType::Mutable(inner) => return self.runtime_type_object(inner),
+			InterfaceType::SelfType => {
+				let receiver = self
+					.receiver_binding
+					.clone()
+					.map(HirExpr::Local)
+					.unwrap_or(HirExpr::This);
+				return Ok(HirExpr::RuntimeTypeProjection {
+					receiver: Box::new(receiver),
+					path: vec![],
+				});
+			}
+			InterfaceType::Generic(parameter) => {
+				if let Some(index) = self
+					.type_parameters
+					.iter()
+					.position(|candidate| candidate == parameter)
+				{
+					return Ok(HirExpr::Local(EcoString::from(format!("$type${index}"))));
+				}
+				if let Some(path) = self
+					.self_type
+					.and_then(|type_| owner_parameter_path(type_, parameter))
+				{
+					let receiver = self
+						.receiver_binding
+						.clone()
+						.map(HirExpr::Local)
+						.unwrap_or(HirExpr::This);
+					return Ok(HirExpr::RuntimeTypeProjection {
+						receiver: Box::new(receiver),
+						path,
+					});
+				}
+				if self.instance_member
+					&& let Some(index) = self
+						.all_type_parameters
+						.iter()
+						.filter(|parameter| parameter.binder.scope != crate::BinderScope::Member)
+						.position(|candidate| candidate == parameter)
+				{
+					let receiver = self
+						.receiver_binding
+						.clone()
+						.map(HirExpr::Local)
+						.unwrap_or(HirExpr::This);
+					return Ok(HirExpr::RuntimeTypeProjection {
+						receiver: Box::new(receiver),
+						path: vec![index],
+					});
+				}
+				return Err(StableLoweringError::Unsupported {
+					definition: self.artifact.definition.clone(),
+					node: None,
+					feature: "unbound hidden generic type object".into(),
+				});
+			}
+			InterfaceType::Named {
+				definition,
+				positional,
+				named,
+			} => {
+				self.demand_direct(definition);
+				let artifact = self.context.runtime_definition(definition)?;
+				let arguments = positional
+					.iter()
+					.chain(named.iter().map(|(_, argument)| argument))
+					.collect();
+				(
+					self.context.binding_name(definition)?.as_str().into(),
+					false,
+					matches!(artifact.payload, crate::RuntimePayload::Enum(_)),
+					arguments,
+				)
+			}
+			_ => {
+				return Err(StableLoweringError::Unsupported {
+					definition: self.artifact.definition.clone(),
+					node: None,
+					feature: format!("runtime type object for non-runtime type {type_:?}").into(),
+				});
+			}
+		};
+		let arguments = argument_types
+			.into_iter()
+			.map(|argument| self.runtime_type_object(argument))
+			.collect::<Result<_, _>>()?;
+		Ok(HirExpr::RuntimeTypeObject {
+			binding,
+			box_runtime,
+			is_enum,
+			arguments,
+		})
+	}
+
+	fn construction_prototype(
+		&self,
+		expr: &StableExpr,
+	) -> Result<Option<Box<HirExpr>>, StableLoweringError> {
+		let arguments = self
+			.annotations
+			.generic_call_arguments
+			.iter()
+			.find_map(|(id, arguments)| (*id == self.id(expr)).then_some(arguments));
+		let target = self
+			.annotations
+			.generic_call_targets
+			.iter()
+			.find_map(|(id, target)| (*id == self.id(expr)).then_some(target));
+		if let (Some(arguments), Some(target)) = (arguments, target)
+			&& matches!(
+				self.context.runtime_definition(target)?.payload,
+				crate::RuntimePayload::Struct(_)
+			) {
+			let arguments = arguments
+				.iter()
+				.map(|argument| match argument {
+					crate::runtime::RuntimeTypeArgument::Canonical(type_) => {
+						self.runtime_type_object(type_).map(Some)
+					}
+					crate::runtime::RuntimeTypeArgument::Erased => Ok(None),
+				})
+				.collect::<Result<Option<Vec<_>>, _>>()?;
+			if let Some(arguments) = arguments {
+				return Ok(Some(Box::new(HirExpr::RuntimeTypeObject {
+					binding: self.context.binding_name(target)?.as_str().into(),
+					box_runtime: false,
+					is_enum: false,
+					arguments,
+				})));
+			}
+		}
+		let annotated = self
+			.annotations
+			.types
+			.iter()
+			.find_map(|(id, type_)| (*id == self.id(expr)).then_some(type_));
+		let Some(type_) = annotated else {
+			return Ok(None);
+		};
+		let type_ = substitute_type_parameters(type_, self.type_substitutions);
+		if matches!(&type_, InterfaceType::Named { definition, .. } if self.annotations.option.as_ref().is_some_and(|option| &option.option == definition))
+		{
+			// Host/runtime Option producers share the canonical enum prototype.
+			// Keep source constructors on that ABI rather than creating a child
+			// identity which external Option values cannot carry.
+			return Ok(None);
+		}
+		let parameterized = match &type_ {
+			InterfaceType::Named {
+				positional, named, ..
+			} => !positional.is_empty() || !named.is_empty(),
+			InterfaceType::List(_) | InterfaceType::Map(_, _) => true,
+			InterfaceType::Tuple(arguments) => !arguments.is_empty(),
+			_ => false,
+		};
+		parameterized
+			.then(|| self.runtime_type_object(&type_).map(Box::new))
+			.transpose()
+	}
+
+	fn demand_receiverless_implementations(
+		&self,
+		interface: &DefinitionId,
+		member: &DefinitionId,
+	) -> Result<(), StableLoweringError> {
+		let request = StableShapeRequest::ImplementationsForInterface(interface.clone());
+		let StableShapeFact::Implementations(implementations) = self.context.stable_shape(&request)?
+		else {
+			return Err(StableShapeLookupError::WrongFact { request }.into());
+		};
+		let mut skipped_matching_slot = false;
+		let mut demanded_exact_slot = false;
+		for implementation in implementations {
+			// #15 owns blanket/generic implementation body emission. #14 only
+			// installs exact concrete implementation members on canonical objects.
+			if !implementation.binders.is_empty()
+				|| matches!(implementation.self_type, InterfaceType::Generic(_))
+			{
+				skipped_matching_slot |= implementation.member_slots.target(member).is_some();
+				continue;
+			}
+			if let Some(slot) = implementation.member_slots.target(member) {
+				self.demand_direct(&slot.member_id);
+				demanded_exact_slot = true;
+			}
+		}
+		if skipped_matching_slot && !demanded_exact_slot {
+			return Err(StableLoweringError::Unsupported {
+				definition: self.artifact.definition.clone(),
+				node: None,
+				feature: "receiverless dispatch is reachable only through a generic implementation whose emission belongs to #15".into(),
+			});
+		}
+		Ok(())
+	}
+
+	fn demand_concrete_receiverless_implementation(
+		&self,
+		type_: &InterfaceType,
+		interface: &DefinitionId,
+		member: &DefinitionId,
+	) -> Result<(), StableLoweringError> {
+		let request = StableShapeRequest::ImplementationsForInterface(interface.clone());
+		let StableShapeFact::Implementations(implementations) = self.context.stable_shape(&request)?
+		else {
+			return Err(StableShapeLookupError::WrongFact { request }.into());
+		};
+		if let Some(slot) = implementations
+			.iter()
+			.filter(|implementation| implementation.binders.is_empty())
+			.filter(|implementation| peel_mut(&implementation.self_type) == peel_mut(type_))
+			.find_map(|implementation| implementation.member_slots.target(member))
+		{
+			self.demand_direct(&slot.member_id);
+			return Ok(());
+		}
+		if implementations.iter().any(|implementation| {
+			!implementation.binders.is_empty() && implementation.member_slots.target(member).is_some()
+		}) {
+			return Err(StableLoweringError::Unsupported {
+				definition: self.artifact.definition.clone(),
+				node: None,
+				feature: "receiverless dispatch for this concrete type requires generic implementation emission owned by #15".into(),
+			});
+		}
+		Ok(())
+	}
+
+	fn required_receiverless_slots(
+		&self,
+		definition: &DefinitionId,
+	) -> Result<std::collections::HashSet<usize>, StableLoweringError> {
+		fn visit<C: StableLoweringContext>(
+			context: &C,
+			definition: &DefinitionId,
+			visiting: &mut std::collections::HashSet<DefinitionId>,
+		) -> Result<std::collections::HashSet<usize>, StableLoweringError> {
+			if !visiting.insert(definition.clone()) {
+				return Ok(std::collections::HashSet::new());
+			}
+			let artifact = context.runtime_definition(definition)?;
+			let body = match &artifact.payload {
+				crate::RuntimePayload::NymphBody(body) => body,
+				crate::RuntimePayload::MaterializedInterfaceMember {
+					body_definition, ..
+				} => {
+					let required = visit(context, body_definition, visiting)?;
+					let body_artifact = context.runtime_definition(body_definition)?;
+					let crate::RuntimePayload::NymphBody(body) = &body_artifact.payload else {
+						return Err(invalid(
+							definition,
+							"materialized default body is not a Nymph body",
+						));
+					};
+					let crate::DeclarationKey::MaterializedInterfaceMember { implementation, .. } =
+						&definition.key
+					else {
+						return Err(invalid(
+							definition,
+							"materialized default has inconsistent identity",
+						));
+					};
+					let request = StableShapeRequest::Implementation((**implementation).clone());
+					let StableShapeFact::Implementation(implementation) = context.stable_shape(&request)?
+					else {
+						return Err(StableShapeLookupError::WrongFact { request }.into());
+					};
+					let required = body
+						.type_parameters
+						.iter()
+						.enumerate()
+						.filter(|(index, _)| required.contains(index))
+						.filter(|(_, parameter)| {
+							!implementation
+								.interface_argument_bindings
+								.iter()
+								.any(|(bound, _)| bound == *parameter)
+						})
+						.map(|(index, _)| {
+							body.type_parameters[..index]
+								.iter()
+								.filter(|parameter| {
+									!implementation
+										.interface_argument_bindings
+										.iter()
+										.any(|(bound, _)| bound == *parameter)
+								})
+								.count()
+						})
+						.collect();
+					visiting.remove(definition);
+					return Ok(required);
+				}
+				_ => {
+					visiting.remove(definition);
+					return Ok(std::collections::HashSet::new());
+				}
+			};
+			let mut required = body
+				.annotations
+				.generic_namespaced_calls
+				.iter()
+				.map(|(_, parameter, ..)| *parameter as usize)
+				.collect::<std::collections::HashSet<_>>();
+			fn collect_type_parameters(
+				type_: &InterfaceType,
+				parameters: &mut std::collections::HashSet<crate::GenericParameterId>,
+			) {
+				match type_ {
+					InterfaceType::Generic(parameter) => {
+						parameters.insert(parameter.clone());
+					}
+					InterfaceType::Named {
+						positional, named, ..
+					} => {
+						for argument in positional
+							.iter()
+							.chain(named.iter().map(|(_, value)| value))
+						{
+							collect_type_parameters(argument, parameters);
+						}
+					}
+					InterfaceType::List(argument) | InterfaceType::Mutable(argument) => {
+						collect_type_parameters(argument, parameters);
+					}
+					InterfaceType::Tuple(arguments) | InterfaceType::Intersection(arguments) => {
+						for argument in arguments {
+							collect_type_parameters(argument, parameters);
+						}
+					}
+					InterfaceType::Map(key, value) => {
+						collect_type_parameters(key, parameters);
+						collect_type_parameters(value, parameters);
+					}
+					_ => {}
+				}
+			}
+			for (_, type_) in body.annotations.types.iter() {
+				if matches!(type_, InterfaceType::Named { positional, named, .. } if !positional.is_empty() || !named.is_empty())
+				{
+					let mut parameters = std::collections::HashSet::new();
+					collect_type_parameters(type_, &mut parameters);
+					for parameter in parameters {
+						if let Some(position) = body
+							.type_parameters
+							.iter()
+							.position(|candidate| candidate == &parameter)
+						{
+							required.insert(position);
+						}
+					}
+				}
+			}
+			for (node, arguments) in body.annotations.generic_call_arguments.iter() {
+				let Some((_, target)) = body
+					.annotations
+					.generic_call_targets
+					.iter()
+					.find(|(candidate, _)| candidate == node)
+				else {
+					continue;
+				};
+				let nested = visit(context, target, visiting)?;
+				for index in nested {
+					let Some(crate::runtime::RuntimeTypeArgument::Canonical(argument)) = arguments.get(index)
+					else {
+						continue;
+					};
+					let mut parameters = std::collections::HashSet::new();
+					collect_type_parameters(argument, &mut parameters);
+					for parameter in parameters {
+						if let Some(position) = body
+							.type_parameters
+							.iter()
+							.position(|candidate| candidate == &parameter)
+						{
+							required.insert(position);
+						}
+					}
+				}
+			}
+			if body.kind != crate::RuntimeBodyKind::StaticFunction
+				&& matches!(definition.key, crate::DeclarationKey::Member { .. })
+			{
+				required = body
+					.type_parameters
+					.iter()
+					.enumerate()
+					.filter(|(index, parameter)| {
+						required.contains(index) && parameter.binder.scope == crate::BinderScope::Member
+					})
+					.map(|(index, _)| {
+						body.type_parameters[..index]
+							.iter()
+							.filter(|parameter| parameter.binder.scope == crate::BinderScope::Member)
+							.count()
+					})
+					.collect();
+			}
+			visiting.remove(definition);
+			Ok(required)
+		}
+
+		visit(
+			self.context,
+			definition,
+			&mut std::collections::HashSet::new(),
+		)
+	}
+
+	fn append_hidden_arguments(
+		&self,
+		node: crate::BodyNodeId,
+		mut lowered: HirExpr,
+	) -> Result<HirExpr, StableLoweringError> {
+		let Some((_, hidden)) = self
+			.annotations
+			.generic_call_arguments
+			.iter()
+			.find(|(id, _)| *id == node)
+		else {
+			return Ok(lowered);
+		};
+		let call_target = self
+			.annotations
+			.generic_call_targets
+			.iter()
+			.find_map(|(id, target)| (*id == node).then_some(target));
+		let required = call_target
+			.map(|target| self.required_receiverless_slots(target))
+			.transpose()?
+			.unwrap_or_default();
+		let target = match &mut lowered {
+			HirExpr::Call { args, .. } => args,
+			HirExpr::BoundDispatch {
+				hidden_arguments, ..
+			}
+			| HirExpr::UnaryBoundDispatch {
+				hidden_arguments, ..
+			} => hidden_arguments,
+			_ => return Ok(lowered),
+		};
+		if required.iter().any(|index| *index >= hidden.len()) {
+			return Err(StableLoweringError::Unsupported {
+				definition: self.artifact.definition.clone(),
+				node: Some(node),
+				feature: "missing runtime type argument required by receiverless dispatch".into(),
+			});
+		}
+		for (index, argument) in hidden.iter().enumerate() {
+			if matches!(argument, crate::runtime::RuntimeTypeArgument::Erased)
+				&& required.contains(&index)
+			{
+				return Err(StableLoweringError::Unsupported {
+					definition: self.artifact.definition.clone(),
+					node: Some(node),
+					feature: "erased runtime type argument required by receiverless dispatch".into(),
+				});
+			}
+			if required.contains(&index)
+				&& let crate::runtime::RuntimeTypeArgument::Canonical(type_) = argument
+				&& let Some(target) = call_target
+			{
+				let artifact = self.context.runtime_definition(target)?;
+				if let crate::RuntimePayload::NymphBody(body) = &artifact.payload {
+					for (_, _parameter, interface, member) in body
+						.annotations
+						.generic_namespaced_calls
+						.iter()
+						.filter(|(_, parameter, ..)| *parameter as usize == index)
+					{
+						self.demand_concrete_receiverless_implementation(type_, interface, member)?;
+					}
+				}
+			}
+			target.push(match argument {
+				crate::runtime::RuntimeTypeArgument::Canonical(type_) => self.runtime_type_object(type_)?,
+				crate::runtime::RuntimeTypeArgument::Erased => HirExpr::Undefined,
+			});
+		}
+		Ok(lowered)
+	}
+
 	fn lower_for(
 		&self,
 		source_id: crate::BodyNodeId,

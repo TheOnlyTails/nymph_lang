@@ -90,6 +90,7 @@ impl link_plan::LinkNameResolver for QueryLinkResolver<'_> {
 fn link_artifact(fragment: &nymph_sema::LoweredHirFragment) -> link_plan::LinkArtifact<'_> {
 	match fragment {
 		nymph_sema::LoweredHirFragment::TopLevelFunction(_)
+		| nymph_sema::LoweredHirFragment::RuntimeTypeAttachment { .. }
 		| nymph_sema::LoweredHirFragment::TopLevelValue(_)
 		| nymph_sema::LoweredHirFragment::StructShell(_)
 		| nymph_sema::LoweredHirFragment::EnumShell(_) => link_plan::LinkArtifact::TopLevel,
@@ -303,6 +304,7 @@ pub(crate) fn emitted_interface_project<'db>(
 			) && matches!(
 				fragment.fragment.fragment(),
 				nymph_sema::LoweredHirFragment::TopLevelFunction(_)
+					| nymph_sema::LoweredHirFragment::RuntimeTypeAttachment { .. }
 					| nymph_sema::LoweredHirFragment::TopLevelValue(_)
 					| nymph_sema::LoweredHirFragment::TopLevelExternal { .. }
 					| nymph_sema::LoweredHirFragment::StructShell(_)

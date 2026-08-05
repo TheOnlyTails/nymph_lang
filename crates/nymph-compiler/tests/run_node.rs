@@ -2445,7 +2445,7 @@ fn runs_top_level_inherent_statics_for_struct_enum_and_generics() {
 	let js = compile(src);
 	assert_eq!(js.matches("static at(").count(), 1, "{js}");
 	assert_eq!(
-		js.matches("wrap(value) {").count() + js.matches("wrap (value) {").count(),
+		js.matches("wrap(value, $type$0) {").count() + js.matches("wrap (value, $type$0) {").count(),
 		1,
 		"{js}"
 	);
@@ -3775,35 +3775,34 @@ fn real_result_ok_and_err_cross_materialize_option_from_convert_nym() {
 		}
 	"#;
 	assert_eq!(
-		run_against_real_stdlib(user, "ok_is_some(Result.Ok({ value: 5 }))"),
+		run_against_real_stdlib(
+			user,
+			"ok_is_some(Object.setPrototypeOf(Result.Ok({ value: 5 }), nymphType(Result.$nymph$type, [NInt.prototype, NString.prototype])))"
+		),
 		"true"
 	);
 	assert_eq!(
-		run_against_real_stdlib(user, "err_value(Result.Error({ error: 'boom' }))"),
+		run_against_real_stdlib(
+			user,
+			"err_value(Object.setPrototypeOf(Result.Error({ error: 'boom' }), nymphType(Result.$nymph$type, [NInt.prototype, NString.prototype])))"
+		),
 		"boom"
 	);
 }
 
 #[test]
-#[should_panic(
-	expected = "does not yet support a namespaced call through a generic type parameter"
-)]
-fn real_option_map_or_default_stays_a_loud_defer_even_on_demand() {
-	// The honest floor this slice's demand-only approach exists to preserve:
-	// `Option`'s own `map_or_default` (`option.nym`) calls `R.default()`
-	// through a still-generic type parameter, which has no compilable JS form
-	// under type erasure — demand-only lowering means this is NEVER reached
-	// merely because `Option` is referenced (the tests above never hit it),
-	// but a program that actually CALLS `map_or_default` still demands it,
-	// and still hits this same pre-existing generic-namespaced-call panic
-	// once it's lowered.
-	//
-	// `int` already implements the real stdlib's own `Default` (`default.nym`,
-	// part of the same prelude walk), so no extra declaration is needed here.
+fn real_option_map_or_default_lowers_its_hidden_canonical_type_object_dispatch() {
+	// `Option`'s own `map_or_default` (`option.nym`) calls `R.default()`.
+	// Compatibility lowering must preserve the receiverless generic dispatch
+	// and its hidden ABI. End-to-end stable-project execution is covered by
+	// `core_prelude_ambient::default_generic_bound_executes_through_the_ambient_canonical_type_object`.
 	let user = r#"
 		func get(o: Option<int>): int = o.map_or_default((x) -> x)
 	"#;
-	let _ = compile_against_real_stdlib(user);
+	let js = compile_against_real_stdlib(user);
+	assert!(js.contains("$type$0.default()"), "{js}");
+	assert!(js.contains("map_or_default(f, $type$0)"), "{js}");
+	assert!(js.contains("o.map_or_default("), "{js}");
 }
 
 #[test]
@@ -4585,4 +4584,301 @@ func invoke(callback: () -> int): Option<int> = while (true) {
 "#;
 	let stderr = run_failure(src, "invoke(() => { throw new Error('user boom') })");
 	assert!(stderr.contains("user boom"), "{stderr}");
+}
+
+#[test]
+fn receiverless_generic_calls_use_and_forward_canonical_type_objects() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl Seed for int { func seed(value: int) = value + 1 }
+
+struct Marker(value: int)
+impl Seed for Marker { func seed(value: int) = value + 10 }
+
+enum Token { Value }
+impl Seed for Token { func seed(value: int) = value + 100 }
+
+func direct<T: Seed>(marker: T, value: int): int = T.seed(value)
+func forward<U: Seed>(marker: U, value: int): int = direct(marker, value)
+func both<A: Seed, B: Seed>(a: A, b: B): int = A.seed(B.seed(1))
+func answer(): int =
+  forward(0, 40) + forward(Marker(value = 0), 1) +
+  forward(Token.Value, 1) + both(0, Marker(value = 0))
+"#;
+	assert_eq!(run(source, "answer()"), "165");
+}
+
+#[test]
+fn materialized_generic_default_uses_its_concrete_interface_type_object() {
+	let source = r#"
+interface Seed { func seed(): int }
+impl Seed for int { func seed(): int = 41 }
+
+interface Factory<T: Seed> { func make(): int = T.seed() }
+struct Token()
+impl Factory<int> for Token {}
+
+func answer(): int = Token().make()
+"#;
+	assert_eq!(run(source, "answer()"), "41");
+}
+
+#[test]
+fn receiverless_attachments_precede_top_level_initializers() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl Seed for int { func seed(value: int): int = value + 1 }
+func direct<T: Seed>(marker: T, value: int): int = T.seed(value)
+let seeded = direct(0, 40)
+func answer(): int = seeded
+"#;
+	assert_eq!(run(source, "answer()"), "41");
+}
+
+#[test]
+fn grouped_generic_calls_forward_hidden_arguments() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl Seed for int { func seed(value: int): int = value + 1 }
+func direct<T: Seed>(marker: T, value: int): int = T.seed(value)
+func answer(): int = (direct(0, 40))
+"#;
+	assert_eq!(run(source, "answer()"), "41");
+}
+
+#[test]
+fn parameterized_nominals_share_canonical_receiverless_and_instance_dispatch() {
+	let source = r#"
+interface Seed { func seed(): int }
+
+struct Box<T>(value: T)
+impl Seed for Box<int> { func seed(): int = 1 }
+impl Seed for Box<string> { func seed(): int = 2 }
+
+enum Token<T> { Value(value: T), Empty }
+impl Seed for Token<int> { func seed(): int = 3 }
+impl Seed for Token<string> { func seed(): int = 4 }
+
+func static_seed<T: Seed>(value: T): int = T.seed()
+func instance_seed<T: Seed>(value: T): int = value.seed()
+func empty<T>(): Token<T> = Token.Empty
+func int_empty(): Token<int> = empty()
+func string_empty(): Token<string> = empty()
+
+func answer(): int = {
+  let mut result = static_seed(Box(value = 0))
+  result = result + static_seed(Box(value = "")) * 10
+  result = result + instance_seed(Box(value = 0)) * 100
+  result = result + instance_seed(Box(value = "")) * 1000
+  result = result + static_seed(Token.Value(value = 0)) * 10000
+  result = result + instance_seed(Token.Value(value = "")) * 100000
+  result = result + instance_seed(int_empty()) * 1000000
+  result + instance_seed(string_empty()) * 10000000
+}
+"#;
+	assert_eq!(run(source, "answer()"), "43432121");
+}
+
+#[test]
+fn incomplete_hidden_type_slots_do_not_erase_concrete_canonical_slots() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl Seed for int { func seed(value: int) = value + 1 }
+
+func direct<T: Seed, U>(marker: T, value: int): int = T.seed(value)
+func answer(): int = direct(0, 40)
+"#;
+	let js = compile(source);
+	assert!(js.contains("void 0"), "{js}");
+	assert_eq!(run_js(js, "answer()"), "41");
+}
+
+#[test]
+fn generic_construction_rejects_a_required_erased_hidden_argument() {
+	let source = r#"
+enum Token<T> { Empty }
+func make<T>(): Token<T> = Token.Empty
+func answer(): void = {
+  make()
+  return
+}
+"#;
+	let diagnostics = nymph_compiler::compile(source, "test").expect_err("T is underdetermined");
+	assert!(
+		diagnostics.iter().any(|diagnostic| diagnostic
+			.message
+			.contains("erased runtime type argument required by receiverless dispatch")),
+		"{diagnostics:?}"
+	);
+}
+
+#[test]
+fn nested_generic_construction_rejects_a_required_erased_hidden_argument() {
+	let source = r#"
+struct Box<T>(value: T)
+enum Token<T> { Empty }
+func make<T>(): Token<T> = Token.Empty
+func outer<U>(): Token<Box<U>> = make()
+func answer(): void = {
+  outer()
+  return
+}
+"#;
+	let diagnostics = nymph_compiler::compile(source, "test").expect_err("U is underdetermined");
+	assert!(
+		diagnostics.iter().any(|diagnostic| diagnostic
+			.message
+			.contains("erased runtime type argument required by receiverless dispatch")),
+		"{diagnostics:?}"
+	);
+}
+
+#[test]
+fn erased_hidden_slot_required_by_receiverless_dispatch_is_rejected() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl Seed for int { func seed(value: int) = value + 1 }
+
+func direct<T: Seed>(value: int): int = T.seed(value)
+func answer(): void = {
+  direct(40)
+  return
+}
+"#;
+	let diagnostics = nymph_compiler::compile(source, "test").expect_err("T is underdetermined");
+	assert!(
+		diagnostics.iter().any(|diagnostic| diagnostic
+			.message
+			.contains("erased runtime type argument required by receiverless dispatch")),
+		"{diagnostics:?}"
+	);
+}
+
+#[test]
+fn transitively_required_erased_hidden_slot_is_rejected() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl Seed for int { func seed(value: int) = value + 1 }
+
+func inner<T: Seed>(value: int): int = T.seed(value)
+func outer<U: Seed>(value: int): int = inner(value)
+func answer(): void = {
+  outer(40)
+  return
+}
+"#;
+	let diagnostics = nymph_compiler::compile(source, "test").expect_err("U is underdetermined");
+	assert!(
+		diagnostics.iter().any(|diagnostic| diagnostic
+			.message
+			.contains("erased runtime type argument required by receiverless dispatch")),
+		"{diagnostics:?}"
+	);
+}
+
+#[test]
+fn generic_bound_method_forwards_its_hidden_arguments() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl Seed for int { func seed(value: int) = value + 1 }
+
+interface Apply {
+  func apply<T: Seed>(marker: T, value: int): int = T.seed(value)
+}
+impl Apply for int {}
+
+func invoke<A: Apply, T: Seed>(apply: A, marker: T, value: int): int =
+  apply.apply(marker, value)
+func answer(): int = invoke(0, 0, 40)
+"#;
+	assert_eq!(run(source, "answer()"), "41");
+}
+
+#[test]
+fn generic_dispatched_method_rejects_a_required_erased_hidden_argument() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl Seed for int { func seed(value: int) = value + 1 }
+
+interface Apply {
+  func apply<T: Seed>(value: int): int = T.seed(value)
+}
+impl Apply for int {}
+
+func invoke<A: Apply>(apply: A): int = apply.apply(40)
+func answer(): int = invoke(0)
+"#;
+	let diagnostics = nymph_compiler::compile(source, "test").expect_err("T is underdetermined");
+	assert!(
+		diagnostics.iter().any(|diagnostic| diagnostic
+			.message
+			.contains("erased runtime type argument required by receiverless dispatch")),
+		"{diagnostics:?}"
+	);
+}
+
+#[test]
+fn grouped_generic_dispatch_rejects_a_required_erased_hidden_argument() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl Seed for int { func seed(value: int) = value + 1 }
+
+interface Apply {
+  func apply<T: Seed>(value: int): int = T.seed(value)
+}
+impl Apply for int {}
+
+func invoke<A: Apply>(apply: A): int = (apply.apply(40))
+func answer(): int = invoke(0)
+"#;
+	let diagnostics = nymph_compiler::compile(source, "test").expect_err("T is underdetermined");
+	assert!(
+		diagnostics.iter().any(|diagnostic| diagnostic
+			.message
+			.contains("erased runtime type argument required by receiverless dispatch")),
+		"{diagnostics:?}"
+	);
+}
+
+#[test]
+fn higher_order_generic_calls_keep_hidden_arguments_on_the_factory_call() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl Seed for int { func seed(value: int) = value + 1 }
+
+func factory<T: Seed>(marker: T): () -> int = () -> T.seed(40)
+func answer(): int = (factory(0))()
+"#;
+	assert_eq!(run(source, "answer()"), "41");
+}
+
+#[test]
+fn generic_pipeline_calls_forward_one_hidden_argument() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl Seed for int { func seed(value: int) = value + 1 }
+
+func apply<T: Seed>(marker: T): int = T.seed(40)
+func answer(): int = 0 |> apply
+"#;
+	assert_eq!(run(source, "answer()"), "41");
+}
+
+#[test]
+fn hidden_type_objects_preserve_source_argument_order_and_exactly_once_evaluation() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl Seed for int { func seed(value: int) = value }
+
+func direct<T: Seed>(marker: T, value: int): int = T.seed(value)
+func answer(): int = {
+  let mut trace = 0
+  let marker = () -> { trace = trace * 10 + 1
+    0 }
+  let value = () -> { trace = trace * 10 + 2
+    40 }
+  direct(marker(), value()) + trace
+}
+"#;
+	assert_eq!(run(source, "answer()"), "52");
 }

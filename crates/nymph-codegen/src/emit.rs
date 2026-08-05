@@ -714,18 +714,18 @@ impl<'a> Emitter<'a> {
 	/// `Symbol.for("nymph.tag")` — only the per-variant discriminant VALUE
 	/// was the gap.
 	///
-	/// X1: when the enum has methods, a `const proto = { … };` object (built the
+	/// X1: every enum has a `const proto = { … };` object (built the
 	/// same way as struct class methods, see [`Self::emit_method_property`]) is
 	/// also emitted inside the IIFE, and every variant value is created with
 	/// `Object.create(proto)` as its prototype instead of a plain object literal
-	/// — so `c.m()` and `this` inside a method work natively. A method-less enum
-	/// emits none of that, staying byte-identical to before Slice 4D.
+	/// — so `c.m()` and `this` inside a method work natively, while methodless
+	/// enums still have a canonical runtime type object.
 	fn emit_enum(&self, hir_enum: &HirEnum) -> Statement<'a> {
 		let mut stmts = ArenaVec::new_in(&self.ast);
-		let has_methods = !hir_enum.methods.is_empty();
-		if has_methods {
-			stmts.push(self.emit_enum_proto(&hir_enum.methods));
-		}
+		let has_methods = true;
+		// The prototype is also the enum's canonical runtime type object, so it
+		// exists even when there are no instance methods.
+		stmts.push(self.emit_enum_proto(&hir_enum.methods));
 		let mut props = ArenaVec::new_in(&self.ast);
 		for (i, variant) in hir_enum.variants.iter().enumerate() {
 			let t_name = format!("t{i}");
@@ -809,6 +809,19 @@ impl<'a> Emitter<'a> {
 		for method in &hir_enum.statics {
 			props.push(self.emit_method_property(method));
 		}
+		// The canonical enum prototype is also its compiler-only runtime type
+		// object. Exposing this unspellable property lets hidden generic arguments
+		// share the exact object used by every variant instance.
+		props.push(ObjectPropertyKind::ObjectProperty(ObjectProperty::boxed(
+			SPAN,
+			PropertyKind::Init,
+			PropertyKey::new_static_identifier(SPAN, "$nymph$type", &self.ast),
+			Expression::new_identifier(SPAN, "proto", &self.ast),
+			false,
+			false,
+			false,
+			&self.ast,
+		)));
 		let return_obj = Expression::new_object_expression(SPAN, props, &self.ast);
 		let iife = JsValue {
 			stmts,
@@ -1161,6 +1174,7 @@ impl<'a> Emitter<'a> {
 		method: &str,
 		receiver: &HirExpr,
 		argument: &HirExpr,
+		hidden_arguments: &[HirExpr],
 		cases: &[HirBoundDispatchCase],
 	) -> Expression<'a> {
 		let receiver_param = self.gensym();
@@ -1168,11 +1182,14 @@ impl<'a> Emitter<'a> {
 		let argument_param = self.gensym();
 		let argument_param = self.ast.allocator.alloc_str(&argument_param);
 
-		let mut body = self.member_call(
-			self.ident(receiver_param),
-			method,
-			vec![self.ident(argument_param)],
-		);
+		let hidden_params = hidden_arguments
+			.iter()
+			.map(|_| self.ast.allocator.alloc_str(&self.gensym()))
+			.collect::<Vec<_>>();
+		let fallback_args = std::iter::once(self.ident(argument_param))
+			.chain(hidden_params.iter().map(|name| self.ident(name)))
+			.collect();
+		let mut body = self.member_call(self.ident(receiver_param), method, fallback_args);
 		for case in cases.iter().rev() {
 			let receiver_matches = self.strict_eq(
 				self.tag_read(self.ident(receiver_param), true),
@@ -1201,11 +1218,17 @@ impl<'a> Emitter<'a> {
 			let mut args = ArenaVec::new_in(&self.ast);
 			args.push(Argument::from(self.ident(receiver_param)));
 			args.push(Argument::from(self.ident(argument_param)));
+			for name in &hidden_params {
+				args.push(Argument::from(self.ident(name)));
+			}
 			let dispatched =
 				Expression::new_call_expression(SPAN, target, oxc::ast::NONE, args, false, &self.ast);
 			body = Expression::new_conditional_expression(SPAN, test, dispatched, body, &self.ast);
 		}
 
+		for (name, argument) in hidden_params.iter().zip(hidden_arguments).rev() {
+			body = self.arrow_iife(name, body, self.emit_expr(argument));
+		}
 		let argument_iife = self.arrow_iife(argument_param, body, self.emit_expr(argument));
 		self.arrow_iife(receiver_param, argument_iife, self.emit_expr(receiver))
 	}
@@ -1214,11 +1237,20 @@ impl<'a> Emitter<'a> {
 		&self,
 		method: &str,
 		receiver: &HirExpr,
+		hidden_arguments: &[HirExpr],
 		cases: &[HirBoundDispatchCase],
 	) -> Expression<'a> {
 		let receiver_param = self.gensym();
 		let receiver_param = self.ast.allocator.alloc_str(&receiver_param);
-		let mut body = self.member_call(self.ident(receiver_param), method, vec![]);
+		let hidden_params = hidden_arguments
+			.iter()
+			.map(|_| self.ast.allocator.alloc_str(&self.gensym()))
+			.collect::<Vec<_>>();
+		let mut body = self.member_call(
+			self.ident(receiver_param),
+			method,
+			hidden_params.iter().map(|name| self.ident(name)).collect(),
+		);
 		for case in cases.iter().rev() {
 			let test = self.strict_eq(
 				self.tag_read(self.ident(receiver_param), true),
@@ -1235,9 +1267,15 @@ impl<'a> Emitter<'a> {
 			let target = self.ident(self.ast.allocator.alloc_str(&target_name));
 			let mut args = ArenaVec::new_in(&self.ast);
 			args.push(Argument::from(self.ident(receiver_param)));
+			for name in &hidden_params {
+				args.push(Argument::from(self.ident(name)));
+			}
 			let dispatched =
 				Expression::new_call_expression(SPAN, target, oxc::ast::NONE, args, false, &self.ast);
 			body = Expression::new_conditional_expression(SPAN, test, dispatched, body, &self.ast);
+		}
+		for (name, argument) in hidden_params.iter().zip(hidden_arguments).rev() {
+			body = self.arrow_iife(name, body, self.emit_expr(argument));
 		}
 		self.arrow_iife(receiver_param, body, self.emit_expr(receiver))
 	}
@@ -1441,8 +1479,116 @@ impl<'a> Emitter<'a> {
 				let raw = Expression::new_string_literal(SPAN, s, None, &self.ast);
 				self.new_box("NChar", raw)
 			}
+			HirExpr::Undefined => Expression::new_unary_expression(
+				SPAN,
+				UnaryOperator::Void,
+				Expression::new_numeric_literal(SPAN, 0.0, None, NumberBase::Decimal, &self.ast),
+				&self.ast,
+			),
 			HirExpr::Local(name) => {
 				Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(name), &self.ast)
+			}
+			HirExpr::RuntimeTypeObject {
+				binding,
+				box_runtime,
+				is_enum,
+				arguments,
+			} => {
+				if *box_runtime {
+					self
+						.box_runtime_bindings
+						.borrow_mut()
+						.insert(binding.to_string());
+				}
+				let object =
+					Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(binding), &self.ast);
+				let base = Expression::new_static_member_expression(
+					SPAN,
+					object,
+					IdentifierName::new(
+						SPAN,
+						self
+							.ast
+							.allocator
+							.alloc_str(if *is_enum { "$nymph$type" } else { "prototype" }),
+						&self.ast,
+					),
+					false,
+					&self.ast,
+				);
+				if arguments.is_empty() {
+					base
+				} else {
+					self
+						.box_runtime_bindings
+						.borrow_mut()
+						.insert("nymphType".to_string());
+					let mut elements = ArenaVec::new_in(&self.ast);
+					for argument in arguments {
+						elements.push(oxc::ast::ast::ArrayExpressionElement::from(
+							self.emit_expr(argument),
+						));
+					}
+					let array = Expression::new_array_expression(SPAN, elements, &self.ast);
+					let mut call_args = ArenaVec::new_in(&self.ast);
+					call_args.push(Argument::from(base));
+					call_args.push(Argument::from(array));
+					Expression::new_call_expression(
+						SPAN,
+						Expression::new_identifier(SPAN, "nymphType", &self.ast),
+						oxc::ast::NONE,
+						call_args,
+						false,
+						&self.ast,
+					)
+				}
+			}
+			HirExpr::RuntimeTypeProjection { receiver, path } => {
+				self
+					.box_runtime_bindings
+					.borrow_mut()
+					.insert("nymphTypeProjection".to_string());
+				let mut elements = ArenaVec::new_in(&self.ast);
+				for index in path {
+					elements.push(oxc::ast::ast::ArrayExpressionElement::from(
+						Expression::new_numeric_literal(
+							SPAN,
+							*index as f64,
+							None,
+							NumberBase::Decimal,
+							&self.ast,
+						),
+					));
+				}
+				let mut args = ArenaVec::new_in(&self.ast);
+				args.push(Argument::from(self.emit_expr(receiver)));
+				args.push(Argument::from(Expression::new_array_expression(
+					SPAN, elements, &self.ast,
+				)));
+				Expression::new_call_expression(
+					SPAN,
+					Expression::new_identifier(SPAN, "nymphTypeProjection", &self.ast),
+					oxc::ast::NONE,
+					args,
+					false,
+					&self.ast,
+				)
+			}
+			HirExpr::WithPrototype { value, prototype } => self.member_call(
+				Expression::new_identifier(SPAN, "Object", &self.ast),
+				"setPrototypeOf",
+				vec![self.emit_expr(value), self.emit_expr(prototype)],
+			),
+			HirExpr::RuntimeTypeAttachment { object, method } => {
+				let object = self.emit_expr(object);
+				let mut properties = ArenaVec::new_in(&self.ast);
+				properties.push(self.emit_method_property(method));
+				let methods = Expression::new_object_expression(SPAN, properties, &self.ast);
+				self.member_call(
+					Expression::new_identifier(SPAN, "Object", &self.ast),
+					"assign",
+					vec![object, methods],
+				)
 			}
 			// The `this` receiver.
 			HirExpr::This => Expression::new_this_expression(SPAN, &self.ast),
@@ -1569,15 +1715,17 @@ impl<'a> Emitter<'a> {
 				method,
 				receiver,
 				argument,
+				hidden_arguments,
 				cases,
 				..
-			} => self.emit_bound_dispatch(method, receiver, argument, cases),
+			} => self.emit_bound_dispatch(method, receiver, argument, hidden_arguments, cases),
 			HirExpr::UnaryBoundDispatch {
 				method,
 				receiver,
+				hidden_arguments,
 				cases,
 				..
-			} => self.emit_unary_bound_dispatch(method, receiver, cases),
+			} => self.emit_unary_bound_dispatch(method, receiver, hidden_arguments, cases),
 			// Collection literals own a native array payload; compiler-internal
 			// accumulators remain raw arrays.
 			HirExpr::Array { kind, items } => {
@@ -1666,7 +1814,11 @@ impl<'a> Emitter<'a> {
 				self.member_call(object, "index", vec![key])
 			}
 			// Struct construction → `new <class>({ field: value, … })`.
-			HirExpr::New { class, fields } => {
+			HirExpr::New {
+				class,
+				fields,
+				prototype,
+			} => {
 				if class == "NymphRange" {
 					self
 						.box_runtime_bindings
@@ -1694,7 +1846,16 @@ impl<'a> Emitter<'a> {
 					Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(class), &self.ast);
 				let mut args = ArenaVec::new_in(&self.ast);
 				args.push(Argument::from(obj));
-				Expression::new_new_expression(SPAN, callee, oxc::ast::NONE, args, &self.ast)
+				let value = Expression::new_new_expression(SPAN, callee, oxc::ast::NONE, args, &self.ast);
+				if let Some(prototype) = prototype {
+					self.member_call(
+						Expression::new_identifier(SPAN, "Object", &self.ast),
+						"setPrototypeOf",
+						vec![value, self.emit_expr(prototype)],
+					)
+				} else {
+					value
+				}
 			}
 			// Field access → `recv.name`.
 			HirExpr::Field { recv, name } => {
@@ -1712,6 +1873,7 @@ impl<'a> Emitter<'a> {
 				enum_name,
 				variant,
 				fields,
+				prototype,
 			} => {
 				let mut props = ArenaVec::new_in(&self.ast);
 				for (name, value) in fields {
@@ -1731,10 +1893,42 @@ impl<'a> Emitter<'a> {
 				}
 				let obj = Expression::new_object_expression(SPAN, props, &self.ast);
 				let callee = self.variant_member(enum_name, variant);
-				self.call1(callee, obj)
+				let value = self.call1(callee, obj);
+				if let Some(prototype) = prototype {
+					self.member_call(
+						Expression::new_identifier(SPAN, "Object", &self.ast),
+						"setPrototypeOf",
+						vec![value, self.emit_expr(prototype)],
+					)
+				} else {
+					value
+				}
 			}
 			// Nullary variant reference → `<enum>.<variant>` (the frozen singleton).
-			HirExpr::VariantRef { enum_name, variant } => self.variant_member(enum_name, variant),
+			HirExpr::VariantRef {
+				enum_name,
+				variant,
+				prototype,
+			} => {
+				let value = self.variant_member(enum_name, variant);
+				if let Some(prototype) = prototype {
+					self
+						.box_runtime_bindings
+						.borrow_mut()
+						.insert("nymphVariant".to_string());
+					self.member_call(
+						Expression::new_identifier(SPAN, "nymphVariant", &self.ast),
+						"call",
+						vec![
+							Expression::new_null_literal(SPAN, &self.ast),
+							self.emit_expr(prototype),
+							value,
+						],
+					)
+				} else {
+					value
+				}
+			}
 			// A map lookup → `recv.get(key)`.
 			HirExpr::MapGet { recv, key } => {
 				let object = self.emit_expr(recv);
@@ -2522,6 +2716,7 @@ impl<'a> Emitter<'a> {
 					let none = self.emit_expr(&HirExpr::VariantRef {
 						enum_name: option.enum_name.clone(),
 						variant: option.none.clone(),
+						prototype: None,
 					});
 					stmts.push(Statement::new_expression_statement(
 						SPAN,

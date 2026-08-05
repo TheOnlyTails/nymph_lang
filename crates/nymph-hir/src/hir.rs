@@ -236,8 +236,31 @@ pub enum HirExpr {
 	InterpolatedString(Vec<HirExpr>),
 	Bool(bool),
 	Char(char),
+	/// Compiler-only placeholder for an erased hidden ABI slot.
+	Undefined,
 	/// An identifier or parameter reference.
 	Local(EcoString),
+	/// Compiler-only canonical runtime type object. This is never a Nymph value:
+	/// it is calling-convention data used by receiverless generic dispatch.
+	RuntimeTypeObject {
+		binding: EcoString,
+		box_runtime: bool,
+		is_enum: bool,
+		arguments: Vec<HirExpr>,
+	},
+	/// Compiler-only projection from a receiver's canonical runtime type object.
+	RuntimeTypeProjection {
+		receiver: Box<HirExpr>,
+		path: Vec<usize>,
+	},
+	WithPrototype {
+		value: Box<HirExpr>,
+		prototype: Box<HirExpr>,
+	},
+	RuntimeTypeAttachment {
+		object: Box<HirExpr>,
+		method: Box<HirMethod>,
+	},
 	/// The method receiver — emits as the JS `this` keyword.
 	This,
 	Call {
@@ -283,6 +306,7 @@ pub enum HirExpr {
 		method: EcoString,
 		receiver: Box<HirExpr>,
 		argument: Box<HirExpr>,
+		hidden_arguments: Vec<HirExpr>,
 		cases: Vec<HirBoundDispatchCase>,
 	},
 	/// A zero-argument method selected through a still-generic interface bound.
@@ -292,6 +316,7 @@ pub enum HirExpr {
 		interface: EcoString,
 		method: EcoString,
 		receiver: Box<HirExpr>,
+		hidden_arguments: Vec<HirExpr>,
 		cases: Vec<HirBoundDispatchCase>,
 	},
 	/// A tuple, list, or compiler-internal raw array.
@@ -330,6 +355,7 @@ pub enum HirExpr {
 	New {
 		class: EcoString,
 		fields: Vec<(EcoString, HirExpr)>,
+		prototype: Option<Box<HirExpr>>,
 	},
 	/// Field access — emits as `recv.name`.
 	Field {
@@ -341,11 +367,13 @@ pub enum HirExpr {
 		enum_name: EcoString,
 		variant: EcoString,
 		fields: Vec<(EcoString, HirExpr)>,
+		prototype: Option<Box<HirExpr>>,
 	},
 	/// Nullary variant reference — emits as `<enum>.<variant>` (frozen singleton).
 	VariantRef {
 		enum_name: EcoString,
 		variant: EcoString,
+		prototype: Option<Box<HirExpr>>,
 	},
 	Binary {
 		op: BinOp,
@@ -427,7 +455,29 @@ pub enum HirExpr {
 impl HirExpr {
 	fn collect_runtime_type_references(&self, references: &mut FxHashSet<EcoString>) {
 		match self {
-			Self::Num(..) | Self::Str(_) | Self::Bool(_) | Self::Char(_) | Self::This => {}
+			Self::Num(..)
+			| Self::Str(_)
+			| Self::Bool(_)
+			| Self::Char(_)
+			| Self::Undefined
+			| Self::This => {}
+			Self::RuntimeTypeObject {
+				binding, arguments, ..
+			} => {
+				references.insert(binding.clone());
+				collect_exprs(arguments, references);
+			}
+			Self::RuntimeTypeProjection { receiver, .. } => {
+				receiver.collect_runtime_type_references(references);
+			}
+			Self::WithPrototype { value, prototype } => {
+				value.collect_runtime_type_references(references);
+				prototype.collect_runtime_type_references(references);
+			}
+			Self::RuntimeTypeAttachment { object, method } => {
+				object.collect_runtime_type_references(references);
+				method.body.collect_runtime_type_references(references);
+			}
 			Self::Local(name) => {
 				references.insert(name.clone());
 			}
@@ -439,13 +489,22 @@ impl HirExpr {
 			Self::ExternCall { args, .. } => collect_exprs(args, references),
 			Self::ExternValue { .. } => {}
 			Self::BoundDispatch {
-				receiver, argument, ..
+				receiver,
+				argument,
+				hidden_arguments,
+				..
 			} => {
 				receiver.collect_runtime_type_references(references);
 				argument.collect_runtime_type_references(references);
+				collect_exprs(hidden_arguments, references);
 			}
-			Self::UnaryBoundDispatch { receiver, .. } => {
+			Self::UnaryBoundDispatch {
+				receiver,
+				hidden_arguments,
+				..
+			} => {
 				receiver.collect_runtime_type_references(references);
+				collect_exprs(hidden_arguments, references);
 			}
 			Self::Array { items, .. } => collect_exprs(items, references),
 			Self::ArraySpread { elems, .. } => {
@@ -477,19 +536,39 @@ impl HirExpr {
 				recv.collect_runtime_type_references(references);
 				key.collect_runtime_type_references(references);
 			}
-			Self::New { class, fields } => {
+			Self::New {
+				class,
+				fields,
+				prototype,
+			} => {
 				references.insert(class.clone());
 				collect_named(fields, references);
+				if let Some(prototype) = prototype {
+					prototype.collect_runtime_type_references(references);
+				}
 			}
 			Self::Field { recv, .. } => recv.collect_runtime_type_references(references),
 			Self::VariantNew {
-				enum_name, fields, ..
+				enum_name,
+				fields,
+				prototype,
+				..
 			} => {
 				references.insert(enum_name.clone());
 				collect_named(fields, references);
+				if let Some(prototype) = prototype {
+					prototype.collect_runtime_type_references(references);
+				}
 			}
-			Self::VariantRef { enum_name, .. } => {
+			Self::VariantRef {
+				enum_name,
+				prototype,
+				..
+			} => {
 				references.insert(enum_name.clone());
+				if let Some(prototype) = prototype {
+					prototype.collect_runtime_type_references(references);
+				}
 			}
 			Self::Binary { lhs, rhs, .. } => {
 				lhs.collect_runtime_type_references(references);

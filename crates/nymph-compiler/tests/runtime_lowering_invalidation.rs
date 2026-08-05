@@ -40,8 +40,16 @@ fn hir_contains(
 		}),
 		HirExpr::Index { recv, index } => contains(recv) || contains(index),
 		HirExpr::MapGet { recv, key } => contains(recv) || contains(key),
-		HirExpr::New { fields, .. } | HirExpr::VariantNew { fields, .. } => {
+		HirExpr::New {
+			fields, prototype, ..
+		}
+		| HirExpr::VariantNew {
+			fields, prototype, ..
+		} => {
 			fields.iter().any(|(_, value)| contains(value))
+				|| prototype
+					.as_ref()
+					.is_some_and(|prototype| contains(prototype))
 		}
 		HirExpr::Field { recv, .. } => contains(recv),
 		HirExpr::Binary { lhs, rhs, .. } => contains(lhs) || contains(rhs),
@@ -69,10 +77,15 @@ fn hir_contains(
 					.any(|arm| arm.guard.as_ref().is_some_and(contains) || contains(&arm.body))
 		}
 		HirExpr::Closure { body, .. } => contains(body),
+		HirExpr::RuntimeTypeObject { arguments, .. } => arguments.iter().any(contains),
+		HirExpr::RuntimeTypeProjection { receiver, .. } => contains(receiver),
+		HirExpr::WithPrototype { value, prototype } => contains(value) || contains(prototype),
+		HirExpr::RuntimeTypeAttachment { method, .. } => contains(&method.body),
 		HirExpr::Num(..)
 		| HirExpr::Str(_)
 		| HirExpr::Bool(_)
 		| HirExpr::Char(_)
+		| HirExpr::Undefined
 		| HirExpr::Local(_)
 		| HirExpr::This
 		| HirExpr::ExternValue { .. }

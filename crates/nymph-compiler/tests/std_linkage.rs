@@ -459,7 +459,7 @@ fn linked_map_merge_and_to_string_compile_bundle_and_run() {
 		\tlet mut a = #{1: 10}\n\
 		\tlet b = #{2: 20}\n\
 		\tlet merged = a.plus(b)\n\
-		\tmerged.size()\n\
+		\tmerged.keys().length()\n\
 		}\n\
 		func main(): void = {}\n";
 	let load = only_entry("main", entry);
