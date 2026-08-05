@@ -1967,14 +1967,6 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		}
 	}
 	fn lower_branch(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
-		if let StableExprKind::Return { value, label: None } = &expr.kind {
-			return Ok(HirExpr::Block {
-				stmts: vec![HirStmt::Return(
-					value.as_ref().map(|value| self.lower(value)).transpose()?,
-				)],
-				tail: None,
-			});
-		}
 		self.lower(expr)
 	}
 	fn lower_loop_branch(
@@ -2573,9 +2565,13 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					body: Box::new(body),
 				}
 			}
-			StableExprKind::Return { .. } => {
-				return Err(self.unsupported(expr, "return outside block statement"));
-			}
+			StableExprKind::Return { value, label: None } => HirExpr::Block {
+				stmts: vec![HirStmt::Return(
+					value.as_ref().map(|value| self.lower(value)).transpose()?,
+				)],
+				tail: None,
+			},
+			StableExprKind::Return { .. } => return Err(self.unsupported(expr, "labeled return")),
 			StableExprKind::Break { value, label: None } => HirExpr::Break {
 				target: *self
 					.loop_targets

@@ -1314,6 +1314,116 @@ fn return_inside_a_subexpression_position_match_arm_targets_the_function() {
 }
 
 #[test]
+fn return_works_across_general_expression_positions_and_preserves_evaluation() {
+	let src = r#"
+func id(value: int): int = value
+func operand(): int = 1 + if (true) return 2 else 0
+func lazy_and(): int = { false && return 3
+4 }
+func lazy_or(): int = { true || return 5
+6 }
+func callee(): int = (return 7)()
+func argument(): int = id(return 8)
+func member(): int = (return 9).field
+func index(): int = #[1][return 10]
+func list_element(): int = #[1, return 11][0]
+func list_spread(): int = #[1, ...(if (true) return 12 else #[2])][0]
+func map_element(): int = #{ 1: return 13 }[1]
+func map_spread(): int = { #{ 1: 1, ...(if (true) return 14 else #{ 2: 2 }) }
+0 }
+func tuple_element(): int = { #(1, return 15)
+0 }
+func tuple_spread(): int = { #(1, ...(if (true) return 16 else #(2)))
+0 }
+func interpolation(): int = { "value=${return 14}"
+0 }
+func nested_block(): int = 1 + { 2 + { if (true) return 15 else 0 } }
+func condition(): int = { while (return 16) {} 0 }
+func loop_body(): int = { while (true) return 17
+0 }
+func for_body(): int = { for (value in #[24]) return value
+0 }
+func arm(flag: boolean): int = if (flag) return 18 else match (0) { 0 -> return 19, _ -> 0 }
+
+func ordered(flag: boolean): int = {
+	let mut seen = 0
+	let mark = (value: int) -> { seen = seen * 10 + value
+	value }
+	let result = id(mark(1)) + if (flag) return seen * 10 + 2 else mark(2)
+	result * 10 + seen
+}
+
+func loop_completion(flag: boolean): int = {
+	let result = while (true) {
+		if (flag) { return 20 }
+		false && continue
+		break 3
+	}
+	match (result) { Some(value) -> value, None -> 0 }
+}
+
+func closure_boundary(): int = {
+	let inner = (value: int) -> id(return value)
+	inner(21) + 1
+}
+
+struct Value(value: int) {
+	func method(flag: boolean): int = this.value + if (flag) return 22 else 1
+}
+
+interface DefaultValue {
+	func default_value(flag: boolean): int = 1 + if (flag) return 23 else 2
+}
+impl DefaultValue for Value {}
+"#;
+	for (call, expected) in [
+		("operand()", "2"),
+		("lazy_and()", "4"),
+		("lazy_or()", "6"),
+		("callee()", "7"),
+		("argument()", "8"),
+		("member()", "9"),
+		("index()", "10"),
+		("list_element()", "11"),
+		("list_spread()", "12"),
+		("map_element()", "13"),
+		("map_spread()", "14"),
+		("tuple_element()", "15"),
+		("tuple_spread()", "16"),
+		("interpolation()", "14"),
+		("nested_block()", "15"),
+		("condition()", "16"),
+		("loop_body()", "17"),
+		("for_body()", "24"),
+		("arm(new NBool(true))", "18"),
+		("arm(new NBool(false))", "19"),
+		("ordered(new NBool(true))", "12"),
+		("ordered(new NBool(false))", "42"),
+		("loop_completion(new NBool(true))", "20"),
+		("loop_completion(new NBool(false))", "3"),
+		("closure_boundary()", "22"),
+		(
+			"new Value({ value: new NInt(30) }).method(new NBool(true))",
+			"22",
+		),
+		(
+			"new Value({ value: new NInt(30) }).method(new NBool(false))",
+			"31",
+		),
+		(
+			"new Value({ value: new NInt(30) }).default_value(new NBool(true))",
+			"23",
+		),
+		(
+			"new Value({ value: new NInt(30) }).default_value(new NBool(false))",
+			"3",
+		),
+	] {
+		assert_eq!(run(src, call), expected, "{call}");
+	}
+}
+
+#[test]
 fn runs_same_scope_let_shadow_computes_using_the_prior_binding() {
 	// `let x = 1; let x = x + 1; x * 10` — the redeclaration renames in emitted
 	// JS (avoiding a `SyntaxError: Identifier 'x' has already been declared`),

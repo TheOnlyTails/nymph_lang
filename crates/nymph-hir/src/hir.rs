@@ -140,13 +140,10 @@ pub enum HirStmt {
 	},
 	/// A bare expression evaluated for its effect.
 	Expr(HirExpr),
-	/// `return <value>;` (`None` for a bare `return`). Statement-flavored: valid
-	/// only directly inside a `HirExpr::Block`'s `stmts` — never reachable as a
-	/// subexpression. Lowering panics loudly if `return` appears anywhere else
-	/// (an expression position, or with a label); emit panics loudly if a
-	/// `Return` is reached while emitting an expression-position (IIFE-wrapped)
-	/// block/if/match, where a JS `return` would target the IIFE rather than the
-	/// enclosing function (Slice 4E, Y1).
+	/// `return <value>;` (`None` for a bare `return`). Source returns remain
+	/// statement-flavored in HIR: expression-position returns lower to a
+	/// one-statement `HirExpr::Block`. Codegen carries them across synthetic
+	/// expression IIFEs to the nearest real callable boundary.
 	Return(Option<HirExpr>),
 }
 
@@ -404,8 +401,8 @@ pub enum HirExpr {
 	/// arrow function. Captures are free: JS arrows close over their enclosing
 	/// scope by reference, which already matches the checker's own capture
 	/// semantics (Slice 4L), so no explicit capture list is carried here.
-	/// `return` lexically inside `body` is rejected by lowering (never reaches
-	/// this node) — see `lower_hir`'s closure-depth guard for why.
+	/// This is a real callable boundary: a `return` in `body` exits this closure,
+	/// including when synthetic expression IIFEs occur inside it.
 	Closure {
 		params: Vec<EcoString>,
 		body: Box<HirExpr>,

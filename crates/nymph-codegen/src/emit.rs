@@ -124,15 +124,10 @@ pub struct Emitter<'a> {
 	/// control flow). `Cell` keeps the emit methods `&self`.
 	gensym: std::cell::Cell<u32>,
 	/// Set while emitting a control-flow expression's (`Block`/`If`/`While`/
-	/// `Match`) IIFE body from `emit_expr`'s subexpression-position fallthrough —
-	/// the ONLY place `JsValue::into_expression` wraps in an arrow-IIFE (the enum
-	/// factory path in `emit_enum` never contains user statement code, so it needs
-	/// no guard). A JS `return` emitted while this is set would return from that
-	/// IIFE, not the enclosing function, so `emit_stmt`'s `HirStmt::Return` arm
-	/// asserts against it. `Cell` keeps emit methods `&self`; save/restore (never a
-	/// bare `set(true)`) around each use so the flag can't stay stuck true after a
-	/// nested subexpression-position construct returns control to a statement-
-	/// position caller (Slice 4E, Y1).
+	/// `Match`) generated IIFE body. Returns encountered there use the active
+	/// callable's private completion token rather than targeting the IIFE.
+	/// Save/restore around each use keeps nested callable and expression scopes
+	/// independent.
 	in_iife_subexpr: std::cell::Cell<bool>,
 	/// Every `(module, symbol)` pair a `HirExpr::ExternCall` lowered during
 	/// this emit run needs imported (Gap 3, L0) — populated by the

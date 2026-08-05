@@ -251,6 +251,23 @@ fn nested_closure_return_contexts_restore_to_the_nearest_callable() {
 }
 
 #[test]
+fn return_typechecks_in_general_expression_positions_and_callable_kinds() {
+	assert_ok(
+		r#"
+		func id(value: int): int = value
+		func positions(flag: boolean): int = id(1 + if (flag) return 2 else #[3][0])
+		struct Value(value: int) {
+			func get(flag: boolean): int = this.value + if (flag) return 4 else 1
+		}
+		interface DefaultValue {
+			func default_value(flag: boolean): int = 1 + if (flag) return 5 else 2
+		}
+		impl DefaultValue for Value {}
+		"#,
+	);
+}
+
+#[test]
 fn wrong_argument_type_is_reported() {
 	assert_error_contains(
 		"func takes_int(x: int): int = x

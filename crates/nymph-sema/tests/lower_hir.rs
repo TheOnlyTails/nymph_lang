@@ -1410,12 +1410,8 @@ fn lowers_bare_return_in_a_void_function() {
 }
 
 #[test]
-#[should_panic(expected = "only supported in statement position")]
-fn return_as_an_unbraced_match_arm_body_panics_in_lowering() {
-	// `return` reached in genuine expression position (an unbraced match-arm
-	// body) has no HIR representation — lowering panics loudly rather than
-	// silently dropping or misplacing it (Slice 4E, Y1).
-	lower(
+fn lowers_return_as_an_unbraced_match_arm_body() {
+	let hir = lower(
 		r#"
 		func f(n: int): int = match (n) {
 			0 -> return 7,
@@ -1423,6 +1419,14 @@ fn return_as_an_unbraced_match_arm_body_panics_in_lowering() {
 		}
 		"#,
 	);
+	let HirExpr::Match { arms, .. } = &hir.funcs[0].body else {
+		panic!("expected match body");
+	};
+	assert!(matches!(
+		&arms[0].body,
+		HirExpr::Block { stmts, tail: None }
+			if matches!(stmts.as_slice(), [HirStmt::Return(Some(HirExpr::Num(7.0, NumKind::Int)))])
+	));
 }
 
 #[test]
@@ -2962,9 +2966,8 @@ fn return_inside_closure_block_body_lowers_to_the_closure() {
 }
 
 #[test]
-#[should_panic(expected = "return` inside an anonymous closure body is not supported")]
-fn return_inside_anonymous_closure_body_retains_the_lowering_guard() {
-	lower(
+fn return_inside_anonymous_closure_body_lowers_to_that_callable() {
+	let hir = lower(
 		r#"
 		func f(): int = {
 			let g: (int) -> boolean = {
@@ -2975,18 +2978,12 @@ fn return_inside_anonymous_closure_body_retains_the_lowering_guard() {
 		}
 		"#,
 	);
+	assert!(matches!(hir.funcs[0].body, HirExpr::Block { .. }));
 }
 
 #[test]
-#[should_panic(expected = "only supported in statement position")]
-fn return_inside_an_unbraced_closure_body_panics_in_lowering() {
-	// P22: `(x) -> return x` typechecks (the checker permits a closure whose
-	// entire body is a bare `return`, inferring the closure's own return type
-	// as `never`). The body here is never a `Block`, so `lower_func_body`
-	// routes it straight to `lower_expr`, which panics unconditionally on a
-	// subexpression-position `Return` (Slice 4E, Y1) — belt-and-braces
-	// alongside the `closure_depth` guard above.
-	lower(
+fn return_inside_an_unbraced_closure_body_lowers() {
+	let hir = lower(
 		r#"
 		func f(): int = {
 			let g = (x: int) -> return x
@@ -2994,14 +2991,22 @@ fn return_inside_an_unbraced_closure_body_panics_in_lowering() {
 		}
 		"#,
 	);
+	let HirExpr::Block { stmts, .. } = &hir.funcs[0].body else {
+		panic!("expected function block");
+	};
+	assert!(matches!(
+		stmts[0],
+		HirStmt::Let {
+			value: HirExpr::Closure { .. },
+			..
+		}
+	));
 }
 
 #[test]
 fn legal_return_in_a_statement_position_match_is_unaffected_by_a_sibling_closure() {
 	// Regression guard: an unrelated closure elsewhere in the same function
-	// body (with no `return` of its own) must not leak `closure_depth` state —
-	// a genuinely legal `return` inside a STATEMENT-position match, later in
-	// the same function, must still lower fine.
+	// body must not affect a return inside a later statement-position match.
 	let hir = lower(
 		r#"
 		func f(n: int): int = {

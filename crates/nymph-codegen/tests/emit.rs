@@ -447,10 +447,8 @@ fn emits_a_closure_as_an_arrow_function() {
 
 #[test]
 fn closure_return_emits_fine_inside_a_subexpression_position_match_arm() {
-	// Slice 4L, JJ2's closure-boundary story, tested independently of
-	// lowering (which never actually PRODUCES this shape — any `return`
-	// lexically inside a closure body panics at lowering): a `return` inside
-	// a closure that itself sits inside a SUBEXPRESSION-position match arm
+	// A `return` inside a closure that itself sits inside a
+	// SUBEXPRESSION-position match arm
 	// (which sets `in_iife_subexpr = true` for everything underneath, Slice
 	// 4E, Y1) must still emit as a plain arrow `return`, not panic as if it
 	// targeted the match's own IIFE. This is exactly what the closure-body
@@ -489,6 +487,45 @@ fn closure_return_emits_fine_inside_a_subexpression_position_match_arm() {
 	let js = emit(&module);
 	assert!(js.contains("=>"), "arrow present: {js}");
 	assert!(js.contains("return x"), "closure body's own return: {js}");
+}
+
+#[test]
+fn function_return_crosses_a_generated_iife_without_losing_sibling_values() {
+	let module = HirModule {
+		lets: vec![],
+		funcs: vec![HirFunc {
+			name: "f".into(),
+			params: vec!["flag".into()],
+			body: HirExpr::Binary {
+				op: BinOp::Add,
+				result: BuiltinResult::Raw,
+				lhs: Box::new(HirExpr::Num(1.0, NumKind::Int)),
+				rhs: Box::new(HirExpr::If {
+					cond: Box::new(HirExpr::Local("flag".into())),
+					then: Box::new(HirExpr::Block {
+						stmts: vec![HirStmt::Return(Some(HirExpr::Num(7.0, NumKind::Int)))],
+						tail: None,
+					}),
+					otherwise: Some(Box::new(HirExpr::Num(2.0, NumKind::Int))),
+				}),
+			},
+		}],
+		classes: vec![],
+		enums: vec![],
+	};
+	let js = emit(&module);
+	assert!(
+		js.contains("throw ["),
+		"return crosses the generated IIFE: {js}"
+	);
+	assert!(
+		js.contains("catch ("),
+		"function consumes its completion: {js}"
+	);
+	assert!(
+		js.contains(" + "),
+		"non-returning sibling value is preserved: {js}"
+	);
 }
 
 #[test]
