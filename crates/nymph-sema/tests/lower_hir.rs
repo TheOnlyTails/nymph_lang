@@ -2779,6 +2779,36 @@ fn is_pattern_bindings_do_not_leak_into_the_match_arm_body() {
 }
 
 #[test]
+fn compatibility_pattern_operator_lowers_source_before_union_bindings() {
+	let hir = lower(
+		"func test(x: int, value: int): boolean = ({
+		   let x = x
+		   value
+		 }) is (x = 1 | x = 2)",
+	);
+	let HirExpr::Match { scrutinee, arms } = &hir.funcs[0].body else {
+		panic!("expected pattern operator to lower to a match")
+	};
+	let HirExpr::Block { stmts, .. } = scrutinee.as_ref() else {
+		panic!("expected block scrutinee")
+	};
+	assert!(matches!(
+		stmts.as_slice(),
+		[HirStmt::Let { name, .. }] if name == "x$1"
+	));
+	let HirPat::Or(left, right) = &arms[0].pat else {
+		panic!("expected union pattern")
+	};
+	assert!(matches!(
+		(left.as_ref(), right.as_ref()),
+		(
+			HirPat::Binding { name: left, .. },
+			HirPat::Binding { name: right, .. },
+		) if left == "x$2" && right == "x$2"
+	));
+}
+
+#[test]
 fn identity_cast_lowers_to_the_bare_operand() {
 	// `P as P` needs no runtime conversion at all — no `ScalarCast`, no `Into`
 	// call, just the lowered operand unchanged.

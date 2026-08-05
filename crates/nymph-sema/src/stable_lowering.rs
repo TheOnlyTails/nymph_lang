@@ -2853,8 +2853,11 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.collect::<Result<_, StableLoweringError>>()?,
 			},
 			StableExprKind::PatternOp { lhs, op, rhs } => {
+				let scrutinee = Box::new(self.lower(lhs)?);
 				// Pattern-operator bindings are scoped to the test and must not replace
-				// an outer source-name mapping used by following expressions.
+				// an outer source-name mapping used by following expressions. Lower the
+				// source first to preserve source-order name allocation, matching the
+				// compatibility lowering path.
 				self.scopes.borrow_mut().push(HashMap::new());
 				let pat = self.lower_pattern(rhs);
 				self.scopes.borrow_mut().pop();
@@ -2865,7 +2868,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					(false, true)
 				};
 				HirExpr::Match {
-					scrutinee: Box::new(self.lower(lhs)?),
+					scrutinee,
 					arms: vec![
 						HirArm {
 							pat,
