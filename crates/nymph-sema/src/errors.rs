@@ -18,21 +18,37 @@ use nymph_errorcode::ErrorCode;
 pub enum TypeError {
 	// ── Names & resolution ───────────────────────────────────────────────────
 	/// A name was referenced that isn't bound in the current scope.
-	CannotFind { name: EcoString },
+	CannotFind {
+		name: EcoString,
+	},
 	/// A type name was referenced that isn't in scope.
-	CannotFindType { name: EcoString },
+	CannotFindType {
+		name: EcoString,
+	},
 	/// A pattern referenced an enum that isn't in scope.
-	CannotFindEnum { name: EcoString },
+	CannotFindEnum {
+		name: EcoString,
+	},
 	/// A pattern referenced a constructor that couldn't be resolved.
-	CannotFindConstructor { name: EcoString },
+	CannotFindConstructor {
+		name: EcoString,
+	},
 	/// A bare variant name matched more than one enum; it must be qualified.
-	AmbiguousVariant { name: EcoString },
+	AmbiguousVariant {
+		name: EcoString,
+	},
 	/// A name used in type position doesn't denote a type.
-	NotAType { name: EcoString },
+	NotAType {
+		name: EcoString,
+	},
 	/// A name used as an interface doesn't denote one.
-	NotAnInterface { name: EcoString },
+	NotAnInterface {
+		name: EcoString,
+	},
 	/// A generic parameter was given type arguments (it takes none).
-	GenericParamWithArgs { name: EcoString },
+	GenericParamWithArgs {
+		name: EcoString,
+	},
 	/// A top-level name was defined more than once.
 	Redefinition {
 		name: EcoString,
@@ -42,7 +58,9 @@ pub enum TypeError {
 	/// A type alias expands into itself without termination.
 	RecursiveTypeAlias,
 	/// Inference produced a type that contains itself.
-	InfiniteType { ty: String },
+	InfiniteType {
+		ty: String,
+	},
 
 	// ── Values & access ──────────────────────────────────────────────────────
 	/// `this` was used outside any method body.
@@ -54,44 +72,81 @@ pub enum TypeError {
 	/// A non-callable expression was called.
 	NotCallable,
 	/// A field was named that the type does not have.
-	UnknownField { field: EcoString },
+	UnknownField {
+		field: EcoString,
+	},
 	/// A struct literal supplied more fields than the type declares.
 	TooManyFields,
 	/// A field access named a field the receiver type lacks.
-	NoField { field: EcoString, ty: String },
+	NoField {
+		field: EcoString,
+		ty: String,
+	},
 	/// An enum was accessed with a variant name it doesn't declare.
 	EnumHasNoVariant {
 		enum_name: EcoString,
 		variant: EcoString,
 	},
 	/// A namespaced access found neither a variant nor a namespaced function.
-	NoVariantOrNamespacedFn { ty: EcoString, name: EcoString },
+	NoVariantOrNamespacedFn {
+		ty: EcoString,
+		name: EcoString,
+	},
 	/// A namespaced access found no namespaced function of that name.
-	NoNamespacedFn { ty: EcoString, name: EcoString },
+	NoNamespacedFn {
+		ty: EcoString,
+		name: EcoString,
+	},
 	/// No method of that name resolves for the receiver type.
-	NoMethod { method: EcoString, ty: String },
+	NoMethod {
+		method: EcoString,
+		ty: String,
+	},
 	/// A member access could not be resolved on the receiver type.
-	CannotAccess { member: EcoString, ty: String },
+	CannotAccess {
+		member: EcoString,
+		ty: String,
+	},
 	/// A namespaced function was called through a type parameter that lacks it.
-	NoNamespacedFnOnParam { name: EcoString },
+	NoNamespacedFnOnParam {
+		name: EcoString,
+	},
 
 	// ── Operators, casts, impls ──────────────────────────────────────────────
 	/// A required interface method isn't implemented for the operand type.
-	NotImplemented { method: EcoString, ty: String },
+	NotImplemented {
+		method: EcoString,
+		ty: String,
+	},
 	/// An `as` cast has no corresponding `Into` implementation.
-	CannotCast { from: String, to: String },
+	CannotCast {
+		from: String,
+		to: String,
+	},
 	/// Two types that were required to match did not.
-	MismatchedTypes { expected: String, found: String },
+	MismatchedTypes {
+		expected: String,
+		found: String,
+	},
 	/// Two impls of one interface overlap for the same receiver.
-	ConflictingImpls { iface: EcoString },
+	ConflictingImpls {
+		iface: EcoString,
+	},
 	/// No overload of a function matches the given arguments.
-	NoMatchingOverload { name: EcoString },
+	NoMatchingOverload {
+		name: EcoString,
+	},
 	/// Multiple impls apply to a call, and none is more specific.
-	AmbiguousCall { name: EcoString },
+	AmbiguousCall {
+		name: EcoString,
+	},
 
 	// ── Arguments ────────────────────────────────────────────────────────────
 	/// A call supplied the wrong number of arguments.
-	WrongArgCount { expected: usize, found: usize },
+	WrongArgCount {
+		expected: usize,
+		found: usize,
+	},
 	/// A named function/method was called with the wrong number of arguments.
 	NamedWrongArgCount {
 		name: EcoString,
@@ -101,9 +156,13 @@ pub enum TypeError {
 
 	// ── Assignment ───────────────────────────────────────────────────────────
 	/// Assignment to an immutable binding.
-	AssignToImmutable { name: EcoString },
+	AssignToImmutable {
+		name: EcoString,
+	},
 	/// Assignment to something that isn't an assignable place.
-	CannotAssign { name: EcoString },
+	CannotAssign {
+		name: EcoString,
+	},
 
 	// ── Patterns ─────────────────────────────────────────────────────────────
 	/// A constructor pattern used an unsupported path form.
@@ -122,7 +181,9 @@ pub enum TypeError {
 
 	// ── Exhaustiveness (warnings + errors) ───────────────────────────────────
 	/// A `match` does not cover a constructible value (witness rendered).
-	NonExhaustiveMatch { witness: String },
+	NonExhaustiveMatch {
+		witness: String,
+	},
 	/// A `match` over `int` leaves some values uncovered.
 	NonExhaustiveInt,
 	/// A `match` needs a `_` arm to cover its remaining cases.
@@ -135,7 +196,9 @@ pub enum TypeError {
 	/// Its constructor is not yet expressible in the value ABI (the emitted factory
 	/// takes an object, not positional args), so this is rejected rather than
 	/// silently miscompiled. Call it to construct instead.
-	FieldVariantAsValue { variant: EcoString },
+	FieldVariantAsValue {
+		variant: EcoString,
+	},
 
 	// ── Operators (late finalization) ────────────────────────────────────────
 	/// A binary operator's operand type was still an unresolved inference variable
@@ -148,7 +211,10 @@ pub enum TypeError {
 	/// the `impl Interface` param sugar) with a type that does not implement the
 	/// required interface — e.g. `measure(3)` against `measure<T: Area>(shape: T)`.
 	/// Without this check the call type-checks and then crashes at JS runtime.
-	BoundNotSatisfied { ty: String, interface: EcoString },
+	BoundNotSatisfied {
+		ty: String,
+		interface: EcoString,
+	},
 
 	// ── Inner members ────────────────────────────────────────────────────────
 	/// A struct/enum inner member — an instance `func`, a `namespace func`
@@ -199,7 +265,10 @@ pub enum TypeError {
 	/// linkage. New variant appended at the enum's end per the `ErrorCode`
 	/// derive's declaration-order codes (mints 2050; MainNonVoidReturn above kept
 	/// its existing 2049).
-	CastRequiresInto { from: String, to: String },
+	CastRequiresInto {
+		from: String,
+		to: String,
+	},
 
 	/// An `as` cast resolved a `holds`-satisfying `Into`-named interface (`self.defs
 	/// .get("Into")` found one, and some impl satisfies it for `src`/`target`), but
@@ -213,7 +282,10 @@ pub enum TypeError {
 	/// the class at all — the exact silent-miscompile bug this fixes). New variant
 	/// appended at the enum's end (mints 2051; CastRequiresInto above kept its
 	/// existing 2050).
-	IntoInterfaceMalformed { from: String, to: String },
+	IntoInterfaceMalformed {
+		from: String,
+		to: String,
+	},
 	/// A literal numeric-to-`char` cast truncates to a value outside the Unicode
 	/// scalar-value range (including the surrogate interval).
 	InvalidCharCastLiteral,
@@ -228,7 +300,9 @@ pub enum TypeError {
 	/// for, instead of reading like an ordinary type-mismatch bug. New variant
 	/// appended at the enum's end (mints 2052; IntoInterfaceMalformed above kept
 	/// its existing 2051).
-	LogicalOperandNotBoolean { found: String },
+	LogicalOperandNotBoolean {
+		found: String,
+	},
 
 	/// A source `int`/`uint` literal whose magnitude exceeds `2^53 - 1`
 	/// (`Number.MAX_SAFE_INTEGER`) — Nymph's `int`/`uint` are JS doubles at
@@ -245,13 +319,18 @@ pub enum TypeError {
 	/// special-casing of the surrounding `Negate` is needed. New variant
 	/// appended at the enum's end (mints 2053; LogicalOperandNotBoolean above
 	/// kept its existing 2052).
-	IntLiteralUnsafe { value: u64 },
+	IntLiteralUnsafe {
+		value: u64,
+	},
 
 	/// A field's SLOT was reassigned (`p.field = v`) through a receiver whose
 	/// type is not `mut` — mutable-types (MT1) enforcement. The field's own
 	/// declared type is irrelevant here; what's gating is whether `p` itself is
 	/// a `mut` view. New variant appended at the enum's end (mints 2054).
-	AssignFieldThroughImmutable { field: EcoString, ty: String },
+	AssignFieldThroughImmutable {
+		field: EcoString,
+		ty: String,
+	},
 
 	// ── Mutable types, interfaces (MT2) ──────────────────────────────────────
 	/// A `mut func` interface method (OO1: the interface's declared kind is the
@@ -261,7 +340,9 @@ pub enum TypeError {
 	/// receiver, an interface default body, and a `T: A` bound's `mut T`
 	/// requirement (OO3) alike. New variant appended at the enum's end (mints
 	/// 2055).
-	MutMethodNeedsMutReceiver { method: EcoString },
+	MutMethodNeedsMutReceiver {
+		method: EcoString,
+	},
 
 	/// An `impl A for B` (or nested `impl A { .. }`) restated a method's
 	/// `mut func`/`func` kind differently from what interface `A` itself
@@ -283,7 +364,9 @@ pub enum TypeError {
 	/// single type for `T` can be correct for both call sites when `A` is
 	/// implemented only for `mut B` (`impl A for mut B` / `impl mut A for B`).
 	/// New variant appended at the enum's end (mints 2057).
-	MixedMutabilityForBound { interface: EcoString },
+	MixedMutabilityForBound {
+		interface: EcoString,
+	},
 
 	/// A `T: A` bound obligation failed for a plain type `ty`, but the `mut`
 	/// version of `ty` WOULD satisfy it (OO4: `A` is implemented only for
@@ -291,7 +374,10 @@ pub enum TypeError {
 	/// specific diagnostic than [`TypeError::BoundNotSatisfied`], hinting the
 	/// fix directly (pass a `mut` value) rather than leaving the caller to
 	/// guess. New variant appended at the enum's end (mints 2058).
-	BoundSatisfiedOnlyByMut { ty: String, interface: EcoString },
+	BoundSatisfiedOnlyByMut {
+		ty: String,
+		interface: EcoString,
+	},
 
 	/// A `for` loop's source implements neither `Iterator` nor `Iterable` (the
 	/// only two shapes `infer_iterable_element` accepts once the syntactic-range
@@ -299,7 +385,9 @@ pub enum TypeError {
 	/// `self.fresh()` accept — the loop pattern bound to an unconstrained
 	/// inference variable that let the body typecheck against garbage, only to
 	/// panic in lowering. New variant appended at the enum's end (mints 2059).
-	NotIterable { ty: String },
+	NotIterable {
+		ty: String,
+	},
 
 	/// A `match` over `uint` leaves some values uncovered — the unsigned-domain
 	/// counterpart of [`TypeError::NonExhaustiveInt`], worded for `uint` so the
@@ -323,38 +411,67 @@ pub enum TypeError {
 	/// exactly one field, so there is no single field for it to bind to. `fields` is
 	/// the constructor's actual field count. New variant appended at the enum's end
 	/// (mints 2062).
-	PositionalPatternArity { fields: usize },
+	PositionalPatternArity {
+		fields: usize,
+	},
 
 	/// Range iteration advances by one, so its bounds must be discrete integer
 	/// values. Floating-point and other `Comparable` values do not define that
 	/// progression. New variant appended at the enum's end (mints 2063).
-	InvalidRangeBound { ty: String },
+	InvalidRangeBound {
+		ty: String,
+	},
 
 	/// One destructuring pattern binds the same local more than once.
-	DuplicatePatternBinding { name: EcoString },
+	DuplicatePatternBinding {
+		name: EcoString,
+	},
 	/// The alternatives of a union pattern introduce different locals.
 	InconsistentUnionBindings,
 	/// A tuple spread operand does not have a concrete, statically known tuple
 	/// shape, so its elements cannot be incorporated into the result type.
-	TupleSpreadRequiresStaticTuple { ty: String },
+	TupleSpreadRequiresStaticTuple {
+		ty: String,
+	},
 	/// An external let marker has no immutable-value registry entry.
-	ExternalValueLinkageMissing { marker: EcoString },
+	ExternalValueLinkageMissing {
+		marker: EcoString,
+	},
 	/// An external let marker is registered for a callable external instead.
-	ExternalLinkageWrongKind { marker: EcoString },
+	ExternalLinkageWrongKind {
+		marker: EcoString,
+	},
 	/// An external function marker is registered for an immutable value instead.
-	ExternalFunctionLinkageWrongKind { marker: EcoString },
+	ExternalFunctionLinkageWrongKind {
+		marker: EcoString,
+	},
 	/// The declared type has no raw-host marshalling ABI.
 	ExternalValueTypeUnsupported,
 	/// The declaration's marshal ABI differs from the registry contract.
-	ExternalValueTypeMismatch { marker: EcoString },
+	ExternalValueTypeMismatch {
+		marker: EcoString,
+	},
 	/// External host values are snapshots and cannot be mutable bindings.
 	ExternalValueMutable,
 	/// A loop-control expression has no lexically enclosing loop. Appended so
 	/// existing numeric diagnostic codes remain stable.
-	LoopControlOutsideLoop { keyword: &'static str },
+	LoopControlOutsideLoop {
+		keyword: &'static str,
+	},
 	/// One loop contains both `break` and `break value`. Appended so existing
 	/// numeric diagnostic codes remain stable.
 	MixedBreakForms,
+	UnknownControlLabel {
+		name: EcoString,
+	},
+	WrongControlLabelKind {
+		name: EcoString,
+		keyword: &'static str,
+	},
+	DuplicateControlLabel {
+		name: EcoString,
+		previous: Span,
+	},
 }
 
 impl IntoDiagnostic for TypeError {
@@ -382,6 +499,9 @@ impl IntoDiagnostic for TypeError {
 			E::MixedBreakForms => {
 				"a loop cannot mix bare `break` with `break value`".into()
 			}
+			E::UnknownControlLabel { name } => format!("unknown control label `{name}`").into(),
+			E::WrongControlLabelKind { name, keyword } => format!("`{keyword}` cannot target `{name}` because it has the wrong kind").into(),
+			E::DuplicateControlLabel { name, .. } => format!("control label `{name}` is already active").into(),
 
 			E::ThisOutsideMethod => "`this` is only valid inside a method".into(),
 			E::StructTypeAsValue => "a struct type cannot be used as a value directly".into(),
@@ -605,6 +725,9 @@ impl IntoDiagnostic for TypeError {
 				Label::new(*redefined_span, "redefined here"),
 				Label::new(*prev, "first defined here"),
 			],
+			TypeError::DuplicateControlLabel { previous, .. } => {
+				vec![Label::new(*previous, "previous label is here")]
+			}
 			_ => Vec::new(),
 		}
 	}

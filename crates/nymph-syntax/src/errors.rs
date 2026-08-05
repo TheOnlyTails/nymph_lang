@@ -9,7 +9,8 @@
 //! `code()` inherits the trait default (`None`).
 
 use ecow::EcoString;
-use nymph_diagnostics::{ErrorCode, IntoDiagnostic};
+use nymph_ast::Span;
+use nymph_diagnostics::{ErrorCode, IntoDiagnostic, Label};
 use nymph_errorcode::ErrorCode;
 
 /// A diagnostic produced while parsing (after lexing).
@@ -69,6 +70,14 @@ pub enum ParseError {
 	TrailingInterpolationContent,
 	/// An inclusive range (`a..=`) omitted its required upper bound.
 	MissingInclusiveRangeUpperBound,
+	/// Whitespace separated tokens that form a label's `@` edge.
+	WhitespaceInLabel,
+	/// The prefix and body labels on a closure did not agree.
+	MismatchedClosureLabels {
+		outer: EcoString,
+		inner: EcoString,
+		inner_span: Span,
+	},
 }
 
 impl IntoDiagnostic for ParseError {
@@ -111,6 +120,22 @@ impl IntoDiagnostic for ParseError {
 				"unexpected trailing content in string interpolation".into()
 			}
 			E::MissingInclusiveRangeUpperBound => "an inclusive range needs an upper bound".into(),
+			E::WhitespaceInLabel => "label syntax cannot contain whitespace around `@`".into(),
+			E::MismatchedClosureLabels { outer, inner, .. } => {
+				format!("closure labels must match: `{outer}` and `{inner}` differ").into()
+			}
+		}
+	}
+
+	fn labels(&self) -> Vec<Label> {
+		match self {
+			Self::MismatchedClosureLabels {
+				inner, inner_span, ..
+			} => vec![Label::new(
+				*inner_span,
+				format!("secondary label `{inner}`"),
+			)],
+			_ => Vec::new(),
 		}
 	}
 }

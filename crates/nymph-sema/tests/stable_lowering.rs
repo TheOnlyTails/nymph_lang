@@ -226,6 +226,33 @@ fn stable_lowering_preserves_loop_targets_and_canonical_option_abi() {
 }
 
 #[test]
+fn stable_lowering_preserves_resolved_labeled_block_returns() {
+	let lowered = lower_named(
+		"func choose(flag: boolean): int = result@{ if (flag) { return@choose 1 } return@result 7 }",
+		"choose",
+	);
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("expected function fragment")
+	};
+	assert!(matches!(
+		&function.body,
+		nymph_hir::hir::HirExpr::LabeledBlock { target, body }
+			if matches!(body.as_ref(), nymph_hir::hir::HirExpr::Block { stmts, .. }
+				if matches!(stmts.last(), Some(nymph_hir::hir::HirStmt::Return {
+					target: nymph_hir::hir::HirReturnTarget::Block(return_target), ..
+				}) if return_target == target)
+					&& matches!(stmts.first(), Some(nymph_hir::hir::HirStmt::Expr(nymph_hir::hir::HirExpr::If { then, .. }))
+						if matches!(then.as_ref(), nymph_hir::hir::HirExpr::Block { stmts, .. }
+							if matches!(stmts.as_slice(), [nymph_hir::hir::HirStmt::Return {
+								target: nymph_hir::hir::HirReturnTarget::Callable, ..
+							}])
+						)
+					)
+			)
+	));
+}
+
+#[test]
 fn stable_lowering_preserves_contextual_integer_literal_kinds() {
 	for (source, expected) in [
 		("func value(): int = 5", None),
@@ -298,7 +325,7 @@ fn stable_lowering_accepts_unbraced_return_branches() {
 			nymph_hir::hir::HirExpr::Block {
 				stmts,
 				tail: None,
-			} if matches!(stmts.as_slice(), [nymph_hir::hir::HirStmt::Return(Some(_))])
+			} if matches!(stmts.as_slice(), [nymph_hir::hir::HirStmt::Return { value: Some(_), .. }])
 		));
 	}
 }

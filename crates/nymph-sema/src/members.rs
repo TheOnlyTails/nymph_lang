@@ -726,8 +726,22 @@ impl<'m> Checker<'m> {
 			let ty = self.subst(ty, &empty, Some(self_ty));
 			self.bind_pattern(&param.0.name, ty, param.0.mutable);
 		}
+		let outer_labels = std::mem::take(&mut self.control_labels);
+		let trial_ret = self.fresh();
+		self.push_control_label(
+			Some(&meta.name),
+			body.id,
+			crate::check::ControlLabelKind::Callable,
+			None,
+			Some(trial_ret),
+		);
+		let previous_ret = self.ret_ty.replace(trial_ret);
+		self.resolve_anon(body, Some(trial_ret));
 		let body_ty = self.infer(body);
-		let ret = self.resolve_deep(body_ty);
+		self.subtype(body_ty, trial_ret, body.span);
+		self.ret_ty = previous_ret;
+		self.control_labels = outer_labels;
+		let ret = self.resolve_deep(trial_ret);
 
 		self.self_ty = prev_self;
 		self.pop_scope();
@@ -848,7 +862,7 @@ impl<'m> Checker<'m> {
 		}
 		let ret = self.subst(ret, &empty, Some(self_ty));
 		let prev_ret = self.ret_ty.replace(ret);
-		self.check(body, ret);
+		self.check_named_callable_body(&meta.name, body, ret);
 		// Drain this method body's deferred operators now, while its `param_bounds`
 		// (owner generics + this method's own) are still live — see
 		// `pending_operators`'s doc comment.
@@ -1001,7 +1015,7 @@ impl<'m> Checker<'m> {
 				None => self.fresh(),
 			};
 			let prev_ret = self.ret_ty.replace(ret);
-			self.check(body, ret);
+			self.check_named_callable_body(&meta.name, body, ret);
 			// Drain this member body's deferred operators now, while the impl
 			// block's `param_bounds` are still live — see `pending_operators`'s doc
 			// comment. All members of one impl block share the same bounds, but the
@@ -1145,7 +1159,7 @@ impl<'m> Checker<'m> {
 		}
 		let ret = self.subst(method.ret, &empty, Some(self_ty));
 		let prev_ret = self.ret_ty.replace(ret);
-		self.check(body, ret);
+		self.check_named_callable_body(&meta.name, body, ret);
 		// Drain this body's deferred operators now, while its `param_bounds` (the
 		// interface's generics + the synthetic self bound) are still live — see
 		// `pending_operators`'s doc comment.

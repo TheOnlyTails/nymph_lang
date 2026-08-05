@@ -88,6 +88,7 @@ pub struct Checker<'m> {
 	/// Lexical loop-control contracts, innermost last. Callable inference replaces
 	/// this stack so jumps cannot escape a callable body.
 	pub(crate) loop_controls: Vec<LoopBreakKind>,
+	pub(crate) control_labels: Vec<ControlLabel>,
 	/// Explicit DFS state used only while local aliases are collected.
 	pub(crate) alias_states: FxHashMap<DefId, AliasLowerState>,
 	pub(crate) collecting_signatures: bool,
@@ -187,6 +188,23 @@ pub struct Checker<'m> {
 	/// so a given `$N` occurrence can only ever be discovered by exactly one
 	/// top-level `resolve_anon` scan.
 	pub(crate) anon_consumed: FxHashSet<NodeId>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ControlLabel {
+	pub name: Option<EcoString>,
+	pub id: NodeId,
+	pub span: Span,
+	pub kind: ControlLabelKind,
+	pub loop_index: Option<usize>,
+	pub result_ty: Option<Ty>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlLabelKind {
+	Loop,
+	Block,
+	Callable,
 }
 
 /// One bound instantiated through the same exact substitution as its scheme.
@@ -893,6 +911,7 @@ impl<'m> Checker<'m> {
 			anon_ctx: Vec::new(),
 			anon_consumed: FxHashSet::default(),
 			loop_controls: Vec::new(),
+			control_labels: Vec::new(),
 		}
 	}
 

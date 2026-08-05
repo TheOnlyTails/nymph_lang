@@ -238,6 +238,87 @@ fn control_flow_expressions() {
 }
 
 #[test]
+fn labeled_control_syntax() {
+	for source in ["while@outer (true) {}", "for@outer (x in xs) {}"] {
+		let parsed = expr(source);
+		assert!(matches!(
+			parsed.kind,
+			ExprKind::While { label: Some(_), .. } | ExprKind::For { label: Some(_), .. }
+		));
+	}
+	assert!(matches!(
+		expr("outer@{ return@outer 1 }").kind,
+		ExprKind::Block { label: Some(_), .. }
+	));
+	assert!(matches!(
+		expr("break@outer 1").kind,
+		ExprKind::Break { label: Some(_), .. }
+	));
+	assert!(matches!(
+		expr("continue@outer").kind,
+		ExprKind::Continue { label: Some(_) }
+	));
+	assert!(matches!(
+		expr("outer@() -> 1").kind,
+		ExprKind::Closure { label: Some(_), .. }
+	));
+	assert!(matches!(
+		expr("() -> outer@{ return@outer 1 }").kind,
+		ExprKind::Closure { label: Some(_), .. }
+	));
+	assert!(matches!(
+		expr("outer@(x)  ->  outer@{ return@outer x }").kind,
+		ExprKind::Closure { label: Some(_), .. }
+	));
+}
+
+#[test]
+fn label_edges_must_be_adjacent() {
+	for source in [
+		"while @outer (true) {}",
+		"while@ outer (true) {}",
+		"for @outer (x in xs) {}",
+		"for@ outer (x in xs) {}",
+		"break @outer 1",
+		"break@ outer 1",
+		"continue @outer",
+		"continue@ outer",
+		"return @outer 1",
+		"return@ outer 1",
+		"outer @{ 1 }",
+		"outer@ { 1 }",
+		"outer @(x) -> x",
+		"outer@ (x) -> x",
+		"(x) -> outer @{ x }",
+		"(x) -> outer@ { x }",
+	] {
+		let result = parse_expression(source);
+		assert!(
+			result
+				.diagnostics
+				.iter()
+				.any(|diagnostic| diagnostic.message.contains("cannot contain whitespace")),
+			"expected focused label-whitespace diagnostic for {source:?}: {:?}",
+			result.diagnostics
+		);
+	}
+}
+
+#[test]
+fn mismatched_dual_closure_labels_mark_both_labels() {
+	let source = "outer@(x) -> inner@{ x }";
+	let result = parse_expression(source);
+	let diagnostic = result
+		.diagnostics
+		.iter()
+		.find(|diagnostic| diagnostic.message.contains("closure labels must match"))
+		.expect("expected mismatched-label diagnostic");
+	assert_eq!(diagnostic.span, Span::new(0, 5));
+	assert_eq!(diagnostic.labels.len(), 1);
+	assert_eq!(diagnostic.labels[0].span, Span::new(13, 18));
+}
+
+#[test]
 fn string_interpolation() {
 	let e = expr(r#""Hello, ${name}!""#);
 	let ExprKind::String(parts) = e.kind else {

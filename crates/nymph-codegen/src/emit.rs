@@ -123,6 +123,10 @@ pub struct Emitter<'a> {
 	/// Counter for fresh temporary names (result temporaries for value-position
 	/// control flow). `Cell` keeps the emit methods `&self`.
 	gensym: std::cell::Cell<u32>,
+	/// Counter in a compiler-reserved namespace for completion packets and catch
+	/// bindings. Nymph source identifiers cannot contain `$`, so these names
+	/// cannot shadow user locals referenced from a generated completion scope.
+	completion_gensym: std::cell::Cell<u32>,
 	/// Set while emitting a control-flow expression's (`Block`/`If`/`While`/
 	/// `Match`) generated IIFE body. Returns encountered there use the active
 	/// callable's private completion token rather than targeting the IIFE.
@@ -150,6 +154,7 @@ pub struct Emitter<'a> {
 	/// expression IIFE. The boolean records whether a callable actually needs
 	/// the corresponding catch boundary.
 	return_completion_tokens: std::cell::RefCell<Vec<(&'a str, bool)>>,
+	block_completion_tokens: std::cell::RefCell<Vec<(nymph_hir::hir::BlockTarget, &'a str)>>,
 	import_box_runtime: bool,
 	current_module: Option<String>,
 }
@@ -159,11 +164,13 @@ impl<'a> Emitter<'a> {
 		Emitter {
 			ast: AstBuilder::new(alloc),
 			gensym: std::cell::Cell::new(0),
+			completion_gensym: std::cell::Cell::new(0),
 			in_iife_subexpr: std::cell::Cell::new(false),
 			needed_imports: std::cell::RefCell::new(std::collections::BTreeSet::new()),
 			box_runtime_bindings: std::cell::RefCell::new(std::collections::BTreeSet::new()),
 			loop_completion_tokens: std::cell::RefCell::new(Vec::new()),
 			return_completion_tokens: std::cell::RefCell::new(Vec::new()),
+			block_completion_tokens: std::cell::RefCell::new(Vec::new()),
 			import_box_runtime: false,
 			current_module: None,
 		}
@@ -194,6 +201,12 @@ impl<'a> Emitter<'a> {
 		let n = self.gensym.get();
 		self.gensym.set(n + 1);
 		format!("_t{n}")
+	}
+
+	fn completion_name(&self) -> String {
+		let n = self.completion_gensym.get();
+		self.completion_gensym.set(n + 1);
+		format!("$nymph$completion${n}")
 	}
 
 	pub fn emit_module(&self, module: &HirModule) -> String {
@@ -1815,18 +1828,16 @@ impl<'a> Emitter<'a> {
 					.rev()
 					.find_map(|(found, token)| (*found == *target).then_some(*token))
 					.expect("break target is not active while emitting its loop body");
-				let mut elems = ArenaVec::new_in(&self.ast);
-				elems.push(ArrayExpressionElement::from(Expression::new_identifier(
-					SPAN, token, &self.ast,
-				)));
-				elems.push(ArrayExpressionElement::from(
-					Expression::new_numeric_literal(SPAN, 0.0, None, NumberBase::Decimal, &self.ast),
-				));
-				elems.push(ArrayExpressionElement::from(self.emit_expr(value)));
-				let thrown = Statement::new_throw_statement(
-					SPAN,
-					Expression::new_array_expression(SPAN, elems, &self.ast),
-					&self.ast,
+				let thrown = self.completion_transfer(
+					token,
+					Some(Expression::new_numeric_literal(
+						SPAN,
+						0.0,
+						None,
+						NumberBase::Decimal,
+						&self.ast,
+					)),
+					Some(self.emit_expr(value)),
 				);
 				JsValue {
 					stmts: ArenaVec::from_value_in(thrown, &self.ast),
@@ -1842,15 +1853,16 @@ impl<'a> Emitter<'a> {
 					.rev()
 					.find_map(|(found, token)| (*found == *target).then_some(*token))
 					.expect("continue target is not active while emitting its loop body");
-				let mut elems = ArenaVec::new_in(&self.ast);
-				elems.push(Expression::new_identifier(SPAN, token, &self.ast).into());
-				elems.push(
-					Expression::new_numeric_literal(SPAN, 1.0, None, NumberBase::Decimal, &self.ast).into(),
-				);
-				let thrown = Statement::new_throw_statement(
-					SPAN,
-					Expression::new_array_expression(SPAN, elems, &self.ast),
-					&self.ast,
+				let thrown = self.completion_transfer(
+					token,
+					Some(Expression::new_numeric_literal(
+						SPAN,
+						1.0,
+						None,
+						NumberBase::Decimal,
+						&self.ast,
+					)),
+					None,
 				);
 				JsValue {
 					stmts: ArenaVec::from_value_in(thrown, &self.ast),
@@ -1924,6 +1936,28 @@ impl<'a> Emitter<'a> {
 			}
 			// A closure → a JS arrow function `(<params>) => { … }` (Slice 4L).
 			HirExpr::Closure { params, body } => self.closure_arrow(params, body),
+			HirExpr::LabeledBlock { target, body } => {
+				let token = self.begin_return_completion();
+				self
+					.block_completion_tokens
+					.borrow_mut()
+					.push((*target, token));
+				let previous_iife = self.in_iife_subexpr.replace(true);
+				let value = self.emit_value(body);
+				self.in_iife_subexpr.set(previous_iife);
+				self.block_completion_tokens.borrow_mut().pop();
+				let mut stmts = value.stmts;
+				stmts.push(Statement::new_return_statement(
+					SPAN,
+					Some(value.expr),
+					&self.ast,
+				));
+				JsValue {
+					stmts: self.finish_return_completion(token, stmts),
+					expr: Expression::new_identifier(SPAN, "undefined", &self.ast),
+				}
+				.into_expression(self.ast)
+			}
 		}
 	}
 
@@ -2028,8 +2062,50 @@ impl<'a> Emitter<'a> {
 		)))
 	}
 
+	fn completion_slot(&self, token: &'a str, index: f64) -> AssignmentTarget<'a> {
+		AssignmentTarget::from(MemberExpression::ComputedMemberExpression(
+			ComputedMemberExpression::boxed(
+				SPAN,
+				Expression::new_identifier(SPAN, token, &self.ast),
+				Expression::new_numeric_literal(SPAN, index, None, NumberBase::Decimal, &self.ast),
+				false,
+				&self.ast,
+			),
+		))
+	}
+
+	fn completion_transfer(
+		&self,
+		token: &'a str,
+		kind: Option<Expression<'a>>,
+		value: Option<Expression<'a>>,
+	) -> Statement<'a> {
+		let mut statements = ArenaVec::new_in(&self.ast);
+		for (index, expression) in [(1.0, kind), (2.0, value)] {
+			if let Some(expression) = expression {
+				statements.push(Statement::new_expression_statement(
+					SPAN,
+					Expression::new_assignment_expression(
+						SPAN,
+						AssignmentOperator::Assign,
+						self.completion_slot(token, index),
+						expression,
+						&self.ast,
+					),
+					&self.ast,
+				));
+			}
+		}
+		statements.push(Statement::new_throw_statement(
+			SPAN,
+			Expression::new_identifier(SPAN, token, &self.ast),
+			&self.ast,
+		));
+		Statement::new_block_statement(SPAN, statements, &self.ast)
+	}
+
 	fn begin_return_completion(&self) -> &'a str {
-		let token = self.ast.allocator.alloc_str(&self.gensym());
+		let token = self.ast.allocator.alloc_str(&self.completion_name());
 		self
 			.return_completion_tokens
 			.borrow_mut()
@@ -2038,8 +2114,8 @@ impl<'a> Emitter<'a> {
 	}
 
 	/// Wrap a callable body only when one of its returns must cross a generated
-	/// expression IIFE. The private object token prevents collisions with user
-	/// exceptions, which are rethrown unchanged.
+	/// expression IIFE. The private packet is recognized by identity before any
+	/// fields are read, so arbitrary user exceptions are rethrown unchanged.
 	fn finish_return_completion(
 		&self,
 		token: &'a str,
@@ -2055,7 +2131,7 @@ impl<'a> Emitter<'a> {
 			return body;
 		}
 
-		let completion = self.ast.allocator.alloc_str(&self.gensym());
+		let completion = self.ast.allocator.alloc_str(&self.completion_name());
 		let completion_at = |index: f64| {
 			Expression::from(MemberExpression::ComputedMemberExpression(
 				ComputedMemberExpression::boxed(
@@ -2067,31 +2143,17 @@ impl<'a> Emitter<'a> {
 				),
 			))
 		};
-		let null_test = Expression::new_binary_expression(
-			SPAN,
-			Expression::new_identifier(SPAN, completion, &self.ast),
-			BinaryOperator::Equality,
-			Expression::NullLiteral(NullLiteral::boxed(SPAN, &self.ast)),
-			&self.ast,
-		);
 		let wrong_token = Expression::new_binary_expression(
 			SPAN,
-			completion_at(0.0),
+			Expression::new_identifier(SPAN, completion, &self.ast),
 			BinaryOperator::StrictInequality,
 			Expression::new_identifier(SPAN, token, &self.ast),
-			&self.ast,
-		);
-		let target_test = Expression::new_logical_expression(
-			SPAN,
-			null_test,
-			LogicalOperator::Or,
-			wrong_token,
 			&self.ast,
 		);
 		let mut catch_stmts = ArenaVec::new_in(&self.ast);
 		catch_stmts.push(Statement::new_if_statement(
 			SPAN,
-			target_test,
+			wrong_token,
 			Statement::new_throw_statement(
 				SPAN,
 				Expression::new_identifier(SPAN, completion, &self.ast),
@@ -2102,7 +2164,7 @@ impl<'a> Emitter<'a> {
 		));
 		catch_stmts.push(Statement::new_return_statement(
 			SPAN,
-			Some(completion_at(1.0)),
+			Some(completion_at(2.0)),
 			&self.ast,
 		));
 		let handler = CatchClause::boxed(
@@ -2124,17 +2186,9 @@ impl<'a> Emitter<'a> {
 			&self.ast,
 		);
 		let mut wrapped = ArenaVec::new_in(&self.ast);
-		wrapped.push(self.let_uninit(token));
-		wrapped.push(Statement::new_expression_statement(
-			SPAN,
-			Expression::new_assignment_expression(
-				SPAN,
-				AssignmentOperator::Assign,
-				self.assign_target(token),
-				Expression::new_object_expression(SPAN, ArenaVec::new_in(&self.ast), &self.ast),
-				&self.ast,
-			),
-			&self.ast,
+		wrapped.push(self.const_decl(
+			token,
+			Expression::new_array_expression(SPAN, ArenaVec::new_in(&self.ast), &self.ast),
 		));
 		wrapped.push(try_stmt);
 		wrapped
@@ -2234,31 +2288,43 @@ impl<'a> Emitter<'a> {
 			// A return under a generated expression IIFE uses the callable's private
 			// completion token so it can cross that synthetic function boundary.
 			// Ordinary statement-position returns remain direct JS returns.
-			HirStmt::Return(value) => {
-				if self.in_iife_subexpr.get() {
+			HirStmt::Return { value, target } => {
+				let block_token = match target {
+					nymph_hir::hir::HirReturnTarget::Callable => None,
+					nymph_hir::hir::HirReturnTarget::Block(target) => self
+						.block_completion_tokens
+						.borrow()
+						.iter()
+						.rev()
+						.find_map(|(candidate, token)| (candidate == target).then_some(*token)),
+				};
+				if block_token.is_some() || self.in_iife_subexpr.get() {
 					let token = {
 						let mut tokens = self.return_completion_tokens.borrow_mut();
-						let (token, used) = tokens
-							.last_mut()
-							.expect("return in an expression IIFE has an active callable");
+						let (token, used) = if let Some(block_token) = block_token {
+							tokens
+								.iter_mut()
+								.rev()
+								.find(|(token, _)| *token == block_token)
+						} else {
+							let block_tokens = self.block_completion_tokens.borrow();
+							tokens.iter_mut().rev().find(|(token, _)| {
+								!block_tokens
+									.iter()
+									.any(|(_, block_token)| block_token == token)
+							})
+						}
+						.expect("completion return has an active target");
 						*used = true;
 						*token
 					};
-					let mut elems = ArenaVec::new_in(&self.ast);
-					elems.push(Expression::new_identifier(SPAN, token, &self.ast).into());
-					elems.push(
-						value
-							.as_ref()
-							.map_or_else(
-								|| Expression::new_identifier(SPAN, "undefined", &self.ast),
-								|value| self.emit_expr(value),
-							)
-							.into(),
-					);
-					Statement::new_throw_statement(
-						SPAN,
-						Expression::new_array_expression(SPAN, elems, &self.ast),
-						&self.ast,
+					self.completion_transfer(
+						token,
+						None,
+						Some(value.as_ref().map_or_else(
+							|| Expression::new_identifier(SPAN, "undefined", &self.ast),
+							|value| self.emit_expr(value),
+						)),
 					)
 				} else {
 					let value_expr = value.as_ref().map(|value| self.emit_expr(value));
@@ -2321,8 +2387,8 @@ impl<'a> Emitter<'a> {
 				option,
 			} => {
 				let cond_expr = self.emit_cond(cond);
-				let completion = self.ast.allocator.alloc_str(&self.gensym());
-				let token = self.ast.allocator.alloc_str(&self.gensym());
+				let completion = self.ast.allocator.alloc_str(&self.completion_name());
+				let token = self.ast.allocator.alloc_str(&self.completion_name());
 				self
 					.loop_completion_tokens
 					.borrow_mut()
@@ -2343,31 +2409,17 @@ impl<'a> Emitter<'a> {
 						),
 					))
 				};
-				let null_test = Expression::new_binary_expression(
-					SPAN,
-					Expression::new_identifier(SPAN, completion, &self.ast),
-					BinaryOperator::Equality,
-					Expression::NullLiteral(NullLiteral::boxed(SPAN, &self.ast)),
-					&self.ast,
-				);
 				let wrong_token = Expression::new_binary_expression(
 					SPAN,
-					completion_at(0.0),
+					Expression::new_identifier(SPAN, completion, &self.ast),
 					BinaryOperator::StrictInequality,
 					Expression::new_identifier(SPAN, token, &self.ast),
-					&self.ast,
-				);
-				let target_test = Expression::new_logical_expression(
-					SPAN,
-					null_test,
-					LogicalOperator::Or,
-					wrong_token,
 					&self.ast,
 				);
 				let mut catch_stmts = ArenaVec::new_in(&self.ast);
 				catch_stmts.push(Statement::new_if_statement(
 					SPAN,
-					target_test,
+					wrong_token,
 					Statement::new_throw_statement(
 						SPAN,
 						Expression::new_identifier(SPAN, completion, &self.ast),
@@ -2461,17 +2513,9 @@ impl<'a> Emitter<'a> {
 				);
 				let while_stmt = Statement::new_while_statement(SPAN, cond_expr, body_stmt, &self.ast);
 				let mut stmts = ArenaVec::new_in(&self.ast);
-				stmts.push(self.let_uninit(token));
-				stmts.push(Statement::new_expression_statement(
-					SPAN,
-					Expression::new_assignment_expression(
-						SPAN,
-						AssignmentOperator::Assign,
-						self.assign_target(token),
-						Expression::new_object_expression(SPAN, ArenaVec::new_in(&self.ast), &self.ast),
-						&self.ast,
-					),
-					&self.ast,
+				stmts.push(self.const_decl(
+					token,
+					Expression::new_array_expression(SPAN, ArenaVec::new_in(&self.ast), &self.ast),
 				));
 				if let (Some(result), Some(option)) = (result, option) {
 					stmts.push(self.let_uninit(result));

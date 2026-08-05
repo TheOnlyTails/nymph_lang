@@ -339,9 +339,12 @@ func first_positive(xs: #[int]): int = {
 }
 ```
 
-`break` and `continue` target the innermost lexically enclosing `while` or `for` loop. A callable
-body is a boundary: a closure or nested function cannot jump to a loop outside that callable.
-Labels are not currently supported.
+`break` and `continue` target the innermost lexically enclosing `while` or `for` loop. Label a loop
+as `while@outer (...)` or `for@outer (...)`, then target it as `break@outer value` or
+`continue@outer`. A block is labeled `outer@{ ... }`; `return@outer value` completes that block,
+and all such returns unify with its direct tail value. A callable body is a boundary: control can
+never target a construct outside the current callable. Unlabeled return still targets the nearest
+callable.
 
 A loop with no targeting `break` has type `void`. If it contains bare `break`, its result is
 `Option<#()>` (`Some(#())` on the early exit and `None` on natural exhaustion). If every targeting

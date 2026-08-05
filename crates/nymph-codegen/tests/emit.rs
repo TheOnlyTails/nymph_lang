@@ -471,7 +471,10 @@ fn closure_return_emits_fine_inside_a_subexpression_position_match_arm() {
 							body: HirExpr::Closure {
 								params: vec!["x".into()],
 								body: Box::new(HirExpr::Block {
-									stmts: vec![HirStmt::Return(Some(HirExpr::Local("x".into())))],
+									stmts: vec![HirStmt::Return {
+										value: Some(HirExpr::Local("x".into())),
+										target: nymph_hir::hir::HirReturnTarget::Callable,
+									}],
 									tail: None,
 								}),
 							},
@@ -503,7 +506,10 @@ fn function_return_crosses_a_generated_iife_without_losing_sibling_values() {
 				rhs: Box::new(HirExpr::If {
 					cond: Box::new(HirExpr::Local("flag".into())),
 					then: Box::new(HirExpr::Block {
-						stmts: vec![HirStmt::Return(Some(HirExpr::Num(7.0, NumKind::Int)))],
+						stmts: vec![HirStmt::Return {
+							value: Some(HirExpr::Num(7.0, NumKind::Int)),
+							target: nymph_hir::hir::HirReturnTarget::Callable,
+						}],
 						tail: None,
 					}),
 					otherwise: Some(Box::new(HirExpr::Num(2.0, NumKind::Int))),
@@ -515,7 +521,7 @@ fn function_return_crosses_a_generated_iife_without_losing_sibling_values() {
 	};
 	let js = emit(&module);
 	assert!(
-		js.contains("throw ["),
+		js.contains("throw $nymph$completion$"),
 		"return crosses the generated IIFE: {js}"
 	);
 	assert!(
@@ -551,7 +557,10 @@ fn return_inside_a_nested_subexpression_uses_the_closure_completion_target() {
 									pat: HirPat::Lit(HirLit::Num(0.0, NumKind::Int)),
 									guard: None,
 									body: HirExpr::Block {
-										stmts: vec![HirStmt::Return(Some(HirExpr::Num(1.0, NumKind::Int)))],
+										stmts: vec![HirStmt::Return {
+											value: Some(HirExpr::Num(1.0, NumKind::Int)),
+											target: nymph_hir::hir::HirReturnTarget::Callable,
+										}],
 										tail: None,
 									},
 								},
@@ -571,7 +580,10 @@ fn return_inside_a_nested_subexpression_uses_the_closure_completion_target() {
 		enums: vec![],
 	};
 	let js = emit(&module);
-	assert!(js.contains("throw ["), "return completion is thrown: {js}");
+	assert!(
+		js.contains("throw $nymph$completion$"),
+		"return completion is thrown: {js}"
+	);
 	assert!(
 		js.contains("catch ("),
 		"closure catches its completion: {js}"

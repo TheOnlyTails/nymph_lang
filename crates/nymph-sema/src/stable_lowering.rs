@@ -1565,6 +1565,8 @@ fn lower_body(
 		loop_depth: Cell::new(0),
 		loop_targets: RefCell::new(Vec::new()),
 		next_loop_target: Cell::new(0),
+		block_targets: RefCell::new(Vec::new()),
+		next_block_target: Cell::new(0),
 		self_type,
 		implementation_slots,
 		receiver_binding: has_receiver.then(|| EcoString::from("$self")),
@@ -1690,8 +1692,10 @@ struct StableBodyLowerer<'a, C> {
 	execution: RefCell<&'a mut RuntimeExecutionSummary>,
 	deferred_depth: Cell<u32>,
 	loop_depth: Cell<u32>,
-	loop_targets: RefCell<Vec<u32>>,
+	loop_targets: RefCell<Vec<(crate::BodyNodeId, u32)>>,
 	next_loop_target: Cell<u32>,
+	block_targets: RefCell<Vec<(crate::BodyNodeId, nymph_hir::hir::BlockTarget)>>,
+	next_block_target: Cell<nymph_hir::hir::BlockTarget>,
 	self_type: Option<&'a InterfaceType>,
 	implementation_slots: Option<&'a crate::ImplementationMemberCatalog>,
 	receiver_binding: Option<EcoString>,
@@ -2009,23 +2013,45 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.map(|(_, variant)| variant)
 	}
 	fn lower_function_body(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
-		if let StableExprKind::Block { body, .. } = &expr.kind {
-			self.lower_block(body, false)
-		} else {
-			self.lower(expr)
-		}
+		let outer_loops = self.loop_targets.replace(Vec::new());
+		let outer_blocks = self.block_targets.replace(Vec::new());
+		let lowered = match &expr.kind {
+			StableExprKind::Block { body, label: None } => self.lower_block(body, false),
+			StableExprKind::Block {
+				body,
+				label: Some(_),
+			} => {
+				let target = self.next_block_target.get();
+				self.next_block_target.set(target + 1);
+				self
+					.block_targets
+					.borrow_mut()
+					.push((self.id(expr), target));
+				let body = self.lower_block(body, false);
+				self.block_targets.borrow_mut().pop();
+				body.map(|body| HirExpr::LabeledBlock {
+					target,
+					body: Box::new(body),
+				})
+			}
+			_ => self.lower(expr),
+		};
+		self.block_targets.replace(outer_blocks);
+		self.loop_targets.replace(outer_loops);
+		lowered
 	}
 	fn lower_branch(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
 		self.lower(expr)
 	}
 	fn lower_loop_branch(
 		&self,
+		source: crate::BodyNodeId,
 		target: u32,
 		expr: &StableExpr,
 	) -> Result<HirExpr, StableLoweringError> {
 		let depth = self.loop_depth.get();
 		self.loop_depth.set(depth + 1);
-		self.loop_targets.borrow_mut().push(target);
+		self.loop_targets.borrow_mut().push((source, target));
 		let result = self.lower_branch(expr);
 		self.loop_targets.borrow_mut().pop();
 		self.loop_depth.set(depth);
@@ -2035,6 +2061,26 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		let target = self.next_loop_target.get();
 		self.next_loop_target.set(target + 1);
 		target
+	}
+	fn return_target(&self, expr: &StableExpr) -> nymph_hir::hir::HirReturnTarget {
+		let jump = self.id(expr);
+		let resolved = self
+			.annotations
+			.control_targets
+			.iter()
+			.find_map(|(candidate, target)| (*candidate == jump).then_some(*target));
+		let Some(crate::runtime::RuntimeControlTarget::Block(resolved)) = resolved else {
+			return nymph_hir::hir::HirReturnTarget::Callable;
+		};
+		self
+			.block_targets
+			.borrow()
+			.iter()
+			.rev()
+			.find(|(source, _)| *source == resolved)
+			.map_or(nymph_hir::hir::HirReturnTarget::Callable, |(_, target)| {
+				nymph_hir::hir::HirReturnTarget::Block(*target)
+			})
 	}
 	fn loop_option(
 		&self,
@@ -2076,7 +2122,9 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				.collect();
 			let loop_depth = self.loop_depth.replace(0);
 			let loop_targets = self.loop_targets.replace(Vec::new());
+			let block_targets = self.block_targets.replace(Vec::new());
 			let body = self.lower_deferred(|| self.lower_inner(expr));
+			self.block_targets.replace(block_targets);
 			self.loop_targets.replace(loop_targets);
 			self.loop_depth.set(loop_depth);
 			let body = body?;
@@ -2612,7 +2660,24 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					value: Box::new(value),
 				}
 			}
-			StableExprKind::Block { body, .. } => self.lower_block(body, true)?,
+			StableExprKind::Block { body, label } => {
+				if label.is_some() {
+					let target = self.next_block_target.get();
+					self.next_block_target.set(target + 1);
+					self
+						.block_targets
+						.borrow_mut()
+						.push((self.id(expr), target));
+					let body = self.lower_block(body, true)?;
+					self.block_targets.borrow_mut().pop();
+					HirExpr::LabeledBlock {
+						target,
+						body: Box::new(body),
+					}
+				} else {
+					self.lower_block(body, true)?
+				}
+			}
 			StableExprKind::If {
 				condition,
 				then,
@@ -2626,15 +2691,13 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.transpose()?,
 			},
 			StableExprKind::While {
-				condition,
-				body,
-				label: None,
+				condition, body, ..
 			} => {
 				let target = self.next_loop();
 				HirExpr::While {
 					target,
 					cond: Box::new(self.lower(condition)?),
-					body: Box::new(self.lower_loop_branch(target, body)?),
+					body: Box::new(self.lower_loop_branch(self.id(expr), target, body)?),
 					continue_epilogue: None,
 					option: self.loop_option(expr)?,
 				}
@@ -2647,7 +2710,9 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.collect::<Result<_, _>>()?;
 				let loop_depth = self.loop_depth.replace(0);
 				let loop_targets = self.loop_targets.replace(Vec::new());
+				let block_targets = self.block_targets.replace(Vec::new());
 				let body = self.lower_deferred(|| self.lower_function_body(body));
+				self.block_targets.replace(block_targets);
 				self.loop_targets.replace(loop_targets);
 				self.loop_depth.set(loop_depth);
 				let body = body?;
@@ -2657,18 +2722,30 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					body: Box::new(body),
 				}
 			}
-			StableExprKind::Return { value, label: None } => HirExpr::Block {
-				stmts: vec![HirStmt::Return(
-					value.as_ref().map(|value| self.lower(value)).transpose()?,
-				)],
+			StableExprKind::Return { value, .. } => HirExpr::Block {
+				stmts: vec![HirStmt::Return {
+					value: value.as_ref().map(|value| self.lower(value)).transpose()?,
+					target: self.return_target(expr),
+				}],
 				tail: None,
 			},
-			StableExprKind::Return { .. } => return Err(self.unsupported(expr, "labeled return")),
-			StableExprKind::Break { value, label: None } => HirExpr::Break {
-				target: *self
+			StableExprKind::Break { value, .. } => HirExpr::Break {
+				target: self
 					.loop_targets
 					.borrow()
-					.last()
+					.iter()
+					.rev()
+					.find(|(source, _)| {
+						self
+							.annotations
+							.control_targets
+							.iter()
+							.any(|(jump, target)| {
+								*jump == self.id(expr)
+									&& matches!(target, crate::runtime::RuntimeControlTarget::Loop(id) if id == source)
+							})
+					})
+					.map(|(_, target)| *target)
 					.ok_or_else(|| self.unsupported(expr, "break outside a loop"))?,
 				value: Box::new(
 					value
@@ -2681,17 +2758,25 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						}),
 				),
 			},
-			StableExprKind::Continue { label: None } => HirExpr::Continue {
-				target: *self
+			StableExprKind::Continue { .. } => HirExpr::Continue {
+				target: self
 					.loop_targets
 					.borrow()
-					.last()
+					.iter()
+					.rev()
+					.find(|(source, _)| {
+						self
+							.annotations
+							.control_targets
+							.iter()
+							.any(|(jump, target)| {
+								*jump == self.id(expr)
+									&& matches!(target, crate::runtime::RuntimeControlTarget::Loop(id) if id == source)
+							})
+					})
+					.map(|(_, target)| *target)
 					.ok_or_else(|| self.unsupported(expr, "continue outside a loop"))?,
 			},
-			StableExprKind::Break { label: Some(_), .. }
-			| StableExprKind::Continue { label: Some(_) } => {
-				return Err(self.unsupported(expr, "labeled loop control"));
-			}
 			StableExprKind::IndexAccess { parent, index, .. } if self.definitely_transfers(parent) => {
 				self.lower(parent)?
 			}
@@ -2716,8 +2801,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				variable,
 				iterable,
 				body,
-				label: None,
-			} => self.lower_for(variable, iterable, body, self.loop_option(expr)?)?,
+				..
+			} => self.lower_for(
+				self.id(expr),
+				variable,
+				iterable,
+				body,
+				self.loop_option(expr)?,
+			)?,
 			StableExprKind::Range(range) => {
 				let definition = self.target(expr).ok_or_else(|| {
 					invalid(
@@ -2796,8 +2887,6 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				dispatch => self.lower_dispatch(dispatch, lhs, vec![])?,
 			},
 			StableExprKind::String(parts) => self.lower_string(parts)?,
-			StableExprKind::While { .. } => return Err(self.unsupported(expr, "labeled while")),
-			StableExprKind::For { .. } => return Err(self.unsupported(expr, "labeled for")),
 		})
 	}
 	fn replace_dispatch_argument(expr: &mut HirExpr, argument: HirExpr) {
@@ -3957,6 +4046,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 	}
 	fn lower_for(
 		&self,
+		source_id: crate::BodyNodeId,
 		variable: &StablePattern,
 		iterable: &StableExpr,
 		body: &StableExpr,
@@ -3998,7 +4088,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			let done = self.declare(&"$range_done".into());
 			let pat = self.lower_pattern(variable)?;
 			let target = self.next_loop();
-			let body = self.lower_loop_branch(target, body)?;
+			let body = self.lower_loop_branch(source_id, target, body)?;
 			self.scopes.borrow_mut().pop();
 			let current_expr = || HirExpr::Local(current.clone());
 			let end_expr = || HirExpr::Local(end.clone());
@@ -4248,7 +4338,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		let go = self.declare(&"$go".into());
 		let pat = self.lower_pattern(variable)?;
 		let target = self.next_loop();
-		let body = self.lower_loop_branch(target, body)?;
+		let body = self.lower_loop_branch(source_id, target, body)?;
 		self.scopes.borrow_mut().pop();
 		let call = HirExpr::Call {
 			callee: Box::new(HirExpr::Field {
@@ -4690,12 +4780,13 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					});
 				}
 				StableStatement::Expr(expr) if matches!(expr.kind, StableExprKind::Return { .. }) => {
-					let StableExprKind::Return { value, label: None } = &expr.kind else {
-						return Err(self.unsupported(expr, "labeled return"));
+					let StableExprKind::Return { value, .. } = &expr.kind else {
+						unreachable!()
 					};
-					stmts.push(HirStmt::Return(
-						value.as_ref().map(|value| self.lower(value)).transpose()?,
-					));
+					stmts.push(HirStmt::Return {
+						value: value.as_ref().map(|value| self.lower(value)).transpose()?,
+						target: self.return_target(expr),
+					});
 				}
 				StableStatement::Expr(expr) if last => {
 					let lowered = self.lower(expr)?;

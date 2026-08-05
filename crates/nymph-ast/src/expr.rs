@@ -85,6 +85,8 @@ pub enum ExprKind {
 	},
 	/// `(x, y) -> x + y`, `x -> x * 2`
 	Closure {
+		/// Callable label written before the parameter list or on the body block.
+		label: Option<Ident>,
 		params: Vec<Spanned<ClosureParam>>,
 		generics: Vec<Spanned<GenericParam>>,
 		return_type: Option<Spanned<Type>>,

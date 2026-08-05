@@ -50,9 +50,10 @@ fn hir_contains(
 		HirExpr::Block { stmts, tail } => {
 			stmts.iter().any(|stmt| match stmt {
 				HirStmt::Let { value, .. } | HirStmt::Expr(value) => contains(value),
-				HirStmt::Return(value) => value.as_ref().is_some_and(contains),
+				HirStmt::Return { value, .. } => value.as_ref().is_some_and(contains),
 			}) || tail.as_ref().is_some_and(|tail| contains(tail))
 		}
+		HirExpr::LabeledBlock { body, .. } => contains(body),
 		HirExpr::If {
 			cond,
 			then,

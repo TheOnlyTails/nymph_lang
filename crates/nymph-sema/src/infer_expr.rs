@@ -18,8 +18,12 @@ use nymph_ast::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::annotate::{DispatchKind, IterMode, Resolution};
-use crate::check::{Checker, InstantiatedObligation, LoopBreakKind, PendingBound};
+use crate::annotate::{
+	DispatchKind, IterMode, Resolution, ResolvedControlTarget, ResolvedControlTargetKind,
+};
+use crate::check::{
+	Checker, ControlLabel, ControlLabelKind, InstantiatedObligation, LoopBreakKind, PendingBound,
+};
 use crate::def::{DefKind, FuncSig, NamespaceMemberSig};
 use crate::errors::TypeError;
 use crate::ids::{DefId, ParamIdx};
@@ -148,6 +152,116 @@ enum BoundFinalizationDisposition {
 }
 
 impl<'m> Checker<'m> {
+	pub(crate) fn push_control_label(
+		&mut self,
+		label: Option<&nymph_ast::Ident>,
+		id: NodeId,
+		kind: ControlLabelKind,
+		loop_index: Option<usize>,
+		result_ty: Option<Ty>,
+	) {
+		if let Some(label) = label {
+			if let Some(previous) = self
+				.control_labels
+				.iter()
+				.rev()
+				.find(|target| target.name.as_ref() == Some(&label.0))
+			{
+				self.emit(
+					label.1,
+					TypeError::DuplicateControlLabel {
+						name: label.0.clone(),
+						previous: previous.span,
+					},
+				);
+			}
+		}
+		self.control_labels.push(ControlLabel {
+			name: label.map(|label| label.0.clone()),
+			id,
+			span: label.map_or(Span::new(0, 0), |label| label.1),
+			kind,
+			loop_index,
+			result_ty,
+		});
+	}
+
+	fn resolve_control(
+		&mut self,
+		expr: &Expr,
+		label: Option<&nymph_ast::Ident>,
+		keyword: &'static str,
+		allowed: &[ControlLabelKind],
+	) -> Option<ControlLabel> {
+		let target = if let Some(label) = label {
+			self
+				.control_labels
+				.iter()
+				.rev()
+				.find(|target| target.name.as_ref() == Some(&label.0))
+				.cloned()
+				.or_else(|| {
+					self.emit(
+						label.1,
+						TypeError::UnknownControlLabel {
+							name: label.0.clone(),
+						},
+					);
+					None
+				})
+		} else {
+			self
+				.control_labels
+				.iter()
+				.rev()
+				.find(|target| {
+					allowed.contains(&target.kind)
+						&& (keyword != "return" || target.kind == ControlLabelKind::Callable)
+				})
+				.cloned()
+		};
+		let target = target?;
+		if !allowed.contains(&target.kind) {
+			let name = label.map_or_else(|| "<nearest>".into(), |label| label.0.clone());
+			self.emit(
+				label.map_or(expr.span, |label| label.1),
+				TypeError::WrongControlLabelKind { name, keyword },
+			);
+			return None;
+		}
+		let kind = match target.kind {
+			ControlLabelKind::Loop => ResolvedControlTargetKind::Loop,
+			ControlLabelKind::Block => ResolvedControlTargetKind::Block,
+			ControlLabelKind::Callable => ResolvedControlTargetKind::Callable,
+		};
+		self.annotations.record_control_target(
+			expr.id,
+			ResolvedControlTarget {
+				source: target.id,
+				kind,
+			},
+		);
+		Some(target)
+	}
+
+	pub(crate) fn check_named_callable_body(
+		&mut self,
+		name: &nymph_ast::Ident,
+		body: &Expr,
+		ret: Ty,
+	) {
+		let outer_labels = std::mem::take(&mut self.control_labels);
+		self.push_control_label(
+			Some(name),
+			body.id,
+			ControlLabelKind::Callable,
+			None,
+			Some(ret),
+		);
+		self.resolve_anon(body, Some(ret));
+		self.check(body, ret);
+		self.control_labels = outer_labels;
+	}
 	// ── Body driver ──────────────────────────────────────────────────────────
 	pub(crate) fn check_bodies(&mut self) {
 		let defs: Vec<(DefId, DefKind, usize)> = self
@@ -194,8 +308,7 @@ impl<'m> Checker<'m> {
 		// `func pred(): (int) -> boolean = $ % 2 == 0` is just the top-level
 		// spelling of the same boundary the canonical `xs.filter($ % 2 == 0)`
 		// example forms as a call argument.
-		self.resolve_anon(body, Some(sig.ret));
-		self.check(body, sig.ret);
+		self.check_named_callable_body(&meta.name, body, sig.ret);
 		self.ret_ty = prev;
 		// Drain this body's deferred operators now, while its `param_bounds` are
 		// still the ones just built above — see `pending_operators`'s doc comment.
@@ -252,8 +365,20 @@ impl<'m> Checker<'m> {
 		}
 		match &expr.kind {
 			ExprKind::Closure { .. } => self.check_closure(expr, expected),
-			ExprKind::Block { body, .. } => {
+			ExprKind::Block { body, label } => {
+				if label.is_some() {
+					self.push_control_label(
+						label.as_ref(),
+						expr.id,
+						ControlLabelKind::Block,
+						None,
+						Some(expected),
+					);
+				}
 				let ty = self.infer_block(body, Some(expected));
+				if label.is_some() {
+					self.control_labels.pop();
+				}
 				self.subtype(ty, expected, expr.span);
 			}
 			ExprKind::If {
@@ -785,8 +910,14 @@ impl<'m> Checker<'m> {
 				// This arm only exists so the match stays exhaustive.
 				self.infer_assign(lhs, *op, rhs, span).0
 			}
-			ExprKind::Return { value, .. } => {
-				let ret = self.ret_ty;
+			ExprKind::Return { value, label } => {
+				let target = self.resolve_control(
+					expr,
+					label.as_ref(),
+					"return",
+					&[ControlLabelKind::Block, ControlLabelKind::Callable],
+				);
+				let ret = target.and_then(|target| target.result_ty).or(self.ret_ty);
 				if let Some(v) = value {
 					match ret {
 						Some(rt) => {
@@ -798,20 +929,32 @@ impl<'m> Checker<'m> {
 							self.infer(v);
 						}
 					}
+				} else if let Some(ret) = ret {
+					let void = self.interner.void();
+					self.unify(void, ret, expr.span);
 				}
 				self.interner.never()
 			}
-			ExprKind::Break { value, .. } => {
+			ExprKind::Break { value, label } => {
 				let found = value.as_ref().map(|v| self.infer(v));
-				let Some(previous) = self.loop_controls.last().copied() else {
-					self.emit(
-						expr.span,
-						TypeError::LoopControlOutsideLoop { keyword: "break" },
-					);
+				let Some(target) =
+					self.resolve_control(expr, label.as_ref(), "break", &[ControlLabelKind::Loop])
+				else {
+					if label.is_none() {
+						self.emit(
+							expr.span,
+							TypeError::LoopControlOutsideLoop { keyword: "break" },
+						);
+					}
 					return self.interner.never();
 				};
+				let loop_index = target.loop_index.expect("loop target has contract");
+				let previous = self.loop_controls[loop_index];
 				match (previous, found) {
-					(LoopBreakKind::None, _) => unreachable!("break scan omitted a targeting break"),
+					(LoopBreakKind::None, found) => {
+						self.loop_controls[loop_index] =
+							found.map_or(LoopBreakKind::Bare, LoopBreakKind::Valued);
+					}
 					(LoopBreakKind::Bare, Some(_)) | (LoopBreakKind::Valued(_), None) => {
 						self.emit(expr.span, TypeError::MixedBreakForms);
 					}
@@ -825,58 +968,77 @@ impl<'m> Checker<'m> {
 				}
 				self.interner.never()
 			}
-			ExprKind::Continue { .. } => {
-				if self.loop_controls.is_empty() {
-					self.emit(
-						expr.span,
-						TypeError::LoopControlOutsideLoop {
-							keyword: "continue",
-						},
-					);
+			ExprKind::Continue { label } => {
+				if self
+					.resolve_control(expr, label.as_ref(), "continue", &[ControlLabelKind::Loop])
+					.is_none()
+				{
+					if label.is_none() {
+						self.emit(
+							expr.span,
+							TypeError::LoopControlOutsideLoop {
+								keyword: "continue",
+							},
+						);
+					}
 				}
 				self.interner.never()
 			}
 			ExprKind::While {
-				condition, body, ..
+				condition,
+				body,
+				label,
 			} => {
 				let boolean = self.interner.boolean();
-				let outer_controls = std::mem::take(&mut self.loop_controls);
 				self.check(condition, boolean);
-				self.loop_controls = outer_controls;
-				let break_kind = self.targeting_break_kind(body);
+				let break_kind = self.targeting_break_kind(body, label.as_ref());
 				let break_ty = match break_kind {
 					Some(false) => Some(LoopBreakKind::Bare),
 					Some(true) => Some(LoopBreakKind::Valued(self.fresh())),
 					None => Some(LoopBreakKind::None),
 				};
 				self.loop_controls.push(break_ty.unwrap());
+				self.push_control_label(
+					label.as_ref(),
+					expr.id,
+					ControlLabelKind::Loop,
+					Some(self.loop_controls.len() - 1),
+					None,
+				);
 				self.push_scope();
 				self.infer(body);
 				self.pop_scope();
 				self.loop_controls.pop();
+				self.control_labels.pop();
 				self.loop_result_type(break_ty)
 			}
 			ExprKind::For {
 				variable,
 				iterable,
 				body,
-				..
+				label,
 			} => {
-				let outer_controls = std::mem::take(&mut self.loop_controls);
 				let elem = self.infer_iterable_element(iterable);
-				self.loop_controls = outer_controls;
-				let break_kind = self.targeting_break_kind(body);
+				let break_kind = self.targeting_break_kind(body, label.as_ref());
 				let break_ty = match break_kind {
 					Some(false) => Some(LoopBreakKind::Bare),
 					Some(true) => Some(LoopBreakKind::Valued(self.fresh())),
 					None => Some(LoopBreakKind::None),
 				};
 				self.loop_controls.push(break_ty.unwrap());
+				self.push_control_label(
+					label.as_ref(),
+					expr.id,
+					ControlLabelKind::Loop,
+					Some(self.loop_controls.len() - 1),
+					None,
+				);
 				self.push_scope();
 				self.check_pattern(variable, elem);
 				self.infer(body);
 				self.pop_scope();
 				self.loop_controls.pop();
+				self.control_labels.pop();
 				self.loop_result_type(break_ty)
 			}
 			ExprKind::If {
@@ -926,7 +1088,24 @@ impl<'m> Checker<'m> {
 					self.interner.never()
 				}
 			}
-			ExprKind::Block { body, .. } => self.infer_block(body, None),
+			ExprKind::Block { body, label } => {
+				if label.is_none() {
+					self.infer_block(body, None)
+				} else {
+					let result = self.fresh();
+					self.push_control_label(
+						label.as_ref(),
+						expr.id,
+						ControlLabelKind::Block,
+						None,
+						Some(result),
+					);
+					let tail = self.infer_block(body, Some(result));
+					self.control_labels.pop();
+					self.unify(tail, result, expr.span);
+					result
+				}
+			}
 			ExprKind::Grouped(inner) => self.infer(inner),
 		}
 	}
@@ -1811,6 +1990,7 @@ impl<'m> Checker<'m> {
 			generics,
 			return_type,
 			body,
+			label,
 		} = &expr.kind
 		else {
 			unreachable!("guarded by caller");
@@ -1832,9 +2012,21 @@ impl<'m> Checker<'m> {
 		// this one included, must scan its own slot before checking/inferring
 		// it).
 		let outer_loops = std::mem::take(&mut self.loop_controls);
+		let outer_labels = std::mem::take(&mut self.control_labels);
+		let closure_ret = return_type
+			.as_ref()
+			.map(|annot| self.lower_type(annot))
+			.unwrap_or_else(|| self.fresh());
+		self.push_control_label(
+			label.as_ref(),
+			expr.id,
+			ControlLabelKind::Callable,
+			None,
+			Some(closure_ret),
+		);
 		let ret = match return_type {
-			Some(annot) => {
-				let rt = self.lower_type(annot);
+			Some(_) => {
+				let rt = closure_ret;
 				let outer_ret = self.ret_ty.replace(rt);
 				self.resolve_anon(body, Some(rt));
 				self.check(body, rt);
@@ -1842,7 +2034,7 @@ impl<'m> Checker<'m> {
 				rt
 			}
 			None => {
-				let rt = self.fresh();
+				let rt = closure_ret;
 				let outer_ret = self.ret_ty.replace(rt);
 				self.resolve_anon(body, Some(rt));
 				self.check(body, rt);
@@ -1851,6 +2043,7 @@ impl<'m> Checker<'m> {
 			}
 		};
 		self.loop_controls = outer_loops;
+		self.control_labels = outer_labels;
 		self.pop_scope();
 		self.pop_params();
 		self.interner.mk_fn(param_tys, ret)
@@ -1863,17 +2056,26 @@ impl<'m> Checker<'m> {
 			generics,
 			return_type,
 			body,
+			label,
 		} = &expr.kind
 		else {
 			unreachable!("guarded by caller");
 		};
 
 		let outer_loops = std::mem::take(&mut self.loop_controls);
+		let outer_labels = std::mem::take(&mut self.control_labels);
 		// Pull expected parameter/return types out of an expected function type.
 		let (exp_params, exp_ret) = match self.interner.kind(expected).clone() {
 			TyKind::Fn { params, ret } => (Some(params), Some(ret)),
 			_ => (None, None),
 		};
+		self.push_control_label(
+			label.as_ref(),
+			expr.id,
+			ControlLabelKind::Callable,
+			None,
+			exp_ret,
+		);
 
 		self.push_params(build_param_scope(generics));
 		self.push_scope();
@@ -1919,6 +2121,7 @@ impl<'m> Checker<'m> {
 		self.pop_scope();
 		self.pop_params();
 		self.loop_controls = outer_loops;
+		self.control_labels = outer_labels;
 		let got = self.interner.mk_fn(param_tys, ret);
 		self.subtype(got, expected, expr.span);
 	}
@@ -3734,6 +3937,22 @@ impl Checker<'_> {
 			LoopBreakKind::Bare => self.interner.mk_tuple(vec![]),
 			LoopBreakKind::Valued(ty) => ty,
 		};
+		let element = self.shallow_resolve(element);
+		let unresolved = match self.interner.kind(element) {
+			TyKind::Infer(var) => Some(*var),
+			_ => None,
+		};
+		let element = if let Some(var) = unresolved {
+			// A syntactically valued break whose value always transfers control
+			// (for example `break (break@outer 1)`) never constrains its loop's
+			// element variable. The loop still has the valued Option shape required
+			// by the syntax scan; complete that otherwise-unsolved type as `never`.
+			let never = self.interner.never();
+			self.table.assign(var, never);
+			never
+		} else {
+			element
+		};
 		let Some(option) = self.runtime_roles.option else {
 			return self.interner.error();
 		};
@@ -3744,7 +3963,11 @@ impl Checker<'_> {
 
 	/// Finds breaks targeting the immediately enclosing loop. `Some(true)` means
 	/// at least one valued break; nested loops and every callable body are boundaries.
-	fn targeting_break_kind(&self, expr: &Expr) -> Option<bool> {
+	fn targeting_break_kind(
+		&self,
+		expr: &Expr,
+		target_label: Option<&nymph_ast::Ident>,
+	) -> Option<bool> {
 		fn merge(a: Option<bool>, b: Option<bool>) -> Option<bool> {
 			match (a, b) {
 				(None, b) => b,
@@ -3752,18 +3975,70 @@ impl Checker<'_> {
 				(Some(a), Some(b)) => Some(a || b),
 			}
 		}
-		fn walk(checker: &Checker<'_>, expr: &Expr) -> Option<bool> {
+		fn walk(
+			checker: &Checker<'_>,
+			expr: &Expr,
+			target: (Option<&nymph_ast::Ident>, bool),
+		) -> Option<bool> {
 			if checker.annotations.anon_boundary_arity(expr.id).is_some() {
 				return None;
 			}
 			let many = |items: Vec<&Expr>| {
-				items
-					.into_iter()
-					.fold(None, |found, item| merge(found, walk(checker, item)))
+				items.into_iter().fold(None, |found, item| {
+					merge(found, walk(checker, item, target))
+				})
 			};
 			match &expr.kind {
-				ExprKind::Break { value, label: None } => Some(value.is_some()),
-				ExprKind::While { .. } | ExprKind::For { .. } | ExprKind::Closure { .. } => None,
+				ExprKind::Break { value, label } => {
+					let nested = value
+						.as_deref()
+						.and_then(|value| walk(checker, value, target));
+					if match (label, target.0) {
+						(None, _) => target.1,
+						(Some(a), Some(b)) => a.0 == b.0,
+						_ => false,
+					} {
+						merge(Some(value.is_some()), nested)
+					} else {
+						nested
+					}
+				}
+				ExprKind::Closure { .. } => None,
+				ExprKind::While {
+					condition,
+					body,
+					label,
+				} => merge(
+					walk(checker, condition, target),
+					if target.0.is_none()
+						|| label
+							.as_ref()
+							.zip(target.0)
+							.is_some_and(|(a, b)| a.0 == b.0)
+					{
+						None
+					} else {
+						walk(checker, body, (target.0, false))
+					},
+				),
+				ExprKind::For {
+					iterable,
+					body,
+					label,
+					..
+				} => merge(
+					walk(checker, iterable, target),
+					if target.0.is_none()
+						|| label
+							.as_ref()
+							.zip(target.0)
+							.is_some_and(|(a, b)| a.0 == b.0)
+					{
+						None
+					} else {
+						walk(checker, body, (target.0, false))
+					},
+				),
 				ExprKind::String(parts) => many(
 					parts
 						.iter()
@@ -3783,67 +4058,80 @@ impl Checker<'_> {
 				),
 				ExprKind::Map(entries) => entries.iter().fold(None, |found, entry| {
 					let nested = match &entry.0 {
-						MapEntry::Entry(key, value) => merge(walk(checker, key), walk(checker, value)),
-						MapEntry::Spread(expr) => walk(checker, expr),
+						MapEntry::Entry(key, value) => {
+							merge(walk(checker, key, target), walk(checker, value, target))
+						}
+						MapEntry::Spread(expr) => walk(checker, expr, target),
 					};
 					merge(found, nested)
 				}),
 				ExprKind::Range(range) => match range {
 					RangeKind::From(expr) | RangeKind::To(expr) | RangeKind::ToInclusive(expr) => {
-						walk(checker, expr)
+						walk(checker, expr, target)
 					}
 					RangeKind::Exclusive { min, max } | RangeKind::Inclusive { min, max } => {
-						merge(walk(checker, min), walk(checker, max))
+						merge(walk(checker, min, target), walk(checker, max, target))
 					}
 				},
 				ExprKind::Call { func, args, .. } => merge(
-					walk(checker, func),
+					walk(checker, func, target),
 					many(args.iter().map(|arg| &arg.0.value).collect()),
 				),
-				ExprKind::MemberAccess { parent, .. } => walk(checker, parent),
+				ExprKind::MemberAccess { parent, .. } => walk(checker, parent, target),
 				ExprKind::IndexAccess { parent, index, .. } => {
-					merge(walk(checker, parent), walk(checker, index))
+					merge(walk(checker, parent, target), walk(checker, index, target))
 				}
 				ExprKind::PrefixOp { value, .. }
 				| ExprKind::PostfixOp { value, .. }
 				| ExprKind::Grouped(value)
 				| ExprKind::TypeOp { lhs: value, .. }
-				| ExprKind::PatternOp { lhs: value, .. } => walk(checker, value),
+				| ExprKind::PatternOp { lhs: value, .. } => walk(checker, value, target),
 				ExprKind::BinaryOp { lhs, rhs, .. } | ExprKind::AssignOp { lhs, rhs, .. } => {
-					merge(walk(checker, lhs), walk(checker, rhs))
+					merge(walk(checker, lhs, target), walk(checker, rhs, target))
 				}
-				ExprKind::Return { value, .. } => value.as_deref().and_then(|value| walk(checker, value)),
+				ExprKind::Return { value, .. } => value
+					.as_deref()
+					.and_then(|value| walk(checker, value, target)),
 				ExprKind::If {
 					condition,
 					then,
 					otherwise,
 				} => merge(
-					walk(checker, condition),
+					walk(checker, condition, target),
 					merge(
-						walk(checker, then),
-						otherwise.as_deref().and_then(|value| walk(checker, value)),
+						walk(checker, then, target),
+						otherwise
+							.as_deref()
+							.and_then(|value| walk(checker, value, target)),
 					),
 				),
-				ExprKind::Match { value, arms } => arms.iter().fold(walk(checker, value), |found, arm| {
-					merge(
-						found,
-						merge(
-							arm.guard.as_ref().and_then(|guard| walk(checker, guard)),
-							walk(checker, &arm.body),
-						),
-					)
-				}),
+				ExprKind::Match { value, arms } => {
+					arms
+						.iter()
+						.fold(walk(checker, value, target), |found, arm| {
+							merge(
+								found,
+								merge(
+									arm
+										.guard
+										.as_ref()
+										.and_then(|guard| walk(checker, guard, target)),
+									walk(checker, &arm.body, target),
+								),
+							)
+						})
+				}
 				ExprKind::Block { body, .. } => body.iter().fold(None, |found, statement| {
 					let expr = match &statement.0 {
 						Statement::Expr(expr) => expr,
 						Statement::Let { value, .. } => value,
 					};
-					merge(found, walk(checker, expr))
+					merge(found, walk(checker, expr, target))
 				}),
 				_ => None,
 			}
 		}
-		walk(self, expr)
+		walk(self, expr, (target_label, true))
 	}
 }
 
