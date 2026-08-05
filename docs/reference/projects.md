@@ -88,5 +88,20 @@ An explicit source argument is still resolved within the selected manifest's
 `package.src`; a source outside that root is rejected rather than causing
 discovery of another project.
 
+## Formatting sources
+
+`nymph format [FILES...]` rewrites explicitly named `.nym` files in normalized,
+deterministic order. Duplicate paths are processed once. With no files it
+discovers the authoritative project and formats every `.nym` file below
+`package.src`, without following symlinks or entering generated/dependency
+directories. Use `--manifest <PATH>` to select a project authoritatively;
+explicit files outside that project's source root are rejected.
+
+Formatting writes atomically and leaves already formatted files untouched.
+`nymph format --check [FILES...]` performs the same selection without writing.
+Exit status 0 means success (and, in check mode, no changes), 1 means check mode
+found files that would change, and 2 means selection, I/O, or syntax errors.
+Errors do not prevent other selected files from being checked or formatted.
+
 Dependency declarations may use a version string or a table with `version`,
 `path`, or `git`. Dependency fetching and resolution are not yet implemented.

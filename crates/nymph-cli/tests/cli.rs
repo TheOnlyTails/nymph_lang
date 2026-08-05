@@ -1206,3 +1206,190 @@ fn package_management_commands_are_unknown() {
 		);
 	}
 }
+
+#[test]
+fn format_explicit_files_writes_atomically_in_deterministic_order() {
+	let root = unique_temp_path("nymph_cli_format_files", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let a = root.join("a.nym");
+	let b = root.join("b.nym");
+	std::fs::write(&a, "let a=#[1,2]\r\n").unwrap();
+	std::fs::write(&b, "func b()={ 2 }\n").unwrap();
+
+	let out = nymph_in(&["format", b.to_str().unwrap(), a.to_str().unwrap()], &root);
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(std::fs::read_to_string(&a).unwrap(), "let a = #[1, 2]\n");
+	assert_eq!(std::fs::read_to_string(&b).unwrap(), "func b() = 2\n");
+	assert!(
+		out.stderr.find(&a.display().to_string()).unwrap()
+			< out.stderr.find(&b.display().to_string()).unwrap(),
+		"reporting was not deterministic: {}",
+		out.stderr
+	);
+	assert!(out.stderr.contains("formatted 2 files"));
+	assert!(std::fs::read_dir(&root).unwrap().all(|entry| {
+		!entry
+			.unwrap()
+			.file_name()
+			.to_string_lossy()
+			.contains("nymph-format")
+	}));
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn format_check_is_read_only_and_distinguishes_clean_dirty_and_malformed() {
+	let root = unique_temp_path("nymph_cli_format_check", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let clean = root.join("clean.nym");
+	let dirty = root.join("dirty.nym");
+	let malformed = root.join("malformed.nym");
+	std::fs::write(&clean, "let clean = 1\n").unwrap();
+	std::fs::write(&dirty, "let dirty=2\n").unwrap();
+	std::fs::write(&malformed, "let broken = {\n").unwrap();
+	let dirty_before = std::fs::read(&dirty).unwrap();
+	let malformed_before = std::fs::read(&malformed).unwrap();
+
+	let out = nymph_in(
+		&[
+			"format",
+			"--check",
+			clean.to_str().unwrap(),
+			dirty.to_str().unwrap(),
+			malformed.to_str().unwrap(),
+		],
+		&root,
+	);
+	assert_eq!(out.status.code(), Some(2));
+	assert!(out.stderr.contains("would format") && out.stderr.contains("2 files require attention"));
+	assert!(
+		out.stderr.contains("expected"),
+		"diagnostics missing: {}",
+		out.stderr
+	);
+	assert_eq!(std::fs::read(&dirty).unwrap(), dirty_before);
+	assert_eq!(std::fs::read(&malformed).unwrap(), malformed_before);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn format_write_continues_past_malformed_files_without_touching_them() {
+	let root = unique_temp_path("nymph_cli_format_partial", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let valid = root.join("valid.nym");
+	let malformed = root.join("malformed.nym");
+	std::fs::write(&valid, "let valid=1\n").unwrap();
+	std::fs::write(&malformed, "let malformed = #[1,\n").unwrap();
+	let malformed_before = std::fs::read(&malformed).unwrap();
+
+	let out = nymph_in(
+		&[
+			"format",
+			valid.to_str().unwrap(),
+			malformed.to_str().unwrap(),
+		],
+		&root,
+	);
+	assert_eq!(out.status.code(), Some(2));
+	assert_eq!(std::fs::read_to_string(valid).unwrap(), "let valid = 1\n");
+	assert_eq!(std::fs::read(malformed).unwrap(), malformed_before);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn format_without_files_formats_all_and_only_project_sources() {
+	let root = write_project("main.nym", "func main()={ 1 }\n");
+	let nested = root.join("src/nested/value.nym");
+	std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+	std::fs::write(&nested, "let value=2\n").unwrap();
+	let target = root.join("src/target/ignored.nym");
+	std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+	std::fs::write(&target, "let ignored=3\n").unwrap();
+
+	let out = nymph_in(&["format"], &root);
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(
+		std::fs::read_to_string(root.join("src/main.nym")).unwrap(),
+		"func main() = 1\n"
+	);
+	assert_eq!(std::fs::read_to_string(&nested).unwrap(), "let value = 2\n");
+	assert_eq!(std::fs::read_to_string(&target).unwrap(), "let ignored=3\n");
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn format_preserves_unchanged_file_mtime() {
+	let root = unique_temp_path("nymph_cli_format_mtime", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let source = root.join("clean.nym");
+	std::fs::write(&source, "let clean = 1\n").unwrap();
+	let before = std::fs::metadata(&source).unwrap().modified().unwrap();
+	let out = nymph_in(&["format", source.to_str().unwrap()], &root);
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(
+		std::fs::metadata(&source).unwrap().modified().unwrap(),
+		before
+	);
+	assert!(
+		out.stderr.is_empty(),
+		"unchanged formatting was not quiet: {}",
+		out.stderr
+	);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn format_without_a_project_or_files_errors_actionably() {
+	let root = unique_temp_path("nymph_cli_format_empty", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let out = nymph_in(&["format"], &root);
+	assert_eq!(out.status.code(), Some(2));
+	assert!(
+		out.stderr.contains("pass one or more .nym files"),
+		"{}",
+		out.stderr
+	);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn format_explicit_manifest_rejects_sources_outside_its_root() {
+	let root = write_project("main.nym", "func main() = 1\n");
+	let outside = write_source("let outside=1\n");
+	let out = nymph_in(
+		&[
+			"--manifest",
+			root.join("nymph.toml").to_str().unwrap(),
+			"format",
+			outside.to_str().unwrap(),
+		],
+		&root,
+	);
+	assert_eq!(out.status.code(), Some(2));
+	assert!(out.stderr.contains("outside source root"), "{}", out.stderr);
+	assert_eq!(
+		std::fs::read_to_string(&outside).unwrap(),
+		"let outside=1\n"
+	);
+	std::fs::remove_dir_all(root).unwrap();
+	std::fs::remove_file(outside).unwrap();
+}
+
+#[test]
+fn format_cli_matches_the_shared_canonical_fixture() {
+	let root = unique_temp_path("nymph_cli_format_parity", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let source = root.join("fixture.nym");
+	std::fs::write(
+		&source,
+		include_str!("../../nymph-format/testdata/comments_whitespace/boundaries.input.nym"),
+	)
+	.unwrap();
+	let out = nymph_in(&["format", source.to_str().unwrap()], &root);
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(
+		std::fs::read_to_string(&source).unwrap(),
+		include_str!("../../nymph-format/testdata/comments_whitespace/boundaries.expected.nym")
+	);
+	std::fs::remove_dir_all(root).unwrap();
+}
