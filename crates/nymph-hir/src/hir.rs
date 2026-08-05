@@ -144,7 +144,18 @@ pub enum HirStmt {
 	/// statement-flavored in HIR: expression-position returns lower to a
 	/// one-statement `HirExpr::Block`. Codegen carries them across synthetic
 	/// expression IIFEs to the nearest real callable boundary.
-	Return(Option<HirExpr>),
+	Return {
+		value: Option<HirExpr>,
+		target: HirReturnTarget,
+	},
+}
+
+pub type BlockTarget = u32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HirReturnTarget {
+	Callable,
+	Block(BlockTarget),
 }
 
 pub type LoopTarget = u32;
@@ -358,6 +369,10 @@ pub enum HirExpr {
 		stmts: Vec<HirStmt>,
 		tail: Option<Box<HirExpr>>,
 	},
+	LabeledBlock {
+		target: BlockTarget,
+		body: Box<HirExpr>,
+	},
 	If {
 		cond: Box<HirExpr>,
 		then: Box<HirExpr>,
@@ -493,7 +508,7 @@ impl HirExpr {
 						HirStmt::Let { value, .. } | HirStmt::Expr(value) => {
 							value.collect_runtime_type_references(references)
 						}
-						HirStmt::Return(value) => {
+						HirStmt::Return { value, .. } => {
 							if let Some(value) = value {
 								value.collect_runtime_type_references(references);
 							}
@@ -504,6 +519,7 @@ impl HirExpr {
 					tail.collect_runtime_type_references(references);
 				}
 			}
+			Self::LabeledBlock { body, .. } => body.collect_runtime_type_references(references),
 			Self::If {
 				cond,
 				then,

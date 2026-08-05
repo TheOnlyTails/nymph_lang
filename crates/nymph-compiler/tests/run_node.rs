@@ -4338,6 +4338,69 @@ fn break_value_and_continue_cross_expression_iifes() {
 }
 
 #[test]
+fn labeled_loops_and_callable_returns_execute() {
+	let src = r#"func outer_break(): int = match (while@outer (true) {
+  while (true) { break@outer 7 }
+}) { Some(value) -> value, None -> 0 }
+func outer_continue(): int = {
+  let mut count = 0
+  while@outer (count < 3) {
+    count = count + 1
+    while (true) { continue@outer }
+  }
+  count
+}
+func for_break(): int = match (for@outer (value in 1..4) {
+  while (true) { break@outer value }
+}) { Some(value) -> value, None -> 0 }
+func direct_break(): int = match (while@outer (true) { break 8 }) {
+  Some(value) -> value,
+  None -> 0,
+}
+func direct_for_break(): int = match (for@outer (value in 1..4) { break value }) {
+  Some(value) -> value,
+  None -> 0,
+}
+func named(): int = { return@named 9 }
+func closure(): int = { let f = done@() -> { return@done 11 } f() }
+func body_closure(): int = { let f = () -> done@{ return@done 12 } f() }
+func dual_closure(): int = { let f = done@() -> done@{ return@done 13 } f() }"#;
+	assert_eq!(run(src, "outer_break()"), "7");
+	assert_eq!(run(src, "outer_continue()"), "3");
+	assert_eq!(run(src, "for_break()"), "1");
+	assert_eq!(run(src, "direct_break()"), "8");
+	assert_eq!(run(src, "direct_for_break()"), "1");
+	assert_eq!(run(src, "named()"), "9");
+	assert_eq!(run(src, "closure()"), "11");
+	assert_eq!(run(src, "body_closure()"), "12");
+	assert_eq!(run(src, "dual_closure()"), "13");
+}
+
+#[test]
+fn labeled_block_returns_complete_only_the_target_block() {
+	let src = r#"func block(): int = {
+  let value = result@{ return@result 7 }
+  value + 1
+}
+func nested(): int = {
+  let value = outer@{ inner@{ return@outer 9 } 1 }
+  value + 2
+}
+func callable_iife(): int = {
+  let value = block@{ if (true) { return@callable_iife 13 } 3 }
+  value + 4
+}
+func callable_iife_fallthrough(): int = {
+  let value = block@{ if (false) { return@callable_iife_fallthrough 13 } 3 }
+  value + 4
+}"#;
+	assert_eq!(run(src, "block()"), "8");
+	assert_eq!(run(src, "nested()"), "11");
+	assert_eq!(run(src, "callable_iife_fallthrough()"), "7");
+	assert_eq!(run(src, "callable_iife()"), "13");
+}
+
+#[test]
 fn loop_natural_exhaustion_and_bare_break_use_option_abi() {
 	let src = r#"func exhausted(): int = match (while (false) { break 1 }) {
 		Some(value) -> value,

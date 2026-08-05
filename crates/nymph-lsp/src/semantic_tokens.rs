@@ -804,6 +804,7 @@ fn walk_expr(expr: &Expr, map: &mut RoleMap) {
 			generics,
 			return_type,
 			body,
+			..
 		} => {
 			walk_generics(generics, map);
 			for p in params {

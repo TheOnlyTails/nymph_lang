@@ -150,6 +150,7 @@ pub struct Emitter<'a> {
 	/// expression IIFE. The boolean records whether a callable actually needs
 	/// the corresponding catch boundary.
 	return_completion_tokens: std::cell::RefCell<Vec<(&'a str, bool)>>,
+	block_completion_tokens: std::cell::RefCell<Vec<(nymph_hir::hir::BlockTarget, &'a str)>>,
 	import_box_runtime: bool,
 	current_module: Option<String>,
 }
@@ -164,6 +165,7 @@ impl<'a> Emitter<'a> {
 			box_runtime_bindings: std::cell::RefCell::new(std::collections::BTreeSet::new()),
 			loop_completion_tokens: std::cell::RefCell::new(Vec::new()),
 			return_completion_tokens: std::cell::RefCell::new(Vec::new()),
+			block_completion_tokens: std::cell::RefCell::new(Vec::new()),
 			import_box_runtime: false,
 			current_module: None,
 		}
@@ -1924,6 +1926,28 @@ impl<'a> Emitter<'a> {
 			}
 			// A closure → a JS arrow function `(<params>) => { … }` (Slice 4L).
 			HirExpr::Closure { params, body } => self.closure_arrow(params, body),
+			HirExpr::LabeledBlock { target, body } => {
+				let token = self.begin_return_completion();
+				self
+					.block_completion_tokens
+					.borrow_mut()
+					.push((*target, token));
+				let previous_iife = self.in_iife_subexpr.replace(true);
+				let value = self.emit_value(body);
+				self.in_iife_subexpr.set(previous_iife);
+				self.block_completion_tokens.borrow_mut().pop();
+				let mut stmts = value.stmts;
+				stmts.push(Statement::new_return_statement(
+					SPAN,
+					Some(value.expr),
+					&self.ast,
+				));
+				JsValue {
+					stmts: self.finish_return_completion(token, stmts),
+					expr: Expression::new_identifier(SPAN, "undefined", &self.ast),
+				}
+				.into_expression(self.ast)
+			}
 		}
 	}
 
@@ -2234,13 +2258,33 @@ impl<'a> Emitter<'a> {
 			// A return under a generated expression IIFE uses the callable's private
 			// completion token so it can cross that synthetic function boundary.
 			// Ordinary statement-position returns remain direct JS returns.
-			HirStmt::Return(value) => {
-				if self.in_iife_subexpr.get() {
+			HirStmt::Return { value, target } => {
+				let block_token = match target {
+					nymph_hir::hir::HirReturnTarget::Callable => None,
+					nymph_hir::hir::HirReturnTarget::Block(target) => self
+						.block_completion_tokens
+						.borrow()
+						.iter()
+						.rev()
+						.find_map(|(candidate, token)| (candidate == target).then_some(*token)),
+				};
+				if block_token.is_some() || self.in_iife_subexpr.get() {
 					let token = {
 						let mut tokens = self.return_completion_tokens.borrow_mut();
-						let (token, used) = tokens
-							.last_mut()
-							.expect("return in an expression IIFE has an active callable");
+						let (token, used) = if let Some(block_token) = block_token {
+							tokens
+								.iter_mut()
+								.rev()
+								.find(|(token, _)| *token == block_token)
+						} else {
+							let block_tokens = self.block_completion_tokens.borrow();
+							tokens.iter_mut().rev().find(|(token, _)| {
+								!block_tokens
+									.iter()
+									.any(|(_, block_token)| block_token == token)
+							})
+						}
+						.expect("completion return has an active target");
 						*used = true;
 						*token
 					};

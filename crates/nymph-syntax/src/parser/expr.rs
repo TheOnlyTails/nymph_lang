@@ -2,7 +2,7 @@
 
 use crate::errors::ParseError;
 use nymph_ast::{
-	Span, Spanned,
+	Ident, Span, Spanned,
 	expr::{
 		CallArg, ClosureParam, Expr, ExprKind, ListItem, MapEntry, MatchArm, RangeKind, Statement,
 		StringPart,
@@ -454,8 +454,32 @@ impl Parser<'_> {
 				self.mk_expr(ExprKind::AnonymousParam(index), span)
 			}
 			Token::Identifier(_) => {
+				// A labeled closure or block: `label@(params) -> body`, `label@{...}`.
+				if self.peek_nth(1) == Some(&Token::At) {
+					let label = self.expect_ident();
+					let at = self.expect(&Token::At).unwrap();
+					self.require_label_adjacency(label.1, at);
+					if let Some(opener) = self.peek_nth_span(0) {
+						self.require_label_adjacency(at, opener);
+					}
+					if self.check(&Token::LParen) {
+						self.parse_labeled_closure(label, start)
+					} else if self.check(&Token::LBrace) {
+						self.parse_block_with_label(Some(label), start)
+					} else {
+						let span = self.current_span();
+						self.emit(
+							span,
+							ParseError::ExpectedExpression {
+								found: self
+									.peek()
+									.map_or("end of input".into(), |token| token.describe().into()),
+							},
+						);
+						self.mk_expr(ExprKind::Tuple(Vec::new()), span)
+					}
 				// A single-parameter closure: `x -> body`.
-				if self.peek_nth(1) == Some(&Token::Arrow) {
+				} else if self.peek_nth(1) == Some(&Token::Arrow) {
 					self.parse_ident_closure()
 				} else {
 					let name = self.expect_ident();
@@ -472,32 +496,29 @@ impl Parser<'_> {
 			Token::While => self.parse_while(),
 			Token::For => self.parse_for(),
 			Token::Return => {
-				self.advance();
+				let keyword = self.advance().unwrap().1;
+				let label = self.parse_control_label(keyword);
 				let value = if self.can_start_expr() {
 					Some(Box::new(self.parse_expr()))
 				} else {
 					None
 				};
-				self.mk_expr(
-					ExprKind::Return { value, label: None },
-					self.span_from(start),
-				)
+				self.mk_expr(ExprKind::Return { value, label }, self.span_from(start))
 			}
 			Token::Break => {
-				self.advance();
+				let keyword = self.advance().unwrap().1;
+				let label = self.parse_control_label(keyword);
 				let value = if self.can_start_expr() {
 					Some(Box::new(self.parse_expr()))
 				} else {
 					None
 				};
-				self.mk_expr(
-					ExprKind::Break { value, label: None },
-					self.span_from(start),
-				)
+				self.mk_expr(ExprKind::Break { value, label }, self.span_from(start))
 			}
 			Token::Continue => {
-				self.advance();
-				self.mk_expr(ExprKind::Continue { label: None }, self.span_from(start))
+				let keyword = self.advance().unwrap().1;
+				let label = self.parse_control_label(keyword);
+				self.mk_expr(ExprKind::Continue { label }, self.span_from(start))
 			}
 			other => {
 				let span = self.current_span();
@@ -641,9 +662,15 @@ impl Parser<'_> {
 			self.diagnostics.truncate(before);
 			return None;
 		}
-		let body = self.parse_expr();
+		let mut body = self.parse_expr();
+		let label = if let ExprKind::Block { label, .. } = &mut body.kind {
+			label.take()
+		} else {
+			None
+		};
 		Some(self.mk_expr(
 			ExprKind::Closure {
+				label,
 				params,
 				generics: Vec::new(),
 				return_type,
@@ -651,6 +678,46 @@ impl Parser<'_> {
 			},
 			self.span_from(start),
 		))
+	}
+
+	fn parse_labeled_closure(&mut self, label: Ident, start: usize) -> Expr {
+		let mut closure = self.try_parse_paren_closure().unwrap_or_else(|| {
+			let span = self.current_span();
+			self.mk_expr(ExprKind::Tuple(Vec::new()), span)
+		});
+		if let ExprKind::Closure { label: slot, .. } = &mut closure.kind {
+			if let Some(inner) = slot.as_ref().filter(|inner| inner.0 != label.0) {
+				self.emit(
+					label.1,
+					ParseError::MismatchedClosureLabels {
+						outer: label.0.clone(),
+						inner: inner.0.clone(),
+						inner_span: inner.1,
+					},
+				);
+			}
+			*slot = Some(label);
+		}
+		closure.span = self.span_from(start);
+		closure
+	}
+
+	fn parse_control_label(&mut self, keyword: Span) -> Option<Ident> {
+		self.eat(&Token::At).map(|at| {
+			self.require_label_adjacency(keyword, at);
+			let label = self.expect_ident();
+			self.require_label_adjacency(at, label.1);
+			label
+		})
+	}
+
+	fn require_label_adjacency(&mut self, left: Span, right: Span) {
+		if left.end != right.start {
+			self.emit(
+				Span::new(left.end, right.start),
+				ParseError::WhitespaceInLabel,
+			);
+		}
 	}
 
 	fn parse_closure_param(&mut self) -> Spanned<ClosureParam> {
@@ -696,6 +763,7 @@ impl Parser<'_> {
 		let body = self.parse_expr();
 		self.mk_expr(
 			ExprKind::Closure {
+				label: None,
 				params: vec![param],
 				generics: Vec::new(),
 				return_type: None,
@@ -760,7 +828,8 @@ impl Parser<'_> {
 
 	fn parse_while(&mut self) -> Expr {
 		let start = self.position();
-		self.advance(); // `while`
+		let keyword = self.advance().unwrap().1; // `while`
+		let label = self.parse_control_label(keyword);
 		self.expect(&Token::LParen);
 		let condition = self.parse_expr();
 		self.expect(&Token::RParen);
@@ -769,7 +838,7 @@ impl Parser<'_> {
 			ExprKind::While {
 				condition: Box::new(condition),
 				body: Box::new(body),
-				label: None,
+				label,
 			},
 			self.span_from(start),
 		)
@@ -777,7 +846,8 @@ impl Parser<'_> {
 
 	fn parse_for(&mut self) -> Expr {
 		let start = self.position();
-		self.advance(); // `for`
+		let keyword = self.advance().unwrap().1; // `for`
+		let label = self.parse_control_label(keyword);
 		self.expect(&Token::LParen);
 		let variable = self.parse_binding_pattern();
 		self.expect(&Token::In);
@@ -789,7 +859,7 @@ impl Parser<'_> {
 				variable,
 				iterable: Box::new(iterable),
 				body: Box::new(body),
-				label: None,
+				label,
 			},
 			self.span_from(start),
 		)
@@ -797,13 +867,17 @@ impl Parser<'_> {
 
 	pub(super) fn parse_block(&mut self) -> Expr {
 		let start = self.position();
+		self.parse_block_with_label(None, start)
+	}
+
+	fn parse_block_with_label(&mut self, label: Option<Ident>, start: usize) -> Expr {
 		self.expect(&Token::LBrace);
 		let mut body = Vec::new();
 		while !self.check(&Token::RBrace) && !self.at_end() {
 			body.push(self.parse_statement());
 		}
 		self.expect(&Token::RBrace);
-		self.mk_expr(ExprKind::Block { body, label: None }, self.span_from(start))
+		self.mk_expr(ExprKind::Block { body, label }, self.span_from(start))
 	}
 
 	fn parse_statement(&mut self) -> Spanned<Statement> {

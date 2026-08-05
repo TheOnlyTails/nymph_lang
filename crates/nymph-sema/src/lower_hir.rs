@@ -14,7 +14,7 @@ use std::cell::RefCell;
 
 use ecow::EcoString;
 use nymph_ast::{
-	Ident, Span, Spanned,
+	Ident, NodeId, Span, Spanned,
 	decl::{Declaration, FuncDeclaration, ImplMember, InterfaceElement, InterfaceMember, Module},
 	expr::{CallArg, Expr, ExprKind, ListItem, MapEntry, Statement},
 	ops::{AssignOperator, BinaryOperator, PatternOperator, PrefixOperator},
@@ -269,6 +269,8 @@ fn lower_hir_impl(
 		generics_stack: RefCell::new(Vec::new()),
 		loop_targets: RefCell::new(Vec::new()),
 		next_loop_target: std::cell::Cell::new(0),
+		block_targets: RefCell::new(Vec::new()),
+		next_block_target: std::cell::Cell::new(0),
 		this_sub: RefCell::new(Vec::new()),
 		lowering_runtime_sibling: RefCell::new(Vec::new()),
 		runtime_funcs_seen: RefCell::new(FxHashMap::default()),
@@ -352,8 +354,10 @@ struct Lowerer<'a> {
 	/// merged with `scopes`, which is JS-scope/shadowing bookkeeping, not
 	/// type-parameter bookkeeping).
 	generics_stack: RefCell<Vec<FxHashSet<EcoString>>>,
-	loop_targets: RefCell<Vec<nymph_hir::hir::LoopTarget>>,
+	loop_targets: RefCell<Vec<(NodeId, nymph_hir::hir::LoopTarget)>>,
 	next_loop_target: std::cell::Cell<nymph_hir::hir::LoopTarget>,
+	block_targets: RefCell<Vec<(NodeId, nymph_hir::hir::BlockTarget)>>,
+	next_block_target: std::cell::Cell<nymph_hir::hir::BlockTarget>,
 	/// Stack of receiver-param names currently substituting for `this` while
 	/// lowering a prelude body as a top-level mangled function (stdlib body
 	/// lowering slice, gap b) — the innermost entry is what
@@ -3190,10 +3194,15 @@ impl<'a> Lowerer<'a> {
 	/// [`Self::lower_expr`] — every other, genuinely nested, block). A non-block
 	/// body (`= expr`) has no `let`s of its own anyway, so it just lowers normally.
 	fn lower_func_body(&self, body: &Expr) -> HirExpr {
-		match &body.kind {
+		let outer_loops = self.loop_targets.replace(Vec::new());
+		let outer_blocks = self.block_targets.replace(Vec::new());
+		let lowered = match &body.kind {
 			ExprKind::Block { body: stmts, .. } => self.lower_block(stmts, false),
 			_ => self.lower_expr(body),
-		}
+		};
+		self.block_targets.replace(outer_blocks);
+		self.loop_targets.replace(outer_loops);
+		lowered
 	}
 
 	/// Lower a closure expression (Slice 4L, JJ1) into `HirExpr::Closure`. Mirrors
@@ -3234,7 +3243,9 @@ impl<'a> Lowerer<'a> {
 			.map(|p| self.declare(&param_name(&p.0.name)))
 			.collect();
 		let outer_loop_targets = self.loop_targets.replace(Vec::new());
+		let outer_block_targets = self.block_targets.replace(Vec::new());
 		let body = self.lower_func_body(body);
+		self.block_targets.replace(outer_block_targets);
 		self.loop_targets.replace(outer_loop_targets);
 		self.pop_scope();
 		HirExpr::Closure {
@@ -3264,6 +3275,19 @@ impl<'a> Lowerer<'a> {
 		target
 	}
 
+	fn return_target(&self, jump: NodeId) -> nymph_hir::hir::HirReturnTarget {
+		let resolved = self.annotations.control_target_of(jump);
+		self
+			.block_targets
+			.borrow()
+			.iter()
+			.rev()
+			.find(|(source, _)| Some(*source) == resolved)
+			.map_or(nymph_hir::hir::HirReturnTarget::Callable, |(_, target)| {
+				nymph_hir::hir::HirReturnTarget::Block(*target)
+			})
+	}
+
 	fn loop_option(&self, expr: &Expr) -> Option<nymph_hir::hir::HirOptionAbi> {
 		let ty = self.annotations.get(expr.id)?.ty;
 		matches!(
@@ -3278,8 +3302,13 @@ impl<'a> Lowerer<'a> {
 		})
 	}
 
-	fn lower_loop_body(&self, target: nymph_hir::hir::LoopTarget, body: &Expr) -> HirExpr {
-		self.loop_targets.borrow_mut().push(target);
+	fn lower_loop_body(
+		&self,
+		source: NodeId,
+		target: nymph_hir::hir::LoopTarget,
+		body: &Expr,
+	) -> HirExpr {
+		self.loop_targets.borrow_mut().push((source, target));
 		let lowered = self.lower_branch(body);
 		self.loop_targets.borrow_mut().pop();
 		lowered
@@ -3297,7 +3326,9 @@ impl<'a> Lowerer<'a> {
 			.map(|i| self.declare(&anon_param_name(i)))
 			.collect();
 		let outer_loop_targets = self.loop_targets.replace(Vec::new());
+		let outer_block_targets = self.block_targets.replace(Vec::new());
 		let body = self.lower_expr_inner(expr);
+		self.block_targets.replace(outer_block_targets);
 		self.loop_targets.replace(outer_loop_targets);
 		self.pop_scope();
 		HirExpr::Closure {
@@ -3740,20 +3771,31 @@ impl<'a> Lowerer<'a> {
 			// pushes its own scope — unlike a function/method's OWN body block,
 			// which `lower_func_body` lowers directly via `lower_block(_, false)`
 			// into the scope its params already seeded (Slice 4E, Y2).
-			ExprKind::Block { body, .. } => self.lower_block(body, true),
-			ExprKind::Return { value, label } => {
+			ExprKind::Block { body, label } => {
+				if label.is_some() {
+					let target = self.next_block_target.get();
+					self.next_block_target.set(target + 1);
+					self.block_targets.borrow_mut().push((expr.id, target));
+					let body = self.lower_block(body, true);
+					self.block_targets.borrow_mut().pop();
+					HirExpr::LabeledBlock {
+						target,
+						body: Box::new(body),
+					}
+				} else {
+					self.lower_block(body, true)
+				}
+			}
+			ExprKind::Return { value, .. } => {
 				// HIR keeps return statement-flavored, so an expression-position return
 				// is represented by a block containing exactly that statement. Codegen
 				// propagates it across any synthetic expression IIFEs to the nearest
 				// real callable boundary.
-				assert!(
-					label.is_none(),
-					"slice-4e lowering does not yet support labeled `return`"
-				);
 				HirExpr::Block {
-					stmts: vec![HirStmt::Return(
-						value.as_ref().map(|value| self.lower_expr(value)),
-					)],
+					stmts: vec![HirStmt::Return {
+						value: value.as_ref().map(|value| self.lower_expr(value)),
+						target: self.return_target(expr.id),
+					}],
 					tail: None,
 				}
 			}
@@ -3773,7 +3815,7 @@ impl<'a> Lowerer<'a> {
 				HirExpr::While {
 					target,
 					cond: Box::new(self.lower_expr(condition)),
-					body: Box::new(self.lower_loop_body(target, body)),
+					body: Box::new(self.lower_loop_body(expr.id, target, body)),
 					continue_epilogue: None,
 					option: self.loop_option(expr),
 				}
@@ -3819,11 +3861,14 @@ impl<'a> Lowerer<'a> {
 				body,
 				..
 			} => self.lower_for(expr, variable, iterable, body),
-			ExprKind::Break { value, label: None } => HirExpr::Break {
-				target: *self
+			ExprKind::Break { value, .. } => HirExpr::Break {
+				target: self
 					.loop_targets
 					.borrow()
-					.last()
+					.iter()
+					.rev()
+					.find(|(source, _)| Some(*source) == self.annotations.control_target_of(expr.id))
+					.map(|(_, target)| *target)
 					.expect("checked break has an active loop target"),
 				value: Box::new(value.as_deref().map_or_else(
 					|| HirExpr::Array {
@@ -3833,11 +3878,14 @@ impl<'a> Lowerer<'a> {
 					|value| self.lower_expr(value),
 				)),
 			},
-			ExprKind::Continue { label: None } => HirExpr::Continue {
-				target: *self
+			ExprKind::Continue { .. } => HirExpr::Continue {
+				target: self
 					.loop_targets
 					.borrow()
-					.last()
+					.iter()
+					.rev()
+					.find(|(source, _)| Some(*source) == self.annotations.control_target_of(expr.id))
+					.map(|(_, target)| *target)
 					.expect("checked continue has an active loop target"),
 			},
 			// Direct `for` sources are handled by `lower_for`; every other range
@@ -4044,13 +4092,14 @@ impl<'a> Lowerer<'a> {
 		let target = self.next_loop_target();
 		let option = self.loop_option(expr);
 		if let ExprKind::Range(kind) = &iterable.kind {
-			return self.lower_for_range_protocol(target, option, variable, kind, body);
+			return self.lower_for_range_protocol(expr.id, target, option, variable, kind, body);
 		}
-		self.lower_for_protocol(target, option, variable, iterable, body)
+		self.lower_for_protocol(expr.id, target, option, variable, iterable, body)
 	}
 
 	fn lower_for_range_protocol(
 		&self,
+		source_id: NodeId,
 		target: nymph_hir::hir::LoopTarget,
 		option: Option<nymph_hir::hir::HirOptionAbi>,
 		variable: &Spanned<nymph_ast::expr::Pattern>,
@@ -4091,7 +4140,7 @@ impl<'a> Lowerer<'a> {
 		self.push_scope();
 		let mut stmts = self.drain_loop_stmts(target, option.clone(), it_value, |s| {
 			let pat = s.lower_pattern(variable);
-			let body = s.lower_loop_body(target, body);
+			let body = s.lower_loop_body(source_id, target, body);
 			(pat, body)
 		});
 		self.pop_scope();
@@ -4133,6 +4182,7 @@ impl<'a> Lowerer<'a> {
 	/// hook needed, the same way any other user method call already lowers.
 	fn lower_for_protocol(
 		&self,
+		source_id: NodeId,
 		target: nymph_hir::hir::LoopTarget,
 		option: Option<nymph_hir::hir::HirOptionAbi>,
 		variable: &Spanned<nymph_ast::expr::Pattern>,
@@ -4155,7 +4205,7 @@ impl<'a> Lowerer<'a> {
 		self.push_scope();
 		let mut stmts = self.drain_loop_stmts(target, option.clone(), it_value, |s| {
 			let pat = s.lower_pattern(variable);
-			let body = s.lower_loop_body(target, body);
+			let body = s.lower_loop_body(source_id, target, body);
 			(pat, body)
 		});
 		self.pop_scope();
@@ -5495,16 +5545,13 @@ impl<'a> Lowerer<'a> {
 				// the direct statement form. Subexpression returns use the identical
 				// statement inside a synthetic HIR block in `lower_expr`.
 				Statement::Expr(e) if matches!(e.kind, ExprKind::Return { .. }) => {
-					let ExprKind::Return { value, label } = &e.kind else {
+					let ExprKind::Return { value, .. } = &e.kind else {
 						unreachable!("matched above");
 					};
-					assert!(
-						label.is_none(),
-						"slice-4e lowering does not yet support labeled `return`"
-					);
-					stmts.push(HirStmt::Return(
-						value.as_ref().map(|value| self.lower_expr(value)),
-					));
+					stmts.push(HirStmt::Return {
+						value: value.as_ref().map(|value| self.lower_expr(value)),
+						target: self.return_target(e.id),
+					});
 				}
 				Statement::Expr(e) => {
 					if is_last {
@@ -5631,6 +5678,7 @@ fn collect_locals(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 				collect_locals(t, out);
 			}
 		}
+		HirExpr::LabeledBlock { body, .. } => collect_locals(body, out),
 		HirExpr::If {
 			cond,
 			then,
@@ -5684,7 +5732,7 @@ fn collect_locals_stmt(stmt: &HirStmt, out: &mut FxHashSet<EcoString>) {
 	match stmt {
 		HirStmt::Let { value, .. } => collect_locals(value, out),
 		HirStmt::Expr(e) => collect_locals(e, out),
-		HirStmt::Return(v) => {
+		HirStmt::Return { value: v, .. } => {
 			if let Some(v) = v {
 				collect_locals(v, out);
 			}
@@ -5821,7 +5869,7 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 				match stmt {
 					HirStmt::Let { value, .. } => collect_variant_ref_enums(value, out),
 					HirStmt::Expr(e) => collect_variant_ref_enums(e, out),
-					HirStmt::Return(v) => {
+					HirStmt::Return { value: v, .. } => {
 						if let Some(v) = v {
 							collect_variant_ref_enums(v, out);
 						}
@@ -5860,6 +5908,7 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 			}
 		}
 		HirExpr::ScalarCast { operand, .. } => collect_variant_ref_enums(operand, out),
+		HirExpr::LabeledBlock { body, .. } => collect_variant_ref_enums(body, out),
 		HirExpr::Closure { body, .. } => collect_variant_ref_enums(body, out),
 	}
 }

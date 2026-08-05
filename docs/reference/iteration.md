@@ -153,6 +153,10 @@ exhaustion is `None`, while an executed break is `Some`. Break collection scans 
 body syntactically, including unreachable branches, but stops at nested loops and callable bodies.
 See [Control flow](./expressions.md#control-flow) for the full jump-expression rules.
 
+Loops can be labeled with `while@outer` or `for@outer`; `break@outer` and `continue@outer` select
+that loop through intervening nested loops. There is no whitespace between the keyword, `@`, and
+label.
+
 > [!NOTE] Real `Iterator`/`Iterable` come from the standard library
 > The stdlib defines the real `Iterator`/`Iterable` interfaces in
 > [`@/iter`](./stdlib/iter#Iterator) — the versions declared inline above are for illustration

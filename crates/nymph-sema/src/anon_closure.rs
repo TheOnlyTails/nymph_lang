@@ -217,8 +217,17 @@ impl<'m> Checker<'m> {
 		let outer_loops = std::mem::take(&mut self.loop_controls);
 		let body_ty = self.fresh();
 		let outer_ret = self.ret_ty.replace(body_ty);
+		let outer_labels = std::mem::take(&mut self.control_labels);
+		self.push_control_label(
+			None,
+			expr.id,
+			crate::check::ControlLabelKind::Callable,
+			None,
+			Some(body_ty),
+		);
 		let inferred = self.infer_dispatch(expr);
 		self.subtype(inferred, body_ty, expr.span);
+		self.control_labels = outer_labels;
 		self.ret_ty = outer_ret;
 		self.loop_controls = outer_loops;
 		self.anon_ctx.pop();

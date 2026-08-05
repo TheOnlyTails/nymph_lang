@@ -36,6 +36,91 @@ fn callable_is_a_loop_control_boundary() {
 }
 
 #[test]
+fn labels_resolve_by_kind_and_do_not_cross_callables() {
+	assert!(
+		messages("func f(): Option<int> = while@outer (true) { while (true) { break@outer 7 } }")
+			.is_empty()
+	);
+	assert!(
+		messages("func f(): void = outer@{ break@outer }")
+			.iter()
+			.any(|m| m.contains("wrong kind"))
+	);
+	assert!(
+		messages("func f(): void = while@outer (true) { return@outer }")
+			.iter()
+			.any(|m| m.contains("wrong kind"))
+	);
+	assert!(
+		messages("func f(): void = while@outer (true) { let g = () -> break@outer }")
+			.iter()
+			.any(|m| m.contains("unknown"))
+	);
+	assert!(messages("func f(): int = { return@f 3 }").is_empty());
+}
+
+#[test]
+fn anonymous_closures_do_not_capture_outer_control_labels() {
+	for source in [
+		"func f(): void = while@outer (true) { let g: (boolean) -> boolean = { if ($) { break@outer } true } break }",
+		"func f(): int = { let g: (boolean) -> boolean = { if ($) { return@f 1 } true } 0 }",
+	] {
+		let found = messages(source);
+		assert!(
+			!found.is_empty(),
+			"{source} unexpectedly accepted an escaping jump"
+		);
+		assert!(
+			!found
+				.iter()
+				.any(|message| message.contains("only valid inside a loop")),
+			"{source}: {found:?}"
+		);
+	}
+}
+
+#[test]
+fn named_method_forms_install_callable_labels() {
+	for source in [
+		"struct S { func inherent(): int = { return@inherent 1 } }",
+		"struct S {} impl S { namespace func make(): int = { return@make 1 } mut func change(): int = { return@change 2 } }",
+		"interface I { func defaulted(): int = { return@defaulted 1 } } struct S {} impl I for S {}",
+		"interface I { func value(): int } struct S {} impl I for S { func value(): int = { return@value 1 } }",
+	] {
+		let found = messages(source);
+		assert!(found.is_empty(), "{source}: {found:?}");
+	}
+}
+
+#[test]
+fn labeled_block_returns_unify_with_the_tail() {
+	assert!(
+		messages("func f(flag: boolean): int = result@{ if (flag) { return@result 1 } 2 }").is_empty()
+	);
+	assert!(
+		messages("func f(): int = result@{ if (true) { return@result true } 2 }")
+			.iter()
+			.any(|m| m.contains("type"))
+	);
+}
+
+#[test]
+fn bare_returns_unify_void_with_the_target_result() {
+	for source in [
+		"func f(): int = { return }",
+		"func f(): int = value@{ return@value }",
+	] {
+		let found = messages(source);
+		assert!(
+			found
+				.iter()
+				.any(|message| message.contains("mismatched types")),
+			"{source}: {found:?}"
+		);
+	}
+}
+
+#[test]
 fn one_loop_cannot_mix_bare_and_valued_breaks() {
 	let found =
 		messages("func f(flag: boolean) = while (true) { if (flag) { break } else { break 1 } }");
@@ -57,6 +142,9 @@ fn loop_result_contracts_type_check() {
 		"func no_break(): void = while (false) {}",
 		"func bare(): Option<#()> = while (false) { break }",
 		"func valued(): Option<int> = while (false) { if (false) { break 1 } break 2 }",
+		"func labeled_while(): Option<int> = while@outer (true) { break 1 }",
+		"func labeled_for(): Option<int> = for@outer (_ in #[1]) { break 1 }",
+		"func nested_unlabeled(): void = while@outer (false) { while (true) { break 1 } }",
 		"func lexical(): Option<int> = while (false) { break 1 }",
 		"func branch(flag: boolean): Option<int> = while (true) { let value = if (flag) { break 1 } else { 2 } break value }",
 		"func arm(value: int): Option<int> = while (true) { let found = match (value) { 0 -> break 1, _ -> 2 } break found }",
@@ -76,14 +164,14 @@ fn loop_result_contracts_type_check() {
 }
 
 #[test]
-fn loop_headers_do_not_target_an_outer_loop_or_ice() {
+fn loop_headers_preserve_outer_targets_without_adding_the_new_loop() {
 	for source in [
 		"func f(): void = while (true) { while (break 1) {} }",
 		"func f(): void = while (true) { for (_ in break 1) {} }",
 	] {
 		let found = messages(source);
 		assert!(
-			found
+			!found
 				.iter()
 				.any(|message| message.contains("only valid inside a loop")),
 			"{source}: {found:?}"

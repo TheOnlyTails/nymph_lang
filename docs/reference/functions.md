@@ -22,6 +22,13 @@ The return type can be omitted and inferred from the body:
 func doubled(x: int) = x * 2
 ```
 
+## Callable labels
+
+A named function's name is its callable label, so `return@name value` explicitly returns from it.
+Closures may write a label as `label@(params) -> body` or `(params) -> label@{ body }`. If both
+positions are used, their labels must match. Labels are lexical and cannot escape across a nested
+function or closure boundary.
+
 ## Parameters
 
 Each parameter is `name: Type`. Two modifiers can prefix a parameter, and they mean different

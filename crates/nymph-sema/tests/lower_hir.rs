@@ -48,6 +48,31 @@ fn compatibility_lowering_preserves_loop_control_targets_and_option_results() {
 }
 
 #[test]
+fn compatibility_lowering_preserves_resolved_labeled_block_returns() {
+	let hir = lower("func choose(): int = { result@{ return@result 7 } }");
+	assert!(matches!(
+		&hir.funcs[0].body,
+		HirExpr::Block {
+			tail: Some(tail),
+			..
+		} if matches!(tail.as_ref(),
+			HirExpr::LabeledBlock {
+				target,
+				body,
+			} if matches!(body.as_ref(),
+				HirExpr::Block {
+					stmts,
+					..
+				} if matches!(stmts.as_slice(), [HirStmt::Return {
+					target: nymph_hir::hir::HirReturnTarget::Block(return_target),
+					..
+				}] if return_target == target)
+			)
+		)
+	));
+}
+
+#[test]
 fn separates_demanded_prelude_runtime_from_consumer_hir() {
 	let prelude = parse_module("enum Order { Less, Equal, Greater }", "prelude");
 	let user = parse_module("func equal(): Order = Order.Equal", "test");
@@ -1385,7 +1410,10 @@ fn lowers_return_with_value_as_last_statement_of_a_block() {
 	};
 	assert_eq!(
 		then_stmts,
-		&vec![HirStmt::Return(Some(HirExpr::Local("n".into())))]
+		&vec![HirStmt::Return {
+			value: Some(HirExpr::Local("n".into())),
+			target: nymph_hir::hir::HirReturnTarget::Callable
+		}]
 	);
 	assert!(
 		then_tail.is_none(),
@@ -1403,7 +1431,10 @@ fn lowers_bare_return_in_a_void_function() {
 	assert_eq!(
 		hir.funcs[0].body,
 		HirExpr::Block {
-			stmts: vec![HirStmt::Return(None)],
+			stmts: vec![HirStmt::Return {
+				value: None,
+				target: nymph_hir::hir::HirReturnTarget::Callable
+			}],
 			tail: None,
 		}
 	);
@@ -1425,7 +1456,7 @@ fn lowers_return_as_an_unbraced_match_arm_body() {
 	assert!(matches!(
 		&arms[0].body,
 		HirExpr::Block { stmts, tail: None }
-			if matches!(stmts.as_slice(), [HirStmt::Return(Some(HirExpr::Num(7.0, NumKind::Int)))])
+			if matches!(stmts.as_slice(), [HirStmt::Return { value: Some(HirExpr::Num(7.0, NumKind::Int)), .. }])
 	));
 }
 
@@ -1437,7 +1468,7 @@ fn lowers_return_as_a_direct_eager_operand_without_operator_dispatch() {
 		HirExpr::Block { stmts, tail: Some(tail) }
 			if matches!(stmts.as_slice(), [HirStmt::Expr(HirExpr::Num(1.0, NumKind::Int))])
 				&& matches!(tail.as_ref(), HirExpr::Block { stmts, tail: None }
-					if matches!(stmts.as_slice(), [HirStmt::Return(Some(HirExpr::Num(9.0, NumKind::Int)))])
+					if matches!(stmts.as_slice(), [HirStmt::Return { value: Some(HirExpr::Num(9.0, NumKind::Int)), .. }])
 				)
 	));
 }
@@ -1921,7 +1952,10 @@ fn lowers_bare_return_as_an_unbraced_while_body() {
 	assert_eq!(
 		body.as_ref(),
 		&HirExpr::Block {
-			stmts: vec![HirStmt::Return(Some(HirExpr::Local("n".into())))],
+			stmts: vec![HirStmt::Return {
+				value: Some(HirExpr::Local("n".into())),
+				target: nymph_hir::hir::HirReturnTarget::Callable
+			}],
 			tail: None,
 		}
 	);
@@ -1952,12 +1986,15 @@ fn lowers_bare_return_as_an_unbraced_if_then_branch() {
 	assert_eq!(
 		then.as_ref(),
 		&HirExpr::Block {
-			stmts: vec![HirStmt::Return(Some(HirExpr::Binary {
-				op: BinOp::Sub,
-				result: BuiltinResult::Int,
-				lhs: Box::new(HirExpr::Num(0.0, NumKind::Int)),
-				rhs: Box::new(HirExpr::Local("n".into())),
-			}))],
+			stmts: vec![HirStmt::Return {
+				value: Some(HirExpr::Binary {
+					op: BinOp::Sub,
+					result: BuiltinResult::Int,
+					lhs: Box::new(HirExpr::Num(0.0, NumKind::Int)),
+					rhs: Box::new(HirExpr::Local("n".into())),
+				}),
+				target: nymph_hir::hir::HirReturnTarget::Callable
+			}],
 			tail: None,
 		}
 	);

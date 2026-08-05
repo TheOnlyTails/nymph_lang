@@ -400,6 +400,8 @@ pub struct RuntimeAnnotations {
 	pub anonymous_closures: Arc<[(BodyNodeId, u8)]>,
 	pub generic_namespaced_calls: Arc<[BodyNodeId]>,
 	pub external_marshals: Arc<[(BodyNodeId, nymph_hir::hir::MarshalKind)]>,
+	/// Resolved jump node → lexical target node, projected to stable body ids.
+	pub control_targets: Arc<[(BodyNodeId, BodyNodeId)]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, salsa::SalsaValue)]
@@ -1418,6 +1420,11 @@ fn runtime_annotations(
 	let mut iterations = Vec::new();
 	let mut anonymous_closures = Vec::new();
 	let mut generic_namespaced_calls = Vec::new();
+	let mut control_targets = checked
+		.annotations
+		.control_targets()
+		.filter_map(|(jump, target)| Some((*local.get(&jump)?, *local.get(&target)?)))
+		.collect::<Vec<_>>();
 	for (&source, &id) in local {
 		if let Some(mode) = checked.annotations.iter_mode_of(source).or_else(|| {
 			native_range_nodes
@@ -1476,6 +1483,7 @@ fn runtime_annotations(
 	iterations.sort_by_key(|item| item.0);
 	anonymous_closures.sort_by_key(|item| item.0);
 	generic_namespaced_calls.sort_unstable();
+	control_targets.sort_unstable();
 	let mut direct_namespace_members = checked
 		.annotations
 		.direct_namespace_members()
@@ -1501,6 +1509,7 @@ fn runtime_annotations(
 		anonymous_closures: anonymous_closures.into(),
 		generic_namespaced_calls: generic_namespaced_calls.into(),
 		external_marshals: external_marshals.into(),
+		control_targets: control_targets.into(),
 	})
 }
 

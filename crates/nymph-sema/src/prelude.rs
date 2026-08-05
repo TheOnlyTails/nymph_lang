@@ -399,7 +399,9 @@ fn expr_kind(k: ExprKind) -> ExprKind {
 			generics,
 			return_type,
 			body,
+			label,
 		} => ExprKind::Closure {
+			label: opt_ident(label),
 			params: params.into_iter().map(closure_param).collect(),
 			generics: generics.into_iter().map(generic_param).collect(),
 			return_type: return_type.map(spanned_type),

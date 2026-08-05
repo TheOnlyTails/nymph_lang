@@ -220,6 +220,9 @@ pub struct Annotations {
 	/// The parameter identifier has no runtime binding, so stable lowering must
 	/// reject these rather than emitting an undefined local.
 	generic_namespaced_calls: FxHashSet<NodeId>,
+	/// Checker-resolved lexical control target for each jump expression. Both
+	/// endpoints are source identities; lowering must never repeat name lookup.
+	control_targets: FxHashMap<NodeId, NodeId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -229,6 +232,20 @@ pub struct PositionalFieldResolution {
 }
 
 impl Annotations {
+	pub(crate) fn record_control_target(&mut self, jump: NodeId, target: NodeId) {
+		self.control_targets.insert(jump, target);
+	}
+
+	pub fn control_target_of(&self, jump: NodeId) -> Option<NodeId> {
+		self.control_targets.get(&jump).copied()
+	}
+
+	pub fn control_targets(&self) -> impl Iterator<Item = (NodeId, NodeId)> + '_ {
+		self
+			.control_targets
+			.iter()
+			.map(|(&jump, &target)| (jump, target))
+	}
 	pub fn record_unresolved_qualified_access(
 		&mut self,
 		module: ModuleIdentity,
