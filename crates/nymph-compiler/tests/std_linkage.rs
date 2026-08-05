@@ -69,7 +69,12 @@ fn only_entry(entry_key: &'static str, entry_src: &'static str) -> impl Fn(&str)
 }
 
 fn synth_std_math_provider(path: &str) -> Option<String> {
-	(path == "math").then(|| "public external(max_float) let max_float: float\n".to_string())
+	(path == "math").then(|| {
+		"public external(max_float) let max_float: float\n\
+		 public external(min_float) let min_float: float\n\
+		 public external(min_positive_float) let min_positive_float: float\n"
+			.to_string()
+	})
 }
 
 fn run_node(js: &str, tag: &str) -> String {

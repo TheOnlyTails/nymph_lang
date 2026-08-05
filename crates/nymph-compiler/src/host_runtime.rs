@@ -121,7 +121,7 @@ const HOST_MODULES: &[HostModuleDescriptor] = &[
 	HostModuleDescriptor {
 		module: "std/math/intrinsics",
 		provider: SourceProvider::EmbeddedTs(include_str!("../../../stdlib/src/math/mod.ts")),
-		dependencies: &[],
+		dependencies: &[BOX],
 	},
 	HostModuleDescriptor {
 		module: "std/string",
@@ -513,6 +513,26 @@ mod tests {
 			.expect("expected the linked I/O runtime module to be injected");
 		assert!(io_js.contains("from \"std/display\""), "{io_js}");
 		assert!(!io_js.contains("from \"./display\""), "{io_js}");
+	}
+
+	#[test]
+	fn math_source_exports_every_registry_symbol_through_the_canonical_box_runtime() {
+		let sources = HostRuntimeGraph::compiler_facts().module_sources("Option");
+		let math_js = sources
+			.get("std/math/intrinsics")
+			.expect("expected the linked math runtime module to be injected");
+		assert!(math_js.contains("from \"std/box\""), "{math_js}");
+		for (_, symbols) in nymph_hir::linkage::modules()
+			.into_iter()
+			.filter(|(module, _)| *module == "std/math/intrinsics")
+		{
+			for symbol in symbols {
+				assert!(
+					math_js.contains(&format!("const {symbol} =")),
+					"missing `{symbol}` in {math_js}"
+				);
+			}
+		}
 	}
 
 	#[test]
