@@ -8,6 +8,21 @@
 
 use std::path::{Path, PathBuf};
 
+/// Select whether target resolution discovers the nearest conventional
+/// manifest or loads one explicit path authoritatively.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ManifestSelection {
+	#[default]
+	Discover,
+	Explicit(PathBuf),
+}
+
+impl From<Option<PathBuf>> for ManifestSelection {
+	fn from(path: Option<PathBuf>) -> Self {
+		path.map_or(Self::Discover, Self::Explicit)
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TargetIntent {
 	Entry,
@@ -22,11 +37,15 @@ pub(crate) struct ResolvedTarget {
 	pub intent: TargetIntent,
 }
 
-/// Resolve an optional explicit file against the nearest project. With a
-/// project and no file, the manifest's `build.entry` is selected relative to
-/// its source root. Without a project, an explicit file is a loose library;
-/// without either, selection fails before compilation with a usage hint.
-pub(crate) fn resolve(file: Option<&Path>) -> anyhow::Result<ResolvedTarget> {
+/// Resolve an optional explicit file using the selected manifest policy. An
+/// explicit manifest is loaded exactly and never falls back to discovery.
+/// With a project and no file, the manifest's `build.entry` is selected
+/// relative to its source root. Without a discovered project, an explicit file
+/// is a loose library; without either, selection fails with a usage hint.
+pub(crate) fn resolve(
+	file: Option<&Path>,
+	manifest: &ManifestSelection,
+) -> anyhow::Result<ResolvedTarget> {
 	let explicit_file = file.map(nymph_project::normalize_path).transpose()?;
 	let current_dir = nymph_project::normalize_path(std::env::current_dir()?)?;
 	let start_dir = match &explicit_file {
@@ -36,8 +55,17 @@ pub(crate) fn resolve(file: Option<&Path>) -> anyhow::Result<ResolvedTarget> {
 		None => &current_dir,
 	};
 
-	match nymph_project::discover(start_dir) {
-		Ok(project) => {
+	let project = match manifest {
+		ManifestSelection::Discover => match nymph_project::discover(start_dir) {
+			Ok(project) => Some(project),
+			Err(nymph_project::DiscoverError::NotFound { .. }) => None,
+			Err(error) => return Err(error.into()),
+		},
+		ManifestSelection::Explicit(path) => Some(nymph_project::Project::load(path)?),
+	};
+
+	match project {
+		Some(project) => {
 			let src_root = project.source_root();
 			let entry_module = project.entry_module().map_err(|error| {
 				anyhow::anyhow!(
@@ -61,6 +89,7 @@ pub(crate) fn resolve(file: Option<&Path>) -> anyhow::Result<ResolvedTarget> {
 				),
 			};
 			ensure_source_file(&file)?;
+			ensure_source_within_root(&file, &src_root)?;
 			let intent = if module == entry_module {
 				TargetIntent::Entry
 			} else {
@@ -73,7 +102,7 @@ pub(crate) fn resolve(file: Option<&Path>) -> anyhow::Result<ResolvedTarget> {
 				intent,
 			})
 		}
-		Err(nymph_project::DiscoverError::NotFound { .. }) => {
+		None => {
 			let file = explicit_file.ok_or_else(|| {
 				anyhow::anyhow!(
 					"no nymph.toml found and no source file was provided; pass a .nym file or run from inside a Nymph project"
@@ -94,7 +123,6 @@ pub(crate) fn resolve(file: Option<&Path>) -> anyhow::Result<ResolvedTarget> {
 				intent: TargetIntent::Library,
 			})
 		}
-		Err(error) => Err(error.into()),
 	}
 }
 
@@ -103,6 +131,20 @@ fn ensure_source_file(file: &Path) -> anyhow::Result<()> {
 		Ok(())
 	} else {
 		anyhow::bail!("target source file does not exist: {}", file.display())
+	}
+}
+
+fn ensure_source_within_root(file: &Path, src_root: &Path) -> anyhow::Result<()> {
+	let canonical_file = std::fs::canonicalize(file)?;
+	let canonical_root = std::fs::canonicalize(src_root)?;
+	if canonical_file.starts_with(canonical_root) {
+		Ok(())
+	} else {
+		anyhow::bail!(
+			"source file {} is outside source root {}",
+			file.display(),
+			src_root.display()
+		)
 	}
 }
 

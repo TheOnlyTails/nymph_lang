@@ -10,6 +10,12 @@ manifest that cannot be read or validated is a fatal project error. A broken
 nearby manifest is authoritative and must be fixed (or the source moved out of
 its search chain); tools never ignore it and retry the source as a loose file.
 
+Pass the global `--manifest <PATH>` option to select a manifest explicitly.
+The selected path is authoritative: tools read exactly that file, do not
+discover `nymph.toml` or fall back to loose-file mode, and report any read or
+parse error for that path. There is no `--config` alias or environment-based
+project configuration.
+
 Every manifest requires a `[package]` table:
 
 ```toml
@@ -62,6 +68,20 @@ nymph check src/network/http.nym
 nymph build scratch.nym
 nymph run script.nym
 ```
+
+Because manifest fields are based on the selected manifest's directory, an
+explicit manifest works from anywhere. As a global option, it may appear
+before or after the subcommand:
+
+```sh
+nymph --manifest ../hello/nymph.toml check
+nymph build --manifest ../hello/nymph.toml
+nymph run --manifest ../hello/nymph.toml
+```
+
+An explicit source argument is still resolved within the selected manifest's
+`package.src`; a source outside that root is rejected rather than causing
+discovery of another project.
 
 Dependency declarations may use a version string or a table with `version`,
 `path`, or `git`. Dependency fetching and resolution are not yet implemented.

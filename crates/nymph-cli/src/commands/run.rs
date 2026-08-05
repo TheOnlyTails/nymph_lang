@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::NymphCommand;
 use crate::compile_guard::{CompileOutcome, compile_guarded, guarded, unsupported_feature_message};
-use crate::project_support::{self, fs_loader, render_project_diagnostics};
+use crate::project_support::{self, ManifestSelection, fs_loader, render_project_diagnostics};
 
 /// `nymph run [file]` — compile a Nymph source file and execute it under
 /// `node`, forwarding stdout/stderr live and propagating node's exit status.
@@ -45,12 +45,12 @@ pub(crate) struct RunCommand {
 }
 
 impl NymphCommand for RunCommand {
-	fn run(&self) -> i32 {
+	fn run(&self, manifest: &ManifestSelection) -> i32 {
 		if let Some(expr) = &self.expr {
 			return run_inline_expr(expr);
 		}
 
-		let target = match project_support::resolve(self.file.as_deref()) {
+		let target = match project_support::resolve(self.file.as_deref(), manifest) {
 			Ok(target) => target,
 			Err(error) => {
 				eprintln!("error: {error}");

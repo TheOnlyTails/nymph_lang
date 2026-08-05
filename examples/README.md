@@ -33,6 +33,15 @@ nymph build
 nymph run
 ```
 
+You can also run an example from outside its directory by selecting its
+manifest exactly (the option may appear before or after the subcommand):
+
+```sh
+nymph --manifest examples/hello-world/nymph.toml check
+nymph build --manifest examples/hello-world/nymph.toml
+nymph run --manifest examples/hello-world/nymph.toml
+```
+
 ## The examples
 
 | Example | What it shows | Ambient today? |

@@ -1,7 +1,9 @@
 use std::path::PathBuf;
 
 use crate::NymphCommand;
-use crate::project_support::{self, TargetIntent, fs_loader, render_project_diagnostics};
+use crate::project_support::{
+	self, ManifestSelection, TargetIntent, fs_loader, render_project_diagnostics,
+};
 
 /// `nymph check [file]` — parse and type-check a Nymph source file. Prints
 /// "ok" and exits 0 when there are no diagnostics; otherwise renders every
@@ -19,8 +21,8 @@ pub(crate) struct CheckCommand {
 }
 
 impl NymphCommand for CheckCommand {
-	fn run(&self) -> i32 {
-		let target = match project_support::resolve(self.file.as_deref()) {
+	fn run(&self, manifest: &ManifestSelection) -> i32 {
+		let target = match project_support::resolve(self.file.as_deref(), manifest) {
 			Ok(target) => target,
 			Err(error) => {
 				eprintln!("error: {error}");
