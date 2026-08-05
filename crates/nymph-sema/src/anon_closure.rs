@@ -216,7 +216,9 @@ impl<'m> Checker<'m> {
 	pub(crate) fn form_anon_closure(&mut self, expr: &Expr, arity: u8) -> Ty {
 		let param_tys: Vec<Ty> = (0..arity).map(|_| self.fresh()).collect();
 		self.anon_ctx.push(param_tys.clone());
+		let outer_loops = std::mem::take(&mut self.loop_controls);
 		let body_ty = self.infer_dispatch(expr);
+		self.loop_controls = outer_loops;
 		self.anon_ctx.pop();
 		self.interner.mk_fn(param_tys, body_ty)
 	}

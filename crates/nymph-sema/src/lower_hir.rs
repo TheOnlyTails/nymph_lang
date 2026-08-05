@@ -268,6 +268,8 @@ fn lower_hir_impl(
 		pattern_declaration_reuse: RefCell::new(Vec::new()),
 		generics_stack: RefCell::new(Vec::new()),
 		closure_depth: std::cell::Cell::new(0),
+		loop_targets: RefCell::new(Vec::new()),
+		next_loop_target: std::cell::Cell::new(0),
 		this_sub: RefCell::new(Vec::new()),
 		lowering_runtime_sibling: RefCell::new(Vec::new()),
 		runtime_funcs_seen: RefCell::new(FxHashMap::default()),
@@ -355,6 +357,8 @@ struct Lowerer<'a> {
 	/// Anonymous closures do not yet establish the explicit-closure return
 	/// context implemented for issue #22, so their existing guard remains.
 	closure_depth: std::cell::Cell<u32>,
+	loop_targets: RefCell<Vec<nymph_hir::hir::LoopTarget>>,
+	next_loop_target: std::cell::Cell<nymph_hir::hir::LoopTarget>,
 	/// Stack of receiver-param names currently substituting for `this` while
 	/// lowering a prelude body as a top-level mangled function (stdlib body
 	/// lowering slice, gap b) — the innermost entry is what
@@ -3240,7 +3244,9 @@ impl<'a> Lowerer<'a> {
 		// it is nested inside an anonymous `$N` closure. Suspend the anonymous
 		// guard while lowering this body, then restore it for the outer boundary.
 		let outer_closure_depth = self.closure_depth.replace(0);
+		let outer_loop_targets = self.loop_targets.replace(Vec::new());
 		let body = self.lower_func_body(body);
+		self.loop_targets.replace(outer_loop_targets);
 		self.closure_depth.set(outer_closure_depth);
 		self.pop_scope();
 		HirExpr::Closure {
@@ -3264,6 +3270,33 @@ impl<'a> Lowerer<'a> {
 		}
 	}
 
+	fn next_loop_target(&self) -> nymph_hir::hir::LoopTarget {
+		let target = self.next_loop_target.get();
+		self.next_loop_target.set(target + 1);
+		target
+	}
+
+	fn loop_option(&self, expr: &Expr) -> Option<nymph_hir::hir::HirOptionAbi> {
+		let ty = self.annotations.get(expr.id)?.ty;
+		matches!(
+			self.interner.kind(Self::peel_mut(self.interner, ty)),
+			TyKind::Adt(..)
+		)
+		.then(|| nymph_hir::hir::HirOptionAbi {
+			enum_name: "Option".into(),
+			some: "Some".into(),
+			some_value: "value".into(),
+			none: "None".into(),
+		})
+	}
+
+	fn lower_loop_body(&self, target: nymph_hir::hir::LoopTarget, body: &Expr) -> HirExpr {
+		self.loop_targets.borrow_mut().push(target);
+		let lowered = self.lower_branch(body);
+		self.loop_targets.borrow_mut().pop();
+		lowered
+	}
+
 	/// Lower the closure committed at `expr` (see [`Self::lower_expr`]):
 	/// mirrors [`Self::lower_closure`] exactly — one fresh JS scope seeded
 	/// with `arity` synthesized `anon$0`, `anon$1`, … params, `closure_depth`
@@ -3278,7 +3311,9 @@ impl<'a> Lowerer<'a> {
 			.map(|i| self.declare(&anon_param_name(i)))
 			.collect();
 		self.closure_depth.set(self.closure_depth.get() + 1);
+		let outer_loop_targets = self.loop_targets.replace(Vec::new());
 		let body = self.lower_expr_inner(expr);
+		self.loop_targets.replace(outer_loop_targets);
 		self.closure_depth.set(self.closure_depth.get() - 1);
 		self.pop_scope();
 		HirExpr::Closure {
@@ -3742,10 +3777,16 @@ impl<'a> Lowerer<'a> {
 			},
 			ExprKind::While {
 				condition, body, ..
-			} => HirExpr::While {
-				cond: Box::new(self.lower_expr(condition)),
-				body: Box::new(self.lower_branch(body)),
-			},
+			} => {
+				let target = self.next_loop_target();
+				HirExpr::While {
+					target,
+					cond: Box::new(self.lower_expr(condition)),
+					body: Box::new(self.lower_loop_body(target, body)),
+					continue_epilogue: None,
+					option: self.loop_option(expr),
+				}
+			}
 			ExprKind::Match { value, arms } => {
 				let scrutinee = Box::new(self.lower_expr(value));
 				let arms = arms
@@ -3786,7 +3827,28 @@ impl<'a> Lowerer<'a> {
 				iterable,
 				body,
 				..
-			} => self.lower_for(variable, iterable, body),
+			} => self.lower_for(expr, variable, iterable, body),
+			ExprKind::Break { value, label: None } => HirExpr::Break {
+				target: *self
+					.loop_targets
+					.borrow()
+					.last()
+					.expect("checked break has an active loop target"),
+				value: Box::new(value.as_deref().map_or_else(
+					|| HirExpr::Array {
+						kind: HirArrayKind::Tuple,
+						items: vec![],
+					},
+					|value| self.lower_expr(value),
+				)),
+			},
+			ExprKind::Continue { label: None } => HirExpr::Continue {
+				target: *self
+					.loop_targets
+					.borrow()
+					.last()
+					.expect("checked continue has an active loop target"),
+			},
 			// Direct `for` sources are handled by `lower_for`; every other range
 			// expression constructs the corresponding canonical stdlib value.
 			ExprKind::Range(kind) => {
@@ -3974,18 +4036,23 @@ impl<'a> Lowerer<'a> {
 	///   `resolve_iterable_source`).
 	fn lower_for(
 		&self,
+		expr: &Expr,
 		variable: &Spanned<nymph_ast::expr::Pattern>,
 		iterable: &Expr,
 		body: &Expr,
 	) -> HirExpr {
+		let target = self.next_loop_target();
+		let option = self.loop_option(expr);
 		if let ExprKind::Range(kind) = &iterable.kind {
-			return self.lower_for_range_protocol(variable, kind, body);
+			return self.lower_for_range_protocol(target, option, variable, kind, body);
 		}
-		self.lower_for_protocol(variable, iterable, body)
+		self.lower_for_protocol(target, option, variable, iterable, body)
 	}
 
 	fn lower_for_range_protocol(
 		&self,
+		target: nymph_hir::hir::LoopTarget,
+		option: Option<nymph_hir::hir::HirOptionAbi>,
 		variable: &Spanned<nymph_ast::expr::Pattern>,
 		kind: &nymph_ast::expr::RangeKind,
 		body: &Expr,
@@ -4022,13 +4089,19 @@ impl<'a> Lowerer<'a> {
 		};
 		let it_value = Self::direct_it_value_for(IterMode::ViaIter, source);
 		self.push_scope();
-		let stmts = self.drain_loop_stmts(it_value, |s| {
+		let mut stmts = self.drain_loop_stmts(target, option.clone(), it_value, |s| {
 			let pat = s.lower_pattern(variable);
-			let body = s.lower_branch(body);
+			let body = s.lower_loop_body(target, body);
 			(pat, body)
 		});
 		self.pop_scope();
-		HirExpr::Block { stmts, tail: None }
+		let tail = option.map(|_| {
+			let HirStmt::Expr(loop_expr) = stmts.pop().expect("for loop expression") else {
+				unreachable!()
+			};
+			Box::new(loop_expr)
+		});
+		HirExpr::Block { stmts, tail }
 	}
 
 	/// The general `Iterator`/`Iterable` protocol desugar (RR1/RR2): every
@@ -4060,6 +4133,8 @@ impl<'a> Lowerer<'a> {
 	/// hook needed, the same way any other user method call already lowers.
 	fn lower_for_protocol(
 		&self,
+		target: nymph_hir::hir::LoopTarget,
+		option: Option<nymph_hir::hir::HirOptionAbi>,
 		variable: &Spanned<nymph_ast::expr::Pattern>,
 		iterable: &Expr,
 		body: &Expr,
@@ -4078,14 +4153,20 @@ impl<'a> Lowerer<'a> {
 		// loop-continues flag (plus, via `drain_loop_stmts`, the loop pattern's
 		// own nested scope).
 		self.push_scope();
-		let stmts = self.drain_loop_stmts(it_value, |s| {
+		let mut stmts = self.drain_loop_stmts(target, option.clone(), it_value, |s| {
 			let pat = s.lower_pattern(variable);
-			let body = s.lower_branch(body);
+			let body = s.lower_loop_body(target, body);
 			(pat, body)
 		});
 		self.pop_scope();
 
-		HirExpr::Block { stmts, tail: None }
+		let tail = option.map(|_| {
+			let HirStmt::Expr(loop_expr) = stmts.pop().expect("for loop expression") else {
+				unreachable!()
+			};
+			Box::new(loop_expr)
+		});
+		HirExpr::Block { stmts, tail }
 	}
 
 	/// Build the iterator-or-iterable-via-`.iter()` source `lower_for_protocol`
@@ -4152,6 +4233,8 @@ impl<'a> Lowerer<'a> {
 	/// `$acc`).
 	fn drain_loop_stmts(
 		&self,
+		target: nymph_hir::hir::LoopTarget,
+		option: Option<nymph_hir::hir::HirOptionAbi>,
 		it_value: HirExpr,
 		build_some: impl FnOnce(&Self) -> (HirPat, HirExpr),
 	) -> Vec<HirStmt> {
@@ -4199,11 +4282,14 @@ impl<'a> Lowerer<'a> {
 			],
 		};
 		let while_expr = HirExpr::While {
+			target,
 			cond: Box::new(HirExpr::Local(go_name.clone())),
 			body: Box::new(HirExpr::Block {
 				stmts: vec![HirStmt::Expr(match_expr)],
 				tail: None,
 			}),
+			continue_epilogue: None,
+			option,
 		};
 
 		vec![
@@ -4256,23 +4342,25 @@ impl<'a> Lowerer<'a> {
 				items: vec![],
 			},
 		}];
-		stmts.extend(self.drain_loop_stmts(it_value, |s| {
-			let x_name = s.declare(&EcoString::from("$x"));
-			let push_call = HirExpr::Call {
-				callee: Box::new(HirExpr::Field {
-					recv: Box::new(HirExpr::Local(acc_name.clone())),
-					name: "push".into(),
-				}),
-				args: vec![HirExpr::Local(x_name.clone())],
-			};
-			(
-				HirPat::Binding {
-					name: x_name,
-					sub: None,
-				},
-				push_call,
-			)
-		}));
+		stmts.extend(
+			self.drain_loop_stmts(self.next_loop_target(), None, it_value, |s| {
+				let x_name = s.declare(&EcoString::from("$x"));
+				let push_call = HirExpr::Call {
+					callee: Box::new(HirExpr::Field {
+						recv: Box::new(HirExpr::Local(acc_name.clone())),
+						name: "push".into(),
+					}),
+					args: vec![HirExpr::Local(x_name.clone())],
+				};
+				(
+					HirPat::Binding {
+						name: x_name,
+						sub: None,
+					},
+					push_call,
+				)
+			}),
+		);
 		self.pop_scope();
 		HirExpr::Block {
 			stmts,
@@ -5508,10 +5596,12 @@ fn collect_locals(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 				collect_locals(o, out);
 			}
 		}
-		HirExpr::While { cond, body } => {
+		HirExpr::While { cond, body, .. } => {
 			collect_locals(cond, out);
 			collect_locals(body, out);
 		}
+		HirExpr::Break { value, .. } => collect_locals(value, out),
+		HirExpr::Continue { .. } => {}
 		HirExpr::Match { scrutinee, arms } => {
 			collect_locals(scrutinee, out);
 			for arm in arms {
@@ -5553,7 +5643,6 @@ fn collect_locals_stmt(stmt: &HirStmt, out: &mut FxHashSet<EcoString>) {
 				collect_locals(v, out);
 			}
 		}
-		HirStmt::Break => {}
 	}
 }
 
@@ -5691,7 +5780,6 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 							collect_variant_ref_enums(v, out);
 						}
 					}
-					HirStmt::Break => {}
 				}
 			}
 			if let Some(t) = tail {
@@ -5709,10 +5797,12 @@ fn collect_variant_ref_enums(expr: &HirExpr, out: &mut FxHashSet<EcoString>) {
 				collect_variant_ref_enums(o, out);
 			}
 		}
-		HirExpr::While { cond, body } => {
+		HirExpr::While { cond, body, .. } => {
 			collect_variant_ref_enums(cond, out);
 			collect_variant_ref_enums(body, out);
 		}
+		HirExpr::Break { value, .. } => collect_variant_ref_enums(value, out),
+		HirExpr::Continue { .. } => {}
 		HirExpr::Match { scrutinee, arms } => {
 			collect_variant_ref_enums(scrutinee, out);
 			for arm in arms {

@@ -147,6 +147,12 @@ yield the same key-value tuple sequence. Repeated iteration of an unchanged map 
 but map order is otherwise unspecified: separate map instances need not have the same order, and
 mutation may change it. As with every `for` source, the map expression is evaluated exactly once.
 
+Both `while` and `for` are expressions. A loop with no lexical `break` has type `void`; bare
+breaks produce `Option<#()>`, and consistently valued breaks produce `Option<T>`. Natural
+exhaustion is `None`, while an executed break is `Some`. Break collection scans the complete loop
+body syntactically, including unreachable branches, but stops at nested loops and callable bodies.
+See [Control flow](./expressions.md#control-flow) for the full jump-expression rules.
+
 > [!NOTE] Real `Iterator`/`Iterable` come from the standard library
 > The stdlib defines the real `Iterator`/`Iterable` interfaces in
 > [`@/iter`](./stdlib/iter#Iterator) — the versions declared inline above are for illustration

@@ -147,6 +147,10 @@ pub struct Emitter<'a> {
 	/// the inline runtime when this is non-empty; project emission imports only
 	/// these bindings from the canonical `std/box` virtual module.
 	box_runtime_bindings: std::cell::RefCell<std::collections::BTreeSet<String>>,
+	/// Private per-loop completion tokens active while that loop's body is
+	/// emitted. A generated local object, rather than a forgeable numeric id,
+	/// distinguishes compiler control transfers from unrelated exceptions.
+	loop_completion_tokens: std::cell::RefCell<Vec<(nymph_hir::hir::LoopTarget, &'a str)>>,
 	import_box_runtime: bool,
 	current_module: Option<String>,
 }
@@ -159,6 +163,7 @@ impl<'a> Emitter<'a> {
 			in_iife_subexpr: std::cell::Cell::new(false),
 			needed_imports: std::cell::RefCell::new(std::collections::BTreeSet::new()),
 			box_runtime_bindings: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+			loop_completion_tokens: std::cell::RefCell::new(Vec::new()),
 			import_box_runtime: false,
 			current_module: None,
 		}
@@ -1798,6 +1803,57 @@ impl<'a> Emitter<'a> {
 					&self.ast,
 				)
 			}
+			HirExpr::Break { target, value } => {
+				let token = self
+					.loop_completion_tokens
+					.borrow()
+					.iter()
+					.rev()
+					.find_map(|(found, token)| (*found == *target).then_some(*token))
+					.expect("break target is not active while emitting its loop body");
+				let mut elems = ArenaVec::new_in(&self.ast);
+				elems.push(ArrayExpressionElement::from(Expression::new_identifier(
+					SPAN, token, &self.ast,
+				)));
+				elems.push(ArrayExpressionElement::from(
+					Expression::new_numeric_literal(SPAN, 0.0, None, NumberBase::Decimal, &self.ast),
+				));
+				elems.push(ArrayExpressionElement::from(self.emit_expr(value)));
+				let thrown = Statement::new_throw_statement(
+					SPAN,
+					Expression::new_array_expression(SPAN, elems, &self.ast),
+					&self.ast,
+				);
+				JsValue {
+					stmts: ArenaVec::from_value_in(thrown, &self.ast),
+					expr: Expression::new_identifier(SPAN, "undefined", &self.ast),
+				}
+				.into_expression(self.ast)
+			}
+			HirExpr::Continue { target } => {
+				let token = self
+					.loop_completion_tokens
+					.borrow()
+					.iter()
+					.rev()
+					.find_map(|(found, token)| (*found == *target).then_some(*token))
+					.expect("continue target is not active while emitting its loop body");
+				let mut elems = ArenaVec::new_in(&self.ast);
+				elems.push(Expression::new_identifier(SPAN, token, &self.ast).into());
+				elems.push(
+					Expression::new_numeric_literal(SPAN, 1.0, None, NumberBase::Decimal, &self.ast).into(),
+				);
+				let thrown = Statement::new_throw_statement(
+					SPAN,
+					Expression::new_array_expression(SPAN, elems, &self.ast),
+					&self.ast,
+				);
+				JsValue {
+					stmts: ArenaVec::from_value_in(thrown, &self.ast),
+					expr: Expression::new_identifier(SPAN, "undefined", &self.ast),
+				}
+				.into_expression(self.ast)
+			}
 			// Control-flow expressions in value position collapse to an expression
 			// (an IIFE when they carry leading statements). Mark that we're inside
 			// that IIFE's body while building it — a `return` reached anywhere
@@ -2072,13 +2128,6 @@ impl<'a> Emitter<'a> {
 				let value_expr = value.as_ref().map(|v| self.emit_expr(v));
 				Statement::new_return_statement(SPAN, value_expr, &self.ast)
 			}
-			HirStmt::Break => {
-				assert!(
-					!self.in_iife_subexpr.get(),
-					"`break` inside an expression-position block/if/match cannot target its enclosing loop"
-				);
-				Statement::new_break_statement(SPAN, None, &self.ast)
-			}
 		}
 	}
 
@@ -2094,9 +2143,12 @@ impl<'a> Emitter<'a> {
 				for stmt in stmts {
 					js_stmts.push(self.emit_stmt(stmt));
 				}
-				let tail_expr = match tail {
-					Some(tail) => self.emit_expr(tail),
-					None => Expression::new_identifier(SPAN, "undefined", &self.ast),
+				let tail_expr = if let Some(tail) = tail {
+					let tail = self.emit_value(tail);
+					js_stmts.extend(tail.stmts);
+					tail.expr
+				} else {
+					Expression::new_identifier(SPAN, "undefined", &self.ast)
 				};
 				JsValue {
 					stmts: js_stmts,
@@ -2124,16 +2176,188 @@ impl<'a> Emitter<'a> {
 					expr: Expression::new_identifier(SPAN, tmp, &self.ast),
 				}
 			}
-			HirExpr::While { cond, body } => {
-				// A `while` is a statement; its value is `undefined`.
+			HirExpr::While {
+				target,
+				cond,
+				body,
+				continue_epilogue,
+				option,
+			} => {
 				let cond_expr = self.emit_cond(cond);
-				let body_stmt = self.block_stmt(body);
+				let completion = self.ast.allocator.alloc_str(&self.gensym());
+				let token = self.ast.allocator.alloc_str(&self.gensym());
+				self
+					.loop_completion_tokens
+					.borrow_mut()
+					.push((*target, token));
+				let try_body = match self.block_stmt(body) {
+					Statement::BlockStatement(block) => block,
+					_ => unreachable!(),
+				};
+				self.loop_completion_tokens.borrow_mut().pop();
+				let completion_at = |index: f64| {
+					Expression::from(MemberExpression::ComputedMemberExpression(
+						ComputedMemberExpression::boxed(
+							SPAN,
+							Expression::new_identifier(SPAN, completion, &self.ast),
+							Expression::new_numeric_literal(SPAN, index, None, NumberBase::Decimal, &self.ast),
+							false,
+							&self.ast,
+						),
+					))
+				};
+				let null_test = Expression::new_binary_expression(
+					SPAN,
+					Expression::new_identifier(SPAN, completion, &self.ast),
+					BinaryOperator::Equality,
+					Expression::NullLiteral(NullLiteral::boxed(SPAN, &self.ast)),
+					&self.ast,
+				);
+				let wrong_token = Expression::new_binary_expression(
+					SPAN,
+					completion_at(0.0),
+					BinaryOperator::StrictInequality,
+					Expression::new_identifier(SPAN, token, &self.ast),
+					&self.ast,
+				);
+				let target_test = Expression::new_logical_expression(
+					SPAN,
+					null_test,
+					LogicalOperator::Or,
+					wrong_token,
+					&self.ast,
+				);
+				let mut catch_stmts = ArenaVec::new_in(&self.ast);
+				catch_stmts.push(Statement::new_if_statement(
+					SPAN,
+					target_test,
+					Statement::new_throw_statement(
+						SPAN,
+						Expression::new_identifier(SPAN, completion, &self.ast),
+						&self.ast,
+					),
+					None,
+					&self.ast,
+				));
+				let continue_test = Expression::new_binary_expression(
+					SPAN,
+					completion_at(1.0),
+					BinaryOperator::StrictEquality,
+					Expression::new_numeric_literal(SPAN, 1.0, None, NumberBase::Decimal, &self.ast),
+					&self.ast,
+				);
+				let continue_body = if let Some(epilogue) = continue_epilogue {
+					let mut statements = self.emit_value(epilogue).stmts;
+					statements.push(Statement::new_continue_statement(SPAN, None, &self.ast));
+					Statement::new_block_statement(SPAN, statements, &self.ast)
+				} else {
+					Statement::new_continue_statement(SPAN, None, &self.ast)
+				};
+				catch_stmts.push(Statement::new_if_statement(
+					SPAN,
+					continue_test,
+					continue_body,
+					None,
+					&self.ast,
+				));
+				let result = option
+					.as_ref()
+					.map(|_| self.ast.allocator.alloc_str(&self.gensym()));
+				if let (Some(result), Some(option)) = (result, option) {
+					let key = PropertyKey::new_static_identifier(
+						SPAN,
+						self.ast.allocator.alloc_str(&option.some_value),
+						&self.ast,
+					);
+					let property = ObjectProperty::boxed(
+						SPAN,
+						PropertyKind::Init,
+						key,
+						completion_at(2.0),
+						false,
+						false,
+						false,
+						&self.ast,
+					);
+					let object = Expression::new_object_expression(
+						SPAN,
+						ArenaVec::from_value_in(ObjectPropertyKind::ObjectProperty(property), &self.ast),
+						&self.ast,
+					);
+					let value = self.call1(self.variant_member(&option.enum_name, &option.some), object);
+					catch_stmts.push(Statement::new_expression_statement(
+						SPAN,
+						Expression::new_assignment_expression(
+							SPAN,
+							AssignmentOperator::Assign,
+							self.assign_target(result),
+							value,
+							&self.ast,
+						),
+						&self.ast,
+					));
+				}
+				catch_stmts.push(Statement::new_break_statement(SPAN, None, &self.ast));
+				let catch_pattern = BindingPattern::new_binding_identifier(SPAN, completion, &self.ast);
+				let handler = CatchClause::boxed(
+					SPAN,
+					Some(CatchParameter::new(
+						SPAN,
+						catch_pattern,
+						oxc::ast::NONE,
+						&self.ast,
+					)),
+					BlockStatement::new(SPAN, catch_stmts, &self.ast),
+					&self.ast,
+				);
+				let try_stmt = Statement::new_try_statement(
+					SPAN,
+					try_body,
+					Some(handler),
+					None::<ArenaBox<'a, BlockStatement<'a>>>,
+					&self.ast,
+				);
+				let body_stmt = Statement::new_block_statement(
+					SPAN,
+					ArenaVec::from_value_in(try_stmt, &self.ast),
+					&self.ast,
+				);
 				let while_stmt = Statement::new_while_statement(SPAN, cond_expr, body_stmt, &self.ast);
 				let mut stmts = ArenaVec::new_in(&self.ast);
+				stmts.push(self.let_uninit(token));
+				stmts.push(Statement::new_expression_statement(
+					SPAN,
+					Expression::new_assignment_expression(
+						SPAN,
+						AssignmentOperator::Assign,
+						self.assign_target(token),
+						Expression::new_object_expression(SPAN, ArenaVec::new_in(&self.ast), &self.ast),
+						&self.ast,
+					),
+					&self.ast,
+				));
+				if let (Some(result), Some(option)) = (result, option) {
+					stmts.push(self.let_uninit(result));
+					let none = self.emit_expr(&HirExpr::VariantRef {
+						enum_name: option.enum_name.clone(),
+						variant: option.none.clone(),
+					});
+					stmts.push(Statement::new_expression_statement(
+						SPAN,
+						Expression::new_assignment_expression(
+							SPAN,
+							AssignmentOperator::Assign,
+							self.assign_target(result),
+							none,
+							&self.ast,
+						),
+						&self.ast,
+					));
+				}
 				stmts.push(while_stmt);
 				JsValue {
 					stmts,
-					expr: Expression::new_identifier(SPAN, "undefined", &self.ast),
+					expr: Expression::new_identifier(SPAN, result.unwrap_or("undefined"), &self.ast),
 				}
 			}
 			HirExpr::Match { scrutinee, arms } => {

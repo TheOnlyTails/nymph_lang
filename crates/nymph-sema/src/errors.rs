@@ -349,6 +349,12 @@ pub enum TypeError {
 	ExternalValueTypeMismatch { marker: EcoString },
 	/// External host values are snapshots and cannot be mutable bindings.
 	ExternalValueMutable,
+	/// A loop-control expression has no lexically enclosing loop. Appended so
+	/// existing numeric diagnostic codes remain stable.
+	LoopControlOutsideLoop { keyword: &'static str },
+	/// One loop contains both `break` and `break value`. Appended so existing
+	/// numeric diagnostic codes remain stable.
+	MixedBreakForms,
 }
 
 impl IntoDiagnostic for TypeError {
@@ -370,6 +376,12 @@ impl IntoDiagnostic for TypeError {
 			E::Redefinition { name, .. } => format!("`{name}` is defined more than once").into(),
 			E::RecursiveTypeAlias => "type alias expands recursively without end".into(),
 			E::InfiniteType { ty } => format!("this expression has an infinite type `{ty}`").into(),
+			E::LoopControlOutsideLoop { keyword } => {
+				format!("`{keyword}` is only valid inside a loop").into()
+			}
+			E::MixedBreakForms => {
+				"a loop cannot mix bare `break` with `break value`".into()
+			}
 
 			E::ThisOutsideMethod => "`this` is only valid inside a method".into(),
 			E::StructTypeAsValue => "a struct type cannot be used as a value directly".into(),

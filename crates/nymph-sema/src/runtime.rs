@@ -388,6 +388,7 @@ pub enum RuntimePlacement {
 /// here rather than recovered later through names or spans.
 #[derive(Clone, Debug, PartialEq, Eq, salsa::SalsaValue)]
 pub struct RuntimeAnnotations {
+	pub option: Option<crate::OptionRuntimeRole>,
 	pub types: Arc<[(BodyNodeId, InterfaceType)]>,
 	pub definition_targets: Arc<[(BodyNodeId, DefinitionId)]>,
 	pub direct_namespace_members: Arc<[BodyNodeId]>,
@@ -1488,6 +1489,7 @@ fn runtime_annotations(
 		}
 	}
 	Ok(RuntimeAnnotations {
+		option: checked.runtime_roles.option.clone(),
 		types: types.into(),
 		definition_targets: definition_targets.into(),
 		direct_namespace_members: direct_namespace_members.into(),
@@ -1518,6 +1520,9 @@ fn required_type_nodes(
 	let mut required = std::collections::HashSet::new();
 	for expression in nodes {
 		match &expression.kind {
+			ExprKind::While { .. } => {
+				required.insert(expression.id);
+			}
 			// Persist only a contextual widening. A plain `int` literal already
 			// carries its runtime kind syntactically and some recovered declaration
 			// paths do not annotate that redundant fact.
@@ -1624,10 +1629,11 @@ fn required_type_nodes(
 				required.insert(expression.id);
 				required.insert(lhs.id);
 			}
-			ExprKind::For { iterable, .. }
-				if checked.annotations.iter_mode_of(iterable.id) == Some(crate::IterMode::ViaIter) =>
-			{
-				required.insert(iterable.id);
+			ExprKind::For { iterable, .. } => {
+				required.insert(expression.id);
+				if checked.annotations.iter_mode_of(iterable.id) == Some(crate::IterMode::ViaIter) {
+					required.insert(iterable.id);
+				}
 			}
 			_ => {}
 		}
