@@ -205,16 +205,63 @@ func origin(): Point = Point(x = 0, y = 0)
 
 ## Imports
 
+An import resolves and links another module. It binds a namespace named after the path's last
+segment; `as` changes that namespace name. It also brings non-private declarations into scope
+unqualified: without a `with` list, all are selected; a `with` list limits the selection, and each
+selected name can be aliased. The namespace remains available alongside selected declarations
+unless a selected declaration occupies the same name.
+
+Nymph's **ambient core** is different: APIs such as `Option`, `Result`, `Iterator`, `Iterable`,
+ranges, operators, and methods on built-in strings, lists, and maps are already in scope. Do not
+import them.
+
+Other standard-library modules are opt-in and use the `std/...` root. For example,
+`LinkedList` is not ambient:
+
 ```nymph
-import @/math               // project-rooted
-import ./sibling             // relative to the current file
-import ../parent             // relative to the parent directory
-import pkg/name as aliased   // future external-package syntax, aliased
-import @/math with (sin as sine, cos)
+import std/collections/linked_list with (LinkedList)
+
+func retain<T>(list: LinkedList<T>): LinkedList<T> = list
 ```
 
-> [!NOTE] Imports don't link yet
-> `import` parses and type-checks today, but nothing is actually resolved or linked in from another
-> module — every sample on this page (and everywhere else in this reference) relies only on the
-> stdlib's ambient **operator prelude** (see [Operators](./operators)), which is available without
-> any `import` at all. Treat the syntax above as forward-looking, not yet load-bearing.
+Project imports are rooted at the project's configured source directory or relative to the file
+containing the import. Given these files:
+
+```text
+src/
+├── math.nym
+├── shared.nym
+└── app/
+    ├── format.nym
+    └── main.nym
+```
+
+`src/app/main.nym` can use all three project forms:
+
+```nym [src/math.nym]
+public func double(x: int): int = x * 2
+```
+
+```nym [src/app/format.nym]
+public func increment(x: int): int = x + 1
+```
+
+```nym [src/shared.nym]
+public func seed(): int = 20
+```
+
+```nymph
+import @/math as root_math
+import ./format with (increment)
+import ../shared with (seed as seed_value)
+
+func answer(): int = increment(root_math.double(seed_value()))
+```
+
+- `@/...` starts at the source root, regardless of the importing file's directory.
+- `./...` starts in the importing file's directory; `../...` starts in its parent directory and
+  cannot escape the source root.
+- Paths omit `.nym`: a canonical path such as `app/format` resolves exactly to
+  `src/app/format.nym`. There is no extension probing or `index.nym` fallback.
+- `std/...` is the only supported package root. Imports beginning with another package name are
+  rejected; third-party dependency resolution is not implemented.

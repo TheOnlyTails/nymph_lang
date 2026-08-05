@@ -4,7 +4,7 @@ Nymph has **no exceptions** and **no `null`**. A value that might be absent, or 
 operation that might fail, says so *in its type* — with `Option<T>` or
 `Result<T, E>` — and the caller is made to deal with the empty/failing case before it
 can reach the value. Both types live in the always-available prelude
-([`core`](./operators)), so they need no `import`.
+([ambient core](./declarations#imports)), so they need no `import`.
 
 There is no `throw`, no `try`/`catch`, and no `?`-style early-return operator: a
 failure is an ordinary value that flows through the program like any other, handled
