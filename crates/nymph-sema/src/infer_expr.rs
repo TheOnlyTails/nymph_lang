@@ -136,6 +136,17 @@ fn dispatch_kind_for_method_call(res: &MethodResolution) -> DispatchKind {
 	}
 }
 
+fn method_resolution(method: EcoString, res: &MethodResolution) -> Resolution {
+	Resolution {
+		method,
+		dispatch: dispatch_kind_for_method_call(res),
+		target: res.target.clone(),
+		implementation: res.implementation.clone(),
+		resolved_target: res.resolved_target.clone(),
+		impl_span: res.impl_span,
+	}
+}
+
 /// Whether `expr` denotes a *place* (an lvalue with backing storage — a variable,
 /// field, or element) rather than a freshly-produced temporary (a call result,
 /// constructor, block, `if`/`match` value, …). A temporary receiver is exclusively
@@ -3458,6 +3469,24 @@ impl<'m> Checker<'m> {
 					return self.interner.error();
 				};
 				self.gate_mutating(iterator, &next_name, self_is_mut, iterable.span);
+				if let (Some(interface), Some(interface_member)) =
+					(self.defs.stable(iterator).cloned(), Some(next.clone()))
+				{
+					self.annotations.record_iteration_next_resolution(
+						iterable.id,
+						Resolution {
+							method: next_name,
+							dispatch: DispatchKind::UserImpl,
+							target: Some(interface_member.clone()),
+							implementation: None,
+							resolved_target: Some(crate::annotate::ResolvedMethodTarget::GenericBound {
+								interface,
+								interface_member,
+							}),
+							impl_span: Some(self.defs.data(iterator).span),
+						},
+					);
+				}
 				self
 					.annotations
 					.record_iter_mode(iterable.id, IterMode::Direct);
@@ -3504,7 +3533,7 @@ impl<'m> Checker<'m> {
 				.interfaces
 				.get(&iterator)
 				.and_then(|i| i.generics.first().cloned())
-			&& let Some((item, _)) =
+			&& let Some((item, implementation_index)) =
 				self.resolve_iface_arg_with_implementation(stripped, self_is_mut, iterator, &item_name, 0)
 		{
 			// The desugar (`lower_for_protocol`) invokes `next()` on this exact
@@ -3517,6 +3546,16 @@ impl<'m> Checker<'m> {
 				return self.interner.error();
 			};
 			self.gate_mutating(iterator, &next_name, self_is_mut, iterable.span);
+			let resolution = self.commit_method(
+				implementation_index,
+				stripped,
+				&next_name,
+				Some((&[], &[])),
+				iterable.span,
+			);
+			self
+				.annotations
+				.record_iteration_next_resolution(iterable.id, method_resolution(next_name, &resolution));
 			self
 				.annotations
 				.record_iter_mode(iterable.id, IterMode::Direct);
@@ -3539,46 +3578,38 @@ impl<'m> Checker<'m> {
 				return self.interner.error();
 			};
 			self.gate_mutating(iface, &iter_name, self_is_mut, iterable.span);
-			let implementation = self.impls.impls[implementation_index].clone();
-			let resolution = self
-				.defs
-				.stable(iface)
-				.cloned()
-				.zip(Some(iter.clone()))
-				.and_then(|(interface, interface_member)| {
-					let slot = implementation
-						.member_catalog
-						.target(&interface_member)?
-						.clone();
-					Some((interface, slot))
-				});
-			if let Some((interface, slot)) = resolution {
-				let dispatch = if matches!(
-					slot.implementation_id.module.origin,
-					crate::ModuleOrigin::Compiler | crate::ModuleOrigin::ImportableStd
-				) {
-					DispatchKind::UserImplDefaultMethod
-				} else {
-					DispatchKind::UserImpl
-				};
-				self.annotations.record_iter_resolution(
+			let iter_resolution = self.commit_method(
+				implementation_index,
+				stripped,
+				&iter_name,
+				Some((&[], &[])),
+				iterable.span,
+			);
+			let iterator_ty = self.strip_mut(iter_resolution.ty);
+			if let Some((iterator, next)) = self.runtime_roles.iterator.clone()
+				&& let Some(next_name) = self.runtime_role_member_name(iterator, &next)
+				&& let Some(item_name) = self
+					.interfaces
+					.get(&iterator)
+					.and_then(|interface| interface.generics.first().cloned())
+				&& let Some((_, next_implementation_index)) =
+					self.resolve_iface_arg_with_implementation(iterator_ty, true, iterator, &item_name, 0)
+			{
+				let next_resolution = self.commit_method(
+					next_implementation_index,
+					iterator_ty,
+					&next_name,
+					Some((&[], &[])),
+					iterable.span,
+				);
+				self.annotations.record_iteration_next_resolution(
 					iterable.id,
-					Resolution {
-						method: "iter".into(),
-						dispatch,
-						target: Some(slot.member_id.clone()),
-						implementation: Some(slot.implementation_id.clone()),
-						resolved_target: Some(
-							crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
-								interface,
-								slot,
-								implementation_arguments: Vec::new(),
-							},
-						),
-						impl_span: implementation.legacy_span,
-					},
+					method_resolution(next_name, &next_resolution),
 				);
 			}
+			self
+				.annotations
+				.record_iter_resolution(iterable.id, method_resolution(iter_name, &iter_resolution));
 			self
 				.annotations
 				.record_iter_mode(iterable.id, IterMode::ViaIter);

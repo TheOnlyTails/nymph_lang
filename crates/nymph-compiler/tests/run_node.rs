@@ -4880,6 +4880,54 @@ func answer(): int = 0.seed() + Box(value = 0).seed()
 }
 
 #[test]
+fn blanket_iterator_next_is_used_by_direct_via_iter_for_and_spread_drains() {
+	let prelude = r#"
+enum Option<T> { Some(value: T), None }
+interface Iterator<Item> { mut func next(): Option<Item> }
+interface Iterable<Item> { func iter(): Iterator<Item> }
+
+impl<T> Iterator<int> for T { mut func next(): Option<int> = Option.None }
+"#;
+	let source = r#"
+struct First
+struct Second
+struct Values
+impl Iterable<int> for Values { func iter(): Second = Second() }
+struct Concrete
+impl Iterator<int> for Concrete { mut func next(): Option<int> = Option.None }
+
+func answer(): #[int] = {
+  let mut direct = First()
+  for (value in direct) { value }
+  let mut via = Values()
+  for (value in via) { value }
+  let mut spread = Second()
+  let direct_values = #[...spread]
+  let mut via_spread = Values()
+  let via_values = #[...via_spread]
+  let mut concrete = Concrete()
+  for (value in concrete) { value }
+  via_values
+}
+"#;
+	let js = compile_with_prelude(source, prelude);
+	assert_eq!(
+		js.matches("function $std$Iterator$blanket").count(),
+		1,
+		"two iterator types must share one canonical blanket body: {js}"
+	);
+	assert!(
+		js.matches("$std$Iterator$blanket").count() >= 5,
+		"direct, via-iter, and spread drains must call the selected blanket body: {js}"
+	);
+	assert!(
+		js.contains("$it.next()"),
+		"an ordinary concrete Iterator.next must retain prototype dispatch: {js}"
+	);
+	assert_eq!(run_with_prelude(source, prelude, "answer()"), "[]");
+}
+
+#[test]
 fn blanket_body_forwards_implementation_arguments_before_nested_generic_arguments() {
 	let source = r#"
 interface Seed { func seed(): int }
@@ -4901,6 +4949,25 @@ func answer(): int = "".probe()
 		"nested call must carry its source arguments before implementation and nested generic runtime objects: {js}"
 	);
 	assert_eq!(run(source, "answer()"), "110");
+}
+
+#[test]
+fn blanket_membership_preserves_source_argument_and_hidden_slot_order() {
+	let source = r#"
+interface Seed { func seed(): int }
+impl Seed for int { func seed(): int = 7 }
+interface Contains<Item> { func contains(item: Item): boolean }
+impl<T: Seed> Contains<string> for T {
+  func contains(item: string): boolean = T.seed() == 7
+}
+func answer(): boolean = "" in 7
+"#;
+	let js = nymph_compiler::compile(source, "test").expect("blanket membership lowers");
+	assert!(
+		js.contains("$member, NInt.prototype)"),
+		"membership source argument must precede the preserved implementation hidden slot: {js}"
+	);
+	assert_eq!(run(source, "answer()"), "true");
 }
 
 #[test]

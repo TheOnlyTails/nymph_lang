@@ -309,6 +309,7 @@ pub enum StableDispatch {
 		implementation: DefinitionId,
 		materialization: DispatchMaterialization,
 		implementation_arguments: Arc<[RuntimeTypeArgument]>,
+		method_arguments: Arc<[RuntimeTypeArgument]>,
 	},
 	InterfaceDefault {
 		interface: DefinitionId,
@@ -316,6 +317,7 @@ pub enum StableDispatch {
 		implementation: DefinitionId,
 		materialization: DispatchMaterialization,
 		implementation_arguments: Arc<[RuntimeTypeArgument]>,
+		method_arguments: Arc<[RuntimeTypeArgument]>,
 	},
 	GenericBound {
 		interface: DefinitionId,
@@ -365,6 +367,7 @@ pub enum RuntimeIteration {
 	Direct {
 		iterator_interface: DefinitionId,
 		next: DefinitionId,
+		next_dispatch: Option<StableDispatch>,
 		option: crate::OptionRuntimeRole,
 	},
 	ViaIter {
@@ -373,6 +376,7 @@ pub enum RuntimeIteration {
 		iter: StableDispatch,
 		iterator_interface: DefinitionId,
 		next: DefinitionId,
+		next_dispatch: Option<StableDispatch>,
 		option: crate::OptionRuntimeRole,
 	},
 }
@@ -1509,6 +1513,7 @@ fn runtime_annotations(
 				crate::IterMode::Direct => RuntimeIteration::Direct {
 					iterator_interface: protocols.0.clone(),
 					next: protocols.1.clone(),
+					next_dispatch: stable_iteration_next_dispatch(checked, source, &context)?,
 					option: protocols.2.clone(),
 				},
 				crate::IterMode::ViaIter => {
@@ -1535,6 +1540,7 @@ fn runtime_annotations(
 						iter: stable_dispatch(checked, resolution, &context)?,
 						iterator_interface: protocols.0.clone(),
 						next: protocols.1.clone(),
+						next_dispatch: stable_iteration_next_dispatch(checked, source, &context)?,
 						option: protocols.2.clone(),
 					}
 				}
@@ -1875,6 +1881,19 @@ mod tests {
 	}
 }
 
+fn stable_iteration_next_dispatch(
+	checked: &crate::CheckedFacts,
+	source: nymph_ast::NodeId,
+	context: &CanonicalizationContext,
+) -> Result<Option<StableDispatch>, RuntimeExtractionError> {
+	let dispatch = checked
+		.annotations
+		.iteration_next_resolution_of(source)
+		.map(|resolution| stable_dispatch(checked, resolution, context))
+		.transpose()?;
+	Ok(dispatch.filter(|dispatch| !matches!(dispatch, StableDispatch::GenericBound { .. })))
+}
+
 fn stable_dispatch(
 	checked: &crate::CheckedFacts,
 	resolution: &crate::annotate::Resolution,
@@ -1943,21 +1962,26 @@ fn exact_method_dispatch(
 			interface,
 			slot,
 			implementation_arguments,
+			method_arguments,
 		} => {
-			let implementation_arguments = implementation_arguments
-				.iter()
-				.map(
-					|argument| match required_canonical_type(&checked.interner, *argument, context) {
-						Ok(type_) if runtime_type_object_supported(&type_) => {
-							Ok(RuntimeTypeArgument::Canonical(type_))
-						}
-						Ok(_) | Err(RuntimeExtractionError::IncompleteCanonicalType) => {
-							Ok(RuntimeTypeArgument::Erased)
-						}
-						Err(error) => Err(error),
-					},
-				)
-				.collect::<Result<Arc<[_]>, _>>()?;
+			let canonical_arguments = |arguments: &[crate::Ty]| {
+				arguments
+					.iter()
+					.map(
+						|argument| match required_canonical_type(&checked.interner, *argument, context) {
+							Ok(type_) if runtime_type_object_supported(&type_) => {
+								Ok(RuntimeTypeArgument::Canonical(type_))
+							}
+							Ok(_) | Err(RuntimeExtractionError::IncompleteCanonicalType) => {
+								Ok(RuntimeTypeArgument::Erased)
+							}
+							Err(error) => Err(error),
+						},
+					)
+					.collect::<Result<Arc<[_]>, _>>()
+			};
+			let implementation_arguments = canonical_arguments(implementation_arguments)?;
+			let method_arguments = canonical_arguments(method_arguments)?;
 			if slot.external {
 				return Ok(StableDispatch::External {
 					member: slot.member_id.clone(),
@@ -1984,6 +2008,7 @@ fn exact_method_dispatch(
 					implementation: slot.implementation_id.clone(),
 					materialization: DispatchMaterialization::Attached,
 					implementation_arguments,
+					method_arguments,
 				},
 				crate::ImplementationMemberSource::InheritedDefault => StableDispatch::InterfaceDefault {
 					interface: interface.clone(),
@@ -1991,6 +2016,7 @@ fn exact_method_dispatch(
 					implementation: slot.implementation_id.clone(),
 					materialization: DispatchMaterialization::CanonicalBody,
 					implementation_arguments,
+					method_arguments,
 				},
 			})
 		}

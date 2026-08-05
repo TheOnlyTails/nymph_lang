@@ -2874,6 +2874,75 @@ fn compatibility_blanket_method_value_adapts_the_canonical_function_abi() {
 }
 
 #[test]
+fn compatibility_blanket_operator_uses_the_canonical_selected_call_abi() {
+	let hir = lower(
+		"interface Plus<Other, Output> { func plus(other: Other): Output }
+		 impl<T> Plus<int, int> for T { func plus(other: int): int = other }
+		 struct Box
+		 func answer(): int = Box() + 7",
+	);
+	let answer = hir
+		.funcs
+		.iter()
+		.find(|function| function.name == "answer")
+		.unwrap();
+	assert!(matches!(
+		&answer.body,
+		HirExpr::Call { callee, args }
+			if matches!(callee.as_ref(), HirExpr::Local(name)
+				if name.starts_with("$std$Plus$blanket") && name.ends_with("$plus"))
+				&& matches!(args.as_slice(), [_, HirExpr::Num(7.0, NumKind::Int), HirExpr::RuntimeTypeObject { binding, .. }]
+					if binding == "Box")
+	));
+}
+
+#[test]
+fn compatibility_blanket_lookup_uses_the_selected_module_before_relative_span() {
+	fn selected_body(prelude_sources: [&str; 3]) -> HirExpr {
+		let preludes = prelude_sources
+			.into_iter()
+			.enumerate()
+			.map(|(index, source)| parse_module(source, format!("prelude-{index}")))
+			.collect::<Vec<_>>();
+		assert!(preludes.iter().all(|parsed| parsed.diagnostics.is_empty()));
+		let modules = preludes
+			.iter()
+			.map(|parsed| parsed.tree.clone())
+			.collect::<Vec<_>>();
+		let user = parse_module(
+			"struct Box\nimpl MarkerA for Box {}\nfunc answer(): int = Box().pick()",
+			"test",
+		);
+		let checked = check_module_with_prelude(&user.tree, &modules);
+		assert!(
+			checked.diags.is_empty(),
+			"check failed: {:?}",
+			checked.diags
+		);
+		let hir = lower_hir_with_prelude(&user.tree, &modules, &checked);
+		hir
+			.funcs
+			.into_iter()
+			.find(|function| function.name.ends_with("$pick"))
+			.expect("selected blanket body")
+			.body
+	}
+
+	let declarations =
+		"interface Shared { func pick(): int }\ninterface MarkerA {}\ninterface MarkerB {}";
+	let selected = "impl<T: MarkerA> Shared for T { func pick(): int = 1 }";
+	let colliding = "impl<T: MarkerB> Shared for T { func pick(): int = 2 }";
+	assert_eq!(
+		selected_body([declarations, selected, colliding]),
+		HirExpr::Num(1.0, NumKind::Int)
+	);
+	assert_eq!(
+		selected_body([declarations, colliding, selected]),
+		HirExpr::Num(1.0, NumKind::Int)
+	);
+}
+
+#[test]
 fn namespaced_call_through_a_struct_owned_generic_lowers_hidden_type_object() {
 	// Confirmed defect (code review, Slice 4J): `push_generics` used to track
 	// only the CURRENT func/method's OWN generics, never the OWNING struct/

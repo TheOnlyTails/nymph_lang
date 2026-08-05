@@ -107,6 +107,7 @@ pub enum ResolvedMethodTarget {
 		interface: DefinitionId,
 		slot: crate::ImplementationMemberSlot,
 		implementation_arguments: Vec<Ty>,
+		method_arguments: Vec<Ty>,
 	},
 	GenericBound {
 		interface: DefinitionId,
@@ -144,6 +145,22 @@ pub struct Resolution {
 	/// against `SPAN_BASE` to classify `dispatch` in the first place, just
 	/// carried forward instead of discarded.
 	pub impl_span: Option<Span>,
+}
+
+fn map_resolution_types(resolution: &mut Resolution, map: &mut impl FnMut(Ty) -> Ty) {
+	if let Some(ResolvedMethodTarget::InterfaceImplementation {
+		implementation_arguments,
+		method_arguments,
+		..
+	}) = &mut resolution.resolved_target
+	{
+		for argument in implementation_arguments
+			.iter_mut()
+			.chain(method_arguments.iter_mut())
+		{
+			*argument = map(*argument);
+		}
+	}
 }
 
 /// What the checker learned about one expression node.
@@ -216,6 +233,8 @@ pub struct Annotations {
 	iter_modes: FxHashMap<NodeId, IterMode>,
 	/// Resolution of the implicit `.iter()` call inserted for an iterable source.
 	iter_resolutions: FxHashMap<NodeId, Resolution>,
+	/// Resolution of the implicit `.next()` call used to drain the selected iterator.
+	iteration_next_resolutions: FxHashMap<NodeId, Resolution>,
 	/// NodeId of a committed anonymous-closure-parameter (`$N`) boundary → its
 	/// arity (Slice: `$N` anonymous closure params). Populated by the
 	/// checker's type-directed boundary search (`anon_closure.rs`) as each
@@ -374,6 +393,16 @@ impl Annotations {
 	pub(crate) fn map_types(&mut self, mut map: impl FnMut(Ty) -> Ty) {
 		for info in self.infos.values_mut() {
 			info.ty = map(info.ty);
+			if let Some(resolution) = &mut info.resolution {
+				map_resolution_types(resolution, &mut map);
+			}
+		}
+		for resolution in self
+			.iter_resolutions
+			.values_mut()
+			.chain(self.iteration_next_resolutions.values_mut())
+		{
+			map_resolution_types(resolution, &mut map);
 		}
 		for arguments in self.generic_call_arguments.values_mut() {
 			for argument in arguments {
@@ -449,6 +478,16 @@ impl Annotations {
 
 	pub fn iter_resolution_of(&self, id: NodeId) -> Option<&Resolution> {
 		self.iter_resolutions.get(&id)
+	}
+
+	pub(crate) fn record_iteration_next_resolution(&mut self, id: NodeId, resolution: Resolution) {
+		if id != NodeId::DUMMY {
+			self.iteration_next_resolutions.insert(id, resolution);
+		}
+	}
+
+	pub fn iteration_next_resolution_of(&self, id: NodeId) -> Option<&Resolution> {
+		self.iteration_next_resolutions.get(&id)
 	}
 
 	/// Record `id` as a committed anonymous-closure-parameter boundary with

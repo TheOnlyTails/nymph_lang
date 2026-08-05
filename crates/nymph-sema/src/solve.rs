@@ -1168,7 +1168,7 @@ impl Checker<'_> {
 	/// Commit a chosen impl for real: unify the receiver, then check each argument
 	/// against the method's parameter (emitting mismatches). Returns the method's
 	/// return type.
-	fn commit_method(
+	pub(crate) fn commit_method(
 		&mut self,
 		idx: usize,
 		recv: Ty,
@@ -1201,6 +1201,7 @@ impl Checker<'_> {
 				interface,
 				slot,
 				implementation_arguments: implementation_arguments.clone(),
+				method_arguments: Vec::new(),
 			}
 		});
 
@@ -1252,6 +1253,14 @@ impl Checker<'_> {
 					span,
 				);
 			}
+		}
+		let mut resolved_target = resolved_target;
+		if let Some(crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
+			method_arguments,
+			..
+		}) = &mut resolved_target
+		{
+			*method_arguments = type_arguments.clone();
 		}
 		MethodResolution {
 			ty: ret,
