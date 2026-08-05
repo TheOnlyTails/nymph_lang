@@ -2388,27 +2388,46 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						self.context.stable_shape(&request)?
 					{
 						self.demand_external(target)?;
-						let fields = args
+						self.scopes.borrow_mut().push(HashMap::new());
+						let mut stmts = Vec::with_capacity(args.len());
+						let mut values = HashMap::with_capacity(args.len());
+						for (index, argument) in args.iter().enumerate() {
+							let field = argument
+								.name
+								.as_ref()
+								.and_then(|name| shell.fields.iter().find(|field| field.name == *name))
+								.or_else(|| shell.fields.get(index))
+								.ok_or_else(|| {
+									invalid(
+										&self.artifact.definition,
+										"struct argument has no exact field",
+									)
+								})?;
+							let temporary = self.declare(&format!("$struct_arg_{index}").into());
+							stmts.push(HirStmt::Let {
+								name: temporary.clone(),
+								mutable: false,
+								value: self.lower(&argument.value)?,
+							});
+							values.insert(field.name.clone(), temporary);
+						}
+						let fields = shell
+							.fields
 							.iter()
-							.enumerate()
-							.map(|(index, argument)| {
-								let field = argument
-									.name
-									.as_ref()
-									.and_then(|name| shell.fields.iter().find(|field| field.name == *name))
-									.or_else(|| shell.fields.get(index))
-									.ok_or_else(|| {
-										invalid(
-											&self.artifact.definition,
-											"struct argument has no exact field",
-										)
-									})?;
-								Ok((field.name.clone(), self.lower(&argument.value)?))
+							.filter_map(|field| {
+								values
+									.get(&field.name)
+									.cloned()
+									.map(|value| (field.name.clone(), HirExpr::Local(value)))
 							})
-							.collect::<Result<Vec<_>, StableLoweringError>>()?;
-						return Ok(HirExpr::New {
-							class: self.context.binding_name(target)?.as_str().into(),
-							fields,
+							.collect();
+						self.scopes.borrow_mut().pop();
+						return Ok(HirExpr::Block {
+							stmts,
+							tail: Some(Box::new(HirExpr::New {
+								class: self.context.binding_name(target)?.as_str().into(),
+								fields,
+							})),
 						});
 					}
 				}

@@ -336,7 +336,18 @@ fn stable_lowering_preserves_labeled_constructor_argument_order() {
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
 		panic!("expected function fragment");
 	};
-	let nymph_hir::hir::HirExpr::New { fields, .. } = &function.body else {
+	let nymph_hir::hir::HirExpr::Block { stmts, tail } = &function.body else {
+		panic!("expected ordered struct construction block");
+	};
+	assert_eq!(
+		stmts.len(),
+		2,
+		"arguments must be evaluated in source order"
+	);
+	let Some(tail) = tail else {
+		panic!("expected struct construction tail");
+	};
+	let nymph_hir::hir::HirExpr::New { fields, .. } = tail.as_ref() else {
 		panic!("expected struct construction");
 	};
 	assert_eq!(
@@ -344,7 +355,8 @@ fn stable_lowering_preserves_labeled_constructor_argument_order() {
 			.iter()
 			.map(|(name, _)| name.as_str())
 			.collect::<Vec<_>>(),
-		["b", "a"]
+		["a", "b"],
+		"constructed object fields retain canonical declaration order"
 	);
 }
 
@@ -1980,8 +1992,9 @@ fn lowers_struct_and_enum_construction_and_variant_patterns_from_stable_facts() 
 	assert!(matches!(
 		point.fragment(),
 		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
-			if matches!(&function.body, nymph_hir::hir::HirExpr::New { class, fields }
-				if class == "Point" && fields.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>() == ["v", "value"])
+			if matches!(&function.body, nymph_hir::hir::HirExpr::Block { stmts, tail: Some(tail) }
+				if stmts.len() == 2 && matches!(tail.as_ref(), nymph_hir::hir::HirExpr::New { class, fields }
+					if class == "Point" && fields.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>() == ["value", "v"]))
 	));
 	let choice = lower_named(source, "choose");
 	assert!(matches!(
