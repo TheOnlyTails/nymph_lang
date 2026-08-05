@@ -31,16 +31,12 @@ impl NymphCommand for CheckCommand {
 		};
 		let load = fs_loader(target.src_root.clone());
 		let diagnostics = match target.intent {
-			TargetIntent::Entry => nymph_compiler::check_project_with_std(
-				&target.entry_key,
-				&load,
-				&nymph_compiler::embedded_std_provider,
-			),
-			TargetIntent::Library => nymph_compiler::check_project_library_with_std(
-				&target.entry_key,
-				&load,
-				&nymph_compiler::embedded_std_provider,
-			),
+			TargetIntent::Entry => {
+				nymph_compiler::check_project_with_embedded_std(&target.entry_key, &load)
+			}
+			TargetIntent::Library => {
+				nymph_compiler::check_project_library_with_embedded_std(&target.entry_key, &load)
+			}
 		};
 		if diagnostics.is_empty() {
 			println!("ok");

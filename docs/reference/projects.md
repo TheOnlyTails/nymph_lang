@@ -53,6 +53,11 @@ other explicit project files and loose files are libraries. `run` always
 requires the selected target to declare a valid `main`. Entry selection never
 depends on whether a file happens to be named `main.nym`.
 
+`check` resolves the same complete import graph and uses the same embedded
+ambient core and `std/…` sources as `build` and `run`. It stops after parsing,
+binding, and semantic checking: it emits no JavaScript, creates no `.mjs`
+artifact, and executes neither the selected module nor Node.
+
 From a project directory, all three commands select `build.entry`:
 
 ```sh

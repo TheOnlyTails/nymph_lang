@@ -43,7 +43,8 @@ pub use nymph_diagnostics::{Diagnostic, Severity};
 pub use project::{
 	AmbientCoreModuleKey, BuiltinRuntimeOwnerArtifact, BuiltinRuntimeOwnerShape, CompiledProject,
 	CompilerSession, ModuleAnalysis, ModulePath, ProjectDiagnostic, ProjectId, SourceVersion,
-	check_project, check_project_library, check_project_library_with_std, check_project_with_std,
+	check_project, check_project_library, check_project_library_with_embedded_std,
+	check_project_library_with_std, check_project_with_embedded_std, check_project_with_std,
 	compile_project, compile_project_library, compile_project_library_with_std,
 	compile_project_with_std,
 };

@@ -3,7 +3,8 @@
 //! visibility, cycles, and collisions — over a virtual, filesystem-free
 //! project (an `FxHashMap<String, String>` keyed by canonical module path).
 use nymph_compiler::{
-	check_project, compile_project, project::compile_project_module_sources_with_std,
+	check_project, check_project_with_embedded_std, compile_project,
+	project::compile_project_module_sources_with_std,
 };
 use rustc_hash::FxHashMap;
 /// Build a `load` closure over a virtual project map.
@@ -20,6 +21,23 @@ fn resolves_at_import_against_the_source_root() {
 		("math", "func sin(x: int): int = x"),
 	]);
 	let diags = check_project("main", &loader(files));
+	assert!(diags.is_empty(), "expected a clean project, got: {diags:?}");
+}
+
+#[test]
+fn embedded_std_project_check_resolves_project_and_std_graph() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/helper with (leaf)\nfunc main(): void = { let tree = leaf() }",
+		),
+		(
+			"helper",
+			"import std/collections/tree with (Tree)\npublic func leaf(): Tree<int> = Tree.Leaf(value = 1)",
+		),
+	]);
+	let diags = check_project_with_embedded_std("main", &loader(files));
+
 	assert!(diags.is_empty(), "expected a clean project, got: {diags:?}");
 }
 
