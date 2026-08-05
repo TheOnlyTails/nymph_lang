@@ -2853,7 +2853,12 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.collect::<Result<_, StableLoweringError>>()?,
 			},
 			StableExprKind::PatternOp { lhs, op, rhs } => {
-				let pat = self.lower_pattern(rhs)?;
+				// Pattern-operator bindings are scoped to the test and must not replace
+				// an outer source-name mapping used by following expressions.
+				self.scopes.borrow_mut().push(HashMap::new());
+				let pat = self.lower_pattern(rhs);
+				self.scopes.borrow_mut().pop();
+				let pat = pat?;
 				let (yes, no) = if *op == PatternOperator::Is {
 					(true, false)
 				} else {

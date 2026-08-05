@@ -736,6 +736,40 @@ fn lowers_consistently_bound_union_patterns() {
 }
 
 #[test]
+fn compatibility_lowering_reuses_bindings_through_nested_unions() {
+	let hir = lower(
+		"func f(value: #(int, int)): #(int, int) = match (value) {
+		   (#(x = 1, y) | #(y, x = 2)) | #(x, y = 3) -> #(x, y),
+		   _ -> #(0, 0),
+		 }",
+	);
+	let HirExpr::Match { arms, .. } = &hir.funcs[0].body else {
+		panic!("expected match");
+	};
+	let HirPat::Or(left, right) = &arms[0].pat else {
+		panic!("expected outer union pattern");
+	};
+	let HirPat::Or(first, second) = left.as_ref() else {
+		panic!("expected nested union pattern");
+	};
+	let names = |pattern: &HirPat| {
+		let HirPat::Tuple(items) = pattern else {
+			panic!("expected tuple alternative");
+		};
+		items
+			.iter()
+			.map(|item| match item {
+				HirPat::Binding { name, .. } => name.clone(),
+				_ => panic!("expected binding"),
+			})
+			.collect::<Vec<_>>()
+	};
+	assert_eq!(names(first), ["x", "y"]);
+	assert_eq!(names(second), ["y", "x"]);
+	assert_eq!(names(right), ["x", "y"]);
+}
+
+#[test]
 fn lowers_enum_inherent_methods() {
 	// `impl Color { func ... }` on an enum type-checks and, per Slice 4D, now
 	// lowers onto the enum's own `methods`, mirroring struct inherent methods.

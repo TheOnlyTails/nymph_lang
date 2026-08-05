@@ -624,6 +624,85 @@ fn bound_union_selects_each_binding_from_the_matching_alternative() {
 }
 
 #[test]
+fn bound_union_tests_once_and_uses_leftmost_matching_extraction() {
+	let src = r#"
+		func select(value: #(int, int)): #(int, int) = match (value) {
+			#(x = 1, y = 2) | #(y, x) -> #(x, y),
+		}
+	"#;
+	let call = r#"(() => {
+		let reads = 0;
+		const values = new Proxy([new NInt(1), new NInt(2)], {
+			get(target, key) {
+				if (key === "0" || key === "1") reads += 1;
+				return target[key];
+			}
+		});
+		const selected = select(new NTuple(values));
+		return new NTuple([selected, new NInt(reads)]);
+	})()"#;
+	assert_eq!(run(src, call), "[ [ 1, 2 ], 4 ]");
+}
+
+#[test]
+fn bound_union_source_names_cannot_collide_with_compiler_temporaries() {
+	let src = r#"
+		func select(value: #(int, int)): #(int, int) = match (value) {
+			#(_t0 = 1, _t3 = 2) | #(_t3 = 3, _t0 = 4) -> #(_t0, _t3),
+			_ -> #(0, 0),
+		}
+	"#;
+	assert_eq!(
+		run(src, "select(new NTuple([new NInt(1), new NInt(2)]))"),
+		"[ 1, 2 ]"
+	);
+	assert_eq!(
+		run(src, "select(new NTuple([new NInt(3), new NInt(4)]))"),
+		"[ 4, 3 ]"
+	);
+}
+
+#[test]
+fn nested_bound_unions_select_all_branches_in_source_order() {
+	let src = r#"
+		func left_nested(value: int): int = match (value) {
+			((x = 1 | x = 2) | x = 3) -> x,
+			_ -> 0,
+		}
+		func right_nested(value: int): int = match (value) {
+			(x = 1 | (x = 2 | x = 3)) -> x,
+			_ -> 0,
+		}
+	"#;
+	for name in ["left_nested", "right_nested"] {
+		for value in 1..=3 {
+			assert_eq!(
+				run(src, &format!("{name}(new NInt({value}))")),
+				value.to_string()
+			);
+		}
+	}
+}
+
+#[test]
+fn nested_destructuring_union_extracts_only_the_matching_plan() {
+	let src = r#"
+		func select(value: #(int, int)): #(int, int) = match (value) {
+			#((x = 1 | x = 2), y) | #(y = 3, x) -> #(x, y),
+			_ -> #(0, 0),
+		}
+	"#;
+	assert_eq!(
+		run(src, "select(new NTuple([new NInt(2), new NInt(8)]))"),
+		"[ 2, 8 ]"
+	);
+	assert_eq!(
+		run(src, "select(new NTuple([new NInt(3), new NInt(9)]))"),
+		"[ 9, 3 ]"
+	);
+}
+
+#[test]
 fn runs_struct_method_with_this() {
 	// An inherent method emits as a class method; `this` reads the instance's fields.
 	let src = r#"

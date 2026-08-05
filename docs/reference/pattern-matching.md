@@ -43,8 +43,10 @@ func endpoints(pair: #(int, int)): int = match (pair) {
 }
 ```
 
-Each name may be bound only once in a pattern. Both alternatives of a union must bind the same
-names; put a binding around a grouped union when both alternatives should capture the whole value:
+Each name may be bound only once in a pattern. Both alternatives of a union must bind exactly the
+same names with the same inferred types and mutability. Names are compared by identity, not by the
+order in which they appear; put a binding around a grouped union when both alternatives should
+capture the whole value:
 
 ```nym
 func one_or_two(n: int): int = match (n) {
@@ -79,6 +81,10 @@ func is_warm(c: Color): boolean = match (c) {
   Blue -> false,
 }
 ```
+
+Alternatives are tested from left to right and stop at the first match. Only that alternative's
+bindings are extracted. The value being matched is evaluated once, including when a union is nested
+inside another destructuring pattern. Unions whose alternatives bind no names remain valid.
 
 Wrap a union in parentheses when it needs to read as a single pattern in context:
 

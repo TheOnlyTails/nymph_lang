@@ -472,6 +472,18 @@ pub enum TypeError {
 		name: EcoString,
 		previous: Span,
 	},
+	/// The same local has incompatible inferred types in two union alternatives.
+	/// Appended so existing numeric diagnostic codes remain stable.
+	InconsistentUnionBindingType {
+		name: EcoString,
+		left: String,
+		right: String,
+	},
+	/// The same local has different binding mutability in two union alternatives.
+	/// Appended so existing numeric diagnostic codes remain stable.
+	InconsistentUnionBindingMutability {
+		name: EcoString,
+	},
 }
 
 impl IntoDiagnostic for TypeError {
@@ -619,6 +631,13 @@ impl IntoDiagnostic for TypeError {
 			}
 			E::InconsistentUnionBindings => {
 				"both sides of a union pattern must bind the same names".into()
+			}
+			E::InconsistentUnionBindingType { name, left, right } => format!(
+				"mismatched types for union pattern binding `{name}`: left alternative has `{left}`, right alternative has `{right}`"
+			)
+			.into(),
+			E::InconsistentUnionBindingMutability { name } => {
+				format!("`{name}` has different mutability across union pattern alternatives").into()
 			}
 			E::ExternalValueLinkageMissing { marker } => {
 				format!("external value marker `{marker}` is not registered").into()

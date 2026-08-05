@@ -454,6 +454,27 @@ fn stable_lowering_reuses_exact_bindings_across_union_alternatives() {
 }
 
 #[test]
+fn stable_pattern_operator_union_bindings_do_not_escape() {
+	let lowered = lower_named(
+		"func keep(x: int, value: int): int = {
+		   value is (x = 1 | x = 2)
+		   x
+		 }",
+		"keep",
+	);
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("expected function fragment")
+	};
+	let nymph_hir::hir::HirExpr::Block { tail, .. } = &function.body else {
+		panic!("expected block body")
+	};
+	assert!(matches!(
+		tail.as_deref(),
+		Some(nymph_hir::hir::HirExpr::Local(name)) if name == "x"
+	));
+}
+
+#[test]
 fn implementation_header_generic_body_receiver_has_canonical_type_annotation() {
 	let source = "impl<T> #[T] { func first(): T = { let result = this\nresult[0] } }";
 	let (artifacts, interface) = artifacts_and_interface(source);
