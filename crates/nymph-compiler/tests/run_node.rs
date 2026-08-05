@@ -4923,6 +4923,54 @@ func answer(): int = 0.probe()
 }
 
 #[test]
+fn first_class_blanket_method_preserves_source_before_hidden_abi() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl<T> Seed for T { func seed(value: int): int = value }
+
+func answer(): int = {
+  let seed = 0.seed
+  seed(7)
+}
+"#;
+	let js = nymph_compiler::compile(source, "test").expect("blanket method value lowers");
+	assert!(
+		js.contains("return $m0$impl$i0$seed($receiver, $arg0, NInt.prototype);"),
+		"method-value adapter must preserve receiver, source, hidden ABI order: {js}"
+	);
+	assert_eq!(run(source, "answer()"), "7");
+}
+
+#[test]
+fn first_class_generic_blanket_methods_capture_method_hidden_arguments() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl Seed for string { func seed(value: int): int = value + 40 }
+
+interface Apply {
+  func apply<T: Seed>(marker: T, value: int): int = T.seed(value)
+}
+impl<U> Apply for U {}
+
+func stored(): int = {
+  let apply = 0.apply
+  apply("", 1)
+}
+func grouped(): int = (0.apply)("", 2)
+func immediate(): int = 0.apply("", 3)
+"#;
+	let js = nymph_compiler::compile(source, "test").expect("generic blanket method values lower");
+	assert!(
+		js.contains("$m0$impl$i1$apply($receiver, $arg0, $arg1, NInt.prototype, NString.prototype)"),
+		"method hidden object must follow receiver, source, and implementation slots: {js}"
+	);
+	assert_eq!(
+		run(source, "stored().v + grouped().v + immediate().v"),
+		"126"
+	);
+}
+
+#[test]
 fn generic_bound_method_forwards_its_hidden_arguments() {
 	let source = r#"
 interface Seed { func seed(value: int): int }

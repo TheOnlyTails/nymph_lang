@@ -2832,7 +2832,7 @@ fn compatibility_blanket_method_is_one_canonical_function_with_explicit_hidden_a
 }
 
 #[test]
-fn compatibility_blanket_method_value_binds_the_canonical_function() {
+fn compatibility_blanket_method_value_adapts_the_canonical_function_abi() {
 	let hir = lower(
 		"interface Seed { func seed(value: int): int }
 		 impl<T> Seed for T { func seed(value: int): int = value }
@@ -2852,9 +2852,24 @@ fn compatibility_blanket_method_value_binds_the_canonical_function() {
 	assert!(matches!(
 		value,
 		HirExpr::Call { callee, args }
-			if args.len() == 3
-				&& matches!(&**callee, HirExpr::Field { recv, name }
-					if name == "bind" && matches!(&**recv, HirExpr::Local(function) if function.starts_with("$std$Seed$blanket")))
+			if args.len() == 1
+				&& matches!(&**callee, HirExpr::Closure { params, body }
+					if params == &["$receiver"]
+						&& matches!(&**body, HirExpr::Closure { params, body }
+							if params == &["$arg$0"]
+								&& matches!(&**body, HirExpr::Call { callee, args }
+									if args == &[
+										HirExpr::Local("$receiver".into()),
+										HirExpr::Local("$arg$0".into()),
+										HirExpr::RuntimeTypeObject {
+											binding: "NInt".into(),
+											box_runtime: true,
+											is_enum: false,
+											arguments: vec![],
+										},
+									]
+										&& matches!(&**callee, HirExpr::Local(function)
+											if function.starts_with("$std$Seed$blanket")))))
 	));
 }
 

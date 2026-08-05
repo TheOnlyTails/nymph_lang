@@ -1119,9 +1119,15 @@ impl<'m> Checker<'m> {
 			}
 			ExprKind::Grouped(inner) => {
 				let ty = self.infer(inner);
-				self
-					.annotations
-					.move_generic_call_arguments(inner.id, expr.id);
+				// A first-class method owns its hidden generic arguments: its
+				// receiver-capturing adapter must append them after future source
+				// arguments. Moving them to a grouped or outer call would pass them
+				// to the adapter itself, where JavaScript ignores the extra slots.
+				if self.annotations.resolution_of(inner.id).is_none() {
+					self
+						.annotations
+						.move_generic_call_arguments(inner.id, expr.id);
+				}
 				ty
 			}
 		}
@@ -1845,6 +1851,9 @@ impl<'m> Checker<'m> {
 			_ => false,
 		};
 		if !has_field && let Some(resolution) = self.resolve_method_value(parent_ty, member, span) {
+			self
+				.annotations
+				.record_generic_call_arguments(id, resolution.type_arguments.clone());
 			let ty = self
 				.interner
 				.mk_fn(resolution.params.clone(), resolution.ty);

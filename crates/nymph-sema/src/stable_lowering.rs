@@ -1816,20 +1816,15 @@ fn lower_body(
 			.filter(|parameter| !type_parameters.contains(parameter))
 			.collect::<Vec<_>>(),
 	);
-	let mut all_type_parameters = implementation_type_parameters;
-	let remaining_type_parameters = body
-		.type_parameters
-		.iter()
-		.filter(|parameter| !all_type_parameters.contains(parameter))
-		.cloned()
-		.collect::<Vec<_>>();
-	all_type_parameters.extend(remaining_type_parameters);
 	let lowerer = StableBodyLowerer {
 		context,
 		artifact,
 		annotations: &body.annotations,
 		type_parameters: &type_parameters,
-		all_type_parameters: &all_type_parameters,
+		// Annotation slot indexes are defined against the checked body's own
+		// binder order. Keep that identity map unchanged; `type_parameters`
+		// above separately defines the canonical runtime ABI order.
+		all_type_parameters: &body.type_parameters,
 		implementation_hidden,
 		instance_member,
 		type_substitutions,
@@ -3974,6 +3969,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				args: arguments,
 			}
 		};
+		let body = self.append_hidden_arguments(self.id(expr), body)?;
 		Ok(HirExpr::Call {
 			callee: Box::new(HirExpr::Closure {
 				params: vec![receiver_name],

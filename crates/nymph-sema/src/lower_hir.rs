@@ -3858,14 +3858,36 @@ impl<'a> Lowerer<'a> {
 							) && let Some(RuntimeDispatch::TopLevel(mangled)) =
 							self.try_lower_runtime_dispatch(res, Self::is_this_receiver(parent))
 						{
-							let mut bound = vec![HirExpr::Undefined, self.lower_expr(parent)];
-							self.append_implementation_arguments(res, &mut bound);
+							let params = match self
+								.annotations
+								.get(expr.id)
+								.map(|info| self.interner.kind(info.ty))
+							{
+								Some(TyKind::Fn { params, .. }) => (0..params.len())
+									.map(|index| EcoString::from(format!("$arg${index}")))
+									.collect::<Vec<_>>(),
+								_ => Vec::new(),
+							};
+							let receiver = EcoString::from("$receiver");
+							let mut args = vec![HirExpr::Local(receiver.clone())];
+							args.extend(params.iter().cloned().map(HirExpr::Local));
+							self.append_implementation_arguments(res, &mut args);
+							let body = self.append_hidden_call_arguments(
+								expr.id,
+								HirExpr::Call {
+									callee: Box::new(HirExpr::Local(mangled)),
+									args,
+								},
+							);
 							HirExpr::Call {
-								callee: Box::new(HirExpr::Field {
-									recv: Box::new(HirExpr::Local(mangled)),
-									name: "bind".into(),
+								callee: Box::new(HirExpr::Closure {
+									params: vec![receiver],
+									body: Box::new(HirExpr::Closure {
+										params,
+										body: Box::new(body),
+									}),
 								}),
-								args: bound,
+								args: vec![self.lower_expr(parent)],
 							}
 						} else {
 							HirExpr::Field {
