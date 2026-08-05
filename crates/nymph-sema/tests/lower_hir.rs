@@ -24,6 +24,30 @@ fn lower(src: &str) -> HirModule {
 }
 
 #[test]
+fn compatibility_lowering_preserves_loop_control_targets_and_option_results() {
+	let hir = lower(
+		"enum Option<T> { Some(value: T), None }\nfunc stop(): Option<int> = while (true) { break 1 }",
+	);
+	let HirExpr::While {
+		target,
+		body,
+		option: Some(option),
+		..
+	} = &hir.funcs[0].body
+	else {
+		panic!("expected Option-valued while")
+	};
+	assert_eq!(option.enum_name, "Option");
+	assert!(matches!(
+		body.as_ref(),
+		HirExpr::Block {
+			tail: Some(value),
+			..
+		} if matches!(value.as_ref(), HirExpr::Break { target: found, .. } if found == target)
+	));
+}
+
+#[test]
 fn separates_demanded_prelude_runtime_from_consumer_hir() {
 	let prelude = parse_module("enum Order { Less, Equal, Greater }", "prelude");
 	let user = parse_module("func equal(): Order = Order.Equal", "test");
@@ -2111,7 +2135,7 @@ fn assert_range_protocol(stmts: &[HirStmt], inclusive: bool) {
 	else {
 		panic!("expected mutable continuation binding, got {:?}", stmts[1]);
 	};
-	let HirStmt::Expr(HirExpr::While { cond, body }) = &stmts[2] else {
+	let HirStmt::Expr(HirExpr::While { cond, body, .. }) = &stmts[2] else {
 		panic!("expected protocol while loop, got {:?}", stmts[2]);
 	};
 	assert_eq!(cond.as_ref(), &HirExpr::Local(continuation.clone()));

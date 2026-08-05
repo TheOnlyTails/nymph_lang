@@ -51,7 +51,6 @@ fn hir_contains(
 			stmts.iter().any(|stmt| match stmt {
 				HirStmt::Let { value, .. } | HirStmt::Expr(value) => contains(value),
 				HirStmt::Return(value) => value.as_ref().is_some_and(contains),
-				HirStmt::Break => false,
 			}) || tail.as_ref().is_some_and(|tail| contains(tail))
 		}
 		HirExpr::If {
@@ -59,7 +58,9 @@ fn hir_contains(
 			then,
 			otherwise,
 		} => contains(cond) || contains(then) || otherwise.as_ref().is_some_and(|expr| contains(expr)),
-		HirExpr::While { cond, body } => contains(cond) || contains(body),
+		HirExpr::While { cond, body, .. } => contains(cond) || contains(body),
+		HirExpr::Break { value, .. } => contains(value),
+		HirExpr::Continue { .. } => false,
 		HirExpr::Match { scrutinee, arms } => {
 			contains(scrutinee)
 				|| arms

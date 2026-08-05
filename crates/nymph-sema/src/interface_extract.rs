@@ -1452,6 +1452,7 @@ fn checker_snapshot(checker: &crate::check::Checker<'_>) -> Checked {
 		diags: Vec::new(),
 		facts: crate::CheckedFacts {
 			annotations: crate::Annotations::default(),
+			runtime_roles: checker.stable_runtime_roles.clone(),
 			external_value_marshals: Default::default(),
 			interner: checker.interner.clone(),
 			semantic: crate::CheckedSemantic {

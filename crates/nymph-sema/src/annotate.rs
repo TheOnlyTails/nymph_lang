@@ -473,6 +473,7 @@ impl Annotations {
 #[derive(Clone, Debug)]
 pub struct CheckedFacts {
 	pub annotations: Annotations,
+	pub runtime_roles: crate::CompilerRuntimeRoles,
 	/// Resolved host marshalling ABI for each checked external-let declaration,
 	/// keyed by its binding span for consumption during HIR lowering.
 	pub external_value_marshals: FxHashMap<Span, MarshalKind>,

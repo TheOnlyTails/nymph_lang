@@ -12,14 +12,14 @@ use ecow::EcoString;
 use nymph_ast::{
 	NodeId, Span, Spanned,
 	decl::Declaration,
-	expr::{CallArg, Expr, ExprKind, ListItem, RangeKind, Statement, StringPart},
+	expr::{CallArg, Expr, ExprKind, ListItem, MapEntry, RangeKind, Statement, StringPart},
 	ops::{AssignOperator, BinaryOperator, PrefixOperator},
 	ty::Type,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::annotate::{DispatchKind, IterMode, Resolution};
-use crate::check::{Checker, InstantiatedObligation, PendingBound};
+use crate::check::{Checker, InstantiatedObligation, LoopBreakKind, PendingBound};
 use crate::def::{DefKind, FuncSig, NamespaceMemberSig};
 use crate::errors::TypeError;
 use crate::ids::{DefId, ParamIdx};
@@ -802,21 +802,59 @@ impl<'m> Checker<'m> {
 				self.interner.never()
 			}
 			ExprKind::Break { value, .. } => {
-				if let Some(v) = value {
-					self.infer(v);
+				let found = value.as_ref().map(|v| self.infer(v));
+				let Some(previous) = self.loop_controls.last().copied() else {
+					self.emit(
+						expr.span,
+						TypeError::LoopControlOutsideLoop { keyword: "break" },
+					);
+					return self.interner.never();
+				};
+				match (previous, found) {
+					(LoopBreakKind::None, _) => unreachable!("break scan omitted a targeting break"),
+					(LoopBreakKind::Bare, Some(_)) | (LoopBreakKind::Valued(_), None) => {
+						self.emit(expr.span, TypeError::MixedBreakForms);
+					}
+					(LoopBreakKind::Valued(expected), Some(found))
+						if !matches!(self.interner.kind(found), TyKind::Never) =>
+					{
+						self.unify(found, expected, expr.span)
+					}
+					(LoopBreakKind::Valued(_), Some(_)) => {}
+					(LoopBreakKind::Bare, None) => {}
 				}
 				self.interner.never()
 			}
-			ExprKind::Continue { .. } => self.interner.never(),
+			ExprKind::Continue { .. } => {
+				if self.loop_controls.is_empty() {
+					self.emit(
+						expr.span,
+						TypeError::LoopControlOutsideLoop {
+							keyword: "continue",
+						},
+					);
+				}
+				self.interner.never()
+			}
 			ExprKind::While {
 				condition, body, ..
 			} => {
 				let boolean = self.interner.boolean();
+				let outer_controls = std::mem::take(&mut self.loop_controls);
 				self.check(condition, boolean);
+				self.loop_controls = outer_controls;
+				let break_kind = self.targeting_break_kind(body);
+				let break_ty = match break_kind {
+					Some(false) => Some(LoopBreakKind::Bare),
+					Some(true) => Some(LoopBreakKind::Valued(self.fresh())),
+					None => Some(LoopBreakKind::None),
+				};
+				self.loop_controls.push(break_ty.unwrap());
 				self.push_scope();
 				self.infer(body);
 				self.pop_scope();
-				self.interner.void()
+				self.loop_controls.pop();
+				self.loop_result_type(break_ty)
 			}
 			ExprKind::For {
 				variable,
@@ -824,12 +862,22 @@ impl<'m> Checker<'m> {
 				body,
 				..
 			} => {
+				let outer_controls = std::mem::take(&mut self.loop_controls);
 				let elem = self.infer_iterable_element(iterable);
+				self.loop_controls = outer_controls;
+				let break_kind = self.targeting_break_kind(body);
+				let break_ty = match break_kind {
+					Some(false) => Some(LoopBreakKind::Bare),
+					Some(true) => Some(LoopBreakKind::Valued(self.fresh())),
+					None => Some(LoopBreakKind::None),
+				};
+				self.loop_controls.push(break_ty.unwrap());
 				self.push_scope();
 				self.check_pattern(variable, elem);
 				self.infer(body);
 				self.pop_scope();
-				self.interner.void()
+				self.loop_controls.pop();
+				self.loop_result_type(break_ty)
 			}
 			ExprKind::If {
 				condition,
@@ -841,6 +889,9 @@ impl<'m> Checker<'m> {
 				match otherwise {
 					Some(else_) => {
 						let then_ty = self.infer(then);
+						if matches!(self.interner.kind(then_ty), TyKind::Never) {
+							return self.infer(else_);
+						}
 						self.check(else_, then_ty);
 						then_ty
 					}
@@ -853,6 +904,7 @@ impl<'m> Checker<'m> {
 			ExprKind::Match { value, arms } => {
 				let scrutinee = self.infer(value);
 				let result = self.fresh();
+				let mut has_value_arm = false;
 				for arm in arms {
 					self.push_scope();
 					self.check_pattern(&arm.pattern, scrutinee);
@@ -860,11 +912,19 @@ impl<'m> Checker<'m> {
 						let boolean = self.interner.boolean();
 						self.check(guard, boolean);
 					}
-					self.check(&arm.body, result);
+					let arm_ty = self.infer(&arm.body);
+					if !matches!(self.interner.kind(arm_ty), TyKind::Never) {
+						has_value_arm = true;
+						self.unify(arm_ty, result, arm.body.span);
+					}
 					self.pop_scope();
 				}
 				self.check_exhaustive(scrutinee, arms, span);
-				result
+				if has_value_arm {
+					result
+				} else {
+					self.interner.never()
+				}
 			}
 			ExprKind::Block { body, .. } => self.infer_block(body, None),
 			ExprKind::Grouped(inner) => self.infer(inner),
@@ -896,6 +956,11 @@ impl<'m> Checker<'m> {
 	) -> (Ty, Option<Resolution>) {
 		let recv = self.infer(parent);
 		let key = self.infer(index);
+		if matches!(self.interner.kind(recv), TyKind::Never)
+			|| matches!(self.interner.kind(key), TyKind::Never)
+		{
+			return (self.interner.never(), None);
+		}
 		let key = self.strip_mut(key);
 		let recv_r = self.strip_mut(recv);
 		match self.interner.kind(recv_r).clone() {
@@ -1364,6 +1429,9 @@ impl<'m> Checker<'m> {
 		}
 
 		let callee = self.infer(func);
+		if matches!(self.interner.kind(callee), TyKind::Never) {
+			return (self.interner.never(), None);
+		}
 		let callee = self.strip_mut(callee);
 		let ty = match self.interner.kind(callee).clone() {
 			TyKind::Fn { params, ret } => {
@@ -1520,6 +1588,9 @@ impl<'m> Checker<'m> {
 			return (self.infer_member(parent, member, span, id), None);
 		}
 		let parent_ty = self.infer(parent);
+		if matches!(self.interner.kind(parent_ty), TyKind::Never) {
+			return (self.interner.never(), None);
+		}
 		let resolved_parent = self.shallow_resolve(parent_ty);
 		let nominal = self.strip_mut(resolved_parent);
 		let has_field = match self.interner.kind(nominal) {
@@ -1760,6 +1831,7 @@ impl<'m> Checker<'m> {
 		// `resolve_anon`'s doc comment on why every closure-slot call site,
 		// this one included, must scan its own slot before checking/inferring
 		// it).
+		let outer_loops = std::mem::take(&mut self.loop_controls);
 		let ret = match return_type {
 			Some(annot) => {
 				let rt = self.lower_type(annot);
@@ -1778,6 +1850,7 @@ impl<'m> Checker<'m> {
 				rt
 			}
 		};
+		self.loop_controls = outer_loops;
 		self.pop_scope();
 		self.pop_params();
 		self.interner.mk_fn(param_tys, ret)
@@ -1795,6 +1868,7 @@ impl<'m> Checker<'m> {
 			unreachable!("guarded by caller");
 		};
 
+		let outer_loops = std::mem::take(&mut self.loop_controls);
 		// Pull expected parameter/return types out of an expected function type.
 		let (exp_params, exp_ret) = match self.interner.kind(expected).clone() {
 			TyKind::Fn { params, ret } => (Some(params), Some(ret)),
@@ -1844,6 +1918,7 @@ impl<'m> Checker<'m> {
 		};
 		self.pop_scope();
 		self.pop_params();
+		self.loop_controls = outer_loops;
 		let got = self.interner.mk_fn(param_tys, ret);
 		self.subtype(got, expected, expr.span);
 	}
@@ -1868,6 +1943,9 @@ impl<'m> Checker<'m> {
 	) -> (Ty, Option<Resolution>, Option<Ty>) {
 		use nymph_ast::ops::PrefixOperator::*;
 		let operand = self.infer(value);
+		if matches!(self.interner.kind(operand), TyKind::Never) {
+			return (self.interner.never(), None, None);
+		}
 		// See the matching comment in `infer_binary`: an operator's operand type
 		// is used mut-transparently throughout this function.
 		let operand = self.strip_mut(operand);
@@ -2062,6 +2140,11 @@ impl<'m> Checker<'m> {
 
 		let l = self.infer(lhs);
 		let r = self.infer(rhs);
+		if matches!(self.interner.kind(l), TyKind::Never)
+			|| (!matches!(op, BoolAnd | BoolOr) && matches!(self.interner.kind(r), TyKind::Never))
+		{
+			return (self.interner.never(), None, None);
+		}
 		// Operators never produce (or require) a `mut` operand — arithmetic on a
 		// `mut int` local reads through exactly like on a plain `int` (peeling
 		// mirrors `prim_kind`/`is_adt` above; stripping it here too, once, keeps
@@ -2509,6 +2592,7 @@ impl<'m> Checker<'m> {
 		let boolean = self.interner.boolean();
 		let resolved = self.shallow_resolve(ty);
 		match self.interner.kind(resolved) {
+			TyKind::Never => {}
 			TyKind::Boolean | TyKind::Infer(_) | TyKind::Error => self.unify(ty, boolean, span),
 			_ => {
 				let found = self.display(ty);
@@ -2624,6 +2708,9 @@ impl<'m> Checker<'m> {
 	) -> (Ty, Option<Resolution>) {
 		let src = self.infer(lhs);
 		let target = self.lower_type(rhs);
+		if matches!(self.interner.kind(src), TyKind::Never) {
+			return (self.interner.never(), None);
+		}
 		let target_r = self.strip_mut(target);
 		if matches!(self.interner.kind(target_r), TyKind::Char)
 			&& self.numeric_literal_value(lhs).is_some_and(|value| {
@@ -3635,6 +3722,129 @@ fn prefix_method(op: PrefixOperator) -> &'static str {
 
 /// Build a `ParamIdx → arg` substitution from an ADT's positional generic
 /// arguments, for reading a field type in terms of the receiver's arguments.
+impl Checker<'_> {
+	fn loop_result_type(&mut self, kind: Option<LoopBreakKind>) -> Ty {
+		let Some(kind) = kind else {
+			return self.interner.void();
+		};
+		let element = match kind {
+			LoopBreakKind::None => return self.interner.void(),
+			LoopBreakKind::Bare => self.interner.mk_tuple(vec![]),
+			LoopBreakKind::Valued(ty) => ty,
+		};
+		let Some(option) = self.runtime_roles.option else {
+			return self.interner.error();
+		};
+		self
+			.interner
+			.mk_adt(option, GenericArgs::new(vec![element], vec![]))
+	}
+
+	/// Finds breaks targeting the immediately enclosing loop. `Some(true)` means
+	/// at least one valued break; nested loops and every callable body are boundaries.
+	fn targeting_break_kind(&self, expr: &Expr) -> Option<bool> {
+		fn merge(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+			match (a, b) {
+				(None, b) => b,
+				(a, None) => a,
+				(Some(a), Some(b)) => Some(a || b),
+			}
+		}
+		fn walk(checker: &Checker<'_>, expr: &Expr) -> Option<bool> {
+			if checker.annotations.anon_boundary_arity(expr.id).is_some() {
+				return None;
+			}
+			let many = |items: Vec<&Expr>| {
+				items
+					.into_iter()
+					.fold(None, |found, item| merge(found, walk(checker, item)))
+			};
+			match &expr.kind {
+				ExprKind::Break { value, label: None } => Some(value.is_some()),
+				ExprKind::While { .. } | ExprKind::For { .. } | ExprKind::Closure { .. } => None,
+				ExprKind::String(parts) => many(
+					parts
+						.iter()
+						.filter_map(|part| match &part.0 {
+							StringPart::InterpolatedExpr(expr) => Some(expr),
+							_ => None,
+						})
+						.collect(),
+				),
+				ExprKind::List(items) | ExprKind::Tuple(items) => many(
+					items
+						.iter()
+						.map(|item| match &item.0 {
+							ListItem::Expr(expr) | ListItem::Spread(expr) => expr,
+						})
+						.collect(),
+				),
+				ExprKind::Map(entries) => entries.iter().fold(None, |found, entry| {
+					let nested = match &entry.0 {
+						MapEntry::Entry(key, value) => merge(walk(checker, key), walk(checker, value)),
+						MapEntry::Spread(expr) => walk(checker, expr),
+					};
+					merge(found, nested)
+				}),
+				ExprKind::Range(range) => match range {
+					RangeKind::From(expr) | RangeKind::To(expr) | RangeKind::ToInclusive(expr) => {
+						walk(checker, expr)
+					}
+					RangeKind::Exclusive { min, max } | RangeKind::Inclusive { min, max } => {
+						merge(walk(checker, min), walk(checker, max))
+					}
+				},
+				ExprKind::Call { func, args, .. } => merge(
+					walk(checker, func),
+					many(args.iter().map(|arg| &arg.0.value).collect()),
+				),
+				ExprKind::MemberAccess { parent, .. } => walk(checker, parent),
+				ExprKind::IndexAccess { parent, index, .. } => {
+					merge(walk(checker, parent), walk(checker, index))
+				}
+				ExprKind::PrefixOp { value, .. }
+				| ExprKind::PostfixOp { value, .. }
+				| ExprKind::Grouped(value)
+				| ExprKind::TypeOp { lhs: value, .. }
+				| ExprKind::PatternOp { lhs: value, .. } => walk(checker, value),
+				ExprKind::BinaryOp { lhs, rhs, .. } | ExprKind::AssignOp { lhs, rhs, .. } => {
+					merge(walk(checker, lhs), walk(checker, rhs))
+				}
+				ExprKind::Return { value, .. } => value.as_deref().and_then(|value| walk(checker, value)),
+				ExprKind::If {
+					condition,
+					then,
+					otherwise,
+				} => merge(
+					walk(checker, condition),
+					merge(
+						walk(checker, then),
+						otherwise.as_deref().and_then(|value| walk(checker, value)),
+					),
+				),
+				ExprKind::Match { value, arms } => arms.iter().fold(walk(checker, value), |found, arm| {
+					merge(
+						found,
+						merge(
+							arm.guard.as_ref().and_then(|guard| walk(checker, guard)),
+							walk(checker, &arm.body),
+						),
+					)
+				}),
+				ExprKind::Block { body, .. } => body.iter().fold(None, |found, statement| {
+					let expr = match &statement.0 {
+						Statement::Expr(expr) => expr,
+						Statement::Let { value, .. } => value,
+					};
+					merge(found, walk(checker, expr))
+				}),
+				_ => None,
+			}
+		}
+		walk(self, expr)
+	}
+}
+
 fn adt_subst(args: &GenericArgs) -> FxHashMap<ParamIdx, Ty> {
 	args
 		.positional

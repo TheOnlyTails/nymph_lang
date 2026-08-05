@@ -195,6 +195,37 @@ fn stable_lowering_is_identical_across_body_formatting() {
 }
 
 #[test]
+fn stable_lowering_preserves_loop_targets_and_canonical_option_abi() {
+	let lowered = lower_named(
+		"enum Option<T> { Some(value: T), None }\nfunc choose(): Option<int> = while (true) { break 7 }",
+		"choose",
+	);
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("expected function fragment")
+	};
+	let nymph_hir::hir::HirExpr::While {
+		target,
+		body,
+		option: Some(option),
+		..
+	} = &function.body
+	else {
+		panic!("expected Option-valued while, got {:?}", function.body)
+	};
+	assert_eq!(option.enum_name, "Option");
+	assert_eq!(option.some, "Some");
+	assert_eq!(option.some_value, "value");
+	assert_eq!(option.none, "None");
+	assert!(matches!(
+		body.as_ref(),
+		nymph_hir::hir::HirExpr::Block {
+			tail: Some(tail),
+			..
+		} if matches!(tail.as_ref(), nymph_hir::hir::HirExpr::Break { target: break_target, .. } if break_target == target)
+	));
+}
+
+#[test]
 fn stable_lowering_preserves_contextual_integer_literal_kinds() {
 	for (source, expected) in [
 		("func value(): int = 5", None),

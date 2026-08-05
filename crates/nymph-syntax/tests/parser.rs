@@ -224,6 +224,17 @@ fn control_flow_expressions() {
 		expr("{ let x = 1 x + 1 }").kind,
 		ExprKind::Block { .. }
 	));
+	assert!(matches!(
+		expr("break 42").kind,
+		ExprKind::Break {
+			value: Some(_),
+			label: None,
+		}
+	));
+	assert!(matches!(
+		expr("continue").kind,
+		ExprKind::Continue { label: None }
+	));
 }
 
 #[test]

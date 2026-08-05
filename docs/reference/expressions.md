@@ -337,3 +337,14 @@ func first_positive(xs: #[int]): int = {
   i
 }
 ```
+
+`break` and `continue` target the innermost lexically enclosing `while` or `for` loop. A callable
+body is a boundary: a closure or nested function cannot jump to a loop outside that callable.
+Labels are not currently supported.
+
+A loop with no targeting `break` has type `void`. If it contains bare `break`, its result is
+`Option<#()>` (`Some(#())` on the early exit and `None` on natural exhaustion). If every targeting
+break supplies a value of type `T`, the result is `Option<T>` instead. Bare and valued breaks may
+not be mixed in one loop, and all valued breaks must agree on `T`. This is determined by a lexical
+scan of the whole loop body, including unreachable branches; breaks in nested loops or callable
+bodies are deliberately excluded.

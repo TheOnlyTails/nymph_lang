@@ -26,6 +26,13 @@ pub(crate) struct Binding {
 	pub mutable: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum LoopBreakKind {
+	None,
+	Bare,
+	Valued(Ty),
+}
+
 /// Which AST node shape a deferred `pending_operators` entry was recorded from,
 /// carrying the specific operator itself (Slice 4C-a: a prefix op has no separate
 /// `BinaryOperator` to hang off a shared tuple slot, so the operator moved into the
@@ -78,6 +85,9 @@ pub struct Checker<'m> {
 	pub(crate) self_ty: Option<Ty>,
 	/// The declared/expected return type of the function currently being checked.
 	pub(crate) ret_ty: Option<Ty>,
+	/// Lexical loop-control contracts, innermost last. Callable inference replaces
+	/// this stack so jumps cannot escape a callable body.
+	pub(crate) loop_controls: Vec<LoopBreakKind>,
 	/// Explicit DFS state used only while local aliases are collected.
 	pub(crate) alias_states: FxHashMap<DefId, AliasLowerState>,
 	pub(crate) collecting_signatures: bool,
@@ -499,6 +509,7 @@ fn check_module_from_parts(
 		diags: checker.diags,
 		facts: CheckedFacts {
 			annotations,
+			runtime_roles: checker.stable_runtime_roles.clone(),
 			external_value_marshals: checker.external_value_marshals,
 			interner: checker.interner,
 			semantic: CheckedSemantic {
@@ -881,6 +892,7 @@ impl<'m> Checker<'m> {
 			pending_bound_arg_mut: FxHashMap::default(),
 			anon_ctx: Vec::new(),
 			anon_consumed: FxHashSet::default(),
+			loop_controls: Vec::new(),
 		}
 	}
 

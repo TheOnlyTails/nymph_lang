@@ -1296,13 +1296,10 @@ fn runs_return_inside_a_statement_position_match() {
 }
 
 #[test]
-#[should_panic(expected = "would return from the emitted IIFE")]
-fn return_inside_a_subexpression_position_match_arm_panics_in_emit() {
+fn return_inside_a_subexpression_position_match_arm_targets_the_function() {
 	// A braced match-arm body used as a SUBEXPRESSION (here, a `let` initializer)
-	// IS wrapped in an IIFE by emit — a `return` there would return from that
-	// IIFE, not the enclosing function. Lowering accepts it (the arm body is a
-	// block whose last statement is `return`), so this panics later, in emit,
-	// via the scope guard (Slice 4E, Y1).
+	// is wrapped in an IIFE by emit. The private callable completion carries its
+	// return across that generated boundary to the enclosing function.
 	let src = r#"
 		func f(n: int): int = {
 			let x = match (n) {
@@ -1312,7 +1309,8 @@ fn return_inside_a_subexpression_position_match_arm_panics_in_emit() {
 			x
 		}
 	"#;
-	run(src, "f(0)");
+	assert_eq!(run(src, "f(new NInt(0))"), "7");
+	assert_eq!(run(src, "f(new NInt(3))"), "3");
 }
 
 #[test]
@@ -1969,9 +1967,9 @@ func bounded_stored(): int = {
 		.unwrap_err(),
 	] {
 		assert!(
-			diagnostics
-				.iter()
-				.any(|diagnostic| diagnostic.message.contains("break outside a loop")),
+			diagnostics.iter().any(
+				|diagnostic| diagnostic.message.contains("break") && diagnostic.message.contains("loop")
+			),
 			"{diagnostics:?}"
 		);
 	}
@@ -4181,4 +4179,151 @@ fn pattern_binding_exposes_whole_value_and_nested_captures() {
 fn pattern_binding_evaluates_the_scrutinee_once() {
 	let src = "struct Counter(n: int) {}\nimpl Counter {\n\tmut func next(): #(int, int) = {\n\t\tthis.n = this.n + 1\n\t\t#(1, 7)\n\t}\n}\nfunc capture(): #(int, int, int) = {\n\tlet mut counter = Counter(n = 0)\n\tmatch (counter.next()) {\n\t\twhole = #(left, _) -> #(counter.n as int, whole[0], left),\n\t}\n}";
 	assert_eq!(run(src, "capture()"), "[ 1, 1, 1 ]");
+}
+
+#[test]
+fn break_value_and_continue_cross_expression_iifes() {
+	let src = r#"func branch(): int = match (while (true) { if (true) { break 7 } else { continue } }) {
+		Some(value) -> value,
+		None -> 0,
+	}"#;
+	assert_eq!(run(src, "branch()"), "7");
+}
+
+#[test]
+fn loop_natural_exhaustion_and_bare_break_use_option_abi() {
+	let src = r#"func exhausted(): int = match (while (false) { break 1 }) {
+		Some(value) -> value,
+		None -> 4,
+	}
+func bare(): int = match (while (true) { break }) {
+		Some(#()) -> 5,
+		None -> 0,
+	}"#;
+	assert_eq!(run(src, "exhausted()"), "4");
+	assert_eq!(run(src, "bare()"), "5");
+}
+
+#[test]
+fn loop_control_targets_for_and_nested_loops_and_evaluates_positions_once() {
+	let src = r#"
+func keep(value: int): int = value
+
+func positioned(): int = {
+  let mut hits = 0
+  let result = while (true) {
+    hits = hits + 1
+    keep(10 + if (hits == 1) { continue } else { break hits })
+  }
+  match (result) { Some(value) -> hits * 10 + value, None -> 0 }
+}
+
+func for_results(): int = {
+  let early = for (value in 1..4) { if (value == 2) { break value } }
+  let natural = for (value in 1..3) { if (value == 9) { break value } }
+  match (early) {
+    Some(value) -> value * 10 + match (natural) { Some(_) -> 1, None -> 0 },
+    None -> 0,
+  }
+}
+
+func range_continue(): int = {
+  let mut total = 0
+  for (value in 1..=5) {
+    if (value == 3) { continue }
+    total = total + value
+  }
+  total
+}
+
+func nested(): int = match (while (true) {
+  let inner = while (true) { break 4 }
+  break match (inner) { Some(value) -> value + 1, None -> 0 }
+}) { Some(value) -> value, None -> 0 }
+
+func match_arm(): int = match (while (true) {
+  match (1) { 1 -> break 8, _ -> continue }
+}) { Some(value) -> value, None -> 0 }
+
+func short_circuit(): int = {
+  let mut hits = 0
+  let result = while (true) {
+    hits = hits + 1
+    false && continue
+    true || continue
+    if (hits == 1) { true && continue }
+    false || break hits
+  }
+  match (result) { Some(value) -> hits * 10 + value, None -> 0 }
+}
+
+func eager_positions(): int = {
+  let prefix = while (true) { -(break 1) }
+  let callee = while (true) { (break 2)() }
+  let member = while (true) { (break 3).field }
+  let index = while (true) { #[0][break 4] }
+  let cast = while (true) { (break 5) as int }
+  match (prefix) { Some(a) -> match (callee) { Some(b) -> match (member) {
+    Some(c) -> match (index) { Some(d) -> match (cast) { Some(e) -> a + b + c + d + e, None -> 0 }, None -> 0 },
+    None -> 0,
+  }, None -> 0 }, None -> 0 }
+}
+"#;
+	assert_eq!(run(src, "positioned()"), "22");
+	assert_eq!(run(src, "for_results()"), "20");
+	assert_eq!(run(src, "range_continue()"), "12");
+	assert_eq!(run(src, "nested()"), "5");
+	assert_eq!(run(src, "match_arm()"), "8");
+	assert_eq!(run(src, "short_circuit()"), "22");
+	assert_eq!(run(src, "eager_positions()"), "15");
+}
+
+#[test]
+fn return_crosses_option_loop_expression_iife_in_both_lowering_paths() {
+	let src = r#"
+func choose(flag: boolean): int = {
+	let result = while (true) {
+		if (flag) { return 9 }
+		break 4
+	}
+	match (result) { Some(value) -> value, None -> 0 }
+}
+
+func nested(): int = {
+	let choose = (flag: boolean) -> {
+		let result = while (true) {
+			if (flag) { return 8 }
+			break 3
+		}
+		match (result) { Some(value) -> value, None -> 0 }
+	}
+	choose(true) * 10 + choose(false)
+}
+"#;
+	assert_eq!(run(src, "choose(new NBool(true))"), "9");
+	assert_eq!(run(src, "choose(new NBool(false))"), "4");
+	assert_eq!(run(src, "nested()"), "83");
+
+	let prelude = "enum Option<T> { Some(value: T), None }";
+	assert_eq!(
+		run_with_prelude(src, prelude, "choose(new NBool(true))"),
+		"9"
+	);
+	assert_eq!(
+		run_with_prelude(src, prelude, "choose(new NBool(false))"),
+		"4"
+	);
+	assert_eq!(run_with_prelude(src, prelude, "nested()"), "83");
+}
+
+#[test]
+fn loop_completion_does_not_swallow_user_exceptions() {
+	let src = r#"
+func invoke(callback: () -> int): Option<int> = while (true) {
+	callback()
+	break 1
+}
+"#;
+	let stderr = run_failure(src, "invoke(() => { throw new Error('user boom') })");
+	assert!(stderr.contains("user boom"), "{stderr}");
 }

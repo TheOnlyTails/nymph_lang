@@ -148,8 +148,16 @@ pub enum HirStmt {
 	/// block/if/match, where a JS `return` would target the IIFE rather than the
 	/// enclosing function (Slice 4E, Y1).
 	Return(Option<HirExpr>),
-	/// An unlabeled, valueless `break`; valid only in loop statement position.
-	Break,
+}
+
+pub type LoopTarget = u32;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HirOptionAbi {
+	pub enum_name: EcoString,
+	pub some: EcoString,
+	pub some_value: EcoString,
+	pub none: EcoString,
 }
 
 /// The runtime numeric type a boxed numeric value carries — the one piece of
@@ -359,8 +367,20 @@ pub enum HirExpr {
 		otherwise: Option<Box<HirExpr>>,
 	},
 	While {
+		target: LoopTarget,
 		cond: Box<HirExpr>,
 		body: Box<HirExpr>,
+		/// Compiler-generated work that must run before a `continue` resumes this
+		/// loop (for example advancing a lowered bounded-range counter).
+		continue_epilogue: Option<Box<HirExpr>>,
+		option: Option<HirOptionAbi>,
+	},
+	Break {
+		target: LoopTarget,
+		value: Box<HirExpr>,
+	},
+	Continue {
+		target: LoopTarget,
 	},
 	/// `match <scrutinee> { <arms> }` — compiled to an if/else-if chain.
 	Match {
@@ -481,7 +501,6 @@ impl HirExpr {
 								value.collect_runtime_type_references(references);
 							}
 						}
-						HirStmt::Break => {}
 					}
 				}
 				if let Some(tail) = tail {
@@ -499,10 +518,24 @@ impl HirExpr {
 					otherwise.collect_runtime_type_references(references);
 				}
 			}
-			Self::While { cond, body } => {
+			Self::While {
+				cond,
+				body,
+				continue_epilogue,
+				option,
+				..
+			} => {
 				cond.collect_runtime_type_references(references);
 				body.collect_runtime_type_references(references);
+				if let Some(epilogue) = continue_epilogue {
+					epilogue.collect_runtime_type_references(references);
+				}
+				if let Some(option) = option {
+					references.insert(option.enum_name.clone());
+				}
 			}
+			Self::Break { value, .. } => value.collect_runtime_type_references(references),
+			Self::Continue { .. } => {}
 			Self::Match { scrutinee, arms } => {
 				scrutinee.collect_runtime_type_references(references);
 				for arm in arms {

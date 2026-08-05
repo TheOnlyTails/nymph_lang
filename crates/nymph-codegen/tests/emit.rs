@@ -492,14 +492,10 @@ fn closure_return_emits_fine_inside_a_subexpression_position_match_arm() {
 }
 
 #[test]
-#[should_panic(expected = "would return from the emitted IIFE")]
-fn return_inside_a_nested_subexpression_match_within_a_closure_body_still_panics() {
-	// The closure boundary's reset only covers the closure's OWN top-level
-	// body emission — a construct NESTED inside that body which is itself in
-	// subexpression position (here, a `let`'s match initializer) still sets
-	// its own `in_iife_subexpr` guard and must still panic on a `return`
-	// inside one of ITS arms. Proves the reset is scoped, not a blanket
-	// "never panic again" pass triggered by merely being inside a closure.
+fn return_inside_a_nested_subexpression_uses_the_closure_completion_target() {
+	// A construct nested in a closure body and used in subexpression position
+	// needs an IIFE. Its return must cross that synthetic boundary while still
+	// targeting the closure, not the function that created the closure.
 	let module = HirModule {
 		lets: vec![],
 		funcs: vec![HirFunc {
@@ -537,5 +533,10 @@ fn return_inside_a_nested_subexpression_match_within_a_closure_body_still_panics
 		classes: vec![],
 		enums: vec![],
 	};
-	emit(&module);
+	let js = emit(&module);
+	assert!(js.contains("throw ["), "return completion is thrown: {js}");
+	assert!(
+		js.contains("catch ("),
+		"closure catches its completion: {js}"
+	);
 }
