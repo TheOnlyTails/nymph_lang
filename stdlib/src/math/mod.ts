@@ -1,4 +1,4 @@
-import { NFloat, NInt } from "std/box";
+import { NBool, NFloat, NInt } from "std/box";
 
 export const sin = (x: NFloat) => new NFloat(Math.sin(x.v));
 export const cos = (x: NFloat) => new NFloat(Math.cos(x.v));
@@ -20,6 +20,11 @@ export const exp = (x: NFloat) => new NFloat(Math.exp(x.v));
 export const ln = (x: NFloat) => new NFloat(Math.log(x.v));
 
 export const atan2 = (y: NFloat, x: NFloat) => new NFloat(Math.atan2(y.v, x.v));
+export const is_integral_float = (x: NFloat) =>
+  new NBool(Number.isFinite(x.v) && Number.isInteger(x.v));
+export const power_domain_error = (): never => {
+  throw new RangeError("zero cannot be raised to a negative power");
+};
 
 export const floor = (x: NFloat) => new NInt(Math.floor(x.v));
 export const ceil = (x: NFloat) => new NInt(Math.ceil(x.v));

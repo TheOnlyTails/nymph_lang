@@ -136,10 +136,17 @@ pub(crate) fn emitted_interface_module<'db>(
 		}
 	};
 	public.extend(stable.fragments.iter().filter_map(|fragment| {
-		matches!(
+		(matches!(
 			fragment.fragment(),
 			nymph_sema::LoweredHirFragment::RuntimeTypeAttachment { .. }
-		)
+		) || matches!(
+			(&fragment.definition().key, fragment.fragment()),
+			(
+				nymph_sema::DeclarationKey::MethodBody { name, .. }
+					| nymph_sema::DeclarationKey::Member { name, .. },
+				nymph_sema::LoweredHirFragment::TopLevelFunction(_)
+			) if name == "power"
+		))
 		.then(|| fragment.definition().clone())
 	}));
 	let preserve = key.preserve_names(db) && stable.module.path == key.entry(db).as_str();

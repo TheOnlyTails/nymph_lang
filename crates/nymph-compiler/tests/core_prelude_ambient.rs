@@ -169,9 +169,8 @@ fn ambient_core_option_result_convert_and_for_over_list_run_with_no_import() {
 }
 
 /// `std/math` (added to `CORE_SOURCES` alongside the other core modules) is
-/// ambient too: `int`/`float`'s `abs`/`sqrt` methods, and the `Power<Other =
-/// float, Output = float> for int` impl that makes `this ** 0.5` type-check
-/// for an `int` receiver, all resolve and run with **no `import` anywhere** —
+/// ambient too: `int`/`float`'s `abs`/`sqrt` methods and integer-exponent
+/// `Power` implementations all resolve and run with **no `import` anywhere** —
 /// the headline payoff of making `math` a 9th core module. Locks in the
 /// runtime behavior so a regression (e.g. dropping `("std/math", ..)` from
 /// `CORE_SOURCES`, or reintroducing the `Power<Other = float, Output =
@@ -185,7 +184,7 @@ fn ambient_math_abs_sqrt_and_power_run_with_no_import() {
 		func pos_abs(): int = (5).abs()
 		func float_abs(): float = (0.0 - 2.5).abs()
 		func int_sqrt(): float = (16).sqrt()
-		func int_pow_frac(): float = 16 ** 0.5
+		func int_pow(): int = 2 ** 10u
 		"#;
 
 	let diags = check(src, "test");
@@ -198,7 +197,7 @@ fn ambient_math_abs_sqrt_and_power_run_with_no_import() {
 	assert_eq!(run(src, "pos_abs()"), "5");
 	assert_eq!(run(src, "float_abs()"), "2.5");
 	assert_eq!(run(src, "int_sqrt()"), "4");
-	assert_eq!(run(src, "int_pow_frac()"), "4");
+	assert_eq!(run(src, "int_pow()"), "1024");
 }
 
 #[test]

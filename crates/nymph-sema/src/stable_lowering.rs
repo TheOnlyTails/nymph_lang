@@ -1871,6 +1871,15 @@ fn lower_body(
 			body: lowered_body.clone(),
 		};
 		if shellless_implementation {
+			// Primitive `Power` has an intentionally overloaded scalar matrix. A
+			// canonical primitive prototype can only own one property named `power`,
+			// while every checked call already carries its exact implementation slot
+			// and lowers directly to this top-level function. Do not manufacture an
+			// ambiguous prototype facade (or collide during runtime assembly); generic
+			// bound dispatch likewise routes to exact top-level cases.
+			if context.member_name(&artifact.definition)?.as_str() == "power" {
+				return Ok(LoweredHirFragment::TopLevelFunction(function));
+			}
 			if self_type
 				.filter(|ty| is_concrete_runtime_type(ty))
 				.and_then(stable_runtime_tag)
@@ -4112,6 +4121,13 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				interface: interface.clone(),
 				member: member.clone(),
 			})?;
+		let receiver_type = (!arguments.is_empty())
+			.then(|| self.ty(receiver))
+			.transpose()?;
+		let argument_type = arguments
+			.first()
+			.map(|argument| self.ty(argument))
+			.transpose()?;
 		let mut cases = Vec::new();
 		let mut has_nominal_fallback = false;
 		for implementation in implementations {
@@ -4183,7 +4199,19 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				};
 				argument_tag
 			};
-			if receiver_tag != argument_tag {
+			if receiver_type
+				.as_ref()
+				.and_then(stable_runtime_tag)
+				.is_some_and(|tag| tag != receiver_tag)
+				|| argument_type
+					.as_ref()
+					.and_then(stable_runtime_tag)
+					.is_some_and(|tag| tag != argument_tag)
+				|| matches!(
+					(&receiver_type, &argument_type),
+					(Some(InterfaceType::Generic(receiver)), Some(InterfaceType::Generic(argument)))
+						if receiver == argument && receiver_tag != argument_tag
+				) {
 				continue;
 			}
 			let _ = self.record_call(&slot.member_id)?;

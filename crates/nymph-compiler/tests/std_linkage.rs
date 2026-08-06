@@ -1299,3 +1299,236 @@ fn import_std_io_resolves_via_embedded_provider_and_runs() {
 	let js = format!("{}\n{}();\n", compiled.js, compiled.entry_main);
 	assert_eq!(run_node(&js, "std_io"), "hi from std/io");
 }
+
+#[test]
+fn exact_power_matrix_compiles_without_native_exponentiation_and_runs() {
+	let entry = r#"
+		import std/math/complex with (Complex)
+		func int_uint(): int = 2 ** 10u
+		func uint_uint(): uint = 3u ** 4u
+		func float_uint(): float = 1.5 ** 3u
+		func int_int(): float = 2 ** -3
+		func uint_int(): float = 4u ** -2
+		func float_int(): float = (0.0 - 2.0) ** 3
+		func int_float(): Complex = (0 - 4) ** 0.5
+		func uint_float(): Complex = 9u ** 0.5
+		func float_float(): Complex = (0.0 - 8.0) ** 0.3333333333333333
+		func complex_uint(): Complex = Complex(real = 1.0, imaginary = 1.0) ** 8u
+		func complex_int(): Complex = Complex(real = 0.0, imaginary = 2.0) ** -2
+		func complex_float(): Complex = Complex(real = 3.0, imaginary = 4.0) ** 2.0
+		func generic_uint_power<T: Power<Other = uint, Output = T>>(base: T, exponent: uint): T =
+		  base ** exponent
+		func generic_int_uint(): int = generic_uint_power(5, 3u)
+		func generic_float_uint(): float = generic_uint_power(2.5, 2u)
+		func large(): int = 2 ** 40u
+		func order(): int = {
+		  let mut observed = 0
+		  let value = ({ observed = observed * 10 + 1 2 }) ** ({ observed = observed * 10 + 2 3u })
+		  observed
+		}
+		struct Base(value: int)
+		struct Exponent(value: int)
+		impl Power<Other = Exponent, Output = int> for Base {
+		  func power(other: Exponent): int = this.value + other.value
+		}
+		func overridden(): int = Base(value = 20) ** Exponent(value = 22)
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &nymph_compiler::embedded_std_provider)
+		.expect("every accepted power-matrix cell should compile");
+	assert!(
+		!compiled.js.contains(" ** "),
+		"power must dispatch to the selected Nymph implementation, never raw JavaScript `**`:\n{}",
+		compiled.js
+	);
+
+	let symbols: Vec<_> = [
+		"int_uint",
+		"uint_uint",
+		"float_uint",
+		"int_int",
+		"uint_int",
+		"float_int",
+		"int_float",
+		"uint_float",
+		"float_float",
+		"complex_uint",
+		"complex_int",
+		"complex_float",
+		"generic_int_uint",
+		"generic_float_uint",
+		"large",
+		"order",
+		"overridden",
+	]
+	.into_iter()
+	.map(|name| compiled.entry_symbol(name))
+	.collect();
+	let mut js = compiled.js;
+	js.push_str(&format!(
+		"\nconsole.log({}().v, {}().v, {}().v, {}().v, {}().v, {}().v);\n\
+		 const a = {}(); const b = {}(); const c = {}();\n\
+		 const d = {}(); const e = {}(); const f = {}();\n\
+		 console.log(a.real.v, a.imaginary.v, b.real.v, b.imaginary.v);\n\
+		 console.log(c.real.v, c.imaginary.v, d.real.v, d.imaginary.v);\n\
+		 console.log(e.real.v, e.imaginary.v, f.real.v, f.imaginary.v);\n\
+		 console.log({}().v, {}().v);\n\
+		 console.log({}().v, {}().v, {}().v, a.constructor === b.constructor);\n",
+		symbols[0],
+		symbols[1],
+		symbols[2],
+		symbols[3],
+		symbols[4],
+		symbols[5],
+		symbols[6],
+		symbols[7],
+		symbols[8],
+		symbols[9],
+		symbols[10],
+		symbols[11],
+		symbols[12],
+		symbols[13],
+		symbols[14],
+		symbols[15],
+		symbols[16],
+	));
+	let output = run_node(&js, "power_matrix");
+	let lines: Vec<_> = output.lines().collect();
+	assert_eq!(lines[0], "1024 81 3.375 0.125 0.0625 -8");
+	let values: Vec<f64> = lines[1..=3]
+		.iter()
+		.flat_map(|line| line.split_whitespace())
+		.map(|value| value.parse().unwrap())
+		.collect();
+	assert!(values[0].abs() < 1e-12 && (values[1] - 2.0).abs() < 1e-12);
+	assert!((values[2] - 3.0).abs() < 1e-12 && values[3].abs() < 1e-12);
+	assert!((values[4] - 1.0).abs() < 1e-9 && (values[5] - 3.0_f64.sqrt()).abs() < 1e-9);
+	assert!((values[6] - 16.0).abs() < 1e-12 && values[7].abs() < 1e-12);
+	assert!((values[8] + 0.25).abs() < 1e-12 && values[9].abs() < 1e-12);
+	assert!((values[10] + 7.0).abs() < 1e-12 && (values[11] - 24.0).abs() < 1e-12);
+	assert_eq!(lines[4], "125 6.25");
+	assert_eq!(lines[5], "1099511627776 12 42 true");
+}
+
+#[test]
+fn power_zero_signed_zero_and_ieee_edges_follow_the_contract() {
+	let entry = r#"
+		import std/math/complex with (Complex)
+		func zeros(): #(int, uint, float, Complex, Complex) = #(
+		  0 ** 0u,
+		  0u ** 7u,
+		  0.0 ** 5,
+		  0 ** 0.0,
+		  Complex(real = 0.0, imaginary = 0.0) ** 2.5,
+		)
+		func negative_zero_odd(base: float): Complex = base ** 3.0
+		func negative_zero_even(base: float): Complex = base ** 2.0
+		func complex_negative_zero_odd(base: float): Complex =
+		  Complex(real = base, imaginary = 0.0) ** 1.0
+		func complex_negative_zero_even(base: float): Complex =
+		  Complex(real = base, imaginary = 0.0) ** 2.0
+		func huge_sqrt(): Complex = Complex(real = 10.0 ** 200u, imaginary = 0.0) ** 0.5
+		func tiny_sqrt(): Complex = Complex(real = 1.0 / (10.0 ** 200u), imaginary = 0.0) ** 0.5
+		func huge_reciprocal(): Complex = Complex(real = 10.0 ** 200u, imaginary = 0.0) ** -1
+		func infinite_reciprocal(): Complex = Complex(real = 1.0 / 0.0, imaginary = 0.0) ** -1
+		func nan_power(): Complex = 2.0 ** ((-1.0).ln())
+		func infinity_power(): Complex = 2.0 ** (1.0 / 0.0)
+		func main(): void = {}
+	"#;
+	let load = only_entry("main", entry);
+	let compiled = compile_project_with_std("main", &load, &nymph_compiler::embedded_std_provider)
+		.expect("power zero and IEEE edge fixture should compile");
+	let symbols: Vec<_> = [
+		"zeros",
+		"negative_zero_odd",
+		"negative_zero_even",
+		"complex_negative_zero_odd",
+		"complex_negative_zero_even",
+		"huge_sqrt",
+		"tiny_sqrt",
+		"huge_reciprocal",
+		"infinite_reciprocal",
+		"nan_power",
+		"infinity_power",
+	]
+	.into_iter()
+	.map(|name| compiled.entry_symbol(name))
+	.collect();
+	let mut js = compiled.js;
+	js.push_str(&format!(
+		"\nconst z = {}(); const odd = {}(new NFloat(-0)); const even = {}(new NFloat(-0));\n\
+		 const complexOdd = {}(new NFloat(-0)); const complexEven = {}(new NFloat(-0));\n\
+		 const huge = {}(); const tiny = {}(); const reciprocal = {}(); const infiniteReciprocal = {}();\n\
+		 const nan = {}(); const inf = {}();\n\
+		 console.log(z.v[0].v, z.v[1].v, z.v[2].v, z.v[3].real.v, z.v[3].imaginary.v, z.v[4].real.v, z.v[4].imaginary.v);\n\
+		 console.log(Object.is(odd.real.v, -0), Object.is(even.real.v, 0), Object.is(complexOdd.real.v, -0), Object.is(complexEven.real.v, 0));\n\
+		 console.log(huge.real.v, tiny.real.v, reciprocal.real.v, Object.is(infiniteReciprocal.real.v, 0), Number.isNaN(infiniteReciprocal.real.v));\n\
+		 console.log(Number.isNaN(nan.real.v), inf.real.v, inf.imaginary.v);\n",
+		symbols[0],
+		symbols[1],
+		symbols[2],
+		symbols[3],
+		symbols[4],
+		symbols[5],
+		symbols[6],
+		symbols[7],
+		symbols[8],
+		symbols[9],
+		symbols[10],
+	));
+	let output = run_node(&js, "power_edges");
+	let lines: Vec<_> = output.lines().collect();
+	assert_eq!(lines[0], "1 0 0 1 0 0 0");
+	assert_eq!(lines[1], "true true true true");
+	let finite: Vec<f64> = lines[2]
+		.split_whitespace()
+		.take(3)
+		.map(|value| value.parse().unwrap())
+		.collect();
+	assert!((finite[0] / 1e100 - 1.0).abs() < 1e-12);
+	assert!((finite[1] / 1e-100 - 1.0).abs() < 1e-12);
+	assert!((finite[2] / 1e-200 - 1.0).abs() < 1e-12);
+	assert!(lines[2].ends_with("true false"));
+	assert_eq!(lines[3], "true Infinity 0");
+}
+
+#[test]
+fn zero_to_negative_power_raises_the_runtime_domain_error() {
+	for (name, expression) in [
+		("real_int", "0 ** -1"),
+		("real_float", "0.0 ** -1.0"),
+		("complex_int", "Complex(real = 0.0, imaginary = 0.0) ** -1"),
+		(
+			"complex_float",
+			"Complex(real = 0.0, imaginary = 0.0) ** -1.0",
+		),
+	] {
+		let entry = format!(
+			"import std/math/complex with (Complex)\nfunc fail() = {expression}\nfunc main(): void = {{}}"
+		);
+		let load = |key: &str| (key == "main").then(|| entry.clone());
+		let compiled = compile_project_with_std("main", &load, &nymph_compiler::embedded_std_provider)
+			.expect("zero-negative fixture should compile and fail only at runtime");
+		let path = std::env::temp_dir().join(format!(
+			"nymph_power_domain_{name}_{}.mjs",
+			std::process::id()
+		));
+		std::fs::write(
+			&path,
+			format!("{}\n{}();\n", compiled.js, compiled.entry_symbol("fail")),
+		)
+		.unwrap();
+		let output = std::process::Command::new("node")
+			.arg(&path)
+			.output()
+			.unwrap();
+		let _ = std::fs::remove_file(path);
+		assert!(!output.status.success(), "{name} unexpectedly succeeded");
+		let stderr = String::from_utf8_lossy(&output.stderr);
+		assert!(
+			stderr.contains("RangeError: zero cannot be raised to a negative power"),
+			"{name}: {stderr}"
+		);
+	}
+}

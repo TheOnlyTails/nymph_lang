@@ -22,6 +22,8 @@ interface Power<Other, Output> {
   func power(other: Other): Output
 }
 
+external(power_domain_error) func scalar_power_domain_error(): never
+
 interface Negate<Output> {
   func negate(): Output
 }
@@ -281,22 +283,82 @@ impl Equals<Other = int> for uint {
   external(primitive_equals) func equals(other: int): boolean
 }
 
-// Power for uint -> float (no negative bases, but fractional results possible)
-impl Power<Other = uint, Output = float> for uint {
-  external func power(other: uint): float
+// Integer-exponent powers are ordinary Nymph so every call observes the
+// language's zero-domain rules instead of falling through to JavaScript `**`.
+// The three helpers intentionally use exponentiation by squaring.
+func int_power_uint(base: int, exponent: uint): int = {
+  let mut result = 1
+  let mut factor = base
+  let mut remaining = exponent
+  while (remaining > 0u) {
+    if (remaining % 2u == 1u) { result = result * factor }
+    remaining = (remaining / 2u) as uint
+    if (remaining > 0u) { factor = factor * factor }
+  }
+  result
+}
+
+func uint_power_uint(base: uint, exponent: uint): uint = {
+  let mut result = 1u
+  let mut factor = base
+  let mut remaining = exponent
+  while (remaining > 0u) {
+    if (remaining % 2u == 1u) { result = result * factor }
+    remaining = (remaining / 2u) as uint
+    if (remaining > 0u) { factor = factor * factor }
+  }
+  result
+}
+
+func float_power_uint(base: float, exponent: uint): float = {
+  let mut result = 1.0
+  let mut factor = base
+  let mut remaining = exponent
+  while (remaining > 0u) {
+    if (remaining % 2u == 1u) { result = result * factor }
+    remaining = (remaining / 2u) as uint
+    if (remaining > 0u) { factor = factor * factor }
+  }
+  result
+}
+
+impl Power<Other = uint, Output = int> for int {
+  func power(other: uint): int = int_power_uint(this, other)
+}
+
+impl Power<Other = uint, Output = uint> for uint {
+  func power(other: uint): uint = uint_power_uint(this, other)
+}
+
+impl Power<Other = uint, Output = float> for float {
+  func power(other: uint): float = float_power_uint(this, other)
+}
+
+impl Power<Other = int, Output = float> for int {
+  func power(other: int): float = if (other < 0) {
+    if (this == 0) { scalar_power_domain_error() }
+    1.0 / float_power_uint(this as float, other as uint)
+  } else {
+    float_power_uint(this as float, other as uint)
+  }
 }
 
 impl Power<Other = int, Output = float> for uint {
-  external func power(other: int): float
+  func power(other: int): float = if (other < 0) {
+    if (this == 0u) { scalar_power_domain_error() }
+    1.0 / float_power_uint(this as float, other as uint)
+  } else {
+    float_power_uint(this as float, other as uint)
+  }
 }
 
-impl Power<Other = float, Output = float> for uint {
-  external func power(other: float): float
-}
-
-// Power for int (fractional exponent -> float; integral `**` stays native int)
-impl Power<Other = float, Output = float> for int {
-  external func power(other: float): float
+impl Power<Other = int, Output = float> for float {
+  func power(other: int): float = if (other < 0) {
+    if (this == 0.0) { scalar_power_domain_error() }
+    1.0 / float_power_uint(this, other as uint)
+  } else {
+    float_power_uint(this, other as uint)
+  }
 }
 
 // Negate for int/float

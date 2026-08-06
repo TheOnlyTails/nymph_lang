@@ -2459,7 +2459,23 @@ impl<'m> Checker<'m> {
 		};
 
 		match op {
-			Plus | Minus | Times | Divide | Remainder | Power | BitAnd | BitOr | BitXor | LeftShift
+			Power => {
+				let (ty, dispatch, target, implementation, resolved_target, impl_span) =
+					self.dispatch_operator(l, binary_method(op), &[r], span);
+				(
+					ty,
+					Some(Resolution {
+						method: binary_method(op).into(),
+						dispatch,
+						target,
+						implementation,
+						resolved_target,
+						impl_span,
+					}),
+					None,
+				)
+			}
+			Plus | Minus | Times | Divide | Remainder | BitAnd | BitOr | BitXor | LeftShift
 			| RightShift => match (self.prim_kind(l), self.prim_kind(r)) {
 				// Same primitive → built-in. Division of integral operands produces a
 				// float; every other result keeps the operand type. Boolean is the other

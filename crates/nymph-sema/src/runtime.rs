@@ -1730,6 +1730,30 @@ fn required_type_nodes(
 		{
 			required.insert(expression.id);
 		}
+		if checked
+			.annotations
+			.get(expression.id)
+			.and_then(|info| info.resolution)
+			.is_some_and(|resolution| {
+				matches!(
+					resolution.resolved_target,
+					Some(crate::annotate::ResolvedMethodTarget::GenericBound { .. })
+				)
+			}) {
+			match &expression.kind {
+				ExprKind::BinaryOp { lhs, rhs, .. } => {
+					required.insert(lhs.id);
+					required.insert(rhs.id);
+				}
+				ExprKind::Call { func, args, .. } if !args.is_empty() => {
+					if let ExprKind::MemberAccess { parent, .. } = &func.kind {
+						required.insert(parent.id);
+					}
+					required.extend(args.iter().map(|argument| argument.value().value.id));
+				}
+				_ => {}
+			}
+		}
 		match &expression.kind {
 			ExprKind::While { .. } => {
 				required.insert(expression.id);
