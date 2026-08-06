@@ -1320,6 +1320,11 @@ fn exact_power_matrix_compiles_without_native_exponentiation_and_runs() {
 		  base ** exponent
 		func generic_int_uint(): int = generic_uint_power(5, 3u)
 		func generic_float_uint(): float = generic_uint_power(2.5, 2u)
+		func generic_assign<T: Power<Other = uint, Output = T>>(mut base: T, exponent: uint): T = {
+		  base **= exponent
+		  base
+		}
+		func generic_assign_int(): int = generic_assign(3, 4u)
 		func large(): int = 2 ** 40u
 		func order(): int = {
 		  let mut observed = 0
@@ -1358,6 +1363,7 @@ fn exact_power_matrix_compiles_without_native_exponentiation_and_runs() {
 		"complex_float",
 		"generic_int_uint",
 		"generic_float_uint",
+		"generic_assign_int",
 		"large",
 		"order",
 		"overridden",
@@ -1373,7 +1379,7 @@ fn exact_power_matrix_compiles_without_native_exponentiation_and_runs() {
 		 console.log(a.real.v, a.imaginary.v, b.real.v, b.imaginary.v);\n\
 		 console.log(c.real.v, c.imaginary.v, d.real.v, d.imaginary.v);\n\
 		 console.log(e.real.v, e.imaginary.v, f.real.v, f.imaginary.v);\n\
-		 console.log({}().v, {}().v);\n\
+		 console.log({}().v, {}().v, {}().v);\n\
 		 console.log({}().v, {}().v, {}().v, a.constructor === b.constructor);\n",
 		symbols[0],
 		symbols[1],
@@ -1392,6 +1398,7 @@ fn exact_power_matrix_compiles_without_native_exponentiation_and_runs() {
 		symbols[14],
 		symbols[15],
 		symbols[16],
+		symbols[17],
 	));
 	let output = run_node(&js, "power_matrix");
 	let lines: Vec<_> = output.lines().collect();
@@ -1407,7 +1414,7 @@ fn exact_power_matrix_compiles_without_native_exponentiation_and_runs() {
 	assert!((values[6] - 16.0).abs() < 1e-12 && values[7].abs() < 1e-12);
 	assert!((values[8] + 0.25).abs() < 1e-12 && values[9].abs() < 1e-12);
 	assert!((values[10] + 7.0).abs() < 1e-12 && (values[11] - 24.0).abs() < 1e-12);
-	assert_eq!(lines[4], "125 6.25");
+	assert_eq!(lines[4], "125 6.25 81");
 	assert_eq!(lines[5], "1099511627776 12 42 true");
 }
 
@@ -1432,6 +1439,16 @@ fn power_zero_signed_zero_and_ieee_edges_follow_the_contract() {
 		func tiny_sqrt(): Complex = Complex(real = 1.0 / (10.0 ** 200u), imaginary = 0.0) ** 0.5
 		func huge_reciprocal(): Complex = Complex(real = 10.0 ** 200u, imaginary = 0.0) ** -1
 		func infinite_reciprocal(): Complex = Complex(real = 1.0 / 0.0, imaginary = 0.0) ** -1
+		func infinite_identity_uint(): Complex = Complex(real = 1.0 / 0.0, imaginary = 0.0) ** 1u
+		func infinite_identity_float(): Complex = Complex(real = 1.0 / 0.0, imaginary = 0.0) ** 1.0
+		func signed_imaginary_identity(imaginary: float): Complex =
+		  Complex(real = 0.0, imaginary = imaginary) ** 1.0
+		func signed_imaginary_fractional(imaginary: float): Complex =
+		  Complex(real = 4.0, imaginary = imaginary) ** 0.5
+		func signed_imaginary_negative_fractional(imaginary: float): Complex =
+		  Complex(real = 4.0, imaginary = imaginary) ** -0.5
+		func nonnegative_infinite_power(): Complex = Complex(real = 2.0, imaginary = 0.0) ** (1.0 / 0.0)
+		func infinite_fractional_power(): Complex = Complex(real = 1.0 / 0.0, imaginary = 0.0) ** 0.5
 		func nan_power(): Complex = 2.0 ** ((-1.0).ln())
 		func infinity_power(): Complex = 2.0 ** (1.0 / 0.0)
 		func main(): void = {}
@@ -1449,6 +1466,13 @@ fn power_zero_signed_zero_and_ieee_edges_follow_the_contract() {
 		"tiny_sqrt",
 		"huge_reciprocal",
 		"infinite_reciprocal",
+		"infinite_identity_uint",
+		"infinite_identity_float",
+		"signed_imaginary_identity",
+		"signed_imaginary_fractional",
+		"signed_imaginary_negative_fractional",
+		"nonnegative_infinite_power",
+		"infinite_fractional_power",
 		"nan_power",
 		"infinity_power",
 	]
@@ -1460,10 +1484,15 @@ fn power_zero_signed_zero_and_ieee_edges_follow_the_contract() {
 		"\nconst z = {}(); const odd = {}(new NFloat(-0)); const even = {}(new NFloat(-0));\n\
 		 const complexOdd = {}(new NFloat(-0)); const complexEven = {}(new NFloat(-0));\n\
 		 const huge = {}(); const tiny = {}(); const reciprocal = {}(); const infiniteReciprocal = {}();\n\
-		 const nan = {}(); const inf = {}();\n\
+		 const identityUint = {}(); const identityFloat = {}(); const signedImaginary = {}(new NFloat(-0));\n\
+		 const fractionalNegativeZero = {}(new NFloat(-0)); const negativeFractionalPositiveZero = {}(new NFloat(0));\n\
+		 const nonnegativeInfinity = {}(); const fractionalInfinity = {}(); const nan = {}(); const inf = {}();\n\
 		 console.log(z.v[0].v, z.v[1].v, z.v[2].v, z.v[3].real.v, z.v[3].imaginary.v, z.v[4].real.v, z.v[4].imaginary.v);\n\
 		 console.log(Object.is(odd.real.v, -0), Object.is(even.real.v, 0), Object.is(complexOdd.real.v, -0), Object.is(complexEven.real.v, 0));\n\
 		 console.log(huge.real.v, tiny.real.v, reciprocal.real.v, Object.is(infiniteReciprocal.real.v, 0), Number.isNaN(infiniteReciprocal.real.v));\n\
+		 console.log(identityUint.real.v, identityUint.imaginary.v, identityFloat.real.v, identityFloat.imaginary.v, Object.is(signedImaginary.imaginary.v, -0));\n\
+		 console.log(fractionalNegativeZero.real.v, Object.is(fractionalNegativeZero.imaginary.v, -0), negativeFractionalPositiveZero.real.v, Object.is(negativeFractionalPositiveZero.imaginary.v, -0));\n\
+		 console.log(nonnegativeInfinity.real.v, nonnegativeInfinity.imaginary.v, fractionalInfinity.real.v, fractionalInfinity.imaginary.v);\n\
 		 console.log(Number.isNaN(nan.real.v), inf.real.v, inf.imaginary.v);\n",
 		symbols[0],
 		symbols[1],
@@ -1476,6 +1505,13 @@ fn power_zero_signed_zero_and_ieee_edges_follow_the_contract() {
 		symbols[8],
 		symbols[9],
 		symbols[10],
+		symbols[11],
+		symbols[12],
+		symbols[13],
+		symbols[14],
+		symbols[15],
+		symbols[16],
+		symbols[17],
 	));
 	let output = run_node(&js, "power_edges");
 	let lines: Vec<_> = output.lines().collect();
@@ -1490,7 +1526,10 @@ fn power_zero_signed_zero_and_ieee_edges_follow_the_contract() {
 	assert!((finite[1] / 1e-100 - 1.0).abs() < 1e-12);
 	assert!((finite[2] / 1e-200 - 1.0).abs() < 1e-12);
 	assert!(lines[2].ends_with("true false"));
-	assert_eq!(lines[3], "true Infinity 0");
+	assert_eq!(lines[3], "Infinity 0 Infinity 0 true");
+	assert_eq!(lines[4], "2 true 0.5 true");
+	assert_eq!(lines[5], "Infinity 0 Infinity 0");
+	assert_eq!(lines[6], "true Infinity 0");
 }
 
 #[test]

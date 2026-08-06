@@ -1741,7 +1741,7 @@ fn required_type_nodes(
 				)
 			}) {
 			match &expression.kind {
-				ExprKind::BinaryOp { lhs, rhs, .. } => {
+				ExprKind::BinaryOp { lhs, rhs, .. } | ExprKind::AssignOp { lhs, rhs, .. } => {
 					required.insert(lhs.id);
 					required.insert(rhs.id);
 				}

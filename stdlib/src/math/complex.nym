@@ -95,6 +95,7 @@ func complex_reciprocal(value: Complex): Complex = {
 }
 
 func complex_power_uint(base: Complex, exponent: uint): Complex = {
+  if (exponent == 1u) { return base }
   let mut result = complex_one()
   let mut factor = base
   let mut remaining = exponent
@@ -110,6 +111,8 @@ func complex_power_uint(base: Complex, exponent: uint): Complex = {
 // avoids a saturating float-to-int cast and covers every finite integral IEEE
 // value represented by Nymph.
 func complex_power_integral_float(base: Complex, exponent: float): Complex = {
+  if (exponent == 1.0) { return base }
+  if (exponent == -1.0) { return complex_reciprocal(base) }
   let negative = exponent < 0.0
   let mut remaining = if (negative) { -exponent } else { exponent }
   let mut result = complex_one()
@@ -165,6 +168,11 @@ func complex_power_float(base: Complex, exponent: float): Complex = {
         imaginary = exponent * logarithm.imaginary,
       ))
     }
+  } else if (base.imaginary == 0.0 && base.real >= 0.0 && exponent == exponent) {
+    let result = real_power_float(base.real, exponent)
+    if (exponent - exponent == 0.0) {
+      Complex(real = result.real, imaginary = exponent * base.imaginary)
+    } else { result }
   } else {
     let logarithm = complex_log(base)
     complex_exp(Complex(
