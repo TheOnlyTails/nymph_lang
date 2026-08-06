@@ -528,12 +528,23 @@ mod tests {
 
 	#[test]
 	fn project_diagnostics_resolve_available_and_transitive_embedded_std_without_synthetic_uris() {
-		// Cover every compiler-owned importable std module directly, then reach a
+		// Derive the imports from the compiler-owned registry so adding a new
+		// embedded module cannot silently leave LSP coverage behind. Then reach a
 		// nested provider path again through a transitive project import. None of
 		// these std modules exists under this project's src root.
-		let main = "import std/io as embedded_io\nimport std/collections/set as embedded_set\nimport std/collections/linked_list as embedded_linked_list\nimport std/collections/tree as embedded_tree\nimport std/math/complex as embedded_complex\nimport @/helper with (leaf)\nfunc use(): int = leaf()\n";
+		let paths = nymph_compiler::CompilerSession::new().importable_std_module_paths_for_test();
+		assert!(
+			!paths.is_empty(),
+			"the embedded std registry must not be empty"
+		);
+		let mut main = paths
+			.iter()
+			.enumerate()
+			.map(|(index, path)| format!("import std/{path} as embedded_{index}\n"))
+			.collect::<String>();
+		main.push_str("import @/helper with (leaf)\nfunc use(): int = leaf()\n");
 		let (_tmp, main_uri, docs) = project_fixture(
-			main,
+			&main,
 			&[(
 				"helper",
 				"import std/collections/tree with (Tree)\npublic func leaf(): int = match (Tree.Leaf(value = 1)) { Tree.Leaf(value) -> value, Tree.Node(...) -> 0 }\n",
@@ -572,6 +583,43 @@ mod tests {
 		assert_eq!(notifications[0].uri, main_uri);
 		assert!(notifications[0].diagnostics.iter().any(|diagnostic| {
 			diagnostic.code == Some(NumberOrString::String("IMPORT-UNRESOLVED".into()))
+		}));
+	}
+
+	#[test]
+	fn graph_error_publications_have_deterministic_uri_order() {
+		let main = "import @/b\nimport @/a\nfunc use(): int = 1\n";
+		let (_tmp, main_uri, docs) = project_fixture(
+			main,
+			&[
+				("a", "import @/missing_a\npublic func a(): int = 1\n"),
+				("b", "import @/missing_b\npublic func b(): int = 1\n"),
+			],
+		);
+		let a_uri = main_uri
+			.as_str()
+			.replace("main.nym", "a.nym")
+			.parse::<Uri>()
+			.unwrap();
+		let b_uri = main_uri
+			.as_str()
+			.replace("main.nym", "b.nym")
+			.parse::<Uri>()
+			.unwrap();
+		let (server, client) = Connection::memory();
+
+		check_and_publish(&server, &docs, &main_uri).unwrap();
+
+		let notifications = published(&client);
+		let uris: Vec<_> = notifications
+			.iter()
+			.map(|params| params.uri.clone())
+			.collect();
+		assert_eq!(uris, [a_uri, b_uri, main_uri]);
+		assert!(notifications[..2].iter().all(|params| {
+			params.diagnostics.iter().any(|diagnostic| {
+				diagnostic.code == Some(NumberOrString::String("IMPORT-UNRESOLVED".into()))
+			})
 		}));
 	}
 
@@ -643,6 +691,60 @@ mod tests {
 		assert!(
 			diagnostics.is_empty(),
 			"project overlay and embedded std should resolve in separate domains: {diagnostics:?}"
+		);
+	}
+
+	#[test]
+	fn provider_diagnostics_are_suppressed_without_suppressing_project_publication() {
+		let main = "import std/collections/tree as embedded_tree\nimport @/broken with (broken)\nfunc use(): int = broken()\n";
+		let (_tmp, main_uri, docs) =
+			project_fixture(main, &[("broken", "public func broken(): int = true\n")]);
+		let broken_uri = main_uri
+			.as_str()
+			.replace("main.nym", "broken.nym")
+			.parse::<Uri>()
+			.unwrap();
+		let mut state = CompilerState::new();
+		state.session.set_importable_std_source_for_test(
+			"collections/tree",
+			"public func provider_error(): int = true\n".into(),
+		);
+		state
+			.open(&mut docs.lock().unwrap(), main_uri.clone(), main.into(), 1)
+			.unwrap();
+		let diagnostics = state
+			.diagnostics_for_uri(&docs.lock().unwrap(), &main_uri)
+			.unwrap();
+		assert!(
+			diagnostics.iter().any(|diagnostic| {
+				diagnostic.module == "std::collections/tree" && diagnostic.diag.is_error()
+			}),
+			"fixture must induce a provider-owned diagnostic: {diagnostics:?}"
+		);
+		let compiler = Arc::new(Mutex::new(state));
+		let (server, client) = Connection::memory();
+
+		check_and_publish_state(&server, &docs, &compiler, &main_uri).unwrap();
+
+		let notifications = published(&client);
+		assert_eq!(notifications.len(), 2, "{notifications:?}");
+		assert!(notifications.iter().any(|params| params.uri == main_uri));
+		let broken = notifications
+			.iter()
+			.find(|params| params.uri == broken_uri)
+			.expect("real project diagnostics must still be published");
+		assert!(
+			broken
+				.diagnostics
+				.iter()
+				.any(|diagnostic| diagnostic.severity == Some(DiagnosticSeverity::ERROR)),
+			"{broken:?}"
+		);
+		assert!(
+			notifications
+				.iter()
+				.all(|params| !params.uri.as_str().contains("std::")),
+			"provider identity was fabricated into a workspace URI: {notifications:?}"
 		);
 	}
 }
