@@ -1,9 +1,9 @@
 # Operators
 
 Most of Nymph's operators are backed by an interface — implement the interface for your type and
-the operator syntax starts working for it. These interfaces live in the stdlib's **operator
-prelude**, which (unlike the rest of the standard library) is ambient: every one of them is
-available with no `import`, in every module.
+the operator syntax starts working for it. These interfaces are part of Nymph's **ambient core**,
+alongside APIs such as `Option`, `Result`, and iteration interfaces. Every one of them is available
+with no `import`, in every module; this is separate from opt-in `std/...` modules.
 
 > [!NOTE] `==` and `!=` are the exception
 > Equality and inequality never dispatch anywhere — they always compare by native identity

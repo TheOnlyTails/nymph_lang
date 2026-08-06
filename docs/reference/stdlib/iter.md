@@ -1,7 +1,8 @@
-# `@/iter`
+# Ambient iteration APIs
 
 The interfaces behind [`for` loops](../iteration), including the fallible stepping contract used
-by canonical ranges.
+by canonical ranges. `Step`, `Iterator`, and `Iterable` are part of Nymph's ambient core: use them
+directly, without an import.
 
 ## `Step`
 
@@ -54,8 +55,6 @@ For maps, `Iterable<#(K, V)>.iter()` is ordinary Nymph and delegates to
 sequence is stable when the same map instance is iterated repeatedly without mutation, but its
 order is otherwise unspecified, including across distinct instances.
 
-> [!NOTE] Illustrative, not imported
-> Every sample on this page mirrors `@/iter`'s real declarations, but user programs can't `import`
-> stdlib modules yet — see the note on [Declarations](../declarations#imports). The
-> [Iteration](../iteration) reference page's worked examples declare an equivalent `Iterator`/
-> `Iterable` inline for exactly this reason, and exercise the same `for`-loop desugaring either way.
+The [Iteration](../iteration) reference page declares equivalent interfaces inline where a worked
+example needs to show their complete shape. Ordinary programs should use the ambient interfaces
+instead of redeclaring or importing them.

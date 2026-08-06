@@ -20,6 +20,10 @@ features:
     details: Absence is Option, failure is Result — both ambient, both checked, so callers can't forget the edge cases.
 ---
 
+Core APIs such as `Option`, `Result`, operators, and iteration are ambient. Other standard-library
+modules are opt-in through `std/...`; project modules use source-rooted `@/...` or relative
+`./...` and `../...` imports.
+
 ::: code-group
 
 ```nymph [hello_world.nym]

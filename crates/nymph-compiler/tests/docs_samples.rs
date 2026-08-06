@@ -25,7 +25,11 @@
 //! `nymph`-tagged illustrative fragments) is not extracted at all — it is
 //! simply not checked.
 
-use nymph_compiler::{CompilerSession, Diagnostic, ModulePath, ProjectId, SourceVersion};
+use nymph_compiler::{
+	CompilerSession, Diagnostic, ModulePath, ProjectId, SourceVersion,
+	check_project_with_embedded_std,
+};
+use rustc_hash::FxHashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -98,6 +102,9 @@ fn collect_md_files(dir: &Path, out: &mut Vec<PathBuf>) {
 // ── expression-vs-program heuristic + the CLI's inline-eval wrap ───────────
 
 const DECL_KEYWORDS: &[&str] = &[
+	"public ",
+	"internal ",
+	"private ",
 	"func ",
 	"struct ",
 	"enum ",
@@ -329,5 +336,31 @@ fn every_doc_sample_is_covered() {
 		failures.len(),
 		clean_count + error_marked_count,
 		failures.join("\n\n")
+	);
+}
+
+#[test]
+fn documented_import_forms_check() {
+	let files = FxHashMap::from_iter([
+		(
+			"app/main",
+			"import std/collections/linked_list with (LinkedList)\n\
+			 import @/math as root_math\n\
+			 import ./format with (increment)\n\
+			 import ../shared with (seed as seed_value)\n\
+			 func retain<T>(list: LinkedList<T>): LinkedList<T> = list\n\
+			 func maybe_answer(): Option<int> = Some(increment(root_math.double(seed_value())))\n\
+			 func main(): void = {}",
+		),
+		("math", "public func double(x: int): int = x * 2"),
+		("app/format", "public func increment(x: int): int = x + 1"),
+		("shared", "public func seed(): int = 20"),
+	]);
+	let load = |key: &str| files.get(key).map(|source| (*source).to_string());
+	let diags = check_project_with_embedded_std("app/main", &load);
+
+	assert!(
+		diags.is_empty(),
+		"documented ambient, std, project-rooted, and relative import forms should check: {diags:?}"
 	);
 }
