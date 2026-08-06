@@ -1493,6 +1493,7 @@ dependencies = [
  "nymph-diagnostics",
  "nymph-project",
  "owo-colors",
+ "rustix",
 ]
 
 [[package]]
