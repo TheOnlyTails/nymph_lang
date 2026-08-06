@@ -1243,6 +1243,32 @@ fn new_accepts_an_existing_empty_directory_and_refuses_other_destinations_untouc
 	std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn new_preserves_existing_empty_directory_permissions() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let root = unique_temp_path("nymph_cli_new_existing_permissions", "dir");
+	let destination = root.join("private-app");
+	std::fs::create_dir_all(&destination).unwrap();
+	let mut permissions = std::fs::metadata(&destination).unwrap().permissions();
+	permissions.set_mode(0o700);
+	std::fs::set_permissions(&destination, permissions).unwrap();
+
+	let out = nymph(&["new", destination.to_str().unwrap(), "--no-git"]);
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(
+		std::fs::metadata(&destination)
+			.unwrap()
+			.permissions()
+			.mode()
+			& 0o777,
+		0o700
+	);
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn new_creates_nested_parents_and_no_git_is_deterministic() {
 	let root = unique_temp_path("nymph_cli_new_nested", "dir");
@@ -1351,6 +1377,151 @@ fn new_failing_git_preserves_an_existing_empty_destination_and_cleans_staging() 
 			.collect::<std::collections::BTreeSet<_>>(),
 		["bin", "git-app"].into_iter().map(Into::into).collect()
 	);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn new_rejects_a_symlink_ancestor_changed_by_git_without_touching_either_target() {
+	use std::os::unix::fs::{PermissionsExt, symlink};
+
+	let root = unique_temp_path("nymph_cli_new_symlink_race", "dir");
+	let original = root.join("original");
+	let replacement = root.join("replacement");
+	let bin = root.join("bin");
+	let link = root.join("link");
+	std::fs::create_dir_all(&original).unwrap();
+	std::fs::create_dir_all(&replacement).unwrap();
+	std::fs::create_dir_all(&bin).unwrap();
+	symlink(&original, &link).unwrap();
+	let git = bin.join("git");
+	std::fs::write(
+		&git,
+		"#!/bin/sh\nPATH=/usr/bin:/bin\nrm \"$ATTACK_ROOT/link\"\nln -s \"$ATTACK_ROOT/replacement\" \"$ATTACK_ROOT/link\"\nexit 0\n",
+	)
+	.unwrap();
+	let mut permissions = std::fs::metadata(&git).unwrap().permissions();
+	permissions.set_mode(0o755);
+	std::fs::set_permissions(&git, permissions).unwrap();
+	let destination = link.join("nested/app");
+
+	let out = Command::new(env!("CARGO_BIN_EXE_nymph"))
+		.arg("new")
+		.arg(&destination)
+		.env("PATH", &bin)
+		.env("ATTACK_ROOT", &root)
+		.output()
+		.unwrap();
+	assert_eq!(out.status.code(), Some(1));
+	assert!(
+		String::from_utf8_lossy(&out.stderr).contains("parent ancestor changed"),
+		"{}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	assert_eq!(std::fs::read_dir(&original).unwrap().count(), 0);
+	assert_eq!(std::fs::read_dir(&replacement).unwrap().count(), 0);
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn new_rejects_a_symlink_created_in_a_missing_parent_without_publishing() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let root = unique_temp_path("nymph_cli_new_missing_parent_race", "dir");
+	let original = root.join("original");
+	let replacement = root.join("replacement");
+	let bin = root.join("bin");
+	std::fs::create_dir_all(&original).unwrap();
+	std::fs::create_dir_all(&replacement).unwrap();
+	std::fs::create_dir_all(&bin).unwrap();
+	let git = bin.join("git");
+	std::fs::write(
+		&git,
+		"#!/bin/sh\nPATH=/usr/bin:/bin\nln -s \"$ATTACK_ROOT/replacement\" \"$ATTACK_ROOT/original/nested\"\nexit 0\n",
+	)
+	.unwrap();
+	let mut permissions = std::fs::metadata(&git).unwrap().permissions();
+	permissions.set_mode(0o755);
+	std::fs::set_permissions(&git, permissions).unwrap();
+	let destination = original.join("nested/app");
+
+	let out = Command::new(env!("CARGO_BIN_EXE_nymph"))
+		.arg("new")
+		.arg(&destination)
+		.env("PATH", &bin)
+		.env("ATTACK_ROOT", &root)
+		.output()
+		.unwrap();
+	assert_eq!(out.status.code(), Some(1));
+	assert!(!replacement.join("app").exists());
+	assert_eq!(
+		std::fs::read_dir(&original)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name())
+			.collect::<Vec<_>>(),
+		["nested"]
+	);
+	assert!(
+		std::fs::symlink_metadata(original.join("nested"))
+			.unwrap()
+			.file_type()
+			.is_symlink()
+	);
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn new_cleans_staging_after_preserving_read_only_destination_permissions() {
+	use std::os::unix::fs::{PermissionsExt, symlink};
+
+	let root = unique_temp_path("nymph_cli_new_read_only_cleanup", "dir");
+	let original = root.join("original");
+	let replacement = root.join("replacement");
+	let bin = root.join("bin");
+	let link = root.join("link");
+	let destination = original.join("private-app");
+	std::fs::create_dir_all(&destination).unwrap();
+	std::fs::create_dir_all(&replacement).unwrap();
+	std::fs::create_dir_all(&bin).unwrap();
+	symlink(&original, &link).unwrap();
+	let mut permissions = std::fs::metadata(&destination).unwrap().permissions();
+	permissions.set_mode(0o555);
+	std::fs::set_permissions(&destination, permissions).unwrap();
+	let git = bin.join("git");
+	std::fs::write(
+		&git,
+		"#!/bin/sh\nPATH=/usr/bin:/bin\nrm \"$ATTACK_ROOT/link\"\nln -s \"$ATTACK_ROOT/replacement\" \"$ATTACK_ROOT/link\"\nexit 0\n",
+	)
+	.unwrap();
+	let mut permissions = std::fs::metadata(&git).unwrap().permissions();
+	permissions.set_mode(0o755);
+	std::fs::set_permissions(&git, permissions).unwrap();
+
+	let out = Command::new(env!("CARGO_BIN_EXE_nymph"))
+		.arg("new")
+		.arg(link.join("private-app"))
+		.env("PATH", &bin)
+		.env("ATTACK_ROOT", &root)
+		.output()
+		.unwrap();
+	assert_eq!(out.status.code(), Some(1));
+	assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+	assert_eq!(std::fs::read_dir(&replacement).unwrap().count(), 0);
+	assert_eq!(
+		std::fs::read_dir(&original)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name())
+			.collect::<Vec<_>>(),
+		["private-app"]
+	);
+
+	let mut permissions = std::fs::metadata(&destination).unwrap().permissions();
+	permissions.set_mode(0o755);
+	std::fs::set_permissions(&destination, permissions).unwrap();
 	std::fs::remove_dir_all(root).unwrap();
 }
 

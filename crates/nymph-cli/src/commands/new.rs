@@ -43,10 +43,9 @@ impl NymphCommand for NewCommand {
 	}
 }
 
-#[derive(Clone, Copy)]
 enum DestinationState {
 	Absent,
-	EmptyDirectory,
+	EmptyDirectory(std::fs::Permissions),
 }
 
 fn create_project(path: &Path, library: bool, no_git: bool) -> anyhow::Result<String> {
@@ -58,7 +57,22 @@ fn create_project(path: &Path, library: bool, no_git: bool) -> anyhow::Result<St
 		.filter(|parent| !parent.as_os_str().is_empty())
 		.unwrap_or_else(|| Path::new("."));
 	let existing_ancestor = existing_ancestor(parent)?;
-	let mut staging = StagingDirectory::new(&existing_ancestor, destination.file_name().unwrap())?;
+	let canonical_ancestor = std::fs::canonicalize(&existing_ancestor).with_context(|| {
+		format!(
+			"could not resolve parent ancestor {}",
+			existing_ancestor.display()
+		)
+	})?;
+	let relative_parent = parent.strip_prefix(&existing_ancestor).map_err(|_| {
+		anyhow::anyhow!(
+			"parent {} escaped existing ancestor {}",
+			parent.display(),
+			existing_ancestor.display()
+		)
+	})?;
+	let publish_parent = canonical_ancestor.join(relative_parent);
+	let publish_destination = publish_parent.join(destination.file_name().unwrap());
+	let mut staging = StagingDirectory::new(&canonical_ancestor, destination.file_name().unwrap())?;
 
 	let manifest = nymph_project::Manifest::new(name.clone());
 	let source_name = if library { "lib.nym" } else { "main.nym" };
@@ -79,12 +93,28 @@ fn create_project(path: &Path, library: bool, no_git: bool) -> anyhow::Result<St
 	if !no_git {
 		initialize_git(staging.path())?;
 	}
+	if let DestinationState::EmptyDirectory(permissions) = &destination_state {
+		std::fs::set_permissions(staging.path(), permissions.clone())?;
+	}
+
+	let current_ancestor = std::fs::canonicalize(&existing_ancestor).with_context(|| {
+		format!(
+			"parent ancestor changed during project creation: {}",
+			existing_ancestor.display()
+		)
+	})?;
+	if current_ancestor != canonical_ancestor {
+		bail!(
+			"parent ancestor changed during project creation: {}",
+			existing_ancestor.display()
+		);
+	}
 
 	publish(
 		staging.path(),
-		&destination,
-		parent,
-		existing_ancestor,
+		&publish_destination,
+		&publish_parent,
+		canonical_ancestor,
 		destination_state,
 	)?;
 	staging.disarm();
@@ -111,13 +141,13 @@ fn inspect_destination(path: &Path) -> anyhow::Result<DestinationState> {
 				path.display()
 			)
 		}
-		Ok(_) => {
+		Ok(metadata) => {
 			let mut entries = std::fs::read_dir(path)
 				.with_context(|| format!("could not inspect destination {}", path.display()))?;
 			if entries.next().transpose()?.is_some() {
 				bail!("destination is not empty: {}", path.display());
 			}
-			Ok(DestinationState::EmptyDirectory)
+			Ok(DestinationState::EmptyDirectory(metadata.permissions()))
 		}
 		Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(DestinationState::Absent),
 		Err(error) => {
@@ -178,8 +208,8 @@ fn publish(
 					.with_context(|| format!("could not publish destination {}", destination.display()));
 			}
 		}
-		DestinationState::EmptyDirectory => {
-			std::fs::rename(staging, destination).with_context(|| {
+		DestinationState::EmptyDirectory(_) => {
+			replace_empty_destination(staging, destination).with_context(|| {
 				format!(
 					"destination is no longer an empty directory: {}",
 					destination.display()
@@ -188,6 +218,10 @@ fn publish(
 		}
 	}
 	Ok(())
+}
+
+fn replace_empty_destination(staging: &Path, destination: &Path) -> io::Result<()> {
+	std::fs::rename(staging, destination)
 }
 
 fn create_missing_parents(parent: &Path, existing_ancestor: &Path) -> io::Result<Vec<PathBuf>> {
@@ -207,7 +241,19 @@ fn create_missing_parents(parent: &Path, existing_ancestor: &Path) -> io::Result
 	for path in missing.iter().rev() {
 		match std::fs::create_dir(path) {
 			Ok(()) => created.push(path.clone()),
-			Err(error) if error.kind() == io::ErrorKind::AlreadyExists && path.is_dir() => {}
+			Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+				let metadata = match std::fs::symlink_metadata(path) {
+					Ok(metadata) => metadata,
+					Err(metadata_error) => {
+						cleanup_created_parents(&created);
+						return Err(metadata_error);
+					}
+				};
+				if !metadata.file_type().is_dir() {
+					cleanup_created_parents(&created);
+					return Err(error);
+				}
+			}
 			Err(error) => {
 				cleanup_created_parents(&created);
 				return Err(error);
@@ -242,8 +288,18 @@ fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
-	// Windows rename fails rather than replacing an existing destination.
-	std::fs::rename(from, to)
+	use std::os::windows::ffi::OsStrExt;
+
+	let from: Vec<_> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+	let to: Vec<_> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+	// With no MOVEFILE_REPLACE_EXISTING flag, this is one no-replace filesystem
+	// operation for both files and directories.
+	if unsafe { windows_sys::Win32::Storage::FileSystem::MoveFileExW(from.as_ptr(), to.as_ptr(), 0) }
+		== 0
+	{
+		return Err(io::Error::last_os_error());
+	}
+	Ok(())
 }
 
 #[cfg(not(any(
@@ -281,6 +337,7 @@ fn unique_sibling(parent: &Path, basename: &OsStr, suffix: &str) -> io::Result<P
 
 struct StagingDirectory {
 	path: Option<PathBuf>,
+	cleanup_permissions: std::fs::Permissions,
 }
 
 impl StagingDirectory {
@@ -288,7 +345,19 @@ impl StagingDirectory {
 		for _ in 0..100 {
 			let path = unique_sibling(parent, basename, "stage")?;
 			match std::fs::create_dir(&path) {
-				Ok(()) => return Ok(Self { path: Some(path) }),
+				Ok(()) => {
+					let cleanup_permissions = match std::fs::metadata(&path) {
+						Ok(metadata) => metadata.permissions(),
+						Err(error) => {
+							let _ = std::fs::remove_dir(&path);
+							return Err(error);
+						}
+					};
+					return Ok(Self {
+						path: Some(path),
+						cleanup_permissions,
+					});
+				}
 				Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
 				Err(error) => return Err(error),
 			}
@@ -311,6 +380,7 @@ impl StagingDirectory {
 impl Drop for StagingDirectory {
 	fn drop(&mut self) {
 		if let Some(path) = &self.path {
+			let _ = std::fs::set_permissions(path, self.cleanup_permissions.clone());
 			let _ = std::fs::remove_dir_all(path);
 		}
 	}

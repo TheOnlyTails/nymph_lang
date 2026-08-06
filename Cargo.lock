@@ -1494,6 +1494,7 @@ dependencies = [
  "nymph-project",
  "owo-colors",
  "rustix",
+ "windows-sys",
 ]
 
 [[package]]
