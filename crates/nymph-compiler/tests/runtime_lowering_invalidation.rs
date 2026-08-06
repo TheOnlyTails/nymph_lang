@@ -257,10 +257,6 @@ func inclusive(): int = { let mut total = 0 for (x in 1..=4) { total = total + x
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = list.fragment() else {
 		panic!("list_sum must lower to a top-level function");
 	};
-	let iter_body = ambient_iteration_demands(&session)[1].clone();
-	let iter_binding = session
-		.binding_name_for_test(project.clone(), main.clone(), iter_body, EntryMode::Library)
-		.expect("selected List.iter body has an authoritative binding name");
 	assert!(hir_contains(&function.body, &|expr| matches!(
 		expr,
 		nymph_hir::hir::HirExpr::Assign { target, .. }
@@ -269,16 +265,20 @@ func inclusive(): int = { let mut total = 0 for (x in 1..=4) { total = total + x
 	assert!(hir_contains(&function.body, &|expr| matches!(
 		expr,
 		nymph_hir::hir::HirExpr::Call { callee, args }
-			if args.len() == 1 && matches!(
+			if args.is_empty() && matches!(
 				callee.as_ref(),
-				nymph_hir::hir::HirExpr::Local(name) if name == iter_binding.as_str()
+				nymph_hir::hir::HirExpr::Field { name, .. } if name == "iter"
 			)
 	)));
 	assert!(hir_contains(&function.body, &|expr| matches!(
 		expr,
 		nymph_hir::hir::HirExpr::While { .. }
 	)));
-	assert_eq!(list.demands(), ambient_iteration_demands(&session));
+	assert_eq!(
+		list.demands(),
+		[ambient_iteration_demands(&session)[0].clone()],
+		"prototype-dispatched List.iter needs no direct body demand",
+	);
 	for name in ["exclusive", "inclusive"] {
 		let lowered = session
 			.lower_runtime_definition(
