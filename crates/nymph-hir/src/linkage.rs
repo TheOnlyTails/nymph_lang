@@ -87,6 +87,14 @@ pub struct LinkedValue {
 	pub marshal: MarshalKind,
 }
 
+const fn math_intrinsic(symbol: &'static str, receiver_tag: Option<&'static str>) -> Linked {
+	Linked {
+		module: "std/math/intrinsics",
+		symbol,
+		receiver_tag,
+	}
+}
+
 /// Immutable host-value linkages. Kept separate from callable linkages so a
 /// declaration can never accidentally import a function as a value (or vice versa).
 pub const VALUE_REGISTRY: &[(&str, LinkedValue)] = &[
@@ -107,6 +115,17 @@ pub const VALUE_REGISTRY: &[(&str, LinkedValue)] = &[
 			linked: Linked {
 				module: "std/math/intrinsics",
 				symbol: "min_float",
+				receiver_tag: None,
+			},
+			marshal: MarshalKind::Float,
+		},
+	),
+	(
+		"min_positive_float",
+		LinkedValue {
+			linked: Linked {
+				module: "std/math/intrinsics",
+				symbol: "min_positive_float",
 				receiver_tag: None,
 			},
 			marshal: MarshalKind::Float,
@@ -144,6 +163,24 @@ pub const VALUE_REGISTRY: &[(&str, LinkedValue)] = &[
 ///   direct `.into()` is a checker error, and string interpolation bypasses
 ///   `into` entirely; see `nymph-compiler/tests/std_linkage.rs`).
 pub const REGISTRY: &[(&str, Linked)] = &[
+	("sin", math_intrinsic("sin", Some("float"))),
+	("cos", math_intrinsic("cos", Some("float"))),
+	("tan", math_intrinsic("tan", Some("float"))),
+	("asin", math_intrinsic("asin", Some("float"))),
+	("acos", math_intrinsic("acos", Some("float"))),
+	("atan", math_intrinsic("atan", Some("float"))),
+	("sinh", math_intrinsic("sinh", Some("float"))),
+	("cosh", math_intrinsic("cosh", Some("float"))),
+	("tanh", math_intrinsic("tanh", Some("float"))),
+	("asinh", math_intrinsic("asinh", Some("float"))),
+	("acosh", math_intrinsic("acosh", Some("float"))),
+	("atanh", math_intrinsic("atanh", Some("float"))),
+	("exp", math_intrinsic("exp", Some("float"))),
+	("ln", math_intrinsic("ln", Some("float"))),
+	("floor", math_intrinsic("floor", Some("float"))),
+	("ceil", math_intrinsic("ceil", Some("float"))),
+	("round", math_intrinsic("round", Some("float"))),
+	("atan2", math_intrinsic("atan2", None)),
 	(
 		"display",
 		Linked {
@@ -880,6 +917,33 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn math_declarations_are_exhaustively_linked_with_their_declared_abi() {
+		let instance_markers = [
+			"sin", "cos", "tan", "asin", "acos", "atan", "sinh", "cosh", "tanh", "asinh", "acosh",
+			"atanh", "exp", "ln", "floor", "ceil", "round",
+		];
+		for marker in instance_markers {
+			let linked = lookup(marker, Some("float")).expect("float math marker must be linked");
+			assert_eq!(linked.module, "std/math/intrinsics");
+			assert_eq!(linked.symbol, marker);
+			assert_eq!(linked.receiver_tag, Some("float"));
+			assert!(lookup(marker, None).is_none());
+			assert!(lookup(marker, Some("int")).is_none());
+		}
+
+		let atan2 = lookup("atan2", None).expect("atan2 must be receiverless");
+		assert_eq!(atan2, &math_intrinsic("atan2", None));
+
+		for marker in ["max_float", "min_float", "min_positive_float"] {
+			let value = lookup_value(marker).expect("float constant must be linked as a value");
+			assert_eq!(value.linked.module, "std/math/intrinsics");
+			assert_eq!(value.linked.symbol, marker);
+			assert_eq!(value.marshal, MarshalKind::Float);
+			assert!(lookup(marker, None).is_none());
+		}
+	}
+
+	#[test]
 	fn length_links_to_the_canonical_module_for_each_supported_receiver() {
 		for receiver in ["list", "mut_list"] {
 			let linked =
@@ -1006,7 +1070,32 @@ mod tests {
 				),
 				("std/hash", vec!["hash"]),
 				("std/io", vec!["print", "println"]),
-				("std/math/intrinsics", vec!["max_float", "min_float"]),
+				(
+					"std/math/intrinsics",
+					vec![
+						"acos",
+						"acosh",
+						"asin",
+						"asinh",
+						"atan",
+						"atan2",
+						"atanh",
+						"ceil",
+						"cos",
+						"cosh",
+						"exp",
+						"floor",
+						"ln",
+						"max_float",
+						"min_float",
+						"min_positive_float",
+						"round",
+						"sin",
+						"sinh",
+						"tan",
+						"tanh",
+					]
+				),
 				(
 					"std/string",
 					vec![
