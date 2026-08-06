@@ -10,7 +10,10 @@
 //! a `Lowerer` so later slices can add further type-directed lowering without another
 //! signature change.
 
-use std::cell::RefCell;
+use std::{
+	cell::RefCell,
+	hash::{DefaultHasher, Hash, Hasher},
+};
 
 use ecow::EcoString;
 use nymph_ast::{
@@ -552,6 +555,9 @@ struct RuntimeFuncDemand<'a> {
 	/// `owner_generics` parameter; see `push_unoverridden_defaults`'s doc
 	/// comment for why the CALLER must pass the same scope the checker used.
 	owner_generics: &'a [Spanned<GenericParam>],
+	/// Implementation-binder runtime type objects in the canonical ABI.
+	/// They follow source parameters and precede method-generic objects.
+	implementation_hidden: usize,
 	meta: &'a FuncDeclaration,
 	body: &'a Expr,
 	/// Gap 2 (sibling-interface-method dispatch inside a lowered
@@ -811,6 +817,7 @@ impl<'a> Lowerer<'a> {
 					meta,
 					body,
 					&res.method,
+					None,
 				) {
 					RuntimeDispatch::TopLevel(name) => HirBoundDispatchTarget::TopLevel {
 						module: interface_module.key().clone(),
@@ -1042,6 +1049,24 @@ impl<'a> Lowerer<'a> {
 					.then(|| RuntimeOwner::Compiler(self.module.path.clone()))
 			})
 			.unwrap_or_else(|| panic!("interface `{interface}` has no canonical owner"))
+	}
+
+	fn implementation_owner(&self, implementation: &crate::DefinitionId) -> RuntimeOwner {
+		self
+			.prelude_modules
+			.iter()
+			.zip(self.prelude_owners)
+			.find_map(|(module, owner)| {
+				(module.path == implementation.module.path).then(|| owner.clone())
+			})
+			.unwrap_or_else(|| match implementation.module.origin {
+				crate::ModuleOrigin::Project(_) => {
+					RuntimeOwner::Project(implementation.module.path.clone())
+				}
+				crate::ModuleOrigin::Compiler | crate::ModuleOrigin::ImportableStd => {
+					RuntimeOwner::Compiler(implementation.module.path.clone())
+				}
+			})
 	}
 
 	fn register_runtime_func(
@@ -1447,7 +1472,11 @@ impl<'a> Lowerer<'a> {
 	/// kept bare (a prelude top-level name is never renamed, exactly like a
 	/// module's own).
 	fn lower_runtime_let(&self, name: &EcoString) -> Option<HirLet> {
-		for module in self.prelude_modules {
+		for module in self
+			.prelude_modules
+			.iter()
+			.chain(std::iter::once(self.module))
+		{
 			for decl in &module.members {
 				if let Declaration::ExternalLet(_, marker, meta) = decl
 					&& param_name(&meta.name) == *name
@@ -1600,7 +1629,11 @@ impl<'a> Lowerer<'a> {
 	/// top-level function instead of a class method.
 	fn lower_runtime_func(&self, pending: &RuntimeFuncDemand<'a>) -> HirFunc {
 		self.push_scope();
-		self.push_generics(pending.owner_generics, &pending.meta.generics, false);
+		self.push_generics(
+			pending.owner_generics,
+			&pending.meta.generics,
+			pending.implementation_hidden > 0,
+		);
 		let self_param = self.declare(&EcoString::from("$self"));
 		let mut params = vec![self_param.clone()];
 		params.extend(
@@ -1609,6 +1642,10 @@ impl<'a> Lowerer<'a> {
 				.params
 				.iter()
 				.map(|p| self.declare(&param_name(&p.0.name))),
+		);
+		params.extend(
+			(0..pending.implementation_hidden + pending.meta.generics.len())
+				.map(|index| EcoString::from(format!("$type${index}"))),
 		);
 		self.this_sub.borrow_mut().push(self_param);
 		// Gap 2: while lowering an `ImplFor`-lowered default body, push
@@ -2197,15 +2234,13 @@ impl<'a> Lowerer<'a> {
 		};
 
 		// A blanket impl (`impl<T> Iface for T`) parses its target as a bare
-		// `Type::Reference` naming the impl's own generic parameter. Left
-		// unchecked, that name could coincide with an unrelated real struct in the
-		// module and silently attach the blanket's methods to it; refuse instead
-		// (V5: blanket impls stay a loud deferral, never lowered).
+		// `Type::Reference` naming the impl's own generic parameter. It must not
+		// enter this class/prototype table: selected blanket bodies are emitted once
+		// as canonical top-level functions by `try_lower_runtime_dispatch`.
 		if generics.iter().any(|g| g.0.name.0 == name.0) {
-			panic!(
-				"slice-4c-b lowering does not yet support blanket impls (`impl<{0}> {1} for {0}`)",
-				name.0, for_interface.0.0
-			);
+			// Blanket members are canonical demand-driven top-level functions;
+			// attaching one to a class would create receiver-specific copies.
+			return;
 		}
 
 		let entry = methods_by_type.entry(name.0.clone()).or_default();
@@ -2403,22 +2438,54 @@ impl<'a> Lowerer<'a> {
 		// nominal type's emitted class. The isolated flattened-prelude compatibility
 		// API assigns a deterministic `standalone` identity to all declarations, so
 		// it still needs its offset span to distinguish its prelude-owned methods.
-		if res.implementation.as_ref().is_some_and(|implementation| {
-			matches!(
-				&implementation.module.origin,
-				crate::ModuleOrigin::Project(project)
-					if project != "standalone"
-						|| res.impl_span.is_none_or(|span| span.start < crate::prelude::SPAN_BASE)
-			)
-		}) {
+		let selected_is_blanket = res.impl_span.is_some_and(|span| {
+			self
+				.prelude_modules
+				.iter()
+				.filter(|module| {
+					res.implementation.as_ref().is_none_or(|implementation| {
+						implementation.module.project == "standalone"
+							|| module.path == implementation.module.path
+					})
+				})
+				.chain(
+					res
+						.implementation
+						.as_ref()
+						.is_none_or(|implementation| {
+							implementation.module.project == "standalone"
+								|| implementation.module.path == self.module.path
+						})
+						.then_some(self.module),
+				)
+				.flat_map(|module| &module.members)
+				.any(|declaration| {
+					matches!(
+						declaration,
+						Declaration::ImplFor { generics, type_, for_interface, .. }
+							if res.implementation.as_ref().is_some_and(|implementation|
+								implementation.module.project == "standalone")
+								.then_some(for_interface.0.1 == span)
+								.unwrap_or_else(|| crate::prelude::same_source_span(for_interface.0.1, span))
+								&& matches!(&type_.0, Type::Reference { name, .. }
+									if generics.iter().any(|generic| generic.0.name.0 == name.0))
+					)
+				})
+		});
+		if !selected_is_blanket
+			&& res.implementation.as_ref().is_some_and(|implementation| {
+				matches!(
+					&implementation.module.origin,
+					crate::ModuleOrigin::Project(project)
+						if project != "standalone"
+							|| res.impl_span.is_none_or(|span| span.start < crate::prelude::SPAN_BASE)
+				)
+			}) {
 			return Some(RuntimeDispatch::OntoClass {
 				method: res.method.clone(),
 			});
 		}
 		let span = res.impl_span?;
-		if self.prelude_modules.is_empty() {
-			return None;
-		}
 		// This slice's extension: an INLINE method declared directly inside a
 		// prelude `enum` body (`Option`'s own `is_some`, `is_none`, `map`, …)
 		// resolves through `resolve_inherent` with `impl_span` = the method's
@@ -2437,7 +2504,24 @@ impl<'a> Lowerer<'a> {
 		// silent-wrong-JS failure mode this compiler never accepts. A named
 		// struct receiver must keep panicking exactly as before this slice
 		// (pinned by `inherent_prelude_struct_receiver_still_stays_a_loud_defer`).
-		for module in self.prelude_modules {
+		for module in self
+			.prelude_modules
+			.iter()
+			.filter(|module| {
+				res.implementation.as_ref().is_none_or(|implementation| {
+					implementation.module.project == "standalone" || module.path == implementation.module.path
+				})
+			})
+			.chain(
+				res
+					.implementation
+					.as_ref()
+					.is_none_or(|implementation| {
+						implementation.module.project == "standalone"
+							|| implementation.module.path == self.module.path
+					})
+					.then_some(self.module),
+			) {
 			for decl in &module.members {
 				if let Declaration::Enum {
 					name: enum_name,
@@ -2500,7 +2584,11 @@ impl<'a> Lowerer<'a> {
 		// operator (`Range::contains`'s `this.start <= item`, ALSO reached through its
 		// interface span since `contains` is abstract in `RangeBounds`), neither of which
 		// is lowerable — those keep the loud defer below.
-		for module in self.prelude_modules {
+		for module in self
+			.prelude_modules
+			.iter()
+			.chain(std::iter::once(self.module))
+		{
 			for decl in &module.members {
 				if let Declaration::Struct { name, impls, .. } = decl
 					&& impls.iter().any(|si| {
@@ -2521,7 +2609,25 @@ impl<'a> Lowerer<'a> {
 				}
 			}
 		}
-		for module in self.prelude_modules {
+		// Restrict relative-span matching to the module selected by semantic identity.
+		for module in self
+			.prelude_modules
+			.iter()
+			.filter(|module| {
+				res.implementation.as_ref().is_none_or(|implementation| {
+					implementation.module.project == "standalone" || module.path == implementation.module.path
+				})
+			})
+			.chain(
+				res
+					.implementation
+					.as_ref()
+					.is_none_or(|implementation| {
+						implementation.module.project == "standalone"
+							|| implementation.module.path == self.module.path
+					})
+					.then_some(self.module),
+			) {
 			for decl in &module.members {
 				match decl {
 					Declaration::ImplFor {
@@ -2532,8 +2638,34 @@ impl<'a> Lowerer<'a> {
 						members,
 						..
 					} => {
-						if for_interface.0.1 != span {
+						let span_matches = if res
+							.implementation
+							.as_ref()
+							.is_some_and(|implementation| implementation.module.project == "standalone")
+						{
+							for_interface.0.1 == span
+						} else {
+							crate::prelude::same_source_span(for_interface.0.1, span)
+						};
+						if !span_matches {
 							continue;
+						}
+						let blanket = matches!(&type_.0, Type::Reference { name, .. }
+							if generics.iter().any(|generic| generic.0.name.0 == name.0));
+						// Concrete project implementations are emitted as class
+						// methods and must win over canonical blanket dispatch.
+						if !blanket
+							&& res.implementation.as_ref().is_some_and(|implementation| {
+								matches!(
+									&implementation.module.origin,
+									crate::ModuleOrigin::Project(project)
+										if project != "standalone"
+											|| span.start < crate::prelude::SPAN_BASE
+								)
+							}) {
+							return Some(RuntimeDispatch::OntoClass {
+								method: res.method.clone(),
+							});
 						}
 						// Found the exact impl the checker resolved through —
 						// definitive either way (a `Span` is a unique source
@@ -2577,6 +2709,26 @@ impl<'a> Lowerer<'a> {
 						if self.body_calls_unlinked_external(body) {
 							return None;
 						}
+						if blanket {
+							let implementation = res
+								.implementation
+								.as_ref()
+								.expect("blanket dispatch has stable implementation identity");
+							let mut hasher = DefaultHasher::new();
+							implementation.hash(&mut hasher);
+							let tag = format!("blanket{:x}", hasher.finish());
+							return Some(self.finish_runtime_impl_lowering(
+								&iface_name.0,
+								&tag,
+								members,
+								generics.as_slice(),
+								owner_generics,
+								meta,
+								body,
+								&res.method,
+								Some(self.implementation_owner(implementation)),
+							));
+						}
 						if let Some(tag) = inherent_self_type_tag(&type_.0, *mutable) {
 							return Some(self.finish_runtime_impl_lowering(
 								&iface_name.0,
@@ -2587,6 +2739,7 @@ impl<'a> Lowerer<'a> {
 								meta,
 								body,
 								&res.method,
+								None,
 							));
 						}
 						// Not a primitive target — this slice's extension: a
@@ -2679,6 +2832,7 @@ impl<'a> Lowerer<'a> {
 									mangled: mangled.clone(),
 									canonical_owner: owner,
 									owner_generics: generics.as_slice(),
+									implementation_hidden: 0,
 									meta,
 									body,
 									// D1: an inherent method's own name span IS its
@@ -2770,6 +2924,7 @@ impl<'a> Lowerer<'a> {
 				meta,
 				body,
 				&res.method,
+				None,
 			));
 		}
 		None
@@ -2850,9 +3005,10 @@ impl<'a> Lowerer<'a> {
 		meta: &'a FuncDeclaration,
 		body: &'a Expr,
 		method: &EcoString,
+		canonical_owner: Option<RuntimeOwner>,
 	) -> RuntimeDispatch {
 		let mangled: EcoString = format!("$std${iface_name}${tag}${method}").into();
-		let canonical_owner = self.interface_owner(iface_name);
+		let canonical_owner = canonical_owner.unwrap_or_else(|| self.interface_owner(iface_name));
 		if !self.register_runtime_func(&mangled, &canonical_owner, meta) {
 			return RuntimeDispatch::TopLevel(mangled);
 		}
@@ -2863,6 +3019,7 @@ impl<'a> Lowerer<'a> {
 				mangled: mangled.clone(),
 				canonical_owner,
 				owner_generics,
+				implementation_hidden: impl_generics.len(),
 				meta,
 				body,
 				sibling_frame: Some(RuntimeSiblingFrame {
@@ -3652,13 +3809,7 @@ impl<'a> Lowerer<'a> {
 						Some(RuntimeDispatch::TopLevel(mangled)) => {
 							let mut call_args = vec![self.lower_expr(parent)];
 							call_args.extend(args.iter().map(|a| self.lower_expr(&a.0.value)));
-							self.append_hidden_call_arguments(
-								expr.id,
-								HirExpr::Call {
-									callee: Box::new(HirExpr::Local(mangled)),
-									args: call_args,
-								},
-							)
+							self.lower_selected_top_level_call(expr.id, res, mangled, call_args)
 						}
 						Some(RuntimeDispatch::OntoClass { .. }) => self.append_hidden_call_arguments(
 							expr.id,
@@ -3743,10 +3894,52 @@ impl<'a> Lowerer<'a> {
 						variant: res.variant.clone(),
 						prototype: self.construction_prototype(expr.id),
 					},
-					None => HirExpr::Field {
-						recv: Box::new(self.lower_expr(parent)),
-						name: member.0.clone(),
-					},
+					None => {
+						if let Some(res) = self.annotations.resolution_of(expr.id)
+							&& matches!(
+								res.dispatch,
+								DispatchKind::UserImpl | DispatchKind::UserImplDefaultMethod
+							) && let Some(RuntimeDispatch::TopLevel(mangled)) =
+							self.try_lower_runtime_dispatch(res, Self::is_this_receiver(parent))
+						{
+							let params = match self
+								.annotations
+								.get(expr.id)
+								.map(|info| self.interner.kind(info.ty))
+							{
+								Some(TyKind::Fn { params, .. }) => (0..params.len())
+									.map(|index| EcoString::from(format!("$arg${index}")))
+									.collect::<Vec<_>>(),
+								_ => Vec::new(),
+							};
+							let receiver = EcoString::from("$receiver");
+							let mut args = vec![HirExpr::Local(receiver.clone())];
+							args.extend(params.iter().cloned().map(HirExpr::Local));
+							self.append_implementation_arguments(res, &mut args);
+							let body = self.append_hidden_call_arguments(
+								expr.id,
+								HirExpr::Call {
+									callee: Box::new(HirExpr::Local(mangled)),
+									args,
+								},
+							);
+							HirExpr::Call {
+								callee: Box::new(HirExpr::Closure {
+									params: vec![receiver],
+									body: Box::new(HirExpr::Closure {
+										params,
+										body: Box::new(body),
+									}),
+								}),
+								args: vec![self.lower_expr(parent)],
+							}
+						} else {
+							HirExpr::Field {
+								recv: Box::new(self.lower_expr(parent)),
+								name: member.0.clone(),
+							}
+						}
+					}
 				}
 			}
 			ExprKind::Tuple(items) => self.with_construction_prototype(expr.id, self.lower_tuple(items)),
@@ -3816,13 +4009,9 @@ impl<'a> Lowerer<'a> {
 				Some(res) if res.dispatch == DispatchKind::BuiltinEager => {
 					self.lower_scalar_cast(expr.id, lhs)
 				}
-				Some(res) if res.dispatch == DispatchKind::UserImpl => HirExpr::Call {
-					callee: Box::new(HirExpr::Field {
-						recv: Box::new(self.lower_expr(lhs)),
-						name: res.method.clone(),
-					}),
-					args: vec![],
-				},
+				Some(res) if res.dispatch == DispatchKind::UserImpl => {
+					self.lower_attached_selected_call(expr.id, res, self.lower_expr(lhs), vec![])
+				}
 				Some(res)
 					if res.dispatch == DispatchKind::UserImplDefaultMethod
 						&& self.lowering_onto_runtime_owner.get() > 0
@@ -3848,10 +4037,9 @@ impl<'a> Lowerer<'a> {
 				// operator/method-call sites, or stay loud if it can't be.
 				Some(res) if res.dispatch == DispatchKind::UserImplDefaultMethod => {
 					match self.try_lower_runtime_dispatch(res, Self::is_this_receiver(lhs)) {
-						Some(RuntimeDispatch::TopLevel(mangled)) => HirExpr::Call {
-							callee: Box::new(HirExpr::Local(mangled)),
-							args: vec![self.lower_expr(lhs)],
-						},
+						Some(RuntimeDispatch::TopLevel(mangled)) => {
+							self.lower_selected_top_level_call(expr.id, res, mangled, vec![self.lower_expr(lhs)])
+						}
 						Some(RuntimeDispatch::OntoClass { method, .. }) => HirExpr::Call {
 							callee: Box::new(HirExpr::Field {
 								recv: Box::new(self.lower_expr(lhs)),
@@ -4325,6 +4513,106 @@ impl<'a> Lowerer<'a> {
 		call
 	}
 
+	fn append_implementation_arguments(&self, res: &Resolution, arguments: &mut Vec<HirExpr>) {
+		if let Some(crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
+			implementation_arguments,
+			..
+		}) = &res.resolved_target
+		{
+			arguments.extend(
+				implementation_arguments
+					.iter()
+					.map(|type_| self.runtime_type_object(*type_)),
+			);
+			if implementation_arguments.is_empty()
+				&& let Some(frame) = self.lowering_runtime_sibling.borrow().last()
+			{
+				arguments.extend(
+					(0..frame.impl_generics.len())
+						.map(|index| HirExpr::Local(format!("$type${index}").into())),
+				);
+			}
+		}
+	}
+
+	fn lower_selected_top_level_call(
+		&self,
+		id: NodeId,
+		res: &Resolution,
+		mangled: EcoString,
+		mut arguments: Vec<HirExpr>,
+	) -> HirExpr {
+		self.append_implementation_arguments(res, &mut arguments);
+		let method_arguments = match &res.resolved_target {
+			Some(crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
+				method_arguments,
+				..
+			}) => method_arguments.as_slice(),
+			_ => &[],
+		};
+		if method_arguments.is_empty() {
+			if let Some(hidden) = self
+				.annotations
+				.generic_call_arguments()
+				.find_map(|(call_id, arguments)| (call_id == id).then_some(arguments))
+			{
+				arguments.extend(hidden.iter().map(|type_| self.runtime_type_object(*type_)));
+			}
+		} else {
+			arguments.extend(
+				method_arguments
+					.iter()
+					.map(|type_| self.runtime_type_object(*type_)),
+			);
+		}
+		HirExpr::Call {
+			callee: Box::new(HirExpr::Local(mangled)),
+			args: arguments,
+		}
+	}
+
+	fn lower_attached_selected_call(
+		&self,
+		id: NodeId,
+		res: &Resolution,
+		receiver: HirExpr,
+		arguments: Vec<HirExpr>,
+	) -> HirExpr {
+		let mut arguments = arguments;
+		let method_arguments = match &res.resolved_target {
+			Some(crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
+				method_arguments,
+				..
+			}) => method_arguments.as_slice(),
+			_ => &[],
+		};
+		if !method_arguments.is_empty() {
+			arguments.extend(
+				method_arguments
+					.iter()
+					.map(|type_| self.runtime_type_object(*type_)),
+			);
+			HirExpr::Call {
+				callee: Box::new(HirExpr::Field {
+					recv: Box::new(receiver),
+					name: res.method.clone(),
+				}),
+				args: arguments,
+			}
+		} else {
+			self.append_hidden_call_arguments(
+				id,
+				HirExpr::Call {
+					callee: Box::new(HirExpr::Field {
+						recv: Box::new(receiver),
+						name: res.method.clone(),
+					}),
+					args: arguments,
+				},
+			)
+		}
+	}
+
 	fn generic_callable_adapter(&self, id: NodeId, callee: HirExpr) -> HirExpr {
 		let Some(hidden) = self
 			.annotations
@@ -4384,13 +4672,12 @@ impl<'a> Lowerer<'a> {
 				index: Box::new(self.lower_expr(index)),
 			},
 			_ => match self.annotations.resolution_of(id) {
-				Some(res) if res.dispatch == DispatchKind::UserImpl => HirExpr::Call {
-					callee: Box::new(HirExpr::Field {
-						recv: Box::new(self.lower_expr(parent)),
-						name: res.method.clone(),
-					}),
-					args: vec![self.lower_expr(index)],
-				},
+				Some(res) if res.dispatch == DispatchKind::UserImpl => self.lower_attached_selected_call(
+					id,
+					res,
+					self.lower_expr(parent),
+					vec![self.lower_expr(index)],
+				),
 				Some(res)
 					if res.dispatch == DispatchKind::UserImplDefaultMethod
 						&& self.lowering_onto_runtime_owner.get() > 0
@@ -4420,10 +4707,12 @@ impl<'a> Lowerer<'a> {
 				}
 				Some(res) if res.dispatch == DispatchKind::UserImplDefaultMethod => {
 					match self.try_lower_runtime_dispatch(res, Self::is_this_receiver(parent)) {
-						Some(RuntimeDispatch::TopLevel(mangled)) => HirExpr::Call {
-							callee: Box::new(HirExpr::Local(mangled)),
-							args: vec![self.lower_expr(parent), self.lower_expr(index)],
-						},
+						Some(RuntimeDispatch::TopLevel(mangled)) => self.lower_selected_top_level_call(
+							id,
+							res,
+							mangled,
+							vec![self.lower_expr(parent), self.lower_expr(index)],
+						),
 						Some(RuntimeDispatch::OntoClass { method, .. }) => HirExpr::Call {
 							callee: Box::new(HirExpr::Field {
 								recv: Box::new(self.lower_expr(parent)),
@@ -4554,7 +4843,7 @@ impl<'a> Lowerer<'a> {
 		};
 		let it_value = Self::direct_it_value_for(IterMode::ViaIter, source);
 		self.push_scope();
-		let mut stmts = self.drain_loop_stmts(target, option.clone(), it_value, |s| {
+		let mut stmts = self.drain_loop_stmts(target, option.clone(), it_value, None, None, |s| {
 			let pat = s.lower_pattern(variable);
 			let body = s.lower_loop_body(source_id, target, body);
 			(pat, body)
@@ -4619,11 +4908,18 @@ impl<'a> Lowerer<'a> {
 		// loop-continues flag (plus, via `drain_loop_stmts`, the loop pattern's
 		// own nested scope).
 		self.push_scope();
-		let mut stmts = self.drain_loop_stmts(target, option.clone(), it_value, |s| {
-			let pat = s.lower_pattern(variable);
-			let body = s.lower_loop_body(source_id, target, body);
-			(pat, body)
-		});
+		let mut stmts = self.drain_loop_stmts(
+			target,
+			option.clone(),
+			it_value,
+			Some(iterable.id),
+			self.annotations.iteration_next_resolution_of(iterable.id),
+			|s| {
+				let pat = s.lower_pattern(variable);
+				let body = s.lower_loop_body(source_id, target, body);
+				(pat, body)
+			},
+		);
 		self.pop_scope();
 
 		let tail = option.map(|_| {
@@ -4648,10 +4944,7 @@ impl<'a> Lowerer<'a> {
 					&& let Some(RuntimeDispatch::TopLevel(mangled)) =
 						self.try_lower_runtime_dispatch(resolution, false)
 				{
-					HirExpr::Call {
-						callee: Box::new(HirExpr::Local(mangled)),
-						args: vec![src],
-					}
+					self.lower_selected_top_level_call(iterable.id, resolution, mangled, vec![src])
 				} else {
 					Self::direct_it_value_for(mode, src)
 				}
@@ -4702,6 +4995,8 @@ impl<'a> Lowerer<'a> {
 		target: nymph_hir::hir::LoopTarget,
 		option: Option<nymph_hir::hir::HirOptionAbi>,
 		it_value: HirExpr,
+		source_id: Option<NodeId>,
+		next_resolution: Option<&Resolution>,
 		build_some: impl FnOnce(&Self) -> (HirPat, HirExpr),
 	) -> Vec<HirStmt> {
 		let it_name = self.declare(&EcoString::from("$it"));
@@ -4714,12 +5009,21 @@ impl<'a> Lowerer<'a> {
 		let (pat, body) = build_some(self);
 		self.pop_scope();
 
-		let next_call = HirExpr::Call {
-			callee: Box::new(HirExpr::Field {
-				recv: Box::new(HirExpr::Local(it_name.clone())),
-				name: "next".into(),
-			}),
-			args: vec![],
+		let receiver = HirExpr::Local(it_name.clone());
+		let next_call = if let (Some(id), Some(resolution)) = (source_id, next_resolution)
+			&& resolution.dispatch == DispatchKind::UserImplDefaultMethod
+			&& let Some(RuntimeDispatch::TopLevel(mangled)) =
+				self.try_lower_runtime_dispatch(resolution, false)
+		{
+			self.lower_selected_top_level_call(id, resolution, mangled, vec![receiver])
+		} else {
+			HirExpr::Call {
+				callee: Box::new(HirExpr::Field {
+					recv: Box::new(receiver),
+					name: "next".into(),
+				}),
+				args: vec![],
+			}
 		};
 		let match_expr = HirExpr::Match {
 			scrutinee: Box::new(next_call),
@@ -4797,7 +5101,7 @@ impl<'a> Lowerer<'a> {
 	/// feeds its own drain. Returns a `Block`; `emit_expr`'s existing
 	/// subexpression-position `Block` arm wraps it in an IIFE, so no new emit
 	/// code is needed for the drain itself.
-	fn drain_to_array(&self, it_value: HirExpr) -> HirExpr {
+	fn drain_to_array(&self, source: &Expr, it_value: HirExpr) -> HirExpr {
 		self.push_scope();
 		let acc_name = self.declare(&EcoString::from("$acc"));
 		let mut stmts = vec![HirStmt::Let {
@@ -4808,8 +5112,13 @@ impl<'a> Lowerer<'a> {
 				items: vec![],
 			},
 		}];
-		stmts.extend(
-			self.drain_loop_stmts(self.next_loop_target(), None, it_value, |s| {
+		stmts.extend(self.drain_loop_stmts(
+			self.next_loop_target(),
+			None,
+			it_value,
+			Some(source.id),
+			self.annotations.iteration_next_resolution_of(source.id),
+			|s| {
 				let x_name = s.declare(&EcoString::from("$x"));
 				let push_call = HirExpr::Call {
 					callee: Box::new(HirExpr::Field {
@@ -4825,8 +5134,8 @@ impl<'a> Lowerer<'a> {
 					},
 					push_call,
 				)
-			}),
-		);
+			},
+		));
 		self.pop_scope();
 		HirExpr::Block {
 			stmts,
@@ -4865,7 +5174,7 @@ impl<'a> Lowerer<'a> {
 		});
 		let src = self.lower_expr(e);
 		let it_value = self.it_value_for(mode, e, src);
-		self.drain_to_array(it_value)
+		self.drain_to_array(e, it_value)
 	}
 
 	/// Peel through zero or more `ExprKind::Grouped` wrapper layers (i.e.
@@ -5067,13 +5376,12 @@ impl<'a> Lowerer<'a> {
 				let lhs_name = self.declare(&EcoString::from("$member"));
 				let lhs_value = self.lower_expr(lhs);
 				let mut operation = match self.annotations.resolution_of(id) {
-					Some(res) if res.dispatch == DispatchKind::UserImpl => HirExpr::Call {
-						callee: Box::new(HirExpr::Field {
-							recv: Box::new(self.lower_expr(rhs)),
-							name: res.method.clone(),
-						}),
-						args: vec![self.lower_expr(lhs)],
-					},
+					Some(res) if res.dispatch == DispatchKind::UserImpl => self.lower_attached_selected_call(
+						id,
+						res,
+						self.lower_expr(rhs),
+						vec![self.lower_expr(lhs)],
+					),
 					Some(res)
 						if res.dispatch == DispatchKind::UserImplDefaultMethod
 							&& self.lowering_onto_runtime_owner.get() > 0
@@ -5090,10 +5398,12 @@ impl<'a> Lowerer<'a> {
 					}
 					Some(res) if res.dispatch == DispatchKind::UserImplDefaultMethod => {
 						match self.try_lower_runtime_dispatch(res, Self::is_this_receiver(rhs)) {
-							Some(RuntimeDispatch::TopLevel(mangled)) => HirExpr::Call {
-								callee: Box::new(HirExpr::Local(mangled)),
-								args: vec![self.lower_expr(rhs), self.lower_expr(lhs)],
-							},
+							Some(RuntimeDispatch::TopLevel(mangled)) => self.lower_selected_top_level_call(
+								id,
+								res,
+								mangled,
+								vec![self.lower_expr(rhs), self.lower_expr(lhs)],
+							),
 							Some(RuntimeDispatch::OntoClass { method, .. }) => HirExpr::Call {
 								callee: Box::new(HirExpr::Field {
 									recv: Box::new(self.lower_expr(rhs)),
@@ -5139,13 +5449,12 @@ impl<'a> Lowerer<'a> {
 			// produces for `UserImpl`, just with no native `BinOp` to fall back to.
 			BinaryOperator::Unwrap => {
 				return match self.annotations.resolution_of(id) {
-					Some(res) if res.dispatch == DispatchKind::UserImpl => HirExpr::Call {
-						callee: Box::new(HirExpr::Field {
-							recv: Box::new(self.lower_expr(lhs)),
-							name: res.method.clone(),
-						}),
-						args: vec![self.lower_expr(rhs)],
-					},
+					Some(res) if res.dispatch == DispatchKind::UserImpl => self.lower_attached_selected_call(
+						id,
+						res,
+						self.lower_expr(lhs),
+						vec![self.lower_expr(rhs)],
+					),
 					Some(res)
 						if res.dispatch == DispatchKind::UserImplDefaultMethod
 							&& self.lowering_onto_runtime_owner.get() > 0
@@ -5162,10 +5471,12 @@ impl<'a> Lowerer<'a> {
 					}
 					Some(res) if res.dispatch == DispatchKind::UserImplDefaultMethod => {
 						match self.try_lower_runtime_dispatch(res, Self::is_this_receiver(lhs)) {
-							Some(RuntimeDispatch::TopLevel(mangled)) => HirExpr::Call {
-								callee: Box::new(HirExpr::Local(mangled)),
-								args: vec![self.lower_expr(lhs), self.lower_expr(rhs)],
-							},
+							Some(RuntimeDispatch::TopLevel(mangled)) => self.lower_selected_top_level_call(
+								id,
+								res,
+								mangled,
+								vec![self.lower_expr(lhs), self.lower_expr(rhs)],
+							),
 							Some(RuntimeDispatch::OntoClass { method, .. }) => HirExpr::Call {
 								callee: Box::new(HirExpr::Field {
 									recv: Box::new(self.lower_expr(lhs)),
@@ -5233,13 +5544,9 @@ impl<'a> Lowerer<'a> {
 					rhs: Box::new(self.lower_expr(rhs)),
 				}
 			}
-			Some(res) if res.dispatch == DispatchKind::UserImpl => HirExpr::Call {
-				callee: Box::new(HirExpr::Field {
-					recv: Box::new(self.lower_expr(lhs)),
-					name: res.method.clone(),
-				}),
-				args: vec![self.lower_expr(rhs)],
-			},
+			Some(res) if res.dispatch == DispatchKind::UserImpl => {
+				self.lower_attached_selected_call(id, res, self.lower_expr(lhs), vec![self.lower_expr(rhs)])
+			}
 			Some(res)
 				if res.dispatch == DispatchKind::UserImplDefaultMethod
 					&& self.lowering_onto_runtime_owner.get() > 0
@@ -5287,10 +5594,12 @@ impl<'a> Lowerer<'a> {
 			// `try_lower_runtime_dispatch`'s doc comment.
 			Some(res) if res.dispatch == DispatchKind::UserImplDefaultMethod => {
 				match self.try_lower_runtime_dispatch(res, Self::is_this_receiver(lhs)) {
-					Some(RuntimeDispatch::TopLevel(mangled)) => HirExpr::Call {
-						callee: Box::new(HirExpr::Local(mangled)),
-						args: vec![self.lower_expr(lhs), self.lower_expr(rhs)],
-					},
+					Some(RuntimeDispatch::TopLevel(mangled)) => self.lower_selected_top_level_call(
+						id,
+						res,
+						mangled,
+						vec![self.lower_expr(lhs), self.lower_expr(rhs)],
+					),
 					Some(RuntimeDispatch::OntoClass { method, .. }) => HirExpr::Call {
 						callee: Box::new(HirExpr::Field {
 							recv: Box::new(self.lower_expr(lhs)),
@@ -5342,13 +5651,9 @@ impl<'a> Lowerer<'a> {
 				result: self.builtin_result(id, value.id),
 				operand: Box::new(self.lower_expr(value)),
 			},
-			Some(res) if res.dispatch == DispatchKind::UserImpl => HirExpr::Call {
-				callee: Box::new(HirExpr::Field {
-					recv: Box::new(self.lower_expr(value)),
-					name: res.method.clone(),
-				}),
-				args: vec![],
-			},
+			Some(res) if res.dispatch == DispatchKind::UserImpl => {
+				self.lower_attached_selected_call(id, res, self.lower_expr(value), vec![])
+			}
 			Some(res)
 				if res.dispatch == DispatchKind::UserImplDefaultMethod
 					&& self.lowering_onto_runtime_owner.get() > 0
@@ -5371,10 +5676,9 @@ impl<'a> Lowerer<'a> {
 			// `try_lower_runtime_dispatch`'s doc comment.
 			Some(res) if res.dispatch == DispatchKind::UserImplDefaultMethod => {
 				match self.try_lower_runtime_dispatch(res, Self::is_this_receiver(value)) {
-					Some(RuntimeDispatch::TopLevel(mangled)) => HirExpr::Call {
-						callee: Box::new(HirExpr::Local(mangled)),
-						args: vec![self.lower_expr(value)],
-					},
+					Some(RuntimeDispatch::TopLevel(mangled)) => {
+						self.lower_selected_top_level_call(id, res, mangled, vec![self.lower_expr(value)])
+					}
 					Some(RuntimeDispatch::OntoClass { method, .. }) => HirExpr::Call {
 						callee: Box::new(HirExpr::Field {
 							recv: Box::new(self.lower_expr(value)),
@@ -5444,8 +5748,12 @@ impl<'a> Lowerer<'a> {
 
 	fn replace_dispatch_argument(expr: &mut HirExpr, argument: HirExpr) {
 		match expr {
-			HirExpr::Call { args, .. } | HirExpr::ExternCall { args, .. } => {
-				*args.last_mut().expect("binary dispatch has an argument") = argument;
+			HirExpr::Call { callee, args } => {
+				let index = usize::from(!matches!(callee.as_ref(), HirExpr::Field { .. }));
+				args[index] = argument;
+			}
+			HirExpr::ExternCall { args, .. } => {
+				args[1] = argument;
 			}
 			HirExpr::BoundDispatch {
 				argument: found, ..

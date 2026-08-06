@@ -4856,24 +4856,184 @@ func answer(): void = {
 }
 
 #[test]
-fn receiverless_dispatch_does_not_partially_emit_blanket_implementations() {
+fn receiverless_dispatch_demands_one_canonical_blanket_implementation() {
 	let source = r#"
 interface Seed { func seed(): int }
 impl Seed for int { func seed(): int = 1 }
 
+impl<T> Seed for T { func seed(): int = 2 }
 struct Box<T>(value: T)
-impl<T> Seed for Box<T> { func seed(): int = 2 }
 
-func direct<T: Seed>(marker: T): int = T.seed()
-func answer(): int = direct(Box(value = 0))
+func answer(): int = 0.seed() + Box(value = 0).seed()
 "#;
-	let diagnostics = nymph_compiler::compile(source, "test")
-		.expect_err("blanket receiverless body emission belongs to #15");
+	let js = nymph_compiler::compile(source, "test").expect("blanket implementation lowers");
 	assert!(
-		diagnostics.iter().any(|diagnostic| diagnostic
-			.message
-			.contains("generic implementation emission owned by #15")),
-		"{diagnostics:?}"
+		js.contains("function $m0$impl$i1$seed($self, $type$0)"),
+		"blanket member must be one canonical top-level function: {js}"
+	);
+	assert!(
+		!js.contains(
+			"class {\n\tconstructor(fields) {\n\t\tObject.assign(this, fields);\n\t}\n\tseed()"
+		)
+	);
+	assert_eq!(run(source, "answer()"), "3");
+}
+
+#[test]
+fn blanket_iterator_next_is_used_by_direct_via_iter_for_and_spread_drains() {
+	let prelude = r#"
+enum Option<T> { Some(value: T), None }
+interface Iterator<Item> { mut func next(): Option<Item> }
+interface Iterable<Item> { func iter(): Iterator<Item> }
+
+impl<T> Iterator<int> for T { mut func next(): Option<int> = Option.None }
+"#;
+	let source = r#"
+struct First
+struct Second
+struct Values
+impl Iterable<int> for Values { func iter(): Second = Second() }
+struct Concrete
+impl Iterator<int> for Concrete { mut func next(): Option<int> = Option.None }
+
+func answer(): #[int] = {
+  let mut direct = First()
+  for (value in direct) { value }
+  let mut via = Values()
+  for (value in via) { value }
+  let mut spread = Second()
+  let direct_values = #[...spread]
+  let mut via_spread = Values()
+  let via_values = #[...via_spread]
+  let mut concrete = Concrete()
+  for (value in concrete) { value }
+  via_values
+}
+"#;
+	let js = compile_with_prelude(source, prelude);
+	assert_eq!(
+		js.matches("function $std$Iterator$blanket").count(),
+		1,
+		"two iterator types must share one canonical blanket body: {js}"
+	);
+	assert!(
+		js.matches("$std$Iterator$blanket").count() >= 5,
+		"direct, via-iter, and spread drains must call the selected blanket body: {js}"
+	);
+	assert!(
+		js.contains("$it.next()"),
+		"an ordinary concrete Iterator.next must retain prototype dispatch: {js}"
+	);
+	assert_eq!(run_with_prelude(source, prelude, "answer()"), "[]");
+}
+
+#[test]
+fn blanket_body_forwards_implementation_arguments_before_nested_generic_arguments() {
+	let source = r#"
+interface Seed { func seed(): int }
+impl Seed for int { func seed(): int = 1 }
+impl Seed for string { func seed(): int = 10 }
+impl Seed for boolean { func seed(): int = 100 }
+
+interface Probe { func probe(): int }
+func combine<T: Seed, U: Seed>(left: T, right: U): int = T.seed() + U.seed()
+impl<T: Seed> Probe for T {
+  func probe(): int = combine(this, true)
+}
+
+func answer(): int = "".probe()
+"#;
+	let js = nymph_compiler::compile(source, "test").expect("generic implementation lowers");
+	assert!(
+		js.contains("combine($self, new NBool(true), $type$0, NBool.prototype)"),
+		"nested call must carry its source arguments before implementation and nested generic runtime objects: {js}"
+	);
+	assert_eq!(run(source, "answer()"), "110");
+}
+
+#[test]
+fn blanket_membership_preserves_source_argument_and_hidden_slot_order() {
+	let source = r#"
+interface Seed { func seed(): int }
+impl Seed for int { func seed(): int = 7 }
+interface Contains<Item> { func contains(item: Item): boolean }
+impl<T: Seed> Contains<string> for T {
+  func contains(item: string): boolean = T.seed() == 7
+}
+func answer(): boolean = "" in 7
+"#;
+	let js = nymph_compiler::compile(source, "test").expect("blanket membership lowers");
+	assert!(
+		js.contains("$member, NInt.prototype)"),
+		"membership source argument must precede the preserved implementation hidden slot: {js}"
+	);
+	assert_eq!(run(source, "answer()"), "true");
+}
+
+#[test]
+fn blanket_materialized_default_forwards_implementation_arguments_to_override() {
+	let source = r#"
+interface Seed { func seed(): int }
+impl Seed for int { func seed(): int = 1 }
+
+interface Probe {
+  func target(): int
+  func probe(): int = this.target()
+}
+impl<T: Seed> Probe for T {
+  func target(): int = T.seed()
+}
+
+func answer(): int = 0.probe()
+"#;
+	assert_eq!(run(source, "answer()"), "1");
+}
+
+#[test]
+fn first_class_blanket_method_preserves_source_before_hidden_abi() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl<T> Seed for T { func seed(value: int): int = value }
+
+func answer(): int = {
+  let seed = 0.seed
+  seed(7)
+}
+"#;
+	let js = nymph_compiler::compile(source, "test").expect("blanket method value lowers");
+	assert!(
+		js.contains("return $m0$impl$i0$seed($receiver, $arg0, NInt.prototype);"),
+		"method-value adapter must preserve receiver, source, hidden ABI order: {js}"
+	);
+	assert_eq!(run(source, "answer()"), "7");
+}
+
+#[test]
+fn first_class_generic_blanket_methods_capture_method_hidden_arguments() {
+	let source = r#"
+interface Seed { func seed(value: int): int }
+impl Seed for string { func seed(value: int): int = value + 40 }
+
+interface Apply {
+  func apply<T: Seed>(marker: T, value: int): int = T.seed(value)
+}
+impl<U> Apply for U {}
+
+func stored(): int = {
+  let apply = 0.apply
+  apply("", 1)
+}
+func grouped(): int = (0.apply)("", 2)
+func immediate(): int = 0.apply("", 3)
+"#;
+	let js = nymph_compiler::compile(source, "test").expect("generic blanket method values lower");
+	assert!(
+		js.contains("$m0$impl$i1$apply($receiver, $arg0, $arg1, NInt.prototype, NString.prototype)"),
+		"method hidden object must follow receiver, source, and implementation slots: {js}"
+	);
+	assert_eq!(
+		run(source, "stored().v + grouped().v + immediate().v"),
+		"126"
 	);
 }
 

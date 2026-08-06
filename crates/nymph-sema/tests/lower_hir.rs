@@ -2798,6 +2798,151 @@ fn compatibility_lowering_captures_hidden_arguments_for_generic_callable_values(
 }
 
 #[test]
+fn compatibility_blanket_method_is_one_canonical_function_with_explicit_hidden_abi() {
+	let hir = lower(
+		"interface Seed { func seed(value: int): int }
+		 impl<T> Seed for T { func seed(value: int): int = 7 }
+		 func from_int(): int = 0.seed(1)
+		 func from_string(): int = \"\".seed(1)",
+	);
+	let blanket = hir
+		.funcs
+		.iter()
+		.filter(|function| {
+			function.name.starts_with("$std$Seed$blanket") && function.name.ends_with("$seed")
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(blanket.len(), 1, "blanket body must be emitted once");
+	assert_eq!(blanket[0].params, ["$self", "value", "$type$0"]);
+	for caller in ["from_int", "from_string"] {
+		let body = &hir
+			.funcs
+			.iter()
+			.find(|function| function.name == caller)
+			.unwrap()
+			.body;
+		assert!(matches!(body, HirExpr::Call { args, .. } if args.len() == 3));
+	}
+	assert!(
+		hir
+			.classes
+			.iter()
+			.all(|class| class.methods.iter().all(|method| method.name != "seed"))
+	);
+}
+
+#[test]
+fn compatibility_blanket_method_value_adapts_the_canonical_function_abi() {
+	let hir = lower(
+		"interface Seed { func seed(value: int): int }
+		 impl<T> Seed for T { func seed(value: int): int = value }
+		 func apply(): int = { let seed = 0.seed seed(7) }",
+	);
+	let apply = hir
+		.funcs
+		.iter()
+		.find(|function| function.name == "apply")
+		.unwrap();
+	let HirExpr::Block { stmts, .. } = &apply.body else {
+		panic!("apply body")
+	};
+	let HirStmt::Let { value, .. } = &stmts[0] else {
+		panic!("method value binding")
+	};
+	assert!(matches!(
+		value,
+		HirExpr::Call { callee, args }
+			if args.len() == 1
+				&& matches!(&**callee, HirExpr::Closure { params, body }
+					if params == &["$receiver"]
+						&& matches!(&**body, HirExpr::Closure { params, body }
+							if params == &["$arg$0"]
+								&& matches!(&**body, HirExpr::Call { callee, args }
+									if args == &[
+										HirExpr::Local("$receiver".into()),
+										HirExpr::Local("$arg$0".into()),
+										HirExpr::RuntimeTypeObject {
+											binding: "NInt".into(),
+											box_runtime: true,
+											is_enum: false,
+											arguments: vec![],
+										},
+									]
+										&& matches!(&**callee, HirExpr::Local(function)
+											if function.starts_with("$std$Seed$blanket")))))
+	));
+}
+
+#[test]
+fn compatibility_blanket_operator_uses_the_canonical_selected_call_abi() {
+	let hir = lower(
+		"interface Plus<Other, Output> { func plus(other: Other): Output }
+		 impl<T> Plus<int, int> for T { func plus(other: int): int = other }
+		 struct Box
+		 func answer(): int = Box() + 7",
+	);
+	let answer = hir
+		.funcs
+		.iter()
+		.find(|function| function.name == "answer")
+		.unwrap();
+	assert!(matches!(
+		&answer.body,
+		HirExpr::Call { callee, args }
+			if matches!(callee.as_ref(), HirExpr::Local(name)
+				if name.starts_with("$std$Plus$blanket") && name.ends_with("$plus"))
+				&& matches!(args.as_slice(), [_, HirExpr::Num(7.0, NumKind::Int), HirExpr::RuntimeTypeObject { binding, .. }]
+					if binding == "Box")
+	));
+}
+
+#[test]
+fn compatibility_blanket_lookup_uses_the_selected_module_before_relative_span() {
+	fn selected_body(prelude_sources: [&str; 3]) -> HirExpr {
+		let preludes = prelude_sources
+			.into_iter()
+			.enumerate()
+			.map(|(index, source)| parse_module(source, format!("prelude-{index}")))
+			.collect::<Vec<_>>();
+		assert!(preludes.iter().all(|parsed| parsed.diagnostics.is_empty()));
+		let modules = preludes
+			.iter()
+			.map(|parsed| parsed.tree.clone())
+			.collect::<Vec<_>>();
+		let user = parse_module(
+			"struct Box\nimpl MarkerA for Box {}\nfunc answer(): int = Box().pick()",
+			"test",
+		);
+		let checked = check_module_with_prelude(&user.tree, &modules);
+		assert!(
+			checked.diags.is_empty(),
+			"check failed: {:?}",
+			checked.diags
+		);
+		let hir = lower_hir_with_prelude(&user.tree, &modules, &checked);
+		hir
+			.funcs
+			.into_iter()
+			.find(|function| function.name.ends_with("$pick"))
+			.expect("selected blanket body")
+			.body
+	}
+
+	let declarations =
+		"interface Shared { func pick(): int }\ninterface MarkerA {}\ninterface MarkerB {}";
+	let selected = "impl<T: MarkerA> Shared for T { func pick(): int = 1 }";
+	let colliding = "impl<T: MarkerB> Shared for T { func pick(): int = 2 }";
+	assert_eq!(
+		selected_body([declarations, selected, colliding]),
+		HirExpr::Num(1.0, NumKind::Int)
+	);
+	assert_eq!(
+		selected_body([declarations, colliding, selected]),
+		HirExpr::Num(1.0, NumKind::Int)
+	);
+}
+
+#[test]
 fn namespaced_call_through_a_struct_owned_generic_lowers_hidden_type_object() {
 	// Confirmed defect (code review, Slice 4J): `push_generics` used to track
 	// only the CURRENT func/method's OWN generics, never the OWNING struct/

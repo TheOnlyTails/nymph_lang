@@ -93,6 +93,11 @@ func biggest<T: Area>(a: T, b: T): int = {
 }
 ```
 
+Calls through generic bounds use the implementation selected for the concrete argument type. This
+includes blanket implementations; an implementation written for that concrete type still wins when
+both apply. Receivers and explicit arguments are evaluated once, from left to right, before any
+compiler-managed generic information is used.
+
 ## Higher-order functions
 
 A function value's type is written `(Params) -> Return` — see [Types](./types#compound-types).

@@ -1738,6 +1738,30 @@ fn lower_body(
 	} else {
 		false
 	};
+	let blanket_implementation_shape = if shellless_implementation {
+		let crate::RuntimePlacement::Attached { owner, .. } = &artifact.placement else {
+			unreachable!()
+		};
+		let request = StableShapeRequest::Implementation(owner.clone());
+		let StableShapeFact::Implementation(implementation) = context.stable_shape(&request)? else {
+			return Err(StableShapeLookupError::WrongFact { request }.into());
+		};
+		matches!(implementation.self_type, InterfaceType::Generic(_)).then_some(implementation)
+	} else {
+		None
+	};
+	let blanket_implementation = blanket_implementation_shape.is_some();
+	let implementation_type_parameters = blanket_implementation_shape
+		.as_ref()
+		.map(|implementation| {
+			implementation
+				.binders
+				.iter()
+				.map(|binder| binder.id.clone())
+				.collect::<Vec<_>>()
+		})
+		.unwrap_or_default();
+	let implementation_hidden = implementation_type_parameters.len();
 	let exact_parameterized_implementation = if let (
 		Some(InterfaceType::Named {
 			positional, named, ..
@@ -1775,23 +1799,33 @@ fn lower_body(
 					| crate::MemberKind::MutableValue
 			)
 		)) || (exact_parameterized_implementation && instance_member);
-	let type_parameters = body
-		.type_parameters
-		.iter()
-		.filter(|parameter| {
-			(!instance_member || parameter.binder.scope == crate::BinderScope::Member)
-				&& !type_substitutions
-					.iter()
-					.any(|(candidate, _)| candidate == *parameter)
-		})
-		.cloned()
-		.collect::<Vec<_>>();
+	let mut type_parameters = implementation_type_parameters.clone();
+	type_parameters.extend(
+		body
+			.type_parameters
+			.iter()
+			.filter(|parameter| {
+				(!instance_member
+					|| blanket_implementation
+					|| parameter.binder.scope == crate::BinderScope::Member)
+					&& !type_substitutions
+						.iter()
+						.any(|(candidate, _)| candidate == *parameter)
+			})
+			.cloned()
+			.filter(|parameter| !type_parameters.contains(parameter))
+			.collect::<Vec<_>>(),
+	);
 	let lowerer = StableBodyLowerer {
 		context,
 		artifact,
 		annotations: &body.annotations,
 		type_parameters: &type_parameters,
+		// Annotation slot indexes are defined against the checked body's own
+		// binder order. Keep that identity map unchanged; `type_parameters`
+		// above separately defines the canonical runtime ABI order.
 		all_type_parameters: &body.type_parameters,
+		implementation_hidden,
 		instance_member,
 		type_substitutions,
 		scopes: RefCell::new(vec![HashMap::new()]),
@@ -2003,6 +2037,7 @@ struct StableBodyLowerer<'a, C> {
 	annotations: &'a crate::RuntimeAnnotations,
 	type_parameters: &'a [crate::GenericParameterId],
 	all_type_parameters: &'a [crate::GenericParameterId],
+	implementation_hidden: usize,
 	instance_member: bool,
 	type_substitutions: &'a [(crate::GenericParameterId, InterfaceType)],
 	scopes: RefCell<Vec<HashMap<EcoString, EcoString>>>,
@@ -2843,13 +2878,20 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						.iter()
 						.find(|(id, _)| *id == self.id(expr))
 				{
-					let mut lowered = self.lower_dispatch(
+					let lowered = self.lower_dispatch(
 						dispatch,
 						parent,
 						args.iter().map(|arg| &arg.value).collect(),
 					)?;
-					lowered = self.append_hidden_arguments(self.id(expr), lowered)?;
-					return Ok(lowered);
+					return if matches!(
+						dispatch,
+						crate::StableDispatch::SelectedImplementation { .. }
+							| crate::StableDispatch::InterfaceDefault { .. }
+					) {
+						Ok(lowered)
+					} else {
+						self.append_hidden_arguments(self.id(expr), lowered)
+					};
 				}
 				if let Some((_, parameter, interface, member_definition)) = self
 					.annotations
@@ -3319,8 +3361,12 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 	}
 	fn replace_dispatch_argument(expr: &mut HirExpr, argument: HirExpr) {
 		match expr {
-			HirExpr::Call { args, .. } | HirExpr::ExternCall { args, .. } => {
-				*args.last_mut().expect("binary dispatch has an argument") = argument;
+			HirExpr::Call { callee, args } => {
+				let index = usize::from(!matches!(callee.as_ref(), HirExpr::Field { .. }));
+				args[index] = argument;
+			}
+			HirExpr::ExternCall { args, .. } => {
+				args[1] = argument;
 			}
 			HirExpr::BoundDispatch {
 				argument: found, ..
@@ -3414,6 +3460,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				member,
 				implementation,
 				materialization,
+				..
 			} => {
 				let request = StableShapeRequest::Implementation(implementation.clone());
 				let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
@@ -3440,6 +3487,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				member,
 				implementation,
 				materialization,
+				..
 			} => {
 				let request = StableShapeRequest::Implementation(implementation.clone());
 				let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
@@ -3623,6 +3671,23 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.map(|arg| self.lower(arg))
 					.collect::<Result<Vec<_>, _>>()?,
 			);
+			self.append_selected_call_arguments(
+				dispatch,
+				&member,
+				Some(self.id(receiver)),
+				true,
+				&mut args,
+			)?;
+			if matches!(dispatch, crate::StableDispatch::GenericBound { .. }) {
+				args.extend(
+					self
+						.type_parameters
+						.iter()
+						.take(self.implementation_hidden)
+						.enumerate()
+						.map(|(index, _)| HirExpr::Local(format!("$type${index}").into())),
+				);
+			}
 			return Ok(HirExpr::Call {
 				callee: Box::new(HirExpr::Local(
 					self.context.binding_name(&member)?.as_str().into(),
@@ -3631,15 +3696,23 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			});
 		}
 		let name: EcoString = self.context.member_name(&member)?.as_str().into();
+		let mut args = arguments
+			.into_iter()
+			.map(|arg| self.lower(arg))
+			.collect::<Result<Vec<_>, _>>()?;
+		self.append_selected_call_arguments(
+			dispatch,
+			&member,
+			Some(self.id(receiver)),
+			false,
+			&mut args,
+		)?;
 		Ok(HirExpr::Call {
 			callee: Box::new(HirExpr::Field {
 				recv: Box::new(self.lower(receiver)?),
 				name,
 			}),
-			args: arguments
-				.into_iter()
-				.map(|arg| self.lower(arg))
-				.collect::<Result<_, _>>()?,
+			args,
 		})
 	}
 
@@ -3721,6 +3794,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				member,
 				implementation,
 				materialization,
+				..
 			} => {
 				let request = StableShapeRequest::Implementation(implementation.clone());
 				let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
@@ -3741,6 +3815,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				member,
 				implementation,
 				materialization,
+				..
 			} => {
 				let request = StableShapeRequest::Implementation(implementation.clone());
 				let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
@@ -3863,6 +3938,13 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		{
 			let mut args = vec![receiver_value];
 			args.extend(arguments);
+			self.append_selected_call_arguments(
+				dispatch,
+				&member,
+				Some(self.id(expr)),
+				true,
+				&mut args,
+			)?;
 			HirExpr::Call {
 				callee: Box::new(HirExpr::Local(
 					self.context.binding_name(&member)?.as_str().into(),
@@ -3870,6 +3952,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				args,
 			}
 		} else {
+			let mut arguments = arguments;
+			self.append_selected_call_arguments(
+				dispatch,
+				&member,
+				Some(self.id(expr)),
+				false,
+				&mut arguments,
+			)?;
 			HirExpr::Call {
 				callee: Box::new(HirExpr::Field {
 					recv: Box::new(receiver_value),
@@ -3877,6 +3967,15 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				}),
 				args: arguments,
 			}
+		};
+		let body = if matches!(
+			dispatch,
+			crate::StableDispatch::SelectedImplementation { .. }
+				| crate::StableDispatch::InterfaceDefault { .. }
+		) {
+			body
+		} else {
+			self.append_hidden_arguments(self.id(expr), body)?
 		};
 		Ok(HirExpr::Call {
 			callee: Box::new(HirExpr::Closure {
@@ -3888,6 +3987,70 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			}),
 			args: vec![self.lower(receiver)?],
 		})
+	}
+
+	fn append_selected_call_arguments(
+		&self,
+		dispatch: &crate::StableDispatch,
+		member: &DefinitionId,
+		node: Option<crate::BodyNodeId>,
+		include_implementation: bool,
+		args: &mut Vec<HirExpr>,
+	) -> Result<(), StableLoweringError> {
+		let (implementation_arguments, method_arguments) = match dispatch {
+			crate::StableDispatch::SelectedImplementation {
+				implementation_arguments,
+				method_arguments,
+				..
+			}
+			| crate::StableDispatch::InterfaceDefault {
+				implementation_arguments,
+				method_arguments,
+				..
+			} => (implementation_arguments.as_ref(), method_arguments.as_ref()),
+			_ => return Ok(()),
+		};
+		let required = self.required_receiverless_slots(member)?;
+		let selected_implementation_arguments = if include_implementation {
+			implementation_arguments
+		} else {
+			&[]
+		};
+		if selected_implementation_arguments
+			.iter()
+			.enumerate()
+			.any(|(index, argument)| {
+				required.contains(&index) && matches!(argument, crate::runtime::RuntimeTypeArgument::Erased)
+			}) {
+			return Err(StableLoweringError::Unsupported {
+				definition: self.artifact.definition.clone(),
+				node,
+				feature: "erased implementation type argument required by receiverless dispatch".into(),
+			});
+		}
+		if method_arguments
+			.iter()
+			.enumerate()
+			.any(|(index, argument)| {
+				required.contains(&index) && matches!(argument, crate::runtime::RuntimeTypeArgument::Erased)
+			}) {
+			return Err(StableLoweringError::Unsupported {
+				definition: self.artifact.definition.clone(),
+				node,
+				feature: "erased runtime type argument required by receiverless dispatch".into(),
+			});
+		}
+		args.extend(
+			selected_implementation_arguments
+				.iter()
+				.chain(method_arguments)
+				.map(|argument| match argument {
+					crate::runtime::RuntimeTypeArgument::Canonical(type_) => self.runtime_type_object(type_),
+					crate::runtime::RuntimeTypeArgument::Erased => Ok(HirExpr::Undefined),
+				})
+				.collect::<Result<Vec<_>, _>>()?,
+		);
+		Ok(())
 	}
 
 	fn lower_generic_bound(
@@ -4158,17 +4321,20 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						channel: "spread iteration".into(),
 					})?;
 				let source = self.lower(value)?;
-				let (it, next, option) = match iteration {
+				let (it, next, next_dispatch, option) = match iteration {
 					crate::RuntimeIteration::Direct {
 						iterator_interface,
 						next,
+						next_dispatch,
 						option,
 					} => {
-						self.record_unresolved_call(UnresolvedRuntimeCall::IteratorNext {
-							interface: iterator_interface.clone(),
-							member: next.clone(),
-						});
-						(source, next, option)
+						if next_dispatch.is_none() {
+							self.record_unresolved_call(UnresolvedRuntimeCall::IteratorNext {
+								interface: iterator_interface.clone(),
+								member: next.clone(),
+							});
+						}
+						(source, next, next_dispatch, option)
 					}
 					crate::RuntimeIteration::ViaIter {
 						iter,
@@ -4176,22 +4342,45 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						iter_interface_member,
 						iterator_interface,
 						next,
+						next_dispatch,
 						option,
 					} => {
-						self.demand_concrete_iteration_next(
-							iter,
-							iterable_interface,
-							iter_interface_member,
-							iterator_interface,
+						let next_is_shellless = next_dispatch
+							.as_ref()
+							.map(|dispatch| self.iteration_dispatch_is_shellless(dispatch))
+							.transpose()?
+							.unwrap_or(false);
+						if !next_is_shellless {
+							self.demand_concrete_iteration_next(
+								iter,
+								iterable_interface,
+								iter_interface_member,
+								iterator_interface,
+								next,
+							)?;
+						}
+						(
+							self.lower_dispatch_value(iter, source)?,
 							next,
-						)?;
-						(self.lower_dispatch_value(iter, source)?, next, option)
+							next_dispatch,
+							option,
+						)
 					}
 				};
-				let next = self.context.member_name(next)?.as_str().into();
+				let next_call = if let Some(dispatch) = next_dispatch {
+					self.lower_iteration_next(dispatch, next, HirExpr::Local("$it".into()))?
+				} else {
+					HirExpr::Call {
+						callee: Box::new(HirExpr::Field {
+							recv: Box::new(HirExpr::Local("$it".into())),
+							name: self.context.member_name(next)?.as_str().into(),
+						}),
+						args: vec![],
+					}
+				};
 				Ok(drain_spread(
 					it,
-					next,
+					next_call,
 					self.context.binding_name(&option.option)?.as_str().into(),
 					self.context.member_name(&option.some)?.as_str().into(),
 					self
@@ -4663,28 +4852,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		else {
 			return Err(StableShapeLookupError::WrongFact { request }.into());
 		};
-		let mut skipped_matching_slot = false;
-		let mut demanded_exact_slot = false;
 		for implementation in implementations {
-			// #15 owns blanket/generic implementation body emission. #14 only
-			// installs exact concrete implementation members on canonical objects.
-			if !implementation.binders.is_empty()
-				|| matches!(implementation.self_type, InterfaceType::Generic(_))
-			{
-				skipped_matching_slot |= implementation.member_slots.target(member).is_some();
-				continue;
-			}
 			if let Some(slot) = implementation.member_slots.target(member) {
 				self.demand_direct(&slot.member_id);
-				demanded_exact_slot = true;
 			}
-		}
-		if skipped_matching_slot && !demanded_exact_slot {
-			return Err(StableLoweringError::Unsupported {
-				definition: self.artifact.definition.clone(),
-				node: None,
-				feature: "receiverless dispatch is reachable only through a generic implementation whose emission belongs to #15".into(),
-			});
 		}
 		Ok(())
 	}
@@ -4709,14 +4880,15 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			self.demand_direct(&slot.member_id);
 			return Ok(());
 		}
-		if implementations.iter().any(|implementation| {
-			!implementation.binders.is_empty() && implementation.member_slots.target(member).is_some()
-		}) {
-			return Err(StableLoweringError::Unsupported {
-				definition: self.artifact.definition.clone(),
-				node: None,
-				feature: "receiverless dispatch for this concrete type requires generic implementation emission owned by #15".into(),
-			});
+		if let Some(slot) = implementations
+			.iter()
+			.filter(|implementation| {
+				!implementation.binders.is_empty()
+					|| matches!(implementation.self_type, InterfaceType::Generic(_))
+			})
+			.find_map(|implementation| implementation.member_slots.target(member))
+		{
+			self.demand_direct(&slot.member_id);
 		}
 		Ok(())
 	}
@@ -5212,13 +5384,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				node: self.id(iterable),
 				channel: "iteration".into(),
 			})?;
-		let (it, next, option) = match iteration {
+		let (it, next, next_dispatch, option) = match iteration {
 			crate::RuntimeIteration::Direct {
 				iterator_interface,
 				next,
+				next_dispatch,
 				option,
 			} => {
-				if !native_range {
+				if !native_range && next_dispatch.is_none() {
 					self.record_unresolved_call(UnresolvedRuntimeCall::IteratorNext {
 						interface: iterator_interface.clone(),
 						member: next.clone(),
@@ -5235,7 +5408,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				} else {
 					source
 				};
-				(source, next, option)
+				(source, next, next_dispatch, option)
 			}
 			crate::RuntimeIteration::ViaIter {
 				iter,
@@ -5243,16 +5416,24 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				iter_interface_member,
 				iterator_interface,
 				next,
+				next_dispatch,
 				option,
 				..
 			} => {
-				self.demand_concrete_iteration_next(
-					iter,
-					iterable_interface,
-					iter_interface_member,
-					iterator_interface,
-					next,
-				)?;
+				let next_is_shellless = next_dispatch
+					.as_ref()
+					.map(|dispatch| self.iteration_dispatch_is_shellless(dispatch))
+					.transpose()?
+					.unwrap_or(false);
+				if !next_is_shellless {
+					self.demand_concrete_iteration_next(
+						iter,
+						iterable_interface,
+						iter_interface_member,
+						iterator_interface,
+						next,
+					)?;
+				}
 				let lowered = if matches!(peel_mut(&self.ty(iterable)?), InterfaceType::List(_)) {
 					let request = StableShapeRequest::ImplementationsForInterface(iterable_interface.clone());
 					let StableShapeFact::Implementations(implementations) =
@@ -5298,18 +5479,17 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						slot.source,
 						materialization,
 					)?;
-					self.demand_external(member)?;
-					let _ = self.record_call(member)?;
 					HirExpr::Call {
-						callee: Box::new(HirExpr::Local(
-							self.context.binding_name(member)?.as_str().into(),
-						)),
-						args: vec![source],
+						callee: Box::new(HirExpr::Field {
+							recv: Box::new(source),
+							name: "iter".into(),
+						}),
+						args: vec![],
 					}
 				} else {
 					self.lower_dispatch_value(iter, source)?
 				};
-				(lowered, next, option)
+				(lowered, next, next_dispatch, option)
 			}
 		};
 		self.scopes.borrow_mut().push(HashMap::new());
@@ -5319,12 +5499,16 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		let target = self.next_loop();
 		let body = self.lower_loop_branch(source_id, target, body)?;
 		self.scopes.borrow_mut().pop();
-		let call = HirExpr::Call {
-			callee: Box::new(HirExpr::Field {
-				recv: Box::new(HirExpr::Local(it_name.clone())),
-				name: self.context.member_name(next)?.as_str().into(),
-			}),
-			args: vec![],
+		let call = if let Some(dispatch) = next_dispatch {
+			self.lower_iteration_next(dispatch, next, HirExpr::Local(it_name.clone()))?
+		} else {
+			HirExpr::Call {
+				callee: Box::new(HirExpr::Field {
+					recv: Box::new(HirExpr::Local(it_name.clone())),
+					name: self.context.member_name(next)?.as_str().into(),
+				}),
+				args: vec![],
+			}
 		};
 		let option_name: EcoString = self.context.binding_name(&option.option)?.as_str().into();
 		let some_name: EcoString = self.context.member_name(&option.some)?.as_str().into();
@@ -5717,11 +5901,13 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			_ => false,
 		};
 		if shellless {
+			let mut args = vec![receiver];
+			self.append_selected_call_arguments(dispatch, target, None, true, &mut args)?;
 			return Ok(HirExpr::Call {
 				callee: Box::new(HirExpr::Local(
 					self.context.binding_name(target)?.as_str().into(),
 				)),
-				args: vec![receiver],
+				args,
 			});
 		}
 		Ok(HirExpr::Call {
@@ -5731,6 +5917,57 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			}),
 			args: vec![],
 		})
+	}
+
+	fn iteration_dispatch_is_shellless(
+		&self,
+		dispatch: &crate::StableDispatch,
+	) -> Result<bool, StableLoweringError> {
+		let (member, implementation) = match dispatch {
+			crate::StableDispatch::Direct {
+				member,
+				implementation,
+				..
+			}
+			| crate::StableDispatch::SelectedImplementation {
+				member,
+				implementation,
+				..
+			}
+			| crate::StableDispatch::InterfaceDefault {
+				member,
+				implementation,
+				..
+			} => (member, implementation),
+			_ => return Ok(false),
+		};
+		let request = StableShapeRequest::Implementation(implementation.clone());
+		let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
+			return Err(StableShapeLookupError::WrongFact { request }.into());
+		};
+		let target = exact_implementation_slot(&shape, member)
+			.map(|slot| &slot.member_id)
+			.unwrap_or(member);
+		shellless_implementation_member(self.context, target, implementation)
+	}
+
+	fn lower_iteration_next(
+		&self,
+		dispatch: &crate::StableDispatch,
+		member: &DefinitionId,
+		receiver: HirExpr,
+	) -> Result<HirExpr, StableLoweringError> {
+		if self.iteration_dispatch_is_shellless(dispatch)? {
+			self.lower_dispatch_value(dispatch, receiver)
+		} else {
+			Ok(HirExpr::Call {
+				callee: Box::new(HirExpr::Field {
+					recv: Box::new(receiver),
+					name: self.context.member_name(member)?.as_str().into(),
+				}),
+				args: vec![],
+			})
+		}
 	}
 	fn lower_block(
 		&self,
@@ -5830,7 +6067,7 @@ fn assign_binop(op: AssignOperator) -> Option<BinaryOperator> {
 
 fn drain_spread(
 	iterator: HirExpr,
-	next: EcoString,
+	next_call: HirExpr,
 	option: EcoString,
 	some_name: EcoString,
 	value_name: EcoString,
@@ -5840,13 +6077,6 @@ fn drain_spread(
 	let it: EcoString = "$it".into();
 	let go: EcoString = "$go".into();
 	let value: EcoString = "$x".into();
-	let next_call = HirExpr::Call {
-		callee: Box::new(HirExpr::Field {
-			recv: Box::new(HirExpr::Local(it.clone())),
-			name: next,
-		}),
-		args: vec![],
-	};
 	let some = HirArm {
 		pat: HirPat::Variant {
 			enum_name: option.clone(),

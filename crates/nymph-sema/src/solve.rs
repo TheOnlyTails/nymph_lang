@@ -1168,7 +1168,7 @@ impl Checker<'_> {
 	/// Commit a chosen impl for real: unify the receiver, then check each argument
 	/// against the method's parameter (emitting mismatches). Returns the method's
 	/// return type.
-	fn commit_method(
+	pub(crate) fn commit_method(
 		&mut self,
 		idx: usize,
 		recv: Ty,
@@ -1193,8 +1193,16 @@ impl Checker<'_> {
 			.and_then(|member| def.member_catalog.target(member))
 			.cloned();
 		let target = slot.as_ref().map(|slot| slot.member_id.clone());
+		let implementation_arguments = (0..def.generics.len())
+			.map(|index| self.shallow_resolve(subst[&ParamIdx(index as u32)]))
+			.collect::<Vec<_>>();
 		let resolved_target = interface.zip(slot).map(|(interface, slot)| {
-			crate::annotate::ResolvedMethodTarget::InterfaceImplementation { interface, slot }
+			crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
+				interface,
+				slot,
+				implementation_arguments: implementation_arguments.clone(),
+				method_arguments: Vec::new(),
+			}
 		});
 
 		let Some((params, ret, source, type_arguments)) =
@@ -1245,6 +1253,14 @@ impl Checker<'_> {
 					span,
 				);
 			}
+		}
+		let mut resolved_target = resolved_target;
+		if let Some(crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
+			method_arguments,
+			..
+		}) = &mut resolved_target
+		{
+			*method_arguments = type_arguments.clone();
 		}
 		MethodResolution {
 			ty: ret,

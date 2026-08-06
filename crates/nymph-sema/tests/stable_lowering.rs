@@ -1200,14 +1200,21 @@ fn generic_blanket_body_and_dispatch_use_the_exact_module_binding() {
 	let lowered = lower_runtime_definition(&context, Arc::new(artifact.clone())).unwrap();
 	assert_eq!(lowered.definition(), &wrapper);
 	assert!(lowered.demands().contains(&target));
-	assert!(matches!(
-		lowered.fragment(),
-		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
-			if function.params == ["$self"]
-				&& matches!(&function.body, nymph_hir::hir::HirExpr::Call { callee, args }
-					if args.len() == 1
-						&& matches!(&**callee, nymph_hir::hir::HirExpr::Local(name) if name == "target"))
-	));
+	assert!(
+		matches!(
+			lowered.fragment(),
+			nymph_sema::LoweredHirFragment::TopLevelFunction(function)
+				if function.params == ["$self", "$type$0"]
+					&& matches!(&function.body, nymph_hir::hir::HirExpr::Call { callee, args }
+						if args == &[
+							nymph_hir::hir::HirExpr::Local("$self".into()),
+							nymph_hir::hir::HirExpr::Local("$type$0".into()),
+						]
+							&& matches!(&**callee, nymph_hir::hir::HirExpr::Local(name) if name == "target"))
+		),
+		"{:?}",
+		lowered.fragment()
+	);
 	assert_eq!(
 		lowered.placement(),
 		&nymph_sema::RuntimeAssemblyPlacement::Module(wrapper.module.clone())
@@ -1219,13 +1226,18 @@ fn generic_blanket_body_and_dispatch_use_the_exact_module_binding() {
 		.expect("blanket dispatch consumer");
 	let lowered = lower_runtime_definition(&context, Arc::new(read)).unwrap();
 	assert!(lowered.demands().contains(&wrapper));
-	assert!(matches!(
-		lowered.fragment(),
-		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
-			if matches!(&function.body, nymph_hir::hir::HirExpr::Call { callee, args }
-				if args.len() == 1
-					&& matches!(&**callee, nymph_hir::hir::HirExpr::Local(name) if name == "wrapper"))
-	));
+	assert!(
+		matches!(
+			lowered.fragment(),
+			nymph_sema::LoweredHirFragment::TopLevelFunction(function)
+				if matches!(&function.body, nymph_hir::hir::HirExpr::Call { callee, args }
+					if args.len() == 2
+						&& matches!(&args[1], nymph_hir::hir::HirExpr::RuntimeTypeObject { binding, .. } if binding == "NInt")
+						&& matches!(&**callee, nymph_hir::hir::HirExpr::Local(name) if name == "wrapper"))
+		),
+		"{:?}",
+		lowered.fragment()
+	);
 }
 
 #[test]
@@ -1245,7 +1257,7 @@ fn generic_interface_extension_body_keeps_exact_identity_and_skips_absent_dispat
 	assert!(matches!(
 		lowered.fragment(),
 		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
-			if function.params == ["$self", "other"]
+			if function.params == ["$self", "other", "$type$0"]
 	));
 	assert_eq!(
 		lowered.placement(),
@@ -1295,7 +1307,7 @@ fn generic_blanket_materialized_default_uses_the_exact_module_binding() {
 	assert!(matches!(
 		lowered.fragment(),
 		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
-			if function.params == ["$self"]
+			if function.params == ["$self", "$type$0"]
 	));
 	assert_eq!(
 		lowered.placement(),
