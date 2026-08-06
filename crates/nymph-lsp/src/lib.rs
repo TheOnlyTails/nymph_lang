@@ -492,6 +492,83 @@ mod tests {
 	}
 
 	#[test]
+	fn wire_project_diagnostics_resolve_transitive_std_without_provider_uri_publication() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='wire-stdlib'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let main_path = temp.path().join("src/main.nym");
+		let helper_path = temp.path().join("src/helper.nym");
+		let source = "import @/helper with (leaf)\nfunc use(): int = leaf()";
+		let helper = "import std/collections/tree with (Tree)\npublic func leaf(): int = match (Tree.Leaf(value = 1)) { Tree.Leaf(value) -> value, Tree.Node(...) -> 0 }";
+		std::fs::write(&main_path, source).unwrap();
+		std::fs::write(&helper_path, helper).unwrap();
+		let uri = workspace::path_to_uri(&main_path).unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		handshake(&client);
+
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidOpenTextDocument::METHOD.into(),
+				serde_json::to_value(DidOpenTextDocumentParams {
+					text_document: TextDocumentItem {
+						uri: uri.clone(),
+						language_id: "nymph".into(),
+						version: 1,
+						text: source.into(),
+					},
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		// A request/response round trip is an ordering barrier: any fabricated
+		// provider publication from didOpen would have arrived before this response.
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(20),
+				HoverRequest::METHOD.into(),
+				serde_json::to_value(HoverParams {
+					text_document_position_params: TextDocumentPositionParams {
+						text_document: TextDocumentIdentifier { uri: uri.clone() },
+						position: Position {
+							line: 1,
+							character: 5,
+						},
+					},
+					work_done_progress_params: WorkDoneProgressParams::default(),
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		let mut diagnostic_uris = Vec::new();
+		loop {
+			match client.receiver.recv().unwrap() {
+				Message::Response(response) => {
+					assert_eq!(response.id, RequestId::from(20));
+					break;
+				}
+				Message::Notification(notification)
+					if notification.method == lsp_types::notification::PublishDiagnostics::METHOD =>
+				{
+					let params: PublishDiagnosticsParams =
+						serde_json::from_value(notification.params).unwrap();
+					assert!(params.diagnostics.is_empty());
+					diagnostic_uris.push(params.uri);
+				}
+				other => panic!("expected diagnostics or hover response, got {other:?}"),
+			}
+		}
+		assert_eq!(diagnostic_uris, [uri]);
+		shutdown(&client, handle);
+	}
+
+	#[test]
 	fn closing_dirty_dependency_republishes_open_importer_after_restore_and_delete() {
 		let temp = tempfile::tempdir().unwrap();
 		std::fs::write(

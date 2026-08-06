@@ -1,10 +1,9 @@
 //! Re-check a document and republish its diagnostics.
 //!
-//! Loose mode (Task 2): no `nymph.toml` project is found for the document's
-//! file, so it's checked standalone via [`nymph_compiler::check`] — full
-//! parse + check diagnostics (errors and warnings), no `main` required.
-//! Project mode (Task 3) is layered in on top for documents that do sit
-//! inside a discovered project.
+//! Both loose and project documents are checked through the shared,
+//! long-lived [`nymph_compiler::CompilerSession`] owned by [`CompilerState`].
+//! Project sessions include the compiler-owned embedded standard-library
+//! modules; only project modules with real workspace sources are published.
 
 use std::sync::{Arc, Mutex};
 
@@ -23,11 +22,11 @@ use crate::{compiler_state::CompilerState, document_store::DocumentStore, line_i
 /// `didClose`).
 ///
 /// If `uri` sits inside a discovered `nymph.toml` project (see
-/// [`workspace::detect`]), the WHOLE project graph reachable from `uri`'s
-/// own module (it plus its transitive `import` closure — see
-/// [`nymph_compiler::check_project_library`]'s doc comment on that limit) is
-/// checked, and every touched module's diagnostics are republished against
-/// its own file. Otherwise `uri` is checked standalone (loose mode).
+/// [`workspace::detect`]), the whole project graph reachable from `uri`'s
+/// own module is checked in library mode, including transitive embedded-std
+/// dependencies. Every touched project module's diagnostics are republished
+/// against its own file; compiler-owned modules have no workspace URI and
+/// are not publication targets. Otherwise `uri` is checked in loose mode.
 pub fn check_and_publish_state(
 	connection: &Connection,
 	docs: &Arc<Mutex<DocumentStore>>,
@@ -488,6 +487,162 @@ mod tests {
 		assert!(
 			!params.diagnostics.is_empty(),
 			"expected the live buffer's type error to be reported, got zero diagnostics"
+		);
+	}
+
+	fn project_fixture(
+		main: &str,
+		files: &[(&str, &str)],
+	) -> (TempDir, Uri, Arc<Mutex<DocumentStore>>) {
+		let tmp = TempDir::new();
+		std::fs::write(
+			tmp.0.join("nymph.toml"),
+			"[package]\nname = \"stdlib-diagnostics\"\nversion = \"0.1.0\"\n",
+		)
+		.unwrap();
+		std::fs::create_dir_all(tmp.0.join("src")).unwrap();
+		let main_path = tmp.0.join("src/main.nym");
+		std::fs::write(&main_path, main).unwrap();
+		for (module, source) in files {
+			let path = tmp.0.join("src").join(format!("{module}.nym"));
+			std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+			std::fs::write(path, source).unwrap();
+		}
+		let main_uri = crate::workspace::path_to_uri(&main_path).unwrap();
+		let docs = open_doc(&main_uri, main);
+		(tmp, main_uri, docs)
+	}
+
+	fn published(client: &Connection) -> Vec<PublishDiagnosticsParams> {
+		client
+			.receiver
+			.try_iter()
+			.map(|message| {
+				let Message::Notification(notification) = message else {
+					panic!("expected a diagnostics notification")
+				};
+				serde_json::from_value(notification.params).unwrap()
+			})
+			.collect()
+	}
+
+	#[test]
+	fn project_diagnostics_resolve_available_and_transitive_embedded_std_without_synthetic_uris() {
+		// Cover every compiler-owned importable std module directly, then reach a
+		// nested provider path again through a transitive project import. None of
+		// these std modules exists under this project's src root.
+		let main = "import std/io as embedded_io\nimport std/collections/set as embedded_set\nimport std/collections/linked_list as embedded_linked_list\nimport std/collections/tree as embedded_tree\nimport std/math/complex as embedded_complex\nimport @/helper with (leaf)\nfunc use(): int = leaf()\n";
+		let (_tmp, main_uri, docs) = project_fixture(
+			main,
+			&[(
+				"helper",
+				"import std/collections/tree with (Tree)\npublic func leaf(): int = match (Tree.Leaf(value = 1)) { Tree.Leaf(value) -> value, Tree.Node(...) -> 0 }\n",
+			)],
+		);
+		let (server, client) = Connection::memory();
+
+		check_and_publish(&server, &docs, &main_uri).unwrap();
+
+		let notifications = published(&client);
+		assert_eq!(
+			notifications.len(),
+			1,
+			"provider-only modules were published"
+		);
+		assert_eq!(notifications[0].uri, main_uri);
+		assert!(
+			notifications
+				.iter()
+				.all(|params| params.diagnostics.is_empty()),
+			"available embedded std import diagnosed: {:?}",
+			notifications
+		);
+	}
+
+	#[test]
+	fn missing_embedded_std_is_diagnosed_on_the_importing_project_module() {
+		let main = "import std/definitely_missing\nfunc helper(): int = 1\n";
+		let (_tmp, main_uri, docs) = project_fixture(main, &[]);
+		let (server, client) = Connection::memory();
+
+		check_and_publish(&server, &docs, &main_uri).unwrap();
+
+		let notifications = published(&client);
+		assert_eq!(notifications.len(), 1);
+		assert_eq!(notifications[0].uri, main_uri);
+		assert!(notifications[0].diagnostics.iter().any(|diagnostic| {
+			diagnostic.code == Some(NumberOrString::String("IMPORT-UNRESOLVED".into()))
+		}));
+	}
+
+	#[test]
+	fn semantic_errors_with_std_imports_are_published_on_the_project_source() {
+		let main = "import std/collections/tree with (Tree)\nimport @/broken with (broken)\nfunc helper(): Tree<int> = Tree.Leaf(value = broken())\n";
+		let (_tmp, main_uri, docs) =
+			project_fixture(main, &[("broken", "public func broken(): int = true\n")]);
+		let broken_uri = main_uri
+			.as_str()
+			.replace("main.nym", "broken.nym")
+			.parse::<Uri>()
+			.unwrap();
+		let (server, client) = Connection::memory();
+
+		check_and_publish(&server, &docs, &main_uri).unwrap();
+
+		let notifications = published(&client);
+		assert_eq!(notifications.len(), 2);
+		let broken = notifications
+			.iter()
+			.find(|params| params.uri == broken_uri)
+			.expect("semantic error must be attributed to broken.nym");
+		assert!(broken.diagnostics.iter().any(|diagnostic| {
+			diagnostic.severity == Some(DiagnosticSeverity::ERROR)
+				&& diagnostic.code != Some(NumberOrString::String("IMPORT-UNRESOLVED".into()))
+		}));
+		assert!(
+			notifications
+				.iter()
+				.find(|params| params.uri == main_uri)
+				.unwrap()
+				.diagnostics
+				.is_empty()
+		);
+	}
+
+	#[test]
+	fn project_overlay_wins_for_colliding_project_path_without_shadowing_embedded_std() {
+		let main = "import std/collections/tree with (Tree)\nimport @/std/collections/tree as project_tree\nfunc helper(): Tree<int> = Tree.Leaf(value = project_tree.project_value())\n";
+		let (_tmp, main_uri, docs) = project_fixture(
+			main,
+			&[(
+				"std/collections/tree",
+				"public func project_value(): int = true\n",
+			)],
+		);
+		let project_uri = main_uri
+			.as_str()
+			.replace("main.nym", "std/collections/tree.nym")
+			.parse::<Uri>()
+			.unwrap();
+		let mut state = CompilerState::new();
+		state
+			.open(&mut docs.lock().unwrap(), main_uri.clone(), main.into(), 1)
+			.unwrap();
+		state
+			.open(
+				&mut docs.lock().unwrap(),
+				project_uri,
+				"public func project_value(): int = 1\n".into(),
+				1,
+			)
+			.unwrap();
+
+		let diagnostics = state
+			.diagnostics_for_uri(&docs.lock().unwrap(), &main_uri)
+			.unwrap();
+		assert!(
+			diagnostics.is_empty(),
+			"project overlay and embedded std should resolve in separate domains: {diagnostics:?}"
 		);
 	}
 }
