@@ -201,6 +201,19 @@ fn ambient_math_abs_sqrt_and_power_run_with_no_import() {
 }
 
 #[test]
+fn power_compound_assignment_evaluates_an_index_target_once() {
+	let src = r#"
+		func probe(): int = {
+			let mut calls = 0
+			let mut values: mut #[int] = #[2]
+			values[{ calls += 1 0 }] **= 2u
+			calls * 10 + values[0]
+		}
+	"#;
+	assert_eq!(run(src, "probe()"), "14");
+}
+
+#[test]
 fn ambient_boxed_float_intrinsics_cover_the_complete_runtime_surface() {
 	let src = r#"
 		func sin_value(): float = 0.0.sin()

@@ -1,5 +1,4 @@
 external(atan2) func complex_atan2(y: float, x: float): float
-external(is_integral_float) func complex_is_integral(value: float): boolean
 external(power_domain_error) func complex_power_domain_error(): never
 
 public struct Complex(real: float, imaginary: float) {
@@ -64,6 +63,8 @@ public struct Complex(real: float, imaginary: float) {
 func complex_one(): Complex = Complex(real = 1.0, imaginary = 0.0)
 
 func complex_zero(): Complex = Complex(real = 0.0, imaginary = 0.0)
+
+func complex_is_integral(value: float): boolean = value % 1.0 == 0.0
 
 // Scale before squaring so finite values near the ends of the IEEE range do
 // not overflow or underflow merely while their logarithmic magnitude is found.

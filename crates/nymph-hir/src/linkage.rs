@@ -182,10 +182,6 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 	("round", math_intrinsic("round", Some("float"))),
 	("atan2", math_intrinsic("atan2", None)),
 	(
-		"is_integral_float",
-		math_intrinsic("is_integral_float", None),
-	),
-	(
 		"power_domain_error",
 		math_intrinsic("power_domain_error", None),
 	),
@@ -935,7 +931,7 @@ mod tests {
 			assert!(lookup(marker, Some("int")).is_none());
 		}
 
-		for marker in ["atan2", "is_integral_float", "power_domain_error"] {
+		for marker in ["atan2", "power_domain_error"] {
 			let linked = lookup(marker, None).expect("top-level math marker must be receiverless");
 			assert_eq!(linked, &math_intrinsic(marker, None));
 		}
@@ -1091,7 +1087,6 @@ mod tests {
 						"cosh",
 						"exp",
 						"floor",
-						"is_integral_float",
 						"ln",
 						"max_float",
 						"min_float",
