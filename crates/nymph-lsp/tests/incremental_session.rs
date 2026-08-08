@@ -1,4 +1,5 @@
 use std::{
+	cell::Cell,
 	fs,
 	path::Path,
 	sync::{
@@ -100,8 +101,14 @@ fn unchanged_features_share_one_analysis_and_change_recomputes_once() {
 	assert!(initial_parse_count >= 1);
 	assert_eq!(check.load(Ordering::Relaxed), 1);
 
+	compiler.change(&mut docs, &uri, source.into(), 2).unwrap();
+	let unchanged = compiler.analysis_for_uri(&docs, &uri).unwrap();
+	assert!(Arc::ptr_eq(&first.analysis, &unchanged.analysis));
+	assert_eq!(parse.load(Ordering::Relaxed), initial_parse_count);
+	assert_eq!(check.load(Ordering::Relaxed), 1);
+
 	compiler
-		.change(&mut docs, &uri, "func value(): int = 2".into(), 2)
+		.change(&mut docs, &uri, "func value(): int = 2".into(), 3)
 		.unwrap();
 	assert!(
 		compiler
@@ -221,6 +228,14 @@ fn closing_dependency_overlay_restores_disk_hover_with_project_and_prelude_conte
 	compiler.close(&mut docs, &dep_uri).unwrap();
 	assert!(docs.get(&dep_uri).is_none());
 	assert_eq!(compiler.source_for_uri(&dep_uri).as_deref(), Some(disk_dep));
+	let stale_sent = Cell::new(false);
+	nymph_lsp::compiler_state::publish_if_current(&docs, &main_uri, &overlay, (), |_| {
+		stale_sent.set(true);
+	});
+	assert!(
+		!stale_sent.get(),
+		"a dependency overlay change must invalidate importer response publication"
+	);
 	let restored = compiler.analysis_for_uri(&docs, &main_uri).unwrap();
 	assert_eq!(overlay.project, restored.project);
 	assert_eq!(overlay.module, restored.module);

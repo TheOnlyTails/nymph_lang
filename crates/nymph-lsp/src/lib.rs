@@ -377,7 +377,7 @@ mod tests {
 	}
 
 	#[test]
-	fn production_handlers_reuse_analysis_until_document_version_changes() {
+	fn production_handlers_reuse_analysis_until_effective_source_changes() {
 		let parse = Arc::new(AtomicUsize::new(0));
 		let analysis = Arc::new(AtomicUsize::new(0));
 		let parse_events = parse.clone();
@@ -816,7 +816,7 @@ mod tests {
 	}
 
 	#[test]
-	fn stale_hover_and_semantic_token_responses_are_not_prepared_for_publication() {
+	fn previous_lifecycle_responses_are_not_prepared_after_same_version_reopen() {
 		let uri: lsp_types::Uri = "file:///wire_stale_analysis.nym".parse().unwrap();
 		let mut docs = DocumentStore::default();
 		let mut compiler = CompilerState::new();
@@ -824,7 +824,10 @@ mod tests {
 			.open(&mut docs, uri.clone(), "func f(): int = 1".into(), 1)
 			.unwrap();
 		let snapshot = compiler.analysis_for_uri(&docs, &uri).unwrap();
-		docs.change_full(&uri, "func f(): int = 2".into(), 2);
+		compiler.close(&mut docs, &uri).unwrap();
+		compiler
+			.open(&mut docs, uri.clone(), "func f(): boolean = true".into(), 1)
+			.unwrap();
 		let docs = Mutex::new(docs);
 
 		assert!(prepare_hover_response(&docs, &uri, &snapshot, None).is_none());

@@ -11,7 +11,10 @@ use nymph_compiler::{
 };
 use nymph_sema::EntryMode;
 
-use crate::{document_store::DocumentStore, workspace};
+use crate::{
+	document_store::{DocumentStore, DocumentStoreRevision},
+	workspace,
+};
 
 #[derive(Clone)]
 struct DocumentIdentity {
@@ -30,7 +33,7 @@ pub struct DiagnosticModuleSnapshot {
 }
 
 pub struct DiagnosticsSnapshot {
-	pub requested_version: i32,
+	pub document_revision: DocumentStoreRevision,
 	pub modules: Vec<DiagnosticModuleSnapshot>,
 }
 
@@ -38,9 +41,11 @@ pub struct AnalysisSnapshot {
 	pub project: ProjectId,
 	pub module: ModulePath,
 	/// Client sequence number used only to suppress responses after a newer
-	/// notification. Salsa analysis identity comes from the effective source
-	/// inputs and their dependencies, never from this LSP version.
+	/// notification. It is protocol metadata, not an analysis-cache key.
 	pub document_version: i32,
+	/// Identity of the complete open-document overlay state that produced this
+	/// analysis, including dependency overlays and document lifecycles.
+	pub document_revision: DocumentStoreRevision,
 	pub source: Arc<str>,
 	pub analysis: Arc<ModuleAnalysis>,
 }
@@ -175,6 +180,7 @@ impl CompilerState {
 			project: identity.project.clone(),
 			module: identity.module.clone(),
 			document_version: document.version,
+			document_revision: docs.revision(),
 			source: Arc::from(document.text.as_str()),
 			analysis,
 		})
@@ -217,7 +223,8 @@ impl CompilerState {
 		docs: &DocumentStore,
 		uri: &Uri,
 	) -> Option<DiagnosticsSnapshot> {
-		let requested_version = docs.version(uri)?;
+		let _ = docs.version(uri)?;
+		let document_revision = docs.revision();
 		let identity = self.documents.get(uri)?;
 		let session = self.session_for(identity);
 		let diagnostics = session.tooling_diagnostics(
@@ -297,7 +304,7 @@ impl CompilerState {
 			.diagnostic_targets
 			.insert(uri.as_str().to_string(), current_targets);
 		Some(DiagnosticsSnapshot {
-			requested_version,
+			document_revision,
 			modules,
 		})
 	}
@@ -455,7 +462,9 @@ pub fn publish_if_current<T>(
 	value: T,
 	send: impl FnOnce(T),
 ) {
-	if docs.version(uri) == Some(snapshot.document_version) {
+	if docs.revision() == snapshot.document_revision
+		&& docs.version(uri) == Some(snapshot.document_version)
+	{
 		send(value);
 	}
 }
@@ -466,7 +475,7 @@ mod tests {
 	use std::cell::Cell;
 
 	#[test]
-	fn stale_snapshot_is_not_published() {
+	fn snapshot_from_a_previous_same_version_lifecycle_is_not_published() {
 		let uri: Uri = "file:///tmp/stale.nym".parse().unwrap();
 		let mut docs = DocumentStore::default();
 		let mut state = CompilerState::new();
@@ -474,7 +483,10 @@ mod tests {
 			.open(&mut docs, uri.clone(), "func f(): int = 1".into(), 1)
 			.unwrap();
 		let snapshot = state.analysis_for_uri(&docs, &uri).unwrap();
-		docs.change_full(&uri, "func f(): int = 2".into(), 2);
+		state.close(&mut docs, &uri).unwrap();
+		state
+			.open(&mut docs, uri.clone(), "func f(): boolean = true".into(), 1)
+			.unwrap();
 		let sent = Cell::new(false);
 		publish_if_current(&docs, &uri, &snapshot, (), |_| sent.set(true));
 		assert!(!sent.get());

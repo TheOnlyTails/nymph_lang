@@ -17,14 +17,23 @@ pub struct Document {
 	pub version: i32,
 }
 
+/// Monotonic identity for one complete state of the open-document overlays.
+/// Unlike an LSP document version, this spans URIs and open/close lifecycles,
+/// so snapshots that depend on imports can be rejected after any overlay
+/// changes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DocumentStoreRevision(u64);
+
 #[derive(Clone, Default)]
 pub struct DocumentStore {
 	docs: HashMap<Uri, Document>,
+	revision: DocumentStoreRevision,
 }
 
 impl DocumentStore {
 	/// Record a newly opened document (`textDocument/didOpen`).
 	pub fn open(&mut self, uri: Uri, text: String, version: i32) {
+		self.advance_revision();
 		self.docs.insert(uri, Document { text, version });
 	}
 
@@ -33,6 +42,7 @@ impl DocumentStore {
 	/// last one in a batch matters). Inserts the document if it was somehow
 	/// not already open, rather than silently dropping the edit.
 	pub fn change_full(&mut self, uri: &Uri, text: String, version: i32) {
+		self.advance_revision();
 		if let Some(doc) = self.docs.get_mut(uri) {
 			doc.text = text;
 			doc.version = version;
@@ -43,6 +53,7 @@ impl DocumentStore {
 
 	/// Forget a closed document (`textDocument/didClose`).
 	pub fn close(&mut self, uri: &Uri) {
+		self.advance_revision();
 		self.docs.remove(uri);
 	}
 
@@ -56,7 +67,20 @@ impl DocumentStore {
 		self.docs.get(uri).map(|document| document.version)
 	}
 
+	#[must_use]
+	pub fn revision(&self) -> DocumentStoreRevision {
+		self.revision
+	}
+
 	pub fn iter(&self) -> impl Iterator<Item = (&Uri, &Document)> {
 		self.docs.iter()
+	}
+
+	fn advance_revision(&mut self) {
+		self.revision.0 = self
+			.revision
+			.0
+			.checked_add(1)
+			.expect("document store revision exhausted");
 	}
 }

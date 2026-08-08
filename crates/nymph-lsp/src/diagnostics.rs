@@ -36,9 +36,13 @@ pub fn check_and_publish_state(
 	// Copy the document table first, then release its mutex before entering the
 	// compiler. Publication below holds neither mutex.
 	let docs_snapshot = docs.lock().unwrap().clone();
+	let document_revision = docs_snapshot.revision();
 	let mut compiler = compiler.lock().unwrap();
 	if let Some((message, stale_targets)) = compiler.manifest_error_snapshot(uri) {
 		drop(compiler);
+		if docs.lock().unwrap().revision() != document_revision {
+			return Ok(());
+		}
 		let Some(document) = docs_snapshot.get(uri) else {
 			return Ok(());
 		};
@@ -54,8 +58,9 @@ pub fn check_and_publish_state(
 		return Ok(());
 	};
 	// This is deliberately the final state read before any send: if the root
-	// changed while analysis ran, publish no partial project result.
-	if docs.lock().unwrap().version(uri) != Some(snapshot.requested_version) {
+	// or any dependency overlay changed while analysis ran, publish no partial
+	// project result.
+	if docs.lock().unwrap().revision() != snapshot.document_revision {
 		return Ok(());
 	}
 	for module in snapshot.modules {
