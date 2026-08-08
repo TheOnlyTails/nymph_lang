@@ -41,8 +41,10 @@ Nymph LSP host` error directing the user to one of the six target-specific packa
 non-executable payload also stops activation and displays a specific reinstall or permissions
 message; the extension does not silently search the workspace for another server.
 
-Language-server diagnostics and traffic are available in the **Nymph Language Server** channel in the
-**Output** panel (**View → Output**). Startup failures also appear as VS Code error notifications.
+Compiler diagnostics appear in the editor and the **Problems** panel. Language-client logs and server
+stderr are available in the **Nymph Language Server** channel in the **Output** panel (**View →
+Output**). To inspect protocol traffic, run **Developer: Set Log Level**, select **Nymph Language
+Server**, and choose **Trace**. Startup failures appear as VS Code error notifications.
 
 ## Nymph files
 
@@ -53,8 +55,9 @@ Language-server diagnostics and traffic are available in the **Nymph Language Se
 func add(a: int, b: int): int = a + b
 ```
 
-See the [function reference](../docs/reference/functions.md) for parameters, inferred return types,
-blocks, methods, and closures.
+See the
+[function reference](https://github.com/TheOnlyTails/nymph_lang/blob/main/docs/reference/functions.md)
+for parameters, inferred return types, blocks, methods, and closures.
 
 ## Troubleshooting
 
@@ -71,7 +74,7 @@ blocks, methods, and closures.
 ### Language features do not appear
 
 - Confirm the file name ends in `.nym` and the status bar identifies the language as Nymph.
-- Fix syntax errors reported in the Nymph Language Server output channel.
+- Fix syntax errors shown in the editor or the **Problems** panel.
 - Run **Developer: Reload Window** after reinstalling or changing development settings.
 
 ## Extension development
@@ -129,4 +132,5 @@ node scripts/verify-vsix.cjs nymph-linux-x64.vsix linux-x64
 The stage command removes any previous payload before copying the selected executable, and the
 verification command checks that the VSIX contains exactly that executable with the required Unix
 permissions. Use the Rust/VS Code target pairing in the
-[packaging workflow](../.github/workflows/vscode.yml) for the other supported packages.
+[packaging workflow](https://github.com/TheOnlyTails/nymph_lang/blob/main/.github/workflows/vscode.yml)
+for the other supported packages.

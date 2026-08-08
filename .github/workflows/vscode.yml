@@ -2,7 +2,7 @@ name: Package VSCode Extension
 on:
   workflow_dispatch:
   pull_request:
-    paths: ["extension/**", ".github/workflows/vscode.yml"]
+    paths: ["extension/**", "docs/reference/functions.md", ".github/workflows/vscode.yml"]
 
 jobs:
   package:
