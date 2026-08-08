@@ -1,5 +1,5 @@
 use std::{
-	collections::{HashMap, HashSet},
+	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	fs,
 	path::PathBuf,
 	sync::Arc,
@@ -50,7 +50,7 @@ pub struct CompilerState {
 	documents: HashMap<Uri, DocumentIdentity>,
 	sources: HashMap<Uri, Arc<str>>,
 	manifest_errors: HashMap<Uri, String>,
-	diagnostic_targets: HashMap<String, HashSet<String>>,
+	diagnostic_targets: HashMap<String, BTreeSet<String>>,
 }
 
 impl Default for CompilerState {
@@ -222,7 +222,7 @@ impl CompilerState {
 			identity.entry.clone(),
 			!identity.without_prelude,
 		);
-		let mut grouped: HashMap<String, Vec<nymph_diagnostics::Diagnostic>> = HashMap::new();
+		let mut grouped: BTreeMap<String, Vec<nymph_diagnostics::Diagnostic>> = BTreeMap::new();
 		for diagnostic in diagnostics.iter() {
 			grouped
 				.entry(diagnostic.module.clone())
@@ -241,7 +241,12 @@ impl CompilerState {
 		keys.retain(|module| grouped.contains_key(module.as_str()));
 		for module in grouped.keys() {
 			if !keys.iter().any(|key| key.as_str() == module) {
-				keys.push(ModulePath::new(module.clone()).ok()?);
+				// Compiler-owned module identities (for example `std::io`) are
+				// intentionally not valid project paths and have no workspace URI.
+				// Skip them without suppressing publication for real project modules.
+				if let Ok(module) = ModulePath::new(module.clone()) {
+					keys.push(module);
+				}
 			}
 		}
 		let mut modules: Vec<_> = keys
@@ -264,7 +269,7 @@ impl CompilerState {
 				})
 			})
 			.collect();
-		let current_targets: HashSet<String> = modules
+		let current_targets: BTreeSet<String> = modules
 			.iter()
 			.map(|module| module.uri.as_str().to_string())
 			.collect();

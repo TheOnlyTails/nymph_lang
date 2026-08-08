@@ -447,6 +447,34 @@ impl CompilerSession {
 		))
 	}
 
+	#[doc(hidden)]
+	#[must_use]
+	#[cfg(feature = "test-support")]
+	pub fn importable_std_module_paths_for_test(&self) -> Vec<String> {
+		self
+			.builtin_sources
+			.keys()
+			.map(ToString::to_string)
+			.collect()
+	}
+
+	#[doc(hidden)]
+	#[cfg(feature = "test-support")]
+	pub fn set_importable_std_source_for_test(&mut self, path: &str, source: String) {
+		let path: Arc<str> = Arc::from(path);
+		let input = self
+			.builtins
+			.get(&BuiltinModuleKey {
+				domain: BuiltinModuleDomain::ImportableStd,
+				path: path.clone(),
+			})
+			.copied()
+			.expect("test mutation must name an embedded importable std module");
+		let source: Arc<str> = Arc::from(source);
+		input.set_source(&mut self.db).to(source.clone());
+		self.builtin_sources.insert(path, source);
+	}
+
 	/// Test-only mutation seam for proving ambient query invalidation. Ordinary
 	/// compiler clients cannot obtain or mutate ambient Salsa inputs directly.
 	#[doc(hidden)]
