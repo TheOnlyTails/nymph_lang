@@ -868,7 +868,7 @@ fn stable_emission_links_exact_ambient_math_demands_once_and_runs() {
 	session.set_source(
 		project.clone(),
 		main.clone(),
-		"func constant(): float = pi\nfunc root(): float = (16).sqrt()\nfunc power(): float = 16 ** 0.5\npublic func main(): void = {}"
+		"func constant(): float = pi\nfunc root(): float = (16).sqrt()\nfunc power(): int = 2 ** 10u\npublic func main(): void = {}"
 			.into(),
 		SourceVersion(1),
 	);
@@ -893,12 +893,7 @@ fn stable_emission_links_exact_ambient_math_demands_once_and_runs() {
 		"{}",
 		compiled.js
 	);
-	assert_eq!(
-		compiled.js.matches(" ** new NFloat(.5).v").count(),
-		2,
-		"{}",
-		compiled.js
-	);
+	assert!(!compiled.js.contains(" ** "), "{}", compiled.js);
 	let js = compiled.js.replace(
 		"import { NFloat, NInt } from \"std/box\";",
 		"class NFloat { constructor(v) { this.v = v; } } class NInt { constructor(v) { this.v = v; } }",
@@ -918,7 +913,7 @@ fn stable_emission_links_exact_ambient_math_demands_once_and_runs() {
 	);
 	assert_eq!(
 		String::from_utf8_lossy(&output.stdout),
-		"3.141592653589793 4 4\n"
+		"3.141592653589793 4 1024\n"
 	);
 }
 

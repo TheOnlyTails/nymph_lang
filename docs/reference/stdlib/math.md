@@ -36,3 +36,25 @@ source order.
 
 The external float constants are immutable boxed values initialized once per
 generated program and shared by every reference.
+
+## Complex numbers and powers
+
+`import std/math/complex with (Complex)` provides the canonical
+`Complex(real: float, imaginary: float)` type. It supports addition,
+subtraction, multiplication, division, negation, conjugation, magnitude, and
+the exact scalar exponentiation matrix documented under
+[Operators](../operators#exponentiation). The same import supplies the real
+base/`float` exponent rows because those rows return `Complex`.
+
+Integer and integral-valued float powers use exponentiation by squaring.
+Non-integral powers use a positive-real fast path where valid and otherwise
+the principal branch
+
+\[
+z^x = \exp\!\left(x\operatorname{Log}(z)\right),
+\]
+
+where `Log` uses `ln(abs(z))` and `atan2(imaginary, real)`. Thus, for example,
+`(-4) ** 0.5` has a positive imaginary component on the principal branch.
+`0 ** 0` is one, zero to a positive exponent is zero, and zero to a negative
+exponent raises a runtime domain error.

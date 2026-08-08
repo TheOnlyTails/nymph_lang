@@ -20,6 +20,9 @@ export const exp = (x: NFloat) => new NFloat(Math.exp(x.v));
 export const ln = (x: NFloat) => new NFloat(Math.log(x.v));
 
 export const atan2 = (y: NFloat, x: NFloat) => new NFloat(Math.atan2(y.v, x.v));
+export const power_domain_error = (): never => {
+	throw new RangeError("zero cannot be raised to a negative power");
+};
 
 export const floor = (x: NFloat) => new NInt(Math.floor(x.v));
 export const ceil = (x: NFloat) => new NInt(Math.ceil(x.v));

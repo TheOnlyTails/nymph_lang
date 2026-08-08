@@ -182,6 +182,10 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 	("round", math_intrinsic("round", Some("float"))),
 	("atan2", math_intrinsic("atan2", None)),
 	(
+		"power_domain_error",
+		math_intrinsic("power_domain_error", None),
+	),
+	(
 		"display",
 		Linked {
 			module: "std/display",
@@ -824,10 +828,6 @@ pub fn resolve(
 				result,
 			})
 		}
-		("power", true, Some(result)) if explicit_arity == Some(1) => Some(NativeExternal::Binary {
-			op: BinOp::Pow,
-			result,
-		}),
 		("bit_and", true, Some(result)) if explicit_arity == Some(1) => Some(NativeExternal::Binary {
 			op: BinOp::BitAnd,
 			result,
@@ -931,8 +931,10 @@ mod tests {
 			assert!(lookup(marker, Some("int")).is_none());
 		}
 
-		let atan2 = lookup("atan2", None).expect("atan2 must be receiverless");
-		assert_eq!(atan2, &math_intrinsic("atan2", None));
+		for marker in ["atan2", "power_domain_error"] {
+			let linked = lookup(marker, None).expect("top-level math marker must be receiverless");
+			assert_eq!(linked, &math_intrinsic(marker, None));
+		}
 
 		for marker in ["max_float", "min_float", "min_positive_float"] {
 			let value = lookup_value(marker).expect("float constant must be linked as a value");
@@ -1089,6 +1091,7 @@ mod tests {
 						"max_float",
 						"min_float",
 						"min_positive_float",
+						"power_domain_error",
 						"round",
 						"sin",
 						"sinh",
