@@ -5,55 +5,60 @@
 //! It deliberately owns no compiler session, module identity, or Salsa state.
 
 use std::{
-	collections::HashMap,
+	collections::BTreeMap,
 	io,
 	path::{Component, Path, PathBuf},
 };
 
 use nymph_compiler::ModulePath;
 use semver::{Version, VersionReq};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const MANIFEST_FILE: &str = "nymph.toml";
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Manifest {
 	pub package: Package,
-	#[serde(default)]
-	pub dependencies: HashMap<String, Dependency>,
-	#[serde(default)]
+	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+	pub dependencies: BTreeMap<String, Dependency>,
+	#[serde(default, skip_serializing_if = "Build::is_default")]
 	pub build: Build,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Package {
 	pub name: String,
 	pub version: Version,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub description: Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub private: Option<bool>,
-	#[serde(default = "default_src")]
+	#[serde(default = "default_src", skip_serializing_if = "is_default_src")]
 	pub src: PathBuf,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum Dependency {
 	Version(VersionReq),
 	Detailed(DependencyDetail),
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct DependencyDetail {
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub version: Option<VersionReq>,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub path: Option<PathBuf>,
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub git: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Build {
 	#[serde(default = "default_entry")]
 	pub entry: PathBuf,
-	#[serde(default)]
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 	pub disable_implicit_prelude: bool,
 }
 
@@ -66,11 +71,36 @@ impl Default for Build {
 	}
 }
 
+impl Build {
+	fn is_default(&self) -> bool {
+		self == &Self::default()
+	}
+}
+
 fn default_src() -> PathBuf {
 	PathBuf::from("src")
 }
+fn is_default_src(path: &Path) -> bool {
+	path == Path::new("src")
+}
 fn default_entry() -> PathBuf {
 	PathBuf::from("main.nym")
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+	"package name must start with a lowercase ASCII letter and contain only lowercase ASCII letters, digits, or hyphens"
+)]
+pub struct PackageNameError;
+
+pub fn validate_package_name(name: &str) -> Result<(), PackageNameError> {
+	let mut chars = name.chars();
+	if !chars.next().is_some_and(|ch| ch.is_ascii_lowercase())
+		|| chars.any(|ch| !(ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'))
+	{
+		return Err(PackageNameError);
+	}
+	Ok(())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -93,6 +123,13 @@ pub enum ManifestError {
 		#[source]
 		source: toml::de::Error,
 	},
+	#[error("invalid package name `{name}` in manifest {path}: {source}")]
+	InvalidPackageName {
+		path: PathBuf,
+		name: String,
+		#[source]
+		source: PackageNameError,
+	},
 	#[error("invalid `{field}` path in manifest {path}: {value}")]
 	InvalidPath {
 		path: PathBuf,
@@ -102,6 +139,25 @@ pub enum ManifestError {
 }
 
 impl Manifest {
+	#[must_use]
+	pub fn new(name: String) -> Self {
+		Self {
+			package: Package {
+				name,
+				version: Version::new(0, 1, 0),
+				description: None,
+				private: None,
+				src: default_src(),
+			},
+			dependencies: BTreeMap::new(),
+			build: Build::default(),
+		}
+	}
+
+	pub fn to_toml(&self) -> Result<String, toml::ser::Error> {
+		toml::to_string_pretty(self)
+	}
+
 	pub fn read(path: &Path) -> Result<Self, ManifestError> {
 		let contents = std::fs::read_to_string(path).map_err(|source| ManifestError::Read {
 			path: path.into(),
@@ -120,6 +176,13 @@ impl Manifest {
 	}
 
 	fn validate_paths(&self, manifest_path: &Path) -> Result<(), ManifestError> {
+		validate_package_name(&self.package.name).map_err(|source| {
+			ManifestError::InvalidPackageName {
+				path: manifest_path.into(),
+				name: self.package.name.clone(),
+				source,
+			}
+		})?;
 		if !is_contained_relative(&self.package.src) {
 			return Err(ManifestError::InvalidPath {
 				path: manifest_path.into(),
@@ -314,6 +377,39 @@ mod tests {
 		let defaults: Manifest = toml::from_str("[package]\nname='x'\nversion='1.0.0'").unwrap();
 		assert!(defaults.dependencies.is_empty());
 		assert_eq!(defaults.build.entry, Path::new("main.nym"));
+	}
+
+	#[test]
+	fn package_names_have_one_shared_ascii_grammar() {
+		for valid in ["a", "hello-world", "app2"] {
+			assert_eq!(validate_package_name(valid), Ok(()), "{valid}");
+		}
+		for invalid in ["", "2app", "Hello", "hello_world", "hello--world!", "café"] {
+			assert_eq!(
+				validate_package_name(invalid),
+				Err(PackageNameError),
+				"{invalid}"
+			);
+		}
+	}
+
+	#[test]
+	fn canonical_manifest_serialization_round_trips() {
+		let binary = Manifest::new("hello-world".into());
+		assert_eq!(
+			binary.to_toml().unwrap(),
+			"[package]\nname = \"hello-world\"\nversion = \"0.1.0\"\n"
+		);
+		let parsed: Manifest = toml::from_str(&binary.to_toml().unwrap()).unwrap();
+		assert_eq!(parsed.package.name, "hello-world");
+		assert_eq!(parsed.build, Build::default());
+
+		let mut library = Manifest::new("my-lib".into());
+		library.build.entry = "lib.nym".into();
+		assert_eq!(
+			library.to_toml().unwrap(),
+			"[package]\nname = \"my-lib\"\nversion = \"0.1.0\"\n\n[build]\nentry = \"lib.nym\"\n"
+		);
 	}
 
 	#[test]
