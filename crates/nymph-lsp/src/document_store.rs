@@ -8,8 +8,9 @@ use lsp_types::Uri;
 use std::collections::HashMap;
 
 /// One open document: its full current text and the client's version
-/// counter for it (used to keep republished diagnostics attributable to the
-/// right edit).
+/// counter. The version orders notifications and guards response publication;
+/// it is not an analysis-cache key. Compiler/Salsa reuse follows effective
+/// source content and dependency revisions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Document {
 	pub text: String,

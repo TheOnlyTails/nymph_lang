@@ -8,8 +8,8 @@ use std::{
 };
 
 use lsp_types::{
-	HoverParams, Position, SemanticTokensParams, TextDocumentIdentifier, TextDocumentPositionParams,
-	Uri, WorkDoneProgressParams,
+	HoverContents, HoverParams, MarkupContent, Position, SemanticTokensParams,
+	TextDocumentIdentifier, TextDocumentPositionParams, Uri, WorkDoneProgressParams,
 };
 use nymph_lsp::{
 	compiler_state::CompilerState, document_store::DocumentStore, hover, semantic_tokens, workspace,
@@ -17,6 +17,31 @@ use nymph_lsp::{
 
 fn uri(path: &Path) -> Uri {
 	workspace::path_to_uri(path).unwrap()
+}
+
+fn hover_code(
+	compiler: &CompilerState,
+	docs: &DocumentStore,
+	uri: &Uri,
+	line: u32,
+	character: u32,
+) -> String {
+	let snapshot = compiler.analysis_for_uri(docs, uri).unwrap();
+	let hover = hover::hover(
+		&snapshot,
+		&HoverParams {
+			text_document_position_params: TextDocumentPositionParams {
+				text_document: TextDocumentIdentifier { uri: uri.clone() },
+				position: Position { line, character },
+			},
+			work_done_progress_params: WorkDoneProgressParams::default(),
+		},
+	)
+	.unwrap();
+	match hover.contents {
+		HoverContents::Markup(MarkupContent { value, .. }) => value,
+		other => panic!("expected Markdown hover, got {other:?}"),
+	}
 }
 
 #[test]
@@ -87,6 +112,124 @@ fn unchanged_features_share_one_analysis_and_change_recomputes_once() {
 	compiler.analysis_for_uri(&docs, &uri).unwrap();
 	assert_eq!(parse.load(Ordering::Relaxed), initial_parse_count + 1);
 	assert_eq!(check.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn close_and_reopen_same_uri_and_version_uses_new_effective_source() {
+	let parse = Arc::new(AtomicUsize::new(0));
+	let analysis = Arc::new(AtomicUsize::new(0));
+	let parse_events = parse.clone();
+	let analysis_events = analysis.clone();
+	let mut compiler = CompilerState::with_event_callback(move |event| match event {
+		"parse" => _ = parse_events.fetch_add(1, Ordering::Relaxed),
+		"interface_module_analysis" => _ = analysis_events.fetch_add(1, Ordering::Relaxed),
+		_ => {}
+	});
+	let mut docs = DocumentStore::default();
+	let temp = tempfile::tempdir().unwrap();
+	let source_path = temp.path().join("reopened.nym");
+	let uri = uri(&source_path);
+
+	compiler
+		.open(&mut docs, uri.clone(), "func value(): int = 1".into(), 1)
+		.unwrap();
+	let first = compiler.analysis_for_uri(&docs, &uri).unwrap();
+	assert_eq!(
+		hover_code(&compiler, &docs, &uri, 0, 20),
+		"```nymph\nint\n```"
+	);
+	let first_counts = (
+		parse.load(Ordering::Relaxed),
+		analysis.load(Ordering::Relaxed),
+	);
+	let unchanged = compiler.analysis_for_uri(&docs, &uri).unwrap();
+	assert!(Arc::ptr_eq(&first.analysis, &unchanged.analysis));
+	assert_eq!(
+		(
+			parse.load(Ordering::Relaxed),
+			analysis.load(Ordering::Relaxed)
+		),
+		first_counts,
+		"an unchanged effective source should reuse Salsa analysis"
+	);
+
+	compiler.close(&mut docs, &uri).unwrap();
+	assert!(docs.get(&uri).is_none());
+	compiler
+		.open(
+			&mut docs,
+			uri.clone(),
+			"func value(): boolean = true".into(),
+			1,
+		)
+		.unwrap();
+	let reopened = compiler.analysis_for_uri(&docs, &uri).unwrap();
+	assert_eq!(reopened.document_version, first.document_version);
+	assert_eq!(reopened.source.as_ref(), "func value(): boolean = true");
+	assert!(!Arc::ptr_eq(&first.analysis, &reopened.analysis));
+	assert_eq!(
+		hover_code(&compiler, &docs, &uri, 0, 27),
+		"```nymph\nboolean\n```"
+	);
+	assert!(parse.load(Ordering::Relaxed) > first_counts.0);
+	assert!(analysis.load(Ordering::Relaxed) > first_counts.1);
+}
+
+#[test]
+fn closing_dependency_overlay_restores_disk_hover_with_project_and_prelude_context() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='hover-close'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let main_source = "import @/dep with (value)\nfunc use(): void = {\n  let imported = value()\n  let sum = 1 + 2\n}";
+	let disk_dep = "public func value(): int = 1";
+	fs::write(&main_path, main_source).unwrap();
+	fs::write(&dep_path, disk_dep).unwrap();
+	let main_uri = uri(&main_path);
+	let dep_uri = uri(&dep_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+
+	compiler
+		.open(&mut docs, main_uri.clone(), main_source.into(), 1)
+		.unwrap();
+	compiler
+		.open(
+			&mut docs,
+			dep_uri.clone(),
+			"public func value(): boolean = true".into(),
+			1,
+		)
+		.unwrap();
+	let overlay = compiler.analysis_for_uri(&docs, &main_uri).unwrap();
+	assert_eq!(
+		hover_code(&compiler, &docs, &main_uri, 2, 20),
+		"```nymph\n() -> boolean\n```",
+		"hover must use the open dependency overlay in the shared project graph"
+	);
+	assert_eq!(
+		hover_code(&compiler, &docs, &main_uri, 3, 12),
+		"```nymph\nint\n```",
+		"the same project analysis must retain ambient prelude operator semantics"
+	);
+
+	compiler.close(&mut docs, &dep_uri).unwrap();
+	assert!(docs.get(&dep_uri).is_none());
+	assert_eq!(compiler.source_for_uri(&dep_uri).as_deref(), Some(disk_dep));
+	let restored = compiler.analysis_for_uri(&docs, &main_uri).unwrap();
+	assert_eq!(overlay.project, restored.project);
+	assert_eq!(overlay.module, restored.module);
+	assert!(!Arc::ptr_eq(&overlay.analysis, &restored.analysis));
+	assert_eq!(
+		hover_code(&compiler, &docs, &main_uri, 2, 20),
+		"```nymph\n() -> int\n```",
+		"closing the dependency must reveal disk semantics, not overlay-era analysis"
+	);
 }
 
 #[test]

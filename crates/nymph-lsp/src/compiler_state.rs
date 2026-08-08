@@ -37,7 +37,10 @@ pub struct DiagnosticsSnapshot {
 pub struct AnalysisSnapshot {
 	pub project: ProjectId,
 	pub module: ModulePath,
-	pub version: SourceVersion,
+	/// Client sequence number used only to suppress responses after a newer
+	/// notification. Salsa analysis identity comes from the effective source
+	/// inputs and their dependencies, never from this LSP version.
+	pub document_version: i32,
 	pub source: Arc<str>,
 	pub analysis: Arc<ModuleAnalysis>,
 }
@@ -171,7 +174,7 @@ impl CompilerState {
 		Some(AnalysisSnapshot {
 			project: identity.project.clone(),
 			module: identity.module.clone(),
-			version: SourceVersion(i64::from(document.version)),
+			document_version: document.version,
 			source: Arc::from(document.text.as_str()),
 			analysis,
 		})
@@ -452,7 +455,7 @@ pub fn publish_if_current<T>(
 	value: T,
 	send: impl FnOnce(T),
 ) {
-	if docs.version(uri) == i32::try_from(snapshot.version.0).ok() {
+	if docs.version(uri) == Some(snapshot.document_version) {
 		send(value);
 	}
 }
