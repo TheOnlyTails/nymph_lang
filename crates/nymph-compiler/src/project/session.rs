@@ -622,6 +622,24 @@ impl CompilerSession {
 		self.module_analysis(project, input, key)
 	}
 
+	pub(super) fn documentation_module_interface(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		document_private_items: bool,
+	) -> Option<Result<Arc<nymph_sema::ModuleInterface>, Arc<nymph_sema::InterfaceConversionError>>>
+	{
+		let input = self.registry.get(&(project.clone(), module))?.input;
+		let key = self.project_key(project, entry, EntryMode::Library, true, true);
+		Some(queries::documentation_module_interface(
+			&self.db,
+			key,
+			SemanticModuleInput::Project(input),
+			document_private_items,
+		))
+	}
+
 	/// Resolve and read one exact runtime-bearing definition from its source
 	/// module. The owner comes from `DefinitionId`, never from placement metadata.
 	#[must_use]

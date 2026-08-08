@@ -39,6 +39,7 @@ fn exported(id: DefinitionId, name: &str) -> ExportedDefinition {
 		fields: vec![],
 		variants: vec![],
 		members: vec![],
+		implementations: vec![],
 		super_interfaces: vec![],
 		external: None,
 		runtime_owner: None,

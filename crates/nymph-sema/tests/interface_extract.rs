@@ -628,6 +628,7 @@ fn extraction_preserves_transitive_imported_nominal_return_identity() {
 			fields: vec![],
 			variants: vec![],
 			members: vec![],
+			implementations: vec![],
 			super_interfaces: vec![],
 			external: None,
 			runtime_owner: None,

@@ -454,6 +454,7 @@ pub struct ExportedDefinition {
 	pub fields: Vec<FieldShape<InterfaceType>>,
 	pub variants: Vec<VariantShape<InterfaceType>>,
 	pub members: Vec<MemberShape<InterfaceType>>,
+	pub implementations: Vec<ExportedImpl>,
 	pub super_interfaces: Vec<SuperInterface>,
 	pub external: Option<ExternalAbi>,
 	pub runtime_owner: Option<DefinitionId>,

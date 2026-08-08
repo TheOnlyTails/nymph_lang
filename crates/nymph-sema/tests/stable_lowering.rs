@@ -577,6 +577,7 @@ fn imported_external_reference_has_exact_stable_marshal_annotation() {
 			fields: vec![],
 			variants: vec![],
 			members: vec![],
+			implementations: vec![],
 			super_interfaces: vec![],
 			external: Some(ExternalAbi {
 				marker: "max_float".into(),

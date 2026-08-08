@@ -360,6 +360,7 @@ fn empty_definition(
 		fields: Vec::new(),
 		variants: Vec::new(),
 		members: Vec::new(),
+		implementations: Vec::new(),
 		super_interfaces: Vec::new(),
 		external: None,
 		runtime_owner: None,
@@ -1318,7 +1319,7 @@ pub(crate) fn assign_runtime_body_identities(
 						nested: Some(index as u32),
 					},
 				)
-				.collect(),
+				.collect::<Vec<_>>(),
 			_ => Vec::new(),
 		});
 	let interface_paths = top_paths.chain(nested_paths).collect::<Vec<_>>();
@@ -1853,6 +1854,8 @@ fn extract_definition(
 					Ok(member)
 				})
 				.collect::<Result<_, InterfaceConversionError>>()?;
+			shape.implementations =
+				extract_nested_interface_implementations(&shape, members, checked, headers)?;
 			shape
 		}
 		Declaration::Namespace {
@@ -1973,6 +1976,9 @@ fn referenced_definition_shape(definition: &ExportedDefinition, out: &mut HashSe
 			referenced_definitions(ty, out);
 		}
 	}
+	for implementation in &definition.implementations {
+		referenced_impl_shape(implementation, out);
+	}
 }
 
 fn referenced_impl_shape(implementation: &ExportedImpl, out: &mut HashSet<DefinitionId>) {
@@ -2013,6 +2019,126 @@ fn referenced_impl_shape(implementation: &ExportedImpl, out: &mut HashSet<Defini
 			referenced_definitions(ty, out);
 		}
 	}
+}
+
+fn extract_nested_interface_implementations(
+	owner: &ExportedDefinition,
+	members: &[nymph_ast::Spanned<nymph_ast::decl::InterfaceMember>],
+	checked: &CheckedFacts,
+	headers: &DeclaredHeaders,
+) -> Result<Vec<ExportedImpl>, InterfaceConversionError> {
+	let mut ids = StableIdBuilder::new(headers.module.clone());
+	members
+		.iter()
+		.filter_map(|member| match &member.0 {
+			nymph_ast::decl::InterfaceMember::Impl {
+				interface,
+				generics,
+				members,
+			} => Some((interface, generics, members)),
+			_ => None,
+		})
+		.map(|((interface_name, arguments), generics, members)| {
+			let interface = headers
+				.id(&interface_name.0)
+				.ok_or(InterfaceConversionError::ErrorType)?;
+			let temporary = DefinitionId::new(
+				headers.module.clone(),
+				DeclarationKey::top_level(DeclarationCategory::Namespace, "$interface_impl"),
+			);
+			let generic_names = owner
+				.binders
+				.iter()
+				.map(|binder| binder.name.clone())
+				.chain(generics.iter().map(|generic| generic.0.name.0.clone()))
+				.collect::<Vec<_>>();
+			let (_, temporary_binders) =
+				definition_context(checked, headers, &temporary, generic_names.clone());
+			let typed_arguments = arguments
+				.iter()
+				.map(|argument| ast_type(&argument.0.value.0, headers, &temporary_binders))
+				.collect::<Result<Vec<_>, _>>()?;
+			let interface_generics = checked
+				.semantic
+				.definitions
+				.defs
+				.iter()
+				.enumerate()
+				.find(|(_, definition)| definition.stable.as_ref() == Some(&interface))
+				.and_then(|(index, _)| checked.semantic.interfaces.get(&crate::DefId(index as u32)))
+				.map(|definition| definition.generics.as_slice())
+				.unwrap_or(&[]);
+			let named_arguments = arguments
+				.iter()
+				.zip(&typed_arguments)
+				.enumerate()
+				.map(|(index, (argument, ty))| {
+					let name = argument
+						.0
+						.name
+						.as_ref()
+						.map(|name| name.0.clone())
+						.or_else(|| interface_generics.get(index).cloned())
+						.ok_or(InterfaceConversionError::ErrorType)?;
+					Ok((name, ty.clone()))
+				})
+				.collect::<Result<Vec<_>, InterfaceConversionError>>()?;
+			let id = ids.allocate(DeclarationKey::implementation(ImplementationHeader {
+				interface: Some(interface.clone()),
+				interface_arguments: named_arguments
+					.iter()
+					.map(|(name, ty)| (name.clone(), header_type(ty, &temporary_binders)))
+					.collect(),
+				self_type: HeaderType::SelfType,
+				mutable: false,
+				binders: (0..temporary_binders.len())
+					.map(|index| HeaderBinder {
+						parameter: HeaderParameterId(index as u32),
+					})
+					.collect(),
+				constraints: Vec::new(),
+			}));
+			let (_, binders) = definition_context(checked, headers, &id, generic_names);
+			let interface_arguments = named_arguments
+				.into_iter()
+				.zip(arguments)
+				.map(|((name, _), argument)| Ok((name, ast_type(&argument.0.value.0, headers, &binders)?)))
+				.collect::<Result<Vec<_>, InterfaceConversionError>>()?;
+			let mut member_ids = StableIdBuilder::new(headers.module.clone());
+			let members = members
+				.iter()
+				.map(|member| member_shape(&member.0, &id, headers, &binders, &mut member_ids))
+				.collect::<Result<_, _>>()?;
+			let interface_argument_bindings = interface_arguments
+				.iter()
+				.filter_map(|(name, ty)| {
+					interface_generics
+						.iter()
+						.position(|generic| generic == name)
+						.map(|index| {
+							(
+								GenericParameterId::new(interface.binder(BinderScope::Definition, 0), index as u32),
+								ty.clone(),
+							)
+						})
+				})
+				.collect();
+			Ok(ExportedImpl {
+				id,
+				visibility: owner.visibility,
+				interface: Some(interface),
+				interface_arguments,
+				interface_argument_bindings,
+				self_type: InterfaceType::SelfType,
+				mutable: false,
+				constraints: generic_constraints(generics, headers, &binders[owner.binders.len()..])?,
+				binders,
+				members,
+				member_slots: Default::default(),
+				runtime_owner: None,
+			})
+		})
+		.collect()
 }
 
 fn extract_implementations(

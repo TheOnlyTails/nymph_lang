@@ -239,6 +239,7 @@ fn complete_fixture() -> ModuleInterface {
 			fields: vec![field],
 		}],
 		members: vec![member.clone()],
+		implementations: vec![],
 		super_interfaces: vec![SuperInterfaceShape {
 			interface: definition("Bound"),
 			positional: vec![InterfaceType::Int],

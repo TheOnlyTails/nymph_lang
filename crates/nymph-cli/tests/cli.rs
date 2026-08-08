@@ -91,6 +91,157 @@ fn write_project(entry: &str, source: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn doc_generates_default_and_custom_deterministic_sites_with_visibility_and_links() {
+	let root = write_project(
+		"main.nym",
+		"import @/model/token with (Token)\n\
+		 public func echo(value: Token): Token = value\n\
+		 private func hidden(): int = 42\n",
+	);
+	let model = root.join("src/model/token.nym");
+	std::fs::create_dir_all(model.parent().unwrap()).unwrap();
+	std::fs::write(&model, "public struct Token {}\n").unwrap();
+
+	let generated = nymph_in(&["doc"], &root);
+	assert!(generated.status.success(), "{}", generated.stderr);
+	let default = root.join("target/nymph/doc");
+	let index = std::fs::read_to_string(default.join("index.html")).unwrap();
+	let main = std::fs::read_to_string(default.join("modules/main.html")).unwrap();
+	assert!(index.contains("modules/model/token.html"), "{index}");
+	assert!(main.contains("echo"), "{main}");
+	assert!(!main.contains("hidden"), "{main}");
+	assert!(
+		main.contains("modules/model/token.html#item-Token-0"),
+		"cross-module type should link by its semantic target: {main}"
+	);
+	let first = std::fs::read(default.join("modules/main.html")).unwrap();
+	let regenerated = nymph_in(&["doc"], &root);
+	assert!(regenerated.status.success(), "{}", regenerated.stderr);
+	assert_eq!(
+		first,
+		std::fs::read(default.join("modules/main.html")).unwrap(),
+		"same checked project must render byte-for-byte deterministically"
+	);
+
+	let custom = root.join("custom-docs");
+	let private = nymph_in(
+		&[
+			"doc",
+			"--output",
+			custom.to_str().unwrap(),
+			"--document-private-items",
+		],
+		&root,
+	);
+	assert!(private.status.success(), "{}", private.stderr);
+	let custom_main = std::fs::read_to_string(custom.join("modules/main.html")).unwrap();
+	assert!(custom_main.contains("hidden"), "{custom_main}");
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn doc_failure_preserves_the_previous_output_tree() {
+	let root = write_project("main.nym", "public func broken(: int\n");
+	let output = root.join("site");
+	std::fs::create_dir_all(&output).unwrap();
+	std::fs::write(output.join("preserved.txt"), "old documentation").unwrap();
+
+	let result = nymph_in(&["doc", "--output", output.to_str().unwrap()], &root);
+	assert_eq!(result.status.code(), Some(1), "{}", result.stderr);
+	assert_eq!(
+		std::fs::read_to_string(output.join("preserved.txt")).unwrap(),
+		"old documentation"
+	);
+	assert!(!output.join("index.html").exists());
+
+	std::fs::write(root.join("src/main.nym"), "public let fixed: int = 1\n").unwrap();
+	let prior_file = root.join("prior-file");
+	std::fs::write(&prior_file, "old file").unwrap();
+	let replaced = nymph_in(&["doc", "--output", prior_file.to_str().unwrap()], &root);
+	assert!(replaced.status.success(), "{}", replaced.stderr);
+	assert!(prior_file.join("index.html").is_file());
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn doc_requires_strict_discovery_and_honors_an_explicit_manifest_authoritatively() {
+	let empty = unique_temp_path("nymph_cli_doc_empty", "dir");
+	std::fs::create_dir_all(&empty).unwrap();
+	let absent = nymph_in(&["doc"], &empty);
+	assert_eq!(absent.status.code(), Some(1));
+	assert!(
+		absent.stderr.contains("no nymph.toml found"),
+		"{}",
+		absent.stderr
+	);
+
+	let root = write_project("main.nym", "public let answer: int = 42\n");
+	let missing = root.join("missing.toml");
+	let selected = nymph_in(&["--manifest", missing.to_str().unwrap(), "doc"], &root);
+	assert_eq!(selected.status.code(), Some(1));
+	assert!(
+		selected.stderr.contains("could not read manifest"),
+		"{}",
+		selected.stderr
+	);
+	assert!(selected.stderr.contains(&missing.display().to_string()));
+	assert!(!root.join("target/nymph/doc/index.html").exists());
+
+	std::fs::remove_dir_all(empty).unwrap();
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn doc_open_runs_only_after_publication_and_receives_the_generated_index() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let root = write_project("main.nym", "public let answer: int = 42\n");
+	let bin = root.join("fake-bin");
+	std::fs::create_dir_all(&bin).unwrap();
+	let record = root.join("opened.txt");
+	let opener = bin.join("xdg-open");
+	std::fs::write(
+		&opener,
+		format!(
+			"#!/bin/sh\ntest -f \"$1\" || exit 9\nprintf '%s' \"$1\" > '{}'\n",
+			record.display()
+		),
+	)
+	.unwrap();
+	let mut permissions = std::fs::metadata(&opener).unwrap().permissions();
+	permissions.set_mode(0o755);
+	std::fs::set_permissions(&opener, permissions).unwrap();
+	let path = std::env::var_os("PATH").unwrap_or_default();
+	let path = std::iter::once(bin.clone())
+		.chain(std::env::split_paths(&path))
+		.collect::<Vec<_>>();
+	let output = Command::new(env!("CARGO_BIN_EXE_nymph"))
+		.arg("doc")
+		.arg("--open")
+		.current_dir(&root)
+		.env("PATH", std::env::join_paths(path).unwrap())
+		.output()
+		.unwrap();
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(
+		std::fs::read_to_string(record).unwrap(),
+		root
+			.join("target/nymph/doc/index.html")
+			.display()
+			.to_string()
+	);
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn manifest_is_a_global_flag_before_or_after_the_subcommand() {
 	let root = write_project("main.nym", "func main(): void = {}\n");
 	let manifest = root.join("nymph.toml");
@@ -1533,17 +1684,6 @@ fn new_help_documents_the_path_and_supported_flags() {
 	assert!(out.stdout.contains("--lib"));
 	assert!(out.stdout.contains("--no-git"));
 	assert!(!out.stdout.contains("--name"));
-}
-
-#[test]
-fn stub_subcommand_exits_nonzero_with_a_message() {
-	let out = nymph(&["doc"]);
-	assert_eq!(out.status.code(), Some(2));
-	assert!(
-		out.stderr.contains("not implemented"),
-		"stderr was: {}",
-		out.stderr
-	);
 }
 
 #[test]

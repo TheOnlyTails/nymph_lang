@@ -40,6 +40,10 @@ mod std_source;
 use std::path::{Path, PathBuf};
 
 pub use nymph_diagnostics::{Diagnostic, Severity};
+pub use project::documentation::{
+	DocFragment, DocImplementation, DocItem, DocModule, DocOptions, DocProject, DocSignature,
+	StaticDocSite, document_project, document_project_with_std,
+};
 pub use project::{
 	AmbientCoreModuleKey, BuiltinRuntimeOwnerArtifact, BuiltinRuntimeOwnerShape, CompiledProject,
 	CompilerSession, ModuleAnalysis, ModulePath, ProjectDiagnostic, ProjectId, SourceVersion,

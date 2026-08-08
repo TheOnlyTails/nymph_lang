@@ -12,6 +12,7 @@
 
 mod assembly;
 mod bundle;
+pub mod documentation;
 mod emission;
 mod link_plan;
 mod metrics;
