@@ -1,5 +1,5 @@
 use std::{
-	collections::{BTreeMap, HashMap, HashSet},
+	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	fs,
 	path::PathBuf,
 	sync::Arc,
@@ -253,18 +253,36 @@ impl CompilerState {
 		docs: &mut DocumentStore,
 		uris: &[Uri],
 	) -> anyhow::Result<Vec<WatchedFileRefresh>> {
-		docs.filesystem_changed();
-		let mut refreshes = Vec::new();
+		let mut manifests = BTreeSet::new();
+		let mut sources = BTreeSet::new();
 		for uri in uris {
 			let Some(path) = workspace::uri_to_path(uri) else {
 				continue;
 			};
 			let path = std::path::absolute(path)?;
 			if path.file_name().and_then(|name| name.to_str()) == Some("nymph.toml") {
-				self.refresh_manifest(docs, &path, &mut refreshes)?;
+				manifests.insert(path);
 			} else if path.extension().and_then(|extension| extension.to_str()) == Some("nym") {
-				self.refresh_source(docs, &path, &mut refreshes)?;
+				sources.insert(path);
 			}
+		}
+		let filesystem_changed = !manifests.is_empty() || !sources.is_empty();
+		let mut refreshes = Vec::new();
+		// Manifest discovery determines final project membership, so source
+		// events in the same client batch must be routed only after it settles.
+		for manifest in manifests {
+			self.refresh_manifest(docs, &manifest, &mut refreshes)?;
+		}
+		for source in sources {
+			self.refresh_source(docs, &source, &mut refreshes)?;
+		}
+		let mut covered = HashSet::new();
+		for refresh in &mut refreshes {
+			refresh.affected.retain(|uri| covered.insert(uri.clone()));
+		}
+		refreshes.retain(|refresh| !refresh.affected.is_empty());
+		if filesystem_changed {
+			docs.filesystem_changed();
 		}
 		Ok(refreshes)
 	}
@@ -352,21 +370,24 @@ impl CompilerState {
 		});
 		for (root, project, without_prelude, module) in roots {
 			let disk_path = nymph_project::file_for_module(&root, &module);
-			let Some(origin) = workspace::path_to_uri(&disk_path) else {
+			let Some(disk_uri) = workspace::path_to_uri(&disk_path) else {
 				continue;
 			};
 			let identity = DocumentIdentity {
 				project,
 				module: module.clone(),
-				entry: module,
+				entry: module.clone(),
 				root,
 				without_prelude,
 				kind: DocumentKind::Project(disk_path.clone()),
 			};
 			self
 				.documents
-				.entry(origin.clone())
+				.entry(disk_uri.clone())
 				.or_insert(identity.clone());
+			let origin = self
+				.publication_uri(docs, &identity, &module)
+				.unwrap_or(disk_uri);
 			let mut affected = self.affected_project_documents(docs, &origin);
 			let module_identity = identity.module_identity();
 			if self

@@ -550,17 +550,21 @@ mod tests {
 	}
 
 	fn send_watched_file(client: &Connection, uri: Uri) {
+		send_watched_files(
+			client,
+			vec![lsp_types::FileEvent::new(
+				uri,
+				lsp_types::FileChangeType::CHANGED,
+			)],
+		);
+	}
+
+	fn send_watched_files(client: &Connection, changes: Vec<lsp_types::FileEvent>) {
 		client
 			.sender
 			.send(Message::Notification(Notification::new(
 				DidChangeWatchedFiles::METHOD.into(),
-				serde_json::to_value(DidChangeWatchedFilesParams {
-					changes: vec![lsp_types::FileEvent::new(
-						uri,
-						lsp_types::FileChangeType::CHANGED,
-					)],
-				})
-				.unwrap(),
+				serde_json::to_value(DidChangeWatchedFilesParams { changes }).unwrap(),
 			)))
 			.unwrap();
 	}
@@ -1863,19 +1867,15 @@ mod tests {
 		);
 
 		std::fs::write(&dep_path, "public func value(): int = true").unwrap();
-		client
-			.sender
-			.send(Message::Notification(Notification::new(
-				DidChangeWatchedFiles::METHOD.into(),
-				serde_json::to_value(DidChangeWatchedFilesParams {
-					changes: vec![lsp_types::FileEvent::new(
-						dep_uri.clone(),
-						lsp_types::FileChangeType::CHANGED,
-					)],
-				})
-				.unwrap(),
-			)))
-			.unwrap();
+		send_watched_files(
+			&client,
+			vec![
+				lsp_types::FileEvent::new(dep_uri.clone(), lsp_types::FileChangeType::CREATED),
+				lsp_types::FileEvent::new(main_uri.clone(), lsp_types::FileChangeType::CHANGED),
+				lsp_types::FileEvent::new(dep_uri.clone(), lsp_types::FileChangeType::CHANGED),
+				lsp_types::FileEvent::new(dep_uri.clone(), lsp_types::FileChangeType::DELETED),
+			],
+		);
 		client
 			.sender
 			.send(Message::Request(Request::new(
@@ -1909,6 +1909,91 @@ mod tests {
 		);
 		assert!(!publications[0].diagnostics.is_empty());
 		assert!(publications[1].diagnostics.is_empty());
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn watcher_notification_publishes_an_authoritative_equivalent_overlay_once() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='wire-watch-alias'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let main_path = temp.path().join("src/main.nym");
+		let dep_path = temp.path().join("src/dep.nym");
+		let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+		std::fs::write(&main_path, main_source).unwrap();
+		std::fs::write(&dep_path, "public func value(): int = 1").unwrap();
+		let main_uri = workspace::path_to_uri(&main_path).unwrap();
+		let dep_uri = workspace::path_to_uri(&dep_path).unwrap();
+		let equivalent_uri: Uri = dep_uri
+			.as_str()
+			.replace("dep.nym", "%64ep.nym")
+			.parse()
+			.unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		let registration = handshake_with_watchers(&client);
+		client
+			.sender
+			.send(Message::Response(Response::new_ok(
+				registration.id,
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		send_open(&client, main_uri.clone(), 1, main_source);
+		recv_diagnostics_for(&client, &main_uri);
+		send_open(
+			&client,
+			equivalent_uri.clone(),
+			7,
+			"public func value(): int = true",
+		);
+		recv_diagnostics_for(&client, &equivalent_uri);
+		recv_diagnostics_for(&client, &main_uri);
+
+		std::fs::write(&dep_path, "public func value(): int = 2").unwrap();
+		send_watched_files(
+			&client,
+			vec![
+				lsp_types::FileEvent::new(dep_uri.clone(), lsp_types::FileChangeType::CHANGED),
+				lsp_types::FileEvent::new(equivalent_uri.clone(), lsp_types::FileChangeType::CHANGED),
+			],
+		);
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(94),
+				"test/barrier".into(),
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		let mut publications = Vec::new();
+		loop {
+			match client.receiver.recv().unwrap() {
+				Message::Notification(notification)
+					if notification.method == lsp_types::notification::PublishDiagnostics::METHOD =>
+				{
+					publications
+						.push(serde_json::from_value::<PublishDiagnosticsParams>(notification.params).unwrap());
+				}
+				Message::Response(response) => {
+					assert_eq!(response.id, RequestId::from(94));
+					break;
+				}
+				other => panic!("expected diagnostics or barrier response, got {other:?}"),
+			}
+		}
+		assert_eq!(
+			publications
+				.iter()
+				.map(|params| (&params.uri, params.version))
+				.collect::<Vec<_>>(),
+			[(&equivalent_uri, Some(7)), (&main_uri, Some(1))]
+		);
+		assert!(publications.iter().all(|params| params.uri != dep_uri));
 		shutdown(&client, handle);
 	}
 

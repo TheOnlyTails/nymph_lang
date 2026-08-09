@@ -1551,6 +1551,17 @@ fn watched_filesystem_revision_rejects_pre_event_snapshot_publication() {
 			1,
 		)
 		.unwrap();
+	let before_ignored_batch = docs.revision();
+	compiler
+		.watched_files_changed(
+			&mut docs,
+			&[
+				"untitled:ignored".parse().unwrap(),
+				uri(&temp.path().join("ignored.txt")),
+			],
+		)
+		.unwrap();
+	assert_eq!(docs.revision(), before_ignored_batch);
 	let snapshot = compiler.analysis_for_uri(&docs, &file_uri).unwrap();
 	compiler
 		.watched_files_changed(&mut docs, std::slice::from_ref(&file_uri))
