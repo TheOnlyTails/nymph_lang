@@ -46,6 +46,12 @@ stderr are available in the **Nymph Language Server** channel in the **Output** 
 Output**). To inspect protocol traffic, run **Developer: Set Log Level**, select **Nymph Language
 Server**, and choose **Trace**. Startup failures appear as VS Code error notifications.
 
+Hover uses the same checked snapshot as diagnostics. In a project, that includes project imports and
+aliases, the embedded `std/...` modules, the ambient prelude, inferred generic substitutions, and
+unsaved overlays for every open dependency. A saved `.nym` file outside a project is checked as a
+one-file library with the ambient prelude; it has no project import graph. The extension currently
+registers language-server features for `file:` documents only, not untitled editor buffers.
+
 ## Nymph files
 
 `.nym` is the only Nymph source-file suffix. Functions use

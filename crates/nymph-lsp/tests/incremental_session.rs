@@ -27,6 +27,16 @@ fn hover_code(
 	line: u32,
 	character: u32,
 ) -> String {
+	hover_value(compiler, docs, uri, line, character).unwrap()
+}
+
+fn hover_value(
+	compiler: &CompilerState,
+	docs: &DocumentStore,
+	uri: &Uri,
+	line: u32,
+	character: u32,
+) -> Option<String> {
 	let snapshot = compiler.analysis_for_uri(docs, uri).unwrap();
 	let hover = hover::hover(
 		&snapshot,
@@ -37,12 +47,30 @@ fn hover_code(
 			},
 			work_done_progress_params: WorkDoneProgressParams::default(),
 		},
-	)
-	.unwrap();
+	)?;
 	match hover.contents {
-		HoverContents::Markup(MarkupContent { value, .. }) => value,
+		HoverContents::Markup(MarkupContent { value, .. }) => Some(value),
 		other => panic!("expected Markdown hover, got {other:?}"),
 	}
+}
+
+fn hover_needle(
+	compiler: &CompilerState,
+	docs: &DocumentStore,
+	uri: &Uri,
+	source: &str,
+	needle: &str,
+) -> Option<String> {
+	let offset = source.find(needle).unwrap();
+	let line = source[..offset]
+		.bytes()
+		.filter(|byte| *byte == b'\n')
+		.count() as u32;
+	let character = offset
+		- source[..offset]
+			.rfind('\n')
+			.map_or(0, |newline| newline + 1);
+	hover_value(compiler, docs, uri, line, character as u32)
 }
 
 #[test]
@@ -376,6 +404,186 @@ fn loose_file_identity_is_stable_and_uses_library_mode() {
 			.unwrap()
 			.is_empty()
 	);
+}
+
+#[test]
+fn project_hover_uses_imports_aliases_std_prelude_generics_and_reuses_the_checked_world() {
+	let analyses = Arc::new(AtomicUsize::new(0));
+	let analysis_events = analyses.clone();
+	let mut compiler = CompilerState::with_event_callback(move |event| {
+		if event == "interface_module_analysis" {
+			_ = analysis_events.fetch_add(1, Ordering::Relaxed);
+		}
+	});
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='project-hover'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let source = "import @/dep with (Box, id as identify)\nimport std/collections/linked_list with (LinkedList)\nfunc use(box: Box<int>, list: LinkedList<string>): Option<string> = {\n  let imported_box = box\n  let imported_std = list\n  let sum = 1 + 2\n  Some(value = identify(\"ok\"))\n}\nfunc unwrap(option: Option<int>): int = match (option) { Some(value) -> value, None -> 0 }";
+	let dependency = "public struct Box<T>(public value: T)\npublic func id<T>(value: T): T = value";
+	fs::write(&main_path, source).unwrap();
+	fs::write(&dep_path, dependency).unwrap();
+	let main_uri = uri(&main_path);
+	let mut docs = DocumentStore::default();
+	compiler
+		.open(&mut docs, main_uri.clone(), source.into(), 1)
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.is_empty()
+	);
+
+	assert_eq!(
+		hover_needle(&compiler, &docs, &main_uri, source, "Box<int>"),
+		Some("```nymph\nBox<int>\n```".to_string())
+	);
+	let initial_analyses = analyses.load(Ordering::Relaxed);
+	assert!(initial_analyses > 0);
+	let cases = [
+		("LinkedList<string>", "LinkedList<string>"),
+		("Option<string>", "Option<string>"),
+		("box\n", "Box<int>"),
+		("list\n", "LinkedList<string>"),
+		("sum =", "int"),
+		("identify(\"ok\")", "(string) -> string"),
+		("Some(value", "Option.Some(value: T)"),
+		("Some(value) ->", "Option.Some(value: T)"),
+		("value) ->", "int"),
+		("None ->", "Option.None"),
+	];
+	for (needle, expected) in cases {
+		assert_eq!(
+			hover_needle(&compiler, &docs, &main_uri, source, needle),
+			Some(format!("```nymph\n{expected}\n```")),
+			"hover fixture {needle:?}"
+		);
+	}
+	assert_eq!(
+		analyses.load(Ordering::Relaxed),
+		initial_analyses,
+		"repeated project hover must reuse the one checked Salsa snapshot"
+	);
+}
+
+#[test]
+fn loose_file_hover_uses_library_mode_with_the_ambient_prelude() {
+	let temp = tempfile::tempdir().unwrap();
+	let path = temp.path().join("scratch.nym");
+	let uri = uri(&path);
+	let source = "func keep(value: Option<int>): Option<int> = {\n  let sum = 1 + 2\n  value\n}";
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, uri.clone(), source.into(), 1)
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &uri)
+			.unwrap()
+			.is_empty()
+	);
+
+	assert_eq!(
+		hover_needle(&compiler, &docs, &uri, source, "Option<int>"),
+		Some("```nymph\nOption<int>\n```".to_string())
+	);
+	assert_eq!(
+		hover_needle(&compiler, &docs, &uri, source, "value\n}"),
+		Some("```nymph\nOption<int>\n```".to_string())
+	);
+}
+
+#[test]
+fn loose_files_in_one_directory_remain_isolated_when_both_are_open() {
+	let temp = tempfile::tempdir().unwrap();
+	let main_uri = uri(&temp.path().join("main.nym"));
+	let dependency_uri = uri(&temp.path().join("dependency.nym"));
+	let main_source =
+		"import @/dependency with (value)\nfunc use(): Option<int> = Some(value = value())";
+	let dependency_source = "public func value(): int = 1";
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+
+	compiler
+		.open(&mut docs, main_uri.clone(), main_source.into(), 1)
+		.unwrap();
+	let before = compiler.diagnostics_for_uri(&docs, &main_uri).unwrap();
+	assert!(
+		before
+			.iter()
+			.any(|diagnostic| diagnostic.diag.code == "IMPORT-UNRESOLVED")
+	);
+	assert!(compiler.analysis_for_uri(&docs, &main_uri).is_none());
+
+	let affected = compiler
+		.open(
+			&mut docs,
+			dependency_uri.clone(),
+			dependency_source.into(),
+			1,
+		)
+		.unwrap();
+	assert_eq!(affected, vec![dependency_uri]);
+	let after = compiler.diagnostics_for_uri(&docs, &main_uri).unwrap();
+	assert!(
+		after
+			.iter()
+			.any(|diagnostic| diagnostic.diag.code == "IMPORT-UNRESOLVED"),
+		"opening a loose sibling must not create a project import graph: {after:?}"
+	);
+	assert!(compiler.analysis_for_uri(&docs, &main_uri).is_none());
+}
+
+#[test]
+fn private_unresolved_and_malformed_project_hover_return_none_without_panicking() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='negative-hover'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let main_uri = uri(&main_path);
+	let private_source = "import @/dep with (hidden)\nfunc use(): int = hidden()";
+	fs::write(&main_path, private_source).unwrap();
+	fs::write(&dep_path, "private func hidden(): int = 1").unwrap();
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), private_source.into(), 1)
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.iter()
+			.any(|diagnostic| diagnostic.diag.code == "IMPORT-PRIVATE-NAME")
+	);
+	assert_eq!(
+		hover_needle(&compiler, &docs, &main_uri, private_source, "hidden()"),
+		None
+	);
+
+	let unresolved = "import @/missing with (answer)\nfunc use(): int = answer()";
+	compiler
+		.change(&mut docs, &main_uri, unresolved.into(), 2)
+		.unwrap();
+	assert!(compiler.analysis_for_uri(&docs, &main_uri).is_none());
+
+	let malformed = "func broken(): int = {\n  let value =";
+	compiler
+		.change(&mut docs, &main_uri, malformed.into(), 3)
+		.unwrap();
+	assert!(compiler.analysis_for_uri(&docs, &main_uri).is_none());
 }
 
 #[test]
