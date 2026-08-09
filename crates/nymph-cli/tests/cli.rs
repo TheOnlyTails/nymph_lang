@@ -114,11 +114,17 @@ fn doc_generates_default_and_custom_deterministic_sites_with_visibility_and_link
 	let default = root.join("target/nymph/doc");
 	let index = std::fs::read_to_string(default.join("index.html")).unwrap();
 	let main = std::fs::read_to_string(default.join("modules/main.html")).unwrap();
+	let model = std::fs::read_to_string(default.join("modules/model/token.html")).unwrap();
+	let token_anchor = model
+		.split_once("<section id=\"")
+		.and_then(|(_, html)| html.split_once('"'))
+		.map(|(anchor, _)| anchor)
+		.expect("Token documentation should have an item anchor");
 	assert!(index.contains("modules/model/token.html"), "{index}");
 	assert!(main.contains("echo"), "{main}");
 	assert!(!main.contains("hidden"), "{main}");
 	assert!(
-		main.contains("modules/model/token.html#item-Token-0"),
+		main.contains(&format!("modules/model/token.html#{token_anchor}")),
 		"cross-module type should link by its semantic target: {main}"
 	);
 	let first = std::fs::read(default.join("modules/main.html")).unwrap();
