@@ -21,6 +21,8 @@
 //! So hovering a `let` binder returns `None`; hovering its initializer
 //! expression, or a later `Identifier` use of the bound name, resolves.
 
+use std::{collections::HashSet, sync::Arc};
+
 use ecow::EcoString;
 use nymph_ast::{
 	Ident, NodeId, Span, Spanned,
@@ -38,10 +40,139 @@ use nymph_ast::{
 use rustc_hash::FxHashMap;
 
 use crate::{
-	Checked, DefId, GenericArgs, Interner, Ty, TyKind,
+	Checked, DeclarationCategory, DeclarationKey, DefId, GenericArgs, Interner, ModuleEnvironment,
+	ResolvedImportBinding, Ty, TyKind,
 	annotate::VariantResolution,
 	def::{self, DefMap},
 };
+
+/// Editor-facing category of a name made lexically available by an import.
+///
+/// This deliberately carries only stable semantic meaning needed by tooling;
+/// checker-local IDs and resolver internals remain private to sema/compiler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportedNameKind {
+	Function,
+	Value,
+	TypeAlias,
+	Struct,
+	Enum,
+	Interface,
+	Namespace,
+	Variant,
+}
+
+/// One resolved spelling visible in the importing module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportedName {
+	pub name: String,
+	pub kind: ImportedNameKind,
+}
+
+/// Project resolved import bindings into immutable, editor-facing facts.
+///
+/// Aliases are retained as their local spelling, namespace imports are
+/// represented directly, imported enums contribute their known bare variants,
+/// and unresolved/private imports (`Poison`) are omitted. The compiler remains
+/// the sole owner of import resolution and visibility.
+#[must_use]
+pub fn imported_names(
+	bindings: &FxHashMap<EcoString, ResolvedImportBinding>,
+	modules: &[Arc<ModuleEnvironment>],
+) -> Vec<ImportedName> {
+	let mut names = bindings
+		.iter()
+		.filter_map(|(name, binding)| {
+			let kind = match binding {
+				ResolvedImportBinding::Namespace(_) => ImportedNameKind::Namespace,
+				ResolvedImportBinding::Poison => return None,
+				ResolvedImportBinding::Definition(definition) => match &definition.key {
+					DeclarationKey::TopLevel { category, .. } | DeclarationKey::Member { category, .. } => {
+						match category {
+							DeclarationCategory::Function | DeclarationCategory::Method => {
+								ImportedNameKind::Function
+							}
+							DeclarationCategory::Let | DeclarationCategory::Field => ImportedNameKind::Value,
+							DeclarationCategory::TypeAlias => ImportedNameKind::TypeAlias,
+							DeclarationCategory::Struct => ImportedNameKind::Struct,
+							DeclarationCategory::Enum => ImportedNameKind::Enum,
+							DeclarationCategory::Interface => ImportedNameKind::Interface,
+							DeclarationCategory::Namespace => ImportedNameKind::Namespace,
+							DeclarationCategory::Variant => ImportedNameKind::Variant,
+							DeclarationCategory::Static
+							| DeclarationCategory::Implementation
+							| DeclarationCategory::MethodBody => return None,
+						}
+					}
+					DeclarationKey::Implementation { .. }
+					| DeclarationKey::RecoveredImplementation { .. }
+					| DeclarationKey::MethodBody { .. }
+					| DeclarationKey::MaterializedInterfaceMember { .. } => return None,
+				},
+			};
+			Some(ImportedName {
+				name: name.to_string(),
+				kind,
+			})
+		})
+		.collect::<Vec<_>>();
+	names.sort_by(|left, right| left.name.cmp(&right.name));
+	let mut seen = names
+		.iter()
+		.map(|imported| imported.name.clone())
+		.collect::<HashSet<_>>();
+	let imported_enums = bindings
+		.values()
+		.filter_map(|binding| match binding {
+			ResolvedImportBinding::Definition(definition)
+				if matches!(
+					definition.key,
+					DeclarationKey::TopLevel {
+						category: DeclarationCategory::Enum,
+						..
+					}
+				) =>
+			{
+				Some(definition)
+			}
+			_ => None,
+		})
+		.collect::<HashSet<_>>();
+	let variants = modules.iter().flat_map(|module| match module.as_ref() {
+		ModuleEnvironment::Complete(interface) => interface
+			.exports
+			.iter()
+			.filter(|definition| imported_enums.contains(&definition.id))
+			.flat_map(|definition| {
+				definition
+					.variants
+					.iter()
+					.map(|variant| variant.name.as_str())
+			})
+			.collect::<Vec<_>>(),
+		ModuleEnvironment::Recovered(interface) => interface
+			.exports
+			.iter()
+			.filter(|definition| imported_enums.contains(&definition.id))
+			.flat_map(|definition| {
+				definition
+					.variants
+					.iter()
+					.map(|variant| variant.name.as_str())
+			})
+			.collect::<Vec<_>>(),
+	});
+	for variant in variants {
+		if seen.insert(variant.to_string()) {
+			names.push(ImportedName {
+				name: variant.to_string(),
+				kind: ImportedNameKind::Variant,
+			});
+		}
+	}
+	names.sort_by(|left, right| left.name.cmp(&right.name));
+	names
+}
 
 /// Find the type of the smallest checked expression covering byte `offset`
 /// in `module`, rendered as a display string (`"int"`, `"#[Option<T0>]"`,
@@ -4945,6 +5076,63 @@ mod type_at_tests {
 		assert_eq!(
 			type_at(&module, &checked, offset),
 			Some("namespace func make(): int".to_string())
+		);
+	}
+}
+
+#[cfg(test)]
+mod imported_name_tests {
+	use super::*;
+	use crate::{DefinitionId, ModuleIdentity, ModuleOrigin};
+
+	fn definition(category: DeclarationCategory, name: &str) -> DefinitionId {
+		DefinitionId::new(
+			ModuleIdentity {
+				origin: ModuleOrigin::Project("project".into()),
+				project: "project".into(),
+				path: "dependency".into(),
+			},
+			DeclarationKey::top_level(category, name),
+		)
+	}
+
+	#[test]
+	fn imported_names_preserve_aliases_kinds_and_omit_poison() {
+		let mut bindings = FxHashMap::default();
+		bindings.insert(
+			"renamed".into(),
+			ResolvedImportBinding::Definition(definition(DeclarationCategory::Function, "original")),
+		);
+		bindings.insert(
+			"Shape".into(),
+			ResolvedImportBinding::Definition(definition(DeclarationCategory::Struct, "Shape")),
+		);
+		bindings.insert(
+			"dependency".into(),
+			ResolvedImportBinding::Namespace(ModuleIdentity {
+				origin: ModuleOrigin::Project("project".into()),
+				project: "project".into(),
+				path: "dependency".into(),
+			}),
+		);
+		bindings.insert("private_or_missing".into(), ResolvedImportBinding::Poison);
+
+		assert_eq!(
+			imported_names(&bindings, &[]),
+			vec![
+				ImportedName {
+					name: "Shape".into(),
+					kind: ImportedNameKind::Struct,
+				},
+				ImportedName {
+					name: "dependency".into(),
+					kind: ImportedNameKind::Namespace,
+				},
+				ImportedName {
+					name: "renamed".into(),
+					kind: ImportedNameKind::Function,
+				},
+			]
 		);
 	}
 }

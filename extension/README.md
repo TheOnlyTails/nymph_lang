@@ -52,6 +52,12 @@ unsaved overlays for every open dependency. A saved `.nym` file outside a projec
 one-file library with the ambient prelude; it has no project import graph. The extension currently
 registers language-server features for `file:` documents only, not untitled editor buffers.
 
+Completion for ordinary identifiers uses the latest immutable project analysis snapshot. It offers
+nearest lexical names first, then visible imported names (including aliases and unsaved dependency
+overlays), same-module declarations, and keywords. Prefix filtering applies within those tiers.
+Completion after `.` intentionally returns no members yet; member completion and auto-import edits
+are not currently supported. Files outside a project retain lexical and same-file completion.
+
 ## Nymph files
 
 `.nym` is the only Nymph source-file suffix. Functions use

@@ -9,11 +9,13 @@ use std::{
 };
 
 use lsp_types::{
-	HoverContents, HoverParams, MarkupContent, Position, SemanticTokensParams,
-	TextDocumentIdentifier, TextDocumentPositionParams, Uri, WorkDoneProgressParams,
+	CompletionItem, CompletionParams, CompletionResponse, HoverContents, HoverParams, MarkupContent,
+	Position, SemanticTokensParams, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
+	WorkDoneProgressParams,
 };
 use nymph_lsp::{
-	compiler_state::CompilerState, document_store::DocumentStore, hover, semantic_tokens, workspace,
+	compiler_state::CompilerState, completion, document_store::DocumentStore, hover, semantic_tokens,
+	workspace,
 };
 
 fn uri(path: &Path) -> Uri {
@@ -71,6 +73,183 @@ fn hover_needle(
 			.rfind('\n')
 			.map_or(0, |newline| newline + 1);
 	hover_value(compiler, docs, uri, line, character as u32)
+}
+
+fn completion_items(
+	compiler: &CompilerState,
+	docs: &DocumentStore,
+	uri: &Uri,
+	line: u32,
+	character: u32,
+) -> Vec<CompletionItem> {
+	let snapshot = compiler.completion_for_uri(docs, uri).unwrap();
+	let response = completion::completion_snapshot(
+		&snapshot,
+		&CompletionParams {
+			text_document_position: TextDocumentPositionParams {
+				text_document: TextDocumentIdentifier { uri: uri.clone() },
+				position: Position { line, character },
+			},
+			work_done_progress_params: WorkDoneProgressParams::default(),
+			partial_result_params: Default::default(),
+			context: None,
+		},
+	);
+	match response {
+		CompletionResponse::Array(items) => items,
+		CompletionResponse::List(list) => list.items,
+	}
+}
+
+#[test]
+fn project_completion_uses_resolved_imports_ranking_kinds_and_shadowing() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='completion'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let source = "import @/dep with (call as imported_alias, spare, Shape, Choice as Selected, hidden)\nfunc z_local_top(): int = 1\nfunc main(): int = {\n  let imported_alias = 1\n  imported_alias\n}";
+	fs::write(&main_path, source).unwrap();
+	fs::write(
+		&dep_path,
+		"public func call(): int = 1\npublic func spare(): int = 1\npublic struct Shape(value: int)\npublic enum Choice { First, Second(value: int) }\nprivate func hidden(): int = 1",
+	)
+	.unwrap();
+	let main_uri = uri(&main_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), source.into(), 1)
+		.unwrap();
+
+	let items = completion_items(&compiler, &docs, &main_uri, 4, 2);
+	let labels = items
+		.iter()
+		.map(|item| item.label.as_str())
+		.collect::<Vec<_>>();
+	assert_eq!(
+		labels
+			.iter()
+			.filter(|label| **label == "imported_alias")
+			.count(),
+		1,
+		"lexical shadowing must de-duplicate the imported spelling: {labels:?}"
+	);
+	let alias = items
+		.iter()
+		.find(|item| item.label == "imported_alias")
+		.unwrap();
+	assert_eq!(alias.kind, Some(lsp_types::CompletionItemKind::VARIABLE));
+	let shape = items.iter().find(|item| item.label == "Shape").unwrap();
+	assert_eq!(shape.kind, Some(lsp_types::CompletionItemKind::STRUCT));
+	let spare = items.iter().find(|item| item.label == "spare").unwrap();
+	assert_eq!(spare.kind, Some(lsp_types::CompletionItemKind::FUNCTION));
+	let selected = items.iter().find(|item| item.label == "Selected").unwrap();
+	assert_eq!(selected.kind, Some(lsp_types::CompletionItemKind::ENUM));
+	for variant in ["First", "Second"] {
+		let variant = items.iter().find(|item| item.label == variant).unwrap();
+		assert_eq!(
+			variant.kind,
+			Some(lsp_types::CompletionItemKind::ENUM_MEMBER)
+		);
+	}
+	assert!(
+		!labels.contains(&"call"),
+		"only the visible alias completes"
+	);
+	assert!(
+		!labels.contains(&"hidden"),
+		"private imports never complete"
+	);
+	assert!(
+		labels.iter().position(|label| *label == "Shape").unwrap()
+			< labels
+				.iter()
+				.position(|label| *label == "z_local_top")
+				.unwrap()
+	);
+	assert!(
+		labels
+			.iter()
+			.position(|label| *label == "z_local_top")
+			.unwrap()
+			< labels.iter().position(|label| *label == "while").unwrap()
+	);
+	let mut client_sorted = items.clone();
+	client_sorted.sort_by(|left, right| {
+		left
+			.sort_text
+			.as_deref()
+			.unwrap_or(&left.label)
+			.cmp(right.sort_text.as_deref().unwrap_or(&right.label))
+	});
+	assert_eq!(
+		client_sorted
+			.iter()
+			.map(|item| item.label.as_str())
+			.collect::<Vec<_>>(),
+		labels,
+		"LSP sortText must preserve tier order in clients"
+	);
+}
+
+#[test]
+fn project_completion_uses_latest_dependency_overlay_with_partial_source() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='completion-overlay'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let source = "import @/dep\nfunc main(): int = {\n  ";
+	fs::write(&main_path, source).unwrap();
+	fs::write(&dep_path, "public func disk_name(): int = 1").unwrap();
+	let main_uri = uri(&main_path);
+	let dep_uri = uri(&dep_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), source.into(), 1)
+		.unwrap();
+	let stale_snapshot = compiler.completion_for_uri(&docs, &main_uri).unwrap();
+	let before = completion_items(&compiler, &docs, &main_uri, 2, 2);
+	assert!(before.iter().any(|item| item.label == "disk_name"));
+
+	compiler
+		.open(
+			&mut docs,
+			dep_uri.clone(),
+			"public func overlay_name(): int = 1\npublic enum OverlayChoice { Known }\nfunc broken("
+				.into(),
+			1,
+		)
+		.unwrap();
+	let after = completion_items(&compiler, &docs, &main_uri, 2, 2);
+	assert!(after.iter().any(|item| item.label == "overlay_name"));
+	assert!(after.iter().any(|item| item.label == "OverlayChoice"));
+	assert!(after.iter().any(|item| item.label == "Known"));
+	assert!(!after.iter().any(|item| item.label == "disk_name"));
+	let mut stale_was_published = false;
+	nymph_lsp::compiler_state::publish_completion_if_current(
+		&docs,
+		&main_uri,
+		&stale_snapshot,
+		(),
+		|()| stale_was_published = true,
+	);
+	assert!(!stale_was_published);
+
+	compiler.close(&mut docs, &dep_uri).unwrap();
+	let restored = completion_items(&compiler, &docs, &main_uri, 2, 2);
+	assert!(restored.iter().any(|item| item.label == "disk_name"));
+	assert!(!restored.iter().any(|item| item.label == "overlay_name"));
 }
 
 #[test]

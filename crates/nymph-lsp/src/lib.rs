@@ -15,8 +15,9 @@
 //! declarations, parser-only (see [`document_symbols`]);
 //! `textDocument/definition` jumps an identifier/variant/type-name use to its
 //! declaration, AST + `DefMap`-only, no type-check (see [`definition`]);
-//! `textDocument/completion` offers in-scope identifiers and keywords (see
-//! [`completion`] — member completion after a `.` is deferred, see its
+//! `textDocument/completion` offers lexical names, resolved project imports,
+//! same-module declarations, and keywords from an immutable analysis snapshot
+//! (see [`completion`] — member completion after a `.` is deferred, see its
 //! module doc comment); `textDocument/semanticTokens/full` classifies every
 //! token from the compiler's own lexer + AST, so highlighting stays correct
 //! independent of the TextMate grammar (see [`semantic_tokens`]).
@@ -162,6 +163,22 @@ fn prepare_definition_response(
 	prepare_if_current(docs, uri, snapshot, value)
 }
 
+fn prepare_completion_response(
+	docs: &Mutex<DocumentStore>,
+	uri: &lsp_types::Uri,
+	snapshot: &compiler_state::CompletionSnapshot,
+	value: lsp_types::CompletionResponse,
+) -> Option<Option<lsp_types::CompletionResponse>> {
+	let mut prepared = None;
+	{
+		let docs = docs.lock().unwrap();
+		compiler_state::publish_completion_if_current(&docs, uri, snapshot, Some(value), |value| {
+			prepared = Some(value);
+		});
+	}
+	prepared
+}
+
 fn main_loop(
 	connection: &Connection,
 	docs: &Arc<Mutex<DocumentStore>>,
@@ -234,10 +251,23 @@ fn main_loop(
 					}
 				} else if req.method == Completion::METHOD {
 					let (id, params) = req.extract::<CompletionParams>(Completion::METHOD)?;
-					let result = completion::completion(&docs.lock().unwrap(), &params);
-					connection
-						.sender
-						.send(Message::Response(Response::new_ok(id, result)))?;
+					let uri = &params.text_document_position.text_document.uri;
+					let snapshot = compiler
+						.lock()
+						.unwrap()
+						.completion_for_uri(&docs.lock().unwrap(), uri);
+					let response = match snapshot {
+						Some(snapshot) => {
+							let result = completion::completion_snapshot(&snapshot, &params);
+							prepare_completion_response(docs, uri, &snapshot, result)
+						}
+						None => Some(completion::completion(&docs.lock().unwrap(), &params)),
+					};
+					if let Some(result) = response {
+						connection
+							.sender
+							.send(Message::Response(Response::new_ok(id, result)))?;
+					}
 				} else if req.method == SemanticTokensFullRequest::METHOD {
 					let (id, params) =
 						req.extract::<SemanticTokensParams>(SemanticTokensFullRequest::METHOD)?;
@@ -1090,6 +1120,7 @@ mod tests {
 			.open(&mut docs, uri.clone(), "func f(): int = 1".into(), 1)
 			.unwrap();
 		let snapshot = compiler.analysis_for_uri(&docs, &uri).unwrap();
+		let completion_snapshot = compiler.completion_for_uri(&docs, &uri).unwrap();
 		compiler.close(&mut docs, &uri).unwrap();
 		compiler
 			.open(&mut docs, uri.clone(), "func f(): boolean = true".into(), 1)
@@ -1099,6 +1130,15 @@ mod tests {
 		assert!(prepare_hover_response(&docs, &uri, &snapshot, None).is_none());
 		assert!(prepare_semantic_tokens_response(&docs, &uri, &snapshot, None).is_none());
 		assert!(prepare_definition_response(&docs, &uri, &snapshot, None).is_none());
+		assert!(
+			prepare_completion_response(
+				&docs,
+				&uri,
+				&completion_snapshot,
+				lsp_types::CompletionResponse::Array(Vec::new()),
+			)
+			.is_none()
+		);
 	}
 
 	/// A round trip through the real `Connection::memory()` wire (not just a
@@ -1239,7 +1279,8 @@ mod tests {
 	}
 
 	/// A round trip proving `textDocument/completion` is dispatched by
-	/// `main_loop` and returns at least one top-level name and one keyword.
+	/// `main_loop` through project analysis and returns imported, same-module,
+	/// and keyword tiers.
 	#[test]
 	fn completion_request_round_trips_through_the_wire() {
 		use lsp_types::{
@@ -1252,8 +1293,22 @@ mod tests {
 		let handle = std::thread::spawn(move || run(server));
 		handshake(&client);
 
-		let uri: Uri = "file:///wire_complete.nym".parse().unwrap();
-		let text = "func helper(): int = 1\nfunc main(): int = 1";
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='wire-completion'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let main_path = temp.path().join("src/main.nym");
+		std::fs::write(
+			temp.path().join("src/dep.nym"),
+			"public func imported(): int = 1",
+		)
+		.unwrap();
+		let text = "import @/dep with (imported as imported_alias)\nfunc helper(): int = 1\nfunc main(): int = 1";
+		std::fs::write(&main_path, text).unwrap();
+		let uri = workspace::path_to_uri(&main_path).unwrap();
 		client
 			.sender
 			.send(Message::Notification(Notification::new(
@@ -1279,7 +1334,7 @@ mod tests {
 					text_document_position: TextDocumentPositionParams {
 						text_document: TextDocumentIdentifier { uri: uri.clone() },
 						position: Position {
-							line: 1,
+							line: 2,
 							character: 0,
 						},
 					},
@@ -1303,6 +1358,10 @@ mod tests {
 			CompletionResponse::Array(items) => items.into_iter().map(|i| i.label).collect(),
 			CompletionResponse::List(list) => list.items.into_iter().map(|i| i.label).collect(),
 		};
+		assert!(
+			labels.contains(&"imported_alias".to_string()),
+			"got {labels:?}"
+		);
 		assert!(labels.contains(&"helper".to_string()), "got {labels:?}");
 		assert!(labels.contains(&"func".to_string()), "got {labels:?}");
 

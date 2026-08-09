@@ -292,6 +292,13 @@ pub struct ModuleAnalysis {
 	pub diagnostics: ProjectDiagnostics,
 }
 
+/// Body-independent completion facts paired with the exact source input that
+/// produced them.
+pub struct ToolingCompletionAnalysis {
+	pub source: Arc<str>,
+	pub imported_names: Arc<[nymph_sema::query::ImportedName]>,
+}
+
 /// Project diagnostics are deliberately separate from reusable semantic facts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectDiagnostics(pub Arc<[ProjectDiagnostic]>);
@@ -859,6 +866,48 @@ impl CompilerSession {
 					.collect()
 			})
 			.collect()
+	}
+
+	/// Return explicit imported-name facts even when partial source prevents a
+	/// checked-body analysis from being produced.
+	#[doc(hidden)]
+	#[must_use]
+	pub fn tooling_completion_analysis(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		ambient_prelude: bool,
+	) -> Option<ToolingCompletionAnalysis> {
+		let input = self.registry.get(&(project.clone(), module))?.input;
+		let key = self.tooling_key(project.clone(), entry, ambient_prelude);
+		let common = input.project(&self.db) == project
+			&& key.project_input(&self.db).project(&self.db) == project
+			&& key
+				.project_input(&self.db)
+				.active_modules(&self.db)
+				.contains(&input);
+		if !common {
+			return None;
+		}
+		let source = input.source(&self.db)?;
+		let graph = queries::project_graph(&self.db, key);
+		let modules = graph
+			.semantic_direct_dependencies(SemanticModuleInput::Project(input))
+			.iter()
+			.copied()
+			.map(|dependency| queries::interface_module_environment(&self.db, key, dependency))
+			.collect::<Vec<_>>();
+		let imported_names = nymph_sema::query::imported_names(
+			&queries::resolved_module_imports(&self.db, key, SemanticModuleInput::Project(input))
+				.bindings,
+			&modules,
+		)
+		.into();
+		Some(ToolingCompletionAnalysis {
+			source,
+			imported_names,
+		})
 	}
 
 	/// Return tooling analysis under the same request key used by
