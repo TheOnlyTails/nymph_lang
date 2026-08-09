@@ -131,6 +131,37 @@ impl CompilerState {
 			return Ok(Vec::new());
 		};
 		self.diagnostic_targets.remove(uri.as_str());
+		self.sources.remove(uri);
+		let remaining_overlay = self
+			.documents
+			.iter()
+			.filter(|(_, candidate)| {
+				candidate.project == identity.project
+					&& candidate.module == identity.module
+					&& candidate.without_prelude == identity.without_prelude
+			})
+			.filter_map(|(open_uri, _)| {
+				docs
+					.get(open_uri)
+					.map(|document| (open_uri.clone(), document.text.clone(), document.version))
+			})
+			.max_by(
+				|(left_uri, _, left_version), (right_uri, _, right_version)| {
+					left_version
+						.cmp(right_version)
+						.then_with(|| left_uri.as_str().cmp(right_uri.as_str()))
+				},
+			);
+		if let Some((open_uri, source, version)) = remaining_overlay {
+			self.session_mut(identity.without_prelude).set_source(
+				identity.project.clone(),
+				identity.module.clone(),
+				source.clone(),
+				SourceVersion(i64::from(version)),
+			);
+			self.sources.insert(open_uri, source.into());
+			return Ok(self.open_project_documents_for(docs, &identity.project));
+		}
 		let path = workspace::uri_to_path(uri);
 		match fs::read_to_string(path) {
 			Ok(source) => {
@@ -146,7 +177,6 @@ impl CompilerState {
 				self
 					.session_mut(identity.without_prelude)
 					.remove_source(identity.project.clone(), identity.module.clone());
-				self.sources.remove(uri);
 			}
 			Err(error) => return Err(error.into()),
 		}
@@ -447,7 +477,7 @@ impl CompilerState {
 			root: root.clone(),
 			without_prelude,
 		};
-		self.documents.insert(uri.clone(), identity);
+		self.documents.insert(uri.clone(), identity.clone());
 
 		if scan_disk && self.synchronized_roots.insert(root.clone()) {
 			for (path, module) in nymph_files(&root)? {
@@ -479,6 +509,20 @@ impl CompilerState {
 					.sources
 					.insert(open_uri.clone(), Arc::from(document.text.as_str()));
 			}
+		}
+		// Equivalent URI spellings can name the same module. The notification
+		// currently being synchronized is authoritative regardless of hash-map
+		// iteration order above; closing it later restores another live overlay.
+		if let Some(document) = docs.get(uri) {
+			self.session_mut(identity.without_prelude).set_source(
+				project,
+				identity.module,
+				document.text.clone(),
+				SourceVersion(i64::from(document.version)),
+			);
+			self
+				.sources
+				.insert(uri.clone(), Arc::from(document.text.as_str()));
 		}
 		Ok(())
 	}

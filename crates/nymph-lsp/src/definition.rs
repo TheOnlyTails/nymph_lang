@@ -282,6 +282,43 @@ mod tests {
 	}
 
 	#[test]
+	fn closing_one_equivalent_uri_keeps_the_other_overlay_authoritative() {
+		let main = "import @/target with (answer)\nfunc use(): int = answer()";
+		let mut fixture = ProjectFixture::new(main, "public func answer(): int = 1");
+		let alternate: Uri = fixture
+			.target_uri
+			.as_str()
+			.replace("target.nym", "%74arget.nym")
+			.parse()
+			.unwrap();
+		fixture.open_target(
+			fixture.target_uri.clone(),
+			"\npublic func answer(): int = 2",
+			2,
+		);
+		fixture.open_target(alternate.clone(), "\n\npublic func answer(): int = 3", 3);
+		assert_eq!(fixture.location(1, 18).unwrap().range.start.line, 2);
+		fixture
+			.state
+			.close(&mut fixture.docs, &fixture.target_uri)
+			.unwrap();
+		assert_eq!(fixture.location(1, 18).unwrap().range.start.line, 2);
+
+		fixture.open_target(
+			fixture.target_uri.clone(),
+			"\npublic func answer(): int = 4",
+			4,
+		);
+		assert_eq!(fixture.location(1, 18).unwrap().range.start.line, 1);
+		fixture
+			.state
+			.close(&mut fixture.docs, &fixture.target_uri)
+			.unwrap();
+
+		assert_eq!(fixture.location(1, 18).unwrap().range.start.line, 2);
+	}
+
+	#[test]
 	fn close_restores_disk_provenance_and_deletion_removes_the_target() {
 		let main = "import @/target with (answer)\nfunc use(): int = answer()";
 		let disk = "public func answer(): int = 1";
