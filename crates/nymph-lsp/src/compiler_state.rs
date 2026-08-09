@@ -57,6 +57,7 @@ pub struct DefinitionTargetSnapshot {
 	pub uri: Uri,
 	pub source: Arc<str>,
 	pub span: nymph_ast::Span,
+	pub requires_disk_validation: bool,
 }
 
 pub struct CompilerState {
@@ -284,7 +285,18 @@ impl CompilerState {
 		let span = analysis.declaration_provenance(&definition)?.name_span;
 		let uri = workspace::key_to_uri(&snapshot.root, module.as_str())?;
 		let source = analysis.source.clone();
-		valid_source_span(&source, span).then_some(DefinitionTargetSnapshot { uri, source, span })
+		let target_is_open = self.documents.iter().any(|(open_uri, identity)| {
+			identity.project == snapshot.project
+				&& identity.module == module
+				&& identity.without_prelude == snapshot.without_prelude
+				&& docs.get(open_uri).is_some()
+		});
+		valid_source_span(&source, span).then_some(DefinitionTargetSnapshot {
+			uri,
+			source,
+			span,
+			requires_disk_validation: !target_is_open,
+		})
 	}
 
 	pub fn diagnostics_for_uri(

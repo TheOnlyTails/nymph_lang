@@ -52,8 +52,40 @@ pub fn definition_snapshot(
 	snapshot: &AnalysisSnapshot,
 	params: &GotoDefinitionParams,
 ) -> Option<GotoDefinitionResponse> {
+	definition_snapshot_candidate(docs, state, snapshot, params)?.validate_disk_source()
+}
+
+pub(crate) struct DefinitionResponseCandidate {
+	response: GotoDefinitionResponse,
+	disk_source: Option<(std::path::PathBuf, std::sync::Arc<str>)>,
+}
+
+impl DefinitionResponseCandidate {
+	/// Validate unopened targets after releasing server-state locks. A session
+	/// intentionally retains disk sources between filesystem events, so an
+	/// externally changed or deleted file must not receive a stale location.
+	pub(crate) fn validate_disk_source(self) -> Option<GotoDefinitionResponse> {
+		if let Some((path, expected)) = self.disk_source {
+			let current = std::fs::read_to_string(path).ok()?;
+			if current.as_str() != expected.as_ref() {
+				return None;
+			}
+		}
+		Some(self.response)
+	}
+}
+
+pub(crate) fn definition_snapshot_candidate(
+	docs: &DocumentStore,
+	state: &CompilerState,
+	snapshot: &AnalysisSnapshot,
+	params: &GotoDefinitionParams,
+) -> Option<DefinitionResponseCandidate> {
 	if let Some(local) = definition(docs, params) {
-		return Some(local);
+		return Some(DefinitionResponseCandidate {
+			response: local,
+			disk_source: None,
+		});
 	}
 	let position = params.text_document_position_params.position;
 	let index = LineIndex::new(&snapshot.source);
@@ -62,10 +94,20 @@ pub fn definition_snapshot(
 		state.definition_target(docs, snapshot, candidate)
 	})?;
 	let target_index = LineIndex::new(&target.source);
-	Some(GotoDefinitionResponse::Scalar(Location {
+	let disk_source = target.requires_disk_validation.then(|| {
+		(
+			crate::workspace::uri_to_path(&target.uri),
+			target.source.clone(),
+		)
+	});
+	let response = GotoDefinitionResponse::Scalar(Location {
 		uri: target.uri,
 		range: target_index.range(&target.source, target.span),
-	}))
+	});
+	Some(DefinitionResponseCandidate {
+		response,
+		disk_source,
+	})
 }
 
 #[cfg(test)]
@@ -347,6 +389,18 @@ mod tests {
 			.close(&mut fixture.docs, &fixture.target_uri)
 			.unwrap();
 		assert!(fixture.location(1, 18).is_none());
+	}
+
+	#[test]
+	fn externally_stale_or_deleted_unopened_targets_do_not_produce_locations() {
+		let main = "import @/target with (answer)\nfunc use(): int = answer()";
+		let stale = ProjectFixture::new(main, "public func answer(): int = 1");
+		std::fs::write(&stale.target_path, "\npublic func answer(): int = 2").unwrap();
+		assert!(stale.location(1, 18).is_none());
+
+		let deleted = ProjectFixture::new(main, "public func answer(): int = 1");
+		std::fs::remove_file(&deleted.target_path).unwrap();
+		assert!(deleted.location(1, 18).is_none());
 	}
 
 	#[test]

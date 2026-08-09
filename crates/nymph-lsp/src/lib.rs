@@ -208,18 +208,24 @@ fn main_loop(
 					let snapshot = compiler.analysis_for_uri(&docs_guard, uri);
 					let response = match snapshot {
 						Some(snapshot) => {
-							let result =
-								definition::definition_snapshot(&docs_guard, &compiler, &snapshot, &params);
+							let candidate = definition::definition_snapshot_candidate(
+								&docs_guard,
+								&compiler,
+								&snapshot,
+								&params,
+							);
 							drop(docs_guard);
+							drop(compiler);
+							let result = candidate.and_then(|candidate| candidate.validate_disk_source());
 							prepare_definition_response(docs, uri, &snapshot, result)
 						}
 						None => {
 							let result = definition::definition(&docs_guard, &params);
 							drop(docs_guard);
+							drop(compiler);
 							Some(result)
 						}
 					};
-					drop(compiler);
 					if let Some(result) = response {
 						connection
 							.sender
