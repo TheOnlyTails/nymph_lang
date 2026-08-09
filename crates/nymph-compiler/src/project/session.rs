@@ -1202,13 +1202,14 @@ impl CompilerSession {
 	}
 
 	fn refresh_project(&mut self, project: ProjectId) {
-		let active: Arc<[ModuleInput]> = self
+		let mut active: Vec<ModuleInput> = self
 			.registry
 			.iter()
 			.filter(|((owner, _), record)| owner == &project && record.source.is_some())
 			.map(|(_, record)| record.input)
-			.collect::<Vec<_>>()
-			.into();
+			.collect();
+		active.sort_by_key(|module| module.path(&self.db));
+		let active: Arc<[ModuleInput]> = active.into();
 		let projects = self
 			.projects
 			.get_mut()
@@ -1481,6 +1482,28 @@ impl CompilerSession {
 			.iter()
 			.map(|importer| importer.path(&self.db))
 			.collect()
+	}
+
+	/// Return `module` followed by every transitive project importer.
+	///
+	/// Results are deterministic and dependency-before-importer. Importers at
+	/// the same distance are ordered by canonical module path. The project-wide
+	/// relation is tracked by Salsa and cycle-safe; callers do not need to keep
+	/// a separate reverse index synchronized with source edits.
+	#[must_use]
+	pub fn reverse_importer_closure(
+		&self,
+		project: ProjectId,
+		module: ModulePath,
+	) -> Vec<ModulePath> {
+		let projects = self
+			.projects
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		let Some(input) = projects.get(&project).copied() else {
+			return vec![module];
+		};
+		queries::project_dependency_graph(&self.db, input).reverse_importer_closure(module)
 	}
 
 	#[doc(hidden)]

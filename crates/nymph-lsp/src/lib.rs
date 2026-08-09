@@ -6,9 +6,10 @@
 //!
 //! MVP scope (see `extension/README.md`): `textDocument/didOpen` /
 //! `didChange` (full sync) / `didClose` keep an in-memory [`DocumentStore`]
-//! current; every open/change re-checks the document and republishes its
-//! full diagnostic set (loose single-file mode, or whole-project mode when a
-//! `nymph.toml` is found — see [`workspace`]); `textDocument/hover` answers
+//! current; project source changes and overlay closes re-check and republish
+//! the changed module plus its transitive reverse importers in stable
+//! dependency order (loose files remain single-document checks; see
+//! [`workspace`]); `textDocument/hover` answers
 //! with the type of the smallest checked expression under the cursor (see
 //! [`hover`]); `textDocument/documentSymbol` outlines a module's top-level
 //! declarations, parser-only (see [`document_symbols`]);
@@ -247,15 +248,14 @@ fn handle_notification(
 	match not.method.as_str() {
 		m if m == DidOpenTextDocument::METHOD => {
 			let params: DidOpenTextDocumentParams = serde_json::from_value(not.params)?;
+			let uri = params.text_document.uri;
 			let affected = compiler.lock().unwrap().open(
 				&mut docs.lock().unwrap(),
-				params.text_document.uri,
+				uri.clone(),
 				params.text_document.text,
 				params.text_document.version,
 			)?;
-			for affected_uri in affected {
-				diagnostics::check_and_publish_state(connection, docs, compiler, &affected_uri)?;
-			}
+			diagnostics::check_and_publish_affected(connection, docs, compiler, &uri, &affected)?;
 		}
 		m if m == DidChangeTextDocument::METHOD => {
 			let params: DidChangeTextDocumentParams = serde_json::from_value(not.params)?;
@@ -267,9 +267,7 @@ fn handle_notification(
 					change.text,
 					params.text_document.version,
 				)?;
-				for affected_uri in affected {
-					diagnostics::check_and_publish_state(connection, docs, compiler, &affected_uri)?;
-				}
+				diagnostics::check_and_publish_affected(connection, docs, compiler, &uri, &affected)?;
 			}
 		}
 		m if m == DidCloseTextDocument::METHOD => {
@@ -281,9 +279,13 @@ fn handle_notification(
 			if had_manifest_error {
 				diagnostics::clear(connection, &params.text_document.uri)?;
 			}
-			for uri in affected {
-				diagnostics::check_and_publish_state(connection, docs, compiler, &uri)?;
-			}
+			diagnostics::check_and_publish_affected(
+				connection,
+				docs,
+				compiler,
+				&params.text_document.uri,
+				&affected,
+			)?;
 		}
 		_ => {}
 	}
@@ -658,15 +660,18 @@ mod tests {
 		let main_path = temp.path().join("src/main.nym");
 		let middle_path = temp.path().join("src/middle.nym");
 		let leaf_path = temp.path().join("src/leaf.nym");
+		let unrelated_path = temp.path().join("src/unrelated.nym");
 		let main = "import @/middle with (middle)\nfunc use(): int = middle()";
 		let middle = "import @/leaf with (value)\npublic func middle(): int = value()";
 		let leaf = "public func value(): int = 1";
 		std::fs::write(&main_path, main).unwrap();
 		std::fs::write(&middle_path, middle).unwrap();
 		std::fs::write(&leaf_path, leaf).unwrap();
+		std::fs::write(&unrelated_path, "func stable(): int = 0").unwrap();
 		let main_uri = workspace::path_to_uri(&main_path).unwrap();
 		let middle_uri = workspace::path_to_uri(&middle_path).unwrap();
 		let leaf_uri = workspace::path_to_uri(&leaf_path).unwrap();
+		let unrelated_uri = workspace::path_to_uri(&unrelated_path).unwrap();
 		let (server, client) = Connection::memory();
 		let handle = std::thread::spawn(move || run(server));
 		handshake(&client);
@@ -695,30 +700,257 @@ mod tests {
 				.is_empty()
 		);
 
-		open(leaf_uri.clone(), 2, "public func value(): float = 1.0");
+		open(leaf_uri.clone(), 1, leaf);
+		for _ in 0..3 {
+			recv_diagnostics(&client);
+		}
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidChangeTextDocument::METHOD.into(),
+				serde_json::to_value(DidChangeTextDocumentParams {
+					text_document: VersionedTextDocumentIdentifier {
+						uri: leaf_uri.clone(),
+						version: 2,
+					},
+					content_changes: vec![TextDocumentContentChangeEvent {
+						range: None,
+						range_length: None,
+						text: "public func value(): float = 1.0".into(),
+					}],
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		let changed = [
+			recv_diagnostics(&client),
+			recv_diagnostics(&client),
+			recv_diagnostics(&client),
+		];
+		assert_eq!(
+			changed.iter().map(|params| &params.uri).collect::<Vec<_>>(),
+			[&leaf_uri, &middle_uri, &main_uri]
+		);
+		assert_eq!(
+			changed
+				.iter()
+				.map(|params| params.version)
+				.collect::<Vec<_>>(),
+			[Some(2), None, Some(1)]
+		);
 		assert!(
-			!recv_diagnostics_for(&client, &middle_uri)
-				.diagnostics
-				.is_empty(),
+			!changed[1].diagnostics.is_empty(),
 			"opening a dependency overlay did not republish its transitive importer diagnostics"
 		);
+		assert!(changed.iter().all(|params| params.uri != unrelated_uri));
+		assert!(client.receiver.try_recv().is_err());
 
 		client
 			.sender
 			.send(Message::Notification(Notification::new(
 				DidCloseTextDocument::METHOD.into(),
 				serde_json::to_value(DidCloseTextDocumentParams {
-					text_document: TextDocumentIdentifier { uri: leaf_uri },
+					text_document: TextDocumentIdentifier {
+						uri: leaf_uri.clone(),
+					},
 				})
 				.unwrap(),
 			)))
 			.unwrap();
+		let restored = [
+			recv_diagnostics(&client),
+			recv_diagnostics(&client),
+			recv_diagnostics(&client),
+		];
+		assert_eq!(
+			restored
+				.iter()
+				.map(|params| &params.uri)
+				.collect::<Vec<_>>(),
+			[&leaf_uri, &middle_uri, &main_uri]
+		);
 		assert!(
-			recv_diagnostics_for(&client, &middle_uri)
-				.diagnostics
-				.is_empty(),
+			restored[1].diagnostics.is_empty(),
 			"closing the overlay did not republish diagnostics from restored disk source"
 		);
+		assert_eq!(restored[0].version, None);
+		assert!(restored.iter().all(|params| params.uri != unrelated_uri));
+		assert!(client.receiver.try_recv().is_err());
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn cyclic_reverse_importers_publish_once_each_without_losing_cycle_diagnostics() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='wire-cycle'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let a_path = temp.path().join("src/a.nym");
+		let b_path = temp.path().join("src/b.nym");
+		std::fs::write(&a_path, "import @/b").unwrap();
+		std::fs::write(&b_path, "import @/a").unwrap();
+		let a_uri = workspace::path_to_uri(&a_path).unwrap();
+		let b_uri = workspace::path_to_uri(&b_path).unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		handshake(&client);
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidOpenTextDocument::METHOD.into(),
+				serde_json::to_value(DidOpenTextDocumentParams {
+					text_document: TextDocumentItem {
+						uri: a_uri.clone(),
+						language_id: "nymph".into(),
+						version: 1,
+						text: "import @/b".into(),
+					},
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+
+		let cycle = [recv_diagnostics(&client), recv_diagnostics(&client)];
+		assert_eq!(
+			cycle.iter().map(|params| &params.uri).collect::<Vec<_>>(),
+			[&a_uri, &b_uri]
+		);
+		assert!(
+			cycle
+				.iter()
+				.all(|params| params.diagnostics.iter().any(|diagnostic| {
+					diagnostic.code == Some(lsp_types::NumberOrString::String("IMPORT-CYCLE".into()))
+				}))
+		);
+		assert!(client.receiver.try_recv().is_err());
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn manifest_transition_clears_previously_published_reverse_importers() {
+		let temp = tempfile::tempdir().unwrap();
+		let manifest_path = temp.path().join("nymph.toml");
+		std::fs::write(
+			&manifest_path,
+			"[package]\nname='wire-manifest-transition'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let main_path = temp.path().join("src/main.nym");
+		let dependency_path = temp.path().join("src/dependency.nym");
+		let main = "import @/dependency with (value)\nfunc use(): int = value()";
+		let dependency = "public func value(): int = 1";
+		std::fs::write(&main_path, main).unwrap();
+		std::fs::write(&dependency_path, dependency).unwrap();
+		let main_uri = workspace::path_to_uri(&main_path).unwrap();
+		let dependency_uri = workspace::path_to_uri(&dependency_path).unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		handshake(&client);
+
+		let open = |uri: Uri, text: &str| {
+			client
+				.sender
+				.send(Message::Notification(Notification::new(
+					DidOpenTextDocument::METHOD.into(),
+					serde_json::to_value(DidOpenTextDocumentParams {
+						text_document: TextDocumentItem {
+							uri,
+							language_id: "nymph".into(),
+							version: 1,
+							text: text.into(),
+						},
+					})
+					.unwrap(),
+				)))
+				.unwrap();
+		};
+		open(main_uri.clone(), main);
+		assert!(
+			recv_diagnostics_for(&client, &main_uri)
+				.diagnostics
+				.is_empty()
+		);
+		open(dependency_uri.clone(), "public func value(): float = 1.0");
+		let overlay = [recv_diagnostics(&client), recv_diagnostics(&client)];
+		assert_eq!(
+			overlay.iter().map(|params| &params.uri).collect::<Vec<_>>(),
+			[&dependency_uri, &main_uri]
+		);
+		assert!(!overlay[1].diagnostics.is_empty());
+
+		std::fs::write(&manifest_path, "not = [toml").unwrap();
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidChangeTextDocument::METHOD.into(),
+				serde_json::to_value(DidChangeTextDocumentParams {
+					text_document: VersionedTextDocumentIdentifier {
+						uri: dependency_uri.clone(),
+						version: 2,
+					},
+					content_changes: vec![TextDocumentContentChangeEvent {
+						range: None,
+						range_length: None,
+						text: "public func value(): float = 2.0".into(),
+					}],
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(20),
+				HoverRequest::METHOD.into(),
+				serde_json::to_value(HoverParams {
+					text_document_position_params: TextDocumentPositionParams {
+						text_document: TextDocumentIdentifier {
+							uri: dependency_uri.clone(),
+						},
+						position: Position {
+							line: 0,
+							character: 12,
+						},
+					},
+					work_done_progress_params: WorkDoneProgressParams::default(),
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		let mut publications = Vec::new();
+		loop {
+			match client.receiver.recv().unwrap() {
+				Message::Response(response) => {
+					assert_eq!(response.id, RequestId::from(20));
+					break;
+				}
+				Message::Notification(notification)
+					if notification.method == lsp_types::notification::PublishDiagnostics::METHOD =>
+				{
+					publications
+						.push(serde_json::from_value::<PublishDiagnosticsParams>(notification.params).unwrap());
+				}
+				other => panic!("expected diagnostics or hover response, got {other:?}"),
+			}
+		}
+		assert_eq!(
+			publications
+				.iter()
+				.map(|params| &params.uri)
+				.collect::<Vec<_>>(),
+			[&dependency_uri, &main_uri]
+		);
+		assert_eq!(publications[0].version, Some(2));
+		assert_eq!(publications[1].version, Some(1));
+		assert_eq!(
+			publications[0].diagnostics[0].code,
+			Some(lsp_types::NumberOrString::String("MANIFEST".into()))
+		);
+		assert!(publications[1].diagnostics.is_empty());
 		shutdown(&client, handle);
 	}
 

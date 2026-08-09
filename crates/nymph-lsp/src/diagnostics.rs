@@ -3,7 +3,10 @@
 //! Both loose and project documents are checked through the shared,
 //! long-lived [`nymph_compiler::CompilerSession`] owned by [`CompilerState`].
 //! Project sessions include the compiler-owned embedded standard-library
-//! modules; only project modules with real workspace sources are published.
+//! modules. Notification refreshes consume the compiler's Salsa-backed
+//! reverse-importer closure in dependency-before-importer order, publishing
+//! every affected project URI once and publishing an empty list when its
+//! previous diagnostics have disappeared.
 
 use std::sync::{Arc, Mutex};
 
@@ -37,23 +40,34 @@ pub fn check_and_publish_state(
 	// compiler. Publication below holds neither mutex.
 	let docs_snapshot = docs.lock().unwrap().clone();
 	let document_revision = docs_snapshot.revision();
-	let mut compiler = compiler.lock().unwrap();
-	if let Some((message, stale_targets)) = compiler.manifest_error_snapshot(uri) {
-		drop(compiler);
+	let compiler_state = compiler.lock().unwrap();
+	if let Some((message, stale_targets)) = compiler_state.manifest_error_snapshot(uri) {
+		drop(compiler_state);
 		if docs.lock().unwrap().revision() != document_revision {
 			return Ok(());
 		}
 		let Some(document) = docs_snapshot.get(uri) else {
 			return Ok(());
 		};
-		for stale_uri in stale_targets {
-			clear(connection, &stale_uri)?;
-		}
+		compiler
+			.lock()
+			.unwrap()
+			.record_diagnostic_targets(uri, std::slice::from_ref(uri));
 		publish_manifest_error(connection, uri, &message, document.version)?;
+		for stale_uri in stale_targets {
+			let stale_document = docs_snapshot.get(&stale_uri);
+			publish(
+				connection,
+				&stale_uri,
+				stale_document.map_or("", |document| document.text.as_str()),
+				&[],
+				stale_document.map(|document| document.version),
+			)?;
+		}
 		return Ok(());
 	}
-	let snapshot = compiler.diagnostics_snapshot(&docs_snapshot, uri);
-	drop(compiler);
+	let snapshot = compiler_state.diagnostics_snapshot(&docs_snapshot, uri);
+	drop(compiler_state);
 	let Some(snapshot) = snapshot else {
 		return Ok(());
 	};
@@ -63,6 +77,53 @@ pub fn check_and_publish_state(
 	if docs.lock().unwrap().revision() != snapshot.document_revision {
 		return Ok(());
 	}
+	compiler
+		.lock()
+		.unwrap()
+		.record_diagnostic_targets(uri, &snapshot.owned_targets);
+	for module in snapshot.modules {
+		publish(
+			connection,
+			&module.uri,
+			&module.source,
+			&module.diagnostics,
+			module.version,
+		)?;
+	}
+	Ok(())
+}
+
+/// Re-check and publish an already ordered reverse-importer closure.
+///
+/// Each target is analyzed through the shared project session and published
+/// exactly once. The caller supplies dependency-before-importer order from the
+/// compiler's Salsa-backed dependency index.
+pub fn check_and_publish_affected(
+	connection: &Connection,
+	docs: &Arc<Mutex<DocumentStore>>,
+	compiler: &Arc<Mutex<CompilerState>>,
+	origin: &Uri,
+	uris: &[Uri],
+) -> anyhow::Result<()> {
+	if uris.is_empty() {
+		return Ok(());
+	}
+	if compiler.lock().unwrap().has_manifest_error(origin) {
+		return check_and_publish_state(connection, docs, compiler, origin);
+	}
+	let docs_snapshot = docs.lock().unwrap().clone();
+	let snapshot =
+		compiler
+			.lock()
+			.unwrap()
+			.affected_diagnostics_snapshot(&docs_snapshot, origin, uris);
+	if docs.lock().unwrap().revision() != snapshot.document_revision {
+		return Ok(());
+	}
+	compiler
+		.lock()
+		.unwrap()
+		.record_diagnostic_targets(origin, &snapshot.owned_targets);
 	for module in snapshot.modules {
 		publish(
 			connection,
