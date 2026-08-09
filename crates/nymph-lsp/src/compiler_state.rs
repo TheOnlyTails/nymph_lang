@@ -26,6 +26,23 @@ struct DocumentIdentity {
 	kind: DocumentKind,
 }
 
+impl DocumentIdentity {
+	fn module_identity(&self) -> ModuleIdentity {
+		ModuleIdentity {
+			project: self.project.clone(),
+			module: self.module.clone(),
+			without_prelude: self.without_prelude,
+		}
+	}
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ModuleIdentity {
+	project: ProjectId,
+	module: ModulePath,
+	without_prelude: bool,
+}
+
 #[derive(Clone)]
 enum DocumentKind {
 	Project(PathBuf),
@@ -80,7 +97,8 @@ pub struct CompilerState {
 	pub workspaces: HashMap<PathBuf, ProjectId>,
 	synchronized_roots: HashSet<PathBuf>,
 	documents: HashMap<Uri, DocumentIdentity>,
-	sources: HashMap<Uri, Arc<str>>,
+	effective_sources: HashMap<ModuleIdentity, Arc<str>>,
+	authoritative_overlays: HashMap<ModuleIdentity, Uri>,
 	manifest_errors: HashMap<Uri, String>,
 	diagnostic_targets: HashMap<String, Vec<String>>,
 }
@@ -109,7 +127,8 @@ impl CompilerState {
 			workspaces: HashMap::new(),
 			synchronized_roots: HashSet::new(),
 			documents: HashMap::new(),
-			sources: HashMap::new(),
+			effective_sources: HashMap::new(),
+			authoritative_overlays: HashMap::new(),
 			manifest_errors: HashMap::new(),
 			diagnostic_targets: HashMap::new(),
 		}
@@ -124,7 +143,7 @@ impl CompilerState {
 	) -> anyhow::Result<Vec<Uri>> {
 		docs.open(uri.clone(), text, version);
 		self.synchronize(docs, &uri)?;
-		Ok(self.affected_project_documents(&uri))
+		Ok(self.affected_project_documents(docs, &uri))
 	}
 
 	pub fn change(
@@ -136,11 +155,11 @@ impl CompilerState {
 	) -> anyhow::Result<Vec<Uri>> {
 		docs.change_full(uri, text, version);
 		self.synchronize(docs, uri)?;
-		Ok(self.affected_project_documents(uri))
+		Ok(self.affected_project_documents(docs, uri))
 	}
 
 	pub fn close(&mut self, docs: &mut DocumentStore, uri: &Uri) -> anyhow::Result<CloseAction> {
-		let previous = self.affected_project_documents(uri);
+		let previous = self.affected_project_documents(docs, uri);
 		// Remove the overlay before choosing the effective replacement source.
 		docs.close(uri);
 		self.manifest_errors.remove(uri);
@@ -148,85 +167,61 @@ impl CompilerState {
 			return Ok(CloseAction::Clear);
 		};
 		self.diagnostic_targets.remove(uri.as_str());
-		self.sources.remove(uri);
 		if !matches!(identity.kind, DocumentKind::Project(_)) {
 			self.documents.remove(uri);
 		}
-		let remaining_overlay = self
-			.documents
-			.iter()
-			.filter(|(_, candidate)| {
-				candidate.project == identity.project
-					&& candidate.module == identity.module
-					&& candidate.without_prelude == identity.without_prelude
-			})
-			.filter_map(|(open_uri, _)| {
-				docs
-					.get(open_uri)
-					.map(|document| (open_uri.clone(), document.text.clone(), document.version))
-			})
-			.max_by(
-				|(left_uri, _, left_version), (right_uri, _, right_version)| {
-					left_version
-						.cmp(right_version)
-						.then_with(|| left_uri.as_str().cmp(right_uri.as_str()))
-				},
-			);
+		let module_identity = identity.module_identity();
+		let remaining_overlay = self.remaining_overlay(docs, &module_identity, Some(uri));
 		if let Some((open_uri, source, version)) = remaining_overlay {
-			self.session_mut(identity.without_prelude).set_source(
-				identity.project.clone(),
-				identity.module.clone(),
-				source.clone(),
-				SourceVersion(i64::from(version)),
-			);
-			self.sources.insert(open_uri.clone(), source.clone().into());
+			self.set_effective_source(&module_identity, source, SourceVersion(i64::from(version)));
+			self
+				.authoritative_overlays
+				.insert(module_identity.clone(), open_uri);
 			if !matches!(identity.kind, DocumentKind::Project(_)) {
 				return Ok(CloseAction::Clear);
 			}
-			// The closed spelling remains a valid project publication target even
-			// when an equivalent URI spelling still supplies the live overlay.
-			self.sources.insert(uri.clone(), source.into());
 			let mut affected = previous;
-			for current in self.affected_project_documents(uri) {
+			for current in self.affected_project_documents(docs, uri) {
 				if !affected.contains(&current) {
 					affected.push(current);
 				}
 			}
 			return Ok(CloseAction::PublishProject(affected));
 		}
+		self.authoritative_overlays.remove(&module_identity);
 		let DocumentKind::Project(path) = identity.kind else {
-			self
-				.session_mut(identity.without_prelude)
-				.remove_source(identity.project, identity.module);
+			self.remove_effective_source(&module_identity);
 			return Ok(CloseAction::Clear);
 		};
 		match fs::read_to_string(path) {
 			Ok(source) => {
-				self.session_mut(identity.without_prelude).set_source(
-					identity.project.clone(),
-					identity.module.clone(),
-					source.clone(),
-					SourceVersion(0),
-				);
-				self.sources.insert(uri.clone(), source.into());
+				self.set_effective_source(&module_identity, source, SourceVersion(0));
 			}
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-				self
-					.session_mut(identity.without_prelude)
-					.remove_source(identity.project.clone(), identity.module.clone());
+				self.remove_effective_source(&module_identity);
 			}
 			Err(error) => return Err(error.into()),
 		}
 		let mut affected = previous;
-		for current in self.affected_project_documents(uri) {
+		for current in self.affected_project_documents(docs, uri) {
 			if !affected.contains(&current) {
 				affected.push(current);
+			}
+		}
+		let mut insert_at = affected
+			.iter()
+			.position(|candidate| candidate == uri)
+			.map_or(0, |index| index + 1);
+		for alias in self.published_closed_aliases(docs, &module_identity, uri) {
+			if !affected.contains(&alias) {
+				affected.insert(insert_at, alias);
+				insert_at += 1;
 			}
 		}
 		Ok(CloseAction::PublishProject(affected))
 	}
 
-	fn affected_project_documents(&self, uri: &Uri) -> Vec<Uri> {
+	fn affected_project_documents(&self, docs: &DocumentStore, uri: &Uri) -> Vec<Uri> {
 		let Some(identity) = self.documents.get(uri) else {
 			return vec![uri.clone()];
 		};
@@ -237,12 +232,143 @@ impl CompilerState {
 			.filter_map(|module| {
 				(module == identity.module)
 					.then(|| uri.clone())
-					.or_else(|| workspace::key_to_uri(&identity.root, module.as_str()))
+					.or_else(|| self.publication_uri(docs, identity, &module))
 			})
 			.collect()
 	}
 
+	fn publication_uri(
+		&self,
+		docs: &DocumentStore,
+		identity: &DocumentIdentity,
+		module: &ModulePath,
+	) -> Option<Uri> {
+		let module_identity = ModuleIdentity {
+			project: identity.project.clone(),
+			module: module.clone(),
+			without_prelude: identity.without_prelude,
+		};
+		self
+			.authoritative_overlays
+			.get(&module_identity)
+			.filter(|uri| docs.get(uri).is_some())
+			.cloned()
+			.or_else(|| {
+				self
+					.remaining_overlay(docs, &module_identity, None)
+					.map(|(uri, _, _)| uri)
+			})
+			.or_else(|| workspace::key_to_uri(&identity.root, module.as_str()))
+	}
+
+	fn remaining_overlay(
+		&self,
+		docs: &DocumentStore,
+		identity: &ModuleIdentity,
+		excluded: Option<&Uri>,
+	) -> Option<(Uri, String, i32)> {
+		if let Some(uri) = self.authoritative_overlays.get(identity)
+			&& excluded != Some(uri)
+			&& let Some(document) = docs.get(uri)
+		{
+			return Some((uri.clone(), document.text.clone(), document.version));
+		}
+		self
+			.documents
+			.iter()
+			.filter(|(uri, candidate)| excluded != Some(uri) && candidate.module_identity() == *identity)
+			.filter_map(|(uri, _)| {
+				docs
+					.get(uri)
+					.map(|document| (uri.clone(), document.text.clone(), document.version))
+			})
+			.max_by(
+				|(left_uri, _, left_version), (right_uri, _, right_version)| {
+					left_version
+						.cmp(right_version)
+						.then_with(|| left_uri.as_str().cmp(right_uri.as_str()))
+				},
+			)
+	}
+
+	fn published_closed_aliases(
+		&self,
+		docs: &DocumentStore,
+		identity: &ModuleIdentity,
+		origin: &Uri,
+	) -> Vec<Uri> {
+		let mut aliases: Vec<_> = self
+			.diagnostic_targets
+			.keys()
+			.filter_map(|raw| raw.parse::<Uri>().ok())
+			.filter(|uri| uri != origin && docs.get(uri).is_none())
+			.filter(|uri| {
+				self
+					.documents
+					.get(uri)
+					.is_some_and(|candidate| candidate.module_identity() == *identity)
+			})
+			.collect();
+		aliases.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+		aliases
+	}
+
+	fn set_effective_source(
+		&mut self,
+		identity: &ModuleIdentity,
+		source: String,
+		version: SourceVersion,
+	) {
+		self.session_mut(identity.without_prelude).set_source(
+			identity.project.clone(),
+			identity.module.clone(),
+			source.clone(),
+			version,
+		);
+		self
+			.effective_sources
+			.insert(identity.clone(), Arc::from(source));
+	}
+
+	fn remove_effective_source(&mut self, identity: &ModuleIdentity) {
+		self
+			.session_mut(identity.without_prelude)
+			.remove_source(identity.project.clone(), identity.module.clone());
+		self.effective_sources.remove(identity);
+	}
+
+	fn effective_source_for_uri(&self, uri: &Uri) -> Option<Arc<str>> {
+		let identity = self.documents.get(uri)?.module_identity();
+		self.effective_sources.get(&identity).cloned()
+	}
+
+	fn retire_transitioned_identity(
+		&mut self,
+		docs: &DocumentStore,
+		uri: &Uri,
+		identity: &DocumentIdentity,
+	) {
+		if matches!(identity.kind, DocumentKind::Project(_)) {
+			self.synchronized_roots.remove(&identity.root);
+		}
+		let module_identity = identity.module_identity();
+		if let Some((open_uri, source, version)) =
+			self.remaining_overlay(docs, &module_identity, Some(uri))
+		{
+			self.set_effective_source(&module_identity, source, SourceVersion(i64::from(version)));
+			self
+				.authoritative_overlays
+				.insert(module_identity, open_uri);
+		} else {
+			self.authoritative_overlays.remove(&module_identity);
+			self.remove_effective_source(&module_identity);
+		}
+	}
+
 	pub fn analysis_for_uri(&self, docs: &DocumentStore, uri: &Uri) -> Option<AnalysisSnapshot> {
+		if self.has_manifest_error(uri) {
+			return None;
+		}
 		let document = docs.get(uri)?;
 		let identity = self.documents.get(uri)?;
 		let analysis = self.session_for(identity).tooling_analyze_module(
@@ -339,6 +465,9 @@ impl CompilerState {
 		docs: &DocumentStore,
 		uri: &Uri,
 	) -> Option<Arc<[ProjectDiagnostic]>> {
+		if self.has_manifest_error(uri) {
+			return None;
+		}
 		let identity = self.documents.get(uri)?;
 		let _ = docs.get(uri)?;
 		Some(self.session_for(identity).tooling_diagnostics(
@@ -413,12 +542,10 @@ impl CompilerState {
 				let module_uri = if module == identity.module {
 					uri.clone()
 				} else {
-					workspace::key_to_uri(&identity.root, module.as_str())?
+					self.publication_uri(docs, identity, &module)?
 				};
 				let open = docs.get(&module_uri);
-				let source = open
-					.map(|document| Arc::from(document.text.as_str()))
-					.or_else(|| self.sources.get(&module_uri).cloned())?;
+				let source = self.effective_source_for_uri(&module_uri)?;
 				Some(DiagnosticModuleSnapshot {
 					uri: module_uri,
 					source,
@@ -444,7 +571,7 @@ impl CompilerState {
 					uri: previous_uri.clone(),
 					source: open
 						.map(|document| Arc::from(document.text.as_str()))
-						.or_else(|| self.sources.get(&previous_uri).cloned())
+						.or_else(|| self.effective_source_for_uri(&previous_uri))
 						.unwrap_or_else(|| Arc::from("")),
 					version: open.map(|document| document.version),
 					diagnostics: Vec::new(),
@@ -469,9 +596,10 @@ impl CompilerState {
 			.filter_map(|uri| {
 				let identity = self.documents.get(uri)?;
 				let open = docs.get(uri);
-				let source = open
-					.map(|document| Arc::from(document.text.as_str()))
-					.or_else(|| self.sources.get(uri).cloned())
+				let source = self
+					.effective_sources
+					.get(&identity.module_identity())
+					.cloned()
 					.unwrap_or_else(|| Arc::from(""));
 				let diagnostics = if source.is_empty()
 					&& !self
@@ -500,7 +628,24 @@ impl CompilerState {
 				})
 			})
 			.collect();
-		let owned_targets: Vec<Uri> = modules.iter().map(|module| module.uri.clone()).collect();
+		let origin_identity = self
+			.documents
+			.get(origin)
+			.map(DocumentIdentity::module_identity);
+		let owned_targets: Vec<Uri> = modules
+			.iter()
+			.filter(|module| {
+				module.uri == *origin
+					|| !origin_identity.as_ref().is_some_and(|origin_identity| {
+						docs.get(&module.uri).is_none()
+							&& self
+								.documents
+								.get(&module.uri)
+								.is_some_and(|candidate| candidate.module_identity() == *origin_identity)
+					})
+			})
+			.map(|module| module.uri.clone())
+			.collect();
 		if let Some(previous_targets) = self.diagnostic_targets.get(origin.as_str()) {
 			for previous in previous_targets {
 				if owned_targets
@@ -517,7 +662,7 @@ impl CompilerState {
 					uri: previous_uri.clone(),
 					source: open
 						.map(|document| Arc::from(document.text.as_str()))
-						.or_else(|| self.sources.get(&previous_uri).cloned())
+						.or_else(|| self.effective_source_for_uri(&previous_uri))
 						.unwrap_or_else(|| Arc::from("")),
 					version: open.map(|document| document.version),
 					diagnostics: Vec::new(),
@@ -544,7 +689,7 @@ impl CompilerState {
 	#[doc(hidden)]
 	#[must_use]
 	pub fn source_for_uri(&self, uri: &Uri) -> Option<Arc<str>> {
-		self.sources.get(uri).cloned()
+		self.effective_source_for_uri(uri)
 	}
 
 	#[cfg(test)]
@@ -563,9 +708,12 @@ impl CompilerState {
 		// Filesystem discovery is intentionally tied to the first project open.
 		// Without a watcher, later external adds/deletes of unopened files are
 		// not events; opening a file still overlays or adds its live source.
+		let previous_identity = self.documents.get(uri).cloned();
 		let class = match workspace::classify_uri(uri) {
 			Err(error) => {
-				self.documents.remove(uri);
+				// Retain the last valid identity as lifecycle metadata. The manifest
+				// error suppresses analysis, but close still needs the project path to
+				// retire the overlay and restore disk state.
 				self.manifest_errors.insert(uri.clone(), error.to_string());
 				return Ok(());
 			}
@@ -636,63 +784,60 @@ impl CompilerState {
 			without_prelude,
 			kind: kind.clone(),
 		};
+		if let Some(previous) = previous_identity
+			&& previous.module_identity() != identity.module_identity()
+		{
+			self.retire_transitioned_identity(docs, uri, &previous);
+		}
 		self.documents.insert(uri.clone(), identity.clone());
 
 		if matches!(kind, DocumentKind::Project(_)) && self.synchronized_roots.insert(root.clone()) {
 			for (path, module) in nymph_files(&root)? {
 				if let Ok(source) = fs::read_to_string(&path) {
-					self.session_mut(without_prelude).set_source(
-						project.clone(),
-						module.clone(),
-						source.clone(),
-						SourceVersion(0),
-					);
+					let disk_identity = DocumentIdentity {
+						project: project.clone(),
+						module: module.clone(),
+						entry: module.clone(),
+						root: root.clone(),
+						without_prelude,
+						kind: DocumentKind::Project(path.clone()),
+					};
+					self.set_effective_source(&disk_identity.module_identity(), source, SourceVersion(0));
 					if let Some(disk_uri) = workspace::path_to_uri(&path) {
-						self.sources.insert(disk_uri.clone(), source.into());
-						self
-							.documents
-							.entry(disk_uri)
-							.or_insert_with(|| DocumentIdentity {
-								project: project.clone(),
-								module: module.clone(),
-								entry: module,
-								root: root.clone(),
-								without_prelude,
-								kind: DocumentKind::Project(path.clone()),
-							});
+						self.documents.entry(disk_uri).or_insert(disk_identity);
 					}
 				}
 			}
 		}
-		for (open_uri, document) in docs.iter() {
-			let Some(open_identity) = self.documents.get(open_uri).cloned() else {
-				continue;
-			};
-			if open_identity.project == project {
-				self.session_mut(open_identity.without_prelude).set_source(
-					open_identity.project,
-					open_identity.module.clone(),
-					document.text.clone(),
-					SourceVersion(i64::from(document.version)),
-				);
-				self
-					.sources
-					.insert(open_uri.clone(), Arc::from(document.text.as_str()));
-			}
-		}
-		// Equivalent URI spellings can name the same module. The notification
-		// currently being synchronized is authoritative regardless of hash-map
-		// iteration order above; closing it later restores another live overlay.
-		if let Some(document) = docs.get(uri) {
-			self.session_mut(identity.without_prelude).set_source(
-				project,
-				identity.module,
-				document.text.clone(),
-				SourceVersion(i64::from(document.version)),
-			);
+		if docs.get(uri).is_some() {
 			self
-				.sources
-				.insert(uri.clone(), Arc::from(document.text.as_str()));
+				.authoritative_overlays
+				.insert(identity.module_identity(), uri.clone());
+		}
+		// Replay one explicitly authoritative overlay per logical module. The
+		// current notification wins for its module; other aliases are not chosen
+		// by hash-map iteration order.
+		let overlays: Vec<_> = self
+			.authoritative_overlays
+			.iter()
+			.filter(|(module, _)| module.project == project)
+			.filter_map(|(module, open_uri)| {
+				let document = docs.get(open_uri)?;
+				(self
+					.documents
+					.get(open_uri)
+					.is_some_and(|candidate| candidate.module_identity() == *module))
+				.then(|| {
+					(
+						module.clone(),
+						document.text.clone(),
+						SourceVersion(i64::from(document.version)),
+					)
+				})
+			})
+			.collect();
+		for (module, source, version) in overlays {
+			self.set_effective_source(&module, source, version);
 		}
 		Ok(())
 	}

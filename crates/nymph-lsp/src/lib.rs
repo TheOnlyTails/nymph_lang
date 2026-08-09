@@ -549,6 +549,208 @@ mod tests {
 	}
 
 	#[test]
+	fn reverse_importer_refresh_uses_its_open_equivalent_uri_and_version() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='wire-equivalent-importer'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let importer_path = temp.path().join("src/importer.nym");
+		let dependency_path = temp.path().join("src/dependency.nym");
+		let disk_importer_text = "import @/dependency with (value)\nfunc use(): int = value()";
+		let importer_text = format!("\n{disk_importer_text}");
+		std::fs::write(&importer_path, disk_importer_text).unwrap();
+		std::fs::write(&dependency_path, "public func value(): int = 1").unwrap();
+		let canonical_importer_uri = workspace::path_to_uri(&importer_path).unwrap();
+		let importer_uri: Uri = canonical_importer_uri
+			.as_str()
+			.replace("importer.nym", "%69mporter.nym")
+			.parse()
+			.unwrap();
+		let dependency_uri = workspace::path_to_uri(&dependency_path).unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		handshake(&client);
+
+		send_open(&client, importer_uri.clone(), 7, &importer_text);
+		let opened = recv_diagnostics(&client);
+		assert_eq!(opened.uri, importer_uri);
+		assert_eq!(opened.version, Some(7));
+		assert!(opened.diagnostics.is_empty());
+
+		send_open(
+			&client,
+			dependency_uri.clone(),
+			2,
+			"public func value(): float = 1.0",
+		);
+		let changed = [recv_diagnostics(&client), recv_diagnostics(&client)];
+		assert_eq!(
+			changed.iter().map(|params| &params.uri).collect::<Vec<_>>(),
+			[&dependency_uri, &importer_uri]
+		);
+		assert_eq!(
+			changed
+				.iter()
+				.map(|params| params.version)
+				.collect::<Vec<_>>(),
+			[Some(2), Some(7)]
+		);
+		assert!(!changed[1].diagnostics.is_empty());
+		assert!(
+			changed[1]
+				.diagnostics
+				.iter()
+				.all(|diagnostic| diagnostic.range.start.line == 2),
+			"reverse-importer ranges must use the open alias text, not canonical disk text"
+		);
+		assert!(
+			changed
+				.iter()
+				.all(|params| params.uri != canonical_importer_uri)
+		);
+		assert!(client.receiver.try_recv().is_err());
+
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn closing_the_last_equivalent_uri_clears_prior_closed_alias_diagnostics() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='wire-equivalent-last-close'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let importer_path = temp.path().join("src/importer.nym");
+		let dependency_path = temp.path().join("src/dependency.nym");
+		let importer_text = "import @/dependency with (value)\nfunc use(): int = value()";
+		std::fs::write(&importer_path, importer_text).unwrap();
+		std::fs::write(&dependency_path, "public func value(): int = 1").unwrap();
+		let importer_uri = workspace::path_to_uri(&importer_path).unwrap();
+		let dependency_uri = workspace::path_to_uri(&dependency_path).unwrap();
+		let alternate_uri: Uri = dependency_uri
+			.as_str()
+			.replace("dependency.nym", "%64ependency.nym")
+			.parse()
+			.unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		handshake(&client);
+
+		send_open(&client, importer_uri.clone(), 1, importer_text);
+		recv_diagnostics(&client);
+		send_open(
+			&client,
+			dependency_uri.clone(),
+			2,
+			"public func value(): int = 2",
+		);
+		for _ in 0..2 {
+			recv_diagnostics(&client);
+		}
+		send_open(
+			&client,
+			alternate_uri.clone(),
+			3,
+			"public func value(): int = true",
+		);
+		for _ in 0..2 {
+			recv_diagnostics(&client);
+		}
+
+		send_close(&client, dependency_uri.clone());
+		let first_close = [recv_diagnostics(&client), recv_diagnostics(&client)];
+		assert_eq!(first_close[0].uri, dependency_uri);
+		assert!(!first_close[0].diagnostics.is_empty());
+		assert_eq!(first_close[1].uri, importer_uri);
+		assert!(client.receiver.try_recv().is_err());
+
+		send_close(&client, alternate_uri.clone());
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(99),
+				HoverRequest::METHOD.into(),
+				serde_json::to_value(HoverParams {
+					text_document_position_params: TextDocumentPositionParams {
+						text_document: TextDocumentIdentifier {
+							uri: importer_uri.clone(),
+						},
+						position: Position::new(1, 18),
+					},
+					work_done_progress_params: WorkDoneProgressParams::default(),
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		let mut last_close = Vec::new();
+		loop {
+			match client.receiver.recv().unwrap() {
+				Message::Notification(notification)
+					if notification.method == lsp_types::notification::PublishDiagnostics::METHOD =>
+				{
+					last_close
+						.push(serde_json::from_value::<PublishDiagnosticsParams>(notification.params).unwrap());
+				}
+				Message::Response(response) => {
+					assert_eq!(response.id, RequestId::from(99));
+					break;
+				}
+				other => panic!("expected diagnostics or hover response, got {other:?}"),
+			}
+		}
+		assert_eq!(
+			last_close
+				.iter()
+				.map(|params| &params.uri)
+				.collect::<Vec<_>>(),
+			[&alternate_uri, &dependency_uri, &importer_uri]
+		);
+		assert_eq!(
+			last_close
+				.iter()
+				.map(|params| params.version)
+				.collect::<Vec<_>>(),
+			[None, None, Some(1)]
+		);
+		assert!(
+			last_close
+				.iter()
+				.all(|params| params.diagnostics.is_empty())
+		);
+
+		send_open(
+			&client,
+			alternate_uri.clone(),
+			4,
+			"public func value(): int = 4",
+		);
+		let reopened = [recv_diagnostics(&client), recv_diagnostics(&client)];
+		assert_eq!(
+			reopened
+				.iter()
+				.map(|params| &params.uri)
+				.collect::<Vec<_>>(),
+			[&alternate_uri, &importer_uri]
+		);
+		assert_eq!(
+			reopened
+				.iter()
+				.map(|params| params.version)
+				.collect::<Vec<_>>(),
+			[Some(4), Some(1)]
+		);
+		assert!(reopened.iter().all(|params| params.diagnostics.is_empty()));
+		assert!(client.receiver.try_recv().is_err());
+
+		shutdown(&client, handle);
+	}
+
+	#[test]
 	fn production_handlers_reuse_analysis_until_effective_source_changes() {
 		let parse = Arc::new(AtomicUsize::new(0));
 		let analysis = Arc::new(AtomicUsize::new(0));
@@ -1146,6 +1348,22 @@ mod tests {
 			Some(lsp_types::NumberOrString::String("MANIFEST".into()))
 		);
 		assert!(publications[1].diagnostics.is_empty());
+
+		send_close(&client, dependency_uri.clone());
+		let closed = [recv_diagnostics(&client), recv_diagnostics(&client)];
+		assert_eq!(
+			closed.iter().map(|params| &params.uri).collect::<Vec<_>>(),
+			[&dependency_uri, &main_uri]
+		);
+		assert_eq!(
+			closed
+				.iter()
+				.map(|params| params.version)
+				.collect::<Vec<_>>(),
+			[None, Some(1)]
+		);
+		assert!(closed.iter().all(|params| params.diagnostics.is_empty()));
+		assert!(client.receiver.try_recv().is_err());
 		shutdown(&client, handle);
 	}
 
