@@ -709,10 +709,14 @@ fn lower_external(
 	let crate::RuntimePlacement::Attached { owner, .. } = &artifact.placement else {
 		return lower_top_level_external(context, definition, abi);
 	};
-	let Some((_, member)) = attached_implementation_member(context, artifact)? else {
+	let member = if let Some((_, member)) = attached_implementation_member(context, artifact)? {
+		member
+	} else if let Some(member) = attached_nominal_member(context, artifact, abi)? {
+		member
+	} else {
 		return Err(invalid(
 			definition,
-			"external member has no exact implementation shape",
+			"external member has no exact checked member shape",
 		));
 	};
 	if owner_has_no_attachment_shell(context, owner)? {
@@ -744,7 +748,7 @@ fn lower_external(
 		crate::MemberKind::Function
 		| crate::MemberKind::MutatingFunction
 		| crate::MemberKind::StaticFunction => {
-			let params = member
+			let mut params = member
 				.parameters
 				.iter()
 				.enumerate()
@@ -755,6 +759,8 @@ fn lower_external(
 						.unwrap_or_else(|| format!("$arg{index}").into())
 				})
 				.collect::<Vec<_>>();
+			let (_, hidden_arity, _) = external_callable_shape(context, definition, abi)?;
+			params.extend((0..hidden_arity).map(|index| EcoString::from(format!("$type${index}"))));
 			let mut args = if member.kind == crate::MemberKind::StaticFunction {
 				Vec::new()
 			} else {
@@ -862,13 +868,45 @@ fn lower_top_level_external(
 	abi: &crate::ExternalAbi,
 ) -> Result<LoweredHirFragment, StableLoweringError> {
 	let name = context.binding_name(definition)?;
-	if matches!(
-		&definition.key,
-		crate::DeclarationKey::TopLevel {
-			category: crate::DeclarationCategory::Let,
-			..
+	let is_value = match &definition.key {
+		crate::DeclarationKey::TopLevel { category, .. } => match category {
+			crate::DeclarationCategory::Let => true,
+			crate::DeclarationCategory::Function => false,
+			_ => {
+				return Err(invalid(
+					definition,
+					"top-level external has a non-callable, non-value identity",
+				));
+			}
+		},
+		crate::DeclarationKey::Member { .. } => {
+			let request = StableShapeRequest::Member(definition.clone());
+			let StableShapeFact::Member(shape) = context.stable_shape(&request)? else {
+				return Err(StableShapeLookupError::WrongFact { request }.into());
+			};
+			if shape.id != *definition || shape.external.as_ref() != Some(abi) {
+				return Err(invalid(
+					definition,
+					"top-level external disagrees with its exact checked member shape",
+				));
+			}
+			match shape.kind {
+				crate::MemberKind::Value
+				| crate::MemberKind::MutableValue
+				| crate::MemberKind::StaticValue => true,
+				crate::MemberKind::Function
+				| crate::MemberKind::MutatingFunction
+				| crate::MemberKind::StaticFunction => false,
+			}
 		}
-	) {
+		_ => {
+			return Err(invalid(
+				definition,
+				"top-level external has no exact checked definition or member shape",
+			));
+		}
+	};
+	if is_value {
 		let module = external_module(definition, abi)?;
 		let symbol = external_symbol(definition, abi)?;
 		let marshal = abi
@@ -1041,11 +1079,11 @@ fn exact_external_abi(
 	Ok(shape_abi)
 }
 
-fn external_callable_arity(
+fn external_callable_shape(
 	context: &impl StableLoweringContext,
 	definition: &DefinitionId,
 	abi: &ExternalAbi,
-) -> Result<usize, StableLoweringError> {
+) -> Result<(usize, usize, usize), StableLoweringError> {
 	match &definition.key {
 		crate::DeclarationKey::TopLevel {
 			category: crate::DeclarationCategory::Function,
@@ -1064,7 +1102,7 @@ fn external_callable_arity(
 					"generic external callable disagrees with its exact definition shape",
 				));
 			}
-			Ok(shape.parameters.len())
+			Ok((shape.parameters.len(), shape.binders.len(), 0))
 		}
 		crate::DeclarationKey::Member { .. } => {
 			let request = StableShapeRequest::Member(definition.clone());
@@ -1084,7 +1122,54 @@ fn external_callable_arity(
 					"generic external callable disagrees with its exact member shape",
 				));
 			}
-			Ok(shape.parameters.len())
+			let owner_binders = if shape.kind == crate::MemberKind::StaticFunction {
+				let owner = shape.runtime_owner.as_ref().ok_or_else(|| {
+					invalid(
+						definition,
+						"generic static external callable has no exact runtime owner",
+					)
+				})?;
+				match &owner.key {
+					crate::DeclarationKey::Implementation { .. } => {
+						let request = StableShapeRequest::Implementation(owner.clone());
+						let StableShapeFact::Implementation(owner_shape) = context.stable_shape(&request)?
+						else {
+							return Err(StableShapeLookupError::WrongFact { request }.into());
+						};
+						if owner_shape.id != *owner {
+							return Err(invalid(
+								definition,
+								"generic static external owner disagrees with its exact implementation shape",
+							));
+						}
+						owner_shape.binders.len()
+					}
+					_ => {
+						let request = StableShapeRequest::Definition(owner.clone());
+						let StableShapeFact::Definition(owner_shape) = context.stable_shape(&request)? else {
+							return Err(StableShapeLookupError::WrongFact { request }.into());
+						};
+						if owner_shape.id != *owner {
+							return Err(invalid(
+								definition,
+								"generic static external owner disagrees with its exact definition shape",
+							));
+						}
+						owner_shape.binders.len()
+					}
+				}
+			} else {
+				0
+			};
+			let receiver_arity = usize::from(matches!(
+				shape.kind,
+				crate::MemberKind::Function | crate::MemberKind::MutatingFunction
+			));
+			Ok((
+				shape.parameters.len(),
+				owner_binders + shape.binders.len(),
+				receiver_arity,
+			))
 		}
 		_ => Err(invalid(
 			definition,
@@ -1739,6 +1824,69 @@ fn attached_implementation_member(
 		));
 	}
 	Ok(Some((implementation, member)))
+}
+
+fn attached_nominal_member(
+	context: &impl StableLoweringContext,
+	artifact: &RuntimeDefinition,
+	abi: &ExternalAbi,
+) -> Result<Option<crate::MemberShape<InterfaceType>>, StableLoweringError> {
+	let crate::RuntimePlacement::Attached { owner, name } = &artifact.placement else {
+		return Ok(None);
+	};
+	if matches!(owner.key, crate::DeclarationKey::Implementation { .. }) {
+		return Ok(None);
+	}
+	let owner_request = StableShapeRequest::Definition(owner.clone());
+	let StableShapeFact::Definition(owner_shape) = context.stable_shape(&owner_request)? else {
+		return Err(
+			StableShapeLookupError::WrongFact {
+				request: owner_request,
+			}
+			.into(),
+		);
+	};
+	if owner_shape.id != *owner
+		|| !matches!(
+			owner_shape.kind,
+			crate::DefinitionShapeKind::Struct | crate::DefinitionShapeKind::Enum
+		) {
+		return Err(invalid(
+			&artifact.definition,
+			"attached external owner disagrees with its exact nominal definition shape",
+		));
+	}
+	let owner_member = owner_shape
+		.members
+		.iter()
+		.find(|member| member.id == artifact.definition)
+		.cloned()
+		.ok_or_else(|| {
+			invalid(
+				&artifact.definition,
+				"attached external has no exact nominal member shape",
+			)
+		})?;
+	let member_request = StableShapeRequest::Member(artifact.definition.clone());
+	let StableShapeFact::Member(member) = context.stable_shape(&member_request)? else {
+		return Err(
+			StableShapeLookupError::WrongFact {
+				request: member_request,
+			}
+			.into(),
+		);
+	};
+	if member != owner_member
+		|| member.name != *name
+		|| member.runtime_owner.as_ref() != Some(owner)
+		|| member.external.as_ref() != Some(abi)
+	{
+		return Err(invalid(
+			&artifact.definition,
+			"attached external disagrees with its exact nominal member shape",
+		));
+	}
+	Ok(Some(member))
 }
 
 fn fragment_method(fragment: LoweredHirFragment) -> Result<HirMethod, StableLoweringError> {
@@ -2650,7 +2798,11 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				.unwrap_or(HirExpr::This),
 			StableExprKind::Grouped(inner) => {
 				let lowered = self.lower(inner)?;
-				self.append_hidden_arguments(self.id(expr), lowered)?
+				if matches!(&lowered, HirExpr::Local(_) | HirExpr::Field { .. }) {
+					self.generic_callable_adapter(self.id(expr), lowered)?
+				} else {
+					self.append_hidden_arguments(self.id(expr), lowered)?
+				}
 			}
 			StableExprKind::List(items) | StableExprKind::Tuple(items) => {
 				let kind = if matches!(expr.kind, StableExprKind::List(_)) {
@@ -2767,17 +2919,22 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				{
 					if matches!(target.key, crate::DeclarationKey::TopLevel { .. }) {
 						self.demand_external(target)?;
-						return Ok(HirExpr::Local(
-							self.context.binding_name(target)?.as_str().into(),
-						));
+						return self.generic_callable_adapter(
+							self.id(expr),
+							HirExpr::Local(self.context.binding_name(target)?.as_str().into()),
+						);
 					}
 					if matches!(target.key, crate::DeclarationKey::Member { .. }) {
 						let runtime = self.context.runtime_definition(target)?;
-						let crate::RuntimePlacement::Attached { owner, .. } = &runtime.placement else {
-							return Err(invalid(
-								&self.artifact.definition,
-								"static member target is not attached to an owner",
-							));
+						let owner = match &runtime.placement {
+							crate::RuntimePlacement::TopLevel => {
+								self.demand_external(target)?;
+								return self.generic_callable_adapter(
+									self.id(expr),
+									HirExpr::Local(self.context.binding_name(target)?.as_str().into()),
+								);
+							}
+							crate::RuntimePlacement::Attached { owner, .. } => owner,
 						};
 						let shell = match &owner.key {
 							crate::DeclarationKey::TopLevel {
@@ -2802,10 +2959,13 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 									&& matches!(&implementation.self_type, InterfaceType::Named { positional, named, .. } if !positional.is_empty() || !named.is_empty())
 								{
 									self.demand_external(target)?;
-									return Ok(HirExpr::Field {
-										recv: Box::new(self.runtime_type_object(&implementation.self_type)?),
-										name: self.context.member_name(target)?.as_str().into(),
-									});
+									return self.generic_callable_adapter(
+										self.id(expr),
+										HirExpr::Field {
+											recv: Box::new(self.runtime_type_object(&implementation.self_type)?),
+											name: self.context.member_name(target)?.as_str().into(),
+										},
+									);
 								}
 								nominal_attachment_shell(&implementation.self_type).cloned()
 							}
@@ -2818,16 +2978,20 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						};
 						self.demand_external(target)?;
 						let Some(shell) = shell else {
-							return Ok(HirExpr::Local(
-								self.context.binding_name(target)?.as_str().into(),
-							));
+							return self.generic_callable_adapter(
+								self.id(expr),
+								HirExpr::Local(self.context.binding_name(target)?.as_str().into()),
+							);
 						};
-						return Ok(HirExpr::Field {
-							recv: Box::new(HirExpr::Local(
-								self.context.binding_name(&shell)?.as_str().into(),
-							)),
-							name: self.context.member_name(target)?.as_str().into(),
-						});
+						return self.generic_callable_adapter(
+							self.id(expr),
+							HirExpr::Field {
+								recv: Box::new(HirExpr::Local(
+									self.context.binding_name(&shell)?.as_str().into(),
+								)),
+								name: self.context.member_name(target)?.as_str().into(),
+							},
+						);
 					}
 				}
 				HirExpr::Field {
@@ -3012,19 +3176,37 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				if let Some(target) = self.target(func) {
 					let target_artifact = self.context.runtime_definition(target)?;
 					if matches!(target_artifact.payload, crate::RuntimePayload::External(_)) {
-						let _ = self.record_call(target)?;
-						self.demand_direct(target);
 						let abi = exact_external_abi(self.context, target, None)?;
-						let module = external_module(target, &abi)?;
-						let symbol = external_symbol(target, &abi)?;
-						return Ok(HirExpr::ExternCall {
-							module,
-							symbol,
-							args: args
-								.iter()
-								.map(|arg| self.lower(&arg.value))
-								.collect::<Result<_, _>>()?,
-						});
+						if matches!(&abi.callable, crate::ExternalCallable::Deferred) {
+							return Err(invalid(
+								target,
+								"direct external call targets a deferred external",
+							));
+						}
+						let (source_arity, binder_arity, receiver_arity) =
+							external_callable_shape(self.context, target, &abi)?;
+						if receiver_arity != 0 || args.len() != source_arity {
+							return Err(StableLoweringError::ShapeDrift {
+								definition: target.clone(),
+								reason:
+									"direct external call source arity disagrees with its exact definition shape"
+										.into(),
+							});
+						}
+						let hidden_arity = self
+							.annotations
+							.generic_call_arguments
+							.iter()
+							.find_map(|(id, arguments)| (*id == self.id(expr)).then_some(arguments.len()))
+							.unwrap_or_default();
+						if hidden_arity != binder_arity {
+							return Err(StableLoweringError::ShapeDrift {
+								definition: target.clone(),
+								reason:
+									"direct external call binder arity disagrees with its canonical type arguments"
+										.into(),
+							});
+						}
 					}
 					if !self.record_call(target)? {
 						self.record_unresolved_call(UnresolvedRuntimeCall::CallableValue(target.clone()));
@@ -3773,44 +3955,39 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		let _ = self.record_call(&member)?;
 		if external {
 			let abi = exact_external_abi(self.context, &member, persisted_marshal)?;
-			let mut args = vec![self.lower(receiver)?];
-			args.extend(
-				arguments
-					.into_iter()
-					.map(|arg| self.lower(arg))
-					.collect::<Result<Vec<_>, _>>()?,
-			);
-			return match abi.callable {
-				crate::ExternalCallable::Linked { module, symbol } => Ok(HirExpr::ExternCall {
-					module: Box::leak(module.to_string().into_boxed_str()),
-					symbol: Box::leak(symbol.to_string().into_boxed_str()),
-					args,
-				}),
-				crate::ExternalCallable::Native(native) => match (native, args.as_slice()) {
-					(nymph_hir::linkage::NativeExternal::Binary { op, result }, [lhs, rhs]) => {
-						Ok(HirExpr::Binary {
-							op,
-							result,
-							lhs: Box::new(lhs.clone()),
-							rhs: Box::new(rhs.clone()),
+			let receiver = self.lower(receiver)?;
+			let arguments = arguments
+				.into_iter()
+				.map(|arg| self.lower(arg))
+				.collect::<Result<Vec<_>, _>>()?;
+			return match &abi.callable {
+				crate::ExternalCallable::Linked { .. } => {
+					if let Some(implementation) = &implementation
+						&& shellless_implementation_member(self.context, &member, implementation)?
+					{
+						let mut args = vec![receiver];
+						args.extend(arguments);
+						Ok(HirExpr::Call {
+							callee: Box::new(HirExpr::Local(
+								self.context.binding_name(&member)?.as_str().into(),
+							)),
+							args,
+						})
+					} else {
+						Ok(HirExpr::Call {
+							callee: Box::new(HirExpr::Field {
+								recv: Box::new(receiver),
+								name: self.context.member_name(&member)?.as_str().into(),
+							}),
+							args: arguments,
 						})
 					}
-					(nymph_hir::linkage::NativeExternal::Unary { op, result }, [operand]) => {
-						Ok(HirExpr::Unary {
-							op,
-							result,
-							operand: Box::new(operand.clone()),
-						})
-					}
-					(nymph_hir::linkage::NativeExternal::Index, [receiver, index]) => Ok(HirExpr::Index {
-						recv: Box::new(receiver.clone()),
-						index: Box::new(index.clone()),
-					}),
-					_ => Err(invalid(
-						&self.artifact.definition,
-						"native external dispatch arity does not match its exact ABI",
-					)),
-				},
+				}
+				crate::ExternalCallable::Native(_) => {
+					let mut args = vec![receiver];
+					args.extend(arguments);
+					external_call_expr(&member, &abi, &args)
+				}
 				crate::ExternalCallable::Deferred => Err(invalid(
 					&self.artifact.definition,
 					"external dispatch target is deferred",
@@ -4086,9 +4263,41 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				_ => None,
 			};
 			let abi = exact_external_abi(self.context, &member, persisted_marshal)?;
-			let mut args = vec![receiver_value];
-			args.extend(arguments);
-			external_call_expr(&member, &abi, &args)?
+			match &abi.callable {
+				crate::ExternalCallable::Linked { .. } => {
+					if let Some(implementation) = &implementation
+						&& shellless_implementation_member(self.context, &member, implementation)?
+					{
+						let mut args = vec![receiver_value];
+						args.extend(arguments);
+						HirExpr::Call {
+							callee: Box::new(HirExpr::Local(
+								self.context.binding_name(&member)?.as_str().into(),
+							)),
+							args,
+						}
+					} else {
+						HirExpr::Call {
+							callee: Box::new(HirExpr::Field {
+								recv: Box::new(receiver_value),
+								name: self.context.member_name(&member)?.as_str().into(),
+							}),
+							args: arguments,
+						}
+					}
+				}
+				crate::ExternalCallable::Native(_) => {
+					let mut args = vec![receiver_value];
+					args.extend(arguments);
+					external_call_expr(&member, &abi, &args)?
+				}
+				crate::ExternalCallable::Deferred => {
+					return Err(invalid(
+						&member,
+						"generic callable value targets a deferred external",
+					));
+				}
+			}
 		} else if let Some(implementation) = &implementation
 			&& shellless_implementation_member(self.context, &member, implementation)?
 		{
@@ -5080,6 +5289,32 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			if !visiting.insert(definition.clone()) {
 				return Ok(std::collections::HashSet::new());
 			}
+			if matches!(
+				&definition.key,
+				crate::DeclarationKey::Member { owner, .. }
+					if matches!(
+						owner.key,
+						crate::DeclarationKey::TopLevel {
+							category: crate::DeclarationCategory::Interface,
+							..
+						}
+					)
+			) {
+				let request = StableShapeRequest::Member(definition.clone());
+				let StableShapeFact::Member(member) = context.stable_shape(&request)? else {
+					return Err(StableShapeLookupError::WrongFact { request }.into());
+				};
+				if member.id != *definition {
+					return Err(invalid(
+						definition,
+						"generic interface member disagrees with its exact checked shape",
+					));
+				}
+				if !member.has_default {
+					visiting.remove(definition);
+					return Ok(std::collections::HashSet::new());
+				}
+			}
 			let artifact = context.runtime_definition(definition)?;
 			let body = match &artifact.payload {
 				crate::RuntimePayload::NymphBody(body) => body,
@@ -5272,8 +5507,13 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.map(|target| self.required_receiverless_slots(target))
 			.transpose()?
 			.unwrap_or_default();
-		let target = match &mut lowered {
+		let explicit_receiver = usize::from(
+			matches!(&lowered, HirExpr::ExternCall { .. })
+				|| matches!(&lowered, HirExpr::Call { callee, .. } if matches!(&**callee, HirExpr::Local(_))),
+		);
+		let arguments = match &mut lowered {
 			HirExpr::Call { args, .. } => args,
+			HirExpr::ExternCall { args, .. } => args,
 			HirExpr::BoundDispatch {
 				hidden_arguments, ..
 			}
@@ -5282,6 +5522,50 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			} => hidden_arguments,
 			_ => return Ok(lowered),
 		};
+		let external_target = if let Some(call_target) = call_target {
+			match self.context.runtime_definition(call_target) {
+				Ok(artifact) => matches!(&artifact.payload, crate::RuntimePayload::External(_)),
+				Err(RuntimeDefinitionLookupError::Missing { .. })
+					if matches!(
+						&call_target.key,
+						crate::DeclarationKey::Member { owner, .. }
+							if matches!(
+								owner.key,
+								crate::DeclarationKey::TopLevel {
+									category: crate::DeclarationCategory::Interface,
+									..
+								}
+							)
+					) =>
+				{
+					false
+				}
+				Err(error) => return Err(error.into()),
+			}
+		} else {
+			false
+		};
+		if external_target && let Some(call_target) = call_target {
+			let abi = exact_external_abi(self.context, call_target, None)?;
+			let (source_arity, binder_arity, receiver_arity) =
+				external_callable_shape(self.context, call_target, &abi)?;
+			if arguments.len() != source_arity + receiver_arity * explicit_receiver {
+				return Err(StableLoweringError::ShapeDrift {
+					definition: call_target.clone(),
+					reason:
+						"generic external callable source arity disagrees with its exact definition shape"
+							.into(),
+				});
+			}
+			if hidden.len() != binder_arity {
+				return Err(StableLoweringError::ShapeDrift {
+					definition: call_target.clone(),
+					reason:
+						"generic external callable binder arity disagrees with its canonical type arguments"
+							.into(),
+				});
+			}
+		}
 		if required.iter().any(|index| *index >= hidden.len()) {
 			return Err(StableLoweringError::Unsupported {
 				definition: self.artifact.definition.clone(),
@@ -5315,7 +5599,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					}
 				}
 			}
-			target.push(match argument {
+			arguments.push(match argument {
 				crate::runtime::RuntimeTypeArgument::Canonical(type_) => self.runtime_type_object(type_)?,
 				crate::runtime::RuntimeTypeArgument::Erased => HirExpr::Undefined,
 			});
@@ -5328,14 +5612,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		node: crate::BodyNodeId,
 		callee: HirExpr,
 	) -> Result<HirExpr, StableLoweringError> {
-		if !self
+		let Some((_, hidden)) = self
 			.annotations
 			.generic_call_arguments
 			.iter()
-			.any(|(id, _)| *id == node)
-		{
+			.find(|(id, _)| *id == node)
+		else {
 			return Ok(callee);
-		}
+		};
 		let Some(target) = self
 			.annotations
 			.generic_call_targets
@@ -5360,7 +5644,16 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						feature: "generic callable value targets a deferred external".into(),
 					});
 				}
-				external_callable_arity(self.context, target, &abi)?
+				let (source_arity, binder_arity, _) = external_callable_shape(self.context, target, &abi)?;
+				if hidden.len() != binder_arity {
+					return Err(StableLoweringError::ShapeDrift {
+						definition: target.clone(),
+						reason:
+							"generic external callable binder arity disagrees with its canonical type arguments"
+								.into(),
+					});
+				}
+				source_arity
 			}
 			_ => {
 				return Err(StableLoweringError::Unsupported {

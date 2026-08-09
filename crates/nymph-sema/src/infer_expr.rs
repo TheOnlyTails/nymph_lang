@@ -1506,7 +1506,9 @@ impl<'m> Checker<'m> {
 		id: NodeId,
 	) -> (Ty, Option<Resolution>) {
 		// Constructor calls: `Struct(field = …)` / `Variant(field = …)`.
-		if let ExprKind::Identifier(name) = &func.kind {
+		if let ExprKind::Identifier(name) = &func.kind
+			&& self.lookup_local(&name.0).is_none()
+		{
 			if let Some(def) = self.defs.get(&name.0)
 				&& let DefKind::Struct = self.defs.data(def).kind
 			{
@@ -1542,6 +1544,7 @@ impl<'m> Checker<'m> {
 		// type name, not a value.
 		if let ExprKind::MemberAccess { parent, member, .. } = &func.kind
 			&& let ExprKind::Identifier(type_name) = &parent.kind
+			&& self.lookup_local(&type_name.0).is_none()
 			&& let Some(def) = self.defs.get(&type_name.0)
 		{
 			match self.defs.data(def).kind {
@@ -1898,10 +1901,11 @@ impl<'m> Checker<'m> {
 		id: NodeId,
 	) -> (Ty, Option<Resolution>) {
 		if let ExprKind::Identifier(name) = &parent.kind
+			&& self.lookup_local(&name.0).is_none()
 			&& let Some(definition) = self.defs.get(&name.0)
 			&& matches!(
 				self.defs.data(definition).kind,
-				DefKind::Namespace | DefKind::Enum
+				DefKind::Namespace | DefKind::Struct | DefKind::Enum
 			) {
 			return (self.infer_member(parent, member, span, id), None);
 		}
@@ -1945,6 +1949,7 @@ impl<'m> Checker<'m> {
 
 	fn infer_member(&mut self, parent: &Expr, member: &str, span: Span, id: NodeId) -> Ty {
 		if let ExprKind::Identifier(name) = &parent.kind
+			&& self.lookup_local(&name.0).is_none()
 			&& let Some(def) = self.defs.get(&name.0)
 			&& matches!(self.defs.data(def).kind, DefKind::Namespace)
 		{
@@ -1993,8 +1998,35 @@ impl<'m> Checker<'m> {
 				}
 			};
 		}
+		if let ExprKind::Identifier(type_name) = &parent.kind
+			&& self.lookup_local(&type_name.0).is_none()
+			&& let Some(definition) = self.defs.get(&type_name.0)
+			&& matches!(self.defs.data(definition).kind, DefKind::Struct)
+		{
+			if let Some((parameters, return_type, target, type_arguments)) =
+				self.resolve_namespaced_value(definition, member, span)
+			{
+				self.annotations.record_direct_namespace_member(id);
+				self
+					.annotations
+					.record_definition_target(id, target.as_ref());
+				self
+					.annotations
+					.record_generic_call_arguments(id, type_arguments);
+				return self.interner.mk_fn(parameters, return_type);
+			}
+			self.emit(
+				span,
+				TypeError::NoNamespacedFn {
+					ty: type_name.0.clone(),
+					name: member.into(),
+				},
+			);
+			return self.interner.error();
+		}
 		// `EnumName.Variant` — a variant referenced through its type.
 		if let ExprKind::Identifier(tname) = &parent.kind
+			&& self.lookup_local(&tname.0).is_none()
 			&& let Some(def) = self.defs.get(&tname.0)
 			&& let DefKind::Enum = self.defs.data(def).kind
 		{
@@ -2002,11 +2034,23 @@ impl<'m> Checker<'m> {
 			if let Some(vidx) = variants.iter().position(|v| v.name == member) {
 				return self.variant_value(def, vidx, id, span);
 			}
+			if let Some((parameters, return_type, target, type_arguments)) =
+				self.resolve_namespaced_value(def, member, span)
+			{
+				self.annotations.record_direct_namespace_member(id);
+				self
+					.annotations
+					.record_definition_target(id, target.as_ref());
+				self
+					.annotations
+					.record_generic_call_arguments(id, type_arguments);
+				return self.interner.mk_fn(parameters, return_type);
+			}
 			self.emit(
 				span,
-				TypeError::EnumHasNoVariant {
-					enum_name: tname.0.clone(),
-					variant: member.into(),
+				TypeError::NoVariantOrNamespacedFn {
+					ty: tname.0.clone(),
+					name: member.into(),
 				},
 			);
 			return self.interner.error();

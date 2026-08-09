@@ -217,16 +217,12 @@ pub enum TypeError {
 	},
 
 	// ── Inner members ────────────────────────────────────────────────────────
-	/// A struct/enum inner member — an instance `func`, a `namespace func`
-	/// static, or a `mut func` method — was declared more than once under the
-	/// same name on the same type. `collect_impl_member` (members.rs) used to
-	/// collect all three kinds into one `FxHashMap` keyed only by name, letting a
-	/// later member silently overwrite an earlier same-named one; the shadowed
-	/// member's body was then never type-checked, yet the Slice 4J HIR lowering
-	/// walks the raw AST and emits every member's body regardless — an
-	/// unchecked-body-reaches-JS soundness hole. This diagnostic closes it at the
-	/// root: a program with this collision never has zero diagnostics, so it
-	/// never reaches lowering. `ty` names the owning struct/enum.
+	/// A struct, enum, or namespace member was declared more than once under the
+	/// same name on the same owner. The member collectors keep a single signature
+	/// per name, so silently accepting a later declaration would leave an earlier
+	/// body unchecked even though runtime extraction still walks the raw AST.
+	/// This diagnostic keeps that collision from reaching lowering. `ty` names
+	/// the owning type or namespace.
 	DuplicateMember {
 		name: EcoString,
 		ty: String,

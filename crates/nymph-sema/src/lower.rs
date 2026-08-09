@@ -459,9 +459,22 @@ impl Checker<'_> {
 			return;
 		};
 		let mut owned = NamespaceSig::default();
+		let mut member_spans = FxHashMap::default();
+		let namespace_name = self.defs.data(def).name.clone();
 		for member in members {
 			match &member.0 {
 				ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => {
+					if let Some(previous) = member_spans.insert(meta.name.0.clone(), meta.name.1) {
+						self.emit(
+							meta.name.1,
+							TypeError::DuplicateMember {
+								name: meta.name.0.clone(),
+								ty: namespace_name.to_string(),
+								redefined_span: meta.name.1,
+								prev: previous,
+							},
+						);
+					}
 					let scope = build_param_scope(&meta.generics);
 					let generics = generic_names(&meta.generics);
 					self.push_params(scope);
@@ -498,6 +511,17 @@ impl Checker<'_> {
 					let Some(name) = meta.name.0.as_binding() else {
 						continue;
 					};
+					if let Some(previous) = member_spans.insert(name.0.clone(), meta.name.1) {
+						self.emit(
+							meta.name.1,
+							TypeError::DuplicateMember {
+								name: name.0.clone(),
+								ty: namespace_name.to_string(),
+								redefined_span: meta.name.1,
+								prev: previous,
+							},
+						);
+					}
 					let ty = match &meta.type_ {
 						Some(ty) => self.lower_type(ty),
 						None => self.fresh(),

@@ -82,7 +82,7 @@ impl Checker<'_> {
 		let receiver_is_mut = matches!(self.interner.kind(resolved), TyKind::Mut(_));
 		let receiver = self.strip_mut(resolved);
 
-		if let Some((params, ty, target, implementation, method_span)) =
+		if let Some((params, ty, target, implementation, method_span, type_arguments)) =
 			self.resolve_inherent_value(receiver, name, span)
 		{
 			let resolved_target =
@@ -98,7 +98,7 @@ impl Checker<'_> {
 			return Some(MethodResolution {
 				ty,
 				params,
-				type_arguments: Vec::new(),
+				type_arguments,
 				source: MethodSource::Inherent,
 				target,
 				implementation,
@@ -188,7 +188,7 @@ impl Checker<'_> {
 				.unwrap_or_else(|| self.fresh());
 			substitution.insert(ParamIdx(index as u32), ty);
 		}
-		let (params, ty, _) = self.instantiate_iface_method_signature(
+		let (params, ty, type_arguments) = self.instantiate_iface_method_signature(
 			&method,
 			substitution,
 			definition.generics.len(),
@@ -210,7 +210,7 @@ impl Checker<'_> {
 		Some(MethodResolution {
 			ty,
 			params,
-			type_arguments: Vec::new(),
+			type_arguments,
 			source: MethodSource::GenericBound,
 			target,
 			implementation: None,
