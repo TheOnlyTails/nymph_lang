@@ -1,5 +1,5 @@
 use std::{
-	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
+	collections::{BTreeMap, HashMap, HashSet},
 	fs,
 	path::PathBuf,
 	sync::Arc,
@@ -36,6 +36,7 @@ pub struct DiagnosticModuleSnapshot {
 pub struct DiagnosticsSnapshot {
 	pub document_revision: DocumentStoreRevision,
 	pub modules: Vec<DiagnosticModuleSnapshot>,
+	pub owned_targets: Vec<Uri>,
 }
 
 pub struct AnalysisSnapshot {
@@ -59,7 +60,7 @@ pub struct CompilerState {
 	documents: HashMap<Uri, DocumentIdentity>,
 	sources: HashMap<Uri, Arc<str>>,
 	manifest_errors: HashMap<Uri, String>,
-	diagnostic_targets: HashMap<String, BTreeSet<String>>,
+	diagnostic_targets: HashMap<String, Vec<String>>,
 }
 
 impl Default for CompilerState {
@@ -212,21 +213,21 @@ impl CompilerState {
 		self.manifest_errors.contains_key(uri)
 	}
 
-	pub fn manifest_error_snapshot(&mut self, uri: &Uri) -> Option<(String, Vec<Uri>)> {
+	pub fn manifest_error_snapshot(&self, uri: &Uri) -> Option<(String, Vec<Uri>)> {
 		let message = self.manifest_errors.get(uri)?.clone();
 		let stale_targets = self
 			.diagnostic_targets
-			.remove(uri.as_str())
+			.get(uri.as_str())
 			.into_iter()
 			.flatten()
-			.filter(|target| target != uri.as_str())
-			.filter_map(|target| target.parse().ok())
+			.filter(|target| target.as_str() != uri.as_str())
+			.filter_map(|target| target.parse::<Uri>().ok())
 			.collect();
 		Some((message, stale_targets))
 	}
 
 	pub fn diagnostics_snapshot(
-		&mut self,
+		&self,
 		docs: &DocumentStore,
 		uri: &Uri,
 	) -> Option<DiagnosticsSnapshot> {
@@ -286,12 +287,15 @@ impl CompilerState {
 				})
 			})
 			.collect();
-		let current_targets: BTreeSet<String> = modules
-			.iter()
-			.map(|module| module.uri.as_str().to_string())
-			.collect();
+		let owned_targets: Vec<Uri> = modules.iter().map(|module| module.uri.clone()).collect();
 		if let Some(previous_targets) = self.diagnostic_targets.get(uri.as_str()) {
-			for previous in previous_targets.difference(&current_targets) {
+			for previous in previous_targets {
+				if owned_targets
+					.iter()
+					.any(|current| current.as_str() == previous)
+				{
+					continue;
+				}
 				let Ok(previous_uri) = previous.parse::<Uri>() else {
 					continue;
 				};
@@ -307,21 +311,20 @@ impl CompilerState {
 				});
 			}
 		}
-		self
-			.diagnostic_targets
-			.insert(uri.as_str().to_string(), current_targets);
 		Some(DiagnosticsSnapshot {
 			document_revision,
 			modules,
+			owned_targets,
 		})
 	}
 
 	pub fn affected_diagnostics_snapshot(
 		&self,
 		docs: &DocumentStore,
+		origin: &Uri,
 		uris: &[Uri],
 	) -> DiagnosticsSnapshot {
-		let modules = uris
+		let mut modules: Vec<_> = uris
 			.iter()
 			.filter_map(|uri| {
 				let identity = self.documents.get(uri)?;
@@ -357,10 +360,45 @@ impl CompilerState {
 				})
 			})
 			.collect();
+		let owned_targets: Vec<Uri> = modules.iter().map(|module| module.uri.clone()).collect();
+		if let Some(previous_targets) = self.diagnostic_targets.get(origin.as_str()) {
+			for previous in previous_targets {
+				if owned_targets
+					.iter()
+					.any(|current| current.as_str() == previous)
+				{
+					continue;
+				}
+				let Ok(previous_uri) = previous.parse::<Uri>() else {
+					continue;
+				};
+				let open = docs.get(&previous_uri);
+				modules.push(DiagnosticModuleSnapshot {
+					uri: previous_uri.clone(),
+					source: open
+						.map(|document| Arc::from(document.text.as_str()))
+						.or_else(|| self.sources.get(&previous_uri).cloned())
+						.unwrap_or_else(|| Arc::from("")),
+					version: open.map(|document| document.version),
+					diagnostics: Vec::new(),
+				});
+			}
+		}
 		DiagnosticsSnapshot {
 			document_revision: docs.revision(),
 			modules,
+			owned_targets,
 		}
+	}
+
+	pub fn record_diagnostic_targets(&mut self, origin: &Uri, targets: &[Uri]) {
+		self.diagnostic_targets.insert(
+			origin.as_str().to_string(),
+			targets
+				.iter()
+				.map(|target| target.as_str().to_string())
+				.collect(),
+		);
 	}
 
 	#[doc(hidden)]
