@@ -544,8 +544,8 @@ fn project_semantic_tokens_use_imports_prelude_and_dependency_overlays() {
 	fs::create_dir(temp.path().join("src")).unwrap();
 	let main_path = temp.path().join("src/main.nym");
 	let dep_path = temp.path().join("src/dep.nym");
-	let source = "import @/dep as dependency with (Box as ImportedBox, Choice, Config, make as build, amount as imported_amount)\nfunc use(box: ImportedBox): Option<Choice> = Some(value = build(box))\nfunc choose(): Choice = Choice.One\nfunc read(box: ImportedBox): int = box.get() + box.value + Config.count + dependency.amount + imported_amount\nfunc construct(): ImportedBox = ImportedBox(value = 1)";
-	let dependency = "public struct Box(public value: int) { func get(): int = this.value }\npublic enum Choice { One }\npublic namespace Config { public let count = 1 }\npublic func make(box: Box): Choice = Choice.One\npublic let amount: int = 1";
+	let source = "import @/dep as dependency with (Box as ImportedBox, Choice, Config, make as build, amount as imported_amount)\nfunc use(box: ImportedBox): Option<Choice> = Some(value = build(box))\nfunc choose(): Choice = Choice.One\nfunc read(box: ImportedBox): int = box.get() + box.value + Config.count + dependency.amount + imported_amount\nfunc construct(): ImportedBox = ImportedBox(value = 1)\nfunc static_construct(): ImportedBox = ImportedBox.create()\nfunc qualified_pattern(choice: Choice): int = match (choice) { Choice.One -> 1 }";
+	let dependency = "public struct Box(public value: int) { func get(): int = this.value namespace func create(): Box = Box(value = 1) }\npublic enum Choice { One }\npublic namespace Config { public let count = 1 }\npublic func make(box: Box): Choice = Choice.One\npublic let amount: int = 1";
 	fs::write(&main_path, source).unwrap();
 	fs::write(&dep_path, dependency).unwrap();
 	let main_uri = uri(&main_path);
@@ -632,6 +632,22 @@ fn project_semantic_tokens_use_imports_prelude_and_dependency_overlays() {
 		12
 	);
 	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "ImportedBox.create"),
+		2
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "create()"),
+		4
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "Choice.One ->"),
+		2
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "One ->"),
+		8
+	);
+	assert_eq!(
 		semantic_token_type_at(
 			&compiler,
 			&docs,
@@ -658,7 +674,7 @@ fn project_semantic_tokens_use_imports_prelude_and_dependency_overlays() {
 		.open(
 			&mut docs,
 			dep_uri,
-			"public struct Box(public value: int) { func get(): int = this.value }\npublic enum Choice { One }\npublic let make: int = 1\npublic let amount: int = 2".into(),
+			"public struct Box(public value: int) { func get(): int = this.value namespace func create(): Box = Box(value = 1) }\npublic enum Choice { One }\npublic let make: int = 1\npublic let amount: int = 2".into(),
 			2,
 		)
 		.unwrap();

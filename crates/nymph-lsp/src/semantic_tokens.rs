@@ -1295,6 +1295,18 @@ fn walk_expr_uses(
 					}
 					_ => walk_expr_uses(func, analysis, variant_names, decls, out),
 				}
+			} else if let Some(call) = analysis.annotations.generic_namespaced_call(expr.id)
+				&& let ExprKind::MemberAccess { parent, member, .. } = &func.kind
+			{
+				let role = stable_definition_role(analysis, &call.member).unwrap_or((METHOD, 0));
+				out.push((member.1.start, role));
+				out.push((parent.span.start, (TYPE, 0)));
+			} else if let Some(target) = analysis.annotations.definition_target_of(expr.id)
+				&& let ExprKind::MemberAccess { parent, member, .. } = &func.kind
+				&& let Some(role) = stable_definition_role(analysis, target)
+			{
+				out.push((member.1.start, role));
+				walk_expr_uses(parent, analysis, variant_names, decls, out);
 			} else if analysis.annotations.resolution_of(expr.id).is_some()
 				&& let ExprKind::MemberAccess { parent, member, .. } = &func.kind
 			{
@@ -1306,6 +1318,12 @@ fn walk_expr_uses(
 				out.push((func.span.start, (ENUM_MEMBER, 0)));
 			} else {
 				walk_expr_uses(func, analysis, variant_names, decls, out);
+			}
+			if let ExprKind::MemberAccess { parent, member, .. } = &func.kind
+				&& let Some(role) = nominal_parent_role(parent, analysis, decls)
+			{
+				out.push((parent.span.start, role));
+				out.push((member.1.start, (METHOD, 0)));
 			}
 			for a in args {
 				if let Some(label) = &a.0.name {
@@ -1326,6 +1344,9 @@ fn walk_expr_uses(
 				&& let Some(role) = stable_definition_role(analysis, target)
 			{
 				out.push((member.1.start, role));
+				if let Some(role) = nominal_parent_role(parent, analysis, decls) {
+					out.push((parent.span.start, role));
+				}
 			} else if let Some(decl_span) = nymph_sema::query::definition_at(module, member.1.start)
 				&& let Some(&(ty, _)) = decls.get(&decl_span.start)
 				&& ty == METHOD
@@ -1416,6 +1437,24 @@ fn walk_expr_uses(
 	}
 }
 
+fn nominal_parent_role(
+	parent: &Expr,
+	analysis: &SemanticAnalysis,
+	decls: &RoleMap,
+) -> Option<(u32, u32)> {
+	let ExprKind::Identifier(name) = &parent.kind else {
+		return None;
+	};
+	if let Some(decl_span) = nymph_sema::query::definition_at(&analysis.module, parent.span.start)
+		&& let Some(&(ty, _)) = decls.get(&decl_span.start)
+	{
+		return matches!(ty, TYPE | NAMESPACE).then_some((ty, 0));
+	}
+	nymph_sema::query::definition_kind_by_name(analysis, &name.0)
+		.map(definition_kind_role)
+		.filter(|(ty, _)| matches!(*ty, TYPE | NAMESPACE))
+}
+
 fn push_qualified_parent(expr: &Expr, out: &mut Vec<(usize, (u32, u32))>) {
 	if let ExprKind::MemberAccess { parent, .. } = &expr.kind
 		&& matches!(parent.kind, ExprKind::Identifier(_))
@@ -1446,9 +1485,7 @@ fn walk_pattern_uses(
 	if analysis.annotations.pattern_variant_of(pattern.1).is_some() {
 		match &pattern.0 {
 			Pattern::Struct { path, .. } => {
-				if let Some(last) = path.last() {
-					out.push((last.1.start, (ENUM_MEMBER, 0)));
-				}
+				push_variant_pattern_path(path, out);
 			}
 			Pattern::Binding { name, .. } => out.push((name.1.start, (ENUM_MEMBER, 0))),
 			_ => {}
@@ -1459,7 +1496,7 @@ fn walk_pattern_uses(
 				if let Some(last) = path.last()
 					&& is_unshadowed_variant(module, variant_names, last)
 				{
-					out.push((last.1.start, (ENUM_MEMBER, 0)));
+					push_variant_pattern_path(path, out);
 				}
 			}
 			Pattern::Binding { name, inner }
@@ -1510,6 +1547,15 @@ fn walk_pattern_uses(
 		}
 		Pattern::Grouped(inner) => walk_pattern_uses(inner, analysis, variant_names, out),
 		_ => {}
+	}
+}
+
+fn push_variant_pattern_path(path: &[Ident], out: &mut Vec<(usize, (u32, u32))>) {
+	if path.len() == 2 {
+		out.push((path[0].1.start, (TYPE, 0)));
+	}
+	if let Some(last) = path.last() {
+		out.push((last.1.start, (ENUM_MEMBER, 0)));
 	}
 }
 
@@ -2004,6 +2050,64 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 		let use_offset = text.rfind("count").unwrap();
 		let (use_line, use_col) = line_col(text, use_offset);
 		assert_eq!(find(&decoded, use_line, use_col).type_name, "variable");
+	}
+
+	#[test]
+	fn nominal_and_generic_static_calls_classify_qualifiers_and_members() {
+		let text = "interface Default {\n  func default(): self\n}\nstruct Point(x: int) {\n  namespace func origin(): Point = Point(x = 0)\n}\nfunc local(): Point = Point.origin()\nfunc generic<T: Default>(): T = T.default()";
+		let parsed = nymph_syntax::parse_module(text, "static-calls.nym");
+		assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+		let checked = nymph_sema::check_module(&parsed.tree);
+		assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		let nominal_offset = text.find("Point.origin").unwrap();
+		let (nominal_line, nominal_col) = line_col(text, nominal_offset);
+		assert_eq!(find(&decoded, nominal_line, nominal_col).type_name, "type");
+		assert_eq!(
+			find(&decoded, nominal_line, nominal_col + "Point.".len() as u32).type_name,
+			"method"
+		);
+
+		let generic_offset = text.find("T.default()").unwrap();
+		let (generic_line, generic_col) = line_col(text, generic_offset);
+		assert_eq!(find(&decoded, generic_line, generic_col).type_name, "type");
+		assert_eq!(
+			find(&decoded, generic_line, generic_col + "T.".len() as u32).type_name,
+			"method"
+		);
+	}
+
+	#[test]
+	fn a_value_receiver_shadowing_a_nominal_stays_a_parameter() {
+		let text = "struct Box(value: int) {\n  func get(): int = this.value\n}\nfunc read(Box: Box): int = Box.get()";
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		let offset = text.rfind("Box.get()").unwrap();
+		let (line, col) = line_col(text, offset);
+		assert_eq!(find(&decoded, line, col).type_name, "parameter");
+		assert_eq!(
+			find(&decoded, line, col + "Box.".len() as u32).type_name,
+			"method"
+		);
+	}
+
+	#[test]
+	fn a_qualified_enum_pattern_classifies_its_qualifier_and_variant() {
+		let text =
+			"enum Choice { One }\nfunc read(value: Choice): int = match (value) { Choice.One -> 1 }";
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		let offset = text.rfind("Choice.One").unwrap();
+		let (line, col) = line_col(text, offset);
+		assert_eq!(find(&decoded, line, col).type_name, "type");
+		assert_eq!(
+			find(&decoded, line, col + "Choice.".len() as u32).type_name,
+			"enumMember"
+		);
 	}
 
 	#[test]
