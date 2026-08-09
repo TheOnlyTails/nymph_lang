@@ -861,6 +861,62 @@ fn stable_native_range_runtime_is_exact_collision_safe_and_runs_after_dependency
 }
 
 #[test]
+fn stable_native_range_endpoints_evaluate_once_in_source_order() {
+	let mut session = CompilerSession::new();
+	let project = ProjectId::new("stable-range-order");
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		r#"func ordered(): int = {
+  let mut order = 0
+  let endpoint = (value: int) -> { order = order * 10 + value value }
+  let mut total = 0
+  for (value in (if (true) { endpoint(1) } else { endpoint(9) })..endpoint(4)) {
+    total = total + value
+  }
+  order * 100 + total
+}
+public func main(): void = {}"#
+			.into(),
+		SourceVersion(1),
+	);
+
+	let emitted = session
+		.emit_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
+		.expect("check-mode numeric range starts emit as direct native loops");
+	let source = &emitted.module_sources["main"];
+	assert_eq!(source.matches("while (").count(), 1, "{source}");
+	assert!(!source.contains("NymphRange"), "{source}");
+	assert!(!source.contains("@nymph/runtime/option"), "{source}");
+	assert!(!source.contains("@nymph/runtime/iter"), "{source}");
+	assert!(!emitted.module_sources.contains_key("@nymph/runtime/option"));
+	assert!(!emitted.module_sources.contains_key("@nymph/runtime/iter"));
+
+	let compiled = session
+		.compile_interface_project_for_test(project, main, EntryMode::Entry)
+		.expect("ordered direct native range bundles");
+	let ordered = compiled.entry_symbol("ordered");
+	let script = format!("{}\nconsole.log({ordered}().v);\n", compiled.js);
+	let path = std::env::temp_dir().join(format!(
+		"nymph-stable-range-order-{}.mjs",
+		std::process::id()
+	));
+	std::fs::write(&path, script).unwrap();
+	let output = std::process::Command::new("node")
+		.arg(&path)
+		.output()
+		.unwrap();
+	let _ = std::fs::remove_file(path);
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(String::from_utf8_lossy(&output.stdout), "1406\n");
+}
+
+#[test]
 fn stable_native_range_loop_results_link_only_option_and_preserve_completion_values() {
 	let mut session = CompilerSession::new();
 	let project = ProjectId::new("stable-range-results");
@@ -868,7 +924,7 @@ fn stable_native_range_loop_results_link_only_option_and_preserve_completion_val
 	session.set_source(
 		project.clone(),
 		main.clone(),
-		"func int_start(): int = 1\nfunc early(): int = match (for (value in int_start()..4) { if (value == 2) { break value } }) { Some(value) -> value, None -> 0 }\nfunc natural(): int = match (for (value in int_start()..3) { if (value == 9) { break value } }) { Some(value) -> value, None -> 4 }\nfunc exercise(): int = early() + natural()\npublic func main(): void = {}"
+		"func early(): int = match (for (value in (if (true) { 1 } else { 2 })..4) { if (value == 2) { break value } }) { Some(value) -> value, None -> 0 }\nfunc natural(): int = match (for (value in (match (true) { true -> 1, false -> 2 })..3) { if (value == 9) { break value } }) { Some(value) -> value, None -> 4 }\nfunc exercise(): int = early() + natural()\npublic func main(): void = {}"
 			.into(),
 		SourceVersion(1),
 	);

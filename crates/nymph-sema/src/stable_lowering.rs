@@ -5324,28 +5324,20 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		result_option: Option<nymph_hir::hir::HirOptionAbi>,
 	) -> Result<HirExpr, StableLoweringError> {
 		let native_range_number = match &iterable.kind {
-			StableExprKind::Range(
-				StableRange::Exclusive { min, .. } | StableRange::Inclusive { min, .. },
-			) => {
-				let mut source = min.as_ref();
-				while let StableExprKind::Grouped(inner) = &source.kind {
-					source = inner;
-				}
-				match source.kind {
-					StableExprKind::Int(_) => Some(BuiltinResult::Int),
-					StableExprKind::UInt(_) => Some(BuiltinResult::UInt),
-					_ => self
-						.annotations
-						.types
-						.iter()
-						.find(|(id, _)| *id == self.id(source))
-						.and_then(|(_, ty)| match peel_mut(ty) {
-							InterfaceType::Int => Some(BuiltinResult::Int),
-							InterfaceType::UInt => Some(BuiltinResult::UInt),
-							_ => None,
-						}),
-				}
-			}
+			StableExprKind::Range(StableRange::Exclusive { .. } | StableRange::Inclusive { .. }) => self
+				.annotations
+				.types
+				.iter()
+				.find(|(id, _)| *id == self.id(iterable))
+				.and_then(|(_, ty)| match peel_mut(ty) {
+					InterfaceType::Named { positional, .. } => positional.first(),
+					_ => None,
+				})
+				.and_then(|ty| match peel_mut(ty) {
+					InterfaceType::Int => Some(BuiltinResult::Int),
+					InterfaceType::UInt => Some(BuiltinResult::UInt),
+					_ => None,
+				}),
 			_ => None,
 		};
 		if let StableExprKind::Range(
