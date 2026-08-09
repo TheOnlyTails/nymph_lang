@@ -96,7 +96,10 @@ fn select_files(files: &[PathBuf], manifest: &ManifestSelection) -> anyhow::Resu
 					Err(error) => return Err(error.into()),
 				}
 			}
-			selected.insert(file);
+			// Resolve aliases only after enforcing the source boundary implied by
+			// the spelling the user supplied. This deduplicates symlinks and makes
+			// the atomic replacement update the source rather than the link itself.
+			selected.insert(fs::canonicalize(file)?);
 		}
 	}
 	if selected.is_empty() {
@@ -182,7 +185,7 @@ fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
 					output.write_all(contents)?;
 					output.sync_all()?;
 					drop(output);
-					fs::rename(&temporary, path)
+					replace_file(&temporary, path)
 				})();
 				if result.is_err() {
 					let _ = fs::remove_file(&temporary);
@@ -194,4 +197,31 @@ fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
 		}
 	}
 	anyhow::bail!("could not create an atomic temporary file")
+}
+
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+	fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+	use std::os::windows::ffi::OsStrExt as _;
+	use windows_sys::Win32::Storage::FileSystem::{
+		MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+	};
+
+	let from: Vec<_> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+	let to: Vec<_> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+	if unsafe {
+		MoveFileExW(
+			from.as_ptr(),
+			to.as_ptr(),
+			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+		)
+	} == 0
+	{
+		return Err(std::io::Error::last_os_error());
+	}
+	Ok(())
 }

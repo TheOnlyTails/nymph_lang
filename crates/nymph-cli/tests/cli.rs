@@ -1842,6 +1842,59 @@ fn format_explicit_files_writes_atomically_in_deterministic_order() {
 	std::fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn format_deduplicates_symlink_aliases_without_replacing_the_link() {
+	use std::os::unix::fs::{PermissionsExt as _, symlink};
+
+	let root = unique_temp_path("nymph_cli_format_alias", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let source = root.join("source.nym");
+	let alias = root.join("alias.nym");
+	std::fs::write(&source, "let value=#[1,2]\n").unwrap();
+	let mut permissions = std::fs::metadata(&source).unwrap().permissions();
+	permissions.set_mode(0o640);
+	std::fs::set_permissions(&source, permissions).unwrap();
+	symlink(&source, &alias).unwrap();
+
+	let out = nymph_in(
+		&[
+			"format",
+			"source.nym",
+			"./source.nym",
+			alias.to_str().unwrap(),
+		],
+		&root,
+	);
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(
+		std::fs::read_to_string(&source).unwrap(),
+		"let value = #[1, 2]\n"
+	);
+	assert!(
+		std::fs::symlink_metadata(&alias)
+			.unwrap()
+			.file_type()
+			.is_symlink(),
+		"formatter replaced the selected symlink"
+	);
+	assert_eq!(
+		std::fs::metadata(&source).unwrap().permissions().mode() & 0o777,
+		0o640
+	);
+	assert_eq!(
+		out
+			.stderr
+			.lines()
+			.filter(|line| line.starts_with("formatted "))
+			.count(),
+		1,
+		"aliased source was reported more than once: {}",
+		out.stderr
+	);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn format_check_is_read_only_and_distinguishes_clean_dirty_and_malformed() {
 	let root = unique_temp_path("nymph_cli_format_check", "dir");
