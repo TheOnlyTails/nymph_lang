@@ -2,9 +2,9 @@
 //! tokio/async — the compiler facade it wraps is synchronous) providing
 //! diagnostics, hover, document symbols, go-to-definition, and completion
 //! over stdio, spawned by the VS Code extension (`extension/src/extension.ts`)
-//! as `target/{release,debug}/nymph-lsp`.
+//! from its target-specific packaged payload.
 //!
-//! MVP scope (see `extension/LSP_INTEGRATION.md`): `textDocument/didOpen` /
+//! MVP scope (see `extension/README.md`): `textDocument/didOpen` /
 //! `didChange` (full sync) / `didClose` keep an in-memory [`DocumentStore`]
 //! current; every open/change re-checks the document and republishes its
 //! full diagnostic set (loose single-file mode, or whole-project mode when a
