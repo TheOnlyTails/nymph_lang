@@ -6,6 +6,13 @@ use std::io::Write;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+const ATOMIC_DIRECTORY_EXCHANGE: bool = cfg!(any(
+	target_os = "linux",
+	target_os = "android",
+	target_os = "macos",
+	target_os = "ios"
+));
+
 /// A unique path in the system temp dir, isolated across parallel test threads
 /// (mirrors the pid + monotonic-counter pattern in
 /// `crates/nymph-codegen/tests/run_node.rs`).
@@ -115,11 +122,24 @@ fn doc_generates_default_and_custom_deterministic_sites_with_visibility_and_link
 		"cross-module type should link by its semantic target: {main}"
 	);
 	let first = std::fs::read(default.join("modules/main.html")).unwrap();
-	let regenerated = nymph_in(&["doc"], &root);
+	let second = root.join("deterministic-docs");
+	let regenerated = if ATOMIC_DIRECTORY_EXCHANGE {
+		nymph_in(&["doc"], &root)
+	} else {
+		nymph_in(&["doc", "--output", second.to_str().unwrap()], &root)
+	};
 	assert!(regenerated.status.success(), "{}", regenerated.stderr);
 	assert_eq!(
 		first,
-		std::fs::read(default.join("modules/main.html")).unwrap(),
+		std::fs::read(
+			if ATOMIC_DIRECTORY_EXCHANGE {
+				&default
+			} else {
+				&second
+			}
+			.join("modules/main.html")
+		)
+		.unwrap(),
 		"same checked project must render byte-for-byte deterministically"
 	);
 
@@ -159,8 +179,33 @@ fn doc_failure_preserves_the_previous_output_tree() {
 	let prior_file = root.join("prior-file");
 	std::fs::write(&prior_file, "old file").unwrap();
 	let replaced = nymph_in(&["doc", "--output", prior_file.to_str().unwrap()], &root);
-	assert!(replaced.status.success(), "{}", replaced.stderr);
-	assert!(prior_file.join("index.html").is_file());
+	if ATOMIC_DIRECTORY_EXCHANGE {
+		assert!(replaced.status.success(), "{}", replaced.stderr);
+		assert!(prior_file.join("index.html").is_file());
+	} else {
+		assert_eq!(replaced.status.code(), Some(1), "{}", replaced.stderr);
+		assert_eq!(std::fs::read_to_string(&prior_file).unwrap(), "old file");
+	}
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn doc_reports_warnings_without_blocking_publication() {
+	let root = write_project("main.nym", "public func large(): int = 9007199254740992\n");
+	let result = nymph_in(&["doc"], &root);
+	assert!(result.status.success(), "{}", result.stderr);
+	assert!(
+		result.stderr.to_ascii_lowercase().contains("warning"),
+		"{}",
+		result.stderr
+	);
+	assert!(
+		result.stderr.contains("9007199254740992"),
+		"{}",
+		result.stderr
+	);
+	assert!(root.join("target/nymph/doc/index.html").is_file());
 
 	std::fs::remove_dir_all(root).unwrap();
 }
@@ -221,6 +266,7 @@ fn doc_open_runs_only_after_publication_and_receives_the_generated_index() {
 	let output = Command::new(env!("CARGO_BIN_EXE_nymph"))
 		.arg("doc")
 		.arg("--open")
+		.arg("--output=-site")
 		.current_dir(&root)
 		.env("PATH", std::env::join_paths(path).unwrap())
 		.output()
@@ -232,10 +278,7 @@ fn doc_open_runs_only_after_publication_and_receives_the_generated_index() {
 	);
 	assert_eq!(
 		std::fs::read_to_string(record).unwrap(),
-		root
-			.join("target/nymph/doc/index.html")
-			.display()
-			.to_string()
+		root.join("-site/index.html").display().to_string()
 	);
 
 	std::fs::remove_dir_all(root).unwrap();

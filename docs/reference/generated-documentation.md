@@ -46,10 +46,19 @@ mode because it describes a project module graph.
 - Declaration signatures come from checked semantic interfaces. Links between
   project types use exact resolved declaration identities, including when two
   modules or declarations use the same text name.
-- Module and declaration text is HTML-escaped before rendering.
+- Signatures retain declaration, field, member, and implementation visibility.
+- Module and declaration text is HTML-escaped before rendering. Module paths use
+  a case-fold-safe encoding that also avoids reserved Windows device names, and
+  item anchors are derived from stable semantic identities.
+- Warnings are reported but do not prevent publication. Errors prevent output.
 - Generation happens in a sibling staging directory. The destination is
   replaced only after every page and asset has been written. A parse, type,
   resolution, or staging failure leaves the previous destination tree intact.
+- Replacing an existing tree requires an atomic directory-exchange primitive.
+  Platforms without one, including Windows, refuse replacement rather than
+  temporarily removing the old tree. Windows still supports first publication;
+  another platform may also refuse first publication if it has no atomic
+  no-replace rename primitive.
 - `--open` runs only after publication succeeds.
 
 The site currently documents the reachable project closure rather than every
