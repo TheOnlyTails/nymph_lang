@@ -290,7 +290,9 @@ impl CompilerState {
 		}
 		let mut covered = HashSet::new();
 		for refresh in &mut refreshes {
-			refresh.affected.retain(|uri| covered.insert(uri.clone()));
+			refresh
+				.affected
+				.retain(|uri| covered.insert(uri.as_str().to_string()));
 		}
 		refreshes.retain(|refresh| !refresh.affected.is_empty());
 		if filesystem_changed {
