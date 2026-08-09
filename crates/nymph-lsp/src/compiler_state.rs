@@ -624,10 +624,12 @@ impl CompilerState {
 				&& matches!(candidate.kind, DocumentKind::Project(_))
 				&& candidate.root == identity.root
 		});
-		if matches!(identity.kind, DocumentKind::Project(_)) && !root_still_open {
+		if matches!(identity.kind, DocumentKind::Project(_)) {
 			self.synchronized_roots.remove(&identity.root);
-			self.retire_project(docs, uri, identity);
-			return;
+			if !root_still_open {
+				self.retire_project(docs, uri, identity);
+				return;
+			}
 		}
 		let module_identity = identity.module_identity();
 		if let Some((open_uri, source, version)) =
