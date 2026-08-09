@@ -1998,6 +1998,79 @@ mod tests {
 	}
 
 	#[test]
+	fn watcher_read_race_removes_the_source_without_stopping_the_server() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='wire-watch-race'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let main_path = temp.path().join("src/main.nym");
+		let dep_path = temp.path().join("src/dep.nym");
+		let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+		std::fs::write(&main_path, main_source).unwrap();
+		std::fs::write(&dep_path, "public func value(): int = 1").unwrap();
+		let main_uri = workspace::path_to_uri(&main_path).unwrap();
+		let dep_uri = workspace::path_to_uri(&dep_path).unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		let registration = handshake_with_watchers(&client);
+		client
+			.sender
+			.send(Message::Response(Response::new_ok(
+				registration.id,
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		send_open(&client, main_uri.clone(), 1, main_source);
+		recv_diagnostics_for(&client, &main_uri);
+
+		std::fs::remove_file(&dep_path).unwrap();
+		std::fs::create_dir(&dep_path).unwrap();
+		send_watched_file(&client, dep_uri.clone());
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(95),
+				"test/barrier".into(),
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		let mut publications = Vec::new();
+		loop {
+			match client.receiver.recv().unwrap() {
+				Message::Notification(notification)
+					if notification.method == lsp_types::notification::PublishDiagnostics::METHOD =>
+				{
+					publications
+						.push(serde_json::from_value::<PublishDiagnosticsParams>(notification.params).unwrap());
+				}
+				Message::Response(response) => {
+					assert_eq!(response.id, RequestId::from(95));
+					break;
+				}
+				other => panic!("expected diagnostics or barrier response, got {other:?}"),
+			}
+		}
+		assert_eq!(
+			publications
+				.iter()
+				.map(|params| &params.uri)
+				.collect::<Vec<_>>(),
+			[&dep_uri, &main_uri]
+		);
+		assert!(publications[0].diagnostics.is_empty());
+		assert!(publications[1].diagnostics.iter().any(|diagnostic| {
+			diagnostic.code
+				== Some(lsp_types::NumberOrString::String(
+					"IMPORT-UNRESOLVED".into(),
+				))
+		}));
+		shutdown(&client, handle);
+	}
+
+	#[test]
 	fn previous_lifecycle_responses_are_not_prepared_after_same_version_reopen() {
 		let uri: lsp_types::Uri = "file:///wire_stale_analysis.nym".parse().unwrap();
 		let mut docs = DocumentStore::default();

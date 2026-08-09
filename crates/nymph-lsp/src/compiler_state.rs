@@ -464,10 +464,9 @@ impl CompilerState {
 			{
 				match fs::read_to_string(&disk_path) {
 					Ok(source) => self.set_effective_source(&module_identity, source, SourceVersion(0)),
-					Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+					Err(_) => {
 						self.remove_effective_source(&module_identity);
 					}
-					Err(error) => return Err(error.into()),
 				}
 			}
 			for current in self.affected_project_documents(docs, &origin) {
@@ -1079,8 +1078,15 @@ impl CompilerState {
 		self.documents.insert(uri.clone(), identity.clone());
 
 		if matches!(kind, DocumentKind::Project(_)) && self.synchronized_roots.insert(root.clone()) {
-			let files = nymph_files(&root)?;
-			let disk_modules: HashSet<_> = files.iter().map(|(_, module)| module.clone()).collect();
+			let files: Vec<_> = nymph_files(&root)
+				.into_iter()
+				.filter_map(|(path, module)| {
+					fs::read_to_string(&path)
+						.ok()
+						.map(|source| (path, module, source))
+				})
+				.collect();
+			let disk_modules: HashSet<_> = files.iter().map(|(_, module, _)| module.clone()).collect();
 			let stale_modules: Vec<_> = self
 				.effective_sources
 				.keys()
@@ -1095,28 +1101,26 @@ impl CompilerState {
 			for module in stale_modules {
 				self.remove_effective_source(&module);
 			}
-			for (path, module) in files {
-				if let Ok(source) = fs::read_to_string(&path) {
-					let disk_identity = DocumentIdentity {
-						project: project.clone(),
-						module: module.clone(),
-						entry: module.clone(),
-						root: root.clone(),
-						without_prelude,
-						kind: DocumentKind::Project(path.clone()),
-					};
-					self.set_effective_source(&disk_identity.module_identity(), source, SourceVersion(0));
-					if let Some(disk_uri) = workspace::path_to_uri(&path) {
-						self
-							.documents
-							.entry(disk_uri.clone())
-							.and_modify(|current| {
-								if docs.get(&disk_uri).is_none() {
-									*current = disk_identity.clone();
-								}
-							})
-							.or_insert(disk_identity);
-					}
+			for (path, module, source) in files {
+				let disk_identity = DocumentIdentity {
+					project: project.clone(),
+					module: module.clone(),
+					entry: module,
+					root: root.clone(),
+					without_prelude,
+					kind: DocumentKind::Project(path.clone()),
+				};
+				self.set_effective_source(&disk_identity.module_identity(), source, SourceVersion(0));
+				if let Some(disk_uri) = workspace::path_to_uri(&path) {
+					self
+						.documents
+						.entry(disk_uri.clone())
+						.and_modify(|current| {
+							if docs.get(&disk_uri).is_none() {
+								*current = disk_identity.clone();
+							}
+						})
+						.or_insert(disk_identity);
 				}
 			}
 		}
@@ -1177,33 +1181,32 @@ fn valid_source_span(source: &str, span: nymph_ast::Span) -> bool {
 		&& source.is_char_boundary(span.end)
 }
 
-fn nymph_files(root: &std::path::Path) -> anyhow::Result<Vec<(PathBuf, ModulePath)>> {
-	fn visit(
-		root: &std::path::Path,
-		dir: &std::path::Path,
-		out: &mut Vec<(PathBuf, ModulePath)>,
-	) -> anyhow::Result<()> {
+fn nymph_files(root: &std::path::Path) -> Vec<(PathBuf, ModulePath)> {
+	fn visit(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(PathBuf, ModulePath)>) {
 		if !dir.is_dir() {
-			return Ok(());
+			return;
 		}
-		if dir != root && dir.join("nymph.toml").try_exists()? {
-			return Ok(());
+		if dir != root && !matches!(dir.join("nymph.toml").try_exists(), Ok(false)) {
+			return;
 		}
-		for entry in fs::read_dir(dir)? {
-			let path = entry?.path();
+		let Ok(entries) = fs::read_dir(dir) else {
+			return;
+		};
+		for entry in entries.flatten() {
+			let path = entry.path();
 			if path.is_dir() {
-				visit(root, &path, out)?;
+				visit(root, &path, out);
 			} else if path.extension().and_then(|ext| ext.to_str()) == Some("nym")
 				&& let Ok(module) = nymph_project::module_from_file(root, &path)
 			{
 				out.push((path, module));
 			}
 		}
-		Ok(())
 	}
 	let mut files = Vec::new();
-	visit(root, root, &mut files)?;
-	Ok(files)
+	visit(root, root, &mut files);
+	files.sort_by(|left, right| left.0.cmp(&right.0));
+	files
 }
 
 pub fn publish_if_current<T>(

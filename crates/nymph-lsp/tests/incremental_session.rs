@@ -1637,6 +1637,52 @@ fn watched_source_root_error_and_recovery_rescan_deleted_modules() {
 	);
 }
 
+#[cfg(unix)]
+#[test]
+fn watched_manifest_rescan_removes_an_unreadable_stale_source() {
+	use std::os::unix::fs::symlink;
+
+	let temp = tempfile::tempdir().unwrap();
+	let manifest_path = temp.path().join("nymph.toml");
+	fs::write(
+		&manifest_path,
+		"[package]\nname='unreadable-rescan'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+	fs::write(&main_path, main_source).unwrap();
+	fs::write(&dep_path, "public func value(): int = 1").unwrap();
+	let main_uri = uri(&main_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), main_source.into(), 1)
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.is_empty()
+	);
+
+	fs::remove_file(&dep_path).unwrap();
+	symlink(temp.path().join("missing-target"), &dep_path).unwrap();
+	compiler
+		.watched_files_changed(&mut docs, &[uri(&manifest_path)])
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.iter()
+			.any(|diagnostic| diagnostic.diag.code == "IMPORT-UNRESOLVED"),
+		"the failed rescan read retained the previous dependency source"
+	);
+}
+
 #[test]
 fn watched_nested_manifest_preserves_outer_refresh_and_isolates_inner_sources() {
 	let temp = tempfile::tempdir().unwrap();
