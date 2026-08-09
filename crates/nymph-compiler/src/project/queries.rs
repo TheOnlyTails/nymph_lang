@@ -616,6 +616,181 @@ pub struct ProjectGraph {
 	pub diagnostics: Arc<[ProjectDiagnostic]>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectDependencyGraph {
+	direct: Arc<[(ModulePath, Arc<[ModulePath]>)]>,
+}
+
+impl ProjectDependencyGraph {
+	pub(crate) fn reverse_importer_closure(&self, module: ModulePath) -> Vec<ModulePath> {
+		use std::collections::{BTreeMap, BTreeSet, VecDeque};
+
+		let mut seen = BTreeSet::from([module.clone()]);
+		let mut pending = VecDeque::from([module.clone()]);
+		while let Some(dependency) = pending.pop_front() {
+			for (importer, imports) in self.direct.iter() {
+				if imports.contains(&dependency) && seen.insert(importer.clone()) {
+					pending.push_back(importer.clone());
+				}
+			}
+		}
+
+		let mut forward: BTreeMap<ModulePath, Vec<ModulePath>> = seen
+			.iter()
+			.cloned()
+			.map(|module| (module, Vec::new()))
+			.collect();
+		let mut reverse = forward.clone();
+		for (importer, imports) in self.direct.iter().filter(|(owner, _)| seen.contains(owner)) {
+			for dependency in imports
+				.iter()
+				.filter(|dependency| seen.contains(*dependency))
+			{
+				forward.get_mut(dependency).unwrap().push(importer.clone());
+				reverse.get_mut(importer).unwrap().push(dependency.clone());
+			}
+		}
+		for edges in forward.values_mut().chain(reverse.values_mut()) {
+			edges.sort();
+		}
+
+		fn finish_order(
+			module: &ModulePath,
+			graph: &BTreeMap<ModulePath, Vec<ModulePath>>,
+			seen: &mut BTreeSet<ModulePath>,
+			order: &mut Vec<ModulePath>,
+		) {
+			if !seen.insert(module.clone()) {
+				return;
+			}
+			for next in &graph[module] {
+				finish_order(next, graph, seen, order);
+			}
+			order.push(module.clone());
+		}
+
+		fn collect_component(
+			module: &ModulePath,
+			graph: &BTreeMap<ModulePath, Vec<ModulePath>>,
+			seen: &mut BTreeSet<ModulePath>,
+			component: &mut Vec<ModulePath>,
+		) {
+			if !seen.insert(module.clone()) {
+				return;
+			}
+			component.push(module.clone());
+			for next in &graph[module] {
+				collect_component(next, graph, seen, component);
+			}
+		}
+
+		let mut finished = Vec::new();
+		let mut visited = BTreeSet::new();
+		for current in forward.keys() {
+			finish_order(current, &forward, &mut visited, &mut finished);
+		}
+		let mut components = Vec::<Vec<ModulePath>>::new();
+		visited.clear();
+		for current in finished.iter().rev() {
+			if visited.contains(current) {
+				continue;
+			}
+			let mut component = Vec::new();
+			collect_component(current, &reverse, &mut visited, &mut component);
+			component.sort();
+			components.push(component);
+		}
+		let component_of: BTreeMap<ModulePath, usize> = components
+			.iter()
+			.enumerate()
+			.flat_map(|(index, component)| component.iter().cloned().map(move |module| (module, index)))
+			.collect();
+		let mut outgoing = vec![BTreeSet::new(); components.len()];
+		let mut indegree = vec![0usize; components.len()];
+		for (dependency, importers) in &forward {
+			let dependency = component_of[dependency];
+			for importer in importers {
+				let importer = component_of[importer];
+				if dependency != importer && outgoing[dependency].insert(importer) {
+					indegree[importer] += 1;
+				}
+			}
+		}
+
+		let mut available: BTreeSet<(ModulePath, usize)> = components
+			.iter()
+			.enumerate()
+			.filter(|(index, _)| indegree[*index] == 0)
+			.map(|(index, component)| (component[0].clone(), index))
+			.collect();
+		let mut depth = vec![0usize; components.len()];
+		let mut topological = Vec::with_capacity(components.len());
+		while let Some((_, component)) = available.pop_first() {
+			topological.push(component);
+			for importer in &outgoing[component] {
+				depth[*importer] = depth[*importer].max(depth[component] + 1);
+				indegree[*importer] -= 1;
+				if indegree[*importer] == 0 {
+					available.insert((components[*importer][0].clone(), *importer));
+				}
+			}
+		}
+		topological.sort_by(|left, right| {
+			depth[*left]
+				.cmp(&depth[*right])
+				.then_with(|| components[*left][0].cmp(&components[*right][0]))
+		});
+		let mut ordered = Vec::with_capacity(seen.len());
+		for component in topological {
+			let mut members = components[component].clone();
+			if let Some(changed) = members.iter().position(|member| member == &module) {
+				members.swap(0, changed);
+			}
+			ordered.extend(members);
+		}
+		ordered
+	}
+}
+
+/// Stable project-wide import relations derived from tracked parsed imports.
+///
+/// Unlike [`project_graph`], this index is not scoped to one entry module, so
+/// long-lived tooling can discover reverse importers without rebuilding a
+/// parallel graph outside the shared Salsa database.
+#[salsa::tracked(returns(clone))]
+pub(crate) fn project_dependency_graph(
+	db: &dyn Db,
+	project: ProjectInput,
+) -> Arc<ProjectDependencyGraph> {
+	use std::collections::BTreeMap;
+
+	let active: BTreeMap<ModulePath, ModuleInput> = project
+		.active_modules(db)
+		.iter()
+		.map(|module| (module.path(db), *module))
+		.collect();
+	let direct = active
+		.iter()
+		.map(|(owner, module)| {
+			let mut dependencies = Vec::new();
+			for import in direct_imports(db, *module).iter() {
+				let Ok(target) = &import.target else {
+					continue;
+				};
+				let Ok(target) = ModulePath::new(target) else {
+					continue;
+				};
+				if active.contains_key(&target) && !dependencies.contains(&target) {
+					dependencies.push(target);
+				}
+			}
+			(owner.clone(), Arc::from(dependencies))
+		})
+		.collect::<Vec<_>>()
+		.into();
+	Arc::new(ProjectDependencyGraph { direct })
+}
+
 impl ProjectGraph {
 	pub(crate) fn direct_dependencies(&self, module: ModuleInput) -> Arc<[ModuleInput]> {
 		self

@@ -23,6 +23,7 @@ struct DocumentIdentity {
 	entry: ModulePath,
 	root: PathBuf,
 	without_prelude: bool,
+	project_file: bool,
 }
 
 pub struct DiagnosticModuleSnapshot {
@@ -100,7 +101,7 @@ impl CompilerState {
 	) -> anyhow::Result<Vec<Uri>> {
 		docs.open(uri.clone(), text, version);
 		self.synchronize(docs, &uri)?;
-		Ok(self.open_project_documents(docs, &uri))
+		Ok(self.affected_project_documents(&uri))
 	}
 
 	pub fn change(
@@ -112,16 +113,20 @@ impl CompilerState {
 	) -> anyhow::Result<Vec<Uri>> {
 		docs.change_full(uri, text, version);
 		self.synchronize(docs, uri)?;
-		Ok(self.open_project_documents(docs, uri))
+		Ok(self.affected_project_documents(uri))
 	}
 
 	pub fn close(&mut self, docs: &mut DocumentStore, uri: &Uri) -> anyhow::Result<Vec<Uri>> {
+		let previous = self.affected_project_documents(uri);
 		docs.close(uri);
 		self.manifest_errors.remove(uri);
-		let Some(identity) = self.documents.remove(uri) else {
+		let Some(identity) = self.documents.get(uri).cloned() else {
 			return Ok(Vec::new());
 		};
 		self.diagnostic_targets.remove(uri.as_str());
+		if !identity.project_file {
+			self.documents.remove(uri);
+		}
 		let path = workspace::uri_to_path(uri);
 		match fs::read_to_string(path) {
 			Ok(source) => {
@@ -141,30 +146,32 @@ impl CompilerState {
 			}
 			Err(error) => return Err(error.into()),
 		}
-		Ok(self.open_project_documents_for(docs, &identity.project))
+		if !identity.project_file {
+			return Ok(Vec::new());
+		}
+		let mut affected = previous;
+		for current in self.affected_project_documents(uri) {
+			if !affected.contains(&current) {
+				affected.push(current);
+			}
+		}
+		Ok(affected)
 	}
 
-	fn open_project_documents(&self, docs: &DocumentStore, uri: &Uri) -> Vec<Uri> {
-		self.documents.get(uri).map_or_else(
-			|| vec![uri.clone()],
-			|identity| {
-				let mut affected = self.open_project_documents_for(docs, &identity.project);
-				affected.retain(|affected_uri| affected_uri != uri);
-				affected.insert(0, uri.clone());
-				affected
-			},
-		)
-	}
-
-	fn open_project_documents_for(&self, docs: &DocumentStore, project: &ProjectId) -> Vec<Uri> {
-		let mut documents: Vec<_> = self
-			.documents
-			.iter()
-			.filter(|(open_uri, identity)| &identity.project == project && docs.get(open_uri).is_some())
-			.map(|(open_uri, _)| open_uri.clone())
-			.collect();
-		documents.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-		documents
+	fn affected_project_documents(&self, uri: &Uri) -> Vec<Uri> {
+		let Some(identity) = self.documents.get(uri) else {
+			return vec![uri.clone()];
+		};
+		self
+			.session_for(identity)
+			.reverse_importer_closure(identity.project.clone(), identity.module.clone())
+			.into_iter()
+			.filter_map(|module| {
+				(module == identity.module)
+					.then(|| uri.clone())
+					.or_else(|| workspace::key_to_uri(&identity.root, module.as_str()))
+			})
+			.collect()
 	}
 
 	pub fn analysis_for_uri(&self, docs: &DocumentStore, uri: &Uri) -> Option<AnalysisSnapshot> {
@@ -309,6 +316,53 @@ impl CompilerState {
 		})
 	}
 
+	pub fn affected_diagnostics_snapshot(
+		&self,
+		docs: &DocumentStore,
+		uris: &[Uri],
+	) -> DiagnosticsSnapshot {
+		let modules = uris
+			.iter()
+			.filter_map(|uri| {
+				let identity = self.documents.get(uri)?;
+				let open = docs.get(uri);
+				let source = open
+					.map(|document| Arc::from(document.text.as_str()))
+					.or_else(|| self.sources.get(uri).cloned())
+					.unwrap_or_else(|| Arc::from(""));
+				let diagnostics = if source.is_empty()
+					&& !self
+						.session_for(identity)
+						.has_source(identity.project.clone(), identity.module.clone())
+				{
+					Vec::new()
+				} else {
+					self
+						.session_for(identity)
+						.tooling_diagnostics(
+							identity.project.clone(),
+							identity.entry.clone(),
+							!identity.without_prelude,
+						)
+						.iter()
+						.filter(|diagnostic| diagnostic.module == identity.module.as_str())
+						.map(|diagnostic| diagnostic.diag.clone())
+						.collect()
+				};
+				Some(DiagnosticModuleSnapshot {
+					uri: uri.clone(),
+					source,
+					version: open.map(|document| document.version),
+					diagnostics,
+				})
+			})
+			.collect();
+		DiagnosticsSnapshot {
+			document_revision: docs.revision(),
+			modules,
+		}
+	}
+
 	#[doc(hidden)]
 	#[must_use]
 	pub fn source_for_uri(&self, uri: &Uri) -> Option<Arc<str>> {
@@ -375,6 +429,7 @@ impl CompilerState {
 			entry: module,
 			root: root.clone(),
 			without_prelude,
+			project_file: scan_disk,
 		};
 		self.documents.insert(uri.clone(), identity);
 
@@ -383,12 +438,23 @@ impl CompilerState {
 				if let Ok(source) = fs::read_to_string(&path) {
 					self.session_mut(without_prelude).set_source(
 						project.clone(),
-						module,
+						module.clone(),
 						source.clone(),
 						SourceVersion(0),
 					);
 					if let Some(disk_uri) = workspace::path_to_uri(&path) {
-						self.sources.insert(disk_uri, source.into());
+						self.sources.insert(disk_uri.clone(), source.into());
+						self
+							.documents
+							.entry(disk_uri)
+							.or_insert_with(|| DocumentIdentity {
+								project: project.clone(),
+								module: module.clone(),
+								entry: module,
+								root: root.clone(),
+								without_prelude,
+								project_file: true,
+							});
 					}
 				}
 			}

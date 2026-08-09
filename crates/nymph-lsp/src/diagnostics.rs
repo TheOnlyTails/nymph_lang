@@ -3,7 +3,10 @@
 //! Both loose and project documents are checked through the shared,
 //! long-lived [`nymph_compiler::CompilerSession`] owned by [`CompilerState`].
 //! Project sessions include the compiler-owned embedded standard-library
-//! modules; only project modules with real workspace sources are published.
+//! modules. Notification refreshes consume the compiler's Salsa-backed
+//! reverse-importer closure in dependency-before-importer order, publishing
+//! every affected project URI once and publishing an empty list when its
+//! previous diagnostics have disappeared.
 
 use std::sync::{Arc, Mutex};
 
@@ -60,6 +63,40 @@ pub fn check_and_publish_state(
 	// This is deliberately the final state read before any send: if the root
 	// or any dependency overlay changed while analysis ran, publish no partial
 	// project result.
+	if docs.lock().unwrap().revision() != snapshot.document_revision {
+		return Ok(());
+	}
+	for module in snapshot.modules {
+		publish(
+			connection,
+			&module.uri,
+			&module.source,
+			&module.diagnostics,
+			module.version,
+		)?;
+	}
+	Ok(())
+}
+
+/// Re-check and publish an already ordered reverse-importer closure.
+///
+/// Each target is analyzed through the shared project session and published
+/// exactly once. The caller supplies dependency-before-importer order from the
+/// compiler's Salsa-backed dependency index.
+pub fn check_and_publish_affected(
+	connection: &Connection,
+	docs: &Arc<Mutex<DocumentStore>>,
+	compiler: &Arc<Mutex<CompilerState>>,
+	uris: &[Uri],
+) -> anyhow::Result<()> {
+	if uris.len() == 1 && compiler.lock().unwrap().has_manifest_error(&uris[0]) {
+		return check_and_publish_state(connection, docs, compiler, &uris[0]);
+	}
+	let docs_snapshot = docs.lock().unwrap().clone();
+	let snapshot = compiler
+		.lock()
+		.unwrap()
+		.affected_diagnostics_snapshot(&docs_snapshot, uris);
 	if docs.lock().unwrap().revision() != snapshot.document_revision {
 		return Ok(());
 	}
