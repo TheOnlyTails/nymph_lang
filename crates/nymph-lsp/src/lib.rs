@@ -388,6 +388,9 @@ fn main_loop(
 				}
 			}
 			Message::Notification(not) => {
+				if not.method == DidChangeWatchedFiles::METHOD && !client_state.watchers_authoritative {
+					continue;
+				}
 				handle_notification(connection, docs, compiler, not)?;
 			}
 			Message::Response(response) => client_state.handle_response(&response),
@@ -526,6 +529,13 @@ mod tests {
 			client.receiver.recv().unwrap(),
 			Message::Response(_)
 		));
+		assert!(
+			client
+				.receiver
+				.recv_timeout(std::time::Duration::from_millis(100))
+				.is_err(),
+			"dynamic registration must wait for the initialized notification"
+		);
 		client
 			.sender
 			.send(Message::Notification(Notification::new(
@@ -537,6 +547,22 @@ mod tests {
 			Message::Request(request) => request,
 			other => panic!("expected dynamic registration request, got {other:?}"),
 		}
+	}
+
+	fn send_watched_file(client: &Connection, uri: Uri) {
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidChangeWatchedFiles::METHOD.into(),
+				serde_json::to_value(DidChangeWatchedFilesParams {
+					changes: vec![lsp_types::FileEvent::new(
+						uri,
+						lsp_types::FileChangeType::CHANGED,
+					)],
+				})
+				.unwrap(),
+			)))
+			.unwrap();
 	}
 
 	fn shutdown(client: &Connection, handle: std::thread::JoinHandle<anyhow::Result<()>>) {
@@ -1649,8 +1675,12 @@ mod tests {
 	#[test]
 	fn supported_client_receives_exactly_one_project_file_watcher_registration() {
 		let (server, client) = Connection::memory();
-		let handle = std::thread::spawn(move || run(server));
+		let docs = Arc::new(Mutex::new(DocumentStore::default()));
+		let observed_docs = docs.clone();
+		let handle =
+			std::thread::spawn(move || serve(server, docs, Arc::new(Mutex::new(CompilerState::new()))));
 		let request = handshake_with_watchers(&client);
+		let registration_request_id = request.id.clone();
 		assert_eq!(request.method, RegisterCapability::METHOD);
 		let params: RegistrationParams = serde_json::from_value(request.params).unwrap();
 		assert_eq!(params.registrations.len(), 1);
@@ -1676,11 +1706,45 @@ mod tests {
 				.iter()
 				.all(|watcher| watcher.kind.is_none())
 		);
+
 		client
 			.sender
 			.send(Message::Response(Response::new_ok(
-				request.id,
+				RequestId::from("unrelated".to_string()),
 				serde_json::Value::Null,
+			)))
+			.unwrap();
+		send_watched_file(
+			&client,
+			"file:///ignored-before-registration.nym".parse().unwrap(),
+		);
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(89),
+				"test/barrier".into(),
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		assert_eq!(recv_response(&client, 89).id, RequestId::from(89));
+		assert_eq!(
+			observed_docs.lock().unwrap().revision(),
+			DocumentStore::default().revision(),
+			"an unrelated response must not activate watched-file handling"
+		);
+
+		client
+			.sender
+			.send(Message::Response(Response::new_ok(
+				registration_request_id,
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				lsp_types::notification::Initialized::METHOD.into(),
+				serde_json::json!({}),
 			)))
 			.unwrap();
 		client
@@ -1691,7 +1755,10 @@ mod tests {
 				serde_json::Value::Null,
 			)))
 			.unwrap();
-		assert_eq!(recv_response(&client, 90).id, RequestId::from(90));
+		match client.receiver.recv().unwrap() {
+			Message::Response(response) => assert_eq!(response.id, RequestId::from(90)),
+			other => panic!("duplicate initialized triggered an extra message: {other:?}"),
+		}
 		assert!(client.receiver.try_recv().is_err());
 		shutdown(&client, handle);
 	}
@@ -1699,8 +1766,12 @@ mod tests {
 	#[test]
 	fn unsupported_client_skips_registration_and_continues_serving_requests() {
 		let (server, client) = Connection::memory();
-		let handle = std::thread::spawn(move || run(server));
+		let docs = Arc::new(Mutex::new(DocumentStore::default()));
+		let observed_docs = docs.clone();
+		let handle =
+			std::thread::spawn(move || serve(server, docs, Arc::new(Mutex::new(CompilerState::new()))));
 		handshake(&client);
+		send_watched_file(&client, "file:///unsupported-client.nym".parse().unwrap());
 		client
 			.sender
 			.send(Message::Request(Request::new(
@@ -1713,13 +1784,21 @@ mod tests {
 			Message::Response(response) => assert_eq!(response.id, RequestId::from(91)),
 			other => panic!("unsupported client unexpectedly received {other:?}"),
 		}
+		assert_eq!(
+			observed_docs.lock().unwrap().revision(),
+			DocumentStore::default().revision(),
+			"an unsupported client's watcher notification must be ignored"
+		);
 		shutdown(&client, handle);
 	}
 
 	#[test]
 	fn rejected_watcher_registration_does_not_stop_the_server() {
 		let (server, client) = Connection::memory();
-		let handle = std::thread::spawn(move || run(server));
+		let docs = Arc::new(Mutex::new(DocumentStore::default()));
+		let observed_docs = docs.clone();
+		let handle =
+			std::thread::spawn(move || serve(server, docs, Arc::new(Mutex::new(CompilerState::new()))));
 		let registration = handshake_with_watchers(&client);
 		client
 			.sender
@@ -1729,6 +1808,10 @@ mod tests {
 				"watching unavailable".into(),
 			)))
 			.unwrap();
+		send_watched_file(
+			&client,
+			"file:///rejected-registration.nym".parse().unwrap(),
+		);
 		client
 			.sender
 			.send(Message::Request(Request::new(
@@ -1738,6 +1821,11 @@ mod tests {
 			)))
 			.unwrap();
 		assert_eq!(recv_response(&client, 93).id, RequestId::from(93));
+		assert_eq!(
+			observed_docs.lock().unwrap().revision(),
+			DocumentStore::default().revision(),
+			"a rejected registration must not authorize watcher notifications"
+		);
 		shutdown(&client, handle);
 	}
 
