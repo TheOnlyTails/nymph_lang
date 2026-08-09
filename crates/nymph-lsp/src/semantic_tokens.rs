@@ -84,10 +84,6 @@ const ENUM_MEMBER: u32 = 8;
 const STRING: u32 = 9;
 const NUMBER: u32 = 10;
 const COMMENT: u32 = 11;
-#[expect(
-	dead_code,
-	reason = "reserved legend slot: no AST node currently classifies as namespace besides a top-level `namespace` name, which is handled as `type`; kept for a future refinement (import path segments)"
-)]
 const NAMESPACE: u32 = 12;
 
 const DECLARATION: u32 = 1 << 0;
@@ -443,6 +439,7 @@ fn build_role_map(analysis: &SemanticAnalysis) -> RoleMap {
 	let module = &analysis.module;
 	let mut map = RoleMap::new();
 	for decl in &module.members {
+		walk_import_decl(decl, analysis, &mut map);
 		walk_decl(decl, &mut map);
 	}
 
@@ -456,6 +453,40 @@ fn build_role_map(analysis: &SemanticAnalysis) -> RoleMap {
 	}
 
 	map
+}
+
+fn walk_import_decl(decl: &Declaration, analysis: &SemanticAnalysis, map: &mut RoleMap) {
+	let Declaration::Import {
+		root,
+		path,
+		alias,
+		idents,
+	} = decl
+	else {
+		return;
+	};
+
+	if let nymph_ast::decl::ImportRoot::Package(package) = root {
+		map.insert(package.1.start, (NAMESPACE, 0));
+	}
+	for segment in path {
+		map.insert(segment.1.start, (NAMESPACE, 0));
+	}
+	if let Some(binding) = alias.as_ref().or_else(|| path.last()) {
+		map.insert(binding.1.start, (NAMESPACE, DECLARATION));
+	}
+
+	for (source, alias) in idents.iter().flatten() {
+		let local = alias.as_ref().unwrap_or(source);
+		let (ty, mut modifiers) = nymph_sema::query::definition_kind_by_name(analysis, &local.0)
+			.map(definition_kind_role)
+			.unwrap_or((VARIABLE, 0));
+		modifiers |= DECLARATION;
+		map.insert(source.1.start, (ty, modifiers));
+		if let Some(alias) = alias {
+			map.insert(alias.1.start, (ty, modifiers));
+		}
+	}
 }
 
 fn walk_decl(decl: &Declaration, map: &mut RoleMap) {
@@ -523,7 +554,7 @@ fn walk_decl(decl: &Declaration, map: &mut RoleMap) {
 			}
 		}
 		Declaration::Namespace { name, members, .. } => {
-			map.insert(name.1.start, (TYPE, DECLARATION));
+			map.insert(name.1.start, (NAMESPACE, DECLARATION));
 			for m in members {
 				walk_impl_member(m, map);
 			}
@@ -961,6 +992,9 @@ fn identifier_role(
 		return Some(role);
 	}
 	let module = &analysis.module;
+	if is_unshadowed_namespace(analysis, name) {
+		return Some((NAMESPACE, 0));
+	}
 	if is_unshadowed_variant(module, variant_names, name) {
 		return Some((ENUM_MEMBER, 0));
 	}
@@ -971,6 +1005,46 @@ fn identifier_role(
 		return Some((ty, 0));
 	}
 	None
+}
+
+fn is_unshadowed_namespace(analysis: &SemanticAnalysis, name: &Ident) -> bool {
+	let module = &analysis.module;
+	let declared = module.members.iter().any(|decl| match decl {
+		Declaration::Namespace { name: declared, .. } => declared.0 == name.0,
+		Declaration::Import {
+			path,
+			alias,
+			idents,
+			..
+		} => {
+			alias
+				.as_ref()
+				.or_else(|| path.last())
+				.is_some_and(|binding| binding.0 == name.0)
+				|| idents.iter().flatten().any(|(source, alias)| {
+					let binding = alias.as_ref().unwrap_or(source);
+					binding.0 == name.0
+						&& nymph_sema::query::definition_kind_by_name(analysis, &binding.0)
+							== Some(DefKind::Namespace)
+				})
+		}
+		_ => false,
+	});
+	declared
+		&& !nymph_sema::query::scope_names_at_exact(module, name.1.start)
+			.unwrap_or_default()
+			.iter()
+			.any(|candidate| candidate == name.0.as_str())
+}
+
+fn definition_kind_role(kind: DefKind) -> (u32, u32) {
+	match kind {
+		DefKind::Func => (FUNCTION, 0),
+		DefKind::Struct | DefKind::Enum | DefKind::TypeAlias | DefKind::Interface => (TYPE, 0),
+		DefKind::Namespace => (NAMESPACE, 0),
+		DefKind::Variant { .. } => (ENUM_MEMBER, 0),
+		DefKind::Let => (VARIABLE, READONLY),
+	}
 }
 
 fn stable_definition_role(
@@ -1001,16 +1075,7 @@ fn stable_definition_role(
 		| DeclarationKey::Implementation { .. }
 		| DeclarationKey::RecoveredImplementation { .. } => {}
 	}
-	let ty = match nymph_sema::query::stable_definition_kind(analysis, target)? {
-		DefKind::Func => FUNCTION,
-		DefKind::Struct
-		| DefKind::Enum
-		| DefKind::TypeAlias
-		| DefKind::Namespace
-		| DefKind::Interface => TYPE,
-		DefKind::Variant { .. } => ENUM_MEMBER,
-		DefKind::Let => VARIABLE,
-	};
+	let (ty, _) = definition_kind_role(nymph_sema::query::stable_definition_kind(analysis, target)?);
 	Some((ty, 0))
 }
 
@@ -1820,6 +1885,18 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 		let text = "namespace Config { let count: int = 1 }\nfunc main(): int = Config.count";
 		let decoded = tokens_for(text);
 		assert_sorted_and_non_overlapping(&decoded);
+
+		let declaration_offset = text.find("Config").unwrap();
+		let (declaration_line, declaration_col) = line_col(text, declaration_offset);
+		let declaration = find(&decoded, declaration_line, declaration_col);
+		assert_eq!(declaration.type_name, "namespace");
+		assert!(declaration.modifiers.contains(&"declaration"));
+
+		let namespace_use_offset = text.rfind("Config").unwrap();
+		let (namespace_use_line, namespace_use_col) = line_col(text, namespace_use_offset);
+		let namespace_use = find(&decoded, namespace_use_line, namespace_use_col);
+		assert_eq!(namespace_use.type_name, "namespace");
+		assert!(namespace_use.modifiers.is_empty());
 
 		let use_offset = text.rfind("count").unwrap();
 		let (use_line, use_col) = line_col(text, use_offset);

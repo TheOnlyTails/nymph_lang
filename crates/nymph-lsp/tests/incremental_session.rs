@@ -74,13 +74,13 @@ fn hover_needle(
 	hover_value(compiler, docs, uri, line, character as u32)
 }
 
-fn semantic_token_type_at(
+fn semantic_token_at(
 	compiler: &CompilerState,
 	docs: &DocumentStore,
 	uri: &Uri,
 	source: &str,
 	needle: &str,
-) -> u32 {
+) -> SemanticToken {
 	let offset = source.find(needle).unwrap();
 	let line = source[..offset]
 		.bytes()
@@ -105,13 +105,12 @@ fn semantic_token_type_at(
 	};
 	let mut token_line = 0;
 	let mut token_character = 0;
-	for SemanticToken {
-		delta_line,
-		delta_start,
-		token_type,
-		..
-	} in tokens.data
-	{
+	for token in tokens.data {
+		let SemanticToken {
+			delta_line,
+			delta_start,
+			..
+		} = token;
 		if delta_line == 0 {
 			token_character += delta_start;
 		} else {
@@ -119,10 +118,20 @@ fn semantic_token_type_at(
 			token_character = delta_start;
 		}
 		if (token_line, token_character) == (line, character) {
-			return token_type;
+			return token;
 		}
 	}
 	panic!("no semantic token for {needle:?} at {line}:{character}");
+}
+
+fn semantic_token_type_at(
+	compiler: &CompilerState,
+	docs: &DocumentStore,
+	uri: &Uri,
+	source: &str,
+	needle: &str,
+) -> u32 {
+	semantic_token_at(compiler, docs, uri, source, needle).token_type
 }
 
 #[test]
@@ -535,8 +544,8 @@ fn project_semantic_tokens_use_imports_prelude_and_dependency_overlays() {
 	fs::create_dir(temp.path().join("src")).unwrap();
 	let main_path = temp.path().join("src/main.nym");
 	let dep_path = temp.path().join("src/dep.nym");
-	let source = "import @/dep with (Box as ImportedBox, Choice, Config, make as build)\nfunc use(box: ImportedBox): Option<Choice> = Some(value = build(box))\nfunc choose(): Choice = Choice.One\nfunc read(box: ImportedBox): int = box.get() + box.value + Config.count\nfunc construct(): ImportedBox = ImportedBox(value = 1)";
-	let dependency = "public struct Box(public value: int) { func get(): int = this.value }\npublic enum Choice { One }\npublic namespace Config { public let count = 1 }\npublic func make(box: Box): Choice = Choice.One";
+	let source = "import @/dep as dependency with (Box as ImportedBox, Choice, Config, make as build, amount as imported_amount)\nfunc use(box: ImportedBox): Option<Choice> = Some(value = build(box))\nfunc choose(): Choice = Choice.One\nfunc read(box: ImportedBox): int = box.get() + box.value + Config.count + dependency.amount + imported_amount\nfunc construct(): ImportedBox = ImportedBox(value = 1)";
+	let dependency = "public struct Box(public value: int) { func get(): int = this.value }\npublic enum Choice { One }\npublic namespace Config { public let count = 1 }\npublic func make(box: Box): Choice = Choice.One\npublic let amount: int = 1";
 	fs::write(&main_path, source).unwrap();
 	fs::write(&dep_path, dependency).unwrap();
 	let main_uri = uri(&main_path);
@@ -546,8 +555,38 @@ fn project_semantic_tokens_use_imports_prelude_and_dependency_overlays() {
 	compiler
 		.open(&mut docs, main_uri.clone(), source.into(), 1)
 		.unwrap();
+	assert!(
+		compiler.analysis_for_uri(&docs, &main_uri).is_some(),
+		"semantic fixture did not analyze: {:?}",
+		compiler.diagnostics_for_uri(&docs, &main_uri)
+	);
 
-	// Fixed legend indices: type=2, function=3, variable=5, enumMember=8.
+	// Fixed legend indices: type=2, function=3, variable=5,
+	// enumMember=8, namespace=12. Declaration and readonly are bits 0 and 1.
+	let dependency_path = semantic_token_at(&compiler, &docs, &main_uri, source, "dep as");
+	assert_eq!(dependency_path.token_type, 12);
+	assert_eq!(dependency_path.token_modifiers_bitset, 0);
+	let dependency_alias = semantic_token_at(&compiler, &docs, &main_uri, source, "dependency with");
+	assert_eq!(dependency_alias.token_type, 12);
+	assert_eq!(dependency_alias.token_modifiers_bitset, 1);
+	for needle in ["Box as", "ImportedBox,", "Choice, "] {
+		let binding = semantic_token_at(&compiler, &docs, &main_uri, source, needle);
+		assert_eq!(binding.token_type, 2, "{needle}");
+		assert_eq!(binding.token_modifiers_bitset, 1, "{needle}");
+	}
+	let namespace_binding = semantic_token_at(&compiler, &docs, &main_uri, source, "Config,");
+	assert_eq!(namespace_binding.token_type, 12);
+	assert_eq!(namespace_binding.token_modifiers_bitset, 1);
+	for needle in ["make as", "build,"] {
+		let binding = semantic_token_at(&compiler, &docs, &main_uri, source, needle);
+		assert_eq!(binding.token_type, 3, "{needle}");
+		assert_eq!(binding.token_modifiers_bitset, 1, "{needle}");
+	}
+	for needle in ["amount as", "imported_amount)"] {
+		let binding = semantic_token_at(&compiler, &docs, &main_uri, source, needle);
+		assert_eq!(binding.token_type, 5, "{needle}");
+		assert_eq!(binding.token_modifiers_bitset, 3, "{needle}");
+	}
 	assert_eq!(
 		semantic_token_type_at(&compiler, &docs, &main_uri, source, "ImportedBox):"),
 		2
@@ -581,9 +620,36 @@ fn project_semantic_tokens_use_imports_prelude_and_dependency_overlays() {
 		7
 	);
 	assert_eq!(
-		semantic_token_type_at(&compiler, &docs, &main_uri, source, "count\nfunc construct"),
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "count + dependency"),
 		5
 	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "Config.count"),
+		12
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "dependency.amount"),
+		12
+	);
+	assert_eq!(
+		semantic_token_type_at(
+			&compiler,
+			&docs,
+			&main_uri,
+			source,
+			"amount + imported_amount"
+		),
+		5
+	);
+	let imported_amount_use = semantic_token_at(
+		&compiler,
+		&docs,
+		&main_uri,
+		source,
+		"imported_amount\nfunc construct",
+	);
+	assert_eq!(imported_amount_use.token_type, 5);
+	assert_eq!(imported_amount_use.token_modifiers_bitset, 0);
 
 	// An unsaved dependency buffer is authoritative for the whole project.
 	// Even though changing `make` from a function to a value makes the call
@@ -592,7 +658,7 @@ fn project_semantic_tokens_use_imports_prelude_and_dependency_overlays() {
 		.open(
 			&mut docs,
 			dep_uri,
-			"public struct Box(public value: int) { func get(): int = this.value }\npublic enum Choice { One }\npublic let make: int = 1".into(),
+			"public struct Box(public value: int) { func get(): int = this.value }\npublic enum Choice { One }\npublic let make: int = 1\npublic let amount: int = 2".into(),
 			2,
 		)
 		.unwrap();

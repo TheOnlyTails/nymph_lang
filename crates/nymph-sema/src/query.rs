@@ -1006,6 +1006,23 @@ pub fn stable_definition_kind(
 	Some(semantic.definitions.data(definition).kind)
 }
 
+/// Return the semantic category bound to a source-visible name in this
+/// analysis's exact local/imported/prelude definition arena.
+///
+/// This complements [`stable_definition_kind`] for declaration syntax that
+/// introduces a local spelling without an expression node, notably import
+/// aliases. Whole-module import namespaces intentionally have no stable
+/// declaration ID, but they are still present in the checked definition map.
+#[must_use]
+pub fn definition_kind_by_name(
+	analysis: &crate::SemanticAnalysis,
+	name: &str,
+) -> Option<crate::DefKind> {
+	let semantic = &analysis.checked.semantic;
+	let definition = semantic.definitions.get(name)?;
+	Some(semantic.definitions.data(definition).kind)
+}
+
 /// Find the definition site of the identifier (or bare enum variant, or
 /// type-position type name) at byte `offset` in `module`. Resolution order,
 /// mirroring `infer_identifier`'s shadowing: the nearest enclosing
