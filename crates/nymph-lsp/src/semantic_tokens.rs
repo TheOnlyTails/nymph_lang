@@ -35,9 +35,9 @@
 //!
 //! Comments are not tokens at all — the lexer discards them — so they are
 //! recovered by scanning the gaps between consecutive lexed tokens for `//`
-//! and `/* … */` runs. A string's `//` can never be mistaken for a comment
-//! this way, because it sits inside the `Str` token's own span, never in a
-//! gap.
+//! and `/* … */` runs, recursively inside interpolation token streams. Quoted
+//! runs in malformed lexical gaps are skipped, so an unterminated string's
+//! `//` is not mistaken for a comment.
 //!
 //! A [`Token::Str`] is not one opaque span: it is expanded
 //! fragment-by-fragment ([`push_str_token`]), so plain text and escapes stay
@@ -254,7 +254,7 @@ fn push_str_token(
 
 	for frag in fragments {
 		if let StrFragment::Interpolation(inner) = &frag.0 {
-			let open_end = inner.first().map_or(frag.1.end, |t| t.1.start);
+			let open_end = (frag.1.start + "${".len()).min(frag.1.end);
 			if open_end > run_start {
 				items.push((Span::new(run_start, open_end), STRING, 0));
 			}
@@ -263,7 +263,9 @@ fn push_str_token(
 				push_token(tok, roles, items);
 			}
 
-			run_start = inner.last().map_or(open_end, |t| t.1.end);
+			// Resume at the closing `}`. Whitespace and comments between `${`
+			// and `}` belong to the interpolated expression, not the string.
+			run_start = frag.1.end.saturating_sub('}'.len_utf8()).max(open_end);
 		}
 	}
 
@@ -303,28 +305,51 @@ fn lexer_token_type(token: &Token) -> Option<u32> {
 }
 
 /// Recover comment spans (the lexer discards them entirely) by scanning the
-/// gaps between consecutive lexed tokens, plus the leading/trailing gaps
-/// against the whole document.
+/// gaps between consecutive lexed tokens, plus the leading/trailing gaps,
+/// recursively for every interpolation token stream.
 fn comment_spans(text: &str, tokens: &[Spanned<Token>]) -> Vec<Span> {
 	let mut spans = Vec::new();
-	let mut prev_end = 0usize;
-	for spanned in tokens {
-		let span = spanned.1;
-		if span.start > prev_end {
-			scan_comments_into(text, prev_end, span.start, &mut spans);
-		}
-		prev_end = prev_end.max(span.end);
-	}
-	if prev_end < text.len() {
-		scan_comments_into(text, prev_end, text.len(), &mut spans);
-	}
+	collect_comment_spans(text, tokens, 0, text.len(), &mut spans);
 	spans
 }
 
-/// Scan `text[start..end]` (known to hold only whitespace and comments) for
-/// `//` and `/* … */` runs, pushing their spans in source order. An
-/// unterminated block comment runs to `end` (matches the lexer's own
-/// recovery).
+fn collect_comment_spans(
+	text: &str,
+	tokens: &[Spanned<Token>],
+	start: usize,
+	end: usize,
+	out: &mut Vec<Span>,
+) {
+	let mut prev_end = start;
+	for spanned in tokens {
+		let span = spanned.1;
+		if span.start > prev_end {
+			scan_comments_into(text, prev_end, span.start.min(end), out);
+		}
+		if let Token::Str(fragments) = &spanned.0 {
+			for fragment in fragments {
+				if let StrFragment::Interpolation(inner) = &fragment.0 {
+					let inner_start = (fragment.1.start + "${".len()).min(fragment.1.end);
+					let inner_end = fragment
+						.1
+						.end
+						.saturating_sub('}'.len_utf8())
+						.max(inner_start);
+					collect_comment_spans(text, inner, inner_start, inner_end, out);
+				}
+			}
+		}
+		prev_end = prev_end.max(span.end);
+	}
+	if prev_end < end {
+		scan_comments_into(text, prev_end, end, out);
+	}
+}
+
+/// Scan `text[start..end]` for `//` and `/* … */` runs, pushing their spans in
+/// source order. Quoted runs are skipped because malformed strings/chars can
+/// remain in a lexical gap; an unterminated block comment runs to `end`
+/// (matching the lexer's own recovery).
 fn scan_comments_into(text: &str, start: usize, end: usize, out: &mut Vec<Span>) {
 	let gap = &text[start..end];
 	let bytes = gap.as_bytes();
@@ -347,6 +372,19 @@ fn scan_comments_into(text: &str, start: usize, end: usize, out: &mut Vec<Span>)
 			} else {
 				out.push(Span::new(comment_start, end));
 				i = bytes.len();
+			}
+		} else if matches!(bytes[i], b'"' | b'\'') {
+			let quote = bytes[i];
+			i += 1;
+			while i < bytes.len() {
+				if bytes[i] == b'\\' {
+					i = (i + 2).min(bytes.len());
+				} else if bytes[i] == quote {
+					i += 1;
+					break;
+				} else {
+					i += 1;
+				}
 			}
 		} else {
 			i += 1;
@@ -1708,6 +1746,36 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 	}
 
 	#[test]
+	fn comments_inside_nested_interpolations_are_comments_without_string_overlap() {
+		let text =
+			"func main(value: int): string = \"${/* outer */ value + \"${/* nested */ value}\"}\"";
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		for needle in ["/* outer */", "/* nested */"] {
+			let offset = text.find(needle).unwrap();
+			let (line, col) = line_col(text, offset);
+			let comment = find(&decoded, line, col);
+			assert_eq!(comment.type_name, "comment", "{needle}");
+			assert_eq!(comment.len, needle.len() as u32, "{needle}");
+		}
+	}
+
+	#[test]
+	fn a_crlf_line_comment_inside_interpolation_is_recovered_without_the_carriage_return() {
+		let text = "func main(value: int): string = \"${ // comment\r\nvalue }\"";
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		let offset = text.find("// comment").unwrap();
+		let (line, col) = line_col(text, offset);
+		let comment = find(&decoded, line, col);
+		assert_eq!(comment.type_name, "comment");
+		assert_eq!(comment.len, "// comment".len() as u32);
+		assert_eq!(find(&decoded, 1, 0).type_name, "parameter");
+	}
+
+	#[test]
 	fn a_let_binding_is_variable_with_readonly_unless_mut() {
 		let text = "func main(): int = { let x = 1\n  let mut y = 2\n  x + y }";
 		let decoded = tokens_for(text);
@@ -1782,6 +1850,20 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 			result.is_some(),
 			"expected tokens even over a broken buffer"
 		);
+	}
+
+	#[test]
+	fn unterminated_literals_do_not_turn_embedded_slashes_into_comments() {
+		for text in [
+			"func main(): string = \"unterminated // string",
+			"func main(): char = 'unterminated // char",
+		] {
+			let decoded = tokens_for(text);
+			assert!(
+				decoded.iter().all(|token| token.type_name != "comment"),
+				"malformed literal produced a false comment token: {decoded:?}"
+			);
+		}
 	}
 
 	#[test]
