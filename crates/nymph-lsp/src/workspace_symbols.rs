@@ -249,8 +249,9 @@ mod tests {
 			),
 			(
 				"a",
-				"public func map(): void = {}\npublic func mop(): void = {}",
+				"public func map(): void = {}\npublic func mop(): void = {}\npublic func cap(): void = {}",
 			),
+			("z", "public func mop(): void = {}"),
 		]);
 		let symbols = fixture.search("map");
 		assert_eq!(
@@ -258,9 +259,11 @@ mod tests {
 				.iter()
 				.map(|symbol| symbol.name.as_str())
 				.collect::<Vec<_>>(),
-			["map", "map", "mapper", "mop"]
+			["map", "map", "mapper", "mop", "mop", "cap"]
 		);
 		assert!(symbols[0].location.uri.as_str() < symbols[1].location.uri.as_str());
+		assert!(symbols[3].location.uri.as_str() < symbols[4].location.uri.as_str());
+		assert_eq!(fixture.search("map"), symbols);
 	}
 
 	#[test]
@@ -297,6 +300,48 @@ mod tests {
 				.kind,
 			lsp_types::SymbolKind::CLASS
 		);
+	}
+
+	#[test]
+	fn malformed_modules_expose_every_top_level_kind_without_nested_or_private_leaks() {
+		let mut fixture = Fixture::new(&[(
+			"main",
+			"public func top(): void = { let local = 1 }\npublic let constant = 1\npublic let mut variable = 2\npublic type Alias = int\npublic struct Record(field: int)\npublic enum Choice { Variant }\npublic interface Contract { func method(): void }\npublic namespace Tools { namespace func nested(): void = {} }\nimpl Record { func implementation(): void = {} }\nprivate func hidden(): void = {}\npublic func (",
+		)]);
+		let symbols = fixture.search("");
+		assert_eq!(
+			symbols
+				.iter()
+				.map(|symbol| (symbol.name.as_str(), symbol.kind))
+				.collect::<Vec<_>>(),
+			[
+				("top", lsp_types::SymbolKind::FUNCTION),
+				("constant", lsp_types::SymbolKind::CONSTANT),
+				("variable", lsp_types::SymbolKind::VARIABLE),
+				("Alias", lsp_types::SymbolKind::CLASS),
+				("Record", lsp_types::SymbolKind::STRUCT),
+				("Choice", lsp_types::SymbolKind::ENUM),
+				("Contract", lsp_types::SymbolKind::INTERFACE),
+				("Tools", lsp_types::SymbolKind::NAMESPACE),
+			]
+		);
+		for leaked in [
+			"local",
+			"field",
+			"Variant",
+			"method",
+			"nested",
+			"implementation",
+			"hidden",
+		] {
+			assert!(
+				fixture
+					.search(leaked)
+					.iter()
+					.all(|symbol| symbol.name != leaked),
+				"nested/private declaration `{leaked}` leaked into workspace search",
+			);
+		}
 	}
 
 	#[test]
@@ -566,6 +611,128 @@ mod tests {
 				))
 				.collect::<Vec<_>>(),
 			[("overlay_dep", "dep"), ("overlay_main", "main")]
+		);
+	}
+
+	#[test]
+	fn snapshots_keep_their_exact_document_revision_and_source_facts() {
+		let mut fixture = Fixture::new(&[("main", "public func before(): void = {}")]);
+		fixture.state.refresh_workspace_symbols(&fixture.docs);
+		let old = fixture.state.workspace_symbol_snapshot(&fixture.docs);
+		assert_eq!(old.document_revision, fixture.docs.revision());
+
+		fixture
+			.state
+			.change(
+				&mut fixture.docs,
+				&fixture.main_uri,
+				"public func after(): void = {}".to_string(),
+				2,
+			)
+			.unwrap();
+		assert_ne!(old.document_revision, fixture.docs.revision());
+		assert_eq!(
+			flat(workspace_symbols(&old, &params("")))
+				.iter()
+				.map(|symbol| symbol.name.as_str())
+				.collect::<Vec<_>>(),
+			["before"]
+		);
+
+		fixture.state.refresh_workspace_symbols(&fixture.docs);
+		let fresh = fixture.state.workspace_symbol_snapshot(&fixture.docs);
+		assert_eq!(fresh.document_revision, fixture.docs.revision());
+		assert_eq!(
+			flat(workspace_symbols(&fresh, &params("")))
+				.iter()
+				.map(|symbol| symbol.name.as_str())
+				.collect::<Vec<_>>(),
+			["after"]
+		);
+	}
+
+	#[test]
+	fn canonical_uri_utf16_range_and_container_survive_unicode_and_spaces() {
+		let temp = tempfile::tempdir().unwrap();
+		let root = temp.path().join("project with space");
+		std::fs::create_dir_all(root.join("src")).unwrap();
+		std::fs::write(
+			root.join("nymph.toml"),
+			"[package]\nname='unicode-symbols'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		let path = root.join("src/main.nym");
+		let source = "public func 变量(): void = {}";
+		std::fs::write(&path, source).unwrap();
+		let uri = path_to_uri(&path).unwrap();
+		let mut docs = DocumentStore::default();
+		let mut state = CompilerState::new();
+		state
+			.open(&mut docs, uri.clone(), source.to_string(), 1)
+			.unwrap();
+		state.refresh_workspace_symbols(&docs);
+		let symbols = flat(workspace_symbols(
+			&state.workspace_symbol_snapshot(&docs),
+			&params("变量"),
+		));
+
+		assert_eq!(symbols.len(), 1);
+		assert_eq!(symbols[0].location.uri, uri);
+		assert!(symbols[0].location.uri.as_str().contains("%20"));
+		assert_eq!(symbols[0].container_name.as_deref(), Some("main"));
+		assert_eq!(symbols[0].location.range.start.line, 0);
+		assert_eq!(symbols[0].location.range.start.character, 12);
+		assert_eq!(symbols[0].location.range.end.line, 0);
+		assert_eq!(symbols[0].location.range.end.character, 14);
+	}
+
+	#[test]
+	fn identical_module_and_symbol_names_remain_isolated_between_projects() {
+		let mut fixture = Fixture::new(&[("main", "public func shared(): void = {}")]);
+		let other = tempfile::tempdir().unwrap();
+		std::fs::write(
+			other.path().join("nymph.toml"),
+			"[package]\nname='other-symbols'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(other.path().join("src")).unwrap();
+		let other_path = other.path().join("src/main.nym");
+		let shared = "public func shared(): void = {}";
+		std::fs::write(&other_path, shared).unwrap();
+		let other_uri = path_to_uri(&other_path).unwrap();
+		fixture
+			.state
+			.open(&mut fixture.docs, other_uri.clone(), shared.to_string(), 1)
+			.unwrap();
+
+		let exact = fixture
+			.search("shared")
+			.into_iter()
+			.filter(|symbol| symbol.name == "shared")
+			.collect::<Vec<_>>();
+		assert_eq!(exact.len(), 2);
+		assert_ne!(exact[0].location.uri, exact[1].location.uri);
+		assert!(exact[0].location.uri.as_str() < exact[1].location.uri.as_str());
+
+		fixture
+			.state
+			.change(
+				&mut fixture.docs,
+				&fixture.main_uri,
+				"public func first_only(): void = {}".to_string(),
+				2,
+			)
+			.unwrap();
+		let remaining = fixture
+			.search("shared")
+			.into_iter()
+			.filter(|symbol| symbol.name == "shared")
+			.collect::<Vec<_>>();
+		assert_eq!(remaining.len(), 1);
+		assert_eq!(remaining[0].location.uri, other_uri);
+		assert_eq!(
+			fixture.search("first_only")[0].location.uri,
+			fixture.main_uri
 		);
 	}
 
