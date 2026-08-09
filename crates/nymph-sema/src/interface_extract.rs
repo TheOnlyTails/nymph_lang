@@ -1171,6 +1171,57 @@ pub(crate) fn assign_runtime_body_identities(
 			})
 			.collect(),
 	};
+	let namespaces = checker
+		.defs
+		.defs
+		.iter()
+		.enumerate()
+		.filter_map(|(index, definition)| {
+			let def = crate::DefId(index as u32);
+			let member = checker.defs.local_member(def)?;
+			let owner = definition.stable.clone()?;
+			let Declaration::Namespace { members, .. } = &checker.module.members[member] else {
+				return None;
+			};
+			(owner.module == *identity).then(|| {
+				(
+					def,
+					owner,
+					members
+						.iter()
+						.filter_map(|member| match &member.0 {
+							ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => {
+								Some(meta.name.0.clone())
+							}
+							ImplMember::Let { meta, .. } | ImplMember::ExternalLet(_, _, meta) => {
+								meta.name.0.as_binding().map(|name| name.0.clone())
+							}
+						})
+						.collect::<Vec<_>>(),
+				)
+			})
+		})
+		.collect::<Vec<_>>();
+	for (definition, owner, members) in namespaces {
+		let Some(namespace) = checker.sigs.namespaces.get_mut(&definition) else {
+			continue;
+		};
+		let mut ids = StableIdBuilder::new(identity.clone());
+		for name in members {
+			let target = ids.allocate(DeclarationKey::member(
+				owner.clone(),
+				DeclarationCategory::Method,
+				name.clone(),
+			));
+			match namespace.members.get_mut(&name) {
+				Some(crate::NamespaceMemberSig::Func { target: exact, .. })
+				| Some(crate::NamespaceMemberSig::Value { target: exact, .. }) => {
+					*exact = Some(target);
+				}
+				None => {}
+			}
+		}
+	}
 
 	for (&interface, definition) in &mut checker.interfaces {
 		let Some(owner) = checker.defs.stable(interface).cloned() else {

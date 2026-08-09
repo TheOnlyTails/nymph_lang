@@ -270,6 +270,17 @@ fn two_namespace_statics_same_name_is_reported() {
 }
 
 #[test]
+fn duplicate_func_in_namespace_is_reported() {
+	assert_error_contains(
+		"namespace Point {
+		   func at(v: int): int = v
+		   func at(v: int): int = v
+		 }",
+		"defined more than once",
+	);
+}
+
+#[test]
 fn two_different_member_names_stay_clean() {
 	assert_ok(
 		"struct Point(x: int) {

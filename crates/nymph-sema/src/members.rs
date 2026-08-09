@@ -475,6 +475,7 @@ impl<'m> Checker<'m> {
 		Option<DefinitionId>,
 		Option<DefinitionId>,
 		Option<nymph_ast::Span>,
+		Vec<Ty>,
 	)> {
 		let recv = self.strip_mut(recv);
 		let head = head_of(&self.interner, recv)?;
@@ -496,15 +497,29 @@ impl<'m> Checker<'m> {
 		}
 		if matches.len() > 1 {
 			self.emit(span, TypeError::AmbiguousCall { name: name.into() });
-			return Some((Vec::new(), self.interner.error(), None, None, None));
+			return Some((
+				Vec::new(),
+				self.interner.error(),
+				None,
+				None,
+				None,
+				Vec::new(),
+			));
 		}
 		let idx = matches.pop()?;
 		let method = &self.inherent.impls[idx].methods[name];
 		let target = method.definition.clone();
 		let method_span = method.local_span;
 		let implementation = self.inherent.impls[idx].definition.clone();
-		let (params, ret, _) = self.commit_inherent(idx, recv, name, None, span, false);
-		Some((params, ret, target, implementation, method_span))
+		let (params, ret, type_arguments) = self.commit_inherent(idx, recv, name, None, span, false);
+		Some((
+			params,
+			ret,
+			target,
+			implementation,
+			method_span,
+			type_arguments,
+		))
 	}
 
 	/// Resolve a namespaced function `Type.name(args)`.
@@ -539,6 +554,39 @@ impl<'m> Checker<'m> {
 			}
 		}
 		None
+	}
+
+	/// Resolve a namespaced/static function as a first-class callable without
+	/// argument expressions. As with an instance method value, multiple
+	/// receiver-applicable declarations are ambiguous rather than selected from
+	/// an invented argument list.
+	pub(crate) fn resolve_namespaced_value(
+		&mut self,
+		type_def: DefId,
+		name: &str,
+		span: nymph_ast::Span,
+	) -> Option<(Vec<Ty>, Ty, Option<DefinitionId>, Vec<Ty>)> {
+		let mut matches = self
+			.inherent
+			.candidates(Head::Adt(type_def))
+			.into_iter()
+			.filter(|index| {
+				self.inherent.impls[*index]
+					.methods
+					.get(name)
+					.is_some_and(|method| method.namespaced)
+			})
+			.collect::<Vec<_>>();
+		if matches.len() > 1 {
+			self.emit(span, TypeError::AmbiguousCall { name: name.into() });
+			return Some((Vec::new(), self.interner.error(), None, Vec::new()));
+		}
+		let index = matches.pop()?;
+		let target = self.inherent.impls[index].methods[name].definition.clone();
+		let placeholder = self.interner.error();
+		let (parameters, return_type, type_arguments) =
+			self.commit_inherent(index, placeholder, name, None, span, true);
+		Some((parameters, return_type, target, type_arguments))
 	}
 
 	fn inherent_receiver_matches(&mut self, idx: usize, recv: Ty) -> bool {

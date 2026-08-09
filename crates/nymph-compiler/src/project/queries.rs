@@ -1482,14 +1482,51 @@ fn runtime_owner<'db>(
 	Ok(owner)
 }
 
+#[salsa::tracked(returns(clone))]
+fn stable_shape_interface<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	module: SemanticModuleInput,
+) -> Result<Arc<nymph_sema::ModuleInterface>, Arc<nymph_sema::InterfaceConversionError>> {
+	let (analysis, headers) = match module {
+		SemanticModuleInput::Builtin(input)
+			if input.key(db).domain == BuiltinModuleDomain::AmbientCore =>
+		{
+			(
+				ambient_core_analysis(db, key.ambient_core_registry(db), input).clone(),
+				ambient_core_headers(db, key.ambient_core_registry(db), input),
+			)
+		}
+		_ => (
+			interface_module_analysis(db, key, module),
+			interface_declared_headers(db, key, module),
+		),
+	};
+	let facts = nymph_sema::ExtractionFactSelection::current_module_from_facts(
+		&analysis.semantic.module,
+		&analysis.semantic.checked,
+	)
+	.including_private_definitions();
+	nymph_sema::extract_module_interface_from_facts_with_selection(
+		module.identity(db),
+		&analysis.semantic.module,
+		&analysis.semantic.checked,
+		&headers,
+		&facts,
+	)
+	.map(Arc::new)
+	.map_err(Arc::new)
+}
+
 fn complete_interface<'db>(
 	db: &'db dyn Db,
 	key: ProjectKey<'db>,
-	definition: &nymph_sema::DefinitionId,
-) -> Result<Arc<nymph_sema::ModuleEnvironment>, nymph_sema::StableShapeLookupError> {
+	request: &nymph_sema::StableShapeRequest,
+) -> Result<Arc<nymph_sema::ModuleInterface>, nymph_sema::StableShapeLookupError> {
+	let definition = request.definition();
 	let module = runtime_owner(db, key, definition).map_err(|_| {
 		nymph_sema::StableShapeLookupError::Missing {
-			request: nymph_sema::StableShapeRequest::InterfaceShell(definition.clone()),
+			request: request.clone(),
 		}
 	})?;
 	let environment = exact_module_environment(db, key, module);
@@ -1501,7 +1538,11 @@ fn complete_interface<'db>(
 			definition: definition.clone(),
 		});
 	}
-	Ok(environment)
+	stable_shape_interface(db, key, module).map_err(|_| {
+		nymph_sema::StableShapeLookupError::Recovered {
+			definition: definition.clone(),
+		}
+	})
 }
 
 #[salsa::tracked(returns(clone))]
@@ -1529,10 +1570,7 @@ pub(crate) fn stable_shape<'db>(
 			_ => Err(nymph_sema::StableShapeLookupError::Missing { request }),
 		};
 	}
-	let environment = complete_interface(db, key, request.definition())?;
-	let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
-		unreachable!()
-	};
+	let interface = complete_interface(db, key, &request)?;
 	let definitions = interface.exports.iter().chain(
 		interface
 			.support_definitions
@@ -1540,6 +1578,11 @@ pub(crate) fn stable_shape<'db>(
 			.map(|item| &item.definition),
 	);
 	let result = match &request {
+		Request::Definition(id) => definitions
+			.clone()
+			.find(|definition| definition.id == *id)
+			.cloned()
+			.map(Fact::Definition),
 		Request::Member(id) => definitions
 			.clone()
 			.flat_map(|definition| &definition.members)
@@ -1666,14 +1709,12 @@ pub(crate) fn binding_name<'db>(
 		let nymph_sema::DeclarationKey::Implementation { header, .. } = &implementation.key else {
 			return Ok(None);
 		};
-		let environment = complete_interface(db, key, implementation).map_err(|_| {
+		let request = nymph_sema::StableShapeRequest::Implementation(implementation.clone());
+		let interface = complete_interface(db, key, &request).map_err(|_| {
 			nymph_sema::StableNameLookupError::MissingBinding {
 				definition: implementation.clone(),
 			}
 		})?;
-		let nymph_sema::ModuleEnvironment::Complete(interface) = environment.as_ref() else {
-			unreachable!("complete_interface rejects recovered module environments")
-		};
 		let local_ordinal = interface
 			.implementations
 			.iter()
