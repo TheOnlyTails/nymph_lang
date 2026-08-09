@@ -5685,36 +5685,32 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		body: &StableExpr,
 		result_option: Option<nymph_hir::hir::HirOptionAbi>,
 	) -> Result<HirExpr, StableLoweringError> {
+		let native_range_number = match &iterable.kind {
+			StableExprKind::Range(StableRange::Exclusive { .. } | StableRange::Inclusive { .. }) => self
+				.annotations
+				.types
+				.iter()
+				.find(|(id, _)| *id == self.id(iterable))
+				.and_then(|(_, ty)| match peel_mut(ty) {
+					InterfaceType::Named { positional, .. } => positional.first(),
+					_ => None,
+				})
+				.and_then(|ty| match peel_mut(ty) {
+					InterfaceType::Int => Some(BuiltinResult::Int),
+					InterfaceType::UInt => Some(BuiltinResult::UInt),
+					_ => None,
+				}),
+			_ => None,
+		};
 		if let StableExprKind::Range(
 			StableRange::Exclusive { min, max } | StableRange::Inclusive { min, max },
 		) = &iterable.kind
-			&& (matches!(min.kind, StableExprKind::Int(_) | StableExprKind::UInt(_))
-				|| matches!(
-					self
-						.annotations
-						.types
-						.iter()
-						.find(|(id, _)| *id == self.id(min))
-						.map(|(_, ty)| ty),
-					Some(InterfaceType::Int | InterfaceType::UInt)
-				)) {
+			&& let Some(number) = native_range_number
+		{
 			let inclusive = matches!(
 				iterable.kind,
 				StableExprKind::Range(StableRange::Inclusive { .. })
 			);
-			let min_type = self
-				.annotations
-				.types
-				.iter()
-				.find(|(id, _)| *id == self.id(min))
-				.map(|(_, ty)| ty);
-			let number = if matches!(min.kind, StableExprKind::UInt(_))
-				|| matches!(min_type, Some(InterfaceType::UInt))
-			{
-				BuiltinResult::UInt
-			} else {
-				BuiltinResult::Int
-			};
 			self.scopes.borrow_mut().push(HashMap::new());
 			let current = self.declare(&"$range_current".into());
 			let end = self.declare(&"$range_end".into());
