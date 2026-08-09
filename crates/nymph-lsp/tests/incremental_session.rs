@@ -654,6 +654,132 @@ fn closing_dirty_importee_restores_disk_semantics_and_deletion_breaks_the_import
 }
 
 #[test]
+fn close_during_manifest_error_does_not_leak_the_overlay_after_project_recovery() {
+	let temp = tempfile::tempdir().unwrap();
+	let manifest_path = temp.path().join("nymph.toml");
+	let manifest = "[package]\nname='manifest-recovery'\nversion='0.1.0'\n";
+	fs::write(&manifest_path, manifest).unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+	fs::write(&main_path, main_source).unwrap();
+	fs::write(&dep_path, "public func value(): int = 1").unwrap();
+	let main_uri = uri(&main_path);
+	let dep_uri = uri(&dep_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+
+	compiler
+		.open(&mut docs, main_uri.clone(), main_source.into(), 1)
+		.unwrap();
+	compiler
+		.open(
+			&mut docs,
+			dep_uri.clone(),
+			"public func value(): float = 1.0".into(),
+			1,
+		)
+		.unwrap();
+	assert!(
+		!compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.is_empty()
+	);
+
+	fs::write(&manifest_path, "not = [toml").unwrap();
+	compiler
+		.change(
+			&mut docs,
+			&dep_uri,
+			"public func value(): float = 2.0".into(),
+			2,
+		)
+		.unwrap();
+	assert!(
+		compiler.analysis_for_uri(&docs, &dep_uri).is_none(),
+		"retained lifecycle identity must not expose stale analysis during a manifest error"
+	);
+	compiler.close(&mut docs, &dep_uri).unwrap();
+	assert_eq!(
+		compiler.source_for_uri(&dep_uri).as_deref(),
+		Some("public func value(): int = 1")
+	);
+	fs::write(&manifest_path, manifest).unwrap();
+	compiler
+		.change(&mut docs, &main_uri, main_source.into(), 2)
+		.unwrap();
+
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.is_empty(),
+		"closing during a manifest error must restore disk state before the project recovers"
+	);
+}
+
+#[test]
+fn project_to_loose_close_rescans_disk_when_the_project_returns() {
+	let temp = tempfile::tempdir().unwrap();
+	let manifest_path = temp.path().join("nymph.toml");
+	let manifest = "[package]\nname='project-return'\nversion='0.1.0'\n";
+	fs::write(&manifest_path, manifest).unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+	fs::write(&main_path, main_source).unwrap();
+	fs::write(&dep_path, "public func value(): int = 1").unwrap();
+	let main_uri = uri(&main_path);
+	let dep_uri = uri(&dep_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+
+	compiler
+		.open(&mut docs, main_uri.clone(), main_source.into(), 1)
+		.unwrap();
+	compiler
+		.open(
+			&mut docs,
+			dep_uri.clone(),
+			"public func value(): float = 1.0".into(),
+			1,
+		)
+		.unwrap();
+	assert!(
+		!compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.is_empty()
+	);
+
+	fs::remove_file(&manifest_path).unwrap();
+	compiler
+		.change(
+			&mut docs,
+			&dep_uri,
+			"public func value(): float = 2.0".into(),
+			2,
+		)
+		.unwrap();
+	compiler.close(&mut docs, &dep_uri).unwrap();
+	fs::write(&manifest_path, manifest).unwrap();
+	compiler
+		.change(&mut docs, &main_uri, main_source.into(), 2)
+		.unwrap();
+
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.is_empty(),
+		"project recovery must reload the closed dependency's disk source"
+	);
+}
+
+#[test]
 fn changing_an_open_buffer_does_not_reread_unopened_project_files() {
 	let temp = tempfile::tempdir().unwrap();
 	fs::write(

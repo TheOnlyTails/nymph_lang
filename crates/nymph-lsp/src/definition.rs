@@ -94,12 +94,14 @@ pub(crate) fn definition_snapshot_candidate(
 		state.definition_target(docs, snapshot, candidate)
 	})?;
 	let target_index = LineIndex::new(&target.source);
-	let disk_source = target.requires_disk_validation.then(|| {
-		(
-			crate::workspace::uri_to_path(&target.uri),
+	let disk_source = if target.requires_disk_validation {
+		Some((
+			crate::workspace::uri_to_path(&target.uri)?,
 			target.source.clone(),
-		)
-	});
+		))
+	} else {
+		None
+	};
 	let response = GotoDefinitionResponse::Scalar(Location {
 		uri: target.uri,
 		range: target_index.range(&target.source, target.span),

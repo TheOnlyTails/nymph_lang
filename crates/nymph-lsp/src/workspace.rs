@@ -21,6 +21,33 @@ pub struct Project {
 	pub entry_key: String,
 }
 
+/// Filesystem policy for an LSP document URI.
+///
+/// Only `file:` URIs may carry paths. File-backed documents are further
+/// separated by whether they belong to a discovered Nymph project, so close
+/// handling can reload project files while clearing loose and non-file
+/// documents without touching the filesystem.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UriClass {
+	ProjectFile { path: PathBuf, project: Project },
+	LooseFile { path: PathBuf },
+	NonFile,
+}
+
+/// Classify an LSP URI according to the server's filesystem policy.
+///
+/// Project discovery errors remain authoritative for `file:` URIs. Non-file
+/// URIs never pass through path conversion or project discovery.
+pub fn classify_uri(uri: &Uri) -> anyhow::Result<UriClass> {
+	let Some(path) = uri_to_path(uri) else {
+		return Ok(UriClass::NonFile);
+	};
+	Ok(match detect(&path)? {
+		Some(project) => UriClass::ProjectFile { path, project },
+		None => UriClass::LooseFile { path },
+	})
+}
+
 /// Climb from `file`'s directory looking for the nearest `nymph.toml`; if
 /// found, and `file` (canonicalized) lies under that project's resolved
 /// source root, return the project and `file`'s own canonical module key.
@@ -108,11 +135,17 @@ pub fn path_to_uri(path: &Path) -> Option<Uri> {
 
 /// The filesystem path a `file://` [`Uri`] refers to, percent-decoding the
 /// path component (`lsp_types::Uri::path` returns it still encoded, e.g.
-/// `%20` for a space).
+/// `%20` for a space). Non-file URIs have no filesystem path.
 #[must_use]
-pub fn uri_to_path(uri: &Uri) -> PathBuf {
+pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
+	if !uri
+		.scheme()
+		.is_some_and(|scheme| scheme.as_str().eq_ignore_ascii_case("file"))
+	{
+		return None;
+	}
 	let decoded = percent_decode_str(uri.path().as_str()).decode_utf8_lossy();
-	PathBuf::from(decoded.into_owned())
+	Some(PathBuf::from(decoded.into_owned()))
 }
 
 #[cfg(test)]
@@ -195,8 +228,17 @@ mod tests {
 		let uri: Uri = "file:///tmp/my%20project/src/a.nym".parse().unwrap();
 		assert_eq!(
 			uri_to_path(&uri),
-			PathBuf::from("/tmp/my project/src/a.nym")
+			Some(PathBuf::from("/tmp/my project/src/a.nym"))
 		);
+	}
+
+	#[test]
+	fn non_file_uris_never_become_filesystem_paths() {
+		for raw in ["untitled:Untitled-1", "nymph-notebook:/cell/1"] {
+			let uri: Uri = raw.parse().unwrap();
+			assert_eq!(uri_to_path(&uri), None);
+			assert_eq!(classify_uri(&uri).unwrap(), UriClass::NonFile);
+		}
 	}
 
 	#[test]
@@ -219,7 +261,7 @@ mod tests {
 	fn path_to_uri_and_uri_to_path_round_trip_through_a_path_with_a_space() {
 		let path = Path::new("/tmp/my project/src/a.nym");
 		let uri = path_to_uri(path).expect("a path with a space should still yield a Uri");
-		assert_eq!(uri_to_path(&uri), path);
+		assert_eq!(uri_to_path(&uri).as_deref(), Some(path));
 	}
 
 	#[test]
@@ -247,6 +289,6 @@ mod tests {
 		std::fs::create_dir_all(&src_root).unwrap();
 
 		let uri = key_to_uri(&src_root, "a/b").expect("should build a Uri for the module key");
-		assert_eq!(uri_to_path(&uri), src_root.join("a/b.nym"));
+		assert_eq!(uri_to_path(&uri), Some(src_root.join("a/b.nym")));
 	}
 }
