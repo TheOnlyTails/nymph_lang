@@ -119,6 +119,7 @@ pub struct CompilerState {
 	authoritative_overlays: HashMap<ModuleIdentity, Uri>,
 	manifest_errors: HashMap<Uri, String>,
 	diagnostic_targets: HashMap<String, Vec<String>>,
+	diagnostic_owners: HashMap<String, String>,
 }
 
 impl Default for CompilerState {
@@ -149,6 +150,7 @@ impl CompilerState {
 			authoritative_overlays: HashMap::new(),
 			manifest_errors: HashMap::new(),
 			diagnostic_targets: HashMap::new(),
+			diagnostic_owners: HashMap::new(),
 		}
 	}
 
@@ -186,7 +188,17 @@ impl CompilerState {
 		let Some(identity) = self.documents.get(uri).cloned() else {
 			return Ok(CloseAction::Clear);
 		};
-		self.diagnostic_targets.remove(uri.as_str());
+		if let Some(targets) = self.diagnostic_targets.remove(uri.as_str()) {
+			for target in targets {
+				if self
+					.diagnostic_owners
+					.get(&target)
+					.is_some_and(|owner| owner == uri.as_str())
+				{
+					self.diagnostic_owners.remove(&target);
+				}
+			}
+		}
 		if !matches!(identity.kind, DocumentKind::Project(_)) {
 			self.documents.remove(uri);
 		}
@@ -776,6 +788,12 @@ impl CompilerState {
 			.into_iter()
 			.flatten()
 			.filter(|target| target.as_str() != uri.as_str())
+			.filter(|target| {
+				self
+					.diagnostic_owners
+					.get(target.as_str())
+					.is_some_and(|owner| owner == uri.as_str())
+			})
 			.filter_map(|target| target.parse::<Uri>().ok())
 			.collect();
 		Some((message, stale_targets))
@@ -846,6 +864,13 @@ impl CompilerState {
 				if owned_targets
 					.iter()
 					.any(|current| current.as_str() == previous)
+				{
+					continue;
+				}
+				if !self
+					.diagnostic_owners
+					.get(previous)
+					.is_some_and(|owner| owner == uri.as_str())
 				{
 					continue;
 				}
@@ -940,6 +965,13 @@ impl CompilerState {
 				{
 					continue;
 				}
+				if !self
+					.diagnostic_owners
+					.get(previous)
+					.is_some_and(|owner| owner == origin.as_str())
+				{
+					continue;
+				}
 				let Ok(previous_uri) = previous.parse::<Uri>() else {
 					continue;
 				};
@@ -963,13 +995,29 @@ impl CompilerState {
 	}
 
 	pub fn record_diagnostic_targets(&mut self, origin: &Uri, targets: &[Uri]) {
-		self.diagnostic_targets.insert(
-			origin.as_str().to_string(),
-			targets
-				.iter()
-				.map(|target| target.as_str().to_string())
-				.collect(),
-		);
+		let origin = origin.as_str().to_string();
+		let targets: Vec<_> = targets
+			.iter()
+			.map(|target| target.as_str().to_string())
+			.collect();
+		if let Some(previous_targets) = self
+			.diagnostic_targets
+			.insert(origin.clone(), targets.clone())
+		{
+			for previous in previous_targets {
+				if !targets.contains(&previous)
+					&& self
+						.diagnostic_owners
+						.get(&previous)
+						.is_some_and(|owner| owner == &origin)
+				{
+					self.diagnostic_owners.remove(&previous);
+				}
+			}
+		}
+		for target in targets {
+			self.diagnostic_owners.insert(target, origin.clone());
+		}
 	}
 
 	#[doc(hidden)]

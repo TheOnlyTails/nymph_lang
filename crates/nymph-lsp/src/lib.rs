@@ -624,6 +624,33 @@ mod tests {
 		}
 	}
 
+	fn barrier_diagnostics(client: &Connection, id: i32) -> Vec<PublishDiagnosticsParams> {
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(id),
+				"test/barrier".into(),
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		let mut publications = Vec::new();
+		loop {
+			match client.receiver.recv().unwrap() {
+				Message::Notification(notification)
+					if notification.method == lsp_types::notification::PublishDiagnostics::METHOD =>
+				{
+					publications
+						.push(serde_json::from_value::<PublishDiagnosticsParams>(notification.params).unwrap());
+				}
+				Message::Response(response) => {
+					assert_eq!(response.id, RequestId::from(id));
+					return publications;
+				}
+				other => panic!("expected diagnostics or barrier response, got {other:?}"),
+			}
+		}
+	}
+
 	fn send_open(client: &Connection, uri: Uri, version: i32, text: &str) {
 		client
 			.sender
@@ -2067,6 +2094,76 @@ mod tests {
 					"IMPORT-UNRESOLVED".into(),
 				))
 		}));
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn stale_reverse_importer_owner_does_not_clear_newer_diagnostics() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='wire-watch-owner'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let main_path = temp.path().join("src/main.nym");
+		let a_path = temp.path().join("src/a.nym");
+		let b_path = temp.path().join("src/b.nym");
+		let main_source = "import @/a with (middle)\nfunc use(): int = middle()";
+		std::fs::write(&main_path, main_source).unwrap();
+		std::fs::write(
+			&a_path,
+			"import @/b with (value)\npublic func middle(): int = value()",
+		)
+		.unwrap();
+		std::fs::write(&b_path, "public func value(): int = 1").unwrap();
+		let main_uri = workspace::path_to_uri(&main_path).unwrap();
+		let a_uri = workspace::path_to_uri(&a_path).unwrap();
+		let b_uri = workspace::path_to_uri(&b_path).unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		let registration = handshake_with_watchers(&client);
+		client
+			.sender
+			.send(Message::Response(Response::new_ok(
+				registration.id,
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		send_open(&client, main_uri.clone(), 1, main_source);
+		recv_diagnostics_for(&client, &main_uri);
+
+		std::fs::write(&b_path, "public func value(): float = 1.0").unwrap();
+		send_watched_file(&client, b_uri.clone());
+		let from_b = barrier_diagnostics(&client, 96);
+		assert!(
+			from_b
+				.iter()
+				.find(|params| params.uri == a_uri)
+				.is_some_and(|params| !params.diagnostics.is_empty())
+		);
+
+		std::fs::write(&a_path, "public func middle(): int = true").unwrap();
+		send_watched_file(&client, a_uri.clone());
+		let from_a = barrier_diagnostics(&client, 97);
+		assert!(
+			from_a
+				.iter()
+				.find(|params| params.uri == a_uri)
+				.is_some_and(|params| !params.diagnostics.is_empty())
+		);
+
+		std::fs::write(&b_path, "public func value(): int = 2").unwrap();
+		send_watched_file(&client, b_uri.clone());
+		let final_publications = barrier_diagnostics(&client, 98);
+		assert_eq!(
+			final_publications
+				.iter()
+				.map(|params| &params.uri)
+				.collect::<Vec<_>>(),
+			[&b_uri],
+			"the old b refresh owner cleared diagnostics more recently published by a"
+		);
 		shutdown(&client, handle);
 	}
 
