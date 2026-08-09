@@ -172,6 +172,45 @@ fn environment_check_uses_imported_function_without_mutating_environment() {
 }
 
 #[test]
+fn stable_definition_kind_resolves_namespace_and_inherent_function_members() {
+	let parsed = parse_module(
+		"namespace Host { func emit(): int = 1 }\n\
+		 struct Point(x: int) { namespace func origin(): Point = Point(x = 0) }\n\
+		 func read(): int = { let emit = Host.emit let origin = Point.origin emit() + origin().x }",
+		"member-kinds.nymph",
+	);
+	assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+	let module = parsed.tree;
+	let checked = check_module(&module);
+	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+	let analysis = SemanticAnalysis {
+		module: Arc::new(module),
+		annotations: Arc::new(ModuleAnnotations::from(checked.annotations.clone())),
+		checked: Arc::new(checked.facts),
+		declarations: Arc::default(),
+	};
+
+	for expected in ["emit", "origin"] {
+		let target = analysis
+			.annotations
+			.definition_targets()
+			.map(|(_, target)| target)
+			.find(|target| {
+				matches!(
+					&target.key,
+					DeclarationKey::Member { name, .. } if name == expected
+				)
+			})
+			.unwrap_or_else(|| panic!("missing exact target for `{expected}`"));
+		assert_eq!(
+			nymph_sema::query::stable_definition_kind(&analysis, target),
+			Some(nymph_sema::DefKind::Func),
+			"wrong kind for {target:?}"
+		);
+	}
+}
+
+#[test]
 fn imported_opaque_method_return_retains_its_exact_interface_bound() {
 	let dependency_identity = identity("iterable.nymph");
 	let parsed = parse_module(

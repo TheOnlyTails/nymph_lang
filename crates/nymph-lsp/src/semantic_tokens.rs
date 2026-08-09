@@ -2080,6 +2080,27 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 	}
 
 	#[test]
+	fn first_class_namespace_and_static_functions_keep_method_roles() {
+		let text = "namespace Host {\n  func emit(): int = 1\n}\nstruct Point(x: int) {\n  namespace func origin(): Point = Point(x = 0)\n}\nfunc read(): int = {\n  let emit = Host.emit\n  let origin = Point.origin\n  emit() + origin().x\n}";
+		let parsed = nymph_syntax::parse_module(text, "first-class-statics.nym");
+		assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+		let checked = nymph_sema::check_module(&parsed.tree);
+		assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		for (qualified, qualifier_role) in [("Host.emit", "namespace"), ("Point.origin", "type")] {
+			let offset = text.find(qualified).unwrap();
+			let (line, col) = line_col(text, offset);
+			assert_eq!(find(&decoded, line, col).type_name, qualifier_role);
+			let member_col = col + qualified.find('.').unwrap() as u32 + 1;
+			let member = find(&decoded, line, member_col);
+			assert_eq!(member.type_name, "method");
+			assert!(member.modifiers.is_empty());
+		}
+	}
+
+	#[test]
 	fn a_value_receiver_shadowing_a_nominal_stays_a_parameter() {
 		let text = "struct Box(value: int) {\n  func get(): int = this.value\n}\nfunc read(Box: Box): int = Box.get()";
 		let decoded = tokens_for(text);

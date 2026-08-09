@@ -981,13 +981,6 @@ pub fn stable_definition_kind(
 	target: &crate::DefinitionId,
 ) -> Option<crate::DefKind> {
 	let semantic = &analysis.checked.semantic;
-	let definition = semantic.definitions.by_stable(target)?;
-	if semantic.signatures.funcs.contains_key(&definition) {
-		return Some(crate::DefKind::Func);
-	}
-	if semantic.signatures.lets.contains_key(&definition) {
-		return Some(crate::DefKind::Let);
-	}
 	for namespace in semantic.signatures.namespaces.values() {
 		for member in namespace.members.values() {
 			match member {
@@ -1002,6 +995,21 @@ pub fn stable_definition_kind(
 				_ => {}
 			}
 		}
+	}
+	if semantic.inherent.iter().any(|implementation| {
+		implementation
+			.methods
+			.values()
+			.any(|method| method.definition.as_ref() == Some(target))
+	}) {
+		return Some(crate::DefKind::Func);
+	}
+	let definition = semantic.definitions.by_stable(target)?;
+	if semantic.signatures.funcs.contains_key(&definition) {
+		return Some(crate::DefKind::Func);
+	}
+	if semantic.signatures.lets.contains_key(&definition) {
+		return Some(crate::DefKind::Let);
 	}
 	Some(semantic.definitions.data(definition).kind)
 }
