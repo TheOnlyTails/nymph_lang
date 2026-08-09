@@ -3,7 +3,11 @@ use std::{
 	path::{Path, PathBuf},
 };
 
-use nymph_ast::token::Token;
+use nymph_ast::{
+	decl::Declaration,
+	expr::{ExprKind, StringPart},
+	token::Token,
+};
 use nymph_format::format;
 use nymph_syntax::{lex, parse_module};
 
@@ -37,6 +41,29 @@ fn parse_clean(source: &str, context: &Path) {
 		"{context:?} did not parse cleanly: {:?}",
 		parsed.diagnostics
 	);
+}
+
+fn sole_string_value(source: &str) -> String {
+	let parsed = parse_module(source, "string-value.nym");
+	assert!(
+		parsed.diagnostics.is_empty(),
+		"string test source must parse"
+	);
+	let [Declaration::Let { value, .. }] = parsed.tree.members.as_slice() else {
+		panic!("expected one let declaration");
+	};
+	let ExprKind::String(parts) = &value.kind else {
+		panic!("expected a string value");
+	};
+	let mut value = String::new();
+	for part in parts {
+		match &part.0 {
+			StringPart::Text(text) => value.push_str(text),
+			StringPart::EscapeSequence(escape) => value.push(escape.to_char().expect("character escape")),
+			StringPart::InterpolatedExpr(_) => panic!("unexpected interpolation"),
+		}
+	}
+	value
 }
 
 /// A location-independent semantic fingerprint. Formatting may remove ordinary
@@ -146,4 +173,94 @@ fn literal_spelling_and_import_order_are_byte_stable() {
 		format(source, "spelling.nym").expect("format literals"),
 		source
 	);
+}
+
+#[test]
+fn block_elision_preserves_control_flow_precedence_and_dangling_else_binding() {
+	let source = "func g(): int = { return@g 1 } + 2\n\
+		func call(): int = ({return@call 1})(2)\n\
+		func branch(a: bool, b: bool): int = if (a) {if (b) 1} else 2\n\
+		func nested(a: bool, b: bool, c: bool): int = if (a) {if (b) 1 else if (c) 2} else 3\n\
+		func safe(a: bool): int = if(a){break@safe 1}else{2}\n";
+	let expected = "func g(): int = {\n\
+		\treturn@g 1\n\
+		} + 2\n\
+		func call(): int = ({\n\
+		\treturn@call 1\n\
+		})(2)\n\
+		func branch(a: bool, b: bool): int = if (a) {\n\
+		\tif (b) 1\n\
+		} else 2\n\
+		func nested(a: bool, b: bool, c: bool): int = if (a) {\n\
+		\tif (b) 1 else if (c) 2\n\
+		} else 3\n\
+		func safe(a: bool): int = if (a) break@safe 1 else 2\n";
+	let actual = format(source, "block-elision.nym").expect("format block expressions");
+	assert_eq!(actual, expected);
+	assert_eq!(format(&actual, "block-elision.nym").unwrap(), actual);
+	assert_eq!(semantic_fingerprint(source), semantic_fingerprint(&actual));
+}
+
+#[test]
+fn required_precedence_groups_have_canonical_spacing_and_are_idempotent() {
+	let source = "func left(a:int,b:int,c:int)= (a + b) * c\n\
+		func right(a:int,b:int,c:int)= a * (b + c)\n\
+		func unary(a:int,b:int)= -(a + b)\n\
+		func power()=2**3**2\n\
+		func left_power()=(2**3)**2\n\
+		func power_assign()={let mut x=2 x**=3 x}\n";
+	let expected = "func left(a: int, b: int, c: int) = (a + b) * c\n\
+		func right(a: int, b: int, c: int) = a * (b + c)\n\
+		func unary(a: int, b: int) = -(a + b)\n\
+		func power() = 2 ** 3 ** 2\n\
+		func left_power() = (2 ** 3) ** 2\n\
+		func power_assign() = {\n\
+		\tlet mut x = 2\n\
+		\tx **= 3\n\
+		\tx\n\
+		}\n";
+	let actual = format(source, "groups.nym").expect("format groups");
+	assert_eq!(actual, expected);
+	assert_eq!(format(&actual, "groups.nym").unwrap(), actual);
+	assert_eq!(semantic_fingerprint(source), semantic_fingerprint(&actual));
+}
+
+#[test]
+fn interpolation_line_comments_keep_their_terminating_newline() {
+	let source = "let text = \"${value // keep\n}\"\n";
+	let actual = format(source, "interpolation-comment.nym").expect("format interpolation");
+	assert_eq!(actual, source);
+	assert_eq!(
+		format(&actual, "interpolation-comment.nym").unwrap(),
+		actual
+	);
+	parse_clean(&actual, Path::new("interpolation-comment.nym"));
+}
+
+#[test]
+fn raw_carriage_returns_in_strings_are_escaped_without_changing_the_value() {
+	let source = "let text = \"first\r\nsecond\rmiddle\"\r\n";
+	let actual = format(source, "string-cr.nym").expect("format raw string CRs");
+	assert_eq!(actual, "let text = \"first\\r\nsecond\\rmiddle\"\n");
+	assert!(!actual.contains('\r'));
+	assert_eq!(format(&actual, "string-cr.nym").unwrap(), actual);
+	assert_eq!(sole_string_value(source), sole_string_value(&actual));
+}
+
+#[test]
+fn width_uses_the_full_line_and_unicode_display_columns() {
+	let ascii = format(
+		"func width() = aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa(one,two)\n",
+		"ascii-width.nym",
+	)
+	.expect("format ASCII width boundary");
+	assert!(ascii.contains("aaaaaaaaaa(\n\tone,\n\ttwo,\n)"));
+
+	let unicode = format(
+		&format!("func width() = {}(one,two)\n", "界".repeat(39)),
+		"unicode-width.nym",
+	)
+	.expect("format Unicode width boundary");
+	assert!(unicode.contains("界(\n\tone,\n\ttwo,\n)"));
+	assert_eq!(format(&unicode, "unicode-width.nym").unwrap(), unicode);
 }

@@ -13,6 +13,7 @@ nymph-ast = { workspace = true }
 nymph-diagnostics = { workspace = true }
 nymph-syntax = { workspace = true }
 thiserror = { workspace = true }
+unicode-width = "0.2.2"
 
 [lints.clippy]
 all = "warn"

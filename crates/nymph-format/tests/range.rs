@@ -45,6 +45,23 @@ fn utf8_spans_are_bytes_not_scalar_or_utf16_offsets() {
 }
 
 #[test]
+fn invalid_utf8_boundaries_and_out_of_bounds_ranges_are_ineligible() {
+	let source = "let λ = 1\n";
+	for range in [
+		Span::new(5, 5),
+		Span::new(source.len() + 1, source.len() + 1),
+		Span::new(0, source.len() + 1),
+		Span::new(4, 3),
+	] {
+		assert!(
+			format_range(source, "invalid-range.nym", range)
+				.expect("invalid byte range must not panic or fail parsing")
+				.is_none()
+		);
+	}
+}
+
+#[test]
 fn cursor_and_surrounding_whitespace_select_the_nearest_format_unit() {
 	let source = "let value = foo(  1,2 )\n";
 	for offset in [

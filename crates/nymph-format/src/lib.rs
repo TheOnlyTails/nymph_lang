@@ -14,6 +14,7 @@ use nymph_ast::{
 use nymph_diagnostics::Diagnostic;
 use nymph_syntax::{parse_expression, parse_module};
 use thiserror::Error;
+use unicode_width::UnicodeWidthChar as _;
 
 const WIDTH: usize = 100;
 
@@ -68,7 +69,12 @@ pub fn format_range(
 	if !parsed.diagnostics.is_empty() {
 		return Err(FormatError::syntax(path, parsed.diagnostics));
 	}
-	if range.start > range.end || range.start >= source.len() {
+	if range.start > range.end
+		|| range.start >= source.len()
+		|| range.end > source.len()
+		|| !source.is_char_boundary(range.start)
+		|| !source.is_char_boundary(range.end)
+	{
 		return Ok(None);
 	}
 	let hints = Hints::module(source, &parsed.tree);
@@ -163,6 +169,7 @@ struct Hints {
 	blocks: HashSet<usize>,
 	matches: HashSet<usize>,
 	remove_delimiters: HashMap<usize, usize>,
+	grouped: HashSet<usize>,
 	multiline_lists: HashMap<usize, usize>,
 	units: Vec<Span>,
 	removable_units: Vec<Span>,
@@ -197,32 +204,67 @@ impl Hints {
 
 		let mut scanner = Scanner::new(source);
 		let mut stack: Vec<Candidate> = Vec::new();
+		let mut line_width = 0;
+		let mut depth: usize = 0;
+		let mut declaration_prefix = false;
 		while let Some(item) = scanner.next() {
 			if item.kind != Kind::Space {
+				if item.kind == Kind::Token && depth == 0 {
+					if is_declaration_prefix(item.text) {
+						if !declaration_prefix {
+							line_width = 0;
+						}
+						declaration_prefix = true;
+					} else if is_declaration_start(item.text) {
+						if !declaration_prefix {
+							line_width = 0;
+						}
+						declaration_prefix = false;
+					}
+				}
+				if self.line_before.contains(&item.start) {
+					line_width = 0;
+				}
+				let item_width = display_width(item.text);
+				if line_width > 0 {
+					line_width += 1;
+				}
+				line_width += item_width;
 				for candidate in &mut stack {
-					candidate.width += item.text.chars().count() + 1;
-					candidate.has_line_comment |= item.kind == Kind::LineComment;
+					candidate.width += item_width + 1;
+					candidate.has_line_comment |=
+						item.kind == Kind::LineComment || item.kind == Kind::BlockComment && item.had_newline;
 				}
 			}
 			if item.kind != Kind::Token {
+				if item.kind == Kind::LineComment || item.kind == Kind::BlockComment && item.had_newline {
+					line_width = item
+						.text
+						.rsplit(['\r', '\n'])
+						.next()
+						.map_or(0, display_width);
+				}
 				continue;
 			}
 			match item.text {
-				"(" | "[" | "{" | "#(" | "#[" | "#{" => stack.push(Candidate {
-					open: item.start,
-					opener: match item.text {
-						"(" => "(",
-						"[" => "[",
-						"{" => "{",
-						"#(" => "#(",
-						"#[" => "#[",
-						"#{" => "#{",
-						_ => unreachable!(),
-					},
-					width: item.text.len(),
-					has_comma: false,
-					has_line_comment: false,
-				}),
+				"(" | "[" | "{" | "#(" | "#[" | "#{" => {
+					stack.push(Candidate {
+						open: item.start,
+						opener: match item.text {
+							"(" => "(",
+							"[" => "[",
+							"{" => "{",
+							"#(" => "#(",
+							"#[" => "#[",
+							"#{" => "#{",
+							_ => unreachable!(),
+						},
+						width: line_width,
+						has_comma: false,
+						has_line_comment: false,
+					});
+					depth += 1;
+				}
 				"," => {
 					if let Some(candidate) = stack.last_mut() {
 						candidate.has_comma = true;
@@ -240,6 +282,7 @@ impl Hints {
 						continue;
 					}
 					let candidate = stack.pop().expect("candidate exists");
+					depth = depth.saturating_sub(1);
 					if candidate.opener != "{"
 						&& candidate.has_comma
 						&& (candidate.width > WIDTH || candidate.has_line_comment)
@@ -456,7 +499,13 @@ impl Hints {
 				otherwise,
 			} => {
 				self.visit_expr(source, condition, true);
-				self.visit_expr(source, then, true);
+				// Removing braces around a nested `if` in this position can make the
+				// outer `else` bind to the inner expression instead.
+				self.visit_expr(
+					source,
+					then,
+					otherwise.is_none() || !ends_in_unmatched_if(then),
+				);
 				if let Some(otherwise) = otherwise {
 					self.visit_expr(source, otherwise, true);
 				}
@@ -481,6 +530,7 @@ impl Hints {
 				let open = expr.span.start + open_offset;
 				let close = expr.span.end.saturating_sub(1);
 				let removable = label.is_none()
+					&& root
 					&& !self.blocks.contains(&open)
 					&& body.len() == 1
 					&& matches!(body[0].0, Statement::Expr(_))
@@ -505,6 +555,7 @@ impl Hints {
 			ExprKind::Grouped(inner) => {
 				let open = expr.span.start;
 				let close = expr.span.end.saturating_sub(1);
+				self.grouped.insert(open);
 				if root
 					&& !contains_comment(&source[open + 1..inner.span.start])
 					&& !contains_comment(&source[inner.span.end..close])
@@ -536,6 +587,29 @@ impl Hints {
 	}
 }
 
+fn ends_in_unmatched_if(expr: &Expr) -> bool {
+	match &expr.kind {
+		ExprKind::If { otherwise, .. } => otherwise.as_deref().is_none_or(ends_in_unmatched_if),
+		ExprKind::Block { body, label: None } if body.len() == 1 => match &body[0].0 {
+			Statement::Expr(expr) => ends_in_unmatched_if(expr),
+			Statement::Let { .. } => false,
+		},
+		ExprKind::Grouped(inner) => ends_in_unmatched_if(inner),
+		ExprKind::While { body, .. } | ExprKind::For { body, .. } | ExprKind::Closure { body, .. } => {
+			ends_in_unmatched_if(body)
+		}
+		ExprKind::Return {
+			value: Some(value), ..
+		}
+		| ExprKind::Break {
+			value: Some(value), ..
+		}
+		| ExprKind::BinaryOp { rhs: value, .. }
+		| ExprKind::AssignOp { rhs: value, .. } => ends_in_unmatched_if(value),
+		_ => false,
+	}
+}
+
 fn contains_comment(source: &str) -> bool {
 	source.contains("//") || source.contains("/*")
 }
@@ -551,10 +625,21 @@ fn flat_width(source: &str) -> usize {
 		if !first {
 			width += 1;
 		}
-		width += item.text.chars().count();
+		width += display_width(item.text);
 		first = false;
 	}
 	width
+}
+
+fn display_width(source: &str) -> usize {
+	source
+		.chars()
+		.map(|character| match character {
+			'\t' => 2,
+			'\r' | '\n' => 0,
+			_ => character.width().unwrap_or(0),
+		})
+		.sum()
 }
 
 fn first_token_start(source: &str, start: usize, end: usize) -> Option<usize> {
@@ -590,10 +675,23 @@ fn format_string_literal(literal: &str) -> String {
 			};
 			let inner = &literal[at + 2..close];
 			let formatted = format_fragment(inner);
+			let formatted = formatted.trim_start_matches(char::is_whitespace);
+			let trailing_line_comment = ends_with_line_comment(formatted);
+			let formatted = formatted.strip_suffix('\n').unwrap_or(formatted);
 			output.push_str("${");
-			output.push_str(formatted.trim());
+			output.push_str(formatted);
+			if trailing_line_comment {
+				output.push('\n');
+			}
 			output.push('}');
 			at = close + 1;
+			continue;
+		}
+		if bytes[at] == b'\r' {
+			// Preserve the cooked string value while keeping canonical source free
+			// of carriage-return bytes. In CRLF, the following LF remains literal.
+			output.push_str("\\r");
+			at += 1;
 			continue;
 		}
 		let ch = literal[at..].chars().next().expect("valid string slice");
@@ -602,6 +700,17 @@ fn format_string_literal(literal: &str) -> String {
 	}
 	output.push('"');
 	output
+}
+
+fn ends_with_line_comment(source: &str) -> bool {
+	let mut scanner = Scanner::new(source);
+	let mut last = None;
+	while let Some(item) = scanner.next() {
+		if item.kind != Kind::Space {
+			last = Some(item.kind);
+		}
+	}
+	last == Some(Kind::LineComment)
 }
 
 fn interpolation_close(source: &str, mut at: usize, end: usize) -> Option<usize> {
@@ -988,7 +1097,12 @@ impl<'a> Formatter<'a> {
 			self.previous = Some(token);
 			return;
 		}
-		if self.previous_was_block_close && !matches!(token, "else" | ")" | "]" | "," | "." | "?.") {
+		if self.previous_was_block_close
+			&& !matches!(
+				token,
+				"else" | ")" | "]" | "," | "." | "?." | "::" | "?" | "(" | "["
+			) && !is_infix_operator(token)
+		{
 			self.newline();
 		}
 		self.previous_was_block_close = false;
@@ -1105,6 +1219,10 @@ impl<'a> Formatter<'a> {
 				{
 					self.space();
 					self.control_pending = false;
+				} else if token == "(" && self.hints.grouped.contains(&item.start) {
+					if self.grouped_needs_space() {
+						self.space();
+					}
 				} else if self.needs_space(token) {
 					self.space();
 				}
@@ -1193,6 +1311,17 @@ impl<'a> Formatter<'a> {
 		true
 	}
 
+	fn grouped_needs_space(&self) -> bool {
+		let Some(previous) = self.previous else {
+			return false;
+		};
+		!self.previous_was_prefix
+			&& !matches!(
+				previous,
+				"(" | "[" | "." | "?." | "::" | "#(" | "#[" | "#{" | "@" | "!" | "..." | ".." | "..="
+			)
+	}
+
 	fn empty_brace_close(&self, after_open: usize) -> Option<usize> {
 		let mut scanner = Scanner {
 			source: self.source,
@@ -1248,7 +1377,7 @@ impl<'a> Formatter<'a> {
 			self.continuation_line = false;
 		}
 		self.out.push_str(text);
-		self.line_len += text.chars().count();
+		self.line_len += display_width(text);
 	}
 	fn trailing_comma(&mut self) {
 		if self.at_line_start {
@@ -1271,12 +1400,9 @@ impl<'a> Formatter<'a> {
 		}
 		self.out.push_str(text);
 		if text.contains('\n') {
-			self.line_len = text
-				.rsplit('\n')
-				.next()
-				.map_or(0, |line| line.chars().count());
+			self.line_len = text.rsplit('\n').next().map_or(0, display_width);
 		} else {
-			self.line_len += text.chars().count();
+			self.line_len += display_width(text);
 		}
 	}
 	fn space(&mut self) {
@@ -1312,6 +1438,53 @@ fn is_declaration_start(token: &str) -> bool {
 
 fn is_declaration_prefix(token: &str) -> bool {
 	matches!(token, "public" | "internal" | "private" | "external")
+}
+
+fn is_infix_operator(token: &str) -> bool {
+	matches!(
+		token,
+		"+"
+			| "-"
+			| "*"
+			| "/"
+			| "%"
+			| "**"
+			| "&"
+			| "|"
+			| "^"
+			| "=="
+			| "!="
+			| "<"
+			| ">"
+			| "<="
+			| ">="
+			| "in"
+			| "!in"
+			| "&&"
+			| "||"
+			| "|>"
+			| "??"
+			| "<<"
+			| ">>"
+			| "="
+			| "+="
+			| "-="
+			| "*="
+			| "/="
+			| "%="
+			| "**="
+			| "<<="
+			| ">>="
+			| "&="
+			| "^="
+			| "|="
+			| "~="
+			| "&&="
+			| "||="
+			| "as"
+			| "is"
+			| "!is"
+	)
 }
 
 fn is_prefix_operator(token: &str, previous: Option<&str>) -> bool {
