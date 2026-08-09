@@ -50,7 +50,10 @@ Hover uses the same checked snapshot as diagnostics. In a project, that includes
 aliases, the embedded `std/...` modules, the ambient prelude, inferred generic substitutions, and
 unsaved overlays for every open dependency. A saved `.nym` file outside a project is checked as a
 one-file library with the ambient prelude; it has no project import graph. The extension currently
-registers language-server features for `file:` documents only, not untitled editor buffers.
+registers language-server features for `file:` documents only, not untitled editor buffers. Closing
+a project file discards its overlay and refreshes diagnostics from the current disk source, including
+affected importers; closing a loose or non-file document clears its diagnostics without reading it
+from disk.
 
 ## Nymph files
 

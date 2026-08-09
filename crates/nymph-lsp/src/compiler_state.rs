@@ -23,7 +23,19 @@ struct DocumentIdentity {
 	entry: ModulePath,
 	root: PathBuf,
 	without_prelude: bool,
-	project_file: bool,
+	kind: DocumentKind,
+}
+
+#[derive(Clone)]
+enum DocumentKind {
+	Project(PathBuf),
+	Loose(PathBuf),
+	NonFile,
+}
+
+pub enum CloseAction {
+	PublishProject(Vec<Uri>),
+	Clear,
 }
 
 pub struct DiagnosticModuleSnapshot {
@@ -127,16 +139,17 @@ impl CompilerState {
 		Ok(self.affected_project_documents(uri))
 	}
 
-	pub fn close(&mut self, docs: &mut DocumentStore, uri: &Uri) -> anyhow::Result<Vec<Uri>> {
+	pub fn close(&mut self, docs: &mut DocumentStore, uri: &Uri) -> anyhow::Result<CloseAction> {
 		let previous = self.affected_project_documents(uri);
+		// Remove the overlay before choosing the effective replacement source.
 		docs.close(uri);
 		self.manifest_errors.remove(uri);
 		let Some(identity) = self.documents.get(uri).cloned() else {
-			return Ok(Vec::new());
+			return Ok(CloseAction::Clear);
 		};
 		self.diagnostic_targets.remove(uri.as_str());
 		self.sources.remove(uri);
-		if !identity.project_file {
+		if !matches!(identity.kind, DocumentKind::Project(_)) {
 			self.documents.remove(uri);
 		}
 		let remaining_overlay = self
@@ -166,19 +179,27 @@ impl CompilerState {
 				source.clone(),
 				SourceVersion(i64::from(version)),
 			);
-			self.sources.insert(open_uri.clone(), source.into());
-			if !identity.project_file {
-				return Ok(Vec::new());
+			self.sources.insert(open_uri.clone(), source.clone().into());
+			if !matches!(identity.kind, DocumentKind::Project(_)) {
+				return Ok(CloseAction::Clear);
 			}
+			// The closed spelling remains a valid project publication target even
+			// when an equivalent URI spelling still supplies the live overlay.
+			self.sources.insert(uri.clone(), source.into());
 			let mut affected = previous;
-			for current in self.affected_project_documents(&open_uri) {
+			for current in self.affected_project_documents(uri) {
 				if !affected.contains(&current) {
 					affected.push(current);
 				}
 			}
-			return Ok(affected);
+			return Ok(CloseAction::PublishProject(affected));
 		}
-		let path = workspace::uri_to_path(uri);
+		let DocumentKind::Project(path) = identity.kind else {
+			self
+				.session_mut(identity.without_prelude)
+				.remove_source(identity.project, identity.module);
+			return Ok(CloseAction::Clear);
+		};
 		match fs::read_to_string(path) {
 			Ok(source) => {
 				self.session_mut(identity.without_prelude).set_source(
@@ -196,16 +217,13 @@ impl CompilerState {
 			}
 			Err(error) => return Err(error.into()),
 		}
-		if !identity.project_file {
-			return Ok(Vec::new());
-		}
 		let mut affected = previous;
 		for current in self.affected_project_documents(uri) {
 			if !affected.contains(&current) {
 				affected.push(current);
 			}
 		}
-		Ok(affected)
+		Ok(CloseAction::PublishProject(affected))
 	}
 
 	fn affected_project_documents(&self, uri: &Uri) -> Vec<Uri> {
@@ -545,19 +563,21 @@ impl CompilerState {
 		// Filesystem discovery is intentionally tied to the first project open.
 		// Without a watcher, later external adds/deletes of unopened files are
 		// not events; opening a file still overlays or adds its live source.
-		let path = workspace::uri_to_path(uri);
-		let (root, module, scan_disk) = match workspace::detect(&path) {
+		let class = match workspace::classify_uri(uri) {
 			Err(error) => {
 				self.documents.remove(uri);
 				self.manifest_errors.insert(uri.clone(), error.to_string());
 				return Ok(());
 			}
-			Ok(Some(project)) => (
+			Ok(class) => class,
+		};
+		let (root, module, kind) = match class {
+			workspace::UriClass::ProjectFile { path, project } => (
 				project.src_root,
 				ModulePath::new(project.entry_key).unwrap(),
-				true,
+				DocumentKind::Project(path),
 			),
-			Ok(None) => {
+			workspace::UriClass::LooseFile { path } => {
 				let root = path
 					.parent()
 					.unwrap_or_else(|| std::path::Path::new("/"))
@@ -572,36 +592,53 @@ impl CompilerState {
 						path.display()
 					)
 				})?;
-				(root, module, false)
+				(root, module, DocumentKind::Loose(path))
 			}
+			workspace::UriClass::NonFile => (
+				PathBuf::new(),
+				ModulePath::new("document").unwrap(),
+				DocumentKind::NonFile,
+			),
 		};
 		self.manifest_errors.remove(uri);
-		let root = std::path::absolute(root)?;
+		let root = if matches!(kind, DocumentKind::NonFile) {
+			root
+		} else {
+			std::path::absolute(root)?
+		};
 		// A manifest project shares one source graph at its source root. A
 		// loose file is deliberately its own one-module project, even when
 		// sibling loose files in the same directory are open.
-		let project_key = if scan_disk {
-			root.clone()
-		} else {
-			std::path::absolute(&path)?
+		let project_key = match &kind {
+			DocumentKind::Project(_) => root.clone(),
+			DocumentKind::Loose(path) => path.clone(),
+			DocumentKind::NonFile => PathBuf::new(),
 		};
-		let without_prelude = nymph_compiler::is_stdlib_source_path(&path);
-		let project = self
-			.workspaces
-			.entry(project_key.clone())
-			.or_insert_with(|| ProjectId::new(project_key.to_string_lossy().into_owned()))
-			.clone();
+		let without_prelude = match &kind {
+			DocumentKind::Project(path) => nymph_compiler::is_stdlib_source_path(path),
+			DocumentKind::Loose(path) => nymph_compiler::is_stdlib_source_path(path),
+			DocumentKind::NonFile => false,
+		};
+		let project = if matches!(kind, DocumentKind::NonFile) {
+			ProjectId::new(uri.as_str().to_string())
+		} else {
+			self
+				.workspaces
+				.entry(std::path::absolute(project_key)?)
+				.or_insert_with_key(|key| ProjectId::new(key.to_string_lossy().into_owned()))
+				.clone()
+		};
 		let identity = DocumentIdentity {
 			project: project.clone(),
 			module: module.clone(),
 			entry: module,
 			root: root.clone(),
 			without_prelude,
-			project_file: scan_disk,
+			kind: kind.clone(),
 		};
 		self.documents.insert(uri.clone(), identity.clone());
 
-		if scan_disk && self.synchronized_roots.insert(root.clone()) {
+		if matches!(kind, DocumentKind::Project(_)) && self.synchronized_roots.insert(root.clone()) {
 			for (path, module) in nymph_files(&root)? {
 				if let Ok(source) = fs::read_to_string(&path) {
 					self.session_mut(without_prelude).set_source(
@@ -621,7 +658,7 @@ impl CompilerState {
 								entry: module,
 								root: root.clone(),
 								without_prelude,
-								project_file: true,
+								kind: DocumentKind::Project(path.clone()),
 							});
 					}
 				}
