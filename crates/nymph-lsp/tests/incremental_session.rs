@@ -9,11 +9,13 @@ use std::{
 };
 
 use lsp_types::{
-	HoverContents, HoverParams, MarkupContent, Position, SemanticTokensParams,
-	TextDocumentIdentifier, TextDocumentPositionParams, Uri, WorkDoneProgressParams,
+	CompletionItem, CompletionParams, CompletionResponse, HoverContents, HoverParams, MarkupContent,
+	Position, SemanticTokensParams, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
+	WorkDoneProgressParams,
 };
 use nymph_lsp::{
-	compiler_state::CompilerState, document_store::DocumentStore, hover, semantic_tokens, workspace,
+	compiler_state::CompilerState, completion, document_store::DocumentStore, hover, semantic_tokens,
+	workspace,
 };
 
 fn uri(path: &Path) -> Uri {
@@ -73,6 +75,243 @@ fn hover_needle(
 	hover_value(compiler, docs, uri, line, character as u32)
 }
 
+fn completion_items(
+	compiler: &CompilerState,
+	docs: &DocumentStore,
+	uri: &Uri,
+	line: u32,
+	character: u32,
+) -> Vec<CompletionItem> {
+	let snapshot = compiler.completion_for_uri(docs, uri).unwrap();
+	let response = completion::completion_snapshot(
+		&snapshot,
+		&CompletionParams {
+			text_document_position: TextDocumentPositionParams {
+				text_document: TextDocumentIdentifier { uri: uri.clone() },
+				position: Position { line, character },
+			},
+			work_done_progress_params: WorkDoneProgressParams::default(),
+			partial_result_params: Default::default(),
+			context: None,
+		},
+	);
+	match response {
+		CompletionResponse::Array(items) => items,
+		CompletionResponse::List(list) => list.items,
+	}
+}
+
+#[test]
+fn project_completion_uses_resolved_imports_ranking_kinds_and_shadowing() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='completion'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let source = "import @/dep with (call as imported_alias, spare, Shape, Choice as Selected, hidden)\nfunc z_local_top(): int = 1\nfunc main(): int = {\n  let imported_alias = 1\n  imported_alias\n  imported_ali";
+	fs::write(&main_path, source).unwrap();
+	fs::write(
+		&dep_path,
+		"public func call(): int = 1\npublic func spare(): int = 1\npublic struct Shape(value: int)\npublic enum Choice { First, Second(value: int) }\nprivate func hidden(): int = 1",
+	)
+	.unwrap();
+	let main_uri = uri(&main_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), source.into(), 1)
+		.unwrap();
+
+	let items = completion_items(&compiler, &docs, &main_uri, 4, 2);
+	let labels = items
+		.iter()
+		.map(|item| item.label.as_str())
+		.collect::<Vec<_>>();
+	assert_eq!(
+		labels
+			.iter()
+			.filter(|label| **label == "imported_alias")
+			.count(),
+		1,
+		"lexical shadowing must de-duplicate the imported spelling: {labels:?}"
+	);
+	let alias = items
+		.iter()
+		.find(|item| item.label == "imported_alias")
+		.unwrap();
+	assert_eq!(alias.kind, Some(lsp_types::CompletionItemKind::VARIABLE));
+	let shape = items.iter().find(|item| item.label == "Shape").unwrap();
+	assert_eq!(shape.kind, Some(lsp_types::CompletionItemKind::STRUCT));
+	let spare = items.iter().find(|item| item.label == "spare").unwrap();
+	assert_eq!(spare.kind, Some(lsp_types::CompletionItemKind::FUNCTION));
+	let selected = items.iter().find(|item| item.label == "Selected").unwrap();
+	assert_eq!(selected.kind, Some(lsp_types::CompletionItemKind::ENUM));
+	for variant in ["First", "Second"] {
+		let variant = items.iter().find(|item| item.label == variant).unwrap();
+		assert_eq!(
+			variant.kind,
+			Some(lsp_types::CompletionItemKind::ENUM_MEMBER)
+		);
+	}
+	assert!(
+		!labels.contains(&"call"),
+		"only the visible alias completes"
+	);
+	assert!(
+		!labels.contains(&"hidden"),
+		"private imports never complete"
+	);
+	assert!(
+		labels.iter().position(|label| *label == "Shape").unwrap()
+			< labels
+				.iter()
+				.position(|label| *label == "z_local_top")
+				.unwrap()
+	);
+	assert!(
+		labels
+			.iter()
+			.position(|label| *label == "z_local_top")
+			.unwrap()
+			< labels.iter().position(|label| *label == "while").unwrap()
+	);
+	let mut client_sorted = items.clone();
+	client_sorted.sort_by(|left, right| {
+		left
+			.sort_text
+			.as_deref()
+			.unwrap_or(&left.label)
+			.cmp(right.sort_text.as_deref().unwrap_or(&right.label))
+	});
+	assert_eq!(
+		client_sorted
+			.iter()
+			.map(|item| item.label.as_str())
+			.collect::<Vec<_>>(),
+		labels,
+		"LSP sortText must preserve tier order in clients"
+	);
+	let shadowed_prefix = completion_items(&compiler, &docs, &main_uri, 5, 14);
+	let alias = shadowed_prefix
+		.iter()
+		.find(|item| item.label == "imported_alias")
+		.expect("the lexical binding should complete from its typed prefix");
+	assert_eq!(alias.kind, Some(lsp_types::CompletionItemKind::VARIABLE));
+}
+
+#[test]
+fn project_completion_matches_variant_precedence_ambiguity_and_mutability() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='completion-collisions'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let source = "import @/first with (Remote, counter)\nimport @/second with (Other)\nenum Local { LocalAmbiguous }\nfunc TopCollision(): int = 1\nfunc main(): int = 1";
+	fs::write(&main_path, source).unwrap();
+	fs::write(
+		temp.path().join("src/first.nym"),
+		"public enum Remote { Unique, TopCollision, Ambiguous, LocalAmbiguous }\npublic let mut counter: int = 0",
+	)
+	.unwrap();
+	fs::write(
+		temp.path().join("src/second.nym"),
+		"public enum Other { Ambiguous }",
+	)
+	.unwrap();
+	let main_uri = uri(&main_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), source.into(), 1)
+		.unwrap();
+
+	let items = completion_items(&compiler, &docs, &main_uri, 4, 0);
+	let unique = items.iter().find(|item| item.label == "Unique").unwrap();
+	assert_eq!(
+		unique.kind,
+		Some(lsp_types::CompletionItemKind::ENUM_MEMBER)
+	);
+	let top_collision = items
+		.iter()
+		.find(|item| item.label == "TopCollision")
+		.unwrap();
+	assert_eq!(
+		top_collision.kind,
+		Some(lsp_types::CompletionItemKind::FUNCTION),
+		"an ordinary local definition wins semantic lookup over a variant"
+	);
+	for ambiguous in ["Ambiguous", "LocalAmbiguous"] {
+		assert!(
+			!items.iter().any(|item| item.label == ambiguous),
+			"an ambiguous bare variant must not be suggested: {ambiguous}"
+		);
+	}
+	let counter = items.iter().find(|item| item.label == "counter").unwrap();
+	assert_eq!(counter.kind, Some(lsp_types::CompletionItemKind::VARIABLE));
+}
+
+#[test]
+fn project_completion_uses_latest_dependency_overlay_with_partial_source() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='completion-overlay'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let source = "import @/dep\nfunc main(): int = {\n  ";
+	fs::write(&main_path, source).unwrap();
+	fs::write(&dep_path, "public func disk_name(): int = 1").unwrap();
+	let main_uri = uri(&main_path);
+	let dep_uri = uri(&dep_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), source.into(), 1)
+		.unwrap();
+	let stale_snapshot = compiler.completion_for_uri(&docs, &main_uri).unwrap();
+	let before = completion_items(&compiler, &docs, &main_uri, 2, 2);
+	assert!(before.iter().any(|item| item.label == "disk_name"));
+
+	compiler
+		.open(
+			&mut docs,
+			dep_uri.clone(),
+			"public func overlay_name(): int = 1\npublic enum OverlayChoice { Known }\nfunc broken("
+				.into(),
+			1,
+		)
+		.unwrap();
+	let after = completion_items(&compiler, &docs, &main_uri, 2, 2);
+	assert!(after.iter().any(|item| item.label == "overlay_name"));
+	assert!(after.iter().any(|item| item.label == "OverlayChoice"));
+	assert!(after.iter().any(|item| item.label == "Known"));
+	assert!(!after.iter().any(|item| item.label == "disk_name"));
+	let mut stale_was_published = false;
+	nymph_lsp::compiler_state::publish_completion_if_current(
+		&docs,
+		&main_uri,
+		&stale_snapshot,
+		(),
+		|()| stale_was_published = true,
+	);
+	assert!(!stale_was_published);
+
+	compiler.close(&mut docs, &dep_uri).unwrap();
+	let restored = completion_items(&compiler, &docs, &main_uri, 2, 2);
+	assert!(restored.iter().any(|item| item.label == "disk_name"));
+	assert!(!restored.iter().any(|item| item.label == "overlay_name"));
+}
+
 #[test]
 fn unchanged_features_share_one_analysis_and_change_recomputes_once() {
 	let parse = Arc::new(AtomicUsize::new(0));
@@ -125,6 +364,7 @@ fn unchanged_features_share_one_analysis_and_change_recomputes_once() {
 		partial_result_params: Default::default(),
 	};
 	assert!(semantic_tokens::semantic_tokens_full(&first, &token_params).is_some());
+	let first_completion = compiler.completion_for_uri(&docs, &uri).unwrap();
 	let initial_parse_count = parse.load(Ordering::Relaxed);
 	assert!(initial_parse_count >= 1);
 	assert_eq!(check.load(Ordering::Relaxed), 1);
@@ -132,6 +372,17 @@ fn unchanged_features_share_one_analysis_and_change_recomputes_once() {
 	compiler.change(&mut docs, &uri, source.into(), 2).unwrap();
 	let unchanged = compiler.analysis_for_uri(&docs, &uri).unwrap();
 	assert!(Arc::ptr_eq(&first.analysis, &unchanged.analysis));
+	let unchanged_completion = compiler.completion_for_uri(&docs, &uri).unwrap();
+	assert_eq!(unchanged_completion.document_version, 2);
+	let mut stale_completion_sent = false;
+	nymph_lsp::compiler_state::publish_completion_if_current(
+		&docs,
+		&uri,
+		&first_completion,
+		(),
+		|()| stale_completion_sent = true,
+	);
+	assert!(!stale_completion_sent);
 	assert_eq!(parse.load(Ordering::Relaxed), initial_parse_count);
 	assert_eq!(check.load(Ordering::Relaxed), 1);
 

@@ -55,6 +55,15 @@ pub struct AnalysisSnapshot {
 	without_prelude: bool,
 }
 
+/// Immutable completion inputs from one authoritative project/overlay revision.
+/// Unlike checked-body analysis, these remain available while source syntax is partial.
+pub struct CompletionSnapshot {
+	pub document_version: i32,
+	pub document_revision: DocumentStoreRevision,
+	pub source: Arc<str>,
+	pub imported_names: Arc<[nymph_sema::query::ImportedName]>,
+}
+
 pub struct DefinitionTargetSnapshot {
 	pub uri: Uri,
 	pub source: Arc<str>,
@@ -244,6 +253,26 @@ impl CompilerState {
 			entry: identity.entry.clone(),
 			root: identity.root.clone(),
 			without_prelude: identity.without_prelude,
+		})
+	}
+
+	pub fn completion_for_uri(&self, docs: &DocumentStore, uri: &Uri) -> Option<CompletionSnapshot> {
+		let document = docs.get(uri)?;
+		let identity = self.documents.get(uri)?;
+		let analysis = self.session_for(identity).tooling_completion_analysis(
+			identity.project.clone(),
+			identity.entry.clone(),
+			identity.module.clone(),
+			!identity.without_prelude,
+		)?;
+		if analysis.source.as_ref() != document.text {
+			return None;
+		}
+		Some(CompletionSnapshot {
+			document_version: document.version,
+			document_revision: docs.revision(),
+			source: analysis.source,
+			imported_names: analysis.imported_names,
 		})
 	}
 
@@ -714,6 +743,20 @@ pub fn publish_if_current<T>(
 	docs: &DocumentStore,
 	uri: &Uri,
 	snapshot: &AnalysisSnapshot,
+	value: T,
+	send: impl FnOnce(T),
+) {
+	if docs.revision() == snapshot.document_revision
+		&& docs.version(uri) == Some(snapshot.document_version)
+	{
+		send(value);
+	}
+}
+
+pub fn publish_completion_if_current<T>(
+	docs: &DocumentStore,
+	uri: &Uri,
+	snapshot: &CompletionSnapshot,
 	value: T,
 	send: impl FnOnce(T),
 ) {

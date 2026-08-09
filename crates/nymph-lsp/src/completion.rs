@@ -1,6 +1,8 @@
-//! `textDocument/completion`: a conservative MVP — in-scope identifiers
-//! (locals/params visible at the cursor, plus every top-level declaration
-//! name) and the language's keywords, ranked exact-prefix-first.
+//! `textDocument/completion`: non-member names visible at the cursor, ranked
+//! by lexical scope, resolved project imports, same-module declarations, then
+//! keywords. Project requests consume the compiler's immutable analysis
+//! snapshot, so dependency overlays, import visibility, and aliases stay under
+//! compiler/sema ownership. Loose files retain lexical/same-file completion.
 //!
 //! Member completion after a `.` (fields/methods available on a receiver's
 //! type) needs the checker's member resolution (`InherentRegistry`, built
@@ -16,7 +18,8 @@ use lsp_types::{CompletionItem, CompletionItemKind, CompletionParams, Completion
 use nymph_ast::decl::Declaration;
 
 use crate::{
-	document_store::DocumentStore, line_index::LineIndex, position::query_with_whitespace_left_bias,
+	compiler_state::CompletionSnapshot, document_store::DocumentStore, line_index::LineIndex,
+	position::query_with_whitespace_left_bias,
 };
 
 /// Every keyword in the surface grammar (`nymph_syntax`'s `keyword_or_ident`
@@ -70,8 +73,41 @@ const KEYWORDS: &[&str] = &[
 /// a `.` — see the module doc comment).
 pub fn completion(docs: &DocumentStore, params: &CompletionParams) -> Option<CompletionResponse> {
 	let uri = &params.text_document_position.text_document.uri;
-	let position = params.text_document_position.position;
 	let doc = docs.get(uri)?;
+	let parsed = nymph_syntax::parse_module(&doc.text, uri.path().as_str());
+	Some(complete(&doc.text, &parsed.tree, &[], params))
+}
+
+/// Complete from one immutable, revision-tagged project analysis snapshot.
+#[must_use]
+pub fn completion_snapshot(
+	snapshot: &CompletionSnapshot,
+	params: &CompletionParams,
+) -> CompletionResponse {
+	let parsed = nymph_syntax::parse_module(
+		&snapshot.source,
+		params
+			.text_document_position
+			.text_document
+			.uri
+			.path()
+			.as_str(),
+	);
+	complete(
+		&snapshot.source,
+		&parsed.tree,
+		&snapshot.imported_names,
+		params,
+	)
+}
+
+fn complete(
+	text: &str,
+	module: &nymph_ast::decl::Module,
+	imported_names: &[nymph_sema::query::ImportedName],
+	params: &CompletionParams,
+) -> CompletionResponse {
+	let position = params.text_document_position.position;
 
 	let triggered_by_dot = params
 		.context
@@ -79,77 +115,123 @@ pub fn completion(docs: &DocumentStore, params: &CompletionParams) -> Option<Com
 		.and_then(|c| c.trigger_character.as_deref())
 		== Some(".");
 	if triggered_by_dot {
-		return Some(CompletionResponse::Array(Vec::new()));
+		return CompletionResponse::Array(Vec::new());
 	}
 
-	let parsed = nymph_syntax::parse_module(&doc.text, uri.path().as_str());
-	let index = LineIndex::new(&doc.text);
-	let offset = index.offset(&doc.text, position);
-	let prefix = identifier_prefix(&doc.text, offset);
+	let index = LineIndex::new(text);
+	let offset = index.offset(text, position);
+	let (prefix, prefix_scope_offset) = identifier_prefix(text, offset);
 
 	let mut items = Vec::new();
 	let mut seen: HashSet<String> = HashSet::new();
 
 	// Locals/params in scope, innermost (nearest shadowing candidate) first.
-	let scope_names = query_with_whitespace_left_bias(&doc.text, offset, |candidate| {
-		nymph_sema::query::scope_names_at_exact(&parsed.tree, candidate)
+	let scope_names = query_with_whitespace_left_bias(text, offset, |candidate| {
+		nymph_sema::query::scope_names_at_exact(module, candidate)
+	})
+	.or_else(|| {
+		prefix_scope_offset
+			.and_then(|candidate| nymph_sema::query::scope_names_at_exact(module, candidate))
 	})
 	.unwrap_or_default();
-	for name in scope_names {
-		if seen.insert(name.clone()) {
-			items.push(CompletionItem {
-				label: name,
-				kind: Some(CompletionItemKind::VARIABLE),
-				..Default::default()
-			});
-		}
-	}
+	push_tier(
+		&mut items,
+		&mut seen,
+		scope_names
+			.into_iter()
+			.map(|name| (name, CompletionItemKind::VARIABLE)),
+		&prefix,
+		0,
+	);
+
+	push_tier(
+		&mut items,
+		&mut seen,
+		imported_names
+			.iter()
+			.map(|imported| (imported.name.clone(), imported_kind(imported.kind))),
+		&prefix,
+		1,
+	);
 
 	// Top-level declarations, with a proper kind each.
-	for (name, kind) in top_level_items(&parsed.tree) {
-		if seen.insert(name.clone()) {
-			items.push(CompletionItem {
-				label: name,
-				kind: Some(kind),
-				..Default::default()
-			});
-		}
-	}
+	push_tier(&mut items, &mut seen, top_level_items(module), &prefix, 2);
 
-	// Keywords last — locals and top-level names are more likely to be
-	// what's wanted, so they get first crack at the sort's tie-breaks below.
-	for kw in KEYWORDS {
-		if seen.insert((*kw).to_string()) {
-			items.push(CompletionItem {
-				label: (*kw).to_string(),
-				kind: Some(CompletionItemKind::KEYWORD),
-				..Default::default()
-			});
-		}
-	}
+	push_tier(
+		&mut items,
+		&mut seen,
+		KEYWORDS
+			.iter()
+			.map(|keyword| ((*keyword).to_string(), CompletionItemKind::KEYWORD)),
+		&prefix,
+		3,
+	);
 
-	if !prefix.is_empty() {
-		items.retain(|item| item.label.starts_with(prefix.as_str()));
-	}
-	// Exact-prefix matches first (all of them are, post-retain, so this is
-	// really just a stable alphabetical order — kept as its own sort step
-	// since a future relevance signal, e.g. preferring locals, would slot in
-	// here without disturbing the rest).
-	items.sort_by(|a, b| a.label.cmp(&b.label));
-
-	Some(CompletionResponse::Array(items))
+	CompletionResponse::Array(items)
 }
 
-/// The identifier characters immediately before `offset`, i.e. the partial
-/// word being typed — ASCII-only, matching every keyword and every
-/// user-declared name in the surface grammar.
-fn identifier_prefix(text: &str, offset: usize) -> String {
-	let bytes = text.as_bytes();
-	let mut start = offset.min(bytes.len());
-	while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
-		start -= 1;
+fn push_tier(
+	items: &mut Vec<CompletionItem>,
+	seen: &mut HashSet<String>,
+	candidates: impl IntoIterator<Item = (String, CompletionItemKind)>,
+	prefix: &str,
+	rank: u8,
+) {
+	let mut tier = candidates
+		.into_iter()
+		.filter(|(name, _)| prefix.is_empty() || name.starts_with(prefix))
+		.filter(|(name, _)| seen.insert(name.clone()))
+		.map(|(label, kind)| CompletionItem {
+			sort_text: Some(format!("{rank}:{label}")),
+			label,
+			kind: Some(kind),
+			..Default::default()
+		})
+		.collect::<Vec<_>>();
+	tier.sort_by(|left, right| left.label.cmp(&right.label));
+	items.extend(tier);
+}
+
+fn imported_kind(kind: nymph_sema::query::ImportedNameKind) -> CompletionItemKind {
+	use nymph_sema::query::ImportedNameKind;
+	match kind {
+		ImportedNameKind::Function => CompletionItemKind::FUNCTION,
+		ImportedNameKind::Value => CompletionItemKind::CONSTANT,
+		ImportedNameKind::Variable => CompletionItemKind::VARIABLE,
+		ImportedNameKind::TypeAlias => CompletionItemKind::CLASS,
+		ImportedNameKind::Struct => CompletionItemKind::STRUCT,
+		ImportedNameKind::Enum => CompletionItemKind::ENUM,
+		ImportedNameKind::Interface => CompletionItemKind::INTERFACE,
+		ImportedNameKind::Namespace => CompletionItemKind::MODULE,
+		ImportedNameKind::Variant => CompletionItemKind::ENUM_MEMBER,
 	}
-	text[start..offset.min(bytes.len())].to_string()
+}
+
+/// The lexer-recognized identifier characters immediately before `offset`,
+/// plus a scalar position inside that token for completion's half-open scope
+/// retry. This intentionally reuses the language's Unicode identifier rules.
+fn identifier_prefix(text: &str, offset: usize) -> (String, Option<usize>) {
+	let offset = offset.min(text.len());
+	let Some(token) = nymph_syntax::lex(text)
+		.tokens
+		.into_iter()
+		.find(|token| token.1.start < offset && offset <= token.1.end)
+	else {
+		return (String::new(), None);
+	};
+	let lexeme = &text[token.1.start..token.1.end];
+	if !matches!(token.0, nymph_ast::token::Token::Identifier(_))
+		&& lexeme != "_"
+		&& !KEYWORDS.contains(&lexeme)
+	{
+		return (String::new(), None);
+	}
+	let prefix = &text[token.1.start..offset];
+	let scope_offset = prefix
+		.char_indices()
+		.next_back()
+		.map(|(relative, _)| token.1.start + relative);
+	(prefix.to_string(), scope_offset)
 }
 
 /// Every top-level declaration's own name and a matching [`CompletionItemKind`]
@@ -268,6 +350,32 @@ mod tests {
 			!labels.contains(&"func".to_string()),
 			"keyword `func` doesn't start with `fi`"
 		);
+	}
+
+	#[test]
+	fn completes_a_parameter_at_the_half_open_end_of_a_typed_prefix() {
+		let uri: Uri = "file:///complete_parameter_prefix.nym".parse().unwrap();
+		let text = "func main(parameter: int): int = par";
+		let docs = docs_with(&uri, text);
+		let character = text.encode_utf16().count() as u32;
+
+		let result = completion(&docs, &params(&uri, 0, character, None));
+		let labels = labels(result.expect("document is open"));
+
+		assert!(labels.contains(&"parameter".to_string()), "got {labels:?}");
+	}
+
+	#[test]
+	fn filters_with_an_astral_unicode_identifier_prefix() {
+		let uri: Uri = "file:///complete_unicode_prefix.nym".parse().unwrap();
+		let text = "func 𝔘value(): int = 1\nfunc main(): int = 𝔘v";
+		let docs = docs_with(&uri, text);
+		let character = text.lines().last().unwrap().encode_utf16().count() as u32;
+
+		let result = completion(&docs, &params(&uri, 1, character, None));
+		let labels = labels(result.expect("document is open"));
+
+		assert_eq!(labels, vec!["𝔘value".to_string()]);
 	}
 
 	#[test]
