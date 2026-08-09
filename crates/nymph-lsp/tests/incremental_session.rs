@@ -501,6 +501,47 @@ fn loose_file_hover_uses_library_mode_with_the_ambient_prelude() {
 }
 
 #[test]
+fn loose_files_in_one_directory_remain_isolated_when_both_are_open() {
+	let temp = tempfile::tempdir().unwrap();
+	let main_uri = uri(&temp.path().join("main.nym"));
+	let dependency_uri = uri(&temp.path().join("dependency.nym"));
+	let main_source =
+		"import @/dependency with (value)\nfunc use(): Option<int> = Some(value = value())";
+	let dependency_source = "public func value(): int = 1";
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+
+	compiler
+		.open(&mut docs, main_uri.clone(), main_source.into(), 1)
+		.unwrap();
+	let before = compiler.diagnostics_for_uri(&docs, &main_uri).unwrap();
+	assert!(
+		before
+			.iter()
+			.any(|diagnostic| diagnostic.diag.code == "IMPORT-UNRESOLVED")
+	);
+	assert!(compiler.analysis_for_uri(&docs, &main_uri).is_none());
+
+	let affected = compiler
+		.open(
+			&mut docs,
+			dependency_uri.clone(),
+			dependency_source.into(),
+			1,
+		)
+		.unwrap();
+	assert_eq!(affected, vec![dependency_uri]);
+	let after = compiler.diagnostics_for_uri(&docs, &main_uri).unwrap();
+	assert!(
+		after
+			.iter()
+			.any(|diagnostic| diagnostic.diag.code == "IMPORT-UNRESOLVED"),
+		"opening a loose sibling must not create a project import graph: {after:?}"
+	);
+	assert!(compiler.analysis_for_uri(&docs, &main_uri).is_none());
+}
+
+#[test]
 fn private_unresolved_and_malformed_project_hover_return_none_without_panicking() {
 	let temp = tempfile::tempdir().unwrap();
 	fs::write(

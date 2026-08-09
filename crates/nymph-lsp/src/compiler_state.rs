@@ -363,11 +363,19 @@ impl CompilerState {
 		};
 		self.manifest_errors.remove(uri);
 		let root = std::path::absolute(root)?;
+		// A manifest project shares one source graph at its source root. A
+		// loose file is deliberately its own one-module project, even when
+		// sibling loose files in the same directory are open.
+		let project_key = if scan_disk {
+			root.clone()
+		} else {
+			std::path::absolute(&path)?
+		};
 		let without_prelude = nymph_compiler::is_stdlib_source_path(&path);
 		let project = self
 			.workspaces
-			.entry(root.clone())
-			.or_insert_with(|| ProjectId::new(root.to_string_lossy().into_owned()))
+			.entry(project_key.clone())
+			.or_insert_with(|| ProjectId::new(project_key.to_string_lossy().into_owned()))
 			.clone();
 		let identity = DocumentIdentity {
 			project: project.clone(),
@@ -397,9 +405,9 @@ impl CompilerState {
 			let Some(open_identity) = self.documents.get(open_uri).cloned() else {
 				continue;
 			};
-			if open_identity.root == root {
+			if open_identity.project == project {
 				self.session_mut(open_identity.without_prelude).set_source(
-					project.clone(),
+					open_identity.project,
 					open_identity.module.clone(),
 					document.text.clone(),
 					SourceVersion(i64::from(document.version)),
