@@ -1518,10 +1518,10 @@ fn nominal_parent_role(
 	let ExprKind::Identifier(name) = &parent.kind else {
 		return None;
 	};
-	if let Some(decl_span) = nymph_sema::query::definition_at(&analysis.module, parent.span.start)
-		&& let Some(&(ty, _)) = decls.get(&decl_span.start)
-	{
-		return matches!(ty, TYPE | NAMESPACE).then_some((ty, 0));
+	if let Some(decl_span) = nymph_sema::query::definition_at(&analysis.module, parent.span.start) {
+		return decls
+			.get(&decl_span.start)
+			.and_then(|&(ty, _)| matches!(ty, TYPE | NAMESPACE).then_some((ty, 0)));
 	}
 	nymph_sema::query::definition_kind_by_name(analysis, &name.0)
 		.map(definition_kind_role)
@@ -2229,6 +2229,21 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 		let offset = text.rfind("Box.get()").unwrap();
 		let (line, col) = line_col(text, offset);
 		assert_eq!(find(&decoded, line, col).type_name, "parameter");
+		assert_eq!(
+			find(&decoded, line, col + "Box.".len() as u32).type_name,
+			"method"
+		);
+	}
+
+	#[test]
+	fn a_destructured_value_receiver_shadowing_a_nominal_stays_a_variable() {
+		let text = "struct Box(value: int) {\n  func get(): int = this.value\n}\nfunc read(#(Box, ignored): #(Box, int)): int = Box.get()";
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		let offset = text.rfind("Box.get()").unwrap();
+		let (line, col) = line_col(text, offset);
+		assert_eq!(find(&decoded, line, col).type_name, "variable");
 		assert_eq!(
 			find(&decoded, line, col + "Box.".len() as u32).type_name,
 			"method"
