@@ -296,6 +296,22 @@ impl CompilerState {
 		let Some(root) = manifest.parent() else {
 			return Ok(());
 		};
+		let roots_to_rescan: HashSet<_> = self
+			.documents
+			.iter()
+			.filter(|(uri, identity)| {
+				docs.get(uri).is_some()
+					&& matches!(identity.kind, DocumentKind::Project(_))
+					&& (manifest.starts_with(&identity.root)
+						|| workspace::uri_to_path(uri)
+							.and_then(|path| std::path::absolute(path).ok())
+							.is_some_and(|path| path.starts_with(root)))
+			})
+			.map(|(_, identity)| identity.root.clone())
+			.collect();
+		for source_root in &roots_to_rescan {
+			self.synchronized_roots.remove(source_root);
+		}
 		let authoritative_uris: HashSet<_> = self
 			.authoritative_overlays
 			.values()
@@ -333,6 +349,44 @@ impl CompilerState {
 				affected,
 			});
 		}
+		// A nested manifest also changes which sources belong to an enclosing
+		// project even when that project's open entry lies outside the nested
+		// directory. Reconcile one open representative for every such root.
+		let mut representatives: Vec<_> = self
+			.documents
+			.iter()
+			.filter(|(uri, identity)| {
+				docs.get(uri).is_some()
+					&& matches!(identity.kind, DocumentKind::Project(_))
+					&& roots_to_rescan.contains(&identity.root)
+					&& !self.synchronized_roots.contains(&identity.root)
+			})
+			.map(|(uri, identity)| (identity.root.clone(), uri.clone()))
+			.collect();
+		representatives.sort_by(|(left_root, left_uri), (right_root, right_uri)| {
+			left_root
+				.cmp(right_root)
+				.then_with(|| {
+					authoritative_uris
+						.contains(right_uri.as_str())
+						.cmp(&authoritative_uris.contains(left_uri.as_str()))
+				})
+				.then_with(|| left_uri.as_str().cmp(right_uri.as_str()))
+		});
+		representatives.dedup_by(|left, right| left.0 == right.0);
+		for (_, uri) in representatives {
+			let mut affected = self.affected_project_documents(docs, &uri);
+			self.synchronize(docs, &uri)?;
+			for current in self.affected_project_documents(docs, &uri) {
+				if !affected.contains(&current) {
+					affected.push(current);
+				}
+			}
+			refreshes.push(WatchedFileRefresh {
+				origin: uri,
+				affected,
+			});
+		}
 		Ok(())
 	}
 
@@ -342,14 +396,23 @@ impl CompilerState {
 		path: &std::path::Path,
 		refreshes: &mut Vec<WatchedFileRefresh>,
 	) -> anyhow::Result<()> {
+		let Some(event_root) = workspace::detect(path)
+			.ok()
+			.flatten()
+			.and_then(|project| std::path::absolute(project.src_root).ok())
+		else {
+			return Ok(());
+		};
 		let mut roots: Vec<_> = self
 			.documents
-			.values()
-			.filter(|identity| {
-				matches!(identity.kind, DocumentKind::Project(_))
+			.iter()
+			.filter(|(uri, identity)| {
+				docs.get(uri).is_some()
+					&& identity.root == event_root
+					&& matches!(identity.kind, DocumentKind::Project(_))
 					&& self.synchronized_roots.contains(&identity.root)
 			})
-			.filter_map(|identity| {
+			.filter_map(|(_, identity)| {
 				let module = nymph_project::module_from_file(&identity.root, path).ok()?;
 				Some((
 					identity.root.clone(),
@@ -384,6 +447,11 @@ impl CompilerState {
 			self
 				.documents
 				.entry(disk_uri.clone())
+				.and_modify(|current| {
+					if docs.get(&disk_uri).is_none() {
+						*current = identity.clone();
+					}
+				})
 				.or_insert(identity.clone());
 			let origin = self
 				.publication_uri(docs, &identity, &module)
@@ -539,7 +607,13 @@ impl CompilerState {
 		uri: &Uri,
 		identity: &DocumentIdentity,
 	) {
-		if matches!(identity.kind, DocumentKind::Project(_)) {
+		let root_still_open = self.documents.iter().any(|(candidate_uri, candidate)| {
+			candidate_uri != uri
+				&& docs.get(candidate_uri).is_some()
+				&& matches!(candidate.kind, DocumentKind::Project(_))
+				&& candidate.root == identity.root
+		});
+		if matches!(identity.kind, DocumentKind::Project(_)) && !root_still_open {
 			self.synchronized_roots.remove(&identity.root);
 		}
 		let module_identity = identity.module_identity();
@@ -1033,7 +1107,15 @@ impl CompilerState {
 					};
 					self.set_effective_source(&disk_identity.module_identity(), source, SourceVersion(0));
 					if let Some(disk_uri) = workspace::path_to_uri(&path) {
-						self.documents.entry(disk_uri).or_insert(disk_identity);
+						self
+							.documents
+							.entry(disk_uri.clone())
+							.and_modify(|current| {
+								if docs.get(&disk_uri).is_none() {
+									*current = disk_identity.clone();
+								}
+							})
+							.or_insert(disk_identity);
 					}
 				}
 			}
@@ -1102,6 +1184,9 @@ fn nymph_files(root: &std::path::Path) -> anyhow::Result<Vec<(PathBuf, ModulePat
 		out: &mut Vec<(PathBuf, ModulePath)>,
 	) -> anyhow::Result<()> {
 		if !dir.is_dir() {
+			return Ok(());
+		}
+		if dir != root && dir.join("nymph.toml").try_exists()? {
 			return Ok(());
 		}
 		for entry in fs::read_dir(dir)? {

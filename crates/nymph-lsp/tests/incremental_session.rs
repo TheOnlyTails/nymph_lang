@@ -1537,6 +1537,184 @@ fn watched_manifest_recovery_does_not_restore_deleted_unopened_module() {
 }
 
 #[test]
+fn watched_source_root_transition_replaces_closed_module_identities() {
+	let temp = tempfile::tempdir().unwrap();
+	let manifest_path = temp.path().join("nymph.toml");
+	fs::write(
+		&manifest_path,
+		"[package]\nname='root-transition'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir_all(temp.path().join("src/new")).unwrap();
+	let main_path = temp.path().join("src/new/main.nym");
+	let dep_path = temp.path().join("src/new/dep.nym");
+	let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+	fs::write(&main_path, main_source).unwrap();
+	fs::write(&dep_path, "public func value(): int = 1").unwrap();
+	let main_uri = uri(&main_path);
+	let dep_uri = uri(&dep_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), main_source.into(), 1)
+		.unwrap();
+
+	fs::write(
+		&manifest_path,
+		"[package]\nname='root-transition'\nversion='0.1.0'\nsrc='src/new'\n",
+	)
+	.unwrap();
+	compiler
+		.watched_files_changed(&mut docs, &[uri(&manifest_path)])
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.is_empty()
+	);
+
+	fs::write(&dep_path, "public func value(): int = true").unwrap();
+	let refreshes = compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&dep_uri))
+		.unwrap();
+	assert!(
+		refreshes
+			.iter()
+			.flat_map(|refresh| &refresh.affected)
+			.any(|affected| affected == &main_uri),
+		"the transitioned dependency identity lost its reverse importer"
+	);
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.iter()
+			.any(|diagnostic| diagnostic.module == "dep" && diagnostic.diag.is_error())
+	);
+}
+
+#[test]
+fn watched_source_root_error_and_recovery_rescan_deleted_modules() {
+	let temp = tempfile::tempdir().unwrap();
+	let manifest_path = temp.path().join("nymph.toml");
+	let manifest = "[package]\nname='root-recovery'\nversion='0.1.0'\n";
+	fs::write(&manifest_path, manifest).unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+	fs::write(&main_path, main_source).unwrap();
+	fs::write(&dep_path, "public func value(): int = 1").unwrap();
+	let main_uri = uri(&main_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), main_source.into(), 1)
+		.unwrap();
+
+	fs::write(
+		&manifest_path,
+		"[package]\nname='root-recovery'\nversion='0.1.0'\nsrc='lib'\n",
+	)
+	.unwrap();
+	compiler
+		.watched_files_changed(&mut docs, &[uri(&manifest_path)])
+		.unwrap();
+	assert!(compiler.has_manifest_error(&main_uri));
+	fs::remove_file(&dep_path).unwrap();
+	fs::write(&manifest_path, manifest).unwrap();
+	compiler
+		.watched_files_changed(&mut docs, &[uri(&manifest_path)])
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.iter()
+			.any(|diagnostic| diagnostic.diag.code == "IMPORT-UNRESOLVED"),
+		"recovery reused the source graph from before the invalid source root"
+	);
+}
+
+#[test]
+fn watched_nested_manifest_preserves_outer_refresh_and_isolates_inner_sources() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='outer'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	let outer_src = temp.path().join("src");
+	let inner_root = outer_src.join("child");
+	let inner_src = inner_root.join("src");
+	fs::create_dir_all(&inner_src).unwrap();
+	let outer_main_path = outer_src.join("main.nym");
+	let outer_dep_path = outer_src.join("outer_dep.nym");
+	let inner_main_path = inner_src.join("main.nym");
+	let inner_dep_path = inner_src.join("dep.nym");
+	let outer_main = "import @/child/src/dep with (child_value)\nimport @/outer_dep with (outer_value)\nfunc use(): int = outer_value()";
+	let inner_main = "import @/dep with (value)\nfunc use(): int = value()";
+	fs::write(&outer_main_path, outer_main).unwrap();
+	fs::write(&outer_dep_path, "public func outer_value(): int = 1").unwrap();
+	fs::write(&inner_main_path, inner_main).unwrap();
+	fs::write(&inner_dep_path, "public func value(): int = 1").unwrap();
+	let outer_main_uri = uri(&outer_main_path);
+	let outer_dep_uri = uri(&outer_dep_path);
+	let inner_main_uri = uri(&inner_main_path);
+	let inner_dep_uri = uri(&inner_dep_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, outer_main_uri.clone(), outer_main.into(), 1)
+		.unwrap();
+	compiler
+		.open(&mut docs, inner_main_uri.clone(), inner_main.into(), 1)
+		.unwrap();
+
+	let inner_manifest = inner_root.join("nymph.toml");
+	fs::write(
+		&inner_manifest,
+		"[package]\nname='inner'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	compiler
+		.watched_files_changed(&mut docs, &[uri(&inner_manifest)])
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &outer_main_uri)
+			.unwrap()
+			.iter()
+			.any(|diagnostic| diagnostic.diag.code == "IMPORT-UNRESOLVED"),
+		"the enclosing project retained a source now owned by the nested manifest"
+	);
+
+	fs::write(&inner_dep_path, "public func value(): float = 1.0").unwrap();
+	let inner_refreshes = compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&inner_dep_uri))
+		.unwrap();
+	let inner_affected: Vec<_> = inner_refreshes
+		.iter()
+		.flat_map(|refresh| &refresh.affected)
+		.collect();
+	assert!(inner_affected.contains(&&inner_main_uri));
+	assert!(!inner_affected.contains(&&outer_main_uri));
+
+	fs::write(&outer_dep_path, "public func outer_value(): int = true").unwrap();
+	let outer_refreshes = compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&outer_dep_uri))
+		.unwrap();
+	assert!(
+		outer_refreshes
+			.iter()
+			.flat_map(|refresh| &refresh.affected)
+			.any(|affected| affected == &outer_main_uri),
+		"the nested transition disabled the still-open enclosing project"
+	);
+}
+
+#[test]
 fn watched_filesystem_revision_rejects_pre_event_snapshot_publication() {
 	let temp = tempfile::tempdir().unwrap();
 	let path = temp.path().join("loose.nym");
