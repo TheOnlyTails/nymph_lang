@@ -190,6 +190,48 @@ mod tests {
 	}
 
 	#[test]
+	fn constructor_and_shorthand_pattern_fields_keep_checker_owned_member_identity() {
+		let source = "struct Point(x: int)\nfunc read(point: Point): int = match (point) { Point(x) -> x }\nfunc make(): Point = Point(x = 1)";
+		let (_temp, uri, docs, state) = project(&[("main.nym", source)], "main.nym");
+
+		let field_cursor = position_of(source, "x", 3);
+		let fields = locations(
+			&docs,
+			&state,
+			&params(&uri, field_cursor.line, field_cursor.character, true),
+		)
+		.expect("named constructor label resolves to the declared field");
+		assert_eq!(
+			fields
+				.iter()
+				.map(|location| location.range.start)
+				.collect::<Vec<_>>(),
+			vec![
+				position_of(source, "x", 0),
+				position_of(source, "x", 1),
+				position_of(source, "x", 3),
+			],
+			"field declaration, shorthand field, and constructor label"
+		);
+
+		let local_cursor = position_of(source, "x", 2);
+		let local = locations(
+			&docs,
+			&state,
+			&params(&uri, local_cursor.line, local_cursor.character, true),
+		)
+		.expect("shorthand binding use resolves to its local declaration");
+		assert_eq!(
+			local
+				.iter()
+				.map(|location| location.range.start)
+				.collect::<Vec<_>>(),
+			vec![position_of(source, "x", 1), position_of(source, "x", 2),],
+			"field identity must not absorb the shorthand's local binding"
+		);
+	}
+
+	#[test]
 	fn project_references_include_aliases_unopened_importers_and_exact_declaration_policy() {
 		let (_temp, main_uri, docs, state) = project(
 			&[

@@ -1825,10 +1825,17 @@ impl<'m> Checker<'m> {
 		// Construction commits the exact obligations returned with the same
 		// substitution used for the fields below. Pattern callers intentionally
 		// leave those obligations undeferred.
-		let fields: Vec<(EcoString, Ty)> = sig
+		let fields: Vec<(EcoString, Ty, Option<crate::DefinitionId>)> = sig
 			.fields
 			.iter()
-			.map(|(n, t)| (n.clone(), self.subst(*t, &subst, None)))
+			.zip(&sig.field_metadata)
+			.map(|((n, t), metadata)| {
+				(
+					n.clone(),
+					self.subst(*t, &subst, None),
+					metadata.target.clone(),
+				)
+			})
 			.collect();
 		self.check_ctor_args(&fields, args);
 		adt
@@ -1869,10 +1876,17 @@ impl<'m> Checker<'m> {
 		let sig = self.sigs.enums[&enum_def].clone();
 		// Same reasoning as `infer_struct_ctor` above, for the enum's own bounds.
 		let vsig = sig.variants[variant].clone();
-		let fields: Vec<(EcoString, Ty)> = vsig
+		let fields: Vec<(EcoString, Ty, Option<crate::DefinitionId>)> = vsig
 			.fields
 			.iter()
-			.map(|(n, t)| (n.clone(), self.subst(*t, &subst, None)))
+			.zip(&vsig.field_metadata)
+			.map(|((n, t), metadata)| {
+				(
+					n.clone(),
+					self.subst(*t, &subst, None),
+					metadata.target.clone(),
+				)
+			})
 			.collect();
 		self.check_ctor_args(&fields, args);
 		adt
@@ -1880,12 +1894,21 @@ impl<'m> Checker<'m> {
 
 	/// Check constructor arguments against declared fields, by label when present
 	/// else positionally.
-	fn check_ctor_args(&mut self, fields: &[(EcoString, Ty)], args: &[Spanned<CallArg>]) {
+	fn check_ctor_args(
+		&mut self,
+		fields: &[(EcoString, Ty, Option<crate::DefinitionId>)],
+		args: &[Spanned<CallArg>],
+	) {
 		for (i, arg) in args.iter().enumerate() {
 			let call = &arg.0;
 			let target = if let Some(label) = &call.name {
-				match fields.iter().find(|(n, _)| n == &label.0) {
-					Some((_, ty)) => Some(*ty),
+				match fields.iter().find(|(n, ..)| n == &label.0) {
+					Some((_, ty, definition)) => {
+						self
+							.annotations
+							.record_source_definition_target(label.1, definition.as_ref());
+						Some(*ty)
+					}
 					None => {
 						self.emit(
 							label.1,
@@ -1898,7 +1921,7 @@ impl<'m> Checker<'m> {
 				}
 			} else {
 				match fields.get(i) {
-					Some((_, ty)) => Some(*ty),
+					Some((_, ty, _)) => Some(*ty),
 					None => {
 						self.emit(call.value.span, TypeError::TooManyFields);
 						None

@@ -486,7 +486,12 @@ impl Checker<'_> {
 					}
 				}
 				StructPatternField::Named(name) => match field_tys.iter().find(|(n, _, _)| n == &name.0) {
-					Some((_, fty, _)) => self.define_local(name.0.clone(), name.1, *fty, mutable),
+					Some((_, fty, target)) => {
+						self
+							.annotations
+							.record_source_definition_target(name.1, target.as_ref());
+						self.define_local(name.0.clone(), name.1, *fty, mutable);
+					}
 					// Not a field of this constructor. On a SINGLE-field constructor a bare
 					// identifier is a positional sub-pattern against that sole field — a plain
 					// binding (`Ok(command)`) or a nullary-variant pattern (`Ok(None)`). Reuse
