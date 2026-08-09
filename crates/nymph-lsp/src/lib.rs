@@ -1,6 +1,6 @@
 //! The Nymph language server: a synchronous `lsp-server` loop (no
 //! tokio/async — the compiler facade it wraps is synchronous) providing
-//! diagnostics, hover, document symbols, go-to-definition, and completion
+//! diagnostics, hover, document/workspace symbols, go-to-definition, and completion
 //! over stdio, spawned by the VS Code extension (`extension/src/extension.ts`)
 //! from its target-specific packaged payload.
 //!
@@ -18,7 +18,9 @@
 //! `textDocument/completion` offers lexical names, resolved project imports,
 //! same-module declarations, and keywords from an immutable analysis snapshot
 //! (see [`completion`] — member completion after a `.` is deferred, see its
-//! module doc comment); `textDocument/semanticTokens/full` classifies every
+//! module doc comment); `workspace/symbol` ranks visible declarations across
+//! synchronized project modules (see [`workspace_symbols`]);
+//! `textDocument/semanticTokens/full` classifies every
 //! token from the compiler's own lexer + AST, so highlighting stays correct
 //! independent of the TextMate grammar (see [`semantic_tokens`]).
 //! Incremental sync and rename are deliberately out of scope. Document and
@@ -36,6 +38,7 @@ pub mod line_index;
 mod position;
 pub mod semantic_tokens;
 pub mod workspace;
+pub mod workspace_symbols;
 
 use std::sync::{Arc, Mutex};
 
@@ -47,13 +50,13 @@ use lsp_types::{
 	DocumentSymbolParams, GotoDefinitionParams, HoverParams, HoverProviderCapability,
 	InitializeParams, InitializeResult, OneOf, SemanticTokensFullOptions, SemanticTokensOptions,
 	SemanticTokensParams, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-	TextDocumentSyncCapability, TextDocumentSyncKind,
+	TextDocumentSyncCapability, TextDocumentSyncKind, WorkspaceSymbolParams,
 	notification::{
 		DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _,
 	},
 	request::{
 		Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, RangeFormatting,
-		Request as _, SemanticTokensFullRequest,
+		Request as _, SemanticTokensFullRequest, WorkspaceSymbolRequest,
 	},
 };
 
@@ -68,6 +71,7 @@ pub fn server_capabilities() -> ServerCapabilities {
 		text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
 		hover_provider: Some(HoverProviderCapability::Simple(true)),
 		document_symbol_provider: Some(OneOf::Left(true)),
+		workspace_symbol_provider: Some(OneOf::Left(true)),
 		document_formatting_provider: Some(OneOf::Left(true)),
 		document_range_formatting_provider: Some(OneOf::Left(true)),
 		definition_provider: Some(OneOf::Left(true)),
@@ -195,7 +199,20 @@ fn main_loop(
 				if connection.handle_shutdown(&req)? {
 					return Ok(());
 				}
-				if req.method == HoverRequest::METHOD {
+				if req.method == WorkspaceSymbolRequest::METHOD {
+					let (id, params) =
+						req.extract::<WorkspaceSymbolParams>(WorkspaceSymbolRequest::METHOD)?;
+					let snapshot = {
+						let mut compiler = compiler.lock().unwrap();
+						let docs = docs.lock().unwrap();
+						compiler.refresh_workspace_symbols(&docs);
+						compiler.workspace_symbol_snapshot(&docs)
+					};
+					let result = workspace_symbols::workspace_symbols(&snapshot, &params);
+					connection
+						.sender
+						.send(Message::Response(Response::new_ok(id, result)))?;
+				} else if req.method == HoverRequest::METHOD {
 					let (id, params) = req.extract::<HoverParams>(HoverRequest::METHOD)?;
 					let uri = &params.text_document_position_params.text_document.uri;
 					let snapshot = compiler
@@ -1491,6 +1508,10 @@ mod tests {
 			Some(OneOf::Left(true))
 		);
 		assert_eq!(
+			result.capabilities.workspace_symbol_provider,
+			Some(OneOf::Left(true))
+		);
+		assert_eq!(
 			result.capabilities.document_formatting_provider,
 			Some(OneOf::Left(true))
 		);
@@ -2144,6 +2165,57 @@ mod tests {
 		let edit = &edits[0];
 		assert_eq!(edit.new_text, "alpha + beta");
 		assert_eq!(edit.range.start.character, 6);
+
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn workspace_symbol_request_round_trips_unopened_project_declarations() {
+		use lsp_types::{
+			WorkspaceSymbolResponse,
+			request::{Request as _, WorkspaceSymbolRequest},
+		};
+
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='wire-symbols'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let main_path = temp.path().join("src/main.nym");
+		std::fs::write(&main_path, "public func main(): void = {}").unwrap();
+		std::fs::write(
+			temp.path().join("src/unopened.nym"),
+			"public struct WireResult()",
+		)
+		.unwrap();
+		let uri = workspace::path_to_uri(&main_path).unwrap();
+
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		handshake(&client);
+		send_open(&client, uri.clone(), 1, "public func main(): void = {}");
+		recv_diagnostics_for(&client, &uri);
+
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(46),
+				WorkspaceSymbolRequest::METHOD.to_string(),
+				serde_json::json!({ "query": "WireResult" }),
+			)))
+			.unwrap();
+		let response = recv_response(&client, 46);
+		let result: Option<WorkspaceSymbolResponse> =
+			serde_json::from_value(response.response_result.unwrap()).unwrap();
+		let WorkspaceSymbolResponse::Flat(symbols) = result.unwrap() else {
+			panic!("expected flat workspace symbols");
+		};
+		assert_eq!(symbols.len(), 1);
+		assert_eq!(symbols[0].name, "WireResult");
+		assert_eq!(symbols[0].kind, lsp_types::SymbolKind::STRUCT);
+		assert_eq!(symbols[0].container_name.as_deref(), Some("unopened"));
 
 		shutdown(&client, handle);
 	}

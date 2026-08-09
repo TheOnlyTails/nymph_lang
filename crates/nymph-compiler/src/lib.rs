@@ -47,10 +47,10 @@ pub use project::documentation::{
 pub use project::{
 	AmbientCoreModuleKey, BuiltinRuntimeOwnerArtifact, BuiltinRuntimeOwnerShape, CompiledProject,
 	CompilerSession, ModuleAnalysis, ModulePath, ProjectDiagnostic, ProjectId, SourceVersion,
-	check_project, check_project_library, check_project_library_with_embedded_std,
-	check_project_library_with_std, check_project_with_embedded_std, check_project_with_std,
-	compile_project, compile_project_library, compile_project_library_with_std,
-	compile_project_with_std,
+	ToolingModuleDeclarations, check_project, check_project_library,
+	check_project_library_with_embedded_std, check_project_library_with_std,
+	check_project_with_embedded_std, check_project_with_std, compile_project,
+	compile_project_library, compile_project_library_with_std, compile_project_with_std,
 };
 pub use std_source::embedded_std_provider;
 

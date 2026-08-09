@@ -1589,6 +1589,7 @@ dependencies = [
  "nymph-syntax",
  "percent-encoding",
  "serde_json",
+ "strsim",
  "tempfile",
 ]
 

@@ -5,6 +5,7 @@
 
 use lsp_types::{DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Range, SymbolKind};
 use nymph_ast::decl::Declaration;
+use nymph_sema::DeclarationCategory;
 
 use crate::{document_store::DocumentStore, line_index::LineIndex};
 
@@ -55,6 +56,30 @@ fn make_symbol(
 	}
 }
 
+/// Shared semantic declaration-category to LSP symbol-kind mapping.
+#[must_use]
+pub(crate) fn symbol_kind(category: DeclarationCategory, mutable: bool) -> SymbolKind {
+	match category {
+		DeclarationCategory::Function => SymbolKind::FUNCTION,
+		DeclarationCategory::Method | DeclarationCategory::MethodBody => SymbolKind::METHOD,
+		DeclarationCategory::Let | DeclarationCategory::Static => {
+			if mutable {
+				SymbolKind::VARIABLE
+			} else {
+				SymbolKind::CONSTANT
+			}
+		}
+		DeclarationCategory::TypeAlias => SymbolKind::CLASS,
+		DeclarationCategory::Struct => SymbolKind::STRUCT,
+		DeclarationCategory::Enum => SymbolKind::ENUM,
+		DeclarationCategory::Interface => SymbolKind::INTERFACE,
+		DeclarationCategory::Namespace => SymbolKind::NAMESPACE,
+		DeclarationCategory::Variant => SymbolKind::ENUM_MEMBER,
+		DeclarationCategory::Field => SymbolKind::FIELD,
+		DeclarationCategory::Implementation => SymbolKind::OBJECT,
+	}
+}
+
 /// One top-level [`Declaration`] as a [`DocumentSymbol`], or `None` for
 /// declarations that introduce no named symbol of their own (`import`, and
 /// anonymous `impl`/`impl … for …` blocks — see `nymph_sema::def::build_def_map`,
@@ -66,7 +91,7 @@ fn decl_symbol(decl: &Declaration, text: &str, index: &LineIndex) -> Option<Docu
 			let full = index.range(text, meta.name.1.to(body.span));
 			Some(make_symbol(
 				&meta.name.0,
-				SymbolKind::FUNCTION,
+				symbol_kind(DeclarationCategory::Function, false),
 				full,
 				selection,
 				None,
@@ -76,7 +101,7 @@ fn decl_symbol(decl: &Declaration, text: &str, index: &LineIndex) -> Option<Docu
 			let selection = index.range(text, meta.name.1);
 			Some(make_symbol(
 				&meta.name.0,
-				SymbolKind::FUNCTION,
+				symbol_kind(DeclarationCategory::Function, false),
 				selection,
 				selection,
 				None,
@@ -86,21 +111,13 @@ fn decl_symbol(decl: &Declaration, text: &str, index: &LineIndex) -> Option<Docu
 			let name = meta.name.0.as_binding()?;
 			let selection = index.range(text, name.1);
 			let full = index.range(text, name.1.to(value.span));
-			let kind = if meta.is_mutable() {
-				SymbolKind::VARIABLE
-			} else {
-				SymbolKind::CONSTANT
-			};
+			let kind = symbol_kind(DeclarationCategory::Let, meta.is_mutable());
 			Some(make_symbol(&name.0, kind, full, selection, None))
 		}
 		Declaration::ExternalLet(_, _, meta) => {
 			let name = meta.name.0.as_binding()?;
 			let selection = index.range(text, name.1);
-			let kind = if meta.is_mutable() {
-				SymbolKind::VARIABLE
-			} else {
-				SymbolKind::CONSTANT
-			};
+			let kind = symbol_kind(DeclarationCategory::Let, meta.is_mutable());
 			Some(make_symbol(&name.0, kind, selection, selection, None))
 		}
 		Declaration::Struct { name, fields, .. } => {
@@ -113,7 +130,7 @@ fn decl_symbol(decl: &Declaration, text: &str, index: &LineIndex) -> Option<Docu
 					let field_selection = index.range(text, f.0.name.1);
 					make_symbol(
 						&f.0.name.0,
-						SymbolKind::FIELD,
+						symbol_kind(DeclarationCategory::Field, false),
 						field_selection,
 						field_selection,
 						None,
@@ -124,7 +141,7 @@ fn decl_symbol(decl: &Declaration, text: &str, index: &LineIndex) -> Option<Docu
 			let children = (!children.is_empty()).then_some(children);
 			Some(make_symbol(
 				&name.0,
-				SymbolKind::STRUCT,
+				symbol_kind(DeclarationCategory::Struct, false),
 				full,
 				selection,
 				children,
@@ -140,7 +157,7 @@ fn decl_symbol(decl: &Declaration, text: &str, index: &LineIndex) -> Option<Docu
 					let variant_selection = index.range(text, v.0.name.1);
 					make_symbol(
 						&v.0.name.0,
-						SymbolKind::ENUM_MEMBER,
+						symbol_kind(DeclarationCategory::Variant, false),
 						variant_selection,
 						variant_selection,
 						None,
@@ -151,7 +168,7 @@ fn decl_symbol(decl: &Declaration, text: &str, index: &LineIndex) -> Option<Docu
 			let children = (!children.is_empty()).then_some(children);
 			Some(make_symbol(
 				&name.0,
-				SymbolKind::ENUM,
+				symbol_kind(DeclarationCategory::Enum, false),
 				full,
 				selection,
 				children,
@@ -161,7 +178,7 @@ fn decl_symbol(decl: &Declaration, text: &str, index: &LineIndex) -> Option<Docu
 			let selection = index.range(text, name.1);
 			Some(make_symbol(
 				&name.0,
-				SymbolKind::INTERFACE,
+				symbol_kind(DeclarationCategory::Interface, false),
 				selection,
 				selection,
 				None,
@@ -171,7 +188,7 @@ fn decl_symbol(decl: &Declaration, text: &str, index: &LineIndex) -> Option<Docu
 			let selection = index.range(text, name.1);
 			Some(make_symbol(
 				&name.0,
-				SymbolKind::NAMESPACE,
+				symbol_kind(DeclarationCategory::Namespace, false),
 				selection,
 				selection,
 				None,
@@ -182,7 +199,7 @@ fn decl_symbol(decl: &Declaration, text: &str, index: &LineIndex) -> Option<Docu
 			let full = index.range(text, meta.name.1.to(value.1));
 			Some(make_symbol(
 				&meta.name.0,
-				SymbolKind::CLASS,
+				symbol_kind(DeclarationCategory::TypeAlias, false),
 				full,
 				selection,
 				None,
