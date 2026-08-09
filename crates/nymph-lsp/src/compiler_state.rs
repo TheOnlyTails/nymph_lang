@@ -626,6 +626,8 @@ impl CompilerState {
 		});
 		if matches!(identity.kind, DocumentKind::Project(_)) && !root_still_open {
 			self.synchronized_roots.remove(&identity.root);
+			self.retire_project(docs, uri, identity);
+			return;
 		}
 		let module_identity = identity.module_identity();
 		if let Some((open_uri, source, version)) =
@@ -639,6 +641,62 @@ impl CompilerState {
 			self.authoritative_overlays.remove(&module_identity);
 			self.remove_effective_source(&module_identity);
 		}
+	}
+
+	fn retire_project(&mut self, docs: &DocumentStore, uri: &Uri, identity: &DocumentIdentity) {
+		let retired_uris: HashSet<_> = self
+			.documents
+			.iter()
+			.filter(|(_, candidate)| candidate.project == identity.project)
+			.map(|(uri, _)| uri.as_str().to_string())
+			.collect();
+		let origin = uri.as_str().to_string();
+		let mut inherited_targets: BTreeSet<_> = self
+			.diagnostic_targets
+			.remove(&origin)
+			.unwrap_or_default()
+			.into_iter()
+			.collect();
+		for retired_uri in &retired_uris {
+			if retired_uri == &origin {
+				continue;
+			}
+			for target in self
+				.diagnostic_targets
+				.remove(retired_uri)
+				.unwrap_or_default()
+			{
+				if self
+					.diagnostic_owners
+					.get(&target)
+					.is_some_and(|owner| owner == retired_uri)
+				{
+					self
+						.diagnostic_owners
+						.insert(target.clone(), origin.clone());
+					inherited_targets.insert(target);
+				}
+			}
+		}
+		if !inherited_targets.is_empty() {
+			self
+				.diagnostic_targets
+				.insert(origin, inherited_targets.into_iter().collect());
+		}
+
+		let retired_modules: Vec<_> = self
+			.effective_sources
+			.keys()
+			.filter(|module| module.project == identity.project)
+			.cloned()
+			.collect();
+		for module in retired_modules {
+			self.authoritative_overlays.remove(&module);
+			self.remove_effective_source(&module);
+		}
+		self.documents.retain(|candidate_uri, candidate| {
+			candidate.project != identity.project || docs.get(candidate_uri).is_some()
+		});
 	}
 
 	pub fn analysis_for_uri(&self, docs: &DocumentStore, uri: &Uri) -> Option<AnalysisSnapshot> {

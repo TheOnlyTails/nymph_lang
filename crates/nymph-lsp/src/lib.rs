@@ -2168,6 +2168,82 @@ mod tests {
 	}
 
 	#[test]
+	fn watched_manifest_removal_clears_diagnostics_owned_by_a_retired_closed_module() {
+		let temp = tempfile::tempdir().unwrap();
+		let manifest_path = temp.path().join("nymph.toml");
+		std::fs::write(
+			&manifest_path,
+			"[package]\nname='wire-watch-retired'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let main_path = temp.path().join("src/main.nym");
+		let dep_path = temp.path().join("src/dep.nym");
+		let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+		std::fs::write(&main_path, main_source).unwrap();
+		std::fs::write(&dep_path, "public func value(): int = 1").unwrap();
+		let manifest_uri = workspace::path_to_uri(&manifest_path).unwrap();
+		let main_uri = workspace::path_to_uri(&main_path).unwrap();
+		let dep_uri = workspace::path_to_uri(&dep_path).unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		let registration = handshake_with_watchers(&client);
+		client
+			.sender
+			.send(Message::Response(Response::new_ok(
+				registration.id,
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		send_open(&client, main_uri.clone(), 1, main_source);
+		recv_diagnostics_for(&client, &main_uri);
+
+		std::fs::write(&dep_path, "public func value(): float = 1.0").unwrap();
+		send_watched_file(&client, dep_uri.clone());
+		let from_dep = barrier_diagnostics(&client, 99);
+		assert!(
+			from_dep
+				.iter()
+				.find(|params| params.uri == main_uri)
+				.is_some_and(|params| !params.diagnostics.is_empty())
+		);
+
+		std::fs::remove_file(&manifest_path).unwrap();
+		send_watched_files(
+			&client,
+			vec![lsp_types::FileEvent::new(
+				manifest_uri,
+				lsp_types::FileChangeType::DELETED,
+			)],
+		);
+		let transition = barrier_diagnostics(&client, 100);
+		assert_eq!(
+			transition
+				.iter()
+				.filter(|params| params.uri == dep_uri)
+				.count(),
+			1,
+			"the retired dependency must be cleared exactly once"
+		);
+		assert!(
+			transition
+				.iter()
+				.find(|params| params.uri == dep_uri)
+				.is_some_and(|params| params.diagnostics.is_empty()),
+			"the retired dependency kept diagnostics from its former project"
+		);
+		assert_eq!(
+			transition
+				.iter()
+				.filter(|params| params.uri == main_uri)
+				.count(),
+			1,
+			"the transitioned open document must be republished exactly once"
+		);
+		shutdown(&client, handle);
+	}
+
+	#[test]
 	fn previous_lifecycle_responses_are_not_prepared_after_same_version_reopen() {
 		let uri: lsp_types::Uri = "file:///wire_stale_analysis.nym".parse().unwrap();
 		let mut docs = DocumentStore::default();
