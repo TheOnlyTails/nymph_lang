@@ -232,6 +232,48 @@ mod tests {
 	}
 
 	#[test]
+	fn materialized_defaults_resolve_to_source_members_while_overrides_stay_distinct() {
+		let source = "interface Named { func name(): int = 1 }\nstruct Defaulted\nimpl Named for Defaulted {}\nstruct Overridden\nimpl Named for Overridden { func name(): int = 2 }\nfunc read_default(value: Defaulted): int = value.name()\nfunc read_override(value: Overridden): int = value.name()";
+		let (_temp, uri, docs, state) = project(&[("main.nym", source)], "main.nym");
+
+		let default_cursor = position_of(source, "name", 2);
+		let defaulted = locations(
+			&docs,
+			&state,
+			&params(&uri, default_cursor.line, default_cursor.character, true),
+		)
+		.expect("materialized default resolves to its user-written interface member");
+		assert_eq!(
+			defaulted
+				.iter()
+				.map(|location| location.range.start)
+				.collect::<Vec<_>>(),
+			vec![
+				position_of(source, "name", 0),
+				position_of(source, "name", 2),
+			],
+		);
+
+		let override_cursor = position_of(source, "name", 3);
+		let overridden = locations(
+			&docs,
+			&state,
+			&params(&uri, override_cursor.line, override_cursor.character, true),
+		)
+		.expect("override call resolves to the concrete override declaration");
+		assert_eq!(
+			overridden
+				.iter()
+				.map(|location| location.range.start)
+				.collect::<Vec<_>>(),
+			vec![
+				position_of(source, "name", 1),
+				position_of(source, "name", 3),
+			],
+		);
+	}
+
+	#[test]
 	fn project_references_include_aliases_unopened_importers_and_exact_declaration_policy() {
 		let (_temp, main_uri, docs, state) = project(
 			&[
@@ -295,6 +337,43 @@ mod tests {
 		assert!(locations(&docs, &state, &params(&uri, 0, 4, true)).is_none());
 		assert!(locations(&docs, &state, &params(&uri, 3, 1, true)).is_none());
 		assert!(locations(&docs, &state, &params(&uri, 99, 0, true)).is_none());
+	}
+
+	#[test]
+	fn equivalent_open_uris_use_one_authoritative_overlay_without_stale_cursor_mapping() {
+		let source = "func main(): int = {\n  let value = 1\n  value\n}";
+		let (_temp, canonical_uri, mut docs, mut state) = project(&[("main.nym", source)], "main.nym");
+		let alternate_uri: Uri = canonical_uri
+			.as_str()
+			.replace("main.nym", "%6dain.nym")
+			.parse()
+			.unwrap();
+		state
+			.open(&mut docs, alternate_uri.clone(), source.into(), 2)
+			.unwrap();
+
+		let canonical = locations(&docs, &state, &params(&canonical_uri, 2, 3, true)).unwrap();
+		assert_eq!(canonical.len(), 2);
+		assert!(
+			canonical
+				.iter()
+				.all(|location| location.uri == alternate_uri),
+			"one authoritative URI spelling owns all ranges for the logical module"
+		);
+
+		let shifted = format!("\n{source}");
+		state.change(&mut docs, &alternate_uri, shifted, 3).unwrap();
+		assert!(
+			locations(&docs, &state, &params(&canonical_uri, 2, 3, true)).is_none(),
+			"a non-authoritative alias must not map its cursor into different overlay text"
+		);
+		let authoritative = locations(&docs, &state, &params(&alternate_uri, 3, 3, true)).unwrap();
+		assert_eq!(authoritative.len(), 2);
+		assert!(
+			authoritative
+				.iter()
+				.all(|location| location.uri == alternate_uri)
+		);
 	}
 
 	#[test]
@@ -423,6 +502,22 @@ mod tests {
 			"\npublic func answer(): int = 2",
 		)
 		.unwrap();
+		assert!(locations(&docs, &state, &params(&main_uri, 1, 19, true)).is_none());
+	}
+
+	#[test]
+	fn deleted_unopened_project_source_rejects_the_snapshot() {
+		let (temp, main_uri, docs, state) = project(
+			&[
+				(
+					"main.nym",
+					"import @/target with (answer)\nfunc use(): int = answer()",
+				),
+				("target.nym", "public func answer(): int = 1"),
+			],
+			"main.nym",
+		);
+		std::fs::remove_file(temp.path().join("src/target.nym")).unwrap();
 		assert!(locations(&docs, &state, &params(&main_uri, 1, 19, true)).is_none());
 	}
 }

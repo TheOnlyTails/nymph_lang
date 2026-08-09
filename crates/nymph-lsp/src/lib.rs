@@ -1582,6 +1582,7 @@ mod tests {
 		assert!(prepare_hover_response(&docs, &uri, &snapshot, None).is_none());
 		assert!(prepare_semantic_tokens_response(&docs, &uri, &snapshot, None).is_none());
 		assert!(prepare_definition_response(&docs, &uri, &snapshot, None).is_none());
+		assert!(prepare_references_response(&docs, &uri, &snapshot, None).is_none());
 		assert!(
 			prepare_completion_response(
 				&docs,
