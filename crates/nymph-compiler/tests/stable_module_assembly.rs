@@ -1014,7 +1014,7 @@ fn stable_project_module_exports_first_class_external_alias_and_runs() {
 	session.set_source(
 		project.clone(),
 		main.clone(),
-		"import @/provider with (println as host_println)\nfunc value(): int = { let f = host_println f(1) 0 }\npublic func main(): void = {}".into(),
+		"import @/provider with (println as host_println)\nfunc stored(): int = { let f = host_println f(1) 0 }\nfunc grouped(): int = { (host_println)(2) 0 }\nfunc direct(): int = { host_println(3) 0 }\npublic func main(): void = {}".into(),
 		SourceVersion(1),
 	);
 
@@ -1027,7 +1027,9 @@ fn stable_project_module_exports_first_class_external_alias_and_runs() {
 	let compiled = session
 		.compile_interface_project_for_test(project, main, EntryMode::Entry)
 		.expect("consumer imports the external alias as a first-class value");
-	let value = compiled.entry_symbol("value");
+	let stored = compiled.entry_symbol("stored");
+	let grouped = compiled.entry_symbol("grouped");
+	let direct = compiled.entry_symbol("direct");
 	let js = compiled.js.replace(
 		"import { NInt } from \"std/box\";",
 		"class NInt { constructor(v) { this.v = v; } }",
@@ -1036,7 +1038,11 @@ fn stable_project_module_exports_first_class_external_alias_and_runs() {
 		"nymph-stable-external-value-{}.mjs",
 		std::process::id()
 	));
-	std::fs::write(&path, format!("{js}\nconsole.log({value}().v);\n")).unwrap();
+	std::fs::write(
+		&path,
+		format!("{js}\nconsole.log({stored}().v, {grouped}().v, {direct}().v);\n"),
+	)
+	.unwrap();
 	let output = std::process::Command::new("node")
 		.arg(&path)
 		.output()
@@ -1047,7 +1053,7 @@ fn stable_project_module_exports_first_class_external_alias_and_runs() {
 		"{}",
 		String::from_utf8_lossy(&output.stderr)
 	);
-	assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n0\n");
+	assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n2\n3\n0 0 0\n");
 }
 
 #[test]

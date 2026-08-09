@@ -708,6 +708,10 @@ fn materialized_fixture_in(
 			.iter()
 			.map(|item| &item.definition),
 	) {
+		context.shapes.insert(
+			StableShapeRequest::Definition(definition.id.clone()),
+			StableShapeFact::Definition(definition.clone()),
+		);
 		for variant in &definition.variants {
 			context.members.insert(
 				variant.id.clone(),
@@ -1460,6 +1464,92 @@ fn first_class_external_method_rejects_runtime_and_shape_abi_drift() {
 		lower_runtime_definition(&context, Arc::new(apply)),
 		Err(nymph_sema::StableLoweringError::MismatchedExternalAbi { definition })
 			if definition == render
+	));
+}
+
+#[test]
+fn first_class_generic_external_uses_checked_arity_and_exact_linked_abi() {
+	let (artifacts, _, context) = materialized_fixture(
+		"external(println) func print<T: Display>(value: T): void\nfunc apply(): int = { let f = print f(1) 0 }",
+	);
+	let print = artifacts
+		.iter()
+		.find(|artifact| source_name(&artifact.definition) == "print")
+		.unwrap()
+		.definition
+		.clone();
+	let apply = artifacts
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "apply")
+		.unwrap();
+	let lowered = lower_runtime_definition(&context, Arc::new(apply)).unwrap();
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("apply must lower as a function")
+	};
+	let nymph_hir::hir::HirExpr::Block { stmts, .. } = &function.body else {
+		panic!("apply must retain its block")
+	};
+	let nymph_hir::hir::HirStmt::Let { value, .. } = &stmts[0] else {
+		panic!("external callable value must initialize its binding")
+	};
+	assert!(
+		matches!(
+			value,
+			nymph_hir::hir::HirExpr::Closure { params, body }
+				if params == &["$arg$0"]
+					&& matches!(&**body, nymph_hir::hir::HirExpr::Call { callee, args }
+						if matches!(&**callee, nymph_hir::hir::HirExpr::Local(name) if name == "print")
+							&& args.len() == 2
+							&& matches!(&args[0], nymph_hir::hir::HirExpr::Local(name) if name == "$arg$0")
+							&& matches!(&args[1], nymph_hir::hir::HirExpr::RuntimeTypeObject { binding, .. } if binding == "NInt"))
+		),
+		"{value:#?}"
+	);
+	assert!(lowered.direct_demands().contains(&print));
+}
+
+#[test]
+fn first_class_generic_external_rejects_a_deferred_runtime_target() {
+	let (artifacts, _, mut context) = materialized_fixture(
+		"external(println) func print<T: Display>(value: T): void\nfunc apply(): int = { let f = print f(1) 0 }",
+	);
+	let mut print = artifacts
+		.iter()
+		.find(|artifact| source_name(&artifact.definition) == "print")
+		.unwrap()
+		.clone();
+	let deferred = ExternalAbi {
+		marker: "println".into(),
+		callable: nymph_sema::ExternalCallable::Deferred,
+		marshal: None,
+	};
+	print.payload = nymph_sema::RuntimePayload::External(deferred.clone());
+	context
+		.runtime
+		.insert(print.definition.clone(), Arc::new(print.clone()));
+	context.shapes.insert(
+		StableShapeRequest::ExternalAbi(print.definition.clone()),
+		StableShapeFact::ExternalAbi(deferred.clone()),
+	);
+	let Some(StableShapeFact::Definition(mut shape)) = context
+		.shapes
+		.remove(&StableShapeRequest::Definition(print.definition.clone()))
+	else {
+		panic!("external definition shape")
+	};
+	shape.external = Some(deferred);
+	context.shapes.insert(
+		StableShapeRequest::Definition(print.definition),
+		StableShapeFact::Definition(shape),
+	);
+	let apply = artifacts
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "apply")
+		.unwrap();
+	assert!(matches!(
+		lower_runtime_definition(&context, Arc::new(apply)),
+		Err(nymph_sema::StableLoweringError::Unsupported { feature, .. })
+			if feature == "generic callable value targets a deferred external"
 	));
 }
 

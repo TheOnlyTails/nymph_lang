@@ -49,6 +49,7 @@ pub trait RuntimeDefinitionLookup {
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum StableShapeRequest {
+	Definition(DefinitionId),
 	TypeShell(DefinitionId),
 	Member(DefinitionId),
 	Implementation(DefinitionId),
@@ -60,7 +61,8 @@ pub enum StableShapeRequest {
 impl StableShapeRequest {
 	pub fn definition(&self) -> &DefinitionId {
 		match self {
-			Self::TypeShell(id)
+			Self::Definition(id)
+			| Self::TypeShell(id)
 			| Self::Member(id)
 			| Self::Implementation(id)
 			| Self::ImplementationsForInterface(id)
@@ -78,6 +80,7 @@ pub enum StableTypeShell {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StableShapeFact {
+	Definition(ExportedDefinition),
 	TypeShell(StableTypeShell),
 	Member(MemberShape<InterfaceType>),
 	Implementation(ExportedImpl),
@@ -1036,6 +1039,58 @@ fn exact_external_abi(
 		});
 	}
 	Ok(shape_abi)
+}
+
+fn external_callable_arity(
+	context: &impl StableLoweringContext,
+	definition: &DefinitionId,
+	abi: &ExternalAbi,
+) -> Result<usize, StableLoweringError> {
+	match &definition.key {
+		crate::DeclarationKey::TopLevel {
+			category: crate::DeclarationCategory::Function,
+			..
+		} => {
+			let request = StableShapeRequest::Definition(definition.clone());
+			let StableShapeFact::Definition(shape) = context.stable_shape(&request)? else {
+				return Err(StableShapeLookupError::WrongFact { request }.into());
+			};
+			if shape.id != *definition
+				|| shape.kind != crate::DefinitionShapeKind::Function
+				|| shape.external.as_ref() != Some(abi)
+			{
+				return Err(invalid(
+					definition,
+					"generic external callable disagrees with its exact definition shape",
+				));
+			}
+			Ok(shape.parameters.len())
+		}
+		crate::DeclarationKey::Member { .. } => {
+			let request = StableShapeRequest::Member(definition.clone());
+			let StableShapeFact::Member(shape) = context.stable_shape(&request)? else {
+				return Err(StableShapeLookupError::WrongFact { request }.into());
+			};
+			if shape.id != *definition
+				|| !matches!(
+					shape.kind,
+					crate::MemberKind::Function
+						| crate::MemberKind::MutatingFunction
+						| crate::MemberKind::StaticFunction
+				) || shape.external.as_ref() != Some(abi)
+			{
+				return Err(invalid(
+					definition,
+					"generic external callable disagrees with its exact member shape",
+				));
+			}
+			Ok(shape.parameters.len())
+		}
+		_ => Err(invalid(
+			definition,
+			"generic external callable has no callable definition shape",
+		)),
+	}
 }
 
 fn external_module(
@@ -5294,14 +5349,28 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			});
 		};
 		let target_artifact = self.context.runtime_definition(target)?;
-		let crate::RuntimePayload::NymphBody(target_body) = &target_artifact.payload else {
-			return Err(StableLoweringError::Unsupported {
-				definition: self.artifact.definition.clone(),
-				node: Some(node),
-				feature: "generic callable value without a Nymph runtime body".into(),
-			});
+		let arity = match &target_artifact.payload {
+			crate::RuntimePayload::NymphBody(target_body) => target_body.stable.params.len(),
+			crate::RuntimePayload::External(_) => {
+				let abi = exact_external_abi(self.context, target, None)?;
+				if matches!(abi.callable, crate::ExternalCallable::Deferred) {
+					return Err(StableLoweringError::Unsupported {
+						definition: self.artifact.definition.clone(),
+						node: Some(node),
+						feature: "generic callable value targets a deferred external".into(),
+					});
+				}
+				external_callable_arity(self.context, target, &abi)?
+			}
+			_ => {
+				return Err(StableLoweringError::Unsupported {
+					definition: self.artifact.definition.clone(),
+					node: Some(node),
+					feature: "generic callable value targets a non-callable runtime artifact".into(),
+				});
+			}
 		};
-		let params = (0..target_body.stable.params.len())
+		let params = (0..arity)
 			.map(|index| EcoString::from(format!("$arg${index}")))
 			.collect::<Vec<_>>();
 		let call = HirExpr::Call {

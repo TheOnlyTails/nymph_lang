@@ -1540,6 +1540,11 @@ pub(crate) fn stable_shape<'db>(
 			.map(|item| &item.definition),
 	);
 	let result = match &request {
+		Request::Definition(id) => definitions
+			.clone()
+			.find(|definition| definition.id == *id)
+			.cloned()
+			.map(Fact::Definition),
 		Request::Member(id) => definitions
 			.clone()
 			.flat_map(|definition| &definition.members)
