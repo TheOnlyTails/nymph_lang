@@ -126,6 +126,7 @@ pub struct CompilerState {
 	effective_sources: HashMap<ModuleIdentity, Arc<str>>,
 	authoritative_overlays: HashMap<ModuleIdentity, Uri>,
 	manifest_errors: HashMap<Uri, String>,
+	workspace_symbol_refresh_errors: HashSet<PathBuf>,
 	diagnostic_targets: HashMap<String, Vec<String>>,
 }
 
@@ -156,6 +157,7 @@ impl CompilerState {
 			effective_sources: HashMap::new(),
 			authoritative_overlays: HashMap::new(),
 			manifest_errors: HashMap::new(),
+			workspace_symbol_refresh_errors: HashSet::new(),
 			diagnostic_targets: HashMap::new(),
 		}
 	}
@@ -225,10 +227,9 @@ impl CompilerState {
 			Ok(source) => {
 				self.set_effective_source(&module_identity, source, SourceVersion(0));
 			}
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+			Err(_) => {
 				self.remove_effective_source(&module_identity);
 			}
-			Err(error) => return Err(error.into()),
 		}
 		let mut affected = previous;
 		for current in self.affected_project_documents(docs, uri) {
@@ -457,8 +458,14 @@ impl CompilerState {
 				Some((root.clone(), project, without_prelude))
 			})
 			.collect::<Vec<_>>();
+		self.workspace_symbol_refresh_errors.clear();
 		for (root, project, without_prelude) in projects {
-			let _ = self.synchronize_project_files(docs, &root, &project, without_prelude);
+			if self
+				.synchronize_project_files(docs, &root, &project, without_prelude)
+				.is_err()
+			{
+				self.workspace_symbol_refresh_errors.insert(root);
+			}
 		}
 	}
 
@@ -481,6 +488,7 @@ impl CompilerState {
 			.synchronized_roots
 			.iter()
 			.filter(|root| !invalid_roots.contains(*root))
+			.filter(|root| !self.workspace_symbol_refresh_errors.contains(*root))
 			.filter_map(|root| {
 				let project = self.workspaces.get(root)?.clone();
 				let without_prelude = self.documents.values().find_map(|identity| {
@@ -991,8 +999,13 @@ impl CompilerState {
 				.authoritative_overlays
 				.get(&module_identity)
 				.is_some_and(|uri| docs.get(uri).is_some());
-			if !has_overlay && let Ok(source) = fs::read_to_string(&path) {
-				self.set_effective_source(&module_identity, source, SourceVersion(0));
+			if !has_overlay {
+				match fs::read_to_string(&path) {
+					Ok(source) => {
+						self.set_effective_source(&module_identity, source, SourceVersion(0));
+					}
+					Err(_) => self.remove_effective_source(&module_identity),
+				}
 			}
 			if let Some(disk_uri) = workspace::path_to_uri(&path) {
 				self.documents.insert(disk_uri, disk_identity);

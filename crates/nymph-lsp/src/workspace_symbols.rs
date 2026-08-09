@@ -400,6 +400,53 @@ mod tests {
 	}
 
 	#[test]
+	fn unreadable_unopened_source_retires_stale_symbols_and_recovers() {
+		let mut fixture = Fixture::new(&[
+			("main", "public func main(): void = {}"),
+			("dep", "public func stale_name(): void = {}"),
+		]);
+		let dep_path = fixture.main_path.with_file_name("dep.nym");
+		assert_eq!(fixture.search("stale_name").len(), 1);
+
+		std::fs::write(&dep_path, [0xff]).unwrap();
+		assert!(fixture.search("stale_name").is_empty());
+
+		std::fs::write(&dep_path, "public func fresh_name(): void = {}").unwrap();
+		assert!(
+			fixture
+				.search("stale_name")
+				.iter()
+				.all(|symbol| symbol.name != "stale_name")
+		);
+		assert_eq!(fixture.search("fresh_name")[0].name, "fresh_name");
+	}
+
+	#[test]
+	fn closing_an_overlay_over_unreadable_disk_retires_the_overlay() {
+		let mut fixture = Fixture::new(&[
+			("main", "public func main(): void = {}"),
+			("dep", "public func disk_name(): void = {}"),
+		]);
+		let dep_path = fixture.main_path.with_file_name("dep.nym");
+		let dep_uri = path_to_uri(&dep_path).unwrap();
+		fixture
+			.state
+			.open(
+				&mut fixture.docs,
+				dep_uri.clone(),
+				"public func overlay_name(): void = {}".to_string(),
+				2,
+			)
+			.unwrap();
+		std::fs::write(dep_path, [0xff]).unwrap();
+
+		fixture.state.close(&mut fixture.docs, &dep_uri).unwrap();
+		let snapshot = fixture.state.workspace_symbol_snapshot(&fixture.docs);
+		assert!(flat(workspace_symbols(&snapshot, &params("overlay_name"))).is_empty());
+		assert!(flat(workspace_symbols(&snapshot, &params("disk_name"))).is_empty());
+	}
+
+	#[test]
 	fn manifest_errors_suppress_stale_project_symbols() {
 		let mut fixture = Fixture::new(&[("main", "public func before_error(): void = {}")]);
 		std::fs::write(fixture._temp.path().join("nymph.toml"), "not = [valid").unwrap();
