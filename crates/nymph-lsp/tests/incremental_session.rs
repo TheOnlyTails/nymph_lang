@@ -424,7 +424,7 @@ fn project_hover_uses_imports_aliases_std_prelude_generics_and_reuses_the_checke
 	fs::create_dir(temp.path().join("src")).unwrap();
 	let main_path = temp.path().join("src/main.nym");
 	let dep_path = temp.path().join("src/dep.nym");
-	let source = "import @/dep with (Box, id as identify)\nimport std/collections/linked_list with (LinkedList)\nfunc use(box: Box<int>, list: LinkedList<string>): Option<string> = {\n  let imported_box = box\n  let imported_std = list\n  let sum = 1 + 2\n  Some(value = identify(\"ok\"))\n}";
+	let source = "import @/dep with (Box, id as identify)\nimport std/collections/linked_list with (LinkedList)\nfunc use(box: Box<int>, list: LinkedList<string>): Option<string> = {\n  let imported_box = box\n  let imported_std = list\n  let sum = 1 + 2\n  Some(value = identify(\"ok\"))\n}\nfunc unwrap(option: Option<int>): int = match (option) { Some(value) -> value, None -> 0 }";
 	let dependency = "public struct Box<T>(public value: T)\npublic func id<T>(value: T): T = value";
 	fs::write(&main_path, source).unwrap();
 	fs::write(&dep_path, dependency).unwrap();
@@ -453,7 +453,10 @@ fn project_hover_uses_imports_aliases_std_prelude_generics_and_reuses_the_checke
 		("list\n", "LinkedList<string>"),
 		("sum =", "int"),
 		("identify(\"ok\")", "(string) -> string"),
-		("Some(value", "Option"),
+		("Some(value", "Option.Some(value: T)"),
+		("Some(value) ->", "Option.Some(value: T)"),
+		("value) ->", "int"),
+		("None ->", "Option.None"),
 	];
 	for (needle, expected) in cases {
 		assert_eq!(

@@ -175,8 +175,7 @@ fn variant_hover_at(module: &Module, checked: &Checked, offset: usize) -> Option
 		.filter(|(span, _)| covers(*span, offset))
 		.min_by_key(|(span, _)| span.end - span.start)?;
 
-	let defs = &checked.semantic.definitions;
-	render_variant_from_resolution(module, defs, res)
+	render_variant_from_resolution(module, checked, res)
 }
 
 /// Render a resolved `(enum, variant)` name pair as `EnumName.Variant(f: T,
@@ -185,23 +184,56 @@ fn variant_hover_at(module: &Module, checked: &Checked, offset: usize) -> Option
 /// the resolution's names don't line up with a live declaration.
 fn render_variant_from_resolution(
 	module: &Module,
-	defs: &DefMap,
+	checked: &Checked,
 	res: &VariantResolution,
 ) -> Option<String> {
-	let enum_id = defs.get(res.enum_name.as_str())?;
+	let defs = &checked.semantic.definitions;
+	let enum_id = variant_enum_definition(defs, res)?;
+	if let Some(member) = defs.local_member(enum_id) {
+		let Declaration::Enum { variants, .. } = &module.members[member] else {
+			return None;
+		};
+		let variant = variants.iter().find(|v| v.0.name.0 == res.variant)?;
+		return Some(format!(
+			"{}.{}",
+			res.enum_name,
+			render_enum_variant(&variant.0)
+		));
+	}
+
+	let signature = checked.semantic.signatures.enums.get(&enum_id)?;
+	let variant = semantic_variant(checked, enum_id, res)?;
+	Some(format!(
+		"{}.{}",
+		defs.data(enum_id).name,
+		render_semantic_variant(variant, &checked.interner, defs, &signature.generics)
+	))
+}
+
+fn variant_enum_definition(defs: &DefMap, res: &VariantResolution) -> Option<DefId> {
+	let enum_id = res
+		.enum_target
+		.as_ref()
+		.and_then(|target| defs.by_stable(target))
+		.or_else(|| defs.get(res.enum_name.as_str()))?;
 	let def::DefKind::Enum = defs.data(enum_id).kind else {
 		return None;
 	};
-	let member = defs.local_member(enum_id)?;
-	let Declaration::Enum { variants, .. } = &module.members[member] else {
-		return None;
-	};
-	let variant = variants.iter().find(|v| v.0.name.0 == res.variant)?;
-	Some(format!(
-		"{}.{}",
-		res.enum_name,
-		render_enum_variant(&variant.0)
-	))
+	Some(enum_id)
+}
+
+fn semantic_variant<'a>(
+	checked: &'a Checked,
+	enum_id: DefId,
+	res: &VariantResolution,
+) -> Option<&'a def::VariantSig> {
+	let variants = &checked.semantic.signatures.enums.get(&enum_id)?.variants;
+	match &res.variant_target {
+		Some(target) => variants
+			.iter()
+			.find(|variant| variant.target.as_ref() == Some(target)),
+		None => variants.iter().find(|variant| variant.name == res.variant),
+	}
 }
 
 /// Container/control-flow expression kinds that enclose the cursor rather
@@ -329,6 +361,23 @@ fn render_adt(
 			.map(|(n, t)| format!("{n} = {}", render(interner, defs, params, *t))),
 	);
 	format!("{name}<{}>", inner.join(", "))
+}
+
+fn render_semantic_variant(
+	variant: &def::VariantSig,
+	interner: &Interner,
+	defs: &DefMap,
+	params: &[EcoString],
+) -> String {
+	if variant.fields.is_empty() {
+		return variant.name.to_string();
+	}
+	let fields: Vec<_> = variant
+		.fields
+		.iter()
+		.map(|(name, ty)| format!("{name}: {}", render(interner, defs, params, *ty)))
+		.collect();
+	format!("{}({})", variant.name, fields.join(", "))
 }
 
 // ── Keyword documentation (for hover) ───────────────────────────────────────
@@ -2317,30 +2366,43 @@ fn collect_type_node_candidates(ty: &Spanned<Type>, out: &mut Vec<(Span, String)
 ///
 /// Returns `None` when the def can't be found or isn't the expected kind —
 /// callers treat that as "bind nothing here" rather than guessing.
+enum ConstructorFieldTypes<'a> {
+	Syntactic(Vec<(&'a str, &'a Spanned<Type>)>),
+	Semantic {
+		owner: DefId,
+		generics: &'a [EcoString],
+		fields: &'a [(EcoString, Ty)],
+	},
+}
+
 fn struct_field_types<'m>(
 	module: &'m Module,
-	defs: &DefMap,
-	checked: &Checked,
+	checked: &'m Checked,
 	pattern: &Spanned<Pattern>,
-) -> Option<Vec<(&'m str, &'m Spanned<Type>)>> {
+) -> Option<ConstructorFieldTypes<'m>> {
+	let defs = &checked.semantic.definitions;
 	if let Some(res) = checked.annotations.pattern_variant_of(pattern.1) {
-		let enum_id = defs.get(res.enum_name.as_str())?;
-		let def::DefKind::Enum = defs.data(enum_id).kind else {
-			return None;
-		};
-		let member = defs.local_member(enum_id)?;
-		let Declaration::Enum { variants, .. } = &module.members[member] else {
-			return None;
-		};
-		let variant = variants.iter().find(|v| v.0.name.0 == res.variant)?;
-		return Some(
-			variant
-				.0
-				.fields
-				.iter()
-				.map(|f| (f.0.name.0.as_str(), &f.0.type_))
-				.collect(),
-		);
+		let enum_id = variant_enum_definition(defs, res)?;
+		if let Some(member) = defs.local_member(enum_id) {
+			let Declaration::Enum { variants, .. } = &module.members[member] else {
+				return None;
+			};
+			let variant = variants.iter().find(|v| v.0.name.0 == res.variant)?;
+			return Some(ConstructorFieldTypes::Syntactic(
+				variant
+					.0
+					.fields
+					.iter()
+					.map(|f| (f.0.name.0.as_str(), &f.0.type_))
+					.collect(),
+			));
+		}
+		let signature = checked.semantic.signatures.enums.get(&enum_id)?;
+		return Some(ConstructorFieldTypes::Semantic {
+			owner: enum_id,
+			generics: &signature.generics,
+			fields: &semantic_variant(checked, enum_id, res)?.fields,
+		});
 	}
 	let Pattern::Struct { path, .. } = &pattern.0 else {
 		return None;
@@ -2350,16 +2412,23 @@ fn struct_field_types<'m>(
 	let def::DefKind::Struct = defs.data(id).kind else {
 		return None;
 	};
-	let member = defs.local_member(id)?;
-	let Declaration::Struct { fields, .. } = &module.members[member] else {
-		return None;
-	};
-	Some(
-		fields
-			.iter()
-			.map(|f| (f.0.name.0.as_str(), &f.0.type_))
-			.collect(),
-	)
+	if let Some(member) = defs.local_member(id) {
+		let Declaration::Struct { fields, .. } = &module.members[member] else {
+			return None;
+		};
+		return Some(ConstructorFieldTypes::Syntactic(
+			fields
+				.iter()
+				.map(|f| (f.0.name.0.as_str(), &f.0.type_))
+				.collect(),
+		));
+	}
+	let signature = checked.semantic.signatures.structs.get(&id)?;
+	Some(ConstructorFieldTypes::Semantic {
+		owner: id,
+		generics: &signature.generics,
+		fields: &signature.fields,
+	})
 }
 
 /// Shared `Pattern::Struct` leaf logic for both
@@ -2401,6 +2470,93 @@ fn bind_struct_pattern_fields(
 			StructPatternField::Rest => {}
 		}
 	}
+}
+
+fn bind_semantic_struct_pattern_fields(
+	fields: &[Spanned<StructPatternField>],
+	field_list: &[(EcoString, Ty)],
+	checked: &Checked,
+	module: &Module,
+	defs: &DefMap,
+	params: &[EcoString],
+	out: &mut Vec<(Span, String)>,
+) {
+	for field in fields {
+		match &field.0 {
+			StructPatternField::Value { name, value } => {
+				if let Some((_, ty)) = field_list.iter().find(|(field, _)| field == &name.0) {
+					bind_pattern_semantic(value, *ty, checked, module, defs, params, out);
+				}
+			}
+			StructPatternField::Named(name) => {
+				if let Some((_, ty)) = field_list.iter().find(|(field, _)| field == &name.0)
+					&& !matches!(checked.interner.kind(*ty), TyKind::Error | TyKind::Infer(_))
+				{
+					out.push((name.1, render(&checked.interner, defs, params, *ty)));
+				}
+			}
+			StructPatternField::Positional(value) => {
+				if let [(_, ty)] = field_list {
+					bind_pattern_semantic(value, *ty, checked, module, defs, params, out);
+				}
+			}
+			StructPatternField::Rest => {}
+		}
+	}
+}
+
+fn syntactic_generic_renderings(generics: &[EcoString], ty: &Type) -> Vec<EcoString> {
+	let mut rendered = generics.to_vec();
+	let Type::Reference { generics: args, .. } = ty else {
+		return rendered;
+	};
+	let mut positional = 0;
+	for arg in args {
+		let Some(value) = render_type_node(&arg.0.value.0) else {
+			continue;
+		};
+		if let Some(name) = &arg.0.name {
+			if let Some(index) = generics.iter().position(|generic| generic == &name.0) {
+				rendered[index] = value.into();
+			}
+		} else {
+			if let Some(slot) = rendered.get_mut(positional) {
+				*slot = value.into();
+			}
+			positional += 1;
+		}
+	}
+	rendered
+}
+
+fn semantic_generic_renderings(
+	checked: &Checked,
+	defs: &DefMap,
+	params: &[EcoString],
+	ty: Ty,
+	owner: DefId,
+	generics: &[EcoString],
+) -> Vec<EcoString> {
+	let mut rendered = generics.to_vec();
+	let mut ty = ty;
+	if let TyKind::Mut(inner) = checked.interner.kind(ty) {
+		ty = *inner;
+	}
+	let TyKind::Adt(definition, args) = checked.interner.kind(ty) else {
+		return rendered;
+	};
+	if *definition != owner {
+		return rendered;
+	}
+	for (slot, argument) in rendered.iter_mut().zip(&args.positional) {
+		*slot = render(&checked.interner, defs, params, *argument).into();
+	}
+	for (name, argument) in &args.named {
+		if let Some(index) = generics.iter().position(|generic| generic == name) {
+			rendered[index] = render(&checked.interner, defs, params, *argument).into();
+		}
+	}
+	rendered
 }
 
 /// Bind every name a *syntactic* `Type` node's matching pattern introduces to
@@ -2483,8 +2639,8 @@ fn bind_pattern_syntactic(
 				}
 			}
 		}
-		Pattern::Struct { fields, .. } => {
-			if let Some(field_list) = struct_field_types(module, defs, checked, pattern) {
+		Pattern::Struct { fields, .. } => match struct_field_types(module, checked, pattern) {
+			Some(ConstructorFieldTypes::Syntactic(field_list)) => {
 				bind_struct_pattern_fields(
 					fields,
 					&field_list,
@@ -2495,7 +2651,18 @@ fn bind_pattern_syntactic(
 					out,
 				);
 			}
-		}
+			Some(ConstructorFieldTypes::Semantic {
+				generics,
+				fields: field_list,
+				..
+			}) => {
+				let params = syntactic_generic_renderings(generics, ty);
+				bind_semantic_struct_pattern_fields(
+					fields, field_list, checked, module, defs, &params, out,
+				);
+			}
+			None => {}
+		},
 		Pattern::Grouped(inner) => bind_pattern_syntactic(inner, ty, subst, checked, module, defs, out),
 		Pattern::Union(a, b) => {
 			bind_pattern_syntactic(a, ty, subst, checked, module, defs, out);
@@ -2516,12 +2683,9 @@ fn bind_pattern_syntactic(
 /// destructuring case), walking `pattern` and a *semantic* `Ty` in
 /// lock-step — the same [`render`] the primary path uses for a plain
 /// binding, applied at each structural position instead of once for the
-/// whole pattern. `Pattern::Struct` has no per-field semantic `Ty` available
-/// here (this module never sees the checker's substituted field
-/// signatures), so it hands off to [`bind_pattern_syntactic`] against each
-/// field's own *declared* `Type` node — the same source-level rendering F7
-/// already uses for a struct's field-type annotations at the declaration
-/// site.
+/// whole pattern. Local constructors retain their source [`Type`] nodes;
+/// imported constructors use the checked semantic field signatures and
+/// substitute the matched ADT's arguments before rendering binders.
 fn bind_pattern_semantic(
 	pattern: &Spanned<Pattern>,
 	ty: Ty,
@@ -2597,12 +2761,23 @@ fn bind_pattern_semantic(
 				}
 			}
 		}
-		Pattern::Struct { fields, .. } => {
-			if let Some(field_list) = struct_field_types(module, defs, checked, pattern) {
+		Pattern::Struct { fields, .. } => match struct_field_types(module, checked, pattern) {
+			Some(ConstructorFieldTypes::Syntactic(field_list)) => {
 				let subst = adt_generic_subst(checked, defs, module, params, ty);
 				bind_struct_pattern_fields(fields, &field_list, &subst, checked, module, defs, out);
 			}
-		}
+			Some(ConstructorFieldTypes::Semantic {
+				owner,
+				generics,
+				fields: field_list,
+			}) => {
+				let params = semantic_generic_renderings(checked, defs, params, ty, owner, generics);
+				bind_semantic_struct_pattern_fields(
+					fields, field_list, checked, module, defs, &params, out,
+				);
+			}
+			None => {}
+		},
 		Pattern::Grouped(inner) => bind_pattern_semantic(inner, ty, checked, module, defs, params, out),
 		Pattern::Union(a, b) => {
 			bind_pattern_semantic(a, ty, checked, module, defs, params, out);
@@ -2647,22 +2822,10 @@ fn push_variant_decl_candidate(
 	pattern: &Spanned<Pattern>,
 	res: &VariantResolution,
 	module: &Module,
-	defs: &DefMap,
+	checked: &Checked,
 	out: &mut Vec<(Span, String)>,
 ) {
-	let Some(enum_id) = defs.get(res.enum_name.as_str()) else {
-		return;
-	};
-	let def::DefKind::Enum = defs.data(enum_id).kind else {
-		return;
-	};
-	let Some(member) = defs.local_member(enum_id) else {
-		return;
-	};
-	let Declaration::Enum { variants, .. } = &module.members[member] else {
-		return;
-	};
-	let Some(variant) = variants.iter().find(|v| v.0.name.0 == res.variant) else {
+	let Some(rendered) = render_variant_from_resolution(module, checked, res) else {
 		return;
 	};
 	let span = match &pattern.0 {
@@ -2673,10 +2836,7 @@ fn push_variant_decl_candidate(
 		Pattern::Binding { name, .. } => name.1,
 		_ => pattern.1,
 	};
-	out.push((
-		span,
-		format!("{}.{}", res.enum_name, render_enum_variant(&variant.0)),
-	));
+	out.push((span, rendered));
 }
 
 /// Walk every sub-pattern reachable from `pattern` (mirroring
@@ -2689,28 +2849,27 @@ fn push_pattern_variant_candidates(
 	pattern: &Spanned<Pattern>,
 	checked: &Checked,
 	module: &Module,
-	defs: &DefMap,
 	out: &mut Vec<(Span, String)>,
 ) {
 	if let Some(res) = checked.annotations.pattern_variant_of(pattern.1) {
-		push_variant_decl_candidate(pattern, res, module, defs, out);
+		push_variant_decl_candidate(pattern, res, module, checked, out);
 	}
 	match &pattern.0 {
 		Pattern::Binding { inner, .. } => {
-			push_pattern_variant_candidates(inner, checked, module, defs, out);
+			push_pattern_variant_candidates(inner, checked, module, out);
 		}
 		Pattern::List(items) | Pattern::Tuple(items) => {
 			for item in items {
 				if let ListPatternEntry::Item(p) = &item.0 {
-					push_pattern_variant_candidates(p, checked, module, defs, out);
+					push_pattern_variant_candidates(p, checked, module, out);
 				}
 			}
 		}
 		Pattern::Map(entries) => {
 			for entry in entries {
 				if let MapPatternEntry::Entry(k, v) = &entry.0 {
-					push_pattern_variant_candidates(k, checked, module, defs, out);
-					push_pattern_variant_candidates(v, checked, module, defs, out);
+					push_pattern_variant_candidates(k, checked, module, out);
+					push_pattern_variant_candidates(v, checked, module, out);
 				}
 			}
 		}
@@ -2718,17 +2877,17 @@ fn push_pattern_variant_candidates(
 			for field in fields {
 				match &field.0 {
 					StructPatternField::Value { value, .. } | StructPatternField::Positional(value) => {
-						push_pattern_variant_candidates(value, checked, module, defs, out);
+						push_pattern_variant_candidates(value, checked, module, out);
 					}
 					StructPatternField::Named(_) | StructPatternField::Rest => {}
 				}
 			}
 		}
 		Pattern::Union(a, b) => {
-			push_pattern_variant_candidates(a, checked, module, defs, out);
-			push_pattern_variant_candidates(b, checked, module, defs, out);
+			push_pattern_variant_candidates(a, checked, module, out);
+			push_pattern_variant_candidates(b, checked, module, out);
 		}
-		Pattern::Grouped(inner) => push_pattern_variant_candidates(inner, checked, module, defs, out),
+		Pattern::Grouped(inner) => push_pattern_variant_candidates(inner, checked, module, out),
 		Pattern::Int(_)
 		| Pattern::UInt(_)
 		| Pattern::Float(_)
@@ -3235,7 +3394,7 @@ fn collect_fallback_exprs(
 			collect_fallback_exprs(value, checked, module, defs, params, out);
 			let scrutinee_ty = checked.annotations.get(value.id).map(|info| info.ty);
 			for arm in arms {
-				push_pattern_variant_candidates(&arm.pattern, checked, module, defs, out);
+				push_pattern_variant_candidates(&arm.pattern, checked, module, out);
 				if let Some(ty) = scrutinee_ty {
 					bind_pattern_semantic(&arm.pattern, ty, checked, module, defs, params, out);
 				}
