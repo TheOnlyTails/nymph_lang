@@ -2224,6 +2224,33 @@ pub(crate) fn interface_module_interface<'db>(
 	.map_err(Arc::new)
 }
 
+pub(crate) fn documentation_module_interface<'db>(
+	db: &'db dyn Db,
+	key: super::session::ProjectKey<'db>,
+	module: SemanticModuleInput,
+	document_private_items: bool,
+) -> Result<Arc<nymph_sema::ModuleInterface>, Arc<nymph_sema::InterfaceConversionError>> {
+	if !document_private_items {
+		return interface_module_interface(db, key, module);
+	}
+	let analysis = interface_module_analysis(db, key, module);
+	let headers = interface_declared_headers(db, key, module);
+	let facts = nymph_sema::ExtractionFactSelection::current_module_from_facts(
+		&analysis.semantic.module,
+		&analysis.semantic.checked,
+	)
+	.including_private_definitions();
+	nymph_sema::extract_module_interface_from_facts_with_selection(
+		module.identity(db),
+		&analysis.semantic.module,
+		&analysis.semantic.checked,
+		&headers,
+		&facts,
+	)
+	.map(Arc::new)
+	.map_err(Arc::new)
+}
+
 #[salsa::tracked(returns(clone))]
 pub(crate) fn interface_module_environment<'db>(
 	db: &'db dyn Db,

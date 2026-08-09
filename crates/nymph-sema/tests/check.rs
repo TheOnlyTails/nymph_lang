@@ -203,6 +203,23 @@ fn simple_annotated_function() {
 }
 
 #[test]
+fn namespace_function_and_value_bodies_are_checked() {
+	assert_ok("namespace Values { func id<T>(value: T) = value let answer = 42 }");
+	assert_ok(
+		"interface Default { func default(): self }
+		 namespace Values { func make<T: Default>(): T = T.default() }",
+	);
+	assert_error_contains(
+		"namespace Values { func answer(): int = true }",
+		"expected `int`, found `boolean`",
+	);
+	assert_error_contains(
+		"namespace Values { let answer: int = true }",
+		"expected `int`, found `boolean`",
+	);
+}
+
+#[test]
 fn binding_subpattern_exposes_outer_and_nested_types() {
 	assert_ok(
 		"func sum(value: #(int, int)): int = match (value) {

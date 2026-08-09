@@ -11,7 +11,7 @@
 use ecow::EcoString;
 use nymph_ast::{
 	NodeId, Span, Spanned,
-	decl::Declaration,
+	decl::{Declaration, ImplMember},
 	expr::{CallArg, Expr, ExprKind, ListItem, MapEntry, RangeKind, Statement, StringPart},
 	ops::{AssignOperator, BinaryOperator, PrefixOperator},
 	ty::Type,
@@ -303,6 +303,7 @@ impl<'m> Checker<'m> {
 			match kind {
 				DefKind::Func => self.check_func_body(id, member),
 				DefKind::Let => self.check_let_body(id, member),
+				DefKind::Namespace => self.check_namespace_bodies(id, member),
 				_ => {}
 			}
 		}
@@ -353,6 +354,64 @@ impl<'m> Checker<'m> {
 		self.finalize_pending_operators();
 		self.finalize_pending_bounds();
 		self.pop_scope();
+	}
+
+	fn check_namespace_bodies(&mut self, id: DefId, member: usize) {
+		let module = self.module;
+		let Declaration::Namespace { members, .. } = &module.members[member] else {
+			return;
+		};
+		for member in members {
+			match &member.0 {
+				ImplMember::Func { meta, body, .. } => {
+					let Some(NamespaceMemberSig::Func { sig, .. }) = self
+						.sigs
+						.namespaces
+						.get(&id)
+						.and_then(|namespace| namespace.members.get(&meta.name.0))
+						.cloned()
+					else {
+						continue;
+					};
+					self.param_bounds.clear();
+					self.param_bound_details.clear();
+					self.push_params(build_param_scope(&meta.generics));
+					self.record_param_bounds(&meta.generics, 0);
+					self.push_scope();
+					for (parameter, checked) in meta.params.iter().zip(&sig.params) {
+						self.bind_pattern(&parameter.0.name, checked.ty, parameter.0.mutable);
+					}
+					let previous = self.ret_ty.replace(sig.ret);
+					self.check_named_callable_body(&meta.name, body, sig.ret);
+					self.ret_ty = previous;
+					self.finalize_pending_operators();
+					self.finalize_pending_bounds();
+					self.pop_scope();
+					self.pop_params();
+				}
+				ImplMember::Let { meta, value, .. } => {
+					let Some(name) = meta.name.0.as_binding() else {
+						continue;
+					};
+					let Some(NamespaceMemberSig::Value { ty, .. }) = self
+						.sigs
+						.namespaces
+						.get(&id)
+						.and_then(|namespace| namespace.members.get(&name.0))
+						.cloned()
+					else {
+						continue;
+					};
+					self.push_scope();
+					self.resolve_anon(value, Some(ty));
+					self.check(value, ty);
+					self.finalize_pending_operators();
+					self.finalize_pending_bounds();
+					self.pop_scope();
+				}
+				ImplMember::ExternalFunc(..) | ImplMember::ExternalLet(..) => {}
+			}
+		}
 	}
 
 	// ── check mode ───────────────────────────────────────────────────────────

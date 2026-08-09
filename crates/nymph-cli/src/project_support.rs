@@ -23,6 +23,19 @@ impl From<Option<PathBuf>> for ManifestSelection {
 	}
 }
 
+/// Load the project selected for a project-only command. Discovery is strict:
+/// unlike source-target commands, absence never falls back to loose-file mode,
+/// and an explicit manifest path is always authoritative.
+pub(crate) fn load_project(manifest: &ManifestSelection) -> anyhow::Result<nymph_project::Project> {
+	match manifest {
+		ManifestSelection::Discover => {
+			let current_dir = nymph_project::normalize_path(std::env::current_dir()?)?;
+			Ok(nymph_project::discover(&current_dir)?)
+		}
+		ManifestSelection::Explicit(path) => Ok(nymph_project::Project::load(path)?),
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TargetIntent {
 	Entry,

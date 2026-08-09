@@ -222,6 +222,7 @@ fn complete_fixture() -> ModuleInterface {
 		name: "Owner".into(),
 		visibility: Some(Visibility::Public),
 		kind: DefinitionShapeKind::Struct,
+		declaration_kind: None,
 		binders: vec![binder.clone()],
 		constraints: vec![constraint.clone()],
 		parameters: vec![ParameterShape {
@@ -324,6 +325,7 @@ fn recovered_fixture() -> RecoveredModuleInterface {
 		name: complete.name,
 		visibility: complete.visibility,
 		kind: complete.kind,
+		declaration_kind: complete.declaration_kind,
 		availability: SemanticAvailability::Available,
 		binders: complete.binders,
 		constraints: vec![],

@@ -620,6 +620,7 @@ fn extraction_preserves_transitive_imported_nominal_return_identity() {
 			name: "Answer".into(),
 			visibility: None,
 			kind: DefinitionShapeKind::Struct,
+			declaration_kind: None,
 			binders: vec![],
 			constraints: vec![],
 			parameters: vec![],

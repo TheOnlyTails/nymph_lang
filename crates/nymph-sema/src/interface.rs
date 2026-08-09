@@ -446,6 +446,8 @@ pub struct ExportedDefinition {
 	pub name: EcoString,
 	pub visibility: Option<Visibility>,
 	pub kind: DefinitionShapeKind,
+	/// Callable/value modifier retained for function and let declarations.
+	pub declaration_kind: Option<MemberKind>,
 	pub binders: Vec<GenericParameter>,
 	pub constraints: Vec<GenericConstraint>,
 	pub parameters: Vec<ParameterShape<InterfaceType>>,
@@ -666,6 +668,7 @@ pub struct RecoveredExportedDefinition {
 	pub name: EcoString,
 	pub visibility: Option<Visibility>,
 	pub kind: DefinitionShapeKind,
+	pub declaration_kind: Option<MemberKind>,
 	pub availability: SemanticAvailability,
 	pub binders: Vec<GenericParameter>,
 	pub constraints: Vec<RecoveredGenericConstraint>,

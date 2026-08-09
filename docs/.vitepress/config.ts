@@ -59,6 +59,7 @@ export default defineConfig({
 					{ text: "Literals", link: "/literals/" },
 					{ text: "Expressions", link: "/expressions/" },
 					{ text: "Declarations", link: "/declarations/" },
+					{ text: "Generated Documentation", link: "/generated-documentation/" },
 					{ text: "Types", link: "/types/" },
 					{ text: "Functions", link: "/functions/" },
 					{ text: "Structs and Enums", link: "/structs-and-enums/" },
