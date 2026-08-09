@@ -861,6 +861,78 @@ fn stable_native_range_runtime_is_exact_collision_safe_and_runs_after_dependency
 }
 
 #[test]
+fn stable_native_range_loop_results_link_only_option_and_preserve_completion_values() {
+	let mut session = CompilerSession::new();
+	let project = ProjectId::new("stable-range-results");
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"func int_start(): int = 1\nfunc early(): int = match (for (value in int_start()..4) { if (value == 2) { break value } }) { Some(value) -> value, None -> 0 }\nfunc natural(): int = match (for (value in int_start()..3) { if (value == 9) { break value } }) { Some(value) -> value, None -> 4 }\nfunc exercise(): int = early() + natural()\npublic func main(): void = {}"
+			.into(),
+		SourceVersion(1),
+	);
+
+	let emitted = session
+		.emit_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
+		.expect("used native Range loops emit with their Option completion ABI");
+	let source = &emitted.module_sources["main"];
+	assert_eq!(
+		source.matches("from \"@nymph/runtime/option\"").count(),
+		1,
+		"{source}"
+	);
+	assert!(!source.contains("@nymph/runtime/range"), "{source}");
+	assert!(!source.contains("@nymph/runtime/iter"), "{source}");
+	assert_eq!(source.matches("while (").count(), 2, "{source}");
+	assert!(emitted.module_sources.contains_key("@nymph/runtime/option"));
+	assert!(!emitted.module_sources.contains_key("@nymph/runtime/range"));
+	assert!(!emitted.module_sources.contains_key("@nymph/runtime/iter"));
+
+	let compiled = session
+		.compile_interface_project_for_test(project, main, EntryMode::Entry)
+		.expect("native Range completion values bundle");
+	assert_eq!(
+		compiled
+			.js
+			.matches("//#region @nymph/runtime/option")
+			.count(),
+		1,
+		"{}",
+		compiled.js
+	);
+	assert!(
+		!compiled.js.contains("@nymph/runtime/range"),
+		"{}",
+		compiled.js
+	);
+	assert!(
+		!compiled.js.contains("@nymph/runtime/iter"),
+		"{}",
+		compiled.js
+	);
+
+	let exercise = compiled.entry_symbol("exercise");
+	let script = format!("{}\nconsole.log({exercise}().v);\n", compiled.js);
+	let path = std::env::temp_dir().join(format!(
+		"nymph-stable-range-results-{}.mjs",
+		std::process::id()
+	));
+	std::fs::write(&path, script).unwrap();
+	let output = std::process::Command::new("node")
+		.arg(&path)
+		.output()
+		.unwrap();
+	let _ = std::fs::remove_file(path);
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(String::from_utf8_lossy(&output.stdout), "6\n");
+}
+
+#[test]
 fn stable_emission_links_exact_ambient_math_demands_once_and_runs() {
 	let mut session = CompilerSession::new();
 	let project = ProjectId::new("stable-math-runtime");

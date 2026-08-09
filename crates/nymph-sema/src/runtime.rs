@@ -1849,6 +1849,13 @@ fn required_type_nodes(
 					}
 				}
 			}
+			ExprKind::Range(RangeKind::Exclusive { min, .. } | RangeKind::Inclusive { min, .. }) => {
+				let mut source = min.as_ref();
+				while let ExprKind::Grouped(inner) = &source.kind {
+					source = inner;
+				}
+				required.insert(source.id);
+			}
 			ExprKind::TypeOp { lhs, .. }
 				if checked
 					.annotations
