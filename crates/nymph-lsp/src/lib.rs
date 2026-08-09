@@ -302,9 +302,9 @@ fn main_loop(
 				} else if req.method == References::METHOD {
 					let (id, params) = req.extract::<ReferenceParams>(References::METHOD)?;
 					let uri = &params.text_document_position.text_document.uri;
-					let compiler = compiler.lock().unwrap();
+					let mut compiler = compiler.lock().unwrap();
 					let docs_guard = docs.lock().unwrap();
-					let snapshot = compiler.analysis_for_uri(&docs_guard, uri);
+					let snapshot = compiler.references_analysis_for_uri(&docs_guard, uri);
 					let response = match snapshot {
 						Some(snapshot) => {
 							let candidate = references::references_snapshot_candidate(
@@ -1803,6 +1803,132 @@ mod tests {
 			}
 		};
 		assert!(missing.is_none());
+
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn references_request_discovers_unopened_modules_added_after_initial_sync() {
+		use lsp_types::{
+			Position, ReferenceContext, ReferenceParams, TextDocumentIdentifier,
+			TextDocumentPositionParams, WorkDoneProgressParams,
+			request::{References, Request as _},
+		};
+
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='late-references'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let target_path = temp.path().join("src/target.nym");
+		let target_source = "public func answer(): int = 1";
+		std::fs::write(&target_path, target_source).unwrap();
+		let target_uri = workspace::path_to_uri(&target_path).unwrap();
+
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		handshake(&client);
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidOpenTextDocument::METHOD.to_string(),
+				serde_json::to_value(DidOpenTextDocumentParams {
+					text_document: TextDocumentItem {
+						uri: target_uri.clone(),
+						language_id: "nymph".to_string(),
+						version: 1,
+						text: target_source.to_string(),
+					},
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		let _ = recv_diagnostics_for(&client, &target_uri);
+
+		let importer_path = temp.path().join("src/late_importer.nym");
+		std::fs::write(
+			&importer_path,
+			"import @/target with (answer)\nfunc use(): int = answer()",
+		)
+		.unwrap();
+		std::fs::write(
+			temp.path().join("src/malformed.nym"),
+			"func broken(: = answer answer",
+		)
+		.unwrap();
+
+		let request = |id| {
+			Message::Request(Request::new(
+				RequestId::from(id),
+				References::METHOD.to_string(),
+				serde_json::to_value(ReferenceParams {
+					text_document_position: TextDocumentPositionParams {
+						text_document: TextDocumentIdentifier {
+							uri: target_uri.clone(),
+						},
+						position: Position::new(0, 13),
+					},
+					work_done_progress_params: WorkDoneProgressParams::default(),
+					partial_result_params: Default::default(),
+					context: ReferenceContext {
+						include_declaration: true,
+					},
+				})
+				.unwrap(),
+			))
+		};
+		let receive = || -> Option<Vec<lsp_types::Location>> {
+			loop {
+				match client.receiver.recv().unwrap() {
+					Message::Response(response) => {
+						break serde_json::from_value(response.response_result.unwrap()).unwrap();
+					}
+					_ => continue,
+				}
+			}
+		};
+
+		client.sender.send(request(3)).unwrap();
+		let found = receive().expect("references result");
+		assert_eq!(found.len(), 3, "declaration, late import, and late use");
+		let importer_uri = workspace::path_to_uri(&importer_path).unwrap();
+		assert_eq!(
+			found
+				.iter()
+				.filter(|location| location.uri == importer_uri)
+				.map(|location| location.range.start)
+				.collect::<Vec<_>>(),
+			vec![Position::new(0, 22), Position::new(1, 18)]
+		);
+
+		std::fs::write(
+			&importer_path,
+			"\nimport @/target with (answer)\nfunc use(): int = answer()\nfunc again(): int = answer()",
+		)
+		.unwrap();
+		client.sender.send(request(4)).unwrap();
+		let refreshed = receive().expect("references after unopened disk edit");
+		assert_eq!(refreshed.len(), 4);
+		assert_eq!(
+			refreshed
+				.iter()
+				.filter(|location| location.uri == importer_uri)
+				.map(|location| location.range.start)
+				.collect::<Vec<_>>(),
+			vec![
+				Position::new(1, 22),
+				Position::new(2, 18),
+				Position::new(3, 20),
+			]
+		);
+
+		std::fs::remove_file(importer_path).unwrap();
+		client.sender.send(request(5)).unwrap();
+		let after_delete = receive().expect("references after unopened module deletion");
+		assert_eq!(after_delete.len(), 1);
+		assert_eq!(after_delete[0].uri, target_uri);
 
 		shutdown(&client, handle);
 	}

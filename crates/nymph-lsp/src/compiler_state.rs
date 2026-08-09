@@ -417,6 +417,90 @@ impl CompilerState {
 		})
 	}
 
+	/// Refresh filesystem-backed project membership before taking the snapshot
+	/// used by a project-wide references request. Open overlays remain
+	/// authoritative for their logical modules.
+	pub fn references_analysis_for_uri(
+		&mut self,
+		docs: &DocumentStore,
+		uri: &Uri,
+	) -> Option<AnalysisSnapshot> {
+		self.refresh_project_sources(docs, uri).ok()?;
+		self.analysis_for_uri(docs, uri)
+	}
+
+	fn refresh_project_sources(&mut self, docs: &DocumentStore, uri: &Uri) -> anyhow::Result<()> {
+		let Some(identity) = self.documents.get(uri).cloned() else {
+			return Ok(());
+		};
+		if !matches!(identity.kind, DocumentKind::Project(_)) {
+			return Ok(());
+		}
+
+		let mut disk_modules = BTreeMap::new();
+		for (path, module) in nymph_files(&identity.root)? {
+			let source = fs::read_to_string(&path)?;
+			disk_modules.insert(module, (path, source));
+		}
+		let disk_identities: HashSet<_> = disk_modules
+			.keys()
+			.map(|module| ModuleIdentity {
+				project: identity.project.clone(),
+				module: module.clone(),
+				without_prelude: identity.without_prelude,
+			})
+			.collect();
+		let known_identities: HashSet<_> = self
+			.documents
+			.values()
+			.filter(|candidate| {
+				candidate.project == identity.project
+					&& candidate.root == identity.root
+					&& candidate.without_prelude == identity.without_prelude
+					&& matches!(candidate.kind, DocumentKind::Project(_))
+			})
+			.map(DocumentIdentity::module_identity)
+			.collect();
+		let mut removed = HashSet::new();
+		for known in known_identities {
+			let has_open_overlay = self
+				.authoritative_overlays
+				.get(&known)
+				.is_some_and(|open_uri| docs.get(open_uri).is_some());
+			if !disk_identities.contains(&known) && !has_open_overlay {
+				self.authoritative_overlays.remove(&known);
+				self.remove_effective_source(&known);
+				removed.insert(known);
+			}
+		}
+		self.documents.retain(|document_uri, candidate| {
+			docs.get(document_uri).is_some() || !removed.contains(&candidate.module_identity())
+		});
+
+		for (module, (path, source)) in disk_modules {
+			let disk_identity = DocumentIdentity {
+				project: identity.project.clone(),
+				module: module.clone(),
+				entry: module,
+				root: identity.root.clone(),
+				without_prelude: identity.without_prelude,
+				kind: DocumentKind::Project(path.clone()),
+			};
+			let module_identity = disk_identity.module_identity();
+			let has_open_overlay = self
+				.authoritative_overlays
+				.get(&module_identity)
+				.is_some_and(|open_uri| docs.get(open_uri).is_some());
+			if !has_open_overlay {
+				self.set_effective_source(&module_identity, source, SourceVersion(0));
+			}
+			if let Some(disk_uri) = workspace::path_to_uri(&path) {
+				self.documents.entry(disk_uri).or_insert(disk_identity);
+			}
+		}
+		Ok(())
+	}
+
 	pub fn completion_for_uri(&self, docs: &DocumentStore, uri: &Uri) -> Option<CompletionSnapshot> {
 		let document = docs.get(uri)?;
 		let identity = self.documents.get(uri)?;
@@ -833,9 +917,9 @@ impl CompilerState {
 	}
 
 	fn synchronize(&mut self, docs: &DocumentStore, uri: &Uri) -> anyhow::Result<()> {
-		// Filesystem discovery is intentionally tied to the first project open.
-		// Without a watcher, later external adds/deletes of unopened files are
-		// not events; opening a file still overlays or adds its live source.
+		// Notification-driven discovery is tied to the first project open;
+		// project-wide reference requests explicitly refresh filesystem
+		// membership, while opening a file always overlays or adds its live source.
 		let previous_identity = self.documents.get(uri).cloned();
 		let class = match workspace::classify_uri(uri) {
 			Err(error) => {
