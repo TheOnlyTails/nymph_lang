@@ -17,7 +17,12 @@ void test(".nym is the extension's sole source suffix", () => {
 
 	const clientSource = fs.readFileSync(path.join(extensionRoot, "src", "extension.ts"), "utf8");
 	assert.match(clientSource, /language:\s*["']nymph["']/);
-	assert.match(clientSource, /createFileSystemWatcher\(["']\*\*\/\*\.nym["']\)/);
+	assert.doesNotMatch(clientSource, /createFileSystemWatcher/);
+	const serverSource = fs.readFileSync(
+		path.join(repositoryRoot, "crates", "nymph-lsp", "src", "lib.rs"),
+		"utf8",
+	);
+	assert.match(serverSource, /\["\*\*\/\*\.nym", "\*\*\/nymph\.toml"\]/);
 	assert.ok(!clientSource.includes(`.nym${"ph"}`));
 });
 

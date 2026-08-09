@@ -55,6 +55,11 @@ pub enum CloseAction {
 	Clear,
 }
 
+pub struct WatchedFileRefresh {
+	pub origin: Uri,
+	pub affected: Vec<Uri>,
+}
+
 pub struct DiagnosticModuleSnapshot {
 	pub uri: Uri,
 	pub source: Arc<str>,
@@ -234,6 +239,156 @@ impl CompilerState {
 			}
 		}
 		Ok(CloseAction::PublishProject(affected))
+	}
+
+	/// Refresh disk-backed compiler inputs after one client watcher batch.
+	///
+	/// Source events update only active project roots and defer to an existing
+	/// authoritative open overlay for the same canonical module. Manifest
+	/// events re-run discovery for open files below that manifest, allowing
+	/// project/loose/error and source-root transitions to use the same identity
+	/// retirement and overlay replay path as normal document synchronization.
+	pub fn watched_files_changed(
+		&mut self,
+		docs: &mut DocumentStore,
+		uris: &[Uri],
+	) -> anyhow::Result<Vec<WatchedFileRefresh>> {
+		docs.filesystem_changed();
+		let mut refreshes = Vec::new();
+		for uri in uris {
+			let Some(path) = workspace::uri_to_path(uri) else {
+				continue;
+			};
+			let path = std::path::absolute(path)?;
+			if path.file_name().and_then(|name| name.to_str()) == Some("nymph.toml") {
+				self.refresh_manifest(docs, &path, &mut refreshes)?;
+			} else if path.extension().and_then(|extension| extension.to_str()) == Some("nym") {
+				self.refresh_source(docs, &path, &mut refreshes)?;
+			}
+		}
+		Ok(refreshes)
+	}
+
+	fn refresh_manifest(
+		&mut self,
+		docs: &DocumentStore,
+		manifest: &std::path::Path,
+		refreshes: &mut Vec<WatchedFileRefresh>,
+	) -> anyhow::Result<()> {
+		let Some(root) = manifest.parent() else {
+			return Ok(());
+		};
+		let authoritative_uris: HashSet<_> = self
+			.authoritative_overlays
+			.values()
+			.filter(|uri| docs.get(uri).is_some())
+			.map(|uri| uri.as_str().to_string())
+			.collect();
+		let mut open_uris: Vec<_> = docs
+			.iter()
+			.filter_map(|(uri, _)| {
+				workspace::uri_to_path(uri)
+					.and_then(|path| std::path::absolute(path).ok())
+					.filter(|path| path.starts_with(root))
+					.map(|_| uri.clone())
+			})
+			.collect();
+		// Synchronize non-authoritative aliases first. Replaying the previous
+		// authoritative URI last preserves equivalent-URI ownership while still
+		// allowing every alias to transition through fresh manifest discovery.
+		open_uris.sort_by(|left, right| {
+			authoritative_uris
+				.contains(left.as_str())
+				.cmp(&authoritative_uris.contains(right.as_str()))
+				.then_with(|| left.as_str().cmp(right.as_str()))
+		});
+		for uri in open_uris {
+			let mut affected = self.affected_project_documents(docs, &uri);
+			self.synchronize(docs, &uri)?;
+			for current in self.affected_project_documents(docs, &uri) {
+				if !affected.contains(&current) {
+					affected.push(current);
+				}
+			}
+			refreshes.push(WatchedFileRefresh {
+				origin: uri,
+				affected,
+			});
+		}
+		Ok(())
+	}
+
+	fn refresh_source(
+		&mut self,
+		docs: &DocumentStore,
+		path: &std::path::Path,
+		refreshes: &mut Vec<WatchedFileRefresh>,
+	) -> anyhow::Result<()> {
+		let mut roots: Vec<_> = self
+			.documents
+			.values()
+			.filter(|identity| {
+				matches!(identity.kind, DocumentKind::Project(_))
+					&& self.synchronized_roots.contains(&identity.root)
+			})
+			.filter_map(|identity| {
+				let module = nymph_project::module_from_file(&identity.root, path).ok()?;
+				Some((
+					identity.root.clone(),
+					identity.project.clone(),
+					identity.without_prelude,
+					module,
+				))
+			})
+			.collect();
+		roots.sort_by(|left, right| {
+			left
+				.0
+				.cmp(&right.0)
+				.then_with(|| left.3.as_str().cmp(right.3.as_str()))
+		});
+		roots.dedup_by(|left, right| {
+			left.0 == right.0 && left.1 == right.1 && left.2 == right.2 && left.3 == right.3
+		});
+		for (root, project, without_prelude, module) in roots {
+			let disk_path = nymph_project::file_for_module(&root, &module);
+			let Some(origin) = workspace::path_to_uri(&disk_path) else {
+				continue;
+			};
+			let identity = DocumentIdentity {
+				project,
+				module: module.clone(),
+				entry: module,
+				root,
+				without_prelude,
+				kind: DocumentKind::Project(disk_path.clone()),
+			};
+			self
+				.documents
+				.entry(origin.clone())
+				.or_insert(identity.clone());
+			let mut affected = self.affected_project_documents(docs, &origin);
+			let module_identity = identity.module_identity();
+			if self
+				.remaining_overlay(docs, &module_identity, None)
+				.is_none()
+			{
+				match fs::read_to_string(&disk_path) {
+					Ok(source) => self.set_effective_source(&module_identity, source, SourceVersion(0)),
+					Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+						self.remove_effective_source(&module_identity);
+					}
+					Err(error) => return Err(error.into()),
+				}
+			}
+			for current in self.affected_project_documents(docs, &origin) {
+				if !affected.contains(&current) {
+					affected.push(current);
+				}
+			}
+			refreshes.push(WatchedFileRefresh { origin, affected });
+		}
+		Ok(())
 	}
 
 	fn affected_project_documents(&self, docs: &DocumentStore, uri: &Uri) -> Vec<Uri> {
@@ -829,7 +984,23 @@ impl CompilerState {
 		self.documents.insert(uri.clone(), identity.clone());
 
 		if matches!(kind, DocumentKind::Project(_)) && self.synchronized_roots.insert(root.clone()) {
-			for (path, module) in nymph_files(&root)? {
+			let files = nymph_files(&root)?;
+			let disk_modules: HashSet<_> = files.iter().map(|(_, module)| module.clone()).collect();
+			let stale_modules: Vec<_> = self
+				.effective_sources
+				.keys()
+				.filter(|module| {
+					module.project == project
+						&& module.without_prelude == without_prelude
+						&& !disk_modules.contains(&module.module)
+						&& self.remaining_overlay(docs, module, None).is_none()
+				})
+				.cloned()
+				.collect();
+			for module in stale_modules {
+				self.remove_effective_source(&module);
+			}
+			for (path, module) in files {
 				if let Ok(source) = fs::read_to_string(&path) {
 					let disk_identity = DocumentIdentity {
 						project: project.clone(),
