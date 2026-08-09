@@ -5,7 +5,7 @@ use std::{
 
 use nymph_ast::{
 	decl::Declaration,
-	expr::{ExprKind, StringPart},
+	expr::{ExprKind, Statement, StringPart},
 	token::Token,
 };
 use nymph_format::format;
@@ -202,6 +202,69 @@ fn block_elision_preserves_control_flow_precedence_and_dangling_else_binding() {
 }
 
 #[test]
+fn call_argument_elision_does_not_turn_positional_assignments_into_named_arguments() {
+	let source = "func sink(x: int): int = x\n\
+		func repro(): int = {\n\
+		\tlet mut x = 0\n\
+		\tsink((x = 1))\n\
+		\tsink({ x = 2 })\n\
+		\tx\n\
+		}\n";
+	let actual = format(source, "call-argument-elision.nym").expect("format call arguments");
+	assert_eq!(
+		format(&actual, "call-argument-elision.nym").unwrap(),
+		actual
+	);
+
+	let parsed = parse_module(&actual, "call-argument-elision.nym");
+	assert!(parsed.diagnostics.is_empty());
+	let Declaration::Func { body, .. } = &parsed.tree.members[1] else {
+		panic!("expected repro function");
+	};
+	let ExprKind::Block { body, .. } = &body.kind else {
+		panic!("expected repro block");
+	};
+	for statement in &body[1..=2] {
+		let Statement::Expr(call) = &statement.0 else {
+			panic!("expected call statement");
+		};
+		let ExprKind::Call { args, .. } = &call.kind else {
+			panic!("expected call expression");
+		};
+		assert!(args[0].0.name.is_none(), "positional call became named");
+	}
+}
+
+#[test]
+fn block_elision_preserves_else_ownership_through_prefix_and_range_operands() {
+	let source = "func prefix(a: bool, b: bool): bool = if (a) { !if (b) true } else false\n\
+		func range(a: bool, b: bool) = if (a) { 0..if (b) 1 } else 2\n";
+	let actual = format(source, "dangling-else-operands.nym").expect("format dangling else cases");
+	assert_eq!(
+		format(&actual, "dangling-else-operands.nym").unwrap(),
+		actual
+	);
+	let parsed = parse_module(&actual, "dangling-else-operands.nym");
+	assert!(parsed.diagnostics.is_empty());
+	for declaration in &parsed.tree.members {
+		let Declaration::Func { body, .. } = declaration else {
+			panic!("expected function declaration");
+		};
+		let ExprKind::If {
+			then, otherwise, ..
+		} = &body.kind
+		else {
+			panic!("expected outer if expression");
+		};
+		assert!(otherwise.is_some(), "outer else changed ownership");
+		assert!(
+			matches!(then.kind, ExprKind::Block { .. }),
+			"protective then block was removed"
+		);
+	}
+}
+
+#[test]
 fn required_precedence_groups_have_canonical_spacing_and_are_idempotent() {
 	let source = "func left(a:int,b:int,c:int)= (a + b) * c\n\
 		func right(a:int,b:int,c:int)= a * (b + c)\n\
@@ -263,4 +326,12 @@ fn width_uses_the_full_line_and_unicode_display_columns() {
 	.expect("format Unicode width boundary");
 	assert!(unicode.contains("界(\n\tone,\n\ttwo,\n)"));
 	assert_eq!(format(&unicode, "unicode-width.nym").unwrap(), unicode);
+}
+
+#[test]
+fn unicode_xid_identifiers_always_advance_the_lossless_scanner() {
+	let source = "let ℘ = 1\nlet a\u{301} = ℘\n";
+	let actual = format(source, "unicode-identifiers.nym").expect("format Unicode identifiers");
+	assert_eq!(actual, source);
+	assert_eq!(format(&actual, "unicode-identifiers.nym").unwrap(), actual);
 }

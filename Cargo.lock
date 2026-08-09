@@ -1561,6 +1561,7 @@ dependencies = [
  "nymph-diagnostics",
  "nymph-syntax",
  "thiserror",
+ "unicode-ident",
  "unicode-width",
 ]
 

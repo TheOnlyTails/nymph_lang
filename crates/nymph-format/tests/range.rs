@@ -93,6 +93,19 @@ fn comments_are_not_detached_or_dropped_by_range_expansion() {
 }
 
 #[test]
+fn unmatched_closer_selection_does_not_widen_to_unrelated_declarations() {
+	let source =
+		"let before=0\r\nnamespace Util{\r\nfunc id(value:int):int=value\r\n}\r\nlet after=2\r\n";
+	let close = source.rfind("}\r\n").unwrap();
+	assert!(
+		format_range(source, "closer-range.nym", Span::new(close, close + 1))
+			.expect("valid closer selection")
+			.is_none(),
+		"a closer-only selection must not rewrite from byte zero"
+	);
+}
+
+#[test]
 fn safe_block_removal_expands_over_the_entire_block() {
 	let source = "func answer() = { 42 }\n";
 	let edit = assert_bounded_range(source, byte_span(source, "42"));

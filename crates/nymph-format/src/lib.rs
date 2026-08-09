@@ -90,7 +90,9 @@ pub fn format_range(
 	}
 	let expression_unit = smallest_containing(&hints.removable_units, range)
 		.or_else(|| smallest_containing(&hints.units, range));
-	let selected = expression_unit.unwrap_or_else(|| select_unit(source, range));
+	let Some(selected) = expression_unit.or_else(|| select_unit(source, range)) else {
+		return Ok(None);
+	};
 	let fragment = &source[selected.start..selected.end];
 	let mut candidate = format_fragment(fragment);
 	if expression_unit.is_some() {
@@ -449,7 +451,9 @@ impl Hints {
 			ExprKind::Call { func, args, .. } => {
 				self.visit_expr(source, func, false);
 				for arg in args {
-					self.visit_expr(source, &arg.0.value, true);
+					let removable =
+						arg.0.name.is_some() || arg.0.spread || !exposes_named_argument(&arg.0.value);
+					self.visit_expr(source, &arg.0.value, removable);
 				}
 			}
 			ExprKind::MemberAccess { parent, .. }
@@ -598,6 +602,7 @@ fn ends_in_unmatched_if(expr: &Expr) -> bool {
 		ExprKind::While { body, .. } | ExprKind::For { body, .. } | ExprKind::Closure { body, .. } => {
 			ends_in_unmatched_if(body)
 		}
+		ExprKind::PrefixOp { value, .. } => ends_in_unmatched_if(value),
 		ExprKind::Return {
 			value: Some(value), ..
 		}
@@ -606,6 +611,28 @@ fn ends_in_unmatched_if(expr: &Expr) -> bool {
 		}
 		| ExprKind::BinaryOp { rhs: value, .. }
 		| ExprKind::AssignOp { rhs: value, .. } => ends_in_unmatched_if(value),
+		ExprKind::Range(range) => match range {
+			nymph_ast::expr::RangeKind::To(value)
+			| nymph_ast::expr::RangeKind::ToInclusive(value)
+			| nymph_ast::expr::RangeKind::Exclusive { max: value, .. }
+			| nymph_ast::expr::RangeKind::Inclusive { max: value, .. } => ends_in_unmatched_if(value),
+			nymph_ast::expr::RangeKind::From(_) => false,
+		},
+		_ => false,
+	}
+}
+
+fn exposes_named_argument(expr: &Expr) -> bool {
+	match &expr.kind {
+		ExprKind::Grouped(inner) => exposes_named_argument(inner),
+		ExprKind::Block { body, label: None } if body.len() == 1 => match &body[0].0 {
+			Statement::Expr(expr) => exposes_named_argument(expr),
+			Statement::Let { .. } => false,
+		},
+		ExprKind::AssignOp { lhs, op, .. } => {
+			matches!(lhs.kind, ExprKind::Identifier(_))
+				&& matches!(op, nymph_ast::ops::AssignOperator::Assign)
+		}
 		_ => false,
 	}
 }
@@ -762,8 +789,8 @@ fn interpolation_close(source: &str, mut at: usize, end: usize) -> Option<usize>
 	None
 }
 
-fn select_unit(source: &str, requested: Span) -> Span {
-	let mut start = source[..requested.start.min(source.len())]
+fn select_unit(source: &str, requested: Span) -> Option<Span> {
+	let start = source[..requested.start.min(source.len())]
 		.rfind('\n')
 		.map_or(0, |index| index + 1);
 	let mut end = source[requested.end.min(source.len())..]
@@ -779,11 +806,12 @@ fn select_unit(source: &str, requested: Span) -> Span {
 			.map_or(source.len() - end, |i| i + 1);
 		depth = delimiter_depth(&source[start..end]);
 	}
-	// A closing delimiter belongs to the construct beginning above the requested line.
+	// A closer without its opener cannot be formatted safely without a construct
+	// span: widening to byte zero would rewrite unrelated preceding declarations.
 	if depth < 0 {
-		start = 0;
+		return None;
 	}
-	Span::new(start, end)
+	Some(Span::new(start, end))
 }
 
 fn delimiter_depth(text: &str) -> i32 {
@@ -889,10 +917,13 @@ impl<'a> Scanner<'a> {
 		];
 		if let Some(op) = OPS.iter().find(|op| rest.starts_with(**op)) {
 			self.at += op.len();
-		} else if first.is_ascii_alphanumeric() || first == '_' || !first.is_ascii() {
-			self.at += rest
+		} else if first.is_ascii_alphanumeric() || first == '_' || unicode_ident::is_xid_start(first) {
+			self.at += first.len_utf8();
+			self.at += self.source[self.at..]
 				.char_indices()
-				.take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
+				.take_while(|(_, c)| {
+					c.is_ascii_alphanumeric() || *c == '_' || unicode_ident::is_xid_continue(*c)
+				})
 				.map(|(_, c)| c.len_utf8())
 				.sum::<usize>();
 		} else {
