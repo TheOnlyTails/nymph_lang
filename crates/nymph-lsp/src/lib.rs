@@ -153,6 +153,15 @@ fn prepare_semantic_tokens_response(
 	prepare_if_current(docs, uri, snapshot, value)
 }
 
+fn prepare_definition_response(
+	docs: &Mutex<DocumentStore>,
+	uri: &lsp_types::Uri,
+	snapshot: &compiler_state::AnalysisSnapshot,
+	value: Option<lsp_types::GotoDefinitionResponse>,
+) -> Option<Option<lsp_types::GotoDefinitionResponse>> {
+	prepare_if_current(docs, uri, snapshot, value)
+}
+
 fn main_loop(
 	connection: &Connection,
 	docs: &Arc<Mutex<DocumentStore>>,
@@ -194,10 +203,35 @@ fn main_loop(
 						.send(Message::Response(Response::new_ok(id, result)))?;
 				} else if req.method == GotoDefinition::METHOD {
 					let (id, params) = req.extract::<GotoDefinitionParams>(GotoDefinition::METHOD)?;
-					let result = definition::definition(&docs.lock().unwrap(), &params);
-					connection
-						.sender
-						.send(Message::Response(Response::new_ok(id, result)))?;
+					let uri = &params.text_document_position_params.text_document.uri;
+					let compiler = compiler.lock().unwrap();
+					let docs_guard = docs.lock().unwrap();
+					let snapshot = compiler.analysis_for_uri(&docs_guard, uri);
+					let response = match snapshot {
+						Some(snapshot) => {
+							let candidate = definition::definition_snapshot_candidate(
+								&docs_guard,
+								&compiler,
+								&snapshot,
+								&params,
+							);
+							drop(docs_guard);
+							drop(compiler);
+							let result = candidate.and_then(|candidate| candidate.validate_disk_source());
+							prepare_definition_response(docs, uri, &snapshot, result)
+						}
+						None => {
+							let result = definition::definition(&docs_guard, &params);
+							drop(docs_guard);
+							drop(compiler);
+							Some(result)
+						}
+					};
+					if let Some(result) = response {
+						connection
+							.sender
+							.send(Message::Response(Response::new_ok(id, result)))?;
+					}
 				} else if req.method == Completion::METHOD {
 					let (id, params) = req.extract::<CompletionParams>(Completion::METHOD)?;
 					let result = completion::completion(&docs.lock().unwrap(), &params);
@@ -1064,6 +1098,7 @@ mod tests {
 
 		assert!(prepare_hover_response(&docs, &uri, &snapshot, None).is_none());
 		assert!(prepare_semantic_tokens_response(&docs, &uri, &snapshot, None).is_none());
+		assert!(prepare_definition_response(&docs, &uri, &snapshot, None).is_none());
 	}
 
 	/// A round trip through the real `Connection::memory()` wire (not just a

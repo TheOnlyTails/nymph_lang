@@ -30,6 +30,7 @@ fn semantic_analysis_owns_source_and_node_annotations_without_diagnostics() {
 		module: Arc::new(module.clone()),
 		checked: Arc::new(checked.facts),
 		annotations,
+		declarations: Arc::default(),
 	};
 	let cloned = analysis.clone();
 

@@ -283,6 +283,8 @@ struct SourceRecord {
 /// This intentionally exposes compiler values rather than Salsa inputs or a
 /// database handle, so tooling can safely retain the result between requests.
 pub struct ModuleAnalysis {
+	/// Exact source input from which `semantic` was produced.
+	pub source: Arc<str>,
 	pub semantic: Arc<nymph_sema::SemanticAnalysis>,
 	pub diagnostics: ProjectDiagnostics,
 }
@@ -318,6 +320,19 @@ pub enum BuiltinRuntimeOwnerShape {
 }
 
 impl ModuleAnalysis {
+	#[must_use]
+	pub fn stable_definition_at(&self, offset: usize) -> Option<nymph_sema::DefinitionId> {
+		nymph_sema::query::stable_definition_at(&self.semantic, offset)
+	}
+
+	#[must_use]
+	pub fn declaration_provenance(
+		&self,
+		definition: &nymph_sema::DefinitionId,
+	) -> Option<nymph_sema::DeclarationProvenance> {
+		self.semantic.declaration(definition)
+	}
+
 	/// Query the checked type at a source offset.
 	///
 	/// This is the safe tooling seam: the private module has the exact flattened

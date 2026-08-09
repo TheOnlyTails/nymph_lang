@@ -329,7 +329,17 @@ impl Checker<'_> {
 			return self.interner.error();
 		};
 
-		match self.defs.data(def).kind {
+		let kind = self.defs.data(def).kind;
+		if matches!(
+			kind,
+			DefKind::Struct | DefKind::Enum | DefKind::TypeAlias | DefKind::Interface
+		) {
+			self
+				.annotations
+				.record_type_definition_target(name.1, self.defs.stable(def));
+		}
+
+		match kind {
 			DefKind::Struct | DefKind::Enum => {
 				let args = GenericArgs::new(positional, named);
 				self.interner.mk_adt(def, args)

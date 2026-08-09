@@ -881,6 +881,43 @@ fn collect_expr<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 // straight from the AST plus a freshly rebuilt [`DefMap`], independent of any
 // `Checked` result.
 
+/// Resolve the stable declaration denoted at an exact byte offset in checked
+/// source. This deliberately excludes ordinary fields/members. Namespace
+/// members are considered only over the member identifier's strict half-open span.
+#[must_use]
+pub fn stable_definition_at(
+	analysis: &crate::SemanticAnalysis,
+	offset: usize,
+) -> Option<crate::DefinitionId> {
+	let mut exprs = Vec::new();
+	for decl in &analysis.module.members {
+		collect_decl_exprs(decl, &mut exprs);
+	}
+	let candidate = exprs
+		.into_iter()
+		.filter_map(|expr| {
+			let span = match &expr.kind {
+				ExprKind::Identifier(_) => expr.span,
+				ExprKind::MemberAccess { member, .. } => member.1,
+				_ => return None,
+			};
+			covers(span, offset).then_some((span, expr.id))
+		})
+		.min_by_key(|(span, _)| span.end - span.start);
+	if let Some((_, id)) = candidate
+		&& let Some(target) = analysis.annotations.definition_target_of(id)
+	{
+		return Some(target.clone());
+	}
+
+	analysis
+		.annotations
+		.type_definition_targets()
+		.filter(|(span, _)| covers(*span, offset))
+		.min_by_key(|(span, _)| span.end - span.start)
+		.map(|(_, target)| target.clone())
+}
+
 /// Find the definition site of the identifier (or bare enum variant, or
 /// type-position type name) at byte `offset` in `module`. Resolution order,
 /// mirroring `infer_identifier`'s shadowing: the nearest enclosing

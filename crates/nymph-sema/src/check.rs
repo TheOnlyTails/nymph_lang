@@ -664,6 +664,18 @@ fn check_module_with_environment_parts(
 	let implementation_start = imported_implementations.impls.len();
 	let inherent_start = imported_inherent.impls.len();
 	let defs = build_def_map_on(&module, imported_defs, &mut diagnostics, Some(&headers));
+	let declarations = defs
+		.iter()
+		.filter_map(|(_, data)| match (&data.origin, &data.stable) {
+			(crate::def::DefOrigin::Local { .. }, Some(stable)) => Some((
+				stable.clone(),
+				crate::DeclarationProvenance {
+					name_span: data.span,
+				},
+			)),
+			_ => None,
+		})
+		.collect();
 	let mut checker = Checker::new(&module, defs, diagnostics);
 	checker.interner = interner;
 	checker.sigs = imported_signatures;
@@ -714,6 +726,7 @@ fn check_module_with_environment_parts(
 			module,
 			checked: facts,
 			annotations,
+			declarations: std::sync::Arc::new(declarations),
 		}),
 		diagnostics,
 		lowerable,
