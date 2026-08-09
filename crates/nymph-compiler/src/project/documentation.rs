@@ -5,10 +5,10 @@ use std::{
 	sync::Arc,
 };
 
-use nymph_ast::decl::{Declaration, Visibility};
+use nymph_ast::decl::Visibility;
 use nymph_sema::{
 	DefinitionId, DefinitionShapeKind, ExportedDefinition, ExportedImpl, GenericConstraint,
-	GenericParameter, InterfaceType, MemberKind, MemberShape, ModuleIdentity, ParameterShape,
+	GenericParameter, InterfaceType, MemberKind, MemberShape, ParameterShape,
 };
 
 use super::{CompilerSession, ModulePath, ProjectDiagnostic, ProjectId};
@@ -57,10 +57,12 @@ pub struct DocModule {
 }
 
 /// Checked documentation model for the project-module closure rooted at `entry`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DocProject {
 	pub entry: ModulePath,
 	pub modules: BTreeMap<ModulePath, DocModule>,
+	/// Non-error diagnostics retained from the successful project check.
+	pub diagnostics: Vec<ProjectDiagnostic>,
 }
 
 /// Relative output paths and complete file contents; publication belongs to the caller.
@@ -105,36 +107,13 @@ fn extract(
 	{
 		return Err(diagnostics);
 	}
+	let retained_diagnostics = diagnostics.iter().cloned().collect::<Vec<_>>();
 	let mut modules = BTreeMap::new();
 	for path in session.graph_order(
 		project.clone(),
 		entry.clone(),
 		nymph_sema::EntryMode::Library,
 	) {
-		let analysis = session
-			.analyze_module(
-				project.clone(),
-				entry.clone(),
-				path.clone(),
-				nymph_sema::EntryMode::Library,
-			)
-			.expect("clean reachable module has semantic analysis");
-		let identity = ModuleIdentity {
-			origin: nymph_sema::ModuleOrigin::Project(project.as_str().into()),
-			project: project.as_str().into(),
-			path: path.as_str().into(),
-		};
-		let module = analysis.semantic.module.as_ref().clone();
-		let private = nymph_sema::namespace_summary(identity.clone(), &module)
-			.declarations
-			.into_iter()
-			.filter(|declaration| declaration.visibility == nymph_sema::NamespaceVisibility::Private)
-			.map(|declaration| declaration.definition)
-			.collect::<std::collections::BTreeSet<_>>();
-		let original_interface = session
-			.documentation_module_interface(project.clone(), entry.clone(), path.clone(), false)
-			.expect("clean reachable module is registered")
-			.expect("clean checked module has a complete interface");
 		let interface = session
 			.documentation_module_interface(
 				project.clone(),
@@ -142,35 +121,50 @@ fn extract(
 				path.clone(),
 				options.document_private_items,
 			)
-			.expect("clean reachable module is registered")
-			.expect("clean checked module has a complete interface");
+			.expect("clean reachable module is registered");
+		let interface = match interface {
+			Ok(interface) => interface,
+			Err(error) => {
+				return Err(
+					vec![ProjectDiagnostic {
+						module: path.as_str().to_string(),
+						diag: nymph_diagnostics::Diagnostic::error(
+							"INTERNAL-DOCUMENTATION-INTERFACE".into(),
+							format!("internal documentation interface conversion failed: {error:?}"),
+							nymph_ast::Span::new(0, 0),
+						),
+					}]
+					.into(),
+				);
+			}
+		};
+		let private = interface
+			.exports
+			.iter()
+			.chain(
+				interface
+					.support_definitions
+					.iter()
+					.map(|support| &support.definition),
+			)
+			.filter(|definition| definition.visibility == Some(Visibility::Private))
+			.map(|definition| definition.id.clone())
+			.collect::<std::collections::BTreeSet<_>>();
 		let mut items = interface
 			.exports
 			.iter()
 			.cloned()
-			.map(|definition| item(definition, &private, options.document_private_items))
+			.map(|definition| item(definition, options.document_private_items))
 			.collect::<Vec<_>>();
-		let all_original_implementations = original_interface.implementations.iter().chain(
-			original_interface
-				.exports
-				.iter()
-				.flat_map(|definition| &definition.implementations),
-		);
-		let private_implementations = all_original_implementations
-			.filter(|implementation| {
-				implementation.visibility == Some(Visibility::Private)
-					|| implementation_target(&implementation.self_type)
-						.is_some_and(|target| private.contains(target))
-			})
+		let private_implementations = interface
+			.implementations
+			.iter()
+			.filter(|implementation| implementation_is_private(implementation, &private))
 			.map(|implementation| implementation.id.clone())
 			.collect::<std::collections::BTreeSet<_>>();
-		let all_implementations = interface.implementations.iter().chain(
-			interface
-				.exports
-				.iter()
-				.flat_map(|definition| &definition.implementations),
-		);
-		let mut implementations = all_implementations
+		let mut implementations = interface
+			.implementations
+			.iter()
 			.filter(|implementation| {
 				options.document_private_items || !private_implementations.contains(&implementation.id)
 			})
@@ -183,8 +177,8 @@ fn extract(
 			.collect::<Vec<_>>();
 		items.sort_by(|a, b| a.definition.cmp(&b.definition));
 		implementations.sort_by(|a, b| a.definition.cmp(&b.definition));
-		for (index, implementation) in implementations.iter_mut().enumerate() {
-			implementation.anchor = format!("implementation-{index}");
+		for implementation in &mut implementations {
+			implementation.anchor = implementation_anchor(&implementation.definition);
 		}
 		modules.insert(
 			path.clone(),
@@ -196,95 +190,15 @@ fn extract(
 			},
 		);
 	}
-	Ok(DocProject { entry, modules })
+	Ok(DocProject {
+		entry,
+		modules,
+		diagnostics: retained_diagnostics,
+	})
 }
 
-pub(super) fn make_private_visible(module: &mut nymph_ast::decl::Module) {
-	for declaration in &mut module.members {
-		make_visible(declaration);
-	}
-}
-
-fn make_visible(declaration: &mut Declaration) {
-	let visibility = match declaration {
-		Declaration::Func { visibility, .. }
-		| Declaration::Let { visibility, .. }
-		| Declaration::Struct { visibility, .. }
-		| Declaration::Enum { visibility, .. }
-		| Declaration::TypeAlias { visibility, .. }
-		| Declaration::Interface { visibility, .. }
-		| Declaration::Namespace { visibility, .. }
-		| Declaration::Impl { visibility, .. }
-		| Declaration::ImplFor { visibility, .. }
-		| Declaration::ExternalFunc(visibility, ..)
-		| Declaration::ExternalLet(visibility, ..) => visibility,
-		_ => return,
-	};
-	if *visibility == Some(Visibility::Private) {
-		*visibility = Some(Visibility::Public);
-	}
-	match declaration {
-		Declaration::Struct {
-			fields,
-			members,
-			impls,
-			..
-		} => {
-			for field in fields {
-				make_visibility_public(&mut field.0.visibility);
-			}
-			make_members_visible(members);
-			for implementation in impls {
-				make_members_visible(&mut implementation.0.members);
-			}
-		}
-		Declaration::Enum {
-			variants,
-			members,
-			impls,
-			..
-		} => {
-			for variant in variants {
-				for field in &mut variant.0.fields {
-					make_visibility_public(&mut field.0.visibility);
-				}
-			}
-			make_members_visible(members);
-			for implementation in impls {
-				make_members_visible(&mut implementation.0.members);
-			}
-		}
-		Declaration::Namespace { members, .. }
-		| Declaration::Impl { members, .. }
-		| Declaration::ImplFor { members, .. } => make_members_visible(members),
-		_ => {}
-	}
-}
-
-fn make_members_visible(members: &mut [nymph_ast::Spanned<nymph_ast::decl::ImplMember>]) {
-	for member in members {
-		let visibility = match &mut member.0 {
-			nymph_ast::decl::ImplMember::Let { visibility, .. }
-			| nymph_ast::decl::ImplMember::Func { visibility, .. }
-			| nymph_ast::decl::ImplMember::ExternalLet(visibility, ..)
-			| nymph_ast::decl::ImplMember::ExternalFunc(visibility, ..) => visibility,
-		};
-		make_visibility_public(visibility);
-	}
-}
-
-fn make_visibility_public(visibility: &mut Option<Visibility>) {
-	if *visibility == Some(Visibility::Private) {
-		*visibility = Some(Visibility::Public);
-	}
-}
-
-fn item(
-	definition: ExportedDefinition,
-	private_definitions: &std::collections::BTreeSet<DefinitionId>,
-	document_private_items: bool,
-) -> DocItem {
-	let private = private_definitions.contains(&definition.id);
+fn item(definition: ExportedDefinition, document_private_items: bool) -> DocItem {
+	let private = definition.visibility == Some(Visibility::Private);
 	let anchor = definition_anchor(&definition.id);
 	let signature = signature(&definition, document_private_items);
 	DocItem {
@@ -304,15 +218,24 @@ fn signature(d: &ExportedDefinition, document_private_items: bool) -> DocSignatu
 		.iter()
 		.map(|binder| (binder.id.clone(), binder.name.as_ref()))
 		.collect::<HashMap<_, _>>();
-	let keyword = match d.kind {
-		DefinitionShapeKind::Function => "func ",
-		DefinitionShapeKind::Let => "let ",
-		DefinitionShapeKind::TypeAlias => "type ",
-		DefinitionShapeKind::Struct => "struct ",
-		DefinitionShapeKind::Enum => "enum ",
-		DefinitionShapeKind::Interface => "interface ",
-		DefinitionShapeKind::Namespace => "namespace ",
+	let keyword = match (d.kind, d.declaration_kind) {
+		(DefinitionShapeKind::Function, Some(MemberKind::MutatingFunction)) => "mut func ",
+		(DefinitionShapeKind::Function, Some(MemberKind::StaticFunction)) => "namespace func ",
+		(DefinitionShapeKind::Function, Some(MemberKind::Function) | None) => "func ",
+		(DefinitionShapeKind::Let, Some(MemberKind::MutableValue)) => "let mut ",
+		(DefinitionShapeKind::Let, Some(MemberKind::StaticValue)) => "namespace let ",
+		(DefinitionShapeKind::Let, Some(MemberKind::Value) | None) => "let ",
+		(DefinitionShapeKind::TypeAlias, _) => "type ",
+		(DefinitionShapeKind::Struct, _) => "struct ",
+		(DefinitionShapeKind::Enum, _) => "enum ",
+		(DefinitionShapeKind::Interface, _) => "interface ",
+		(DefinitionShapeKind::Namespace, _) => "namespace ",
+		(DefinitionShapeKind::Function, Some(_)) | (DefinitionShapeKind::Let, Some(_)) => {
+			unreachable!("definition declaration modifier does not match its shape")
+		}
 	};
+	visibility(&mut out, d.visibility);
+	external(&mut out, d.external.as_ref());
 	text(&mut out, keyword);
 	text(&mut out, &d.name);
 	binders(&mut out, &d.binders);
@@ -352,6 +275,7 @@ fn signature(d: &ExportedDefinition, document_private_items: bool) -> DocSignatu
 		.filter(|field| document_private_items || field.visibility != Some(Visibility::Private))
 	{
 		text(&mut out, "\n  ");
+		visibility(&mut out, field.visibility);
 		text(&mut out, &field.name);
 		text(&mut out, ": ");
 		ty_doc(&mut out, &field.ty, &generic_names);
@@ -370,6 +294,7 @@ fn signature(d: &ExportedDefinition, document_private_items: bool) -> DocSignatu
 				if i > 0 {
 					text(&mut out, ", ");
 				}
+				visibility(&mut out, f.visibility);
 				text(&mut out, &f.name);
 				text(&mut out, ": ");
 				ty_doc(&mut out, &f.ty, &generic_names);
@@ -397,6 +322,7 @@ fn implementation_signature(
 		.iter()
 		.map(|binder| (binder.id.clone(), binder.name.as_ref()))
 		.collect::<HashMap<_, _>>();
+	visibility(&mut out, implementation.visibility);
 	text(&mut out, "impl");
 	binders(&mut out, &implementation.binders);
 	text(&mut out, " ");
@@ -430,12 +356,81 @@ fn implementation_signature(
 	out
 }
 
-fn implementation_target(ty: &InterfaceType) -> Option<&DefinitionId> {
+fn type_references_private(
+	ty: &InterfaceType,
+	private_definitions: &std::collections::BTreeSet<DefinitionId>,
+) -> bool {
 	match ty {
-		InterfaceType::Named { definition, .. } => Some(definition),
-		InterfaceType::Mutable(inner) => implementation_target(inner),
-		_ => None,
+		InterfaceType::Named {
+			definition,
+			positional,
+			named,
+		} => {
+			private_definitions.contains(definition)
+				|| positional
+					.iter()
+					.any(|ty| type_references_private(ty, private_definitions))
+				|| named
+					.iter()
+					.any(|(_, ty)| type_references_private(ty, private_definitions))
+		}
+		InterfaceType::List(inner) | InterfaceType::Mutable(inner) => {
+			type_references_private(inner, private_definitions)
+		}
+		InterfaceType::Tuple(items) | InterfaceType::Intersection(items) => items
+			.iter()
+			.any(|ty| type_references_private(ty, private_definitions)),
+		InterfaceType::Map(key, value) => {
+			type_references_private(key, private_definitions)
+				|| type_references_private(value, private_definitions)
+		}
+		InterfaceType::Function {
+			parameters,
+			return_type,
+		} => {
+			parameters
+				.iter()
+				.any(|ty| type_references_private(ty, private_definitions))
+				|| type_references_private(return_type, private_definitions)
+		}
+		InterfaceType::Int
+		| InterfaceType::UInt
+		| InterfaceType::Float
+		| InterfaceType::Char
+		| InterfaceType::String
+		| InterfaceType::Boolean
+		| InterfaceType::Void
+		| InterfaceType::Never
+		| InterfaceType::SelfType
+		| InterfaceType::Generic(_) => false,
 	}
+}
+
+fn implementation_is_private(
+	implementation: &ExportedImpl,
+	private_definitions: &std::collections::BTreeSet<DefinitionId>,
+) -> bool {
+	implementation.visibility == Some(Visibility::Private)
+		|| implementation
+			.interface
+			.as_ref()
+			.is_some_and(|interface| private_definitions.contains(interface))
+		|| type_references_private(&implementation.self_type, private_definitions)
+		|| implementation
+			.interface_arguments
+			.iter()
+			.any(|(_, ty)| type_references_private(ty, private_definitions))
+		|| implementation.constraints.iter().any(|constraint| {
+			private_definitions.contains(&constraint.interface)
+				|| constraint
+					.positional
+					.iter()
+					.any(|ty| type_references_private(ty, private_definitions))
+				|| constraint
+					.named
+					.iter()
+					.any(|(_, ty)| type_references_private(ty, private_definitions))
+		})
 }
 
 fn member_doc(
@@ -451,6 +446,8 @@ fn member_doc(
 			.map(|binder| (binder.id.clone(), binder.name.as_ref())),
 	);
 	text(out, "\n  ");
+	visibility(out, member.visibility);
+	external(out, member.external.as_ref());
 	text(
 		out,
 		match member.kind {
@@ -647,6 +644,22 @@ fn definition(out: &mut DocSignature, target: &DefinitionId) {
 fn text(out: &mut DocSignature, value: &str) {
 	out.0.push(DocFragment::Text(value.to_string()));
 }
+fn visibility(out: &mut DocSignature, value: Option<Visibility>) {
+	let keyword = match value {
+		Some(Visibility::Public) => "public ",
+		Some(Visibility::Internal) => "internal ",
+		Some(Visibility::Private) => "private ",
+		None => return,
+	};
+	text(out, keyword);
+}
+fn external(out: &mut DocSignature, value: Option<&nymph_sema::ExternalAbi>) {
+	if let Some(value) = value {
+		text(out, "external(");
+		text(out, &value.marker);
+		text(out, ") ");
+	}
+}
 fn definition_name(id: &DefinitionId) -> String {
 	match &id.key {
 		nymph_sema::DeclarationKey::TopLevel { name, .. }
@@ -661,8 +674,34 @@ fn module_url(path: &ModulePath) -> String {
 fn definition_anchor(id: &DefinitionId) -> String {
 	format!("item-{}-{}", slug(&definition_name(id)), id.key.duplicate())
 }
+fn implementation_anchor(id: &DefinitionId) -> String {
+	format!("implementation-{}", slug(&format!("{:?}", id.key)))
+}
 fn encode_path(path: &str) -> String {
-	path.split('/').map(slug).collect::<Vec<_>>().join("/")
+	path.split('/').map(path_slug).collect::<Vec<_>>().join("/")
+}
+fn path_slug(value: &str) -> String {
+	let mut encoded = String::new();
+	for b in value.bytes() {
+		if b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_' {
+			encoded.push(char::from(b));
+		} else {
+			encoded.push_str(&format!("~{b:02X}"));
+		}
+	}
+	if is_windows_reserved(&encoded) {
+		format!("~R{encoded}")
+	} else {
+		encoded
+	}
+}
+fn is_windows_reserved(value: &str) -> bool {
+	let value = value.to_ascii_lowercase();
+	matches!(value.as_str(), "con" | "prn" | "aux" | "nul")
+		|| value
+			.strip_prefix("com")
+			.or_else(|| value.strip_prefix("lpt"))
+			.is_some_and(|suffix| matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"))
 }
 fn slug(value: &str) -> String {
 	let mut out = String::new();
@@ -783,7 +822,9 @@ fn escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use nymph_sema::{DeclarationCategory, DeclarationKey, ModuleOrigin, StableIdBuilder};
+	use nymph_sema::{
+		DeclarationCategory, DeclarationKey, ModuleIdentity, ModuleOrigin, StableIdBuilder,
+	};
 
 	#[test]
 	fn doc_duplicate_semantic_ids_have_distinct_stable_anchors() {

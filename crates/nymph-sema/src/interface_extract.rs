@@ -36,6 +36,7 @@ pub struct DeclaredHeaders {
 pub struct ExtractionFactSelection {
 	pub implementations: Range<usize>,
 	pub inherent: Range<usize>,
+	pub include_private_definitions: bool,
 }
 
 impl ExtractionFactSelection {
@@ -50,6 +51,7 @@ impl ExtractionFactSelection {
 			return Self {
 				implementations: checked.semantic.local_implementations.clone(),
 				inherent: checked.semantic.local_inherent.clone(),
+				include_private_definitions: false,
 			};
 		}
 		let current_implementations = checked
@@ -87,13 +89,21 @@ impl ExtractionFactSelection {
 		Self {
 			implementations,
 			inherent: inherent_end.saturating_sub(inherent)..inherent_end,
+			include_private_definitions: false,
 		}
+	}
+
+	#[must_use]
+	pub fn including_private_definitions(mut self) -> Self {
+		self.include_private_definitions = true;
+		self
 	}
 
 	fn all(checked: &CheckedFacts) -> Self {
 		Self {
 			implementations: 0..checked.semantic.implementations.impls.len(),
 			inherent: 0..checked.semantic.inherent.len(),
+			include_private_definitions: false,
 		}
 	}
 }
@@ -352,6 +362,7 @@ fn empty_definition(
 		name,
 		visibility,
 		kind,
+		declaration_kind: None,
 		binders: Vec::new(),
 		constraints: Vec::new(),
 		parameters: Vec::new(),
@@ -360,7 +371,6 @@ fn empty_definition(
 		fields: Vec::new(),
 		variants: Vec::new(),
 		members: Vec::new(),
-		implementations: Vec::new(),
 		super_interfaces: Vec::new(),
 		external: None,
 		runtime_owner: None,
@@ -984,6 +994,97 @@ fn definition_members(
 				ids,
 			),
 			_ => member_shape(&member.0, owner, headers, owner_binders, ids),
+		})
+		.collect()
+}
+
+fn namespace_members(
+	members: &[nymph_ast::Spanned<ImplMember>],
+	def: crate::DefId,
+	owner: &DefinitionId,
+	checked: &CheckedFacts,
+	headers: &DeclaredHeaders,
+	ids: &mut StableIdBuilder,
+) -> Result<Vec<MemberShape<InterfaceType>>, InterfaceConversionError> {
+	let namespace = &checked.semantic.signatures.namespaces[&def];
+	members
+		.iter()
+		.map(|member| match &member.0 {
+			ImplMember::Func {
+				visibility, meta, ..
+			}
+			| ImplMember::ExternalFunc(visibility, _, meta) => {
+				let Some(crate::NamespaceMemberSig::Func { target, sig }) =
+					namespace.members.get(&meta.name.0)
+				else {
+					return Err(InterfaceConversionError::ErrorType);
+				};
+				let facts = crate::annotate::CheckedMethod {
+					definition: target.clone(),
+					generic_count: sig.generics.len(),
+					params: sig.params.iter().map(|parameter| parameter.ty).collect(),
+					ret: sig.ret,
+					bounds: sig.bounds.clone(),
+					external: matches!(member.0, ImplMember::ExternalFunc(..)),
+				};
+				let symbol = match &member.0 {
+					ImplMember::ExternalFunc(_, symbol, _) => Some(symbol),
+					_ => None,
+				};
+				checked_member_shape(
+					meta,
+					*visibility,
+					symbol,
+					&facts,
+					owner,
+					&[],
+					checked,
+					headers,
+					ids,
+				)
+			}
+			ImplMember::Let {
+				visibility, meta, ..
+			}
+			| ImplMember::ExternalLet(visibility, _, meta) => {
+				let Pattern::Binding { name, .. } = &meta.name.0 else {
+					return Err(InterfaceConversionError::ErrorType);
+				};
+				let Some(crate::NamespaceMemberSig::Value { target, ty, .. }) =
+					namespace.members.get(&name.0)
+				else {
+					return Err(InterfaceConversionError::ErrorType);
+				};
+				let id = ids.allocate(DeclarationKey::member(
+					owner.clone(),
+					DeclarationCategory::Method,
+					name.0.clone(),
+				));
+				let ty = canonicalize_type(&checked.interner, *ty, &context(checked, headers))?;
+				let external = match &member.0 {
+					ImplMember::ExternalLet(_, symbol, _) => {
+						Some(external_value_abi(symbol, external_marshal(&ty)))
+					}
+					_ => None,
+				};
+				Ok(MemberShape {
+					id: target.clone().unwrap_or(id),
+					name: name.0.clone(),
+					visibility: *visibility,
+					kind: match meta.kind {
+						nymph_ast::decl::LetKind::Instance => MemberKind::Value,
+						nymph_ast::decl::LetKind::Mut => MemberKind::MutableValue,
+						nymph_ast::decl::LetKind::Namespace => MemberKind::StaticValue,
+					},
+					binders: Vec::new(),
+					constraints: Vec::new(),
+					parameters: Vec::new(),
+					return_type: ty,
+					external,
+					runtime_owner: Some(owner.clone()),
+					has_default: true,
+				})
+			}
 		})
 		.collect()
 }
@@ -1854,8 +1955,6 @@ fn extract_definition(
 					Ok(member)
 				})
 				.collect::<Result<_, InterfaceConversionError>>()?;
-			shape.implementations =
-				extract_nested_interface_implementations(&shape, members, checked, headers)?;
 			shape
 		}
 		Declaration::Namespace {
@@ -1866,20 +1965,37 @@ fn extract_definition(
 			let mut shape =
 				empty_definition(id, source_name, *visibility, DefinitionShapeKind::Namespace);
 			let mut member_ids = StableIdBuilder::new(headers.module.clone());
-			shape.members = members
-				.iter()
-				.map(|m| member_shape(&m.0, &shape.id, headers, &[], &mut member_ids))
-				.collect::<Result<_, _>>()?;
+			shape.members =
+				namespace_members(members, def, &shape.id, checked, headers, &mut member_ids)?;
 			shape
 		}
 		Declaration::Import { .. } | Declaration::Impl { .. } | Declaration::ImplFor { .. } => {
 			unreachable!()
 		}
 	};
+	result.declaration_kind = declaration_member_kind(declaration);
 	// External ABI metadata is intentionally sourced from checked linkage in later
 	// lowering slices; stable ownership is already represented here.
 	result.binders.reserve(0);
 	Ok(Some(result))
+}
+
+fn declaration_member_kind(declaration: &Declaration) -> Option<MemberKind> {
+	match declaration {
+		Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => {
+			Some(match meta.kind {
+				FuncKind::Instance => MemberKind::Function,
+				FuncKind::Mut => MemberKind::MutatingFunction,
+				FuncKind::Namespace => MemberKind::StaticFunction,
+			})
+		}
+		Declaration::Let { meta, .. } | Declaration::ExternalLet(_, _, meta) => Some(match meta.kind {
+			nymph_ast::decl::LetKind::Instance => MemberKind::Value,
+			nymph_ast::decl::LetKind::Mut => MemberKind::MutableValue,
+			nymph_ast::decl::LetKind::Namespace => MemberKind::StaticValue,
+		}),
+		_ => None,
+	}
 }
 
 fn referenced_definitions(ty: &InterfaceType, out: &mut HashSet<DefinitionId>) {
@@ -1976,9 +2092,6 @@ fn referenced_definition_shape(definition: &ExportedDefinition, out: &mut HashSe
 			referenced_definitions(ty, out);
 		}
 	}
-	for implementation in &definition.implementations {
-		referenced_impl_shape(implementation, out);
-	}
 }
 
 fn referenced_impl_shape(implementation: &ExportedImpl, out: &mut HashSet<DefinitionId>) {
@@ -2019,126 +2132,6 @@ fn referenced_impl_shape(implementation: &ExportedImpl, out: &mut HashSet<Defini
 			referenced_definitions(ty, out);
 		}
 	}
-}
-
-fn extract_nested_interface_implementations(
-	owner: &ExportedDefinition,
-	members: &[nymph_ast::Spanned<nymph_ast::decl::InterfaceMember>],
-	checked: &CheckedFacts,
-	headers: &DeclaredHeaders,
-) -> Result<Vec<ExportedImpl>, InterfaceConversionError> {
-	let mut ids = StableIdBuilder::new(headers.module.clone());
-	members
-		.iter()
-		.filter_map(|member| match &member.0 {
-			nymph_ast::decl::InterfaceMember::Impl {
-				interface,
-				generics,
-				members,
-			} => Some((interface, generics, members)),
-			_ => None,
-		})
-		.map(|((interface_name, arguments), generics, members)| {
-			let interface = headers
-				.id(&interface_name.0)
-				.ok_or(InterfaceConversionError::ErrorType)?;
-			let temporary = DefinitionId::new(
-				headers.module.clone(),
-				DeclarationKey::top_level(DeclarationCategory::Namespace, "$interface_impl"),
-			);
-			let generic_names = owner
-				.binders
-				.iter()
-				.map(|binder| binder.name.clone())
-				.chain(generics.iter().map(|generic| generic.0.name.0.clone()))
-				.collect::<Vec<_>>();
-			let (_, temporary_binders) =
-				definition_context(checked, headers, &temporary, generic_names.clone());
-			let typed_arguments = arguments
-				.iter()
-				.map(|argument| ast_type(&argument.0.value.0, headers, &temporary_binders))
-				.collect::<Result<Vec<_>, _>>()?;
-			let interface_generics = checked
-				.semantic
-				.definitions
-				.defs
-				.iter()
-				.enumerate()
-				.find(|(_, definition)| definition.stable.as_ref() == Some(&interface))
-				.and_then(|(index, _)| checked.semantic.interfaces.get(&crate::DefId(index as u32)))
-				.map(|definition| definition.generics.as_slice())
-				.unwrap_or(&[]);
-			let named_arguments = arguments
-				.iter()
-				.zip(&typed_arguments)
-				.enumerate()
-				.map(|(index, (argument, ty))| {
-					let name = argument
-						.0
-						.name
-						.as_ref()
-						.map(|name| name.0.clone())
-						.or_else(|| interface_generics.get(index).cloned())
-						.ok_or(InterfaceConversionError::ErrorType)?;
-					Ok((name, ty.clone()))
-				})
-				.collect::<Result<Vec<_>, InterfaceConversionError>>()?;
-			let id = ids.allocate(DeclarationKey::implementation(ImplementationHeader {
-				interface: Some(interface.clone()),
-				interface_arguments: named_arguments
-					.iter()
-					.map(|(name, ty)| (name.clone(), header_type(ty, &temporary_binders)))
-					.collect(),
-				self_type: HeaderType::SelfType,
-				mutable: false,
-				binders: (0..temporary_binders.len())
-					.map(|index| HeaderBinder {
-						parameter: HeaderParameterId(index as u32),
-					})
-					.collect(),
-				constraints: Vec::new(),
-			}));
-			let (_, binders) = definition_context(checked, headers, &id, generic_names);
-			let interface_arguments = named_arguments
-				.into_iter()
-				.zip(arguments)
-				.map(|((name, _), argument)| Ok((name, ast_type(&argument.0.value.0, headers, &binders)?)))
-				.collect::<Result<Vec<_>, InterfaceConversionError>>()?;
-			let mut member_ids = StableIdBuilder::new(headers.module.clone());
-			let members = members
-				.iter()
-				.map(|member| member_shape(&member.0, &id, headers, &binders, &mut member_ids))
-				.collect::<Result<_, _>>()?;
-			let interface_argument_bindings = interface_arguments
-				.iter()
-				.filter_map(|(name, ty)| {
-					interface_generics
-						.iter()
-						.position(|generic| generic == name)
-						.map(|index| {
-							(
-								GenericParameterId::new(interface.binder(BinderScope::Definition, 0), index as u32),
-								ty.clone(),
-							)
-						})
-				})
-				.collect();
-			Ok(ExportedImpl {
-				id,
-				visibility: owner.visibility,
-				interface: Some(interface),
-				interface_arguments,
-				interface_argument_bindings,
-				self_type: InterfaceType::SelfType,
-				mutable: false,
-				constraints: generic_constraints(generics, headers, &binders[owner.binders.len()..])?,
-				binders,
-				members,
-				member_slots: Default::default(),
-				runtime_owner: None,
-			})
-		})
-		.collect()
 }
 
 fn extract_implementations(
@@ -2412,7 +2405,7 @@ fn extract_implementations(
 			)),
 			_ => None,
 		});
-	for (path, visibility, _mutable, members) in top_level_inherent {
+	for (path, visibility, mutable, members) in top_level_inherent {
 		let id = checked
 			.source_identities
 			.implementations
@@ -2466,7 +2459,7 @@ fn extract_implementations(
 			interface_arguments: Vec::new(),
 			interface_argument_bindings: Vec::new(),
 			self_type: canonicalize_type(&checked.interner, implementation.self_ty, &impl_context)?,
-			mutable: false,
+			mutable,
 			binders,
 			constraints: checked_constraints(
 				&implementation.constraints,
@@ -2553,7 +2546,7 @@ pub fn extract_module_interface_from_facts_with_selection(
 			| Declaration::ExternalLet(visibility, ..) => *visibility,
 			_ => None,
 		};
-		if visible(visibility) {
+		if facts.include_private_definitions || visible(visibility) {
 			exports.push(definition);
 		} else {
 			private.insert(definition.id.clone(), definition);
@@ -3737,6 +3730,7 @@ fn poison_definition(
 		name: name.clone(),
 		visibility,
 		kind,
+		declaration_kind: declaration_member_kind(declaration),
 		availability: SemanticAvailability::Available,
 		binders,
 		constraints: Vec::new(),
@@ -4045,6 +4039,7 @@ impl From<ExportedDefinition> for RecoveredExportedDefinition {
 			name: value.name,
 			visibility: value.visibility,
 			kind: value.kind,
+			declaration_kind: value.declaration_kind,
 			availability: SemanticAvailability::Available,
 			binders: value.binders,
 			constraints: value

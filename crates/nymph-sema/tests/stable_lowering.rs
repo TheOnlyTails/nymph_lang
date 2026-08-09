@@ -569,6 +569,7 @@ fn imported_external_reference_has_exact_stable_marshal_annotation() {
 			name: "maximum".into(),
 			visibility: None,
 			kind: DefinitionShapeKind::Let,
+			declaration_kind: None,
 			binders: vec![],
 			constraints: vec![],
 			parameters: vec![],
@@ -577,7 +578,6 @@ fn imported_external_reference_has_exact_stable_marshal_annotation() {
 			fields: vec![],
 			variants: vec![],
 			members: vec![],
-			implementations: vec![],
 			super_interfaces: vec![],
 			external: Some(ExternalAbi {
 				marker: "max_float".into(),

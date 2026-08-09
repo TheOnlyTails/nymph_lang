@@ -2235,15 +2235,14 @@ pub(crate) fn documentation_module_interface<'db>(
 	}
 	let analysis = interface_module_analysis(db, key, module);
 	let headers = interface_declared_headers(db, key, module);
-	let mut source = analysis.semantic.module.as_ref().clone();
-	super::documentation::make_private_visible(&mut source);
 	let facts = nymph_sema::ExtractionFactSelection::current_module_from_facts(
-		&source,
+		&analysis.semantic.module,
 		&analysis.semantic.checked,
-	);
+	)
+	.including_private_definitions();
 	nymph_sema::extract_module_interface_from_facts_with_selection(
 		module.identity(db),
-		&source,
+		&analysis.semantic.module,
 		&analysis.semantic.checked,
 		&headers,
 		&facts,

@@ -445,6 +445,21 @@ fn check_module_from_parts(
 			}
 		}
 	}
+	for signature in signatures.namespaces.values_mut() {
+		for member in signature.members.values_mut() {
+			match member {
+				crate::NamespaceMemberSig::Func { sig, .. } => {
+					for parameter in &mut sig.params {
+						parameter.ty = checker.resolve_deep(parameter.ty);
+					}
+					sig.ret = checker.resolve_deep(sig.ret);
+				}
+				crate::NamespaceMemberSig::Value { ty, .. } => {
+					*ty = checker.resolve_deep(*ty);
+				}
+			}
+		}
+	}
 	checker.sigs = signatures;
 	let mut interfaces = std::mem::take(&mut checker.interfaces);
 	for interface in interfaces.values_mut() {
