@@ -15,6 +15,8 @@
 //! declarations, parser-only (see [`document_symbols`]);
 //! `textDocument/definition` jumps an identifier/variant/type-name use to its
 //! declaration, AST + `DefMap`-only, no type-check (see [`definition`]);
+//! `textDocument/references` searches compiler-resolved declaration identity
+//! across every source in the current project snapshot (see [`references`]);
 //! `textDocument/completion` offers lexical names, resolved project imports,
 //! same-module declarations, and keywords from an immutable analysis snapshot
 //! (see [`completion`] — member completion after a `.` is deferred, see its
@@ -34,6 +36,7 @@ pub mod formatting;
 pub mod hover;
 pub mod line_index;
 mod position;
+pub mod references;
 pub mod semantic_tokens;
 pub mod workspace;
 
@@ -45,20 +48,20 @@ use lsp_types::{
 	CompletionOptions, CompletionParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
 	DidOpenTextDocumentParams, DocumentFormattingParams, DocumentRangeFormattingParams,
 	DocumentSymbolParams, GotoDefinitionParams, HoverParams, HoverProviderCapability,
-	InitializeParams, InitializeResult, OneOf, SemanticTokensFullOptions, SemanticTokensOptions,
-	SemanticTokensParams, SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo,
-	TextDocumentSyncCapability, TextDocumentSyncKind,
+	InitializeParams, InitializeResult, OneOf, ReferenceParams, SemanticTokensFullOptions,
+	SemanticTokensOptions, SemanticTokensParams, SemanticTokensServerCapabilities,
+	ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind,
 	notification::{
 		DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _,
 	},
 	request::{
 		Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, RangeFormatting,
-		Request as _, SemanticTokensFullRequest,
+		References, Request as _, SemanticTokensFullRequest,
 	},
 };
 
 /// The capabilities this server advertises during `initialize`: full-text
-/// document sync, hover, document symbols, go-to-definition, completion
+/// document sync, hover, document symbols, go-to-definition, references, completion
 /// (triggered on typing and on `.`), and full-document semantic tokens.
 /// Diagnostics are pushed (`textDocument/publishDiagnostics`), not pulled,
 /// so they need no capability flag here.
@@ -71,6 +74,7 @@ pub fn server_capabilities() -> ServerCapabilities {
 		document_formatting_provider: Some(OneOf::Left(true)),
 		document_range_formatting_provider: Some(OneOf::Left(true)),
 		definition_provider: Some(OneOf::Left(true)),
+		references_provider: Some(OneOf::Left(true)),
 		completion_provider: Some(CompletionOptions {
 			trigger_characters: Some(vec![".".to_string()]),
 			..Default::default()
@@ -165,6 +169,15 @@ fn prepare_definition_response(
 	snapshot: &compiler_state::AnalysisSnapshot,
 	value: Option<lsp_types::GotoDefinitionResponse>,
 ) -> Option<Option<lsp_types::GotoDefinitionResponse>> {
+	prepare_if_current(docs, uri, snapshot, value)
+}
+
+fn prepare_references_response(
+	docs: &Mutex<DocumentStore>,
+	uri: &lsp_types::Uri,
+	snapshot: &compiler_state::AnalysisSnapshot,
+	value: Option<Vec<lsp_types::Location>>,
+) -> Option<Option<Vec<lsp_types::Location>>> {
 	prepare_if_current(docs, uri, snapshot, value)
 }
 
@@ -280,6 +293,33 @@ fn main_loop(
 							prepare_completion_response(docs, uri, &snapshot, result)
 						}
 						None => Some(completion::completion(&docs.lock().unwrap(), &params)),
+					};
+					if let Some(result) = response {
+						connection
+							.sender
+							.send(Message::Response(Response::new_ok(id, result)))?;
+					}
+				} else if req.method == References::METHOD {
+					let (id, params) = req.extract::<ReferenceParams>(References::METHOD)?;
+					let uri = &params.text_document_position.text_document.uri;
+					let compiler = compiler.lock().unwrap();
+					let docs_guard = docs.lock().unwrap();
+					let snapshot = compiler.analysis_for_uri(&docs_guard, uri);
+					let response = match snapshot {
+						Some(snapshot) => {
+							let candidate = references::references_snapshot_candidate(
+								&docs_guard,
+								&compiler,
+								&snapshot,
+								&params,
+							);
+							drop(docs_guard);
+							drop(compiler);
+							let result =
+								candidate.and_then(references::ReferencesResponseCandidate::validate_disk_sources);
+							prepare_references_response(docs, uri, &snapshot, result)
+						}
+						None => Some(None),
 					};
 					if let Some(result) = response {
 						connection
@@ -1502,6 +1542,10 @@ mod tests {
 			result.capabilities.definition_provider,
 			Some(OneOf::Left(true))
 		);
+		assert_eq!(
+			result.capabilities.references_provider,
+			Some(OneOf::Left(true))
+		);
 		let completion = result
 			.capabilities
 			.completion_provider
@@ -1682,6 +1726,82 @@ mod tests {
 		};
 		assert_eq!(location.uri, uri);
 		assert_eq!(location.range.start.line, 1);
+
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn references_request_round_trips_success_and_no_symbol_through_the_wire() {
+		use lsp_types::{
+			Position, ReferenceContext, ReferenceParams, TextDocumentIdentifier,
+			TextDocumentPositionParams, WorkDoneProgressParams,
+			request::{References, Request as _},
+		};
+
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		handshake(&client);
+
+		let uri: Uri = "file:///wire_references.nym".parse().unwrap();
+		let text = "func main(): int = {\n  let value = 1\n  value\n}";
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidOpenTextDocument::METHOD.to_string(),
+				serde_json::to_value(DidOpenTextDocumentParams {
+					text_document: TextDocumentItem {
+						uri: uri.clone(),
+						language_id: "nymph".to_string(),
+						version: 1,
+						text: text.to_string(),
+					},
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+
+		let request = |id, position| {
+			Message::Request(Request::new(
+				RequestId::from(id),
+				References::METHOD.to_string(),
+				serde_json::to_value(ReferenceParams {
+					text_document_position: TextDocumentPositionParams {
+						text_document: TextDocumentIdentifier { uri: uri.clone() },
+						position,
+					},
+					work_done_progress_params: WorkDoneProgressParams::default(),
+					partial_result_params: Default::default(),
+					context: ReferenceContext {
+						include_declaration: true,
+					},
+				})
+				.unwrap(),
+			))
+		};
+		client.sender.send(request(3, Position::new(2, 3))).unwrap();
+		let found: Option<Vec<lsp_types::Location>> = loop {
+			match client.receiver.recv().unwrap() {
+				Message::Response(response) => {
+					break serde_json::from_value(response.response_result.unwrap()).unwrap();
+				}
+				_ => continue,
+			}
+		};
+		let found = found.expect("references result");
+		assert_eq!(found.len(), 2);
+		assert_eq!(found[0].range.start, Position::new(1, 6));
+		assert_eq!(found[1].range.start, Position::new(2, 2));
+
+		client.sender.send(request(4, Position::new(0, 4))).unwrap();
+		let missing: Option<Vec<lsp_types::Location>> = loop {
+			match client.receiver.recv().unwrap() {
+				Message::Response(response) => {
+					break serde_json::from_value(response.response_result.unwrap()).unwrap();
+				}
+				_ => continue,
+			}
+		};
+		assert!(missing.is_none());
 
 		shutdown(&client, handle);
 	}

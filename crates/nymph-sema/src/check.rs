@@ -24,6 +24,7 @@ use crate::unify::{TyVarValue, UnifyTable};
 pub(crate) struct Binding {
 	pub ty: Ty,
 	pub mutable: bool,
+	pub declaration: Span,
 }
 
 #[derive(Clone, Copy)]
@@ -664,7 +665,7 @@ fn check_module_with_environment_parts(
 	let implementation_start = imported_implementations.impls.len();
 	let inherent_start = imported_inherent.impls.len();
 	let defs = build_def_map_on(&module, imported_defs, &mut diagnostics, Some(&headers));
-	let declarations = defs
+	let mut declarations: FxHashMap<crate::DefinitionId, crate::DeclarationProvenance> = defs
 		.iter()
 		.filter_map(|(_, data)| match (&data.origin, &data.stable) {
 			(crate::def::DefOrigin::Local { .. }, Some(stable)) => Some((
@@ -714,6 +715,18 @@ fn check_module_with_environment_parts(
 		Some(&identity),
 		external_abis,
 	);
+	declarations.extend(
+		checked
+			.source_identities
+			.declarations
+			.iter()
+			.map(|(id, span)| {
+				(
+					id.clone(),
+					crate::DeclarationProvenance { name_span: *span },
+				)
+			}),
+	);
 	let diagnostics: std::sync::Arc<[Diagnostic]> = checked.diags.into();
 	let facts = std::sync::Arc::new(checked.facts);
 	let annotations = std::sync::Arc::new(crate::ModuleAnnotations::from(facts.annotations.clone()));
@@ -727,6 +740,7 @@ fn check_module_with_environment_parts(
 			checked: facts,
 			annotations,
 			declarations: std::sync::Arc::new(declarations),
+			import_references: std::sync::Arc::new([]),
 		}),
 		diagnostics,
 		lowerable,
@@ -986,9 +1000,30 @@ impl<'m> Checker<'m> {
 		self.scopes.pop();
 	}
 
-	pub(crate) fn define_local(&mut self, name: EcoString, ty: Ty, mutable: bool) {
+	pub(crate) fn define_local(&mut self, name: EcoString, span: Span, ty: Ty, mutable: bool) {
+		self.define_local_with_declarations(name, span, [span], ty, mutable);
+	}
+
+	pub(crate) fn define_local_with_declarations(
+		&mut self,
+		name: EcoString,
+		declaration: Span,
+		written: impl IntoIterator<Item = Span>,
+		ty: Ty,
+		mutable: bool,
+	) {
+		for span in written {
+			self.annotations.record_local_declaration(span, declaration);
+		}
 		if let Some(scope) = self.scopes.last_mut() {
-			scope.insert(name, Binding { ty, mutable });
+			scope.insert(
+				name,
+				Binding {
+					ty,
+					mutable,
+					declaration,
+				},
+			);
 		}
 	}
 

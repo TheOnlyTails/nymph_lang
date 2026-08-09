@@ -219,8 +219,16 @@ pub struct Annotations {
 	infos: FxHashMap<NodeId, ExprInfo>,
 	unresolved_qualified_accesses: Vec<UnresolvedQualifiedAccess>,
 	direct_namespace_members: FxHashSet<NodeId>,
+	module_targets: FxHashMap<NodeId, ModuleIdentity>,
 	definition_targets: FxHashMap<NodeId, DefinitionId>,
+	/// Checker-resolved local identifier uses, keyed by expression node, with
+	/// the accepted binding's canonical declaration span as immutable identity.
+	local_definition_targets: FxHashMap<NodeId, Span>,
+	/// Every written local declaration span mapped to its canonical identity.
+	/// Union-pattern alternatives intentionally share one identity.
+	local_declarations: FxHashMap<Span, Span>,
 	type_definition_targets: FxHashMap<Span, DefinitionId>,
+	source_definition_targets: FxHashMap<Span, DefinitionId>,
 	variants: FxHashMap<NodeId, VariantResolution>,
 	/// Variant *patterns*, keyed by span — patterns carry no `NodeId`, but each
 	/// written pattern has a unique source span.
@@ -317,6 +325,18 @@ impl Annotations {
 
 	pub(crate) fn record_direct_namespace_member(&mut self, id: NodeId) {
 		self.direct_namespace_members.insert(id);
+	}
+
+	pub(crate) fn record_module_target(&mut self, id: NodeId, module: Option<&ModuleIdentity>) {
+		if id != NodeId::DUMMY
+			&& let Some(module) = module
+		{
+			self.module_targets.insert(id, module.clone());
+		}
+	}
+
+	pub fn module_targets(&self) -> impl Iterator<Item = (NodeId, &ModuleIdentity)> {
+		self.module_targets.iter().map(|(&id, module)| (id, module))
 	}
 
 	pub(crate) fn direct_namespace_members(&self) -> impl Iterator<Item = NodeId> + '_ {
@@ -426,6 +446,27 @@ impl Annotations {
 		self.definition_targets.get(&id)
 	}
 
+	pub(crate) fn record_local_definition_target(&mut self, id: NodeId, declaration: Span) {
+		if id != NodeId::DUMMY {
+			self.local_definition_targets.insert(id, declaration);
+		}
+	}
+
+	pub fn local_definition_target_of(&self, id: NodeId) -> Option<Span> {
+		self.local_definition_targets.get(&id).copied()
+	}
+
+	pub(crate) fn record_local_declaration(&mut self, span: Span, identity: Span) {
+		self.local_declarations.insert(span, identity);
+	}
+
+	pub fn local_declarations(&self) -> impl Iterator<Item = (Span, Span)> + '_ {
+		self
+			.local_declarations
+			.iter()
+			.map(|(&span, &identity)| (span, identity))
+	}
+
 	pub(crate) fn record_type_definition_target(
 		&mut self,
 		span: Span,
@@ -444,6 +485,23 @@ impl Annotations {
 	pub fn type_definition_targets(&self) -> impl Iterator<Item = (Span, &DefinitionId)> {
 		self
 			.type_definition_targets
+			.iter()
+			.map(|(&span, target)| (span, target))
+	}
+
+	pub(crate) fn record_source_definition_target(
+		&mut self,
+		span: Span,
+		target: Option<&DefinitionId>,
+	) {
+		if let Some(target) = target {
+			self.source_definition_targets.insert(span, target.clone());
+		}
+	}
+
+	pub fn source_definition_targets(&self) -> impl Iterator<Item = (Span, &DefinitionId)> {
+		self
+			.source_definition_targets
 			.iter()
 			.map(|(&span, target)| (span, target))
 	}
@@ -635,6 +693,10 @@ impl CheckedFacts {
 pub struct SourceIdentities {
 	pub implementations: std::collections::BTreeMap<ImplementationSourcePath, DefinitionId>,
 	pub members: std::collections::BTreeMap<ImplementationMemberSourcePath, DefinitionId>,
+	/// Exact source token which declares each stable identity assigned while
+	/// checking this module. Unlike the path maps above, this also covers
+	/// namespace, interface, inherent, variant, and field declarations.
+	pub declarations: FxHashMap<DefinitionId, Span>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]

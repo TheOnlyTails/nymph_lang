@@ -61,6 +61,13 @@ overlays), same-module declarations, and keywords. Prefix filtering applies with
 Completion after `.` intentionally returns no members yet; member completion and auto-import edits
 are not currently supported. Files outside a project retain lexical and same-file completion.
 
+**Find All References** follows compiler-resolved semantic identity rather than spelling. It searches
+every `.nym` file in the detected project, including unopened files, and uses unsaved open-buffer
+overlays as authoritative source. Imports and aliases, value and type positions, enum patterns, and
+qualified uses participate when they resolve to the selected declaration; shadowed or unrelated
+same-named symbols do not. VS Code's include-declaration request setting is honored. A file outside a
+project is limited to its isolated one-file analysis universe.
+
 Semantic highlighting consumes that same immutable project snapshot. Imported and ambient
 functions, values, types, enum variants, and aliases therefore keep the same semantic kind as their
 declarations, including when an unsaved dependency overrides its on-disk source. Highlighting is

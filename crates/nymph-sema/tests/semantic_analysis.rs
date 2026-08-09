@@ -31,6 +31,7 @@ fn semantic_analysis_owns_source_and_node_annotations_without_diagnostics() {
 		checked: Arc::new(checked.facts),
 		annotations,
 		declarations: Arc::default(),
+		import_references: Arc::default(),
 	};
 	let cloned = analysis.clone();
 
@@ -188,6 +189,7 @@ fn stable_definition_kind_resolves_namespace_and_inherent_function_members() {
 		annotations: Arc::new(ModuleAnnotations::from(checked.annotations.clone())),
 		checked: Arc::new(checked.facts),
 		declarations: Arc::default(),
+		import_references: Arc::default(),
 	};
 
 	for expected in ["emit", "origin"] {

@@ -927,6 +927,35 @@ impl CompilerSession {
 		self.module_analysis(project, input, key)
 	}
 
+	/// Return every active project module from the session's current immutable
+	/// source/overlay revision. Each module is analyzed as a library root so
+	/// disconnected importers participate; compiler and embedded modules are
+	/// deliberately excluded from workspace results.
+	#[doc(hidden)]
+	#[must_use]
+	pub fn tooling_project_analyses(
+		&self,
+		project: ProjectId,
+		_entry: ModulePath,
+		ambient_prelude: bool,
+	) -> Vec<(ModulePath, Arc<str>, Option<Arc<ModuleAnalysis>>)> {
+		let mut modules = self
+			.registry
+			.iter()
+			.filter(|((owner, _), record)| owner == &project && record.source.is_some())
+			.filter_map(|((_, path), record)| Some((path.clone(), record.input, record.source.clone()?)))
+			.collect::<Vec<_>>();
+		modules.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
+		modules
+			.into_iter()
+			.map(|(path, input, source)| {
+				let key = self.tooling_key(project.clone(), path.clone(), ambient_prelude);
+				let analysis = self.module_analysis(project.clone(), input, key);
+				(path, source, analysis)
+			})
+			.collect()
+	}
+
 	/// Check a tooling project with the exact key used by
 	/// [`Self::tooling_analyze_module`].
 	#[doc(hidden)]

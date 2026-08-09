@@ -5,7 +5,13 @@ use std::{ops::Deref, sync::Arc};
 use nymph_ast::{Span, decl::Module};
 use rustc_hash::FxHashMap;
 
-use crate::{Annotations, CheckedFacts, DefinitionId};
+use crate::{Annotations, CheckedFacts, DefinitionId, ModuleIdentity};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImportReferenceTarget {
+	Definition(DefinitionId),
+	Module(ModuleIdentity),
+}
 
 /// Authoritative source occurrence of a stable declaration in its owner module.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,6 +53,12 @@ pub struct SemanticAnalysis {
 	pub annotations: Arc<ModuleAnnotations>,
 	/// Local declarations keyed by their stable semantic identity.
 	pub declarations: Arc<FxHashMap<DefinitionId, DeclarationProvenance>>,
+	/// User-written import names paired with compiler-resolved semantic targets.
+	///
+	/// These are installed by the project compiler after import resolution. A
+	/// standalone module has no project import universe and therefore leaves
+	/// this list empty.
+	pub import_references: Arc<[(Span, ImportReferenceTarget)]>,
 }
 
 impl SemanticAnalysis {

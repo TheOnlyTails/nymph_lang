@@ -69,6 +69,7 @@ pub struct DiagnosticsSnapshot {
 }
 
 pub struct AnalysisSnapshot {
+	pub uri: Uri,
 	pub project: ProjectId,
 	pub module: ModulePath,
 	/// Client sequence number used only to suppress responses after a newer
@@ -101,6 +102,13 @@ pub struct DefinitionTargetSnapshot {
 	pub uri: Uri,
 	pub source: Arc<str>,
 	pub span: nymph_ast::Span,
+	pub requires_disk_validation: bool,
+}
+
+pub struct ReferenceModuleSnapshot {
+	pub uri: Uri,
+	pub source: Arc<str>,
+	pub occurrences: Vec<nymph_sema::query::ReferenceOccurrence>,
 	pub requires_disk_validation: bool,
 }
 
@@ -395,6 +403,7 @@ impl CompilerState {
 		let source = analysis.source.clone();
 		let document_source = Arc::from(document.text.as_str());
 		Some(AnalysisSnapshot {
+			uri: uri.clone(),
 			project: identity.project.clone(),
 			module: identity.module.clone(),
 			document_version: document.version,
@@ -495,6 +504,88 @@ impl CompilerState {
 			span,
 			requires_disk_validation: !target_is_open,
 		})
+	}
+
+	/// Collect semantic occurrences from the complete immutable project analysis
+	/// that produced `snapshot`. Local identities stay isolated to their owner
+	/// module; stable definitions are compared across every reachable module.
+	pub fn reference_modules(
+		&self,
+		docs: &DocumentStore,
+		snapshot: &AnalysisSnapshot,
+		symbol: &nymph_sema::query::SymbolIdentity,
+	) -> Option<Vec<ReferenceModuleSnapshot>> {
+		if docs.revision() != snapshot.document_revision || snapshot.source != snapshot.document_source
+		{
+			return None;
+		}
+		let session = if snapshot.without_prelude {
+			&self.stdlib_session
+		} else {
+			&self.session
+		};
+		let analyses = match symbol {
+			nymph_sema::query::SymbolIdentity::Definition(_)
+			| nymph_sema::query::SymbolIdentity::Module(_) => session.tooling_project_analyses(
+				snapshot.project.clone(),
+				snapshot.entry.clone(),
+				!snapshot.without_prelude,
+			),
+			nymph_sema::query::SymbolIdentity::Local(_) => {
+				vec![(
+					snapshot.module.clone(),
+					snapshot.source.clone(),
+					Some(snapshot.analysis.clone()),
+				)]
+			}
+		};
+		let mut modules = Vec::new();
+		for (module, source, analysis) in analyses {
+			let occurrences = analysis.as_ref().map_or_else(Vec::new, |analysis| {
+				nymph_sema::query::references_to(&analysis.semantic, symbol)
+			});
+			let overlay_uri = self.documents.iter().find_map(|(uri, identity)| {
+				(identity.project == snapshot.project
+					&& identity.module == module
+					&& identity.without_prelude == snapshot.without_prelude
+					&& self
+						.authoritative_overlays
+						.values()
+						.any(|authoritative| authoritative == uri)
+					&& docs.get(uri).is_some())
+				.then_some(uri)
+			});
+			let uri = if let Some(uri) = overlay_uri {
+				uri.clone()
+			} else if module == snapshot.module
+				&& !matches!(
+					self.documents.get(&snapshot.uri)?.kind,
+					DocumentKind::Project(_)
+				) {
+				snapshot.uri.clone()
+			} else {
+				workspace::key_to_uri(&snapshot.root, module.as_str())?
+			};
+			if occurrences
+				.iter()
+				.any(|occurrence| !valid_source_span(&source, occurrence.span))
+			{
+				return None;
+			}
+			let target_is_open = self.documents.iter().any(|(open_uri, identity)| {
+				identity.project == snapshot.project
+					&& identity.module == module
+					&& identity.without_prelude == snapshot.without_prelude
+					&& docs.get(open_uri).is_some()
+			});
+			modules.push(ReferenceModuleSnapshot {
+				uri,
+				source,
+				occurrences,
+				requires_disk_validation: !target_is_open,
+			});
+		}
+		Some(modules)
 	}
 
 	pub fn diagnostics_for_uri(

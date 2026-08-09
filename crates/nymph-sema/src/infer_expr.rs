@@ -784,6 +784,9 @@ impl<'m> Checker<'m> {
 				self.infer_member_with_resolution(parent, &member.0, member.1, expr.id);
 			self.record(expr.id, ty, None);
 			if let Some(resolution) = resolution {
+				self
+					.annotations
+					.record_definition_target(expr.id, resolution.target.as_ref());
 				self.annotations.record_resolution(expr.id, resolution);
 			}
 			return ty;
@@ -1292,8 +1295,14 @@ impl<'m> Checker<'m> {
 	}
 
 	fn infer_identifier(&mut self, name: &str, span: Span, id: NodeId) -> Ty {
-		if let Some(binding) = self.lookup_local(name) {
-			return binding.ty;
+		if let Some((ty, declaration)) = self
+			.lookup_local(name)
+			.map(|binding| (binding.ty, binding.declaration))
+		{
+			self
+				.annotations
+				.record_local_definition_target(id, declaration);
+			return ty;
 		}
 		if let Some(def) = self.defs.get(name) {
 			return self.type_of_def(def, span, id);
@@ -1547,6 +1556,17 @@ impl<'m> Checker<'m> {
 			&& self.lookup_local(&type_name.0).is_none()
 			&& let Some(def) = self.defs.get(&type_name.0)
 		{
+			self
+				.annotations
+				.record_definition_target(parent.id, self.defs.stable(def));
+			if self.defs.stable(def).is_none()
+				&& let crate::DefOrigin::Imported { module } = &self.defs.data(def).origin
+				&& matches!(self.defs.data(def).kind, DefKind::Namespace)
+			{
+				self
+					.annotations
+					.record_module_target(parent.id, Some(module));
+			}
 			match self.defs.data(def).kind {
 				DefKind::Namespace => {
 					let namespace_module = match &self.defs.data(def).origin {
@@ -1667,6 +1687,9 @@ impl<'m> Checker<'m> {
 				.annotations
 				.record_generic_call_arguments(id, type_arguments);
 			if let Some((interface, member)) = target {
+				self
+					.annotations
+					.record_definition_target(func.id, Some(&member));
 				self.annotations.record_generic_namespaced_call(
 					id,
 					crate::annotate::GenericNamespacedCall {
@@ -1702,6 +1725,9 @@ impl<'m> Checker<'m> {
 			let arg_lits = arg_int_lits(args);
 			return match self.resolve_method(recv_dispatch, &member.0, &arg_tys, &arg_lits, member.1) {
 				Some(res) => {
+					self
+						.annotations
+						.record_definition_target(func.id, res.target.as_ref());
 					self
 						.annotations
 						.record_generic_call_arguments(id, res.type_arguments.clone());
@@ -1951,8 +1977,27 @@ impl<'m> Checker<'m> {
 		if let ExprKind::Identifier(name) = &parent.kind
 			&& self.lookup_local(&name.0).is_none()
 			&& let Some(def) = self.defs.get(&name.0)
+			&& matches!(
+				self.defs.data(def).kind,
+				DefKind::Namespace | DefKind::Struct | DefKind::Enum
+			) {
+			self
+				.annotations
+				.record_definition_target(parent.id, self.defs.stable(def));
+		}
+		if let ExprKind::Identifier(name) = &parent.kind
+			&& self.lookup_local(&name.0).is_none()
+			&& let Some(def) = self.defs.get(&name.0)
 			&& matches!(self.defs.data(def).kind, DefKind::Namespace)
 		{
+			let module = match (&self.defs.data(def).origin, self.defs.stable(def)) {
+				(crate::DefOrigin::Imported { module }, None) => Some(module.clone()),
+				(crate::DefOrigin::Local { .. }, _) => None,
+				(crate::DefOrigin::Imported { .. }, Some(_)) => None,
+			};
+			self
+				.annotations
+				.record_module_target(parent.id, module.as_ref());
 			return match self
 				.sigs
 				.namespaces

@@ -1133,6 +1133,204 @@ pub fn stable_definition_at(
 		.map(|(_, target)| target.clone())
 }
 
+/// Semantic identity of a source symbol.
+///
+/// Project declarations use their globally stable checker identity. Lexical
+/// binders use their exact declaration-name span, which is stable for an
+/// immutable [`crate::SemanticAnalysis`] and distinguishes shadowed names.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum SymbolIdentity {
+	Definition(crate::DefinitionId),
+	Module(crate::ModuleIdentity),
+	Local(Span),
+}
+
+fn reference_definition_identity(target: &crate::DefinitionId) -> crate::DefinitionId {
+	match &target.key {
+		DeclarationKey::MaterializedInterfaceMember {
+			interface_member, ..
+		} => (**interface_member).clone(),
+		_ => target.clone(),
+	}
+}
+
+/// One exact source occurrence of a semantic symbol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReferenceOccurrence {
+	pub span: Span,
+	pub is_declaration: bool,
+}
+
+/// Return the semantic symbol whose exact, half-open name span contains
+/// `offset`. Only checker-recorded stable targets and lexically resolved local
+/// binders are considered; unresolved recovery syntax is never matched by
+/// spelling.
+#[must_use]
+pub fn symbol_at(analysis: &crate::SemanticAnalysis, offset: usize) -> Option<SymbolIdentity> {
+	all_symbol_occurrences(analysis)
+		.into_iter()
+		.filter(|(_, occurrence)| covers(occurrence.span, offset))
+		.min_by_key(|(_, occurrence)| occurrence.span.end - occurrence.span.start)
+		.map(|(identity, _)| identity)
+}
+
+/// Return all declaration and reference occurrences of `symbol`, deduplicated
+/// and ordered by `(span.start, span.end)`. Occurrence spans contain only the
+/// target token (including the member token of a qualified access).
+#[must_use]
+pub fn references_to(
+	analysis: &crate::SemanticAnalysis,
+	symbol: &SymbolIdentity,
+) -> Vec<ReferenceOccurrence> {
+	let mut occurrences = all_symbol_occurrences(analysis)
+		.into_iter()
+		.filter_map(|(identity, occurrence)| (identity == *symbol).then_some(occurrence))
+		.collect::<Vec<_>>();
+	occurrences.sort_unstable_by_key(|occurrence| {
+		(
+			occurrence.span.start,
+			occurrence.span.end,
+			!occurrence.is_declaration,
+		)
+	});
+	occurrences.dedup_by_key(|occurrence| (occurrence.span.start, occurrence.span.end));
+	occurrences
+}
+
+fn all_symbol_occurrences(
+	analysis: &crate::SemanticAnalysis,
+) -> Vec<(SymbolIdentity, ReferenceOccurrence)> {
+	let mut result = analysis
+		.declarations
+		.iter()
+		.map(|(identity, provenance)| {
+			(
+				SymbolIdentity::Definition(reference_definition_identity(identity)),
+				ReferenceOccurrence {
+					span: provenance.name_span,
+					is_declaration: true,
+				},
+			)
+		})
+		.collect::<Vec<_>>();
+	result.extend(analysis.import_references.iter().map(|(span, target)| {
+		let identity = match target {
+			crate::ImportReferenceTarget::Definition(target) => {
+				SymbolIdentity::Definition(reference_definition_identity(target))
+			}
+			crate::ImportReferenceTarget::Module(target) => SymbolIdentity::Module(target.clone()),
+		};
+		(
+			identity,
+			ReferenceOccurrence {
+				span: *span,
+				is_declaration: false,
+			},
+		)
+	}));
+
+	let mut exprs = Vec::new();
+	for declaration in &analysis.module.members {
+		collect_decl_exprs(declaration, &mut exprs);
+	}
+	for expr in &exprs {
+		let target_span = match &expr.kind {
+			ExprKind::Identifier(_) => Some(expr.span),
+			ExprKind::MemberAccess { member, .. } => Some(member.1),
+			_ => None,
+		};
+		if let Some(span) = target_span
+			&& let Some(target) = analysis.annotations.definition_target_of(expr.id)
+		{
+			result.push((
+				SymbolIdentity::Definition(reference_definition_identity(target)),
+				ReferenceOccurrence {
+					span,
+					is_declaration: false,
+				},
+			));
+		}
+		if let Some(resolution) = analysis.annotations.variant_of(expr.id)
+			&& let Some(target) = &resolution.variant_target
+			&& let Some(span) = variant_expression_name_span(expr)
+		{
+			result.push((
+				SymbolIdentity::Definition(reference_definition_identity(target)),
+				ReferenceOccurrence {
+					span,
+					is_declaration: false,
+				},
+			));
+		}
+	}
+	for (span, target) in analysis.annotations.type_definition_targets() {
+		result.push((
+			SymbolIdentity::Definition(reference_definition_identity(target)),
+			ReferenceOccurrence {
+				span,
+				is_declaration: false,
+			},
+		));
+	}
+	for (span, target) in analysis.annotations.source_definition_targets() {
+		result.push((
+			SymbolIdentity::Definition(reference_definition_identity(target)),
+			ReferenceOccurrence {
+				span,
+				is_declaration: false,
+			},
+		));
+	}
+	for (id, target) in analysis.annotations.module_targets() {
+		if let Some(expr) = exprs.iter().find(|expr| expr.id == id)
+			&& matches!(expr.kind, ExprKind::Identifier(_))
+		{
+			result.push((
+				SymbolIdentity::Module(target.clone()),
+				ReferenceOccurrence {
+					span: expr.span,
+					is_declaration: false,
+				},
+			));
+		}
+	}
+
+	for expr in exprs {
+		if let Some(declaration) = analysis.annotations.local_definition_target_of(expr.id) {
+			result.push((
+				SymbolIdentity::Local(declaration),
+				ReferenceOccurrence {
+					span: expr.span,
+					is_declaration: false,
+				},
+			));
+		}
+	}
+	for (span, identity) in analysis.annotations.local_declarations() {
+		result.push((
+			SymbolIdentity::Local(identity),
+			ReferenceOccurrence {
+				span,
+				is_declaration: true,
+			},
+		));
+	}
+	result
+}
+
+fn variant_expression_name_span(expr: &Expr) -> Option<Span> {
+	match &expr.kind {
+		ExprKind::Identifier(_) => Some(expr.span),
+		ExprKind::MemberAccess { member, .. } => Some(member.1),
+		ExprKind::Call { func, .. } => match &func.kind {
+			ExprKind::Identifier(_) => Some(func.span),
+			ExprKind::MemberAccess { member, .. } => Some(member.1),
+			_ => None,
+		},
+		_ => None,
+	}
+}
+
 /// Return the semantic category of a stable declaration in this analysis's
 /// exact imported, ambient, and local definition arena.
 ///
