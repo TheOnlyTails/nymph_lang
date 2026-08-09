@@ -300,6 +300,23 @@ mod tests {
 	}
 
 	#[test]
+	fn semantic_duplicate_winner_controls_visibility_kind_and_range() {
+		let mut fixture = Fixture::new(&[(
+			"main",
+			"public func shadowed(): void = {}\nprivate struct shadowed()\npublic func winner(): void = {}\npublic struct winner()",
+		)]);
+
+		assert!(fixture.search("shadowed").is_empty());
+		let symbols = fixture.search("winner");
+		assert_eq!(symbols.len(), 1);
+		assert_eq!(symbols[0].name, "winner");
+		assert_eq!(symbols[0].kind, lsp_types::SymbolKind::STRUCT);
+		assert_eq!(symbols[0].location.range.start.line, 3);
+		assert_eq!(symbols[0].location.range.start.character, 14);
+		assert_eq!(symbols[0].location.range.end.character, 20);
+	}
+
+	#[test]
 	fn authoritative_overlay_replaces_disk_and_close_restores_it() {
 		let mut fixture = Fixture::new(&[
 			("main", "public func main(): void = {}"),

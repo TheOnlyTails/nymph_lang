@@ -228,6 +228,7 @@ pub fn top_level_declarations(
 		.members
 		.iter()
 		.enumerate()
+		.filter(|(member, declaration)| lexical_winner(module, *member, declaration))
 		.filter_map(|(member, declaration)| {
 			let (category, raw_name) = declaration_identity(declaration)?;
 			if raw_name.is_empty() {

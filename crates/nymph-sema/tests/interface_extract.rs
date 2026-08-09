@@ -544,6 +544,47 @@ fn namespace_summary_preserves_duplicate_occurrence_ids_and_selects_the_lexical_
 }
 
 #[test]
+fn top_level_declarations_expose_only_exact_lexical_winners() {
+	let module = parse(
+		"public func hidden(): int = 1\nprivate struct hidden {}\npublic func shown(): int = 1\npublic struct shown {}\npublic func repeated(): int = 1\npublic func repeated(): int = 2",
+	);
+	let headers = declared_headers(identity(), &module);
+	let declarations = nymph_sema::top_level_declarations(identity(), &module);
+
+	assert_eq!(
+		declarations
+			.iter()
+			.map(|declaration| (
+				declaration.name.as_str(),
+				declaration.category,
+				declaration.visibility,
+			))
+			.collect::<Vec<_>>(),
+		[
+			(
+				"hidden",
+				DeclarationCategory::Struct,
+				nymph_sema::NamespaceVisibility::Private,
+			),
+			(
+				"shown",
+				DeclarationCategory::Struct,
+				nymph_sema::NamespaceVisibility::Importable,
+			),
+			(
+				"repeated",
+				DeclarationCategory::Function,
+				nymph_sema::NamespaceVisibility::Importable,
+			),
+		]
+	);
+	assert_eq!(declarations[0].definition, headers.definitions[1].1);
+	assert_eq!(declarations[1].definition, headers.definitions[3].1);
+	assert_eq!(declarations[2].definition, headers.definitions[5].1);
+	assert_eq!(declarations[2].definition.key.duplicate(), 1);
+}
+
+#[test]
 fn recovered_environment_contains_the_exact_importable_duplicate_winner() {
 	let module = parse(
 		"private func same(): int = 1\npublic func same(): int = 2\nfunc broken(value: Missing): int = 0",
