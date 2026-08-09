@@ -360,26 +360,22 @@ fn scan_comments_into(text: &str, start: usize, end: usize, out: &mut Vec<Span>)
 /// literal newline). A single-line span yields exactly one piece.
 fn split_span_lines(text: &str, index: &LineIndex, span: Span) -> Vec<(u32, u32, u32)> {
 	let start_pos = index.position(text, span.start);
-	let end_pos = index.position(text, span.end);
-	if start_pos.line == end_pos.line {
-		return vec![(
-			start_pos.line,
-			start_pos.character,
-			end_pos.character - start_pos.character,
-		)];
-	}
-
 	let mut pieces = Vec::new();
 	let mut line = start_pos.line;
 	let mut char_start = start_pos.character;
 	let mut len: u32 = 0;
-	for ch in text[span.start..span.end].chars() {
+	for (relative, ch) in text[span.start..span.end].char_indices() {
+		// LSP positions exclude the CRLF line terminator. A line comment's
+		// span ends immediately before `\n`, so consult the full source
+		// rather than only the sliced span.
+		let crlf_carriage =
+			ch == '\r' && text.as_bytes().get(span.start + relative + 1) == Some(&b'\n');
 		if ch == '\n' {
 			pieces.push((line, char_start, len));
 			line += 1;
 			char_start = 0;
 			len = 0;
-		} else {
+		} else if !crlf_carriage {
 			len += ch.len_utf16() as u32;
 		}
 	}
@@ -1742,6 +1738,31 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 		assert_eq!(comments[0].line, 0);
 		assert_eq!(comments[1].line, 1);
 		assert_eq!(comments[2].line, 2);
+	}
+
+	#[test]
+	fn crlf_multiline_tokens_exclude_carriage_returns_and_keep_utf16_lengths() {
+		let text = "// 😀\r\n/* a😀\r\n𝔘 */\r\nlet s = \"😀\r\nx\"";
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		let line_comment = find(&decoded, 0, 0);
+		assert_eq!(line_comment.type_name, "comment");
+		assert_eq!(line_comment.len, 5); // `// ` + one astral character.
+
+		let block_first = find(&decoded, 1, 0);
+		assert_eq!(block_first.type_name, "comment");
+		assert_eq!(block_first.len, 6); // `/* a` + one astral character.
+		let block_second = find(&decoded, 2, 0);
+		assert_eq!(block_second.type_name, "comment");
+		assert_eq!(block_second.len, 5); // one astral character + ` */`.
+
+		let string_first = find(&decoded, 3, 8);
+		assert_eq!(string_first.type_name, "string");
+		assert_eq!(string_first.len, 3); // opening quote + astral character.
+		let string_second = find(&decoded, 4, 0);
+		assert_eq!(string_second.type_name, "string");
+		assert_eq!(string_second.len, 2); // `x"`.
 	}
 
 	#[test]
