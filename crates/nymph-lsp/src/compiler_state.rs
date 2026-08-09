@@ -995,11 +995,56 @@ impl CompilerState {
 				without_prelude,
 				kind: DocumentKind::Project(path.clone()),
 			};
-			let has_overlay = self
+			let mut open_overlays = self
+				.documents
+				.iter()
+				.filter_map(|(uri, identity)| {
+					let DocumentKind::Project(candidate_path) = &identity.kind else {
+						return None;
+					};
+					if candidate_path != &path {
+						return None;
+					}
+					let document = docs.get(uri)?;
+					Some((
+						uri.clone(),
+						document.text.clone(),
+						document.version,
+						identity.clone(),
+					))
+				})
+				.collect::<Vec<_>>();
+			open_overlays.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+			for (uri, _, _, previous) in &open_overlays {
+				if previous.module_identity() != module_identity {
+					self.retire_transitioned_identity(docs, uri, previous);
+				}
+				self.documents.insert(uri.clone(), disk_identity.clone());
+			}
+			let authoritative = self
 				.authoritative_overlays
 				.get(&module_identity)
-				.is_some_and(|uri| docs.get(uri).is_some());
-			if !has_overlay {
+				.and_then(|authoritative| {
+					open_overlays
+						.iter()
+						.find(|(uri, _, _, _)| uri == authoritative)
+				})
+				.or_else(|| {
+					open_overlays.iter().max_by(
+						|(left_uri, _, left_version, _), (right_uri, _, right_version, _)| {
+							left_version
+								.cmp(right_version)
+								.then_with(|| left_uri.as_str().cmp(right_uri.as_str()))
+						},
+					)
+				})
+				.map(|(uri, source, version, _)| (uri.clone(), source.clone(), *version));
+			if let Some((uri, source, version)) = authoritative {
+				self
+					.authoritative_overlays
+					.insert(module_identity.clone(), uri);
+				self.set_effective_source(&module_identity, source, SourceVersion(i64::from(version)));
+			} else {
 				match fs::read_to_string(&path) {
 					Ok(source) => {
 						self.set_effective_source(&module_identity, source, SourceVersion(0));

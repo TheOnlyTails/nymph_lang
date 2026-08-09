@@ -494,6 +494,82 @@ mod tests {
 	}
 
 	#[test]
+	fn source_root_transitions_rekey_every_open_overlay_without_history_leaks() {
+		let mut fixture = Fixture::new(&[
+			("main", "public func disk_main(): void = {}"),
+			("dep", "public func disk_dep(): void = {}"),
+		]);
+		let dep_uri = path_to_uri(&fixture.main_path.with_file_name("dep.nym")).unwrap();
+		let dep_alias: lsp_types::Uri = dep_uri
+			.as_str()
+			.replace("dep.nym", "%64ep.nym")
+			.parse()
+			.unwrap();
+		assert_ne!(dep_alias, dep_uri);
+		fixture
+			.state
+			.open(
+				&mut fixture.docs,
+				dep_alias,
+				"public func overlay_dep(): void = {}".to_string(),
+				2,
+			)
+			.unwrap();
+
+		std::fs::write(
+			fixture._temp.path().join("nymph.toml"),
+			"[package]\nname='workspace-symbols'\nversion='0.1.0'\nsrc='.'\n",
+		)
+		.unwrap();
+		fixture
+			.state
+			.change(
+				&mut fixture.docs,
+				&fixture.main_uri,
+				"public func overlay_main(): void = {}".to_string(),
+				2,
+			)
+			.unwrap();
+		let symbols = fixture.search("");
+		assert_eq!(
+			symbols
+				.iter()
+				.map(|symbol| (
+					symbol.name.as_str(),
+					symbol.container_name.as_deref().unwrap(),
+				))
+				.collect::<Vec<_>>(),
+			[("overlay_dep", "src/dep"), ("overlay_main", "src/main")]
+		);
+
+		std::fs::write(
+			fixture._temp.path().join("nymph.toml"),
+			"[package]\nname='workspace-symbols'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		fixture
+			.state
+			.change(
+				&mut fixture.docs,
+				&fixture.main_uri,
+				"public func overlay_main(): void = {}".to_string(),
+				3,
+			)
+			.unwrap();
+		let symbols = fixture.search("");
+		assert_eq!(
+			symbols
+				.iter()
+				.map(|symbol| (
+					symbol.name.as_str(),
+					symbol.container_name.as_deref().unwrap(),
+				))
+				.collect::<Vec<_>>(),
+			[("overlay_dep", "dep"), ("overlay_main", "main")]
+		);
+	}
+
+	#[test]
 	fn missing_recovered_names_never_become_symbols() {
 		let mut fixture = Fixture::new(&[("main", "public func (\npublic struct (")]);
 		assert!(fixture.search("").is_empty());
