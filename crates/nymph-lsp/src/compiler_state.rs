@@ -1,5 +1,5 @@
 use std::{
-	collections::{HashMap, HashSet},
+	collections::{BTreeMap, HashMap, HashSet},
 	fs,
 	path::PathBuf,
 	sync::Arc,
@@ -11,7 +11,10 @@ use nymph_compiler::{
 };
 use nymph_sema::EntryMode;
 
-use crate::{document_store::DocumentStore, workspace};
+use crate::{
+	document_store::{DocumentStore, DocumentStoreRevision},
+	workspace,
+};
 
 #[derive(Clone)]
 struct DocumentIdentity {
@@ -20,6 +23,36 @@ struct DocumentIdentity {
 	entry: ModulePath,
 	root: PathBuf,
 	without_prelude: bool,
+	kind: DocumentKind,
+}
+
+impl DocumentIdentity {
+	fn module_identity(&self) -> ModuleIdentity {
+		ModuleIdentity {
+			project: self.project.clone(),
+			module: self.module.clone(),
+			without_prelude: self.without_prelude,
+		}
+	}
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ModuleIdentity {
+	project: ProjectId,
+	module: ModulePath,
+	without_prelude: bool,
+}
+
+#[derive(Clone)]
+enum DocumentKind {
+	Project(PathBuf),
+	Loose(PathBuf),
+	NonFile,
+}
+
+pub enum CloseAction {
+	PublishProject(Vec<Uri>),
+	Clear,
 }
 
 pub struct DiagnosticModuleSnapshot {
@@ -30,16 +63,45 @@ pub struct DiagnosticModuleSnapshot {
 }
 
 pub struct DiagnosticsSnapshot {
-	pub requested_version: i32,
+	pub document_revision: DocumentStoreRevision,
 	pub modules: Vec<DiagnosticModuleSnapshot>,
+	pub owned_targets: Vec<Uri>,
 }
 
 pub struct AnalysisSnapshot {
 	pub project: ProjectId,
 	pub module: ModulePath,
-	pub version: SourceVersion,
+	/// Client sequence number used only to suppress responses after a newer
+	/// notification. It is protocol metadata, not an analysis-cache key.
+	pub document_version: i32,
+	/// Identity of the complete open-document overlay state that produced this
+	/// analysis, including dependency overlays and document lifecycles.
+	pub document_revision: DocumentStoreRevision,
+	/// Exact text of the requested open URI. This normally aliases `source`,
+	/// but remains distinct when two equivalent URI spellings are open for the
+	/// same canonical module and another spelling is the authoritative overlay.
+	pub document_source: Arc<str>,
 	pub source: Arc<str>,
 	pub analysis: Arc<ModuleAnalysis>,
+	entry: ModulePath,
+	root: PathBuf,
+	without_prelude: bool,
+}
+
+/// Immutable completion inputs from one authoritative project/overlay revision.
+/// Unlike checked-body analysis, these remain available while source syntax is partial.
+pub struct CompletionSnapshot {
+	pub document_version: i32,
+	pub document_revision: DocumentStoreRevision,
+	pub source: Arc<str>,
+	pub imported_names: Arc<[nymph_sema::query::ImportedName]>,
+}
+
+pub struct DefinitionTargetSnapshot {
+	pub uri: Uri,
+	pub source: Arc<str>,
+	pub span: nymph_ast::Span,
+	pub requires_disk_validation: bool,
 }
 
 pub struct CompilerState {
@@ -48,9 +110,10 @@ pub struct CompilerState {
 	pub workspaces: HashMap<PathBuf, ProjectId>,
 	synchronized_roots: HashSet<PathBuf>,
 	documents: HashMap<Uri, DocumentIdentity>,
-	sources: HashMap<Uri, Arc<str>>,
+	effective_sources: HashMap<ModuleIdentity, Arc<str>>,
+	authoritative_overlays: HashMap<ModuleIdentity, Uri>,
 	manifest_errors: HashMap<Uri, String>,
-	diagnostic_targets: HashMap<String, HashSet<String>>,
+	diagnostic_targets: HashMap<String, Vec<String>>,
 }
 
 impl Default for CompilerState {
@@ -77,7 +140,8 @@ impl CompilerState {
 			workspaces: HashMap::new(),
 			synchronized_roots: HashSet::new(),
 			documents: HashMap::new(),
-			sources: HashMap::new(),
+			effective_sources: HashMap::new(),
+			authoritative_overlays: HashMap::new(),
 			manifest_errors: HashMap::new(),
 			diagnostic_targets: HashMap::new(),
 		}
@@ -92,7 +156,7 @@ impl CompilerState {
 	) -> anyhow::Result<Vec<Uri>> {
 		docs.open(uri.clone(), text, version);
 		self.synchronize(docs, &uri)?;
-		Ok(self.open_project_documents(docs, &uri))
+		Ok(self.affected_project_documents(docs, &uri))
 	}
 
 	pub fn change(
@@ -104,62 +168,220 @@ impl CompilerState {
 	) -> anyhow::Result<Vec<Uri>> {
 		docs.change_full(uri, text, version);
 		self.synchronize(docs, uri)?;
-		Ok(self.open_project_documents(docs, uri))
+		Ok(self.affected_project_documents(docs, uri))
 	}
 
-	pub fn close(&mut self, docs: &mut DocumentStore, uri: &Uri) -> anyhow::Result<Vec<Uri>> {
+	pub fn close(&mut self, docs: &mut DocumentStore, uri: &Uri) -> anyhow::Result<CloseAction> {
+		let previous = self.affected_project_documents(docs, uri);
+		// Remove the overlay before choosing the effective replacement source.
 		docs.close(uri);
 		self.manifest_errors.remove(uri);
-		let Some(identity) = self.documents.remove(uri) else {
-			return Ok(Vec::new());
+		let Some(identity) = self.documents.get(uri).cloned() else {
+			return Ok(CloseAction::Clear);
 		};
 		self.diagnostic_targets.remove(uri.as_str());
-		let path = workspace::uri_to_path(uri);
+		if !matches!(identity.kind, DocumentKind::Project(_)) {
+			self.documents.remove(uri);
+		}
+		let module_identity = identity.module_identity();
+		let remaining_overlay = self.remaining_overlay(docs, &module_identity, Some(uri));
+		if let Some((open_uri, source, version)) = remaining_overlay {
+			self.set_effective_source(&module_identity, source, SourceVersion(i64::from(version)));
+			self
+				.authoritative_overlays
+				.insert(module_identity.clone(), open_uri);
+			if !matches!(identity.kind, DocumentKind::Project(_)) {
+				return Ok(CloseAction::Clear);
+			}
+			let mut affected = previous;
+			for current in self.affected_project_documents(docs, uri) {
+				if !affected.contains(&current) {
+					affected.push(current);
+				}
+			}
+			return Ok(CloseAction::PublishProject(affected));
+		}
+		self.authoritative_overlays.remove(&module_identity);
+		let DocumentKind::Project(path) = identity.kind else {
+			self.remove_effective_source(&module_identity);
+			return Ok(CloseAction::Clear);
+		};
 		match fs::read_to_string(path) {
 			Ok(source) => {
-				self.session_mut(identity.without_prelude).set_source(
-					identity.project.clone(),
-					identity.module.clone(),
-					source.clone(),
-					SourceVersion(0),
-				);
-				self.sources.insert(uri.clone(), source.into());
+				self.set_effective_source(&module_identity, source, SourceVersion(0));
 			}
 			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-				self
-					.session_mut(identity.without_prelude)
-					.remove_source(identity.project.clone(), identity.module.clone());
-				self.sources.remove(uri);
+				self.remove_effective_source(&module_identity);
 			}
 			Err(error) => return Err(error.into()),
 		}
-		Ok(self.open_project_documents_for(docs, &identity.project))
+		let mut affected = previous;
+		for current in self.affected_project_documents(docs, uri) {
+			if !affected.contains(&current) {
+				affected.push(current);
+			}
+		}
+		let mut insert_at = affected
+			.iter()
+			.position(|candidate| candidate == uri)
+			.map_or(0, |index| index + 1);
+		for alias in self.published_closed_aliases(docs, &module_identity, uri) {
+			if !affected.contains(&alias) {
+				affected.insert(insert_at, alias);
+				insert_at += 1;
+			}
+		}
+		Ok(CloseAction::PublishProject(affected))
 	}
 
-	fn open_project_documents(&self, docs: &DocumentStore, uri: &Uri) -> Vec<Uri> {
-		self.documents.get(uri).map_or_else(
-			|| vec![uri.clone()],
-			|identity| {
-				let mut affected = self.open_project_documents_for(docs, &identity.project);
-				affected.retain(|affected_uri| affected_uri != uri);
-				affected.insert(0, uri.clone());
-				affected
-			},
-		)
+	fn affected_project_documents(&self, docs: &DocumentStore, uri: &Uri) -> Vec<Uri> {
+		let Some(identity) = self.documents.get(uri) else {
+			return vec![uri.clone()];
+		};
+		self
+			.session_for(identity)
+			.reverse_importer_closure(identity.project.clone(), identity.module.clone())
+			.into_iter()
+			.filter_map(|module| {
+				(module == identity.module)
+					.then(|| uri.clone())
+					.or_else(|| self.publication_uri(docs, identity, &module))
+			})
+			.collect()
 	}
 
-	fn open_project_documents_for(&self, docs: &DocumentStore, project: &ProjectId) -> Vec<Uri> {
-		let mut documents: Vec<_> = self
+	fn publication_uri(
+		&self,
+		docs: &DocumentStore,
+		identity: &DocumentIdentity,
+		module: &ModulePath,
+	) -> Option<Uri> {
+		let module_identity = ModuleIdentity {
+			project: identity.project.clone(),
+			module: module.clone(),
+			without_prelude: identity.without_prelude,
+		};
+		self
+			.authoritative_overlays
+			.get(&module_identity)
+			.filter(|uri| docs.get(uri).is_some())
+			.cloned()
+			.or_else(|| {
+				self
+					.remaining_overlay(docs, &module_identity, None)
+					.map(|(uri, _, _)| uri)
+			})
+			.or_else(|| workspace::key_to_uri(&identity.root, module.as_str()))
+	}
+
+	fn remaining_overlay(
+		&self,
+		docs: &DocumentStore,
+		identity: &ModuleIdentity,
+		excluded: Option<&Uri>,
+	) -> Option<(Uri, String, i32)> {
+		if let Some(uri) = self.authoritative_overlays.get(identity)
+			&& excluded != Some(uri)
+			&& let Some(document) = docs.get(uri)
+		{
+			return Some((uri.clone(), document.text.clone(), document.version));
+		}
+		self
 			.documents
 			.iter()
-			.filter(|(open_uri, identity)| &identity.project == project && docs.get(open_uri).is_some())
-			.map(|(open_uri, _)| open_uri.clone())
+			.filter(|(uri, candidate)| excluded != Some(uri) && candidate.module_identity() == *identity)
+			.filter_map(|(uri, _)| {
+				docs
+					.get(uri)
+					.map(|document| (uri.clone(), document.text.clone(), document.version))
+			})
+			.max_by(
+				|(left_uri, _, left_version), (right_uri, _, right_version)| {
+					left_version
+						.cmp(right_version)
+						.then_with(|| left_uri.as_str().cmp(right_uri.as_str()))
+				},
+			)
+	}
+
+	fn published_closed_aliases(
+		&self,
+		docs: &DocumentStore,
+		identity: &ModuleIdentity,
+		origin: &Uri,
+	) -> Vec<Uri> {
+		let mut aliases: Vec<_> = self
+			.diagnostic_targets
+			.keys()
+			.filter_map(|raw| raw.parse::<Uri>().ok())
+			.filter(|uri| uri != origin && docs.get(uri).is_none())
+			.filter(|uri| {
+				self
+					.documents
+					.get(uri)
+					.is_some_and(|candidate| candidate.module_identity() == *identity)
+			})
 			.collect();
-		documents.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-		documents
+		aliases.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+		aliases
+	}
+
+	fn set_effective_source(
+		&mut self,
+		identity: &ModuleIdentity,
+		source: String,
+		version: SourceVersion,
+	) {
+		self.session_mut(identity.without_prelude).set_source(
+			identity.project.clone(),
+			identity.module.clone(),
+			source.clone(),
+			version,
+		);
+		self
+			.effective_sources
+			.insert(identity.clone(), Arc::from(source));
+	}
+
+	fn remove_effective_source(&mut self, identity: &ModuleIdentity) {
+		self
+			.session_mut(identity.without_prelude)
+			.remove_source(identity.project.clone(), identity.module.clone());
+		self.effective_sources.remove(identity);
+	}
+
+	fn effective_source_for_uri(&self, uri: &Uri) -> Option<Arc<str>> {
+		let identity = self.documents.get(uri)?.module_identity();
+		self.effective_sources.get(&identity).cloned()
+	}
+
+	fn retire_transitioned_identity(
+		&mut self,
+		docs: &DocumentStore,
+		uri: &Uri,
+		identity: &DocumentIdentity,
+	) {
+		if matches!(identity.kind, DocumentKind::Project(_)) {
+			self.synchronized_roots.remove(&identity.root);
+		}
+		let module_identity = identity.module_identity();
+		if let Some((open_uri, source, version)) =
+			self.remaining_overlay(docs, &module_identity, Some(uri))
+		{
+			self.set_effective_source(&module_identity, source, SourceVersion(i64::from(version)));
+			self
+				.authoritative_overlays
+				.insert(module_identity, open_uri);
+		} else {
+			self.authoritative_overlays.remove(&module_identity);
+			self.remove_effective_source(&module_identity);
+		}
 	}
 
 	pub fn analysis_for_uri(&self, docs: &DocumentStore, uri: &Uri) -> Option<AnalysisSnapshot> {
+		if self.has_manifest_error(uri) {
+			return None;
+		}
 		let document = docs.get(uri)?;
 		let identity = self.documents.get(uri)?;
 		let analysis = self.session_for(identity).tooling_analyze_module(
@@ -168,12 +390,108 @@ impl CompilerState {
 			identity.module.clone(),
 			!identity.without_prelude,
 		)?;
+		let source = analysis.source.clone();
+		let document_source = Arc::from(document.text.as_str());
 		Some(AnalysisSnapshot {
 			project: identity.project.clone(),
 			module: identity.module.clone(),
-			version: SourceVersion(i64::from(document.version)),
-			source: Arc::from(document.text.as_str()),
+			document_version: document.version,
+			document_revision: docs.revision(),
+			document_source,
+			source,
 			analysis,
+			entry: identity.entry.clone(),
+			root: identity.root.clone(),
+			without_prelude: identity.without_prelude,
+		})
+	}
+
+	pub fn completion_for_uri(&self, docs: &DocumentStore, uri: &Uri) -> Option<CompletionSnapshot> {
+		let document = docs.get(uri)?;
+		let identity = self.documents.get(uri)?;
+		let analysis = self.session_for(identity).tooling_completion_analysis(
+			identity.project.clone(),
+			identity.entry.clone(),
+			identity.module.clone(),
+			!identity.without_prelude,
+		)?;
+		if analysis.source.as_ref() != document.text {
+			return None;
+		}
+		Some(CompletionSnapshot {
+			document_version: document.version,
+			document_revision: docs.revision(),
+			source: analysis.source,
+			imported_names: analysis.imported_names,
+		})
+	}
+
+	/// Resolve a checked stable target to an authoritative, reachable project source.
+	/// Every validation is fallible so stale or provider-owned identities never become URIs.
+	pub fn definition_target(
+		&self,
+		docs: &DocumentStore,
+		snapshot: &AnalysisSnapshot,
+		offset: usize,
+	) -> Option<DefinitionTargetSnapshot> {
+		if docs.revision() != snapshot.document_revision {
+			return None;
+		}
+		let definition = snapshot.analysis.stable_definition_at(offset)?;
+		if !matches!(
+			definition.key,
+			nymph_sema::DeclarationKey::TopLevel {
+				category: nymph_sema::DeclarationCategory::Function
+					| nymph_sema::DeclarationCategory::Let
+					| nymph_sema::DeclarationCategory::Struct
+					| nymph_sema::DeclarationCategory::Enum
+					| nymph_sema::DeclarationCategory::Interface
+					| nymph_sema::DeclarationCategory::TypeAlias,
+				..
+			}
+		) {
+			return None;
+		}
+		let nymph_sema::ModuleOrigin::Project(owner_project) = &definition.module.origin else {
+			return None;
+		};
+		if owner_project.as_str() != snapshot.project.as_str()
+			|| definition.module.project.as_str() != snapshot.project.as_str()
+		{
+			return None;
+		}
+		let module = ModulePath::new(definition.module.path.as_str()).ok()?;
+		if module == snapshot.module {
+			return None;
+		}
+		let session = if snapshot.without_prelude {
+			&self.stdlib_session
+		} else {
+			&self.session
+		};
+		if !session.has_source(snapshot.project.clone(), module.clone()) {
+			return None;
+		}
+		let analysis = session.tooling_analyze_module(
+			snapshot.project.clone(),
+			snapshot.entry.clone(),
+			module.clone(),
+			!snapshot.without_prelude,
+		)?;
+		let span = analysis.declaration_provenance(&definition)?.name_span;
+		let uri = workspace::key_to_uri(&snapshot.root, module.as_str())?;
+		let source = analysis.source.clone();
+		let target_is_open = self.documents.iter().any(|(open_uri, identity)| {
+			identity.project == snapshot.project
+				&& identity.module == module
+				&& identity.without_prelude == snapshot.without_prelude
+				&& docs.get(open_uri).is_some()
+		});
+		valid_source_span(&source, span).then_some(DefinitionTargetSnapshot {
+			uri,
+			source,
+			span,
+			requires_disk_validation: !target_is_open,
 		})
 	}
 
@@ -182,6 +500,9 @@ impl CompilerState {
 		docs: &DocumentStore,
 		uri: &Uri,
 	) -> Option<Arc<[ProjectDiagnostic]>> {
+		if self.has_manifest_error(uri) {
+			return None;
+		}
 		let identity = self.documents.get(uri)?;
 		let _ = docs.get(uri)?;
 		Some(self.session_for(identity).tooling_diagnostics(
@@ -196,25 +517,26 @@ impl CompilerState {
 		self.manifest_errors.contains_key(uri)
 	}
 
-	pub fn manifest_error_snapshot(&mut self, uri: &Uri) -> Option<(String, Vec<Uri>)> {
+	pub fn manifest_error_snapshot(&self, uri: &Uri) -> Option<(String, Vec<Uri>)> {
 		let message = self.manifest_errors.get(uri)?.clone();
 		let stale_targets = self
 			.diagnostic_targets
-			.remove(uri.as_str())
+			.get(uri.as_str())
 			.into_iter()
 			.flatten()
-			.filter(|target| target != uri.as_str())
-			.filter_map(|target| target.parse().ok())
+			.filter(|target| target.as_str() != uri.as_str())
+			.filter_map(|target| target.parse::<Uri>().ok())
 			.collect();
 		Some((message, stale_targets))
 	}
 
 	pub fn diagnostics_snapshot(
-		&mut self,
+		&self,
 		docs: &DocumentStore,
 		uri: &Uri,
 	) -> Option<DiagnosticsSnapshot> {
-		let requested_version = docs.version(uri)?;
+		let _ = docs.version(uri)?;
+		let document_revision = docs.revision();
 		let identity = self.documents.get(uri)?;
 		let session = self.session_for(identity);
 		let diagnostics = session.tooling_diagnostics(
@@ -222,7 +544,7 @@ impl CompilerState {
 			identity.entry.clone(),
 			!identity.without_prelude,
 		);
-		let mut grouped: HashMap<String, Vec<nymph_diagnostics::Diagnostic>> = HashMap::new();
+		let mut grouped: BTreeMap<String, Vec<nymph_diagnostics::Diagnostic>> = BTreeMap::new();
 		for diagnostic in diagnostics.iter() {
 			grouped
 				.entry(diagnostic.module.clone())
@@ -241,7 +563,12 @@ impl CompilerState {
 		keys.retain(|module| grouped.contains_key(module.as_str()));
 		for module in grouped.keys() {
 			if !keys.iter().any(|key| key.as_str() == module) {
-				keys.push(ModulePath::new(module.clone()).ok()?);
+				// Compiler-owned module identities (for example `std::io`) are
+				// intentionally not valid project paths and have no workspace URI.
+				// Skip them without suppressing publication for real project modules.
+				if let Ok(module) = ModulePath::new(module.clone()) {
+					keys.push(module);
+				}
 			}
 		}
 		let mut modules: Vec<_> = keys
@@ -250,12 +577,10 @@ impl CompilerState {
 				let module_uri = if module == identity.module {
 					uri.clone()
 				} else {
-					workspace::key_to_uri(&identity.root, module.as_str())?
+					self.publication_uri(docs, identity, &module)?
 				};
 				let open = docs.get(&module_uri);
-				let source = open
-					.map(|document| Arc::from(document.text.as_str()))
-					.or_else(|| self.sources.get(&module_uri).cloned())?;
+				let source = self.effective_source_for_uri(&module_uri)?;
 				Some(DiagnosticModuleSnapshot {
 					uri: module_uri,
 					source,
@@ -264,12 +589,15 @@ impl CompilerState {
 				})
 			})
 			.collect();
-		let current_targets: HashSet<String> = modules
-			.iter()
-			.map(|module| module.uri.as_str().to_string())
-			.collect();
+		let owned_targets: Vec<Uri> = modules.iter().map(|module| module.uri.clone()).collect();
 		if let Some(previous_targets) = self.diagnostic_targets.get(uri.as_str()) {
-			for previous in previous_targets.difference(&current_targets) {
+			for previous in previous_targets {
+				if owned_targets
+					.iter()
+					.any(|current| current.as_str() == previous)
+				{
+					continue;
+				}
 				let Ok(previous_uri) = previous.parse::<Uri>() else {
 					continue;
 				};
@@ -278,26 +606,125 @@ impl CompilerState {
 					uri: previous_uri.clone(),
 					source: open
 						.map(|document| Arc::from(document.text.as_str()))
-						.or_else(|| self.sources.get(&previous_uri).cloned())
+						.or_else(|| self.effective_source_for_uri(&previous_uri))
 						.unwrap_or_else(|| Arc::from("")),
 					version: open.map(|document| document.version),
 					diagnostics: Vec::new(),
 				});
 			}
 		}
-		self
-			.diagnostic_targets
-			.insert(uri.as_str().to_string(), current_targets);
 		Some(DiagnosticsSnapshot {
-			requested_version,
+			document_revision,
 			modules,
+			owned_targets,
 		})
+	}
+
+	pub fn affected_diagnostics_snapshot(
+		&self,
+		docs: &DocumentStore,
+		origin: &Uri,
+		uris: &[Uri],
+	) -> DiagnosticsSnapshot {
+		let mut modules: Vec<_> = uris
+			.iter()
+			.filter_map(|uri| {
+				let identity = self.documents.get(uri)?;
+				let open = docs.get(uri);
+				let source = self
+					.effective_sources
+					.get(&identity.module_identity())
+					.cloned()
+					.unwrap_or_else(|| Arc::from(""));
+				let diagnostics = if source.is_empty()
+					&& !self
+						.session_for(identity)
+						.has_source(identity.project.clone(), identity.module.clone())
+				{
+					Vec::new()
+				} else {
+					self
+						.session_for(identity)
+						.tooling_diagnostics(
+							identity.project.clone(),
+							identity.entry.clone(),
+							!identity.without_prelude,
+						)
+						.iter()
+						.filter(|diagnostic| diagnostic.module == identity.module.as_str())
+						.map(|diagnostic| diagnostic.diag.clone())
+						.collect()
+				};
+				Some(DiagnosticModuleSnapshot {
+					uri: uri.clone(),
+					source,
+					version: open.map(|document| document.version),
+					diagnostics,
+				})
+			})
+			.collect();
+		let origin_identity = self
+			.documents
+			.get(origin)
+			.map(DocumentIdentity::module_identity);
+		let owned_targets: Vec<Uri> = modules
+			.iter()
+			.filter(|module| {
+				module.uri == *origin
+					|| !origin_identity.as_ref().is_some_and(|origin_identity| {
+						docs.get(&module.uri).is_none()
+							&& self
+								.documents
+								.get(&module.uri)
+								.is_some_and(|candidate| candidate.module_identity() == *origin_identity)
+					})
+			})
+			.map(|module| module.uri.clone())
+			.collect();
+		if let Some(previous_targets) = self.diagnostic_targets.get(origin.as_str()) {
+			for previous in previous_targets {
+				if owned_targets
+					.iter()
+					.any(|current| current.as_str() == previous)
+				{
+					continue;
+				}
+				let Ok(previous_uri) = previous.parse::<Uri>() else {
+					continue;
+				};
+				let open = docs.get(&previous_uri);
+				modules.push(DiagnosticModuleSnapshot {
+					uri: previous_uri.clone(),
+					source: open
+						.map(|document| Arc::from(document.text.as_str()))
+						.or_else(|| self.effective_source_for_uri(&previous_uri))
+						.unwrap_or_else(|| Arc::from("")),
+					version: open.map(|document| document.version),
+					diagnostics: Vec::new(),
+				});
+			}
+		}
+		DiagnosticsSnapshot {
+			document_revision: docs.revision(),
+			modules,
+			owned_targets,
+		}
+	}
+
+	pub fn record_diagnostic_targets(&mut self, origin: &Uri, targets: &[Uri]) {
+		self.diagnostic_targets.insert(
+			origin.as_str().to_string(),
+			targets
+				.iter()
+				.map(|target| target.as_str().to_string())
+				.collect(),
+		);
 	}
 
 	#[doc(hidden)]
 	#[must_use]
 	pub fn source_for_uri(&self, uri: &Uri) -> Option<Arc<str>> {
-		self.sources.get(uri).cloned()
+		self.effective_source_for_uri(uri)
 	}
 
 	#[cfg(test)]
@@ -316,19 +743,24 @@ impl CompilerState {
 		// Filesystem discovery is intentionally tied to the first project open.
 		// Without a watcher, later external adds/deletes of unopened files are
 		// not events; opening a file still overlays or adds its live source.
-		let path = workspace::uri_to_path(uri);
-		let (root, module, scan_disk) = match workspace::detect(&path) {
+		let previous_identity = self.documents.get(uri).cloned();
+		let class = match workspace::classify_uri(uri) {
 			Err(error) => {
-				self.documents.remove(uri);
+				// Retain the last valid identity as lifecycle metadata. The manifest
+				// error suppresses analysis, but close still needs the project path to
+				// retire the overlay and restore disk state.
 				self.manifest_errors.insert(uri.clone(), error.to_string());
 				return Ok(());
 			}
-			Ok(Some(project)) => (
+			Ok(class) => class,
+		};
+		let (root, module, kind) = match class {
+			workspace::UriClass::ProjectFile { path, project } => (
 				project.src_root,
 				ModulePath::new(project.entry_key).unwrap(),
-				true,
+				DocumentKind::Project(path),
 			),
-			Ok(None) => {
+			workspace::UriClass::LooseFile { path } => {
 				let root = path
 					.parent()
 					.unwrap_or_else(|| std::path::Path::new("/"))
@@ -343,56 +775,104 @@ impl CompilerState {
 						path.display()
 					)
 				})?;
-				(root, module, false)
+				(root, module, DocumentKind::Loose(path))
 			}
+			workspace::UriClass::NonFile => (
+				PathBuf::new(),
+				ModulePath::new("document").unwrap(),
+				DocumentKind::NonFile,
+			),
 		};
 		self.manifest_errors.remove(uri);
-		let root = std::path::absolute(root)?;
-		let without_prelude = nymph_compiler::is_stdlib_source_path(&path);
-		let project = self
-			.workspaces
-			.entry(root.clone())
-			.or_insert_with(|| ProjectId::new(root.to_string_lossy().into_owned()))
-			.clone();
+		let root = if matches!(kind, DocumentKind::NonFile) {
+			root
+		} else {
+			std::path::absolute(root)?
+		};
+		// A manifest project shares one source graph at its source root. A
+		// loose file is deliberately its own one-module project, even when
+		// sibling loose files in the same directory are open.
+		let project_key = match &kind {
+			DocumentKind::Project(_) => root.clone(),
+			DocumentKind::Loose(path) => path.clone(),
+			DocumentKind::NonFile => PathBuf::new(),
+		};
+		let without_prelude = match &kind {
+			DocumentKind::Project(path) => nymph_compiler::is_stdlib_source_path(path),
+			DocumentKind::Loose(path) => nymph_compiler::is_stdlib_source_path(path),
+			DocumentKind::NonFile => false,
+		};
+		let project = if matches!(kind, DocumentKind::NonFile) {
+			ProjectId::new(uri.as_str().to_string())
+		} else {
+			self
+				.workspaces
+				.entry(std::path::absolute(project_key)?)
+				.or_insert_with_key(|key| ProjectId::new(key.to_string_lossy().into_owned()))
+				.clone()
+		};
 		let identity = DocumentIdentity {
 			project: project.clone(),
 			module: module.clone(),
 			entry: module,
 			root: root.clone(),
 			without_prelude,
+			kind: kind.clone(),
 		};
-		self.documents.insert(uri.clone(), identity);
+		if let Some(previous) = previous_identity
+			&& previous.module_identity() != identity.module_identity()
+		{
+			self.retire_transitioned_identity(docs, uri, &previous);
+		}
+		self.documents.insert(uri.clone(), identity.clone());
 
-		if scan_disk && self.synchronized_roots.insert(root.clone()) {
+		if matches!(kind, DocumentKind::Project(_)) && self.synchronized_roots.insert(root.clone()) {
 			for (path, module) in nymph_files(&root)? {
 				if let Ok(source) = fs::read_to_string(&path) {
-					self.session_mut(without_prelude).set_source(
-						project.clone(),
-						module,
-						source.clone(),
-						SourceVersion(0),
-					);
+					let disk_identity = DocumentIdentity {
+						project: project.clone(),
+						module: module.clone(),
+						entry: module.clone(),
+						root: root.clone(),
+						without_prelude,
+						kind: DocumentKind::Project(path.clone()),
+					};
+					self.set_effective_source(&disk_identity.module_identity(), source, SourceVersion(0));
 					if let Some(disk_uri) = workspace::path_to_uri(&path) {
-						self.sources.insert(disk_uri, source.into());
+						self.documents.entry(disk_uri).or_insert(disk_identity);
 					}
 				}
 			}
 		}
-		for (open_uri, document) in docs.iter() {
-			let Some(open_identity) = self.documents.get(open_uri).cloned() else {
-				continue;
-			};
-			if open_identity.root == root {
-				self.session_mut(open_identity.without_prelude).set_source(
-					project.clone(),
-					open_identity.module.clone(),
-					document.text.clone(),
-					SourceVersion(i64::from(document.version)),
-				);
-				self
-					.sources
-					.insert(open_uri.clone(), Arc::from(document.text.as_str()));
-			}
+		if docs.get(uri).is_some() {
+			self
+				.authoritative_overlays
+				.insert(identity.module_identity(), uri.clone());
+		}
+		// Replay one explicitly authoritative overlay per logical module. The
+		// current notification wins for its module; other aliases are not chosen
+		// by hash-map iteration order.
+		let overlays: Vec<_> = self
+			.authoritative_overlays
+			.iter()
+			.filter(|(module, _)| module.project == project)
+			.filter_map(|(module, open_uri)| {
+				let document = docs.get(open_uri)?;
+				(self
+					.documents
+					.get(open_uri)
+					.is_some_and(|candidate| candidate.module_identity() == *module))
+				.then(|| {
+					(
+						module.clone(),
+						document.text.clone(),
+						SourceVersion(i64::from(document.version)),
+					)
+				})
+			})
+			.collect();
+		for (module, source, version) in overlays {
+			self.set_effective_source(&module, source, version);
 		}
 		Ok(())
 	}
@@ -412,6 +892,13 @@ impl CompilerState {
 			&mut self.session
 		}
 	}
+}
+
+fn valid_source_span(source: &str, span: nymph_ast::Span) -> bool {
+	span.start < span.end
+		&& span.end <= source.len()
+		&& source.is_char_boundary(span.start)
+		&& source.is_char_boundary(span.end)
 }
 
 fn nymph_files(root: &std::path::Path) -> anyhow::Result<Vec<(PathBuf, ModulePath)>> {
@@ -447,7 +934,23 @@ pub fn publish_if_current<T>(
 	value: T,
 	send: impl FnOnce(T),
 ) {
-	if docs.version(uri) == i32::try_from(snapshot.version.0).ok() {
+	if docs.revision() == snapshot.document_revision
+		&& docs.version(uri) == Some(snapshot.document_version)
+	{
+		send(value);
+	}
+}
+
+pub fn publish_completion_if_current<T>(
+	docs: &DocumentStore,
+	uri: &Uri,
+	snapshot: &CompletionSnapshot,
+	value: T,
+	send: impl FnOnce(T),
+) {
+	if docs.revision() == snapshot.document_revision
+		&& docs.version(uri) == Some(snapshot.document_version)
+	{
 		send(value);
 	}
 }
@@ -458,7 +961,22 @@ mod tests {
 	use std::cell::Cell;
 
 	#[test]
-	fn stale_snapshot_is_not_published() {
+	fn malformed_or_non_boundary_definition_spans_are_rejected() {
+		let source = "a😀z";
+		assert!(valid_source_span(source, nymph_ast::Span::new(1, 5)));
+		for span in [
+			nymph_ast::Span::new(5, 1),
+			nymph_ast::Span::new(1, 1),
+			nymph_ast::Span::new(0, source.len() + 1),
+			nymph_ast::Span::new(2, 5),
+			nymph_ast::Span::new(1, 4),
+		] {
+			assert!(!valid_source_span(source, span), "span {span:?}");
+		}
+	}
+
+	#[test]
+	fn snapshot_from_a_previous_same_version_lifecycle_is_not_published() {
 		let uri: Uri = "file:///tmp/stale.nym".parse().unwrap();
 		let mut docs = DocumentStore::default();
 		let mut state = CompilerState::new();
@@ -466,7 +984,10 @@ mod tests {
 			.open(&mut docs, uri.clone(), "func f(): int = 1".into(), 1)
 			.unwrap();
 		let snapshot = state.analysis_for_uri(&docs, &uri).unwrap();
-		docs.change_full(&uri, "func f(): int = 2".into(), 2);
+		state.close(&mut docs, &uri).unwrap();
+		state
+			.open(&mut docs, uri.clone(), "func f(): boolean = true".into(), 1)
+			.unwrap();
 		let sent = Cell::new(false);
 		publish_if_current(&docs, &uri, &snapshot, (), |_| sent.set(true));
 		assert!(!sent.get());

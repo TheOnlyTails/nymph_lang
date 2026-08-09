@@ -52,7 +52,7 @@ impl int {
   func acosh() = (this as float).acosh()
   func atanh() = (this as float).atanh()
 
-  func sqrt() = this ** 0.5
+  func sqrt() = ((this as float).ln() / 2.0).exp()
 }
 
 impl float {
@@ -93,16 +93,24 @@ impl float {
   external(acosh) func acosh(): float
   external(atanh) func atanh(): float
 
+  /// Returns Euler's number raised to this value.
+  external(exp) func exp(): float
+  /// Returns the natural logarithm of this value.
+  external(ln) func ln(): float
+  /// Returns the logarithm of this value in the given base.
+  func log(base: float): float = this.ln() / base.ln()
+
   external(floor) func floor(): int
   external(ceil) func ceil(): int
   external(round) func round(): int
 
-  func sqrt() = this ** 0.5
+  func sqrt() = (this.ln() / 2.0).exp()
 }
 
 public external(atan2) func atan2(y: float, x: float): float
 
-public let max_int = 2 ** 63 - 1
-public let min_int = -2 ** 63
+public let max_int = 2 ** 63u - 1
+public let min_int = -(2 ** 63u)
 public external(max_float) let max_float: float
 public external(min_float) let min_float: float
+public external(min_positive_float) let min_positive_float: float

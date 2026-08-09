@@ -541,6 +541,14 @@ fn bare_generic_bound_method_value_instantiates_and_remains_callable() {
 }
 
 #[test]
+fn local_shadowing_a_struct_name_keeps_field_and_method_resolution() {
+	assert_ok(
+		"struct Box(value: int) { func read(): int = this.value }
+		 func f(Box: Box): int = Box.value + Box.read()",
+	);
+}
+
+#[test]
 fn bare_inherited_generic_default_method_value_instantiates_and_remains_callable() {
 	assert_ok(
 		"interface Keep { func keep<T>(value: T): T = value }

@@ -4,6 +4,65 @@ A Nymph project is identified by a `nymph.toml` manifest. Tools discover the
 nearest manifest by searching the starting directory and then each ancestor.
 The directory containing the manifest is the project root.
 
+## Creating a project
+
+Create a binary package at a new destination with:
+
+```sh
+nymph new hello-world
+```
+
+The destination basename becomes the package name. Names must start with a
+lowercase ASCII letter and may contain only lowercase ASCII letters, digits,
+and hyphens. Missing parent directories are created. An existing destination
+is accepted only when it is an empty directory; files and nonempty directories
+are refused without modification.
+
+The generated binary tree and exact initial source are:
+
+```text
+hello-world/
+├── nymph.toml
+└── src/
+    └── main.nym
+```
+
+```toml
+[package]
+name = "hello-world"
+version = "0.1.0"
+```
+
+```nym
+func main(): void = {}
+```
+
+Pass `--lib` to generate `src/lib.nym` instead:
+
+```sh
+nymph new hello-lib --lib
+```
+
+```text
+hello-lib/
+├── nymph.toml
+└── src/
+    └── lib.nym
+```
+
+```nym
+public func hello(): string = "Hello, world!"
+```
+
+Git is initialized by default, but no initial commit is created. Use
+`--no-git` to skip repository initialization. Project creation is
+noninteractive and staged before publication, so a missing or failing Git
+executable and other initialization errors do not leave a partial destination.
+
+The generated binary can be checked from its root with `nymph check`. Until
+library-target metadata is part of the manifest schema, check a generated
+library explicitly with `nymph check src/lib.nym`.
+
 Discovery has three outcomes: a valid manifest selects project mode; finding
 no manifest in the search chain permits loose-file mode; and finding a
 manifest that cannot be read or validated is a fatal project error. A broken

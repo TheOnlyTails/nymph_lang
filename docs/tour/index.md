@@ -136,7 +136,7 @@ lists, guards, and more) is in [Pattern matching](../reference/pattern-matching)
 ## Step 8 — Interfaces and operators
 
 Operators like `<` and `>` are backed by interfaces from an always-available
-**prelude**. Implement `Comparable` for `Priority` — just the one `compare_to`
+**ambient core**. Implement `Comparable` for `Priority` — just the one `compare_to`
 method — and all four comparison operators start working, so `High > Low` becomes a
 real question you can ask.
 
@@ -303,10 +303,10 @@ func main() = {
 
 > [!NOTE] Where's the output?
 > `main()` is the program's [entry point](../guide/), but this tour's `main` only
-> *computes* `summary` rather than printing it: reaching the standard library's
-> `io` for `println` needs `import`, which doesn't link into a running program yet
-> (see the note on [Declarations](../reference/declarations#imports)). Everything
-> above type-checks and runs; printing is the one piece still on the way.
+> *computes* `summary` rather than printing it. Printing is available from the opt-in
+> standard library: add `import std/io` at the top and call `io.println(summary)` at
+> the end of `main`. The tour leaves that extra module out to keep its final example
+> focused; everything above type-checks and runs.
 
 ## Where to go next
 

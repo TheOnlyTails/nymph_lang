@@ -57,6 +57,77 @@ fn module_analysis_type_at_handles_complex_pattern_binders() {
 }
 
 #[test]
+fn module_analysis_type_at_uses_the_checked_project_definition_arena() {
+	let source = "import @/dep with (Box)\nfunc keep(value: Box<int>): Option<Box<int>> = Some(value = value)\nenum Cell<T> { Filled(value: T) }\nfunc take(cell: Cell<int>): int = match (cell) { Filled(value) -> value }";
+	let files = FxHashMap::from_iter([
+		("main", source),
+		("dep", "public struct Box<T>(public value: T)"),
+	]);
+	let (session, project) = session(&files);
+	let analysis = session
+		.analyze_module(project, path("main"), path("main"), EntryMode::Library)
+		.unwrap();
+
+	for (needle, expected) in [
+		("Box<int>", "Box<int>"),
+		("Option<Box<int>>", "Option<Box<int>>"),
+		("value)", "Box<int>"),
+		("value) ->", "int"),
+	] {
+		assert_eq!(
+			analysis.type_at(source.find(needle).unwrap()).as_deref(),
+			Some(expected),
+			"hover fixture {needle:?}"
+		);
+	}
+}
+
+#[test]
+fn module_analysis_type_at_renders_imported_constructors_and_pattern_substitutions() {
+	let source = "import @/namespace_dep as dependency\nimport @/dep with (Choice as Selected, Box)\nfunc choose(choice: Selected<int>): int = match (choice) { Pick(value) -> value, Empty -> 0 }\nfunc unbox(box: Box<string>): string = match (box) { Box(value) -> value }\nfunc make(): Selected<int> = Selected.Pick(value = 1)\nfunc through_namespace(): Box<int> = dependency.make_box()";
+	let files = FxHashMap::from_iter([
+		("main", source),
+		(
+			"dep",
+			"public enum Choice<T> { Pick(value: T), Empty }\npublic struct Box<T>(public value: T)",
+		),
+		(
+			"namespace_dep",
+			"import @/dep with (Box)\npublic func make_box(): Box<int> = Box(value = 1)",
+		),
+	]);
+	let (session, project) = session(&files);
+	let diagnostics = session.check_project(project.clone(), path("main"), EntryMode::Library);
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+	let analysis = session
+		.analyze_module(project, path("main"), path("main"), EntryMode::Library)
+		.unwrap();
+
+	for (needle, delta, expected) in [
+		("Pick(value) ->", 1, "Choice.Pick(value: T)"),
+		("Pick(value) ->", "Pick(".len(), "int"),
+		("Box(value) ->", "Box(".len(), "string"),
+		(
+			"Selected.Pick(value = 1)",
+			"Selected.".len() + 1,
+			"Choice.Pick(value: T)",
+		),
+		("make_box()", 1, "() -> Box<int>"),
+	] {
+		assert_eq!(
+			analysis
+				.type_at(source.find(needle).unwrap() + delta)
+				.as_deref(),
+			Some(expected),
+			"hover fixture {needle:?} at +{delta}"
+		);
+	}
+}
+
+#[test]
 fn session_checks_and_compiles_a_representative_project() {
 	let files = FxHashMap::from_iter([
 		(

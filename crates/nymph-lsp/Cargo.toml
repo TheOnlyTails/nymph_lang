@@ -27,4 +27,5 @@ lsp-types = "0.97.0"
 percent-encoding = "2.3.2"
 
 [dev-dependencies]
+nymph-compiler = { workspace = true, features = ["test-support"] }
 tempfile = "3"

@@ -135,7 +135,8 @@ so long as the `Item` type of the iterator matches the list type.
 > There are 2 ways to make lists - either use an array and expand its capacity as needed,
 > or have each item in the list store a reference to the next item.
 > Nymph uses array-backed lists for its list literal, but [linked lists](./stdlib/collections-linked_list#LinkedList)
-> are also available from the standard library.
+> are also available as the opt-in `std/collections/linked_list` module. Its current
+> `LinkedList<T>` is only a bare data shape and does not yet provide collection operations.
 
 ```nymph
 #["apple", "banana", "cherry"]

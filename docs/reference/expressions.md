@@ -40,8 +40,12 @@ they always compare by native identity/structural equality and never dispatch an
 type that implements `Equals`.
 
 ```nym
-func polynomial(x: int): int = x ** 3 + 2 * x ** 2 - x + 7
+func polynomial(x: int): int = x ** 3u + 2 * x ** 2u - x + 7
 ```
+
+Exponentiation is right-associative: `a ** b ** c` means `a ** (b ** c)`. Its accepted built-in
+operand and result types are the exact [exponentiation matrix](./operators#exponentiation); other
+combinations require a user `Power` implementation.
 
 ## Function calls
 

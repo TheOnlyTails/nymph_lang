@@ -169,9 +169,8 @@ fn ambient_core_option_result_convert_and_for_over_list_run_with_no_import() {
 }
 
 /// `std/math` (added to `CORE_SOURCES` alongside the other core modules) is
-/// ambient too: `int`/`float`'s `abs`/`sqrt` methods, and the `Power<Other =
-/// float, Output = float> for int` impl that makes `this ** 0.5` type-check
-/// for an `int` receiver, all resolve and run with **no `import` anywhere** —
+/// ambient too: `int`/`float`'s `abs`/`sqrt` methods and integer-exponent
+/// `Power` implementations all resolve and run with **no `import` anywhere** —
 /// the headline payoff of making `math` a 9th core module. Locks in the
 /// runtime behavior so a regression (e.g. dropping `("std/math", ..)` from
 /// `CORE_SOURCES`, or reintroducing the `Power<Other = float, Output =
@@ -185,7 +184,7 @@ fn ambient_math_abs_sqrt_and_power_run_with_no_import() {
 		func pos_abs(): int = (5).abs()
 		func float_abs(): float = (0.0 - 2.5).abs()
 		func int_sqrt(): float = (16).sqrt()
-		func int_pow_frac(): float = 16 ** 0.5
+		func int_pow(): int = 2 ** 10u
 		"#;
 
 	let diags = check(src, "test");
@@ -198,7 +197,107 @@ fn ambient_math_abs_sqrt_and_power_run_with_no_import() {
 	assert_eq!(run(src, "pos_abs()"), "5");
 	assert_eq!(run(src, "float_abs()"), "2.5");
 	assert_eq!(run(src, "int_sqrt()"), "4");
-	assert_eq!(run(src, "int_pow_frac()"), "4");
+	assert_eq!(run(src, "int_pow()"), "1024");
+}
+
+#[test]
+fn power_compound_assignment_evaluates_an_index_target_once() {
+	let src = r#"
+		func probe(): int = {
+			let mut calls = 0
+			let mut values: mut #[int] = #[2]
+			values[{ calls += 1 0 }] **= 2u
+			calls * 10 + values[0]
+		}
+	"#;
+	assert_eq!(run(src, "probe()"), "14");
+}
+
+#[test]
+fn ambient_boxed_float_intrinsics_cover_the_complete_runtime_surface() {
+	let src = r#"
+		func sin_value(): float = 0.0.sin()
+		func cos_value(): float = 0.0.cos()
+		func tan_value(): float = 0.0.tan()
+		func asin_value(): float = 0.0.asin()
+		func acos_value(): float = 1.0.acos()
+		func atan_value(): float = 0.0.atan()
+		func sinh_value(): float = 0.0.sinh()
+		func cosh_value(): float = 0.0.cosh()
+		func tanh_value(): float = 0.0.tanh()
+		func asinh_value(): float = 0.0.asinh()
+		func acosh_value(): float = 1.0.acosh()
+		func atanh_value(): float = 0.0.atanh()
+		func exp_value(): float = 1.0.exp()
+		func ln_value(): float = e.ln()
+		func log_value(): float = 8.0.log(2.0)
+		func floor_value(): int = (0.0 - 1.2).floor()
+		func ceil_value(): int = (0.0 - 1.2).ceil()
+		func round_value(): int = 1.5.round()
+		func atan2_value(): float = atan2(1.0, 0.0)
+		func int_sin_value(): float = 0.sin()
+		func int_cosh_value(): float = 0.cosh()
+		func nan_value(): float = (0.0 - 1.0).ln()
+		func neg_infinity_value(): float = 0.0.ln()
+		func infinity_value(): float = (1.0 / 0.0).exp()
+		func receiver_once(): int = {
+			let mut calls = 0
+			let value = ({ calls = calls + 1 0.0 }).sin()
+			calls
+		}
+		func atan2_order(): int = {
+			let mut order = 0
+			let value = atan2(
+				{ order = order * 10 + 1 1.0 },
+				{ order = order * 10 + 2 1.0 },
+			)
+			order
+		}
+	"#;
+
+	let expected = [
+		("sin_value()", "0"),
+		("cos_value()", "1"),
+		("tan_value()", "0"),
+		("asin_value()", "0"),
+		("acos_value()", "0"),
+		("atan_value()", "0"),
+		("sinh_value()", "0"),
+		("cosh_value()", "1"),
+		("tanh_value()", "0"),
+		("asinh_value()", "0"),
+		("acosh_value()", "0"),
+		("atanh_value()", "0"),
+		("ln_value()", "1"),
+		("log_value()", "3"),
+		("floor_value()", "-2"),
+		("ceil_value()", "-1"),
+		("round_value()", "2"),
+		("int_sin_value()", "0"),
+		("int_cosh_value()", "1"),
+		("receiver_once()", "1"),
+		("atan2_order()", "12"),
+	];
+	for (call, value) in expected {
+		assert_eq!(run(src, call), value, "{call}");
+	}
+
+	let exp = run(src, "exp_value()").parse::<f64>().unwrap();
+	assert!((exp - std::f64::consts::E).abs() < f64::EPSILON);
+	let atan2 = run(src, "atan2_value()").parse::<f64>().unwrap();
+	assert!((atan2 - std::f64::consts::FRAC_PI_2).abs() < f64::EPSILON);
+	assert_eq!(run(src, "nan_value()"), "NaN");
+	assert_eq!(run(src, "neg_infinity_value()"), "-Infinity");
+	assert_eq!(run(src, "infinity_value()"), "Infinity");
+
+	let boxed = run(
+		src,
+		"new NInt(\
+			sin_value() instanceof NFloat && atan2_value() instanceof NFloat && \
+			floor_value() instanceof NInt && ceil_value() instanceof NInt && round_value() instanceof NInt \
+			? 1 : 0)",
+	);
+	assert_eq!(boxed, "1");
 }
 
 /// `std/math`'s plain top-level `let` constants (`pi`, `tau`, `e`, `phi`,
@@ -223,6 +322,9 @@ fn ambient_math_constants_run_with_no_import() {
 		func get_phi(): float = phi
 		func get_max_int(): int = max_int
 		func get_min_int(): int = min_int
+		func get_max_float(): float = max_float
+		func get_min_float(): float = min_float
+		func get_min_positive_float(): float = min_positive_float
 		"#;
 
 	let diags = check(src, "test");
@@ -254,6 +356,28 @@ fn ambient_math_constants_run_with_no_import() {
 	let min_int: f64 = -(2f64.powi(63));
 	assert_eq!(run(src, "get_max_int()"), max_int.to_string());
 	assert_eq!(run(src, "get_min_int()"), min_int.to_string());
+	assert_eq!(
+		run(src, "get_max_float()").parse::<f64>().unwrap(),
+		f64::MAX
+	);
+	assert_eq!(
+		run(src, "get_min_float()").parse::<f64>().unwrap(),
+		-f64::MAX
+	);
+	assert_eq!(
+		run(src, "get_min_positive_float()").parse::<f64>().unwrap(),
+		f64::from_bits(1)
+	);
+
+	let boxed_and_shared = run(
+		src,
+		"new NInt(\
+			get_max_float() === get_max_float() && \
+			get_min_float() === get_min_float() && \
+			get_min_positive_float() === get_min_positive_float() && \
+			get_min_float() instanceof NFloat ? 1 : 0)",
+	);
+	assert_eq!(boxed_and_shared, "1");
 }
 
 /// `Default` is ambient too (no `import` needed to name it as a bound), and its

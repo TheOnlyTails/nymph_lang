@@ -110,7 +110,7 @@ fn golden_arithmetic_blocks_and_mutation() {
 	// a real numeric routine would be written.
 	compile_ok(
 		r#"
-		func polynomial(x: int): int = x ** 3 + 2 * x ** 2 - x + 7
+		func polynomial(x: int): int = x ** 3u + 2 * x ** 2u - x + 7
 
 		func average_scaled(a: int, b: int, scale: int): float = {
 			let sum = a + b

@@ -282,9 +282,21 @@ struct SourceRecord {
 ///
 /// This intentionally exposes compiler values rather than Salsa inputs or a
 /// database handle, so tooling can safely retain the result between requests.
+/// Its semantic payload includes the exact imported, ambient-core, and local
+/// definition arena used to mint annotation types; position queries must not
+/// rebuild a source-local arena alongside those types.
 pub struct ModuleAnalysis {
+	/// Exact source input from which `semantic` was produced.
+	pub source: Arc<str>,
 	pub semantic: Arc<nymph_sema::SemanticAnalysis>,
 	pub diagnostics: ProjectDiagnostics,
+}
+
+/// Body-independent completion facts paired with the exact source input that
+/// produced them.
+pub struct ToolingCompletionAnalysis {
+	pub source: Arc<str>,
+	pub imported_names: Arc<[nymph_sema::query::ImportedName]>,
 }
 
 /// Project diagnostics are deliberately separate from reusable semantic facts.
@@ -318,6 +330,19 @@ pub enum BuiltinRuntimeOwnerShape {
 }
 
 impl ModuleAnalysis {
+	#[must_use]
+	pub fn stable_definition_at(&self, offset: usize) -> Option<nymph_sema::DefinitionId> {
+		nymph_sema::query::stable_definition_at(&self.semantic, offset)
+	}
+
+	#[must_use]
+	pub fn declaration_provenance(
+		&self,
+		definition: &nymph_sema::DefinitionId,
+	) -> Option<nymph_sema::DeclarationProvenance> {
+		self.semantic.declaration(definition)
+	}
+
 	/// Query the checked type at a source offset.
 	///
 	/// This is the safe tooling seam: the private module has the exact flattened
@@ -445,6 +470,34 @@ impl CompilerSession {
 			key,
 			SemanticModuleInput::Builtin(module),
 		))
+	}
+
+	#[doc(hidden)]
+	#[must_use]
+	#[cfg(feature = "test-support")]
+	pub fn importable_std_module_paths_for_test(&self) -> Vec<String> {
+		self
+			.builtin_sources
+			.keys()
+			.map(ToString::to_string)
+			.collect()
+	}
+
+	#[doc(hidden)]
+	#[cfg(feature = "test-support")]
+	pub fn set_importable_std_source_for_test(&mut self, path: &str, source: String) {
+		let path: Arc<str> = Arc::from(path);
+		let input = self
+			.builtins
+			.get(&BuiltinModuleKey {
+				domain: BuiltinModuleDomain::ImportableStd,
+				path: path.clone(),
+			})
+			.copied()
+			.expect("test mutation must name an embedded importable std module");
+		let source: Arc<str> = Arc::from(source);
+		input.set_source(&mut self.db).to(source.clone());
+		self.builtin_sources.insert(path, source);
 	}
 
 	/// Test-only mutation seam for proving ambient query invalidation. Ordinary
@@ -592,6 +645,24 @@ impl CompilerSession {
 		let input = self.registry.get(&(project.clone(), module))?.input;
 		let key = self.project_key(project.clone(), entry, mode, true, true);
 		self.module_analysis(project, input, key)
+	}
+
+	pub(super) fn documentation_module_interface(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		document_private_items: bool,
+	) -> Option<Result<Arc<nymph_sema::ModuleInterface>, Arc<nymph_sema::InterfaceConversionError>>>
+	{
+		let input = self.registry.get(&(project.clone(), module))?.input;
+		let key = self.project_key(project, entry, EntryMode::Library, true, true);
+		Some(queries::documentation_module_interface(
+			&self.db,
+			key,
+			SemanticModuleInput::Project(input),
+			document_private_items,
+		))
 	}
 
 	/// Resolve and read one exact runtime-bearing definition from its source
@@ -795,6 +866,49 @@ impl CompilerSession {
 					.collect()
 			})
 			.collect()
+	}
+
+	/// Return explicit imported-name facts even when partial source prevents a
+	/// checked-body analysis from being produced.
+	#[doc(hidden)]
+	#[must_use]
+	pub fn tooling_completion_analysis(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		ambient_prelude: bool,
+	) -> Option<ToolingCompletionAnalysis> {
+		let input = self.registry.get(&(project.clone(), module))?.input;
+		let key = self.tooling_key(project.clone(), entry, ambient_prelude);
+		let common = input.project(&self.db) == project
+			&& key.project_input(&self.db).project(&self.db) == project
+			&& key
+				.project_input(&self.db)
+				.active_modules(&self.db)
+				.contains(&input);
+		if !common {
+			return None;
+		}
+		let source = input.source(&self.db)?;
+		let graph = queries::project_graph(&self.db, key);
+		let semantic_input = SemanticModuleInput::Project(input);
+		let modules = graph
+			.semantic_direct_dependencies(semantic_input)
+			.iter()
+			.copied()
+			.map(|dependency| queries::interface_module_environment(&self.db, key, dependency))
+			.collect::<Vec<_>>();
+		let imported_names = nymph_sema::query::imported_names(
+			&queries::resolved_module_imports(&self.db, key, semantic_input).bindings,
+			&modules,
+			&semantic_input.parsed(&self.db).tree,
+		)
+		.into();
+		Some(ToolingCompletionAnalysis {
+			source,
+			imported_names,
+		})
 	}
 
 	/// Return tooling analysis under the same request key used by
@@ -1156,13 +1270,14 @@ impl CompilerSession {
 	}
 
 	fn refresh_project(&mut self, project: ProjectId) {
-		let active: Arc<[ModuleInput]> = self
+		let mut active: Vec<ModuleInput> = self
 			.registry
 			.iter()
 			.filter(|((owner, _), record)| owner == &project && record.source.is_some())
 			.map(|(_, record)| record.input)
-			.collect::<Vec<_>>()
-			.into();
+			.collect();
+		active.sort_by_key(|module| module.path(&self.db));
+		let active: Arc<[ModuleInput]> = active.into();
 		let projects = self
 			.projects
 			.get_mut()
@@ -1435,6 +1550,28 @@ impl CompilerSession {
 			.iter()
 			.map(|importer| importer.path(&self.db))
 			.collect()
+	}
+
+	/// Return `module` followed by every transitive project importer.
+	///
+	/// Results are deterministic and dependency-before-importer. Importers at
+	/// the same distance are ordered by canonical module path. The project-wide
+	/// relation is tracked by Salsa and cycle-safe; callers do not need to keep
+	/// a separate reverse index synchronized with source edits.
+	#[must_use]
+	pub fn reverse_importer_closure(
+		&self,
+		project: ProjectId,
+		module: ModulePath,
+	) -> Vec<ModulePath> {
+		let projects = self
+			.projects
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		let Some(input) = projects.get(&project).copied() else {
+			return vec![module];
+		};
+		queries::project_dependency_graph(&self.db, input).reverse_importer_closure(module)
 	}
 
 	#[doc(hidden)]

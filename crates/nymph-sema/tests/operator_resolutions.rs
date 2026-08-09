@@ -1318,6 +1318,57 @@ fn int_equals_int_value_still_resolves() {
 	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
 }
 
+#[test]
+fn scalar_power_matrix_resolves_only_through_declared_power_impls() {
+	for source in [
+		"func f(a: int, b: uint): int = a ** b",
+		"func f(a: uint, b: uint): uint = a ** b",
+		"func f(a: float, b: uint): float = a ** b",
+		"func f(a: int, b: int): float = a ** b",
+		"func f(a: uint, b: int): float = a ** b",
+		"func f(a: float, b: int): float = a ** b",
+	] {
+		let resolution = binary_resolution_for_prelude(source, "f");
+		assert_eq!(resolution.method, "power", "{source}");
+		assert_ne!(resolution.dispatch, DispatchKind::BuiltinEager, "{source}");
+	}
+}
+
+#[test]
+fn scalar_power_rejects_cells_not_declared_by_the_visible_impls() {
+	for source in [
+		"func f(a: int, b: float): float = a ** b",
+		"func f(a: uint, b: float): float = a ** b",
+		"func f(a: float, b: float): float = a ** b",
+		"func f(a: int, b: boolean): int = a ** b",
+	] {
+		let parsed = parse_module(source, "test");
+		assert!(
+			!parsed
+				.diagnostics
+				.iter()
+				.any(|diagnostic| diagnostic.is_error())
+		);
+		let checked = check_module_with_prelude(&parsed.tree, &[ops_prelude_module()]);
+		assert!(
+			checked.diags.iter().any(|diagnostic| diagnostic.is_error()),
+			"expected the outside-matrix power to be rejected: {source}"
+		);
+	}
+}
+
+#[test]
+fn user_power_impl_remains_the_fallback_outside_the_builtin_matrix() {
+	let source = "interface Power<Other, Output> { func power(other: Other): Output }\n\
+		struct Base(value: int)\nstruct Exponent(value: int)\n\
+		impl Power<Other = Exponent, Output = int> for Base {\n\
+		  func power(other: Exponent): int = this.value + other.value\n}\n\
+		func f(a: Base, b: Exponent): int = a ** b";
+	let resolution = resolution_for(source, "f");
+	assert_eq!(resolution.method, "power");
+	assert_eq!(resolution.dispatch, DispatchKind::UserImpl);
+}
+
 // ---- Operator-resolution-failure diagnostic (#7) ----
 // When an operator has no impl for its operands, the diagnostic names the operator
 // symbol, BOTH operands, and the interface to implement — not the internal desugared

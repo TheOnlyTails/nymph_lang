@@ -21,4 +21,8 @@ ecow = { workspace = true }
 clap = { workspace = true }
 inquire = "0.9.4"
 owo-colors = "4.3.0"
+rustix = { workspace = true }
 anyhow = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }

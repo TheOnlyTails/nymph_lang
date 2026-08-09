@@ -106,6 +106,8 @@ pub enum ResolvedMethodTarget {
 	InterfaceImplementation {
 		interface: DefinitionId,
 		slot: crate::ImplementationMemberSlot,
+		implementation_arguments: Vec<Ty>,
+		method_arguments: Vec<Ty>,
 	},
 	GenericBound {
 		interface: DefinitionId,
@@ -143,6 +145,22 @@ pub struct Resolution {
 	/// against `SPAN_BASE` to classify `dispatch` in the first place, just
 	/// carried forward instead of discarded.
 	pub impl_span: Option<Span>,
+}
+
+fn map_resolution_types(resolution: &mut Resolution, map: &mut impl FnMut(Ty) -> Ty) {
+	if let Some(ResolvedMethodTarget::InterfaceImplementation {
+		implementation_arguments,
+		method_arguments,
+		..
+	}) = &mut resolution.resolved_target
+	{
+		for argument in implementation_arguments
+			.iter_mut()
+			.chain(method_arguments.iter_mut())
+		{
+			*argument = map(*argument);
+		}
+	}
 }
 
 /// What the checker learned about one expression node.
@@ -202,6 +220,7 @@ pub struct Annotations {
 	unresolved_qualified_accesses: Vec<UnresolvedQualifiedAccess>,
 	direct_namespace_members: FxHashSet<NodeId>,
 	definition_targets: FxHashMap<NodeId, DefinitionId>,
+	type_definition_targets: FxHashMap<Span, DefinitionId>,
 	variants: FxHashMap<NodeId, VariantResolution>,
 	/// Variant *patterns*, keyed by span — patterns carry no `NodeId`, but each
 	/// written pattern has a unique source span.
@@ -215,6 +234,8 @@ pub struct Annotations {
 	iter_modes: FxHashMap<NodeId, IterMode>,
 	/// Resolution of the implicit `.iter()` call inserted for an iterable source.
 	iter_resolutions: FxHashMap<NodeId, Resolution>,
+	/// Resolution of the implicit `.next()` call used to drain the selected iterator.
+	iteration_next_resolutions: FxHashMap<NodeId, Resolution>,
 	/// NodeId of a committed anonymous-closure-parameter (`$N`) boundary → its
 	/// arity (Slice: `$N` anonymous closure params). Populated by the
 	/// checker's type-directed boundary search (`anon_closure.rs`) as each
@@ -373,6 +394,16 @@ impl Annotations {
 	pub(crate) fn map_types(&mut self, mut map: impl FnMut(Ty) -> Ty) {
 		for info in self.infos.values_mut() {
 			info.ty = map(info.ty);
+			if let Some(resolution) = &mut info.resolution {
+				map_resolution_types(resolution, &mut map);
+			}
+		}
+		for resolution in self
+			.iter_resolutions
+			.values_mut()
+			.chain(self.iteration_next_resolutions.values_mut())
+		{
+			map_resolution_types(resolution, &mut map);
 		}
 		for arguments in self.generic_call_arguments.values_mut() {
 			for argument in arguments {
@@ -393,6 +424,28 @@ impl Annotations {
 	/// The stable declaration referenced by `id`, if this node denotes one.
 	pub fn definition_target_of(&self, id: NodeId) -> Option<&DefinitionId> {
 		self.definition_targets.get(&id)
+	}
+
+	pub(crate) fn record_type_definition_target(
+		&mut self,
+		span: Span,
+		target: Option<&DefinitionId>,
+	) {
+		if let Some(target) = target {
+			self.type_definition_targets.insert(span, target.clone());
+		}
+	}
+
+	/// The stable declaration referenced by an exactly checked type identifier.
+	pub fn type_definition_target_at(&self, span: Span) -> Option<&DefinitionId> {
+		self.type_definition_targets.get(&span)
+	}
+
+	pub fn type_definition_targets(&self) -> impl Iterator<Item = (Span, &DefinitionId)> {
+		self
+			.type_definition_targets
+			.iter()
+			.map(|(&span, target)| (span, target))
 	}
 
 	/// Record which `(enum, variant)` a variant construction/reference resolved to.
@@ -448,6 +501,16 @@ impl Annotations {
 
 	pub fn iter_resolution_of(&self, id: NodeId) -> Option<&Resolution> {
 		self.iter_resolutions.get(&id)
+	}
+
+	pub(crate) fn record_iteration_next_resolution(&mut self, id: NodeId, resolution: Resolution) {
+		if id != NodeId::DUMMY {
+			self.iteration_next_resolutions.insert(id, resolution);
+		}
+	}
+
+	pub fn iteration_next_resolution_of(&self, id: NodeId) -> Option<&Resolution> {
+		self.iteration_next_resolutions.get(&id)
 	}
 
 	/// Record `id` as a committed anonymous-closure-parameter boundary with

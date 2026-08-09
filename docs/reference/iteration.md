@@ -157,10 +157,10 @@ Loops can be labeled with `while@outer` or `for@outer`; `break@outer` and `conti
 that loop through intervening nested loops. There is no whitespace between the keyword, `@`, and
 label.
 
-> [!NOTE] Real `Iterator`/`Iterable` come from the standard library
-> The stdlib defines the real `Iterator`/`Iterable` interfaces in
-> [`@/iter`](./stdlib/iter#Iterator) — the versions declared inline above are for illustration
-> and exercise the exact same for-loop desugaring.
+> [!NOTE] `Iterator` and `Iterable` are ambient
+> The versions declared inline above are for illustrating their complete shape and exercise the
+> same for-loop desugaring as Nymph's real ambient [`Iterator`/`Iterable`](./stdlib/iter#Iterator)
+> interfaces. Ordinary programs use those interfaces directly, with no import.
 
 ## Non-iterable sources
 

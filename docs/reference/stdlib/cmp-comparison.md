@@ -1,9 +1,8 @@
-# `@/ops`: comparison
+# Ambient comparison APIs
 
-`Comparable` is one of the interfaces in the stdlib's **operator prelude** — unlike the rest of the
-standard library, it (along with the rest of `@/ops`) is ambient: available in every module with no
-`import`, which is why every sample below implements it directly. See [Operators](../operators)
-for the full prelude.
+`Comparable` and `Order` are part of Nymph's **ambient core**: they are available in every module
+with no `import`, which is why every sample below uses them directly. See
+[Operators](../operators) for the complete operator interface set.
 
 ## `Order`
 

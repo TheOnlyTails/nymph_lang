@@ -234,6 +234,48 @@ fn editing_one_definition_only_reexecutes_its_exact_lowering_consumer() {
 }
 
 #[test]
+fn equivalent_native_range_type_facts_backdate_exact_lowering_consumer() {
+	let events = Arc::new(Mutex::new(Vec::<SemanticQueryEvent>::new()));
+	let sink = events.clone();
+	let mut session = CompilerSession::with_detailed_event_callback_for_test(move |event| {
+		sink.lock().unwrap().push(event)
+	});
+	let project = ProjectId::new("range-type-backdating");
+	let main = ModulePath::new("main").unwrap();
+	let total = id("range-type-backdating", "total");
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"func total(start: int): int = { let mut result = 0 for (value in start..4) { result = result + value } result }"
+			.into(),
+		SourceVersion(1),
+	);
+	let before = session
+		.lower_runtime_definition(
+			project.clone(),
+			main.clone(),
+			total.clone(),
+			EntryMode::Library,
+		)
+		.unwrap();
+	events.lock().unwrap().clear();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"func total(start: mut int): int = { let mut result = 0 for (value in start..4) { result = result + value } result }"
+			.into(),
+		SourceVersion(2),
+	);
+	let after = session
+		.lower_runtime_definition(project, main, total.clone(), EntryMode::Library)
+		.unwrap();
+	assert_eq!(before, after);
+	assert!(!events.lock().unwrap().iter().any(|event| {
+		event.query == "lower_runtime_definition" && event.definition.as_ref() == Some(&total)
+	}));
+}
+
+#[test]
 fn native_list_and_bounded_ranges_lower_with_real_ambient_protocol_facts() {
 	let mut session = CompilerSession::new();
 	let project = ProjectId::new("ambient-iteration");
@@ -241,9 +283,13 @@ fn native_list_and_bounded_ranges_lower_with_real_ambient_protocol_facts() {
 	session.set_source(
 		project.clone(),
 		main.clone(),
-		r#"func list_sum(xs: mut #[int]): int = { xs[0] = xs[0] + 1 let mut total = 0 for (x in xs) { total = total + x } total }
-func exclusive(): int = { let mut total = 0 for (x in 1..4) { total = total + x } total }
-func inclusive(): int = { let mut total = 0 for (x in 1..=4) { total = total + x } total }"#.into(),
+		r#"func int_start(): int = 1
+func uint_start(): uint = 1u
+func list_sum(xs: mut #[int]): int = { xs[0] = xs[0] + 1 let mut total = 0 for (x in xs) { total = total + x } total }
+func exclusive(): int = { let mut total = 0 for (x in (int_start())..4) { total = total + x } total }
+func inclusive(): int = { let mut start = uint_start() let mut total = 0 for (x in start..=4u) { total = total + (x as int) } total }
+func conditional(flag: boolean): int = { let mut total = 0 for (x in (if (flag) { 1 } else { 2 })..4) { total = total + x } total }
+func used(): Option<int> = for (x in int_start()..4) { if (x == 2) { break x } }"#.into(),
 		SourceVersion(1),
 	);
 	let list = session
@@ -257,10 +303,6 @@ func inclusive(): int = { let mut total = 0 for (x in 1..=4) { total = total + x
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = list.fragment() else {
 		panic!("list_sum must lower to a top-level function");
 	};
-	let iter_body = ambient_iteration_demands(&session)[1].clone();
-	let iter_binding = session
-		.binding_name_for_test(project.clone(), main.clone(), iter_body, EntryMode::Library)
-		.expect("selected List.iter body has an authoritative binding name");
 	assert!(hir_contains(&function.body, &|expr| matches!(
 		expr,
 		nymph_hir::hir::HirExpr::Assign { target, .. }
@@ -269,17 +311,21 @@ func inclusive(): int = { let mut total = 0 for (x in 1..=4) { total = total + x
 	assert!(hir_contains(&function.body, &|expr| matches!(
 		expr,
 		nymph_hir::hir::HirExpr::Call { callee, args }
-			if args.len() == 1 && matches!(
+			if args.is_empty() && matches!(
 				callee.as_ref(),
-				nymph_hir::hir::HirExpr::Local(name) if name == iter_binding.as_str()
+				nymph_hir::hir::HirExpr::Field { name, .. } if name == "iter"
 			)
 	)));
 	assert!(hir_contains(&function.body, &|expr| matches!(
 		expr,
 		nymph_hir::hir::HirExpr::While { .. }
 	)));
-	assert_eq!(list.demands(), ambient_iteration_demands(&session));
-	for name in ["exclusive", "inclusive"] {
+	assert_eq!(
+		list.demands(),
+		[ambient_iteration_demands(&session)[0].clone()],
+		"prototype-dispatched List.iter needs no direct body demand",
+	);
+	for name in ["exclusive", "inclusive", "conditional"] {
 		let lowered = session
 			.lower_runtime_definition(
 				project.clone(),
@@ -293,14 +339,73 @@ func inclusive(): int = { let mut total = 0 for (x in 1..=4) { total = total + x
 		};
 		assert!(hir_contains(&function.body, &|expr| matches!(
 			expr,
-			nymph_hir::hir::HirExpr::While { .. }
+			nymph_hir::hir::HirExpr::While { option: None, .. }
 		)));
+		assert!(!hir_contains(&function.body, &|expr| matches!(
+			expr,
+			nymph_hir::hir::HirExpr::Call { callee, args }
+				if args.is_empty() && matches!(
+					callee.as_ref(),
+					nymph_hir::hir::HirExpr::Field { name, .. } if name == "iter" || name == "next"
+				)
+		)));
+		if name == "inclusive" {
+			assert!(hir_contains(&function.body, &|expr| matches!(
+				expr,
+				nymph_hir::hir::HirExpr::Binary {
+					op: nymph_hir::hir::BinOp::Add,
+					result: nymph_hir::hir::BuiltinResult::UInt,
+					rhs,
+					..
+				} if matches!(rhs.as_ref(), nymph_hir::hir::HirExpr::Num(1.0, nymph_hir::hir::NumKind::UInt))
+			)));
+		}
+		let expected = match name {
+			"exclusive" => vec![id("ambient-iteration", "int_start")],
+			"inclusive" => vec![id("ambient-iteration", "uint_start")],
+			"conditional" => vec![],
+			_ => unreachable!(),
+		};
 		assert_eq!(
 			lowered.demands(),
-			[],
-			"{name} has no runtime definition demands"
+			expected,
+			"discarded {name} demands only its dynamic bound"
 		);
 	}
+	let used = session
+		.lower_runtime_definition(
+			project.clone(),
+			main.clone(),
+			id("ambient-iteration", "used"),
+			EntryMode::Library,
+		)
+		.expect("a used native range loop lowers directly");
+	let option_module = session
+		.ambient_core_module_interface(AmbientCoreModuleKey::new("option").unwrap())
+		.expect("Option ambient interface exists");
+	let option = top_level(&option_module, DeclarationCategory::Enum, "Option");
+	assert_eq!(
+		used.demands(),
+		[option, id("ambient-iteration", "int_start")]
+	);
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = used.fragment() else {
+		panic!("used must lower to a top-level function");
+	};
+	assert!(hir_contains(&function.body, &|expr| matches!(
+		expr,
+		nymph_hir::hir::HirExpr::While {
+			option: Some(_),
+			..
+		}
+	)));
+	assert!(!hir_contains(&function.body, &|expr| matches!(
+		expr,
+		nymph_hir::hir::HirExpr::Call { callee, args }
+			if args.is_empty() && matches!(
+				callee.as_ref(),
+				nymph_hir::hir::HirExpr::Field { name, .. } if name == "iter" || name == "next"
+			)
+	)));
 }
 
 #[test]

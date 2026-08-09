@@ -30,6 +30,7 @@ fn semantic_analysis_owns_source_and_node_annotations_without_diagnostics() {
 		module: Arc::new(module.clone()),
 		checked: Arc::new(checked.facts),
 		annotations,
+		declarations: Arc::default(),
 	};
 	let cloned = analysis.clone();
 
@@ -63,6 +64,7 @@ fn environment_check_uses_imported_function_without_mutating_environment() {
 		name: "answer".into(),
 		visibility: None,
 		kind: DefinitionShapeKind::Function,
+		declaration_kind: None,
 		binders: vec![],
 		constraints: vec![],
 		parameters: vec![],
@@ -140,6 +142,14 @@ fn environment_check_uses_imported_function_without_mutating_environment() {
 		Some(&function_id),
 	);
 	assert_eq!(
+		nymph_sema::query::stable_definition_kind(&result.analysis, &function_id),
+		Some(nymph_sema::DefKind::Func),
+	);
+	assert_eq!(
+		nymph_sema::query::definition_kind_by_name(&result.analysis, "answer"),
+		Some(nymph_sema::DefKind::Func),
+	);
+	assert_eq!(
 		result
 			.analysis
 			.annotations
@@ -159,6 +169,45 @@ fn environment_check_uses_imported_function_without_mutating_environment() {
 			DeclarationKey::top_level(DeclarationCategory::Function, "local"),
 		))
 	);
+}
+
+#[test]
+fn stable_definition_kind_resolves_namespace_and_inherent_function_members() {
+	let parsed = parse_module(
+		"namespace Host { func emit(): int = 1 }\n\
+		 struct Point(x: int) { namespace func origin(): Point = Point(x = 0) }\n\
+		 func read(): int = { let emit = Host.emit let origin = Point.origin emit() + origin().x }",
+		"member-kinds.nymph",
+	);
+	assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+	let module = parsed.tree;
+	let checked = check_module(&module);
+	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+	let analysis = SemanticAnalysis {
+		module: Arc::new(module),
+		annotations: Arc::new(ModuleAnnotations::from(checked.annotations.clone())),
+		checked: Arc::new(checked.facts),
+		declarations: Arc::default(),
+	};
+
+	for expected in ["emit", "origin"] {
+		let target = analysis
+			.annotations
+			.definition_targets()
+			.map(|(_, target)| target)
+			.find(|target| {
+				matches!(
+					&target.key,
+					DeclarationKey::Member { name, .. } if name == expected
+				)
+			})
+			.unwrap_or_else(|| panic!("missing exact target for `{expected}`"));
+		assert_eq!(
+			nymph_sema::query::stable_definition_kind(&analysis, target),
+			Some(nymph_sema::DefKind::Func),
+			"wrong kind for {target:?}"
+		);
+	}
 }
 
 #[test]
@@ -353,6 +402,7 @@ fn local_definition_overlays_imported_name_without_rechecking_imported_body() {
 		name: "answer".into(),
 		visibility: None,
 		kind: DefinitionShapeKind::Function,
+		declaration_kind: None,
 		binders: vec![],
 		constraints: vec![],
 		parameters: vec![],
@@ -425,6 +475,7 @@ fn recovered_dependency_poison_suppresses_cascades_without_hiding_independent_er
 			name: name.into(),
 			visibility: None,
 			kind: DefinitionShapeKind::Function,
+			declaration_kind: None,
 			availability,
 			binders: vec![],
 			constraints: vec![],
@@ -526,6 +577,7 @@ fn recovered_dependency_poison_suppresses_cascades_without_hiding_independent_er
 		name: name.into(),
 		visibility: None,
 		kind: DefinitionShapeKind::Function,
+		declaration_kind: None,
 		binders: vec![],
 		constraints: vec![],
 		parameters: vec![],

@@ -1,9 +1,9 @@
 # Operators
 
 Most of Nymph's operators are backed by an interface — implement the interface for your type and
-the operator syntax starts working for it. These interfaces live in the stdlib's **operator
-prelude**, which (unlike the rest of the standard library) is ambient: every one of them is
-available with no `import`, in every module.
+the operator syntax starts working for it. These interfaces are part of Nymph's **ambient core**,
+alongside APIs such as `Option`, `Result`, and iteration interfaces. Every one of them is available
+with no `import`, in every module; this is separate from opt-in `std/...` modules.
 
 > [!NOTE] `==` and `!=` are the exception
 > Equality and inequality never dispatch anywhere — they always compare by native identity
@@ -45,6 +45,32 @@ func flip(v: Vec2): Vec2 = -v
 `Other` and `Output` don't have to be the receiver's own type — `Times<Other = int, Output = Vec2>`
 above scales a `Vec2` by a plain `int` and hands back a `Vec2`, so the two operands of `*` need not
 match.
+
+### Exponentiation
+
+The standard numeric `Power` implementations form an exact matrix:
+
+| Base | Exponent | Result |
+| --- | --- | --- |
+| `int` | `uint` | `int` |
+| `uint` | `uint` | `uint` |
+| `float` | `uint` | `float` |
+| `int`, `uint`, or `float` | `int` | `float` |
+| `int`, `uint`, or `float` | `float` | `Complex` |
+| `Complex` | `uint`, `int`, or `float` | `Complex` |
+
+The `Complex`-producing rows become available with `import std/math/complex with (Complex)`.
+Combinations outside the table are rejected unless a visible user implementation supplies that
+combination.
+
+Integer exponents use exponentiation by squaring. An integral-valued finite `float` exponent takes
+the same algebraic fast path. Other float exponents use a real fast path for a positive real base;
+negative real and Complex bases use the principal branch \(\exp(x\operatorname{Log}(z))\), with the
+principal argument supplied by `atan2`.
+
+For every accepted row, zero to the zeroth power is one and zero to a positive power is zero. Zero
+to a negative power raises a runtime `RangeError`. IEEE-754 behavior is otherwise preserved,
+including signed zero, `NaN`, and infinities.
 
 ## Bitwise and boolean
 

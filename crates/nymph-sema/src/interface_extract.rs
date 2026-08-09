@@ -36,6 +36,7 @@ pub struct DeclaredHeaders {
 pub struct ExtractionFactSelection {
 	pub implementations: Range<usize>,
 	pub inherent: Range<usize>,
+	pub include_private_definitions: bool,
 }
 
 impl ExtractionFactSelection {
@@ -50,6 +51,7 @@ impl ExtractionFactSelection {
 			return Self {
 				implementations: checked.semantic.local_implementations.clone(),
 				inherent: checked.semantic.local_inherent.clone(),
+				include_private_definitions: false,
 			};
 		}
 		let current_implementations = checked
@@ -87,13 +89,21 @@ impl ExtractionFactSelection {
 		Self {
 			implementations,
 			inherent: inherent_end.saturating_sub(inherent)..inherent_end,
+			include_private_definitions: false,
 		}
+	}
+
+	#[must_use]
+	pub fn including_private_definitions(mut self) -> Self {
+		self.include_private_definitions = true;
+		self
 	}
 
 	fn all(checked: &CheckedFacts) -> Self {
 		Self {
 			implementations: 0..checked.semantic.implementations.impls.len(),
 			inherent: 0..checked.semantic.inherent.len(),
+			include_private_definitions: false,
 		}
 	}
 }
@@ -352,6 +362,7 @@ fn empty_definition(
 		name,
 		visibility,
 		kind,
+		declaration_kind: None,
 		binders: Vec::new(),
 		constraints: Vec::new(),
 		parameters: Vec::new(),
@@ -987,6 +998,97 @@ fn definition_members(
 		.collect()
 }
 
+fn namespace_members(
+	members: &[nymph_ast::Spanned<ImplMember>],
+	def: crate::DefId,
+	owner: &DefinitionId,
+	checked: &CheckedFacts,
+	headers: &DeclaredHeaders,
+	ids: &mut StableIdBuilder,
+) -> Result<Vec<MemberShape<InterfaceType>>, InterfaceConversionError> {
+	let namespace = &checked.semantic.signatures.namespaces[&def];
+	members
+		.iter()
+		.map(|member| match &member.0 {
+			ImplMember::Func {
+				visibility, meta, ..
+			}
+			| ImplMember::ExternalFunc(visibility, _, meta) => {
+				let Some(crate::NamespaceMemberSig::Func { target, sig }) =
+					namespace.members.get(&meta.name.0)
+				else {
+					return Err(InterfaceConversionError::ErrorType);
+				};
+				let facts = crate::annotate::CheckedMethod {
+					definition: target.clone(),
+					generic_count: sig.generics.len(),
+					params: sig.params.iter().map(|parameter| parameter.ty).collect(),
+					ret: sig.ret,
+					bounds: sig.bounds.clone(),
+					external: matches!(member.0, ImplMember::ExternalFunc(..)),
+				};
+				let symbol = match &member.0 {
+					ImplMember::ExternalFunc(_, symbol, _) => Some(symbol),
+					_ => None,
+				};
+				checked_member_shape(
+					meta,
+					*visibility,
+					symbol,
+					&facts,
+					owner,
+					&[],
+					checked,
+					headers,
+					ids,
+				)
+			}
+			ImplMember::Let {
+				visibility, meta, ..
+			}
+			| ImplMember::ExternalLet(visibility, _, meta) => {
+				let Pattern::Binding { name, .. } = &meta.name.0 else {
+					return Err(InterfaceConversionError::ErrorType);
+				};
+				let Some(crate::NamespaceMemberSig::Value { target, ty, .. }) =
+					namespace.members.get(&name.0)
+				else {
+					return Err(InterfaceConversionError::ErrorType);
+				};
+				let id = ids.allocate(DeclarationKey::member(
+					owner.clone(),
+					DeclarationCategory::Method,
+					name.0.clone(),
+				));
+				let ty = canonicalize_type(&checked.interner, *ty, &context(checked, headers))?;
+				let external = match &member.0 {
+					ImplMember::ExternalLet(_, symbol, _) => {
+						Some(external_value_abi(symbol, external_marshal(&ty)))
+					}
+					_ => None,
+				};
+				Ok(MemberShape {
+					id: target.clone().unwrap_or(id),
+					name: name.0.clone(),
+					visibility: *visibility,
+					kind: match meta.kind {
+						nymph_ast::decl::LetKind::Instance => MemberKind::Value,
+						nymph_ast::decl::LetKind::Mut => MemberKind::MutableValue,
+						nymph_ast::decl::LetKind::Namespace => MemberKind::StaticValue,
+					},
+					binders: Vec::new(),
+					constraints: Vec::new(),
+					parameters: Vec::new(),
+					return_type: ty,
+					external,
+					runtime_owner: Some(owner.clone()),
+					has_default: true,
+				})
+			}
+		})
+		.collect()
+}
+
 fn header_type(ty: &InterfaceType, binders: &[GenericParameter]) -> HeaderType {
 	match ty {
 		InterfaceType::Int => HeaderType::Int,
@@ -1069,6 +1171,57 @@ pub(crate) fn assign_runtime_body_identities(
 			})
 			.collect(),
 	};
+	let namespaces = checker
+		.defs
+		.defs
+		.iter()
+		.enumerate()
+		.filter_map(|(index, definition)| {
+			let def = crate::DefId(index as u32);
+			let member = checker.defs.local_member(def)?;
+			let owner = definition.stable.clone()?;
+			let Declaration::Namespace { members, .. } = &checker.module.members[member] else {
+				return None;
+			};
+			(owner.module == *identity).then(|| {
+				(
+					def,
+					owner,
+					members
+						.iter()
+						.filter_map(|member| match &member.0 {
+							ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => {
+								Some(meta.name.0.clone())
+							}
+							ImplMember::Let { meta, .. } | ImplMember::ExternalLet(_, _, meta) => {
+								meta.name.0.as_binding().map(|name| name.0.clone())
+							}
+						})
+						.collect::<Vec<_>>(),
+				)
+			})
+		})
+		.collect::<Vec<_>>();
+	for (definition, owner, members) in namespaces {
+		let Some(namespace) = checker.sigs.namespaces.get_mut(&definition) else {
+			continue;
+		};
+		let mut ids = StableIdBuilder::new(identity.clone());
+		for name in members {
+			let target = ids.allocate(DeclarationKey::member(
+				owner.clone(),
+				DeclarationCategory::Method,
+				name.clone(),
+			));
+			match namespace.members.get_mut(&name) {
+				Some(crate::NamespaceMemberSig::Func { target: exact, .. })
+				| Some(crate::NamespaceMemberSig::Value { target: exact, .. }) => {
+					*exact = Some(target);
+				}
+				None => {}
+			}
+		}
+	}
 
 	for (&interface, definition) in &mut checker.interfaces {
 		let Some(owner) = checker.defs.stable(interface).cloned() else {
@@ -1318,7 +1471,7 @@ pub(crate) fn assign_runtime_body_identities(
 						nested: Some(index as u32),
 					},
 				)
-				.collect(),
+				.collect::<Vec<_>>(),
 			_ => Vec::new(),
 		});
 	let interface_paths = top_paths.chain(nested_paths).collect::<Vec<_>>();
@@ -1863,20 +2016,37 @@ fn extract_definition(
 			let mut shape =
 				empty_definition(id, source_name, *visibility, DefinitionShapeKind::Namespace);
 			let mut member_ids = StableIdBuilder::new(headers.module.clone());
-			shape.members = members
-				.iter()
-				.map(|m| member_shape(&m.0, &shape.id, headers, &[], &mut member_ids))
-				.collect::<Result<_, _>>()?;
+			shape.members =
+				namespace_members(members, def, &shape.id, checked, headers, &mut member_ids)?;
 			shape
 		}
 		Declaration::Import { .. } | Declaration::Impl { .. } | Declaration::ImplFor { .. } => {
 			unreachable!()
 		}
 	};
+	result.declaration_kind = declaration_member_kind(declaration);
 	// External ABI metadata is intentionally sourced from checked linkage in later
 	// lowering slices; stable ownership is already represented here.
 	result.binders.reserve(0);
 	Ok(Some(result))
+}
+
+fn declaration_member_kind(declaration: &Declaration) -> Option<MemberKind> {
+	match declaration {
+		Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => {
+			Some(match meta.kind {
+				FuncKind::Instance => MemberKind::Function,
+				FuncKind::Mut => MemberKind::MutatingFunction,
+				FuncKind::Namespace => MemberKind::StaticFunction,
+			})
+		}
+		Declaration::Let { meta, .. } | Declaration::ExternalLet(_, _, meta) => Some(match meta.kind {
+			nymph_ast::decl::LetKind::Instance => MemberKind::Value,
+			nymph_ast::decl::LetKind::Mut => MemberKind::MutableValue,
+			nymph_ast::decl::LetKind::Namespace => MemberKind::StaticValue,
+		}),
+		_ => None,
+	}
 }
 
 fn referenced_definitions(ty: &InterfaceType, out: &mut HashSet<DefinitionId>) {
@@ -2286,7 +2456,7 @@ fn extract_implementations(
 			)),
 			_ => None,
 		});
-	for (path, visibility, _mutable, members) in top_level_inherent {
+	for (path, visibility, mutable, members) in top_level_inherent {
 		let id = checked
 			.source_identities
 			.implementations
@@ -2340,7 +2510,7 @@ fn extract_implementations(
 			interface_arguments: Vec::new(),
 			interface_argument_bindings: Vec::new(),
 			self_type: canonicalize_type(&checked.interner, implementation.self_ty, &impl_context)?,
-			mutable: false,
+			mutable,
 			binders,
 			constraints: checked_constraints(
 				&implementation.constraints,
@@ -2427,7 +2597,7 @@ pub fn extract_module_interface_from_facts_with_selection(
 			| Declaration::ExternalLet(visibility, ..) => *visibility,
 			_ => None,
 		};
-		if visible(visibility) {
+		if facts.include_private_definitions || visible(visibility) {
 			exports.push(definition);
 		} else {
 			private.insert(definition.id.clone(), definition);
@@ -3611,6 +3781,7 @@ fn poison_definition(
 		name: name.clone(),
 		visibility,
 		kind,
+		declaration_kind: declaration_member_kind(declaration),
 		availability: SemanticAvailability::Available,
 		binders,
 		constraints: Vec::new(),
@@ -3919,6 +4090,7 @@ impl From<ExportedDefinition> for RecoveredExportedDefinition {
 			name: value.name,
 			visibility: value.visibility,
 			kind: value.kind,
+			declaration_kind: value.declaration_kind,
 			availability: SemanticAvailability::Available,
 			binders: value.binders,
 			constraints: value

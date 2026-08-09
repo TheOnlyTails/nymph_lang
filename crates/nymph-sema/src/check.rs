@@ -445,6 +445,21 @@ fn check_module_from_parts(
 			}
 		}
 	}
+	for signature in signatures.namespaces.values_mut() {
+		for member in signature.members.values_mut() {
+			match member {
+				crate::NamespaceMemberSig::Func { sig, .. } => {
+					for parameter in &mut sig.params {
+						parameter.ty = checker.resolve_deep(parameter.ty);
+					}
+					sig.ret = checker.resolve_deep(sig.ret);
+				}
+				crate::NamespaceMemberSig::Value { ty, .. } => {
+					*ty = checker.resolve_deep(*ty);
+				}
+			}
+		}
+	}
 	checker.sigs = signatures;
 	let mut interfaces = std::mem::take(&mut checker.interfaces);
 	for interface in interfaces.values_mut() {
@@ -649,6 +664,18 @@ fn check_module_with_environment_parts(
 	let implementation_start = imported_implementations.impls.len();
 	let inherent_start = imported_inherent.impls.len();
 	let defs = build_def_map_on(&module, imported_defs, &mut diagnostics, Some(&headers));
+	let declarations = defs
+		.iter()
+		.filter_map(|(_, data)| match (&data.origin, &data.stable) {
+			(crate::def::DefOrigin::Local { .. }, Some(stable)) => Some((
+				stable.clone(),
+				crate::DeclarationProvenance {
+					name_span: data.span,
+				},
+			)),
+			_ => None,
+		})
+		.collect();
 	let mut checker = Checker::new(&module, defs, diagnostics);
 	checker.interner = interner;
 	checker.sigs = imported_signatures;
@@ -699,6 +726,7 @@ fn check_module_with_environment_parts(
 			module,
 			checked: facts,
 			annotations,
+			declarations: std::sync::Arc::new(declarations),
 		}),
 		diagnostics,
 		lowerable,

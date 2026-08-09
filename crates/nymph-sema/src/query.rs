@@ -1,9 +1,10 @@
 //! A minimal position -> type query over a checked module, for the language
 //! server's `textDocument/hover` (`nymph-lsp`). Purely additive: it reads
-//! only the already-public [`Checked`] result and rebuilds a [`DefMap`] via
-//! [`crate::def::build_def_map`] to name `Adt` types — the one piece
-//! [`Checked`] doesn't carry (its own `DefMap` is dropped after checking).
-//! Nothing here touches `check.rs`/`prelude.rs`/`lower_hir.rs` internals.
+//! only the already-public [`Checked`] result, including the exact [`DefMap`]
+//! that minted its semantic types. That pairing matters for project checks:
+//! imported and ambient definitions occupy the same `DefId` arena as local
+//! definitions, so rebuilding a local-only map would misname them or index a
+//! different arena. Nothing here touches checker or lowering internals.
 //!
 //! # Contract
 //!
@@ -19,6 +20,8 @@
 //! and other non-expression nodes never appear in [`crate::Annotations`].
 //! So hovering a `let` binder returns `None`; hovering its initializer
 //! expression, or a later `Identifier` use of the bound name, resolves.
+
+use std::{collections::HashSet, sync::Arc};
 
 use ecow::EcoString;
 use nymph_ast::{
@@ -37,10 +40,173 @@ use nymph_ast::{
 use rustc_hash::FxHashMap;
 
 use crate::{
-	Checked, DefId, GenericArgs, Interner, Ty, TyKind,
+	Checked, DeclarationCategory, DeclarationKey, DefId, GenericArgs, Interner, ModuleEnvironment,
+	ResolvedImportBinding, Ty, TyKind,
 	annotate::VariantResolution,
 	def::{self, DefMap},
 };
+
+/// Editor-facing category of a name made lexically available by an import.
+///
+/// This deliberately carries only stable semantic meaning needed by tooling;
+/// checker-local IDs and resolver internals remain private to sema/compiler.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportedNameKind {
+	Function,
+	Value,
+	Variable,
+	TypeAlias,
+	Struct,
+	Enum,
+	Interface,
+	Namespace,
+	Variant,
+}
+
+/// One resolved spelling visible in the importing module.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportedName {
+	pub name: String,
+	pub kind: ImportedNameKind,
+}
+
+/// Project resolved import bindings into immutable, editor-facing facts.
+///
+/// Aliases are retained as their local spelling, namespace imports are
+/// represented directly, imported enums contribute their known bare variants,
+/// and unresolved/private imports (`Poison`) are omitted. The compiler remains
+/// the sole owner of import resolution and visibility.
+#[must_use]
+pub fn imported_names(
+	bindings: &FxHashMap<EcoString, ResolvedImportBinding>,
+	modules: &[Arc<ModuleEnvironment>],
+	module: &Module,
+) -> Vec<ImportedName> {
+	let mut names = bindings
+		.iter()
+		.filter_map(|(name, binding)| {
+			let kind = match binding {
+				ResolvedImportBinding::Namespace(_) => ImportedNameKind::Namespace,
+				ResolvedImportBinding::Poison => return None,
+				ResolvedImportBinding::Definition(definition) => match &definition.key {
+					DeclarationKey::TopLevel { category, .. } | DeclarationKey::Member { category, .. } => {
+						match category {
+							DeclarationCategory::Function | DeclarationCategory::Method => {
+								ImportedNameKind::Function
+							}
+							DeclarationCategory::Let | DeclarationCategory::Field => {
+								if imported_definition_is_mutable(definition, modules) {
+									ImportedNameKind::Variable
+								} else {
+									ImportedNameKind::Value
+								}
+							}
+							DeclarationCategory::TypeAlias => ImportedNameKind::TypeAlias,
+							DeclarationCategory::Struct => ImportedNameKind::Struct,
+							DeclarationCategory::Enum => ImportedNameKind::Enum,
+							DeclarationCategory::Interface => ImportedNameKind::Interface,
+							DeclarationCategory::Namespace => ImportedNameKind::Namespace,
+							DeclarationCategory::Variant => ImportedNameKind::Variant,
+							DeclarationCategory::Static
+							| DeclarationCategory::Implementation
+							| DeclarationCategory::MethodBody => return None,
+						}
+					}
+					DeclarationKey::Implementation { .. }
+					| DeclarationKey::RecoveredImplementation { .. }
+					| DeclarationKey::MethodBody { .. }
+					| DeclarationKey::MaterializedInterfaceMember { .. } => return None,
+				},
+			};
+			Some(ImportedName {
+				name: name.to_string(),
+				kind,
+			})
+		})
+		.collect::<Vec<_>>();
+	names.sort_by(|left, right| left.name.cmp(&right.name));
+	let mut seen = names
+		.iter()
+		.map(|imported| imported.name.clone())
+		.collect::<HashSet<_>>();
+	let local_definitions = def::build_def_map(module, &mut Vec::new());
+	seen.extend(local_definitions.by_name.keys().map(ToString::to_string));
+	let imported_enums = bindings
+		.values()
+		.filter_map(|binding| match binding {
+			ResolvedImportBinding::Definition(definition)
+				if matches!(
+					definition.key,
+					DeclarationKey::TopLevel {
+						category: DeclarationCategory::Enum,
+						..
+					}
+				) =>
+			{
+				Some(definition)
+			}
+			_ => None,
+		})
+		.collect::<HashSet<_>>();
+	let mut variants: FxHashMap<String, HashSet<crate::DefinitionId>> = FxHashMap::default();
+	for module in modules {
+		match module.as_ref() {
+			ModuleEnvironment::Complete(interface) => {
+				for definition in &interface.exports {
+					if imported_enums.contains(&definition.id) {
+						for variant in &definition.variants {
+							variants
+								.entry(variant.name.to_string())
+								.or_default()
+								.insert(variant.id.clone());
+						}
+					}
+				}
+			}
+			ModuleEnvironment::Recovered(interface) => {
+				for definition in &interface.exports {
+					if imported_enums.contains(&definition.id) {
+						for variant in &definition.variants {
+							variants
+								.entry(variant.name.to_string())
+								.or_default()
+								.insert(variant.id.clone());
+						}
+					}
+				}
+			}
+		}
+	}
+	for (variant, candidates) in variants {
+		if candidates.len() == 1
+			&& !local_definitions.variants.contains_key(variant.as_str())
+			&& seen.insert(variant.clone())
+		{
+			names.push(ImportedName {
+				name: variant,
+				kind: ImportedNameKind::Variant,
+			});
+		}
+	}
+	names.sort_by(|left, right| left.name.cmp(&right.name));
+	names
+}
+
+fn imported_definition_is_mutable(
+	definition: &crate::DefinitionId,
+	modules: &[Arc<ModuleEnvironment>],
+) -> bool {
+	modules.iter().any(|module| match module.as_ref() {
+		ModuleEnvironment::Complete(interface) => interface.exports.iter().any(|candidate| {
+			candidate.id == *definition
+				&& candidate.declaration_kind == Some(crate::MemberKind::MutableValue)
+		}),
+		ModuleEnvironment::Recovered(interface) => interface.exports.iter().any(|candidate| {
+			candidate.id == *definition
+				&& candidate.declaration_kind == Some(crate::MemberKind::MutableValue)
+		}),
+	})
+}
 
 /// Find the type of the smallest checked expression covering byte `offset`
 /// in `module`, rendered as a display string (`"int"`, `"#[Option<T0>]"`,
@@ -91,7 +257,7 @@ pub fn type_at(module: &Module, checked: &Checked, offset: usize) -> Option<Stri
 			checked.interner.kind(info.ty),
 			TyKind::Error | TyKind::Infer(_)
 		) {
-		let defs = def::build_def_map(module, &mut Vec::new());
+		let defs = &checked.semantic.definitions;
 		let params = generic_scope_at(module, offset);
 
 		// A call-site callee (`helper` in `helper()`): if it resolves to a
@@ -174,8 +340,7 @@ fn variant_hover_at(module: &Module, checked: &Checked, offset: usize) -> Option
 		.filter(|(span, _)| covers(*span, offset))
 		.min_by_key(|(span, _)| span.end - span.start)?;
 
-	let defs = def::build_def_map(module, &mut Vec::new());
-	render_variant_from_resolution(module, &defs, res)
+	render_variant_from_resolution(module, checked, res)
 }
 
 /// Render a resolved `(enum, variant)` name pair as `EnumName.Variant(f: T,
@@ -184,23 +349,56 @@ fn variant_hover_at(module: &Module, checked: &Checked, offset: usize) -> Option
 /// the resolution's names don't line up with a live declaration.
 fn render_variant_from_resolution(
 	module: &Module,
-	defs: &DefMap,
+	checked: &Checked,
 	res: &VariantResolution,
 ) -> Option<String> {
-	let enum_id = defs.get(res.enum_name.as_str())?;
+	let defs = &checked.semantic.definitions;
+	let enum_id = variant_enum_definition(defs, res)?;
+	if let Some(member) = defs.local_member(enum_id) {
+		let Declaration::Enum { variants, .. } = &module.members[member] else {
+			return None;
+		};
+		let variant = variants.iter().find(|v| v.0.name.0 == res.variant)?;
+		return Some(format!(
+			"{}.{}",
+			res.enum_name,
+			render_enum_variant(&variant.0)
+		));
+	}
+
+	let signature = checked.semantic.signatures.enums.get(&enum_id)?;
+	let variant = semantic_variant(checked, enum_id, res)?;
+	Some(format!(
+		"{}.{}",
+		defs.data(enum_id).name,
+		render_semantic_variant(variant, &checked.interner, defs, &signature.generics)
+	))
+}
+
+fn variant_enum_definition(defs: &DefMap, res: &VariantResolution) -> Option<DefId> {
+	let enum_id = res
+		.enum_target
+		.as_ref()
+		.and_then(|target| defs.by_stable(target))
+		.or_else(|| defs.get(res.enum_name.as_str()))?;
 	let def::DefKind::Enum = defs.data(enum_id).kind else {
 		return None;
 	};
-	let member = defs.local_member(enum_id)?;
-	let Declaration::Enum { variants, .. } = &module.members[member] else {
-		return None;
-	};
-	let variant = variants.iter().find(|v| v.0.name.0 == res.variant)?;
-	Some(format!(
-		"{}.{}",
-		res.enum_name,
-		render_enum_variant(&variant.0)
-	))
+	Some(enum_id)
+}
+
+fn semantic_variant<'a>(
+	checked: &'a Checked,
+	enum_id: DefId,
+	res: &VariantResolution,
+) -> Option<&'a def::VariantSig> {
+	let variants = &checked.semantic.signatures.enums.get(&enum_id)?.variants;
+	match &res.variant_target {
+		Some(target) => variants
+			.iter()
+			.find(|variant| variant.target.as_ref() == Some(target)),
+		None => variants.iter().find(|variant| variant.name == res.variant),
+	}
 }
 
 /// Container/control-flow expression kinds that enclose the cursor rather
@@ -328,6 +526,23 @@ fn render_adt(
 			.map(|(n, t)| format!("{n} = {}", render(interner, defs, params, *t))),
 	);
 	format!("{name}<{}>", inner.join(", "))
+}
+
+fn render_semantic_variant(
+	variant: &def::VariantSig,
+	interner: &Interner,
+	defs: &DefMap,
+	params: &[EcoString],
+) -> String {
+	if variant.fields.is_empty() {
+		return variant.name.to_string();
+	}
+	let fields: Vec<_> = variant
+		.fields
+		.iter()
+		.map(|(name, ty)| format!("{name}: {}", render(interner, defs, params, *ty)))
+		.collect();
+	format!("{}({})", variant.name, fields.join(", "))
 }
 
 // ── Keyword documentation (for hover) ───────────────────────────────────────
@@ -880,6 +1095,148 @@ fn collect_expr<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 // mapping — the checker records no such mapping. So go-to-definition is built
 // straight from the AST plus a freshly rebuilt [`DefMap`], independent of any
 // `Checked` result.
+
+/// Resolve the stable declaration denoted at an exact byte offset in checked
+/// source. This deliberately excludes ordinary fields/members. Namespace
+/// members are considered only over the member identifier's strict half-open span.
+#[must_use]
+pub fn stable_definition_at(
+	analysis: &crate::SemanticAnalysis,
+	offset: usize,
+) -> Option<crate::DefinitionId> {
+	let mut exprs = Vec::new();
+	for decl in &analysis.module.members {
+		collect_decl_exprs(decl, &mut exprs);
+	}
+	let candidate = exprs
+		.into_iter()
+		.filter_map(|expr| {
+			let span = match &expr.kind {
+				ExprKind::Identifier(_) => expr.span,
+				ExprKind::MemberAccess { member, .. } => member.1,
+				_ => return None,
+			};
+			covers(span, offset).then_some((span, expr.id))
+		})
+		.min_by_key(|(span, _)| span.end - span.start);
+	if let Some((_, id)) = candidate
+		&& let Some(target) = analysis.annotations.definition_target_of(id)
+	{
+		return Some(target.clone());
+	}
+
+	analysis
+		.annotations
+		.type_definition_targets()
+		.filter(|(span, _)| covers(*span, offset))
+		.min_by_key(|(span, _)| span.end - span.start)
+		.map(|(_, target)| target.clone())
+}
+
+/// Return the semantic category of a stable declaration in this analysis's
+/// exact imported, ambient, and local definition arena.
+///
+/// Tooling must use this instead of rebuilding a source-local [`DefMap`]: a
+/// stable target recorded in [`crate::Annotations`] may belong to an imported
+/// module or the ambient prelude, and its checker-local [`crate::DefId`] is
+/// meaningful only inside the arena that produced the analysis.
+#[must_use]
+pub fn stable_definition_kind(
+	analysis: &crate::SemanticAnalysis,
+	target: &crate::DefinitionId,
+) -> Option<crate::DefKind> {
+	let semantic = &analysis.checked.semantic;
+	for namespace in semantic.signatures.namespaces.values() {
+		for member in namespace.members.values() {
+			match member {
+				crate::NamespaceMemberSig::Func {
+					target: Some(member_target),
+					..
+				} if member_target == target => return Some(crate::DefKind::Func),
+				crate::NamespaceMemberSig::Value {
+					target: Some(member_target),
+					..
+				} if member_target == target => return Some(crate::DefKind::Let),
+				_ => {}
+			}
+		}
+	}
+	if semantic.inherent.iter().any(|implementation| {
+		implementation
+			.methods
+			.values()
+			.any(|method| method.definition.as_ref() == Some(target))
+	}) {
+		return Some(crate::DefKind::Func);
+	}
+	let definition = semantic.definitions.by_stable(target)?;
+	if semantic.signatures.funcs.contains_key(&definition) {
+		return Some(crate::DefKind::Func);
+	}
+	if semantic.signatures.lets.contains_key(&definition) {
+		return Some(crate::DefKind::Let);
+	}
+	Some(semantic.definitions.data(definition).kind)
+}
+
+/// Return the semantic category bound to a source-visible name in this
+/// analysis's exact local/imported/prelude definition arena.
+///
+/// This complements [`stable_definition_kind`] for declaration syntax that
+/// introduces a local spelling without an expression node, notably import
+/// aliases. Whole-module import namespaces intentionally have no stable
+/// declaration ID, but they are still present in the checked definition map.
+#[must_use]
+pub fn definition_kind_by_name(
+	analysis: &crate::SemanticAnalysis,
+	name: &str,
+) -> Option<crate::DefKind> {
+	let semantic = &analysis.checked.semantic;
+	let definition = semantic.definitions.get(name)?;
+	Some(semantic.definitions.data(definition).kind)
+}
+
+/// Return the semantic category of an imported lexical binding in this
+/// analysis's exact definition arena.
+///
+/// Unlike a stable-target lookup, this also covers imported module namespace
+/// bindings: those are checker-owned synthetic definitions and deliberately do
+/// not pretend to have a source declaration identity.
+#[must_use]
+pub fn imported_definition_kind_by_name(
+	analysis: &crate::SemanticAnalysis,
+	name: &str,
+) -> Option<crate::DefKind> {
+	let semantic = &analysis.checked.semantic;
+	let definition = semantic.definitions.get(name)?;
+	let data = semantic.definitions.data(definition);
+	matches!(data.origin, crate::DefOrigin::Imported { .. }).then_some(data.kind)
+}
+
+/// Return the semantic category of the direct type/namespace parent selected
+/// by the checker for a qualified member expression.
+///
+/// The direct-member marker proves that `parent_name` was not a shadowing
+/// local. Looking it up in the producing analysis's arena therefore preserves
+/// the checker decision while also covering synthetic imported namespaces,
+/// which have no stable [`crate::DefinitionId`].
+#[must_use]
+pub fn direct_member_parent_kind(
+	analysis: &crate::SemanticAnalysis,
+	member: nymph_ast::NodeId,
+	parent_name: &str,
+) -> Option<crate::DefKind> {
+	if !analysis
+		.annotations
+		.direct_namespace_members()
+		.any(|candidate| candidate == member)
+	{
+		return None;
+	}
+	let semantic = &analysis.checked.semantic;
+	let definition = semantic.definitions.get(parent_name)?;
+	Some(semantic.definitions.data(definition).kind)
+}
 
 /// Find the definition site of the identifier (or bare enum variant, or
 /// type-position type name) at byte `offset` in `module`. Resolution order,
@@ -1630,7 +1987,7 @@ fn collect_type_refs<'a>(ty: &'a Spanned<Type>, out: &mut Vec<(&'a Ident, Span)>
 // declaration names entirely. This fallback fires only when that primary
 // path yields nothing (no covering expr, a suppressed container, or a
 // missing/`Error`/`Infer` annotation) and mirrors the existing
-// `collect_decl_type_refs`/`pattern_bindings`/`build_def_map` walks used by
+// `collect_decl_type_refs`/`pattern_bindings` walks used by
 // go-to-definition/completion, rendering a TYPE at each tight, non-container
 // position instead of a span. Every candidate here keys off a narrow span —
 // a binder name, a param name, a decl name, a struct-field name, or an
@@ -1644,7 +2001,7 @@ fn collect_type_refs<'a>(ty: &'a Spanned<Type>, out: &mut Vec<(&'a Ident, Span)>
 /// fallback position (e.g. a keyword, an operator, or whitespace inside a
 /// suppressed container).
 fn fallback_type_at(module: &Module, checked: &Checked, offset: usize) -> Option<String> {
-	let defs = def::build_def_map(module, &mut Vec::new());
+	let defs = &checked.semantic.definitions;
 	let params = generic_scope_at(module, offset);
 
 	let mut candidates: Vec<(Span, String)> = Vec::new();
@@ -1862,13 +2219,7 @@ fn adt_generic_subst(
 	let TyKind::Adt(def_id, args) = checked.interner.kind(ty) else {
 		return FxHashMap::default();
 	};
-	let local = checked.semantic.local_definitions.clone();
-	let def_id = if local.contains(&(def_id.0 as usize)) {
-		DefId(def_id.0 - local.start as u32)
-	} else {
-		*def_id
-	};
-	generic_subst_from_adt(&checked.interner, defs, module, params, def_id, args)
+	generic_subst_from_adt(&checked.interner, defs, module, params, *def_id, args)
 }
 
 /// The surface keyword prefix for a declaration's [`Visibility`] (`"public
@@ -2322,30 +2673,43 @@ fn collect_type_node_candidates(ty: &Spanned<Type>, out: &mut Vec<(Span, String)
 ///
 /// Returns `None` when the def can't be found or isn't the expected kind —
 /// callers treat that as "bind nothing here" rather than guessing.
+enum ConstructorFieldTypes<'a> {
+	Syntactic(Vec<(&'a str, &'a Spanned<Type>)>),
+	Semantic {
+		owner: DefId,
+		generics: &'a [EcoString],
+		fields: &'a [(EcoString, Ty)],
+	},
+}
+
 fn struct_field_types<'m>(
 	module: &'m Module,
-	defs: &DefMap,
-	checked: &Checked,
+	checked: &'m Checked,
 	pattern: &Spanned<Pattern>,
-) -> Option<Vec<(&'m str, &'m Spanned<Type>)>> {
+) -> Option<ConstructorFieldTypes<'m>> {
+	let defs = &checked.semantic.definitions;
 	if let Some(res) = checked.annotations.pattern_variant_of(pattern.1) {
-		let enum_id = defs.get(res.enum_name.as_str())?;
-		let def::DefKind::Enum = defs.data(enum_id).kind else {
-			return None;
-		};
-		let member = defs.local_member(enum_id)?;
-		let Declaration::Enum { variants, .. } = &module.members[member] else {
-			return None;
-		};
-		let variant = variants.iter().find(|v| v.0.name.0 == res.variant)?;
-		return Some(
-			variant
-				.0
-				.fields
-				.iter()
-				.map(|f| (f.0.name.0.as_str(), &f.0.type_))
-				.collect(),
-		);
+		let enum_id = variant_enum_definition(defs, res)?;
+		if let Some(member) = defs.local_member(enum_id) {
+			let Declaration::Enum { variants, .. } = &module.members[member] else {
+				return None;
+			};
+			let variant = variants.iter().find(|v| v.0.name.0 == res.variant)?;
+			return Some(ConstructorFieldTypes::Syntactic(
+				variant
+					.0
+					.fields
+					.iter()
+					.map(|f| (f.0.name.0.as_str(), &f.0.type_))
+					.collect(),
+			));
+		}
+		let signature = checked.semantic.signatures.enums.get(&enum_id)?;
+		return Some(ConstructorFieldTypes::Semantic {
+			owner: enum_id,
+			generics: &signature.generics,
+			fields: &semantic_variant(checked, enum_id, res)?.fields,
+		});
 	}
 	let Pattern::Struct { path, .. } = &pattern.0 else {
 		return None;
@@ -2355,16 +2719,23 @@ fn struct_field_types<'m>(
 	let def::DefKind::Struct = defs.data(id).kind else {
 		return None;
 	};
-	let member = defs.local_member(id)?;
-	let Declaration::Struct { fields, .. } = &module.members[member] else {
-		return None;
-	};
-	Some(
-		fields
-			.iter()
-			.map(|f| (f.0.name.0.as_str(), &f.0.type_))
-			.collect(),
-	)
+	if let Some(member) = defs.local_member(id) {
+		let Declaration::Struct { fields, .. } = &module.members[member] else {
+			return None;
+		};
+		return Some(ConstructorFieldTypes::Syntactic(
+			fields
+				.iter()
+				.map(|f| (f.0.name.0.as_str(), &f.0.type_))
+				.collect(),
+		));
+	}
+	let signature = checked.semantic.signatures.structs.get(&id)?;
+	Some(ConstructorFieldTypes::Semantic {
+		owner: id,
+		generics: &signature.generics,
+		fields: &signature.fields,
+	})
 }
 
 /// Shared `Pattern::Struct` leaf logic for both
@@ -2406,6 +2777,93 @@ fn bind_struct_pattern_fields(
 			StructPatternField::Rest => {}
 		}
 	}
+}
+
+fn bind_semantic_struct_pattern_fields(
+	fields: &[Spanned<StructPatternField>],
+	field_list: &[(EcoString, Ty)],
+	checked: &Checked,
+	module: &Module,
+	defs: &DefMap,
+	params: &[EcoString],
+	out: &mut Vec<(Span, String)>,
+) {
+	for field in fields {
+		match &field.0 {
+			StructPatternField::Value { name, value } => {
+				if let Some((_, ty)) = field_list.iter().find(|(field, _)| field == &name.0) {
+					bind_pattern_semantic(value, *ty, checked, module, defs, params, out);
+				}
+			}
+			StructPatternField::Named(name) => {
+				if let Some((_, ty)) = field_list.iter().find(|(field, _)| field == &name.0)
+					&& !matches!(checked.interner.kind(*ty), TyKind::Error | TyKind::Infer(_))
+				{
+					out.push((name.1, render(&checked.interner, defs, params, *ty)));
+				}
+			}
+			StructPatternField::Positional(value) => {
+				if let [(_, ty)] = field_list {
+					bind_pattern_semantic(value, *ty, checked, module, defs, params, out);
+				}
+			}
+			StructPatternField::Rest => {}
+		}
+	}
+}
+
+fn syntactic_generic_renderings(generics: &[EcoString], ty: &Type) -> Vec<EcoString> {
+	let mut rendered = generics.to_vec();
+	let Type::Reference { generics: args, .. } = ty else {
+		return rendered;
+	};
+	let mut positional = 0;
+	for arg in args {
+		let Some(value) = render_type_node(&arg.0.value.0) else {
+			continue;
+		};
+		if let Some(name) = &arg.0.name {
+			if let Some(index) = generics.iter().position(|generic| generic == &name.0) {
+				rendered[index] = value.into();
+			}
+		} else {
+			if let Some(slot) = rendered.get_mut(positional) {
+				*slot = value.into();
+			}
+			positional += 1;
+		}
+	}
+	rendered
+}
+
+fn semantic_generic_renderings(
+	checked: &Checked,
+	defs: &DefMap,
+	params: &[EcoString],
+	ty: Ty,
+	owner: DefId,
+	generics: &[EcoString],
+) -> Vec<EcoString> {
+	let mut rendered = generics.to_vec();
+	let mut ty = ty;
+	if let TyKind::Mut(inner) = checked.interner.kind(ty) {
+		ty = *inner;
+	}
+	let TyKind::Adt(definition, args) = checked.interner.kind(ty) else {
+		return rendered;
+	};
+	if *definition != owner {
+		return rendered;
+	}
+	for (slot, argument) in rendered.iter_mut().zip(&args.positional) {
+		*slot = render(&checked.interner, defs, params, *argument).into();
+	}
+	for (name, argument) in &args.named {
+		if let Some(index) = generics.iter().position(|generic| generic == name) {
+			rendered[index] = render(&checked.interner, defs, params, *argument).into();
+		}
+	}
+	rendered
 }
 
 /// Bind every name a *syntactic* `Type` node's matching pattern introduces to
@@ -2488,8 +2946,8 @@ fn bind_pattern_syntactic(
 				}
 			}
 		}
-		Pattern::Struct { fields, .. } => {
-			if let Some(field_list) = struct_field_types(module, defs, checked, pattern) {
+		Pattern::Struct { fields, .. } => match struct_field_types(module, checked, pattern) {
+			Some(ConstructorFieldTypes::Syntactic(field_list)) => {
 				bind_struct_pattern_fields(
 					fields,
 					&field_list,
@@ -2500,7 +2958,18 @@ fn bind_pattern_syntactic(
 					out,
 				);
 			}
-		}
+			Some(ConstructorFieldTypes::Semantic {
+				generics,
+				fields: field_list,
+				..
+			}) => {
+				let params = syntactic_generic_renderings(generics, ty);
+				bind_semantic_struct_pattern_fields(
+					fields, field_list, checked, module, defs, &params, out,
+				);
+			}
+			None => {}
+		},
 		Pattern::Grouped(inner) => bind_pattern_syntactic(inner, ty, subst, checked, module, defs, out),
 		Pattern::Union(a, b) => {
 			bind_pattern_syntactic(a, ty, subst, checked, module, defs, out);
@@ -2521,12 +2990,9 @@ fn bind_pattern_syntactic(
 /// destructuring case), walking `pattern` and a *semantic* `Ty` in
 /// lock-step — the same [`render`] the primary path uses for a plain
 /// binding, applied at each structural position instead of once for the
-/// whole pattern. `Pattern::Struct` has no per-field semantic `Ty` available
-/// here (this module never sees the checker's substituted field
-/// signatures), so it hands off to [`bind_pattern_syntactic`] against each
-/// field's own *declared* `Type` node — the same source-level rendering F7
-/// already uses for a struct's field-type annotations at the declaration
-/// site.
+/// whole pattern. Local constructors retain their source [`Type`] nodes;
+/// imported constructors use the checked semantic field signatures and
+/// substitute the matched ADT's arguments before rendering binders.
 fn bind_pattern_semantic(
 	pattern: &Spanned<Pattern>,
 	ty: Ty,
@@ -2602,12 +3068,23 @@ fn bind_pattern_semantic(
 				}
 			}
 		}
-		Pattern::Struct { fields, .. } => {
-			if let Some(field_list) = struct_field_types(module, defs, checked, pattern) {
+		Pattern::Struct { fields, .. } => match struct_field_types(module, checked, pattern) {
+			Some(ConstructorFieldTypes::Syntactic(field_list)) => {
 				let subst = adt_generic_subst(checked, defs, module, params, ty);
 				bind_struct_pattern_fields(fields, &field_list, &subst, checked, module, defs, out);
 			}
-		}
+			Some(ConstructorFieldTypes::Semantic {
+				owner,
+				generics,
+				fields: field_list,
+			}) => {
+				let params = semantic_generic_renderings(checked, defs, params, ty, owner, generics);
+				bind_semantic_struct_pattern_fields(
+					fields, field_list, checked, module, defs, &params, out,
+				);
+			}
+			None => {}
+		},
 		Pattern::Grouped(inner) => bind_pattern_semantic(inner, ty, checked, module, defs, params, out),
 		Pattern::Union(a, b) => {
 			bind_pattern_semantic(a, ty, checked, module, defs, params, out);
@@ -2652,22 +3129,10 @@ fn push_variant_decl_candidate(
 	pattern: &Spanned<Pattern>,
 	res: &VariantResolution,
 	module: &Module,
-	defs: &DefMap,
+	checked: &Checked,
 	out: &mut Vec<(Span, String)>,
 ) {
-	let Some(enum_id) = defs.get(res.enum_name.as_str()) else {
-		return;
-	};
-	let def::DefKind::Enum = defs.data(enum_id).kind else {
-		return;
-	};
-	let Some(member) = defs.local_member(enum_id) else {
-		return;
-	};
-	let Declaration::Enum { variants, .. } = &module.members[member] else {
-		return;
-	};
-	let Some(variant) = variants.iter().find(|v| v.0.name.0 == res.variant) else {
+	let Some(rendered) = render_variant_from_resolution(module, checked, res) else {
 		return;
 	};
 	let span = match &pattern.0 {
@@ -2678,10 +3143,7 @@ fn push_variant_decl_candidate(
 		Pattern::Binding { name, .. } => name.1,
 		_ => pattern.1,
 	};
-	out.push((
-		span,
-		format!("{}.{}", res.enum_name, render_enum_variant(&variant.0)),
-	));
+	out.push((span, rendered));
 }
 
 /// Walk every sub-pattern reachable from `pattern` (mirroring
@@ -2694,28 +3156,27 @@ fn push_pattern_variant_candidates(
 	pattern: &Spanned<Pattern>,
 	checked: &Checked,
 	module: &Module,
-	defs: &DefMap,
 	out: &mut Vec<(Span, String)>,
 ) {
 	if let Some(res) = checked.annotations.pattern_variant_of(pattern.1) {
-		push_variant_decl_candidate(pattern, res, module, defs, out);
+		push_variant_decl_candidate(pattern, res, module, checked, out);
 	}
 	match &pattern.0 {
 		Pattern::Binding { inner, .. } => {
-			push_pattern_variant_candidates(inner, checked, module, defs, out);
+			push_pattern_variant_candidates(inner, checked, module, out);
 		}
 		Pattern::List(items) | Pattern::Tuple(items) => {
 			for item in items {
 				if let ListPatternEntry::Item(p) = &item.0 {
-					push_pattern_variant_candidates(p, checked, module, defs, out);
+					push_pattern_variant_candidates(p, checked, module, out);
 				}
 			}
 		}
 		Pattern::Map(entries) => {
 			for entry in entries {
 				if let MapPatternEntry::Entry(k, v) = &entry.0 {
-					push_pattern_variant_candidates(k, checked, module, defs, out);
-					push_pattern_variant_candidates(v, checked, module, defs, out);
+					push_pattern_variant_candidates(k, checked, module, out);
+					push_pattern_variant_candidates(v, checked, module, out);
 				}
 			}
 		}
@@ -2723,17 +3184,17 @@ fn push_pattern_variant_candidates(
 			for field in fields {
 				match &field.0 {
 					StructPatternField::Value { value, .. } | StructPatternField::Positional(value) => {
-						push_pattern_variant_candidates(value, checked, module, defs, out);
+						push_pattern_variant_candidates(value, checked, module, out);
 					}
 					StructPatternField::Named(_) | StructPatternField::Rest => {}
 				}
 			}
 		}
 		Pattern::Union(a, b) => {
-			push_pattern_variant_candidates(a, checked, module, defs, out);
-			push_pattern_variant_candidates(b, checked, module, defs, out);
+			push_pattern_variant_candidates(a, checked, module, out);
+			push_pattern_variant_candidates(b, checked, module, out);
 		}
-		Pattern::Grouped(inner) => push_pattern_variant_candidates(inner, checked, module, defs, out),
+		Pattern::Grouped(inner) => push_pattern_variant_candidates(inner, checked, module, out),
 		Pattern::Int(_)
 		| Pattern::UInt(_)
 		| Pattern::Float(_)
@@ -3240,7 +3701,7 @@ fn collect_fallback_exprs(
 			collect_fallback_exprs(value, checked, module, defs, params, out);
 			let scrutinee_ty = checked.annotations.get(value.id).map(|info| info.ty);
 			for arm in arms {
-				push_pattern_variant_candidates(&arm.pattern, checked, module, defs, out);
+				push_pattern_variant_candidates(&arm.pattern, checked, module, out);
 				if let Some(ty) = scrutinee_ty {
 					bind_pattern_semantic(&arm.pattern, ty, checked, module, defs, params, out);
 				}
@@ -4754,6 +5215,64 @@ mod type_at_tests {
 		assert_eq!(
 			type_at(&module, &checked, offset),
 			Some("namespace func make(): int".to_string())
+		);
+	}
+}
+
+#[cfg(test)]
+mod imported_name_tests {
+	use super::*;
+	use crate::{DefinitionId, ModuleIdentity, ModuleOrigin};
+
+	fn definition(category: DeclarationCategory, name: &str) -> DefinitionId {
+		DefinitionId::new(
+			ModuleIdentity {
+				origin: ModuleOrigin::Project("project".into()),
+				project: "project".into(),
+				path: "dependency".into(),
+			},
+			DeclarationKey::top_level(category, name),
+		)
+	}
+
+	#[test]
+	fn imported_names_preserve_aliases_kinds_and_omit_poison() {
+		let mut bindings = FxHashMap::default();
+		bindings.insert(
+			"renamed".into(),
+			ResolvedImportBinding::Definition(definition(DeclarationCategory::Function, "original")),
+		);
+		bindings.insert(
+			"Shape".into(),
+			ResolvedImportBinding::Definition(definition(DeclarationCategory::Struct, "Shape")),
+		);
+		bindings.insert(
+			"dependency".into(),
+			ResolvedImportBinding::Namespace(ModuleIdentity {
+				origin: ModuleOrigin::Project("project".into()),
+				project: "project".into(),
+				path: "dependency".into(),
+			}),
+		);
+		bindings.insert("private_or_missing".into(), ResolvedImportBinding::Poison);
+		let module = nymph_syntax::parse_module("", "test.nym").tree;
+
+		assert_eq!(
+			imported_names(&bindings, &[], &module),
+			vec![
+				ImportedName {
+					name: "Shape".into(),
+					kind: ImportedNameKind::Struct,
+				},
+				ImportedName {
+					name: "dependency".into(),
+					kind: ImportedNameKind::Namespace,
+				},
+				ImportedName {
+					name: "renamed".into(),
+					kind: ImportedNameKind::Function,
+				},
+			]
 		);
 	}
 }

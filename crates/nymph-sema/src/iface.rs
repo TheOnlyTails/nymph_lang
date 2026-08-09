@@ -216,11 +216,22 @@ impl Checker<'_> {
 
 		for (id, member) in ifaces {
 			let Declaration::Interface {
-				generics, members, ..
+				generics,
+				super_interfaces,
+				members,
+				..
 			} = &module.members[member]
 			else {
 				continue;
 			};
+			for super_interface in super_interfaces {
+				let name = &super_interface.0.0;
+				if let Some(interface) = self.defs.get(&name.0).filter(|&d| self.is_interface(d)) {
+					self
+						.annotations
+						.record_type_definition_target(name.1, self.defs.stable(interface));
+				}
+			}
 			let names = generic_names(generics);
 			self.push_params(build_param_scope(generics));
 			let mut runtime_members = Vec::new();
@@ -422,6 +433,9 @@ impl Checker<'_> {
 			);
 			return;
 		};
+		self
+			.annotations
+			.record_type_definition_target(iface_name.1, self.defs.stable(interface));
 
 		// Interface argument bindings, with `self` substituted to the implementing type.
 		let raw_args = self.align_args(interface, iface_args);
@@ -751,6 +765,9 @@ impl Checker<'_> {
 			}
 			Type::Reference { name, generics } => {
 				if let Some(interface) = self.defs.get(&name.0).filter(|&d| self.is_interface(d)) {
+					self
+						.annotations
+						.record_type_definition_target(name.1, self.defs.stable(interface));
 					let args = self.align_args(interface, generics);
 					out.push(Bound {
 						ty: target,

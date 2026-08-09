@@ -6,6 +6,13 @@ use std::io::Write;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+const ATOMIC_DIRECTORY_EXCHANGE: bool = cfg!(any(
+	target_os = "linux",
+	target_os = "android",
+	target_os = "macos",
+	target_os = "ios"
+));
+
 /// A unique path in the system temp dir, isolated across parallel test threads
 /// (mirrors the pid + monotonic-counter pattern in
 /// `crates/nymph-codegen/tests/run_node.rs`).
@@ -88,6 +95,199 @@ fn write_project(entry: &str, source: &str) -> std::path::PathBuf {
 	.unwrap();
 	std::fs::write(&entry_path, source).unwrap();
 	root
+}
+
+#[test]
+fn doc_generates_default_and_custom_deterministic_sites_with_visibility_and_links() {
+	let root = write_project(
+		"main.nym",
+		"import @/model/token with (Token)\n\
+		 public func echo(value: Token): Token = value\n\
+		 private func hidden(): int = 42\n",
+	);
+	let model = root.join("src/model/token.nym");
+	std::fs::create_dir_all(model.parent().unwrap()).unwrap();
+	std::fs::write(&model, "public struct Token {}\n").unwrap();
+
+	let generated = nymph_in(&["doc"], &root);
+	assert!(generated.status.success(), "{}", generated.stderr);
+	let default = root.join("target/nymph/doc");
+	let index = std::fs::read_to_string(default.join("index.html")).unwrap();
+	let main = std::fs::read_to_string(default.join("modules/main.html")).unwrap();
+	let model = std::fs::read_to_string(default.join("modules/model/token.html")).unwrap();
+	let token_anchor = model
+		.split_once("<section id=\"")
+		.and_then(|(_, html)| html.split_once('"'))
+		.map(|(anchor, _)| anchor)
+		.expect("Token documentation should have an item anchor");
+	assert!(index.contains("modules/model/token.html"), "{index}");
+	assert!(main.contains("echo"), "{main}");
+	assert!(!main.contains("hidden"), "{main}");
+	assert!(
+		main.contains(&format!("modules/model/token.html#{token_anchor}")),
+		"cross-module type should link by its semantic target: {main}"
+	);
+	let first = std::fs::read(default.join("modules/main.html")).unwrap();
+	let second = root.join("deterministic-docs");
+	let regenerated = if ATOMIC_DIRECTORY_EXCHANGE {
+		nymph_in(&["doc"], &root)
+	} else {
+		nymph_in(&["doc", "--output", second.to_str().unwrap()], &root)
+	};
+	assert!(regenerated.status.success(), "{}", regenerated.stderr);
+	assert_eq!(
+		first,
+		std::fs::read(
+			if ATOMIC_DIRECTORY_EXCHANGE {
+				&default
+			} else {
+				&second
+			}
+			.join("modules/main.html")
+		)
+		.unwrap(),
+		"same checked project must render byte-for-byte deterministically"
+	);
+
+	let custom = root.join("custom-docs");
+	let private = nymph_in(
+		&[
+			"doc",
+			"--output",
+			custom.to_str().unwrap(),
+			"--document-private-items",
+		],
+		&root,
+	);
+	assert!(private.status.success(), "{}", private.stderr);
+	let custom_main = std::fs::read_to_string(custom.join("modules/main.html")).unwrap();
+	assert!(custom_main.contains("hidden"), "{custom_main}");
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn doc_failure_preserves_the_previous_output_tree() {
+	let root = write_project("main.nym", "public func broken(: int\n");
+	let output = root.join("site");
+	std::fs::create_dir_all(&output).unwrap();
+	std::fs::write(output.join("preserved.txt"), "old documentation").unwrap();
+
+	let result = nymph_in(&["doc", "--output", output.to_str().unwrap()], &root);
+	assert_eq!(result.status.code(), Some(1), "{}", result.stderr);
+	assert_eq!(
+		std::fs::read_to_string(output.join("preserved.txt")).unwrap(),
+		"old documentation"
+	);
+	assert!(!output.join("index.html").exists());
+
+	std::fs::write(root.join("src/main.nym"), "public let fixed: int = 1\n").unwrap();
+	let prior_file = root.join("prior-file");
+	std::fs::write(&prior_file, "old file").unwrap();
+	let replaced = nymph_in(&["doc", "--output", prior_file.to_str().unwrap()], &root);
+	if ATOMIC_DIRECTORY_EXCHANGE {
+		assert!(replaced.status.success(), "{}", replaced.stderr);
+		assert!(prior_file.join("index.html").is_file());
+	} else {
+		assert_eq!(replaced.status.code(), Some(1), "{}", replaced.stderr);
+		assert_eq!(std::fs::read_to_string(&prior_file).unwrap(), "old file");
+	}
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn doc_reports_warnings_without_blocking_publication() {
+	let root = write_project("main.nym", "public func large(): int = 9007199254740992\n");
+	let result = nymph_in(&["doc"], &root);
+	assert!(result.status.success(), "{}", result.stderr);
+	assert!(
+		result.stderr.to_ascii_lowercase().contains("warning"),
+		"{}",
+		result.stderr
+	);
+	assert!(
+		result.stderr.contains("9007199254740992"),
+		"{}",
+		result.stderr
+	);
+	assert!(root.join("target/nymph/doc/index.html").is_file());
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn doc_requires_strict_discovery_and_honors_an_explicit_manifest_authoritatively() {
+	let empty = unique_temp_path("nymph_cli_doc_empty", "dir");
+	std::fs::create_dir_all(&empty).unwrap();
+	let absent = nymph_in(&["doc"], &empty);
+	assert_eq!(absent.status.code(), Some(1));
+	assert!(
+		absent.stderr.contains("no nymph.toml found"),
+		"{}",
+		absent.stderr
+	);
+
+	let root = write_project("main.nym", "public let answer: int = 42\n");
+	let missing = root.join("missing.toml");
+	let selected = nymph_in(&["--manifest", missing.to_str().unwrap(), "doc"], &root);
+	assert_eq!(selected.status.code(), Some(1));
+	assert!(
+		selected.stderr.contains("could not read manifest"),
+		"{}",
+		selected.stderr
+	);
+	assert!(selected.stderr.contains(&missing.display().to_string()));
+	assert!(!root.join("target/nymph/doc/index.html").exists());
+
+	std::fs::remove_dir_all(empty).unwrap();
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn doc_open_runs_only_after_publication_and_receives_the_generated_index() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let root = write_project("main.nym", "public let answer: int = 42\n");
+	let bin = root.join("fake-bin");
+	std::fs::create_dir_all(&bin).unwrap();
+	let record = root.join("opened.txt");
+	let opener = bin.join("xdg-open");
+	std::fs::write(
+		&opener,
+		format!(
+			"#!/bin/sh\ntest -f \"$1\" || exit 9\nprintf '%s' \"$1\" > '{}'\n",
+			record.display()
+		),
+	)
+	.unwrap();
+	let mut permissions = std::fs::metadata(&opener).unwrap().permissions();
+	permissions.set_mode(0o755);
+	std::fs::set_permissions(&opener, permissions).unwrap();
+	let path = std::env::var_os("PATH").unwrap_or_default();
+	let path = std::iter::once(bin.clone())
+		.chain(std::env::split_paths(&path))
+		.collect::<Vec<_>>();
+	let output = Command::new(env!("CARGO_BIN_EXE_nymph"))
+		.arg("doc")
+		.arg("--open")
+		.arg("--output=-site")
+		.current_dir(&root)
+		.env("PATH", std::env::join_paths(path).unwrap())
+		.output()
+		.unwrap();
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(
+		std::fs::read_to_string(record).unwrap(),
+		root.join("-site/index.html").display().to_string()
+	);
+
+	std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -1120,14 +1320,419 @@ fn check_passes_a_main_dot_nym_using_a_prelude_operator_impl() {
 }
 
 #[test]
-fn stub_subcommand_exits_nonzero_with_a_message() {
-	let out = nymph(&["doc"]);
-	assert_eq!(out.status.code(), Some(2));
-	assert!(
-		out.stderr.contains("not implemented"),
-		"stderr was: {}",
-		out.stderr
+fn new_creates_exact_binary_and_library_projects_that_check() {
+	let root = unique_temp_path("nymph_cli_new", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let binary = root.join("hello-world");
+	let library = root.join("hello-lib");
+
+	let binary_out = nymph(&["new", binary.to_str().unwrap(), "--no-git"]);
+	assert!(binary_out.status.success(), "{}", binary_out.stderr);
+	assert_eq!(binary_out.stdout, "Created binary package `hello-world`\n");
+	assert_eq!(
+		std::fs::read_to_string(binary.join("nymph.toml")).unwrap(),
+		"[package]\nname = \"hello-world\"\nversion = \"0.1.0\"\n"
 	);
+	assert_eq!(
+		std::fs::read_to_string(binary.join("src/main.nym")).unwrap(),
+		"func main(): void = {}\n"
+	);
+	assert_eq!(
+		std::fs::read_dir(&binary)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name())
+			.collect::<std::collections::BTreeSet<_>>(),
+		["nymph.toml", "src"].into_iter().map(Into::into).collect()
+	);
+	let check = nymph_in(&["check"], &binary);
+	assert!(check.status.success(), "{}", check.stderr);
+
+	let library_out = nymph(&["new", library.to_str().unwrap(), "--lib", "--no-git"]);
+	assert!(library_out.status.success(), "{}", library_out.stderr);
+	assert_eq!(library_out.stdout, "Created library package `hello-lib`\n");
+	assert_eq!(
+		std::fs::read_to_string(library.join("nymph.toml")).unwrap(),
+		"[package]\nname = \"hello-lib\"\nversion = \"0.1.0\"\n"
+	);
+	assert_eq!(
+		std::fs::read_to_string(library.join("src/lib.nym")).unwrap(),
+		"public func hello(): string = \"Hello, world!\"\n"
+	);
+	let library_source = library.join("src/lib.nym");
+	let check = nymph_in(&["check", library_source.to_str().unwrap()], &library);
+	assert!(check.status.success(), "{}", check.stderr);
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn new_derives_names_after_validating_unicode_and_path_cases_before_writing() {
+	let root = unique_temp_path("nymph_cli_new_names", "dir");
+	let unicode_parent = root.join("日本語");
+	let valid = unicode_parent.join("app2-core");
+	let out = nymph(&["new", valid.to_str().unwrap(), "--no-git"]);
+	assert!(out.status.success(), "{}", out.stderr);
+	assert!(valid.join("nymph.toml").is_file());
+
+	for invalid in ["Uppercase", "2fast", "has_underscore", "café"] {
+		let destination = root.join(invalid);
+		let out = nymph(&["new", destination.to_str().unwrap(), "--no-git"]);
+		assert_eq!(out.status.code(), Some(1), "{invalid}: {}", out.stderr);
+		assert!(
+			out.stderr.contains("invalid package name"),
+			"{}",
+			out.stderr
+		);
+		assert!(!destination.exists(), "invalid destination was touched");
+	}
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn new_rejects_a_non_unicode_destination_basename_without_writing() {
+	use std::os::unix::ffi::OsStringExt;
+
+	let root = unique_temp_path("nymph_cli_new_non_unicode", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let destination = root.join(std::ffi::OsString::from_vec(vec![b'a', 0xff]));
+	let out = Command::new(env!("CARGO_BIN_EXE_nymph"))
+		.arg("new")
+		.arg(&destination)
+		.arg("--no-git")
+		.output()
+		.unwrap();
+	assert_eq!(out.status.code(), Some(1));
+	assert!(
+		String::from_utf8_lossy(&out.stderr).contains("not valid Unicode"),
+		"{}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	assert!(!destination.exists());
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn new_accepts_an_existing_empty_directory_and_refuses_other_destinations_untouched() {
+	let root = unique_temp_path("nymph_cli_new_existing", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let empty = root.join("empty-app");
+	std::fs::create_dir(&empty).unwrap();
+	let out = nymph(&["new", empty.to_str().unwrap(), "--no-git"]);
+	assert!(out.status.success(), "{}", out.stderr);
+	assert!(empty.join("src/main.nym").is_file());
+
+	let file = root.join("existing-file");
+	std::fs::write(&file, "keep me").unwrap();
+	let out = nymph(&["new", file.to_str().unwrap(), "--no-git"]);
+	assert_eq!(out.status.code(), Some(1));
+	assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep me");
+
+	let nonempty = root.join("nonempty");
+	std::fs::create_dir(&nonempty).unwrap();
+	std::fs::write(nonempty.join("keep"), "untouched").unwrap();
+	let out = nymph(&["new", nonempty.to_str().unwrap(), "--no-git"]);
+	assert_eq!(out.status.code(), Some(1));
+	assert_eq!(
+		std::fs::read_to_string(nonempty.join("keep")).unwrap(),
+		"untouched"
+	);
+	assert_eq!(std::fs::read_dir(&nonempty).unwrap().count(), 1);
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn new_preserves_existing_empty_directory_permissions() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let root = unique_temp_path("nymph_cli_new_existing_permissions", "dir");
+	let destination = root.join("private-app");
+	std::fs::create_dir_all(&destination).unwrap();
+	let mut permissions = std::fs::metadata(&destination).unwrap().permissions();
+	permissions.set_mode(0o700);
+	std::fs::set_permissions(&destination, permissions).unwrap();
+
+	let out = nymph(&["new", destination.to_str().unwrap(), "--no-git"]);
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(
+		std::fs::metadata(&destination)
+			.unwrap()
+			.permissions()
+			.mode()
+			& 0o777,
+		0o700
+	);
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn new_creates_nested_parents_and_no_git_is_deterministic() {
+	let root = unique_temp_path("nymph_cli_new_nested", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let first = root.join("one/more/repeatable");
+	let second = root.join("two/more/repeatable");
+	for destination in [&first, &second] {
+		let out = nymph(&["new", destination.to_str().unwrap(), "--no-git"]);
+		assert!(out.status.success(), "{}", out.stderr);
+		assert!(!destination.join(".git").exists());
+	}
+	assert_eq!(
+		std::fs::read(first.join("nymph.toml")).unwrap(),
+		std::fs::read(second.join("nymph.toml")).unwrap()
+	);
+	assert_eq!(
+		std::fs::read(first.join("src/main.nym")).unwrap(),
+		std::fs::read(second.join("src/main.nym")).unwrap()
+	);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn new_creates_nested_parents_from_a_relative_destination() {
+	let root = unique_temp_path("nymph_cli_new_relative", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let out = nymph_in(&["new", "one/more/relative-app", "--no-git"], &root);
+	assert!(out.status.success(), "{}", out.stderr);
+	assert!(root.join("one/more/relative-app/src/main.nym").is_file());
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn new_initializes_git_by_default_without_a_commit() {
+	let root = unique_temp_path("nymph_cli_new_git", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let destination = root.join("git-app");
+	let out = nymph(&["new", destination.to_str().unwrap()]);
+	assert!(out.status.success(), "{}", out.stderr);
+	assert!(destination.join(".git").is_dir());
+	let head = Command::new("git")
+		.args([
+			"-C",
+			destination.to_str().unwrap(),
+			"rev-parse",
+			"--verify",
+			"HEAD",
+		])
+		.output()
+		.unwrap();
+	assert!(
+		!head.status.success(),
+		"new must not create an initial commit"
+	);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn new_missing_git_leaves_no_destination_or_nested_parents() {
+	let root = unique_temp_path("nymph_cli_new_missing_git", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let destination = root.join("missing/parents/git-app");
+	let out = Command::new(env!("CARGO_BIN_EXE_nymph"))
+		.args(["new"])
+		.arg(&destination)
+		.env("PATH", "")
+		.output()
+		.unwrap();
+	assert_eq!(out.status.code(), Some(1));
+	assert!(String::from_utf8_lossy(&out.stderr).contains("install Git or pass --no-git"));
+	assert!(!root.join("missing").exists());
+	assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn new_failing_git_preserves_an_existing_empty_destination_and_cleans_staging() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let root = unique_temp_path("nymph_cli_new_failing_git", "dir");
+	let bin = root.join("bin");
+	let destination = root.join("git-app");
+	std::fs::create_dir_all(&bin).unwrap();
+	std::fs::create_dir(&destination).unwrap();
+	let git = bin.join("git");
+	std::fs::write(&git, "#!/bin/sh\necho deliberate failure >&2\nexit 42\n").unwrap();
+	let mut permissions = std::fs::metadata(&git).unwrap().permissions();
+	permissions.set_mode(0o755);
+	std::fs::set_permissions(&git, permissions).unwrap();
+
+	let out = Command::new(env!("CARGO_BIN_EXE_nymph"))
+		.args(["new"])
+		.arg(&destination)
+		.env("PATH", &bin)
+		.output()
+		.unwrap();
+	assert_eq!(out.status.code(), Some(1));
+	assert!(String::from_utf8_lossy(&out.stderr).contains("deliberate failure"));
+	assert!(destination.is_dir());
+	assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+	assert_eq!(
+		std::fs::read_dir(&root)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name())
+			.collect::<std::collections::BTreeSet<_>>(),
+		["bin", "git-app"].into_iter().map(Into::into).collect()
+	);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn new_rejects_a_symlink_ancestor_changed_by_git_without_touching_either_target() {
+	use std::os::unix::fs::{PermissionsExt, symlink};
+
+	let root = unique_temp_path("nymph_cli_new_symlink_race", "dir");
+	let original = root.join("original");
+	let replacement = root.join("replacement");
+	let bin = root.join("bin");
+	let link = root.join("link");
+	std::fs::create_dir_all(&original).unwrap();
+	std::fs::create_dir_all(&replacement).unwrap();
+	std::fs::create_dir_all(&bin).unwrap();
+	symlink(&original, &link).unwrap();
+	let git = bin.join("git");
+	std::fs::write(
+		&git,
+		"#!/bin/sh\nPATH=/usr/bin:/bin\nrm \"$ATTACK_ROOT/link\"\nln -s \"$ATTACK_ROOT/replacement\" \"$ATTACK_ROOT/link\"\nexit 0\n",
+	)
+	.unwrap();
+	let mut permissions = std::fs::metadata(&git).unwrap().permissions();
+	permissions.set_mode(0o755);
+	std::fs::set_permissions(&git, permissions).unwrap();
+	let destination = link.join("nested/app");
+
+	let out = Command::new(env!("CARGO_BIN_EXE_nymph"))
+		.arg("new")
+		.arg(&destination)
+		.env("PATH", &bin)
+		.env("ATTACK_ROOT", &root)
+		.output()
+		.unwrap();
+	assert_eq!(out.status.code(), Some(1));
+	assert!(
+		String::from_utf8_lossy(&out.stderr).contains("parent ancestor changed"),
+		"{}",
+		String::from_utf8_lossy(&out.stderr)
+	);
+	assert_eq!(std::fs::read_dir(&original).unwrap().count(), 0);
+	assert_eq!(std::fs::read_dir(&replacement).unwrap().count(), 0);
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn new_rejects_a_symlink_created_in_a_missing_parent_without_publishing() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let root = unique_temp_path("nymph_cli_new_missing_parent_race", "dir");
+	let original = root.join("original");
+	let replacement = root.join("replacement");
+	let bin = root.join("bin");
+	std::fs::create_dir_all(&original).unwrap();
+	std::fs::create_dir_all(&replacement).unwrap();
+	std::fs::create_dir_all(&bin).unwrap();
+	let git = bin.join("git");
+	std::fs::write(
+		&git,
+		"#!/bin/sh\nPATH=/usr/bin:/bin\nln -s \"$ATTACK_ROOT/replacement\" \"$ATTACK_ROOT/original/nested\"\nexit 0\n",
+	)
+	.unwrap();
+	let mut permissions = std::fs::metadata(&git).unwrap().permissions();
+	permissions.set_mode(0o755);
+	std::fs::set_permissions(&git, permissions).unwrap();
+	let destination = original.join("nested/app");
+
+	let out = Command::new(env!("CARGO_BIN_EXE_nymph"))
+		.arg("new")
+		.arg(&destination)
+		.env("PATH", &bin)
+		.env("ATTACK_ROOT", &root)
+		.output()
+		.unwrap();
+	assert_eq!(out.status.code(), Some(1));
+	assert!(!replacement.join("app").exists());
+	assert_eq!(
+		std::fs::read_dir(&original)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name())
+			.collect::<Vec<_>>(),
+		["nested"]
+	);
+	assert!(
+		std::fs::symlink_metadata(original.join("nested"))
+			.unwrap()
+			.file_type()
+			.is_symlink()
+	);
+
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn new_cleans_staging_after_preserving_read_only_destination_permissions() {
+	use std::os::unix::fs::{PermissionsExt, symlink};
+
+	let root = unique_temp_path("nymph_cli_new_read_only_cleanup", "dir");
+	let original = root.join("original");
+	let replacement = root.join("replacement");
+	let bin = root.join("bin");
+	let link = root.join("link");
+	let destination = original.join("private-app");
+	std::fs::create_dir_all(&destination).unwrap();
+	std::fs::create_dir_all(&replacement).unwrap();
+	std::fs::create_dir_all(&bin).unwrap();
+	symlink(&original, &link).unwrap();
+	let mut permissions = std::fs::metadata(&destination).unwrap().permissions();
+	permissions.set_mode(0o555);
+	std::fs::set_permissions(&destination, permissions).unwrap();
+	let git = bin.join("git");
+	std::fs::write(
+		&git,
+		"#!/bin/sh\nPATH=/usr/bin:/bin\nrm \"$ATTACK_ROOT/link\"\nln -s \"$ATTACK_ROOT/replacement\" \"$ATTACK_ROOT/link\"\nexit 0\n",
+	)
+	.unwrap();
+	let mut permissions = std::fs::metadata(&git).unwrap().permissions();
+	permissions.set_mode(0o755);
+	std::fs::set_permissions(&git, permissions).unwrap();
+
+	let out = Command::new(env!("CARGO_BIN_EXE_nymph"))
+		.arg("new")
+		.arg(link.join("private-app"))
+		.env("PATH", &bin)
+		.env("ATTACK_ROOT", &root)
+		.output()
+		.unwrap();
+	assert_eq!(out.status.code(), Some(1));
+	assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+	assert_eq!(std::fs::read_dir(&replacement).unwrap().count(), 0);
+	assert_eq!(
+		std::fs::read_dir(&original)
+			.unwrap()
+			.map(|entry| entry.unwrap().file_name())
+			.collect::<Vec<_>>(),
+		["private-app"]
+	);
+
+	let mut permissions = std::fs::metadata(&destination).unwrap().permissions();
+	permissions.set_mode(0o755);
+	std::fs::set_permissions(&destination, permissions).unwrap();
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn new_help_documents_the_path_and_supported_flags() {
+	let out = nymph(&["new", "--help"]);
+	assert!(out.status.success(), "{}", out.stderr);
+	assert!(out.stdout.contains("Usage: nymph new [OPTIONS] <PATH>"));
+	assert!(out.stdout.contains("--lib"));
+	assert!(out.stdout.contains("--no-git"));
+	assert!(!out.stdout.contains("--name"));
 }
 
 #[test]

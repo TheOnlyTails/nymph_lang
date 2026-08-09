@@ -135,6 +135,11 @@ impl<T> Describe for T {
 func demo(): string = 5.describe()
 ```
 
+When both a blanket implementation and an implementation for a specific concrete type apply, the
+concrete implementation takes precedence. A blanket method has one shared generic body regardless
+of how many concrete receiver types use it; this does not change source-level receiver behavior or
+argument evaluation order.
+
 ## Bounds
 
 `<T: Interface>` on a function, struct, enum, or method restricts `T` to types that implement

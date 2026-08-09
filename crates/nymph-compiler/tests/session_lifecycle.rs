@@ -430,3 +430,41 @@ fn dependency_relations_track_import_edits_without_reparsing_unrelated_modules()
 		"dependency inspection must not trigger semantic checking: {observed:?}"
 	);
 }
+
+#[test]
+fn transitive_reverse_importers_are_stable_deduplicated_and_cycle_safe() {
+	let mut session = CompilerSession::new();
+	let project = ProjectId::new("reverse-closure");
+	for (module, source) in [
+		("main", "import @/middle\nimport @/middle"),
+		("middle", "import @/leaf"),
+		("sibling", "import @/leaf"),
+		("both_paths", "import @/leaf\nimport @/sibling"),
+		("leaf", "let value = 1"),
+		("cycle_a", "import @/cycle_b"),
+		("cycle_b", "import @/cycle_a"),
+		("unrelated", "let untouched = 1"),
+	] {
+		session.set_source(
+			project.clone(),
+			path(module),
+			source.into(),
+			SourceVersion(1),
+		);
+	}
+
+	assert_eq!(
+		session.reverse_importer_closure(project.clone(), path("leaf")),
+		[
+			path("leaf"),
+			path("middle"),
+			path("sibling"),
+			path("both_paths"),
+			path("main"),
+		]
+	);
+	assert_eq!(
+		session.reverse_importer_closure(project, path("cycle_a")),
+		[path("cycle_a"), path("cycle_b")]
+	);
+}
