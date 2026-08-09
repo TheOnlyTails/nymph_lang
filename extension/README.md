@@ -58,6 +58,13 @@ overlays), same-module declarations, and keywords. Prefix filtering applies with
 Completion after `.` intentionally returns no members yet; member completion and auto-import edits
 are not currently supported. Files outside a project retain lexical and same-file completion.
 
+Semantic highlighting consumes that same immutable project snapshot. Imported and ambient
+functions, values, types, enum variants, and aliases therefore keep the same semantic kind as their
+declarations, including when an unsaved dependency overrides its on-disk source. Highlighting is
+best-effort for malformed projects: lexical tokens, comments, and string interpolations remain
+available when semantic resolution is incomplete. The server advertises only full-document tokens
+with its fixed legend; range and delta requests are not supported.
+
 ## Nymph files
 
 `.nym` is the only Nymph source-file suffix. Functions use

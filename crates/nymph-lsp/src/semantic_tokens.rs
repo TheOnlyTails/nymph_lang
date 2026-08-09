@@ -24,21 +24,20 @@
 //!   ([`nymph_sema::query::definition_at`]), and a call-argument/
 //!   struct-field LABEL (`hello` in `f(hello = x)`) classifies as
 //!   `property`, distinct from an ordinary variable.
-//! - [`nymph_sema::check_module`] resolves which enum variant a
-//!   construction/reference/pattern names precisely (disambiguating
-//!   `None`/`Ok`-style bare names) — run fresh per request (mirrors
-//!   `hover.rs`'s uncached path), tolerant of partial/erroring input. Where
-//!   a checker resolution is unavailable, phase 2 falls back to a
-//!   name-set match against the module's own declared enum variants,
-//!   deferring to an in-scope binder of the same name. An identifier whose
-//!   role isn't determined by any of this falls back to `variable` rather
-//!   than risk a wrong classification.
+//! - [`AnalysisSnapshot`] supplies the immutable semantic analysis produced
+//!   for the request's exact document revision. Its definition arena includes
+//!   project imports, aliases, the ambient prelude, and every open-document
+//!   overlay, so imported and ambient functions, values, types, and variants
+//!   classify consistently without rechecking or rebuilding a source-local
+//!   arena. Where checker resolution is unavailable over malformed code,
+//!   phase 2 retains its local AST/name-set fallbacks; an unresolved identifier
+//!   remains `variable` rather than risking a wrong classification.
 //!
 //! Comments are not tokens at all — the lexer discards them — so they are
 //! recovered by scanning the gaps between consecutive lexed tokens for `//`
-//! and `/* … */` runs. A string's `//` can never be mistaken for a comment
-//! this way, because it sits inside the `Str` token's own span, never in a
-//! gap.
+//! and `/* … */` runs, recursively inside interpolation token streams. Quoted
+//! runs in malformed lexical gaps are skipped, so an unterminated string's
+//! `//` is not mistaken for a comment.
 //!
 //! A [`Token::Str`] is not one opaque span: it is expanded
 //! fragment-by-fragment ([`push_str_token`]), so plain text and escapes stay
@@ -66,7 +65,7 @@ use nymph_ast::{
 	token::{StrFragment, Token},
 	ty::{GenericArg, GenericParam, Type},
 };
-use nymph_sema::Checked;
+use nymph_sema::{DeclarationCategory, DeclarationKey, DefKind, SemanticAnalysis};
 
 use crate::{compiler_state::AnalysisSnapshot, line_index::LineIndex};
 
@@ -85,10 +84,6 @@ const ENUM_MEMBER: u32 = 8;
 const STRING: u32 = 9;
 const NUMBER: u32 = 10;
 const COMMENT: u32 = 11;
-#[expect(
-	dead_code,
-	reason = "reserved legend slot: no AST node currently classifies as namespace besides a top-level `namespace` name, which is handled as `type`; kept for a future refinement (import path segments)"
-)]
 const NAMESPACE: u32 = 12;
 
 const DECLARATION: u32 = 1 << 0;
@@ -144,13 +139,37 @@ pub(crate) fn semantic_tokens_snapshot(
 	params: &SemanticTokensParams,
 ) -> Option<SemanticTokensResult> {
 	let _ = params;
+	if snapshot.source != snapshot.document_source {
+		// Equivalent URI spellings can be open with different text while sharing
+		// one canonical project module. The last notification remains the
+		// project's semantic authority, but its AST spans must never be encoded
+		// against another open buffer. Preserve source-correct lexical tokens for
+		// that non-authoritative spelling instead.
+		return Some(semantic_tokens_for_source(
+			&snapshot.document_source,
+			&RoleMap::default(),
+		));
+	}
 	let text = snapshot.source.as_ref();
-	let checked = nymph_sema::Checked {
-		diags: Vec::new(),
-		facts: snapshot.analysis.semantic.checked.as_ref().clone(),
-	};
-	let roles = build_role_map(&snapshot.analysis.semantic.module, &checked);
+	let roles = build_role_map(&snapshot.analysis.semantic);
 	Some(semantic_tokens_for_source(text, &roles))
+}
+
+/// Return lexical best-effort tokens for an open document when malformed
+/// project syntax prevents the compiler from producing a semantic snapshot.
+/// This deliberately uses an empty role map rather than guessing semantic
+/// categories; lexer token kinds, comments, interpolation splitting, and
+/// UTF-16 encoding remain available.
+#[must_use]
+pub fn semantic_tokens_for_open_document(
+	docs: &crate::document_store::DocumentStore,
+	params: &SemanticTokensParams,
+) -> Option<SemanticTokensResult> {
+	let document = docs.get(&params.text_document.uri)?;
+	Some(semantic_tokens_for_source(
+		&document.text,
+		&RoleMap::default(),
+	))
 }
 
 fn semantic_tokens_for_source(text: &str, roles: &RoleMap) -> SemanticTokensResult {
@@ -201,10 +220,7 @@ pub fn semantic_tokens_full(
 		.ok()?;
 	match state.analysis_for_uri(&owned_docs, uri) {
 		Some(snapshot) => semantic_tokens_snapshot(&snapshot, params),
-		None => Some(semantic_tokens_for_source(
-			&document.text,
-			&RoleMap::default(),
-		)),
+		None => semantic_tokens_for_open_document(docs, params),
 	}
 }
 
@@ -249,7 +265,7 @@ fn push_str_token(
 
 	for frag in fragments {
 		if let StrFragment::Interpolation(inner) = &frag.0 {
-			let open_end = inner.first().map_or(frag.1.end, |t| t.1.start);
+			let open_end = (frag.1.start + "${".len()).min(frag.1.end);
 			if open_end > run_start {
 				items.push((Span::new(run_start, open_end), STRING, 0));
 			}
@@ -258,7 +274,9 @@ fn push_str_token(
 				push_token(tok, roles, items);
 			}
 
-			run_start = inner.last().map_or(open_end, |t| t.1.end);
+			// Resume at the closing `}`. Whitespace and comments between `${`
+			// and `}` belong to the interpolated expression, not the string.
+			run_start = frag.1.end.saturating_sub('}'.len_utf8()).max(open_end);
 		}
 	}
 
@@ -298,28 +316,53 @@ fn lexer_token_type(token: &Token) -> Option<u32> {
 }
 
 /// Recover comment spans (the lexer discards them entirely) by scanning the
-/// gaps between consecutive lexed tokens, plus the leading/trailing gaps
-/// against the whole document.
+/// gaps between consecutive lexed tokens, plus the leading/trailing gaps,
+/// recursively for every interpolation token stream.
 fn comment_spans(text: &str, tokens: &[Spanned<Token>]) -> Vec<Span> {
 	let mut spans = Vec::new();
-	let mut prev_end = 0usize;
-	for spanned in tokens {
-		let span = spanned.1;
-		if span.start > prev_end {
-			scan_comments_into(text, prev_end, span.start, &mut spans);
-		}
-		prev_end = prev_end.max(span.end);
-	}
-	if prev_end < text.len() {
-		scan_comments_into(text, prev_end, text.len(), &mut spans);
-	}
+	collect_comment_spans(text, tokens, 0, text.len(), &mut spans);
 	spans
 }
 
-/// Scan `text[start..end]` (known to hold only whitespace and comments) for
-/// `//` and `/* … */` runs, pushing their spans in source order. An
-/// unterminated block comment runs to `end` (matches the lexer's own
-/// recovery).
+fn collect_comment_spans(
+	text: &str,
+	tokens: &[Spanned<Token>],
+	start: usize,
+	end: usize,
+	out: &mut Vec<Span>,
+) {
+	let mut prev_end = start;
+	for spanned in tokens {
+		let span = spanned.1;
+		if span.start > prev_end {
+			scan_comments_into(text, prev_end, span.start.min(end), out);
+		}
+		if let Token::Str(fragments) = &spanned.0 {
+			for fragment in fragments {
+				if let StrFragment::Interpolation(inner) = &fragment.0 {
+					let inner_start = (fragment.1.start + "${".len()).min(fragment.1.end);
+					let inner_end = fragment
+						.1
+						.end
+						.saturating_sub('}'.len_utf8())
+						.max(inner_start);
+					collect_comment_spans(text, inner, inner_start, inner_end, out);
+				}
+			}
+		}
+		prev_end = prev_end.max(span.end);
+	}
+	if prev_end < end {
+		scan_comments_into(text, prev_end, end, out);
+	}
+}
+
+/// Conservatively scan a lexer gap for `//` and `/* … */` runs, pushing their
+/// spans in source order. Quoted runs are skipped because malformed
+/// strings/chars can remain in a lexical gap. Any other non-trivia source
+/// stops recovery rather than inventing a later comment inside malformed
+/// syntax. An unterminated block comment runs to `end` (matching the lexer's
+/// own recovery).
 fn scan_comments_into(text: &str, start: usize, end: usize, out: &mut Vec<Span>) {
 	let gap = &text[start..end];
 	let bytes = gap.as_bytes();
@@ -343,8 +386,28 @@ fn scan_comments_into(text: &str, start: usize, end: usize, out: &mut Vec<Span>)
 				out.push(Span::new(comment_start, end));
 				i = bytes.len();
 			}
-		} else {
+		} else if matches!(bytes[i], b'"' | b'\'') {
+			let quote = bytes[i];
 			i += 1;
+			while i < bytes.len() {
+				if bytes[i] == b'\\' {
+					i = (i + 2).min(bytes.len());
+				} else if bytes[i] == quote {
+					i += 1;
+					break;
+				} else {
+					i += 1;
+				}
+			}
+		} else {
+			let ch = gap[i..]
+				.chars()
+				.next()
+				.expect("gap index is always within the string");
+			if !ch.is_whitespace() {
+				break;
+			}
+			i += ch.len_utf8();
 		}
 	}
 }
@@ -355,26 +418,22 @@ fn scan_comments_into(text: &str, start: usize, end: usize, out: &mut Vec<Span>)
 /// literal newline). A single-line span yields exactly one piece.
 fn split_span_lines(text: &str, index: &LineIndex, span: Span) -> Vec<(u32, u32, u32)> {
 	let start_pos = index.position(text, span.start);
-	let end_pos = index.position(text, span.end);
-	if start_pos.line == end_pos.line {
-		return vec![(
-			start_pos.line,
-			start_pos.character,
-			end_pos.character - start_pos.character,
-		)];
-	}
-
 	let mut pieces = Vec::new();
 	let mut line = start_pos.line;
 	let mut char_start = start_pos.character;
 	let mut len: u32 = 0;
-	for ch in text[span.start..span.end].chars() {
+	for (relative, ch) in text[span.start..span.end].char_indices() {
+		// LSP positions exclude the CRLF line terminator. A line comment's
+		// span ends immediately before `\n`, so consult the full source
+		// rather than only the sliced span.
+		let crlf_carriage =
+			ch == '\r' && text.as_bytes().get(span.start + relative + 1) == Some(&b'\n');
 		if ch == '\n' {
 			pieces.push((line, char_start, len));
 			line += 1;
 			char_start = 0;
 			len = 0;
-		} else {
+		} else if !crlf_carriage {
 			len += ch.len_utf16() as u32;
 		}
 	}
@@ -420,31 +479,74 @@ type RoleMap = HashMap<usize, (u32, u32)>;
 /// legend classification; phase 2 resolves every *use* site — an enum
 /// variant reference/construction/pattern, a parameter/local-binder
 /// identifier use, and a call-argument/struct-field label — to a
-/// classification consistent with its declaration, using `checked`'s
-/// recorded variant resolutions plus the existing scope machinery
-/// ([`nymph_sema::query::definition_at`]/[`nymph_sema::query::scope_names_at`]).
+/// classification consistent with its declaration, using the immutable
+/// analysis's stable definition targets and variant resolutions plus the
+/// existing local scope machinery ([`nymph_sema::query::definition_at`]/
+/// [`nymph_sema::query::scope_names_at`]).
 /// Phase 2 must run after phase 1 completes (not interleaved) so a
 /// forward-referenced top-level declaration is already in the map by the
 /// time any of its uses are resolved. Uses never overwrite an existing
 /// entry — decl-site and use-site spans are always disjoint byte positions,
 /// but `or_insert` keeps that invariant even if two use-walks ever visit the
 /// same span twice.
-fn build_role_map(module: &Module, checked: &Checked) -> RoleMap {
+fn build_role_map(analysis: &SemanticAnalysis) -> RoleMap {
+	let module = &analysis.module;
 	let mut map = RoleMap::new();
 	for decl in &module.members {
+		walk_import_decl(decl, analysis, &mut map);
 		walk_decl(decl, &mut map);
 	}
 
 	let variant_names = collect_enum_variant_names(module);
 	let mut uses: Vec<(usize, (u32, u32))> = Vec::new();
 	for decl in &module.members {
-		walk_decl_uses(decl, module, checked, &variant_names, &map, &mut uses);
+		walk_decl_uses(decl, analysis, &variant_names, &map, &mut uses);
 	}
 	for (start, role) in uses {
 		map.entry(start).or_insert(role);
 	}
 
 	map
+}
+
+fn walk_import_decl(decl: &Declaration, analysis: &SemanticAnalysis, map: &mut RoleMap) {
+	let Declaration::Import {
+		root,
+		path,
+		alias,
+		idents,
+	} = decl
+	else {
+		return;
+	};
+
+	if let nymph_ast::decl::ImportRoot::Package(package) = root {
+		map.insert(package.1.start, (NAMESPACE, 0));
+	}
+	for segment in path {
+		map.insert(segment.1.start, (NAMESPACE, 0));
+	}
+	if let Some(alias) = alias {
+		map.insert(alias.1.start, (NAMESPACE, DECLARATION));
+	} else if let Some(namespace) = path.last()
+		&& nymph_sema::query::imported_definition_kind_by_name(analysis, &namespace.0)
+			== Some(DefKind::Namespace)
+	{
+		map.insert(namespace.1.start, (NAMESPACE, DECLARATION));
+	}
+
+	for (source, alias) in idents.iter().flatten() {
+		let local = alias.as_ref().unwrap_or(source);
+		let Some(kind) = nymph_sema::query::imported_definition_kind_by_name(analysis, &local.0) else {
+			continue;
+		};
+		let (ty, modifiers) = definition_kind_role(kind);
+		let role = (ty, modifiers | DECLARATION);
+		map.insert(source.1.start, role);
+		if let Some(alias) = alias {
+			map.insert(alias.1.start, role);
+		}
+	}
 }
 
 fn walk_decl(decl: &Declaration, map: &mut RoleMap) {
@@ -512,9 +614,9 @@ fn walk_decl(decl: &Declaration, map: &mut RoleMap) {
 			}
 		}
 		Declaration::Namespace { name, members, .. } => {
-			map.insert(name.1.start, (TYPE, DECLARATION));
+			map.insert(name.1.start, (NAMESPACE, DECLARATION));
 			for m in members {
-				walk_impl_member(m, map);
+				walk_namespace_member(m, map);
 			}
 		}
 		Declaration::Interface {
@@ -623,6 +725,25 @@ fn walk_impl_member(m: &Spanned<ImplMember>, map: &mut RoleMap) {
 		ImplMember::ExternalFunc(_, _, meta) => {
 			bind_func(meta, METHOD, map);
 		}
+	}
+}
+
+fn walk_namespace_member(m: &Spanned<ImplMember>, map: &mut RoleMap) {
+	match &m.0 {
+		ImplMember::Let { meta, value, .. } => {
+			bind_let(meta, map);
+			walk_type_opt(&meta.type_, map);
+			walk_expr(value, map);
+		}
+		ImplMember::ExternalLet(_, _, meta) => {
+			bind_let(meta, map);
+			walk_type_opt(&meta.type_, map);
+		}
+		ImplMember::Func { meta, body, .. } => {
+			bind_func(meta, FUNCTION, map);
+			walk_expr(body, map);
+		}
+		ImplMember::ExternalFunc(_, _, meta) => bind_func(meta, FUNCTION, map),
 	}
 }
 
@@ -935,15 +1056,23 @@ fn is_unshadowed_variant(module: &Module, variant_names: &HashSet<&str>, name: &
 /// `readonly` bit at a use site); `None` (→ the `variable` default) when
 /// nothing resolves, matching a still-erroring or unresolvable identifier.
 fn identifier_role(
-	module: &Module,
-	checked: &Checked,
+	analysis: &SemanticAnalysis,
 	decls: &RoleMap,
 	variant_names: &HashSet<&str>,
 	expr: &Expr,
 	name: &Ident,
 ) -> Option<(u32, u32)> {
-	if checked.annotations.variant_of(expr.id).is_some() {
+	if analysis.annotations.variant_of(expr.id).is_some() {
 		return Some((ENUM_MEMBER, 0));
+	}
+	if let Some(target) = analysis.annotations.definition_target_of(expr.id)
+		&& let Some(role) = stable_definition_role(analysis, target)
+	{
+		return Some(role);
+	}
+	let module = &analysis.module;
+	if is_unshadowed_namespace(analysis, name) {
+		return Some((NAMESPACE, 0));
 	}
 	if is_unshadowed_variant(module, variant_names, name) {
 		return Some((ENUM_MEMBER, 0));
@@ -957,10 +1086,91 @@ fn identifier_role(
 	None
 }
 
+fn is_unshadowed_namespace(analysis: &SemanticAnalysis, name: &Ident) -> bool {
+	let module = &analysis.module;
+	let declared = module.members.iter().any(|decl| match decl {
+		Declaration::Namespace { name: declared, .. } => declared.0 == name.0,
+		Declaration::Import {
+			path,
+			alias,
+			idents,
+			..
+		} => {
+			alias
+				.as_ref()
+				.or_else(|| path.last())
+				.is_some_and(|binding| binding.0 == name.0)
+				|| idents.iter().flatten().any(|(source, alias)| {
+					let binding = alias.as_ref().unwrap_or(source);
+					binding.0 == name.0
+						&& nymph_sema::query::definition_kind_by_name(analysis, &binding.0)
+							== Some(DefKind::Namespace)
+				})
+		}
+		_ => false,
+	});
+	declared
+		&& !nymph_sema::query::scope_names_at_exact(module, name.1.start)
+			.unwrap_or_default()
+			.iter()
+			.any(|candidate| candidate == name.0.as_str())
+}
+
+fn definition_kind_role(kind: DefKind) -> (u32, u32) {
+	match kind {
+		DefKind::Func => (FUNCTION, 0),
+		DefKind::Struct | DefKind::Enum | DefKind::TypeAlias | DefKind::Interface => (TYPE, 0),
+		DefKind::Namespace => (NAMESPACE, 0),
+		DefKind::Variant { .. } => (ENUM_MEMBER, 0),
+		DefKind::Let => (VARIABLE, READONLY),
+	}
+}
+
+fn stable_definition_role(
+	analysis: &SemanticAnalysis,
+	target: &nymph_sema::DefinitionId,
+) -> Option<(u32, u32)> {
+	match &target.key {
+		DeclarationKey::Member {
+			owner, category, ..
+		} => {
+			return match category {
+				DeclarationCategory::Field => Some((PROPERTY, 0)),
+				DeclarationCategory::Method => {
+					let kind = nymph_sema::query::stable_definition_kind(analysis, target)?;
+					match (&owner.key, kind) {
+						(
+							DeclarationKey::TopLevel {
+								category: DeclarationCategory::Namespace,
+								..
+							},
+							DefKind::Func,
+						) => Some((FUNCTION, 0)),
+						(_, DefKind::Let) => Some((VARIABLE, 0)),
+						_ => Some((METHOD, 0)),
+					}
+				}
+				DeclarationCategory::Function
+				| DeclarationCategory::Static
+				| DeclarationCategory::MethodBody => Some((METHOD, 0)),
+				DeclarationCategory::Variant => Some((ENUM_MEMBER, 0)),
+				_ => None,
+			};
+		}
+		DeclarationKey::MethodBody { .. } | DeclarationKey::MaterializedInterfaceMember { .. } => {
+			return Some((METHOD, 0));
+		}
+		DeclarationKey::TopLevel { .. }
+		| DeclarationKey::Implementation { .. }
+		| DeclarationKey::RecoveredImplementation { .. } => {}
+	}
+	let (ty, _) = definition_kind_role(nymph_sema::query::stable_definition_kind(analysis, target)?);
+	Some((ty, 0))
+}
+
 fn walk_decl_uses(
 	decl: &Declaration,
-	module: &Module,
-	checked: &Checked,
+	analysis: &SemanticAnalysis,
 	variant_names: &HashSet<&str>,
 	decls: &RoleMap,
 	out: &mut Vec<(usize, (u32, u32))>,
@@ -971,7 +1181,7 @@ fn walk_decl_uses(
 		| Declaration::ExternalFunc(..)
 		| Declaration::TypeAlias { .. } => {}
 		Declaration::Let { value, .. } | Declaration::Func { body: value, .. } => {
-			walk_expr_uses(value, module, checked, variant_names, decls, out);
+			walk_expr_uses(value, analysis, variant_names, decls, out);
 		}
 		Declaration::Struct {
 			fields,
@@ -981,41 +1191,41 @@ fn walk_decl_uses(
 		} => {
 			for f in fields {
 				if let Some(default) = &f.0.default {
-					walk_expr_uses(default, module, checked, variant_names, decls, out);
+					walk_expr_uses(default, analysis, variant_names, decls, out);
 				}
 			}
 			for m in members {
-				walk_impl_member_uses(&m.0, module, checked, variant_names, decls, out);
+				walk_impl_member_uses(&m.0, analysis, variant_names, decls, out);
 			}
 			for si in impls {
 				for m in &si.0.members {
-					walk_impl_member_uses(&m.0, module, checked, variant_names, decls, out);
+					walk_impl_member_uses(&m.0, analysis, variant_names, decls, out);
 				}
 			}
 		}
 		Declaration::Enum { members, impls, .. } => {
 			for m in members {
-				walk_impl_member_uses(&m.0, module, checked, variant_names, decls, out);
+				walk_impl_member_uses(&m.0, analysis, variant_names, decls, out);
 			}
 			for si in impls {
 				for m in &si.0.members {
-					walk_impl_member_uses(&m.0, module, checked, variant_names, decls, out);
+					walk_impl_member_uses(&m.0, analysis, variant_names, decls, out);
 				}
 			}
 		}
 		Declaration::Namespace { members, .. } => {
 			for m in members {
-				walk_impl_member_uses(&m.0, module, checked, variant_names, decls, out);
+				walk_impl_member_uses(&m.0, analysis, variant_names, decls, out);
 			}
 		}
 		Declaration::Interface { members, .. } => {
 			for m in members {
-				walk_interface_member_uses(&m.0, module, checked, variant_names, decls, out);
+				walk_interface_member_uses(&m.0, analysis, variant_names, decls, out);
 			}
 		}
 		Declaration::Impl { members, .. } | Declaration::ImplFor { members, .. } => {
 			for m in members {
-				walk_impl_member_uses(&m.0, module, checked, variant_names, decls, out);
+				walk_impl_member_uses(&m.0, analysis, variant_names, decls, out);
 			}
 		}
 	}
@@ -1023,8 +1233,7 @@ fn walk_decl_uses(
 
 fn walk_impl_member_uses(
 	member: &ImplMember,
-	module: &Module,
-	checked: &Checked,
+	analysis: &SemanticAnalysis,
 	variant_names: &HashSet<&str>,
 	decls: &RoleMap,
 	out: &mut Vec<(usize, (u32, u32))>,
@@ -1032,15 +1241,14 @@ fn walk_impl_member_uses(
 	match member {
 		ImplMember::ExternalLet(..) | ImplMember::ExternalFunc(..) => {}
 		ImplMember::Let { value, .. } | ImplMember::Func { body: value, .. } => {
-			walk_expr_uses(value, module, checked, variant_names, decls, out);
+			walk_expr_uses(value, analysis, variant_names, decls, out);
 		}
 	}
 }
 
 fn walk_interface_member_uses(
 	member: &InterfaceMember,
-	module: &Module,
-	checked: &Checked,
+	analysis: &SemanticAnalysis,
 	variant_names: &HashSet<&str>,
 	decls: &RoleMap,
 	out: &mut Vec<(usize, (u32, u32))>,
@@ -1049,18 +1257,18 @@ fn walk_interface_member_uses(
 		InterfaceMember::Element(elem) => match &elem.0 {
 			InterfaceElement::Let { value, .. } => {
 				if let Some(v) = value {
-					walk_expr_uses(v, module, checked, variant_names, decls, out);
+					walk_expr_uses(v, analysis, variant_names, decls, out);
 				}
 			}
 			InterfaceElement::Func { body, .. } => {
 				if let Some(b) = body {
-					walk_expr_uses(b, module, checked, variant_names, decls, out);
+					walk_expr_uses(b, analysis, variant_names, decls, out);
 				}
 			}
 		},
 		InterfaceMember::Impl { members, .. } => {
 			for m in members {
-				walk_impl_member_uses(&m.0, module, checked, variant_names, decls, out);
+				walk_impl_member_uses(&m.0, analysis, variant_names, decls, out);
 			}
 		}
 	}
@@ -1068,12 +1276,12 @@ fn walk_interface_member_uses(
 
 fn walk_expr_uses(
 	expr: &Expr,
-	module: &Module,
-	checked: &Checked,
+	analysis: &SemanticAnalysis,
 	variant_names: &HashSet<&str>,
 	decls: &RoleMap,
 	out: &mut Vec<(usize, (u32, u32))>,
 ) {
+	let module = &analysis.module;
 	match &expr.kind {
 		ExprKind::Int(_)
 		| ExprKind::UInt(_)
@@ -1084,14 +1292,14 @@ fn walk_expr_uses(
 		| ExprKind::This
 		| ExprKind::Continue { .. } => {}
 		ExprKind::Identifier(name) => {
-			if let Some(role) = identifier_role(module, checked, decls, variant_names, expr, name) {
+			if let Some(role) = identifier_role(analysis, decls, variant_names, expr, name) {
 				out.push((expr.span.start, role));
 			}
 		}
 		ExprKind::String(parts) => {
 			for part in parts {
 				if let StringPart::InterpolatedExpr(e) = &part.0 {
-					walk_expr_uses(e, module, checked, variant_names, decls, out);
+					walk_expr_uses(e, analysis, variant_names, decls, out);
 				}
 			}
 		}
@@ -1099,7 +1307,7 @@ fn walk_expr_uses(
 			for item in items {
 				match &item.0 {
 					ListItem::Expr(e) | ListItem::Spread(e) => {
-						walk_expr_uses(e, module, checked, variant_names, decls, out);
+						walk_expr_uses(e, analysis, variant_names, decls, out);
 					}
 				}
 			}
@@ -1108,20 +1316,20 @@ fn walk_expr_uses(
 			for entry in entries {
 				match &entry.0 {
 					MapEntry::Entry(k, v) => {
-						walk_expr_uses(k, module, checked, variant_names, decls, out);
-						walk_expr_uses(v, module, checked, variant_names, decls, out);
+						walk_expr_uses(k, analysis, variant_names, decls, out);
+						walk_expr_uses(v, analysis, variant_names, decls, out);
 					}
-					MapEntry::Spread(e) => walk_expr_uses(e, module, checked, variant_names, decls, out),
+					MapEntry::Spread(e) => walk_expr_uses(e, analysis, variant_names, decls, out),
 				}
 			}
 		}
 		ExprKind::Range(kind) => match kind {
 			RangeKind::From(e) | RangeKind::To(e) | RangeKind::ToInclusive(e) => {
-				walk_expr_uses(e, module, checked, variant_names, decls, out);
+				walk_expr_uses(e, analysis, variant_names, decls, out);
 			}
 			RangeKind::Exclusive { min, max } | RangeKind::Inclusive { min, max } => {
-				walk_expr_uses(min, module, checked, variant_names, decls, out);
-				walk_expr_uses(max, module, checked, variant_names, decls, out);
+				walk_expr_uses(min, analysis, variant_names, decls, out);
+				walk_expr_uses(max, analysis, variant_names, decls, out);
 			}
 		},
 		ExprKind::Call { func, args, .. } => {
@@ -1132,34 +1340,79 @@ fn walk_expr_uses(
 			// and skip walking `func` further (it's fully classified);
 			// otherwise try the narrow name-set fallback, then fall back to
 			// treating `func` as an ordinary use (a real function call).
-			let resolved = checked.annotations.variant_of(expr.id).is_some();
+			let resolved = analysis.annotations.variant_of(expr.id).is_some();
 			if resolved {
 				match &func.kind {
 					ExprKind::Identifier(_) => out.push((func.span.start, (ENUM_MEMBER, 0))),
 					ExprKind::MemberAccess { member, .. } => {
 						out.push((member.1.start, (ENUM_MEMBER, 0)));
+						push_qualified_parent(func, out);
 					}
-					_ => walk_expr_uses(func, module, checked, variant_names, decls, out),
+					_ => walk_expr_uses(func, analysis, variant_names, decls, out),
 				}
+			} else if let Some(call) = analysis.annotations.generic_namespaced_call(expr.id)
+				&& let ExprKind::MemberAccess { parent, member, .. } = &func.kind
+			{
+				let role = stable_definition_role(analysis, &call.member).unwrap_or((METHOD, 0));
+				out.push((member.1.start, role));
+				out.push((parent.span.start, (TYPE, 0)));
+			} else if let Some(target) = analysis.annotations.definition_target_of(expr.id)
+				&& let ExprKind::MemberAccess { parent, member, .. } = &func.kind
+				&& let Some(role) = stable_definition_role(analysis, target)
+			{
+				out.push((member.1.start, role));
+				walk_expr_uses(parent, analysis, variant_names, decls, out);
+			} else if analysis.annotations.resolution_of(expr.id).is_some()
+				&& let ExprKind::MemberAccess { parent, member, .. } = &func.kind
+			{
+				out.push((member.1.start, (METHOD, 0)));
+				walk_expr_uses(parent, analysis, variant_names, decls, out);
 			} else if let ExprKind::Identifier(name) = &func.kind
 				&& is_unshadowed_variant(module, variant_names, name)
 			{
 				out.push((func.span.start, (ENUM_MEMBER, 0)));
 			} else {
-				walk_expr_uses(func, module, checked, variant_names, decls, out);
+				walk_expr_uses(func, analysis, variant_names, decls, out);
+			}
+			if let ExprKind::MemberAccess { parent, member, .. } = &func.kind
+				&& let ExprKind::Identifier(parent_name) = &parent.kind
+				&& let Some(role) =
+					nymph_sema::query::direct_member_parent_kind(analysis, func.id, &parent_name.0)
+						.map(definition_kind_role)
+						.or_else(|| nominal_parent_role(parent, analysis, decls))
+			{
+				out.push((parent.span.start, role));
+				out.push((
+					member.1.start,
+					(
+						if role.0 == NAMESPACE {
+							FUNCTION
+						} else {
+							METHOD
+						},
+						0,
+					),
+				));
 			}
 			for a in args {
 				if let Some(label) = &a.0.name {
 					out.push((label.1.start, (PROPERTY, 0)));
 				}
-				walk_expr_uses(&a.0.value, module, checked, variant_names, decls, out);
+				walk_expr_uses(&a.0.value, analysis, variant_names, decls, out);
 			}
 		}
 		ExprKind::MemberAccess { parent, member, .. } => {
 			// A qualified nullary reference (`Result.Ok`): the checker
 			// resolves the variant against the MemberAccess node's own id.
-			if checked.annotations.variant_of(expr.id).is_some() {
+			if analysis.annotations.variant_of(expr.id).is_some() {
 				out.push((member.1.start, (ENUM_MEMBER, 0)));
+				out.push((parent.span.start, (TYPE, 0)));
+			} else if analysis.annotations.resolution_of(expr.id).is_some() {
+				out.push((member.1.start, (METHOD, 0)));
+			} else if let Some(target) = analysis.annotations.definition_target_of(expr.id)
+				&& let Some(role) = stable_definition_role(analysis, target)
+			{
+				out.push((member.1.start, role));
 			} else if let Some(decl_span) = nymph_sema::query::definition_at(module, member.1.start)
 				&& let Some(&(ty, _)) = decls.get(&decl_span.start)
 				&& ty == METHOD
@@ -1171,39 +1424,46 @@ fn walk_expr_uses(
 				// default `push_token` applies when nothing here matches.
 				out.push((member.1.start, (METHOD, 0)));
 			}
-			walk_expr_uses(parent, module, checked, variant_names, decls, out);
+			if let ExprKind::Identifier(parent_name) = &parent.kind
+				&& let Some(kind) =
+					nymph_sema::query::direct_member_parent_kind(analysis, expr.id, &parent_name.0)
+			{
+				out.push((parent.span.start, definition_kind_role(kind)));
+			} else {
+				walk_expr_uses(parent, analysis, variant_names, decls, out);
+			}
 		}
 		ExprKind::IndexAccess { parent, index, .. } => {
-			walk_expr_uses(parent, module, checked, variant_names, decls, out);
-			walk_expr_uses(index, module, checked, variant_names, decls, out);
+			walk_expr_uses(parent, analysis, variant_names, decls, out);
+			walk_expr_uses(index, analysis, variant_names, decls, out);
 		}
 		ExprKind::Closure { body, .. } => {
-			walk_expr_uses(body, module, checked, variant_names, decls, out);
+			walk_expr_uses(body, analysis, variant_names, decls, out);
 		}
 		ExprKind::PrefixOp { value, .. } | ExprKind::PostfixOp { value, .. } => {
-			walk_expr_uses(value, module, checked, variant_names, decls, out);
+			walk_expr_uses(value, analysis, variant_names, decls, out);
 		}
 		ExprKind::BinaryOp { lhs, rhs, .. } | ExprKind::AssignOp { lhs, rhs, .. } => {
-			walk_expr_uses(lhs, module, checked, variant_names, decls, out);
-			walk_expr_uses(rhs, module, checked, variant_names, decls, out);
+			walk_expr_uses(lhs, analysis, variant_names, decls, out);
+			walk_expr_uses(rhs, analysis, variant_names, decls, out);
 		}
 		ExprKind::TypeOp { lhs, .. } => {
-			walk_expr_uses(lhs, module, checked, variant_names, decls, out);
+			walk_expr_uses(lhs, analysis, variant_names, decls, out);
 		}
 		ExprKind::PatternOp { lhs, rhs, .. } => {
-			walk_expr_uses(lhs, module, checked, variant_names, decls, out);
-			walk_pattern_uses(rhs, module, checked, variant_names, out);
+			walk_expr_uses(lhs, analysis, variant_names, decls, out);
+			walk_pattern_uses(rhs, analysis, variant_names, out);
 		}
 		ExprKind::Return { value, .. } | ExprKind::Break { value, .. } => {
 			if let Some(v) = value {
-				walk_expr_uses(v, module, checked, variant_names, decls, out);
+				walk_expr_uses(v, analysis, variant_names, decls, out);
 			}
 		}
 		ExprKind::While {
 			condition, body, ..
 		} => {
-			walk_expr_uses(condition, module, checked, variant_names, decls, out);
-			walk_expr_uses(body, module, checked, variant_names, decls, out);
+			walk_expr_uses(condition, analysis, variant_names, decls, out);
+			walk_expr_uses(body, analysis, variant_names, decls, out);
 		}
 		ExprKind::For {
 			variable,
@@ -1211,42 +1471,68 @@ fn walk_expr_uses(
 			body,
 			..
 		} => {
-			walk_expr_uses(iterable, module, checked, variant_names, decls, out);
-			walk_pattern_uses(variable, module, checked, variant_names, out);
-			walk_expr_uses(body, module, checked, variant_names, decls, out);
+			walk_expr_uses(iterable, analysis, variant_names, decls, out);
+			walk_pattern_uses(variable, analysis, variant_names, out);
+			walk_expr_uses(body, analysis, variant_names, decls, out);
 		}
 		ExprKind::If {
 			condition,
 			then,
 			otherwise,
 		} => {
-			walk_expr_uses(condition, module, checked, variant_names, decls, out);
-			walk_expr_uses(then, module, checked, variant_names, decls, out);
+			walk_expr_uses(condition, analysis, variant_names, decls, out);
+			walk_expr_uses(then, analysis, variant_names, decls, out);
 			if let Some(o) = otherwise {
-				walk_expr_uses(o, module, checked, variant_names, decls, out);
+				walk_expr_uses(o, analysis, variant_names, decls, out);
 			}
 		}
 		ExprKind::Match { value, arms } => {
-			walk_expr_uses(value, module, checked, variant_names, decls, out);
+			walk_expr_uses(value, analysis, variant_names, decls, out);
 			for arm in arms {
-				walk_pattern_uses(&arm.pattern, module, checked, variant_names, out);
+				walk_pattern_uses(&arm.pattern, analysis, variant_names, out);
 				if let Some(g) = &arm.guard {
-					walk_expr_uses(g, module, checked, variant_names, decls, out);
+					walk_expr_uses(g, analysis, variant_names, decls, out);
 				}
-				walk_expr_uses(&arm.body, module, checked, variant_names, decls, out);
+				walk_expr_uses(&arm.body, analysis, variant_names, decls, out);
 			}
 		}
 		ExprKind::Block { body, .. } => {
 			for stmt in body {
 				match &stmt.0 {
-					Statement::Expr(e) => walk_expr_uses(e, module, checked, variant_names, decls, out),
+					Statement::Expr(e) => walk_expr_uses(e, analysis, variant_names, decls, out),
 					Statement::Let { value, .. } => {
-						walk_expr_uses(value, module, checked, variant_names, decls, out);
+						walk_expr_uses(value, analysis, variant_names, decls, out);
 					}
 				}
 			}
 		}
-		ExprKind::Grouped(e) => walk_expr_uses(e, module, checked, variant_names, decls, out),
+		ExprKind::Grouped(e) => walk_expr_uses(e, analysis, variant_names, decls, out),
+	}
+}
+
+fn nominal_parent_role(
+	parent: &Expr,
+	analysis: &SemanticAnalysis,
+	decls: &RoleMap,
+) -> Option<(u32, u32)> {
+	let ExprKind::Identifier(name) = &parent.kind else {
+		return None;
+	};
+	if let Some(decl_span) = nymph_sema::query::definition_at(&analysis.module, parent.span.start) {
+		return decls
+			.get(&decl_span.start)
+			.and_then(|&(ty, _)| matches!(ty, TYPE | NAMESPACE).then_some((ty, 0)));
+	}
+	nymph_sema::query::definition_kind_by_name(analysis, &name.0)
+		.map(definition_kind_role)
+		.filter(|(ty, _)| matches!(*ty, TYPE | NAMESPACE))
+}
+
+fn push_qualified_parent(expr: &Expr, out: &mut Vec<(usize, (u32, u32))>) {
+	if let ExprKind::MemberAccess { parent, .. } = &expr.kind
+		&& matches!(parent.kind, ExprKind::Identifier(_))
+	{
+		out.push((parent.span.start, (TYPE, 0)));
 	}
 }
 
@@ -1264,17 +1550,15 @@ fn walk_expr_uses(
 /// itself resolved as a variant.
 fn walk_pattern_uses(
 	pattern: &Spanned<Pattern>,
-	module: &Module,
-	checked: &Checked,
+	analysis: &SemanticAnalysis,
 	variant_names: &HashSet<&str>,
 	out: &mut Vec<(usize, (u32, u32))>,
 ) {
-	if checked.annotations.pattern_variant_of(pattern.1).is_some() {
+	let module = &analysis.module;
+	if analysis.annotations.pattern_variant_of(pattern.1).is_some() {
 		match &pattern.0 {
 			Pattern::Struct { path, .. } => {
-				if let Some(last) = path.last() {
-					out.push((last.1.start, (ENUM_MEMBER, 0)));
-				}
+				push_variant_pattern_path(path, out);
 			}
 			Pattern::Binding { name, .. } => out.push((name.1.start, (ENUM_MEMBER, 0))),
 			_ => {}
@@ -1285,7 +1569,7 @@ fn walk_pattern_uses(
 				if let Some(last) = path.last()
 					&& is_unshadowed_variant(module, variant_names, last)
 				{
-					out.push((last.1.start, (ENUM_MEMBER, 0)));
+					push_variant_pattern_path(path, out);
 				}
 			}
 			Pattern::Binding { name, inner }
@@ -1299,19 +1583,19 @@ fn walk_pattern_uses(
 	}
 
 	match &pattern.0 {
-		Pattern::Binding { inner, .. } => walk_pattern_uses(inner, module, checked, variant_names, out),
+		Pattern::Binding { inner, .. } => walk_pattern_uses(inner, analysis, variant_names, out),
 		Pattern::List(items) | Pattern::Tuple(items) => {
 			for item in items {
 				if let ListPatternEntry::Item(p) = &item.0 {
-					walk_pattern_uses(p, module, checked, variant_names, out);
+					walk_pattern_uses(p, analysis, variant_names, out);
 				}
 			}
 		}
 		Pattern::Map(entries) => {
 			for entry in entries {
 				if let MapPatternEntry::Entry(k, v) = &entry.0 {
-					walk_pattern_uses(k, module, checked, variant_names, out);
-					walk_pattern_uses(v, module, checked, variant_names, out);
+					walk_pattern_uses(k, analysis, variant_names, out);
+					walk_pattern_uses(v, analysis, variant_names, out);
 				}
 			}
 		}
@@ -1320,10 +1604,10 @@ fn walk_pattern_uses(
 				match &field.0 {
 					StructPatternField::Value { name, value } => {
 						out.push((name.1.start, (PROPERTY, 0)));
-						walk_pattern_uses(value, module, checked, variant_names, out);
+						walk_pattern_uses(value, analysis, variant_names, out);
 					}
 					StructPatternField::Positional(value) => {
-						walk_pattern_uses(value, module, checked, variant_names, out);
+						walk_pattern_uses(value, analysis, variant_names, out);
 					}
 					StructPatternField::Named(name) => out.push((name.1.start, (PROPERTY, 0))),
 					StructPatternField::Rest => {}
@@ -1331,11 +1615,20 @@ fn walk_pattern_uses(
 			}
 		}
 		Pattern::Union(a, b) => {
-			walk_pattern_uses(a, module, checked, variant_names, out);
-			walk_pattern_uses(b, module, checked, variant_names, out);
+			walk_pattern_uses(a, analysis, variant_names, out);
+			walk_pattern_uses(b, analysis, variant_names, out);
 		}
-		Pattern::Grouped(inner) => walk_pattern_uses(inner, module, checked, variant_names, out),
+		Pattern::Grouped(inner) => walk_pattern_uses(inner, analysis, variant_names, out),
 		_ => {}
+	}
+}
+
+fn push_variant_pattern_path(path: &[Ident], out: &mut Vec<(usize, (u32, u32))>) {
+	if path.len() == 2 {
+		out.push((path[0].1.start, (TYPE, 0)));
+	}
+	if let Some(last) = path.last() {
+		out.push((last.1.start, (ENUM_MEMBER, 0)));
 	}
 }
 
@@ -1572,6 +1865,36 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 	}
 
 	#[test]
+	fn comments_inside_nested_interpolations_are_comments_without_string_overlap() {
+		let text =
+			"func main(value: int): string = \"${/* outer */ value + \"${/* nested */ value}\"}\"";
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		for needle in ["/* outer */", "/* nested */"] {
+			let offset = text.find(needle).unwrap();
+			let (line, col) = line_col(text, offset);
+			let comment = find(&decoded, line, col);
+			assert_eq!(comment.type_name, "comment", "{needle}");
+			assert_eq!(comment.len, needle.len() as u32, "{needle}");
+		}
+	}
+
+	#[test]
+	fn a_crlf_line_comment_inside_interpolation_is_recovered_without_the_carriage_return() {
+		let text = "func main(value: int): string = \"${ // comment\r\nvalue }\"";
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		let offset = text.find("// comment").unwrap();
+		let (line, col) = line_col(text, offset);
+		let comment = find(&decoded, line, col);
+		assert_eq!(comment.type_name, "comment");
+		assert_eq!(comment.len, "// comment".len() as u32);
+		assert_eq!(find(&decoded, 1, 0).type_name, "parameter");
+	}
+
+	#[test]
 	fn a_let_binding_is_variable_with_readonly_unless_mut() {
 		let text = "func main(): int = { let x = 1\n  let mut y = 2\n  x + y }";
 		let decoded = tokens_for(text);
@@ -1605,6 +1928,58 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 	}
 
 	#[test]
+	fn crlf_multiline_tokens_exclude_carriage_returns_and_keep_utf16_lengths() {
+		let text = "// 😀\r\n/* a😀\r\n𝔘 */\r\nlet s = \"😀\r\nx\"";
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		let line_comment = find(&decoded, 0, 0);
+		assert_eq!(line_comment.type_name, "comment");
+		assert_eq!(line_comment.len, 5); // `// ` + one astral character.
+
+		let block_first = find(&decoded, 1, 0);
+		assert_eq!(block_first.type_name, "comment");
+		assert_eq!(block_first.len, 6); // `/* a` + one astral character.
+		let block_second = find(&decoded, 2, 0);
+		assert_eq!(block_second.type_name, "comment");
+		assert_eq!(block_second.len, 5); // one astral character + ` */`.
+
+		let string_first = find(&decoded, 3, 8);
+		assert_eq!(string_first.type_name, "string");
+		assert_eq!(string_first.len, 3); // opening quote + astral character.
+		let string_second = find(&decoded, 4, 0);
+		assert_eq!(string_second.type_name, "string");
+		assert_eq!(string_second.len, 2); // `x"`.
+	}
+
+	#[test]
+	fn equivalent_non_authoritative_uri_uses_its_own_source_for_ranges() {
+		let canonical: Uri = "file:///semtok_equivalent.nym".parse().unwrap();
+		let equivalent: Uri = "file:///semtok_%65quivalent.nym".parse().unwrap();
+		let canonical_source = "func first(): int = 1";
+		let authoritative_source = "// 😀\nfunc second(): int = 2";
+		let mut docs = DocumentStore::default();
+		let mut state = crate::compiler_state::CompilerState::new();
+		state
+			.open(&mut docs, canonical.clone(), canonical_source.into(), 1)
+			.unwrap();
+		state
+			.open(&mut docs, equivalent, authoritative_source.into(), 2)
+			.unwrap();
+
+		let snapshot = state.analysis_for_uri(&docs, &canonical).unwrap();
+		assert_eq!(snapshot.source.as_ref(), authoritative_source);
+		assert_eq!(snapshot.document_source.as_ref(), canonical_source);
+		let result = semantic_tokens_snapshot(&snapshot, &params(&canonical)).unwrap();
+		let SemanticTokensResult::Tokens(tokens) = result else {
+			panic!("expected full semantic tokens");
+		};
+		let decoded = decode(&tokens.data);
+		assert!(decoded.iter().all(|token| token.line == 0), "{decoded:?}");
+		assert_eq!(find(&decoded, 0, 5).type_name, "variable");
+	}
+
+	#[test]
 	fn returns_none_for_an_unopened_document() {
 		let uri: Uri = "file:///semtok_missing.nym".parse().unwrap();
 		let docs = DocumentStore::default();
@@ -1621,6 +1996,20 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 			result.is_some(),
 			"expected tokens even over a broken buffer"
 		);
+	}
+
+	#[test]
+	fn unterminated_literals_do_not_turn_embedded_slashes_into_comments() {
+		for text in [
+			"func main(): string = \"unterminated // string",
+			"func main(): char = 'unterminated // char",
+		] {
+			let decoded = tokens_for(text);
+			assert!(
+				decoded.iter().all(|token| token.type_name != "comment"),
+				"malformed literal produced a false comment token: {decoded:?}"
+			);
+		}
 	}
 
 	#[test]
@@ -1730,16 +2119,151 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 	}
 
 	#[test]
-	fn a_this_field_accesss_name_stays_the_variable_default() {
-		// `this.x` names a FIELD, not a method — `definition_at` cannot
-		// resolve it to a method decl, so it must NOT classify as `method`.
+	fn a_this_field_accesss_name_classifies_as_property() {
 		let text = "struct Point(x: int) {\n  func get(): int = this.x\n}";
 		let decoded = tokens_for(text);
 		assert_sorted_and_non_overlapping(&decoded);
 
 		let use_offset = text.rfind("this.x").unwrap() + "this.".len();
 		let (use_line, use_col) = line_col(text, use_offset);
+		assert_eq!(find(&decoded, use_line, use_col).type_name, "property");
+	}
+
+	#[test]
+	fn namespace_declarations_functions_and_values_use_their_semantic_roles() {
+		let text = "namespace Config {\n  func load(): int = 1\n  let count: int = 1\n}\nfunc main(): int = Config.load() + Config.count";
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		let declaration_offset = text.find("Config").unwrap();
+		let (declaration_line, declaration_col) = line_col(text, declaration_offset);
+		let declaration = find(&decoded, declaration_line, declaration_col);
+		assert_eq!(declaration.type_name, "namespace");
+		assert!(declaration.modifiers.contains(&"declaration"));
+
+		let function_decl_offset = text.find("load").unwrap();
+		let (function_decl_line, function_decl_col) = line_col(text, function_decl_offset);
+		let function_decl = find(&decoded, function_decl_line, function_decl_col);
+		assert_eq!(function_decl.type_name, "function");
+		assert!(function_decl.modifiers.contains(&"declaration"));
+
+		for namespace_use_offset in [
+			text.find("Config.load").unwrap(),
+			text.rfind("Config").unwrap(),
+		] {
+			let (namespace_use_line, namespace_use_col) = line_col(text, namespace_use_offset);
+			let namespace_use = find(&decoded, namespace_use_line, namespace_use_col);
+			assert_eq!(namespace_use.type_name, "namespace");
+			assert!(namespace_use.modifiers.is_empty());
+		}
+
+		let function_use_offset = text.rfind("load").unwrap();
+		let (function_use_line, function_use_col) = line_col(text, function_use_offset);
+		assert_eq!(
+			find(&decoded, function_use_line, function_use_col).type_name,
+			"function"
+		);
+
+		let use_offset = text.rfind("count").unwrap();
+		let (use_line, use_col) = line_col(text, use_offset);
 		assert_eq!(find(&decoded, use_line, use_col).type_name, "variable");
+	}
+
+	#[test]
+	fn nominal_and_generic_static_calls_classify_qualifiers_and_members() {
+		let text = "interface Default {\n  func default(): self\n}\nstruct Point(x: int) {\n  namespace func origin(): Point = Point(x = 0)\n}\nfunc local(): Point = Point.origin()\nfunc generic<T: Default>(): T = T.default()";
+		let parsed = nymph_syntax::parse_module(text, "static-calls.nym");
+		assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+		let checked = nymph_sema::check_module(&parsed.tree);
+		assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		let nominal_offset = text.find("Point.origin").unwrap();
+		let (nominal_line, nominal_col) = line_col(text, nominal_offset);
+		assert_eq!(find(&decoded, nominal_line, nominal_col).type_name, "type");
+		assert_eq!(
+			find(&decoded, nominal_line, nominal_col + "Point.".len() as u32).type_name,
+			"method"
+		);
+
+		let generic_offset = text.find("T.default()").unwrap();
+		let (generic_line, generic_col) = line_col(text, generic_offset);
+		assert_eq!(find(&decoded, generic_line, generic_col).type_name, "type");
+		assert_eq!(
+			find(&decoded, generic_line, generic_col + "T.".len() as u32).type_name,
+			"method"
+		);
+	}
+
+	#[test]
+	fn first_class_namespace_and_static_functions_keep_their_roles() {
+		let text = "namespace Host {\n  func emit(): int = 1\n}\nstruct Point(x: int) {\n  namespace func origin(): Point = Point(x = 0)\n}\nfunc read(): int = {\n  let emit = Host.emit\n  let origin = Point.origin\n  emit() + origin().x\n}";
+		let parsed = nymph_syntax::parse_module(text, "first-class-statics.nym");
+		assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+		let checked = nymph_sema::check_module(&parsed.tree);
+		assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		for (qualified, qualifier_role, member_role) in [
+			("Host.emit", "namespace", "function"),
+			("Point.origin", "type", "method"),
+		] {
+			let offset = text.find(qualified).unwrap();
+			let (line, col) = line_col(text, offset);
+			assert_eq!(find(&decoded, line, col).type_name, qualifier_role);
+			let member_col = col + qualified.find('.').unwrap() as u32 + 1;
+			let member = find(&decoded, line, member_col);
+			assert_eq!(member.type_name, member_role);
+			assert!(member.modifiers.is_empty());
+		}
+	}
+
+	#[test]
+	fn a_value_receiver_shadowing_a_nominal_stays_a_parameter() {
+		let text = "struct Box(value: int) {\n  func get(): int = this.value\n}\nfunc read(Box: Box): int = Box.get()";
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		let offset = text.rfind("Box.get()").unwrap();
+		let (line, col) = line_col(text, offset);
+		assert_eq!(find(&decoded, line, col).type_name, "parameter");
+		assert_eq!(
+			find(&decoded, line, col + "Box.".len() as u32).type_name,
+			"method"
+		);
+	}
+
+	#[test]
+	fn a_destructured_value_receiver_shadowing_a_nominal_stays_a_variable() {
+		let text = "struct Box(value: int) {\n  func get(): int = this.value\n}\nfunc read(#(Box, ignored): #(Box, int)): int = Box.get()";
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		let offset = text.rfind("Box.get()").unwrap();
+		let (line, col) = line_col(text, offset);
+		assert_eq!(find(&decoded, line, col).type_name, "variable");
+		assert_eq!(
+			find(&decoded, line, col + "Box.".len() as u32).type_name,
+			"method"
+		);
+	}
+
+	#[test]
+	fn a_qualified_enum_pattern_classifies_its_qualifier_and_variant() {
+		let text =
+			"enum Choice { One }\nfunc read(value: Choice): int = match (value) { Choice.One -> 1 }";
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		let offset = text.rfind("Choice.One").unwrap();
+		let (line, col) = line_col(text, offset);
+		assert_eq!(find(&decoded, line, col).type_name, "type");
+		assert_eq!(
+			find(&decoded, line, col + "Choice.".len() as u32).type_name,
+			"enumMember"
+		);
 	}
 
 	#[test]

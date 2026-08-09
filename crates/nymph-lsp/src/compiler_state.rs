@@ -48,6 +48,10 @@ pub struct AnalysisSnapshot {
 	/// Identity of the complete open-document overlay state that produced this
 	/// analysis, including dependency overlays and document lifecycles.
 	pub document_revision: DocumentStoreRevision,
+	/// Exact text of the requested open URI. This normally aliases `source`,
+	/// but remains distinct when two equivalent URI spellings are open for the
+	/// same canonical module and another spelling is the authoritative overlay.
+	pub document_source: Arc<str>,
 	pub source: Arc<str>,
 	pub analysis: Arc<ModuleAnalysis>,
 	entry: ModulePath,
@@ -243,11 +247,14 @@ impl CompilerState {
 			!identity.without_prelude,
 		)?;
 		let source = analysis.source.clone();
+		let document_source = self.sources.get(uri)?.clone();
+		debug_assert_eq!(document_source.as_ref(), document.text);
 		Some(AnalysisSnapshot {
 			project: identity.project.clone(),
 			module: identity.module.clone(),
 			document_version: document.version,
 			document_revision: docs.revision(),
+			document_source,
 			source,
 			analysis,
 			entry: identity.entry.clone(),

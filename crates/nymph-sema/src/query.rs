@@ -1133,6 +1133,111 @@ pub fn stable_definition_at(
 		.map(|(_, target)| target.clone())
 }
 
+/// Return the semantic category of a stable declaration in this analysis's
+/// exact imported, ambient, and local definition arena.
+///
+/// Tooling must use this instead of rebuilding a source-local [`DefMap`]: a
+/// stable target recorded in [`crate::Annotations`] may belong to an imported
+/// module or the ambient prelude, and its checker-local [`crate::DefId`] is
+/// meaningful only inside the arena that produced the analysis.
+#[must_use]
+pub fn stable_definition_kind(
+	analysis: &crate::SemanticAnalysis,
+	target: &crate::DefinitionId,
+) -> Option<crate::DefKind> {
+	let semantic = &analysis.checked.semantic;
+	for namespace in semantic.signatures.namespaces.values() {
+		for member in namespace.members.values() {
+			match member {
+				crate::NamespaceMemberSig::Func {
+					target: Some(member_target),
+					..
+				} if member_target == target => return Some(crate::DefKind::Func),
+				crate::NamespaceMemberSig::Value {
+					target: Some(member_target),
+					..
+				} if member_target == target => return Some(crate::DefKind::Let),
+				_ => {}
+			}
+		}
+	}
+	if semantic.inherent.iter().any(|implementation| {
+		implementation
+			.methods
+			.values()
+			.any(|method| method.definition.as_ref() == Some(target))
+	}) {
+		return Some(crate::DefKind::Func);
+	}
+	let definition = semantic.definitions.by_stable(target)?;
+	if semantic.signatures.funcs.contains_key(&definition) {
+		return Some(crate::DefKind::Func);
+	}
+	if semantic.signatures.lets.contains_key(&definition) {
+		return Some(crate::DefKind::Let);
+	}
+	Some(semantic.definitions.data(definition).kind)
+}
+
+/// Return the semantic category bound to a source-visible name in this
+/// analysis's exact local/imported/prelude definition arena.
+///
+/// This complements [`stable_definition_kind`] for declaration syntax that
+/// introduces a local spelling without an expression node, notably import
+/// aliases. Whole-module import namespaces intentionally have no stable
+/// declaration ID, but they are still present in the checked definition map.
+#[must_use]
+pub fn definition_kind_by_name(
+	analysis: &crate::SemanticAnalysis,
+	name: &str,
+) -> Option<crate::DefKind> {
+	let semantic = &analysis.checked.semantic;
+	let definition = semantic.definitions.get(name)?;
+	Some(semantic.definitions.data(definition).kind)
+}
+
+/// Return the semantic category of an imported lexical binding in this
+/// analysis's exact definition arena.
+///
+/// Unlike a stable-target lookup, this also covers imported module namespace
+/// bindings: those are checker-owned synthetic definitions and deliberately do
+/// not pretend to have a source declaration identity.
+#[must_use]
+pub fn imported_definition_kind_by_name(
+	analysis: &crate::SemanticAnalysis,
+	name: &str,
+) -> Option<crate::DefKind> {
+	let semantic = &analysis.checked.semantic;
+	let definition = semantic.definitions.get(name)?;
+	let data = semantic.definitions.data(definition);
+	matches!(data.origin, crate::DefOrigin::Imported { .. }).then_some(data.kind)
+}
+
+/// Return the semantic category of the direct type/namespace parent selected
+/// by the checker for a qualified member expression.
+///
+/// The direct-member marker proves that `parent_name` was not a shadowing
+/// local. Looking it up in the producing analysis's arena therefore preserves
+/// the checker decision while also covering synthetic imported namespaces,
+/// which have no stable [`crate::DefinitionId`].
+#[must_use]
+pub fn direct_member_parent_kind(
+	analysis: &crate::SemanticAnalysis,
+	member: nymph_ast::NodeId,
+	parent_name: &str,
+) -> Option<crate::DefKind> {
+	if !analysis
+		.annotations
+		.direct_namespace_members()
+		.any(|candidate| candidate == member)
+	{
+		return None;
+	}
+	let semantic = &analysis.checked.semantic;
+	let definition = semantic.definitions.get(parent_name)?;
+	Some(semantic.definitions.data(definition).kind)
+}
+
 /// Find the definition site of the identifier (or bare enum variant, or
 /// type-position type name) at byte `offset` in `module`. Resolution order,
 /// mirroring `infer_identifier`'s shadowing: the nearest enclosing

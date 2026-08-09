@@ -281,7 +281,10 @@ fn main_loop(
 							let result = semantic_tokens::semantic_tokens_snapshot(&snapshot, &params);
 							prepare_semantic_tokens_response(docs, uri, &snapshot, result)
 						}
-						None => Some(None),
+						None => Some(semantic_tokens::semantic_tokens_for_open_document(
+							&docs.lock().unwrap(),
+							&params,
+						)),
 					};
 					if let Some(result) = response {
 						connection
@@ -1447,6 +1450,78 @@ mod tests {
 			"expected an `operator` token (the match arm `->`) in {:?}",
 			tokens.data
 		);
+
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn malformed_project_semantic_tokens_fall_back_over_the_wire() {
+		use lsp_types::{
+			PartialResultParams, SemanticTokensParams, SemanticTokensResult, TextDocumentIdentifier,
+			WorkDoneProgressParams,
+			request::{Request as _, SemanticTokensFullRequest},
+		};
+
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='malformed-semantic-tokens'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let path = temp.path().join("src/main.nym");
+		let text = "import @/missing with (\n// keep me\nfunc broken(): string = \"x ${1 + 2}\"";
+		std::fs::write(&path, text).unwrap();
+		let uri = crate::workspace::path_to_uri(&path).unwrap();
+
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		handshake(&client);
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidOpenTextDocument::METHOD.to_string(),
+				serde_json::to_value(DidOpenTextDocumentParams {
+					text_document: TextDocumentItem {
+						uri: uri.clone(),
+						language_id: "nymph".to_string(),
+						version: 1,
+						text: text.to_string(),
+					},
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(4),
+				SemanticTokensFullRequest::METHOD.to_string(),
+				serde_json::to_value(SemanticTokensParams {
+					work_done_progress_params: WorkDoneProgressParams::default(),
+					partial_result_params: PartialResultParams::default(),
+					text_document: TextDocumentIdentifier { uri },
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+
+		let result: Option<SemanticTokensResult> = loop {
+			if let Message::Response(response) = client.receiver.recv().unwrap() {
+				break serde_json::from_value(response.response_result.unwrap()).unwrap();
+			}
+		};
+		let SemanticTokensResult::Tokens(tokens) = result.expect("expected fallback tokens") else {
+			panic!("expected full tokens");
+		};
+		assert!(!tokens.data.is_empty());
+		for expected in [0, 1, 9, 10, 11] {
+			assert!(
+				tokens.data.iter().any(|token| token.token_type == expected),
+				"expected fixed-legend token type {expected} in {:?}",
+				tokens.data
+			);
+		}
 
 		shutdown(&client, handle);
 	}
