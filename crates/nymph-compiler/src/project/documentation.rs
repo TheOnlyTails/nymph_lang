@@ -672,10 +672,13 @@ fn module_url(path: &ModulePath) -> String {
 	format!("modules/{}.html", encode_path(path.as_str()))
 }
 fn definition_anchor(id: &DefinitionId) -> String {
-	format!("item-{}-{}", slug(&definition_name(id)), id.key.duplicate())
+	format!("item-{}", semantic_identity_slug(id))
 }
 fn implementation_anchor(id: &DefinitionId) -> String {
-	format!("implementation-{}", slug(&format!("{:?}", id.key)))
+	format!("implementation-{}", semantic_identity_slug(id))
+}
+fn semantic_identity_slug(id: &DefinitionId) -> String {
+	slug(&format!("{id:?}"))
 }
 fn encode_path(path: &str) -> String {
 	path.split('/').map(path_slug).collect::<Vec<_>>().join("/")
@@ -827,13 +830,13 @@ mod tests {
 	};
 
 	#[test]
-	fn doc_duplicate_semantic_ids_have_distinct_stable_anchors() {
+	fn doc_semantic_ids_have_distinct_stable_anchors() {
 		let identity = ModuleIdentity {
 			origin: ModuleOrigin::Project("test".into()),
 			project: "test".into(),
 			path: "main".into(),
 		};
-		let mut ids = StableIdBuilder::new(identity);
+		let mut ids = StableIdBuilder::new(identity.clone());
 		let first = ids.allocate(DeclarationKey::top_level(
 			DeclarationCategory::Function,
 			"same",
@@ -842,7 +845,26 @@ mod tests {
 			DeclarationCategory::Function,
 			"same",
 		));
-		assert_eq!(definition_anchor(&first), "item-same-0");
-		assert_eq!(definition_anchor(&second), "item-same-1");
+		let different_category = DefinitionId::new(
+			identity,
+			DeclarationKey::top_level(DeclarationCategory::Struct, "same"),
+		);
+		let different_module = DefinitionId::new(
+			ModuleIdentity {
+				origin: ModuleOrigin::Project("test".into()),
+				project: "test".into(),
+				path: "other".into(),
+			},
+			DeclarationKey::top_level(DeclarationCategory::Function, "same"),
+		);
+		let anchors = [
+			definition_anchor(&first),
+			definition_anchor(&second),
+			definition_anchor(&different_category),
+			definition_anchor(&different_module),
+		];
+		let unique = anchors.iter().collect::<std::collections::HashSet<_>>();
+		assert_eq!(unique.len(), anchors.len());
+		assert_eq!(anchors[0], definition_anchor(&first));
 	}
 }
