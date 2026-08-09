@@ -139,6 +139,17 @@ pub(crate) fn semantic_tokens_snapshot(
 	params: &SemanticTokensParams,
 ) -> Option<SemanticTokensResult> {
 	let _ = params;
+	if snapshot.source != snapshot.document_source {
+		// Equivalent URI spellings can be open with different text while sharing
+		// one canonical project module. The last notification remains the
+		// project's semantic authority, but its AST spans must never be encoded
+		// against another open buffer. Preserve source-correct lexical tokens for
+		// that non-authoritative spelling instead.
+		return Some(semantic_tokens_for_source(
+			&snapshot.document_source,
+			&RoleMap::default(),
+		));
+	}
 	let text = snapshot.source.as_ref();
 	let roles = build_role_map(&snapshot.analysis.semantic);
 	Some(semantic_tokens_for_source(text, &roles))
@@ -346,10 +357,12 @@ fn collect_comment_spans(
 	}
 }
 
-/// Scan `text[start..end]` for `//` and `/* … */` runs, pushing their spans in
-/// source order. Quoted runs are skipped because malformed strings/chars can
-/// remain in a lexical gap; an unterminated block comment runs to `end`
-/// (matching the lexer's own recovery).
+/// Conservatively scan a lexer gap for `//` and `/* … */` runs, pushing their
+/// spans in source order. Quoted runs are skipped because malformed
+/// strings/chars can remain in a lexical gap. Any other non-trivia source
+/// stops recovery rather than inventing a later comment inside malformed
+/// syntax. An unterminated block comment runs to `end` (matching the lexer's
+/// own recovery).
 fn scan_comments_into(text: &str, start: usize, end: usize, out: &mut Vec<Span>) {
 	let gap = &text[start..end];
 	let bytes = gap.as_bytes();
@@ -387,7 +400,14 @@ fn scan_comments_into(text: &str, start: usize, end: usize, out: &mut Vec<Span>)
 				}
 			}
 		} else {
-			i += 1;
+			let ch = gap[i..]
+				.chars()
+				.next()
+				.expect("gap index is always within the string");
+			if !ch.is_whitespace() {
+				break;
+			}
+			i += ch.len_utf8();
 		}
 	}
 }
@@ -506,19 +526,25 @@ fn walk_import_decl(decl: &Declaration, analysis: &SemanticAnalysis, map: &mut R
 	for segment in path {
 		map.insert(segment.1.start, (NAMESPACE, 0));
 	}
-	if let Some(binding) = alias.as_ref().or_else(|| path.last()) {
-		map.insert(binding.1.start, (NAMESPACE, DECLARATION));
+	if let Some(alias) = alias {
+		map.insert(alias.1.start, (NAMESPACE, DECLARATION));
+	} else if let Some(namespace) = path.last()
+		&& nymph_sema::query::imported_definition_kind_by_name(analysis, &namespace.0)
+			== Some(DefKind::Namespace)
+	{
+		map.insert(namespace.1.start, (NAMESPACE, DECLARATION));
 	}
 
 	for (source, alias) in idents.iter().flatten() {
 		let local = alias.as_ref().unwrap_or(source);
-		let (ty, mut modifiers) = nymph_sema::query::definition_kind_by_name(analysis, &local.0)
-			.map(definition_kind_role)
-			.unwrap_or((VARIABLE, 0));
-		modifiers |= DECLARATION;
-		map.insert(source.1.start, (ty, modifiers));
+		let Some(kind) = nymph_sema::query::imported_definition_kind_by_name(analysis, &local.0) else {
+			continue;
+		};
+		let (ty, modifiers) = definition_kind_role(kind);
+		let role = (ty, modifiers | DECLARATION);
+		map.insert(source.1.start, role);
 		if let Some(alias) = alias {
-			map.insert(alias.1.start, (ty, modifiers));
+			map.insert(alias.1.start, role);
 		}
 	}
 }
@@ -590,7 +616,7 @@ fn walk_decl(decl: &Declaration, map: &mut RoleMap) {
 		Declaration::Namespace { name, members, .. } => {
 			map.insert(name.1.start, (NAMESPACE, DECLARATION));
 			for m in members {
-				walk_impl_member(m, map);
+				walk_namespace_member(m, map);
 			}
 		}
 		Declaration::Interface {
@@ -699,6 +725,25 @@ fn walk_impl_member(m: &Spanned<ImplMember>, map: &mut RoleMap) {
 		ImplMember::ExternalFunc(_, _, meta) => {
 			bind_func(meta, METHOD, map);
 		}
+	}
+}
+
+fn walk_namespace_member(m: &Spanned<ImplMember>, map: &mut RoleMap) {
+	match &m.0 {
+		ImplMember::Let { meta, value, .. } => {
+			bind_let(meta, map);
+			walk_type_opt(&meta.type_, map);
+			walk_expr(value, map);
+		}
+		ImplMember::ExternalLet(_, _, meta) => {
+			bind_let(meta, map);
+			walk_type_opt(&meta.type_, map);
+		}
+		ImplMember::Func { meta, body, .. } => {
+			bind_func(meta, FUNCTION, map);
+			walk_expr(body, map);
+		}
+		ImplMember::ExternalFunc(_, _, meta) => bind_func(meta, FUNCTION, map),
 	}
 }
 
@@ -1086,12 +1131,22 @@ fn stable_definition_role(
 	target: &nymph_sema::DefinitionId,
 ) -> Option<(u32, u32)> {
 	match &target.key {
-		DeclarationKey::Member { category, .. } => {
+		DeclarationKey::Member {
+			owner, category, ..
+		} => {
 			return match category {
 				DeclarationCategory::Field => Some((PROPERTY, 0)),
 				DeclarationCategory::Method => {
-					match nymph_sema::query::stable_definition_kind(analysis, target)? {
-						DefKind::Let => Some((VARIABLE, 0)),
+					let kind = nymph_sema::query::stable_definition_kind(analysis, target)?;
+					match (&owner.key, kind) {
+						(
+							DeclarationKey::TopLevel {
+								category: DeclarationCategory::Namespace,
+								..
+							},
+							DefKind::Func,
+						) => Some((FUNCTION, 0)),
+						(_, DefKind::Let) => Some((VARIABLE, 0)),
 						_ => Some((METHOD, 0)),
 					}
 				}
@@ -1320,10 +1375,24 @@ fn walk_expr_uses(
 				walk_expr_uses(func, analysis, variant_names, decls, out);
 			}
 			if let ExprKind::MemberAccess { parent, member, .. } = &func.kind
-				&& let Some(role) = nominal_parent_role(parent, analysis, decls)
+				&& let ExprKind::Identifier(parent_name) = &parent.kind
+				&& let Some(role) =
+					nymph_sema::query::direct_member_parent_kind(analysis, func.id, &parent_name.0)
+						.map(definition_kind_role)
+						.or_else(|| nominal_parent_role(parent, analysis, decls))
 			{
 				out.push((parent.span.start, role));
-				out.push((member.1.start, (METHOD, 0)));
+				out.push((
+					member.1.start,
+					(
+						if role.0 == NAMESPACE {
+							FUNCTION
+						} else {
+							METHOD
+						},
+						0,
+					),
+				));
 			}
 			for a in args {
 				if let Some(label) = &a.0.name {
@@ -1344,9 +1413,6 @@ fn walk_expr_uses(
 				&& let Some(role) = stable_definition_role(analysis, target)
 			{
 				out.push((member.1.start, role));
-				if let Some(role) = nominal_parent_role(parent, analysis, decls) {
-					out.push((parent.span.start, role));
-				}
 			} else if let Some(decl_span) = nymph_sema::query::definition_at(module, member.1.start)
 				&& let Some(&(ty, _)) = decls.get(&decl_span.start)
 				&& ty == METHOD
@@ -1358,7 +1424,14 @@ fn walk_expr_uses(
 				// default `push_token` applies when nothing here matches.
 				out.push((member.1.start, (METHOD, 0)));
 			}
-			walk_expr_uses(parent, analysis, variant_names, decls, out);
+			if let ExprKind::Identifier(parent_name) = &parent.kind
+				&& let Some(kind) =
+					nymph_sema::query::direct_member_parent_kind(analysis, expr.id, &parent_name.0)
+			{
+				out.push((parent.span.start, definition_kind_role(kind)));
+			} else {
+				walk_expr_uses(parent, analysis, variant_names, decls, out);
+			}
 		}
 		ExprKind::IndexAccess { parent, index, .. } => {
 			walk_expr_uses(parent, analysis, variant_names, decls, out);
@@ -1880,6 +1953,33 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 	}
 
 	#[test]
+	fn equivalent_non_authoritative_uri_uses_its_own_source_for_ranges() {
+		let canonical: Uri = "file:///semtok_equivalent.nym".parse().unwrap();
+		let equivalent: Uri = "file:///semtok_%65quivalent.nym".parse().unwrap();
+		let canonical_source = "func first(): int = 1";
+		let authoritative_source = "// 😀\nfunc second(): int = 2";
+		let mut docs = DocumentStore::default();
+		let mut state = crate::compiler_state::CompilerState::new();
+		state
+			.open(&mut docs, canonical.clone(), canonical_source.into(), 1)
+			.unwrap();
+		state
+			.open(&mut docs, equivalent, authoritative_source.into(), 2)
+			.unwrap();
+
+		let snapshot = state.analysis_for_uri(&docs, &canonical).unwrap();
+		assert_eq!(snapshot.source.as_ref(), authoritative_source);
+		assert_eq!(snapshot.document_source.as_ref(), canonical_source);
+		let result = semantic_tokens_snapshot(&snapshot, &params(&canonical)).unwrap();
+		let SemanticTokensResult::Tokens(tokens) = result else {
+			panic!("expected full semantic tokens");
+		};
+		let decoded = decode(&tokens.data);
+		assert!(decoded.iter().all(|token| token.line == 0), "{decoded:?}");
+		assert_eq!(find(&decoded, 0, 5).type_name, "variable");
+	}
+
+	#[test]
 	fn returns_none_for_an_unopened_document() {
 		let uri: Uri = "file:///semtok_missing.nym".parse().unwrap();
 		let docs = DocumentStore::default();
@@ -2030,8 +2130,8 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 	}
 
 	#[test]
-	fn a_namespace_value_access_stays_variable_not_method() {
-		let text = "namespace Config { let count: int = 1 }\nfunc main(): int = Config.count";
+	fn namespace_declarations_functions_and_values_use_their_semantic_roles() {
+		let text = "namespace Config {\n  func load(): int = 1\n  let count: int = 1\n}\nfunc main(): int = Config.load() + Config.count";
 		let decoded = tokens_for(text);
 		assert_sorted_and_non_overlapping(&decoded);
 
@@ -2041,11 +2141,28 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 		assert_eq!(declaration.type_name, "namespace");
 		assert!(declaration.modifiers.contains(&"declaration"));
 
-		let namespace_use_offset = text.rfind("Config").unwrap();
-		let (namespace_use_line, namespace_use_col) = line_col(text, namespace_use_offset);
-		let namespace_use = find(&decoded, namespace_use_line, namespace_use_col);
-		assert_eq!(namespace_use.type_name, "namespace");
-		assert!(namespace_use.modifiers.is_empty());
+		let function_decl_offset = text.find("load").unwrap();
+		let (function_decl_line, function_decl_col) = line_col(text, function_decl_offset);
+		let function_decl = find(&decoded, function_decl_line, function_decl_col);
+		assert_eq!(function_decl.type_name, "function");
+		assert!(function_decl.modifiers.contains(&"declaration"));
+
+		for namespace_use_offset in [
+			text.find("Config.load").unwrap(),
+			text.rfind("Config").unwrap(),
+		] {
+			let (namespace_use_line, namespace_use_col) = line_col(text, namespace_use_offset);
+			let namespace_use = find(&decoded, namespace_use_line, namespace_use_col);
+			assert_eq!(namespace_use.type_name, "namespace");
+			assert!(namespace_use.modifiers.is_empty());
+		}
+
+		let function_use_offset = text.rfind("load").unwrap();
+		let (function_use_line, function_use_col) = line_col(text, function_use_offset);
+		assert_eq!(
+			find(&decoded, function_use_line, function_use_col).type_name,
+			"function"
+		);
 
 		let use_offset = text.rfind("count").unwrap();
 		let (use_line, use_col) = line_col(text, use_offset);
@@ -2080,7 +2197,7 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 	}
 
 	#[test]
-	fn first_class_namespace_and_static_functions_keep_method_roles() {
+	fn first_class_namespace_and_static_functions_keep_their_roles() {
 		let text = "namespace Host {\n  func emit(): int = 1\n}\nstruct Point(x: int) {\n  namespace func origin(): Point = Point(x = 0)\n}\nfunc read(): int = {\n  let emit = Host.emit\n  let origin = Point.origin\n  emit() + origin().x\n}";
 		let parsed = nymph_syntax::parse_module(text, "first-class-statics.nym");
 		assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
@@ -2089,13 +2206,16 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 		let decoded = tokens_for(text);
 		assert_sorted_and_non_overlapping(&decoded);
 
-		for (qualified, qualifier_role) in [("Host.emit", "namespace"), ("Point.origin", "type")] {
+		for (qualified, qualifier_role, member_role) in [
+			("Host.emit", "namespace", "function"),
+			("Point.origin", "type", "method"),
+		] {
 			let offset = text.find(qualified).unwrap();
 			let (line, col) = line_col(text, offset);
 			assert_eq!(find(&decoded, line, col).type_name, qualifier_role);
 			let member_col = col + qualified.find('.').unwrap() as u32 + 1;
 			let member = find(&decoded, line, member_col);
-			assert_eq!(member.type_name, "method");
+			assert_eq!(member.type_name, member_role);
 			assert!(member.modifiers.is_empty());
 		}
 	}
