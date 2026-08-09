@@ -120,7 +120,7 @@ fn complete(
 
 	let index = LineIndex::new(text);
 	let offset = index.offset(text, position);
-	let prefix = identifier_prefix(text, offset);
+	let (prefix, prefix_scope_offset) = identifier_prefix(text, offset);
 
 	let mut items = Vec::new();
 	let mut seen: HashSet<String> = HashSet::new();
@@ -128,6 +128,10 @@ fn complete(
 	// Locals/params in scope, innermost (nearest shadowing candidate) first.
 	let scope_names = query_with_whitespace_left_bias(text, offset, |candidate| {
 		nymph_sema::query::scope_names_at_exact(module, candidate)
+	})
+	.or_else(|| {
+		prefix_scope_offset
+			.and_then(|candidate| nymph_sema::query::scope_names_at_exact(module, candidate))
 	})
 	.unwrap_or_default();
 	push_tier(
@@ -193,6 +197,7 @@ fn imported_kind(kind: nymph_sema::query::ImportedNameKind) -> CompletionItemKin
 	match kind {
 		ImportedNameKind::Function => CompletionItemKind::FUNCTION,
 		ImportedNameKind::Value => CompletionItemKind::CONSTANT,
+		ImportedNameKind::Variable => CompletionItemKind::VARIABLE,
 		ImportedNameKind::TypeAlias => CompletionItemKind::CLASS,
 		ImportedNameKind::Struct => CompletionItemKind::STRUCT,
 		ImportedNameKind::Enum => CompletionItemKind::ENUM,
@@ -202,16 +207,31 @@ fn imported_kind(kind: nymph_sema::query::ImportedNameKind) -> CompletionItemKin
 	}
 }
 
-/// The identifier characters immediately before `offset`, i.e. the partial
-/// word being typed — ASCII-only, matching every keyword and every
-/// user-declared name in the surface grammar.
-fn identifier_prefix(text: &str, offset: usize) -> String {
-	let bytes = text.as_bytes();
-	let mut start = offset.min(bytes.len());
-	while start > 0 && (bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_') {
-		start -= 1;
+/// The lexer-recognized identifier characters immediately before `offset`,
+/// plus a scalar position inside that token for completion's half-open scope
+/// retry. This intentionally reuses the language's Unicode identifier rules.
+fn identifier_prefix(text: &str, offset: usize) -> (String, Option<usize>) {
+	let offset = offset.min(text.len());
+	let Some(token) = nymph_syntax::lex(text)
+		.tokens
+		.into_iter()
+		.find(|token| token.1.start < offset && offset <= token.1.end)
+	else {
+		return (String::new(), None);
+	};
+	let lexeme = &text[token.1.start..token.1.end];
+	if !matches!(token.0, nymph_ast::token::Token::Identifier(_))
+		&& lexeme != "_"
+		&& !KEYWORDS.contains(&lexeme)
+	{
+		return (String::new(), None);
 	}
-	text[start..offset.min(bytes.len())].to_string()
+	let prefix = &text[token.1.start..offset];
+	let scope_offset = prefix
+		.char_indices()
+		.next_back()
+		.map(|(relative, _)| token.1.start + relative);
+	(prefix.to_string(), scope_offset)
 }
 
 /// Every top-level declaration's own name and a matching [`CompletionItemKind`]
@@ -330,6 +350,32 @@ mod tests {
 			!labels.contains(&"func".to_string()),
 			"keyword `func` doesn't start with `fi`"
 		);
+	}
+
+	#[test]
+	fn completes_a_parameter_at_the_half_open_end_of_a_typed_prefix() {
+		let uri: Uri = "file:///complete_parameter_prefix.nym".parse().unwrap();
+		let text = "func main(parameter: int): int = par";
+		let docs = docs_with(&uri, text);
+		let character = text.encode_utf16().count() as u32;
+
+		let result = completion(&docs, &params(&uri, 0, character, None));
+		let labels = labels(result.expect("document is open"));
+
+		assert!(labels.contains(&"parameter".to_string()), "got {labels:?}");
+	}
+
+	#[test]
+	fn filters_with_an_astral_unicode_identifier_prefix() {
+		let uri: Uri = "file:///complete_unicode_prefix.nym".parse().unwrap();
+		let text = "func 𝔘value(): int = 1\nfunc main(): int = 𝔘v";
+		let docs = docs_with(&uri, text);
+		let character = text.lines().last().unwrap().encode_utf16().count() as u32;
+
+		let result = completion(&docs, &params(&uri, 1, character, None));
+		let labels = labels(result.expect("document is open"));
+
+		assert_eq!(labels, vec!["𝔘value".to_string()]);
 	}
 
 	#[test]

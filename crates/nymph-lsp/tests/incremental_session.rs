@@ -112,7 +112,7 @@ fn project_completion_uses_resolved_imports_ranking_kinds_and_shadowing() {
 	fs::create_dir(temp.path().join("src")).unwrap();
 	let main_path = temp.path().join("src/main.nym");
 	let dep_path = temp.path().join("src/dep.nym");
-	let source = "import @/dep with (call as imported_alias, spare, Shape, Choice as Selected, hidden)\nfunc z_local_top(): int = 1\nfunc main(): int = {\n  let imported_alias = 1\n  imported_alias\n}";
+	let source = "import @/dep with (call as imported_alias, spare, Shape, Choice as Selected, hidden)\nfunc z_local_top(): int = 1\nfunc main(): int = {\n  let imported_alias = 1\n  imported_alias\n  imported_ali";
 	fs::write(&main_path, source).unwrap();
 	fs::write(
 		&dep_path,
@@ -195,6 +195,66 @@ fn project_completion_uses_resolved_imports_ranking_kinds_and_shadowing() {
 		labels,
 		"LSP sortText must preserve tier order in clients"
 	);
+	let shadowed_prefix = completion_items(&compiler, &docs, &main_uri, 5, 14);
+	let alias = shadowed_prefix
+		.iter()
+		.find(|item| item.label == "imported_alias")
+		.expect("the lexical binding should complete from its typed prefix");
+	assert_eq!(alias.kind, Some(lsp_types::CompletionItemKind::VARIABLE));
+}
+
+#[test]
+fn project_completion_matches_variant_precedence_ambiguity_and_mutability() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='completion-collisions'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let source = "import @/first with (Remote, counter)\nimport @/second with (Other)\nenum Local { LocalAmbiguous }\nfunc TopCollision(): int = 1\nfunc main(): int = 1";
+	fs::write(&main_path, source).unwrap();
+	fs::write(
+		temp.path().join("src/first.nym"),
+		"public enum Remote { Unique, TopCollision, Ambiguous, LocalAmbiguous }\npublic let mut counter: int = 0",
+	)
+	.unwrap();
+	fs::write(
+		temp.path().join("src/second.nym"),
+		"public enum Other { Ambiguous }",
+	)
+	.unwrap();
+	let main_uri = uri(&main_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), source.into(), 1)
+		.unwrap();
+
+	let items = completion_items(&compiler, &docs, &main_uri, 4, 0);
+	let unique = items.iter().find(|item| item.label == "Unique").unwrap();
+	assert_eq!(
+		unique.kind,
+		Some(lsp_types::CompletionItemKind::ENUM_MEMBER)
+	);
+	let top_collision = items
+		.iter()
+		.find(|item| item.label == "TopCollision")
+		.unwrap();
+	assert_eq!(
+		top_collision.kind,
+		Some(lsp_types::CompletionItemKind::FUNCTION),
+		"an ordinary local definition wins semantic lookup over a variant"
+	);
+	for ambiguous in ["Ambiguous", "LocalAmbiguous"] {
+		assert!(
+			!items.iter().any(|item| item.label == ambiguous),
+			"an ambiguous bare variant must not be suggested: {ambiguous}"
+		);
+	}
+	let counter = items.iter().find(|item| item.label == "counter").unwrap();
+	assert_eq!(counter.kind, Some(lsp_types::CompletionItemKind::VARIABLE));
 }
 
 #[test]
@@ -304,6 +364,7 @@ fn unchanged_features_share_one_analysis_and_change_recomputes_once() {
 		partial_result_params: Default::default(),
 	};
 	assert!(semantic_tokens::semantic_tokens_full(&first, &token_params).is_some());
+	let first_completion = compiler.completion_for_uri(&docs, &uri).unwrap();
 	let initial_parse_count = parse.load(Ordering::Relaxed);
 	assert!(initial_parse_count >= 1);
 	assert_eq!(check.load(Ordering::Relaxed), 1);
@@ -311,6 +372,17 @@ fn unchanged_features_share_one_analysis_and_change_recomputes_once() {
 	compiler.change(&mut docs, &uri, source.into(), 2).unwrap();
 	let unchanged = compiler.analysis_for_uri(&docs, &uri).unwrap();
 	assert!(Arc::ptr_eq(&first.analysis, &unchanged.analysis));
+	let unchanged_completion = compiler.completion_for_uri(&docs, &uri).unwrap();
+	assert_eq!(unchanged_completion.document_version, 2);
+	let mut stale_completion_sent = false;
+	nymph_lsp::compiler_state::publish_completion_if_current(
+		&docs,
+		&uri,
+		&first_completion,
+		(),
+		|()| stale_completion_sent = true,
+	);
+	assert!(!stale_completion_sent);
 	assert_eq!(parse.load(Ordering::Relaxed), initial_parse_count);
 	assert_eq!(check.load(Ordering::Relaxed), 1);
 

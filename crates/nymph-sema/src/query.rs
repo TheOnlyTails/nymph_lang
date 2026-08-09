@@ -54,6 +54,7 @@ use crate::{
 pub enum ImportedNameKind {
 	Function,
 	Value,
+	Variable,
 	TypeAlias,
 	Struct,
 	Enum,
@@ -79,6 +80,7 @@ pub struct ImportedName {
 pub fn imported_names(
 	bindings: &FxHashMap<EcoString, ResolvedImportBinding>,
 	modules: &[Arc<ModuleEnvironment>],
+	module: &Module,
 ) -> Vec<ImportedName> {
 	let mut names = bindings
 		.iter()
@@ -92,7 +94,13 @@ pub fn imported_names(
 							DeclarationCategory::Function | DeclarationCategory::Method => {
 								ImportedNameKind::Function
 							}
-							DeclarationCategory::Let | DeclarationCategory::Field => ImportedNameKind::Value,
+							DeclarationCategory::Let | DeclarationCategory::Field => {
+								if imported_definition_is_mutable(definition, modules) {
+									ImportedNameKind::Variable
+								} else {
+									ImportedNameKind::Value
+								}
+							}
 							DeclarationCategory::TypeAlias => ImportedNameKind::TypeAlias,
 							DeclarationCategory::Struct => ImportedNameKind::Struct,
 							DeclarationCategory::Enum => ImportedNameKind::Enum,
@@ -121,6 +129,8 @@ pub fn imported_names(
 		.iter()
 		.map(|imported| imported.name.clone())
 		.collect::<HashSet<_>>();
+	let local_definitions = def::build_def_map(module, &mut Vec::new());
+	seen.extend(local_definitions.by_name.keys().map(ToString::to_string));
 	let imported_enums = bindings
 		.values()
 		.filter_map(|binding| match binding {
@@ -138,40 +148,64 @@ pub fn imported_names(
 			_ => None,
 		})
 		.collect::<HashSet<_>>();
-	let variants = modules.iter().flat_map(|module| match module.as_ref() {
-		ModuleEnvironment::Complete(interface) => interface
-			.exports
-			.iter()
-			.filter(|definition| imported_enums.contains(&definition.id))
-			.flat_map(|definition| {
-				definition
-					.variants
-					.iter()
-					.map(|variant| variant.name.as_str())
-			})
-			.collect::<Vec<_>>(),
-		ModuleEnvironment::Recovered(interface) => interface
-			.exports
-			.iter()
-			.filter(|definition| imported_enums.contains(&definition.id))
-			.flat_map(|definition| {
-				definition
-					.variants
-					.iter()
-					.map(|variant| variant.name.as_str())
-			})
-			.collect::<Vec<_>>(),
-	});
-	for variant in variants {
-		if seen.insert(variant.to_string()) {
+	let mut variants: FxHashMap<String, HashSet<crate::DefinitionId>> = FxHashMap::default();
+	for module in modules {
+		match module.as_ref() {
+			ModuleEnvironment::Complete(interface) => {
+				for definition in &interface.exports {
+					if imported_enums.contains(&definition.id) {
+						for variant in &definition.variants {
+							variants
+								.entry(variant.name.to_string())
+								.or_default()
+								.insert(variant.id.clone());
+						}
+					}
+				}
+			}
+			ModuleEnvironment::Recovered(interface) => {
+				for definition in &interface.exports {
+					if imported_enums.contains(&definition.id) {
+						for variant in &definition.variants {
+							variants
+								.entry(variant.name.to_string())
+								.or_default()
+								.insert(variant.id.clone());
+						}
+					}
+				}
+			}
+		}
+	}
+	for (variant, candidates) in variants {
+		if candidates.len() == 1
+			&& !local_definitions.variants.contains_key(variant.as_str())
+			&& seen.insert(variant.clone())
+		{
 			names.push(ImportedName {
-				name: variant.to_string(),
+				name: variant,
 				kind: ImportedNameKind::Variant,
 			});
 		}
 	}
 	names.sort_by(|left, right| left.name.cmp(&right.name));
 	names
+}
+
+fn imported_definition_is_mutable(
+	definition: &crate::DefinitionId,
+	modules: &[Arc<ModuleEnvironment>],
+) -> bool {
+	modules.iter().any(|module| match module.as_ref() {
+		ModuleEnvironment::Complete(interface) => interface.exports.iter().any(|candidate| {
+			candidate.id == *definition
+				&& candidate.declaration_kind == Some(crate::MemberKind::MutableValue)
+		}),
+		ModuleEnvironment::Recovered(interface) => interface.exports.iter().any(|candidate| {
+			candidate.id == *definition
+				&& candidate.declaration_kind == Some(crate::MemberKind::MutableValue)
+		}),
+	})
 }
 
 /// Find the type of the smallest checked expression covering byte `offset`
@@ -5116,9 +5150,10 @@ mod imported_name_tests {
 			}),
 		);
 		bindings.insert("private_or_missing".into(), ResolvedImportBinding::Poison);
+		let module = nymph_syntax::parse_module("", "test.nym").tree;
 
 		assert_eq!(
-			imported_names(&bindings, &[]),
+			imported_names(&bindings, &[], &module),
 			vec![
 				ImportedName {
 					name: "Shape".into(),

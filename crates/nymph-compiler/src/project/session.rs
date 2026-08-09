@@ -892,16 +892,17 @@ impl CompilerSession {
 		}
 		let source = input.source(&self.db)?;
 		let graph = queries::project_graph(&self.db, key);
+		let semantic_input = SemanticModuleInput::Project(input);
 		let modules = graph
-			.semantic_direct_dependencies(SemanticModuleInput::Project(input))
+			.semantic_direct_dependencies(semantic_input)
 			.iter()
 			.copied()
 			.map(|dependency| queries::interface_module_environment(&self.db, key, dependency))
 			.collect::<Vec<_>>();
 		let imported_names = nymph_sema::query::imported_names(
-			&queries::resolved_module_imports(&self.db, key, SemanticModuleInput::Project(input))
-				.bindings,
+			&queries::resolved_module_imports(&self.db, key, semantic_input).bindings,
 			&modules,
+			&semantic_input.parsed(&self.db).tree,
 		)
 		.into();
 		Some(ToolingCompletionAnalysis {
