@@ -321,10 +321,12 @@ fn comment_spans(text: &str, tokens: &[Spanned<Token>]) -> Vec<Span> {
 	spans
 }
 
-/// Scan `text[start..end]` (known to hold only whitespace and comments) for
-/// `//` and `/* … */` runs, pushing their spans in source order. An
-/// unterminated block comment runs to `end` (matches the lexer's own
-/// recovery).
+/// Conservatively scan a lexer gap for `//` and `/* … */` runs, pushing their
+/// spans in source order. Valid lexer gaps contain only whitespace and
+/// comments. Malformed tokens can leave arbitrary source in a gap, though, so
+/// scanning stops at the first non-trivia character rather than inventing a
+/// comment inside (for example) an unterminated string. An unterminated block
+/// comment runs to `end` (matches the lexer's own recovery).
 fn scan_comments_into(text: &str, start: usize, end: usize, out: &mut Vec<Span>) {
 	let gap = &text[start..end];
 	let bytes = gap.as_bytes();
@@ -349,7 +351,14 @@ fn scan_comments_into(text: &str, start: usize, end: usize, out: &mut Vec<Span>)
 				i = bytes.len();
 			}
 		} else {
-			i += 1;
+			let ch = gap[i..]
+				.chars()
+				.next()
+				.expect("gap index is always within the string");
+			if !ch.is_whitespace() {
+				break;
+			}
+			i += ch.len_utf8();
 		}
 	}
 }
@@ -360,25 +369,19 @@ fn scan_comments_into(text: &str, start: usize, end: usize, out: &mut Vec<Span>)
 /// literal newline). A single-line span yields exactly one piece.
 fn split_span_lines(text: &str, index: &LineIndex, span: Span) -> Vec<(u32, u32, u32)> {
 	let start_pos = index.position(text, span.start);
-	let end_pos = index.position(text, span.end);
-	if start_pos.line == end_pos.line {
-		return vec![(
-			start_pos.line,
-			start_pos.character,
-			end_pos.character - start_pos.character,
-		)];
-	}
-
 	let mut pieces = Vec::new();
 	let mut line = start_pos.line;
 	let mut char_start = start_pos.character;
 	let mut len: u32 = 0;
-	for ch in text[span.start..span.end].chars() {
+	for (relative, ch) in text[span.start..span.end].char_indices() {
 		if ch == '\n' {
 			pieces.push((line, char_start, len));
 			line += 1;
 			char_start = 0;
 			len = 0;
+		} else if ch == '\r' && text.as_bytes().get(span.start + relative + 1) == Some(&b'\n') {
+			// CRLF is one logical line terminator. Neither code unit belongs
+			// to the semantic token piece for the preceding line.
 		} else {
 			len += ch.len_utf16() as u32;
 		}
@@ -1749,6 +1752,58 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 		assert_eq!(comments[0].line, 0);
 		assert_eq!(comments[1].line, 1);
 		assert_eq!(comments[2].line, 2);
+	}
+
+	#[test]
+	fn malformed_unterminated_string_does_not_invent_comment_tokens() {
+		let text = "// real comment\nfunc broken(): string = \"not // a comment or /* one";
+		let decoded = tokens_for(text);
+		let comments = decoded
+			.iter()
+			.filter(|token| token.type_name == "comment")
+			.collect::<Vec<_>>();
+		assert_eq!(comments.len(), 1, "got {decoded:?}");
+		assert_eq!((comments[0].line, comments[0].col), (0, 0));
+	}
+
+	#[test]
+	fn crlf_token_pieces_exclude_line_terminators_and_keep_utf16_positions() {
+		let text = "// 😀\r\n/* a\r\nb */\r\nfunc f(): string = \"😀${f}\"";
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		let comments = decoded
+			.iter()
+			.filter(|token| token.type_name == "comment")
+			.collect::<Vec<_>>();
+		assert_eq!(comments.len(), 3, "got {decoded:?}");
+		assert_eq!(
+			comments
+				.iter()
+				.map(|token| (token.line, token.col, token.len))
+				.collect::<Vec<_>>(),
+			vec![(0, 0, 5), (1, 0, 4), (2, 0, 4)]
+		);
+
+		let interpolated_function = find(&decoded, 3, 24);
+		assert_eq!(interpolated_function.type_name, "function");
+		assert_eq!(interpolated_function.len, 1);
+	}
+
+	#[test]
+	fn multiline_string_crlf_pieces_exclude_the_carriage_return() {
+		let decoded = tokens_for("\"a\r\nb\"");
+		let strings = decoded
+			.iter()
+			.filter(|token| token.type_name == "string")
+			.collect::<Vec<_>>();
+		assert_eq!(
+			strings
+				.iter()
+				.map(|token| (token.line, token.col, token.len))
+				.collect::<Vec<_>>(),
+			vec![(0, 0, 2), (1, 0, 2)]
+		);
 	}
 
 	#[test]
