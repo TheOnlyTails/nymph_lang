@@ -282,6 +282,9 @@ struct SourceRecord {
 ///
 /// This intentionally exposes compiler values rather than Salsa inputs or a
 /// database handle, so tooling can safely retain the result between requests.
+/// Its semantic payload includes the exact imported, ambient-core, and local
+/// definition arena used to mint annotation types; position queries must not
+/// rebuild a source-local arena alongside those types.
 pub struct ModuleAnalysis {
 	pub semantic: Arc<nymph_sema::SemanticAnalysis>,
 	pub diagnostics: ProjectDiagnostics,

@@ -1,9 +1,10 @@
 //! A minimal position -> type query over a checked module, for the language
 //! server's `textDocument/hover` (`nymph-lsp`). Purely additive: it reads
-//! only the already-public [`Checked`] result and rebuilds a [`DefMap`] via
-//! [`crate::def::build_def_map`] to name `Adt` types — the one piece
-//! [`Checked`] doesn't carry (its own `DefMap` is dropped after checking).
-//! Nothing here touches `check.rs`/`prelude.rs`/`lower_hir.rs` internals.
+//! only the already-public [`Checked`] result, including the exact [`DefMap`]
+//! that minted its semantic types. That pairing matters for project checks:
+//! imported and ambient definitions occupy the same `DefId` arena as local
+//! definitions, so rebuilding a local-only map would misname them or index a
+//! different arena. Nothing here touches checker or lowering internals.
 //!
 //! # Contract
 //!
@@ -91,7 +92,7 @@ pub fn type_at(module: &Module, checked: &Checked, offset: usize) -> Option<Stri
 			checked.interner.kind(info.ty),
 			TyKind::Error | TyKind::Infer(_)
 		) {
-		let defs = def::build_def_map(module, &mut Vec::new());
+		let defs = &checked.semantic.definitions;
 		let params = generic_scope_at(module, offset);
 
 		// A call-site callee (`helper` in `helper()`): if it resolves to a
@@ -174,8 +175,8 @@ fn variant_hover_at(module: &Module, checked: &Checked, offset: usize) -> Option
 		.filter(|(span, _)| covers(*span, offset))
 		.min_by_key(|(span, _)| span.end - span.start)?;
 
-	let defs = def::build_def_map(module, &mut Vec::new());
-	render_variant_from_resolution(module, &defs, res)
+	let defs = &checked.semantic.definitions;
+	render_variant_from_resolution(module, defs, res)
 }
 
 /// Render a resolved `(enum, variant)` name pair as `EnumName.Variant(f: T,
@@ -1630,7 +1631,7 @@ fn collect_type_refs<'a>(ty: &'a Spanned<Type>, out: &mut Vec<(&'a Ident, Span)>
 // declaration names entirely. This fallback fires only when that primary
 // path yields nothing (no covering expr, a suppressed container, or a
 // missing/`Error`/`Infer` annotation) and mirrors the existing
-// `collect_decl_type_refs`/`pattern_bindings`/`build_def_map` walks used by
+// `collect_decl_type_refs`/`pattern_bindings` walks used by
 // go-to-definition/completion, rendering a TYPE at each tight, non-container
 // position instead of a span. Every candidate here keys off a narrow span —
 // a binder name, a param name, a decl name, a struct-field name, or an
@@ -1644,7 +1645,7 @@ fn collect_type_refs<'a>(ty: &'a Spanned<Type>, out: &mut Vec<(&'a Ident, Span)>
 /// fallback position (e.g. a keyword, an operator, or whitespace inside a
 /// suppressed container).
 fn fallback_type_at(module: &Module, checked: &Checked, offset: usize) -> Option<String> {
-	let defs = def::build_def_map(module, &mut Vec::new());
+	let defs = &checked.semantic.definitions;
 	let params = generic_scope_at(module, offset);
 
 	let mut candidates: Vec<(Span, String)> = Vec::new();
@@ -1862,13 +1863,7 @@ fn adt_generic_subst(
 	let TyKind::Adt(def_id, args) = checked.interner.kind(ty) else {
 		return FxHashMap::default();
 	};
-	let local = checked.semantic.local_definitions.clone();
-	let def_id = if local.contains(&(def_id.0 as usize)) {
-		DefId(def_id.0 - local.start as u32)
-	} else {
-		*def_id
-	};
-	generic_subst_from_adt(&checked.interner, defs, module, params, def_id, args)
+	generic_subst_from_adt(&checked.interner, defs, module, params, *def_id, args)
 }
 
 /// The surface keyword prefix for a declaration's [`Visibility`] (`"public

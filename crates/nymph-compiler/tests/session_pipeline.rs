@@ -57,6 +57,32 @@ fn module_analysis_type_at_handles_complex_pattern_binders() {
 }
 
 #[test]
+fn module_analysis_type_at_uses_the_checked_project_definition_arena() {
+	let source = "import @/dep with (Box)\nfunc keep(value: Box<int>): Option<Box<int>> = Some(value = value)\nenum Cell<T> { Filled(value: T) }\nfunc take(cell: Cell<int>): int = match (cell) { Filled(value) -> value }";
+	let files = FxHashMap::from_iter([
+		("main", source),
+		("dep", "public struct Box<T>(public value: T)"),
+	]);
+	let (session, project) = session(&files);
+	let analysis = session
+		.analyze_module(project, path("main"), path("main"), EntryMode::Library)
+		.unwrap();
+
+	for (needle, expected) in [
+		("Box<int>", "Box<int>"),
+		("Option<Box<int>>", "Option<Box<int>>"),
+		("value)", "Box<int>"),
+		("value) ->", "int"),
+	] {
+		assert_eq!(
+			analysis.type_at(source.find(needle).unwrap()).as_deref(),
+			Some(expected),
+			"hover fixture {needle:?}"
+		);
+	}
+}
+
+#[test]
 fn session_checks_and_compiles_a_representative_project() {
 	let files = FxHashMap::from_iter([
 		(

@@ -1,9 +1,13 @@
 //! `textDocument/hover`: the type of the smallest checked expression under
 //! the cursor.
 //!
-//! Hover consumes the compiler session's immutable analysis snapshot. The
-//! compiler-owned `ModuleAnalysis::type_at` seam pairs annotations with the
-//! exact flattened module that produced their ordinal semantic identities.
+//! Hover consumes the compiler session's immutable analysis snapshot. Project
+//! files therefore use the same effective sources, imports, aliases, embedded
+//! standard library, ambient prelude, generic substitutions, and dependency
+//! overlays as diagnostics. Loose saved files use a one-module library project
+//! with the ambient prelude; the VS Code client currently selects `file:`
+//! documents only. The compiler-owned `ModuleAnalysis::type_at` seam pairs
+//! annotations with the exact semantic definition arena that produced them.
 
 use lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 
