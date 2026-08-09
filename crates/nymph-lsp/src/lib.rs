@@ -2025,6 +2025,60 @@ mod tests {
 	}
 
 	#[test]
+	fn stale_did_change_after_close_does_not_resurrect_formatting_buffer() {
+		use lsp_types::request::{Formatting, Request as _};
+
+		let (server, client) = Connection::memory();
+		let docs = Arc::new(Mutex::new(DocumentStore::default()));
+		let docs_for_server = docs.clone();
+		let compiler = Arc::new(Mutex::new(compiler_state::CompilerState::new()));
+		let handle = std::thread::spawn(move || serve(server, docs_for_server, compiler));
+		handshake(&client);
+
+		let uri: Uri = "file:///stale-change-after-close.nym".parse().unwrap();
+		send_open(&client, uri.clone(), 1, "let value=1\n");
+		recv_diagnostics_for(&client, &uri);
+		send_close(&client, uri.clone());
+		recv_diagnostics_for(&client, &uri);
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidChangeTextDocument::METHOD.to_string(),
+				serde_json::to_value(DidChangeTextDocumentParams {
+					text_document: VersionedTextDocumentIdentifier {
+						uri: uri.clone(),
+						version: 2,
+					},
+					content_changes: vec![TextDocumentContentChangeEvent {
+						range: None,
+						range_length: None,
+						text: "let value=2\n".to_string(),
+					}],
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(40),
+				Formatting::METHOD.into(),
+				serde_json::json!({
+					"textDocument": { "uri": uri.as_str() },
+					"options": { "tabSize": 2, "insertSpaces": false }
+				}),
+			)))
+			.unwrap();
+		let response = recv_response(&client, 40);
+		let edits: Option<Vec<lsp_types::TextEdit>> =
+			serde_json::from_value(response.response_result.unwrap()).unwrap();
+		assert!(edits.is_none());
+
+		shutdown(&client, handle);
+		assert!(docs.lock().unwrap().get(&uri).is_none());
+	}
+
+	#[test]
 	fn document_and_range_formatting_requests_round_trip_through_the_wire() {
 		use lsp_types::{
 			TextEdit,

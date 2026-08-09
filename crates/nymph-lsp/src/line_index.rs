@@ -48,6 +48,7 @@ impl LineIndex {
 			Err(insert_at) => insert_at - 1,
 		};
 		let line_start = self.line_starts[line];
+		let offset = offset.min(self.line_content_end(text, line));
 		// UTF-16 column: count UTF-16 code units of every char strictly
 		// between the line start and `offset` (handles multi-byte UTF-8 and
 		// surrogate-pair-requiring astral characters alike).
@@ -76,12 +77,7 @@ impl LineIndex {
 	pub fn offset(&self, text: &str, position: Position) -> usize {
 		let line = (position.line as usize).min(self.line_starts.len() - 1);
 		let line_start = self.line_starts[line];
-		let line_end = self
-			.line_starts
-			.get(line + 1)
-			.copied()
-			.unwrap_or(self.text_len)
-			.min(text.len());
+		let line_end = self.line_content_end(text, line);
 		let slice = &text[line_start..line_end];
 
 		let mut utf16_count: u32 = 0;
@@ -92,6 +88,24 @@ impl LineIndex {
 			utf16_count += ch.len_utf16() as u32;
 		}
 		line_end
+	}
+
+	fn line_content_end(&self, text: &str, line: usize) -> usize {
+		let next_line_start = self.line_starts.get(line + 1).copied();
+		let line_end = next_line_start.unwrap_or(self.text_len).min(text.len());
+		// LSP columns address line content, not the CR/LF terminators. Without
+		// this clamp, an oversized column on one line becomes the start of the
+		// next line and can make a range request edit the wrong format unit.
+		if next_line_start.is_some() {
+			let line_end = text[..line_end]
+				.strip_suffix('\n')
+				.map_or(line_end, str::len);
+			text[..line_end]
+				.strip_suffix('\r')
+				.map_or(line_end, str::len)
+		} else {
+			line_end
+		}
 	}
 }
 
@@ -178,13 +192,25 @@ mod tests {
 	fn offset_round_trips_through_a_multi_byte_char_and_crlf() {
 		let text = "é𝔘x\r\nsecond";
 		let idx = LineIndex::new(text);
-		for (byte, _) in text.char_indices() {
+		for (byte, character) in text.char_indices() {
+			if matches!(character, '\r' | '\n') {
+				continue;
+			}
 			let pos = idx.position(text, byte);
 			assert_eq!(
 				idx.offset(text, pos),
 				byte,
 				"byte {byte} did not round-trip"
 			);
+		}
+	}
+
+	#[test]
+	fn oversized_columns_clamp_before_lf_and_crlf_terminators() {
+		for (text, expected) in [("abc\ndef", 3), ("abc\r\ndef", 3)] {
+			let idx = LineIndex::new(text);
+			assert_eq!(idx.offset(text, Position::new(0, u32::MAX)), expected);
+			assert_eq!(idx.offset(text, Position::new(1, u32::MAX)), text.len());
 		}
 	}
 }

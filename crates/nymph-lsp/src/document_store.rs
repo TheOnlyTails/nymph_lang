@@ -37,18 +37,19 @@ impl DocumentStore {
 		self.docs.insert(uri, Document { text, version });
 	}
 
-	/// Replace a document's full text (`textDocument/didChange` under FULL
-	/// sync — every change event carries the whole new text, so only the
-	/// last one in a batch matters). Inserts the document if it was somehow
-	/// not already open, rather than silently dropping the edit.
-	pub fn change_full(&mut self, uri: &Uri, text: String, version: i32) {
-		self.advance_revision();
-		if let Some(doc) = self.docs.get_mut(uri) {
-			doc.text = text;
-			doc.version = version;
-		} else {
-			self.docs.insert(uri.clone(), Document { text, version });
+	/// Replace an open document's full text (`textDocument/didChange` under
+	/// FULL sync — every change event carries the whole new text, so only the
+	/// last one in a batch matters). Returns `false` for a stale notification
+	/// received after `didClose`; only `didOpen` starts a document lifecycle.
+	pub fn change_full(&mut self, uri: &Uri, text: String, version: i32) -> bool {
+		if !self.docs.contains_key(uri) {
+			return false;
 		}
+		self.advance_revision();
+		let doc = self.docs.get_mut(uri).expect("document checked above");
+		doc.text = text;
+		doc.version = version;
+		true
 	}
 
 	/// Forget a closed document (`textDocument/didClose`).

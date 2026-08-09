@@ -166,7 +166,9 @@ impl CompilerState {
 		text: String,
 		version: i32,
 	) -> anyhow::Result<Vec<Uri>> {
-		docs.change_full(uri, text, version);
+		if !docs.change_full(uri, text, version) {
+			return Ok(Vec::new());
+		}
 		self.synchronize(docs, uri)?;
 		Ok(self.affected_project_documents(docs, uri))
 	}

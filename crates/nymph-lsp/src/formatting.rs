@@ -134,6 +134,19 @@ mod tests {
 	}
 
 	#[test]
+	fn oversized_range_column_does_not_select_the_next_crlf_line() {
+		let uri: Uri = "file:///format-range-clamp.nym".parse().unwrap();
+		let text = "let first=1\r\nlet second=2\r\n";
+		let mut docs = DocumentStore::default();
+		docs.open(uri.clone(), text.into(), 1);
+		let cursor = Position::new(0, u32::MAX);
+		let edits = document_range_formatting(&docs, &range_params(&uri, Range::new(cursor, cursor)))
+			.expect("valid range request");
+		assert_eq!(edits.len(), 1);
+		assert_eq!(apply(text, &edits[0]), "let first = 1\nlet second=2\r\n");
+	}
+
+	#[test]
 	fn range_formatting_is_safe_for_malformed_and_out_of_order_ranges() {
 		let uri: Uri = "file:///format-range-invalid.nym".parse().unwrap();
 		let mut docs = DocumentStore::default();
