@@ -535,7 +535,7 @@ fn project_semantic_tokens_use_imports_prelude_and_dependency_overlays() {
 	fs::create_dir(temp.path().join("src")).unwrap();
 	let main_path = temp.path().join("src/main.nym");
 	let dep_path = temp.path().join("src/dep.nym");
-	let source = "import @/dep with (Box as ImportedBox, Choice, Config, make as build)\nfunc use(box: ImportedBox): Option<Choice> = Some(value = build(box))\nfunc choose(): Choice = Choice.One\nfunc read(box: ImportedBox): int = box.get() + box.value + Config.count\nfunc construct(): ImportedBox = ImportedBox(value = 1)";
+	let source = "import @/dep with (Box as ImportedBox, Choice, Config, make as build)\nfunc use(box: ImportedBox): Option<Choice> = Some(value = build(box))\nfunc choose(): Choice = Choice.One\nfunc read(box: ImportedBox): int = box.get() + box.value + Config.count\nfunc construct(): ImportedBox = ImportedBox(value = 1)\nfunc qualified(): Choice = dep.make(ImportedBox(value = 1))";
 	let dependency = "public struct Box(public value: int) { func get(): int = this.value }\npublic enum Choice { One }\npublic namespace Config { public let count = 1 }\npublic func make(box: Box): Choice = Choice.One";
 	fs::write(&main_path, source).unwrap();
 	fs::write(&dep_path, dependency).unwrap();
@@ -547,7 +547,29 @@ fn project_semantic_tokens_use_imports_prelude_and_dependency_overlays() {
 		.open(&mut docs, main_uri.clone(), source.into(), 1)
 		.unwrap();
 
-	// Fixed legend indices: type=2, function=3, variable=5, enumMember=8.
+	// Fixed legend indices: type=2, function=3, variable=5, enumMember=8,
+	// namespace=12. Import-clause declarations keep the role of the exact
+	// imported binding rather than falling back to variable.
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "dep with"),
+		12
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "Box as"),
+		2
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "ImportedBox, Choice"),
+		2
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "make as"),
+		3
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "build)"),
+		3
+	);
 	assert_eq!(
 		semantic_token_type_at(&compiler, &docs, &main_uri, source, "ImportedBox):"),
 		2
@@ -583,6 +605,14 @@ fn project_semantic_tokens_use_imports_prelude_and_dependency_overlays() {
 	assert_eq!(
 		semantic_token_type_at(&compiler, &docs, &main_uri, source, "count\nfunc construct"),
 		5
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "dep.make"),
+		12
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "make(ImportedBox"),
+		3
 	);
 
 	// An unsaved dependency buffer is authoritative for the whole project.

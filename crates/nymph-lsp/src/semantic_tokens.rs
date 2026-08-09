@@ -55,8 +55,8 @@ use lsp_types::{
 use nymph_ast::{
 	Ident, Span, Spanned,
 	decl::{
-		Declaration, EnumVariant, FuncDeclaration, ImplMember, InterfaceElement, InterfaceMember,
-		LetDeclaration, Module, StructField, StructImpl,
+		Declaration, EnumVariant, FuncDeclaration, ImplMember, ImportRoot, InterfaceElement,
+		InterfaceMember, LetDeclaration, Module, StructField, StructImpl,
 	},
 	expr::{
 		Expr, ExprKind, ListItem, ListPatternEntry, MapEntry, MapPatternEntry, Pattern, RangeKind,
@@ -84,10 +84,6 @@ const ENUM_MEMBER: u32 = 8;
 const STRING: u32 = 9;
 const NUMBER: u32 = 10;
 const COMMENT: u32 = 11;
-#[expect(
-	dead_code,
-	reason = "reserved legend slot: no AST node currently classifies as namespace besides a top-level `namespace` name, which is handled as `type`; kept for a future refinement (import path segments)"
-)]
 const NAMESPACE: u32 = 12;
 
 const DECLARATION: u32 = 1 << 0;
@@ -443,7 +439,7 @@ fn build_role_map(analysis: &SemanticAnalysis) -> RoleMap {
 	let module = &analysis.module;
 	let mut map = RoleMap::new();
 	for decl in &module.members {
-		walk_decl(decl, &mut map);
+		walk_decl(decl, analysis, &mut map);
 	}
 
 	let variant_names = collect_enum_variant_names(module);
@@ -458,9 +454,46 @@ fn build_role_map(analysis: &SemanticAnalysis) -> RoleMap {
 	map
 }
 
-fn walk_decl(decl: &Declaration, map: &mut RoleMap) {
+fn walk_decl(decl: &Declaration, analysis: &SemanticAnalysis, map: &mut RoleMap) {
 	match decl {
-		Declaration::Import { .. } => {}
+		Declaration::Import {
+			root,
+			path,
+			alias,
+			idents,
+		} => {
+			if let ImportRoot::Package(package) = root {
+				map.insert(package.1.start, (NAMESPACE, 0));
+			}
+			for segment in path {
+				map.insert(segment.1.start, (NAMESPACE, 0));
+			}
+
+			if let Some(alias) = alias {
+				map.insert(alias.1.start, (NAMESPACE, DECLARATION));
+			} else if let Some(namespace) = path.last()
+				&& nymph_sema::query::imported_definition_kind_by_name(analysis, &namespace.0)
+					== Some(DefKind::Namespace)
+			{
+				map.insert(namespace.1.start, (NAMESPACE, DECLARATION));
+			}
+
+			for (source, alias) in idents.iter().flatten() {
+				let local = alias.as_ref().unwrap_or(source);
+				let Some(kind) = nymph_sema::query::imported_definition_kind_by_name(analysis, &local.0)
+				else {
+					continue;
+				};
+				let role = definition_kind_role(kind);
+				map.insert(
+					source.1.start,
+					(role.0, if alias.is_none() { DECLARATION } else { 0 }),
+				);
+				if let Some(alias) = alias {
+					map.insert(alias.1.start, (role.0, DECLARATION));
+				}
+			}
+		}
 		Declaration::Let { meta, value, .. } => {
 			bind_let(meta, map);
 			walk_type_opt(&meta.type_, map);
@@ -523,9 +556,9 @@ fn walk_decl(decl: &Declaration, map: &mut RoleMap) {
 			}
 		}
 		Declaration::Namespace { name, members, .. } => {
-			map.insert(name.1.start, (TYPE, DECLARATION));
+			map.insert(name.1.start, (NAMESPACE, DECLARATION));
 			for m in members {
-				walk_impl_member(m, map);
+				walk_namespace_member(m, map);
 			}
 		}
 		Declaration::Interface {
@@ -634,6 +667,25 @@ fn walk_impl_member(m: &Spanned<ImplMember>, map: &mut RoleMap) {
 		ImplMember::ExternalFunc(_, _, meta) => {
 			bind_func(meta, METHOD, map);
 		}
+	}
+}
+
+fn walk_namespace_member(m: &Spanned<ImplMember>, map: &mut RoleMap) {
+	match &m.0 {
+		ImplMember::Let { meta, value, .. } => {
+			bind_let(meta, map);
+			walk_type_opt(&meta.type_, map);
+			walk_expr(value, map);
+		}
+		ImplMember::ExternalLet(_, _, meta) => {
+			bind_let(meta, map);
+			walk_type_opt(&meta.type_, map);
+		}
+		ImplMember::Func { meta, body, .. } => {
+			bind_func(meta, FUNCTION, map);
+			walk_expr(body, map);
+		}
+		ImplMember::ExternalFunc(_, _, meta) => bind_func(meta, FUNCTION, map),
 	}
 }
 
@@ -978,12 +1030,22 @@ fn stable_definition_role(
 	target: &nymph_sema::DefinitionId,
 ) -> Option<(u32, u32)> {
 	match &target.key {
-		DeclarationKey::Member { category, .. } => {
+		DeclarationKey::Member {
+			owner, category, ..
+		} => {
 			return match category {
 				DeclarationCategory::Field => Some((PROPERTY, 0)),
 				DeclarationCategory::Method => {
-					match nymph_sema::query::stable_definition_kind(analysis, target)? {
-						DefKind::Let => Some((VARIABLE, 0)),
+					let kind = nymph_sema::query::stable_definition_kind(analysis, target)?;
+					match (&owner.key, kind) {
+						(
+							DeclarationKey::TopLevel {
+								category: DeclarationCategory::Namespace,
+								..
+							},
+							DefKind::Func,
+						) => Some((FUNCTION, 0)),
+						(_, DefKind::Let) => Some((VARIABLE, 0)),
 						_ => Some((METHOD, 0)),
 					}
 				}
@@ -1001,17 +1063,20 @@ fn stable_definition_role(
 		| DeclarationKey::Implementation { .. }
 		| DeclarationKey::RecoveredImplementation { .. } => {}
 	}
-	let ty = match nymph_sema::query::stable_definition_kind(analysis, target)? {
+	Some(definition_kind_role(
+		nymph_sema::query::stable_definition_kind(analysis, target)?,
+	))
+}
+
+fn definition_kind_role(kind: DefKind) -> (u32, u32) {
+	let ty = match kind {
 		DefKind::Func => FUNCTION,
-		DefKind::Struct
-		| DefKind::Enum
-		| DefKind::TypeAlias
-		| DefKind::Namespace
-		| DefKind::Interface => TYPE,
+		DefKind::Struct | DefKind::Enum | DefKind::TypeAlias | DefKind::Interface => TYPE,
+		DefKind::Namespace => NAMESPACE,
 		DefKind::Variant { .. } => ENUM_MEMBER,
 		DefKind::Let => VARIABLE,
 	};
-	Some((ty, 0))
+	(ty, 0)
 }
 
 fn walk_decl_uses(
@@ -1238,7 +1303,14 @@ fn walk_expr_uses(
 				// default `push_token` applies when nothing here matches.
 				out.push((member.1.start, (METHOD, 0)));
 			}
-			walk_expr_uses(parent, analysis, variant_names, decls, out);
+			if let ExprKind::Identifier(parent_name) = &parent.kind
+				&& let Some(kind) =
+					nymph_sema::query::direct_member_parent_kind(analysis, expr.id, &parent_name.0)
+			{
+				out.push((parent.span.start, definition_kind_role(kind)));
+			} else {
+				walk_expr_uses(parent, analysis, variant_names, decls, out);
+			}
 		}
 		ExprKind::IndexAccess { parent, index, .. } => {
 			walk_expr_uses(parent, analysis, variant_names, decls, out);
@@ -1816,14 +1888,34 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 	}
 
 	#[test]
-	fn a_namespace_value_access_stays_variable_not_method() {
-		let text = "namespace Config { let count: int = 1 }\nfunc main(): int = Config.count";
+	fn namespace_declarations_parents_functions_and_values_use_their_semantic_roles() {
+		let text = "namespace Config {\n  func load(): int = 1\n  let count: int = 1\n}\nfunc main(): int = Config.load() + Config.count";
 		let decoded = tokens_for(text);
 		assert_sorted_and_non_overlapping(&decoded);
 
-		let use_offset = text.rfind("count").unwrap();
-		let (use_line, use_col) = line_col(text, use_offset);
-		assert_eq!(find(&decoded, use_line, use_col).type_name, "variable");
+		let declaration = find(&decoded, 0, "namespace ".len() as u32);
+		assert_eq!(declaration.type_name, "namespace");
+		assert!(declaration.modifiers.contains(&"declaration"));
+
+		let function_decl = text.find("load").unwrap();
+		let (line, col) = line_col(text, function_decl);
+		assert_eq!(find(&decoded, line, col).type_name, "function");
+
+		for parent in [
+			text.find("Config.load").unwrap(),
+			text.rfind("Config.count").unwrap(),
+		] {
+			let (line, col) = line_col(text, parent);
+			assert_eq!(find(&decoded, line, col).type_name, "namespace");
+		}
+
+		let function_use = text.rfind("load").unwrap();
+		let (line, col) = line_col(text, function_use);
+		assert_eq!(find(&decoded, line, col).type_name, "function");
+
+		let value_use = text.rfind("count").unwrap();
+		let (line, col) = line_col(text, value_use);
+		assert_eq!(find(&decoded, line, col).type_name, "variable");
 	}
 
 	#[test]

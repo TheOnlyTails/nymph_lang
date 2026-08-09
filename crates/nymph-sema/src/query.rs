@@ -981,13 +981,9 @@ pub fn stable_definition_kind(
 	target: &crate::DefinitionId,
 ) -> Option<crate::DefKind> {
 	let semantic = &analysis.checked.semantic;
-	let definition = semantic.definitions.by_stable(target)?;
-	if semantic.signatures.funcs.contains_key(&definition) {
-		return Some(crate::DefKind::Func);
-	}
-	if semantic.signatures.lets.contains_key(&definition) {
-		return Some(crate::DefKind::Let);
-	}
+	// Namespace member identities are owned by their namespace signature and
+	// need not have a standalone checker-local DefId. Check them before the
+	// arena lookup so local and imported namespace members behave identically.
 	for namespace in semantic.signatures.namespaces.values() {
 		for member in namespace.members.values() {
 			match member {
@@ -1003,6 +999,55 @@ pub fn stable_definition_kind(
 			}
 		}
 	}
+	let definition = semantic.definitions.by_stable(target)?;
+	if semantic.signatures.funcs.contains_key(&definition) {
+		return Some(crate::DefKind::Func);
+	}
+	if semantic.signatures.lets.contains_key(&definition) {
+		return Some(crate::DefKind::Let);
+	}
+	Some(semantic.definitions.data(definition).kind)
+}
+
+/// Return the semantic category of an imported lexical binding in this
+/// analysis's exact definition arena.
+///
+/// Unlike a stable-target lookup, this also covers imported module namespace
+/// bindings: those are checker-owned synthetic definitions and deliberately do
+/// not pretend to have a source declaration identity.
+#[must_use]
+pub fn imported_definition_kind_by_name(
+	analysis: &crate::SemanticAnalysis,
+	name: &str,
+) -> Option<crate::DefKind> {
+	let semantic = &analysis.checked.semantic;
+	let definition = semantic.definitions.get(name)?;
+	let data = semantic.definitions.data(definition);
+	matches!(data.origin, crate::DefOrigin::Imported { .. }).then_some(data.kind)
+}
+
+/// Return the semantic category of the direct type/namespace parent selected
+/// by the checker for a qualified member expression.
+///
+/// The direct-member marker proves that `parent_name` was not a shadowing
+/// local. Looking it up in the producing analysis's arena therefore preserves
+/// the checker decision while also covering synthetic imported namespaces,
+/// which have no stable [`crate::DefinitionId`].
+#[must_use]
+pub fn direct_member_parent_kind(
+	analysis: &crate::SemanticAnalysis,
+	member: nymph_ast::NodeId,
+	parent_name: &str,
+) -> Option<crate::DefKind> {
+	if !analysis
+		.annotations
+		.direct_namespace_members()
+		.any(|candidate| candidate == member)
+	{
+		return None;
+	}
+	let semantic = &analysis.checked.semantic;
+	let definition = semantic.definitions.get(parent_name)?;
 	Some(semantic.definitions.data(definition).kind)
 }
 

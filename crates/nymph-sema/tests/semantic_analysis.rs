@@ -146,6 +146,10 @@ fn environment_check_uses_imported_function_without_mutating_environment() {
 		Some(nymph_sema::DefKind::Func),
 	);
 	assert_eq!(
+		nymph_sema::query::imported_definition_kind_by_name(&result.analysis, "answer"),
+		Some(nymph_sema::DefKind::Func),
+	);
+	assert_eq!(
 		result
 			.analysis
 			.annotations
