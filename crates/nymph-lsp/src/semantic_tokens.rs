@@ -139,6 +139,17 @@ pub(crate) fn semantic_tokens_snapshot(
 	params: &SemanticTokensParams,
 ) -> Option<SemanticTokensResult> {
 	let _ = params;
+	if snapshot.source != snapshot.document_source {
+		// Equivalent URI spellings can be open with different text while sharing
+		// one canonical project module. The last notification remains the
+		// project's semantic authority, but its AST spans must never be encoded
+		// against another open buffer. Preserve source-correct lexical tokens for
+		// that non-authoritative spelling instead.
+		return Some(semantic_tokens_for_source(
+			&snapshot.document_source,
+			&RoleMap::default(),
+		));
+	}
 	let text = snapshot.source.as_ref();
 	let roles = build_role_map(&snapshot.analysis.semantic);
 	Some(semantic_tokens_for_source(text, &roles))
@@ -1804,6 +1815,33 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 				.collect::<Vec<_>>(),
 			vec![(0, 0, 2), (1, 0, 2)]
 		);
+	}
+
+	#[test]
+	fn equivalent_non_authoritative_uri_uses_its_own_source_for_ranges() {
+		let canonical: Uri = "file:///semtok_equivalent.nym".parse().unwrap();
+		let equivalent: Uri = "file:///semtok_%65quivalent.nym".parse().unwrap();
+		let canonical_source = "func first(): int = 1";
+		let authoritative_source = "// 😀\nfunc second(): int = 2";
+		let mut docs = DocumentStore::default();
+		let mut state = crate::compiler_state::CompilerState::new();
+		state
+			.open(&mut docs, canonical.clone(), canonical_source.into(), 1)
+			.unwrap();
+		state
+			.open(&mut docs, equivalent, authoritative_source.into(), 2)
+			.unwrap();
+
+		let snapshot = state.analysis_for_uri(&docs, &canonical).unwrap();
+		assert_eq!(snapshot.source.as_ref(), authoritative_source);
+		assert_eq!(snapshot.document_source.as_ref(), canonical_source);
+		let result = semantic_tokens_snapshot(&snapshot, &params(&canonical)).unwrap();
+		let SemanticTokensResult::Tokens(tokens) = result else {
+			panic!("expected full semantic tokens");
+		};
+		let decoded = decode(&tokens.data);
+		assert!(decoded.iter().all(|token| token.line == 0), "{decoded:?}");
+		assert_eq!(find(&decoded, 0, 5).type_name, "variable");
 	}
 
 	#[test]
