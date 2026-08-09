@@ -937,6 +937,7 @@ pub(crate) fn ambient_core_analysis(
 		result
 	};
 	Arc::new(super::session::ModuleAnalysis {
+		source: module.source(db),
 		semantic: result.analysis,
 		diagnostics: super::session::ProjectDiagnostics(
 			result
@@ -2160,6 +2161,10 @@ pub(crate) fn interface_module_analysis<'db>(
 		}
 	}
 	Arc::new(super::session::ModuleAnalysis {
+		source: match module {
+			SemanticModuleInput::Project(module) => module.source(db).unwrap_or_default(),
+			SemanticModuleInput::Builtin(module) => module.source(db),
+		},
 		semantic: result.analysis,
 		diagnostics: super::session::ProjectDiagnostics(diagnostics.into()),
 	})

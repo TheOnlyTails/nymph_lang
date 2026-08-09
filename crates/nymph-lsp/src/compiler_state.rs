@@ -48,6 +48,15 @@ pub struct AnalysisSnapshot {
 	pub document_revision: DocumentStoreRevision,
 	pub source: Arc<str>,
 	pub analysis: Arc<ModuleAnalysis>,
+	entry: ModulePath,
+	root: PathBuf,
+	without_prelude: bool,
+}
+
+pub struct DefinitionTargetSnapshot {
+	pub uri: Uri,
+	pub source: Arc<str>,
+	pub span: nymph_ast::Span,
 }
 
 pub struct CompilerState {
@@ -176,14 +185,76 @@ impl CompilerState {
 			identity.module.clone(),
 			!identity.without_prelude,
 		)?;
+		let source = analysis.source.clone();
 		Some(AnalysisSnapshot {
 			project: identity.project.clone(),
 			module: identity.module.clone(),
 			document_version: document.version,
 			document_revision: docs.revision(),
-			source: Arc::from(document.text.as_str()),
+			source,
 			analysis,
+			entry: identity.entry.clone(),
+			root: identity.root.clone(),
+			without_prelude: identity.without_prelude,
 		})
+	}
+
+	/// Resolve a checked stable target to an authoritative, reachable project source.
+	/// Every validation is fallible so stale or provider-owned identities never become URIs.
+	pub fn definition_target(
+		&self,
+		docs: &DocumentStore,
+		snapshot: &AnalysisSnapshot,
+		offset: usize,
+	) -> Option<DefinitionTargetSnapshot> {
+		if docs.revision() != snapshot.document_revision {
+			return None;
+		}
+		let definition = snapshot.analysis.stable_definition_at(offset)?;
+		if !matches!(
+			definition.key,
+			nymph_sema::DeclarationKey::TopLevel {
+				category: nymph_sema::DeclarationCategory::Function
+					| nymph_sema::DeclarationCategory::Let
+					| nymph_sema::DeclarationCategory::Struct
+					| nymph_sema::DeclarationCategory::Enum
+					| nymph_sema::DeclarationCategory::Interface
+					| nymph_sema::DeclarationCategory::TypeAlias,
+				..
+			}
+		) {
+			return None;
+		}
+		let nymph_sema::ModuleOrigin::Project(owner_project) = &definition.module.origin else {
+			return None;
+		};
+		if owner_project.as_str() != snapshot.project.as_str()
+			|| definition.module.project.as_str() != snapshot.project.as_str()
+		{
+			return None;
+		}
+		let module = ModulePath::new(definition.module.path.as_str()).ok()?;
+		if module == snapshot.module {
+			return None;
+		}
+		let session = if snapshot.without_prelude {
+			&self.stdlib_session
+		} else {
+			&self.session
+		};
+		if !session.has_source(snapshot.project.clone(), module.clone()) {
+			return None;
+		}
+		let analysis = session.tooling_analyze_module(
+			snapshot.project.clone(),
+			snapshot.entry.clone(),
+			module.clone(),
+			!snapshot.without_prelude,
+		)?;
+		let span = analysis.declaration_provenance(&definition)?.name_span;
+		let uri = workspace::key_to_uri(&snapshot.root, module.as_str())?;
+		let source = analysis.source.clone();
+		valid_source_span(&source, span).then_some(DefinitionTargetSnapshot { uri, source, span })
 	}
 
 	pub fn diagnostics_for_uri(
@@ -429,6 +500,13 @@ impl CompilerState {
 	}
 }
 
+fn valid_source_span(source: &str, span: nymph_ast::Span) -> bool {
+	span.start < span.end
+		&& span.end <= source.len()
+		&& source.is_char_boundary(span.start)
+		&& source.is_char_boundary(span.end)
+}
+
 fn nymph_files(root: &std::path::Path) -> anyhow::Result<Vec<(PathBuf, ModulePath)>> {
 	fn visit(
 		root: &std::path::Path,
@@ -473,6 +551,21 @@ pub fn publish_if_current<T>(
 mod tests {
 	use super::*;
 	use std::cell::Cell;
+
+	#[test]
+	fn malformed_or_non_boundary_definition_spans_are_rejected() {
+		let source = "a😀z";
+		assert!(valid_source_span(source, nymph_ast::Span::new(1, 5)));
+		for span in [
+			nymph_ast::Span::new(5, 1),
+			nymph_ast::Span::new(1, 1),
+			nymph_ast::Span::new(0, source.len() + 1),
+			nymph_ast::Span::new(2, 5),
+			nymph_ast::Span::new(1, 4),
+		] {
+			assert!(!valid_source_span(source, span), "span {span:?}");
+		}
+	}
 
 	#[test]
 	fn snapshot_from_a_previous_same_version_lifecycle_is_not_published() {

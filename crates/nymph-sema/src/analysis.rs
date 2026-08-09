@@ -2,9 +2,16 @@
 
 use std::{ops::Deref, sync::Arc};
 
-use nymph_ast::decl::Module;
+use nymph_ast::{Span, decl::Module};
+use rustc_hash::FxHashMap;
 
-use crate::{Annotations, CheckedFacts};
+use crate::{Annotations, CheckedFacts, DefinitionId};
+
+/// Authoritative source occurrence of a stable declaration in its owner module.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DeclarationProvenance {
+	pub name_span: Span,
+}
 
 /// Owned semantic annotations for one module.
 ///
@@ -38,6 +45,15 @@ pub struct SemanticAnalysis {
 	pub module: Arc<Module>,
 	pub checked: Arc<CheckedFacts>,
 	pub annotations: Arc<ModuleAnnotations>,
+	/// Local declarations keyed by their stable semantic identity.
+	pub declarations: Arc<FxHashMap<DefinitionId, DeclarationProvenance>>,
+}
+
+impl SemanticAnalysis {
+	#[must_use]
+	pub fn declaration(&self, id: &DefinitionId) -> Option<DeclarationProvenance> {
+		self.declarations.get(id).copied()
+	}
 }
 
 #[derive(Clone, Debug)]

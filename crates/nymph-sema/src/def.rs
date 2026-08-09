@@ -78,6 +78,15 @@ pub enum DefKind {
 }
 
 impl DefMap {
+	/// Iterate every checker definition without exposing the map's indexing internals.
+	pub fn iter(&self) -> impl Iterator<Item = (DefId, &DefData)> {
+		self
+			.defs
+			.iter()
+			.enumerate()
+			.map(|(index, data)| (DefId(index as u32), data))
+	}
+
 	pub(crate) fn clear_lexical_imports(&mut self) {
 		self.by_name.clear();
 		self.variants.clear();

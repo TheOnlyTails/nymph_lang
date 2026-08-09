@@ -220,6 +220,7 @@ pub struct Annotations {
 	unresolved_qualified_accesses: Vec<UnresolvedQualifiedAccess>,
 	direct_namespace_members: FxHashSet<NodeId>,
 	definition_targets: FxHashMap<NodeId, DefinitionId>,
+	type_definition_targets: FxHashMap<Span, DefinitionId>,
 	variants: FxHashMap<NodeId, VariantResolution>,
 	/// Variant *patterns*, keyed by span — patterns carry no `NodeId`, but each
 	/// written pattern has a unique source span.
@@ -423,6 +424,28 @@ impl Annotations {
 	/// The stable declaration referenced by `id`, if this node denotes one.
 	pub fn definition_target_of(&self, id: NodeId) -> Option<&DefinitionId> {
 		self.definition_targets.get(&id)
+	}
+
+	pub(crate) fn record_type_definition_target(
+		&mut self,
+		span: Span,
+		target: Option<&DefinitionId>,
+	) {
+		if let Some(target) = target {
+			self.type_definition_targets.insert(span, target.clone());
+		}
+	}
+
+	/// The stable declaration referenced by an exactly checked type identifier.
+	pub fn type_definition_target_at(&self, span: Span) -> Option<&DefinitionId> {
+		self.type_definition_targets.get(&span)
+	}
+
+	pub fn type_definition_targets(&self) -> impl Iterator<Item = (Span, &DefinitionId)> {
+		self
+			.type_definition_targets
+			.iter()
+			.map(|(&span, target)| (span, target))
 	}
 
 	/// Record which `(enum, variant)` a variant construction/reference resolved to.
