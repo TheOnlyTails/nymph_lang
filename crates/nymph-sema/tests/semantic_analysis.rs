@@ -142,6 +142,10 @@ fn environment_check_uses_imported_function_without_mutating_environment() {
 		Some(&function_id),
 	);
 	assert_eq!(
+		nymph_sema::query::stable_definition_kind(&result.analysis, &function_id),
+		Some(nymph_sema::DefKind::Func),
+	);
+	assert_eq!(
 		result
 			.analysis
 			.annotations

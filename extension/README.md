@@ -52,6 +52,13 @@ unsaved overlays for every open dependency. A saved `.nym` file outside a projec
 one-file library with the ambient prelude; it has no project import graph. The extension currently
 registers language-server features for `file:` documents only, not untitled editor buffers.
 
+Semantic highlighting consumes that same immutable project snapshot. Imported and ambient
+functions, values, types, enum variants, and aliases therefore keep the same semantic kind as their
+declarations, including when an unsaved dependency overrides its on-disk source. Highlighting is
+best-effort for malformed projects: lexical tokens, comments, and string interpolations remain
+available when semantic resolution is incomplete. The server advertises only full-document tokens
+with its fixed legend; range and delta requests are not supported.
+
 ## Nymph files
 
 `.nym` is the only Nymph source-file suffix. Functions use

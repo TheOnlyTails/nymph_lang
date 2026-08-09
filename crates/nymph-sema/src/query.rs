@@ -968,6 +968,44 @@ pub fn stable_definition_at(
 		.map(|(_, target)| target.clone())
 }
 
+/// Return the semantic category of a stable declaration in this analysis's
+/// exact imported, ambient, and local definition arena.
+///
+/// Tooling must use this instead of rebuilding a source-local [`DefMap`]: a
+/// stable target recorded in [`crate::Annotations`] may belong to an imported
+/// module or the ambient prelude, and its checker-local [`crate::DefId`] is
+/// meaningful only inside the arena that produced the analysis.
+#[must_use]
+pub fn stable_definition_kind(
+	analysis: &crate::SemanticAnalysis,
+	target: &crate::DefinitionId,
+) -> Option<crate::DefKind> {
+	let semantic = &analysis.checked.semantic;
+	let definition = semantic.definitions.by_stable(target)?;
+	if semantic.signatures.funcs.contains_key(&definition) {
+		return Some(crate::DefKind::Func);
+	}
+	if semantic.signatures.lets.contains_key(&definition) {
+		return Some(crate::DefKind::Let);
+	}
+	for namespace in semantic.signatures.namespaces.values() {
+		for member in namespace.members.values() {
+			match member {
+				crate::NamespaceMemberSig::Func {
+					target: Some(member_target),
+					..
+				} if member_target == target => return Some(crate::DefKind::Func),
+				crate::NamespaceMemberSig::Value {
+					target: Some(member_target),
+					..
+				} if member_target == target => return Some(crate::DefKind::Let),
+				_ => {}
+			}
+		}
+	}
+	Some(semantic.definitions.data(definition).kind)
+}
+
 /// Find the definition site of the identifier (or bare enum variant, or
 /// type-position type name) at byte `offset` in `module`. Resolution order,
 /// mirroring `infer_identifier`'s shadowing: the nearest enclosing

@@ -9,8 +9,9 @@ use std::{
 };
 
 use lsp_types::{
-	HoverContents, HoverParams, MarkupContent, Position, SemanticTokensParams,
-	TextDocumentIdentifier, TextDocumentPositionParams, Uri, WorkDoneProgressParams,
+	HoverContents, HoverParams, MarkupContent, Position, SemanticToken, SemanticTokensParams,
+	SemanticTokensResult, TextDocumentIdentifier, TextDocumentPositionParams, Uri,
+	WorkDoneProgressParams,
 };
 use nymph_lsp::{
 	compiler_state::CompilerState, document_store::DocumentStore, hover, semantic_tokens, workspace,
@@ -71,6 +72,57 @@ fn hover_needle(
 			.rfind('\n')
 			.map_or(0, |newline| newline + 1);
 	hover_value(compiler, docs, uri, line, character as u32)
+}
+
+fn semantic_token_type_at(
+	compiler: &CompilerState,
+	docs: &DocumentStore,
+	uri: &Uri,
+	source: &str,
+	needle: &str,
+) -> u32 {
+	let offset = source.find(needle).unwrap();
+	let line = source[..offset]
+		.bytes()
+		.filter(|byte| *byte == b'\n')
+		.count() as u32;
+	let character = (offset
+		- source[..offset]
+			.rfind('\n')
+			.map_or(0, |newline| newline + 1)) as u32;
+	let snapshot = compiler.analysis_for_uri(docs, uri).unwrap();
+	let result = semantic_tokens::semantic_tokens_full(
+		&snapshot,
+		&SemanticTokensParams {
+			text_document: TextDocumentIdentifier { uri: uri.clone() },
+			work_done_progress_params: WorkDoneProgressParams::default(),
+			partial_result_params: Default::default(),
+		},
+	)
+	.unwrap();
+	let SemanticTokensResult::Tokens(tokens) = result else {
+		panic!("expected full semantic tokens");
+	};
+	let mut token_line = 0;
+	let mut token_character = 0;
+	for SemanticToken {
+		delta_line,
+		delta_start,
+		token_type,
+		..
+	} in tokens.data
+	{
+		if delta_line == 0 {
+			token_character += delta_start;
+		} else {
+			token_line += delta_line;
+			token_character = delta_start;
+		}
+		if (token_line, token_character) == (line, character) {
+			return token_type;
+		}
+	}
+	panic!("no semantic token for {needle:?} at {line}:{character}");
 }
 
 #[test]
@@ -469,6 +521,107 @@ fn project_hover_uses_imports_aliases_std_prelude_generics_and_reuses_the_checke
 		analyses.load(Ordering::Relaxed),
 		initial_analyses,
 		"repeated project hover must reuse the one checked Salsa snapshot"
+	);
+}
+
+#[test]
+fn project_semantic_tokens_use_imports_prelude_and_dependency_overlays() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='project-semantic-tokens'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let source = "import @/dep with (Box as ImportedBox, Choice, Config, make as build)\nfunc use(box: ImportedBox): Option<Choice> = Some(value = build(box))\nfunc choose(): Choice = Choice.One\nfunc read(box: ImportedBox): int = box.get() + box.value + Config.count\nfunc construct(): ImportedBox = ImportedBox(value = 1)";
+	let dependency = "public struct Box(public value: int) { func get(): int = this.value }\npublic enum Choice { One }\npublic namespace Config { public let count = 1 }\npublic func make(box: Box): Choice = Choice.One";
+	fs::write(&main_path, source).unwrap();
+	fs::write(&dep_path, dependency).unwrap();
+	let main_uri = uri(&main_path);
+	let dep_uri = uri(&dep_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), source.into(), 1)
+		.unwrap();
+
+	// Fixed legend indices: type=2, function=3, variable=5, enumMember=8.
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "ImportedBox):"),
+		2
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "ImportedBox(value"),
+		2
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "build(box)"),
+		3
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "Some(value"),
+		8
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "Choice.One"),
+		2
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "One\nfunc"),
+		8
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "get()"),
+		4
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "value + Config"),
+		7
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "count\nfunc construct"),
+		5
+	);
+
+	// An unsaved dependency buffer is authoritative for the whole project.
+	// Even though changing `make` from a function to a value makes the call
+	// malformed, semantic tokens remain best-effort and use the new role.
+	compiler
+		.open(
+			&mut docs,
+			dep_uri,
+			"public struct Box(public value: int) { func get(): int = this.value }\npublic enum Choice { One }\npublic let make: int = 1".into(),
+			2,
+		)
+		.unwrap();
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &main_uri, source, "build(box)"),
+		5
+	);
+
+	let malformed = "import @/missing with (\nfunc still_here(): int = build";
+	compiler
+		.change(&mut docs, &main_uri, malformed.into(), 3)
+		.unwrap();
+	assert!(
+		compiler.analysis_for_uri(&docs, &main_uri).is_none(),
+		"this fixture must exercise the no-snapshot recovery path"
+	);
+	assert!(
+		semantic_tokens::semantic_tokens_for_open_document(
+			&docs,
+			&SemanticTokensParams {
+				text_document: TextDocumentIdentifier {
+					uri: main_uri.clone(),
+				},
+				work_done_progress_params: WorkDoneProgressParams::default(),
+				partial_result_params: Default::default(),
+			},
+		)
+		.is_some(),
+		"a malformed import must still return best-effort tokens"
 	);
 }
 

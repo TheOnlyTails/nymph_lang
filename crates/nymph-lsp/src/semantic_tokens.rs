@@ -24,15 +24,14 @@
 //!   ([`nymph_sema::query::definition_at`]), and a call-argument/
 //!   struct-field LABEL (`hello` in `f(hello = x)`) classifies as
 //!   `property`, distinct from an ordinary variable.
-//! - [`nymph_sema::check_module`] resolves which enum variant a
-//!   construction/reference/pattern names precisely (disambiguating
-//!   `None`/`Ok`-style bare names) — run fresh per request (mirrors
-//!   `hover.rs`'s uncached path), tolerant of partial/erroring input. Where
-//!   a checker resolution is unavailable, phase 2 falls back to a
-//!   name-set match against the module's own declared enum variants,
-//!   deferring to an in-scope binder of the same name. An identifier whose
-//!   role isn't determined by any of this falls back to `variable` rather
-//!   than risk a wrong classification.
+//! - [`AnalysisSnapshot`] supplies the immutable semantic analysis produced
+//!   for the request's exact document revision. Its definition arena includes
+//!   project imports, aliases, the ambient prelude, and every open-document
+//!   overlay, so imported and ambient functions, values, types, and variants
+//!   classify consistently without rechecking or rebuilding a source-local
+//!   arena. Where checker resolution is unavailable over malformed code,
+//!   phase 2 retains its local AST/name-set fallbacks; an unresolved identifier
+//!   remains `variable` rather than risking a wrong classification.
 //!
 //! Comments are not tokens at all — the lexer discards them — so they are
 //! recovered by scanning the gaps between consecutive lexed tokens for `//`
@@ -66,7 +65,7 @@ use nymph_ast::{
 	token::{StrFragment, Token},
 	ty::{GenericArg, GenericParam, Type},
 };
-use nymph_sema::Checked;
+use nymph_sema::{DeclarationCategory, DeclarationKey, DefKind, SemanticAnalysis};
 
 use crate::{compiler_state::AnalysisSnapshot, line_index::LineIndex};
 
@@ -145,12 +144,25 @@ pub(crate) fn semantic_tokens_snapshot(
 ) -> Option<SemanticTokensResult> {
 	let _ = params;
 	let text = snapshot.source.as_ref();
-	let checked = nymph_sema::Checked {
-		diags: Vec::new(),
-		facts: snapshot.analysis.semantic.checked.as_ref().clone(),
-	};
-	let roles = build_role_map(&snapshot.analysis.semantic.module, &checked);
+	let roles = build_role_map(&snapshot.analysis.semantic);
 	Some(semantic_tokens_for_source(text, &roles))
+}
+
+/// Return lexical best-effort tokens for an open document when malformed
+/// project syntax prevents the compiler from producing a semantic snapshot.
+/// This deliberately uses an empty role map rather than guessing semantic
+/// categories; lexer token kinds, comments, interpolation splitting, and
+/// UTF-16 encoding remain available.
+#[must_use]
+pub fn semantic_tokens_for_open_document(
+	docs: &crate::document_store::DocumentStore,
+	params: &SemanticTokensParams,
+) -> Option<SemanticTokensResult> {
+	let document = docs.get(&params.text_document.uri)?;
+	Some(semantic_tokens_for_source(
+		&document.text,
+		&RoleMap::default(),
+	))
 }
 
 fn semantic_tokens_for_source(text: &str, roles: &RoleMap) -> SemanticTokensResult {
@@ -201,10 +213,7 @@ pub fn semantic_tokens_full(
 		.ok()?;
 	match state.analysis_for_uri(&owned_docs, uri) {
 		Some(snapshot) => semantic_tokens_snapshot(&snapshot, params),
-		None => Some(semantic_tokens_for_source(
-			&document.text,
-			&RoleMap::default(),
-		)),
+		None => semantic_tokens_for_open_document(docs, params),
 	}
 }
 
@@ -420,16 +429,18 @@ type RoleMap = HashMap<usize, (u32, u32)>;
 /// legend classification; phase 2 resolves every *use* site — an enum
 /// variant reference/construction/pattern, a parameter/local-binder
 /// identifier use, and a call-argument/struct-field label — to a
-/// classification consistent with its declaration, using `checked`'s
-/// recorded variant resolutions plus the existing scope machinery
-/// ([`nymph_sema::query::definition_at`]/[`nymph_sema::query::scope_names_at`]).
+/// classification consistent with its declaration, using the immutable
+/// analysis's stable definition targets and variant resolutions plus the
+/// existing local scope machinery ([`nymph_sema::query::definition_at`]/
+/// [`nymph_sema::query::scope_names_at`]).
 /// Phase 2 must run after phase 1 completes (not interleaved) so a
 /// forward-referenced top-level declaration is already in the map by the
 /// time any of its uses are resolved. Uses never overwrite an existing
 /// entry — decl-site and use-site spans are always disjoint byte positions,
 /// but `or_insert` keeps that invariant even if two use-walks ever visit the
 /// same span twice.
-fn build_role_map(module: &Module, checked: &Checked) -> RoleMap {
+fn build_role_map(analysis: &SemanticAnalysis) -> RoleMap {
+	let module = &analysis.module;
 	let mut map = RoleMap::new();
 	for decl in &module.members {
 		walk_decl(decl, &mut map);
@@ -438,7 +449,7 @@ fn build_role_map(module: &Module, checked: &Checked) -> RoleMap {
 	let variant_names = collect_enum_variant_names(module);
 	let mut uses: Vec<(usize, (u32, u32))> = Vec::new();
 	for decl in &module.members {
-		walk_decl_uses(decl, module, checked, &variant_names, &map, &mut uses);
+		walk_decl_uses(decl, analysis, &variant_names, &map, &mut uses);
 	}
 	for (start, role) in uses {
 		map.entry(start).or_insert(role);
@@ -935,16 +946,21 @@ fn is_unshadowed_variant(module: &Module, variant_names: &HashSet<&str>, name: &
 /// `readonly` bit at a use site); `None` (→ the `variable` default) when
 /// nothing resolves, matching a still-erroring or unresolvable identifier.
 fn identifier_role(
-	module: &Module,
-	checked: &Checked,
+	analysis: &SemanticAnalysis,
 	decls: &RoleMap,
 	variant_names: &HashSet<&str>,
 	expr: &Expr,
 	name: &Ident,
 ) -> Option<(u32, u32)> {
-	if checked.annotations.variant_of(expr.id).is_some() {
+	if analysis.annotations.variant_of(expr.id).is_some() {
 		return Some((ENUM_MEMBER, 0));
 	}
+	if let Some(target) = analysis.annotations.definition_target_of(expr.id)
+		&& let Some(role) = stable_definition_role(analysis, target)
+	{
+		return Some(role);
+	}
+	let module = &analysis.module;
 	if is_unshadowed_variant(module, variant_names, name) {
 		return Some((ENUM_MEMBER, 0));
 	}
@@ -957,10 +973,50 @@ fn identifier_role(
 	None
 }
 
+fn stable_definition_role(
+	analysis: &SemanticAnalysis,
+	target: &nymph_sema::DefinitionId,
+) -> Option<(u32, u32)> {
+	match &target.key {
+		DeclarationKey::Member { category, .. } => {
+			return match category {
+				DeclarationCategory::Field => Some((PROPERTY, 0)),
+				DeclarationCategory::Method => {
+					match nymph_sema::query::stable_definition_kind(analysis, target)? {
+						DefKind::Let => Some((VARIABLE, 0)),
+						_ => Some((METHOD, 0)),
+					}
+				}
+				DeclarationCategory::Function
+				| DeclarationCategory::Static
+				| DeclarationCategory::MethodBody => Some((METHOD, 0)),
+				DeclarationCategory::Variant => Some((ENUM_MEMBER, 0)),
+				_ => None,
+			};
+		}
+		DeclarationKey::MethodBody { .. } | DeclarationKey::MaterializedInterfaceMember { .. } => {
+			return Some((METHOD, 0));
+		}
+		DeclarationKey::TopLevel { .. }
+		| DeclarationKey::Implementation { .. }
+		| DeclarationKey::RecoveredImplementation { .. } => {}
+	}
+	let ty = match nymph_sema::query::stable_definition_kind(analysis, target)? {
+		DefKind::Func => FUNCTION,
+		DefKind::Struct
+		| DefKind::Enum
+		| DefKind::TypeAlias
+		| DefKind::Namespace
+		| DefKind::Interface => TYPE,
+		DefKind::Variant { .. } => ENUM_MEMBER,
+		DefKind::Let => VARIABLE,
+	};
+	Some((ty, 0))
+}
+
 fn walk_decl_uses(
 	decl: &Declaration,
-	module: &Module,
-	checked: &Checked,
+	analysis: &SemanticAnalysis,
 	variant_names: &HashSet<&str>,
 	decls: &RoleMap,
 	out: &mut Vec<(usize, (u32, u32))>,
@@ -971,7 +1027,7 @@ fn walk_decl_uses(
 		| Declaration::ExternalFunc(..)
 		| Declaration::TypeAlias { .. } => {}
 		Declaration::Let { value, .. } | Declaration::Func { body: value, .. } => {
-			walk_expr_uses(value, module, checked, variant_names, decls, out);
+			walk_expr_uses(value, analysis, variant_names, decls, out);
 		}
 		Declaration::Struct {
 			fields,
@@ -981,41 +1037,41 @@ fn walk_decl_uses(
 		} => {
 			for f in fields {
 				if let Some(default) = &f.0.default {
-					walk_expr_uses(default, module, checked, variant_names, decls, out);
+					walk_expr_uses(default, analysis, variant_names, decls, out);
 				}
 			}
 			for m in members {
-				walk_impl_member_uses(&m.0, module, checked, variant_names, decls, out);
+				walk_impl_member_uses(&m.0, analysis, variant_names, decls, out);
 			}
 			for si in impls {
 				for m in &si.0.members {
-					walk_impl_member_uses(&m.0, module, checked, variant_names, decls, out);
+					walk_impl_member_uses(&m.0, analysis, variant_names, decls, out);
 				}
 			}
 		}
 		Declaration::Enum { members, impls, .. } => {
 			for m in members {
-				walk_impl_member_uses(&m.0, module, checked, variant_names, decls, out);
+				walk_impl_member_uses(&m.0, analysis, variant_names, decls, out);
 			}
 			for si in impls {
 				for m in &si.0.members {
-					walk_impl_member_uses(&m.0, module, checked, variant_names, decls, out);
+					walk_impl_member_uses(&m.0, analysis, variant_names, decls, out);
 				}
 			}
 		}
 		Declaration::Namespace { members, .. } => {
 			for m in members {
-				walk_impl_member_uses(&m.0, module, checked, variant_names, decls, out);
+				walk_impl_member_uses(&m.0, analysis, variant_names, decls, out);
 			}
 		}
 		Declaration::Interface { members, .. } => {
 			for m in members {
-				walk_interface_member_uses(&m.0, module, checked, variant_names, decls, out);
+				walk_interface_member_uses(&m.0, analysis, variant_names, decls, out);
 			}
 		}
 		Declaration::Impl { members, .. } | Declaration::ImplFor { members, .. } => {
 			for m in members {
-				walk_impl_member_uses(&m.0, module, checked, variant_names, decls, out);
+				walk_impl_member_uses(&m.0, analysis, variant_names, decls, out);
 			}
 		}
 	}
@@ -1023,8 +1079,7 @@ fn walk_decl_uses(
 
 fn walk_impl_member_uses(
 	member: &ImplMember,
-	module: &Module,
-	checked: &Checked,
+	analysis: &SemanticAnalysis,
 	variant_names: &HashSet<&str>,
 	decls: &RoleMap,
 	out: &mut Vec<(usize, (u32, u32))>,
@@ -1032,15 +1087,14 @@ fn walk_impl_member_uses(
 	match member {
 		ImplMember::ExternalLet(..) | ImplMember::ExternalFunc(..) => {}
 		ImplMember::Let { value, .. } | ImplMember::Func { body: value, .. } => {
-			walk_expr_uses(value, module, checked, variant_names, decls, out);
+			walk_expr_uses(value, analysis, variant_names, decls, out);
 		}
 	}
 }
 
 fn walk_interface_member_uses(
 	member: &InterfaceMember,
-	module: &Module,
-	checked: &Checked,
+	analysis: &SemanticAnalysis,
 	variant_names: &HashSet<&str>,
 	decls: &RoleMap,
 	out: &mut Vec<(usize, (u32, u32))>,
@@ -1049,18 +1103,18 @@ fn walk_interface_member_uses(
 		InterfaceMember::Element(elem) => match &elem.0 {
 			InterfaceElement::Let { value, .. } => {
 				if let Some(v) = value {
-					walk_expr_uses(v, module, checked, variant_names, decls, out);
+					walk_expr_uses(v, analysis, variant_names, decls, out);
 				}
 			}
 			InterfaceElement::Func { body, .. } => {
 				if let Some(b) = body {
-					walk_expr_uses(b, module, checked, variant_names, decls, out);
+					walk_expr_uses(b, analysis, variant_names, decls, out);
 				}
 			}
 		},
 		InterfaceMember::Impl { members, .. } => {
 			for m in members {
-				walk_impl_member_uses(&m.0, module, checked, variant_names, decls, out);
+				walk_impl_member_uses(&m.0, analysis, variant_names, decls, out);
 			}
 		}
 	}
@@ -1068,12 +1122,12 @@ fn walk_interface_member_uses(
 
 fn walk_expr_uses(
 	expr: &Expr,
-	module: &Module,
-	checked: &Checked,
+	analysis: &SemanticAnalysis,
 	variant_names: &HashSet<&str>,
 	decls: &RoleMap,
 	out: &mut Vec<(usize, (u32, u32))>,
 ) {
+	let module = &analysis.module;
 	match &expr.kind {
 		ExprKind::Int(_)
 		| ExprKind::UInt(_)
@@ -1084,14 +1138,14 @@ fn walk_expr_uses(
 		| ExprKind::This
 		| ExprKind::Continue { .. } => {}
 		ExprKind::Identifier(name) => {
-			if let Some(role) = identifier_role(module, checked, decls, variant_names, expr, name) {
+			if let Some(role) = identifier_role(analysis, decls, variant_names, expr, name) {
 				out.push((expr.span.start, role));
 			}
 		}
 		ExprKind::String(parts) => {
 			for part in parts {
 				if let StringPart::InterpolatedExpr(e) = &part.0 {
-					walk_expr_uses(e, module, checked, variant_names, decls, out);
+					walk_expr_uses(e, analysis, variant_names, decls, out);
 				}
 			}
 		}
@@ -1099,7 +1153,7 @@ fn walk_expr_uses(
 			for item in items {
 				match &item.0 {
 					ListItem::Expr(e) | ListItem::Spread(e) => {
-						walk_expr_uses(e, module, checked, variant_names, decls, out);
+						walk_expr_uses(e, analysis, variant_names, decls, out);
 					}
 				}
 			}
@@ -1108,20 +1162,20 @@ fn walk_expr_uses(
 			for entry in entries {
 				match &entry.0 {
 					MapEntry::Entry(k, v) => {
-						walk_expr_uses(k, module, checked, variant_names, decls, out);
-						walk_expr_uses(v, module, checked, variant_names, decls, out);
+						walk_expr_uses(k, analysis, variant_names, decls, out);
+						walk_expr_uses(v, analysis, variant_names, decls, out);
 					}
-					MapEntry::Spread(e) => walk_expr_uses(e, module, checked, variant_names, decls, out),
+					MapEntry::Spread(e) => walk_expr_uses(e, analysis, variant_names, decls, out),
 				}
 			}
 		}
 		ExprKind::Range(kind) => match kind {
 			RangeKind::From(e) | RangeKind::To(e) | RangeKind::ToInclusive(e) => {
-				walk_expr_uses(e, module, checked, variant_names, decls, out);
+				walk_expr_uses(e, analysis, variant_names, decls, out);
 			}
 			RangeKind::Exclusive { min, max } | RangeKind::Inclusive { min, max } => {
-				walk_expr_uses(min, module, checked, variant_names, decls, out);
-				walk_expr_uses(max, module, checked, variant_names, decls, out);
+				walk_expr_uses(min, analysis, variant_names, decls, out);
+				walk_expr_uses(max, analysis, variant_names, decls, out);
 			}
 		},
 		ExprKind::Call { func, args, .. } => {
@@ -1132,34 +1186,47 @@ fn walk_expr_uses(
 			// and skip walking `func` further (it's fully classified);
 			// otherwise try the narrow name-set fallback, then fall back to
 			// treating `func` as an ordinary use (a real function call).
-			let resolved = checked.annotations.variant_of(expr.id).is_some();
+			let resolved = analysis.annotations.variant_of(expr.id).is_some();
 			if resolved {
 				match &func.kind {
 					ExprKind::Identifier(_) => out.push((func.span.start, (ENUM_MEMBER, 0))),
 					ExprKind::MemberAccess { member, .. } => {
 						out.push((member.1.start, (ENUM_MEMBER, 0)));
+						push_qualified_parent(func, out);
 					}
-					_ => walk_expr_uses(func, module, checked, variant_names, decls, out),
+					_ => walk_expr_uses(func, analysis, variant_names, decls, out),
 				}
+			} else if analysis.annotations.resolution_of(expr.id).is_some()
+				&& let ExprKind::MemberAccess { parent, member, .. } = &func.kind
+			{
+				out.push((member.1.start, (METHOD, 0)));
+				walk_expr_uses(parent, analysis, variant_names, decls, out);
 			} else if let ExprKind::Identifier(name) = &func.kind
 				&& is_unshadowed_variant(module, variant_names, name)
 			{
 				out.push((func.span.start, (ENUM_MEMBER, 0)));
 			} else {
-				walk_expr_uses(func, module, checked, variant_names, decls, out);
+				walk_expr_uses(func, analysis, variant_names, decls, out);
 			}
 			for a in args {
 				if let Some(label) = &a.0.name {
 					out.push((label.1.start, (PROPERTY, 0)));
 				}
-				walk_expr_uses(&a.0.value, module, checked, variant_names, decls, out);
+				walk_expr_uses(&a.0.value, analysis, variant_names, decls, out);
 			}
 		}
 		ExprKind::MemberAccess { parent, member, .. } => {
 			// A qualified nullary reference (`Result.Ok`): the checker
 			// resolves the variant against the MemberAccess node's own id.
-			if checked.annotations.variant_of(expr.id).is_some() {
+			if analysis.annotations.variant_of(expr.id).is_some() {
 				out.push((member.1.start, (ENUM_MEMBER, 0)));
+				out.push((parent.span.start, (TYPE, 0)));
+			} else if analysis.annotations.resolution_of(expr.id).is_some() {
+				out.push((member.1.start, (METHOD, 0)));
+			} else if let Some(target) = analysis.annotations.definition_target_of(expr.id)
+				&& let Some(role) = stable_definition_role(analysis, target)
+			{
+				out.push((member.1.start, role));
 			} else if let Some(decl_span) = nymph_sema::query::definition_at(module, member.1.start)
 				&& let Some(&(ty, _)) = decls.get(&decl_span.start)
 				&& ty == METHOD
@@ -1171,39 +1238,39 @@ fn walk_expr_uses(
 				// default `push_token` applies when nothing here matches.
 				out.push((member.1.start, (METHOD, 0)));
 			}
-			walk_expr_uses(parent, module, checked, variant_names, decls, out);
+			walk_expr_uses(parent, analysis, variant_names, decls, out);
 		}
 		ExprKind::IndexAccess { parent, index, .. } => {
-			walk_expr_uses(parent, module, checked, variant_names, decls, out);
-			walk_expr_uses(index, module, checked, variant_names, decls, out);
+			walk_expr_uses(parent, analysis, variant_names, decls, out);
+			walk_expr_uses(index, analysis, variant_names, decls, out);
 		}
 		ExprKind::Closure { body, .. } => {
-			walk_expr_uses(body, module, checked, variant_names, decls, out);
+			walk_expr_uses(body, analysis, variant_names, decls, out);
 		}
 		ExprKind::PrefixOp { value, .. } | ExprKind::PostfixOp { value, .. } => {
-			walk_expr_uses(value, module, checked, variant_names, decls, out);
+			walk_expr_uses(value, analysis, variant_names, decls, out);
 		}
 		ExprKind::BinaryOp { lhs, rhs, .. } | ExprKind::AssignOp { lhs, rhs, .. } => {
-			walk_expr_uses(lhs, module, checked, variant_names, decls, out);
-			walk_expr_uses(rhs, module, checked, variant_names, decls, out);
+			walk_expr_uses(lhs, analysis, variant_names, decls, out);
+			walk_expr_uses(rhs, analysis, variant_names, decls, out);
 		}
 		ExprKind::TypeOp { lhs, .. } => {
-			walk_expr_uses(lhs, module, checked, variant_names, decls, out);
+			walk_expr_uses(lhs, analysis, variant_names, decls, out);
 		}
 		ExprKind::PatternOp { lhs, rhs, .. } => {
-			walk_expr_uses(lhs, module, checked, variant_names, decls, out);
-			walk_pattern_uses(rhs, module, checked, variant_names, out);
+			walk_expr_uses(lhs, analysis, variant_names, decls, out);
+			walk_pattern_uses(rhs, analysis, variant_names, out);
 		}
 		ExprKind::Return { value, .. } | ExprKind::Break { value, .. } => {
 			if let Some(v) = value {
-				walk_expr_uses(v, module, checked, variant_names, decls, out);
+				walk_expr_uses(v, analysis, variant_names, decls, out);
 			}
 		}
 		ExprKind::While {
 			condition, body, ..
 		} => {
-			walk_expr_uses(condition, module, checked, variant_names, decls, out);
-			walk_expr_uses(body, module, checked, variant_names, decls, out);
+			walk_expr_uses(condition, analysis, variant_names, decls, out);
+			walk_expr_uses(body, analysis, variant_names, decls, out);
 		}
 		ExprKind::For {
 			variable,
@@ -1211,42 +1278,50 @@ fn walk_expr_uses(
 			body,
 			..
 		} => {
-			walk_expr_uses(iterable, module, checked, variant_names, decls, out);
-			walk_pattern_uses(variable, module, checked, variant_names, out);
-			walk_expr_uses(body, module, checked, variant_names, decls, out);
+			walk_expr_uses(iterable, analysis, variant_names, decls, out);
+			walk_pattern_uses(variable, analysis, variant_names, out);
+			walk_expr_uses(body, analysis, variant_names, decls, out);
 		}
 		ExprKind::If {
 			condition,
 			then,
 			otherwise,
 		} => {
-			walk_expr_uses(condition, module, checked, variant_names, decls, out);
-			walk_expr_uses(then, module, checked, variant_names, decls, out);
+			walk_expr_uses(condition, analysis, variant_names, decls, out);
+			walk_expr_uses(then, analysis, variant_names, decls, out);
 			if let Some(o) = otherwise {
-				walk_expr_uses(o, module, checked, variant_names, decls, out);
+				walk_expr_uses(o, analysis, variant_names, decls, out);
 			}
 		}
 		ExprKind::Match { value, arms } => {
-			walk_expr_uses(value, module, checked, variant_names, decls, out);
+			walk_expr_uses(value, analysis, variant_names, decls, out);
 			for arm in arms {
-				walk_pattern_uses(&arm.pattern, module, checked, variant_names, out);
+				walk_pattern_uses(&arm.pattern, analysis, variant_names, out);
 				if let Some(g) = &arm.guard {
-					walk_expr_uses(g, module, checked, variant_names, decls, out);
+					walk_expr_uses(g, analysis, variant_names, decls, out);
 				}
-				walk_expr_uses(&arm.body, module, checked, variant_names, decls, out);
+				walk_expr_uses(&arm.body, analysis, variant_names, decls, out);
 			}
 		}
 		ExprKind::Block { body, .. } => {
 			for stmt in body {
 				match &stmt.0 {
-					Statement::Expr(e) => walk_expr_uses(e, module, checked, variant_names, decls, out),
+					Statement::Expr(e) => walk_expr_uses(e, analysis, variant_names, decls, out),
 					Statement::Let { value, .. } => {
-						walk_expr_uses(value, module, checked, variant_names, decls, out);
+						walk_expr_uses(value, analysis, variant_names, decls, out);
 					}
 				}
 			}
 		}
-		ExprKind::Grouped(e) => walk_expr_uses(e, module, checked, variant_names, decls, out),
+		ExprKind::Grouped(e) => walk_expr_uses(e, analysis, variant_names, decls, out),
+	}
+}
+
+fn push_qualified_parent(expr: &Expr, out: &mut Vec<(usize, (u32, u32))>) {
+	if let ExprKind::MemberAccess { parent, .. } = &expr.kind
+		&& matches!(parent.kind, ExprKind::Identifier(_))
+	{
+		out.push((parent.span.start, (TYPE, 0)));
 	}
 }
 
@@ -1264,12 +1339,12 @@ fn walk_expr_uses(
 /// itself resolved as a variant.
 fn walk_pattern_uses(
 	pattern: &Spanned<Pattern>,
-	module: &Module,
-	checked: &Checked,
+	analysis: &SemanticAnalysis,
 	variant_names: &HashSet<&str>,
 	out: &mut Vec<(usize, (u32, u32))>,
 ) {
-	if checked.annotations.pattern_variant_of(pattern.1).is_some() {
+	let module = &analysis.module;
+	if analysis.annotations.pattern_variant_of(pattern.1).is_some() {
 		match &pattern.0 {
 			Pattern::Struct { path, .. } => {
 				if let Some(last) = path.last() {
@@ -1299,19 +1374,19 @@ fn walk_pattern_uses(
 	}
 
 	match &pattern.0 {
-		Pattern::Binding { inner, .. } => walk_pattern_uses(inner, module, checked, variant_names, out),
+		Pattern::Binding { inner, .. } => walk_pattern_uses(inner, analysis, variant_names, out),
 		Pattern::List(items) | Pattern::Tuple(items) => {
 			for item in items {
 				if let ListPatternEntry::Item(p) = &item.0 {
-					walk_pattern_uses(p, module, checked, variant_names, out);
+					walk_pattern_uses(p, analysis, variant_names, out);
 				}
 			}
 		}
 		Pattern::Map(entries) => {
 			for entry in entries {
 				if let MapPatternEntry::Entry(k, v) = &entry.0 {
-					walk_pattern_uses(k, module, checked, variant_names, out);
-					walk_pattern_uses(v, module, checked, variant_names, out);
+					walk_pattern_uses(k, analysis, variant_names, out);
+					walk_pattern_uses(v, analysis, variant_names, out);
 				}
 			}
 		}
@@ -1320,10 +1395,10 @@ fn walk_pattern_uses(
 				match &field.0 {
 					StructPatternField::Value { name, value } => {
 						out.push((name.1.start, (PROPERTY, 0)));
-						walk_pattern_uses(value, module, checked, variant_names, out);
+						walk_pattern_uses(value, analysis, variant_names, out);
 					}
 					StructPatternField::Positional(value) => {
-						walk_pattern_uses(value, module, checked, variant_names, out);
+						walk_pattern_uses(value, analysis, variant_names, out);
 					}
 					StructPatternField::Named(name) => out.push((name.1.start, (PROPERTY, 0))),
 					StructPatternField::Rest => {}
@@ -1331,10 +1406,10 @@ fn walk_pattern_uses(
 			}
 		}
 		Pattern::Union(a, b) => {
-			walk_pattern_uses(a, module, checked, variant_names, out);
-			walk_pattern_uses(b, module, checked, variant_names, out);
+			walk_pattern_uses(a, analysis, variant_names, out);
+			walk_pattern_uses(b, analysis, variant_names, out);
 		}
-		Pattern::Grouped(inner) => walk_pattern_uses(inner, module, checked, variant_names, out),
+		Pattern::Grouped(inner) => walk_pattern_uses(inner, analysis, variant_names, out),
 		_ => {}
 	}
 }
@@ -1730,14 +1805,23 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 	}
 
 	#[test]
-	fn a_this_field_accesss_name_stays_the_variable_default() {
-		// `this.x` names a FIELD, not a method — `definition_at` cannot
-		// resolve it to a method decl, so it must NOT classify as `method`.
+	fn a_this_field_accesss_name_classifies_as_property() {
 		let text = "struct Point(x: int) {\n  func get(): int = this.x\n}";
 		let decoded = tokens_for(text);
 		assert_sorted_and_non_overlapping(&decoded);
 
 		let use_offset = text.rfind("this.x").unwrap() + "this.".len();
+		let (use_line, use_col) = line_col(text, use_offset);
+		assert_eq!(find(&decoded, use_line, use_col).type_name, "property");
+	}
+
+	#[test]
+	fn a_namespace_value_access_stays_variable_not_method() {
+		let text = "namespace Config { let count: int = 1 }\nfunc main(): int = Config.count";
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		let use_offset = text.rfind("count").unwrap();
 		let (use_line, use_col) = line_col(text, use_offset);
 		assert_eq!(find(&decoded, use_line, use_col).type_name, "variable");
 	}
