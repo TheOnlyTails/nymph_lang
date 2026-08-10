@@ -809,6 +809,7 @@ fn instantiate_complete_definition(
 	let owned_members = definition
 		.members
 		.iter()
+		.filter(|member| member.visibility != Some(nymph_ast::decl::Visibility::Private))
 		.map(|member| {
 			owned_member(
 				&facts.defs,
@@ -857,6 +858,7 @@ fn instantiate_complete_definition(
 			let fields = definition
 				.fields
 				.iter()
+				.filter(|field| field.visibility != Some(nymph_ast::decl::Visibility::Private))
 				.map(|field| {
 					(
 						field.name.clone(),
@@ -872,6 +874,7 @@ fn instantiate_complete_definition(
 					field_metadata: definition
 						.fields
 						.iter()
+						.filter(|field| field.visibility != Some(nymph_ast::decl::Visibility::Private))
 						.map(|field| FieldSigMetadata {
 							target: Some(field.id.clone()),
 							mutable: field.mutable,
@@ -935,7 +938,11 @@ fn instantiate_complete_definition(
 		}
 		DefinitionShapeKind::Namespace => {
 			let mut namespace = NamespaceSig::default();
-			for member in &definition.members {
+			for member in definition
+				.members
+				.iter()
+				.filter(|member| member.visibility != Some(nymph_ast::decl::Visibility::Private))
+			{
 				let mut member_binders = definition.binders.clone();
 				member_binders.extend(member.binders.clone());
 				let member_ctx = context(definitions, &member_binders);
@@ -971,6 +978,7 @@ fn instantiate_complete_definition(
 				runtime_members: definition
 					.members
 					.iter()
+					.filter(|member| member.visibility != Some(nymph_ast::decl::Visibility::Private))
 					.map(|member| crate::iface::RuntimeMemberDef {
 						definition: Some(member.id.clone()),
 						name: member.name.clone(),
@@ -982,7 +990,11 @@ fn instantiate_complete_definition(
 					.collect(),
 				methods: FxHashMap::default(),
 			};
-			for member in &definition.members {
+			for member in definition
+				.members
+				.iter()
+				.filter(|member| member.visibility != Some(nymph_ast::decl::Visibility::Private))
+			{
 				if matches!(
 					member.kind,
 					MemberKind::Function | MemberKind::MutatingFunction
@@ -1083,10 +1095,11 @@ fn instantiate_definition_inherent(
 		.members
 		.iter()
 		.filter(|member| {
-			matches!(
-				member.kind,
-				MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction
-			)
+			member.visibility != Some(nymph_ast::decl::Visibility::Private)
+				&& matches!(
+					member.kind,
+					MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction
+				)
 		})
 		.map(|member| {
 			Ok((
@@ -1214,10 +1227,11 @@ fn instantiate_complete_impl(
 			.members
 			.iter()
 			.filter(|member| {
-				matches!(
-					member.kind,
-					MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction
-				)
+				member.visibility != Some(nymph_ast::decl::Visibility::Private)
+					&& matches!(
+						member.kind,
+						MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction
+					)
 			})
 			.map(|member| {
 				Ok((
@@ -1328,6 +1342,7 @@ fn instantiate_recovered_definition(
 	let owned_members = definition
 		.members
 		.iter()
+		.filter(|member| member.visibility != Some(nymph_ast::decl::Visibility::Private))
 		.map(|member| {
 			recovered_owned_member(
 				&facts.defs,
@@ -1389,11 +1404,13 @@ fn instantiate_recovered_definition(
 					fields: definition
 						.fields
 						.iter()
+						.filter(|field| field.visibility != Some(nymph_ast::decl::Visibility::Private))
 						.map(|f| (f.name.clone(), recovered_ty(interner, &f.ty, &ctx)))
 						.collect(),
 					field_metadata: definition
 						.fields
 						.iter()
+						.filter(|field| field.visibility != Some(nymph_ast::decl::Visibility::Private))
 						.map(|field| FieldSigMetadata {
 							target: Some(field.id.clone()),
 							mutable: field.mutable,
@@ -1480,7 +1497,12 @@ fn instantiate_recovered_definition(
 		}
 		DefinitionShapeKind::Namespace => {
 			let mut namespace = NamespaceSig::default();
-			for member in &facts.definition_members[&def] {
+			for (shape, member) in definition
+				.members
+				.iter()
+				.filter(|member| member.visibility != Some(nymph_ast::decl::Visibility::Private))
+				.zip(&facts.definition_members[&def])
+			{
 				let target = Some(member.target.clone());
 				let value = match member.kind {
 					MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction => {
@@ -1501,20 +1523,20 @@ fn instantiate_recovered_definition(
 						mutable: matches!(member.kind, MemberKind::MutableValue),
 					},
 				};
-				namespace.members.insert(
-					definition.members[namespace.members.len()].name.clone(),
-					value,
-				);
+				namespace.members.insert(shape.name.clone(), value);
 			}
 			facts.signatures.namespaces.insert(def, namespace);
 		}
 		DefinitionShapeKind::Interface => {
+			let visible = definition
+				.members
+				.iter()
+				.filter(|member| member.visibility != Some(nymph_ast::decl::Visibility::Private))
+				.zip(&facts.definition_members[&def]);
 			let mut interface = InterfaceDef {
 				generics,
-				runtime_members: definition
-					.members
-					.iter()
-					.zip(&facts.definition_members[&def])
+				runtime_members: visible
+					.clone()
 					.map(|(shape, member)| crate::iface::RuntimeMemberDef {
 						definition: Some(member.target.clone()),
 						name: shape.name.clone(),
@@ -1526,11 +1548,7 @@ fn instantiate_recovered_definition(
 					.collect(),
 				methods: FxHashMap::default(),
 			};
-			for (shape, member) in definition
-				.members
-				.iter()
-				.zip(&facts.definition_members[&def])
-			{
+			for (shape, member) in visible {
 				if matches!(
 					member.kind,
 					MemberKind::Function | MemberKind::MutatingFunction
@@ -1571,10 +1589,11 @@ fn instantiate_recovered_definition(
 			.members
 			.iter()
 			.filter(|member| {
-				matches!(
-					member.kind,
-					MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction
-				)
+				member.visibility != Some(nymph_ast::decl::Visibility::Private)
+					&& matches!(
+						member.kind,
+						MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction
+					)
 			})
 			.map(|member| {
 				let owned = recovered_owned_member(
@@ -1676,10 +1695,11 @@ fn instantiate_recovered_impl(
 		.members
 		.iter()
 		.filter(|member| {
-			matches!(
-				member.kind,
-				MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction
-			)
+			member.visibility != Some(nymph_ast::decl::Visibility::Private)
+				&& matches!(
+					member.kind,
+					MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction
+				)
 		})
 		.map(|member| {
 			let owned = recovered_owned_member(

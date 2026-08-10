@@ -10,6 +10,53 @@ use nymph_sema::{
 };
 use nymph_sema::{ParamIdx, TyKind};
 
+fn recovered(definition: ExportedDefinition) -> RecoveredExportedDefinition {
+	RecoveredExportedDefinition {
+		id: definition.id,
+		name: definition.name,
+		visibility: definition.visibility,
+		kind: definition.kind,
+		declaration_kind: definition.declaration_kind,
+		availability: SemanticAvailability::Available,
+		binders: definition.binders,
+		constraints: vec![],
+		parameters: vec![],
+		return_type: None,
+		ty: definition.ty.map(RecoveredInterfaceType::Known),
+		fields: vec![],
+		variants: vec![],
+		members: definition
+			.members
+			.into_iter()
+			.map(|member| nymph_sema::RecoveredMemberShape {
+				id: member.id,
+				name: member.name,
+				visibility: member.visibility,
+				kind: member.kind,
+				binders: member.binders,
+				constraints: vec![],
+				parameters: member
+					.parameters
+					.into_iter()
+					.map(|parameter| ParameterShape {
+						name: parameter.name,
+						ty: RecoveredInterfaceType::Known(parameter.ty),
+						spread: parameter.spread,
+						mutable: parameter.mutable,
+					})
+					.collect(),
+				return_type: RecoveredInterfaceType::Known(member.return_type),
+				external: member.external,
+				runtime_owner: member.runtime_owner,
+				has_default: member.has_default,
+			})
+			.collect(),
+		super_interfaces: vec![],
+		external: definition.external,
+		runtime_owner: definition.runtime_owner,
+	}
+}
+
 fn module(path: &str) -> ModuleIdentity {
 	ModuleIdentity {
 		origin: ModuleOrigin::Project("test".into()),
@@ -168,6 +215,106 @@ fn complete_interfaces_and_impls_populate_owned_dispatch_registries() {
 	);
 	assert!(inherent.methods["touch"].mutating);
 	assert!(inherent.methods["make"].namespaced);
+}
+
+#[test]
+fn complete_and_recovered_imports_keep_only_ordered_public_members() {
+	for recovered_mode in [false, true] {
+		let owner = module(if recovered_mode {
+			"recovered-private"
+		} else {
+			"complete-private"
+		});
+		let iface_id = id(&owner, "Visible");
+		let struct_id = id(&owner, "Record");
+		let mut interface = exported(iface_id.clone(), "Visible");
+		interface.kind = DefinitionShapeKind::Interface;
+		let mut before = member(
+			&iface_id,
+			"before",
+			MemberKind::Function,
+			InterfaceType::String,
+		);
+		before.visibility = Some(nymph_ast::decl::Visibility::Private);
+		let mut public = member(
+			&iface_id,
+			"public",
+			MemberKind::Function,
+			InterfaceType::Int,
+		);
+		public.parameters.push(ParameterShape {
+			name: None,
+			ty: InterfaceType::String,
+			spread: false,
+			mutable: false,
+		});
+		let mut after = member(
+			&iface_id,
+			"after",
+			MemberKind::Function,
+			InterfaceType::Boolean,
+		);
+		after.visibility = Some(nymph_ast::decl::Visibility::Private);
+		interface.members = vec![before, public.clone(), after];
+		let mut record = exported(struct_id.clone(), "Record");
+		let mut hidden = member(
+			&struct_id,
+			"hidden",
+			MemberKind::Function,
+			InterfaceType::Int,
+		);
+		hidden.visibility = Some(nymph_ast::decl::Visibility::Private);
+		record.members = vec![
+			hidden,
+			member(
+				&struct_id,
+				"shown",
+				MemberKind::Function,
+				InterfaceType::String,
+			),
+		];
+
+		let input = if recovered_mode {
+			Arc::new(ModuleEnvironment::Recovered(RecoveredModuleInterface {
+				module: owner,
+				exports: vec![recovered(interface), recovered(record)],
+				support_definitions: vec![],
+				implementations: vec![],
+				fingerprint: 0,
+			}))
+		} else {
+			complete(owner, vec![interface, record])
+		};
+		let env = SemanticEnvironment::from_modules(module("consumer"), &[input]).unwrap();
+		let iface = &env.imported.interfaces[&env.imported.defs.by_stable(&iface_id).unwrap()];
+		assert_eq!(
+			iface
+				.runtime_members
+				.iter()
+				.map(|member| member.name.as_str())
+				.collect::<Vec<_>>(),
+			vec!["public"]
+		);
+		assert_eq!(
+			iface
+				.methods
+				.keys()
+				.map(|name| name.as_str())
+				.collect::<Vec<_>>(),
+			vec!["public"]
+		);
+		assert_eq!(
+			iface.methods["public"].definition.as_ref(),
+			Some(&public.id)
+		);
+		assert!(matches!(
+			env.interner.kind(iface.methods["public"].params[0]),
+			TyKind::String
+		));
+		let inherent = env.imported.inherent.impls.iter().find(|implementation| matches!(env.interner.kind(implementation.self_ty), TyKind::Adt(def, _) if *def == env.imported.defs.by_stable(&struct_id).unwrap())).unwrap();
+		assert!(inherent.methods.contains_key("shown"));
+		assert!(!inherent.methods.contains_key("hidden"));
+	}
 }
 
 #[test]

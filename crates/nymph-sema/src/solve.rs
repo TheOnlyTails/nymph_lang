@@ -83,7 +83,7 @@ impl Checker<'_> {
 		let receiver = self.strip_mut(resolved);
 
 		if let Some((params, ty, target, implementation, method_span, type_arguments)) =
-			self.resolve_inherent_value(receiver, name, span)
+			self.resolve_inherent_value(receiver, receiver_is_mut, name, span)
 		{
 			let resolved_target =
 				target
@@ -232,7 +232,10 @@ impl Checker<'_> {
 		}
 	}
 
-	fn param_interface_bounds(&self, param: ParamIdx) -> Vec<(DefId, Vec<(EcoString, Ty)>)> {
+	pub(crate) fn param_interface_bounds(
+		&self,
+		param: ParamIdx,
+	) -> Vec<(DefId, Vec<(EcoString, Ty)>)> {
 		let mut bounds = Vec::new();
 		if let Some(interfaces) = self.param_bounds.get(&param) {
 			for &interface in interfaces {
@@ -542,6 +545,39 @@ impl Checker<'_> {
 		}
 		self.emit(span, TypeError::NoNamespacedFnOnParam { name: name.into() });
 		(self.interner.error(), None, Vec::new())
+	}
+
+	pub(crate) fn resolve_param_namespaced_value(
+		&mut self,
+		param: ParamIdx,
+		name: &str,
+		span: Span,
+	) -> Option<(Vec<Ty>, Ty)> {
+		let param_ty = self.interner.mk_param(param);
+		for (iface_def, bound_args) in self.param_interface_bounds(param) {
+			let iface = self.interfaces.get(&iface_def)?.clone();
+			let Some(method) = iface.methods.get(name).cloned() else {
+				continue;
+			};
+			let mut substitution = FxHashMap::default();
+			for (index, generic) in iface.generics.iter().enumerate() {
+				let ty = bound_args
+					.iter()
+					.find(|(name, _)| name == generic)
+					.map(|(_, ty)| *ty)
+					.unwrap_or_else(|| self.fresh());
+				substitution.insert(ParamIdx(index as u32), ty);
+			}
+			let (params, ret, _) = self.instantiate_iface_method_signature(
+				&method,
+				substitution,
+				iface.generics.len(),
+				param_ty,
+				span,
+			);
+			return Some((params, ret));
+		}
+		None
 	}
 
 	/// Resolve an instance method `recv.name(args)` where `recv` is a generic parameter,
@@ -863,7 +899,7 @@ impl Checker<'_> {
 
 		// Inherent methods take priority over interface methods.
 		if let Some((params, ret, target, implementation, method_span, type_arguments)) =
-			self.resolve_inherent(recv, name, arg_tys, arg_lits, span)
+			self.resolve_inherent(recv, recv_is_mut, name, arg_tys, arg_lits, span)
 		{
 			let resolved_target =
 				target

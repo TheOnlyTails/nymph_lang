@@ -46,6 +46,47 @@ use crate::{
 	def::{self, DefMap},
 };
 
+/// Checker-owned member candidates for the member access being edited at
+/// `offset`. The accepted interval is half-open and starts immediately after
+/// the receiver; malformed/unresolved accesses safely return an empty slice.
+#[must_use]
+pub fn member_completions_at(
+	analysis: &crate::SemanticAnalysis,
+	offset: usize,
+) -> Vec<crate::MemberCompletion> {
+	let mut expressions = Vec::new();
+	for declaration in &analysis.module.members {
+		collect_decl_exprs(declaration, &mut expressions);
+	}
+	expressions
+		.into_iter()
+		.filter_map(|expression| {
+			let ExprKind::MemberAccess { parent, member, .. } = &expression.kind else {
+				return None;
+			};
+			// A recovered bare dot has a zero-width missing member and may also
+			// leave the access expression ending at the receiver boundary. The dot
+			// byte is nevertheless the one valid query position; preserve the
+			// strict half-open contract by synthesizing exactly that one byte.
+			let end = member
+				.1
+				.end
+				.max(expression.span.end)
+				.max(parent.span.end.saturating_add(1));
+			(parent.span.end <= offset && offset < end)
+				.then_some((expression.span.end - expression.span.start, parent.id))
+		})
+		.min_by_key(|(width, _)| *width)
+		.map(|(_, receiver)| {
+			analysis
+				.checked
+				.annotations
+				.member_completions(receiver)
+				.to_vec()
+		})
+		.unwrap_or_default()
+}
+
 /// Editor-facing category of a name made lexically available by an import.
 ///
 /// This deliberately carries only stable semantic meaning needed by tooling;
@@ -5588,6 +5629,220 @@ mod type_at_tests {
 			type_at(&module, &checked, offset),
 			Some("namespace func make(): int".to_string())
 		);
+	}
+}
+
+#[cfg(test)]
+mod member_completion_tests {
+	use std::sync::Arc;
+
+	use super::*;
+	use crate::{MemberCompletionKind as Kind, ModuleAnnotations, SemanticAnalysis, check_module};
+
+	fn analyze(source: &str) -> (SemanticAnalysis, Vec<nymph_diagnostics::Diagnostic>) {
+		let parsed = nymph_syntax::parse_module(source, "member_completion.nym");
+		let checked = check_module(&parsed.tree);
+		let diagnostics = checked.diags.clone();
+		let facts = Arc::new(checked.facts);
+		(
+			SemanticAnalysis {
+				module: Arc::new(parsed.tree),
+				annotations: Arc::new(ModuleAnnotations::from(facts.annotations.clone())),
+				checked: facts,
+				declarations: Arc::default(),
+				import_references: Arc::default(),
+			},
+			diagnostics,
+		)
+	}
+
+	fn at(source: &str, occurrence: &str) -> Vec<(String, Kind, String)> {
+		let (analysis, _) = analyze(source);
+		let start = source.rfind(occurrence).expect("completion occurrence");
+		let dot = start + occurrence.find('.').expect("member dot");
+		member_completions_at(&analysis, dot)
+			.into_iter()
+			.map(|item| (item.name.to_string(), item.kind, item.detail))
+			.collect()
+	}
+
+	#[test]
+	fn generic_struct_fields_are_substituted_and_aliases_are_static_values() {
+		let source = "struct Box<T>(value: T) { namespace func make(): int = 1 }\ntype Alias = Box<string>\nfunc read(box: Box<string>): string = box.value\nfunc static_read(): int = Alias.make";
+		assert_eq!(
+			at(source, "box.value")[0],
+			("value".into(), Kind::Field, "string".into())
+		);
+		assert_eq!(
+			at(source, "Alias.make"),
+			vec![("make".into(), Kind::Function, "() -> int".into())]
+		);
+	}
+
+	#[test]
+	fn inherent_concrete_interface_and_inherited_default_methods_are_ordered() {
+		let source = "interface Child { func base(): int = 1\nfunc child(): string }\nstruct Item { func own(): boolean = true }\nimpl Child for Item { func child(): string = \"\" }\nfunc read(item: Item): int = item.own";
+		let items = at(source, "item.own");
+		assert_eq!(
+			items.iter().map(|i| i.0.as_str()).collect::<Vec<_>>(),
+			vec!["base", "child", "own"]
+		);
+		assert!(items.iter().all(|i| i.1 == Kind::Method));
+	}
+
+	#[test]
+	fn constrained_generic_parameter_excludes_unbounded_and_non_applicable_methods() {
+		let source = "interface Named { func name(): string }\ninterface Other { func other(): int }\nfunc bounded<T: Named>(value: T): string = value.name\nfunc plain<U>(value: U): U = value.nope";
+		assert_eq!(
+			at(source, "value.name"),
+			vec![("name".into(), Kind::Method, "() -> string".into())]
+		);
+		assert!(at(source, "value.nope").is_empty());
+	}
+
+	#[test]
+	fn mutating_methods_obey_place_capability_without_same_name_suppression() {
+		let source = "struct Cell { mut func change(): int = 1 }\nstruct Other { func change(): string = \"\" }\nfunc mutable(value: mut Cell): int = value.change\nfunc immutable(value: Cell): int = value.change\nfunc owned(): int = Cell().change";
+		assert!(at(source, "value.change").is_empty());
+		assert_eq!(at(source, "Cell().change")[0].0, "change");
+		let mutable_source = source.replacen("value.change", "value.change", 1);
+		let (analysis, _) = analyze(&mutable_source);
+		let first = mutable_source.find("value.change").unwrap() + "value".len();
+		assert_eq!(member_completions_at(&analysis, first)[0].name, "change");
+
+		let owned =
+			"struct Cell { mut func change(): int = 1 }\nfunc take(): () -> int = Cell().change";
+		let (_, diagnostics) = analyze(owned);
+		assert!(diagnostics.is_empty(), "{diagnostics:?}");
+	}
+
+	#[test]
+	fn receiver_and_method_generics_render_callable_detail() {
+		let source = "struct Box<T> { func map<U>(f: (T) -> U): U = f(this.value) }\nfunc use_it(box: Box<int>): int = box.map";
+		assert_eq!(
+			at(source, "box.map"),
+			vec![("map".into(), Kind::Method, "((int) -> _) -> _".into())]
+		);
+	}
+
+	#[test]
+	fn static_namespace_candidates_exclude_instance_members() {
+		let source = "enum Choice { Pick(value: int) namespace func make(): Choice = Pick(value = 1) func instance(): int = 1 }\nfunc use_it(): Choice = Choice.make";
+		let items = at(source, "Choice.make");
+		assert_eq!(
+			items.iter().map(|i| (&i.0, i.1)).collect::<Vec<_>>(),
+			vec![
+				(&"Pick".into(), Kind::Variant),
+				(&"make".into(), Kind::Function)
+			]
+		);
+		assert!(!items.iter().any(|i| i.0 == "instance"));
+	}
+
+	#[test]
+	fn field_and_variant_dedupe_precedence_is_deterministic() {
+		let source = "struct Pair(value: int) { func value(): string = \"\" }\nenum E { Same namespace func Same(): int = 1 }\nfunc read(pair: Pair): int = pair.value\nfunc static_read(): int = E.Same";
+		assert_eq!(
+			at(source, "pair.value"),
+			vec![("value".into(), Kind::Field, "int".into())]
+		);
+		assert_eq!(at(source, "E.Same")[0].1, Kind::Variant);
+	}
+
+	#[test]
+	fn malformed_receivers_are_empty_and_member_interval_is_strictly_half_open() {
+		let source = "struct Point(x: int)\nfunc read(point: Point): int = point.x";
+		let (analysis, _) = analyze(source);
+		let dot = source.rfind('.').unwrap();
+		let end = source.len();
+		assert!(!member_completions_at(&analysis, dot).is_empty());
+		assert!(member_completions_at(&analysis, end).is_empty());
+		assert!(at("func broken(): int = unknown.member", "unknown.member").is_empty());
+	}
+
+	#[test]
+	fn repeated_checking_and_queries_preserve_diagnostics_and_results() {
+		let source = "interface Marker { func mark(): int }\nimpl Marker for int { func mark(): int = 1 }\nenum Choice<T: Marker> { Pick(value: T) namespace func make(value: T): Choice<T> = Pick(value = value) }\ntype IntChoice = Choice<int>\nfunc read(): IntChoice = IntChoice.Pick(value = 1)";
+		let (first, first_diagnostics) = analyze(source);
+		let dot = source.rfind("IntChoice.").unwrap() + "IntChoice".len();
+		let expected = member_completions_at(&first, dot);
+		assert_eq!(member_completions_at(&first, dot), expected);
+		let (second, second_diagnostics) = analyze(source);
+		assert_eq!(first_diagnostics, second_diagnostics);
+		assert_eq!(member_completions_at(&second, dot), expected);
+	}
+
+	#[test]
+	fn qualified_calls_record_completion_facts_without_reinferring_the_callee() {
+		let source = "namespace Tools { func run<T>(value: T): T = value }\nstruct Point { func get(): int = 1 }\nstruct Vault { namespace func make(): Vault = Vault() }\nenum Choice { Pick }\ninterface Default { func default(): self }\nfunc use<R: Default>(point: Point): int = { point.get()\nVault.make()\nChoice.Pick()\nTools.run(1)\nR.default()\npoint.get() }";
+		for (occurrence, expected) in [
+			("point.get()", "get"),
+			("Vault.make()", "make"),
+			("Choice.Pick()", "Pick"),
+			("Tools.run(1)", "run"),
+			("R.default()", "default"),
+		] {
+			assert!(
+				at(source, occurrence).iter().any(|item| item.0 == expected),
+				"missing {expected} at {occurrence}"
+			);
+		}
+	}
+
+	#[test]
+	fn alias_statics_and_generic_static_details_use_the_concrete_target() {
+		let source = "enum Choice<T> { Pick(value: T) namespace func make(value: T): Choice<T> = Pick(value = value) }\ntype Strings = Choice<string>\nnamespace Tools { func same<T>(value: T): T = value }\nfunc use(): Strings = { let picked: Strings = Strings.Pick(value = \"x\")\nlet made: Strings = Strings.make(\"x\")\nlet text: string = Tools.same(\"x\")\npicked }";
+		let items = at(source, "Strings.make(\"x\")");
+		assert!(items.contains(&(
+			"Pick".into(),
+			Kind::Variant,
+			"(string) -> Choice<string>".into()
+		)));
+		assert!(items.contains(&(
+			"make".into(),
+			Kind::Function,
+			"(string) -> Choice<string>".into()
+		)));
+		assert_eq!(
+			at(source, "Tools.same(\"x\")"),
+			vec![("same".into(), Kind::Function, "(_) -> _".into())]
+		);
+		let (_, diagnostics) = analyze(source);
+		assert!(diagnostics.is_empty(), "{diagnostics:?}");
+	}
+
+	#[test]
+	fn alias_static_calls_ignore_same_named_methods_for_other_instantiations() {
+		let source = "struct Box<T>(value: T)\nimpl Box<int> { namespace func make(value: int): Box<int> = Box(value = value) }\nimpl Box<string> { namespace func make(value: string): Box<string> = Box(value = value) }\ntype Strings = Box<string>\nfunc use(): Strings = Strings.make(\"ok\")";
+		assert_eq!(
+			at(source, "Strings.make(\"ok\")"),
+			vec![(
+				"make".into(),
+				Kind::Function,
+				"(string) -> Box<string>".into()
+			)]
+		);
+		let (_, diagnostics) = analyze(source);
+		assert!(diagnostics.is_empty(), "{diagnostics:?}");
+	}
+
+	#[test]
+	fn receiver_resolved_later_still_has_member_candidates() {
+		let source = "external(make) func make<T>(): T\nstruct Point(x: int)\nfunc use(): int = { let value = make()\nvalue.x\nlet point: Point = value\npoint.x }";
+		assert_eq!(
+			at(source, "value.x"),
+			vec![("x".into(), Kind::Field, "int".into())]
+		);
+		let (_, diagnostics) = analyze(source);
+		assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+		let bounded = "external(make) func make<T>(): T\ninterface Named { func name(): string }\nfunc use<T: Named>(): string = { let value = make()\nvalue.name\nlet typed: T = value\ntyped.name() }";
+		assert_eq!(
+			at(bounded, "value.name"),
+			vec![("name".into(), Kind::Method, "() -> string".into())]
+		);
+		let (_, diagnostics) = analyze(bounded);
+		assert!(diagnostics.is_empty(), "{diagnostics:?}");
 	}
 }
 

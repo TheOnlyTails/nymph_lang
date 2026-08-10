@@ -173,6 +173,16 @@ enum BoundFinalizationDisposition {
 	Check(TyKind),
 }
 
+pub(crate) struct PendingMemberCompletion {
+	receiver: NodeId,
+	ty: Ty,
+	span: Span,
+	temporary_receiver: bool,
+	param_bounds: FxHashMap<ParamIdx, Vec<DefId>>,
+	param_bound_details: FxHashMap<ParamIdx, Vec<crate::iface::Bound>>,
+	checking_interface_default: Option<(DefId, ParamIdx)>,
+}
+
 impl<'m> Checker<'m> {
 	pub(crate) fn push_control_label(
 		&mut self,
@@ -1556,6 +1566,7 @@ impl<'m> Checker<'m> {
 			&& self.lookup_local(&type_name.0).is_none()
 			&& let Some(def) = self.defs.get(&type_name.0)
 		{
+			self.record_member_completion_facts(parent, None, member.1);
 			self
 				.annotations
 				.record_definition_target(parent.id, self.defs.stable(def));
@@ -1669,6 +1680,56 @@ impl<'m> Checker<'m> {
 					);
 					return (self.interner.error(), None);
 				}
+				DefKind::TypeAlias => {
+					let Some(alias) = self.sigs.aliases.get(&def).cloned() else {
+						return (self.interner.error(), None);
+					};
+					let target = alias.target;
+					let TyKind::Adt(owner, _) = self.interner.kind(target).clone() else {
+						return (self.interner.error(), None);
+					};
+					if let Some(variant) = self
+						.sigs
+						.enums
+						.get(&owner)
+						.and_then(|enumeration| enumeration.variants.iter().position(|v| v.name == member.0))
+					{
+						return (
+							self.infer_variant_ctor(owner, variant, args, member.1, id, Some(target)),
+							None,
+						);
+					}
+					let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
+					let arg_lits = arg_int_lits(args);
+					if let Some((ret, target, type_arguments)) = self.resolve_namespaced_on(
+						owner,
+						Some(target),
+						&member.0,
+						&arg_tys,
+						&arg_lits,
+						member.1,
+					) {
+						self
+							.annotations
+							.record_generic_call_arguments(id, type_arguments);
+						self.annotations.record_direct_namespace_member(func.id);
+						self
+							.annotations
+							.record_definition_target(id, target.as_ref());
+						self
+							.annotations
+							.record_definition_target(func.id, target.as_ref());
+						return (ret, None);
+					}
+					self.emit(
+						member.1,
+						TypeError::NoNamespacedFn {
+							ty: type_name.0.clone(),
+							name: member.0.clone(),
+						},
+					);
+					return (self.interner.error(), None);
+				}
 				_ => {}
 			}
 		}
@@ -1680,6 +1741,7 @@ impl<'m> Checker<'m> {
 			&& self.lookup_local(&pname.0).is_none()
 			&& let Some(pidx) = self.lookup_param(&pname.0)
 		{
+			self.record_member_completion_facts(parent, None, member.1);
 			let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
 			let (result, target, type_arguments) =
 				self.resolve_param_namespaced(pidx, &member.0, &arg_tys, member.1);
@@ -1705,6 +1767,7 @@ impl<'m> Checker<'m> {
 		// Method call: `receiver.method(args…)` resolves through the interface solver.
 		if let ExprKind::MemberAccess { parent, member, .. } = &func.kind {
 			let recv = self.infer(parent);
+			self.record_member_completion_facts(parent, Some(recv), member.1);
 			// A temporary (rvalue) receiver is owned here, so present it to the solver as
 			// `mut`: a `mut func` such as an iterator's `fold`/`to_list`/`count` may then be
 			// called directly on `a.map(f)` without an intermediate `let mut` binding.
@@ -1954,11 +2017,12 @@ impl<'m> Checker<'m> {
 			&& let Some(definition) = self.defs.get(&name.0)
 			&& matches!(
 				self.defs.data(definition).kind,
-				DefKind::Namespace | DefKind::Struct | DefKind::Enum
+				DefKind::Namespace | DefKind::Struct | DefKind::Enum | DefKind::TypeAlias
 			) {
 			return (self.infer_member(parent, member, span, id), None);
 		}
 		let parent_ty = self.infer(parent);
+		self.record_member_completion_facts(parent, Some(parent_ty), span);
 		if matches!(self.interner.kind(parent_ty), TyKind::Never) {
 			return (self.interner.never(), None);
 		}
@@ -1973,7 +2037,15 @@ impl<'m> Checker<'m> {
 			}
 			_ => false,
 		};
-		if !has_field && let Some(resolution) = self.resolve_method_value(parent_ty, member, span) {
+		let method_receiver = if (!expr_is_place(parent) || self.custom_index_value(parent))
+			&& !matches!(self.interner.kind(resolved_parent), TyKind::Mut(_))
+		{
+			self.interner.mk_mut(resolved_parent)
+		} else {
+			parent_ty
+		};
+		if !has_field && let Some(resolution) = self.resolve_method_value(method_receiver, member, span)
+		{
 			self
 				.annotations
 				.record_generic_call_arguments(id, resolution.type_arguments.clone());
@@ -1996,13 +2068,347 @@ impl<'m> Checker<'m> {
 		(self.member_ty_of(parent_ty, member, span, Some(id)), None)
 	}
 
+	/// Capture completion at the point where all lexical generic bounds and place
+	/// mutability are live. Tooling consumes these immutable facts and never
+	/// reconstructs solver decisions.
+	fn record_member_completion_facts(&mut self, parent: &Expr, inferred: Option<Ty>, span: Span) {
+		use crate::{MemberCompletion, MemberCompletionKind};
+		let mut out = Vec::new();
+		if let ExprKind::Identifier(name) = &parent.kind
+			&& self.lookup_local(&name.0).is_none()
+			&& let Some(param) = self.lookup_param(&name.0)
+		{
+			let mut names = self
+				.param_interface_bounds(param)
+				.into_iter()
+				.filter_map(|(definition, _)| self.interfaces.get(&definition))
+				.flat_map(|interface| interface.methods.keys().cloned())
+				.collect::<Vec<_>>();
+			names.sort();
+			names.dedup();
+			for candidate_name in names {
+				let checkpoint = self.table.snapshot();
+				let diagnostics = self.diags.len();
+				let pending_bounds = self.pending_bounds.len();
+				let pending_operators = self.pending_operators.len();
+				let pending_bound_arg_mut = self.pending_bound_arg_mut.clone();
+				let synthetic_params = self.synthetic_params;
+				let synthetic_bounds = self.synthetic_bounds.clone();
+				let synthetic_bound_details = self.synthetic_bound_details.clone();
+				let annotations = self.annotations.clone();
+				let resolved = self.resolve_param_namespaced_value(param, &candidate_name, span);
+				let detail = resolved.map(|(params, ret)| {
+					let ty = self.interner.mk_fn(params, ret);
+					self.display(ty)
+				});
+				self.table.rollback_to(checkpoint);
+				self.diags.truncate(diagnostics);
+				self.pending_bounds.truncate(pending_bounds);
+				self.pending_operators.truncate(pending_operators);
+				self.pending_bound_arg_mut = pending_bound_arg_mut;
+				self.synthetic_params = synthetic_params;
+				self.synthetic_bounds = synthetic_bounds;
+				self.synthetic_bound_details = synthetic_bound_details;
+				self.annotations = annotations;
+				if let Some(detail) = detail {
+					out.push(MemberCompletion {
+						name: candidate_name,
+						kind: MemberCompletionKind::Function,
+						detail,
+					});
+				}
+			}
+			self.annotations.record_member_completions(parent.id, out);
+			return;
+		}
+		if let ExprKind::Identifier(name) = &parent.kind
+			&& self.lookup_local(&name.0).is_none()
+			&& let Some(def) = self.defs.get(&name.0)
+		{
+			let checkpoint = self.table.snapshot();
+			let diagnostics = self.diags.len();
+			let pending_bounds = self.pending_bounds.len();
+			let pending_operators = self.pending_operators.len();
+			let pending_bound_arg_mut = self.pending_bound_arg_mut.clone();
+			let synthetic_params = self.synthetic_params;
+			let synthetic_bounds = self.synthetic_bounds.clone();
+			let synthetic_bound_details = self.synthetic_bound_details.clone();
+			let annotations = self.annotations.clone();
+			match self.defs.data(def).kind {
+				DefKind::Namespace => {
+					if let Some(namespace) = self.sigs.namespaces.get(&def).cloned() {
+						for (name, member) in namespace.members {
+							let (kind, detail) = match member {
+								NamespaceMemberSig::Func { sig, .. } => {
+									let (ty, _) = self.namespace_func_type(&sig, span);
+									(MemberCompletionKind::Function, self.display(ty))
+								}
+								NamespaceMemberSig::Value { ty, mutable, .. } => {
+									let kind = if mutable {
+										MemberCompletionKind::Variable
+									} else {
+										MemberCompletionKind::Value
+									};
+									(kind, self.display(ty))
+								}
+							};
+							out.push(MemberCompletion { name, kind, detail });
+						}
+					}
+				}
+				DefKind::Struct | DefKind::Enum | DefKind::TypeAlias => {
+					let owner = if matches!(self.defs.data(def).kind, DefKind::TypeAlias) {
+						self
+							.sigs
+							.aliases
+							.get(&def)
+							.and_then(|alias| match self.interner.kind(alias.target) {
+								TyKind::Adt(owner, _) => Some(*owner),
+								_ => None,
+							})
+					} else {
+						Some(def)
+					};
+					let concrete_owner = if matches!(self.defs.data(def).kind, DefKind::TypeAlias) {
+						self.sigs.aliases.get(&def).map(|alias| alias.target)
+					} else {
+						None
+					};
+					if let Some(enumeration) = owner.and_then(|owner| self.sigs.enums.get(&owner)).cloned() {
+						let result =
+							concrete_owner.unwrap_or_else(|| self.instantiate_enum(owner.unwrap_or(def)).ty);
+						let subst = match self.interner.kind(result) {
+							TyKind::Adt(_, args) => adt_subst(args),
+							_ => FxHashMap::default(),
+						};
+						for variant in enumeration.variants {
+							let fields = variant
+								.fields
+								.into_iter()
+								.map(|(name, ty)| (name, self.subst(ty, &subst, Some(result))))
+								.collect::<Vec<_>>();
+							let detail = if fields.is_empty() {
+								self.display(result)
+							} else {
+								let ty = self
+									.interner
+									.mk_fn(fields.into_iter().map(|(_, ty)| ty).collect(), result);
+								self.display(ty)
+							};
+							out.push(MemberCompletion {
+								name: variant.name,
+								kind: MemberCompletionKind::Variant,
+								detail,
+							});
+						}
+					}
+					let mut names = owner
+						.into_iter()
+						.flat_map(|owner| self.inherent.candidates(crate::iface::Head::Adt(owner)))
+						.flat_map(|index| self.inherent.impls[index].methods.keys().cloned())
+						.collect::<Vec<_>>();
+					names.sort();
+					names.dedup();
+					for name in names {
+						let checkpoint = self.table.snapshot();
+						let diagnostics = self.diags.len();
+						let pending_bounds = self.pending_bounds.len();
+						let pending_operators = self.pending_operators.len();
+						let pending_bound_arg_mut = self.pending_bound_arg_mut.clone();
+						let synthetic_params = self.synthetic_params;
+						let synthetic_bounds = self.synthetic_bounds.clone();
+						let synthetic_bound_details = self.synthetic_bound_details.clone();
+						let annotations = self.annotations.clone();
+						let mut candidate = None;
+						if let Some((params, ret, _, _)) =
+							self.resolve_namespaced_value_on(owner.unwrap_or(def), concrete_owner, &name, span)
+							&& self.diags.len() == diagnostics
+							&& !matches!(self.interner.kind(ret), TyKind::Error)
+						{
+							let ty = self.interner.mk_fn(params, ret);
+							candidate = Some(self.display(ty));
+						}
+						self.diags.truncate(diagnostics);
+						self.table.rollback_to(checkpoint);
+						self.pending_bounds.truncate(pending_bounds);
+						self.pending_operators.truncate(pending_operators);
+						self.pending_bound_arg_mut = pending_bound_arg_mut;
+						self.synthetic_params = synthetic_params;
+						self.synthetic_bounds = synthetic_bounds;
+						self.synthetic_bound_details = synthetic_bound_details;
+						self.annotations = annotations;
+						if let Some(detail) = candidate {
+							out.push(MemberCompletion {
+								name,
+								kind: MemberCompletionKind::Function,
+								detail,
+							});
+						}
+					}
+				}
+				_ => {}
+			}
+			self.diags.truncate(diagnostics);
+			self.table.rollback_to(checkpoint);
+			self.pending_bounds.truncate(pending_bounds);
+			self.pending_operators.truncate(pending_operators);
+			self.pending_bound_arg_mut = pending_bound_arg_mut;
+			self.synthetic_params = synthetic_params;
+			self.synthetic_bounds = synthetic_bounds;
+			self.synthetic_bound_details = synthetic_bound_details;
+			self.annotations = annotations;
+			self.annotations.record_member_completions(parent.id, out);
+			return;
+		}
+
+		let Some(recv) = inferred else {
+			self.annotations.record_member_completions(parent.id, out);
+			return;
+		};
+		let resolved = self.resolve_deep(recv);
+		if matches!(self.interner.kind(resolved), TyKind::Error) {
+			self.annotations.record_member_completions(parent.id, out);
+			return;
+		}
+		let temporary_receiver = !expr_is_place(parent) || self.custom_index_value(parent);
+		if self.has_infer(resolved) {
+			self
+				.pending_member_completions
+				.push(PendingMemberCompletion {
+					receiver: parent.id,
+					ty: resolved,
+					span,
+					temporary_receiver,
+					param_bounds: self.param_bounds.clone(),
+					param_bound_details: self.param_bound_details.clone(),
+					checking_interface_default: self.checking_interface_default,
+				});
+			self.annotations.record_member_completions(parent.id, out);
+			return;
+		}
+		self.record_value_member_completion_facts(parent.id, resolved, span, temporary_receiver);
+	}
+
+	fn record_value_member_completion_facts(
+		&mut self,
+		receiver: NodeId,
+		recv: Ty,
+		span: Span,
+		temporary_receiver: bool,
+	) {
+		use crate::{MemberCompletion, MemberCompletionKind};
+		let mut out = Vec::new();
+		let dispatch = if temporary_receiver && !matches!(self.interner.kind(recv), TyKind::Mut(_)) {
+			self.interner.mk_mut(recv)
+		} else {
+			recv
+		};
+		let nominal = self.strip_mut(recv);
+		if let TyKind::Adt(def, args) = self.interner.kind(nominal).clone()
+			&& let Some(sig) = self.sigs.structs.get(&def).cloned()
+		{
+			let subst = adt_subst(&args);
+			for (name, ty) in sig.fields {
+				let ty = self.subst(ty, &subst, Some(nominal));
+				out.push(MemberCompletion {
+					name,
+					kind: MemberCompletionKind::Field,
+					detail: self.display(ty),
+				});
+			}
+		}
+		let mut names = self
+			.inherent
+			.impls
+			.iter()
+			.flat_map(|i| i.methods.keys().cloned())
+			.chain(
+				self
+					.interfaces
+					.values()
+					.flat_map(|i| i.methods.keys().cloned()),
+			)
+			.collect::<Vec<_>>();
+		names.sort();
+		names.dedup();
+		for name in names {
+			if out.iter().any(|candidate| candidate.name == name) {
+				continue;
+			}
+			let checkpoint = self.table.snapshot();
+			let diagnostics = self.diags.len();
+			let pending_bounds = self.pending_bounds.len();
+			let pending_operators = self.pending_operators.len();
+			let pending_bound_arg_mut = self.pending_bound_arg_mut.clone();
+			let synthetic_params = self.synthetic_params;
+			let synthetic_bounds = self.synthetic_bounds.clone();
+			let synthetic_bound_details = self.synthetic_bound_details.clone();
+			let annotations = self.annotations.clone();
+			if let Some(method) = self.resolve_method_value(dispatch, &name, span)
+				&& self.diags.len() == diagnostics
+				&& !matches!(self.interner.kind(method.ty), TyKind::Error)
+			{
+				let ty = self.interner.mk_fn(method.params, method.ty);
+				let detail = self.display(ty);
+				out.push(MemberCompletion {
+					name,
+					kind: MemberCompletionKind::Method,
+					detail,
+				});
+			}
+			self.diags.truncate(diagnostics);
+			self.table.rollback_to(checkpoint);
+			self.pending_bounds.truncate(pending_bounds);
+			self.pending_operators.truncate(pending_operators);
+			self.pending_bound_arg_mut = pending_bound_arg_mut;
+			self.synthetic_params = synthetic_params;
+			self.synthetic_bounds = synthetic_bounds;
+			self.synthetic_bound_details = synthetic_bound_details;
+			self.annotations = annotations;
+		}
+		self.annotations.record_member_completions(receiver, out);
+	}
+
+	pub(crate) fn finalize_pending_member_completions(&mut self) {
+		for pending in std::mem::take(&mut self.pending_member_completions) {
+			let previous_bounds = std::mem::replace(&mut self.param_bounds, pending.param_bounds);
+			let previous_bound_details =
+				std::mem::replace(&mut self.param_bound_details, pending.param_bound_details);
+			let previous_default = std::mem::replace(
+				&mut self.checking_interface_default,
+				pending.checking_interface_default,
+			);
+			let receiver = self.resolve_deep(pending.ty);
+			if !self.has_infer(receiver) && !matches!(self.interner.kind(receiver), TyKind::Error) {
+				self.record_value_member_completion_facts(
+					pending.receiver,
+					receiver,
+					pending.span,
+					pending.temporary_receiver,
+				);
+			}
+			self.param_bounds = previous_bounds;
+			self.param_bound_details = previous_bound_details;
+			self.checking_interface_default = previous_default;
+		}
+	}
+
 	fn infer_member(&mut self, parent: &Expr, member: &str, span: Span, id: NodeId) -> Ty {
+		if let ExprKind::Identifier(name) = &parent.kind
+			&& self.lookup_local(&name.0).is_none()
+			&& let Some(definition) = self.defs.get(&name.0)
+			&& matches!(
+				self.defs.data(definition).kind,
+				DefKind::Namespace | DefKind::Struct | DefKind::Enum | DefKind::TypeAlias
+			) {
+			self.record_member_completion_facts(parent, None, span);
+		}
 		if let ExprKind::Identifier(name) = &parent.kind
 			&& self.lookup_local(&name.0).is_none()
 			&& let Some(def) = self.defs.get(&name.0)
 			&& matches!(
 				self.defs.data(def).kind,
-				DefKind::Namespace | DefKind::Struct | DefKind::Enum
+				DefKind::Namespace | DefKind::Struct | DefKind::Enum | DefKind::TypeAlias
 			) {
 			self
 				.annotations
@@ -2092,6 +2498,44 @@ impl<'m> Checker<'m> {
 			);
 			return self.interner.error();
 		}
+		if let ExprKind::Identifier(type_name) = &parent.kind
+			&& self.lookup_local(&type_name.0).is_none()
+			&& let Some(alias_def) = self.defs.get(&type_name.0)
+			&& matches!(self.defs.data(alias_def).kind, DefKind::TypeAlias)
+			&& let Some(alias) = self.sigs.aliases.get(&alias_def).cloned()
+			&& let TyKind::Adt(owner, _) = self.interner.kind(alias.target).clone()
+		{
+			if let Some(variant) = self
+				.sigs
+				.enums
+				.get(&owner)
+				.and_then(|enumeration| enumeration.variants.iter().position(|v| v.name == member))
+			{
+				let result = self.variant_value(owner, variant, id, span);
+				self.unify(result, alias.target, span);
+				return alias.target;
+			}
+			if let Some((parameters, return_type, target, type_arguments)) =
+				self.resolve_namespaced_value_on(owner, Some(alias.target), member, span)
+			{
+				self.annotations.record_direct_namespace_member(id);
+				self
+					.annotations
+					.record_definition_target(id, target.as_ref());
+				self
+					.annotations
+					.record_generic_call_arguments(id, type_arguments);
+				return self.interner.mk_fn(parameters, return_type);
+			}
+			self.emit(
+				span,
+				TypeError::NoNamespacedFn {
+					ty: type_name.0.clone(),
+					name: member.into(),
+				},
+			);
+			return self.interner.error();
+		}
 		// `EnumName.Variant` — a variant referenced through its type.
 		if let ExprKind::Identifier(tname) = &parent.kind
 			&& self.lookup_local(&tname.0).is_none()
@@ -2125,6 +2569,7 @@ impl<'m> Checker<'m> {
 		}
 
 		let parent_ty = self.infer(parent);
+		self.record_member_completion_facts(parent, Some(parent_ty), span);
 		self.member_ty_of(parent_ty, member, span, Some(id))
 	}
 

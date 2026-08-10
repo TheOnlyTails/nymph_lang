@@ -19,10 +19,10 @@
 //! across every source in the current project snapshot (see [`references`]);
 //! `textDocument/prepareRename` and `textDocument/rename` edit every occurrence
 //! of a user-written semantic identity (see [`rename`]);
-//! `textDocument/completion` offers lexical names, resolved project imports,
-//! same-module declarations, and keywords from an immutable analysis snapshot
-//! (see [`completion`] — member completion after a `.` is deferred, see its
-//! module doc comment); `workspace/symbol` ranks visible declarations across
+//! `textDocument/completion` offers checker-approved fields and applicable
+//! methods after `.`, plus lexical names, resolved project imports, same-module
+//! declarations, and keywords from an immutable analysis snapshot (see
+//! [`completion`]); `workspace/symbol` ranks visible declarations across
 //! synchronized project modules (see [`workspace_symbols`]);
 //! `textDocument/semanticTokens/full` classifies every
 //! token from the compiler's own lexer + AST, so highlighting stays correct

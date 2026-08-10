@@ -170,6 +170,25 @@ pub struct ExprInfo {
 	pub resolution: Option<Resolution>,
 }
 
+/// One checker-approved member offered to editor tooling.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MemberCompletion {
+	pub name: EcoString,
+	pub kind: MemberCompletionKind,
+	/// Fully instantiated field type or callable signature.
+	pub detail: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum MemberCompletionKind {
+	Field,
+	Method,
+	Function,
+	Value,
+	Variable,
+	Variant,
+}
+
 /// The resolved `(enum, variant)` names behind a variant construction or
 /// reference. Recorded so lowering can emit the Symbol-tag ABI without
 /// re-resolving ambiguous bare variant names (`None`, `Some`).
@@ -227,6 +246,7 @@ pub enum GenericSymbolIdentity {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Annotations {
 	infos: FxHashMap<NodeId, ExprInfo>,
+	member_completions: FxHashMap<NodeId, Vec<MemberCompletion>>,
 	unresolved_qualified_accesses: Vec<UnresolvedQualifiedAccess>,
 	direct_namespace_members: FxHashSet<NodeId>,
 	module_targets: FxHashMap<NodeId, ModuleIdentity>,
@@ -302,6 +322,33 @@ pub struct PositionalFieldResolution {
 }
 
 impl Annotations {
+	pub(crate) fn record_member_completions(
+		&mut self,
+		receiver: NodeId,
+		mut candidates: Vec<MemberCompletion>,
+	) {
+		let precedence = |kind| match kind {
+			MemberCompletionKind::Field | MemberCompletionKind::Variant => 0,
+			_ => 1,
+		};
+		candidates.sort_by(|a, b| {
+			a.name
+				.cmp(&b.name)
+				.then(precedence(a.kind).cmp(&precedence(b.kind)))
+				.then(a.kind.cmp(&b.kind))
+		});
+		candidates.dedup_by(|a, b| a.name == b.name);
+		self.member_completions.insert(receiver, candidates);
+	}
+
+	#[must_use]
+	pub fn member_completions(&self, receiver: NodeId) -> &[MemberCompletion] {
+		self
+			.member_completions
+			.get(&receiver)
+			.map(Vec::as_slice)
+			.unwrap_or_default()
+	}
 	pub(crate) fn record_control_target(&mut self, jump: NodeId, target: ResolvedControlTarget) {
 		self.control_targets.insert(jump, target);
 	}

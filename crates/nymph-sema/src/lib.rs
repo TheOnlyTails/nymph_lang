@@ -49,7 +49,7 @@ pub use analysis::{
 };
 pub use annotate::{
 	Annotations, Checked, CheckedFacts, CheckedSemantic, DispatchKind, ExprInfo,
-	GenericSymbolIdentity, IterMode, Resolution,
+	GenericSymbolIdentity, IterMode, MemberCompletion, MemberCompletionKind, Resolution,
 };
 pub use check::{
 	EntryMode, check_module, check_module_entry, check_module_with_environment,

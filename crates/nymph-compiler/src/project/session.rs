@@ -302,6 +302,9 @@ pub struct ToolingCompletionAnalysis {
 	pub source: Arc<str>,
 	pub imported_names: Arc<[nymph_sema::query::ImportedName]>,
 	pub ambient_names: Arc<[nymph_sema::query::ImportedName]>,
+	/// Checked facts when recovery produced a semantic module. Member completion
+	/// is intentionally absent rather than guessed when no analysis is possible.
+	pub semantic: Option<Arc<nymph_sema::SemanticAnalysis>>,
 }
 
 /// Body-independent declaration facts for one active project module.
@@ -1001,6 +1004,17 @@ impl CompilerSession {
 			source,
 			imported_names,
 			ambient_names,
+			// Completion must retain checker-owned facts for parser-recovered
+			// member accesses such as a trailing `value.`. The ordinary analysis
+			// accessor intentionally rejects modules omitted from the graph's
+			// fully valid semantic order; the tooling query is recovery-capable
+			// and can still check its recovered tree against the same immutable
+			// dependency/prelude environment.
+			semantic: Some(
+				queries::interface_module_analysis(&self.db, key, SemanticModuleInput::Project(input))
+					.semantic
+					.clone(),
+			),
 		})
 	}
 

@@ -2567,15 +2567,14 @@ fn runs_enum_namespaced_static_called_from_a_js_driver() {
 
 #[test]
 fn runs_impl_mut_method_mutates_a_this_field() {
-	// FF2: the checker enforces nothing beyond an ordinary field assignment
-	// for a `mut func` body, so lowering treats it as an ordinary instance
-	// method — and emit now supports a `this.field = ..` assignment target
-	// (previously an `unreachable!` reachable from a zero-diagnostic program).
+	// Lowering treats a `mut func` as an ordinary instance method after the
+	// checker proves the caller has a mutable receiver. Emit supports the
+	// resulting `this.field = ..` assignment target.
 	let src = r#"
 		struct Counter(n: int) {
 			mut func bump(): void = { this.n = this.n + 1 }
 		}
-		func run_bump(c: Counter): int = {
+		func run_bump(c: mut Counter): int = {
 			c.bump()
 			c.n
 		}
@@ -4050,7 +4049,7 @@ fn real_set_insert_stays_a_loud_transitively_external_defer() {
 	// genuine `Set` insert/remove/contains round-trip against the REAL stdlib
 	// cannot run under Node until that separate gap closes — confirmed by probe,
 	// not fixed here.
-	let user = "func f(): boolean = {\n\tlet s = Set(inner = #{})\n\ts.insert(1)\n}";
+	let user = "func f(): boolean = {\n\tlet mut s = Set(inner = #{})\n\ts.insert(1)\n}";
 	let _ = compile_against_real_stdlib(user);
 }
 

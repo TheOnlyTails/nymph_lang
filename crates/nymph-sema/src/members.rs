@@ -411,6 +411,7 @@ impl<'m> Checker<'m> {
 	pub(crate) fn resolve_inherent(
 		&mut self,
 		recv: Ty,
+		receiver_is_mut: bool,
 		name: &str,
 		arg_tys: &[Ty],
 		arg_lits: &[bool],
@@ -434,7 +435,7 @@ impl<'m> Checker<'m> {
 				.impls
 				.get(idx)
 				.and_then(|i| i.methods.get(name))
-				.is_some_and(|m| !m.namespaced);
+				.is_some_and(|m| !m.namespaced && (!m.mutating || receiver_is_mut));
 			if !has {
 				continue;
 			}
@@ -464,6 +465,7 @@ impl<'m> Checker<'m> {
 	pub(crate) fn resolve_inherent_value(
 		&mut self,
 		recv: Ty,
+		receiver_is_mut: bool,
 		name: &str,
 		span: nymph_ast::Span,
 	) -> Option<(
@@ -481,7 +483,7 @@ impl<'m> Checker<'m> {
 			let Some(_) = self.inherent.impls[idx]
 				.methods
 				.get(name)
-				.filter(|method| !method.namespaced)
+				.filter(|method| !method.namespaced && (!method.mutating || receiver_is_mut))
 			else {
 				continue;
 			};
@@ -528,8 +530,28 @@ impl<'m> Checker<'m> {
 		arg_lits: &[bool],
 		span: nymph_ast::Span,
 	) -> Option<(Ty, Option<crate::DefinitionId>, Vec<Ty>)> {
+		self.resolve_namespaced_on(type_def, None, name, arg_tys, arg_lits, span)
+	}
+
+	pub(crate) fn resolve_namespaced_on(
+		&mut self,
+		type_def: DefId,
+		receiver: Option<Ty>,
+		name: &str,
+		arg_tys: &[Ty],
+		arg_lits: &[bool],
+		span: nymph_ast::Span,
+	) -> Option<(Ty, Option<crate::DefinitionId>, Vec<Ty>)> {
 		let candidates = self.inherent.candidates(Head::Adt(type_def));
 		for idx in candidates {
+			if let Some(receiver) = receiver {
+				let snapshot = self.table.snapshot();
+				let applicable = self.inherent_receiver_matches(idx, receiver);
+				self.table.rollback_to(snapshot);
+				if !applicable {
+					continue;
+				}
+			}
 			let target = self
 				.inherent
 				.impls
@@ -538,7 +560,7 @@ impl<'m> Checker<'m> {
 				.filter(|method| method.namespaced)
 				.map(|method| method.definition.clone());
 			if let Some(target) = target {
-				let placeholder = self.interner.error();
+				let placeholder = receiver.unwrap_or_else(|| self.interner.error());
 				let (_, ret, type_arguments) = self.commit_inherent(
 					idx,
 					placeholder,
@@ -563,24 +585,41 @@ impl<'m> Checker<'m> {
 		name: &str,
 		span: nymph_ast::Span,
 	) -> Option<(Vec<Ty>, Ty, Option<DefinitionId>, Vec<Ty>)> {
-		let mut matches = self
-			.inherent
-			.candidates(Head::Adt(type_def))
-			.into_iter()
-			.filter(|index| {
-				self.inherent.impls[*index]
-					.methods
-					.get(name)
-					.is_some_and(|method| method.namespaced)
-			})
-			.collect::<Vec<_>>();
+		self.resolve_namespaced_value_on(type_def, None, name, span)
+	}
+
+	pub(crate) fn resolve_namespaced_value_on(
+		&mut self,
+		type_def: DefId,
+		receiver: Option<Ty>,
+		name: &str,
+		span: nymph_ast::Span,
+	) -> Option<(Vec<Ty>, Ty, Option<DefinitionId>, Vec<Ty>)> {
+		let mut matches = Vec::new();
+		for index in self.inherent.candidates(Head::Adt(type_def)) {
+			let implementation = &self.inherent.impls[index];
+			if !implementation
+				.methods
+				.get(name)
+				.is_some_and(|method| method.namespaced)
+			{
+				continue;
+			}
+			let receiver = receiver.unwrap_or(implementation.self_ty);
+			let snapshot = self.table.snapshot();
+			let applicable = self.inherent_receiver_matches(index, receiver);
+			self.table.rollback_to(snapshot);
+			if applicable {
+				matches.push(index);
+			}
+		}
 		if matches.len() > 1 {
 			self.emit(span, TypeError::AmbiguousCall { name: name.into() });
 			return Some((Vec::new(), self.interner.error(), None, Vec::new()));
 		}
 		let index = matches.pop()?;
 		let target = self.inherent.impls[index].methods[name].definition.clone();
-		let placeholder = self.interner.error();
+		let placeholder = receiver.unwrap_or_else(|| self.interner.error());
 		let (parameters, return_type, type_arguments) =
 			self.commit_inherent(index, placeholder, name, None, span, true);
 		Some((parameters, return_type, target, type_arguments))
@@ -629,7 +668,7 @@ impl<'m> Checker<'m> {
 		);
 		let mut subst = owner.substitution;
 		let impl_self = owner.ty;
-		if !namespaced {
+		if !namespaced || !matches!(self.interner.kind(recv), crate::TyKind::Error) {
 			self.unify(recv, impl_self, span);
 		}
 		let self_concrete = impl_self;
