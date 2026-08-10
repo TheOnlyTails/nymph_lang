@@ -24,7 +24,7 @@ use crate::def::DefKind;
 use crate::identity::DefinitionId;
 use crate::ids::{DefId, ParamIdx};
 use crate::iface::{Bound, Head, head_of};
-use crate::lower::build_param_scope;
+use crate::lower::{build_param_scope, build_param_scope_at};
 use crate::ty::{GenericArgs, Ty};
 
 /// Owned semantic facts for one inherent method. Local syntax is kept separately in
@@ -362,10 +362,7 @@ impl<'m> Checker<'m> {
 				},
 			);
 		}
-		let mut scope = FxHashMap::default();
-		for (j, g) in meta.generics.iter().enumerate() {
-			scope.insert(g.0.name.0.clone(), ParamIdx((base + j) as u32));
-		}
+		let scope = build_param_scope_at(&meta.generics, base);
 		self.push_params(scope);
 		let params = meta
 			.params
@@ -747,10 +744,7 @@ impl<'m> Checker<'m> {
 		};
 
 		let base = owner_generics.len();
-		let mut scope = build_param_scope(owner_generics);
-		for (j, g) in meta.generics.iter().enumerate() {
-			scope.insert(g.0.name.0.clone(), ParamIdx((base + j) as u32));
-		}
+		let scope = build_param_scope_at(&meta.generics, base);
 
 		let snapshot = self.table.snapshot();
 		let diag_mark = self.diags.len();
@@ -762,6 +756,7 @@ impl<'m> Checker<'m> {
 		self.push_params(build_param_scope(owner_generics));
 		self.record_param_bounds(owner_generics, 0);
 		self.pop_params();
+		self.push_params(build_param_scope(owner_generics));
 		self.push_params(scope);
 		self.record_param_bounds(&meta.generics, base);
 		self.push_scope();
@@ -805,6 +800,7 @@ impl<'m> Checker<'m> {
 
 		self.self_ty = prev_self;
 		self.pop_scope();
+		self.pop_params();
 		self.pop_params();
 		self.diags.truncate(diag_mark);
 		self.table.rollback_to(snapshot);
@@ -891,15 +887,13 @@ impl<'m> Checker<'m> {
 		namespaced: bool,
 	) {
 		let base = owner_generics.len();
-		let mut scope = build_param_scope(owner_generics);
-		for (j, g) in meta.generics.iter().enumerate() {
-			scope.insert(g.0.name.0.clone(), ParamIdx((base + j) as u32));
-		}
+		let scope = build_param_scope_at(&meta.generics, base);
 		self.param_bounds.clear();
 		self.param_bound_details.clear();
 		self.push_params(build_param_scope(owner_generics));
 		self.record_param_bounds(owner_generics, 0);
 		self.pop_params();
+		self.push_params(build_param_scope(owner_generics));
 		self.push_params(scope);
 		self.record_param_bounds(&meta.generics, base);
 		self.push_scope();
@@ -932,6 +926,7 @@ impl<'m> Checker<'m> {
 		self.ret_ty = prev_ret;
 		self.self_ty = prev_self;
 		self.pop_scope();
+		self.pop_params();
 		self.pop_params();
 	}
 
@@ -987,7 +982,7 @@ impl<'m> Checker<'m> {
 					);
 				}
 			}
-			self.check_interface_impl_members(self_ty, members);
+			self.check_interface_impl_members(self_ty, members, generics.len());
 			self.pop_params();
 		}
 	}
@@ -1021,14 +1016,11 @@ impl<'m> Checker<'m> {
 			for m in impls {
 				let impl_generics = &m.0.generics;
 				let impl_members = &m.0.members;
-				let combined: Vec<Spanned<GenericParam>> =
-					generics.iter().chain(impl_generics).cloned().collect();
 				self.param_bounds.clear();
 				self.param_bound_details.clear();
 				self.push_params(build_param_scope(generics));
 				self.record_param_bounds(generics, 0);
-				self.pop_params();
-				self.push_params(build_param_scope(&combined));
+				self.push_params(build_param_scope_at(impl_generics, generics.len()));
 				self.record_param_bounds(impl_generics, generics.len());
 				let owner_len = generics.len();
 				let positional: Vec<Ty> = (0..owner_len)
@@ -1037,7 +1029,12 @@ impl<'m> Checker<'m> {
 				let self_ty = self
 					.interner
 					.mk_adt(def, GenericArgs::new(positional, Vec::new()));
-				self.check_interface_impl_members(self_ty, impl_members);
+				self.check_interface_impl_members(
+					self_ty,
+					impl_members,
+					generics.len() + impl_generics.len(),
+				);
+				self.pop_params();
 				self.pop_params();
 			}
 		}
@@ -1046,13 +1043,25 @@ impl<'m> Checker<'m> {
 	/// Check each `func` body in an interface-impl block against its declared (or fresh,
 	/// if omitted) return type, with `this: self_ty` bound. Assumes the impl's generic
 	/// scope and `param_bounds` are already set up by the caller.
-	fn check_interface_impl_members(&mut self, self_ty: Ty, members: &'m [Spanned<ImplMember>]) {
+	fn check_interface_impl_members(
+		&mut self,
+		self_ty: Ty,
+		members: &'m [Spanned<ImplMember>],
+		implementation_generic_base: usize,
+	) {
 		let empty = FxHashMap::default();
 		for m in members {
 			let (meta, body) = match &m.0 {
 				ImplMember::Func { meta, body, .. } => (meta, body),
 				_ => continue,
 			};
+			let saved_param_bounds = self.param_bounds.clone();
+			let saved_param_bound_details = self.param_bound_details.clone();
+			self.push_params(build_param_scope_at(
+				&meta.generics,
+				implementation_generic_base,
+			));
+			self.record_param_bounds(&meta.generics, implementation_generic_base);
 			self.push_scope();
 			// See the matching comment in `check_method_body`: a `mut func`'s
 			// `this` is bound as `mut Self`.
@@ -1085,6 +1094,9 @@ impl<'m> Checker<'m> {
 			self.ret_ty = prev_ret;
 			self.self_ty = prev_self;
 			self.pop_scope();
+			self.pop_params();
+			self.param_bounds = saved_param_bounds;
+			self.param_bound_details = saved_param_bound_details;
 		}
 	}
 
@@ -1159,15 +1171,13 @@ impl<'m> Checker<'m> {
 		let iface_len = iface_generics.len();
 		let self_idx = ParamIdx((iface_len + meta.generics.len()) as u32);
 
-		let mut scope = build_param_scope(iface_generics);
-		for (j, g) in meta.generics.iter().enumerate() {
-			scope.insert(g.0.name.0.clone(), ParamIdx((iface_len + j) as u32));
-		}
+		let scope = build_param_scope_at(&meta.generics, iface_len);
 		self.param_bounds.clear();
 		self.param_bound_details.clear();
 		self.push_params(build_param_scope(iface_generics));
 		self.record_param_bounds(iface_generics, 0);
 		self.pop_params();
+		self.push_params(build_param_scope(iface_generics));
 		self.push_params(scope);
 		self.record_param_bounds(&meta.generics, iface_len);
 		self
@@ -1230,6 +1240,7 @@ impl<'m> Checker<'m> {
 		self.checking_interface_default = prev_checking;
 		self.self_ty = prev_self;
 		self.pop_scope();
+		self.pop_params();
 		self.pop_params();
 	}
 }

@@ -147,6 +147,127 @@ mod tests {
 	}
 
 	#[test]
+	fn query_generic_identity_covers_declaration_and_signature_uses() {
+		let source = "func identity<T>(value: T): T = value";
+		let (_temp, uri, docs, state) = project(&[("main.nym", source)], "main.nym");
+		let snapshot = state.analysis_for_uri(&docs, &uri).unwrap();
+		let offset = source.find("<T>").unwrap() + 1;
+		let symbol = nymph_sema::query::symbol_at(&snapshot.analysis.semantic, offset).unwrap();
+		let occurrences = nymph_sema::query::references_to(&snapshot.analysis.semantic, &symbol);
+		assert_eq!(
+			occurrences
+				.iter()
+				.map(|occurrence| occurrence.span)
+				.collect::<Vec<_>>(),
+			source
+				.match_indices('T')
+				.map(|(offset, _)| nymph_ast::Span::new(offset, offset + 1))
+				.collect::<Vec<_>>()
+		);
+		assert!(occurrences[0].is_declaration);
+		assert!(
+			occurrences[1..]
+				.iter()
+				.all(|occurrence| !occurrence.is_declaration)
+		);
+	}
+
+	#[test]
+	fn same_spelled_function_generics_have_disjoint_references() {
+		let source = "func first<T>(value: T): T = value\nfunc second<T>(value: T): T = value";
+		let (_temp, uri, docs, state) = project(&[("main.nym", source)], "main.nym");
+		for generic_occurrence in [0, 3] {
+			let cursor = position_of(source, "T", generic_occurrence);
+			let found = locations(
+				&docs,
+				&state,
+				&params(&uri, cursor.line, cursor.character, true),
+			)
+			.unwrap();
+			assert_eq!(found.len(), 3);
+			assert_eq!(
+				found
+					.iter()
+					.map(|location| location.range.start.line)
+					.collect::<Vec<_>>(),
+				vec![cursor.line; 3],
+			);
+		}
+	}
+
+	#[test]
+	fn interface_owner_and_shadowing_method_generics_are_distinct() {
+		let source = "interface Mapper<T: Equals<Other = T>> {\n  func keep(value: T): T\n  func map<T: Equals<Other = T>>(value: T): T\n}";
+		let (_temp, uri, docs, state) = project(&[("main.nym", source)], "main.nym");
+		let owner = position_of(source, "T", 0);
+		let owner_refs = locations(
+			&docs,
+			&state,
+			&params(&uri, owner.line, owner.character, true),
+		)
+		.unwrap();
+		assert_eq!(owner_refs.len(), 3);
+		assert!(
+			owner_refs
+				.iter()
+				.all(|location| location.range.start.line <= 1)
+		);
+
+		let method = position_of(source, "T", 4);
+		let method_refs = locations(
+			&docs,
+			&state,
+			&params(&uri, method.line, method.character, true),
+		)
+		.unwrap();
+		assert_eq!(
+			method_refs.len(),
+			4,
+			"constraint/default type use shares shadowing method binding"
+		);
+		assert!(
+			method_refs
+				.iter()
+				.all(|location| location.range.start.line == 2)
+		);
+	}
+
+	#[test]
+	fn nested_impl_generic_shadows_owner_as_a_distinct_declaration_backed_symbol() {
+		let source = "interface Marker { func apply(value: int): int }\nstruct Box<T> {\n  impl<T> Marker { func apply(value: T): T = value }\n}";
+		let (_temp, uri, docs, state) = project(&[("main.nym", source)], "main.nym");
+
+		let owner = position_of(source, "T", 0);
+		let owner_refs = locations(
+			&docs,
+			&state,
+			&params(&uri, owner.line, owner.character, true),
+		)
+		.expect("owner generic declaration is a symbol");
+		assert_eq!(owner_refs.len(), 1);
+		assert_eq!(owner_refs[0].range.start, owner);
+
+		let nested = position_of(source, "T", 1);
+		let nested_refs = locations(
+			&docs,
+			&state,
+			&params(&uri, nested.line, nested.character, true),
+		)
+		.expect("nested impl generic declaration is a symbol");
+		assert_eq!(
+			nested_refs
+				.iter()
+				.map(|location| location.range.start)
+				.collect::<Vec<_>>(),
+			vec![
+				position_of(source, "T", 1),
+				position_of(source, "T", 2),
+				position_of(source, "T", 3),
+			],
+		);
+	}
+
+	#[test]
 	fn member_static_namespace_and_field_cursors_have_exact_declaration_policy() {
 		let source = "struct Point(x: int) {\n  func get(): int = this.x\n  namespace func origin(): Point = Point(x = 0)\n}\nnamespace Host { func answer(): int = 1 }\nfunc use(point: Point): int = point.get() + Point.origin().x + Host.answer()";
 		let (_temp, uri, docs, state) = project(&[("main.nym", source)], "main.nym");

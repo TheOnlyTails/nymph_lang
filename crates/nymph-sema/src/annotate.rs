@@ -10,7 +10,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::ops::Deref;
 
 use crate::Ty;
-use crate::identity::{DefinitionId, ModuleIdentity};
+use crate::identity::{DefinitionId, GenericParameterId, ModuleIdentity};
 use crate::ty::Interner;
 use nymph_hir::hir::MarshalKind;
 
@@ -212,6 +212,16 @@ pub struct GenericNamespacedCall {
 	pub member: DefinitionId,
 }
 
+/// Exact identity of a user-written generic parameter. Parameters owned by a
+/// stable declaration use that owner's binder and ordinal; transient owners
+/// fall back to their declaration token span, which still preserves lexical
+/// shadowing within one immutable module analysis.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum GenericSymbolIdentity {
+	Stable(GenericParameterId),
+	Local(Span),
+}
+
 /// A [`NodeId`]-keyed map of [`ExprInfo`] plus variant resolutions, produced by
 /// checking and consumed by lowering.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -228,6 +238,10 @@ pub struct Annotations {
 	/// Union-pattern alternatives intentionally share one identity.
 	local_declarations: FxHashMap<Span, Span>,
 	type_definition_targets: FxHashMap<Span, DefinitionId>,
+	generic_symbols: FxHashMap<Span, (GenericSymbolIdentity, bool)>,
+	conflicting_generic_symbols: FxHashSet<Span>,
+	stable_generic_declarations: FxHashMap<Span, GenericParameterId>,
+	conflicting_stable_generic_declarations: FxHashSet<Span>,
 	source_definition_targets: FxHashMap<Span, DefinitionId>,
 	variants: FxHashMap<NodeId, VariantResolution>,
 	/// Variant *patterns*, keyed by span — patterns carry no `NodeId`, but each
@@ -487,6 +501,62 @@ impl Annotations {
 			.type_definition_targets
 			.iter()
 			.map(|(&span, target)| (span, target))
+	}
+
+	pub(crate) fn record_generic_symbol(
+		&mut self,
+		span: Span,
+		identity: GenericSymbolIdentity,
+		is_declaration: bool,
+	) {
+		if self.conflicting_generic_symbols.contains(&span) {
+			return;
+		}
+		match self.generic_symbols.entry(span) {
+			std::collections::hash_map::Entry::Vacant(entry) => {
+				entry.insert((identity, is_declaration));
+			}
+			std::collections::hash_map::Entry::Occupied(entry)
+				if entry.get() == &(identity, is_declaration) => {}
+			std::collections::hash_map::Entry::Occupied(entry) => {
+				entry.remove();
+				self.conflicting_generic_symbols.insert(span);
+			}
+		}
+	}
+
+	pub(crate) fn stabilize_generic_declaration(&mut self, span: Span, identity: GenericParameterId) {
+		if self.conflicting_stable_generic_declarations.contains(&span) {
+			return;
+		}
+		match self.stable_generic_declarations.entry(span) {
+			std::collections::hash_map::Entry::Vacant(entry) => {
+				entry.insert(identity);
+			}
+			std::collections::hash_map::Entry::Occupied(entry) if entry.get() == &identity => {}
+			std::collections::hash_map::Entry::Occupied(entry) => {
+				entry.remove();
+				self.conflicting_stable_generic_declarations.insert(span);
+			}
+		}
+	}
+
+	pub(crate) fn suppress_generic_declaration(&mut self, span: Span) {
+		self.generic_symbols.remove(&span);
+		self.conflicting_generic_symbols.insert(span);
+		self.stable_generic_declarations.remove(&span);
+		self.conflicting_stable_generic_declarations.insert(span);
+	}
+
+	pub fn stable_generic_declaration(&self, span: Span) -> Option<&GenericParameterId> {
+		self.stable_generic_declarations.get(&span)
+	}
+
+	pub fn generic_symbols(&self) -> impl Iterator<Item = (Span, &GenericSymbolIdentity, bool)> {
+		self
+			.generic_symbols
+			.iter()
+			.map(|(&span, (identity, declaration))| (span, identity, *declaration))
 	}
 
 	pub(crate) fn record_source_definition_target(

@@ -237,6 +237,126 @@ mod tests {
 	}
 
 	#[test]
+	fn generic_parameter_rename_edits_declaration_and_both_signature_uses() {
+		let source = "func identity<T>(value: T): T = value";
+		let edit = candidate(source, "T", 0)
+			.unwrap()
+			.validate_disk_sources()
+			.unwrap();
+		let Some(DocumentChanges::Edits(documents)) = edit.document_changes else {
+			panic!();
+		};
+		assert_eq!(documents.len(), 1);
+		assert_eq!(documents[0].edits.len(), 3);
+		assert!(
+			documents[0]
+				.edits
+				.iter()
+				.all(|edit| { matches!(edit, OneOf::Left(edit) if edit.new_text == "replacement") })
+		);
+	}
+
+	#[test]
+	fn named_generic_label_renames_with_cross_module_stable_declaration() {
+		let target = "public struct Box<T>(value: T)";
+		let main = "import @/target with (Box)\nfunc make(): Box<T = int> = Box(value = 1)";
+		let (temp, main_uri, docs, state) =
+			project(&[("main.nym", main), ("target.nym", target)], "main.nym");
+		let snapshot = state.analysis_for_uri(&docs, &main_uri).unwrap();
+		let offset = main.find("T =").unwrap();
+		let position = LineIndex::new(main).position(main, offset);
+		let edit = rename_candidate(&docs, &state, &snapshot, position, "Item")
+			.unwrap()
+			.validate_disk_sources()
+			.unwrap();
+		let Some(DocumentChanges::Edits(documents)) = edit.document_changes else {
+			panic!();
+		};
+		assert_eq!(documents.len(), 2);
+		let target_uri = crate::workspace::path_to_uri(&temp.path().join("src/target.nym")).unwrap();
+		let main_edits = documents
+			.iter()
+			.find(|document| document.text_document.uri == main_uri)
+			.unwrap();
+		assert_eq!(main_edits.edits.len(), 1, "named argument label");
+		let target_edits = documents
+			.iter()
+			.find(|document| document.text_document.uri == target_uri)
+			.unwrap();
+		assert_eq!(
+			target_edits.edits.len(),
+			2,
+			"declaration and field type use"
+		);
+		assert!(
+			documents
+				.iter()
+				.flat_map(|document| &document.edits)
+				.all(|edit| { matches!(edit, OneOf::Left(edit) if edit.new_text == "Item") })
+		);
+	}
+
+	#[test]
+	fn named_generic_label_created_in_a_typed_local_body_is_renameable() {
+		let source = "struct Box<T>(value: T)\nfunc make(): Box<int> = {\n  let local: Box<T = int> = Box(value = 1)\n  local\n}";
+		let edit = candidate(source, "T =", 0)
+			.unwrap()
+			.validate_disk_sources()
+			.unwrap();
+		let Some(DocumentChanges::Edits(documents)) = edit.document_changes else {
+			panic!();
+		};
+		assert_eq!(
+			documents[0].edits.len(),
+			3,
+			"declaration, field use, body label"
+		);
+	}
+
+	#[test]
+	fn duplicate_method_generic_declarations_are_not_rename_candidates() {
+		let source = "struct Host { func choose<T, T>(value: T): T = value }";
+		assert!(candidate(source, "T", 0).is_none());
+		assert!(candidate(source, "T", 1).is_none());
+		assert!(candidate(source, "T", 2).is_none());
+	}
+
+	#[test]
+	fn owner_and_shadowing_nested_impl_generics_have_disjoint_rename_groups() {
+		let source = "interface Marker { func apply(value: int): int }\nstruct Box<T> {\n  impl<T> Marker { func apply(value: T): T = value }\n}";
+		for (occurrence, expected_edits) in [(0, 1), (1, 3)] {
+			let edit = candidate(source, "T", occurrence)
+				.expect("each generic declaration is independently renameable")
+				.validate_disk_sources()
+				.unwrap();
+			let Some(DocumentChanges::Edits(documents)) = edit.document_changes else {
+				panic!();
+			};
+			assert_eq!(documents.len(), 1);
+			assert_eq!(documents[0].edits.len(), expected_edits);
+		}
+	}
+
+	#[test]
+	fn recovered_non_binding_impl_let_does_not_shift_method_generic_identity() {
+		let source = "interface Mapper {\n  func first<A>(value: A): A\n  func second<B>(value: B): B\n}\nstruct Host\nimpl Mapper for Host {\n  let #(left, right) = #(1, 2)\n  func first<A>(value: A): A = value\n  func second<B>(value: B): B = value\n}";
+		let edit = candidate(source, "B", 3)
+			.unwrap()
+			.validate_disk_sources()
+			.unwrap();
+		let Some(DocumentChanges::Edits(documents)) = edit.document_changes else {
+			panic!();
+		};
+		assert_eq!(documents[0].edits.len(), 3);
+		assert!(
+			documents[0]
+				.edits
+				.iter()
+				.all(|edit| { matches!(edit, OneOf::Left(edit) if edit.range.start.line == 8) })
+		);
+	}
+
+	#[test]
 	fn new_name_requires_one_complete_identifier_token() {
 		for valid in ["renamed", "éclair", "Δelta", "变量", "snake_case", "x2"] {
 			assert!(valid_new_name(valid), "{valid}");

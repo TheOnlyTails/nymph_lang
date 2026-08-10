@@ -48,7 +48,8 @@ pub use analysis::{
 	SemanticCheckResult,
 };
 pub use annotate::{
-	Annotations, Checked, CheckedFacts, CheckedSemantic, DispatchKind, ExprInfo, IterMode, Resolution,
+	Annotations, Checked, CheckedFacts, CheckedSemantic, DispatchKind, ExprInfo,
+	GenericSymbolIdentity, IterMode, Resolution,
 };
 pub use check::{
 	EntryMode, check_module, check_module_entry, check_module_with_environment,

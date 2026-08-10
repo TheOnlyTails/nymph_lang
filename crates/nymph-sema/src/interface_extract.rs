@@ -1215,6 +1215,20 @@ pub(crate) fn assign_runtime_body_identities(
 	checker: &mut crate::check::Checker<'_>,
 	identity: &ModuleIdentity,
 ) -> crate::annotate::SourceIdentities {
+	fn stabilize_generics(
+		annotations: &mut crate::Annotations,
+		generics: &[nymph_ast::Spanned<nymph_ast::ty::GenericParam>],
+		owner: &DefinitionId,
+		scope: BinderScope,
+	) {
+		for (index, generic) in generics.iter().enumerate() {
+			annotations.stabilize_generic_declaration(
+				generic.0.name.1,
+				GenericParameterId::new(owner.binder(scope, 0), index as u32),
+			);
+		}
+	}
+
 	let mut source_identities = crate::annotate::SourceIdentities::default();
 	let headers = DeclaredHeaders {
 		module: identity.clone(),
@@ -1262,11 +1276,13 @@ pub(crate) fn assign_runtime_body_identities(
 						.iter()
 						.filter_map(|member| match &member.0 {
 							ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => {
-								Some(meta.name.0.clone())
+								Some((meta.name.0.clone(), meta.generics.clone()))
 							}
-							ImplMember::Let { meta, .. } | ImplMember::ExternalLet(_, _, meta) => {
-								meta.name.0.as_binding().map(|name| name.0.clone())
-							}
+							ImplMember::Let { meta, .. } | ImplMember::ExternalLet(_, _, meta) => meta
+								.name
+								.0
+								.as_binding()
+								.map(|name| (name.0.clone(), Vec::new())),
 						})
 						.collect::<Vec<_>>(),
 				)
@@ -1278,7 +1294,7 @@ pub(crate) fn assign_runtime_body_identities(
 			continue;
 		};
 		let mut ids = StableIdBuilder::new(identity.clone());
-		for name in members {
+		for (name, generics) in members {
 			let target = ids.allocate(DeclarationKey::member(
 				owner.clone(),
 				DeclarationCategory::Method,
@@ -1287,10 +1303,16 @@ pub(crate) fn assign_runtime_body_identities(
 			match namespace.members.get_mut(&name) {
 				Some(crate::NamespaceMemberSig::Func { target: exact, .. })
 				| Some(crate::NamespaceMemberSig::Value { target: exact, .. }) => {
-					*exact = Some(target);
+					*exact = Some(target.clone());
 				}
 				None => {}
 			}
+			stabilize_generics(
+				&mut checker.annotations,
+				&generics,
+				&target,
+				BinderScope::Member,
+			);
 		}
 	}
 
@@ -1301,8 +1323,54 @@ pub(crate) fn assign_runtime_body_identities(
 		if owner.module != *identity {
 			continue;
 		}
+		let Some(source_member) = checker.defs.local_member(interface) else {
+			continue;
+		};
+		let Declaration::Interface {
+			generics, members, ..
+		} = &checker.module.members[source_member]
+		else {
+			continue;
+		};
+		let generics = generics.clone();
+		let source_runtime_members = members
+			.iter()
+			.filter_map(|member| match &member.0 {
+				nymph_ast::decl::InterfaceMember::Element(element) => match &element.0 {
+					nymph_ast::decl::InterfaceElement::Func { meta, .. } => {
+						Some((meta.name.0.clone(), meta.generics.clone()))
+					}
+					nymph_ast::decl::InterfaceElement::Let { meta, .. } => meta
+						.name
+						.0
+						.as_binding()
+						.map(|name| (name.0.clone(), Vec::new())),
+				},
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		stabilize_generics(
+			&mut checker.annotations,
+			&generics,
+			&owner,
+			BinderScope::Definition,
+		);
+		if source_runtime_members.len() != definition.runtime_members.len()
+			|| source_runtime_members
+				.iter()
+				.zip(&definition.runtime_members)
+				.any(|((name, _), member)| name != &member.name)
+		{
+			// Recovered source and checked runtime facts disagree: publishing any
+			// positional identity here could make a different declaration renameable.
+			continue;
+		}
 		let mut ids = StableIdBuilder::new(identity.clone());
-		for member in &mut definition.runtime_members {
+		for (member, (_, generics)) in definition
+			.runtime_members
+			.iter_mut()
+			.zip(source_runtime_members)
+		{
 			if member.definition.is_some() {
 				continue;
 			}
@@ -1312,6 +1380,12 @@ pub(crate) fn assign_runtime_body_identities(
 				member.name.clone(),
 			));
 			member.definition = Some(id.clone());
+			stabilize_generics(
+				&mut checker.annotations,
+				&generics,
+				&id,
+				BinderScope::Member,
+			);
 			if let Some(method) = definition.methods.get_mut(&member.name) {
 				method.definition = Some(id);
 			}
@@ -1446,13 +1520,51 @@ pub(crate) fn assign_runtime_body_identities(
 		}));
 		implementation.definition = Some(id.clone());
 		let mut member_ids = StableIdBuilder::new(identity.clone());
-		for member in &mut implementation.runtime_members {
+		let source_runtime_members = implementation_sources
+			.iter()
+			.find(|(span, ..)| Some(*span) == implementation.legacy_span)
+			.map(|(_, _, _, members)| {
+				members
+					.iter()
+					.filter_map(|member| match &member.0 {
+						ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => {
+							Some((meta.name.0.clone(), meta.generics.clone()))
+						}
+						ImplMember::Let { meta, .. } | ImplMember::ExternalLet(_, _, meta) => meta
+							.name
+							.0
+							.as_binding()
+							.map(|name| (name.0.clone(), Vec::new())),
+					})
+					.collect::<Vec<_>>()
+			})
+			.unwrap_or_default();
+		if source_runtime_members.len() != implementation.runtime_members.len()
+			|| source_runtime_members
+				.iter()
+				.zip(&implementation.runtime_members)
+				.any(|((name, _), member)| name != &member.name)
+		{
+			implementation.definition = None;
+			continue;
+		}
+		for (member, (_, generics)) in implementation
+			.runtime_members
+			.iter_mut()
+			.zip(source_runtime_members)
+		{
 			let member_id = member_ids.allocate(DeclarationKey::member(
 				id.clone(),
 				DeclarationCategory::Method,
 				member.name.clone(),
 			));
 			member.definition = Some(member_id.clone());
+			stabilize_generics(
+				&mut checker.annotations,
+				&generics,
+				&member_id,
+				BinderScope::Member,
+			);
 			if let Some(method) = implementation.methods.get_mut(&member.name) {
 				method.definition = Some(member_id);
 			}
@@ -1480,6 +1592,25 @@ pub(crate) fn assign_runtime_body_identities(
 				_ => None,
 			},
 		));
+	let adt_member_generics = checker
+		.module
+		.members
+		.iter()
+		.filter_map(|declaration| match declaration {
+			Declaration::Struct { members, .. } | Declaration::Enum { members, .. } => Some(
+				members
+					.iter()
+					.filter_map(|member| match &member.0 {
+						ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => {
+							Some((meta.name.0.clone(), meta.generics.clone()))
+						}
+						_ => None,
+					})
+					.collect::<Vec<_>>(),
+			),
+			_ => None,
+		})
+		.collect::<Vec<_>>();
 	for ((index, implementation), mutable) in checker
 		.inherent
 		.impls
@@ -1501,6 +1632,31 @@ pub(crate) fn assign_runtime_body_identities(
 					identity.clone(),
 					DeclarationKey::member(owner.clone(), DeclarationCategory::Method, name.clone()),
 				));
+			}
+			if let Some(source_members) = adt_member_generics.get(index) {
+				for (name, generics) in source_members {
+					if source_members
+						.iter()
+						.filter(|(candidate, _)| candidate == name)
+						.count()
+						!= 1
+					{
+						continue;
+					}
+					let Some(member) = implementation
+						.methods
+						.get(name)
+						.and_then(|method| method.definition.as_ref())
+					else {
+						continue;
+					};
+					stabilize_generics(
+						&mut checker.annotations,
+						generics,
+						member,
+						BinderScope::Member,
+					);
+				}
 			}
 		} else {
 			let temporary = DefinitionId::new(
@@ -1599,19 +1755,33 @@ pub(crate) fn assign_runtime_body_identities(
 		};
 		source_identities.implementations.insert(path, id.clone());
 		for (index, member) in members.iter().enumerate() {
+			let name = impl_member_name(&member.0);
+			if members
+				.iter()
+				.filter(|candidate| impl_member_name(&candidate.0) == name)
+				.count()
+				!= 1
+			{
+				continue;
+			}
+			let member_id = DefinitionId::new(
+				identity.clone(),
+				DeclarationKey::member(id.clone(), DeclarationCategory::Method, name),
+			);
+			if let ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) = &member.0 {
+				stabilize_generics(
+					&mut checker.annotations,
+					&meta.generics,
+					&member_id,
+					BinderScope::Member,
+				);
+			}
 			source_identities.members.insert(
 				crate::annotate::ImplementationMemberSourcePath {
 					implementation: path,
 					member: index as u32,
 				},
-				DefinitionId::new(
-					identity.clone(),
-					DeclarationKey::member(
-						id.clone(),
-						DeclarationCategory::Method,
-						impl_member_name(&member.0),
-					),
-				),
+				member_id,
 			);
 		}
 	}

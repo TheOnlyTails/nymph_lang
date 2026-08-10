@@ -29,7 +29,7 @@ use crate::check::Checker;
 use crate::def::DefKind;
 use crate::identity::DefinitionId;
 use crate::ids::{DefId, ParamIdx};
-use crate::lower::build_param_scope;
+use crate::lower::{build_param_scope, build_param_scope_at};
 use crate::ty::{GenericArgs, Interner, Ty, TyKind};
 
 /// A method signature as seen through an interface or impl. `Param` indices refer to
@@ -380,16 +380,19 @@ impl Checker<'_> {
 		impl_generics: &[Spanned<GenericParam>],
 		members: &[Spanned<ImplMember>],
 	) {
-		// The impl's generic scope is the owner's generics (indices `0..k`) followed by
-		// any the impl block declares itself.
+		// Keep the owner and nested impl as separate lexical scopes so an impl generic
+		// may legally shadow an owner generic while retaining a distinct parameter index.
 		let combined: Vec<Spanned<GenericParam>> = owner_generics
 			.iter()
 			.chain(impl_generics)
 			.cloned()
 			.collect();
 		let names = generic_names(&combined);
-		self.push_params(build_param_scope(&combined));
 		let owner_len = owner_generics.len();
+		self.push_params(build_param_scope(owner_generics));
+		let mut constraints = self.lower_constraints(owner_generics, 0);
+		self.push_params(build_param_scope_at(impl_generics, owner_len));
+		constraints.extend(self.lower_constraints(impl_generics, owner_len));
 		let positional: Vec<Ty> = (0..owner_len)
 			.map(|i| self.interner.mk_param(ParamIdx(i as u32)))
 			.collect();
@@ -397,8 +400,8 @@ impl Checker<'_> {
 			.interner
 			.mk_adt(def, GenericArgs::new(positional, Vec::new()));
 		let (iface_name, iface_args) = interface;
-		let constraints = self.lower_constraints(&combined, 0);
 		self.finish_interface_impl(names, self_ty, iface_name, iface_args, members, constraints);
+		self.pop_params();
 		self.pop_params();
 	}
 
@@ -522,10 +525,7 @@ impl Checker<'_> {
 				}
 			}
 			let base = names.len();
-			let mut method_scope = FxHashMap::default();
-			for (index, generic) in meta.generics.iter().enumerate() {
-				method_scope.insert(generic.0.name.0.clone(), ParamIdx((base + index) as u32));
-			}
+			let method_scope = build_param_scope_at(&meta.generics, base);
 			self.push_params(method_scope);
 			let params = meta
 				.params
@@ -649,12 +649,7 @@ impl Checker<'_> {
 	/// `Param(base + j)` so a signature that mentions them (`map<R>(f: (Item) -> R): …R…`)
 	/// resolves instead of failing `cannot find type R`.
 	fn lower_method_sig(&mut self, meta: &FuncDeclaration, base: usize) -> IfaceMethod {
-		let method_scope: FxHashMap<EcoString, ParamIdx> = meta
-			.generics
-			.iter()
-			.enumerate()
-			.map(|(j, g)| (g.0.name.0.clone(), ParamIdx((base + j) as u32)))
-			.collect();
+		let method_scope = build_param_scope_at(&meta.generics, base);
 		self.push_params(method_scope);
 		let params = meta
 			.params
@@ -685,6 +680,9 @@ impl Checker<'_> {
 		interface: DefId,
 		args: &[Spanned<GenericArg>],
 	) -> Vec<(EcoString, Ty)> {
+		if let Some(owner) = self.defs.stable(interface).cloned() {
+			self.queue_named_generic_labels(owner, args);
+		}
 		let names = self
 			.interfaces
 			.get(&interface)

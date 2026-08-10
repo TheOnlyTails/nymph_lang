@@ -1141,6 +1141,7 @@ pub fn stable_definition_at(
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SymbolIdentity {
 	Definition(crate::DefinitionId),
+	Generic(crate::annotate::GenericSymbolIdentity),
 	Module(crate::ModuleIdentity),
 	Local(Span),
 }
@@ -1310,6 +1311,29 @@ fn all_symbol_occurrences(
 			)
 		})
 		.collect::<Vec<_>>();
+	result.extend(
+		analysis
+			.annotations
+			.generic_symbols()
+			.map(|(span, identity, is_declaration)| {
+				let identity = match identity {
+					crate::annotate::GenericSymbolIdentity::Local(declaration) => analysis
+						.annotations
+						.stable_generic_declaration(*declaration)
+						.cloned()
+						.map(crate::annotate::GenericSymbolIdentity::Stable)
+						.unwrap_or_else(|| identity.clone()),
+					_ => identity.clone(),
+				};
+				(
+					SymbolIdentity::Generic(identity),
+					ReferenceOccurrence {
+						span,
+						is_declaration,
+					},
+				)
+			}),
+	);
 	result.extend(analysis.import_references.iter().map(|(span, target)| {
 		let identity = match target {
 			crate::ImportReferenceTarget::Definition(target) => {

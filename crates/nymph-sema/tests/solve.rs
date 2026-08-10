@@ -904,16 +904,14 @@ fn method_own_generic_bound_forwarding_without_the_bound_is_reported() {
 }
 
 #[test]
-fn interface_impl_method_own_generic_stays_loud() {
-	// CC3: interface-impl method own-generics are inexpressible (not a bound
-	// enforcement gap — `finish_interface_impl` never pushes them into scope),
-	// so a USED own-generic must still error loudly, not silently miscompile.
-	assert_error_contains(
-		"interface Mapper { func extra(): int }
-		 interface Area { func area(): int }
-		 struct Square(side: int)
-		 impl Mapper for Square { func extra<U: Area>(u: U): int = u.area() }",
-		"cannot find type",
+fn interface_impl_method_generic_scope_is_available_in_signature_and_body() {
+	assert_ok(
+		"interface Area { func area(): int }
+		 interface Mapper { func extra<U: Area>(u: U): int }
+		 struct Box<T>(value: T)
+		 impl<T> Mapper for Box<T> {
+		   func extra<T: Area>(u: T): int = u.area()
+		 }",
 	);
 }
 

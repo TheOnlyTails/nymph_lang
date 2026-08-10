@@ -1022,12 +1022,14 @@ impl CompilerState {
 		};
 		let analyses = match symbol {
 			nymph_sema::query::SymbolIdentity::Definition(_)
+			| nymph_sema::query::SymbolIdentity::Generic(nymph_sema::GenericSymbolIdentity::Stable(_))
 			| nymph_sema::query::SymbolIdentity::Module(_) => session.tooling_project_analyses(
 				snapshot.project.clone(),
 				snapshot.entry.clone(),
 				!snapshot.without_prelude,
 			),
-			nymph_sema::query::SymbolIdentity::Local(_) => {
+			nymph_sema::query::SymbolIdentity::Local(_)
+			| nymph_sema::query::SymbolIdentity::Generic(nymph_sema::GenericSymbolIdentity::Local(_)) => {
 				vec![(
 					snapshot.module.clone(),
 					snapshot.source.clone(),
