@@ -66,8 +66,10 @@ normal open/change/close behavior, but cannot report external filesystem changes
 Completion for ordinary identifiers uses the latest immutable project analysis snapshot. It offers
 nearest lexical names first, then visible imported names (including aliases and unsaved dependency
 overlays), same-module declarations, and keywords. Prefix filtering applies within those tiers.
-Completion after `.` intentionally returns no members yet; member completion and auto-import edits
-are not currently supported. Files outside a project retain lexical and same-file completion.
+Completion after `.` offers only semantically applicable visible fields, methods, enum variants,
+and namespace/type members. Receiver types, generic bounds, interface implementations, and actual
+place mutability are decided by the compiler snapshot rather than reconstructed by the extension.
+Files outside a project retain lexical and same-file completion; auto-import edits are not supported.
 
 **Find All References** follows compiler-resolved semantic identity rather than spelling. It searches
 every `.nym` file in the detected project, including unopened files, and uses unsaved open-buffer

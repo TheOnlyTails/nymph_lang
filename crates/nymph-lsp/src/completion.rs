@@ -1,20 +1,20 @@
-//! `textDocument/completion`: non-member names visible at the cursor, ranked
+//! `textDocument/completion`: checker-approved members and non-member names
+//! visible at the cursor, ranked
 //! by lexical scope, resolved project imports, same-module declarations, then
 //! keywords. Project requests consume the compiler's immutable analysis
 //! snapshot, so dependency overlays, import visibility, and aliases stay under
 //! compiler/sema ownership. Loose files retain lexical/same-file completion.
 //!
-//! Member completion after a `.` (fields/methods available on a receiver's
-//! type) needs the checker's member resolution (`InherentRegistry`, built
-//! from the private `Checker`) and the receiver's inferred `Ty` — neither is
-//! reachable additively from this crate without touching `check.rs`, which
-//! is out of scope here. So a dot-triggered request answers an empty list
-//! rather than guessing; a follow-up query.rs addition ("members of a `Ty`")
-//! would be the natural way to add it later.
+//! Member applicability is computed by sema while its solver, generic bounds,
+//! and place-mutability facts are live. This module only converts that immutable
+//! snapshot to LSP items.
 
 use std::collections::HashSet;
 
-use lsp_types::{CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse};
+use lsp_types::{
+	CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, CompletionTextEdit,
+	TextEdit,
+};
 use nymph_ast::decl::Declaration;
 
 use crate::{
@@ -68,14 +68,14 @@ const KEYWORDS: &[&str] = &[
 	"this",
 ];
 
-/// Answer a completion request: `None` when the document isn't open.
-/// Otherwise always `Some` (an empty list is a valid answer, e.g. right after
-/// a `.` — see the module doc comment).
+/// Answer a loose-file completion request: `None` when the document isn't open.
+/// Otherwise always `Some`; member completion is empty because loose files do
+/// not have the project semantic snapshot required for checker-owned candidates.
 pub fn completion(docs: &DocumentStore, params: &CompletionParams) -> Option<CompletionResponse> {
 	let uri = &params.text_document_position.text_document.uri;
 	let doc = docs.get(uri)?;
 	let parsed = nymph_syntax::parse_module(&doc.text, uri.path().as_str());
-	Some(complete(&doc.text, &parsed.tree, &[], params))
+	Some(complete(&doc.text, &parsed.tree, &[], None, params))
 }
 
 /// Complete from one immutable, revision-tagged project analysis snapshot.
@@ -97,6 +97,7 @@ pub fn completion_snapshot(
 		&snapshot.source,
 		&parsed.tree,
 		&snapshot.imported_names,
+		snapshot.semantic.as_deref(),
 		params,
 	)
 }
@@ -105,22 +106,53 @@ fn complete(
 	text: &str,
 	module: &nymph_ast::decl::Module,
 	imported_names: &[nymph_sema::query::ImportedName],
+	semantic: Option<&nymph_sema::SemanticAnalysis>,
 	params: &CompletionParams,
 ) -> CompletionResponse {
 	let position = params.text_document_position.position;
 
-	let triggered_by_dot = params
-		.context
-		.as_ref()
-		.and_then(|c| c.trigger_character.as_deref())
-		== Some(".");
-	if triggered_by_dot {
-		return CompletionResponse::Array(Vec::new());
-	}
-
 	let index = LineIndex::new(text);
 	let offset = index.offset(text, position);
 	let (prefix, prefix_scope_offset) = identifier_prefix(text, offset);
+	let prefix_start = offset.saturating_sub(prefix.len());
+	if prefix_start > 0 && text.as_bytes().get(prefix_start - 1) == Some(&b'.') {
+		let Some(semantic) = semantic else {
+			return CompletionResponse::Array(Vec::new());
+		};
+		let range = lsp_types::Range {
+			start: index.position(text, prefix_start),
+			end: index.position(text, offset),
+		};
+		// Sema's position contract is strictly half-open. Query at the previous
+		// Unicode scalar (the dot for an empty prefix, otherwise the final prefix
+		// scalar), while the edit continues to replace `[prefix_start, cursor)`.
+		let query_offset = text[..offset]
+			.char_indices()
+			.next_back()
+			.map_or(offset, |(scalar, _)| scalar);
+		let mut candidates = nymph_sema::query::member_completions_at(semantic, query_offset)
+			.into_iter()
+			.filter(|candidate| candidate.name.starts_with(&prefix))
+			.collect::<Vec<_>>();
+		candidates.sort_by(|a, b| a.name.cmp(&b.name).then(a.kind.cmp(&b.kind)));
+		candidates.dedup_by(|a, b| a.name == b.name);
+		return CompletionResponse::Array(
+			candidates
+				.into_iter()
+				.map(|candidate| CompletionItem {
+					label: candidate.name.to_string(),
+					kind: Some(member_kind(candidate.kind)),
+					detail: Some(candidate.detail),
+					sort_text: Some(format!("0:{}", candidate.name)),
+					text_edit: Some(CompletionTextEdit::Edit(TextEdit {
+						range,
+						new_text: candidate.name.to_string(),
+					})),
+					..Default::default()
+				})
+				.collect(),
+		);
+	}
 
 	let mut items = Vec::new();
 	let mut seen: HashSet<String> = HashSet::new();
@@ -168,6 +200,17 @@ fn complete(
 	);
 
 	CompletionResponse::Array(items)
+}
+
+fn member_kind(kind: nymph_sema::MemberCompletionKind) -> CompletionItemKind {
+	match kind {
+		nymph_sema::MemberCompletionKind::Field => CompletionItemKind::FIELD,
+		nymph_sema::MemberCompletionKind::Method => CompletionItemKind::METHOD,
+		nymph_sema::MemberCompletionKind::Function => CompletionItemKind::FUNCTION,
+		nymph_sema::MemberCompletionKind::Value => CompletionItemKind::CONSTANT,
+		nymph_sema::MemberCompletionKind::Variable => CompletionItemKind::VARIABLE,
+		nymph_sema::MemberCompletionKind::Variant => CompletionItemKind::ENUM_MEMBER,
+	}
 }
 
 fn push_tier(
@@ -400,7 +443,7 @@ mod tests {
 	}
 
 	#[test]
-	fn a_dot_trigger_returns_an_empty_list_not_a_wrong_guess() {
+	fn a_loose_file_dot_trigger_returns_an_empty_list_not_a_wrong_guess() {
 		let uri: Uri = "file:///complete_dot.nym".parse().unwrap();
 		let text = "struct Point(x: int)\nfunc main(): int = Point(x = 0).";
 		let docs = docs_with(&uri, text);
@@ -416,7 +459,7 @@ mod tests {
 
 		assert!(
 			labels.is_empty(),
-			"member completion is deferred; expected an empty (not wrong) list, got {labels:?}"
+			"loose files have no semantic member snapshot; expected no guesses, got {labels:?}"
 		);
 	}
 

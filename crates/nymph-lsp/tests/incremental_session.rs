@@ -312,6 +312,259 @@ fn project_completion_uses_latest_dependency_overlay_with_partial_source() {
 	assert!(!restored.iter().any(|item| item.label == "overlay_name"));
 }
 
+#[test]
+fn project_member_completion_is_semantic_and_replaces_partial_prefix() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='member-completion'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let source = "struct Point(x: int, y: string)\nfunc main(): int = {\n  let point = Point(x = 1, y = \"\")\n  point.x\n  point.y\n}";
+	fs::write(&main_path, source).unwrap();
+	let main_uri = uri(&main_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), source.into(), 1)
+		.unwrap();
+
+	let items = completion_items(&compiler, &docs, &main_uri, 4, 9);
+	assert_eq!(items.len(), 1);
+	assert_eq!(items[0].label, "y");
+	assert_eq!(items[0].kind, Some(lsp_types::CompletionItemKind::FIELD));
+	assert_eq!(items[0].detail.as_deref(), Some("string"));
+	let Some(lsp_types::CompletionTextEdit::Edit(edit)) = &items[0].text_edit else {
+		panic!("member completion must carry a replacement edit")
+	};
+	assert_eq!(edit.range.start.character, 8);
+	assert_eq!(edit.range.end.character, 9);
+}
+
+#[test]
+fn project_member_completion_is_available_inside_qualified_calls() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='call-member-completion'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let path = temp.path().join("src/main.nym");
+	let source = "namespace Tools { func run<T>(value: T): T = value }\nstruct Point { func get(): int = 1 }\nstruct Vault { namespace func make(): Vault = Vault() }\nenum Choice { Pick }\ninterface Default { func default(): self }\nfunc use<R: Default>(point: Point): int = { point.get()\nVault.make()\nChoice.Pick()\nTools.run(1)\nR.default()\npoint.get() }";
+	fs::write(&path, source).unwrap();
+	let uri = uri(&path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, uri.clone(), source.into(), 1)
+		.unwrap();
+
+	for (line, character, expected) in [
+		(5, 53, "get"),
+		(6, 10, "make"),
+		(7, 11, "Pick"),
+		(8, 9, "run"),
+		(9, 9, "default"),
+	] {
+		assert!(
+			completion_items(&compiler, &docs, &uri, line, character)
+				.iter()
+				.any(|item| item.label == expected),
+			"missing {expected} completion"
+		);
+	}
+}
+
+#[test]
+fn project_member_completion_enforces_visibility_and_static_context() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='member-boundaries'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let source = "import @/dep with (Vault, Tools)\nfunc inspect(v: Vault): int = v.r";
+	fs::write(&main_path, source).unwrap();
+	fs::write(
+		temp.path().join("src/dep.nym"),
+		"public struct Vault(public shown: int, private secret: int) {\n  public func read(): int = this.shown\n  private func erase(): int = 0\n  public namespace func make(value: int): Vault = Vault(shown = value, secret = 0)\n}\npublic namespace Tools {\n  public func run(value: int): string = \"\"\n  public let mut counter: int = 0\n  private func hidden(): int = 0\n}",
+	)
+	.unwrap();
+	let main_uri = uri(&main_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), source.into(), 1)
+		.unwrap();
+
+	let instance = completion_items(&compiler, &docs, &main_uri, 1, 33);
+	assert_eq!(
+		instance
+			.iter()
+			.map(|item| item.label.as_str())
+			.collect::<Vec<_>>(),
+		vec!["read"]
+	);
+	assert!(
+		!instance
+			.iter()
+			.any(|item| matches!(item.label.as_str(), "secret" | "erase" | "make"))
+	);
+	let namespace_source = "import @/dep with (Vault, Tools)\nfunc inspect(): int = Tools.r";
+	compiler
+		.change(&mut docs, &main_uri, namespace_source.into(), 2)
+		.unwrap();
+	let namespace = completion_items(&compiler, &docs, &main_uri, 1, 29);
+	assert_eq!(
+		namespace
+			.iter()
+			.map(|item| item.label.as_str())
+			.collect::<Vec<_>>(),
+		vec!["run"]
+	);
+	assert_eq!(namespace[0].detail.as_deref(), Some("(int) -> string"));
+	let static_source = "import @/dep with (Vault, Tools)\nfunc inspect(): int = Vault.m";
+	compiler
+		.change(&mut docs, &main_uri, static_source.into(), 3)
+		.unwrap();
+	let static_items = completion_items(&compiler, &docs, &main_uri, 1, 29);
+	assert_eq!(
+		static_items
+			.iter()
+			.map(|item| item.label.as_str())
+			.collect::<Vec<_>>(),
+		vec!["make"]
+	);
+	assert_eq!(static_items[0].detail.as_deref(), Some("(int) -> Vault"));
+}
+
+#[test]
+fn member_completion_replaces_astral_prefix_with_exact_utf16_range() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='unicode-members'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let path = temp.path().join("src/main.nym");
+	let source = "struct Glyph(astral𐐀: int)\nfunc read(g: Glyph): int = g.astral𐐀";
+	fs::write(&path, source).unwrap();
+	let uri = uri(&path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, uri.clone(), source.into(), 1)
+		.unwrap();
+	let items = completion_items(&compiler, &docs, &uri, 1, 37);
+	let item = items.iter().find(|item| item.label == "astral𐐀").unwrap();
+	let Some(lsp_types::CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+		panic!("missing edit")
+	};
+	assert_eq!(
+		(edit.range.start.character, edit.range.end.character),
+		(29, 37)
+	);
+}
+
+#[test]
+fn project_member_completion_supports_bare_dot_and_nested_access() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='member-dot'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let path = temp.path().join("src/main.nym");
+	let source = "struct Inner(answer: int)\nstruct Outer(inner: Inner)\nfunc read(value: Outer): int = value.inner.";
+	fs::write(&path, source).unwrap();
+	let uri = uri(&path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, uri.clone(), source.into(), 1)
+		.unwrap();
+	let items = completion_items(&compiler, &docs, &uri, 2, 44);
+	let answer = items
+		.iter()
+		.find(|item| item.label == "answer")
+		.expect("nested receiver field");
+	assert_eq!(answer.kind, Some(lsp_types::CompletionItemKind::FIELD));
+	assert_eq!(answer.detail.as_deref(), Some("int"));
+}
+
+#[test]
+fn project_dependency_overlay_changes_member_candidates() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='member-overlay'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main = temp.path().join("src/main.nym");
+	let dep = temp.path().join("src/dep.nym");
+	let source = "import @/dep with (Record)\nfunc read(value: Record): int = value.disk";
+	fs::write(&main, source).unwrap();
+	fs::write(&dep, "public struct Record(public disk: int)").unwrap();
+	let main_uri = uri(&main);
+	let dep_uri = uri(&dep);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), source.into(), 1)
+		.unwrap();
+	assert!(
+		completion_items(&compiler, &docs, &main_uri, 1, 38)
+			.iter()
+			.any(|item| item.label == "disk")
+	);
+	compiler
+		.open(
+			&mut docs,
+			dep_uri,
+			"public struct Record(public overlay: int)".into(),
+			1,
+		)
+		.unwrap();
+	let changed = completion_items(&compiler, &docs, &main_uri, 1, 38);
+	assert!(changed.iter().any(|item| item.label == "overlay"));
+	assert!(!changed.iter().any(|item| item.label == "disk"));
+}
+
+#[test]
+fn project_member_completion_includes_ambient_string_members() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='ambient-member'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let path = temp.path().join("src/main.nym");
+	let source = "func read(value: string): uint = value.length";
+	fs::write(&path, source).unwrap();
+	let uri = uri(&path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, uri.clone(), source.into(), 1)
+		.unwrap();
+	let items = completion_items(&compiler, &docs, &uri, 0, 39);
+	let length = items
+		.iter()
+		.find(|item| item.label == "length")
+		.expect("ambient string.length");
+	assert_eq!(length.kind, Some(lsp_types::CompletionItemKind::METHOD));
+	assert_eq!(length.detail.as_deref(), Some("() -> uint"));
+}
+
 fn semantic_token_at(
 	compiler: &CompilerState,
 	docs: &DocumentStore,

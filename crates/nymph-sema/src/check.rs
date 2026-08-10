@@ -1653,7 +1653,7 @@ mod tests {
 
 		let span = Span::new(0, 0);
 		let (_, resolved, _, _, defining_span, _) = checker
-			.resolve_inherent(self_ty, "get", &[], &[], span)
+			.resolve_inherent(self_ty, false, "get", &[], &[], span)
 			.expect("imported instance method should resolve");
 		assert_eq!(resolved, int);
 		assert_eq!(defining_span, None);

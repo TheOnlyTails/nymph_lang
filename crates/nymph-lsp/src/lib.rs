@@ -17,10 +17,10 @@
 //! declaration, AST + `DefMap`-only, no type-check (see [`definition`]);
 //! `textDocument/references` searches compiler-resolved declaration identity
 //! across every source in the current project snapshot (see [`references`]);
-//! `textDocument/completion` offers lexical names, resolved project imports,
-//! same-module declarations, and keywords from an immutable analysis snapshot
-//! (see [`completion`] — member completion after a `.` is deferred, see its
-//! module doc comment); `workspace/symbol` ranks visible declarations across
+//! `textDocument/completion` offers checker-approved fields and applicable
+//! methods after `.`, plus lexical names, resolved project imports, same-module
+//! declarations, and keywords from an immutable analysis snapshot (see
+//! [`completion`]); `workspace/symbol` ranks visible declarations across
 //! synchronized project modules (see [`workspace_symbols`]);
 //! `textDocument/semanticTokens/full` classifies every
 //! token from the compiler's own lexer + AST, so highlighting stays correct

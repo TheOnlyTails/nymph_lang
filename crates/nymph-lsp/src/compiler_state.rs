@@ -101,6 +101,7 @@ pub struct CompletionSnapshot {
 	pub document_revision: DocumentStoreRevision,
 	pub source: Arc<str>,
 	pub imported_names: Arc<[nymph_sema::query::ImportedName]>,
+	pub semantic: Option<Arc<nymph_sema::SemanticAnalysis>>,
 }
 
 pub struct DefinitionTargetSnapshot {
@@ -793,6 +794,7 @@ impl CompilerState {
 			document_revision: docs.revision(),
 			source: analysis.source,
 			imported_names: analysis.imported_names,
+			semantic: analysis.semantic,
 		})
 	}
 
