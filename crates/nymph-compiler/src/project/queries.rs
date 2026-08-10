@@ -441,7 +441,14 @@ pub(crate) fn resolved_module_imports<'db>(
 	#[cfg(feature = "test-support")]
 	db.semantic_query_will_execute("resolved_module_imports", module);
 	let graph = project_graph(db, key);
-	let direct = graph.semantic_direct_dependencies(module);
+	let direct = graph
+		.semantic_direct_dependencies(module)
+		.iter()
+		.copied()
+		.filter(|dependency| {
+			!key.isolated(db) || dependency.domain(db) != SemanticModuleDomain::Project
+		})
+		.collect::<Vec<_>>();
 	let locals = module
 		.parsed(db)
 		.tree
@@ -2294,6 +2301,9 @@ pub(crate) fn interface_module_analysis<'db>(
 		.semantic_closure(module)
 		.iter()
 		.copied()
+		.filter(|dependency| {
+			!key.isolated(db) || dependency.domain(db) != SemanticModuleDomain::Project
+		})
 		.map(|dependency| interface_module_environment(db, key, dependency))
 		.collect::<Vec<_>>();
 	let mut roots = Vec::new();
@@ -2973,6 +2983,7 @@ mod tests {
 			EntryMode::Entry,
 			false,
 			true,
+			false,
 		);
 		// Test databases outlive each key in these tests; Salsa's key does not
 		// contain an actual reference despite its invariant database lifetime.

@@ -49,10 +49,14 @@ Server**, and choose **Trace**. Startup failures appear as VS Code error notific
 Hover uses the same checked snapshot as diagnostics. In a project, that includes project imports and
 aliases, the embedded `std/...` modules, the ambient prelude, inferred generic substitutions, and
 unsaved overlays for every open dependency. A saved `.nym` file outside a project is checked as a
-one-file library with the ambient prelude; it has no project import graph. The extension currently
-registers language-server features for `file:` documents only, not untitled editor buffers. Closing
-a project file discards its overlay and refreshes diagnostics from the current disk source, including
-affected importers; closing a loose or non-file document clears its diagnostics without reading it
+one-file library with the ambient prelude; it has no project import graph. Untitled documents whose
+language mode is Nymph receive the same applicable same-buffer features over their current editor
+text. Each is an isolated one-module library with the ambient prelude: project-local imports remain
+unresolved, and the server performs no path conversion, project discovery, filesystem access, or
+untitled-specific watcher setup. Closing an untitled document drops its isolated state and clears its
+diagnostics. After it is saved and reopened under a `file:` URI, normal loose-file or project behavior
+begins. Closing a project file discards its overlay and refreshes diagnostics from the current disk
+source, including affected importers; closing a loose file clears its diagnostics without reading it
 from disk.
 
 After initialization, the language server asks clients that support dynamic watched-file

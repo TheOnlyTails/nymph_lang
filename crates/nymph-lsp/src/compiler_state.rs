@@ -47,6 +47,7 @@ struct ModuleIdentity {
 enum DocumentKind {
 	Project(PathBuf),
 	Loose(PathBuf),
+	Untitled,
 	NonFile,
 }
 
@@ -196,6 +197,15 @@ impl CompilerState {
 		text: String,
 		version: i32,
 	) -> anyhow::Result<Vec<Uri>> {
+		if uri
+			.scheme()
+			.is_some_and(|scheme| scheme.as_str().eq_ignore_ascii_case("untitled"))
+			&& docs
+				.version(uri)
+				.is_some_and(|current_version| version <= current_version)
+		{
+			return Ok(Vec::new());
+		}
 		if !docs.change_full(uri, text, version) {
 			return Ok(Vec::new());
 		}
@@ -290,6 +300,12 @@ impl CompilerState {
 		let mut manifests = BTreeSet::new();
 		let mut sources = BTreeSet::new();
 		for uri in uris {
+			if !uri
+				.scheme()
+				.is_some_and(|scheme| scheme.as_str().eq_ignore_ascii_case("file"))
+			{
+				continue;
+			}
 			let Some(path) = workspace::uri_to_path(uri) else {
 				continue;
 			};
@@ -357,6 +373,14 @@ impl CompilerState {
 		let mut open_uris: Vec<_> = docs
 			.iter()
 			.filter_map(|(uri, _)| {
+				if !self.documents.get(uri).is_some_and(|identity| {
+					matches!(
+						identity.kind,
+						DocumentKind::Project(_) | DocumentKind::Loose(_)
+					)
+				}) {
+					return None;
+				}
 				workspace::uri_to_path(uri)
 					.and_then(|path| std::path::absolute(path).ok())
 					.filter(|path| path.starts_with(root))
@@ -731,12 +755,22 @@ impl CompilerState {
 		}
 		let document = docs.get(uri)?;
 		let identity = self.documents.get(uri)?;
-		let analysis = self.session_for(identity).tooling_analyze_module(
-			identity.project.clone(),
-			identity.entry.clone(),
-			identity.module.clone(),
-			!identity.without_prelude,
-		)?;
+		let session = self.session_for(identity);
+		let analysis = if matches!(identity.kind, DocumentKind::Untitled) {
+			session.tooling_analyze_isolated_module(
+				identity.project.clone(),
+				identity.entry.clone(),
+				identity.module.clone(),
+				!identity.without_prelude,
+			)
+		} else {
+			session.tooling_analyze_module(
+				identity.project.clone(),
+				identity.entry.clone(),
+				identity.module.clone(),
+				!identity.without_prelude,
+			)
+		}?;
 		let source = analysis.source.clone();
 		let document_source = Arc::from(document.text.as_str());
 		Some(AnalysisSnapshot {
@@ -779,12 +813,22 @@ impl CompilerState {
 	pub fn completion_for_uri(&self, docs: &DocumentStore, uri: &Uri) -> Option<CompletionSnapshot> {
 		let document = docs.get(uri)?;
 		let identity = self.documents.get(uri)?;
-		let analysis = self.session_for(identity).tooling_completion_analysis(
-			identity.project.clone(),
-			identity.entry.clone(),
-			identity.module.clone(),
-			!identity.without_prelude,
-		)?;
+		let session = self.session_for(identity);
+		let analysis = if matches!(identity.kind, DocumentKind::Untitled) {
+			session.tooling_isolated_completion_analysis(
+				identity.project.clone(),
+				identity.entry.clone(),
+				identity.module.clone(),
+				!identity.without_prelude,
+			)
+		} else {
+			session.tooling_completion_analysis(
+				identity.project.clone(),
+				identity.entry.clone(),
+				identity.module.clone(),
+				!identity.without_prelude,
+			)
+		}?;
 		if analysis.source.as_ref() != document.text {
 			return None;
 		}
@@ -974,7 +1018,16 @@ impl CompilerState {
 		} else {
 			&self.session
 		};
+		let isolated = matches!(
+			self.documents.get(&snapshot.uri)?.kind,
+			DocumentKind::Untitled
+		);
 		let analyses = match symbol {
+			_ if isolated => vec![(
+				snapshot.module.clone(),
+				snapshot.source.clone(),
+				Some(snapshot.analysis.clone()),
+			)],
 			nymph_sema::query::SymbolIdentity::Definition(_)
 			| nymph_sema::query::SymbolIdentity::Module(_) => session.tooling_project_analyses(
 				snapshot.project.clone(),
@@ -1048,11 +1101,7 @@ impl CompilerState {
 		}
 		let identity = self.documents.get(uri)?;
 		let _ = docs.get(uri)?;
-		Some(self.session_for(identity).tooling_diagnostics(
-			identity.project.clone(),
-			identity.entry.clone(),
-			!identity.without_prelude,
-		))
+		Some(self.tooling_diagnostics(identity))
 	}
 
 	#[must_use]
@@ -1088,11 +1137,7 @@ impl CompilerState {
 		let document_revision = docs.revision();
 		let identity = self.documents.get(uri)?;
 		let session = self.session_for(identity);
-		let diagnostics = session.tooling_diagnostics(
-			identity.project.clone(),
-			identity.entry.clone(),
-			!identity.without_prelude,
-		);
+		let diagnostics = self.tooling_diagnostics(identity);
 		let mut grouped: BTreeMap<String, Vec<nymph_diagnostics::Diagnostic>> = BTreeMap::new();
 		for diagnostic in diagnostics.iter() {
 			grouped
@@ -1200,12 +1245,7 @@ impl CompilerState {
 					Vec::new()
 				} else {
 					self
-						.session_for(identity)
-						.tooling_diagnostics(
-							identity.project.clone(),
-							identity.entry.clone(),
-							!identity.without_prelude,
-						)
+						.tooling_diagnostics(identity)
 						.iter()
 						.filter(|diagnostic| diagnostic.module == identity.module.as_str())
 						.map(|diagnostic| diagnostic.diag.clone())
@@ -1306,6 +1346,26 @@ impl CompilerState {
 		self.effective_source_for_uri(uri)
 	}
 
+	fn tooling_diagnostics(&self, identity: &DocumentIdentity) -> Arc<[ProjectDiagnostic]> {
+		let session = self.session_for(identity);
+		if matches!(identity.kind, DocumentKind::Untitled) {
+			session
+				.tooling_isolated_diagnostics(
+					identity.project.clone(),
+					identity.entry.clone(),
+					identity.module.clone(),
+					!identity.without_prelude,
+				)
+				.unwrap_or_else(|| Arc::new([]))
+		} else {
+			session.tooling_diagnostics(
+				identity.project.clone(),
+				identity.entry.clone(),
+				!identity.without_prelude,
+			)
+		}
+	}
+
 	#[cfg(test)]
 	pub fn synchronize_open_document(
 		&mut self,
@@ -1356,6 +1416,11 @@ impl CompilerState {
 				})?;
 				(root, module, DocumentKind::Loose(path))
 			}
+			workspace::UriClass::Untitled => (
+				PathBuf::new(),
+				ModulePath::new("document").unwrap(),
+				DocumentKind::Untitled,
+			),
 			workspace::UriClass::NonFile => (
 				PathBuf::new(),
 				ModulePath::new("document").unwrap(),
@@ -1363,7 +1428,7 @@ impl CompilerState {
 			),
 		};
 		self.manifest_errors.remove(uri);
-		let root = if matches!(kind, DocumentKind::NonFile) {
+		let root = if matches!(kind, DocumentKind::Untitled | DocumentKind::NonFile) {
 			root
 		} else {
 			std::path::absolute(root)?
@@ -1374,14 +1439,14 @@ impl CompilerState {
 		let project_key = match &kind {
 			DocumentKind::Project(_) => root.clone(),
 			DocumentKind::Loose(path) => path.clone(),
-			DocumentKind::NonFile => PathBuf::new(),
+			DocumentKind::Untitled | DocumentKind::NonFile => PathBuf::new(),
 		};
 		let without_prelude = match &kind {
 			DocumentKind::Project(path) => nymph_compiler::is_stdlib_source_path(path),
 			DocumentKind::Loose(path) => nymph_compiler::is_stdlib_source_path(path),
-			DocumentKind::NonFile => false,
+			DocumentKind::Untitled | DocumentKind::NonFile => false,
 		};
-		let project = if matches!(kind, DocumentKind::NonFile) {
+		let project = if matches!(kind, DocumentKind::Untitled | DocumentKind::NonFile) {
 			ProjectId::new(uri.as_str().to_string())
 		} else {
 			self
@@ -1636,6 +1701,7 @@ pub fn publish_completion_if_current<T>(
 mod tests {
 	use super::*;
 	use std::cell::Cell;
+	use std::sync::Mutex;
 
 	#[test]
 	fn malformed_or_non_boundary_definition_spans_are_rejected() {
@@ -1668,6 +1734,132 @@ mod tests {
 		let sent = Cell::new(false);
 		publish_if_current(&docs, &uri, &snapshot, (), |_| sent.set(true));
 		assert!(!sent.get());
+	}
+
+	#[test]
+	fn adversarial_untitled_uri_stays_isolated_and_retains_recovered_analysis() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='must-not-load'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		std::fs::write(
+			temp.path().join("src/dependency.nym"),
+			"public func disk_only(): int = 99",
+		)
+		.unwrap();
+		let uri: Uri = format!("untitled:{}", temp.path().join("src/main.nym").display())
+			.parse()
+			.unwrap();
+		let source = "import @/dependency with (disk_only)\nfunc helper(value: int): int = value.abs()\nfunc main(): int = helper(1)\nfunc bad(): int = true";
+		let events = Arc::new(Mutex::new(Vec::new()));
+		let observed = events.clone();
+		let mut state = CompilerState::with_event_callback(move |event| {
+			observed.lock().unwrap().push(event.to_string());
+		});
+		let mut docs = DocumentStore::default();
+
+		state
+			.open(&mut docs, uri.clone(), source.into(), 52)
+			.unwrap();
+
+		assert!(
+			state.workspaces.is_empty(),
+			"untitled entered project membership"
+		);
+		assert_eq!(state.source_for_uri(&uri).as_deref(), Some(source));
+		let diagnostics = state.diagnostics_for_uri(&docs, &uri).unwrap();
+		assert!(diagnostics.iter().any(|diagnostic| {
+			diagnostic.diag.code == "IMPORT-UNRESOLVED" && diagnostic.diag.message.contains("dependency")
+		}));
+		assert!(
+			diagnostics.iter().any(|diagnostic| {
+				diagnostic.diag.code != "IMPORT-UNRESOLVED"
+					&& diagnostic.diag.span.start <= source.rfind("true").unwrap()
+					&& diagnostic.diag.span.end >= source.len()
+			}),
+			"the independent local type error was suppressed: {diagnostics:?}"
+		);
+		let snapshot = state
+			.analysis_for_uri(&docs, &uri)
+			.expect("an unresolved import must not suppress same-buffer semantic analysis");
+		assert_eq!(snapshot.document_version, 52);
+		assert_eq!(snapshot.source.as_ref(), source);
+		let helper_literal = source.find("helper(1)").unwrap() + "helper(".len();
+		assert_eq!(
+			snapshot.analysis.type_at(helper_literal).as_deref(),
+			Some("int")
+		);
+		assert!(
+			events
+				.lock()
+				.unwrap()
+				.iter()
+				.any(|event| event == "interface_module_analysis")
+		);
+
+		let cycle_uri: Uri = "untitled:self-cycle".parse().unwrap();
+		let cycle_source = "import @/document as cycle\nfunc main(): int = cycle.main()";
+		state
+			.open(&mut docs, cycle_uri.clone(), cycle_source.into(), 1)
+			.unwrap();
+		let cycle_diagnostics = state.diagnostics_for_uri(&docs, &cycle_uri).unwrap();
+		assert!(
+			cycle_diagnostics
+				.iter()
+				.any(|diagnostic| diagnostic.diag.message.contains("cycle"))
+		);
+		let cycle_analysis = state.analysis_for_uri(&docs, &cycle_uri).unwrap();
+		assert!(
+			nymph_sema::query::symbol_at(
+				&cycle_analysis.analysis.semantic,
+				cycle_source.rfind("cycle").unwrap()
+			)
+			.is_none()
+		);
+	}
+
+	#[test]
+	fn untitled_changes_reject_non_increasing_versions_without_changing_file_behavior() {
+		let uri: Uri = "untitled:version-authority".parse().unwrap();
+		let mut docs = DocumentStore::default();
+		let mut state = CompilerState::new();
+		state
+			.open(&mut docs, uri.clone(), "let latest = 1".into(), 8)
+			.unwrap();
+		let revision = docs.revision();
+
+		assert!(
+			state
+				.change(&mut docs, &uri, "let stale = 1".into(), 7)
+				.unwrap()
+				.is_empty()
+		);
+		assert_eq!(docs.get(&uri).unwrap().text, "let latest = 1");
+		assert_eq!(docs.version(&uri), Some(8));
+		assert_eq!(docs.revision(), revision);
+
+		state.close(&mut docs, &uri).unwrap();
+		state
+			.open(&mut docs, uri.clone(), "let reopened = 1".into(), 1)
+			.unwrap();
+		assert_eq!(docs.version(&uri), Some(1));
+		assert_eq!(docs.get(&uri).unwrap().text, "let reopened = 1");
+
+		let file_uri: Uri = "file:///tmp/version-behavior.nym".parse().unwrap();
+		state
+			.open(&mut docs, file_uri.clone(), "let current = 1".into(), 8)
+			.unwrap();
+		state
+			.change(&mut docs, &file_uri, "let existing_behavior = 1".into(), 7)
+			.unwrap();
+		assert_eq!(docs.version(&file_uri), Some(7));
+		assert_eq!(
+			docs.get(&file_uri).unwrap().text,
+			"let existing_behavior = 1"
+		);
 	}
 
 	#[cfg(unix)]

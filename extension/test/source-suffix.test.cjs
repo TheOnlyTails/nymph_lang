@@ -16,7 +16,15 @@ void test(".nym is the extension's sole source suffix", () => {
 	assert.equal(manifest.contributes.grammars[1].scopeName, "markdown.nymph.codeblock");
 
 	const clientSource = fs.readFileSync(path.join(extensionRoot, "src", "extension.ts"), "utf8");
-	assert.match(clientSource, /language:\s*["']nymph["']/);
+	assert.equal(
+		(clientSource.match(/\{\s*scheme:\s*"file",\s*language:\s*"nymph"\s*\}/g) || []).length,
+		1,
+	);
+	assert.equal(
+		(clientSource.match(/\{\s*scheme:\s*"untitled",\s*language:\s*"nymph"\s*\}/g) || [])
+			.length,
+		1,
+	);
 	assert.doesNotMatch(clientSource, /createFileSystemWatcher/);
 	const serverSource = fs.readFileSync(
 		path.join(repositoryRoot, "crates", "nymph-lsp", "src", "lib.rs"),

@@ -92,3 +92,31 @@ impl DocumentStore {
 			.expect("document store revision exhausted");
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn untitled_lifecycle_is_uri_keyed_and_never_resurrected_by_change() {
+		let uri: Uri = "untitled:Untitled-52".parse().unwrap();
+		let mut store = DocumentStore::default();
+
+		store.open(uri.clone(), "let value = 1".into(), 7);
+		assert_eq!(store.get(&uri).unwrap().text, "let value = 1");
+		assert_eq!(store.version(&uri), Some(7));
+		let open_revision = store.revision();
+
+		assert!(store.change_full(&uri, "let value = 2".into(), 8));
+		assert_eq!(store.get(&uri).unwrap().text, "let value = 2");
+		assert_eq!(store.version(&uri), Some(8));
+		assert_ne!(store.revision(), open_revision);
+
+		store.close(&uri);
+		let close_revision = store.revision();
+		assert!(store.get(&uri).is_none());
+		assert!(!store.change_full(&uri, "let stale = true".into(), 9));
+		assert_eq!(store.revision(), close_revision);
+		assert!(store.get(&uri).is_none());
+	}
+}

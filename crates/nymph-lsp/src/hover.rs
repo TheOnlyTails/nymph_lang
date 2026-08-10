@@ -5,9 +5,10 @@
 //! files therefore use the same effective sources, imports, aliases, embedded
 //! standard library, ambient prelude, generic substitutions, and dependency
 //! overlays as diagnostics. Loose saved files use a one-module library project
-//! with the ambient prelude; the VS Code client currently selects `file:`
-//! documents only. The compiler-owned `ModuleAnalysis::type_at` seam pairs
-//! annotations with the exact semantic definition arena that produced them.
+//! with the ambient prelude; untitled files use an isolated one-module project
+//! over their open text. The compiler-owned `ModuleAnalysis::type_at` seam
+//! pairs annotations with the exact semantic definition arena that produced
+//! them.
 
 use lsp_types::{Hover, HoverContents, HoverParams, MarkupContent, MarkupKind};
 

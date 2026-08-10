@@ -728,6 +728,41 @@ mod tests {
 			.unwrap();
 	}
 
+	fn send_change(client: &Connection, uri: Uri, version: i32, text: &str) {
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidChangeTextDocument::METHOD.into(),
+				serde_json::to_value(DidChangeTextDocumentParams {
+					text_document: VersionedTextDocumentIdentifier { uri, version },
+					content_changes: vec![TextDocumentContentChangeEvent {
+						range: None,
+						range_length: None,
+						text: text.into(),
+					}],
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+	}
+
+	fn request_value(
+		client: &Connection,
+		id: i32,
+		method: &str,
+		params: serde_json::Value,
+	) -> serde_json::Value {
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(id),
+				method.into(),
+				params,
+			)))
+			.unwrap();
+		recv_response(client, id).response_result.unwrap()
+	}
+
 	fn send_close(client: &Connection, uri: Uri) {
 		client
 			.sender
@@ -771,6 +806,233 @@ mod tests {
 			assert!(client.receiver.try_recv().is_err());
 		}
 
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn untitled_wire_supports_every_advertised_same_buffer_capability_with_unresolved_imports() {
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		handshake(&client);
+		let uri: Uri = "untitled:capabilities-52".parse().unwrap();
+		let text = "import @/missing\nimport @/document as cycle\nfunc helper(value: int): int = value.abs()\nfunc main(): int = {\n  let local=helper(1)\n  local\n}\nfunc bad(): int = true";
+		send_open(&client, uri.clone(), 52, text);
+		let diagnostics = recv_diagnostics_for(&client, &uri);
+		assert_eq!(diagnostics.version, Some(52));
+		assert!(diagnostics.diagnostics.iter().any(|diagnostic| {
+			diagnostic.code
+				== Some(lsp_types::NumberOrString::String(
+					"IMPORT-UNRESOLVED".into(),
+				))
+		}));
+		assert!(diagnostics.diagnostics.iter().any(|diagnostic| {
+			diagnostic.code
+				!= Some(lsp_types::NumberOrString::String(
+					"IMPORT-UNRESOLVED".into(),
+				)) && diagnostic.range.start.line == 7
+		}));
+
+		let position = |line, character| {
+			serde_json::json!({
+				"textDocument": { "uri": uri.as_str() },
+				"position": { "line": line, "character": character }
+			})
+		};
+		let hover = request_value(&client, 10, HoverRequest::METHOD, position(4, 19));
+		assert_ne!(hover, serde_json::Value::Null);
+
+		let symbols = request_value(
+			&client,
+			11,
+			DocumentSymbolRequest::METHOD,
+			serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
+		);
+		assert_eq!(symbols.as_array().unwrap().len(), 3);
+
+		let definition = request_value(&client, 12, GotoDefinition::METHOD, position(4, 14));
+		assert_eq!(definition["uri"], uri.as_str());
+		assert_eq!(definition["range"]["start"]["line"], 2);
+
+		let mut references_params = position(4, 14);
+		references_params["context"] = serde_json::json!({ "includeDeclaration": true });
+		let references = request_value(&client, 13, References::METHOD, references_params);
+		let references = references.as_array().unwrap();
+		assert_eq!(references.len(), 2);
+		assert!(
+			references
+				.iter()
+				.all(|location| location["uri"] == uri.as_str())
+		);
+
+		let completion = request_value(&client, 14, Completion::METHOD, position(5, 5));
+		let completion_items = completion
+			.as_array()
+			.or_else(|| completion["items"].as_array())
+			.unwrap();
+		assert!(completion_items.iter().any(|item| item["label"] == "local"));
+		assert!(completion_items.iter().all(|item| item["label"] != "cycle"));
+
+		let tokens = request_value(
+			&client,
+			15,
+			SemanticTokensFullRequest::METHOD,
+			serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
+		);
+		assert!(!tokens["data"].as_array().unwrap().is_empty());
+
+		let formatting = request_value(
+			&client,
+			16,
+			Formatting::METHOD,
+			serde_json::json!({
+				"textDocument": { "uri": uri.as_str() },
+				"options": { "tabSize": 2, "insertSpaces": true }
+			}),
+		);
+		assert!(formatting.as_array().is_some_and(|edits| !edits.is_empty()));
+
+		let range_formatting = request_value(
+			&client,
+			17,
+			RangeFormatting::METHOD,
+			serde_json::json!({
+				"textDocument": { "uri": uri.as_str() },
+				"range": {
+					"start": { "line": 3, "character": 2 },
+					"end": { "line": 3, "character": 21 }
+				},
+				"options": { "tabSize": 2, "insertSpaces": true }
+			}),
+		);
+		assert!(
+			range_formatting
+				.as_array()
+				.is_some_and(|edits| !edits.is_empty())
+		);
+
+		send_close(&client, uri.clone());
+		let clear = recv_diagnostics_for(&client, &uri);
+		assert_eq!(clear.version, None);
+		assert!(clear.diagnostics.is_empty());
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn untitled_wire_versions_malformed_input_and_close_preserve_buffer_authority() {
+		let (server, client) = Connection::memory();
+		let docs = Arc::new(Mutex::new(DocumentStore::default()));
+		let observed_docs = docs.clone();
+		let handle =
+			std::thread::spawn(move || serve(server, docs, Arc::new(Mutex::new(CompilerState::new()))));
+		handshake(&client);
+		let uri: Uri = "untitled:lifecycle-52".parse().unwrap();
+		send_open(&client, uri.clone(), 7, "func value(): int = true");
+		assert_eq!(recv_diagnostics_for(&client, &uri).version, Some(7));
+
+		let malformed = "func value(: = { definitely malformed";
+		send_change(&client, uri.clone(), 8, malformed);
+		let changed = recv_diagnostics_for(&client, &uri);
+		assert_eq!(changed.version, Some(8));
+		assert!(!changed.diagnostics.is_empty());
+		let malformed_tokens = request_value(
+			&client,
+			20,
+			SemanticTokensFullRequest::METHOD,
+			serde_json::json!({ "textDocument": { "uri": uri.as_str() } }),
+		);
+		assert!(!malformed_tokens["data"].as_array().unwrap().is_empty());
+
+		send_change(&client, uri.clone(), 7, "func stale(): int = 1");
+		assert!(barrier_diagnostics(&client, 21).is_empty());
+		{
+			let docs = observed_docs.lock().unwrap();
+			assert_eq!(docs.version(&uri), Some(8));
+			assert_eq!(docs.get(&uri).unwrap().text, malformed);
+		}
+
+		send_close(&client, uri.clone());
+		let clear = recv_diagnostics_for(&client, &uri);
+		assert_eq!(clear.version, None);
+		assert!(clear.diagnostics.is_empty());
+		send_change(&client, uri.clone(), 9, "func resurrected(): int = 1");
+		assert!(barrier_diagnostics(&client, 22).is_empty());
+		assert!(observed_docs.lock().unwrap().get(&uri).is_none());
+
+		// A reopened lifecycle may restart its client version counter.
+		send_open(&client, uri.clone(), 1, "func reopened(): int = 1");
+		let reopened = recv_diagnostics_for(&client, &uri);
+		assert_eq!(reopened.version, Some(1));
+		assert!(reopened.diagnostics.is_empty());
+		send_close(&client, uri.clone());
+		recv_diagnostics_for(&client, &uri);
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn save_reopen_transition_keeps_untitled_and_file_lifecycles_independent() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='untitled-save-transition'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let main_path = temp.path().join("src/main.nym");
+		let source = "import @/dependency with (disk_value)\nfunc main(): int = disk_value()";
+		std::fs::write(&main_path, source).unwrap();
+		std::fs::write(
+			temp.path().join("src/dependency.nym"),
+			"public func disk_value(): int = 52",
+		)
+		.unwrap();
+		let file_uri = workspace::path_to_uri(&main_path).unwrap();
+		let untitled_uri: Uri = "untitled:save-transition-52".parse().unwrap();
+		let (server, client) = Connection::memory();
+		let docs = Arc::new(Mutex::new(DocumentStore::default()));
+		let observed_docs = docs.clone();
+		let handle =
+			std::thread::spawn(move || serve(server, docs, Arc::new(Mutex::new(CompilerState::new()))));
+		handshake(&client);
+
+		send_open(&client, untitled_uri.clone(), 7, source);
+		let isolated = recv_diagnostics_for(&client, &untitled_uri);
+		assert!(isolated.diagnostics.iter().any(|diagnostic| {
+			diagnostic.code
+				== Some(lsp_types::NumberOrString::String(
+					"IMPORT-UNRESOLVED".into(),
+				))
+		}));
+
+		// VS Code may open the saved file URI before closing the old untitled
+		// URI. They must remain independent during this overlap.
+		send_open(&client, file_uri.clone(), 1, source);
+		let file_diagnostics = recv_diagnostics_for(&client, &file_uri);
+		assert_eq!(file_diagnostics.version, Some(1));
+		assert!(file_diagnostics.diagnostics.is_empty());
+		{
+			let docs = observed_docs.lock().unwrap();
+			assert!(docs.get(&untitled_uri).is_some());
+			assert!(docs.get(&file_uri).is_some());
+		}
+
+		send_close(&client, untitled_uri.clone());
+		let clear = recv_diagnostics_for(&client, &untitled_uri);
+		assert!(clear.diagnostics.is_empty());
+		assert_eq!(clear.version, None);
+		assert!(observed_docs.lock().unwrap().get(&file_uri).is_some());
+		let hover = request_value(
+			&client,
+			30,
+			HoverRequest::METHOD,
+			serde_json::json!({
+				"textDocument": { "uri": file_uri.as_str() },
+				"position": { "line": 1, "character": 20 }
+			}),
+		);
+		assert_ne!(hover, serde_json::Value::Null);
+
+		send_close(&client, file_uri.clone());
+		recv_diagnostics_for(&client, &file_uri);
 		shutdown(&client, handle);
 	}
 

@@ -11,6 +11,12 @@ use std::path::{Path, PathBuf};
 use lsp_types::Uri;
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 
+#[cfg(test)]
+thread_local! {
+	static PATH_CONVERSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+	static PROJECT_DETECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// An open project: its source root directory and the canonical module key
 /// of the file that triggered detection (the driver's graph root — see
 /// `nymph_compiler::check_project_library`'s doc comment on transitive-
@@ -29,8 +35,17 @@ pub struct Project {
 /// documents without touching the filesystem.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UriClass {
-	ProjectFile { path: PathBuf, project: Project },
-	LooseFile { path: PathBuf },
+	ProjectFile {
+		path: PathBuf,
+		project: Project,
+	},
+	LooseFile {
+		path: PathBuf,
+	},
+	/// An editor-owned unsaved document with no filesystem identity.
+	Untitled,
+	/// Any other non-file scheme. These retain their existing strict tooling
+	/// behavior and are not opted into untitled recovery semantics.
 	NonFile,
 }
 
@@ -39,6 +54,12 @@ pub enum UriClass {
 /// Project discovery errors remain authoritative for `file:` URIs. Non-file
 /// URIs never pass through path conversion or project discovery.
 pub fn classify_uri(uri: &Uri) -> anyhow::Result<UriClass> {
+	if uri
+		.scheme()
+		.is_some_and(|scheme| scheme.as_str().eq_ignore_ascii_case("untitled"))
+	{
+		return Ok(UriClass::Untitled);
+	}
 	let Some(path) = uri_to_path(uri) else {
 		return Ok(UriClass::NonFile);
 	};
@@ -56,6 +77,8 @@ pub fn classify_uri(uri: &Uri) -> anyhow::Result<UriClass> {
 /// loose-file checking.
 #[must_use]
 pub fn detect(file: &Path) -> anyhow::Result<Option<Project>> {
+	#[cfg(test)]
+	PROJECT_DETECTIONS.set(PROJECT_DETECTIONS.get() + 1);
 	let file_abs = std::path::absolute(file)?;
 	let start_dir = file_abs
 		.parent()
@@ -138,6 +161,8 @@ pub fn path_to_uri(path: &Path) -> Option<Uri> {
 /// `%20` for a space). Non-file URIs have no filesystem path.
 #[must_use]
 pub fn uri_to_path(uri: &Uri) -> Option<PathBuf> {
+	#[cfg(test)]
+	PATH_CONVERSIONS.set(PATH_CONVERSIONS.get() + 1);
 	if !uri
 		.scheme()
 		.is_some_and(|scheme| scheme.as_str().eq_ignore_ascii_case("file"))
@@ -234,11 +259,25 @@ mod tests {
 
 	#[test]
 	fn non_file_uris_never_become_filesystem_paths() {
-		for raw in ["untitled:Untitled-1", "nymph-notebook:/cell/1"] {
-			let uri: Uri = raw.parse().unwrap();
-			assert_eq!(uri_to_path(&uri), None);
-			assert_eq!(classify_uri(&uri).unwrap(), UriClass::NonFile);
-		}
+		let untitled: Uri = "untitled:Untitled-1".parse().unwrap();
+		PATH_CONVERSIONS.set(0);
+		PROJECT_DETECTIONS.set(0);
+		assert_eq!(classify_uri(&untitled).unwrap(), UriClass::Untitled);
+		assert_eq!(
+			PATH_CONVERSIONS.get(),
+			0,
+			"untitled entered path conversion"
+		);
+		assert_eq!(
+			PROJECT_DETECTIONS.get(),
+			0,
+			"untitled entered project detection"
+		);
+		assert_eq!(uri_to_path(&untitled), None);
+
+		let notebook: Uri = "nymph-notebook:/cell/1".parse().unwrap();
+		assert_eq!(uri_to_path(&notebook), None);
+		assert_eq!(classify_uri(&notebook).unwrap(), UriClass::NonFile);
 	}
 
 	#[test]
