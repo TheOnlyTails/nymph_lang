@@ -26,8 +26,11 @@ impl RenameCandidate {
 		self.disk_sources_are_current().then_some(self.prepare)
 	}
 
-	pub(crate) fn validate_disk_sources(self) -> Option<WorkspaceEdit> {
-		self.disk_sources_are_current().then_some(self.edit)
+	pub(crate) fn validate_disk_sources(self) -> Result<WorkspaceEdit, RenameContentModified> {
+		self
+			.disk_sources_are_current()
+			.then_some(self.edit)
+			.ok_or(RenameContentModified)
 	}
 
 	fn disk_sources_are_current(&self) -> bool {
@@ -49,6 +52,9 @@ impl RenameCandidate {
 		true
 	}
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RenameContentModified;
 
 #[must_use]
 pub(crate) fn valid_new_name(name: &str) -> bool {
@@ -495,7 +501,7 @@ mod tests {
 			} else {
 				std::fs::write(target, "public func answer(): int = 2").unwrap();
 			}
-			assert!(candidate.validate_disk_sources().is_none());
+			assert!(candidate.validate_disk_sources().is_err());
 		}
 	}
 
@@ -513,7 +519,7 @@ mod tests {
 		.unwrap();
 
 		assert!(
-			candidate.validate_disk_sources().is_none(),
+			candidate.validate_disk_sources().is_err(),
 			"a file created after analysis can contain an omitted reference"
 		);
 	}

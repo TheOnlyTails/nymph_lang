@@ -478,20 +478,29 @@ fn main_loop(
 					);
 					drop(docs_guard);
 					drop(compiler);
-					let result = candidate.and_then(rename::RenameCandidate::validate_disk_sources);
-					if let Some(edit) = result {
-						if let Some(edit) = prepare_if_current(docs, uri, &snapshot, edit) {
-							connection
-								.sender
-								.send(Message::Response(Response::new_ok(id, edit)))?;
-						}
-					} else {
-						connection.sender.send(Message::Response(Response::new_err(
+					let response = match candidate {
+						None => Response::new_err(
 							id,
 							lsp_server::ErrorCode::InvalidParams as i32,
-							"target is not renameable or project sources changed".into(),
-						)))?;
-					}
+							"target is not renameable".into(),
+						),
+						Some(candidate) => match candidate.validate_disk_sources() {
+							Err(rename::RenameContentModified) => Response::new_err(
+								id,
+								lsp_server::ErrorCode::ContentModified as i32,
+								"project sources changed while preparing rename".into(),
+							),
+							Ok(edit) => match prepare_if_current(docs, uri, &snapshot, edit) {
+								Some(edit) => Response::new_ok(id, edit),
+								None => Response::new_err(
+									id,
+									lsp_server::ErrorCode::ContentModified as i32,
+									"open documents changed while preparing rename".into(),
+								),
+							},
+						},
+					};
+					connection.sender.send(Message::Response(response))?;
 				} else if req.method == SemanticTokensFullRequest::METHOD {
 					let (id, params) =
 						req.extract::<SemanticTokensParams>(SemanticTokensFullRequest::METHOD)?;
@@ -2427,6 +2436,86 @@ mod tests {
 			)
 			.is_none()
 		);
+	}
+
+	#[test]
+	fn rename_wire_protocol_returns_null_or_errors_instead_of_orphaning_requests() {
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		handshake(&client);
+		let uri: Uri = "untitled:rename-wire".parse().unwrap();
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidOpenTextDocument::METHOD.to_string(),
+				serde_json::to_value(DidOpenTextDocumentParams {
+					text_document: TextDocumentItem {
+						uri: uri.clone(),
+						language_id: "nymph".to_string(),
+						version: 1,
+						text: "func answer(): int = 1".to_string(),
+					},
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+
+		let keyword = TextDocumentPositionParams {
+			text_document: TextDocumentIdentifier { uri: uri.clone() },
+			position: Position::new(0, 1),
+		};
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(30),
+				PrepareRenameRequest::METHOD.to_string(),
+				serde_json::to_value(keyword.clone()).unwrap(),
+			)))
+			.unwrap();
+		assert_eq!(
+			recv_response(&client, 30).response_result.unwrap(),
+			serde_json::Value::Null
+		);
+
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(31),
+				Rename::METHOD.to_string(),
+				serde_json::to_value(RenameParams {
+					text_document_position: keyword,
+					new_name: "renamed".into(),
+					work_done_progress_params: WorkDoneProgressParams::default(),
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		assert_eq!(
+			recv_response(&client, 31).response_result.unwrap_err().code,
+			lsp_server::ErrorCode::InvalidParams as i32
+		);
+
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(32),
+				Rename::METHOD.to_string(),
+				serde_json::to_value(RenameParams {
+					text_document_position: TextDocumentPositionParams {
+						text_document: TextDocumentIdentifier { uri },
+						position: Position::new(0, 6),
+					},
+					new_name: "func".into(),
+					work_done_progress_params: WorkDoneProgressParams::default(),
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		assert_eq!(
+			recv_response(&client, 32).response_result.unwrap_err().code,
+			lsp_server::ErrorCode::InvalidParams as i32
+		);
+		shutdown(&client, handle);
 	}
 
 	/// A round trip through the real `Connection::memory()` wire (not just a
