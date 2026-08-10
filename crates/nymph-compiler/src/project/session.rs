@@ -195,6 +195,10 @@ pub(crate) struct ProjectKey<'db> {
 	pub preserve_names: bool,
 	#[returns(copy)]
 	pub ambient_prelude: bool,
+	/// Isolated editor analysis may recover local semantic facts after graph
+	/// errors, but must never admit project-domain import dependencies.
+	#[returns(copy)]
+	pub isolated: bool,
 }
 
 #[salsa::db]
@@ -297,6 +301,7 @@ pub struct ModuleAnalysis {
 pub struct ToolingCompletionAnalysis {
 	pub source: Arc<str>,
 	pub imported_names: Arc<[nymph_sema::query::ImportedName]>,
+	pub ambient_names: Arc<[nymph_sema::query::ImportedName]>,
 }
 
 /// Body-independent declaration facts for one active project module.
@@ -887,14 +892,52 @@ impl CompilerSession {
 		module: ModulePath,
 		ambient_prelude: bool,
 	) -> Option<ToolingCompletionAnalysis> {
+		self.tooling_completion_analysis_with_key(project, entry, module, ambient_prelude, false)
+	}
+
+	/// Return completion facts for one isolated active editor module. Project
+	/// imports remain unresolved and cannot contribute imported names.
+	#[doc(hidden)]
+	#[must_use]
+	pub fn tooling_isolated_completion_analysis(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		ambient_prelude: bool,
+	) -> Option<ToolingCompletionAnalysis> {
+		if entry != module {
+			return None;
+		}
+		self.tooling_completion_analysis_with_key(project, entry, module, ambient_prelude, true)
+	}
+
+	fn tooling_completion_analysis_with_key(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		ambient_prelude: bool,
+		isolated: bool,
+	) -> Option<ToolingCompletionAnalysis> {
 		let input = self.registry.get(&(project.clone(), module))?.input;
-		let key = self.tooling_key(project.clone(), entry, ambient_prelude);
+		let key = if isolated {
+			self.isolated_tooling_key(project.clone(), entry, ambient_prelude)
+		} else {
+			self.tooling_key(project.clone(), entry, ambient_prelude)
+		};
 		let common = input.project(&self.db) == project
 			&& key.project_input(&self.db).project(&self.db) == project
 			&& key
 				.project_input(&self.db)
 				.active_modules(&self.db)
-				.contains(&input);
+				.contains(&input)
+			&& (!isolated
+				|| key
+					.project_input(&self.db)
+					.active_modules(&self.db)
+					.as_ref()
+					== [input]);
 		if !common {
 			return None;
 		}
@@ -905,6 +948,9 @@ impl CompilerSession {
 			.semantic_direct_dependencies(semantic_input)
 			.iter()
 			.copied()
+			.filter(|dependency| {
+				!isolated || dependency.domain(&self.db) != SemanticModuleDomain::Project
+			})
 			.map(|dependency| queries::interface_module_environment(&self.db, key, dependency))
 			.collect::<Vec<_>>();
 		let imported_names = nymph_sema::query::imported_names(
@@ -913,9 +959,48 @@ impl CompilerSession {
 			&semantic_input.parsed(&self.db).tree,
 		)
 		.into();
+		let ambient_names: Arc<[nymph_sema::query::ImportedName]> = if isolated && ambient_prelude {
+			let registry = key.ambient_core_registry(&self.db);
+			let ambient_modules = registry
+				.modules(&self.db)
+				.iter()
+				.copied()
+				.map(|module| queries::ambient_core_environment(&self.db, registry, module))
+				.collect::<Vec<_>>();
+			let mut bindings = rustc_hash::FxHashMap::default();
+			for module in &ambient_modules {
+				match module.as_ref() {
+					nymph_sema::ModuleEnvironment::Complete(interface) => {
+						for definition in &interface.exports {
+							bindings.insert(
+								definition.name.clone(),
+								nymph_sema::ResolvedImportBinding::Definition(definition.id.clone()),
+							);
+						}
+					}
+					nymph_sema::ModuleEnvironment::Recovered(interface) => {
+						for definition in &interface.exports {
+							bindings.insert(
+								definition.name.clone(),
+								nymph_sema::ResolvedImportBinding::Definition(definition.id.clone()),
+							);
+						}
+					}
+				}
+			}
+			nymph_sema::query::imported_names(
+				&bindings,
+				&ambient_modules,
+				&semantic_input.parsed(&self.db).tree,
+			)
+			.into()
+		} else {
+			Arc::new([])
+		};
 		Some(ToolingCompletionAnalysis {
 			source,
 			imported_names,
+			ambient_names,
 		})
 	}
 
@@ -933,6 +1018,67 @@ impl CompilerSession {
 		let input = self.registry.get(&(project.clone(), module))?.input;
 		let key = self.tooling_key(project.clone(), entry, ambient_prelude);
 		self.module_analysis(project, input, key)
+	}
+
+	/// Return recovered tooling analysis for one active module even when its
+	/// import graph is incomplete. This is intended for isolated editor
+	/// documents: unresolved imports contribute diagnostics and no bindings,
+	/// while the module's remaining semantic facts and ambient prelude stay
+	/// available to tooling. It does not load or register any source.
+	#[doc(hidden)]
+	#[must_use]
+	pub fn tooling_analyze_isolated_module(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		ambient_prelude: bool,
+	) -> Option<Arc<ModuleAnalysis>> {
+		if entry != module {
+			return None;
+		}
+		let input = self.registry.get(&(project.clone(), module))?.input;
+		let key = self.isolated_tooling_key(project.clone(), entry, ambient_prelude);
+		(input.project(&self.db) == project
+			&& key.project_input(&self.db).project(&self.db) == project
+			&& key
+				.project_input(&self.db)
+				.active_modules(&self.db)
+				.as_ref()
+				== [input])
+		.then(|| queries::interface_module_analysis(&self.db, key, SemanticModuleInput::Project(input)))
+	}
+
+	/// Diagnostics paired with [`Self::tooling_analyze_isolated_module`]: graph
+	/// failures such as unresolved imports plus independent recovered parser,
+	/// import-name, and checker diagnostics from the same module.
+	#[doc(hidden)]
+	#[must_use]
+	pub fn tooling_isolated_diagnostics(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		ambient_prelude: bool,
+	) -> Option<Arc<[ProjectDiagnostic]>> {
+		let analysis = self.tooling_analyze_isolated_module(
+			project.clone(),
+			entry.clone(),
+			module,
+			ambient_prelude,
+		)?;
+		let key = self.isolated_tooling_key(project, entry, ambient_prelude);
+		let mut diagnostics = queries::project_graph(&self.db, key)
+			.diagnostics
+			.iter()
+			.cloned()
+			.collect::<Vec<_>>();
+		for diagnostic in analysis.diagnostics.iter() {
+			if !diagnostics.contains(diagnostic) {
+				diagnostics.push(diagnostic.clone());
+			}
+		}
+		Some(diagnostics.into())
 	}
 
 	/// Return every active project module from the session's current immutable
@@ -1406,6 +1552,7 @@ impl CompilerSession {
 				mode,
 				false,
 				true,
+				false,
 			),
 		)
 		.clone()
@@ -1437,6 +1584,7 @@ impl CompilerSession {
 			mode,
 			preserve_names,
 			ambient_prelude,
+			false,
 		)
 	}
 
@@ -1447,6 +1595,26 @@ impl CompilerSession {
 		ambient_prelude: bool,
 	) -> ProjectKey<'_> {
 		self.project_key(project, entry, EntryMode::Library, true, ambient_prelude)
+	}
+
+	fn isolated_tooling_key(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		ambient_prelude: bool,
+	) -> ProjectKey<'_> {
+		let key = self.project_key(project, entry, EntryMode::Library, true, ambient_prelude);
+		ProjectKey::new(
+			&self.db,
+			key.project_input(&self.db),
+			self.builtin_registry,
+			self.ambient_core_registry,
+			key.entry(&self.db),
+			key.mode(&self.db),
+			key.preserve_names(&self.db),
+			key.ambient_prelude(&self.db),
+			true,
+		)
 	}
 
 	#[must_use]

@@ -24,7 +24,10 @@ export async function activate(context: ExtensionContext) {
 	};
 
 	const clientOptions: LanguageClientOptions = {
-		documentSelector: [{ scheme: "file", language: "nymph" }],
+		documentSelector: [
+			{ scheme: "file", language: "nymph" },
+			{ scheme: "untitled", language: "nymph" },
+		],
 	};
 
 	client = new LanguageClient("nymph-lsp", "Nymph Language Server", serverOptions, clientOptions);
