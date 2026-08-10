@@ -470,6 +470,17 @@ fn member_completion_replaces_astral_prefix_with_exact_utf16_range() {
 		(edit.range.start.character, edit.range.end.character),
 		(29, 37)
 	);
+
+	let middle = completion_items(&compiler, &docs, &uri, 1, 31);
+	let item = middle.iter().find(|item| item.label == "astral𐐀").unwrap();
+	let Some(lsp_types::CompletionTextEdit::Edit(edit)) = &item.text_edit else {
+		panic!("missing edit")
+	};
+	assert_eq!(
+		(edit.range.start.character, edit.range.end.character),
+		(29, 37),
+		"completion in the middle of a member must replace its entire UTF-16 token"
+	);
 }
 
 #[test]

@@ -113,7 +113,7 @@ fn complete(
 
 	let index = LineIndex::new(text);
 	let offset = index.offset(text, position);
-	let (prefix, prefix_scope_offset) = identifier_prefix(text, offset);
+	let (prefix, prefix_scope_offset, prefix_token_end) = identifier_prefix(text, offset);
 	let prefix_start = offset.saturating_sub(prefix.len());
 	if prefix_start > 0 && text.as_bytes().get(prefix_start - 1) == Some(&b'.') {
 		let Some(semantic) = semantic else {
@@ -121,11 +121,11 @@ fn complete(
 		};
 		let range = lsp_types::Range {
 			start: index.position(text, prefix_start),
-			end: index.position(text, offset),
+			end: index.position(text, prefix_token_end),
 		};
 		// Sema's position contract is strictly half-open. Query at the previous
 		// Unicode scalar (the dot for an empty prefix, otherwise the final prefix
-		// scalar), while the edit continues to replace `[prefix_start, cursor)`.
+		// scalar), while the edit replaces the complete identifier token.
 		let query_offset = text[..offset]
 			.char_indices()
 			.next_back()
@@ -251,30 +251,31 @@ fn imported_kind(kind: nymph_sema::query::ImportedNameKind) -> CompletionItemKin
 }
 
 /// The lexer-recognized identifier characters immediately before `offset`,
-/// plus a scalar position inside that token for completion's half-open scope
-/// retry. This intentionally reuses the language's Unicode identifier rules.
-fn identifier_prefix(text: &str, offset: usize) -> (String, Option<usize>) {
+/// a scalar position inside that token for completion's half-open scope retry,
+/// and the token end for a replacement edit. This intentionally reuses the
+/// language's Unicode identifier rules.
+fn identifier_prefix(text: &str, offset: usize) -> (String, Option<usize>, usize) {
 	let offset = offset.min(text.len());
 	let Some(token) = nymph_syntax::lex(text)
 		.tokens
 		.into_iter()
 		.find(|token| token.1.start < offset && offset <= token.1.end)
 	else {
-		return (String::new(), None);
+		return (String::new(), None, offset);
 	};
 	let lexeme = &text[token.1.start..token.1.end];
 	if !matches!(token.0, nymph_ast::token::Token::Identifier(_))
 		&& lexeme != "_"
 		&& !KEYWORDS.contains(&lexeme)
 	{
-		return (String::new(), None);
+		return (String::new(), None, offset);
 	}
 	let prefix = &text[token.1.start..offset];
 	let scope_offset = prefix
 		.char_indices()
 		.next_back()
 		.map(|(relative, _)| token.1.start + relative);
-	(prefix.to_string(), scope_offset)
+	(prefix.to_string(), scope_offset, token.1.end)
 }
 
 /// Every top-level declaration's own name and a matching [`CompletionItemKind`]
