@@ -115,6 +115,8 @@ pub struct ReferenceModuleSnapshot {
 	pub uri: Uri,
 	pub source: Arc<str>,
 	pub occurrences: Vec<nymph_sema::query::ReferenceOccurrence>,
+	pub occurrences_are_uniquely_editable: bool,
+	pub document_version: Option<i32>,
 	pub requires_disk_validation: bool,
 }
 
@@ -1047,6 +1049,9 @@ impl CompilerState {
 			let occurrences = analysis.as_ref().map_or_else(Vec::new, |analysis| {
 				nymph_sema::query::references_to(&analysis.semantic, symbol)
 			});
+			let occurrences_are_uniquely_editable = analysis.as_ref().is_none_or(|analysis| {
+				nymph_sema::query::rename_occurrences(&analysis.semantic, symbol).is_some()
+			});
 			let overlay_uri = self.documents.iter().find_map(|(uri, identity)| {
 				(identity.project == snapshot.project
 					&& identity.module == module
@@ -1075,17 +1080,14 @@ impl CompilerState {
 			{
 				return None;
 			}
-			let target_is_open = self.documents.iter().any(|(open_uri, identity)| {
-				identity.project == snapshot.project
-					&& identity.module == module
-					&& identity.without_prelude == snapshot.without_prelude
-					&& docs.get(open_uri).is_some()
-			});
+			let document_version = docs.get(&uri).map(|document| document.version);
 			modules.push(ReferenceModuleSnapshot {
 				uri,
 				source,
 				occurrences,
-				requires_disk_validation: !target_is_open,
+				occurrences_are_uniquely_editable,
+				document_version,
+				requires_disk_validation: document_version.is_none(),
 			});
 		}
 		Some(modules)
