@@ -76,6 +76,17 @@ qualified uses participate when they resolve to the selected declaration; shadow
 same-named symbols do not. VS Code's include-declaration request setting is honored. A file outside a
 project is limited to its isolated one-file analysis universe.
 
+**Rename Symbol** uses that same compiler-resolved identity and edits the declaration and every use
+in the project, without matching unrelated same-spelled or shadowed names. Import aliases participate
+as references to the imported declaration: the source import token, alias token, alias uses, and
+declaration are renamed together. User-written declarations and local bindings are renameable;
+module names, builtins, prelude/synthetic symbols, unresolved or
+ambiguous names, keywords, literals, and non-symbol labels are rejected. The replacement must lex as
+exactly one Nymph identifier (so keywords, `_`, malformed, empty, and multi-token names are invalid).
+Open authoritative buffers carry their current document versions in the workspace edit, while closed
+files are unversioned and are reread from disk before any edit is returned. If an open overlay or a
+closed project source changes while rename is being computed, the stale result is not published.
+
 **Go to Symbol in Workspace** searches visible top-level declarations in synchronized manifest
 projects, including unopened modules and unsaved open-file overlays. It excludes private items,
 locals, implementation members, compiler-generated symbols, dependencies, and loose files. Matching

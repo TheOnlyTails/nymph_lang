@@ -1197,6 +1197,53 @@ pub fn references_to(
 	occurrences
 }
 
+/// Return rename-editable occurrences of `symbol`, or `None` when any of
+/// their source spans overlaps an occurrence owned by another semantic
+/// identity.
+///
+/// A token can deliberately have two roles, notably a shorthand struct field
+/// pattern that is both a field reference and a local declaration. References
+/// may report both roles, but replacing that token cannot rename only one of
+/// them without expanding the shorthand, so rename conservatively rejects the
+/// complete operation.
+#[must_use]
+pub fn rename_occurrences(
+	analysis: &crate::SemanticAnalysis,
+	symbol: &SymbolIdentity,
+) -> Option<Vec<ReferenceOccurrence>> {
+	let all = all_symbol_occurrences(analysis);
+	uniquely_editable_occurrences(&all, symbol)
+}
+
+fn uniquely_editable_occurrences(
+	all: &[(SymbolIdentity, ReferenceOccurrence)],
+	symbol: &SymbolIdentity,
+) -> Option<Vec<ReferenceOccurrence>> {
+	let selected = all
+		.iter()
+		.filter_map(|(identity, occurrence)| (identity == symbol).then_some(*occurrence))
+		.collect::<Vec<_>>();
+	let uniquely_editable = selected.iter().all(|selected| {
+		all.iter().all(|(identity, other)| {
+			identity == symbol
+				|| selected.span.end <= other.span.start
+				|| other.span.end <= selected.span.start
+		})
+	});
+	uniquely_editable.then(|| {
+		let mut selected = selected;
+		selected.sort_unstable_by_key(|occurrence| {
+			(
+				occurrence.span.start,
+				occurrence.span.end,
+				!occurrence.is_declaration,
+			)
+		});
+		selected.dedup_by_key(|occurrence| (occurrence.span.start, occurrence.span.end));
+		selected
+	})
+}
+
 fn all_symbol_occurrences(
 	analysis: &crate::SemanticAnalysis,
 ) -> Vec<(SymbolIdentity, ReferenceOccurrence)> {
@@ -4268,6 +4315,45 @@ mod definition_and_scope_tests {
 		for (name, span, offset, expected) in cases {
 			assert_eq!(covers(span, offset), expected, "case {name}");
 		}
+	}
+
+	#[test]
+	fn rename_occurrences_reject_dual_identity_span_but_references_can_keep_both_roles() {
+		let field = SymbolIdentity::Local(Span::new(1, 2));
+		let binding = SymbolIdentity::Local(Span::new(3, 4));
+		let shorthand = ReferenceOccurrence {
+			span: Span::new(10, 11),
+			is_declaration: false,
+		};
+		let all = vec![
+			(field.clone(), shorthand),
+			(
+				binding.clone(),
+				ReferenceOccurrence {
+					is_declaration: true,
+					..shorthand
+				},
+			),
+		];
+
+		assert_eq!(
+			all
+				.iter()
+				.filter(|(identity, _)| identity == &field)
+				.count(),
+			1,
+			"reference collection retains the field role"
+		);
+		assert_eq!(
+			all
+				.iter()
+				.filter(|(identity, _)| identity == &binding)
+				.count(),
+			1,
+			"reference collection retains the binding role"
+		);
+		assert!(uniquely_editable_occurrences(&all, &field).is_none());
+		assert!(uniquely_editable_occurrences(&all, &binding).is_none());
 	}
 
 	#[test]
