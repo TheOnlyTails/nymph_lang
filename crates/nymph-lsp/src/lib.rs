@@ -46,23 +46,91 @@ pub mod workspace_symbols;
 use std::sync::{Arc, Mutex};
 
 use document_store::DocumentStore;
-use lsp_server::{Connection, Message, Notification as ServerNotification, Response};
+use lsp_server::{
+	Connection, Message, Notification as ServerNotification, Request as ServerRequest, RequestId,
+	Response,
+};
 use lsp_types::{
-	CompletionOptions, CompletionParams, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-	DidOpenTextDocumentParams, DocumentFormattingParams, DocumentRangeFormattingParams,
-	DocumentSymbolParams, GotoDefinitionParams, HoverParams, HoverProviderCapability,
-	InitializeParams, InitializeResult, OneOf, ReferenceParams, SemanticTokensFullOptions,
-	SemanticTokensOptions, SemanticTokensParams, SemanticTokensServerCapabilities,
-	ServerCapabilities, ServerInfo, TextDocumentSyncCapability, TextDocumentSyncKind,
-	WorkspaceSymbolParams,
+	CompletionOptions, CompletionParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+	DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+	DocumentFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams, FileSystemWatcher,
+	GlobPattern, GotoDefinitionParams, HoverParams, HoverProviderCapability, InitializeParams,
+	InitializeResult, OneOf, ReferenceParams, Registration, RegistrationParams,
+	SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+	SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
+	TextDocumentSyncKind, WorkspaceSymbolParams,
 	notification::{
-		DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _,
+		DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
+		Notification as _,
 	},
 	request::{
 		Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, RangeFormatting,
-		References, Request as _, SemanticTokensFullRequest, WorkspaceSymbolRequest,
+		References, RegisterCapability, Request as _, SemanticTokensFullRequest,
+		WorkspaceSymbolRequest,
 	},
 };
+
+const WATCH_REGISTRATION_REQUEST_ID: &str = "nymph-watchers";
+const WATCH_REGISTRATION_ID: &str = "nymph-project-files";
+
+struct ClientState {
+	supports_dynamic_watch_registration: bool,
+	registration_request: Option<RequestId>,
+	watchers_authoritative: bool,
+}
+
+impl ClientState {
+	fn from_initialize(params: &InitializeParams) -> Self {
+		let supports_dynamic_watch_registration = params
+			.capabilities
+			.workspace
+			.as_ref()
+			.and_then(|workspace| workspace.did_change_watched_files.as_ref())
+			.and_then(|watched_files| watched_files.dynamic_registration)
+			.unwrap_or(false);
+		Self {
+			supports_dynamic_watch_registration,
+			registration_request: None,
+			watchers_authoritative: false,
+		}
+	}
+
+	fn register_watchers(&mut self, connection: &Connection) -> anyhow::Result<()> {
+		if !self.supports_dynamic_watch_registration || self.registration_request.is_some() {
+			return Ok(());
+		}
+		let id = RequestId::from(WATCH_REGISTRATION_REQUEST_ID.to_string());
+		let options = DidChangeWatchedFilesRegistrationOptions {
+			watchers: ["**/*.nym", "**/nymph.toml"]
+				.into_iter()
+				.map(|pattern| FileSystemWatcher {
+					glob_pattern: GlobPattern::String(pattern.to_string()),
+					kind: None,
+				})
+				.collect(),
+		};
+		let params = RegistrationParams {
+			registrations: vec![Registration {
+				id: WATCH_REGISTRATION_ID.to_string(),
+				method: DidChangeWatchedFiles::METHOD.to_string(),
+				register_options: Some(serde_json::to_value(options)?),
+			}],
+		};
+		connection.sender.send(Message::Request(ServerRequest::new(
+			id.clone(),
+			RegisterCapability::METHOD.to_string(),
+			params,
+		)))?;
+		self.registration_request = Some(id);
+		Ok(())
+	}
+
+	fn handle_response(&mut self, response: &Response) {
+		if self.registration_request.as_ref() == Some(&response.id) {
+			self.watchers_authoritative = response.response_result.is_ok();
+		}
+	}
+}
 
 /// The capabilities this server advertises during `initialize`: full-text
 /// document sync, hover, document symbols, go-to-definition, references, completion
@@ -120,7 +188,8 @@ fn serve(
 	compiler: Arc<Mutex<compiler_state::CompilerState>>,
 ) -> anyhow::Result<()> {
 	let (id, params) = connection.initialize_start()?;
-	let _init_params: InitializeParams = serde_json::from_value(params)?;
+	let init_params: InitializeParams = serde_json::from_value(params)?;
+	let mut client_state = ClientState::from_initialize(&init_params);
 
 	let init_result = InitializeResult {
 		capabilities: server_capabilities(),
@@ -130,8 +199,9 @@ fn serve(
 		}),
 	};
 	connection.initialize_finish(id, serde_json::to_value(init_result)?)?;
+	client_state.register_watchers(&connection)?;
 
-	main_loop(&connection, &docs, &compiler)
+	main_loop(&connection, &docs, &compiler, &mut client_state)
 }
 
 fn prepare_if_current<T>(
@@ -206,6 +276,7 @@ fn main_loop(
 	connection: &Connection,
 	docs: &Arc<Mutex<DocumentStore>>,
 	compiler: &Arc<Mutex<compiler_state::CompilerState>>,
+	client_state: &mut ClientState,
 ) -> anyhow::Result<()> {
 	for msg in &connection.receiver {
 		match msg {
@@ -375,8 +446,13 @@ fn main_loop(
 					)))?;
 				}
 			}
-			Message::Notification(not) => handle_notification(connection, docs, compiler, not)?,
-			Message::Response(_) => {}
+			Message::Notification(not) => {
+				if not.method == DidChangeWatchedFiles::METHOD && !client_state.watchers_authoritative {
+					continue;
+				}
+				handle_notification(connection, docs, compiler, not)?;
+			}
+			Message::Response(response) => client_state.handle_response(&response),
 		}
 	}
 	Ok(())
@@ -434,6 +510,27 @@ fn handle_notification(
 				}
 			}
 		}
+		m if m == DidChangeWatchedFiles::METHOD => {
+			let params: DidChangeWatchedFilesParams = serde_json::from_value(not.params)?;
+			let uris: Vec<_> = params
+				.changes
+				.into_iter()
+				.map(|change| change.uri)
+				.collect();
+			let refreshes = compiler
+				.lock()
+				.unwrap()
+				.watched_files_changed(&mut docs.lock().unwrap(), &uris)?;
+			for refresh in refreshes {
+				diagnostics::check_and_publish_affected(
+					connection,
+					docs,
+					compiler,
+					&refresh.origin,
+					&refresh.affected,
+				)?;
+			}
+		}
 		_ => {}
 	}
 	Ok(())
@@ -466,6 +563,67 @@ mod tests {
 			.send(Message::Notification(Notification::new(
 				"initialized".to_string(),
 				serde_json::json!({}),
+			)))
+			.unwrap();
+	}
+
+	fn handshake_with_watchers(client: &Connection) -> Request {
+		let mut params = InitializeParams::default();
+		params.capabilities.workspace = Some(lsp_types::WorkspaceClientCapabilities {
+			did_change_watched_files: Some(lsp_types::DidChangeWatchedFilesClientCapabilities {
+				dynamic_registration: Some(true),
+				relative_pattern_support: None,
+			}),
+			..Default::default()
+		});
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(1),
+				"initialize".to_string(),
+				serde_json::to_value(params).unwrap(),
+			)))
+			.unwrap();
+		assert!(matches!(
+			client.receiver.recv().unwrap(),
+			Message::Response(_)
+		));
+		assert!(
+			client
+				.receiver
+				.recv_timeout(std::time::Duration::from_millis(100))
+				.is_err(),
+			"dynamic registration must wait for the initialized notification"
+		);
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				lsp_types::notification::Initialized::METHOD.to_string(),
+				serde_json::json!({}),
+			)))
+			.unwrap();
+		match client.receiver.recv().unwrap() {
+			Message::Request(request) => request,
+			other => panic!("expected dynamic registration request, got {other:?}"),
+		}
+	}
+
+	fn send_watched_file(client: &Connection, uri: Uri) {
+		send_watched_files(
+			client,
+			vec![lsp_types::FileEvent::new(
+				uri,
+				lsp_types::FileChangeType::CHANGED,
+			)],
+		);
+	}
+
+	fn send_watched_files(client: &Connection, changes: Vec<lsp_types::FileEvent>) {
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidChangeWatchedFiles::METHOD.into(),
+				serde_json::to_value(DidChangeWatchedFilesParams { changes }).unwrap(),
 			)))
 			.unwrap();
 	}
@@ -521,6 +679,33 @@ mod tests {
 			let diagnostics = recv_diagnostics(client);
 			if diagnostics.uri == *uri {
 				return diagnostics;
+			}
+		}
+	}
+
+	fn barrier_diagnostics(client: &Connection, id: i32) -> Vec<PublishDiagnosticsParams> {
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(id),
+				"test/barrier".into(),
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		let mut publications = Vec::new();
+		loop {
+			match client.receiver.recv().unwrap() {
+				Message::Notification(notification)
+					if notification.method == lsp_types::notification::PublishDiagnostics::METHOD =>
+				{
+					publications
+						.push(serde_json::from_value::<PublishDiagnosticsParams>(notification.params).unwrap());
+				}
+				Message::Response(response) => {
+					assert_eq!(response.id, RequestId::from(id));
+					return publications;
+				}
+				other => panic!("expected diagnostics or barrier response, got {other:?}"),
 			}
 		}
 	}
@@ -1582,6 +1767,546 @@ mod tests {
 			)))
 			.unwrap();
 
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn supported_client_receives_exactly_one_project_file_watcher_registration() {
+		let (server, client) = Connection::memory();
+		let docs = Arc::new(Mutex::new(DocumentStore::default()));
+		let observed_docs = docs.clone();
+		let handle =
+			std::thread::spawn(move || serve(server, docs, Arc::new(Mutex::new(CompilerState::new()))));
+		let request = handshake_with_watchers(&client);
+		let registration_request_id = request.id.clone();
+		assert_eq!(request.method, RegisterCapability::METHOD);
+		let params: RegistrationParams = serde_json::from_value(request.params).unwrap();
+		assert_eq!(params.registrations.len(), 1);
+		let registration = &params.registrations[0];
+		assert_eq!(registration.id, WATCH_REGISTRATION_ID);
+		assert_eq!(registration.method, DidChangeWatchedFiles::METHOD);
+		let options: DidChangeWatchedFilesRegistrationOptions =
+			serde_json::from_value(registration.register_options.clone().unwrap()).unwrap();
+		assert_eq!(
+			options
+				.watchers
+				.iter()
+				.map(|watcher| &watcher.glob_pattern)
+				.collect::<Vec<_>>(),
+			[
+				&GlobPattern::String("**/*.nym".into()),
+				&GlobPattern::String("**/nymph.toml".into())
+			]
+		);
+		assert!(
+			options
+				.watchers
+				.iter()
+				.all(|watcher| watcher.kind.is_none())
+		);
+
+		client
+			.sender
+			.send(Message::Response(Response::new_ok(
+				RequestId::from("unrelated".to_string()),
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		send_watched_file(
+			&client,
+			"file:///ignored-before-registration.nym".parse().unwrap(),
+		);
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(89),
+				"test/barrier".into(),
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		assert_eq!(recv_response(&client, 89).id, RequestId::from(89));
+		assert_eq!(
+			observed_docs.lock().unwrap().revision(),
+			DocumentStore::default().revision(),
+			"an unrelated response must not activate watched-file handling"
+		);
+
+		client
+			.sender
+			.send(Message::Response(Response::new_ok(
+				registration_request_id,
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				lsp_types::notification::Initialized::METHOD.into(),
+				serde_json::json!({}),
+			)))
+			.unwrap();
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(90),
+				"test/barrier".into(),
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		match client.receiver.recv().unwrap() {
+			Message::Response(response) => assert_eq!(response.id, RequestId::from(90)),
+			other => panic!("duplicate initialized triggered an extra message: {other:?}"),
+		}
+		assert!(client.receiver.try_recv().is_err());
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn unsupported_client_skips_registration_and_continues_serving_requests() {
+		let (server, client) = Connection::memory();
+		let docs = Arc::new(Mutex::new(DocumentStore::default()));
+		let observed_docs = docs.clone();
+		let handle =
+			std::thread::spawn(move || serve(server, docs, Arc::new(Mutex::new(CompilerState::new()))));
+		handshake(&client);
+		send_watched_file(&client, "file:///unsupported-client.nym".parse().unwrap());
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(91),
+				"test/barrier".into(),
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		match client.receiver.recv().unwrap() {
+			Message::Response(response) => assert_eq!(response.id, RequestId::from(91)),
+			other => panic!("unsupported client unexpectedly received {other:?}"),
+		}
+		assert_eq!(
+			observed_docs.lock().unwrap().revision(),
+			DocumentStore::default().revision(),
+			"an unsupported client's watcher notification must be ignored"
+		);
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn rejected_watcher_registration_does_not_stop_the_server() {
+		let (server, client) = Connection::memory();
+		let docs = Arc::new(Mutex::new(DocumentStore::default()));
+		let observed_docs = docs.clone();
+		let handle =
+			std::thread::spawn(move || serve(server, docs, Arc::new(Mutex::new(CompilerState::new()))));
+		let registration = handshake_with_watchers(&client);
+		client
+			.sender
+			.send(Message::Response(Response::new_err(
+				registration.id,
+				lsp_server::ErrorCode::InternalError as i32,
+				"watching unavailable".into(),
+			)))
+			.unwrap();
+		send_watched_file(
+			&client,
+			"file:///rejected-registration.nym".parse().unwrap(),
+		);
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(93),
+				"test/barrier".into(),
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		assert_eq!(recv_response(&client, 93).id, RequestId::from(93));
+		assert_eq!(
+			observed_docs.lock().unwrap().revision(),
+			DocumentStore::default().revision(),
+			"a rejected registration must not authorize watcher notifications"
+		);
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn watcher_notification_republishes_disk_dependency_and_importer_over_wire() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='wire-watch'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let main_path = temp.path().join("src/main.nym");
+		let dep_path = temp.path().join("src/dep.nym");
+		let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+		std::fs::write(&main_path, main_source).unwrap();
+		std::fs::write(&dep_path, "public func value(): int = 1").unwrap();
+		let main_uri = workspace::path_to_uri(&main_path).unwrap();
+		let dep_uri = workspace::path_to_uri(&dep_path).unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		let registration = handshake_with_watchers(&client);
+		client
+			.sender
+			.send(Message::Response(Response::new_ok(
+				registration.id,
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		send_open(&client, main_uri.clone(), 1, main_source);
+		assert!(
+			recv_diagnostics_for(&client, &main_uri)
+				.diagnostics
+				.is_empty()
+		);
+
+		std::fs::write(&dep_path, "public func value(): int = true").unwrap();
+		send_watched_files(
+			&client,
+			vec![
+				lsp_types::FileEvent::new(dep_uri.clone(), lsp_types::FileChangeType::CREATED),
+				lsp_types::FileEvent::new(main_uri.clone(), lsp_types::FileChangeType::CHANGED),
+				lsp_types::FileEvent::new(dep_uri.clone(), lsp_types::FileChangeType::CHANGED),
+				lsp_types::FileEvent::new(dep_uri.clone(), lsp_types::FileChangeType::DELETED),
+			],
+		);
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(92),
+				"test/barrier".into(),
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		let mut publications = Vec::new();
+		loop {
+			match client.receiver.recv().unwrap() {
+				Message::Notification(notification)
+					if notification.method == lsp_types::notification::PublishDiagnostics::METHOD =>
+				{
+					publications
+						.push(serde_json::from_value::<PublishDiagnosticsParams>(notification.params).unwrap());
+				}
+				Message::Response(response) => {
+					assert_eq!(response.id, RequestId::from(92));
+					break;
+				}
+				other => panic!("expected diagnostics or barrier response, got {other:?}"),
+			}
+		}
+		assert_eq!(
+			publications
+				.iter()
+				.map(|params| &params.uri)
+				.collect::<Vec<_>>(),
+			[&dep_uri, &main_uri]
+		);
+		assert!(!publications[0].diagnostics.is_empty());
+		assert!(publications[1].diagnostics.is_empty());
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn watcher_notification_publishes_an_authoritative_equivalent_overlay_once() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='wire-watch-alias'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let main_path = temp.path().join("src/main.nym");
+		let dep_path = temp.path().join("src/dep.nym");
+		let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+		std::fs::write(&main_path, main_source).unwrap();
+		std::fs::write(&dep_path, "public func value(): int = 1").unwrap();
+		let main_uri = workspace::path_to_uri(&main_path).unwrap();
+		let dep_uri = workspace::path_to_uri(&dep_path).unwrap();
+		let equivalent_uri: Uri = dep_uri
+			.as_str()
+			.replace("dep.nym", "%64ep.nym")
+			.parse()
+			.unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		let registration = handshake_with_watchers(&client);
+		client
+			.sender
+			.send(Message::Response(Response::new_ok(
+				registration.id,
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		send_open(&client, main_uri.clone(), 1, main_source);
+		recv_diagnostics_for(&client, &main_uri);
+		send_open(
+			&client,
+			equivalent_uri.clone(),
+			7,
+			"public func value(): int = true",
+		);
+		recv_diagnostics_for(&client, &equivalent_uri);
+		recv_diagnostics_for(&client, &main_uri);
+
+		std::fs::write(&dep_path, "public func value(): int = 2").unwrap();
+		send_watched_files(
+			&client,
+			vec![
+				lsp_types::FileEvent::new(dep_uri.clone(), lsp_types::FileChangeType::CHANGED),
+				lsp_types::FileEvent::new(equivalent_uri.clone(), lsp_types::FileChangeType::CHANGED),
+			],
+		);
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(94),
+				"test/barrier".into(),
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		let mut publications = Vec::new();
+		loop {
+			match client.receiver.recv().unwrap() {
+				Message::Notification(notification)
+					if notification.method == lsp_types::notification::PublishDiagnostics::METHOD =>
+				{
+					publications
+						.push(serde_json::from_value::<PublishDiagnosticsParams>(notification.params).unwrap());
+				}
+				Message::Response(response) => {
+					assert_eq!(response.id, RequestId::from(94));
+					break;
+				}
+				other => panic!("expected diagnostics or barrier response, got {other:?}"),
+			}
+		}
+		assert_eq!(
+			publications
+				.iter()
+				.map(|params| (&params.uri, params.version))
+				.collect::<Vec<_>>(),
+			[(&equivalent_uri, Some(7)), (&main_uri, Some(1))]
+		);
+		assert!(publications.iter().all(|params| params.uri != dep_uri));
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn watcher_read_race_removes_the_source_without_stopping_the_server() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='wire-watch-race'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let main_path = temp.path().join("src/main.nym");
+		let dep_path = temp.path().join("src/dep.nym");
+		let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+		std::fs::write(&main_path, main_source).unwrap();
+		std::fs::write(&dep_path, "public func value(): int = 1").unwrap();
+		let main_uri = workspace::path_to_uri(&main_path).unwrap();
+		let dep_uri = workspace::path_to_uri(&dep_path).unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		let registration = handshake_with_watchers(&client);
+		client
+			.sender
+			.send(Message::Response(Response::new_ok(
+				registration.id,
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		send_open(&client, main_uri.clone(), 1, main_source);
+		recv_diagnostics_for(&client, &main_uri);
+
+		std::fs::remove_file(&dep_path).unwrap();
+		std::fs::create_dir(&dep_path).unwrap();
+		send_watched_file(&client, dep_uri.clone());
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(95),
+				"test/barrier".into(),
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		let mut publications = Vec::new();
+		loop {
+			match client.receiver.recv().unwrap() {
+				Message::Notification(notification)
+					if notification.method == lsp_types::notification::PublishDiagnostics::METHOD =>
+				{
+					publications
+						.push(serde_json::from_value::<PublishDiagnosticsParams>(notification.params).unwrap());
+				}
+				Message::Response(response) => {
+					assert_eq!(response.id, RequestId::from(95));
+					break;
+				}
+				other => panic!("expected diagnostics or barrier response, got {other:?}"),
+			}
+		}
+		assert_eq!(
+			publications
+				.iter()
+				.map(|params| &params.uri)
+				.collect::<Vec<_>>(),
+			[&dep_uri, &main_uri]
+		);
+		assert!(publications[0].diagnostics.is_empty());
+		assert!(publications[1].diagnostics.iter().any(|diagnostic| {
+			diagnostic.code
+				== Some(lsp_types::NumberOrString::String(
+					"IMPORT-UNRESOLVED".into(),
+				))
+		}));
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn stale_reverse_importer_owner_does_not_clear_newer_diagnostics() {
+		let temp = tempfile::tempdir().unwrap();
+		std::fs::write(
+			temp.path().join("nymph.toml"),
+			"[package]\nname='wire-watch-owner'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let main_path = temp.path().join("src/main.nym");
+		let a_path = temp.path().join("src/a.nym");
+		let b_path = temp.path().join("src/b.nym");
+		let main_source = "import @/a with (middle)\nfunc use(): int = middle()";
+		std::fs::write(&main_path, main_source).unwrap();
+		std::fs::write(
+			&a_path,
+			"import @/b with (value)\npublic func middle(): int = value()",
+		)
+		.unwrap();
+		std::fs::write(&b_path, "public func value(): int = 1").unwrap();
+		let main_uri = workspace::path_to_uri(&main_path).unwrap();
+		let a_uri = workspace::path_to_uri(&a_path).unwrap();
+		let b_uri = workspace::path_to_uri(&b_path).unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		let registration = handshake_with_watchers(&client);
+		client
+			.sender
+			.send(Message::Response(Response::new_ok(
+				registration.id,
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		send_open(&client, main_uri.clone(), 1, main_source);
+		recv_diagnostics_for(&client, &main_uri);
+
+		std::fs::write(&b_path, "public func value(): float = 1.0").unwrap();
+		send_watched_file(&client, b_uri.clone());
+		let from_b = barrier_diagnostics(&client, 96);
+		assert!(
+			from_b
+				.iter()
+				.find(|params| params.uri == a_uri)
+				.is_some_and(|params| !params.diagnostics.is_empty())
+		);
+
+		std::fs::write(&a_path, "public func middle(): int = true").unwrap();
+		send_watched_file(&client, a_uri.clone());
+		let from_a = barrier_diagnostics(&client, 97);
+		assert!(
+			from_a
+				.iter()
+				.find(|params| params.uri == a_uri)
+				.is_some_and(|params| !params.diagnostics.is_empty())
+		);
+
+		std::fs::write(&b_path, "public func value(): int = 2").unwrap();
+		send_watched_file(&client, b_uri.clone());
+		let final_publications = barrier_diagnostics(&client, 98);
+		assert_eq!(
+			final_publications
+				.iter()
+				.map(|params| &params.uri)
+				.collect::<Vec<_>>(),
+			[&b_uri],
+			"the old b refresh owner cleared diagnostics more recently published by a"
+		);
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn watched_manifest_removal_clears_diagnostics_owned_by_a_retired_closed_module() {
+		let temp = tempfile::tempdir().unwrap();
+		let manifest_path = temp.path().join("nymph.toml");
+		std::fs::write(
+			&manifest_path,
+			"[package]\nname='wire-watch-retired'\nversion='0.1.0'\n",
+		)
+		.unwrap();
+		std::fs::create_dir(temp.path().join("src")).unwrap();
+		let main_path = temp.path().join("src/main.nym");
+		let dep_path = temp.path().join("src/dep.nym");
+		let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+		std::fs::write(&main_path, main_source).unwrap();
+		std::fs::write(&dep_path, "public func value(): int = 1").unwrap();
+		let manifest_uri = workspace::path_to_uri(&manifest_path).unwrap();
+		let main_uri = workspace::path_to_uri(&main_path).unwrap();
+		let dep_uri = workspace::path_to_uri(&dep_path).unwrap();
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		let registration = handshake_with_watchers(&client);
+		client
+			.sender
+			.send(Message::Response(Response::new_ok(
+				registration.id,
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		send_open(&client, main_uri.clone(), 1, main_source);
+		recv_diagnostics_for(&client, &main_uri);
+
+		std::fs::write(&dep_path, "public func value(): float = 1.0").unwrap();
+		send_watched_file(&client, dep_uri.clone());
+		let from_dep = barrier_diagnostics(&client, 99);
+		assert!(
+			from_dep
+				.iter()
+				.find(|params| params.uri == main_uri)
+				.is_some_and(|params| !params.diagnostics.is_empty())
+		);
+
+		std::fs::remove_file(&manifest_path).unwrap();
+		send_watched_files(
+			&client,
+			vec![lsp_types::FileEvent::new(
+				manifest_uri,
+				lsp_types::FileChangeType::DELETED,
+			)],
+		);
+		let transition = barrier_diagnostics(&client, 100);
+		assert_eq!(
+			transition
+				.iter()
+				.filter(|params| params.uri == dep_uri)
+				.count(),
+			1,
+			"the retired dependency must be cleared exactly once"
+		);
+		assert!(
+			transition
+				.iter()
+				.find(|params| params.uri == dep_uri)
+				.is_some_and(|params| params.diagnostics.is_empty()),
+			"the retired dependency kept diagnostics from its former project"
+		);
+		assert_eq!(
+			transition
+				.iter()
+				.filter(|params| params.uri == main_uri)
+				.count(),
+			1,
+			"the transitioned open document must be republished exactly once"
+		);
 		shutdown(&client, handle);
 	}
 

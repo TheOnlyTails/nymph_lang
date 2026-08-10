@@ -25,9 +25,6 @@ export async function activate(context: ExtensionContext) {
 
 	const clientOptions: LanguageClientOptions = {
 		documentSelector: [{ scheme: "file", language: "nymph" }],
-		synchronize: {
-			fileEvents: workspace.createFileSystemWatcher("**/*.nym"),
-		},
 	};
 
 	client = new LanguageClient("nymph-lsp", "Nymph Language Server", serverOptions, clientOptions);

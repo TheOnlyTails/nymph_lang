@@ -1,5 +1,5 @@
 use std::{
-	collections::{BTreeMap, HashMap, HashSet},
+	collections::{BTreeMap, BTreeSet, HashMap, HashSet},
 	fs,
 	path::PathBuf,
 	sync::Arc,
@@ -53,6 +53,11 @@ enum DocumentKind {
 pub enum CloseAction {
 	PublishProject(Vec<Uri>),
 	Clear,
+}
+
+pub struct WatchedFileRefresh {
+	pub origin: Uri,
+	pub affected: Vec<Uri>,
 }
 
 pub struct DiagnosticModuleSnapshot {
@@ -136,6 +141,7 @@ pub struct CompilerState {
 	manifest_errors: HashMap<Uri, String>,
 	workspace_symbol_refresh_errors: HashSet<PathBuf>,
 	diagnostic_targets: HashMap<String, Vec<String>>,
+	diagnostic_owners: HashMap<String, String>,
 }
 
 impl Default for CompilerState {
@@ -167,6 +173,7 @@ impl CompilerState {
 			manifest_errors: HashMap::new(),
 			workspace_symbol_refresh_errors: HashSet::new(),
 			diagnostic_targets: HashMap::new(),
+			diagnostic_owners: HashMap::new(),
 		}
 	}
 
@@ -204,7 +211,17 @@ impl CompilerState {
 		let Some(identity) = self.documents.get(uri).cloned() else {
 			return Ok(CloseAction::Clear);
 		};
-		self.diagnostic_targets.remove(uri.as_str());
+		if let Some(targets) = self.diagnostic_targets.remove(uri.as_str()) {
+			for target in targets {
+				if self
+					.diagnostic_owners
+					.get(&target)
+					.is_some_and(|owner| owner == uri.as_str())
+				{
+					self.diagnostic_owners.remove(&target);
+				}
+			}
+		}
 		if !matches!(identity.kind, DocumentKind::Project(_)) {
 			self.documents.remove(uri);
 		}
@@ -256,6 +273,246 @@ impl CompilerState {
 			}
 		}
 		Ok(CloseAction::PublishProject(affected))
+	}
+
+	/// Refresh disk-backed compiler inputs after one client watcher batch.
+	///
+	/// Source events update only active project roots and defer to an existing
+	/// authoritative open overlay for the same canonical module. Manifest
+	/// events re-run discovery for open files below that manifest, allowing
+	/// project/loose/error and source-root transitions to use the same identity
+	/// retirement and overlay replay path as normal document synchronization.
+	pub fn watched_files_changed(
+		&mut self,
+		docs: &mut DocumentStore,
+		uris: &[Uri],
+	) -> anyhow::Result<Vec<WatchedFileRefresh>> {
+		let mut manifests = BTreeSet::new();
+		let mut sources = BTreeSet::new();
+		for uri in uris {
+			let Some(path) = workspace::uri_to_path(uri) else {
+				continue;
+			};
+			let path = std::path::absolute(path)?;
+			if path.file_name().and_then(|name| name.to_str()) == Some("nymph.toml") {
+				manifests.insert(path);
+			} else if path.extension().and_then(|extension| extension.to_str()) == Some("nym") {
+				sources.insert(path);
+			}
+		}
+		let filesystem_changed = !manifests.is_empty() || !sources.is_empty();
+		let mut refreshes = Vec::new();
+		// Manifest discovery determines final project membership, so source
+		// events in the same client batch must be routed only after it settles.
+		for manifest in manifests {
+			self.refresh_manifest(docs, &manifest, &mut refreshes)?;
+		}
+		for source in sources {
+			self.refresh_source(docs, &source, &mut refreshes)?;
+		}
+		let mut covered = HashSet::new();
+		for refresh in &mut refreshes {
+			refresh
+				.affected
+				.retain(|uri| covered.insert(uri.as_str().to_string()));
+		}
+		refreshes.retain(|refresh| !refresh.affected.is_empty());
+		if filesystem_changed {
+			docs.filesystem_changed();
+		}
+		Ok(refreshes)
+	}
+
+	fn refresh_manifest(
+		&mut self,
+		docs: &DocumentStore,
+		manifest: &std::path::Path,
+		refreshes: &mut Vec<WatchedFileRefresh>,
+	) -> anyhow::Result<()> {
+		let Some(root) = manifest.parent() else {
+			return Ok(());
+		};
+		let roots_to_rescan: HashSet<_> = self
+			.documents
+			.iter()
+			.filter(|(uri, identity)| {
+				docs.get(uri).is_some()
+					&& matches!(identity.kind, DocumentKind::Project(_))
+					&& (manifest.starts_with(&identity.root)
+						|| workspace::uri_to_path(uri)
+							.and_then(|path| std::path::absolute(path).ok())
+							.is_some_and(|path| path.starts_with(root)))
+			})
+			.map(|(_, identity)| identity.root.clone())
+			.collect();
+		for source_root in &roots_to_rescan {
+			self.synchronized_roots.remove(source_root);
+		}
+		let authoritative_uris: HashSet<_> = self
+			.authoritative_overlays
+			.values()
+			.filter(|uri| docs.get(uri).is_some())
+			.map(|uri| uri.as_str().to_string())
+			.collect();
+		let mut open_uris: Vec<_> = docs
+			.iter()
+			.filter_map(|(uri, _)| {
+				workspace::uri_to_path(uri)
+					.and_then(|path| std::path::absolute(path).ok())
+					.filter(|path| path.starts_with(root))
+					.map(|_| uri.clone())
+			})
+			.collect();
+		// Synchronize non-authoritative aliases first. Replaying the previous
+		// authoritative URI last preserves equivalent-URI ownership while still
+		// allowing every alias to transition through fresh manifest discovery.
+		open_uris.sort_by(|left, right| {
+			authoritative_uris
+				.contains(left.as_str())
+				.cmp(&authoritative_uris.contains(right.as_str()))
+				.then_with(|| left.as_str().cmp(right.as_str()))
+		});
+		for uri in open_uris {
+			let mut affected = self.affected_project_documents(docs, &uri);
+			self.synchronize(docs, &uri)?;
+			for current in self.affected_project_documents(docs, &uri) {
+				if !affected.contains(&current) {
+					affected.push(current);
+				}
+			}
+			refreshes.push(WatchedFileRefresh {
+				origin: uri,
+				affected,
+			});
+		}
+		// A nested manifest also changes which sources belong to an enclosing
+		// project even when that project's open entry lies outside the nested
+		// directory. Reconcile one open representative for every such root.
+		let mut representatives: Vec<_> = self
+			.documents
+			.iter()
+			.filter(|(uri, identity)| {
+				docs.get(uri).is_some()
+					&& matches!(identity.kind, DocumentKind::Project(_))
+					&& roots_to_rescan.contains(&identity.root)
+					&& !self.synchronized_roots.contains(&identity.root)
+			})
+			.map(|(uri, identity)| (identity.root.clone(), uri.clone()))
+			.collect();
+		representatives.sort_by(|(left_root, left_uri), (right_root, right_uri)| {
+			left_root
+				.cmp(right_root)
+				.then_with(|| {
+					authoritative_uris
+						.contains(right_uri.as_str())
+						.cmp(&authoritative_uris.contains(left_uri.as_str()))
+				})
+				.then_with(|| left_uri.as_str().cmp(right_uri.as_str()))
+		});
+		representatives.dedup_by(|left, right| left.0 == right.0);
+		for (_, uri) in representatives {
+			let mut affected = self.affected_project_documents(docs, &uri);
+			self.synchronize(docs, &uri)?;
+			for current in self.affected_project_documents(docs, &uri) {
+				if !affected.contains(&current) {
+					affected.push(current);
+				}
+			}
+			refreshes.push(WatchedFileRefresh {
+				origin: uri,
+				affected,
+			});
+		}
+		Ok(())
+	}
+
+	fn refresh_source(
+		&mut self,
+		docs: &DocumentStore,
+		path: &std::path::Path,
+		refreshes: &mut Vec<WatchedFileRefresh>,
+	) -> anyhow::Result<()> {
+		let Some(event_root) = workspace::detect(path)
+			.ok()
+			.flatten()
+			.and_then(|project| std::path::absolute(project.src_root).ok())
+		else {
+			return Ok(());
+		};
+		let mut roots: Vec<_> = self
+			.documents
+			.iter()
+			.filter(|(uri, identity)| {
+				docs.get(uri).is_some()
+					&& identity.root == event_root
+					&& matches!(identity.kind, DocumentKind::Project(_))
+					&& self.synchronized_roots.contains(&identity.root)
+			})
+			.filter_map(|(_, identity)| {
+				let module = nymph_project::module_from_file(&identity.root, path).ok()?;
+				Some((
+					identity.root.clone(),
+					identity.project.clone(),
+					identity.without_prelude,
+					module,
+				))
+			})
+			.collect();
+		roots.sort_by(|left, right| {
+			left
+				.0
+				.cmp(&right.0)
+				.then_with(|| left.3.as_str().cmp(right.3.as_str()))
+		});
+		roots.dedup_by(|left, right| {
+			left.0 == right.0 && left.1 == right.1 && left.2 == right.2 && left.3 == right.3
+		});
+		for (root, project, without_prelude, module) in roots {
+			let disk_path = nymph_project::file_for_module(&root, &module);
+			let Some(disk_uri) = workspace::path_to_uri(&disk_path) else {
+				continue;
+			};
+			let identity = DocumentIdentity {
+				project,
+				module: module.clone(),
+				entry: module.clone(),
+				root,
+				without_prelude,
+				kind: DocumentKind::Project(disk_path.clone()),
+			};
+			self
+				.documents
+				.entry(disk_uri.clone())
+				.and_modify(|current| {
+					if docs.get(&disk_uri).is_none() {
+						*current = identity.clone();
+					}
+				})
+				.or_insert(identity.clone());
+			let origin = self
+				.publication_uri(docs, &identity, &module)
+				.unwrap_or(disk_uri);
+			let mut affected = self.affected_project_documents(docs, &origin);
+			let module_identity = identity.module_identity();
+			if self
+				.remaining_overlay(docs, &module_identity, None)
+				.is_none()
+			{
+				match fs::read_to_string(&disk_path) {
+					Ok(source) => self.set_effective_source(&module_identity, source, SourceVersion(0)),
+					Err(_) => {
+						self.remove_effective_source(&module_identity);
+					}
+				}
+			}
+			for current in self.affected_project_documents(docs, &origin) {
+				if !affected.contains(&current) {
+					affected.push(current);
+				}
+			}
+			refreshes.push(WatchedFileRefresh { origin, affected });
+		}
+		Ok(())
 	}
 
 	fn affected_project_documents(&self, docs: &DocumentStore, uri: &Uri) -> Vec<Uri> {
@@ -385,8 +642,18 @@ impl CompilerState {
 		uri: &Uri,
 		identity: &DocumentIdentity,
 	) {
+		let root_still_open = self.documents.iter().any(|(candidate_uri, candidate)| {
+			candidate_uri != uri
+				&& docs.get(candidate_uri).is_some()
+				&& matches!(candidate.kind, DocumentKind::Project(_))
+				&& candidate.root == identity.root
+		});
 		if matches!(identity.kind, DocumentKind::Project(_)) {
 			self.synchronized_roots.remove(&identity.root);
+			if !root_still_open {
+				self.retire_project(docs, uri, identity);
+				return;
+			}
 		}
 		let module_identity = identity.module_identity();
 		if let Some((open_uri, source, version)) =
@@ -400,6 +667,62 @@ impl CompilerState {
 			self.authoritative_overlays.remove(&module_identity);
 			self.remove_effective_source(&module_identity);
 		}
+	}
+
+	fn retire_project(&mut self, docs: &DocumentStore, uri: &Uri, identity: &DocumentIdentity) {
+		let retired_uris: HashSet<_> = self
+			.documents
+			.iter()
+			.filter(|(_, candidate)| candidate.project == identity.project)
+			.map(|(uri, _)| uri.as_str().to_string())
+			.collect();
+		let origin = uri.as_str().to_string();
+		let mut inherited_targets: BTreeSet<_> = self
+			.diagnostic_targets
+			.remove(&origin)
+			.unwrap_or_default()
+			.into_iter()
+			.collect();
+		for retired_uri in &retired_uris {
+			if retired_uri == &origin {
+				continue;
+			}
+			for target in self
+				.diagnostic_targets
+				.remove(retired_uri)
+				.unwrap_or_default()
+			{
+				if self
+					.diagnostic_owners
+					.get(&target)
+					.is_some_and(|owner| owner == retired_uri)
+				{
+					self
+						.diagnostic_owners
+						.insert(target.clone(), origin.clone());
+					inherited_targets.insert(target);
+				}
+			}
+		}
+		if !inherited_targets.is_empty() {
+			self
+				.diagnostic_targets
+				.insert(origin, inherited_targets.into_iter().collect());
+		}
+
+		let retired_modules: Vec<_> = self
+			.effective_sources
+			.keys()
+			.filter(|module| module.project == identity.project)
+			.cloned()
+			.collect();
+		for module in retired_modules {
+			self.authoritative_overlays.remove(&module);
+			self.remove_effective_source(&module);
+		}
+		self.documents.retain(|candidate_uri, candidate| {
+			candidate.project != identity.project || docs.get(candidate_uri).is_some()
+		});
 	}
 
 	pub fn analysis_for_uri(&self, docs: &DocumentStore, uri: &Uri) -> Option<AnalysisSnapshot> {
@@ -745,6 +1068,12 @@ impl CompilerState {
 			.into_iter()
 			.flatten()
 			.filter(|target| target.as_str() != uri.as_str())
+			.filter(|target| {
+				self
+					.diagnostic_owners
+					.get(target.as_str())
+					.is_some_and(|owner| owner == uri.as_str())
+			})
 			.filter_map(|target| target.parse::<Uri>().ok())
 			.collect();
 		Some((message, stale_targets))
@@ -815,6 +1144,13 @@ impl CompilerState {
 				if owned_targets
 					.iter()
 					.any(|current| current.as_str() == previous)
+				{
+					continue;
+				}
+				if !self
+					.diagnostic_owners
+					.get(previous)
+					.is_some_and(|owner| owner == uri.as_str())
 				{
 					continue;
 				}
@@ -909,6 +1245,13 @@ impl CompilerState {
 				{
 					continue;
 				}
+				if !self
+					.diagnostic_owners
+					.get(previous)
+					.is_some_and(|owner| owner == origin.as_str())
+				{
+					continue;
+				}
 				let Ok(previous_uri) = previous.parse::<Uri>() else {
 					continue;
 				};
@@ -932,13 +1275,29 @@ impl CompilerState {
 	}
 
 	pub fn record_diagnostic_targets(&mut self, origin: &Uri, targets: &[Uri]) {
-		self.diagnostic_targets.insert(
-			origin.as_str().to_string(),
-			targets
-				.iter()
-				.map(|target| target.as_str().to_string())
-				.collect(),
-		);
+		let origin = origin.as_str().to_string();
+		let targets: Vec<_> = targets
+			.iter()
+			.map(|target| target.as_str().to_string())
+			.collect();
+		if let Some(previous_targets) = self
+			.diagnostic_targets
+			.insert(origin.clone(), targets.clone())
+		{
+			for previous in previous_targets {
+				if !targets.contains(&previous)
+					&& self
+						.diagnostic_owners
+						.get(&previous)
+						.is_some_and(|owner| owner == &origin)
+				{
+					self.diagnostic_owners.remove(&previous);
+				}
+			}
+		}
+		for target in targets {
+			self.diagnostic_owners.insert(target, origin.clone());
+		}
 	}
 
 	#[doc(hidden)]
@@ -1093,7 +1452,7 @@ impl CompilerState {
 		without_prelude: bool,
 	) -> anyhow::Result<()> {
 		let mut present = HashSet::new();
-		for (path, module) in nymph_files(root)? {
+		for (path, module) in nymph_files(root) {
 			let module_identity = ModuleIdentity {
 				project: project.clone(),
 				module: module.clone(),
@@ -1217,30 +1576,32 @@ fn valid_source_span(source: &str, span: nymph_ast::Span) -> bool {
 		&& source.is_char_boundary(span.end)
 }
 
-fn nymph_files(root: &std::path::Path) -> anyhow::Result<Vec<(PathBuf, ModulePath)>> {
-	fn visit(
-		root: &std::path::Path,
-		dir: &std::path::Path,
-		out: &mut Vec<(PathBuf, ModulePath)>,
-	) -> anyhow::Result<()> {
+fn nymph_files(root: &std::path::Path) -> Vec<(PathBuf, ModulePath)> {
+	fn visit(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(PathBuf, ModulePath)>) {
 		if !dir.is_dir() {
-			return Ok(());
+			return;
 		}
-		for entry in fs::read_dir(dir)? {
-			let path = entry?.path();
+		if dir != root && !matches!(dir.join("nymph.toml").try_exists(), Ok(false)) {
+			return;
+		}
+		let Ok(entries) = fs::read_dir(dir) else {
+			return;
+		};
+		for entry in entries.flatten() {
+			let path = entry.path();
 			if path.is_dir() {
-				visit(root, &path, out)?;
+				visit(root, &path, out);
 			} else if path.extension().and_then(|ext| ext.to_str()) == Some("nym")
 				&& let Ok(module) = nymph_project::module_from_file(root, &path)
 			{
 				out.push((path, module));
 			}
 		}
-		Ok(())
 	}
 	let mut files = Vec::new();
-	visit(root, root, &mut files)?;
-	Ok(files)
+	visit(root, root, &mut files);
+	files.sort_by(|left, right| left.0.cmp(&right.0));
+	files
 }
 
 pub fn publish_if_current<T>(

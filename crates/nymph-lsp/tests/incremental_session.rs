@@ -1275,3 +1275,524 @@ fn transitive_importers_follow_overlay_and_close_while_unrelated_analysis_is_reu
 		"closing the overlay did not reveal the valid disk source"
 	);
 }
+
+#[test]
+fn watched_unopened_module_create_change_and_delete_refresh_project_analysis() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='watch-source'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+	fs::write(&main_path, main_source).unwrap();
+	let main_uri = uri(&main_path);
+	let dep_uri = uri(&dep_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), main_source.into(), 1)
+		.unwrap();
+	assert!(
+		compiler.diagnostics_for_uri(&docs, &main_uri).unwrap()[0]
+			.diag
+			.code
+			.eq("IMPORT-UNRESOLVED")
+	);
+
+	fs::write(&dep_path, "public func value(): int = 1").unwrap();
+	let created = compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&dep_uri))
+		.unwrap();
+	assert_eq!(created.len(), 1);
+	assert!(created[0].affected.contains(&main_uri));
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.is_empty()
+	);
+
+	fs::write(&dep_path, "public func value(): int = true").unwrap();
+	compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&dep_uri))
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.iter()
+			.any(|diagnostic| diagnostic.module == "dep" && diagnostic.diag.is_error())
+	);
+
+	fs::remove_file(&dep_path).unwrap();
+	compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&dep_uri))
+		.unwrap();
+	let deleted = compiler.diagnostics_for_uri(&docs, &main_uri).unwrap();
+	assert!(deleted.iter().any(|diagnostic| {
+		diagnostic.module == "main" && diagnostic.diag.code == "IMPORT-UNRESOLVED"
+	}));
+}
+
+#[test]
+fn watched_disk_change_preserves_equivalent_uri_overlay_until_close() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='watch-overlay'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+	fs::write(&main_path, main_source).unwrap();
+	fs::write(&dep_path, "public func value(): int = 1").unwrap();
+	let main_uri = uri(&main_path);
+	let dep_uri = uri(&dep_path);
+	let equivalent_uri: Uri = dep_uri
+		.as_str()
+		.replace("dep.nym", "%64ep.nym")
+		.parse()
+		.unwrap();
+	let overlay = "public func value(): int = true";
+	let disk_after = "public func value(): int = 2";
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), main_source.into(), 1)
+		.unwrap();
+	compiler
+		.open(&mut docs, equivalent_uri.clone(), overlay.into(), 7)
+		.unwrap();
+
+	fs::write(&dep_path, disk_after).unwrap();
+	compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&dep_uri))
+		.unwrap();
+	assert_eq!(compiler.source_for_uri(&dep_uri).as_deref(), Some(overlay));
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.iter()
+			.any(|diagnostic| diagnostic.module == "dep" && diagnostic.diag.is_error())
+	);
+
+	compiler.close(&mut docs, &equivalent_uri).unwrap();
+	assert_eq!(
+		compiler.source_for_uri(&dep_uri).as_deref(),
+		Some(disk_after)
+	);
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.is_empty()
+	);
+}
+
+#[test]
+fn watched_manifest_change_preserves_equivalent_uri_overlay_authority() {
+	let temp = tempfile::tempdir().unwrap();
+	let manifest_path = temp.path().join("nymph.toml");
+	let manifest = "[package]\nname='manifest-overlay'\nversion='0.1.0'\n";
+	fs::write(&manifest_path, manifest).unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let path = temp.path().join("src/main.nym");
+	fs::write(&path, "func disk(): int = 0").unwrap();
+	let canonical_uri = uri(&path);
+	let equivalent_uri: Uri = canonical_uri
+		.as_str()
+		.replace("main.nym", "%6dain.nym")
+		.parse()
+		.unwrap();
+	let canonical_overlay = "func canonical(): int = 1";
+	let authoritative_overlay = "func authoritative(): int = 2";
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(
+			&mut docs,
+			canonical_uri.clone(),
+			canonical_overlay.into(),
+			1,
+		)
+		.unwrap();
+	compiler
+		.open(&mut docs, equivalent_uri, authoritative_overlay.into(), 2)
+		.unwrap();
+	assert_eq!(
+		compiler.source_for_uri(&canonical_uri).as_deref(),
+		Some(authoritative_overlay)
+	);
+
+	fs::write(&manifest_path, manifest).unwrap();
+	compiler
+		.watched_files_changed(&mut docs, &[uri(&manifest_path)])
+		.unwrap();
+	assert_eq!(
+		compiler.source_for_uri(&canonical_uri).as_deref(),
+		Some(authoritative_overlay)
+	);
+}
+
+#[test]
+fn watched_manifest_create_error_recovery_and_delete_reclassify_open_document() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let manifest_path = temp.path().join("nymph.toml");
+	let manifest_uri = uri(&manifest_path);
+	let source = "func value(): int = 1";
+	fs::write(&main_path, source).unwrap();
+	let main_uri = uri(&main_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), source.into(), 1)
+		.unwrap();
+	let loose_project = compiler.analysis_for_uri(&docs, &main_uri).unwrap().project;
+
+	let manifest = "[package]\nname='watch-manifest'\nversion='0.1.0'\n";
+	fs::write(&manifest_path, manifest).unwrap();
+	compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&manifest_uri))
+		.unwrap();
+	let project = compiler.analysis_for_uri(&docs, &main_uri).unwrap().project;
+	assert_ne!(project, loose_project);
+
+	fs::write(&manifest_path, "not = [toml").unwrap();
+	compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&manifest_uri))
+		.unwrap();
+	assert!(compiler.has_manifest_error(&main_uri));
+	assert!(compiler.analysis_for_uri(&docs, &main_uri).is_none());
+
+	fs::write(&manifest_path, manifest).unwrap();
+	compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&manifest_uri))
+		.unwrap();
+	assert_eq!(
+		compiler.analysis_for_uri(&docs, &main_uri).unwrap().project,
+		project
+	);
+
+	fs::remove_file(&manifest_path).unwrap();
+	compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&manifest_uri))
+		.unwrap();
+	assert_eq!(
+		compiler.analysis_for_uri(&docs, &main_uri).unwrap().project,
+		loose_project
+	);
+}
+
+#[test]
+fn watched_manifest_recovery_does_not_restore_deleted_unopened_module() {
+	let temp = tempfile::tempdir().unwrap();
+	let manifest_path = temp.path().join("nymph.toml");
+	let manifest_uri = uri(&manifest_path);
+	let manifest = "[package]\nname='manifest-stale'\nversion='0.1.0'\n";
+	fs::write(&manifest_path, manifest).unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let source = "import @/dep with (value)\nfunc use(): int = value()";
+	fs::write(&main_path, source).unwrap();
+	fs::write(&dep_path, "public func value(): int = 1").unwrap();
+	let main_uri = uri(&main_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), source.into(), 1)
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.is_empty()
+	);
+
+	fs::remove_file(&manifest_path).unwrap();
+	compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&manifest_uri))
+		.unwrap();
+	fs::remove_file(&dep_path).unwrap();
+	fs::write(&manifest_path, manifest).unwrap();
+	compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&manifest_uri))
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.iter()
+			.any(|diagnostic| diagnostic.diag.code == "IMPORT-UNRESOLVED")
+	);
+}
+
+#[test]
+fn watched_source_root_transition_replaces_closed_module_identities() {
+	let temp = tempfile::tempdir().unwrap();
+	let manifest_path = temp.path().join("nymph.toml");
+	fs::write(
+		&manifest_path,
+		"[package]\nname='root-transition'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir_all(temp.path().join("src/new")).unwrap();
+	let main_path = temp.path().join("src/new/main.nym");
+	let dep_path = temp.path().join("src/new/dep.nym");
+	let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+	fs::write(&main_path, main_source).unwrap();
+	fs::write(&dep_path, "public func value(): int = 1").unwrap();
+	let main_uri = uri(&main_path);
+	let dep_uri = uri(&dep_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), main_source.into(), 1)
+		.unwrap();
+
+	fs::write(
+		&manifest_path,
+		"[package]\nname='root-transition'\nversion='0.1.0'\nsrc='src/new'\n",
+	)
+	.unwrap();
+	compiler
+		.watched_files_changed(&mut docs, &[uri(&manifest_path)])
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.is_empty()
+	);
+
+	fs::write(&dep_path, "public func value(): int = true").unwrap();
+	let refreshes = compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&dep_uri))
+		.unwrap();
+	assert!(
+		refreshes
+			.iter()
+			.flat_map(|refresh| &refresh.affected)
+			.any(|affected| affected == &main_uri),
+		"the transitioned dependency identity lost its reverse importer"
+	);
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.iter()
+			.any(|diagnostic| diagnostic.module == "dep" && diagnostic.diag.is_error())
+	);
+}
+
+#[test]
+fn watched_source_root_error_and_recovery_rescan_deleted_modules() {
+	let temp = tempfile::tempdir().unwrap();
+	let manifest_path = temp.path().join("nymph.toml");
+	let manifest = "[package]\nname='root-recovery'\nversion='0.1.0'\n";
+	fs::write(&manifest_path, manifest).unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+	fs::write(&main_path, main_source).unwrap();
+	fs::write(&dep_path, "public func value(): int = 1").unwrap();
+	let main_uri = uri(&main_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), main_source.into(), 1)
+		.unwrap();
+
+	fs::write(
+		&manifest_path,
+		"[package]\nname='root-recovery'\nversion='0.1.0'\nsrc='lib'\n",
+	)
+	.unwrap();
+	compiler
+		.watched_files_changed(&mut docs, &[uri(&manifest_path)])
+		.unwrap();
+	assert!(compiler.has_manifest_error(&main_uri));
+	fs::remove_file(&dep_path).unwrap();
+	fs::write(&manifest_path, manifest).unwrap();
+	compiler
+		.watched_files_changed(&mut docs, &[uri(&manifest_path)])
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.iter()
+			.any(|diagnostic| diagnostic.diag.code == "IMPORT-UNRESOLVED"),
+		"recovery reused the source graph from before the invalid source root"
+	);
+}
+
+#[cfg(unix)]
+#[test]
+fn watched_manifest_rescan_removes_an_unreadable_stale_source() {
+	use std::os::unix::fs::symlink;
+
+	let temp = tempfile::tempdir().unwrap();
+	let manifest_path = temp.path().join("nymph.toml");
+	fs::write(
+		&manifest_path,
+		"[package]\nname='unreadable-rescan'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let main_path = temp.path().join("src/main.nym");
+	let dep_path = temp.path().join("src/dep.nym");
+	let main_source = "import @/dep with (value)\nfunc use(): int = value()";
+	fs::write(&main_path, main_source).unwrap();
+	fs::write(&dep_path, "public func value(): int = 1").unwrap();
+	let main_uri = uri(&main_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, main_uri.clone(), main_source.into(), 1)
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.is_empty()
+	);
+
+	fs::remove_file(&dep_path).unwrap();
+	symlink(temp.path().join("missing-target"), &dep_path).unwrap();
+	compiler
+		.watched_files_changed(&mut docs, &[uri(&manifest_path)])
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &main_uri)
+			.unwrap()
+			.iter()
+			.any(|diagnostic| diagnostic.diag.code == "IMPORT-UNRESOLVED"),
+		"the failed rescan read retained the previous dependency source"
+	);
+}
+
+#[test]
+fn watched_nested_manifest_preserves_outer_refresh_and_isolates_inner_sources() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='outer'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	let outer_src = temp.path().join("src");
+	let inner_root = outer_src.join("child");
+	let inner_src = inner_root.join("src");
+	fs::create_dir_all(&inner_src).unwrap();
+	let outer_main_path = outer_src.join("main.nym");
+	let outer_dep_path = outer_src.join("outer_dep.nym");
+	let inner_main_path = inner_src.join("main.nym");
+	let inner_dep_path = inner_src.join("dep.nym");
+	let outer_main = "import @/child/src/dep with (child_value)\nimport @/outer_dep with (outer_value)\nfunc use(): int = outer_value()";
+	let inner_main = "import @/dep with (value)\nfunc use(): int = value()";
+	fs::write(&outer_main_path, outer_main).unwrap();
+	fs::write(&outer_dep_path, "public func outer_value(): int = 1").unwrap();
+	fs::write(&inner_main_path, inner_main).unwrap();
+	fs::write(&inner_dep_path, "public func value(): int = 1").unwrap();
+	let outer_main_uri = uri(&outer_main_path);
+	let outer_dep_uri = uri(&outer_dep_path);
+	let inner_main_uri = uri(&inner_main_path);
+	let inner_dep_uri = uri(&inner_dep_path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(&mut docs, outer_main_uri.clone(), outer_main.into(), 1)
+		.unwrap();
+	compiler
+		.open(&mut docs, inner_main_uri.clone(), inner_main.into(), 1)
+		.unwrap();
+
+	let inner_manifest = inner_root.join("nymph.toml");
+	fs::write(
+		&inner_manifest,
+		"[package]\nname='inner'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	compiler
+		.watched_files_changed(&mut docs, &[uri(&inner_manifest)])
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &outer_main_uri)
+			.unwrap()
+			.iter()
+			.any(|diagnostic| diagnostic.diag.code == "IMPORT-UNRESOLVED"),
+		"the enclosing project retained a source now owned by the nested manifest"
+	);
+
+	fs::write(&inner_dep_path, "public func value(): float = 1.0").unwrap();
+	let inner_refreshes = compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&inner_dep_uri))
+		.unwrap();
+	let inner_affected: Vec<_> = inner_refreshes
+		.iter()
+		.flat_map(|refresh| &refresh.affected)
+		.collect();
+	assert!(inner_affected.contains(&&inner_main_uri));
+	assert!(!inner_affected.contains(&&outer_main_uri));
+
+	fs::write(&outer_dep_path, "public func outer_value(): int = true").unwrap();
+	let outer_refreshes = compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&outer_dep_uri))
+		.unwrap();
+	assert!(
+		outer_refreshes
+			.iter()
+			.flat_map(|refresh| &refresh.affected)
+			.any(|affected| affected == &outer_main_uri),
+		"the nested transition disabled the still-open enclosing project"
+	);
+}
+
+#[test]
+fn watched_filesystem_revision_rejects_pre_event_snapshot_publication() {
+	let temp = tempfile::tempdir().unwrap();
+	let path = temp.path().join("loose.nym");
+	let file_uri = uri(&path);
+	let mut docs = DocumentStore::default();
+	let mut compiler = CompilerState::new();
+	compiler
+		.open(
+			&mut docs,
+			file_uri.clone(),
+			"func value(): int = 1".into(),
+			1,
+		)
+		.unwrap();
+	let before_ignored_batch = docs.revision();
+	compiler
+		.watched_files_changed(
+			&mut docs,
+			&[
+				"untitled:ignored".parse().unwrap(),
+				uri(&temp.path().join("ignored.txt")),
+			],
+		)
+		.unwrap();
+	assert_eq!(docs.revision(), before_ignored_batch);
+	let snapshot = compiler.analysis_for_uri(&docs, &file_uri).unwrap();
+	compiler
+		.watched_files_changed(&mut docs, std::slice::from_ref(&file_uri))
+		.unwrap();
+	let published = Cell::new(false);
+	nymph_lsp::compiler_state::publish_if_current(&docs, &file_uri, &snapshot, (), |_| {
+		published.set(true);
+	});
+	assert!(!published.get());
+}

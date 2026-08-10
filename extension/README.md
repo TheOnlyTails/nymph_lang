@@ -55,6 +55,14 @@ a project file discards its overlay and refreshes diagnostics from the current d
 affected importers; closing a loose or non-file document clears its diagnostics without reading it
 from disk.
 
+After initialization, the language server asks clients that support dynamic watched-file
+registration to watch `**/*.nym` and `**/nymph.toml`. Creating, changing, or deleting an unopened
+project source refreshes the compiler snapshot and affected diagnostics; manifest changes rerun
+project discovery, including source-root and project-membership transitions. An open editor overlay
+always remains authoritative over watcher events for the same module, including equivalent URI
+spellings, until the overlay is closed. Clients without dynamic registration continue to support
+normal open/change/close behavior, but cannot report external filesystem changes to the server.
+
 Completion for ordinary identifiers uses the latest immutable project analysis snapshot. It offers
 nearest lexical names first, then visible imported names (including aliases and unsaved dependency
 overlays), same-module declarations, and keywords. Prefix filtering applies within those tiers.
