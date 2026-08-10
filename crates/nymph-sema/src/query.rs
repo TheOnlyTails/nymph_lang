@@ -5646,6 +5646,25 @@ mod member_completion_tests {
 		let (_, diagnostics) = analyze(source);
 		assert!(diagnostics.is_empty(), "{diagnostics:?}");
 	}
+
+	#[test]
+	fn receiver_resolved_later_still_has_member_candidates() {
+		let source = "external(make) func make<T>(): T\nstruct Point(x: int)\nfunc use(): int = { let value = make()\nvalue.x\nlet point: Point = value\npoint.x }";
+		assert_eq!(
+			at(source, "value.x"),
+			vec![("x".into(), Kind::Field, "int".into())]
+		);
+		let (_, diagnostics) = analyze(source);
+		assert!(diagnostics.is_empty(), "{diagnostics:?}");
+
+		let bounded = "external(make) func make<T>(): T\ninterface Named { func name(): string }\nfunc use<T: Named>(): string = { let value = make()\nvalue.name\nlet typed: T = value\ntyped.name() }";
+		assert_eq!(
+			at(bounded, "value.name"),
+			vec![("name".into(), Kind::Method, "() -> string".into())]
+		);
+		let (_, diagnostics) = analyze(bounded);
+		assert!(diagnostics.is_empty(), "{diagnostics:?}");
+	}
 }
 
 #[cfg(test)]

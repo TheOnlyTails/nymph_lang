@@ -117,6 +117,10 @@ pub struct Checker<'m> {
 	/// selected operator/method impl). Keyed by [`nymph_ast::NodeId`]. Emitted
 	/// alongside diagnostics as part of [`crate::Checked`].
 	pub(crate) annotations: crate::annotate::Annotations,
+	/// Member receivers whose types still contained inference variables when
+	/// visited. Completion facts for these are finalized only after body checking
+	/// has applied every later constraint.
+	pub(crate) pending_member_completions: Vec<crate::infer_expr::PendingMemberCompletion>,
 
 	/// Operator nodes whose LHS operand was still an unresolved inference variable
 	/// at the moment `infer_binary`'s fallback arm ran (an `Infer` type var that
@@ -414,6 +418,7 @@ fn check_module_from_parts(
 		checker.pending_bound_arg_mut.is_empty(),
 		"pending_bound_arg_mut should be drained per-body, not left for module end"
 	);
+	checker.finalize_pending_member_completions();
 	// Some annotations are recorded before later expressions constrain their
 	// inference variables. Resolve them one final time while the unify table is
 	// still available so lowering never sees a stale `TyKind::Infer`.
@@ -948,6 +953,7 @@ impl<'m> Checker<'m> {
 			synthetic_bound_details: FxHashMap::default(),
 			checking_interface_default: None,
 			annotations: crate::annotate::Annotations::default(),
+			pending_member_completions: Vec::new(),
 			pending_operators: Vec::new(),
 			pending_bounds: Vec::new(),
 			pending_bound_arg_mut: FxHashMap::default(),

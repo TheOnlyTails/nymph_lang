@@ -173,6 +173,16 @@ enum BoundFinalizationDisposition {
 	Check(TyKind),
 }
 
+pub(crate) struct PendingMemberCompletion {
+	receiver: NodeId,
+	ty: Ty,
+	span: Span,
+	temporary_receiver: bool,
+	param_bounds: FxHashMap<ParamIdx, Vec<DefId>>,
+	param_bound_details: FxHashMap<ParamIdx, Vec<crate::iface::Bound>>,
+	checking_interface_default: Option<(DefId, ParamIdx)>,
+}
+
 impl<'m> Checker<'m> {
 	pub(crate) fn push_control_label(
 		&mut self,
@@ -2247,22 +2257,45 @@ impl<'m> Checker<'m> {
 			self.annotations.record_member_completions(parent.id, out);
 			return;
 		};
-		let resolved = self.shallow_resolve(recv);
-		if matches!(
-			self.interner.kind(resolved),
-			TyKind::Error | TyKind::Infer(_)
-		) {
+		let resolved = self.resolve_deep(recv);
+		if matches!(self.interner.kind(resolved), TyKind::Error) {
 			self.annotations.record_member_completions(parent.id, out);
 			return;
 		}
-		let dispatch = if (!expr_is_place(parent) || self.custom_index_value(parent))
-			&& !matches!(self.interner.kind(resolved), TyKind::Mut(_))
-		{
-			self.interner.mk_mut(resolved)
+		let temporary_receiver = !expr_is_place(parent) || self.custom_index_value(parent);
+		if self.has_infer(resolved) {
+			self
+				.pending_member_completions
+				.push(PendingMemberCompletion {
+					receiver: parent.id,
+					ty: resolved,
+					span,
+					temporary_receiver,
+					param_bounds: self.param_bounds.clone(),
+					param_bound_details: self.param_bound_details.clone(),
+					checking_interface_default: self.checking_interface_default,
+				});
+			self.annotations.record_member_completions(parent.id, out);
+			return;
+		}
+		self.record_value_member_completion_facts(parent.id, resolved, span, temporary_receiver);
+	}
+
+	fn record_value_member_completion_facts(
+		&mut self,
+		receiver: NodeId,
+		recv: Ty,
+		span: Span,
+		temporary_receiver: bool,
+	) {
+		use crate::{MemberCompletion, MemberCompletionKind};
+		let mut out = Vec::new();
+		let dispatch = if temporary_receiver && !matches!(self.interner.kind(recv), TyKind::Mut(_)) {
+			self.interner.mk_mut(recv)
 		} else {
 			recv
 		};
-		let nominal = self.strip_mut(resolved);
+		let nominal = self.strip_mut(recv);
 		if let TyKind::Adt(def, args) = self.interner.kind(nominal).clone()
 			&& let Some(sig) = self.sigs.structs.get(&def).cloned()
 		{
@@ -2325,7 +2358,31 @@ impl<'m> Checker<'m> {
 			self.synthetic_bound_details = synthetic_bound_details;
 			self.annotations = annotations;
 		}
-		self.annotations.record_member_completions(parent.id, out);
+		self.annotations.record_member_completions(receiver, out);
+	}
+
+	pub(crate) fn finalize_pending_member_completions(&mut self) {
+		for pending in std::mem::take(&mut self.pending_member_completions) {
+			let previous_bounds = std::mem::replace(&mut self.param_bounds, pending.param_bounds);
+			let previous_bound_details =
+				std::mem::replace(&mut self.param_bound_details, pending.param_bound_details);
+			let previous_default = std::mem::replace(
+				&mut self.checking_interface_default,
+				pending.checking_interface_default,
+			);
+			let receiver = self.resolve_deep(pending.ty);
+			if !self.has_infer(receiver) && !matches!(self.interner.kind(receiver), TyKind::Error) {
+				self.record_value_member_completion_facts(
+					pending.receiver,
+					receiver,
+					pending.span,
+					pending.temporary_receiver,
+				);
+			}
+			self.param_bounds = previous_bounds;
+			self.param_bound_details = previous_bound_details;
+			self.checking_interface_default = previous_default;
+		}
 	}
 
 	fn infer_member(&mut self, parent: &Expr, member: &str, span: Span, id: NodeId) -> Ty {
