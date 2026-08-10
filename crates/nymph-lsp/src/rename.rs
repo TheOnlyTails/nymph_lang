@@ -9,7 +9,7 @@ use lsp_types::{
 use nymph_ast::token::Token;
 
 use crate::{
-	compiler_state::{AnalysisSnapshot, CompilerState},
+	compiler_state::{AnalysisSnapshot, CompilerState, ProjectDiskSnapshot},
 	document_store::DocumentStore,
 	line_index::LineIndex,
 };
@@ -18,6 +18,7 @@ pub(crate) struct RenameCandidate {
 	prepare: PrepareRenameResponse,
 	edit: WorkspaceEdit,
 	disk_sources: Vec<(PathBuf, Arc<str>)>,
+	project_disk: Option<ProjectDiskSnapshot>,
 }
 
 impl RenameCandidate {
@@ -30,6 +31,13 @@ impl RenameCandidate {
 	}
 
 	fn disk_sources_are_current(&self) -> bool {
+		if self
+			.project_disk
+			.as_ref()
+			.is_some_and(|snapshot| !snapshot.is_current())
+		{
+			return false;
+		}
 		for (path, expected) in &self.disk_sources {
 			let Ok(current) = std::fs::read_to_string(path) else {
 				return false;
@@ -68,7 +76,7 @@ pub(crate) fn rename_candidate(
 	let mut modules = state.reference_modules(docs, snapshot, &symbol)?;
 	if modules
 		.iter()
-		.any(|module| !module.occurrences_are_uniquely_editable)
+		.any(|module| module.rename_occurrences.is_none() || module.has_equivalent_open_documents)
 	{
 		return None;
 	}
@@ -95,7 +103,8 @@ pub(crate) fn rename_candidate(
 	let mut document_edits = Vec::new();
 	let mut disk_sources = Vec::new();
 	for module in modules {
-		if module.occurrences.iter().any(|occurrence| {
+		let occurrences = module.rename_occurrences?;
+		if occurrences.iter().any(|occurrence| {
 			module
 				.source
 				.get(occurrence.span.start..occurrence.span.end)
@@ -110,17 +119,34 @@ pub(crate) fn rename_candidate(
 			));
 		}
 		let index = LineIndex::new(&module.source);
-		let mut ranges = module
-			.occurrences
+		let mut edits = occurrences
 			.into_iter()
-			.map(|occurrence| index.range(&module.source, occurrence.span))
+			.map(|occurrence| {
+				let source_name = &module.source[occurrence.span.start..occurrence.span.end];
+				let new_text = match occurrence.replacement {
+					nymph_sema::query::RenameReplacement::Identifier => new_name.to_string(),
+					nymph_sema::query::RenameReplacement::ShorthandField => {
+						format!("{new_name} = {source_name}")
+					}
+					nymph_sema::query::RenameReplacement::ShorthandLocal => {
+						format!("{source_name} = {new_name}")
+					}
+				};
+				TextEdit {
+					range: index.range(&module.source, occurrence.span),
+					new_text,
+				}
+			})
 			.collect::<Vec<_>>();
-		ranges.sort_by(range_order);
-		ranges.dedup();
-		if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {
+		edits.sort_by(|left, right| range_order(&left.range, &right.range));
+		edits.dedup();
+		if edits
+			.windows(2)
+			.any(|pair| pair[0].range.end > pair[1].range.start)
+		{
 			return None;
 		}
-		if ranges.is_empty() {
+		if edits.is_empty() {
 			continue;
 		}
 		document_edits.push(TextDocumentEdit {
@@ -128,15 +154,7 @@ pub(crate) fn rename_candidate(
 				uri: module.uri,
 				version: module.document_version,
 			},
-			edits: ranges
-				.into_iter()
-				.map(|range| {
-					OneOf::Left(TextEdit {
-						range,
-						new_text: new_name.to_string(),
-					})
-				})
-				.collect(),
+			edits: edits.into_iter().map(OneOf::Left).collect(),
 		});
 	}
 	Some(RenameCandidate {
@@ -150,6 +168,7 @@ pub(crate) fn rename_candidate(
 			change_annotations: None,
 		},
 		disk_sources,
+		project_disk: state.project_disk_snapshot(snapshot),
 	})
 }
 
@@ -312,21 +331,28 @@ mod tests {
 	}
 
 	#[test]
-	fn dual_role_struct_pattern_shorthand_rejects_field_and_local_rename() {
+	fn dual_role_struct_pattern_shorthand_expands_for_field_and_local_rename() {
 		let source =
 			"struct Point(x: int)\nfunc read(point: Point): int = match (point) { Point(x) -> x }";
-		assert!(
-			candidate(source, "x", 1).is_none(),
-			"field role at shorthand"
-		);
-		assert!(
-			candidate(source, "x", 2).is_none(),
-			"local use whose declaration is shorthand"
-		);
-		assert!(
-			candidate(source, "x", 0).is_none(),
-			"field declaration reaches shorthand"
-		);
+		let field = candidate(source, "x", 0).expect("field declaration");
+		let local = candidate(source, "x", 2).expect("local use");
+		let edit_texts = |candidate: RenameCandidate| {
+			let Some(DocumentChanges::Edits(documents)) =
+				candidate.validate_disk_sources().unwrap().document_changes
+			else {
+				panic!()
+			};
+			documents[0]
+				.edits
+				.iter()
+				.map(|edit| match edit {
+					OneOf::Left(edit) => edit.new_text.clone(),
+					OneOf::Right(_) => panic!(),
+				})
+				.collect::<Vec<_>>()
+		};
+		assert_eq!(edit_texts(field), ["replacement", "replacement = x"]);
+		assert_eq!(edit_texts(local), ["x = replacement", "replacement"]);
 	}
 
 	#[test]
@@ -471,5 +497,59 @@ mod tests {
 			}
 			assert!(candidate.validate_disk_sources().is_none());
 		}
+	}
+
+	#[test]
+	fn changed_project_membership_rejects_the_complete_edit() {
+		let (temp, main_uri, docs, state) =
+			project(&[("main.nym", "public func answer(): int = 1")], "main.nym");
+		let snapshot = state.analysis_for_uri(&docs, &main_uri).unwrap();
+		let candidate =
+			rename_candidate(&docs, &state, &snapshot, Position::new(0, 12), "renamed").unwrap();
+		std::fs::write(
+			temp.path().join("src/late.nym"),
+			"import @/main with (answer)\nfunc late(): int = answer()",
+		)
+		.unwrap();
+
+		assert!(
+			candidate.validate_disk_sources().is_none(),
+			"a file created after analysis can contain an omitted reference"
+		);
+	}
+
+	#[test]
+	fn request_time_manifest_rediscovery_rejects_the_retired_project() {
+		let (temp, main_uri, docs, mut state) =
+			project(&[("main.nym", "public func answer(): int = 1")], "main.nym");
+		assert!(state.analysis_for_uri(&docs, &main_uri).is_some());
+		std::fs::write(temp.path().join("nymph.toml"), "not valid toml").unwrap();
+
+		assert!(
+			state
+				.references_analysis_for_uri(&docs, &main_uri)
+				.is_none(),
+			"rename must not use a cached project identity after its manifest becomes invalid"
+		);
+	}
+
+	#[test]
+	fn equivalent_open_documents_reject_ambiguous_versioned_edits() {
+		let source = "public func answer(): int = 1";
+		let (_temp, canonical_uri, mut docs, mut state) = project(&[("main.nym", source)], "main.nym");
+		let equivalent_uri: Uri = canonical_uri
+			.as_str()
+			.replace("main.nym", "%6dain.nym")
+			.parse()
+			.unwrap();
+		state
+			.open(&mut docs, equivalent_uri.clone(), source.into(), 2)
+			.unwrap();
+		let snapshot = state.analysis_for_uri(&docs, &equivalent_uri).unwrap();
+
+		assert!(
+			rename_candidate(&docs, &state, &snapshot, Position::new(0, 12), "renamed").is_none(),
+			"one logical module cannot safely receive two independently versioned URI edits"
+		);
 	}
 }

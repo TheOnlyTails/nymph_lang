@@ -1197,20 +1197,36 @@ pub fn references_to(
 	occurrences
 }
 
-/// Return rename-editable occurrences of `symbol`, or `None` when any of
-/// their source spans overlaps an occurrence owned by another semantic
-/// identity.
-///
-/// A token can deliberately have two roles, notably a shorthand struct field
-/// pattern that is both a field reference and a local declaration. References
-/// may report both roles, but replacing that token cannot rename only one of
-/// them without expanding the shorthand, so rename conservatively rejects the
-/// complete operation.
+/// How a semantic occurrence must be rewritten during rename.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenameReplacement {
+	/// Replace the identifier token directly.
+	Identifier,
+	/// Expand a shorthand pattern while renaming its field identity:
+	/// `field` becomes `renamed = field`.
+	ShorthandField,
+	/// Expand a shorthand pattern while renaming its local binding identity:
+	/// `field` becomes `field = renamed`.
+	ShorthandLocal,
+}
+
+/// One exact source occurrence and the syntax-preserving replacement it needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RenameOccurrence {
+	pub span: Span,
+	pub is_declaration: bool,
+	pub replacement: RenameReplacement,
+}
+
+/// Return rename-editable occurrences of `symbol`, or `None` when an overlap
+/// with another semantic identity cannot be represented by one source edit.
+/// A shorthand struct pattern's field reference and local declaration share
+/// one token; those two known roles are preserved by expanding the shorthand.
 #[must_use]
 pub fn rename_occurrences(
 	analysis: &crate::SemanticAnalysis,
 	symbol: &SymbolIdentity,
-) -> Option<Vec<ReferenceOccurrence>> {
+) -> Option<Vec<RenameOccurrence>> {
 	let all = all_symbol_occurrences(analysis);
 	uniquely_editable_occurrences(&all, symbol)
 }
@@ -1218,30 +1234,64 @@ pub fn rename_occurrences(
 fn uniquely_editable_occurrences(
 	all: &[(SymbolIdentity, ReferenceOccurrence)],
 	symbol: &SymbolIdentity,
-) -> Option<Vec<ReferenceOccurrence>> {
-	let selected = all
+) -> Option<Vec<RenameOccurrence>> {
+	let mut selected = all
 		.iter()
-		.filter_map(|(identity, occurrence)| (identity == symbol).then_some(*occurrence))
-		.collect::<Vec<_>>();
-	let uniquely_editable = selected.iter().all(|selected| {
-		all.iter().all(|(identity, other)| {
-			identity == symbol
-				|| selected.span.end <= other.span.start
-				|| other.span.end <= selected.span.start
+		.filter_map(|(identity, occurrence)| {
+			if identity != symbol {
+				return None;
+			}
+			let overlapping = all
+				.iter()
+				.filter(|(other_identity, other)| {
+					other_identity != symbol
+						&& occurrence.span.end > other.span.start
+						&& other.span.end > occurrence.span.start
+				})
+				.collect::<Vec<_>>();
+			let replacement = if overlapping.is_empty() {
+				RenameReplacement::Identifier
+			} else if overlapping.iter().all(|(other_identity, other)| {
+				other.span == occurrence.span
+					&& other_identity != symbol
+					&& !occurrence.is_declaration
+					&& other.is_declaration
+			}) {
+				RenameReplacement::ShorthandField
+			} else if overlapping.iter().all(|(other_identity, other)| {
+				other.span == occurrence.span
+					&& other_identity != symbol
+					&& occurrence.is_declaration
+					&& !other.is_declaration
+			}) {
+				RenameReplacement::ShorthandLocal
+			} else {
+				return None;
+			};
+			Some(RenameOccurrence {
+				span: occurrence.span,
+				is_declaration: occurrence.is_declaration,
+				replacement,
+			})
 		})
+		.collect::<Vec<_>>();
+	if selected.len()
+		!= all
+			.iter()
+			.filter(|(identity, _)| identity == symbol)
+			.count()
+	{
+		return None;
+	}
+	selected.sort_unstable_by_key(|occurrence| {
+		(
+			occurrence.span.start,
+			occurrence.span.end,
+			!occurrence.is_declaration,
+		)
 	});
-	uniquely_editable.then(|| {
-		let mut selected = selected;
-		selected.sort_unstable_by_key(|occurrence| {
-			(
-				occurrence.span.start,
-				occurrence.span.end,
-				!occurrence.is_declaration,
-			)
-		});
-		selected.dedup_by_key(|occurrence| (occurrence.span.start, occurrence.span.end));
-		selected
-	})
+	selected.dedup_by_key(|occurrence| (occurrence.span.start, occurrence.span.end));
+	Some(selected)
 }
 
 fn all_symbol_occurrences(
@@ -4318,7 +4368,7 @@ mod definition_and_scope_tests {
 	}
 
 	#[test]
-	fn rename_occurrences_reject_dual_identity_span_but_references_can_keep_both_roles() {
+	fn rename_occurrences_expand_dual_identity_shorthand_without_conflating_references() {
 		let field = SymbolIdentity::Local(Span::new(1, 2));
 		let binding = SymbolIdentity::Local(Span::new(3, 4));
 		let shorthand = ReferenceOccurrence {
@@ -4352,8 +4402,22 @@ mod definition_and_scope_tests {
 			1,
 			"reference collection retains the binding role"
 		);
-		assert!(uniquely_editable_occurrences(&all, &field).is_none());
-		assert!(uniquely_editable_occurrences(&all, &binding).is_none());
+		assert_eq!(
+			uniquely_editable_occurrences(&all, &field),
+			Some(vec![RenameOccurrence {
+				span: shorthand.span,
+				is_declaration: false,
+				replacement: RenameReplacement::ShorthandField,
+			}])
+		);
+		assert_eq!(
+			uniquely_editable_occurrences(&all, &binding),
+			Some(vec![RenameOccurrence {
+				span: shorthand.span,
+				is_declaration: true,
+				replacement: RenameReplacement::ShorthandLocal,
+			}])
+		);
 	}
 
 	#[test]

@@ -114,9 +114,36 @@ pub struct ReferenceModuleSnapshot {
 	pub uri: Uri,
 	pub source: Arc<str>,
 	pub occurrences: Vec<nymph_sema::query::ReferenceOccurrence>,
-	pub occurrences_are_uniquely_editable: bool,
+	pub rename_occurrences: Option<Vec<nymph_sema::query::RenameOccurrence>>,
 	pub document_version: Option<i32>,
 	pub requires_disk_validation: bool,
+	pub has_equivalent_open_documents: bool,
+}
+
+pub struct ProjectDiskSnapshot {
+	root: PathBuf,
+	files: Vec<PathBuf>,
+}
+
+impl ProjectDiskSnapshot {
+	#[must_use]
+	pub fn is_current(&self) -> bool {
+		let current = nymph_files(&self.root)
+			.into_iter()
+			.map(|(path, _)| path)
+			.collect::<Vec<_>>();
+		current == self.files
+			&& current.iter().all(|path| {
+				let Some(uri) = workspace::path_to_uri(path) else {
+					return false;
+				};
+				matches!(
+					workspace::classify_uri(&uri),
+					Ok(workspace::UriClass::ProjectFile { project, .. })
+						if project.src_root == self.root
+				)
+			})
+	}
 }
 
 /// One module in an immutable, overlay-authoritative workspace-symbol snapshot.
@@ -140,6 +167,7 @@ pub struct CompilerState {
 	documents: HashMap<Uri, DocumentIdentity>,
 	effective_sources: HashMap<ModuleIdentity, Arc<str>>,
 	authoritative_overlays: HashMap<ModuleIdentity, Uri>,
+	project_disk_files: HashMap<PathBuf, Vec<PathBuf>>,
 	manifest_errors: HashMap<Uri, String>,
 	workspace_symbol_refresh_errors: HashSet<PathBuf>,
 	diagnostic_targets: HashMap<String, Vec<String>>,
@@ -172,6 +200,7 @@ impl CompilerState {
 			documents: HashMap::new(),
 			effective_sources: HashMap::new(),
 			authoritative_overlays: HashMap::new(),
+			project_disk_files: HashMap::new(),
 			manifest_errors: HashMap::new(),
 			workspace_symbol_refresh_errors: HashSet::new(),
 			diagnostic_targets: HashMap::new(),
@@ -764,6 +793,10 @@ impl CompilerState {
 		docs: &DocumentStore,
 		uri: &Uri,
 	) -> Option<AnalysisSnapshot> {
+		// Project boundaries are filesystem state too. Rediscover them at
+		// request time rather than relying on a watcher notification having
+		// already transitioned the open document's cached identity.
+		self.synchronize(docs, uri).ok()?;
 		let identity = self.documents.get(uri)?.clone();
 		if matches!(identity.kind, DocumentKind::Project(_)) {
 			self
@@ -776,6 +809,17 @@ impl CompilerState {
 				.ok()?;
 		}
 		self.analysis_for_uri(docs, uri)
+	}
+
+	pub fn project_disk_snapshot(&self, snapshot: &AnalysisSnapshot) -> Option<ProjectDiskSnapshot> {
+		let identity = self.documents.get(&snapshot.uri)?;
+		if !matches!(identity.kind, DocumentKind::Project(_)) {
+			return None;
+		}
+		Some(ProjectDiskSnapshot {
+			root: snapshot.root.clone(),
+			files: self.project_disk_files.get(&snapshot.root)?.clone(),
+		})
 	}
 
 	pub fn completion_for_uri(&self, docs: &DocumentStore, uri: &Uri) -> Option<CompletionSnapshot> {
@@ -996,19 +1040,30 @@ impl CompilerState {
 			let occurrences = analysis.as_ref().map_or_else(Vec::new, |analysis| {
 				nymph_sema::query::references_to(&analysis.semantic, symbol)
 			});
-			let occurrences_are_uniquely_editable = analysis.as_ref().is_none_or(|analysis| {
-				nymph_sema::query::rename_occurrences(&analysis.semantic, symbol).is_some()
-			});
-			let overlay_uri = self.documents.iter().find_map(|(uri, identity)| {
+			let rename_occurrences = analysis
+				.as_ref()
+				.map(|analysis| nymph_sema::query::rename_occurrences(&analysis.semantic, symbol));
+			let open_uris = self
+				.documents
+				.iter()
+				.filter_map(|(uri, identity)| {
+					(identity.project == snapshot.project
+						&& identity.module == module
+						&& identity.without_prelude == snapshot.without_prelude
+						&& docs.get(uri).is_some())
+					.then_some(uri)
+				})
+				.collect::<Vec<_>>();
+			let overlay_uri = open_uris.iter().find_map(|uri| {
+				let identity = self.documents.get(*uri)?;
 				(identity.project == snapshot.project
 					&& identity.module == module
 					&& identity.without_prelude == snapshot.without_prelude
 					&& self
 						.authoritative_overlays
 						.values()
-						.any(|authoritative| authoritative == uri)
-					&& docs.get(uri).is_some())
-				.then_some(uri)
+						.any(|authoritative| authoritative == *uri))
+				.then_some(*uri)
 			});
 			let uri = if let Some(uri) = overlay_uri {
 				uri.clone()
@@ -1032,9 +1087,10 @@ impl CompilerState {
 				uri,
 				source,
 				occurrences,
-				occurrences_are_uniquely_editable,
+				rename_occurrences: rename_occurrences.unwrap_or(Some(Vec::new())),
 				document_version,
 				requires_disk_validation: document_version.is_none(),
+				has_equivalent_open_documents: open_uris.len() > 1,
 			});
 		}
 		Some(modules)
@@ -1454,7 +1510,12 @@ impl CompilerState {
 		without_prelude: bool,
 	) -> anyhow::Result<()> {
 		let mut present = HashSet::new();
-		for (path, module) in nymph_files(root) {
+		let disk_files = nymph_files(root);
+		self.project_disk_files.insert(
+			root.to_path_buf(),
+			disk_files.iter().map(|(path, _)| path.clone()).collect(),
+		);
+		for (path, module) in disk_files {
 			let module_identity = ModuleIdentity {
 				project: project.clone(),
 				module: module.clone(),
