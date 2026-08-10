@@ -2037,7 +2037,15 @@ impl<'m> Checker<'m> {
 			}
 			_ => false,
 		};
-		if !has_field && let Some(resolution) = self.resolve_method_value(parent_ty, member, span) {
+		let method_receiver = if (!expr_is_place(parent) || self.custom_index_value(parent))
+			&& !matches!(self.interner.kind(resolved_parent), TyKind::Mut(_))
+		{
+			self.interner.mk_mut(resolved_parent)
+		} else {
+			parent_ty
+		};
+		if !has_field && let Some(resolution) = self.resolve_method_value(method_receiver, member, span)
+		{
 			self
 				.annotations
 				.record_generic_call_arguments(id, resolution.type_arguments.clone());

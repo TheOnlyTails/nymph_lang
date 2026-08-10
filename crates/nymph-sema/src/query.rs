@@ -5535,6 +5535,11 @@ mod member_completion_tests {
 		let (analysis, _) = analyze(&mutable_source);
 		let first = mutable_source.find("value.change").unwrap() + "value".len();
 		assert_eq!(member_completions_at(&analysis, first)[0].name, "change");
+
+		let owned =
+			"struct Cell { mut func change(): int = 1 }\nfunc take(): () -> int = Cell().change";
+		let (_, diagnostics) = analyze(owned);
+		assert!(diagnostics.is_empty(), "{diagnostics:?}");
 	}
 
 	#[test]
