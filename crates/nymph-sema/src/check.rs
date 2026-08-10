@@ -74,7 +74,10 @@ pub struct Checker<'m> {
 	// ── Transient per-body state ─────────────────────────────────────────────
 	pub(crate) scopes: Vec<FxHashMap<EcoString, Binding>>,
 	/// Stack of generic-parameter scopes (name → rigid `ParamIdx`).
-	pub(crate) params: Vec<FxHashMap<EcoString, ParamIdx>>,
+	pub(crate) params: Vec<FxHashMap<EcoString, crate::lower::GenericBinding>>,
+	/// Named generic labels waiting for the referenced declaration's final
+	/// signature metadata. Keeping the resolved owner makes this fail closed.
+	pub(crate) pending_generic_labels: Vec<(Span, crate::DefinitionId, EcoString)>,
 	/// The interface bounds on the generic parameters of the body currently being
 	/// checked (`ParamIdx` → the interfaces it must implement). Rebuilt per body; used
 	/// to resolve a namespaced call through a type parameter, e.g. `R.default()` where
@@ -373,6 +376,7 @@ fn check_module_from_parts(
 	checker.collect_inherent();
 	checker.collect_impls();
 	checker.collect_inner_impls();
+	checker.finalize_named_generic_labels();
 	checker.check_coherence();
 	checker.generalize_returns();
 	let inferred_identity = checker.defs.defs.iter().rev().find_map(|definition| {
@@ -388,6 +392,9 @@ fn check_module_from_parts(
 	};
 	checker.check_bodies();
 	checker.check_member_bodies();
+	// Type syntax in bodies (typed locals, casts, and member bodies) can create
+	// named generic-label work after signature collection has completed.
+	checker.finalize_named_generic_labels();
 	checker.check_external_value_linkage();
 	checker.check_external_func_kinds();
 	if entry == EntryMode::Entry {
@@ -413,6 +420,10 @@ fn check_module_from_parts(
 	debug_assert!(
 		checker.pending_bound_arg_mut.is_empty(),
 		"pending_bound_arg_mut should be drained per-body, not left for module end"
+	);
+	assert!(
+		checker.pending_generic_labels.is_empty(),
+		"named generic labels must be finalized before annotations are published"
 	);
 	// Some annotations are recorded before later expressions constrain their
 	// inference variables. Resolve them one final time while the unify table is
@@ -937,6 +948,7 @@ impl<'m> Checker<'m> {
 			runtime_role_provenance: crate::environment::RuntimeRoleProvenance::StandaloneFixture,
 			scopes: Vec::new(),
 			params: Vec::new(),
+			pending_generic_labels: Vec::new(),
 			param_bounds: FxHashMap::default(),
 			param_bound_details: FxHashMap::default(),
 			self_ty: None,
@@ -1032,7 +1044,22 @@ impl<'m> Checker<'m> {
 	}
 
 	// ── Generic-parameter scopes ─────────────────────────────────────────────
-	pub(crate) fn push_params(&mut self, scope: FxHashMap<EcoString, ParamIdx>) {
+	pub(crate) fn push_params(&mut self, scope: FxHashMap<EcoString, crate::lower::GenericBinding>) {
+		for binding in scope.values() {
+			if binding.written_declarations.len() > 1 {
+				for &declaration in &binding.written_declarations {
+					self.annotations.suppress_generic_declaration(declaration);
+				}
+				continue;
+			}
+			for &declaration in &binding.written_declarations {
+				self.annotations.record_generic_symbol(
+					declaration,
+					crate::annotate::GenericSymbolIdentity::Local(declaration),
+					true,
+				);
+			}
+		}
 		self.params.push(scope);
 	}
 
@@ -1045,7 +1072,55 @@ impl<'m> Checker<'m> {
 			.params
 			.iter()
 			.rev()
-			.find_map(|scope| scope.get(name).copied())
+			.find_map(|scope| scope.get(name).map(|binding| binding.index))
+	}
+
+	pub(crate) fn lookup_param_binding(&self, name: &str) -> Option<crate::lower::GenericBinding> {
+		self
+			.params
+			.iter()
+			.rev()
+			.find_map(|scope| scope.get(name).cloned())
+	}
+
+	pub(crate) fn queue_named_generic_labels(
+		&mut self,
+		owner: crate::DefinitionId,
+		args: &[nymph_ast::Spanned<nymph_ast::ty::GenericArg>],
+	) {
+		for arg in args {
+			if let Some(label) = &arg.0.name {
+				self
+					.pending_generic_labels
+					.push((label.1, owner.clone(), label.0.clone()));
+			}
+		}
+	}
+
+	pub(crate) fn finalize_named_generic_labels(&mut self) {
+		for (span, owner, label) in std::mem::take(&mut self.pending_generic_labels) {
+			let Some(def) = self.defs.by_stable(&owner) else {
+				continue;
+			};
+			let names = match self.defs.data(def).kind {
+				crate::DefKind::Struct => self.sigs.structs.get(&def).map(|sig| &sig.generics),
+				crate::DefKind::Enum => self.sigs.enums.get(&def).map(|sig| &sig.generics),
+				crate::DefKind::TypeAlias => self.sigs.aliases.get(&def).map(|sig| &sig.generics),
+				crate::DefKind::Interface => self.interfaces.get(&def).map(|sig| &sig.generics),
+				_ => None,
+			};
+			let Some(index) = names.and_then(|names| names.iter().position(|name| name == &label)) else {
+				continue;
+			};
+			self.annotations.record_generic_symbol(
+				span,
+				crate::GenericSymbolIdentity::Stable(crate::GenericParameterId::new(
+					owner.binder(crate::BinderScope::Definition, 0),
+					index as u32,
+				)),
+				false,
+			);
+		}
 	}
 
 	// ── Type resolution ──────────────────────────────────────────────────────
@@ -1412,7 +1487,7 @@ impl<'m> Checker<'m> {
 				.find_map(|scope| {
 					scope
 						.iter()
-						.find(|(_, idx)| **idx == *p)
+						.find(|(_, binding)| binding.index == *p)
 						.map(|(n, _)| n.to_string())
 				})
 				.unwrap_or_else(|| format!("T{}", p.0)),

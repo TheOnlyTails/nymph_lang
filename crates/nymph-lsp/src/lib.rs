@@ -1,6 +1,6 @@
 //! The Nymph language server: a synchronous `lsp-server` loop (no
 //! tokio/async — the compiler facade it wraps is synchronous) providing
-//! diagnostics, hover, document/workspace symbols, go-to-definition, and completion
+//! diagnostics, hover, document/workspace symbols, navigation, rename, and completion
 //! over stdio, spawned by the VS Code extension (`extension/src/extension.ts`)
 //! from its target-specific packaged payload.
 //!
@@ -17,6 +17,8 @@
 //! declaration, AST + `DefMap`-only, no type-check (see [`definition`]);
 //! `textDocument/references` searches compiler-resolved declaration identity
 //! across every source in the current project snapshot (see [`references`]);
+//! `textDocument/prepareRename` and `textDocument/rename` edit every occurrence
+//! of a user-written semantic identity (see [`rename`]);
 //! `textDocument/completion` offers lexical names, resolved project imports,
 //! same-module declarations, and keywords from an immutable analysis snapshot
 //! (see [`completion`] — member completion after a `.` is deferred, see its
@@ -25,7 +27,7 @@
 //! `textDocument/semanticTokens/full` classifies every
 //! token from the compiler's own lexer + AST, so highlighting stays correct
 //! independent of the TextMate grammar (see [`semantic_tokens`]).
-//! Incremental sync and rename are deliberately out of scope. Document and
+//! Incremental sync is deliberately out of scope. Document and
 //! range formatting use the canonical formatter against the open buffer.
 
 pub mod compiler_state;
@@ -39,6 +41,7 @@ pub mod hover;
 pub mod line_index;
 mod position;
 pub mod references;
+mod rename;
 pub mod semantic_tokens;
 pub mod workspace;
 pub mod workspace_symbols;
@@ -55,8 +58,8 @@ use lsp_types::{
 	DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
 	DocumentFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams, FileSystemWatcher,
 	GlobPattern, GotoDefinitionParams, HoverParams, HoverProviderCapability, InitializeParams,
-	InitializeResult, OneOf, ReferenceParams, Registration, RegistrationParams,
-	SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+	InitializeResult, OneOf, ReferenceParams, Registration, RegistrationParams, RenameOptions,
+	RenameParams, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
 	SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
 	TextDocumentSyncKind, WorkspaceSymbolParams,
 	notification::{
@@ -64,9 +67,9 @@ use lsp_types::{
 		Notification as _,
 	},
 	request::{
-		Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest, RangeFormatting,
-		References, RegisterCapability, Request as _, SemanticTokensFullRequest,
-		WorkspaceSymbolRequest,
+		Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
+		PrepareRenameRequest, RangeFormatting, References, RegisterCapability, Rename, Request as _,
+		SemanticTokensFullRequest, WorkspaceSymbolRequest,
 	},
 };
 
@@ -148,6 +151,10 @@ pub fn server_capabilities() -> ServerCapabilities {
 		document_range_formatting_provider: Some(OneOf::Left(true)),
 		definition_provider: Some(OneOf::Left(true)),
 		references_provider: Some(OneOf::Left(true)),
+		rename_provider: Some(OneOf::Right(RenameOptions {
+			prepare_provider: Some(true),
+			work_done_progress_options: Default::default(),
+		})),
 		completion_provider: Some(CompletionOptions {
 			trigger_characters: Some(vec![".".to_string()]),
 			..Default::default()
@@ -415,6 +422,85 @@ fn main_loop(
 							.sender
 							.send(Message::Response(Response::new_ok(id, result)))?;
 					}
+				} else if req.method == PrepareRenameRequest::METHOD {
+					let (id, params) =
+						req.extract::<lsp_types::TextDocumentPositionParams>(PrepareRenameRequest::METHOD)?;
+					let uri = &params.text_document.uri;
+					let mut compiler = compiler.lock().unwrap();
+					let docs_guard = docs.lock().unwrap();
+					let snapshot = compiler.references_analysis_for_uri(&docs_guard, uri);
+					let response = match snapshot {
+						Some(snapshot) => {
+							let candidate =
+								rename::rename_candidate(&docs_guard, &compiler, &snapshot, params.position, "");
+							drop(docs_guard);
+							drop(compiler);
+							let result = candidate.and_then(rename::RenameCandidate::validate_prepare);
+							prepare_if_current(docs, uri, &snapshot, result)
+						}
+						None => Some(None),
+					};
+					if let Some(result) = response {
+						connection
+							.sender
+							.send(Message::Response(Response::new_ok(id, result)))?;
+					}
+				} else if req.method == Rename::METHOD {
+					let (id, params) = req.extract::<RenameParams>(Rename::METHOD)?;
+					if !rename::valid_new_name(&params.new_name) {
+						connection.sender.send(Message::Response(Response::new_err(
+							id,
+							lsp_server::ErrorCode::InvalidParams as i32,
+							"new name must be exactly one Nymph identifier".into(),
+						)))?;
+						continue;
+					}
+					let uri = &params.text_document_position.text_document.uri;
+					let mut compiler = compiler.lock().unwrap();
+					let docs_guard = docs.lock().unwrap();
+					let snapshot = compiler.references_analysis_for_uri(&docs_guard, uri);
+					let Some(snapshot) = snapshot else {
+						drop(docs_guard);
+						drop(compiler);
+						connection.sender.send(Message::Response(Response::new_err(
+							id,
+							lsp_server::ErrorCode::InvalidParams as i32,
+							"target is not renameable".into(),
+						)))?;
+						continue;
+					};
+					let candidate = rename::rename_candidate(
+						&docs_guard,
+						&compiler,
+						&snapshot,
+						params.text_document_position.position,
+						&params.new_name,
+					);
+					drop(docs_guard);
+					drop(compiler);
+					let response = match candidate {
+						None => Response::new_err(
+							id,
+							lsp_server::ErrorCode::InvalidParams as i32,
+							"target is not renameable".into(),
+						),
+						Some(candidate) => match candidate.validate_disk_sources() {
+							Err(rename::RenameContentModified) => Response::new_err(
+								id,
+								lsp_server::ErrorCode::ContentModified as i32,
+								"project sources changed while preparing rename".into(),
+							),
+							Ok(edit) => match prepare_if_current(docs, uri, &snapshot, edit) {
+								Some(edit) => Response::new_ok(id, edit),
+								None => Response::new_err(
+									id,
+									lsp_server::ErrorCode::ContentModified as i32,
+									"open documents changed while preparing rename".into(),
+								),
+							},
+						},
+					};
+					connection.sender.send(Message::Response(response))?;
 				} else if req.method == SemanticTokensFullRequest::METHOD {
 					let (id, params) =
 						req.extract::<SemanticTokensParams>(SemanticTokensFullRequest::METHOD)?;
@@ -1753,6 +1839,13 @@ mod tests {
 			result.capabilities.references_provider,
 			Some(OneOf::Left(true))
 		);
+		assert_eq!(
+			result.capabilities.rename_provider,
+			Some(OneOf::Right(RenameOptions {
+				prepare_provider: Some(true),
+				work_done_progress_options: Default::default(),
+			}))
+		);
 		let completion = result
 			.capabilities
 			.completion_provider
@@ -2331,6 +2424,10 @@ mod tests {
 		assert!(prepare_definition_response(&docs, &uri, &snapshot, None).is_none());
 		assert!(prepare_references_response(&docs, &uri, &snapshot, None).is_none());
 		assert!(
+			prepare_if_current(&docs, &uri, &snapshot, lsp_types::WorkspaceEdit::default(),).is_none(),
+			"rename edits from a prior close/reopen lifecycle must not be published"
+		);
+		assert!(
 			prepare_completion_response(
 				&docs,
 				&uri,
@@ -2339,6 +2436,86 @@ mod tests {
 			)
 			.is_none()
 		);
+	}
+
+	#[test]
+	fn rename_wire_protocol_returns_null_or_errors_instead_of_orphaning_requests() {
+		let (server, client) = Connection::memory();
+		let handle = std::thread::spawn(move || run(server));
+		handshake(&client);
+		let uri: Uri = "untitled:rename-wire".parse().unwrap();
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				DidOpenTextDocument::METHOD.to_string(),
+				serde_json::to_value(DidOpenTextDocumentParams {
+					text_document: TextDocumentItem {
+						uri: uri.clone(),
+						language_id: "nymph".to_string(),
+						version: 1,
+						text: "func answer(): int = 1".to_string(),
+					},
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+
+		let keyword = TextDocumentPositionParams {
+			text_document: TextDocumentIdentifier { uri: uri.clone() },
+			position: Position::new(0, 1),
+		};
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(30),
+				PrepareRenameRequest::METHOD.to_string(),
+				serde_json::to_value(keyword.clone()).unwrap(),
+			)))
+			.unwrap();
+		assert_eq!(
+			recv_response(&client, 30).response_result.unwrap(),
+			serde_json::Value::Null
+		);
+
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(31),
+				Rename::METHOD.to_string(),
+				serde_json::to_value(RenameParams {
+					text_document_position: keyword,
+					new_name: "renamed".into(),
+					work_done_progress_params: WorkDoneProgressParams::default(),
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		assert_eq!(
+			recv_response(&client, 31).response_result.unwrap_err().code,
+			lsp_server::ErrorCode::InvalidParams as i32
+		);
+
+		client
+			.sender
+			.send(Message::Request(Request::new(
+				RequestId::from(32),
+				Rename::METHOD.to_string(),
+				serde_json::to_value(RenameParams {
+					text_document_position: TextDocumentPositionParams {
+						text_document: TextDocumentIdentifier { uri },
+						position: Position::new(0, 6),
+					},
+					new_name: "func".into(),
+					work_done_progress_params: WorkDoneProgressParams::default(),
+				})
+				.unwrap(),
+			)))
+			.unwrap();
+		assert_eq!(
+			recv_response(&client, 32).response_result.unwrap_err().code,
+			lsp_server::ErrorCode::InvalidParams as i32
+		);
+		shutdown(&client, handle);
 	}
 
 	/// A round trip through the real `Connection::memory()` wire (not just a

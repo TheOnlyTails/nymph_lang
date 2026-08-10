@@ -25,14 +25,44 @@ use crate::ty::{GenericArgs, Ty};
 
 /// Map a generic parameter list to a name → [`ParamIdx`] scope. The `i`-th
 /// declared parameter is `ParamIdx(i)`.
+#[derive(Clone, Debug)]
+pub(crate) struct GenericBinding {
+	pub index: ParamIdx,
+	pub declaration: Span,
+	pub written_declarations: Vec<Span>,
+}
+
 pub(crate) fn build_param_scope(
 	generics: &[Spanned<GenericParam>],
-) -> FxHashMap<EcoString, ParamIdx> {
-	generics
-		.iter()
-		.enumerate()
-		.map(|(i, g)| (g.0.name.0.clone(), ParamIdx(i as u32)))
-		.collect()
+) -> FxHashMap<EcoString, GenericBinding> {
+	build_param_scope_at(generics, 0)
+}
+
+/// Build a generic scope whose indices begin after an enclosing binder.
+/// Duplicate written declarations are all retained for conservative symbol
+/// provenance, while lookup continues to use the last declaration.
+pub(crate) fn build_param_scope_at(
+	generics: &[Spanned<GenericParam>],
+	base: usize,
+) -> FxHashMap<EcoString, GenericBinding> {
+	let mut scope: FxHashMap<EcoString, GenericBinding> = FxHashMap::default();
+	for (i, generic) in generics.iter().enumerate() {
+		let declaration = generic.0.name.1;
+		let mut written_declarations = scope
+			.remove(&generic.0.name.0)
+			.map(|binding| binding.written_declarations)
+			.unwrap_or_default();
+		written_declarations.push(declaration);
+		scope.insert(
+			generic.0.name.0.clone(),
+			GenericBinding {
+				index: ParamIdx((base + i) as u32),
+				declaration,
+				written_declarations,
+			},
+		);
+	}
+	scope
 }
 
 fn generic_names(generics: &[Spanned<GenericParam>]) -> Vec<EcoString> {
@@ -40,6 +70,21 @@ fn generic_names(generics: &[Spanned<GenericParam>]) -> Vec<EcoString> {
 }
 
 impl Checker<'_> {
+	fn stabilize_generics(&mut self, generics: &[Spanned<GenericParam>], owner: DefId) {
+		let Some(owner) = self.defs.stable(owner).cloned() else {
+			return;
+		};
+		for (index, generic) in generics.iter().enumerate() {
+			let identity = crate::GenericParameterId::new(
+				owner.binder(crate::BinderScope::Definition, 0),
+				index as u32,
+			);
+			self
+				.annotations
+				.stabilize_generic_declaration(generic.0.name.1, identity);
+		}
+	}
+
 	/// Lower every top-level definition's signature into semantic types.
 	pub(crate) fn lower_signatures(&mut self) {
 		self.collecting_signatures = true;
@@ -67,6 +112,7 @@ impl Checker<'_> {
 					else {
 						continue;
 					};
+					self.stabilize_generics(generics, id);
 					let scope = build_param_scope(generics);
 					let names = generic_names(generics);
 					self.push_params(scope);
@@ -114,6 +160,7 @@ impl Checker<'_> {
 					else {
 						continue;
 					};
+					self.stabilize_generics(generics, id);
 					let scope = build_param_scope(generics);
 					let names = generic_names(generics);
 					self.push_params(scope);
@@ -180,6 +227,7 @@ impl Checker<'_> {
 						Declaration::ExternalFunc(_, _, meta) => meta,
 						_ => continue,
 					};
+					self.stabilize_generics(&meta.generics, id);
 					let scope = build_param_scope(&meta.generics);
 					let names = generic_names(&meta.generics);
 					self.push_params(scope);
@@ -297,7 +345,7 @@ impl Checker<'_> {
 		generics: &[Spanned<GenericArg>],
 	) -> Ty {
 		// A bare generic parameter in scope wins over any nominal type.
-		if let Some(idx) = self.lookup_param(&name.0) {
+		if let Some(binding) = self.lookup_param_binding(&name.0) {
 			if !generics.is_empty() {
 				self.emit(
 					span,
@@ -306,7 +354,12 @@ impl Checker<'_> {
 					},
 				);
 			}
-			return self.interner.mk_param(idx);
+			self.annotations.record_generic_symbol(
+				name.1,
+				crate::annotate::GenericSymbolIdentity::Local(binding.declaration),
+				false,
+			);
+			return self.interner.mk_param(binding.index);
 		}
 
 		let mut positional = Vec::new();
@@ -330,6 +383,9 @@ impl Checker<'_> {
 		};
 
 		let kind = self.defs.data(def).kind;
+		if let Some(owner) = self.defs.stable(def).cloned() {
+			self.queue_named_generic_labels(owner, generics);
+		}
 		if matches!(
 			kind,
 			DefKind::Struct | DefKind::Enum | DefKind::TypeAlias | DefKind::Interface
@@ -436,6 +492,7 @@ impl Checker<'_> {
 		let Declaration::TypeAlias { meta, value, .. } = &module.members[member] else {
 			return;
 		};
+		self.stabilize_generics(&meta.generics, def);
 		let scope = build_param_scope(&meta.generics);
 		let generics = generic_names(&meta.generics);
 		self.push_params(scope);
