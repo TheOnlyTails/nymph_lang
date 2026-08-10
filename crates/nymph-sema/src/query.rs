@@ -5631,6 +5631,21 @@ mod member_completion_tests {
 		let (_, diagnostics) = analyze(source);
 		assert!(diagnostics.is_empty(), "{diagnostics:?}");
 	}
+
+	#[test]
+	fn alias_static_calls_ignore_same_named_methods_for_other_instantiations() {
+		let source = "struct Box<T>(value: T)\nimpl Box<int> { namespace func make(value: int): Box<int> = Box(value = value) }\nimpl Box<string> { namespace func make(value: string): Box<string> = Box(value = value) }\ntype Strings = Box<string>\nfunc use(): Strings = Strings.make(\"ok\")";
+		assert_eq!(
+			at(source, "Strings.make(\"ok\")"),
+			vec![(
+				"make".into(),
+				Kind::Function,
+				"(string) -> Box<string>".into()
+			)]
+		);
+		let (_, diagnostics) = analyze(source);
+		assert!(diagnostics.is_empty(), "{diagnostics:?}");
+	}
 }
 
 #[cfg(test)]

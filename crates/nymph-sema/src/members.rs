@@ -547,6 +547,14 @@ impl<'m> Checker<'m> {
 	) -> Option<(Ty, Option<crate::DefinitionId>, Vec<Ty>)> {
 		let candidates = self.inherent.candidates(Head::Adt(type_def));
 		for idx in candidates {
+			if let Some(receiver) = receiver {
+				let snapshot = self.table.snapshot();
+				let applicable = self.inherent_receiver_matches(idx, receiver);
+				self.table.rollback_to(snapshot);
+				if !applicable {
+					continue;
+				}
+			}
 			let target = self
 				.inherent
 				.impls
