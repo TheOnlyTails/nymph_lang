@@ -23,6 +23,7 @@ mod session;
 pub use session::{
 	AmbientCoreModuleKey, BuiltinRuntimeOwnerArtifact, BuiltinRuntimeOwnerShape, CompilerSession,
 	ModuleAnalysis, ModulePath, ProjectDiagnostics, ProjectId, RuntimeDefinitionError, SourceVersion,
+	ToolingModuleDeclarations,
 };
 
 #[cfg(feature = "test-support")]

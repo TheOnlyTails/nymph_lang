@@ -68,6 +68,13 @@ qualified uses participate when they resolve to the selected declaration; shadow
 same-named symbols do not. VS Code's include-declaration request setting is honored. A file outside a
 project is limited to its isolated one-file analysis universe.
 
+**Go to Symbol in Workspace** searches visible top-level declarations in synchronized manifest
+projects, including unopened modules and unsaved open-file overlays. It excludes private items,
+locals, implementation members, compiler-generated symbols, dependencies, and loose files. Matching
+is case-sensitive: exact names rank before prefixes, followed by Jaro-Winkler fuzzy matches scoring
+at least 0.70; equal results are ordered by URI, declaration range, and name. Searches return at most
+100 results, while an empty query provides a deterministic project overview limited to 50.
+
 Semantic highlighting consumes that same immutable project snapshot. Imported and ambient
 functions, values, types, enum variants, and aliases therefore keep the same semantic kind as their
 declarations, including when an unsaved dependency overrides its on-disk source. Highlighting is

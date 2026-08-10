@@ -112,6 +112,19 @@ pub struct ReferenceModuleSnapshot {
 	pub requires_disk_validation: bool,
 }
 
+/// One module in an immutable, overlay-authoritative workspace-symbol snapshot.
+pub struct WorkspaceSymbolModuleSnapshot {
+	pub module: ModulePath,
+	pub uri: Uri,
+	pub source: Arc<str>,
+	pub declarations: Arc<[nymph_sema::TopLevelDeclaration]>,
+}
+
+pub struct WorkspaceSymbolSnapshot {
+	pub document_revision: DocumentStoreRevision,
+	pub modules: Vec<WorkspaceSymbolModuleSnapshot>,
+}
+
 pub struct CompilerState {
 	pub session: CompilerSession,
 	stdlib_session: CompilerSession,
@@ -121,6 +134,7 @@ pub struct CompilerState {
 	effective_sources: HashMap<ModuleIdentity, Arc<str>>,
 	authoritative_overlays: HashMap<ModuleIdentity, Uri>,
 	manifest_errors: HashMap<Uri, String>,
+	workspace_symbol_refresh_errors: HashSet<PathBuf>,
 	diagnostic_targets: HashMap<String, Vec<String>>,
 }
 
@@ -151,6 +165,7 @@ impl CompilerState {
 			effective_sources: HashMap::new(),
 			authoritative_overlays: HashMap::new(),
 			manifest_errors: HashMap::new(),
+			workspace_symbol_refresh_errors: HashSet::new(),
 			diagnostic_targets: HashMap::new(),
 		}
 	}
@@ -220,10 +235,9 @@ impl CompilerState {
 			Ok(source) => {
 				self.set_effective_source(&module_identity, source, SourceVersion(0));
 			}
-			Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+			Err(_) => {
 				self.remove_effective_source(&module_identity);
 			}
-			Err(error) => return Err(error.into()),
 		}
 		let mut affected = previous;
 		for current in self.affected_project_documents(docs, uri) {
@@ -425,80 +439,18 @@ impl CompilerState {
 		docs: &DocumentStore,
 		uri: &Uri,
 	) -> Option<AnalysisSnapshot> {
-		self.refresh_project_sources(docs, uri).ok()?;
+		let identity = self.documents.get(uri)?.clone();
+		if matches!(identity.kind, DocumentKind::Project(_)) {
+			self
+				.synchronize_project_files(
+					docs,
+					&identity.root,
+					&identity.project,
+					identity.without_prelude,
+				)
+				.ok()?;
+		}
 		self.analysis_for_uri(docs, uri)
-	}
-
-	fn refresh_project_sources(&mut self, docs: &DocumentStore, uri: &Uri) -> anyhow::Result<()> {
-		let Some(identity) = self.documents.get(uri).cloned() else {
-			return Ok(());
-		};
-		if !matches!(identity.kind, DocumentKind::Project(_)) {
-			return Ok(());
-		}
-
-		let mut disk_modules = BTreeMap::new();
-		for (path, module) in nymph_files(&identity.root)? {
-			let source = fs::read_to_string(&path)?;
-			disk_modules.insert(module, (path, source));
-		}
-		let disk_identities: HashSet<_> = disk_modules
-			.keys()
-			.map(|module| ModuleIdentity {
-				project: identity.project.clone(),
-				module: module.clone(),
-				without_prelude: identity.without_prelude,
-			})
-			.collect();
-		let known_identities: HashSet<_> = self
-			.documents
-			.values()
-			.filter(|candidate| {
-				candidate.project == identity.project
-					&& candidate.root == identity.root
-					&& candidate.without_prelude == identity.without_prelude
-					&& matches!(candidate.kind, DocumentKind::Project(_))
-			})
-			.map(DocumentIdentity::module_identity)
-			.collect();
-		let mut removed = HashSet::new();
-		for known in known_identities {
-			let has_open_overlay = self
-				.authoritative_overlays
-				.get(&known)
-				.is_some_and(|open_uri| docs.get(open_uri).is_some());
-			if !disk_identities.contains(&known) && !has_open_overlay {
-				self.authoritative_overlays.remove(&known);
-				self.remove_effective_source(&known);
-				removed.insert(known);
-			}
-		}
-		self.documents.retain(|document_uri, candidate| {
-			docs.get(document_uri).is_some() || !removed.contains(&candidate.module_identity())
-		});
-
-		for (module, (path, source)) in disk_modules {
-			let disk_identity = DocumentIdentity {
-				project: identity.project.clone(),
-				module: module.clone(),
-				entry: module,
-				root: identity.root.clone(),
-				without_prelude: identity.without_prelude,
-				kind: DocumentKind::Project(path.clone()),
-			};
-			let module_identity = disk_identity.module_identity();
-			let has_open_overlay = self
-				.authoritative_overlays
-				.get(&module_identity)
-				.is_some_and(|open_uri| docs.get(open_uri).is_some());
-			if !has_open_overlay {
-				self.set_effective_source(&module_identity, source, SourceVersion(0));
-			}
-			if let Some(disk_uri) = workspace::path_to_uri(&path) {
-				self.documents.entry(disk_uri).or_insert(disk_identity);
-			}
-		}
-		Ok(())
 	}
 
 	pub fn completion_for_uri(&self, docs: &DocumentStore, uri: &Uri) -> Option<CompletionSnapshot> {
@@ -519,6 +471,97 @@ impl CompilerState {
 			source: analysis.source,
 			imported_names: analysis.imported_names,
 		})
+	}
+
+	/// Refresh disk membership and source facts for workspace-symbol search.
+	/// This is deliberately request-scoped: ordinary editor changes preserve
+	/// the compiler state's established no-reread behavior for unopened files.
+	pub fn refresh_workspace_symbols(&mut self, docs: &DocumentStore) {
+		let projects = self
+			.synchronized_roots
+			.iter()
+			.filter_map(|root| {
+				let project = self.workspaces.get(root)?.clone();
+				let without_prelude = self.documents.values().find_map(|identity| {
+					(identity.root == *root && identity.project == project)
+						.then_some(identity.without_prelude)
+				})?;
+				Some((root.clone(), project, without_prelude))
+			})
+			.collect::<Vec<_>>();
+		self.workspace_symbol_refresh_errors.clear();
+		for (root, project, without_prelude) in projects {
+			if self
+				.synchronize_project_files(docs, &root, &project, without_prelude)
+				.is_err()
+			{
+				self.workspace_symbol_refresh_errors.insert(root);
+			}
+		}
+	}
+
+	/// Snapshot declarations from every synchronized manifest project. Loose
+	/// files and compiler/provider modules are intentionally outside the search
+	/// boundary; open project overlays are already installed in each session.
+	#[must_use]
+	pub fn workspace_symbol_snapshot(&self, docs: &DocumentStore) -> WorkspaceSymbolSnapshot {
+		let invalid_roots = self
+			.manifest_errors
+			.keys()
+			.filter_map(|uri| {
+				self
+					.documents
+					.get(uri)
+					.map(|identity| identity.root.clone())
+			})
+			.collect::<HashSet<_>>();
+		let mut projects = self
+			.synchronized_roots
+			.iter()
+			.filter(|root| !invalid_roots.contains(*root))
+			.filter(|root| !self.workspace_symbol_refresh_errors.contains(*root))
+			.filter_map(|root| {
+				let project = self.workspaces.get(root)?.clone();
+				let without_prelude = self.documents.values().find_map(|identity| {
+					(identity.root == *root && identity.project == project)
+						.then_some(identity.without_prelude)
+				})?;
+				Some((root.clone(), project, without_prelude))
+			})
+			.collect::<Vec<_>>();
+		projects.sort();
+		projects.dedup();
+
+		let mut modules = Vec::new();
+		for (root, project, without_prelude) in projects {
+			let session = if without_prelude {
+				&self.stdlib_session
+			} else {
+				&self.session
+			};
+			for declarations in session.tooling_project_declarations(&project) {
+				let Some(uri) = workspace::key_to_uri(&root, declarations.module.as_str()) else {
+					continue;
+				};
+				modules.push(WorkspaceSymbolModuleSnapshot {
+					module: declarations.module,
+					uri,
+					source: declarations.source,
+					declarations: declarations.declarations,
+				});
+			}
+		}
+		modules.sort_by(|left, right| {
+			left
+				.uri
+				.as_str()
+				.cmp(right.uri.as_str())
+				.then_with(|| left.module.cmp(&right.module))
+		});
+		WorkspaceSymbolSnapshot {
+			document_revision: docs.revision(),
+			modules,
+		}
 	}
 
 	/// Resolve a checked stable target to an authoritative, reachable project source.
@@ -1004,22 +1047,7 @@ impl CompilerState {
 		self.documents.insert(uri.clone(), identity.clone());
 
 		if matches!(kind, DocumentKind::Project(_)) && self.synchronized_roots.insert(root.clone()) {
-			for (path, module) in nymph_files(&root)? {
-				if let Ok(source) = fs::read_to_string(&path) {
-					let disk_identity = DocumentIdentity {
-						project: project.clone(),
-						module: module.clone(),
-						entry: module.clone(),
-						root: root.clone(),
-						without_prelude,
-						kind: DocumentKind::Project(path.clone()),
-					};
-					self.set_effective_source(&disk_identity.module_identity(), source, SourceVersion(0));
-					if let Some(disk_uri) = workspace::path_to_uri(&path) {
-						self.documents.entry(disk_uri).or_insert(disk_identity);
-					}
-				}
-			}
+			self.synchronize_project_files(docs, &root, &project, without_prelude)?;
 		}
 		if docs.get(uri).is_some() {
 			self
@@ -1051,6 +1079,117 @@ impl CompilerState {
 		for (module, source, version) in overlays {
 			self.set_effective_source(&module, source, version);
 		}
+		Ok(())
+	}
+
+	/// Reconcile the session's disk-backed project inputs on every analysis
+	/// refresh. Open overlays remain authoritative; newly added unopened files
+	/// appear and deleted unopened files are tombstoned deterministically.
+	fn synchronize_project_files(
+		&mut self,
+		docs: &DocumentStore,
+		root: &std::path::Path,
+		project: &ProjectId,
+		without_prelude: bool,
+	) -> anyhow::Result<()> {
+		let mut present = HashSet::new();
+		for (path, module) in nymph_files(root)? {
+			let module_identity = ModuleIdentity {
+				project: project.clone(),
+				module: module.clone(),
+				without_prelude,
+			};
+			present.insert(module_identity.clone());
+			let disk_identity = DocumentIdentity {
+				project: project.clone(),
+				module: module.clone(),
+				entry: module,
+				root: root.to_path_buf(),
+				without_prelude,
+				kind: DocumentKind::Project(path.clone()),
+			};
+			let mut open_overlays = self
+				.documents
+				.iter()
+				.filter_map(|(uri, identity)| {
+					let DocumentKind::Project(candidate_path) = &identity.kind else {
+						return None;
+					};
+					if candidate_path != &path {
+						return None;
+					}
+					let document = docs.get(uri)?;
+					Some((
+						uri.clone(),
+						document.text.clone(),
+						document.version,
+						identity.clone(),
+					))
+				})
+				.collect::<Vec<_>>();
+			open_overlays.sort_by(|left, right| left.0.as_str().cmp(right.0.as_str()));
+			for (uri, _, _, previous) in &open_overlays {
+				if previous.module_identity() != module_identity {
+					self.retire_transitioned_identity(docs, uri, previous);
+				}
+				self.documents.insert(uri.clone(), disk_identity.clone());
+			}
+			let authoritative = self
+				.authoritative_overlays
+				.get(&module_identity)
+				.and_then(|authoritative| {
+					open_overlays
+						.iter()
+						.find(|(uri, _, _, _)| uri == authoritative)
+				})
+				.or_else(|| {
+					open_overlays.iter().max_by(
+						|(left_uri, _, left_version, _), (right_uri, _, right_version, _)| {
+							left_version
+								.cmp(right_version)
+								.then_with(|| left_uri.as_str().cmp(right_uri.as_str()))
+						},
+					)
+				})
+				.map(|(uri, source, version, _)| (uri.clone(), source.clone(), *version));
+			if let Some((uri, source, version)) = authoritative {
+				self
+					.authoritative_overlays
+					.insert(module_identity.clone(), uri);
+				self.set_effective_source(&module_identity, source, SourceVersion(i64::from(version)));
+			} else {
+				match fs::read_to_string(&path) {
+					Ok(source) => {
+						self.set_effective_source(&module_identity, source, SourceVersion(0));
+					}
+					Err(_) => self.remove_effective_source(&module_identity),
+				}
+			}
+			if let Some(disk_uri) = workspace::path_to_uri(&path) {
+				self.documents.insert(disk_uri, disk_identity);
+			}
+		}
+
+		let stale = self
+			.effective_sources
+			.keys()
+			.filter(|identity| {
+				identity.project == *project
+					&& identity.without_prelude == without_prelude
+					&& !present.contains(*identity)
+					&& !self
+						.authoritative_overlays
+						.get(*identity)
+						.is_some_and(|uri| docs.get(uri).is_some())
+			})
+			.cloned()
+			.collect::<Vec<_>>();
+		for identity in &stale {
+			self.remove_effective_source(identity);
+		}
+		self.documents.retain(|uri, identity| {
+			docs.get(uri).is_some() || !stale.contains(&identity.module_identity())
+		});
 		Ok(())
 	}
 

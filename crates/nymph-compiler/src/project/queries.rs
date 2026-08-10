@@ -937,6 +937,18 @@ fn parse_source(source: Arc<str>, path: String) -> Arc<ParsedModule> {
 	})
 }
 
+#[salsa::tracked(returns(clone))]
+pub(crate) fn tooling_top_level_declarations(
+	db: &dyn Db,
+	module: ModuleInput,
+) -> Arc<[nymph_sema::TopLevelDeclaration]> {
+	nymph_sema::top_level_declarations(
+		SemanticModuleInput::Project(module).identity(db),
+		&parse(db, module).tree,
+	)
+	.into()
+}
+
 #[salsa::tracked]
 pub(crate) fn direct_imports(db: &dyn Db, module: ModuleInput) -> Arc<DirectImports> {
 	collect_imports(&parse(db, module), module.path(db).as_str())

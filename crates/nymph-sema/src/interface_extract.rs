@@ -213,6 +213,77 @@ fn visible(visibility: Option<Visibility>) -> bool {
 	!matches!(visibility, Some(Visibility::Private))
 }
 
+/// Exact top-level declaration facts from the recovered source module.
+///
+/// This deliberately shares identity, source-name normalization, category,
+/// and visibility rules with interface extraction. Imports, implementations,
+/// non-binding patterns, and synthetic/support definitions are not declarations.
+#[must_use]
+pub fn top_level_declarations(
+	identity: ModuleIdentity,
+	module: &Module,
+) -> Vec<crate::TopLevelDeclaration> {
+	let headers = declared_headers(identity, module);
+	module
+		.members
+		.iter()
+		.enumerate()
+		.filter(|(member, declaration)| lexical_winner(module, *member, declaration))
+		.filter_map(|(member, declaration)| {
+			let (category, raw_name) = declaration_identity(declaration)?;
+			if raw_name.is_empty() {
+				return None;
+			}
+			let (visibility, name_span, mutable) = match declaration {
+				Declaration::Func {
+					visibility, meta, ..
+				} => (*visibility, meta.name.1, false),
+				Declaration::ExternalFunc(visibility, _, meta) => (*visibility, meta.name.1, false),
+				Declaration::Let {
+					visibility, meta, ..
+				} => {
+					let name = meta.name.0.as_binding()?;
+					(*visibility, name.1, meta.is_mutable())
+				}
+				Declaration::ExternalLet(visibility, _, meta) => {
+					let name = meta.name.0.as_binding()?;
+					(*visibility, name.1, meta.is_mutable())
+				}
+				Declaration::TypeAlias {
+					visibility, meta, ..
+				} => (*visibility, meta.name.1, false),
+				Declaration::Struct {
+					visibility, name, ..
+				}
+				| Declaration::Enum {
+					visibility, name, ..
+				}
+				| Declaration::Interface {
+					visibility, name, ..
+				}
+				| Declaration::Namespace {
+					visibility, name, ..
+				} => (*visibility, name.1, false),
+				Declaration::Import { .. } | Declaration::Impl { .. } | Declaration::ImplFor { .. } => {
+					return None;
+				}
+			};
+			Some(crate::TopLevelDeclaration {
+				name: source_name(raw_name).into(),
+				definition: headers.member_id(member)?.clone(),
+				visibility: if visible(visibility) {
+					crate::NamespaceVisibility::Importable
+				} else {
+					crate::NamespaceVisibility::Private
+				},
+				category,
+				mutable,
+				name_span,
+			})
+		})
+		.collect()
+}
+
 pub(crate) fn external_function_abi(marker: &EcoString) -> ExternalAbi {
 	external_function_abi_for_receiver(marker, None, None, None)
 }

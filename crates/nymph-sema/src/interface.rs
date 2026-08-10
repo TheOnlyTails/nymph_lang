@@ -7,7 +7,7 @@ use std::{
 };
 
 use ecow::EcoString;
-use nymph_ast::decl::Visibility;
+use nymph_ast::{Span, decl::Visibility};
 use nymph_hir::{
 	hir::MarshalKind,
 	ids::{DefId, InferVar, ParamIdx},
@@ -37,6 +37,20 @@ pub struct NamespaceDeclaration {
 pub enum NamespaceVisibility {
 	Importable,
 	Private,
+}
+
+/// Body-independent source facts for one user-visible top-level declaration.
+///
+/// These are shared by project tooling that needs semantic declaration identity,
+/// category, and visibility while remaining available over malformed bodies.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub struct TopLevelDeclaration {
+	pub name: EcoString,
+	pub definition: DefinitionId,
+	pub visibility: NamespaceVisibility,
+	pub category: crate::DeclarationCategory,
+	pub mutable: bool,
+	pub name_span: Span,
 }
 
 impl NamespaceSummary {

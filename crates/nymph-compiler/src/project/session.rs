@@ -299,6 +299,14 @@ pub struct ToolingCompletionAnalysis {
 	pub imported_names: Arc<[nymph_sema::query::ImportedName]>,
 }
 
+/// Body-independent declaration facts for one active project module.
+#[derive(Clone)]
+pub struct ToolingModuleDeclarations {
+	pub module: ModulePath,
+	pub source: Arc<str>,
+	pub declarations: Arc<[nymph_sema::TopLevelDeclaration]>,
+}
+
 /// Project diagnostics are deliberately separate from reusable semantic facts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ProjectDiagnostics(pub Arc<[ProjectDiagnostic]>);
@@ -970,6 +978,28 @@ impl CompilerSession {
 		queries::interface_project_diagnostics(&self.db, key)
 			.0
 			.clone()
+	}
+
+	/// Snapshot every active module's recovered top-level declaration facts.
+	/// This query does not require a valid import graph or checked bodies.
+	#[doc(hidden)]
+	#[must_use]
+	pub fn tooling_project_declarations(
+		&self,
+		project: &ProjectId,
+	) -> Vec<ToolingModuleDeclarations> {
+		let mut modules = self
+			.registry
+			.iter()
+			.filter(|((owner, _), record)| owner == project && record.source.is_some())
+			.map(|((_, module), record)| ToolingModuleDeclarations {
+				module: module.clone(),
+				source: record.source.clone().expect("active module has source"),
+				declarations: queries::tooling_top_level_declarations(&self.db, record.input),
+			})
+			.collect::<Vec<_>>();
+		modules.sort_by(|left, right| left.module.cmp(&right.module));
+		modules
 	}
 
 	#[must_use]
