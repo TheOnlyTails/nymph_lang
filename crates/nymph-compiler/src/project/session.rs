@@ -301,6 +301,7 @@ pub struct ModuleAnalysis {
 pub struct ToolingCompletionAnalysis {
 	pub source: Arc<str>,
 	pub imported_names: Arc<[nymph_sema::query::ImportedName]>,
+	pub ambient_names: Arc<[nymph_sema::query::ImportedName]>,
 }
 
 /// Body-independent declaration facts for one active project module.
@@ -958,9 +959,48 @@ impl CompilerSession {
 			&semantic_input.parsed(&self.db).tree,
 		)
 		.into();
+		let ambient_names: Arc<[nymph_sema::query::ImportedName]> = if isolated && ambient_prelude {
+			let registry = key.ambient_core_registry(&self.db);
+			let ambient_modules = registry
+				.modules(&self.db)
+				.iter()
+				.copied()
+				.map(|module| queries::ambient_core_environment(&self.db, registry, module))
+				.collect::<Vec<_>>();
+			let mut bindings = rustc_hash::FxHashMap::default();
+			for module in &ambient_modules {
+				match module.as_ref() {
+					nymph_sema::ModuleEnvironment::Complete(interface) => {
+						for definition in &interface.exports {
+							bindings.insert(
+								definition.name.clone(),
+								nymph_sema::ResolvedImportBinding::Definition(definition.id.clone()),
+							);
+						}
+					}
+					nymph_sema::ModuleEnvironment::Recovered(interface) => {
+						for definition in &interface.exports {
+							bindings.insert(
+								definition.name.clone(),
+								nymph_sema::ResolvedImportBinding::Definition(definition.id.clone()),
+							);
+						}
+					}
+				}
+			}
+			nymph_sema::query::imported_names(
+				&bindings,
+				&ambient_modules,
+				&semantic_input.parsed(&self.db).tree,
+			)
+			.into()
+		} else {
+			Arc::new([])
+		};
 		Some(ToolingCompletionAnalysis {
 			source,
 			imported_names,
+			ambient_names,
 		})
 	}
 

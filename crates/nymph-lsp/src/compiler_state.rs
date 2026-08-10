@@ -102,6 +102,7 @@ pub struct CompletionSnapshot {
 	pub document_revision: DocumentStoreRevision,
 	pub source: Arc<str>,
 	pub imported_names: Arc<[nymph_sema::query::ImportedName]>,
+	pub ambient_names: Arc<[nymph_sema::query::ImportedName]>,
 }
 
 pub struct DefinitionTargetSnapshot {
@@ -839,6 +840,7 @@ impl CompilerState {
 			document_revision: docs.revision(),
 			source: analysis.source,
 			imported_names: analysis.imported_names,
+			ambient_names: analysis.ambient_names,
 		})
 	}
 
@@ -1861,6 +1863,50 @@ mod tests {
 		assert_eq!(
 			docs.get(&file_uri).unwrap().text,
 			"let existing_behavior = 1"
+		);
+	}
+
+	#[test]
+	fn equivalent_untitled_spellings_have_distinct_analysis_identity() {
+		let plain: Uri = "untitled:buffer-52".parse().unwrap();
+		let encoded: Uri = "untitled:%62uffer-52".parse().unwrap();
+		assert_ne!(plain, encoded);
+		let mut docs = DocumentStore::default();
+		let mut state = CompilerState::new();
+		state
+			.open(
+				&mut docs,
+				plain.clone(),
+				"func plain_only(): int = 1".into(),
+				1,
+			)
+			.unwrap();
+		state
+			.open(
+				&mut docs,
+				encoded.clone(),
+				"func encoded_only(): int = 2".into(),
+				1,
+			)
+			.unwrap();
+
+		let plain_snapshot = state.analysis_for_uri(&docs, &plain).unwrap();
+		let encoded_snapshot = state.analysis_for_uri(&docs, &encoded).unwrap();
+		assert_ne!(plain_snapshot.project, encoded_snapshot.project);
+		assert_eq!(plain_snapshot.source.as_ref(), "func plain_only(): int = 1");
+		assert_eq!(
+			encoded_snapshot.source.as_ref(),
+			"func encoded_only(): int = 2"
+		);
+		let plain_completion = state.completion_for_uri(&docs, &plain).unwrap();
+		let encoded_completion = state.completion_for_uri(&docs, &encoded).unwrap();
+		assert_eq!(
+			plain_completion.source.as_ref(),
+			plain_snapshot.source.as_ref()
+		);
+		assert_eq!(
+			encoded_completion.source.as_ref(),
+			encoded_snapshot.source.as_ref()
 		);
 	}
 

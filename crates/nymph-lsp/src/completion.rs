@@ -75,7 +75,7 @@ pub fn completion(docs: &DocumentStore, params: &CompletionParams) -> Option<Com
 	let uri = &params.text_document_position.text_document.uri;
 	let doc = docs.get(uri)?;
 	let parsed = nymph_syntax::parse_module(&doc.text, uri.path().as_str());
-	Some(complete(&doc.text, &parsed.tree, &[], params))
+	Some(complete(&doc.text, &parsed.tree, &[], &[], params))
 }
 
 /// Complete from one immutable, revision-tagged project analysis snapshot.
@@ -97,6 +97,7 @@ pub fn completion_snapshot(
 		&snapshot.source,
 		&parsed.tree,
 		&snapshot.imported_names,
+		&snapshot.ambient_names,
 		params,
 	)
 }
@@ -105,6 +106,7 @@ fn complete(
 	text: &str,
 	module: &nymph_ast::decl::Module,
 	imported_names: &[nymph_sema::query::ImportedName],
+	ambient_names: &[nymph_sema::query::ImportedName],
 	params: &CompletionParams,
 ) -> CompletionResponse {
 	let position = params.text_document_position.position;
@@ -160,11 +162,21 @@ fn complete(
 	push_tier(
 		&mut items,
 		&mut seen,
+		ambient_names
+			.iter()
+			.map(|ambient| (ambient.name.clone(), imported_kind(ambient.kind))),
+		&prefix,
+		3,
+	);
+
+	push_tier(
+		&mut items,
+		&mut seen,
 		KEYWORDS
 			.iter()
 			.map(|keyword| ((*keyword).to_string(), CompletionItemKind::KEYWORD)),
 		&prefix,
-		3,
+		4,
 	);
 
 	CompletionResponse::Array(items)

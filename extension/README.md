@@ -69,9 +69,11 @@ normal open/change/close behavior, but cannot report external filesystem changes
 
 Completion for ordinary identifiers uses the latest immutable project analysis snapshot. It offers
 nearest lexical names first, then visible imported names (including aliases and unsaved dependency
-overlays), same-module declarations, and keywords. Prefix filtering applies within those tiers.
-Completion after `.` intentionally returns no members yet; member completion and auto-import edits
-are not currently supported. Files outside a project retain lexical and same-file completion.
+overlays), same-module declarations, and keywords. Isolated untitled documents additionally offer
+ambient-prelude names after their own declarations and before keywords. Prefix filtering applies
+within those tiers. Completion after `.` intentionally returns no members yet; member completion and
+auto-import edits are not currently supported. Files outside a project retain lexical and same-file
+completion.
 
 **Find All References** follows compiler-resolved semantic identity rather than spelling. It searches
 every `.nym` file in the detected project, including unopened files, and uses unsaved open-buffer

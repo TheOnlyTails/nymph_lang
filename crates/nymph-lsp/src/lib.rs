@@ -941,6 +941,24 @@ mod tests {
 				.all(|location| location["uri"] == uri.as_str())
 		);
 
+		let prepare_rename = request_value(&client, 19, PrepareRenameRequest::METHOD, position(4, 14));
+		assert_eq!(prepare_rename["placeholder"], "helper");
+		let rename = request_value(
+			&client,
+			23,
+			Rename::METHOD,
+			serde_json::json!({
+				"textDocument": { "uri": uri.as_str() },
+				"position": { "line": 4, "character": 14 },
+				"newName": "renamed_helper"
+			}),
+		);
+		let rename_edits = rename["documentChanges"].as_array().unwrap();
+		assert_eq!(rename_edits.len(), 1);
+		assert_eq!(rename_edits[0]["textDocument"]["uri"], uri.as_str());
+		assert_eq!(rename_edits[0]["textDocument"]["version"], 52);
+		assert_eq!(rename_edits[0]["edits"].as_array().unwrap().len(), 2);
+
 		let completion = request_value(&client, 14, Completion::METHOD, position(5, 5));
 		let completion_items = completion
 			.as_array()
@@ -948,6 +966,12 @@ mod tests {
 			.unwrap();
 		assert!(completion_items.iter().any(|item| item["label"] == "local"));
 		assert!(completion_items.iter().all(|item| item["label"] != "cycle"));
+		let ambient_completion = request_value(&client, 18, Completion::METHOD, position(5, 2));
+		let ambient_items = ambient_completion
+			.as_array()
+			.or_else(|| ambient_completion["items"].as_array())
+			.unwrap();
+		assert!(ambient_items.iter().any(|item| item["label"] == "Option"));
 
 		let tokens = request_value(
 			&client,
