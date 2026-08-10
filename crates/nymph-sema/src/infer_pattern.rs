@@ -175,7 +175,7 @@ impl Checker<'_> {
 				{
 					self.unify(shape, adt, span);
 				} else {
-					self.define_local(name.0.clone(), ty, mutable);
+					self.define_local(name.0.clone(), name.1, ty, mutable);
 					if !matches!(inner.0, Pattern::Placeholder) {
 						self.pattern(inner, ty, mutable);
 					}
@@ -267,7 +267,7 @@ impl Checker<'_> {
 						if let Some(Some(name)) = &rest_name {
 							let mid = elems[prefix.len()..suf_start].to_vec();
 							let rest_ty = self.interner.mk_tuple(mid);
-							self.define_local(name.0.clone(), rest_ty, mutable);
+							self.define_local(name.0.clone(), name.1, rest_ty, mutable);
 						}
 					}
 					_ => {
@@ -289,7 +289,7 @@ impl Checker<'_> {
 						}
 						if let Some(Some(name)) = &rest_name {
 							let rest_ty = self.fresh();
-							self.define_local(name.0.clone(), rest_ty, mutable);
+							self.define_local(name.0.clone(), name.1, rest_ty, mutable);
 						}
 					}
 				}
@@ -301,7 +301,9 @@ impl Checker<'_> {
 				for entry in entries {
 					match &entry.0 {
 						ListPatternEntry::Item(p) => self.pattern(p, elem, mutable),
-						ListPatternEntry::Rest(Some(name)) => self.define_local(name.0.clone(), list, mutable),
+						ListPatternEntry::Rest(Some(name)) => {
+							self.define_local(name.0.clone(), name.1, list, mutable);
+						}
 						ListPatternEntry::Rest(None) => {}
 					}
 				}
@@ -317,7 +319,9 @@ impl Checker<'_> {
 							self.pattern(k, key, mutable);
 							self.pattern(v, value, mutable);
 						}
-						MapPatternEntry::Rest(Some(name)) => self.define_local(name.0.clone(), map, mutable),
+						MapPatternEntry::Rest(Some(name)) => {
+							self.define_local(name.0.clone(), name.1, map, mutable);
+						}
 						MapPatternEntry::Rest(None) => {}
 					}
 				}
@@ -348,6 +352,10 @@ impl Checker<'_> {
 		// here, merge the names common to both alternatives and require their types
 		// to agree before exposing one binding to the arm body.
 		for (name, left_binding) in left_bindings {
+			let right_declaration = right_bindings
+				.get(&name)
+				.map(|binding| binding.declaration)
+				.unwrap_or(left_binding.declaration);
 			if let Some(right_binding) = right_bindings.remove(&name) {
 				// Binding mutability is inherited from the enclosing pattern today, but
 				// keep it part of the checked contract rather than relying on that AST
@@ -375,7 +383,13 @@ impl Checker<'_> {
 					);
 				}
 			}
-			self.define_local(name, left_binding.ty, mutable);
+			self.define_local_with_declarations(
+				name,
+				left_binding.declaration,
+				[left_binding.declaration, right_declaration],
+				left_binding.ty,
+				mutable,
+			);
 		}
 	}
 
@@ -388,6 +402,25 @@ impl Checker<'_> {
 		mutable: bool,
 	) {
 		let target = self.resolve_pattern_path(path, ty, span);
+		match target {
+			Some(PatternTarget::Struct(def)) => self.annotations.record_source_definition_target(
+				path.last().map_or(span, |name| name.1),
+				self.defs.stable(def),
+			),
+			Some(PatternTarget::Variant(enum_def, variant)) => {
+				let resolution = self.variant_resolution(enum_def, variant);
+				self.annotations.record_source_definition_target(
+					path.last().map_or(span, |name| name.1),
+					resolution.variant_target.as_ref(),
+				);
+				if path.len() > 1 {
+					self
+						.annotations
+						.record_source_definition_target(path[0].1, resolution.enum_target.as_ref());
+				}
+			}
+			None => {}
+		}
 		let field_tys = match target {
 			Some(PatternTarget::Struct(def)) => {
 				let inst = self.instantiate_struct(def);
@@ -435,7 +468,15 @@ impl Checker<'_> {
 			match &field.0 {
 				StructPatternField::Value { name, value } => {
 					match field_tys.iter().find(|(n, _, _)| n == &name.0) {
-						Some((_, fty, _)) => self.pattern(value, *fty, mutable),
+						Some((_, fty, target)) => {
+							// The left-hand token names the constructor field; the nested
+							// pattern may independently declare locals (including one with
+							// the same spelling).
+							self
+								.annotations
+								.record_source_definition_target(name.1, target.as_ref());
+							self.pattern(value, *fty, mutable);
+						}
 						None => self.emit(
 							name.1,
 							TypeError::UnknownField {
@@ -445,7 +486,12 @@ impl Checker<'_> {
 					}
 				}
 				StructPatternField::Named(name) => match field_tys.iter().find(|(n, _, _)| n == &name.0) {
-					Some((_, fty, _)) => self.define_local(name.0.clone(), *fty, mutable),
+					Some((_, fty, target)) => {
+						self
+							.annotations
+							.record_source_definition_target(name.1, target.as_ref());
+						self.define_local(name.0.clone(), name.1, *fty, mutable);
+					}
 					// Not a field of this constructor. On a SINGLE-field constructor a bare
 					// identifier is a positional sub-pattern against that sole field — a plain
 					// binding (`Ok(command)`) or a nullary-variant pattern (`Ok(None)`). Reuse
@@ -532,6 +578,9 @@ impl Checker<'_> {
 				{
 					// A nullary variant pattern (`None`): record its resolution for lowering.
 					let res = self.variant_resolution(enum_def, variant);
+					self
+						.annotations
+						.record_source_definition_target(span, res.variant_target.as_ref());
 					self.annotations.record_pattern_variant(span, res);
 					Some(self.instantiate_enum(enum_def).ty)
 				} else {

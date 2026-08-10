@@ -784,6 +784,9 @@ impl<'m> Checker<'m> {
 				self.infer_member_with_resolution(parent, &member.0, member.1, expr.id);
 			self.record(expr.id, ty, None);
 			if let Some(resolution) = resolution {
+				self
+					.annotations
+					.record_definition_target(expr.id, resolution.target.as_ref());
 				self.annotations.record_resolution(expr.id, resolution);
 			}
 			return ty;
@@ -1292,8 +1295,14 @@ impl<'m> Checker<'m> {
 	}
 
 	fn infer_identifier(&mut self, name: &str, span: Span, id: NodeId) -> Ty {
-		if let Some(binding) = self.lookup_local(name) {
-			return binding.ty;
+		if let Some((ty, declaration)) = self
+			.lookup_local(name)
+			.map(|binding| (binding.ty, binding.declaration))
+		{
+			self
+				.annotations
+				.record_local_definition_target(id, declaration);
+			return ty;
 		}
 		if let Some(def) = self.defs.get(name) {
 			return self.type_of_def(def, span, id);
@@ -1547,6 +1556,17 @@ impl<'m> Checker<'m> {
 			&& self.lookup_local(&type_name.0).is_none()
 			&& let Some(def) = self.defs.get(&type_name.0)
 		{
+			self
+				.annotations
+				.record_definition_target(parent.id, self.defs.stable(def));
+			if self.defs.stable(def).is_none()
+				&& let crate::DefOrigin::Imported { module } = &self.defs.data(def).origin
+				&& matches!(self.defs.data(def).kind, DefKind::Namespace)
+			{
+				self
+					.annotations
+					.record_module_target(parent.id, Some(module));
+			}
 			match self.defs.data(def).kind {
 				DefKind::Namespace => {
 					let namespace_module = match &self.defs.data(def).origin {
@@ -1667,6 +1687,9 @@ impl<'m> Checker<'m> {
 				.annotations
 				.record_generic_call_arguments(id, type_arguments);
 			if let Some((interface, member)) = target {
+				self
+					.annotations
+					.record_definition_target(func.id, Some(&member));
 				self.annotations.record_generic_namespaced_call(
 					id,
 					crate::annotate::GenericNamespacedCall {
@@ -1702,6 +1725,9 @@ impl<'m> Checker<'m> {
 			let arg_lits = arg_int_lits(args);
 			return match self.resolve_method(recv_dispatch, &member.0, &arg_tys, &arg_lits, member.1) {
 				Some(res) => {
+					self
+						.annotations
+						.record_definition_target(func.id, res.target.as_ref());
 					self
 						.annotations
 						.record_generic_call_arguments(id, res.type_arguments.clone());
@@ -1799,10 +1825,17 @@ impl<'m> Checker<'m> {
 		// Construction commits the exact obligations returned with the same
 		// substitution used for the fields below. Pattern callers intentionally
 		// leave those obligations undeferred.
-		let fields: Vec<(EcoString, Ty)> = sig
+		let fields: Vec<(EcoString, Ty, Option<crate::DefinitionId>)> = sig
 			.fields
 			.iter()
-			.map(|(n, t)| (n.clone(), self.subst(*t, &subst, None)))
+			.zip(&sig.field_metadata)
+			.map(|((n, t), metadata)| {
+				(
+					n.clone(),
+					self.subst(*t, &subst, None),
+					metadata.target.clone(),
+				)
+			})
 			.collect();
 		self.check_ctor_args(&fields, args);
 		adt
@@ -1843,10 +1876,17 @@ impl<'m> Checker<'m> {
 		let sig = self.sigs.enums[&enum_def].clone();
 		// Same reasoning as `infer_struct_ctor` above, for the enum's own bounds.
 		let vsig = sig.variants[variant].clone();
-		let fields: Vec<(EcoString, Ty)> = vsig
+		let fields: Vec<(EcoString, Ty, Option<crate::DefinitionId>)> = vsig
 			.fields
 			.iter()
-			.map(|(n, t)| (n.clone(), self.subst(*t, &subst, None)))
+			.zip(&vsig.field_metadata)
+			.map(|((n, t), metadata)| {
+				(
+					n.clone(),
+					self.subst(*t, &subst, None),
+					metadata.target.clone(),
+				)
+			})
 			.collect();
 		self.check_ctor_args(&fields, args);
 		adt
@@ -1854,12 +1894,21 @@ impl<'m> Checker<'m> {
 
 	/// Check constructor arguments against declared fields, by label when present
 	/// else positionally.
-	fn check_ctor_args(&mut self, fields: &[(EcoString, Ty)], args: &[Spanned<CallArg>]) {
+	fn check_ctor_args(
+		&mut self,
+		fields: &[(EcoString, Ty, Option<crate::DefinitionId>)],
+		args: &[Spanned<CallArg>],
+	) {
 		for (i, arg) in args.iter().enumerate() {
 			let call = &arg.0;
 			let target = if let Some(label) = &call.name {
-				match fields.iter().find(|(n, _)| n == &label.0) {
-					Some((_, ty)) => Some(*ty),
+				match fields.iter().find(|(n, ..)| n == &label.0) {
+					Some((_, ty, definition)) => {
+						self
+							.annotations
+							.record_source_definition_target(label.1, definition.as_ref());
+						Some(*ty)
+					}
 					None => {
 						self.emit(
 							label.1,
@@ -1872,7 +1921,7 @@ impl<'m> Checker<'m> {
 				}
 			} else {
 				match fields.get(i) {
-					Some((_, ty)) => Some(*ty),
+					Some((_, ty, _)) => Some(*ty),
 					None => {
 						self.emit(call.value.span, TypeError::TooManyFields);
 						None
@@ -1951,8 +2000,27 @@ impl<'m> Checker<'m> {
 		if let ExprKind::Identifier(name) = &parent.kind
 			&& self.lookup_local(&name.0).is_none()
 			&& let Some(def) = self.defs.get(&name.0)
+			&& matches!(
+				self.defs.data(def).kind,
+				DefKind::Namespace | DefKind::Struct | DefKind::Enum
+			) {
+			self
+				.annotations
+				.record_definition_target(parent.id, self.defs.stable(def));
+		}
+		if let ExprKind::Identifier(name) = &parent.kind
+			&& self.lookup_local(&name.0).is_none()
+			&& let Some(def) = self.defs.get(&name.0)
 			&& matches!(self.defs.data(def).kind, DefKind::Namespace)
 		{
+			let module = match (&self.defs.data(def).origin, self.defs.stable(def)) {
+				(crate::DefOrigin::Imported { module }, None) => Some(module.clone()),
+				(crate::DefOrigin::Local { .. }, _) => None,
+				(crate::DefOrigin::Imported { .. }, Some(_)) => None,
+			};
+			self
+				.annotations
+				.record_module_target(parent.id, module.as_ref());
 			return match self
 				.sigs
 				.namespaces

@@ -1247,36 +1247,61 @@ pub(crate) fn assign_runtime_body_identities(
 		}
 	}
 
-	let impl_mutability = checker
+	let implementation_sources = checker
 		.module
 		.members
 		.iter()
-		.filter_map(|declaration| match declaration {
-			Declaration::ImplFor { mutable, .. } => Some(*mutable),
+		.enumerate()
+		.filter_map(|(declaration, item)| match item {
+			Declaration::ImplFor {
+				mutable,
+				for_interface,
+				members,
+				..
+			} => Some(vec![(
+				for_interface.0.1,
+				crate::annotate::ImplementationSourcePath {
+					declaration: declaration as u32,
+					nested: None,
+				},
+				*mutable,
+				members,
+			)]),
+			Declaration::Struct { impls, .. } | Declaration::Enum { impls, .. } => Some(
+				impls
+					.iter()
+					.enumerate()
+					.map(|(nested, implementation)| {
+						(
+							implementation.0.interface.0.1,
+							crate::annotate::ImplementationSourcePath {
+								declaration: declaration as u32,
+								nested: Some(nested as u32),
+							},
+							false,
+							&implementation.0.members,
+						)
+					})
+					.collect(),
+			),
 			_ => None,
 		})
-		.chain(
-			checker
-				.module
-				.members
-				.iter()
-				.flat_map(|declaration| match declaration {
-					Declaration::Struct { impls, .. } | Declaration::Enum { impls, .. } => {
-						vec![false; impls.len()]
-					}
-					_ => Vec::new(),
-				}),
-		)
+		.flatten()
 		.collect::<Vec<_>>();
 	let mut implementation_ids = StableIdBuilder::new(identity.clone());
 	let snapshot = checker_snapshot(checker);
-	for (implementation, mutable) in checker
+	for implementation in checker
 		.impls
 		.impls
 		.iter_mut()
 		.filter(|implementation| implementation.definition.is_none())
-		.zip(impl_mutability)
 	{
+		let Some((_, _, mutable, _)) = implementation_sources
+			.iter()
+			.find(|(span, ..)| Some(*span) == implementation.legacy_span)
+		else {
+			continue;
+		};
 		let temporary = DefinitionId::new(
 			identity.clone(),
 			DeclarationKey::top_level(DeclarationCategory::Namespace, "$impl"),
@@ -1319,7 +1344,7 @@ pub(crate) fn assign_runtime_body_identities(
 				.map(|(name, ty)| (name.clone(), header_type(ty, &binders)))
 				.collect(),
 			self_type: header_type(&self_type, &binders),
-			mutable,
+			mutable: *mutable,
 			binders: (0..binders.len())
 				.map(|index| HeaderBinder {
 					parameter: HeaderParameterId(index as u32),
@@ -1443,60 +1468,31 @@ pub(crate) fn assign_runtime_body_identities(
 		}
 	}
 
-	let top_paths = checker
-		.module
-		.members
-		.iter()
-		.enumerate()
-		.filter_map(|(declaration, item)| {
-			matches!(item, Declaration::ImplFor { .. }).then_some(
-				crate::annotate::ImplementationSourcePath {
-					declaration: declaration as u32,
-					nested: None,
-				},
-			)
-		});
-	let nested_paths = checker
-		.module
-		.members
-		.iter()
-		.enumerate()
-		.flat_map(|(declaration, item)| match item {
-			Declaration::Struct { impls, .. } | Declaration::Enum { impls, .. } => impls
-				.iter()
-				.enumerate()
-				.map(
-					move |(index, _)| crate::annotate::ImplementationSourcePath {
-						declaration: declaration as u32,
-						nested: Some(index as u32),
-					},
-				)
-				.collect::<Vec<_>>(),
-			_ => Vec::new(),
-		});
-	let interface_paths = top_paths.chain(nested_paths).collect::<Vec<_>>();
 	let local_impls = checker.impls.impls.iter().filter(|implementation| {
 		implementation
 			.definition
 			.as_ref()
 			.is_some_and(|definition| definition.module == *identity)
 	});
-	for (path, implementation) in interface_paths.into_iter().zip(local_impls) {
+	for implementation in local_impls {
+		let Some((_, path, _, members)) = implementation_sources
+			.iter()
+			.find(|(span, ..)| Some(*span) == implementation.legacy_span)
+		else {
+			continue;
+		};
+		let path = *path;
 		if let Some(id) = &implementation.definition {
 			source_identities.implementations.insert(path, id.clone());
-			let members = match &checker.module.members[path.declaration as usize] {
-				Declaration::ImplFor { members, .. } => members,
-				Declaration::Struct { impls, .. } | Declaration::Enum { impls, .. } => {
-					&impls[path.nested.unwrap() as usize].0.members
-				}
-				_ => unreachable!(),
-			};
-			for (index, member) in members.iter().enumerate() {
-				let name = impl_member_name(&member.0);
-				let member_id = DefinitionId::new(
-					identity.clone(),
-					DeclarationKey::member(id.clone(), DeclarationCategory::Method, name),
-				);
+			for ((index, _), fact) in members
+				.iter()
+				.enumerate()
+				.filter(|(_, member)| impl_member_runtime_name(&member.0).is_some())
+				.zip(&implementation.runtime_members)
+			{
+				let Some(member_id) = fact.definition.clone() else {
+					continue;
+				};
 				source_identities.members.insert(
 					crate::annotate::ImplementationMemberSourcePath {
 						implementation: path,
@@ -1587,7 +1583,174 @@ pub(crate) fn assign_runtime_body_identities(
 				.all(|slot| &slot.implementation_id == implementation_id)
 		);
 	}
+	collect_declaration_provenance(checker, identity, &mut source_identities);
 	source_identities
+}
+
+/// Project exact checker identities back onto the declaration tokens in the
+/// AST while both structures are still available. The parallel walks below
+/// follow declaration structure; names are used only to index the signature
+/// fact belonging to that already-selected declaration, never to resolve an
+/// identity from source spelling.
+fn collect_declaration_provenance(
+	checker: &crate::check::Checker<'_>,
+	identity: &ModuleIdentity,
+	source: &mut crate::annotate::SourceIdentities,
+) {
+	let record_member = |source: &mut crate::annotate::SourceIdentities,
+	                     member: &ImplMember,
+	                     target: Option<&DefinitionId>| {
+		let span = match member {
+			ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => meta.name.1,
+			ImplMember::Let { meta, .. } | ImplMember::ExternalLet(_, _, meta) => match &meta.name.0 {
+				Pattern::Binding { name, .. } => name.1,
+				_ => return,
+			},
+		};
+		if let Some(target) = target {
+			source.declarations.insert(target.clone(), span);
+		}
+	};
+
+	let mut adt_inherent = checker
+		.inherent
+		.impls
+		.iter()
+		.filter(|implementation| !implementation.imported);
+	for (declaration_index, declaration) in checker.module.members.iter().enumerate() {
+		let def = checker
+			.defs
+			.defs
+			.iter()
+			.enumerate()
+			.find_map(|(index, data)| {
+				(checker.defs.local_member(crate::DefId(index as u32)) == Some(declaration_index)
+					&& data
+						.stable
+						.as_ref()
+						.is_some_and(|id| id.module == *identity))
+				.then_some(crate::DefId(index as u32))
+			});
+		match declaration {
+			Declaration::Namespace { members, .. } => {
+				let Some(signature) = def.and_then(|def| checker.sigs.namespaces.get(&def)) else {
+					continue;
+				};
+				for member in members {
+					let target = signature
+						.members
+						.get(&impl_member_name(&member.0))
+						.and_then(|sig| match sig {
+							crate::NamespaceMemberSig::Func { target, .. }
+							| crate::NamespaceMemberSig::Value { target, .. } => target.as_ref(),
+						});
+					record_member(source, &member.0, target);
+				}
+			}
+			Declaration::Interface { members, .. } => {
+				let Some(interface) = def.and_then(|def| checker.interfaces.get(&def)) else {
+					continue;
+				};
+				let elements = members.iter().filter_map(|member| {
+					let nymph_ast::decl::InterfaceMember::Element(element) = &member.0 else {
+						return None;
+					};
+					match &element.0 {
+						nymph_ast::decl::InterfaceElement::Func { .. } => Some(&element.0),
+						nymph_ast::decl::InterfaceElement::Let { meta, .. }
+							if matches!(&meta.name.0, Pattern::Binding { .. }) =>
+						{
+							Some(&element.0)
+						}
+						_ => None,
+					}
+				});
+				for (element, fact) in elements.zip(&interface.runtime_members) {
+					let span = match element {
+						nymph_ast::decl::InterfaceElement::Func { meta, .. } => meta.name.1,
+						nymph_ast::decl::InterfaceElement::Let { meta, .. } => match &meta.name.0 {
+							Pattern::Binding { name, .. } => name.1,
+							_ => continue,
+						},
+					};
+					if let Some(target) = &fact.definition {
+						source.declarations.insert(target.clone(), span);
+					}
+				}
+			}
+			Declaration::Struct {
+				fields, members, ..
+			} => {
+				if let Some(signature) = def.and_then(|def| checker.sigs.structs.get(&def)) {
+					for (field, metadata) in fields.iter().zip(&signature.field_metadata) {
+						if let Some(target) = &metadata.target {
+							source.declarations.insert(target.clone(), field.0.name.1);
+						}
+					}
+				}
+				if let Some(implementation) = adt_inherent.next() {
+					for member in members {
+						record_member(
+							source,
+							&member.0,
+							implementation
+								.methods
+								.get(&impl_member_name(&member.0))
+								.and_then(|m| m.definition.as_ref()),
+						);
+					}
+				}
+			}
+			Declaration::Enum {
+				variants, members, ..
+			} => {
+				if let Some(signature) = def.and_then(|def| checker.sigs.enums.get(&def)) {
+					for (variant, fact) in variants.iter().zip(&signature.variants) {
+						if let Some(target) = &fact.target {
+							source.declarations.insert(target.clone(), variant.0.name.1);
+						}
+						for (field, metadata) in variant.0.fields.iter().zip(&fact.field_metadata) {
+							if let Some(target) = &metadata.target {
+								source.declarations.insert(target.clone(), field.0.name.1);
+							}
+						}
+					}
+				}
+				if let Some(implementation) = adt_inherent.next() {
+					for member in members {
+						record_member(
+							source,
+							&member.0,
+							implementation
+								.methods
+								.get(&impl_member_name(&member.0))
+								.and_then(|m| m.definition.as_ref()),
+						);
+					}
+				}
+			}
+			_ => {}
+		}
+	}
+	let implementation_members = source
+		.members
+		.iter()
+		.map(|(path, target)| (*path, target.clone()))
+		.collect::<Vec<_>>();
+	for (path, target) in implementation_members {
+		let members = match &checker.module.members[path.implementation.declaration as usize] {
+			Declaration::Impl { members, .. } | Declaration::ImplFor { members, .. } => members,
+			Declaration::Struct { impls, .. } | Declaration::Enum { impls, .. } => {
+				&impls[path.implementation.nested.expect("nested implementation") as usize]
+					.0
+					.members
+			}
+			_ => continue,
+		};
+		if let Some(member) = members.get(path.member as usize) {
+			record_member(source, &member.0, Some(&target));
+		}
+	}
 }
 
 fn impl_member_name(member: &ImplMember) -> EcoString {
@@ -1597,6 +1760,15 @@ fn impl_member_name(member: &ImplMember) -> EcoString {
 			Pattern::Binding { name, .. } => name.0.clone(),
 			_ => "<pattern>".into(),
 		},
+	}
+}
+
+fn impl_member_runtime_name(member: &ImplMember) -> Option<&EcoString> {
+	match member {
+		ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => Some(&meta.name.0),
+		ImplMember::Let { meta, .. } | ImplMember::ExternalLet(_, _, meta) => {
+			meta.name.0.as_binding().map(|name| &name.0)
+		}
 	}
 }
 

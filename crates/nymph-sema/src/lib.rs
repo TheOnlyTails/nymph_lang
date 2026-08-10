@@ -44,7 +44,8 @@ mod stable_lowering;
 mod unify;
 
 pub use analysis::{
-	DeclarationProvenance, ModuleAnnotations, SemanticAnalysis, SemanticCheckResult,
+	DeclarationProvenance, ImportReferenceTarget, ModuleAnnotations, SemanticAnalysis,
+	SemanticCheckResult,
 };
 pub use annotate::{
 	Annotations, Checked, CheckedFacts, CheckedSemantic, DispatchKind, ExprInfo, IterMode, Resolution,

@@ -90,6 +90,27 @@ impl LineIndex {
 		line_end
 	}
 
+	/// Convert only an exactly representable LSP UTF-16 position. Unlike
+	/// [`Self::offset`], this rejects missing lines, columns past line content,
+	/// and positions in the middle of a surrogate pair.
+	#[must_use]
+	pub fn exact_offset(&self, text: &str, position: Position) -> Option<usize> {
+		let line = usize::try_from(position.line).ok()?;
+		let &line_start = self.line_starts.get(line)?;
+		let line_end = self.line_content_end(text, line);
+		let mut utf16 = 0_u32;
+		for (byte, ch) in text[line_start..line_end].char_indices() {
+			if utf16 == position.character {
+				return Some(line_start + byte);
+			}
+			utf16 += ch.len_utf16() as u32;
+			if utf16 > position.character {
+				return None;
+			}
+		}
+		(utf16 == position.character).then_some(line_end)
+	}
+
 	fn line_content_end(&self, text: &str, line: usize) -> usize {
 		let next_line_start = self.line_starts.get(line + 1).copied();
 		let line_end = next_line_start.unwrap_or(self.text_len).min(text.len());
@@ -124,6 +145,17 @@ mod tests {
 				character: 4
 			}
 		);
+	}
+
+	#[test]
+	fn exact_offset_rejects_clamping_and_surrogate_interior() {
+		let text = "a😀b\nend";
+		let idx = LineIndex::new(text);
+		assert_eq!(idx.exact_offset(text, Position::new(0, 1)), Some(1));
+		assert_eq!(idx.exact_offset(text, Position::new(0, 2)), None);
+		assert_eq!(idx.exact_offset(text, Position::new(0, 3)), Some(5));
+		assert_eq!(idx.exact_offset(text, Position::new(0, 99)), None);
+		assert_eq!(idx.exact_offset(text, Position::new(9, 0)), None);
 	}
 
 	#[test]

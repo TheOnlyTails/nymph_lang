@@ -69,6 +69,7 @@ pub struct DiagnosticsSnapshot {
 }
 
 pub struct AnalysisSnapshot {
+	pub uri: Uri,
 	pub project: ProjectId,
 	pub module: ModulePath,
 	/// Client sequence number used only to suppress responses after a newer
@@ -101,6 +102,13 @@ pub struct DefinitionTargetSnapshot {
 	pub uri: Uri,
 	pub source: Arc<str>,
 	pub span: nymph_ast::Span,
+	pub requires_disk_validation: bool,
+}
+
+pub struct ReferenceModuleSnapshot {
+	pub uri: Uri,
+	pub source: Arc<str>,
+	pub occurrences: Vec<nymph_sema::query::ReferenceOccurrence>,
 	pub requires_disk_validation: bool,
 }
 
@@ -395,6 +403,7 @@ impl CompilerState {
 		let source = analysis.source.clone();
 		let document_source = Arc::from(document.text.as_str());
 		Some(AnalysisSnapshot {
+			uri: uri.clone(),
 			project: identity.project.clone(),
 			module: identity.module.clone(),
 			document_version: document.version,
@@ -406,6 +415,90 @@ impl CompilerState {
 			root: identity.root.clone(),
 			without_prelude: identity.without_prelude,
 		})
+	}
+
+	/// Refresh filesystem-backed project membership before taking the snapshot
+	/// used by a project-wide references request. Open overlays remain
+	/// authoritative for their logical modules.
+	pub fn references_analysis_for_uri(
+		&mut self,
+		docs: &DocumentStore,
+		uri: &Uri,
+	) -> Option<AnalysisSnapshot> {
+		self.refresh_project_sources(docs, uri).ok()?;
+		self.analysis_for_uri(docs, uri)
+	}
+
+	fn refresh_project_sources(&mut self, docs: &DocumentStore, uri: &Uri) -> anyhow::Result<()> {
+		let Some(identity) = self.documents.get(uri).cloned() else {
+			return Ok(());
+		};
+		if !matches!(identity.kind, DocumentKind::Project(_)) {
+			return Ok(());
+		}
+
+		let mut disk_modules = BTreeMap::new();
+		for (path, module) in nymph_files(&identity.root)? {
+			let source = fs::read_to_string(&path)?;
+			disk_modules.insert(module, (path, source));
+		}
+		let disk_identities: HashSet<_> = disk_modules
+			.keys()
+			.map(|module| ModuleIdentity {
+				project: identity.project.clone(),
+				module: module.clone(),
+				without_prelude: identity.without_prelude,
+			})
+			.collect();
+		let known_identities: HashSet<_> = self
+			.documents
+			.values()
+			.filter(|candidate| {
+				candidate.project == identity.project
+					&& candidate.root == identity.root
+					&& candidate.without_prelude == identity.without_prelude
+					&& matches!(candidate.kind, DocumentKind::Project(_))
+			})
+			.map(DocumentIdentity::module_identity)
+			.collect();
+		let mut removed = HashSet::new();
+		for known in known_identities {
+			let has_open_overlay = self
+				.authoritative_overlays
+				.get(&known)
+				.is_some_and(|open_uri| docs.get(open_uri).is_some());
+			if !disk_identities.contains(&known) && !has_open_overlay {
+				self.authoritative_overlays.remove(&known);
+				self.remove_effective_source(&known);
+				removed.insert(known);
+			}
+		}
+		self.documents.retain(|document_uri, candidate| {
+			docs.get(document_uri).is_some() || !removed.contains(&candidate.module_identity())
+		});
+
+		for (module, (path, source)) in disk_modules {
+			let disk_identity = DocumentIdentity {
+				project: identity.project.clone(),
+				module: module.clone(),
+				entry: module,
+				root: identity.root.clone(),
+				without_prelude: identity.without_prelude,
+				kind: DocumentKind::Project(path.clone()),
+			};
+			let module_identity = disk_identity.module_identity();
+			let has_open_overlay = self
+				.authoritative_overlays
+				.get(&module_identity)
+				.is_some_and(|open_uri| docs.get(open_uri).is_some());
+			if !has_open_overlay {
+				self.set_effective_source(&module_identity, source, SourceVersion(0));
+			}
+			if let Some(disk_uri) = workspace::path_to_uri(&path) {
+				self.documents.entry(disk_uri).or_insert(disk_identity);
+			}
+		}
+		Ok(())
 	}
 
 	pub fn completion_for_uri(&self, docs: &DocumentStore, uri: &Uri) -> Option<CompletionSnapshot> {
@@ -495,6 +588,88 @@ impl CompilerState {
 			span,
 			requires_disk_validation: !target_is_open,
 		})
+	}
+
+	/// Collect semantic occurrences from the complete immutable project analysis
+	/// that produced `snapshot`. Local identities stay isolated to their owner
+	/// module; stable definitions are compared across every reachable module.
+	pub fn reference_modules(
+		&self,
+		docs: &DocumentStore,
+		snapshot: &AnalysisSnapshot,
+		symbol: &nymph_sema::query::SymbolIdentity,
+	) -> Option<Vec<ReferenceModuleSnapshot>> {
+		if docs.revision() != snapshot.document_revision || snapshot.source != snapshot.document_source
+		{
+			return None;
+		}
+		let session = if snapshot.without_prelude {
+			&self.stdlib_session
+		} else {
+			&self.session
+		};
+		let analyses = match symbol {
+			nymph_sema::query::SymbolIdentity::Definition(_)
+			| nymph_sema::query::SymbolIdentity::Module(_) => session.tooling_project_analyses(
+				snapshot.project.clone(),
+				snapshot.entry.clone(),
+				!snapshot.without_prelude,
+			),
+			nymph_sema::query::SymbolIdentity::Local(_) => {
+				vec![(
+					snapshot.module.clone(),
+					snapshot.source.clone(),
+					Some(snapshot.analysis.clone()),
+				)]
+			}
+		};
+		let mut modules = Vec::new();
+		for (module, source, analysis) in analyses {
+			let occurrences = analysis.as_ref().map_or_else(Vec::new, |analysis| {
+				nymph_sema::query::references_to(&analysis.semantic, symbol)
+			});
+			let overlay_uri = self.documents.iter().find_map(|(uri, identity)| {
+				(identity.project == snapshot.project
+					&& identity.module == module
+					&& identity.without_prelude == snapshot.without_prelude
+					&& self
+						.authoritative_overlays
+						.values()
+						.any(|authoritative| authoritative == uri)
+					&& docs.get(uri).is_some())
+				.then_some(uri)
+			});
+			let uri = if let Some(uri) = overlay_uri {
+				uri.clone()
+			} else if module == snapshot.module
+				&& !matches!(
+					self.documents.get(&snapshot.uri)?.kind,
+					DocumentKind::Project(_)
+				) {
+				snapshot.uri.clone()
+			} else {
+				workspace::key_to_uri(&snapshot.root, module.as_str())?
+			};
+			if occurrences
+				.iter()
+				.any(|occurrence| !valid_source_span(&source, occurrence.span))
+			{
+				return None;
+			}
+			let target_is_open = self.documents.iter().any(|(open_uri, identity)| {
+				identity.project == snapshot.project
+					&& identity.module == module
+					&& identity.without_prelude == snapshot.without_prelude
+					&& docs.get(open_uri).is_some()
+			});
+			modules.push(ReferenceModuleSnapshot {
+				uri,
+				source,
+				occurrences,
+				requires_disk_validation: !target_is_open,
+			});
+		}
+		Some(modules)
 	}
 
 	pub fn diagnostics_for_uri(
@@ -742,9 +917,9 @@ impl CompilerState {
 	}
 
 	fn synchronize(&mut self, docs: &DocumentStore, uri: &Uri) -> anyhow::Result<()> {
-		// Filesystem discovery is intentionally tied to the first project open.
-		// Without a watcher, later external adds/deletes of unopened files are
-		// not events; opening a file still overlays or adds its live source.
+		// Notification-driven discovery is tied to the first project open;
+		// project-wide reference requests explicitly refresh filesystem
+		// membership, while opening a file always overlays or adds its live source.
 		let previous_identity = self.documents.get(uri).cloned();
 		let class = match workspace::classify_uri(uri) {
 			Err(error) => {

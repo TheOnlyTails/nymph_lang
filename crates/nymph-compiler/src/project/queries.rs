@@ -317,6 +317,7 @@ pub type DirectImports = [DirectImport];
 pub(crate) struct ResolvedModuleImports {
 	pub bindings: FxHashMap<ecow::EcoString, nymph_sema::ResolvedImportBinding>,
 	pub namespaces: Vec<(ecow::EcoString, nymph_sema::ModuleIdentity)>,
+	pub references: Vec<(Span, nymph_sema::ImportReferenceTarget)>,
 	pub diagnostics: Arc<[ProjectDiagnostic]>,
 }
 
@@ -451,6 +452,7 @@ pub(crate) fn resolved_module_imports<'db>(
 		.collect::<FxHashMap<_, _>>();
 	let mut bindings = FxHashMap::default();
 	let mut namespaces = Vec::new();
+	let mut references = Vec::new();
 	let mut diagnostic_causes = Vec::new();
 	let owner = module.display_key(db);
 	for import in graph.semantic_direct_imports(db, module).iter() {
@@ -482,6 +484,10 @@ pub(crate) fn resolved_module_imports<'db>(
 				import.namespace.1,
 				nymph_sema::ResolvedImportBinding::Namespace(identity.clone()),
 			) {
+			references.push((
+				import.namespace.1,
+				nymph_sema::ImportReferenceTarget::Module(identity.clone()),
+			));
 			namespaces.push((namespace, identity));
 		}
 		let selected = if import.has_with_list {
@@ -489,10 +495,15 @@ pub(crate) fn resolved_module_imports<'db>(
 				.with_idents
 				.iter()
 				.map(|(source, alias)| {
+					let mut spans = vec![source.1];
+					if let Some(alias) = alias {
+						spans.push(alias.1);
+					}
 					(
 						source.0.clone(),
 						alias.as_ref().unwrap_or(source).0.clone(),
 						source.1,
+						spans,
 					)
 				})
 				.collect::<Vec<_>>()
@@ -512,23 +523,31 @@ pub(crate) fn resolved_module_imports<'db>(
 						declaration.name.clone(),
 						declaration.name.clone(),
 						import.namespace.1,
+						Vec::new(),
 					)
 				})
 				.collect::<Vec<_>>()
 		};
-		for (source, local, span) in selected {
+		for (source, local, span, written_spans) in selected {
 			match summary.declaration(&source) {
 				Some(declaration)
 					if declaration.visibility == nymph_sema::NamespaceVisibility::Importable =>
 				{
-					insert_import_binding(
+					if insert_import_binding(
 						&mut bindings,
 						&locals,
 						&mut diagnostic_causes,
 						local,
 						span,
 						nymph_sema::ResolvedImportBinding::Definition(declaration.definition.clone()),
-					);
+					) {
+						references.extend(written_spans.into_iter().map(|span| {
+							(
+								span,
+								nymph_sema::ImportReferenceTarget::Definition(declaration.definition.clone()),
+							)
+						}));
+					}
 				}
 				Some(declaration) => {
 					diagnostic_causes.push(ImportDiagnosticCause::PrivateName {
@@ -543,6 +562,7 @@ pub(crate) fn resolved_module_imports<'db>(
 	Arc::new(ResolvedModuleImports {
 		bindings,
 		namespaces,
+		references,
 		diagnostics: diagnostic_causes
 			.into_iter()
 			.map(|cause| cause.render(&owner))
@@ -2376,12 +2396,14 @@ pub(crate) fn interface_module_analysis<'db>(
 			});
 		}
 	}
+	let mut semantic = result.analysis.as_ref().clone();
+	semantic.import_references = resolved.references.clone().into();
 	Arc::new(super::session::ModuleAnalysis {
 		source: match module {
 			SemanticModuleInput::Project(module) => module.source(db).unwrap_or_default(),
 			SemanticModuleInput::Builtin(module) => module.source(db),
 		},
-		semantic: result.analysis,
+		semantic: Arc::new(semantic),
 		diagnostics: super::session::ProjectDiagnostics(diagnostics.into()),
 	})
 }
