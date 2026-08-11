@@ -1,6 +1,5 @@
-use std::io::{BufRead, IsTerminal, Write};
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::io::{BufRead, BufReader, IsTerminal, Write};
+use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
 
 use crate::NymphCommand;
 use crate::compile_guard::{guarded, unsupported_feature_message};
@@ -29,6 +28,13 @@ impl NymphCommand for ReplCommand {
 			.map_or_else(nymph_compiler::ReplSession::loose, |root| {
 				nymph_compiler::ReplSession::new(fs_loader(root))
 			});
+		let mut worker = match ReplWorker::start() {
+			Ok(worker) => worker,
+			Err(error) => {
+				eprintln!("error: could not start REPL runtime: {error}");
+				return 1;
+			}
+		};
 
 		let stdin = std::io::stdin();
 		let interactive = stdin.is_terminal();
@@ -86,11 +92,9 @@ impl NymphCommand for ReplCommand {
 					continue;
 				}
 			};
-			let runtime = execute(&staged.execution_js());
+			let runtime = worker.execute(&staged);
 			if runtime.success {
-				print!("{}", runtime.stdout);
-				let _ = std::io::stdout().flush();
-				session.commit(staged);
+				session.commit(staged, &runtime.retained_modules);
 			} else {
 				eprintln!("error: REPL submission failed at runtime");
 				if let Some(message) = runtime_error_message(&runtime.stderr) {
@@ -143,36 +147,219 @@ fn render_error(error: &nymph_compiler::ReplStageError, src_root: Option<&std::p
 
 struct RuntimeOutput {
 	success: bool,
-	stdout: String,
 	stderr: String,
+	retained_modules: Vec<String>,
 }
 
-fn execute(js: &str) -> RuntimeOutput {
-	static COUNTER: AtomicU64 = AtomicU64::new(0);
-	let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-	let path = std::env::temp_dir().join(format!(
-		"nymph_cli_repl_{}_{unique}.mjs",
-		std::process::id()
-	));
-	if let Err(error) = std::fs::write(&path, js) {
-		return RuntimeOutput {
-			success: false,
-			stdout: String::new(),
-			stderr: format!("error: could not write {}: {error}\n", path.display()),
-		};
+struct ReplWorker {
+	child: Child,
+	input: Option<ChildStdin>,
+	output: BufReader<ChildStderr>,
+}
+
+impl ReplWorker {
+	fn start() -> std::io::Result<Self> {
+		let mut child = Command::new("node")
+			.args([
+				"--experimental-vm-modules",
+				"--no-warnings",
+				"--input-type=module",
+				"--eval",
+				include_str!("repl_worker.mjs"),
+			])
+			.stdin(Stdio::piped())
+			.stdout(Stdio::inherit())
+			.stderr(Stdio::piped())
+			.spawn()?;
+		let input = child.stdin.take().expect("piped worker stdin");
+		let output = BufReader::new(child.stderr.take().expect("piped worker stderr"));
+		Ok(Self {
+			child,
+			input: Some(input),
+			output,
+		})
 	}
-	let output = Command::new("node").arg(&path).output();
-	let _ = std::fs::remove_file(path);
-	match output {
-		Ok(output) => RuntimeOutput {
-			success: output.status.success(),
-			stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-			stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-		},
-		Err(error) => RuntimeOutput {
-			success: false,
-			stdout: String::new(),
-			stderr: format!("error: could not run node: {error}\n"),
-		},
+
+	fn execute(&mut self, staged: &nymph_compiler::StagedReplSubmission) -> RuntimeOutput {
+		self.execute_request(staged.entry(), staged.render_symbol(), staged.modules())
+	}
+
+	fn execute_request(
+		&mut self,
+		entry: &str,
+		render: Option<&str>,
+		modules: &std::collections::BTreeMap<String, String>,
+	) -> RuntimeOutput {
+		const PREFIX: &str = "\u{1e}nymph-repl:";
+		let request = serde_json::json!({
+			"entry": entry,
+			"render": render,
+			"modules": modules,
+		});
+		let Some(input) = &mut self.input else {
+			return RuntimeOutput {
+				success: false,
+				stderr: "REPL runtime worker is closed".to_string(),
+				retained_modules: Vec::new(),
+			};
+		};
+		if writeln!(input, "{request}")
+			.and_then(|()| input.flush())
+			.is_err()
+		{
+			return RuntimeOutput {
+				success: false,
+				stderr: "REPL runtime worker closed its input".to_string(),
+				retained_modules: Vec::new(),
+			};
+		}
+		loop {
+			let mut line = String::new();
+			match self.output.read_line(&mut line) {
+				Ok(0) => {
+					return RuntimeOutput {
+						success: false,
+						stderr: "REPL runtime worker exited unexpectedly".to_string(),
+						retained_modules: Vec::new(),
+					};
+				}
+				Ok(_) => {
+					let Some(response) = line.strip_prefix(PREFIX) else {
+						eprint!("{line}");
+						continue;
+					};
+					match serde_json::from_str::<serde_json::Value>(response) {
+						Ok(response) => {
+							let success = response["ok"].as_bool().unwrap_or(false);
+							let stderr = response["error"].as_str().unwrap_or_default().to_string();
+							let retained_modules = response["retained"]
+								.as_array()
+								.into_iter()
+								.flatten()
+								.filter_map(|key| key.as_str().map(str::to_string))
+								.collect();
+							return RuntimeOutput {
+								success,
+								stderr,
+								retained_modules,
+							};
+						}
+						Err(error) => {
+							return RuntimeOutput {
+								success: false,
+								stderr: format!("invalid REPL runtime response: {error}"),
+								retained_modules: Vec::new(),
+							};
+						}
+					}
+				}
+				Err(error) => {
+					return RuntimeOutput {
+						success: false,
+						stderr: format!("could not read REPL runtime response: {error}"),
+						retained_modules: Vec::new(),
+					};
+				}
+			}
+		}
+	}
+}
+
+impl Drop for ReplWorker {
+	fn drop(&mut self) {
+		drop(self.input.take());
+		if !matches!(self.child.try_wait(), Ok(Some(_))) {
+			let _ = self.child.kill();
+		}
+		let _ = self.child.wait();
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::BTreeMap;
+
+	use super::ReplWorker;
+
+	#[test]
+	fn failed_first_load_modules_are_evicted_and_can_be_retried() {
+		let mut worker = ReplWorker::start().unwrap();
+		let failed = BTreeMap::from([
+			(
+				"dependency".to_string(),
+				"throw new Error('first load fails');".to_string(),
+			),
+			(
+				"entry".to_string(),
+				"import 'dependency'; export function render() { return { v: 'unreachable' }; }"
+					.to_string(),
+			),
+		]);
+		assert!(
+			!worker
+				.execute_request("entry", Some("render"), &failed)
+				.success
+		);
+
+		let retry = BTreeMap::from([
+			("dependency".to_string(), "export const value = 42;".to_string()),
+			(
+				"entry".to_string(),
+				"import { value } from 'dependency'; export function render() { return { v: String(value) }; }"
+					.to_string(),
+			),
+		]);
+		assert!(
+			worker
+				.execute_request("entry", Some("render"), &retry)
+				.success
+		);
+	}
+
+	#[test]
+	fn strict_worker_rejects_async_render_results() {
+		let mut worker = ReplWorker::start().unwrap();
+		let modules = BTreeMap::from([(
+			"entry".to_string(),
+			"export function render() { return Promise.resolve({ v: 'late' }); }".to_string(),
+		)]);
+		let output = worker.execute_request("entry", Some("render"), &modules);
+		assert!(!output.success);
+		assert!(
+			output
+				.stderr
+				.contains("asynchronous REPL rendering is disabled")
+		);
+	}
+
+	#[test]
+	fn successful_requests_do_not_retain_unlinked_supplied_modules() {
+		let mut worker = ReplWorker::start().unwrap();
+		let first = BTreeMap::from([
+			("entry".to_string(), "export const value = 1;".to_string()),
+			("unused".to_string(), "export const old = 1;".to_string()),
+		]);
+		let output = worker.execute_request("entry", None, &first);
+		assert!(output.success, "{}", output.stderr);
+		assert!(!output.retained_modules.contains(&"unused".to_string()));
+
+		let second = BTreeMap::from([
+			(
+				"entry_2".to_string(),
+				"import { fresh } from 'unused'; export const value = fresh;".to_string(),
+			),
+			("unused".to_string(), "export const fresh = 2;".to_string()),
+		]);
+		let output = worker.execute_request("entry_2", None, &second);
+		assert!(output.success, "{}", output.stderr);
+	}
+
+	#[test]
+	#[cfg(target_os = "linux")]
+	fn dropping_worker_reaps_the_node_process() {
+		let worker = ReplWorker::start().unwrap();
+		let pid = worker.child.id();
+		drop(worker);
+		assert!(!std::path::Path::new(&format!("/proc/{pid}")).exists());
 	}
 }

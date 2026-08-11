@@ -55,6 +55,19 @@ declare module "std/box" {
 	export function structuralHash(value: unknown): number;
 	export function structuralDisplay(value: unknown): string;
 	export function structuralDebug(value: unknown): string;
+	export function nymphTransactionBegin(): void;
+	export function nymphTransactionCommit(): void;
+	export function nymphTransactionRollback(): void;
+	export function nymphArraySplice<T>(
+		array: T[],
+		start: number,
+		deleteCount: number,
+		...items: T[]
+	): T[];
+	export function nymphArrayPush<T>(array: T[], ...items: T[]): number;
+	export function nymphArrayPop<T>(array: T[]): T | undefined;
+	export function nymphArraySetLength<T>(array: T[], length: number): number;
+	export function nymphSetPrototypeOf<T extends object>(object: T, prototype: object): T;
 }
 
 declare module "std/option" {

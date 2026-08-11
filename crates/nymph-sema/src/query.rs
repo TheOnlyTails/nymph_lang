@@ -93,6 +93,7 @@ pub fn member_completions_at(
 /// checker-local IDs and resolver internals remain private to sema/compiler.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImportedNameKind {
+	ModuleNamespace,
 	Function,
 	Value,
 	Variable,
@@ -127,7 +128,7 @@ pub fn imported_names(
 		.iter()
 		.filter_map(|(name, binding)| {
 			let kind = match binding {
-				ResolvedImportBinding::Namespace(_) => ImportedNameKind::Namespace,
+				ResolvedImportBinding::Namespace(_) => ImportedNameKind::ModuleNamespace,
 				ResolvedImportBinding::Poison => return None,
 				ResolvedImportBinding::Definition(definition) => match &definition.key {
 					DeclarationKey::TopLevel { category, .. } | DeclarationKey::Member { category, .. } => {
@@ -5893,7 +5894,7 @@ mod imported_name_tests {
 				},
 				ImportedName {
 					name: "dependency".into(),
-					kind: ImportedNameKind::Namespace,
+					kind: ImportedNameKind::ModuleNamespace,
 				},
 				ImportedName {
 					name: "renamed".into(),

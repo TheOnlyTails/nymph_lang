@@ -150,6 +150,10 @@ pub struct Emitter<'a> {
 	/// prepended import order — and therefore the emitted JS text — stays
 	/// stable across runs, which the golden/e2e tests rely on.
 	needed_imports: std::cell::RefCell<std::collections::BTreeSet<(String, String, String)>>,
+	/// Imports supplied by project linking rather than discovered from an
+	/// `ExternCall`/`ExternValue`. Strict REPL validation subtracts these before
+	/// applying the host-effect policy to the exact emitted external inventory.
+	provided_imports: std::collections::BTreeSet<(String, String, String)>,
 	/// Runtime bindings referenced by emitted code. Standalone emission prepends
 	/// the inline runtime when this is non-empty; project emission imports only
 	/// these bindings from the canonical `std/box` virtual module.
@@ -165,6 +169,8 @@ pub struct Emitter<'a> {
 	block_completion_tokens: std::cell::RefCell<Vec<(nymph_hir::hir::BlockTarget, &'a str)>>,
 	import_box_runtime: bool,
 	current_module: Option<String>,
+	transactional: bool,
+	cell_scopes: std::cell::RefCell<Vec<std::collections::BTreeMap<String, bool>>>,
 }
 
 impl<'a> Emitter<'a> {
@@ -175,12 +181,15 @@ impl<'a> Emitter<'a> {
 			completion_gensym: std::cell::Cell::new(0),
 			in_iife_subexpr: std::cell::Cell::new(false),
 			needed_imports: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+			provided_imports: std::collections::BTreeSet::new(),
 			box_runtime_bindings: std::cell::RefCell::new(std::collections::BTreeSet::new()),
 			loop_completion_tokens: std::cell::RefCell::new(Vec::new()),
 			return_completion_tokens: std::cell::RefCell::new(Vec::new()),
 			block_completion_tokens: std::cell::RefCell::new(Vec::new()),
 			import_box_runtime: false,
 			current_module: None,
+			transactional: false,
+			cell_scopes: std::cell::RefCell::new(vec![std::collections::BTreeMap::new()]),
 		}
 	}
 
@@ -196,12 +205,148 @@ impl<'a> Emitter<'a> {
 		emitter
 	}
 
+	pub fn for_transactional_project_module(
+		alloc: &'a Allocator,
+		module: &str,
+		imported_top_level_lets: &[String],
+	) -> Self {
+		let mut emitter = Self::for_project_module(alloc, module);
+		emitter.transactional = true;
+		emitter.cell_scopes.get_mut()[0].extend(
+			imported_top_level_lets
+				.iter()
+				.cloned()
+				.map(|name| (name, true)),
+		);
+		emitter
+	}
+
+	fn push_cell_scope(&self, non_cells: &[EcoString]) {
+		if self.transactional {
+			self.cell_scopes.borrow_mut().push(
+				non_cells
+					.iter()
+					.map(|name| (name.to_string(), false))
+					.collect(),
+			);
+		}
+	}
+
+	/// Enter a callable scope and choose its JavaScript formal names. Transactional
+	/// user parameters are represented by cells under their source names, so the
+	/// incoming values first need compiler-private raw bindings. Hidden runtime
+	/// type parameters remain ordinary values.
+	fn push_param_cell_scope(&self, params: &[EcoString]) -> Vec<String> {
+		if !self.transactional {
+			self.push_cell_scope(params);
+			return params.iter().map(ToString::to_string).collect();
+		}
+
+		let mut scope = std::collections::BTreeMap::new();
+		let js_params = params
+			.iter()
+			.map(|param| {
+				let is_hidden_type = param.starts_with("$type$");
+				scope.insert(param.to_string(), !is_hidden_type);
+				if is_hidden_type {
+					param.to_string()
+				} else {
+					self.gensym()
+				}
+			})
+			.collect();
+		self.cell_scopes.borrow_mut().push(scope);
+		js_params
+	}
+
+	/// Emit `const param = nymphCell(raw);` for transactional user parameters.
+	fn param_cell_prologue(
+		&self,
+		params: &[EcoString],
+		js_params: &[String],
+	) -> ArenaVec<'a, Statement<'a>> {
+		let mut stmts = ArenaVec::new_in(&self.ast);
+		if !self.transactional {
+			return stmts;
+		}
+		for (param, raw) in params.iter().zip(js_params) {
+			if param.starts_with("$type$") {
+				continue;
+			}
+			let init = self.transaction_call(
+				"nymphCell",
+				vec![Expression::new_identifier(
+					SPAN,
+					self.ast.allocator.alloc_str(raw),
+					&self.ast,
+				)],
+			);
+			stmts.push(self.const_decl(param, init));
+		}
+		stmts
+	}
+
+	fn pop_cell_scope(&self) {
+		if self.transactional {
+			assert!(self.cell_scopes.borrow_mut().pop().is_some());
+		}
+	}
+
+	fn bind_cell(&self, name: &str) {
+		if self.transactional {
+			self
+				.cell_scopes
+				.borrow_mut()
+				.last_mut()
+				.expect("transactional cell scope")
+				.insert(name.to_string(), true);
+		}
+	}
+
+	fn is_cell(&self, name: &str) -> bool {
+		self.transactional
+			&& self
+				.cell_scopes
+				.borrow()
+				.iter()
+				.rev()
+				.find_map(|scope| scope.get(name).copied())
+				.unwrap_or(false)
+	}
+
+	fn transaction_call(&self, helper: &str, args: Vec<Expression<'a>>) -> Expression<'a> {
+		self
+			.box_runtime_bindings
+			.borrow_mut()
+			.insert(helper.to_string());
+		let mut arguments = ArenaVec::new_in(&self.ast);
+		arguments.extend(args.into_iter().map(Argument::from));
+		Expression::new_call_expression(
+			SPAN,
+			Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(helper), &self.ast),
+			oxc::ast::NONE,
+			arguments,
+			false,
+			&self.ast,
+		)
+	}
+
 	pub(crate) fn with_needed_imports(mut self, imports: &[(String, String, String)]) -> Self {
+		self.provided_imports.extend(imports.iter().cloned());
 		self
 			.needed_imports
 			.get_mut()
 			.extend(imports.iter().cloned());
 		self
+	}
+
+	pub(crate) fn unaudited_external(&self) -> Option<(String, String)> {
+		self.needed_imports.borrow().iter().find_map(|import| {
+			(!self.provided_imports.contains(import)
+				&& nymph_hir::linkage::external_effect(&import.0, &import.1)
+					== nymph_hir::linkage::ExternalEffect::UnauditedStateful)
+				.then(|| (import.0.clone(), import.1.clone()))
+		})
 	}
 
 	/// A fresh compiler-reserved temporary name. `$` is not valid in a Nymph
@@ -219,6 +364,10 @@ impl<'a> Emitter<'a> {
 	}
 
 	pub fn emit_module(&self, module: &HirModule) -> String {
+		if self.transactional {
+			self.cell_scopes.borrow_mut()[0]
+				.extend(module.lets.iter().map(|item| (item.name.to_string(), true)));
+		}
 		let mut stmts = ArenaVec::new_in(&self.ast);
 		// The shared discriminant symbol, emitted once if the module has any enum.
 		if !module.enums.is_empty() {
@@ -357,6 +506,7 @@ impl<'a> Emitter<'a> {
 		// When the body is itself a `Block`, emit its statements directly into the
 		// function body (followed by `return <tail>;`) instead of wrapping them in a
 		// needless IIFE via `emit_expr`/`into_expression`.
+		let raw_params = self.push_param_cell_scope(&func.params);
 		let return_token = self.begin_return_completion();
 		let mut body_stmts = ArenaVec::new_in(&self.ast);
 		match &func.body {
@@ -379,8 +529,12 @@ impl<'a> Emitter<'a> {
 			}
 		}
 		let body_stmts = self.finish_return_completion(return_token, body_stmts);
+		let mut prologue = self.param_cell_prologue(&func.params, &raw_params);
+		prologue.extend(body_stmts);
+		let body_stmts = prologue;
+		self.pop_cell_scope();
 		let mut js_params = ArenaVec::new_in(&self.ast);
-		for param in &func.params {
+		for param in &raw_params {
 			let binding_pattern = BindingPattern::BindingIdentifier(BindingIdentifier::boxed(
 				SPAN,
 				self.ast.allocator.alloc_str(param),
@@ -422,12 +576,24 @@ impl<'a> Emitter<'a> {
 	/// `emit_stmt`, generalizing the const-only `const_decl` helper for the `let
 	/// mut` case (the checker accepts top-level `let mut`, so codegen honors it).
 	fn emit_module_let(&self, let_: &HirLet) -> Statement<'a> {
-		let kind = if let_.mutable {
+		let kind = if self.transactional {
+			VariableDeclarationKind::Const
+		} else if let_.mutable {
 			VariableDeclarationKind::Let
 		} else {
 			VariableDeclarationKind::Const
 		};
-		let init = self.emit_expr(&let_.value);
+		let mut init = self.emit_expr(&let_.value);
+		if self.transactional {
+			self
+				.box_runtime_bindings
+				.borrow_mut()
+				.insert("nymphCell".to_string());
+			init = self.call1(
+				Expression::new_identifier(SPAN, "nymphCell", &self.ast),
+				init,
+			);
+		}
 		let pat = BindingPattern::new_binding_identifier(
 			SPAN,
 			self.ast.allocator.alloc_str(&let_.name),
@@ -462,13 +628,21 @@ impl<'a> Emitter<'a> {
 	/// validation are deferred to a later slice.
 	fn emit_class(&self, class: &HirClass) -> Statement<'a> {
 		// Object.assign(this, fields)
-		let object_assign = Expression::StaticMemberExpression(StaticMemberExpression::boxed(
-			SPAN,
-			Expression::Identifier(IdentifierReference::boxed(SPAN, "Object", &self.ast)),
-			IdentifierName::new(SPAN, "assign", &self.ast),
-			false,
-			&self.ast,
-		));
+		let object_assign = if self.transactional {
+			self
+				.box_runtime_bindings
+				.borrow_mut()
+				.insert("nymphAssign".to_string());
+			Expression::new_identifier(SPAN, "nymphAssign", &self.ast)
+		} else {
+			Expression::StaticMemberExpression(StaticMemberExpression::boxed(
+				SPAN,
+				Expression::Identifier(IdentifierReference::boxed(SPAN, "Object", &self.ast)),
+				IdentifierName::new(SPAN, "assign", &self.ast),
+				false,
+				&self.ast,
+			))
+		};
 		let mut call_args = ArenaVec::new_in(&self.ast);
 		call_args.push(Argument::from(Expression::ThisExpression(
 			ThisExpression::boxed(SPAN, &self.ast),
@@ -541,10 +715,15 @@ impl<'a> Emitter<'a> {
 			elements.push(self.emit_method(method, true));
 		}
 		let body = ClassBody::new(SPAN, elements, &self.ast);
+		let class_name = class.name.to_string();
 		let name = BindingIdentifier::new(SPAN, self.ast.allocator.alloc_str(&class.name), &self.ast);
 		let class = Class::boxed(
 			SPAN,
-			ClassType::ClassDeclaration,
+			if self.transactional {
+				ClassType::ClassExpression
+			} else {
+				ClassType::ClassDeclaration
+			},
 			ArenaVec::new_in(&self.ast),
 			Some(name),
 			oxc::ast::NONE,
@@ -556,7 +735,50 @@ impl<'a> Emitter<'a> {
 			false,
 			&self.ast,
 		);
-		Statement::ClassDeclaration(class)
+		if !self.transactional {
+			return Statement::ClassDeclaration(class);
+		}
+		self
+			.box_runtime_bindings
+			.borrow_mut()
+			.insert("nymphRuntimeClass".to_string());
+		let module = self.current_module.as_deref().unwrap_or_default();
+		let init = self.transaction_call(
+			"nymphRuntimeClass",
+			vec![
+				Expression::new_string_literal(SPAN, self.ast.allocator.alloc_str(module), None, &self.ast),
+				Expression::new_string_literal(
+					SPAN,
+					self.ast.allocator.alloc_str(&class_name),
+					None,
+					&self.ast,
+				),
+				Expression::ClassExpression(class),
+			],
+		);
+		let declarator = VariableDeclarator::new(
+			SPAN,
+			VariableDeclarationKind::Const,
+			BindingPattern::new_binding_identifier(
+				SPAN,
+				self.ast.allocator.alloc_str(&class_name),
+				&self.ast,
+			),
+			oxc::ast::NONE,
+			Some(init),
+			false,
+			&self.ast,
+		);
+		Statement::from(Declaration::VariableDeclaration(ArenaBox::new_in(
+			VariableDeclaration::new(
+				SPAN,
+				VariableDeclarationKind::Const,
+				ArenaVec::from_value_in(declarator, &self.ast),
+				false,
+				&self.ast,
+			),
+			&self.ast,
+		)))
 	}
 
 	/// Build a method's params/body into a plain JS `FunctionExpression`
@@ -567,6 +789,7 @@ impl<'a> Emitter<'a> {
 	/// Deliberately a plain function, never an arrow: prototype methods need
 	/// their own `this` bound to the receiver at call time.
 	fn method_function(&self, method: &HirMethod) -> ArenaBox<'a, Function<'a>> {
+		let raw_params = self.push_param_cell_scope(&method.params);
 		let return_token = self.begin_return_completion();
 		let mut body_stmts = ArenaVec::new_in(&self.ast);
 		match &method.body {
@@ -589,8 +812,12 @@ impl<'a> Emitter<'a> {
 			}
 		}
 		let body_stmts = self.finish_return_completion(return_token, body_stmts);
+		let mut prologue = self.param_cell_prologue(&method.params, &raw_params);
+		prologue.extend(body_stmts);
+		let body_stmts = prologue;
+		self.pop_cell_scope();
 		let mut js_params = ArenaVec::new_in(&self.ast);
-		for param in &method.params {
+		for param in &raw_params {
 			let pat = BindingPattern::new_binding_identifier(
 				SPAN,
 				self.ast.allocator.alloc_str(param),
@@ -786,11 +1013,15 @@ impl<'a> Emitter<'a> {
 				)
 			} else {
 				let factory = self.variant_factory(&t_name, has_methods);
-				self.member_call(
-					Expression::new_identifier(SPAN, "Object", &self.ast),
-					"assign",
-					vec![factory, tag_obj],
-				)
+				if self.transactional {
+					self.transaction_call("nymphAssign", vec![factory, tag_obj])
+				} else {
+					self.member_call(
+						Expression::new_identifier(SPAN, "Object", &self.ast),
+						"assign",
+						vec![factory, tag_obj],
+					)
+				}
 			};
 
 			let key = PropertyKey::new_static_identifier(
@@ -832,11 +1063,32 @@ impl<'a> Emitter<'a> {
 			&self.ast,
 		)));
 		let return_obj = Expression::new_object_expression(SPAN, props, &self.ast);
-		let iife = JsValue {
+		let mut iife = JsValue {
 			stmts,
 			expr: return_obj,
 		}
 		.into_expression(self.ast);
+		if self.transactional {
+			let module = self.current_module.as_deref().unwrap_or_default();
+			iife = self.transaction_call(
+				"nymphRuntimeEnum",
+				vec![
+					Expression::new_string_literal(
+						SPAN,
+						self.ast.allocator.alloc_str(module),
+						None,
+						&self.ast,
+					),
+					Expression::new_string_literal(
+						SPAN,
+						self.ast.allocator.alloc_str(&hir_enum.name),
+						None,
+						&self.ast,
+					),
+					iife,
+				],
+			);
+		}
 		self.const_decl(hir_enum.name.as_str(), iife)
 	}
 
@@ -863,11 +1115,15 @@ impl<'a> Emitter<'a> {
 			"create",
 			vec![Expression::new_identifier(SPAN, proto_name, &self.ast)],
 		);
-		self.member_call(
-			Expression::new_identifier(SPAN, "Object", &self.ast),
-			"assign",
-			vec![create_call, props],
-		)
+		if self.transactional {
+			self.transaction_call("nymphAssign", vec![create_call, props])
+		} else {
+			self.member_call(
+				Expression::new_identifier(SPAN, "Object", &self.ast),
+				"assign",
+				vec![create_call, props],
+			)
+		}
 	}
 
 	/// `(fields) => { return { [TAG]: <t_name>, ...fields }; }` — a field variant's
@@ -1495,7 +1751,19 @@ impl<'a> Emitter<'a> {
 				&self.ast,
 			),
 			HirExpr::Local(name) => {
-				Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(name), &self.ast)
+				let value = Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(name), &self.ast);
+				if self.is_cell(name) {
+					self
+						.box_runtime_bindings
+						.borrow_mut()
+						.insert("nymphCellGet".to_string());
+					self.call1(
+						Expression::new_identifier(SPAN, "nymphCellGet", &self.ast),
+						value,
+					)
+				} else {
+					value
+				}
 			}
 			HirExpr::RuntimeTypeObject {
 				binding,
@@ -1583,21 +1851,32 @@ impl<'a> Emitter<'a> {
 					&self.ast,
 				)
 			}
-			HirExpr::WithPrototype { value, prototype } => self.member_call(
-				Expression::new_identifier(SPAN, "Object", &self.ast),
-				"setPrototypeOf",
-				vec![self.emit_expr(value), self.emit_expr(prototype)],
-			),
+			HirExpr::WithPrototype { value, prototype } => {
+				let args = vec![self.emit_expr(value), self.emit_expr(prototype)];
+				if self.transactional {
+					self.transaction_call("nymphSetPrototypeOf", args)
+				} else {
+					self.member_call(
+						Expression::new_identifier(SPAN, "Object", &self.ast),
+						"setPrototypeOf",
+						args,
+					)
+				}
+			}
 			HirExpr::RuntimeTypeAttachment { object, method } => {
 				let object = self.emit_expr(object);
 				let mut properties = ArenaVec::new_in(&self.ast);
 				properties.push(self.emit_method_property(method));
 				let methods = Expression::new_object_expression(SPAN, properties, &self.ast);
-				self.member_call(
-					Expression::new_identifier(SPAN, "Object", &self.ast),
-					"assign",
-					vec![object, methods],
-				)
+				if self.transactional {
+					self.transaction_call("nymphAssign", vec![object, methods])
+				} else {
+					self.member_call(
+						Expression::new_identifier(SPAN, "Object", &self.ast),
+						"assign",
+						vec![object, methods],
+					)
+				}
 			}
 			// The `this` receiver.
 			HirExpr::This => Expression::new_this_expression(SPAN, &self.ast),
@@ -1857,11 +2136,16 @@ impl<'a> Emitter<'a> {
 				args.push(Argument::from(obj));
 				let value = Expression::new_new_expression(SPAN, callee, oxc::ast::NONE, args, &self.ast);
 				if let Some(prototype) = prototype {
-					self.member_call(
-						Expression::new_identifier(SPAN, "Object", &self.ast),
-						"setPrototypeOf",
-						vec![value, self.emit_expr(prototype)],
-					)
+					let args = vec![value, self.emit_expr(prototype)];
+					if self.transactional {
+						self.transaction_call("nymphSetPrototypeOf", args)
+					} else {
+						self.member_call(
+							Expression::new_identifier(SPAN, "Object", &self.ast),
+							"setPrototypeOf",
+							args,
+						)
+					}
 				} else {
 					value
 				}
@@ -1904,11 +2188,16 @@ impl<'a> Emitter<'a> {
 				let callee = self.variant_member(enum_name, variant);
 				let value = self.call1(callee, obj);
 				if let Some(prototype) = prototype {
-					self.member_call(
-						Expression::new_identifier(SPAN, "Object", &self.ast),
-						"setPrototypeOf",
-						vec![value, self.emit_expr(prototype)],
-					)
+					let args = vec![value, self.emit_expr(prototype)];
+					if self.transactional {
+						self.transaction_call("nymphSetPrototypeOf", args)
+					} else {
+						self.member_call(
+							Expression::new_identifier(SPAN, "Object", &self.ast),
+							"setPrototypeOf",
+							args,
+						)
+					}
 				} else {
 					value
 				}
@@ -1953,6 +2242,52 @@ impl<'a> Emitter<'a> {
 				Expression::new_call_expression(SPAN, member, oxc::ast::NONE, args, false, &self.ast)
 			}
 			HirExpr::Assign { target, value } => {
+				if self.transactional {
+					let (helper, args) = match target.as_ref() {
+						HirExpr::Local(name) if self.is_cell(name) => (
+							"nymphCellSet",
+							vec![
+								Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(name), &self.ast),
+								self.emit_expr(value),
+							],
+						),
+						HirExpr::Field { recv, name } => (
+							"nymphSetProperty",
+							vec![
+								self.emit_expr(recv),
+								Expression::new_string_literal(
+									SPAN,
+									self.ast.allocator.alloc_str(name),
+									None,
+									&self.ast,
+								),
+								self.emit_expr(value),
+							],
+						),
+						HirExpr::Index { recv, index } => (
+							"nymphSetProperty",
+							vec![
+								self.unwrap_v(self.emit_expr(recv)),
+								self.unwrap_v(self.emit_expr(index)),
+								self.emit_expr(value),
+							],
+						),
+						_ => ("", Vec::new()),
+					};
+					if !helper.is_empty() {
+						self
+							.box_runtime_bindings
+							.borrow_mut()
+							.insert(helper.to_string());
+						return self.member_call(
+							Expression::new_identifier(SPAN, helper, &self.ast),
+							"call",
+							std::iter::once(Expression::new_null_literal(SPAN, &self.ast))
+								.chain(args)
+								.collect(),
+						);
+					}
+				}
 				let value_expr = self.emit_expr(value);
 				// A `Map` target has no JS assignment-expression form at all — `m[k] =
 				// v` on a real `Map` would silently set an own property on the `Map`
@@ -2182,6 +2517,7 @@ impl<'a> Emitter<'a> {
 	/// target), and it stops being merely defensive the moment closure-scoped
 	/// `return` is ever allowed.
 	fn closure_arrow(&self, params: &[ecow::EcoString], body: &HirExpr) -> Expression<'a> {
+		let raw_params = self.push_param_cell_scope(params);
 		let prev = self.in_iife_subexpr.replace(false);
 		let return_token = self.begin_return_completion();
 		let mut body_stmts = ArenaVec::new_in(&self.ast);
@@ -2205,10 +2541,14 @@ impl<'a> Emitter<'a> {
 			}
 		}
 		let body_stmts = self.finish_return_completion(return_token, body_stmts);
+		let mut prologue = self.param_cell_prologue(params, &raw_params);
+		prologue.extend(body_stmts);
+		let body_stmts = prologue;
 		self.in_iife_subexpr.set(prev);
+		self.pop_cell_scope();
 
 		let mut js_params = ArenaVec::new_in(&self.ast);
-		for param in params {
+		for param in &raw_params {
 			let binding_pattern = BindingPattern::new_binding_identifier(
 				SPAN,
 				self.ast.allocator.alloc_str(param),
@@ -2438,12 +2778,25 @@ impl<'a> Emitter<'a> {
 				mutable,
 				value,
 			} => {
-				let kind = if *mutable {
+				let kind = if self.transactional {
+					VariableDeclarationKind::Const
+				} else if *mutable {
 					VariableDeclarationKind::Let
 				} else {
 					VariableDeclarationKind::Const
 				};
-				let init = self.emit_expr(value);
+				let mut init = self.emit_expr(value);
+				if self.transactional {
+					self.bind_cell(name);
+					self
+						.box_runtime_bindings
+						.borrow_mut()
+						.insert("nymphCell".to_string());
+					init = self.call1(
+						Expression::new_identifier(SPAN, "nymphCell", &self.ast),
+						init,
+					);
+				}
 				let pat = BindingPattern::new_binding_identifier(
 					SPAN,
 					self.ast.allocator.alloc_str(name),
@@ -2545,6 +2898,7 @@ impl<'a> Emitter<'a> {
 	fn emit_value(&self, expr: &HirExpr) -> JsValue<'a> {
 		match expr {
 			HirExpr::Block { stmts, tail } => {
+				self.push_cell_scope(&[]);
 				let mut js_stmts = ArenaVec::new_in(&self.ast);
 				for stmt in stmts {
 					js_stmts.push(self.emit_stmt(stmt));
@@ -2556,6 +2910,7 @@ impl<'a> Emitter<'a> {
 				} else {
 					Expression::new_identifier(SPAN, "undefined", &self.ast)
 				};
+				self.pop_cell_scope();
 				JsValue {
 					stmts: js_stmts,
 					expr: tail_expr,

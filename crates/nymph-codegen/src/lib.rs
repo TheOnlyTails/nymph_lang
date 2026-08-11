@@ -52,3 +52,42 @@ pub fn emit_for_project_module_with_imports(
 		.with_needed_imports(imports)
 		.emit_module(module)
 }
+
+/// Emit a project module whose Nymph `let` bindings and observable mutations
+/// participate in the synchronous runtime journal. Imported top-level `let`
+/// local names must be supplied because they are cells owned by another ESM.
+#[must_use]
+pub fn emit_for_transactional_project_module(
+	module: &HirModule,
+	module_key: &str,
+	imports: &[(String, String, String)],
+	imported_top_level_lets: &[String],
+) -> String {
+	let allocator = Allocator::default();
+	emit::Emitter::for_transactional_project_module(&allocator, module_key, imported_top_level_lets)
+		.with_needed_imports(imports)
+		.emit_module(module)
+}
+
+/// Transactional project emission with strict validation of every external
+/// call/value import discovered while walking the final HIR.
+pub fn emit_for_transactional_project_module_checked(
+	module: &HirModule,
+	module_key: &str,
+	imports: &[(String, String, String)],
+	imported_top_level_lets: &[String],
+) -> Result<String, (String, String)> {
+	let allocator = Allocator::default();
+	let emitter = emit::Emitter::for_transactional_project_module(
+		&allocator,
+		module_key,
+		imported_top_level_lets,
+	)
+	.with_needed_imports(imports);
+	let source = emitter.emit_module(module);
+	if let Some(external) = emitter.unaudited_external() {
+		Err(external)
+	} else {
+		Ok(source)
+	}
+}

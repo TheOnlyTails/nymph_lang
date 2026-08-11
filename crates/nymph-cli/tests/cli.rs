@@ -1221,6 +1221,189 @@ fn repl_eof_exits_cleanly_without_prompts_or_output() {
 }
 
 #[test]
+fn repl_rolls_back_cells_collections_closures_iterators_and_debug_rendering() {
+	let root = unique_temp_path("nymph_cli_repl_transactions", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let transcript = r#"func recurse(): int = recurse()
+let mut scalar = 1
+let mut list = #[1, 2]
+let alias = list
+let mut map = #{1: 10}
+func mutate_then_fail(): int = { scalar = 9 list.insert(1, 8) list.remove(0) list.splice(0, 1, #[7]) list.pop() list.push(3) list[4] = 9 list.clear() map.insert(2, 20) map.remove(1) map.get_or_insert(3, 30) map[4] = 40 map.clear() recurse() }
+mutate_then_fail()
+#(scalar, list, alias, map)
+func make_counter(): () -> int = { let mut value = 0 return () -> { value = value + 1 value } }
+let counter = make_counter()
+counter()
+func counter_then_fail(): int = { counter() recurse() }
+counter_then_fail()
+counter()
+let mut iterator = #[4, 5].iter()
+iterator.next()
+func iterator_then_fail(): int = { iterator.next() recurse() }
+iterator_then_fail()
+iterator.next()
+func debug_fail(): string = debug_fail()
+struct Bad { impl Debug { func debug(): string = { list.push(8) debug_fail() } } }
+Bad()
+list
+"#;
+	let out = nymph_with_stdin(&["repl"], &root, transcript);
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(
+		out.stdout,
+		"#(1, #[1, 2], #[1, 2], #{1: 10})\n1\n2\nOption.Some(value: 4)\nOption.Some(value: 5)\n#[1, 2]\n"
+	);
+	assert_eq!(
+		out.stderr.matches("failed at runtime").count(),
+		4,
+		"{}",
+		out.stderr
+	);
+}
+
+#[test]
+fn repl_rolls_back_closure_private_collections_structs_and_nested_aliases() {
+	let root = unique_temp_path("nymph_cli_repl_closure_state", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let transcript = r#"func recurse(): int = recurse()
+struct Cell(value: mut int)
+func make_list_state(): () -> #[int] = { let mut values = #[1] return () -> { values.push(2) values } }
+let list_state = make_list_state()
+list_state()
+func fail_list_state(): int = { list_state() recurse() }
+fail_list_state()
+list_state()
+func make_map_state(): () -> #{int: int} = { let mut values = #{1: 10} return () -> { values.insert(2, 20) values } }
+let map_state = make_map_state()
+map_state()
+func fail_map_state(): int = { map_state() recurse() }
+fail_map_state()
+map_state()
+func make_struct_state(): () -> Cell = { let mut seed = 1 let mut value: mut Cell = Cell(value = seed) return () -> { value.value = value.value + 1 value } }
+let struct_state = make_struct_state()
+struct_state()
+func fail_struct_state(): int = { struct_state() recurse() }
+fail_struct_state()
+struct_state()
+let mut seed = 3
+let mut cell = Cell(value = seed)
+let nested: #[mut Cell] = #[cell]
+let nested_alias = nested
+func fail_nested(): int = { nested_alias[0].value = 9 recurse() }
+fail_nested()
+#(nested[0].value, nested_alias[0].value)
+"#;
+	let out = nymph_with_stdin(&["repl"], &root, transcript);
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(
+		out.stdout,
+		"#[1, 2]\n#[1, 2, 2]\n#{1: 10, 2: 20}\n#{1: 10, 2: 20}\nCell(value: 2)\nCell(value: 3)\n#(3, 3)\n"
+	);
+	assert_eq!(
+		out.stderr.matches("failed at runtime").count(),
+		4,
+		"{}",
+		out.stderr
+	);
+}
+
+#[test]
+fn repl_preserves_project_private_state_and_bare_import_siblings_when_shadowed() {
+	let root = write_project("main.nym", "func main(): void = {}");
+	std::fs::write(
+		root.join("src/state.nym"),
+		concat!(
+			"private let mut values = #[1]\n",
+			"public func current(): #[int] = values\n",
+			"func recurse(): int = recurse()\n",
+			"public func fail(): int = { values.push(2) recurse() }\n",
+			"public let a = 1\n",
+			"public let b = 2\n",
+			"public enum Shade { Light }",
+		),
+	)
+	.unwrap();
+	std::fs::write(root.join("src/dep.nym"), "public let dep = 4").unwrap();
+	let transcript = concat!(
+		"import @/state\n",
+		"current()\n",
+		"fail()\n",
+		"current()\n",
+		"let a = 9\n",
+		"#(a, b, state.b)\n",
+		"Light\n",
+		"let state = 7\n",
+		"state\n",
+		"import @/state with (a as grouped_a, b as grouped_b)\n",
+		"let grouped_a = 8\n",
+		"#(grouped_a, grouped_b)\n",
+		"import @/dep\n",
+		"let dep = 9\n",
+		"dep\n",
+	);
+	let out = nymph_with_stdin(&["repl"], &root, transcript);
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(
+		out.stdout,
+		"#[1]\n#[1]\n#(9, 2, 2)\nShade.Light\n7\n#(8, 2)\n9\n"
+	);
+	assert_eq!(
+		out.stderr.matches("failed at runtime").count(),
+		1,
+		"{}",
+		out.stderr
+	);
+}
+
+#[test]
+fn repl_renders_void_canonically() {
+	let root = unique_temp_path("nymph_cli_repl_void", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let out = nymph_with_stdin(&["repl"], &root, "if (true) {}\n");
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(out.stdout, "void\n");
+	assert!(!out.stdout.contains("undefined"));
+}
+
+#[test]
+fn repl_rolls_back_hamt_collisions_and_equal_nonidentical_keys() {
+	let root = unique_temp_path("nymph_cli_repl_hamt", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let transcript = r#"func recurse(): int = recurse()
+struct Key(id: int) { impl Equals<Other = Key> { func equals(other: Key): boolean = this.id == other.id } impl Hash { func hash(): int = 0 } }
+let mut values = #{Key(id = 1): 10, Key(id = 2): 20}
+func mutate_hamt_then_fail(): int = { values.insert(Key(id = 3), 30) values.remove(Key(id = 1)) recurse() }
+mutate_hamt_then_fail()
+#(values.size(), values[Key(id = 1)], values[Key(id = 2)])
+let mut hash_calls = 0
+let mut hash_side_effects: #[int] = #[]
+struct StatefulKey(id: int) { impl Equals<Other = StatefulKey> { func equals(other: StatefulKey): boolean = this.id == other.id } impl Hash { func hash(): int = { hash_calls = hash_calls + 1 hash_side_effects.push(hash_calls) 0 } } }
+let mut stateful_values = #{StatefulKey(id = 1): 10}
+func mutate_stateful_hash_then_fail(): int = { stateful_values[StatefulKey(id = 2)] = 20 recurse() }
+mutate_stateful_hash_then_fail()
+#(hash_calls, hash_side_effects, stateful_values)
+"#;
+	let out = nymph_with_stdin(&["repl"], &root, transcript);
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(
+		out.stdout,
+		"#(2, 10, 20)\n#(1, #[1], #{StatefulKey(id: 1): 10})\n"
+	);
+	assert_eq!(
+		out.stderr.matches("failed at runtime").count(),
+		2,
+		"{}",
+		out.stderr
+	);
+}
+
+#[test]
 fn repl_closed_invalid_interpolation_does_not_swallow_the_next_submission() {
 	let root = unique_temp_path("nymph_cli_repl_interpolation", "dir");
 	std::fs::create_dir_all(&root).unwrap();

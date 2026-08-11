@@ -54,6 +54,8 @@ pub struct Checker<'m> {
 	pub(crate) module: &'m Module,
 	pub(crate) interner: Interner,
 	pub(crate) defs: DefMap,
+	pub(crate) mutable_imports: FxHashSet<DefId>,
+	pub(crate) allow_imported_assignment: bool,
 	pub(crate) sigs: Signatures,
 	/// Collected interface definitions (method signatures), keyed by interface def.
 	pub(crate) interfaces: FxHashMap<DefId, crate::iface::InterfaceDef>,
@@ -248,6 +250,9 @@ pub enum EntryMode {
 	/// taking no parameters, declaring no generics, and declaring no return
 	/// type other than `void` is required (see `entry::check_entry_main`).
 	Entry,
+	/// Explicit persistent-REPL mode. Entry validation stays disabled, while
+	/// mutable imported top-level values remain assignable through runtime cells.
+	Repl,
 }
 
 /// Check a whole (single) module and return every diagnostic produced.
@@ -602,6 +607,7 @@ pub fn check_module_with_environment(
 		identity,
 		environment.interner.clone(),
 		environment.imported.defs.clone(),
+		environment.imported.mutable_values.clone(),
 		environment.imported.signatures.clone(),
 		environment.imported.interfaces.clone(),
 		environment.imported.implementations.clone(),
@@ -635,6 +641,7 @@ pub fn check_module_with_owned_environment(
 	} = environment;
 	let crate::ImportedFacts {
 		defs,
+		mutable_values,
 		signatures,
 		interfaces,
 		implementations,
@@ -647,6 +654,7 @@ pub fn check_module_with_owned_environment(
 		identity,
 		interner,
 		defs,
+		mutable_values,
 		signatures,
 		interfaces,
 		implementations,
@@ -665,6 +673,7 @@ fn check_module_with_environment_parts(
 	identity: crate::ModuleIdentity,
 	interner: Interner,
 	imported_defs: DefMap,
+	imported_mutable_values: FxHashSet<DefId>,
 	imported_signatures: Signatures,
 	imported_interfaces: FxHashMap<DefId, crate::iface::InterfaceDef>,
 	imported_implementations: crate::iface::ImplRegistry,
@@ -694,6 +703,8 @@ fn check_module_with_environment_parts(
 		})
 		.collect();
 	let mut checker = Checker::new(&module, defs, diagnostics);
+	checker.mutable_imports = imported_mutable_values;
+	checker.allow_imported_assignment = mode == EntryMode::Repl;
 	checker.interner = interner;
 	checker.sigs = imported_signatures;
 	checker.interfaces = imported_interfaces;
@@ -940,6 +951,8 @@ impl<'m> Checker<'m> {
 			module,
 			interner: Interner::new(),
 			defs,
+			mutable_imports: FxHashSet::default(),
+			allow_imported_assignment: false,
 			sigs: Signatures::default(),
 			interfaces: FxHashMap::default(),
 			impls: crate::iface::ImplRegistry::default(),

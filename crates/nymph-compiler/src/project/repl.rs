@@ -17,11 +17,12 @@ use nymph_ast::{
 	expr::{ListPatternEntry, MapPatternEntry, Pattern, StructPatternField},
 };
 use nymph_diagnostics::Diagnostic;
-use nymph_sema::EntryMode;
+use nymph_sema::query::ImportedNameKind;
 
-use super::{CompiledProject, CompilerSession, ModulePath, ProjectDiagnostic, ProjectId};
+use super::{CompilerSession, ModulePath, ProjectDiagnostic, ProjectId};
 
 const REPL_ROOT: &str = "__nymph_repl";
+const REPL_RESERVED_PREFIX: &str = "__nymph_repl_";
 
 type SourceLoader = dyn Fn(&str) -> Option<String> + Send + Sync;
 
@@ -90,8 +91,15 @@ struct ReplImport {
 	path: Vec<String>,
 	alias: Option<String>,
 	idents: Option<Vec<(String, Option<String>)>>,
+	wildcard_names: BTreeSet<String>,
 	visible_names: BTreeSet<String>,
 	hidden_suffix: String,
+}
+
+struct ResolvedImportNames {
+	visible: BTreeSet<String>,
+	all_visible: BTreeSet<String>,
+	module_namespaces: BTreeSet<String>,
 }
 
 impl ReplImport {
@@ -122,6 +130,7 @@ impl ReplImport {
 					})
 					.collect()
 			}),
+			wildcard_names: BTreeSet::new(),
 			visible_names,
 			hidden_suffix,
 		}
@@ -158,7 +167,21 @@ impl ReplImport {
 				));
 			}
 		}
-		if let Some(idents) = &self.idents {
+		let wildcard_idents;
+		let idents = if let Some(idents) = &self.idents {
+			Some(idents)
+		} else if !self.wildcard_names.is_empty() {
+			wildcard_idents = self
+				.wildcard_names
+				.iter()
+				.cloned()
+				.map(|name| (name, None))
+				.collect::<Vec<_>>();
+			Some(&wildcard_idents)
+		} else {
+			None
+		};
+		if let Some(idents) = idents {
 			source.push_str(" with (");
 			for (index, (name, alias)) in idents.iter().enumerate() {
 				if index > 0 {
@@ -198,27 +221,33 @@ pub struct StagedReplSubmission {
 	committed: CommittedSubmission,
 	imports: Vec<ReplImport>,
 	visible: BTreeMap<String, String>,
-	compiled: CompiledProject,
-	render_function: Option<String>,
+	modules: BTreeMap<String, String>,
+	dependency_sources: BTreeMap<String, String>,
+	entry: String,
+	render_symbol: Option<String>,
 }
 
 impl StagedReplSubmission {
-	/// Runnable JavaScript for this candidate. Expression results pass through a
-	/// Nymph function constrained by `Debug`; JavaScript only prints the returned
-	/// Nymph string payload.
+	/// Exact compiler-emitted ES modules for this candidate. The persistent REPL
+	/// worker loads only modules absent from its committed module registry.
 	#[must_use]
-	pub fn execution_js(&self) -> String {
-		let mut js = self.compiled.js.clone();
-		if let Some(render_function) = &self.render_function {
-			let symbol = self.compiled.entry_symbol(render_function);
-			js.push_str(&format!("\nconsole.log({symbol}().v);\n"));
-		}
-		js
+	pub fn modules(&self) -> &BTreeMap<String, String> {
+		&self.modules
+	}
+
+	#[must_use]
+	pub fn entry(&self) -> &str {
+		&self.entry
+	}
+
+	#[must_use]
+	pub fn render_symbol(&self) -> Option<&str> {
+		self.render_symbol.as_deref()
 	}
 
 	#[must_use]
 	pub fn renders_value(&self) -> bool {
-		self.render_function.is_some()
+		self.render_symbol.is_some()
 	}
 }
 
@@ -229,6 +258,8 @@ pub struct ReplSession {
 	committed: Vec<CommittedSubmission>,
 	imports: Vec<ReplImport>,
 	visible: BTreeMap<String, String>,
+	loaded_modules: BTreeMap<String, String>,
+	dependency_sources: BTreeMap<String, String>,
 }
 
 impl ReplSession {
@@ -240,6 +271,8 @@ impl ReplSession {
 			committed: Vec::new(),
 			imports: Vec::new(),
 			visible: BTreeMap::new(),
+			loaded_modules: BTreeMap::new(),
+			dependency_sources: BTreeMap::new(),
 		}
 	}
 
@@ -301,25 +334,48 @@ impl ReplSession {
 			.collect();
 		sources.insert(module.clone(), source.clone());
 		let disk = self.load.clone();
-		let load = |key: &str| sources.get(key).cloned().or_else(|| disk(key));
+		let dependency_sources = std::cell::RefCell::new(BTreeMap::new());
+		let load = |key: &str| {
+			sources.get(key).cloned().or_else(|| {
+				let source = disk(key)?;
+				dependency_sources
+					.borrow_mut()
+					.insert(key.to_string(), source.clone());
+				Some(source)
+			})
+		};
 		let session = CompilerSession::from_source_loaders(
 			self.project.clone(),
 			&module,
 			&load,
 			&crate::embedded_std_provider,
 		);
-		let compiled = session
-			.compile_project(
+		let (modules, _entry_tag) = session
+			.emit_transactional_repl_project(
 				self.project.clone(),
 				ModulePath::new(&module).expect("REPL module keys are canonical"),
-				EntryMode::Library,
 			)
 			.map_err(|diagnostics| ReplStageError::Diagnostics {
 				diagnostics: diagnostics.iter().cloned().collect(),
 				module: module.clone(),
 				source: source.clone(),
 			})?;
+		let dependency_sources = dependency_sources.into_inner();
+		if let Some((key, _)) = dependency_sources.iter().find(|(key, source)| {
+			self
+				.dependency_sources
+				.get(*key)
+				.is_some_and(|committed| committed != *source)
+		}) {
+			return Err(self.local_error(
+				generation,
+				input,
+				&format!("loaded project module `{key}` changed during this REPL session"),
+			));
+		}
 
+		let mut modules = version_runtime_modules(modules);
+		modules.retain(|key, _| !self.loaded_modules.contains_key(key));
 		let mut visible = self.visible.clone();
 		let imported_names: BTreeSet<_> = prepared
 			.imports
@@ -330,18 +386,23 @@ impl ReplSession {
 		for name in prepared.declared {
 			visible.insert(name, module.clone());
 		}
+		let render_symbol = prepared
+			.render_function
+			.map(|render| format!("$m{}${render}", super::queries::repl_module_tag(&module)));
 		Ok(StagedReplSubmission {
 			generation,
 			committed: CommittedSubmission { module, source },
 			imports: prepared.imports,
 			visible,
-			compiled: compiled.as_ref().clone(),
-			render_function: prepared.render_function,
+			modules: modules.into_iter().collect(),
+			dependency_sources,
+			entry: format!("{REPL_ROOT}/submission_{generation}"),
+			render_symbol,
 		})
 	}
 
 	/// Commit a candidate after successful runtime execution.
-	pub fn commit(&mut self, staged: StagedReplSubmission) {
+	pub fn commit(&mut self, staged: StagedReplSubmission, retained_modules: &[String]) {
 		assert_eq!(
 			staged.generation,
 			self.committed.len(),
@@ -350,6 +411,20 @@ impl ReplSession {
 		self.committed.push(staged.committed);
 		self.imports = staged.imports;
 		self.visible = staged.visible;
+		self
+			.loaded_modules
+			.extend(retained_modules.iter().filter_map(|key| {
+				staged
+					.modules
+					.get(key)
+					.map(|source| (key.clone(), source.clone()))
+			}));
+		self.dependency_sources.extend(
+			staged
+				.dependency_sources
+				.into_iter()
+				.filter(|(key, _)| retained_modules.contains(key)),
+		);
 	}
 
 	#[must_use]
@@ -369,7 +444,34 @@ impl ReplSession {
 		{
 			let mut imports = self.imports.clone();
 			for (index, declaration) in declarations.iter().enumerate() {
-				let import = ReplImport::new(declaration, format!("{generation}_{index}"));
+				let mut import = ReplImport::new(declaration, format!("{generation}_{index}"));
+				let resolved = self
+					.resolved_import_names(&import, generation)
+					.ok_or_else(|| {
+						self.local_error(
+							generation,
+							input,
+							"could not resolve the imported binding inventory",
+						)
+					})?;
+				import.visible_names = resolved.visible;
+				if let Some(name) = resolved
+					.all_visible
+					.iter()
+					.find(|name| name.starts_with(REPL_RESERVED_PREFIX))
+				{
+					return Err(self.local_error(
+						generation,
+						input,
+						&format!("`{name}` uses the reserved REPL identifier prefix"),
+					));
+				}
+				if import.idents.is_none() {
+					import.wildcard_names = import.visible_names.clone();
+					for namespace in resolved.module_namespaces {
+						import.wildcard_names.remove(&namespace);
+					}
+				}
 				for previous in &mut imports {
 					previous
 						.visible_names
@@ -394,6 +496,20 @@ impl ReplSession {
 		let declaration = &declarations[0];
 		let mut declared = BTreeSet::new();
 		declaration_names(declaration, &mut declared);
+		let mut reserved_names = declared.clone();
+		if let Declaration::Enum { variants, .. } = declaration {
+			reserved_names.extend(variants.iter().map(|variant| variant.0.name.0.to_string()));
+		}
+		if let Some(name) = reserved_names
+			.iter()
+			.find(|name| name.starts_with(REPL_RESERVED_PREFIX))
+		{
+			return Err(self.local_error(
+				generation,
+				input,
+				&format!("`{name}` uses the reserved REPL identifier prefix"),
+			));
+		}
 		let mut imports = self.imports.clone();
 		for import in &mut imports {
 			import.visible_names.retain(|name| !declared.contains(name));
@@ -427,6 +543,70 @@ impl ReplSession {
 			imports,
 			render_function: None,
 		})
+	}
+
+	fn resolved_import_names(
+		&self,
+		import: &ReplImport,
+		generation: usize,
+	) -> Option<ResolvedImportNames> {
+		let module = format!("{REPL_ROOT}/submission_{generation}");
+		let committed_sources: BTreeMap<String, String> = self
+			.committed
+			.iter()
+			.map(|submission| (submission.module.clone(), submission.source.clone()))
+			.collect();
+		let disk = self.load.clone();
+		(0..1024)
+			.find_map(|index| {
+				let source = format!(
+					"{}\npublic let __nymph_repl_import_probe_{index} = #()\n",
+					import.source()
+				);
+				let mut sources = committed_sources.clone();
+				sources.insert(module.clone(), source);
+				let load = |key: &str| sources.get(key).cloned().or_else(|| disk(key));
+				let session = CompilerSession::from_source_loaders(
+					self.project.clone(),
+					&module,
+					&load,
+					&crate::embedded_std_provider,
+				);
+				let path = ModulePath::new(&module).expect("REPL module keys are canonical");
+				let diagnostics = session.tooling_diagnostics(self.project.clone(), path.clone(), true);
+				if diagnostics
+					.iter()
+					.any(|diagnostic| diagnostic.diag.code == "IMPORT-NAME-COLLISION")
+				{
+					return None;
+				}
+				if diagnostics
+					.iter()
+					.any(|diagnostic| diagnostic.diag.severity == nymph_diagnostics::Severity::Error)
+				{
+					return Some(None);
+				}
+				Some(
+					session
+						.tooling_completion_analysis(self.project.clone(), path.clone(), path, true)
+						.map(|analysis| {
+							let imported = analysis.imported_names.iter();
+							ResolvedImportNames {
+								all_visible: imported.clone().map(|name| name.name.clone()).collect(),
+								visible: imported
+									.clone()
+									.filter(|name| name.kind != ImportedNameKind::Variant)
+									.map(|name| name.name.clone())
+									.collect(),
+								module_namespaces: imported
+									.filter(|name| name.kind == ImportedNameKind::ModuleNamespace)
+									.map(|name| name.name.clone())
+									.collect(),
+							}
+						}),
+				)
+			})
+			.flatten()
 	}
 
 	fn local_error(&self, generation: usize, source: &str, message: &str) -> ReplStageError {
@@ -474,6 +654,47 @@ impl ReplSession {
 		));
 		source
 	}
+}
+
+/// Runtime assembly modules can gain newly demanded attachments as later REPL
+/// submissions are compiled. Content-addressing those exact compiler outputs
+/// lets the persistent worker retain old evaluated modules while loading only
+/// the new runtime delta. Project/source module identities stay canonical.
+fn version_runtime_modules(
+	mut modules: std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+	let mut graph = modules
+		.iter()
+		.filter(|(key, _)| key.starts_with("@nymph/runtime/"))
+		.collect::<Vec<_>>();
+	graph.sort_unstable_by_key(|(key, _)| *key);
+	let mut graph_source = String::new();
+	for (key, source) in graph {
+		graph_source.push_str(key);
+		graph_source.push('\0');
+		graph_source.push_str(source);
+		graph_source.push('\0');
+	}
+	let graph_version = blake3::hash(graph_source.as_bytes()).to_hex();
+	let versions = modules
+		.iter()
+		.filter(|(key, _)| key.starts_with("@nymph/runtime/"))
+		.map(|(key, _)| (key.clone(), format!("{key}?repl={graph_version}")))
+		.collect::<BTreeMap<_, _>>();
+	for source in modules.values_mut() {
+		for (original, versioned) in &versions {
+			*source = source.replace(
+				&format!("from \"{original}\""),
+				&format!("from \"{versioned}\""),
+			);
+		}
+	}
+	for (original, versioned) in versions {
+		if let Some(source) = modules.remove(&original) {
+			modules.insert(versioned, source);
+		}
+	}
+	modules
 }
 
 fn declaration_visibility(declaration: &Declaration) -> Option<Visibility> {

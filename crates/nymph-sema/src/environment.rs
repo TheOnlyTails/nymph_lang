@@ -70,6 +70,7 @@ pub(crate) struct LocalCompilerRuntimeRoles {
 #[derive(Debug, Default, Clone)]
 pub struct ImportedFacts {
 	pub defs: DefMap,
+	pub mutable_values: rustc_hash::FxHashSet<crate::DefId>,
 	pub signatures: Signatures,
 	pub interfaces: FxHashMap<crate::DefId, InterfaceDef>,
 	pub implementations: ImplRegistry,
@@ -146,6 +147,13 @@ impl SemanticEnvironment {
 					let index = module_exports.entry(interface.module.clone()).or_default();
 					for definition in &interface.exports {
 						allocate_complete_definition(&mut imported.defs, definition, true)?;
+						if definition.declaration_kind == Some(crate::MemberKind::MutableValue) {
+							let id = imported
+								.defs
+								.by_stable(&definition.id)
+								.expect("allocated exported definition");
+							imported.mutable_values.insert(id);
+						}
 						index
 							.by_name
 							.insert(definition.name.clone(), definition.id.clone());
@@ -163,6 +171,13 @@ impl SemanticEnvironment {
 					let index = module_exports.entry(interface.module.clone()).or_default();
 					for definition in &interface.exports {
 						allocate_recovered_definition(&mut imported.defs, definition, true)?;
+						if definition.declaration_kind == Some(crate::MemberKind::MutableValue) {
+							let id = imported
+								.defs
+								.by_stable(&definition.id)
+								.expect("allocated recovered exported definition");
+							imported.mutable_values.insert(id);
+						}
 						index
 							.by_name
 							.insert(definition.name.clone(), definition.id.clone());

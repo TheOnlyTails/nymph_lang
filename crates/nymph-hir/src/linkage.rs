@@ -60,6 +60,53 @@ pub struct Linked {
 	pub receiver_tag: Option<&'static str>,
 }
 
+/// Runtime effect classification enforced by strict transactional REPL
+/// emission. New stateful host externals remain rejected until explicitly
+/// audited into one of the supported classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalEffect {
+	Pure,
+	TransactionAware,
+	IrreversibleHostIo,
+	UnauditedStateful,
+}
+
+#[must_use]
+pub fn external_effect(module: &str, symbol: &str) -> ExternalEffect {
+	match (module, symbol) {
+		("std/io", "print" | "println") => ExternalEffect::IrreversibleHostIo,
+		("std/display", "display" | "debug")
+		| ("std/equality", "equals" | "primitive_equals" | "not_equals")
+		| ("std/hash", "hash")
+		| (
+			"std/collections/list",
+			"length" | "get" | "first" | "last" | "pop" | "slice" | "chunked" | "distinct" | "concat"
+			| "reversed" | "drop" | "take" | "contains" | "to_string" | "push" | "splice" | "insert"
+			| "clear" | "remove",
+		)
+		| (
+			"std/collections/map",
+			"get" | "insert" | "remove" | "clear" | "size" | "get_or_insert" | "contains_key" | "keys"
+			| "values" | "entries" | "merge" | "to_string",
+		) => ExternalEffect::TransactionAware,
+		("std/comparison", "compare_number" | "compare_char" | "compare_string")
+		| (
+			"std/math/intrinsics",
+			"sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
+			| "acosh" | "atanh" | "exp" | "ln" | "floor" | "ceil" | "round" | "atan2"
+			| "power_domain_error" | "max_float" | "min_float" | "min_positive_float",
+		)
+		| (
+			"std/string",
+			"char_at" | "chars" | "concat" | "concat_chars" | "contains" | "contains_char" | "ends_with"
+			| "index_of" | "last_index_of" | "length" | "pad_end" | "pad_start" | "repeat" | "replace"
+			| "replace_first" | "reversed" | "split" | "starts_with" | "substring" | "to_lower"
+			| "to_upper" | "trim" | "trim_end" | "trim_start",
+		) => ExternalEffect::Pure,
+		_ => ExternalEffect::UnauditedStateful,
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NativeExternal {
 	Binary { op: BinOp, result: BuiltinResult },
@@ -1199,5 +1246,35 @@ mod tests {
 			lookup("println", None).expect("`println` must be linked as a free-function external");
 		assert_eq!(println.module, "std/io");
 		assert_eq!(println.symbol, "println");
+	}
+
+	#[test]
+	fn strict_repl_effect_policy_is_exact_and_covers_every_linked_external() {
+		for linked in REGISTRY
+			.iter()
+			.map(|(_, linked)| linked)
+			.chain(VALUE_REGISTRY.iter().map(|(_, value)| &value.linked))
+		{
+			assert_ne!(
+				external_effect(linked.module, linked.symbol),
+				ExternalEffect::UnauditedStateful,
+				"linked external {}::{} needs an explicit effect classification",
+				linked.module,
+				linked.symbol
+			);
+		}
+
+		for module in [
+			"std/io",
+			"std/display",
+			"std/collections/list",
+			"std/math/intrinsics",
+			"std/string",
+		] {
+			assert_eq!(
+				external_effect(module, "new_unreviewed_export"),
+				ExternalEffect::UnauditedStateful
+			);
+		}
 	}
 }

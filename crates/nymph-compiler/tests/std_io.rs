@@ -255,7 +255,7 @@ func main(): void = println(noop())"#;
 		.expect("void should satisfy the blanket Display implementation");
 	let mut js = compiled.js;
 	js.push_str(&format!("\n{}();\n", compiled.entry_main));
-	assert_eq!(run_node(&js, "display_void"), "undefined\n");
+	assert_eq!(run_node(&js, "display_void"), "void\n");
 }
 
 /// A program that does NOT `import std/io` is completely unaffected — the

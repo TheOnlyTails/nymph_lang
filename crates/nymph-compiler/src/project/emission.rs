@@ -14,7 +14,7 @@ use super::{CompiledProject, ProjectDiagnostic, bundle, link_plan, queries};
 pub struct StableEmittedProject {
 	pub module_sources: FxHashMap<String, String>,
 	pub entry_tag: usize,
-	compiler_option_binding: String,
+	pub(crate) compiler_option_binding: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -106,6 +106,7 @@ pub(crate) fn emitted_interface_module<'db>(
 	db: &'db dyn Db,
 	key: ProjectKey<'db>,
 	module: SemanticModuleInput,
+	transactional: bool,
 ) -> StableEmissionResult<String> {
 	#[cfg(feature = "test-support")]
 	db.semantic_query_will_execute("emitted_interface_module", module);
@@ -135,6 +136,14 @@ pub(crate) fn emitted_interface_module<'db>(
 			));
 		}
 	};
+	if key.mode(db) == nymph_sema::EntryMode::Repl {
+		public.extend(
+			stable
+				.fragments
+				.iter()
+				.map(|fragment| fragment.definition().clone()),
+		);
+	}
 	public.extend(stable.fragments.iter().filter_map(|fragment| {
 		(matches!(
 			fragment.fragment(),
@@ -176,6 +185,20 @@ pub(crate) fn emitted_interface_module<'db>(
 			));
 		}
 	};
+	if transactional
+		&& let Some(alias) = plan.external_aliases.iter().find(|alias| {
+			alias.abi.linked().is_some_and(|(module, symbol)| {
+				nymph_hir::linkage::external_effect(module, symbol)
+					== nymph_hir::linkage::ExternalEffect::UnauditedStateful
+			})
+		}) {
+		let (module, symbol) = alias.abi.linked().expect("filtered linked external");
+		return StableEmissionResult::Diagnostics(internal_diagnostic(
+			&stable.module.path,
+			"REPL-UNSAFE-EXTERNAL",
+			format!("strict REPL mode rejects unaudited stateful external `{module}::{symbol}`"),
+		));
+	}
 	let imports = plan
 		.imports
 		.iter()
@@ -188,8 +211,39 @@ pub(crate) fn emitted_interface_module<'db>(
 			)
 		})
 		.collect::<Vec<_>>();
-	let mut source =
-		nymph_codegen::emit_for_project_module_with_imports(&stable.hir, &stable.module.path, &imports);
+	let mut source = if transactional {
+		let imported_top_level_lets = plan
+			.imports
+			.iter()
+			.filter(|import| {
+				matches!(
+					import.definition.key,
+					nymph_sema::DeclarationKey::TopLevel {
+						category: nymph_sema::DeclarationCategory::Let,
+						..
+					}
+				)
+			})
+			.map(|import| import.binding.as_str().to_string())
+			.collect::<Vec<_>>();
+		match nymph_codegen::emit_for_transactional_project_module_checked(
+			&stable.hir,
+			&stable.module.path,
+			&imports,
+			&imported_top_level_lets,
+		) {
+			Ok(source) => source,
+			Err((module, symbol)) => {
+				return StableEmissionResult::Diagnostics(internal_diagnostic(
+					&stable.module.path,
+					"REPL-UNSAFE-EXTERNAL",
+					format!("strict REPL mode rejects unaudited stateful external `{module}::{symbol}`"),
+				));
+			}
+		}
+	} else {
+		nymph_codegen::emit_for_project_module_with_imports(&stable.hir, &stable.module.path, &imports)
+	};
 	prepend_external_aliases(&mut source, &plan.external_aliases);
 	if !plan.exports.is_empty() {
 		source.push_str(&format!(
@@ -209,6 +263,7 @@ pub(crate) fn emitted_interface_module<'db>(
 pub(crate) fn emitted_interface_project<'db>(
 	db: &'db dyn Db,
 	key: ProjectKey<'db>,
+	transactional: bool,
 ) -> StableEmissionResult<StableEmittedProject> {
 	let diagnostics = queries::interface_project_diagnostics(db, key);
 	if diagnostics
@@ -296,7 +351,7 @@ pub(crate) fn emitted_interface_project<'db>(
 				));
 			}
 		}
-		match emitted_interface_module(db, key, module) {
+		match emitted_interface_module(db, key, module, transactional) {
 			StableEmissionResult::Value(source) => {
 				sources.insert(
 					module.identity(db).path.to_string(),
@@ -346,6 +401,7 @@ pub(crate) fn emitted_interface_project<'db>(
 			&fragments,
 			&execution_fragments,
 			&virtual_deliveries,
+			transactional,
 		) {
 			Ok(source) => {
 				let specifier = module_specifier(&owner);
@@ -425,6 +481,7 @@ fn emit_virtual_runtime_module(
 		nymph_sema::DefinitionId,
 		link_plan::VirtualDemandDelivery,
 	>,
+	transactional: bool,
 ) -> Result<String, String> {
 	let hir = super::assembly::assemble_runtime_module_with_execution(
 		owner,
@@ -453,6 +510,18 @@ fn emit_virtual_runtime_module(
 		&mut QueryLinkResolver { db, key },
 	)
 	.map_err(|error| format!("runtime link planning failed: {error:?}"))?;
+	if transactional
+		&& let Some(alias) = plan.external_aliases.iter().find(|alias| {
+			alias.abi.linked().is_some_and(|(module, symbol)| {
+				nymph_hir::linkage::external_effect(module, symbol)
+					== nymph_hir::linkage::ExternalEffect::UnauditedStateful
+			})
+		}) {
+		let (module, symbol) = alias.abi.linked().expect("filtered linked external");
+		return Err(format!(
+			"strict REPL mode rejects unaudited stateful external `{module}::{symbol}`"
+		));
+	}
 	let runtime_imports = plan
 		.imports
 		.iter()
@@ -465,8 +534,33 @@ fn emit_virtual_runtime_module(
 			)
 		})
 		.collect::<Vec<_>>();
-	let mut source =
-		nymph_codegen::emit_for_project_module_with_imports(&hir, &current_module, &runtime_imports);
+	let mut source = if transactional {
+		let imported_top_level_lets = plan
+			.imports
+			.iter()
+			.filter(|import| {
+				matches!(
+					import.definition.key,
+					nymph_sema::DeclarationKey::TopLevel {
+						category: nymph_sema::DeclarationCategory::Let,
+						..
+					}
+				)
+			})
+			.map(|import| import.binding.as_str().to_string())
+			.collect::<Vec<_>>();
+		nymph_codegen::emit_for_transactional_project_module_checked(
+			&hir,
+			&current_module,
+			&runtime_imports,
+			&imported_top_level_lets,
+		)
+		.map_err(|(module, symbol)| {
+			format!("strict REPL mode rejects unaudited stateful external `{module}::{symbol}`")
+		})?
+	} else {
+		nymph_codegen::emit_for_project_module_with_imports(&hir, &current_module, &runtime_imports)
+	};
 	prepend_external_aliases(&mut source, &plan.external_aliases);
 	if !plan.exports.is_empty() {
 		source.push_str(&format!(
@@ -487,7 +581,7 @@ pub(crate) fn compiled_interface_project<'db>(
 	db: &'db dyn Db,
 	key: ProjectKey<'db>,
 ) -> StableEmissionResult<CompiledProject> {
-	let emitted = match emitted_interface_project(db, key) {
+	let emitted = match emitted_interface_project(db, key, false) {
 		StableEmissionResult::Value(value) => value,
 		StableEmissionResult::Diagnostics(diagnostics) => {
 			return StableEmissionResult::Diagnostics(diagnostics);
