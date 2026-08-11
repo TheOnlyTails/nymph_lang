@@ -1,8 +1,23 @@
-//! The Nymph language server: a synchronous `lsp-server` loop (no
-//! tokio/async — the compiler facade it wraps is synchronous) providing
-//! diagnostics, hover, document/workspace symbols, navigation, rename, and completion
-//! over stdio, spawned by the VS Code extension (`extension/src/extension.ts`)
-//! from its target-specific packaged payload.
+//! The Nymph language server: one serialized `lsp-server` protocol/state
+//! owner plus a fixed, bounded pool for synchronous compiler work. The owner
+//! applies messages in order, creates immutable revisioned document snapshots,
+//! tracks cancellation and diagnostic ownership, and is the only code that
+//! sends analysis-derived responses or publications. Project-affine workers
+//! each reconstruct and mutate a private [`compiler_state::CompilerState`];
+//! Salsa databases and memo storage are never cloned or shared across workers.
+//! This keeps the message loop responsive without making the compiler itself
+//! async. The server runs over stdio, spawned by the VS Code extension
+//! (`extension/src/extension.ts`) from its target-specific packaged payload.
+//!
+//! `$/cancelRequest` accepts numeric and string request IDs and completes a
+//! cancelled request with `RequestCanceled` (`-32800`). Workers check tokens
+//! before and after compiler/query phases and while converting multi-result
+//! diagnostics. Successful work is published only if its canonical
+//! project/document generation and exact open-document lifecycle still match;
+//! otherwise requests receive `ContentModified` and stale diagnostics are
+//! suppressed. New diagnostics supersede pending or running work for the same
+//! canonical project/document. Shutdown cancels outstanding work, closes the
+//! bounded queues, drains submitted tasks, and joins every worker.
 //!
 //! MVP scope (see `extension/README.md`): `textDocument/didOpen` /
 //! `didChange` (full sync) / `didClose` keep an in-memory [`DocumentStore`]
@@ -30,6 +45,7 @@
 //! Incremental sync is deliberately out of scope. Document and
 //! range formatting use the canonical formatter against the open buffer.
 
+mod analysis_scheduler;
 pub mod compiler_state;
 pub mod completion;
 pub mod definition;
@@ -43,33 +59,32 @@ mod position;
 pub mod references;
 mod rename;
 pub mod semantic_tokens;
+mod server;
 pub mod workspace;
 pub mod workspace_symbols;
 
 use std::sync::{Arc, Mutex};
 
 use document_store::DocumentStore;
-use lsp_server::{
-	Connection, Message, Notification as ServerNotification, Request as ServerRequest, RequestId,
-	Response,
-};
+use lsp_server::{Connection, Message, Request as ServerRequest, RequestId, Response};
 use lsp_types::{
-	CompletionOptions, CompletionParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-	DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-	DocumentFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams, FileSystemWatcher,
-	GlobPattern, GotoDefinitionParams, HoverParams, HoverProviderCapability, InitializeParams,
-	InitializeResult, OneOf, ReferenceParams, Registration, RegistrationParams, RenameOptions,
-	RenameParams, SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams,
+	CompletionOptions, DidChangeWatchedFilesRegistrationOptions, FileSystemWatcher, GlobPattern,
+	HoverProviderCapability, InitializeParams, InitializeResult, OneOf, Registration,
+	RegistrationParams, RenameOptions, SemanticTokensFullOptions, SemanticTokensOptions,
 	SemanticTokensServerCapabilities, ServerCapabilities, ServerInfo, TextDocumentSyncCapability,
-	TextDocumentSyncKind, WorkspaceSymbolParams,
-	notification::{
-		DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
-		Notification as _,
-	},
+	TextDocumentSyncKind,
+	notification::{DidChangeWatchedFiles, Notification as _},
+	request::{RegisterCapability, Request as _},
+};
+
+#[cfg(test)]
+use lsp_types::{
+	DidChangeTextDocumentParams, DidChangeWatchedFilesParams, DidCloseTextDocumentParams,
+	DidOpenTextDocumentParams, HoverParams, RenameParams,
+	notification::{DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument},
 	request::{
 		Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
-		PrepareRenameRequest, RangeFormatting, References, RegisterCapability, Rename, Request as _,
-		SemanticTokensFullRequest, WorkspaceSymbolRequest,
+		PrepareRenameRequest, RangeFormatting, References, Rename, SemanticTokensFullRequest,
 	},
 };
 
@@ -211,75 +226,17 @@ fn serve(
 	main_loop(&connection, &docs, &compiler, &mut client_state)
 }
 
-fn prepare_if_current<T>(
-	docs: &Mutex<DocumentStore>,
-	uri: &lsp_types::Uri,
-	snapshot: &compiler_state::AnalysisSnapshot,
-	value: T,
-) -> Option<T> {
-	let mut prepared = None;
-	{
-		let docs = docs.lock().unwrap();
-		compiler_state::publish_if_current(&docs, uri, snapshot, value, |value| {
-			prepared = Some(value);
-		});
-	}
-	prepared
-}
-
-fn prepare_hover_response(
-	docs: &Mutex<DocumentStore>,
-	uri: &lsp_types::Uri,
-	snapshot: &compiler_state::AnalysisSnapshot,
-	value: Option<lsp_types::Hover>,
-) -> Option<Option<lsp_types::Hover>> {
-	prepare_if_current(docs, uri, snapshot, value)
-}
-
-fn prepare_semantic_tokens_response(
-	docs: &Mutex<DocumentStore>,
-	uri: &lsp_types::Uri,
-	snapshot: &compiler_state::AnalysisSnapshot,
-	value: Option<lsp_types::SemanticTokensResult>,
-) -> Option<Option<lsp_types::SemanticTokensResult>> {
-	prepare_if_current(docs, uri, snapshot, value)
-}
-
-fn prepare_definition_response(
-	docs: &Mutex<DocumentStore>,
-	uri: &lsp_types::Uri,
-	snapshot: &compiler_state::AnalysisSnapshot,
-	value: Option<lsp_types::GotoDefinitionResponse>,
-) -> Option<Option<lsp_types::GotoDefinitionResponse>> {
-	prepare_if_current(docs, uri, snapshot, value)
-}
-
-fn prepare_references_response(
-	docs: &Mutex<DocumentStore>,
-	uri: &lsp_types::Uri,
-	snapshot: &compiler_state::AnalysisSnapshot,
-	value: Option<Vec<lsp_types::Location>>,
-) -> Option<Option<Vec<lsp_types::Location>>> {
-	prepare_if_current(docs, uri, snapshot, value)
-}
-
-fn prepare_completion_response(
-	docs: &Mutex<DocumentStore>,
-	uri: &lsp_types::Uri,
-	snapshot: &compiler_state::CompletionSnapshot,
-	value: lsp_types::CompletionResponse,
-) -> Option<Option<lsp_types::CompletionResponse>> {
-	let mut prepared = None;
-	{
-		let docs = docs.lock().unwrap();
-		compiler_state::publish_completion_if_current(&docs, uri, snapshot, Some(value), |value| {
-			prepared = Some(value);
-		});
-	}
-	prepared
-}
-
 fn main_loop(
+	connection: &Connection,
+	docs: &Arc<Mutex<DocumentStore>>,
+	compiler: &Arc<Mutex<compiler_state::CompilerState>>,
+	client_state: &mut ClientState,
+) -> anyhow::Result<()> {
+	server::main_loop(connection, docs, compiler, client_state)
+}
+
+#[cfg(any())]
+fn synchronous_main_loop(
 	connection: &Connection,
 	docs: &Arc<Mutex<DocumentStore>>,
 	compiler: &Arc<Mutex<compiler_state::CompilerState>>,
@@ -544,6 +501,7 @@ fn main_loop(
 	Ok(())
 }
 
+#[cfg(any())]
 fn handle_notification(
 	connection: &Connection,
 	docs: &Arc<Mutex<DocumentStore>>,
@@ -1187,6 +1145,8 @@ mod tests {
 			3,
 			"public func value(): int = 1",
 		);
+		let retired = recv_diagnostics_for(&client, &dependency_uri);
+		assert!(retired.diagnostics.is_empty());
 		recv_diagnostics_for(&client, &alternate_uri);
 		assert!(
 			recv_diagnostics_for(&client, &importer_uri)
@@ -1324,7 +1284,7 @@ mod tests {
 			3,
 			"public func value(): int = true",
 		);
-		for _ in 0..2 {
+		for _ in 0..3 {
 			recv_diagnostics(&client);
 		}
 
@@ -1336,39 +1296,7 @@ mod tests {
 		assert!(client.receiver.try_recv().is_err());
 
 		send_close(&client, alternate_uri.clone());
-		client
-			.sender
-			.send(Message::Request(Request::new(
-				RequestId::from(99),
-				HoverRequest::METHOD.into(),
-				serde_json::to_value(HoverParams {
-					text_document_position_params: TextDocumentPositionParams {
-						text_document: TextDocumentIdentifier {
-							uri: importer_uri.clone(),
-						},
-						position: Position::new(1, 18),
-					},
-					work_done_progress_params: WorkDoneProgressParams::default(),
-				})
-				.unwrap(),
-			)))
-			.unwrap();
-		let mut last_close = Vec::new();
-		loop {
-			match client.receiver.recv().unwrap() {
-				Message::Notification(notification)
-					if notification.method == lsp_types::notification::PublishDiagnostics::METHOD =>
-				{
-					last_close
-						.push(serde_json::from_value::<PublishDiagnosticsParams>(notification.params).unwrap());
-				}
-				Message::Response(response) => {
-					assert_eq!(response.id, RequestId::from(99));
-					break;
-				}
-				other => panic!("expected diagnostics or hover response, got {other:?}"),
-			}
-		}
+		let last_close = barrier_diagnostics(&client, 99);
 		assert_eq!(
 			last_close
 				.iter()
@@ -1964,42 +1892,7 @@ mod tests {
 				.unwrap(),
 			)))
 			.unwrap();
-		client
-			.sender
-			.send(Message::Request(Request::new(
-				RequestId::from(20),
-				HoverRequest::METHOD.into(),
-				serde_json::to_value(HoverParams {
-					text_document_position_params: TextDocumentPositionParams {
-						text_document: TextDocumentIdentifier {
-							uri: dependency_uri.clone(),
-						},
-						position: Position {
-							line: 0,
-							character: 12,
-						},
-					},
-					work_done_progress_params: WorkDoneProgressParams::default(),
-				})
-				.unwrap(),
-			)))
-			.unwrap();
-		let mut publications = Vec::new();
-		loop {
-			match client.receiver.recv().unwrap() {
-				Message::Response(response) => {
-					assert_eq!(response.id, RequestId::from(20));
-					break;
-				}
-				Message::Notification(notification)
-					if notification.method == lsp_types::notification::PublishDiagnostics::METHOD =>
-				{
-					publications
-						.push(serde_json::from_value::<PublishDiagnosticsParams>(notification.params).unwrap());
-				}
-				other => panic!("expected diagnostics or hover response, got {other:?}"),
-			}
-		}
+		let publications = barrier_diagnostics(&client, 20);
 		assert_eq!(
 			publications
 				.iter()
@@ -2687,41 +2580,6 @@ mod tests {
 			"the transitioned open document must be republished exactly once"
 		);
 		shutdown(&client, handle);
-	}
-
-	#[test]
-	fn previous_lifecycle_responses_are_not_prepared_after_same_version_reopen() {
-		let uri: lsp_types::Uri = "file:///wire_stale_analysis.nym".parse().unwrap();
-		let mut docs = DocumentStore::default();
-		let mut compiler = CompilerState::new();
-		compiler
-			.open(&mut docs, uri.clone(), "func f(): int = 1".into(), 1)
-			.unwrap();
-		let snapshot = compiler.analysis_for_uri(&docs, &uri).unwrap();
-		let completion_snapshot = compiler.completion_for_uri(&docs, &uri).unwrap();
-		compiler.close(&mut docs, &uri).unwrap();
-		compiler
-			.open(&mut docs, uri.clone(), "func f(): boolean = true".into(), 1)
-			.unwrap();
-		let docs = Mutex::new(docs);
-
-		assert!(prepare_hover_response(&docs, &uri, &snapshot, None).is_none());
-		assert!(prepare_semantic_tokens_response(&docs, &uri, &snapshot, None).is_none());
-		assert!(prepare_definition_response(&docs, &uri, &snapshot, None).is_none());
-		assert!(prepare_references_response(&docs, &uri, &snapshot, None).is_none());
-		assert!(
-			prepare_if_current(&docs, &uri, &snapshot, lsp_types::WorkspaceEdit::default(),).is_none(),
-			"rename edits from a prior close/reopen lifecycle must not be published"
-		);
-		assert!(
-			prepare_completion_response(
-				&docs,
-				&uri,
-				&completion_snapshot,
-				lsp_types::CompletionResponse::Array(Vec::new()),
-			)
-			.is_none()
-		);
 	}
 
 	#[test]

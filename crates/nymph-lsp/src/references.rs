@@ -19,14 +19,19 @@ pub(crate) struct ReferencesResponseCandidate {
 impl ReferencesResponseCandidate {
 	/// Reject the whole immutable result if an unopened project source changed
 	/// after the session snapshot was built.
+	#[cfg(test)]
 	pub(crate) fn validate_disk_sources(self) -> Option<Vec<Location>> {
+		self.validate_disk_sources_result().ok()
+	}
+
+	pub(crate) fn validate_disk_sources_result(self) -> Result<Vec<Location>, ()> {
 		for (path, expected) in self.disk_sources {
-			let current = std::fs::read_to_string(path).ok()?;
+			let current = std::fs::read_to_string(path).map_err(|_| ())?;
 			if current.as_str() != expected.as_ref() {
-				return None;
+				return Err(());
 			}
 		}
-		Some(self.locations)
+		Ok(self.locations)
 	}
 }
 

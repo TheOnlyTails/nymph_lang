@@ -1266,6 +1266,22 @@ impl CompilerSession {
 		Self::with_builtin_sources(sources, callback, threshold)
 	}
 
+	/// Create an empty, mutation-isolated session with the same compiler-owned
+	/// sources, event callback, and tombstone policy as this session.
+	///
+	/// This reconstructs a fresh Salsa database rather than cloning `self`;
+	/// callers may therefore mutate the two sessions concurrently without
+	/// sharing memo storage.
+	#[doc(hidden)]
+	#[must_use]
+	pub fn isolated_empty(&self) -> Self {
+		Self::with_builtin_sources(
+			self.builtin_sources.clone(),
+			self.event_callback.clone(),
+			self.tombstone_threshold,
+		)
+	}
+
 	fn with_builtin_sources(
 		builtin_sources: BTreeMap<Arc<str>, Arc<str>>,
 		callback: Arc<dyn Fn(&str) + Send + Sync>,

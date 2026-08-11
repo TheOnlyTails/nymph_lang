@@ -65,13 +65,17 @@ impl DefinitionResponseCandidate {
 	/// intentionally retains disk sources between filesystem events, so an
 	/// externally changed or deleted file must not receive a stale location.
 	pub(crate) fn validate_disk_source(self) -> Option<GotoDefinitionResponse> {
+		self.validate_disk_source_result().ok()
+	}
+
+	pub(crate) fn validate_disk_source_result(self) -> Result<GotoDefinitionResponse, ()> {
 		if let Some((path, expected)) = self.disk_source {
-			let current = std::fs::read_to_string(path).ok()?;
+			let current = std::fs::read_to_string(path).map_err(|_| ())?;
 			if current.as_str() != expected.as_ref() {
-				return None;
+				return Err(());
 			}
 		}
-		Some(self.response)
+		Ok(self.response)
 	}
 }
 

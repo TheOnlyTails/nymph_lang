@@ -15,26 +15,41 @@ use std::collections::HashMap;
 pub struct Document {
 	pub text: String,
 	pub version: i32,
+	/// Owner revision of the notification that last opened or changed this
+	/// URI. Worker-local compiler sessions use it to replay equivalent URI
+	/// overlays in the same authoritative order as the protocol owner.
+	pub(crate) update_revision: DocumentStoreRevision,
+	/// Owner revision that began this URI's current open lifecycle.
+	pub(crate) lifecycle_revision: DocumentStoreRevision,
 }
 
 /// Monotonic identity for one complete state of the open-document overlays.
 /// Unlike an LSP document version, this spans URIs and open/close lifecycles,
 /// so snapshots that depend on imports can be rejected after any overlay
 /// changes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DocumentStoreRevision(u64);
 
 #[derive(Clone, Default)]
 pub struct DocumentStore {
 	docs: HashMap<Uri, Document>,
 	revision: DocumentStoreRevision,
+	filesystem_revision: u64,
 }
 
 impl DocumentStore {
 	/// Record a newly opened document (`textDocument/didOpen`).
 	pub fn open(&mut self, uri: Uri, text: String, version: i32) {
 		self.advance_revision();
-		self.docs.insert(uri, Document { text, version });
+		self.docs.insert(
+			uri,
+			Document {
+				text,
+				version,
+				update_revision: self.revision,
+				lifecycle_revision: self.revision,
+			},
+		);
 	}
 
 	/// Replace an open document's full text (`textDocument/didChange` under
@@ -49,6 +64,7 @@ impl DocumentStore {
 		let doc = self.docs.get_mut(uri).expect("document checked above");
 		doc.text = text;
 		doc.version = version;
+		doc.update_revision = self.revision;
 		true
 	}
 
@@ -77,11 +93,33 @@ impl DocumentStore {
 		self.docs.iter()
 	}
 
+	/// Open documents in protocol-authoritative update order. The URI tie-break
+	/// is defensive (revisions are unique) and keeps reconstruction deterministic.
+	pub(crate) fn documents_in_update_order(&self) -> Vec<(&Uri, &Document)> {
+		let mut documents = self.docs.iter().collect::<Vec<_>>();
+		documents.sort_by(|(left_uri, left), (right_uri, right)| {
+			left
+				.update_revision
+				.cmp(&right.update_revision)
+				.then_with(|| left_uri.as_str().cmp(right_uri.as_str()))
+		});
+		documents
+	}
+
 	/// Advance the shared publication revision for a filesystem event. Open
 	/// document contents are unchanged, but project snapshots may now contain
 	/// different disk-backed modules or manifest discovery results.
 	pub fn filesystem_changed(&mut self) {
 		self.advance_revision();
+		self.filesystem_revision = self
+			.filesystem_revision
+			.checked_add(1)
+			.expect("document store filesystem revision exhausted");
+	}
+
+	#[must_use]
+	pub(crate) fn filesystem_revision(&self) -> u64 {
+		self.filesystem_revision
 	}
 
 	fn advance_revision(&mut self) {

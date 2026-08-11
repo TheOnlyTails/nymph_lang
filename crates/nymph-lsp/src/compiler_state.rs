@@ -189,6 +189,25 @@ impl CompilerState {
 		Self::from_session(CompilerSession::new())
 	}
 
+	/// Construct an empty worker state with deeply reconstructed compiler
+	/// sessions. In particular, this does not clone either Salsa database.
+	pub(crate) fn isolated_empty(&self) -> Self {
+		Self {
+			session: self.session.isolated_empty(),
+			stdlib_session: self.stdlib_session.isolated_empty(),
+			workspaces: HashMap::new(),
+			synchronized_roots: HashSet::new(),
+			documents: HashMap::new(),
+			effective_sources: HashMap::new(),
+			authoritative_overlays: HashMap::new(),
+			project_disk_files: HashMap::new(),
+			manifest_errors: HashMap::new(),
+			workspace_symbol_refresh_errors: HashSet::new(),
+			diagnostic_targets: HashMap::new(),
+			diagnostic_owners: HashMap::new(),
+		}
+	}
+
 	#[doc(hidden)]
 	pub fn with_event_callback(callback: impl Fn(&str) + Send + Sync + 'static) -> Self {
 		Self::from_session(CompilerSession::with_event_callback_and_tombstone_threshold(callback, 256))
@@ -586,6 +605,13 @@ impl CompilerState {
 					.or_else(|| self.publication_uri(docs, identity, &module))
 			})
 			.collect()
+	}
+
+	/// Ordered reverse-importer publication targets for the worker-owned
+	/// compiler/document revision. The protocol owner never calls this against
+	/// mutable shared state; it is exposed only for asynchronous diagnostic jobs.
+	pub(crate) fn affected_documents(&self, docs: &DocumentStore, uri: &Uri) -> Vec<Uri> {
+		self.affected_project_documents(docs, uri)
 	}
 
 	fn publication_uri(

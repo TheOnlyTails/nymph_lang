@@ -22,8 +22,11 @@ pub(crate) struct RenameCandidate {
 }
 
 impl RenameCandidate {
-	pub(crate) fn validate_prepare(self) -> Option<PrepareRenameResponse> {
-		self.disk_sources_are_current().then_some(self.prepare)
+	pub(crate) fn validate_prepare(self) -> Result<PrepareRenameResponse, RenameContentModified> {
+		self
+			.disk_sources_are_current()
+			.then_some(self.prepare)
+			.ok_or(RenameContentModified)
 	}
 
 	pub(crate) fn validate_disk_sources(self) -> Result<WorkspaceEdit, RenameContentModified> {
