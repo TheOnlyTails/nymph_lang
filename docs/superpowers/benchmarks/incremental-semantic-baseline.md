@@ -198,3 +198,24 @@ Absolute ratios differ from the 16-logical-CPU July measurements because native
 cold diagnostics prewarm independent semantic roots in parallel; retained-session
 acceptance remains based on paired same-process ratios and passes all required
 gates.
+
+An independent cutover review repeated the current cases at `c08a8a2` with the
+same toolchain, build settings, fixture, 10 samples, 1-second warm-up, and
+3-second requested measurement window. The ordinary current harness measured
+460.34 ms diagnostics (456.93–464.68 ms) and 477.14 ms full compile
+(473.55–481.04 ms). The historical executable above installed a process-global
+counting allocator that performs relaxed atomic updates on every allocation,
+reallocation, and deallocation; the current executable did not. Repeating the
+current cases with that exact allocator instrumentation measured 868.81 ms
+diagnostics (854.57–886.03 ms) and 843.16 ms full compile
+(817.53–870.22 ms), or 7.23× and 6.16× the instrumented historical point
+estimates. The original 4.14×/3.66× comparison therefore understates rather
+than causes the regression and demonstrates that the stable pipeline is much
+more allocation-sensitive. Because diagnostics account for essentially the
+whole uninstrumented full-compile time, the measured cost is already present in
+the diagnostics path rather than stable lowering, emission, or bundling. The
+allocator experiment establishes allocation sensitivity but does not distinguish
+environment construction, canonical fact instantiation, and checker work inside
+that path; no sampling or allocation profiler was available in the review orb.
+Optimizing that ownership-preserving work remains open; the #80 acceptance text
+requires investigation but specifies no clean-build ratio ceiling.
