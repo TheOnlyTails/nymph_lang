@@ -290,7 +290,7 @@ fn a_std_key_mangles_to_valid_runnable_js() {
 }
 
 /// Regression: a `std::`-keyed module's OWN genuine type error, found on its
-/// own turn (not as some other module's flattened-prelude dependency), must
+/// own semantic-analysis turn, must
 /// be reported — never silently dropped. `check_project_with_std` must
 /// return this diagnostic, not an empty list, exactly as it would for an
 /// ordinary `@/…`-keyed project module with the same bug.

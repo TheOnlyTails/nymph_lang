@@ -1335,7 +1335,7 @@ fn walk_expr_uses(
 		ExprKind::Call { func, args, .. } => {
 			// A construction (`Ok(value = x)`, `Circle(radius = n)`): the
 			// checker resolves the variant against the CALL's own NodeId
-			// (not `func`'s), matching `lower_hir`'s `variant_new(expr.id)`.
+			// (not `func`'s), matching stable variant-constructor projection.
 			// When resolved, color the func sub-expression's own name span
 			// and skip walking `func` further (it's fully classified);
 			// otherwise try the narrow name-set fallback, then fall back to

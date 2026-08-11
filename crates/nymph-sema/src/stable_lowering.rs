@@ -488,8 +488,8 @@ impl From<StableNameLookupError> for StableLoweringError {
 	}
 }
 
-/// Lowers one checked, location-free runtime artifact. This deliberately accepts
-/// no module, compatibility annotation table, prelude offset, or symbol map.
+/// Lowers one checked, location-free runtime artifact from stable semantic IDs;
+/// source modules and location-based annotation or symbol tables are not inputs.
 pub fn lower_runtime_definition(
 	context: &impl StableLoweringContext,
 	artifact: Arc<RuntimeDefinition>,
@@ -3575,8 +3575,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				let scrutinee = Box::new(self.lower(lhs)?);
 				// Pattern-operator bindings are scoped to the test and must not replace
 				// an outer source-name mapping used by following expressions. Lower the
-				// source first to preserve source-order name allocation, matching the
-				// compatibility lowering path.
+				// source first to preserve source-order name allocation in stable lowering.
 				self.scopes.borrow_mut().push(HashMap::new());
 				let pat = self.lower_pattern(rhs);
 				self.scopes.borrow_mut().pop();

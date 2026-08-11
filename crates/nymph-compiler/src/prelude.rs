@@ -10,36 +10,22 @@
 //! these `stdlib/src/**` files is embedded into the binary via `include_str!`.
 //! The project driver keeps each ambient module as its own Salsa input and
 //! query key, while exact canonical source bytes reuse an independently cached
-//! immutable parse. The legacy flattened-prelude path retains its own parsed
-//! `Vec<Module>` cache.
+//! immutable parse.
 //!
 //! `nymph-sema` deliberately does *not* depend on `nymph-syntax` (a heavyweight
 //! parser dependency an otherwise dependency-light checker crate has no other
 //! reason to pull in); `nymph-compiler` already depends on both, so it — not
 //! `nymph-sema` — owns embedding and parsing the prelude sources.
 //!
-//! The intra-core `@/…` imports each of these files carries (e.g.
-//! `option.nym`'s `import @/default`) are inert once flattened: the checker
-//! drops every `Declaration::Import` when flattening a prelude module (see
-//! `nymph_sema::prelude::check_module_with_prelude_impl`), so they never spawn
-//! a project-level module lookup — core is passed straight to check/lower as
-//! `&[Module]`, bypassing the project driver's import resolution entirely.
-//! This is also what makes the `Option`/`Result` cycle (`convert.nym` imports
-//! both, one-way; `option.nym`/`result.nym` do not import each other — see
-//! MT4) harmless here: the whole bundle shares one flattened scope.
+//! Intra-core `@/…` imports use normal project module resolution. Cycles are
+//! represented in the module graph and semantic environments rather than by
+//! combining source scopes.
 
-use std::sync::OnceLock;
-
-use nymph_ast::decl::Module;
-
-/// One core source file: its `std/…` display name (kept for span-scrub
-/// compatibility — see `nymph_sema::prelude::scrub_prelude_labels`) and its
+/// One core source file: its canonical `std/…` display name and its
 /// `include_str!`-embedded source.
 ///
-/// Order matters only for readability/debuggability (name resolution over a
-/// flattened prelude slice is order-independent — the checker builds a
-/// def-map over the combined members), but `convert` is still listed after
-/// `option`/`result` since it imports both.
+/// Order is retained for deterministic display and diagnostics; semantic
+/// resolution uses each module's complete environment.
 const CORE_SOURCES: &[(&str, &str)] = &[
 	("std/ops", include_str!("../../../stdlib/src/ops/mod.nym")),
 	(
@@ -99,33 +85,4 @@ pub(crate) fn core_source(path: &str) -> Option<(usize, &'static str)> {
 		.find_map(|(index, (display, source))| {
 			(display.strip_prefix("std/") == Some(path)).then_some((index, *source))
 		})
-}
-
-static CORE_PRELUDE: OnceLock<Vec<Module>> = OnceLock::new();
-
-/// Parse one embedded core source, panicking (via `debug_assert`, same as the
-/// prior single-module `ops_prelude`) if it fails to parse — every entry in
-/// [`CORE_SOURCES`] is real, checked-in stdlib source, never user input.
-fn parse_core_source(display_name: &str, source: &str) -> Module {
-	let parsed = nymph_syntax::parse_module(source, display_name);
-	debug_assert!(
-		parsed.diagnostics.iter().all(|d| !d.is_error()),
-		"the embedded {display_name} core module failed to parse: {:?}",
-		parsed.diagnostics
-	);
-	parsed.tree
-}
-
-/// The parsed `core` prelude — every module in [`CORE_SOURCES`], parsed once
-/// and cached. Every call site that used to pass the single `std/ops` module
-/// as `[Module; 1]` now passes this whole slice.
-pub(crate) fn core_prelude() -> &'static [Module] {
-	CORE_PRELUDE
-		.get_or_init(|| {
-			CORE_SOURCES
-				.iter()
-				.map(|(name, source)| parse_core_source(name, source))
-				.collect()
-		})
-		.as_slice()
 }

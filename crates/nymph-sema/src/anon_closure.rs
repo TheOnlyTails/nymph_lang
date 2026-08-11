@@ -22,10 +22,9 @@
 //! every existing closure code path start to finish: [`Checker::form_anon_closure`]
 //! mirrors `infer_closure`/`check_closure`'s param-binding shape (minus the
 //! `generics_stack` frame, exactly like a real closure never declares generics
-//! either), and `lower_hir::Lowerer::lower_anon_closure` mirrors `lower_closure`
-//! byte for byte. The one new piece of machinery either side needs is a channel
-//! from the checker's boundary DECISION back to lowering (which re-walks the
-//! original AST and has no type/solver access of its own): committed boundaries
+//! either), and stable runtime lowering projects the same ordinary closure form.
+//! The one new piece of machinery either side needs is a channel from the
+//! checker's boundary decision to lowering: committed boundaries
 //! are recorded on [`crate::annotate::Annotations`] (`record_anon_boundary`),
 //! keyed by [`NodeId`] — see that type's doc comment.
 //!

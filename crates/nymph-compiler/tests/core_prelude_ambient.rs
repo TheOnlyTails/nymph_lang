@@ -304,7 +304,7 @@ fn ambient_boxed_float_intrinsics_cover_the_complete_runtime_surface() {
 /// `max_int`, `min_int` — literal-initialized, never `external`) are ambient
 /// too, and must be genuinely usable with no import: a bare reference type-
 /// checks (name resolution sees every core module's names) AND runs correctly
-/// under Node. Before the fix this locks in, `lower_hir_with_prelude`'s
+/// under Node. Before the fix this locks in, ambient runtime lowering's
 /// materialization machinery only ever demand-materialized prelude
 /// FUNCTIONS/METHODS (`try_materialize_prelude_dispatch`,
 /// `materialize_referenced_prelude_enums`) — a bare identifier referencing a

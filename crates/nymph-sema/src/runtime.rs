@@ -487,8 +487,8 @@ pub struct RuntimeDefinition {
 }
 
 /// Project top-level runtime artifacts directly from checker facts. Member and
-/// aggregate channels are represented by the schema and will be connected to
-/// production lowering in the next #79 unit; no compatibility lookup is used.
+/// aggregate channels are represented by the schema and projected through
+/// stable definition identity; no name- or span-based lookup is used.
 pub fn runtime_definitions(
 	module: &nymph_ast::decl::Module,
 	checked: &crate::CheckedFacts,

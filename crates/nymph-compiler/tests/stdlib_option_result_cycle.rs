@@ -7,7 +7,7 @@
 //! `Result::ok`/`err` built an `Option`). Run through the REAL multi-module
 //! project driver (`nymph_compiler::check_project`, what the CLI's project
 //! build actually calls, over a loader reading the real `stdlib/src` files —
-//! not `nymph_sema::check_program`, which flattens every module into one
+//! using the stable project graph rather than combining module syntax into one
 //! namespace and drops `import`s entirely, so it can never see a cycle), that
 //! mutual import is rejected outright by the import-graph cycle detector
 //! ("import cycle detected: option -> result -> option"), so NO real program

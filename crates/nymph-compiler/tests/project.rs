@@ -386,7 +386,7 @@ fn imported_direct_and_default_interface_methods_run_under_node() {
 
 #[test]
 fn imported_struct_construction_lowers_to_new_not_a_plain_call() {
-	// Regression pin for the cross-module `struct_names` gap `lower_hir.rs`
+	// Regression pin for a cross-module stable runtime identity gap that
 	// flagged: an imported struct constructor call must lower to `new`, not
 	// a plain function call (which would just crash at runtime).
 	let files = FxHashMap::from_iter([
@@ -527,7 +527,7 @@ fn a_namespace_name_colliding_with_a_with_name_is_a_diagnostic() {
 #[test]
 fn interface_only_dependency_module_bundles_successfully() {
 	// A dependency whose only top-level declaration is a (default-visibility)
-	// `interface` must not break bundling: `nymph_sema::lower_hir` never emits
+	// `interface` must not break bundling: stable lowering never emits
 	// a JS binding for an `Interface` declaration, so the synthesized
 	// `export`/`import` lines must not name it either.
 	let files = FxHashMap::from_iter([

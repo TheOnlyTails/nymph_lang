@@ -206,7 +206,7 @@ fn function_valued_operator_operand_is_reported() {
 	// concretely, a first-class function value. `resolve_fallback_operand` returned
 	// `None` for it (not primitive, not ADT, not `Param`), and the diagnostic guard
 	// only fired for a still-unresolved `Infer` var, so this used to type-check with
-	// zero diagnostics and then ICE in `lower_hir` on `None => panic!(..)` -- the
+	// zero diagnostics and then ICE during runtime lowering -- the
 	// exact "valid program reaches an unrecoverable panic" pathology this closes.
 	assert_error_contains(
 		"func g(x: int): int = x
@@ -1174,7 +1174,7 @@ fn nested_impl_with_duplicate_method_name_is_reported() {
 	// HH3 (Slice 4K): before this, a nested `impl Iface { .. }` block declaring the
 	// same method name twice type-checked completely clean (silent last-wins in
 	// `finish_interface_impl`'s `methods.insert`), and the first (shadowed, never
-	// checked) body still reached `lower_hir.rs`'s `assert_no_duplicate_methods`,
+	// checked) body still reached runtime lowering's duplicate-method assertion,
 	// which panicked — this is the ledgered ICE probe turned into a diagnostic test.
 	assert_error_contains(
 		&format!(
@@ -1213,7 +1213,7 @@ fn nested_impl_method_colliding_with_inherent_method_is_reported() {
 	// struct body) and a nested `impl Iface { .. }` method of the SAME name. This
 	// used to type-check clean (the two collection passes — `members.rs`'s inherent
 	// map and `iface.rs`'s `finish_interface_impl` — never compared notes) and then
-	// panic in `lower_hir.rs`'s `assert_no_duplicate_methods`.
+	// panic in runtime lowering's duplicate-method assertion.
 	assert_error_contains(
 		&format!(
 			"{PLUS}

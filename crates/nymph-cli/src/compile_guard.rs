@@ -2,7 +2,7 @@
 //! critical #2).
 //!
 //! Lowering panics on purpose for deferred-but-type-checked language features
-//! (see `crates/nymph-sema/src/lower_hir.rs`) — a program can pass parsing
+//! during stable runtime lowering — a program can pass parsing
 //! and type-checking and still hit a `panic!` once the compiler tries to
 //! lower it to HIR. Left unguarded, that panic would cross `build`/`run` as a
 //! raw Rust panic: a backtrace-shaped stderr dump and exit code 101, nothing

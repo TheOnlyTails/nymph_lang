@@ -26,7 +26,7 @@ pub struct DeclaredHeaders {
 	pub definitions: Vec<(EcoString, DefinitionId)>,
 	/// Exact identities keyed by their source module-member index.
 	pub member_definitions: Vec<(usize, DefinitionId)>,
-	/// Exact checker-visible names, including compatibility rewrite prefixes.
+	/// Exact diagnostic spellings used to disambiguate imported definitions.
 	/// This is deliberately separate from source headers: imported definitions
 	/// may share a source name with an item owned by this module.
 	pub checked_definitions: Vec<(EcoString, DefinitionId)>,
@@ -47,48 +47,11 @@ impl ExtractionFactSelection {
 
 	#[must_use]
 	pub fn current_module_from_facts(module: &Module, checked: &CheckedFacts) -> Self {
-		if checked.semantic.has_explicit_local_ranges {
-			return Self {
-				implementations: checked.semantic.local_implementations.clone(),
-				inherent: checked.semantic.local_inherent.clone(),
-				include_private_definitions: false,
-			};
-		}
-		let current_implementations = checked
-			.semantic
-			.implementations
-			.impls
-			.iter()
-			.enumerate()
-			.filter(|(_, implementation)| {
-				implementation
-					.legacy_span
-					.is_some_and(|span| span.start < crate::prelude::SPAN_BASE)
-			})
-			.map(|(index, _)| index)
-			.collect::<Vec<_>>();
-		let inherent = module
-			.members
-			.iter()
-			.filter(|declaration| {
-				matches!(
-					declaration,
-					Declaration::Struct { .. } | Declaration::Enum { .. } | Declaration::Impl { .. }
-				)
-			})
-			.count();
-		let implementations = match (
-			current_implementations.first(),
-			current_implementations.last(),
-		) {
-			(Some(first), Some(last)) => *first..last + 1,
-			(None, None) => 0..0,
-			_ => unreachable!(),
-		};
-		let inherent_end = checked.semantic.inherent.len();
+		debug_assert!(checked.semantic.has_explicit_local_ranges);
+		let _ = module;
 		Self {
-			implementations,
-			inherent: inherent_end.saturating_sub(inherent)..inherent_end,
+			implementations: checked.semantic.local_implementations.clone(),
+			inherent: checked.semantic.local_inherent.clone(),
 			include_private_definitions: false,
 		}
 	}
@@ -1443,7 +1406,7 @@ pub(crate) fn assign_runtime_body_identities(
 	{
 		let Some((_, _, mutable, _)) = implementation_sources
 			.iter()
-			.find(|(span, ..)| Some(*span) == implementation.legacy_span)
+			.find(|(span, ..)| Some(*span) == implementation.source_span)
 		else {
 			continue;
 		};
@@ -1522,7 +1485,7 @@ pub(crate) fn assign_runtime_body_identities(
 		let mut member_ids = StableIdBuilder::new(identity.clone());
 		let source_runtime_members = implementation_sources
 			.iter()
-			.find(|(span, ..)| Some(*span) == implementation.legacy_span)
+			.find(|(span, ..)| Some(*span) == implementation.source_span)
 			.map(|(_, _, _, members)| {
 				members
 					.iter()
@@ -1704,7 +1667,7 @@ pub(crate) fn assign_runtime_body_identities(
 	for implementation in local_impls {
 		let Some((_, path, _, members)) = implementation_sources
 			.iter()
-			.find(|(span, ..)| Some(*span) == implementation.legacy_span)
+			.find(|(span, ..)| Some(*span) == implementation.source_span)
 		else {
 			continue;
 		};
