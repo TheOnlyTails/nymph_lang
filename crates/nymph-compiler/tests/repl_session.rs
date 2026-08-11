@@ -48,6 +48,8 @@ fn completeness_uses_syntax_for_blocks_interpolation_and_comments() {
 		"\"value ${if (true) { 1 } else { 0 }}\"",
 		"1 + /* closed */ 1",
 		"let = 1",
+		"\"${let}\"",
+		"\"${1 2}\"",
 	] {
 		assert_eq!(repl_input_status(source), ReplInputStatus::Complete);
 	}
@@ -115,4 +117,14 @@ fn imports_and_declarations_shadow_each_other_latest_first() {
 	let mut private_is_repl_visible = ReplSession::loose();
 	submit(&mut private_is_repl_visible, "private let secret = 9");
 	assert_eq!(submit(&mut private_is_repl_visible, "secret"), "9\n");
+}
+
+#[test]
+fn shadowing_one_selected_import_keeps_its_siblings_and_namespace() {
+	let loader =
+		|module: &str| (module == "dep").then(|| "public let a = 1\npublic let b = 2".to_string());
+	let mut session = ReplSession::new(loader);
+	submit(&mut session, "import @/dep with (a, b)");
+	submit(&mut session, "let a = 9");
+	assert_eq!(submit(&mut session, "#(a, b, dep.b)"), "#(9, 2, 2)\n");
 }

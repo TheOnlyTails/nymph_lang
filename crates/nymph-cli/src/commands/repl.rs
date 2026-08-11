@@ -58,6 +58,10 @@ impl NymphCommand for ReplCommand {
 				if interactive {
 					println!();
 				}
+				if !buffer.trim().is_empty() {
+					eprintln!("error: incomplete REPL submission at end of input");
+					return 1;
+				}
 				return 0;
 			}
 			buffer.push_str(&line);

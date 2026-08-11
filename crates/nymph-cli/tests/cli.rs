@@ -1221,6 +1221,31 @@ fn repl_eof_exits_cleanly_without_prompts_or_output() {
 }
 
 #[test]
+fn repl_closed_invalid_interpolation_does_not_swallow_the_next_submission() {
+	let root = unique_temp_path("nymph_cli_repl_interpolation", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let out = nymph_with_stdin(&["repl"], &root, "\"${let}\"\n40 + 2\n");
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(out.stdout, "42\n");
+	assert!(out.stderr.contains("expected"), "{}", out.stderr);
+}
+
+#[test]
+fn repl_reports_a_truncated_piped_submission_at_eof() {
+	let root = unique_temp_path("nymph_cli_repl_truncated", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let out = nymph_with_stdin(&["repl"], &root, "1 +\n");
+	std::fs::remove_dir_all(root).unwrap();
+	assert_eq!(out.status.code(), Some(1));
+	assert!(out.stdout.is_empty());
+	assert_eq!(
+		out.stderr,
+		"error: incomplete REPL submission at end of input\n"
+	);
+}
+
+#[test]
 fn run_invokes_main_and_surfaces_a_runtime_error_from_its_body() {
 	// The language has no I/O yet, so a `main` can't print a value to prove
 	// it ran. Deliberate unbounded recursion is a side effect that IS

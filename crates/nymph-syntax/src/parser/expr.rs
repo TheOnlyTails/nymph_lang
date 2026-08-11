@@ -569,6 +569,12 @@ impl Parser<'_> {
 						expr
 					};
 					self.next_id = sub.next_id;
+					// The interpolation token is already closed. Syntax errors inside it
+					// cannot be repaired by appending source after the closing `}`, even
+					// when the nested parser happened to reach its local end-of-input.
+					if !sub.diagnostics.is_empty() {
+						self.incomplete = false;
+					}
 					self.diagnostics.extend(sub.diagnostics);
 					parts.push(Spanned(StringPart::InterpolatedExpr(expr), fragment.1));
 				}

@@ -13,7 +13,7 @@ use std::{
 };
 
 use nymph_ast::{
-	decl::{Declaration, Visibility},
+	decl::{Declaration, ImportRoot, Visibility},
 	expr::{ListPatternEntry, MapPatternEntry, Pattern, StructPatternField},
 };
 use nymph_diagnostics::Diagnostic;
@@ -86,8 +86,102 @@ struct CommittedSubmission {
 
 #[derive(Clone)]
 struct ReplImport {
-	source: String,
-	names: BTreeSet<String>,
+	root: ImportRoot,
+	path: Vec<String>,
+	alias: Option<String>,
+	idents: Option<Vec<(String, Option<String>)>>,
+	visible_names: BTreeSet<String>,
+	hidden_suffix: String,
+}
+
+impl ReplImport {
+	fn new(declaration: &Declaration, hidden_suffix: String) -> Self {
+		let Declaration::Import {
+			root,
+			path,
+			alias,
+			idents,
+		} = declaration
+		else {
+			unreachable!("REPL imports are constructed from import declarations")
+		};
+		let mut visible_names = BTreeSet::new();
+		import_names(declaration, &mut visible_names);
+		Self {
+			root: root.clone(),
+			path: path.iter().map(|part| part.0.to_string()).collect(),
+			alias: alias.as_ref().map(|alias| alias.0.to_string()),
+			idents: idents.as_ref().map(|idents| {
+				idents
+					.iter()
+					.map(|(name, alias)| {
+						(
+							name.0.to_string(),
+							alias.as_ref().map(|alias| alias.0.to_string()),
+						)
+					})
+					.collect()
+			}),
+			visible_names,
+			hidden_suffix,
+		}
+	}
+
+	fn source(&self) -> String {
+		let mut source = String::from("import ");
+		match &self.root {
+			ImportRoot::Project => source.push_str("@/"),
+			ImportRoot::Current => source.push_str("./"),
+			ImportRoot::Parent => source.push_str("../"),
+			ImportRoot::Package(package) => {
+				source.push_str(&package.0);
+				if !self.path.is_empty() {
+					source.push('/');
+				}
+			}
+		}
+		source.push_str(&self.path.join("/"));
+		let namespace = self.alias.clone().or_else(|| {
+			self.path.last().cloned().or_else(|| match &self.root {
+				ImportRoot::Package(package) => Some(package.0.to_string()),
+				ImportRoot::Project | ImportRoot::Current | ImportRoot::Parent => None,
+			})
+		});
+		if let Some(namespace) = namespace {
+			source.push_str(" as ");
+			if self.visible_names.contains(&namespace) {
+				source.push_str(&namespace);
+			} else {
+				source.push_str(&format!(
+					"__nymph_repl_import_namespace_{}",
+					self.hidden_suffix
+				));
+			}
+		}
+		if let Some(idents) = &self.idents {
+			source.push_str(" with (");
+			for (index, (name, alias)) in idents.iter().enumerate() {
+				if index > 0 {
+					source.push_str(", ");
+				}
+				source.push_str(name);
+				let local = alias.as_ref().unwrap_or(name);
+				if alias.is_some() || !self.visible_names.contains(local) {
+					source.push_str(" as ");
+					if self.visible_names.contains(local) {
+						source.push_str(local);
+					} else {
+						source.push_str(&format!(
+							"__nymph_repl_import_{index}_{}",
+							self.hidden_suffix
+						));
+					}
+				}
+			}
+			source.push(')');
+		}
+		source
+	}
 }
 
 struct PreparedSubmission {
@@ -197,7 +291,7 @@ impl ReplSession {
 			prepared
 				.imports
 				.iter()
-				.flat_map(|import| import.names.iter().cloned()),
+				.flat_map(|import| import.visible_names.iter().cloned()),
 		);
 		let source = self.module_source(generation, &prepared.imports, &shadowed, &prepared.body);
 		let mut sources: BTreeMap<String, String> = self
@@ -230,7 +324,7 @@ impl ReplSession {
 		let imported_names: BTreeSet<_> = prepared
 			.imports
 			.iter()
-			.flat_map(|import| import.names.iter().cloned())
+			.flat_map(|import| import.visible_names.iter().cloned())
 			.collect();
 		visible.retain(|name, _| !imported_names.contains(name));
 		for name in prepared.declared {
@@ -273,18 +367,16 @@ impl ReplSession {
 			.iter()
 			.all(|decl| matches!(decl, Declaration::Import { .. }))
 		{
-			let names = declarations
-				.iter()
-				.fold(BTreeSet::new(), |mut names, declaration| {
-					import_names(declaration, &mut names);
-					names
-				});
 			let mut imports = self.imports.clone();
-			imports.retain(|import| import.names.is_disjoint(&names));
-			imports.push(ReplImport {
-				source: input.trim().to_string(),
-				names,
-			});
+			for (index, declaration) in declarations.iter().enumerate() {
+				let import = ReplImport::new(declaration, format!("{generation}_{index}"));
+				for previous in &mut imports {
+					previous
+						.visible_names
+						.retain(|name| !import.visible_names.contains(name));
+				}
+				imports.push(import);
+			}
 			return Ok(PreparedSubmission {
 				body: String::new(),
 				declared: BTreeSet::new(),
@@ -303,7 +395,9 @@ impl ReplSession {
 		let mut declared = BTreeSet::new();
 		declaration_names(declaration, &mut declared);
 		let mut imports = self.imports.clone();
-		imports.retain(|import| import.names.is_disjoint(&declared));
+		for import in &mut imports {
+			import.visible_names.retain(|name| !declared.contains(name));
+		}
 		let trimmed = input.trim();
 		let body = match declaration_visibility(declaration) {
 			None => format!("public {trimmed}\n"),
@@ -356,7 +450,7 @@ impl ReplSession {
 	) -> String {
 		let mut source = String::new();
 		for import in imports {
-			source.push_str(&import.source);
+			source.push_str(&import.source());
 			source.push('\n');
 		}
 		let mut owners: BTreeMap<String, Vec<String>> = BTreeMap::new();
