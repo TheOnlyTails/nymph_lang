@@ -3,7 +3,7 @@
 //! `run`, and command-line parsing.
 
 use std::io::Write;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const ATOMIC_DIRECTORY_EXCHANGE: bool = cfg!(any(
@@ -77,6 +77,35 @@ fn nymph_in(args: &[&str], current_dir: impl AsRef<std::path::Path>) -> Output {
 		.env_remove("FORCE_COLOR")
 		.output()
 		.expect("spawn nymph");
+	Output {
+		status: out.status,
+		stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+		stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+	}
+}
+
+fn nymph_with_stdin(
+	args: &[&str],
+	current_dir: impl AsRef<std::path::Path>,
+	stdin: &str,
+) -> Output {
+	let mut child = Command::new(env!("CARGO_BIN_EXE_nymph"))
+		.args(args)
+		.current_dir(current_dir)
+		.env("NO_COLOR", "1")
+		.env_remove("FORCE_COLOR")
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.expect("spawn nymph");
+	child
+		.stdin
+		.take()
+		.unwrap()
+		.write_all(stdin.as_bytes())
+		.unwrap();
+	let out = child.wait_with_output().unwrap();
 	Output {
 		status: out.status,
 		stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1087,6 +1116,108 @@ fn run_reports_a_type_error_in_an_inline_expression() {
 		"stdout must not carry a raw panic dump: {}",
 		out.stdout
 	);
+}
+
+#[test]
+fn repl_piped_transcript_is_prompt_free_persistent_multiline_and_transactional() {
+	let root = unique_temp_path("nymph_cli_repl_loose", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let transcript = r#"let stable = 7
+let old = stable
+let stable = 9
+let = 1
+let wrong: int = true
+func recurse(): int = recurse()
+let failed = recurse()
+#(stable, old)
+"value ${if (true) {
+  42
+} else {
+  0
+}}"
+1 + /* multiline
+comment */ 1
+"#;
+	let out = nymph_with_stdin(&["repl"], &root, transcript);
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(out.stdout, "#(9, 7)\n\"value 42\"\n2\n");
+	assert!(
+		!out.stdout.contains('>'),
+		"piped mode must not emit prompts"
+	);
+	assert!(out.stderr.contains("expected a pattern"), "{}", out.stderr);
+	assert!(
+		out.stderr.contains("expected `int`, found `boolean`"),
+		"{}",
+		out.stderr
+	);
+	assert!(out.stderr.contains("failed at runtime"), "{}", out.stderr);
+}
+
+#[test]
+fn repl_uses_discovered_project_imports_embedded_std_and_debug_rendering() {
+	let root = write_project("main.nym", "func main(): void = {}");
+	std::fs::write(root.join("src/model.nym"), "public func answer(): int = 42").unwrap();
+	let transcript = r#"import @/model with (answer)
+import std/io with (println)
+struct Marker(v: int) {
+  impl Debug {
+    func debug(): string = "<marker>"
+  }
+}
+answer()
+#[Marker(v = 1)]
+"#;
+	let out = nymph_with_stdin(&["repl"], &root, transcript);
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(out.stdout, "42\n#[<marker>]\n");
+	assert_eq!(out.stderr, "");
+}
+
+#[test]
+fn repl_manifest_is_authoritative_and_discovery_only_falls_back_when_absent() {
+	let loose = unique_temp_path("nymph_cli_repl_loose", "dir");
+	std::fs::create_dir_all(&loose).unwrap();
+	let loose_out = nymph_with_stdin(&["repl"], &loose, "40 + 2\n");
+	assert!(loose_out.status.success(), "{}", loose_out.stderr);
+	assert_eq!(loose_out.stdout, "42\n");
+
+	let project = write_project("main.nym", "func main(): void = {}");
+	std::fs::write(project.join("src/value.nym"), "public let selected = 21").unwrap();
+	let manifest = project.join("nymph.toml");
+	let explicit = nymph_with_stdin(
+		&["--manifest", manifest.to_str().unwrap(), "repl"],
+		&loose,
+		"import @/value with (selected)\nselected * 2\n",
+	);
+	assert!(explicit.status.success(), "{}", explicit.stderr);
+	assert_eq!(explicit.stdout, "42\n");
+
+	std::fs::write(loose.join("nymph.toml"), "not = [toml").unwrap();
+	let malformed = nymph_with_stdin(&["repl"], &loose, "1\n");
+	assert_eq!(malformed.status.code(), Some(1));
+	assert!(malformed.stdout.is_empty());
+	assert!(
+		malformed.stderr.contains("nymph.toml"),
+		"{}",
+		malformed.stderr
+	);
+
+	std::fs::remove_dir_all(loose).unwrap();
+	std::fs::remove_dir_all(project).unwrap();
+}
+
+#[test]
+fn repl_eof_exits_cleanly_without_prompts_or_output() {
+	let root = unique_temp_path("nymph_cli_repl_eof", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let out = nymph_with_stdin(&["repl"], &root, "");
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(out.stdout, "");
+	assert_eq!(out.stderr, "");
 }
 
 #[test]

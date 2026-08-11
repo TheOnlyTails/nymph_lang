@@ -27,6 +27,7 @@ use crate::lex;
 pub struct Parser<'src> {
 	cursor: TokenCursor<'src>,
 	diagnostics: Vec<Diagnostic>,
+	incomplete: bool,
 	next_id: u32,
 }
 
@@ -34,6 +35,9 @@ pub struct Parser<'src> {
 pub struct ParseResult<T> {
 	pub tree: T,
 	pub diagnostics: Vec<Diagnostic>,
+	/// Whether every syntax failure is caused by reaching end-of-input while
+	/// expecting more syntax. Appending input may complete this parse.
+	pub incomplete: bool,
 }
 
 /// Lex and parse a whole source file into a [`Module`].
@@ -42,6 +46,8 @@ pub fn parse_module(source: &str, module_path: impl Into<EcoString>) -> ParseRes
 	let eoi = Span::new(source.len(), source.len());
 	let mut parser = Parser::new(&lexed.tokens, eoi);
 	let members = parser.parse_module_members();
+	let incomplete = lexed.incomplete
+		|| (!parser.diagnostics.is_empty() && lexed.diagnostics.is_empty() && parser.incomplete);
 	let mut diagnostics = lexed.diagnostics;
 	diagnostics.extend(parser.diagnostics);
 	ParseResult {
@@ -50,6 +56,7 @@ pub fn parse_module(source: &str, module_path: impl Into<EcoString>) -> ParseRes
 			path: module_path.into(),
 		},
 		diagnostics,
+		incomplete,
 	}
 }
 
@@ -63,11 +70,14 @@ pub fn parse_expression(source: &str) -> ParseResult<Expr> {
 		let span = parser.current_span();
 		parser.emit(span, ParseError::TrailingTokens);
 	}
+	let incomplete = lexed.incomplete
+		|| (!parser.diagnostics.is_empty() && lexed.diagnostics.is_empty() && parser.incomplete);
 	let mut diagnostics = lexed.diagnostics;
 	diagnostics.extend(parser.diagnostics);
 	ParseResult {
 		tree: expr,
 		diagnostics,
+		incomplete,
 	}
 }
 
@@ -76,6 +86,7 @@ impl<'src> Parser<'src> {
 		Self {
 			cursor: TokenCursor::new(tokens, eoi),
 			diagnostics: Vec::new(),
+			incomplete: true,
 			next_id: 0,
 		}
 	}
@@ -131,6 +142,8 @@ impl<'src> Parser<'src> {
 	/// Emit a typed [`ParseError`](crate::errors::ParseError), anchored at `span`.
 	fn emit(&mut self, span: Span, err: crate::errors::ParseError) {
 		use nymph_diagnostics::IntoDiagnostic;
+		let incomplete = err.is_incomplete() || (self.at_end() && err.is_append_repairable());
+		self.incomplete &= incomplete;
 		self.diagnostics.push(err.as_diagnostic(span));
 	}
 

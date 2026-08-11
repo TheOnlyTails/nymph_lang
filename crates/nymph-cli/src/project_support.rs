@@ -42,6 +42,29 @@ pub(crate) enum TargetIntent {
 	Library,
 }
 
+/// Filesystem context for a REPL. A missing source root is the deliberate
+/// loose fallback and occurs only when discovery finds no manifest.
+pub(crate) struct ReplContext {
+	pub src_root: Option<PathBuf>,
+}
+
+pub(crate) fn resolve_repl(manifest: &ManifestSelection) -> anyhow::Result<ReplContext> {
+	let current_dir = nymph_project::normalize_path(std::env::current_dir()?)?;
+	let project = match manifest {
+		ManifestSelection::Discover => match nymph_project::discover(&current_dir) {
+			Ok(project) => Some(project),
+			Err(nymph_project::DiscoverError::NotFound { .. }) => None,
+			Err(error) => return Err(error.into()),
+		},
+		ManifestSelection::Explicit(path) => Some(nymph_project::Project::load(path)?),
+	};
+	Ok(ReplContext {
+		src_root: project
+			.map(|project| nymph_project::normalize_path(project.source_root()))
+			.transpose()?,
+	})
+}
+
 /// The shared target selected for `run`, `build`, or `check`.
 pub(crate) struct ResolvedTarget {
 	pub file: PathBuf,

@@ -17,8 +17,13 @@ mod emission;
 mod link_plan;
 mod metrics;
 mod queries;
+mod repl;
 mod resolve;
 mod session;
+
+pub use repl::{
+	ReplInputStatus, ReplSession, ReplStageError, StagedReplSubmission, repl_input_status,
+};
 
 pub use session::{
 	AmbientCoreModuleKey, BuiltinRuntimeOwnerArtifact, BuiltinRuntimeOwnerShape, CompilerSession,
