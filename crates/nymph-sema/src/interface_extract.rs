@@ -47,7 +47,10 @@ impl ExtractionFactSelection {
 
 	#[must_use]
 	pub fn current_module_from_facts(module: &Module, checked: &CheckedFacts) -> Self {
-		debug_assert!(checked.semantic.has_explicit_local_ranges);
+		assert!(
+			checked.semantic.has_explicit_local_ranges,
+			"interface extraction requires explicit checker-owned local fact ranges"
+		);
 		let _ = module;
 		Self {
 			implementations: checked.semantic.local_implementations.clone(),
