@@ -648,7 +648,7 @@ impl CompilerState {
 			&& excluded != Some(uri)
 			&& let Some(document) = docs.get(uri)
 		{
-			return Some((uri.clone(), document.text.clone(), document.version));
+			return Some((uri.clone(), document.text.to_string(), document.version));
 		}
 		self
 			.documents
@@ -657,7 +657,7 @@ impl CompilerState {
 			.filter_map(|(uri, _)| {
 				docs
 					.get(uri)
-					.map(|document| (uri.clone(), document.text.clone(), document.version))
+					.map(|document| (uri.clone(), document.text.to_string(), document.version))
 			})
 			.max_by(
 				|(left_uri, _, left_version), (right_uri, _, right_version)| {
@@ -831,7 +831,7 @@ impl CompilerState {
 			)
 		}?;
 		let source = analysis.source.clone();
-		let document_source = Arc::from(document.text.as_str());
+		let document_source = document.text.clone();
 		Some(AnalysisSnapshot {
 			uri: uri.clone(),
 			project: identity.project.clone(),
@@ -903,7 +903,7 @@ impl CompilerState {
 				!identity.without_prelude,
 			)
 		}?;
-		if analysis.source.as_ref() != document.text {
+		if analysis.source.as_ref() != document.text.as_ref() {
 			return None;
 		}
 		Some(CompletionSnapshot {
@@ -1296,7 +1296,7 @@ impl CompilerState {
 				modules.push(DiagnosticModuleSnapshot {
 					uri: previous_uri.clone(),
 					source: open
-						.map(|document| Arc::from(document.text.as_str()))
+						.map(|document| document.text.clone())
 						.or_else(|| self.effective_source_for_uri(&previous_uri))
 						.unwrap_or_else(|| Arc::from("")),
 					version: open.map(|document| document.version),
@@ -1389,7 +1389,7 @@ impl CompilerState {
 				modules.push(DiagnosticModuleSnapshot {
 					uri: previous_uri.clone(),
 					source: open
-						.map(|document| Arc::from(document.text.as_str()))
+						.map(|document| document.text.clone())
 						.or_else(|| self.effective_source_for_uri(&previous_uri))
 						.unwrap_or_else(|| Arc::from("")),
 					version: open.map(|document| document.version),
@@ -1591,7 +1591,7 @@ impl CompilerState {
 			})
 			.collect();
 		for (module, source, version) in overlays {
-			self.set_effective_source(&module, source, version);
+			self.set_effective_source(&module, source.to_string(), version);
 		}
 		Ok(())
 	}
@@ -1675,7 +1675,11 @@ impl CompilerState {
 				self
 					.authoritative_overlays
 					.insert(module_identity.clone(), uri);
-				self.set_effective_source(&module_identity, source, SourceVersion(i64::from(version)));
+				self.set_effective_source(
+					&module_identity,
+					source.to_string(),
+					SourceVersion(i64::from(version)),
+				);
 			} else {
 				match fs::read_to_string(&path) {
 					Ok(source) => {
@@ -1932,7 +1936,7 @@ mod tests {
 				.unwrap()
 				.is_empty()
 		);
-		assert_eq!(docs.get(&uri).unwrap().text, "let latest = 1");
+		assert_eq!(docs.get(&uri).unwrap().text.as_ref(), "let latest = 1");
 		assert_eq!(docs.version(&uri), Some(8));
 		assert_eq!(docs.revision(), revision);
 
@@ -1941,7 +1945,7 @@ mod tests {
 			.open(&mut docs, uri.clone(), "let reopened = 1".into(), 1)
 			.unwrap();
 		assert_eq!(docs.version(&uri), Some(1));
-		assert_eq!(docs.get(&uri).unwrap().text, "let reopened = 1");
+		assert_eq!(docs.get(&uri).unwrap().text.as_ref(), "let reopened = 1");
 
 		let file_uri: Uri = "file:///tmp/version-behavior.nym".parse().unwrap();
 		state
@@ -1952,7 +1956,7 @@ mod tests {
 			.unwrap();
 		assert_eq!(docs.version(&file_uri), Some(7));
 		assert_eq!(
-			docs.get(&file_uri).unwrap().text,
+			docs.get(&file_uri).unwrap().text.as_ref(),
 			"let existing_behavior = 1"
 		);
 	}

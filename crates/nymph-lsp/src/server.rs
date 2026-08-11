@@ -3,6 +3,7 @@ use std::{
 	hash::{DefaultHasher, Hash, Hasher},
 	path::PathBuf,
 	sync::{Arc, Mutex},
+	thread::JoinHandle,
 };
 
 use crossbeam_channel::TrySendError;
@@ -106,6 +107,8 @@ struct ProtocolOwner<'a> {
 	target_owners: HashMap<Uri, DiagnosticOwner>,
 	canonical_targets: HashMap<String, Uri>,
 	barriers: Vec<BarrierRequest>,
+	deferred_completions: VecDeque<CompletedWork>,
+	defer_completion_effects: bool,
 	next_job: u64,
 	shutting_down: bool,
 }
@@ -133,6 +136,8 @@ impl<'a> ProtocolOwner<'a> {
 			target_owners: HashMap::new(),
 			canonical_targets: HashMap::new(),
 			barriers: Vec::new(),
+			deferred_completions: VecDeque::new(),
+			defer_completion_effects: false,
 			next_job: 1,
 			shutting_down: false,
 		}
@@ -148,10 +153,11 @@ impl<'a> ProtocolOwner<'a> {
 		id
 	}
 
-	fn schedule_request(
+	fn schedule_request_with_snapshot(
 		&mut self,
 		id: RequestId,
 		target: Option<Uri>,
+		snapshot: Arc<DocumentStore>,
 		task: Task,
 	) -> anyhow::Result<()> {
 		// A reused JSON-RPC ID retires the prior logical request before admission.
@@ -166,7 +172,6 @@ impl<'a> ProtocolOwner<'a> {
 			)?;
 			return Ok(());
 		}
-		let snapshot = self.snapshot();
 		let (revision, route) = if let Some(target) = target {
 			let key = self.diagnostic_key_for_uri(&target);
 			let generation = self.diagnostic_generations.get(&key).copied().unwrap_or(0);
@@ -214,6 +219,17 @@ impl<'a> ProtocolOwner<'a> {
 		Ok(())
 	}
 
+	#[cfg(test)]
+	fn schedule_request(
+		&mut self,
+		id: RequestId,
+		target: Option<Uri>,
+		task: Task,
+	) -> anyhow::Result<()> {
+		let snapshot = self.snapshot();
+		self.schedule_request_with_snapshot(id, target, snapshot, task)
+	}
+
 	fn schedule_diagnostics(
 		&mut self,
 		key: DiagnosticKey,
@@ -221,13 +237,14 @@ impl<'a> ProtocolOwner<'a> {
 		publication: DiagnosticPublication,
 		task: Task,
 	) -> anyhow::Result<()> {
-		// Reserve before superseding so overload can never cancel the current
-		// diagnostic and then discard its only replacement. A pending predecessor
-		// itself constitutes the slot that supersession will release.
+		// Invalidate the predecessor before capacity handling can drain a buffered
+		// completion. This makes publication linearize after supersession even at
+		// the exact outstanding-work limit. If admission still fails, the advanced
+		// generation suppresses the stale result rather than publishing old state.
+		let generation = self.supersede_diagnostics(&key);
 		if !self.reserve_diagnostic_slot(&key)? {
 			return Ok(());
 		}
-		let generation = self.supersede_diagnostics(&key);
 		let cancellation = CancellationToken::default();
 		self
 			.diagnostic_cancellations
@@ -414,6 +431,21 @@ impl<'a> ProtocolOwner<'a> {
 
 	fn drain_completed(&mut self) -> anyhow::Result<()> {
 		while let Ok(completed) = self.pool.completed().try_recv() {
+			if self.defer_completion_effects {
+				// Reclaim physical capacity while preserving the protocol batch's
+				// response/publication ordering boundary.
+				self.submitted.remove(&completed.id);
+				self.deferred_completions.push_back(completed);
+			} else {
+				self.complete(completed)?;
+			}
+		}
+		Ok(())
+	}
+
+	fn finish_protocol_batch(&mut self) -> anyhow::Result<()> {
+		self.defer_completion_effects = false;
+		while let Some(completed) = self.deferred_completions.pop_front() {
 			self.complete(completed)?;
 		}
 		Ok(())
@@ -860,6 +892,155 @@ impl<'a> ProtocolOwner<'a> {
 	}
 }
 
+enum OwnerEvent {
+	Protocol(Result<Message, crossbeam_channel::RecvError>),
+	Completed(Result<CompletedWork, crossbeam_channel::RecvError>),
+}
+
+const PROTOCOL_QUEUE_CAPACITY: usize = 256;
+
+/// Fixed-capacity ingress buffer for the serialized owner. The stdio
+/// transport is itself a rendezvous channel, so buffering here establishes an
+/// observable, finite protocol batch without applying state off-owner.
+struct ProtocolInbox {
+	receiver: crossbeam_channel::Receiver<Message>,
+	flush: crossbeam_channel::Sender<()>,
+	flushed: crossbeam_channel::Receiver<u64>,
+	consumed: u64,
+	stop: crossbeam_channel::Sender<()>,
+	thread: Option<JoinHandle<()>>,
+}
+
+impl ProtocolInbox {
+	fn new(source: crossbeam_channel::Receiver<Message>) -> Self {
+		let (sender, receiver) = crossbeam_channel::bounded(PROTOCOL_QUEUE_CAPACITY);
+		let (flush, flush_requested) = crossbeam_channel::unbounded();
+		let (flushed_sender, flushed) = crossbeam_channel::unbounded();
+		let (stop, stopped) = crossbeam_channel::bounded(1);
+		let thread = std::thread::Builder::new()
+			.name("nymph-lsp-protocol-inbox".to_string())
+			.spawn(move || {
+				let mut forwarded = 0_u64;
+				'relay: loop {
+					let message = crossbeam_channel::select_biased! {
+						recv(stopped) -> _ => break,
+						recv(flush_requested) -> request => {
+							if request.is_err() { break }
+							// Include source messages already ready at the handoff while
+							// bounding the flush even under a continuously writing client.
+							for _ in 0..PROTOCOL_QUEUE_CAPACITY {
+								let Ok(message) = source.try_recv() else { break };
+								crossbeam_channel::select_biased! {
+									recv(stopped) -> _ => break 'relay,
+									send(sender, message) -> result => if result.is_err() { break 'relay },
+								}
+								forwarded += 1;
+							}
+							if flushed_sender.send(forwarded).is_err() { break }
+							continue;
+						},
+						recv(source) -> message => match message {
+							Ok(message) => message,
+							Err(_) => break,
+						},
+					};
+					crossbeam_channel::select_biased! {
+						recv(stopped) -> _ => break,
+						send(sender, message) -> result => if result.is_err() { break },
+					}
+					forwarded += 1;
+				}
+			})
+			.expect("failed to spawn LSP protocol inbox");
+		Self {
+			receiver,
+			flush,
+			flushed,
+			consumed: 0,
+			stop,
+			thread: Some(thread),
+		}
+	}
+
+	/// Capture every message the relay accepted before this flush request. The
+	/// owner drains while waiting, so a full queue cannot deadlock an in-flight
+	/// relay send. Relay-side flush priority closes the handoff race.
+	fn batch(
+		&mut self,
+		first: Result<Message, crossbeam_channel::RecvError>,
+	) -> Vec<Result<Message, crossbeam_channel::RecvError>> {
+		let mut batch = vec![first];
+		self.consumed += 1;
+		if self.flush.send(()).is_err() {
+			return batch;
+		}
+		let mut target = None;
+		loop {
+			if target.is_some_and(|target| self.consumed >= target) {
+				break;
+			}
+			crossbeam_channel::select_biased! {
+				recv(self.receiver) -> message => match message {
+					Ok(message) => {
+						self.consumed += 1;
+						batch.push(Ok(message));
+					},
+					Err(error) => {
+						batch.push(Err(error));
+						break;
+					},
+				},
+				recv(self.flushed) -> result => match result {
+					Ok(flushed) => target = Some(flushed),
+					Err(_) => break,
+				},
+			}
+		}
+		batch
+	}
+
+	fn finish(&mut self) {
+		let _ = self.stop.try_send(());
+		if let Some(thread) = self.thread.take() {
+			let _ = thread.join();
+		}
+	}
+}
+
+impl Drop for ProtocolInbox {
+	fn drop(&mut self) {
+		self.finish();
+	}
+}
+
+fn receive_owner_event(
+	protocol: &crossbeam_channel::Receiver<Message>,
+	completed: &crossbeam_channel::Receiver<CompletedWork>,
+) -> OwnerEvent {
+	crossbeam_channel::select_biased! {
+		recv(protocol) -> message => OwnerEvent::Protocol(message),
+		recv(completed) -> result => OwnerEvent::Completed(result),
+	}
+}
+
+fn handle_protocol_message(
+	owner: &mut ProtocolOwner<'_>,
+	client_state: &mut ClientState,
+	message: Result<Message, crossbeam_channel::RecvError>,
+) -> anyhow::Result<bool> {
+	match message {
+		Ok(Message::Request(request)) => handle_request(owner, request),
+		Ok(Message::Notification(notification)) => {
+			handle_notification(owner, client_state, notification)
+		}
+		Ok(Message::Response(response)) => {
+			client_state.handle_response(&response);
+			Ok(false)
+		}
+		Err(_) => Ok(true),
+	}
+}
+
 pub(crate) fn main_loop(
 	connection: &Connection,
 	documents: &Arc<Mutex<DocumentStore>>,
@@ -867,23 +1048,31 @@ pub(crate) fn main_loop(
 	client_state: &mut ClientState,
 ) -> anyhow::Result<()> {
 	let mut owner = ProtocolOwner::new(connection, documents.clone(), &compiler.lock().unwrap());
+	let mut inbox = ProtocolInbox::new(connection.receiver.clone());
 	let completed = owner.pool.completed().clone();
 	let result = (|| {
 		let mut exit = false;
 		while !exit {
 			owner.dispatch_pending()?;
-			crossbeam_channel::select! {
-				recv(connection.receiver) -> message => match message {
-					Ok(Message::Request(request)) => {
-						exit = handle_request(&mut owner, request)?;
+			// Protocol mutations and cancellations already queued at this boundary
+			// linearize before worker results. The captured batch is finite: messages
+			// arriving while it is processed cannot indefinitely starve a completion.
+			match receive_owner_event(&inbox.receiver, &completed) {
+				OwnerEvent::Protocol(message) => {
+					owner.defer_completion_effects = true;
+					for message in inbox.batch(message) {
+						exit = handle_protocol_message(&mut owner, client_state, message)?;
+						if exit {
+							break;
+						}
 					}
-					Ok(Message::Notification(notification)) => {
-						exit = handle_notification(&mut owner, client_state, notification)?;
+					owner.drain_completed()?;
+					owner.finish_protocol_batch()?;
+					if !exit && let Ok(result) = completed.try_recv() {
+						owner.complete(result)?;
 					}
-					Ok(Message::Response(response)) => client_state.handle_response(&response),
-					Err(_) => exit = true,
-				},
-				recv(completed) -> result => match result {
+				}
+				OwnerEvent::Completed(result) => match result {
 					Ok(result) => owner.complete(result)?,
 					Err(_) => exit = true,
 				},
@@ -892,6 +1081,7 @@ pub(crate) fn main_loop(
 		Ok(())
 	})();
 	owner.finish();
+	inbox.finish();
 	result
 }
 
@@ -921,7 +1111,7 @@ fn handle_request(owner: &mut ProtocolOwner<'_>, request: ServerRequest) -> anyh
 		else {
 			return Ok(false);
 		};
-		(None, workspace_symbol_task(snapshot, params))
+		(None, workspace_symbol_task(snapshot.clone(), params))
 	} else if method == HoverRequest::METHOD {
 		let Some(params) = decode_request_params::<HoverParams>(owner, &id, request.params)? else {
 			return Ok(false);
@@ -931,7 +1121,7 @@ fn handle_request(owner: &mut ProtocolOwner<'_>, request: ServerRequest) -> anyh
 			.text_document
 			.uri
 			.clone();
-		(Some(uri), hover_task(snapshot, params))
+		(Some(uri), hover_task(snapshot.clone(), params))
 	} else if method == Formatting::METHOD {
 		let Some(params) =
 			decode_request_params::<DocumentFormattingParams>(owner, &id, request.params)?
@@ -939,7 +1129,7 @@ fn handle_request(owner: &mut ProtocolOwner<'_>, request: ServerRequest) -> anyh
 			return Ok(false);
 		};
 		let uri = params.text_document.uri.clone();
-		(Some(uri), formatting_task(snapshot, params))
+		(Some(uri), formatting_task(snapshot.clone(), params))
 	} else if method == RangeFormatting::METHOD {
 		let Some(params) =
 			decode_request_params::<DocumentRangeFormattingParams>(owner, &id, request.params)?
@@ -947,14 +1137,14 @@ fn handle_request(owner: &mut ProtocolOwner<'_>, request: ServerRequest) -> anyh
 			return Ok(false);
 		};
 		let uri = params.text_document.uri.clone();
-		(Some(uri), range_formatting_task(snapshot, params))
+		(Some(uri), range_formatting_task(snapshot.clone(), params))
 	} else if method == DocumentSymbolRequest::METHOD {
 		let Some(params) = decode_request_params::<DocumentSymbolParams>(owner, &id, request.params)?
 		else {
 			return Ok(false);
 		};
 		let uri = params.text_document.uri.clone();
-		(Some(uri), document_symbol_task(snapshot, params))
+		(Some(uri), document_symbol_task(snapshot.clone(), params))
 	} else if method == GotoDefinition::METHOD {
 		let Some(params) = decode_request_params::<GotoDefinitionParams>(owner, &id, request.params)?
 		else {
@@ -965,20 +1155,20 @@ fn handle_request(owner: &mut ProtocolOwner<'_>, request: ServerRequest) -> anyh
 			.text_document
 			.uri
 			.clone();
-		(Some(uri), definition_task(snapshot, params))
+		(Some(uri), definition_task(snapshot.clone(), params))
 	} else if method == Completion::METHOD {
 		let Some(params) = decode_request_params::<CompletionParams>(owner, &id, request.params)?
 		else {
 			return Ok(false);
 		};
 		let uri = params.text_document_position.text_document.uri.clone();
-		(Some(uri), completion_task(snapshot, params))
+		(Some(uri), completion_task(snapshot.clone(), params))
 	} else if method == References::METHOD {
 		let Some(params) = decode_request_params::<ReferenceParams>(owner, &id, request.params)? else {
 			return Ok(false);
 		};
 		let uri = params.text_document_position.text_document.uri.clone();
-		(Some(uri), references_task(snapshot, params))
+		(Some(uri), references_task(snapshot.clone(), params))
 	} else if method == PrepareRenameRequest::METHOD {
 		let Some(params) =
 			decode_request_params::<lsp_types::TextDocumentPositionParams>(owner, &id, request.params)?
@@ -986,20 +1176,20 @@ fn handle_request(owner: &mut ProtocolOwner<'_>, request: ServerRequest) -> anyh
 			return Ok(false);
 		};
 		let uri = params.text_document.uri.clone();
-		(Some(uri), prepare_rename_task(snapshot, params))
+		(Some(uri), prepare_rename_task(snapshot.clone(), params))
 	} else if method == Rename::METHOD {
 		let Some(params) = decode_request_params::<RenameParams>(owner, &id, request.params)? else {
 			return Ok(false);
 		};
 		let uri = params.text_document_position.text_document.uri.clone();
-		(Some(uri), rename_task(snapshot, params))
+		(Some(uri), rename_task(snapshot.clone(), params))
 	} else if method == SemanticTokensFullRequest::METHOD {
 		let Some(params) = decode_request_params::<SemanticTokensParams>(owner, &id, request.params)?
 		else {
 			return Ok(false);
 		};
 		let uri = params.text_document.uri.clone();
-		(Some(uri), semantic_tokens_task(snapshot, params))
+		(Some(uri), semantic_tokens_task(snapshot.clone(), params))
 	} else {
 		owner.send_error(
 			request.id,
@@ -1008,7 +1198,7 @@ fn handle_request(owner: &mut ProtocolOwner<'_>, request: ServerRequest) -> anyh
 		)?;
 		return Ok(false);
 	};
-	owner.schedule_request(id, target, task)?;
+	owner.schedule_request_with_snapshot(id, target, snapshot, task)?;
 	Ok(false)
 }
 
@@ -1812,6 +2002,180 @@ mod tests {
 	use super::*;
 	use lsp_server::Notification;
 	use std::sync::atomic::{AtomicBool, Ordering};
+
+	#[test]
+	fn ready_protocol_edit_precedes_ready_completion() {
+		let (protocol_sender, protocol) = crossbeam_channel::bounded(1);
+		let (completed_sender, completed) = crossbeam_channel::bounded(1);
+		protocol_sender
+			.send(Message::Notification(Notification::new(
+				DidChangeTextDocument::METHOD.into(),
+				serde_json::Value::Null,
+			)))
+			.unwrap();
+		completed_sender
+			.send(CompletedWork {
+				id: 1,
+				result: TaskResult::Request(Ok(serde_json::Value::Null)),
+			})
+			.unwrap();
+		assert!(matches!(
+			receive_owner_event(&protocol, &completed),
+			OwnerEvent::Protocol(Ok(Message::Notification(_)))
+		));
+	}
+
+	#[test]
+	fn ready_protocol_cancellation_precedes_ready_completion() {
+		let (protocol_sender, protocol) = crossbeam_channel::bounded(1);
+		let (completed_sender, completed) = crossbeam_channel::bounded(1);
+		protocol_sender
+			.send(Message::Notification(Notification::new(
+				"$/cancelRequest".into(),
+				serde_json::json!({ "id": 7 }),
+			)))
+			.unwrap();
+		completed_sender
+			.send(CompletedWork {
+				id: 1,
+				result: TaskResult::Request(Ok(serde_json::Value::Null)),
+			})
+			.unwrap();
+		assert!(matches!(
+			receive_owner_event(&protocol, &completed),
+			OwnerEvent::Protocol(Ok(Message::Notification(_)))
+		));
+	}
+
+	#[test]
+	fn captured_protocol_batch_does_not_starve_ready_completion() {
+		let (protocol_sender, protocol) = crossbeam_channel::bounded(0);
+		let mut inbox = ProtocolInbox::new(protocol);
+		let (completed_sender, completed) = crossbeam_channel::bounded(1);
+		let (accepted_sender, accepted) = crossbeam_channel::bounded(0);
+		let producer = std::thread::spawn(move || {
+			for id in 1..=2 {
+				protocol_sender
+					.send(Message::Notification(Notification::new(
+						"$/cancelRequest".into(),
+						serde_json::json!({ "id": id }),
+					)))
+					.unwrap();
+			}
+			accepted_sender.send(()).unwrap();
+		});
+		completed_sender
+			.send(CompletedWork {
+				id: 7,
+				result: TaskResult::Request(Ok(serde_json::Value::Null)),
+			})
+			.unwrap();
+
+		accepted.recv().unwrap();
+		let OwnerEvent::Protocol(first) = receive_owner_event(&inbox.receiver, &completed) else {
+			panic!("ready protocol batch must linearize before completion");
+		};
+		let batch = inbox.batch(first);
+		assert!(!batch.is_empty());
+		assert_eq!(completed.try_recv().unwrap().id, 7);
+		producer.join().unwrap();
+	}
+
+	#[test]
+	fn batched_cancellation_precedes_capacity_reclaimed_completion() {
+		let (server, client) = Connection::memory();
+		let documents = Arc::new(Mutex::new(DocumentStore::default()));
+		let mut owner = ProtocolOwner::new(&server, documents, &CompilerState::new());
+		let request = RequestId::from(41);
+		let job = 7;
+		let cancellation = CancellationToken::default();
+		owner.requests.insert(request.clone(), job);
+		owner.jobs.insert(
+			job,
+			JobMetadata::Request {
+				id: request.clone(),
+				revision: RequestRevision::Global(DocumentStoreRevision::default()),
+				cancellation,
+			},
+		);
+		owner.submitted.insert(job);
+		owner.unfinished.insert(job);
+
+		// Capacity reclamation may physically receive this completion while a
+		// protocol batch is in progress, but its success effect remains deferred.
+		owner.defer_completion_effects = true;
+		owner.submitted.remove(&job);
+		owner.deferred_completions.push_back(CompletedWork {
+			id: job,
+			result: TaskResult::Request(Ok(serde_json::json!("stale"))),
+		});
+		owner.cancel_request(&request).unwrap();
+		owner.finish_protocol_batch().unwrap();
+
+		let Message::Response(response) = client.receiver.recv().unwrap() else {
+			panic!("cancellation must produce a response");
+		};
+		assert_eq!(response.id, request);
+		assert_eq!(
+			response
+				.response_result
+				.as_ref()
+				.err()
+				.map(|error| error.code),
+			Some(lsp_server::ErrorCode::RequestCanceled as i32)
+		);
+		assert!(client.receiver.try_recv().is_err());
+	}
+
+	#[test]
+	fn exact_capacity_replacement_suppresses_buffered_old_diagnostics() {
+		let (server, client) = Connection::memory();
+		let documents = Arc::new(Mutex::new(DocumentStore::default()));
+		let mut owner = ProtocolOwner::new(&server, documents, &CompilerState::new());
+		let uri: Uri = "untitled:capacity-generation".parse().unwrap();
+		let key = owner.diagnostic_key_for_uri(&uri);
+		let old_job = 1;
+		let old_cancellation = CancellationToken::default();
+		owner.diagnostic_generations.insert(key.clone(), 1);
+		owner
+			.diagnostic_cancellations
+			.insert(key.clone(), old_cancellation.clone());
+		owner.jobs.insert(
+			old_job,
+			JobMetadata::Diagnostics {
+				key: key.clone(),
+				owner: canonical_owner(&uri),
+				generation: 1,
+				cancellation: old_cancellation,
+				publication: DiagnosticPublication::default(),
+			},
+		);
+		owner.submitted.extend(1..=OUTSTANDING_WORK_CAPACITY as u64);
+		assert_eq!(owner.outstanding_work(), OUTSTANDING_WORK_CAPACITY);
+
+		owner
+			.schedule_diagnostics(
+				key.clone(),
+				canonical_owner(&uri),
+				DiagnosticPublication::default(),
+				Box::new(|_, _| TaskResult::Diagnostics(Ok(Vec::new()))),
+			)
+			.unwrap();
+		assert_eq!(owner.diagnostic_generations.get(&key), Some(&2));
+		owner
+			.complete(CompletedWork {
+				id: old_job,
+				result: TaskResult::Diagnostics(Ok(vec![PublishDiagnosticsParams {
+					uri,
+					diagnostics: Vec::new(),
+					version: Some(1),
+				}])),
+			})
+			.unwrap();
+		assert!(client.receiver.try_recv().is_err());
+		assert!(owner.outstanding_work() <= OUTSTANDING_WORK_CAPACITY);
+		owner.finish();
+	}
 
 	fn client_state() -> ClientState {
 		ClientState {

@@ -133,7 +133,7 @@ pub fn check_and_publish_state(
 			publish(
 				connection,
 				&stale_uri,
-				stale_document.map_or("", |document| document.text.as_str()),
+				stale_document.map_or("", |document| document.text.as_ref()),
 				&[],
 				stale_document.map(|document| document.version),
 			)?;

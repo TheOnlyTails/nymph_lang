@@ -184,7 +184,7 @@ impl WorkerState {
 					.change(
 						&mut self.documents,
 						uri,
-						desired.text.clone(),
+						desired.text.to_string(),
 						desired.version,
 					)
 					.map_err(|error| TaskError::Internal(error.to_string()))?;
@@ -194,7 +194,7 @@ impl WorkerState {
 					.open(
 						&mut self.documents,
 						uri.clone(),
-						desired.text.clone(),
+						desired.text.to_string(),
 						desired.version,
 					)
 					.map_err(|error| TaskError::Internal(error.to_string()))?;
@@ -230,7 +230,7 @@ impl WorkerState {
 				.open(
 					&mut self.documents,
 					uri.clone(),
-					document.text.clone(),
+					document.text.to_string(),
 					document.version,
 				)
 				.map_err(|error| TaskError::Internal(error.to_string()))?;

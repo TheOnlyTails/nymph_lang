@@ -214,7 +214,7 @@ pub fn semantic_tokens_full(
 		.open(
 			&mut owned_docs,
 			uri.clone(),
-			document.text.clone(),
+			document.text.to_string(),
 			document.version,
 		)
 		.ok()?;

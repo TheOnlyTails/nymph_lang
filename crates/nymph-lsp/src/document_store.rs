@@ -5,7 +5,7 @@
 //! `textDocument/didClose`.
 
 use lsp_types::Uri;
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 /// One open document: its full current text and the client's version
 /// counter. The version orders notifications and guards response publication;
@@ -13,7 +13,7 @@ use std::collections::HashMap;
 /// source content and dependency revisions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Document {
-	pub text: String,
+	pub text: Arc<str>,
 	pub version: i32,
 	/// Owner revision of the notification that last opened or changed this
 	/// URI. Worker-local compiler sessions use it to replay equivalent URI
@@ -44,7 +44,7 @@ impl DocumentStore {
 		self.docs.insert(
 			uri,
 			Document {
-				text,
+				text: text.into(),
 				version,
 				update_revision: self.revision,
 				lifecycle_revision: self.revision,
@@ -62,7 +62,7 @@ impl DocumentStore {
 		}
 		self.advance_revision();
 		let doc = self.docs.get_mut(uri).expect("document checked above");
-		doc.text = text;
+		doc.text = text.into();
 		doc.version = version;
 		doc.update_revision = self.revision;
 		true
@@ -141,12 +141,12 @@ mod tests {
 		let mut store = DocumentStore::default();
 
 		store.open(uri.clone(), "let value = 1".into(), 7);
-		assert_eq!(store.get(&uri).unwrap().text, "let value = 1");
+		assert_eq!(store.get(&uri).unwrap().text.as_ref(), "let value = 1");
 		assert_eq!(store.version(&uri), Some(7));
 		let open_revision = store.revision();
 
 		assert!(store.change_full(&uri, "let value = 2".into(), 8));
-		assert_eq!(store.get(&uri).unwrap().text, "let value = 2");
+		assert_eq!(store.get(&uri).unwrap().text.as_ref(), "let value = 2");
 		assert_eq!(store.version(&uri), Some(8));
 		assert_ne!(store.revision(), open_revision);
 

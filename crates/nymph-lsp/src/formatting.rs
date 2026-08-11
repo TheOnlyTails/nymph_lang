@@ -13,7 +13,7 @@ pub fn document_formatting(
 	let document = docs.get(&params.text_document.uri)?;
 	let path = params.text_document.uri.as_str();
 	let formatted = nymph_format::format(&document.text, path).ok()?;
-	if formatted == document.text {
+	if formatted.as_str() == document.text.as_ref() {
 		return Some(Vec::new());
 	}
 	let index = LineIndex::new(&document.text);
