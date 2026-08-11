@@ -75,6 +75,11 @@ if ! command -v jj >/dev/null 2>&1; then
 	cargo install jj-cli --locked
 fi
 
+echo "Installing cargo-nextest..."
+if ! command -v cargo-nextest >/dev/null 2>&1; then
+	cargo install cargo-nextest --locked
+fi
+
 echo "Installing JavaScript dependencies..."
 pnpm install --frozen-lockfile
 
@@ -84,3 +89,4 @@ pnpm --version
 rustc --version
 cargo --version
 jj --version
+cargo nextest --version
