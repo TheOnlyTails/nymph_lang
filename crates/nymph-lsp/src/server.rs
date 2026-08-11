@@ -994,10 +994,10 @@ impl ProtocolInbox {
 				break;
 			}
 			crossbeam_channel::select_biased! {
-				recv(self.flushed) -> result => match result {
-					Ok(flushed) => target = Some(flushed),
-					Err(_) => break,
-				},
+					recv(self.flushed) -> result => match result {
+						Ok(flushed) => target = Some(flushed),
+						Err(_) => break,
+					},
 				recv(self.receiver) -> message => match message {
 					Ok(message) => {
 						self.consumed += 1;
@@ -1757,13 +1757,17 @@ fn json(value: impl Serialize) -> Result<serde_json::Value, TaskError> {
 
 fn workspace_symbol_task(snapshot: Arc<DocumentStore>, params: WorkspaceSymbolParams) -> Task {
 	compiler_task(snapshot, move |state, cancellation| {
-		state.compiler.refresh_workspace_symbols(&state.documents);
-		cancellation.checkpoint()?;
-		let snapshot = state.compiler.workspace_symbol_snapshot(&state.documents);
-		cancellation.checkpoint()?;
-		json(crate::workspace_symbols::workspace_symbols(
-			&snapshot, &params,
-		))
+		state
+			.compiler
+			.refresh_workspace_symbols_cancellable(&state.documents, cancellation)?;
+		let snapshot = state
+			.compiler
+			.workspace_symbol_snapshot_cancellable(&state.documents, cancellation)?;
+		json(crate::workspace_symbols::workspace_symbols_cancellable(
+			&snapshot,
+			&params,
+			cancellation,
+		)?)
 	})
 }
 
@@ -1800,7 +1804,8 @@ fn range_formatting_task(
 fn document_symbol_task(snapshot: Arc<DocumentStore>, params: DocumentSymbolParams) -> Task {
 	parse_task(move |cancellation| {
 		cancellation.checkpoint()?;
-		let result = crate::document_symbols::document_symbols(&snapshot, &params);
+		let result =
+			crate::document_symbols::document_symbols_cancellable(&snapshot, &params, cancellation)?;
 		cancellation.checkpoint()?;
 		json(result)
 	})
@@ -1853,23 +1858,18 @@ fn references_task(snapshot: Arc<DocumentStore>, params: ReferenceParams) -> Tas
 			.compiler
 			.references_analysis_for_uri(&state.documents, uri);
 		cancellation.checkpoint()?;
-		let result = snapshot
-			.and_then(|snapshot| {
-				crate::references::references_snapshot_candidate(
-					&state.documents,
-					&state.compiler,
-					&snapshot,
-					&params,
-				)
-			})
-			.map(|candidate| {
-				candidate.validate_disk_sources_result().map_err(|()| {
-					TaskError::ContentModified(
-						"project sources changed while analyzing references".to_string(),
-					)
-				})
-			})
-			.transpose()?;
+		let result = match snapshot {
+			Some(snapshot) => crate::references::references_snapshot_candidate_cancellable(
+				&state.documents,
+				&state.compiler,
+				&snapshot,
+				&params,
+				cancellation,
+			)?
+			.map(|candidate| candidate.validate_disk_sources_cancellable(cancellation))
+			.transpose()?,
+			None => None,
+		};
 		cancellation.checkpoint()?;
 		json(result)
 	})
@@ -1885,22 +1885,19 @@ fn prepare_rename_task(
 			.compiler
 			.references_analysis_for_uri(&state.documents, uri);
 		cancellation.checkpoint()?;
-		let result = snapshot
-			.and_then(|snapshot| {
-				crate::rename::rename_candidate(
-					&state.documents,
-					&state.compiler,
-					&snapshot,
-					params.position,
-					"",
-				)
-			})
-			.map(|candidate| {
-				candidate.validate_prepare().map_err(|_| {
-					TaskError::ContentModified("project sources changed while preparing rename".to_string())
-				})
-			})
-			.transpose()?;
+		let result = match snapshot {
+			Some(snapshot) => crate::rename::rename_candidate_cancellable(
+				&state.documents,
+				&state.compiler,
+				&snapshot,
+				params.position,
+				"",
+				cancellation,
+			)?
+			.map(|candidate| candidate.validate_prepare_cancellable(cancellation))
+			.transpose()?,
+			None => None,
+		};
 		json(result)
 	})
 }
@@ -1922,21 +1919,21 @@ fn rename_task(snapshot: Arc<DocumentStore>, params: RenameParams) -> Task {
 			));
 		};
 		cancellation.checkpoint()?;
-		let Some(candidate) = crate::rename::rename_candidate(
+		let Some(candidate) = crate::rename::rename_candidate_cancellable(
 			&state.documents,
 			&state.compiler,
 			&snapshot,
 			params.text_document_position.position,
 			&params.new_name,
-		) else {
+			cancellation,
+		)?
+		else {
 			return Err(TaskError::InvalidParams(
 				"target is not renameable".to_string(),
 			));
 		};
 		cancellation.checkpoint()?;
-		let edit = candidate.validate_disk_sources().map_err(|_| {
-			TaskError::ContentModified("project sources changed while preparing rename".to_string())
-		})?;
+		let edit = candidate.validate_disk_sources_cancellable(cancellation)?;
 		json(edit)
 	})
 }
@@ -1946,9 +1943,17 @@ fn semantic_tokens_task(snapshot: Arc<DocumentStore>, params: SemanticTokensPara
 		let uri = &params.text_document.uri;
 		let result = if let Some(snapshot) = state.compiler.analysis_for_uri(&state.documents, uri) {
 			cancellation.checkpoint()?;
-			crate::semantic_tokens::semantic_tokens_snapshot(&snapshot, &params)
+			crate::semantic_tokens::semantic_tokens_snapshot_cancellable(
+				&snapshot,
+				&params,
+				cancellation,
+			)?
 		} else {
-			crate::semantic_tokens::semantic_tokens_for_open_document(&state.documents, &params)
+			crate::semantic_tokens::semantic_tokens_for_open_document_cancellable(
+				&state.documents,
+				&params,
+				cancellation,
+			)?
 		};
 		cancellation.checkpoint()?;
 		json(result)

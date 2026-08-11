@@ -6,6 +6,7 @@ use std::{path::PathBuf, sync::Arc};
 use lsp_types::{Location, ReferenceParams};
 
 use crate::{
+	analysis_scheduler::{CancellationToken, TaskError},
 	compiler_state::{AnalysisSnapshot, CompilerState},
 	document_store::DocumentStore,
 	line_index::LineIndex,
@@ -24,6 +25,7 @@ impl ReferencesResponseCandidate {
 		self.validate_disk_sources_result().ok()
 	}
 
+	#[cfg(test)]
 	pub(crate) fn validate_disk_sources_result(self) -> Result<Vec<Location>, ()> {
 		for (path, expected) in self.disk_sources {
 			let current = std::fs::read_to_string(path).map_err(|_| ())?;
@@ -33,30 +35,76 @@ impl ReferencesResponseCandidate {
 		}
 		Ok(self.locations)
 	}
+
+	pub(crate) fn validate_disk_sources_cancellable(
+		self,
+		cancellation: &CancellationToken,
+	) -> Result<Vec<Location>, TaskError> {
+		for (path, expected) in self.disk_sources {
+			cancellation.checkpoint()?;
+			let current = std::fs::read_to_string(path).map_err(|_| {
+				TaskError::ContentModified("project sources changed while analyzing references".into())
+			})?;
+			if current.as_str() != expected.as_ref() {
+				return Err(TaskError::ContentModified(
+					"project sources changed while analyzing references".into(),
+				));
+			}
+		}
+		Ok(self.locations)
+	}
 }
 
+#[cfg(test)]
 pub(crate) fn references_snapshot_candidate(
 	docs: &DocumentStore,
 	state: &CompilerState,
 	snapshot: &AnalysisSnapshot,
 	params: &ReferenceParams,
 ) -> Option<ReferencesResponseCandidate> {
+	references_snapshot_candidate_cancellable(
+		docs,
+		state,
+		snapshot,
+		params,
+		&CancellationToken::default(),
+	)
+	.ok()
+	.flatten()
+}
+
+pub(crate) fn references_snapshot_candidate_cancellable(
+	docs: &DocumentStore,
+	state: &CompilerState,
+	snapshot: &AnalysisSnapshot,
+	params: &ReferenceParams,
+	cancellation: &CancellationToken,
+) -> Result<Option<ReferencesResponseCandidate>, TaskError> {
 	let position = params.text_document_position.position;
 	let index = LineIndex::new(&snapshot.source);
-	let offset = index.exact_offset(&snapshot.source, position)?;
-	let symbol = nymph_sema::query::symbol_at(&snapshot.analysis.semantic, offset)?;
-	let modules = state.reference_modules(docs, snapshot, &symbol)?;
+	let Some(offset) = index.exact_offset(&snapshot.source, position) else {
+		return Ok(None);
+	};
+	let Some(symbol) = nymph_sema::query::symbol_at(&snapshot.analysis.semantic, offset) else {
+		return Ok(None);
+	};
+	let Some(modules) = state.reference_modules_cancellable(docs, snapshot, &symbol, cancellation)?
+	else {
+		return Ok(None);
+	};
 	let mut locations = Vec::new();
 	let mut disk_sources = Vec::new();
 	for module in modules {
+		cancellation.checkpoint()?;
 		if module.requires_disk_validation {
-			disk_sources.push((
-				crate::workspace::uri_to_path(&module.uri)?,
-				module.source.clone(),
-			));
+			let Some(path) = crate::workspace::uri_to_path(&module.uri) else {
+				return Ok(None);
+			};
+			disk_sources.push((path, module.source.clone()));
 		}
 		let index = LineIndex::new(&module.source);
 		for occurrence in module.occurrences {
+			cancellation.checkpoint()?;
 			if occurrence.is_declaration && !params.context.include_declaration {
 				continue;
 			}
@@ -77,10 +125,10 @@ pub(crate) fn references_snapshot_candidate(
 			.then_with(|| left.range.end.character.cmp(&right.range.end.character))
 	});
 	locations.dedup();
-	Some(ReferencesResponseCandidate {
+	Ok(Some(ReferencesResponseCandidate {
 		locations,
 		disk_sources,
-	})
+	}))
 }
 
 #[cfg(test)]
@@ -149,6 +197,21 @@ mod tests {
 			prefix.bytes().filter(|byte| *byte == b'\n').count() as u32,
 			prefix.rsplit('\n').next().unwrap().encode_utf16().count() as u32,
 		)
+	}
+
+	#[test]
+	fn compiler_state_reference_traversal_is_cancellable() {
+		let source = "func target(): Int = 1\nfunc use(): Int = target()";
+		let (_temp, uri, docs, state) = project(&[("main.nym", source)], "main.nym");
+		let snapshot = state.analysis_for_uri(&docs, &uri).unwrap();
+		let offset = source.find("target").unwrap();
+		let symbol = nymph_sema::query::symbol_at(&snapshot.analysis.semantic, offset).unwrap();
+		let cancellation = CancellationToken::cancel_after(0);
+
+		assert!(matches!(
+			state.reference_modules_cancellable(&docs, &snapshot, &symbol, &cancellation),
+			Err(TaskError::Cancelled)
+		));
 	}
 
 	#[test]

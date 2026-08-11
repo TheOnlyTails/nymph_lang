@@ -29,9 +29,19 @@ pub(crate) const OUTSTANDING_WORK_CAPACITY: usize =
 #[derive(Clone, Default)]
 pub(crate) struct CancellationToken {
 	cancelled: Arc<AtomicBool>,
+	#[cfg(test)]
+	cancel_after: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 
 impl CancellationToken {
+	#[cfg(test)]
+	pub(crate) fn cancel_after(checkpoints: usize) -> Self {
+		Self {
+			cancelled: Arc::new(AtomicBool::new(false)),
+			cancel_after: Some(Arc::new(std::sync::atomic::AtomicUsize::new(checkpoints))),
+		}
+	}
+
 	pub(crate) fn cancel(&self) {
 		self.cancelled.store(true, Ordering::Release);
 	}
@@ -45,6 +55,16 @@ impl CancellationToken {
 	}
 
 	pub(crate) fn checkpoint(&self) -> Result<(), Cancelled> {
+		#[cfg(test)]
+		if let Some(remaining) = &self.cancel_after
+			&& remaining
+				.try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+					value.checked_sub(1)
+				})
+				.is_err()
+		{
+			self.cancel();
+		}
 		if self.is_cancelled() {
 			Err(Cancelled)
 		} else {
