@@ -368,7 +368,10 @@ impl<'a> ProtocolOwner<'a> {
 				self.pending.push_back(item);
 				Ok(true)
 			}
-			Err(TrySendError::Disconnected(_)) => Ok(false),
+			Err(TrySendError::Disconnected(item)) => {
+				self.fail_disconnected_job(item.id)?;
+				Ok(true)
+			}
 		}
 	}
 
@@ -488,7 +491,18 @@ impl<'a> ProtocolOwner<'a> {
 					"analysis workers stopped unexpectedly",
 				)?;
 			}
-			Some(JobMetadata::Diagnostics { cancellation, .. }) => cancellation.cancel(),
+			Some(JobMetadata::Diagnostics {
+				key, cancellation, ..
+			}) => {
+				cancellation.cancel();
+				if self
+					.diagnostic_cancellations
+					.get(&key)
+					.is_some_and(|current| current.ptr_eq(&cancellation))
+				{
+					self.diagnostic_cancellations.remove(&key);
+				}
+			}
 			None => {}
 		}
 		Ok(())
@@ -914,8 +928,8 @@ struct ProtocolInbox {
 impl ProtocolInbox {
 	fn new(source: crossbeam_channel::Receiver<Message>) -> Self {
 		let (sender, receiver) = crossbeam_channel::bounded(PROTOCOL_QUEUE_CAPACITY);
-		let (flush, flush_requested) = crossbeam_channel::unbounded();
-		let (flushed_sender, flushed) = crossbeam_channel::unbounded();
+		let (flush, flush_requested) = crossbeam_channel::bounded(1);
+		let (flushed_sender, flushed) = crossbeam_channel::bounded(1);
 		let (stop, stopped) = crossbeam_channel::bounded(1);
 		let thread = std::thread::Builder::new()
 			.name("nymph-lsp-protocol-inbox".to_string())
@@ -980,6 +994,10 @@ impl ProtocolInbox {
 				break;
 			}
 			crossbeam_channel::select_biased! {
+				recv(self.flushed) -> result => match result {
+					Ok(flushed) => target = Some(flushed),
+					Err(_) => break,
+				},
 				recv(self.receiver) -> message => match message {
 					Ok(message) => {
 						self.consumed += 1;
@@ -989,10 +1007,6 @@ impl ProtocolInbox {
 						batch.push(Err(error));
 						break;
 					},
-				},
-				recv(self.flushed) -> result => match result {
-					Ok(flushed) => target = Some(flushed),
-					Err(_) => break,
 				},
 			}
 		}
@@ -1086,16 +1100,17 @@ pub(crate) fn main_loop(
 }
 
 fn handle_request(owner: &mut ProtocolOwner<'_>, request: ServerRequest) -> anyhow::Result<bool> {
-	if request.method == "shutdown" {
-		owner.begin_shutdown(request.id)?;
-		return Ok(false);
-	}
 	if owner.shutting_down {
 		owner.send_error(
 			request.id,
 			lsp_server::ErrorCode::InvalidRequest as i32,
 			"server is shutting down",
 		)?;
+		return Ok(false);
+	}
+	if request.method == "shutdown" {
+		owner.retire_duplicate_request(&request.id);
+		owner.begin_shutdown(request.id)?;
 		return Ok(false);
 	}
 	if request.method == "test/barrier" {
@@ -2082,6 +2097,44 @@ mod tests {
 	}
 
 	#[test]
+	fn captured_protocol_batch_stops_at_the_acknowledged_boundary() {
+		let (protocol_sender, protocol) = crossbeam_channel::bounded(2);
+		for id in 2..=3 {
+			protocol_sender
+				.send(Message::Notification(Notification::new(
+					"$/cancelRequest".into(),
+					serde_json::json!({ "id": id }),
+				)))
+				.unwrap();
+		}
+		let (flush, flush_requested) = crossbeam_channel::bounded(1);
+		let (flushed_sender, flushed) = crossbeam_channel::bounded(1);
+		let (stop, _stopped) = crossbeam_channel::bounded(1);
+		flushed_sender.send(2).unwrap();
+		let mut inbox = ProtocolInbox {
+			receiver: protocol,
+			flush,
+			flushed,
+			consumed: 0,
+			stop,
+			thread: None,
+		};
+		let first = Message::Notification(Notification::new(
+			"$/cancelRequest".into(),
+			serde_json::json!({ "id": 1 }),
+		));
+
+		let batch = inbox.batch(Ok(first));
+
+		assert_eq!(batch.len(), 2);
+		assert!(matches!(
+			inbox.receiver.try_recv(),
+			Ok(Message::Notification(_))
+		));
+		assert!(flush_requested.try_recv().is_ok());
+	}
+
+	#[test]
 	fn batched_cancellation_precedes_capacity_reclaimed_completion() {
 		let (server, client) = Connection::memory();
 		let documents = Arc::new(Mutex::new(DocumentStore::default()));
@@ -2684,6 +2737,79 @@ mod tests {
 		let completed = owner.pool.completed().recv().unwrap();
 		owner.complete(completed).unwrap();
 		assert!(client.receiver.try_recv().is_err());
+		owner.finish();
+	}
+
+	#[test]
+	fn repeated_shutdown_is_rejected_and_a_reused_id_has_one_terminal_response() {
+		let (server, client) = Connection::memory();
+		let documents = Arc::new(Mutex::new(DocumentStore::default()));
+		let mut owner = ProtocolOwner::new(&server, documents, &CompilerState::new());
+		let id = RequestId::from("shutdown".to_string());
+		let (started_sender, started) = crossbeam_channel::bounded(0);
+		let (release_sender, release) = crossbeam_channel::bounded(0);
+		owner
+			.schedule_request(id.clone(), None, blocking_request(started_sender, release))
+			.unwrap();
+		started.recv().unwrap();
+
+		handle_request(
+			&mut owner,
+			ServerRequest::new(id.clone(), "shutdown".into(), serde_json::Value::Null),
+		)
+		.unwrap();
+		let first = recv_response(&client);
+		assert_eq!(first.id, id);
+		assert_eq!(first.response_result.unwrap(), serde_json::Value::Null);
+
+		handle_request(
+			&mut owner,
+			ServerRequest::new(
+				RequestId::from(2),
+				"shutdown".into(),
+				serde_json::Value::Null,
+			),
+		)
+		.unwrap();
+		let repeated = recv_response(&client);
+		assert_eq!(repeated.id, RequestId::from(2));
+		assert_eq!(
+			repeated.response_result.unwrap_err().code,
+			lsp_server::ErrorCode::InvalidRequest as i32
+		);
+
+		release_sender.send(()).unwrap();
+		let completed = owner.pool.completed().recv().unwrap();
+		owner.complete(completed).unwrap();
+		assert!(client.receiver.try_recv().is_err());
+		owner.finish();
+	}
+
+	#[test]
+	fn disconnected_worker_returns_internal_error_once() {
+		let (server, client) = Connection::memory();
+		let documents = Arc::new(Mutex::new(DocumentStore::default()));
+		let mut owner = ProtocolOwner::new(&server, documents, &CompilerState::new());
+		owner.pool = WorkerPool::disconnected();
+		let id = RequestId::from(52);
+
+		owner
+			.schedule_request(
+				id.clone(),
+				None,
+				Box::new(|_, _| TaskResult::Request(Ok(serde_json::Value::Null))),
+			)
+			.unwrap();
+
+		let response = recv_response(&client);
+		assert_eq!(response.id, id);
+		assert_eq!(
+			response.response_result.unwrap_err().code,
+			lsp_server::ErrorCode::InternalError as i32
+		);
+		assert!(client.receiver.try_recv().is_err());
+		assert!(owner.requests.is_empty());
+		assert!(owner.jobs.is_empty());
 		owner.finish();
 	}
 

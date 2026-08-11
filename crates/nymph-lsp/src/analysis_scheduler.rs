@@ -253,6 +253,19 @@ impl WorkerPool {
 		Self::with_limits(template, WORKER_COUNT, WORK_QUEUE_CAPACITY)
 	}
 
+	#[cfg(test)]
+	pub(crate) fn disconnected() -> Self {
+		let (sender, receiver) = crossbeam_channel::bounded(1);
+		drop(receiver);
+		let (completed_sender, completed) = crossbeam_channel::bounded(1);
+		drop(completed_sender);
+		Self {
+			senders: vec![sender],
+			completed,
+			threads: Vec::new(),
+		}
+	}
+
 	fn with_limits(template: &CompilerState, worker_count: usize, queue_capacity: usize) -> Self {
 		assert!(worker_count > 0);
 		assert!(queue_capacity >= worker_count);
