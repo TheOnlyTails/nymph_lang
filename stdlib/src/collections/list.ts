@@ -1,9 +1,20 @@
-import { NBool, NList, NMap, NString, NUint, protocolEquals } from "std/box";
+import {
+	NBool,
+	NList,
+	NMap,
+	NString,
+	NUint,
+	nymphArrayPop,
+	nymphArrayPush,
+	nymphArraySetLength,
+	nymphArraySplice,
+	protocolEquals,
+} from "std/box";
 import { Option } from "std/option";
 
 export const length = ($_this: NList) => new NUint($_this.v.length);
 export const insert = <T>($_this: NList<T>, i: NUint, element: T) => {
-	$_this.v.splice(i.v, 0, element);
+	nymphArraySplice($_this.v, i.v, 0, element);
 };
 // Gap 3 (L1): the compiler's own emitted `Option` ABI (`emit_enum`,
 // `nymph-codegen`) builds a field variant via `Object.assign(<tag>, fields)`
@@ -16,21 +27,23 @@ export const insert = <T>($_this: NList<T>, i: NUint, element: T) => {
 export const get = <T>($_this: NList<T>, i: NUint) =>
 	i.v < $_this.v.length ? Option.Some({ value: $_this.v[i.v] }) : Option.None;
 export const remove = <T>($_this: NList<T>, i: NUint) =>
-	i.v < $_this.v.length ? Option.Some({ value: $_this.v.splice(i.v, 1)[0] }) : Option.None;
+	i.v < $_this.v.length
+		? Option.Some({ value: nymphArraySplice($_this.v, i.v, 1)[0] })
+		: Option.None;
 export const push = <T>($_this: NList<T>, item: T) => {
-	$_this.v.push(item);
+	nymphArrayPush($_this.v, item);
 };
 export const pop = <T>($_this: NList<T>) =>
-	$_this.v.length === 0 ? Option.None : Option.Some({ value: $_this.v.pop()! });
+	$_this.v.length === 0 ? Option.None : Option.Some({ value: nymphArrayPop($_this.v)! });
 export const first = <T>($_this: NList<T>) =>
 	$_this.v.length === 0 ? Option.None : Option.Some({ value: $_this.v[0] });
 export const last = <T>($_this: NList<T>) =>
 	$_this.v.length === 0 ? Option.None : Option.Some({ value: $_this.v[$_this.v.length - 1] });
 export const clear = ($_this: NList) => {
-	$_this.v.length = 0;
+	nymphArraySetLength($_this.v, 0);
 };
 export const splice = <T>($_this: NList<T>, start: NUint, end: NUint, replacement: NList<T>) =>
-	new NList($_this.v.splice(start.v, end.v - start.v, ...replacement.v));
+	new NList(nymphArraySplice($_this.v, start.v, end.v - start.v, ...replacement.v));
 export const slice = <T>($_this: NList<T>, start: NUint, end: NUint) =>
 	new NList($_this.v.slice(start.v, end.v));
 export const concat = <T>($_this: NList<T>, other: NList<T>) => new NList($_this.v.concat(other.v));

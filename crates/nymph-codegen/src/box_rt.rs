@@ -79,14 +79,14 @@ fn class_defs(export: bool, option_enum_name: &str) -> String {
 	out.push_str("\ttoString() {\n\t\treturn this.debug().v;\n\t}\n");
 	out.push_str("}\n");
 	out.push_str("const NYMPH_TYPE_INTERN = new globalThis.Map();\nconst NYMPH_TYPE_RESULT = Symbol(\"nymph.type.result\");\nconst NYMPH_TYPE_ARGUMENTS = new globalThis.WeakMap();\n");
-	out.push_str("function nymphType(base, args) {\n\tif (args.length === 0) return base;\n\targs = Object.freeze([...args]);\n\tlet node = NYMPH_TYPE_INTERN.get(base);\n\tif (node === undefined) { node = new globalThis.Map(); NYMPH_TYPE_INTERN.set(base, node); }\n\tfor (const arg of args) { let next = node.get(arg); if (next === undefined) { next = new globalThis.Map(); node.set(arg, next); } node = next; }\n\tlet result = node.get(NYMPH_TYPE_RESULT);\n\tif (result === undefined) { result = Object.create(base); NYMPH_TYPE_ARGUMENTS.set(result, args); node.set(NYMPH_TYPE_RESULT, result); }\n\treturn result;\n}\nfunction nymphTypeProjection(receiver, path) {\n\tlet type = Object.getPrototypeOf(receiver);\n\tfor (const index of path) { const args = NYMPH_TYPE_ARGUMENTS.get(type); if (args === undefined || index >= args.length) throw new TypeError(\"missing canonical Nymph type argument\"); type = args[index]; }\n\treturn type;\n}\n");
-	out.push_str("const NYMPH_VARIANT_INTERN = new globalThis.WeakMap();\nfunction nymphVariant(type, variant) {\n\tlet variants = NYMPH_VARIANT_INTERN.get(type);\n\tif (variants === undefined) { variants = new globalThis.WeakMap(); NYMPH_VARIANT_INTERN.set(type, variants); }\n\tlet result = variants.get(variant);\n\tif (result === undefined) { result = Object.freeze(Object.assign(Object.create(type), variant)); variants.set(variant, result); }\n\treturn result;\n}\n");
+	out.push_str("function nymphType(base, args) {\n\tif (args.length === 0) return base;\n\targs = Object.freeze([...args]);\n\tlet node = NYMPH_TYPE_INTERN.get(base);\n\tif (node === undefined) { node = new globalThis.Map(); nymphMapSet(NYMPH_TYPE_INTERN, base, node); }\n\tfor (const arg of args) { let next = node.get(arg); if (next === undefined) { next = new globalThis.Map(); nymphMapSet(node, arg, next); } node = next; }\n\tlet result = node.get(NYMPH_TYPE_RESULT);\n\tif (result === undefined) { result = Object.create(base); nymphWeakMapSet(NYMPH_TYPE_ARGUMENTS, result, args); nymphMapSet(node, NYMPH_TYPE_RESULT, result); }\n\treturn result;\n}\nfunction nymphTypeProjection(receiver, path) {\n\tlet type = Object.getPrototypeOf(receiver);\n\tfor (const index of path) { const args = NYMPH_TYPE_ARGUMENTS.get(type); if (args === undefined || index >= args.length) throw new TypeError(\"missing canonical Nymph type argument\"); type = args[index]; }\n\treturn type;\n}\n");
+	out.push_str("const NYMPH_VARIANT_INTERN = new globalThis.WeakMap();\nfunction nymphVariant(type, variant) {\n\tlet variants = NYMPH_VARIANT_INTERN.get(type);\n\tif (variants === undefined) { variants = new globalThis.WeakMap(); nymphWeakMapSet(NYMPH_VARIANT_INTERN, type, variants); }\n\tlet result = variants.get(variant);\n\tif (result === undefined) { result = Object.freeze(nymphAssign(Object.create(type), variant)); nymphWeakMapSet(variants, variant, result); }\n\treturn result;\n}\n");
 	out.push_str(&format!(
 		"const NYMPH_OPTION_ENUM_NAME = \"{option_enum_name}\";\n"
 	));
 	out.push_str(HASH_MAP_RUNTIME);
 	if export {
-		out.push_str("export { NymphRange, nymphKeyEquals as protocolEquals, nymphHash as structuralHash, nymphDisplay as structuralDisplay, nymphDebug as structuralDebug, nymphProtocolDisplay, nymphProtocolDebug };\n");
+		out.push_str("export { NymphRange, nymphKeyEquals as protocolEquals, nymphHash as structuralHash, nymphDisplay as structuralDisplay, nymphDebug as structuralDebug, nymphProtocolDisplay, nymphProtocolDebug, nymphTransactionBegin, nymphTransactionCommit, nymphTransactionRollback, nymphCell, nymphCellGet, nymphCellSet, nymphSetProperty, nymphDeleteProperty, nymphAssign, nymphSetPrototypeOf, nymphArraySplice, nymphArrayPush, nymphArrayPop, nymphArraySetLength, nymphMapSet, nymphWeakMapSet, nymphRuntimeClass, nymphRuntimeEnum };\n");
 	}
 	for (class, _) in BOX_CLASSES {
 		if *class == "NMap" {
@@ -101,7 +101,7 @@ fn class_defs(export: bool, option_enum_name: &str) -> String {
 			));
 		} else if *class == "NList" {
 			out.push_str(&format!(
-				"{kw}class {class} extends {BASE} {{\n\tindex(key) {{\n\t\treturn this.v[key.v];\n\t}}\n\tpush(item) {{\n\t\tthis.v.push(item);\n\t}}\n\titer() {{\n\t\treturn new NymphListIterator(this.v);\n\t}}\n}}\n"
+				"{kw}class {class} extends {BASE} {{\n\tindex(key) {{\n\t\treturn this.v[key.v];\n\t}}\n\tpush(item) {{\n\t\tnymphArrayPush(this.v, item);\n\t}}\n\titer() {{\n\t\treturn new NymphListIterator(this.v);\n\t}}\n}}\n"
 			));
 		} else {
 			out.push_str(&format!("{kw}class {class} extends {BASE} {{}}\n"));
@@ -238,7 +238,7 @@ mod tests {
 	fn list_wrapper_exposes_the_mutation_used_by_nymph_default_methods() {
 		let src = box_module_source();
 		assert!(src.contains("push(item)"), "{src}");
-		assert!(src.contains("this.v.push(item)"), "{src}");
+		assert!(src.contains("nymphArrayPush(this.v, item)"), "{src}");
 	}
 
 	#[test]

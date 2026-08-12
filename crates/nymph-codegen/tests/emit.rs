@@ -1,4 +1,6 @@
-use nymph_codegen::emit;
+use nymph_codegen::{
+	emit, emit_for_transactional_project_module, emit_for_transactional_project_module_checked,
+};
 use nymph_hir::hir::{
 	BinOp, BuiltinResult, HirArm, HirBoundDispatchCase, HirBoundDispatchTarget, HirEnum, HirExpr,
 	HirFunc, HirLit, HirMethod, HirModule, HirPat, HirStmt, HirVariant, NumKind,
@@ -20,6 +22,76 @@ fn emits_a_function_returning_a_number() {
 	// A single-expression body becomes an arrow-style function returning the value.
 	assert!(js.contains("answer"), "function name present: {js}");
 	assert!(js.contains("42"), "literal present: {js}");
+}
+
+#[test]
+fn transactional_callable_parameters_are_cells_but_hidden_type_parameters_are_not() {
+	let module = HirModule {
+		lets: vec![],
+		funcs: vec![HirFunc {
+			name: "capture".into(),
+			params: vec!["value".into(), "$type$T".into()],
+			body: HirExpr::Closure {
+				params: vec!["next".into()],
+				body: Box::new(HirExpr::Assign {
+					target: Box::new(HirExpr::Local("value".into())),
+					value: Box::new(HirExpr::Local("next".into())),
+				}),
+			},
+		}],
+		classes: vec![],
+		enums: vec![],
+	};
+	let ordinary = emit(&module);
+	let transactional = emit_for_transactional_project_module(&module, "test", &[], &[]);
+
+	assert!(
+		ordinary.contains("function capture(value, $type$T)"),
+		"{ordinary}"
+	);
+	assert!(!ordinary.contains("nymphCell"), "{ordinary}");
+	assert!(
+		transactional.contains("function capture($nymph$temp$0, $type$T)"),
+		"{transactional}"
+	);
+	assert!(
+		transactional.contains("const value = nymphCell($nymph$temp$0);"),
+		"{transactional}"
+	);
+	assert!(
+		transactional.contains("const next = nymphCell($nymph$temp$1);"),
+		"{transactional}"
+	);
+	assert!(
+		transactional.contains("nymphCellSet.call(null, value, nymphCellGet(next))"),
+		"{transactional}"
+	);
+	assert!(
+		!transactional.contains("nymphCell($type$T)"),
+		"{transactional}"
+	);
+}
+
+#[test]
+fn strict_transactional_emission_rejects_the_exact_unaudited_external_inventory() {
+	let module = HirModule {
+		lets: vec![],
+		funcs: vec![HirFunc {
+			name: "call_host".into(),
+			params: vec![],
+			body: HirExpr::ExternCall {
+				module: "host/state",
+				symbol: "mutate",
+				args: vec![],
+			},
+		}],
+		classes: vec![],
+		enums: vec![],
+	};
+	assert_eq!(
+		emit_for_transactional_project_module_checked(&module, "test", &[], &[]),
+		Err(("host/state".to_string(), "mutate".to_string()))
+	);
 }
 
 #[test]

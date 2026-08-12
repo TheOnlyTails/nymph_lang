@@ -147,6 +147,36 @@ An explicit source argument is still resolved within the selected manifest's
 `package.src`; a source outside that root is rejected rather than causing
 discovery of another project.
 
+## Interactive evaluation
+
+`nymph repl` starts a persistent read-eval-print loop. It discovers the nearest
+`nymph.toml` from the current directory and resolves `@/…` imports from that
+project's `package.src`. `--manifest <PATH>` selects exactly that manifest and
+never falls back. Only the absence of a discovered manifest starts a loose
+session; loose sessions still include ambient core and embedded `std/…` modules.
+
+Declarations, imports, and their evaluated values remain available to later
+submissions. A newer declaration may shadow a name without changing the
+meaning of older declarations that captured the previous binding. Each
+submission is staged through the normal project compiler and committed only
+after its generated program executes successfully, so syntax, type, compiler,
+and runtime failures preserve the last good session state.
+
+In a terminal the primary prompt is `> ` and incomplete syntax uses `... `.
+Continuation is determined by lexer/parser end-of-input state, so multiline
+blocks, string interpolation, and block comments do not require an extra blank
+line. Ctrl-D (EOF) exits cleanly. Values are rendered with Nymph's `Debug`
+semantics, including user implementations, rather than JavaScript object
+inspection.
+
+Redirected input prints neither the banner nor prompts. This makes transcripts
+deterministic and scriptable:
+
+```sh
+printf 'let x = 40\nx + 2\n' | nymph repl
+# 42
+```
+
 ## Formatting sources
 
 `nymph format [FILES...]` rewrites explicitly named `.nym` files in normalized,

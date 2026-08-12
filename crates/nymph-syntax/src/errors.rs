@@ -80,6 +80,36 @@ pub enum ParseError {
 	},
 }
 
+impl ParseError {
+	/// Whether this error can be repaired solely by appending more source.
+	#[must_use]
+	pub fn is_incomplete(&self) -> bool {
+		match self {
+			Self::ExpectedTypeFoundEof
+			| Self::ExpectedPatternFoundEof
+			| Self::ExpectedExpressionFoundEof => true,
+			Self::ExpectedToken { found, .. }
+			| Self::ExpectedIdentifier { found }
+			| Self::ExpectedDeclaration { found }
+			| Self::ExpectedMember { found }
+			| Self::ExpectedInterfaceMember { found } => found == "end of input",
+			_ => false,
+		}
+	}
+
+	/// Errors whose missing suffix is implicit in the variant rather than a
+	/// `found: end of input` field.
+	#[must_use]
+	pub fn is_append_repairable(&self) -> bool {
+		matches!(
+			self,
+			Self::ExpectedArrowInFnType
+				| Self::ExpectedNumberAfterMinus
+				| Self::MissingInclusiveRangeUpperBound
+		)
+	}
+}
+
 impl IntoDiagnostic for ParseError {
 	fn message(&self) -> EcoString {
 		use ParseError as E;

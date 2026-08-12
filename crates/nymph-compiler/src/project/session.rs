@@ -753,7 +753,7 @@ impl CompilerSession {
 		{
 			return Err(diagnostics.0);
 		}
-		match super::emission::emitted_interface_project(&self.db, key) {
+		match super::emission::emitted_interface_project(&self.db, key, false) {
 			super::emission::StableEmissionResult::Value(value) => Ok(value),
 			super::emission::StableEmissionResult::Diagnostics(diagnostics) => Err(diagnostics),
 		}
@@ -1714,11 +1714,45 @@ impl CompilerSession {
 		preserve_names: bool,
 	) -> Result<(std::collections::HashMap<String, String>, usize), Arc<[ProjectDiagnostic]>> {
 		let key = self.project_key(project, entry, mode, preserve_names, true);
-		match super::emission::emitted_interface_project(&self.db, key) {
+		match super::emission::emitted_interface_project(&self.db, key, false) {
 			super::emission::StableEmissionResult::Value(emitted) => Ok((
 				emitted.module_sources.clone().into_iter().collect(),
 				emitted.entry_tag,
 			)),
+			super::emission::StableEmissionResult::Diagnostics(diagnostics) => Err(diagnostics),
+		}
+	}
+
+	/// Emit an exact ES-module graph with the explicit synchronous REPL
+	/// transaction mode. Ordinary compilation never selects this path.
+	pub(crate) fn emit_transactional_repl_project(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+	) -> Result<(std::collections::HashMap<String, String>, usize), Arc<[ProjectDiagnostic]>> {
+		let key = self.project_key(project, entry, EntryMode::Repl, false, true);
+		match super::emission::emitted_interface_project(&self.db, key, true) {
+			super::emission::StableEmissionResult::Value(emitted) => {
+				let mut sources = emitted.module_sources.clone();
+				for (module, source) in crate::host_runtime::HostRuntimeGraph::compiler_facts()
+					.module_sources(&emitted.compiler_option_binding)
+				{
+					if sources.insert(module.clone(), source).is_some() {
+						return Err(
+							vec![ProjectDiagnostic {
+								module: module.clone(),
+								diag: nymph_diagnostics::Diagnostic::error(
+									"STABLE-INTRINSIC-COLLISION".into(),
+									format!("intrinsic runtime module `{module}` collides with a project module"),
+									0..0,
+								),
+							}]
+							.into(),
+						);
+					}
+				}
+				Ok((sources.into_iter().collect(), emitted.entry_tag))
+			}
 			super::emission::StableEmissionResult::Diagnostics(diagnostics) => Err(diagnostics),
 		}
 	}

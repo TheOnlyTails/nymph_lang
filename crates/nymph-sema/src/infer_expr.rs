@@ -1302,12 +1302,19 @@ impl<'m> Checker<'m> {
 			.annotations
 			.record_definition_target(id, self.defs.stable(def));
 		match self.defs.data(def).kind {
-			DefKind::Let => self
-				.sigs
-				.lets
-				.get(&def)
-				.map(|sig| sig.ty)
-				.unwrap_or_else(|| self.fresh()),
+			DefKind::Let => {
+				let ty = self
+					.sigs
+					.lets
+					.get(&def)
+					.map(|sig| sig.ty)
+					.unwrap_or_else(|| self.fresh());
+				if self.allow_imported_assignment && self.mutable_imports.contains(&def) {
+					self.interner.mk_mut(ty)
+				} else {
+					ty
+				}
+			}
 			DefKind::Func => {
 				let (ty, arguments) = self.fn_type_of(def, span);
 				self
@@ -3819,6 +3826,24 @@ impl<'m> Checker<'m> {
 						);
 					}
 					ty
+				}
+				None
+					if self.allow_imported_assignment
+						&& self
+							.defs
+							.get(&name.0)
+							.is_some_and(|definition| self.mutable_imports.contains(&definition)) =>
+				{
+					let definition = self.defs.get(&name.0).expect("checked imported definition");
+					self
+						.annotations
+						.record_definition_target(lhs.id, self.defs.stable(definition));
+					self
+						.sigs
+						.lets
+						.get(&definition)
+						.map(|signature| signature.ty)
+						.unwrap_or_else(|| self.fresh())
 				}
 				None => {
 					self.emit(

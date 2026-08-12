@@ -3,7 +3,7 @@
 //! `run`, and command-line parsing.
 
 use std::io::Write;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const ATOMIC_DIRECTORY_EXCHANGE: bool = cfg!(any(
@@ -77,6 +77,35 @@ fn nymph_in(args: &[&str], current_dir: impl AsRef<std::path::Path>) -> Output {
 		.env_remove("FORCE_COLOR")
 		.output()
 		.expect("spawn nymph");
+	Output {
+		status: out.status,
+		stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+		stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+	}
+}
+
+fn nymph_with_stdin(
+	args: &[&str],
+	current_dir: impl AsRef<std::path::Path>,
+	stdin: &str,
+) -> Output {
+	let mut child = Command::new(env!("CARGO_BIN_EXE_nymph"))
+		.args(args)
+		.current_dir(current_dir)
+		.env("NO_COLOR", "1")
+		.env_remove("FORCE_COLOR")
+		.stdin(Stdio::piped())
+		.stdout(Stdio::piped())
+		.stderr(Stdio::piped())
+		.spawn()
+		.expect("spawn nymph");
+	child
+		.stdin
+		.take()
+		.unwrap()
+		.write_all(stdin.as_bytes())
+		.unwrap();
+	let out = child.wait_with_output().unwrap();
 	Output {
 		status: out.status,
 		stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -1086,6 +1115,378 @@ fn run_reports_a_type_error_in_an_inline_expression() {
 		!out.stdout.contains("panicked at"),
 		"stdout must not carry a raw panic dump: {}",
 		out.stdout
+	);
+}
+
+#[test]
+fn repl_piped_transcript_is_prompt_free_persistent_multiline_and_transactional() {
+	let root = unique_temp_path("nymph_cli_repl_loose", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let transcript = r#"let stable = 7
+let old = stable
+let stable = 9
+let = 1
+let wrong: int = true
+func recurse(): int = recurse()
+let failed = recurse()
+#(stable, old)
+"value ${if (true) {
+  42
+} else {
+  0
+}}"
+1 + /* multiline
+comment */ 1
+"#;
+	let out = nymph_with_stdin(&["repl"], &root, transcript);
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(out.stdout, "#(9, 7)\n\"value 42\"\n2\n");
+	assert!(
+		!out.stdout.contains('>'),
+		"piped mode must not emit prompts"
+	);
+	assert!(out.stderr.contains("expected a pattern"), "{}", out.stderr);
+	assert!(
+		out.stderr.contains("expected `int`, found `boolean`"),
+		"{}",
+		out.stderr
+	);
+	assert!(out.stderr.contains("failed at runtime"), "{}", out.stderr);
+}
+
+#[test]
+fn repl_uses_discovered_project_imports_embedded_std_and_debug_rendering() {
+	let root = write_project("main.nym", "func main(): void = {}");
+	std::fs::write(root.join("src/model.nym"), "public func answer(): int = 42").unwrap();
+	let transcript = r#"import @/model with (answer)
+import std/io with (println)
+struct Marker(v: int) {
+  impl Debug {
+    func debug(): string = "<marker>"
+  }
+}
+answer()
+#[Marker(v = 1)]
+"#;
+	let out = nymph_with_stdin(&["repl"], &root, transcript);
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(out.stdout, "42\n#[<marker>]\n");
+	assert_eq!(out.stderr, "");
+}
+
+#[test]
+fn repl_manifest_is_authoritative_and_discovery_only_falls_back_when_absent() {
+	let loose = unique_temp_path("nymph_cli_repl_loose", "dir");
+	std::fs::create_dir_all(&loose).unwrap();
+	let loose_out = nymph_with_stdin(&["repl"], &loose, "40 + 2\n");
+	assert!(loose_out.status.success(), "{}", loose_out.stderr);
+	assert_eq!(loose_out.stdout, "42\n");
+
+	let project = write_project("main.nym", "func main(): void = {}");
+	std::fs::write(project.join("src/value.nym"), "public let selected = 21").unwrap();
+	let manifest = project.join("nymph.toml");
+	let explicit = nymph_with_stdin(
+		&["--manifest", manifest.to_str().unwrap(), "repl"],
+		&loose,
+		"import @/value with (selected)\nselected * 2\n",
+	);
+	assert!(explicit.status.success(), "{}", explicit.stderr);
+	assert_eq!(explicit.stdout, "42\n");
+
+	std::fs::write(loose.join("nymph.toml"), "not = [toml").unwrap();
+	let malformed = nymph_with_stdin(&["repl"], &loose, "1\n");
+	assert_eq!(malformed.status.code(), Some(1));
+	assert!(malformed.stdout.is_empty());
+	assert!(
+		malformed.stderr.contains("nymph.toml"),
+		"{}",
+		malformed.stderr
+	);
+
+	std::fs::remove_dir_all(loose).unwrap();
+	std::fs::remove_dir_all(project).unwrap();
+}
+
+#[test]
+fn repl_eof_exits_cleanly_without_prompts_or_output() {
+	let root = unique_temp_path("nymph_cli_repl_eof", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let out = nymph_with_stdin(&["repl"], &root, "");
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(out.stdout, "");
+	assert_eq!(out.stderr, "");
+}
+
+#[test]
+fn repl_rolls_back_cells_collections_closures_iterators_and_debug_rendering() {
+	let root = unique_temp_path("nymph_cli_repl_transactions", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let transcript = r#"func recurse(): int = recurse()
+let mut scalar = 1
+let mut list = #[1, 2]
+let alias = list
+let mut map = #{1: 10}
+func mutate_then_fail(): int = { scalar = 9 list.insert(1, 8) list.remove(0) list.splice(0, 1, #[7]) list.pop() list.push(3) list[4] = 9 list.clear() map.insert(2, 20) map.remove(1) map.get_or_insert(3, 30) map[4] = 40 map.clear() recurse() }
+mutate_then_fail()
+#(scalar, list, alias, map)
+func make_counter(): () -> int = { let mut value = 0 return () -> { value = value + 1 value } }
+let counter = make_counter()
+counter()
+func counter_then_fail(): int = { counter() recurse() }
+counter_then_fail()
+counter()
+let mut iterator = #[4, 5].iter()
+iterator.next()
+func iterator_then_fail(): int = { iterator.next() recurse() }
+iterator_then_fail()
+iterator.next()
+func debug_fail(): string = debug_fail()
+struct Bad { impl Debug { func debug(): string = { list.push(8) debug_fail() } } }
+Bad()
+list
+"#;
+	let out = nymph_with_stdin(&["repl"], &root, transcript);
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(
+		out.stdout,
+		"#(1, #[1, 2], #[1, 2], #{1: 10})\n1\n2\nOption.Some(value: 4)\nOption.Some(value: 5)\n#[1, 2]\n"
+	);
+	assert_eq!(
+		out.stderr.matches("failed at runtime").count(),
+		4,
+		"{}",
+		out.stderr
+	);
+}
+
+#[test]
+fn repl_rolls_back_closure_private_collections_structs_and_nested_aliases() {
+	let root = unique_temp_path("nymph_cli_repl_closure_state", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let transcript = r#"func recurse(): int = recurse()
+struct Cell(value: mut int)
+func make_list_state(): () -> #[int] = { let mut values = #[1] return () -> { values.push(2) values } }
+let list_state = make_list_state()
+list_state()
+func fail_list_state(): int = { list_state() recurse() }
+fail_list_state()
+list_state()
+func make_map_state(): () -> #{int: int} = { let mut values = #{1: 10} return () -> { values.insert(2, 20) values } }
+let map_state = make_map_state()
+map_state()
+func fail_map_state(): int = { map_state() recurse() }
+fail_map_state()
+map_state()
+func make_struct_state(): () -> Cell = { let mut seed = 1 let mut value: mut Cell = Cell(value = seed) return () -> { value.value = value.value + 1 value } }
+let struct_state = make_struct_state()
+struct_state()
+func fail_struct_state(): int = { struct_state() recurse() }
+fail_struct_state()
+struct_state()
+let mut seed = 3
+let mut cell = Cell(value = seed)
+let nested: #[mut Cell] = #[cell]
+let nested_alias = nested
+func fail_nested(): int = { nested_alias[0].value = 9 recurse() }
+fail_nested()
+#(nested[0].value, nested_alias[0].value)
+"#;
+	let out = nymph_with_stdin(&["repl"], &root, transcript);
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(
+		out.stdout,
+		"#[1, 2]\n#[1, 2, 2]\n#{1: 10, 2: 20}\n#{1: 10, 2: 20}\nCell(value: 2)\nCell(value: 3)\n#(3, 3)\n"
+	);
+	assert_eq!(
+		out.stderr.matches("failed at runtime").count(),
+		4,
+		"{}",
+		out.stderr
+	);
+}
+
+#[test]
+fn repl_preserves_project_private_state_and_bare_import_siblings_when_shadowed() {
+	let root = write_project("main.nym", "func main(): void = {}");
+	std::fs::write(
+		root.join("src/state.nym"),
+		concat!(
+			"private let mut values = #[1]\n",
+			"public func current(): #[int] = values\n",
+			"func recurse(): int = recurse()\n",
+			"public func fail(): int = { values.push(2) recurse() }\n",
+			"public let a = 1\n",
+			"public let b = 2\n",
+			"public enum Shade { Light }",
+		),
+	)
+	.unwrap();
+	std::fs::write(root.join("src/dep.nym"), "public let dep = 4").unwrap();
+	let transcript = concat!(
+		"import @/state\n",
+		"current()\n",
+		"fail()\n",
+		"current()\n",
+		"let a = 9\n",
+		"#(a, b, state.b)\n",
+		"Light\n",
+		"let state = 7\n",
+		"state\n",
+		"import @/state with (a as grouped_a, b as grouped_b)\n",
+		"let grouped_a = 8\n",
+		"#(grouped_a, grouped_b)\n",
+		"import @/dep\n",
+		"let dep = 9\n",
+		"dep\n",
+	);
+	let out = nymph_with_stdin(&["repl"], &root, transcript);
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(
+		out.stdout,
+		"#[1]\n#[1]\n#(9, 2, 2)\nShade.Light\n7\n#(8, 2)\n9\n"
+	);
+	assert_eq!(
+		out.stderr.matches("failed at runtime").count(),
+		1,
+		"{}",
+		out.stderr
+	);
+}
+
+#[test]
+fn repl_renders_void_canonically() {
+	let root = unique_temp_path("nymph_cli_repl_void", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let out = nymph_with_stdin(&["repl"], &root, "if (true) {}\n");
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(out.stdout, "void\n");
+	assert!(!out.stdout.contains("undefined"));
+}
+
+#[test]
+fn repl_rolls_back_hamt_collisions_and_equal_nonidentical_keys() {
+	let root = unique_temp_path("nymph_cli_repl_hamt", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let transcript = r#"func recurse(): int = recurse()
+struct Key(id: int) { impl Equals<Other = Key> { func equals(other: Key): boolean = this.id == other.id } impl Hash { func hash(): int = 0 } }
+let mut values = #{Key(id = 1): 10, Key(id = 2): 20}
+func mutate_hamt_then_fail(): int = { values.insert(Key(id = 3), 30) values.remove(Key(id = 1)) recurse() }
+mutate_hamt_then_fail()
+#(values.size(), values[Key(id = 1)], values[Key(id = 2)])
+let mut hash_calls = 0
+let mut hash_side_effects: #[int] = #[]
+struct StatefulKey(id: int) { impl Equals<Other = StatefulKey> { func equals(other: StatefulKey): boolean = this.id == other.id } impl Hash { func hash(): int = { hash_calls = hash_calls + 1 hash_side_effects.push(hash_calls) 0 } } }
+let mut stateful_values = #{StatefulKey(id = 1): 10}
+func mutate_stateful_hash_then_fail(): int = { stateful_values[StatefulKey(id = 2)] = 20 recurse() }
+mutate_stateful_hash_then_fail()
+#(hash_calls, hash_side_effects, stateful_values)
+"#;
+	let out = nymph_with_stdin(&["repl"], &root, transcript);
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(
+		out.stdout,
+		"#(2, 10, 20)\n#(1, #[1], #{StatefulKey(id: 1): 10})\n"
+	);
+	assert_eq!(
+		out.stderr.matches("failed at runtime").count(),
+		2,
+		"{}",
+		out.stderr
+	);
+}
+
+#[test]
+fn repl_hamt_callbacks_cannot_corrupt_the_map_they_are_querying() {
+	let root = write_project("main.nym", "func main(): void = {}");
+	std::fs::write(
+		root.join("src/state.nym"),
+		r#"let mut hash_armed = #[false]
+struct HashKey(id: int) {
+  impl Equals<Other = HashKey> { func equals(other: HashKey): boolean = this.id == other.id }
+  impl Hash { func hash(): int = { if (hash_armed[0]) { hash_armed[0] = false hash_map.insert(HashKey(id = 99), 99) } 0 } }
+}
+let mut hash_map = #{HashKey(id = 1): 10}
+public func mutate_from_hash(): #(uint, uint, boolean) = {
+  hash_armed[0] = true
+  hash_map[HashKey(id = 2)] = 20
+  #(hash_map.size(), hash_map.entries().length(), hash_map.contains_key(HashKey(id = 99)))
+}
+
+let mut equals_armed = #[false]
+struct EqualsKey(id: int) {
+  impl Equals<Other = EqualsKey> {
+    func equals(other: EqualsKey): boolean = {
+      if (equals_armed[0]) { equals_armed[0] = false equals_map.insert(EqualsKey(id = 99), 99) }
+      this.id == other.id
+    }
+  }
+  impl Hash { func hash(): int = 0 }
+}
+let mut equals_map = #{EqualsKey(id = 1): 10}
+public func mutate_from_equals(): void = {
+  equals_armed[0] = true
+  equals_map[EqualsKey(id = 2)] = 20
+}
+public func equals_snapshot(): #(uint, uint, boolean) =
+  #(equals_map.size(), equals_map.entries().length(), equals_map.contains_key(EqualsKey(id = 99)))
+"#,
+	)
+	.unwrap();
+	let transcript = concat!(
+		"import @/state with (mutate_from_hash, mutate_from_equals, equals_snapshot)\n",
+		"mutate_from_hash()\n",
+		"mutate_from_equals()\n",
+		"equals_snapshot()\n",
+	);
+	let out = nymph_with_stdin(&["repl"], &root, transcript);
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(out.stdout, "#(3, 3, true)\n#(1, 1, false)\n");
+	assert_eq!(
+		out.stderr.matches("failed at runtime").count(),
+		1,
+		"{}",
+		out.stderr
+	);
+	assert!(
+		out
+			.stderr
+			.contains("map equality callback mutated the map being updated"),
+		"{}",
+		out.stderr
+	);
+}
+
+#[test]
+fn repl_closed_invalid_interpolation_does_not_swallow_the_next_submission() {
+	let root = unique_temp_path("nymph_cli_repl_interpolation", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let out = nymph_with_stdin(&["repl"], &root, "\"${let}\"\n40 + 2\n");
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(out.stdout, "42\n");
+	assert!(out.stderr.contains("expected"), "{}", out.stderr);
+}
+
+#[test]
+fn repl_reports_a_truncated_piped_submission_at_eof() {
+	let root = unique_temp_path("nymph_cli_repl_truncated", "dir");
+	std::fs::create_dir_all(&root).unwrap();
+	let out = nymph_with_stdin(&["repl"], &root, "1 +\n");
+	std::fs::remove_dir_all(root).unwrap();
+	assert_eq!(out.status.code(), Some(1));
+	assert!(out.stdout.is_empty());
+	assert_eq!(
+		out.stderr,
+		"error: incomplete REPL submission at end of input\n"
 	);
 }
 

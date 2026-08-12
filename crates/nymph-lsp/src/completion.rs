@@ -257,7 +257,7 @@ fn imported_kind(kind: nymph_sema::query::ImportedNameKind) -> CompletionItemKin
 		ImportedNameKind::Struct => CompletionItemKind::STRUCT,
 		ImportedNameKind::Enum => CompletionItemKind::ENUM,
 		ImportedNameKind::Interface => CompletionItemKind::INTERFACE,
-		ImportedNameKind::Namespace => CompletionItemKind::MODULE,
+		ImportedNameKind::ModuleNamespace | ImportedNameKind::Namespace => CompletionItemKind::MODULE,
 		ImportedNameKind::Variant => CompletionItemKind::ENUM_MEMBER,
 	}
 }

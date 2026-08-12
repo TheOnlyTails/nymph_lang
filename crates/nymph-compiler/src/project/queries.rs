@@ -1709,6 +1709,14 @@ fn declaration_name(definition: &nymph_sema::DefinitionId) -> Option<&str> {
 	}
 }
 
+pub(crate) fn repl_module_tag(path: &str) -> String {
+	path
+		.as_bytes()
+		.iter()
+		.map(|byte| format!("{byte:02x}"))
+		.collect()
+}
+
 #[salsa::tracked(returns(clone))]
 pub(crate) fn binding_name<'db>(
 	db: &'db dyn Db,
@@ -1741,6 +1749,11 @@ pub(crate) fn binding_name<'db>(
 		.ok_or_else(|| nymph_sema::StableNameLookupError::MissingBinding {
 			definition: definition.clone(),
 		})?;
+	let tag = if key.mode(db) == nymph_sema::EntryMode::Repl {
+		repl_module_tag(&definition.module.path)
+	} else {
+		tag.to_string()
+	};
 	let preserve = key.preserve_names(db) && definition.module.path == key.entry(db).as_str();
 	let entry_main = key.mode(db) == nymph_sema::EntryMode::Entry
 		&& definition.module.path == key.entry(db).as_str()
@@ -2353,12 +2366,14 @@ pub(crate) fn interface_module_analysis<'db>(
 	let result = nymph_sema::check_module_with_owned_environment(
 		Arc::new(parsed.tree.clone()),
 		environment,
-		if key.mode(db) == nymph_sema::EntryMode::Entry
-			&& module.display_key(db) == key.entry(db).as_str()
-		{
-			nymph_sema::EntryMode::Entry
-		} else {
-			nymph_sema::EntryMode::Library
+		match key.mode(db) {
+			nymph_sema::EntryMode::Entry if module.display_key(db) == key.entry(db).as_str() => {
+				nymph_sema::EntryMode::Entry
+			}
+			nymph_sema::EntryMode::Repl => nymph_sema::EntryMode::Repl,
+			nymph_sema::EntryMode::Library | nymph_sema::EntryMode::Entry => {
+				nymph_sema::EntryMode::Library
+			}
 		},
 	);
 	let qualified_access_causes = result

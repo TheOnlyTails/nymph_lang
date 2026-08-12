@@ -28,6 +28,10 @@ type Err<'src> = extra::Err<Rich<'src, char, SimpleSpan, LexError>>;
 pub struct LexResult {
 	pub tokens: Vec<Spanned<Token>>,
 	pub diagnostics: Vec<Diagnostic>,
+	/// Whether lexing stopped because the source ended while a token was open.
+	/// REPL clients use this typed signal instead of guessing from rendered
+	/// diagnostic text.
+	pub incomplete: bool,
 }
 
 fn clean(s: &str) -> String {
@@ -43,6 +47,13 @@ pub fn lex(source: &str) -> LexResult {
 	let (output, errors) = lexer().parse(source).into_output_errors();
 	let mut tokens = output.unwrap_or_default();
 	normalize_tokens(&mut tokens);
+	let incomplete = has_unterminated_block_comment(source)
+		|| errors.iter().any(|error| {
+			matches!(
+				error.reason(),
+				RichReason::ExpectedFound { found: None, .. }
+			)
+		});
 
 	let diagnostics = errors
 		.into_iter()
@@ -62,7 +73,54 @@ pub fn lex(source: &str) -> LexResult {
 	LexResult {
 		tokens,
 		diagnostics,
+		incomplete,
 	}
+}
+
+/// The token parser can recover a failed `/* ... */` as `/` and `*` operator
+/// tokens. Keep that lexical recovery for diagnostics, but retain the fact
+/// that the comment token itself is still open for incremental/REPL clients.
+fn has_unterminated_block_comment(source: &str) -> bool {
+	let bytes = source.as_bytes();
+	let mut index = 0;
+	let mut quote = None;
+	while index < bytes.len() {
+		if let Some(end) = quote {
+			if bytes[index] == b'\\' {
+				index += 2;
+				continue;
+			}
+			if bytes[index] == end {
+				quote = None;
+			}
+			index += 1;
+			continue;
+		}
+		if matches!(bytes[index], b'\'' | b'"') {
+			quote = Some(bytes[index]);
+			index += 1;
+			continue;
+		}
+		if bytes[index..].starts_with(b"//") {
+			index += bytes[index..]
+				.iter()
+				.position(|byte| *byte == b'\n')
+				.unwrap_or(bytes.len() - index);
+			continue;
+		}
+		if bytes[index..].starts_with(b"/*") {
+			let Some(close) = bytes[index + 2..]
+				.windows(2)
+				.position(|window| window == b"*/")
+			else {
+				return true;
+			};
+			index += close + 4;
+			continue;
+		}
+		index += 1;
+	}
+	false
 }
 
 /// Apply post-lex normalization to this token stream and every interpolation nested in it.
