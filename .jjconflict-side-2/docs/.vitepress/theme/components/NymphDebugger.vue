@@ -59,6 +59,14 @@ type WorkerResponse =
 	| { type: "ready" }
 	| { type: "result"; id: number; result: Inspection }
 	| { type: "error"; id?: number; message: string };
+type RuntimeResponse =
+	| { type: "output"; level: "log" | "info" | "warn" | "error"; text: string }
+	| { type: "result"; text: string }
+	| { type: "runtime-error"; text: string };
+type ConsoleLine = {
+	level: "log" | "info" | "warn" | "error" | "result" | "system";
+	text: string;
+};
 
 const examples = {
 	Functions: `func fibonacci(n: int): int = match (n) {
@@ -66,7 +74,7 @@ const examples = {
 	_ -> fibonacci(n - 1) + fibonacci(n - 2),
 }
 
-func answer(): int = fibonacci(10)
+func main(): int = fibonacci(10)
 `,
 	Types: `enum Shape {
 	Circle(radius: float),
@@ -87,12 +95,16 @@ func broken(): int = greet("Nymph")
 const source = ref(examples.Functions);
 const result = ref<Inspection | null>(null);
 const loading = ref(true);
+const compiling = ref(false);
 const failure = ref("");
 const activeTab = ref<"tokens" | "ast" | "types" | "javascript">("tokens");
 const editor = ref<HTMLTextAreaElement | null>(null);
 const highlightedEditor = ref<HTMLElement | null>(null);
 const diagnosticPopup = ref<DiagnosticPopup | null>(null);
+const running = ref(false);
+const consoleLines = ref<ConsoleLine[]>([]);
 let compilerWorker: Worker | undefined;
+let runtimeWorker: Worker | undefined;
 let nextRequestId = 0;
 let latestRequestId = 0;
 let timer: ReturnType<typeof setTimeout> | undefined;
@@ -233,7 +245,61 @@ function runInspection() {
 
 function scheduleInspection() {
 	clearTimeout(timer);
+	stopProgram(false);
+	compiling.value = true;
 	timer = setTimeout(runInspection, 180);
+}
+
+function runProgram() {
+	stopProgram(false);
+	consoleLines.value = [];
+	if (compiling.value) {
+		consoleLines.value.push({ level: "system", text: "Wait for compilation to finish." });
+		return;
+	}
+	if (!result.value?.js) {
+		consoleLines.value.push({
+			level: "system",
+			text: "Fix compiler errors before running the program.",
+		});
+		return;
+	}
+
+	running.value = true;
+	runtimeWorker = new Worker(new URL("./runtime.worker.ts", import.meta.url), { type: "module" });
+	runtimeWorker.addEventListener("message", (event: MessageEvent<RuntimeResponse>) => {
+		const response = event.data;
+		if (response.type === "output") {
+			consoleLines.value.push({ level: response.level, text: response.text });
+			return;
+		}
+		consoleLines.value.push({
+			level: response.type === "result" ? "result" : "error",
+			text: response.type === "result" ? `Result: ${response.text}` : response.text,
+		});
+		running.value = false;
+		runtimeWorker?.terminate();
+		runtimeWorker = undefined;
+	});
+	runtimeWorker.addEventListener("error", (event) => {
+		consoleLines.value.push({ level: "error", text: event.message });
+		running.value = false;
+	});
+	runtimeWorker.postMessage({ js: result.value.js });
+}
+
+function handleEditorKeydown(event: KeyboardEvent) {
+	if (event.key !== "Enter" || (!event.ctrlKey && !event.metaKey)) return;
+	event.preventDefault();
+	runProgram();
+}
+
+function stopProgram(report = true) {
+	if (!runtimeWorker) return;
+	runtimeWorker.terminate();
+	runtimeWorker = undefined;
+	running.value = false;
+	if (report) consoleLines.value.push({ level: "system", text: "Execution stopped." });
 }
 
 function selectRange(start: number, end: number) {
@@ -283,21 +349,25 @@ onMounted(() => {
 			result.value = response.result;
 			failure.value = "";
 			loading.value = false;
+			compiling.value = false;
 			return;
 		}
 		if (response.id === undefined || response.id === latestRequestId) {
 			failure.value = `Could not run the compiler: ${response.message}`;
 			loading.value = false;
+			compiling.value = false;
 		}
 	});
 	compilerWorker.addEventListener("error", (event) => {
 		failure.value = `Could not load the compiler worker: ${event.message}`;
 		loading.value = false;
+		compiling.value = false;
 	});
 });
 
 onBeforeUnmount(() => {
 	clearTimeout(timer);
+	stopProgram(false);
 	compilerWorker?.terminate();
 	compilerWorker = undefined;
 });
@@ -317,9 +387,24 @@ onBeforeUnmount(() => {
 					{{ name }}
 				</button>
 			</div>
-			<div class="compiler-state" aria-live="polite">
-				<span v-if="loading" class="loading-dot"></span>
-				{{ loading ? "Loading compiler…" : `${errors} errors · ${warnings} warnings` }}
+			<div class="lab-actions">
+				<div class="compiler-state" aria-live="polite">
+					<span v-if="loading" class="loading-dot"></span>
+					{{ loading ? "Loading compiler…" : `${errors} errors · ${warnings} warnings` }}
+				</div>
+				<button v-if="running" type="button" class="stop-button" @click="stopProgram()">
+					■ Stop
+				</button>
+				<button
+					v-else
+					type="button"
+					class="run-button"
+					:disabled="loading || compiling"
+					title="Run (Ctrl/⌘ + Enter)"
+					@click="runProgram"
+				>
+					▶ Run
+				</button>
 			</div>
 		</div>
 
@@ -356,6 +441,7 @@ onBeforeUnmount(() => {
 						v-model="source"
 						aria-label="Nymph source code"
 						spellcheck="false"
+						@keydown="handleEditorKeydown"
 						@scroll="syncEditorScroll"
 					></textarea>
 				</div>
@@ -436,6 +522,23 @@ onBeforeUnmount(() => {
 			</p>
 		</section>
 
+		<section class="console-panel" aria-live="polite">
+			<header>
+				<strong>Console</strong>
+				<span v-if="running" class="console-running"><i class="loading-dot"></i> Running</span>
+				<button v-if="consoleLines.length" type="button" @click="consoleLines = []">Clear</button>
+			</header>
+			<div class="console-output">
+				<p v-for="(line, index) in consoleLines" :key="index" :class="`console-${line.level}`">
+					<span aria-hidden="true">{{ line.level === "result" ? "←" : ">" }}</span
+					>{{ line.text }}
+				</p>
+				<p v-if="!consoleLines.length" class="console-empty">
+					Run a module with an exported <code>main</code> function to see its output.
+				</p>
+			</div>
+		</section>
+
 		<Teleport to="body">
 			<div
 				v-if="diagnosticPopup"
@@ -484,7 +587,9 @@ onBeforeUnmount(() => {
 .pipeline,
 .tabs,
 .diagnostics header,
+.console-panel header,
 .example-buttons,
+.lab-actions,
 .compiler-state {
 	display: flex;
 	align-items: center;
@@ -522,6 +627,32 @@ button {
 	gap: 8px;
 	color: var(--vp-c-text-2);
 	white-space: nowrap;
+}
+.lab-actions {
+	gap: 12px;
+}
+.run-button,
+.stop-button {
+	min-width: 78px;
+	padding: 7px 13px;
+	border: 1px solid transparent;
+	border-radius: 7px;
+	color: white;
+	font-weight: 600;
+	cursor: pointer;
+}
+.run-button {
+	background: var(--vp-c-green-1);
+}
+.run-button:hover {
+	background: var(--vp-c-green-2);
+}
+.run-button:disabled {
+	opacity: 0.55;
+	cursor: wait;
+}
+.stop-button {
+	background: var(--vp-c-danger-1);
 }
 .loading-dot {
 	width: 8px;
@@ -594,7 +725,8 @@ button {
 	gap: 16px;
 }
 .lab-panel,
-.diagnostics {
+.diagnostics,
+.console-panel {
 	overflow: hidden;
 	border: 1px solid var(--lab-border);
 	border-radius: 12px;
@@ -1001,7 +1133,8 @@ pre code {
 .diagnostics {
 	margin-top: 16px;
 }
-.diagnostics header {
+.diagnostics header,
+.console-panel header {
 	gap: 8px;
 	padding: 10px 14px;
 	border-bottom: 1px solid var(--lab-border);
@@ -1015,6 +1148,70 @@ pre code {
 	border-radius: 10px;
 	background: var(--vp-c-default-soft);
 	font-size: 12px;
+}
+.console-panel {
+	margin-top: 16px;
+	border: 1px solid var(--lab-border);
+	border-radius: 12px;
+	background: #121212;
+}
+.console-panel header {
+	background: var(--vp-c-bg-soft);
+	color: var(--vp-c-text-1);
+}
+.console-panel header button {
+	margin-left: auto;
+	padding: 3px 8px;
+	border: 0;
+	background: transparent;
+	color: var(--vp-c-text-2);
+	cursor: pointer;
+}
+.console-running {
+	display: flex;
+	align-items: center;
+	gap: 7px;
+	color: var(--vp-c-green-1);
+	font-size: 12px;
+}
+.console-running .loading-dot {
+	display: inline-block;
+}
+.console-output {
+	box-sizing: border-box;
+	min-height: 110px;
+	max-height: 260px;
+	overflow: auto;
+	padding: 10px 14px;
+	color: #dbd7caee;
+	font: 12px/1.6 var(--vp-font-family-mono);
+}
+.console-output p {
+	display: flex;
+	gap: 9px;
+	margin: 0;
+	white-space: pre-wrap;
+}
+.console-output p > span {
+	color: #666666;
+}
+.console-result {
+	color: #5da994;
+}
+.console-error {
+	color: #cb7676;
+}
+.console-warn {
+	color: #d4976c;
+}
+.console-system,
+.console-empty {
+	color: #dedcd590;
+}
+.console-empty code {
+	padding: 0;
+	background: transparent;
+	color: #bd976a;
 }
 .diagnostic {
 	display: grid;
