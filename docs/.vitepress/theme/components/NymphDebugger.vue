@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from "vue";
+import AstTreeNode, { type AstTreeNode as AstNode } from "./AstTreeNode.vue";
 
 type StageStatus = "complete" | "failed" | "blocked";
 type Stage = { name: string; status: StageStatus; detail: string };
@@ -126,6 +127,7 @@ const errors = computed(
 const warnings = computed(
 	() => result.value?.diagnostics.filter((item) => item.severity === "warning").length ?? 0,
 );
+const astTree = computed<AstNode[]>(() => parseAstTree(result.value?.ast ?? ""));
 const highlightedSource = computed<HighlightSegment[]>(() => {
 	const bytes = new TextEncoder().encode(source.value);
 	const tokens = result.value?.tokens ?? [];
@@ -169,6 +171,33 @@ function syntaxClass(kind: string) {
 	if (keywordKinds.has(kind)) return "syntax-keyword";
 	if (/^(L|R|HashL)(Paren|Bracket|Brace)$/.test(kind)) return "syntax-delimiter";
 	return "syntax-operator";
+}
+
+function parseAstTree(ast: string): AstNode[] {
+	const roots: AstNode[] = [];
+	const parents: AstNode[][] = [roots];
+	let id = 0;
+
+	for (const rawLine of ast.split("\n")) {
+		const line = rawLine.trim();
+		if (!line) continue;
+
+		if (/^[\]})],?$/.test(line)) {
+			parents.pop();
+			continue;
+		}
+
+		const opensChildren = /[({[]$/.test(line);
+		const node: AstNode = {
+			id: id++,
+			label: opensChildren ? line.slice(0, -1).trimEnd() : line.replace(/,$/, ""),
+			children: [],
+		};
+		parents.at(-1)?.push(node);
+		if (opensChildren) parents.push(node.children);
+	}
+
+	return roots;
 }
 
 function runInspection() {
@@ -320,7 +349,10 @@ onMounted(async () => {
 					</button>
 					<p v-if="!result?.tokens.length" class="empty-state">No tokens yet.</p>
 				</div>
-				<pre v-else-if="activeTab === 'ast'" role="tabpanel"><code>{{ result?.ast }}</code></pre>
+				<div v-else-if="activeTab === 'ast'" class="ast-tree" role="tabpanel">
+					<AstTreeNode v-for="node in astTree" :key="node.id" :node="node" :depth="0" />
+					<p v-if="!astTree.length" class="empty-state">No syntax tree is available.</p>
+				</div>
 				<div v-else-if="activeTab === 'types'" class="type-state" role="tabpanel">
 					<button
 						v-for="entry in result?.types ?? []"
@@ -774,6 +806,82 @@ pre code {
 .token small {
 	color: var(--vp-c-text-3);
 }
+.ast-tree {
+	box-sizing: border-box;
+	height: 430px;
+	overflow: auto;
+	padding: 12px;
+	background: #121212;
+	color: #dbd7caee;
+	font: 12px/1.45 var(--vp-font-family-mono);
+}
+.ast-tree :deep(.ast-branch),
+.ast-tree :deep(.ast-leaf) {
+	position: relative;
+	margin: 0;
+}
+.ast-tree :deep(summary),
+.ast-tree :deep(.ast-leaf) {
+	display: flex;
+	align-items: center;
+	gap: 7px;
+	min-height: 27px;
+	padding: 2px 7px;
+	border-radius: 5px;
+}
+.ast-tree :deep(summary) {
+	cursor: pointer;
+	list-style: none;
+}
+.ast-tree :deep(summary::-webkit-details-marker) {
+	display: none;
+}
+.ast-tree :deep(summary:hover),
+.ast-tree :deep(summary:focus-visible),
+.ast-tree :deep(.ast-leaf:hover) {
+	background: #1b1b1b;
+	outline: none;
+}
+.ast-tree :deep(code) {
+	overflow: hidden;
+	padding: 0;
+	background: transparent;
+	color: #bd976a;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.ast-tree :deep(summary small) {
+	margin-left: auto;
+	color: #dedcd570;
+}
+.ast-tree :deep(.ast-chevron) {
+	color: #5da994;
+	font-size: 18px;
+	line-height: 1;
+	transition: transform 120ms ease;
+}
+.ast-tree :deep(details[open] > summary .ast-chevron) {
+	transform: rotate(90deg);
+}
+.ast-tree :deep(.ast-children) {
+	position: relative;
+	margin-left: 12px;
+	padding-left: 13px;
+}
+.ast-tree :deep(.ast-children::before) {
+	position: absolute;
+	inset: 0 auto 7px 0;
+	border-left: 1px solid #353535;
+	content: "";
+}
+.ast-tree :deep(.ast-dot) {
+	width: 5px;
+	height: 5px;
+	margin: 0 6px;
+	flex: 0 0 auto;
+	border-radius: 50%;
+	background: #666666;
+}
 .type-state {
 	box-sizing: border-box;
 	height: 430px;
@@ -918,6 +1026,9 @@ pre code {
 	textarea,
 	pre,
 	.tokens {
+		height: 340px;
+	}
+	.ast-tree {
 		height: 340px;
 	}
 	.type-state {
