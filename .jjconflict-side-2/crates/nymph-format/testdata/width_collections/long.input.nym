@@ -1,0 +1,2 @@
+func collect()=#[alpha,beta,gamma,delta,epsilon,zeta,eta,theta,iota,kappa,lambda_value,mu_value,nu_value,xi_value]
+func invoke()=extremely_long_function_name(first_argument,second_argument,third_argument,fourth_argument,fifth_argument,sixth_argument)

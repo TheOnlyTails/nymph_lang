@@ -59,11 +59,26 @@ pub struct StageView {
 	pub detail: String,
 }
 
+/// One expression and its resolved checker state.
+#[derive(Clone, Debug, Serialize)]
+pub struct TypeStateView {
+	pub node: u32,
+	pub source: String,
+	pub type_: String,
+	pub dispatch: Option<String>,
+	pub method: Option<String>,
+	pub start: usize,
+	pub end: usize,
+	pub line: usize,
+	pub col: usize,
+}
+
 /// Debug information for every browser-observable compiler stage.
 #[derive(Clone, Debug, Serialize)]
 pub struct InspectionResult {
 	pub tokens: Vec<TokenView>,
 	pub ast: String,
+	pub types: Vec<TypeStateView>,
 	pub stages: Vec<StageView>,
 	pub js: Option<String>,
 	pub diagnostics: Vec<Diag>,

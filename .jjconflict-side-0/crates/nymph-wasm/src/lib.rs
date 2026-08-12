@@ -102,6 +102,7 @@ mod tests {
 
 		assert!(result.tokens.iter().any(|token| token.text == "func"));
 		assert!(result.ast.contains("Func"));
+		assert!(result.types.iter().any(|entry| entry.type_ == "int"));
 		assert_eq!(result.stages.len(), 4);
 		assert!(result.js.is_some());
 		assert!(result.diagnostics.is_empty());

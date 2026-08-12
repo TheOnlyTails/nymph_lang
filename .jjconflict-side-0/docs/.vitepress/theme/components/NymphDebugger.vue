@@ -22,9 +22,21 @@ type Diagnostic = {
 	end_line: number;
 	end_col: number;
 };
+type TypeState = {
+	node: number;
+	source: string;
+	type_: string;
+	dispatch: string | null;
+	method: string | null;
+	start: number;
+	end: number;
+	line: number;
+	col: number;
+};
 type Inspection = {
 	tokens: Token[];
 	ast: string;
+	types: TypeState[];
 	stages: Stage[];
 	js: string | null;
 	diagnostics: Diagnostic[];
@@ -69,7 +81,7 @@ const source = ref(examples.Functions);
 const result = ref<Inspection | null>(null);
 const loading = ref(true);
 const failure = ref("");
-const activeTab = ref<"tokens" | "ast" | "javascript">("tokens");
+const activeTab = ref<"tokens" | "ast" | "types" | "javascript">("tokens");
 const editor = ref<HTMLTextAreaElement | null>(null);
 const highlightedEditor = ref<HTMLElement | null>(null);
 const diagnosticPopup = ref<DiagnosticPopup | null>(null);
@@ -283,7 +295,7 @@ onMounted(async () => {
 			<section class="lab-panel output-panel">
 				<div class="tabs" role="tablist" aria-label="Compiler output">
 					<button
-						v-for="tab in ['tokens', 'ast', 'javascript'] as const"
+						v-for="tab in ['tokens', 'ast', 'types', 'javascript'] as const"
 						:key="tab"
 						type="button"
 						role="tab"
@@ -309,6 +321,27 @@ onMounted(async () => {
 					<p v-if="!result?.tokens.length" class="empty-state">No tokens yet.</p>
 				</div>
 				<pre v-else-if="activeTab === 'ast'" role="tabpanel"><code>{{ result?.ast }}</code></pre>
+				<div v-else-if="activeTab === 'types'" class="type-state" role="tabpanel">
+					<button
+						v-for="entry in result?.types ?? []"
+						:key="entry.node"
+						type="button"
+						class="type-entry"
+						@click="selectRange(entry.start, entry.end)"
+					>
+						<span class="type-source">
+							<code>{{ entry.source }}</code>
+							<small>node {{ entry.node }} · {{ entry.line }}:{{ entry.col }}</small>
+						</span>
+						<strong>{{ entry.type_ }}</strong>
+						<small v-if="entry.dispatch" class="type-dispatch">
+							{{ entry.dispatch }}<template v-if="entry.method"> · {{ entry.method }}</template>
+						</small>
+					</button>
+					<p v-if="!result?.types.length" class="empty-state">
+						No inferred expression state is available for this module.
+					</p>
+				</div>
 				<pre
 					v-else
 					role="tabpanel"
@@ -741,6 +774,57 @@ pre code {
 .token small {
 	color: var(--vp-c-text-3);
 }
+.type-state {
+	box-sizing: border-box;
+	height: 430px;
+	overflow: auto;
+	background: #121212;
+	color: #dbd7caee;
+	font: 12px/1.45 var(--vp-font-family-mono);
+}
+.type-entry {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) auto;
+	gap: 4px 16px;
+	width: 100%;
+	padding: 10px 14px;
+	border: 0;
+	border-bottom: 1px solid #242424;
+	background: transparent;
+	color: inherit;
+	text-align: left;
+	cursor: pointer;
+}
+.type-entry:hover,
+.type-entry:focus-visible {
+	background: #181818;
+	outline: none;
+}
+.type-source {
+	display: grid;
+	min-width: 0;
+	gap: 2px;
+}
+.type-source code {
+	overflow: hidden;
+	padding: 0;
+	background: transparent;
+	color: #bd976a;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.type-source small,
+.type-dispatch {
+	color: #dedcd590;
+}
+.type-entry strong {
+	color: #5da994;
+	font-weight: 500;
+}
+.type-dispatch {
+	grid-column: 2;
+	text-align: right;
+}
 
 .diagnostics {
 	margin-top: 16px;
@@ -834,6 +918,9 @@ pre code {
 	textarea,
 	pre,
 	.tokens {
+		height: 340px;
+	}
+	.type-state {
 		height: 340px;
 	}
 	.editor-shell {

@@ -1,0 +1,5 @@
+import std/io with (println)
+
+func main(): void = {
+  println("Hello, world!")
+}

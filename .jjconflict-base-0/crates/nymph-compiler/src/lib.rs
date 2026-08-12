@@ -69,7 +69,7 @@ pub fn compile_report(source: &str, path: &str) -> StandaloneCompileReport {
 /// Whether a compile/check pass should additionally require a valid
 /// top-level `main` entry point ([`nymph_sema::check_module_entry`]) or run
 /// as a plain library module ([`nymph_sema::check_module`]).
-use nymph_sema::EntryMode;
+pub use nymph_sema::EntryMode;
 
 /// Compile Nymph `source` to a JavaScript module string.
 ///

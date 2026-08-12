@@ -1,9 +1,11 @@
 //! Browser DTO adaptation around the stable compiler session pipeline.
 
-use nymph_compiler::Severity;
+use nymph_compiler::{CompilerSession, EntryMode, ModulePath, ProjectId, Severity, SourceVersion};
 use nymph_syntax::{lex, parse_module};
 
-use crate::diag::{CompileResult, InspectionResult, LineIndex, StageStatus, StageView, TokenView};
+use crate::diag::{
+	CompileResult, InspectionResult, LineIndex, StageStatus, StageView, TokenView, TypeStateView,
+};
 
 /// Parse, check, and (if error-free) lower + emit `source` to a JS module
 /// string. Mirrors `nymph_compiler::compile`.
@@ -70,6 +72,41 @@ pub(crate) fn run_inspect(source: &str) -> InspectionResult {
 		.iter()
 		.any(|diagnostic| diagnostic.severity == Severity::Error);
 	let ast = format!("{:#?}", parsed.tree);
+	let project = ProjectId::new("playground");
+	let module = ModulePath::new("playground").expect("the playground module path is canonical");
+	let mut session = CompilerSession::new();
+	session.set_source(
+		project.clone(),
+		module.clone(),
+		source.to_owned(),
+		SourceVersion(1),
+	);
+	let types = session
+		.analyze_module(project, module.clone(), module, EntryMode::Library)
+		.map(|analysis| {
+			analysis
+				.expression_type_state()
+				.into_iter()
+				.map(|entry| {
+					let (line, col) = index.line_col(entry.span.start);
+					TypeStateView {
+						node: entry.node.0,
+						source: source
+							.get(entry.span.start..entry.span.end)
+							.unwrap_or_default()
+							.to_owned(),
+						type_: entry.type_,
+						dispatch: entry.dispatch,
+						method: entry.method,
+						start: entry.span.start,
+						end: entry.span.end,
+						line,
+						col,
+					}
+				})
+				.collect()
+		})
+		.unwrap_or_default();
 
 	let report = nymph_compiler::compile_report(source, "playground");
 	let compile_failed = report
@@ -150,6 +187,7 @@ pub(crate) fn run_inspect(source: &str) -> InspectionResult {
 	InspectionResult {
 		tokens,
 		ast,
+		types,
 		stages,
 		js: report.js,
 		diagnostics,

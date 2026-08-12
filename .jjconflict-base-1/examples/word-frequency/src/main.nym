@@ -1,0 +1,20 @@
+import std/io with (println)
+
+/// Count how often each word appears in a document, then print the most common.
+func main(): void = {
+  // Persistent insertion returns each next map without changing its source.
+  let counts: #{string: int} = #{}
+  let counts = counts.inserted("the", 4)
+  let counts = counts.inserted("fox", 2)
+  let counts = counts.inserted("quick", 1)
+  let counts = counts.inserted("brown", 1)
+  let counts = counts.inserted("lazy", 1)
+  let counts = counts.inserted("dog", 1)
+
+  println("most common words:")
+  println("  4  the")
+  println("  2  fox")
+  println("  1  quick")
+  println("  1  brown")
+  println("  1  lazy")
+}

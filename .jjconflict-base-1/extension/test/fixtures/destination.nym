@@ -1,0 +1,21 @@
+effect Console
+
+struct Point(x: int, y: int) {
+	namespace func origin(): Point = Point(x = 0, y = 0)
+}
+
+enum Choice { One, Two }
+
+async func destination(base: Point, choice: Choice): int !Console = async {
+	let use resource = acquire()
+	let moved = Point(...base, x = 1)
+	let selected = Choice.One
+	let origin = Point.origin()
+	for (value in 0..=10) {
+		value |> echo
+	}
+	loop (let count = 0) {
+		if (count == 10) { break count }
+		continue(count = count + 1)
+	}.await
+}

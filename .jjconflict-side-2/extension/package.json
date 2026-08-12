@@ -1,0 +1,108 @@
+{
+	"name": "nymph",
+	"displayName": "Nymph",
+	"version": "0.0.1",
+	"description": "Support for the Nymph programming language",
+	"categories": [
+		"Programming Languages"
+	],
+	"homepage": "https://nymphlang.dev/",
+	"license": "Apache-2.0",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/theonlytails/nymph_lang.git",
+		"directory": "extension"
+	},
+	"publisher": "theonlytails",
+	"main": "./dist/extension.js",
+	"scripts": {
+		"vscode:prepublish": "npm run compile && npm run bundle",
+		"compile": "tsc -p ./",
+		"bundle": "esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js",
+		"watch": "tsc -watch -p ./",
+		"test": "pnpm run compile && node --test test/*.test.cjs && pnpm run test:configuration && pnpm run test:smoke",
+		"test:configuration": "node --test out/test/languageConfiguration.test.js",
+		"test:docs": "node scripts/check-docs.cjs",
+		"test:smoke": "node out/test/runTest.js",
+		"test:unit": "pnpm run compile && node --test test/*.test.cjs",
+		"stage:server": "node scripts/stage-server.cjs",
+		"verify:vsix": "node scripts/verify-vsix.cjs",
+		"package:target": "vsce package --no-dependencies",
+		"deploy": "vsce publish"
+	},
+	"dependencies": {
+		"vscode-languageclient": "^10.1.0"
+	},
+	"devDependencies": {
+		"@types/node": "^26.1.1",
+		"@types/vscode": "1.100.0",
+		"@vscode/test-electron": "^2.5.2",
+		"@vscode/vsce": "^3.9.2",
+		"esbuild": "^0.28.1",
+		"jsonc-parser": "^3.3.1",
+		"typescript": "^7.0.2"
+	},
+	"contributes": {
+		"configuration": {
+			"title": "Nymph",
+			"properties": {
+				"nymph.server.path": {
+					"type": "string",
+					"default": "",
+					"scope": "machine",
+					"description": "Development-only absolute path override for nymph-lsp. Published packages use their bundled server by default."
+				},
+				"nymph.buildProfile": {
+					"type": "string",
+					"enum": [
+						"development",
+						"release"
+					],
+					"default": "development",
+					"scope": "window",
+					"description": "Select the compiler profile used for workspace diagnostics."
+				}
+			}
+		},
+		"languages": [
+			{
+				"id": "nymph",
+				"aliases": [
+					"Nymph",
+					"nymph"
+				],
+				"extensions": [
+					".nym"
+				],
+				"configuration": "./language-configuration.json"
+			}
+		],
+		"snippets": [
+			{
+				"language": "nymph",
+				"path": "./snippets/nymph.json"
+			}
+		],
+		"grammars": [
+			{
+				"language": "nymph",
+				"scopeName": "source.nymph",
+				"path": "./syntaxes/nymph.tmLanguage.json"
+			},
+			{
+				"scopeName": "markdown.nymph.codeblock",
+				"path": "./syntaxes/nymph.codeblock.json",
+				"injectTo": [
+					"text.html.markdown"
+				],
+				"embeddedLanguages": {
+					"meta.embedded.block.nymph": "nymph"
+				}
+			}
+		]
+	},
+	"preview": true,
+	"engines": {
+		"vscode": "^1.100.0"
+	}
+}

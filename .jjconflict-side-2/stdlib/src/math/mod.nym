@@ -1,0 +1,116 @@
+import @/ops with (Power)
+
+/// The ratio between a circle's circumference and its diameter.
+public let pi = 3.14159265358979323846
+/// The ratio between a circle's circumference and its radius, or 2π.
+public let tau = 6.28318530717958647692
+/// The base of the natural logarithm, or Euler's number.
+public let e = 2.71828182845904523536
+/// The golden ratio, (1 + √5) / 2.
+public let phi = 1.61803398874989484820
+
+/// Numeric methods shared by the built-in number types.
+impl int {
+  /// The distance from 0 — the value without its sign.
+  func abs(): int = if (this > 0) this else -this
+  /// -1, 0, or 1 according to the number's sign.
+  func sign(): int = match (this) {
+    0 -> 0,
+    1.. -> 1,
+    ..=-1 -> -1,
+  }
+  /// The midpoint between this number and `other`.
+  func midpoint(other: int) = (this + other) / 2
+
+  /// Returns the sine of the input (in radians).
+  /// Given a right triangle ABC and angle A as the input,
+  /// the output of the function would be the ratio between the side opposite the angle
+  /// to the hypotenuse of the triangle.
+  func sin() = (this as float).sin()
+
+  /// Returns the cosine of the input (in radians).
+  /// Given a right triangle ABC and angle A as the input,
+  /// the output of the function would be the ratio between the side adjecent to the angle
+  /// to the hypotenuse of the triangle.
+  func cos() = (this as float).cos()
+
+  /// Returns the tangent of the input (in radians).
+  /// Given a right triangle ABC and angle A as the input,
+  /// the output of the function would be the ratio between the side opposite to the angle
+  /// to the side adjecent to the angle.
+  func tan() = (this as float).tan()
+
+  func asin() = (this as float).asin()
+  func acos() = (this as float).acos()
+  func atan() = (this as float).atan()
+
+  func sinh() = (this as float).sinh()
+  func cosh() = (this as float).cosh()
+  func tanh() = (this as float).tanh()
+
+  func asinh() = (this as float).asinh()
+  func acosh() = (this as float).acosh()
+  func atanh() = (this as float).atanh()
+
+  func sqrt() = ((this as float).ln() / 2.0).exp()
+}
+
+impl float {
+  /// The distance from 0 — the value without its sign.
+  func abs(): float = if (this > 0) this else -this
+  /// -1, 0, or 1 according to the number's sign.
+  func sign(): int = if (this > 0) 1 else if (this < 0) -1 else 0
+  /// The midpoint between this number and `other`.
+  func midpoint(other: float) = (this + other) / 2
+
+  /// Returns the sine of the input (in radians).
+  /// Given a right triangle ABC and angle A as the input,
+  /// the output of the function would be the ratio between the side opposite the angle
+  /// to the hypotenuse of the triangle.
+  external(sin) func sin(): float
+
+  /// Returns the cosine of the input (in radians).
+  /// Given a right triangle ABC and angle A as the input,
+  /// the output of the function would be the ratio between the side adjecent to the angle
+  /// to the hypotenuse of the triangle.
+  external(cos) func cos(): float
+
+  /// Returns the tangent of the input (in radians).
+  /// Given a right triangle ABC and angle A as the input,
+  /// the output of the function would be the ratio between the side opposite to the angle
+  /// to the side adjecent to the angle.
+  external(tan) func tan(): float
+
+  external(asin) func asin(): float
+  external(acos) func acos(): float
+  external(atan) func atan(): float
+
+  external(sinh) func sinh(): float
+  external(cosh) func cosh(): float
+  external(tanh) func tanh(): float
+
+  external(asinh) func asinh(): float
+  external(acosh) func acosh(): float
+  external(atanh) func atanh(): float
+
+  /// Returns Euler's number raised to this value.
+  external(exp) func exp(): float
+  /// Returns the natural logarithm of this value.
+  external(ln) func ln(): float
+  /// Returns the logarithm of this value in the given base.
+  func log(base: float): float = this.ln() / base.ln()
+
+  external(floor) func floor(): int
+  external(ceil) func ceil(): int
+  external(round) func round(): int
+
+  func sqrt() = (this.ln() / 2.0).exp()
+}
+
+public external(atan2) func atan2(y: float, x: float): float
+
+public let max_int = 9223372036854775807
+public let min_int = -9223372036854775808
+public external(max_float) let max_float: float
+public external(min_float) let min_float: float
+public external(min_positive_float) let min_positive_float: float

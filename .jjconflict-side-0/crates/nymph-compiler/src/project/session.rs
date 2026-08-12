@@ -495,6 +495,12 @@ impl ModuleAnalysis {
 		};
 		nymph_sema::query::type_at(&self.semantic.module, &checked, offset)
 	}
+
+	/// Return every expression type recorded by semantic analysis in source-node order.
+	#[must_use]
+	pub fn expression_type_state(&self) -> Vec<nymph_sema::query::ExpressionTypeState> {
+		nymph_sema::query::expression_type_state(&self.semantic)
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]

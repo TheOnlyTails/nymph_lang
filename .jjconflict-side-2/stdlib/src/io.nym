@@ -1,0 +1,2 @@
+public external(print) func print<T>(x: T): void
+public external(println) func println<T>(x: T): void

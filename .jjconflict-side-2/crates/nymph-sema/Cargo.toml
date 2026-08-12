@@ -1,0 +1,29 @@
+[package]
+name = "nymph-sema"
+description = "Name resolution, type checking, and interface solving for the Nymph language."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+nymph-ast = { workspace = true }
+nymph-diagnostics = { workspace = true }
+nymph-errorcode = { workspace = true }
+nymph-hir = { workspace = true }
+nymph-syntax = { workspace = true }
+ecow = { workspace = true }
+ena = { workspace = true }
+num-bigint = { workspace = true }
+ordered-float = { workspace = true }
+rustc-hash = { workspace = true }
+salsa = { workspace = true }
+
+[dev-dependencies]
+ecow = { workspace = true }
+rustc-hash = { workspace = true }
+
+[lints.clippy]
+all = "warn"

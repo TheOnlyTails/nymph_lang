@@ -1,0 +1,33 @@
+// `Option` <-> `Result` conversions live here, in a third module, rather than
+// in `option.nym`/`result.nym` themselves: those two types reference each
+// other (`Option::ok_or_else` builds a `Result`, `Result::ok`/`err` build an
+// `Option`), and a mutual top-level `import` between them is a genuine import
+// cycle the project resolver rejects outright ("import cycle detected: option
+// -> result -> option"). Splitting the cross-referencing methods out into a
+// module that imports both, one-way, breaks the cycle while keeping the
+// exact same public API (`opt.ok_or(e)`, `res.ok()`, `res.err()`, ...).
+import @/option with (Option)
+import @/result with (Result)
+
+impl<T> Option<T> {
+  func ok_or<E>(error: E) = this.ok_or_else(() -> error)
+
+  func ok_or_else<E>(error: () -> E) = match (this) {
+    Some(value) -> Result.Ok(value),
+    None -> Result.Error(error)
+  }
+}
+
+impl<T, E> Result<T, E> {
+  /// Converts a `Result<T, E>` into an `Option<T>`, discarding the error.
+  func ok(): Option<T> = match (this) {
+    Ok(value) -> Option.Some(value),
+    Error(...) -> Option.None
+  }
+
+  /// Converts a `Result<T, E>` into an `Option<E>`, discarding the success value.
+  func err(): Option<E> = match (this) {
+    Ok(...) -> Option.None,
+    Error(error) -> Option.Some(error)
+  }
+}

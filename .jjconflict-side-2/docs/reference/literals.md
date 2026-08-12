@@ -1,0 +1,266 @@
+# Literals
+
+Literals are language constructs that are "built-in", with special syntax to create and manipulate them.
+They should be either very _basic_ primitives or very _useful_ structures.
+
+## Numbers
+
+Number literals come in two kinds: integers and floats. Unsuffixed integer literals default to the
+signed 64-bit `int` type, while `u`-suffixed or contextually inferred literals use the unsigned
+64-bit `uint` type. Floats are IEEE 754 double-precision values.
+
+Integers are sequences of digits, optionally separated by underscores,
+in either binary, octal, decimal, or hexadecimal.
+
+```nymph
+12345 // decimal
+1_000_000_000 // digit separators
+0b10101101 // binary
+0o7654321 // octal
+0xDEADF00D // hexadecimal
+```
+
+An integer literal suffixed with `u` has type `uint`. An unsuffixed, non-negative integer literal
+adopts a required `uint` or `float` type in ordinary arguments, fields, and return values. In a binary
+numeric expression, it also adopts the known `uint` or `float` type of the other operand. This keeps
+simple calculations such as `index - 1` and `value > 0` suffix-free.
+
+A negated literal such as `-1` is an `int` expression, not a non-negative literal eligible for this
+inference. Likewise, an `int` variable is never implicitly converted to `uint` or `float`. The `u`
+suffix remains useful where no expected or known operand type is available.
+
+```nymph
+10u
+func ten(): uint = 10
+func previous(index: uint): uint = index - 1
+func positive(value: float): boolean = value > 0
+func offset(index: uint): int = index + -1
+```
+
+Floats are only decimal, and they may include underscore digit separators, scientific-notation exponents.
+Decimal integer literals suffixed with `f` are treated as floats of the same value.
+
+```nymph
+1.0 // regular float
+0.24e10 // exponent
+9e-1 // dotless float with exponent
+102.000_000_0001 // digit separators
+1f // integer float
+```
+
+Note that digit separators for both integers and floats may _only_ appear between digits,
+not other parts such as the `f` float prefix, `0b` radix specifier, etc:
+
+```nymph
+0b_0110 // ❌
+10_f // ❌
+1._2 // ❌
+```
+
+## Booleans
+
+Boolean literals are `true` and `false`, which are the only two values of the `boolean` type,
+represented by their respective case-sensitive keywords.
+
+```nymph
+true
+false
+```
+
+## Characters
+
+Character literals are single characters, enclosed in single quotes.
+They are a single UTF-8 codepoint, and may be entered either directly or using escape sequences.
+
+The only available escape sequences are newline (`\n`), tab (`\t`), carriage return (`\r`),
+apostrophe (`\'`), backslash (`\\`), and the Unicode escape (`\uXXXX`).
+Unicode escape sequences always use 4-6 hexadecimal digits, and must represent a valid Unicode codepoint.
+
+```nymph
+'a' // regular character
+'\n' // newline
+'\t' // tab
+'\r' // carriage return
+'\'' // single quote
+'\\' // backslash
+'\u1234' // unicode escape (4-6 hex digits)
+```
+
+## Strings
+
+String literals are sequences of characters, enclosed in double quotes.
+They are UTF-8 encoded, and may include unescaped newlines.
+
+> [!NOTE] Escape Sequences
+> While they may appear similar, string escape sequences are different from character escape sequences.
+> Character literals may include escape apostrophes `'\''`, while string literals may not.
+> On the flip side, string literals must escape double quotes `"\""`, and may include escaped
+> interpolated expressions `\${`.
+
+```nymph
+"Hello, world!" // regular string
+"Hello, \"world!\"" // escaped double quotes
+"Hello,
+world!" // newline
+"Hello, \nworld!" // escaped newline
+"Hello, ${name}!" // interpolated expression
+"Hello, \${name}!" // escaped interpolated expression
+```
+
+Each `${...}` interpolation must contain exactly one complete expression. Empty interpolations and
+extra content after that expression are invalid. Grouped expressions, calls, and closures are
+supported, for example `${(a + b)}`, `${format(value)}`, and `${x -> x + 1}`. Balanced braces are
+supported too, including block and `match` expressions.
+
+## Identifiers
+
+Identifiers are names for variables, functions, types, and other constructs.
+They are case-sensitive, and may include letters (including some Unicode characters), digits, and underscores.
+They must start with a letter or underscore, and may not be a reserved keyword.
+
+The single underscore `_` is a special identifier,
+which is used to indicate that a variable is intentionally unused and to suppress compiler warnings.
+Any declaration or assignment to `_` effectively discards the value.
+
+> [!NOTE] Casing and Conventions
+> Nymph does not enforce any particular casing or naming convention for identifiers.
+> However, it is recommended to use `snake_case` for variables and functions,
+> and `PascalCase` for types, structs, enums, etc.
+
+```nymph
+myVariable
+_myVariable
+MY_VARIABLE
+my_variable
+myVariable123
+שלום_עולם
+αβγδε
+ابتثج
+```
+
+## Lists
+
+Lists are ordered collections of values, enclosed in square brackets, preceded with the collection sigil `#`.
+All items in a list must be of the same type, and may be any valid expression.
+
+They may include any number of items, including zero, as well as an optional trailing comma,
+and span multiple lines.
+
+Other [Iterators](./stdlib/iter#Iterator) may be spread into a list using the `...` operator,
+so long as the `Item` type of the iterator matches the list type.
+
+> [!NOTE] Array lists vs. Linked lists
+> There are 2 ways to make lists - either use an array and expand its capacity as needed,
+> or have each item in the list store a reference to the next item.
+> Nymph uses array-backed lists for its list literal, but [linked lists](./stdlib/collections-linked_list#LinkedList)
+> are also available as the opt-in `std/collections/linked_list` module. Its current
+> `LinkedList<T>` is only a bare data shape and does not yet provide collection operations.
+
+```nymph
+#["apple", "banana", "cherry"]
+#[a, b, ...c]
+#[]
+#[
+  1,
+  2,
+  3,
+  4,
+  5,
+]
+```
+
+## Tuples
+
+Similar to lists, tuples are ordered collections of values, enclosed in parentheses, preceded with the collection sigil `#`.
+Unlike lists, tuples may contain values of different types, and are fixed in size.
+
+They may include any number of items, including zero, as well as an optional trailing comma,
+and span multiple lines.
+
+Statically shaped tuples may be spread into a tuple using the `...` operator.
+Their element types are flattened into the exact result tuple type; lists,
+generic values, and other dynamically sized sources cannot be spread into a tuple.
+Any number of tuple spreads may be interleaved with ordinary elements, including
+empty and nested tuples. Elements and spread source expressions are evaluated
+exactly once from left to right.
+
+```nymph
+#(1, true, 'a')
+#(
+  1,
+  2,
+  3,
+)
+#(1, ...a, 'c') // a : #(int, boolean) -> #(int, int, boolean, char)
+#(...#(), ...a, 2u)
+```
+
+## Maps
+
+Maps are unordered collections of key-value pairs, enclosed in curly braces, preceded with the collection sigil `#`.
+All keys in a map must be of the same type, and all values must be of the same type.
+
+Keys and values may be any valid expression, and the key-value pairs are separated by commas.
+They may include any number of items, including zero, as well as an optional trailing comma,
+and span multiple lines.
+
+Other [Iterators](./stdlib/iter#Iterator) may be spread into a map using the `...` operator,
+so long as their `Item` type is a tuple containing the key and value types of the map.
+
+Iterating a map yields `#(key, value)` tuples in the same sequence returned by `entries()`.
+Repeated iteration of an unchanged map instance preserves that sequence. The order is otherwise
+unspecified—including across separate map instances—and mutation may change it.
+
+```nymph
+#{"apple": 1, "banana": 2, "cherry": 3}
+#{}
+#{
+  "apple": 1,
+  "banana": 2,
+  "cherry": 3,
+  ...a,
+} // a : #[#(string, int)]
+```
+
+## Ranges
+
+Range expressions create values of the canonical standard-library range structs.
+A range can be either exclusive (`..`) or inclusive (`..=`):
+
+| Syntax        | Value type and fields           |
+| ------------- | ------------------------------- |
+| `start..end`  | `Range { start, end }`          |
+| `start..`     | `RangeFrom { start }`           |
+| `..end`       | `RangeTo { end }`               |
+| `start..=end` | `RangeInclusive { start, end }` |
+| `..=end`      | `RangeToInclusive { end }`      |
+
+Supplied endpoints are evaluated exactly once, from left to right. Range values can be stored,
+passed, returned, and inspected like values constructed from those structs directly.
+Either form may omit its lower bound. Only an exclusive range may omit its upper bound: `a..` is
+valid, but `a..=` is not, because an inclusive range requires an upper bound.
+
+Range endpoints must implement the fallible [`Step`](./stdlib/iter#Step) contract. The standard
+library provides `Step` for `int`, `uint`, and `char`.
+
+Ranges which do not contain a lower bound are "max-only" ranges, and ranges which do not contain
+an upper bound are "min-only" ranges. Max-only ranges become iterable only through explicit
+`.reversed()`; min-only ranges iterate forward until control flow, an adapter, or `Step.None`
+stops them.
+
+See [Iteration](./iteration#ranges) for how ranges behave inside a `for` loop.
+
+```nymph
+1..10 // exclusive range
+1..=10 // inclusive range
+1.. // min-only exclusive range
+..10 // max-only exclusive range
+..=10 // max-only inclusive range
+```
+
+## This
+
+The `this` keyword is a special identifier that refers to the current instance of an interface, struct, or enum.
+It is used to access instance variables and methods within the context of the surrounding scope.
+
+It may not be used outside of an instance context, such as in namespaces or in the global scope.

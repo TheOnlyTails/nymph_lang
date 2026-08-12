@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = [
+	"crates/nymph-ast",
+	"crates/nymph-diagnostics",
+	"crates/nymph-errorcode",
+	"crates/nymph-syntax",
+	"crates/nymph-format",
+	"crates/nymph-hir",
+	"crates/nymph-sema",
+	"crates/nymph-codegen",
+	# Added layer by layer as each crate is built:
+	"crates/nymph-compiler",
+	"crates/nymph-project",
+	"crates/nymph-cli",
+	"crates/nymph-lsp",
+	"crates/nymph-wasm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+homepage = "https://nymphlang.dev/"
+repository = "https://github.com/theonlytails/nymph_lang"
+authors = ["Shachar Zidon <theonlytails@theonlytails.com>"]
+
+[workspace.dependencies]
+# Internal crates
+nymph-ast = { path = "crates/nymph-ast" }
+nymph-diagnostics = { path = "crates/nymph-diagnostics" }
+nymph-errorcode = { path = "crates/nymph-errorcode" }
+nymph-syntax = { path = "crates/nymph-syntax" }
+nymph-format = { path = "crates/nymph-format" }
+nymph-hir = { path = "crates/nymph-hir" }
+nymph-sema = { path = "crates/nymph-sema" }
+nymph-codegen = { path = "crates/nymph-codegen" }
+nymph-compiler = { path = "crates/nymph-compiler" }
+nymph-project = { path = "crates/nymph-project" }
+
+# Shared external dependencies (proven set carried over from the previous implementation)
+anyhow = "1.0.104"
+ariadne = "0.6.0"
+clap = { version = "4.6.2", features = ["derive", "cargo"] }
+crossbeam-channel = "0.5.16"
+ecow = "0.3.0"
+ena = "0.14.4"
+num-bigint = "0.4.8"
+ordered-float = "5.3.0"
+oxc = { version = "0.140.0", features = ["codegen", "transformer", "semantic"] }
+rayon = "1.12.0"
+rustc-hash = "2.1.3"
+rustix = { version = "1.1.4", features = ["fs"] }
+salsa = "0.28.0"
+semver = { version = "1.0.28", features = ["serde"] }
+serde = { version = "1.0.229", features = ["derive"] }
+strsim = "0.11.1"
+strum = { version = "0.28.0", features = ["derive"] }
+thiserror = "2.0.19"
+toml = "1.1.3"
+url = { version = "2.5.8", features = ["serde"] }
+
+[profile.bench]
+debug = true
