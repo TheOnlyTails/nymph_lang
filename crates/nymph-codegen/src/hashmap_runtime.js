@@ -5,11 +5,10 @@ const NYMPH_TAG = Symbol.for("nymph.tag");
 // different module URLs while still participating in one REPL transaction.
 const NYMPH_TX_KEY = Symbol.for("nymph.transaction.journal");
 const nymphTransactionJournal =
-	globalThis[NYMPH_TX_KEY] ??
-	(globalThis[NYMPH_TX_KEY] = { stack: [], rollingBack: false });
+	globalThis[NYMPH_TX_KEY] ?? (globalThis[NYMPH_TX_KEY] = { stack: [], rollingBack: false });
 const NYMPH_CLASS_KEY = Symbol.for("nymph.runtime.classes");
-const nymphRuntimeClasses = globalThis[NYMPH_CLASS_KEY] ??
-	(globalThis[NYMPH_CLASS_KEY] = new globalThis.Map());
+const nymphRuntimeClasses =
+	globalThis[NYMPH_CLASS_KEY] ?? (globalThis[NYMPH_CLASS_KEY] = new globalThis.Map());
 
 function nymphTransactionBegin() {
 	nymphTransactionJournal.stack.push([]);
@@ -33,9 +32,16 @@ function nymphTransactionRollback() {
 function nymphJournal(undo) {
 	if (!nymphTransactionJournal.rollingBack) nymphTransactionJournal.stack.at(-1)?.push(undo);
 }
-function nymphCell(value) { return { value }; }
-function nymphCellGet(cell) { return cell.value; }
-function nymphCellSet(cell, value) { nymphSetProperty(cell, "value", value); return value; }
+function nymphCell(value) {
+	return { value };
+}
+function nymphCellGet(cell) {
+	return cell.value;
+}
+function nymphCellSet(cell, value) {
+	nymphSetProperty(cell, "value", value);
+	return value;
+}
 function nymphSetProperty(object, key, value) {
 	const descriptor = Object.getOwnPropertyDescriptor(object, key);
 	const oldLength = Array.isArray(object) ? object.length : undefined;
@@ -44,12 +50,15 @@ function nymphSetProperty(object, key, value) {
 		else Reflect.deleteProperty(object, key);
 		if (oldLength !== undefined && object.length !== oldLength) object.length = oldLength;
 	});
-	if (!Reflect.set(object, key, value)) throw new TypeError(`cannot assign property ${String(key)}`);
+	if (!Reflect.set(object, key, value))
+		throw new TypeError(`cannot assign property ${String(key)}`);
 	return value;
 }
 function nymphDeleteProperty(object, key) {
 	const descriptor = Object.getOwnPropertyDescriptor(object, key);
-	nymphJournal(() => { if (descriptor) Object.defineProperty(object, key, descriptor); });
+	nymphJournal(() => {
+		if (descriptor) Object.defineProperty(object, key, descriptor);
+	});
 	return Reflect.deleteProperty(object, key);
 }
 function nymphAssign(object, source) {
@@ -71,22 +80,31 @@ function nymphArraySplice(array, start, deleteCount, ...items) {
 	});
 	return array.splice(start, deleteCount, ...items);
 }
-function nymphArrayPush(array, ...items) { nymphArraySplice(array, array.length, 0, ...items); return array.length; }
-function nymphArrayPop(array) { return array.length ? nymphArraySplice(array, array.length - 1, 1)[0] : undefined; }
+function nymphArrayPush(array, ...items) {
+	nymphArraySplice(array, array.length, 0, ...items);
+	return array.length;
+}
+function nymphArrayPop(array) {
+	return array.length ? nymphArraySplice(array, array.length - 1, 1)[0] : undefined;
+}
 function nymphArraySetLength(array, length) {
 	if (length < array.length) nymphArraySplice(array, length, array.length - length);
 	else nymphSetProperty(array, "length", length);
 	return length;
 }
 function nymphMapSet(map, key, value) {
-	const had = map.has(key), old = map.get(key);
-	nymphJournal(() => had ? map.set(key, old) : map.delete(key));
-	map.set(key, value); return map;
+	const had = map.has(key),
+		old = map.get(key);
+	nymphJournal(() => (had ? map.set(key, old) : map.delete(key)));
+	map.set(key, value);
+	return map;
 }
 function nymphWeakMapSet(map, key, value) {
-	const had = map.has(key), old = map.get(key);
-	nymphJournal(() => had ? map.set(key, old) : map.delete(key));
-	map.set(key, value); return map;
+	const had = map.has(key),
+		old = map.get(key);
+	nymphJournal(() => (had ? map.set(key, old) : map.delete(key)));
+	map.set(key, value);
+	return map;
 }
 function nymphRuntimeClass(module, name, implementation) {
 	const key = `${module}\0${name.replace(/^\$m[^$]+\$/, "")}`;
@@ -113,7 +131,10 @@ function nymphRuntimeEnum(module, name, implementation) {
 			nymphSetProperty(existing.$nymph$type, property, implementation.$nymph$type[property]);
 		for (const property of Reflect.ownKeys(implementation)) {
 			if (!(property in existing)) nymphSetProperty(existing, property, implementation[property]);
-			else if (typeof implementation[property] === "function" && !implementation[property][NYMPH_TAG])
+			else if (
+				typeof implementation[property] === "function" &&
+				!implementation[property][NYMPH_TAG]
+			)
 				nymphSetProperty(existing, property, implementation[property]);
 		}
 		return existing;
@@ -208,11 +229,27 @@ function nymphEquals(left, right) {
 	}
 	if (left[NYMPH_TAG] !== right[NYMPH_TAG]) return false;
 	if (nymphTagName(left) === "nymph.map") {
-		if (left.size !== right.size) return false;
-		for (const [key, value] of left) {
-			if (!right.has(key) || !nymphEquals(value, right.get(key))) return false;
+		const leftRoot = left.root,
+			leftSize = left.size,
+			rightRoot = right.root,
+			rightSize = right.size;
+		let equal = leftSize === rightSize;
+		if (equal) {
+			for (const [key, value] of hamtEntries(leftRoot)) {
+				if (!right.has(key) || !nymphEquals(value, right.get(key))) {
+					equal = false;
+					break;
+				}
+			}
 		}
-		return true;
+		if (
+			left.root !== leftRoot ||
+			left.size !== leftSize ||
+			right.root !== rightRoot ||
+			right.size !== rightSize
+		)
+			throw new Error("map callback mutated a map being compared");
+		return equal;
 	}
 	if (Array.isArray(left.v) && Array.isArray(right.v)) {
 		return (
@@ -234,10 +271,14 @@ function nymphHash(value) {
 	if (typeof value !== "object") return nymphHashString(`${typeof value}:${String(value)}`);
 	let hash = nymphHashString(nymphTagName(value) ?? value.constructor?.name ?? "object");
 	if (nymphTagName(value) === "nymph.map") {
+		const root = value.root,
+			size = value.size;
 		let entriesHash = 0;
-		for (const [key, entryValue] of value) {
+		for (const [key, entryValue] of hamtEntries(root)) {
 			entriesHash = (entriesHash + nymphHashCombine(nymphKeyHash(key), nymphHash(entryValue))) | 0;
 		}
+		if (value.root !== root || value.size !== size)
+			throw new Error("map callback mutated the map being hashed");
 		return nymphHashCombine(hash, entriesHash);
 	}
 	if (Array.isArray(value.v)) {
@@ -329,7 +370,8 @@ function hamtSet(node, hash, key, value, shift) {
 		}
 		const entryIndex = node.entries.findIndex(([candidate]) => nymphKeyEquals(candidate, key));
 		if (entryIndex >= 0) {
-			const entries = node.entries.slice(); entries[entryIndex] = [key, value];
+			const entries = node.entries.slice();
+			entries[entryIndex] = [key, value];
 			return [{ ...node, entries }, false];
 		}
 		return [{ ...node, entries: [...node.entries, [key, value]] }, true];
@@ -342,7 +384,8 @@ function hamtSet(node, hash, key, value, shift) {
 		return [{ ...node, bitmap: node.bitmap | bit, children }, true];
 	}
 	const [child, inserted] = hamtSet(node.children[index], hash, key, value, shift + 5);
-	const children = node.children.slice(); children[index] = child;
+	const children = node.children.slice();
+	children[index] = child;
 	return [{ ...node, children }, inserted];
 }
 
@@ -373,11 +416,11 @@ function hamtDelete(node, hash, key, shift) {
 	if (child == null) {
 		const children = node.children.toSpliced(index, 1);
 		if (children.length === 0) return [null, value, true];
-		if (children.length === 1 && children[0].kind !== "bitmap")
-			return [children[0], value, true];
+		if (children.length === 1 && children[0].kind !== "bitmap") return [children[0], value, true];
 		return [{ ...node, bitmap: node.bitmap & ~bit, children }, value, true];
 	} else {
-		const children = node.children.slice(); children[index] = child;
+		const children = node.children.slice();
+		children[index] = child;
 		return [{ ...node, children }, value, true];
 	}
 }
@@ -405,21 +448,45 @@ class NymphHamt {
 		}
 	}
 	get(key) {
-		const value = hamtGet(this.root, nymphKeyHash(key), key, 0);
+		const hash = nymphKeyHash(key);
+		const root = this.root,
+			size = this.size;
+		const value = hamtGet(root, hash, key, 0);
+		if (this.root !== root || this.size !== size)
+			throw new Error("map equality callback mutated the map being queried");
 		return value === HAMT_NOT_FOUND ? undefined : value;
 	}
 	has(key) {
-		return hamtGet(this.root, nymphKeyHash(key), key, 0) !== HAMT_NOT_FOUND;
+		const hash = nymphKeyHash(key);
+		const root = this.root,
+			size = this.size;
+		const found = hamtGet(root, hash, key, 0) !== HAMT_NOT_FOUND;
+		if (this.root !== root || this.size !== size)
+			throw new Error("map equality callback mutated the map being queried");
+		return found;
 	}
 	set(key, value) {
-		const [root, inserted] = hamtSet(this.root, nymphKeyHash(key), key, value, 0);
+		const hash = nymphKeyHash(key);
+		const previousRoot = this.root,
+			previousSize = this.size;
+		const [root, inserted] = hamtSet(previousRoot, hash, key, value, 0);
+		if (this.root !== previousRoot || this.size !== previousSize)
+			throw new Error("map equality callback mutated the map being updated");
 		nymphSetProperty(this, "root", root);
 		if (inserted) nymphSetProperty(this, "size", this.size + 1);
 		return this;
 	}
 	delete(key) {
-		const [root, , removed] = hamtDelete(this.root, nymphKeyHash(key), key, 0);
-		if (removed) { nymphSetProperty(this, "root", root); nymphSetProperty(this, "size", this.size - 1); }
+		const hash = nymphKeyHash(key);
+		const previousRoot = this.root,
+			previousSize = this.size;
+		const [root, , removed] = hamtDelete(previousRoot, hash, key, 0);
+		if (this.root !== previousRoot || this.size !== previousSize)
+			throw new Error("map equality callback mutated the map being updated");
+		if (removed) {
+			nymphSetProperty(this, "root", root);
+			nymphSetProperty(this, "size", this.size - 1);
+		}
 		return removed;
 	}
 	clear() {
@@ -452,7 +519,8 @@ class NymphListIterator {
 	}
 	next() {
 		if (this.index >= this.items.length) return NYMPH_OPTION_NONE;
-		const value = this.items[this.index]; nymphSetProperty(this, "index", this.index + 1);
+		const value = this.items[this.index];
+		nymphSetProperty(this, "index", this.index + 1);
 		return { [NYMPH_TAG]: NYMPH_OPTION_SOME, value };
 	}
 }
@@ -464,7 +532,8 @@ class NymphMapIterator {
 	}
 	next() {
 		if (this.index >= this.entries.length) return NYMPH_OPTION_NONE;
-		const entry = this.entries[this.index]; nymphSetProperty(this, "index", this.index + 1);
+		const entry = this.entries[this.index];
+		nymphSetProperty(this, "index", this.index + 1);
 		return { [NYMPH_TAG]: NYMPH_OPTION_SOME, value: new NTuple(entry) };
 	}
 }

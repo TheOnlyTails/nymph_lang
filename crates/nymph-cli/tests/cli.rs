@@ -1404,6 +1404,68 @@ mutate_stateful_hash_then_fail()
 }
 
 #[test]
+fn repl_hamt_callbacks_cannot_corrupt_the_map_they_are_querying() {
+	let root = write_project("main.nym", "func main(): void = {}");
+	std::fs::write(
+		root.join("src/state.nym"),
+		r#"let mut hash_armed = #[false]
+struct HashKey(id: int) {
+  impl Equals<Other = HashKey> { func equals(other: HashKey): boolean = this.id == other.id }
+  impl Hash { func hash(): int = { if (hash_armed[0]) { hash_armed[0] = false hash_map.insert(HashKey(id = 99), 99) } 0 } }
+}
+let mut hash_map = #{HashKey(id = 1): 10}
+public func mutate_from_hash(): #(uint, uint, boolean) = {
+  hash_armed[0] = true
+  hash_map[HashKey(id = 2)] = 20
+  #(hash_map.size(), hash_map.entries().length(), hash_map.contains_key(HashKey(id = 99)))
+}
+
+let mut equals_armed = #[false]
+struct EqualsKey(id: int) {
+  impl Equals<Other = EqualsKey> {
+    func equals(other: EqualsKey): boolean = {
+      if (equals_armed[0]) { equals_armed[0] = false equals_map.insert(EqualsKey(id = 99), 99) }
+      this.id == other.id
+    }
+  }
+  impl Hash { func hash(): int = 0 }
+}
+let mut equals_map = #{EqualsKey(id = 1): 10}
+public func mutate_from_equals(): void = {
+  equals_armed[0] = true
+  equals_map[EqualsKey(id = 2)] = 20
+}
+public func equals_snapshot(): #(uint, uint, boolean) =
+  #(equals_map.size(), equals_map.entries().length(), equals_map.contains_key(EqualsKey(id = 99)))
+"#,
+	)
+	.unwrap();
+	let transcript = concat!(
+		"import @/state with (mutate_from_hash, mutate_from_equals, equals_snapshot)\n",
+		"mutate_from_hash()\n",
+		"mutate_from_equals()\n",
+		"equals_snapshot()\n",
+	);
+	let out = nymph_with_stdin(&["repl"], &root, transcript);
+	std::fs::remove_dir_all(root).unwrap();
+	assert!(out.status.success(), "{}", out.stderr);
+	assert_eq!(out.stdout, "#(3, 3, true)\n#(1, 1, false)\n");
+	assert_eq!(
+		out.stderr.matches("failed at runtime").count(),
+		1,
+		"{}",
+		out.stderr
+	);
+	assert!(
+		out
+			.stderr
+			.contains("map equality callback mutated the map being updated"),
+		"{}",
+		out.stderr
+	);
+}
+
+#[test]
 fn repl_closed_invalid_interpolation_does_not_swallow_the_next_submission() {
 	let root = unique_temp_path("nymph_cli_repl_interpolation", "dir");
 	std::fs::create_dir_all(&root).unwrap();
