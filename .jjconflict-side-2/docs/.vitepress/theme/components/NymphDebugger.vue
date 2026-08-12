@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, ref, watch } from "vue";
+import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import AstTreeNode, { type AstTreeNode as AstNode } from "./AstTreeNode.vue";
 import TypeTreeNode, { type TypeTreeNode as TypeNode } from "./TypeTreeNode.vue";
 
@@ -55,6 +55,10 @@ type DiagnosticPopup = {
 	y: number;
 	placement: "above" | "below";
 };
+type WorkerResponse =
+	| { type: "ready" }
+	| { type: "result"; id: number; result: Inspection }
+	| { type: "error"; id?: number; message: string };
 
 const examples = {
 	Functions: `func fibonacci(n: int): int = match (n) {
@@ -88,7 +92,9 @@ const activeTab = ref<"tokens" | "ast" | "types" | "javascript">("tokens");
 const editor = ref<HTMLTextAreaElement | null>(null);
 const highlightedEditor = ref<HTMLElement | null>(null);
 const diagnosticPopup = ref<DiagnosticPopup | null>(null);
-let inspectSource: ((value: string) => Inspection) | undefined;
+let compilerWorker: Worker | undefined;
+let nextRequestId = 0;
+let latestRequestId = 0;
 let timer: ReturnType<typeof setTimeout> | undefined;
 
 const keywordKinds = new Set([
@@ -220,13 +226,9 @@ function parseAstTree(ast: string): AstNode[] {
 }
 
 function runInspection() {
-	if (!inspectSource) return;
-	try {
-		result.value = inspectSource(source.value);
-		failure.value = "";
-	} catch (error) {
-		failure.value = error instanceof Error ? error.message : String(error);
-	}
+	if (!compilerWorker) return;
+	latestRequestId = ++nextRequestId;
+	compilerWorker.postMessage({ id: latestRequestId, source: source.value });
 }
 
 function scheduleInspection() {
@@ -268,17 +270,36 @@ function chooseExample(name: keyof typeof examples) {
 
 watch(source, scheduleInspection);
 
-onMounted(async () => {
-	try {
-		const wasm = await import("../../wasm/nymph_wasm.js");
-		await wasm.default();
-		inspectSource = wasm.inspect as (value: string) => Inspection;
-		runInspection();
-	} catch (error) {
-		failure.value = `Could not load the compiler: ${error instanceof Error ? error.message : String(error)}`;
-	} finally {
+onMounted(() => {
+	compilerWorker = new Worker(new URL("./compiler.worker.ts", import.meta.url), { type: "module" });
+	compilerWorker.addEventListener("message", (event: MessageEvent<WorkerResponse>) => {
+		const response = event.data;
+		if (response.type === "ready") {
+			if (latestRequestId === 0) runInspection();
+			return;
+		}
+		if (response.type === "result") {
+			if (response.id !== latestRequestId) return;
+			result.value = response.result;
+			failure.value = "";
+			loading.value = false;
+			return;
+		}
+		if (response.id === undefined || response.id === latestRequestId) {
+			failure.value = `Could not run the compiler: ${response.message}`;
+			loading.value = false;
+		}
+	});
+	compilerWorker.addEventListener("error", (event) => {
+		failure.value = `Could not load the compiler worker: ${event.message}`;
 		loading.value = false;
-	}
+	});
+});
+
+onBeforeUnmount(() => {
+	clearTimeout(timer);
+	compilerWorker?.terminate();
+	compilerWorker = undefined;
 });
 </script>
 
