@@ -7,7 +7,11 @@ use lsp_types::{DocumentSymbol, DocumentSymbolParams, DocumentSymbolResponse, Ra
 use nymph_ast::decl::Declaration;
 use nymph_sema::DeclarationCategory;
 
-use crate::{document_store::DocumentStore, line_index::LineIndex};
+use crate::{
+	analysis_scheduler::{CancellationToken, TaskError},
+	document_store::DocumentStore,
+	line_index::LineIndex,
+};
 
 /// Answer a documentSymbol request: `None` when the document isn't open.
 /// Otherwise always `Some`, even for a module with zero symbols (an empty
@@ -17,20 +21,33 @@ pub fn document_symbols(
 	docs: &DocumentStore,
 	params: &DocumentSymbolParams,
 ) -> Option<DocumentSymbolResponse> {
+	document_symbols_cancellable(docs, params, &CancellationToken::default())
+		.ok()
+		.flatten()
+}
+
+pub(crate) fn document_symbols_cancellable(
+	docs: &DocumentStore,
+	params: &DocumentSymbolParams,
+	cancellation: &CancellationToken,
+) -> Result<Option<DocumentSymbolResponse>, TaskError> {
 	let uri = &params.text_document.uri;
-	let doc = docs.get(uri)?;
+	let Some(doc) = docs.get(uri) else {
+		return Ok(None);
+	};
 
 	let parsed = nymph_syntax::parse_module(&doc.text, uri.path().as_str());
 	let index = LineIndex::new(&doc.text);
 
-	let symbols: Vec<DocumentSymbol> = parsed
-		.tree
-		.members
-		.iter()
-		.filter_map(|decl| decl_symbol(decl, &doc.text, &index))
-		.collect();
+	let mut symbols = Vec::new();
+	for decl in &parsed.tree.members {
+		cancellation.checkpoint()?;
+		if let Some(symbol) = decl_symbol(decl, &doc.text, &index, cancellation)? {
+			symbols.push(symbol);
+		}
+	}
 
-	Some(DocumentSymbolResponse::Nested(symbols))
+	Ok(Some(DocumentSymbolResponse::Nested(symbols)))
 }
 
 /// `DocumentSymbol::deprecated` is `#[deprecated]` in lsp-types 0.97 (kept
@@ -84,8 +101,13 @@ pub(crate) fn symbol_kind(category: DeclarationCategory, mutable: bool) -> Symbo
 /// declarations that introduce no named symbol of their own (`import`, and
 /// anonymous `impl`/`impl … for …` blocks — see `nymph_sema::def::build_def_map`,
 /// which likewise skips them).
-fn decl_symbol(decl: &Declaration, text: &str, index: &LineIndex) -> Option<DocumentSymbol> {
-	match decl {
+fn decl_symbol(
+	decl: &Declaration,
+	text: &str,
+	index: &LineIndex,
+	cancellation: &CancellationToken,
+) -> Result<Option<DocumentSymbol>, TaskError> {
+	Ok(match decl {
 		Declaration::Func { meta, body, .. } => {
 			let selection = index.range(text, meta.name.1);
 			let full = index.range(text, meta.name.1.to(body.span));
@@ -108,14 +130,18 @@ fn decl_symbol(decl: &Declaration, text: &str, index: &LineIndex) -> Option<Docu
 			))
 		}
 		Declaration::Let { meta, value, .. } => {
-			let name = meta.name.0.as_binding()?;
+			let Some(name) = meta.name.0.as_binding() else {
+				return Ok(None);
+			};
 			let selection = index.range(text, name.1);
 			let full = index.range(text, name.1.to(value.span));
 			let kind = symbol_kind(DeclarationCategory::Let, meta.is_mutable());
 			Some(make_symbol(&name.0, kind, full, selection, None))
 		}
 		Declaration::ExternalLet(_, _, meta) => {
-			let name = meta.name.0.as_binding()?;
+			let Some(name) = meta.name.0.as_binding() else {
+				return Ok(None);
+			};
 			let selection = index.range(text, name.1);
 			let kind = symbol_kind(DeclarationCategory::Let, meta.is_mutable());
 			Some(make_symbol(&name.0, kind, selection, selection, None))
@@ -123,20 +149,19 @@ fn decl_symbol(decl: &Declaration, text: &str, index: &LineIndex) -> Option<Docu
 		Declaration::Struct { name, fields, .. } => {
 			let selection = index.range(text, name.1);
 			let mut whole = name.1;
-			let children: Vec<DocumentSymbol> = fields
-				.iter()
-				.map(|f| {
-					whole = whole.to(f.1);
-					let field_selection = index.range(text, f.0.name.1);
-					make_symbol(
-						&f.0.name.0,
-						symbol_kind(DeclarationCategory::Field, false),
-						field_selection,
-						field_selection,
-						None,
-					)
-				})
-				.collect();
+			let mut children = Vec::new();
+			for f in fields {
+				cancellation.checkpoint()?;
+				whole = whole.to(f.1);
+				let field_selection = index.range(text, f.0.name.1);
+				children.push(make_symbol(
+					&f.0.name.0,
+					symbol_kind(DeclarationCategory::Field, false),
+					field_selection,
+					field_selection,
+					None,
+				));
+			}
 			let full = index.range(text, whole);
 			let children = (!children.is_empty()).then_some(children);
 			Some(make_symbol(
@@ -150,20 +175,19 @@ fn decl_symbol(decl: &Declaration, text: &str, index: &LineIndex) -> Option<Docu
 		Declaration::Enum { name, variants, .. } => {
 			let selection = index.range(text, name.1);
 			let mut whole = name.1;
-			let children: Vec<DocumentSymbol> = variants
-				.iter()
-				.map(|v| {
-					whole = whole.to(v.1);
-					let variant_selection = index.range(text, v.0.name.1);
-					make_symbol(
-						&v.0.name.0,
-						symbol_kind(DeclarationCategory::Variant, false),
-						variant_selection,
-						variant_selection,
-						None,
-					)
-				})
-				.collect();
+			let mut children = Vec::new();
+			for v in variants {
+				cancellation.checkpoint()?;
+				whole = whole.to(v.1);
+				let variant_selection = index.range(text, v.0.name.1);
+				children.push(make_symbol(
+					&v.0.name.0,
+					symbol_kind(DeclarationCategory::Variant, false),
+					variant_selection,
+					variant_selection,
+					None,
+				));
+			}
 			let full = index.range(text, whole);
 			let children = (!children.is_empty()).then_some(children);
 			Some(make_symbol(
@@ -206,7 +230,7 @@ fn decl_symbol(decl: &Declaration, text: &str, index: &LineIndex) -> Option<Docu
 			))
 		}
 		Declaration::Import { .. } | Declaration::Impl { .. } | Declaration::ImplFor { .. } => None,
-	}
+	})
 }
 
 #[cfg(test)]
@@ -362,5 +386,16 @@ type Pair<A, B> = #(A, B)
 		let docs = DocumentStore::default();
 
 		assert_eq!(document_symbols(&docs, &params(&uri)), None);
+	}
+
+	#[test]
+	fn cancellation_interrupts_struct_children_after_progress() {
+		let uri: Uri = "file:///symbols_cancel.nym".parse().unwrap();
+		let docs = docs_with(&uri, "struct Many(first: int, second: int, third: int)");
+		let cancellation = CancellationToken::cancel_after(2);
+		assert!(matches!(
+			document_symbols_cancellable(&docs, &params(&uri), &cancellation),
+			Err(TaskError::Cancelled)
+		));
 	}
 }

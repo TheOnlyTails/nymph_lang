@@ -17,7 +17,81 @@ use lsp_types::{
 };
 use nymph_diagnostics::{Diagnostic, Severity};
 
-use crate::{compiler_state::CompilerState, document_store::DocumentStore, line_index::LineIndex};
+use crate::{
+	analysis_scheduler::{CancellationToken, TaskError},
+	compiler_state::CompilerState,
+	document_store::DocumentStore,
+	line_index::LineIndex,
+};
+
+/// Build diagnostics from one immutable worker-owned compiler/document
+/// revision without performing protocol I/O. Publication ownership and stale
+/// revision checks remain with the serialized protocol loop.
+pub(crate) fn collect_state(
+	docs: &DocumentStore,
+	compiler: &CompilerState,
+	uri: &Uri,
+	cancellation: &CancellationToken,
+) -> Result<Vec<PublishDiagnosticsParams>, TaskError> {
+	cancellation.checkpoint()?;
+	if let Some((message, _)) = compiler.manifest_error_snapshot(uri) {
+		let Some(document) = docs.get(uri) else {
+			return Ok(Vec::new());
+		};
+		return Ok(vec![manifest_error_params(uri, &message, document.version)]);
+	}
+	let Some(snapshot) = compiler.diagnostics_snapshot(docs, uri) else {
+		return Ok(Vec::new());
+	};
+	let mut publications = Vec::with_capacity(snapshot.modules.len());
+	for module in snapshot.modules {
+		cancellation.checkpoint()?;
+		publications.push(params(
+			module.uri,
+			&module.source,
+			&module.diagnostics,
+			module.version,
+		));
+	}
+	Ok(publications)
+}
+
+pub(crate) fn collect_affected(
+	docs: &DocumentStore,
+	compiler: &CompilerState,
+	origin: &Uri,
+	uris: &[Uri],
+	cancellation: &CancellationToken,
+) -> Result<Vec<PublishDiagnosticsParams>, TaskError> {
+	if uris.is_empty() {
+		return Ok(Vec::new());
+	}
+	if compiler.has_manifest_error(origin) {
+		return collect_state(docs, compiler, origin, cancellation);
+	}
+	cancellation.checkpoint()?;
+	let snapshot = compiler.affected_diagnostics_snapshot(docs, origin, uris);
+	let mut publications = Vec::with_capacity(snapshot.modules.len());
+	for module in snapshot.modules {
+		cancellation.checkpoint()?;
+		publications.push(params(
+			module.uri,
+			&module.source,
+			&module.diagnostics,
+			module.version,
+		));
+	}
+	Ok(publications)
+}
+
+#[must_use]
+pub(crate) fn clear_params(uri: Uri) -> PublishDiagnosticsParams {
+	PublishDiagnosticsParams {
+		uri,
+		diagnostics: Vec::new(),
+		version: None,
+	}
+}
 
 /// Re-check `uri`'s current text and publish its full diagnostic set
 /// (replacing whatever was previously published for it, so a fix clears
@@ -59,7 +133,7 @@ pub fn check_and_publish_state(
 			publish(
 				connection,
 				&stale_uri,
-				stale_document.map_or("", |document| document.text.as_str()),
+				stale_document.map_or("", |document| document.text.as_ref()),
 				&[],
 				stale_document.map(|document| document.version),
 			)?;
@@ -146,6 +220,17 @@ fn publish_manifest_error(
 	message: &str,
 	version: i32,
 ) -> anyhow::Result<()> {
+	let params = manifest_error_params(uri, message, version);
+	connection.sender.send(lsp_server::Message::Notification(
+		lsp_server::Notification::new(
+			PublishDiagnostics::METHOD.to_string(),
+			serde_json::to_value(params)?,
+		),
+	))?;
+	Ok(())
+}
+
+fn manifest_error_params(uri: &Uri, message: &str, version: i32) -> PublishDiagnosticsParams {
 	let diagnostic = LspDiagnostic {
 		range: Default::default(),
 		severity: Some(DiagnosticSeverity::ERROR),
@@ -154,18 +239,11 @@ fn publish_manifest_error(
 		message: message.to_string(),
 		..Default::default()
 	};
-	let params = PublishDiagnosticsParams {
+	PublishDiagnosticsParams {
 		uri: uri.clone(),
 		diagnostics: vec![diagnostic],
 		version: Some(version),
-	};
-	connection.sender.send(lsp_server::Message::Notification(
-		lsp_server::Notification::new(
-			PublishDiagnostics::METHOD.to_string(),
-			serde_json::to_value(params)?,
-		),
-	))?;
-	Ok(())
+	}
 }
 
 #[cfg(test)]
@@ -188,13 +266,7 @@ fn publish(
 	diags: &[Diagnostic],
 	version: Option<i32>,
 ) -> anyhow::Result<()> {
-	let index = LineIndex::new(text);
-	let lsp_diags: Vec<LspDiagnostic> = diags.iter().map(|d| to_lsp(d, text, &index)).collect();
-	let params = PublishDiagnosticsParams {
-		uri: uri.clone(),
-		diagnostics: lsp_diags,
-		version,
-	};
+	let params = params(uri.clone(), text, diags, version);
 	connection.sender.send(lsp_server::Message::Notification(
 		lsp_server::Notification::new(
 			PublishDiagnostics::METHOD.to_string(),
@@ -202,6 +274,21 @@ fn publish(
 		),
 	))?;
 	Ok(())
+}
+
+fn params(
+	uri: Uri,
+	text: &str,
+	diags: &[Diagnostic],
+	version: Option<i32>,
+) -> PublishDiagnosticsParams {
+	let index = LineIndex::new(text);
+	let lsp_diags: Vec<LspDiagnostic> = diags.iter().map(|d| to_lsp(d, text, &index)).collect();
+	PublishDiagnosticsParams {
+		uri,
+		diagnostics: lsp_diags,
+		version,
+	}
 }
 
 fn to_lsp(diag: &Diagnostic, text: &str, index: &LineIndex) -> LspDiagnostic {

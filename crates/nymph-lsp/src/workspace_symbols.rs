@@ -13,7 +13,10 @@ use lsp_types::{Location, SymbolInformation, WorkspaceSymbolParams, WorkspaceSym
 use nymph_sema::NamespaceVisibility;
 
 use crate::{
-	compiler_state::WorkspaceSymbolSnapshot, document_symbols::symbol_kind, line_index::LineIndex,
+	analysis_scheduler::{CancellationToken, TaskError},
+	compiler_state::WorkspaceSymbolSnapshot,
+	document_symbols::symbol_kind,
+	line_index::LineIndex,
 };
 
 pub const MAX_RESULTS: usize = 100;
@@ -39,15 +42,27 @@ pub fn workspace_symbols(
 	snapshot: &WorkspaceSymbolSnapshot,
 	params: &WorkspaceSymbolParams,
 ) -> Option<WorkspaceSymbolResponse> {
+	workspace_symbols_cancellable(snapshot, params, &CancellationToken::default())
+		.ok()
+		.flatten()
+}
+
+pub(crate) fn workspace_symbols_cancellable(
+	snapshot: &WorkspaceSymbolSnapshot,
+	params: &WorkspaceSymbolParams,
+	cancellation: &CancellationToken,
+) -> Result<Option<WorkspaceSymbolResponse>, TaskError> {
 	let query = params.query.as_str();
 	let mut ranked = Vec::new();
 	for module in &snapshot.modules {
+		cancellation.checkpoint()?;
 		let index = LineIndex::new(&module.source);
 		for declaration in module
 			.declarations
 			.iter()
 			.filter(|declaration| declaration.visibility == NamespaceVisibility::Importable)
 		{
+			cancellation.checkpoint()?;
 			let name = declaration.name.as_str();
 			let rank = if query.is_empty() {
 				MatchRank::Overview
@@ -88,13 +103,13 @@ pub fn workspace_symbols(
 	} else {
 		MAX_RESULTS
 	};
-	Some(WorkspaceSymbolResponse::Flat(
+	Ok(Some(WorkspaceSymbolResponse::Flat(
 		ranked
 			.into_iter()
 			.take(limit)
 			.map(|candidate| candidate.symbol)
 			.collect(),
-	))
+	)))
 }
 
 fn compare_ranked(left: &RankedSymbol, right: &RankedSymbol) -> Ordering {

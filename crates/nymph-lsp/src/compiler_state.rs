@@ -12,6 +12,7 @@ use nymph_compiler::{
 use nymph_sema::EntryMode;
 
 use crate::{
+	analysis_scheduler::{CancellationToken, TaskError},
 	document_store::{DocumentStore, DocumentStoreRevision},
 	workspace,
 };
@@ -187,6 +188,25 @@ impl CompilerState {
 	#[must_use]
 	pub fn new() -> Self {
 		Self::from_session(CompilerSession::new())
+	}
+
+	/// Construct an empty worker state with deeply reconstructed compiler
+	/// sessions. In particular, this does not clone either Salsa database.
+	pub(crate) fn isolated_empty(&self) -> Self {
+		Self {
+			session: self.session.isolated_empty(),
+			stdlib_session: self.stdlib_session.isolated_empty(),
+			workspaces: HashMap::new(),
+			synchronized_roots: HashSet::new(),
+			documents: HashMap::new(),
+			effective_sources: HashMap::new(),
+			authoritative_overlays: HashMap::new(),
+			project_disk_files: HashMap::new(),
+			manifest_errors: HashMap::new(),
+			workspace_symbol_refresh_errors: HashSet::new(),
+			diagnostic_targets: HashMap::new(),
+			diagnostic_owners: HashMap::new(),
+		}
 	}
 
 	#[doc(hidden)]
@@ -588,6 +608,13 @@ impl CompilerState {
 			.collect()
 	}
 
+	/// Ordered reverse-importer publication targets for the worker-owned
+	/// compiler/document revision. The protocol owner never calls this against
+	/// mutable shared state; it is exposed only for asynchronous diagnostic jobs.
+	pub(crate) fn affected_documents(&self, docs: &DocumentStore, uri: &Uri) -> Vec<Uri> {
+		self.affected_project_documents(docs, uri)
+	}
+
 	fn publication_uri(
 		&self,
 		docs: &DocumentStore,
@@ -622,7 +649,7 @@ impl CompilerState {
 			&& excluded != Some(uri)
 			&& let Some(document) = docs.get(uri)
 		{
-			return Some((uri.clone(), document.text.clone(), document.version));
+			return Some((uri.clone(), document.text.to_string(), document.version));
 		}
 		self
 			.documents
@@ -631,7 +658,7 @@ impl CompilerState {
 			.filter_map(|(uri, _)| {
 				docs
 					.get(uri)
-					.map(|document| (uri.clone(), document.text.clone(), document.version))
+					.map(|document| (uri.clone(), document.text.to_string(), document.version))
 			})
 			.max_by(
 				|(left_uri, _, left_version), (right_uri, _, right_version)| {
@@ -805,7 +832,7 @@ impl CompilerState {
 			)
 		}?;
 		let source = analysis.source.clone();
-		let document_source = Arc::from(document.text.as_str());
+		let document_source = document.text.clone();
 		Some(AnalysisSnapshot {
 			uri: uri.clone(),
 			project: identity.project.clone(),
@@ -877,7 +904,7 @@ impl CompilerState {
 				!identity.without_prelude,
 			)
 		}?;
-		if analysis.source.as_ref() != document.text {
+		if analysis.source.as_ref() != document.text.as_ref() {
 			return None;
 		}
 		Some(CompletionSnapshot {
@@ -893,7 +920,16 @@ impl CompilerState {
 	/// Refresh disk membership and source facts for workspace-symbol search.
 	/// This is deliberately request-scoped: ordinary editor changes preserve
 	/// the compiler state's established no-reread behavior for unopened files.
+	#[cfg(test)]
 	pub fn refresh_workspace_symbols(&mut self, docs: &DocumentStore) {
+		let _ = self.refresh_workspace_symbols_cancellable(docs, &CancellationToken::default());
+	}
+
+	pub(crate) fn refresh_workspace_symbols_cancellable(
+		&mut self,
+		docs: &DocumentStore,
+		cancellation: &CancellationToken,
+	) -> Result<(), TaskError> {
 		let projects = self
 			.synchronized_roots
 			.iter()
@@ -908,20 +944,34 @@ impl CompilerState {
 			.collect::<Vec<_>>();
 		self.workspace_symbol_refresh_errors.clear();
 		for (root, project, without_prelude) in projects {
+			cancellation.checkpoint()?;
 			if self
 				.synchronize_project_files(docs, &root, &project, without_prelude)
 				.is_err()
 			{
 				self.workspace_symbol_refresh_errors.insert(root);
 			}
+			cancellation.checkpoint()?;
 		}
+		Ok(())
 	}
 
 	/// Snapshot declarations from every synchronized manifest project. Loose
 	/// files and compiler/provider modules are intentionally outside the search
 	/// boundary; open project overlays are already installed in each session.
+	#[cfg(test)]
 	#[must_use]
 	pub fn workspace_symbol_snapshot(&self, docs: &DocumentStore) -> WorkspaceSymbolSnapshot {
+		self
+			.workspace_symbol_snapshot_cancellable(docs, &CancellationToken::default())
+			.expect("a fresh cancellation token cannot be cancelled")
+	}
+
+	pub(crate) fn workspace_symbol_snapshot_cancellable(
+		&self,
+		docs: &DocumentStore,
+		cancellation: &CancellationToken,
+	) -> Result<WorkspaceSymbolSnapshot, TaskError> {
 		let invalid_roots = self
 			.manifest_errors
 			.keys()
@@ -951,12 +1001,14 @@ impl CompilerState {
 
 		let mut modules = Vec::new();
 		for (root, project, without_prelude) in projects {
+			cancellation.checkpoint()?;
 			let session = if without_prelude {
 				&self.stdlib_session
 			} else {
 				&self.session
 			};
 			for declarations in session.tooling_project_declarations(&project) {
+				cancellation.checkpoint()?;
 				let Some(uri) = workspace::key_to_uri(&root, declarations.module.as_str()) else {
 					continue;
 				};
@@ -975,10 +1027,10 @@ impl CompilerState {
 				.cmp(right.uri.as_str())
 				.then_with(|| left.module.cmp(&right.module))
 		});
-		WorkspaceSymbolSnapshot {
+		Ok(WorkspaceSymbolSnapshot {
 			document_revision: docs.revision(),
 			modules,
-		}
+		})
 	}
 
 	/// Resolve a checked stable target to an authoritative, reachable project source.
@@ -1053,25 +1105,39 @@ impl CompilerState {
 	/// Collect semantic occurrences from the complete immutable project analysis
 	/// that produced `snapshot`. Local identities stay isolated to their owner
 	/// module; stable definitions are compared across every reachable module.
+	#[cfg(test)]
 	pub fn reference_modules(
 		&self,
 		docs: &DocumentStore,
 		snapshot: &AnalysisSnapshot,
 		symbol: &nymph_sema::query::SymbolIdentity,
 	) -> Option<Vec<ReferenceModuleSnapshot>> {
+		self
+			.reference_modules_cancellable(docs, snapshot, symbol, &CancellationToken::default())
+			.ok()
+			.flatten()
+	}
+
+	pub(crate) fn reference_modules_cancellable(
+		&self,
+		docs: &DocumentStore,
+		snapshot: &AnalysisSnapshot,
+		symbol: &nymph_sema::query::SymbolIdentity,
+		cancellation: &CancellationToken,
+	) -> Result<Option<Vec<ReferenceModuleSnapshot>>, TaskError> {
 		if docs.revision() != snapshot.document_revision || snapshot.source != snapshot.document_source
 		{
-			return None;
+			return Ok(None);
 		}
 		let session = if snapshot.without_prelude {
 			&self.stdlib_session
 		} else {
 			&self.session
 		};
-		let isolated = matches!(
-			self.documents.get(&snapshot.uri)?.kind,
-			DocumentKind::Untitled
-		);
+		let Some(snapshot_identity) = self.documents.get(&snapshot.uri) else {
+			return Ok(None);
+		};
+		let isolated = matches!(snapshot_identity.kind, DocumentKind::Untitled);
 		let analyses = match symbol {
 			_ if isolated => vec![(
 				snapshot.module.clone(),
@@ -1096,50 +1162,59 @@ impl CompilerState {
 		};
 		let mut modules = Vec::new();
 		for (module, source, analysis) in analyses {
+			cancellation.checkpoint()?;
 			let occurrences = analysis.as_ref().map_or_else(Vec::new, |analysis| {
 				nymph_sema::query::references_to(&analysis.semantic, symbol)
 			});
 			let rename_occurrences = analysis
 				.as_ref()
 				.map(|analysis| nymph_sema::query::rename_occurrences(&analysis.semantic, symbol));
-			let open_uris = self
-				.documents
-				.iter()
-				.filter_map(|(uri, identity)| {
-					(identity.project == snapshot.project
-						&& identity.module == module
-						&& identity.without_prelude == snapshot.without_prelude
-						&& docs.get(uri).is_some())
-					.then_some(uri)
-				})
-				.collect::<Vec<_>>();
-			let overlay_uri = open_uris.iter().find_map(|uri| {
-				let identity = self.documents.get(*uri)?;
-				(identity.project == snapshot.project
+			let mut open_uris = Vec::new();
+			for (uri, identity) in &self.documents {
+				cancellation.checkpoint()?;
+				if identity.project == snapshot.project
+					&& identity.module == module
+					&& identity.without_prelude == snapshot.without_prelude
+					&& docs.get(uri).is_some()
+				{
+					open_uris.push(uri);
+				}
+			}
+			let mut overlay_uri = None;
+			for uri in &open_uris {
+				cancellation.checkpoint()?;
+				let Some(identity) = self.documents.get(*uri) else {
+					continue;
+				};
+				if identity.project == snapshot.project
 					&& identity.module == module
 					&& identity.without_prelude == snapshot.without_prelude
 					&& self
 						.authoritative_overlays
 						.values()
-						.any(|authoritative| authoritative == *uri))
-				.then_some(*uri)
-			});
+						.any(|authoritative| authoritative == *uri)
+				{
+					overlay_uri = Some(*uri);
+					break;
+				}
+			}
 			let uri = if let Some(uri) = overlay_uri {
 				uri.clone()
 			} else if module == snapshot.module
-				&& !matches!(
-					self.documents.get(&snapshot.uri)?.kind,
-					DocumentKind::Project(_)
-				) {
+				&& !matches!(snapshot_identity.kind, DocumentKind::Project(_))
+			{
 				snapshot.uri.clone()
 			} else {
-				workspace::key_to_uri(&snapshot.root, module.as_str())?
+				let Some(uri) = workspace::key_to_uri(&snapshot.root, module.as_str()) else {
+					return Ok(None);
+				};
+				uri
 			};
-			if occurrences
-				.iter()
-				.any(|occurrence| !valid_source_span(&source, occurrence.span))
-			{
-				return None;
+			for occurrence in &occurrences {
+				cancellation.checkpoint()?;
+				if !valid_source_span(&source, occurrence.span) {
+					return Ok(None);
+				}
 			}
 			let document_version = docs.get(&uri).map(|document| document.version);
 			modules.push(ReferenceModuleSnapshot {
@@ -1152,7 +1227,7 @@ impl CompilerState {
 				has_equivalent_open_documents: open_uris.len() > 1,
 			});
 		}
-		Some(modules)
+		Ok(Some(modules))
 	}
 
 	pub fn diagnostics_for_uri(
@@ -1270,7 +1345,7 @@ impl CompilerState {
 				modules.push(DiagnosticModuleSnapshot {
 					uri: previous_uri.clone(),
 					source: open
-						.map(|document| Arc::from(document.text.as_str()))
+						.map(|document| document.text.clone())
 						.or_else(|| self.effective_source_for_uri(&previous_uri))
 						.unwrap_or_else(|| Arc::from("")),
 					version: open.map(|document| document.version),
@@ -1363,7 +1438,7 @@ impl CompilerState {
 				modules.push(DiagnosticModuleSnapshot {
 					uri: previous_uri.clone(),
 					source: open
-						.map(|document| Arc::from(document.text.as_str()))
+						.map(|document| document.text.clone())
 						.or_else(|| self.effective_source_for_uri(&previous_uri))
 						.unwrap_or_else(|| Arc::from("")),
 					version: open.map(|document| document.version),
@@ -1565,7 +1640,7 @@ impl CompilerState {
 			})
 			.collect();
 		for (module, source, version) in overlays {
-			self.set_effective_source(&module, source, version);
+			self.set_effective_source(&module, source.to_string(), version);
 		}
 		Ok(())
 	}
@@ -1649,7 +1724,11 @@ impl CompilerState {
 				self
 					.authoritative_overlays
 					.insert(module_identity.clone(), uri);
-				self.set_effective_source(&module_identity, source, SourceVersion(i64::from(version)));
+				self.set_effective_source(
+					&module_identity,
+					source.to_string(),
+					SourceVersion(i64::from(version)),
+				);
 			} else {
 				match fs::read_to_string(&path) {
 					Ok(source) => {
@@ -1906,7 +1985,7 @@ mod tests {
 				.unwrap()
 				.is_empty()
 		);
-		assert_eq!(docs.get(&uri).unwrap().text, "let latest = 1");
+		assert_eq!(docs.get(&uri).unwrap().text.as_ref(), "let latest = 1");
 		assert_eq!(docs.version(&uri), Some(8));
 		assert_eq!(docs.revision(), revision);
 
@@ -1915,7 +1994,7 @@ mod tests {
 			.open(&mut docs, uri.clone(), "let reopened = 1".into(), 1)
 			.unwrap();
 		assert_eq!(docs.version(&uri), Some(1));
-		assert_eq!(docs.get(&uri).unwrap().text, "let reopened = 1");
+		assert_eq!(docs.get(&uri).unwrap().text.as_ref(), "let reopened = 1");
 
 		let file_uri: Uri = "file:///tmp/version-behavior.nym".parse().unwrap();
 		state
@@ -1926,7 +2005,7 @@ mod tests {
 			.unwrap();
 		assert_eq!(docs.version(&file_uri), Some(7));
 		assert_eq!(
-			docs.get(&file_uri).unwrap().text,
+			docs.get(&file_uri).unwrap().text.as_ref(),
 			"let existing_behavior = 1"
 		);
 	}

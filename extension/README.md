@@ -46,6 +46,17 @@ stderr are available in the **Nymph Language Server** channel in the **Output** 
 Output**). To inspect protocol traffic, run **Developer: Set Log Level**, select **Nymph Language
 Server**, and choose **Trace**. Startup failures appear as VS Code error notifications.
 
+The server applies protocol messages through one serialized state owner while expensive compiler
+analysis runs on a fixed-size worker pool with bounded queues. Every job receives an immutable
+open-document revision, and each project-affine worker owns a separate compiler session; compiler
+databases and caches are not shared with concurrently mutating state. Requests can be cancelled by
+the editor, and a result is returned only while its canonical project/document revision and exact
+open-buffer lifecycle are still current. An edit that overtakes a request therefore produces the LSP
+`ContentModified` error instead of stale data. Diagnostic work is superseded per canonical project
+or standalone document, including equivalent `file:` URI spellings, so only the latest revision is
+published. Server shutdown cancels outstanding requests and diagnostics, drains submitted work, and
+joins all analysis workers.
+
 Hover uses the same checked snapshot as diagnostics. In a project, that includes project imports and
 aliases, the embedded `std/...` modules, the ambient prelude, inferred generic substitutions, and
 unsaved overlays for every open dependency. A saved `.nym` file outside a project is checked as a

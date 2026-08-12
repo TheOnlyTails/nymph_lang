@@ -9,6 +9,7 @@ use lsp_types::{
 use nymph_ast::token::Token;
 
 use crate::{
+	analysis_scheduler::{CancellationToken, TaskError},
 	compiler_state::{AnalysisSnapshot, CompilerState, ProjectDiskSnapshot},
 	document_store::DocumentStore,
 	line_index::LineIndex,
@@ -22,10 +23,7 @@ pub(crate) struct RenameCandidate {
 }
 
 impl RenameCandidate {
-	pub(crate) fn validate_prepare(self) -> Option<PrepareRenameResponse> {
-		self.disk_sources_are_current().then_some(self.prepare)
-	}
-
+	#[cfg(test)]
 	pub(crate) fn validate_disk_sources(self) -> Result<WorkspaceEdit, RenameContentModified> {
 		self
 			.disk_sources_are_current()
@@ -33,6 +31,7 @@ impl RenameCandidate {
 			.ok_or(RenameContentModified)
 	}
 
+	#[cfg(test)]
 	fn disk_sources_are_current(&self) -> bool {
 		if self
 			.project_disk
@@ -51,9 +50,52 @@ impl RenameCandidate {
 		}
 		true
 	}
+
+	pub(crate) fn validate_prepare_cancellable(
+		self,
+		cancellation: &CancellationToken,
+	) -> Result<PrepareRenameResponse, TaskError> {
+		self.validate_current_cancellable(cancellation)?;
+		Ok(self.prepare)
+	}
+
+	pub(crate) fn validate_disk_sources_cancellable(
+		self,
+		cancellation: &CancellationToken,
+	) -> Result<WorkspaceEdit, TaskError> {
+		self.validate_current_cancellable(cancellation)?;
+		Ok(self.edit)
+	}
+
+	fn validate_current_cancellable(
+		&self,
+		cancellation: &CancellationToken,
+	) -> Result<(), TaskError> {
+		cancellation.checkpoint()?;
+		if self
+			.project_disk
+			.as_ref()
+			.is_some_and(|snapshot| !snapshot.is_current())
+		{
+			return Err(rename_content_modified());
+		}
+		for (path, expected) in &self.disk_sources {
+			cancellation.checkpoint()?;
+			let current = std::fs::read_to_string(path).map_err(|_| rename_content_modified())?;
+			if current.as_str() != expected.as_ref() {
+				return Err(rename_content_modified());
+			}
+		}
+		Ok(())
+	}
+}
+
+fn rename_content_modified() -> TaskError {
+	TaskError::ContentModified("project sources changed while preparing rename".into())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub(crate) struct RenameContentModified;
 
 #[must_use]
@@ -67,6 +109,7 @@ fn is_identifier_source(source: &str) -> bool {
 		&& matches!(lexed.tokens.as_slice(), [token] if matches!(token.0, Token::Identifier(_)) && token.1.start == 0 && token.1.end == source.len())
 }
 
+#[cfg(test)]
 pub(crate) fn rename_candidate(
 	docs: &DocumentStore,
 	state: &CompilerState,
@@ -74,83 +117,127 @@ pub(crate) fn rename_candidate(
 	position: Position,
 	new_name: &str,
 ) -> Option<RenameCandidate> {
-	let offset = LineIndex::new(&snapshot.source).exact_offset(&snapshot.source, position)?;
-	let symbol = nymph_sema::query::symbol_at(&snapshot.analysis.semantic, offset)?;
+	rename_candidate_cancellable(
+		docs,
+		state,
+		snapshot,
+		position,
+		new_name,
+		&CancellationToken::default(),
+	)
+	.ok()
+	.flatten()
+}
+
+pub(crate) fn rename_candidate_cancellable(
+	docs: &DocumentStore,
+	state: &CompilerState,
+	snapshot: &AnalysisSnapshot,
+	position: Position,
+	new_name: &str,
+	cancellation: &CancellationToken,
+) -> Result<Option<RenameCandidate>, TaskError> {
+	let Some(offset) = LineIndex::new(&snapshot.source).exact_offset(&snapshot.source, position)
+	else {
+		return Ok(None);
+	};
+	let Some(symbol) = nymph_sema::query::symbol_at(&snapshot.analysis.semantic, offset) else {
+		return Ok(None);
+	};
 	if matches!(symbol, nymph_sema::query::SymbolIdentity::Module(_)) {
-		return None;
+		return Ok(None);
 	}
-	let mut modules = state.reference_modules(docs, snapshot, &symbol)?;
-	if modules
-		.iter()
-		.any(|module| module.rename_occurrences.is_none() || module.has_equivalent_open_documents)
-	{
-		return None;
+	let Some(mut modules) =
+		state.reference_modules_cancellable(docs, snapshot, &symbol, cancellation)?
+	else {
+		return Ok(None);
+	};
+	let mut has_declaration = false;
+	for module in &modules {
+		cancellation.checkpoint()?;
+		if module.rename_occurrences.is_none() || module.has_equivalent_open_documents {
+			return Ok(None);
+		}
+		for occurrence in &module.occurrences {
+			cancellation.checkpoint()?;
+			has_declaration |= occurrence.is_declaration;
+		}
 	}
-	if !modules
-		.iter()
-		.flat_map(|module| &module.occurrences)
-		.any(|occurrence| occurrence.is_declaration)
-	{
-		return None;
+	if !has_declaration {
+		return Ok(None);
 	}
-	let selected = nymph_sema::query::rename_occurrences(&snapshot.analysis.semantic, &symbol)?
+	let Some(selected) = nymph_sema::query::rename_occurrences(&snapshot.analysis.semantic, &symbol)
+	else {
+		return Ok(None);
+	};
+	let Some(selected) = selected
 		.into_iter()
-		.find(|occurrence| occurrence.span.start <= offset && offset < occurrence.span.end)?;
+		.find(|occurrence| occurrence.span.start <= offset && offset < occurrence.span.end)
+	else {
+		return Ok(None);
+	};
 	let selected_range = LineIndex::new(&snapshot.source).range(&snapshot.source, selected.span);
 	let placeholder = snapshot
 		.source
-		.get(selected.span.start..selected.span.end)?
+		.get(selected.span.start..selected.span.end)
+		.ok_or(TaskError::Internal(
+			"rename span was outside its source".into(),
+		))?
 		.to_string();
 	if !is_identifier_source(&placeholder) {
-		return None;
+		return Ok(None);
 	}
 
 	modules.sort_by(|left, right| left.uri.as_str().cmp(right.uri.as_str()));
 	let mut document_edits = Vec::new();
 	let mut disk_sources = Vec::new();
 	for module in modules {
-		let occurrences = module.rename_occurrences?;
-		if occurrences.iter().any(|occurrence| {
-			module
+		cancellation.checkpoint()?;
+		let Some(occurrences) = module.rename_occurrences else {
+			return Ok(None);
+		};
+		for occurrence in &occurrences {
+			cancellation.checkpoint()?;
+			if module
 				.source
 				.get(occurrence.span.start..occurrence.span.end)
 				.is_none_or(|source| !is_identifier_source(source))
-		}) {
-			return None;
+			{
+				return Ok(None);
+			}
 		}
 		if module.requires_disk_validation {
-			disk_sources.push((
-				crate::workspace::uri_to_path(&module.uri)?,
-				module.source.clone(),
-			));
+			let Some(path) = crate::workspace::uri_to_path(&module.uri) else {
+				return Ok(None);
+			};
+			disk_sources.push((path, module.source.clone()));
 		}
 		let index = LineIndex::new(&module.source);
-		let mut edits = occurrences
-			.into_iter()
-			.map(|occurrence| {
-				let source_name = &module.source[occurrence.span.start..occurrence.span.end];
-				let new_text = match occurrence.replacement {
-					nymph_sema::query::RenameReplacement::Identifier => new_name.to_string(),
-					nymph_sema::query::RenameReplacement::ShorthandField => {
-						format!("{new_name} = {source_name}")
-					}
-					nymph_sema::query::RenameReplacement::ShorthandLocal => {
-						format!("{source_name} = {new_name}")
-					}
-				};
-				TextEdit {
-					range: index.range(&module.source, occurrence.span),
-					new_text,
+		let mut edits = Vec::new();
+		for occurrence in occurrences {
+			cancellation.checkpoint()?;
+			let source_name = &module.source[occurrence.span.start..occurrence.span.end];
+			let new_text = match occurrence.replacement {
+				nymph_sema::query::RenameReplacement::Identifier => new_name.to_string(),
+				nymph_sema::query::RenameReplacement::ShorthandField => {
+					format!("{new_name} = {source_name}")
 				}
-			})
-			.collect::<Vec<_>>();
+				nymph_sema::query::RenameReplacement::ShorthandLocal => {
+					format!("{source_name} = {new_name}")
+				}
+			};
+			edits.push(TextEdit {
+				range: index.range(&module.source, occurrence.span),
+				new_text,
+			});
+		}
 		edits.sort_by(|left, right| range_order(&left.range, &right.range));
 		edits.dedup();
 		if edits
 			.windows(2)
 			.any(|pair| pair[0].range.end > pair[1].range.start)
 		{
-			return None;
+			return Ok(None);
 		}
 		if edits.is_empty() {
 			continue;
@@ -163,7 +250,7 @@ pub(crate) fn rename_candidate(
 			edits: edits.into_iter().map(OneOf::Left).collect(),
 		});
 	}
-	Some(RenameCandidate {
+	Ok(Some(RenameCandidate {
 		prepare: PrepareRenameResponse::RangeWithPlaceholder {
 			range: selected_range,
 			placeholder,
@@ -175,7 +262,7 @@ pub(crate) fn rename_candidate(
 		},
 		disk_sources,
 		project_disk: state.project_disk_snapshot(snapshot),
-	})
+	}))
 }
 
 fn range_order(left: &Range, right: &Range) -> std::cmp::Ordering {

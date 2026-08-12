@@ -67,7 +67,11 @@ use nymph_ast::{
 };
 use nymph_sema::{DeclarationCategory, DeclarationKey, DefKind, SemanticAnalysis};
 
-use crate::{compiler_state::AnalysisSnapshot, line_index::LineIndex};
+use crate::{
+	analysis_scheduler::{CancellationToken, TaskError},
+	compiler_state::AnalysisSnapshot,
+	line_index::LineIndex,
+};
 
 // ── Legend (fixed index order — the classifier below must never reference
 // an index outside this table) ──────────────────────────────────────────
@@ -138,6 +142,16 @@ pub(crate) fn semantic_tokens_snapshot(
 	snapshot: &AnalysisSnapshot,
 	params: &SemanticTokensParams,
 ) -> Option<SemanticTokensResult> {
+	semantic_tokens_snapshot_cancellable(snapshot, params, &CancellationToken::default())
+		.ok()
+		.flatten()
+}
+
+pub(crate) fn semantic_tokens_snapshot_cancellable(
+	snapshot: &AnalysisSnapshot,
+	params: &SemanticTokensParams,
+	cancellation: &CancellationToken,
+) -> Result<Option<SemanticTokensResult>, TaskError> {
 	let _ = params;
 	if snapshot.source != snapshot.document_source {
 		// Equivalent URI spellings can be open with different text while sharing
@@ -145,14 +159,19 @@ pub(crate) fn semantic_tokens_snapshot(
 		// project's semantic authority, but its AST spans must never be encoded
 		// against another open buffer. Preserve source-correct lexical tokens for
 		// that non-authoritative spelling instead.
-		return Some(semantic_tokens_for_source(
+		return Ok(Some(semantic_tokens_for_source_cancellable(
 			&snapshot.document_source,
 			&RoleMap::default(),
-		));
+			cancellation,
+		)?));
 	}
 	let text = snapshot.source.as_ref();
 	let roles = build_role_map(&snapshot.analysis.semantic);
-	Some(semantic_tokens_for_source(text, &roles))
+	Ok(Some(semantic_tokens_for_source_cancellable(
+		text,
+		&roles,
+		cancellation,
+	)?))
 }
 
 /// Return lexical best-effort tokens for an open document when malformed
@@ -172,33 +191,61 @@ pub fn semantic_tokens_for_open_document(
 	))
 }
 
+pub(crate) fn semantic_tokens_for_open_document_cancellable(
+	docs: &crate::document_store::DocumentStore,
+	params: &SemanticTokensParams,
+	cancellation: &CancellationToken,
+) -> Result<Option<SemanticTokensResult>, TaskError> {
+	let Some(document) = docs.get(&params.text_document.uri) else {
+		return Ok(None);
+	};
+	Ok(Some(semantic_tokens_for_source_cancellable(
+		&document.text,
+		&RoleMap::default(),
+		cancellation,
+	)?))
+}
+
 fn semantic_tokens_for_source(text: &str, roles: &RoleMap) -> SemanticTokensResult {
+	semantic_tokens_for_source_cancellable(text, roles, &CancellationToken::default())
+		.expect("a never-cancelled conversion cannot fail")
+}
+
+fn semantic_tokens_for_source_cancellable(
+	text: &str,
+	roles: &RoleMap,
+	cancellation: &CancellationToken,
+) -> Result<SemanticTokensResult, TaskError> {
 	let index = LineIndex::new(text);
 	let lexed = nymph_syntax::lex(text);
 
 	let mut items: Vec<(Span, u32, u32)> = Vec::new();
 
 	for spanned in &lexed.tokens {
-		push_token(spanned, roles, &mut items);
+		cancellation.checkpoint()?;
+		push_token(spanned, roles, &mut items, cancellation)?;
 	}
 
-	for span in comment_spans(text, &lexed.tokens) {
+	for span in comment_spans(text, &lexed.tokens, cancellation)? {
+		cancellation.checkpoint()?;
 		items.push((span, COMMENT, 0));
 	}
 
 	let mut pieces: Vec<(u32, u32, u32, u32, u32)> = Vec::new();
 	for (span, ty, mods) in items {
+		cancellation.checkpoint()?;
 		for (line, col, len) in split_span_lines(text, &index, span) {
+			cancellation.checkpoint()?;
 			if len > 0 {
 				pieces.push((line, col, len, ty, mods));
 			}
 		}
 	}
 
-	SemanticTokensResult::Tokens(SemanticTokens {
+	Ok(SemanticTokensResult::Tokens(SemanticTokens {
 		result_id: None,
-		data: encode(pieces),
-	})
+		data: encode(pieces, cancellation)?,
+	}))
 }
 
 #[cfg(test)]
@@ -214,7 +261,7 @@ pub fn semantic_tokens_full(
 		.open(
 			&mut owned_docs,
 			uri.clone(),
-			document.text.clone(),
+			document.text.to_string(),
 			document.version,
 		)
 		.ok()?;
@@ -230,20 +277,27 @@ pub fn semantic_tokens_full(
 /// span, so an interpolated `${ … }` expression's own tokens get real
 /// classification instead of being swallowed into `string`. Every other
 /// token classifies directly via [`lexer_token_type`].
-fn push_token(spanned: &Spanned<Token>, roles: &RoleMap, items: &mut Vec<(Span, u32, u32)>) {
+fn push_token(
+	spanned: &Spanned<Token>,
+	roles: &RoleMap,
+	items: &mut Vec<(Span, u32, u32)>,
+	cancellation: &CancellationToken,
+) -> Result<(), TaskError> {
+	cancellation.checkpoint()?;
 	let span = spanned.1;
 	match &spanned.0 {
 		Token::Identifier(_) | Token::AnonymousParam(_) => {
 			let (ty, mods) = roles.get(&span.start).copied().unwrap_or((VARIABLE, 0));
 			items.push((span, ty, mods));
 		}
-		Token::Str(fragments) => push_str_token(span, fragments, roles, items),
+		Token::Str(fragments) => push_str_token(span, fragments, roles, items, cancellation)?,
 		other => {
 			if let Some(ty) = lexer_token_type(other) {
 				items.push((span, ty, 0));
 			}
 		}
 	}
+	Ok(())
 }
 
 /// Expand a string literal's fragments. Plain text, escapes, and the `${`/`}`
@@ -257,13 +311,15 @@ fn push_str_token(
 	fragments: &[Spanned<StrFragment>],
 	roles: &RoleMap,
 	items: &mut Vec<(Span, u32, u32)>,
-) {
+	cancellation: &CancellationToken,
+) -> Result<(), TaskError> {
 	// Plain text/escape fragments need no action here: they simply extend
 	// whatever `string` run is pending, which is flushed lazily — either when
 	// an interpolation breaks it, or at the very end.
 	let mut run_start = span.start;
 
 	for frag in fragments {
+		cancellation.checkpoint()?;
 		if let StrFragment::Interpolation(inner) = &frag.0 {
 			let open_end = (frag.1.start + "${".len()).min(frag.1.end);
 			if open_end > run_start {
@@ -271,7 +327,7 @@ fn push_str_token(
 			}
 
 			for tok in inner {
-				push_token(tok, roles, items);
+				push_token(tok, roles, items, cancellation)?;
 			}
 
 			// Resume at the closing `}`. Whitespace and comments between `${`
@@ -283,6 +339,7 @@ fn push_str_token(
 	if span.end > run_start {
 		items.push((Span::new(run_start, span.end), STRING, 0));
 	}
+	Ok(())
 }
 
 /// Direct token -> legend-index classification for every [`Token`] variant
@@ -318,10 +375,14 @@ fn lexer_token_type(token: &Token) -> Option<u32> {
 /// Recover comment spans (the lexer discards them entirely) by scanning the
 /// gaps between consecutive lexed tokens, plus the leading/trailing gaps,
 /// recursively for every interpolation token stream.
-fn comment_spans(text: &str, tokens: &[Spanned<Token>]) -> Vec<Span> {
+fn comment_spans(
+	text: &str,
+	tokens: &[Spanned<Token>],
+	cancellation: &CancellationToken,
+) -> Result<Vec<Span>, TaskError> {
 	let mut spans = Vec::new();
-	collect_comment_spans(text, tokens, 0, text.len(), &mut spans);
-	spans
+	collect_comment_spans(text, tokens, 0, text.len(), &mut spans, cancellation)?;
+	Ok(spans)
 }
 
 fn collect_comment_spans(
@@ -330,15 +391,18 @@ fn collect_comment_spans(
 	start: usize,
 	end: usize,
 	out: &mut Vec<Span>,
-) {
+	cancellation: &CancellationToken,
+) -> Result<(), TaskError> {
 	let mut prev_end = start;
 	for spanned in tokens {
+		cancellation.checkpoint()?;
 		let span = spanned.1;
 		if span.start > prev_end {
 			scan_comments_into(text, prev_end, span.start.min(end), out);
 		}
 		if let Token::Str(fragments) = &spanned.0 {
 			for fragment in fragments {
+				cancellation.checkpoint()?;
 				if let StrFragment::Interpolation(inner) = &fragment.0 {
 					let inner_start = (fragment.1.start + "${".len()).min(fragment.1.end);
 					let inner_end = fragment
@@ -346,7 +410,7 @@ fn collect_comment_spans(
 						.end
 						.saturating_sub('}'.len_utf8())
 						.max(inner_start);
-					collect_comment_spans(text, inner, inner_start, inner_end, out);
+					collect_comment_spans(text, inner, inner_start, inner_end, out, cancellation)?;
 				}
 			}
 		}
@@ -355,6 +419,7 @@ fn collect_comment_spans(
 	if prev_end < end {
 		scan_comments_into(text, prev_end, end, out);
 	}
+	Ok(())
 }
 
 /// Conservatively scan a lexer gap for `//` and `/* … */` runs, pushing their
@@ -444,13 +509,17 @@ fn split_span_lines(text: &str, index: &LineIndex, span: Span) -> Vec<(u32, u32,
 /// Delta-encode absolute `(line, start_char, len, type_idx, mods)` tuples —
 /// already sorted by `(line, start_char)` — into the wire's `SemanticToken`
 /// vector.
-fn encode(mut items: Vec<(u32, u32, u32, u32, u32)>) -> Vec<SemanticToken> {
+fn encode(
+	mut items: Vec<(u32, u32, u32, u32, u32)>,
+	cancellation: &CancellationToken,
+) -> Result<Vec<SemanticToken>, TaskError> {
 	items.sort_by_key(|&(line, col, ..)| (line, col));
 
 	let mut result = Vec::with_capacity(items.len());
 	let mut prev_line = 0u32;
 	let mut prev_char = 0u32;
 	for (line, col, length, token_type, token_modifiers_bitset) in items {
+		cancellation.checkpoint()?;
 		let delta_line = line - prev_line;
 		let delta_start = if delta_line == 0 {
 			col - prev_char
@@ -467,7 +536,7 @@ fn encode(mut items: Vec<(u32, u32, u32, u32, u32)>) -> Vec<SemanticToken> {
 		prev_line = line;
 		prev_char = col;
 	}
-	result
+	Ok(result)
 }
 
 // ── AST role resolution ─────────────────────────────────────────────────
@@ -2271,5 +2340,18 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 		let legend = legend();
 		assert_eq!(legend.token_types.len(), TYPE_NAMES.len());
 		assert_eq!(legend.token_modifiers.len(), MODIFIER_NAMES.len());
+	}
+
+	#[test]
+	fn cancellation_interrupts_token_conversion_after_progress() {
+		let cancellation = CancellationToken::cancel_after(3);
+		assert!(matches!(
+			semantic_tokens_for_source_cancellable(
+				"func main(): int = 1 + 2",
+				&RoleMap::default(),
+				&cancellation,
+			),
+			Err(TaskError::Cancelled)
+		));
 	}
 }
