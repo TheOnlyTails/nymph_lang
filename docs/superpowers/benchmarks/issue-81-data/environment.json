@@ -1,5 +1,5 @@
 {
-  "base_remote_tip": "269f87c963631f21ad53677c21e624e98f91f4f7",
+  "capture_checkout_note": "The 320-row raw matrix was collected with the evidence sources uncommitted atop this checkout; those sources and the original artifacts were committed as e972e6375a21231a6b9b6dd4de940ccb792fbfc3. Snapshot payloads were regenerated during final audit after removing a non-semantic sorted module_order field.",
   "cargo": "cargo 1.99.0-nightly (b07e5a086 2026-08-07)",
   "commit": "269f87c963631f21ad53677c21e624e98f91f4f7",
   "controls": {

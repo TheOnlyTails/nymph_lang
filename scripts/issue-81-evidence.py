@@ -19,6 +19,13 @@ BIN = ROOT / "target/release/issue_81_evidence"
 SHAPES = ("single", "wide", "deep", "mixed")
 WORKERS = (1, 2, 4, 8)
 REQUESTS = ("diagnostics", "compile")
+RAW_REPEATS = 5
+SNAPSHOT_REPEATS = 3
+PHASES = (
+	"parse", "interface_environment", "checker", "diagnostic_fold_wrapper",
+	"stable_lowering", "emission", "bundling",
+)
+ARTIFACTS = ("raw.jsonl", "snapshots.jsonl", "summary.json", "environment.json", "commands.txt")
 
 
 def run(command: list[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -45,7 +52,6 @@ def environment() -> dict[str, object]:
 		"cargo": output("cargo", "--version"),
 		"node": output("node", "--version"),
 		"commit": output("git", "rev-parse", "HEAD"),
-		"base_remote_tip": "269f87c963631f21ad53677c21e624e98f91f4f7",
 		"controls": {"CARGO_INCREMENTAL": "0", "RAYON_NUM_THREADS": list(WORKERS)},
 	}
 
@@ -121,8 +127,7 @@ def median(values: list[float]) -> float:
 	return statistics.median(values)
 
 
-def summarize() -> None:
-	rows = [json.loads(line) for line in (DATA / "raw.jsonl").read_text().splitlines()]
+def summary(rows: list[dict[str, object]]) -> dict[str, object]:
 	groups: dict[tuple[int, str, str, bool], list[dict[str, object]]] = {}
 	for row in rows:
 		key = (row["rayon_workers"], row["shape"], row["request"], row["instrumented"])
@@ -172,8 +177,114 @@ def summarize() -> None:
 		"min": min(all_overhead),
 		"max": max(all_overhead),
 	}
+	return result
+
+
+def summarize() -> None:
+	rows = [json.loads(line) for line in (DATA / "raw.jsonl").read_text().splitlines()]
+	result = summary(rows)
 	(DATA / "summary.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
 	print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def verify(data: Path) -> None:
+	def jsonl(name: str) -> list[dict[str, object]]:
+		path = data / name
+		if not path.is_file():
+			raise AssertionError(f"missing artifact: {path}")
+		return [json.loads(line) for line in path.read_text().splitlines()]
+
+	rows = jsonl("raw.jsonl")
+	expected_cells = {
+		(workers, shape, request, instrumented, repeat)
+		for workers in WORKERS for shape in SHAPES for request in REQUESTS
+		for instrumented in (False, True) for repeat in range(1, RAW_REPEATS + 1)
+	}
+	actual_cells = [
+		(row.get("rayon_workers"), row.get("shape"), row.get("request"),
+		 row.get("instrumented"), row.get("repeat")) for row in rows
+	]
+	if len(actual_cells) != len(expected_cells) or set(actual_cells) != expected_cells:
+		raise AssertionError("raw matrix must contain each of the 320 expected cells exactly once")
+	for row in rows:
+		if row.get("kind") != "sample":
+			raise AssertionError(f"invalid raw row kind: {row}")
+		if row["warm_iterations"] < 10_000 or row["warm_total_ns"] < 200_000_000:
+			raise AssertionError(f"warm-loop minimum not met: {row}")
+		expected_warm = row["warm_total_ns"] / row["warm_iterations"]
+		if abs(row["warm_ns_per_iteration"] - expected_warm) > expected_warm * 1e-12:
+			raise AssertionError(f"warm-loop units mismatch: {row}")
+		process = row.get("process", {})
+		if process.get("user_s", -1) < 0 or process.get("system_s", -1) < 0 or process.get("peak_rss_kib", 0) <= 0:
+			raise AssertionError(f"invalid process measurement: {row}")
+		profile = row.get("profile")
+		if not row["instrumented"]:
+			if profile is not None:
+				raise AssertionError(f"uninstrumented row contains a profile: {row}")
+			continue
+		if profile is None:
+			raise AssertionError(f"instrumented row has no profile: {row}")
+		if profile["prewarm_configured_workers"] != row["rayon_workers"]:
+			raise AssertionError(f"configured worker mismatch: {row}")
+		if not 0 < profile["prewarm_max_active"] <= profile["prewarm_configured_workers"]:
+			raise AssertionError(f"prewarm bound exceeded: {row}")
+		phases = profile.get("phases", [])
+		if tuple(phase.get("name") for phase in phases) != PHASES:
+			raise AssertionError(f"phase labels mismatch: {row}")
+		modules = 1 if row["shape"] == "single" else 17
+		expected_counts = (modules + 12, modules, modules, modules + 1) + (
+			(0, 0, 0) if row["request"] == "diagnostics" else (modules, modules, 1)
+		)
+		if tuple(phase.get("executions") for phase in phases) != expected_counts:
+			raise AssertionError(f"phase execution counts mismatch: {row}")
+
+	snapshots = jsonl("snapshots.jsonl")
+	expected_snapshots = {
+		(workers, repeat, shape)
+		for workers in WORKERS for repeat in range(1, SNAPSHOT_REPEATS + 1) for shape in SHAPES
+	}
+	actual_snapshots = [
+		(item.get("workers"), item.get("repeat"), item.get("snapshot", {}).get("shape"))
+		for item in snapshots
+	]
+	if len(actual_snapshots) != len(expected_snapshots) or set(actual_snapshots) != expected_snapshots:
+		raise AssertionError("snapshot matrix must contain each of the 48 expected identities exactly once")
+	baseline: dict[str, dict[str, object]] = {}
+	for item in snapshots:
+		payload = item["snapshot"]
+		canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+		if hashlib.sha256(canonical.encode()).hexdigest() != item.get("sha256"):
+			raise AssertionError(f"snapshot hash mismatch: workers={item['workers']} repeat={item['repeat']}")
+		shape = payload["shape"]
+		if shape in baseline and payload != baseline[shape]:
+			raise AssertionError(f"snapshot payload mismatch for {shape}")
+		baseline.setdefault(shape, payload)
+
+	retained_summary = json.loads((data / "summary.json").read_text())
+	if retained_summary != summary(rows):
+		raise AssertionError("summary.json does not derive exactly from raw.jsonl")
+	environment = json.loads((data / "environment.json").read_text())
+	if environment.get("controls") != {"CARGO_INCREMENTAL": "0", "RAYON_NUM_THREADS": list(WORKERS)}:
+		raise AssertionError("environment controls mismatch")
+	if not all(environment.get(name) for name in ("platform", "machine", "python", "rustc", "cargo", "node", "commit")):
+		raise AssertionError("environment metadata is incomplete")
+	commands = (data / "commands.txt").read_text().splitlines()
+	if commands != [
+		"CARGO_INCREMENTAL=0 python3 scripts/issue-81-evidence.py matrix --repeats 5",
+		"python3 scripts/issue-81-evidence.py snapshots --repeats 3",
+		"python3 scripts/issue-81-evidence.py summarize",
+		"python3 scripts/issue-81-evidence.py verify",
+	]:
+		raise AssertionError("commands.txt does not contain the exact reproduction workflow")
+	manifest = {}
+	for line in (data / "artifacts.sha256").read_text().splitlines():
+		digest, name = line.split("  ", 1)
+		manifest[name] = digest
+	for name in ARTIFACTS:
+		digest = hashlib.sha256((data / name).read_bytes()).hexdigest()
+		if manifest.get(name) != digest:
+			raise AssertionError(f"artifact hash mismatch: {name}")
+	print("verified 320 raw cells, 160 profile pairs, 48 snapshots, summary, metadata, and artifact hashes")
 
 
 def main() -> None:
@@ -183,13 +294,17 @@ def main() -> None:
 		command = sub.add_parser(name)
 		command.add_argument("--repeats", type=int, default=default)
 	sub.add_parser("summarize")
+	verify_parser = sub.add_parser("verify")
+	verify_parser.add_argument("--data-dir", type=Path, default=DATA)
 	args = parser.parse_args()
 	if args.command == "matrix":
 		matrix(args.repeats)
 	elif args.command == "snapshots":
 		snapshots(args.repeats)
-	else:
+	elif args.command == "summarize":
 		summarize()
+	else:
+		verify(args.data_dir)
 
 
 if __name__ == "__main__":

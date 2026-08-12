@@ -195,7 +195,6 @@ fn snapshot(shape_name: &str) {
 			"shape": shape_name,
 			"diagnostics_sorted": diagnostics,
 			"graph_order": graph_order,
-			"module_order": module_sources.keys().collect::<Vec<_>>(),
 			"stable_definition_ids": definitions,
 			"module_sources": module_sources,
 			"final_js_blake3": blake3::hash(compiled.js.as_bytes()).to_hex().to_string(),
