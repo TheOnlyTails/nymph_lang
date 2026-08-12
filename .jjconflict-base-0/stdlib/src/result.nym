@@ -1,0 +1,101 @@
+import @/ops with (Unwrap)
+
+public enum Result<T, E> {
+  Ok(value: T),
+  Error(error: E)
+
+  func is_ok() = match (this) {
+    Ok(...) -> true,
+    Error(...) -> false,
+  }
+
+  func is_err() = !this.is_ok()
+
+  func is_ok_and(f: (T) -> boolean) = match (this) {
+    Ok(value) -> f(value),
+    Error(...) -> false,
+  }
+
+  func is_err_and(f: (E) -> boolean) = match (this) {
+    Ok(...) -> false,
+    Error(error) -> f(error),
+  }
+
+  func map<R>(f: (T) -> R) = match (this) {
+    Ok(value) -> Ok(value = f(value)),
+    Error(error) -> Error(error)
+  }
+
+  func map_err<F>(f: (E) -> F) = match (this) {
+    Ok(value) -> Ok(value),
+    Error(error) -> Error(error = f(error))
+  }
+
+  func map_or<R>(default: R, f: (T) -> R) = match (this) {
+    Ok(value) -> f(value),
+    Error(...) -> default,
+  }
+
+  func map_or_else<R>(default: (E) -> R, f: (T) -> R) = match (this) {
+    Ok(value) -> f(value),
+    Error(error) -> default(error),
+  }
+
+  func unwrap_or_else(default: (E) -> T) = match (this) {
+    Ok(value) -> value,
+    Error(error) -> default(error)
+  }
+
+  func inspect(f: (T) -> void) = {
+    match (this) {
+      Ok(value) -> f(value),
+      _ -> {}
+    }
+
+    this
+  }
+
+  func inspect_err(f: (E) -> void) = {
+    match (this) {
+      Error(error) -> f(error),
+      _ -> {}
+    }
+
+    this
+  }
+
+  func and<U>(other: Result<U, E>) = match (this) {
+    Ok(...) -> other,
+    Error(error) -> Error(error)
+  }
+
+  func and_then<U>(f: (T) -> Result<U, E>) = match (this) {
+    Ok(value) -> f(value),
+    Error(error) -> Error(error)
+  }
+
+  func or<F>(other: Result<T, F>) = match (this) {
+    Ok(value) -> Ok(value),
+    Error(...) -> other
+  }
+
+  func or_else<F>(f: (E) -> Result<T, F>) = match (this) {
+    Ok(value) -> Ok(value),
+    Error(error) -> f(error)
+  }
+}
+
+impl<T, E> Unwrap<Output = T> for Result<T, E> {
+  func unwrap(default: T): T = match (this) {
+    Ok(value) -> value,
+    Error(...) -> default
+  }
+}
+
+impl<T, E> Result<Result<T, E>, E> {
+  func flatten() = match (this) {
+    Ok(value = Ok(value)) -> Ok(value),
+    Ok(value = Error(error)) -> Error(error),
+    Error(error) -> Error(error)
+  }
+}

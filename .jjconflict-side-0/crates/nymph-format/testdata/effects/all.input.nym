@@ -1,0 +1,6 @@
+effect Database
+effect Network
+func pure( ) : void+!()={}
+func inferred():!_={}
+func apply<T,!E>(callback:(T)->void+!E):void+!Database+!Network+!E={}
+type Applied=Wrapper<int,!Database+!Network>

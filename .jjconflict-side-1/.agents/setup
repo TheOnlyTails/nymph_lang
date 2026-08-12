@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+export DEBIAN_FRONTEND=noninteractive
+
+echo "Installing system build dependencies..."
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+	build-essential \
+	ca-certificates \
+	curl \
+	git \
+	libssl-dev \
+	pkg-config \
+	xz-utils
+
+echo "Installing Node.js 24..."
+case "$(uname -m)" in
+	x86_64) node_arch=x64 ;;
+	aarch64) node_arch=arm64 ;;
+	*)
+		echo "Unsupported Node.js architecture: $(uname -m)" >&2
+		exit 1
+		;;
+esac
+node_index="$(curl --fail --silent --show-error https://nodejs.org/dist/index.tab)"
+node_version="$(awk 'NR > 1 && $1 ~ /^v24\./ { print $1; exit }' <<< "$node_index")"
+node_prefix="/opt/node-${node_version}-linux-${node_arch}"
+if [[ ! -x "$node_prefix/bin/node" ]]; then
+	node_archive="$(mktemp)"
+	trap 'rm -f "$node_archive"' EXIT
+	curl --fail --location --show-error \
+		"https://nodejs.org/dist/${node_version}/node-${node_version}-linux-${node_arch}.tar.xz" \
+		--output "$node_archive"
+	sudo tar -xJf "$node_archive" -C /opt
+	rm -f "$node_archive"
+	trap - EXIT
+fi
+for executable in node npm npx corepack; do
+	sudo ln -sfn "$node_prefix/bin/$executable" "/usr/local/bin/$executable"
+done
+
+pnpm_version="$(node -p "require('./package.json').packageManager.split('@').at(-1)")"
+echo "Installing pnpm ${pnpm_version}..."
+corepack prepare "pnpm@${pnpm_version}" --activate
+sudo corepack enable --install-directory /usr/local/bin pnpm
+
+echo "Installing the pinned Rust toolchain..."
+export PATH="$HOME/.cargo/bin:$PATH"
+if ! command -v rustup >/dev/null 2>&1; then
+	curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+		https://sh.rustup.rs \
+		| sh -s -- -y --profile minimal --default-toolchain none --no-modify-path
+fi
+rustup toolchain install nightly \
+	--profile minimal \
+	--component rustfmt \
+	--component clippy \
+	--component rust-src
+
+profile_marker="# Nymph Rust toolchain"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+	cat >> "$HOME/.bash_profile" <<'EOF'
+
+# Nymph Rust toolchain
+export PATH="$HOME/.cargo/bin:$PATH"
+EOF
+fi
+
+echo "Installing Jujutsu..."
+if ! command -v jj >/dev/null 2>&1; then
+	cargo install jj-cli --locked
+fi
+
+echo "Installing cargo-nextest..."
+if ! command -v cargo-nextest >/dev/null 2>&1; then
+	cargo install cargo-nextest --locked
+fi
+
+echo "Installing JavaScript dependencies..."
+pnpm install --frozen-lockfile
+
+echo "Orb setup complete."
+node --version
+pnpm --version
+rustc --version
+cargo --version
+jj --version
+cargo nextest --version

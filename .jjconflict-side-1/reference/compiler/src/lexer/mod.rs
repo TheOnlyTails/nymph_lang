@@ -1,0 +1,809 @@
+pub(crate) mod token;
+
+use chumsky::{input::MapExtra, prelude::*};
+use ecow::EcoString;
+use itertools::Itertools;
+use ordered_float::OrderedFloat;
+use regex::Regex;
+
+use crate::{
+	ast::{
+		Spanned,
+		expr::{CharEscape, StringEscape},
+	},
+	lexer::token::Token,
+};
+
+type LexerError<'src> = Rich<'src, char, SimpleSpan>;
+
+type LexerExtra<'src> = extra::Err<LexerError<'src>>;
+
+pub(crate) trait Lexer<'src, O> = Parser<'src, &'src str, O, LexerExtra<'src>> + Clone + 'src;
+
+pub(crate) fn lexer<'src>() -> impl Lexer<'src, Vec<Spanned<Token>>> {
+	let token = recursive(|token| {
+		choice((
+			float_lexer(),
+			int_lexer(),
+			keyword_lexer(),
+			anonymous_param_lexer(),
+			punct_lexer(),
+			ident_lexer(),
+			char_lexer(),
+			string_lexer(token.clone()),
+			delimiter_lexer(token),
+		))
+		.padded_by(comment_lexer().repeated())
+		.padded()
+	});
+
+	token.repeated().collect()
+}
+
+fn int_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
+	choice((
+		regex(r"0[bB][01](_?[01])*")
+			.map(|it: &str| u64::from_str_radix(&it[2..].replace("_", ""), 2))
+			.unwrapped()
+			.map(Token::BinaryInt),
+		regex(r"0[oO][0-7](_?[0-7])*")
+			.map(|it: &str| u64::from_str_radix(&it[2..].replace("_", ""), 8))
+			.unwrapped()
+			.map(Token::OctalInt),
+		regex(r"0[xX][a-fA-F\d](_?[a-fA-F\d])*")
+			.map(|it: &str| u64::from_str_radix(&it[2..].replace("_", ""), 16))
+			.unwrapped()
+			.map(Token::HexInt),
+		regex(r"\d(_?\d)*")
+			.map(|it: &str| it.replace("_", "").parse::<u64>())
+			.unwrapped()
+			.map(Token::DecimalInt),
+	))
+	.map_with(Spanned::new)
+	.then(
+		comment_lexer().to(String::new()).or(
+			any()
+				.filter(|&c: &char| {
+					c.is_alphabetic() || c == '_' || c.is_ascii_digit() || c == '-' || c == '+'
+				})
+				.repeated()
+				.collect::<String>(),
+		),
+	)
+	.validate(
+		|(token, text), e: &mut MapExtra<&str, LexerExtra>, emitter| {
+			let span = SimpleSpan::from((e.span().end - text.len())..e.span().end);
+			let Spanned(int, _) = &token;
+
+			match (int, text.as_str()) {
+				(_, "") => token,
+
+				(_, separators) if Regex::new("_+").unwrap().is_match(separators) => {
+					emitter.emit(Rich::custom(
+						span,
+						"Found invalid digit separators in integer literal",
+					));
+					Spanned(Token::Error, span.into())
+				}
+
+				(Token::BinaryInt(v), "u" | "U") => Spanned(Token::BinaryUInt(*v), e.span().into()),
+				(Token::OctalInt(v), "u" | "U") => Spanned(Token::OctalUInt(*v), e.span().into()),
+				(Token::HexInt(v), "u" | "U") => Spanned(Token::HexUInt(*v), e.span().into()),
+				(Token::DecimalInt(v), "u" | "U") => Spanned(Token::DecimalUInt(*v), e.span().into()),
+
+				(Token::BinaryInt(_) | Token::DecimalInt(0), invalid_digits)
+					if Regex::new(r"[bB]?(_?[2-9])+")
+						.unwrap()
+						.is_match(invalid_digits) =>
+				{
+					emitter.emit(Rich::custom(span, "Found invalid digit in binary integer"));
+					Spanned(Token::Error, span.into())
+				}
+
+				(Token::OctalInt(_) | Token::DecimalInt(0), invalid_digits)
+					if Regex::new(r"[oO]?(_?[8-9])+")
+						.unwrap()
+						.is_match(invalid_digits) =>
+				{
+					emitter.emit(Rich::custom(span, "Found invalid digit in octal integer"));
+					Spanned(Token::Error, span.into())
+				}
+
+				(Token::HexInt(_) | Token::DecimalInt(0), invalid_digits)
+					if Regex::new(r"[xX]?(_?[g-zG-Z])+")
+						.unwrap()
+						.is_match(invalid_digits) =>
+				{
+					emitter.emit(Rich::custom(
+						span,
+						"Found invalid digit in hexadecimal integer",
+					));
+					Spanned(Token::Error, span.into())
+				}
+
+				(Token::DecimalInt(_), "e" | "E" | "e-" | "E-" | "e+" | "E+") => {
+					emitter.emit(Rich::custom(span, "Found start of exponent, but no digits"));
+					Spanned(Token::Error, span.into())
+				}
+				(_, exp) if Regex::new(r"[eE][-+]?\d?(_?\d)*").unwrap().is_match(exp) => {
+					emitter.emit(Rich::custom(span, "Found exponent on non-decimal integer"));
+					Spanned(Token::Error, span.into())
+				}
+				(Token::DecimalInt(0), "b" | "B") => {
+					emitter.emit(Rich::custom(span, "Found binary suffix without digits"));
+					Spanned(Token::Error, span.into())
+				}
+				(Token::DecimalInt(0), "x" | "X") => {
+					emitter.emit(Rich::custom(
+						span,
+						"Found hexadecimal suffix without digits",
+					));
+					Spanned(Token::Error, span.into())
+				}
+				(Token::DecimalInt(0), "o" | "O") => {
+					emitter.emit(Rich::custom(span, "Found octal suffix without digits"));
+					Spanned(Token::Error, span.into())
+				}
+				_ => {
+					emitter.emit(Rich::custom(span, "Found unexpected character"));
+					Spanned(Token::Error, span.into())
+				}
+			}
+		},
+	)
+	.labelled("integer literal")
+	.as_context()
+	.boxed()
+}
+
+fn float_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
+	choice((
+		// 1.2e-3
+		regex(r"\d(_?\d)*\.\d(_?\d)*[eE][-+]?\d(_?\d)*").try_map(|input: &str, span| {
+			let unseparated = input.replace("_", "");
+			let (mantissa, exponent) = unseparated.split(['e', 'E']).collect_tuple().unwrap();
+
+			let mantissa = mantissa
+				.parse::<OrderedFloat<f64>>()
+				.map_err(|e| Rich::custom(span, format!("Invalid mantissa: {e}")))?;
+			let exponent = exponent
+				.parse::<i32>()
+				.map_err(|e| Rich::custom(span, format!("Invalid exponent: {e}")))?;
+			Ok(Token::FloatExpFloat(mantissa, exponent))
+		}),
+		// 1e-2
+		regex(r"\d(_?\d)*[eE][-+]?\d(_?\d)*").try_map(|input: &str, span| {
+			let unseparated = input.replace("_", "");
+			let (mantissa, exponent) = unseparated.split(['e', 'E']).collect_tuple().unwrap();
+
+			let mantissa = mantissa
+				.parse::<u64>()
+				.map_err(|e| Rich::custom(span, format!("Invalid mantissa: {e}")))?;
+			let exponent = exponent
+				.parse::<i32>()
+				.map_err(|e| Rich::custom(span, format!("Invalid exponent: {e}")))?;
+			Ok(Token::IntExpFloat(mantissa, exponent))
+		}),
+		// 1.2
+		regex(r"(0|[1-9](_?\d)*)\.\d(_?\d)*")
+			.map(|it: &str| it.replace("_", "").parse::<OrderedFloat<f64>>())
+			.unwrapped()
+			.map(Token::Float),
+		// 1f
+		regex(r"\d(_?\d)*[fF]")
+			.map(|it: &str| {
+				it.strip_suffix(['f', 'F'])
+					.unwrap()
+					.replace("_", "")
+					.parse::<u64>()
+			})
+			.unwrapped()
+			.map(Token::IntFloat),
+	))
+	.map_with(Spanned::new)
+	.then(
+		comment_lexer().to(String::new()).or(
+			any()
+				.filter(|&c: &char| {
+					c.is_alphabetic() || c == '_' || c.is_ascii_digit() || c == '-' || c == '+'
+				})
+				.repeated()
+				.collect::<String>(),
+		),
+	)
+	.validate(|(token, text), e, emitter| {
+		let span = SimpleSpan::from((e.span().end - text.len())..e.span().end);
+		let Spanned(float, _) = &token;
+
+		match (float, text.as_str()) {
+			(_, "") => token,
+
+			(_, separators) if Regex::new("_+").unwrap().is_match(separators) => {
+				emitter.emit(Rich::custom(
+					e.span(),
+					"Found invalid digit separators in float literal",
+				));
+				Spanned(Token::Error, span.into())
+			}
+
+			(Token::IntFloat(_), exp) if Regex::new(r"[eE][-+]?\d?(_?\d)*").unwrap().is_match(exp) => {
+				emitter.emit(Rich::custom(e.span(), "Found exponent on integer float"));
+				Spanned(Token::Error, span.into())
+			}
+			(_, "e" | "E" | "e-" | "E-" | "e+" | "E+") => {
+				emitter.emit(Rich::custom(
+					e.span(),
+					"Found start of exponent, but no digits",
+				));
+				Spanned(Token::Error, span.into())
+			}
+
+			(Token::IntFloat(_), suffix) => {
+				emitter.emit(Rich::custom(
+					e.span(),
+					format!("Found invalid suffix for an integer: {suffix:?}"),
+				));
+				Spanned(Token::Error, span.into())
+			}
+
+			(_, c) => {
+				emitter.emit(Rich::custom(
+					e.span(),
+					format!("Found unexpected character: {c:?}"),
+				));
+				Spanned(Token::Error, span.into())
+			}
+		}
+	})
+	.labelled("float literal")
+	.as_context()
+	.boxed()
+}
+
+fn char_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
+	choice((
+		just('\\')
+			.ignore_then(one_of("uU"))
+			.ignore_then(
+				text::digits(16)
+					.repeated()
+					.at_least(1)
+					.at_most(6)
+					.to_slice(),
+			)
+			.map(|s| u32::from_str_radix(s, 16))
+			.unwrapped()
+			.validate(|code, e, emitter| match char::from_u32(code) {
+				Some(c) => Token::CharEscape(CharEscape::Unicode(c)),
+				None => {
+					emitter.emit(Rich::custom(
+						e.span(),
+						format!("Invalid unicode codepoint: U+{code:X}"),
+					));
+					Token::Error
+				}
+			}),
+		just(r"\n").to(Token::CharEscape(CharEscape::Newline)),
+		just(r"\N").to(Token::CharEscape(CharEscape::Newline)),
+		just(r"\r").to(Token::CharEscape(CharEscape::Carriage)),
+		just(r"\R").to(Token::CharEscape(CharEscape::Carriage)),
+		just(r"\t").to(Token::CharEscape(CharEscape::Tab)),
+		just(r"\T").to(Token::CharEscape(CharEscape::Tab)),
+		just(r"\\").to(Token::CharEscape(CharEscape::Backslash)),
+		just(r"\'").to(Token::CharEscape(CharEscape::Apostrophe)),
+		just(r"\").ignore_then(any()).validate(|c, e, emitter| {
+			emitter.emit(Rich::custom(
+				e.span(),
+				format!(r"Invalid escape sequence: \{c}"),
+			));
+			Token::Error
+		}),
+		none_of(r"[^\\']").map(Token::Char),
+	))
+	.delimited_by(just('\''), just('\''))
+	.map_with(Spanned::new)
+	.labelled("character literal")
+	.as_context()
+	.boxed()
+}
+
+fn string_lexer<'src, T: Lexer<'src, Spanned<Token>>>(
+	token: T,
+) -> impl Lexer<'src, Spanned<Token>> {
+	let string_token = choice((
+		// Unicode escape
+		regex(r"\\[uU][a-fA-F\d]{1,6}")
+			.map(|s: &str| u32::from_str_radix(&s[2..], 16))
+			.unwrapped()
+			.validate(|code, e, emitter| match char::from_u32(code) {
+				Some(c) => Token::StringEscape(StringEscape::Unicode(c)),
+				None => {
+					emitter.emit(Rich::custom(
+						e.span(),
+						format!("Invalid unicode codepoint: U+{code:X}"),
+					));
+					Token::Error
+				}
+			}),
+		// escape sequences
+		just(r"\n").to(Token::StringEscape(StringEscape::Newline)),
+		just(r"\N").to(Token::StringEscape(StringEscape::Newline)),
+		just(r"\r").to(Token::StringEscape(StringEscape::Carriage)),
+		just(r"\R").to(Token::StringEscape(StringEscape::Carriage)),
+		just(r"\t").to(Token::StringEscape(StringEscape::Tab)),
+		just(r"\T").to(Token::StringEscape(StringEscape::Tab)),
+		just(r"\\").to(Token::StringEscape(StringEscape::Backslash)),
+		just(r#"\""#).to(Token::StringEscape(StringEscape::Quote)),
+		just(r"\${").to(Token::StringEscape(StringEscape::Interpolation)),
+		just(r"\").ignore_then(any()).validate(|c, e, emitter| {
+			emitter.emit(Rich::custom(
+				e.span(),
+				format!(r"Invalid escape sequence: \{c}"),
+			));
+			Token::Error
+		}),
+		// interpolation
+		token
+			.repeated()
+			.at_least(1)
+			.collect()
+			.delimited_by(just("${"), just('}'))
+			.map(Token::StringInterpolation),
+		// regular text
+		choice((
+			none_of("\"\\$").ignored(),
+			just('$')
+				.repeated()
+				.at_least(1)
+				.then(none_of("\"\\${"))
+				.ignored(),
+		))
+		.repeated()
+		.at_least(1)
+		.to_slice()
+		.map(|s: &str| Token::StringText(s.into())),
+	));
+
+	string_token
+		.map_with(Spanned::new)
+		.repeated()
+		.collect()
+		.delimited_by(just('"'), just('"'))
+		.map_with(|toks, e| Spanned(Token::String(toks), e.span().into()))
+		.labelled("string literal")
+		.as_context()
+		.boxed()
+}
+
+fn ident_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
+	text::ident()
+		.map(|t: &str| match t {
+			"_" => Token::Underscore,
+			t => Token::Identifier(EcoString::from(t.to_string())),
+		})
+		.map_with(Spanned::new)
+		.boxed()
+}
+
+fn anonymous_param_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
+	just('$')
+		.ignore_then(text::digits(10).to_slice().or_not())
+		.try_map(|digits, span| {
+			digits
+				.map(|digits: &str| {
+					digits
+						.parse::<u32>()
+						.map(Some)
+						.map_err(|_| Rich::custom(span, "Anonymous parameter index is too large"))
+				})
+				.unwrap_or(Ok(None))
+				.map(Token::AnonymousParam)
+		})
+		.map_with(Spanned::new)
+		.boxed()
+}
+
+fn delimiter_lexer<'src, T: Lexer<'src, Spanned<Token>>>(
+	token: T,
+) -> impl Lexer<'src, Spanned<Token>> {
+	choice((
+		token
+			.clone()
+			.repeated()
+			.collect()
+			.padded()
+			.delimited_by(just('('), just(')'))
+			.map(Token::Parens),
+		token
+			.clone()
+			.repeated()
+			.collect()
+			.padded()
+			.delimited_by(just('['), just(']'))
+			.map(Token::Brackets),
+		token
+			.clone()
+			.repeated()
+			.collect()
+			.padded()
+			.delimited_by(just('{'), just('}'))
+			.map(Token::Braces),
+		token
+			.clone()
+			.repeated()
+			.collect()
+			.padded()
+			.delimited_by(just("#("), just(')'))
+			.map(Token::Tuple),
+		token
+			.clone()
+			.repeated()
+			.collect()
+			.padded()
+			.delimited_by(just("#["), just(']'))
+			.map(Token::List),
+		token
+			.repeated()
+			.collect()
+			.padded()
+			.delimited_by(just("#{"), just('}'))
+			.map(Token::Map),
+	))
+	.map_with(Spanned::new)
+	.boxed()
+}
+
+fn keyword_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
+	choice([
+		text::keyword("true").to(Token::True),
+		text::keyword("false").to(Token::False),
+		text::keyword("public").to(Token::Public),
+		text::keyword("internal").to(Token::Internal),
+		text::keyword("private").to(Token::Private),
+		text::keyword("import").to(Token::Import),
+		text::keyword("with").to(Token::With),
+		text::keyword("async").to(Token::Async),
+		text::keyword("await").to(Token::Await),
+		text::keyword("type").to(Token::Type),
+		text::keyword("struct").to(Token::Struct),
+		text::keyword("enum").to(Token::Enum),
+		text::keyword("let").to(Token::Let),
+		text::keyword("mut").to(Token::Mut),
+		text::keyword("external").to(Token::External),
+		text::keyword("func").to(Token::Func),
+		text::keyword("interface").to(Token::Interface),
+		text::keyword("impl").to(Token::Impl),
+		text::keyword("namespace").to(Token::Namespace),
+		text::keyword("for").to(Token::For),
+		text::keyword("while").to(Token::While),
+		text::keyword("if").to(Token::If),
+		text::keyword("else").to(Token::Else),
+		text::keyword("match").to(Token::Match),
+		text::keyword("int").to(Token::IntType),
+		text::keyword("uint").to(Token::UIntType),
+		text::keyword("float").to(Token::FloatType),
+		text::keyword("boolean").to(Token::BooleanType),
+		text::keyword("char").to(Token::CharType),
+		text::keyword("string").to(Token::StringType),
+		text::keyword("void").to(Token::VoidType),
+		text::keyword("never").to(Token::NeverType),
+		text::keyword("self").to(Token::SelfType),
+		text::keyword("as").to(Token::As),
+		text::keyword("is").to(Token::Is),
+		text::keyword("in").to(Token::In),
+		text::keyword("return").to(Token::Return),
+		text::keyword("break").to(Token::Break),
+		text::keyword("continue").to(Token::Continue),
+		text::keyword("this").to(Token::This),
+	])
+	.map_with(Spanned::new)
+	.boxed()
+}
+
+fn punct_lexer<'src>() -> impl Lexer<'src, Spanned<Token>> {
+	choice([
+		just("...").to(Token::DotDotDot),
+		just("..<").to(Token::DotDotLt),
+		just("..=").to(Token::DotDotEq),
+		just("..").to(Token::DotDot),
+		just(".").to(Token::Dot),
+		just("??").to(Token::DoubleQuestion),
+		just("?.").to(Token::QuestionDot),
+		just("?").to(Token::QuestionMark),
+		just("@").to(Token::AtSign),
+		just(",").to(Token::Comma),
+		just("::").to(Token::ColonColon),
+		just(":").to(Token::Colon),
+		just("!in").to(Token::NotIn),
+		just("!is").to(Token::NotIs),
+		just("!=").to(Token::NotEq),
+		just("!").to(Token::ExclamationMark),
+		just("+=").to(Token::PlusEq),
+		just("+").to(Token::Plus),
+		just("->").to(Token::Arrow),
+		just("-=").to(Token::MinusEq),
+		just("-").to(Token::Minus),
+		just("**=").to(Token::StarStarEq),
+		just("**").to(Token::StarStar),
+		just("*=").to(Token::StarEq),
+		just("*").to(Token::Star),
+		just("/=").to(Token::SlashEq),
+		just("/").to(Token::Slash),
+		just("%=").to(Token::PercentEq),
+		just("%").to(Token::Percent),
+		just("&&=").to(Token::AndAndEq),
+		just("&&").to(Token::AndAnd),
+		just("&=").to(Token::AndEq),
+		just("&").to(Token::And),
+		just("|>").to(Token::Triangle),
+		just("||=").to(Token::PipePipeEq),
+		just("||").to(Token::PipePipe),
+		just("|=").to(Token::PipeEq),
+		just("|").to(Token::Pipe),
+		just("^=").to(Token::CaretEq),
+		just("^").to(Token::Caret),
+		just("~=").to(Token::TildeEq),
+		just("~").to(Token::Tilde),
+		just("==").to(Token::EqEq),
+		just("=").to(Token::Eq),
+		just("<<=").to(Token::LtLtEq),
+		just("<=").to(Token::LtEq),
+		just("<").to(Token::Lt),
+		just(">>=").to(Token::GtGtEq),
+		just(">=").to(Token::GtEq),
+		just(">").to(Token::Gt),
+	])
+	.map_with(Spanned::new)
+	.boxed()
+}
+
+fn comment_lexer<'src>() -> impl Lexer<'src, ()> {
+	just("//")
+		.then(any().and_is(just("\n").not()).repeated())
+		.ignored()
+		.padded()
+		.labelled("comment")
+		.boxed()
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::ast::SpannedExt;
+	use test_case::test_case;
+
+	// ints
+	#[test_case("1234" => Ok(vec![Token::DecimalInt(1234).spanned(0..4)]) ; "decimal")]
+	#[test_case("1_234_567" => Ok(vec![Token::DecimalInt(1234567).spanned(0..9)]) ; "decimal with separators")]
+	#[test_case("0xFF" => Ok(vec![Token::HexInt(255).spanned(0..4)]) ; "hex")]
+	#[test_case("0xFF_FF" => Ok(vec![Token::HexInt(65535).spanned(0..7)]) ; "hex with separator")]
+	#[test_case("0b1010" => Ok(vec![Token::BinaryInt(10).spanned(0..6)]) ; "binary")]
+	#[test_case("0b1010_1010" => Ok(vec![Token::BinaryInt(170).spanned(0..11)]) ; "binary with separator")]
+	#[test_case("0o755" => Ok(vec![Token::OctalInt(493).spanned(0..5)]) ; "octal")]
+	#[test_case("0o77_77" => Ok(vec![Token::OctalInt(4095).spanned(0..7)]) ; "octal with separator")]
+	#[test_case("1234u" => Ok(vec![Token::DecimalUInt(1234).spanned(0..5)]) ; "unsigned decimal")]
+	#[test_case("0xFFu" => Ok(vec![Token::HexUInt(255).spanned(0..5)]) ; "unsigned hex")]
+	#[test_case("0b1010u" => Ok(vec![Token::BinaryUInt(10).spanned(0..7)]) ; "unsigned binary")]
+	#[test_case("0o755u" => Ok(vec![Token::OctalUInt(493).spanned(0..6)]) ; "unsigned octal")]
+	// floats
+	#[test_case("1.23" => Ok(vec![Token::Float(OrderedFloat(1.23)).spanned(0..4)]) ; "simple float")]
+	#[test_case("1_234.567_89" => Ok(vec![Token::Float(OrderedFloat(1234.56789)).spanned(0..12)]) ; "float with separators")]
+	#[test_case("1.2e-3" => Ok(vec![Token::FloatExpFloat(OrderedFloat(1.2), -3).spanned(0..6)]) ; "scientific notation")]
+	#[test_case("1_234e-1_0" => Ok(vec![Token::IntExpFloat(1234, -10).spanned(0..10)]) ; "scientific with separators")]
+	#[test_case("1e2" => Ok(vec![Token::IntExpFloat(1, 2).spanned(0..3)]) ; "scientific without decimal")]
+	#[test_case("1f" => Ok(vec![Token::IntFloat(1).spanned(0..2)]) ; "float suffix")]
+	// characters
+	#[test_case("'a'" => Ok(vec![Token::Char('a').spanned(0..3)]) ; "simple char")]
+	#[test_case("'β'" => Ok(vec![Token::Char('β').spanned(0..4)]) ; "unicode char")]
+	#[test_case(r"'\n'" => Ok(vec![Token::CharEscape(CharEscape::Newline).spanned(0..4)]) ; "newline escape")]
+	#[test_case(r"'\t'" => Ok(vec![Token::CharEscape(CharEscape::Tab).spanned(0..4)]) ; "tab escape")]
+	#[test_case(r"'\''" => Ok(vec![Token::CharEscape(CharEscape::Apostrophe).spanned(0..4)]) ; "apostrophe escape")]
+	#[test_case(r"'\u0041'" => Ok(vec![Token::CharEscape(CharEscape::Unicode('A')).spanned(0..8)]) ; "unicode escape A")]
+	#[test_case(r"'\u1'" => Ok(vec![Token::CharEscape(CharEscape::Unicode('\u{0001}')).spanned(0..5)]) ; "unicode escape SOH")]
+	#[test_case(r"'\u2764'" => Ok(vec![Token::CharEscape(CharEscape::Unicode('❤')).spanned(0..8)]) ; "unicode escape emoji 1")]
+	#[test_case(r"'\u1F600'" => Ok(vec![Token::CharEscape(CharEscape::Unicode('😀')).spanned(0..9)]) ; "unicode escape emoji 2")]
+	// identifiers
+	#[test_case("foo_bar123" => Ok(vec![Token::Identifier("foo_bar123".into()).spanned(0..10)]) ; "identifier")]
+	#[test_case("x" => Ok(vec![Token::Identifier("x".into()).spanned(0..1)]) ; "single char")]
+	#[test_case("_x" => Ok(vec![Token::Identifier("_x".into()).spanned(0..2)]) ; "starts with underscore")]
+	#[test_case("x1" => Ok(vec![Token::Identifier("x1".into()).spanned(0..2)]) ; "alphanumeric")]
+	#[test_case("snake_case" => Ok(vec![Token::Identifier("snake_case".into()).spanned(0..10)]) ; "snake case")]
+	#[test_case("camelCase" => Ok(vec![Token::Identifier("camelCase".into()).spanned(0..9)]) ; "camel case")]
+	#[test_case("PascalCase" => Ok(vec![Token::Identifier("PascalCase".into()).spanned(0..10)]) ; "pascal case")]
+	#[test_case("SCREAMING_SNAKE" => Ok(vec![Token::Identifier("SCREAMING_SNAKE".into()).spanned(0..15)]) ; "screaming snake")]
+	#[test_case("αβγ" => Ok(vec![Token::Identifier("αβγ".into()).spanned(0..6)]) ; "unicode letters")]
+	#[test_case("foo123_αβγ" => Ok(vec![Token::Identifier("foo123_αβγ".into()).spanned(0..13)]) ; "mixed alphanumeric unicode")]
+	#[test_case("$" => Ok(vec![Token::AnonymousParam(None).spanned(0..1)]) ; "anonymous param default")]
+	#[test_case("$0" => Ok(vec![Token::AnonymousParam(Some(0)).spanned(0..2)]) ; "anonymous param zero")]
+	#[test_case("$12" => Ok(vec![Token::AnonymousParam(Some(12)).spanned(0..3)]) ; "anonymous param index")]
+	// keywords
+	#[test_case("func" => Ok(vec![Token::Func.spanned(0..4)]) ; "func keyword")]
+	#[test_case("let" => Ok(vec![Token::Let.spanned(0..3)]) ; "let keyword")]
+	#[test_case("mut" => Ok(vec![Token::Mut.spanned(0..3)]) ; "mut keyword")]
+	#[test_case("if" => Ok(vec![Token::If.spanned(0..2)]) ; "if keyword")]
+	#[test_case("else" => Ok(vec![Token::Else.spanned(0..4)]) ; "else keyword")]
+	#[test_case("return" => Ok(vec![Token::Return.spanned(0..6)]) ; "return keyword")]
+	#[test_case("true" => Ok(vec![Token::True.spanned(0..4)]) ; "true keyword")]
+	#[test_case("false" => Ok(vec![Token::False.spanned(0..5)]) ; "false keyword")]
+	#[test_case("public" => Ok(vec![Token::Public.spanned(0..6)]) ; "public keyword")]
+	#[test_case("internal" => Ok(vec![Token::Internal.spanned(0..8)]) ; "internal keyword")]
+	#[test_case("private" => Ok(vec![Token::Private.spanned(0..7)]) ; "private keyword")]
+	#[test_case("import" => Ok(vec![Token::Import.spanned(0..6)]) ; "import keyword")]
+	#[test_case("with" => Ok(vec![Token::With.spanned(0..4)]) ; "with keyword")]
+	#[test_case("async" => Ok(vec![Token::Async.spanned(0..5)]) ; "async keyword")]
+	#[test_case("await" => Ok(vec![Token::Await.spanned(0..5)]) ; "await keyword")]
+	#[test_case("type" => Ok(vec![Token::Type.spanned(0..4)]) ; "type keyword")]
+	#[test_case("struct" => Ok(vec![Token::Struct.spanned(0..6)]) ; "struct keyword")]
+	#[test_case("enum" => Ok(vec![Token::Enum.spanned(0..4)]) ; "enum keyword")]
+	#[test_case("external" => Ok(vec![Token::External.spanned(0..8)]) ; "external keyword")]
+	#[test_case("interface" => Ok(vec![Token::Interface.spanned(0..9)]) ; "interface keyword")]
+	#[test_case("impl" => Ok(vec![Token::Impl.spanned(0..4)]) ; "impl keyword")]
+	#[test_case("namespace" => Ok(vec![Token::Namespace.spanned(0..9)]) ; "namespace keyword")]
+	#[test_case("while" => Ok(vec![Token::While.spanned(0..5)]) ; "while keyword")]
+	#[test_case("match" => Ok(vec![Token::Match.spanned(0..5)]) ; "match keyword")]
+	#[test_case("int" => Ok(vec![Token::IntType.spanned(0..3)]) ; "int type keyword")]
+	#[test_case("uint" => Ok(vec![Token::UIntType.spanned(0..4)]) ; "uint type keyword")]
+	#[test_case("float" => Ok(vec![Token::FloatType.spanned(0..5)]) ; "float type keyword")]
+	#[test_case("boolean" => Ok(vec![Token::BooleanType.spanned(0..7)]) ; "boolean type keyword")]
+	#[test_case("char" => Ok(vec![Token::CharType.spanned(0..4)]) ; "char type keyword")]
+	#[test_case("string" => Ok(vec![Token::StringType.spanned(0..6)]) ; "string type keyword")]
+	#[test_case("void" => Ok(vec![Token::VoidType.spanned(0..4)]) ; "void type keyword")]
+	#[test_case("never" => Ok(vec![Token::NeverType.spanned(0..5)]) ; "never type keyword")]
+	#[test_case("self" => Ok(vec![Token::SelfType.spanned(0..4)]) ; "self type keyword")]
+	#[test_case("as" => Ok(vec![Token::As.spanned(0..2)]) ; "as keyword")]
+	#[test_case("is" => Ok(vec![Token::Is.spanned(0..2)]) ; "is keyword")]
+	#[test_case("in" => Ok(vec![Token::In.spanned(0..2)]) ; "in keyword")]
+	#[test_case("break" => Ok(vec![Token::Break.spanned(0..5)]) ; "break keyword")]
+	#[test_case("continue" => Ok(vec![Token::Continue.spanned(0..8)]) ; "continue keyword")]
+	#[test_case("this" => Ok(vec![Token::This.spanned(0..4)]) ; "this keyword")]
+	// punctuation
+	#[test_case("." => Ok(vec![Token::Dot.spanned(0..1)]) ; "dot")]
+	#[test_case("->" => Ok(vec![Token::Arrow.spanned(0..2)]) ; "arrow")]
+	#[test_case("==" => Ok(vec![Token::EqEq.spanned(0..2)]) ; "equals")]
+	#[test_case("!=" => Ok(vec![Token::NotEq.spanned(0..2)]) ; "not equals")]
+	#[test_case("&&" => Ok(vec![Token::AndAnd.spanned(0..2)]) ; "logical and")]
+	#[test_case("||" => Ok(vec![Token::PipePipe.spanned(0..2)]) ; "logical or")]
+	#[test_case("..." => Ok(vec![Token::DotDotDot.spanned(0..3)]) ; "spread")]
+	#[test_case("..<" => Ok(vec![Token::DotDotLt.spanned(0..3)]) ; "exclusive range")]
+	#[test_case("..=" => Ok(vec![Token::DotDotEq.spanned(0..3)]) ; "inclusive range")]
+	#[test_case(".." => Ok(vec![Token::DotDot.spanned(0..2)]) ; "dot dot")]
+	#[test_case("??" => Ok(vec![Token::DoubleQuestion.spanned(0..2)]) ; "null coalescing")]
+	#[test_case("?." => Ok(vec![Token::QuestionDot.spanned(0..2)]) ; "optional chaining")]
+	#[test_case("?" => Ok(vec![Token::QuestionMark.spanned(0..1)]) ; "question mark")]
+	#[test_case("@" => Ok(vec![Token::AtSign.spanned(0..1)]) ; "at sign")]
+	#[test_case("::" => Ok(vec![Token::ColonColon.spanned(0..2)]) ; "double colon")]
+	#[test_case(":" => Ok(vec![Token::Colon.spanned(0..1)]) ; "colon")]
+	#[test_case("_" => Ok(vec![Token::Underscore.spanned(0..1)]) ; "underscore")]
+	#[test_case("!in" => Ok(vec![Token::NotIn.spanned(0..3)]) ; "not in")]
+	#[test_case("!is" => Ok(vec![Token::NotIs.spanned(0..3)]) ; "not is")]
+	#[test_case("+=" => Ok(vec![Token::PlusEq.spanned(0..2)]) ; "plus equals")]
+	#[test_case("+" => Ok(vec![Token::Plus.spanned(0..1)]) ; "plus")]
+	#[test_case("-=" => Ok(vec![Token::MinusEq.spanned(0..2)]) ; "minus equals")]
+	#[test_case("-" => Ok(vec![Token::Minus.spanned(0..1)]) ; "minus")]
+	#[test_case("**=" => Ok(vec![Token::StarStarEq.spanned(0..3)]) ; "power equals")]
+	#[test_case("**" => Ok(vec![Token::StarStar.spanned(0..2)]) ; "power")]
+	#[test_case("*=" => Ok(vec![Token::StarEq.spanned(0..2)]) ; "multiply equals")]
+	#[test_case("*" => Ok(vec![Token::Star.spanned(0..1)]) ; "multiply")]
+	#[test_case("/=" => Ok(vec![Token::SlashEq.spanned(0..2)]) ; "divide equals")]
+	#[test_case("/" => Ok(vec![Token::Slash.spanned(0..1)]) ; "divide")]
+	#[test_case("%=" => Ok(vec![Token::PercentEq.spanned(0..2)]) ; "modulo equals")]
+	#[test_case("%" => Ok(vec![Token::Percent.spanned(0..1)]) ; "modulo")]
+	#[test_case("&&=" => Ok(vec![Token::AndAndEq.spanned(0..3)]) ; "logical and equals")]
+	#[test_case("&=" => Ok(vec![Token::AndEq.spanned(0..2)]) ; "bitwise and equals")]
+	#[test_case("&" => Ok(vec![Token::And.spanned(0..1)]) ; "bitwise and")]
+	#[test_case("|>" => Ok(vec![Token::Triangle.spanned(0..2)]) ; "pipeline")]
+	#[test_case("||=" => Ok(vec![Token::PipePipeEq.spanned(0..3)]) ; "logical or equals")]
+	#[test_case("|=" => Ok(vec![Token::PipeEq.spanned(0..2)]) ; "bitwise or equals")]
+	#[test_case("|" => Ok(vec![Token::Pipe.spanned(0..1)]) ; "bitwise or")]
+	#[test_case("^=" => Ok(vec![Token::CaretEq.spanned(0..2)]) ; "xor equals")]
+	#[test_case("^" => Ok(vec![Token::Caret.spanned(0..1)]) ; "xor")]
+	#[test_case("~=" => Ok(vec![Token::TildeEq.spanned(0..2)]) ; "bitwise not equals")]
+	#[test_case("~" => Ok(vec![Token::Tilde.spanned(0..1)]) ; "bitwise not")]
+	#[test_case("<<=" => Ok(vec![Token::LtLtEq.spanned(0..3)]) ; "left shift equals")]
+	#[test_case(">>=" => Ok(vec![Token::GtGtEq.spanned(0..3)]) ; "right shift equals")]
+	#[test_case("<=" => Ok(vec![Token::LtEq.spanned(0..2)]) ; "less than or equal")]
+	#[test_case(">=" => Ok(vec![Token::GtEq.spanned(0..2)]) ; "greater than or equal")]
+	// delimiters
+	#[test_case("()" => Ok(vec![Token::Parens(vec![]).spanned(0..2)]) ; "empty parens")]
+	#[test_case("[]" => Ok(vec![Token::Brackets(vec![]).spanned(0..2)]) ; "empty brackets")]
+	#[test_case("{}" => Ok(vec![Token::Braces(vec![]).spanned(0..2)]) ; "empty braces")]
+	#[test_case("#()" => Ok(vec![Token::Tuple(vec![]).spanned(0..3)]) ; "empty tuple")]
+	#[test_case("#[]" => Ok(vec![Token::List(vec![]).spanned(0..3)]) ; "empty list")]
+	#[test_case("#{}" => Ok(vec![Token::Map(vec![]).spanned(0..3)]) ; "empty map")]
+	#[test_case("(a, b)" => Ok(vec![Token::Parens(vec![
+			Token::Identifier("a".into()).spanned(1..2),
+			Token::Comma.spanned(2..3),
+			Token::Identifier("b".into()).spanned(4..5),
+		]).spanned(0..6)]) ; "parens with items")]
+	#[test_case("[1, 2, 3]" => Ok(vec![Token::Brackets(vec![
+			Token::DecimalInt(1).spanned(1..2),
+			Token::Comma.spanned(2..3),
+			Token::DecimalInt(2).spanned(4..5),
+			Token::Comma.spanned(5..6),
+			Token::DecimalInt(3).spanned(7..8),
+		]).spanned(0..9)]) ; "brackets with items")]
+	#[test_case("{a: 1, b: 2}" => Ok(vec![Token::Braces(vec![
+			Token::Identifier("a".into()).spanned(1..2),
+			Token::Colon.spanned(2..3),
+			Token::DecimalInt(1).spanned(4..5),
+			Token::Comma.spanned(5..6),
+			Token::Identifier("b".into()).spanned(7..8),
+			Token::Colon.spanned(8..9),
+			Token::DecimalInt(2).spanned(10..11),
+		]).spanned(0..12)]) ; "braces with key-value pairs")]
+	#[test_case("{\n\t\n}" => Ok(vec![Token::Braces(vec![]).spanned(0..5)]) ; "braces with whitespace")]
+	// comments
+	#[test_case("1// This is a comment" => Ok(vec![Token::DecimalInt(1).spanned(0..1)]) ; "single line comment")]
+	// strings
+	#[test_case(r#""Hello, world!""# => Ok(vec![Token::String(vec![
+			Token::StringText(EcoString::from("Hello, world!")).spanned(1..14),
+    ]).spanned(0..15)]) ; "simple string")]
+	#[test_case(r#""Hello\nWorld""# => Ok(vec![Token::String(vec![
+			Token::StringText(EcoString::from("Hello")).spanned(1..6),
+			Token::StringEscape(StringEscape::Newline).spanned(6..8),
+			Token::StringText(EcoString::from("World")).spanned(8..13),
+    ]).spanned(0..14)]) ; "string with escape sequence")]
+	#[test_case(r#""Value: ${42}""# => Ok(vec![Token::String(vec![
+			Token::StringText(EcoString::from("Value: ")).spanned(1..8),
+			Token::StringInterpolation(vec![Token::DecimalInt(42).spanned(10..12)]).spanned(8..13),
+    ]).spanned(0..14)]) ; "string with interpolation")]
+	#[test_case(r#""Hello, $world!""# => Ok(vec![Token::String(vec![
+			Token::StringText(EcoString::from("Hello, $world!")).spanned(1..15),
+    ]).spanned(0..16)]) ; "string with dollar sign")]
+	#[test_case(r#""Escaped \${not interpolation}""# => Ok(vec![Token::String(vec![
+			Token::StringText(EcoString::from("Escaped ")).spanned(1..9),
+			Token::StringEscape(StringEscape::Interpolation).spanned(9..12),
+			Token::StringText(EcoString::from("not interpolation}")).spanned(12..30),
+    ]).spanned(0..31)]) ; "string with escaped interpolation")]
+	#[test_case(r#""Unicode: \u0048\u0065\u006C\u006C\u006F""# => Ok(vec![Token::String(vec![
+			Token::StringText(EcoString::from("Unicode: ")).spanned(1..10),
+			Token::StringEscape(StringEscape::Unicode('H')).spanned(10..16),
+			Token::StringEscape(StringEscape::Unicode('e')).spanned(16..22),
+			Token::StringEscape(StringEscape::Unicode('l')).spanned(22..28),
+			Token::StringEscape(StringEscape::Unicode('l')).spanned(28..34),
+			Token::StringEscape(StringEscape::Unicode('o')).spanned(34..40),
+		]).spanned(0..41)]) ; "string with unicode escapes")]
+	#[test_case(r#""Value: ${1 + "${2 + 3}"}""# => Ok(vec![Token::String(vec![
+			Token::StringText(EcoString::from("Value: ")).spanned(1..8),
+			Token::StringInterpolation(vec![
+				Token::DecimalInt(1).spanned(10..11),
+				Token::Plus.spanned(12..13),
+				Token::String(vec![
+					Token::StringInterpolation(vec![
+						Token::DecimalInt(2).spanned(17..18),
+						Token::Plus.spanned(19..20),
+						Token::DecimalInt(3).spanned(21..22),
+					]).spanned(15..23),
+				]).spanned(14..24),
+			]).spanned(8..25),
+    ]).spanned(0..26)]) ; "nested string interpolation")]
+	// invalid chars
+	#[test_case("''" => matches Err(_) ; "empty char")]
+	#[test_case("'ab'" => matches Err(_) ; "char too long")]
+	#[test_case("'\\'" => matches Err(_) ; "incomplete escape")]
+	#[test_case(r"'\u110000'" => matches Err(_) ; "invalid unicode")]
+	// invalid strings
+	#[test_case(r#""Hello"#  => matches Err(_) ; "unclosed string")]
+	#[test_case(r#""${1"#   => matches Err(_) ; "unclosed interpolation")]
+	#[test_case(r#""\x""#   => matches Err(_) ; "invalid escape sequence")]
+	// invalid numbers
+	#[test_case("1e" => matches Err(_) ; "incomplete exponent")]
+	#[test_case("1e+" => matches Err(_) ; "incomplete signed exponent")]
+	#[test_case("1ea" => matches Err(_) ; "invalid exponent")]
+	#[test_case("0b2" => matches Err(_) ; "invalid binary digit")]
+	#[test_case("0o8" => matches Err(_) ; "invalid octal digit")]
+	#[test_case("0xg" => matches Err(_) ; "invalid hex digit")]
+	#[test_case("1_" => matches Err(_) ; "trailing underscore")]
+	#[test_case("0x_" => matches Err(_) ; "trailing underscore in hex")]
+	#[test_case("0b_" => matches Err(_) ; "trailing underscore in binary")]
+	#[test_case("0o_" => matches Err(_) ; "trailing underscore in octal")]
+	#[test_case("0b" => matches Err(_) ; "incomplete binary")]
+	#[test_case("0o" => matches Err(_) ; "incomplete octal")]
+	#[test_case("0x" => matches Err(_) ; "incomplete hex")]
+	#[test_case("0b1_2" => matches Err(_) ; "invalid binary digit with separator")]
+	#[test_case("0o7_8" => matches Err(_) ; "invalid octal digit with separator")]
+	#[test_case("0xF_FG" => matches Err(_) ; "invalid hex digit with separator")]
+	fn test_lexer(input: &str) -> Result<Vec<Spanned<Token>>, Vec<Rich<'_, char, SimpleSpan>>> {
+		lexer().parse(input).into_result()
+	}
+}

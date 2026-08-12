@@ -1,0 +1,248 @@
+external(atan2) func complex_atan2(y: float, x: float): float
+external(power_domain_error) func complex_power_domain_error(): never
+
+public struct Complex(real: float, imaginary: float) {
+  namespace func new(real: float, imaginary: float): Complex =
+    Complex(real = real, imaginary = imaginary)
+
+  func conjugate() = Complex(real = this.real, imaginary = -this.imaginary)
+
+  func abs() = complex_log_magnitude(this).exp()
+
+  impl Plus<Other = Complex, Output = Complex> {
+    func plus(other: Complex) = Complex(
+      real = this.real + other.real,
+      imaginary = this.imaginary + other.imaginary,
+    )
+  }
+
+  impl Minus<Other = Complex, Output = Complex> {
+    func minus(other: Complex) = Complex(
+      real = this.real - other.real,
+      imaginary = this.imaginary - other.imaginary,
+    )
+  }
+  
+  impl Times<Other = Complex, Output = Complex> {
+    func times(other: Complex) = Complex(
+      real = this.real * other.real - this.imaginary * other.imaginary,
+      imaginary = this.real * other.imaginary + this.imaginary * other.real,
+    )
+  }
+
+  impl Divide<Other = Complex, Output = Complex> {
+    func divide(other: Complex) = {
+      let divisor = other.real * other.real + other.imaginary * other.imaginary
+
+      Complex(
+        real = (this.real * other.real + this.imaginary * other.imaginary) / divisor,
+        imaginary = (this.imaginary * other.real - this.real * other.imaginary) / divisor
+      )
+    }
+  }
+  
+  impl Negate<Output = Complex> {
+    func negate() = Complex(
+      real = -this.real,
+      imaginary = -this.imaginary
+    )
+  }
+
+  impl Display {
+    func display() = if (this.real == 0 && this.imaginary == 0) {
+      "0"
+    } else if (this.imaginary == 0) {
+      "${this.real}"
+    } else if (this.real == 0) {
+      "${this.imaginary}i"
+    } else if (this.imaginary.sign() == -1) {
+      "${this.real}${this.imaginary}i"
+    } else {
+      "${this.real}+${this.imaginary}i"
+    }
+  }
+}
+
+func complex_one(): Complex = Complex(real = 1.0, imaginary = 0.0)
+
+func complex_zero(): Complex = Complex(real = 0.0, imaginary = 0.0)
+
+func complex_is_integral(value: float): boolean = value % 1.0 == 0.0
+
+// Scale before squaring so finite values near the ends of the IEEE range do
+// not overflow or underflow merely while their logarithmic magnitude is found.
+func complex_log_magnitude(value: Complex): float = {
+  let real = value.real.abs()
+  let imaginary = value.imaginary.abs()
+  let high = if (real > imaginary) { real } else { imaginary }
+  let low = if (real > imaginary) { imaginary } else { real }
+  if (high == 0.0 || high == 1.0 / 0.0) { high.ln() }
+  else {
+    let ratio = low / high
+    high.ln() + (1.0 + ratio * ratio).ln() / 2.0
+  }
+}
+
+// Smith's scaled reciprocal avoids forming real² + imaginary². In particular,
+// finite huge values retain finite reciprocals and a single infinite component
+// maps to signed zero instead of NaN.
+func complex_reciprocal(value: Complex): Complex = {
+  if (value.real.abs() >= value.imaginary.abs()) {
+    let ratio = value.imaginary / value.real
+    let denominator = value.real + value.imaginary * ratio
+    Complex(real = 1.0 / denominator, imaginary = -ratio / denominator)
+  } else {
+    let ratio = value.real / value.imaginary
+    let denominator = value.imaginary + value.real * ratio
+    Complex(real = ratio / denominator, imaginary = -1.0 / denominator)
+  }
+}
+
+func complex_power_uint(base: Complex, exponent: uint): Complex = {
+  if (exponent == 1) { return base }
+  complex_power_uint_state(complex_one(), base, exponent)
+}
+
+func complex_power_uint_state(result: Complex, factor: Complex, remaining: uint): Complex =
+  if (remaining == 0u) result else {
+    let next_remaining = (remaining / 2u) as uint
+    complex_power_uint_state(
+      if (remaining % 2u == 1u) result * factor else result,
+      if (next_remaining > 0u) factor * factor else factor,
+      next_remaining,
+    )
+  }
+
+// Float magnitudes stay floats while the integral fast path halves them. This
+// avoids a saturating float-to-int cast and covers every finite integral IEEE
+// value represented by Nymph. Ordered identity checks also accept an exact
+// integer payload routed through the shared JavaScript overload slot.
+func complex_power_integral_float(base: Complex, exponent: float): Complex = {
+  if (exponent >= 1.0 && exponent <= 1.0) { return base }
+  if (exponent >= -1.0 && exponent <= -1.0) { return complex_reciprocal(base) }
+  let negative = exponent < 0.0
+  complex_power_float_state(
+    complex_one(),
+    if (negative) complex_reciprocal(base) else base,
+    if (negative) -exponent else exponent,
+  )
+}
+
+func complex_power_float_state(result: Complex, factor: Complex, remaining: float): Complex =
+  if (remaining <= 0.0) result else {
+    let next_remaining = (remaining - (remaining % 2.0)) / 2.0
+    complex_power_float_state(
+      if (remaining % 2.0 == 1.0) result * factor else result,
+      if (next_remaining > 0.0) factor * factor else factor,
+      next_remaining,
+    )
+  }
+
+func real_power_integral_float(base: float, exponent: float): float = {
+  let negative = exponent < 0.0
+  let result = real_power_float_state(1.0, base, if (negative) -exponent else exponent)
+  if (negative) { 1.0 / result } else { result }
+}
+
+func real_power_float_state(result: float, factor: float, remaining: float): float =
+  if (remaining <= 0.0) result else {
+    let next_remaining = (remaining - (remaining % 2.0)) / 2.0
+    real_power_float_state(
+      if (remaining % 2.0 == 1.0) result * factor else result,
+      if (next_remaining > 0.0) factor * factor else factor,
+      next_remaining,
+    )
+  }
+
+func complex_log(value: Complex): Complex = Complex(
+  real = complex_log_magnitude(value),
+  imaginary = complex_atan2(value.imaginary, value.real),
+)
+
+func complex_exp(value: Complex): Complex = {
+  let magnitude = value.real.exp()
+  Complex(
+    real = magnitude * value.imaginary.cos(),
+    imaginary = magnitude * value.imaginary.sin(),
+  )
+}
+
+func complex_power_float(base: Complex, exponent: float): Complex = {
+  if (exponent == 0.0) { complex_one() }
+  else if (base.real == 0.0 && base.imaginary == 0.0 && exponent < 0.0) {
+    complex_power_domain_error()
+  }
+  else if (complex_is_integral(exponent)) {
+    complex_power_integral_float(base, exponent)
+  }
+  else if (base.real == 0.0 && base.imaginary == 0.0) {
+    if (exponent > 0.0) { complex_zero() }
+    else {
+      let logarithm = complex_log(base)
+      complex_exp(Complex(
+        real = exponent * logarithm.real,
+        imaginary = exponent * logarithm.imaginary,
+      ))
+    }
+  } else if (base.imaginary == 0.0 && base.real >= 0.0 && exponent == exponent) {
+    let result = real_power_float(base.real, exponent)
+    if (exponent - exponent == 0.0) {
+      Complex(real = result.real, imaginary = exponent * base.imaginary)
+    } else { result }
+  } else {
+    let logarithm = complex_log(base)
+    complex_exp(Complex(
+      real = exponent * logarithm.real,
+      imaginary = exponent * logarithm.imaginary,
+    ))
+  }
+}
+
+func real_power_float(base: float, exponent: float): Complex = {
+  if (exponent == 0.0) { complex_one() }
+  else if (base == 0.0) {
+    if (exponent < 0.0) { complex_power_domain_error() }
+    else if (complex_is_integral(exponent)) {
+      // Returning the original zero for odd powers preserves its IEEE sign;
+      // even powers produce canonical positive zero.
+      Complex(real = if (exponent % 2.0 == 1.0) { base } else { 0.0 }, imaginary = 0.0)
+    }
+    else if (exponent > 0.0) { complex_zero() }
+    else { complex_power_float(Complex(real = base, imaginary = 0.0), exponent) }
+  } else if (complex_is_integral(exponent)) {
+    Complex(real = real_power_integral_float(base, exponent), imaginary = 0.0)
+  } else if (base > 0.0) {
+    Complex(real = (exponent * base.ln()).exp(), imaginary = 0.0)
+  } else {
+    complex_power_float(Complex(real = base, imaginary = 0.0), exponent)
+  }
+}
+
+impl Power<Other = float, Output = Complex> for int {
+  func power(other: float): Complex = real_power_float(this as float, other)
+}
+
+impl Power<Other = float, Output = Complex> for uint {
+  func power(other: float): Complex = real_power_float(this as float, other)
+}
+
+impl Power<Other = float, Output = Complex> for float {
+  func power(other: float): Complex = real_power_float(this, other)
+}
+
+impl Power<Other = uint, Output = Complex> for Complex {
+  func power(other: uint): Complex = complex_power_uint(this, other)
+}
+
+impl Power<Other = int, Output = Complex> for Complex {
+  func power(other: int): Complex = if (other < 0) {
+    if (this.real == 0.0 && this.imaginary == 0.0) { complex_power_domain_error() }
+    complex_power_uint(complex_reciprocal(this), ((-(other + 1)) as uint) + 1u)
+  } else {
+    complex_power_uint(this, other as uint)
+  }
+}
+
+impl Power<Other = float, Output = Complex> for Complex {
+  func power(other: float): Complex = complex_power_float(this, other)
+}

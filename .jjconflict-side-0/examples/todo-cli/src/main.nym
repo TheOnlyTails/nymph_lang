@@ -1,0 +1,88 @@
+import std/io with (println)
+
+/// One todo item.
+struct Task(id: int, title: string, done: boolean)
+
+/// The intent parsed out of the command line.
+enum Command {
+  Add(title: string),
+  Complete(id: int),
+  List,
+  Help,
+}
+
+/// Turn raw arguments into a `Command`, or explain why we couldn't. List patterns
+/// (`#["add", ...words]`) match the subcommand and split off the rest.
+func parse(argv: #[string]): Result<Command, string> = match (argv) {
+  #["add", ...words] -> if (words.length() == 0) {
+    Error(error = "`add` needs a title")
+  } else {
+    Ok(value = Command.Add(title = words.join(" ")))
+  },
+  #["done", "1"] -> Ok(value = Command.Complete(id = 1)),
+  #["done", id] -> Error(error = "`done` needs a numeric id, got `${id}`"),
+  #["list"] -> Ok(value = Command.List),
+  #["help"] -> Ok(value = Command.Help),
+  #[] -> Ok(value = Command.Help),
+  #[other, ...] -> Error(error = "unknown command `${other}` — try `help`"),
+  _ -> Error(error = "invalid arguments — try `help`"),
+}
+
+/// The app's state. Updates return a new value; prior stores remain unchanged.
+struct Store(tasks: #[Task], next_id: int)
+
+impl Store {
+  namespace func empty(): Store = Store(tasks = #[], next_id = 1)
+
+  func add(title: string): Store = {
+    let id = this.next_id
+    Store(
+      tasks = this.tasks.appended(Task(id = id, title = title, done = false)),
+      next_id = id + 1,
+    )
+  }
+
+  /// Mark a task done by returning a rebuilt store.
+  func complete(id: int): Result<Store, string> =
+    if (this.tasks.any((task) -> task.id == id)) {
+      Ok(value = Store(
+        tasks = this.tasks.iter().map((task) -> if (task.id == id) {
+          Task(...task, done = true)
+        } else {
+          task
+        }).to_list(),
+        next_id = this.next_id,
+      ))
+    } else {
+      Error(error = "no task with id ${id}")
+    }
+
+  func render(): string =
+    if (this.tasks.length() == 0) {
+      "no tasks yet — add one with `todo add <title>`"
+    } else {
+      this.tasks
+        .iter()
+        .map((task) -> {
+          let mark = if (task.done) { "[x]" } else { "[ ]" }
+          "${mark} #${task.id} ${task.title}"
+        })
+        .to_list()
+        .join("\n")
+    }
+}
+
+func usage(): string =
+  "todo — a tiny task manager
+
+  todo add <title>   add a task
+  todo done <id>     mark a task complete
+  todo list          show all tasks
+  todo help          show this message"
+
+func main(): void = {
+  let empty = Store.empty()
+  let added = empty.add("write the compiler")
+  let completed = added.complete(1) ?? added
+  println(completed.render())
+}

@@ -1,0 +1,14 @@
+import std/io with (println)
+enum Method { Get, Post }
+
+func route(method: Method, path: string): string = match (#(method, path)) {
+  #(Method.Get, "/health") -> "200 ok",
+  #(Method.Get, "/") -> "200 welcome",
+  _ -> "404 not found",
+}
+
+/// A bounded service smoke: exercise requests and terminate deterministically.
+func main(): void = {
+  println(route(Method.Get, "/health"))
+  println(route(Method.Post, "/missing"))
+}

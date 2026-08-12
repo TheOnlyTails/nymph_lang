@@ -1,0 +1,704 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>Checked effects contract prototype — issue 85</title>
+		<style>
+			:root {
+				color-scheme: light;
+				--ink: #172033;
+				--muted: #5f6b7a;
+				--line: #d9e0e8;
+				--paper: #fff;
+				--wash: #f5f7fa;
+				--accent: #5b4ce3;
+				--ok: #19764a;
+				--bad: #b42318;
+			}
+			* {
+				box-sizing: border-box;
+			}
+			body {
+				margin: 0;
+				background: var(--wash);
+				color: var(--ink);
+				font:
+					15px/1.5 ui-sans-serif,
+					system-ui,
+					sans-serif;
+			}
+			main {
+				width: min(1120px, calc(100% - 32px));
+				margin: 36px auto 64px;
+			}
+			h1,
+			h2,
+			h3 {
+				line-height: 1.18;
+			}
+			h1 {
+				margin-bottom: 8px;
+				font-size: clamp(28px, 5vw, 44px);
+				letter-spacing: -0.03em;
+			}
+			h2 {
+				margin-top: 0;
+				font-size: 20px;
+			}
+			p {
+				max-width: 82ch;
+			}
+			.lede {
+				color: var(--muted);
+				font-size: 17px;
+			}
+			.banner,
+			.panel {
+				border: 1px solid var(--line);
+				border-radius: 14px;
+				background: var(--paper);
+				padding: 20px;
+				box-shadow: 0 5px 20px rgb(23 32 51 / 5%);
+			}
+			.banner {
+				margin: 24px 0;
+				border-left: 5px solid var(--accent);
+			}
+			.grid {
+				display: grid;
+				grid-template-columns: 1.15fr 0.85fr;
+				gap: 18px;
+				margin: 18px 0;
+			}
+			@media (max-width: 800px) {
+				.grid {
+					grid-template-columns: 1fr;
+				}
+			}
+			.state-grid {
+				display: grid;
+				grid-template-columns: repeat(2, minmax(0, 1fr));
+				gap: 12px;
+			}
+			@media (max-width: 560px) {
+				.state-grid {
+					grid-template-columns: 1fr;
+				}
+			}
+			.fact {
+				padding: 12px;
+				border-radius: 10px;
+				background: var(--wash);
+			}
+			.fact strong {
+				display: block;
+				color: var(--muted);
+				font-size: 12px;
+				letter-spacing: 0.06em;
+				text-transform: uppercase;
+			}
+			code,
+			pre {
+				font:
+					13px/1.45 ui-monospace,
+					SFMono-Regular,
+					Consolas,
+					monospace;
+			}
+			code {
+				color: #39308d;
+			}
+			pre {
+				margin: 8px 0 0;
+				white-space: pre-wrap;
+			}
+			.verdict {
+				margin-top: 12px;
+				padding: 12px;
+				border-radius: 10px;
+				font-weight: 700;
+			}
+			.verdict.ok {
+				color: var(--ok);
+				background: #eaf8f0;
+			}
+			.verdict.bad {
+				color: var(--bad);
+				background: #fff0ee;
+			}
+			.buttons {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 8px;
+			}
+			button {
+				border: 1px solid var(--line);
+				border-radius: 9px;
+				background: var(--paper);
+				color: var(--ink);
+				padding: 9px 12px;
+				cursor: pointer;
+				font: inherit;
+			}
+			button:hover {
+				border-color: var(--accent);
+			}
+			button.primary {
+				border-color: var(--accent);
+				background: var(--accent);
+				color: white;
+			}
+			button:disabled {
+				cursor: default;
+				opacity: 0.45;
+			}
+			.controls section + section {
+				margin-top: 18px;
+				padding-top: 18px;
+				border-top: 1px solid var(--line);
+			}
+			.tabs {
+				display: flex;
+				gap: 8px;
+				overflow-x: auto;
+				margin-bottom: 14px;
+			}
+			.tabs button[aria-selected="true"] {
+				border-color: var(--accent);
+				color: var(--accent);
+				font-weight: 700;
+			}
+			.walkthrough {
+				min-height: 170px;
+			}
+			.step {
+				margin-top: 12px;
+			}
+			.step.done {
+				text-decoration: line-through;
+				color: var(--muted);
+			}
+			.trace {
+				max-height: 300px;
+				overflow: auto;
+			}
+			.trace li {
+				margin: 7px 0;
+			}
+			.options {
+				display: grid;
+				gap: 12px;
+			}
+			.option {
+				border: 1px solid var(--line);
+				border-radius: 10px;
+				padding: 14px;
+			}
+			.option.recommended {
+				border-color: var(--accent);
+				background: #f5f3ff;
+			}
+			.badge {
+				display: inline-block;
+				border-radius: 99px;
+				background: var(--accent);
+				color: white;
+				padding: 2px 8px;
+				font-size: 12px;
+				font-weight: 700;
+			}
+			.frontier li {
+				margin: 9px 0;
+			}
+			footer {
+				color: var(--muted);
+				margin-top: 24px;
+			}
+		</style>
+	</head>
+	<body>
+		<main>
+			<h1>Checked effects contract prototype</h1>
+			<p class="lede">
+				A throwaway model for one question: can Nymph represent nominal effect sets, infer effect
+				generics, enforce closed upper bounds, preserve narrower implementations, and delay
+				iterator/task/resource effects without coupling them to ordinary type unification?
+			</p>
+			<div class="banner">
+				<strong>Prototype assumption</strong>
+				<p>
+					This page exercises a separate effect lattice. A row is a canonical set of nominal labels
+					plus rigid effect parameters; call-site holes are solver variables with subset
+					constraints. The solver chooses the least set satisfying all lower bounds, then checks
+					every closed upper bound.
+				</p>
+				<p>
+					Expected failures are still <code>Result</code> values. Effects are static labels, not
+					exceptions, handlers, or capabilities.
+				</p>
+			</div>
+
+			<div class="grid">
+				<section class="panel" aria-labelledby="state-title">
+					<h2 id="state-title">Current checker state</h2>
+					<div id="state"></div>
+				</section>
+				<section class="panel controls" aria-labelledby="play-title">
+					<h2 id="play-title">Free play</h2>
+					<section>
+						<h3>Function contract</h3>
+						<div class="buttons" id="contracts"></div>
+					</section>
+					<section>
+						<h3>Immediate operations</h3>
+						<div class="buttons" id="immediate"></div>
+					</section>
+					<section>
+						<h3>Generic, interface, and delayed effects</h3>
+						<div class="buttons" id="operations"></div>
+					</section>
+					<section><button id="reset">Reset everything</button></section>
+				</section>
+			</div>
+
+			<section class="panel" aria-labelledby="walkthrough-title">
+				<h2 id="walkthrough-title">Guided walkthroughs</h2>
+				<div class="tabs" id="tabs" role="tablist"></div>
+				<div class="walkthrough" id="walkthrough"></div>
+			</section>
+
+			<div class="grid">
+				<section class="panel">
+					<h2>Decision options</h2>
+					<div class="options">
+						<div class="option">
+							<strong>A. Put effect variables into HM type unification</strong>
+							<p>
+								One solver, but equality-oriented unification fights the required subset relation
+								and function-effect covariance. It also expands the blast radius of ordinary type
+								inference.
+							</p>
+						</div>
+						<div class="option recommended">
+							<span class="badge">Recommended</span>
+							<strong>B. Canonical rows + a separate subset solver</strong>
+							<p>
+								Keep value types and effect rows adjacent in callable/nominal signatures, but solve
+								effects through join and subset constraints. Stable interfaces serialize only
+								resolved labels and rigid parameters; inference variables never escape a body or
+								call.
+							</p>
+						</div>
+						<div class="option">
+							<strong>C. Collect concrete body effects after type checking</strong>
+							<p>
+								Cheap for first-order calls, but cannot infer <code>!E</code> through higher-order
+								arguments, represent latent effects, or prove implementation narrowing. It would
+								need replacement rather than extension.
+							</p>
+						</div>
+					</div>
+				</section>
+				<section class="panel frontier">
+					<h2>Human decision frontier</h2>
+					<p>
+						The governing docs settle the language behavior. Issue 85 still needs confirmation of
+						the checker contract:
+					</p>
+					<ol>
+						<li><strong>Representation:</strong> choose B, or accept the coupling/risk of A.</li>
+						<li>
+							<strong>Inference:</strong> infer each call-site effect variable as the least solution
+							to subset constraints; reject only when that solution exceeds a closed upper bound.
+						</li>
+						<li>
+							<strong><code>known + !_</code>:</strong> preserve explicitly named effects as
+							conservative API promises, then union inferred body effects; display the inferred
+							remainder only diagnostically.
+						</li>
+						<li>
+							<strong>Placement:</strong> store a row on every callable result and in
+							effect-parameterized nominal arguments such as <code>Task&lt;T + !E&gt;</code>,
+							<code>Iterator&lt;T + !E&gt;</code>, and <code>Close&lt;!E&gt;</code>; do not add
+							special task/iterator/resource effect channels.
+						</li>
+					</ol>
+				</section>
+			</div>
+			<footer>
+				PROTOTYPE — issue 85. This is a planning artifact, not compiler or language-reference
+				implementation.
+			</footer>
+		</main>
+
+		<script>
+			// Pure prototype module. No DOM access belongs in this object.
+			const EffectModel = (() => {
+				const canonical = (values) => [...new Set(values)].sort();
+				const union = (...rows) => canonical(rows.flat());
+				const subset = (left, right) => left.every((effect) => right.includes(effect));
+				const difference = (left, right) => left.filter((effect) => !right.includes(effect));
+				const format = (row) =>
+					row.length ? row.map((effect) => `!${effect}`).join(" + ") : "!()";
+
+				const contracts = {
+					pure: { label: "Closed pure", known: [], infer: false },
+					database: { label: "Closed !Database", known: ["Database"], infer: false },
+					infer: { label: "Infer !_", known: [], infer: true },
+					knownInfer: { label: "Keep !Database + infer !_", known: ["Database"], infer: true },
+				};
+
+				const initial = () => ({
+					contract: "infer",
+					observed: [],
+					constraints: [],
+					genericLower: [],
+					genericUpper: null,
+					trace: ["Started with an inferred function effect row."],
+				});
+
+				const observe = (state, effects, explanation) => ({
+					...state,
+					observed: union(state.observed, effects),
+					trace: [...state.trace, explanation],
+				});
+
+				function reduce(state, action) {
+					switch (action.type) {
+						case "reset":
+							return initial();
+						case "contract":
+							return {
+								...initial(),
+								contract: action.name,
+								trace: [`Selected ${contracts[action.name].label}.`],
+							};
+						case "effect":
+							return observe(
+								state,
+								[action.effect],
+								`${action.origin} performs !${action.effect}.`,
+							);
+						case "callback": {
+							const lower = union(state.genericLower, action.effects);
+							return observe(
+								{
+									...state,
+									genericLower: lower,
+									constraints: [...state.constraints, `${format(action.effects)} ⊆ !E`],
+								},
+								action.effects,
+								`A callback adds a lower bound; least solution is now !E = ${format(lower)}.`,
+							);
+						}
+						case "genericUpper":
+							return {
+								...state,
+								genericUpper: canonical(action.effects),
+								constraints: [...state.constraints, `!E ⊆ ${format(action.effects)}`],
+								trace: [
+									...state.trace,
+									`Closed contextual upper bound set to ${format(action.effects)}.`,
+								],
+							};
+						case "concreteCall":
+							return observe(
+								state,
+								["Database"],
+								"Concrete Store implementation call charges its narrower !Database row.",
+							);
+						case "interfaceCall":
+							return observe(
+								state,
+								["Database", "Telemetry"],
+								"Call through the Store interface charges its static !Database + !Telemetry contract.",
+							);
+						case "makeIterator":
+							return {
+								...state,
+								trace: [
+									...state.trace,
+									"Created Iterator<int + !Io>; callback remains latent, so no effect is charged.",
+								],
+							};
+						case "consumeIterator":
+							return observe(
+								state,
+								["Io"],
+								"Consuming Iterator<int + !Io> charges its latent !Io row.",
+							);
+						case "makeTask":
+							return {
+								...state,
+								trace: [
+									...state.trace,
+									"Created cold Task<int + !Network>; its recipe is not driven, so no effect is charged.",
+								],
+							};
+						case "driveTask":
+							return observe(
+								state,
+								["Network"],
+								"Task.await or Task.spawn drives a recipe and charges !Network.",
+							);
+						case "awaitHandle":
+							return {
+								...state,
+								trace: [
+									...state.trace,
+									"Handle.await observes an execution and is pure; no application effect is repeated.",
+								],
+							};
+						case "registerClose":
+							return {
+								...state,
+								trace: [
+									...state.trace,
+									"Registered a value satisfying Close<!Cleanup>; registration itself does not run cleanup.",
+								],
+							};
+						case "exitScope":
+							return observe(
+								state,
+								["Cleanup"],
+								"Lexical exit invokes Close<!Cleanup> and charges cleanup effects on the enclosing scope.",
+							);
+						default:
+							return state;
+					}
+				}
+
+				function derive(state) {
+					const contract = contracts[state.contract];
+					const declared = contract.infer ? union(contract.known, state.observed) : contract.known;
+					const bodyAllowed = contract.infer || subset(state.observed, contract.known);
+					const genericAllowed =
+						state.genericUpper === null || subset(state.genericLower, state.genericUpper);
+					const errors = [];
+					if (!bodyAllowed)
+						errors.push(
+							`${format(difference(state.observed, contract.known))} exceeds the closed function bound`,
+						);
+					if (!genericAllowed)
+						errors.push(
+							`${format(difference(state.genericLower, state.genericUpper))} exceeds !E's contextual upper bound`,
+						);
+					return {
+						contract,
+						declared,
+						remainder: contract.infer ? difference(state.observed, contract.known) : [],
+						generic: state.genericLower,
+						ok: errors.length === 0,
+						errors,
+					};
+				}
+
+				return { initial, reduce, derive, format, contracts };
+			})();
+
+			const actions = {
+				pure: { type: "contract", name: "pure" },
+				database: { type: "contract", name: "database" },
+				infer: { type: "contract", name: "infer" },
+				knownInfer: { type: "contract", name: "knownInfer" },
+				dbCall: { type: "effect", effect: "Database", origin: "query()" },
+				networkCall: { type: "effect", effect: "Network", origin: "fetch()" },
+				ioCallback: { type: "callback", effects: ["Io"] },
+				networkCallback: { type: "callback", effects: ["Network"] },
+				ioUpper: { type: "genericUpper", effects: ["Io"] },
+				concreteCall: { type: "concreteCall" },
+				interfaceCall: { type: "interfaceCall" },
+				makeIterator: { type: "makeIterator" },
+				consumeIterator: { type: "consumeIterator" },
+				makeTask: { type: "makeTask" },
+				driveTask: { type: "driveTask" },
+				awaitHandle: { type: "awaitHandle" },
+				registerClose: { type: "registerClose" },
+				exitScope: { type: "exitScope" },
+			};
+
+			const buttonGroups = {
+				contracts: [
+					["Closed pure", "pure"],
+					["Closed !Database", "database"],
+					["Infer !_", "infer"],
+					["!Database + !_", "knownInfer"],
+				],
+				immediate: [
+					["Call query (!Database)", "dbCall"],
+					["Call fetch (!Network)", "networkCall"],
+				],
+				operations: [
+					["Pass !Io callback", "ioCallback"],
+					["Pass !Network callback", "networkCallback"],
+					["Bound !E by !Io", "ioUpper"],
+					["Concrete Store call", "concreteCall"],
+					["Interface Store call", "interfaceCall"],
+					["Create iterator", "makeIterator"],
+					["Consume iterator", "consumeIterator"],
+					["Create task", "makeTask"],
+					["Await/spawn task", "driveTask"],
+					["Await handle", "awaitHandle"],
+					["Register Close", "registerClose"],
+					["Exit resource scope", "exitScope"],
+				],
+			};
+
+			const scenarios = [
+				{
+					name: "Closed bound",
+					description:
+						"A closed annotation is an upper bound, not an exact body effect. Database is accepted; Network is rejected.",
+					steps: [
+						["Choose closed !Database", "database"],
+						["Call the database", "dbCall"],
+						["Also call the network", "networkCall"],
+					],
+				},
+				{
+					name: "Generic least solution",
+					description:
+						"Each callback creates a subset constraint. The generic variable becomes the least union satisfying every lower bound.",
+					steps: [
+						["Start inferred", "infer"],
+						["Pass an !Io callback", "ioCallback"],
+						["Pass a !Network callback", "networkCallback"],
+						["Constrain !E to !Io", "ioUpper"],
+					],
+				},
+				{
+					name: "Static dispatch",
+					description:
+						"A concrete implementation may be narrower. The charged row follows the statically selected callable contract.",
+					steps: [
+						["Start inferred", "infer"],
+						["Call concrete Store", "concreteCall"],
+						["Call through Store interface", "interfaceCall"],
+					],
+				},
+				{
+					name: "Latent work",
+					description:
+						"Creating iterators and cold tasks is pure. Consuming or driving them charges the row; observing a handle stays pure.",
+					steps: [
+						["Create iterator", "makeIterator"],
+						["Consume iterator", "consumeIterator"],
+						["Create task", "makeTask"],
+						["Drive task", "driveTask"],
+						["Observe handle", "awaitHandle"],
+					],
+				},
+				{
+					name: "Managed cleanup",
+					description:
+						"Issue 84 makes Close effect-parameterized. Registration is management; cleanup effects enter the enclosing scope when lexical cleanup runs.",
+					steps: [
+						["Start inferred", "infer"],
+						["Register Close<!Cleanup>", "registerClose"],
+						["Exit lexical scope", "exitScope"],
+					],
+				},
+			];
+
+			let state = EffectModel.initial();
+			let activeScenario = 0;
+			let completedSteps = 0;
+
+			function dispatch(action) {
+				state = EffectModel.reduce(state, action);
+				render();
+			}
+
+			function makeButton(label, actionName, className = "") {
+				const button = document.createElement("button");
+				button.textContent = label;
+				button.className = className;
+				button.addEventListener("click", () => dispatch(actions[actionName]));
+				return button;
+			}
+
+			function renderState() {
+				const derived = EffectModel.derive(state);
+				const constraints = state.constraints.length ? state.constraints.join("\n") : "none";
+				const errors = derived.errors.length
+					? derived.errors.join("; ")
+					: "all subset constraints hold";
+				document.querySelector("#state").innerHTML = `
+		<div class="state-grid">
+			<div class="fact"><strong>Source contract</strong><code>${derived.contract.label}</code></div>
+			<div class="fact"><strong>Observed body row</strong><code>${EffectModel.format(state.observed)}</code></div>
+			<div class="fact"><strong>Exported / callable row</strong><code>${EffectModel.format(derived.declared)}</code></div>
+			<div class="fact"><strong>Inferred remainder</strong><code>${derived.contract.infer ? EffectModel.format(derived.remainder) : "not present"}</code></div>
+			<div class="fact"><strong>Least generic solution</strong><code>!E = ${EffectModel.format(derived.generic)}</code></div>
+			<div class="fact"><strong>Subset constraints</strong><pre>${constraints}</pre></div>
+		</div>
+		<div class="verdict ${derived.ok ? "ok" : "bad"}">${derived.ok ? "Accepted" : "Rejected"} — ${errors}</div>
+		<h3>Trace</h3><ol class="trace">${state.trace.map((item) => `<li>${item}</li>`).join("")}</ol>`;
+			}
+
+			function renderWalkthrough() {
+				const scenario = scenarios[activeScenario];
+				const target = document.querySelector("#walkthrough");
+				target.innerHTML = `<p>${scenario.description}</p>`;
+				scenario.steps.forEach(([label, actionName], index) => {
+					const row = document.createElement("div");
+					row.className = `step ${index < completedSteps ? "done" : ""}`;
+					const button = makeButton(
+						`${index + 1}. ${label}`,
+						actionName,
+						index === completedSteps ? "primary" : "",
+					);
+					button.disabled = index !== completedSteps;
+					button.addEventListener("click", () => {
+						completedSteps += 1;
+						renderWalkthrough();
+					});
+					row.append(button);
+					target.append(row);
+				});
+				if (completedSteps === scenario.steps.length) {
+					const done = document.createElement("p");
+					done.innerHTML =
+						"<strong>Walkthrough complete.</strong> Inspect the final checker state above.";
+					target.append(done);
+				}
+			}
+
+			function startScenario(index) {
+				activeScenario = index;
+				completedSteps = 0;
+				state = EffectModel.initial();
+				render();
+			}
+
+			function render() {
+				renderState();
+				document
+					.querySelectorAll("#tabs button")
+					.forEach((button, index) =>
+						button.setAttribute("aria-selected", index === activeScenario),
+					);
+				renderWalkthrough();
+			}
+
+			for (const [id, group] of Object.entries(buttonGroups)) {
+				const target = document.querySelector(`#${id}`);
+				group.forEach(([label, actionName]) => target.append(makeButton(label, actionName)));
+			}
+			scenarios.forEach((scenario, index) => {
+				const button = document.createElement("button");
+				button.textContent = scenario.name;
+				button.setAttribute("role", "tab");
+				button.addEventListener("click", () => startScenario(index));
+				document.querySelector("#tabs").append(button);
+			});
+			document.querySelector("#reset").addEventListener("click", () => {
+				state = EffectModel.initial();
+				completedSteps = 0;
+				render();
+			});
+			render();
+		</script>
+	</body>
+</html>

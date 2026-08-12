@@ -1,0 +1,130 @@
+import @/option with (Option)
+import @/ops with (Plus, Into, Contains)
+import @/collections/list
+
+impl string {
+  /// Returns the number of Unicode code points. Astral code points count once;
+  /// combining marks count separately.
+  external(length) func length(): uint
+  /// Returns the code point at zero-based code-point offset `i`, or `None` when
+  /// `i` is outside the string.
+  external(char_at) func char_at(i: uint): Option<char>
+  /// Returns the half-open code-point range `start..end`. Bounds beyond the end
+  /// are clamped and a reversed range is empty.
+  external(substring) func substring(start: uint, end: uint): string
+  /// Returns the first matching code-point offset, or `None` when not found.
+  external(index_of) func index_of(needle: string): Option<uint>
+  /// Returns the last matching code-point offset, or `None` when not found.
+  external(last_index_of) func last_index_of(needle: string): Option<uint>
+  func contains(needle: string): boolean = match (this.index_of(needle)) {
+    Some(_) -> true,
+    None -> false,
+  }
+  func starts_with(prefix: string): boolean = this.take(prefix.length()) == prefix
+  func ends_with(suffix: string): boolean =
+    if (suffix.length() > this.length()) false
+    else this.substring(this.length() - suffix.length(), this.length()) == suffix
+  external(to_upper) func to_upper(): string
+  external(to_lower) func to_lower(): string
+  external(trim) func trim(): string
+  external(trim_start) func trim_start(): string
+  external(trim_end) func trim_end(): string
+  func split(separator: string): #[string] =
+    if (separator.is_empty()) this.split_chars(0u, #[])
+    else this.split_remaining(separator, #[])
+
+  func split_chars(index: uint, parts: #[string]): #[string] =
+    if (index >= this.length()) parts
+    else this.split_chars(index + 1u, parts.appended("${this[index as int]}"))
+
+  func split_remaining(separator: string, parts: #[string]): #[string] =
+    match (this.index_of(separator)) {
+      Some(index) -> this.drop(index + separator.length()).split_remaining(
+        separator, parts.appended(this.take(index))),
+      None -> parts.appended(this),
+    }
+
+  func replace(from: string, to: string): string =
+    if (from.is_empty()) this.replace_between(to, 0u, to)
+    else this.replace_remaining(from, to, "")
+
+  func replace_between(to: string, index: uint, result: string): string =
+    if (index >= this.length()) result
+    else this.replace_between(to, index + 1u, result.concat("${this[index as int]}").concat(to))
+
+  func replace_remaining(from: string, to: string, result: string): string =
+    match (this.index_of(from)) {
+      Some(index) -> this.drop(index + from.length()).replace_remaining(
+        from, to, result.concat(this.take(index)).concat(to)),
+      None -> result.concat(this),
+    }
+  func replace_first(from: string, to: string): string = match (this.index_of(from)) {
+    Some(index) -> this.take(index).concat(to).concat(this.drop(index + from.length())),
+    None -> this,
+  }
+  func repeat(n: uint): string = if (n == 0u) "" else this.concat(this.repeat(n - 1u))
+  func chars(): #[char] = this.chars_from(0u, #[])
+
+  func chars_from(index: uint, result: #[char]): #[char] = match (this.char_at(index)) {
+    Some(value) -> this.chars_from(index + 1u, result.appended(value)),
+    None -> result,
+  }
+  external(concat) func concat(other: string): string
+  func concat_chars(other: #[char]): string = this.concat_from(other, 0u)
+
+  func concat_from(other: #[char], index: uint): string =
+    if (index >= other.length()) this
+    else this.concat("${other[index as int]}").concat_from(other, index + 1u)
+
+  func reversed(): string = this.reverse_from(this.length(), "")
+
+  func reverse_from(end: uint, result: string): string =
+    if (end == 0u) result
+    else this.reverse_from(end - 1u, result.concat(this.substring(end - 1u, end)))
+  /// Pads on the left to `length` Unicode code points.
+  func pad_start(length: uint, pad: char): string =
+    if (length > this.length()) "${pad}".repeat(length - this.length()).concat(this) else this
+  /// Pads on the right to `length` Unicode code points.
+  func pad_end(length: uint, pad: char): string =
+    if (length > this.length()) this.concat("${pad}".repeat(length - this.length())) else this
+
+  func is_empty() = this.length() == 0
+  func is_not_empty() = this.is_empty() == false
+
+  func is_blank() = this.trim().is_empty()
+
+  /// Returns the first Unicode code point, or `None` if empty.
+  func first(): Option<char> = this.char_at(0)
+
+  /// Returns the last Unicode code point, or `None` if empty.
+  func last(): Option<char> =
+    if (this.is_empty()) None else this.char_at(this.length() - 1)
+
+  /// Drops the first `n` Unicode code points.
+  func drop(n: uint): string = this.substring(n, this.length())
+
+  /// Returns only the first `n` Unicode code points.
+  func take(n: uint): string = this.substring(0, n)
+}
+
+impl Plus<Other = self, Output = self> for string {
+  external(concat) func plus(other: self): self
+}
+
+impl Plus<Other = #[char], Output = self> for string {
+  func plus(other: #[char]): self = this.concat_chars(other)
+}
+
+impl Contains<Item = string> for string {
+  func contains(item: string): boolean = match (this.index_of(item)) {
+    Some(_) -> true,
+    None -> false,
+  }
+}
+
+impl Contains<Item = char> for string {
+  func contains(item: char): boolean = match (this.index_of("${item}")) {
+    Some(_) -> true,
+    None -> false,
+  }
+}

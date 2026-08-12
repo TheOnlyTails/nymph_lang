@@ -1,0 +1,300 @@
+import @/option with (Option)
+import @/collections/list
+import @/ops with (Order)
+
+/// One immutable iterator step. `next` is the complete successor state, so a
+/// caller may save, replay, or branch from any pure iterator value.
+public enum Iteration<Item, Next> {
+  Done,
+  Yield(item: Item, next: Next),
+}
+
+public interface Iterator<Item + !E> {
+  func next(): Iteration<Item, self> + !E
+
+  func map<R + !F>(
+    f: (Item) -> R + !F,
+  ): Mapped<Item = Item, R = R, E = !E, F = !F, S = self> =
+    Mapped(source = this, f = f)
+
+  func filter<!F>(
+    predicate: (Item) -> boolean + !F,
+  ): Filtered<Item = Item, E = !E, F = !F, S = self> =
+    Filtered(source = this, predicate = predicate)
+
+  func take(n: uint): Take<Item = Item, E = !E, S = self> = Take(source = this, remaining = n)
+
+  func drop(n: uint): Drop<Item = Item, E = !E, S = self> = Drop(source = this, remaining = n)
+
+  func enumerate(): Enumerate<Item = Item, E = !E, S = self> = Enumerate(source = this, index = 0u)
+
+  func chain<!F, Other: Iterator<Item + !F>>(
+    other: Other,
+  ): Chain<Item = Item, E = !E, F = !F, A = self, B = Other> =
+    Chain(first = this, second = other, first_done = false)
+
+  func zip<OtherItem + !F, Other: Iterator<OtherItem + !F>>(
+    other: Other,
+  ): Zip<Left = Item, Right = OtherItem, E = !E, F = !F, A = self, B = Other> =
+    Zip(left = this, right = other)
+
+  /// Sorting is lazy: the source is drained only by the first `next` call.
+  /// Comparators are pure because their invocation order is algorithm-defined.
+  func sorted_by(compare: (Item, Item) -> Order): SortedBy<Item = Item, E = !E, S = self> =
+    SortedBy(source = this, compare = compare, items = Option.None, index = 0u)
+
+  func for_each<!F>(f: (Item) -> void + !F): void + !E + !F = match (this.next()) {
+    Yield(item, next) -> {
+      f(item)
+      next.for_each(f)
+    },
+    Done -> {},
+  }
+
+  func fold<Acc + !F>(initial: Acc, combine: (Acc, Item) -> Acc + !F): Acc + !E + !F =
+    match (this.next()) {
+      Yield(item, next) -> next.fold(combine(initial, item), combine),
+      Done -> initial,
+    }
+
+  func to_list(): #[Item] + !E = this.fold(#[], (items: #[Item], item) -> items.appended(item))
+
+  func count(): uint + !E = this.fold(0u, (count, _) -> count + 1u)
+
+  func any<!F>(predicate: (Item) -> boolean + !F): boolean + !E + !F =
+    match (this.next()) {
+      Yield(item, next) -> if (predicate(item)) true else next.any(predicate),
+      Done -> false,
+    }
+
+  func all<!F>(predicate: (Item) -> boolean + !F): boolean + !E + !F =
+    match (this.next()) {
+      Yield(item, next) -> if (predicate(item)) next.all(predicate) else false,
+      Done -> true,
+    }
+
+  func find<!F>(predicate: (Item) -> boolean + !F): Option<Item> + !E + !F =
+    match (this.next()) {
+      Yield(item, next) -> if (predicate(item)) Some(value = item) else next.find(predicate),
+      Done -> None,
+    }
+}
+
+/// The exact number of future `Yield` steps.
+public interface ExactSizeIterator<Item + !E>: Iterator<Item + !E> {
+  func remaining(): uint
+}
+
+struct Mapped<Item, R, S: Iterator<Item + !E>, !E, !F>(source: S, f: (Item) -> R + !F) {
+  impl Iterator<R + !E + !F> {
+    func next(): Iteration<R, self> + !E + !F = match (this.source.next()) {
+      Yield(item, next) -> {
+        let f = this.f
+        Iteration.Yield(
+        item = f(item),
+        next = Mapped(source = next, f = this.f),
+        )
+      },
+      Done -> Iteration.Done,
+    }
+  }
+}
+
+impl<Item, R, S: ExactSizeIterator<Item + !E>, !E, !F> ExactSizeIterator<R + !E + !F>
+  for Mapped<Item = Item, R = R, E = !E, F = !F, S = S> {
+  func remaining(): uint = this.source.remaining()
+}
+
+struct Filtered<Item, S: Iterator<Item + !E>, !E, !F>(
+  source: S,
+  predicate: (Item) -> boolean + !F,
+) {
+  impl Iterator<Item + !E + !F> {
+    func next(): Iteration<Item, self> + !E + !F = loop (let source = this.source) {
+      match (source.next()) {
+        Yield(item, next) -> {
+          let predicate = this.predicate
+          if (predicate(item)) {
+            break Iteration.Yield(item = item, next = Filtered(source = next, predicate = predicate))
+          }
+          continue(source = next)
+        },
+        Done -> break Iteration.Done,
+      }
+    }
+  }
+}
+
+struct Take<Item, S: Iterator<Item + !E>, !E>(source: S, remaining: uint) {
+  impl Iterator<Item + !E> {
+    func next(): Iteration<Item, self> + !E = if (this.remaining == 0u) {
+      Iteration.Done
+    } else match (this.source.next()) {
+      Yield(item, next) -> Iteration.Yield(
+        item = item,
+        next = Take(source = next, remaining = this.remaining - 1u),
+      ),
+      Done -> Iteration.Done,
+    }
+  }
+}
+
+impl<Item, S: ExactSizeIterator<Item + !E>, !E> ExactSizeIterator<Item + !E>
+  for Take<Item = Item, E = !E, S = S> {
+  func remaining(): uint = if (this.remaining < this.source.remaining()) {
+    this.remaining
+  } else this.source.remaining()
+}
+
+struct Drop<Item, S: Iterator<Item + !E>, !E>(source: S, remaining: uint) {
+  impl Iterator<Item + !E> {
+    func next(): Iteration<Item, self> + !E = loop (
+      let source = this.source,
+      let remaining = this.remaining,
+    ) {
+      match (source.next()) {
+        Yield(item, next) -> if (remaining == 0u) {
+          break Iteration.Yield(item = item, next = Drop(source = next, remaining = 0u))
+        } else {
+          continue(source = next, remaining = remaining - 1u)
+        },
+        Done -> break Iteration.Done,
+      }
+    }
+  }
+}
+
+impl<Item, S: ExactSizeIterator<Item + !E>, !E> ExactSizeIterator<Item + !E>
+  for Drop<Item = Item, E = !E, S = S> {
+  func remaining(): uint = if (this.remaining < this.source.remaining()) {
+    this.source.remaining() - this.remaining
+  } else 0u
+}
+
+struct Enumerate<Item, S: Iterator<Item + !E>, !E>(source: S, index: uint) {
+  impl Iterator<#(uint, Item) + !E> {
+    func next(): Iteration<#(uint, Item), self> + !E = match (this.source.next()) {
+      Yield(item, next) -> Iteration.Yield(
+        item = #(this.index, item),
+        next = Enumerate(source = next, index = this.index + 1u),
+      ),
+      Done -> Iteration.Done,
+    }
+  }
+}
+
+impl<Item, S: ExactSizeIterator<Item + !E>, !E> ExactSizeIterator<#(uint, Item) + !E>
+  for Enumerate<Item = Item, E = !E, S = S> {
+  func remaining(): uint = this.source.remaining()
+}
+
+struct Chain<Item, A: Iterator<Item + !E>, B: Iterator<Item + !F>, !E, !F>(
+  first: A,
+  second: B,
+  first_done: boolean,
+) {
+  impl Iterator<Item + !E + !F> {
+    func next(): Iteration<Item, self> + !E + !F = if (this.first_done) {
+      match (this.second.next()) {
+        Yield(item, next) -> Iteration.Yield(
+          item = item,
+          next = Chain(first = this.first, second = next, first_done = true),
+        ),
+        Done -> Iteration.Done,
+      }
+    } else match (this.first.next()) {
+      Yield(item, next) -> Iteration.Yield(
+        item = item,
+        next = Chain(first = next, second = this.second, first_done = false),
+      ),
+      Done -> match (this.second.next()) {
+        Yield(item, next) -> Iteration.Yield(
+          item = item,
+          next = Chain(first = this.first, second = next, first_done = true),
+        ),
+        Done -> Iteration.Done,
+      },
+    }
+  }
+}
+
+impl<
+  Item,
+  A: ExactSizeIterator<Item + !E>,
+  B: ExactSizeIterator<Item + !F>,
+  !E,
+  !F,
+> ExactSizeIterator<Item + !E + !F>
+  for Chain<Item = Item, E = !E, F = !F, A = A, B = B> {
+  func remaining(): uint = if (this.first_done) {
+    this.second.remaining()
+  } else this.first.remaining() + this.second.remaining()
+}
+
+struct Zip<Left, Right, A: Iterator<Left + !E>, B: Iterator<Right + !F>, !E, !F>(
+  left: A,
+  right: B,
+) {
+  impl Iterator<#(Left, Right) + !E + !F> {
+    func next(): Iteration<#(Left, Right), self> + !E + !F = match (this.left.next()) {
+      Yield(item = left, next = left_next) -> match (this.right.next()) {
+        Yield(item = right, next = right_next) -> Iteration.Yield(
+          item = #(left, right),
+          next = Zip(left = left_next, right = right_next),
+        ),
+        Done -> Iteration.Done,
+      },
+      Done -> Iteration.Done,
+    }
+  }
+}
+
+impl<
+  Left,
+  Right,
+  A: ExactSizeIterator<Left + !E>,
+  B: ExactSizeIterator<Right + !F>,
+  !E,
+  !F,
+> ExactSizeIterator<#(Left, Right) + !E + !F>
+  for Zip<Left = Left, Right = Right, E = !E, F = !F, A = A, B = B> {
+  func remaining(): uint = if (this.left.remaining() < this.right.remaining()) {
+    this.left.remaining()
+  } else this.right.remaining()
+}
+
+struct SortedBy<Item, S: Iterator<Item + !E>, !E>(
+  source: S,
+  compare: (Item, Item) -> Order,
+  items: Option<#[Item]>,
+  index: uint,
+) {
+  impl Iterator<Item + !E> {
+    func next(): Iteration<Item, self> + !E = {
+      let items = match (this.items) {
+        Some(items) -> items,
+        None -> this.source.to_list().sort_by(this.compare),
+      }
+      match (items.get(this.index)) {
+        Some(item) -> Iteration.Yield(
+          item = item,
+          next = SortedBy(
+            source = this.source,
+            compare = this.compare,
+            items = Some(value = items),
+            index = this.index + 1u,
+          ),
+        ),
+        None -> Iteration.Done,
+      }
+    }
+  }
+}
+
+impl<Item, S: ExactSizeIterator<Item + !E>, !E> ExactSizeIterator<Item + !E>
+  for SortedBy<Item = Item, E = !E, S = S> {
+  func remaining(): uint = match (this.items) {
+    Some(items) -> items.length() - this.index,
+    None -> this.source.remaining(),
+  }
+}
