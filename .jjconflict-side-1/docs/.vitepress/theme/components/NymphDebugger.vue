@@ -32,7 +32,13 @@ type Inspection = {
 type HighlightSegment = {
 	text: string;
 	classes: string[];
-	title?: string;
+	diagnostics: Diagnostic[];
+};
+type DiagnosticPopup = {
+	diagnostics: Diagnostic[];
+	x: number;
+	y: number;
+	placement: "above" | "below";
 };
 
 const examples = {
@@ -66,6 +72,7 @@ const failure = ref("");
 const activeTab = ref<"tokens" | "ast" | "javascript">("tokens");
 const editor = ref<HTMLTextAreaElement | null>(null);
 const highlightedEditor = ref<HTMLElement | null>(null);
+const diagnosticPopup = ref<DiagnosticPopup | null>(null);
 let inspectSource: ((value: string) => Inspection) | undefined;
 let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -135,7 +142,7 @@ const highlightedSource = computed<HighlightSegment[]>(() => {
 		return {
 			text: new TextDecoder().decode(bytes.slice(start, end)),
 			classes,
-			title: overlappingDiagnostics.map((item) => item.message).join("\n") || undefined,
+			diagnostics: overlappingDiagnostics,
 		};
 	});
 });
@@ -143,9 +150,9 @@ const highlightedSource = computed<HighlightSegment[]>(() => {
 function syntaxClass(kind: string) {
 	if (kind.startsWith("Identifier") || kind.startsWith("AnonymousParam"))
 		return "syntax-identifier";
-	if (/^(Int|UInt|Float|Char|Str)\(/.test(kind) || kind === "True" || kind === "False") {
-		return "syntax-literal";
-	}
+	if (kind.startsWith("Str(") || kind.startsWith("Char(")) return "syntax-string";
+	if (/^(Int|UInt|Float)\(/.test(kind)) return "syntax-number";
+	if (kind === "True" || kind === "False") return "syntax-boolean";
 	if (kind.endsWith("Type")) return "syntax-type";
 	if (keywordKinds.has(kind)) return "syntax-keyword";
 	if (/^(L|R|HashL)(Paren|Bracket|Brace)$/.test(kind)) return "syntax-delimiter";
@@ -181,6 +188,18 @@ function syncEditorScroll() {
 	if (!editor.value || !highlightedEditor.value) return;
 	highlightedEditor.value.scrollTop = editor.value.scrollTop;
 	highlightedEditor.value.scrollLeft = editor.value.scrollLeft;
+}
+
+function showDiagnosticPopup(event: MouseEvent, diagnostics: Diagnostic[]) {
+	if (!diagnostics.length) return;
+	const bounds = (event.currentTarget as HTMLElement).getBoundingClientRect();
+	const placement = bounds.top > 150 ? "above" : "below";
+	diagnosticPopup.value = {
+		diagnostics,
+		x: Math.max(16, Math.min(bounds.left, window.innerWidth - 376)),
+		y: placement === "above" ? bounds.top - 9 : bounds.bottom + 9,
+		placement,
+	};
 }
 
 function chooseExample(name: keyof typeof examples) {
@@ -248,7 +267,8 @@ onMounted(async () => {
 						v-for="(segment, index) in highlightedSource"
 						:key="index"
 						:class="segment.classes"
-						:title="segment.title"
+						@mouseenter="showDiagnosticPopup($event, segment.diagnostics)"
+						@mouseleave="diagnosticPopup = null"
 					>{{ segment.text }}</span></code></pre>
 					<textarea
 						ref="editor"
@@ -318,27 +338,49 @@ onMounted(async () => {
 				✓ No diagnostics. The module compiles cleanly.
 			</p>
 		</section>
+
+		<Teleport to="body">
+			<div
+				v-if="diagnosticPopup"
+				class="diagnostic-popup"
+				:class="`popup-${diagnosticPopup.placement}`"
+				:style="{ left: `${diagnosticPopup.x}px`, top: `${diagnosticPopup.y}px` }"
+				role="tooltip"
+			>
+				<span
+					v-for="diagnostic in diagnosticPopup.diagnostics"
+					:key="`${diagnostic.code}-${diagnostic.message}`"
+					class="popup-diagnostic"
+				>
+					<strong :class="`popup-${diagnostic.severity}`">{{ diagnostic.severity }}</strong>
+					<span>{{ diagnostic.message }}</span>
+					<small
+						><code>{{ diagnostic.code }}</code> · {{ diagnostic.start_line }}:{{
+							diagnostic.start_col
+						}}</small
+					>
+				</span>
+			</div>
+		</Teleport>
 	</div>
 </template>
 
 <style scoped>
 .compiler-lab {
 	--lab-border: color-mix(in srgb, var(--vp-c-divider) 82%, var(--vp-c-brand-1));
-	--syntax-keyword: #8250df;
-	--syntax-type: #0550ae;
-	--syntax-literal: #0a3069;
-	--syntax-operator: #cf222e;
+	--syntax-background: #121212;
+	--syntax-foreground: #dbd7caee;
+	--syntax-keyword: #4d9375;
+	--syntax-type: #5da994;
+	--syntax-string: #c98a7d;
+	--syntax-number: #4c9a91;
+	--syntax-identifier: #bd976a;
+	--syntax-operator: #cb7676;
+	--syntax-delimiter: #666666;
 	width: min(1120px, calc(100vw - 40px));
 	margin: 32px 0 48px 50%;
 	transform: translateX(-50%);
 	font-size: 14px;
-}
-
-:global(.dark) .compiler-lab {
-	--syntax-keyword: #d2a8ff;
-	--syntax-type: #79c0ff;
-	--syntax-literal: #a5d6ff;
-	--syntax-operator: #ff7b72;
 }
 
 .lab-toolbar,
@@ -499,7 +541,7 @@ textarea:focus {
 .editor-shell {
 	position: relative;
 	height: 430px;
-	background: var(--vp-code-block-bg);
+	background: var(--syntax-background);
 }
 .editor-shell textarea,
 .source-highlight {
@@ -510,15 +552,17 @@ textarea:focus {
 	white-space: pre;
 }
 .source-highlight {
-	z-index: 0;
+	z-index: 2;
 	overflow: hidden;
 	pointer-events: none;
+	background: transparent;
+	color: var(--syntax-foreground);
 }
 .editor-shell textarea {
 	z-index: 1;
 	background: transparent;
 	color: transparent;
-	caret-color: var(--vp-code-block-color);
+	caret-color: var(--syntax-foreground);
 	-webkit-text-fill-color: transparent;
 }
 .editor-shell textarea::selection {
@@ -531,21 +575,30 @@ textarea:focus {
 .source-highlight .syntax-type {
 	color: var(--syntax-type);
 }
-.source-highlight .syntax-literal {
-	color: var(--syntax-literal);
+.source-highlight .syntax-string {
+	color: var(--syntax-string);
+}
+.source-highlight .syntax-number {
+	color: var(--syntax-number);
+}
+.source-highlight .syntax-boolean {
+	color: var(--syntax-keyword);
 }
 .source-highlight .syntax-identifier {
-	color: var(--vp-code-block-color);
+	color: var(--syntax-identifier);
 }
 .source-highlight .syntax-delimiter {
-	color: var(--vp-c-text-2);
+	color: var(--syntax-delimiter);
 }
 .source-highlight .syntax-operator {
 	color: var(--syntax-operator);
 }
 .source-highlight .inline-error,
 .source-highlight .inline-warning {
+	position: relative;
 	border-radius: 2px;
+	pointer-events: auto;
+	cursor: help;
 	text-decoration-line: underline;
 	text-decoration-style: wavy;
 	text-decoration-thickness: 1.5px;
@@ -558,6 +611,74 @@ textarea:focus {
 .source-highlight .inline-warning {
 	background: color-mix(in srgb, var(--vp-c-warning-1) 14%, transparent);
 	text-decoration-color: var(--vp-c-warning-1);
+}
+.diagnostic-popup {
+	position: fixed;
+	z-index: 1000;
+	display: grid;
+	gap: 9px;
+	width: max-content;
+	max-width: min(360px, calc(100vw - 64px));
+	padding: 10px 12px;
+	border: 1px solid #2f2f2f;
+	border-radius: 8px;
+	background: #181818;
+	box-shadow: 0 10px 30px #00000066;
+	color: #dbd7caee;
+	font: 12px/1.45 var(--vp-font-family-mono);
+	pointer-events: none;
+	white-space: normal;
+}
+.diagnostic-popup::after {
+	position: absolute;
+	left: 12px;
+	width: 8px;
+	height: 8px;
+	border-right: 1px solid #2f2f2f;
+	border-bottom: 1px solid #2f2f2f;
+	background: #181818;
+	content: "";
+}
+.diagnostic-popup.popup-above {
+	transform: translateY(-100%);
+}
+.diagnostic-popup.popup-above::after {
+	top: 100%;
+	transform: translateY(-4px) rotate(45deg);
+}
+.diagnostic-popup.popup-below::after {
+	bottom: 100%;
+	transform: translateY(4px) rotate(225deg);
+}
+.popup-diagnostic {
+	display: grid;
+	grid-template-columns: auto 1fr;
+	gap: 2px 8px;
+	color: #dbd7caee;
+}
+.popup-diagnostic strong {
+	font-size: 10px;
+	letter-spacing: 0.06em;
+	text-transform: uppercase;
+}
+.popup-diagnostic small {
+	grid-column: 2;
+	color: #dedcd590;
+}
+.popup-diagnostic code {
+	color: #dedcd590;
+}
+.popup-error {
+	color: #cb7676;
+}
+.popup-warning {
+	color: #d4976c;
+}
+.popup-info {
+	color: #6394bf;
+}
+.popup-hint {
+	color: #4d9375;
 }
 pre {
 	overflow: auto;
