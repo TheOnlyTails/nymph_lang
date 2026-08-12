@@ -312,6 +312,23 @@ fn return_type_mismatch_is_reported() {
 }
 
 #[test]
+fn return_type_mismatch_spans_the_whole_call_expression() {
+	let source =
+		"func greet(name: string) = \"Hello, \" + name\n\nfunc broken(): int = greet(\"Nymph\")";
+	let parsed = parse_module(source, "test");
+	let checked = check_module(&parsed.tree);
+	let mismatch = checked
+		.diags
+		.iter()
+		.find(|diagnostic| diagnostic.message.contains("mismatched types"))
+		.expect("expected return type mismatch");
+	assert_eq!(
+		&source[mismatch.span.start..mismatch.span.end],
+		"greet(\"Nymph\")"
+	);
+}
+
+#[test]
 fn closure_return_is_checked_against_the_closure_not_the_outer_function() {
 	assert_error_contains(
 		"func f(): int = { let g: (boolean) -> boolean = (b: boolean) -> { if (b) { return 1 } true } 1 }",

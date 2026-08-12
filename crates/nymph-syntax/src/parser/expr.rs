@@ -291,6 +291,7 @@ impl Parser<'_> {
 
 	fn parse_postfix(&mut self, mut expr: Expr) -> Expr {
 		let start = self.position();
+		let expr_start = expr.span;
 		loop {
 			expr = match self.peek() {
 				Some(Token::Dot) => {
@@ -302,7 +303,7 @@ impl Parser<'_> {
 							member,
 							optional: false,
 						},
-						self.span_from(start),
+						expr_start.to(self.span_from(start)),
 					)
 				}
 				Some(Token::QuestionDot) => {
@@ -317,7 +318,7 @@ impl Parser<'_> {
 								index: Box::new(index),
 								optional: true,
 							},
-							self.span_from(start),
+							expr_start.to(self.span_from(start)),
 						)
 					} else {
 						let member = self.expect_ident();
@@ -327,7 +328,7 @@ impl Parser<'_> {
 								member,
 								optional: true,
 							},
-							self.span_from(start),
+							expr_start.to(self.span_from(start)),
 						)
 					}
 				}
@@ -341,7 +342,7 @@ impl Parser<'_> {
 							index: Box::new(index),
 							optional: false,
 						},
-						self.span_from(start),
+						expr_start.to(self.span_from(start)),
 					)
 				}
 				Some(Token::LParen) => {
@@ -353,7 +354,7 @@ impl Parser<'_> {
 							generics: Vec::new(),
 							args,
 						},
-						self.span_from(start),
+						expr_start.to(self.span_from(start)),
 					)
 				}
 				Some(Token::Question) => {
@@ -363,7 +364,7 @@ impl Parser<'_> {
 							op: nymph_ast::ops::PostfixOperator::ErrorReturn,
 							value: Box::new(expr),
 						},
-						self.span_from(start),
+						expr_start.to(self.span_from(start)),
 					)
 				}
 				_ => break,
