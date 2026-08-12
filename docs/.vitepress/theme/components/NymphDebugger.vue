@@ -29,6 +29,11 @@ type Inspection = {
 	js: string | null;
 	diagnostics: Diagnostic[];
 };
+type HighlightSegment = {
+	text: string;
+	classes: string[];
+	title?: string;
+};
 
 const examples = {
 	Functions: `func fibonacci(n: int): int = match (n) {
@@ -60,8 +65,41 @@ const loading = ref(true);
 const failure = ref("");
 const activeTab = ref<"tokens" | "ast" | "javascript">("tokens");
 const editor = ref<HTMLTextAreaElement | null>(null);
+const highlightedEditor = ref<HTMLElement | null>(null);
 let inspectSource: ((value: string) => Inspection) | undefined;
 let timer: ReturnType<typeof setTimeout> | undefined;
+
+const keywordKinds = new Set([
+	"Public",
+	"Internal",
+	"Private",
+	"Import",
+	"With",
+	"Type",
+	"Struct",
+	"Enum",
+	"Let",
+	"Mut",
+	"External",
+	"Func",
+	"Interface",
+	"Impl",
+	"Namespace",
+	"For",
+	"While",
+	"If",
+	"Else",
+	"Match",
+	"Continue",
+	"Break",
+	"Return",
+	"This",
+	"In",
+	"As",
+	"Is",
+	"Async",
+	"Await",
+]);
 
 const errors = computed(
 	() => result.value?.diagnostics.filter((item) => item.severity === "error").length ?? 0,
@@ -69,6 +107,50 @@ const errors = computed(
 const warnings = computed(
 	() => result.value?.diagnostics.filter((item) => item.severity === "warning").length ?? 0,
 );
+const highlightedSource = computed<HighlightSegment[]>(() => {
+	const bytes = new TextEncoder().encode(source.value);
+	const tokens = result.value?.tokens ?? [];
+	const diagnostics = result.value?.diagnostics ?? [];
+	const boundaries = new Set([0, bytes.length]);
+
+	for (const token of tokens) {
+		boundaries.add(Math.min(token.start, bytes.length));
+		boundaries.add(Math.min(token.end, bytes.length));
+	}
+	for (const diagnostic of diagnostics) {
+		boundaries.add(Math.min(diagnostic.start, bytes.length));
+		boundaries.add(Math.min(Math.max(diagnostic.end, diagnostic.start + 1), bytes.length));
+	}
+
+	const offsets = [...boundaries].sort((left, right) => left - right);
+	return offsets.slice(0, -1).map((start, index) => {
+		const end = offsets[index + 1];
+		const token = tokens.find((item) => item.start <= start && item.end >= end);
+		const overlappingDiagnostics = diagnostics.filter(
+			(item) => item.start < end && Math.max(item.end, item.start + 1) > start,
+		);
+		const classes = token ? [syntaxClass(token.kind)] : [];
+		classes.push(...overlappingDiagnostics.map((item) => `inline-${item.severity}`));
+
+		return {
+			text: new TextDecoder().decode(bytes.slice(start, end)),
+			classes,
+			title: overlappingDiagnostics.map((item) => item.message).join("\n") || undefined,
+		};
+	});
+});
+
+function syntaxClass(kind: string) {
+	if (kind.startsWith("Identifier") || kind.startsWith("AnonymousParam"))
+		return "syntax-identifier";
+	if (/^(Int|UInt|Float|Char|Str)\(/.test(kind) || kind === "True" || kind === "False") {
+		return "syntax-literal";
+	}
+	if (kind.endsWith("Type")) return "syntax-type";
+	if (keywordKinds.has(kind)) return "syntax-keyword";
+	if (/^(L|R|HashL)(Paren|Bracket|Brace)$/.test(kind)) return "syntax-delimiter";
+	return "syntax-operator";
+}
 
 function runInspection() {
 	if (!inspectSource) return;
@@ -93,6 +175,12 @@ function selectRange(start: number, end: number) {
 		editor.value?.focus();
 		editor.value?.setSelectionRange(startIndex, Math.max(startIndex + 1, endIndex));
 	});
+}
+
+function syncEditorScroll() {
+	if (!editor.value || !highlightedEditor.value) return;
+	highlightedEditor.value.scrollTop = editor.value.scrollTop;
+	highlightedEditor.value.scrollLeft = editor.value.scrollLeft;
 }
 
 function chooseExample(name: keyof typeof examples) {
@@ -155,12 +243,21 @@ onMounted(async () => {
 		<div class="lab-grid">
 			<section class="lab-panel source-panel">
 				<header><span>Nymph source</span><small>playground.nym</small></header>
-				<textarea
-					ref="editor"
-					v-model="source"
-					aria-label="Nymph source code"
-					spellcheck="false"
-				></textarea>
+				<div class="editor-shell">
+					<pre ref="highlightedEditor" class="source-highlight" aria-hidden="true"><code><span
+						v-for="(segment, index) in highlightedSource"
+						:key="index"
+						:class="segment.classes"
+						:title="segment.title"
+					>{{ segment.text }}</span></code></pre>
+					<textarea
+						ref="editor"
+						v-model="source"
+						aria-label="Nymph source code"
+						spellcheck="false"
+						@scroll="syncEditorScroll"
+					></textarea>
+				</div>
 			</section>
 
 			<section class="lab-panel output-panel">
@@ -227,10 +324,21 @@ onMounted(async () => {
 <style scoped>
 .compiler-lab {
 	--lab-border: color-mix(in srgb, var(--vp-c-divider) 82%, var(--vp-c-brand-1));
+	--syntax-keyword: #8250df;
+	--syntax-type: #0550ae;
+	--syntax-literal: #0a3069;
+	--syntax-operator: #cf222e;
 	width: min(1120px, calc(100vw - 40px));
 	margin: 32px 0 48px 50%;
 	transform: translateX(-50%);
 	font-size: 14px;
+}
+
+:global(.dark) .compiler-lab {
+	--syntax-keyword: #d2a8ff;
+	--syntax-type: #79c0ff;
+	--syntax-literal: #a5d6ff;
+	--syntax-operator: #ff7b72;
 }
 
 .lab-toolbar,
@@ -382,11 +490,74 @@ pre,
 }
 textarea {
 	display: block;
-	resize: vertical;
+	resize: none;
 	outline: none;
 }
 textarea:focus {
 	box-shadow: inset 0 0 0 2px var(--vp-c-brand-1);
+}
+.editor-shell {
+	position: relative;
+	height: 430px;
+	background: var(--vp-code-block-bg);
+}
+.editor-shell textarea,
+.source-highlight {
+	position: absolute;
+	inset: 0;
+	height: 100%;
+	overflow: auto;
+	white-space: pre;
+}
+.source-highlight {
+	z-index: 0;
+	overflow: hidden;
+	pointer-events: none;
+}
+.editor-shell textarea {
+	z-index: 1;
+	background: transparent;
+	color: transparent;
+	caret-color: var(--vp-code-block-color);
+	-webkit-text-fill-color: transparent;
+}
+.editor-shell textarea::selection {
+	background: color-mix(in srgb, var(--vp-c-brand-1) 32%, transparent);
+}
+.source-highlight .syntax-keyword {
+	color: var(--syntax-keyword);
+	font-weight: 600;
+}
+.source-highlight .syntax-type {
+	color: var(--syntax-type);
+}
+.source-highlight .syntax-literal {
+	color: var(--syntax-literal);
+}
+.source-highlight .syntax-identifier {
+	color: var(--vp-code-block-color);
+}
+.source-highlight .syntax-delimiter {
+	color: var(--vp-c-text-2);
+}
+.source-highlight .syntax-operator {
+	color: var(--syntax-operator);
+}
+.source-highlight .inline-error,
+.source-highlight .inline-warning {
+	border-radius: 2px;
+	text-decoration-line: underline;
+	text-decoration-style: wavy;
+	text-decoration-thickness: 1.5px;
+	text-underline-offset: 3px;
+}
+.source-highlight .inline-error {
+	background: color-mix(in srgb, var(--vp-c-danger-1) 14%, transparent);
+	text-decoration-color: var(--vp-c-danger-1);
+}
+.source-highlight .inline-warning {
+	background: color-mix(in srgb, var(--vp-c-warning-1) 14%, transparent);
+	text-decoration-color: var(--vp-c-warning-1);
 }
 pre {
 	overflow: auto;
@@ -542,6 +713,9 @@ pre code {
 	textarea,
 	pre,
 	.tokens {
+		height: 340px;
+	}
+	.editor-shell {
 		height: 340px;
 	}
 	.diagnostic {
