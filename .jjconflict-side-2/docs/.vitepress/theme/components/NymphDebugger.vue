@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from "vue";
 import AstTreeNode, { type AstTreeNode as AstNode } from "./AstTreeNode.vue";
+import TypeTreeNode, { type TypeTreeNode as TypeNode } from "./TypeTreeNode.vue";
 
 type StageStatus = "complete" | "failed" | "blocked";
 type Stage = { name: string; status: StageStatus; detail: string };
@@ -25,6 +26,7 @@ type Diagnostic = {
 };
 type TypeState = {
 	node: number;
+	parent: number | null;
 	source: string;
 	type_: string;
 	dispatch: string | null;
@@ -128,6 +130,23 @@ const warnings = computed(
 	() => result.value?.diagnostics.filter((item) => item.severity === "warning").length ?? 0,
 );
 const astTree = computed<AstNode[]>(() => parseAstTree(result.value?.ast ?? ""));
+const typeTree = computed<TypeNode[]>(() => {
+	const entries = result.value?.types ?? [];
+	const nodes = new Map<number, TypeNode>(
+		entries.map((entry) => [entry.node, { ...entry, children: [] }]),
+	);
+	const roots: TypeNode[] = [];
+
+	for (const entry of entries) {
+		const node = nodes.get(entry.node);
+		const parent = entry.parent === null ? undefined : nodes.get(entry.parent);
+		if (!node) continue;
+		if (parent) parent.children.push(node);
+		else roots.push(node);
+	}
+
+	return roots;
+});
 const highlightedSource = computed<HighlightSegment[]>(() => {
 	const bytes = new TextEncoder().encode(source.value);
 	const tokens = result.value?.tokens ?? [];
@@ -354,23 +373,15 @@ onMounted(async () => {
 					<p v-if="!astTree.length" class="empty-state">No syntax tree is available.</p>
 				</div>
 				<div v-else-if="activeTab === 'types'" class="type-state" role="tabpanel">
-					<button
-						v-for="entry in result?.types ?? []"
-						:key="entry.node"
-						type="button"
-						class="type-entry"
-						@click="selectRange(entry.start, entry.end)"
-					>
-						<span class="type-source">
-							<code>{{ entry.source }}</code>
-							<small>node {{ entry.node }} · {{ entry.line }}:{{ entry.col }}</small>
-						</span>
-						<strong>{{ entry.type_ }}</strong>
-						<small v-if="entry.dispatch" class="type-dispatch">
-							{{ entry.dispatch }}<template v-if="entry.method"> · {{ entry.method }}</template>
-						</small>
-					</button>
-					<p v-if="!result?.types.length" class="empty-state">
+					<ul v-if="typeTree.length" class="inference-roots">
+						<TypeTreeNode
+							v-for="node in typeTree"
+							:key="node.node"
+							:node="node"
+							@select="selectRange"
+						/>
+					</ul>
+					<p v-else class="empty-state">
 						No inferred expression state is available for this module.
 					</p>
 				</div>
@@ -886,34 +897,69 @@ pre code {
 	box-sizing: border-box;
 	height: 430px;
 	overflow: auto;
+	padding: 14px;
 	background: #121212;
 	color: #dbd7caee;
 	font: 12px/1.45 var(--vp-font-family-mono);
 }
-.type-entry {
+.type-state :deep(ul) {
+	margin: 0;
+	padding: 0;
+	list-style: none;
+}
+.type-state :deep(.inference-roots) {
 	display: grid;
-	grid-template-columns: minmax(0, 1fr) auto;
-	gap: 4px 16px;
+	gap: 18px;
+}
+.type-state :deep(.inference-node) {
+	position: relative;
+}
+.type-state :deep(.inference-children) {
+	position: relative;
+	display: grid;
+	gap: 10px;
+	margin: 10px 0 0 18px;
+	padding-left: 22px;
+}
+.type-state :deep(.inference-children::before) {
+	position: absolute;
+	inset: -10px auto 17px 0;
+	border-left: 1px solid #3b665b;
+	content: "";
+}
+.type-state :deep(.inference-children > .inference-node::before) {
+	position: absolute;
+	top: 17px;
+	right: 100%;
+	width: 22px;
+	border-top: 1px solid #3b665b;
+	content: "";
+}
+.type-state :deep(.type-card) {
+	display: grid;
+	gap: 3px;
 	width: 100%;
-	padding: 10px 14px;
-	border: 0;
-	border-bottom: 1px solid #242424;
-	background: transparent;
+	padding: 8px 10px;
+	border: 1px solid #303030;
+	border-radius: 7px;
+	background: #181818;
 	color: inherit;
 	text-align: left;
 	cursor: pointer;
 }
-.type-entry:hover,
-.type-entry:focus-visible {
-	background: #181818;
+.type-state :deep(.type-card:hover),
+.type-state :deep(.type-card:focus-visible) {
+	border-color: #5da994;
+	background: #1d1d1d;
 	outline: none;
 }
-.type-source {
-	display: grid;
-	min-width: 0;
-	gap: 2px;
+.type-state :deep(.type-card-heading) {
+	display: flex;
+	align-items: baseline;
+	justify-content: space-between;
+	gap: 14px;
 }
-.type-source code {
+.type-state :deep(.type-card code) {
 	overflow: hidden;
 	padding: 0;
 	background: transparent;
@@ -921,17 +967,14 @@ pre code {
 	text-overflow: ellipsis;
 	white-space: nowrap;
 }
-.type-source small,
-.type-dispatch {
+.type-state :deep(.type-card small),
+.type-state :deep(.type-dispatch) {
 	color: #dedcd590;
 }
-.type-entry strong {
+.type-state :deep(.type-card strong) {
+	flex: 0 0 auto;
 	color: #5da994;
 	font-weight: 500;
-}
-.type-dispatch {
-	grid-column: 2;
-	text-align: right;
 }
 
 .diagnostics {

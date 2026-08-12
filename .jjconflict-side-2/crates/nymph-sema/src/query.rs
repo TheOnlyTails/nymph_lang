@@ -329,6 +329,7 @@ pub fn type_at(module: &Module, checked: &Checked, offset: usize) -> Option<Stri
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExpressionTypeState {
 	pub node: NodeId,
+	pub parent: Option<NodeId>,
 	pub span: Span,
 	pub type_: String,
 	pub dispatch: Option<String>,
@@ -348,12 +349,31 @@ pub fn expression_type_state(analysis: &crate::SemanticAnalysis) -> Vec<Expressi
 	}
 	let definitions = &analysis.checked.semantic.definitions;
 	let mut state = expressions
-		.into_iter()
-		.filter_map(|expression| {
+		.iter()
+		.enumerate()
+		.filter_map(|(expression_index, expression)| {
 			let info = analysis.checked.annotations.get(expression.id)?;
 			let params = generic_scope_at(&analysis.module, expression.span.start);
+			let parent = expressions
+				.iter()
+				.enumerate()
+				.filter(|(candidate_index, candidate)| {
+					candidate.id != expression.id
+						&& candidate.span.start <= expression.span.start
+						&& candidate.span.end >= expression.span.end
+						&& (candidate.span != expression.span || *candidate_index < expression_index)
+						&& analysis.checked.annotations.get(candidate.id).is_some()
+				})
+				.min_by_key(|(candidate_index, candidate)| {
+					(
+						candidate.span.end - candidate.span.start,
+						std::cmp::Reverse(*candidate_index),
+					)
+				})
+				.map(|(_, candidate)| candidate.id);
 			Some(ExpressionTypeState {
 				node: expression.id,
+				parent,
 				span: expression.span,
 				type_: render(&analysis.checked.interner, definitions, &params, info.ty),
 				dispatch: info

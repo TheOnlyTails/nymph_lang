@@ -91,6 +91,7 @@ pub(crate) fn run_inspect(source: &str) -> InspectionResult {
 					let (line, col) = index.line_col(entry.span.start);
 					TypeStateView {
 						node: entry.node.0,
+						parent: entry.parent.map(|parent| parent.0),
 						source: source
 							.get(entry.span.start..entry.span.end)
 							.unwrap_or_default()

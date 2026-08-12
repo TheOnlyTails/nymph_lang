@@ -63,6 +63,7 @@ pub struct StageView {
 #[derive(Clone, Debug, Serialize)]
 pub struct TypeStateView {
 	pub node: u32,
+	pub parent: Option<u32>,
 	pub source: String,
 	pub type_: String,
 	pub dispatch: Option<String>,
