@@ -304,6 +304,72 @@ pub fn type_at(module: &Module, checked: &Checked, offset: usize) -> Option<Stri
 	fallback_type_at(module, checked, offset)
 }
 
+/// One inferred expression type from the checker, in stable source-node order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExpressionTypeState {
+	pub node: NodeId,
+	pub parent: Option<NodeId>,
+	pub span: Span,
+	pub type_: String,
+	pub dispatch: Option<String>,
+	pub method: Option<String>,
+}
+
+/// Return the checker state attached to every annotated expression in `analysis`.
+///
+/// Unlike [`type_at`], this includes container expressions and unresolved/error
+/// types because compiler-debugging clients need the complete inferred state,
+/// not only the subset suitable for editor hover.
+#[must_use]
+pub fn expression_type_state(analysis: &crate::SemanticAnalysis) -> Vec<ExpressionTypeState> {
+	let mut expressions = Vec::new();
+	for declaration in &analysis.module.members {
+		collect_decl_exprs(declaration, &mut expressions);
+	}
+	let definitions = &analysis.checked.semantic.definitions;
+	let mut state = expressions
+		.iter()
+		.enumerate()
+		.filter_map(|(expression_index, expression)| {
+			let info = analysis.checked.annotations.get(expression.id)?;
+			let params = generic_scope_at(&analysis.module, expression.span.start);
+			let parent = expressions
+				.iter()
+				.enumerate()
+				.filter(|(candidate_index, candidate)| {
+					candidate.id != expression.id
+						&& candidate.span.start <= expression.span.start
+						&& candidate.span.end >= expression.span.end
+						&& (candidate.span != expression.span || *candidate_index < expression_index)
+						&& analysis.checked.annotations.get(candidate.id).is_some()
+				})
+				.min_by_key(|(candidate_index, candidate)| {
+					(
+						candidate.span.end - candidate.span.start,
+						std::cmp::Reverse(*candidate_index),
+					)
+				})
+				.map(|(_, candidate)| candidate.id);
+			Some(ExpressionTypeState {
+				node: expression.id,
+				parent,
+				span: expression.span,
+				type_: render(&analysis.checked.interner, definitions, &params, info.ty),
+				dispatch: info
+					.resolution
+					.as_ref()
+					.map(|resolution| format!("{:?}", resolution.dispatch)),
+				method: info
+					.resolution
+					.as_ref()
+					.map(|resolution| resolution.method.to_string()),
+			})
+		})
+		.collect::<Vec<_>>();
+	state.sort_unstable_by_key(|entry| entry.node);
+	state
+}
+
 /// Variant-construction/reference hover. Walks every `Expr` in
 /// `module` (mirroring [`type_at`]'s own walk) collecting a candidate at the
 /// TIGHTEST name span the checker attached a [`VariantResolution`] to:

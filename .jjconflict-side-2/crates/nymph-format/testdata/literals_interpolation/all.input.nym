@@ -1,6 +1,0 @@
-let ints=#[0b0101,0o77,0xDEAD_F00D,1_000u]
-let scalars=#['\n','λ',true,false,6.02e23,2f]
-let text="escape \n \${literal} ${ user.name } ${ {let x=1 x+2} } ${match(value){Some(x)->x,None->0}}"
-let multi="first
-  preserved λ
-last"

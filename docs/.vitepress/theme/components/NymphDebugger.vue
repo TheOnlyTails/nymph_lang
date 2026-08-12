@@ -97,8 +97,9 @@ const result = ref<Inspection | null>(null);
 const loading = ref(true);
 const compiling = ref(false);
 const failure = ref("");
-const activeTab = ref<"tokens" | "ast" | "types" | "javascript">("tokens");
-const feedbackTab = ref<"diagnostics" | "console">("diagnostics");
+const activeTab = ref<"tokens" | "ast" | "types" | "diagnostics" | "console" | "javascript">(
+	"tokens",
+);
 const editor = ref<HTMLTextAreaElement | null>(null);
 const highlightedEditor = ref<HTMLElement | null>(null);
 const diagnosticPopup = ref<DiagnosticPopup | null>(null);
@@ -253,7 +254,7 @@ function scheduleInspection() {
 
 function runProgram() {
 	stopProgram(false);
-	feedbackTab.value = "console";
+	activeTab.value = "console";
 	consoleLines.value = [];
 	if (compiling.value) {
 		consoleLines.value.push({ level: "system", text: "Wait for compilation to finish." });
@@ -452,7 +453,14 @@ onBeforeUnmount(() => {
 			<section class="lab-panel output-panel">
 				<div class="tabs" role="tablist" aria-label="Compiler output">
 					<button
-						v-for="tab in ['tokens', 'ast', 'types', 'javascript'] as const"
+						v-for="tab in [
+							'tokens',
+							'ast',
+							'types',
+							'diagnostics',
+							'console',
+							'javascript',
+						] as const"
 						:key="tab"
 						type="button"
 						role="tab"
@@ -460,6 +468,10 @@ onBeforeUnmount(() => {
 						@click="activeTab = tab"
 					>
 						{{ tab === "ast" ? "AST" : tab[0].toUpperCase() + tab.slice(1) }}
+						<span v-if="tab === 'diagnostics'" class="tab-count">
+							{{ result?.diagnostics.length ?? 0 }}
+						</span>
+						<i v-if="tab === 'console' && running" class="loading-dot" aria-label="Running"></i>
 					</button>
 				</div>
 
@@ -494,69 +506,47 @@ onBeforeUnmount(() => {
 						No inferred expression state is available for this module.
 					</p>
 				</div>
+				<div v-else-if="activeTab === 'diagnostics'" class="diagnostic-output" role="tabpanel">
+					<button
+						v-for="diagnostic in result?.diagnostics ?? []"
+						:key="`${diagnostic.code}-${diagnostic.start}-${diagnostic.message}`"
+						type="button"
+						class="diagnostic"
+						:class="`is-${diagnostic.severity}`"
+						@click="selectRange(diagnostic.start, diagnostic.end)"
+					>
+						<span class="severity">{{ diagnostic.severity }}</span>
+						<span class="message">{{ diagnostic.message }}</span>
+						<code>{{ diagnostic.code }}</code>
+						<small>{{ diagnostic.start_line }}:{{ diagnostic.start_col }}</small>
+					</button>
+					<p v-if="!result?.diagnostics.length" class="clean-state">
+						✓ No diagnostics. The module compiles cleanly.
+					</p>
+				</div>
+				<div v-else-if="activeTab === 'console'" class="console-output" role="tabpanel">
+					<button
+						v-if="consoleLines.length"
+						type="button"
+						class="clear-console"
+						@click="consoleLines = []"
+					>
+						Clear
+					</button>
+					<p v-for="(line, index) in consoleLines" :key="index" :class="`console-${line.level}`">
+						<span aria-hidden="true">{{ line.level === "result" ? "←" : ">" }}</span
+						>{{ line.text }}
+					</p>
+					<p v-if="!consoleLines.length" class="console-empty">
+						Run a module with an exported <code>main</code> function to see its output.
+					</p>
+				</div>
 				<pre
 					v-else
 					role="tabpanel"
 				><code>{{ result?.js ?? "JavaScript is emitted after a clean analysis." }}</code></pre>
 			</section>
 		</div>
-
-		<section class="feedback-panel" aria-live="polite">
-			<header class="feedback-tabs" role="tablist" aria-label="Diagnostics and console">
-				<button
-					type="button"
-					role="tab"
-					:aria-selected="feedbackTab === 'diagnostics'"
-					@click="feedbackTab = 'diagnostics'"
-				>
-					Diagnostics <span>{{ result?.diagnostics.length ?? 0 }}</span>
-				</button>
-				<button
-					type="button"
-					role="tab"
-					:aria-selected="feedbackTab === 'console'"
-					@click="feedbackTab = 'console'"
-				>
-					Console
-					<i v-if="running" class="loading-dot" aria-label="Running"></i>
-				</button>
-				<button
-					v-if="feedbackTab === 'console' && consoleLines.length"
-					type="button"
-					class="clear-console"
-					@click="consoleLines = []"
-				>
-					Clear
-				</button>
-			</header>
-			<div v-if="feedbackTab === 'diagnostics'" role="tabpanel">
-				<button
-					v-for="diagnostic in result?.diagnostics ?? []"
-					:key="`${diagnostic.code}-${diagnostic.start}-${diagnostic.message}`"
-					type="button"
-					class="diagnostic"
-					:class="`is-${diagnostic.severity}`"
-					@click="selectRange(diagnostic.start, diagnostic.end)"
-				>
-					<span class="severity">{{ diagnostic.severity }}</span>
-					<span class="message">{{ diagnostic.message }}</span>
-					<code>{{ diagnostic.code }}</code>
-					<small>{{ diagnostic.start_line }}:{{ diagnostic.start_col }}</small>
-				</button>
-				<p v-if="!result?.diagnostics.length" class="clean-state">
-					✓ No diagnostics. The module compiles cleanly.
-				</p>
-			</div>
-			<div v-else class="console-output" role="tabpanel">
-				<p v-for="(line, index) in consoleLines" :key="index" :class="`console-${line.level}`">
-					<span aria-hidden="true">{{ line.level === "result" ? "←" : ">" }}</span
-					>{{ line.text }}
-				</p>
-				<p v-if="!consoleLines.length" class="console-empty">
-					Run a module with an exported <code>main</code> function to see its output.
-				</p>
-			</div>
-		</section>
 
 		<Teleport to="body">
 			<div
@@ -605,7 +595,6 @@ onBeforeUnmount(() => {
 .lab-toolbar,
 .pipeline,
 .tabs,
-.feedback-tabs,
 .example-buttons,
 .lab-actions,
 .compiler-state {
@@ -742,8 +731,7 @@ button {
 	grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
 	gap: 16px;
 }
-.lab-panel,
-.feedback-panel {
+.lab-panel {
 	overflow: hidden;
 	border: 1px solid var(--lab-border);
 	border-radius: 12px;
@@ -942,8 +930,11 @@ pre code {
 	background: var(--vp-c-bg-soft);
 }
 .tabs button {
+	display: flex;
+	align-items: center;
+	gap: 5px;
 	align-self: stretch;
-	padding: 0 10px;
+	padding: 0 7px;
 	border: 0;
 	border-bottom: 2px solid transparent;
 	background: transparent;
@@ -953,6 +944,20 @@ pre code {
 .tabs button[aria-selected="true"] {
 	border-color: var(--vp-c-brand-1);
 	color: var(--vp-c-brand-1);
+}
+.tabs .tab-count {
+	display: grid;
+	place-items: center;
+	min-width: 18px;
+	height: 18px;
+	border-radius: 9px;
+	background: var(--vp-c-default-soft);
+	font-size: 11px;
+}
+.tabs .loading-dot {
+	display: inline-block;
+	width: 6px;
+	height: 6px;
 }
 .tokens {
 	display: flex;
@@ -1147,56 +1152,21 @@ pre code {
 	font-weight: 500;
 }
 
-.feedback-panel {
-	margin-top: 16px;
-}
-.feedback-tabs {
-	height: 44px;
-	padding: 0 8px;
-	border-bottom: 1px solid var(--lab-border);
-	background: var(--vp-c-bg-soft);
-}
-.feedback-tabs > button:not(.clear-console) {
-	display: flex;
-	align-items: center;
-	align-self: stretch;
-	gap: 7px;
-	padding: 0 10px;
-	border: 0;
-	border-bottom: 2px solid transparent;
-	background: transparent;
-	color: var(--vp-c-text-2);
-	cursor: pointer;
-}
-.feedback-tabs > button[aria-selected="true"] {
-	border-color: var(--vp-c-brand-1);
-	color: var(--vp-c-brand-1);
-}
-.feedback-tabs button span {
-	display: grid;
-	place-items: center;
-	min-width: 21px;
-	height: 21px;
-	border-radius: 10px;
-	background: var(--vp-c-default-soft);
-	font-size: 12px;
-}
-.feedback-tabs .clear-console {
-	margin-left: auto;
+.clear-console {
+	float: right;
 	padding: 3px 8px;
 	border: 0;
 	background: transparent;
-	color: var(--vp-c-text-2);
+	color: #dedcd590;
 	cursor: pointer;
 }
-.feedback-tabs .loading-dot {
-	display: inline-block;
-}
+.diagnostic-output,
 .console-output {
 	box-sizing: border-box;
-	min-height: 110px;
-	max-height: 260px;
+	height: 430px;
 	overflow: auto;
+}
+.console-output {
 	padding: 10px 14px;
 	background: #121212;
 	color: #dbd7caee;
@@ -1309,6 +1279,10 @@ pre code {
 		height: 340px;
 	}
 	.type-state {
+		height: 340px;
+	}
+	.diagnostic-output,
+	.console-output {
 		height: 340px;
 	}
 	.editor-shell {

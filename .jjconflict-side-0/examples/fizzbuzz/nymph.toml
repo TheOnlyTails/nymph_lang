@@ -1,4 +1,0 @@
-[package]
-name = "fizzbuzz"
-version = "0.1.0"
-description = "FizzBuzz — ranges, match, and guards."

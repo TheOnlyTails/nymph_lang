@@ -1,7 +1,0 @@
-.vscode/**
-.vscode-test/**
-.gitignore
-test/**
-scripts/**
-src/**
-out/**

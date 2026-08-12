@@ -1,4 +1,0 @@
-[package]
-name = "word-frequency"
-version = "0.1.0"
-description = "Count and rank the most common words in a document."
