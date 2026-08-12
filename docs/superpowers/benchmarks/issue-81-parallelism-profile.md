@@ -7,11 +7,11 @@ Captured 2026-08-12 at exact base
 
 Keep the existing native ambient-first, module-level diagnostics prewarmer and
 make **no compiler concurrency change**. It already provides the only material,
-repeatable end-to-end win found: at four Rayon workers, clean diagnostics are
+observed end-to-end win found: at four Rayon workers, clean diagnostics are
 20.4–33.7% faster than at one worker across small, wide, deep, and mixed
 fixtures. Increasing the pool from four workers (the physical-core count) to
-eight logical workers produced no statistically repeatable improvement, raised
-whole-process peak RSS by 9.1 MiB (2.9%), and raised total CPU consumption while
+eight logical workers produced no demonstrated improvement, raised
+whole-process peak RSS by 9.6 MiB (3.1%), and raised total CPU consumption while
 occupancy remained below 1.5 cores. Warm requests execute no Salsa queries and
 complete in 3.0–5.1 µs, so they must not acquire more parallel work.
 
@@ -21,8 +21,11 @@ full-build time. The dominant critical path is the construction of each
 module's semantic environment from ambient and dependency interfaces followed
 by `check_module_with_owned_environment`; dependent module interfaces serialize
 the deep path. `perf`, Callgrind, DHAT, and allocation profilers were unavailable
-in the orb, so this report does not claim an allocation-site split between
-environment construction, canonical fact instantiation, and checker work.
+in the orb. The public phase subtraction only localizes the cost to diagnostics;
+it does not distinguish environment construction, canonical fact instantiation,
+checker work, allocation count, or synchronization. Instrumenting those
+subphases separately is required before attributing or optimizing the #80
+regression.
 
 The checked-in benchmark expansion is retained because it makes the
 small/wide/deep/mixed cold and warm safeguards reproducible. No speculative
@@ -54,6 +57,13 @@ estimate.
 
 Representative reproduction commands:
 
+`RAYON_NUM_THREADS` is consumed by the compiler's private diagnostics
+`ThreadPoolBuilder::new().build()` because the builder has no explicit
+`num_threads` override. Each worker-count sweep ran in a separate process so
+the pool's `OnceLock` could not retain a prior setting. `CARGO_BUILD_JOBS`
+controls only the preceding Cargo build and was not used as the runtime worker
+control.
+
 ```sh
 CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0 cargo bench -p nymph-compiler \
   --features test-support --bench incremental_project --no-run
@@ -80,11 +90,11 @@ source installation, priming, source mutation, and state destruction.
 
 ### One Rayon worker
 
-| Shape | Diagnostics | Full compile |
-|---|---:|---:|
-| Single | 548.02 ms (544.80–551.15) | 570.11 ms (562.33–579.92) |
-| Wide 16 | 712.80 ms (702.08–723.81) | 714.19 ms (703.25–725.69) |
-| Deep 16 | 713.49 ms (701.39–727.30) | 712.40 ms (696.71–734.68) |
+| Shape     |               Diagnostics |              Full compile |
+| --------- | ------------------------: | ------------------------: |
+| Single    | 548.02 ms (544.80–551.15) | 570.11 ms (562.33–579.92) |
+| Wide 16   | 712.80 ms (702.08–723.81) | 714.19 ms (703.25–725.69) |
+| Deep 16   | 713.49 ms (701.39–727.30) | 712.40 ms (696.71–734.68) |
 | Mixed 4×4 | 690.55 ms (680.92–701.64) | 707.19 ms (696.97–719.56) |
 
 Process totals: user 74.63 s, system 0.26 s, wall 74.92 s, 99% CPU,
@@ -92,11 +102,11 @@ Process totals: user 74.63 s, system 0.26 s, wall 74.92 s, 99% CPU,
 
 ### Two Rayon workers
 
-| Shape | Diagnostics | Full compile |
-|---|---:|---:|
-| Single | 399.47 ms (397.53–401.73) | 408.29 ms (405.65–411.34) |
-| Wide 16 | 503.06 ms (502.04–504.10) | 531.73 ms (522.15–543.90) |
-| Deep 16 | 560.32 ms (552.68–568.83) | 582.30 ms (574.63–591.97) |
+| Shape     |               Diagnostics |              Full compile |
+| --------- | ------------------------: | ------------------------: |
+| Single    | 399.47 ms (397.53–401.73) | 408.29 ms (405.65–411.34) |
+| Wide 16   | 503.06 ms (502.04–504.10) | 531.73 ms (522.15–543.90) |
+| Deep 16   | 560.32 ms (552.68–568.83) | 582.30 ms (574.63–591.97) |
 | Mixed 4×4 | 508.53 ms (502.66–516.72) | 521.74 ms (515.44–532.15) |
 
 Process totals: user 74.84 s, system 0.46 s, wall 56.30 s, 133% CPU,
@@ -104,11 +114,11 @@ Process totals: user 74.84 s, system 0.46 s, wall 56.30 s, 133% CPU,
 
 ### Four Rayon workers
 
-| Shape | Diagnostics | Full compile |
-|---|---:|---:|
-| Single | 384.14 ms (378.98–389.84) | 398.82 ms (389.76–408.68) |
-| Wide 16 | 472.93 ms (465.68–484.30) | 485.69 ms (478.98–493.53) |
-| Deep 16 | 568.27 ms (557.58–578.31) | 564.01 ms (556.23–572.74) |
+| Shape     |               Diagnostics |              Full compile |
+| --------- | ------------------------: | ------------------------: |
+| Single    | 384.14 ms (378.98–389.84) | 398.82 ms (389.76–408.68) |
+| Wide 16   | 472.93 ms (465.68–484.30) | 485.69 ms (478.98–493.53) |
+| Deep 16   | 568.27 ms (557.58–578.31) | 564.01 ms (556.23–572.74) |
 | Mixed 4×4 | 491.30 ms (473.89–510.02) | 503.05 ms (487.24–523.05) |
 
 Process totals: user 77.45 s, system 0.55 s, wall 53.86 s, 144% CPU,
@@ -116,11 +126,11 @@ Process totals: user 77.45 s, system 0.55 s, wall 53.86 s, 144% CPU,
 
 ### Eight Rayon workers
 
-| Shape | Diagnostics | Full compile |
-|---|---:|---:|
-| Single | 393.51 ms (389.57–397.66) | 396.92 ms (387.62–409.18) |
-| Wide 16 | 463.96 ms (460.19–468.56) | 485.26 ms (476.98–493.93) |
-| Deep 16 | 565.13 ms (552.56–579.52) | 556.52 ms (551.45–561.78) |
+| Shape     |               Diagnostics |              Full compile |
+| --------- | ------------------------: | ------------------------: |
+| Single    | 393.51 ms (389.57–397.66) | 396.92 ms (387.62–409.18) |
+| Wide 16   | 463.96 ms (460.19–468.56) | 485.26 ms (476.98–493.93) |
+| Deep 16   | 565.13 ms (552.56–579.52) | 556.52 ms (551.45–561.78) |
 | Mixed 4×4 | 488.21 ms (474.80–503.03) | 492.18 ms (483.41–502.31) |
 
 Process totals: user 78.79 s, system 0.88 s, wall 53.54 s, 148% CPU,
@@ -132,6 +142,13 @@ confidence intervals overlap for every full compile and all but the small
 diagnostics case; small diagnostics regressed 2.4%. The follow-up raw Mixed
 diagnostics samples likewise averaged 470.4 ms at four workers and 478.3 ms at
 eight workers, a 1.7% regression rather than a gain.
+
+The percentage reductions above are point-estimate comparisons, not paired
+sample statistics. Criterion sample files for the full shape sweep were not
+retained, so the summary intervals cannot establish repeatability by themselves.
+The checked-in raw samples below support only the Mixed follow-up. Consequently,
+the evidence supports rejecting an unproven 4→8 expansion, but it is not a
+general statistical proof that eight workers cannot help.
 
 ### Raw repeated Mixed 4×4 samples
 
@@ -160,11 +177,11 @@ Values are milliseconds per operation calculated directly from Criterion's
 These four-worker cases share one process and pair fresh and exactly primed
 requests. Warm setup is untimed.
 
-| Shape | Fresh diagnostics | Warm diagnostics | Fresh full compile | Warm full compile |
-|---|---:|---:|---:|---:|
-| Single | 381.00 ms (371.28–394.70) | 3.6577 µs (3.3586–4.0219) | 385.08 ms (377.55–393.59) | 4.7953 µs (4.5015–5.0725) |
-| Wide 16 | 458.44 ms (432.57–489.00) | 3.3702 µs (3.0155–3.7617) | 457.66 ms (447.73–467.41) | 5.0984 µs (4.6051–5.6265) |
-| Deep 16 | 490.82 ms (483.37–498.42) | 3.5631 µs (3.3066–3.7939) | 555.88 ms (531.66–581.79) | 4.7439 µs (4.0370–5.5550) |
+| Shape     |         Fresh diagnostics |          Warm diagnostics |        Fresh full compile |         Warm full compile |
+| --------- | ------------------------: | ------------------------: | ------------------------: | ------------------------: |
+| Single    | 381.00 ms (371.28–394.70) | 3.6577 µs (3.3586–4.0219) | 385.08 ms (377.55–393.59) | 4.7953 µs (4.5015–5.0725) |
+| Wide 16   | 458.44 ms (432.57–489.00) | 3.3702 µs (3.0155–3.7617) | 457.66 ms (447.73–467.41) | 5.0984 µs (4.6051–5.6265) |
+| Deep 16   | 490.82 ms (483.37–498.42) | 3.5631 µs (3.3066–3.7939) | 555.88 ms (531.66–581.79) | 4.7439 µs (4.0370–5.5550) |
 | Mixed 4×4 | 440.79 ms (428.48–457.56) | 2.9869 µs (2.8348–3.1436) | 460.39 ms (452.18–467.94) | 4.2245 µs (3.8676–4.6057) |
 
 The event audit observed zero query executions for repeated diagnostics and
@@ -180,11 +197,11 @@ the two installed unrelated modules.
 A separate four-worker retained Mixed 4×4 run measured the existing public
 phase boundaries:
 
-| Inclusive boundary | Wall estimate | Increment over prior boundary |
-|---|---:|---:|
-| diagnostics | 458.29 ms (445.27–470.36) | — |
-| prebundle emitted project | 469.42 ms (452.92–486.18) | about 11 ms |
-| full compile | 506.05 ms (488.10–524.64) | about 37 ms |
+| Inclusive boundary        |             Wall estimate | Increment over prior boundary |
+| ------------------------- | ------------------------: | ----------------------------: |
+| diagnostics               | 458.29 ms (445.27–470.36) |                             — |
+| prebundle emitted project | 469.42 ms (452.92–486.18) |                   about 11 ms |
+| full compile              | 506.05 ms (488.10–524.64) |                   about 37 ms |
 
 Confidence intervals overlap, so the subtractions are attribution estimates,
 not independent Criterion distributions. The exact baseline-compatible sweep
@@ -289,29 +306,32 @@ process-global counting allocator. Ordinary current diagnostics/full compile
 were 460.34/477.14 ms; atomic accounting on every allocation, reallocation, and
 deallocation raised them to 868.81/843.16 ms. The historical executable used
 the same accounting yet measured 120.23/136.78 ms. Instrumentation therefore
-does not cause the regression: it demonstrates that the current diagnostics
-path performs substantially more allocation-sensitive ownership work.
+does not explain away the uninstrumented regression. The larger instrumented
+ratio does **not** by itself prove more allocation or ownership work: relaxed
+global atomics can also amplify contention in the current parallel diagnostics
+path relative to a differently scheduled historical pipeline.
 
 This orb had `/usr/bin/time` but no `perf`, Valgrind/Callgrind, DHAT, heaptrack,
 Samply, or cargo-flamegraph. Whole-process RSS rose from 304,516 KiB at one
 worker to 319,728 KiB at four and 329,576 KiB at eight. Because no allocation
-profiler was available, the remaining regression is attributed only to the
-narrowest supported boundary: environment/fact construction plus checking
-inside diagnostics. Allocation-site optimization should precede any additional
-parallel scheduling experiment.
+profiler was available, the remaining regression is localized only to the
+diagnostics query boundary. Lightweight built-in counters/timers around semantic
+environment construction, fact materialization, and checker execution—or an
+allocation/lock profiler—are needed before choosing an optimization. Additional
+parallel scheduling should not be added on the present evidence.
 
 ## Evaluated boundaries
 
-| Boundary | Decision | Evidence |
-|---|---|---|
-| Existing ambient-first independent module diagnostics | **Keep** | 20.4–33.7% clean wall win at four versus one worker; deterministic serial fold and warm backdating already tested. |
-| No additional concurrency | **Chosen** | Best end-to-end result after safeguards; four-to-eight scaling is flat, CPU occupancy is low, and RSS rises. |
-| Explicit dependency-ready semantic layers | Reject | Salsa already schedules demand; barriers reduce overlap and deep graphs have width one. |
-| Independent parse prewarm | Reject | Reachability requires parsing; all-active prewarm does unnecessary work and retains more ASTs. |
-| Per-definition lowering frontiers | Reject | Dynamic FIFO demand order is semantic; incremental edits have one item; total post-diagnostic ceiling is too small. |
-| Per-module emission prewarm | Reject | Safe only with cloned DBs plus serial fold, but measured prebundle ceiling is about 11 ms and memory pressure rises. |
-| Compiler-level bundling parallelism | Reject | One opaque project-wide Rolldown operation; no independent compiler boundary. |
-| Internal Node verification fan-out | Reject | Outside compiler latency and already governed by nextest; oversubscription risk. |
+| Boundary                                              | Decision   | Evidence                                                                                                             |
+| ----------------------------------------------------- | ---------- | -------------------------------------------------------------------------------------------------------------------- |
+| Existing ambient-first independent module diagnostics | **Keep**   | 20.4–33.7% clean wall win at four versus one worker; deterministic serial fold and warm backdating already tested.   |
+| No additional concurrency                             | **Chosen** | Best end-to-end result after safeguards; four-to-eight scaling is flat, CPU occupancy is low, and RSS rises.         |
+| Explicit dependency-ready semantic layers             | Reject     | Salsa already schedules demand; barriers reduce overlap and deep graphs have width one.                              |
+| Independent parse prewarm                             | Reject     | Reachability requires parsing; all-active prewarm does unnecessary work and retains more ASTs.                       |
+| Per-definition lowering frontiers                     | Reject     | Dynamic FIFO demand order is semantic; incremental edits have one item; total post-diagnostic ceiling is too small.  |
+| Per-module emission prewarm                           | Reject     | Safe only with cloned DBs plus serial fold, but measured prebundle ceiling is about 11 ms and memory pressure rises. |
+| Compiler-level bundling parallelism                   | Reject     | One opaque project-wide Rolldown operation; no independent compiler boundary.                                        |
+| Internal Node verification fan-out                    | Reject     | Outside compiler latency and already governed by nextest; oversubscription risk.                                     |
 
 ## Limitations
 
@@ -320,6 +340,10 @@ parallel scheduling experiment.
 - Criterion used ten samples and short warm-up/measurement targets to keep the
   full shape/thread matrix tractable; heavyweight cases extended the collection
   period automatically.
+- Full Criterion raw samples were not retained for the shape/thread matrix.
+  Only the Mixed follow-up samples printed above can be independently
+  recalculated; the 20.4–33.7% range otherwise relies on reported point
+  estimates and confidence intervals.
 - `/usr/bin/time` cannot attribute RSS or CPU occupancy to individual compiler
   phases, and its totals include the benchmark's invariant audit.
 - Parse and graph wall time cannot be independently observed through the public
@@ -329,3 +353,9 @@ parallel scheduling experiment.
   profile was available. The environment/checker split within diagnostics
   remains the next profiling target on a machine with `perf` or an allocation
   profiler.
+- Existing tests cover graph-order diagnostics, unchanged-query backdating,
+  shape invalidation, stable definition identity, emitted output, and Node
+  runtime output. They do not explicitly compare diagnostics, stable IDs, or
+  JavaScript across 1/2/4/8 worker processes, nor do they assert an
+  oversubscription bound. Because this change adds no runtime concurrency, that
+  is a limitation of the evidence rather than a new implementation regression.
