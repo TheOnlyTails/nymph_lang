@@ -2619,6 +2619,7 @@ fn prewarm_interface_module_diagnostics(
 				POOL
 					.get_or_init(|| {
 						rayon::ThreadPoolBuilder::new()
+							.num_threads(diagnostics_worker_limit())
 							.thread_name(|index| format!("nymph-diagnostics-{index}"))
 							.build()
 							.expect("build diagnostics worker pool")
@@ -2651,6 +2652,16 @@ fn prewarm_interface_module_diagnostics(
 	if let Err(payload) = result {
 		std::panic::resume_unwind(payload);
 	}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn diagnostics_worker_limit() -> usize {
+	let available = std::thread::available_parallelism().map_or(1, usize::from);
+	std::env::var("RAYON_NUM_THREADS")
+		.ok()
+		.and_then(|value| value.parse().ok())
+		.unwrap_or(available)
+		.clamp(1, available)
 }
 
 #[salsa::tracked(returns(clone))]

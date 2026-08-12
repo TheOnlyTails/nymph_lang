@@ -1,0 +1,6 @@
+{
+  "available_parallelism": 8,
+  "configured_workers": 8,
+  "observed_max_active": 8,
+  "requested_workers": 16
+}

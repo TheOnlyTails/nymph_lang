@@ -41,6 +41,11 @@ fn profiling_preserves_output_and_prewarm_never_exceeds_its_pool() {
 		profile.prewarm_configured_workers > 0,
 		"profile: {profile:#?}"
 	);
+	assert!(
+		profile.prewarm_configured_workers
+			<= std::thread::available_parallelism().map_or(1, usize::from),
+		"profile: {profile:#?}"
+	);
 	assert!(profile.prewarm_max_active > 0, "profile: {profile:#?}");
 	assert!(
 		profile.prewarm_max_active <= profile.prewarm_configured_workers,

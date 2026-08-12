@@ -16,6 +16,32 @@ enum Request {
 	Compile,
 }
 
+fn process_ticks() -> (u64, u64) {
+	let stat = std::fs::read_to_string("/proc/self/stat").expect("read /proc/self/stat");
+	let fields = stat
+		.rsplit_once(')')
+		.unwrap()
+		.1
+		.split_whitespace()
+		.collect::<Vec<_>>();
+	(fields[11].parse().unwrap(), fields[12].parse().unwrap())
+}
+
+fn memory_kib(field: &str) -> u64 {
+	std::fs::read_to_string("/proc/self/status")
+		.expect("read /proc/self/status")
+		.lines()
+		.find_map(|line| {
+			line
+				.strip_prefix(field)?
+				.split_whitespace()
+				.next()?
+				.parse()
+				.ok()
+		})
+		.unwrap()
+}
+
 fn shape(name: &str) -> GraphShape {
 	match name {
 		"single" => GraphShape::Single,
@@ -95,9 +121,13 @@ fn sample(shape_name: &str, request_name: &str, instrumented: bool) {
 	if instrumented {
 		begin_benchmark_profile();
 	}
+	let cold_rss_before_kib = memory_kib("VmRSS:");
+	let (cold_user_ticks_before, cold_system_ticks_before) = process_ticks();
 	let cold_started = Instant::now();
 	black_box(request(&session, &project, &entry, kind));
 	let cold_ns = cold_started.elapsed().as_nanos() as u64;
+	let (cold_user_ticks_after, cold_system_ticks_after) = process_ticks();
+	let cold_peak_rss_kib = memory_kib("VmHWM:");
 	let profile = instrumented.then(finish_benchmark_profile);
 
 	let warm_started = Instant::now();
@@ -118,6 +148,10 @@ fn sample(shape_name: &str, request_name: &str, instrumented: bool) {
 			"instrumented": instrumented,
 			"rayon_workers": std::env::var("RAYON_NUM_THREADS").expect("RAYON_NUM_THREADS is required").parse::<usize>().unwrap(),
 			"cold_wall_ns": cold_ns,
+			"cold_user_ticks": cold_user_ticks_after - cold_user_ticks_before,
+			"cold_system_ticks": cold_system_ticks_after - cold_system_ticks_before,
+			"cold_rss_before_kib": cold_rss_before_kib,
+			"cold_peak_rss_kib": cold_peak_rss_kib,
 			"warm_iterations": warm_iterations,
 			"warm_total_ns": warm_total_ns,
 			"warm_ns_per_iteration": warm_total_ns as f64 / warm_iterations as f64,
@@ -138,6 +172,42 @@ fn sorted_diagnostics(
 		.collect::<Vec<_>>();
 	diagnostics.sort();
 	diagnostics
+}
+
+fn ordered_error_diagnostics() -> Vec<String> {
+	let mut session = CompilerSession::new();
+	let project = ProjectId::new("issue-81-error-evidence");
+	for (path, source) in [
+		("leaf", "public func leaf(): int = 1\n"),
+		(
+			"left",
+			"import @/leaf with (leaf)\npublic func left(): int = \"left\"\n",
+		),
+		(
+			"right",
+			"import @/leaf with (leaf)\npublic func right(): int = \"right\"\n",
+		),
+		(
+			"main",
+			"import @/left with (left)\nimport @/right with (right)\npublic func value(): int = \"main\"\n",
+		),
+	] {
+		session.set_source(
+			project.clone(),
+			ModulePath::new(path).unwrap(),
+			source.into(),
+			SourceVersion(1),
+		);
+	}
+	session
+		.check_project(
+			project,
+			ModulePath::new("main").unwrap(),
+			EntryMode::Library,
+		)
+		.iter()
+		.map(|item| format!("{}::{:?}", item.module, item.diag))
+		.collect()
 }
 
 fn snapshot(shape_name: &str) {
@@ -194,6 +264,7 @@ fn snapshot(shape_name: &str) {
 			"kind": "snapshot",
 			"shape": shape_name,
 			"diagnostics_sorted": diagnostics,
+			"ordered_error_diagnostics": ordered_error_diagnostics(),
 			"graph_order": graph_order,
 			"stable_definition_ids": definitions,
 			"module_sources": module_sources,

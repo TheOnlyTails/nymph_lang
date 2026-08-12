@@ -25,7 +25,7 @@ PHASES = (
 	"parse", "interface_environment", "checker", "diagnostic_fold_wrapper",
 	"stable_lowering", "emission", "bundling",
 )
-ARTIFACTS = ("raw.jsonl", "snapshots.jsonl", "summary.json", "environment.json", "commands.txt")
+ARTIFACTS = ("raw.jsonl", "snapshots.jsonl", "summary.json", "environment.json", "commands.txt", "bound.json")
 
 
 def run(command: list[str], *, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -47,11 +47,14 @@ def environment() -> dict[str, object]:
 	return {
 		"platform": platform.platform(),
 		"machine": platform.machine(),
+		"available_parallelism": len(os.sched_getaffinity(0)),
 		"python": platform.python_version(),
 		"rustc": output("rustc", "--version", "--verbose"),
 		"cargo": output("cargo", "--version"),
 		"node": output("node", "--version"),
-		"commit": output("git", "rev-parse", "HEAD"),
+		"clock_ticks_per_second": int(output("getconf", "CLK_TCK")),
+		"capture_parent_commit": output("git", "rev-parse", "HEAD"),
+		"base_remote_tip": "269f87c963631f21ad53677c21e624e98f91f4f7",
 		"controls": {"CARGO_INCREMENTAL": "0", "RAYON_NUM_THREADS": list(WORKERS)},
 	}
 
@@ -80,9 +83,11 @@ def matrix(repeats: int) -> None:
 	DATA.mkdir(parents=True, exist_ok=True)
 	(DATA / "environment.json").write_text(json.dumps(environment(), indent=2, sort_keys=True) + "\n")
 	commands = [
-		"CARGO_INCREMENTAL=0 cargo build --release -p nymph-compiler --features test-support --bin issue_81_evidence",
-		"RAYON_NUM_THREADS={1,2,4,8} /usr/bin/time -f '%U %S %e %M' target/release/issue_81_evidence sample {single,wide,deep,mixed} {diagnostics,compile} {uninstrumented,instrumented}",
-		f"python3 scripts/issue-81-evidence.py matrix --repeats {repeats}",
+		f"CARGO_INCREMENTAL=0 python3 scripts/issue-81-evidence.py matrix --repeats {repeats}",
+		"python3 scripts/issue-81-evidence.py snapshots --repeats 3",
+		"python3 scripts/issue-81-evidence.py bound",
+		"python3 scripts/issue-81-evidence.py summarize",
+		"python3 scripts/issue-81-evidence.py verify",
 	]
 	(DATA / "commands.txt").write_text("\n".join(commands) + "\n")
 	with (DATA / "raw.jsonl").open("w") as output:
@@ -123,11 +128,34 @@ def snapshots(repeats: int) -> None:
 	print(f"deterministic snapshots: {len(WORKERS) * repeats * len(SHAPES)} exact matches")
 
 
+def bound() -> None:
+	build()
+	available = len(os.sched_getaffinity(0))
+	requested = available * 2
+	row = timed_sample(requested, "wide", "diagnostics", "instrumented")
+	profile = row["profile"]
+	assert profile["prewarm_configured_workers"] == available, row
+	assert profile["prewarm_max_active"] <= available, row
+	(DATA / "bound.json").write_text(json.dumps({
+		"available_parallelism": available,
+		"requested_workers": requested,
+		"configured_workers": profile["prewarm_configured_workers"],
+		"observed_max_active": profile["prewarm_max_active"],
+	}, indent=2, sort_keys=True) + "\n")
+
+
 def median(values: list[float]) -> float:
 	return statistics.median(values)
 
 
-def summary(rows: list[dict[str, object]]) -> dict[str, object]:
+def write_manifest() -> None:
+	(DATA / "artifacts.sha256").write_text("".join(
+		f"{hashlib.sha256((DATA / name).read_bytes()).hexdigest()}  {name}\n"
+		for name in ARTIFACTS
+	))
+
+
+def summary(rows: list[dict[str, object]], clock_ticks: int) -> dict[str, object]:
 	groups: dict[tuple[int, str, str, bool], list[dict[str, object]]] = {}
 	for row in rows:
 		key = (row["rayon_workers"], row["shape"], row["request"], row["instrumented"])
@@ -147,6 +175,12 @@ def summary(rows: list[dict[str, object]]) -> dict[str, object]:
 			"cold_ms_min": min(cold), "cold_ms_max": max(cold), "warm_us_median": median(warm),
 			"process_cpu_s_median": median([item["process"]["user_s"] + item["process"]["system_s"] for item in items]),
 			"peak_rss_kib_max": max(item["process"]["peak_rss_kib"] for item in items),
+			"cold_cpu_ticks_median": median([item["cold_user_ticks"] + item["cold_system_ticks"] for item in items]),
+			"cold_cpu_cores_median": median([
+				(item["cold_user_ticks"] + item["cold_system_ticks"]) / clock_ticks
+				/ (item["cold_wall_ns"] / 1e9) for item in items
+			]),
+			"cold_peak_rss_kib_max": max(item["cold_peak_rss_kib"] for item in items),
 		}
 		if instrumented:
 			group["prewarm_max_active_max"] = max(item["profile"]["prewarm_max_active"] for item in items)
@@ -182,8 +216,10 @@ def summary(rows: list[dict[str, object]]) -> dict[str, object]:
 
 def summarize() -> None:
 	rows = [json.loads(line) for line in (DATA / "raw.jsonl").read_text().splitlines()]
-	result = summary(rows)
+	clock_ticks = json.loads((DATA / "environment.json").read_text())["clock_ticks_per_second"]
+	result = summary(rows, clock_ticks)
 	(DATA / "summary.json").write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+	write_manifest()
 	print(json.dumps(result, indent=2, sort_keys=True))
 
 
@@ -258,20 +294,26 @@ def verify(data: Path) -> None:
 		shape = payload["shape"]
 		if shape in baseline and payload != baseline[shape]:
 			raise AssertionError(f"snapshot payload mismatch for {shape}")
+		if len(payload.get("ordered_error_diagnostics", [])) != 3:
+			raise AssertionError(f"non-empty diagnostic inventory mismatch for {shape}")
 		baseline.setdefault(shape, payload)
+	bound = json.loads((data / "bound.json").read_text())
+	if not 0 < bound["observed_max_active"] <= bound["configured_workers"] <= bound["available_parallelism"] < bound["requested_workers"]:
+		raise AssertionError(f"oversubscription bound mismatch: {bound}")
 
-	retained_summary = json.loads((data / "summary.json").read_text())
-	if retained_summary != summary(rows):
-		raise AssertionError("summary.json does not derive exactly from raw.jsonl")
 	environment = json.loads((data / "environment.json").read_text())
+	retained_summary = json.loads((data / "summary.json").read_text())
+	if retained_summary != summary(rows, environment["clock_ticks_per_second"]):
+		raise AssertionError("summary.json does not derive exactly from raw.jsonl")
 	if environment.get("controls") != {"CARGO_INCREMENTAL": "0", "RAYON_NUM_THREADS": list(WORKERS)}:
 		raise AssertionError("environment controls mismatch")
-	if not all(environment.get(name) for name in ("platform", "machine", "python", "rustc", "cargo", "node", "commit")):
+	if not all(environment.get(name) for name in ("platform", "machine", "python", "rustc", "cargo", "node", "clock_ticks_per_second", "capture_parent_commit", "base_remote_tip")):
 		raise AssertionError("environment metadata is incomplete")
 	commands = (data / "commands.txt").read_text().splitlines()
 	if commands != [
 		"CARGO_INCREMENTAL=0 python3 scripts/issue-81-evidence.py matrix --repeats 5",
 		"python3 scripts/issue-81-evidence.py snapshots --repeats 3",
+		"python3 scripts/issue-81-evidence.py bound",
 		"python3 scripts/issue-81-evidence.py summarize",
 		"python3 scripts/issue-81-evidence.py verify",
 	]:
@@ -293,6 +335,7 @@ def main() -> None:
 	for name, default in (("matrix", 5), ("snapshots", 3)):
 		command = sub.add_parser(name)
 		command.add_argument("--repeats", type=int, default=default)
+	sub.add_parser("bound")
 	sub.add_parser("summarize")
 	verify_parser = sub.add_parser("verify")
 	verify_parser.add_argument("--data-dir", type=Path, default=DATA)
@@ -301,6 +344,8 @@ def main() -> None:
 		matrix(args.repeats)
 	elif args.command == "snapshots":
 		snapshots(args.repeats)
+	elif args.command == "bound":
+		bound()
 	elif args.command == "summarize":
 		summarize()
 	else:
