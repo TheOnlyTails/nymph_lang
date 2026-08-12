@@ -98,6 +98,7 @@ const loading = ref(true);
 const compiling = ref(false);
 const failure = ref("");
 const activeTab = ref<"tokens" | "ast" | "types" | "javascript">("tokens");
+const feedbackTab = ref<"diagnostics" | "console">("diagnostics");
 const editor = ref<HTMLTextAreaElement | null>(null);
 const highlightedEditor = ref<HTMLElement | null>(null);
 const diagnosticPopup = ref<DiagnosticPopup | null>(null);
@@ -252,6 +253,7 @@ function scheduleInspection() {
 
 function runProgram() {
 	stopProgram(false);
+	feedbackTab.value = "console";
 	consoleLines.value = [];
 	if (compiling.value) {
 		consoleLines.value.push({ level: "system", text: "Wait for compilation to finish." });
@@ -499,36 +501,53 @@ onBeforeUnmount(() => {
 			</section>
 		</div>
 
-		<section class="diagnostics" aria-live="polite">
-			<header>
-				<strong>Diagnostics</strong>
-				<span>{{ result?.diagnostics.length ?? 0 }}</span>
+		<section class="feedback-panel" aria-live="polite">
+			<header class="feedback-tabs" role="tablist" aria-label="Diagnostics and console">
+				<button
+					type="button"
+					role="tab"
+					:aria-selected="feedbackTab === 'diagnostics'"
+					@click="feedbackTab = 'diagnostics'"
+				>
+					Diagnostics <span>{{ result?.diagnostics.length ?? 0 }}</span>
+				</button>
+				<button
+					type="button"
+					role="tab"
+					:aria-selected="feedbackTab === 'console'"
+					@click="feedbackTab = 'console'"
+				>
+					Console
+					<i v-if="running" class="loading-dot" aria-label="Running"></i>
+				</button>
+				<button
+					v-if="feedbackTab === 'console' && consoleLines.length"
+					type="button"
+					class="clear-console"
+					@click="consoleLines = []"
+				>
+					Clear
+				</button>
 			</header>
-			<button
-				v-for="diagnostic in result?.diagnostics ?? []"
-				:key="`${diagnostic.code}-${diagnostic.start}-${diagnostic.message}`"
-				type="button"
-				class="diagnostic"
-				:class="`is-${diagnostic.severity}`"
-				@click="selectRange(diagnostic.start, diagnostic.end)"
-			>
-				<span class="severity">{{ diagnostic.severity }}</span>
-				<span class="message">{{ diagnostic.message }}</span>
-				<code>{{ diagnostic.code }}</code>
-				<small>{{ diagnostic.start_line }}:{{ diagnostic.start_col }}</small>
-			</button>
-			<p v-if="!result?.diagnostics.length" class="clean-state">
-				✓ No diagnostics. The module compiles cleanly.
-			</p>
-		</section>
-
-		<section class="console-panel" aria-live="polite">
-			<header>
-				<strong>Console</strong>
-				<span v-if="running" class="console-running"><i class="loading-dot"></i> Running</span>
-				<button v-if="consoleLines.length" type="button" @click="consoleLines = []">Clear</button>
-			</header>
-			<div class="console-output">
+			<div v-if="feedbackTab === 'diagnostics'" role="tabpanel">
+				<button
+					v-for="diagnostic in result?.diagnostics ?? []"
+					:key="`${diagnostic.code}-${diagnostic.start}-${diagnostic.message}`"
+					type="button"
+					class="diagnostic"
+					:class="`is-${diagnostic.severity}`"
+					@click="selectRange(diagnostic.start, diagnostic.end)"
+				>
+					<span class="severity">{{ diagnostic.severity }}</span>
+					<span class="message">{{ diagnostic.message }}</span>
+					<code>{{ diagnostic.code }}</code>
+					<small>{{ diagnostic.start_line }}:{{ diagnostic.start_col }}</small>
+				</button>
+				<p v-if="!result?.diagnostics.length" class="clean-state">
+					✓ No diagnostics. The module compiles cleanly.
+				</p>
+			</div>
+			<div v-else class="console-output" role="tabpanel">
 				<p v-for="(line, index) in consoleLines" :key="index" :class="`console-${line.level}`">
 					<span aria-hidden="true">{{ line.level === "result" ? "←" : ">" }}</span
 					>{{ line.text }}
@@ -586,8 +605,7 @@ onBeforeUnmount(() => {
 .lab-toolbar,
 .pipeline,
 .tabs,
-.diagnostics header,
-.console-panel header,
+.feedback-tabs,
 .example-buttons,
 .lab-actions,
 .compiler-state {
@@ -725,8 +743,7 @@ button {
 	gap: 16px;
 }
 .lab-panel,
-.diagnostics,
-.console-panel {
+.feedback-panel {
 	overflow: hidden;
 	border: 1px solid var(--lab-border);
 	border-radius: 12px;
@@ -1130,17 +1147,32 @@ pre code {
 	font-weight: 500;
 }
 
-.diagnostics {
+.feedback-panel {
 	margin-top: 16px;
 }
-.diagnostics header,
-.console-panel header {
-	gap: 8px;
-	padding: 10px 14px;
+.feedback-tabs {
+	height: 44px;
+	padding: 0 8px;
 	border-bottom: 1px solid var(--lab-border);
 	background: var(--vp-c-bg-soft);
 }
-.diagnostics header span {
+.feedback-tabs > button:not(.clear-console) {
+	display: flex;
+	align-items: center;
+	align-self: stretch;
+	gap: 7px;
+	padding: 0 10px;
+	border: 0;
+	border-bottom: 2px solid transparent;
+	background: transparent;
+	color: var(--vp-c-text-2);
+	cursor: pointer;
+}
+.feedback-tabs > button[aria-selected="true"] {
+	border-color: var(--vp-c-brand-1);
+	color: var(--vp-c-brand-1);
+}
+.feedback-tabs button span {
 	display: grid;
 	place-items: center;
 	min-width: 21px;
@@ -1149,17 +1181,7 @@ pre code {
 	background: var(--vp-c-default-soft);
 	font-size: 12px;
 }
-.console-panel {
-	margin-top: 16px;
-	border: 1px solid var(--lab-border);
-	border-radius: 12px;
-	background: #121212;
-}
-.console-panel header {
-	background: var(--vp-c-bg-soft);
-	color: var(--vp-c-text-1);
-}
-.console-panel header button {
+.feedback-tabs .clear-console {
 	margin-left: auto;
 	padding: 3px 8px;
 	border: 0;
@@ -1167,14 +1189,7 @@ pre code {
 	color: var(--vp-c-text-2);
 	cursor: pointer;
 }
-.console-running {
-	display: flex;
-	align-items: center;
-	gap: 7px;
-	color: var(--vp-c-green-1);
-	font-size: 12px;
-}
-.console-running .loading-dot {
+.feedback-tabs .loading-dot {
 	display: inline-block;
 }
 .console-output {
@@ -1183,6 +1198,7 @@ pre code {
 	max-height: 260px;
 	overflow: auto;
 	padding: 10px 14px;
+	background: #121212;
 	color: #dbd7caee;
 	font: 12px/1.6 var(--vp-font-family-mono);
 }
