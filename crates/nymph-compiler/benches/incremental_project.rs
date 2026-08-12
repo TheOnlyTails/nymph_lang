@@ -427,6 +427,14 @@ fn baseline_compatible_clean_check(fixture: &GraphFixture) -> usize {
 	diagnostics.len()
 }
 
+fn retained_shape(shape: GraphShape, request_kind: Request, warm_request: bool) -> RetainedState {
+	let state = install(shape.generate().sources().clone());
+	if warm_request {
+		black_box(request(&state, request_kind));
+	}
+	state
+}
+
 fn incremental_project(c: &mut Criterion) {
 	audit_preflight();
 	let cases: &[(&str, fn() -> RetainedState, Request)] = &[
@@ -498,24 +506,54 @@ fn incremental_project(c: &mut Criterion) {
 	}
 	group.finish();
 
-	// Preserve the exact historical Mixed 4×4 fixture and stateless facade
-	// operation boundary solely for clean-build regression comparison. It is
-	// intentionally not an incremental acceptance case.
+	// Keep shape-sensitive cold and memoized measurements in one executable so
+	// concurrency changes can be checked against wide, deep, mixed, and small
+	// graphs under identical process, allocator, and toolchain conditions.
+	let shapes = [
+		("single", GraphShape::Single),
+		("wide-16", GraphShape::Wide { leaves: 16 }),
+		("deep-16", GraphShape::Deep { depth: 16 }),
+		("mixed-4x4", GraphShape::Mixed { width: 4, depth: 4 }),
+	];
+	let mut shaped = c.benchmark_group("profile-shapes");
+	for (shape_name, shape) in shapes {
+		for (request_name, request_kind) in [
+			("diagnostics", Request::Diagnostics),
+			("full-compile", Request::FullCompile),
+		] {
+			for (temperature, warm_request) in [("fresh", false), ("warm", true)] {
+				shaped.bench_function(format!("{shape_name}/{request_name}/{temperature}"), |b| {
+					b.iter_batched_ref(
+						|| retained_shape(shape, request_kind, warm_request),
+						|state| black_box(request(black_box(state), request_kind)),
+						BatchSize::PerIteration,
+					);
+				});
+			}
+		}
+	}
+	shaped.finish();
+
+	// Preserve the exact historical fixtures and stateless facade operation
+	// boundary solely for clean-build regression and concurrency comparison.
+	// These are intentionally not incremental acceptance cases.
 	let mut historical = c.benchmark_group("baseline-compatible");
-	historical.bench_function("mixed-4x4/diagnostics", |b| {
-		b.iter_batched(
-			|| GraphShape::Mixed { width: 4, depth: 4 }.generate(),
-			|fixture| black_box(baseline_compatible_clean_check(black_box(&fixture))),
-			BatchSize::SmallInput,
-		);
-	});
-	historical.bench_function("mixed-4x4/full-compile", |b| {
-		b.iter_batched(
-			|| GraphShape::Mixed { width: 4, depth: 4 }.generate(),
-			|fixture| black_box(baseline_compatible_clean_compile(black_box(&fixture))),
-			BatchSize::SmallInput,
-		);
-	});
+	for (shape_name, shape) in shapes {
+		historical.bench_function(format!("{shape_name}/diagnostics"), |b| {
+			b.iter_batched(
+				|| shape.generate(),
+				|fixture| black_box(baseline_compatible_clean_check(black_box(&fixture))),
+				BatchSize::SmallInput,
+			);
+		});
+		historical.bench_function(format!("{shape_name}/full-compile"), |b| {
+			b.iter_batched(
+				|| shape.generate(),
+				|fixture| black_box(baseline_compatible_clean_compile(black_box(&fixture))),
+				BatchSize::SmallInput,
+			);
+		});
+	}
 	historical.finish();
 }
 
