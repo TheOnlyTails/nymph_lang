@@ -110,6 +110,8 @@ pub(crate) fn emitted_interface_module<'db>(
 ) -> StableEmissionResult<String> {
 	#[cfg(feature = "test-support")]
 	db.semantic_query_will_execute("emitted_interface_module", module);
+	#[cfg(feature = "test-support")]
+	let _timing = super::benchmark_support::phase(super::benchmark_support::Phase::Emission);
 	let stable = match queries::lower_interface_module(db, key, module) {
 		Ok(module) => module,
 		Err(error) => {
@@ -599,6 +601,8 @@ pub(crate) fn compiled_interface_project<'db>(
 			));
 		}
 	}
+	#[cfg(feature = "test-support")]
+	let _timing = super::benchmark_support::phase(super::benchmark_support::Phase::Bundling);
 	match bundle::bundle(key.entry(db).as_str(), module_sources) {
 		Ok(js) => StableEmissionResult::Value(Arc::new(CompiledProject {
 			js,

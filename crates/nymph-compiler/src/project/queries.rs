@@ -938,6 +938,8 @@ pub(crate) fn parse_builtin(db: &dyn Db, module: BuiltinModuleInput) -> Arc<Pars
 }
 
 fn parse_source(source: Arc<str>, path: String) -> Arc<ParsedModule> {
+	#[cfg(feature = "test-support")]
+	let _timing = super::benchmark_support::phase(super::benchmark_support::Phase::Parse);
 	let parsed = nymph_syntax::parse_module(&source, path);
 	Arc::new(ParsedModule {
 		tree: parsed.tree,
@@ -2048,6 +2050,8 @@ pub(crate) fn lower_interface_module<'db>(
 ) -> Result<Arc<nymph_sema::StableHirModule>, nymph_sema::StableModuleAssemblyError> {
 	#[cfg(feature = "test-support")]
 	db.semantic_query_will_execute("lower_interface_module", module);
+	#[cfg(feature = "test-support")]
+	let _timing = super::benchmark_support::phase(super::benchmark_support::Phase::StableLowering);
 	let graph = project_graph(db, key);
 	let mut environments = vec![module];
 	environments.extend(graph.semantic_closure(module).iter().copied());
@@ -2333,6 +2337,9 @@ pub(crate) fn interface_module_analysis<'db>(
 	}
 	roots.extend(dependencies);
 	let parsed = module.parsed(db);
+	#[cfg(feature = "test-support")]
+	let environment_timing =
+		super::benchmark_support::phase(super::benchmark_support::Phase::Environment);
 	let mut environment = nymph_sema::SemanticEnvironment::from_modules_with_runtime_roles(
 		module.identity(db),
 		&roots,
@@ -2363,6 +2370,10 @@ pub(crate) fn interface_module_analysis<'db>(
 			.map(|(name, binding)| (name.clone(), binding.clone())),
 	);
 	environment.set_resolved_imports(bindings);
+	#[cfg(feature = "test-support")]
+	drop(environment_timing);
+	#[cfg(feature = "test-support")]
+	let checker_timing = super::benchmark_support::phase(super::benchmark_support::Phase::Checker);
 	let result = nymph_sema::check_module_with_owned_environment(
 		Arc::new(parsed.tree.clone()),
 		environment,
@@ -2376,6 +2387,11 @@ pub(crate) fn interface_module_analysis<'db>(
 			}
 		},
 	);
+	#[cfg(feature = "test-support")]
+	drop(checker_timing);
+	#[cfg(feature = "test-support")]
+	let _reporting_timing =
+		super::benchmark_support::phase(super::benchmark_support::Phase::DiagnosticReporting);
 	let qualified_access_causes = result
 		.analysis
 		.annotations
@@ -2608,11 +2624,15 @@ fn prewarm_interface_module_diagnostics(
 							.expect("build diagnostics worker pool")
 					})
 					.install(|| {
+						#[cfg(feature = "test-support")]
+						super::benchmark_support::record_prewarm_workers(rayon::current_num_threads());
 						if let (Some((registry, modules)), Some(workers)) = (ambient, ambient_workers) {
 							workers
 								.into_par_iter()
 								.zip(modules.into_par_iter())
 								.for_each(|(worker, module)| {
+									#[cfg(feature = "test-support")]
+									let _active = super::benchmark_support::prewarm_task();
 									ambient_core_environment(worker.as_ref(), registry, module);
 								});
 						}
@@ -2620,6 +2640,8 @@ fn prewarm_interface_module_diagnostics(
 							.into_par_iter()
 							.zip(modules.into_par_iter())
 							.for_each(|(worker, module)| {
+								#[cfg(feature = "test-support")]
+								let _active = super::benchmark_support::prewarm_task();
 								interface_module_diagnostics(worker.as_ref(), key, module);
 							});
 					});
@@ -2669,6 +2691,9 @@ pub(crate) fn interface_project_diagnostics<'db>(
 		});
 		prewarm_interface_module_diagnostics(db, key, ambient, graph.semantic_order.to_vec());
 	}
+	#[cfg(feature = "test-support")]
+	let _reporting_timing =
+		super::benchmark_support::phase(super::benchmark_support::Phase::DiagnosticReporting);
 	let mut all = Vec::new();
 	for module in graph.semantic_order.iter().copied() {
 		all.extend(

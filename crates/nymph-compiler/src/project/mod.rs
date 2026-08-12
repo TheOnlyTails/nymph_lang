@@ -11,6 +11,8 @@
 //! reverse-importer relation is derived from that same graph.
 
 mod assembly;
+#[cfg(feature = "test-support")]
+mod benchmark_support;
 mod bundle;
 pub mod documentation;
 mod emission;
@@ -32,6 +34,11 @@ pub use session::{
 
 #[cfg(feature = "test-support")]
 pub use emission::StableEmittedProject;
+
+#[cfg(feature = "test-support")]
+pub use benchmark_support::{
+	BenchmarkPhaseTiming, BenchmarkProfile, begin_benchmark_profile, finish_benchmark_profile,
+};
 
 #[cfg(feature = "test-support")]
 pub use session::SemanticQueryEvent;
