@@ -98,7 +98,7 @@ pub struct ImplDef {
 	pub interface: DefId,
 	/// The span of the interface reference in the `impl … for …` header, used to
 	/// anchor a coherence (conflicting-impl) diagnostic.
-	pub legacy_span: Option<Span>,
+	pub source_span: Option<Span>,
 	/// Interface argument bindings (`Other = …`, `Output = …`), by parameter name,
 	/// with `self` already substituted to `self_ty`.
 	pub args: Vec<(EcoString, Ty)>,
@@ -473,7 +473,7 @@ impl Checker<'_> {
 		// method (top-level `impl … for` or a nested `impl Iface { .. }`) of the
 		// same name as the ADT's own inherent method used to type-check clean (the
 		// two collection passes never compared notes) and only panicked later in
-		// `lower_hir.rs`'s `assert_no_duplicate_methods` — which walks exactly this
+		// runtime lowering's duplicate-method assertion — which walks exactly this
 		// combined method list for a struct/enum's *generated JS class*. Deliberately
 		// scoped to `Head::Adt`: builtin scalar/collection types (e.g. `string`) never
 		// materialize a JS class this way, so an inherent method and an interface-impl
@@ -490,7 +490,7 @@ impl Checker<'_> {
 			// A same-named method declared twice inside ONE `impl Iface { .. }`/`impl
 			// Iface for T { .. }` block used to silently last-wins here (mirrored by
 			// the `methods.insert` below), leaving the first body entirely unchecked
-			// while `lower_hir.rs` emits every one it walks — the same soundness hole
+			// while runtime lowering emits every declaration — the same soundness hole
 			// `collect_impl_member` (members.rs) closes for inherent members. This is
 			// the shared insert point for BOTH top-level `impl … for` and nested
 			// `impl Iface { .. }` (both funnel through `finish_interface_impl`), so
@@ -609,7 +609,7 @@ impl Checker<'_> {
 			generics: names,
 			self_ty,
 			interface,
-			legacy_span: Some(iface_name.1),
+			source_span: Some(iface_name.1),
 			args,
 			methods,
 			constraints,

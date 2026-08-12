@@ -129,22 +129,9 @@ pub struct Resolution {
 	/// Stable semantic identity of the selected concrete impl, when known.
 	pub implementation: Option<DefinitionId>,
 	/// Exact checker-owned dispatch result. This is the authoritative channel
-	/// for stable runtime projection; the legacy optional fields above remain
-	/// temporarily while lowering consumers migrate.
+	/// for stable runtime projection; the optional identities above support
+	/// definition annotations and dispatch classification.
 	pub resolved_target: Option<ResolvedMethodTarget>,
-	/// The defining span of whatever provided `method` — an impl's own `impl
-	/// Interface … for …`/nested `impl Interface { .. }` header (the `Ident`
-	/// naming the interface, `solve::ImplDef::span`), or an interface's own
-	/// span when resolved through a still-generic bound. `None` for a
-	/// `BuiltinEager`/`BuiltinShortCircuit` dispatch, which never goes through
-	/// the impl index at all. Lowering (Slice: stdlib body materialization)
-	/// reads this back to locate, inside the reconstructed offset prelude AST,
-	/// exactly which prelude impl/interface-default body a
-	/// `UserImplDefaultMethod` dispatch is unmaterialized *from* — the same
-	/// span `crate::infer_expr::impl_is_unmaterialized` already compares
-	/// against `SPAN_BASE` to classify `dispatch` in the first place, just
-	/// carried forward instead of discarded.
-	pub impl_span: Option<Span>,
 }
 
 fn map_resolution_types(resolution: &mut Resolution, map: &mut impl FnMut(Ty) -> Ty) {
@@ -351,10 +338,6 @@ impl Annotations {
 	}
 	pub(crate) fn record_control_target(&mut self, jump: NodeId, target: ResolvedControlTarget) {
 		self.control_targets.insert(jump, target);
-	}
-
-	pub(crate) fn control_target_of(&self, jump: NodeId) -> Option<ResolvedControlTarget> {
-		self.control_targets.get(&jump).copied()
 	}
 
 	pub(crate) fn control_targets(
@@ -828,7 +811,7 @@ pub struct ImplementationMemberSourcePath {
 	pub member: u32,
 }
 
-/// Legacy checker result. Fact field access remains compatible through dereferencing.
+/// Diagnostic-bearing result returned by direct semantic checks.
 #[derive(Clone, Debug)]
 pub struct Checked {
 	pub diags: Vec<Diagnostic>,

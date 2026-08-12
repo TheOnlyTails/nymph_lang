@@ -9,7 +9,7 @@
 
 use crate::errors::TypeError;
 use ecow::EcoString;
-use nymph_ast::{NodeId, Span, decl::Declaration, decl::Module};
+use nymph_ast::{NodeId, Span, decl::Module};
 use nymph_diagnostics::Diagnostic;
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -273,7 +273,7 @@ pub(crate) fn check_module_impl(module: &Module, entry: EntryMode) -> Checked {
 		0,
 		0,
 		0,
-		false,
+		true,
 		Some(&identity),
 		FxHashMap::default(),
 	)
@@ -375,7 +375,7 @@ fn check_module_from_parts(
 	// (iface.rs) can cross-check an interface-impl method against the owning type's
 	// already-known inherent methods (Slice 4K, HH3) — closing the ICE where a
 	// same-named inherent method and interface-impl method type-checked clean and
-	// only panicked later in `lower_hir.rs`'s `assert_no_duplicate_methods`. Neither
+	// only panicked later during runtime lowering. Neither
 	// pass reads data the other produces otherwise, so this reordering is safe.
 	checker.collect_inherent();
 	checker.collect_impls();
@@ -781,33 +781,6 @@ pub fn check_module(module: &Module) -> Checked {
 /// diagnostics it can emit.
 pub fn check_module_entry(module: &Module) -> Checked {
 	check_module_impl(module, EntryMode::Entry)
-}
-
-/// Check several modules together as one program.
-///
-/// This is the **minimal multi-module driver** (the module-resolution shim the plan
-/// anticipated): it flattens every module's top-level declarations into one combined
-/// module and runs the single-module checker over the result. `import` statements are
-/// dropped — after flattening, every item shares a single global namespace, so an
-/// `import @/x with (Y)` needs no separate binding step. This lets the cross-file
-/// stdlib typecheck before the full salsa module graph (a later project-layer concern)
-/// exists. It deliberately does *not* yet enforce per-module visibility or import
-/// aliasing; those arrive with the real module graph.
-pub fn check_program(modules: &[Module]) -> Checked {
-	let mut members = Vec::new();
-	for module in modules {
-		for decl in &module.members {
-			if matches!(decl, Declaration::Import { .. }) {
-				continue;
-			}
-			members.push(decl.clone());
-		}
-	}
-	let combined = Module {
-		members,
-		path: "<program>".into(),
-	};
-	check_module(&combined)
 }
 
 impl<'m> Checker<'m> {
@@ -1733,11 +1706,10 @@ mod tests {
 		);
 
 		let span = Span::new(0, 0);
-		let (_, resolved, _, _, defining_span, _) = checker
+		let (_, resolved, _, _, _) = checker
 			.resolve_inherent(self_ty, false, "get", &[], &[], span)
 			.expect("imported instance method should resolve");
 		assert_eq!(resolved, int);
-		assert_eq!(defining_span, None);
 		assert_eq!(
 			checker.resolve_namespaced(record, "make", &[], &[], span),
 			Some((self_ty, None, Vec::new()))
@@ -1911,7 +1883,7 @@ mod tests {
 					generics: Vec::new(),
 					self_ty,
 					interface,
-					legacy_span: None,
+					source_span: None,
 					args: Vec::new(),
 					methods: method.into_iter().collect(),
 					constraints: Vec::new(),

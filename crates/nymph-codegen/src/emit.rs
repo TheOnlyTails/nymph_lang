@@ -1961,7 +1961,7 @@ impl<'a> Emitter<'a> {
 				// reachable: `infer_assign`'s field/index arm, infer_expr.rs, accepts
 				// any place expression including `IndexAccess` with no restriction,
 				// and a `Map`-typed receiver's `IndexAccess` lowers to
-				// `HirExpr::MapGet` just like a read, lower_hir.rs — so `m[k] = v`
+				// `HirExpr::MapGet` just like a read, so `m[k] = v`
 				// reaches here as `Assign { target: MapGet { .. }, .. }` from a
 				// zero-diagnostic program).
 				if let HirExpr::MapGet { recv, key } = target.as_ref() {
@@ -1983,7 +1983,7 @@ impl<'a> Emitter<'a> {
 				// but with a COMPUTED member (`SimpleAssignmentTarget` also inherits
 				// `ComputedMemberExpression`) — confirmed reachable the same way as
 				// the `Map` case above: a non-`Map` receiver's `IndexAccess` lowers to
-				// `HirExpr::Index` (lower_hir.rs), so `xs[i] = value` reaches here as
+				// `HirExpr::Index`, so `xs[i] = value` reaches here as
 				// `Assign { target: Index { .. }, .. }` from a zero-diagnostic
 				// program. This `unreachable!` used to fire (an ICE) on exactly that
 				// valid input (confirmed by probe: `func f(xs: #[int], i: int): void

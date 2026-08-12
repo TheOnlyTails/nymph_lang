@@ -11,9 +11,8 @@
 //! [`type_at`]'s arguments MUST have the exact same declaration layout used
 //! for checking. Pointer identity is unnecessary and cloning the module is
 //! safe, but declaration filtering, order, and nesting must be identical:
-//! local `DefId` and `DefOrigin::Local::member` are assigned ordinally. For prelude-aware
-//! checks, use the [`crate::CheckedModule::module`] returned alongside its
-//! [`crate::CheckedModule::checked`].
+//! local `DefId` and `DefOrigin::Local::member` are assigned ordinally. Use the
+//! module and checked facts from the same semantic analysis.
 //!
 //! Only [`nymph_ast::expr::Expr`] nodes carry a [`nymph_ast::NodeId`] and
 //! get annotated — patterns (including a `let` binder's own name), types,

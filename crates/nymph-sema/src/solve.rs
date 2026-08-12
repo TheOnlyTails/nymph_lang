@@ -56,15 +56,6 @@ pub(crate) struct MethodResolution {
 	pub(crate) target: Option<DefinitionId>,
 	pub(crate) implementation: Option<DefinitionId>,
 	pub(crate) resolved_target: Option<crate::annotate::ResolvedMethodTarget>,
-	/// The span of the matched impl's `interface … for …` header (`ImplDef::span`),
-	/// when resolution went through the impl index (`Inherent`/`GenericBound`
-	/// don't: neither commits a specific `impl` block, see their construction
-	/// sites). Lets a caller tell whether the impl that provided this method (or
-	/// whose interface default it fell back to) lives in the program lowering
-	/// will actually walk, or was cloned from an offset prelude module (a span
-	/// `>= check_module_with_prelude`'s `SPAN_BASE`) and so is never lowered —
-	/// see `dispatch_kind_for` in `infer_expr.rs`.
-	pub(crate) impl_span: Option<Span>,
 }
 
 impl Checker<'_> {
@@ -82,7 +73,7 @@ impl Checker<'_> {
 		let receiver_is_mut = matches!(self.interner.kind(resolved), TyKind::Mut(_));
 		let receiver = self.strip_mut(resolved);
 
-		if let Some((params, ty, target, implementation, method_span, type_arguments)) =
+		if let Some((params, ty, target, implementation, type_arguments)) =
 			self.resolve_inherent_value(receiver, receiver_is_mut, name, span)
 		{
 			let resolved_target =
@@ -103,7 +94,6 @@ impl Checker<'_> {
 				target,
 				implementation,
 				resolved_target,
-				impl_span: method_span,
 			});
 		}
 
@@ -215,7 +205,6 @@ impl Checker<'_> {
 			target,
 			implementation: None,
 			resolved_target,
-			impl_span: Some(self.defs.data(interface).span),
 		})
 	}
 
@@ -228,7 +217,6 @@ impl Checker<'_> {
 			target: None,
 			implementation: None,
 			resolved_target: None,
-			impl_span: None,
 		}
 	}
 
@@ -585,14 +573,8 @@ impl Checker<'_> {
 	/// `param_bounds`, or bounds minted for an `impl Iface` type in `synthetic_bounds`).
 	/// The concrete impl is chosen later, where the parameter is instantiated; here the
 	/// result is the interface method's return type with `Self` bound to the parameter,
-	/// paired with the `DefId` of the interface the bound was satisfied through — its
-	/// caller (`resolve_method`) reads that back into `MethodResolution::impl_span`
-	/// (Finding 1/3, stdlib linkage groundwork review round 2): a bound interface
-	/// declared inside an offset prelude clone has a `DefData::span` `>= SPAN_BASE`,
-	/// letting `impl_is_unmaterialized` (`infer_expr.rs`) flag a `GenericBound`
-	/// resolution as prelude-origin exactly the way it already does for
-	/// `ImplDirect`/`InterfaceDefault`, without changing behavior for an ordinary
-	/// user-declared interface bound (whose span is always well below `SPAN_BASE`).
+	/// paired with the stable identity of the interface that satisfied the bound.
+	/// Runtime ownership and projection are derived from that identity.
 	pub(crate) fn resolve_param_method(
 		&mut self,
 		param: ParamIdx,
@@ -723,8 +705,8 @@ impl Checker<'_> {
 					// at the consuming module rather than silently accepting incoherence or
 					// reconstructing provenance from dependency syntax.
 					let span = b
-						.legacy_span
-						.or(a.legacy_span)
+						.source_span
+						.or(a.source_span)
 						.unwrap_or_else(|| Span::new(0, 0));
 					self.emit(span, TypeError::ConflictingImpls { iface });
 				}
@@ -838,14 +820,6 @@ impl Checker<'_> {
 				recv,
 				span,
 			);
-			// `iface_id`'s own `DefData::span` doubles as the prelude-origin marker
-			// `impl_is_unmaterialized` (`infer_expr.rs`) reads (Finding 1/3, stdlib
-			// linkage groundwork review round 2): an interface declared inside an
-			// offset prelude clone has a span `>= SPAN_BASE`, so a default-method
-			// body checked generically against a prelude-only interface is
-			// correctly flagged as unmaterialized too, exactly like every other
-			// `GenericBound` construction site below.
-			let iface_span = self.defs.data(iface_id).span;
 			let resolved_target = self
 				.defs
 				.stable(iface_id)
@@ -874,7 +848,6 @@ impl Checker<'_> {
 					target: method.definition.clone(),
 					implementation: None,
 					resolved_target: resolved_target.clone(),
-					impl_span: Some(iface_span),
 				});
 			}
 			for (i, (param, arg)) in params.iter().zip(arg_tys).enumerate() {
@@ -893,12 +866,11 @@ impl Checker<'_> {
 				target: method.definition,
 				implementation: None,
 				resolved_target,
-				impl_span: Some(iface_span),
 			});
 		}
 
 		// Inherent methods take priority over interface methods.
-		if let Some((params, ret, target, implementation, method_span, type_arguments)) =
+		if let Some((params, ret, target, implementation, type_arguments)) =
 			self.resolve_inherent(recv, recv_is_mut, name, arg_tys, arg_lits, span)
 		{
 			let resolved_target =
@@ -919,7 +891,6 @@ impl Checker<'_> {
 				target,
 				implementation,
 				resolved_target,
-				impl_span: method_span,
 			});
 		}
 
@@ -966,7 +937,6 @@ impl Checker<'_> {
 				target,
 				implementation: None,
 				resolved_target,
-				impl_span: Some(self.defs.data(iface_def).span),
 			});
 		}
 
@@ -1070,7 +1040,6 @@ impl Checker<'_> {
 					target: None,
 					implementation: None,
 					resolved_target: None,
-					impl_span: None,
 				})
 			}
 			1 => {
@@ -1092,7 +1061,6 @@ impl Checker<'_> {
 					target: None,
 					implementation: None,
 					resolved_target: None,
-					impl_span: None,
 				})
 			}
 		}
@@ -1121,7 +1089,7 @@ impl Checker<'_> {
 		match method.and_then(|method| method.definition.as_ref()) {
 			Some(member) => implementation.member_catalog.target(member).is_some(),
 			None => {
-				// Identity-less `check_module` is a diagnostics-only compatibility API.
+				// Direct `check_module` has no compiler-owned member identities.
 				// Preserve type checking there, but never fabricate a stable target.
 				implementation.methods.contains_key(name) || method.is_some_and(|method| method.has_default)
 			}
@@ -1257,7 +1225,6 @@ impl Checker<'_> {
 				target,
 				implementation,
 				resolved_target,
-				impl_span: def.legacy_span,
 			};
 		};
 		if let Some((arg_tys, arg_lits)) = arguments {
@@ -1278,7 +1245,6 @@ impl Checker<'_> {
 					target,
 					implementation,
 					resolved_target,
-					impl_span: def.legacy_span,
 				};
 			}
 			for (i, (param, arg)) in params.iter().zip(arg_tys).enumerate() {
@@ -1306,7 +1272,6 @@ impl Checker<'_> {
 			target,
 			implementation,
 			resolved_target,
-			impl_span: def.legacy_span,
 		}
 	}
 

@@ -361,9 +361,8 @@ impl ModuleAnalysis {
 
 	/// Query the checked type at a source offset.
 	///
-	/// This is the safe tooling seam: the private module has the exact flattened
-	/// declaration layout that produced `checked`, while `module` remains the
-	/// public source/rewrite AST used by lowering and NodeId/span annotations.
+	/// The semantic analysis and source module share the exact AST identity and
+	/// coordinate system used by checking and stable lowering.
 	#[must_use]
 	pub fn type_at(&self, offset: usize) -> Option<String> {
 		let checked = nymph_sema::Checked {
@@ -532,6 +531,7 @@ impl CompilerSession {
 		input.set_source(&mut self.db).to(Arc::from(source));
 	}
 
+	#[cfg(feature = "test-support")]
 	fn semantic_input(
 		&self,
 		project: &ProjectId,

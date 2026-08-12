@@ -4,7 +4,7 @@
 //! through the interface solver), `print`/`println` are bare, receiver-less
 //! calls (`ExprKind::Call { func: Identifier(..), .. }`) to a TOP-LEVEL
 //! `external` func — a callee shape the pre-existing dispatch in
-//! `nymph-sema`'s `lower_hir.rs` never recognized at all, falling through to
+//! stable runtime lowering never recognized at all, falling through to
 //! a plain `HirExpr::Call` to a name with no JS binding (silent-wrong-JS, a
 //! runtime `ReferenceError`).
 //!

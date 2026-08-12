@@ -270,7 +270,7 @@ fn unrelated_anonymous_binder_insertion_does_not_change_public_interface() {
 }
 
 #[test]
-fn recovered_flattened_implementation_keeps_current_module_provenance_and_shape() {
+fn recovered_implementation_keeps_current_module_provenance_and_shape() {
 	let mut session = CompilerSession::without_builtin_sources();
 	let project = ProjectId::new("recovered-provenance");
 	for (path, source) in [

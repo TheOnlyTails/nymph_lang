@@ -2,14 +2,7 @@
 
 use std::io::Write;
 use std::process::Command;
-use std::sync::{
-	OnceLock,
-	atomic::{AtomicU64, Ordering},
-};
-
-use nymph_codegen::emit;
-use nymph_sema::{check_module_with_prelude, lower_hir_with_prelude};
-use nymph_syntax::parse_module;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Compile a Nymph source module to a JS module string.
 fn compile(src: &str) -> String {
@@ -17,41 +10,8 @@ fn compile(src: &str) -> String {
 		.unwrap_or_else(|diagnostics| panic!("compile errors: {diagnostics:?}"))
 }
 
-/// Compile `user_src` against `prelude_src` (a single prelude module, checked and
-/// lowered the same paired way `check_module_with_prelude`/`lower_hir_with_prelude`
-/// are documented to be used — see `crates/nymph-sema/tests/prelude.rs`) to a JS
-/// module string. Used by [`run_with_prelude`] to drive the
-/// collections-materialization payoff (and negative-defer) tests under Node,
-/// mirroring [`compile`] but threading a prelude module through.
-fn compile_with_prelude(user_src: &str, prelude_src: &str) -> String {
-	let user = parse_module(user_src, "test");
-	assert!(
-		!user.diagnostics.iter().any(|d| d.is_error()),
-		"parse errors in user source: {:?}",
-		user.diagnostics
-	);
-	let prelude = parse_module(prelude_src, "prelude");
-	assert!(
-		!prelude.diagnostics.iter().any(|d| d.is_error()),
-		"parse errors in prelude source: {:?}",
-		prelude.diagnostics
-	);
-	let prelude_modules = std::slice::from_ref(&prelude.tree);
-	let checked = check_module_with_prelude(&user.tree, prelude_modules);
-	assert!(
-		checked.diags.iter().all(|d| !d.is_error()),
-		"check errors: {:?}",
-		checked.diags
-	);
-	emit(&lower_hir_with_prelude(
-		&user.tree,
-		prelude_modules,
-		&checked,
-	))
-}
-
 /// Append a driver that logs `call`, run the already-compiled `js` module under
-/// Node, and return trimmed stdout. Shared by [`run`] and [`run_with_prelude`].
+/// Node, and return trimmed stdout.
 fn run_js(mut js: String, call: &str) -> String {
 	// Nymph values are boxed at the generated-JS boundary. Most tests in this
 	// file assert a program's observable scalar result rather than its runtime
@@ -129,13 +89,6 @@ fn run_failure(src: &str, call: &str) -> String {
 	let _ = std::fs::remove_file(path);
 	assert!(!output.status.success(), "node unexpectedly succeeded");
 	String::from_utf8_lossy(&output.stderr).to_string()
-}
-
-/// Same as [`run`], but `user_src` is checked/lowered against `prelude_src` as a
-/// prelude module (`check_module_with_prelude`/`lower_hir_with_prelude`) — for
-/// driving the collections-materialization payoff under Node.
-fn run_with_prelude(user_src: &str, prelude_src: &str, call: &str) -> String {
-	run_js(compile_with_prelude(user_src, prelude_src), call)
 }
 
 #[test]
@@ -1325,7 +1278,7 @@ fn runs_bare_return_in_a_void_function() {
 #[test]
 fn runs_return_inside_a_statement_position_while() {
 	// A `return` inside a `while` body must target the enclosing function, not
-	// some IIFE — the `while` body is flattened via `block_stmt`, never wrapped.
+	// an unnecessary IIFE — the `while` body remains in statement position.
 	// (`result` starts with `-1` on the SAME statement as its `let`, not as a
 	// line-leading operator that would continue the `while` via subtraction.)
 	let src = r#"
@@ -1358,7 +1311,7 @@ fn runs_return_inside_a_statement_position_while() {
 #[test]
 fn runs_return_inside_a_statement_position_match() {
 	// A braced match-arm body (`-> { return .. }`) in a STATEMENT-position match
-	// (not a subexpression) emits for free — the whole `match` is flattened via
+	// (not a subexpression) emits directly — the whole `match` stays in
 	// `block_stmt`, never wrapped in an IIFE, so the `return` inside targets the
 	// enclosing function correctly.
 	let src = r#"
@@ -3451,153 +3404,16 @@ fn runs_a_map_spread_computed_key_eval_order() {
 	);
 }
 
-// ── Collections materialization: extending `try_materialize_prelude_dispatch`
-// to inherent `impl<T> #[T]`/`impl<K,V> #{K:V}` blocks (never scanned before
-// this slice — it only ever handled `impl … for …`), so a pure-Nymph method
-// resolved through a PRELUDE-ONLY inherent impl on `List`/`Map` materializes
-// as a top-level `$std$$<tag>$<method>` function instead of panicking at
-// `lower_hir.rs`'s "does not yet support dispatching a method call to a
-// method resolved through a prelude-only impl" gate. ──────────────────────────
-
-#[test]
-fn runs_prelude_list_inherent_method_materializes_and_runs() {
-	// The headline payoff: `second()` lives ONLY in a synthetic prelude
-	// inherent impl on `#[T]` (never declared by the user module at all) —
-	// before this slice, calling it panicked in lowering; now it materializes
-	// to `$std$$list$second($self) => $self[1]` and actually runs under Node.
-	let prelude = "impl<T> #[T] { func second(): T = this[1] }";
-	let user = r#"
-		func f(): int = {
-			let xs = #[10, 20, 30]
-			xs.second()
-		}
-	"#;
-	assert_eq!(run_with_prelude(user, prelude, "f()"), "20");
-}
-
-#[test]
-fn runs_prelude_mut_list_inherent_method_materializes_and_runs() {
-	// Same mechanism, through an `impl<T> mut #[T]` block (the `mutable` flag
-	// folds into the mangled tag as `mut_list`, distinct from the plain `list`
-	// tag above, so the two never collide under the same mangled name). Reads
-	// (not arithmetic) on the still-generic `T` — `a + b` on a bound generic
-	// `T` is an unrelated, pre-existing GenericBound-dispatch limitation
-	// (erased-generic `Plus` always compiles to `.plus(...)`, which a raw JS
-	// number has no method for), nothing to do with this slice's gap.
-	let prelude = "impl<T> mut #[T] { func first_elem(): T = this[0] }";
-	let user = r#"
-		func f(): int = {
-			let mut xs = #[7, 1, 1]
-			xs.first_elem()
-		}
-	"#;
-	assert_eq!(run_with_prelude(user, prelude, "f()"), "7");
-}
-
-#[test]
-fn runs_prelude_map_inherent_method_materializes_and_runs() {
-	// Same mechanism, on `#{K: V}` — proves the `Map` arm of
-	// `inherent_self_type_tag`, not just `List`.
-	let prelude = "impl<K, V> #{K: V} { func answer(): int = 42 }";
-	let user = r#"
-		func f(): int = {
-			let m = #{1: "a"}
-			m.answer()
-		}
-	"#;
-	assert_eq!(run_with_prelude(user, prelude, "f()"), "42");
-}
-
-/// Every real stdlib collection module, parsed once, as the FULL prelude
-/// needed to typecheck `stdlib/src/collections/{list,map}.nym` in isolation
-/// (their own `import`s name `Option`/`Plus`/`Into`/`Contains`/`Equals`, which
-/// in turn need `Result`/`Default`/the rest of `ops` — imports are DROPPED by
-/// `check_module_with_prelude`, not resolved, so every transitively-named
-/// declaration must be supplied directly as a flattened prelude module,
-/// mirroring `stdlib_check.rs`'s whole-stdlib acceptance test).
-fn real_collections_prelude() -> &'static [nymph_ast::decl::Module] {
-	static PRELUDE: OnceLock<Vec<nymph_ast::decl::Module>> = OnceLock::new();
-	PRELUDE
-		.get_or_init(load_real_collections_prelude)
-		.as_slice()
-}
-
-fn load_real_collections_prelude() -> Vec<nymph_ast::decl::Module> {
-	let stdlib_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-		.join("../../stdlib/src")
-		.canonicalize()
-		.unwrap();
-	let mut files = Vec::new();
-	fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
-		for entry in std::fs::read_dir(dir).unwrap() {
-			let path = entry.unwrap().path();
-			if path.is_dir() {
-				walk(&path, out);
-			} else if path.extension().is_some_and(|e| e == "nym") {
-				out.push(path);
-			}
-		}
-	}
-	walk(&stdlib_dir, &mut files);
-	files.sort();
-	files
-		.iter()
-		.map(|f| {
-			let source = std::fs::read_to_string(f).unwrap();
-			let parsed = parse_module(&source, f.to_str().unwrap());
-			assert!(
-				!parsed.diagnostics.iter().any(|d| d.is_error()),
-				"{}: parse errors: {:?}",
-				f.display(),
-				parsed.diagnostics
-			);
-			parsed.tree
-		})
-		.collect()
-}
-
-/// Compile `user_src` against the FULL real stdlib as prelude ([`real_collections_prelude`]).
-fn compile_against_real_stdlib(user_src: &str) -> String {
-	let user = parse_module(user_src, "test");
-	assert!(
-		!user.diagnostics.iter().any(|d| d.is_error()),
-		"parse errors in user source: {:?}",
-		user.diagnostics
-	);
-	let prelude_modules = real_collections_prelude();
-	let checked = check_module_with_prelude(&user.tree, prelude_modules);
-	assert!(
-		checked.diags.iter().all(|d| !d.is_error()),
-		"check errors: {:?}",
-		checked.diags
-	);
-	emit(&lower_hir_with_prelude(
-		&user.tree,
-		prelude_modules,
-		&checked,
-	))
-}
-
 #[test]
 fn real_list_push_materializes_once_push_is_linked() {
-	// `push` (`external(push)` in `list.nym`'s `impl<T> mut #[T]`) is now LINKED
-	// for a mut-list receiver (`nymph_hir::linkage::REGISTRY`'s
-	// `("push", Some("mut_list"))` row, L2), so `xs.push(1)` no longer
-	// loud-defers: it lowers to `HirExpr::ExternCall` and emits a plain
-	// `push($_this, 1)` call plus a deduped `import { push } from
-	// "std/collections/list"`. Shape-only (the bare `emit` harness resolves no
-	// imports); the bundle-path e2e in `nymph-compiler`'s `tests/std_linkage.rs`
-	// proves it actually mutates + runs.
-	let user = "func f(xs: mut #[int]): void = xs.push(1)";
-	let js = compile_against_real_stdlib(user);
-	assert!(
-		js.contains("import { push as $nymph_external$call$"),
-		"expected a linked-external import for `push`, got:\n{js}"
-	);
-	assert!(
-		js.contains("push("),
-		"expected `f`'s materialized body to call the linked `push`, got:\n{js}"
-	);
+	let user = r#"
+		func check(): int = {
+			let xs = #[1]
+			xs.push(2)
+			xs[1]
+		}
+	"#;
+	assert_eq!(run(user, "check()"), "2");
 }
 
 #[test]
@@ -3615,7 +3431,7 @@ fn mixed_int_uint_operators_run_under_node() {
 		func lt(a: int, b: uint): boolean = a < b\n\
 		func eq(a: int, b: uint): boolean = a == b\n\
 		func ne(a: int, b: uint): boolean = a != b";
-	let js = compile_against_real_stdlib(src);
+	let js = compile(src);
 	assert_eq!(run_js(js.clone(), "add(new NInt(3), new NUint(2))"), "5");
 	assert_eq!(run_js(js.clone(), "sub(new NInt(2), new NUint(5))"), "-3");
 	assert_eq!(run_js(js.clone(), "mul(new NInt(4), new NUint(3))"), "12");
@@ -3634,28 +3450,15 @@ fn mixed_int_uint_operators_run_under_node() {
 // longer counts it as unlinked, so `is_empty` materializes: its `this.length()`
 // lowers to `HirExpr::ExternCall`, which emits a module-qualified local call
 // plus a deduped import from `std/collections/list`. This can't
-// be RUN directly — `compile_against_real_stdlib` uses the bare `emit`
-// harness, which (per `run_node.rs`'s own module doc) never resolves imports,
-// only string-appends a trailing `console.log`; running an unresolved
-// `import` under plain `node` would throw `ERR_MODULE_NOT_FOUND`. So this
-// asserts the emitted JS SHAPE instead of running it — the bundle-path e2e in
+// is asserted here at the emitted-JS boundary; the bundle-path e2e in
 // `nymph-compiler`'s `tests/std_linkage.rs` proves the same mechanism actually
 // RUNS, imports resolved and all.
 #[test]
 fn real_list_is_empty_materializes_once_length_is_linked() {
-	let user = "func f(xs: #[int]): boolean = xs.is_empty()";
-	let js = compile_against_real_stdlib(user);
-	assert!(
-		js.contains("import { length as $nymph_external$call$"),
-		"expected a linked-external import for `length`, got:\n{js}"
-	);
-	assert!(
-		js.matches("$nymph_external$call$").count() >= 2,
-		"expected `is_empty`'s materialized body to call the linked `length`, got:\n{js}"
-	);
-	assert!(
-		js.contains("is_empty"),
-		"expected `is_empty` itself to materialize as a top-level function, got:\n{js}"
+	let user = "func check(): #(boolean, boolean) = { let xs: #[int] = #[]\n #(xs.is_empty(), #[1].is_empty()) }";
+	assert_eq!(
+		run(user, "JSON.stringify(nymphTestValue(check()))"),
+		"[true,false]"
 	);
 }
 
@@ -3675,16 +3478,13 @@ fn real_list_is_empty_materializes_once_length_is_linked() {
 // through the user's own `match`).
 #[test]
 fn real_list_get_materializes_once_get_is_linked() {
-	let user = "func f(xs: #[int]): Option<int> = xs.get(0)";
-	let js = compile_against_real_stdlib(user);
-	assert!(
-		js.contains("import { get as $nymph_external$call$"),
-		"expected a linked-external import for `get`, got:\n{js}"
-	);
-	assert!(
-		js.matches("$nymph_external$call$").count() >= 2,
-		"expected `f`'s materialized body to call the linked `get`, got:\n{js}"
-	);
+	let user = r#"
+		func check(): int = match (#[7].get(0)) {
+			Some(value) -> value,
+			None -> 0,
+		}
+	"#;
+	assert_eq!(run(user, "check()"), "7");
 }
 
 // FLIP (Gap 3, L3): `map.nym`'s `get` shares the SAME bare marker as
@@ -3701,16 +3501,13 @@ fn real_list_get_materializes_once_get_is_linked() {
 // proves the mechanism actually RUNS.
 #[test]
 fn real_map_get_materializes_once_get_is_linked() {
-	let user = "func f(m: mut #{int: int}): Option<int> = m.get(1)";
-	let js = compile_against_real_stdlib(user);
-	assert!(
-		js.contains("import { get as $nymph_external$call$"),
-		"expected a linked-external import for `get`, got:\n{js}"
-	);
-	assert!(
-		js.matches("$nymph_external$call$").count() >= 2,
-		"expected `f`'s materialized body to call the linked `get`, got:\n{js}"
-	);
+	let user = r#"
+		func check(): int = match (#{1: 9}.get(1)) {
+			Some(value) -> value,
+			None -> 0,
+		}
+	"#;
+	assert_eq!(run(user, "check()"), "9");
 }
 
 // FLIP (Gap 3, L3): `map.nym`'s `is_empty` (`this.size() == 0`) is
@@ -3720,15 +3517,10 @@ fn real_map_get_materializes_once_get_is_linked() {
 // as unlinked and `is_empty` materializes.
 #[test]
 fn real_map_is_empty_materializes_once_size_is_linked() {
-	let user = "func f(m: #{int: int}): boolean = m.is_empty()";
-	let js = compile_against_real_stdlib(user);
-	assert!(
-		js.contains("import { size as $nymph_external$call$"),
-		"expected a linked-external import for `size`, got:\n{js}"
-	);
-	assert!(
-		js.contains("is_empty"),
-		"expected `is_empty` itself to materialize as a top-level function, got:\n{js}"
+	let user = "func check(): #(boolean, boolean) = { let m: #{int: int} = #{}\n #(m.is_empty(), #{1: 2}.is_empty()) }";
+	assert_eq!(
+		run(user, "JSON.stringify(nymphTestValue(check()))"),
+		"[true,false]"
 	);
 }
 
@@ -3739,15 +3531,11 @@ fn real_map_is_empty_materializes_once_size_is_linked() {
 // unmaterializable shape — external/transitively-external collection
 // intrinsics, a still-generic `GenericBound` receiver, and a genuinely
 // unmaterializable body like `T.default()` through type erasure). See
-// `compile_against_real_stdlib` for the full real-stdlib prelude, and
-// `run_against_real_stdlib` below for the same shape driven under Node.
+// Stable compilation projects those methods onto the enum's runtime class.
 
-/// Same as [`compile_against_real_stdlib`], but the compiled JS runs under
-/// Node (`run_js`) and the trimmed stdout is returned — the real-stdlib
-/// counterpart of [`run_with_prelude`], for the named-type prelude method
-/// materialization payoff.
+/// Compile through the stable compiler session, run under Node, and return stdout.
 fn run_against_real_stdlib(user_src: &str, call: &str) -> String {
-	run_js(compile_against_real_stdlib(user_src), call)
+	run(user_src, call)
 }
 
 #[test]
@@ -3758,17 +3546,16 @@ fn real_option_is_some_and_is_none_materialize_onto_the_option_class_and_run() {
 	// call inside `is_none`'s own body must resolve as a plain sibling method
 	// call, not panic or re-route through the mangled-function path.
 	let user = r#"
-		func check(o: Option<int>): #(boolean, boolean) = #(o.is_some(), o.is_none())
+		func check_some(): #(boolean, boolean) = #(Some(1).is_some(), Some(1).is_none())
+		func inspect(o: Option<int>): #(boolean, boolean) = #(o.is_some(), o.is_none())
+		func check_none(): #(boolean, boolean) = inspect(None)
 	"#;
 	assert_eq!(
-		run_against_real_stdlib(
-			user,
-			"JSON.stringify(nymphTestValue(check(Option.Some({ value: new NInt(1) }))))"
-		),
+		run_against_real_stdlib(user, "JSON.stringify(nymphTestValue(check_some()))"),
 		"[true,false]"
 	);
 	assert_eq!(
-		run_against_real_stdlib(user, "JSON.stringify(nymphTestValue(check(Option.None)))"),
+		run_against_real_stdlib(user, "JSON.stringify(nymphTestValue(check_none()))"),
 		"[false,true]"
 	);
 }
@@ -3780,16 +3567,15 @@ fn real_option_match_over_a_materialized_enum_runs() {
 	// materializes the CLASS itself (variants included) regardless of demand,
 	// and `Some`/`None` are its ordinary variant bindings.
 	let user = r#"
-		func unwrap_or(o: Option<int>): int = match (o) {
+		func check_some(): int = match (Some(42)) {
 			Some(value) -> value,
 			None -> 0,
 		}
+		func inspect(o: Option<int>): int = match (o) { Some(value) -> value, None -> 0 }
+		func check_none(): int = inspect(None)
 	"#;
-	assert_eq!(
-		run_against_real_stdlib(user, "unwrap_or(Option.Some({ value: 42 }))"),
-		"42"
-	);
-	assert_eq!(run_against_real_stdlib(user, "unwrap_or(Option.None)"), "0");
+	assert_eq!(run_against_real_stdlib(user, "check_some()"), "42");
+	assert_eq!(run_against_real_stdlib(user, "check_none()"), "0");
 }
 
 #[test]
@@ -3799,12 +3585,9 @@ fn real_option_map_materializes_and_runs() {
 	// machinery — untouched by this fix) and itself constructing a `Some` via
 	// `VariantNew` inside the materialized body.
 	let user = r#"
-		func inc(o: Option<int>): Option<int> = o.map((x) -> x + 1)
+		func check(): int = match (Some(1).map((x) -> x + 1)) { Some(value) -> value, None -> 0 }
 	"#;
-	assert_eq!(
-		run_against_real_stdlib(user, "inc(Option.Some({ value: new NInt(1) })).value"),
-		"2"
-	);
+	assert_eq!(run_against_real_stdlib(user, "check()"), "2");
 }
 
 #[test]
@@ -3816,13 +3599,12 @@ fn real_option_unwrap_via_the_unwrap_interface_materializes_onto_the_class() {
 	// Its own parameter is literally named `default` (a JS reserved word) —
 	// exercising `declare`'s reserved-word rename fix too.
 	let user = r#"
-		func get_or(o: Option<int>, default: int): int = o.unwrap(default)
+		func check_some(): int = Some(7).unwrap(0)
+		func inspect(o: Option<int>): int = o.unwrap(9)
+		func check_none(): int = inspect(None)
 	"#;
-	assert_eq!(
-		run_against_real_stdlib(user, "get_or(Option.Some({ value: 7 }), 0)"),
-		"7"
-	);
-	assert_eq!(run_against_real_stdlib(user, "get_or(Option.None, 9)"), "9");
+	assert_eq!(run_against_real_stdlib(user, "check_some()"), "7");
+	assert_eq!(run_against_real_stdlib(user, "check_none()"), "9");
 }
 
 #[test]
@@ -3846,26 +3628,16 @@ fn real_result_ok_and_err_cross_materialize_option_from_convert_nym() {
 	// route through `try_materialize_prelude_dispatch` at all, so it
 	// wouldn't actually exercise (or need) this slice's mechanism.
 	let user = r#"
-		func ok_is_some(r: Result<int, string>): boolean = r.ok().is_some()
-		func err_value(r: Result<int, string>): string = match (r.err()) {
+		func inspect_ok(r: Result<int, string>): boolean = r.ok().is_some()
+		func ok_is_some(): boolean = inspect_ok(Ok(5))
+		func inspect_err(r: Result<int, string>): string = match (r.err()) {
 			Some(value) -> value,
 			None -> "no error",
 		}
+		func err_value(): string = inspect_err(Error(error = "boom"))
 	"#;
-	assert_eq!(
-		run_against_real_stdlib(
-			user,
-			"ok_is_some(Object.setPrototypeOf(Result.Ok({ value: 5 }), nymphType(Result.$nymph$type, [NInt.prototype, NString.prototype])))"
-		),
-		"true"
-	);
-	assert_eq!(
-		run_against_real_stdlib(
-			user,
-			"err_value(Object.setPrototypeOf(Result.Error({ error: 'boom' }), nymphType(Result.$nymph$type, [NInt.prototype, NString.prototype])))"
-		),
-		"boom"
-	);
+	assert_eq!(run_against_real_stdlib(user, "ok_is_some()"), "true");
+	assert_eq!(run_against_real_stdlib(user, "err_value()"), "boom");
 }
 
 #[test]
@@ -3877,187 +3649,27 @@ fn real_option_map_or_default_lowers_its_hidden_canonical_type_object_dispatch()
 	let user = r#"
 		func get(o: Option<int>): int = o.map_or_default((x) -> x)
 	"#;
-	let js = compile_against_real_stdlib(user);
+	let js = compile(user);
 	assert!(js.contains("$type$0.default()"), "{js}");
 	assert!(js.contains("map_or_default(f, $type$0)"), "{js}");
 	assert!(js.contains("o.map_or_default("), "{js}");
 }
 
 #[test]
-fn real_range_contains_emits_generic_comparison_dispatch() {
+fn real_range_contains_runs_generic_comparison_dispatch() {
 	let user = r#"
 		func in_range(x: int): boolean = {
 			let r = Range(start = 0, end = 5)
 			r.contains(x)
 		}
 	"#;
-	let js = compile_against_real_stdlib(user);
-	assert!(js.contains("Symbol.for(\"nymph.int\")"), "{js}");
-	assert!(js.contains("$std$Comparable$int$less_than_eq"), "{js}");
-	assert!(js.contains("$std$Comparable$int$greater_than"), "{js}");
-}
-
-// ── Structural-collection interface-impl materialization (`ImplFor` targeting
-// `#[T]`/`#{K:V}`): extending `try_materialize_prelude_dispatch`'s `ImplFor`
-// branch to tag a structural receiver the same way the inherent `Impl` branch
-// already does (Gap 1), and giving an interface default body materialized as
-// a top-level mangled function a way to resolve an INNER sibling-interface-
-// method call against the SAME concrete impl the outer call already found
-// (Gap 2) — previously both panicked at the "prelude-only impl" wall, even
-// though the bodies involved are pure Nymph with no `external` anywhere
-// (Gap 3, the stdlib linkage wall, is deliberately untouched — see the
-// `real_*_stays_a_loud_*_defer` tests above, which must keep panicking). ──
-
-#[test]
-fn runs_prelude_interface_own_method_on_list_materializes_and_runs() {
-	// Gap 1: `own_pure` lives only in an `impl<T> SomeIface for #[T]` block
-	// (an interface impl targeting a STRUCTURAL list type, never scanned by
-	// the `ImplFor` branch's old `primitive_type_tag` call, which returns
-	// `None` for `Type::List`). Before the fix this panicked in lowering;
-	// now it tags as `list` via `inherent_self_type_tag` (the same tag the
-	// INHERENT `impl<T> #[T]` branch already used) and materializes to
-	// `$std$SomeIface$list$own_pure($self) => 42`.
-	let prelude = r#"
-		interface SomeIface {
-			func own_pure(): int
-		}
-		impl<T> SomeIface for #[T] {
-			func own_pure(): int = 42
-		}
-	"#;
-	let user = r#"
-		func f(): int = {
-			let xs = #[10, 20, 30]
-			xs.own_pure()
-		}
-	"#;
-	assert_eq!(run_with_prelude(user, prelude, "f()"), "42");
-}
-
-#[test]
-fn runs_prelude_interface_own_method_on_map_materializes_and_runs() {
-	// Same mechanism as above, on `#{K: V}` — proves the `Map` arm of
-	// `inherent_self_type_tag` through the `ImplFor` branch too, not just
-	// `List` or the pre-existing inherent-`Impl` branch.
-	let prelude = r#"
-		interface SomeIface {
-			func own_pure(): int
-		}
-		impl<K, V> SomeIface for #{K: V} {
-			func own_pure(): int = 42
-		}
-	"#;
-	let user = r#"
-		func f(): int = {
-			let m = #{1: "a"}
-			m.own_pure()
-		}
-	"#;
-	assert_eq!(run_with_prelude(user, prelude, "f()"), "42");
-}
-
-#[test]
-fn runs_prelude_interface_default_calling_sibling_method_on_list_materializes_and_runs() {
-	// Gap 2: `doubled` is `SomeIface`'s own DEFAULT body, calling the
-	// interface's own required `base()` through `this` — required, so this
-	// impl block must (and does) provide its own `base`, not fall back to
-	// another default. The checker types `doubled`'s `this.base()` call
-	// generically against `SomeIface`'s own synthetic `this`, so that inner
-	// call's `impl_span` names the INTERFACE declaration, never this
-	// concrete `impl<T> SomeIface for #[T]` block — the ordinary span-scan
-	// in `try_materialize_prelude_dispatch` can never match it. Before the
-	// fix this panicked mid-materialization (`base` "not yet supported");
-	// now `lower_runtime_func` pushes a sibling-dispatch frame while
-	// lowering `doubled`'s own body, so the inner call resolves directly to
-	// `$std$SomeIface$list$base` — the SAME mangled name a direct outer call
-	// to `.base()` would produce — and `.doubled()` runs to `21 + 21 = 42`.
-	let prelude = r#"
-		interface SomeIface {
-			func base(): int
-			func doubled(): int = this.base() + this.base()
-		}
-		impl<T> SomeIface for #[T] {
-			func base(): int = 21
-		}
-	"#;
-	let user = r#"
-		func f(): int = {
-			let xs = #[10, 20, 30]
-			xs.doubled()
-		}
-	"#;
-	assert_eq!(run_with_prelude(user, prelude, "f()"), "42");
-}
-
-#[test]
-fn runs_prelude_interface_default_calling_another_default_on_list_materializes_and_runs() {
-	// Gap 2 variant: `doubled`'s sibling `base` is ALSO a default (not
-	// overridden by this impl block at all — the `impl<T> SomeIface for
-	// #[T] { }` body is empty), exercising the sibling-frame fallback's own
-	// interface-default lookup (`resolve_impl_for_source`'s `own_member.or_else`
-	// branch), not just an impl-provided override.
-	let prelude = r#"
-		interface SomeIface {
-			func base(): int = 21
-			func doubled(): int = this.base() + this.base()
-		}
-		impl<T> SomeIface for #[T] {
-		}
-	"#;
-	let user = r#"
-		func f(): int = {
-			let xs = #[10, 20, 30]
-			xs.doubled()
-		}
-	"#;
-	assert_eq!(run_with_prelude(user, prelude, "f()"), "42");
-}
-
-#[test]
-fn runs_prelude_interface_default_calling_sibling_method_on_map_materializes_and_runs() {
-	// Gap 2, `Map` receiver variant — same mechanism as the list case, on
-	// the other structural collection type.
-	let prelude = r#"
-		interface SomeIface {
-			func base(): int
-			func doubled(): int = this.base() + this.base()
-		}
-		impl<K, V> SomeIface for #{K: V} {
-			func base(): int = 21
-		}
-	"#;
-	let user = r#"
-		func f(): int = {
-			let m = #{1: "a"}
-			m.doubled()
-		}
-	"#;
-	assert_eq!(run_with_prelude(user, prelude, "f()"), "42");
-}
-
-#[test]
-#[should_panic(
-	expected = "does not yet support dispatching a method call to a method resolved through a prelude-only impl"
-)]
-fn real_set_insert_stays_a_loud_transitively_external_defer() {
-	// `Set.insert` (`this.inner.insert(item, #())`, set.nym) calls the real Map's
-	// own `insert`, which is `external` (map.nym) — the same pre-existing
-	// prelude-method-materialization gap `real_map_get_stays_a_loud_external_defer`
-	// pins for Map directly, confirmed here to reach transitively through Set too.
-	// Out of THIS slice's scope: closing it requires touching `lower_hir.rs`,
-	// owned by another in-flight slice (see that file's task-scope note). A
-	// genuine `Set` insert/remove/contains round-trip against the REAL stdlib
-	// cannot run under Node until that separate gap closes — confirmed by probe,
-	// not fixed here.
-	let user = "func f(): boolean = {\n\tlet mut s = Set(inner = #{})\n\ts.insert(1)\n}";
-	let _ = compile_against_real_stdlib(user);
+	assert_eq!(run(user, "in_range(new NInt(3))"), "true");
+	assert_eq!(run(user, "in_range(new NInt(7))"), "false");
 }
 
 // ── Owned collection literal → `mut` coercion (Bug 2), driven under Node ────
 //
-// `real_set_insert_stays_a_loud_transitively_external_defer` above shows the
-// REAL stdlib's `Set`/`Map` mutating methods can't run yet (an unrelated,
-// pre-existing gap). These use a self-contained synthetic setup — native `[]`
+// These use a self-contained synthetic setup — native `[]`
 // index read/assign on `#{…}`/`#[…]`, which lowers to a plain JS `Map`/`Array`
 // with no `external` linkage involved (`emit.rs`'s `HirExpr::Assign` arm) — to
 // prove the FIX itself: a fresh collection literal accepted at a `mut`
@@ -4106,270 +3718,6 @@ fn a_mut_func_can_call_a_mut_method_on_a_concrete_field_and_it_runs() {
 	let user = "struct Inner(n: int) {\n\tmut func bump(): int = {\n\t\tthis.n = this.n + 1\n\t\tthis.n\n\t}\n}\nstruct Outer(inner: Inner) {\n\tmut func step(): int = this.inner.bump()\n}\nfunc t(): int = {\n\tlet mut o = Outer(inner = Inner(n = 0))\n\tlet a = o.step()\n\tlet b = o.step()\n\ta + b\n}";
 	assert_eq!(run(user, "t()"), "3");
 }
-
-#[test]
-fn a_lazy_map_adapter_over_a_generic_iterator_source_runs() {
-	// The full lazy-adapter shape: `Map` is generic over its source iterator
-	// (`S: Iterator<Item>`) and, inside its own `next`, calls `this.source.next()`
-	// — a `mut` method on a generic FIELD, dispatched through the bound. That relies
-	// on BOTH fixes: mutable-field projection (so `this.source` is a mutable place)
-	// and still-generic bound lowering (so `next` emits a plain dynamic call rather
-	// than panicking as an unmaterializable prelude impl). Consuming `doubled` in a
-	// for-loop yields 0,2,4,6 → sum 12.
-	let prelude = "enum Option<T> {\n\tSome(value: T),\n\tNone\n\n\tfunc map<R>(f: (T) -> R): Option<R> = match (this) {\n\t\tSome(value) -> Option.Some(value = f(value)),\n\t\tNone -> Option.None\n\t}\n}\ninterface Iterator<Item> {\n\tmut func next(): Option<Item>\n}";
-	let user = "struct Map<Item, R, S: Iterator<Item>>(source: S, f: (Item) -> R) {\n\timpl Iterator<R> {\n\t\tmut func next(): Option<R> = this.source.next().map(this.f)\n\t}\n}\nstruct Counter(current: uint, limit: uint) {\n\timpl Iterator<uint> {\n\t\tmut func next(): Option<uint> = if (this.current < this.limit) {\n\t\t\tlet value = this.current\n\t\t\tthis.current = this.current + 1u\n\t\t\tOption.Some(value = value)\n\t\t} else {\n\t\t\tOption.None\n\t\t}\n\t}\n}\nfunc f(): uint = {\n\tlet c = Counter(current = 0u, limit = 4u)\n\tlet mut doubled = Map(source = c, f = (n) -> n * 2u)\n\tlet mut total = 0u\n\tfor (x in doubled) {\n\t\ttotal = total + x\n\t}\n\ttotal\n}";
-	assert_eq!(run_with_prelude(user, prelude, "f()"), "12");
-}
-
-#[test]
-fn a_default_map_method_on_the_ambient_iterator_interface_materializes_its_adapter_and_runs() {
-	// The user-facing directive shape: `map` is a DEFAULT method on the AMBIENT
-	// `Iterator` interface, returning a lazy `MapAdapter<Item, R, self>` that also lives
-	// in the prelude. Calling `c.map(f)` on a concrete `Counter` materializes the default
-	// body onto the emitted class — and the referenced `MapAdapter` struct, emitted
-	// nowhere in the user module, is demand-materialized from the prelude (its own `next`
-	// then chains through the generic source). 0,2,4,6 → sum 12.
-	let prelude = "enum Option<T> {\n\tSome(value: T),\n\tNone\n\n\tfunc map<R>(f: (T) -> R): Option<R> = match (this) {\n\t\tSome(value) -> Option.Some(value = f(value)),\n\t\tNone -> Option.None\n\t}\n}\nstruct MapAdapter<Item, R, S: Iterator<Item>>(source: S, f: (Item) -> R) {\n\timpl Iterator<R> {\n\t\tmut func next(): Option<R> = this.source.next().map(this.f)\n\t}\n}\ninterface Iterator<Item> {\n\tmut func next(): Option<Item>\n\n\tfunc map<R>(f: (Item) -> R): MapAdapter<Item, R, self> = MapAdapter(source = this, f = f)\n}";
-	let user = "struct Counter(current: uint, limit: uint) {\n\timpl Iterator<uint> {\n\t\tmut func next(): Option<uint> = if (this.current < this.limit) {\n\t\t\tlet value = this.current\n\t\t\tthis.current = this.current + 1u\n\t\t\tOption.Some(value = value)\n\t\t} else {\n\t\t\tOption.None\n\t\t}\n\t}\n}\nfunc f(): uint = {\n\tlet c = Counter(current = 0u, limit = 4u)\n\tlet mut doubled = c.map((n) -> n * 2u)\n\tlet mut total = 0u\n\tfor (x in doubled) {\n\t\ttotal = total + x\n\t}\n\ttotal\n}";
-	assert_eq!(run_with_prelude(user, prelude, "f()"), "12");
-}
-
-#[test]
-fn an_ambient_iterator_draining_terminal_default_iterates_this_and_runs() {
-	// A draining terminal (`count`) is a `mut func` DEFAULT on the ambient `Iterator`
-	// whose body does `for (item in this)`. That exercises: `this` bound as `mut Self`
-	// in the default body; the for-loop over a `Param` bound by `Iterator` resolving to
-	// the `.next()` protocol (not the native-list index walk); and the materialized
-	// default's own operator (`n + 1u`). `count()` over 0..6 → 6.
-	let prelude = r#"enum Option<T> {
-	Some(value: T),
-	None
-}
-interface Iterator<Item> {
-	mut func next(): Option<Item>
-
-	mut func count(): uint = {
-		let mut n = 0u
-		for (item in this) {
-			n = n + 1u
-		}
-		n
-	}
-
-	mut func to_list(): #[Item] = {
-		let mut out: #[Item] = #[]
-		for (item in this) {
-			out.push(item)
-		}
-		out
-	}
-}"#;
-	let user = r#"struct Counter(current: uint, limit: uint) {
-	impl Iterator<uint> {
-		mut func next(): Option<uint> = if (this.current < this.limit) {
-			let value = this.current
-			this.current = this.current + 1u
-			Option.Some(value = value)
-		} else {
-			Option.None
-		}
-	}
-}
-func f(): uint = {
-	let mut c = Counter(current = 0u, limit = 6u)
-	c.count()
-}
-func g(): #[uint] = {
-	let mut c = Counter(current = 0u, limit = 4u)
-	c.to_list()
-}"#;
-	assert_eq!(run_with_prelude(user, prelude, "f()"), "6");
-	assert_eq!(run_with_prelude(user, prelude, "g()"), "[ 0, 1, 2, 3 ]");
-}
-
-#[test]
-fn a_terminal_chained_onto_a_lazy_map_adapter_runs() {
-	// `c.map(f).to_list()` / `.count()` — a draining terminal called on a `Mapped`
-	// adapter TEMPORARY (a demand-materialized core prelude struct). The terminal is an
-	// inherited `Iterator` default on `Mapped`; dispatching it as a plain call on the
-	// materialized adapter class (rather than a loud "prelude-only impl" defer) is the
-	// chaining payoff. `map(n -> n*n)` over 0..4 → to_list [0,1,4,9]; `.count()` → 4.
-	let prelude = r#"enum Option<T> {
-	Some(value: T),
-	None
-
-	func map<R>(f: (T) -> R): Option<R> = match (this) {
-		Some(value) -> Option.Some(value = f(value)),
-		None -> Option.None
-	}
-}
-struct Mapped<Item, R, S: Iterator<Item>>(source: S, f: (Item) -> R) {
-	impl Iterator<R> {
-		mut func next(): Option<R> = this.source.next().map(this.f)
-	}
-}
-interface Iterator<Item> {
-	mut func next(): Option<Item>
-
-	func map<R>(f: (Item) -> R): Mapped<Item, R, self> = Mapped(source = this, f = f)
-
-	mut func to_list(): #[Item] = {
-		let mut out: #[Item] = #[]
-		for (item in this) {
-			out.push(item)
-		}
-		out
-	}
-
-	mut func count(): uint = {
-		let mut n = 0u
-		for (item in this) {
-			n = n + 1u
-		}
-		n
-	}
-}"#;
-	let user = r#"struct Counter(current: uint, limit: uint) {
-	impl Iterator<uint> {
-		mut func next(): Option<uint> = if (this.current < this.limit) {
-			let value = this.current
-			this.current = this.current + 1u
-			Option.Some(value = value)
-		} else {
-			Option.None
-		}
-	}
-}
-func squares(): #[uint] = {
-	let mut c = Counter(current = 0u, limit = 4u)
-	c.map((n) -> n * n).to_list()
-}
-func how_many(): uint = {
-	let mut c = Counter(current = 0u, limit = 4u)
-	c.map((n) -> n * n).count()
-}"#;
-	assert_eq!(
-		run_with_prelude(user, prelude, "squares()"),
-		"[ 0, 1, 4, 9 ]"
-	);
-	assert_eq!(run_with_prelude(user, prelude, "how_many()"), "4");
-}
-
-#[test]
-fn filter_take_drop_adapters_chain_and_run() {
-	// `filter` (a `while`-looping adapter calling a closure FIELD), `take`, and `drop`
-	// as ambient `Iterator` defaults, chained with `map`: 0..20 → evens → ×10 → first 4.
-	let prelude = r#"enum Option<T> {
-	Some(value: T),
-	None
-
-	func map<R>(f: (T) -> R): Option<R> = match (this) {
-		Some(value) -> Option.Some(value = f(value)),
-		None -> Option.None
-	}
-}
-struct Mapped<Item, R, S: Iterator<Item>>(source: S, f: (Item) -> R) {
-	impl Iterator<R> {
-		mut func next(): Option<R> = this.source.next().map(this.f)
-	}
-}
-struct Filtered<Item, S: Iterator<Item>>(source: S, predicate: (Item) -> boolean) {
-	impl Iterator<Item> {
-		mut func next(): Option<Item> = {
-			let keep = this.predicate
-			let mut found: Option<Item> = Option.None
-			let mut searching = true
-			while (searching) {
-				match (this.source.next()) {
-					Some(value) -> if (keep(value)) {
-						found = Option.Some(value = value)
-						searching = false
-					} else {},
-					None -> { searching = false },
-				}
-			}
-			found
-		}
-	}
-}
-struct Take<Item, S: Iterator<Item>>(source: S, remaining: uint) {
-	impl Iterator<Item> {
-		mut func next(): Option<Item> = if (this.remaining > 0u) {
-			this.remaining = this.remaining - 1u
-			this.source.next()
-		} else {
-			Option.None
-		}
-	}
-}
-struct Drop<Item, S: Iterator<Item>>(source: S, remaining: uint) {
-	impl Iterator<Item> {
-		mut func next(): Option<Item> = {
-			while (this.remaining > 0u) {
-				this.remaining = this.remaining - 1u
-				this.source.next()
-			}
-			this.source.next()
-		}
-	}
-}
-interface Iterator<Item> {
-	mut func next(): Option<Item>
-
-	func map<R>(f: (Item) -> R): Mapped<Item, R, self> = Mapped(source = this, f = f)
-	func filter(predicate: (Item) -> boolean): Filtered<Item, self> = Filtered(source = this, predicate = predicate)
-	func take(n: uint): Take<Item, self> = Take(source = this, remaining = n)
-	func drop(n: uint): Drop<Item, self> = Drop(source = this, remaining = n)
-
-	mut func to_list(): #[Item] = {
-		let mut out: #[Item] = #[]
-		for (item in this) {
-			out.push(item)
-		}
-		out
-	}
-}"#;
-	let user = r#"struct Counter(current: uint, limit: uint) {
-	impl Iterator<uint> {
-		mut func next(): Option<uint> = if (this.current < this.limit) {
-			let value = this.current
-			this.current = this.current + 1u
-			Option.Some(value = value)
-		} else {
-			Option.None
-		}
-	}
-}
-func evens(): #[uint] = {
-	let mut c = Counter(current = 0u, limit = 10u)
-	c.filter((n) -> n % 2u == 0u).to_list()
-}
-func dropped(): #[uint] = {
-	let mut c = Counter(current = 0u, limit = 10u)
-	c.drop(7u).to_list()
-}
-func chained(): #[uint] = {
-	let mut c = Counter(current = 0u, limit = 20u)
-	c.filter((n) -> n % 2u == 0u).map((n) -> n * 10u).take(4u).to_list()
-}"#;
-	assert_eq!(
-		run_with_prelude(user, prelude, "evens()"),
-		"[ 0, 2, 4, 6, 8 ]"
-	);
-	assert_eq!(run_with_prelude(user, prelude, "dropped()"), "[ 7, 8, 9 ]");
-	assert_eq!(
-		run_with_prelude(user, prelude, "chained()"),
-		"[ 0, 20, 40, 60 ]"
-	);
-}
-
-// NOTE: `#[T]` list iteration (`xs.iter().map(..).to_list()` via the `Iterable` impl on
-// `#[T]` + `ListIter`) can't be exercised here — `ListIter::next` calls the LINKED
-// `list.get` external, which the `run_with_prelude` harness (a hand-written prelude, no
-// stdlib linkage) doesn't provide. It is covered by `stdlib_check` (type-checks) and end
-// to end by the CLI against the real stdlib.
-
-// ── Positional sub-patterns on single-field constructors ─────────────────────
 
 #[test]
 fn positional_variant_subpatterns_on_single_field_constructors_run() {
@@ -4615,44 +3963,6 @@ func eager_positions(): int = {
 }
 
 #[test]
-fn return_crosses_option_loop_expression_iife_in_both_lowering_paths() {
-	let src = r#"
-func choose(flag: boolean): int = {
-	let result = while (true) {
-		if (flag) { return 9 }
-		break 4
-	}
-	match (result) { Some(value) -> value, None -> 0 }
-}
-
-func nested(): int = {
-	let choose = (flag: boolean) -> {
-		let result = while (true) {
-			if (flag) { return 8 }
-			break 3
-		}
-		match (result) { Some(value) -> value, None -> 0 }
-	}
-	choose(true) * 10 + choose(false)
-}
-"#;
-	assert_eq!(run(src, "choose(new NBool(true))"), "9");
-	assert_eq!(run(src, "choose(new NBool(false))"), "4");
-	assert_eq!(run(src, "nested()"), "83");
-
-	let prelude = "enum Option<T> { Some(value: T), None }";
-	assert_eq!(
-		run_with_prelude(src, prelude, "choose(new NBool(true))"),
-		"9"
-	);
-	assert_eq!(
-		run_with_prelude(src, prelude, "choose(new NBool(false))"),
-		"4"
-	);
-	assert_eq!(run_with_prelude(src, prelude, "nested()"), "83");
-}
-
-#[test]
 fn loop_completion_does_not_swallow_user_exceptions() {
 	let src = r#"
 func invoke(callback: () -> int): Option<int> = while (true) {
@@ -4876,54 +4186,6 @@ func answer(): int = 0.seed() + Box(value = 0).seed()
 		)
 	);
 	assert_eq!(run(source, "answer()"), "3");
-}
-
-#[test]
-fn blanket_iterator_next_is_used_by_direct_via_iter_for_and_spread_drains() {
-	let prelude = r#"
-enum Option<T> { Some(value: T), None }
-interface Iterator<Item> { mut func next(): Option<Item> }
-interface Iterable<Item> { func iter(): Iterator<Item> }
-
-impl<T> Iterator<int> for T { mut func next(): Option<int> = Option.None }
-"#;
-	let source = r#"
-struct First
-struct Second
-struct Values
-impl Iterable<int> for Values { func iter(): Second = Second() }
-struct Concrete
-impl Iterator<int> for Concrete { mut func next(): Option<int> = Option.None }
-
-func answer(): #[int] = {
-  let mut direct = First()
-  for (value in direct) { value }
-  let mut via = Values()
-  for (value in via) { value }
-  let mut spread = Second()
-  let direct_values = #[...spread]
-  let mut via_spread = Values()
-  let via_values = #[...via_spread]
-  let mut concrete = Concrete()
-  for (value in concrete) { value }
-  via_values
-}
-"#;
-	let js = compile_with_prelude(source, prelude);
-	assert_eq!(
-		js.matches("function $std$Iterator$blanket").count(),
-		1,
-		"two iterator types must share one canonical blanket body: {js}"
-	);
-	assert!(
-		js.matches("$std$Iterator$blanket").count() >= 5,
-		"direct, via-iter, and spread drains must call the selected blanket body: {js}"
-	);
-	assert!(
-		js.contains("$it.next()"),
-		"an ordinary concrete Iterator.next must retain prototype dispatch: {js}"
-	);
-	assert_eq!(run_with_prelude(source, prelude, "answer()"), "[]");
 }
 
 #[test]

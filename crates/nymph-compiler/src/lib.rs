@@ -15,22 +15,14 @@
 //! [`compile_entry`] and [`check_entry`] are additive entry-mode counterparts
 //! (GG1): identical to [`compile`]/[`check`], except the module is also
 //! required to declare a valid top-level `main` — the program's entry point —
-//! via [`nymph_sema::check_module_entry_with_prelude`]. Plain
+//! through the project semantic pipeline. Plain
 //! [`compile`]/[`check`] never require a `main`, so every existing
 //! library-mode caller is unaffected.
 //!
-//! Because the prelude is flattened ahead of every checked module, a user
-//! program can implement (and use) `Plus`/`Comparable`/… without declaring
-//! them locally, and `compile` now lowers and emits that program too. A
-//! dispatch into a prelude-owned body still panics loudly at lowering time
-//! when codegen genuinely cannot materialize it (`external`/intrinsic
-//! markers — every primitive arithmetic op, `compare_to_int`/`_float`/
-//! `_char`/`_string`, the `Equals`/`Contains` blanket externals — or a
-//! still-generic bound satisfied only through the prelude); silent wrong JS
-//! is never an acceptable alternative to that loud deferral. Compiling
-//! `stdlib/src/ops/mod.nym` itself through this facade is out of scope — the
-//! prelude would collide with itself (KK2) — real stdlib compilation arrives
-//! with import binding.
+//! Ambient core definitions are supplied by project-backed semantic queries,
+//! so user programs can implement and use `Plus`, `Comparable`, and related
+//! interfaces without local declarations. Runtime bodies are projected and
+//! lowered by stable definition identity.
 
 mod host_runtime;
 mod prelude;
@@ -144,13 +136,10 @@ fn check_impl(source: &str, path: &str, entry: EntryMode) -> Vec<Diagnostic> {
 /// module's own operator interfaces, `Option`/`Result`, `Iterator`/`Iterable`,
 /// etc. are *not* injected.
 ///
-/// [`check`] always flattens [`prelude::core_prelude`] ahead of the checked
-/// module, which is exactly wrong for a **stdlib source file itself**: opening
-/// `stdlib/src/ops/mod.nym` (say) through [`check`] injects a second copy of
-/// `std/ops` right next to the real one, so every declaration in it collides
-/// with its own ambient copy — a flood of spurious duplicate-declaration
-/// errors that has nothing to do with the file's actual content. This entry
-/// point checks `source` in isolation instead, exactly like a normal
+/// [`check`] supplies ambient core through the project pipeline, which is wrong
+/// for a **stdlib source file itself** because it would analyze the source both
+/// as ambient core and as the current module. This entry point checks `source`
+/// in isolation instead, exactly like a normal
 /// `nymph_sema::check_module` library-mode module with no injected sources.
 ///
 /// This trades self-duplication for a different, honest limitation: a stdlib

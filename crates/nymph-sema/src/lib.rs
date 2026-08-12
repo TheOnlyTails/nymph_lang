@@ -34,9 +34,7 @@ mod infer_pattern;
 mod interface;
 mod interface_extract;
 mod lower;
-mod lower_hir;
 mod members;
-mod prelude;
 pub mod query;
 mod runtime;
 mod solve;
@@ -53,7 +51,7 @@ pub use annotate::{
 };
 pub use check::{
 	EntryMode, check_module, check_module_entry, check_module_with_environment,
-	check_module_with_owned_environment, check_program,
+	check_module_with_owned_environment,
 };
 pub use def::{
 	AliasSig, DefData, DefKind, DefMap, DefOrigin, FieldSigMetadata, NamespaceMemberSig,
@@ -70,17 +68,9 @@ pub use identity::{
 pub use iface::{ImplRegistry, InterfaceDef};
 pub use interface::*;
 pub use interface_extract::*;
-pub use lower_hir::{
-	LoweredHir, RuntimeOwner, lower_hir, lower_hir_with_prelude, lower_hir_with_prelude_and_deps,
-	lower_hir_with_prelude_runtime_and_deps, lower_hir_with_prelude_runtime_and_deps_with_owners,
-};
 pub use members::InherentRegistry;
 pub use nymph_hir::ids::{self, DefId, InferVar, ParamIdx};
 pub use nymph_hir::ty::{self, GenericArgs, Interner, Ty, TyKind};
-pub use prelude::{
-	CheckedModule, check_module_entry_with_prelude, check_module_entry_with_prelude_and_module,
-	check_module_with_prelude, check_module_with_prelude_and_module,
-};
 pub use runtime::{
 	BodyNodeId, BuiltinDispatch, CheckedRuntimeBody, DispatchMaterialization, EnumShell,
 	ExpressionVariant, PatternNodeId, PatternVariant, RuntimeAnnotations, RuntimeBodyKind,

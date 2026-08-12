@@ -926,8 +926,8 @@ fn build_supports_first_class_range_values() {
 fn check_reports_ok_for_a_user_struct_plus_impl_via_the_default_prelude() {
 	// The prelude-default-flip payoff: `check` resolves a user struct's own
 	// `Plus` impl with no local `interface Plus` declaration at all — the
-	// stdlib operator-interface prelude is now flattened ahead of every
-	// checked module by default (see `nymph-compiler`'s `check`/`compile`).
+	// stdlib operator interface is available through every module's complete
+	// ambient environment (see `nymph-compiler`'s `check`/`compile`).
 	let path = write_source(
 		"struct P(v: int)\n\
 		impl Plus<Other = P, Output = P> for P { func plus(other: P): P = other }\n\

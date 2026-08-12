@@ -52,8 +52,7 @@ pub struct OptionRuntimeRole {
 }
 
 /// Records why protocol roles are present or absent. In particular, an explicitly
-/// empty compiler inventory must not be mistaken for the standalone compatibility
-/// fixture.
+/// empty compiler inventory must not be mistaken for a direct semantic-check fixture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeRoleProvenance {
 	StandaloneFixture,
@@ -112,15 +111,14 @@ pub struct SemanticEnvironment {
 }
 
 impl SemanticEnvironment {
-	/// Assigns compatibility-visible checker spellings without changing semantic names,
+	/// Assigns diagnostic-only checker spellings without changing semantic names,
 	/// stable identities, or lexical lookup.
 	pub fn set_diagnostic_module_tags(&mut self, tags: &FxHashMap<ModuleIdentity, usize>) {
 		self.imported.defs.set_imported_diagnostic_module_tags(tags);
 	}
 
 	/// Allocates dependency identities in the caller's dependency-first graph order.
-	/// Export name overlays intentionally use insertion order, preserving compatibility's
-	/// complete-transitive visibility and deterministic later-wins behavior.
+	/// Export-name allocation intentionally uses deterministic dependency-first order.
 	pub fn from_modules(
 		current: ModuleIdentity,
 		modules: &[Arc<ModuleEnvironment>],
@@ -246,8 +244,8 @@ impl SemanticEnvironment {
 		})
 	}
 
-	/// Replaces compatibility's transitive bare-name overlay with the lexical bindings
-	/// resolved for the module currently being checked. All imported definitions remain
+	/// Installs the lexical bindings resolved for the module currently being checked.
+	/// All imported definitions remain
 	/// allocated and stable-addressable for transported types and dispatch.
 	pub fn set_resolved_imports(&mut self, bindings: FxHashMap<EcoString, ResolvedImportBinding>) {
 		self.imported.defs.clear_lexical_imports();
@@ -1215,7 +1213,7 @@ fn instantiate_complete_impl(
 					.collect(),
 				self_ty,
 				interface,
-				legacy_span: None,
+				source_span: None,
 				args,
 				methods,
 				constraints,
@@ -1767,7 +1765,7 @@ fn instantiate_recovered_impl(
 						.collect(),
 					self_ty,
 					interface,
-					legacy_span: None,
+					source_span: None,
 					args,
 					methods,
 					constraints,

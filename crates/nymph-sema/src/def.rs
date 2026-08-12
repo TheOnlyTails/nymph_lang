@@ -39,8 +39,8 @@ pub struct DefMap {
 #[derive(Debug, Clone)]
 pub struct DefData {
 	pub name: EcoString,
-	/// Checker-compatibility spelling used only by diagnostics which historically
-	/// exposed rewritten project symbols. Semantic identity and lookup always use
+	/// Alternate spelling used only by diagnostics that disambiguate imported
+	/// project symbols. Semantic identity and lookup always use
 	/// [`Self::name`] and [`Self::stable`].
 	pub diagnostic_display_name: Option<EcoString>,
 	/// The defining occurrence's span. Reserved for go-to-definition (LSP) and
@@ -182,8 +182,7 @@ impl DefMap {
 	}
 
 	/// Allocates an imported stable definition once, optionally exposing this occurrence's
-	/// name to compatibility bare-name lookup. Repeated stable IDs reuse their original
-	/// checker-local ID while each exported spelling participates in later-wins lookup.
+	/// name to lexical lookup. Repeated stable IDs reuse their original checker-local ID.
 	pub(crate) fn allocate_imported(
 		&mut self,
 		name: EcoString,

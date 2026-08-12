@@ -15,7 +15,6 @@ mod bundle;
 pub mod documentation;
 mod emission;
 mod link_plan;
-mod metrics;
 mod queries;
 mod resolve;
 mod session;
@@ -31,9 +30,6 @@ pub use emission::StableEmittedProject;
 
 #[cfg(feature = "test-support")]
 pub use session::SemanticQueryEvent;
-
-#[cfg(feature = "test-support")]
-pub use metrics::{PhaseCounts, with_phase_counts};
 
 #[cfg(feature = "test-support")]
 pub use test_support::{GraphFixture, GraphShape};

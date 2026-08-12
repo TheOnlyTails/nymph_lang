@@ -28,33 +28,18 @@ use crate::def::{DefKind, FuncSig, NamespaceMemberSig};
 use crate::errors::TypeError;
 use crate::ids::{DefId, ParamIdx};
 use crate::lower::build_param_scope;
-use crate::prelude::SPAN_BASE;
 use crate::solve::{MethodResolution, MethodSource};
 use crate::ty::{GenericArgs, Ty, TyKind};
 
-/// Whether a resolved method call's underlying impl is invisible to lowering: its
-/// declaration was cloned from an offset canonical runtime module (`impl_span.start >=
-/// SPAN_BASE`, `check_module_with_prelude`'s canonical-runtime-origin marker), which
-/// `compile_with_prelude` never lowers (it lowers only the user's own AST — see
-/// `nymph_compiler::prelude`). True for a method the matched impl provides
-/// directly (e.g. the stdlib's `impl<T> Equals<Other = self> for T` blanket impl)
-/// just as much as one that falls back to the interface's own default body (e.g.
-/// that same `Equals`'s `not_equals`) — either way nothing materializes the
-/// method anywhere in the emitted class (Finding 2, stdlib linkage groundwork).
-/// Every `MethodSource` populates `impl_span` with *some* defining span (round 2
-/// of the stdlib linkage groundwork review closed the `Inherent`/`GenericBound`
-/// gap: `Inherent` now carries the matched inherent method's own span,
-/// `GenericBound` the span of the interface the bound was satisfied through —
-/// see their `MethodResolution` construction sites in `solve.rs`), so this
-/// correctly flags a canonical-runtime resolution regardless of `MethodSource`,
-/// while staying `false` for every ordinary user-declared method/interface
-/// (whose span is always well below `SPAN_BASE`).
+/// Whether a resolved method is owned by canonical compiler or importable-stdlib
+/// runtime code rather than by the current project. Stable semantic identity is
+/// the sole provenance channel; source spans are never used to infer ownership.
 fn impl_is_unmaterialized(res: &MethodResolution) -> bool {
 	if let Some(implementation) = &res.implementation {
 		// Generic implementations have one canonical method body and cannot be
 		// materialized correctly as receiver-specific prototype methods. Stable
 		// implementation identity is authoritative here, including project-local
-		// implementations whose spans are not in the offset prelude range.
+		// implementations regardless of their source location.
 		if matches!(
 			&implementation.key,
 			crate::DeclarationKey::Implementation { header, .. }
@@ -65,29 +50,15 @@ fn impl_is_unmaterialized(res: &MethodResolution) -> bool {
 		return matches!(
 			implementation.module.origin,
 			crate::ModuleOrigin::Compiler | crate::ModuleOrigin::ImportableStd
-		) || matches!(
-			&implementation.module.origin,
-			crate::ModuleOrigin::Project(project) if project == "standalone"
-		) && res.impl_span.is_some_and(|span| span.start >= SPAN_BASE);
+		);
 	}
-	if res.source == MethodSource::GenericBound
+	res.source == MethodSource::GenericBound
 		&& res.target.as_ref().is_some_and(|target| {
 			matches!(
 				target.module.origin,
 				crate::ModuleOrigin::Compiler | crate::ModuleOrigin::ImportableStd
-			) || matches!(
-				&target.module.origin,
-				crate::ModuleOrigin::Project(project) if project == "standalone"
-			) && res.impl_span.is_some_and(|span| span.start >= SPAN_BASE)
-		}) {
-		return true;
-	}
-	// Legacy single-module prelude checking predates stable imported identities.
-	// Keep that isolated API's offset provenance as a compatibility fallback;
-	// interface-environment checking always takes one of the stable paths above.
-	res.implementation.is_none()
-		&& res.target.is_none()
-		&& res.impl_span.is_some_and(|span| span.start >= SPAN_BASE)
+			)
+		})
 }
 
 /// The `DispatchKind` a resolved *operator* desugaring (Slice 4B) must be lowered
@@ -143,7 +114,6 @@ fn method_resolution(method: EcoString, res: &MethodResolution) -> Resolution {
 		target: res.target.clone(),
 		implementation: res.implementation.clone(),
 		resolved_target: res.resolved_target.clone(),
-		impl_span: res.impl_span,
 	}
 }
 
@@ -429,8 +399,7 @@ impl<'m> Checker<'m> {
 	/// anonymous-closure (`$N`) boundary (Slice: `$N` anonymous closure
 	/// params) BEFORE the ordinary per-kind dispatch, forming the closure and
 	/// subtyping it against `expected` exactly like an explicit closure would
-	/// — see `anon_closure.rs`'s module doc for why this split (mirroring
-	/// `lower_expr`/`lower_expr_inner` in `lower_hir.rs`) is needed: calling
+	/// — see `anon_closure.rs`'s module doc for why this split is needed: calling
 	/// `self.check` again from inside the boundary's own formation would just
 	/// re-hit this same interception and recurse forever.
 	pub(crate) fn check(&mut self, expr: &Expr, expected: Ty) {
@@ -1276,7 +1245,6 @@ impl<'m> Checker<'m> {
 							target: res.target.clone(),
 							implementation: res.implementation.clone(),
 							resolved_target: res.resolved_target.clone(),
-							impl_span: res.impl_span,
 						};
 						(res.ty, Some(resolution))
 					}
@@ -1806,7 +1774,6 @@ impl<'m> Checker<'m> {
 						target: res.target.clone(),
 						implementation: res.implementation.clone(),
 						resolved_target: res.resolved_target.clone(),
-						impl_span: res.impl_span,
 					};
 					(res.ty, Some(resolution))
 				}
@@ -2061,7 +2028,6 @@ impl<'m> Checker<'m> {
 					target: resolution.target,
 					implementation: resolution.implementation,
 					resolved_target: resolution.resolved_target,
-					impl_span: resolution.impl_span,
 				}),
 			);
 		}
@@ -2877,12 +2843,11 @@ impl<'m> Checker<'m> {
 							target: None,
 							implementation: None,
 							resolved_target: None,
-							impl_span: None,
 						}),
 						None,
 					)
 				} else {
-					let (ty, dispatch, target, implementation, resolved_target, impl_span) =
+					let (ty, dispatch, target, implementation, resolved_target) =
 						self.dispatch_operator(operand, "not", &[], span);
 					(
 						ty,
@@ -2892,7 +2857,6 @@ impl<'m> Checker<'m> {
 							target,
 							implementation,
 							resolved_target,
-							impl_span,
 						}),
 						None,
 					)
@@ -2909,7 +2873,6 @@ impl<'m> Checker<'m> {
 							target: None,
 							implementation: None,
 							resolved_target: None,
-							impl_span: None,
 						}),
 						None,
 					)
@@ -2919,7 +2882,7 @@ impl<'m> Checker<'m> {
 				} {
 					// A resolved ADT or generic-parameter operand dispatches through the
 					// solver immediately, exactly like `infer_binary`'s equivalent branch.
-					let (ty, dispatch, target, implementation, resolved_target, impl_span) =
+					let (ty, dispatch, target, implementation, resolved_target) =
 						self.dispatch_operator(operand, method, &[], span);
 					(
 						ty,
@@ -2929,7 +2892,6 @@ impl<'m> Checker<'m> {
 							target,
 							implementation,
 							resolved_target,
-							impl_span,
 						}),
 						None,
 					)
@@ -2967,7 +2929,6 @@ impl<'m> Checker<'m> {
 					target: None,
 					implementation: None,
 					resolved_target: None,
-					impl_span: None,
 				},
 			));
 		}
@@ -2978,7 +2939,7 @@ impl<'m> Checker<'m> {
 		) {
 			return None;
 		}
-		let (result_ty, dispatch, target, implementation, resolved_target, impl_span) =
+		let (result_ty, dispatch, target, implementation, resolved_target) =
 			self.dispatch_operator(ty, method, &[], span);
 		Some((
 			result_ty,
@@ -2988,7 +2949,6 @@ impl<'m> Checker<'m> {
 				target,
 				implementation,
 				resolved_target,
-				impl_span,
 			},
 		))
 	}
@@ -3070,13 +3030,12 @@ impl<'m> Checker<'m> {
 				target: None,
 				implementation: None,
 				resolved_target: None,
-				impl_span: None,
 			})
 		};
 
 		match op {
 			Power => {
-				let (ty, dispatch, target, implementation, resolved_target, impl_span) =
+				let (ty, dispatch, target, implementation, resolved_target) =
 					self.dispatch_operator(l, binary_method(op), &[r], span);
 				(
 					ty,
@@ -3086,7 +3045,6 @@ impl<'m> Checker<'m> {
 						target,
 						implementation,
 						resolved_target,
-						impl_span,
 					}),
 					None,
 				)
@@ -3106,7 +3064,7 @@ impl<'m> Checker<'m> {
 				(Some(a), Some(b)) if a == b => {
 					self.unify(l, r, span);
 					if matches!(a, TyKind::Boolean) {
-						let (ty, dispatch, target, implementation, resolved_target, impl_span) =
+						let (ty, dispatch, target, implementation, resolved_target) =
 							self.dispatch_operator(l, binary_method(op), &[r], span);
 						(
 							ty,
@@ -3116,7 +3074,6 @@ impl<'m> Checker<'m> {
 								target,
 								implementation,
 								resolved_target,
-								impl_span,
 							}),
 							None,
 						)
@@ -3142,7 +3099,7 @@ impl<'m> Checker<'m> {
 					} else if matches!(lhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(r) {
 						(r, eager(binary_method(op)), None)
 					} else {
-						let (ty, _, _, _, _, _) = self.dispatch_operator(l, binary_method(op), &[r], span);
+						let (ty, _, _, _, _) = self.dispatch_operator(l, binary_method(op), &[r], span);
 						(ty, eager(binary_method(op)), None)
 					}
 				}
@@ -3160,7 +3117,7 @@ impl<'m> Checker<'m> {
 					matches!(self.interner.kind(resolved), TyKind::Param(_))
 				} =>
 				{
-					let (ty, dispatch, target, implementation, resolved_target, impl_span) =
+					let (ty, dispatch, target, implementation, resolved_target) =
 						self.dispatch_operator(l, binary_method(op), &[r], span);
 					(
 						ty,
@@ -3170,7 +3127,6 @@ impl<'m> Checker<'m> {
 							target,
 							implementation,
 							resolved_target,
-							impl_span,
 						}),
 						None,
 					)
@@ -3227,7 +3183,7 @@ impl<'m> Checker<'m> {
 						if matches!(self.interner.kind(resolved), TyKind::Error) {
 							return (boolean, eager(method), None);
 						}
-						let (_, dispatch, target, implementation, resolved_target, impl_span) =
+						let (_, dispatch, target, implementation, resolved_target) =
 							self.dispatch_operator(l, method, &[r], span);
 						(
 							boolean,
@@ -3237,7 +3193,6 @@ impl<'m> Checker<'m> {
 								target,
 								implementation,
 								resolved_target,
-								impl_span,
 							}),
 							None,
 						)
@@ -3287,7 +3242,7 @@ impl<'m> Checker<'m> {
 						matches!(self.interner.kind(resolved), TyKind::Param(_))
 					} =>
 					{
-						let (_, dispatch, target, implementation, resolved_target, impl_span) =
+						let (_, dispatch, target, implementation, resolved_target) =
 							self.dispatch_operator(l, method, &[r], span);
 						(
 							boolean,
@@ -3297,7 +3252,6 @@ impl<'m> Checker<'m> {
 								target,
 								implementation,
 								resolved_target,
-								impl_span,
 							}),
 							None,
 						)
@@ -3331,7 +3285,6 @@ impl<'m> Checker<'m> {
 						target: None,
 						implementation: None,
 						resolved_target: None,
-						impl_span: None,
 					}),
 					None,
 				)
@@ -3354,7 +3307,7 @@ impl<'m> Checker<'m> {
 				// operator is left for a future slice; such a RHS reaches
 				// `dispatch_operator` directly and gets whatever diagnostic that produces.)
 				let method = if op == In { "contains" } else { "not_contains" };
-				let (_, dispatch, target, implementation, resolved_target, impl_span) =
+				let (_, dispatch, target, implementation, resolved_target) =
 					self.dispatch_operator(r, method, &[l], span);
 				(
 					boolean,
@@ -3364,7 +3317,6 @@ impl<'m> Checker<'m> {
 						target,
 						implementation,
 						resolved_target,
-						impl_span,
 					}),
 					None,
 				)
@@ -3376,7 +3328,7 @@ impl<'m> Checker<'m> {
 			// an unresolvable receiver is a `NotImplemented` diagnostic, exactly like any
 			// other operator with no matching impl (`dispatch_operator`'s `None` arm).
 			Unwrap => {
-				let (ty, dispatch, target, implementation, resolved_target, impl_span) =
+				let (ty, dispatch, target, implementation, resolved_target) =
 					self.dispatch_operator(l, "unwrap", &[r], span);
 				(
 					ty,
@@ -3386,7 +3338,6 @@ impl<'m> Checker<'m> {
 						target,
 						implementation,
 						resolved_target,
-						impl_span,
 					}),
 					None,
 				)
@@ -3454,7 +3405,6 @@ impl<'m> Checker<'m> {
 					target: None,
 					implementation: None,
 					resolved_target: None,
-					impl_span: None,
 				},
 			));
 		}
@@ -3465,7 +3415,7 @@ impl<'m> Checker<'m> {
 		) {
 			return None;
 		}
-		let (dispatch_ty, dispatch, target, implementation, resolved_target, impl_span) =
+		let (dispatch_ty, dispatch, target, implementation, resolved_target) =
 			self.dispatch_operator(ty, method, &[ty], span);
 		let result_ty = if is_comparison || is_equality {
 			self.interner.boolean()
@@ -3480,7 +3430,6 @@ impl<'m> Checker<'m> {
 				target,
 				implementation,
 				resolved_target,
-				impl_span,
 			},
 		))
 	}
@@ -3548,7 +3497,6 @@ impl<'m> Checker<'m> {
 		Option<crate::DefinitionId>,
 		Option<crate::DefinitionId>,
 		Option<crate::annotate::ResolvedMethodTarget>,
-		Option<Span>,
 	) {
 		// Operator operands are already typed; literal widening on them is handled on the
 		// primitive fast-paths, so no argument is flagged as a coercible literal here.
@@ -3573,7 +3521,6 @@ impl<'m> Checker<'m> {
 					res.target,
 					res.implementation,
 					res.resolved_target,
-					res.impl_span,
 				)
 			}
 			None => {
@@ -3610,7 +3557,6 @@ impl<'m> Checker<'m> {
 				(
 					self.interner.error(),
 					DispatchKind::UserImpl,
-					None,
 					None,
 					None,
 					None,
@@ -3695,7 +3641,6 @@ impl<'m> Checker<'m> {
 				target: None,
 				implementation: None,
 				resolved_target: None,
-				impl_span: None,
 			});
 		}
 		let Some(into) = self.defs.get("Into").filter(|&d| self.is_interface(d)) else {
@@ -3760,7 +3705,6 @@ impl<'m> Checker<'m> {
 						target: res.target.clone(),
 						implementation: res.implementation.clone(),
 						resolved_target: res.resolved_target.clone(),
-						impl_span: res.impl_span,
 					}),
 					// `holds` already proved an impl exists; `resolve_method` failing
 					// here would mean the two solver entry points disagree — kept
@@ -4115,7 +4059,6 @@ impl<'m> Checker<'m> {
 								interface,
 								interface_member,
 							}),
-							impl_span: Some(self.defs.data(iterator).span),
 						},
 					);
 				}
@@ -4150,7 +4093,6 @@ impl<'m> Checker<'m> {
 								interface,
 								interface_member,
 							}),
-							impl_span: Some(self.defs.data(iface).span),
 						},
 					);
 				}

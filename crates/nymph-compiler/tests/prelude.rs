@@ -58,6 +58,17 @@ fn run_emitted_js(js: String) -> String {
 	String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+fn with_compiler_stack(test: impl FnOnce() + Send + 'static) {
+	// Deeply nested ambient generic adapters exceed libtest's 2 MiB worker
+	// stack in debug builds. Production CLI threads use the process stack.
+	std::thread::Builder::new()
+		.stack_size(8 * 1024 * 1024)
+		.spawn(test)
+		.expect("spawn ambient compiler test")
+		.join()
+		.expect("ambient compiler test panicked");
+}
+
 #[test]
 fn standalone_intrinsic_and_source_options_share_one_runtime_prototype() {
 	let source = r#"
@@ -236,6 +247,51 @@ fn interface_default_generic_arithmetic_executes_through_the_stable_protocol() {
 		"expected `Bar`'s `Foo` impl to typecheck cleanly via the prelude's `Plus`, got: {diags:?}"
 	);
 	assert_eq!(run_int_entry(source, "result"), "42");
+}
+
+#[test]
+fn ambient_iterator_default_adapter_chain_and_terminals_run() {
+	with_compiler_stack(ambient_iterator_default_adapter_chain_and_terminals_body);
+}
+
+fn ambient_iterator_default_adapter_chain_and_terminals_body() {
+	// This crosses the highest-risk stable ownership path removed with the
+	// flattened-prelude harness: a project implementation calls ambient generic
+	// defaults, those defaults materialize nested adapter types, and terminal
+	// defaults repeatedly dispatch through each adapter's exact Iterator.next.
+	let source = r#"
+		struct Counter(current: uint, limit: uint) {
+			impl Iterator<uint> {
+				mut func next(): Option<uint> = if (this.current < this.limit) {
+					let value = this.current
+					this.current = this.current + 1u
+					Some(value = value)
+				} else None
+			}
+		}
+
+		func values(): #[uint] = {
+			let mut counter = Counter(current = 0u, limit = 20u)
+			counter
+				.filter((value) -> value % 2u == 0u)
+				.map((value) -> value * 10u)
+				.drop(1u)
+				.take(3u)
+				.to_list()
+		}
+
+		func count(): uint = {
+			let mut counter = Counter(current = 0u, limit = 6u)
+			counter.map((value) -> value + 1u).count()
+		}
+	"#;
+	assert_eq!(
+		run(
+			source,
+			"values().v.map(value => value.v).join(',') + '|' + count().v"
+		),
+		"20,40,60|6"
+	);
 }
 
 #[test]

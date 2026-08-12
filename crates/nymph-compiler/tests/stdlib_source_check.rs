@@ -11,7 +11,10 @@
 //! [`nymph_compiler::is_stdlib_source_path`] is the principled detection
 //! signal a caller (the LSP) uses to pick between the two entry points.
 
-use nymph_compiler::{check, check_without_prelude, is_stdlib_source_path};
+use nymph_compiler::{
+	check, check_project_library_with_std, check_without_prelude, embedded_std_provider,
+	is_stdlib_source_path,
+};
 use std::path::Path;
 
 fn ops_mod_source() -> &'static str {
@@ -44,6 +47,30 @@ fn prelude_free_check_of_a_stdlib_source_file_has_no_self_duplication() {
 	assert!(
 		errors.is_empty(),
 		"expected a clean prelude-free check of ops/mod.nym, got: {errors:?}"
+	);
+}
+
+#[test]
+fn complete_embedded_stdlib_checks_cleanly_through_the_stable_project_pipeline() {
+	// Ambient core is checked as the root's compiler-owned dependency closure.
+	// Import every non-ambient stdlib owner from one project root so this test
+	// also checks their source, imports, interfaces, implementations, defaults,
+	// externals, and namespace members without flattening their ASTs together.
+	let source = r#"
+import std/collections/linked_list
+import std/collections/set
+import std/collections/tree
+import std/io
+import std/math/complex
+"#;
+	let diagnostics = check_project_library_with_std(
+		"main",
+		&|path| (path == "main").then(|| source.to_string()),
+		&embedded_std_provider,
+	);
+	assert!(
+		diagnostics.is_empty(),
+		"expected the complete embedded stdlib to check cleanly through the stable project pipeline: {diagnostics:#?}"
 	);
 }
 

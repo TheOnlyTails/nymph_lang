@@ -14,11 +14,8 @@
 //! Deliberately synthetic, not the real on-disk `stdlib/src/collections/list.nym`
 //! — that file's own `import @/option`/`import @/ops` don't resolve when
 //! reached as a `std::`-keyed module (a `resolve.rs` limitation, out of this
-//! slice's owned-files scope; see the on-disk equivalent's `run_node.rs`
-//! coverage, `compile_against_real_stdlib`, which drives the REAL stdlib but
-//! only through the bare, import-free `emit` harness — it can assert the
-//! emitted SHAPE, never run it). This file is the one place the mechanism is
-//! actually driven end-to-end through the bundle + Node.
+//! slice's owned-files scope. This file drives the mechanism end-to-end through
+//! stable project assembly, bundling, and Node.
 
 use nymph_compiler::compile_project_with_std;
 use nymph_compiler::project::compile_project_module_sources_with_std;
@@ -30,8 +27,8 @@ use nymph_compiler::project::compile_project_module_sources_with_std;
 /// Nymph source that calls `length` transitively (proving
 /// `body_calls_unlinked_external`'s registry subtraction). `get` returns
 /// `Option<T>` — `Option` itself needs no `import` here, it's ambient via the
-/// `core` prelude every module (including a `std::`-keyed one, on its own
-/// check/lower turn) is flattened against.
+/// complete core environment supplied to every module, including a
+/// `std::`-keyed one analyzed on its own turn.
 fn synth_std_provider(path: &str) -> Option<String> {
 	(path == "collections/list").then(|| {
 		"impl<T> #[T] {\n  \

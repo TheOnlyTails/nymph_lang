@@ -628,7 +628,8 @@ impl SemanticModuleInput {
 		}
 	}
 
-	pub(crate) fn is_ambient_core(self, db: &dyn Db) -> bool {
+	#[cfg(test)]
+	fn is_ambient_core(self, db: &dyn Db) -> bool {
 		self.domain(db) == SemanticModuleDomain::AmbientCore
 	}
 }
@@ -836,8 +837,8 @@ impl ProjectGraph {
 			.into()
 	}
 
-	/// Deterministic project symbol tags shared by independent semantic pipelines.
-	/// This is graph data, not a compatibility-analysis or symbol-map query.
+	/// Deterministic project symbol tags shared by semantic query roots.
+	/// This is graph data rather than a semantic-analysis or symbol-map query.
 	pub(crate) fn semantic_module_tags(
 		&self,
 		db: &dyn Db,
@@ -3158,7 +3159,7 @@ mod tests {
 	}
 
 	#[test]
-	fn builtin_parse_uses_the_legacy_module_path() {
+	fn builtin_parse_uses_the_external_display_path() {
 		let (db, key) = fixture(&[("main", "")], &[("custom", "public let answer = 42")]);
 		let builtin = key.builtin_registry(&db).modules(&db)[0];
 		assert_eq!(

@@ -93,15 +93,12 @@ impl InherentRegistry {
 	/// reachable from `head`'s self type, if any. Used by `finish_interface_impl`
 	/// (iface.rs, Slice 4K/HH3) to catch an interface-impl method (top-level `impl
 	/// … for` or a nested `impl Iface { .. }`) colliding with a same-named inherent
-	/// INSTANCE method on the same type — a collision `lower_hir.rs`'s
-	/// `assert_no_duplicate_methods` used to be the only thing catching, and only
-	/// by panicking.
+	/// INSTANCE method on the same type — a collision formerly caught only by a
+	/// runtime-lowering assertion and panic.
 	///
 	/// Deliberately excludes `namespace func` statics (`m.namespaced`): a static
 	/// and an interface-impl instance method of the same name are DIFFERENT JS
-	/// slots (a class static vs. a prototype method — `collect_adt_methods`,
-	/// lower_hir.rs, keeps them in wholly separate `statics`/`methods` lists, each
-	/// independently checked by `assert_no_duplicate_methods`), so they're ordinary
+	/// slots (a class static vs. a prototype method), so they're ordinary
 	/// overloading, not a collision. Without this filter, a `namespace func foo`
 	/// static false-positived a `DuplicateMember` against any interface-impl
 	/// instance method also named `foo` — legal, resolvable JS the checker
@@ -237,8 +234,7 @@ impl<'m> Checker<'m> {
 		let mut body_jobs = Vec::new();
 		for m in members {
 			// Same kind-driven namespacing as a struct/enum body: a `namespace func`
-			// in an `impl Type { … }` block is a static. (Its lowering is a loud
-			// defer — see the `Declaration::Impl` arm in lower_hir.rs.)
+			// in an `impl Type { … }` block is a static.
 			let namespaced = match &m.0 {
 				ImplMember::Func { meta, .. } | ImplMember::ExternalFunc(_, _, meta) => {
 					meta.kind == FuncKind::Namespace
@@ -398,16 +394,8 @@ impl<'m> Checker<'m> {
 	}
 
 	// ── Resolution ───────────────────────────────────────────────────────────
-	/// Resolve an inherent instance method `recv.name(args)`. Returns the method's
-	/// instantiated return type paired with the *matched method's own defining
-	/// span* (its `func` name's identifier span, from `InherentMethod::meta`) — a
-	/// bare `impl Type { .. }` block commits no `ImplDef` (unlike an interface
-	/// impl, which threads `def.span` through `MethodResolution::impl_span` via
-	/// `commit_method`), so without this, an `Inherent`-sourced resolution could
-	/// never be told apart from one whose impl lives in an offset prelude clone
-	/// (Finding 2, stdlib linkage groundwork review round 2) — `impl_is_unmaterialized`
-	/// (`infer_expr.rs`) reads exactly this span the same way it reads
-	/// `ImplDirect`/`InterfaceDefault`'s `def.span`.
+	/// Resolve an inherent instance method `recv.name(args)`, returning its
+	/// instantiated signature and stable declaration identities.
 	pub(crate) fn resolve_inherent(
 		&mut self,
 		recv: Ty,
@@ -421,7 +409,6 @@ impl<'m> Checker<'m> {
 		Ty,
 		Option<DefinitionId>,
 		Option<DefinitionId>,
-		Option<nymph_ast::Span>,
 		Vec<Ty>,
 	)> {
 		// See `resolve_method`'s matching comment: peel `mut` before matching
@@ -446,17 +433,9 @@ impl<'m> Checker<'m> {
 				let implementation = self.inherent.impls[idx].definition.clone();
 				let method = &self.inherent.impls[idx].methods[name];
 				let target = method.definition.clone();
-				let method_span = method.local_span;
 				let (params, ret, type_arguments) =
 					self.commit_inherent(idx, recv, name, Some((arg_tys, arg_lits)), span, false);
-				return Some((
-					params,
-					ret,
-					target,
-					implementation,
-					method_span,
-					type_arguments,
-				));
+				return Some((params, ret, target, implementation, type_arguments));
 			}
 		}
 		None
@@ -473,7 +452,6 @@ impl<'m> Checker<'m> {
 		Ty,
 		Option<DefinitionId>,
 		Option<DefinitionId>,
-		Option<nymph_ast::Span>,
 		Vec<Ty>,
 	)> {
 		let recv = self.strip_mut(recv);
@@ -496,29 +474,14 @@ impl<'m> Checker<'m> {
 		}
 		if matches.len() > 1 {
 			self.emit(span, TypeError::AmbiguousCall { name: name.into() });
-			return Some((
-				Vec::new(),
-				self.interner.error(),
-				None,
-				None,
-				None,
-				Vec::new(),
-			));
+			return Some((Vec::new(), self.interner.error(), None, None, Vec::new()));
 		}
 		let idx = matches.pop()?;
 		let method = &self.inherent.impls[idx].methods[name];
 		let target = method.definition.clone();
-		let method_span = method.local_span;
 		let implementation = self.inherent.impls[idx].definition.clone();
 		let (params, ret, type_arguments) = self.commit_inherent(idx, recv, name, None, span, false);
-		Some((
-			params,
-			ret,
-			target,
-			implementation,
-			method_span,
-			type_arguments,
-		))
+		Some((params, ret, target, implementation, type_arguments))
 	}
 
 	/// Resolve a namespaced function `Type.name(args)`.

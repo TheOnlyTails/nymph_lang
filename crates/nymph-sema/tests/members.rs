@@ -297,7 +297,7 @@ fn variant_name_matching_namespaced_function_is_not_a_member_duplicate() {
 	// per-type inherent-method map this check guards, so a namespaced function
 	// sharing a variant's name is NOT flagged here. (It IS a real hazard, but a
 	// different, enum-specific one caught later at lowering by
-	// `assert_no_variant_static_collision` — see `crates/nymph-sema/src/lower_hir.rs`.)
+	// the runtime class's variant/static collision assertion.)
 	assert_ok(
 		"enum Color { Red
 		   namespace func Red(): Color = Color.Red
