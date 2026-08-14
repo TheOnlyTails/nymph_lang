@@ -28,13 +28,6 @@ export const remove = <K, V>($_this: NMap<K, V>, key: K) => {
 	return Option.None;
 };
 export const clear = <K, V>($_this: NMap<K, V>) => $_this.clear();
-export const get_or_insert = <K, V>($_this: NMap<K, V>, key: K, defaultValue: V): V => {
-	if (!$_this.has(key)) {
-		$_this.set(key, defaultValue);
-	}
-	return $_this.get(key)!;
-};
-export const contains_key = <K, V>($_this: NMap<K, V>, key: K) => new NBool($_this.has(key));
 export const keys = <K, V>($_this: NMap<K, V>) =>
 	nymphSetPrototypeOf(
 		new NList([...$_this.keys()]),
@@ -54,10 +47,5 @@ export const entries = <K, V>($_this: NMap<K, V>) => {
 		nymphType(NList.prototype, [tuple]),
 	);
 };
-export const merge = <K, V>($_this: NMap<K, V>, other: NMap<K, V>) =>
-	nymphSetPrototypeOf(
-		new NMap([...$_this.entries(), ...other.entries()]),
-		Object.getPrototypeOf($_this),
-	);
 export const to_string = ($_this: NMap<unknown, unknown>) =>
 	new NString(`#{${[...$_this.entries()].map(([key, value]) => `${key}: ${value}`).join(", ")}}`);

@@ -1271,7 +1271,7 @@ fn stable_static_generic_external_forwards_hidden_arguments_and_runs() {
 	session.set_source(
 		project.clone(),
 		main.clone(),
-		"struct Host<Owner> { external(compare_number) namespace func compare<Value>(first: Owner, second: Value): int }\nfunc stored(): int = { let f = Host.compare f(1, 2) }\nfunc stored_grouped(): int = { let f = (Host.compare) f(2, 1) }\nfunc immediate_grouped(): int = (Host.compare)(1, 1)\nfunc direct(): int = Host.compare(1, 2)\npublic func main(): void = {}".into(),
+		"struct Host<Owner> { external(compare_char) namespace func compare<Value>(first: Owner, second: Value): int }\nfunc stored(): int = { let f = Host.compare f('a', 'b') }\nfunc stored_grouped(): int = { let f = (Host.compare) f('b', 'a') }\nfunc immediate_grouped(): int = (Host.compare)('a', 'a')\nfunc direct(): int = Host.compare('a', 'b')\npublic func main(): void = {}".into(),
 		SourceVersion(1),
 	);
 
@@ -1281,7 +1281,7 @@ fn stable_static_generic_external_forwards_hidden_arguments_and_runs() {
 	assert_eq!(
 		emitted.module_sources["main"]
 			.lines()
-			.filter(|line| line.starts_with("import { compare_number"))
+			.filter(|line| line.starts_with("import { compare_char"))
 			.count(),
 		1,
 		"{}",

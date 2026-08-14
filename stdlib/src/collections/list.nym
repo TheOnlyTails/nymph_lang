@@ -13,7 +13,8 @@ impl<T> mut #[T] {
   external(push) func push(item: T): void
 
   /// Removes and returns the last element, or `None` if empty.
-  external(pop) func pop(): Option<T>
+  func pop(): Option<T> =
+    if (this.is_empty()) Option.None else this.remove(this.length() - 1u)
 
   func is_empty(): boolean = this.length() == 0
   func is_not_empty(): boolean = !this.is_empty()
@@ -24,31 +25,53 @@ impl<T> #[T] {
   external(get) func get(i: uint): Option<T>
 
   /// Returns the first element, or `None` if empty.
-  external(first) func first(): Option<T>
+  func first(): Option<T> = this.get(0u)
 
   /// Returns the last element, or `None` if empty.
-  external(last) func last(): Option<T>
+  func last(): Option<T> =
+    if (this.is_empty()) Option.None else this.get(this.length() - 1u)
 
   /// Returns a new list with elements from `start` (inclusive) to `end` (exclusive).
   external(slice) func slice(start: uint, end: uint): #[T]
 
   /// Returns a new list with `other` appended.
-  external(concat) func concat(other: #[T]): #[T]
+  func concat(other: #[T]): #[T] = {
+    let mut result = this.slice(0u, this.length())
+    for (item in other) {
+      result.push(item)
+    }
+    result
+  }
 
   /// Returns a new list with the elements in reverse order.
-  external(reversed) func reversed(): #[T]
+  func reversed(): #[T] = {
+    let mut result: #[T] = #[]
+    let mut i = this.length()
+    while (i > 0u) {
+      i = i - 1u
+      result.push(this[i])
+    }
+    result
+  }
 
   /// Returns a list of sub-lists, each of the given `size` (the last chunk may be smaller).
-  external(chunked) func chunked(size: uint): #[#[T]]
-
-  /// Returns a new list with duplicate elements removed.
-  external(distinct) func distinct(): #[T]
+  func chunked(size: uint): #[#[T]] = {
+    let mut result: #[#[T]] = #[]
+    if (size > 0u) {
+      let mut start = 0u
+      while (start < this.length()) {
+        result.push(this.slice(start, start + size))
+        start = start + size
+      }
+    }
+    result
+  }
 
   /// Returns a new list with the first `n` elements dropped.
-  external(drop) func drop(n: uint): #[T]
+  func drop(n: uint): #[T] = this.slice(n, this.length())
 
   /// Returns a new list with only the first `n` elements.
-  external(take) func take(n: uint): #[T]
+  func take(n: uint): #[T] = this.slice(0u, n)
 
   /// Returns whether any element satisfies `predicate`, stopping at the first match.
   func any(predicate: (T) -> boolean): boolean = {
@@ -105,10 +128,30 @@ impl<T: Comparable<Other = T>> #[T] {
   }
 }
 
+impl<T: Equals<Other = T>> #[T] {
+  /// Returns a new list with duplicate elements removed, preserving first-seen order.
+  func distinct(): #[T] = {
+    let mut result: #[T] = #[]
+    for (item in this) {
+      if (!result.contains(item)) {
+        result.push(item)
+      }
+    }
+    result
+  }
+}
+
 impl<T> Plus<Other = self, Output = self> for #[T] {
-  external(concat) func plus(other: self): self
+  func plus(other: self): self = this.concat(other)
 }
 
 impl<T: Equals<Other = T>> Contains<Item = T> for #[T] {
-  external(contains) func contains(item: T): boolean
+  func contains(item: T): boolean = {
+    for (candidate in this) {
+      if (candidate.equals(item)) {
+        return true
+      }
+    }
+    false
+  }
 }

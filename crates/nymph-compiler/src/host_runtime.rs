@@ -691,18 +691,18 @@ mod tests {
 	}
 
 	#[test]
-	fn injects_a_list_module_with_every_linked_symbol_and_a_resolvable_option_import() {
+	fn injects_a_list_primitive_module_with_a_resolvable_option_import() {
 		let sources = HostRuntimeGraph::compiler_facts().module_sources("Option");
 		let list_js = sources
 			.get("std/collections/list")
 			.expect("expected the linked-symbol registry module to be injected");
-		for symbol in ["length", "get", "first", "last", "pop"] {
+		for symbol in ["length", "get", "remove", "slice", "splice"] {
 			assert!(
 				list_js.contains(symbol),
 				"expected the linked `{symbol}` export to survive stripping, got:\n{list_js}"
 			);
 		}
-		// `get`/`first`/`last`/`pop` all construct `Option.Some`/`Option.None`
+		// `get` and `remove` construct `Option.Some`/`Option.None`
 		// — the import must survive, rewritten to the injected virtual
 		// `std/option` key (never the original, unresolvable `"../option"`).
 		assert!(
@@ -731,12 +731,9 @@ mod tests {
 			"insert",
 			"remove",
 			"clear",
-			"get_or_insert",
-			"contains_key",
 			"keys",
 			"values",
 			"entries",
-			"merge",
 			"to_string",
 		] {
 			assert!(

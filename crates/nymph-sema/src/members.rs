@@ -411,6 +411,46 @@ impl<'m> Checker<'m> {
 		Option<DefinitionId>,
 		Vec<Ty>,
 	)> {
+		self.resolve_inherent_impl(recv, receiver_is_mut, name, arg_tys, arg_lits, span, false)
+	}
+
+	/// Resolve only an inherent overload whose arguments fit. This lets ordinary
+	/// method resolution fall through to an interface overload with the same name.
+	pub(crate) fn resolve_matching_inherent(
+		&mut self,
+		recv: Ty,
+		receiver_is_mut: bool,
+		name: &str,
+		arg_tys: &[Ty],
+		arg_lits: &[bool],
+		span: nymph_ast::Span,
+	) -> Option<(
+		Vec<Ty>,
+		Ty,
+		Option<DefinitionId>,
+		Option<DefinitionId>,
+		Vec<Ty>,
+	)> {
+		self.resolve_inherent_impl(recv, receiver_is_mut, name, arg_tys, arg_lits, span, true)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn resolve_inherent_impl(
+		&mut self,
+		recv: Ty,
+		receiver_is_mut: bool,
+		name: &str,
+		arg_tys: &[Ty],
+		arg_lits: &[bool],
+		span: nymph_ast::Span,
+		require_argument_match: bool,
+	) -> Option<(
+		Vec<Ty>,
+		Ty,
+		Option<DefinitionId>,
+		Option<DefinitionId>,
+		Vec<Ty>,
+	)> {
 		// See `resolve_method`'s matching comment: peel `mut` before matching
 		// against any impl's (never-`mut`) `Self` type.
 		let recv = self.strip_mut(recv);
@@ -430,6 +470,19 @@ impl<'m> Checker<'m> {
 			let matched = self.inherent_receiver_matches(idx, recv);
 			self.table.rollback_to(snapshot);
 			if matched {
+				let snapshot = self.table.snapshot();
+				let diagnostic_mark = self.diags.len();
+				let pending_bound_mark = self.pending_bounds.len();
+				let pending_bound_arg_mut = self.pending_bound_arg_mut.clone();
+				self.commit_inherent(idx, recv, name, Some((arg_tys, arg_lits)), span, false);
+				let arguments_match = self.diags.len() == diagnostic_mark;
+				self.diags.truncate(diagnostic_mark);
+				self.pending_bounds.truncate(pending_bound_mark);
+				self.pending_bound_arg_mut = pending_bound_arg_mut;
+				self.table.rollback_to(snapshot);
+				if require_argument_match && !arguments_match {
+					continue;
+				}
 				let implementation = self.inherent.impls[idx].definition.clone();
 				let method = &self.inherent.impls[idx].methods[name];
 				let target = method.definition.clone();

@@ -1599,7 +1599,7 @@ fn direct_generic_externals_append_hidden_arguments_after_exact_source_arity() {
 			1,
 		),
 		(
-			"external(compare_number) func compare<A, B>(first: A, second: B): int\nfunc apply(): int = compare(first = 1, second = 2)",
+			"external(compare_char) func compare<A, B>(first: A, second: B): int\nfunc apply(): int = compare(first = 1, second = 2)",
 			4,
 		),
 	] {
@@ -1622,7 +1622,7 @@ fn direct_generic_externals_append_hidden_arguments_after_exact_source_arity() {
 
 #[test]
 fn generic_external_method_calls_and_values_preserve_receiver_source_hidden_order() {
-	let source = "impl int { external(compare_number) func compare<T>(other: T): int }\nfunc apply(): int = { let f = (1).compare f(2) }\nfunc direct(): int = (1).compare(2)";
+	let source = "impl int { external(compare_char) func compare<T>(other: T): int }\nfunc apply(): int = { let f = (1).compare f(2) }\nfunc direct(): int = (1).compare(2)";
 	let lowered = lower_named(source, "apply");
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
 		panic!("apply must lower as a function")
@@ -1663,7 +1663,7 @@ fn generic_external_method_calls_and_values_preserve_receiver_source_hidden_orde
 
 #[test]
 fn generic_external_static_value_forwards_source_then_hidden_arguments() {
-	let source = "struct Host<Owner> { external(compare_number) namespace func compare<Value>(first: Owner, second: Value): int }\nfunc apply(): int = { let f = (Host.compare) f(1, 2) }";
+	let source = "struct Host<Owner> { external(compare_char) namespace func compare<Value>(first: Owner, second: Value): int }\nfunc apply(): int = { let f = (Host.compare) f(1, 2) }";
 	let (artifacts, _, context) = materialized_fixture(source);
 	let compare = artifacts
 		.iter()
@@ -1712,7 +1712,7 @@ fn generic_external_static_value_forwards_source_then_hidden_arguments() {
 #[test]
 fn concrete_parameterized_static_value_keeps_its_generic_adapter() {
 	let lowered = lower_named(
-		"struct Host<Owner>\nimpl Host<int> { external(compare_number) namespace func compare<Value>(first: int, second: Value): int }\nfunc apply(): int = { let f = Host.compare f(1, 2) }",
+		"struct Host<Owner>\nimpl Host<int> { external(compare_char) namespace func compare<Value>(first: int, second: Value): int }\nfunc apply(): int = { let f = Host.compare f(1, 2) }",
 		"apply",
 	);
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
@@ -1815,7 +1815,7 @@ fn same_module_identifier_records_its_exact_definition_demand() {
 #[test]
 fn direct_external_call_records_its_exact_definition_demand() {
 	let (artifacts, _, context) = materialized_fixture(
-		"external(compare_number) func compare(first: int, second: int): int\nfunc sign(): int = compare(1, 2)",
+		"external(compare_char) func compare(first: int, second: int): int\nfunc sign(): int = compare(1, 2)",
 	);
 	let compare = artifacts
 		.iter()
@@ -1836,7 +1836,7 @@ fn direct_external_call_records_its_exact_definition_demand() {
 #[test]
 fn direct_external_call_rejects_runtime_and_shape_abi_drift() {
 	let (artifacts, _, mut context) = materialized_fixture(
-		"external(compare_number) func compare(first: int, second: int): int\nfunc sign(): int = compare(1, 2)",
+		"external(compare_char) func compare(first: int, second: int): int\nfunc sign(): int = compare(1, 2)",
 	);
 	let compare = artifacts
 		.iter()

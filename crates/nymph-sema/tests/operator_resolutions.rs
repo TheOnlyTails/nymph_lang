@@ -615,6 +615,20 @@ fn bool_not_on_boolean_is_builtin_eager() {
 }
 
 #[test]
+fn bool_not_on_a_generic_inherent_method_result_is_builtin_eager() {
+	let res = prefix_resolution_for(
+		"interface Hash { func hash(): int }
+		 impl<K: Hash, V> #{K: V} {
+		   external func contains_key(key: K): boolean
+		 }
+		 func missing<K: Hash, V>(map: #{K: V}, key: K): boolean = !map.contains_key(key)",
+		"missing",
+	);
+	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
+	assert_eq!(res.method, "not");
+}
+
+#[test]
 fn bit_not_int_is_builtin_eager() {
 	let res = prefix_resolution_for("func f(a: int): int = ~a", "f");
 	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);

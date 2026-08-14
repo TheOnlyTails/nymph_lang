@@ -581,3 +581,35 @@ fn list_join_converts_in_order_and_places_separators_between_elements() {
 		"item=2 / item=1 / item=3||item=7"
 	);
 }
+
+#[test]
+fn collection_and_string_convenience_apis_run_from_nymph_bodies() {
+	with_compiler_stack(|| {
+		let source = r#"
+		func summary(): string = {
+			let mut mutable = #[1, 2, 3]
+			let popped = mutable.pop() ?? 0
+			let combined = #[1, 2].concat(#[3, 4])
+			let window = combined.drop(1u).take(2u).reversed()
+			let edges = (combined.first() ?? 0) + (combined.last() ?? 0)
+
+			let mut map = #{1: 10}
+			let existing = map.get_or_insert(1, 99)
+			let inserted = map.get_or_insert(2, 20)
+			let merged = map + #{2: 22, 3: 30}
+
+			let text = "ab".repeat(2u).concat_chars(#['c'])
+			let pieces = "a,,b,".split(",")
+			let scalars = "😀x".split("")
+			let replaced = "aaaa".replace("aa", "b")
+			let inserted_between = "😀x".replace("", "-")
+			let replaced_first = "aaaa".replace_first("aa", "b")
+			"${popped}|${window[0]}${window[1]}|${edges}|${existing},${inserted},${merged[2]},${merged[3]}|${text}|${text.starts_with("ab")},${text.ends_with("bc")},${'c' in text}|${pieces.length()}:${pieces[1]}:${pieces[3]}|${scalars.length()}:${scalars[0]}|${replaced}:${inserted_between}:${replaced_first}"
+		}
+	"#;
+		assert_eq!(
+			run(source, "summary().v"),
+			"3|32|5|10,20,22,30|ababc|true,true,true|4::|2:😀|bb:-😀-x-:baa"
+		);
+	});
+}

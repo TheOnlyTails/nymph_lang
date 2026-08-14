@@ -1566,27 +1566,56 @@ fn runtime_annotations(
 					option: protocols.2.clone(),
 				},
 				crate::IterMode::ViaIter => {
-					let resolution = checked
-						.annotations
-						.iter_resolution_of(source)
-						.ok_or(RuntimeExtractionError::MissingIterationProtocol)?;
-					let (iterable_interface, iter_interface_member) =
-						match resolution.resolved_target.as_ref() {
-							Some(crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
+					let (iterable_interface, iter_interface_member, iter) =
+						if let Some(resolution) = checked.annotations.iter_resolution_of(source) {
+							let (interface, member) = match resolution.resolved_target.as_ref() {
+								Some(crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
+									interface,
+									slot,
+									..
+								}) => (interface.clone(), slot.interface_member_id.clone()),
+								Some(crate::annotate::ResolvedMethodTarget::GenericBound {
+									interface,
+									interface_member,
+								}) => (interface.clone(), interface_member.clone()),
+								_ => return Err(RuntimeExtractionError::MissingIterationProtocol),
+							};
+							(
 								interface,
-								slot,
-								..
-							}) => (interface.clone(), slot.interface_member_id.clone()),
-							Some(crate::annotate::ResolvedMethodTarget::GenericBound {
-								interface,
-								interface_member,
-							}) => (interface.clone(), interface_member.clone()),
-							_ => return Err(RuntimeExtractionError::MissingIterationProtocol),
+								member,
+								stable_dispatch(checked, resolution, &context)?,
+							)
+						} else {
+							let source_type = checked
+								.annotations
+								.get(source)
+								.ok_or(RuntimeExtractionError::MissingIterationProtocol)?
+								.ty;
+							if !matches!(
+								required_canonical_type(&checked.interner, source_type, &context)?,
+								InterfaceType::List(_)
+							) {
+								return Err(RuntimeExtractionError::MissingIterationProtocol);
+							}
+							let iterable = checked
+								.semantic
+								.compiler_runtime_roles
+								.iterable
+								.as_ref()
+								.ok_or(RuntimeExtractionError::MissingIterationProtocol)?;
+							(
+								iterable.interface.clone(),
+								iterable.member.clone(),
+								StableDispatch::Builtin {
+									method: "iter".into(),
+									category: BuiltinDispatch::Eager,
+								},
+							)
 						};
 					RuntimeIteration::ViaIter {
 						iterable_interface,
 						iter_interface_member,
-						iter: stable_dispatch(checked, resolution, &context)?,
+						iter,
 						iterator_interface: protocols.0.clone(),
 						next: protocols.1.clone(),
 						next_dispatch: stable_iteration_next_dispatch(checked, source, &context)?,
