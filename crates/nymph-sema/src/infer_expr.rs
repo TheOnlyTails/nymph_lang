@@ -532,6 +532,7 @@ impl<'m> Checker<'m> {
 					Some(ty) => ty,
 					None => self.infer(expr),
 				};
+				self.record_implicit_uint_to_int(expr, got, expected);
 				self.subtype(got, expected, expr.span);
 			}
 		}
@@ -1648,10 +1649,11 @@ impl<'m> Checker<'m> {
 				self
 					.annotations
 					.record_generic_call_arguments(id, resolution.type_arguments.clone());
-				for (argument, expected) in args.iter().zip(&resolution.params) {
+				for ((argument, found), expected) in args.iter().zip(&arg_tys).zip(&resolution.params) {
 					if matches!(argument.0.value.kind, ExprKind::Closure { .. }) {
 						self.check_closure(&argument.0.value, *expected);
 					}
+					self.record_implicit_uint_to_int(&argument.0.value, *found, *expected);
 				}
 				let mapped = resolution.ty;
 				let dispatch = Resolution {
@@ -1966,10 +1968,11 @@ impl<'m> Checker<'m> {
 					self
 						.annotations
 						.record_generic_call_arguments(id, res.type_arguments.clone());
-					for (argument, expected) in args.iter().zip(&res.params) {
+					for ((argument, found), expected) in args.iter().zip(&arg_tys).zip(&res.params) {
 						if matches!(argument.0.value.kind, ExprKind::Closure { .. }) {
 							self.check_closure(&argument.0.value, *expected);
 						}
+						self.record_implicit_uint_to_int(&argument.0.value, *found, *expected);
 					}
 					let dispatch = dispatch_kind_for_method_call(&res);
 					let resolution = Resolution {
@@ -4797,6 +4800,7 @@ impl<'m> Checker<'m> {
 			ExprKind::Map(_) | ExprKind::List(_) => self.check(expr, pty),
 			_ => {
 				let got = self.infer(expr);
+				self.record_implicit_uint_to_int(expr, got, pty);
 				let got_resolved = self.shallow_resolve(got);
 				let is_mut = matches!(self.interner.kind(got_resolved), TyKind::Mut(_));
 				let entry = self

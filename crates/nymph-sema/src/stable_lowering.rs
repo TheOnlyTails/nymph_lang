@@ -2997,7 +2997,18 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				})
 			});
 		}
-		self.lower_inner(expr)
+		let lowered = self.lower_inner(expr)?;
+		if self
+			.annotations
+			.implicitly_converts_uint_to_int(self.id(expr))
+		{
+			Ok(HirExpr::ScalarCast {
+				kind: ScalarCastKind::ToInt,
+				operand: Box::new(lowered),
+			})
+		} else {
+			Ok(lowered)
+		}
 	}
 	fn lower_inner(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
 		Ok(match &expr.kind {

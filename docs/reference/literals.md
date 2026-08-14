@@ -19,6 +19,15 @@ in either binary, octal, decimal, or hexadecimal.
 0xDEADF00D // hexadecimal
 ```
 
+An integer literal suffixed with `u` has type `uint`. A non-negated integer literal also becomes a
+`uint` automatically when its context requires one, so ordinary arguments, fields, and return values
+usually do not need the suffix. The suffix remains useful where no expected type is available.
+
+```nymph
+10u
+func ten(): uint = 10
+```
+
 Floats are only decimal, and they may include underscore digit separators, scientific-notation exponents.
 Decimal integer literals suffixed with `f` are treated as floats of the same value.
 

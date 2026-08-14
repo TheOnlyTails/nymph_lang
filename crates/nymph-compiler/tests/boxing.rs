@@ -75,6 +75,26 @@ fn boxes_a_uint_literal_as_new_nuint() {
 }
 
 #[test]
+fn implicit_uint_to_int_conversion_reboxes_the_value() {
+	let js = emit_js("func f(n: uint): int = n");
+	assert!(
+		js.contains("new NInt(n.v)"),
+		"implicit uint-to-int conversion must produce an int box: {js}"
+	);
+
+	let call_js = emit_js(
+		"func take(n: int): int = n\n\
+		 struct Box { func take(n: int): int = n }\n\
+		 func direct(n: uint): int = take(n)\n\
+		 func method(box: Box, n: uint): int = box.take(n)",
+	);
+	assert!(
+		call_js.matches("new NInt(n.v)").count() >= 2,
+		"free and method arguments must both rebox implicit conversions: {call_js}"
+	);
+}
+
+#[test]
 fn boxes_a_float_literal_as_new_nfloat() {
 	let js = emit_js("func f(): float = 5.0");
 	assert!(

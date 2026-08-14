@@ -1019,6 +1019,22 @@ fn int_literal_widens_to_uint_in_return_position() {
 }
 
 #[test]
+fn uint_value_widens_to_int() {
+	assert_ok("func f(n: uint): int = n");
+	assert_ok("func takes_int(n: int): int = n func f(n: uint): int = takes_int(n)");
+}
+
+#[test]
+fn negated_int_literal_does_not_widen_to_uint() {
+	assert_error_contains("func f(): uint = -1", "mismatched types");
+}
+
+#[test]
+fn non_literal_int_does_not_convert_to_uint() {
+	assert_error_contains("func f(n: int): uint = n", "mismatched types");
+}
+
+#[test]
 fn int_literal_widens_to_float_argument() {
 	assert_ok(
 		"func takes_float(x: float): float = x

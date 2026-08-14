@@ -16,6 +16,19 @@ use crate::check::Checker;
 use crate::ty::{Ty, TyKind};
 
 impl Checker<'_> {
+	fn uint_fits_int(&mut self, expected: Ty, found: Ty) -> bool {
+		let expected = self.shallow_resolve(expected);
+		let found = self.strip_mut(found);
+		matches!(self.interner.kind(expected), TyKind::Int)
+			&& matches!(self.interner.kind(found), TyKind::UInt)
+	}
+
+	pub(crate) fn record_implicit_uint_to_int(&mut self, expr: &Expr, found: Ty, expected: Ty) {
+		if self.uint_fits_int(expected, found) {
+			self.annotations.record_implicit_uint_to_int(expr.id);
+		}
+	}
+
 	/// Whether an `int` literal argument may implicitly widen to the parameter type
 	/// (`float`/`uint`) — the argument-position counterpart of the check-mode literal
 	/// widening, since method/operator arguments are synthesised, not checked.
@@ -27,14 +40,17 @@ impl Checker<'_> {
 	}
 
 	/// Unify a call/operator argument against its parameter, letting an `int` *literal*
-	/// argument widen to a `float`/`uint` parameter instead of clashing, and letting a
-	/// `mut`-typed argument satisfy a non-`mut` parameter (NN3's one-way `mut T <: T`,
+	/// widen to `float`/`uint`, any `uint` value widen to `int`, and a `mut`-typed
+	/// argument satisfy a non-`mut` parameter (NN3's one-way `mut T <: T`,
 	/// mirroring [`Checker::subtype`] — see the comment there for why the peel is
 	/// asymmetric). Every method-style call (inherent, interface-impl, interface-default,
 	/// generic-bound) routes arguments through here, so without this, `mut T <: T` held
 	/// only for free-function calls and operators, not method calls.
 	pub(crate) fn unify_arg(&mut self, param: Ty, arg: Ty, is_int_literal: bool, span: Span) {
 		if is_int_literal && self.int_literal_fits_param(param, arg) {
+			return;
+		}
+		if self.uint_fits_int(param, arg) {
 			return;
 		}
 		let param_r = self.shallow_resolve(param);
@@ -51,9 +67,9 @@ impl Checker<'_> {
 	}
 
 	/// Trial version of [`Checker::unify_arg`] for overload selection (non-emitting).
-	/// On success also reports whether the match required `int`-literal widening
-	/// (`int` literal → `float`/`uint`) rather than an exact-type unification. Overload
-	/// phase 2 uses this to prefer an exact-type
+	/// On success also reports whether the match required numeric widening (`int`
+	/// literal → `float`/`uint`, or `uint` → `int`) rather than exact-type unification.
+	/// Overload phase 2 uses this to prefer an exact-type
 	/// argument match over a widened one, so a same-type operator impl
 	/// (`Plus<Other = int> for int`) beats a cross-type sibling
 	/// (`Plus<Other = uint> for int`) for an `int`-literal argument instead of the two
@@ -66,6 +82,9 @@ impl Checker<'_> {
 		is_int_literal: bool,
 	) -> Option<bool> {
 		if is_int_literal && self.int_literal_fits_param(param, arg) {
+			return Some(true);
+		}
+		if self.uint_fits_int(param, arg) {
 			return Some(true);
 		}
 		let param_r = self.shallow_resolve(param);
@@ -226,8 +245,9 @@ impl Checker<'_> {
 	}
 
 	/// Milestone-A subtyping: `never` is a subtype of everything, `error` absorbs,
-	/// `mut T` is (one-way) assignable to `T`, and everything else is invariant
-	/// unification. (Covariance for containers and functions is a later refinement.)
+	/// `mut T` is (one-way) assignable to `T`, `uint` is safely assignable to `int`,
+	/// and everything else is invariant unification. (Covariance for containers and
+	/// functions is a later refinement.)
 	pub(crate) fn subtype(&mut self, sub: Ty, sup: Ty, span: Span) {
 		let sub = self.shallow_resolve(sub);
 		let sup = self.shallow_resolve(sup);
@@ -245,6 +265,7 @@ impl Checker<'_> {
 		}
 		match (self.interner.kind(sub), self.interner.kind(sup)) {
 			(TyKind::Never, _) | (TyKind::Error, _) | (_, TyKind::Error) => {}
+			(TyKind::UInt, TyKind::Int) => {}
 			// `mut T <: mut U` iff `T <: U` (inner variance carries through).
 			(&TyKind::Mut(a), &TyKind::Mut(b)) => self.subtype(a, b, span),
 			// `mut T <: T`, one-way: dropping mutability is always allowed. Never

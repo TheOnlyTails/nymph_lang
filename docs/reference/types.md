@@ -13,6 +13,8 @@ should generally use `PascalCase`.
 Basic types represent a very simple construct, which can be created using a [literal](./literals):
 
 - `int`: a 64-bit signed integer.
+- `uint`: a 64-bit unsigned integer. A `uint` value converts safely and implicitly to `int`; conversion
+  in the other direction requires a non-negated literal or an explicit cast.
 - `float`: a double-precision floating point number.
 - `boolean`: a value of either `true` or `false`.
 - `char`: a single Unicode codepoint.

@@ -398,6 +398,7 @@ pub struct RuntimeAnnotations {
 	pub option: Option<crate::OptionRuntimeRole>,
 	pub result: Option<crate::ResultRuntimeRole>,
 	pub types: Arc<[(BodyNodeId, InterfaceType)]>,
+	pub implicit_uint_to_int: Arc<[BodyNodeId]>,
 	pub definition_targets: Arc<[(BodyNodeId, DefinitionId)]>,
 	pub direct_namespace_members: Arc<[BodyNodeId]>,
 	pub dispatches: Arc<[(BodyNodeId, StableDispatch)]>,
@@ -428,6 +429,10 @@ impl RuntimeAnnotations {
 			.types
 			.iter()
 			.find_map(|(id, value)| (*id == node).then_some(value))
+	}
+
+	pub fn implicitly_converts_uint_to_int(&self, node: BodyNodeId) -> bool {
+		self.implicit_uint_to_int.contains(&node)
 	}
 
 	pub fn definition_target(&self, node: BodyNodeId) -> Option<&DefinitionId> {
@@ -1590,6 +1595,11 @@ fn runtime_annotations(
 		.definition_targets()
 		.filter_map(|(id, target)| local.get(&id).map(|id| (*id, target.clone())))
 		.collect::<Vec<_>>();
+	let mut implicit_uint_to_int = checked
+		.annotations
+		.implicit_uint_to_int()
+		.filter_map(|source| local.get(&source).copied())
+		.collect::<Vec<_>>();
 	let mut variants = checked
 		.annotations
 		.variants()
@@ -1812,6 +1822,7 @@ fn runtime_annotations(
 		})
 		.collect::<Vec<_>>();
 	types.sort_by_key(|item| item.0);
+	implicit_uint_to_int.sort_unstable();
 	definition_targets.sort_by_key(|item| item.0);
 	dispatches.sort_by_key(|item| item.0);
 	variants.sort_by_key(|item| item.0);
@@ -1840,6 +1851,7 @@ fn runtime_annotations(
 		option: checked.runtime_roles.option.clone(),
 		result: checked.runtime_roles.result.clone(),
 		types: types.into(),
+		implicit_uint_to_int: implicit_uint_to_int.into(),
 		definition_targets: definition_targets.into(),
 		direct_namespace_members: direct_namespace_members.into(),
 		dispatches: dispatches.into(),

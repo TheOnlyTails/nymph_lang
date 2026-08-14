@@ -1053,8 +1053,8 @@ impl Checker<'_> {
 		// actually fit the arguments — e.g. `intVal.equals(intVal)` must fall to the
 		// blanket `Equals<Other = self>` rather than committing the cross-type
 		// `Equals<Other = uint> for int` and then mismatching the `int` argument.
-		// Each surviving candidate is tagged with whether it matched only via
-		// `int`-literal widening (`int` literal → `uint`/`float`); an exact-type match is
+		// Each surviving candidate is tagged with whether it matched only via numeric
+		// widening (`int` literal → `uint`/`float`, or `uint` → `int`); an exact-type match is
 		// strictly more specific, so if any candidate matches exactly, the widened ones
 		// are dropped, and `most_specific` (concrete over blanket) breaks any remaining
 		// tie. This keeps `a.plus(2)` (a: int) resolving to `Plus<Other = int> for int`
@@ -1191,7 +1191,7 @@ impl Checker<'_> {
 
 	/// Trial (arg-aware): does impl `idx` provide `name` applicable to `recv(args)`?
 	/// On success returns `(return type, widened)`, where `widened` is true iff any
-	/// argument matched only via `int`-literal widening (see
+	/// argument matched only via numeric widening (see
 	/// [`Checker::try_unify_arg_widened`]) rather than an exact-type unification —
 	/// phase 2 uses it to prefer exact matches over widened ones.
 	fn try_method(

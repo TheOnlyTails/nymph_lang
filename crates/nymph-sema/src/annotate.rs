@@ -233,6 +233,9 @@ pub enum GenericSymbolIdentity {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Annotations {
 	infos: FxHashMap<NodeId, ExprInfo>,
+	/// Expressions whose `uint` value is implicitly widened to `int` at this use site.
+	/// Lowering reboxes these nodes as `NInt`, preserving the declared runtime type.
+	implicit_uint_to_int: FxHashSet<NodeId>,
 	member_completions: FxHashMap<NodeId, Vec<MemberCompletion>>,
 	unresolved_qualified_accesses: Vec<UnresolvedQualifiedAccess>,
 	direct_namespace_members: FxHashSet<NodeId>,
@@ -316,6 +319,16 @@ pub struct PositionalFieldResolution {
 }
 
 impl Annotations {
+	pub(crate) fn record_implicit_uint_to_int(&mut self, id: NodeId) {
+		if id != NodeId::DUMMY {
+			self.implicit_uint_to_int.insert(id);
+		}
+	}
+
+	pub(crate) fn implicit_uint_to_int(&self) -> impl Iterator<Item = NodeId> + '_ {
+		self.implicit_uint_to_int.iter().copied()
+	}
+
 	pub(crate) fn record_member_completions(
 		&mut self,
 		receiver: NodeId,
