@@ -195,7 +195,43 @@ fn calls_and_member_access() {
 		expr("list?.first").kind,
 		ExprKind::MemberAccess { optional: true, .. }
 	));
-	assert!(matches!(expr("value?").kind, ExprKind::PostfixOp { .. }));
+	assert!(matches!(
+		expr("value?").kind,
+		ExprKind::PostfixOp { label: None, .. }
+	));
+	assert!(matches!(
+		expr("value?@target").kind,
+		ExprKind::PostfixOp { label: Some(_), .. }
+	));
+}
+
+#[test]
+fn optional_chain_postfix_forms_and_composition() {
+	let method = expr("option?.method(1)");
+	let ExprKind::Call { func, .. } = method.kind else {
+		panic!("expected optional method call");
+	};
+	assert!(matches!(
+		func.kind,
+		ExprKind::MemberAccess { optional: true, .. }
+	));
+	assert!(matches!(
+		expr("option?.[index]").kind,
+		ExprKind::IndexAccess { optional: true, .. }
+	));
+	let chained = expr("option?.child?.name");
+	let ExprKind::MemberAccess {
+		parent,
+		optional: true,
+		..
+	} = chained.kind
+	else {
+		panic!("expected outer optional member access");
+	};
+	assert!(matches!(
+		parent.kind,
+		ExprKind::MemberAccess { optional: true, .. }
+	));
 }
 
 #[test]
@@ -285,6 +321,8 @@ fn label_edges_must_be_adjacent() {
 		"continue@ outer",
 		"return @outer 1",
 		"return@ outer 1",
+		"value? @outer",
+		"value?@ outer",
 		"outer @{ 1 }",
 		"outer@ { 1 }",
 		"outer @(x) -> x",

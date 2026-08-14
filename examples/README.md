@@ -8,8 +8,9 @@ read.
 > [!IMPORTANT] These are aspirational
 > Not every example compiles or runs today. Some lean on standard-library modules
 > that aren't implemented yet (`std/os`, `std/fs`, `std/http`, `std/json`, …) or on
-> language features still in flight (lazy iterator adapters like `map`/`filter`/
-> `fold` on `Iterator`). Each example's README calls out what it depends on and how
+> language features still in flight. Lazy iterator adapters including `map`,
+> `filter`, `take`, `fold`, and `sorted_by` are implemented. Each example's README
+> calls out what it depends on and how
 > much of it works right now. Treat them as design targets, not a test suite.
 
 ## Project layout
@@ -49,7 +50,7 @@ nymph run --manifest examples/hello-world/nymph.toml
 | [`hello-world`](./hello-world) | The smallest program — `println` from `std/io`. | ✅ runs |
 | [`fizzbuzz`](./fizzbuzz) | Ranges, `match`, guards, string interpolation — no imports beyond `std/io`. | ✅ runs |
 | [`shapes`](./shapes) | Enums, interfaces + `impl`, generics, exhaustive `match`. Pure language. | ✅ runs |
-| [`word-frequency`](./word-frequency) | An iterator pipeline: `split` → `filter` → `fold` → `sorted`. File I/O. | 🚧 iterators/`std/fs` in flight |
+| [`word-frequency`](./word-frequency) | A lazy iterator pipeline with stable sorting. File I/O. | 🚧 `std/fs` aspirational |
 | [`todo-cli`](./todo-cli) | A real CLI: argument parsing, subcommands, mutable state, `Result`. | 🚧 `std/os` aspirational |
 | [`http-server`](./http-server) | A routed HTTP service with typed requests/responses and JSON. | 🚧 `std/http`/`std/json` aspirational |
 

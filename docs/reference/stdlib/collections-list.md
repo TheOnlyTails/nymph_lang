@@ -1,7 +1,26 @@
 # Lists
 
-List literals (`#[...]`) provide stable, non-mutating sorting methods. Both methods allocate a new
-list and leave the source list unchanged.
+List literals (`#[...]`) provide eager query and string-joining conveniences, plus stable,
+non-mutating sorting methods.
+
+## `any`
+
+```nym
+let has_even = #[1, 2, 3].any((value) -> value % 2 == 0)
+```
+
+`any` evaluates elements in list order and stops as soon as the predicate returns `true`.
+
+## `join`
+
+```nym
+let words = #["one", "two", "three"].join(" | ")
+let numbers = #[1, 2, 3].join(", ")
+```
+
+`join` is available for element types implementing `Into<Other = string>`. It converts elements
+in list order and places the string separator only between adjacent elements. Empty lists produce
+the empty string.
 
 ## `sort`
 
@@ -26,3 +45,6 @@ let descending = #[1, 3, 2].sort_by((left, right) ->
 `sort_by` accepts any element type. The comparator receives two elements and returns
 `Order.LessThan`, `Order.Equal`, or `Order.GreaterThan`. Returning `Order.Equal` preserves the
 elements' source order, so custom descending or key-based orderings remain stable.
+
+Lists intentionally do not have an eager `map`. Use `items.iter().map(f)` for a lazy result, and
+append `.to_list()` when a list is required.

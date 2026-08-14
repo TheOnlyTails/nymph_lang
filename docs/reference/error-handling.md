@@ -6,9 +6,42 @@ operation that might fail, says so *in its type* — with `Option<T>` or
 can reach the value. Both types live in the always-available prelude
 ([ambient core](./declarations#imports)), so they need no `import`.
 
-There is no `throw`, no `try`/`catch`, and no `?`-style early-return operator: a
-failure is an ordinary value that flows through the program like any other, handled
-with `match` or with the combinator methods below.
+There is no `throw` or `try`/`catch`. A failure is an ordinary value, handled with
+`match`, combinator methods, or postfix `?` propagation.
+
+## Propagation with `?`
+
+Postfix `?` extracts the success value and completes the nearest callable early on
+failure. For `Option<T>`, `Some(value)` produces `value` and `None` returns `None`.
+For `Result<T, E>`, `Ok(value)` produces `value` and `Error(error)` returns that same
+error. The target must return the same family, and `Result` error types must match
+exactly; the success types may differ.
+
+```nym
+struct Task(title: string)
+
+func title(task: Option<Task>): Option<string> = {
+  let task = task?
+  Some(task.title)
+}
+
+func validate(code: Result<int, string>): Result<boolean, string> = {
+  let code = code?
+  Ok(code > 0)
+}
+```
+
+Propagation never converts between `Option` and `Result`; use `.ok()`, `.err()`, or
+`.ok_or(error)` explicitly. Like `return`, `?` cannot cross a callable boundary.
+It can target a labeled block or callable with `value?@label`, following the same
+lexical label rules as `return@label`:
+
+```nym
+func label_example(value: Option<int>): Option<string> = target@{
+  let value = value?@target
+  Some("${value}")
+}
+```
 
 ## `Option`
 
@@ -140,6 +173,35 @@ func wrap_err(r: Result<int, int>): Result<int, Fail> =
 ```nym
 func value_or(r: Result<int, string>): int = r ?? -1
 ```
+
+## Optional chaining
+
+`?.` maps a field access, method call, or index operation over the value inside an
+`Option` or the `Ok` value inside a `Result`:
+
+```nym
+struct User(name: string, tags: #[string]) {
+  func greeting(prefix: string): string = "${prefix}, ${this.name}"
+}
+
+func name(user: Option<User>): Option<string> = user?.name
+func greeting(user: Option<User>): Option<string> = user?.greeting("Hello")
+func first_tag(user: Option<User>): Option<string> = user?.tags?.[0]
+func result_name(user: Result<User, string>): Result<string, string> = user?.name
+```
+
+These are mapping operations: `user?.name` is equivalent to
+`user.map((value) -> value.name)`. `None` remains `None`, and `Error(error)` preserves
+the same error. The receiver is evaluated once; method arguments and index expressions
+are evaluated only for `Some` or `Ok`, because they are part of the mapped operation.
+
+Mapping does not flatten. If `user?.field` accesses a field of type `Option<T>`, its
+type is `Option<Option<T>>` (and similarly for nested `Result` values). Use `flatten`
+or `and_then` when flattening is intended.
+
+Optional chaining is specific to Nymph's canonical `Option` and `Result` types. It is
+not JavaScript null/undefined chaining, and applying it to another receiver type is a
+type error.
 
 ## Converting between them
 

@@ -329,6 +329,36 @@ impl Checker<'_> {
 			return false;
 		}
 		let resolved = self.shallow_resolve(self_ty);
+		if let TyKind::Param(parameter) = self.interner.kind(resolved) {
+			let parameter = *parameter;
+			let declared_bounds = self
+				.param_bounds
+				.get(&parameter)
+				.cloned()
+				.unwrap_or_default();
+			for bound in declared_bounds {
+				if bound != interface {
+					continue;
+				}
+				let arguments = self
+					.param_bound_details
+					.get(&parameter)
+					.and_then(|details| details.iter().find(|detail| detail.interface == bound))
+					.map(|detail| detail.args.clone())
+					.unwrap_or_default();
+				let snapshot = self.table.snapshot();
+				let matched = known.iter().all(|(name, expected)| {
+					arguments
+						.iter()
+						.find(|(argument, _)| argument == name)
+						.is_some_and(|(_, actual)| self.try_unify(*expected, *actual))
+				});
+				self.table.rollback_to(snapshot);
+				if matched {
+					return true;
+				}
+			}
+		}
 		let head = head_of(&self.interner, resolved);
 		for idx in self.impls.candidates(interface, head) {
 			let snapshot = self.table.snapshot();
@@ -871,7 +901,7 @@ impl Checker<'_> {
 
 		// Inherent methods take priority over interface methods.
 		if let Some((params, ret, target, implementation, type_arguments)) =
-			self.resolve_inherent(recv, recv_is_mut, name, arg_tys, arg_lits, span)
+			self.resolve_matching_inherent(recv, recv_is_mut, name, arg_tys, arg_lits, span)
 		{
 			let resolved_target =
 				target
@@ -970,7 +1000,32 @@ impl Checker<'_> {
 			// No impl matches the receiver. For a `Param` receiver, the bound-first
 			// branch above already tried `resolve_param_method` and would have
 			// returned on a hit — reaching here means it also found nothing, so
-			// there is nothing left to try.
+			// there is nothing left to try. Preserve the diagnostics from a same-name
+			// inherent method whose arguments did not fit; it was skipped above only
+			// to give a viable interface overload the opportunity to resolve.
+			if let Some((params, ret, target, implementation, type_arguments)) =
+				self.resolve_inherent(recv, recv_is_mut, name, arg_tys, arg_lits, span)
+			{
+				let resolved_target =
+					target
+						.clone()
+						.zip(implementation.clone())
+						.map(
+							|(member, implementation)| crate::annotate::ResolvedMethodTarget::Inherent {
+								member,
+								implementation,
+							},
+						);
+				return Some(MethodResolution {
+					ty: ret,
+					params,
+					type_arguments,
+					source: MethodSource::Inherent,
+					target,
+					implementation,
+					resolved_target,
+				});
+			}
 			return None;
 		}
 

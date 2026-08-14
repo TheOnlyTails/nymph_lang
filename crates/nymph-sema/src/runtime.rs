@@ -90,6 +90,7 @@ pub enum StableExprKind {
 	PostfixOp {
 		op: PostfixOperator,
 		value: Box<StableExpr>,
+		label: Option<EcoString>,
 	},
 	BinaryOp {
 		lhs: Box<StableExpr>,
@@ -395,6 +396,7 @@ pub enum RuntimePlacement {
 #[derive(Clone, Debug, PartialEq, Eq, salsa::SalsaValue)]
 pub struct RuntimeAnnotations {
 	pub option: Option<crate::OptionRuntimeRole>,
+	pub result: Option<crate::ResultRuntimeRole>,
 	pub types: Arc<[(BodyNodeId, InterfaceType)]>,
 	pub definition_targets: Arc<[(BodyNodeId, DefinitionId)]>,
 	pub direct_namespace_members: Arc<[BodyNodeId]>,
@@ -411,6 +413,13 @@ pub struct RuntimeAnnotations {
 	pub external_marshals: Arc<[(BodyNodeId, nymph_hir::hir::MarshalKind)]>,
 	/// Resolved jump node → typed lexical target, projected to stable body ids.
 	pub control_targets: Arc<[(BodyNodeId, RuntimeControlTarget)]>,
+	pub propagations: Arc<[(BodyNodeId, RuntimePropagationKind)]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, salsa::SalsaValue)]
+pub enum RuntimePropagationKind {
+	Option,
+	Result,
 }
 
 impl RuntimeAnnotations {
@@ -538,6 +547,9 @@ pub enum RuntimeBodyKind {
 #[derive(Clone, Debug, salsa::SalsaValue)]
 pub struct CheckedRuntimeBody {
 	pub kind: RuntimeBodyKind,
+	/// Whether a value body is bound immutably and can therefore retain an exact
+	/// callable identity for initializer dependency analysis.
+	pub immutable: bool,
 	/// Declared hidden type-object parameters, in canonical binder order.
 	pub type_parameters: Arc<[crate::GenericParameterId]>,
 	pub stable: StableBody,
@@ -547,6 +559,7 @@ pub struct CheckedRuntimeBody {
 impl PartialEq for CheckedRuntimeBody {
 	fn eq(&self, other: &Self) -> bool {
 		self.kind == other.kind
+			&& self.immutable == other.immutable
 			&& self.type_parameters == other.type_parameters
 			&& self.stable == other.stable
 			&& self.annotations == other.annotations
@@ -625,6 +638,7 @@ pub fn runtime_definitions(
 					required_top_level(checked, name)?,
 					RuntimePlacement::TopLevel,
 					value,
+					!meta.is_mutable(),
 					checked,
 				)?;
 			}
@@ -753,13 +767,14 @@ pub fn runtime_definitions(
 									checked,
 								)?,
 								InterfaceElement::Let {
-									meta: _,
+									meta,
 									value: Some(value),
 								} => push_value(
 									&mut result,
 									member.id.clone(),
 									attached(member),
 									value,
+									!meta.is_mutable(),
 									checked,
 								)?,
 								_ => {}
@@ -892,9 +907,14 @@ fn extract_members(
 			ImplMember::Func { meta, body, .. } => {
 				push_body(result, shape.id.clone(), placement(), meta, body, checked)?
 			}
-			ImplMember::Let { value, .. } => {
-				push_value(result, shape.id.clone(), placement(), value, checked)?
-			}
+			ImplMember::Let { meta, value, .. } => push_value(
+				result,
+				shape.id.clone(),
+				placement(),
+				value,
+				!meta.is_mutable(),
+				checked,
+			)?,
 			ImplMember::ExternalFunc(..) | ImplMember::ExternalLet(..) => push_external(
 				result,
 				shape.id.clone(),
@@ -959,7 +979,14 @@ fn extract_implementation_members(
 			ImplMember::Func { meta, body, .. } => {
 				push_body(result, definition, placement, meta, body, checked)?
 			}
-			ImplMember::Let { value, .. } => push_value(result, definition, placement, value, checked)?,
+			ImplMember::Let { meta, value, .. } => push_value(
+				result,
+				definition,
+				placement,
+				value,
+				!meta.is_mutable(),
+				checked,
+			)?,
 			ImplMember::ExternalFunc(..) => {
 				push_external(result, definition, placement, member_shape.external.clone())?
 			}
@@ -975,6 +1002,7 @@ fn push_value(
 	definition: DefinitionId,
 	placement: RuntimePlacement,
 	value: &Expr,
+	immutable: bool,
 	checked: &crate::CheckedFacts,
 ) -> Result<(), RuntimeExtractionError> {
 	push_canonical_body(
@@ -982,6 +1010,7 @@ fn push_value(
 		definition,
 		placement,
 		RuntimeBodyKind::Value,
+		immutable,
 		&[],
 		value,
 		checked,
@@ -1005,6 +1034,7 @@ fn push_body(
 		} else {
 			RuntimeBodyKind::InstanceFunction
 		},
+		true,
 		&meta.params,
 		body,
 		checked,
@@ -1016,6 +1046,7 @@ fn push_canonical_body(
 	definition: DefinitionId,
 	placement: RuntimePlacement,
 	kind: RuntimeBodyKind,
+	immutable: bool,
 	params: &[nymph_ast::Spanned<FuncParam>],
 	body: &Expr,
 	checked: &crate::CheckedFacts,
@@ -1062,6 +1093,7 @@ fn push_canonical_body(
 		placement,
 		payload: RuntimePayload::NymphBody(CheckedRuntimeBody {
 			kind,
+			immutable,
 			type_parameters: type_parameters
 				.into_iter()
 				.map(|(_, parameter)| parameter)
@@ -1354,9 +1386,14 @@ impl<'a> StableBodyBuilder<'a> {
 				op: *op,
 				value: boxed(value)?,
 			},
-			ExprKind::PostfixOp { op, value } => StableExprKind::PostfixOp {
+			ExprKind::PostfixOp {
+				op,
+				value,
+				label: l,
+			} => StableExprKind::PostfixOp {
 				op: *op,
 				value: boxed(value)?,
+				label: label(l),
 			},
 			ExprKind::BinaryOp { lhs, op, rhs } => StableExprKind::BinaryOp {
 				lhs: boxed(lhs)?,
@@ -1604,6 +1641,18 @@ fn runtime_annotations(
 			Some((jump, target))
 		})
 		.collect::<Vec<_>>();
+	let mut propagations = checked
+		.annotations
+		.propagations()
+		.filter_map(|(node, kind)| {
+			let node = *local.get(&node)?;
+			let kind = match kind {
+				crate::annotate::PropagationKind::Option => RuntimePropagationKind::Option,
+				crate::annotate::PropagationKind::Result => RuntimePropagationKind::Result,
+			};
+			Some((node, kind))
+		})
+		.collect::<Vec<_>>();
 	for (&source, &id) in local {
 		if let Some(mode) = checked.annotations.iter_mode_of(source).or_else(|| {
 			native_range_nodes
@@ -1619,27 +1668,56 @@ fn runtime_annotations(
 					option: protocols.2.clone(),
 				},
 				crate::IterMode::ViaIter => {
-					let resolution = checked
-						.annotations
-						.iter_resolution_of(source)
-						.ok_or(RuntimeExtractionError::MissingIterationProtocol)?;
-					let (iterable_interface, iter_interface_member) =
-						match resolution.resolved_target.as_ref() {
-							Some(crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
+					let (iterable_interface, iter_interface_member, iter) =
+						if let Some(resolution) = checked.annotations.iter_resolution_of(source) {
+							let (interface, member) = match resolution.resolved_target.as_ref() {
+								Some(crate::annotate::ResolvedMethodTarget::InterfaceImplementation {
+									interface,
+									slot,
+									..
+								}) => (interface.clone(), slot.interface_member_id.clone()),
+								Some(crate::annotate::ResolvedMethodTarget::GenericBound {
+									interface,
+									interface_member,
+								}) => (interface.clone(), interface_member.clone()),
+								_ => return Err(RuntimeExtractionError::MissingIterationProtocol),
+							};
+							(
 								interface,
-								slot,
-								..
-							}) => (interface.clone(), slot.interface_member_id.clone()),
-							Some(crate::annotate::ResolvedMethodTarget::GenericBound {
-								interface,
-								interface_member,
-							}) => (interface.clone(), interface_member.clone()),
-							_ => return Err(RuntimeExtractionError::MissingIterationProtocol),
+								member,
+								stable_dispatch(checked, resolution, &context)?,
+							)
+						} else {
+							let source_type = checked
+								.annotations
+								.get(source)
+								.ok_or(RuntimeExtractionError::MissingIterationProtocol)?
+								.ty;
+							if !matches!(
+								required_canonical_type(&checked.interner, source_type, &context)?,
+								InterfaceType::List(_)
+							) {
+								return Err(RuntimeExtractionError::MissingIterationProtocol);
+							}
+							let iterable = checked
+								.semantic
+								.compiler_runtime_roles
+								.iterable
+								.as_ref()
+								.ok_or(RuntimeExtractionError::MissingIterationProtocol)?;
+							(
+								iterable.interface.clone(),
+								iterable.member.clone(),
+								StableDispatch::Builtin {
+									method: "iter".into(),
+									category: BuiltinDispatch::Eager,
+								},
+							)
 						};
 					RuntimeIteration::ViaIter {
 						iterable_interface,
 						iter_interface_member,
-						iter: stable_dispatch(checked, resolution, &context)?,
+						iter,
 						iterator_interface: protocols.0.clone(),
 						next: protocols.1.clone(),
 						next_dispatch: stable_iteration_next_dispatch(checked, source, &context)?,
@@ -1745,6 +1823,7 @@ fn runtime_annotations(
 	generic_call_arguments.sort_by_key(|item| item.0);
 	generic_call_targets.sort_by_key(|item| item.0);
 	control_targets.sort_unstable();
+	propagations.sort_unstable();
 	let mut direct_namespace_members = checked
 		.annotations
 		.direct_namespace_members()
@@ -1759,6 +1838,7 @@ fn runtime_annotations(
 	}
 	Ok(RuntimeAnnotations {
 		option: checked.runtime_roles.option.clone(),
+		result: checked.runtime_roles.result.clone(),
 		types: types.into(),
 		definition_targets: definition_targets.into(),
 		direct_namespace_members: direct_namespace_members.into(),
@@ -1773,6 +1853,7 @@ fn runtime_annotations(
 		generic_call_targets: generic_call_targets.into(),
 		external_marshals: external_marshals.into(),
 		control_targets: control_targets.into(),
+		propagations: propagations.into(),
 	})
 }
 
@@ -1873,6 +1954,14 @@ fn required_type_nodes(
 			{
 				required.insert(expression.id);
 			}
+			ExprKind::MemberAccess {
+				parent,
+				optional: true,
+				..
+			} => {
+				required.insert(parent.id);
+				required.insert(expression.id);
+			}
 			ExprKind::MemberAccess { .. }
 				if checked
 					.annotations
@@ -1882,8 +1971,22 @@ fn required_type_nodes(
 			{
 				required.insert(expression.id);
 			}
+			ExprKind::Call { func, .. }
+				if matches!(func.kind, ExprKind::MemberAccess { optional: true, .. }) =>
+			{
+				if let ExprKind::MemberAccess { parent, .. } = &func.kind {
+					required.insert(parent.id);
+				}
+				required.insert(expression.id);
+			}
 			ExprKind::IndexAccess { parent, .. } => {
 				required.insert(parent.id);
+				if matches!(
+					expression.kind,
+					ExprKind::IndexAccess { optional: true, .. }
+				) {
+					required.insert(expression.id);
+				}
 			}
 			ExprKind::BinaryOp { lhs, op, .. } => {
 				if matches!(op, BinaryOperator::Equals | BinaryOperator::NotEquals) {

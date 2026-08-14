@@ -254,48 +254,84 @@ fn order_top_level_values(
 				callee: value.clone(),
 			});
 		};
-		if let Some(call) = root.unresolved_calls().first() {
-			return Err(RuntimeAssemblyError::UnresolvedInitializerCall {
-				initializer: value.clone(),
-				body: value.clone(),
-				call: call.clone(),
-			});
-		}
 		let required = prerequisites.entry(value.clone()).or_default();
-		required.extend(
-			root
-				.immediate_reads()
-				.iter()
-				.filter(|read| value_set.contains(*read))
-				.cloned(),
-		);
-		let mut calls = root.immediate_calls().to_vec();
+		let mut bodies = vec![(
+			value.clone(),
+			root.execution_summary(),
+			Vec::<&nymph_sema::RuntimeExecutionSummary>::new(),
+		)];
 		let mut visited = HashSet::new();
-		while let Some(callee) = calls.pop() {
-			if !visited.insert(callee.clone()) {
+		while let Some((body_definition, execution, mut callables)) = bodies.pop() {
+			for read in execution.immediate_reads() {
+				if let Some(invocation) = by_definition.get(read).and_then(|body| body.invocation())
+					&& !callables
+						.iter()
+						.any(|known| std::ptr::eq(*known, invocation))
+				{
+					callables.push(invocation);
+				}
+			}
+			for closure in execution.closures() {
+				if !callables.iter().any(|known| std::ptr::eq(*known, closure)) {
+					callables.push(closure);
+				}
+			}
+			let callable_key = callables
+				.iter()
+				.map(|summary| *summary as *const _)
+				.collect::<Vec<_>>();
+			if !visited.insert((body_definition.clone(), execution as *const _, callable_key)) {
 				continue;
 			}
-			let Some(body) = by_definition.get(&callee).copied() else {
-				return Err(RuntimeAssemblyError::MissingExecutionBody {
-					caller: value.clone(),
-					callee,
-				});
-			};
-			if let Some(call) = body.unresolved_calls().first() {
-				return Err(RuntimeAssemblyError::UnresolvedInitializerCall {
-					initializer: value.clone(),
-					body: callee,
-					call: call.clone(),
-				});
-			}
 			required.extend(
-				body
+				execution
 					.immediate_reads()
 					.iter()
 					.filter(|read| value_set.contains(*read))
 					.cloned(),
 			);
-			calls.extend(body.immediate_calls().iter().cloned());
+			for call in execution.unresolved_calls() {
+				match call {
+					// Registered externals are host/runtime leaves: they cannot read a
+					// Nymph module binding and therefore add no initializer dependency.
+					nymph_sema::UnresolvedRuntimeCall::OpaqueExternal(_) => {}
+					nymph_sema::UnresolvedRuntimeCall::CallableValue(callee) => {
+						let Some(body) = by_definition.get(callee).copied() else {
+							return Err(RuntimeAssemblyError::MissingExecutionBody {
+								caller: value.clone(),
+								callee: callee.clone(),
+							});
+						};
+						let Some(invocation) = body.invocation() else {
+							return Err(RuntimeAssemblyError::UnresolvedInitializerCall {
+								initializer: value.clone(),
+								body: body_definition.clone(),
+								call: call.clone(),
+							});
+						};
+						bodies.push((callee.clone(), invocation, callables.clone()));
+					}
+					nymph_sema::UnresolvedRuntimeCall::DynamicCallee if callables.len() == 1 => {
+						bodies.push((body_definition.clone(), callables[0], Vec::new()));
+					}
+					_ => {
+						return Err(RuntimeAssemblyError::UnresolvedInitializerCall {
+							initializer: value.clone(),
+							body: body_definition.clone(),
+							call: call.clone(),
+						});
+					}
+				}
+			}
+			for callee in execution.immediate_calls() {
+				let Some(body) = by_definition.get(callee).copied() else {
+					return Err(RuntimeAssemblyError::MissingExecutionBody {
+						caller: value.clone(),
+						callee: callee.clone(),
+					});
+				};
+				bodies.push((callee.clone(), body.execution_summary(), callables.clone()));
+			}
 		}
 	}
 

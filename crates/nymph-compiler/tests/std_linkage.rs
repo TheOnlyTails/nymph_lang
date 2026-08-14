@@ -97,16 +97,15 @@ fn run_node(js: &str, tag: &str) -> String {
 	String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-fn with_complex_compiler_stack(test: impl FnOnce() + Send + 'static) {
-	// The stable compiler recursively walks the complete imported Complex source.
-	// Its finite depth exceeds libtest's 2 MiB worker stack, but fits comfortably
-	// in 4 MiB; keep a margin without requiring RUST_MIN_STACK for the whole suite.
+fn with_compiler_stack(test: impl FnOnce() + Send + 'static) {
+	// Deep ambient native method graphs can exceed libtest's 2 MiB worker stack.
+	// Production CLI threads use the process stack; keep the tests representative.
 	std::thread::Builder::new()
 		.stack_size(8 * 1024 * 1024)
 		.spawn(test)
-		.expect("spawn Complex compiler test")
+		.expect("spawn ambient compiler test")
 		.join()
-		.expect("Complex compiler test panicked");
+		.expect("ambient compiler test panicked");
 }
 
 /// `xs.length()` on a real list — the linked external itself — compiles,
@@ -503,8 +502,8 @@ fn linked_map_merge_and_to_string_compile_bundle_and_run() {
 
 /// L3's Set proof: `Set<Item>` (`stdlib/src/collections/set.nym`) is a
 /// `struct Set(inner: #{Item: #()})` whose `insert`/`remove`/`contains`
-/// delegate to the inner map's `insert`/`remove`/`contains_key` — now that
-/// the map surface is linked, a Set defined as an ordinary USER/entry struct
+/// delegate to the inner map's `insert`/`remove`/native `contains_key`, so a
+/// Set defined as an ordinary USER/entry struct
 /// (mirroring `set.nym`'s own body exactly) round-trips insert/remove/
 /// contains under Node with NO new linkage of its own. (The REAL prelude
 /// `Set` cannot materialize yet — a separate, pre-existing
@@ -535,17 +534,19 @@ fn a_user_set_struct_backed_by_the_linked_map_inserts_removes_and_contains_round
 		func main(): void = {}\n";
 	let load = only_entry("main", entry);
 
-	// This synthetic `MySet` needs `contains_key` too, so the synthetic
-	// provider must also declare it (unlike the get/insert/remove/size/keys
-	// surface `synth_std_map_provider` already covers).
+	// Mirror the native `contains_key` body over the host `get` primitive.
 	fn provider_with_contains_key(path: &str) -> Option<String> {
 		(path == "collections/map").then(|| {
 			"impl<K, V> mut #{K: V} {\n  \
+				external(get) func get(key: K): Option<V>\n  \
 				external(insert) func insert(key: K, value: V): boolean\n  \
 				external(remove) func remove(key: K): Option<V>\n\
 			}\n\
 			impl<K, V> #{K: V} {\n  \
-				external(contains_key) func contains_key(key: K): boolean\n\
+				func contains_key(key: K): boolean = match (this.get(key)) {\n    \
+					Some(_) -> true,\n    \
+					None -> false,\n  \
+				}\n\
 			}\n"
 				.to_string()
 		})
@@ -967,7 +968,8 @@ fn ambient_string_convenience_methods_are_nymph_composition() {
 
 #[test]
 fn ambient_string_intrinsics_preserve_the_boxed_abi() {
-	let entry = r#"
+	with_compiler_stack(|| {
+		let entry = r#"
 		func length(): uint = "abc".length()
 		func contains(): boolean = "abc".contains("b")
 		func slice(): string = "abcd".substring(1u, 3u)
@@ -978,28 +980,29 @@ fn ambient_string_intrinsics_preserve_the_boxed_abi() {
 		func chars_item(): char = "abc".chars()[1]
 		func main(): void = {}
 	"#;
-	let load = only_entry("main", entry);
-	let compiled = compile_project_with_std("main", &load, &|_| None)
-		.expect("ambient string intrinsics should compile with boxed inputs and outputs");
-	let calls = [
-		"length",
-		"contains",
-		"slice",
-		"index",
-		"missing_index",
-		"character",
-		"split_item",
-		"chars_item",
-	]
-	.map(|name| compiled.entry_symbol(name));
-	let mut js = compiled.js;
-	for call in calls {
-		js.push_str(&format!("\nconsole.log({call}().v);\n"));
-	}
-	assert_eq!(
-		run_node(&js, "string_boxed_abi"),
-		"3\ntrue\nbc\n2\n99\nc\nb\nb"
-	);
+		let load = only_entry("main", entry);
+		let compiled = compile_project_with_std("main", &load, &|_| None)
+			.expect("ambient string intrinsics should compile with boxed inputs and outputs");
+		let calls = [
+			"length",
+			"contains",
+			"slice",
+			"index",
+			"missing_index",
+			"character",
+			"split_item",
+			"chars_item",
+		]
+		.map(|name| compiled.entry_symbol(name));
+		let mut js = compiled.js;
+		for call in calls {
+			js.push_str(&format!("\nconsole.log({call}().v);\n"));
+		}
+		assert_eq!(
+			run_node(&js, "string_boxed_abi"),
+			"3\ntrue\nbc\n2\n99\nc\nb\nb"
+		);
+	});
 }
 
 /// Inventory of every language-level string API whose argument or result is a
@@ -1311,7 +1314,7 @@ fn import_std_io_resolves_via_embedded_provider_and_runs() {
 
 #[test]
 fn exact_power_matrix_compiles_without_native_exponentiation_and_runs() {
-	with_complex_compiler_stack(exact_power_matrix_body);
+	with_compiler_stack(exact_power_matrix_body);
 }
 
 fn exact_power_matrix_body() {
@@ -1433,7 +1436,7 @@ fn exact_power_matrix_body() {
 
 #[test]
 fn power_zero_signed_zero_and_ieee_edges_follow_the_contract() {
-	with_complex_compiler_stack(power_zero_signed_zero_and_ieee_edges_body);
+	with_compiler_stack(power_zero_signed_zero_and_ieee_edges_body);
 }
 
 fn power_zero_signed_zero_and_ieee_edges_body() {
@@ -1551,7 +1554,7 @@ fn power_zero_signed_zero_and_ieee_edges_body() {
 
 #[test]
 fn power_principal_branch_large_integral_and_call_paths_run() {
-	with_complex_compiler_stack(power_principal_branch_large_integral_and_call_paths_body);
+	with_compiler_stack(power_principal_branch_large_integral_and_call_paths_body);
 }
 
 fn power_principal_branch_large_integral_and_call_paths_body() {
@@ -1652,7 +1655,7 @@ fn power_principal_branch_large_integral_and_call_paths_body() {
 
 #[test]
 fn power_rejects_combinations_outside_the_exact_matrix() {
-	with_complex_compiler_stack(power_rejects_combinations_outside_the_exact_matrix_body);
+	with_compiler_stack(power_rejects_combinations_outside_the_exact_matrix_body);
 }
 
 fn power_rejects_combinations_outside_the_exact_matrix_body() {
@@ -1685,7 +1688,7 @@ fn power_rejects_combinations_outside_the_exact_matrix_body() {
 
 #[test]
 fn zero_to_negative_power_raises_the_runtime_domain_error() {
-	with_complex_compiler_stack(zero_to_negative_power_body);
+	with_compiler_stack(zero_to_negative_power_body);
 }
 
 fn zero_to_negative_power_body() {

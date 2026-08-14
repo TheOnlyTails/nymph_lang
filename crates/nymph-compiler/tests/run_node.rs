@@ -1681,15 +1681,67 @@ fn function_mediated_top_level_initializer_self_cycles_are_compile_errors() {
 }
 
 #[test]
-fn unresolved_callable_value_initializer_calls_are_compile_errors() {
-	let src = "let callback = () -> later\nlet result = callback()\nlet later = 5";
+fn immutable_closure_initializer_calls_are_ordered_transitively() {
+	let src = "let callback = () -> later\nfunc apply(callback: () -> int): int = callback()\nlet result = apply(callback)\nlet later = 5";
+	assert_eq!(run(src, "result"), "5");
+}
+
+#[test]
+fn closure_mediated_top_level_initializer_cycles_are_compile_errors() {
+	let src = "let callback = () -> result\nlet result: int = callback()";
 	let result = nymph_compiler::compile(src, "test");
-	let diagnostics = result.expect_err("dynamic initializer call must not produce JavaScript");
+	let diagnostics = result.expect_err("closure-mediated self-cycle must not produce JavaScript");
+	assert!(
+		diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.message.contains("InitializerCycle")),
+		"{diagnostics:?}"
+	);
+}
+
+#[test]
+fn mutable_callable_initializer_calls_remain_compile_errors() {
+	let src = "let mut callback = () -> 5\nlet result = callback()";
+	let result = nymph_compiler::compile(src, "test");
+	let diagnostics = result.expect_err("mutable callable initializer must not produce JavaScript");
 	assert!(
 		diagnostics
 			.iter()
 			.any(|diagnostic| diagnostic.message.contains("UnresolvedInitializerCall")),
 		"{diagnostics:?}"
+	);
+}
+
+#[test]
+fn top_level_initializer_is_evaluated_once_after_closure_ordering() {
+	let src = r#"
+		let callback = () -> later
+		let result = callback()
+		let later = 1
+		func observed(): #(int, int) = #(result, result)
+	"#;
+	let js = compile(src);
+	assert_eq!(js.matches("const result = callback();").count(), 1, "{js}");
+	assert_eq!(
+		run_js(js, "JSON.stringify(nymphTestValue(observed()))"),
+		"[1,1]"
+	);
+}
+
+#[test]
+fn stdlib_sort_initializers_run_through_external_leaf_calls() {
+	let src = r#"
+		let sorted = #[3, 1, 2].sort()
+		let descending = #[1, 3, 2].sort_by((left, right) ->
+			if (left > right) { Order.LessThan }
+			else if (left < right) { Order.GreaterThan }
+			else { Order.Equal }
+		)
+		func observed(): #(#[int], #[int]) = #(sorted, descending)
+	"#;
+	assert_eq!(
+		run(src, "JSON.stringify(nymphTestValue(observed()))"),
+		"[[1,2,3],[3,2,1]]"
 	);
 }
 
@@ -3829,6 +3881,45 @@ func direct_body(flag: boolean): int = result@{
 	assert_eq!(run(src, "callable_iife()"), "13");
 	assert_eq!(run(src, "direct_body(new NBool(true))"), "17");
 	assert_eq!(run(src, "direct_body(new NBool(false))"), "19");
+}
+
+#[test]
+fn question_propagation_executes_for_option_result_and_labeled_blocks() {
+	let src = r#"struct Counter(calls: int) {}
+impl Counter {
+  mut func option(present: boolean): Option<int> = {
+    this.calls = this.calls + 1
+    if (present) Some(4) else None
+  }
+}
+func option(present: boolean): Option<string> = {
+  let mut counter = Counter(calls = 0)
+  let value = counter.option(present)?
+  Some("${value}:${counter.calls}")
+}
+func result(ok: boolean): Result<string, int> = {
+  let value = (if (ok) Ok(5) else Error(9))?
+  Ok("${value}")
+}
+func labeled(present: boolean): Option<string> = target@{
+  let value = (if (present) Some(6) else None)?@target
+  Some("${value}")
+}
+func nearest(present: boolean): int = {
+  let inner: () -> Option<string> = () -> {
+    let value = (if (present) Some(7) else None)?
+    Some("${value}")
+  }
+  inner()
+  8
+}"#;
+	assert_eq!(run(src, "option(new NBool(true))"), "{ value: '4:1' }");
+	assert_eq!(run(src, "option(new NBool(false))"), "{}");
+	assert_eq!(run(src, "result(new NBool(true))"), "{ value: '5' }");
+	assert_eq!(run(src, "result(new NBool(false))"), "{ error: 9 }");
+	assert_eq!(run(src, "labeled(new NBool(true))"), "{ value: '6' }");
+	assert_eq!(run(src, "labeled(new NBool(false))"), "{}");
+	assert_eq!(run(src, "nearest(new NBool(false))"), "8");
 }
 
 #[test]

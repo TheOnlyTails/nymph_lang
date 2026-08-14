@@ -80,16 +80,13 @@ pub fn external_effect(module: &str, symbol: &str) -> ExternalEffect {
 		| ("std/hash", "hash")
 		| (
 			"std/collections/list",
-			"length" | "get" | "first" | "last" | "pop" | "slice" | "chunked" | "distinct" | "concat"
-			| "reversed" | "drop" | "take" | "contains" | "to_string" | "push" | "splice" | "insert"
-			| "clear" | "remove",
+			"length" | "get" | "slice" | "to_string" | "push" | "splice" | "insert" | "clear" | "remove",
 		)
 		| (
 			"std/collections/map",
-			"get" | "insert" | "remove" | "clear" | "size" | "get_or_insert" | "contains_key" | "keys"
-			| "values" | "entries" | "merge" | "to_string",
+			"get" | "insert" | "remove" | "clear" | "size" | "keys" | "values" | "entries" | "to_string",
 		) => ExternalEffect::TransactionAware,
-		("std/comparison", "compare_number" | "compare_char" | "compare_string")
+		("std/comparison", "compare_char" | "compare_string")
 		| (
 			"std/math/intrinsics",
 			"sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
@@ -98,9 +95,7 @@ pub fn external_effect(module: &str, symbol: &str) -> ExternalEffect {
 		)
 		| (
 			"std/string",
-			"char_at" | "chars" | "concat" | "concat_chars" | "contains" | "contains_char" | "ends_with"
-			| "index_of" | "last_index_of" | "length" | "pad_end" | "pad_start" | "repeat" | "replace"
-			| "replace_first" | "reversed" | "split" | "starts_with" | "substring" | "to_lower"
+			"char_at" | "concat" | "index_of" | "last_index_of" | "length" | "substring" | "to_lower"
 			| "to_upper" | "trim" | "trim_end" | "trim_start",
 		) => ExternalEffect::Pure,
 		_ => ExternalEffect::UnauditedStateful,
@@ -180,35 +175,9 @@ pub const VALUE_REGISTRY: &[(&str, LinkedValue)] = &[
 	),
 ];
 
-/// The linkage table. L0 seeded `length` (`stdlib/src/collections/list.ts`'s
-/// `export const length = ($_this) => $_this.length`) — a plain `uint`/JS
-/// `number` return needing no `Option`/`Result` runtime ABI. L1 adds the
-/// Option-returning `List` intrinsics (`get`/`first`/`last`/`pop`) now that
-/// the Option ABI seam is wired (see `nymph-codegen::strip_ts_to_js`'s
-/// `import_rewrites` and `nymph-compiler::host_runtime`'s injected
-/// `std/option` virtual module) — `get` and `length` need `receiver_tag`
-/// disambiguation (see this module's own doc comment); `first`/`last`/`pop`
-/// are `List`-only in the real stdlib today, so they stay unambiguous.
-///
-/// L2 links the REST of `list.nym`'s markers. Non-`mut`, non-collision
-/// markers (`slice`/`chunked`/`distinct`/`splice`; `push` on the
-/// `mut` side) stay `receiver_tag: None` — no other
-/// stdlib collection/primitive declares the same bare marker name today.
-/// Every OTHER new row needs `Some(tag)` because a second, DIFFERENT prelude
-/// impl declares the identical bare marker against a different JS
-/// implementation (see this module's own doc comment on why a bare-name
-/// lookup would mislink):
-/// - `concat`/`reversed`/`drop`/`take`/`contains` collide with
-///   `string.nym`'s inherent `impl string { .. }` (tag `"string"`), so each
-///   needs `Some("list")` to stay `List`-only.
-/// - `insert`/`clear`/`remove` collide with `map.nym`'s `impl<K,V> mut
-///   #{K:V} { .. }` (tag `"mut_map"`), so each needs `Some("mut_list")`.
-/// - `to_string` (the marker behind `Into<string> for #[T]`'s `into`)
-///   collides with `map.nym`'s own `Into<string> for #{K:V}`'s `to_string`
-///   (tag `"map"`), so it needs `Some("list")` too — registered for
-///   forward-safety even though no path calls `#[T]::into()` today (a
-///   direct `.into()` is a checker error, and string interpolation bypasses
-///   `into` entirely; see `nymph-compiler/tests/std_linkage.rs`).
+/// Linkage for the host primitives declared with `external(...)` in the stdlib.
+/// Collection and string algorithms implemented in Nymph deliberately do not
+/// appear here; only operations that cross the JavaScript representation boundary do.
 pub const REGISTRY: &[(&str, Linked)] = &[
 	("sin", math_intrinsic("sin", Some("float"))),
 	("cos", math_intrinsic("cos", Some("float"))),
@@ -281,14 +250,6 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 		},
 	),
 	(
-		"compare_number",
-		Linked {
-			module: "std/comparison",
-			symbol: "compare_number",
-			receiver_tag: None,
-		},
-	),
-	(
 		"compare_char",
 		Linked {
 			module: "std/comparison",
@@ -337,91 +298,11 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 		},
 	),
 	(
-		"first",
-		Linked {
-			module: "std/collections/list",
-			symbol: "first",
-			receiver_tag: None,
-		},
-	),
-	(
-		"last",
-		Linked {
-			module: "std/collections/list",
-			symbol: "last",
-			receiver_tag: None,
-		},
-	),
-	(
-		"pop",
-		Linked {
-			module: "std/collections/list",
-			symbol: "pop",
-			receiver_tag: None,
-		},
-	),
-	(
 		"slice",
 		Linked {
 			module: "std/collections/list",
 			symbol: "slice",
 			receiver_tag: None,
-		},
-	),
-	(
-		"chunked",
-		Linked {
-			module: "std/collections/list",
-			symbol: "chunked",
-			receiver_tag: None,
-		},
-	),
-	(
-		"distinct",
-		Linked {
-			module: "std/collections/list",
-			symbol: "distinct",
-			receiver_tag: None,
-		},
-	),
-	(
-		"concat",
-		Linked {
-			module: "std/collections/list",
-			symbol: "concat",
-			receiver_tag: Some("list"),
-		},
-	),
-	(
-		"reversed",
-		Linked {
-			module: "std/collections/list",
-			symbol: "reversed",
-			receiver_tag: Some("list"),
-		},
-	),
-	(
-		"drop",
-		Linked {
-			module: "std/collections/list",
-			symbol: "drop",
-			receiver_tag: Some("list"),
-		},
-	),
-	(
-		"take",
-		Linked {
-			module: "std/collections/list",
-			symbol: "take",
-			receiver_tag: Some("list"),
-		},
-	),
-	(
-		"contains",
-		Linked {
-			module: "std/collections/list",
-			symbol: "contains",
-			receiver_tag: Some("list"),
 		},
 	),
 	(
@@ -495,24 +376,18 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 			receiver_tag: None,
 		},
 	),
-	// L3: `map.nym`'s markers. Unlike the task-prose "non-mut/mut" split,
-	// `map.nym`'s ACTUAL impl blocks put `size`/`get`/`insert`/`remove`/
-	// `clear`/`get_or_insert` ALL in `impl<K,V> mut #{K:V}` (tag `"mut_map"`,
+	// `map.nym`'s primitive markers. Its mut impl puts `size`/`get`/`insert`/
+	// `remove`/`clear` in `impl<K,V> mut #{K:V}` (tag `"mut_map"`,
 	// per `inherent_self_type_tag`'s IMPL-mutability-keyed tagging — a
 	// non-mut receiver calling one of these still tags `mut_map`, since the
 	// tag comes from the impl block, not the call-site receiver) —
-	// `contains_key`/`keys`/`values`/`entries`/`merge` (via `Plus::plus`)
-	// live in the non-mut `impl<K,V> #{K:V}` (tag `"map"`). `get`/`insert`/
+	// `keys`/`values`/`entries` live in the non-mut impl. `get`/`insert`/
 	// `remove`/`clear` collide with `list.nym`'s own markers of the same
 	// name (registered above under `"list"`/`"mut_list"`), so each needs
-	// `Some("mut_map")` to stay `Map`-only; `size`/`get_or_insert` are
-	// unique bare markers, so `None` (matches any receiver, mirroring
-	// `length`). `to_string` (the marker behind `Into<string> for
+	// `Some("mut_map")` to stay `Map`-only; `size` is unique. `to_string`
+	// (the marker behind `Into<string> for
 	// #{K:V}`'s `into`) collides with `list.nym`'s own `to_string`
 	// (registered `Some("list")` above), so it needs `Some("map")`.
-	// `contains_key` alone serves BOTH the inherent `contains_key` method
-	// AND `Contains<Item=K> for #{K:V}`'s `contains` — both declare
-	// `external(contains_key)`, so one row covers both call sites.
 	(
 		"get",
 		Linked {
@@ -554,22 +429,6 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 		},
 	),
 	(
-		"get_or_insert",
-		Linked {
-			module: "std/collections/map",
-			symbol: "get_or_insert",
-			receiver_tag: None,
-		},
-	),
-	(
-		"contains_key",
-		Linked {
-			module: "std/collections/map",
-			symbol: "contains_key",
-			receiver_tag: None,
-		},
-	),
-	(
 		"keys",
 		Linked {
 			module: "std/collections/map",
@@ -594,14 +453,6 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 		},
 	),
 	(
-		"merge",
-		Linked {
-			module: "std/collections/map",
-			symbol: "merge",
-			receiver_tag: None,
-		},
-	),
-	(
 		"to_string",
 		Linked {
 			module: "std/collections/map",
@@ -609,12 +460,8 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 			receiver_tag: Some("map"),
 		},
 	),
-	// `string.nym`'s ambient methods. `string` is a primitive, so its receiver
-	// tag (`inherent_self_type_tag` → `primitive_type_tag`) is `"string"`, which
-	// disambiguates the markers it shares with `list`/`map` (`contains`, `concat`,
-	// `reversed`, `split`, `chars`). `symbol == marker`; each maps to a
-	// `string.ts` export. Convenience methods implemented in Nymph (`first`,
-	// `last`, `drop`, and `take`) deliberately have no registry entries.
+	// `string.nym`'s host primitives. `string` is a primitive, so its receiver
+	// tag (`inherent_self_type_tag` → `primitive_type_tag`) is `"string"`.
 	(
 		"char_at",
 		Linked {
@@ -624,50 +471,10 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 		},
 	),
 	(
-		"chars",
-		Linked {
-			module: "std/string",
-			symbol: "chars",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
 		"concat",
 		Linked {
 			module: "std/string",
 			symbol: "concat",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
-		"concat_chars",
-		Linked {
-			module: "std/string",
-			symbol: "concat_chars",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
-		"contains",
-		Linked {
-			module: "std/string",
-			symbol: "contains",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
-		"contains_char",
-		Linked {
-			module: "std/string",
-			symbol: "contains_char",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
-		"ends_with",
-		Linked {
-			module: "std/string",
-			symbol: "ends_with",
 			receiver_tag: Some("string"),
 		},
 	),
@@ -692,70 +499,6 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 		Linked {
 			module: "std/string",
 			symbol: "length",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
-		"pad_end",
-		Linked {
-			module: "std/string",
-			symbol: "pad_end",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
-		"pad_start",
-		Linked {
-			module: "std/string",
-			symbol: "pad_start",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
-		"repeat",
-		Linked {
-			module: "std/string",
-			symbol: "repeat",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
-		"replace",
-		Linked {
-			module: "std/string",
-			symbol: "replace",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
-		"replace_first",
-		Linked {
-			module: "std/string",
-			symbol: "replace_first",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
-		"reversed",
-		Linked {
-			module: "std/string",
-			symbol: "reversed",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
-		"split",
-		Linked {
-			module: "std/string",
-			symbol: "split",
-			receiver_tag: Some("string"),
-		},
-	),
-	(
-		"starts_with",
-		Linked {
-			module: "std/string",
-			symbol: "starts_with",
 			receiver_tag: Some("string"),
 		},
 	),
@@ -1070,24 +813,14 @@ mod tests {
 				(
 					"std/collections/list",
 					vec![
-						"chunked",
 						"clear",
-						"concat",
-						"contains",
-						"distinct",
-						"drop",
-						"first",
 						"get",
 						"insert",
-						"last",
 						"length",
-						"pop",
 						"push",
 						"remove",
-						"reversed",
 						"slice",
 						"splice",
-						"take",
 						"to_string",
 					]
 				),
@@ -1095,23 +828,17 @@ mod tests {
 					"std/collections/map",
 					vec![
 						"clear",
-						"contains_key",
 						"entries",
 						"get",
-						"get_or_insert",
 						"insert",
 						"keys",
-						"merge",
 						"remove",
 						"size",
 						"to_string",
 						"values",
 					]
 				),
-				(
-					"std/comparison",
-					vec!["compare_char", "compare_number", "compare_string"]
-				),
+				("std/comparison", vec!["compare_char", "compare_string"]),
 				("std/display", vec!["debug", "display"]),
 				(
 					"std/equality",
@@ -1150,23 +877,10 @@ mod tests {
 					"std/string",
 					vec![
 						"char_at",
-						"chars",
 						"concat",
-						"concat_chars",
-						"contains",
-						"contains_char",
-						"ends_with",
 						"index_of",
 						"last_index_of",
 						"length",
-						"pad_end",
-						"pad_start",
-						"repeat",
-						"replace",
-						"replace_first",
-						"reversed",
-						"split",
-						"starts_with",
 						"substring",
 						"to_lower",
 						"to_upper",
@@ -1188,7 +902,7 @@ mod tests {
 
 	#[test]
 	fn comparison_leaves_are_linked_host_primitives() {
-		for symbol in ["compare_number", "compare_char", "compare_string"] {
+		for symbol in ["compare_char", "compare_string"] {
 			let linked = lookup(symbol, None).expect("comparison leaf must be linked");
 			assert_eq!(linked.module, "std/comparison");
 			assert_eq!(linked.symbol, symbol);

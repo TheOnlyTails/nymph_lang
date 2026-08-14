@@ -107,6 +107,10 @@ pub enum TypeError {
 		member: EcoString,
 		ty: String,
 	},
+	/// Optional chaining was used on a value other than canonical `Option`/`Result`.
+	OptionalChainReceiver {
+		ty: String,
+	},
 	/// A namespaced function was called through a type parameter that lacks it.
 	NoNamespacedFnOnParam {
 		name: EcoString,
@@ -480,6 +484,14 @@ pub enum TypeError {
 	InconsistentUnionBindingMutability {
 		name: EcoString,
 	},
+	QuestionOperand {
+		found: String,
+	},
+	QuestionTarget {
+		family: &'static str,
+		found: String,
+	},
+	QuestionOutsideCallable,
 }
 
 impl IntoDiagnostic for TypeError {
@@ -510,6 +522,16 @@ impl IntoDiagnostic for TypeError {
 			E::UnknownControlLabel { name } => format!("unknown control label `{name}`").into(),
 			E::WrongControlLabelKind { name, keyword } => format!("`{keyword}` cannot target `{name}` because it has the wrong kind").into(),
 			E::DuplicateControlLabel { name, .. } => format!("control label `{name}` is already active").into(),
+			E::QuestionOperand { found } => {
+				format!("the `?` operand must be `Option` or `Result`, found `{found}`").into()
+			}
+			E::QuestionTarget { family, found } => format!(
+				"cannot propagate `{family}` into a target returning `{found}`"
+			)
+			.into(),
+			E::QuestionOutsideCallable => {
+				"unlabelled `?` is only valid inside a callable".into()
+			}
 
 			E::ThisOutsideMethod => "`this` is only valid inside a method".into(),
 			E::StructTypeAsValue => "a struct type cannot be used as a value directly".into(),
@@ -533,6 +555,10 @@ impl IntoDiagnostic for TypeError {
 			}
 			E::NoMethod { method, ty } => format!("no method `{method}` found for `{ty}`").into(),
 			E::CannotAccess { member, ty } => format!("cannot access `{member}` on `{ty}`").into(),
+			E::OptionalChainReceiver { ty } => format!(
+				"optional chaining requires canonical `Option` or `Result`, found `{ty}`"
+			)
+			.into(),
 			E::NoNamespacedFnOnParam { name } => {
 				format!("no namespaced function `{name}` found on this type parameter").into()
 			}

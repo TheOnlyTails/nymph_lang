@@ -212,6 +212,8 @@ pub enum ExprKind {
 	PostfixOp {
 		op: PostfixOperator,
 		value: Box<Expr>,
+		/// Optional propagation target in `value?@label`.
+		label: Option<Ident>,
 	},
 	BinaryOp {
 		lhs: Box<Expr>,
@@ -632,6 +634,7 @@ mod tests {
 			ExprKind::PostfixOp {
 				op: PostfixOperator::ErrorReturn,
 				value: Box::new(child(1)),
+				label: None,
 			},
 			&[1],
 		);

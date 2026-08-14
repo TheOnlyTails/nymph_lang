@@ -9,7 +9,13 @@ impl<K: Hash, V> mut #{K: V} {
   external(insert) func insert(key: K, value: V): boolean
   external(remove) func remove(key: K): Option<V>
   external(clear) func clear(): void
-  external(get_or_insert) func get_or_insert(key: K, default: V): V
+  func get_or_insert(key: K, default: V): V = match (this.get(key)) {
+    Some(value) -> value,
+    None -> {
+      this.insert(key, default)
+      default
+    },
+  }
 
   /// Returns `true` if the map contains no entries.
   func is_empty(): boolean = this.size() == 0
@@ -18,7 +24,10 @@ impl<K: Hash, V> mut #{K: V} {
 
 impl<K: Hash, V> #{K: V} {
   /// Returns `true` if the map contains the given key.
-  external(contains_key) func contains_key(key: K): boolean
+  func contains_key(key: K): boolean = match (this.get(key)) {
+    Some(_) -> true,
+    None -> false,
+  }
 
   /// Returns a list of all keys.
   external(keys) func keys(): #[K]
@@ -31,11 +40,20 @@ impl<K: Hash, V> #{K: V} {
 }
 
 impl<K: Hash, V> Plus<Other = self, Output = self> for #{K: V} {
-  external(merge) func plus(other: self): self
+  func plus(other: self): self = {
+    let mut result: #{K: V} = #{}
+    for (#(key, value) in this.entries()) {
+      result.insert(key, value)
+    }
+    for (#(key, value) in other.entries()) {
+      result.insert(key, value)
+    }
+    result
+  }
 }
 
 impl<K: Hash, V> Contains<Item = K> for #{K: V} {
-  external(contains_key) func contains(item: K): boolean
+  func contains(item: K): boolean = this.contains_key(item)
 }
 
 impl<K: Hash, V> Iterable<#(K, V)> for #{K: V} {

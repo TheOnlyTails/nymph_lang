@@ -46,12 +46,15 @@ impl Store {
   /// Mark a task done by rebuilding the list with that one task flipped.
   mut func complete(id: int): Result<int, string> =
     if (this.tasks.any((task) -> task.id == id)) {
-      this.tasks = this.tasks.map((task) ->
-        if (task.id == id) {
-          Task(id = task.id, title = task.title, done = true)
-        } else {
-          task
-        })
+      this.tasks = this.tasks
+        .iter()
+        .map((task) ->
+          if (task.id == id) {
+            Task(id = task.id, title = task.title, done = true)
+          } else {
+            task
+          })
+        .to_list()
       Ok(id)
     } else {
       Error("no task with id ${id}")
@@ -62,10 +65,12 @@ impl Store {
       "no tasks yet — add one with `todo add <title>`"
     } else {
       this.tasks
+        .iter()
         .map((task) -> {
           let mark = if (task.done) { "[x]" } else { "[ ]" }
           "${mark} #${task.id} ${task.title}"
         })
+        .to_list()
         .join("\n")
     }
 }

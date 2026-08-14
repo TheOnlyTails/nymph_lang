@@ -36,6 +36,59 @@ fn compiles_a_valid_program() {
 }
 
 #[test]
+fn optional_chaining_maps_canonical_option_and_result_and_is_lazy() {
+	let source = r#"
+		struct Child(name: string)
+		struct Item(name: string, child: Child, maybe: Option<string>) {
+		  func add(value: int): int = value + 1
+		}
+		struct Counter(value: int) {
+		  mut func bump(): int = { this.value += 1 this.value }
+		  mut func wrap(item: Item): Option<Item> = {
+		    this.value += 1
+		    Some(value = item)
+		  }
+		}
+
+		func item(): Item = Item(name = "nymph", child = Child(name = "nested"), maybe = Some(value = "inner"))
+		func field_some(): string = Some(value = item())?.name ?? "missing"
+		func field_none(): string = { let value: Option<Item> = None value?.name ?? "missing" }
+		func method_some(): int = Some(value = item())?.add(41) ?? 0
+		func index_some(): int = Some(value = #[7, 8])?.[1] ?? 0
+		func chained(): string = Some(value = item())?.child?.name ?? "missing"
+		func result_ok(): string = {
+		  let value: Result<Item, string> = Ok(value = item())
+		  value?.name ?? "missing"
+		}
+		func result_error(): string = {
+		  let value: Result<Item, string> = Error(error = "kept")
+		  match (value?.name) { Ok(...) -> "wrong", Error(error) -> error }
+		}
+		func nested_is_not_flattened(): string = match (Some(value = item())?.maybe) {
+		  Some(value = Some(value)) -> value,
+		  _ -> "flattened"
+		}
+		func evaluation_count(): int = {
+		  let mut counter = Counter(value = 0)
+		  let none_item: Option<Item> = None
+		  let none_list: Option<#[int]> = None
+		  let ignored_argument = none_item?.add(counter.bump())
+		  let ignored_index = none_list?.[counter.bump()]
+		  let mapped = counter.wrap(item())?.name
+		  counter.value
+		}
+	"#;
+	let js = compile(source, "optional_runtime").expect("optional chaining should compile");
+	assert_eq!(
+		run_node(
+			&js,
+			"[field_some().v, field_none().v, method_some().v, index_some().v, chained().v, result_ok().v, result_error().v, nested_is_not_flattened().v, evaluation_count().v].join('|')"
+		),
+		"nymph|missing|42|8|nested|nymph|kept|inner|1"
+	);
+}
+
+#[test]
 fn reports_type_errors() {
 	let result = compile("func f(): int = true", "test");
 	let diags = result.expect_err("type-mismatched program should not compile");

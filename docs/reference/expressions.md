@@ -350,6 +350,10 @@ and all such returns unify with its direct tail value. A callable body is a boun
 never target a construct outside the current callable. Unlabeled return still targets the nearest
 callable.
 
+Postfix `?` uses the same targets: unlabelled `value?` propagates `None` or `Error` to the nearest
+callable, while `value?@label` may complete a labeled block or callable. See
+[Error handling](./error-handling#propagation-with) for its `Option` and `Result` type rules.
+
 A loop with no targeting `break` has type `void`. If it contains bare `break`, its result is
 `Option<#()>` (`Some(#())` on the early exit and `None` on natural exhaustion). If every targeting
 break supplies a value of type `T`, the result is `Option<T>` instead. Bare and valued breaks may

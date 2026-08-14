@@ -305,6 +305,8 @@ pub struct RuntimeExecutionSummary {
 	immediate_reads: StableDemandSet,
 	immediate_calls: StableDemandSet,
 	unresolved_calls: Vec<UnresolvedRuntimeCall>,
+	invocation: Option<Box<RuntimeExecutionSummary>>,
+	closures: Vec<RuntimeExecutionSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -331,6 +333,12 @@ impl RuntimeExecutionSummary {
 	}
 	pub fn unresolved_calls(&self) -> &[UnresolvedRuntimeCall] {
 		&self.unresolved_calls
+	}
+	pub fn invocation(&self) -> Option<&RuntimeExecutionSummary> {
+		self.invocation.as_deref()
+	}
+	pub fn closures(&self) -> &[RuntimeExecutionSummary] {
+		&self.closures
 	}
 }
 
@@ -393,6 +401,12 @@ impl LoweredRuntimeDefinition {
 	}
 	pub fn unresolved_calls(&self) -> &[UnresolvedRuntimeCall] {
 		self.execution.unresolved_calls()
+	}
+	pub fn invocation(&self) -> Option<&RuntimeExecutionSummary> {
+		self.execution.invocation()
+	}
+	pub fn execution_summary(&self) -> &RuntimeExecutionSummary {
+		&self.execution
 	}
 	pub fn placement(&self) -> &RuntimeAssemblyPlacement {
 		&self.placement
@@ -2039,7 +2053,16 @@ fn lower_body(
 		direct_demands: RefCell::new(direct_demands),
 		routed_demands: RefCell::new(routed_demands),
 		execution: RefCell::new(execution),
+		deferred_execution: RefCell::new(Vec::new()),
 		deferred_depth: Cell::new(0),
+		capture_root_invocation: !is_function
+			&& body.immutable
+			&& (matches!(stable.root.kind, StableExprKind::Closure { .. })
+				|| body
+					.annotations
+					.anonymous_closures
+					.iter()
+					.any(|(node, _)| *node == stable.root.id)),
 		loop_depth: Cell::new(0),
 		loop_targets: RefCell::new(Vec::new()),
 		next_loop_target: Cell::new(0),
@@ -2260,7 +2283,9 @@ struct StableBodyLowerer<'a, C> {
 	direct_demands: RefCell<&'a mut StableDemandSet>,
 	routed_demands: RefCell<&'a mut StableDemandSet>,
 	execution: RefCell<&'a mut RuntimeExecutionSummary>,
+	deferred_execution: RefCell<Vec<RuntimeExecutionSummary>>,
 	deferred_depth: Cell<u32>,
+	capture_root_invocation: bool,
 	loop_depth: Cell<u32>,
 	loop_targets: RefCell<Vec<(crate::BodyNodeId, u32)>>,
 	next_loop_target: Cell<u32>,
@@ -2389,16 +2414,6 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		self.scopes.borrow_mut().pop();
 		result
 	}
-	fn with_deferred<T>(
-		&self,
-		lower: impl FnOnce() -> Result<T, StableLoweringError>,
-	) -> Result<T, StableLoweringError> {
-		let depth = self.deferred_depth.get();
-		self.deferred_depth.set(depth + 1);
-		let result = lower();
-		self.deferred_depth.set(depth);
-		result
-	}
 	fn with_loop_target<T>(
 		&self,
 		source: crate::BodyNodeId,
@@ -2448,18 +2463,11 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		self.annotations.definition_target(self.id(expr))
 	}
 	fn record_read(&self, target: &DefinitionId) {
-		if self.deferred_depth.get() == 0 {
-			self
-				.execution
-				.borrow_mut()
-				.immediate_reads
-				.insert(target.clone());
+		if let Some(mut execution) = self.active_execution() {
+			execution.immediate_reads.insert(target.clone());
 		}
 	}
 	fn record_call(&self, target: &DefinitionId) -> Result<bool, StableLoweringError> {
-		if self.deferred_depth.get() != 0 {
-			return Ok(false);
-		}
 		let artifact = self.context.runtime_definition(target)?;
 		let callable = match &artifact.payload {
 			crate::RuntimePayload::NymphBody(body) => body.kind != crate::RuntimeBodyKind::Value,
@@ -2475,8 +2483,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		};
 		if callable {
 			self
-				.execution
-				.borrow_mut()
+				.active_execution()
+				.expect("active execution summary")
 				.immediate_calls
 				.insert(target.clone());
 			if matches!(
@@ -2492,9 +2500,50 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		Ok(callable)
 	}
 	fn record_unresolved_call(&self, call: UnresolvedRuntimeCall) {
-		if self.deferred_depth.get() == 0 && !self.execution.borrow().unresolved_calls.contains(&call) {
-			self.execution.borrow_mut().unresolved_calls.push(call);
+		if let Some(mut execution) = self.active_execution()
+			&& !execution.unresolved_calls.contains(&call)
+		{
+			execution.unresolved_calls.push(call);
 		}
+	}
+	fn active_execution(&self) -> Option<std::cell::RefMut<'_, RuntimeExecutionSummary>> {
+		if !self.deferred_execution.borrow().is_empty() {
+			return Some(std::cell::RefMut::map(
+				self.deferred_execution.borrow_mut(),
+				|stack| stack.last_mut().expect("checked non-empty closure stack"),
+			));
+		}
+		if self.deferred_depth.get() == 0 {
+			return Some(std::cell::RefMut::map(
+				self.execution.borrow_mut(),
+				|execution| &mut **execution,
+			));
+		}
+		None
+	}
+	fn with_deferred<T>(
+		&self,
+		lower: impl FnOnce() -> Result<T, StableLoweringError>,
+	) -> Result<T, StableLoweringError> {
+		let depth = self.deferred_depth.get();
+		self.deferred_depth.set(depth + 1);
+		self
+			.deferred_execution
+			.borrow_mut()
+			.push(RuntimeExecutionSummary::default());
+		let result = lower();
+		let execution = self
+			.deferred_execution
+			.borrow_mut()
+			.pop()
+			.expect("closure execution summary");
+		self.deferred_depth.set(depth);
+		if depth == 0 && self.capture_root_invocation {
+			self.execution.borrow_mut().invocation = Some(Box::new(execution));
+		} else if let Some(mut parent) = self.active_execution() {
+			parent.closures.push(execution);
+		}
+		result
 	}
 	fn external_marshal(
 		&self,
@@ -2517,6 +2566,155 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			|self_type| substitute_self_type(ty, self_type),
 		);
 		Ok(substitute_type_parameters(&ty, self.type_substitutions))
+	}
+
+	fn optional_chain_payload_type(
+		&self,
+		parent: &StableExpr,
+	) -> Result<InterfaceType, StableLoweringError> {
+		match peel_mut(&self.ty(parent)?) {
+			InterfaceType::Named {
+				definition,
+				positional,
+				..
+			} if self
+				.annotations
+				.option
+				.as_ref()
+				.is_some_and(|role| &role.option == definition)
+				|| self
+					.annotations
+					.result
+					.as_ref()
+					.is_some_and(|role| &role.result == definition) =>
+			{
+				positional.first().cloned().ok_or_else(|| {
+					invalid(
+						&self.artifact.definition,
+						"optional chain has no payload type",
+					)
+				})
+			}
+			_ => Err(invalid(
+				&self.artifact.definition,
+				"optional chain receiver lost its canonical container type",
+			)),
+		}
+	}
+
+	fn lower_optional_chain(
+		&self,
+		expr: &StableExpr,
+		parent: &StableExpr,
+		mapped: impl FnOnce(&Self, HirExpr) -> Result<HirExpr, StableLoweringError>,
+	) -> Result<HirExpr, StableLoweringError> {
+		let parent_type = self.ty(parent)?;
+		let definition = match peel_mut(&parent_type) {
+			InterfaceType::Named { definition, .. } => definition,
+			_ => {
+				return Err(invalid(
+					&self.artifact.definition,
+					"optional chain receiver is not nominal",
+				));
+			}
+		};
+		let (enum_definition, success, success_field, failure, failure_field) = if let Some(role) = self
+			.annotations
+			.option
+			.as_ref()
+			.filter(|role| &role.option == definition)
+		{
+			(&role.option, &role.some, &role.some_value, &role.none, None)
+		} else if let Some(role) = self
+			.annotations
+			.result
+			.as_ref()
+			.filter(|role| &role.result == definition)
+		{
+			(
+				&role.result,
+				&role.ok,
+				&role.ok_value,
+				&role.error,
+				Some(&role.error_value),
+			)
+		} else {
+			return Err(invalid(
+				&self.artifact.definition,
+				"optional chain has no canonical runtime role",
+			));
+		};
+		self.demand_external(enum_definition)?;
+		let enum_name: EcoString = self.context.binding_name(enum_definition)?.as_str().into();
+		let success_name: EcoString = self.context.member_name(success)?.as_str().into();
+		let success_field_name: EcoString = self.context.member_name(success_field)?.as_str().into();
+		let failure_name: EcoString = self.context.member_name(failure)?.as_str().into();
+		let payload = self.declare(&"$optional_value".into());
+		let mapped = mapped(self, HirExpr::Local(payload.clone()))?;
+		let prototype = self.construction_prototype(expr)?;
+		let success_body = HirExpr::VariantNew {
+			enum_name: enum_name.clone(),
+			variant: success_name.clone(),
+			fields: vec![(success_field_name.clone(), mapped)],
+			prototype: prototype.clone(),
+		};
+		let (failure_pattern_fields, failure_body) = if let Some(failure_field) = failure_field {
+			let field_name: EcoString = self.context.member_name(failure_field)?.as_str().into();
+			let error = self.declare(&"$optional_error".into());
+			(
+				vec![(
+					field_name.clone(),
+					HirPat::Binding {
+						name: error.clone(),
+						sub: None,
+					},
+				)],
+				HirExpr::VariantNew {
+					enum_name: enum_name.clone(),
+					variant: failure_name.clone(),
+					fields: vec![(field_name, HirExpr::Local(error))],
+					prototype: prototype.clone(),
+				},
+			)
+		} else {
+			(
+				vec![],
+				HirExpr::VariantRef {
+					enum_name: enum_name.clone(),
+					variant: failure_name.clone(),
+					prototype: prototype.clone(),
+				},
+			)
+		};
+		Ok(HirExpr::Match {
+			scrutinee: Box::new(self.lower(parent)?),
+			arms: vec![
+				HirArm {
+					pat: HirPat::Variant {
+						enum_name: enum_name.clone(),
+						variant: success_name,
+						fields: vec![(
+							success_field_name,
+							HirPat::Binding {
+								name: payload,
+								sub: None,
+							},
+						)],
+					},
+					guard: None,
+					body: success_body,
+				},
+				HirArm {
+					pat: HirPat::Variant {
+						enum_name: enum_name.clone(),
+						variant: failure_name.clone(),
+						fields: failure_pattern_fields,
+					},
+					guard: None,
+					body: failure_body,
+				},
+			],
+		})
 	}
 	/// Whether this checked expression cannot complete normally. An anonymous
 	/// closure annotation turns the underlying expression into a callable value,
@@ -2644,6 +2842,107 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.map_or(nymph_hir::hir::HirReturnTarget::Callable, |(_, target)| {
 				nymph_hir::hir::HirReturnTarget::Block(*target)
 			})
+	}
+	fn lower_propagation(
+		&self,
+		expr: &StableExpr,
+		value: &StableExpr,
+	) -> Result<HirExpr, StableLoweringError> {
+		let kind = self
+			.annotations
+			.propagations
+			.iter()
+			.find_map(|(node, kind)| (*node == self.id(expr)).then_some(*kind))
+			.ok_or_else(|| StableLoweringError::MissingAnnotation {
+				definition: self.artifact.definition.clone(),
+				node: self.id(expr),
+				channel: "propagation".into(),
+			})?;
+		let (definition, success, success_field, failure, failure_field) = match kind {
+			crate::RuntimePropagationKind::Option => {
+				let role = self
+					.annotations
+					.option
+					.as_ref()
+					.ok_or_else(|| self.unsupported(expr, "canonical Option propagation ABI"))?;
+				(&role.option, &role.some, &role.some_value, &role.none, None)
+			}
+			crate::RuntimePropagationKind::Result => {
+				let role = self
+					.annotations
+					.result
+					.as_ref()
+					.ok_or_else(|| self.unsupported(expr, "canonical Result propagation ABI"))?;
+				(
+					&role.result,
+					&role.ok,
+					&role.ok_value,
+					&role.error,
+					Some(&role.error_value),
+				)
+			}
+		};
+		self.demand_external(definition)?;
+		let enum_name: EcoString = self.context.binding_name(definition)?.as_str().into();
+		let success: EcoString = self.context.member_name(success)?.as_str().into();
+		let success_field: EcoString = self.context.member_name(success_field)?.as_str().into();
+		let failure: EcoString = self.context.member_name(failure)?.as_str().into();
+		let failure_field = failure_field
+			.map(|field| {
+				self
+					.context
+					.member_name(field)
+					.map(|name| name.as_str().into())
+			})
+			.transpose()?;
+		let temporary = self.declare(&"$propagation".into());
+		let payload = self.declare(&"$value".into());
+		let failure_fields = failure_field
+			.into_iter()
+			.map(|field| (field, HirPat::Wildcard))
+			.collect();
+		Ok(HirExpr::Block {
+			stmts: vec![HirStmt::Let {
+				name: temporary.clone(),
+				mutable: false,
+				value: self.lower(value)?,
+			}],
+			tail: Some(Box::new(HirExpr::Match {
+				scrutinee: Box::new(HirExpr::Local(temporary.clone())),
+				arms: vec![
+					HirArm {
+						pat: HirPat::Variant {
+							enum_name: enum_name.clone(),
+							variant: success,
+							fields: vec![(
+								success_field,
+								HirPat::Binding {
+									name: payload.clone(),
+									sub: None,
+								},
+							)],
+						},
+						guard: None,
+						body: HirExpr::Local(payload),
+					},
+					HirArm {
+						pat: HirPat::Variant {
+							enum_name,
+							variant: failure,
+							fields: failure_fields,
+						},
+						guard: None,
+						body: HirExpr::Block {
+							stmts: vec![HirStmt::Return {
+								value: Some(HirExpr::Local(temporary)),
+								target: self.return_target(expr),
+							}],
+							tail: None,
+						},
+					},
+				],
+			})),
+		})
 	}
 	fn loop_option(
 		&self,
@@ -2875,7 +3174,24 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			StableExprKind::MemberAccess {
 				parent,
 				member,
-				optional: _,
+				optional: true,
+			} => {
+				let name = if let Some(target) = self.target(expr) {
+					self.context.member_name(target)?.as_str().into()
+				} else {
+					member.clone()
+				};
+				return self.lower_optional_chain(expr, parent, |_, payload| {
+					Ok(HirExpr::Field {
+						recv: Box::new(payload),
+						name,
+					})
+				});
+			}
+			StableExprKind::MemberAccess {
+				parent,
+				member,
+				optional: false,
 			} => {
 				if self.definitely_transfers(parent) {
 					return self.lower(parent);
@@ -2989,6 +3305,23 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				}
 			}
 			StableExprKind::Call { func, args } => {
+				if let StableExprKind::MemberAccess {
+					parent,
+					optional: true,
+					..
+				} = &func.kind
+				{
+					let dispatch = self.dispatch(expr)?.clone();
+					return self.lower_optional_chain(expr, parent, |lowerer, payload| {
+						let mut operation = lowerer.lower_dispatch(
+							&dispatch,
+							parent,
+							args.iter().map(|argument| &argument.value).collect(),
+						)?;
+						Self::replace_dispatch_receiver(&mut operation, payload);
+						Ok(operation)
+					});
+				}
 				if self.definitely_transfers(func) {
 					return self.lower(func);
 				}
@@ -3425,6 +3758,31 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			StableExprKind::Continue { .. } => HirExpr::Continue {
 				target: self.resolve_loop_target(expr, "continue outside a loop")?,
 			},
+			StableExprKind::IndexAccess {
+				parent,
+				index,
+				optional: true,
+			} => {
+				let payload_type = self.optional_chain_payload_type(parent)?;
+				return self.lower_optional_chain(expr, parent, |lowerer, payload| {
+					Ok(match peel_mut(&payload_type) {
+						InterfaceType::Map(..) => HirExpr::MapGet {
+							recv: Box::new(payload),
+							key: Box::new(lowerer.lower(index)?),
+						},
+						InterfaceType::List(_) | InterfaceType::Tuple(_) => HirExpr::Index {
+							recv: Box::new(payload),
+							index: Box::new(lowerer.lower(index)?),
+						},
+						_ => {
+							let mut operation =
+								lowerer.lower_dispatch(lowerer.dispatch(expr)?, parent, vec![index])?;
+							Self::replace_dispatch_receiver(&mut operation, payload);
+							operation
+						}
+					})
+				});
+			}
 			StableExprKind::IndexAccess { parent, index, .. } if self.definitely_transfers(parent) => {
 				self.lower(parent)?
 			}
@@ -3530,9 +3888,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			StableExprKind::PostfixOp { value, .. } if self.definitely_transfers(value) => {
 				self.lower(value)?
 			}
-			StableExprKind::PostfixOp { value, .. } => {
-				self.lower_dispatch(self.dispatch(expr)?, value, vec![])?
-			}
+			StableExprKind::PostfixOp { value, .. } => self.lower_propagation(expr, value)?,
 			StableExprKind::TypeOp { lhs, .. } if self.definitely_transfers(lhs) => self.lower(lhs)?,
 			StableExprKind::TypeOp { lhs, .. } => match self.dispatch(expr)? {
 				crate::StableDispatch::Builtin { .. } => self.lower_cast(expr, lhs)?,

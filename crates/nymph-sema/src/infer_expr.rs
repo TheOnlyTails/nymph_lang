@@ -10,7 +10,7 @@
 
 use ecow::EcoString;
 use nymph_ast::{
-	NodeId, Span, Spanned,
+	Ident, NodeId, Span, Spanned,
 	decl::{Declaration, ImplMember},
 	expr::{CallArg, Expr, ExprKind, ListItem, MapEntry, RangeKind, Statement, StringPart},
 	ops::{AssignOperator, BinaryOperator, PrefixOperator},
@@ -30,6 +30,11 @@ use crate::ids::{DefId, ParamIdx};
 use crate::lower::build_param_scope;
 use crate::solve::{MethodResolution, MethodSource};
 use crate::ty::{GenericArgs, Ty, TyKind};
+
+enum OptionalContainer {
+	Option(DefId, GenericArgs),
+	Result(DefId, GenericArgs),
+}
 
 /// Whether a resolved method is owned by canonical compiler or importable-stdlib
 /// runtime code rather than by the current project. Stable semantic identity is
@@ -218,7 +223,7 @@ impl<'m> Checker<'m> {
 				.rev()
 				.find(|target| {
 					allowed.contains(&target.kind)
-						&& (keyword != "return" || target.kind == ControlLabelKind::Callable)
+						&& (!matches!(keyword, "return" | "?") || target.kind == ControlLabelKind::Callable)
 				})
 				.cloned()
 		};
@@ -741,6 +746,20 @@ impl<'m> Checker<'m> {
 		// `Call` arm below is unreachable through this path, kept only so the
 		// match stays exhaustive).
 		if let ExprKind::Call { func, args, .. } = &expr.kind {
+			if let ExprKind::MemberAccess {
+				parent,
+				member,
+				optional: true,
+			} = &func.kind
+			{
+				let (ty, resolution) =
+					self.infer_optional_method_call(parent, member, args, expr.span, expr.id, func.id);
+				self.record(expr.id, ty, None);
+				if let Some(resolution) = resolution {
+					self.annotations.record_resolution(expr.id, resolution);
+				}
+				return ty;
+			}
 			let (ty, resolution) = self.infer_call(func, args, expr.span, expr.id);
 			self.record(expr.id, ty, None);
 			if let Some(resolution) = resolution {
@@ -750,17 +769,34 @@ impl<'m> Checker<'m> {
 		}
 		// Custom indexing is method dispatch too. Record its selected `Index::index`
 		// implementation so lowering can honor prelude materialization and linkage.
-		if let ExprKind::IndexAccess { parent, index, .. } = &expr.kind {
-			let (ty, resolution) = self.infer_index_access(parent, index, expr.span);
+		if let ExprKind::IndexAccess {
+			parent,
+			index,
+			optional,
+		} = &expr.kind
+		{
+			let (ty, resolution) = if *optional {
+				self.infer_optional_index_access(parent, index, expr.span)
+			} else {
+				self.infer_index_access(parent, index, expr.span)
+			};
 			self.record(expr.id, ty, None);
 			if let Some(resolution) = resolution {
 				self.annotations.record_resolution(expr.id, resolution);
 			}
 			return ty;
 		}
-		if let ExprKind::MemberAccess { parent, member, .. } = &expr.kind {
-			let (ty, resolution) =
-				self.infer_member_with_resolution(parent, &member.0, member.1, expr.id);
+		if let ExprKind::MemberAccess {
+			parent,
+			member,
+			optional,
+		} = &expr.kind
+		{
+			let (ty, resolution) = if *optional {
+				self.infer_optional_member(parent, &member.0, member.1, expr.id)
+			} else {
+				self.infer_member_with_resolution(parent, &member.0, member.1, expr.id)
+			};
 			self.record(expr.id, ty, None);
 			if let Some(resolution) = resolution {
 				self
@@ -939,10 +975,79 @@ impl<'m> Checker<'m> {
 				// recording logic.
 				self.infer_prefix(*op, value, span).0
 			}
-			ExprKind::PostfixOp { value, .. } => {
-				// `?` error propagation — Milestone B; unwrap best-effort.
-				self.infer(value);
-				self.fresh()
+			ExprKind::PostfixOp { value, label, .. } => {
+				let operand = self.infer(value);
+				let operand = self.strip_mut(operand);
+				let target = self.resolve_control(
+					expr,
+					label.as_ref(),
+					"?",
+					&[ControlLabelKind::Block, ControlLabelKind::Callable],
+				);
+				if target.is_none() && label.is_none() {
+					self.emit(expr.span, TypeError::QuestionOutsideCallable);
+				}
+				let target_ty = target.and_then(|target| target.result_ty).or(self.ret_ty);
+				let TyKind::Adt(definition, arguments) = self.interner.kind(operand).clone() else {
+					if !matches!(self.interner.kind(operand), TyKind::Error | TyKind::Never) {
+						let found = self.display(operand);
+						self.emit(expr.span, TypeError::QuestionOperand { found });
+					}
+					return self.interner.error();
+				};
+				let (kind, value_ty, expected_target) = if Some(definition) == self.runtime_roles.option
+					&& arguments.positional.len() == 1
+				{
+					let success = self.fresh();
+					let target = self
+						.interner
+						.mk_adt(definition, GenericArgs::new(vec![success], Vec::new()));
+					(
+						crate::annotate::PropagationKind::Option,
+						arguments.positional[0],
+						target,
+					)
+				} else if Some(definition) == self.runtime_roles.result && arguments.positional.len() == 2 {
+					let success = self.fresh();
+					let target = self.interner.mk_adt(
+						definition,
+						GenericArgs::new(vec![success, arguments.positional[1]], Vec::new()),
+					);
+					(
+						crate::annotate::PropagationKind::Result,
+						arguments.positional[0],
+						target,
+					)
+				} else {
+					let found = self.display(operand);
+					self.emit(expr.span, TypeError::QuestionOperand { found });
+					return self.interner.error();
+				};
+				if let Some(target_ty) = target_ty {
+					let resolved = self.strip_mut(target_ty);
+					let family_matches = match (kind, self.interner.kind(resolved)) {
+						(_, TyKind::Infer(_)) | (_, TyKind::Error) => true,
+						(crate::annotate::PropagationKind::Option, TyKind::Adt(def, _)) => {
+							Some(*def) == self.runtime_roles.option
+						}
+						(crate::annotate::PropagationKind::Result, TyKind::Adt(def, _)) => {
+							Some(*def) == self.runtime_roles.result
+						}
+						_ => false,
+					};
+					if family_matches {
+						self.unify(expected_target, target_ty, expr.span);
+					} else {
+						let found = self.display(target_ty);
+						let family = match kind {
+							crate::annotate::PropagationKind::Option => "Option",
+							crate::annotate::PropagationKind::Result => "Result",
+						};
+						self.emit(expr.span, TypeError::QuestionTarget { family, found });
+					}
+				}
+				self.annotations.record_propagation(expr.id, kind);
+				value_ty
 			}
 			ExprKind::BinaryOp { lhs, op, rhs } => {
 				// Unreachable in practice: `infer` (the sole caller of `infer_kind`)
@@ -1209,6 +1314,15 @@ impl<'m> Checker<'m> {
 		span: Span,
 	) -> (Ty, Option<Resolution>) {
 		let recv = self.infer(parent);
+		self.infer_index_access_for_type(recv, index, span)
+	}
+
+	fn infer_index_access_for_type(
+		&mut self,
+		recv: Ty,
+		index: &Expr,
+		span: Span,
+	) -> (Ty, Option<Resolution>) {
 		let key = self.infer(index);
 		if matches!(self.interner.kind(recv), TyKind::Never)
 			|| matches!(self.interner.kind(key), TyKind::Never)
@@ -1262,6 +1376,21 @@ impl<'m> Checker<'m> {
 				}
 			}
 		}
+	}
+
+	fn infer_optional_index_access(
+		&mut self,
+		parent: &Expr,
+		index: &Expr,
+		span: Span,
+	) -> (Ty, Option<Resolution>) {
+		let receiver = self.infer(parent);
+		let Some((payload, container)) = self.optional_chain_payload(receiver, span) else {
+			self.infer(index);
+			return (self.interner.error(), None);
+		};
+		let (mapped, resolution) = self.infer_index_access_for_type(payload, index, span);
+		(self.optional_chain_result(container, mapped), resolution)
 	}
 
 	fn custom_index_value(&self, mut expr: &Expr) -> bool {
@@ -1483,6 +1612,74 @@ impl<'m> Checker<'m> {
 	}
 
 	// ── Calls & construction ─────────────────────────────────────────────────
+	fn infer_optional_method_call(
+		&mut self,
+		parent: &Expr,
+		member: &Ident,
+		args: &[Spanned<CallArg>],
+		span: Span,
+		id: NodeId,
+		func_id: NodeId,
+	) -> (Ty, Option<Resolution>) {
+		let receiver = self.infer(parent);
+		let Some((payload, container)) = self.optional_chain_payload(receiver, span) else {
+			for argument in args {
+				self.infer(&argument.0.value);
+			}
+			return (self.interner.error(), None);
+		};
+		self.record_member_completion_facts(parent, Some(payload), member.1);
+		let payload = self.shallow_resolve(payload);
+		let dispatch = if matches!(self.interner.kind(payload), TyKind::Mut(_)) {
+			payload
+		} else {
+			self.interner.mk_mut(payload)
+		};
+		let arg_tys: Vec<Ty> = args
+			.iter()
+			.map(|argument| self.infer_method_call_arg(&argument.0.value))
+			.collect();
+		let arg_lits = arg_int_lits(args);
+		match self.resolve_method(dispatch, &member.0, &arg_tys, &arg_lits, member.1) {
+			Some(resolution) => {
+				self
+					.annotations
+					.record_definition_target(func_id, resolution.target.as_ref());
+				self
+					.annotations
+					.record_generic_call_arguments(id, resolution.type_arguments.clone());
+				for (argument, expected) in args.iter().zip(&resolution.params) {
+					if matches!(argument.0.value.kind, ExprKind::Closure { .. }) {
+						self.check_closure(&argument.0.value, *expected);
+					}
+				}
+				let mapped = resolution.ty;
+				let dispatch = Resolution {
+					method: member.0.clone(),
+					dispatch: dispatch_kind_for_method_call(&resolution),
+					target: resolution.target,
+					implementation: resolution.implementation,
+					resolved_target: resolution.resolved_target,
+				};
+				(
+					self.optional_chain_result(container, mapped),
+					Some(dispatch),
+				)
+			}
+			None => {
+				let ty = self.display(payload);
+				self.emit(
+					member.1,
+					TypeError::NoMethod {
+						method: member.0.clone(),
+						ty,
+					},
+				);
+				(self.interner.error(), None)
+			}
+		}
+	}
+
 	/// Infer a call's type. Also returns a `Resolution` when the call is a plain
 	/// `receiver.method(args…)` dispatched through the interface solver (Finding
 	/// 2, stdlib linkage groundwork) — mirroring how `infer_binary`/`infer_prefix`
@@ -1996,6 +2193,17 @@ impl<'m> Checker<'m> {
 			return (self.infer_member(parent, member, span, id), None);
 		}
 		let parent_ty = self.infer(parent);
+		self.infer_member_from_type(parent, parent_ty, member, span, id)
+	}
+
+	fn infer_member_from_type(
+		&mut self,
+		parent: &Expr,
+		parent_ty: Ty,
+		member: &str,
+		span: Span,
+		id: NodeId,
+	) -> (Ty, Option<Resolution>) {
 		self.record_member_completion_facts(parent, Some(parent_ty), span);
 		if matches!(self.interner.kind(parent_ty), TyKind::Never) {
 			return (self.interner.never(), None);
@@ -2039,6 +2247,60 @@ impl<'m> Checker<'m> {
 			);
 		}
 		(self.member_ty_of(parent_ty, member, span, Some(id)), None)
+	}
+
+	fn infer_optional_member(
+		&mut self,
+		parent: &Expr,
+		member: &str,
+		span: Span,
+		id: NodeId,
+	) -> (Ty, Option<Resolution>) {
+		let receiver = self.infer(parent);
+		let Some((payload, container)) = self.optional_chain_payload(receiver, span) else {
+			return (self.interner.error(), None);
+		};
+		let (mapped, resolution) = self.infer_member_from_type(parent, payload, member, span, id);
+		(self.optional_chain_result(container, mapped), resolution)
+	}
+
+	fn optional_chain_payload(
+		&mut self,
+		receiver: Ty,
+		span: Span,
+	) -> Option<(Ty, OptionalContainer)> {
+		let receiver = self.shallow_resolve(receiver);
+		let receiver = self.strip_mut(receiver);
+		let TyKind::Adt(definition, args) = self.interner.kind(receiver).clone() else {
+			let ty = self.display(receiver);
+			self.emit(span, TypeError::OptionalChainReceiver { ty });
+			return None;
+		};
+		if self.runtime_roles.option == Some(definition)
+			&& let Some(payload) = args.positional.first().copied()
+		{
+			return Some((payload, OptionalContainer::Option(definition, args)));
+		}
+		if self.runtime_roles.result == Some(definition)
+			&& let Some(payload) = args.positional.first().copied()
+		{
+			return Some((payload, OptionalContainer::Result(definition, args)));
+		}
+		let ty = self.display(receiver);
+		self.emit(span, TypeError::OptionalChainReceiver { ty });
+		None
+	}
+
+	fn optional_chain_result(&mut self, container: OptionalContainer, mapped: Ty) -> Ty {
+		let (definition, mut args) = match container {
+			OptionalContainer::Option(definition, args) | OptionalContainer::Result(definition, args) => {
+				(definition, args)
+			}
+		};
+		if let Some(payload) = args.positional.first_mut() {
+			*payload = mapped;
+		}
+		self.interner.mk_adt(definition, args)
 	}
 
 	/// Capture completion at the point where all lexical generic bounds and place

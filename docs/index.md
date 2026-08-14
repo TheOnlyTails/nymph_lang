@@ -53,6 +53,7 @@ import std/io
 
 let nums = #[1, 2, 3]
 nums
+  .iter()
   .filter($ % 2 == 1)
   .map($ ** 2u)
   .fold(0, $0 + $1)

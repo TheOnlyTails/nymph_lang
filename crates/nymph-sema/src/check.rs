@@ -349,29 +349,68 @@ fn check_module_from_parts(
 						role.member.clone(),
 					))
 				});
-		checker.runtime_roles.option = checker.defs.get("Option");
-		if let Some(option) = checker.runtime_roles.option
+		if let Some(option) = checker.defs.get("Option")
 			&& let Some(stable) = checker.defs.stable(option).cloned()
 			&& let Some(signature) = checker.sigs.enums.get(&option)
 			&& signature.generics.len() == 1
-			&& let Some(some) = signature
-				.variants
-				.iter()
-				.find(|variant| variant.name == "Some" && variant.fields.len() == 1)
-			&& let Some(none) = signature
-				.variants
-				.iter()
-				.find(|variant| variant.name == "None" && variant.fields.is_empty())
+			&& let Some(some) = signature.variants.iter().find(|variant| {
+				variant.name == "Some"
+					&& variant.fields.len() == 1
+					&& variant.fields[0].0 == "value"
+					&& matches!(
+						checker.interner.kind(variant.fields[0].1),
+						TyKind::Param(ParamIdx(0))
+					)
+			}) && let Some(none) = signature
+			.variants
+			.iter()
+			.find(|variant| variant.name == "None" && variant.fields.is_empty())
 			&& let (Some(some_id), Some(value_id), Some(none_id)) = (
 				some.target.clone(),
 				some.field_metadata[0].target.clone(),
 				none.target.clone(),
 			) {
+			checker.runtime_roles.option = Some(option);
 			checker.stable_runtime_roles.option = Some(crate::OptionRuntimeRole {
 				option: stable,
 				some: some_id,
 				some_value: value_id,
 				none: none_id,
+			});
+		}
+		if let Some(result) = checker.defs.get("Result")
+			&& let Some(stable) = checker.defs.stable(result).cloned()
+			&& let Some(signature) = checker.sigs.enums.get(&result)
+			&& signature.generics.len() == 2
+			&& let Some(ok) = signature.variants.iter().find(|variant| {
+				variant.name == "Ok"
+					&& variant.fields.len() == 1
+					&& variant.fields[0].0 == "value"
+					&& matches!(
+						checker.interner.kind(variant.fields[0].1),
+						TyKind::Param(ParamIdx(0))
+					)
+			}) && let Some(error) = signature.variants.iter().find(|variant| {
+			variant.name == "Error"
+				&& variant.fields.len() == 1
+				&& variant.fields[0].0 == "error"
+				&& matches!(
+					checker.interner.kind(variant.fields[0].1),
+					TyKind::Param(ParamIdx(1))
+				)
+		}) && let (Some(ok_id), Some(ok_value), Some(error_id), Some(error_value)) = (
+			ok.target.clone(),
+			ok.field_metadata[0].target.clone(),
+			error.target.clone(),
+			error.field_metadata[0].target.clone(),
+		) {
+			checker.runtime_roles.result = Some(result);
+			checker.stable_runtime_roles.result = Some(crate::ResultRuntimeRole {
+				result: stable,
+				ok: ok_id,
+				ok_value,
+				error: error_id,
+				error_value,
 			});
 		}
 	}
@@ -729,6 +768,10 @@ fn check_module_with_environment_parts(
 			.option
 			.as_ref()
 			.and_then(|role| checker.defs.by_stable(&role.option)),
+		result: compiler_runtime_roles
+			.result
+			.as_ref()
+			.and_then(|role| checker.defs.by_stable(&role.result)),
 	};
 	checker.stable_runtime_roles = compiler_runtime_roles;
 	checker.runtime_role_provenance = runtime_role_provenance;
