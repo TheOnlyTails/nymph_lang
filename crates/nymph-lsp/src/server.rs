@@ -1254,7 +1254,8 @@ fn handle_notification(
 	if owner.shutting_down {
 		return Ok(false);
 	}
-	if notification.method == DidChangeWatchedFiles::METHOD && !client_state.watchers_authoritative {
+	if notification.method == DidChangeWatchedFiles::METHOD && !client_state.watchers_authoritative()
+	{
 		return Ok(false);
 	}
 
@@ -2237,9 +2238,7 @@ mod tests {
 
 	fn client_state() -> ClientState {
 		ClientState {
-			supports_dynamic_watch_registration: false,
-			registration_request: None,
-			watchers_authoritative: false,
+			watch_registration: crate::WatchRegistration::Unsupported,
 		}
 	}
 

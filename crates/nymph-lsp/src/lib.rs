@@ -91,10 +91,17 @@ use lsp_types::{
 const WATCH_REGISTRATION_REQUEST_ID: &str = "nymph-watchers";
 const WATCH_REGISTRATION_ID: &str = "nymph-project-files";
 
+#[derive(Debug, PartialEq, Eq)]
+enum WatchRegistration {
+	Unsupported,
+	Unregistered,
+	Pending(RequestId),
+	Active,
+	Failed,
+}
+
 struct ClientState {
-	supports_dynamic_watch_registration: bool,
-	registration_request: Option<RequestId>,
-	watchers_authoritative: bool,
+	watch_registration: WatchRegistration,
 }
 
 impl ClientState {
@@ -107,14 +114,16 @@ impl ClientState {
 			.and_then(|watched_files| watched_files.dynamic_registration)
 			.unwrap_or(false);
 		Self {
-			supports_dynamic_watch_registration,
-			registration_request: None,
-			watchers_authoritative: false,
+			watch_registration: if supports_dynamic_watch_registration {
+				WatchRegistration::Unregistered
+			} else {
+				WatchRegistration::Unsupported
+			},
 		}
 	}
 
 	fn register_watchers(&mut self, connection: &Connection) -> anyhow::Result<()> {
-		if !self.supports_dynamic_watch_registration || self.registration_request.is_some() {
+		if self.watch_registration != WatchRegistration::Unregistered {
 			return Ok(());
 		}
 		let id = RequestId::from(WATCH_REGISTRATION_REQUEST_ID.to_string());
@@ -139,14 +148,25 @@ impl ClientState {
 			RegisterCapability::METHOD.to_string(),
 			params,
 		)))?;
-		self.registration_request = Some(id);
+		self.watch_registration = WatchRegistration::Pending(id);
 		Ok(())
 	}
 
 	fn handle_response(&mut self, response: &Response) {
-		if self.registration_request.as_ref() == Some(&response.id) {
-			self.watchers_authoritative = response.response_result.is_ok();
+		if matches!(
+			&self.watch_registration,
+			WatchRegistration::Pending(id) if id == &response.id
+		) {
+			self.watch_registration = if response.response_result.is_ok() {
+				WatchRegistration::Active
+			} else {
+				WatchRegistration::Failed
+			};
 		}
+	}
+
+	fn watchers_authoritative(&self) -> bool {
+		self.watch_registration == WatchRegistration::Active
 	}
 }
 
@@ -246,6 +266,51 @@ mod tests {
 		VersionedTextDocumentIdentifier, WorkDoneProgressParams,
 	};
 	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	#[test]
+	fn watcher_registration_has_explicit_pending_and_active_states() {
+		let (server, client) = Connection::memory();
+		let mut state = ClientState {
+			watch_registration: WatchRegistration::Unregistered,
+		};
+
+		state.register_watchers(&server).unwrap();
+		let Message::Request(request) = client.receiver.recv().unwrap() else {
+			panic!("expected registration request");
+		};
+		assert_eq!(
+			state.watch_registration,
+			WatchRegistration::Pending(request.id.clone())
+		);
+		assert!(!state.watchers_authoritative());
+		state.register_watchers(&server).unwrap();
+		assert!(client.receiver.try_recv().is_err());
+
+		state.handle_response(&Response::new_ok(
+			RequestId::from("unrelated".to_string()),
+			serde_json::Value::Null,
+		));
+		assert!(matches!(
+			state.watch_registration,
+			WatchRegistration::Pending(_)
+		));
+		state.handle_response(&Response::new_ok(request.id, serde_json::Value::Null));
+		assert_eq!(state.watch_registration, WatchRegistration::Active);
+		assert!(state.watchers_authoritative());
+	}
+
+	#[test]
+	fn rejected_watcher_registration_is_terminal_and_not_authoritative() {
+		let id = RequestId::from(WATCH_REGISTRATION_REQUEST_ID.to_string());
+		let mut state = ClientState {
+			watch_registration: WatchRegistration::Pending(id.clone()),
+		};
+
+		state.handle_response(&Response::new_err(id, -1, "rejected".into()));
+
+		assert_eq!(state.watch_registration, WatchRegistration::Failed);
+		assert!(!state.watchers_authoritative());
+	}
 
 	fn handshake(client: &Connection) {
 		client
