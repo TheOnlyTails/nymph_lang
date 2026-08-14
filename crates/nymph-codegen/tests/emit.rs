@@ -2,8 +2,8 @@ use nymph_codegen::{
 	emit, emit_for_transactional_project_module, emit_for_transactional_project_module_checked,
 };
 use nymph_hir::hir::{
-	BinOp, BuiltinResult, HirArm, HirBoundDispatchCase, HirBoundDispatchTarget, HirEnum, HirExpr,
-	HirFunc, HirLit, HirMethod, HirModule, HirPat, HirStmt, HirVariant, NumKind,
+	BinOp, BuiltinResult, HirArm, HirBoundDispatchCase, HirBoundDispatchTarget, HirClass, HirEnum,
+	HirExpr, HirFunc, HirLit, HirMethod, HirModule, HirPat, HirStmt, HirVariant, NumKind,
 };
 
 #[test]
@@ -68,6 +68,81 @@ fn transactional_callable_parameters_are_cells_but_hidden_type_parameters_are_no
 	);
 	assert!(
 		!transactional.contains("nymphCell($type$T)"),
+		"{transactional}"
+	);
+}
+
+#[test]
+fn representation_policy_preserves_direct_bindings_and_routes_transactional_mutations() {
+	let module = HirModule {
+		lets: vec![],
+		funcs: vec![HirFunc {
+			name: "update".into(),
+			params: vec!["object".into()],
+			body: HirExpr::Block {
+				stmts: vec![
+					HirStmt::Let {
+						name: "value".into(),
+						mutable: true,
+						value: HirExpr::Num(1.0, NumKind::Int),
+					},
+					HirStmt::Expr(HirExpr::Assign {
+						target: Box::new(HirExpr::Local("value".into())),
+						value: Box::new(HirExpr::Num(2.0, NumKind::Int)),
+					}),
+					HirStmt::Expr(HirExpr::Assign {
+						target: Box::new(HirExpr::Field {
+							recv: Box::new(HirExpr::Local("object".into())),
+							name: "field".into(),
+						}),
+						value: Box::new(HirExpr::Local("value".into())),
+					}),
+				],
+				tail: Some(Box::new(HirExpr::Local("value".into()))),
+			},
+		}],
+		classes: vec![HirClass {
+			name: "Record".into(),
+			fields: vec!["field".into()],
+			methods: vec![],
+			statics: vec![],
+		}],
+		enums: vec![],
+	};
+	let direct = emit(&module);
+	let transactional = emit_for_transactional_project_module(&module, "test", &[], &[]);
+
+	assert!(direct.contains("class Record"), "{direct}");
+	assert!(direct.contains("Object.assign(this, fields)"), "{direct}");
+	assert!(direct.contains("let value = new NInt(1)"), "{direct}");
+	assert!(direct.contains("value = new NInt(2)"), "{direct}");
+	assert!(direct.contains("object.field = value"), "{direct}");
+	assert!(!direct.contains("const value = nymphCell"), "{direct}");
+
+	assert!(
+		transactional.contains("nymphRuntimeClass"),
+		"{transactional}"
+	);
+	assert!(
+		transactional.contains("nymphAssign(this, fields)"),
+		"{transactional}"
+	);
+	assert!(
+		transactional.contains("const value = nymphCell(new NInt(1))"),
+		"{transactional}"
+	);
+	assert!(
+		transactional.contains("nymphCellSet.call(null, value, new NInt(2))"),
+		"{transactional}"
+	);
+	assert!(
+		transactional.contains(
+			"nymphSetProperty.call(null, nymphCellGet(object), \"field\", nymphCellGet(value))"
+		),
+		"{transactional}"
+	);
+	assert!(
+		transactional.contains("return nymphCellGet(value)"),
 		"{transactional}"
 	);
 }
