@@ -87,9 +87,7 @@ struct BarrierRequest {
 	through: u64,
 }
 
-struct ProtocolOwner<'a> {
-	connection: &'a Connection,
-	documents: Arc<Mutex<DocumentStore>>,
+struct WorkScheduler {
 	pool: WorkerPool,
 	pending: VecDeque<WorkItem>,
 	/// Work already accepted by a worker. IDs remain here after logical
@@ -98,19 +96,252 @@ struct ProtocolOwner<'a> {
 	submitted: HashSet<u64>,
 	jobs: HashMap<u64, JobMetadata>,
 	unfinished: BTreeSet<u64>,
-	requests: HashMap<RequestId, u64>,
-	diagnostic_generations: HashMap<DiagnosticKey, u64>,
-	diagnostic_cancellations: HashMap<DiagnosticKey, CancellationToken>,
-	diagnostic_targets: HashMap<DiagnosticOwner, Vec<Uri>>,
-	diagnostic_owner_keys: HashMap<DiagnosticOwner, DiagnosticKey>,
-	document_keys: HashMap<String, DiagnosticKey>,
-	target_owners: HashMap<Uri, DiagnosticOwner>,
-	canonical_targets: HashMap<String, Uri>,
 	barriers: Vec<BarrierRequest>,
 	deferred_completions: VecDeque<CompletedWork>,
 	defer_completion_effects: bool,
 	next_job: u64,
-	shutting_down: bool,
+}
+
+impl WorkScheduler {
+	fn new(compiler_template: &CompilerState) -> Self {
+		Self {
+			pool: WorkerPool::new(compiler_template),
+			pending: VecDeque::new(),
+			submitted: HashSet::new(),
+			jobs: HashMap::new(),
+			unfinished: BTreeSet::new(),
+			barriers: Vec::new(),
+			deferred_completions: VecDeque::new(),
+			defer_completion_effects: false,
+			next_job: 1,
+		}
+	}
+
+	fn next_job_id(&mut self) -> u64 {
+		let id = self.next_job;
+		self.next_job = self.next_job.checked_add(1).expect("LSP job id exhausted");
+		id
+	}
+
+	fn track(&mut self, job: u64) {
+		self.unfinished.insert(job);
+	}
+
+	fn start_job(&mut self, job: u64, metadata: JobMetadata) {
+		self.jobs.insert(job, metadata);
+		self.track(job);
+	}
+
+	fn finish_logical(&mut self, job: u64) {
+		self.unfinished.remove(&job);
+		self.pending.retain(|item| item.id != job);
+	}
+
+	fn retire_job(&mut self, job: u64) -> Option<JobMetadata> {
+		self.finish_logical(job);
+		self.jobs.remove(&job)
+	}
+
+	fn outstanding(&self) -> usize {
+		self.submitted.len() + self.pending.len()
+	}
+
+	fn add_barrier(&mut self, id: RequestId) {
+		let through = self.next_job.saturating_sub(1);
+		self.barriers.push(BarrierRequest { id, through });
+	}
+
+	fn ready_barriers(&mut self) -> Vec<RequestId> {
+		let barriers = std::mem::take(&mut self.barriers);
+		let (ready, pending): (Vec<_>, Vec<_>) = barriers
+			.into_iter()
+			.partition(|barrier| self.unfinished.range(..=barrier.through).next().is_none());
+		self.barriers = pending;
+		ready.into_iter().map(|barrier| barrier.id).collect()
+	}
+}
+
+#[derive(Default)]
+struct RequestTracker {
+	jobs: HashMap<RequestId, u64>,
+}
+
+impl RequestTracker {
+	fn start(&mut self, id: RequestId, job: u64) -> Option<u64> {
+		self.jobs.insert(id, job)
+	}
+
+	fn retire(&mut self, id: &RequestId) -> Option<u64> {
+		self.jobs.remove(id)
+	}
+
+	fn finish(&mut self, id: &RequestId, job: u64) {
+		if self.jobs.get(id) == Some(&job) {
+			self.jobs.remove(id);
+		}
+	}
+}
+
+#[derive(Default)]
+struct DiagnosticTracker {
+	generations: HashMap<DiagnosticKey, u64>,
+	cancellations: HashMap<DiagnosticKey, CancellationToken>,
+	targets: HashMap<DiagnosticOwner, Vec<Uri>>,
+	owner_keys: HashMap<DiagnosticOwner, DiagnosticKey>,
+	document_keys: HashMap<String, DiagnosticKey>,
+	target_owners: HashMap<Uri, DiagnosticOwner>,
+	canonical_targets: HashMap<String, Uri>,
+}
+
+impl DiagnosticTracker {
+	fn current_generation(&self, key: &DiagnosticKey) -> u64 {
+		self.generations.get(key).copied().unwrap_or(0)
+	}
+
+	fn supersede(&mut self, key: &DiagnosticKey) -> u64 {
+		if let Some(previous) = self.cancellations.remove(key) {
+			previous.cancel();
+		}
+		let generation = self
+			.generations
+			.entry(key.clone())
+			.and_modify(|generation| *generation += 1)
+			.or_insert(1);
+		*generation
+	}
+
+	fn track_cancellation(&mut self, key: DiagnosticKey, cancellation: CancellationToken) {
+		self.cancellations.insert(key, cancellation);
+	}
+
+	fn finish_cancellation(&mut self, key: &DiagnosticKey, cancellation: &CancellationToken) {
+		if self
+			.cancellations
+			.get(key)
+			.is_some_and(|current| current.ptr_eq(cancellation))
+		{
+			self.cancellations.remove(key);
+		}
+	}
+
+	fn stale_targets_for_publication(
+		&self,
+		key: &DiagnosticKey,
+		owner: &DiagnosticOwner,
+		new_targets: &[Uri],
+		replace_project: bool,
+		retire_keys: &[DiagnosticKey],
+		retire_document: Option<&str>,
+	) -> Vec<(DiagnosticOwner, Uri)> {
+		let mut owners = vec![owner.clone()];
+		let mut additional = self
+			.owner_keys
+			.iter()
+			.filter_map(|(candidate, candidate_key)| {
+				(replace_project && candidate_key == key || retire_keys.contains(candidate_key))
+					.then_some(candidate.clone())
+			})
+			.collect::<Vec<_>>();
+		additional.sort();
+		owners.extend(additional);
+		if let Some(retire_document) = retire_document {
+			let mut equivalent = self
+				.owner_keys
+				.keys()
+				.filter_map(|candidate| {
+					candidate
+						.parse::<Uri>()
+						.ok()
+						.is_some_and(|uri| canonical_document(&uri) == retire_document)
+						.then_some(candidate.clone())
+				})
+				.collect::<Vec<_>>();
+			equivalent.sort();
+			owners.extend(equivalent);
+		}
+		let mut seen = HashSet::new();
+		owners.retain(|owner| seen.insert(owner.clone()));
+		let mut stale = Vec::new();
+		for previous_owner in owners {
+			for target in self.targets.get(&previous_owner).into_iter().flatten() {
+				if !new_targets.contains(target) && self.target_owners.get(target) == Some(&previous_owner)
+				{
+					stale.push((previous_owner.clone(), target.clone()));
+				}
+			}
+		}
+		stale
+	}
+
+	fn record_publication(&mut self, owner: DiagnosticOwner, key: DiagnosticKey, targets: Vec<Uri>) {
+		self.targets.insert(owner.clone(), targets);
+		self.owner_keys.insert(owner, key);
+	}
+
+	fn claim_target(
+		&mut self,
+		owner: &DiagnosticOwner,
+		target: &Uri,
+		replace_canonical: bool,
+	) -> Option<Uri> {
+		let replaced = if replace_canonical {
+			let canonical = canonical_document(target);
+			let previous = self.canonical_targets.insert(canonical, target.clone());
+			previous.filter(|previous| previous != target)
+		} else {
+			None
+		};
+		if let Some(previous) = &replaced
+			&& let Some(previous_owner) = self.target_owners.remove(previous)
+			&& let Some(targets) = self.targets.get_mut(&previous_owner)
+		{
+			targets.retain(|target| target != previous);
+		}
+		if let Some(previous_owner) = self.target_owners.insert(target.clone(), owner.clone())
+			&& previous_owner != *owner
+			&& let Some(targets) = self.targets.get_mut(&previous_owner)
+		{
+			targets.retain(|previous| previous != target);
+		}
+		replaced
+	}
+
+	fn release_target(&mut self, owner: &DiagnosticOwner, target: &Uri) -> bool {
+		if self.target_owners.get(target) != Some(owner) {
+			return false;
+		}
+		self.target_owners.remove(target);
+		let canonical = canonical_document(target);
+		if self.canonical_targets.get(&canonical) == Some(target) {
+			self.canonical_targets.remove(&canonical);
+		}
+		true
+	}
+
+	fn retire_owner(&mut self, owner: &DiagnosticOwner) -> Option<Vec<Uri>> {
+		let targets = self.targets.remove(owner)?;
+		Some(
+			targets
+				.into_iter()
+				.filter(|target| self.release_target(owner, target))
+				.collect(),
+		)
+	}
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ServerPhase {
+	Running,
+	ShuttingDown,
+}
+
+struct ProtocolOwner<'a> {
+	connection: &'a Connection,
+	documents: Arc<Mutex<DocumentStore>>,
+	work: WorkScheduler,
+	requests: RequestTracker,
+	diagnostics: DiagnosticTracker,
+	phase: ServerPhase,
 }
 
 impl<'a> ProtocolOwner<'a> {
@@ -122,35 +353,15 @@ impl<'a> ProtocolOwner<'a> {
 		Self {
 			connection,
 			documents,
-			pool: WorkerPool::new(compiler_template),
-			pending: VecDeque::new(),
-			submitted: HashSet::new(),
-			jobs: HashMap::new(),
-			unfinished: BTreeSet::new(),
-			requests: HashMap::new(),
-			diagnostic_generations: HashMap::new(),
-			diagnostic_cancellations: HashMap::new(),
-			diagnostic_targets: HashMap::new(),
-			diagnostic_owner_keys: HashMap::new(),
-			document_keys: HashMap::new(),
-			target_owners: HashMap::new(),
-			canonical_targets: HashMap::new(),
-			barriers: Vec::new(),
-			deferred_completions: VecDeque::new(),
-			defer_completion_effects: false,
-			next_job: 1,
-			shutting_down: false,
+			work: WorkScheduler::new(compiler_template),
+			requests: RequestTracker::default(),
+			diagnostics: DiagnosticTracker::default(),
+			phase: ServerPhase::Running,
 		}
 	}
 
 	fn snapshot(&self) -> Arc<DocumentStore> {
 		Arc::new(self.documents.lock().unwrap().clone())
-	}
-
-	fn next_job_id(&mut self) -> u64 {
-		let id = self.next_job;
-		self.next_job = self.next_job.checked_add(1).expect("LSP job id exhausted");
-		id
 	}
 
 	fn schedule_request_with_snapshot(
@@ -174,7 +385,7 @@ impl<'a> ProtocolOwner<'a> {
 		}
 		let (revision, route) = if let Some(target) = target {
 			let key = self.diagnostic_key_for_uri(&target);
-			let generation = self.diagnostic_generations.get(&key).copied().unwrap_or(0);
+			let generation = self.diagnostics.current_generation(&key);
 			let document = snapshot.get(&target).cloned();
 			(
 				RequestRevision::Analysis {
@@ -189,9 +400,9 @@ impl<'a> ProtocolOwner<'a> {
 			(RequestRevision::Global(snapshot.revision()), 0)
 		};
 		let cancellation = CancellationToken::default();
-		let job = self.next_job_id();
-		self.requests.insert(id.clone(), job);
-		self.jobs.insert(
+		let job = self.work.next_job_id();
+		self.requests.start(id.clone(), job);
+		self.work.start_job(
 			job,
 			JobMetadata::Request {
 				id: id.clone(),
@@ -199,7 +410,6 @@ impl<'a> ProtocolOwner<'a> {
 				cancellation: cancellation.clone(),
 			},
 		);
-		self.unfinished.insert(job);
 		let item = WorkItem {
 			id: job,
 			route,
@@ -207,9 +417,8 @@ impl<'a> ProtocolOwner<'a> {
 			task,
 		};
 		if !self.enqueue(item, false)? {
-			self.jobs.remove(&job);
-			self.unfinished.remove(&job);
-			self.requests.remove(&id);
+			self.work.retire_job(job);
+			self.requests.finish(&id, job);
 			self.send_error(
 				id,
 				lsp_server::ErrorCode::ServerCancelled as i32,
@@ -247,10 +456,10 @@ impl<'a> ProtocolOwner<'a> {
 		}
 		let cancellation = CancellationToken::default();
 		self
-			.diagnostic_cancellations
-			.insert(key.clone(), cancellation.clone());
-		let job = self.next_job_id();
-		self.jobs.insert(
+			.diagnostics
+			.track_cancellation(key.clone(), cancellation.clone());
+		let job = self.work.next_job_id();
+		self.work.start_job(
 			job,
 			JobMetadata::Diagnostics {
 				key: key.clone(),
@@ -260,7 +469,6 @@ impl<'a> ProtocolOwner<'a> {
 				publication,
 			},
 		);
-		self.unfinished.insert(job);
 		let item = WorkItem {
 			id: job,
 			route: route_for(&key),
@@ -270,33 +478,20 @@ impl<'a> ProtocolOwner<'a> {
 		if !self.enqueue(item, true)? {
 			if let Some(JobMetadata::Diagnostics {
 				key, cancellation, ..
-			}) = self.jobs.remove(&job)
+			}) = self.work.retire_job(job)
 			{
 				cancellation.cancel();
-				if self
-					.diagnostic_cancellations
-					.get(&key)
-					.is_some_and(|current| current.ptr_eq(&cancellation))
-				{
-					self.diagnostic_cancellations.remove(&key);
-				}
+				self.diagnostics.finish_cancellation(&key, &cancellation);
 			}
-			self.unfinished.remove(&job);
+			self.work.finish_logical(job);
 		}
 		Ok(())
 	}
 
 	fn supersede_diagnostics(&mut self, key: &DiagnosticKey) -> u64 {
-		if let Some(previous) = self.diagnostic_cancellations.remove(key) {
-			previous.cancel();
-		}
-		let generation = self
-			.diagnostic_generations
-			.entry(key.clone())
-			.and_modify(|generation| *generation += 1)
-			.or_insert(1);
-		let generation = *generation;
+		let generation = self.diagnostics.supersede(key);
 		let superseded = self
+			.work
 			.jobs
 			.iter()
 			.filter_map(|(job, metadata)| {
@@ -308,17 +503,15 @@ impl<'a> ProtocolOwner<'a> {
 			})
 			.collect::<Vec<_>>();
 		for job in superseded {
-			if let Some(JobMetadata::Diagnostics { cancellation, .. }) = self.jobs.remove(&job) {
+			if let Some(JobMetadata::Diagnostics { cancellation, .. }) = self.work.retire_job(job) {
 				cancellation.cancel();
 			}
-			self.unfinished.remove(&job);
 		}
-		self.pending.retain(|item| self.jobs.contains_key(&item.id));
 		generation
 	}
 
 	fn outstanding_work(&self) -> usize {
-		self.submitted.len() + self.pending.len()
+		self.work.outstanding()
 	}
 
 	fn reserve_work_slot(&mut self, evict_pending: bool) -> anyhow::Result<bool> {
@@ -341,9 +534,9 @@ impl<'a> ProtocolOwner<'a> {
 		}
 		self.drain_completed()?;
 		if self.outstanding_work() < OUTSTANDING_WORK_CAPACITY
-			|| self.pending.iter().any(|item| {
+			|| self.work.pending.iter().any(|item| {
 				matches!(
-					self.jobs.get(&item.id),
+					self.work.jobs.get(&item.id),
 					Some(JobMetadata::Diagnostics { key: pending_key, .. }) if pending_key == key
 				)
 			}) {
@@ -354,18 +547,18 @@ impl<'a> ProtocolOwner<'a> {
 
 	fn enqueue(&mut self, item: WorkItem, replace_pending: bool) -> anyhow::Result<bool> {
 		let id = item.id;
-		match self.pool.try_submit(item) {
+		match self.work.pool.try_submit(item) {
 			Ok(()) => {
-				self.submitted.insert(id);
+				self.work.submitted.insert(id);
 				Ok(true)
 			}
 			Err(TrySendError::Full(item)) => {
-				if self.pending.len() >= OWNER_PENDING_CAPACITY
+				if self.work.pending.len() >= OWNER_PENDING_CAPACITY
 					&& (!replace_pending || !self.evict_pending()?)
 				{
 					return Ok(false);
 				}
-				self.pending.push_back(item);
+				self.work.pending.push_back(item);
 				Ok(true)
 			}
 			Err(TrySendError::Disconnected(item)) => {
@@ -376,39 +569,41 @@ impl<'a> ProtocolOwner<'a> {
 	}
 
 	fn retire_duplicate_request(&mut self, id: &RequestId) {
-		let Some(job) = self.requests.remove(id) else {
+		let Some(job) = self.requests.retire(id) else {
 			return;
 		};
-		self.pending.retain(|item| item.id != job);
-		self.unfinished.remove(&job);
-		if let Some(JobMetadata::Request { cancellation, .. }) = self.jobs.remove(&job) {
+		if let Some(JobMetadata::Request { cancellation, .. }) = self.work.retire_job(job) {
 			cancellation.cancel();
 		}
 	}
 
 	fn evict_pending(&mut self) -> anyhow::Result<bool> {
 		let Some(index) = self
+			.work
 			.pending
 			.iter()
-			.position(|item| matches!(self.jobs.get(&item.id), Some(JobMetadata::Request { .. })))
-			.or_else(|| (!self.pending.is_empty()).then_some(0))
+			.position(|item| {
+				matches!(
+					self.work.jobs.get(&item.id),
+					Some(JobMetadata::Request { .. })
+				)
+			})
+			.or_else(|| (!self.work.pending.is_empty()).then_some(0))
 		else {
 			return Ok(false);
 		};
 		let item = self
+			.work
 			.pending
 			.remove(index)
 			.expect("pending index was selected");
 		item.cancellation.cancel();
-		self.unfinished.remove(&item.id);
-		match self.jobs.remove(&item.id) {
+		match self.work.retire_job(item.id) {
 			Some(JobMetadata::Request {
 				id, cancellation, ..
 			}) => {
 				cancellation.cancel();
-				if self.requests.get(&id) == Some(&item.id) {
-					self.requests.remove(&id);
-				}
+				self.requests.finish(&id, item.id);
 				self.send_error(
 					id,
 					lsp_server::ErrorCode::ServerCancelled as i32,
@@ -419,13 +614,7 @@ impl<'a> ProtocolOwner<'a> {
 				key, cancellation, ..
 			}) => {
 				cancellation.cancel();
-				if self
-					.diagnostic_cancellations
-					.get(&key)
-					.is_some_and(|current| current.ptr_eq(&cancellation))
-				{
-					self.diagnostic_cancellations.remove(&key);
-				}
+				self.diagnostics.finish_cancellation(&key, &cancellation);
 			}
 			None => {}
 		}
@@ -433,12 +622,12 @@ impl<'a> ProtocolOwner<'a> {
 	}
 
 	fn drain_completed(&mut self) -> anyhow::Result<()> {
-		while let Ok(completed) = self.pool.completed().try_recv() {
-			if self.defer_completion_effects {
+		while let Ok(completed) = self.work.pool.completed().try_recv() {
+			if self.work.defer_completion_effects {
 				// Reclaim physical capacity while preserving the protocol batch's
 				// response/publication ordering boundary.
-				self.submitted.remove(&completed.id);
-				self.deferred_completions.push_back(completed);
+				self.work.submitted.remove(&completed.id);
+				self.work.deferred_completions.push_back(completed);
 			} else {
 				self.complete(completed)?;
 			}
@@ -447,27 +636,28 @@ impl<'a> ProtocolOwner<'a> {
 	}
 
 	fn finish_protocol_batch(&mut self) -> anyhow::Result<()> {
-		self.defer_completion_effects = false;
-		while let Some(completed) = self.deferred_completions.pop_front() {
+		self.work.defer_completion_effects = false;
+		while let Some(completed) = self.work.deferred_completions.pop_front() {
 			self.complete(completed)?;
 		}
 		Ok(())
 	}
 
 	fn dispatch_pending(&mut self) -> anyhow::Result<()> {
-		let pending = self.pending.len();
+		let pending = self.work.pending.len();
 		for _ in 0..pending {
 			let item = self
+				.work
 				.pending
 				.pop_front()
 				.expect("pending length was captured");
 			let id = item.id;
-			match self.pool.try_submit(item) {
+			match self.work.pool.try_submit(item) {
 				Ok(()) => {
-					self.submitted.insert(id);
+					self.work.submitted.insert(id);
 				}
 				Err(TrySendError::Full(item)) => {
-					self.pending.push_back(item);
+					self.work.pending.push_back(item);
 				}
 				Err(TrySendError::Disconnected(item)) => {
 					self.fail_disconnected_job(item.id)?;
@@ -478,13 +668,12 @@ impl<'a> ProtocolOwner<'a> {
 	}
 
 	fn fail_disconnected_job(&mut self, job: u64) -> anyhow::Result<()> {
-		self.unfinished.remove(&job);
-		match self.jobs.remove(&job) {
+		match self.work.retire_job(job) {
 			Some(JobMetadata::Request {
 				id, cancellation, ..
 			}) => {
 				cancellation.cancel();
-				self.requests.remove(&id);
+				self.requests.finish(&id, job);
 				self.send_error(
 					id,
 					lsp_server::ErrorCode::InternalError as i32,
@@ -495,13 +684,7 @@ impl<'a> ProtocolOwner<'a> {
 				key, cancellation, ..
 			}) => {
 				cancellation.cancel();
-				if self
-					.diagnostic_cancellations
-					.get(&key)
-					.is_some_and(|current| current.ptr_eq(&cancellation))
-				{
-					self.diagnostic_cancellations.remove(&key);
-				}
+				self.diagnostics.finish_cancellation(&key, &cancellation);
 			}
 			None => {}
 		}
@@ -512,38 +695,38 @@ impl<'a> ProtocolOwner<'a> {
 		let document = canonical_document(uri);
 		match discovered_diagnostic_key(uri) {
 			Ok(key @ DiagnosticKey::Project(_)) => {
-				self.document_keys.insert(document, key.clone());
+				self.diagnostics.document_keys.insert(document, key.clone());
 				key
 			}
 			Ok(document_key) => {
 				let key = self
+					.diagnostics
 					.document_keys
 					.get(&document)
 					.cloned()
 					.unwrap_or(document_key);
-				self.document_keys.insert(document, key.clone());
+				self.diagnostics.document_keys.insert(document, key.clone());
 				key
 			}
 			Err(()) => {
 				let key = self
+					.diagnostics
 					.document_keys
 					.get(&document)
 					.cloned()
 					.unwrap_or_else(|| DiagnosticKey::Document(document.clone()));
-				self.document_keys.insert(document, key.clone());
+				self.diagnostics.document_keys.insert(document, key.clone());
 				key
 			}
 		}
 	}
 
 	fn cancel_request(&mut self, id: &RequestId) -> anyhow::Result<()> {
-		let Some(job) = self.requests.remove(id) else {
+		let Some(job) = self.requests.retire(id) else {
 			return Ok(());
 		};
-		if let Some(JobMetadata::Request { cancellation, .. }) = self.jobs.remove(&job) {
+		if let Some(JobMetadata::Request { cancellation, .. }) = self.work.retire_job(job) {
 			cancellation.cancel();
-			self.unfinished.remove(&job);
-			self.pending.retain(|item| item.id != job);
 			self.send_error(
 				id.clone(),
 				lsp_server::ErrorCode::RequestCanceled as i32,
@@ -555,9 +738,8 @@ impl<'a> ProtocolOwner<'a> {
 	}
 
 	fn complete(&mut self, completed: CompletedWork) -> anyhow::Result<()> {
-		self.submitted.remove(&completed.id);
-		self.unfinished.remove(&completed.id);
-		let Some(metadata) = self.jobs.remove(&completed.id) else {
+		self.work.submitted.remove(&completed.id);
+		let Some(metadata) = self.work.retire_job(completed.id) else {
 			self.finish_barriers()?;
 			return Ok(());
 		};
@@ -570,7 +752,7 @@ impl<'a> ProtocolOwner<'a> {
 				},
 				TaskResult::Request(result),
 			) => {
-				self.requests.remove(&id);
+				self.requests.finish(&id, completed.id);
 				if cancellation.is_cancelled() {
 					self.send_error(
 						id,
@@ -591,9 +773,7 @@ impl<'a> ProtocolOwner<'a> {
 				},
 				TaskResult::Diagnostics(Ok(publications)),
 			) => {
-				if !cancellation.is_cancelled()
-					&& self.diagnostic_generations.get(&key) == Some(&generation)
-				{
+				if !cancellation.is_cancelled() && self.diagnostics.current_generation(&key) == generation {
 					self.publish_diagnostics(key, owner, publications, publication)?;
 				}
 			}
@@ -628,7 +808,7 @@ impl<'a> ProtocolOwner<'a> {
 						target,
 						document,
 					} => {
-						self.diagnostic_generations.get(&key).copied().unwrap_or(0) == generation
+						self.diagnostics.current_generation(&key) == generation
 							&& documents.get(&target) == document.as_ref()
 					}
 				};
@@ -684,64 +864,14 @@ impl<'a> ProtocolOwner<'a> {
 		let retired_owner_uri = retire_document
 			.as_ref()
 			.and_then(|_| owner.parse::<Uri>().ok());
-		let mut owners = vec![owner.clone()];
-		if replace_project {
-			let mut project_owners = self
-				.diagnostic_owner_keys
-				.iter()
-				.filter_map(|(candidate, candidate_key)| {
-					(candidate_key == &key).then_some(candidate.clone())
-				})
-				.collect::<Vec<_>>();
-			project_owners.sort();
-			owners.extend(project_owners);
-		}
-		if !retire_keys.is_empty() {
-			let mut retired_owners = self
-				.diagnostic_owner_keys
-				.iter()
-				.filter_map(|(candidate, candidate_key)| {
-					retire_keys
-						.contains(candidate_key)
-						.then_some(candidate.clone())
-				})
-				.collect::<Vec<_>>();
-			retired_owners.sort();
-			owners.extend(retired_owners);
-		}
-		if let Some(retire_document) = retire_document {
-			let mut equivalent_owners = self
-				.diagnostic_owner_keys
-				.keys()
-				.filter_map(|candidate| {
-					candidate
-						.parse::<Uri>()
-						.ok()
-						.is_some_and(|uri| canonical_document(&uri) == retire_document)
-						.then_some(candidate.clone())
-				})
-				.collect::<Vec<_>>();
-			equivalent_owners.sort();
-			owners.extend(equivalent_owners);
-		}
-		let mut seen_owners = HashSet::new();
-		owners.retain(|owner| seen_owners.insert(owner.clone()));
-		let mut stale_targets = Vec::new();
-		for previous_owner in owners {
-			for stale in self
-				.diagnostic_targets
-				.get(&previous_owner)
-				.into_iter()
-				.flatten()
-				.filter(|target| !new_targets.contains(*target))
-				.cloned()
-				.collect::<Vec<_>>()
-			{
-				if self.target_owners.get(&stale) == Some(&previous_owner) {
-					stale_targets.push((previous_owner.clone(), stale));
-				}
-			}
-		}
+		let mut stale_targets = self.diagnostics.stale_targets_for_publication(
+			&key,
+			&owner,
+			&new_targets,
+			replace_project,
+			&retire_keys,
+			retire_document.as_deref(),
+		);
 		if let Some(ref retired_owner_uri) = retired_owner_uri {
 			stale_targets.sort_by(|(_, left), (_, right)| {
 				(left != retired_owner_uri)
@@ -772,8 +902,7 @@ impl<'a> ProtocolOwner<'a> {
 		if !clear_before {
 			self.publish_stale_clears(&stale_targets)?;
 		}
-		self.diagnostic_targets.insert(owner.clone(), new_targets);
-		self.diagnostic_owner_keys.insert(owner, key);
+		self.diagnostics.record_publication(owner, key, new_targets);
 		Ok(())
 	}
 
@@ -783,28 +912,12 @@ impl<'a> ProtocolOwner<'a> {
 		publication: PublishDiagnosticsParams,
 		replace_canonical: bool,
 	) -> anyhow::Result<()> {
-		if replace_canonical {
-			let canonical = canonical_document(&publication.uri);
-			if let Some(previous) = self.canonical_targets.get(&canonical).cloned()
-				&& previous != publication.uri
-				&& let Some(previous_owner) = self.target_owners.remove(&previous)
-			{
-				self.send_diagnostics(current_clear(&self.documents, previous.clone()))?;
-				if let Some(targets) = self.diagnostic_targets.get_mut(&previous_owner) {
-					targets.retain(|target| target != &previous);
-				}
-			}
+		if let Some(previous) =
 			self
-				.canonical_targets
-				.insert(canonical, publication.uri.clone());
-		}
-		if let Some(previous_owner) = self
-			.target_owners
-			.insert(publication.uri.clone(), owner.clone())
-			&& previous_owner != *owner
-			&& let Some(targets) = self.diagnostic_targets.get_mut(&previous_owner)
+				.diagnostics
+				.claim_target(owner, &publication.uri, replace_canonical)
 		{
-			targets.retain(|target| target != &publication.uri);
+			self.send_diagnostics(current_clear(&self.documents, previous))?;
 		}
 		self.send_diagnostics(publication)
 	}
@@ -814,13 +927,8 @@ impl<'a> ProtocolOwner<'a> {
 		stale_targets: &[(DiagnosticOwner, Uri)],
 	) -> anyhow::Result<()> {
 		for (previous_owner, stale) in stale_targets {
-			if self.target_owners.get(stale) == Some(previous_owner) {
+			if self.diagnostics.release_target(previous_owner, stale) {
 				self.send_diagnostics(current_clear(&self.documents, stale.clone()))?;
-				self.target_owners.remove(stale);
-				let canonical = canonical_document(stale);
-				if self.canonical_targets.get(&canonical) == Some(stale) {
-					self.canonical_targets.remove(&canonical);
-				}
 			}
 		}
 		Ok(())
@@ -850,28 +958,20 @@ impl<'a> ProtocolOwner<'a> {
 	}
 
 	fn add_barrier(&mut self, id: RequestId) -> anyhow::Result<()> {
-		let through = self.next_job.saturating_sub(1);
-		self.barriers.push(BarrierRequest { id, through });
+		self.work.add_barrier(id);
 		self.finish_barriers()
 	}
 
 	fn finish_barriers(&mut self) -> anyhow::Result<()> {
-		let mut pending = Vec::new();
-		let barriers = std::mem::take(&mut self.barriers);
-		for barrier in barriers {
-			if self.unfinished.range(..=barrier.through).next().is_none() {
-				self
-					.connection
-					.sender
-					.send(Message::Response(Response::new_ok(
-						barrier.id,
-						serde_json::Value::Null,
-					)))?;
-			} else {
-				pending.push(barrier);
-			}
+		for id in self.work.ready_barriers() {
+			self
+				.connection
+				.sender
+				.send(Message::Response(Response::new_ok(
+					id,
+					serde_json::Value::Null,
+				)))?;
 		}
-		self.barriers = pending;
 		Ok(())
 	}
 
@@ -883,26 +983,26 @@ impl<'a> ProtocolOwner<'a> {
 				id,
 				serde_json::Value::Null,
 			)))?;
-		self.shutting_down = true;
-		let request_ids = self.requests.keys().cloned().collect::<Vec<_>>();
+		self.phase = ServerPhase::ShuttingDown;
+		let request_ids = self.requests.jobs.keys().cloned().collect::<Vec<_>>();
 		for request in request_ids {
 			self.cancel_request(&request)?;
 		}
-		for cancellation in self.diagnostic_cancellations.values() {
+		for cancellation in self.diagnostics.cancellations.values() {
 			cancellation.cancel();
 		}
 		Ok(())
 	}
 
 	fn finish(mut self) {
-		for metadata in self.jobs.values() {
+		for metadata in self.work.jobs.values() {
 			match metadata {
 				JobMetadata::Request { cancellation, .. }
 				| JobMetadata::Diagnostics { cancellation, .. } => cancellation.cancel(),
 			}
 		}
-		self.pending.clear();
-		self.pool.finish();
+		self.work.pending.clear();
+		self.work.pool.finish();
 	}
 }
 
@@ -1063,7 +1163,7 @@ pub(crate) fn main_loop(
 ) -> anyhow::Result<()> {
 	let mut owner = ProtocolOwner::new(connection, documents.clone(), &compiler.lock().unwrap());
 	let mut inbox = ProtocolInbox::new(connection.receiver.clone());
-	let completed = owner.pool.completed().clone();
+	let completed = owner.work.pool.completed().clone();
 	let result = (|| {
 		let mut exit = false;
 		while !exit {
@@ -1073,7 +1173,7 @@ pub(crate) fn main_loop(
 			// arriving while it is processed cannot indefinitely starve a completion.
 			match receive_owner_event(&inbox.receiver, &completed) {
 				OwnerEvent::Protocol(message) => {
-					owner.defer_completion_effects = true;
+					owner.work.defer_completion_effects = true;
 					for message in inbox.batch(message) {
 						exit = handle_protocol_message(&mut owner, client_state, message)?;
 						if exit {
@@ -1100,7 +1200,7 @@ pub(crate) fn main_loop(
 }
 
 fn handle_request(owner: &mut ProtocolOwner<'_>, request: ServerRequest) -> anyhow::Result<bool> {
-	if owner.shutting_down {
+	if owner.phase == ServerPhase::ShuttingDown {
 		owner.send_error(
 			request.id,
 			lsp_server::ErrorCode::InvalidRequest as i32,
@@ -1118,121 +1218,130 @@ fn handle_request(owner: &mut ProtocolOwner<'_>, request: ServerRequest) -> anyh
 		return Ok(false);
 	}
 
-	let id = request.id.clone();
-	let snapshot = owner.snapshot();
 	let method = request.method.clone();
-	let (target, task) = if method == WorkspaceSymbolRequest::METHOD {
-		let Some(params) = decode_request_params::<WorkspaceSymbolParams>(owner, &id, request.params)?
-		else {
-			return Ok(false);
-		};
-		(None, workspace_symbol_task(snapshot.clone(), params))
-	} else if method == HoverRequest::METHOD {
-		let Some(params) = decode_request_params::<HoverParams>(owner, &id, request.params)? else {
-			return Ok(false);
-		};
-		let uri = params
-			.text_document_position_params
-			.text_document
-			.uri
-			.clone();
-		(Some(uri), hover_task(snapshot.clone(), params))
-	} else if method == Formatting::METHOD {
-		let Some(params) =
-			decode_request_params::<DocumentFormattingParams>(owner, &id, request.params)?
-		else {
-			return Ok(false);
-		};
-		let uri = params.text_document.uri.clone();
-		(Some(uri), formatting_task(snapshot.clone(), params))
-	} else if method == RangeFormatting::METHOD {
-		let Some(params) =
-			decode_request_params::<DocumentRangeFormattingParams>(owner, &id, request.params)?
-		else {
-			return Ok(false);
-		};
-		let uri = params.text_document.uri.clone();
-		(Some(uri), range_formatting_task(snapshot.clone(), params))
-	} else if method == DocumentSymbolRequest::METHOD {
-		let Some(params) = decode_request_params::<DocumentSymbolParams>(owner, &id, request.params)?
-		else {
-			return Ok(false);
-		};
-		let uri = params.text_document.uri.clone();
-		(Some(uri), document_symbol_task(snapshot.clone(), params))
-	} else if method == GotoDefinition::METHOD {
-		let Some(params) = decode_request_params::<GotoDefinitionParams>(owner, &id, request.params)?
-		else {
-			return Ok(false);
-		};
-		let uri = params
-			.text_document_position_params
-			.text_document
-			.uri
-			.clone();
-		(Some(uri), definition_task(snapshot.clone(), params))
-	} else if method == Completion::METHOD {
-		let Some(params) = decode_request_params::<CompletionParams>(owner, &id, request.params)?
-		else {
-			return Ok(false);
-		};
-		let uri = params.text_document_position.text_document.uri.clone();
-		(Some(uri), completion_task(snapshot.clone(), params))
-	} else if method == References::METHOD {
-		let Some(params) = decode_request_params::<ReferenceParams>(owner, &id, request.params)? else {
-			return Ok(false);
-		};
-		let uri = params.text_document_position.text_document.uri.clone();
-		(Some(uri), references_task(snapshot.clone(), params))
-	} else if method == PrepareRenameRequest::METHOD {
-		let Some(params) =
-			decode_request_params::<lsp_types::TextDocumentPositionParams>(owner, &id, request.params)?
-		else {
-			return Ok(false);
-		};
-		let uri = params.text_document.uri.clone();
-		(Some(uri), prepare_rename_task(snapshot.clone(), params))
-	} else if method == Rename::METHOD {
-		let Some(params) = decode_request_params::<RenameParams>(owner, &id, request.params)? else {
-			return Ok(false);
-		};
-		let uri = params.text_document_position.text_document.uri.clone();
-		(Some(uri), rename_task(snapshot.clone(), params))
-	} else if method == SemanticTokensFullRequest::METHOD {
-		let Some(params) = decode_request_params::<SemanticTokensParams>(owner, &id, request.params)?
-		else {
-			return Ok(false);
-		};
-		let uri = params.text_document.uri.clone();
-		(Some(uri), semantic_tokens_task(snapshot.clone(), params))
-	} else {
-		owner.send_error(
+	match method.as_str() {
+		method if method == WorkspaceSymbolRequest::METHOD => {
+			schedule_typed_request::<WorkspaceSymbolParams>(
+				owner,
+				request,
+				|_| None,
+				workspace_symbol_task,
+			)?
+		}
+		method if method == HoverRequest::METHOD => schedule_typed_request::<HoverParams>(
+			owner,
+			request,
+			|params| {
+				Some(
+					params
+						.text_document_position_params
+						.text_document
+						.uri
+						.clone(),
+				)
+			},
+			hover_task,
+		)?,
+		method if method == Formatting::METHOD => schedule_typed_request::<DocumentFormattingParams>(
+			owner,
+			request,
+			|params| Some(params.text_document.uri.clone()),
+			formatting_task,
+		)?,
+		method if method == RangeFormatting::METHOD => {
+			schedule_typed_request::<DocumentRangeFormattingParams>(
+				owner,
+				request,
+				|params| Some(params.text_document.uri.clone()),
+				range_formatting_task,
+			)?
+		}
+		method if method == DocumentSymbolRequest::METHOD => {
+			schedule_typed_request::<DocumentSymbolParams>(
+				owner,
+				request,
+				|params| Some(params.text_document.uri.clone()),
+				document_symbol_task,
+			)?
+		}
+		method if method == GotoDefinition::METHOD => schedule_typed_request::<GotoDefinitionParams>(
+			owner,
+			request,
+			|params| {
+				Some(
+					params
+						.text_document_position_params
+						.text_document
+						.uri
+						.clone(),
+				)
+			},
+			definition_task,
+		)?,
+		method if method == Completion::METHOD => schedule_typed_request::<CompletionParams>(
+			owner,
+			request,
+			|params| Some(params.text_document_position.text_document.uri.clone()),
+			completion_task,
+		)?,
+		method if method == References::METHOD => schedule_typed_request::<ReferenceParams>(
+			owner,
+			request,
+			|params| Some(params.text_document_position.text_document.uri.clone()),
+			references_task,
+		)?,
+		method if method == PrepareRenameRequest::METHOD => {
+			schedule_typed_request::<lsp_types::TextDocumentPositionParams>(
+				owner,
+				request,
+				|params| Some(params.text_document.uri.clone()),
+				prepare_rename_task,
+			)?
+		}
+		method if method == Rename::METHOD => schedule_typed_request::<RenameParams>(
+			owner,
+			request,
+			|params| Some(params.text_document_position.text_document.uri.clone()),
+			rename_task,
+		)?,
+		method if method == SemanticTokensFullRequest::METHOD => {
+			schedule_typed_request::<SemanticTokensParams>(
+				owner,
+				request,
+				|params| Some(params.text_document.uri.clone()),
+				semantic_tokens_task,
+			)?
+		}
+		_ => owner.send_error(
 			request.id,
 			lsp_server::ErrorCode::MethodNotFound as i32,
 			&format!("unhandled request method `{method}`"),
-		)?;
-		return Ok(false);
-	};
-	owner.schedule_request_with_snapshot(id, target, snapshot, task)?;
+		)?,
+	}
 	Ok(false)
 }
 
-fn decode_request_params<T: DeserializeOwned>(
-	owner: &ProtocolOwner<'_>,
-	id: &RequestId,
-	params: serde_json::Value,
-) -> anyhow::Result<Option<T>> {
-	match serde_json::from_value(params) {
-		Ok(params) => Ok(Some(params)),
+fn schedule_typed_request<P: DeserializeOwned>(
+	owner: &mut ProtocolOwner<'_>,
+	request: ServerRequest,
+	target: impl FnOnce(&P) -> Option<Uri>,
+	task: fn(Arc<DocumentStore>, P) -> Task,
+) -> anyhow::Result<()> {
+	let params = match serde_json::from_value::<P>(request.params) {
+		Ok(params) => params,
 		Err(error) => {
 			owner.send_error(
-				id.clone(),
+				request.id,
 				lsp_server::ErrorCode::InvalidParams as i32,
 				&format!("invalid request parameters: {error}"),
 			)?;
-			Ok(None)
+			return Ok(());
 		}
-	}
+	};
+	let target = target(&params);
+	let snapshot = owner.snapshot();
+	let task = task(snapshot.clone(), params);
+	owner.schedule_request_with_snapshot(request.id, target, snapshot, task)
 }
 
 fn handle_notification(
@@ -1251,7 +1360,7 @@ fn handle_notification(
 		}
 		return Ok(false);
 	}
-	if owner.shutting_down {
+	if owner.phase == ServerPhase::ShuttingDown {
 		return Ok(false);
 	}
 	if notification.method == DidChangeWatchedFiles::METHOD && !client_state.watchers_authoritative()
@@ -1261,7 +1370,8 @@ fn handle_notification(
 
 	match notification.method.as_str() {
 		method if method == DidOpenTextDocument::METHOD => {
-			let Ok(params) = serde_json::from_value::<DidOpenTextDocumentParams>(notification.params)
+			let Some(params) =
+				decode_notification_params::<DidOpenTextDocumentParams>(notification.params)
 			else {
 				return Ok(false);
 			};
@@ -1274,7 +1384,8 @@ fn handle_notification(
 			schedule_document_diagnostics(owner, uri, false)?;
 		}
 		method if method == DidChangeTextDocument::METHOD => {
-			let Ok(params) = serde_json::from_value::<DidChangeTextDocumentParams>(notification.params)
+			let Some(params) =
+				decode_notification_params::<DidChangeTextDocumentParams>(notification.params)
 			else {
 				return Ok(false);
 			};
@@ -1294,7 +1405,8 @@ fn handle_notification(
 			}
 		}
 		method if method == DidCloseTextDocument::METHOD => {
-			let Ok(params) = serde_json::from_value::<DidCloseTextDocumentParams>(notification.params)
+			let Some(params) =
+				decode_notification_params::<DidCloseTextDocumentParams>(notification.params)
 			else {
 				return Ok(false);
 			};
@@ -1310,7 +1422,8 @@ fn handle_notification(
 			}
 		}
 		method if method == DidChangeWatchedFiles::METHOD => {
-			let Ok(params) = serde_json::from_value::<DidChangeWatchedFilesParams>(notification.params)
+			let Some(params) =
+				decode_notification_params::<DidChangeWatchedFilesParams>(notification.params)
 			else {
 				return Ok(false);
 			};
@@ -1325,6 +1438,10 @@ fn handle_notification(
 		_ => {}
 	}
 	Ok(false)
+}
+
+fn decode_notification_params<T: DeserializeOwned>(params: serde_json::Value) -> Option<T> {
+	serde_json::from_value(params).ok()
 }
 
 fn schedule_document_diagnostics(
@@ -1560,6 +1677,7 @@ fn schedule_manifest_diagnostics(
 	affected_documents.sort_by(|left, right| left.as_str().cmp(right.as_str()));
 
 	let mut retired_keys = owner
+		.diagnostics
 		.document_keys
 		.iter()
 		.filter_map(|(document, key)| {
@@ -1570,7 +1688,8 @@ fn schedule_manifest_diagnostics(
 		.collect::<HashSet<_>>();
 	retired_keys.extend(
 		owner
-			.diagnostic_owner_keys
+			.diagnostics
+			.owner_keys
 			.iter()
 			.filter_map(|(diagnostic_owner, key)| {
 				diagnostic_owner
@@ -1586,10 +1705,13 @@ fn schedule_manifest_diagnostics(
 	let mut groups: HashMap<DiagnosticKey, Vec<Uri>> = HashMap::new();
 	for uri in affected_documents {
 		let document = canonical_document(&uri);
-		let previous = owner.document_keys.get(&document).cloned();
+		let previous = owner.diagnostics.document_keys.get(&document).cloned();
 		let current = discovered_diagnostic_key(&uri)
 			.unwrap_or_else(|()| previous.unwrap_or_else(|| DiagnosticKey::Document(document.clone())));
-		owner.document_keys.insert(document, current.clone());
+		owner
+			.diagnostics
+			.document_keys
+			.insert(document, current.clone());
 		groups.entry(current).or_default().push(uri);
 	}
 
@@ -1698,20 +1820,12 @@ fn clear_owner_diagnostics(
 	diagnostic_owner: &str,
 	uri: Uri,
 ) -> anyhow::Result<()> {
-	if let Some(targets) = owner.diagnostic_targets.remove(diagnostic_owner) {
+	if let Some(targets) = owner
+		.diagnostics
+		.retire_owner(&diagnostic_owner.to_string())
+	{
 		for target in targets {
-			if owner
-				.target_owners
-				.get(&target)
-				.is_some_and(|current| current == diagnostic_owner)
-			{
-				owner.send_diagnostics(current_clear(&owner.documents, target.clone()))?;
-				owner.target_owners.remove(&target);
-				let canonical = canonical_document(&target);
-				if owner.canonical_targets.get(&canonical) == Some(&target) {
-					owner.canonical_targets.remove(&canonical);
-				}
-			}
+			owner.send_diagnostics(current_clear(&owner.documents, target))?;
 		}
 	} else {
 		owner.send_diagnostics(diagnostics::clear_params(uri))?;
@@ -2025,6 +2139,67 @@ mod tests {
 	use std::sync::atomic::{AtomicBool, Ordering};
 
 	#[test]
+	fn request_tracker_does_not_retire_a_replacement_on_stale_completion() {
+		let id = RequestId::from(1);
+		let mut requests = RequestTracker::default();
+		assert_eq!(requests.start(id.clone(), 10), None);
+		assert_eq!(requests.start(id.clone(), 11), Some(10));
+
+		requests.finish(&id, 10);
+		assert_eq!(requests.jobs.get(&id), Some(&11));
+		requests.finish(&id, 11);
+		assert!(requests.jobs.is_empty());
+	}
+
+	#[test]
+	fn work_scheduler_barrier_waits_only_for_earlier_logical_work() {
+		let mut work = WorkScheduler::new(&CompilerState::new());
+		let first = work.next_job_id();
+		work.track(first);
+		work.add_barrier(RequestId::from(2));
+		let later = work.next_job_id();
+		work.track(later);
+
+		assert!(work.ready_barriers().is_empty());
+		work.finish_logical(first);
+		assert_eq!(work.ready_barriers(), [RequestId::from(2)]);
+		work.finish_logical(later);
+		work.pool.finish();
+	}
+
+	#[test]
+	fn diagnostic_tracker_supersession_and_target_claims_are_atomic() {
+		let key = DiagnosticKey::Document("file:///a.nym".into());
+		let first_owner = "file:///first.nym".to_string();
+		let second_owner = "file:///second.nym".to_string();
+		let first_uri: Uri = "file:///same/a.nym".parse().unwrap();
+		let equivalent_uri: Uri = "file:///same/./a.nym".parse().unwrap();
+		let cancellation = CancellationToken::default();
+		let mut diagnostics = DiagnosticTracker::default();
+		diagnostics.track_cancellation(key.clone(), cancellation.clone());
+		assert_eq!(diagnostics.supersede(&key), 1);
+		assert!(cancellation.is_cancelled());
+
+		diagnostics.record_publication(first_owner.clone(), key.clone(), vec![first_uri.clone()]);
+		assert_eq!(
+			diagnostics.claim_target(&first_owner, &first_uri, true),
+			None
+		);
+		diagnostics.record_publication(second_owner.clone(), key, vec![equivalent_uri.clone()]);
+		assert_eq!(
+			diagnostics.claim_target(&second_owner, &equivalent_uri, true),
+			Some(first_uri.clone())
+		);
+		assert!(diagnostics.targets[&first_owner].is_empty());
+		assert_eq!(
+			diagnostics.target_owners.get(&equivalent_uri),
+			Some(&second_owner)
+		);
+		assert!(diagnostics.release_target(&second_owner, &equivalent_uri));
+		assert!(!diagnostics.target_owners.contains_key(&equivalent_uri));
+	}
+
+	#[test]
 	fn ready_protocol_edit_precedes_ready_completion() {
 		let (protocol_sender, protocol) = crossbeam_channel::bounded(1);
 		let (completed_sender, completed) = crossbeam_channel::bounded(1);
@@ -2148,8 +2323,8 @@ mod tests {
 		let request = RequestId::from(41);
 		let job = 7;
 		let cancellation = CancellationToken::default();
-		owner.requests.insert(request.clone(), job);
-		owner.jobs.insert(
+		owner.requests.start(request.clone(), job);
+		owner.work.start_job(
 			job,
 			JobMetadata::Request {
 				id: request.clone(),
@@ -2157,14 +2332,13 @@ mod tests {
 				cancellation,
 			},
 		);
-		owner.submitted.insert(job);
-		owner.unfinished.insert(job);
+		owner.work.submitted.insert(job);
 
 		// Capacity reclamation may physically receive this completion while a
 		// protocol batch is in progress, but its success effect remains deferred.
-		owner.defer_completion_effects = true;
-		owner.submitted.remove(&job);
-		owner.deferred_completions.push_back(CompletedWork {
+		owner.work.defer_completion_effects = true;
+		owner.work.submitted.remove(&job);
+		owner.work.deferred_completions.push_back(CompletedWork {
 			id: job,
 			result: TaskResult::Request(Ok(serde_json::json!("stale"))),
 		});
@@ -2195,11 +2369,12 @@ mod tests {
 		let key = owner.diagnostic_key_for_uri(&uri);
 		let old_job = 1;
 		let old_cancellation = CancellationToken::default();
-		owner.diagnostic_generations.insert(key.clone(), 1);
+		owner.diagnostics.generations.insert(key.clone(), 1);
 		owner
-			.diagnostic_cancellations
+			.diagnostics
+			.cancellations
 			.insert(key.clone(), old_cancellation.clone());
-		owner.jobs.insert(
+		owner.work.start_job(
 			old_job,
 			JobMetadata::Diagnostics {
 				key: key.clone(),
@@ -2209,7 +2384,10 @@ mod tests {
 				publication: DiagnosticPublication::default(),
 			},
 		);
-		owner.submitted.extend(1..=OUTSTANDING_WORK_CAPACITY as u64);
+		owner
+			.work
+			.submitted
+			.extend(1..=OUTSTANDING_WORK_CAPACITY as u64);
 		assert_eq!(owner.outstanding_work(), OUTSTANDING_WORK_CAPACITY);
 
 		owner
@@ -2220,7 +2398,7 @@ mod tests {
 				Box::new(|_, _| TaskResult::Diagnostics(Ok(Vec::new()))),
 			)
 			.unwrap();
-		assert_eq!(owner.diagnostic_generations.get(&key), Some(&2));
+		assert_eq!(owner.diagnostics.generations.get(&key), Some(&2));
 		owner
 			.complete(CompletedWork {
 				id: old_job,
@@ -2335,7 +2513,7 @@ mod tests {
 		assert_eq!(recv_response(&client).id, RequestId::from(8));
 		release_sender.send(()).unwrap();
 		for _ in 0..2 {
-			let completed = owner.pool.completed().recv().unwrap();
+			let completed = owner.work.pool.completed().recv().unwrap();
 			owner.complete(completed).unwrap();
 		}
 		assert!(queued_ran.load(Ordering::SeqCst));
@@ -2376,7 +2554,7 @@ mod tests {
 		let unrelated_key = owner.diagnostic_key_for_uri(&unrelated);
 		owner.supersede_diagnostics(&unrelated_key);
 		release_sender.send(()).unwrap();
-		let completed = owner.pool.completed().recv().unwrap();
+		let completed = owner.work.pool.completed().recv().unwrap();
 		owner.complete(completed).unwrap();
 		let current = recv_response(&client);
 		assert_eq!(current.id, RequestId::from(10));
@@ -2402,7 +2580,7 @@ mod tests {
 		let key = owner.diagnostic_key_for_uri(&uri);
 		owner.supersede_diagnostics(&key);
 		release_sender.send(()).unwrap();
-		let completed = owner.pool.completed().recv().unwrap();
+		let completed = owner.work.pool.completed().recv().unwrap();
 		owner.complete(completed).unwrap();
 		let stale = recv_response(&client);
 		assert_eq!(stale.id, RequestId::from(11));
@@ -2474,7 +2652,7 @@ mod tests {
 			.unwrap();
 		release_sender.send(()).unwrap();
 		for _ in 0..2 {
-			let completed = owner.pool.completed().recv().unwrap();
+			let completed = owner.work.pool.completed().recv().unwrap();
 			owner.complete(completed).unwrap();
 		}
 		match client.receiver.recv().unwrap() {
@@ -2599,7 +2777,7 @@ mod tests {
 				.unwrap();
 			assert!(owner.outstanding_work() <= OUTSTANDING_WORK_CAPACITY);
 		}
-		assert_eq!(owner.pending.len(), OWNER_PENDING_CAPACITY);
+		assert_eq!(owner.work.pending.len(), OWNER_PENDING_CAPACITY);
 
 		let latest_uri = uri.clone();
 		owner
@@ -2623,12 +2801,12 @@ mod tests {
 				}),
 			)
 			.unwrap();
-		assert_eq!(owner.pending.len(), OWNER_PENDING_CAPACITY);
+		assert_eq!(owner.work.pending.len(), OWNER_PENDING_CAPACITY);
 		assert!(owner.outstanding_work() <= OUTSTANDING_WORK_CAPACITY);
 
 		release_sender.send(()).unwrap();
 		for _ in 0..(1 + 8 + OWNER_PENDING_CAPACITY) {
-			let completed = owner.pool.completed().recv().unwrap();
+			let completed = owner.work.pool.completed().recv().unwrap();
 			owner.complete(completed).unwrap();
 			owner.dispatch_pending().unwrap();
 		}
@@ -2720,7 +2898,7 @@ mod tests {
 		// Model submitted completions that have not yet been consumed. They are
 		// deliberately metadata-free tombstones, just like cancelled work.
 		for job in 10_000..10_000 + OUTSTANDING_WORK_CAPACITY as u64 - 1 {
-			owner.submitted.insert(job);
+			owner.work.submitted.insert(job);
 		}
 		assert_eq!(owner.outstanding_work(), OUTSTANDING_WORK_CAPACITY);
 		owner
@@ -2738,7 +2916,7 @@ mod tests {
 		);
 
 		release_sender.send(()).unwrap();
-		let completed = owner.pool.completed().recv().unwrap();
+		let completed = owner.work.pool.completed().recv().unwrap();
 		owner.complete(completed).unwrap();
 		assert!(client.receiver.try_recv().is_err());
 		owner.finish();
@@ -2783,7 +2961,7 @@ mod tests {
 		);
 
 		release_sender.send(()).unwrap();
-		let completed = owner.pool.completed().recv().unwrap();
+		let completed = owner.work.pool.completed().recv().unwrap();
 		owner.complete(completed).unwrap();
 		assert!(client.receiver.try_recv().is_err());
 		owner.finish();
@@ -2794,7 +2972,7 @@ mod tests {
 		let (server, client) = Connection::memory();
 		let documents = Arc::new(Mutex::new(DocumentStore::default()));
 		let mut owner = ProtocolOwner::new(&server, documents, &CompilerState::new());
-		owner.pool = WorkerPool::disconnected();
+		owner.work.pool = WorkerPool::disconnected();
 		let id = RequestId::from(52);
 
 		owner
@@ -2812,8 +2990,8 @@ mod tests {
 			lsp_server::ErrorCode::InternalError as i32
 		);
 		assert!(client.receiver.try_recv().is_err());
-		assert!(owner.requests.is_empty());
-		assert!(owner.jobs.is_empty());
+		assert!(owner.requests.jobs.is_empty());
+		assert!(owner.work.jobs.is_empty());
 		owner.finish();
 	}
 
@@ -2854,9 +3032,9 @@ mod tests {
 
 		documents.lock().unwrap().filesystem_changed();
 		schedule_manifest_diagnostics(&mut owner, &manifest_uri).unwrap();
-		assert_eq!(owner.jobs.len(), 2);
+		assert_eq!(owner.work.jobs.len(), 2);
 		for _ in 0..2 {
-			let completed = owner.pool.completed().recv().unwrap();
+			let completed = owner.work.pool.completed().recv().unwrap();
 			owner.complete(completed).unwrap();
 		}
 		let publications = client
@@ -2935,7 +3113,7 @@ mod tests {
 		schedule_watcher_diagnostics(&mut owner, vec![manifest_uri]).unwrap();
 		release_sender.send(()).unwrap();
 		for _ in 0..2 {
-			let completed = owner.pool.completed().recv().unwrap();
+			let completed = owner.work.pool.completed().recv().unwrap();
 			owner.complete(completed).unwrap();
 		}
 
