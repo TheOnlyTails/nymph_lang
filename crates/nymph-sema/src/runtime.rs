@@ -436,6 +436,9 @@ pub enum RuntimeBodyKind {
 #[derive(Clone, Debug, salsa::SalsaValue)]
 pub struct CheckedRuntimeBody {
 	pub kind: RuntimeBodyKind,
+	/// Whether a value body is bound immutably and can therefore retain an exact
+	/// callable identity for initializer dependency analysis.
+	pub immutable: bool,
 	/// Declared hidden type-object parameters, in canonical binder order.
 	pub type_parameters: Arc<[crate::GenericParameterId]>,
 	pub stable: StableBody,
@@ -445,6 +448,7 @@ pub struct CheckedRuntimeBody {
 impl PartialEq for CheckedRuntimeBody {
 	fn eq(&self, other: &Self) -> bool {
 		self.kind == other.kind
+			&& self.immutable == other.immutable
 			&& self.type_parameters == other.type_parameters
 			&& self.stable == other.stable
 			&& self.annotations == other.annotations
@@ -523,6 +527,7 @@ pub fn runtime_definitions(
 					required_top_level(checked, name)?,
 					RuntimePlacement::TopLevel,
 					value,
+					!meta.is_mutable(),
 					checked,
 				)?;
 			}
@@ -651,13 +656,14 @@ pub fn runtime_definitions(
 									checked,
 								)?,
 								InterfaceElement::Let {
-									meta: _,
+									meta,
 									value: Some(value),
 								} => push_value(
 									&mut result,
 									member.id.clone(),
 									attached(member),
 									value,
+									!meta.is_mutable(),
 									checked,
 								)?,
 								_ => {}
@@ -790,9 +796,14 @@ fn extract_members(
 			ImplMember::Func { meta, body, .. } => {
 				push_body(result, shape.id.clone(), placement(), meta, body, checked)?
 			}
-			ImplMember::Let { value, .. } => {
-				push_value(result, shape.id.clone(), placement(), value, checked)?
-			}
+			ImplMember::Let { meta, value, .. } => push_value(
+				result,
+				shape.id.clone(),
+				placement(),
+				value,
+				!meta.is_mutable(),
+				checked,
+			)?,
 			ImplMember::ExternalFunc(..) | ImplMember::ExternalLet(..) => push_external(
 				result,
 				shape.id.clone(),
@@ -857,7 +868,14 @@ fn extract_implementation_members(
 			ImplMember::Func { meta, body, .. } => {
 				push_body(result, definition, placement, meta, body, checked)?
 			}
-			ImplMember::Let { value, .. } => push_value(result, definition, placement, value, checked)?,
+			ImplMember::Let { meta, value, .. } => push_value(
+				result,
+				definition,
+				placement,
+				value,
+				!meta.is_mutable(),
+				checked,
+			)?,
 			ImplMember::ExternalFunc(..) => {
 				push_external(result, definition, placement, member_shape.external.clone())?
 			}
@@ -873,6 +891,7 @@ fn push_value(
 	definition: DefinitionId,
 	placement: RuntimePlacement,
 	value: &Expr,
+	immutable: bool,
 	checked: &crate::CheckedFacts,
 ) -> Result<(), RuntimeExtractionError> {
 	push_canonical_body(
@@ -880,6 +899,7 @@ fn push_value(
 		definition,
 		placement,
 		RuntimeBodyKind::Value,
+		immutable,
 		&[],
 		value,
 		checked,
@@ -903,6 +923,7 @@ fn push_body(
 		} else {
 			RuntimeBodyKind::InstanceFunction
 		},
+		true,
 		&meta.params,
 		body,
 		checked,
@@ -914,6 +935,7 @@ fn push_canonical_body(
 	definition: DefinitionId,
 	placement: RuntimePlacement,
 	kind: RuntimeBodyKind,
+	immutable: bool,
 	params: &[nymph_ast::Spanned<FuncParam>],
 	body: &Expr,
 	checked: &crate::CheckedFacts,
@@ -960,6 +982,7 @@ fn push_canonical_body(
 		placement,
 		payload: RuntimePayload::NymphBody(CheckedRuntimeBody {
 			kind,
+			immutable,
 			type_parameters: type_parameters
 				.into_iter()
 				.map(|(_, parameter)| parameter)

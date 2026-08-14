@@ -305,6 +305,8 @@ pub struct RuntimeExecutionSummary {
 	immediate_reads: StableDemandSet,
 	immediate_calls: StableDemandSet,
 	unresolved_calls: Vec<UnresolvedRuntimeCall>,
+	invocation: Option<Box<RuntimeExecutionSummary>>,
+	closures: Vec<RuntimeExecutionSummary>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -331,6 +333,12 @@ impl RuntimeExecutionSummary {
 	}
 	pub fn unresolved_calls(&self) -> &[UnresolvedRuntimeCall] {
 		&self.unresolved_calls
+	}
+	pub fn invocation(&self) -> Option<&RuntimeExecutionSummary> {
+		self.invocation.as_deref()
+	}
+	pub fn closures(&self) -> &[RuntimeExecutionSummary] {
+		&self.closures
 	}
 }
 
@@ -393,6 +401,12 @@ impl LoweredRuntimeDefinition {
 	}
 	pub fn unresolved_calls(&self) -> &[UnresolvedRuntimeCall] {
 		self.execution.unresolved_calls()
+	}
+	pub fn invocation(&self) -> Option<&RuntimeExecutionSummary> {
+		self.execution.invocation()
+	}
+	pub fn execution_summary(&self) -> &RuntimeExecutionSummary {
+		&self.execution
 	}
 	pub fn placement(&self) -> &RuntimeAssemblyPlacement {
 		&self.placement
@@ -2039,7 +2053,16 @@ fn lower_body(
 		direct_demands: RefCell::new(direct_demands),
 		routed_demands: RefCell::new(routed_demands),
 		execution: RefCell::new(execution),
+		deferred_execution: RefCell::new(Vec::new()),
 		deferred_depth: Cell::new(0),
+		capture_root_invocation: !is_function
+			&& body.immutable
+			&& (matches!(stable.root.kind, StableExprKind::Closure { .. })
+				|| body
+					.annotations
+					.anonymous_closures
+					.iter()
+					.any(|(node, _)| *node == stable.root.id)),
 		loop_depth: Cell::new(0),
 		loop_targets: RefCell::new(Vec::new()),
 		next_loop_target: Cell::new(0),
@@ -2260,7 +2283,9 @@ struct StableBodyLowerer<'a, C> {
 	direct_demands: RefCell<&'a mut StableDemandSet>,
 	routed_demands: RefCell<&'a mut StableDemandSet>,
 	execution: RefCell<&'a mut RuntimeExecutionSummary>,
+	deferred_execution: RefCell<Vec<RuntimeExecutionSummary>>,
 	deferred_depth: Cell<u32>,
+	capture_root_invocation: bool,
 	loop_depth: Cell<u32>,
 	loop_targets: RefCell<Vec<(crate::BodyNodeId, u32)>>,
 	next_loop_target: Cell<u32>,
@@ -2390,18 +2415,11 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.map(|(_, target)| target)
 	}
 	fn record_read(&self, target: &DefinitionId) {
-		if self.deferred_depth.get() == 0 {
-			self
-				.execution
-				.borrow_mut()
-				.immediate_reads
-				.insert(target.clone());
+		if let Some(mut execution) = self.active_execution() {
+			execution.immediate_reads.insert(target.clone());
 		}
 	}
 	fn record_call(&self, target: &DefinitionId) -> Result<bool, StableLoweringError> {
-		if self.deferred_depth.get() != 0 {
-			return Ok(false);
-		}
 		let artifact = self.context.runtime_definition(target)?;
 		let callable = match &artifact.payload {
 			crate::RuntimePayload::NymphBody(body) => body.kind != crate::RuntimeBodyKind::Value,
@@ -2417,8 +2435,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		};
 		if callable {
 			self
-				.execution
-				.borrow_mut()
+				.active_execution()
+				.expect("active execution summary")
 				.immediate_calls
 				.insert(target.clone());
 			if matches!(
@@ -2434,9 +2452,26 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		Ok(callable)
 	}
 	fn record_unresolved_call(&self, call: UnresolvedRuntimeCall) {
-		if self.deferred_depth.get() == 0 && !self.execution.borrow().unresolved_calls.contains(&call) {
-			self.execution.borrow_mut().unresolved_calls.push(call);
+		if let Some(mut execution) = self.active_execution()
+			&& !execution.unresolved_calls.contains(&call)
+		{
+			execution.unresolved_calls.push(call);
 		}
+	}
+	fn active_execution(&self) -> Option<std::cell::RefMut<'_, RuntimeExecutionSummary>> {
+		if !self.deferred_execution.borrow().is_empty() {
+			return Some(std::cell::RefMut::map(
+				self.deferred_execution.borrow_mut(),
+				|stack| stack.last_mut().expect("checked non-empty closure stack"),
+			));
+		}
+		if self.deferred_depth.get() == 0 {
+			return Some(std::cell::RefMut::map(
+				self.execution.borrow_mut(),
+				|execution| &mut **execution,
+			));
+		}
+		None
 	}
 	fn lower_deferred<T>(
 		&self,
@@ -2444,8 +2479,22 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 	) -> Result<T, StableLoweringError> {
 		let depth = self.deferred_depth.get();
 		self.deferred_depth.set(depth + 1);
+		self
+			.deferred_execution
+			.borrow_mut()
+			.push(RuntimeExecutionSummary::default());
 		let result = lower();
+		let execution = self
+			.deferred_execution
+			.borrow_mut()
+			.pop()
+			.expect("closure execution summary");
 		self.deferred_depth.set(depth);
+		if depth == 0 && self.capture_root_invocation {
+			self.execution.borrow_mut().invocation = Some(Box::new(execution));
+		} else if let Some(mut parent) = self.active_execution() {
+			parent.closures.push(execution);
+		}
 		result
 	}
 	fn external_marshal(

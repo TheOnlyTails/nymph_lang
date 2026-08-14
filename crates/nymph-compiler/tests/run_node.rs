@@ -1681,15 +1681,67 @@ fn function_mediated_top_level_initializer_self_cycles_are_compile_errors() {
 }
 
 #[test]
-fn unresolved_callable_value_initializer_calls_are_compile_errors() {
-	let src = "let callback = () -> later\nlet result = callback()\nlet later = 5";
+fn immutable_closure_initializer_calls_are_ordered_transitively() {
+	let src = "let callback = () -> later\nfunc apply(callback: () -> int): int = callback()\nlet result = apply(callback)\nlet later = 5";
+	assert_eq!(run(src, "result"), "5");
+}
+
+#[test]
+fn closure_mediated_top_level_initializer_cycles_are_compile_errors() {
+	let src = "let callback = () -> result\nlet result: int = callback()";
 	let result = nymph_compiler::compile(src, "test");
-	let diagnostics = result.expect_err("dynamic initializer call must not produce JavaScript");
+	let diagnostics = result.expect_err("closure-mediated self-cycle must not produce JavaScript");
+	assert!(
+		diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.message.contains("InitializerCycle")),
+		"{diagnostics:?}"
+	);
+}
+
+#[test]
+fn mutable_callable_initializer_calls_remain_compile_errors() {
+	let src = "let mut callback = () -> 5\nlet result = callback()";
+	let result = nymph_compiler::compile(src, "test");
+	let diagnostics = result.expect_err("mutable callable initializer must not produce JavaScript");
 	assert!(
 		diagnostics
 			.iter()
 			.any(|diagnostic| diagnostic.message.contains("UnresolvedInitializerCall")),
 		"{diagnostics:?}"
+	);
+}
+
+#[test]
+fn top_level_initializer_is_evaluated_once_after_closure_ordering() {
+	let src = r#"
+		let callback = () -> later
+		let result = callback()
+		let later = 1
+		func observed(): #(int, int) = #(result, result)
+	"#;
+	let js = compile(src);
+	assert_eq!(js.matches("const result = callback();").count(), 1, "{js}");
+	assert_eq!(
+		run_js(js, "JSON.stringify(nymphTestValue(observed()))"),
+		"[1,1]"
+	);
+}
+
+#[test]
+fn stdlib_sort_initializers_run_through_external_leaf_calls() {
+	let src = r#"
+		let sorted = #[3, 1, 2].sort()
+		let descending = #[1, 3, 2].sort_by((left, right) ->
+			if (left > right) { Order.LessThan }
+			else if (left < right) { Order.GreaterThan }
+			else { Order.Equal }
+		)
+		func observed(): #(#[int], #[int]) = #(sorted, descending)
+	"#;
+	assert_eq!(
+		run(src, "JSON.stringify(nymphTestValue(observed()))"),
+		"[[1,2,3],[3,2,1]]"
 	);
 }
 
