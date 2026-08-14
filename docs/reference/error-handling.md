@@ -174,6 +174,35 @@ func wrap_err(r: Result<int, int>): Result<int, Fail> =
 func value_or(r: Result<int, string>): int = r ?? -1
 ```
 
+## Optional chaining
+
+`?.` maps a field access, method call, or index operation over the value inside an
+`Option` or the `Ok` value inside a `Result`:
+
+```nym
+struct User(name: string, tags: #[string]) {
+  func greeting(prefix: string): string = "${prefix}, ${this.name}"
+}
+
+func name(user: Option<User>): Option<string> = user?.name
+func greeting(user: Option<User>): Option<string> = user?.greeting("Hello")
+func first_tag(user: Option<User>): Option<string> = user?.tags?.[0]
+func result_name(user: Result<User, string>): Result<string, string> = user?.name
+```
+
+These are mapping operations: `user?.name` is equivalent to
+`user.map((value) -> value.name)`. `None` remains `None`, and `Error(error)` preserves
+the same error. The receiver is evaluated once; method arguments and index expressions
+are evaluated only for `Some` or `Ok`, because they are part of the mapped operation.
+
+Mapping does not flatten. If `user?.field` accesses a field of type `Option<T>`, its
+type is `Option<Option<T>>` (and similarly for nested `Result` values). Use `flatten`
+or `and_then` when flattening is intended.
+
+Optional chaining is specific to Nymph's canonical `Option` and `Result` types. It is
+not JavaScript null/undefined chaining, and applying it to another receiver type is a
+type error.
+
 ## Converting between them
 
 A `Result` drops its error side with `.ok()` (keeping the success as an `Option`) or

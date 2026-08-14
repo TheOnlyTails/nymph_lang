@@ -1823,6 +1823,14 @@ fn required_type_nodes(
 			{
 				required.insert(expression.id);
 			}
+			ExprKind::MemberAccess {
+				parent,
+				optional: true,
+				..
+			} => {
+				required.insert(parent.id);
+				required.insert(expression.id);
+			}
 			ExprKind::MemberAccess { .. }
 				if checked
 					.annotations
@@ -1832,8 +1840,22 @@ fn required_type_nodes(
 			{
 				required.insert(expression.id);
 			}
+			ExprKind::Call { func, .. }
+				if matches!(func.kind, ExprKind::MemberAccess { optional: true, .. }) =>
+			{
+				if let ExprKind::MemberAccess { parent, .. } = &func.kind {
+					required.insert(parent.id);
+				}
+				required.insert(expression.id);
+			}
 			ExprKind::IndexAccess { parent, .. } => {
 				required.insert(parent.id);
+				if matches!(
+					expression.kind,
+					ExprKind::IndexAccess { optional: true, .. }
+				) {
+					required.insert(expression.id);
+				}
 			}
 			ExprKind::BinaryOp { lhs, op, .. } => {
 				if matches!(op, BinaryOperator::Equals | BinaryOperator::NotEquals) {

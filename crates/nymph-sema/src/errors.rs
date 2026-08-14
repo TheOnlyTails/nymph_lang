@@ -107,6 +107,10 @@ pub enum TypeError {
 		member: EcoString,
 		ty: String,
 	},
+	/// Optional chaining was used on a value other than canonical `Option`/`Result`.
+	OptionalChainReceiver {
+		ty: String,
+	},
 	/// A namespaced function was called through a type parameter that lacks it.
 	NoNamespacedFnOnParam {
 		name: EcoString,
@@ -551,6 +555,10 @@ impl IntoDiagnostic for TypeError {
 			}
 			E::NoMethod { method, ty } => format!("no method `{method}` found for `{ty}`").into(),
 			E::CannotAccess { member, ty } => format!("cannot access `{member}` on `{ty}`").into(),
+			E::OptionalChainReceiver { ty } => format!(
+				"optional chaining requires canonical `Option` or `Result`, found `{ty}`"
+			)
+			.into(),
 			E::NoNamespacedFnOnParam { name } => {
 				format!("no namespaced function `{name}` found on this type parameter").into()
 			}

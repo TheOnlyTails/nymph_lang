@@ -275,13 +275,16 @@ fn ambient_runtime_role_inventory(
 				_ => None,
 			});
 		let (generics, variants) = enums.next()?;
-		if enums.next().is_some() || generics.len() != 2 {
+		if enums.next().is_some() {
 			return None;
 		}
+		let [ok_generic, error_generic] = generics.as_slice() else {
+			return None;
+		};
 		let variant = |name: &str, field: &str, generic: &str| {
-			let mut found = variants.iter().filter(|variant| variant.0.name.0 == name);
-			let shape = found.next()?;
-			if found.next().is_some()
+			let mut matches = variants.iter().filter(|variant| variant.0.name.0 == name);
+			let shape = matches.next()?;
+			if matches.next().is_some()
 				|| shape.0.fields.len() != 1
 				|| shape.0.fields[0].0.name.0 != field
 				|| !matches!(
@@ -292,8 +295,8 @@ fn ambient_runtime_role_inventory(
 			}
 			Some(())
 		};
-		variant("Ok", "value", &generics[0].0.name.0)?;
-		variant("Error", "error", &generics[1].0.name.0)?;
+		variant("Ok", "value", &ok_generic.0.name.0)?;
+		variant("Error", "error", &error_generic.0.name.0)?;
 		let ok = DefinitionId::new(
 			identity.clone(),
 			DeclarationKey::member(owner.clone(), Category::Variant, "Ok"),

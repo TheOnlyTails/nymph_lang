@@ -2533,6 +2533,155 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		);
 		Ok(substitute_type_parameters(&ty, self.type_substitutions))
 	}
+
+	fn optional_chain_payload_type(
+		&self,
+		parent: &StableExpr,
+	) -> Result<InterfaceType, StableLoweringError> {
+		match peel_mut(&self.ty(parent)?) {
+			InterfaceType::Named {
+				definition,
+				positional,
+				..
+			} if self
+				.annotations
+				.option
+				.as_ref()
+				.is_some_and(|role| &role.option == definition)
+				|| self
+					.annotations
+					.result
+					.as_ref()
+					.is_some_and(|role| &role.result == definition) =>
+			{
+				positional.first().cloned().ok_or_else(|| {
+					invalid(
+						&self.artifact.definition,
+						"optional chain has no payload type",
+					)
+				})
+			}
+			_ => Err(invalid(
+				&self.artifact.definition,
+				"optional chain receiver lost its canonical container type",
+			)),
+		}
+	}
+
+	fn lower_optional_chain(
+		&self,
+		expr: &StableExpr,
+		parent: &StableExpr,
+		mapped: impl FnOnce(&Self, HirExpr) -> Result<HirExpr, StableLoweringError>,
+	) -> Result<HirExpr, StableLoweringError> {
+		let parent_type = self.ty(parent)?;
+		let definition = match peel_mut(&parent_type) {
+			InterfaceType::Named { definition, .. } => definition,
+			_ => {
+				return Err(invalid(
+					&self.artifact.definition,
+					"optional chain receiver is not nominal",
+				));
+			}
+		};
+		let (enum_definition, success, success_field, failure, failure_field) = if let Some(role) = self
+			.annotations
+			.option
+			.as_ref()
+			.filter(|role| &role.option == definition)
+		{
+			(&role.option, &role.some, &role.some_value, &role.none, None)
+		} else if let Some(role) = self
+			.annotations
+			.result
+			.as_ref()
+			.filter(|role| &role.result == definition)
+		{
+			(
+				&role.result,
+				&role.ok,
+				&role.ok_value,
+				&role.error,
+				Some(&role.error_value),
+			)
+		} else {
+			return Err(invalid(
+				&self.artifact.definition,
+				"optional chain has no canonical runtime role",
+			));
+		};
+		self.demand_external(enum_definition)?;
+		let enum_name: EcoString = self.context.binding_name(enum_definition)?.as_str().into();
+		let success_name: EcoString = self.context.member_name(success)?.as_str().into();
+		let success_field_name: EcoString = self.context.member_name(success_field)?.as_str().into();
+		let failure_name: EcoString = self.context.member_name(failure)?.as_str().into();
+		let payload = self.declare(&"$optional_value".into());
+		let mapped = mapped(self, HirExpr::Local(payload.clone()))?;
+		let prototype = self.construction_prototype(expr)?;
+		let success_body = HirExpr::VariantNew {
+			enum_name: enum_name.clone(),
+			variant: success_name.clone(),
+			fields: vec![(success_field_name.clone(), mapped)],
+			prototype: prototype.clone(),
+		};
+		let (failure_pattern_fields, failure_body) = if let Some(failure_field) = failure_field {
+			let field_name: EcoString = self.context.member_name(failure_field)?.as_str().into();
+			let error = self.declare(&"$optional_error".into());
+			(
+				vec![(
+					field_name.clone(),
+					HirPat::Binding {
+						name: error.clone(),
+						sub: None,
+					},
+				)],
+				HirExpr::VariantNew {
+					enum_name: enum_name.clone(),
+					variant: failure_name.clone(),
+					fields: vec![(field_name, HirExpr::Local(error))],
+					prototype: prototype.clone(),
+				},
+			)
+		} else {
+			(
+				vec![],
+				HirExpr::VariantRef {
+					enum_name: enum_name.clone(),
+					variant: failure_name.clone(),
+					prototype: prototype.clone(),
+				},
+			)
+		};
+		Ok(HirExpr::Match {
+			scrutinee: Box::new(self.lower(parent)?),
+			arms: vec![
+				HirArm {
+					pat: HirPat::Variant {
+						enum_name: enum_name.clone(),
+						variant: success_name,
+						fields: vec![(
+							success_field_name,
+							HirPat::Binding {
+								name: payload,
+								sub: None,
+							},
+						)],
+					},
+					guard: None,
+					body: success_body,
+				},
+				HirArm {
+					pat: HirPat::Variant {
+						enum_name: enum_name.clone(),
+						variant: failure_name.clone(),
+						fields: failure_pattern_fields,
+					},
+					guard: None,
+					body: failure_body,
+				},
+			],
+		})
+	}
 	/// Whether this checked expression cannot complete normally. An anonymous
 	/// closure annotation turns the underlying expression into a callable value,
 	/// so its body's `never` type must not erase an enclosing operation.
@@ -3032,7 +3181,24 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			StableExprKind::MemberAccess {
 				parent,
 				member,
-				optional: _,
+				optional: true,
+			} => {
+				let name = if let Some(target) = self.target(expr) {
+					self.context.member_name(target)?.as_str().into()
+				} else {
+					member.clone()
+				};
+				return self.lower_optional_chain(expr, parent, |_, payload| {
+					Ok(HirExpr::Field {
+						recv: Box::new(payload),
+						name,
+					})
+				});
+			}
+			StableExprKind::MemberAccess {
+				parent,
+				member,
+				optional: false,
 			} => {
 				if self.definitely_transfers(parent) {
 					return self.lower(parent);
@@ -3154,6 +3320,23 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				}
 			}
 			StableExprKind::Call { func, args } => {
+				if let StableExprKind::MemberAccess {
+					parent,
+					optional: true,
+					..
+				} = &func.kind
+				{
+					let dispatch = self.dispatch(expr)?.clone();
+					return self.lower_optional_chain(expr, parent, |lowerer, payload| {
+						let mut operation = lowerer.lower_dispatch(
+							&dispatch,
+							parent,
+							args.iter().map(|argument| &argument.value).collect(),
+						)?;
+						Self::replace_dispatch_receiver(&mut operation, payload);
+						Ok(operation)
+					});
+				}
 				if self.definitely_transfers(func) {
 					return self.lower(func);
 				}
@@ -3645,6 +3828,31 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.map(|(_, target)| *target)
 					.ok_or_else(|| self.unsupported(expr, "continue outside a loop"))?,
 			},
+			StableExprKind::IndexAccess {
+				parent,
+				index,
+				optional: true,
+			} => {
+				let payload_type = self.optional_chain_payload_type(parent)?;
+				return self.lower_optional_chain(expr, parent, |lowerer, payload| {
+					Ok(match peel_mut(&payload_type) {
+						InterfaceType::Map(..) => HirExpr::MapGet {
+							recv: Box::new(payload),
+							key: Box::new(lowerer.lower(index)?),
+						},
+						InterfaceType::List(_) | InterfaceType::Tuple(_) => HirExpr::Index {
+							recv: Box::new(payload),
+							index: Box::new(lowerer.lower(index)?),
+						},
+						_ => {
+							let mut operation =
+								lowerer.lower_dispatch(lowerer.dispatch(expr)?, parent, vec![index])?;
+							Self::replace_dispatch_receiver(&mut operation, payload);
+							operation
+						}
+					})
+				});
+			}
 			StableExprKind::IndexAccess { parent, index, .. } if self.definitely_transfers(parent) => {
 				self.lower(parent)?
 			}
