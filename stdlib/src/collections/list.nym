@@ -1,5 +1,5 @@
 import @/option with (Option)
-import @/ops with (Plus, Comparable, Contains, Equals, Order)
+import @/ops with (Plus, Comparable, Contains, Equals, Into, Order)
 
 impl<T> mut #[T] {
   external(length) func length(): uint
@@ -50,6 +50,18 @@ impl<T> #[T] {
   /// Returns a new list with only the first `n` elements.
   external(take) func take(n: uint): #[T]
 
+  /// Returns whether any element satisfies `predicate`, stopping at the first match.
+  func any(predicate: (T) -> boolean): boolean = {
+    let mut i = 0u
+    while (i < this.length()) {
+      if (predicate(this[i])) {
+        return true
+      }
+      i = i + 1u
+    }
+    false
+  }
+
   /// Returns a new list stably ordered by `compare`; the source is unchanged.
   func sort_by(compare: (T, T) -> Order): #[T] = {
     let mut result = this.slice(0u, this.length())
@@ -63,6 +75,24 @@ impl<T> #[T] {
         j = j - 1
       }
       i = i + 1
+    }
+    result
+  }
+}
+
+impl<T: Into<Other = string>> #[T] {
+  /// Converts each element to a string and joins them with `separator`.
+  func join(separator: string): string = {
+    let mut result = ""
+    let mut i = 0u
+    while (i < this.length()) {
+      if (i > 0u) {
+        result = result + separator
+      }
+      // `Into<string>`'s standard blanket implementation delegates to the same
+      // `Display` conversion used by interpolation.
+      result = result + "${this[i]}"
+      i = i + 1u
     }
     result
   }

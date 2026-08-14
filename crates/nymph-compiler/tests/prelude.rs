@@ -295,6 +295,106 @@ fn ambient_iterator_default_adapter_chain_and_terminals_body() {
 }
 
 #[test]
+fn iterator_sorted_by_is_lazy_and_materializes_exactly_once() {
+	with_compiler_stack(iterator_sorted_by_is_lazy_and_materializes_exactly_once_body);
+}
+
+fn iterator_sorted_by_is_lazy_and_materializes_exactly_once_body() {
+	let source = r#"
+		struct Observed(values: #[int], index: uint, pulled: mut #[int]) {
+			impl Iterator<int> {
+				mut func next(): Option<int> = match (this.values.get(this.index)) {
+					Some(value) -> {
+						this.index = this.index + 1u
+						this.pulled.push(value)
+						Some(value = value)
+					},
+					None -> None,
+				}
+			}
+		}
+
+		func observations(): #(uint, uint, uint, int, int) = {
+			let mut pulled: #[int] = #[]
+			let mut sorted = Observed(values = #[3, 1, 2], index = 0u, pulled = pulled)
+				.sorted_by((left, right) -> left.compare_to(right))
+			let before = pulled.length()
+			let first = sorted.next().unwrap(-1)
+			let after_first = pulled.length()
+			let second = sorted.next().unwrap(-1)
+			#(before, after_first, pulled.length(), first, second)
+		}
+	"#;
+	assert_eq!(
+		run(source, "observations().v.map(value => value.v).join(',')"),
+		"0,3,3,1,2"
+	);
+}
+
+#[test]
+fn iterator_sorted_by_supports_descending_keys_and_is_stable() {
+	with_compiler_stack(iterator_sorted_by_supports_descending_keys_and_is_stable_body);
+}
+
+fn iterator_sorted_by_supports_descending_keys_and_is_stable_body() {
+	let source = r#"
+		struct Item(key: int, sequence: int)
+		func values(): #[Item] = #[
+			Item(key = 2, sequence = 0),
+			Item(key = 1, sequence = 1),
+			Item(key = 2, sequence = 2),
+			Item(key = 3, sequence = 3),
+			Item(key = 2, sequence = 4),
+		]
+			.iter()
+			.map((item) -> item)
+			.sorted_by((left, right) -> right.key.compare_to(left.key))
+			.to_list()
+	"#;
+	assert_eq!(
+		run(source, "values().v.map(item => item.sequence.v).join(',')"),
+		"3,0,2,4,1"
+	);
+}
+
+#[test]
+fn iterator_sorted_by_sorts_only_the_remaining_source() {
+	with_compiler_stack(iterator_sorted_by_sorts_only_the_remaining_source_body);
+}
+
+fn iterator_sorted_by_sorts_only_the_remaining_source_body() {
+	let source = r#"
+		func values(): #[int] = {
+			let mut source = #[9, 3, 1, 2].iter()
+			let skipped = source.next()
+			source.sorted_by((left, right) -> left.compare_to(right)).to_list()
+		}
+	"#;
+	assert_eq!(run(source, "values().v.map(x => x.v).join(',')"), "1,2,3");
+}
+
+#[test]
+fn iterator_sorted_by_handles_empty_and_single_sources() {
+	with_compiler_stack(iterator_sorted_by_handles_empty_and_single_sources_body);
+}
+
+fn iterator_sorted_by_handles_empty_and_single_sources_body() {
+	let source = r#"
+		func empty(): #[int] =
+			#[].iter().sorted_by((left: int, right: int) -> left.compare_to(right)).to_list()
+		func single(): #[int] =
+			#[7].iter().sorted_by((left, right) -> left.compare_to(right)).to_list()
+	"#;
+	assert_eq!(
+		run(
+			source,
+			"empty().v.length + '|' + single().v.map(x => x.v).join(',')"
+		),
+		"0|7"
+	);
+}
+
+#[test]
 fn materialized_self_equality_substitutes_primitive_and_nominal_receivers() {
 	let source = "interface IdentityDefault { func same(other: self): boolean = this == other }\n\
 		struct Box(value: int)\n\
@@ -437,5 +537,47 @@ fn list_sort_by_preserves_source_and_equal_element_order() {
 			"values().v.map(xs => xs.v.map(item => item.sequence.v).join(',')).join('|')"
 		),
 		"0,1,2|1,0,2"
+	);
+}
+
+#[test]
+fn list_any_short_circuits_in_source_order() {
+	let source = r#"
+		func observations(): #(boolean, #[int]) = {
+			let mut visited: #[int] = #[]
+			let found = #[1, 2, 3, 4].any((value) -> {
+				visited.push(value)
+				value == 3
+			})
+			#(found, visited.slice(0u, visited.length()))
+		}
+	"#;
+	assert_eq!(
+		run(
+			source,
+			"observations().v[0].v + '|' + observations().v[1].v.map(x => x.v).join(',')"
+		),
+		"true|1,2,3"
+	);
+}
+
+#[test]
+fn list_join_converts_in_order_and_places_separators_between_elements() {
+	let source = r#"
+		struct Label(value: int) {
+			impl Display {
+				func display(): string = "item=${this.value}"
+			}
+		}
+		func joined(): string = #[Label(value = 2), Label(value = 1), Label(value = 3)].join(" / ")
+		func empty(): string = {
+			let labels: #[Label] = #[]
+			labels.join(",")
+		}
+		func single(): string = #[Label(value = 7)].join("unused")
+	"#;
+	assert_eq!(
+		run(source, "joined().v + '|' + empty().v + '|' + single().v"),
+		"item=2 / item=1 / item=3||item=7"
 	);
 }

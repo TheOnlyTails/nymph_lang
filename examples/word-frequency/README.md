@@ -8,14 +8,16 @@ built by chaining adapters on an iterator.
 ```nym
 let top = counts
   .entries()
-  .sorted_by((a, b) -> b[1] - a[1])
-  .take(5)
+  .iter()
+  .sorted_by((a, b) -> b[1].compare_to(a[1]))
+  .take(5u)
 ```
 
-`entries()` gives an iterator of `#(word, count)` tuples; `sorted_by` orders them by
-count descending; `take(5)` keeps the first five. Because the pipeline is lazy,
-these stages compose without materializing an intermediate list at each step —
-nothing is computed until the `for` loop consumes `top`.
+`entries()` gives a list of `#(word, count)` tuples; `iter()` turns it into an
+iterator; `sorted_by` orders the remaining entries by count descending; `take(5u)`
+keeps the first five. Building the pipeline does no iteration. On the first pull,
+`sorted_by` materializes and stably sorts its remaining source once, then yields
+from that buffer.
 
 Also on display:
 
@@ -28,6 +30,5 @@ Also on display:
 **Status:** 🚧 In flight.
 - The word-tallying loop (map + `Option` default) works today.
 - `read_file` needs `std/fs` (not implemented yet).
-- The `entries().sorted_by(...).take(...)` chain needs the lazy `Iterator` adapters
-  (`map`/`filter`/`sorted_by`/`take` defined once on `Iterator`) — the current focus
-  of standard-library work.
+- The `entries().iter().sorted_by(...).take(...)` iterator chain is implemented.
+  The missing `std/fs` module still prevents the complete example from running.

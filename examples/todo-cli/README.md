@@ -11,7 +11,8 @@ The focus here is the shape of a real CLI:
 - **List patterns** — `#["add", ...words]` peels the subcommand off the front and
   binds the remainder; `#[other, ...]` catches anything unrecognized.
 - **State behind methods** — `Store` holds a `mut #[Task]`; `add`/`complete` are
-  `mut func`s that update it. `complete` rebuilds the list functionally with `map`.
+  `mut func`s that update it. `complete` rebuilds the list through lazy
+  `iter().map(...)`, then collects it with `to_list()`.
 - **Nested positional patterns** — `main` matches both levels at once:
   `Ok(Add(title))` matches the `Result`'s `Ok` and, positionally, its sole payload
   against the `Command` variant. A single-field constructor accepts an un-named
@@ -29,8 +30,8 @@ todo done 1
 **Status:** 🚧 Aspirational.
 - `args()` needs `std/os`; `id.to_int()` needs a string→int parse on the stdlib
   string type — neither exists yet.
-- The `.any(...)` / `.map(...)` / `.join(...)` list methods depend on the iterator
-  adapters currently being built.
+- Direct list `.any(...)` and `.join(...)` are implemented; transformations use
+  `.iter().map(...).to_list()` because lists do not have an eager `.map(...)`.
 - As written, state lives only for one invocation. A real version would persist the
   task list to a file (see [`word-frequency`](../word-frequency) for `std/fs`, and a
   future `std/json` for serialization).

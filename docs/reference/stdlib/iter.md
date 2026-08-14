@@ -27,6 +27,17 @@ See [Ranges](../iteration#ranges) for endpoint and direction rules.
 ```nymph
 public interface Iterator<Item> {
   mut func next(): Option<Item>
+
+  func map<R>(f: (Item) -> R): Mapped<Item, R, self>
+  func filter(predicate: (Item) -> boolean): Filtered<Item, self>
+  func take(n: uint): Take<Item, self>
+  func drop(n: uint): Drop<Item, self>
+  func sorted_by(compare: (Item, Item) -> Order): SortedBy<Item, self>
+
+  mut func for_each(f: (Item) -> void): void
+  mut func fold<Acc>(initial: Acc, combine: (Acc, Item) -> Acc): Acc
+  mut func to_list(): #[Item]
+  mut func count(): uint
 }
 ```
 
@@ -35,6 +46,13 @@ iterator's own position, not necessarily a mutation of the collection it travers
 directly as a `for` source must therefore be `let mut`. A `for` loop over a type implementing
 `Iterator<Item>` calls `next()` until it returns `None`, binding each `Some`'s payload to the loop
 pattern in turn. See [Iterators](../iteration#iterators) for a full worked implementation.
+
+`map`, `filter`, `take`, and `drop` are lazy adapters. The terminal methods `for_each`, `fold`,
+`to_list`, and `count` consume the iterator's remaining items. `sorted_by` is also lazy to call:
+its first `next()` materializes the remaining source, performs a stable sort with an
+`(Item, Item) -> Order` comparator, and then yields from that sorted buffer. Equal elements retain
+their source order. If the source was partially consumed before `sorted_by` was created, only its
+remaining items are sorted.
 
 ## `Iterable`
 

@@ -18,13 +18,14 @@ func main() = {
     }
   }
 
-  // Rank the entries by count (descending) and keep the top five. This is a lazy
-  // iterator pipeline: `sorted_by` and `take` compose without building throwaway
-  // intermediate lists — nothing runs until the `for` loop pulls values out.
+  // Rank the entries by count (descending) and keep the top five. Constructing
+  // the iterator pipeline does no work; `sorted_by` materializes and stably sorts
+  // the remaining entries on the first pull, and `take` limits the output.
   let top = counts
     .entries()
-    .sorted_by((a, b) -> b[1] - a[1])
-    .take(5)
+    .iter()
+    .sorted_by((a, b) -> b[1].compare_to(a[1]))
+    .take(5u)
 
   println("most common words:")
   for (#(word, count) in top) {

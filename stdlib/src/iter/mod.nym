@@ -1,5 +1,6 @@
 import @/option with (Option)
 import @/collections/list
+import @/ops with (Order)
 
 /// The iterator surface: `next` advances the iterator, so it is a `mut func`
 /// (producing the next value mutates the iterator's own state).
@@ -23,6 +24,11 @@ public interface Iterator<Item> {
 
   /// Lazily skip the first `n` items, then yield the rest.
   func drop(n: uint): Drop<Item, self> = Drop(source = this, remaining = n)
+
+  /// Lazily return the remaining items in the stable order defined by `compare`.
+  /// The source is materialized and sorted only when the result is first consumed.
+  func sorted_by(compare: (Item, Item) -> Order): SortedBy<Item, self> =
+    SortedBy(source = this, compare = compare, items = #[], index = 0u, initialized = false)
 
   /// Run `f` for its side effect on every remaining item, draining the iterator.
   mut func for_each(f: (Item) -> void): void = {
@@ -115,6 +121,37 @@ struct Drop<Item, S: Iterator<Item>>(source: S, remaining: uint) {
         this.source.next()
       }
       this.source.next()
+    }
+  }
+}
+
+/// The lazy adapter behind [`Iterator::sorted_by`]. The first call to `next`
+/// drains and stably sorts the remaining source exactly once; later calls walk
+/// the materialized buffer.
+struct SortedBy<Item, S: Iterator<Item>>(
+  source: S,
+  compare: (Item, Item) -> Order,
+  items: #[Item],
+  index: uint,
+  initialized: boolean,
+) {
+  impl Iterator<Item> {
+    mut func next(): Option<Item> = {
+      if (!this.initialized) {
+        let compare = this.compare
+        for (item in this.source) {
+          this.items.push(item)
+        }
+        this.items = this.items.sort_by(compare)
+        this.initialized = true
+      }
+
+      let current = this.items.get(this.index)
+      this.index = this.index + 1u
+      match (current) {
+        Some(value) -> Option.Some(value = value),
+        None -> Option.None,
+      }
     }
   }
 }
