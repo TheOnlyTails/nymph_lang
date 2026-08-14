@@ -75,11 +75,13 @@ pub(crate) struct ResolvedTarget {
 	pub intent: TargetIntent,
 }
 
+type SourceLoader = dyn Fn(&str) -> Option<String>;
+
 /// Shared target, source loader, compiler dispatch, and diagnostic context for
 /// a single `build`, `check`, or `run` operation.
 pub(crate) struct ProjectOperation {
 	target: ResolvedTarget,
-	load: Box<dyn Fn(&str) -> Option<String>>,
+	load: Box<SourceLoader>,
 }
 
 impl ProjectOperation {
