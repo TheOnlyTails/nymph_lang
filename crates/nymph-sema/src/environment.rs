@@ -35,6 +35,7 @@ pub struct CompilerRuntimeRoles {
 	pub iterable: Option<InterfaceRuntimeRole>,
 	pub iterator: Option<InterfaceRuntimeRole>,
 	pub option: Option<OptionRuntimeRole>,
+	pub result: Option<ResultRuntimeRole>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +52,15 @@ pub struct OptionRuntimeRole {
 	pub none: DefinitionId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ResultRuntimeRole {
+	pub result: DefinitionId,
+	pub ok: DefinitionId,
+	pub ok_value: DefinitionId,
+	pub error: DefinitionId,
+	pub error_value: DefinitionId,
+}
+
 /// Records why protocol roles are present or absent. In particular, an explicitly
 /// empty compiler inventory must not be mistaken for a direct semantic-check fixture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +74,7 @@ pub(crate) struct LocalCompilerRuntimeRoles {
 	pub iterable: Option<(DefId, DefinitionId)>,
 	pub iterator: Option<(DefId, DefinitionId)>,
 	pub option: Option<DefId>,
+	pub result: Option<DefId>,
 }
 
 #[derive(Debug, Default, Clone)]

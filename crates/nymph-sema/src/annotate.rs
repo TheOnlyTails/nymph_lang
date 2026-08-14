@@ -287,6 +287,13 @@ pub struct Annotations {
 	/// share a source node (notably a callable and its directly labeled body).
 	/// Lowering must never repeat name lookup.
 	control_targets: FxHashMap<NodeId, ResolvedControlTarget>,
+	propagations: FxHashMap<NodeId, PropagationKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PropagationKind {
+	Option,
+	Result,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,6 +354,13 @@ impl Annotations {
 			.control_targets
 			.iter()
 			.map(|(&jump, &target)| (jump, target))
+	}
+	pub(crate) fn record_propagation(&mut self, node: NodeId, kind: PropagationKind) {
+		self.propagations.insert(node, kind);
+	}
+
+	pub(crate) fn propagations(&self) -> impl Iterator<Item = (NodeId, PropagationKind)> + '_ {
+		self.propagations.iter().map(|(&node, &kind)| (node, kind))
 	}
 	pub fn record_unresolved_qualified_access(
 		&mut self,

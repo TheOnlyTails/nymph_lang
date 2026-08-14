@@ -259,12 +259,70 @@ fn ambient_runtime_role_inventory(
 			),
 		})
 	})();
+	let result = (|| {
+		let owner = exact_top("Result", Category::Enum)?;
+		let mut enums = parsed
+			.tree
+			.members
+			.iter()
+			.filter_map(|declaration| match declaration {
+				Declaration::Enum {
+					name,
+					generics,
+					variants,
+					..
+				} if name.0 == "Result" => Some((generics, variants)),
+				_ => None,
+			});
+		let (generics, variants) = enums.next()?;
+		if enums.next().is_some() || generics.len() != 2 {
+			return None;
+		}
+		let variant = |name: &str, field: &str, generic: &str| {
+			let mut found = variants.iter().filter(|variant| variant.0.name.0 == name);
+			let shape = found.next()?;
+			if found.next().is_some()
+				|| shape.0.fields.len() != 1
+				|| shape.0.fields[0].0.name.0 != field
+				|| !matches!(
+					&shape.0.fields[0].0.type_.0,
+					Type::Reference { name, generics } if name.0 == generic && generics.is_empty()
+				) {
+				return None;
+			}
+			Some(())
+		};
+		variant("Ok", "value", &generics[0].0.name.0)?;
+		variant("Error", "error", &generics[1].0.name.0)?;
+		let ok = DefinitionId::new(
+			identity.clone(),
+			DeclarationKey::member(owner.clone(), Category::Variant, "Ok"),
+		);
+		let error = DefinitionId::new(
+			identity.clone(),
+			DeclarationKey::member(owner.clone(), Category::Variant, "Error"),
+		);
+		Some(nymph_sema::ResultRuntimeRole {
+			result: owner,
+			ok_value: DefinitionId::new(
+				identity.clone(),
+				DeclarationKey::member(ok.clone(), Category::Field, "value"),
+			),
+			ok,
+			error_value: DefinitionId::new(
+				identity.clone(),
+				DeclarationKey::member(error.clone(), Category::Field, "error"),
+			),
+			error,
+		})
+	})();
 	Arc::new(nymph_sema::CompilerRuntimeRoles {
 		display: interface("Display", "display"),
 		debug: interface("Debug", "debug"),
 		iterable: interface("Iterable", "iter"),
 		iterator: interface("Iterator", "next"),
 		option,
+		result,
 	})
 }
 
@@ -287,12 +345,15 @@ pub(crate) fn compiler_runtime_roles(
 		};
 	let option =
 		module("option").and_then(|module| ambient_runtime_role_inventory(db, module).option.clone());
+	let result =
+		module("result").and_then(|module| ambient_runtime_role_inventory(db, module).result.clone());
 	Arc::new(nymph_sema::CompilerRuntimeRoles {
 		display: interface("ops", |roles| &roles.display),
 		debug: interface("ops", |roles| &roles.debug),
 		iterable: interface("iter/iterable", |roles| &roles.iterable),
 		iterator: interface("iter", |roles| &roles.iterator),
 		option,
+		result,
 	})
 }
 

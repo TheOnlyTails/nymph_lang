@@ -218,7 +218,7 @@ impl<'m> Checker<'m> {
 				.rev()
 				.find(|target| {
 					allowed.contains(&target.kind)
-						&& (keyword != "return" || target.kind == ControlLabelKind::Callable)
+						&& (!matches!(keyword, "return" | "?") || target.kind == ControlLabelKind::Callable)
 				})
 				.cloned()
 		};
@@ -939,10 +939,79 @@ impl<'m> Checker<'m> {
 				// recording logic.
 				self.infer_prefix(*op, value, span).0
 			}
-			ExprKind::PostfixOp { value, .. } => {
-				// `?` error propagation — Milestone B; unwrap best-effort.
-				self.infer(value);
-				self.fresh()
+			ExprKind::PostfixOp { value, label, .. } => {
+				let operand = self.infer(value);
+				let operand = self.strip_mut(operand);
+				let target = self.resolve_control(
+					expr,
+					label.as_ref(),
+					"?",
+					&[ControlLabelKind::Block, ControlLabelKind::Callable],
+				);
+				if target.is_none() && label.is_none() {
+					self.emit(expr.span, TypeError::QuestionOutsideCallable);
+				}
+				let target_ty = target.and_then(|target| target.result_ty).or(self.ret_ty);
+				let TyKind::Adt(definition, arguments) = self.interner.kind(operand).clone() else {
+					if !matches!(self.interner.kind(operand), TyKind::Error | TyKind::Never) {
+						let found = self.display(operand);
+						self.emit(expr.span, TypeError::QuestionOperand { found });
+					}
+					return self.interner.error();
+				};
+				let (kind, value_ty, expected_target) = if Some(definition) == self.runtime_roles.option
+					&& arguments.positional.len() == 1
+				{
+					let success = self.fresh();
+					let target = self
+						.interner
+						.mk_adt(definition, GenericArgs::new(vec![success], Vec::new()));
+					(
+						crate::annotate::PropagationKind::Option,
+						arguments.positional[0],
+						target,
+					)
+				} else if Some(definition) == self.runtime_roles.result && arguments.positional.len() == 2 {
+					let success = self.fresh();
+					let target = self.interner.mk_adt(
+						definition,
+						GenericArgs::new(vec![success, arguments.positional[1]], Vec::new()),
+					);
+					(
+						crate::annotate::PropagationKind::Result,
+						arguments.positional[0],
+						target,
+					)
+				} else {
+					let found = self.display(operand);
+					self.emit(expr.span, TypeError::QuestionOperand { found });
+					return self.interner.error();
+				};
+				if let Some(target_ty) = target_ty {
+					let resolved = self.strip_mut(target_ty);
+					let family_matches = match (kind, self.interner.kind(resolved)) {
+						(_, TyKind::Infer(_)) | (_, TyKind::Error) => true,
+						(crate::annotate::PropagationKind::Option, TyKind::Adt(def, _)) => {
+							Some(*def) == self.runtime_roles.option
+						}
+						(crate::annotate::PropagationKind::Result, TyKind::Adt(def, _)) => {
+							Some(*def) == self.runtime_roles.result
+						}
+						_ => false,
+					};
+					if family_matches {
+						self.unify(expected_target, target_ty, expr.span);
+					} else {
+						let found = self.display(target_ty);
+						let family = match kind {
+							crate::annotate::PropagationKind::Option => "Option",
+							crate::annotate::PropagationKind::Result => "Result",
+						};
+						self.emit(expr.span, TypeError::QuestionTarget { family, found });
+					}
+				}
+				self.annotations.record_propagation(expr.id, kind);
+				value_ty
 			}
 			ExprKind::BinaryOp { lhs, op, rhs } => {
 				// Unreachable in practice: `infer` (the sole caller of `infer_kind`)

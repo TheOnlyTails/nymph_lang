@@ -3884,6 +3884,45 @@ func direct_body(flag: boolean): int = result@{
 }
 
 #[test]
+fn question_propagation_executes_for_option_result_and_labeled_blocks() {
+	let src = r#"struct Counter(calls: int) {}
+impl Counter {
+  mut func option(present: boolean): Option<int> = {
+    this.calls = this.calls + 1
+    if (present) Some(4) else None
+  }
+}
+func option(present: boolean): Option<string> = {
+  let mut counter = Counter(calls = 0)
+  let value = counter.option(present)?
+  Some("${value}:${counter.calls}")
+}
+func result(ok: boolean): Result<string, int> = {
+  let value = (if (ok) Ok(5) else Error(9))?
+  Ok("${value}")
+}
+func labeled(present: boolean): Option<string> = target@{
+  let value = (if (present) Some(6) else None)?@target
+  Some("${value}")
+}
+func nearest(present: boolean): int = {
+  let inner: () -> Option<string> = () -> {
+    let value = (if (present) Some(7) else None)?
+    Some("${value}")
+  }
+  inner()
+  8
+}"#;
+	assert_eq!(run(src, "option(new NBool(true))"), "{ value: '4:1' }");
+	assert_eq!(run(src, "option(new NBool(false))"), "{}");
+	assert_eq!(run(src, "result(new NBool(true))"), "{ value: '5' }");
+	assert_eq!(run(src, "result(new NBool(false))"), "{ error: 9 }");
+	assert_eq!(run(src, "labeled(new NBool(true))"), "{ value: '6' }");
+	assert_eq!(run(src, "labeled(new NBool(false))"), "{}");
+	assert_eq!(run(src, "nearest(new NBool(false))"), "8");
+}
+
+#[test]
 fn explicitly_outer_breaks_inside_nested_break_values_count_and_execute() {
 	let src = r#"func nested(): int = match (while@outer (true) {
 	while (true) { break (break@outer 7) }

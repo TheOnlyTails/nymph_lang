@@ -2702,6 +2702,107 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				nymph_hir::hir::HirReturnTarget::Block(*target)
 			})
 	}
+	fn lower_propagation(
+		&self,
+		expr: &StableExpr,
+		value: &StableExpr,
+	) -> Result<HirExpr, StableLoweringError> {
+		let kind = self
+			.annotations
+			.propagations
+			.iter()
+			.find_map(|(node, kind)| (*node == self.id(expr)).then_some(*kind))
+			.ok_or_else(|| StableLoweringError::MissingAnnotation {
+				definition: self.artifact.definition.clone(),
+				node: self.id(expr),
+				channel: "propagation".into(),
+			})?;
+		let (definition, success, success_field, failure, failure_field) = match kind {
+			crate::RuntimePropagationKind::Option => {
+				let role = self
+					.annotations
+					.option
+					.as_ref()
+					.ok_or_else(|| self.unsupported(expr, "canonical Option propagation ABI"))?;
+				(&role.option, &role.some, &role.some_value, &role.none, None)
+			}
+			crate::RuntimePropagationKind::Result => {
+				let role = self
+					.annotations
+					.result
+					.as_ref()
+					.ok_or_else(|| self.unsupported(expr, "canonical Result propagation ABI"))?;
+				(
+					&role.result,
+					&role.ok,
+					&role.ok_value,
+					&role.error,
+					Some(&role.error_value),
+				)
+			}
+		};
+		self.demand_external(definition)?;
+		let enum_name: EcoString = self.context.binding_name(definition)?.as_str().into();
+		let success: EcoString = self.context.member_name(success)?.as_str().into();
+		let success_field: EcoString = self.context.member_name(success_field)?.as_str().into();
+		let failure: EcoString = self.context.member_name(failure)?.as_str().into();
+		let failure_field = failure_field
+			.map(|field| {
+				self
+					.context
+					.member_name(field)
+					.map(|name| name.as_str().into())
+			})
+			.transpose()?;
+		let temporary = self.declare(&"$propagation".into());
+		let payload = self.declare(&"$value".into());
+		let failure_fields = failure_field
+			.into_iter()
+			.map(|field| (field, HirPat::Wildcard))
+			.collect();
+		Ok(HirExpr::Block {
+			stmts: vec![HirStmt::Let {
+				name: temporary.clone(),
+				mutable: false,
+				value: self.lower(value)?,
+			}],
+			tail: Some(Box::new(HirExpr::Match {
+				scrutinee: Box::new(HirExpr::Local(temporary.clone())),
+				arms: vec![
+					HirArm {
+						pat: HirPat::Variant {
+							enum_name: enum_name.clone(),
+							variant: success,
+							fields: vec![(
+								success_field,
+								HirPat::Binding {
+									name: payload.clone(),
+									sub: None,
+								},
+							)],
+						},
+						guard: None,
+						body: HirExpr::Local(payload),
+					},
+					HirArm {
+						pat: HirPat::Variant {
+							enum_name,
+							variant: failure,
+							fields: failure_fields,
+						},
+						guard: None,
+						body: HirExpr::Block {
+							stmts: vec![HirStmt::Return {
+								value: Some(HirExpr::Local(temporary)),
+								target: self.return_target(expr),
+							}],
+							tail: None,
+						},
+					},
+				],
+			})),
+		})
+	}
 	fn loop_option(
 		&self,
 		expr: &StableExpr,
@@ -3653,9 +3754,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			StableExprKind::PostfixOp { value, .. } if self.definitely_transfers(value) => {
 				self.lower(value)?
 			}
-			StableExprKind::PostfixOp { value, .. } => {
-				self.lower_dispatch(self.dispatch(expr)?, value, vec![])?
-			}
+			StableExprKind::PostfixOp { value, .. } => self.lower_propagation(expr, value)?,
 			StableExprKind::TypeOp { lhs, .. } if self.definitely_transfers(lhs) => self.lower(lhs)?,
 			StableExprKind::TypeOp { lhs, .. } => match self.dispatch(expr)? {
 				crate::StableDispatch::Builtin { .. } => self.lower_cast(expr, lhs)?,

@@ -480,6 +480,14 @@ pub enum TypeError {
 	InconsistentUnionBindingMutability {
 		name: EcoString,
 	},
+	QuestionOperand {
+		found: String,
+	},
+	QuestionTarget {
+		family: &'static str,
+		found: String,
+	},
+	QuestionOutsideCallable,
 }
 
 impl IntoDiagnostic for TypeError {
@@ -510,6 +518,16 @@ impl IntoDiagnostic for TypeError {
 			E::UnknownControlLabel { name } => format!("unknown control label `{name}`").into(),
 			E::WrongControlLabelKind { name, keyword } => format!("`{keyword}` cannot target `{name}` because it has the wrong kind").into(),
 			E::DuplicateControlLabel { name, .. } => format!("control label `{name}` is already active").into(),
+			E::QuestionOperand { found } => {
+				format!("the `?` operand must be `Option` or `Result`, found `{found}`").into()
+			}
+			E::QuestionTarget { family, found } => format!(
+				"cannot propagate `{family}` into a target returning `{found}`"
+			)
+			.into(),
+			E::QuestionOutsideCallable => {
+				"unlabelled `?` is only valid inside a callable".into()
+			}
 
 			E::ThisOutsideMethod => "`this` is only valid inside a method".into(),
 			E::StructTypeAsValue => "a struct type cannot be used as a value directly".into(),

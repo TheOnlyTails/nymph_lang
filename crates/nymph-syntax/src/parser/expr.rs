@@ -358,11 +358,13 @@ impl Parser<'_> {
 					)
 				}
 				Some(Token::Question) => {
-					self.advance();
+					let question = self.advance().expect("peeked question token").1;
+					let label = self.parse_control_label(question);
 					self.mk_expr(
 						ExprKind::PostfixOp {
 							op: nymph_ast::ops::PostfixOperator::ErrorReturn,
 							value: Box::new(expr),
+							label,
 						},
 						expr_start.to(self.span_from(start)),
 					)

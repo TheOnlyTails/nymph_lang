@@ -90,6 +90,7 @@ pub enum StableExprKind {
 	PostfixOp {
 		op: PostfixOperator,
 		value: Box<StableExpr>,
+		label: Option<EcoString>,
 	},
 	BinaryOp {
 		lhs: Box<StableExpr>,
@@ -395,6 +396,7 @@ pub enum RuntimePlacement {
 #[derive(Clone, Debug, PartialEq, Eq, salsa::SalsaValue)]
 pub struct RuntimeAnnotations {
 	pub option: Option<crate::OptionRuntimeRole>,
+	pub result: Option<crate::ResultRuntimeRole>,
 	pub types: Arc<[(BodyNodeId, InterfaceType)]>,
 	pub definition_targets: Arc<[(BodyNodeId, DefinitionId)]>,
 	pub direct_namespace_members: Arc<[BodyNodeId]>,
@@ -411,6 +413,13 @@ pub struct RuntimeAnnotations {
 	pub external_marshals: Arc<[(BodyNodeId, nymph_hir::hir::MarshalKind)]>,
 	/// Resolved jump node → typed lexical target, projected to stable body ids.
 	pub control_targets: Arc<[(BodyNodeId, RuntimeControlTarget)]>,
+	pub propagations: Arc<[(BodyNodeId, RuntimePropagationKind)]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, salsa::SalsaValue)]
+pub enum RuntimePropagationKind {
+	Option,
+	Result,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
@@ -1275,9 +1284,14 @@ impl<'a> StableBodyBuilder<'a> {
 				op: *op,
 				value: boxed(value)?,
 			},
-			ExprKind::PostfixOp { op, value } => StableExprKind::PostfixOp {
+			ExprKind::PostfixOp {
+				op,
+				value,
+				label: l,
+			} => StableExprKind::PostfixOp {
 				op: *op,
 				value: boxed(value)?,
+				label: label(l),
 			},
 			ExprKind::BinaryOp { lhs, op, rhs } => StableExprKind::BinaryOp {
 				lhs: boxed(lhs)?,
@@ -1525,6 +1539,18 @@ fn runtime_annotations(
 			Some((jump, target))
 		})
 		.collect::<Vec<_>>();
+	let mut propagations = checked
+		.annotations
+		.propagations()
+		.filter_map(|(node, kind)| {
+			let node = *local.get(&node)?;
+			let kind = match kind {
+				crate::annotate::PropagationKind::Option => RuntimePropagationKind::Option,
+				crate::annotate::PropagationKind::Result => RuntimePropagationKind::Result,
+			};
+			Some((node, kind))
+		})
+		.collect::<Vec<_>>();
 	for (&source, &id) in local {
 		if let Some(mode) = checked.annotations.iter_mode_of(source).or_else(|| {
 			native_range_nodes
@@ -1666,6 +1692,7 @@ fn runtime_annotations(
 	generic_call_arguments.sort_by_key(|item| item.0);
 	generic_call_targets.sort_by_key(|item| item.0);
 	control_targets.sort_unstable();
+	propagations.sort_unstable();
 	let mut direct_namespace_members = checked
 		.annotations
 		.direct_namespace_members()
@@ -1680,6 +1707,7 @@ fn runtime_annotations(
 	}
 	Ok(RuntimeAnnotations {
 		option: checked.runtime_roles.option.clone(),
+		result: checked.runtime_roles.result.clone(),
 		types: types.into(),
 		definition_targets: definition_targets.into(),
 		direct_namespace_members: direct_namespace_members.into(),
@@ -1694,6 +1722,7 @@ fn runtime_annotations(
 		generic_call_targets: generic_call_targets.into(),
 		external_marshals: external_marshals.into(),
 		control_targets: control_targets.into(),
+		propagations: propagations.into(),
 	})
 }
 

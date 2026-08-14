@@ -195,7 +195,14 @@ fn calls_and_member_access() {
 		expr("list?.first").kind,
 		ExprKind::MemberAccess { optional: true, .. }
 	));
-	assert!(matches!(expr("value?").kind, ExprKind::PostfixOp { .. }));
+	assert!(matches!(
+		expr("value?").kind,
+		ExprKind::PostfixOp { label: None, .. }
+	));
+	assert!(matches!(
+		expr("value?@target").kind,
+		ExprKind::PostfixOp { label: Some(_), .. }
+	));
 }
 
 #[test]
@@ -285,6 +292,8 @@ fn label_edges_must_be_adjacent() {
 		"continue@ outer",
 		"return @outer 1",
 		"return@ outer 1",
+		"value? @outer",
+		"value?@ outer",
 		"outer @{ 1 }",
 		"outer@ { 1 }",
 		"outer @(x) -> x",

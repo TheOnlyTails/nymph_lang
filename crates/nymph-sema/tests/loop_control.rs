@@ -2,7 +2,9 @@ use nymph_sema::check_module;
 use nymph_syntax::parse_module;
 
 fn messages(source: &str) -> Vec<String> {
-	let source = format!("enum Option<T> {{ Some(value: T), None }}\n{source}");
+	let source = format!(
+		"enum Option<T> {{ Some(value: T), None }}\nenum Result<T, E> {{ Ok(value: T), Error(error: E) }}\n{source}"
+	);
 	let parsed = parse_module(&source, "test");
 	assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
 	check_module(&parsed.tree)
@@ -10,6 +12,73 @@ fn messages(source: &str) -> Vec<String> {
 		.into_iter()
 		.map(|diagnostic| diagnostic.message.to_string())
 		.collect()
+}
+
+#[test]
+fn question_propagation_checks_family_target_and_result_error() {
+	for source in [
+		"func option(o: Option<int>): Option<string> = { let value = o? Some(\"${value}\") }",
+		"func result(r: Result<int, string>): Result<boolean, string> = { let value = r? Ok(value > 0) }",
+		"func labeled(o: Option<int>): Option<string> = target@{ let value = o?@target Some(\"${value}\") }",
+	] {
+		let found = messages(source);
+		assert!(found.is_empty(), "{source}: {found:?}");
+	}
+
+	for source in [
+		"func mixed(o: Option<int>): Result<int, string> = { let value = o? Ok(value) }",
+		"func mixed(r: Result<int, string>): Option<int> = { let value = r? Some(value) }",
+	] {
+		let found = messages(source);
+		assert!(
+			found
+				.iter()
+				.any(|message| message.contains("cannot propagate")),
+			"{source}: {found:?}"
+		);
+	}
+
+	let found = messages(
+		"func mismatch(r: Result<int, string>): Result<int, boolean> = { let value = r? Ok(value) }",
+	);
+	assert!(
+		found
+			.iter()
+			.any(|message| message.contains("mismatched types")),
+		"{found:?}"
+	);
+}
+
+#[test]
+fn question_labels_do_not_cross_callable_boundaries() {
+	let found = messages(
+		"func outer(o: Option<int>): Option<int> = target@{ let inner = () -> { o?@target Some(1) } inner() }",
+	);
+	assert!(
+		found
+			.iter()
+			.any(|message| message.contains("unknown control label")),
+		"{found:?}"
+	);
+
+	let found = messages(
+		"func nearest(o: Option<int>): int = { let inner: () -> Option<string> = () -> { let value = o? Some(\"${value}\") } inner() 7 }",
+	);
+	assert!(found.is_empty(), "{found:?}");
+
+	let source = "enum Option<T> { Some(value: T), None }\nlet invalid = Some(1)?";
+	let parsed = parse_module(source, "test");
+	let found = check_module(&parsed.tree)
+		.diags
+		.into_iter()
+		.map(|diagnostic| diagnostic.message.to_string())
+		.collect::<Vec<_>>();
+	assert!(
+		found
+			.iter()
+			.any(|message| message.contains("inside a callable")),
+		"{found:?}"
+	);
 }
 
 #[test]
