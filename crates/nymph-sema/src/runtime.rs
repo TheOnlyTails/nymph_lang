@@ -413,6 +413,108 @@ pub struct RuntimeAnnotations {
 	pub control_targets: Arc<[(BodyNodeId, RuntimeControlTarget)]>,
 }
 
+impl RuntimeAnnotations {
+	pub fn type_of(&self, node: BodyNodeId) -> Option<&InterfaceType> {
+		self
+			.types
+			.iter()
+			.find_map(|(id, value)| (*id == node).then_some(value))
+	}
+
+	pub fn definition_target(&self, node: BodyNodeId) -> Option<&DefinitionId> {
+		self
+			.definition_targets
+			.iter()
+			.find_map(|(id, value)| (*id == node).then_some(value))
+	}
+
+	pub fn is_direct_namespace_member(&self, node: BodyNodeId) -> bool {
+		self.direct_namespace_members.contains(&node)
+	}
+
+	pub fn dispatch(&self, node: BodyNodeId) -> Option<&StableDispatch> {
+		self
+			.dispatches
+			.iter()
+			.find_map(|(id, value)| (*id == node).then_some(value))
+	}
+
+	pub fn variant(&self, node: BodyNodeId) -> Option<&ExpressionVariant> {
+		self
+			.variants
+			.iter()
+			.find_map(|(id, value)| (*id == node).then_some(value))
+	}
+
+	pub fn pattern_variant(&self, node: PatternNodeId) -> Option<&PatternVariant> {
+		self
+			.pattern_variants
+			.iter()
+			.find_map(|(id, value)| (*id == node).then_some(value))
+	}
+
+	pub fn positional_field(&self, node: PatternNodeId) -> Option<&StableVariantField> {
+		self
+			.positional_fields
+			.iter()
+			.find_map(|(id, value)| (*id == node).then_some(value))
+	}
+
+	pub fn iteration(&self, node: BodyNodeId) -> Option<&RuntimeIteration> {
+		self
+			.iterations
+			.iter()
+			.find_map(|(id, value)| (*id == node).then_some(value))
+	}
+
+	pub fn anonymous_closure_arity(&self, node: BodyNodeId) -> Option<u8> {
+		self
+			.anonymous_closures
+			.iter()
+			.find_map(|(id, value)| (*id == node).then_some(*value))
+	}
+
+	pub fn generic_namespaced_call(
+		&self,
+		node: BodyNodeId,
+	) -> Option<(u32, &DefinitionId, &DefinitionId)> {
+		self
+			.generic_namespaced_calls
+			.iter()
+			.find_map(|(id, parameter, interface, member)| {
+				(*id == node).then_some((*parameter, interface, member))
+			})
+	}
+
+	pub fn generic_call_arguments(&self, node: BodyNodeId) -> Option<&[RuntimeTypeArgument]> {
+		self
+			.generic_call_arguments
+			.iter()
+			.find_map(|(id, value)| (*id == node).then_some(value.as_ref()))
+	}
+
+	pub fn generic_call_target(&self, node: BodyNodeId) -> Option<&DefinitionId> {
+		self
+			.generic_call_targets
+			.iter()
+			.find_map(|(id, value)| (*id == node).then_some(value))
+	}
+
+	pub fn external_marshal(&self, node: BodyNodeId) -> Option<nymph_hir::hir::MarshalKind> {
+		self
+			.external_marshals
+			.iter()
+			.find_map(|(id, value)| (*id == node).then_some(*value))
+	}
+
+	pub fn control_target(&self, node: BodyNodeId) -> Option<RuntimeControlTarget> {
+		self
+			.control_targets
+			.iter()
+			.find_map(|(id, value)| (*id == node).then_some(*value))
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum RuntimeTypeArgument {
 	Canonical(InterfaceType),

@@ -2380,14 +2380,72 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.find_map(|scope| scope.get(name).cloned())
 			.unwrap_or_else(|| name.clone())
 	}
+	fn with_scope<T>(
+		&self,
+		lower: impl FnOnce() -> Result<T, StableLoweringError>,
+	) -> Result<T, StableLoweringError> {
+		self.scopes.borrow_mut().push(HashMap::new());
+		let result = lower();
+		self.scopes.borrow_mut().pop();
+		result
+	}
+	fn with_deferred<T>(
+		&self,
+		lower: impl FnOnce() -> Result<T, StableLoweringError>,
+	) -> Result<T, StableLoweringError> {
+		let depth = self.deferred_depth.get();
+		self.deferred_depth.set(depth + 1);
+		let result = lower();
+		self.deferred_depth.set(depth);
+		result
+	}
+	fn with_loop_target<T>(
+		&self,
+		source: crate::BodyNodeId,
+		target: u32,
+		lower: impl FnOnce() -> Result<T, StableLoweringError>,
+	) -> Result<T, StableLoweringError> {
+		let depth = self.loop_depth.get();
+		self.loop_depth.set(depth + 1);
+		self.loop_targets.borrow_mut().push((source, target));
+		let result = lower();
+		self.loop_targets.borrow_mut().pop();
+		self.loop_depth.set(depth);
+		result
+	}
+	fn with_block_target<T>(
+		&self,
+		source: crate::BodyNodeId,
+		target: nymph_hir::hir::BlockTarget,
+		lower: impl FnOnce() -> Result<T, StableLoweringError>,
+	) -> Result<T, StableLoweringError> {
+		self.block_targets.borrow_mut().push((source, target));
+		let result = lower();
+		self.block_targets.borrow_mut().pop();
+		result
+	}
+	fn with_callable_frame<T>(
+		&self,
+		lower: impl FnOnce() -> Result<T, StableLoweringError>,
+	) -> Result<T, StableLoweringError> {
+		let loop_depth = self.loop_depth.replace(0);
+		let loop_targets = self.loop_targets.replace(Vec::new());
+		let block_targets = self.block_targets.replace(Vec::new());
+		let result = lower();
+		self.block_targets.replace(block_targets);
+		self.loop_targets.replace(loop_targets);
+		self.loop_depth.set(loop_depth);
+		result
+	}
+	fn missing_annotation(&self, node: crate::BodyNodeId, channel: &str) -> StableLoweringError {
+		StableLoweringError::MissingAnnotation {
+			definition: self.artifact.definition.clone(),
+			node,
+			channel: channel.into(),
+		}
+	}
 	fn target(&self, expr: &StableExpr) -> Option<&DefinitionId> {
-		let id = self.id(expr);
-		self
-			.annotations
-			.definition_targets
-			.iter()
-			.find(|(found, _)| *found == id)
-			.map(|(_, target)| target)
+		self.annotations.definition_target(self.id(expr))
 	}
 	fn record_read(&self, target: &DefinitionId) {
 		if self.deferred_depth.get() == 0 {
@@ -2438,16 +2496,6 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			self.execution.borrow_mut().unresolved_calls.push(call);
 		}
 	}
-	fn lower_deferred<T>(
-		&self,
-		lower: impl FnOnce() -> Result<T, StableLoweringError>,
-	) -> Result<T, StableLoweringError> {
-		let depth = self.deferred_depth.get();
-		self.deferred_depth.set(depth + 1);
-		let result = lower();
-		self.deferred_depth.set(depth);
-		result
-	}
 	fn external_marshal(
 		&self,
 		expr: &StableExpr,
@@ -2455,29 +2503,15 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		let node = self.id(expr);
 		self
 			.annotations
-			.external_marshals
-			.iter()
-			.find(|(id, _)| *id == node)
-			.map(|(_, marshal)| *marshal)
-			.ok_or_else(|| StableLoweringError::MissingAnnotation {
-				definition: self.artifact.definition.clone(),
-				node,
-				channel: "external marshal".into(),
-			})
+			.external_marshal(node)
+			.ok_or_else(|| self.missing_annotation(node, "external marshal"))
 	}
 	fn ty(&self, expr: &StableExpr) -> Result<InterfaceType, StableLoweringError> {
 		let node = self.id(expr);
 		let ty = self
 			.annotations
-			.types
-			.iter()
-			.find(|(id, _)| *id == node)
-			.map(|(_, ty)| ty)
-			.ok_or_else(|| StableLoweringError::MissingAnnotation {
-				definition: self.artifact.definition.clone(),
-				node,
-				channel: "type".into(),
-			})?;
+			.type_of(node)
+			.ok_or_else(|| self.missing_annotation(node, "type"))?;
 		let ty = self.self_type.map_or_else(
 			|| ty.clone(),
 			|self_type| substitute_self_type(ty, self_type),
@@ -2489,20 +2523,13 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 	/// so its body's `never` type must not erase an enclosing operation.
 	fn definitely_transfers(&self, expr: &StableExpr) -> bool {
 		let node = self.id(expr);
-		if self
-			.annotations
-			.anonymous_closures
-			.iter()
-			.any(|(id, _)| *id == node)
-		{
+		if self.annotations.anonymous_closure_arity(node).is_some() {
 			return false;
 		}
 		if self
 			.annotations
-			.types
-			.iter()
-			.find(|(id, _)| *id == node)
-			.is_some_and(|(_, ty)| matches!(peel_mut(ty), InterfaceType::Never))
+			.type_of(node)
+			.is_some_and(|ty| matches!(peel_mut(ty), InterfaceType::Never))
 		{
 			return true;
 		}
@@ -2545,13 +2572,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		}
 	}
 	fn int_literal_kind(&self, expr: &StableExpr) -> Result<NumKind, StableLoweringError> {
-		let Some(ty) = self
-			.annotations
-			.types
-			.iter()
-			.find(|(id, _)| *id == self.id(expr))
-			.map(|(_, ty)| ty)
-		else {
+		let Some(ty) = self.annotations.type_of(self.id(expr)) else {
 			return Ok(NumKind::Int);
 		};
 		match peel_mut(ty) {
@@ -2565,28 +2586,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		let node = self.id(expr);
 		self
 			.annotations
-			.dispatches
-			.iter()
-			.find(|(id, _)| *id == node)
-			.map(|(_, dispatch)| dispatch)
-			.ok_or_else(|| StableLoweringError::MissingAnnotation {
-				definition: self.artifact.definition.clone(),
-				node,
-				channel: "dispatch".into(),
-			})
+			.dispatch(node)
+			.ok_or_else(|| self.missing_annotation(node, "dispatch"))
 	}
 	fn variant(&self, expr: &StableExpr) -> Option<&crate::ExpressionVariant> {
-		self
-			.annotations
-			.variants
-			.iter()
-			.find(|(id, _)| *id == self.id(expr))
-			.map(|(_, variant)| variant)
+		self.annotations.variant(self.id(expr))
 	}
 	fn lower_function_body(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
-		let outer_loops = self.loop_targets.replace(Vec::new());
-		let outer_blocks = self.block_targets.replace(Vec::new());
-		let lowered = match &expr.kind {
+		self.with_callable_frame(|| match &expr.kind {
 			StableExprKind::Block { body, label: None } => self.lower_block(body, false),
 			StableExprKind::Block {
 				body,
@@ -2594,22 +2601,17 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			} => {
 				let target = self.next_block_target.get();
 				self.next_block_target.set(target + 1);
-				self
-					.block_targets
-					.borrow_mut()
-					.push((self.id(expr), target));
-				let body = self.lower_block(body, false);
-				self.block_targets.borrow_mut().pop();
-				body.map(|body| HirExpr::LabeledBlock {
-					target,
-					body: Box::new(body),
+				self.with_block_target(self.id(expr), target, || {
+					self
+						.lower_block(body, false)
+						.map(|body| HirExpr::LabeledBlock {
+							target,
+							body: Box::new(body),
+						})
 				})
 			}
 			_ => self.lower(expr),
-		};
-		self.block_targets.replace(outer_blocks);
-		self.loop_targets.replace(outer_loops);
-		lowered
+		})
 	}
 	fn lower_branch(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
 		self.lower(expr)
@@ -2620,13 +2622,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		target: u32,
 		expr: &StableExpr,
 	) -> Result<HirExpr, StableLoweringError> {
-		let depth = self.loop_depth.get();
-		self.loop_depth.set(depth + 1);
-		self.loop_targets.borrow_mut().push((source, target));
-		let result = self.lower_branch(expr);
-		self.loop_targets.borrow_mut().pop();
-		self.loop_depth.set(depth);
-		result
+		self.with_loop_target(source, target, || self.lower_branch(expr))
 	}
 	fn next_loop(&self) -> u32 {
 		let target = self.next_loop_target.get();
@@ -2635,11 +2631,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 	}
 	fn return_target(&self, expr: &StableExpr) -> nymph_hir::hir::HirReturnTarget {
 		let jump = self.id(expr);
-		let resolved = self
-			.annotations
-			.control_targets
-			.iter()
-			.find_map(|(candidate, target)| (*candidate == jump).then_some(*target));
+		let resolved = self.annotations.control_target(jump);
 		let Some(crate::runtime::RuntimeControlTarget::Block(resolved)) = resolved else {
 			return nymph_hir::hir::HirReturnTarget::Callable;
 		};
@@ -2660,12 +2652,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		let Some(role) = &self.annotations.option else {
 			return Ok(None);
 		};
-		let Some((_, ty)) = self
-			.annotations
-			.types
-			.iter()
-			.find(|(id, _)| *id == self.id(expr))
-		else {
+		let Some(ty) = self.annotations.type_of(self.id(expr)) else {
 			return Ok(None);
 		};
 		if !matches!(peel_mut(ty), InterfaceType::Named { definition, .. } if definition == &role.option)
@@ -2680,29 +2667,35 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			none: self.context.member_name(&role.none)?.as_str().into(),
 		}))
 	}
-	fn lower(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
-		if let Some((_, arity)) = self
-			.annotations
-			.anonymous_closures
+	fn resolve_loop_target(
+		&self,
+		expr: &StableExpr,
+		unsupported: &str,
+	) -> Result<u32, StableLoweringError> {
+		let Some(crate::runtime::RuntimeControlTarget::Loop(source)) =
+			self.annotations.control_target(self.id(expr))
+		else {
+			return Err(self.unsupported(expr, unsupported));
+		};
+		self
+			.loop_targets
+			.borrow()
 			.iter()
-			.find(|(id, _)| *id == self.id(expr))
-		{
-			self.scopes.borrow_mut().push(HashMap::new());
-			let params = (0..*arity)
-				.map(|i| self.declare(&crate::anon_closure::anon_param_name(i)))
-				.collect();
-			let loop_depth = self.loop_depth.replace(0);
-			let loop_targets = self.loop_targets.replace(Vec::new());
-			let block_targets = self.block_targets.replace(Vec::new());
-			let body = self.lower_deferred(|| self.lower_inner(expr));
-			self.block_targets.replace(block_targets);
-			self.loop_targets.replace(loop_targets);
-			self.loop_depth.set(loop_depth);
-			let body = body?;
-			self.scopes.borrow_mut().pop();
-			return Ok(HirExpr::Closure {
-				params,
-				body: Box::new(body),
+			.rev()
+			.find_map(|(candidate, target)| (*candidate == source).then_some(*target))
+			.ok_or_else(|| self.unsupported(expr, unsupported))
+	}
+	fn lower(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
+		if let Some(arity) = self.annotations.anonymous_closure_arity(self.id(expr)) {
+			return self.with_scope(|| {
+				let params = (0..arity)
+					.map(|i| self.declare(&crate::anon_closure::anon_param_name(i)))
+					.collect();
+				let body = self.with_callable_frame(|| self.with_deferred(|| self.lower_inner(expr)))?;
+				Ok(HirExpr::Closure {
+					params,
+					body: Box::new(body),
+				})
 			});
 		}
 		self.lower_inner(expr)
@@ -2887,12 +2880,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				if self.definitely_transfers(parent) {
 					return self.lower(parent);
 				}
-				if let Some((_, dispatch)) = self
-					.annotations
-					.dispatches
-					.iter()
-					.find(|(id, _)| *id == self.id(expr))
-				{
+				if let Some(dispatch) = self.annotations.dispatch(self.id(expr)) {
 					return self.lower_method_value(expr, dispatch, parent);
 				}
 				if let Some(variant) = self.variant(expr) {
@@ -2911,10 +2899,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						prototype: self.construction_prototype(expr)?,
 					});
 				}
-				if self
-					.annotations
-					.direct_namespace_members
-					.contains(&self.id(expr))
+				if self.annotations.is_direct_namespace_member(self.id(expr))
 					&& let Some(target) = self.target(expr)
 				{
 					if matches!(target.key, crate::DeclarationKey::TopLevel { .. }) {
@@ -3055,40 +3040,41 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						self.context.stable_shape(&request)?
 					{
 						self.demand_external(target)?;
-						self.scopes.borrow_mut().push(HashMap::new());
-						let mut stmts = Vec::with_capacity(args.len());
-						let mut values = HashMap::with_capacity(args.len());
-						for (index, argument) in args.iter().enumerate() {
-							let field = argument
-								.name
-								.as_ref()
-								.and_then(|name| shell.fields.iter().find(|field| field.name == *name))
-								.or_else(|| shell.fields.get(index))
-								.ok_or_else(|| {
-									invalid(
-										&self.artifact.definition,
-										"struct argument has no exact field",
-									)
-								})?;
-							let temporary = self.declare(&format!("$struct_arg_{index}").into());
-							stmts.push(HirStmt::Let {
-								name: temporary.clone(),
-								mutable: false,
-								value: self.lower(&argument.value)?,
-							});
-							values.insert(field.name.clone(), temporary);
-						}
-						let fields = shell
-							.fields
-							.iter()
-							.filter_map(|field| {
-								values
-									.get(&field.name)
-									.cloned()
-									.map(|value| (field.name.clone(), HirExpr::Local(value)))
-							})
-							.collect();
-						self.scopes.borrow_mut().pop();
+						let (stmts, fields) = self.with_scope(|| {
+							let mut stmts = Vec::with_capacity(args.len());
+							let mut values = HashMap::with_capacity(args.len());
+							for (index, argument) in args.iter().enumerate() {
+								let field = argument
+									.name
+									.as_ref()
+									.and_then(|name| shell.fields.iter().find(|field| field.name == *name))
+									.or_else(|| shell.fields.get(index))
+									.ok_or_else(|| {
+										invalid(
+											&self.artifact.definition,
+											"struct argument has no exact field",
+										)
+									})?;
+								let temporary = self.declare(&format!("$struct_arg_{index}").into());
+								stmts.push(HirStmt::Let {
+									name: temporary.clone(),
+									mutable: false,
+									value: self.lower(&argument.value)?,
+								});
+								values.insert(field.name.clone(), temporary);
+							}
+							let fields = shell
+								.fields
+								.iter()
+								.filter_map(|field| {
+									values
+										.get(&field.name)
+										.cloned()
+										.map(|value| (field.name.clone(), HirExpr::Local(value)))
+								})
+								.collect();
+							Ok((stmts, fields))
+						})?;
 						return Ok(HirExpr::Block {
 							stmts,
 							tail: Some(Box::new(HirExpr::New {
@@ -3100,11 +3086,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					}
 				}
 				if let StableExprKind::MemberAccess { parent, .. } = &func.kind
-					&& let Some((_, dispatch)) = self
-						.annotations
-						.dispatches
-						.iter()
-						.find(|(id, _)| *id == self.id(expr))
+					&& let Some(dispatch) = self.annotations.dispatch(self.id(expr))
 				{
 					let lowered = self.lower_dispatch(
 						dispatch,
@@ -3121,11 +3103,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						self.append_hidden_arguments(self.id(expr), lowered)
 					};
 				}
-				if let Some((_, parameter, interface, member_definition)) = self
-					.annotations
-					.generic_namespaced_calls
-					.iter()
-					.find(|(id, ..)| *id == self.id(expr))
+				if let Some((parameter, interface, member_definition)) =
+					self.annotations.generic_namespaced_call(self.id(expr))
 					&& let StableExprKind::MemberAccess { member, .. } = &func.kind
 				{
 					self.demand_receiverless_implementations(interface, member_definition)?;
@@ -3133,12 +3112,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						.iter()
 						.map(|arg| self.lower(&arg.value))
 						.collect::<Result<Vec<_>, _>>()?;
-					if let Some((_, hidden)) = self
-						.annotations
-						.generic_call_arguments
-						.iter()
-						.find(|(id, _)| *id == self.id(expr))
-					{
+					if let Some(hidden) = self.annotations.generic_call_arguments(self.id(expr)) {
 						for argument in hidden.iter() {
 							lowered_args.push(match argument {
 								crate::runtime::RuntimeTypeArgument::Canonical(type_) => {
@@ -3157,7 +3131,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					}
 					let parameter = self
 						.all_type_parameters
-						.get(*parameter as usize)
+						.get(parameter as usize)
 						.ok_or_else(|| {
 							invalid(
 								&self.artifact.definition,
@@ -3195,9 +3169,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						}
 						let hidden_arity = self
 							.annotations
-							.generic_call_arguments
-							.iter()
-							.find_map(|(id, arguments)| (*id == self.id(expr)).then_some(arguments.len()))
+							.generic_call_arguments(self.id(expr))
+							.map(<[crate::runtime::RuntimeTypeArgument]>::len)
 							.unwrap_or_default();
 						if hidden_arity != binder_arity {
 							return Err(StableLoweringError::ShapeDrift {
@@ -3246,11 +3219,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					} else {
 						self.record_unresolved_call(UnresolvedRuntimeCall::DynamicCallee);
 					}
-					self.scopes.borrow_mut().push(HashMap::new());
-					let lhs_name = self.declare(&EcoString::from("$pipe"));
-					let lhs = self.lower(lhs)?;
-					let lowered_rhs = self.lower(rhs)?;
-					self.scopes.borrow_mut().pop();
+					let (lhs_name, lhs, lowered_rhs) = self.with_scope(|| {
+						let lhs_name = self.declare(&EcoString::from("$pipe"));
+						Ok((lhs_name, self.lower(lhs)?, self.lower(rhs)?))
+					})?;
 					let call_args = vec![HirExpr::Local(lhs_name.clone())];
 					let mut metadata_source = rhs;
 					while let StableExprKind::Grouped(inner) = &metadata_source.kind {
@@ -3288,12 +3260,13 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				}
 				let dispatch = self.dispatch(expr)?;
 				if matches!(op, BinaryOperator::In | BinaryOperator::NotIn) {
-					self.scopes.borrow_mut().push(HashMap::new());
-					let lhs_name = self.declare(&EcoString::from("$member"));
-					let lhs_value = self.lower(lhs)?;
-					let mut operation = self.lower_dispatch(dispatch, rhs, vec![lhs])?;
-					Self::replace_dispatch_argument(&mut operation, HirExpr::Local(lhs_name.clone()));
-					self.scopes.borrow_mut().pop();
+					let (lhs_name, lhs_value, operation) = self.with_scope(|| {
+						let lhs_name = self.declare(&EcoString::from("$member"));
+						let lhs_value = self.lower(lhs)?;
+						let mut operation = self.lower_dispatch(dispatch, rhs, vec![lhs])?;
+						Self::replace_dispatch_argument(&mut operation, HirExpr::Local(lhs_name.clone()));
+						Ok((lhs_name, lhs_value, operation))
+					})?;
 					return Ok(HirExpr::Block {
 						stmts: vec![HirStmt::Let {
 							name: lhs_name,
@@ -3382,16 +3355,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				if label.is_some() {
 					let target = self.next_block_target.get();
 					self.next_block_target.set(target + 1);
-					self
-						.block_targets
-						.borrow_mut()
-						.push((self.id(expr), target));
-					let body = self.lower_block(body, true)?;
-					self.block_targets.borrow_mut().pop();
-					HirExpr::LabeledBlock {
-						target,
-						body: Box::new(body),
-					}
+					self.with_block_target(self.id(expr), target, || {
+						self
+							.lower_block(body, true)
+							.map(|body| HirExpr::LabeledBlock {
+								target,
+								body: Box::new(body),
+							})
+					})?
 				} else {
 					self.lower_block(body, true)?
 				}
@@ -3420,26 +3391,17 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					option: self.loop_option(expr)?,
 				}
 			}
-			StableExprKind::Closure { params, body, .. } => {
-				self.scopes.borrow_mut().push(HashMap::new());
+			StableExprKind::Closure { params, body, .. } => self.with_scope(|| {
 				let params = params
 					.iter()
 					.map(|param| pattern_name(&param.pattern).map(|name| self.declare(name)))
 					.collect::<Result<_, _>>()?;
-				let loop_depth = self.loop_depth.replace(0);
-				let loop_targets = self.loop_targets.replace(Vec::new());
-				let block_targets = self.block_targets.replace(Vec::new());
-				let body = self.lower_deferred(|| self.lower_function_body(body));
-				self.block_targets.replace(block_targets);
-				self.loop_targets.replace(loop_targets);
-				self.loop_depth.set(loop_depth);
-				let body = body?;
-				self.scopes.borrow_mut().pop();
-				HirExpr::Closure {
+				let body = self.with_deferred(|| self.lower_function_body(body))?;
+				Ok(HirExpr::Closure {
 					params,
 					body: Box::new(body),
-				}
-			}
+				})
+			})?,
 			StableExprKind::Return { value, .. } => HirExpr::Block {
 				stmts: vec![HirStmt::Return {
 					value: value.as_ref().map(|value| self.lower(value)).transpose()?,
@@ -3448,23 +3410,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				tail: None,
 			},
 			StableExprKind::Break { value, .. } => HirExpr::Break {
-				target: self
-					.loop_targets
-					.borrow()
-					.iter()
-					.rev()
-					.find(|(source, _)| {
-						self
-							.annotations
-							.control_targets
-							.iter()
-							.any(|(jump, target)| {
-								*jump == self.id(expr)
-									&& matches!(target, crate::runtime::RuntimeControlTarget::Loop(id) if id == source)
-							})
-					})
-					.map(|(_, target)| *target)
-					.ok_or_else(|| self.unsupported(expr, "break outside a loop"))?,
+				target: self.resolve_loop_target(expr, "break outside a loop")?,
 				value: Box::new(
 					value
 						.as_ref()
@@ -3477,23 +3423,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				),
 			},
 			StableExprKind::Continue { .. } => HirExpr::Continue {
-				target: self
-					.loop_targets
-					.borrow()
-					.iter()
-					.rev()
-					.find(|(source, _)| {
-						self
-							.annotations
-							.control_targets
-							.iter()
-							.any(|(jump, target)| {
-								*jump == self.id(expr)
-									&& matches!(target, crate::runtime::RuntimeControlTarget::Loop(id) if id == source)
-							})
-					})
-					.map(|(_, target)| *target)
-					.ok_or_else(|| self.unsupported(expr, "continue outside a loop"))?,
+				target: self.resolve_loop_target(expr, "continue outside a loop")?,
 			},
 			StableExprKind::IndexAccess { parent, index, .. } if self.definitely_transfers(parent) => {
 				self.lower(parent)?
@@ -3556,18 +3486,17 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				arms: arms
 					.iter()
 					.map(|arm| {
-						self.scopes.borrow_mut().push(HashMap::new());
-						let result = Ok(HirArm {
-							pat: self.lower_pattern(&arm.pattern)?,
-							guard: arm
-								.guard
-								.as_ref()
-								.map(|guard| self.lower(guard))
-								.transpose()?,
-							body: self.lower(&arm.body)?,
-						});
-						self.scopes.borrow_mut().pop();
-						result
+						self.with_scope(|| {
+							Ok(HirArm {
+								pat: self.lower_pattern(&arm.pattern)?,
+								guard: arm
+									.guard
+									.as_ref()
+									.map(|guard| self.lower(guard))
+									.transpose()?,
+								body: self.lower(&arm.body)?,
+							})
+						})
 					})
 					.collect::<Result<_, StableLoweringError>>()?,
 			},
@@ -3576,10 +3505,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				// Pattern-operator bindings are scoped to the test and must not replace
 				// an outer source-name mapping used by following expressions. Lower the
 				// source first to preserve source-order name allocation in stable lowering.
-				self.scopes.borrow_mut().push(HashMap::new());
-				let pat = self.lower_pattern(rhs);
-				self.scopes.borrow_mut().pop();
-				let pat = pat?;
+				let pat = self.with_scope(|| self.lower_pattern(rhs))?;
 				let (yes, no) = if *op == PatternOperator::Is {
 					(true, false)
 				} else {
@@ -4694,15 +4620,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			_ => {
 				let iteration = self
 					.annotations
-					.iterations
-					.iter()
-					.find(|(id, _)| *id == self.id(value))
-					.map(|(_, value)| value)
-					.ok_or_else(|| StableLoweringError::MissingAnnotation {
-						definition: self.artifact.definition.clone(),
-						node: self.id(value),
-						channel: "spread iteration".into(),
-					})?;
+					.iteration(self.id(value))
+					.ok_or_else(|| self.missing_annotation(self.id(value), "spread iteration"))?;
 				let source = self.lower(value)?;
 				let (it, next, next_dispatch, option) = match iteration {
 					crate::RuntimeIteration::Direct {
@@ -4844,15 +4763,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		}))
 	}
 	fn lower_pattern(&self, pattern: &StablePattern) -> Result<HirPat, StableLoweringError> {
-		let id = Some(pattern.id);
-		let variant = id.and_then(|id| {
-			self
-				.annotations
-				.pattern_variants
-				.iter()
-				.find(|(found, _)| *found == id)
-				.map(|(_, value)| value)
-		});
+		let variant = self.annotations.pattern_variant(pattern.id);
 		Ok(match &pattern.kind {
 			StablePatternKind::Placeholder => HirPat::Wildcard,
 			StablePatternKind::Int(v) => HirPat::Lit(HirLit::Num(*v as f64, NumKind::Int)),
@@ -4973,10 +4884,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				StableStructPatternField::Named { id, name } => {
 					let pattern = self
 						.annotations
-						.pattern_variants
-						.iter()
-						.find(|(found, _)| found == id)
-						.map(|(_, variant)| self.variant_pattern(variant, vec![]))
+						.pattern_variant(*id)
+						.map(|variant| self.variant_pattern(variant, vec![]))
 						.transpose()?
 						.unwrap_or_else(|| HirPat::Binding {
 							name: self.declare(name),
@@ -4984,25 +4893,16 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						});
 					let exact = self
 						.annotations
-						.positional_fields
-						.iter()
-						.find(|(found, _)| found == id)
-						.map(|(_, field)| field.name.clone())
+						.positional_field(*id)
+						.map(|field| field.name.clone())
 						.unwrap_or_else(|| name.clone());
 					result.push((exact, pattern));
 				}
 				StableStructPatternField::Positional { id: pid, pattern } => {
 					let exact = self
 						.annotations
-						.positional_fields
-						.iter()
-						.find(|(id, _)| id == pid)
-						.ok_or_else(|| StableLoweringError::MissingAnnotation {
-							definition: self.artifact.definition.clone(),
-							node: crate::BodyNodeId(pid.0),
-							channel: "positional field".into(),
-						})?
-						.1
+						.positional_field(*pid)
+						.ok_or_else(|| self.missing_annotation(crate::BodyNodeId(pid.0), "positional field"))?
 						.name
 						.clone();
 					result.push((exact, self.lower_pattern(pattern)?));
@@ -5163,16 +5063,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		&self,
 		expr: &StableExpr,
 	) -> Result<Option<Box<HirExpr>>, StableLoweringError> {
-		let arguments = self
-			.annotations
-			.generic_call_arguments
-			.iter()
-			.find_map(|(id, arguments)| (*id == self.id(expr)).then_some(arguments));
-		let target = self
-			.annotations
-			.generic_call_targets
-			.iter()
-			.find_map(|(id, target)| (*id == self.id(expr)).then_some(target));
+		let arguments = self.annotations.generic_call_arguments(self.id(expr));
+		let target = self.annotations.generic_call_target(self.id(expr));
 		if let (Some(arguments), Some(target)) = (arguments, target)
 			&& matches!(
 				self.context.runtime_definition(target)?.payload,
@@ -5196,11 +5088,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				})));
 			}
 		}
-		let annotated = self
-			.annotations
-			.types
-			.iter()
-			.find_map(|(id, type_)| (*id == self.id(expr)).then_some(type_));
+		let annotated = self.annotations.type_of(self.id(expr));
 		let Some(type_) = annotated else {
 			return Ok(None);
 		};
@@ -5428,12 +5316,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				}
 			}
 			for (node, arguments) in body.annotations.generic_call_arguments.iter() {
-				let Some((_, target)) = body
-					.annotations
-					.generic_call_targets
-					.iter()
-					.find(|(candidate, _)| candidate == node)
-				else {
+				let Some(target) = body.annotations.generic_call_target(*node) else {
 					continue;
 				};
 				let nested = visit(context, target, visiting)?;
@@ -5489,19 +5372,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		node: crate::BodyNodeId,
 		mut lowered: HirExpr,
 	) -> Result<HirExpr, StableLoweringError> {
-		let Some((_, hidden)) = self
-			.annotations
-			.generic_call_arguments
-			.iter()
-			.find(|(id, _)| *id == node)
-		else {
+		let Some(hidden) = self.annotations.generic_call_arguments(node) else {
 			return Ok(lowered);
 		};
-		let call_target = self
-			.annotations
-			.generic_call_targets
-			.iter()
-			.find_map(|(id, target)| (*id == node).then_some(target));
+		let call_target = self.annotations.generic_call_target(node);
 		let required = call_target
 			.map(|target| self.required_receiverless_slots(target))
 			.transpose()?
@@ -5611,20 +5485,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		node: crate::BodyNodeId,
 		callee: HirExpr,
 	) -> Result<HirExpr, StableLoweringError> {
-		let Some((_, hidden)) = self
-			.annotations
-			.generic_call_arguments
-			.iter()
-			.find(|(id, _)| *id == node)
-		else {
+		let Some(hidden) = self.annotations.generic_call_arguments(node) else {
 			return Ok(callee);
 		};
-		let Some(target) = self
-			.annotations
-			.generic_call_targets
-			.iter()
-			.find_map(|(id, target)| (*id == node).then_some(target))
-		else {
+		let Some(target) = self.annotations.generic_call_target(node) else {
 			return Err(StableLoweringError::Unsupported {
 				definition: self.artifact.definition.clone(),
 				node: Some(node),
@@ -5687,10 +5551,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		let native_range_number = match &iterable.kind {
 			StableExprKind::Range(StableRange::Exclusive { .. } | StableRange::Inclusive { .. }) => self
 				.annotations
-				.types
-				.iter()
-				.find(|(id, _)| *id == self.id(iterable))
-				.and_then(|(_, ty)| match peel_mut(ty) {
+				.type_of(self.id(iterable))
+				.and_then(|ty| match peel_mut(ty) {
 					InterfaceType::Named { positional, .. } => positional.first(),
 					_ => None,
 				})
@@ -5710,14 +5572,15 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				iterable.kind,
 				StableExprKind::Range(StableRange::Inclusive { .. })
 			);
-			self.scopes.borrow_mut().push(HashMap::new());
-			let current = self.declare(&"$range_current".into());
-			let end = self.declare(&"$range_end".into());
-			let done = self.declare(&"$range_done".into());
-			let pat = self.lower_pattern(variable)?;
-			let target = self.next_loop();
-			let body = self.lower_loop_branch(source_id, target, body)?;
-			self.scopes.borrow_mut().pop();
+			let (current, end, done, pat, target, body) = self.with_scope(|| {
+				let current = self.declare(&"$range_current".into());
+				let end = self.declare(&"$range_end".into());
+				let done = self.declare(&"$range_done".into());
+				let pat = self.lower_pattern(variable)?;
+				let target = self.next_loop();
+				let body = self.lower_loop_branch(source_id, target, body)?;
+				Ok((current, end, done, pat, target, body))
+			})?;
 			let current_expr = || HirExpr::Local(current.clone());
 			let end_expr = || HirExpr::Local(end.clone());
 			let advance = HirExpr::Assign {
@@ -5852,15 +5715,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		let source = self.lower(iterable)?;
 		let iteration = self
 			.annotations
-			.iterations
-			.iter()
-			.find(|(id, _)| *id == self.id(iterable))
-			.map(|(_, value)| value)
-			.ok_or_else(|| StableLoweringError::MissingAnnotation {
-				definition: self.artifact.definition.clone(),
-				node: self.id(iterable),
-				channel: "iteration".into(),
-			})?;
+			.iteration(self.id(iterable))
+			.ok_or_else(|| self.missing_annotation(self.id(iterable), "iteration"))?;
 		let (it, next, next_dispatch, option) = match iteration {
 			crate::RuntimeIteration::Direct {
 				iterator_interface,
@@ -5969,13 +5825,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				(lowered, next, next_dispatch, option)
 			}
 		};
-		self.scopes.borrow_mut().push(HashMap::new());
-		let it_name = self.declare(&"$it".into());
-		let go = self.declare(&"$go".into());
-		let pat = self.lower_pattern(variable)?;
-		let target = self.next_loop();
-		let body = self.lower_loop_branch(source_id, target, body)?;
-		self.scopes.borrow_mut().pop();
+		let (it_name, go, pat, target, body) = self.with_scope(|| {
+			let it_name = self.declare(&"$it".into());
+			let go = self.declare(&"$go".into());
+			let pat = self.lower_pattern(variable)?;
+			let target = self.next_loop();
+			let body = self.lower_loop_branch(source_id, target, body)?;
+			Ok((it_name, go, pat, target, body))
+		})?;
 		let call = if let Some(dispatch) = next_dispatch {
 			self.lower_iteration_next(dispatch, next, HirExpr::Local(it_name.clone()))?
 		} else {
@@ -6452,7 +6309,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		new_scope: bool,
 	) -> Result<HirExpr, StableLoweringError> {
 		if new_scope {
-			self.scopes.borrow_mut().push(HashMap::new());
+			return self.with_scope(|| self.lower_block(body, false));
 		}
 		let mut stmts = vec![];
 		let mut tail = None;
@@ -6487,9 +6344,6 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				}
 				StableStatement::Expr(expr) => stmts.push(HirStmt::Expr(self.lower(expr)?)),
 			}
-		}
-		if new_scope {
-			self.scopes.borrow_mut().pop();
 		}
 		Ok(HirExpr::Block { stmts, tail })
 	}

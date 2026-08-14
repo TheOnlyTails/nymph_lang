@@ -2790,6 +2790,30 @@ fn missing_index_dispatch_iteration_mode_and_iteration_resolution_are_distinct_t
 }
 
 #[test]
+fn runtime_annotation_lookups_are_typed_and_body_local() {
+	let mut item = artifacts("func identity(value: int): int = value")
+		.into_iter()
+		.find(|item| source_name(&item.definition) == "identity")
+		.unwrap();
+	let target = item.definition.clone();
+	let nymph_sema::RuntimePayload::NymphBody(body) = &mut item.payload else {
+		unreachable!()
+	};
+	let node = body.stable.root.id;
+	body.annotations.types = Arc::from([(node, InterfaceType::UInt)]);
+	body.annotations.definition_targets = Arc::from([(node, target.clone())]);
+	body.annotations.anonymous_closures = Arc::from([(node, 2)]);
+
+	assert_eq!(body.annotations.type_of(node), Some(&InterfaceType::UInt));
+	assert_eq!(body.annotations.definition_target(node), Some(&target));
+	assert_eq!(body.annotations.anonymous_closure_arity(node), Some(2));
+	assert_eq!(
+		body.annotations.type_of(nymph_sema::BodyNodeId(node.0 + 1)),
+		None
+	);
+}
+
+#[test]
 fn body_local_pattern_facts_survive_unrelated_earlier_declarations() {
 	let body = "enum Choice { Pair(left: int, right: int) }\nfunc choose(value: Choice): int = match (value) { Choice.Pair(left, right) -> left + right }";
 	let before = artifacts(body)
