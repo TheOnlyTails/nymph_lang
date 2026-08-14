@@ -96,14 +96,14 @@ func complex_reciprocal(value: Complex): Complex = {
 }
 
 func complex_power_uint(base: Complex, exponent: uint): Complex = {
-  if (exponent == 1u) { return base }
+  if (exponent == 1) { return base }
   let mut result = complex_one()
   let mut factor = base
   let mut remaining = exponent
-  while (remaining > 0u) {
-    if (remaining % 2u == 1u) { result = result * factor }
+  while (remaining > 0) {
+    if (remaining % 2 == 1) { result = result * factor }
     remaining = (remaining / 2u) as uint
-    if (remaining > 0u) { factor = factor * factor }
+    if (remaining > 0) { factor = factor * factor }
   }
   result
 }

@@ -15,7 +15,7 @@ enum Command {
 /// Turn raw arguments into a `Command`, or explain why we couldn't. List patterns
 /// (`#["add", ...words]`) match the subcommand and split off the rest.
 func parse(argv: #[string]): Result<Command, string> = match (argv) {
-  #["add", ...words] -> if (words.length() == 0u) {
+  #["add", ...words] -> if (words.length() == 0) {
     Error("`add` needs a title")
   } else {
     Ok(Command.Add(title = words.join(" ")))
@@ -61,7 +61,7 @@ impl Store {
     }
 
   func render(): string =
-    if (this.tasks.length() == 0u) {
+    if (this.tasks.length() == 0) {
       "no tasks yet — add one with `todo add <title>`"
     } else {
       this.tasks

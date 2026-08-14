@@ -28,7 +28,7 @@ public interface Iterator<Item> {
   /// Lazily return the remaining items in the stable order defined by `compare`.
   /// The source is materialized and sorted only when the result is first consumed.
   func sorted_by(compare: (Item, Item) -> Order): SortedBy<Item, self> =
-    SortedBy(source = this, compare = compare, items = #[], index = 0u, initialized = false)
+    SortedBy(source = this, compare = compare, items = #[], index = 0, initialized = false)
 
   /// Run `f` for its side effect on every remaining item, draining the iterator.
   mut func for_each(f: (Item) -> void): void = {
@@ -57,9 +57,9 @@ public interface Iterator<Item> {
 
   /// Count the remaining items, draining the iterator.
   mut func count(): uint = {
-    let mut n = 0u
+    let mut n: uint = 0
     for (item in this) {
-      n = n + 1u
+      n = n + 1
     }
     n
   }
@@ -102,8 +102,8 @@ struct Filtered<Item, S: Iterator<Item>>(source: S, predicate: (Item) -> boolean
 /// The lazy adapter behind [`Iterator::take`]: yields at most `remaining` items.
 struct Take<Item, S: Iterator<Item>>(source: S, remaining: uint) {
   impl Iterator<Item> {
-    mut func next(): Option<Item> = if (this.remaining > 0u) {
-      this.remaining = this.remaining - 1u
+    mut func next(): Option<Item> = if (this.remaining > 0) {
+      this.remaining = this.remaining - 1
       this.source.next()
     } else {
       Option.None
@@ -116,8 +116,8 @@ struct Take<Item, S: Iterator<Item>>(source: S, remaining: uint) {
 struct Drop<Item, S: Iterator<Item>>(source: S, remaining: uint) {
   impl Iterator<Item> {
     mut func next(): Option<Item> = {
-      while (this.remaining > 0u) {
-        this.remaining = this.remaining - 1u
+      while (this.remaining > 0) {
+        this.remaining = this.remaining - 1
         this.source.next()
       }
       this.source.next()
@@ -147,7 +147,7 @@ struct SortedBy<Item, S: Iterator<Item>>(
       }
 
       let current = this.items.get(this.index)
-      this.index = this.index + 1u
+      this.index = this.index + 1
       match (current) {
         Some(value) -> Option.Some(value = value),
         None -> Option.None,

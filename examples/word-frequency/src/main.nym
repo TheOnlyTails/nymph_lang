@@ -13,7 +13,7 @@ func main() = {
   let mut counts: #{string: int} = #{}
   for (raw in text.split(" ")) {
     let word = raw.trim().to_lower()
-    if (word.length() > 0u) {
+    if (word.length() > 0) {
       counts.insert(word, (counts.get(word) ?? 0) + 1)
     }
   }
@@ -25,7 +25,7 @@ func main() = {
     .entries()
     .iter()
     .sorted_by((a, b) -> b[1].compare_to(a[1]))
-    .take(5u)
+    .take(5)
 
   println("most common words:")
   for (#(word, count) in top) {

@@ -84,22 +84,22 @@ impl string {
   }
   func repeat(n: uint): string = {
     let mut result = ""
-    let mut i = 0u
+    let mut i: uint = 0
     while (i < n) {
       result = result.concat(this)
-      i = i + 1u
+      i = i + 1
     }
     result
   }
   func chars(): #[char] = {
     let mut result: #[char] = #[]
-    let mut i = 0u
+    let mut i: uint = 0
     while (i < this.length()) {
       match (this.char_at(i)) {
         Some(value) -> result.push(value),
         None -> {},
       }
-      i = i + 1u
+      i = i + 1
     }
     result
   }
@@ -114,9 +114,9 @@ impl string {
   func reversed(): string = {
     let mut result = ""
     let mut i = this.length()
-    while (i > 0u) {
-      i = i - 1u
-      result = result.concat(this.substring(i, i + 1u))
+    while (i > 0) {
+      i = i - 1
+      result = result.concat(this.substring(i, i + 1))
     }
     result
   }
@@ -133,17 +133,17 @@ impl string {
   func is_blank() = this.trim().is_empty()
 
   /// Returns the first Unicode code point, or `None` if empty.
-  func first(): Option<char> = this.char_at(0u)
+  func first(): Option<char> = this.char_at(0)
 
   /// Returns the last Unicode code point, or `None` if empty.
   func last(): Option<char> =
-    if (this.is_empty()) None else this.char_at(this.length() - 1u)
+    if (this.is_empty()) None else this.char_at(this.length() - 1)
 
   /// Drops the first `n` Unicode code points.
   func drop(n: uint): string = this.substring(n, this.length())
 
   /// Returns only the first `n` Unicode code points.
-  func take(n: uint): string = this.substring(0u, n)
+  func take(n: uint): string = this.substring(0, n)
 }
 
 impl Plus<Other = self, Output = self> for string {

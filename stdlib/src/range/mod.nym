@@ -27,14 +27,14 @@ impl Step for int {
 }
 
 impl Step for uint {
-  func next(): Option<uint> = if (this < 9007199254740991u) {
-    Option.Some(value = this + 1u)
+  func next(): Option<uint> = if (this < 9007199254740991) {
+    Option.Some(value = this + 1)
   } else {
     Option.None
   }
 
-  func previous(): Option<uint> = if (this > 0u && this <= 9007199254740991u) {
-    Option.Some(value = this - 1u)
+  func previous(): Option<uint> = if (this > 0 && this <= 9007199254740991) {
+    Option.Some(value = this - 1)
   } else {
     Option.None
   }

@@ -295,22 +295,22 @@ func int_power_uint(base: int, exponent: uint): int = {
   let mut result = 1
   let mut factor = base
   let mut remaining = exponent
-  while (remaining > 0u) {
-    if (remaining % 2u == 1u) { result = result * factor }
+  while (remaining > 0) {
+    if (remaining % 2 == 1) { result = result * factor }
     remaining = (remaining / 2u) as uint
-    if (remaining > 0u) { factor = factor * factor }
+    if (remaining > 0) { factor = factor * factor }
   }
   result
 }
 
 func uint_power_uint(base: uint, exponent: uint): uint = {
-  let mut result = 1u
+  let mut result: uint = 1
   let mut factor = base
   let mut remaining = exponent
-  while (remaining > 0u) {
-    if (remaining % 2u == 1u) { result = result * factor }
+  while (remaining > 0) {
+    if (remaining % 2 == 1) { result = result * factor }
     remaining = (remaining / 2u) as uint
-    if (remaining > 0u) { factor = factor * factor }
+    if (remaining > 0) { factor = factor * factor }
   }
   result
 }
@@ -319,10 +319,10 @@ func float_power_uint(base: float, exponent: uint): float = {
   let mut result = 1.0
   let mut factor = base
   let mut remaining = exponent
-  while (remaining > 0u) {
-    if (remaining % 2u == 1u) { result = result * factor }
+  while (remaining > 0) {
+    if (remaining % 2 == 1) { result = result * factor }
     remaining = (remaining / 2u) as uint
-    if (remaining > 0u) { factor = factor * factor }
+    if (remaining > 0) { factor = factor * factor }
   }
   result
 }
@@ -350,7 +350,7 @@ impl Power<Other = int, Output = float> for int {
 
 impl Power<Other = int, Output = float> for uint {
   func power(other: int): float = if (other < 0) {
-    if (this == 0u) { scalar_power_domain_error() }
+    if (this == 0) { scalar_power_domain_error() }
     1.0 / float_power_uint(this as float, other as uint)
   } else {
     float_power_uint(this as float, other as uint)

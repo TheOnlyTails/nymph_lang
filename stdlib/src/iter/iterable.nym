@@ -19,7 +19,7 @@ struct ListIter<T>(items: #[T], index: uint) {
       // adapters' `Option::map` etc. are available (the tags compare equal, both
       // being `Symbol.for("Option.…")`). Past the end, `get` yields `None`.
       let current = this.items.get(this.index)
-      this.index = this.index + 1u
+      this.index = this.index + 1
       match (current) {
         Some(value) -> Option.Some(value = value),
         None -> Option.None,
@@ -29,5 +29,5 @@ struct ListIter<T>(items: #[T], index: uint) {
 }
 
 impl<T> Iterable<T> for #[T] {
-  func iter(): ListIter<T> = ListIter(items = this, index = 0u)
+  func iter(): ListIter<T> = ListIter(items = this, index = 0)
 }

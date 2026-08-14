@@ -14,7 +14,7 @@ impl<T> mut #[T] {
 
   /// Removes and returns the last element, or `None` if empty.
   func pop(): Option<T> =
-    if (this.is_empty()) Option.None else this.remove(this.length() - 1u)
+    if (this.is_empty()) Option.None else this.remove(this.length() - 1)
 
   func is_empty(): boolean = this.length() == 0
   func is_not_empty(): boolean = !this.is_empty()
@@ -25,18 +25,18 @@ impl<T> #[T] {
   external(get) func get(i: uint): Option<T>
 
   /// Returns the first element, or `None` if empty.
-  func first(): Option<T> = this.get(0u)
+  func first(): Option<T> = this.get(0)
 
   /// Returns the last element, or `None` if empty.
   func last(): Option<T> =
-    if (this.is_empty()) Option.None else this.get(this.length() - 1u)
+    if (this.is_empty()) Option.None else this.get(this.length() - 1)
 
   /// Returns a new list with elements from `start` (inclusive) to `end` (exclusive).
   external(slice) func slice(start: uint, end: uint): #[T]
 
   /// Returns a new list with `other` appended.
   func concat(other: #[T]): #[T] = {
-    let mut result = this.slice(0u, this.length())
+    let mut result = this.slice(0, this.length())
     for (item in other) {
       result.push(item)
     }
@@ -47,9 +47,9 @@ impl<T> #[T] {
   func reversed(): #[T] = {
     let mut result: #[T] = #[]
     let mut i = this.length()
-    while (i > 0u) {
-      i = i - 1u
-      result.push(this[i as int])
+    while (i > 0) {
+      i = i - 1
+      result.push(this[i])
     }
     result
   }
@@ -57,8 +57,8 @@ impl<T> #[T] {
   /// Returns a list of sub-lists, each of the given `size` (the last chunk may be smaller).
   func chunked(size: uint): #[#[T]] = {
     let mut result: #[#[T]] = #[]
-    if (size > 0u) {
-      let mut start = 0u
+    if (size > 0) {
+      let mut start: uint = 0
       while (start < this.length()) {
         result.push(this.slice(start, start + size))
         start = start + size
@@ -71,23 +71,23 @@ impl<T> #[T] {
   func drop(n: uint): #[T] = this.slice(n, this.length())
 
   /// Returns a new list with only the first `n` elements.
-  func take(n: uint): #[T] = this.slice(0u, n)
+  func take(n: uint): #[T] = this.slice(0, n)
 
   /// Returns whether any element satisfies `predicate`, stopping at the first match.
   func any(predicate: (T) -> boolean): boolean = {
-    let mut i = 0u
+    let mut i: uint = 0
     while (i < this.length()) {
-      if (predicate(this[i as int])) {
+      if (predicate(this[i])) {
         return true
       }
-      i = i + 1u
+      i = i + 1
     }
     false
   }
 
   /// Returns a new list stably ordered by `compare`; the source is unchanged.
   func sort_by(compare: (T, T) -> Order): #[T] = {
-    let mut result = this.slice(0u, this.length())
+    let mut result = this.slice(0, this.length())
     let mut i = 1
     while (i < result.length()) {
       let mut j = i
@@ -107,15 +107,15 @@ impl<T: Into<Other = string>> #[T] {
   /// Converts each element to a string and joins them with `separator`.
   func join(separator: string): string = {
     let mut result = ""
-    let mut i = 0u
+    let mut i: uint = 0
     while (i < this.length()) {
-      if (i > 0u) {
+      if (i > 0) {
         result = result + separator
       }
       // `Into<string>`'s standard blanket implementation delegates to the same
       // `Display` conversion used by interpolation.
-      result = result + "${this[i as int]}"
-      i = i + 1u
+      result = result + "${this[i]}"
+      i = i + 1
     }
     result
   }
