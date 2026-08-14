@@ -3,9 +3,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::NymphCommand;
-use crate::project_support::{
-	ManifestSelection, fs_loader, load_project, render_project_diagnostics,
-};
+use crate::project_support::{ManifestSelection, load_project, render_project_diagnostics};
 
 #[derive(clap::Args)]
 pub(crate) struct DocCommand {
@@ -48,7 +46,7 @@ impl DocCommand {
 			}
 		};
 		let source_root = project.source_root();
-		let load = fs_loader(source_root.clone());
+		let load = nymph_project::fs_loader(source_root.clone());
 		let documentation = match nymph_compiler::document_project(
 			entry.as_str(),
 			&load,

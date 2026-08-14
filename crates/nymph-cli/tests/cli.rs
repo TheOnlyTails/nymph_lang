@@ -812,6 +812,24 @@ fn check_reports_a_type_error_with_location_and_message() {
 }
 
 #[test]
+fn check_renders_warnings_without_failing() {
+	let path = write_source("func value(): int = 9007199254740992");
+	let out = nymph(&["check", path.to_str().unwrap()]);
+	let _ = std::fs::remove_file(&path);
+
+	assert!(
+		out.status.success(),
+		"warnings alone should exit successfully: {}",
+		out.stderr
+	);
+	assert!(
+		out.stderr.to_ascii_lowercase().contains("warning"),
+		"the warning should still be rendered: {}",
+		out.stderr
+	);
+}
+
+#[test]
 fn build_writes_the_compiled_js_on_success() {
 	let path = write_source("func add(a: int, b: int): int = a + b");
 	let output_path = path.with_extension("mjs");
@@ -1542,6 +1560,23 @@ fn run_without_a_top_level_main_errors_and_does_not_invoke_node() {
 	assert!(
 		out.stderr.contains("no `main` function found"),
 		"stderr should carry the checker's missing-main diagnostic:\n{}",
+		out.stderr
+	);
+}
+
+#[test]
+fn run_forces_entry_compilation_for_an_explicit_project_library() {
+	let root = write_project("main.nym", "func main(): void = {}\n");
+	let library = root.join("src/library.nym");
+	std::fs::write(&library, "public func answer(): int = 42\n").unwrap();
+
+	let out = nymph_in(&["run", library.to_str().unwrap()], &root);
+	std::fs::remove_dir_all(root).unwrap();
+
+	assert_eq!(out.status.code(), Some(1), "{}", out.stderr);
+	assert!(
+		out.stderr.contains("no `main` function found"),
+		"run must compile a library-intent target in entry mode: {}",
 		out.stderr
 	);
 }

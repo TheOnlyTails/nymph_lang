@@ -8,6 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::compile_guard::{guarded, unsupported_feature_message};
+
 /// Select whether target resolution discovers the nearest conventional
 /// manifest or loads one explicit path authoritatively.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -71,6 +73,79 @@ pub(crate) struct ResolvedTarget {
 	pub src_root: PathBuf,
 	pub entry_key: String,
 	pub intent: TargetIntent,
+}
+
+/// Shared target, source loader, compiler dispatch, and diagnostic context for
+/// a single `build`, `check`, or `run` operation.
+pub(crate) struct ProjectOperation {
+	target: ResolvedTarget,
+	load: Box<dyn Fn(&str) -> Option<String>>,
+}
+
+impl ProjectOperation {
+	/// Resolve the command target and report selection failures consistently.
+	pub fn resolve(file: Option<&Path>, manifest: &ManifestSelection) -> Option<Self> {
+		let target = resolve(file, manifest)
+			.map_err(|error| {
+				eprintln!("error: {error}");
+			})
+			.ok()?;
+		let load = Box::new(nymph_project::fs_loader(target.src_root.clone()));
+		Some(Self { target, load })
+	}
+
+	pub fn target_file(&self) -> &Path {
+		&self.target.file
+	}
+
+	pub fn check_selected_mode(&self) -> Vec<nymph_compiler::ProjectDiagnostic> {
+		match self.target.intent {
+			TargetIntent::Entry => {
+				nymph_compiler::check_project_with_embedded_std(&self.target.entry_key, &self.load)
+			}
+			TargetIntent::Library => {
+				nymph_compiler::check_project_library_with_embedded_std(&self.target.entry_key, &self.load)
+			}
+		}
+	}
+
+	pub fn compile_selected_mode(&self) -> Option<nymph_compiler::CompiledProject> {
+		self.compile(self.target.intent)
+	}
+
+	pub fn compile_entry(&self) -> Option<nymph_compiler::CompiledProject> {
+		self.compile(TargetIntent::Entry)
+	}
+
+	pub fn render(&self, diagnostics: &[nymph_compiler::ProjectDiagnostic]) -> String {
+		render_project_diagnostics(diagnostics, &self.target.src_root, &self.load)
+	}
+
+	fn compile(&self, intent: TargetIntent) -> Option<nymph_compiler::CompiledProject> {
+		let result = guarded(|| match intent {
+			TargetIntent::Entry => nymph_compiler::compile_project_with_std(
+				&self.target.entry_key,
+				&self.load,
+				&nymph_compiler::embedded_std_provider,
+			),
+			TargetIntent::Library => nymph_compiler::compile_project_library_with_std(
+				&self.target.entry_key,
+				&self.load,
+				&nymph_compiler::embedded_std_provider,
+			),
+		});
+		match result {
+			Ok(Ok(compiled)) => Some(compiled),
+			Ok(Err(diagnostics)) => {
+				eprint!("{}", self.render(&diagnostics));
+				None
+			}
+			Err(payload) => {
+				eprintln!("{}", unsupported_feature_message(&payload));
+				None
+			}
+		}
+	}
 }
 
 /// Resolve an optional explicit file using the selected manifest policy. An
@@ -182,12 +257,6 @@ fn ensure_source_within_root(file: &Path, src_root: &Path) -> anyhow::Result<()>
 			src_root.display()
 		)
 	}
-}
-
-/// Build the FS-backed `load` closure a `src_root`'s project driver call
-/// needs: a canonical key `"a/b"` maps to `<src_root>/a/b.nym`.
-pub(crate) fn fs_loader(src_root: PathBuf) -> impl Fn(&str) -> Option<String> {
-	nymph_project::fs_loader(src_root)
 }
 
 /// Render a batch of project diagnostics, each against its own module's

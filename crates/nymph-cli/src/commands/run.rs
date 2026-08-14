@@ -3,8 +3,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::NymphCommand;
-use crate::compile_guard::{CompileOutcome, compile_guarded, guarded, unsupported_feature_message};
-use crate::project_support::{self, ManifestSelection, fs_loader, render_project_diagnostics};
+use crate::compile_guard::{CompileOutcome, compile_guarded, unsupported_feature_message};
+use crate::project_support::{ManifestSelection, ProjectOperation};
 
 /// `nymph run [file]` — compile a Nymph source file and execute it under
 /// `node`, forwarding stdout/stderr live and propagating node's exit status.
@@ -50,33 +50,13 @@ impl NymphCommand for RunCommand {
 			return run_inline_expr(expr);
 		}
 
-		let target = match project_support::resolve(self.file.as_deref(), manifest) {
-			Ok(target) => target,
-			Err(error) => {
-				eprintln!("error: {error}");
-				return 1;
-			}
+		let operation = match ProjectOperation::resolve(self.file.as_deref(), manifest) {
+			Some(operation) => operation,
+			None => return 1,
 		};
-		let load = fs_loader(target.src_root.clone());
-		match guarded(|| {
-			nymph_compiler::compile_project_with_std(
-				&target.entry_key,
-				&load,
-				&nymph_compiler::embedded_std_provider,
-			)
-		}) {
-			Ok(Ok(compiled)) => execute(&format!("{}\n{}();\n", compiled.js, compiled.entry_main)),
-			Ok(Err(diags)) => {
-				eprint!(
-					"{}",
-					render_project_diagnostics(&diags, &target.src_root, &load)
-				);
-				1
-			}
-			Err(payload) => {
-				eprintln!("{}", unsupported_feature_message(&payload));
-				1
-			}
+		match operation.compile_entry() {
+			Some(compiled) => execute(&format!("{}\n{}();\n", compiled.js, compiled.entry_main)),
+			None => 1,
 		}
 	}
 }

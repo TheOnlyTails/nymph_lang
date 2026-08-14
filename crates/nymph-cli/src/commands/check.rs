@@ -1,9 +1,7 @@
 use std::path::PathBuf;
 
 use crate::NymphCommand;
-use crate::project_support::{
-	self, ManifestSelection, TargetIntent, fs_loader, render_project_diagnostics,
-};
+use crate::project_support::{ManifestSelection, ProjectOperation};
 
 /// `nymph check [file]` — parse and type-check a Nymph source file. Prints
 /// "ok" and exits 0 when there are no diagnostics; otherwise renders every
@@ -22,30 +20,16 @@ pub(crate) struct CheckCommand {
 
 impl NymphCommand for CheckCommand {
 	fn run(&self, manifest: &ManifestSelection) -> i32 {
-		let target = match project_support::resolve(self.file.as_deref(), manifest) {
-			Ok(target) => target,
-			Err(error) => {
-				eprintln!("error: {error}");
-				return 1;
-			}
+		let operation = match ProjectOperation::resolve(self.file.as_deref(), manifest) {
+			Some(operation) => operation,
+			None => return 1,
 		};
-		let load = fs_loader(target.src_root.clone());
-		let diagnostics = match target.intent {
-			TargetIntent::Entry => {
-				nymph_compiler::check_project_with_embedded_std(&target.entry_key, &load)
-			}
-			TargetIntent::Library => {
-				nymph_compiler::check_project_library_with_embedded_std(&target.entry_key, &load)
-			}
-		};
+		let diagnostics = operation.check_selected_mode();
 		if diagnostics.is_empty() {
 			println!("ok");
 			return 0;
 		}
-		eprint!(
-			"{}",
-			render_project_diagnostics(&diagnostics, &target.src_root, &load)
-		);
+		eprint!("{}", operation.render(&diagnostics));
 		i32::from(diagnostics.iter().any(|d| d.diag.is_error()))
 	}
 }

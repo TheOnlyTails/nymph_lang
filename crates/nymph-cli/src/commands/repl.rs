@@ -3,7 +3,7 @@ use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
 
 use crate::NymphCommand;
 use crate::compile_guard::{guarded, unsupported_feature_message};
-use crate::project_support::{self, ManifestSelection, fs_loader};
+use crate::project_support::{self, ManifestSelection};
 
 /// Start a persistent, project-aware Nymph read-eval-print loop.
 ///
@@ -26,7 +26,7 @@ impl NymphCommand for ReplCommand {
 		let mut session = context
 			.src_root
 			.map_or_else(nymph_compiler::ReplSession::loose, |root| {
-				nymph_compiler::ReplSession::new(fs_loader(root))
+				nymph_compiler::ReplSession::new(nymph_project::fs_loader(root))
 			});
 		let mut worker = match ReplWorker::start() {
 			Ok(worker) => worker,
@@ -118,7 +118,7 @@ fn render_error(error: &nymph_compiler::ReplStageError, src_root: Option<&std::p
 	let Some((diagnostics, staged_module, staged_source)) = error.diagnostics() else {
 		return;
 	};
-	let disk = src_root.map(|root| fs_loader(root.to_path_buf()));
+	let disk = src_root.map(|root| nymph_project::fs_loader(root.to_path_buf()));
 	for item in diagnostics {
 		let (filename, source) = if item.module == staged_module {
 			("<repl>".to_string(), staged_source.to_string())

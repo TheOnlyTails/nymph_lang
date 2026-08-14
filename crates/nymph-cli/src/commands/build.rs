@@ -2,10 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::NymphCommand;
-use crate::compile_guard::{guarded, unsupported_feature_message};
-use crate::project_support::{
-	self, ManifestSelection, TargetIntent, fs_loader, render_project_diagnostics,
-};
+use crate::project_support::{ManifestSelection, ProjectOperation};
 
 /// compile a Nymph source file to a JavaScript module.
 #[derive(clap::Args)]
@@ -20,49 +17,23 @@ pub(crate) struct BuildCommand {
 
 impl NymphCommand for BuildCommand {
 	fn run(&self, manifest: &ManifestSelection) -> i32 {
-		let target = match project_support::resolve(self.file.as_deref(), manifest) {
-			Ok(target) => target,
-			Err(error) => {
-				eprintln!("error: {error}");
-				return 1;
-			}
+		let operation = match ProjectOperation::resolve(self.file.as_deref(), manifest) {
+			Some(operation) => operation,
+			None => return 1,
 		};
 		let output_path = self
 			.output
 			.clone()
-			.unwrap_or_else(|| target.file.with_extension("mjs"));
-		let load = fs_loader(target.src_root.clone());
-		let result = guarded(|| match target.intent {
-			TargetIntent::Entry => nymph_compiler::compile_project_with_std(
-				&target.entry_key,
-				&load,
-				&nymph_compiler::embedded_std_provider,
-			),
-			TargetIntent::Library => nymph_compiler::compile_project_library_with_std(
-				&target.entry_key,
-				&load,
-				&nymph_compiler::embedded_std_provider,
-			),
-		});
-		match result {
-			Ok(Ok(compiled)) => match write_output_atomically(&output_path, &compiled.js) {
+			.unwrap_or_else(|| operation.target_file().with_extension("mjs"));
+		match operation.compile_selected_mode() {
+			Some(compiled) => match write_output_atomically(&output_path, &compiled.js) {
 				Ok(()) => 0,
 				Err(err) => {
 					eprintln!("error: could not write {}: {err}", output_path.display());
 					1
 				}
 			},
-			Ok(Err(diags)) => {
-				eprint!(
-					"{}",
-					render_project_diagnostics(&diags, &target.src_root, &load)
-				);
-				1
-			}
-			Err(payload) => {
-				eprintln!("{}", unsupported_feature_message(&payload));
-				1
-			}
+			None => 1,
 		}
 	}
 }
