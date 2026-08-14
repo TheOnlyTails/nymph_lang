@@ -30,8 +30,7 @@ use nymph_ast::{
 		InterfaceMember, LetKind, Module, StructField, StructImpl, Visibility,
 	},
 	expr::{
-		Expr, ExprKind, ListItem, ListPatternEntry, MapEntry, MapPatternEntry, Pattern, RangeKind,
-		Statement, StringPart, StructPatternField,
+		Expr, ExprKind, ListPatternEntry, MapPatternEntry, Pattern, Statement, StructPatternField,
 	},
 	token::Token,
 	ty::{GenericParam, Type},
@@ -1019,114 +1018,7 @@ fn collect_interface_member<'a>(member: &'a InterfaceMember, out: &mut Vec<&'a E
 
 fn collect_expr<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 	out.push(expr);
-	match &expr.kind {
-		ExprKind::Int(_)
-		| ExprKind::UInt(_)
-		| ExprKind::Float(_)
-		| ExprKind::Char(_)
-		| ExprKind::Boolean(_)
-		| ExprKind::Identifier(_)
-		| ExprKind::AnonymousParam(_)
-		| ExprKind::This
-		| ExprKind::Continue { .. } => {}
-		ExprKind::String(parts) => {
-			for p in parts {
-				if let StringPart::InterpolatedExpr(e) = &p.0 {
-					collect_expr(e, out);
-				}
-			}
-		}
-		ExprKind::List(items) | ExprKind::Tuple(items) => {
-			for item in items {
-				match &item.0 {
-					ListItem::Expr(e) | ListItem::Spread(e) => collect_expr(e, out),
-				}
-			}
-		}
-		ExprKind::Map(entries) => {
-			for entry in entries {
-				match &entry.0 {
-					MapEntry::Entry(k, v) => {
-						collect_expr(k, out);
-						collect_expr(v, out);
-					}
-					MapEntry::Spread(e) => collect_expr(e, out),
-				}
-			}
-		}
-		ExprKind::Range(kind) => match kind {
-			RangeKind::From(e) | RangeKind::To(e) | RangeKind::ToInclusive(e) => {
-				collect_expr(e, out);
-			}
-			RangeKind::Exclusive { min, max } | RangeKind::Inclusive { min, max } => {
-				collect_expr(min, out);
-				collect_expr(max, out);
-			}
-		},
-		ExprKind::Call { func, args, .. } => {
-			collect_expr(func, out);
-			for arg in args {
-				collect_expr(&arg.0.value, out);
-			}
-		}
-		ExprKind::MemberAccess { parent, .. } => collect_expr(parent, out),
-		ExprKind::IndexAccess { parent, index, .. } => {
-			collect_expr(parent, out);
-			collect_expr(index, out);
-		}
-		ExprKind::Closure { body, .. } => collect_expr(body, out),
-		ExprKind::PrefixOp { value, .. } | ExprKind::PostfixOp { value, .. } => {
-			collect_expr(value, out);
-		}
-		ExprKind::BinaryOp { lhs, rhs, .. } | ExprKind::AssignOp { lhs, rhs, .. } => {
-			collect_expr(lhs, out);
-			collect_expr(rhs, out);
-		}
-		ExprKind::TypeOp { lhs, .. } | ExprKind::PatternOp { lhs, .. } => collect_expr(lhs, out),
-		ExprKind::Return { value, .. } | ExprKind::Break { value, .. } => {
-			if let Some(v) = value {
-				collect_expr(v, out);
-			}
-		}
-		ExprKind::While {
-			condition, body, ..
-		} => {
-			collect_expr(condition, out);
-			collect_expr(body, out);
-		}
-		ExprKind::For { iterable, body, .. } => {
-			collect_expr(iterable, out);
-			collect_expr(body, out);
-		}
-		ExprKind::If {
-			condition,
-			then,
-			otherwise,
-		} => {
-			collect_expr(condition, out);
-			collect_expr(then, out);
-			if let Some(o) = otherwise {
-				collect_expr(o, out);
-			}
-		}
-		ExprKind::Match { value, arms } => {
-			collect_expr(value, out);
-			for arm in arms {
-				if let Some(g) = &arm.guard {
-					collect_expr(g, out);
-				}
-				collect_expr(&arm.body, out);
-			}
-		}
-		ExprKind::Block { body, .. } => {
-			for stmt in body {
-				match &stmt.0 {
-					Statement::Expr(e) | Statement::Let { value: e, .. } => collect_expr(e, out),
-				}
-			}
-		}
-		ExprKind::Grouped(inner) => collect_expr(inner, out),
-	}
+	expr.for_each_child(|child| collect_expr(child, out));
 }
 
 // ── Go-to-definition ───────────────────────────────────────────────────────
@@ -1944,45 +1836,6 @@ fn walk_expr<'a>(
 	}
 
 	match &expr.kind {
-		ExprKind::Int(_)
-		| ExprKind::UInt(_)
-		| ExprKind::Float(_)
-		| ExprKind::Char(_)
-		| ExprKind::Boolean(_)
-		| ExprKind::Identifier(_)
-		| ExprKind::AnonymousParam(_)
-		| ExprKind::This
-		| ExprKind::Continue { .. } => None,
-		ExprKind::String(parts) => parts.iter().find_map(|p| match &p.0 {
-			StringPart::InterpolatedExpr(e) => walk_expr(e, target_id, scopes),
-			_ => None,
-		}),
-		ExprKind::List(items) | ExprKind::Tuple(items) => items.iter().find_map(|item| match &item.0 {
-			ListItem::Expr(e) | ListItem::Spread(e) => walk_expr(e, target_id, scopes),
-		}),
-		ExprKind::Map(entries) => entries.iter().find_map(|entry| match &entry.0 {
-			MapEntry::Entry(k, v) => {
-				walk_expr(k, target_id, scopes).or_else(|| walk_expr(v, target_id, scopes))
-			}
-			MapEntry::Spread(e) => walk_expr(e, target_id, scopes),
-		}),
-		ExprKind::Range(kind) => match kind {
-			RangeKind::From(e) | RangeKind::To(e) | RangeKind::ToInclusive(e) => {
-				walk_expr(e, target_id, scopes)
-			}
-			RangeKind::Exclusive { min, max } | RangeKind::Inclusive { min, max } => {
-				walk_expr(min, target_id, scopes).or_else(|| walk_expr(max, target_id, scopes))
-			}
-		},
-		ExprKind::Call { func, args, .. } => walk_expr(func, target_id, scopes).or_else(|| {
-			args
-				.iter()
-				.find_map(|arg| walk_expr(&arg.0.value, target_id, scopes))
-		}),
-		ExprKind::MemberAccess { parent, .. } => walk_expr(parent, target_id, scopes),
-		ExprKind::IndexAccess { parent, index, .. } => {
-			walk_expr(parent, target_id, scopes).or_else(|| walk_expr(index, target_id, scopes))
-		}
 		ExprKind::Closure { params, body, .. } => {
 			let base = scopes.len();
 			for p in params {
@@ -1992,21 +1845,6 @@ fn walk_expr<'a>(
 			scopes.truncate(base);
 			result
 		}
-		ExprKind::PrefixOp { value, .. } | ExprKind::PostfixOp { value, .. } => {
-			walk_expr(value, target_id, scopes)
-		}
-		ExprKind::BinaryOp { lhs, rhs, .. } | ExprKind::AssignOp { lhs, rhs, .. } => {
-			walk_expr(lhs, target_id, scopes).or_else(|| walk_expr(rhs, target_id, scopes))
-		}
-		ExprKind::TypeOp { lhs, .. } | ExprKind::PatternOp { lhs, .. } => {
-			walk_expr(lhs, target_id, scopes)
-		}
-		ExprKind::Return { value, .. } | ExprKind::Break { value, .. } => {
-			value.as_ref().and_then(|v| walk_expr(v, target_id, scopes))
-		}
-		ExprKind::While {
-			condition, body, ..
-		} => walk_expr(condition, target_id, scopes).or_else(|| walk_expr(body, target_id, scopes)),
 		ExprKind::For {
 			variable,
 			iterable,
@@ -2022,17 +1860,6 @@ fn walk_expr<'a>(
 			scopes.truncate(base);
 			result
 		}
-		ExprKind::If {
-			condition,
-			then,
-			otherwise,
-		} => walk_expr(condition, target_id, scopes)
-			.or_else(|| walk_expr(then, target_id, scopes))
-			.or_else(|| {
-				otherwise
-					.as_ref()
-					.and_then(|o| walk_expr(o, target_id, scopes))
-			}),
 		ExprKind::Match { value, arms } => {
 			if let Some(r) = walk_expr(value, target_id, scopes) {
 				return Some(r);
@@ -2074,7 +1901,15 @@ fn walk_expr<'a>(
 			scopes.truncate(base);
 			result
 		}
-		ExprKind::Grouped(inner) => walk_expr(inner, target_id, scopes),
+		_ => {
+			let mut result = None;
+			expr.for_each_child(|child| {
+				if result.is_none() {
+					result = walk_expr(child, target_id, scopes);
+				}
+			});
+			result
+		}
 	}
 }
 
@@ -3921,52 +3756,7 @@ fn collect_fallback_exprs(
 	out: &mut Vec<(Span, String)>,
 ) {
 	match &expr.kind {
-		ExprKind::Int(_)
-		| ExprKind::UInt(_)
-		| ExprKind::Float(_)
-		| ExprKind::Char(_)
-		| ExprKind::Boolean(_)
-		| ExprKind::Identifier(_)
-		| ExprKind::AnonymousParam(_)
-		| ExprKind::This
-		| ExprKind::Continue { .. } => {}
-		ExprKind::String(parts) => {
-			for p in parts {
-				if let StringPart::InterpolatedExpr(e) = &p.0 {
-					collect_fallback_exprs(e, checked, module, defs, params, out);
-				}
-			}
-		}
-		ExprKind::List(items) | ExprKind::Tuple(items) => {
-			for item in items {
-				match &item.0 {
-					ListItem::Expr(e) | ListItem::Spread(e) => {
-						collect_fallback_exprs(e, checked, module, defs, params, out);
-					}
-				}
-			}
-		}
-		ExprKind::Map(entries) => {
-			for entry in entries {
-				match &entry.0 {
-					MapEntry::Entry(k, v) => {
-						collect_fallback_exprs(k, checked, module, defs, params, out);
-						collect_fallback_exprs(v, checked, module, defs, params, out);
-					}
-					MapEntry::Spread(e) => collect_fallback_exprs(e, checked, module, defs, params, out),
-				}
-			}
-		}
-		ExprKind::Range(kind) => match kind {
-			RangeKind::From(e) | RangeKind::To(e) | RangeKind::ToInclusive(e) => {
-				collect_fallback_exprs(e, checked, module, defs, params, out);
-			}
-			RangeKind::Exclusive { min, max } | RangeKind::Inclusive { min, max } => {
-				collect_fallback_exprs(min, checked, module, defs, params, out);
-				collect_fallback_exprs(max, checked, module, defs, params, out);
-			}
-		},
-		ExprKind::Call { func, args, .. } => {
+		ExprKind::Call { func, .. } => {
 			if let ExprKind::Identifier(name) = &func.kind
 				&& checked.annotations.get(func.id).is_none()
 			{
@@ -3982,22 +3772,9 @@ fn collect_fallback_exprs(
 					out.push((func.span, defs.data(enum_def).name.to_string()));
 				}
 			}
-			collect_fallback_exprs(func, checked, module, defs, params, out);
-			for arg in args {
-				collect_fallback_exprs(&arg.0.value, checked, module, defs, params, out);
-			}
-		}
-		ExprKind::MemberAccess { parent, .. } => {
-			collect_fallback_exprs(parent, checked, module, defs, params, out);
-		}
-		ExprKind::IndexAccess { parent, index, .. } => {
-			collect_fallback_exprs(parent, checked, module, defs, params, out);
-			collect_fallback_exprs(index, checked, module, defs, params, out);
 		}
 		ExprKind::Closure {
-			params: cparams,
-			body,
-			..
+			params: cparams, ..
 		} => {
 			for p in cparams {
 				if let Some(t) = &p.0.type_ {
@@ -4013,28 +3790,6 @@ fn collect_fallback_exprs(
 					);
 				}
 			}
-			collect_fallback_exprs(body, checked, module, defs, params, out);
-		}
-		ExprKind::PrefixOp { value, .. } | ExprKind::PostfixOp { value, .. } => {
-			collect_fallback_exprs(value, checked, module, defs, params, out);
-		}
-		ExprKind::BinaryOp { lhs, rhs, .. } | ExprKind::AssignOp { lhs, rhs, .. } => {
-			collect_fallback_exprs(lhs, checked, module, defs, params, out);
-			collect_fallback_exprs(rhs, checked, module, defs, params, out);
-		}
-		ExprKind::TypeOp { lhs, .. } | ExprKind::PatternOp { lhs, .. } => {
-			collect_fallback_exprs(lhs, checked, module, defs, params, out);
-		}
-		ExprKind::Return { value, .. } | ExprKind::Break { value, .. } => {
-			if let Some(v) = value {
-				collect_fallback_exprs(v, checked, module, defs, params, out);
-			}
-		}
-		ExprKind::While {
-			condition, body, ..
-		} => {
-			collect_fallback_exprs(condition, checked, module, defs, params, out);
-			collect_fallback_exprs(body, checked, module, defs, params, out);
 		}
 		ExprKind::For {
 			variable,
@@ -4045,17 +3800,7 @@ fn collect_fallback_exprs(
 			collect_fallback_exprs(iterable, checked, module, defs, params, out);
 			push_for_binder_candidates(variable, iterable, checked, module, defs, params, out);
 			collect_fallback_exprs(body, checked, module, defs, params, out);
-		}
-		ExprKind::If {
-			condition,
-			then,
-			otherwise,
-		} => {
-			collect_fallback_exprs(condition, checked, module, defs, params, out);
-			collect_fallback_exprs(then, checked, module, defs, params, out);
-			if let Some(o) = otherwise {
-				collect_fallback_exprs(o, checked, module, defs, params, out);
-			}
+			return;
 		}
 		ExprKind::Match { value, arms } => {
 			collect_fallback_exprs(value, checked, module, defs, params, out);
@@ -4070,6 +3815,7 @@ fn collect_fallback_exprs(
 				}
 				collect_fallback_exprs(&arm.body, checked, module, defs, params, out);
 			}
+			return;
 		}
 		ExprKind::Block { body, .. } => {
 			for stmt in body {
@@ -4084,9 +3830,14 @@ fn collect_fallback_exprs(
 					}
 				}
 			}
+			return;
 		}
-		ExprKind::Grouped(inner) => collect_fallback_exprs(inner, checked, module, defs, params, out),
+		_ => {}
 	}
+
+	expr.for_each_child(|child| {
+		collect_fallback_exprs(child, checked, module, defs, params, out);
+	});
 }
 
 // ── In-scope names (for completion) ─────────────────────────────────────────
@@ -4217,62 +3968,6 @@ fn collect_expr_scope_names<'a>(
 		.extend(scopes.iter().map(|(n, _)| (*n).to_string()));
 
 	match &expr.kind {
-		ExprKind::Int(_)
-		| ExprKind::UInt(_)
-		| ExprKind::Float(_)
-		| ExprKind::Char(_)
-		| ExprKind::Boolean(_)
-		| ExprKind::Identifier(_)
-		| ExprKind::AnonymousParam(_)
-		| ExprKind::This
-		| ExprKind::Continue { .. } => {}
-		ExprKind::String(parts) => {
-			for p in parts {
-				if let StringPart::InterpolatedExpr(e) = &p.0 {
-					collect_expr_scope_names(e, offset, scopes, out);
-				}
-			}
-		}
-		ExprKind::List(items) | ExprKind::Tuple(items) => {
-			for item in items {
-				match &item.0 {
-					ListItem::Expr(e) | ListItem::Spread(e) => {
-						collect_expr_scope_names(e, offset, scopes, out);
-					}
-				}
-			}
-		}
-		ExprKind::Map(entries) => {
-			for entry in entries {
-				match &entry.0 {
-					MapEntry::Entry(k, v) => {
-						collect_expr_scope_names(k, offset, scopes, out);
-						collect_expr_scope_names(v, offset, scopes, out);
-					}
-					MapEntry::Spread(e) => collect_expr_scope_names(e, offset, scopes, out),
-				}
-			}
-		}
-		ExprKind::Range(kind) => match kind {
-			RangeKind::From(e) | RangeKind::To(e) | RangeKind::ToInclusive(e) => {
-				collect_expr_scope_names(e, offset, scopes, out);
-			}
-			RangeKind::Exclusive { min, max } | RangeKind::Inclusive { min, max } => {
-				collect_expr_scope_names(min, offset, scopes, out);
-				collect_expr_scope_names(max, offset, scopes, out);
-			}
-		},
-		ExprKind::Call { func, args, .. } => {
-			collect_expr_scope_names(func, offset, scopes, out);
-			for arg in args {
-				collect_expr_scope_names(&arg.0.value, offset, scopes, out);
-			}
-		}
-		ExprKind::MemberAccess { parent, .. } => collect_expr_scope_names(parent, offset, scopes, out),
-		ExprKind::IndexAccess { parent, index, .. } => {
-			collect_expr_scope_names(parent, offset, scopes, out);
-			collect_expr_scope_names(index, offset, scopes, out);
-		}
 		ExprKind::Closure { params, body, .. } => {
 			let base = scopes.len();
 			for p in params {
@@ -4280,27 +3975,6 @@ fn collect_expr_scope_names<'a>(
 			}
 			collect_expr_scope_names(body, offset, scopes, out);
 			scopes.truncate(base);
-		}
-		ExprKind::PrefixOp { value, .. } | ExprKind::PostfixOp { value, .. } => {
-			collect_expr_scope_names(value, offset, scopes, out);
-		}
-		ExprKind::BinaryOp { lhs, rhs, .. } | ExprKind::AssignOp { lhs, rhs, .. } => {
-			collect_expr_scope_names(lhs, offset, scopes, out);
-			collect_expr_scope_names(rhs, offset, scopes, out);
-		}
-		ExprKind::TypeOp { lhs, .. } | ExprKind::PatternOp { lhs, .. } => {
-			collect_expr_scope_names(lhs, offset, scopes, out);
-		}
-		ExprKind::Return { value, .. } | ExprKind::Break { value, .. } => {
-			if let Some(v) = value {
-				collect_expr_scope_names(v, offset, scopes, out);
-			}
-		}
-		ExprKind::While {
-			condition, body, ..
-		} => {
-			collect_expr_scope_names(condition, offset, scopes, out);
-			collect_expr_scope_names(body, offset, scopes, out);
 		}
 		ExprKind::For {
 			variable,
@@ -4313,17 +3987,6 @@ fn collect_expr_scope_names<'a>(
 			pattern_bindings(&variable.0, scopes);
 			collect_expr_scope_names(body, offset, scopes, out);
 			scopes.truncate(base);
-		}
-		ExprKind::If {
-			condition,
-			then,
-			otherwise,
-		} => {
-			collect_expr_scope_names(condition, offset, scopes, out);
-			collect_expr_scope_names(then, offset, scopes, out);
-			if let Some(o) = otherwise {
-				collect_expr_scope_names(o, offset, scopes, out);
-			}
 		}
 		ExprKind::Match { value, arms } => {
 			collect_expr_scope_names(value, offset, scopes, out);
@@ -4394,7 +4057,7 @@ fn collect_expr_scope_names<'a>(
 			}
 			scopes.truncate(base);
 		}
-		ExprKind::Grouped(inner) => collect_expr_scope_names(inner, offset, scopes, out),
+		_ => expr.for_each_child(|child| collect_expr_scope_names(child, offset, scopes, out)),
 	}
 }
 

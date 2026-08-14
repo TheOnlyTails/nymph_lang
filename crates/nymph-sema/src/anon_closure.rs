@@ -64,7 +64,7 @@
 use ecow::EcoString;
 use nymph_ast::{
 	NodeId,
-	expr::{Expr, ExprKind, ListItem, MapEntry, RangeKind, Statement, StringPart},
+	expr::{Expr, ExprKind},
 };
 use rustc_hash::FxHashMap;
 
@@ -267,134 +267,8 @@ impl<'m> Checker<'m> {
 			return;
 		}
 		path.push(expr);
-		self.collect_anon_children(expr, path, out);
+		expr.for_each_child(|child| self.collect_anon(child, path, out));
 		path.pop();
-	}
-
-	/// The child-`Expr` half of [`Self::collect_anon`], split out only to keep
-	/// that function's own short-circuits (the `AnonymousParam`/`Closure` leaf
-	/// cases) from being buried inside a huge match arm.
-	fn collect_anon_children<'e>(
-		&self,
-		expr: &'e Expr,
-		path: &mut Vec<&'e Expr>,
-		out: &mut Vec<Occurrence<'e>>,
-	) {
-		match &expr.kind {
-			ExprKind::BinaryOp { lhs, rhs, .. } | ExprKind::AssignOp { lhs, rhs, .. } => {
-				self.collect_anon(lhs, path, out);
-				self.collect_anon(rhs, path, out);
-			}
-			ExprKind::PrefixOp { value, .. } | ExprKind::PostfixOp { value, .. } => {
-				self.collect_anon(value, path, out);
-			}
-			ExprKind::TypeOp { lhs, .. } | ExprKind::PatternOp { lhs, .. } => {
-				self.collect_anon(lhs, path, out);
-			}
-			ExprKind::Call { func, args, .. } => {
-				self.collect_anon(func, path, out);
-				for a in args {
-					self.collect_anon(&a.0.value, path, out);
-				}
-			}
-			ExprKind::MemberAccess { parent, .. } => self.collect_anon(parent, path, out),
-			ExprKind::IndexAccess { parent, index, .. } => {
-				self.collect_anon(parent, path, out);
-				self.collect_anon(index, path, out);
-			}
-			ExprKind::Return { value, .. } | ExprKind::Break { value, .. } => {
-				if let Some(v) = value {
-					self.collect_anon(v, path, out);
-				}
-			}
-			ExprKind::While {
-				condition, body, ..
-			} => {
-				self.collect_anon(condition, path, out);
-				self.collect_anon(body, path, out);
-			}
-			ExprKind::For { iterable, body, .. } => {
-				self.collect_anon(iterable, path, out);
-				self.collect_anon(body, path, out);
-			}
-			ExprKind::If {
-				condition,
-				then,
-				otherwise,
-			} => {
-				self.collect_anon(condition, path, out);
-				self.collect_anon(then, path, out);
-				if let Some(o) = otherwise {
-					self.collect_anon(o, path, out);
-				}
-			}
-			ExprKind::Match { value, arms } => {
-				self.collect_anon(value, path, out);
-				for arm in arms {
-					if let Some(g) = &arm.guard {
-						self.collect_anon(g, path, out);
-					}
-					self.collect_anon(&arm.body, path, out);
-				}
-			}
-			ExprKind::Block { body, .. } => {
-				for s in body {
-					match &s.0 {
-						Statement::Expr(e) => self.collect_anon(e, path, out),
-						Statement::Let { value, .. } => self.collect_anon(value, path, out),
-					}
-				}
-			}
-			ExprKind::Grouped(inner) => self.collect_anon(inner, path, out),
-			ExprKind::List(items) | ExprKind::Tuple(items) => {
-				for i in items {
-					match &i.0 {
-						ListItem::Expr(e) | ListItem::Spread(e) => self.collect_anon(e, path, out),
-					}
-				}
-			}
-			ExprKind::Map(entries) => {
-				for e in entries {
-					match &e.0 {
-						MapEntry::Entry(k, v) => {
-							self.collect_anon(k, path, out);
-							self.collect_anon(v, path, out);
-						}
-						MapEntry::Spread(e) => self.collect_anon(e, path, out),
-					}
-				}
-			}
-			ExprKind::Range(kind) => match kind {
-				RangeKind::From(e) | RangeKind::To(e) | RangeKind::ToInclusive(e) => {
-					self.collect_anon(e, path, out);
-				}
-				RangeKind::Exclusive { min, max } | RangeKind::Inclusive { min, max } => {
-					self.collect_anon(min, path, out);
-					self.collect_anon(max, path, out);
-				}
-			},
-			ExprKind::String(parts) => {
-				for p in parts {
-					if let StringPart::InterpolatedExpr(e) = &p.0 {
-						self.collect_anon(e, path, out);
-					}
-				}
-			}
-			// Leaves: no child `Expr`s to scan.
-			ExprKind::Int(_)
-			| ExprKind::UInt(_)
-			| ExprKind::Float(_)
-			| ExprKind::Char(_)
-			| ExprKind::Boolean(_)
-			| ExprKind::Identifier(_)
-			| ExprKind::Continue { .. }
-			| ExprKind::This => {}
-			// Already short-circuited by the caller, `collect_anon`, before it
-			// ever calls this function.
-			ExprKind::AnonymousParam(_) | ExprKind::Closure { .. } => unreachable!(
-				"collect_anon short-circuits AnonymousParam/Closure before calling collect_anon_children"
-			),
-		}
 	}
 }
 
