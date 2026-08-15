@@ -1334,47 +1334,52 @@ impl<'m> Checker<'m> {
 		let recv_r = self.strip_mut(recv);
 		match self.interner.kind(recv_r).clone() {
 			TyKind::Error => (self.interner.error(), None),
-			TyKind::List(elem) => {
-				let int = self.interner.int();
-				self.unify(key, int, span);
-				(elem, None)
-			}
+			TyKind::List(elem) if matches!(self.interner.kind(key), TyKind::UInt) => (elem, None),
+			TyKind::List(_) => self.infer_index_dispatch(recv, index, key, span),
 			TyKind::Tuple(_) => (self.fresh(), None),
 			TyKind::Map(k, v) => {
 				self.unify(key, k, span);
 				(v, None)
 			}
-			_ => {
-				let key_lit = matches!(index.kind, ExprKind::Int(_));
-				match self.resolve_method(recv, "index", &[key], &[key_lit], span) {
-					Some(res) => {
-						if key_lit && let Some(&expected) = res.params.first() {
-							let expected = self.shallow_resolve(expected);
-							if matches!(self.interner.kind(expected), TyKind::UInt | TyKind::Float) {
-								self.record(index.id, expected, None);
-							}
-						}
-						let resolution = Resolution {
-							method: "index".into(),
-							dispatch: dispatch_kind_for_method_call(&res),
-							target: res.target.clone(),
-							implementation: res.implementation.clone(),
-							resolved_target: res.resolved_target.clone(),
-						};
-						(res.ty, Some(resolution))
-					}
-					None => {
-						let ty = self.display(recv);
-						self.emit(
-							span,
-							TypeError::NoMethod {
-								method: "index".into(),
-								ty,
-							},
-						);
-						(self.interner.error(), None)
+			_ => self.infer_index_dispatch(recv, index, key, span),
+		}
+	}
+
+	fn infer_index_dispatch(
+		&mut self,
+		recv: Ty,
+		index: &Expr,
+		key: Ty,
+		span: Span,
+	) -> (Ty, Option<Resolution>) {
+		let key_lit = matches!(index.kind, ExprKind::Int(_));
+		match self.resolve_method(recv, "index", &[key], &[key_lit], span) {
+			Some(res) => {
+				if key_lit && let Some(&expected) = res.params.first() {
+					let expected = self.shallow_resolve(expected);
+					if matches!(self.interner.kind(expected), TyKind::UInt | TyKind::Float) {
+						self.record(index.id, expected, None);
 					}
 				}
+				let resolution = Resolution {
+					method: "index".into(),
+					dispatch: dispatch_kind_for_method_call(&res),
+					target: res.target.clone(),
+					implementation: res.implementation.clone(),
+					resolved_target: res.resolved_target.clone(),
+				};
+				(res.ty, Some(resolution))
+			}
+			None => {
+				let ty = self.display(recv);
+				self.emit(
+					span,
+					TypeError::NoMethod {
+						method: "index".into(),
+						ty,
+					},
+				);
+				(self.interner.error(), None)
 			}
 		}
 	}

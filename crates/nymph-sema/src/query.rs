@@ -4566,12 +4566,12 @@ mod type_at_tests {
 
 	#[test]
 	fn hovering_inside_an_index_access_returns_the_element_type() {
-		let text = "func main(): int = {\n  let a = #[1, 2, 3]\n  a[ 0 ]\n}";
+		let text = "func main(): int = {\n  let a = #[1, 2, 3]\n  a[ 0u ]\n}";
 		let module = module_of(text);
 		let checked = check_module(&module);
 		// The space right after `[` — covered only by the (unsuppressed)
-		// `IndexAccess`, not by `a` or the `0` index expr.
-		let offset = text.find("[ 0").unwrap() + 1;
+		// `IndexAccess`, not by `a` or the `0u` index expr.
+		let offset = text.find("[ 0u").unwrap() + 1;
 
 		assert_eq!(type_at(&module, &checked, offset), Some("int".to_string()));
 	}

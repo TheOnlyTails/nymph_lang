@@ -511,7 +511,7 @@ fn stable_pattern_operator_lowers_source_before_union_bindings() {
 
 #[test]
 fn implementation_header_generic_body_receiver_has_canonical_type_annotation() {
-	let source = "impl<T> #[T] { func first(): T = { let result = this\nresult[0] } }";
+	let source = "impl<T> #[T] { func first(): T = { let result = this\nresult[0u] } }";
 	let (artifacts, interface) = artifacts_and_interface(source);
 	let implementation = &interface.implementations[0];
 	let expected = InterfaceType::List(Box::new(InterfaceType::Generic(
@@ -2428,7 +2428,7 @@ fn lowers_struct_and_enum_construction_and_variant_patterns_from_stable_facts() 
 
 #[test]
 fn lowers_native_index_access_and_assignment_without_protocol_fallback() {
-	let list = lower_fixture("func update(xs: mut #[int]): int = { xs[0] = 2\nxs[0] }");
+	let list = lower_fixture("func update(xs: mut #[int]): int = { xs[0u] = 2\nxs[0u] }");
 	assert!(matches!(
 		list.fragment(),
 		nymph_sema::LoweredHirFragment::TopLevelFunction(function)

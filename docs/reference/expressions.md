@@ -1,37 +1,37 @@
 # Expressions
 
-Nymph is expression-oriented: `if`, `match`, `while`, `for`, and blocks all *produce* a value,
-not just literals and operator chains. The only things that are *not* expressions are a bare `let`
+Nymph is expression-oriented: `if`, `match`, `while`, `for`, and blocks all _produce_ a value,
+not just literals and operator chains. The only things that are _not_ expressions are a bare `let`
 binding and the handful of top-level [declarations](./declarations).
 
 ## Operators and precedence
 
 From lowest to highest binding strength:
 
-| Tier             | Operators                                    |
-| ---------------- | --------------------------------------------- |
-| Assignment        | `=`, `+=`, `-=`, `*=`, `/=`, `%=`, `**=`, `<<=`, `>>=`, `&=`, `^=`, `\|=`, `~=`, `&&=`, `\|\|=` |
-| Pipe               | `\|>`                                         |
-| Logical or         | `\|\|`                                        |
-| Logical and        | `&&`                                          |
-| Equality           | `==`, `!=`                                    |
-| Comparison         | `<`, `<=`, `>`, `>=`                          |
-| Inclusion          | `in`, `!in`                                   |
-| Unwrap             | `??`                                          |
-| Bitwise or         | `\|`                                          |
-| Bitwise xor        | `^`                                            |
-| Bitwise and        | `&`                                            |
-| Shift              | `<<`, `>>`                                    |
-| Range              | `..`, `..=`                                   |
-| Additive           | `+`, `-`                                      |
-| Multiplicative     | `*`, `/`, `%`                                 |
-| Power              | `**`                                          |
-| Pattern test       | `is`, `!is`                                   |
-| Cast               | `as`                                           |
-| Unary              | `!`, `-`, `~`                                 |
-| Indexing           | `x[i]`                                        |
-| Member access      | `x.field`                                     |
-| Call               | `f(x)`                                        |
+| Tier           | Operators                                                                                       |
+| -------------- | ----------------------------------------------------------------------------------------------- |
+| Assignment     | `=`, `+=`, `-=`, `*=`, `/=`, `%=`, `**=`, `<<=`, `>>=`, `&=`, `^=`, `\|=`, `~=`, `&&=`, `\|\|=` |
+| Pipe           | `\|>`                                                                                           |
+| Logical or     | `\|\|`                                                                                          |
+| Logical and    | `&&`                                                                                            |
+| Equality       | `==`, `!=`                                                                                      |
+| Comparison     | `<`, `<=`, `>`, `>=`                                                                            |
+| Inclusion      | `in`, `!in`                                                                                     |
+| Unwrap         | `??`                                                                                            |
+| Bitwise or     | `\|`                                                                                            |
+| Bitwise xor    | `^`                                                                                             |
+| Bitwise and    | `&`                                                                                             |
+| Shift          | `<<`, `>>`                                                                                      |
+| Range          | `..`, `..=`                                                                                     |
+| Additive       | `+`, `-`                                                                                        |
+| Multiplicative | `*`, `/`, `%`                                                                                   |
+| Power          | `**`                                                                                            |
+| Pattern test   | `is`, `!is`                                                                                     |
+| Cast           | `as`                                                                                            |
+| Unary          | `!`, `-`, `~`                                                                                   |
+| Indexing       | `x[i]`                                                                                          |
+| Member access  | `x.field`                                                                                       |
+| Call           | `f(x)`                                                                                          |
 
 Most binary and unary operators are backed by an interface from the stdlib's ambient operator
 prelude, so user types can overload them by implementing the matching interface — see
@@ -94,11 +94,15 @@ func demo(c: Counter): int = c.peek()
 ## Indexing
 
 `x[i]` reads an element out of a [list](./literals#lists), [tuple](./literals#tuples), or
-[map](./literals#maps). A tuple index must be a literal integer (its element types can differ per
-position, so the checker needs a constant to know which one you get back).
+[map](./literals#maps). Lists natively accept `uint` indices. The standard library extends them with
+`Index<Key = int>`, where a negative index counts backward from the end, so `xs[-1]` is the last
+element. Other key types can be supported with additional `Index` implementations. A tuple index
+must be a literal integer (its element types can differ per position, so the checker needs a constant
+to know which one you get back).
 
 ```nym
 func first_of(xs: #[int]): int = xs[0]
+func last_of(xs: #[int]): int = xs[-1]
 func swap_sum(t: #(int, int)): int = t[1] + t[0]
 func lookup(scores: #{int: int}, level: int): int = scores[level]
 ```
@@ -107,7 +111,7 @@ Indexing is also a valid assignment target — see [Field assignment](./mutabili
 for the general mutability rule it falls under:
 
 ```nym
-func set(xs: #[int], i: int, v: int): #[int] = {
+func set(xs: #[int], i: uint, v: int): #[int] = {
   xs[i] = v
   xs
 }
@@ -214,7 +218,7 @@ retarget a source `return`.
 A closure short enough that naming its parameters is just noise can skip the header
 entirely and refer to its arguments positionally: `$0` is the first, `$1` the second,
 and so on, with a bare `$` as a shorthand for `$0`. An expression that mentions any
-`$N` *implicitly becomes a closure* — no `->` needed.
+`$N` _implicitly becomes a closure_ — no `->` needed.
 
 ```nym
 func apply(f: (int) -> int, x: int): int = f(x)
@@ -235,7 +239,7 @@ func evens(o: Option<int>): Option<int> = o.filter($ % 2 == 0)
 ```
 
 Which enclosing expression becomes the closure's body — the **boundary** — is chosen
-by the *types*, not by punctuation: it's the smallest enclosing expression for which
+by the _types_, not by punctuation: it's the smallest enclosing expression for which
 the resulting closure type-checks in its position. That's why `$ % 2 == 0` above
 becomes the whole predicate `(x) -> x % 2 == 0` rather than `((x) -> x % 2) == 0`:
 only the wider reading is a `(int) -> boolean`, which is what `filter` wants. The
@@ -288,7 +292,7 @@ func is_big_circle(s: Shape): boolean = s is Circle(radius = 20)
 ## `in` and `!in`
 
 `item in collection` / `item !in collection` dispatch to the ambient `Contains<Item>` interface's
-`contains`/`not_contains` methods — note the receiver is the *collection*, the right-hand operand,
+`contains`/`not_contains` methods — note the receiver is the _collection_, the right-hand operand,
 not the left-hand `item`.
 
 ```nym

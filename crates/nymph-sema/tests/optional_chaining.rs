@@ -32,7 +32,7 @@ fn optional_chaining_maps_option_and_result_payloads_without_flattening() {
 		"{PRELUDE}\n\
 		 func field(value: Option<Item>): Option<string> = value?.name\n\
 		 func method(value: Option<Item>): Option<string> = value?.label(\"!\")\n\
-		 func index(value: Option<#[int]>, i: int): Option<int> = value?.[i]\n\
+		 func index(value: Option<#[int]>, i: uint): Option<int> = value?.[i]\n\
 		 func result(value: Result<Item, string>): Result<string, string> = value?.name\n\
 		 func nested(value: Option<Item>): Option<Option<Box<string>>> = value?.maybe\n\
 		 func chain(value: Option<Item>): Option<string> = value?.child?.value\n\

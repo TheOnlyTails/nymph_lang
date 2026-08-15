@@ -66,8 +66,8 @@ fn late_resolved_integral_division_reboxes_as_nfloat() {
 	let js = emit_js(
 		"func divide(): float = {
 			let xs = #[]
-			let result = xs[0] / xs[0]
-			let pin: int = xs[0]
+			let result = xs[0u] / xs[0u]
+			let pin: int = xs[0u]
 			result
 		}",
 	);
@@ -117,8 +117,8 @@ fn late_resolved_primitive_equality_compares_payloads() {
 	let js = emit_js(
 		"func same(): boolean = {
 			let xs = #[]
-			let result = xs[0] == xs[0]
-			let pin: int = xs[0]
+			let result = xs[0u] == xs[0u]
+			let pin: int = xs[0u]
 			result
 		}",
 	);
@@ -135,7 +135,7 @@ fn late_resolved_adt_equality_uses_identity() {
 		impl Equals<Other = Point> for Point { func equals(other: Point): boolean = true }
 		func same(): boolean = {
 			let xs = #[]
-			let result = xs[0] == xs[0]
+			let result = xs[0u] == xs[0u]
 			let pin: #[Point] = xs
 			result
 		}",

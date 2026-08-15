@@ -3781,6 +3781,12 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							recv: Box::new(payload),
 							key: Box::new(lowerer.lower(index)?),
 						},
+						InterfaceType::List(_) if lowerer.annotations.dispatch(lowerer.id(expr)).is_some() => {
+							let mut operation =
+								lowerer.lower_dispatch(lowerer.dispatch(expr)?, parent, vec![index])?;
+							Self::replace_dispatch_receiver(&mut operation, payload);
+							operation
+						}
 						InterfaceType::List(_) | InterfaceType::Tuple(_) => HirExpr::Index {
 							recv: Box::new(payload),
 							index: Box::new(lowerer.lower(index)?),
@@ -3808,6 +3814,9 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					recv: Box::new(self.lower(parent)?),
 					key: Box::new(self.lower(index)?),
 				},
+				InterfaceType::List(_) if self.annotations.dispatch(self.id(expr)).is_some() => {
+					self.lower_dispatch(self.dispatch(expr)?, parent, vec![index])?
+				}
 				InterfaceType::List(_) | InterfaceType::Tuple(_) => HirExpr::Index {
 					recv: Box::new(self.lower(parent)?),
 					index: Box::new(self.lower(index)?),

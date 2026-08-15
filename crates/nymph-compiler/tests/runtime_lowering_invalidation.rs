@@ -285,7 +285,7 @@ fn native_list_and_bounded_ranges_lower_with_real_ambient_protocol_facts() {
 		main.clone(),
 		r#"func int_start(): int = 1
 func uint_start(): uint = 1u
-func list_sum(xs: mut #[int]): int = { xs[0] = xs[0] + 1 let mut total = 0 for (x in xs) { total = total + x } total }
+func list_sum(xs: mut #[int]): int = { xs[0u] = xs[0u] + 1 let mut total = 0 for (x in xs) { total = total + x } total }
 func exclusive(): int = { let mut total = 0 for (x in (int_start())..4) { total = total + x } total }
 func inclusive(): int = { let mut start = uint_start() let mut total = 0 for (x in start..=4u) { total = total + (x as int) } total }
 func conditional(flag: boolean): int = { let mut total = 0 for (x in (if (flag) { 1 } else { 2 })..4) { total = total + x } total }

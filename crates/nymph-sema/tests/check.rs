@@ -203,6 +203,22 @@ fn simple_annotated_function() {
 }
 
 #[test]
+fn list_index_is_native_for_uint_and_extensible_for_other_keys() {
+	assert_ok("func unsigned(xs: #[int], i: uint): int = xs[i]");
+	assert_error_contains(
+		"func signed(xs: #[int], i: int): int = xs[i]",
+		"no method `index`",
+	);
+	assert_ok(
+		"interface Index<Key, Output> { func index(key: Key): Output }
+		 impl<T> Index<Key = int, Output = T> for #[T] {
+		   func index(key: int): T = this[key as uint]
+		 }
+		 func signed(xs: #[int], i: int): int = xs[i]",
+	);
+}
+
+#[test]
 fn namespace_function_and_value_bodies_are_checked() {
 	assert_ok("namespace Values { func id<T>(value: T) = value let answer = 42 }");
 	assert_ok(
@@ -348,7 +364,7 @@ fn return_typechecks_in_general_expression_positions_and_callable_kinds() {
 	assert_ok(
 		r#"
 		func id(value: int): int = value
-		func positions(flag: boolean): int = id(1 + if (flag) return 2 else #[3][0])
+		func positions(flag: boolean): int = id(1 + if (flag) return 2 else #[3][0u])
 		struct Value(value: int) {
 			func get(flag: boolean): int = this.value + if (flag) return 4 else 1
 		}

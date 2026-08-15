@@ -1,5 +1,5 @@
 import @/option with (Option)
-import @/ops with (Plus, Comparable, Contains, Equals, Into, Order)
+import @/ops with (Plus, Comparable, Contains, Equals, Index, Into, Order)
 
 impl<T> mut #[T] {
   external(length) func length(): uint
@@ -88,18 +88,25 @@ impl<T> #[T] {
   /// Returns a new list stably ordered by `compare`; the source is unchanged.
   func sort_by(compare: (T, T) -> Order): #[T] = {
     let mut result = this.slice(0, this.length())
-    let mut i = 1
+    let mut i = 1u
     while (i < result.length()) {
       let mut j = i
-      while (j > 0 && compare(result[j], result[j - 1]) == Order.LessThan) {
-        let previous = result[j - 1]
-        result[j - 1] = result[j]
+      while (j > 0u && compare(result[j], result[j - 1u]) == Order.LessThan) {
+        let previous = result[j - 1u]
+        result[j - 1u] = result[j]
         result[j] = previous
-        j = j - 1
+        j = j - 1u
       }
-      i = i + 1
+      i = i + 1u
     }
     result
+  }
+}
+
+impl<T> Index<Key = int, Output = T> for #[T] {
+  func index(key: int): T = {
+    let normalized = if (key < 0) (this.length() as int) + key else key
+    this[normalized as uint]
   }
 }
 

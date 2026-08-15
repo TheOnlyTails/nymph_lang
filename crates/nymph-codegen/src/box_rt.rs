@@ -97,11 +97,11 @@ fn class_defs(export: bool, option_enum_name: &str) -> String {
 			// Native Map's constructor reads pair entries through numeric properties.
 			// Keep that boundary compatible while the tuple's canonical storage stays `.v`.
 			out.push_str(&format!(
-				"{kw}class {class} extends {BASE} {{\n\tindex(key) {{\n\t\treturn this.v[key.v];\n\t}}\n\tget 0() {{\n\t\treturn this.v[0];\n\t}}\n\tget 1() {{\n\t\treturn this.v[1];\n\t}}\n}}\n"
+				"{kw}class {class} extends {BASE} {{\n\tindex(key) {{\n\t\treturn this.v[key.v];\n\t}}\n\tsetIndex(key, value) {{\n\t\treturn nymphSetProperty(this.v, key.v, value);\n\t}}\n\tget 0() {{\n\t\treturn this.v[0];\n\t}}\n\tget 1() {{\n\t\treturn this.v[1];\n\t}}\n}}\n"
 			));
 		} else if *class == "NList" {
 			out.push_str(&format!(
-				"{kw}class {class} extends {BASE} {{\n\tindex(key) {{\n\t\treturn this.v[key.v];\n\t}}\n\tpush(item) {{\n\t\tnymphArrayPush(this.v, item);\n\t}}\n\titer() {{\n\t\treturn new NymphListIterator(this.v);\n\t}}\n}}\n"
+				"{kw}class {class} extends {BASE} {{\n\tindex(key) {{\n\t\treturn this.v[key.v];\n\t}}\n\tsetIndex(key, value) {{\n\t\treturn nymphSetProperty(this.v, key.v, value);\n\t}}\n\tpush(item) {{\n\t\tnymphArrayPush(this.v, item);\n\t}}\n\titer() {{\n\t\treturn new NymphListIterator(this.v);\n\t}}\n}}\n"
 			));
 		} else {
 			out.push_str(&format!("{kw}class {class} extends {BASE} {{}}\n"));
@@ -184,6 +184,19 @@ mod tests {
 	fn canonical_type_objects_snapshot_their_argument_identity_sequence() {
 		let src = box_module_source();
 		assert!(src.contains("args = Object.freeze([...args]);"), "{src}");
+	}
+
+	#[test]
+	fn list_wrapper_uses_native_unsigned_indices_for_reads_and_writes() {
+		let src = box_module_source();
+		assert!(
+			src.contains("index(key) {\n\t\treturn this.v[key.v];\n\t}"),
+			"list reads must use the native uint key directly: {src}"
+		);
+		assert!(
+			src.contains("return nymphSetProperty(this.v, key.v, value);"),
+			"list index assignment must remain transaction-aware: {src}"
+		);
 	}
 
 	#[test]

@@ -27,12 +27,14 @@ declare module "std/box" {
 
 	export class NList<T = unknown> extends NBox<T[]> {
 		index(key: NUint): T;
+		setIndex(key: NUint, value: T): T;
 		push(item: T): void;
 		iter(): NymphIterator<T>;
 	}
 
 	export class NTuple<T = unknown> extends NBox<T[]> {
-		index(key: NUint): T;
+		index(key: NInt | NUint): T;
+		setIndex(key: NInt | NUint, value: T): T;
 		readonly 0: T;
 		readonly 1: T;
 	}

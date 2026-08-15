@@ -1247,7 +1247,7 @@ let mut scalar = 1
 let mut list = #[1, 2]
 let alias = list
 let mut map = #{1: 10}
-func mutate_then_fail(): int = { scalar = 9 list.insert(1, 8) list.remove(0) list.splice(0, 1, #[7]) list.pop() list.push(3) list[4] = 9 list.clear() map.insert(2, 20) map.remove(1) map.get_or_insert(3, 30) map[4] = 40 map.clear() recurse() }
+func mutate_then_fail(): int = { scalar = 9 list.insert(1, 8) list.remove(0) list.splice(0, 1, #[7]) list.pop() list.push(3) list[4u] = 9 list.clear() map.insert(2, 20) map.remove(1) map.get_or_insert(3, 30) map[4] = 40 map.clear() recurse() }
 mutate_then_fail()
 #(scalar, list, alias, map)
 func make_counter(): () -> int = { let mut value = 0 return () -> { value = value + 1 value } }
@@ -1429,11 +1429,11 @@ fn repl_hamt_callbacks_cannot_corrupt_the_map_they_are_querying() {
 		r#"let mut hash_armed = #[false]
 struct HashKey(id: int) {
   impl Equals<Other = HashKey> { func equals(other: HashKey): boolean = this.id == other.id }
-  impl Hash { func hash(): int = { if (hash_armed[0]) { hash_armed[0] = false hash_map.insert(HashKey(id = 99), 99) } 0 } }
+  impl Hash { func hash(): int = { if (hash_armed[0]) { hash_armed[0u] = false hash_map.insert(HashKey(id = 99), 99) } 0 } }
 }
 let mut hash_map = #{HashKey(id = 1): 10}
 public func mutate_from_hash(): #(uint, uint, boolean) = {
-  hash_armed[0] = true
+  hash_armed[0u] = true
   hash_map[HashKey(id = 2)] = 20
   #(hash_map.size(), hash_map.entries().length(), hash_map.contains_key(HashKey(id = 99)))
 }
@@ -1442,7 +1442,7 @@ let mut equals_armed = #[false]
 struct EqualsKey(id: int) {
   impl Equals<Other = EqualsKey> {
     func equals(other: EqualsKey): boolean = {
-      if (equals_armed[0]) { equals_armed[0] = false equals_map.insert(EqualsKey(id = 99), 99) }
+      if (equals_armed[0]) { equals_armed[0u] = false equals_map.insert(EqualsKey(id = 99), 99) }
       this.id == other.id
     }
   }
@@ -1450,7 +1450,7 @@ struct EqualsKey(id: int) {
 }
 let mut equals_map = #{EqualsKey(id = 1): 10}
 public func mutate_from_equals(): void = {
-  equals_armed[0] = true
+  equals_armed[0u] = true
   equals_map[EqualsKey(id = 2)] = 20
 }
 public func equals_snapshot(): #(uint, uint, boolean) =

@@ -61,9 +61,9 @@ fn tuple_literal_uses_its_distinct_box_and_tag() {
 
 #[test]
 fn boxed_list_index_returns_the_already_boxed_element() {
-	let mut js = emit_js("func second(): int = #[10, 20][1]");
+	let mut js = emit_js("func second(): int = #[10, 20][1u]");
 	assert!(
-		js.contains(".index(new NInt(1))"),
+		js.contains(".index(new NUint(1))"),
 		"index dispatches through the list box: {js}"
 	);
 	js.push_str("\nconsole.log(second().v);\n");
@@ -80,7 +80,7 @@ fn list_spread_splices_the_boxed_sources_payload_and_reboxes_the_result() {
 
 #[test]
 fn mutable_list_index_assignment_updates_the_payload() {
-	let src = "func replace(): int = { let mut values = #[1, 2] values[1] = 9 values[1] }";
+	let src = "func replace(): int = { let mut values = #[1, 2] values[1u] = 9 values[1u] }";
 	let mut js = emit_js(src);
 	js.push_str("\nconsole.log(replace().v);\n");
 	assert_eq!(run_node(&js), "9");

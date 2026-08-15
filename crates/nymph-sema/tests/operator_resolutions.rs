@@ -227,8 +227,8 @@ fn late_resolved_infer_var_less_than_is_builtin_eager() {
 	let res = resolution_for(
 		"func f(): boolean = {
 		   let xs = #[]
-		   let c = xs[0] < xs[0]
-		   let pin: int = xs[0]
+		   let c = xs[0u] < xs[0u]
+		   let pin: int = xs[0u]
 		   c
 		 }",
 		"f",
@@ -254,7 +254,7 @@ fn late_pinned_adt_less_than_dispatches_to_user_impl() {
 		 }
 		 func f(): boolean = {
 		   let xs = #[]
-		   let c = xs[0] < xs[0]
+		   let c = xs[0u] < xs[0u]
 		   let pin: #[Vec2] = xs
 		   c
 		 }",
@@ -396,8 +396,8 @@ fn deferred_compound_assign_keeps_its_own_type_as_void() {
 	// two paths must agree on the stored `ExprInfo.ty` for the same AST shape.
 	let source = "func f(): int = {
 	   let mut xs = #[]
-	   let mut x = xs[0]
-	   x += xs[0]
+	   let mut x = xs[0u]
+	   x += xs[0u]
 	   x
 	 }";
 	let parsed = parse_module(source, "test");
@@ -475,7 +475,7 @@ fn late_resolved_infer_var_operand_is_builtin_eager() {
 	let res = resolution_for(
 		"func f(): int = {
 		   let xs = #[]
-		   xs[0] + xs[0]
+		   xs[0u] + xs[0u]
 		 }",
 		"f",
 	);
@@ -688,7 +688,7 @@ fn late_resolved_infer_var_negate_operand_is_builtin_eager() {
 	let res = prefix_resolution_for(
 		"func f(): int = {
 		   let xs = #[]
-		   let y = -xs[0]
+		   let y = -xs[0u]
 		   y
 		 }",
 		"f",

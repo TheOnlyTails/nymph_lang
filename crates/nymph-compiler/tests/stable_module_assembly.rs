@@ -517,7 +517,7 @@ fn stable_native_list_runtime_is_exact_collision_safe_and_runs_after_dependency_
 	session.set_source(
 		project.clone(),
 		main.clone(),
-		"import @/collections/list with (values)\nfunc exercise(): int = {\n  let mut items = values()\n  let before = match (items.get(1u)) { Some(value) -> value, None -> 0 }\n  items[1] = 7\n  let mut total = 0\n  for (item in items) { total = total + item }\n  before + items[1] + items.length() + total\n}\npublic func main(): void = {}"
+		"import @/collections/list with (values)\nfunc exercise(): int = {\n  let mut items = values()\n  let before = match (items.get(1u)) { Some(value) -> value, None -> 0 }\n  items[1u] = 7\n  let mut total = 0\n  for (item in items) { total = total + item }\n  before + items[1] + items.length() + total\n}\npublic func main(): void = {}"
 			.into(),
 		SourceVersion(1),
 	);

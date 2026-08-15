@@ -166,9 +166,12 @@ fn runs_while_loop() {
 
 #[test]
 fn runs_list_and_index() {
-	// A list literal emits as a JS array; indexing is a computed member `arr[i]`.
-	let src = "func third(): int = #[10, 20, 30][2]";
-	assert_eq!(run(src, "third()"), "30");
+	let src = r#"
+		func at(i: int): int = #[10, 20, 30][i]
+		func at_unsigned(i: uint): int = #[10, 20, 30][i]
+	"#;
+	assert_eq!(run(src, "at(new NInt(-1))"), "30");
+	assert_eq!(run(src, "at_unsigned(new NUint(1))"), "20");
 }
 
 #[test]
@@ -2646,21 +2649,17 @@ fn runs_let_mut_reassignment_of_a_mut_typed_binding() {
 
 #[test]
 fn runs_list_index_assignment() {
-	// Confirmed defect (code review): `xs[i] = value` type-checks with zero
-	// diagnostics (`infer_assign`'s field/index arm places no restriction on
-	// an `IndexAccess` LHS) and used to panic in emit's `HirExpr::Assign`
-	// match — an ICE (`unreachable!`) on valid input. A non-`Map` receiver's
-	// index target now emits as a plain JS computed-member assignment.
 	let src = r#"
-		func set(xs: #[int], i: int, v: int): #[int] = {
-			xs[i] = v
-			xs
+		func set_unsigned(i: uint, v: int): #[int] = {
+			let mut values = #[1, 2, 3]
+			values[i] = v
+			values
 		}
 	"#;
 	assert_eq!(
 		run(
 			src,
-			"JSON.stringify(nymphTestValue(set({ v: [{ v: 1 }, { v: 2 }, { v: 3 }] }, { v: 1 }, { v: 99 })))"
+			"JSON.stringify(nymphTestValue(set_unsigned(new NUint(1), new NInt(99))))"
 		),
 		"[1,99,3]"
 	);
@@ -3737,7 +3736,7 @@ fn a_fresh_map_literal_at_a_mut_parameter_is_mutated_and_read_back() {
 
 #[test]
 fn a_fresh_list_literal_at_a_mut_parameter_is_mutated_and_read_back() {
-	let user = "func take(xs: mut #[int]): int = {\n\txs[0] = 99\n\txs[0]\n}\nfunc t(): int = take(#[1, 2, 3])";
+	let user = "func take(xs: mut #[int]): int = {\n\txs[0u] = 99\n\txs[0]\n}\nfunc t(): int = take(#[1, 2, 3])";
 	assert_eq!(run(user, "t()"), "99");
 }
 

@@ -171,8 +171,8 @@ fn pending_operator_finalization_is_declaration_order_independent() {
 		"{PLUS}
 		 func a<T: Plus<Other = T, Output = T>>(): T = {{
 		   let xs = #[]
-		   let y = xs[0] + xs[0]
-		   let z: T = xs[0]
+		   let y = xs[0u] + xs[0u]
+		   let z: T = xs[0u]
 		   y
 		 }}
 		 func b(): int = 1",
@@ -182,8 +182,8 @@ fn pending_operator_finalization_is_declaration_order_independent() {
 		 func b(): int = 1
 		 func a<T: Plus<Other = T, Output = T>>(): T = {{
 		   let xs = #[]
-		   let y = xs[0] + xs[0]
-		   let z: T = xs[0]
+		   let y = xs[0u] + xs[0u]
+		   let z: T = xs[0u]
 		   y
 		 }}",
 	);
@@ -242,7 +242,7 @@ fn never_pinned_infer_less_than_reports_cannot_infer_operand_type() {
 	assert_error_contains(
 		"func f(): boolean = {
 		   let xs = #[]
-		   xs[0] < xs[0]
+		   xs[0u] < xs[0u]
 		 }",
 		"cannot infer",
 	);

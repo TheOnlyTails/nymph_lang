@@ -490,14 +490,6 @@ impl<'a> Emitter<'a> {
 					self.emit_expr(value),
 				],
 			),
-			HirExpr::Index { recv, index } => (
-				"nymphSetProperty",
-				vec![
-					self.unwrap_v(self.emit_expr(recv)),
-					self.unwrap_v(self.emit_expr(index)),
-					self.emit_expr(value),
-				],
-			),
 			_ => return None,
 		};
 		self
@@ -2282,6 +2274,12 @@ impl<'a> Emitter<'a> {
 				Expression::new_call_expression(SPAN, member, oxc::ast::NONE, args, false, &self.ast)
 			}
 			HirExpr::Assign { target, value } => {
+				if let HirExpr::Index { recv, index } = target.as_ref() {
+					let object = self.emit_expr(recv);
+					let key = self.emit_expr(index);
+					let value = self.emit_expr(value);
+					return self.member_call(object, "setIndex", vec![key, value]);
+				}
 				if let Some(transactional) = self.transactional_assignment(target, value) {
 					return transactional;
 				}
@@ -2311,17 +2309,6 @@ impl<'a> Emitter<'a> {
 				// (`SimpleAssignmentTarget` inherits `MemberExpression`), not the
 				// identifier-only path `HirExpr::Local` uses.
 				//
-				// A list/tuple subscript target (`xs[i] = value`) is the same shape
-				// but with a COMPUTED member (`SimpleAssignmentTarget` also inherits
-				// `ComputedMemberExpression`) — confirmed reachable the same way as
-				// the `Map` case above: a non-`Map` receiver's `IndexAccess` lowers to
-				// `HirExpr::Index`, so `xs[i] = value` reaches here as
-				// `Assign { target: Index { .. }, .. }` from a zero-diagnostic
-				// program. This `unreachable!` used to fire (an ICE) on exactly that
-				// valid input (confirmed by probe: `func f(xs: #[int], i: int): void
-				// = { xs[i] = 5 }` type-checks with zero diagnostics yet panicked
-				// here) — this codebase never treats a crash on valid input as an
-				// acceptable substitute for correct codegen.
 				let assignment_target = match target.as_ref() {
 					HirExpr::Local(n) => self.assign_target(self.ast.allocator.alloc_str(n)),
 					HirExpr::Field { recv, name } => {
@@ -2334,14 +2321,6 @@ impl<'a> Emitter<'a> {
 							&self.ast,
 						);
 						AssignmentTarget::from(MemberExpression::StaticMemberExpression(member))
-					}
-					HirExpr::Index { recv, index } => {
-						let recv = self.emit_expr(recv);
-						let object = self.unwrap_v(recv);
-						let index = self.emit_expr(index);
-						let property = self.unwrap_v(index);
-						let member = ComputedMemberExpression::boxed(SPAN, object, property, false, &self.ast);
-						AssignmentTarget::from(MemberExpression::ComputedMemberExpression(member))
 					}
 					other => unreachable!(
 						"lowering never produces an assignment target other than a local, a field access, a list/tuple subscript, or a map index (got {other:?})"

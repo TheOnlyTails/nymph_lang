@@ -546,8 +546,8 @@ fn emits_list_index_assignment_against_the_boxed_payload() {
 	};
 	let js = emit(&module);
 	assert!(
-		js.contains("xs.v[i.v] = v"),
-		"boxed-payload assignment: {js}"
+		js.contains("xs.setIndex(i, v)"),
+		"list wrapper owns index normalization and assignment: {js}"
 	);
 }
 
