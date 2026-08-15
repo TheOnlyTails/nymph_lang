@@ -53,6 +53,48 @@ fn int_addition_unwraps_and_reboxes_as_nint() {
 }
 
 #[test]
+fn uint_arithmetic_retypes_an_unsuffixed_int_literal() {
+	let js = emit_js(
+		"func previous(index: uint): uint = index - 1
+		 func next(index: uint): uint = 1 + index
+		 func half(value: uint): float = value / 2
+		 func increment(value: float): float = value + 1",
+	);
+	assert!(
+		js.contains("new NUint(index.v - new NUint(1).v)"),
+		"a right-hand literal inherits the uint operand type: {js}"
+	);
+	assert!(
+		js.contains("new NUint(new NUint(1).v + index.v)"),
+		"a left-hand literal inherits the uint operand type: {js}"
+	);
+	assert!(
+		js.contains("new NFloat(value.v / new NUint(2).v)"),
+		"uint division by an inherited literal still produces a float: {js}"
+	);
+	assert!(
+		js.contains("new NFloat(value.v + new NFloat(1).v)"),
+		"an unsuffixed literal inherits a float operand type: {js}"
+	);
+}
+
+#[test]
+fn negative_literals_and_int_values_stay_signed_in_uint_arithmetic() {
+	let js = emit_js(
+		"func offset(index: uint): int = index + -1
+		 func add_offset(index: uint, offset: int): int = index + offset",
+	);
+	assert!(
+		js.contains("new NInt(index.v + new NInt(-new NInt(1).v).v)"),
+		"a negated literal remains signed: {js}"
+	);
+	assert!(
+		js.contains("new NInt(index.v + offset.v)"),
+		"an int value remains signed: {js}"
+	);
+}
+
+#[test]
 fn division_reboxes_in_the_resolved_float_output_type() {
 	let js = emit_js("func divide(a: int, b: int): float = a / b");
 	assert!(

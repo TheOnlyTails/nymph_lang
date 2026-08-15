@@ -206,8 +206,8 @@ fn power_compound_assignment_evaluates_an_index_target_once() {
 		func probe(): int = {
 			let mut calls = 0
 			let mut values: mut #[int] = #[2]
-			values[{ calls += 1 0 }] **= 2u
-			calls * 10 + values[0]
+			values[{ calls += 1 0u }] **= 2u
+			calls * 10 + values[0u]
 		}
 	"#;
 	assert_eq!(run(src, "probe()"), "14");

@@ -297,7 +297,7 @@ func int_power_uint(base: int, exponent: uint): int = {
   let mut remaining = exponent
   while (remaining > 0) {
     if (remaining % 2 == 1) { result = result * factor }
-    remaining = (remaining / 2u) as uint
+    remaining = (remaining / 2) as uint
     if (remaining > 0) { factor = factor * factor }
   }
   result
@@ -309,7 +309,7 @@ func uint_power_uint(base: uint, exponent: uint): uint = {
   let mut remaining = exponent
   while (remaining > 0) {
     if (remaining % 2 == 1) { result = result * factor }
-    remaining = (remaining / 2u) as uint
+    remaining = (remaining / 2) as uint
     if (remaining > 0) { factor = factor * factor }
   }
   result
@@ -321,7 +321,7 @@ func float_power_uint(base: float, exponent: uint): float = {
   let mut remaining = exponent
   while (remaining > 0) {
     if (remaining % 2 == 1) { result = result * factor }
-    remaining = (remaining / 2u) as uint
+    remaining = (remaining / 2) as uint
     if (remaining > 0) { factor = factor * factor }
   }
   result

@@ -3371,10 +3371,13 @@ impl<'m> Checker<'m> {
 				// "impl self-type is a primitive" — stdlib isn't linked until Slice 5, so
 				// its JS numeric semantics already match).
 				(Some(_), Some(_)) => {
-					if matches!(rhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(l) {
-						(l, eager(binary_method(op)), None)
-					} else if matches!(lhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(r) {
-						(r, eager(binary_method(op)), None)
+					if let Some(coerced) = self.coerce_binary_int_literal(lhs, l, rhs, r) {
+						let result = if op == Divide && matches!(self.interner.kind(coerced), TyKind::UInt) {
+							self.interner.float()
+						} else {
+							coerced
+						};
+						(result, eager(binary_method(op)), None)
 					} else {
 						let (ty, _, _, _, _) = self.dispatch_operator(l, binary_method(op), &[r], span);
 						(ty, eager(binary_method(op)), None)
@@ -3437,10 +3440,7 @@ impl<'m> Checker<'m> {
 					// `boolVal == intVal`). Two primitives always compare via a native JS
 					// `===`/`!==`, so the impl only authorizes — it is not dispatched to.
 					(Some(_), Some(_)) => {
-						let literal_widens = (matches!(lhs.kind, ExprKind::Int(_))
-							&& self.int_literal_coerces_to(r))
-							|| (matches!(rhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(l));
-						if !literal_widens {
+						if self.coerce_binary_int_literal(lhs, l, rhs, r).is_none() {
 							self.dispatch_operator(l, method, &[r], span);
 						}
 						(boolean, eager(method), None)
@@ -3499,10 +3499,7 @@ impl<'m> Checker<'m> {
 					// condition here (the arithmetic arm keeps them separate because it
 					// must pick *which* operand's type becomes the result).
 					(Some(_), Some(_)) => {
-						let literal_widens = (matches!(rhs.kind, ExprKind::Int(_))
-							&& self.int_literal_coerces_to(l))
-							|| (matches!(lhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(r));
-						if literal_widens {
+						if self.coerce_binary_int_literal(lhs, l, rhs, r).is_some() {
 							(boolean, eager(method), None)
 						} else {
 							// Validate the operator is implemented for this primitive pair
@@ -3719,12 +3716,27 @@ impl<'m> Checker<'m> {
 		matches!(self.interner.kind(expected), TyKind::Float | TyKind::UInt)
 	}
 
+	/// Retype one unsuffixed integer literal operand from the other operand's
+	/// concrete numeric type. Recording the coerced type here keeps lowering's
+	/// boxed literal representation consistent with the binary expression type.
+	fn coerce_binary_int_literal(&mut self, lhs: &Expr, l: Ty, rhs: &Expr, r: Ty) -> Option<Ty> {
+		if matches!(lhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(r) {
+			let coerced = self.shallow_resolve(r);
+			self.record(lhs.id, coerced, None);
+			Some(coerced)
+		} else if matches!(rhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(l) {
+			let coerced = self.shallow_resolve(l);
+			self.record(rhs.id, coerced, None);
+			Some(coerced)
+		} else {
+			None
+		}
+	}
+
 	/// Unify two operand types, but let an `int` *literal* operand widen to a `float`/
 	/// `uint` sibling instead of clashing (so `someFloat > 0` and `someUint == 0` type).
 	fn unify_operands(&mut self, lhs: &Expr, l: Ty, rhs: &Expr, r: Ty, span: Span) {
-		if (matches!(lhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(r))
-			|| (matches!(rhs.kind, ExprKind::Int(_)) && self.int_literal_coerces_to(l))
-		{
+		if self.coerce_binary_int_literal(lhs, l, rhs, r).is_some() {
 			return;
 		}
 		self.unify(l, r, span);

@@ -102,7 +102,7 @@ func complex_power_uint(base: Complex, exponent: uint): Complex = {
   let mut remaining = exponent
   while (remaining > 0) {
     if (remaining % 2 == 1) { result = result * factor }
-    remaining = (remaining / 2u) as uint
+    remaining = (remaining / 2) as uint
     if (remaining > 0) { factor = factor * factor }
   }
   result

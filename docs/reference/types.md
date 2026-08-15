@@ -14,7 +14,8 @@ Basic types represent a very simple construct, which can be created using a [lit
 
 - `int`: a 64-bit signed integer.
 - `uint`: a 64-bit unsigned integer. A `uint` value converts safely and implicitly to `int`; conversion
-  in the other direction requires a non-negated literal or an explicit cast.
+  in the other direction requires an eligible [contextually inferred literal](./literals#numbers) or
+  an explicit cast.
 - `float`: a double-precision floating point number.
 - `boolean`: a value of either `true` or `false`.
 - `char`: a single Unicode codepoint.

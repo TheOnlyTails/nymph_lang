@@ -12,15 +12,20 @@ with no `import`, in every module; this is separate from opt-in `std/...` module
 
 ## Arithmetic
 
-| Operator | Interface                | Method       |
-| -------- | ------------------------ | ------------ |
-| `a + b`  | `Plus<Other, Output>`     | `plus`       |
-| `a - b`  | `Minus<Other, Output>`    | `minus`      |
-| `a * b`  | `Times<Other, Output>`    | `times`      |
-| `a / b`  | `Divide<Other, Output>`   | `divide`     |
+An unsuffixed, non-negative integer literal inherits a known `uint` or `float` type from the other
+operand, so `index - 1` works when `index` is a `uint`. This applies only to literals: `-1` and values
+stored in `int` variables remain signed and use the corresponding mixed-type overload. See
+[Number literals](./literals#numbers) for the complete inference rule.
+
+| Operator | Interface                  | Method      |
+| -------- | -------------------------- | ----------- |
+| `a + b`  | `Plus<Other, Output>`      | `plus`      |
+| `a - b`  | `Minus<Other, Output>`     | `minus`     |
+| `a * b`  | `Times<Other, Output>`     | `times`     |
+| `a / b`  | `Divide<Other, Output>`    | `divide`    |
 | `a % b`  | `Remainder<Other, Output>` | `remainder` |
-| `a ** b` | `Power<Other, Output>`    | `power`      |
-| `-a`     | `Negate<Output>`          | `negate`     |
+| `a ** b` | `Power<Other, Output>`     | `power`     |
+| `-a`     | `Negate<Output>`           | `negate`    |
 
 ```nym
 struct Vec2(x: int, y: int)
@@ -50,14 +55,14 @@ match.
 
 The standard numeric `Power` implementations form an exact matrix:
 
-| Base | Exponent | Result |
-| --- | --- | --- |
-| `int` | `uint` | `int` |
-| `uint` | `uint` | `uint` |
-| `float` | `uint` | `float` |
-| `int`, `uint`, or `float` | `int` | `float` |
-| `int`, `uint`, or `float` | `float` | `Complex` |
-| `Complex` | `uint`, `int`, or `float` | `Complex` |
+| Base                      | Exponent                  | Result    |
+| ------------------------- | ------------------------- | --------- |
+| `int`                     | `uint`                    | `int`     |
+| `uint`                    | `uint`                    | `uint`    |
+| `float`                   | `uint`                    | `float`   |
+| `int`, `uint`, or `float` | `int`                     | `float`   |
+| `int`, `uint`, or `float` | `float`                   | `Complex` |
+| `Complex`                 | `uint`, `int`, or `float` | `Complex` |
 
 The `Complex`-producing rows become available with `import std/math/complex with (Complex)`.
 Combinations outside the table are rejected unless a visible user implementation supplies that
@@ -74,15 +79,15 @@ including signed zero, `NaN`, and infinities.
 
 ## Bitwise and boolean
 
-| Operator | Interface                 | Method     |
-| -------- | -------------------------- | ---------- |
-| `a & b`  | `BitAnd<Other, Output>`    | `bit_and`  |
-| `a \| b` | `BitOr<Other, Output>`     | `bit_or`   |
-| `a ^ b`  | `BitXor<Other, Output>`    | `bit_xor`  |
-| `~a`     | `BitNot<Output>`           | `bit_not`  |
-| `a << b` | `LeftShift<Other, Output>` | `shl`      |
-| `a >> b` | `RightShift<Other, Output>`| `shr`      |
-| `!a`     | `Not<Output>`              | `not`      |
+| Operator | Interface                   | Method    |
+| -------- | --------------------------- | --------- |
+| `a & b`  | `BitAnd<Other, Output>`     | `bit_and` |
+| `a \| b` | `BitOr<Other, Output>`      | `bit_or`  |
+| `a ^ b`  | `BitXor<Other, Output>`     | `bit_xor` |
+| `~a`     | `BitNot<Output>`            | `bit_not` |
+| `a << b` | `LeftShift<Other, Output>`  | `shl`     |
+| `a >> b` | `RightShift<Other, Output>` | `shr`     |
+| `!a`     | `Not<Output>`               | `not`     |
 
 `int` and `boolean` already implement the bitwise set out of the box (`&`/`|`/`^`/`~` work on both
 natively), so overloading them yourself is for a type of your own:
@@ -105,8 +110,8 @@ func combine(a: Mask, b: Mask): Mask = a & ~b
 
 ## Comparison
 
-| Operator             | Interface           | Method(s)                                    |
-| --------------------- | -------------------- | --------------------------------------------- |
+| Operator                             | Interface           | Method(s)                                                                                                   |
+| ------------------------------------ | ------------------- | ----------------------------------------------------------------------------------------------------------- |
 | `a < b`, `a <= b`, `a > b`, `a >= b` | `Comparable<Other>` | `compare_to` (required); `less_than`, `less_than_eq`, `greater_than`, `greater_than_eq` (defaulted from it) |
 
 `Comparable<Other>` needs just one method, `compare_to`, returning an `Order` (`LessThan`, `Equal`,

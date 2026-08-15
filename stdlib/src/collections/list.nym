@@ -88,16 +88,16 @@ impl<T> #[T] {
   /// Returns a new list stably ordered by `compare`; the source is unchanged.
   func sort_by(compare: (T, T) -> Order): #[T] = {
     let mut result = this.slice(0, this.length())
-    let mut i = 1u
+    let mut i: uint = 1
     while (i < result.length()) {
       let mut j = i
-      while (j > 0u && compare(result[j], result[j - 1u]) == Order.LessThan) {
-        let previous = result[j - 1u]
-        result[j - 1u] = result[j]
+      while (j > 0 && compare(result[j], result[j - 1]) == Order.LessThan) {
+        let previous = result[j - 1]
+        result[j - 1] = result[j]
         result[j] = previous
-        j = j - 1u
+        j = j - 1
       }
-      i = i + 1u
+      i = i + 1
     }
     result
   }

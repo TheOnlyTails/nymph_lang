@@ -5,8 +5,9 @@ They should be either very _basic_ primitives or very _useful_ structures.
 
 ## Numbers
 
-Number literals come in 2 kinds: integers and floats. Integers are whole, signed 64-bit numbers,
-and floats are IEEE 754 double-precision floating point numbers.
+Number literals come in two kinds: integers and floats. Unsuffixed integer literals default to the
+signed 64-bit `int` type, while `u`-suffixed or contextually inferred literals use the unsigned
+64-bit `uint` type. Floats are IEEE 754 double-precision values.
 
 Integers are sequences of digits, optionally separated by underscores,
 in either binary, octal, decimal, or hexadecimal.
@@ -19,13 +20,21 @@ in either binary, octal, decimal, or hexadecimal.
 0xDEADF00D // hexadecimal
 ```
 
-An integer literal suffixed with `u` has type `uint`. A non-negated integer literal also becomes a
-`uint` automatically when its context requires one, so ordinary arguments, fields, and return values
-usually do not need the suffix. The suffix remains useful where no expected type is available.
+An integer literal suffixed with `u` has type `uint`. An unsuffixed, non-negative integer literal
+adopts a required `uint` or `float` type in ordinary arguments, fields, and return values. In a binary
+numeric expression, it also adopts the known `uint` or `float` type of the other operand. This keeps
+simple calculations such as `index - 1` and `value > 0` suffix-free.
+
+A negated literal such as `-1` is an `int` expression, not a non-negative literal eligible for this
+inference. Likewise, an `int` variable is never implicitly converted to `uint` or `float`. The `u`
+suffix remains useful where no expected or known operand type is available.
 
 ```nymph
 10u
 func ten(): uint = 10
+func previous(index: uint): uint = index - 1
+func positive(value: float): boolean = value > 0
+func offset(index: uint): int = index + -1
 ```
 
 Floats are only decimal, and they may include underscore digit separators, scientific-notation exponents.

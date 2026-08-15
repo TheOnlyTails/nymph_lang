@@ -205,6 +205,12 @@ fn simple_annotated_function() {
 #[test]
 fn list_index_is_native_for_uint_and_extensible_for_other_keys() {
 	assert_ok("func unsigned(xs: #[int], i: uint): int = xs[i]");
+	assert_ok(
+		"func previous(xs: mut #[int], i: uint): int = {
+		   xs[i - 1] = xs[i - 1] + 1
+		   xs[i - 1]
+		 }",
+	);
 	assert_error_contains(
 		"func signed(xs: #[int], i: int): int = xs[i]",
 		"no method `index`",
@@ -1048,6 +1054,19 @@ fn negated_int_literal_does_not_widen_to_uint() {
 #[test]
 fn non_literal_int_does_not_convert_to_uint() {
 	assert_error_contains("func f(n: int): uint = n", "mismatched types");
+}
+
+#[test]
+fn only_non_negative_int_literals_inherit_a_binary_numeric_type() {
+	assert_ok("func previous(n: uint): uint = n - 1");
+	assert_error_contains(
+		"func offset(n: uint): int = n + -1",
+		"not implemented for `uint` and `int`",
+	);
+	assert_error_contains(
+		"func add_offset(n: uint, offset: int): int = n + offset",
+		"not implemented for `uint` and `int`",
+	);
 }
 
 #[test]
