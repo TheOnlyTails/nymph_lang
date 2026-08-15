@@ -4,6 +4,10 @@ The compiler for the Nymph language (Rust → JavaScript). This glossary fixes t
 
 ## Language
 
+**Ordinary value**:
+An immutable, persistent Nymph value with no observable shared mutation, ownership, or borrowing. Runtime structural sharing and internal mutation are permitted only when they preserve value semantics.
+_Avoid_: owned value, mutable value.
+
 **Boxed value**:
 The runtime form of every Nymph value — a wrapper object carrying its type's methods via a prototype, so `x.method(...)` dispatches uniformly for primitives and objects alike. See [ADR-0002](./docs/adr/0002-uniform-value-boxing.md).
 _Avoid_: unboxed value.
@@ -27,6 +31,40 @@ _Avoid_: builtin.
 **Marshalling**:
 Converting a boxed value to a raw value, or the reverse, at the JavaScript-interop boundary.
 _Avoid_: conversion, casting (a cast is a Nymph-level `as` between types).
+
+**Effect**:
+A nominal, statically tracked label describing an externally observable operation a computation may perform. Effects form an idempotent, commutative set and are not runtime handlers or expected-error values.
+_Avoid_: exception, capability (effects describe and constrain operations but are not a security boundary).
+
+**Managed resource**:
+An opaque resource reference registered by `let use` for deterministic lexical cleanup through `Close`. Aliases may escape, but cleanup closes the underlying resource and later operations fail safely.
+_Avoid_: owned value (Nymph does not generally track ownership), finalizable object.
+
+### Async model
+
+**Task**:
+A cold reusable computation recipe plus one memoized default execution. Direct await drives or observes the default execution; each explicit spawn creates a fresh independent execution.
+_Avoid_: promise (a JavaScript promise is eager), process.
+
+**Task context**:
+The structured lifetime that owns spawned task executions. An async block creates one; an async function inherits its caller's context without creating another.
+_Avoid_: executor (the executor is a runtime mechanism, not the structured lifetime).
+
+**Task handle**:
+The reference to one running or completed task execution. Driving it to completion observes a `Result` that distinguishes a produced value from cancellation or a defect.
+_Avoid_: detached task, process handle.
+
+**Drive to completion**:
+Start a cold task or wait for a running task, suspending the current logical execution until the task completes. Driving an already completed task returns its memoized result immediately.
+_Avoid_: run, block (neither says whether the caller waits or the physical thread stops).
+
+**Run concurrently**:
+Spawn a fresh execution from a task recipe as a child of the current task context, then continue the current logical execution before that child completes.
+_Avoid_: drive, run in parallel (concurrency does not require parallel threads).
+
+**Close**:
+The synchronous, non-fallible, idempotent interface through which a managed resource restores its local invariants during deterministic cleanup. Suspending or recoverable finalization must be performed explicitly before `Close` runs.
+_Avoid_: `AsyncClose`, finalizer (garbage-collector finalization is not deterministic cleanup).
 
 ## Compiler architecture
 
