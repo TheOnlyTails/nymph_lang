@@ -2811,16 +2811,13 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			_ => self.lower(expr),
 		})
 	}
-	fn lower_branch(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
-		self.lower(expr)
-	}
 	fn lower_loop_branch(
 		&self,
 		source: crate::BodyNodeId,
 		target: u32,
 		expr: &StableExpr,
 	) -> Result<HirExpr, StableLoweringError> {
-		self.with_loop_target(source, target, || self.lower_branch(expr))
+		self.with_loop_target(source, target, || self.lower(expr))
 	}
 	fn next_loop(&self) -> u32 {
 		let target = self.next_loop_target.get();
@@ -3717,10 +3714,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				otherwise,
 			} => HirExpr::If {
 				cond: Box::new(self.lower(condition)?),
-				then: Box::new(self.lower_branch(then)?),
+				then: Box::new(self.lower(then)?),
 				otherwise: otherwise
 					.as_ref()
-					.map(|value| self.lower_branch(value).map(Box::new))
+					.map(|value| self.lower(value).map(Box::new))
 					.transpose()?,
 			},
 			StableExprKind::While {

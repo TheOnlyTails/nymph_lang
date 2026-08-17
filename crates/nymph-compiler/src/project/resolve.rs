@@ -1,4 +1,4 @@
-//! Import path resolution and whole-program module-graph discovery (IB1).
+//! Import path resolution and whole-program module-graph discovery.
 //!
 //! `@/a/b` resolves against the *source root*; `./x`/`../x` resolve relative to
 //! the *importing file's* directory. Every module is keyed by a canonical,
@@ -26,15 +26,14 @@ pub(crate) fn dir_segments(key: &str) -> Vec<String> {
 
 /// Resolve one `import`'s root+path against `importer_key` to a canonical
 /// module key, or a diagnostic (an escaping `../`, an empty path, or an
-/// unsupported `pkg/` import — packages other than `std` are a later slice).
+/// unsupported `pkg/` import; `std` is the only supported package root).
 /// Returning `Diagnostic` itself (not `Box`ed) matches every other
 /// diagnostic-producing path in this driver (`ProjectDiagnostic` also stores
 /// one inline) — this call isn't hot (once per `import` statement, at most a
 /// few per module), so the larger `Err` variant clippy flags isn't a real
 /// perf concern here.
 ///
-/// `std/…` is the one package root resolved today (Slice B, core/std split):
-/// its key is `std::<path>` — `::` can never appear in an ordinary
+/// A `std/…` import resolves to `std::<path>`; `::` can never appear in an ordinary
 /// `@/`/`./`/`../`-rooted key (those are always `/`-joined identifier
 /// segments), so a `std` key can never collide with a project key, however
 /// deeply nested (`import std/collections/tree` → `std::collections/tree`,

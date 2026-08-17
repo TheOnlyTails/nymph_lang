@@ -1,10 +1,10 @@
-//! End-to-end proof of the external-linkage mechanism (Gap 3, L0/L1): a
+//! End-to-end proof of the external-linkage mechanism: a
 //! project `import std/collections/list`s a SYNTHETIC, self-contained std
 //! module declaring `length`/`get` as `external(..)` (linked) and `is_empty`
 //! as real Nymph source that transitively calls `length`, compiles through
 //! the project driver's bundle path (`compile_project_with_std` →
 //! `bundle::bundle`), and RUNS under Node with every linked-external import
-//! resolved and inlined — L1 additionally proves the Option ABI seam: `get`'s
+//! resolved and inlined. The tests also prove the Option ABI seam: `get`'s
 //! `Some`/`None` (built by the injected, stripped `list.ts` intrinsic,
 //! importing the project compiler's canonical, source-derived `std/option`
 //! module) are recognized by the user PROGRAM's own inline `match`, because
@@ -14,7 +14,7 @@
 //! Deliberately synthetic, not the real on-disk `stdlib/src/collections/list.nym`
 //! — that file's own `import @/option`/`import @/ops` don't resolve when
 //! reached as a `std::`-keyed module (a `resolve.rs` limitation, out of this
-//! slice's owned-files scope. This file drives the mechanism end-to-end through
+//! source-file scope. This file drives the mechanism end-to-end through
 //! stable project assembly, bundling, and Node.
 
 use nymph_compiler::compile_project_with_std;
@@ -40,7 +40,7 @@ fn synth_std_provider(path: &str) -> Option<String> {
 	})
 }
 
-/// The synthetic `std/collections/map` module (Gap 3, L3): just enough to
+/// The synthetic `std/collections/map` module contains just enough to
 /// exercise the newly-linked map surface — `size`/`get`/`insert`/`remove` are
 /// declared inside a `mut #{K:V}` impl, mirroring the real `map.nym` (whose
 /// registry rows for these markers are keyed `Some("mut_map")` — the impl's
@@ -226,7 +226,7 @@ fn ambient_external_let_has_one_project_owner_across_consumers() {
 }
 
 /// `xs.is_empty()` — real Nymph source whose body transitively calls the
-/// LINKED `length` — now materializes (Gap 3's `body_calls_unlinked_external`
+/// linked `length` — materializes because `body_calls_unlinked_external`
 /// registry subtraction) instead of loud-deferring, and the materialized
 /// body's own `this.length()` call resolves through the SAME linked-external
 /// mechanism, end to end.
@@ -260,15 +260,14 @@ fn transitively_linked_is_empty_compiles_bundles_and_runs() {
 	assert_eq!(lines.next(), Some("true"), "full output: {output:?}");
 }
 
-/// L1's whole proof obligation: `xs.get(1)` — the Option-RETURNING linked
+/// `xs.get(1)` — the Option-returning linked
 /// external — compiles, bundles (the stripped `list.ts` intrinsic's own
 /// `import { Option } from "../option"` resolves against the canonical
 /// source-derived `std/option` module), and RUNS under Node —
 /// with the intrinsic-BUILT `Some`/`None` recognized by the user PROGRAM's
-/// OWN inline `match`, because `nymph-codegen`'s `emit_enum` now tags every
+/// OWN inline `match`, because `nymph-codegen`'s `emit_enum` tags every
 /// variant with the GLOBAL `Symbol.for(..)` discriminant (not a fresh,
-/// per-module `Symbol(..)`) — the actual defect this slice's ABI-seam
-/// investigation found and fixed. Both the in-bounds (`Some`) and
+/// per-module `Symbol(..)`). Both the in-bounds (`Some`) and
 /// out-of-bounds (`None`) arms are exercised.
 #[test]
 fn linked_list_get_compiles_bundles_and_runs_the_option_round_trip() {
@@ -353,12 +352,12 @@ fn option_consumer_imports_the_canonical_runtime_before_bundling() {
 	);
 }
 
-/// L3's whole proof obligation for the MAP surface: `get`/`insert`/`remove`/
+/// The map surface's `get`/`insert`/`remove`/
 /// `size`/`keys` — all newly linked — compile, bundle (the stripped `map.ts`
 /// intrinsic's own `import { Option } from "../option"` resolves against the
 /// canonical source-derived `std/option` module, exactly like `list.ts`), and RUN
 /// under Node. Exercises both `get`'s in-bounds/missing arms (proving the
-/// L3 ABI fix — `Option.Some({ value })`, not a bare positional value, round
+/// named-field ABI — `Option.Some({ value })`, not a bare positional value — round
 /// -trips through the user's own `match`), a mutation (`insert` then
 /// `size`), an Option-returning mutation (`remove`), and the list-returning
 /// `keys` (indexed natively, no further linkage needed).
@@ -453,19 +452,18 @@ fn linked_map_get_insert_remove_and_keys_compile_bundle_and_run() {
 }
 
 /// The map merge/to_string linkage proof, driven against the AMBIENT map (map
-/// is now part of the `core` prelude, so no `import`/synthetic std module is
+/// is part of the `core` prelude, so no `import`/synthetic std module is
 /// needed). `merge` (`Plus<Other=self,Output=self> for #{K:V}`) is a STRUCTURAL
-/// `ImplFor` block — the shape that used to unconditionally panic in
-/// `push_impl_for_methods` — so lowering the ambient map's own declarations
+/// `ImplFor` block, so lowering the ambient map's own declarations
 /// exercises it; once linked, `.plus()` actually compiles, bundles, and runs
 /// under Node. `to_string` (`Into<string> for #{K:V}`'s `into`) is linked in
 /// the registry the same way, but there is today no checker-accepted call site
 /// that reaches it for a STRUCTURAL receiver (a bare `m.into()` is a checker
-/// error — a separate, pre-existing gap), so this test only asserts the row is
+/// error from unrelated lowering behavior), so this test only asserts the row is
 /// linked and lowering never panics on it.
 #[test]
 fn linked_map_merge_and_to_string_compile_bundle_and_run() {
-	// `map` is now ambient (part of the `core` prelude), so no `import` is
+	// `map` is ambient (part of the `core` prelude), so no `import` is
 	// needed — the map literals' `.plus()` (merge, via `Plus for #{K:V}`) and
 	// `.size()` link against the registry directly, no synthetic std module.
 	let entry = "func demo_merge_size(): uint = {\n\
@@ -500,16 +498,16 @@ fn linked_map_merge_and_to_string_compile_bundle_and_run() {
 	);
 }
 
-/// L3's Set proof: `Set<Item>` (`stdlib/src/collections/set.nym`) is a
+/// `Set<Item>` (`stdlib/src/collections/set.nym`) is a
 /// `struct Set(inner: #{Item: #()})` whose `insert`/`remove`/`contains`
 /// delegate to the inner map's `insert`/`remove`/native `contains_key`, so a
 /// Set defined as an ordinary USER/entry struct
 /// (mirroring `set.nym`'s own body exactly) round-trips insert/remove/
 /// contains under Node with NO new linkage of its own. (The REAL prelude
 /// `Set` cannot materialize yet — a separate, pre-existing
-/// prelude-method-materialization gap for named-struct receivers,
+/// unsupported prelude method materialization for named-struct receivers,
 /// `nymph-codegen`'s `real_set_insert_stays_a_loud_transitively_external_defer`
-/// — out of this slice's scope; see that test's own doc comment.)
+/// — see that test's own doc comment.)
 #[test]
 fn a_user_set_struct_backed_by_the_linked_map_inserts_removes_and_contains_round_trips() {
 	let entry = "import std/collections/map\n\
@@ -871,7 +869,7 @@ fn boxed_lists_and_maps_iterate_through_the_uniform_protocol() {
 	assert_eq!(contract[4], "1", "for source expression ran more than once");
 }
 
-/// The ambient `string` methods (now `core`, linked to `string.ts`): a program
+/// The ambient `string` methods (`core`, linked to `string.ts`): a program
 /// calls several on a plain string literal WITH NO IMPORT, and they compile,
 /// bundle, and run under Node — the primitive-methods-just-work payoff.
 #[test]

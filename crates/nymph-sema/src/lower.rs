@@ -138,8 +138,8 @@ impl Checker<'_> {
 							has_default: false,
 						})
 						.collect();
-					// Lower the struct's own generics' bounds while their param scope is
-					// still active (Slice 4G-b), so `Bound::ty`/`args` land in the same
+					// Lower the struct's generic bounds while their parameter scope is
+					// active so `Bound::ty`/`args` land in the same
 					// `Param` index space as `fields` above.
 					let bounds = self.lower_constraints(generics, 0);
 					self.pop_params();
@@ -208,8 +208,8 @@ impl Checker<'_> {
 							}
 						})
 						.collect();
-					// Lower the enum's own generics' bounds while their param scope is
-					// still active (Slice 4G-b), same reasoning as the struct arm above.
+					// Lower the enum's generic bounds while their parameter scope is active,
+					// for the same reason as the struct arm above.
 					let bounds = self.lower_constraints(generics, 0);
 					self.pop_params();
 					self.sigs.enums.insert(
@@ -244,8 +244,8 @@ impl Checker<'_> {
 						Some(ty) => self.lower_type(ty),
 						None => self.fresh(),
 					};
-					// Lower the generics' own bounds while their param scope is still
-					// active (Slice 4G), so `Bound::ty`/`args` land in the same `Param`
+					// Lower the generic bounds while their parameter scope is active so
+					// `Bound::ty`/`args` land in the same `Param`
 					// index space as `params`/`ret` above and a call site can substitute
 					// them with the scheme's identical instantiation map.
 					let bounds = self.lower_constraints(&meta.generics, 0);

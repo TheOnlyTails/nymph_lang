@@ -1,4 +1,4 @@
-//! Integration tests for the core/std split, Slice B: `import std/…` now
+//! Integration tests for the core/std split: `import std/…`
 //! resolves through a pluggable `std_provider` closure threaded through
 //! `check_project_with_std`/`check_project_library_with_std` and their
 //! embedded-provider convenience counterparts, plus
@@ -14,12 +14,12 @@
 //! The build/test provider here is backed by the real, on-disk `stdlib/src`
 //! tree (mirroring `stdlib_option_result_cycle.rs`'s `stdlib_loader`) — the
 //! production embedded/installed loader is deferred to a later (print/WASM)
-//! slice; `std_provider` is exactly the swap point for that.
+//! behavior; `std_provider` is exactly the swap point for that.
 //!
-//! Per the Slice B brief's own correction: today's on-disk stdlib files
+//! The on-disk stdlib files
 //! (`set.nym`, `list.nym`, ...) cross-reference each other and core via
-//! `@/…` (project-root), not `std/…` — rewriting those imports is Slice C,
-//! deferred. `stdlib/src/collections/tree.nym` is the one import-free real
+//! `@/…` (project-root), not `std/…`. `stdlib/src/collections/tree.nym` is the
+//! one import-free real
 //! std module, so it's this file's end-to-end "resolves AND runs" target;
 //! the std-to-std link test below uses two small SYNTHETIC std modules
 //! (served by a virtual provider, not real files) to prove the linking
@@ -182,7 +182,7 @@ fn std_to_std_import_resolves_and_links() {
 	assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
 }
 
-/// A package root other than `std` is still the pre-Slice-B hard error —
+/// A package root other than `std` is a hard error —
 /// only `std` gained a resolver seam; every other package name is untouched.
 #[test]
 fn an_unknown_package_import_still_errors_unsupported() {
@@ -245,7 +245,7 @@ fn custom_provider_has_no_embedded_std_fallback() {
 	);
 }
 
-/// The `std::`-prefixed module key mangles to valid, runnable JS: Slice B's
+/// The `std::`-prefixed module key mangles to valid, runnable JS. The
 /// design note is that the mangle scheme (`$m{numeric-tag}$name`) never
 /// embeds the module KEY string at all, so a `::` in the key is inert — this
 /// exercises it end-to-end (a deep multi-segment std path, imported `with` a
@@ -289,11 +289,11 @@ fn a_std_key_mangles_to_valid_runnable_js() {
 	assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0");
 }
 
-/// Regression: a `std::`-keyed module's OWN genuine type error, found on its
+/// A `std::`-keyed module's own genuine type error, found on its
 /// own semantic-analysis turn, must
 /// be reported — never silently dropped. `check_project_with_std` must
 /// return this diagnostic, not an empty list, exactly as it would for an
-/// ordinary `@/…`-keyed project module with the same bug.
+/// ordinary `@/…`-keyed project module with the same error.
 #[test]
 fn a_genuine_type_error_in_a_std_modules_own_turn_is_reported_not_swallowed() {
 	let provider = |path: &str| -> Option<String> {
@@ -310,8 +310,8 @@ fn a_genuine_type_error_in_a_std_modules_own_turn_is_reported_not_swallowed() {
 	);
 }
 
-/// Regression sibling of the above, at the `compile_project_with_std` layer:
-/// a std module with a genuine own-turn type error must fail the whole
+/// At the `compile_project_with_std` layer, a std module with a genuine
+/// own-turn type error must fail the whole
 /// compile (`Err`, carrying the diagnostic) — never `Ok` with emitted JS that
 /// silently skipped that module's codegen (which would otherwise bundle a
 /// dangling `import` from a module specifier nothing ever produced).

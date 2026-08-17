@@ -5,7 +5,7 @@
 //! `std/ops` right next to the real one, so every declaration collides with
 //! its own ambient copy.
 //!
-//! [`nymph_compiler::check_without_prelude`] is the fix: it runs the same
+//! [`nymph_compiler::check_without_prelude`] runs the same
 //! parse+check pipeline as [`check`] but with no injected prelude sources at
 //! all, so a self-contained core file (like `ops/mod.nym`) checks clean.
 //! [`nymph_compiler::is_stdlib_source_path`] is the principled detection

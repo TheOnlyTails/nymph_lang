@@ -1,5 +1,5 @@
-//! Milestone B: inherent methods (`this`), method-body checking, namespaced
-//! functions (`Type.f()`), and top-level inherent impls.
+//! Tests inherent methods, method-body checking, namespaced functions, and
+//! top-level inherent implementations.
 
 use nymph_sema::check_module;
 use nymph_syntax::parse_module;
@@ -205,13 +205,13 @@ fn negation_of_a_method_with_omitted_return() {
 // ── Duplicate inner members (checker-level collision detection) ────────────
 //
 // Struct/enum inner members of any kind (instance `func`, `namespace func`
-// statics, `mut func` methods) used to be collected into one `FxHashMap` keyed
-// only by name (`collect_impl_member`), with a later member silently
-// overwriting an earlier same-named one and no diagnostic ever fired. The
-// shadowed member's body was then never type-checked, yet the Slice 4J HIR
-// lowering walks the raw AST and emits EVERY member's body regardless — an
-// unchecked-body-reaches-JS soundness hole. These tests pin the fix: any such
-// collision must now be reported as an error, for every kind combination, on
+// statics, `mut func` methods) share one `FxHashMap` keyed only by name
+// (`collect_impl_member`), where a later member could silently overwrite an
+// earlier same-named one without a diagnostic. The shadowed member's body is
+// not type-checked, yet HIR lowering walks the
+// raw AST and emits every member's body regardless — an
+// unchecked-body-reaches-JS soundness hole. Any such collision must be
+// reported as an error, for every kind combination, on
 // both structs and enums.
 
 #[test]
@@ -305,11 +305,11 @@ fn variant_name_matching_namespaced_function_is_not_a_member_duplicate() {
 	);
 }
 
-// ── Mutable types (MT1): `mut T <: T` through method-call syntax ───────────
+// ── Mutable types: `mut T <: T` through method-call syntax ───────────
 //
 // `recv.method(arg)` resolves through `resolve_method` -> `resolve_inherent`
 // (this file) / `commit_method` (interface impls, see solve.rs), both of
-// which check arguments via `unify_arg`. NN3 says `mut T` is one-way
+// which check arguments via `unify_arg`. `mut T` is one-way
 // assignable to `T` everywhere; free-function calls and binary operators
 // already honored that, but the method-call path didn't.
 
@@ -329,10 +329,9 @@ fn mut_typed_argument_is_accepted_by_an_inherent_method_call() {
 
 #[test]
 fn shadowed_body_type_error_still_surfaces_the_duplicate_diagnostic() {
-	// Before the fix, the FIRST `bad` here would be silently shadowed by the
-	// second and its (broken) body would never be checked at all. Now the
-	// collision itself must always be reported, regardless of whether the
-	// shadowed body would also have failed on its own merits.
+	// The second `bad` must not silently shadow the first and skip its broken
+	// body. The collision itself must always be reported, regardless of
+	// whether the shadowed body would also have failed on its own merits.
 	assert_error_contains(
 		"struct Point(x: int) {
 		   func bad(): int = true
@@ -345,7 +344,7 @@ fn shadowed_body_type_error_still_surfaces_the_duplicate_diagnostic() {
 #[test]
 fn interface_default_method_own_generic_scopes_into_signature() {
 	// A generic parameter declared on an interface DEFAULT method (`wrap<R>`) must be
-	// in scope when its own signature (`value: R): R`) is lowered — previously this
+	// in scope when its own signature (`value: R): R`) is lowered — this
 	// failed with `cannot find type R` because only the interface's generics were
 	// registered, not the method's.
 	assert_ok(

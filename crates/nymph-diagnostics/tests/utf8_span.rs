@@ -1,4 +1,4 @@
-//! Regression tests: `render` must treat `Span` offsets as byte offsets (as
+//! `render` must treat `Span` offsets as byte offsets (as
 //! documented on `nymph_ast::Span`) rather than feeding them to `ariadne` as
 //! char indices. A multi-byte UTF-8 character anywhere at or before a
 //! diagnostic's span must not shift the reported `line:col`, and must not

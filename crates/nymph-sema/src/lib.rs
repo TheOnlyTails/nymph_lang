@@ -12,10 +12,7 @@
 //!
 //! The inference engine is bidirectional (`check`/`infer` modes, in `infer_expr`
 //! and `infer_pattern`) backed by union-find unification (`unify`) with an
-//! occurs-check. [`check_module`] is the Milestone-A entry point.
-//!
-//! Milestone B (interface solving, operator overloading, associated generics, and
-//! match exhaustiveness) is layered on top later.
+//! occurs-check. [`check_module`] is the module-checking entry point.
 
 mod analysis;
 mod annotate;

@@ -50,9 +50,9 @@ pub struct IfaceMethod {
 	pub bounds: Vec<Bound>,
 	/// Whether this method is declared `mut func` (needs a `mut` receiver) rather
 	/// than plain `func`. On an [`InterfaceDef`]'s copy this is the SOURCE OF
-	/// TRUTH (MT2, OO1) that every call-site gate (`solve.rs`) consults; on an
+	/// TRUTH that every call-site gate (`solve.rs`) consults; on an
 	/// [`ImplDef`]'s copy it is the impl's own restatement, compared against the
-	/// interface's declaration at collection time (OO2) and otherwise unused for
+	/// interface's declaration at collection time and otherwise unused for
 	/// gating (the interface's copy is what's authoritative).
 	pub mutating: bool,
 }
@@ -143,8 +143,8 @@ pub fn head_of(interner: &Interner, ty: Ty) -> Option<Head> {
 		TyKind::Map(..) => Some(Head::Map),
 		TyKind::Fn { .. } => Some(Head::Fn),
 		TyKind::Adt(def, _) => Some(Head::Adt(*def)),
-		// `mut` is transparent to method/impl dispatch in MT1 — per-method mut
-		// availability (which methods a `mut` receiver additionally unlocks) is MT2.
+		// `mut` is transparent to method/impl dispatch in — per-method mut
+		// availability (which methods a `mut` receiver additionally unlocks) is.
 		TyKind::Mut(inner) => head_of(interner, *inner),
 		TyKind::Param(_)
 		| TyKind::Infer(_)
@@ -308,7 +308,7 @@ impl Checker<'_> {
 
 		self.push_params(build_param_scope(generics));
 		let self_ty = self.lower_type(type_);
-		// OO4/OO5 (MT2): `impl A for mut B` and `impl mut A for B` are the SAME
+		// `impl A for mut B` and `impl mut A for B` are the SAME
 		// feature under two spellings (design ruling: "`impl mut A for B` = mut
 		// applies to BOTH A and B (same effect: only mut B)") — the interface is
 		// implemented ONLY for the mutable view of the type. `impl A for mut B`
@@ -469,10 +469,10 @@ impl Checker<'_> {
 		let mut first_seen: FxHashMap<EcoString, Span> = FxHashMap::default();
 		// The self type's inherent methods, if it's a struct/enum (`Head::Adt`) —
 		// collected before impls (see `check_module_impl`, check.rs) precisely so
-		// this cross-check has data to query. Closes the HH3 ICE: an interface-impl
-		// method (top-level `impl … for` or a nested `impl Iface { .. }`) of the
-		// same name as the ADT's own inherent method used to type-check clean (the
-		// two collection passes never compared notes) and only panicked later in
+		// this cross-check has data to query. An interface-impl
+		// method (top-level `impl … for` or a nested `impl Iface {.. }`) of the
+		// same name as the ADT's own inherent method can escape the separate
+		// collection passes and panic later in
 		// runtime lowering's duplicate-method assertion — which walks exactly this
 		// combined method list for a struct/enum's *generated JS class*. Deliberately
 		// scoped to `Head::Adt`: builtin scalar/collection types (e.g. `string`) never
@@ -487,13 +487,13 @@ impl Checker<'_> {
 				ImplMember::ExternalFunc(_, _, meta) => meta,
 				ImplMember::Let { .. } | ImplMember::ExternalLet(..) => continue,
 			};
-			// A same-named method declared twice inside ONE `impl Iface { .. }`/`impl
-			// Iface for T { .. }` block used to silently last-wins here (mirrored by
-			// the `methods.insert` below), leaving the first body entirely unchecked
+			// A same-named method declared twice inside ONE `impl Iface {.. }`/`impl
+			// Iface for T {.. }` block would otherwise silently use the last entry
+			// (mirrored by the `methods.insert` below), leaving the first body unchecked
 			// while runtime lowering emits every declaration — the same soundness hole
 			// `collect_impl_member` (members.rs) closes for inherent members. This is
 			// the shared insert point for BOTH top-level `impl … for` and nested
-			// `impl Iface { .. }` (both funnel through `finish_interface_impl`), so
+			// `impl Iface {.. }` (both funnel through `finish_interface_impl`), so
 			// guarding here covers a within-block duplicate in either shape at once.
 			if let Some(&prev) = first_seen.get(&meta.name.0) {
 				let ty = self.display(self_ty);
@@ -539,14 +539,14 @@ impl Checker<'_> {
 			let bounds = self.lower_constraints(&meta.generics, base);
 			self.pop_params();
 			let mutating = meta.kind == FuncKind::Mut;
-			// OO2 (MT2): a plain-target impl (`impl A for B`, not `for mut B`)
+			// a plain-target impl (`impl A for B`, not `for mut B`)
 			// restates each method's `mut func`/`func` kind and it must MATCH the
 			// interface's own declaration — the interface is the source of truth
 			// every call-site gate (`solve.rs`) reads, so a mismatched restatement
 			// here would silently desync what the impl body actually requires
 			// (`this: mut Self` or not, `members.rs`) from what callers are gated
 			// against. Skipped for a `Mut` self type (`impl A for mut B` / `impl
-			// mut A for B`, OO4/OO5): there, EVERY method of `A` requires a `mut`
+			// mut A for B`, ): there, EVERY method of `A` requires a `mut`
 			// receiver by construction (the interface is only reachable through
 			// the mutable view at all), so per-method kind restatement inside the
 			// impl body doesn't carry the same meaning and isn't checked against
@@ -729,7 +729,7 @@ impl Checker<'_> {
 
 	/// Record, into `self.param_bounds`, the interfaces bounding each parameter in a
 	/// generics list (offset by `base` for method generics that follow owner generics).
-	/// Enables resolving `P.method()` through `P`'s bound during body checking.
+	/// Enables resolving `P.method` through `P`'s bound during body checking.
 	pub(crate) fn record_param_bounds(
 		&mut self,
 		generics: &[Spanned<nymph_ast::ty::GenericParam>],

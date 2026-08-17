@@ -386,7 +386,7 @@ fn imported_direct_and_default_interface_methods_run_under_node() {
 
 #[test]
 fn imported_struct_construction_lowers_to_new_not_a_plain_call() {
-	// Regression pin for a cross-module stable runtime identity gap that
+	// Cross-module values require stable runtime identity because
 	// flagged: an imported struct constructor call must lower to `new`, not
 	// a plain function call (which would just crash at runtime).
 	let files = FxHashMap::from_iter([
@@ -452,7 +452,7 @@ fn dependency_with_a_genuine_type_error_is_reported_not_panicked() {
 	// `geometry` has a plain, unrelated type error (no name shadowing
 	// whatsoever). Checking `main` (which imports and calls it) must report
 	// the diagnostic — not panic via the prelude-flattening machinery's
-	// internal invariant, which assumed a "prelude" slice entry was always a
+	// internal invariant, which assumed a prelude entry was always a
 	// trusted, bug-free stdlib clone.
 	let files = FxHashMap::from_iter([
 		(
@@ -470,9 +470,8 @@ fn dependency_with_a_genuine_type_error_is_reported_not_panicked() {
 
 #[test]
 fn imported_enum_is_emitted_once_and_the_bundle_is_valid_js() {
-	// Regression: a cross-module enum used to be BOTH emitted on its own
-	// module's turn AND re-materialized into the importing module's chunk
-	// (`materialize_referenced_prelude_enums` treated every prelude-slice entry
+	// A cross-module enum must be emitted only on its own module's turn.
+	// `materialize_referenced_prelude_enums` must not treat every prelude entry
 	// like the ambient stdlib), so the concatenated bundle declared it twice and
 	// Node crashed at load with "Identifier ... has already been declared".
 	let files = FxHashMap::from_iter([
@@ -506,9 +505,8 @@ fn imported_enum_is_emitted_once_and_the_bundle_is_valid_js() {
 #[test]
 fn a_namespace_name_colliding_with_a_with_name_is_a_diagnostic() {
 	// The spec requires a namespace name and a `with`-bound name sharing an
-	// identifier to be a diagnostic, not a silent double-bind. The two checks
-	// used to inspect disjoint tables (namespace vs own/namespaces; with vs
-	// own/renames), so a namespace/with clash slipped through both.
+	// identifier to be a diagnostic, not a silent double-bind. Both checks must
+	// inspect the namespace and `with` tables or this clash slips through.
 	let files = FxHashMap::from_iter([
 		(
 			"main",
@@ -618,7 +616,7 @@ fn namespace_only_dependency_module_bundles_successfully() {
 #[test]
 fn a_with_name_colliding_with_a_namespace_name_is_a_diagnostic() {
 	// The reverse order (namespace declared after the `with`-name) must also
-	// collide — the with-name check now cross-references the namespaces table.
+	// collide, so the with-name check must cross-reference the namespaces table.
 	let files = FxHashMap::from_iter([
 		(
 			"main",
@@ -796,7 +794,7 @@ fn native_generic_dispatch_members_are_declared_once_by_exact_identity() {
 
 #[test]
 fn cross_module_enum_match_runs_under_node() {
-	// Regression (IB2): matching an enum imported from another module used to
+	// Matching an enum imported from another module must not
 	// crash at RUNTIME with `ReferenceError: TAG is not defined` — the shared
 	// `TAG` discriminant const is emitted only by the enum's DECLARING module,
 	// but across rolldown's per-module ES scopes the MATCHING module referenced

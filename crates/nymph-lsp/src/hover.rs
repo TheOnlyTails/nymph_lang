@@ -177,12 +177,10 @@ mod tests {
 
 	#[test]
 	fn hovering_the_let_keyword_shows_its_doc_not_the_enclosing_block() {
-		// BUG 1 end-to-end, now layered with keyword docs: the smallest expr
+		// The smallest expression
 		// covering the `let` keyword is the enclosing `Block` (which IS
 		// annotated, with its trailing expression's type) — hover must still
-		// suppress that container (never leak the block's type). With
-		// `keyword_doc_at` wired in, this position now resolves to the
-		// `let` keyword's own prose doc instead of `None`.
+		// suppress that container and resolve the `let` keyword's own prose doc.
 		let uri: Uri = "file:///hover_let_kw.nym".parse().unwrap();
 		let text = "func main(): int = {\n  let x: int = 1\n  x\n}";
 		let docs = docs_with(&uri, text);
@@ -264,7 +262,7 @@ mod tests {
 
 	#[test]
 	fn hovering_the_calls_callee_still_resolves_its_function_type() {
-		// Upgraded: a call-site callee now shows the full NAMED signature
+		// A call-site callee shows the full named signature
 		// (`func helper(): int`), not just the unnamed `() -> int` `Fn` type.
 		let uri: Uri = "file:///hover_call_callee.nym".parse().unwrap();
 		let text = "func helper(): int = 1\nfunc main(): int = helper()";
@@ -284,7 +282,7 @@ mod tests {
 
 	#[test]
 	fn hovering_a_generic_typed_value_shows_the_source_param_name() {
-		// BUG 2 end-to-end: `V` must render as `V`, not the internal `T0`.
+		// `V` must render as `V`, not the internal `T0`.
 		let uri: Uri = "file:///hover_generic.nym".parse().unwrap();
 		let text = "func id<V>(v: V): V = v";
 		let docs = docs_with(&uri, text);
@@ -408,10 +406,8 @@ mod tests {
 
 	#[test]
 	fn hovering_an_operator_still_returns_none() {
-		// Operators/delimiters return `None` from both `type_at` (already
-		// pinned in `nymph_sema`) and `keyword_doc_at` (not a keyword token)
-		// — the prior-slice "operator ⇒ None" guarantee must still hold with
-		// keyword docs layered in.
+		// Operators and delimiters must remain absent from both type and keyword
+		// hover lookup; adding keyword documentation must not classify them.
 		let uri: Uri = "file:///hover_operator.nym".parse().unwrap();
 		let text = "func main(): int = 1 + 2";
 		let docs = docs_with(&uri, text);

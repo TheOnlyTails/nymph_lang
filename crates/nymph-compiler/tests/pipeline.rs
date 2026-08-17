@@ -144,7 +144,7 @@ fn compile_report_clean_output_is_stable() {
 
 // ── Entry mode (`check_entry` / `compile_entry`) ────────────────────────────
 //
-// GG1: entry mode is additive — the same source that's clean under library
+// Entry mode is additive — the same source that's clean under library
 // mode (`check`/`compile`) can error under entry mode if it has no valid
 // top-level `main`, and vice versa is never true (entry mode is strictly more
 // demanding than library mode).

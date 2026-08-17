@@ -1,6 +1,5 @@
-//! The ambient `core` prelude, embedded and parsed once (Slice: core/std
-//! split — Slice A injects all of `core` as the ambient prelude; Slice B
-//! resolves `import std/…` via a pluggable provider).
+//! The ambient `core` prelude, embedded, parsed once, and injected into every
+//! module. Explicit `std/…` imports resolve through a pluggable provider.
 //!
 //! `core` is the compiler-coupled subset of the stdlib that every Nymph
 //! program gets for free, with no `import` required: the operator interfaces

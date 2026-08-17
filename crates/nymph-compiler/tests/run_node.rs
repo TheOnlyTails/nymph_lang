@@ -93,7 +93,7 @@ fn run_failure(src: &str, call: &str) -> String {
 
 #[test]
 fn runs_arithmetic() {
-	// Pure scalar arithmetic (Task 3/4 already cover emit+lower; this asserts it RUNS).
+	// Assert that pure scalar arithmetic runs, in addition to emission/lowering coverage.
 	let out = run(
 		"func add(a: int, b: int): int = a + b * 2",
 		"add(new NInt(3), new NInt(4))",
@@ -103,10 +103,9 @@ fn runs_arithmetic() {
 
 #[test]
 fn runs_an_operator_inside_a_string_interpolation() {
-	// Regression: an interpolated expression used to be parsed by a FRESH sub-parser
-	// whose node ids restarted at 0, colliding with the surrounding tree's — so the
-	// operator's recorded dispatch was clobbered by whatever unrelated node shared its
-	// id, surfacing at lowering as "no operator resolution recorded". The interpolated
+	// Interpolated expressions must share the surrounding parser's node-id
+	// sequence. A fresh sub-parser creates collisions that clobber recorded
+	// operator dispatches, surfacing as "no operator resolution recorded". The
 	// `${a + b}` (and a call/closure inside one) must run.
 	let out = run(
 		"func f(a: int, b: int): string = \"sum=${a + b}\"",
@@ -198,7 +197,7 @@ fn runs_tuple_roundtrip() {
 #[test]
 fn runs_map_get() {
 	// A map emits as `new Map([[k, v], …])`; indexing dispatches to `.get(key)`.
-	// Int keys keep this slice free of string-literal lowering (a later slice).
+	// Int keys isolate map indexing from string-literal lowering.
 	let src = "func lookup(): int = #{ 1: 5, 2: 6 }[2]";
 	assert_eq!(run(src, "lookup()"), "6");
 }
@@ -422,7 +421,7 @@ fn runs_tuple_rest_binds_middle_subtuple() {
 	// `#(a, ...rest, z)` — `rest` binds the heterogeneous middle sub-tuple
 	// (boolean, char), sliced from the tuple's own concrete element types.
 	// (Destructuring `let` patterns are a separate, pre-existing lowering
-	// limitation — "slice-1 lowering supports only identifier params" — unrelated
+	// limitation that lowering supports only identifier parameters — unrelated
 	// to pattern rest, so this drives the binding through `match` instead.)
 	let src = r#"
 		func mid(t: #(int, boolean, char, int)): #(boolean, char) = match (t) {
@@ -730,7 +729,7 @@ fn runs_struct_inner_func() {
 #[test]
 fn runs_operator_overload_via_nested_impl() {
 	// `+` on a struct with a NESTED `impl Plus<...>` (declared inside the struct
-	// body) dispatches to `.plus(...)` rather than a native JS `+` (Slice 4B, D3/D4).
+	// body) dispatches to `.plus(...)` rather than a native JS `+`.
 	let src = r#"
 		interface Plus<Other, Output> { func plus(other: Other): Output }
 		struct Vec2(x: int, y: int) {
@@ -804,7 +803,7 @@ fn runs_mixed_int_and_float_stays_native() {
 fn runs_compound_assign_dispatches_user_operator() {
 	// `v1 += v2` on a struct with a directly-defined `Plus.plus` impl actually calls
 	// `.plus(...)` at runtime, rather than emitting a literal JS `v1 = v1 + v2`
-	// (which would silently string-coerce two class instances) — Finding 1.
+	// (which would silently string-coerce two class instances).
 	let src = r#"
 		interface Plus<Other, Output> { func plus(other: Other): Output }
 		struct Vec2(x: int, y: int)
@@ -849,7 +848,7 @@ fn runs_compound_assign_on_int_stays_native() {
 #[test]
 fn runs_prefix_negate_overload_dispatches_to_method() {
 	// `-v` on a struct with a directly-defined `Negate.negate` impl actually calls
-	// `.negate()` at runtime, componentwise negating the vector (Slice 4C-a).
+	// `.negate()` at runtime, componentwise negating the vector.
 	let src = r#"
 		interface Negate<Output> { func negate(): Output }
 		struct Vec2(x: int, y: int)
@@ -913,7 +912,7 @@ fn runs_prefix_bit_not_native_on_int() {
 #[test]
 fn runs_prefix_bit_not_overload_dispatches_to_method() {
 	// `~m` on a struct with a directly-defined `BitNot.bit_not` impl actually calls
-	// `.bit_not()` at runtime, componentwise bit-negating the mask (Slice 4C-a).
+	// `.bit_not()` at runtime, componentwise bit-negating the mask.
 	let src = r#"
 		interface BitNot<Output> { func bit_not(): Output }
 		struct Mask(a: int, b: int)
@@ -932,12 +931,12 @@ fn runs_prefix_bit_not_overload_dispatches_to_method() {
 	);
 }
 
-// ── Slice 4C-b: interface default method materialization ───────────────────
+// ── Interface default method materialization ───────────────────────────────
 
 #[test]
 fn runs_interface_default_dispatches_via_operator() {
 	// `v1 < v2` desugars to `Comparable::less_than`, which `Vec2` never defines
-	// directly — only `compare_to`. Slice 4C-b materializes `less_than`'s
+	// directly — only `compare_to`. Lowering materializes `less_than`'s
 	// interface-default body onto `Vec2`'s class, and `less_than` itself calls
 	// `this.compare_to(other)` (another materialized/impl method) — both must
 	// actually run under Node and return the right boolean.
@@ -971,9 +970,8 @@ fn runs_interface_default_dispatches_via_operator() {
 #[test]
 fn runs_interface_default_explicit_call() {
 	// The same materialized `less_than` default, called explicitly
-	// (`v.less_than(w)`) rather than through the `<` operator. Before Slice 4C-b
-	// this was a *silent* miscompile (a zero-diagnostic program whose lowered JS
-	// called a method that didn't exist on the class); now it's a real method.
+	// (`v.less_than(w)`) rather than through the `<` operator. The default must
+	// materialize as a real class method so lowered JS cannot call a missing method.
 	let src = r#"
 		interface Comparable<Other> {
 			func compare_to(other: Other): int
@@ -1005,7 +1003,7 @@ fn runs_interface_default_explicit_call() {
 fn runs_interface_default_override_wins() {
 	// `Vec2` overrides `less_than` directly rather than relying on the interface
 	// default — the override's body must be the one that actually runs (a
-	// constant `false`), not the materialized default (V1: override always wins).
+	// constant `false`), not the materialized default; overrides always win.
 	let src = r#"
 		interface Comparable<Other> {
 			func compare_to(other: Other): int
@@ -1043,14 +1041,14 @@ fn runs_generic_bound_operator_with_user_override() {
 	assert_eq!(run(src, "demo()"), "false");
 }
 
-// ── Slice 4C-c, Task 3: comparison/equality generics end-to-end ─────────────
+// ── Comparison/equality generics end-to-end ────────────────────────────────
 
 #[test]
 fn runs_late_pinned_adt_comparison_dispatches_at_runtime() {
 	// The headline silent-miscompile probe, run for real under Node: `xs[0] <
 	// xs[0]` is recorded against a still-unbound inference variable, later
-	// pinned to `Vec2` by the `#[Vec2]` annotation. Before W1 this compiled to a
-	// native JS `<` between two class instances (`NaN`-ish nonsense); after W1
+	// pinned to `Vec2` by the `#[Vec2]` annotation. It must not compile to a
+	// native JS `<` between two class instances (`NaN`-ish nonsense);
 	// it must actually call `.less_than(...)` and produce the impl's real
 	// answer.
 	let src = r#"
@@ -1084,7 +1082,7 @@ fn runs_late_pinned_adt_comparison_dispatches_at_runtime() {
 
 #[test]
 fn runs_native_int_and_float_comparison_unchanged() {
-	// W1 leaves the concrete-primitive fast path untouched: `int`/`float`
+	// The concrete-primitive fast path remains untouched: `int`/`float`
 	// comparisons still compile to a native JS `<`/`>`, not a dispatched call.
 	let src = "func lt(a: int, b: int): boolean = a < b
 	           func gt(a: float, b: float): boolean = a > b";
@@ -1146,8 +1144,8 @@ fn user_struct_operators_use_identity_while_explicit_equals_dispatches() {
 fn runs_enum_inherent_method_matching_this() {
 	// An inherent method on an enum branches on `match (this) { .. }` (the
 	// checker rejects direct `this.field` access on an enum receiver — see the
-	// Slice 4D plan's investigation brief, "corrections" #2 — so matching is
-	// the supported way to inspect `this` inside an enum method).
+	// checker rejects direct `this.field` access, so matching is the supported
+	// way to inspect `this` inside an enum method).
 	let src = r#"
 		enum Color { Red, Green, Blue }
 		impl Color {
@@ -1182,7 +1180,7 @@ fn runs_enum_method_reads_field_variant_payload_via_match() {
 #[test]
 fn runs_enum_operator_overload_dispatches_to_method() {
 	// `a + b` on an enum dispatches to `.plus(...)` (a `UserImpl` resolution),
-	// exactly like the struct case, now that enums can carry methods.
+	// exactly like the struct case because enums can carry methods.
 	let src = r#"
 		interface Plus<Other, Output> { func plus(other: Other): Output }
 		enum Color { Red, Green }
@@ -1213,7 +1211,7 @@ fn runs_enum_interface_default_method() {
 
 #[test]
 fn runs_enum_with_methods_preserves_tag_identity() {
-	// The Slice 2C tag-identity value ABI must not change for a methodful enum:
+	// The tag-identity value ABI must not change for a methodful enum:
 	// a constructed field variant still shares the factory's own `[TAG]`, and
 	// distinct variants still have distinct tags — while methods are also
 	// callable on both variant shapes.
@@ -1249,12 +1247,12 @@ fn compile_produces_runnable_js() {
 	);
 }
 
-// ── Slice 4E: `return`, let-shadowing, module lets ──────────────────────────
+// ── `return`, let-shadowing, module lets ───────────────────────────────────
 
 #[test]
 fn runs_early_return_with_value_inside_a_statement_position_if() {
 	// The corpus `abs` shape: an early `return n` inside a statement-position
-	// `if`, falling through to the trailing expression otherwise (Slice 4E, Y1).
+	// `if`, falling through to the trailing expression otherwise.
 	let src = r#"
 		func abs(n: int): int = {
 			if (n >= 0) { return n }
@@ -1499,7 +1497,7 @@ impl DefaultValue for Value {}
 fn runs_same_scope_let_shadow_computes_using_the_prior_binding() {
 	// `let x = 1; let x = x + 1; x * 10` — the redeclaration renames in emitted
 	// JS (avoiding a `SyntaxError: Identifier 'x' has already been declared`),
-	// and its RHS reads the PRIOR `x` (Slice 4E, Y2).
+	// and its RHS reads the prior `x`.
 	let src = r#"
 		func f(): int = {
 			let x = 1
@@ -1597,7 +1595,7 @@ fn runs_mutable_top_level_let() {
 fn runs_nested_block_shadow_that_reads_the_outer_binding() {
 	// The exact reported hazard: a nested block's `let i` redeclares the outer
 	// `i` AND its own initializer reads that outer `i` (`let i = i + 100`).
-	// Without the Y2 fix, both bindings would emit as the identical JS
+	// Both bindings must not emit as the identical JS
 	// identifier `i`, and JS's block-scope hoisting (TDZ) would make the inner
 	// initializer read the not-yet-initialized inner `i` instead of the outer
 	// one, throwing `ReferenceError: Cannot access 'i' before initialization`.
@@ -1813,7 +1811,7 @@ fn runs_top_level_lets_via_a_three_function_mutual_recursion_cycle() {
 	assert_eq!(run(src, "r"), "3");
 }
 
-// ── Slice 4E follow-up: `return` inside an UNBRACED if/while branch ─────────
+// ── `return` inside an unbraced if/while branch ─────────────────────────────
 
 #[test]
 fn runs_bare_return_as_an_unbraced_while_body() {
@@ -1839,7 +1837,7 @@ fn runs_bare_return_as_an_unbraced_if_then_branch() {
 	assert_eq!(run(src, "f(new NInt(3))"), "3");
 }
 
-// ── Slice 4G: call-site bound enforcement ───────────────────────────────────
+// ── Call-site bound enforcement ─────────────────────────────────────────────
 //
 // A bound-satisfying generic call, both spellings (declared generic and the
 // `impl Trait` param sugar), still checks and runs correctly under Node —
@@ -1859,7 +1857,7 @@ fn runs_bound_satisfying_call_both_spellings() {
 	assert_eq!(run(src, "total(new Square({ side: new NInt(4) }))"), "32");
 }
 
-// ── Slice 4H: string expressions ─────────────────────────────────────────────
+// ── String expressions ──────────────────────────────────────────────────────
 
 #[test]
 fn runs_a_plain_string_literal() {
@@ -1923,7 +1921,7 @@ fn runs_string_compound_assign() {
 	assert_eq!(run(src, "f()"), "ab");
 }
 
-// ── Slice 4H: range/for-loop expressions ────────────────────────────────────
+// ── Range/for-loop expressions ──────────────────────────────────────────────
 
 #[test]
 fn runs_a_for_loop_over_an_exclusive_range() {
@@ -2245,15 +2243,15 @@ fn runs_a_for_loop_over_a_mut_list() {
 
 #[test]
 fn runs_a_for_loop_over_an_iterator_directly() {
-	// RR1/RR2: a source that itself implements `Iterator<Item>` is used
+	// A source that itself implements `Iterator<Item>` is used
 	// directly (`let $it = <src>`, no `.iter()` hop) — desugars to
 	// `while ($go) { match ($it.next()) { Some(x) -> .., None -> $go = false } }`.
 	// `Counter`'s `next` mutates `this.n`, which requires `this: mut Self` —
-	// declaring `next` a `mut func` on BOTH the interface (OO1, the source of
-	// truth every gate reads) and this impl (OO2, the impl's restatement must
+	// declaring `next` a `mut func` on both the interface (the source of
+	// truth every gate reads) and this impl (whose restatement must
 	// match) gets that without needing a `Mut`-self-type impl target (`impl ..
 	// for mut Counter`), which lowering doesn't support yet for a class-backed
-	// ADT (a separate, pre-existing MT2 lowering gap this slice doesn't touch).
+	// ADT, which lowering does not support for mutable self-type impl targets.
 	// `c` itself must be bound `mut`: the `for`-loop desugar calls `next()` on
 	// it directly (`IterMode::Direct`), and that call is gated exactly like an
 	// explicit `c.next()` would be (`MutMethodNeedsMutReceiver`).
@@ -2283,7 +2281,7 @@ fn runs_a_for_loop_over_an_iterator_directly() {
 
 #[test]
 fn runs_a_for_loop_over_an_iterable_via_iter() {
-	// RR1/RR2: a source that implements `Iterable<T>` (not `Iterator` itself)
+	// A source that implements `Iterable<T>` (not `Iterator` itself)
 	// is desugared through `.iter()` — `let $it = <src>.iter()` — then the
 	// same while/match/next protocol as the direct case above. `T` is read off
 	// the matched `Iterable` impl's own argument (`resolve_iface_arg`), not by
@@ -2358,11 +2356,11 @@ fn runs_a_for_loop_over_a_spread_param_bound_to_a_list() {
 	assert_eq!(run(src, "demo().v"), "5");
 }
 
-// ── Slice 4I: `|>`, `in`/`!in`, `??` (Task 2) ────────────────────────────────
+// ── `|>`, `in`/`!in`, `??` ─────────────────────────────────────────────────
 
 #[test]
 fn runs_pipe_chain_applies_functions_left_to_right() {
-	// DD1: `|>` lowers structurally to a `Call`; chained pipes are left-assoc, so
+	// `|>` lowers structurally to a `Call`; chained pipes are left-associative, so
 	// `10 |> double |> inc` is `inc(double(10))`, not `double(inc(10))`.
 	let src = r#"
 		func double(x: int): int = x * 2
@@ -2374,7 +2372,7 @@ fn runs_pipe_chain_applies_functions_left_to_right() {
 
 #[test]
 fn runs_user_contains_impl_dispatches_in_and_not_in() {
-	// DD2: `a in c` / `a !in c` dispatch to `c.contains(a)` / `c.not_contains(a)` —
+	// `a in c` / `a !in c` dispatch to `c.contains(a)` / `c.not_contains(a)` —
 	// the RHS collection is the receiver, swapped from every other operator.
 	let src = r#"
 		interface Contains<Item> {
@@ -2433,7 +2431,7 @@ fn in_operator_never_emits_native_js_in() {
 
 #[test]
 fn runs_user_unwrap_impl_dispatches_eagerly() {
-	// DD3 (corrected): Nymph has no optional runtime representation, so `??`
+	// Nymph has no optional runtime representation, so `??`
 	// always dispatches to an ordinary eager `recv.unwrap(fallback)` call.
 	let src = r#"
 		interface Unwrap<Output> { func unwrap(default: Output): Output }
@@ -2485,12 +2483,12 @@ fn unwrap_never_emits_native_js_nullish_coalescing() {
 	);
 }
 
-// ── Slice 4J: `namespace func` statics, `mut func` methods ─────────────────
+// ── `namespace func` statics, `mut func` methods ───────────────────────────
 
 #[test]
 fn runs_struct_namespaced_static_called_from_nymph() {
 	// `Type.func(args)` inside a Nymph body lowers structurally (a `Field`
-	// callee, zero call-site changes) and the DECLARATION now lands as a JS
+	// callee, zero call-site changes) and the declaration lands as a JS
 	// `static` class method.
 	let src = r#"
 		struct Point(x: int, y: int) {
@@ -2592,7 +2590,7 @@ fn runs_impl_mut_method_mutates_a_this_field() {
 
 #[test]
 fn runs_field_slot_reassignment_gated_on_a_mut_receiver() {
-	// Mutable types (MT1): `mut T` is compile-time-only — codegen is a near
+	// `mut T` is compile-time-only — codegen is a near
 	// no-op (JS objects are already mutable), so a program the checker lets
 	// through because its receiver is `mut` must run under Node exactly like
 	// the equivalent ungated field assignment always has.
@@ -2608,7 +2606,7 @@ fn runs_field_slot_reassignment_gated_on_a_mut_receiver() {
 
 #[test]
 fn runs_nested_mut_field_slot_reassignment_through_an_immutable_receiver() {
-	// NN6, field-type-authority, pinned end to end: `inner`'s OWN declared
+	// Field type authority is pinned end to end: `inner`'s own declared
 	// type (`mut Counter`) governs regardless of the outer `w`'s own
 	// mutability — the checker lets `w.inner.n = ..` through even though `w`
 	// itself is a plain, non-`mut` `Wrapper`, and (mut being compile-time-only)
@@ -2632,10 +2630,9 @@ fn runs_nested_mut_field_slot_reassignment_through_an_immutable_receiver() {
 
 #[test]
 fn runs_let_mut_reassignment_of_a_mut_typed_binding() {
-	// `let mut` binds at `mut <ty(v)>` (NN4) — reassigning that binding, and
+	// `let mut` binds at `mut <ty(v)>` — reassigning that binding, and
 	// passing it on to a plain (non-`mut`) parameter (`mut T <: T`, one-way),
-	// both run under Node exactly like the pre-mutable-types code they used to
-	// be.
+	// both preserve ordinary immutable parameter behavior under Node.
 	let src = r#"
 		func takes_int(x: int): int = x + 1
 		func f(): int = {
@@ -2667,7 +2664,7 @@ fn runs_list_index_assignment() {
 
 #[test]
 fn runs_map_index_assignment() {
-	// Same defect, `Map` receiver: a JS `Map` has no assignment-expression
+	// A JS `Map` has no assignment-expression
 	// form for its entries (`m[k] = v` would silently set an own property on
 	// the `Map` object itself, not mutate an entry), so this must lower to a
 	// `.set(key, value)` call, not a computed-member `AssignmentTarget`.
@@ -2680,7 +2677,7 @@ fn runs_map_index_assignment() {
 	assert_eq!(run(src, "set(new Map([[1, 10]]), 1, 99).get(1)"), "99");
 }
 
-// ── Slice 4K: `is`/`!is` desugar, `as` scalar/`Into` dispatch, end-to-end ──
+// ── `is`/`!is` desugar, `as` scalar/`Into` dispatch, end-to-end ────────────
 
 #[test]
 fn runs_is_matching_and_non_matching_literal_patterns() {
@@ -2730,8 +2727,7 @@ fn runs_int_to_uint_cast_saturates_via_abs() {
 	// Nymph defines its own semantics for `int as uint` rather than inheriting
 	// JS/Rust edge behavior: no `Into` is declared anywhere for `as`, and JS
 	// numbers can't express Rust's 2^64 wraparound, so a negative `int as uint`
-	// takes `Math.abs` first — `int as uint` used to be a plain no-op (Slice 4K,
-	// HH2); the abs-first rule makes it a real runtime operation now.
+	// takes `Math.abs` first so the cast is a real runtime operation.
 	let src = "func f(n: int): uint = n as uint";
 	assert_eq!(run(src, "f(new NInt(5))"), "5");
 	assert_eq!(run(src, "f(new NInt(-1))"), "1");
@@ -2917,7 +2913,7 @@ fn runs_cast_via_a_user_into_impl() {
 
 #[test]
 fn runs_cast_via_a_user_into_impl_with_a_custom_method_name() {
-	// Defect 1 (critical): `check_cast` used to hardcode the dispatched method name
+	// `check_cast` must not hardcode the dispatched method name
 	// to `"into"` regardless of what the resolved `Into`-named interface actually
 	// declares — silently emitting a call to a method that doesn't exist on the
 	// class whenever the interface's sole method isn't literally named `into`.
@@ -2953,7 +2949,7 @@ fn cast_via_into_impl_never_emits_a_native_as_keyword_or_call_to_math() {
 	);
 }
 
-// ── Slice 4K, HH3 (Defect 2): namespaced static vs. interface-impl method ──
+// ── Namespaced static vs. interface-impl method ────────────────────────────
 
 #[test]
 fn namespaced_static_and_interface_impl_method_sharing_a_name_both_run() {
@@ -3022,7 +3018,7 @@ fn runs_bool_or_short_circuits_never_evaluating_the_rhs() {
 	assert_eq!(run(src, "f({ v: true })"), "true");
 }
 
-// ── Closures (Slice 4L) ──────────────────────────────────────────────────────
+// ── Closures ─────────────────────────────────────────────────────────────────
 
 #[test]
 fn runs_a_paren_closure_as_a_pipe_rhs() {
@@ -3065,7 +3061,7 @@ fn runs_a_closure_capturing_and_mutating_an_outer_mut_binding() {
 #[test]
 fn runs_a_closure_capturing_a_shadow_renamed_outer_binding() {
 	// `let x = 1; let x = x + 1` renames the second binding to `x$1` in the
-	// emitted JS (Slice 4E, Y2) — a closure defined afterward, reading the
+	// emitted JS. A closure defined afterward, reading the
 	// free variable `x`, must resolve to that SAME renamed binding, not a
 	// stale reference to the first `x`.
 	let src = "
@@ -3237,7 +3233,7 @@ fn runs_an_enum_variant_constructor_field_as_a_closure_slot() {
 	assert_eq!(run(src, "g()"), "105");
 }
 
-// ── SS1: smart literal spread ────────────────────────────────────────────────
+// ── Smart literal spread ────────────────────────────────────────────────────
 
 #[test]
 fn runs_static_tuple_spreads_as_a_canonical_boxed_tuple() {
@@ -3430,7 +3426,7 @@ fn runs_a_map_spread_over_a_native_list_of_pairs_source() {
 
 #[test]
 fn runs_a_map_spread_computed_key_eval_order() {
-	// SS4: entries emit left-to-right in source order with no hoisting — a
+	// Entries emit left-to-right in source order with no hoisting — a
 	// side-effecting expression key evaluates exactly once, AFTER the spread
 	// ahead of it, and a duplicate key it produces still wins over the
 	// spread's own entry only because the literal comes LATER in the merged
@@ -3469,7 +3465,7 @@ fn real_list_push_materializes_once_push_is_linked() {
 
 #[test]
 fn mixed_int_uint_operators_run_under_node() {
-	// End-to-end for the int<->uint operator slice: mixed operators type-check
+	// Mixed int/uint operators type-check
 	// against the real stdlib's cross-type impls and execute as native JS. Notably
 	// the arithmetic Output is the signed `int` domain (so `sub` can go negative) and
 	// division is `float` (`7 / 2 == 3.5`, not integer). Since every mixed primitive
@@ -3492,12 +3488,11 @@ fn mixed_int_uint_operators_run_under_node() {
 	assert_eq!(run_js(js, "ne(new NInt(4), new NUint(5))"), "true");
 }
 
-// FLIP (Gap 3, L0): `is_empty` (`this.length() == 0`) is real Nymph source,
-// not `external` itself — it used to stay a loud defer because the method it
-// transitively calls, `length`, WAS `external` with no JS binding anywhere
-// (`body_calls_unlinked_external`'s member-call extension caught it). Now
-// that `length` is a LINKED external (Gap 3, L0's one seeded registry entry —
-// see `nymph_hir::linkage::REGISTRY`), `body_calls_unlinked_external` no
+// `is_empty` (`this.length() == 0`) is real Nymph source, not `external`
+// itself. Its transitive `length` call requires an external JS binding
+// (`body_calls_unlinked_external`'s member-call extension caught it). Because
+// `length` is a linked external (see
+// `nymph_hir::linkage::REGISTRY`), `body_calls_unlinked_external` no
 // longer counts it as unlinked, so `is_empty` materializes: its `this.length()`
 // lowers to `HirExpr::ExternCall`, which emits a module-qualified local call
 // plus a deduped import from `std/collections/list`. This can't
@@ -3513,11 +3508,11 @@ fn real_list_is_empty_materializes_once_length_is_linked() {
 	);
 }
 
-// FLIP (Gap 3, L1): `list.nym`'s `get` is `external(get)` — it used to stay a
+// `list.nym`'s `get` is `external(get)` and requires a
 // loud defer for the identical reason `push` (above) still does: no JS
-// binding anywhere for the marker. It is now LINKED for a `List` receiver
+// binding anywhere for the marker. It is linked for a `List` receiver
 // (`nymph_hir::linkage::REGISTRY`'s `("get", Some("list"))`/`("get",
-// Some("mut_list"))` rows, the Option ABI seam this slice wires), so it
+// Some("mut_list"))` rows), so it
 // materializes: the call lowers to `HirExpr::ExternCall` carrying the
 // ALREADY-resolved `(module, symbol)` pair (see `HirExpr::ExternCall`'s own
 // doc comment for why — `get` is an AMBIGUOUS marker shared with `map.nym`'s
@@ -3538,13 +3533,12 @@ fn real_list_get_materializes_once_get_is_linked() {
 	assert_eq!(run(user, "check()"), "7");
 }
 
-// FLIP (Gap 3, L3): `map.nym`'s `get` shares the SAME bare marker as
-// `list.nym`'s (linked since L1, see
+// `map.nym`'s `get` shares the same bare marker as
+// `list.nym`'s (see
 // `real_list_get_materializes_once_get_is_linked` above), but WAS a
 // different, unlinked JS implementation — the registry's receiver-tag
 // disambiguation (`Some("mut_map")`, since `map.nym` declares `get` inside
-// its `impl<K,V> mut #{K:V}` block) is what previously kept a `Map`
-// receiver's `get` a loud defer. L3 links it: it now materializes exactly
+// its `impl<K,V> mut #{K:V}` block) lets a `Map` receiver's `get` materialize
 // like `list`'s `get`, into `HirExpr::ExternCall` emitting a plain
 // `get($_this, key)` call plus a deduped `import { get } from
 // "std/collections/map"`. Shape-only (same reasoning as the list flips
@@ -3561,9 +3555,9 @@ fn real_map_get_materializes_once_get_is_linked() {
 	assert_eq!(run(user, "check()"), "9");
 }
 
-// FLIP (Gap 3, L3): `map.nym`'s `is_empty` (`this.size() == 0`) is
+// `map.nym`'s `is_empty` (`this.size() == 0`) is
 // transitively external through `size`, mirroring the list case above —
-// `size` is now a LINKED (unambiguous, `receiver_tag: None`) external, so
+// `size` is a linked (unambiguous, `receiver_tag: None`) external, so
 // `body_calls_unlinked_external`'s registry subtraction no longer counts it
 // as unlinked and `is_empty` materializes.
 #[test]
@@ -3576,7 +3570,7 @@ fn real_map_is_empty_materializes_once_size_is_linked() {
 }
 
 // ── Named-type prelude method materialization: a prelude-only INSTANCE method
-// on a NAMED enum receiver (`Option`/`Result`) now materializes ONTO that
+// on a NAMED enum receiver (`Option`/`Result`) materializes ONTO that
 // enum's own emitted class and RUNS, instead of panicking at the
 // "prelude-only impl" wall above (that wall still stands for every OTHER
 // unmaterializable shape — external/transitively-external collection
@@ -3632,8 +3626,7 @@ fn real_option_match_over_a_materialized_enum_runs() {
 #[test]
 fn real_option_map_materializes_and_runs() {
 	// `map` is another of `Option`'s own inline methods, this time taking a
-	// closure argument (the sibling closure-lowering track's already-landed
-	// machinery — untouched by this fix) and itself constructing a `Some` via
+	// closure argument and itself constructs a `Some` via
 	// `VariantNew` inside the materialized body.
 	let user = r#"
 		func check(): int = match (Some(1).map((x) -> x + 1)) { Some(value) -> value, None -> 0 }
@@ -3648,7 +3641,7 @@ fn real_option_unwrap_via_the_unwrap_interface_materializes_onto_the_class() {
 	// `option.nym` (Sub-problem #4: a top-level impl targeting a named prelude
 	// enum, never fed to `collect_adt_methods`'s inline-member pass at all).
 	// Its own parameter is literally named `default` (a JS reserved word) —
-	// exercising `declare`'s reserved-word rename fix too.
+	// exercising `declare`'s reserved-word rename too.
 	let user = r#"
 		func check_some(): int = Some(7).unwrap(0)
 		func inspect(o: Option<int>): int = o.unwrap(9)
@@ -3667,7 +3660,7 @@ fn real_result_ok_and_err_cross_materialize_option_from_convert_nym() {
 	// only becomes referenced as a SIDE EFFECT of lowering `ok`'s/`err`'s own
 	// bodies (`Option.Some(..)`/`Option.None`), which
 	// `materialize_referenced_prelude_enums`'s fixed-point loop must notice on
-	// a LATER round (the `VariantNew` gap fix — collecting `enum_name` off a
+	// a later round because collecting `enum_name` off a
 	// `VariantNew`, not just a bare `VariantRef` — matters here: `ok`/`err`'s
 	// bodies never write a bare `None`/`Some` reference, only `Option.Some(..)`/
 	// `Option.None` qualified constructions).
@@ -3677,7 +3670,7 @@ fn real_result_ok_and_err_cross_materialize_option_from_convert_nym() {
 	// method is itself only demand-materialized because a COMPILED call site
 	// asks for it — a JS driver calling `.is_some()` directly would never
 	// route through `try_materialize_prelude_dispatch` at all, so it
-	// wouldn't actually exercise (or need) this slice's mechanism.
+	// would not exercise this mechanism.
 	let user = r#"
 		func inspect_ok(r: Result<int, string>): boolean = r.ok().is_some()
 		func ok_is_some(): boolean = inspect_ok(Ok(5))
@@ -3718,12 +3711,12 @@ fn real_range_contains_runs_generic_comparison_dispatch() {
 	assert_eq!(run(user, "in_range(new NInt(7))"), "false");
 }
 
-// ── Owned collection literal → `mut` coercion (Bug 2), driven under Node ────
+// ── Owned collection literal → `mut` coercion, driven under Node ────────────
 //
 // These use a self-contained synthetic setup — native `[]`
 // index read/assign on `#{…}`/`#[…]`, which lowers to a plain JS `Map`/`Array`
 // with no `external` linkage involved (`emit.rs`'s `HirExpr::Assign` arm) — to
-// prove the FIX itself: a fresh collection literal accepted at a `mut`
+// prove that a fresh collection literal accepted at a `mut`
 // parameter/ctor field type-checks AND the emitted JS actually mutates the
 // SAME literal the caller passed in.
 
@@ -3746,8 +3739,7 @@ fn a_fresh_map_literal_at_a_mut_struct_ctor_field_is_mutated_and_read_back() {
 	assert_eq!(run(user, "t()"), "99");
 }
 
-// ── Unannotated if/block-bodied inherent method return type (Bug 1 regression
-// guard), driven under Node ─────────────────────────────────────────────────
+// ── Unannotated if/block-bodied inherent method return type under Node ──────
 
 #[test]
 fn an_unannotated_inherent_method_with_an_if_block_body_runs_and_returns_the_branches_common_type()
@@ -3763,9 +3755,8 @@ fn an_unannotated_inherent_method_with_an_if_block_body_runs_and_returns_the_bra
 #[test]
 fn a_mut_func_can_call_a_mut_method_on_a_concrete_field_and_it_runs() {
 	// Projecting a field out of a `mut` receiver yields a mutable place, so `step`
-	// (a `mut func`) may call `bump` (also `mut func`) on `this.inner`. Before the
-	// mutable-field-projection fix this failed to type-check ("bump requires a mut
-	// receiver"); now it runs, and the two `bump`s mutate shared state (0 → 2).
+	// A `mut func` may call another `mut func` on a mutable field projection;
+	// the two `bump`s must mutate shared state (0 → 2).
 	let user = "struct Inner(n: int) {\n\tmut func bump(): int = {\n\t\tthis.n = this.n + 1\n\t\tthis.n\n\t}\n}\nstruct Outer(inner: Inner) {\n\tmut func step(): int = this.inner.bump()\n}\nfunc t(): int = {\n\tlet mut o = Outer(inner = Inner(n = 0))\n\tlet a = o.step()\n\tlet b = o.step()\n\ta + b\n}";
 	assert_eq!(run(user, "t()"), "3");
 }

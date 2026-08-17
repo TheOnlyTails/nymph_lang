@@ -485,7 +485,7 @@ fn emits_method_less_enum_with_a_canonical_prototype() {
 
 #[test]
 fn emits_enum_with_methods_prototype_shape() {
-	// X1: an enum WITH methods gets a shared `proto` object and every variant
+	// An enum with methods gets a shared `proto` object and every variant
 	// is created via `Object.create(proto)`, while the tag ABI (Object.freeze /
 	// factory-tagging Object.assign) stays intact.
 	let module = HirModule {
@@ -553,7 +553,7 @@ fn emits_list_index_assignment_against_the_boxed_payload() {
 
 #[test]
 fn emits_map_index_assignment_as_a_set_call() {
-	// Same defect, `Map` receiver: a JS `Map` has no assignment-expression
+	// A JS `Map` receiver has no assignment-expression
 	// form for its entries, so `HirExpr::Assign { target: MapGet { .. }, .. }`
 	// must lower to a `.set(key, value)` call, never a computed-member
 	// assignment (which would silently set an own property on the `Map`
@@ -584,9 +584,7 @@ fn emits_map_index_assignment_as_a_set_call() {
 
 #[test]
 fn emits_a_closure_as_an_arrow_function() {
-	// Slice 4L, JJ1: `HirExpr::Closure` emits as a JS arrow function; a
-	// `Block` body flattens directly into the arrow's function body (no
-	// needless nested IIFE), mirroring `emit_func`'s own body split.
+	// A closure block flattens directly into the arrow body rather than a nested IIFE.
 	let module = HirModule {
 		lets: vec![],
 		funcs: vec![HirFunc {
@@ -612,13 +610,8 @@ fn emits_a_closure_as_an_arrow_function() {
 
 #[test]
 fn closure_return_emits_fine_inside_a_subexpression_position_match_arm() {
-	// A `return` inside a closure that itself sits inside a
-	// SUBEXPRESSION-position match arm
-	// (which sets `in_iife_subexpr = true` for everything underneath, Slice
-	// 4E, Y1) must still emit as a plain arrow `return`, not panic as if it
-	// targeted the match's own IIFE. This is exactly what the closure-body
-	// emission's save/reset-to-`false` of `in_iife_subexpr` (mirroring
-	// `emit_func`'s implicit top-level function boundary) exists to give.
+	// A closure inside a subexpression-position match arm establishes its own
+	// return boundary, so its return must not target the match IIFE.
 	let module = HirModule {
 		lets: vec![],
 		funcs: vec![HirFunc {

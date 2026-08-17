@@ -1,9 +1,5 @@
-//! Mutable types — Slice MT2: interface `mut func` (OO1) is the source of truth for
-//! per-method mut-ness, an impl restating a mismatched kind is a diagnostic (OO2), a
-//! `T: A` bound's `mut func` requirement is gated through the bound (OO3), and
-//! `impl A for mut B` / `impl mut A for B` (equivalent spellings, OO4/OO5) require a
-//! `mut` argument to satisfy a `T: A` bound — mixed `mut`/non-`mut` arguments at one
-//! type parameter is a compile error.
+//! Tests interface method mutability, implementation-kind mismatches,
+//! bound-mediated receiver gates, and mut-qualified implementation self types.
 
 use nymph_sema::check_module;
 use nymph_syntax::parse_module;
@@ -45,7 +41,7 @@ fn assert_error_contains(source: &str, needle: &str) {
 	);
 }
 
-// ── OO1: interface `mut func` is the source of truth ────────────────────────
+// ── interface `mut func` is the source of truth ────────────────────────
 
 const STACK: &str = "interface Stack<E> {
 	mut func push(x: E): void
@@ -96,7 +92,7 @@ fn plain_interface_method_stays_callable_on_a_plain_receiver() {
 	));
 }
 
-// ── OO2: an impl restating a mismatched kind is a diagnostic ────────────────
+// ── an impl restating a mismatched kind is a diagnostic ────────────────
 
 #[test]
 fn impl_restating_a_mut_func_as_plain_func_is_reported() {
@@ -135,7 +131,7 @@ fn impl_matching_the_interfaces_kind_is_clean() {
 	assert_ok(STACK);
 }
 
-// ── OO3: a `T: A` bound's `mut func` requirement is gated through the bound ─
+// ── a `T: A` bound's `mut func` requirement is gated through the bound ─
 
 const STACK_BOUND: &str = "interface Stack<E> {
 	mut func push(x: E): void
@@ -170,7 +166,7 @@ fn bound_plain_func_stays_callable_on_a_plain_generic_param() {
 	));
 }
 
-// ── OO4/OO5: `impl A for mut B` / `impl mut A for B` bound satisfaction ─────
+// ── `impl A for mut B` / `impl mut A for B` bound satisfaction ─────
 
 const A_FOR_MUT_B: &str = "interface A { func touch(): int }
 struct B(n: int) {}
@@ -190,9 +186,8 @@ fn impl_a_for_mut_b_matches_a_mut_receiver_directly() {
 
 #[test]
 fn impl_a_for_mut_b_does_not_match_a_plain_receiver_directly() {
-	// Regression for the "dead impl" bug: `resolve_method` used to strip `mut`
-	// off the receiver before matching, so a `Mut(B)`-self-typed impl could
-	// never match ANY receiver, mut or not.
+	// Stripping `mut` before matching makes a `Mut(B)`-self-typed impl unable
+	// to match any receiver.
 	assert_error_contains(
 		&format!(
 			"{A_FOR_MUT_B}
@@ -271,11 +266,11 @@ fn impl_a_for_mut_b_bound_rejects_mixed_mut_and_plain_arguments() {
 
 #[test]
 fn a_plain_impl_and_a_mut_impl_of_one_interface_is_a_coherence_error() {
-	// Regression (MT2 review): `impl A for B` and `impl A for mut B` both apply
+	// `impl A for B` and `impl A for mut B` both apply
 	// to a `mut B` receiver, so they OVERLAP and coherence must reject them at
 	// the impl declarations — not let both coexist and surface later as a
 	// confusing `AmbiguousCall` at a `mut`-receiver call site. `impls_overlap`
-	// now peels `mut` off both self types before checking overlap.
+	// so overlap checking peels `mut` off both self types.
 	assert_error_contains(
 		"interface A { func touch(): int }
 		 struct B(n: int)
@@ -287,11 +282,8 @@ fn a_plain_impl_and_a_mut_impl_of_one_interface_is_a_coherence_error() {
 
 #[test]
 fn mixed_args_are_fine_when_a_plain_impl_satisfies_the_bound() {
-	// Regression (MT2 review): the mixed-mutability check used to fire
-	// UNCONDITIONALLY, rejecting ANY `f<T: A>(x: T, y: T)` called with one `mut`
-	// and one plain argument — even when A has only an ORDINARY `impl A for B`
-	// and both arguments trivially satisfy the bound (`mut B <: B`). It must be
-	// clean.
+	// A plain `impl A for B` satisfies the bound for both `B` and `mut B`, so
+	// mixed-mutability arguments are valid for `f<T: A>(x: T, y: T)`.
 	assert_ok(
 		"interface A { func touch(): int }
 		 struct B(n: int)
@@ -307,10 +299,8 @@ fn mixed_args_are_fine_when_a_plain_impl_satisfies_the_bound() {
 
 #[test]
 fn ordinary_plain_impl_bound_still_holds_for_a_mut_argument() {
-	// Regression: an ordinary, fully-plain `impl A for B` (no `mut` anywhere)
-	// must still satisfy a `T: A` bound when the caller passes a `mut`-declared
-	// argument — OO4's mut-only-impl bound check must not replace this
-	// one-way `mut B <: B` subtype rule, only add to it.
+	// An ordinary `impl A for B` satisfies a `T: A` bound for a `mut B`
+	// argument. The mut-only-impl check preserves the `mut B <: B` rule.
 	assert_ok(
 		"interface A { func touch(): int }
 		 struct B(n: int) {}
@@ -325,7 +315,7 @@ fn ordinary_plain_impl_bound_still_holds_for_a_mut_argument() {
 
 #[test]
 fn impl_mut_a_for_b_is_equivalent_to_impl_a_for_mut_b() {
-	// OO5: `impl mut A for B` is the SAME feature as `impl A for mut B` under a
+	// `impl mut A for B` is the SAME feature as `impl A for mut B` under a
 	// different spelling (design ruling: "mut applies to BOTH A and B — same
 	// effect: only mut B").
 	assert_ok(
@@ -351,7 +341,7 @@ fn impl_mut_a_for_b_is_equivalent_to_impl_a_for_mut_b() {
 	);
 }
 
-// ── Owned collection literal → `mut` coercion (Bug 2) ───────────────────────
+// ── Owned collection literal → `mut` coercion ──────────────────────────────
 //
 // A `#{…}`/`#[…]` literal is a uniquely-owned temporary — nothing else can
 // alias it — so it may satisfy an expected `mut` collection type directly,
@@ -406,8 +396,8 @@ fn an_empty_map_literal_satisfies_a_mut_map_parameter() {
 
 #[test]
 fn a_mut_named_binding_still_satisfies_a_mut_map_parameter() {
-	// Regression guard: the new literal-only coercion must not have disturbed
-	// the pre-existing, ordinary `mut T <: mut T` path for a named binding
+	// Literal-only coercion must preserve the ordinary `mut T <: mut T` path
+	// for a named binding
 	// that already carries `mut`.
 	assert_ok(
 		"func take(m: mut #{int: int}): boolean = true
@@ -459,13 +449,10 @@ fn a_named_immutable_binding_is_still_rejected_at_a_mut_struct_ctor_field() {
 	);
 }
 
-// ── Unannotated if/block-bodied inherent method return type (Bug 1 regression
-// guard) ─────────────────────────────────────────────────────────────────
+// ── Unannotated if/block-bodied inherent method return type ──────────────
 //
-// Investigation found Bug 1 already fixed on this tree (`generalize_returns` ->
-// `infer_inherent_return` runs a trial `self.infer(body)`, and `infer_block`
-// already returns the type of the block's LAST expression). This pins the
-// exact `Set.remove` shape as a regression guard, not a fix.
+// `infer_inherent_return` infers the body, and `infer_block` returns the type
+// of its last expression. This test exercises the `Set.remove` shape.
 
 #[test]
 fn an_unannotated_inherent_method_with_an_if_block_body_infers_the_branches_common_type() {
@@ -500,10 +487,10 @@ fn omitted_return_trials_do_not_leak_bound_argument_mutability() {
 
 // ── Nested owned-literal → `mut` coercion misses a free-function-call argument
 // whose OWN top-level type isn't `mut` but contains a nested `mut`-expected
-// element/value (Confirmed defect 1) ────────────────────────────────────────
+// element/value ─────────────────────────────────────────────────────
 //
 // `check_call_arg`'s Map/List guard arm only fires when the ARGUMENT'S OWN
-// top-level type is `mut T`; on guard failure it used to fall to the ordinary
+// top-level type is `mut T`; falling through to the ordinary
 // `_` arm, which calls a blind `self.infer(expr)` instead of `self.check(expr,
 // pty)` — so nested elements/values never got the expected-type propagation
 // that would let THEM reach `try_coerce_owned_literal_to_mut` in turn.
@@ -534,7 +521,7 @@ fn a_nested_map_literal_satisfies_a_nested_mut_map_value_in_a_free_function_call
 
 #[test]
 fn a_nested_named_immutable_binding_is_still_rejected_at_a_nested_mut_list_element() {
-	// Regression guard: the nested-literal fix must stay keyed off the nested
+	// Nested-literal coercion must stay keyed off the nested
 	// EXPRESSION being a literal, not off the nested expected type alone — a
 	// nested NAMED immutable binding must still be rejected.
 	assert_error_contains(
@@ -548,7 +535,7 @@ fn a_nested_named_immutable_binding_is_still_rejected_at_a_nested_mut_list_eleme
 }
 
 // ── Owned-literal → `mut` coercion doesn't extend to method-call arguments
-// (Confirmed defect 2) ───────────────────────────────────────────────────────
+// ───────────────────────────────────────────────────────────────────
 //
 // `receiver.method(args…)` infers each argument's type directly and hands the
 // results to `resolve_method` → `commit_method`, which validates the chosen
@@ -585,7 +572,7 @@ fn a_fresh_list_literal_satisfies_a_mut_list_parameter_through_a_method_call() {
 
 #[test]
 fn a_named_immutable_binding_is_still_rejected_at_a_mut_map_parameter_through_a_method_call() {
-	// Regression guard: mirrors the existing free-function-call invariant — a
+	// As with free-function calls, a
 	// NAMED immutable binding must still be rejected at a `mut` method
 	// parameter; only a literal argument gets the coercion.
 	assert_error_contains(

@@ -13,7 +13,7 @@
 //! entry point tooling such as an LSP should use.
 //!
 //! [`compile_entry`] and [`check_entry`] are additive entry-mode counterparts
-//! (GG1): identical to [`compile`]/[`check`], except the module is also
+//! identical to [`compile`]/[`check`], except the module is also
 //! required to declare a valid top-level `main` — the program's entry point —
 //! through the project semantic pipeline. Plain
 //! [`compile`]/[`check`] never require a `main`, so every existing
@@ -147,7 +147,7 @@ fn check_impl(source: &str, path: &str, entry: EntryMode) -> Vec<Diagnostic> {
 /// file that imports siblings (e.g. `option.nym` importing `@/default`) will
 /// report those siblings as unresolved, since a prelude-free, project-free
 /// check only ever sees the one file. That's an inherent consequence of
-/// checking one file in isolation, not a regression — see
+/// checking one file in isolation — see
 /// [`is_stdlib_source_path`] for how callers (the LSP) decide when to use this
 /// instead of [`check`].
 ///

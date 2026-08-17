@@ -35,10 +35,10 @@ pub(crate) enum LoopBreakKind {
 }
 
 /// Which AST node shape a deferred `pending_operators` entry was recorded from,
-/// carrying the specific operator itself (Slice 4C-a: a prefix op has no separate
+/// carrying the specific operator itself (a prefix op has no separate
 /// `BinaryOperator` to hang off a shared tuple slot, so the operator moved into the
 /// variant) — see [`Checker::pending_operators`] for why `finalize_pending_operators`
-/// must treat `BinaryOp`/`AssignOp` vs. `PrefixOp` differently (Finding 1).
+/// must treat `BinaryOp`/`AssignOp` and `PrefixOp` differently.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 // The shared `Op` postfix names the AST node shape each variant was recorded
 // from (`BinaryOp`/`AssignOp`/`PrefixOp` expression kinds) — deliberate, not an
@@ -82,7 +82,7 @@ pub struct Checker<'m> {
 	pub(crate) pending_generic_labels: Vec<(Span, crate::DefinitionId, EcoString)>,
 	/// The interface bounds on the generic parameters of the body currently being
 	/// checked (`ParamIdx` → the interfaces it must implement). Rebuilt per body; used
-	/// to resolve a namespaced call through a type parameter, e.g. `R.default()` where
+	/// to resolve a namespaced call through a type parameter, e.g. `R.default` where
 	/// `R: Default`.
 	pub(crate) param_bounds: FxHashMap<ParamIdx, Vec<DefId>>,
 	/// Declared bounds with their named interface arguments preserved.
@@ -111,7 +111,7 @@ pub struct Checker<'m> {
 	/// declared opaque interface with the exact associated arguments.
 	pub(crate) synthetic_bound_details: FxHashMap<ParamIdx, Vec<crate::iface::Bound>>,
 	/// Set only while checking an interface's own default-method body
-	/// (`check_interface_default_body`, Slice 4C-b): `(interface, this's ParamIdx)`.
+	/// (`check_interface_default_body`): `(interface, this's ParamIdx)`.
 	/// `resolve_method` consults this to resolve a call to another method of *this
 	/// same interface* on `this` directly against the interface's own signature,
 	/// bypassing impl search entirely — see `resolve_method`'s doc comment on why
@@ -129,7 +129,7 @@ pub struct Checker<'m> {
 
 	/// Operator nodes whose LHS operand was still an unresolved inference variable
 	/// at the moment `infer_binary`'s fallback arm ran (an `Infer` type var that
-	/// hasn't unified with a primitive/ADT yet — see the D3 fallback in
+	/// hasn't unified with a primitive/ADT yet — see the fallback in
 	/// `infer_expr.rs`). Recorded as `(node id, operator, span, operand ty, kind)` and
 	/// drained at the end of the *same body* that recorded it (`finalize_pending_operators`,
 	/// called from `check_func_body`, `check_let_body`, `check_method_body`, and
@@ -144,12 +144,12 @@ pub struct Checker<'m> {
 	/// order. `kind` distinguishes a `BinaryOp` node (whose recorded type is the
 	/// operator's own placeholder result and must be unified with the
 	/// finally-resolved type) from an `AssignOp` node (whose recorded type is always
-	/// `Void` and must be left alone — Finding 1: only the `Resolution` gets attached
+	/// `Void` and must be left alone; only the `Resolution` gets attached
 	/// there).
 	pub(crate) pending_operators: Vec<(nymph_ast::NodeId, Span, Ty, Ty, PendingOperatorKind)>,
 
 	/// Call-site bound obligations deferred until the instantiated variable has
-	/// had a chance to unify with a concrete argument (Slice 4G), mirroring
+	/// had a chance to unify with a concrete argument, mirroring
 	/// `pending_operators` exactly: `fn_type_of` pushes one entry per bound on
 	/// every minted var — declared generics (`FuncSig::bounds`) and `impl Trait`
 	/// synthetics (`synthetic_bounds`) alike — and `finalize_pending_bounds`
@@ -161,7 +161,7 @@ pub struct Checker<'m> {
 	/// obligation against only the last-checked body's `param_bounds`.
 	pub(crate) pending_bounds: Vec<PendingBound>,
 
-	/// MT2 OO4: per-`pending_bounds`-variable record of whether the ACTUAL
+	/// per-`pending_bounds`-variable record of whether the ACTUAL
 	/// argument(s) bound to it (at a free-function call site) were `mut` —
 	/// `(saw_a_mut_arg, saw_a_plain_arg)`. `subtype`'s one-way `mut T <: T`
 	/// cancellation (`coerce.rs`) erases an argument's `mut`-ness the moment it
@@ -188,7 +188,7 @@ pub struct Checker<'m> {
 	/// whichever anonymous closure currently encloses it.
 	pub(crate) anon_ctx: Vec<Vec<Ty>>,
 	/// NodeIds of `$N` occurrences already claimed by an in-progress
-	/// `Checker::resolve_anon` scan (Slice: `$N` anonymous closure params).
+	/// `Checker::resolve_anon` scan.
 	/// Guards against a NESTED slot reached while trial- or really-evaluating
 	/// an already-committed boundary (e.g. `check_call_arg` on an argument
 	/// that turns out to just be a bare `$0`, itself already consumed by an
@@ -257,8 +257,8 @@ pub enum EntryMode {
 
 /// Check a whole (single) module and return every diagnostic produced.
 ///
-/// This is the Milestone-A entry point. It runs the three conceptual passes in
-/// order: item resolution (`build_def_map`), signature lowering, then body
+/// Runs three passes in order: item resolution (`build_def_map`), signature
+/// lowering, then body
 /// inference. The signature/body split mirrors the incremental query boundary the
 /// full salsa driver will formalise later. Shared by [`check_module`] (library
 /// mode) and [`check_module_entry`] (entry mode) — see [`EntryMode`].
@@ -415,11 +415,11 @@ fn check_module_from_parts(
 		}
 	}
 	// Inherent methods (struct/enum body `func`s, top-level inherent `impl Type {
-	// .. }`) must be collected before interface impls (below) so `finish_interface_impl`
+	//.. }`) must be collected before interface impls (below) so `finish_interface_impl`
 	// (iface.rs) can cross-check an interface-impl method against the owning type's
-	// already-known inherent methods (Slice 4K, HH3) — closing the ICE where a
-	// same-named inherent method and interface-impl method type-checked clean and
-	// only panicked later during runtime lowering. Neither
+	// already-known inherent methods, preventing a same-named inherent method and
+	// interface-impl method from type-checking cleanly and panicking during runtime
+	// lowering. Neither
 	// pass reads data the other produces otherwise, so this reordering is safe.
 	checker.collect_inherent();
 	checker.collect_impls();
@@ -1025,7 +1025,7 @@ impl<'m> Checker<'m> {
 		// Zonk before storing: a raw `Ty` can still be an unsolved inference variable,
 		// and the unify table is dropped when checking finishes, so it must be resolved
 		// to its concrete form *now* while the table is alive. (Interpreting the stored
-		// `Ty` also needs the `Interner`, which the lowering slice threads through.)
+		// `Ty` also needs the `Interner`, which the lowering path threads through.)
 		let ty = self.resolve_deep(ty);
 		self
 			.annotations
@@ -1431,8 +1431,8 @@ impl<'m> Checker<'m> {
 
 	/// The offset above which a `ParamIdx` is *synthetic*: minted by
 	/// `mint_synthetic_param` (`lower.rs`) for an `impl Interface` type reference
-	/// (Slice 4F sugar) rather than a declared generic parameter. Declared
-	/// generics occupy `0..sig.generics.len()`, well below this offset, so the
+	/// rather than a declared generic parameter. Declared
+	/// generics occupy `0..sig.generics.len`, well below this offset, so the
 	/// two never collide within one signature.
 	pub(crate) const SYNTHETIC_PARAM_BASE: u32 = 1 << 28;
 

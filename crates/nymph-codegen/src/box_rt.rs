@@ -1,4 +1,4 @@
-//! The uniform-value-boxing runtime representation (slice #2, the keystone).
+//! The uniform-value-boxing runtime representation.
 //!
 //! Every Nymph primitive, list, and tuple value compiles to a *boxed value* — a per-type wrapper
 //! ES class carrying its payload in `.v` and its type discriminant on its
@@ -8,9 +8,8 @@
 //!
 //! * [`BOX_MODULE_SOURCE`] — an `export`ed ES module, injected into the bundle
 //!   graph under [`BOX_MODULE_KEY`] exactly like the intrinsic runtime modules
-//!   (`nymph-compiler::HostRuntimeGraph`). This is slice #7's "boxes must be importable
-//!   modules" seam: a later slice's emitted code will `import { NInt } from
-//!   "std/box"` instead of relying on the inline preamble.
+//!   (`nymph-compiler::HostRuntimeGraph`). Project modules import wrappers such
+//!   as `NInt` from `std/box` instead of relying on the inline preamble.
 //! * [`BOX_PREAMBLE`] — the identical class definitions WITHOUT `export`,
 //!   prepended inline by [`crate::emit`] into any single emitted module that
 //!   constructs a box. The single-module facade (`emit`/`compile`, what
@@ -23,13 +22,12 @@
 //!   same `x[TAG]` — the same `Symbol.for`-keyed ABI `emit_enum` already relies on
 //!   for per-module `Option`.
 //!
-//! Collection wrappers expose the payload-level operations required by slice #6;
+//! Collection wrappers expose their payload-level operations;
 //! every built-in box carries the structural equals/hash protocol used by `NMap`.
 
 /// The virtual module specifier the box wrapper classes are importable under.
-/// Stable across the whole boxing branch (later slices' emitted `import`s name
-/// it verbatim), and the key `nymph-compiler` injects [`BOX_MODULE_SOURCE`]
-/// into the bundle graph under.
+/// Generated imports name it verbatim, and `nymph-compiler` injects
+/// [`BOX_MODULE_SOURCE`] into the bundle graph under this key.
 pub const BOX_MODULE_KEY: &str = "std/box";
 
 /// TypeScript declarations for compiler-provided virtual runtime modules.
@@ -42,12 +40,10 @@ const BASE: &str = "NBox";
 const HASH_MAP_RUNTIME: &str = include_str!("./hashmap_runtime.js");
 
 /// Each built-in box wrapper: `(JS class name, the `nymph.<type>` discriminant
-/// suffix)`. The class name is what emitted `new N…(…)` construction and later
-/// slices' imports reference; the suffix builds the global
+/// suffix)`. The class name is referenced by emitted construction and imports;
+/// the suffix builds the global
 /// `Symbol.for("nymph.<type>")` tag installed on the class prototype (which
-/// `match`/hash/display read as "what type is this?"). The string wrapper is
-/// `NString` (not the prototype sketch's `NStr`) because slices #7/#8 reference
-/// `NString`.
+/// `match`/hash/display read as "what type is this?").
 const BOX_CLASSES: &[(&str, &str)] = &[
 	("NInt", "int"),
 	("NUint", "uint"),

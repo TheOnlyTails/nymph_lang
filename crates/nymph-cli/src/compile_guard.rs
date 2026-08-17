@@ -1,5 +1,4 @@
-//! A panic-safe wrapper around `nymph_compiler::compile` (Slice 1, unresolved
-//! critical #2).
+//! A panic-safe wrapper that converts compiler panics into typed CLI failures.
 //!
 //! Lowering panics on purpose for deferred-but-type-checked language features
 //! during stable runtime lowering — a program can pass parsing

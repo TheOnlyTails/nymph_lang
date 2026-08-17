@@ -11,7 +11,7 @@
 //! registry names, and strips + filters it (via `nymph_codegen::strip_ts_to_js`)
 //! into virtual sources merged with the stable emitted project before bundling.
 //!
-//! L1 extension (the Option ABI seam): `list.ts`'s `get`/`first`/`last`/`pop`
+//! `list.ts`'s `get`/`first`/`last`/`pop`
 //! all return `Option<T>`, built by calling the SAME `Option` their `.ts`
 //! source imports (`import { Option } from "../option"`). Two things make
 //! that import resolve to the compiler's canonical, source-derived Option:
@@ -756,10 +756,10 @@ mod tests {
 			map_js.contains("from \"std/box\""),
 			"map results must use the canonical box module: {map_js}"
 		);
-		// L3's ABI fix: `get`/`remove` must build `Option.Some({ value: .. })`
+		// `get`/`remove` must build `Option.Some({ value: .. })`
 		// — a named-field object, not a bare positional value — to
 		// interoperate with the checker's generated `Some(value)` pattern
-		// binding (see `map.ts`'s own doc comment / L1's `list.ts` template).
+		// binding (see `map.ts`'s own doc comment and `list.ts`).
 		assert!(
 			map_js.contains("Option.Some({ value:") || map_js.contains("Option.Some({ value }"),
 			"expected `get`/`remove` to build a named-field `Option.Some`, got:\n{map_js}"

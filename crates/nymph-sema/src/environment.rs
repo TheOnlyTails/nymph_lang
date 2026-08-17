@@ -1,10 +1,8 @@
 //! Query-local semantic facts allocated from dependency interfaces.
 //!
-//! The Task 7 brief proposed accepting an external `&mut Interner`. That cannot form a
-//! coherent fact arena: every [`Ty`](crate::Ty) is meaningful only in the interner that
-//! created it. Consequently the environment owns its interner and all imported facts
-//! that later allocation passes will populate. Pass A below allocates every recoverable
-//! stable identity before any interface type is instantiated.
+//! Every [`Ty`](crate::Ty) is meaningful only in the interner that created it, so
+//! the environment owns its interner and allocates all imported facts in that arena.
+//! Stable identities are allocated before any interface type is instantiated.
 
 use std::{collections::HashMap, sync::Arc};
 

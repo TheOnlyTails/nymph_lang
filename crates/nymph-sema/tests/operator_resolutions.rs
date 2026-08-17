@@ -1,6 +1,6 @@
-//! Slice 4B, Task 1: integration tests pinning the `Resolution` (method name +
-//! [`DispatchKind`]) the checker records on a `BinaryOp` node, per the D3 dispatch
-//! table in the Slice 4B plan.
+//! integration tests pinning the `Resolution` (method name +
+//! [`DispatchKind`]) the checker records on a `BinaryOp` node, per the dispatch
+//! table in the plan.
 //!
 //! Mirrors `tests/solve.rs`'s parse+check helper shape, plus a small local AST walk
 //! (there is no other way to get from a test source string to the `NodeId` whose
@@ -179,9 +179,8 @@ fn user_struct_plus_is_user_impl() {
 fn comparable_less_than_is_materialized_user_impl() {
 	// `v1 < v2` desugars to `Comparable::less_than`, which `Vec2` never defines
 	// directly — only `compare_to`. `less_than` is only reachable as the
-	// interface's *default* body; Slice 4C-b materializes un-overridden defaults
-	// onto the implementing class, so codegen can dispatch to it directly and
-	// this now resolves as `UserImpl` (was `UserImplDefaultMethod` pre-4C-b).
+	// interface's default body. The checker materializes un-overridden defaults
+	// onto the implementing class, so codegen dispatches to a `UserImpl`.
 	let res = resolution_for(
 		"interface Comparable<Other> {
 		   func compare_to(other: Other): int
@@ -198,16 +197,13 @@ fn comparable_less_than_is_materialized_user_impl() {
 	assert_eq!(res.method, "less_than");
 }
 
-// ── Slice 4C-c, Task 1: comparison-arm parity with the arithmetic arm (W1) ──
+// ── comparison-arm parity with the arithmetic arm  ──
 
 #[test]
 fn bounded_generic_less_than_dispatches_through_bound() {
 	// A bounded generic parameter's `a < b` resolves through its `Comparable`
-	// bound (W1) — mirrors the arithmetic arm's `GenericBound` →
-	// `UserImplDefaultMethod` mapping. Before this slice the comparison arm never
-	// routed a `Param` receiver through `dispatch_operator` at all, so this used
-	// to record `BuiltinEager` and silently emit a native JS `<` on the
-	// still-generic operands.
+	// bound, mirroring the arithmetic arm's `GenericBound` →
+	// `UserImplDefaultMethod` mapping.
 	let res = resolution_for(
 		"interface Comparable<Other> { func less_than(other: Other): boolean }
 		 func f<T: Comparable<Other = T>>(a: T, b: T): boolean = a < b",
@@ -221,9 +217,8 @@ fn bounded_generic_less_than_dispatches_through_bound() {
 fn late_resolved_infer_var_less_than_is_builtin_eager() {
 	// Mirrors `late_resolved_infer_var_operand_is_builtin_eager` for `<`: `xs`'s
 	// element type is a genuinely unconstrained inference variable at the moment
-	// this `BinaryOp` node is recorded, pinned to `int` only afterward. W1 routes
-	// this through the pending-operator queue (comparisons never used to defer at
-	// all), finalized once `f`'s body is fully checked.
+	// this `BinaryOp` node is recorded and is pinned to `int` only afterward. The
+	// pending-operator queue finalizes it once `f`'s body is fully checked.
 	let res = resolution_for(
 		"func f(): boolean = {
 		   let xs = #[]
@@ -239,13 +234,9 @@ fn late_resolved_infer_var_less_than_is_builtin_eager() {
 
 #[test]
 fn late_pinned_adt_less_than_dispatches_to_user_impl() {
-	// The headline silent-miscompile probe from the 4C-c investigation: `xs`'s
-	// element type is still an inference variable when `xs[0] < xs[0]` is
-	// recorded, and is only pinned to `Vec2` afterward via the `#[Vec2]`
-	// annotation. Before W1 this recorded `BuiltinEager` with zero diagnostics —
-	// native JS `<` on `Vec2` objects. W1's pending-queue deferral re-resolves it
-	// against the now-known `Vec2` element type, finding the direct `less_than`
-	// impl (`UserImpl`).
+	// `xs`'s element type is an inference variable when `xs[0] < xs[0]` is
+	// recorded and is pinned to `Vec2` afterward by the `#[Vec2]` annotation.
+	// Pending resolution then selects the direct `less_than` impl (`UserImpl`).
 	let res = resolution_for(
 		"interface Comparable<Other> { func less_than(other: Other): boolean }
 		 struct Vec2(x: int)
@@ -264,7 +255,7 @@ fn late_pinned_adt_less_than_dispatches_to_user_impl() {
 	assert_eq!(res.method, "less_than");
 }
 
-/// Like [`collect_binary_ops`], but collects `AssignOp` nodes instead — Finding 1
+/// Like [`collect_binary_ops`], but collects `AssignOp` nodes instead. The checker
 /// records the compound-assign operator's `Resolution` on the `AssignOp` node
 /// itself (there's no separate desugared `BinaryOp` AST node to hang it on).
 fn collect_assign_ops(expr: &Expr, out: &mut Vec<NodeId>) {
@@ -346,7 +337,7 @@ fn assign_resolution_for(source: &str, func_name: &str) -> Resolution {
 #[test]
 fn compound_assign_user_struct_plus_is_user_impl() {
 	// `v1 += v2` on a struct with a directly-defined `Plus.plus` impl resolves
-	// through a direct user impl method, same as `v1 + v2` would (Finding 1): the
+	// through a direct user impl method, same as `v1 + v2` would: the
 	// `AssignOp` node itself carries the `Resolution`, not a separate `BinaryOp`.
 	let res = assign_resolution_for(
 		&format!(
@@ -384,15 +375,8 @@ fn compound_assign_int_plus_is_builtin_eager() {
 
 #[test]
 fn deferred_compound_assign_keeps_its_own_type_as_void() {
-	// Finding 1: `finalize_pending_operators` used to overwrite the `AssignOp`
-	// node's own recorded type with the operator's resolved operand/result type
-	// whenever the resolution was *deferred* (the operand still an unresolved
-	// inference variable at the moment `infer_binary`'s fallback ran, later pinned
-	// down by a `check`-mode subtype applied elsewhere in the body -- here, the
-	// function's declared `int` return type). The immediately-resolved compound-
-	// assign path (`compound_assign_int_plus_is_builtin_eager` above) never
-	// clobbers `ty` this way -- it only ever calls `record_resolution`, leaving
-	// `ty` at the `Void` that `infer`'s `AssignOp` special case sets up front. The
+	// Finalizing a deferred compound operator preserves the `AssignOp` node's
+	// `void` type while recording the resolved operand and result types.
 	// two paths must agree on the stored `ExprInfo.ty` for the same AST shape.
 	let source = "func f(): int = {
 	   let mut xs = #[]
@@ -465,7 +449,7 @@ fn deferred_compound_assign_keeps_its_own_type_as_void() {
 
 #[test]
 fn late_resolved_infer_var_operand_is_builtin_eager() {
-	// Finding 2: `xs[0] + xs[0]` — `xs`'s element type is a genuinely unconstrained
+	// `xs[0] + xs[0]` — `xs`'s element type is a genuinely unconstrained
 	// inference variable at the moment this `BinaryOp` node is recorded (the
 	// fallback's own `unify(l, r)` is a no-op here, since both operands are already
 	// the same still-unbound variable). It only gets pinned to `int` *afterward*,
@@ -496,7 +480,7 @@ fn user_struct_equals_dispatches_to_the_concrete_impl() {
 	assert_eq!(res.method, "equals");
 }
 
-// ── Slice 4C-a: prefix (unary) operator resolutions ─────────────────────────
+// ── prefix (unary) operator resolutions ─────────────────────────
 
 /// Like [`collect_binary_ops`], but collects `PrefixOp` nodes instead.
 fn collect_prefix_ops(expr: &Expr, out: &mut Vec<NodeId>) {
@@ -656,8 +640,8 @@ fn negate_user_struct_direct_impl_is_user_impl() {
 fn negate_interface_default_method_is_materialized_user_impl() {
 	// `-v` resolves through `Negate`'s interface *default* body (`negate`, provided
 	// in terms of `base`), which `Vec2`'s impl never defines directly — only
-	// `base`. Slice 4C-b materializes the un-overridden default onto the class, so
-	// this now resolves as `UserImpl` (was `UserImplDefaultMethod` pre-4C-b).
+	// `base`. The checker materializes the un-overridden default onto the class,
+	// so this resolves as `UserImpl`.
 	let res = prefix_resolution_for(
 		"interface Negate<Output> {
 		   func base(): Output
@@ -714,11 +698,11 @@ fn bounded_generic_negate_dispatches_through_bound() {
 
 #[test]
 fn impl_trait_parameter_negate_dispatches_through_bound() {
-	// Z3 (Slice 4F): `impl Trait` param sugar (`t: Negate<Output = int>`, sugar
+	// `impl Trait` param sugar (`t: Negate<Output = int>`, sugar
 	// for a synthetic generic parameter bounded by `Negate`) resolves `-t`
 	// through that bound exactly like the declared-generic spelling above —
-	// still `GenericBound` → `UserImplDefaultMethod`, unaffected by this
-	// slice's call-site instantiation fix (that fix only touches how the
+	// still `GenericBound` → `UserImplDefaultMethod`, unaffected by the checker's
+	// call-site instantiation (which only touches how the
 	// function's *type* is instantiated at a use site, not how operators
 	// dispatch on the param inside the body being checked).
 	let res = prefix_resolution_for(
@@ -759,7 +743,7 @@ fn unbounded_generic_negate_is_not_implemented() {
 	);
 }
 
-// ── Slice 4I, Task 1: `in`/`!in`/`??` resolutions, `|>` typing ──────────────
+// ── `in`/`!in`/`??` resolutions, `|>` typing ──────────────
 
 #[test]
 fn user_contains_impl_in_is_user_impl() {
@@ -799,9 +783,9 @@ fn user_contains_impl_not_in_dispatches_not_contains() {
 
 #[test]
 fn primitive_rhs_in_is_not_implemented() {
-	// D2/Task 1 gap closed: a primitive RHS with no `Contains` impl used to
+	// A primitive RHS with no `Contains` impl must not
 	// type-check silently (zero diagnostics, `is_adt` gated dispatch off); it must
-	// now report `NotImplemented` rather than reach the lowering panic.
+	// report `NotImplemented` rather than reach the lowering panic.
 	let parsed = parse_module("func f(x: int, y: int): boolean = x in y", "test");
 	assert!(
 		!parsed.diagnostics.iter().any(|d| d.is_error()),
@@ -889,7 +873,7 @@ fn bounded_generic_unwrap_dispatches_through_bound() {
 
 #[test]
 fn pipe_chain_types_as_left_associative_application() {
-	// `10 |> double |> inc` types cleanly and (per D1/DD1) records no
+	// `10 |> double |> inc` type-checks and records no
 	// `Resolution` at all — `|>` lowers structurally to a `Call`, not a dispatch.
 	// This is a smoke check that the checker's existing Pipe handling still
 	// agrees with structural-`Call` lowering; `collect_binary_ops` doesn't walk
@@ -918,11 +902,8 @@ fn pipe_chain_types_as_left_associative_application() {
 fn pipe_widens_int_literal_argument_like_a_direct_call() {
 	// `5 |> takes_float` must type-check exactly like `takes_float(5)`: an int
 	// literal argument widens to the parameter's `float` type either way, since
-	// `|>` lowers structurally to the same `Call` shape (DD1). Regression test for
-	// the confirmed Pipe-widening gap: the checker's Pipe arm used to type the
-	// piped-in literal via `infer` (concrete `int`) instead of `check` against the
-	// callee's parameter type, so the direct call and its pipe-equivalent
-	// disagreed.
+	// `|>` lowers structurally to the same `Call` shape. The checker's Pipe arm
+	// checks the piped-in literal against the callee's parameter type.
 	let parsed = parse_module(
 		"func takes_float(x: float): float = x
 		 func f(): float = 5 |> takes_float",

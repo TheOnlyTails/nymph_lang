@@ -1,4 +1,4 @@
-//! Opt-in counters used by the issue #81 acceptance executable.
+//! Opt-in counters used by the compiler benchmark executable.
 //!
 //! This module is compiled only with `test-support`; ordinary compiler builds
 //! contain neither the branches nor the atomics below.

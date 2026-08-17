@@ -8,17 +8,15 @@
 /// A resolved top-level definition: a `func`, `struct`, `enum`, `interface`,
 /// `type` alias, `let`, or `namespace`. Assigned by name resolution (`resolve/`).
 ///
-/// This will be backed by a `#[salsa::interned]` key once the driver lands; for now
-/// it is a plain index so the type layer can be built and tested in isolation.
+/// A plain index keeps the type layer independent of the compiler driver.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct DefId(pub u32);
 
 /// The index of a generic parameter within the parameter list of its *enclosing*
 /// item (function, impl, struct, …). A `TyKind::Param(ParamIdx)` is a **rigid**
 /// type variable — a skolem the checker may not unify away, unlike an inference
-/// variable. Keeping these distinct from [`InferVar`] is the single most important
-/// fix over the old `Type::Variable`, which conflated the two and led to its
-/// unsound "a variable is compatible with anything" rule.
+/// variable. Conflating these with [`InferVar`] permits the unsound rule that
+/// "a variable is compatible with anything."
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ParamIdx(pub u32);
 

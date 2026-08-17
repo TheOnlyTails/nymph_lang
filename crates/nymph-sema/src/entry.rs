@@ -55,11 +55,11 @@ impl Checker<'_> {
 		if let Some(ret) = &meta.return_type {
 			// This is an AST-declared-annotation-only rule: an unannotated
 			// `main` is accepted even when its body infers a non-`void`
-			// type (`func main() = 42`), and `type V = void; func main():
+			// type (`func main = 42`), and `type V = void; func main:
 			// V = {}` is rejected despite `V` being an alias for `void` —
 			// only the surface annotation is inspected, not the lowered
 			// semantic type. Unwrap a `Grouped` annotation first so `func
-			// main(): (void)` is accepted like the unparenthesized form.
+			// main: (void)` is accepted like the unparenthesized form.
 			let mut inner = ret;
 			while let Type::Grouped(boxed) = inner.value() {
 				inner = boxed.as_ref();

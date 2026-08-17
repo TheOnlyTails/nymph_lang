@@ -1146,23 +1146,17 @@ impl<'a> StableBodyBuilder<'a> {
 	}
 	fn func_param(&self, param: &FuncParam) -> Result<StableParameter, RuntimeExtractionError> {
 		Ok(StableParameter {
-			pattern: self.pattern_param(&param.name)?,
+			pattern: self.pattern(&param.name)?,
 			mutable: param.mutable,
 			spread: param.spread,
 		})
 	}
 	fn closure_param(&self, param: &ClosureParam) -> Result<StableParameter, RuntimeExtractionError> {
 		Ok(StableParameter {
-			pattern: self.pattern_param(&param.name)?,
+			pattern: self.pattern(&param.name)?,
 			mutable: param.mutable,
 			spread: param.spread,
 		})
-	}
-	fn pattern_param(
-		&self,
-		pattern: &nymph_ast::Spanned<Pattern>,
-	) -> Result<StablePattern, RuntimeExtractionError> {
-		self.pattern(pattern)
 	}
 	fn pattern(
 		&self,

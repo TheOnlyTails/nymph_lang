@@ -534,8 +534,8 @@ fn incremental_project(c: &mut Criterion) {
 	}
 	shaped.finish();
 
-	// Preserve the exact historical fixtures and stateless facade operation
-	// boundary solely for clean-build regression and concurrency comparison.
+	// Preserve these fixtures and the stateless facade operation boundary solely
+	// for clean-build and concurrency comparison.
 	// These are intentionally not incremental acceptance cases.
 	let mut historical = c.benchmark_group("baseline-compatible");
 	for (shape_name, shape) in shapes {

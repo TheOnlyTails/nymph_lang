@@ -208,8 +208,8 @@ impl Checker<'_> {
 			Pattern::Grouped(inner) => self.pattern(inner, ty, mutable),
 			Pattern::Union(left, right) => self.pattern_union(left, right, ty, mutable, span),
 			Pattern::Range(_) => {
-				// A range pattern constrains an ordered scrutinee; Milestone A leaves
-				// the type as-is (it is typically already known to be numeric).
+				// A range pattern constrains an ordered scrutinee whose type is
+				// typically already known to be numeric.
 			}
 			Pattern::Tuple(entries)
 				if !entries

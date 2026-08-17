@@ -329,9 +329,9 @@ impl std::ops::Deref for ProjectDiagnostics {
 
 /// Stable semantic owner information for runtime-bearing compiler definitions.
 ///
-/// This ABI/interface runtime descriptor is an input to Task 8, not HIR and not
-/// a checked body. Task 8 owns checked-body/HIR projection and resolves `module`
-/// to the ambient semantic analysis before provenance-preserving lowering.
+/// This is an ABI/interface descriptor rather than HIR or a checked body.
+/// Checked-body projection resolves `module` against the ambient semantic
+/// analysis before provenance-preserving lowering.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct BuiltinRuntimeOwnerArtifact {
 	pub definition: nymph_sema::DefinitionId,

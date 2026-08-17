@@ -7,7 +7,7 @@
 //! substitution — drives both **resolution** (`recv.method(args)`) and **body
 //! checking** (each method's body is checked with `this: Self` bound). Storing the
 //! signatures once means an omitted return type's inference variable is shared
-//! between the two, so a method like `is_some()` resolves to `boolean` for callers.
+//! between the two, so a method like `is_some` resolves to `boolean` for callers.
 
 use crate::errors::TypeError;
 use ecow::EcoString;
@@ -36,7 +36,7 @@ pub struct InherentMethod {
 	pub generic_names: Vec<EcoString>,
 	pub params: Vec<Ty>,
 	pub ret: Ty,
-	/// The interface bounds declared on this method's own generics (Slice 4G-b),
+	/// The interface bounds declared on this method's own generics,
 	/// e.g. `func apply<U: Area>(u: U)` — one [`Bound`] per bound, with `ty =
 	/// Param(base + j)` where `base` is the owner's generic count (the same offset
 	/// `collect_impl_member` uses for the method's own scope, and `commit_inherent`'s
@@ -91,18 +91,17 @@ impl InherentRegistry {
 
 	/// The span of the non-namespaced (instance) inherent method named `name`
 	/// reachable from `head`'s self type, if any. Used by `finish_interface_impl`
-	/// (iface.rs, Slice 4K/HH3) to catch an interface-impl method (top-level `impl
-	/// … for` or a nested `impl Iface { .. }`) colliding with a same-named inherent
-	/// INSTANCE method on the same type — a collision formerly caught only by a
+	/// to catch an interface-impl method (top-level `impl
+	/// … for` or a nested `impl Iface {.. }`) colliding with a same-named inherent
+	/// INSTANCE method on the same type — a collision otherwise caught only by a
 	/// runtime-lowering assertion and panic.
 	///
 	/// Deliberately excludes `namespace func` statics (`m.namespaced`): a static
 	/// and an interface-impl instance method of the same name are DIFFERENT JS
 	/// slots (a class static vs. a prototype method), so they're ordinary
 	/// overloading, not a collision. Without this filter, a `namespace func foo`
-	/// static false-positived a `DuplicateMember` against any interface-impl
-	/// instance method also named `foo` — legal, resolvable JS the checker
-	/// wrongly rejected (Slice 4K, Defect 2).
+	/// static must not conflict with an interface-impl instance method of the same
+	/// name because JavaScript stores them in different tables.
 	pub(crate) fn method_span(&self, head: Head, name: &str) -> Option<nymph_ast::Span> {
 		self.by_head.get(&head)?.iter().find_map(|&idx| {
 			self.impls[idx]
@@ -166,9 +165,8 @@ impl<'m> Checker<'m> {
 
 		// A `namespace func` is a static (`namespaced = true`); an instance `func`
 		// and a `mut func` both attach to `this` (`namespaced = false`; `mut`
-		// carries no extra checker restriction yet — see mutable-types, Task #1).
-		// Nested interface impls live in the separate `impls` field and are
-		// Milestone-B-later, so this inherent pass never sees them.
+		// carries no extra checker restriction). Nested interface impls live in the
+		// separate `impls` field, so this inherent pass never sees them.
 		let mut methods = FxHashMap::default();
 		let mut body_jobs = Vec::new();
 		for m in members {
@@ -369,8 +367,8 @@ impl<'m> Checker<'m> {
 			Some(ty) => self.lower_type(ty),
 			None => self.fresh(),
 		};
-		// Lower the method's own generics' bounds while their scope is still active
-		// (Slice 4G-b), offset past the owner's generics so `Bound::ty` lands at
+		// Lower the method's generic bounds while their scope is active, offset past
+		// the owner's generics so `Bound::ty` lands at
 		// `Param(base + j)` — the exact index `commit_inherent`'s subst mints into.
 		let bounds = self.lower_constraints(&meta.generics, base);
 		self.pop_params();
@@ -689,7 +687,7 @@ impl<'m> Checker<'m> {
 		}
 		let self_concrete = impl_self;
 		// Defer one `pending_bounds` obligation per bound on the method's own
-		// generics (Slice 4G-b), substituted through the same `subst` as
+		// generics, substituted through the same `subst` as
 		// `params`/`ret` so it lands on the freshly-minted variable — mirrors
 		// `fn_type_of`'s treatment of `FuncSig::bounds` exactly. Owner/impl-level
 		// constraints are NOT pushed here: they are already enforced eagerly by
@@ -816,7 +814,7 @@ impl<'m> Checker<'m> {
 		self.record_param_bounds(&meta.generics, base);
 		self.push_scope();
 		// A `mut func`'s `this` is bound as `mut Self` — the smaller correct step
-		// short of full MT2 mut-func semantics (per-method mut availability, bound-
+		// short of full mut-func semantics (per-method mut availability, bound-
 		// method typing), needed so field-slot reassignment through `this` inside
 		// an existing `mut func` body keeps type-checking. Param/return
 		// substitution below still uses the plain `self_ty` — `self` referenced
@@ -865,7 +863,7 @@ impl<'m> Checker<'m> {
 		// be finalized against a rolled-back table or leak into the next body's
 		// drain.
 		self.pending_operators.truncate(pending_mark);
-		// Same discard for any bound obligation this trial deferred (Slice 4G) —
+		// Discard any bound obligation this trial deferred —
 		// see the comment just above.
 		self.pending_bounds.truncate(pending_bounds_mark);
 		self.pending_bound_arg_mut = pending_mut_snapshot;
@@ -923,7 +921,7 @@ impl<'m> Checker<'m> {
 		// `impl … for …` and the `impl Iface { … }` blocks nested in ADT bodies.
 		self.check_impl_for_bodies();
 		self.check_inner_impl_bodies();
-		// An interface's own default-bodied methods (Slice 4C-b): checked once,
+		// An interface's own default-bodied methods are checked once,
 		// generically, with `this` bound to a rigid synthetic `Param` constrained to
 		// the interface — see `check_interface_default_bodies` for why that (and not
 		// `SelfTy`) is the receiver type that actually resolves method calls.
@@ -1156,8 +1154,8 @@ impl<'m> Checker<'m> {
 	}
 
 	/// Check the default (non-abstract) `func` bodies declared directly in every
-	/// `interface { … }` block. Nothing else visited these before Slice 4C-b:
-	/// `collect_interfaces` (iface.rs) only lowers signatures, discarding the body,
+	/// `interface { … }` block. Signature collection only lowers signatures,
+	/// discarding the body,
 	/// and every other body-checking path here re-traverses `impl`/`impl … for`
 	/// blocks, never `Declaration::Interface` itself.
 	fn check_interface_default_bodies(&mut self) {
@@ -1210,7 +1208,7 @@ impl<'m> Checker<'m> {
 	/// `Self` (e.g. `this + other` under an arithmetic-operator interface) still
 	/// resolves through that same generic-bound path, recording
 	/// `MethodSource::GenericBound` → `DispatchKind::UserImplDefaultMethod` — an
-	/// honest deferral (never a silent miscompile), not a defect of this check.
+	/// honest deferral (never a silent miscompile), not a this check.
 	///
 	/// Reuses the method's signature already collected into `self.interfaces` (its
 	/// params/ret in terms of `SelfTy`/interface `Param(k)`) rather than re-lowering
@@ -1245,7 +1243,7 @@ impl<'m> Checker<'m> {
 
 		// A `mut func` default binds `this` as `mut Self`, exactly as a `mut func` on a
 		// concrete type does — so its body may mutate the receiver (call a `mut` method,
-		// e.g. iterate `this` via `this.next()` in `Iterator`'s `for_each`/`fold`/…).
+		// e.g. iterate `this` via `this.next` in `Iterator`'s `for_each`/`fold`/…).
 		let self_ty = self.interner.mk_param(self_idx);
 		let self_ty = if meta.kind == FuncKind::Mut {
 			self.interner.mk_mut(self_ty)
@@ -1268,7 +1266,7 @@ impl<'m> Checker<'m> {
 			.cloned()
 		else {
 			// `collect_interfaces` inserts a signature for every `Func` element, so
-			// this is unreachable in practice; kept total rather than `unreachable!()`
+			// this is unreachable in practice; kept total rather than `unreachable!`
 			// so a future desync fails as a no-op instead of a panic mid-typecheck.
 			self.checking_interface_default = prev_checking;
 			self.self_ty = prev_self;

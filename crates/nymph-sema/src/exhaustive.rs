@@ -354,7 +354,7 @@ impl Checker<'_> {
 					}
 				}
 				// Degenerate case (already reported by the checker as a type mismatch —
-				// `#(a, b, ...rest, c, d)` against a shorter tuple): prefix+suffix alone
+				// `#(a, b,...rest, c, d)` against a shorter tuple): prefix+suffix alone
 				// can exceed `arity`. Truncate to keep the row exactly `arity` columns
 				// wide rather than overrunning it and panicking downstream.
 				if prefix.len() > arity {

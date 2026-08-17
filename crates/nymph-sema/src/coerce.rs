@@ -1,4 +1,4 @@
-//! Hindley-Milner-style structural unification and (Milestone-A) subtyping.
+//! Hindley-Milner-style structural unification and subtyping.
 //!
 //! `unify` implements the symmetric structural unifier via occurs-check and
 //! inference-variable binding through a union-find table: walks two types,
@@ -41,7 +41,7 @@ impl Checker<'_> {
 
 	/// Unify a call/operator argument against its parameter, letting an `int` *literal*
 	/// widen to `float`/`uint`, any `uint` value widen to `int`, and a `mut`-typed
-	/// argument satisfy a non-`mut` parameter (NN3's one-way `mut T <: T`,
+	/// argument satisfy a non-`mut` parameter (the one-way `mut T <: T` rule,
 	/// mirroring [`Checker::subtype`] — see the comment there for why the peel is
 	/// asymmetric). Every method-style call (inherent, interface-impl, interface-default,
 	/// generic-bound) routes arguments through here, so without this, `mut T <: T` held
@@ -244,7 +244,7 @@ impl Checker<'_> {
 		true
 	}
 
-	/// Milestone-A subtyping: `never` is a subtype of everything, `error` absorbs,
+	/// Subtyping treats `never` as a subtype of everything, lets `error` absorb,
 	/// `mut T` is (one-way) assignable to `T`, `uint` is safely assignable to `int`,
 	/// and everything else is invariant unification. (Covariance for containers and
 	/// functions is a later refinement.)

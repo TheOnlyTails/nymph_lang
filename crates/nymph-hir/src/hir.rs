@@ -1,8 +1,6 @@
-//! The mid-level typed IR consumed by code generation. Slice 1 covers the
-//! scalar/control-flow core and is deliberately *type-free*: JS has a single
-//! `number` type and primitive operators map 1:1 to JS operators, so no type
-//! information is needed to emit correct JS. Type-carrying fields arrive in later
-//! slices, where value-copy and operator-overload dispatch first need them.
+//! The mid-level typed IR consumed by code generation. Most nodes are deliberately
+//! type-free because JavaScript has a single numeric representation; nodes retain
+//! type information only where runtime representation or dispatch requires it.
 
 use ecow::EcoString;
 use rustc_hash::FxHashSet;
@@ -43,8 +41,8 @@ impl HirModule {
 	}
 }
 
-/// A top-level `let`/`let mut` binding → a module-scope `const`/`let` declaration
-/// (Slice 4E, Y3). Kept in source order relative to other top-level lets; emitted
+/// A top-level `let`/`let mut` binding → a module-scope `const`/`let` declaration.
+/// Kept in source order relative to other top-level lets; emitted
 /// after classes/enums (so a let constructing/referencing one is safe) and before
 /// functions (whose JS `function` declarations hoist regardless of placement).
 #[derive(Clone, Debug, PartialEq)]
@@ -62,7 +60,7 @@ pub struct HirClass {
 	pub name: EcoString,
 	pub fields: Vec<EcoString>,
 	pub methods: Vec<HirMethod>,
-	/// `namespace func` static functions (Slice 4J) → JS `static` class methods.
+	/// `namespace func` static functions → JS `static` class methods.
 	/// A separate list, not a flag on `HirMethod`: JS legally allows a static and
 	/// an instance method sharing one name (they live in different tables), so
 	/// keeping them in separate lists keeps `assert_no_duplicate_methods`'
@@ -88,7 +86,7 @@ pub struct HirEnum {
 	pub name: EcoString,
 	pub variants: Vec<HirVariant>,
 	pub methods: Vec<HirMethod>,
-	/// `namespace func` static functions (Slice 4J). Unlike a struct's
+	/// `namespace func` static functions. Unlike a struct's
 	/// `statics`, these become OBJECT-level method properties on the IIFE's
 	/// returned object (not `proto`-level): call sites emit `E.func(..)` against
 	/// the object `E` itself, and `proto` is only reachable through a
@@ -170,8 +168,8 @@ pub struct HirOptionAbi {
 
 /// The runtime numeric type a boxed numeric value carries — the one piece of
 /// type information codegen needs to pick the right box wrapper class (`NInt` /
-/// `NUint` / `NFloat`) for an otherwise type-free numeric HIR node (uniform
-/// value boxing, slice #2). HIR is deliberately type-free (JS has one `number`),
+/// `NUint` / `NFloat`) for an otherwise type-free numeric HIR node. HIR is
+/// deliberately type-free (JS has one `number`),
 /// so lowering threads this on from the checker's inferred type at the point it
 /// builds a numeric node; without it emit could not tell `5`, `5u` and `5.0`
 /// apart, all of which lower to the same `f64`.
@@ -188,7 +186,7 @@ pub enum NumKind {
 	/// desugared control-flow machinery operates on with native JS arithmetic
 	/// (loop counters `i + 1`, list indices `arr[i]`, `i < arr.length`), not a
 	/// user-visible Nymph value. Boxing these would break the emitted loop
-	/// desugarings; they stay raw until a later slice reworks that machinery.
+	/// desugarings, so they stay raw.
 	Raw,
 }
 
@@ -203,9 +201,8 @@ pub enum BuiltinResult {
 	Char,
 	String,
 	Boolean,
-	/// Transitional `==`/`!=` on non-primitives: compare object identity directly,
-	/// then box the raw comparison result as `NBool`. Value equality replaces this
-	/// in the later equality slice.
+	/// `==`/`!=` on non-primitives compares object identity directly, then boxes
+	/// the raw comparison result as `NBool`.
 	IdentityBoolean,
 	/// Compiler-generated arithmetic and predicates used by desugarings.
 	Raw,
@@ -267,12 +264,12 @@ pub enum HirExpr {
 		callee: Box<HirExpr>,
 		args: Vec<HirExpr>,
 	},
-	/// A call to a LINKED external (Gap 3, L0/L1) — a method call that
+	/// A call to a linked external — a method call that
 	/// resolved through a prelude `external(name)` marker present in
 	/// [`nymph_hir::linkage::REGISTRY`], instead of the loud "prelude-only
 	/// impl" defer every other `external`/transitively-external body still
 	/// gets. `module`/`symbol` are the ALREADY-RESOLVED [`crate::linkage::Linked`]
-	/// fields — not the bare `external(name)` marker — because L1's `get` is
+	/// fields — not the bare `external(name)` marker — because `get` is
 	/// an AMBIGUOUS marker shared by `List` and `Map` with DIFFERENT JS
 	/// implementations: the only place that knows which receiver's `impl`
 	/// block resolved this call (and can therefore compute the receiver tag
@@ -280,7 +277,7 @@ pub enum HirExpr {
 	/// at the point it decides to build this variant — re-deriving that tag
 	/// from a bare marker at emit time, with only `args[0]`'s already-erased
 	/// HIR to go on, isn't possible. Baking the resolved pair into HIR (rather
-	/// than re-`lookup`-ing by marker in codegen, as L0 did) keeps codegen a
+	/// than re-`lookup`-ing by marker in codegen) keeps codegen a
 	/// dumb consumer instead of a second place that has to re-derive
 	/// receiver-tag disambiguation. `args` is already in `$_this`-FIRST
 	/// order: the receiver lowered first, then the call's own arguments,
@@ -335,7 +332,7 @@ pub enum HirExpr {
 	},
 	/// A map literal — emits as a boxed value-equality HAMT.
 	MapLit(Vec<(HirExpr, HirExpr)>),
-	/// A map literal (SS1) containing at least one spread entry
+	/// A map literal containing at least one spread entry
 	/// (`#{...m, k: v}`) — emits as an `NMap` with the spread entries'
 	/// JS `...` syntax preserved in position (a Map merge, later-key-wins,
 	/// since the `Map` constructor processes its entries array in order). A
@@ -427,8 +424,8 @@ pub enum HirExpr {
 		scrutinee: Box<HirExpr>,
 		arms: Vec<HirArm>,
 	},
-	/// A built-in `as` scalar conversion (Slice 4K, extended by the saturating-cast
-	/// change below) that needs an actual JS runtime operation, not just a value
+	/// A built-in `as` scalar conversion that needs an actual JS runtime operation,
+	/// not just a value
 	/// pass-through. Identity casts and the remaining same-"JS number" numeric
 	/// casts (`int`/`uint` → `float`, `uint` → `int`, plus `Foo as Foo` for any
 	/// `Foo`) need no node at all — lowering just returns the operand unchanged —
@@ -442,8 +439,8 @@ pub enum HirExpr {
 	},
 	/// A closure expression (`(x, y) -> x + y`, `x -> x * 2`) — emits as a JS
 	/// arrow function. Captures are free: JS arrows close over their enclosing
-	/// scope by reference, which already matches the checker's own capture
-	/// semantics (Slice 4L), so no explicit capture list is carried here.
+	/// scope by reference, which matches the checker's capture semantics, so no
+	/// explicit capture list is carried here.
 	/// This is a real callable boundary: a `return` in `body` exits this closure,
 	/// including when synthetic expression IIFEs occur inside it.
 	Closure {
@@ -713,8 +710,7 @@ pub enum ScalarCastKind {
 	/// `float as uint` / `int as uint` — like `SaturatingToInt`, but the operand
 	/// is `Math.abs`-ed first: a negative finite value (or a negative `int` being
 	/// cast to `uint`) saturates to its absolute value, and `-Infinity` collapses
-	/// onto the same `Infinity → i64::MAX` branch as `+Infinity` (`int as uint`
-	/// previously had no runtime effect at all — this makes it a real operation).
+	/// onto the same `Infinity → i64::MAX` branch as `+Infinity`.
 	SaturatingToUInt,
 	/// `char as int`/`char as uint`/`char as float` — `operand.codePointAt(0)`.
 	CharToInt,

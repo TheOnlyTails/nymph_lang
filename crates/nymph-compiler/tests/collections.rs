@@ -1,4 +1,4 @@
-//! Phase-scoped tests for slice #6: boxed collection representation,
+//! Tests for boxed collection representation,
 //! value-equality maps, and uniform index/iteration dispatch.
 
 use std::io::Write;

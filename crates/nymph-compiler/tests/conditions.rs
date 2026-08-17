@@ -1,16 +1,15 @@
-//! Phase-scoped tests for slice #4 — condition + logical-operator lowering under
-//! uniform value boxing (ADR-0002). Slice #2 boxed every value, so
+//! Tests for condition and logical-operator lowering under uniform value boxing
+//! (ADR-0002). Because every value is boxed,
 //! `ToBoolean(box)` is unconditionally `true`: every `if`/`while`/`for`
-//! condition and every `&&`/`||`/`!` was broken (loops never terminated). This
-//! slice makes the user-`boolean` slots read/produce the raw `.v` payload.
+//! condition and every `&&`/`||`/`!` must read or produce the raw `.v` payload.
 //!
 //! Two axes:
 //! * **Emission-shape** — the condition/logical rewrites emit the decided JS
 //!   shapes (`.v` unwrap, the `a.v ? b : a` operand-reuse ternary, `new NBool`).
 //! * **Runtime** — the emitted `.mjs` runs under Node and the boolean logic
-//!   produces the correct result; a previously-hanging boolean-flag loop now
-//!   TERMINATES. These deliberately avoid arithmetic/relational ops, which stay
-//!   broken until slice #10a.
+//!   produces the correct result, including termination of a boolean-flag
+//!   loop. These deliberately isolate boolean behavior from arithmetic
+//!   and relational operators.
 
 use std::io::Write;
 use std::process::Command;
@@ -133,7 +132,7 @@ fn an_is_type_test_produces_a_boxed_nbool() {
 #[test]
 fn a_false_if_condition_takes_the_else_branch() {
 	// The headline correctness point: a boxed `false` is truthy as an object, so
-	// without the `.v` unwrap this took the THEN branch. It must now take `else`.
+	// without the `.v` unwrap this takes the THEN branch. It must take `else`.
 	assert_eq!(run("func f(): int = if (false) 1 else 2", "f().v"), "2");
 }
 

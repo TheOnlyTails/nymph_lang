@@ -1,4 +1,4 @@
-//! Phase-scoped tests for uniform value boxing (slice #2, the keystone): the
+//! Tests for uniform value boxing: the
 //! runtime box representation and literal boxing. Two axes:
 //!
 //! * **Emission-shape** — compiling a Nymph literal emits `new N…(…)` of the
@@ -6,10 +6,8 @@
 //! * **Runtime-unit** — the emitted `.mjs` (and the box classes on their own)
 //!   run under Node with the decided `.v` payload / `[TAG]` discriminant shape.
 //!
-//! This slice is intentionally RED mid-branch for the whole-program `run_node`
-//! suite (downstream ops — conditions, arithmetic, match — are not adapted to
-//! boxed operands until later slices); these tests pin ONLY the box
-//! representation and literal boxing, which must be green now.
+//! These tests isolate the box representation and literal boxing from
+//! downstream operations over boxed operands.
 
 use std::io::Write;
 use std::process::Command;
@@ -134,7 +132,7 @@ fn boxes_a_string_literal_as_new_nstring() {
 fn numeric_kind_is_threaded_from_the_checker_not_the_syntax() {
 	// The literal `0` is SYNTACTICALLY an int, but the return type makes the
 	// checker infer it as `uint` — the box class must follow the checker's
-	// inferred type, the crux of the slice's numeric-type threading.
+	// inferred type, which is required for numeric-type threading.
 	let js = emit_js("func f(): uint = 0");
 	assert!(
 		js.contains("new NUint(0)"),
@@ -148,12 +146,9 @@ fn numeric_kind_is_threaded_from_the_checker_not_the_syntax() {
 
 #[test]
 fn a_coerced_int_literal_call_argument_boxes_by_the_checker_kind() {
-	// Regression (slice #2 review): a free-function call argument takes
-	// `check_call_arg`, whose int-literal coercion arm used to record nothing —
-	// so `g(5)` where `g(x: float)` fell back to the syntactic `int` and misboxed
-	// as `NInt` even though the checker widened `5` to `float`. The arm now
-	// records the coerced type, matching `check`'s own arm, so the argument boxes
-	// as `NFloat`. Mirror the same for a `uint` parameter.
+	// `check_call_arg` must record an int literal's coerced type. Otherwise
+	// `g(5)` where `g(x: float)` falls back to the syntactic `int` and boxes as
+	// `NInt` despite widening to `float`. Mirror this for a `uint` parameter.
 	let js = emit_js("func g(x: float): float = x\nfunc f(): float = g(5)");
 	assert!(
 		js.contains("new NFloat(5)") && !js.contains("new NInt(5)"),
@@ -229,8 +224,8 @@ fn a_boxed_string_literal_runs_and_unwraps_under_node() {
 #[test]
 fn a_struct_value_carries_a_tag_after_boxing() {
 	// Structs keep their `class` emission; this documents that a struct value is
-	// still tag-bearing post-boxing (its fields are now boxed primitives). The
-	// struct's own prototype tag lands in a later slice; here we assert the field
+	// still tag-bearing post-boxing (its fields are boxed primitives). The
+	// This test asserts the field
 	// payloads round-trip as boxes.
 	let mut js = emit_js("struct P(x: int, y: int)\nfunc mk(): P = P(x = 1, y = 2)");
 	js.push_str(

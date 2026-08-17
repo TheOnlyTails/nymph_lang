@@ -1,8 +1,8 @@
-//! Integration tests for the core/std split, Slice A: `core` (the
+//! Integration tests for the core/std split: `core` (the
 //! compiler-coupled subset of the stdlib — `ops`, `default`, `option`,
-//! `result`, `convert`, `iter`, `iter/iterable`, `range`) is now injected as
+//! `result`, `convert`, `iter`, `iter/iterable`, `range`) is injected as
 //! the AMBIENT prelude for every `check`/`compile` call, not just
-//! `stdlib/src/ops/mod.nym` as before this slice.
+//! only `stdlib/src/ops/mod.nym`.
 //!
 //! See `crates/nymph-compiler/tests/golden_programs.rs` for the two
 //! pre-existing golden tests (`golden_enums_construction_and_qualification`,
@@ -106,12 +106,12 @@ fn run(src: &str, call: &str) -> String {
 	String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// The headline Slice A payoff: a program using `Option` (construction +
+/// A program using `Option` (construction +
 /// `match`), `Result`, `convert.nym`'s `Option`/`Result` conversions
 /// (`.ok_or(..)`, `.ok()`), and a `for`-over-list — all with **no `import`
 /// anywhere** — compiles clean and runs under Node with the right values.
 /// `Default`'s `T.default()` is exercised separately below so its unsupported
-/// generic namespaced dispatch has a focused diagnostic regression.
+/// generic namespaced dispatch has a focused diagnostic check.
 #[test]
 fn ambient_core_option_result_convert_and_for_over_list_run_with_no_import() {
 	let src = r#"
@@ -171,10 +171,10 @@ fn ambient_core_option_result_convert_and_for_over_list_run_with_no_import() {
 /// `std/math` (added to `CORE_SOURCES` alongside the other core modules) is
 /// ambient too: `int`/`float`'s `abs`/`sqrt` methods and integer-exponent
 /// `Power` implementations all resolve and run with **no `import` anywhere** —
-/// the headline payoff of making `math` a 9th core module. Locks in the
-/// runtime behavior so a regression (e.g. dropping `("std/math", ..)` from
+/// the headline payoff of making `math` a 9th core module. Dropping
+/// `("std/math", ..)` from
 /// `CORE_SOURCES`, or reintroducing the `Power<Other = float, Output =
-/// Complex> for int` ambiguity this slice removed from `complex.nym`) fails
+/// Complex> for int` ambiguity in `complex.nym`) fails
 /// loudly here instead of staying silently green under `stdlib_typechecks_
 /// cleanly`/`docs_samples` (both compile-only, never run under Node).
 #[test]
@@ -304,8 +304,8 @@ fn ambient_boxed_float_intrinsics_cover_the_complete_runtime_surface() {
 /// `max_int`, `min_int` — literal-initialized, never `external`) are ambient
 /// too, and must be genuinely usable with no import: a bare reference type-
 /// checks (name resolution sees every core module's names) AND runs correctly
-/// under Node. Before the fix this locks in, ambient runtime lowering's
-/// materialization machinery only ever demand-materialized prelude
+/// under Node. Ambient runtime lowering's materialization machinery must
+/// demand-materialize prelude
 /// FUNCTIONS/METHODS (`try_materialize_prelude_dispatch`,
 /// `materialize_referenced_prelude_enums`) — a bare identifier referencing a
 /// prelude top-level `let` lowered straight through `resolve()`'s fallback

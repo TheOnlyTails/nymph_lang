@@ -107,7 +107,7 @@ impl DocumentStore {
 	}
 
 	/// Advance the shared publication revision for a filesystem event. Open
-	/// document contents are unchanged, but project snapshots may now contain
+	/// document contents stay unchanged, but project snapshots may contain
 	/// different disk-backed modules or manifest discovery results.
 	pub fn filesystem_changed(&mut self) {
 		self.advance_revision();

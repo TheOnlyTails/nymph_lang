@@ -1,8 +1,8 @@
 //! `textDocument/semanticTokens/full`: classify every token in a document
 //! from the compiler's own lexer + parser, so the editor colours tokens by
 //! what they actually *are* rather than by a TextMate grammar's best guess.
-//! This is also the robust fix for a match arm's `->`, which a
-//! punctuation-only grammar can't distinguish from a function-type arrow —
+//! A punctuation-only grammar cannot distinguish a match arm's `->`
+//! from a function-type arrow;
 //! here it always lexes to [`Token::Arrow`] and always classifies as
 //! `operator`.
 //!
@@ -1857,7 +1857,7 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 		assert_eq!(find(&decoded, 2, 10).type_name, "type");
 		// `match` keyword.
 		assert_eq!(find(&decoded, 2, 24).type_name, "keyword");
-		// the match arm's `->` — the arrow the bug report is about.
+		// the match arm's `->`.
 		assert_eq!(find(&decoded, 2, 38).type_name, "operator");
 		// the trailing `// c` line comment.
 		assert_eq!(find(&decoded, 2, 45).type_name, "comment");
@@ -2169,7 +2169,7 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 
 	#[test]
 	fn a_this_method_calls_name_classifies_as_method_matching_its_decl() {
-		// BUG 2b: `get` in `this.get()` must classify the same as its own
+		// `get` in `this.get()` must classify the same as its own
 		// `func get` declaration (`method`), not fall through to the
 		// `variable` default `push_token` applies to an unclassified
 		// identifier token.

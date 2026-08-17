@@ -1,6 +1,4 @@
-//! The checker returns a [`Checked`] result: diagnostics plus a [`NodeId`]-keyed
-//! annotation side-table for the lowering pass. This slice wires the plumbing; the
-//! recording of specific node kinds is exercised as later slices add lowering.
+//! Tests the [`NodeId`]-keyed expression annotations consumed by lowering.
 
 use nymph_ast::expr::{Expr, ExprKind};
 use nymph_sema::check_module;

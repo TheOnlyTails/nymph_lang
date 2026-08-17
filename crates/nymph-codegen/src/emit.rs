@@ -258,7 +258,7 @@ pub struct Emitter<'a> {
 	/// independent.
 	in_iife_subexpr: std::cell::Cell<bool>,
 	/// Every `(module, symbol)` pair a `HirExpr::ExternCall` lowered during
-	/// this emit run needs imported (Gap 3, L0) — populated by the
+	/// this emit run needs imported — populated by the
 	/// `HirExpr::ExternCall` arm of [`Self::emit_expr`], drained by
 	/// [`Self::emit_module`] into a deduped, deterministically-ordered
 	/// `import { symbol } from "module";` per pair, prepended ahead of every
@@ -553,7 +553,7 @@ impl<'a> Emitter<'a> {
 		for class in &module.classes {
 			stmts.push(self.emit_class(class));
 		}
-		// Top-level `let`s (Slice 4E, Y3) after classes/enums (a let constructing or
+		// Top-level `let`s follow classes/enums because a binding that constructs or
 		// referencing one must see it already defined — module-scope `const`/`let`
 		// is TDZ, unlike a function declaration) and before functions (whose JS
 		// `function` declarations hoist, so a let calling one is safe regardless of
@@ -589,7 +589,7 @@ impl<'a> Emitter<'a> {
 		for func in &module.funcs {
 			stmts.push(self.emit_func(func));
 		}
-		// Gap 3 (L0): prepend one deduped, deterministically-ordered `import`
+		// Prepend one deduped, deterministically-ordered `import`
 		// per `(module, symbol)` pair any `HirExpr::ExternCall` above
 		// recorded — emitted INTO the returned module string rather than via
 		// a changed `emit`/`emit_module` return shape (a `-> String` many
@@ -617,7 +617,7 @@ impl<'a> Emitter<'a> {
 			&self.ast,
 		);
 		let code = Codegen::new().build(&program).code;
-		// Uniform value boxing (slice #2): standalone modules carry the runtime
+		// Standalone modules carry the boxing runtime
 		// inline for direct Node execution, while project modules import their
 		// exact bindings from the canonical virtual module. Modules that never
 		// reference the runtime remain byte-identical.
@@ -639,7 +639,7 @@ impl<'a> Emitter<'a> {
 		}
 	}
 
-	/// Build `import { <symbol> as <local> } from "<module_specifier>";` (Gap 3, L0).
+	/// Build `import { <symbol> as <local> } from "<module_specifier>";`.
 	fn build_import_statement(
 		&self,
 		module_specifier: &str,
@@ -744,8 +744,8 @@ impl<'a> Emitter<'a> {
 		Statement::FunctionDeclaration(function)
 	}
 
-	/// `const <name> = <value>;` (or `let` when `mutable`) — a top-level `let`
-	/// (Slice 4E, Y3). Mirrors `HirStmt::Let`'s mutable → `Let`/`Const` mapping in
+	/// `const <name> = <value>;` (or `let` when `mutable`) — a top-level `let`.
+	/// Mirrors `HirStmt::Let`'s mutable → `Let`/`Const` mapping in
 	/// `emit_stmt`, generalizing the const-only `const_decl` helper for the `let
 	/// mut` case (the checker accepts top-level `let mut`, so codegen honors it).
 	fn emit_module_let(&self, let_: &HirLet) -> Statement<'a> {
@@ -756,8 +756,8 @@ impl<'a> Emitter<'a> {
 	///
 	/// The object-argument constructor lets construction pass labeled fields as a
 	/// plain object (`new Point({ x, y })`) without depending on field order.
-	/// `Object.assign` copies each property onto the instance; field defaults and
-	/// validation are deferred to a later slice.
+	/// `Object.assign` copies each property onto the instance; this representation
+	/// does not apply field defaults or runtime validation.
 	fn emit_class(&self, class: &HirClass) -> Statement<'a> {
 		let assign_call = self.object_assign(vec![
 			Expression::ThisExpression(ThisExpression::boxed(SPAN, &self.ast)),
@@ -881,7 +881,7 @@ impl<'a> Emitter<'a> {
 	/// Build a method's params/body into a plain JS `FunctionExpression`
 	/// (`(<params>) { return <body>; }`), independent of how the caller wraps
 	/// it — a class method definition (struct/class instance methods) or an
-	/// object-literal method property (the enum prototype ABI, Slice 4D) both
+	/// object-literal method property in the enum prototype ABI both
 	/// share this exactly. Mirrors [`Self::emit_func`]'s param/body handling.
 	/// Deliberately a plain function, never an arrow: prototype methods need
 	/// their own `this` bound to the receiver at call time.
@@ -947,8 +947,8 @@ impl<'a> Emitter<'a> {
 	}
 
 	/// Emit an inherent instance method as a class method `<name>(<params>) { return
-	/// <body>; }`. When `is_static`, emits a `namespace func` static function
-	/// (Slice 4J) as a JS `static` class method instead — `Type.func(args)` then
+	/// <body>; }`. When `is_static`, emits a `namespace func` as a JS `static`
+	/// class method instead — `Type.func(args)` then
 	/// resolves to it natively, with zero call-site changes needed.
 	fn emit_method(&self, method: &HirMethod, is_static: bool) -> ClassElement<'a> {
 		let func = self.method_function(method);
@@ -974,7 +974,7 @@ impl<'a> Emitter<'a> {
 
 	/// Emit an instance method as an object-literal method property (shorthand
 	/// `<name>(<params>) { … }` syntax), used for the enum prototype ABI's
-	/// `const proto = { … };` object (Slice 4D). Must stay a plain
+	/// `const proto = { … };` object. Must stay a plain
 	/// `FunctionExpression` (never an arrow) so each call gets its own `this`.
 	fn emit_method_property(&self, method: &HirMethod) -> ObjectPropertyKind<'a> {
 		let func = self.method_function(method);
@@ -1000,23 +1000,7 @@ impl<'a> Emitter<'a> {
 	/// `const TAG = Symbol.for("nymph.tag");` — the shared discriminant key, the
 	/// same symbol in every module via the global registry.
 	fn emit_tag_const(&self) -> Statement<'a> {
-		let symbol_for = Expression::new_static_member_expression(
-			SPAN,
-			Expression::new_identifier(SPAN, "Symbol", &self.ast),
-			IdentifierName::new(SPAN, "for", &self.ast),
-			false,
-			&self.ast,
-		);
-		let mut args = ArenaVec::new_in(&self.ast);
-		args.push(Argument::from(Expression::new_string_literal(
-			SPAN,
-			self.ast.allocator.alloc_str("nymph.tag"),
-			None,
-			&self.ast,
-		)));
-		let init =
-			Expression::new_call_expression(SPAN, symbol_for, oxc::ast::NONE, args, false, &self.ast);
-		self.const_decl("TAG", init)
+		self.const_decl("TAG", self.global_symbol("nymph.tag"))
 	}
 
 	/// Emit an enum as `const <E> = (() => { const t0 = Symbol.for("E.V0"); …
@@ -1025,7 +1009,7 @@ impl<'a> Emitter<'a> {
 	/// factories, nullary variants frozen singletons — each carrying `[TAG]`
 	/// so a matcher can compare identity.
 	///
-	/// L1 (external linkage's Option ABI seam): the variant discriminant is
+	/// The variant discriminant is
 	/// `Symbol.for(label)` — the GLOBAL symbol registry, keyed by the exact
 	/// string `label` (`"<enum-name>.<variant-name>"`, enum name emitted
 	/// UNMANGLED) — not a bare `Symbol(label)` call, which mints a FRESH,
@@ -1035,8 +1019,8 @@ impl<'a> Emitter<'a> {
 	/// `Symbol(..)`, two DIFFERENT modules' own inline `Option` IIFEs mint
 	/// two DIFFERENT `Symbol("Option.Some")` values, so a `Some` built in one
 	/// module fails an `=== ` tag comparison against `Option.Some[TAG]` read
-	/// from another module's own inline `Option` — cross-module (and,
-	/// crucially for this slice, intrinsic-runtime-built) `Option`/enum
+	/// from another module's own inline `Option` — cross-module and
+	/// intrinsic-runtime-built `Option`/enum
 	/// values silently mismatch every `match`, EVEN THOUGH the checker
 	/// already treats them as the identical type. `Symbol.for` fixes this:
 	/// the same string always resolves to the same global symbol, so any two
@@ -1045,9 +1029,9 @@ impl<'a> Emitter<'a> {
 	/// values of "the same" enum variant compare equal by construction. The
 	/// TAG KEY itself (`emit_tag_const`, above) was already global via
 	/// `Symbol.for("nymph.tag")` — only the per-variant discriminant VALUE
-	/// was the gap.
+	/// would otherwise mismatch.
 	///
-	/// X1: every enum has a `const proto = { … };` object (built the
+	/// Every enum has a `const proto = { … };` object (built the
 	/// same way as struct class methods, see [`Self::emit_method_property`]) is
 	/// also emitted inside the IIFE, and every variant value is created with
 	/// `Object.create(proto)` as its prototype instead of a plain object literal
@@ -1055,7 +1039,6 @@ impl<'a> Emitter<'a> {
 	/// enums still have a canonical runtime type object.
 	fn emit_enum(&self, hir_enum: &HirEnum) -> Statement<'a> {
 		let mut stmts = ArenaVec::new_in(&self.ast);
-		let has_methods = true;
 		// The prototype is also the enum's canonical runtime type object, so it
 		// exists even when there are no instance methods.
 		stmts.push(self.emit_enum_proto(&hir_enum.methods));
@@ -1064,33 +1047,7 @@ impl<'a> Emitter<'a> {
 			let t_name = format!("t{i}");
 			// const t<i> = Symbol("<E>.<V>");
 			let label = format!("{}.{}", hir_enum.name, variant.name);
-			// `Symbol.for(label)`, not a bare `Symbol(label)` call — see this
-			// method's own doc comment for why the discriminant must be the
-			// GLOBAL symbol registry entry, mirroring `emit_tag_const`'s own
-			// `Symbol.for("nymph.tag")` shape.
-			let symbol_for = Expression::new_static_member_expression(
-				SPAN,
-				Expression::new_identifier(SPAN, "Symbol", &self.ast),
-				IdentifierName::new(SPAN, "for", &self.ast),
-				false,
-				&self.ast,
-			);
-			let mut sym_args = ArenaVec::new_in(&self.ast);
-			sym_args.push(Argument::from(Expression::new_string_literal(
-				SPAN,
-				self.ast.allocator.alloc_str(&label),
-				None,
-				&self.ast,
-			)));
-			let sym_call = Expression::new_call_expression(
-				SPAN,
-				symbol_for,
-				oxc::ast::NONE,
-				sym_args,
-				false,
-				&self.ast,
-			);
-			stmts.push(self.const_decl(&t_name, sym_call));
+			stmts.push(self.const_decl(&t_name, self.global_symbol(&label)));
 
 			// The `{ [TAG]: t<i> }` object both variant shapes carry.
 			let mut tag_props = ArenaVec::new_in(&self.ast);
@@ -1098,18 +1055,13 @@ impl<'a> Emitter<'a> {
 			let tag_obj = Expression::new_object_expression(SPAN, tag_props, &self.ast);
 			// The variant's value: a factory (fields) or a frozen singleton (nullary).
 			let value = if variant.fields.is_empty() {
-				let base = if has_methods {
-					self.object_create_and_assign("proto", tag_obj)
-				} else {
-					tag_obj
-				};
 				self.member_call(
 					Expression::new_identifier(SPAN, "Object", &self.ast),
 					"freeze",
-					vec![base],
+					vec![self.object_create_and_assign("proto", tag_obj)],
 				)
 			} else {
-				let factory = self.variant_factory(&t_name, has_methods);
+				let factory = self.variant_factory(&t_name);
 				self.object_assign(vec![factory, tag_obj])
 			};
 
@@ -1129,7 +1081,7 @@ impl<'a> Emitter<'a> {
 				&self.ast,
 			)));
 		}
-		// `namespace func` static functions (Slice 4J) become OBJECT-level
+		// `namespace func` static functions become object-level
 		// method properties on the returned object itself, alongside the
 		// variant keys — NOT on `proto` (only reachable through a constructed
 		// variant instance, never through the enum name; call sites emit
@@ -1182,7 +1134,7 @@ impl<'a> Emitter<'a> {
 	}
 
 	/// `const proto = { m1(…) { … }, … };` — the shared prototype object an
-	/// enum's methodful variants are `Object.create`d against (Slice 4D, X1).
+	/// enum's methodful variants are `Object.create`d against.
 	/// Each method is built the same way a struct's class method is (via
 	/// [`Self::method_function`]), just wrapped as an object-literal method
 	/// property instead of a class element.
@@ -1207,11 +1159,8 @@ impl<'a> Emitter<'a> {
 		self.object_assign(vec![create_call, props])
 	}
 
-	/// `(fields) => { return { [TAG]: <t_name>, ...fields }; }` — a field variant's
-	/// object-argument factory. When `has_methods`, the returned object is instead
-	/// `Object.assign(Object.create(proto), { [TAG]: <t_name>, ...fields })` so the
-	/// constructed value carries the shared prototype's methods (Slice 4D, X1).
-	fn variant_factory(&self, t_name: &str, has_methods: bool) -> Expression<'a> {
+	/// A field variant factory whose values inherit the enum's shared prototype.
+	fn variant_factory(&self, t_name: &str) -> Expression<'a> {
 		let mut obj_props = ArenaVec::new_in(&self.ast);
 		obj_props.push(self.tag_prop(t_name));
 		obj_props.push(ObjectPropertyKind::new_spread_property(
@@ -1220,15 +1169,10 @@ impl<'a> Emitter<'a> {
 			&self.ast,
 		));
 		let obj = Expression::new_object_expression(SPAN, obj_props, &self.ast);
-		let ret_expr = if has_methods {
-			self.object_create_and_assign("proto", obj)
-		} else {
-			obj
-		};
 		let mut body_stmts = ArenaVec::new_in(&self.ast);
 		body_stmts.push(Statement::new_return_statement(
 			SPAN,
-			Some(ret_expr),
+			Some(self.object_create_and_assign("proto", obj)),
 			&self.ast,
 		));
 		let body = FunctionBody::new(SPAN, ArenaVec::new_in(&self.ast), body_stmts, &self.ast);
@@ -1310,8 +1254,8 @@ impl<'a> Emitter<'a> {
 		)
 	}
 
-	/// `new <class>(<payload>)` — a boxed primitive value (uniform value boxing,
-	/// slice #2). `class` is a box wrapper name (`NInt`/`NString`/…); the wrapper
+	/// `new <class>(<payload>)` — a boxed primitive value. `class` is a box wrapper
+	/// name (`NInt`/`NString`/…); the wrapper
 	/// stores `payload` in `.v` and carries its type discriminant on its
 	/// prototype. Records the runtime binding so [`Self::emit_module`] can either
 	/// provide the inline runtime or import it from the project runtime module.
@@ -1326,8 +1270,7 @@ impl<'a> Emitter<'a> {
 		Expression::new_new_expression(SPAN, callee, oxc::ast::NONE, args, &self.ast)
 	}
 
-	/// `<expr>.v` — read a boxed value's raw payload (uniform value boxing,
-	/// ADR-0002). The condition/logical-operator unwrap of slice #4:
+	/// `<expr>.v` — read a boxed value's raw payload (ADR-0002).
 	/// `ToBoolean(object)` is unconditionally `true`, so a user `boolean` in an
 	/// `if`/`while`/guard condition or an `&&`/`||`/`!` slot must consult its raw
 	/// `.v` payload rather than the (always-truthy) box.
@@ -1343,7 +1286,7 @@ impl<'a> Emitter<'a> {
 
 	/// Whether `cond`, in a condition slot, already evaluates to a raw JS boolean
 	/// and so must not be `.v`-unwrapped. Only compiler-generated operator nodes
-	/// carry `BuiltinResult::Raw`; user comparisons now produce boxed `NBool`s.
+	/// carry `BuiltinResult::Raw`; user comparisons produce boxed `NBool`s.
 	fn cond_is_raw(cond: &HirExpr) -> bool {
 		matches!(
 			cond,
@@ -1647,8 +1590,7 @@ impl<'a> Emitter<'a> {
 		local
 	}
 
-	/// The saturating JS runtime mapping for a numeric `ScalarCast` (the change
-	/// that supersedes Slice 4K's plain `Math.trunc` passthrough): Nymph defines
+	/// The saturating JS runtime mapping for a numeric `ScalarCast`: Nymph defines
 	/// its own float→int/uint semantics rather than inheriting JS's (`Math.trunc`
 	/// passes `NaN`/`±Infinity` straight through) or Rust's (`as` saturates, but
 	/// isn't reproducible on JS numbers as-is). Builds an `arrow_iife` around
@@ -1770,8 +1712,8 @@ impl<'a> Emitter<'a> {
 
 	fn emit_expr(&self, expr: &HirExpr) -> Expression<'a> {
 		match expr {
-			// A numeric literal → a boxed `new NInt/NUint/NFloat(<raw>)` (uniform
-			// value boxing, slice #2), the box class chosen from the checker-threaded
+			// A numeric literal → a boxed `new NInt/NUint/NFloat(<raw>)`, with the
+			// box class chosen from the checker-threaded
 			// `NumKind`. `NumKind::Raw` is compiler-internal scaffolding (loop
 			// counters/indices doing native JS arithmetic) and stays an unboxed bare
 			// numeric literal — see `NumKind::Raw`'s own doc comment.
@@ -1953,8 +1895,7 @@ impl<'a> Emitter<'a> {
 			// `!x` reads the raw boolean payload, negates it, and re-boxes:
 			// `new NBool(!x.v)` — `!box` is always `false` (a box is truthy), so the
 			// native operator can't run on the box (uniform value boxing, ADR-0002).
-			// `Neg`/`BitNot` are arithmetic (still broken until slice #10a) and stay
-			// as bare native unary ops over the operand.
+			// `Neg`/`BitNot` use bare native unary operators over the operand.
 			HirExpr::Unary {
 				op: UnOp::Not,
 				operand,
@@ -1992,7 +1933,7 @@ impl<'a> Emitter<'a> {
 				}
 				Expression::new_call_expression(SPAN, callee, oxc::ast::NONE, arguments, false, &self.ast)
 			}
-			// Gap 3 (L0/L1): a call resolved through the linkage registry —
+			// A call resolved through the linkage registry —
 			// `module`/`symbol` are already the resolved `Linked` fields
 			// (lowering did the receiver-tag-disambiguated lookup; see
 			// `HirExpr::ExternCall`'s own doc comment for why emit never
@@ -2078,7 +2019,7 @@ impl<'a> Emitter<'a> {
 					HirArrayKind::Raw => array,
 				}
 			}
-			// A list literal with at least one spread element (SS1) → a JS array
+			// A list literal with at least one spread element → a JS array
 			// `[a, ...xs, b]`, preserving left-to-right source order. Each
 			// `HirArrayElem::Spread` payload is already a JS-array-valued
 			// expression (a native source or a `lower_spread_source` drain IIFE),
@@ -2116,10 +2057,10 @@ impl<'a> Emitter<'a> {
 				let outer = Expression::new_array_expression(SPAN, entries, &self.ast);
 				self.new_box("NMap", outer)
 			}
-			// A map literal with at least one spread entry (SS1) → `new NMap([...])`
+			// A map literal with at least one spread entry → `new NMap([...])`
 			// merging the spread entries in, left-to-right (a later duplicate key
 			// wins — the `Map` constructor processes its entries array in order,
-			// SS4). Each `HirMapElem::Spread` payload is already an array of
+			// source order). Each `HirMapElem::Spread` payload is already an array of
 			// `[k, v]` pairs (an `NMap` iterates as `[k, v]` pairs, or a
 			// `lower_spread_source` drain IIFE), so it always emits with JS spread
 			// syntax inside the entries array.
@@ -2261,17 +2202,7 @@ impl<'a> Emitter<'a> {
 			}
 			// A map lookup → `recv.get(key)`.
 			HirExpr::MapGet { recv, key } => {
-				let object = self.emit_expr(recv);
-				let member = Expression::new_static_member_expression(
-					SPAN,
-					object,
-					IdentifierName::new(SPAN, "get", &self.ast),
-					false,
-					&self.ast,
-				);
-				let mut args = ArenaVec::new_in(&self.ast);
-				args.push(Argument::from(self.emit_expr(key)));
-				Expression::new_call_expression(SPAN, member, oxc::ast::NONE, args, false, &self.ast)
+				self.member_call(self.emit_expr(recv), "get", vec![self.emit_expr(key)])
 			}
 			HirExpr::Assign { target, value } => {
 				if let HirExpr::Index { recv, index } = target.as_ref() {
@@ -2299,7 +2230,7 @@ impl<'a> Emitter<'a> {
 					let key_expr = self.emit_expr(key);
 					return self.member_call(object, "set", vec![key_expr, value_expr]);
 				}
-				// Slice 4J, Task 2: a plain `this.field = value` assignment (a
+				// A plain `this.field = value` assignment (a
 				// `mut func` — or, per the checker's own permissiveness, ANY
 				// method's — field mutation) lowers to `HirExpr::Assign { target:
 				// Field { .. }, .. }` and reaches here from a zero-diagnostic
@@ -2394,7 +2325,7 @@ impl<'a> Emitter<'a> {
 			// arm can recurse (a match arm's own body can itself be a
 			// subexpression-position `if`), and a bare set would leave the flag
 			// stuck true once the outer call returns to a statement-position
-			// caller (Slice 4E, Y1).
+			// caller.
 			HirExpr::Block { .. }
 			| HirExpr::If { .. }
 			| HirExpr::While { .. }
@@ -2404,8 +2335,8 @@ impl<'a> Emitter<'a> {
 				self.in_iife_subexpr.set(prev);
 				result
 			}
-			// A built-in `as` cast's JS runtime mapping (Slice 4K, extended by the
-			// saturating-cast change) — see `HirExpr::ScalarCast`'s doc comment for
+			// A built-in `as` cast's JS runtime mapping — see
+			// `HirExpr::ScalarCast`'s doc comment for
 			// why these are dedicated calls rather than composed `Field`/`Call`
 			// nodes over a `Local("Math"/"String"/"Number")` (shadow-proofing a user
 			// local of that name).
@@ -2448,7 +2379,6 @@ impl<'a> Emitter<'a> {
 					}
 				}
 			}
-			// A closure → a JS arrow function `(<params>) => { … }` (Slice 4L).
 			HirExpr::Closure { params, body } => self.closure_arrow(params, body),
 			HirExpr::LabeledBlock { target, body } => {
 				let token = self.begin_return_completion();
@@ -2476,7 +2406,7 @@ impl<'a> Emitter<'a> {
 	}
 
 	/// `(<params>) => { <body stmts>; return <tail>; }` — a closure's arrow
-	/// function (Slice 4L). Mirrors `emit_func`'s body split exactly: a `Block`
+	/// function. Mirrors `emit_func`'s body split exactly: a `Block`
 	/// body's own statements/tail flatten directly into the arrow's
 	/// `FunctionBody` (no needless nested IIFE), any other body becomes a
 	/// single `return <expr>;`.
@@ -2484,8 +2414,8 @@ impl<'a> Emitter<'a> {
 	/// Saves and resets `in_iife_subexpr` to `false` around the body emission —
 	/// the arrow is a real function boundary, exactly like `emit_func`'s
 	/// top-level function body implicitly is (that path never sets the flag at
-	/// all). Lowering already rejects every `return` lexically inside a closure
-	/// body (Slice 4L, JJ2), so no `HirStmt::Return` can actually reach this
+	/// all). Lowering rejects every `return` lexically inside a closure body, so
+	/// no `HirStmt::Return` can actually reach this
 	/// boundary today — but it's the correct boundary story regardless (a
 	/// closure built while emitting an enclosing subexpression-position
 	/// construct, e.g. a closure passed as a call argument inside a match arm
@@ -2757,11 +2687,11 @@ impl<'a> Emitter<'a> {
 			// A statement-position control-flow expression flattens directly into a
 			// plain JS `BlockStatement` via `block_stmt` (matching how a `while` body
 			// already does), rather than going through `emit_expr`'s subexpression
-			// fallthrough — which would otherwise wrap it in a needless IIFE, and
-			// (post Slice 4E, Y1) trip the `return`-inside-IIFE guard for a
+			// fallthrough — which would otherwise wrap it in a needless IIFE and
+			// trip the `return`-inside-IIFE guard for a
 			// statement-position `if`/`while`/`match` that legitimately contains a
 			// `return`. The `BlockStatement` still gives it its own JS scope
-			// (unaffected by Y2 shadowing) and keeps any gensym `let $nymph$temp$N` temps
+			// and keeps any gensym `let $nymph$temp$N` temps
 			// scoped to it, same as before.
 			HirStmt::Expr(
 				e @ (HirExpr::Block { .. }

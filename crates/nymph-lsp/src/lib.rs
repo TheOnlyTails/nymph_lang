@@ -2813,8 +2813,7 @@ mod tests {
 
 	/// A round trip through the real `Connection::memory()` wire proving
 	/// `textDocument/semanticTokens/full` is actually dispatched by
-	/// `main_loop`, and that a match arm's `->` decodes to `operator` (the
-	/// bug the feature exists to fix).
+	/// `main_loop`, and that a match arm's `->` decodes to `operator`.
 	#[test]
 	fn semantic_tokens_request_round_trips_through_the_wire() {
 		use lsp_types::{

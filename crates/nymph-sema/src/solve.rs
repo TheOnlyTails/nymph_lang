@@ -23,7 +23,7 @@ use crate::ty::{Ty, TyKind};
 const MAX_DEPTH: u32 = 32;
 
 /// Where a resolved method's implementation actually lives. Operator dispatch
-/// (Slice 4B) needs this distinction: codegen can compile a direct call
+/// needs this distinction: codegen can compile a direct call
 /// (`lhs.method(rhs)`) for an inherent or impl-defined method, but not yet for a
 /// method that only exists as an interface's default body (that body isn't
 /// materialized on any class).
@@ -40,7 +40,7 @@ pub(crate) enum MethodSource {
 	/// the concrete impl is only known once the parameter is instantiated, which
 	/// this type-erased-at-lowering compiler does not track. Reached by a
 	/// `Param`-typed receiver — either a bounded generic function parameter, or
-	/// `this` inside an interface default body (Slice 4C-b binds it to a rigid
+	/// `this` inside an interface default body (bound to a rigid
 	/// synthetic `Param` so the body checks generically once for every impl) —
 	/// tagged honestly rather than reused as one of the other variants.
 	GenericBound,
@@ -128,14 +128,14 @@ impl Checker<'_> {
 			}
 		}
 		let receiver_matches = self.most_specific(&receiver_matches);
-		if receiver_matches.len() != 1 {
-			if receiver_matches.len() > 1 {
+		let index = match receiver_matches.as_slice() {
+			[] => return None,
+			[index] => *index,
+			_ => {
 				self.emit(span, TypeError::AmbiguousCall { name: name.into() });
 				return Some(self.error_method_resolution());
 			}
-			return None;
-		}
-		let index = receiver_matches[0];
+		};
 		self.gate_mutating(
 			self.impls.impls[index].interface,
 			name,
@@ -264,9 +264,9 @@ impl Checker<'_> {
 			.map(|(_, ty)| ty)
 	}
 
-	/// MT2 OO1/OO3: emit [`TypeError::MutMethodNeedsMutReceiver`] if `interface`'s
+	/// emit [`TypeError::MutMethodNeedsMutReceiver`] if `interface`'s
 	/// OWN declared kind for `name` (the source of truth — an impl's restatement
-	/// is checked to MATCH it at collection time, `iface.rs`'s OO2 check) is
+	/// is checked to MATCH it at collection time, `iface.rs`'s check) is
 	/// `mut func`, but the receiver the caller actually wrote wasn't `mut`. The
 	/// single gate every method-resolution path in `resolve_method` calls,
 	/// keyed by whichever interface actually provided the resolved method.
@@ -304,8 +304,8 @@ impl Checker<'_> {
 		self.holds_self(self_ty, false, interface, known, depth)
 	}
 
-	/// [`Self::holds`], additionally honoring a `Mut` impl self type (MT2 OO4/OO5:
-	/// `impl A for mut B` / `impl mut A for B`) the same way method resolution's
+	/// [`Self::holds`], additionally honoring a `Mut` impl self type
+	/// (`impl A for mut B` / `impl mut A for B`) the same way method resolution's
 	/// `try_unify_self` does: `self_is_mut` records whether the caller's argument
 	/// was actually written `mut`, and `try_impl` peels a `Mut` impl self type one
 	/// way against `self_ty`, requiring `self_is_mut` for that match — WITHOUT
@@ -418,7 +418,7 @@ impl Checker<'_> {
 	/// `resolve_method` use throughout; `self_is_mut` carries whether the
 	/// caller's value was actually written `mut` (mirrors `resolve_method`'s own
 	/// `recv_is_mut`), so an impl reachable only through the mutable view (`impl
-	/// A for mut B` / `impl mut A for B`, MT2 OO4/OO5 — the only way an
+	/// A for mut B` / `impl mut A for B`, — the only way an
 	/// `Iterator`/`Iterable` impl can mutate `this` inside its own body, since
 	/// `check_method_body` binds `this: mut Self` only for a `mut func`) still
 	/// matches correctly rather than being permanently unreachable.
@@ -752,7 +752,7 @@ impl Checker<'_> {
 		let b_inst = self.instantiate_impl_scheme(b);
 		let a_subst = a_inst.substitution;
 		let b_subst = b_inst.substitution;
-		// Peel `mut` off both self types (MT2 OO4/OO5): `impl A for B` (self `B`)
+		// Peel `mut` off both self types: `impl A for B` (self `B`)
 		// and `impl A for mut B` (self `Mut(B)`) both apply to a `mut B` receiver,
 		// so they OVERLAP and coherence must reject them at declaration — otherwise
 		// a `mut`-receiver call finds both applicable and falls through to a
@@ -795,7 +795,7 @@ impl Checker<'_> {
 		span: Span,
 	) -> Option<MethodResolution> {
 		// Captured BEFORE the peel below erases it: whether the receiver, as the
-		// caller actually wrote it, is `mut` (MT2, OO1/OO3). A concrete `mut B`
+		// caller actually wrote it, is `mut`. A concrete `mut B`
 		// receiver, or a `mut T` bound parameter (which lowers to
 		// `TyKind::Mut(Param(idx))`), both read `true` here; a plain `B` or bare
 		// `T` param reads `false`. This is the single flag every `mut func`
@@ -809,12 +809,12 @@ impl Checker<'_> {
 		// `mut Adt` receiver against it would spuriously mismatch. Peeled once
 		// here, at entry, covers every downstream use in this function
 		// (`resolve_inherent`, `method_matches_receiver`, `commit_method`, …).
-		// Method resolution/matching against a `Mut`-self-type impl (OO4/OO5)
+		// Method resolution/matching against a `Mut`-self-type impl
 		// still needs the real receiver mutability, which is why `recv_is_mut`
 		// was captured above rather than derived from this peeled `recv`.
 		let recv = self.strip_mut(recv);
 
-		// While checking an interface's own default-method body (Slice 4C-b), `this`
+		// While checking an interface's own default-method body, `this`
 		// is bound to a rigid synthetic `Param` so the body checks once, generically,
 		// for every future implementor (`check_interface_default_body`). A call to
 		// *another method of that same interface* on `this` must resolve directly
@@ -838,7 +838,7 @@ impl Checker<'_> {
 				.and_then(|i| i.methods.get(name))
 				.cloned()
 		{
-			// OO1 gate: the default body of one interface method calling another
+			// gate: the default body of one interface method calling another
 			// (`mut func`) method of the same interface on `this` needs `this` to
 			// be `mut` too — mirrors every other call-site gate below.
 			self.gate_mutating(iface_id, name, recv_is_mut, span);
@@ -936,14 +936,13 @@ impl Checker<'_> {
 		// when NONE of the param's bounds provide the method — that preserves
 		// unconstrained blanket dispatch (e.g. `func same<T>(a: T, b: T): boolean =
 		// a.equals(b)` with no bound on `T`, resolved through a blanket `Equals`
-		// impl below). A prior fix attempt returned eagerly on a bounds miss here
-		// and broke exactly that case with a spurious "no method" error — this
+		// impl below). A bounds miss falls through to preserve that case; this
 		// branch must never `return None` itself, only fall through.
 		if let crate::ty::TyKind::Param(idx) = *self.interner.kind(recv)
 			&& let Some((ty, iface_def, params, type_arguments)) =
 				self.resolve_param_method(idx, name, arg_tys, arg_lits, span)
 		{
-			// OO3 gate: `x.method()` where `x: T` (or `x: mut T`) and `T: A`
+			// gate: `x.method` where `x: T` (or `x: mut T`) and `T: A`
 			// resolved `method` through `A`'s bound — same gate as everywhere
 			// else, keyed off the interface the bound was satisfied through.
 			self.gate_mutating(iface_def, name, recv_is_mut, span);
@@ -1059,7 +1058,7 @@ impl Checker<'_> {
 		// are dropped, and `most_specific` (concrete over blanket) breaks any remaining
 		// tie. This keeps `a.plus(2)` (a: int) resolving to `Plus<Other = int> for int`
 		// rather than tying with the cross-type `Plus<Other = uint> for int`, and
-		// generalises the pre-existing `int`/`float` operator overload pair the same way.
+		// also covers the `int`/`float` operator overload pair.
 		let mut arg_matches: Vec<(usize, bool)> = Vec::new();
 		for &idx in &receiver_matches {
 			let snapshot = self.table.snapshot();
@@ -1152,7 +1151,7 @@ impl Checker<'_> {
 	}
 
 	/// Trial-unify a receiver against an impl's (subst'ed) self type, honoring a
-	/// `Mut` self type (MT2 OO4/OO5: `impl A for mut B` / `impl mut A for B`,
+	/// `Mut` self type (`impl A for mut B` / `impl mut A for B`,
 	/// normalized to a `Mut` self type at collection — `iface.rs`). Such an impl
 	/// matches ONLY a receiver the caller actually wrote as `mut`: without this,
 	/// `recv` (already `strip_mut`-peeled, like every other receiver use in this
@@ -1267,11 +1266,10 @@ impl Checker<'_> {
 		let Some((params, ret, source, type_arguments)) =
 			self.method_signature(&def, &subst, recv, name, Some(span))
 		else {
-			// Unreachable in practice: `candidates` was assembled from interfaces whose
+			// Unreachable in practice: `candidates` is assembled from interfaces whose
 			// `methods` map already contains `name`, so `method_signature` always finds
 			// either the impl's own method or the interface's default. Kept total rather
-			// than `unreachable!()` so a future change to that invariant fails loudly via
-			// a wrong-but-safe error type instead of a panic mid-typecheck.
+			// than `unreachable!()` so an invariant violation produces a safe error type.
 			return MethodResolution {
 				ty: self.interner.error(),
 				params: Vec::new(),

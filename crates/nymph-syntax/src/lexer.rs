@@ -39,7 +39,12 @@ fn clean(s: &str) -> String {
 }
 
 fn parse_f64(s: &str) -> f64 {
-	clean(s).parse().unwrap_or(f64::NAN)
+	if s.contains('_') {
+		clean(s).parse()
+	} else {
+		s.parse()
+	}
+	.unwrap_or(f64::NAN)
 }
 
 /// Lex a whole source file.

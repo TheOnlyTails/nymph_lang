@@ -1,4 +1,4 @@
-//! Milestone B: match exhaustiveness and reachability.
+//! Tests match exhaustiveness and reachability.
 
 use nymph_sema::check_module;
 use nymph_syntax::parse_module;
@@ -368,7 +368,7 @@ fn mut_enum_scrutinee_with_all_variants_is_exhaustive() {
 
 #[test]
 fn mut_enum_scrutinee_missing_a_variant_is_still_caught() {
-	// The strip_mut fix must not weaken real exhaustiveness checking — a genuinely
+	// Stripping `mut` must not weaken real exhaustiveness checking: a genuinely
 	// missing variant on a `mut` scrutinee is still reported, witness and all.
 	let src = format!(
 		"{OPT}
@@ -417,7 +417,7 @@ fn mut_tuple_scrutinee_is_exhaustive() {
 }
 
 // A `mut`-typed sub-position (a struct field or enum-variant field declared
-// `mut`) is a strip_mut gap distinct from a `mut`-typed *scrutinee*: the field
+// `mut`) is a strip_mut from a `mut`-typed *scrutinee*: the field
 // type only surfaces once the usefulness algorithm specializes into the
 // constructor's sub-types, deep inside recursion — not at `check_exhaustive`'s
 // single top-level peel.

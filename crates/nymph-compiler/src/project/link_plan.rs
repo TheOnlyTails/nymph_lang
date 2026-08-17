@@ -113,15 +113,7 @@ pub(crate) fn plan_project_module(
 				.push(resolve_import(fragment.definition, resolver)?);
 		}
 		if fragment.definition.module == *module {
-			if let LinkArtifact::External(abi) = fragment.artifact {
-				if abi.linked().is_some() {
-					plan.external_aliases.push(LinkedExternalAlias {
-						definition: fragment.definition.clone(),
-						binding: resolve_binding(fragment.definition, resolver)?,
-						abi: abi.clone(),
-					});
-				}
-			}
+			plan_external_alias(&mut plan, fragment, resolver)?;
 			if !matches!(fragment.artifact, LinkArtifact::Attached)
 				&& (matches!(fragment.artifact, LinkArtifact::External(_))
 					|| preserve_names
@@ -160,15 +152,7 @@ pub(crate) fn plan_virtual_module(
 		}
 	}
 	for fragment in fragments {
-		if let LinkArtifact::External(abi) = fragment.artifact {
-			if abi.linked().is_some() {
-				plan.external_aliases.push(LinkedExternalAlias {
-					definition: fragment.definition.clone(),
-					binding: resolve_binding(fragment.definition, resolver)?,
-					abi: abi.clone(),
-				});
-			}
-		}
+		plan_external_alias(&mut plan, fragment, resolver)?;
 		if !matches!(fragment.artifact, LinkArtifact::Attached) {
 			plan.exports.push(PlannedExport {
 				definition: fragment.definition.clone(),
@@ -178,6 +162,23 @@ pub(crate) fn plan_virtual_module(
 	}
 	finish(&mut plan)?;
 	Ok(plan)
+}
+
+fn plan_external_alias(
+	plan: &mut ModuleLinkPlan,
+	fragment: &LinkFragment<'_>,
+	resolver: &mut impl LinkNameResolver,
+) -> Result<(), ModuleLinkPlanError> {
+	if let LinkArtifact::External(abi) = fragment.artifact
+		&& abi.linked().is_some()
+	{
+		plan.external_aliases.push(LinkedExternalAlias {
+			definition: fragment.definition.clone(),
+			binding: resolve_binding(fragment.definition, resolver)?,
+			abi: abi.clone(),
+		});
+	}
+	Ok(())
 }
 
 fn resolve_binding(

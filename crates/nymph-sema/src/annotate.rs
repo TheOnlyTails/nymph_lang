@@ -121,7 +121,7 @@ pub struct Resolution {
 	/// Interface method name the operator resolved to (e.g. `plus`). Codegen
 	/// only needs the JS method name — impl methods are not `DefId`'d
 	/// (`ImplDef.methods` is a name-keyed map), so a name is all lowering needs
-	/// to build a `Call { callee: Field { .. }, .. }`.
+	/// to build a `Call { callee: Field {.. },.. }`.
 	pub method: EcoString,
 	pub dispatch: DispatchKind,
 	/// Stable semantic identity of the selected method declaration/member.
@@ -193,14 +193,14 @@ pub struct VariantResolution {
 /// native-list fast paths are ruled out (see `infer_iterable_element`). Recorded
 /// on the iterable expression's `NodeId` so lowering (`lower_for`), which has no
 /// solver access of its own, can tell a source that IS the iterator (call
-/// `.next()` directly) apart from one that must first be turned into one (call
-/// `.iter()`). Both desugar to the same while/match protocol; only the first
+/// `.next` directly) apart from one that must first be turned into one (call
+/// `.iter`). Both desugar to the same while/match protocol; only the first
 /// statement of the desugared block differs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IterMode {
 	/// The source itself implements `Iterator<Item>` — use it as-is.
 	Direct,
-	/// The source implements `Iterable<T>` — call `.iter()` to get the iterator.
+	/// The source implements `Iterable<T>` — call `.iter` to get the iterator.
 	ViaIter,
 }
 
@@ -264,12 +264,12 @@ pub struct Annotations {
 	positional_fields: FxHashMap<Span, PositionalFieldResolution>,
 	/// A `for` loop's iterable, keyed by its own `NodeId` — see [`IterMode`].
 	iter_modes: FxHashMap<NodeId, IterMode>,
-	/// Resolution of the implicit `.iter()` call inserted for an iterable source.
+	/// Resolution of the implicit `.iter` call inserted for an iterable source.
 	iter_resolutions: FxHashMap<NodeId, Resolution>,
-	/// Resolution of the implicit `.next()` call used to drain the selected iterator.
+	/// Resolution of the implicit `.next` call used to drain the selected iterator.
 	iteration_next_resolutions: FxHashMap<NodeId, Resolution>,
 	/// NodeId of a committed anonymous-closure-parameter (`$N`) boundary → its
-	/// arity (Slice: `$N` anonymous closure params). Populated by the
+	/// arity. Populated by the
 	/// checker's type-directed boundary search (`anon_closure.rs`) as each
 	/// boundary is finally committed — this is the one channel from that
 	/// search back to lowering, which re-walks the original AST and has no
@@ -756,7 +756,7 @@ impl Annotations {
 	}
 
 	/// Attach a `Resolution` to a node, preserving its already-recorded type. Used
-	/// by operator dispatch (Slice 4B) without clobbering the type recorded by the
+	/// by operator dispatch without clobbering the type recorded by the
 	/// uniform `infer` wrapper.
 	///
 	/// A resolved node is always also `infer`'d first (the wrapper records its type

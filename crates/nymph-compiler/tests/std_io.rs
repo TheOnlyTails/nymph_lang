@@ -1,5 +1,5 @@
-//! End-to-end proof of the FREE-FUNCTION extension to external linkage (the
-//! print/io slice): unlike Gap 3 (L0/L1/L2)'s method-call `HirExpr::ExternCall`
+//! End-to-end proof of the free-function extension to external linkage: unlike
+//! the method-call `HirExpr::ExternCall`
 //! (always `$_this`-first, dispatched off a `MemberAccess` callee resolved
 //! through the interface solver), `print`/`println` are bare, receiver-less
 //! calls (`ExprKind::Call { func: Identifier(..), .. }`) to a TOP-LEVEL
@@ -262,8 +262,7 @@ func main(): void = println(noop())"#;
 /// free-function dispatch only ever consults `self.prelude_modules` (core
 /// plus whatever the entry module actually imports), so with no io import
 /// there is no matching top-level `external` func and an ordinary bare call
-/// keeps taking the ordinary `HirExpr::Call` path, exactly as before this
-/// slice.
+/// keeps taking the ordinary `HirExpr::Call` path.
 #[test]
 fn a_program_without_importing_io_is_unaffected() {
 	let entry = "func add(a: int, b: int): int = a + b\n\

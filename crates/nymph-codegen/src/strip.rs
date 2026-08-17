@@ -1,5 +1,5 @@
 //! In-process TypeScript-to-JavaScript type stripping for a stdlib intrinsic
-//! module's `.ts` source (Gap 3, L0's oxc-strip mechanism).
+//! module's `.ts` source using oxc stripping.
 //!
 //! The `.ts` files under `stdlib/src/**` (e.g.
 //! `stdlib/src/collections/list.ts`) are the single source of truth for a
@@ -15,11 +15,11 @@
 //! resolves every `import` at graph-build time (before tree-shaking can drop
 //! anything) — `list.ts`'s own `import { Option } from "../option"` would be
 //! a fatal unresolved specifier the moment ANY symbol from the module is
-//! used, even one that never touches `Option`. L0 sidestepped this by
+//! used, even one that never touches `Option`. This is avoided by
 //! filtering to only symbols that never reference `Option` (`length`),
 //! dropping the import unconditionally along with everything else.
 //!
-//! L1 extension (the Option ABI seam): an Option-RETURNING intrinsic (e.g.
+//! An Option-returning intrinsic (e.g.
 //! `list.ts`'s `get`) genuinely needs its `import { Option } from
 //! "../option"` to survive — but only when a KEPT export still references it
 //! (an unrelated kept export, like plain `length`, must still drop it, as
@@ -27,7 +27,7 @@
 //! virtual modules at all (e.g. `"../option"` → `"std/option"`, the bare key
 //! `bundle::VirtualFsPlugin` serves an injected `std/option` module under —
 //! see `nymph-compiler`'s `HostRuntimeGraph`); an import whose specifier
-//! isn't in this map is dropped unconditionally, exactly like L0, since
+//! isn't in this map is dropped unconditionally, since
 //! nothing would resolve it in the bundle graph anyway. An import whose
 //! specifier IS in the map is kept — with its specifier rewritten to the
 //! resolvable key — only if at least one of its imported local names still
@@ -153,9 +153,8 @@ pub fn strip_ts_to_js(source: &str, keep: &[&str], import_rewrites: &[(&str, &st
 						}
 						// A default/namespace import never appears in the stdlib
 						// runtime sources today (every cross-module reference is a
-						// named import, e.g. `{ Option }`) — skipped rather than
-						// handled, since keeping one would need a different
-						// rewritten-import shape this slice has no case to test.
+						// named import, e.g. `{ Option }`) — skipped because keeping
+						// one requires a different rewritten-import shape.
 						_ => None,
 					})
 					.collect();
@@ -252,7 +251,7 @@ mod tests {
 		);
 	}
 
-	// L1 (Option ABI seam): the un-kept `Option` import above is dropped only
+	// The un-kept `Option` import above is dropped only
 	// because nothing SURVIVING the `keep` filter still references it. When
 	// `get` (which DOES reference `Option`) is kept instead, the import must
 	// survive too — rewritten to the resolvable virtual specifier
@@ -281,7 +280,7 @@ mod tests {
 	}
 
 	// A specifier with no entry in `import_rewrites` at all must still be
-	// dropped unconditionally, exactly like L0 — nothing in the bundle graph
+	// dropped unconditionally — nothing in the bundle graph
 	// would resolve it even if kept (mirrors `strips_types_and_keeps_only_the_
 	// requested_export`, but pins the "no rewrite configured" branch
 	// specifically, independent of whether the kept export references it).

@@ -57,7 +57,7 @@ pub enum TyKind {
 	Adt(DefId, GenericArgs),
 	/// The intersection `A + B` of interface bounds — a *conjunction*: a value of
 	/// this type satisfies every listed interface. Treated as logical AND
-	/// everywhere (the old checker's bug was treating it like OR).
+	/// everywhere; treating it as OR accepts values missing required bounds.
 	Intersection(Vec<Ty>),
 	/// `mut T` — a mutable *view* of `T`. Compile-time-only: codegen ignores it,
 	/// since JS values are already mutable. `mut T` is implicitly assignable to
@@ -81,7 +81,7 @@ pub enum TyKind {
 /// Nymph unifies ordinary type parameters and associated types into one mechanism:
 /// a named generic parameter that may be supplied positionally (`Option<T>`) or by
 /// label (`Plus<Other = float, Output = float>`). Both forms are retained so the
-/// solver can bind associated outputs by name in Milestone B.
+/// solver can bind associated outputs by name.
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub struct GenericArgs {
 	pub positional: Vec<Ty>,

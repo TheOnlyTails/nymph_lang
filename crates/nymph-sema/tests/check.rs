@@ -1,6 +1,5 @@
-//! End-to-end checker tests: parse a small Nymph program and assert on the
-//! diagnostics the type checker produces. Milestone A covers functions, generics,
-//! ADTs, closures, and local inference.
+//! End-to-end checker tests for functions, generics, ADTs, closures, local
+//! inference, and their diagnostics.
 
 use nymph_sema::check_module;
 use nymph_syntax::parse_module;
@@ -520,12 +519,11 @@ fn mutable_assignment_is_allowed() {
 
 #[test]
 fn plain_let_with_an_explicit_mut_annotation_keeps_the_mut_type() {
-	// NN2 (annotation-position `mut`) + NN4 (`let mut` sugar) are independent
+	// (annotation-position `mut`) + (`let mut` sugar) are independent
 	// axes: a plain `let` (no `let mut`) with an explicit `mut T` annotation
 	// must still bind at `mut T` — the annotation is the authority here, not
 	// the `let mut` keyword, which is a SEPARATE way to reach the same `mut`
-	// type. Previously the plain-let branch unconditionally stripped `mut`
-	// (only `let mut` ever applied it), silently discarding the annotation.
+	// type. The plain-let branch must not strip `mut` and discard the annotation.
 	assert_ok(
 		"struct Counter(n: int)
 		 func f(c: mut Counter): int = {
@@ -557,7 +555,7 @@ fn let_mut_with_an_explicit_mut_annotation_accepts_a_fresh_plain_value() {
 
 #[test]
 fn field_slot_assign_through_an_immutable_receiver_is_rejected() {
-	// NN5 headline enforcement: `p.field = v` requires a `mut` receiver. Through
+	// headline enforcement: `p.field = v` requires a `mut` receiver. Through
 	// an immutable parameter it is the `AssignFieldThroughImmutable` diagnostic —
 	// the error path (the happy `mut`-receiver path is the run_node e2e tests).
 	assert_error_contains(
@@ -572,7 +570,7 @@ fn field_slot_assign_through_an_immutable_receiver_is_rejected() {
 
 #[test]
 fn cast_on_a_mut_typed_value_uses_the_builtin_path() {
-	// Regression: `mut` is transparent to casting — a `let mut`/`mut`-param
+	// `mut` is transparent to casting: a `let mut`/`mut`-param
 	// scalar's identity or scalar cast must reach the built-in path, not fall
 	// through to requiring an `Into` impl ("cannot cast `mut int` to `int`").
 	assert_ok(
@@ -586,7 +584,7 @@ fn cast_on_a_mut_typed_value_uses_the_builtin_path() {
 
 #[test]
 fn for_in_over_a_mut_list_types_the_element() {
-	// Regression: iterating a `mut #[int]` must still bind `int` elements, not an
+	// Iterating a `mut #[int]` must bind `int` elements, not an
 	// unconstrained fresh var — so a type error in the loop body is still caught.
 	assert_error_contains(
 		"func f(): int = {
@@ -603,7 +601,7 @@ fn for_in_over_a_mut_list_types_the_element() {
 
 #[test]
 fn for_in_over_an_iterator_directly_types_the_element() {
-	// RR1: a for-loop source that itself implements `Iterator<Item>` is used
+	// A for-loop source that itself implements `Iterator<Item>` is used
 	// directly (no `.iter()` hop) — the element type must flow through as
 	// `Item`, not an unconstrained fresh var, so a body type error is caught.
 	assert_error_contains(
@@ -671,10 +669,10 @@ fn for_in_over_an_iterator_directly_accepts_a_mut_receiver() {
 
 #[test]
 fn for_in_over_an_iterable_via_iter_types_the_element() {
-	// RR1: a for-loop source that implements `Iterable<T>` (not `Iterator`
+	// A for-loop source that implements `Iterable<T>` (not `Iterator`
 	// itself) is desugared through `.iter()` — the element type must flow
 	// through as `T`, read off the matched `Iterable` impl's own argument
-	// rather than by typing `iter()`'s return (which loses `Item` through
+	// rather than by typing `iter`'s return (which loses `Item` through
 	// `mint_synthetic_param`).
 	assert_error_contains(
 		"struct Counter(n: int)
@@ -747,9 +745,8 @@ fn opaque_iterator_returns_preserve_interface_arguments() {
 
 #[test]
 fn for_in_over_a_non_iterable_source_is_diagnosed() {
-	// RR1: a source that implements neither `Iterator` nor `Iterable` is a
-	// hard error now, not a silent `self.fresh()` accept that let the loop
-	// body escape type-checking entirely.
+	// A source that implements neither `Iterator` nor `Iterable` produces
+	// `NotIterable`; `self.fresh()` does not let the loop bypass type-checking.
 	assert_error_contains(
 		"struct Foo(n: int)
 		 func f(): int = {
@@ -862,7 +859,7 @@ fn nested_impl_generic_shadowing_does_not_change_an_owner_bound() {
 	);
 }
 
-// ── SS1: smart literal spread ───────────────────────────────────────────────
+// ── smart literal spread ───────────────────────────────────────────────
 
 #[test]
 fn list_spread_over_a_native_list_source_types_the_element() {
@@ -889,7 +886,7 @@ fn list_spread_over_a_native_list_source_element_mismatch_is_reported() {
 
 #[test]
 fn list_spread_over_a_user_iterator_types_the_element() {
-	// SS1: a spread source need not be a same-kind list literal — ANY
+	// a spread source need not be a same-kind list literal — ANY
 	// `Iterator<T>`/`Iterable<T>` whose element matches is accepted, reusing
 	// Track A's own iterable resolution.
 	assert_ok(
@@ -964,7 +961,7 @@ fn map_spread_over_a_native_map_source_value_mismatch_is_reported() {
 
 #[test]
 fn map_spread_over_a_non_map_iterable_of_pairs_types_the_entry() {
-	// SS1: `Map` has no stdlib `Iterable` impl, so a non-map spread source must
+	// `Map` has no stdlib `Iterable` impl, so a non-map spread source must
 	// resolve through the ordinary `Iterator`/`Iterable` protocol as an
 	// iterable of `#(K, V)` pairs.
 	assert_ok(
@@ -1220,8 +1217,8 @@ fn compound_assignment_result_must_fit_the_place() {
 
 #[test]
 fn tuple_rest_pattern_binds_the_middle_subtuple() {
-	// `#(a, ...rest, c)` against a known 3-tuple: `rest` binds the single-element
-	// middle sub-tuple (boolean) sliced from the scrutinee's own element types.
+	// `#(a,...rest, c)` against a known 3-tuple: `rest` binds the single-element
+	// middle sub-tuple (boolean) from the scrutinee's own element types.
 	assert_ok(
 		"func mid(t: #(int, boolean, char)): int = match (t) {
 			#(a, ...rest, c) -> a,

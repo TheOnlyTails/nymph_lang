@@ -1,7 +1,5 @@
-//! Regression guard: every stdlib `.nym` file must parse cleanly under the refined
-//! syntax (function bodies use `=`, not `->`). This pins the parser/stdlib migration
-//! so a syntax regression in either is caught immediately. Full type-checking of the
-//! stdlib is tracked separately (see the Milestone B roadmap).
+//! Every stdlib `.nym` file must parse cleanly. Full stdlib type-checking is
+//! covered separately.
 
 use std::path::PathBuf;
 

@@ -1,5 +1,5 @@
 //! Integration tests for the stdlib operator-interface prelude, which the
-//! prelude-default-flip slice made the DEFAULT behind `check`/`compile` (and
+//! is the default behind `check`/`compile` (and
 //! their entry-mode counterparts) — there is no longer a separate
 //! `check_with_prelude`/`compile_with_prelude` facade; `check`/`compile`
 //! themselves flatten `std/ops` ahead of the user module (see `pipeline.rs`
@@ -89,11 +89,10 @@ fn check_now_resolves_a_bare_user_struct_plus_impl_via_the_prelude_default() {
 	// The payoff of the flip: `P` implements the stdlib's `Plus` interface
 	// directly, with no local `interface Plus` declaration and no opt-in
 	// call — plain `check` resolves it cleanly. The stdlib body
-	// materialization slice closes the gap this test used to pin as a
-	// lowering panic ("impl references unknown interface `Plus`" — the
-	// interface's own declaration lives in the prelude tree, invisible to a
-	// lowering that only ever walked the user's own AST): `compile` now
-	// lowers and emits `P`'s `plus` cleanly too, and the emitted JS actually
+	// materialization prevents a
+	// lowering panic ("impl references unknown interface `Plus`"). Lowering must
+	// walk the prelude tree containing the interface declaration as well as the
+	// user's AST, then emit `P`'s `plus` so the generated JS
 	// runs the prelude-resolved `+` correctly.
 	let source = "struct P(v: int)
 		impl Plus<Other = P, Output = P> for P { func plus(other: P): P = P(v = this.v + other.v) }
@@ -122,12 +121,12 @@ fn check_now_resolves_a_bare_user_struct_plus_impl_via_the_prelude_default() {
 fn compile_lowers_and_runs_cleanly_when_a_user_impl_targets_a_stdlib_interface() {
 	// The direct payoff pin (was `compile_panics_loudly_when_a_user_impl_targets_a_stdlib_interface`,
 	// pinning the honest-scope cross-module-lowering limitation the stdlib
-	// body materialization slice fixes): checking `P`'s `Plus` impl against
+	// body materialization addresses): checking `P`'s `Plus` impl against
 	// the prelude is fully clean (see
 	// `check_now_resolves_a_bare_user_struct_plus_impl_via_the_prelude_default`
-	// above), and lowering now feeds the prelude's own `interface`
+	// above), and lowering feeds the prelude's own `interface`
 	// declarations into the same by-name lookup `push_unoverridden_defaults`
-	// already used for the user's own interfaces (gap a of that slice) — a
+	// already used for the user's own interfaces — a
 	// stdlib interface named by a user's own `impl … for …` resolves at
 	// lowering time exactly like a local one, and the resulting class runs
 	// under Node with the right runtime value.
@@ -156,9 +155,8 @@ fn compile_lowers_and_runs_cleanly_when_a_user_impl_targets_a_stdlib_interface()
 
 #[test]
 fn compile_resolves_mixed_float_int_arithmetic() {
-	// Before the prelude existed this was a type error (no impl for
-	// `float + int`); now that it's the default, the stdlib's
-	// `impl Plus<Other = int, Output = self> for float` resolves it and it
+	// The default prelude's `impl Plus<Other = int, Output = self> for float`
+	// resolves mixed `float + int`, and it
 	// still compiles to a native JS `+`.
 	let source = "func f(a: float, b: int): float = a + b";
 	let js = compile(source, "test").expect("should compile via the default prelude");

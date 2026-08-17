@@ -318,11 +318,9 @@ mod tests {
 		assert!(result.is_err(), "invalid ESM must not bypass validation");
 	}
 
-	// Regression pin (not a bug): a wave of review findings flagged rolldown's
-	// tree-shaking as a "silent wrong-JS" risk — a dependency's top-level code
-	// dropped whenever the importer never references what it exports (e.g. a
-	// bare `import @/dep;` with no `with`-list). Investigation (see the IB2
-	// fix-agent notes) showed that risk does NOT materialize: rolldown/oxc
+	// Rolldown's tree-shaking does not drop a dependency's observable top-level
+	// code when the importer never references what it exports (e.g. a
+	// bare `import @/dep;` with no `with`-list): rolldown/oxc
 	// distinguish PROVABLY PURE unused code (safe, correct to drop — e.g. a
 	// literal assigned to an unreferenced binding) from code whose evaluation
 	// has an observable effect the analyzer can't rule out (e.g. a call to an

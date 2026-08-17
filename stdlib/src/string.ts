@@ -1,7 +1,7 @@
 import { NChar, NString, NUint } from "std/box";
 import { Option } from "std/option";
 
-// `Option`-returning helpers use the L1 named-field ABI: the compiler's
+// `Option`-returning helpers use the named-field ABI: the compiler's
 // `Option.Some(..)` carries its payload as `{ value }` (option.nym declares
 // `Some(value: T)`), so every `Some` below passes an object literal, mirroring
 // list.ts/map.ts. `None` is the nullary `Option.None`.

@@ -876,7 +876,7 @@ fn build_writes_nothing_on_a_type_error() {
 
 #[test]
 fn build_leaves_a_previously_built_artifact_intact_when_a_later_build_fails() {
-	// Fix 3: a failed rebuild must NEVER delete (or otherwise touch) whatever
+	// A failed rebuild must NEVER delete (or otherwise touch) whatever
 	// was already at the output path — including a real artifact from an
 	// earlier successful build of the same source.
 	let path = write_source("func add(a: int, b: int): int = a + b");
@@ -915,7 +915,7 @@ fn build_leaves_a_previously_built_artifact_intact_when_a_later_build_fails() {
 
 #[test]
 fn build_failure_does_not_touch_an_unrelated_file_at_the_output_path() {
-	// Fix 3, the other half: the file at `-o` doesn't have to be a stale
+	// The file at `-o` does not have to be a stale
 	// nymph-build artifact at all — it could be anything already sitting at
 	// that path. A failed build must leave it byte-for-byte alone.
 	let path = write_source("func f(): int = true");
@@ -995,17 +995,9 @@ fn check_reports_ok_for_a_user_struct_plus_impl_via_the_default_prelude() {
 
 #[test]
 fn build_and_run_succeed_for_a_user_impl_of_a_stdlib_interface() {
-	// The stdlib body materialization slice's payoff (flips the prelude
-	// flip's former honest-scope KK4 limitation, pinned pre-this-slice as
-	// `build_reports_a_readable_error_for_a_user_impl_of_a_stdlib_interface`):
-	// checking a user struct's `impl Plus for P` (with no local `interface
-	// Plus` declaration at all) was already clean via the default prelude,
-	// but lowering used to panic — "impl references unknown interface
-	// `Plus`" — because the interface's own declaration lives in the
-	// prelude tree, invisible to a lowering that only ever walked the
-	// user's own AST. Feeding the prelude's interfaces into the same
-	// lookup fixes this directly: `build` now succeeds and writes real JS,
-	// and `run` actually executes it. No I/O exists yet to print the
+	// A user `impl Plus for P` resolves `Plus` from the default prelude. Lowering
+	// must search prelude interfaces as well as the user AST for default bodies.
+	// No I/O exists yet to print the
 	// result directly, so — mirroring
 	// `run_invokes_main_and_surfaces_a_runtime_error_from_its_body`'s
 	// "observable side effect without I/O" trick — `main` deliberately
@@ -1110,10 +1102,8 @@ fn run_evaluates_an_inline_expression_and_prints_its_value() {
 
 #[test]
 fn run_evaluates_boolean_bitwise_operators_to_booleans_not_numbers() {
-	// Regression: boolean `&`/`|`/`^` used to hit infer_binary's same-primitive
-	// BuiltinEager fast path and emit native JS bitwise ops, which coerce
-	// booleans to numbers (`true & false` → 0). They now dispatch to the stdlib
-	// BitAnd/BitOr/BitXor impls (materialized) and produce real booleans.
+	// Boolean `&`/`|`/`^` must dispatch to the materialized stdlib impls;
+	// native JS bitwise ops coerce booleans to numbers (`true & false` → 0).
 	let out = nymph(&["run", "-e", "#(true & false, true | false, true ^ true)"]);
 	assert!(
 		out.status.success(),

@@ -1,4 +1,4 @@
-//! The external-linkage registry (Gap 3, L0/L1): a table mapping an
+//! The external-linkage registry: a table mapping an
 //! `external(name)` MARKER (the identifier a stdlib `.nym` declaration writes
 //! inside the `external(..)` parens — e.g. `external(length) func length():
 //! uint`) to the real JS module specifier + exported symbol name that
@@ -12,14 +12,13 @@
 //!
 //! # Key: marker name, RECEIVER-TAG-DISAMBIGUATED where needed
 //!
-//! L0 keyed this registry by bare marker name alone, on the premise that
-//! every stdlib collection used a distinct marker name per intrinsic. L1
-//! breaks that premise: `list.nym` (both its `mut #[T]` and plain `#[T]`
+//! A bare marker name is insufficient because `list.nym` (both its `mut #[T]`
+//! and plain `#[T]`
 //! impls) AND `map.nym`'s `mut #{K: V}` impl all declare their OWN
 //! `external(get)` — same bare marker, three DIFFERENT JS implementations
 //! (`list.ts`'s `get` vs a future `map.ts`'s `get`). A bare-name lookup would
 //! mislink `map`'s `get` to `list`'s the instant `get` gained ANY entry, so
-//! [`lookup`] now also takes the caller's RECEIVER TAG (the same tag
+//! [`lookup`] also takes the caller's RECEIVER TAG (the same tag
 //! `nymph-sema`'s `inherent_self_type_tag` already computes to key a
 //! materialized prelude method's mangled name — `"list"`/`"mut_list"`/
 //! `"map"`/`"mut_map"`/… ) and an entry only matches when its own
@@ -32,10 +31,8 @@
 //! SAME `list.ts` symbol (mutability doesn't change how reading an element
 //! works), so `get` gets two registry rows — `"list"` and `"mut_list"` — both
 //! pointing at `list.ts`'s `get`; `Map`'s `get` is deliberately NOT
-//! registered at all yet (no `map.ts` runtime exists), so a `Map` receiver's
-//! `get` keeps failing `lookup` and stays a loud external defer, exactly as
-//! before this slice — see `nymph-codegen/tests/run_node.rs`'s
-//! `real_map_get_stays_a_loud_external_defer`.
+//! registered at all (no `map.ts` runtime exists), so a `Map` receiver's `get`
+//! fails `lookup` and remains a loud external defer.
 use rustc_hash::FxHashMap;
 
 use crate::hir::{BinOp, BuiltinResult, MarshalKind, UnOp};
@@ -353,7 +350,7 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 			receiver_tag: Some("mut_list"),
 		},
 	),
-	// Free-function externals (the print/io slice): a top-level `external`
+	// Free-function externals: a top-level `external`
 	// func (no enclosing `impl`, so no receiver at all) links exactly like
 	// any other marker, just with `receiver_tag: None` — `lookup(marker,
 	// None)` (a top-level `Declaration::ExternalFunc` has no receiver-type
@@ -676,7 +673,7 @@ pub fn is_value_marker(name: &str) -> bool {
 /// to keep (after stripping/filtering the `.ts` source) so an unrelated,
 /// still-unlinked import (e.g. `Option`, when nothing kept still references
 /// it) never becomes a fatal bundle-resolution failure. Deduped because an
-/// ambiguous marker like `get` now contributes MULTIPLE registry rows (one
+/// ambiguous marker like `get` contributes MULTIPLE registry rows (one
 /// per receiver tag) that all name the SAME `(module, symbol)` pair —
 /// without deduping, `strip_ts_to_js`'s `keep` list would carry a duplicate
 /// entry, harmless there (`Vec::contains`) but not the honest "one row per
@@ -782,7 +779,7 @@ mod tests {
 
 	#[test]
 	fn get_links_to_map_only_for_a_mut_map_receiver() {
-		// L3: `map.nym` declares `get` in its `impl<K,V> mut #{K:V}` block, so
+		// `map.nym` declares `get` in its `impl<K,V> mut #{K:V}` block, so
 		// it links under `"mut_map"` — a DIFFERENT JS implementation than
 		// `list`'s `get`, disambiguated by the receiver tag (a bare-name
 		// lookup would have mislinked one to the other). A non-mut `"map"`
@@ -798,8 +795,7 @@ mod tests {
 
 	#[test]
 	fn an_unlinked_marker_is_none() {
-		// The collection AND string markers are all linked now — retarget to a
-		// genuinely still-unlinked surface (iterator/range) instead.
+		// Iterator/range remains an unlinked surface.
 		assert!(lookup("iter", Some("list")).is_none());
 		assert!(lookup("len", Some("list")).is_none());
 	}

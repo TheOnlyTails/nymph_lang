@@ -13,7 +13,7 @@ export const length = ($_this: NList) => new NUint($_this.v.length);
 export const insert = <T>($_this: NList<T>, i: NUint, element: T) => {
 	nymphArraySplice($_this.v, i.v, 0, element);
 };
-// Gap 3 (L1): the compiler's own emitted `Option` ABI (`emit_enum`,
+// The compiler's emitted `Option` ABI (`emit_enum`,
 // `nymph-codegen`) builds a field variant via `Object.assign(<tag>, fields)`
 // spreading a FIELDS OBJECT (`{ value: X }`) into the result — never a
 // positional argument — because that's the exact shape the checker's

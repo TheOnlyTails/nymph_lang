@@ -12,7 +12,7 @@
 //! ```text
 //! f($1, $0)           => (p0, p1) => f(p1, p0)      -- both $ are direct call args
 //! xs.map($0 + 1)       => xs.map((p0) => p0 + 1)     -- boundary is `$0 + 1` itself
-//! .filter($ % 2 == 0)  => .filter((p0) => p0 % 2 == 0)
+//!.filter($ % 2 == 0)  =>.filter((p0) => p0 % 2 == 0)
 //!   -- KEY CASE: `$ % 2` alone would give `((p0) => p0 % 2) == 0`, a closure
 //!   -- compared to an int — ill-typed — so the boundary EXPANDS outward to
 //!   -- `$ % 2 == 0`, which checks as `(T) -> boolean`.
@@ -23,7 +23,7 @@
 //! mirrors `infer_closure`/`check_closure`'s param-binding shape (minus the
 //! `generics_stack` frame, exactly like a real closure never declares generics
 //! either), and stable runtime lowering projects the same ordinary closure form.
-//! The one new piece of machinery either side needs is a channel from the
+//! Both sides need a channel from the
 //! checker's boundary decision to lowering: committed boundaries
 //! are recorded on [`crate::annotate::Annotations`] (`record_anon_boundary`),
 //! keyed by [`NodeId`] — see that type's doc comment.
@@ -55,11 +55,9 @@
 //! `subtype` mismatch loudly instead of silently.
 //!
 //! Multi-boundary expansion order (which hypothesis to widen when SEVERAL are
-//! simultaneously ill-typed) is a heuristic — smallest-level first — rather
-//! than a precise "which one is actually in a function-rejecting position"
-//! analysis; every case in this slice's test suite has at most one boundary
-//! that ever needs to expand, so this doesn't bite here, but a contrived
-//! multi-boundary program could in principle expand the "wrong" one first.
+//! simultaneously ill-typed) is a smallest-level-first heuristic rather than a
+//! precise analysis of which boundary is in a function-rejecting position. A
+//! multi-boundary program can therefore expand the wrong boundary first.
 
 use ecow::EcoString;
 use nymph_ast::{
@@ -73,7 +71,7 @@ use crate::ty::Ty;
 
 /// The synthesized JS-visible parameter name for anonymous-closure param index
 /// `i`. A leading-`$` identifier is guaranteed collision-free with any
-/// user-written Nymph identifier — the lexer's identifier rule (`ident()`,
+/// user-written Nymph identifier — the lexer's identifier rule (`ident`,
 /// `lexer.rs`) never admits a leading `$` (that's the `AnonymousParam` token
 /// itself) — and `Lowerer::declare`'s Y2 shadow-rename already relies on that
 /// same invariant for its own `name$1`/`name$2` suffixes.

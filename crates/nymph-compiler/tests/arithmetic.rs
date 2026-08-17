@@ -1,4 +1,4 @@
-//! Phase-scoped tests for slice #10a: built-in arithmetic, bitwise, and
+//! Tests that built-in arithmetic, bitwise, and
 //! relational operators unwrap their boxed operands, use the native JS fast
 //! path, and re-box the result in the checker-resolved output type.
 

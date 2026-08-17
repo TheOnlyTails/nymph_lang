@@ -1,13 +1,12 @@
-//! Golden regression corpus: realistic known-good Nymph programs pinned so
-//! future slices cannot silently regress them.
+//! Golden corpus of realistic known-good Nymph programs.
 //!
 //! Two tiers:
 //! - **Compile-clean tier**: each program must compile with zero diagnostics and
-//!   without panicking (a lowering panic here means a slice regressed a feature
-//!   that used to work).
+//!   without panicking (a lowering panic means the compiler rejected a
+//!   supported feature).
 //! - **Run tier**: the emitted JS also executes under `node`, asserting stdout.
 //!
-//! The corpus deliberately stays inside the implemented surface (Slices 0–4H).
+//! The corpus deliberately stays inside the implemented language surface.
 //! Known deferrals it must NOT touch: closures (incl. calling a function
 //! *value*/function-typed parameter — the type-checks but has no HIR lowering
 //! path), range *expressions* in general value position (range patterns and
@@ -18,8 +17,8 @@
 //! static methods, mut methods, positional (unlabeled) variant/struct
 //! construction, zero-field structs, blanket-impl materialization, stdlib
 //! imports, interface-impl method own-generics (4G-b, inexpressible today).
-//! Enum methods/impls (4D) and string literal expressions (4H) are now
-//! IMPLEMENTED — do not re-add them here.
+//! Enum methods/impls (4D) and string literal expressions (4H) are implemented
+//! and do not belong here.
 //!
 //! Sharpest deferral to remember: a bounded-generic *operator* used via
 //! operator SYNTAX (bare `a < b` where `a: T, T: Comparable<Other = T>`)
@@ -310,7 +309,7 @@ fn golden_generic_bound_method_dispatch() {
 
 		// `impl Trait`-parameter sugar: the bound resolves `shape.area()` inside the
 		// body. (Calling `measure_sugar` with a concrete argument is a separate,
-		// currently-broken story — see the finding test at the bottom of this file.)
+		// unsupported behavior covered by a test at the bottom of this file.)
 		func measure_sugar(shape: Area): int = shape.area()
 
 		func total(s: Square, r: Rect): int = measure(s) + measure(r)
@@ -418,7 +417,7 @@ fn golden_operator_overloading_binary() {
 
 #[test]
 fn golden_operator_overloading_unary() {
-	// Unary `-`, `!`, and `~` overloads on user types (Slice 4C-a), alongside
+	// Unary `-`, `!`, and `~` overloads on user types, alongside
 	// native unary on primitives in the same program.
 	compile_ok(
 		r#"
@@ -453,8 +452,7 @@ fn golden_operator_overloading_unary() {
 
 #[test]
 fn golden_operator_compound_assign_on_user_type() {
-	// `+=` on a user type dispatches through the recorded resolution (the 4B
-	// closeout's critical fix) — pinned here at the whole-program level.
+	// `+=` on a user type must dispatch through the recorded resolution.
 	compile_ok(
 		r#"
 		interface MyPlus<Other, Output> { func plus(other: Other): Output }
@@ -479,7 +477,7 @@ fn golden_operator_compound_assign_on_user_type() {
 
 #[test]
 fn golden_interface_default_methods() {
-	// Interface default-method materialization (Slice 4C-b): dispatch through
+	// Interface default-method materialization: dispatch through
 	// the `<` operator, an explicit call to a default, and an override winning.
 	compile_ok(
 		r#"
@@ -898,7 +896,7 @@ fn golden_enum_payload_struct_roundtrip() {
 
 #[test]
 fn golden_enum_inherent_methods_read_payload_via_match_this() {
-	// Enum methods (Slice 4D): `this.field` is rejected on enum receivers, so
+	// `this.field` is rejected on enum receivers, so
 	// an inherent method reads its payload by matching `this` itself.
 	compile_ok(
 		r#"
@@ -916,7 +914,7 @@ fn golden_enum_inherent_methods_read_payload_via_match_this() {
 
 #[test]
 fn golden_enum_operator_impl() {
-	// A binary operator impl on an enum (Slice 4D + 4B), matching `this` and
+	// A binary operator impl on an enum, matching `this` and
 	// `other` to build a new variant. Also exercises the `field = name` pattern
 	// alias, needed here because the inner match would otherwise re-bind the
 	// same field name at both levels.
@@ -988,7 +986,7 @@ fn golden_bounded_generic_comparable_via_bound_explicit_call() {
 	// `less_than`: with the stdlib operator prelude on by default, a method
 	// named `less_than` would resolve through the prelude's own blanket
 	// `Comparable` impl (a genuine resolution-precedence surprise reported
-	// separately, not patched around here — KK5) instead of this test's own
+	// separately, not patched around here) instead of this test's own
 	// user-declared bound.
 	compile_ok(
 		r#"
@@ -1004,7 +1002,7 @@ fn golden_bounded_generic_comparable_via_bound_explicit_call() {
 	);
 }
 
-// KNOWN BUG (reported, not fixed here — needs its own designed slice): when a
+// Known limitation: when a
 // user's generic bound declares a method whose NAME collides with a method a
 // stdlib blanket impl provides (e.g. a bound `MyComparable` with `less_than`,
 // colliding with the prelude's blanket `Comparable`), `resolve_method` on a
@@ -1012,12 +1010,10 @@ fn golden_bounded_generic_comparable_via_bound_explicit_call() {
 // the parameter's own declared bound (`head_of` returns `None` for a bare
 // `Param`, so phase 1's candidate search only ever finds blanket buckets).
 // The sibling test above sidesteps it by renaming the method to
-// `lighter_than`. A naive fix — reordering `resolve_param_method` ahead of
-// phase 1 — was tried and REVERTED: it breaks explicit method calls through a
-// truly-unconstrained blanket impl (`func same<T>(a: T, b: T) = a.equals(b)`
-// via the prelude's blanket `Equals` stops resolving), which is the exact
-// shape the default prelude must keep working. The real fix needs designed
-// precedence rules between declared bounds and blanket impls.
+// `lighter_than`. Reordering `resolve_param_method` ahead of phase 1 breaks
+// explicit method calls through a truly unconstrained blanket impl, such as
+// `func same<T>(a: T, b: T) = a.equals(b)` via the prelude's blanket `Equals`.
+// Resolution needs precedence rules that preserve both shapes.
 
 #[test]
 fn golden_late_pinned_comparison_via_param_annotation() {
@@ -1912,13 +1908,13 @@ fn golden_run_combo_enum_default_method_for_loop_string_builder() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Findings: programs that SHOULD work but don't (kept, ignored, reported)
+// Programs that should work but do not
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[test]
 fn golden_return_statement_lowers() {
 	// (`0 - n` rather than a line-leading `-n`, which would continue the previous
-	// expression as a binary minus — the parse gotcha, not the finding.)
+	// expression as a binary minus — this test avoids that parse ambiguity.)
 	compile_ok(
 		r#"
 		func abs(n: int): int = {
@@ -1952,10 +1948,9 @@ fn golden_finding_top_level_let_is_silently_dropped() {
 
 #[test]
 fn golden_finding_impl_trait_param_rejects_concrete_argument() {
-	// FINDING (fixed by Slice 4F): calling a function whose param uses `impl
-	// Trait` sugar (`shape: Area`) with a concrete impl'ing type used to be
-	// rejected — `mismatched types: expected `T268435456`, found `Square`` (the
-	// synthetic bound param never instantiated at call sites); declaring/using
+	// Calling a function whose parameter uses `impl
+	// Trait` sugar (`shape: Area`) with a concrete implementing type requires the
+	// synthetic bound parameter to instantiate at call sites; declaring/using
 	// it inside the body always worked fine.
 	let src = r#"
 		interface Area { func area(): int }

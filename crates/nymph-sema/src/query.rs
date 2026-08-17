@@ -46,7 +46,7 @@ use crate::{
 
 /// Checker-owned member candidates for the member access being edited at
 /// `offset`. The accepted interval is half-open and starts immediately after
-/// the receiver; malformed/unresolved accesses safely return an empty slice.
+/// the receiver; malformed or unresolved accesses safely return an empty list.
 #[must_use]
 pub fn member_completions_at(
 	analysis: &crate::SemanticAnalysis,
@@ -300,7 +300,7 @@ pub fn type_at(module: &Module, checked: &Checked, offset: usize) -> Option<Stri
 		let defs = &checked.semantic.definitions;
 		let params = generic_scope_at(module, offset);
 
-		// A call-site callee (`helper` in `helper()`): if it resolves to a
+		// A call-site callee (`helper` in `helper`): if it resolves to a
 		// top-level `func`/`external func` declaration and isn't shadowed by
 		// a local/param binder of the same name, show its full named
 		// signature instead of the unnamed `Fn` type — see
@@ -324,11 +324,11 @@ pub fn type_at(module: &Module, checked: &Checked, offset: usize) -> Option<Stri
 	fallback_type_at(module, checked, offset)
 }
 
-/// BUG 1 fix: variant-construction/reference hover. Walks every `Expr` in
+/// Variant-construction/reference hover. Walks every `Expr` in
 /// `module` (mirroring [`type_at`]'s own walk) collecting a candidate at the
 /// TIGHTEST name span the checker attached a [`VariantResolution`] to:
 ///
-///   - `ExprKind::Call { func, .. }` whose CALL node (`e.id`, not `func`'s —
+///   - `ExprKind::Call { func,.. }` whose CALL node (`e.id`, not `func`'s —
 ///     see `infer_variant_ctor`'s `self.annotations.record_variant(id, res)`,
 ///     called with the call expr's own id) resolved to a variant: the name
 ///     span is the callee's own name (`func.span` for a bare `Ok(..)`
@@ -384,7 +384,7 @@ fn variant_hover_at(module: &Module, checked: &Checked, offset: usize) -> Option
 }
 
 /// Render a resolved `(enum, variant)` name pair as `EnumName.Variant(f: T,
-/// ...)`, identical in shape to [`push_variant_decl_candidate`] (the
+///...)`, identical in shape to [`push_variant_decl_candidate`] (the
 /// pattern-hover sibling of this function). `None` — never a guess — when
 /// the resolution's names don't line up with a live declaration.
 fn render_variant_from_resolution(
@@ -713,8 +713,8 @@ pub fn keyword_doc_at(text: &str, offset: usize) -> Option<&'static str> {
 // mirrors each body-checking scope built in `members.rs`/`infer_expr.rs`:
 // owner (struct/enum/interface/impl) generics first, then — only for a
 // struct/enum's own direct members and a top-level inherent `impl` — that
-// member's own generics appended after. A nested `impl Iface { .. }` (either
-// inside a struct/enum body or as a top-level `impl .. for ..`) does NOT
+// member's own generics appended after. A nested `impl Iface {.. }` (either
+// inside a struct/enum body or as a top-level `impl.. for..`) does NOT
 // extend the scope with the method's own generics (see `members.rs`'s
 // `check_inner_impl_bodies`/`check_impl_for_bodies`, which never thread
 // `meta.generics` into the pushed param scope there) — so this recovery
@@ -847,8 +847,8 @@ fn decl_generic_scope(decl: &Declaration, offset: usize) -> Option<Vec<EcoString
 /// A direct `struct`/`enum`/`impl` member's generic scope. `include_own`
 /// selects whether the member's own generics extend `owner` (true for a
 /// struct/enum's direct members and a top-level inherent `impl` — see
-/// `members.rs`'s `check_method_body`; false for a top-level `impl .. for
-/// ..`'s members — see `check_interface_impl_members`, which never threads
+/// `members.rs`'s `check_method_body`; false for a top-level `impl.. for
+///..`'s members — see `check_interface_impl_members`, which never threads
 /// `meta.generics` into its pushed scope).
 fn impl_member_scope(
 	member: &ImplMember,
@@ -872,7 +872,7 @@ fn impl_member_scope(
 	}
 }
 
-/// A nested `impl Iface { .. }` block inside a struct/enum body: the scope
+/// A nested `impl Iface {.. }` block inside a struct/enum body: the scope
 /// is the owner's generics plus the impl block's own (never the member's
 /// own generics — see `members.rs`'s `check_inner_impl_bodies`).
 fn struct_impl_scope(
@@ -891,7 +891,7 @@ fn struct_impl_scope(
 
 /// An interface member's generic scope: a default-bodied method extends
 /// `owner` (the interface's own generics) with its own generics (see
-/// `members.rs`'s `check_interface_default_body`); a nested `impl .. { .. }`
+/// `members.rs`'s `check_interface_default_body`); a nested `impl.. {.. }`
 /// (a super-interface default impl) extends `owner` with the impl block's
 /// own generics only, mirroring [`struct_impl_scope`].
 fn interface_member_scope(
@@ -1575,7 +1575,7 @@ pub fn scope_names_at(module: &Module, offset: usize) -> Vec<String> {
 
 /// The same exact-offset scope query as [`scope_names_at`], preserving whether
 /// an expression scope applies. `None` means there is no scope at `offset`;
-/// `Some(Vec::new())` means a scope applies but has no local or parameter names.
+/// `Some(Vec::new)` means a scope applies but has no local or parameter names.
 ///
 /// This distinction lets cursor-oriented clients decide when a fallback query
 /// is appropriate without changing [`scope_names_at`]'s established API.
@@ -1913,13 +1913,13 @@ fn walk_expr<'a>(
 	}
 }
 
-// ── `this.method()` go-to-definition (BUG 2a) ──────────────────────────────
+// ── `this.method` go-to-definition ──────────────────────────────────────
 //
 // `definition_at`'s identifier walk never targets a `MemberAccess`'s own
-// `member` — go-to-def on `this.method()` therefore falls through to here.
+// `member` — go-to-def on `this.method` therefore falls through to here.
 // Resolved PURELY SYNTACTICALLY (no `Checked`, no solver): each top-level
 // declaration syntactically pins what `this` means inside it (a struct/enum
-// IS its own Self type; a top-level `impl`/`impl .. for ..`'s `this` is its
+// IS its own Self type; a top-level `impl`/`impl.. for..`'s `this` is its
 // own `type_` header), so the method name under the cursor plus that Self
 // type name is enough to search the whole module for a uniquely-named
 // method and jump there. `Interface`/`Namespace`/anything else has no fixed
@@ -1951,7 +1951,7 @@ fn type_ref_name(ty: &Type) -> Option<EcoString> {
 
 /// Find the `func` member named `method_name` declared on Self type
 /// `self_name`, searching the WHOLE module (not just one declaration) —
-/// `self_name` may be implemented via a top-level `impl`/`impl .. for ..`
+/// `self_name` may be implemented via a top-level `impl`/`impl.. for..`
 /// elsewhere in the module, not only the struct/enum's own inline members.
 /// Returns `None` — never a wrong jump — unless exactly one such method
 /// exists; a field of the same name, or an ambiguous multiply-declared
@@ -2432,7 +2432,7 @@ fn render_visibility_prefix(visibility: Option<Visibility>) -> &'static str {
 /// A single declared generic parameter, with its bound if any: `T` or `T:
 /// Area + Into<string>`. Used both inside a `<...>` header
 /// ([`render_generics`]) and as its own fallback candidate at the param's
-/// declaration span (a generic-param hover) — see the module-level plan for
+/// declaration span (a generic-param hover) — see the rationale for
 /// why bounds live here rather than in [`generic_scope_at`]'s semantic
 /// `Param(idx)` recovery.
 fn render_generic_param(param: &GenericParam) -> String {
@@ -2502,7 +2502,7 @@ fn render_param_pattern(pattern: &Pattern) -> Option<String> {
 /// A `func`'s full named signature, rendered from its declared (unchecked)
 /// `FuncDeclaration` meta: `[mut ]func name<G..>(p1: T1, p2: T2): Ret` — used
 /// for both a declaration-site func name hover and a call-site callee hover
-/// (F6). An untyped/inferred parameter or a missing return type falls back
+///. An untyped/inferred parameter or a missing return type falls back
 /// to `_`/`void` respectively rather than failing the whole signature.
 /// The inferred return type of an unannotated func, for
 /// [`render_named_signature`]'s `inferred_ret` argument. `body.id` is
@@ -2681,7 +2681,7 @@ fn render_struct_field(field: &StructField) -> String {
 }
 
 /// A `struct` declaration's full structure: `[public ]struct Name<G..>(f1:
-/// T1, f2: T2, ...)`. A struct with no fields omits the parens entirely
+/// T1, f2: T2,...)`. A struct with no fields omits the parens entirely
 /// (`struct Marker`), matching the surface grammar (`parse_struct` only
 /// parses a field list when a `(` follows the generics). Field-level
 /// visibility and defaults are intentionally omitted — see the module's
@@ -2706,7 +2706,7 @@ fn render_struct_decl(
 }
 
 /// A single enum variant's own shape: a fieldless variant renders bare
-/// (`V2`), a field-bearing one as `V1(f1: T1, ...)`.
+/// (`V2`), a field-bearing one as `V1(f1: T1,...)`.
 fn render_enum_variant(variant: &EnumVariant) -> String {
 	if variant.fields.is_empty() {
 		return variant.name.0.to_string();
@@ -2719,7 +2719,7 @@ fn render_enum_variant(variant: &EnumVariant) -> String {
 	format!("{}({})", variant.name.0, field_strs.join(", "))
 }
 
-/// An enum's full structure: `enum Name<G..> { V1(f: T), V2, ... }`.
+/// An enum's full structure: `enum Name<G..> { V1(f: T), V2,... }`.
 fn render_enum_decl(
 	visibility: Option<Visibility>,
 	name: &Ident,
@@ -2740,7 +2740,7 @@ fn render_enum_decl(
 }
 
 /// An enum-variant *declaration name*'s own hover: `EnumName.Variant(f:
-/// T, ...)` — its own shape, qualified by the enum it belongs to (upgraded
+/// T,...)` — its own shape, qualified by the enum it belongs to (upgraded
 /// from just the owning enum's bare name).
 fn render_variant_decl(enum_name: &Ident, variant: &EnumVariant) -> String {
 	format!("{}.{}", enum_name.0, render_enum_variant(variant))
@@ -2798,7 +2798,7 @@ fn render_interface_decl(
 }
 
 /// Record a fallback candidate at every `Spanned<Type>` node reachable from
-/// `ty` (F7 type-position names) — not just `Type::Reference`s like
+/// `ty` (type-position names) — not just `Type::Reference`s like
 /// [`collect_type_refs`], since a primitive (`int`) or structural
 /// (`#[int]`/`(int) -> int`) type position must hover too. Recording every
 /// nested node (not just the outermost) lets `fallback_type_at`'s
@@ -3062,7 +3062,7 @@ fn semantic_generic_renderings(
 }
 
 /// Bind every name a *syntactic* `Type` node's matching pattern introduces to
-/// its own precise type (F5/F7's destructuring case), walking `pattern` and
+/// its own precise type in destructuring cases, walking `pattern` and
 /// `ty` in lock-step. A structural mismatch — arity, a `Rest` entry against a
 /// fixed tuple, a type that isn't compound the way the pattern is, or an
 /// unresolvable struct/variant name — binds nothing for that subtree rather
@@ -3181,8 +3181,8 @@ fn bind_pattern_syntactic(
 	}
 }
 
-/// Bind every name a pattern introduces to its own precise type (F4's
-/// destructuring case), walking `pattern` and a *semantic* `Ty` in
+/// Bind every name a pattern introduces to its own precise type in a
+/// destructuring case, walking `pattern` and a *semantic* `Ty` in
 /// lock-step — the same [`render`] the primary path uses for a plain
 /// binding, applied at each structural position instead of once for the
 /// whole pattern. Local constructors retain their source [`Type`] nodes;
@@ -3299,12 +3299,12 @@ fn bind_pattern_semantic(
 // ── Match/for pattern hovers: variant names and binder types ───────────────
 //
 // A `Pattern` carries no `NodeId` (see the module doc comment), so hovering
-// an enum-variant name in a match arm (`Circle` in `Circle(radius) -> ...`)
+// an enum-variant name in a match arm (`Circle` in `Circle(radius) ->...`)
 // or a field/element binder inside that pattern (`radius`) is invisible to
 // both the primary `type_at` path (which only walks annotated `Expr`s) and
-// [`fallback_type_at`]'s existing walk (which — until now — never descended
+// [`fallback_type_at`]'s walk (which does not descend
 // into `arm.pattern`/a `for` loop's own `variable` pattern at all). These two
-// entry points close that gap from [`collect_fallback_exprs`]'s `Match`/`For`
+// entry points close that [`collect_fallback_exprs`]'s `Match`/`For`
 // arms, reusing [`bind_pattern_semantic`] for binder types and a small
 // parallel walk ([`push_pattern_variant_candidates`]) for variant-name decls
 // — both read-only against already-recorded checker data (the scrutinee/
@@ -3312,7 +3312,7 @@ fn bind_pattern_semantic(
 // [`crate::annotate::Annotations::pattern_variant_of`]).
 
 /// A single pattern's resolved variant-name candidate: `EnumName.Variant(f:
-/// T, ...)`, keyed at the tight span of just the variant's own name (never
+/// T,...)`, keyed at the tight span of just the variant's own name (never
 /// the whole pattern, which would also cover its field binders) — reuses the
 /// same [`render_enum_variant`] the rich-hover enum-decl renderer uses,
 /// qualified by the enum name exactly like [`render_variant_decl`] (built
@@ -3450,8 +3450,8 @@ fn push_for_binder_candidates(
 	}
 }
 
-/// A `let` binder's fallback candidate (F4): every name the pattern
-/// introduces renders as its own structural slice of the initializer's
+/// A `let` binder's fallback candidate: every name the pattern
+/// introduces renders as its own structural representation of the initializer's
 /// annotated (semantic) type — see [`bind_pattern_semantic`] — so it stays
 /// consistent with how a later use of the same name would hover. Silently
 /// records nothing when the initializer itself has no usable annotation
@@ -3478,9 +3478,9 @@ fn push_let_binder(
 	bind_pattern_semantic(name, info.ty, checked, module, defs, params, out);
 }
 
-/// A parameter list's fallback candidates (F5 + F7): each param's own
-/// `Type` node (F7), plus every name its pattern introduces rendered as its
-/// own structural slice of that declared type (F5) — see
+/// A parameter list's fallback candidates: each param's own
+/// `Type` node, plus every name its pattern introduces rendered as its
+/// own structural representation of that declared type — see
 /// [`bind_pattern_syntactic`]. An untyped param (a closure param with no
 /// annotation) simply contributes nothing here — handled by the caller.
 fn push_func_param_types(
@@ -3741,12 +3741,12 @@ fn collect_fallback_interface_member(
 
 /// Mirrors [`collect_expr`]'s recursion (every `Expr` reachable, in the same
 /// shape), but additionally records three fallback-only positions along the
-/// way: a `Block`'s own nested `let` binders (F4), a `Closure` param's
-/// declared type (F5/F7), and a construction callee — a bare `Identifier` in
+/// way: a `Block`'s own nested `let` binders, a `Closure` param's
+/// declared type, and a construction callee — a bare `Identifier` in
 /// call position that the checker left unannotated (e.g. `Point` in
 /// `Point(x = 0)`, as opposed to a real function call's callee, which the
 /// checker always annotates with its `Fn` type and so already resolves via
-/// the primary path) — resolved by name through `defs` (F7).
+/// the primary path) — resolved by name through `defs`.
 fn collect_fallback_exprs(
 	expr: &Expr,
 	checked: &Checked,
@@ -3765,7 +3765,7 @@ fn collect_fallback_exprs(
 				// a bare enum-variant name (e.g. `Circle` in `Circle(radius =
 				// 1)`) isn't in `defs.by_name` at all (see `DefMap`'s own
 				// doc comment) and needs the same `resolve_variant` fallback
-				// `definition_at` already uses for go-to-definition (F7).
+				// `definition_at` already uses for go-to-definition.
 				if let Some(id) = defs.get(name.0.as_str()) {
 					out.push((func.span, defs.data(id).name.to_string()));
 				} else if let Some(Ok((enum_def, _variant))) = defs.resolve_variant(name.0.as_str()) {
@@ -4038,7 +4038,7 @@ fn collect_expr_scope_names<'a>(
 						}
 					}
 				} else {
-					// `offset` sits in the gap before this not-yet-reached
+					// `offset` sits in this not-yet-reached
 					// statement: everything earlier has already applied.
 					out.names.clear();
 					out
@@ -4268,7 +4268,7 @@ mod definition_and_scope_tests {
 		);
 	}
 
-	// ── BUG 2a: `this.method()` go-to-definition ────────────────────────────
+	// ── `this.method` go-to-definition ────────────────────────────────────
 
 	#[test]
 	fn definition_jumps_a_this_method_call_to_its_method_decl() {
@@ -4377,7 +4377,7 @@ mod type_at_tests {
 		nymph_syntax::parse_module(text, "t.nym").tree
 	}
 
-	// ── BUG 1: containers must not leak the enclosing type ─────────────────
+	// ── Containers must not leak the enclosing type ────────────────────────
 
 	#[test]
 	fn hovering_a_var_use_returns_its_type() {
@@ -4444,9 +4444,8 @@ mod type_at_tests {
 	#[test]
 	fn hovering_a_block_brace_returns_none_not_the_blocks_value_type() {
 		// A value-position `Block` IS annotated with its trailing expression's
-		// type — the exact leak BUG 1 describes: hovering the opening `{`
-		// (covered only by the `Block`, not by the `1` inside it) used to
-		// surface that value type instead of nothing.
+		// type. Hovering the opening `{` (covered only by the `Block`, not by
+		// the `1` inside it) must not surface that value type.
 		let text = "func main(): int = {\n  1\n}";
 		let module = module_of(text);
 		let checked = check_module(&module);
@@ -4457,7 +4456,7 @@ mod type_at_tests {
 
 	#[test]
 	fn hovering_a_call_paren_returns_none_not_the_calls_return_type() {
-		// `Call` is now a suppressed container (F1/F11): the callee and each
+		// `Call` is a suppressed container: the callee and each
 		// real argument are smaller child exprs and still resolve, but the
 		// parens themselves (covered only by the `Call` span) must not leak
 		// the call's return type.
@@ -4473,7 +4472,7 @@ mod type_at_tests {
 
 	#[test]
 	fn hovering_the_calls_callee_still_resolves_its_function_type() {
-		// Upgraded: a call-site callee now shows the full NAMED signature
+		// A call-site callee shows the full named signature
 		// (`func helper(): int`), not just the unnamed `() -> int` `Fn` type
 		// — see `render_named_signature`.
 		let text = "func helper(): int = 1\nfunc main(): int = helper()";
@@ -4504,7 +4503,7 @@ mod type_at_tests {
 		);
 	}
 
-	// ── BUG 2: generic params render with their source name, not `T{idx}` ──
+	// ── Generic params render with their source name, not `T{idx}` ─────────
 
 	#[test]
 	fn hovering_a_generic_func_param_shows_its_source_name() {
@@ -4576,7 +4575,7 @@ mod type_at_tests {
 		assert_eq!(type_at(&module, &checked, offset), Some("int".to_string()));
 	}
 
-	// ── F1/F11: Call/operator/collection suppression ────────────────────────
+	// ── Call/operator/collection suppression ────────────────────────
 
 	#[test]
 	fn hovering_a_labeled_call_args_name_returns_none_not_the_constructed_type() {
@@ -4630,7 +4629,7 @@ mod type_at_tests {
 		assert_eq!(type_at(&module, &checked, offset), None);
 	}
 
-	// ── F3: an Error-typed node must never render "<error>" ─────────────────
+	// ── an Error-typed node must never render "<error>" ─────────────────
 
 	#[test]
 	fn hovering_an_unresolvable_identifier_returns_none_not_error() {
@@ -4642,7 +4641,7 @@ mod type_at_tests {
 		assert_eq!(type_at(&module, &checked, offset), None);
 	}
 
-	// ── F4: a `let` binder hovers as its initializer's type ─────────────────
+	// ── a `let` binder hovers as its initializer's type ─────────────────
 
 	#[test]
 	fn hovering_a_let_binder_name_returns_its_initializers_type() {
@@ -4654,7 +4653,7 @@ mod type_at_tests {
 		assert_eq!(type_at(&module, &checked, offset), Some("int".to_string()));
 	}
 
-	// ── F5: a param name hovers as its declared type ────────────────────────
+	// ── a param name hovers as its declared type ────────────────────────
 
 	#[test]
 	fn hovering_a_param_name_returns_its_declared_type() {
@@ -4666,7 +4665,7 @@ mod type_at_tests {
 		assert_eq!(type_at(&module, &checked, offset), Some("int".to_string()));
 	}
 
-	// ── F7: a type-position name renders the type it names ──────────────────
+	// ── a type-position name renders the type it names ──────────────────
 
 	#[test]
 	fn hovering_a_primitive_return_type_annotation_renders_it() {
@@ -4701,7 +4700,7 @@ mod type_at_tests {
 		);
 	}
 
-	// ── F6: declaration-site names hover as a sensible type/signature ───────
+	// ── declaration-site names hover as a sensible type/signature ───────
 	// (upgraded to a full RICH structural rendering — see the module's
 	// decl-renderer helpers beside `render_type_node`.)
 
@@ -4862,12 +4861,12 @@ mod type_at_tests {
 		assert_eq!(type_at(&module, &checked, offset), None);
 	}
 
-	// ── F7: a bare enum-variant constructor use-site resolves like a struct's ──
+	// ── a bare enum-variant constructor use-site resolves like a struct's ──
 
 	#[test]
 	fn hovering_an_enum_variant_ctor_use_site_renders_the_variant_not_the_enum() {
-		// BUG 1: a bare enum-variant name in call position (`Circle` in
-		// `Circle(radius = 1)`) now shows the VARIANT's own declaration —
+		// A bare enum-variant name in call position (`Circle` in
+		// `Circle(radius = 1)`) shows the VARIANT's own declaration:
 		// `variant_hover_at` intercepts before the primary path would render
 		// the callee identifier's plain-enum type (`Shape`).
 		let text = "enum Shape { Circle(radius: int) }\nfunc origin(): Shape = Circle(radius = 1)";
@@ -4894,7 +4893,7 @@ mod type_at_tests {
 		);
 	}
 
-	// ── F1 (critical): a destructuring binder hovers as its OWN element ────
+	// ── (critical): a destructuring binder hovers as its OWN element ────
 	// ── type, not the whole pattern's type ──────────────────────────────────
 
 	#[test]
@@ -5084,7 +5083,7 @@ mod type_at_tests {
 	#[test]
 	fn hovering_an_unannotated_funcs_name_shows_its_inferred_return_type() {
 		// No `: T` annotation on `f` — the return type must still show as the
-		// body's inferred `boolean`, not the old `void` default.
+		// body's inferred `boolean`, not the `void` fallback.
 		let text = "func f() = true";
 		let module = module_of(text);
 		let checked = check_module(&module);
@@ -5176,8 +5175,8 @@ mod type_at_tests {
 		// match expression's OWN node id (only each arm's body) — unlike an
 		// impl method, a plain top-level func gets no `generalize_returns`
 		// trial pass to fall back on, so `inferred_return`'s direct
-		// `checked.annotations.get(body.id)` lookup used to miss entirely and
-		// silently regress to `void`.
+		// `checked.annotations.get(body.id)` lookup misses entirely and falls
+		// back to `void`.
 		let text = "enum Result<T, E> { Ok(value: T), Error(err: E) }\nfunc classify(r: Result<int, string>) = match (r) { Ok(v) -> true, Error(e) -> false }";
 		let module = module_of(text);
 		let checked = check_module(&module);
@@ -5192,7 +5191,7 @@ mod type_at_tests {
 	#[test]
 	fn hovering_an_unannotated_top_level_funcs_name_with_a_block_body_shows_its_inferred_return_type()
 	{
-		// Same gap as the match-body case above, for `check_dispatch`'s
+		// Same as the match-body case above, for `check_dispatch`'s
 		// `Block` arm.
 		let text = "func classify2() { true }";
 		let module = module_of(text);
@@ -5225,7 +5224,7 @@ mod type_at_tests {
 		);
 	}
 
-	// ── BUG 1: variant-construction/reference hover shows the VARIANT ───────
+	// ── Variant-construction/reference hover shows the VARIANT ─────────────
 
 	#[test]
 	fn hovering_a_labeled_variant_construction_shows_the_variant_not_the_enum() {
@@ -5279,7 +5278,7 @@ mod type_at_tests {
 		assert_eq!(type_at(&module, &checked, offset), Some("int".to_string()));
 	}
 
-	// ── BUG 3: `namespace func` hover keeps the `namespace` keyword ─────────
+	// ── `namespace func` hover keeps the `namespace` keyword ───────────────
 
 	#[test]
 	fn hovering_a_namespace_funcs_name_shows_the_namespace_keyword() {

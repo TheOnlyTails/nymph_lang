@@ -1,6 +1,6 @@
 //! Item-level name resolution and the lowered signatures of top-level definitions.
 //!
-//! [`build_def_map`] is the *separate* resolution pass the old checker lacked: a
+//! [`build_def_map`] is a separate resolution pass: a
 //! single walk over a module that assigns every top-level definition (and every enum
 //! variant) a [`DefId`] and records where it came from. Type checking consumes the
 //! resulting [`DefMap`] and never re-resolves top-level names inline.
@@ -43,8 +43,7 @@ pub struct DefData {
 	/// project symbols. Semantic identity and lookup always use
 	/// [`Self::name`] and [`Self::stable`].
 	pub diagnostic_display_name: Option<EcoString>,
-	/// The defining occurrence's span. Reserved for go-to-definition (LSP) and
-	/// richer diagnostics; not read by Milestone-A checking itself.
+	/// The defining occurrence's span, retained for go-to-definition and richer diagnostics.
 	#[allow(dead_code)]
 	pub span: Span,
 	pub kind: DefKind,
@@ -379,9 +378,9 @@ pub struct StructSig {
 	pub generics: Generics,
 	pub fields: Vec<(EcoString, Ty)>,
 	pub field_metadata: Vec<FieldSigMetadata>,
-	/// The interface bounds declared on this struct's own generics (Slice 4G-b),
+	/// The interface bounds declared on this struct's own generics,
 	/// e.g. `struct Range<Idx: Comparable<Idx>>` — one [`crate::iface::Bound`] per
-	/// bound, with `ty = Param(i)` in this signature's own `0..generics.len()` index
+	/// bound, with `ty = Param(i)` in this signature's own `0..generics.len` index
 	/// space (the same space `instantiate_struct` mints into), so a
 	/// construction site can substitute them exactly like `fields`.
 	pub bounds: Vec<crate::iface::Bound>,
@@ -391,7 +390,7 @@ pub struct StructSig {
 pub struct EnumSig {
 	pub generics: Generics,
 	pub variants: Vec<VariantSig>,
-	/// The interface bounds declared on this enum's own generics (Slice 4G-b), same
+	/// The interface bounds declared on this enum's own generics, in the same
 	/// index space as [`StructSig::bounds`] (matching `instantiate_enum`).
 	pub bounds: Vec<crate::iface::Bound>,
 }
@@ -425,11 +424,11 @@ pub struct OwnedMemberSig {
 
 #[derive(Debug, Clone)]
 pub struct FuncParamSig {
-	/// The parameter's binding name, used for named-argument calls (Milestone B).
+	/// The parameter's binding name, used for named arguments.
 	#[allow(dead_code)]
 	pub label: Option<EcoString>,
 	pub ty: Ty,
-	/// A `...rest` spread parameter (Milestone B).
+	/// Whether this is a `...rest` spread parameter.
 	#[allow(dead_code)]
 	pub spread: bool,
 }
@@ -439,13 +438,12 @@ pub struct FuncSig {
 	pub generics: Generics,
 	pub params: Vec<FuncParamSig>,
 	pub ret: Ty,
-	/// Whether the function has a `this` receiver (an inherent method). Always
-	/// `false` in Milestone A, which has no method definitions.
+	/// Whether the function has a `this` receiver.
 	#[allow(dead_code)]
 	pub has_self: bool,
-	/// The interface bounds declared on this function's own generics (Slice 4G),
+	/// The interface bounds declared on this function's own generics,
 	/// e.g. `T: Area` or `T: Comparable<Other = T>` — one [`crate::iface::Bound`]
-	/// per bound, with `ty = Param(i)` in this signature's own `0..generics.len()`
+	/// per bound, with `ty = Param(i)` in this signature's own `0..generics.len`
 	/// index space (the same space the scheme instantiator mints into), so a call site can
 	/// substitute them exactly like `params`/`ret`. Read by `fn_type_of` to defer a
 	/// call-site obligation per bound per instantiation.

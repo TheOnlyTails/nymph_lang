@@ -118,8 +118,8 @@ fn later_definition_does_not_shadow_a_top_level_main() {
 	// the name collision) -- but entry-main resolution must not be affected
 	// by that: it walks `module.members` directly rather than consulting
 	// `defs.by_name`, so the top-level `func main` is still found and
-	// validated. A regression that resolved entry-main through
-	// `defs.by_name` instead would resolve "main" to the struct (the def map's
+	// validated. Resolving entry-main through `defs.by_name` would resolve
+	// "main" to the struct (the def map's
 	// winner) and incorrectly report "no `main` function found" here.
 	let errors = check_entry("func main(): void = {}\nstruct main(x: int)");
 	assert!(

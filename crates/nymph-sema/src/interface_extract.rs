@@ -1600,13 +1600,14 @@ pub(crate) fn assign_runtime_body_identities(
 				));
 			}
 			if let Some(source_members) = adt_member_generics.get(index) {
+				let name_counts = source_members
+					.iter()
+					.fold(HashMap::new(), |mut counts, (name, _)| {
+						*counts.entry(name.clone()).or_insert(0) += 1;
+						counts
+					});
 				for (name, generics) in source_members {
-					if source_members
-						.iter()
-						.filter(|(candidate, _)| candidate == name)
-						.count()
-						!= 1
-					{
+					if name_counts[name] != 1 {
 						continue;
 					}
 					let Some(member) = implementation
@@ -1720,14 +1721,13 @@ pub(crate) fn assign_runtime_body_identities(
 			continue;
 		};
 		source_identities.implementations.insert(path, id.clone());
+		let name_counts = members.iter().fold(HashMap::new(), |mut counts, member| {
+			*counts.entry(impl_member_name(&member.0)).or_insert(0) += 1;
+			counts
+		});
 		for (index, member) in members.iter().enumerate() {
 			let name = impl_member_name(&member.0);
-			if members
-				.iter()
-				.filter(|candidate| impl_member_name(&candidate.0) == name)
-				.count()
-				!= 1
-			{
+			if name_counts[&name] != 1 {
 				continue;
 			}
 			let member_id = DefinitionId::new(
@@ -2404,8 +2404,8 @@ fn extract_definition(
 		}
 	};
 	result.declaration_kind = declaration_member_kind(declaration);
-	// External ABI metadata is intentionally sourced from checked linkage in later
-	// lowering slices; stable ownership is already represented here.
+	// External ABI metadata comes from checked linkage during lowering; stable
+	// ownership is already represented here.
 	result.binders.reserve(0);
 	Ok(Some(result))
 }
