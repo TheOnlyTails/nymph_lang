@@ -149,5 +149,5 @@ metadata. It must not remove ordinary `Debug` runtime support when actual `.debu
 The destination must replace `language-identity.md`'s statement that only source-visible fields are
 rendered. Echo is source-located but deliberately renders complete ordinary structure. Explicit
 `Debug` controls `.debug()` only, not echo. No new decision ticket is required: parser/HIR rollout,
-manifest/profile plumbing, runtime observation, diagnostics, formatter/LSP, docs, and migration tests
+manifest/profile plumbing, runtime observation, diagnostics, formatter/LSP, docs, and feature tests
 belong in the map's eventual dependency-ordered execution decomposition.

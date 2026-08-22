@@ -1,7 +1,0 @@
-interface LegacyIterator<T> {
-	mut func next(): Option<T>
-}
-
-func consume(mut iterator: LegacyIterator<int>): void = {
-	while iterator.next().is_some() {}
-}

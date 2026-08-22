@@ -20,28 +20,6 @@
       "digest": "5ae43585c73c2296eff7d0788e9b9eeb57d2312913103c2b5fa4d156d8e77c23"
     },
     {
-      "category": "frozen-legacy-source",
-      "rules": [
-        "source-assignment",
-        "source-compound-assignment",
-        "source-mut",
-        "source-option-iterator",
-        "source-while"
-      ],
-      "paths": [
-        "crates/nymph-compiler/testdata/legacy-migration/manual/control-flow-assignment.nym.txt",
-        "crates/nymph-compiler/testdata/legacy-migration/manual/mutating-iterator.nym.txt",
-        "crates/nymph-compiler/testdata/legacy-migration/manual/observable-mutation.nym.txt",
-        "crates/nymph-compiler/testdata/legacy-migration/manual/resource-cleanup.nym.txt",
-        "crates/nymph-compiler/testdata/legacy-migration/manual/struct-visibility-defaults.nym.txt",
-        "crates/nymph-compiler/testdata/legacy-migration/safe/compound-local-reassignment.input.nym.txt",
-        "crates/nymph-compiler/testdata/legacy-migration/safe/simple-local-reassignment.input.nym.txt",
-        "crates/nymph-compiler/testdata/legacy-migration/safe/unused-mutability-marker.input.nym.txt"
-      ],
-      "occurrences": 20,
-      "digest": "0c50122630b31c62fa4ab2540bcc655961a952c6598fb7af0bce0280a7aa0b7b"
-    },
-    {
       "category": "generated-source",
       "rules": [],
       "paths": [],
@@ -134,7 +112,7 @@
         "crates/nymph-compiler/src/project/session.rs"
       ],
       "occurrences": 6,
-      "digest": "4f5682fb10b607e4b300643655f2a0fa6f5e89c92397b6de81eb83dd4d8d8be1"
+      "digest": "04496b2b55a048b0a6a76630f9984526918b46e4e4198055923dd9e30606bafa"
     },
     {
       "category": "runtime",

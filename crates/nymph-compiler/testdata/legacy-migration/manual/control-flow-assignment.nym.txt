@@ -1,7 +1,0 @@
-func count(limit: int): int = {
-	let mut value = 0
-	while value < limit {
-		if value == 2 { value += 2 } else { value += 1 }
-	}
-	value
-}

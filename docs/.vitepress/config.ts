@@ -75,7 +75,7 @@ export default defineConfig({
 					{ text: "Pattern Matching", link: "/pattern-matching/" },
 					{ text: "Operators", link: "/operators/" },
 					{ text: "Error Handling", link: "/error-handling/" },
-					{ text: "Immutability and migration", link: "/mutability/" },
+					{ text: "Immutability", link: "/mutability/" },
 					{ text: "Iteration", link: "/iteration/" },
 					{ text: "Standard Library", link: "/stdlib/" },
 				],

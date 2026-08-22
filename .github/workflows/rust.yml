@@ -26,12 +26,34 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@v2
       - name: Install nextest
-        # `cargo binstall` is not preinstalled on the runner; install-action
-        # fetches a prebuilt nextest binary directly.
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
       - name: Build
         run: cargo build --verbose
       - name: Test
-        run: cargo nextest run
+        # Keep standalone compiler sessions alive within their libtest binaries
+        # while nextest runs the rest of the workspace in parallel.
+        run: |
+          cargo test -p nymph-compiler \
+            --test arithmetic \
+            --test boxing \
+            --test collections \
+            --test conditions \
+            --test exact_integers \
+            --test golden_programs \
+            --test pipeline \
+            --test run_node &
+          libtest_pid=$!
+
+          cargo nextest run -E \
+            'not (package(nymph-compiler) &
+            (binary(arithmetic) | binary(boxing) | binary(collections) |
+            binary(conditions) | binary(exact_integers) | binary(golden_programs) |
+            binary(pipeline) | binary(run_node)))' &
+          nextest_pid=$!
+
+          status=0
+          wait "$libtest_pid" || status=$?
+          wait "$nextest_pid" || status=$?
+          exit "$status"

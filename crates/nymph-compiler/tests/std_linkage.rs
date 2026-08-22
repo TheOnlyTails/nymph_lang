@@ -346,7 +346,7 @@ fn option_consumer_imports_the_canonical_runtime_before_bundling() {
 /// -trips through the user's own `match`), a mutation (`insert` then
 /// `size`), an Option-returning mutation (`remove`), and the list-returning
 /// `keys` (indexed natively, no further linkage needed).
-/* Removed after immutable destination migration; mutable map linkage is frozen elsewhere.
+/* Retired tests for unsupported mutable map linkage.
 #[test]
 fn linked_map_get_insert_remove_and_keys_compile_bundle_and_run() {
 	let entry = "";
@@ -447,7 +447,7 @@ fn linked_map_merge_compiles_bundles_and_runs() {
 /// prelude-method-materialization gap for named-struct receivers,
 /// `nymph-codegen`'s `real_set_insert_stays_a_loud_transitively_external_defer`
 /// — out of this slice's scope; see that test's own doc comment.)
-/* Removed after immutable destination migration; mutable set behavior is frozen elsewhere.
+/* Retired tests for unsupported mutable set behavior.
 #[test]
 fn a_user_set_struct_backed_by_the_linked_map_inserts_removes_and_contains_round_trips() {
 	let entry = "";
@@ -543,7 +543,7 @@ fn ambient_index_bound_accepts_a_builtin_list() {
 	assert_eq!(run_node(&js, "generic_list_index"), "42");
 }
 
-/* Removed after immutable destination migration; assignment-based iteration is frozen elsewhere.
+/* Retired tests for unsupported assignment-based iteration.
 #[test]
 fn real_std_set_iterates_its_keys() {
 	let entry = r#""#;
@@ -700,7 +700,7 @@ fn mixed_primitive_equals_method_matches_the_operator_fast_path() {
 	);
 }
 
-/* Removed after immutable destination migration; old explicit iterator and mutable for-loop semantics are frozen elsewhere.
+/* Retired tests for unsupported explicit iterators and mutable for-loop semantics.
 #[test]
 fn boxed_lists_and_maps_iterate_through_the_uniform_protocol() {
 	let entry = r#"
@@ -1192,7 +1192,7 @@ fn import_std_io_resolves_via_embedded_provider_and_runs() {
 	assert_eq!(run_node(&js, "std_io"), "hi from std/io");
 }
 
-/* Removed after immutable destination migration; compound assignment evaluation is frozen elsewhere.
+/* Retired tests for unsupported compound assignment evaluation.
 #[test]
 fn exact_power_matrix_compiles_without_native_exponentiation_and_runs() {
 	with_compiler_stack(exact_power_matrix_body);

@@ -1395,6 +1395,24 @@ impl CompilerSession {
 		load: &dyn Fn(&str) -> Option<String>,
 		std_provider: &dyn Fn(&str) -> Option<String>,
 	) -> Self {
+		let (project_sources, builtin_sources) = Self::load_source_graph(entry, load, std_provider);
+		let mut session = Self::from_builtin_sources(builtin_sources);
+		for (path, source) in project_sources {
+			session.set_source(
+				project.clone(),
+				ModulePath::new(path).expect("resolved source key is canonical"),
+				source,
+				SourceVersion(1),
+			);
+		}
+		session
+	}
+
+	pub(super) fn load_source_graph(
+		entry: &str,
+		load: &dyn Fn(&str) -> Option<String>,
+		std_provider: &dyn Fn(&str) -> Option<String>,
+	) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
 		let mut project_sources = BTreeMap::new();
 		let mut builtin_sources = BTreeMap::new();
 		let mut seen = BTreeSet::new();
@@ -1437,16 +1455,7 @@ impl CompilerSession {
 				project_sources.insert(key, source);
 			}
 		}
-		let mut session = Self::from_builtin_sources(builtin_sources);
-		for (path, source) in project_sources {
-			session.set_source(
-				project.clone(),
-				ModulePath::new(path).expect("resolved source key is canonical"),
-				source,
-				SourceVersion(1),
-			);
-		}
-		session
+		(project_sources, builtin_sources)
 	}
 
 	#[doc(hidden)]

@@ -1,5 +1,0 @@
-struct Resource(mut open: boolean)
-
-mut func close(mut resource: Resource): void = {
-	resource.open = false
-}

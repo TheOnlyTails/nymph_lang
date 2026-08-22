@@ -1,4 +1,0 @@
-enum Source { Value(value: int) }
-enum Destination { ...Source }
-
-func example(value: Source): Destination = value as Destination

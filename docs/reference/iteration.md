@@ -104,4 +104,4 @@ func swap_twice(): #(int, int) = loop (
 ```
 
 The compiler implements continuation without growing the stack. See
-[Immutability and migration](./mutability) for translating legacy mutable loops.
+[Immutability](./mutability) for the rules governing loop-carried values.

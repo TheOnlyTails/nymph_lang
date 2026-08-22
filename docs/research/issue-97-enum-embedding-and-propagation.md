@@ -28,7 +28,7 @@ rebuilds the destination `Result.Error` wrapper but leaves the error value uncha
 
 Patterns name original qualified variants. A successful pattern binds the source view; an unrefined
 binder retains the destination view. Exhaustiveness and duplicate-arm analysis use the final set.
-The removed `...Source` pattern and `Destination(source)` construction receive migration diagnostics.
+The removed `...Source` pattern and `Destination(source)` construction receive focused diagnostics.
 
 Equality is permitted when enum sets overlap. It compares stable original variant identity and fields;
 different identities are false and static views are irrelevant. Hashing uses the same identity and
@@ -52,7 +52,7 @@ variants, methods, static type object, and semantic set.
 ## Compiler ownership
 
 - **Parser/formatter:** whole and selected embedding declarations, single-variant types, ordinary
-  qualified patterns, and migration errors for removed construction/spread-pattern forms.
+  qualified patterns, and errors for removed construction/spread-pattern forms.
 - **Sema:** fixed-point set expansion, generic projection, assignability, overlap, refinement,
   exhaustiveness, static method resolution, equality availability, and `?` route selection.
 - **Stable interfaces:** canonical sets, variant field shapes, generic projection, method owner, and
@@ -102,4 +102,4 @@ spans, a plain-language cause, and machine-applicable suggestions only when the 
    equality, and hash agreement.
 10. Deep-`?` tests cover transitive inclusion, single-variant errors, explicit fallback, ambiguity,
     and effect rejection.
-11. Migration diagnostics receive focused snapshots.
+11. Removed-form diagnostics receive focused snapshots.

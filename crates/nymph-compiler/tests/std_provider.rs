@@ -108,7 +108,7 @@ fn import_std_collections_tree_resolves_compiles_and_runs() {
 	);
 }
 
-/* Removed after immutable destination migration; mutable closure/resource semantics are frozen elsewhere.
+/* Retired tests for unsupported mutable closure and resource semantics.
 #[test]
 fn managed_resources_close_in_reverse_order_on_normal_and_return_exits() {
 	let entry = r#"

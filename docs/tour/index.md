@@ -102,7 +102,7 @@ func sum_to(limit: int): int = loop (
 }
 ```
 
-See [Iteration](../reference/iteration) and the [migration guide](../reference/mutability).
+See [Iteration](../reference/iteration) and [Immutability](../reference/mutability).
 
 ## Observation and program output
 

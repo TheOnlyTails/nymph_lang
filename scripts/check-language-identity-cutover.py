@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Freeze and check every legacy language-identity path owned by the repository."""
+"""Check that retired language-identity paths remain absent from the repository."""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = ROOT / "scripts/language-identity-cutover-inventory.json"
-CORPUS = ROOT / "crates/nymph-compiler/testdata/legacy-migration"
 
 
 @dataclass(frozen=True)
@@ -275,10 +274,6 @@ def add_match(
 
 
 def scan_sources(findings: dict[tuple[str, str, str], list[tuple[int, str]]]) -> None:
-    for path in sorted(CORPUS.rglob("*.nym.txt")):
-        source = path.read_text(encoding="utf-8")
-        for rule, line, text in source_matches(source):
-            add_match(findings, "frozen-legacy-source", rule, relative(path), line, text)
     for source_root in SOURCE_ROOTS:
         for path in sorted(source_root.rglob("*.nym")):
             source = path.read_text(encoding="utf-8")
@@ -355,7 +350,6 @@ def snapshot() -> list[dict[str, object]]:
     categories = {
         "source",
         "docs-source",
-        "frozen-legacy-source",
         "generated-source",
         "parser-fixture-source",
         "private-runtime-mutation",
@@ -428,10 +422,6 @@ def self_test() -> None:
 
 def check() -> int:
     self_test()
-    corpus = json.loads((CORPUS / "manifest.json").read_text(encoding="utf-8"))
-    if corpus.get("version") != 1:
-        print("legacy migration corpus manifest is missing or unsupported", file=sys.stderr)
-        return 1
     expected = json.loads(BASELINE.read_text(encoding="utf-8"))
     actual = snapshot()
     if expected.get("version") != 1 or expected.get("inventory") != actual:
@@ -448,7 +438,6 @@ def check() -> int:
     required = {
         "source",
         "docs-source",
-        "frozen-legacy-source",
         "generated-source",
         "parser-fixture-source",
         "syntax-ast",

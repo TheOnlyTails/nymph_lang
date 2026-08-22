@@ -1,4 +1,0 @@
-func example(): int = {
-	let value = 1
-	value
-}

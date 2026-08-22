@@ -1,3 +1,0 @@
-struct Credentials(public name: string, private mut token: string = "generated")
-
-func copy(value: Credentials): Credentials = Credentials(value.name, value.token)

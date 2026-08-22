@@ -1,5 +1,0 @@
-func example(): int = {
-	let value = 2
-	let value = value * 3
-	value
-}

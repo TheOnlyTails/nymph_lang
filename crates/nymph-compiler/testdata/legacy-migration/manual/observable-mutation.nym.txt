@@ -1,4 +1,0 @@
-func update(mut values: #[int], index: uint): int = {
-	values[index] += values[index]
-	values[index]
-}

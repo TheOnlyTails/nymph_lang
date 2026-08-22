@@ -8,6 +8,7 @@
 //! it only after its JavaScript has also executed successfully.
 
 use std::{
+	cell::RefCell,
 	collections::{BTreeMap, BTreeSet},
 	sync::Arc,
 };
@@ -16,7 +17,7 @@ use nymph_ast::{
 	decl::{Declaration, ImportRoot, Visibility},
 	expr::{ListPatternEntry, MapPatternEntry, Pattern, StructPatternField},
 };
-use nymph_diagnostics::Diagnostic;
+use nymph_diagnostics::{Diagnostic, SourceVersion};
 use nymph_sema::query::ImportedNameKind;
 
 use super::{CompilerSession, ModulePath, ProjectDiagnostic, ProjectId};
@@ -255,6 +256,7 @@ impl StagedReplSubmission {
 pub struct ReplSession {
 	project: ProjectId,
 	load: Arc<SourceLoader>,
+	compiler: RefCell<CompilerSession>,
 	committed: Vec<CommittedSubmission>,
 	imports: Vec<ReplImport>,
 	visible: BTreeMap<String, String>,
@@ -268,6 +270,7 @@ impl ReplSession {
 		Self {
 			project: ProjectId::new(REPL_ROOT),
 			load: Arc::new(load),
+			compiler: RefCell::new(CompilerSession::new()),
 			committed: Vec::new(),
 			imports: Vec::new(),
 			visible: BTreeMap::new(),
@@ -335,7 +338,7 @@ impl ReplSession {
 		sources.insert(module.clone(), source.clone());
 		let disk = self.load.clone();
 		let dependency_sources = std::cell::RefCell::new(BTreeMap::new());
-		let load = |key: &str| {
+		let load = |key: &str| -> Option<String> {
 			sources.get(key).cloned().or_else(|| {
 				let source = disk(key)?;
 				dependency_sources
@@ -344,13 +347,18 @@ impl ReplSession {
 				Some(source)
 			})
 		};
-		let session = CompilerSession::from_source_loaders(
-			self.project.clone(),
-			&module,
-			&load,
-			&crate::embedded_std_provider,
-		);
-		let (modules, _entry_tag) = session
+		let (project_sources, _) =
+			super::session::CompilerSession::load_source_graph(&module, &load, &|_| None);
+		let mut compiler = self.compiler.borrow_mut();
+		for (path, source) in project_sources {
+			compiler.set_source(
+				self.project.clone(),
+				ModulePath::new(path).expect("resolved REPL source key is canonical"),
+				source,
+				SourceVersion(generation as i64 + 1),
+			);
+		}
+		let (modules, _entry_tag) = compiler
 			.emit_transactional_repl_project(
 				self.project.clone(),
 				ModulePath::new(&module).expect("REPL module keys are canonical"),

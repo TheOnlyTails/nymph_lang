@@ -54,7 +54,7 @@ func sum_to(limit: int): int = loop (let next = 1, let total = 0) {
 }
 ```
 
-See [Immutability and migration](../reference/mutability) for translating legacy mutable code.
+See [Immutability](../reference/mutability) for more about values and repeated state.
 
 ## Structs
 
@@ -188,5 +188,5 @@ From here, the [Reference](../reference/) covers each piece in full:
   [Interfaces and impls](../reference/interfaces-and-impls) — the shapes user code takes.
 - [Pattern matching](../reference/pattern-matching) and [Operators](../reference/operators) — the
   two topics this tour only sampled.
-- [Immutability and migration](../reference/mutability) and [Iteration](../reference/iteration) — the two rules
+- [Immutability](../reference/mutability) and [Iteration](../reference/iteration) — the two rules
   that shape how state and loops behave.

@@ -49,6 +49,7 @@ pub use session::SemanticQueryEvent;
 pub use test_support::{GraphFixture, GraphShape};
 
 use nymph_diagnostics::Diagnostic;
+use std::sync::{Mutex, OnceLock};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompilerOptions {
@@ -258,6 +259,7 @@ impl CompiledProject {
 }
 
 pub(crate) const FACADE_PROJECT: &str = "__nymph_internal_facade_project__";
+const STANDALONE_ENTRY: &str = "__nymph_internal_standalone_entry__";
 
 fn facade_session(
 	entry: &str,
@@ -468,8 +470,41 @@ pub fn compile_project_library_with_embedded_std_options_and_source_uris(
 
 /// Compile one standalone source through the canonical virtual-module
 /// assembly while retaining the facade's unmangled top-level names.
+#[cfg(test)]
 fn standalone_session(source: &str, source_name: &str) -> (CompilerSession, ProjectId, ModulePath) {
 	standalone_session_with_options(source, source_name, &CompilerOptions::default())
+}
+
+fn with_standalone_session<T>(
+	source: &str,
+	source_name: &str,
+	compile: impl FnOnce(&CompilerSession, ProjectId, ModulePath) -> T,
+) -> T {
+	// Reuse ambient queries without making concurrent one-shot compiles wait on
+	// one shared session. Replacing the sole project input keeps calls isolated.
+	static SESSIONS: OnceLock<Mutex<Vec<CompilerSession>>> = OnceLock::new();
+	let sessions = SESSIONS.get_or_init(|| Mutex::new(Vec::new()));
+	let mut session = sessions
+		.lock()
+		.expect("standalone compiler pool lock poisoned")
+		.pop()
+		.unwrap_or_else(|| CompilerSession::from_builtin_sources(Default::default()));
+	let project = ProjectId::new(FACADE_PROJECT);
+	let path = ModulePath::new(STANDALONE_ENTRY).expect("standalone key is canonical");
+	session.set_source_with_location(
+		project.clone(),
+		path.clone(),
+		source.to_string(),
+		SourceVersion(1),
+		source_name,
+		None::<String>,
+	);
+	let result = compile(&session, project, path);
+	sessions
+		.lock()
+		.expect("standalone compiler pool lock poisoned")
+		.push(session);
+	result
 }
 
 fn standalone_session_with_options(
@@ -477,7 +512,6 @@ fn standalone_session_with_options(
 	source_name: &str,
 	options: &CompilerOptions,
 ) -> (CompilerSession, ProjectId, ModulePath) {
-	const STANDALONE_ENTRY: &str = "__nymph_internal_standalone_entry__";
 	let project = ProjectId::new(FACADE_PROJECT);
 	let path = ModulePath::new(STANDALONE_ENTRY).expect("standalone key is canonical");
 	let mut session = CompilerSession::from_builtin_sources(Default::default());
@@ -500,13 +534,14 @@ pub(crate) fn check_standalone(
 	entry_mode: nymph_sema::EntryMode,
 	ambient_prelude: bool,
 ) -> Vec<Diagnostic> {
-	let (session, project, path) = standalone_session(source, path);
-	let diagnostics = if ambient_prelude {
-		session.check_project_with_options(project, path, entry_mode, true)
-	} else {
-		session.check_project_without_prelude(project, path, entry_mode)
-	};
-	diagnostics.iter().map(|item| item.diag.clone()).collect()
+	with_standalone_session(source, path, |session, project, path| {
+		let diagnostics = if ambient_prelude {
+			session.check_project_with_options(project, path, entry_mode, true)
+		} else {
+			session.check_project_without_prelude(project, path, entry_mode)
+		};
+		diagnostics.iter().map(|item| item.diag.clone()).collect()
+	})
 }
 
 pub(crate) fn compile_standalone(
@@ -514,11 +549,12 @@ pub(crate) fn compile_standalone(
 	path: &str,
 	entry_mode: nymph_sema::EntryMode,
 ) -> Result<String, Vec<Diagnostic>> {
-	let (session, project, path) = standalone_session(source, path);
-	session
-		.compile_project_with_options(project, path, entry_mode, true)
-		.map(|compiled| compiled.js.clone())
-		.map_err(|diags| diags.iter().map(|item| item.diag.clone()).collect())
+	with_standalone_session(source, path, |session, project, path| {
+		session
+			.compile_project_with_options(project, path, entry_mode, true)
+			.map(|compiled| compiled.js.clone())
+			.map_err(|diags| diags.iter().map(|item| item.diag.clone()).collect())
+	})
 }
 
 pub(crate) fn compile_standalone_with_options(
@@ -539,24 +575,25 @@ pub(crate) fn compile_standalone_report(
 	path: &str,
 	entry_mode: nymph_sema::EntryMode,
 ) -> crate::StandaloneCompileReport {
-	let (session, project, path) = standalone_session(source, path);
-	let mut diagnostics = session
-		.check_project_with_options(project.clone(), path.clone(), entry_mode, true)
-		.iter()
-		.map(|item| item.diag.clone())
-		.collect::<Vec<_>>();
-	let js = if diagnostics.iter().any(Diagnostic::is_error) {
-		None
-	} else {
-		match session.compile_project_with_options(project, path, entry_mode, true) {
-			Ok(compiled) => Some(compiled.js.clone()),
-			Err(failed) => {
-				diagnostics.extend(failed.iter().map(|item| item.diag.clone()));
-				None
+	with_standalone_session(source, path, |session, project, path| {
+		let mut diagnostics = session
+			.check_project_with_options(project.clone(), path.clone(), entry_mode, true)
+			.iter()
+			.map(|item| item.diag.clone())
+			.collect::<Vec<_>>();
+		let js = if diagnostics.iter().any(Diagnostic::is_error) {
+			None
+		} else {
+			match session.compile_project_with_options(project, path, entry_mode, true) {
+				Ok(compiled) => Some(compiled.js.clone()),
+				Err(failed) => {
+					diagnostics.extend(failed.iter().map(|item| item.diag.clone()));
+					None
+				}
 			}
-		}
-	};
-	crate::StandaloneCompileReport { js, diagnostics }
+		};
+		crate::StandaloneCompileReport { js, diagnostics }
+	})
 }
 
 /// Internal inspection seam for regressions that must assert the exact ES

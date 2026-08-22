@@ -115,6 +115,6 @@ tests should additionally cover multiline and defecting `Display`, synchronous p
 logical activation traces, cleanup defects during cancellation, first-signal cleanup, forced
 second-signal termination, and inert library builds.
 
-No additional decision ticket is needed. Parser/sema migration, launcher emission, task-root driving,
+No additional decision ticket is needed. Parser/sema updates, launcher emission, task-root driving,
 signal handling, defect diagnostics, and the verification matrix belong in the map's eventual
 dependency-ordered implementation decomposition.

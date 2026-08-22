@@ -134,7 +134,7 @@ The nominal owner's HIR field shape carries an optional executable default body.
 the concrete complete-copy representation and may use unobservable structural sharing. Pattern HIR
 contains only checked explicit field subpatterns; the omission marker needs no runtime operation.
 
-## Diagnostics and migration
+## Diagnostics
 
 Diagnostics require a primary operation span, declaration/first-occurrence secondary spans where
 available, and contextual notes. Stable categories cover:
@@ -153,25 +153,6 @@ construction should suggest an opaque clone when a source exists or a public/int
 when the caller needs a fresh value. Safe positional constructions can receive machine-applicable
 field labels; moving a spread is not automatically safe because it can change evaluation order.
 
-The migration corpus includes:
-
-```nymph
-Point(1, 2)                       // before
-Point(x = 1, y = 2)               // after
-
-public struct Point(x: int)       // before: omission leaked outside the package
-public struct Point(public x: int) // after: intentionally public
-
-Point(x)                          // before: implicit partial pattern
-Point(x, ...)                     // after: explicit omission
-
-Point(x = point.x, y = point.y)   // before: manual reconstruction
-Point(...point)                   // after: complete opaque clone
-```
-
-Sibling-dependent defaults migrate to an owner function that supplies both fields explicitly. Fresh
-construction blocked by hidden fields likewise migrates to an intentional owner function.
-
 ## Verification gates
 
 Implementation is complete only when the following gates pass:
@@ -188,6 +169,6 @@ Implementation is complete only when the following gates pass:
    declaration-order defaults, no defaults during clone/update, complete hidden-field preservation,
    and unchanged old values.
 6. Diagnostic snapshots cover source-available and interface-only declarations, causal notes, and safe
-   migration suggestions.
+   suggestions.
 7. Once the owning feature slices exist, cross-feature tests prove complete hidden-field equality,
    hashing, and `echo`, contextual access/matching, and separately filtered public documentation.

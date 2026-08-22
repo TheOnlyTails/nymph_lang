@@ -285,7 +285,7 @@ fn editing_one_definition_only_reexecutes_its_exact_lowering_consumer() {
 	));
 }
 
-/* Mutable range type backdating is covered by the frozen legacy corpus.
+/* Retired test for unsupported mutable range type backdating.
 #[test]
 fn equivalent_native_range_type_facts_backdate_exact_lowering_consumer() {
 	let events = Arc::new(Mutex::new(Vec::<SemanticQueryEvent>::new()));
@@ -327,7 +327,7 @@ fn equivalent_native_range_type_facts_backdate_exact_lowering_consumer() {
 }
 
 */
-/* Mutable collection and direct range-loop lowering are covered by the frozen legacy corpus.
+/* Retired tests for unsupported mutable collection and direct range-loop lowering.
 #[test]
 fn native_list_and_bounded_ranges_lower_with_real_ambient_protocol_facts() {
 	let mut session = CompilerSession::new();

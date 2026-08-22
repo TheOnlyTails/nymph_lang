@@ -1,1 +1,0 @@
-func offset(value: uint, delta: int): int = value + delta
