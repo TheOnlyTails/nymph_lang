@@ -44,7 +44,7 @@ func endpoints(pair: #(int, int)): int = match (pair) {
 ```
 
 Each name may be bound only once in a pattern. Both alternatives of a union must bind exactly the
-same names with the same inferred types and mutability. Names are compared by identity, not by the
+same names with the same inferred types. Names are compared by identity, not by the
 order in which they appear; put a binding around a grouped union when both alternatives should
 capture the whole value:
 
@@ -111,10 +111,9 @@ func route(n: int, limit: int): int = match (n) {
 
 ## Struct and variant patterns
 
-`Name(field, …)` matches a struct value or an enum variant. A bare field name (`field`) is
-shorthand for binding it under its own name; `field = pattern` matches that field against a nested
-pattern (and is also how you bind it under a *different* name than its own). `...` matches the rest
-of the fields without binding them.
+`Name(field = pattern, …)` matches a struct value or an enum variant. Struct fields always use the
+explicit `field = pattern` form. In variant patterns, a bare field name is shorthand for binding the
+field under that name. `...` matches the rest of the fields without binding them.
 
 Inside a struct or variant's field list, the name to the left of the first `=` selects the field;
 it is not a whole-value binding. A nested `name = pattern` on the right retains its general binding
@@ -133,7 +132,7 @@ func on_axis(p: Point): boolean = match (p) {
 ```nym
 struct Point(x: int, y: int)
 func x_only(p: Point): int = match (p) {
-  Point(x, ...) -> x,
+  Point(x = x, ...) -> x,
 }
 ```
 

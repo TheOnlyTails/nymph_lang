@@ -1,9 +1,8 @@
 use crate::NymphCommand;
-use crate::project_support::ManifestSelection;
+use crate::project_support::{ManifestSelection, atomic_write};
 use anyhow::Context as _;
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(clap::Args)]
@@ -157,71 +156,4 @@ fn format_file(path: &Path, check: bool) -> anyhow::Result<bool> {
 			.with_context(|| format!("could not write {}", path.display()))?;
 	}
 	Ok(true)
-}
-
-fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
-	let parent = path.parent().unwrap_or(Path::new("."));
-	let permissions = fs::metadata(path)?.permissions();
-	if permissions.readonly() {
-		anyhow::bail!("source file is read-only");
-	}
-	let name = path
-		.file_name()
-		.and_then(|name| name.to_str())
-		.unwrap_or("source.nym");
-	for attempt in 0..1000_u32 {
-		let temporary = parent.join(format!(
-			".{name}.nymph-format-{}-{attempt}",
-			std::process::id()
-		));
-		match OpenOptions::new()
-			.write(true)
-			.create_new(true)
-			.open(&temporary)
-		{
-			Ok(mut output) => {
-				let result = (|| -> std::io::Result<()> {
-					output.set_permissions(permissions.clone())?;
-					output.write_all(contents)?;
-					output.sync_all()?;
-					drop(output);
-					replace_file(&temporary, path)
-				})();
-				if result.is_err() {
-					let _ = fs::remove_file(&temporary);
-				}
-				return result.map_err(Into::into);
-			}
-			Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-			Err(error) => return Err(error.into()),
-		}
-	}
-	anyhow::bail!("could not create an atomic temporary file")
-}
-
-#[cfg(not(windows))]
-fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
-	fs::rename(from, to)
-}
-
-#[cfg(windows)]
-fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
-	use std::os::windows::ffi::OsStrExt as _;
-	use windows_sys::Win32::Storage::FileSystem::{
-		MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-	};
-
-	let from: Vec<_> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-	let to: Vec<_> = to.as_os_str().encode_wide().chain(Some(0)).collect();
-	if unsafe {
-		MoveFileExW(
-			from.as_ptr(),
-			to.as_ptr(),
-			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-		)
-	} == 0
-	{
-		return Err(std::io::Error::last_os_error());
-	}
-	Ok(())
 }

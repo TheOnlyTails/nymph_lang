@@ -66,9 +66,12 @@ for await (const line of readline.createInterface({ input: process.stdin, crlfDe
 				const render = entry.namespace[request.render];
 				if (typeof render !== "function")
 					throw new Error(`missing REPL render export: ${request.render}`);
-				const rendered = render();
-				if (rendered !== null && typeof rendered?.then === "function")
+				const value = render();
+				if (value !== null && typeof value?.then === "function")
 					throw new Error("asynchronous REPL rendering is disabled in strict REPL mode");
+				const debug = entry.namespace["$nymph$replDebug"];
+				if (typeof debug !== "function") throw new Error("missing REPL debug adapter");
+				const rendered = debug(value);
 				console.log(rendered.v);
 			}
 			transaction(`globalThis[Symbol.for("nymph.transaction.journal")].stack.pop()`);

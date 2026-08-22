@@ -25,7 +25,7 @@ use crate::identity::DefinitionId;
 use crate::ids::{DefId, ParamIdx};
 use crate::iface::{Bound, Head, head_of};
 use crate::lower::{build_param_scope, build_param_scope_at};
-use crate::ty::{GenericArgs, Ty};
+use crate::ty::{GenericArgs, Ty, TyKind};
 
 /// Owned semantic facts for one inherent method. Local syntax is kept separately in
 /// [`InherentBodyJob`], so imported methods cannot accidentally become body jobs.
@@ -36,14 +36,14 @@ pub struct InherentMethod {
 	pub generic_names: Vec<EcoString>,
 	pub params: Vec<Ty>,
 	pub ret: Ty,
-	/// The interface bounds declared on this method's own generics,
+	pub effects: crate::ty::EffectRow,
+	/// The interface bounds declared on this method's own generics (Slice 4G-b),
 	/// e.g. `func apply<U: Area>(u: U)` — one [`Bound`] per bound, with `ty =
 	/// Param(base + j)` where `base` is the owner's generic count (the same offset
 	/// `collect_impl_member` uses for the method's own scope, and `commit_inherent`'s
 	/// subst covers), so a call site can substitute them exactly like `params`/`ret`.
 	pub bounds: Vec<Bound>,
 	pub namespaced: bool,
-	pub mutating: bool,
 	pub external: bool,
 }
 
@@ -326,7 +326,7 @@ impl<'m> Checker<'m> {
 			ImplMember::ExternalFunc(_, _, meta) => (meta, None),
 			ImplMember::ExternalLet(_, marker, meta) => {
 				let ty = meta.type_.as_ref().map(|ty| self.lower_type(ty));
-				self.check_external_value(marker, meta.name.1, meta.is_mutable(), ty);
+				self.check_external_value(marker, meta.name.1, ty);
 				return;
 			}
 			ImplMember::Let { .. } => return,
@@ -363,12 +363,26 @@ impl<'m> Checker<'m> {
 			.iter()
 			.map(|p| self.lower_type(&p.0.type_))
 			.collect();
-		let ret = match &meta.return_type {
+		let output = match &meta.return_type {
 			Some(ty) => self.lower_type(ty),
 			None => self.fresh(),
 		};
-		// Lower the method's generic bounds while their scope is active, offset past
-		// the owner's generics so `Bound::ty` lands at
+		let latent_effects = meta
+			.effects
+			.as_ref()
+			.map(|effects| self.lower_effect_row(effects).0)
+			.unwrap_or_else(crate::ty::EffectRow::pure);
+		self.record_effect_spec(meta, latent_effects.clone(), body.is_some());
+		let (ret, effects) = if meta.is_async {
+			(
+				self.interner.mk_task(output, latent_effects),
+				crate::ty::EffectRow::pure(),
+			)
+		} else {
+			(output, latent_effects)
+		};
+		// Lower the method's own generics' bounds while their scope is still active
+		// (Slice 4G-b), offset past the owner's generics so `Bound::ty` lands at
 		// `Param(base + j)` — the exact index `commit_inherent`'s subst mints into.
 		let bounds = self.lower_constraints(&meta.generics, base);
 		self.pop_params();
@@ -380,9 +394,9 @@ impl<'m> Checker<'m> {
 				generic_names: meta.generics.iter().map(|g| g.0.name.0.clone()).collect(),
 				params,
 				ret,
+				effects,
 				bounds,
 				namespaced,
-				mutating: meta.kind == FuncKind::Mut,
 				external: body.is_none(),
 			},
 		);
@@ -397,7 +411,6 @@ impl<'m> Checker<'m> {
 	pub(crate) fn resolve_inherent(
 		&mut self,
 		recv: Ty,
-		receiver_is_mut: bool,
 		name: &str,
 		arg_tys: &[Ty],
 		arg_lits: &[bool],
@@ -409,7 +422,7 @@ impl<'m> Checker<'m> {
 		Option<DefinitionId>,
 		Vec<Ty>,
 	)> {
-		self.resolve_inherent_impl(recv, receiver_is_mut, name, arg_tys, arg_lits, span, false)
+		self.resolve_inherent_impl(recv, name, arg_tys, arg_lits, span, false)
 	}
 
 	/// Resolve only an inherent overload whose arguments fit. This lets ordinary
@@ -417,7 +430,6 @@ impl<'m> Checker<'m> {
 	pub(crate) fn resolve_matching_inherent(
 		&mut self,
 		recv: Ty,
-		receiver_is_mut: bool,
 		name: &str,
 		arg_tys: &[Ty],
 		arg_lits: &[bool],
@@ -429,14 +441,13 @@ impl<'m> Checker<'m> {
 		Option<DefinitionId>,
 		Vec<Ty>,
 	)> {
-		self.resolve_inherent_impl(recv, receiver_is_mut, name, arg_tys, arg_lits, span, true)
+		self.resolve_inherent_impl(recv, name, arg_tys, arg_lits, span, true)
 	}
 
 	#[allow(clippy::too_many_arguments)]
 	fn resolve_inherent_impl(
 		&mut self,
 		recv: Ty,
-		receiver_is_mut: bool,
 		name: &str,
 		arg_tys: &[Ty],
 		arg_lits: &[bool],
@@ -451,7 +462,8 @@ impl<'m> Checker<'m> {
 	)> {
 		// See `resolve_method`'s matching comment: peel `mut` before matching
 		// against any impl's (never-`mut`) `Self` type.
-		let recv = self.strip_mut(recv);
+		let recv = self.shallow_resolve(recv);
+		let recv = self.static_enum_view_ty(recv);
 		let head = head_of(&self.interner, recv)?;
 		let candidates = self.inherent.candidates(head);
 		for idx in candidates {
@@ -460,7 +472,7 @@ impl<'m> Checker<'m> {
 				.impls
 				.get(idx)
 				.and_then(|i| i.methods.get(name))
-				.is_some_and(|m| !m.namespaced && (!m.mutating || receiver_is_mut));
+				.is_some_and(|m| !m.namespaced);
 			if !has {
 				continue;
 			}
@@ -471,12 +483,10 @@ impl<'m> Checker<'m> {
 				let snapshot = self.table.snapshot();
 				let diagnostic_mark = self.diags.len();
 				let pending_bound_mark = self.pending_bounds.len();
-				let pending_bound_arg_mut = self.pending_bound_arg_mut.clone();
 				self.commit_inherent(idx, recv, name, Some((arg_tys, arg_lits)), span, false);
 				let arguments_match = self.diags.len() == diagnostic_mark;
 				self.diags.truncate(diagnostic_mark);
 				self.pending_bounds.truncate(pending_bound_mark);
-				self.pending_bound_arg_mut = pending_bound_arg_mut;
 				self.table.rollback_to(snapshot);
 				if require_argument_match && !arguments_match {
 					continue;
@@ -495,7 +505,6 @@ impl<'m> Checker<'m> {
 	pub(crate) fn resolve_inherent_value(
 		&mut self,
 		recv: Ty,
-		receiver_is_mut: bool,
 		name: &str,
 		span: nymph_ast::Span,
 	) -> Option<(
@@ -505,14 +514,15 @@ impl<'m> Checker<'m> {
 		Option<DefinitionId>,
 		Vec<Ty>,
 	)> {
-		let recv = self.strip_mut(recv);
+		let recv = self.shallow_resolve(recv);
+		let recv = self.static_enum_view_ty(recv);
 		let head = head_of(&self.interner, recv)?;
 		let mut matches = Vec::new();
 		for idx in self.inherent.candidates(head) {
 			let Some(_) = self.inherent.impls[idx]
 				.methods
 				.get(name)
-				.filter(|method| !method.namespaced && (!method.mutating || receiver_is_mut))
+				.filter(|method| !method.namespaced)
 			else {
 				continue;
 			};
@@ -779,13 +789,17 @@ impl<'m> Checker<'m> {
 	/// when it is fully generalised (no leftover inference variables). Trial-only:
 	/// unification bindings and any diagnostics are discarded.
 	fn infer_inherent_return(&mut self, i: usize, name: &str) -> Option<Ty> {
-		let (owner_generics, self_ty, meta, body, params, namespaced) = {
+		let (owner_generics, self_ty, meta, body, params, namespaced, async_effects) = {
 			let job = self
 				.inherent_body_jobs
 				.iter()
 				.find(|job| job.implementation == i && job.method == name)?;
 			let imp = &self.inherent.impls[i];
 			let method = imp.methods.get(name)?;
+			let async_effects = match self.interner.kind(method.ret) {
+				TyKind::Task { effects, .. } => Some(effects.clone()),
+				_ => None,
+			};
 			(
 				job.owner_generics,
 				imp.self_ty,
@@ -793,6 +807,7 @@ impl<'m> Checker<'m> {
 				job.body,
 				method.params.clone(),
 				method.namespaced,
+				async_effects,
 			)
 		};
 
@@ -803,7 +818,6 @@ impl<'m> Checker<'m> {
 		let diag_mark = self.diags.len();
 		let pending_mark = self.pending_operators.len();
 		let pending_bounds_mark = self.pending_bounds.len();
-		let pending_mut_snapshot = self.pending_bound_arg_mut.clone();
 		self.param_bounds.clear();
 		self.param_bound_details.clear();
 		self.push_params(build_param_scope(owner_generics));
@@ -813,26 +827,15 @@ impl<'m> Checker<'m> {
 		self.push_params(scope);
 		self.record_param_bounds(&meta.generics, base);
 		self.push_scope();
-		// A `mut func`'s `this` is bound as `mut Self` — the smaller correct step
-		// short of full mut-func semantics (per-method mut availability, bound-
-		// method typing), needed so field-slot reassignment through `this` inside
-		// an existing `mut func` body keeps type-checking. Param/return
-		// substitution below still uses the plain `self_ty` — `self` referenced
-		// there is unaffected by the receiver's own mutability.
-		let receiver_ty = if meta.kind == FuncKind::Mut {
-			self.interner.mk_mut(self_ty)
-		} else {
-			self_ty
-		};
 		let prev_self = std::mem::replace(
 			&mut self.self_ty,
-			if namespaced { None } else { Some(receiver_ty) },
+			if namespaced { None } else { Some(self_ty) },
 		);
 
 		let empty = FxHashMap::default();
 		for (param, &ty) in meta.params.iter().zip(&params) {
 			let ty = self.subst(ty, &empty, Some(self_ty));
-			self.bind_pattern(&param.0.name, ty, param.0.mutable);
+			self.bind_pattern(&param.0.name, ty);
 		}
 		let outer_labels = std::mem::take(&mut self.control_labels);
 		let trial_ret = self.fresh();
@@ -845,7 +848,13 @@ impl<'m> Checker<'m> {
 		);
 		let previous_ret = self.ret_ty.replace(trial_ret);
 		self.resolve_anon(body, Some(trial_ret));
+		if meta.is_async {
+			self.async_depth += 1;
+		}
 		let body_ty = self.infer(body);
+		if meta.is_async {
+			self.async_depth -= 1;
+		}
 		self.subtype(body_ty, trial_ret, body.span);
 		self.ret_ty = previous_ret;
 		self.control_labels = outer_labels;
@@ -866,10 +875,15 @@ impl<'m> Checker<'m> {
 		// Discard any bound obligation this trial deferred —
 		// see the comment just above.
 		self.pending_bounds.truncate(pending_bounds_mark);
-		self.pending_bound_arg_mut = pending_mut_snapshot;
 
 		// Accept the inferred type only if it is fully generalised.
-		if self.has_infer(ret) { None } else { Some(ret) }
+		if self.has_infer(ret) {
+			None
+		} else if let Some(effects) = async_effects {
+			Some(self.interner.mk_task(ret, effects))
+		} else {
+			Some(ret)
+		}
 	}
 
 	// ── Body checking ────────────────────────────────────────────────────────
@@ -950,26 +964,29 @@ impl<'m> Checker<'m> {
 		self.push_params(scope);
 		self.record_param_bounds(&meta.generics, base);
 		self.push_scope();
-		// See the matching comment in `infer_inherent_return`: a `mut func`'s
-		// `this` is bound as `mut Self`.
-		let receiver_ty = if meta.kind == FuncKind::Mut {
-			self.interner.mk_mut(self_ty)
-		} else {
-			self_ty
-		};
 		let prev_self = std::mem::replace(
 			&mut self.self_ty,
-			if namespaced { None } else { Some(receiver_ty) },
+			if namespaced { None } else { Some(self_ty) },
 		);
 
 		let empty = FxHashMap::default();
 		for (param, &ty) in meta.params.iter().zip(params) {
 			let ty = self.subst(ty, &empty, Some(self_ty));
-			self.bind_pattern(&param.0.name, ty, param.0.mutable);
+			self.bind_pattern(&param.0.name, ty);
 		}
 		let ret = self.subst(ret, &empty, Some(self_ty));
-		let prev_ret = self.ret_ty.replace(ret);
-		self.check_named_callable_body(&meta.name, body, ret);
+		let body_ret = match self.interner.kind(ret) {
+			TyKind::Task { output, .. } if meta.is_async => *output,
+			_ => ret,
+		};
+		let prev_ret = self.ret_ty.replace(body_ret);
+		if meta.is_async {
+			self.async_depth += 1;
+		}
+		self.check_named_callable_body(&meta.name, body, body_ret);
+		if meta.is_async {
+			self.async_depth -= 1;
+		}
 		// Drain this method body's deferred operators now, while its `param_bounds`
 		// (owner generics + this method's own) are still live — see
 		// `pending_operators`'s doc comment.
@@ -988,7 +1005,6 @@ impl<'m> Checker<'m> {
 		for i in 0..module.members.len() {
 			let Declaration::ImplFor {
 				generics,
-				mutable,
 				type_,
 				for_interface,
 				members,
@@ -1002,12 +1018,7 @@ impl<'m> Checker<'m> {
 			self.param_bound_details.clear();
 			self.record_param_bounds(generics, 0);
 			let self_ty = self.lower_type(type_);
-			let self_ty = if *mutable {
-				self.interner.mk_mut(self_ty)
-			} else {
-				self_ty
-			};
-			let bound_ty = self.strip_mut(self_ty);
+			let bound_ty = self.shallow_resolve(self_ty);
 			if let crate::ty::TyKind::Param(param) = *self.interner.kind(bound_ty) {
 				let (interface_name, interface_args) = for_interface;
 				if let Some(interface) = self
@@ -1015,8 +1026,9 @@ impl<'m> Checker<'m> {
 					.get(&interface_name.0)
 					.filter(|&definition| self.is_interface(definition))
 				{
-					let args = self
-						.align_args(interface, interface_args)
+					let aligned = self.align_args(interface, interface_args);
+					let args = aligned
+						.types
 						.into_iter()
 						.map(|(name, ty)| (name, self.subst(ty, &FxHashMap::default(), Some(self_ty))))
 						.collect();
@@ -1031,6 +1043,7 @@ impl<'m> Checker<'m> {
 							ty: bound_ty,
 							interface,
 							args,
+							effect_args: aligned.effects,
 						},
 					);
 				}
@@ -1116,18 +1129,11 @@ impl<'m> Checker<'m> {
 			));
 			self.record_param_bounds(&meta.generics, implementation_generic_base);
 			self.push_scope();
-			// See the matching comment in `check_method_body`: a `mut func`'s
-			// `this` is bound as `mut Self`.
-			let receiver_ty = if meta.kind == FuncKind::Mut {
-				self.interner.mk_mut(self_ty)
-			} else {
-				self_ty
-			};
-			let prev_self = self.self_ty.replace(receiver_ty);
+			let prev_self = self.self_ty.replace(self_ty);
 			for param in &meta.params {
 				let ty = self.lower_type(&param.0.type_);
 				let ty = self.subst(ty, &empty, Some(self_ty));
-				self.bind_pattern(&param.0.name, ty, param.0.mutable);
+				self.bind_pattern(&param.0.name, ty);
 			}
 			let ret = match &meta.return_type {
 				Some(ty) => {
@@ -1136,8 +1142,18 @@ impl<'m> Checker<'m> {
 				}
 				None => self.fresh(),
 			};
-			let prev_ret = self.ret_ty.replace(ret);
-			self.check_named_callable_body(&meta.name, body, ret);
+			let body_ret = match self.interner.kind(ret) {
+				TyKind::Task { output, .. } if meta.is_async => *output,
+				_ => ret,
+			};
+			let prev_ret = self.ret_ty.replace(body_ret);
+			if meta.is_async {
+				self.async_depth += 1;
+			}
+			self.check_named_callable_body(&meta.name, body, body_ret);
+			if meta.is_async {
+				self.async_depth -= 1;
+			}
 			// Drain this member body's deferred operators now, while the impl
 			// block's `param_bounds` are still live — see `pending_operators`'s doc
 			// comment. All members of one impl block share the same bounds, but the
@@ -1241,15 +1257,7 @@ impl<'m> Checker<'m> {
 
 		self.push_scope();
 
-		// A `mut func` default binds `this` as `mut Self`, exactly as a `mut func` on a
-		// concrete type does — so its body may mutate the receiver (call a `mut` method,
-		// e.g. iterate `this` via `this.next` in `Iterator`'s `for_each`/`fold`/…).
 		let self_ty = self.interner.mk_param(self_idx);
-		let self_ty = if meta.kind == FuncKind::Mut {
-			self.interner.mk_mut(self_ty)
-		} else {
-			self_ty
-		};
 		let prev_self = self.self_ty.replace(self_ty);
 		// See `resolve_method`'s doc comment: a call to another method of *this same
 		// interface* on `this` must bypass ordinary impl search (which could
@@ -1278,11 +1286,21 @@ impl<'m> Checker<'m> {
 		let empty = FxHashMap::default();
 		for (param, &ty) in meta.params.iter().zip(&method.params) {
 			let ty = self.subst(ty, &empty, Some(self_ty));
-			self.bind_pattern(&param.0.name, ty, param.0.mutable);
+			self.bind_pattern(&param.0.name, ty);
 		}
 		let ret = self.subst(method.ret, &empty, Some(self_ty));
-		let prev_ret = self.ret_ty.replace(ret);
-		self.check_named_callable_body(&meta.name, body, ret);
+		let body_ret = match self.interner.kind(ret) {
+			TyKind::Task { output, .. } if meta.is_async => *output,
+			_ => ret,
+		};
+		let prev_ret = self.ret_ty.replace(body_ret);
+		if meta.is_async {
+			self.async_depth += 1;
+		}
+		self.check_named_callable_body(&meta.name, body, body_ret);
+		if meta.is_async {
+			self.async_depth -= 1;
+		}
 		// Drain this body's deferred operators now, while its `param_bounds` (the
 		// interface's generics + the synthetic self bound) are still live — see
 		// `pending_operators`'s doc comment.

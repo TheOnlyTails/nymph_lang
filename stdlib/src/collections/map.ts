@@ -1,33 +1,20 @@
 import {
-	NBool,
 	NList,
 	NMap,
-	NString,
 	NTuple,
-	NUint,
 	nymphType,
 	nymphTypeProjection,
 	nymphSetPrototypeOf,
 } from "std/box";
 import { Option } from "std/option";
 
-export const size = <K, V>($_this: NMap<K, V>) => new NUint($_this.size);
+export const size = <K, V>($_this: NMap<K, V>) => BigInt($_this.size);
 export const get = <K, V>($_this: NMap<K, V>, key: K) =>
 	$_this.has(key) ? Option.Some({ value: $_this.get(key)! }) : Option.None;
-export const insert = <K, V>($_this: NMap<K, V>, key: K, value: V) => {
-	const existed = $_this.has(key);
-	$_this.set(key, value);
-	return new NBool(!existed);
-};
-export const remove = <K, V>($_this: NMap<K, V>, key: K) => {
-	if ($_this.has(key)) {
-		const value = $_this.get(key)!;
-		$_this.delete(key);
-		return Option.Some({ value });
-	}
-	return Option.None;
-};
-export const clear = <K, V>($_this: NMap<K, V>) => $_this.clear();
+export const inserted = <K, V>($_this: NMap<K, V>, key: K, value: V) =>
+	nymphSetPrototypeOf($_this.with(key, value), Object.getPrototypeOf($_this));
+export const removed = <K, V>($_this: NMap<K, V>, key: K) =>
+	nymphSetPrototypeOf($_this.without(key), Object.getPrototypeOf($_this));
 export const keys = <K, V>($_this: NMap<K, V>) =>
 	nymphSetPrototypeOf(
 		new NList([...$_this.keys()]),
@@ -47,5 +34,3 @@ export const entries = <K, V>($_this: NMap<K, V>) => {
 		nymphType(NList.prototype, [tuple]),
 	);
 };
-export const to_string = ($_this: NMap<unknown, unknown>) =>
-	new NString(`#{${[...$_this.entries()].map(([key, value]) => `${key}: ${value}`).join(", ")}}`);

@@ -10,19 +10,21 @@ use std::{
 };
 
 use ecow::EcoString;
-use nymph_ast::ops::{AssignOperator, BinaryOperator, PatternOperator, PrefixOperator};
+use num_bigint::BigInt;
+use nymph_ast::ops::{BinaryOperator, PatternOperator, PrefixOperator};
 use nymph_hir::hir::{
 	BinOp, BuiltinResult, HirArm, HirArrayElem, HirArrayKind, HirBoundDispatchCase,
 	HirBoundDispatchTarget, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit, HirMapElem,
-	HirMethod, HirModule, HirPat, HirRange, HirStmt, HirVariant, NumKind, ScalarCastKind, UnOp,
+	HirMethod, HirModule, HirPat, HirRange, HirStmt, HirVariant, NumKind, OperationMode,
+	ScalarCastKind, UnOp,
 };
 
 use crate::{
 	DefinitionId, EnumShell, ExportedDefinition, ExportedImpl, ExternalAbi, InterfaceType,
 	MemberShape, ModuleIdentity, RuntimeDefinition, StableExpr, StableExprKind, StableListItem,
-	StableListPatternEntry, StableMapEntry, StableMapPatternEntry, StablePattern, StablePatternKind,
-	StablePatternRange, StableRange, StableStatement, StableStringPart, StableStringPatternPart,
-	StableStructPatternField, StructShell,
+	StableListPatternEntry, StableMapEntry, StableMapPatternEntry, StableMatchArm, StablePattern,
+	StablePatternKind, StablePatternRange, StableRange, StableStatement, StableStringPart,
+	StableStringPatternPart, StableStructPatternField, StructShell,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,6 +180,7 @@ pub enum LoweredHirFragment {
 	TopLevelExternal {
 		name: EmittedBindingName,
 		abi: ExternalAbi,
+		function: Option<HirFunc>,
 	},
 	StructShell(HirClass),
 	EnumShell(HirEnum),
@@ -526,9 +529,37 @@ pub fn lower_runtime_definition(
 						.map(|name| name.as_str().into())
 				})
 				.collect::<Result<_, _>>()?;
+			let defaults = shell
+				.defaults
+				.iter()
+				.map(|default| {
+					let name = context.member_name(&default.field)?.as_str().into();
+					let lowered = lower_body(
+						context,
+						&artifact,
+						&default.body,
+						&mut demands,
+						&mut direct_demands,
+						&mut routed_demands,
+						&mut execution,
+						None,
+						None,
+						None,
+						&[],
+					)?;
+					let LoweredHirFragment::TopLevelValue(value) = lowered else {
+						return Err(invalid(
+							&definition,
+							"struct field default did not lower to a value",
+						));
+					};
+					Ok((name, value.value))
+				})
+				.collect::<Result<_, StableLoweringError>>()?;
 			LoweredHirFragment::StructShell(HirClass {
 				name: name.as_str().into(),
 				fields,
+				defaults,
 				methods: vec![],
 				statics: vec![],
 			})
@@ -721,31 +752,34 @@ fn lower_external(
 		});
 	}
 	let crate::RuntimePlacement::Attached { owner, .. } = &artifact.placement else {
-		return lower_top_level_external(context, definition, abi);
+		return lower_top_level_external(context, definition, abi, None);
 	};
-	let member = if let Some((_, member)) = attached_implementation_member(context, artifact)? {
-		member
-	} else if let Some(member) = attached_nominal_member(context, artifact, abi)? {
-		member
-	} else {
-		return Err(invalid(
-			definition,
-			"external member has no exact checked member shape",
-		));
-	};
+	let (member, receiver_type) =
+		if let Some((implementation, member)) = attached_implementation_member(context, artifact)? {
+			(member, Some(implementation.self_type))
+		} else if let Some(member) = attached_nominal_member(context, artifact, abi)? {
+			(member, None)
+		} else {
+			return Err(invalid(
+				definition,
+				"external member has no exact checked member shape",
+			));
+		};
 	if owner_has_no_attachment_shell(context, owner)? {
-		return lower_shellless_external(context, definition, abi, &member);
+		return lower_shellless_external(context, definition, abi, &member, receiver_type.as_ref());
 	}
 	let name: EcoString = context.member_name(definition)?.as_str().into();
 	match member.kind {
-		crate::MemberKind::Value | crate::MemberKind::MutableValue | crate::MemberKind::StaticValue => {
+		crate::MemberKind::Value | crate::MemberKind::StaticValue => {
 			let module = external_module(definition, abi)?;
 			let symbol = external_symbol(definition, abi)?;
-			let marshal = abi
-				.marshal
-				.ok_or_else(|| StableLoweringError::MissingExternalMarshal {
-					definition: definition.clone(),
-				})?;
+			let marshal =
+				abi
+					.marshal
+					.result
+					.ok_or_else(|| StableLoweringError::MissingExternalMarshal {
+						definition: definition.clone(),
+					})?;
 			Ok(LoweredHirFragment::AttachedMember {
 				owner: owner.clone(),
 				method: HirMethod {
@@ -759,9 +793,13 @@ fn lower_external(
 				},
 			})
 		}
-		crate::MemberKind::Function
-		| crate::MemberKind::MutatingFunction
-		| crate::MemberKind::StaticFunction => {
+		crate::MemberKind::Function | crate::MemberKind::StaticFunction => {
+			if abi.marshal.parameters.len() != member.parameters.len() {
+				return Err(invalid(
+					definition,
+					"external parameter marshalling plan does not match its exact ABI",
+				));
+			}
 			let mut params = member
 				.parameters
 				.iter()
@@ -781,7 +819,19 @@ fn lower_external(
 				vec![HirExpr::This]
 			};
 			args.extend(params.iter().cloned().map(HirExpr::Local));
-			let body = external_call_expr(definition, abi, &args)?;
+			let argument_marshals = external_argument_marshals(
+				&abi.marshal.parameters,
+				member.kind != crate::MemberKind::StaticFunction,
+				receiver_type.as_ref(),
+				hidden_arity,
+			);
+			let body = external_call_expr(
+				definition,
+				abi,
+				&args,
+				argument_marshals,
+				abi.marshal.result,
+			)?;
 			let method = HirMethod { name, params, body };
 			if member.kind == crate::MemberKind::StaticFunction {
 				Ok(LoweredHirFragment::AttachedStatic {
@@ -803,28 +853,26 @@ fn lower_shellless_external(
 	definition: &DefinitionId,
 	abi: &crate::ExternalAbi,
 	member: &crate::MemberShape<InterfaceType>,
+	receiver_type: Option<&InterfaceType>,
 ) -> Result<LoweredHirFragment, StableLoweringError> {
 	match member.kind {
-		crate::MemberKind::Function
-		| crate::MemberKind::MutatingFunction
-		| crate::MemberKind::StaticFunction => lower_top_level_external(context, definition, abi),
-		crate::MemberKind::Value | crate::MemberKind::MutableValue | crate::MemberKind::StaticValue => {
+		crate::MemberKind::Function | crate::MemberKind::StaticFunction => {
+			lower_top_level_external(context, definition, abi, receiver_type)
+		}
+		crate::MemberKind::Value | crate::MemberKind::StaticValue => {
 			let value = HirExpr::ExternValue {
 				module: external_module(definition, abi)?,
 				symbol: external_symbol(definition, abi)?,
 				marshal: abi
 					.marshal
+					.result
 					.ok_or_else(|| StableLoweringError::MissingExternalMarshal {
 						definition: definition.clone(),
 					})?,
 			};
 			let name: EcoString = context.binding_name(definition)?.as_str().into();
 			if member.kind == crate::MemberKind::StaticValue {
-				Ok(LoweredHirFragment::TopLevelValue(HirLet {
-					name,
-					mutable: false,
-					value,
-				}))
+				Ok(LoweredHirFragment::TopLevelValue(HirLet { name, value }))
 			} else {
 				Ok(LoweredHirFragment::TopLevelFunction(HirFunc {
 					name,
@@ -840,18 +888,57 @@ fn external_call_expr(
 	definition: &DefinitionId,
 	abi: &crate::ExternalAbi,
 	args: &[HirExpr],
+	argument_marshals: Vec<Option<nymph_hir::hir::MarshalKind>>,
+	return_marshal: Option<nymph_hir::hir::MarshalKind>,
 ) -> Result<HirExpr, StableLoweringError> {
 	match &abi.callable {
-		crate::ExternalCallable::Linked { module, symbol } => Ok(HirExpr::ExternCall {
-			module: Box::leak(module.to_string().into_boxed_str()),
-			symbol: Box::leak(symbol.to_string().into_boxed_str()),
-			args: args.to_vec(),
-		}),
+		crate::ExternalCallable::Linked { adapter } => {
+			if argument_marshals.len() != args.len() {
+				return Err(invalid(
+					definition,
+					"external argument marshalling plan does not match its exact ABI",
+				));
+			}
+			if adapter.module == "std/collections/list" {
+				let list = match (adapter.symbol.as_str(), args) {
+					("appended", [recv, value]) => Some(HirExpr::ListAppend {
+						recv: Box::new(recv.clone()),
+						value: Box::new(value.clone()),
+					}),
+					("replaced", [recv, index, value]) => Some(HirExpr::ListReplace {
+						recv: Box::new(recv.clone()),
+						index: Box::new(index.clone()),
+						value: Box::new(value.clone()),
+					}),
+					("slice", [recv, start, end]) => Some(HirExpr::ListSlice {
+						recv: Box::new(recv.clone()),
+						start: Box::new(start.clone()),
+						end: Box::new(end.clone()),
+					}),
+					_ => None,
+				};
+				if let Some(list) = list {
+					return Ok(list);
+				}
+			}
+			Ok(HirExpr::ExternCall {
+				module: Box::leak(adapter.module.to_string().into_boxed_str()),
+				symbol: Box::leak(adapter.symbol.to_string().into_boxed_str()),
+				args: args.to_vec(),
+				call_mode: match abi.call_mode {
+					crate::ExternalCallMode::Ordinary => nymph_hir::hir::ExternalCallMode::Ordinary,
+					crate::ExternalCallMode::Cancellable => nymph_hir::hir::ExternalCallMode::Cancellable,
+				},
+				argument_marshals,
+				return_marshal,
+			})
+		}
 		crate::ExternalCallable::Native(native) => match (native, args) {
 			(nymph_hir::linkage::NativeExternal::Binary { op, result }, [lhs, rhs]) => {
 				Ok(HirExpr::Binary {
 					op: *op,
 					result: *result,
+					mode: OperationMode::Checked,
 					lhs: Box::new(lhs.clone()),
 					rhs: Box::new(rhs.clone()),
 				})
@@ -864,6 +951,7 @@ fn external_call_expr(
 			(nymph_hir::linkage::NativeExternal::Index, [receiver, index]) => Ok(HirExpr::Index {
 				recv: Box::new(receiver.clone()),
 				index: Box::new(index.clone()),
+				mode: OperationMode::Checked,
 			}),
 			_ => Err(invalid(
 				definition,
@@ -876,16 +964,56 @@ fn external_call_expr(
 	}
 }
 
+fn integer_marshal(ty: &InterfaceType) -> Option<nymph_hir::hir::MarshalKind> {
+	match peel_mut(ty) {
+		InterfaceType::Int => Some(nymph_hir::hir::MarshalKind::Int),
+		InterfaceType::UInt => Some(nymph_hir::hir::MarshalKind::UInt),
+		_ => None,
+	}
+}
+
+fn external_argument_marshals(
+	parameters: &[Option<nymph_hir::hir::MarshalKind>],
+	has_receiver: bool,
+	receiver: Option<&InterfaceType>,
+	hidden_arity: usize,
+) -> Vec<Option<nymph_hir::hir::MarshalKind>> {
+	let mut marshals = Vec::new();
+	if has_receiver {
+		marshals.push(receiver.and_then(integer_marshal));
+	}
+	marshals.extend_from_slice(parameters);
+	marshals.extend((0..hidden_arity).map(|_| None));
+	marshals
+}
+
 fn lower_top_level_external(
 	context: &impl StableLoweringContext,
 	definition: &DefinitionId,
 	abi: &crate::ExternalAbi,
+	receiver_type: Option<&InterfaceType>,
 ) -> Result<LoweredHirFragment, StableLoweringError> {
 	let name = context.binding_name(definition)?;
-	let is_value = match &definition.key {
+	if matches!(abi.callable, crate::ExternalCallable::Linked { .. }) {
+		external_module(definition, abi)?;
+		external_symbol(definition, abi)?;
+	}
+	let (is_value, has_receiver, parameters, _return_type) = match &definition.key {
 		crate::DeclarationKey::TopLevel { category, .. } => match category {
-			crate::DeclarationCategory::Let => true,
-			crate::DeclarationCategory::Function => false,
+			crate::DeclarationCategory::Let => (true, false, Vec::new(), None),
+			crate::DeclarationCategory::Function => {
+				let request = StableShapeRequest::Definition(definition.clone());
+				let StableShapeFact::Definition(shape) = context.stable_shape(&request)? else {
+					return Err(StableShapeLookupError::WrongFact { request }.into());
+				};
+				if shape.id != *definition || shape.external.as_ref() != Some(abi) {
+					return Err(invalid(
+						definition,
+						"top-level external disagrees with its exact checked definition shape",
+					));
+				}
+				(false, false, shape.parameters, shape.return_type)
+			}
 			_ => {
 				return Err(invalid(
 					definition,
@@ -904,14 +1032,17 @@ fn lower_top_level_external(
 					"top-level external disagrees with its exact checked member shape",
 				));
 			}
-			match shape.kind {
-				crate::MemberKind::Value
-				| crate::MemberKind::MutableValue
-				| crate::MemberKind::StaticValue => true,
-				crate::MemberKind::Function
-				| crate::MemberKind::MutatingFunction
-				| crate::MemberKind::StaticFunction => false,
-			}
+			let (is_value, has_receiver) = match shape.kind {
+				crate::MemberKind::Value | crate::MemberKind::StaticValue => (true, false),
+				crate::MemberKind::Function => (false, true),
+				crate::MemberKind::StaticFunction => (false, false),
+			};
+			(
+				is_value,
+				has_receiver,
+				shape.parameters,
+				Some(shape.return_type),
+			)
 		}
 		_ => {
 			return Err(invalid(
@@ -923,14 +1054,15 @@ fn lower_top_level_external(
 	if is_value {
 		let module = external_module(definition, abi)?;
 		let symbol = external_symbol(definition, abi)?;
-		let marshal = abi
-			.marshal
-			.ok_or_else(|| StableLoweringError::MissingExternalMarshal {
-				definition: definition.clone(),
-			})?;
+		let marshal =
+			abi
+				.marshal
+				.result
+				.ok_or_else(|| StableLoweringError::MissingExternalMarshal {
+					definition: definition.clone(),
+				})?;
 		return Ok(LoweredHirFragment::TopLevelValue(HirLet {
 			name: name.as_str().into(),
-			mutable: false,
 			value: HirExpr::ExternValue {
 				module,
 				symbol,
@@ -956,14 +1088,65 @@ fn lower_top_level_external(
 		return Ok(LoweredHirFragment::TopLevelFunction(HirFunc {
 			name: name.as_str().into(),
 			params,
-			body: external_call_expr(definition, abi, &args)?,
+			body: external_call_expr(definition, abi, &args, vec![None; args.len()], None)?,
 		}));
+	}
+	if abi.marshal.parameters.len() != parameters.len() {
+		return Err(invalid(
+			definition,
+			"external parameter marshalling plan does not match its exact ABI",
+		));
+	}
+	let (_, hidden_arity, _) = external_callable_shape(context, definition, abi)?;
+	let argument_marshals = external_argument_marshals(
+		&abi.marshal.parameters,
+		has_receiver,
+		receiver_type,
+		hidden_arity,
+	);
+	let return_marshal = abi.marshal.result;
+	let activation_protocol_adapter = matches!(
+		&abi.callable,
+		crate::ExternalCallable::Linked { adapter }
+			if matches!((adapter.module.as_str(), adapter.symbol.as_str()), ("std/io", "print" | "println"))
+	);
+	if activation_protocol_adapter
+		|| argument_marshals.iter().any(Option::is_some)
+		|| return_marshal.is_some()
+	{
+		let mut params = if has_receiver {
+			vec![EcoString::from("$self")]
+		} else {
+			Vec::new()
+		};
+		params.extend(parameters.iter().enumerate().map(|(index, parameter)| {
+			parameter
+				.name
+				.clone()
+				.unwrap_or_else(|| format!("$arg{index}").into())
+		}));
+		params.extend((0..hidden_arity).map(|index| EcoString::from(format!("$type${index}"))));
+		let args = params
+			.iter()
+			.cloned()
+			.map(HirExpr::Local)
+			.collect::<Vec<_>>();
+		return Ok(LoweredHirFragment::TopLevelExternal {
+			name: name.clone(),
+			abi: abi.clone(),
+			function: Some(HirFunc {
+				name: name.as_str().into(),
+				params,
+				body: external_call_expr(definition, abi, &args, argument_marshals, return_marshal)?,
+			}),
+		});
 	}
 	external_module(definition, abi)?;
 	external_symbol(definition, abi)?;
 	Ok(LoweredHirFragment::TopLevelExternal {
 		name,
 		abi: abi.clone(),
+		function: None,
 	})
 }
 
@@ -1069,7 +1252,7 @@ fn exact_external_abi(
 	};
 	let shape_abi = external_abi(context, definition)?;
 	if let Some(expected) = persisted_marshal {
-		match shape_abi.marshal {
+		match shape_abi.marshal.result {
 			None => {
 				return Err(StableLoweringError::MissingExternalMarshal {
 					definition: definition.clone(),
@@ -1116,7 +1299,15 @@ fn external_callable_shape(
 					"generic external callable disagrees with its exact definition shape",
 				));
 			}
-			Ok((shape.parameters.len(), shape.binders.len(), 0))
+			Ok((
+				shape.parameters.len(),
+				shape
+					.binders
+					.iter()
+					.filter(|binder| binder.kind == crate::GenericParameterKind::Type)
+					.count(),
+				0,
+			))
 		}
 		crate::DeclarationKey::Member { .. } => {
 			let request = StableShapeRequest::Member(definition.clone());
@@ -1126,9 +1317,7 @@ fn external_callable_shape(
 			if shape.id != *definition
 				|| !matches!(
 					shape.kind,
-					crate::MemberKind::Function
-						| crate::MemberKind::MutatingFunction
-						| crate::MemberKind::StaticFunction
+					crate::MemberKind::Function | crate::MemberKind::StaticFunction
 				) || shape.external.as_ref() != Some(abi)
 			{
 				return Err(invalid(
@@ -1156,7 +1345,11 @@ fn external_callable_shape(
 								"generic static external owner disagrees with its exact implementation shape",
 							));
 						}
-						owner_shape.binders.len()
+						owner_shape
+							.binders
+							.iter()
+							.filter(|binder| binder.kind == crate::GenericParameterKind::Type)
+							.count()
 					}
 					_ => {
 						let request = StableShapeRequest::Definition(owner.clone());
@@ -1169,19 +1362,25 @@ fn external_callable_shape(
 								"generic static external owner disagrees with its exact definition shape",
 							));
 						}
-						owner_shape.binders.len()
+						owner_shape
+							.binders
+							.iter()
+							.filter(|binder| binder.kind == crate::GenericParameterKind::Type)
+							.count()
 					}
 				}
 			} else {
 				0
 			};
-			let receiver_arity = usize::from(matches!(
-				shape.kind,
-				crate::MemberKind::Function | crate::MemberKind::MutatingFunction
-			));
+			let receiver_arity = usize::from(matches!(shape.kind, crate::MemberKind::Function));
 			Ok((
 				shape.parameters.len(),
-				owner_binders + shape.binders.len(),
+				owner_binders
+					+ shape
+						.binders
+						.iter()
+						.filter(|binder| binder.kind == crate::GenericParameterKind::Type)
+						.count(),
 				receiver_arity,
 			))
 		}
@@ -1197,8 +1396,8 @@ fn external_module(
 	abi: &ExternalAbi,
 ) -> Result<&'static str, StableLoweringError> {
 	abi
-		.linked()
-		.map(|(module, _)| module)
+		.adapter()
+		.map(|adapter| &adapter.module)
 		.map(|module| Box::leak(module.to_string().into_boxed_str()) as &'static str)
 		.ok_or_else(|| StableLoweringError::MissingExternalModule {
 			definition: definition.clone(),
@@ -1210,8 +1409,8 @@ fn external_symbol(
 	abi: &ExternalAbi,
 ) -> Result<&'static str, StableLoweringError> {
 	abi
-		.linked()
-		.map(|(_, symbol)| symbol)
+		.adapter()
+		.map(|adapter| &adapter.symbol)
 		.map(|symbol| Box::leak(symbol.to_string().into_boxed_str()) as &'static str)
 		.ok_or_else(|| StableLoweringError::MissingExternalSymbol {
 			definition: definition.clone(),
@@ -1230,10 +1429,6 @@ fn stable_runtime_tag(ty: &InterfaceType) -> Option<EcoString> {
 		InterfaceType::List(_) => "list",
 		InterfaceType::Tuple(_) => "tuple",
 		InterfaceType::Map(..) => "map",
-		InterfaceType::Mutable(inner) => {
-			return stable_runtime_tag(inner)
-				.map(|tag| EcoString::from(format!("nymph.mut_{}", &tag[6..])));
-		}
 		_ => return None,
 	};
 	Some(EcoString::from(format!("nymph.{tag}")))
@@ -1257,9 +1452,7 @@ fn primitive_box_binding(tag: EcoString) -> Option<&'static str> {
 fn is_concrete_runtime_type(ty: &InterfaceType) -> bool {
 	match ty {
 		InterfaceType::Generic(_) => false,
-		InterfaceType::List(argument) | InterfaceType::Mutable(argument) => {
-			is_concrete_runtime_type(argument)
-		}
+		InterfaceType::List(argument) => is_concrete_runtime_type(argument),
 		InterfaceType::Tuple(arguments) => arguments.iter().all(is_concrete_runtime_type),
 		InterfaceType::Map(key, value) => {
 			is_concrete_runtime_type(key) && is_concrete_runtime_type(value)
@@ -1295,12 +1488,14 @@ fn substitute_self_type(ty: &InterfaceType, self_type: &InterfaceType) -> Interf
 		InterfaceType::Function {
 			parameters,
 			return_type,
+			effects,
 		} => InterfaceType::Function {
 			parameters: parameters
 				.iter()
 				.map(|parameter| substitute_self_type(parameter, self_type))
 				.collect(),
 			return_type: Box::new(substitute_self_type(return_type, self_type)),
+			effects: effects.clone(),
 		},
 		InterfaceType::Named {
 			definition,
@@ -1323,9 +1518,6 @@ fn substitute_self_type(ty: &InterfaceType, self_type: &InterfaceType) -> Interf
 				.map(|item| substitute_self_type(item, self_type))
 				.collect(),
 		),
-		InterfaceType::Mutable(inner) => {
-			InterfaceType::Mutable(Box::new(substitute_self_type(inner, self_type)))
-		}
 		_ => ty.clone(),
 	}
 }
@@ -1388,7 +1580,6 @@ fn owner_parameter_path(
 						false
 					}
 				}),
-			InterfaceType::Mutable(argument) => visit(argument, parameter, path),
 			_ => false,
 		}
 	}
@@ -1421,12 +1612,14 @@ fn substitute_type_parameters(
 		InterfaceType::Function {
 			parameters,
 			return_type,
+			effects,
 		} => InterfaceType::Function {
 			parameters: parameters
 				.iter()
 				.map(|parameter| substitute_type_parameters(parameter, substitutions))
 				.collect(),
 			return_type: Box::new(substitute_type_parameters(return_type, substitutions)),
+			effects: effects.clone(),
 		},
 		InterfaceType::Named {
 			definition,
@@ -1454,9 +1647,6 @@ fn substitute_type_parameters(
 				.map(|item| substitute_type_parameters(item, substitutions))
 				.collect(),
 		),
-		InterfaceType::Mutable(inner) => {
-			InterfaceType::Mutable(Box::new(substitute_type_parameters(inner, substitutions)))
-		}
 		_ => ty.clone(),
 	}
 }
@@ -1478,7 +1668,6 @@ fn owner_has_no_attachment_shell(
 fn nominal_attachment_shell(ty: &InterfaceType) -> Option<&DefinitionId> {
 	match ty {
 		InterfaceType::Named { definition, .. } => Some(definition),
-		InterfaceType::Mutable(inner) => nominal_attachment_shell(inner),
 		_ => None,
 	}
 }
@@ -1580,10 +1769,8 @@ fn validate_direct_member(
 		|| shape.name != *name
 		|| emitted_name.as_str() != shape.name
 		|| shape.runtime_owner.as_ref() != Some(owner)
-		|| !matches!(
-			shape.kind,
-			crate::MemberKind::Function | crate::MemberKind::MutatingFunction
-		) || shape.external.is_some() != matches!(artifact.payload, crate::RuntimePayload::External(_))
+		|| !matches!(shape.kind, crate::MemberKind::Function)
+		|| shape.external.is_some() != matches!(artifact.payload, crate::RuntimePayload::External(_))
 	{
 		return Err(invalid(member, "direct dispatch member shape has drifted"));
 	}
@@ -1822,13 +2009,13 @@ fn attached_implementation_member(
 		&& !matches!(
 			(member.kind, &body.kind),
 			(
-				crate::MemberKind::Function | crate::MemberKind::MutatingFunction,
+				crate::MemberKind::Function,
 				crate::RuntimeBodyKind::InstanceFunction
 			) | (
 				crate::MemberKind::StaticFunction,
 				crate::RuntimeBodyKind::StaticFunction
 			) | (
-				crate::MemberKind::Value | crate::MemberKind::MutableValue | crate::MemberKind::StaticValue,
+				crate::MemberKind::Value | crate::MemberKind::StaticValue,
 				crate::RuntimeBodyKind::Value
 			)
 		) {
@@ -2009,12 +2196,7 @@ fn lower_body(
 	let has_receiver = (shellless_implementation
 		&& matches!(
 			member_kind,
-			Some(
-				crate::MemberKind::Function
-					| crate::MemberKind::MutatingFunction
-					| crate::MemberKind::Value
-					| crate::MemberKind::MutableValue
-			)
+			Some(crate::MemberKind::Function | crate::MemberKind::Value)
 		)) || (exact_parameterized_implementation && instance_member);
 	let mut type_parameters = implementation_type_parameters.clone();
 	type_parameters.extend(
@@ -2065,6 +2247,7 @@ fn lower_body(
 					.any(|(node, _)| *node == stable.root.id)),
 		loop_depth: Cell::new(0),
 		loop_targets: RefCell::new(Vec::new()),
+		state_loop_targets: RefCell::new(std::collections::HashSet::new()),
 		next_loop_target: Cell::new(0),
 		block_targets: RefCell::new(Vec::new()),
 		next_block_target: Cell::new(0),
@@ -2082,7 +2265,13 @@ fn lower_body(
 			.iter()
 			.map(|param| pattern_name(&param.pattern).map(|name| lowerer.declare(name)))
 			.collect::<Result<Vec<_>, StableLoweringError>>()?;
-		let lowered_body = lowerer.lower_function_body(&stable.root)?;
+		let mut lowered_body = lowerer.lower_function_body(&stable.root)?;
+		if stable.is_async {
+			lowered_body = HirExpr::TaskRecipe {
+				body: Box::new(lowered_body),
+				context: nymph_hir::hir::HirTaskContext::Inherited,
+			};
+		}
 		let hidden = (0..type_parameters.len()).map(|index| EcoString::from(format!("$type${index}")));
 		let function = HirFunc {
 			name: emitted.clone(),
@@ -2133,9 +2322,11 @@ fn lower_body(
 					method: HirMethod {
 						name: context.member_name(&artifact.definition)?.as_str().into(),
 						params: params.into_iter().chain(hidden_params).collect(),
-						body: HirExpr::Call {
+						body: HirExpr::ActivationCall {
 							callee: Box::new(HirExpr::Local(emitted)),
 							args: forwarded_args,
+							mode: nymph_hir::hir::HirCallMode::Tail,
+							source: 0,
 						},
 					},
 				});
@@ -2185,9 +2376,11 @@ fn lower_body(
 							method: HirMethod {
 								name: method.name,
 								params: params.into_iter().chain(hidden_params).collect(),
-								body: HirExpr::Call {
+								body: HirExpr::ActivationCall {
 									callee: Box::new(HirExpr::Local(emitted)),
 									args: forwarded,
+									mode: nymph_hir::hir::HirCallMode::Tail,
+									source: 0,
 								},
 							},
 						});
@@ -2218,7 +2411,6 @@ fn lower_body(
 			} else {
 				Ok(LoweredHirFragment::TopLevelValue(HirLet {
 					name: emitted,
-					mutable: member_kind == Some(crate::MemberKind::MutableValue),
 					value,
 				}))
 			};
@@ -2226,7 +2418,6 @@ fn lower_body(
 		match &artifact.placement {
 			crate::RuntimePlacement::TopLevel => Ok(LoweredHirFragment::TopLevelValue(HirLet {
 				name: emitted,
-				mutable: false,
 				value,
 			})),
 			crate::RuntimePlacement::Attached { owner, .. } => Ok(LoweredHirFragment::AttachedMember {
@@ -2288,6 +2479,7 @@ struct StableBodyLowerer<'a, C> {
 	capture_root_invocation: bool,
 	loop_depth: Cell<u32>,
 	loop_targets: RefCell<Vec<(crate::BodyNodeId, u32)>>,
+	state_loop_targets: RefCell<std::collections::HashSet<u32>>,
 	next_loop_target: Cell<u32>,
 	block_targets: RefCell<Vec<(crate::BodyNodeId, nymph_hir::hir::BlockTarget)>>,
 	next_block_target: Cell<nymph_hir::hir::BlockTarget>,
@@ -2343,6 +2535,47 @@ fn js_reserved_word(name: &str) -> bool {
 impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 	fn id(&self, expr: &StableExpr) -> crate::BodyNodeId {
 		expr.id
+	}
+	fn range_mode(&self, expr: &StableExpr) -> OperationMode {
+		if self
+			.annotations
+			.range_proof(self.id(expr))
+			.is_some_and(|proof| proof.decision == crate::RangeDecision::Safe && proof.audit())
+		{
+			OperationMode::Direct
+		} else {
+			OperationMode::Checked
+		}
+	}
+	fn lower_slice(
+		&self,
+		expr: &StableExpr,
+		index: &StableExpr,
+		recv: HirExpr,
+		string: bool,
+	) -> Result<HirExpr, StableLoweringError> {
+		let StableExprKind::Range(range) = &index.kind else {
+			return Err(self.unsupported(index, "slice index is not a range"));
+		};
+		let (start, end, inclusive) = match range {
+			StableRange::From(start) => (Some(start.as_ref()), None, false),
+			StableRange::To(end) => (None, Some(end.as_ref()), false),
+			StableRange::Exclusive { min, max } => (Some(min.as_ref()), Some(max.as_ref()), false),
+			StableRange::ToInclusive(end) => (None, Some(end.as_ref()), true),
+			StableRange::Inclusive { min, max } => (Some(min.as_ref()), Some(max.as_ref()), true),
+		};
+		Ok(HirExpr::Slice {
+			recv: Box::new(recv),
+			start: start
+				.map(|value| self.lower(value).map(Box::new))
+				.transpose()?,
+			end: end
+				.map(|value| self.lower(value).map(Box::new))
+				.transpose()?,
+			inclusive,
+			string,
+			mode: self.range_mode(expr),
+		})
 	}
 	fn unsupported(&self, expr: &StableExpr, feature: &str) -> StableLoweringError {
 		StableLoweringError::Unsupported {
@@ -2769,14 +3002,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			_ => Err(self.unsupported(expr, "built-in operator result type")),
 		}
 	}
-	fn int_literal_kind(&self, expr: &StableExpr) -> Result<NumKind, StableLoweringError> {
+	fn int_literal_result(&self, expr: &StableExpr) -> Result<BuiltinResult, StableLoweringError> {
 		let Some(ty) = self.annotations.type_of(self.id(expr)) else {
-			return Ok(NumKind::Int);
+			return Ok(BuiltinResult::Int);
 		};
 		match peel_mut(ty) {
-			InterfaceType::Int => Ok(NumKind::Int),
-			InterfaceType::UInt => Ok(NumKind::UInt),
-			InterfaceType::Float => Ok(NumKind::Float),
+			InterfaceType::Int => Ok(BuiltinResult::Int),
+			InterfaceType::UInt => Ok(BuiltinResult::UInt),
+			InterfaceType::Float => Ok(BuiltinResult::Float),
 			_ => Err(self.unsupported(expr, "integer literal type")),
 		}
 	}
@@ -2791,7 +3024,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		self.annotations.variant(self.id(expr))
 	}
 	fn lower_function_body(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
-		self.with_callable_frame(|| match &expr.kind {
+		let mut body = self.with_callable_frame(|| match &expr.kind {
 			StableExprKind::Block { body, label: None } => self.lower_block(body, false),
 			StableExprKind::Block {
 				body,
@@ -2809,7 +3042,98 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				})
 			}
 			_ => self.lower(expr),
-		})
+		})?;
+		Self::mark_tail_call(&mut body);
+		Ok(body)
+	}
+
+	fn activation_call(source: crate::BodyNodeId, call: HirExpr) -> HirExpr {
+		match call {
+			HirExpr::Call { callee, args } => HirExpr::ActivationCall {
+				callee,
+				args,
+				mode: nymph_hir::hir::HirCallMode::Push,
+				source: source.0,
+			},
+			HirExpr::StaticEnumDispatch {
+				owner,
+				method,
+				receiver,
+				args,
+				..
+			} => HirExpr::StaticEnumDispatch {
+				owner,
+				method,
+				receiver,
+				args,
+				mode: nymph_hir::hir::HirCallMode::Push,
+				source: source.0,
+			},
+			other => other,
+		}
+	}
+
+	fn activation_dispatch_call(
+		source: crate::BodyNodeId,
+		dispatch: &crate::StableDispatch,
+		call: HirExpr,
+	) -> HirExpr {
+		let generated = match dispatch {
+			crate::StableDispatch::Direct { .. }
+			| crate::StableDispatch::SelectedImplementation { .. }
+			| crate::StableDispatch::InterfaceDefault { .. }
+			| crate::StableDispatch::External { .. } => matches!(call, HirExpr::Call { .. }),
+			crate::StableDispatch::GenericBound { .. } => true,
+			crate::StableDispatch::Builtin { .. } => false,
+		};
+		if generated {
+			Self::activation_call(source, call)
+		} else {
+			call
+		}
+	}
+
+	/// Mark only calls whose result is the callable's result. Blocks, branches,
+	/// matches, and explicit callable returns preserve tail position; argument,
+	/// condition, and lexical-block-return expressions do not.
+	fn mark_tail_call(expr: &mut HirExpr) {
+		match expr {
+			HirExpr::ActivationCall { mode, .. }
+			| HirExpr::StaticEnumDispatch { mode, .. }
+			| HirExpr::BoundDispatch { mode, .. }
+			| HirExpr::UnaryBoundDispatch { mode, .. } => {
+				*mode = nymph_hir::hir::HirCallMode::Tail;
+			}
+			HirExpr::Block { stmts, tail } => {
+				for stmt in stmts {
+					if let HirStmt::Return {
+						value: Some(value),
+						target: nymph_hir::hir::HirReturnTarget::Callable,
+					} = stmt
+					{
+						Self::mark_tail_call(value);
+					}
+				}
+				if let Some(tail) = tail {
+					Self::mark_tail_call(tail);
+				}
+			}
+			HirExpr::LabeledBlock { body, .. } => Self::mark_tail_call(body),
+			HirExpr::If {
+				then, otherwise, ..
+			} => {
+				Self::mark_tail_call(then);
+				if let Some(otherwise) = otherwise {
+					Self::mark_tail_call(otherwise);
+				}
+			}
+			HirExpr::Match { arms, .. } => {
+				for arm in arms {
+					Self::mark_tail_call(&mut arm.body);
+				}
+			}
+			_ => {}
+		}
 	}
 	fn lower_loop_branch(
 		&self,
@@ -2845,17 +3169,17 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		expr: &StableExpr,
 		value: &StableExpr,
 	) -> Result<HirExpr, StableLoweringError> {
-		let kind = self
+		let propagation = self
 			.annotations
 			.propagations
 			.iter()
-			.find_map(|(node, kind)| (*node == self.id(expr)).then_some(*kind))
+			.find_map(|(node, propagation)| (*node == self.id(expr)).then_some(propagation))
 			.ok_or_else(|| StableLoweringError::MissingAnnotation {
 				definition: self.artifact.definition.clone(),
 				node: self.id(expr),
 				channel: "propagation".into(),
 			})?;
-		let (definition, success, success_field, failure, failure_field) = match kind {
+		let (definition, success, success_field, failure, failure_field) = match propagation.kind {
 			crate::RuntimePropagationKind::Option => {
 				let role = self
 					.annotations
@@ -2894,15 +3218,43 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.transpose()?;
 		let temporary = self.declare(&"$propagation".into());
 		let payload = self.declare(&"$value".into());
+		let failure_payload = propagation
+			.conversion
+			.as_ref()
+			.map(|_| self.declare(&"$error".into()));
 		let failure_fields = failure_field
+			.clone()
 			.into_iter()
-			.map(|field| (field, HirPat::Wildcard))
+			.map(|field| {
+				(
+					field,
+					failure_payload
+						.clone()
+						.map_or(HirPat::Wildcard, |name| HirPat::Binding { name, sub: None }),
+				)
+			})
 			.collect();
+		let failure_return = if let (Some(dispatch), Some(error), Some(field)) = (
+			propagation.conversion.as_ref(),
+			failure_payload,
+			failure_field,
+		) {
+			let mut converted = self.lower_dispatch(dispatch, value, vec![])?;
+			Self::replace_dispatch_receiver(&mut converted, HirExpr::Local(error));
+			HirExpr::VariantNew {
+				enum_name: enum_name.clone(),
+				variant: failure.clone(),
+				fields: vec![(field, converted)],
+				prototype: None,
+			}
+		} else {
+			HirExpr::Local(temporary.clone())
+		};
 		Ok(HirExpr::Block {
 			stmts: vec![HirStmt::Let {
 				name: temporary.clone(),
-				mutable: false,
 				value: self.lower(value)?,
+				cleanup: None,
 			}],
 			tail: Some(Box::new(HirExpr::Match {
 				scrutinee: Box::new(HirExpr::Local(temporary.clone())),
@@ -2931,7 +3283,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						guard: None,
 						body: HirExpr::Block {
 							stmts: vec![HirStmt::Return {
-								value: Some(HirExpr::Local(temporary)),
+								value: Some(failure_return),
 								target: self.return_target(expr),
 							}],
 							tail: None,
@@ -2982,6 +3334,9 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.ok_or_else(|| self.unsupported(expr, unsupported))
 	}
 	fn lower(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
+		if self.is_task_special(expr) {
+			return self.lower_task_special(expr);
+		}
 		if let Some(arity) = self.annotations.anonymous_closure_arity(self.id(expr)) {
 			return self.with_scope(|| {
 				let params = (0..arity)
@@ -2994,23 +3349,78 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				})
 			});
 		}
-		let lowered = self.lower_inner(expr)?;
-		if self
-			.annotations
-			.implicitly_converts_uint_to_int(self.id(expr))
-		{
-			Ok(HirExpr::ScalarCast {
-				kind: ScalarCastKind::ToInt,
-				operand: Box::new(lowered),
-			})
-		} else {
-			Ok(lowered)
-		}
+		// Keep recursively lowered special forms out of the large `lower_inner`
+		// debug frame so ordinary test-thread stacks remain sufficient.
+		let lowered = match &expr.kind {
+			StableExprKind::Match { value, arms } => self.lower_match(value, arms)?,
+			_ => self.lower_inner(expr)?,
+		};
+		Ok(lowered)
 	}
+
+	fn lower_match(
+		&self,
+		value: &StableExpr,
+		arms: &[StableMatchArm],
+	) -> Result<HirExpr, StableLoweringError> {
+		Ok(HirExpr::Match {
+			scrutinee: Box::new(self.lower(value)?),
+			arms: arms
+				.iter()
+				.map(|arm| {
+					self.with_scope(|| {
+						Ok(HirArm {
+							pat: self.lower_pattern(&arm.pattern)?,
+							guard: arm
+								.guard
+								.as_ref()
+								.map(|guard| self.lower(guard))
+								.transpose()?,
+							body: self.lower(&arm.body)?,
+						})
+					})
+				})
+				.collect::<Result<_, StableLoweringError>>()?,
+		})
+	}
+
 	fn lower_inner(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
+		if !matches!(expr.kind, StableExprKind::Int(_) | StableExprKind::UInt(_))
+			&& let Some(value) = stable_integer_constant(expr)
+		{
+			match self.annotations.type_of(self.id(expr)).map(peel_mut) {
+				None | Some(InterfaceType::Int) => {
+					return Ok(HirExpr::Int(i64::try_from(value).map_err(|_| {
+						invalid(
+							&self.artifact.definition,
+							"checked int constant is out of range",
+						)
+					})?));
+				}
+				Some(InterfaceType::UInt) => {
+					return Ok(HirExpr::UInt(u64::try_from(value).map_err(|_| {
+						invalid(
+							&self.artifact.definition,
+							"checked uint constant is out of range",
+						)
+					})?));
+				}
+				_ => {}
+			}
+		}
 		Ok(match &expr.kind {
-			StableExprKind::Int(value) => HirExpr::Num(*value as f64, self.int_literal_kind(expr)?),
-			StableExprKind::UInt(value) => HirExpr::Num(*value as f64, NumKind::UInt),
+			StableExprKind::Int(value) => match self.int_literal_result(expr)? {
+				BuiltinResult::Int => HirExpr::Int(i64::try_from(*value).map_err(|_| {
+					invalid(
+						&self.artifact.definition,
+						"positive int literal exceeds i64::MAX",
+					)
+				})?),
+				BuiltinResult::UInt => HirExpr::UInt(*value),
+				BuiltinResult::Float => HirExpr::Num(*value as f64, NumKind::Float),
+				_ => unreachable!("integer literals only infer numeric result types"),
+			},
+			StableExprKind::UInt(value) => HirExpr::UInt(*value),
 			StableExprKind::Float(value) => HirExpr::Num(value.into_inner(), NumKind::Float),
 			StableExprKind::Boolean(value) => HirExpr::Bool(*value),
 			StableExprKind::Char(value) => HirExpr::Char(*value),
@@ -3064,6 +3474,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							let expected =
 								abi
 									.marshal
+									.result
 									.ok_or_else(|| StableLoweringError::MissingExternalMarshal {
 										definition: target.clone(),
 									})?;
@@ -3105,7 +3516,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				}
 			}
 			StableExprKind::List(items) | StableExprKind::Tuple(items) => {
-				let kind = if matches!(expr.kind, StableExprKind::List(_)) {
+				let is_list = matches!(expr.kind, StableExprKind::List(_));
+				let kind = if is_list {
 					HirArrayKind::List
 				} else {
 					HirArrayKind::Tuple
@@ -3114,26 +3526,30 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.iter()
 					.any(|item| matches!(*item, StableListItem::Spread(_)))
 				{
-					HirExpr::ArraySpread {
-						kind,
-						elems: items
-							.iter()
-							.map(|item| match item {
-								StableListItem::Expr(value) => self.lower(value).map(HirArrayElem::Item),
-								StableListItem::Spread(value) => self.lower_spread(value).map(HirArrayElem::Spread),
-							})
-							.collect::<Result<_, _>>()?,
+					let elems = items
+						.iter()
+						.map(|item| match item {
+							StableListItem::Expr(value) => self.lower(value).map(HirArrayElem::Item),
+							StableListItem::Spread(value) => self.lower_spread(value).map(HirArrayElem::Spread),
+						})
+						.collect::<Result<_, _>>()?;
+					if is_list {
+						HirExpr::ListConstruct(elems)
+					} else {
+						HirExpr::ArraySpread { kind, elems }
 					}
 				} else {
-					HirExpr::Array {
-						kind,
-						items: items
-							.iter()
-							.map(|item| match item {
-								StableListItem::Expr(item) => self.lower(item),
-								_ => unreachable!(),
-							})
-							.collect::<Result<_, _>>()?,
+					let items: Vec<HirExpr> = items
+						.iter()
+						.map(|item| match item {
+							StableListItem::Expr(item) => self.lower(item),
+							_ => unreachable!(),
+						})
+						.collect::<Result<_, _>>()?;
+					if is_list {
+						HirExpr::ListConstruct(items.into_iter().map(HirArrayElem::Item).collect())
+					} else {
+						HirExpr::Array { kind, items }
 					}
 				};
 				match self.construction_prototype(expr)? {
@@ -3327,7 +3743,11 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							args.iter().map(|argument| &argument.value).collect(),
 						)?;
 						Self::replace_dispatch_receiver(&mut operation, payload);
-						Ok(operation)
+						Ok(Self::activation_dispatch_call(
+							lowerer.id(expr),
+							&dispatch,
+							operation,
+						))
 					});
 				}
 				if self.definitely_transfers(func) {
@@ -3381,48 +3801,74 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						self.context.stable_shape(&request)?
 					{
 						self.demand_external(target)?;
-						let (stmts, fields) = self.with_scope(|| {
+						let plan = self
+							.annotations
+							.struct_construction(self.id(expr))
+							.ok_or_else(|| self.missing_annotation(self.id(expr), "struct construction plan"))?;
+						if plan.definition != *target {
+							return Err(invalid(
+								&self.artifact.definition,
+								"struct construction plan has the wrong exact owner",
+							));
+						}
+						let (stmts, values, source) = self.with_scope(|| {
 							let mut stmts = Vec::with_capacity(args.len());
 							let mut values = HashMap::with_capacity(args.len());
+							let mut source = None;
 							for (index, argument) in args.iter().enumerate() {
-								let field = argument
-									.name
-									.as_ref()
-									.and_then(|name| shell.fields.iter().find(|field| field.name == *name))
-									.or_else(|| shell.fields.get(index))
-									.ok_or_else(|| {
-										invalid(
-											&self.artifact.definition,
-											"struct argument has no exact field",
-										)
-									})?;
 								let temporary = self.declare(&format!("$struct_arg_{index}").into());
 								stmts.push(HirStmt::Let {
 									name: temporary.clone(),
-									mutable: false,
 									value: self.lower(&argument.value)?,
+									cleanup: None,
 								});
-								values.insert(field.name.clone(), temporary);
+								if argument.spread {
+									source = Some(temporary);
+								} else if let Some((field, _)) = plan
+									.explicit_fields
+									.iter()
+									.find(|(_, value)| *value == argument.value.id)
+								{
+									values.insert(field.clone(), temporary);
+								}
 							}
-							let fields = shell
-								.fields
-								.iter()
-								.filter_map(|field| {
-									values
-										.get(&field.name)
-										.cloned()
-										.map(|value| (field.name.clone(), HirExpr::Local(value)))
-								})
-								.collect();
-							Ok((stmts, fields))
+							Ok((stmts, values, source))
 						})?;
+						let fields = shell
+							.fields
+							.iter()
+							.filter_map(|field| {
+								values
+									.get(&field.id)
+									.map(|value| (field.name.clone(), HirExpr::Local(value.clone())))
+							})
+							.collect::<Vec<_>>();
+						let class = self.context.binding_name(target)?.as_str().into();
+						let prototype = self.construction_prototype(expr)?;
+						let construction = match &plan.mode {
+							crate::runtime::StableStructConstructionMode::Fresh => HirExpr::StructFresh {
+								class,
+								fields,
+								prototype,
+							},
+							crate::runtime::StableStructConstructionMode::CloneUpdate { .. } => {
+								let source = source.ok_or_else(|| {
+									invalid(
+										&self.artifact.definition,
+										"struct clone has no evaluated source",
+									)
+								})?;
+								HirExpr::StructCloneUpdate {
+									class,
+									source: Box::new(HirExpr::Local(source)),
+									replacements: fields,
+									prototype,
+								}
+							}
+						};
 						return Ok(HirExpr::Block {
 							stmts,
-							tail: Some(Box::new(HirExpr::New {
-								class: self.context.binding_name(target)?.as_str().into(),
-								fields,
-								prototype: self.construction_prototype(expr)?,
-							})),
+							tail: Some(Box::new(construction)),
 						});
 					}
 				}
@@ -3434,15 +3880,20 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						parent,
 						args.iter().map(|arg| &arg.value).collect(),
 					)?;
-					return if matches!(
+					let lowered = if matches!(
 						dispatch,
 						crate::StableDispatch::SelectedImplementation { .. }
 							| crate::StableDispatch::InterfaceDefault { .. }
 					) {
-						Ok(lowered)
+						lowered
 					} else {
-						self.append_hidden_arguments(self.id(expr), lowered)
+						self.append_hidden_arguments(self.id(expr), lowered)?
 					};
+					return Ok(Self::activation_dispatch_call(
+						self.id(expr),
+						dispatch,
+						lowered,
+					));
 				}
 				if let Some((parameter, interface, member_definition)) =
 					self.annotations.generic_namespaced_call(self.id(expr))
@@ -3480,14 +3931,18 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							)
 						})?;
 					let receiver = self.runtime_type_object(&InterfaceType::Generic(parameter.clone()))?;
-					return Ok(HirExpr::Call {
-						callee: Box::new(HirExpr::Field {
-							recv: Box::new(receiver),
-							name: member.clone(),
-						}),
-						args: lowered_args,
-					});
+					return Ok(Self::activation_call(
+						self.id(expr),
+						HirExpr::Call {
+							callee: Box::new(HirExpr::Field {
+								recv: Box::new(receiver),
+								name: member.clone(),
+							}),
+							args: lowered_args,
+						},
+					));
 				}
+				let mut generated_call = true;
 				if let Some(target) = self.target(func) {
 					let target_artifact = self.context.runtime_definition(target)?;
 					if matches!(target_artifact.payload, crate::RuntimePayload::External(_)) {
@@ -3498,6 +3953,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 								"direct external call targets a deferred external",
 							));
 						}
+						generated_call = matches!(&abi.callable, crate::ExternalCallable::Linked { .. });
 						let (source_arity, binder_arity, receiver_arity) =
 							external_callable_shape(self.context, target, &abi)?;
 						if receiver_arity != 0 || args.len() != source_arity {
@@ -3532,13 +3988,18 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.iter()
 					.map(|arg| self.lower(&arg.value))
 					.collect::<Result<Vec<_>, _>>()?;
-				self.append_hidden_arguments(
+				let lowered = self.append_hidden_arguments(
 					self.id(expr),
 					HirExpr::Call {
 						callee: Box::new(self.lower(func)?),
 						args: lowered_args,
 					},
-				)?
+				)?;
+				if generated_call {
+					Self::activation_call(self.id(expr), lowered)
+				} else {
+					lowered
+				}
 			}
 			StableExprKind::BinaryOp { lhs, op, rhs } => {
 				if self.definitely_transfers(lhs) {
@@ -3578,25 +4039,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					} else {
 						self.append_hidden_arguments(self.id(rhs), call)?
 					};
+					let call = Self::activation_call(self.id(expr), call);
 					return Ok(HirExpr::Block {
 						stmts: vec![HirStmt::Let {
 							name: lhs_name.clone(),
-							mutable: false,
 							value: lhs,
+							cleanup: None,
 						}],
 						tail: Some(Box::new(call)),
-					});
-				}
-				if matches!(op, BinaryOperator::Equals | BinaryOperator::NotEquals)
-					&& matches!(
-						peel_mut(&self.ty(lhs)?),
-						InterfaceType::Named { .. } | InterfaceType::Generic(_)
-					) {
-					return Ok(HirExpr::Binary {
-						op: binop(*op).expect("equality operators have builtin identity HIR"),
-						result: BuiltinResult::IdentityBoolean,
-						lhs: Box::new(self.lower(lhs)?),
-						rhs: Box::new(self.lower(rhs)?),
 					});
 				}
 				let dispatch = self.dispatch(expr)?;
@@ -3611,10 +4061,23 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					return Ok(HirExpr::Block {
 						stmts: vec![HirStmt::Let {
 							name: lhs_name,
-							mutable: false,
 							value: lhs_value,
+							cleanup: None,
 						}],
 						tail: Some(Box::new(operation)),
+					});
+				}
+				if let crate::StableDispatch::Builtin {
+					method,
+					category: crate::BuiltinDispatch::StructuralEquality,
+				} = dispatch
+				{
+					return Ok(HirExpr::Call {
+						callee: Box::new(HirExpr::Field {
+							recv: Box::new(self.lower(lhs)?),
+							name: method.clone(),
+						}),
+						args: vec![self.lower(rhs)?],
 					});
 				}
 				if !matches!(dispatch, crate::StableDispatch::Builtin { .. }) {
@@ -3628,6 +4091,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				HirExpr::Binary {
 					op: binop(*op).ok_or_else(|| self.unsupported(expr, "protocol binary operator"))?,
 					result: self.builtin_result(expr)?,
+					mode: self.range_mode(expr),
 					lhs: Box::new(self.lower(lhs)?),
 					rhs: Box::new(self.lower(rhs)?),
 				}
@@ -3635,6 +4099,12 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			StableExprKind::PrefixOp { op, value } => {
 				if self.definitely_transfers(value) {
 					return self.lower(value);
+				}
+				if *op == PrefixOperator::Negate
+					&& matches!(&value.kind, StableExprKind::Int(magnitude) if *magnitude == 1_u64 << 63)
+					&& matches!(self.builtin_result(expr)?, BuiltinResult::Int)
+				{
+					return Ok(HirExpr::Int(i64::MIN));
 				}
 				let dispatch = self.dispatch(expr)?;
 				if !matches!(dispatch, crate::StableDispatch::Builtin { .. }) {
@@ -3648,48 +4118,6 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					},
 					result: self.builtin_result(expr)?,
 					operand: Box::new(self.lower(value)?),
-				}
-			}
-			StableExprKind::AssignOp {
-				lhs,
-				op: AssignOperator::Assign,
-				rhs,
-			} => HirExpr::Assign {
-				target: Box::new(self.lower(lhs)?),
-				value: Box::new(self.lower(rhs)?),
-			},
-			StableExprKind::AssignOp { lhs, op, rhs } => {
-				if self.definitely_transfers(rhs) {
-					return Ok(HirExpr::Assign {
-						target: Box::new(self.lower(lhs)?),
-						value: Box::new(self.lower(rhs)?),
-					});
-				}
-				let binary =
-					assign_binop(*op).ok_or_else(|| self.unsupported(expr, "assignment operator"))?;
-				let target = self.lower(lhs)?;
-				let mut value = match self.dispatch(expr)? {
-					crate::StableDispatch::Builtin { .. } => HirExpr::Binary {
-						op: binop(binary).unwrap(),
-						result: self.builtin_result(lhs)?,
-						lhs: Box::new(self.lower(lhs)?),
-						rhs: Box::new(self.lower(rhs)?),
-					},
-					dispatch => self.lower_dispatch(dispatch, lhs, vec![rhs])?,
-				};
-				let (stmts, target) = self.capture_compound_place(target);
-				Self::replace_dispatch_receiver(&mut value, target.clone());
-				let assignment = HirExpr::Assign {
-					target: Box::new(target),
-					value: Box::new(value),
-				};
-				if stmts.is_empty() {
-					assignment
-				} else {
-					HirExpr::Block {
-						stmts,
-						tail: Some(Box::new(assignment)),
-					}
 				}
 			}
 			StableExprKind::Block { body, label } => {
@@ -3720,18 +4148,6 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.map(|value| self.lower(value).map(Box::new))
 					.transpose()?,
 			},
-			StableExprKind::While {
-				condition, body, ..
-			} => {
-				let target = self.next_loop();
-				HirExpr::While {
-					target,
-					cond: Box::new(self.lower(condition)?),
-					body: Box::new(self.lower_loop_branch(self.id(expr), target, body)?),
-					continue_epilogue: None,
-					option: self.loop_option(expr)?,
-				}
-			}
 			StableExprKind::Closure { params, body, .. } => self.with_scope(|| {
 				let params = params
 					.iter()
@@ -3743,6 +4159,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					body: Box::new(body),
 				})
 			})?,
+			StableExprKind::AsyncBlock(_) | StableExprKind::Await(_) => unreachable!(),
 			StableExprKind::Return { value, .. } => HirExpr::Block {
 				stmts: vec![HirStmt::Return {
 					value: value.as_ref().map(|value| self.lower(value)).transpose()?,
@@ -3763,9 +4180,38 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						}),
 				),
 			},
-			StableExprKind::Continue { .. } => HirExpr::Continue {
-				target: self.resolve_loop_target(expr, "continue outside a loop")?,
+			StableExprKind::Continue { replacements, .. } => {
+				let target = self.resolve_loop_target(expr, "continue outside a loop")?;
+				if self.state_loop_targets.borrow().contains(&target) {
+					HirExpr::ContinueTransition {
+						target,
+						replacements: replacements
+							.iter()
+							.map(|replacement| Ok((replacement.name.clone(), self.lower(&replacement.value)?)))
+							.collect::<Result<_, StableLoweringError>>()?,
+					}
+				} else {
+					HirExpr::Continue { target }
+				}
+			}
+			StableExprKind::Echo { operand, keyword } => HirExpr::Echo {
+				operand: Box::new(self.lower(operand)?),
+				site: nymph_hir::hir::EchoSite {
+					module: self.artifact.definition.module.path.clone(),
+					start: u32::try_from(keyword.start).unwrap_or(u32::MAX),
+					end: u32::try_from(keyword.end).unwrap_or(u32::MAX),
+				},
 			},
+			StableExprKind::IndexAccess {
+				parent,
+				index,
+				optional: false,
+			} if matches!(index.kind, StableExprKind::Range(_)) => self.lower_slice(
+				expr,
+				index,
+				self.lower(parent)?,
+				matches!(peel_mut(&self.ty(parent)?), InterfaceType::String),
+			)?,
 			StableExprKind::IndexAccess {
 				parent,
 				index,
@@ -3773,6 +4219,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			} => {
 				let payload_type = self.optional_chain_payload_type(parent)?;
 				return self.lower_optional_chain(expr, parent, |lowerer, payload| {
+					if matches!(index.kind, StableExprKind::Range(_)) {
+						return lowerer.lower_slice(
+							expr,
+							index,
+							payload,
+							matches!(peel_mut(&payload_type), InterfaceType::String),
+						);
+					}
 					Ok(match peel_mut(&payload_type) {
 						InterfaceType::Map(..) => HirExpr::MapGet {
 							recv: Box::new(payload),
@@ -3784,9 +4238,15 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							Self::replace_dispatch_receiver(&mut operation, payload);
 							operation
 						}
-						InterfaceType::List(_) | InterfaceType::Tuple(_) => HirExpr::Index {
+						InterfaceType::List(_) => HirExpr::ListRead {
 							recv: Box::new(payload),
 							index: Box::new(lowerer.lower(index)?),
+							mode: lowerer.range_mode(expr),
+						},
+						InterfaceType::Tuple(_) | InterfaceType::String => HirExpr::Index {
+							recv: Box::new(payload),
+							index: Box::new(lowerer.lower(index)?),
+							mode: lowerer.range_mode(expr),
 						},
 						_ => {
 							let mut operation =
@@ -3814,9 +4274,15 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				InterfaceType::List(_) if self.annotations.dispatch(self.id(expr)).is_some() => {
 					self.lower_dispatch(self.dispatch(expr)?, parent, vec![index])?
 				}
-				InterfaceType::List(_) | InterfaceType::Tuple(_) => HirExpr::Index {
+				InterfaceType::List(_) => HirExpr::ListRead {
 					recv: Box::new(self.lower(parent)?),
 					index: Box::new(self.lower(index)?),
+					mode: self.range_mode(expr),
+				},
+				InterfaceType::Tuple(_) | InterfaceType::String => HirExpr::Index {
+					recv: Box::new(self.lower(parent)?),
+					index: Box::new(self.lower(index)?),
+					mode: self.range_mode(expr),
 				},
 				_ => self.lower_dispatch(self.dispatch(expr)?, parent, vec![index])?,
 			},
@@ -3825,13 +4291,46 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				iterable,
 				body,
 				..
-			} => self.lower_for(
+			} => self.lower_iteration(
 				self.id(expr),
 				variable,
 				iterable,
 				body,
 				self.loop_option(expr)?,
 			)?,
+			StableExprKind::StateLoop { bindings, body, .. } => self.with_scope(|| {
+				let target = self.next_loop();
+				let mut lowered_bindings = Vec::with_capacity(bindings.len());
+				for binding in bindings.iter() {
+					let source = binding.value.id;
+					let value = self.lower(&binding.value)?;
+					let name = self.declare(&binding.name);
+					let cleanup = if binding.managed {
+						let dispatch = self.annotations.managed_cleanup(source).ok_or_else(|| {
+							invalid(
+								&self.artifact.definition,
+								"managed state binding has no stable cleanup fact",
+							)
+						})?;
+						Some(self.lower_dispatch_value(source, dispatch, HirExpr::Local(name.clone()))?)
+					} else {
+						None
+					};
+					lowered_bindings.push(nymph_hir::hir::HirStateBinding {
+						name,
+						value,
+						cleanup,
+					});
+				}
+				self.state_loop_targets.borrow_mut().insert(target);
+				let body = self.lower_loop_branch(self.id(expr), target, body)?;
+				self.state_loop_targets.borrow_mut().remove(&target);
+				Ok(HirExpr::StateLoop {
+					target,
+					bindings: lowered_bindings,
+					body: Box::new(body),
+				})
+			})?,
 			StableExprKind::Range(range) => {
 				let definition = self.target(expr).ok_or_else(|| {
 					invalid(
@@ -3856,25 +4355,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					prototype: self.construction_prototype(expr)?,
 				}
 			}
-			StableExprKind::Match { value, arms } => HirExpr::Match {
-				scrutinee: Box::new(self.lower(value)?),
-				arms: arms
-					.iter()
-					.map(|arm| {
-						self.with_scope(|| {
-							Ok(HirArm {
-								pat: self.lower_pattern(&arm.pattern)?,
-								guard: arm
-									.guard
-									.as_ref()
-									.map(|guard| self.lower(guard))
-									.transpose()?,
-								body: self.lower(&arm.body)?,
-							})
-						})
-					})
-					.collect::<Result<_, StableLoweringError>>()?,
-			},
+			StableExprKind::Match { value, arms } => return self.lower_match(value, arms),
 			StableExprKind::PatternOp { lhs, op, rhs } => {
 				let scrutinee = Box::new(self.lower(lhs)?);
 				// Pattern-operator bindings are scoped to the test and must not replace
@@ -3914,12 +4395,86 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			StableExprKind::String(parts) => self.lower_string(parts)?,
 		})
 	}
+
+	fn lower_task_spawn(
+		&self,
+		expr: &StableExpr,
+		func: &StableExpr,
+		args: &[crate::StableCallArg],
+	) -> Result<Option<HirExpr>, StableLoweringError> {
+		let StableExprKind::MemberAccess { parent, member, .. } = &func.kind else {
+			return Ok(None);
+		};
+		if member != "spawn"
+			|| !args.is_empty()
+			|| !matches!(
+				self.annotations.type_of(expr.id),
+				Some(InterfaceType::Handle(_))
+			) {
+			return Ok(None);
+		}
+		Ok(Some(HirExpr::TaskOperation {
+			operation: nymph_hir::hir::HirTaskOperation::Spawn,
+			operands: vec![self.lower(parent)?],
+		}))
+	}
+
+	fn is_task_special(&self, expr: &StableExpr) -> bool {
+		match &expr.kind {
+			StableExprKind::AsyncBlock(_) | StableExprKind::Await(_) => true,
+			StableExprKind::Call { func, args } => {
+				matches!(&func.kind, StableExprKind::MemberAccess { member, .. } if member == "spawn")
+					&& args.is_empty()
+					&& matches!(
+						self.annotations.type_of(expr.id),
+						Some(InterfaceType::Handle(_))
+					)
+			}
+			_ => false,
+		}
+	}
+
+	fn lower_task_special(&self, expr: &StableExpr) -> Result<HirExpr, StableLoweringError> {
+		let lowered = match &expr.kind {
+			StableExprKind::AsyncBlock(body) => self.lower_async_block(body)?,
+			StableExprKind::Await(value) => self.lower_await(value)?,
+			StableExprKind::Call { func, args } => self
+				.lower_task_spawn(expr, func, args)?
+				.expect("task-special call is a spawn operation"),
+			_ => unreachable!(),
+		};
+		Ok(lowered)
+	}
+
+	fn lower_async_block(&self, body: &StableExpr) -> Result<HirExpr, StableLoweringError> {
+		Ok(HirExpr::TaskRecipe {
+			body: Box::new(self.with_deferred(|| self.lower_function_body(body))?),
+			context: nymph_hir::hir::HirTaskContext::Nested,
+		})
+	}
+
+	fn lower_await(&self, value: &StableExpr) -> Result<HirExpr, StableLoweringError> {
+		let operation = if matches!(
+			self.annotations.type_of(value.id),
+			Some(InterfaceType::Handle(_))
+		) {
+			nymph_hir::hir::HirTaskOperation::Observe
+		} else {
+			nymph_hir::hir::HirTaskOperation::Drive
+		};
+		Ok(HirExpr::TaskOperation {
+			operation,
+			operands: vec![self.lower(value)?],
+		})
+	}
+
 	fn replace_dispatch_argument(expr: &mut HirExpr, argument: HirExpr) {
 		match expr {
-			HirExpr::Call { callee, args } => {
+			HirExpr::Call { callee, args } | HirExpr::ActivationCall { callee, args, .. } => {
 				let index = usize::from(!matches!(callee.as_ref(), HirExpr::Field { .. }));
 				args[index] = argument;
 			}
+			HirExpr::StaticEnumDispatch { args, .. } => args[0] = argument,
 			HirExpr::ExternCall { args, .. } => {
 				args[1] = argument;
 			}
@@ -3933,97 +4488,42 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 
 	fn replace_dispatch_receiver(expr: &mut HirExpr, receiver: HirExpr) {
 		match expr {
-			HirExpr::Call { callee, .. } if matches!(callee.as_ref(), HirExpr::Field { .. }) => {
+			HirExpr::Call { callee, .. } | HirExpr::ActivationCall { callee, .. }
+				if matches!(callee.as_ref(), HirExpr::Field { .. }) =>
+			{
 				let HirExpr::Field { recv, .. } = callee.as_mut() else {
 					unreachable!()
 				};
 				**recv = receiver;
 			}
-			HirExpr::Call { args, .. } | HirExpr::ExternCall { args, .. } => args[0] = receiver,
+			HirExpr::Call { args, .. }
+			| HirExpr::ActivationCall { args, .. }
+			| HirExpr::ExternCall { args, .. } => args[0] = receiver,
+			HirExpr::StaticEnumDispatch {
+				receiver: found, ..
+			} => **found = receiver,
 			HirExpr::BoundDispatch {
 				receiver: found, ..
 			} => **found = receiver,
+			HirExpr::ListRead { recv, .. } | HirExpr::Index { recv, .. } => **recv = receiver,
 			HirExpr::Binary { lhs, .. } => **lhs = receiver,
 			other => panic!("binary dispatch lowered to an unexpected HIR shape: {other:?}"),
 		}
 	}
 
-	fn capture_compound_place(&self, target: HirExpr) -> (Vec<HirStmt>, HirExpr) {
-		match target {
-			HirExpr::Field { recv, name } => {
-				let receiver = self.declare(&"$compound_receiver".into());
-				(
-					vec![HirStmt::Let {
-						name: receiver.clone(),
-						mutable: false,
-						value: *recv,
-					}],
-					HirExpr::Field {
-						recv: Box::new(HirExpr::Local(receiver)),
-						name,
-					},
-				)
-			}
-			HirExpr::Index { recv, index } => {
-				let receiver = self.declare(&"$compound_receiver".into());
-				let subscript = self.declare(&"$compound_index".into());
-				(
-					vec![
-						HirStmt::Let {
-							name: receiver.clone(),
-							mutable: false,
-							value: *recv,
-						},
-						HirStmt::Let {
-							name: subscript.clone(),
-							mutable: false,
-							value: *index,
-						},
-					],
-					HirExpr::Index {
-						recv: Box::new(HirExpr::Local(receiver)),
-						index: Box::new(HirExpr::Local(subscript)),
-					},
-				)
-			}
-			HirExpr::MapGet { recv, key } => {
-				let receiver = self.declare(&"$compound_receiver".into());
-				let subscript = self.declare(&"$compound_index".into());
-				(
-					vec![
-						HirStmt::Let {
-							name: receiver.clone(),
-							mutable: false,
-							value: *recv,
-						},
-						HirStmt::Let {
-							name: subscript.clone(),
-							mutable: false,
-							value: *key,
-						},
-					],
-					HirExpr::MapGet {
-						recv: Box::new(HirExpr::Local(receiver)),
-						key: Box::new(HirExpr::Local(subscript)),
-					},
-				)
-			}
-			other => (vec![], other),
-		}
-	}
 	fn lower_dispatch(
 		&self,
 		dispatch: &crate::StableDispatch,
 		receiver: &StableExpr,
 		arguments: Vec<&StableExpr>,
 	) -> Result<HirExpr, StableLoweringError> {
-		if let crate::StableDispatch::GenericBound { interface, member } = dispatch {
-			if self
-				.implementation_slots
-				.is_none_or(|slots| slots.target(member).is_none())
-			{
-				return self.lower_generic_bound(interface, member, receiver, arguments);
-			}
+		if let crate::StableDispatch::GenericBound { interface, member } = dispatch
+			&& (!matches!(receiver.kind, StableExprKind::This)
+				|| self
+					.implementation_slots
+					.is_none_or(|slots| slots.target(member).is_none()))
+		{
+			return self.lower_generic_bound(interface, member, receiver, arguments);
 		}
 		let (member, demand, external, implementation, persisted_marshal) = match dispatch {
 			crate::StableDispatch::Builtin { method, .. } => {
@@ -4259,6 +4759,17 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				.map(|arg| self.lower(arg))
 				.collect::<Result<Vec<_>, _>>()?;
 			return match &abi.callable {
+				crate::ExternalCallable::Linked { adapter }
+					if adapter.module == "std/collections/list"
+						&& matches!(
+							adapter.symbol.as_str(),
+							"appended" | "replaced" | "slice" | "insert" | "remove" | "clear" | "push" | "splice"
+						) =>
+				{
+					let mut args = vec![receiver];
+					args.extend(arguments);
+					external_call_expr(&member, &abi, &args, vec![None; args.len()], None)
+				}
 				crate::ExternalCallable::Linked { .. } => {
 					if let Some(implementation) = &implementation
 						&& shellless_implementation_member(self.context, &member, implementation)?
@@ -4284,7 +4795,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				crate::ExternalCallable::Native(_) => {
 					let mut args = vec![receiver];
 					args.extend(arguments);
-					external_call_expr(&member, &abi, &args)
+					external_call_expr(&member, &abi, &args, vec![None; args.len()], None)
 				}
 				crate::ExternalCallable::Deferred => Err(invalid(
 					&self.artifact.definition,
@@ -4292,8 +4803,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				)),
 			};
 		}
-		if let Some(implementation) = implementation
-			&& shellless_implementation_member(self.context, &member, &implementation)?
+		if let Some(ref implementation) = implementation
+			&& shellless_implementation_member(self.context, &member, implementation)?
 		{
 			let mut args = vec![self.lower(receiver)?];
 			args.extend(
@@ -4319,12 +4830,16 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						.map(|(index, _)| HirExpr::Local(format!("$type${index}").into())),
 				);
 			}
-			return Ok(HirExpr::Call {
-				callee: Box::new(HirExpr::Local(
-					self.context.binding_name(&member)?.as_str().into(),
-				)),
-				args,
-			});
+			return Ok(Self::activation_dispatch_call(
+				self.id(receiver),
+				dispatch,
+				HirExpr::Call {
+					callee: Box::new(HirExpr::Local(
+						self.context.binding_name(&member)?.as_str().into(),
+					)),
+					args,
+				},
+			));
 		}
 		let name: EcoString = self.context.member_name(&member)?.as_str().into();
 		let mut args = arguments
@@ -4338,13 +4853,41 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			false,
 			&mut args,
 		)?;
-		Ok(HirExpr::Call {
-			callee: Box::new(HirExpr::Field {
-				recv: Box::new(self.lower(receiver)?),
-				name,
-			}),
-			args,
-		})
+		if let Some(implementation) = implementation
+			&& matches!(
+				implementation.key,
+				crate::DeclarationKey::TopLevel {
+					category: crate::DeclarationCategory::Enum,
+					..
+				}
+			) {
+			let source = self.id(receiver);
+			let mut call_args = vec![self.lower(receiver)?];
+			let receiver = call_args.remove(0);
+			return Ok(Self::activation_dispatch_call(
+				source,
+				dispatch,
+				HirExpr::StaticEnumDispatch {
+					owner: self.context.binding_name(&implementation)?.as_str().into(),
+					method: name,
+					receiver: Box::new(receiver),
+					args,
+					mode: nymph_hir::hir::HirCallMode::Push,
+					source: 0,
+				},
+			));
+		}
+		Ok(Self::activation_dispatch_call(
+			self.id(receiver),
+			dispatch,
+			HirExpr::Call {
+				callee: Box::new(HirExpr::Field {
+					recv: Box::new(self.lower(receiver)?),
+					name,
+				}),
+				args,
+			},
+		))
 	}
 
 	fn lower_method_value(
@@ -4388,16 +4931,19 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				));
 			};
 			*dispatched_receiver = Box::new(receiver_value);
-			return Ok(HirExpr::Call {
-				callee: Box::new(HirExpr::Closure {
-					params: vec![receiver_name],
-					body: Box::new(HirExpr::Closure {
-						params,
-						body: Box::new(body),
+			return Ok(Self::activation_call(
+				self.id(receiver),
+				HirExpr::Call {
+					callee: Box::new(HirExpr::Closure {
+						params: vec![receiver_name],
+						body: Box::new(HirExpr::Closure {
+							params,
+							body: Box::new(body),
+						}),
 					}),
-				}),
-				args: vec![self.lower(receiver)?],
-			});
+					args: vec![self.lower(receiver)?],
+				},
+			));
 		}
 		let (member, implementation, external) = match dispatch {
 			crate::StableDispatch::Direct {
@@ -4587,7 +5133,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				crate::ExternalCallable::Native(_) => {
 					let mut args = vec![receiver_value];
 					args.extend(arguments);
-					external_call_expr(&member, &abi, &args)?
+					external_call_expr(&member, &abi, &args, vec![None; args.len()], None)?
 				}
 				crate::ExternalCallable::Deferred => {
 					return Err(invalid(
@@ -4640,16 +5186,20 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		} else {
 			self.append_hidden_arguments(self.id(expr), body)?
 		};
-		Ok(HirExpr::Call {
-			callee: Box::new(HirExpr::Closure {
-				params: vec![receiver_name],
-				body: Box::new(HirExpr::Closure {
-					params,
-					body: Box::new(body),
+		let body = Self::activation_dispatch_call(self.id(expr), dispatch, body);
+		Ok(Self::activation_call(
+			self.id(receiver),
+			HirExpr::Call {
+				callee: Box::new(HirExpr::Closure {
+					params: vec![receiver_name],
+					body: Box::new(HirExpr::Closure {
+						params,
+						body: Box::new(body),
+					}),
 				}),
-			}),
-			args: vec![self.lower(receiver)?],
-		})
+				args: vec![self.lower(receiver)?],
+			},
+		))
 	}
 
 	fn append_selected_call_arguments(
@@ -4750,16 +5300,19 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				interface: interface.clone(),
 				member: member.clone(),
 			});
-			return Ok(HirExpr::Call {
-				callee: Box::new(HirExpr::Field {
-					recv: Box::new(self.lower(receiver)?),
-					name: method,
-				}),
-				args: arguments
-					.into_iter()
-					.map(|argument| self.lower(argument))
-					.collect::<Result<_, _>>()?,
-			});
+			return Ok(Self::activation_call(
+				self.id(receiver),
+				HirExpr::Call {
+					callee: Box::new(HirExpr::Field {
+						recv: Box::new(self.lower(receiver)?),
+						name: method,
+					}),
+					args: arguments
+						.into_iter()
+						.map(|argument| self.lower(argument))
+						.collect::<Result<_, _>>()?,
+				},
+			));
 		}
 
 		let request = StableShapeRequest::ImplementationsForInterface(interface.clone());
@@ -4872,9 +5425,13 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			let body = self.context.runtime_definition(&slot.member_id)?;
 			let target = match &body.payload {
 				crate::RuntimePayload::External(abi) => match &abi.callable {
-					crate::ExternalCallable::Linked { module, symbol } => HirBoundDispatchTarget::Extern {
-						module: Box::leak(module.to_string().into_boxed_str()),
-						symbol: Box::leak(symbol.to_string().into_boxed_str()),
+					crate::ExternalCallable::Linked { adapter } => HirBoundDispatchTarget::Extern {
+						module: Box::leak(adapter.module.to_string().into_boxed_str()),
+						symbol: Box::leak(adapter.symbol.to_string().into_boxed_str()),
+						call_mode: match abi.call_mode {
+							crate::ExternalCallMode::Ordinary => nymph_hir::hir::ExternalCallMode::Ordinary,
+							crate::ExternalCallMode::Cancellable => nymph_hir::hir::ExternalCallMode::Cancellable,
+						},
 					},
 					crate::ExternalCallable::Native(_) => {
 						let module = self.context.module_specifier(&slot.member_id.module)?;
@@ -4971,6 +5528,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				receiver: Box::new(self.lower(receiver)?),
 				hidden_arguments: vec![],
 				cases,
+				mode: nymph_hir::hir::HirCallMode::Push,
+				source: self.id(receiver).0,
 			})
 		} else {
 			Ok(HirExpr::BoundDispatch {
@@ -4980,6 +5539,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				argument: Box::new(self.lower(arguments[0])?),
 				hidden_arguments: vec![],
 				cases,
+				mode: nymph_hir::hir::HirCallMode::Push,
+				source: self.id(receiver).0,
 			})
 		}
 	}
@@ -4996,12 +5557,12 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					.iteration(self.id(value))
 					.ok_or_else(|| self.missing_annotation(self.id(value), "spread iteration"))?;
 				let source = self.lower(value)?;
-				let (it, next, next_dispatch, option) = match iteration {
+				let (it, next, next_dispatch, iteration) = match iteration {
 					crate::RuntimeIteration::Direct {
 						iterator_interface,
 						next,
 						next_dispatch,
-						option,
+						iteration,
 					} => {
 						if next_dispatch.is_none() {
 							self.record_unresolved_call(UnresolvedRuntimeCall::IteratorNext {
@@ -5009,7 +5570,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 								member: next.clone(),
 							});
 						}
-						(source, next, next_dispatch, option)
+						(source, next, next_dispatch, iteration)
 					}
 					crate::RuntimeIteration::ViaIter {
 						iter,
@@ -5018,7 +5579,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						iterator_interface,
 						next,
 						next_dispatch,
-						option,
+						iteration,
 					} => {
 						let next_is_shellless = next_dispatch
 							.as_ref()
@@ -5034,36 +5595,52 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 								next,
 							)?;
 						}
-						(
-							self.lower_dispatch_value(iter, source)?,
-							next,
-							next_dispatch,
-							option,
-						)
+						let source = self.lower_iter_dispatch(
+							value,
+							iter,
+							iterable_interface,
+							iter_interface_member,
+							source,
+						)?;
+						(source, next, next_dispatch, iteration)
 					}
 				};
 				let next_call = if let Some(dispatch) = next_dispatch {
-					self.lower_iteration_next(dispatch, next, HirExpr::Local("$it".into()))?
+					self.lower_iteration_next(self.id(value), dispatch, next, HirExpr::Local("$it".into()))?
 				} else {
-					HirExpr::Call {
-						callee: Box::new(HirExpr::Field {
-							recv: Box::new(HirExpr::Local("$it".into())),
-							name: self.context.member_name(next)?.as_str().into(),
-						}),
-						args: vec![],
-					}
+					Self::activation_call(
+						self.id(value),
+						HirExpr::Call {
+							callee: Box::new(HirExpr::Field {
+								recv: Box::new(HirExpr::Local("$it".into())),
+								name: self.context.member_name(next)?.as_str().into(),
+							}),
+							args: vec![],
+						},
+					)
 				};
 				Ok(drain_spread(
 					it,
 					next_call,
-					self.context.binding_name(&option.option)?.as_str().into(),
-					self.context.member_name(&option.some)?.as_str().into(),
-					self
-						.context
-						.member_name(&option.some_value)?
-						.as_str()
-						.into(),
-					self.context.member_name(&option.none)?.as_str().into(),
+					nymph_hir::hir::HirIterationAbi {
+						enum_name: self
+							.context
+							.binding_name(&iteration.iteration)?
+							.as_str()
+							.into(),
+						done: self.context.member_name(&iteration.done)?.as_str().into(),
+						yield_: self.context.member_name(&iteration.yield_)?.as_str().into(),
+						item: self
+							.context
+							.member_name(&iteration.yield_item)?
+							.as_str()
+							.into(),
+						next: self
+							.context
+							.member_name(&iteration.yield_next)?
+							.as_str()
+							.into(),
+					},
 				))
 			}
 		}
@@ -5082,11 +5659,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					if !text.is_empty() {
 						result.push(HirExpr::Str(std::mem::take(&mut text)));
 					}
-					result.push(HirExpr::ExternCall {
-						module: "std/display",
-						symbol: "display",
-						args: vec![self.lower(value)?],
-					});
+					result.push(HirExpr::ProtocolDisplay(Box::new(self.lower(value)?)));
 				}
 			}
 		}
@@ -5117,10 +5690,9 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			(InterfaceType::Int | InterfaceType::UInt, InterfaceType::Float) => {
 				Some(ScalarCastKind::ToFloat)
 			}
-			(InterfaceType::Float, InterfaceType::Int) => Some(ScalarCastKind::SaturatingToInt),
-			(InterfaceType::Float | InterfaceType::Int, InterfaceType::UInt) => {
-				Some(ScalarCastKind::SaturatingToUInt)
-			}
+			(InterfaceType::Float, InterfaceType::Int) => Some(ScalarCastKind::CheckedToInt),
+			(InterfaceType::Int, InterfaceType::UInt) => Some(ScalarCastKind::IntToUInt),
+			(InterfaceType::Float, InterfaceType::UInt) => Some(ScalarCastKind::CheckedToUInt),
 			(InterfaceType::Char, InterfaceType::Int) => Some(ScalarCastKind::CharToInt),
 			(InterfaceType::Char, InterfaceType::UInt) => Some(ScalarCastKind::CharToUInt),
 			(InterfaceType::Char, InterfaceType::Float) => Some(ScalarCastKind::CharToFloat),
@@ -5133,14 +5705,15 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		Ok(kind.map_or(operand.clone(), |kind| HirExpr::ScalarCast {
 			kind,
 			operand: Box::new(operand),
+			mode: self.range_mode(expr),
 		}))
 	}
 	fn lower_pattern(&self, pattern: &StablePattern) -> Result<HirPat, StableLoweringError> {
 		let variant = self.annotations.pattern_variant(pattern.id);
 		Ok(match &pattern.kind {
 			StablePatternKind::Placeholder => HirPat::Wildcard,
-			StablePatternKind::Int(v) => HirPat::Lit(HirLit::Num(*v as f64, NumKind::Int)),
-			StablePatternKind::UInt(v) => HirPat::Lit(HirLit::Num(*v as f64, NumKind::UInt)),
+			StablePatternKind::Int(v) => HirPat::Lit(HirLit::Int(*v)),
+			StablePatternKind::UInt(v) => HirPat::Lit(HirLit::UInt(*v)),
 			StablePatternKind::Float(v) => HirPat::Lit(HirLit::Num(v.into_inner(), NumKind::Float)),
 			StablePatternKind::Boolean(v) => HirPat::Lit(HirLit::Bool(*v)),
 			StablePatternKind::Char(v) => HirPat::Lit(HirLit::Char(*v)),
@@ -5337,7 +5910,6 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			InterfaceType::List(argument) => ("NList".into(), true, false, vec![argument.as_ref()]),
 			InterfaceType::Tuple(arguments) => ("NTuple".into(), true, false, arguments.iter().collect()),
 			InterfaceType::Map(key, value) => ("NMap".into(), true, false, vec![key, value]),
-			InterfaceType::Mutable(inner) => return self.runtime_type_object(inner),
 			InterfaceType::SelfType => {
 				let receiver = self
 					.receiver_binding
@@ -5445,14 +6017,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			) {
 			let arguments = arguments
 				.iter()
-				.map(|argument| match argument {
+				.filter_map(|argument| match argument {
 					crate::runtime::RuntimeTypeArgument::Canonical(type_) => {
-						self.runtime_type_object(type_).map(Some)
+						Some(self.runtime_type_object(type_))
 					}
-					crate::runtime::RuntimeTypeArgument::Erased => Ok(None),
+					crate::runtime::RuntimeTypeArgument::Erased => None,
 				})
-				.collect::<Result<Option<Vec<_>>, _>>()?;
-			if let Some(arguments) = arguments {
+				.collect::<Result<Vec<_>, _>>()?;
+			if !arguments.is_empty() {
 				return Ok(Some(Box::new(HirExpr::RuntimeTypeObject {
 					binding: self.context.binding_name(target)?.as_str().into(),
 					box_runtime: false,
@@ -5657,7 +6229,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							collect_type_parameters(argument, parameters);
 						}
 					}
-					InterfaceType::List(argument) | InterfaceType::Mutable(argument) => {
+					InterfaceType::List(argument) => {
 						collect_type_parameters(argument, parameters);
 					}
 					InterfaceType::Tuple(arguments) | InterfaceType::Intersection(arguments) => {
@@ -5755,10 +6327,15 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.unwrap_or_default();
 		let explicit_receiver = usize::from(
 			matches!(&lowered, HirExpr::ExternCall { .. })
-				|| matches!(&lowered, HirExpr::Call { callee, .. } if matches!(&**callee, HirExpr::Local(_))),
+				|| matches!(
+					&lowered,
+					HirExpr::Call { callee, .. } | HirExpr::ActivationCall { callee, .. }
+						if matches!(&**callee, HirExpr::Local(_))
+				),
 		);
 		let arguments = match &mut lowered {
-			HirExpr::Call { args, .. } => args,
+			HirExpr::Call { args, .. } | HirExpr::ActivationCall { args, .. } => args,
+			HirExpr::StaticEnumDispatch { args, .. } => args,
 			HirExpr::ExternCall { args, .. } => args,
 			HirExpr::BoundDispatch {
 				hidden_arguments, ..
@@ -5869,6 +6446,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			});
 		};
 		let target_artifact = self.context.runtime_definition(target)?;
+		let generated = matches!(
+			&target_artifact.payload,
+			crate::RuntimePayload::NymphBody(_)
+		);
 		let arity = match &target_artifact.payload {
 			crate::RuntimePayload::NymphBody(target_body) => target_body.stable.params.len(),
 			crate::RuntimePayload::External(_) => {
@@ -5907,13 +6488,18 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			args: params.iter().cloned().map(HirExpr::Local).collect(),
 		};
 		let call = self.append_hidden_arguments(node, call)?;
+		let call = if generated {
+			Self::activation_call(node, call)
+		} else {
+			call
+		};
 		Ok(HirExpr::Closure {
 			params,
 			body: Box::new(call),
 		})
 	}
 
-	fn lower_for(
+	fn lower_iteration(
 		&self,
 		source_id: crate::BodyNodeId,
 		variable: &StablePattern,
@@ -5921,200 +6507,25 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		body: &StableExpr,
 		result_option: Option<nymph_hir::hir::HirOptionAbi>,
 	) -> Result<HirExpr, StableLoweringError> {
-		let native_range_number = match &iterable.kind {
-			StableExprKind::Range(StableRange::Exclusive { .. } | StableRange::Inclusive { .. }) => self
-				.annotations
-				.type_of(self.id(iterable))
-				.and_then(|ty| match peel_mut(ty) {
-					InterfaceType::Named { positional, .. } => positional.first(),
-					_ => None,
-				})
-				.and_then(|ty| match peel_mut(ty) {
-					InterfaceType::Int => Some(BuiltinResult::Int),
-					InterfaceType::UInt => Some(BuiltinResult::UInt),
-					_ => None,
-				}),
-			_ => None,
-		};
-		if let StableExprKind::Range(
-			StableRange::Exclusive { min, max } | StableRange::Inclusive { min, max },
-		) = &iterable.kind
-			&& let Some(number) = native_range_number
-		{
-			let inclusive = matches!(
-				iterable.kind,
-				StableExprKind::Range(StableRange::Inclusive { .. })
-			);
-			let (current, end, done, pat, target, body) = self.with_scope(|| {
-				let current = self.declare(&"$range_current".into());
-				let end = self.declare(&"$range_end".into());
-				let done = self.declare(&"$range_done".into());
-				let pat = self.lower_pattern(variable)?;
-				let target = self.next_loop();
-				let body = self.lower_loop_branch(source_id, target, body)?;
-				Ok((current, end, done, pat, target, body))
-			})?;
-			let current_expr = || HirExpr::Local(current.clone());
-			let end_expr = || HirExpr::Local(end.clone());
-			let advance = HirExpr::Assign {
-				target: Box::new(current_expr()),
-				value: Box::new(HirExpr::Binary {
-					op: BinOp::Add,
-					result: number,
-					lhs: Box::new(current_expr()),
-					rhs: Box::new(HirExpr::Num(
-						1.0,
-						if number == BuiltinResult::UInt {
-							NumKind::UInt
-						} else {
-							NumKind::Int
-						},
-					)),
-				}),
-			};
-			let upper_boundary = HirExpr::Binary {
-				op: BinOp::Ge,
-				result: BuiltinResult::Boolean,
-				lhs: Box::new(current_expr()),
-				rhs: Box::new(HirExpr::Num(
-					9007199254740991.0,
-					if number == BuiltinResult::UInt {
-						NumKind::UInt
-					} else {
-						NumKind::Int
-					},
-				)),
-			};
-			let step_boundary = if number == BuiltinResult::Int {
-				HirExpr::Binary {
-					op: BinOp::Or,
-					result: BuiltinResult::Boolean,
-					lhs: Box::new(upper_boundary),
-					rhs: Box::new(HirExpr::Binary {
-						op: BinOp::Lt,
-						result: BuiltinResult::Boolean,
-						lhs: Box::new(current_expr()),
-						rhs: Box::new(HirExpr::Num(-9007199254740991.0, NumKind::Int)),
-					}),
-				}
-			} else {
-				upper_boundary
-			};
-			let stop_after_current = if inclusive {
-				HirExpr::Binary {
-					op: BinOp::Or,
-					result: BuiltinResult::Boolean,
-					lhs: Box::new(HirExpr::Binary {
-						op: BinOp::Eq,
-						result: BuiltinResult::Boolean,
-						lhs: Box::new(current_expr()),
-						rhs: Box::new(end_expr()),
-					}),
-					rhs: Box::new(step_boundary),
-				}
-			} else {
-				step_boundary
-			};
-			let update = HirExpr::If {
-				cond: Box::new(stop_after_current),
-				then: Box::new(HirExpr::Assign {
-					target: Box::new(HirExpr::Local(done.clone())),
-					value: Box::new(HirExpr::Bool(true)),
-				}),
-				otherwise: Some(Box::new(advance)),
-			};
-			let mut stmts = vec![
-				HirStmt::Let {
-					name: current.clone(),
-					mutable: true,
-					value: self.lower(min)?,
-				},
-				HirStmt::Let {
-					name: end.clone(),
-					mutable: false,
-					value: self.lower(max)?,
-				},
-				HirStmt::Let {
-					name: done.clone(),
-					mutable: true,
-					value: HirExpr::Bool(false),
-				},
-				HirStmt::Expr(HirExpr::While {
-					target,
-					cond: Box::new(HirExpr::Binary {
-						op: BinOp::And,
-						result: BuiltinResult::Boolean,
-						lhs: Box::new(HirExpr::Unary {
-							op: UnOp::Not,
-							result: BuiltinResult::Boolean,
-							operand: Box::new(HirExpr::Local(done)),
-						}),
-						rhs: Box::new(HirExpr::Binary {
-							op: if inclusive { BinOp::Le } else { BinOp::Lt },
-							result: BuiltinResult::Boolean,
-							lhs: Box::new(current_expr()),
-							rhs: Box::new(end_expr()),
-						}),
-					}),
-					body: Box::new(HirExpr::Block {
-						stmts: vec![
-							HirStmt::Expr(HirExpr::Match {
-								scrutinee: Box::new(current_expr()),
-								arms: vec![HirArm {
-									pat,
-									guard: None,
-									body,
-								}],
-							}),
-							HirStmt::Expr(update.clone()),
-						],
-						tail: None,
-					}),
-					continue_epilogue: Some(Box::new(update)),
-					option: result_option.clone(),
-				}),
-			];
-			let tail = if result_option.is_some() {
-				let HirStmt::Expr(loop_expr) = stmts.pop().expect("range loop expression") else {
-					unreachable!()
-				};
-				Some(Box::new(loop_expr))
-			} else {
-				None
-			};
-			return Ok(HirExpr::Block { stmts, tail });
-		}
-		let native_range = false;
 		let source = self.lower(iterable)?;
 		let iteration = self
 			.annotations
 			.iteration(self.id(iterable))
 			.ok_or_else(|| self.missing_annotation(self.id(iterable), "iteration"))?;
-		let (it, next, next_dispatch, option) = match iteration {
+		let (it, next, next_dispatch, iteration) = match iteration {
 			crate::RuntimeIteration::Direct {
 				iterator_interface,
 				next,
 				next_dispatch,
-				option,
+				iteration,
 			} => {
-				if !native_range && next_dispatch.is_none() {
+				if next_dispatch.is_none() {
 					self.record_unresolved_call(UnresolvedRuntimeCall::IteratorNext {
 						interface: iterator_interface.clone(),
 						member: next.clone(),
 					});
 				}
-				let source = if native_range {
-					HirExpr::Call {
-						callee: Box::new(HirExpr::Field {
-							recv: Box::new(source),
-							name: "iter".into(),
-						}),
-						args: vec![],
-					}
-				} else {
-					source
-				};
-				(source, next, next_dispatch, option)
+				(source, next, next_dispatch, iteration)
 			}
 			crate::RuntimeIteration::ViaIter {
 				iter,
@@ -6123,7 +6534,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				iterator_interface,
 				next,
 				next_dispatch,
-				option,
+				iteration,
 				..
 			} => {
 				let next_is_shellless = next_dispatch
@@ -6140,145 +6551,68 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						next,
 					)?;
 				}
-				let lowered = if matches!(peel_mut(&self.ty(iterable)?), InterfaceType::List(_)) {
-					let request = StableShapeRequest::ImplementationsForInterface(iterable_interface.clone());
-					let StableShapeFact::Implementations(implementations) =
-						self.context.stable_shape(&request)?
-					else {
-						return Err(StableShapeLookupError::WrongFact { request }.into());
-					};
-					let implementation = implementations
-						.into_iter()
-						.find(|implementation| matches!(implementation.self_type, InterfaceType::List(_)))
-						.ok_or_else(|| {
-							invalid(
-								&self.artifact.definition,
-								"native List has no exact Iterable implementation",
-							)
-						})?;
-					let member = &implementation
-						.member_slots
-						.target(iter_interface_member)
-						.ok_or_else(|| {
-							invalid(
-								&self.artifact.definition,
-								"native List Iterable implementation has no iter slot",
-							)
-						})?
-						.member_id;
-					let slot = implementation
-						.member_slots
-						.target(iter_interface_member)
-						.unwrap();
-					let materialization = if slot.external {
-						crate::DispatchMaterialization::ExternalAbi
-					} else if slot.source == crate::ImplementationMemberSource::InheritedDefault {
-						crate::DispatchMaterialization::CanonicalBody
-					} else {
-						crate::DispatchMaterialization::Attached
-					};
-					validate_dispatch_slot(
-						self.context,
-						&implementation,
-						iterable_interface,
-						member,
-						slot.source,
-						materialization,
-					)?;
-					HirExpr::Call {
-						callee: Box::new(HirExpr::Field {
-							recv: Box::new(source),
-							name: "iter".into(),
-						}),
-						args: vec![],
-					}
-				} else {
-					self.lower_dispatch_value(iter, source)?
-				};
-				(lowered, next, next_dispatch, option)
+				let lowered = self.lower_iter_dispatch(
+					iterable,
+					iter,
+					iterable_interface,
+					iter_interface_member,
+					source,
+				)?;
+				(lowered, next, next_dispatch, iteration)
 			}
 		};
-		let (it_name, go, pat, target, body) = self.with_scope(|| {
+		let (it_name, successor_name, pat, target, body) = self.with_scope(|| {
 			let it_name = self.declare(&"$it".into());
-			let go = self.declare(&"$go".into());
+			let successor_name = self.declare(&"$next".into());
 			let pat = self.lower_pattern(variable)?;
 			let target = self.next_loop();
 			let body = self.lower_loop_branch(source_id, target, body)?;
-			Ok((it_name, go, pat, target, body))
+			Ok((it_name, successor_name, pat, target, body))
 		})?;
 		let call = if let Some(dispatch) = next_dispatch {
-			self.lower_iteration_next(dispatch, next, HirExpr::Local(it_name.clone()))?
+			self.lower_iteration_next(source_id, dispatch, next, HirExpr::Local(it_name.clone()))?
 		} else {
-			HirExpr::Call {
-				callee: Box::new(HirExpr::Field {
-					recv: Box::new(HirExpr::Local(it_name.clone())),
-					name: self.context.member_name(next)?.as_str().into(),
-				}),
-				args: vec![],
-			}
+			Self::activation_call(
+				source_id,
+				HirExpr::Call {
+					callee: Box::new(HirExpr::Field {
+						recv: Box::new(HirExpr::Local(it_name.clone())),
+						name: self.context.member_name(next)?.as_str().into(),
+					}),
+					args: vec![],
+				},
+			)
 		};
-		let option_name: EcoString = self.context.binding_name(&option.option)?.as_str().into();
-		let some_name: EcoString = self.context.member_name(&option.some)?.as_str().into();
-		let value_name: EcoString = self
-			.context
-			.member_name(&option.some_value)?
-			.as_str()
-			.into();
-		let none_name: EcoString = self.context.member_name(&option.none)?.as_str().into();
-		let option_valued = result_option.is_some();
-		let mut stmts = vec![
-			HirStmt::Let {
-				name: it_name,
-				mutable: false,
-				value: it,
+		Ok(HirExpr::For {
+			target,
+			source: source_id.0,
+			iterator_name: it_name,
+			successor_name,
+			iterator: Box::new(it),
+			next: Box::new(call),
+			pat,
+			body: Box::new(body),
+			iteration: nymph_hir::hir::HirIterationAbi {
+				enum_name: self
+					.context
+					.binding_name(&iteration.iteration)?
+					.as_str()
+					.into(),
+				done: self.context.member_name(&iteration.done)?.as_str().into(),
+				yield_: self.context.member_name(&iteration.yield_)?.as_str().into(),
+				item: self
+					.context
+					.member_name(&iteration.yield_item)?
+					.as_str()
+					.into(),
+				next: self
+					.context
+					.member_name(&iteration.yield_next)?
+					.as_str()
+					.into(),
 			},
-			HirStmt::Let {
-				name: go.clone(),
-				mutable: true,
-				value: HirExpr::Bool(true),
-			},
-			HirStmt::Expr(HirExpr::While {
-				target,
-				cond: Box::new(HirExpr::Local(go.clone())),
-				body: Box::new(HirExpr::Match {
-					scrutinee: Box::new(call),
-					arms: vec![
-						HirArm {
-							pat: HirPat::Variant {
-								enum_name: option_name.clone(),
-								variant: some_name,
-								fields: vec![(value_name, pat)],
-							},
-							guard: None,
-							body,
-						},
-						HirArm {
-							pat: HirPat::Variant {
-								enum_name: option_name,
-								variant: none_name,
-								fields: vec![],
-							},
-							guard: None,
-							body: HirExpr::Assign {
-								target: Box::new(HirExpr::Local(go)),
-								value: Box::new(HirExpr::Bool(false)),
-							},
-						},
-					],
-				}),
-				continue_epilogue: None,
-				option: result_option,
-			}),
-		];
-		let tail = if option_valued {
-			let HirStmt::Expr(loop_expr) = stmts.pop().expect("iterator loop expression") else {
-				unreachable!()
-			};
-			Some(Box::new(loop_expr))
-		} else {
-			None
-		};
-		Ok(HirExpr::Block { stmts, tail })
+			option: result_option,
+		})
 	}
 
 	fn demand_concrete_iteration_next(
@@ -6468,8 +6802,25 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		Ok(())
 	}
 
+	fn lower_iter_dispatch(
+		&self,
+		value: &StableExpr,
+		dispatch: &crate::StableDispatch,
+		interface: &DefinitionId,
+		member: &DefinitionId,
+		fallback: HirExpr,
+	) -> Result<HirExpr, StableLoweringError> {
+		match dispatch {
+			crate::StableDispatch::Builtin { .. } => {
+				self.lower_generic_bound(interface, member, value, vec![])
+			}
+			_ => self.lower_dispatch_value(self.id(value), dispatch, fallback),
+		}
+	}
+
 	fn lower_dispatch_value(
 		&self,
+		source: crate::BodyNodeId,
 		dispatch: &crate::StableDispatch,
 		receiver: HirExpr,
 	) -> Result<HirExpr, StableLoweringError> {
@@ -6545,21 +6896,25 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				Some(slot.member_id.clone())
 			}
 			crate::StableDispatch::GenericBound { interface, member } => {
+				self.record_unresolved_call(UnresolvedRuntimeCall::GenericDispatch {
+					interface: interface.clone(),
+					member: member.clone(),
+				});
 				let Some(slot) = self
 					.implementation_slots
 					.and_then(|slots| slots.target(member))
 				else {
-					self.record_unresolved_call(UnresolvedRuntimeCall::GenericDispatch {
-						interface: interface.clone(),
-						member: member.clone(),
-					});
-					return Ok(HirExpr::Call {
-						callee: Box::new(HirExpr::Field {
-							recv: Box::new(receiver),
-							name: self.context.member_name(member)?.as_str().into(),
-						}),
-						args: vec![],
-					});
+					return Ok(Self::activation_dispatch_call(
+						source,
+						dispatch,
+						HirExpr::Call {
+							callee: Box::new(HirExpr::Field {
+								recv: Box::new(receiver),
+								name: self.context.member_name(member)?.as_str().into(),
+							}),
+							args: vec![],
+						},
+					));
 				};
 				let request = StableShapeRequest::Implementation(slot.implementation_id.clone());
 				let StableShapeFact::Implementation(shape) = self.context.stable_shape(&request)? else {
@@ -6610,20 +6965,28 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		if shellless {
 			let mut args = vec![receiver];
 			self.append_selected_call_arguments(dispatch, target, None, true, &mut args)?;
-			return Ok(HirExpr::Call {
-				callee: Box::new(HirExpr::Local(
-					self.context.binding_name(target)?.as_str().into(),
-				)),
-				args,
-			});
+			return Ok(Self::activation_dispatch_call(
+				source,
+				dispatch,
+				HirExpr::Call {
+					callee: Box::new(HirExpr::Local(
+						self.context.binding_name(target)?.as_str().into(),
+					)),
+					args,
+				},
+			));
 		}
-		Ok(HirExpr::Call {
-			callee: Box::new(HirExpr::Field {
-				recv: Box::new(receiver),
-				name: self.context.member_name(target)?.as_str().into(),
-			}),
-			args: vec![],
-		})
+		Ok(Self::activation_dispatch_call(
+			source,
+			dispatch,
+			HirExpr::Call {
+				callee: Box::new(HirExpr::Field {
+					recv: Box::new(receiver),
+					name: self.context.member_name(target)?.as_str().into(),
+				}),
+				args: vec![],
+			},
+		))
 	}
 
 	fn iteration_dispatch_is_shellless(
@@ -6660,20 +7023,25 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 
 	fn lower_iteration_next(
 		&self,
+		source: crate::BodyNodeId,
 		dispatch: &crate::StableDispatch,
 		member: &DefinitionId,
 		receiver: HirExpr,
 	) -> Result<HirExpr, StableLoweringError> {
 		if self.iteration_dispatch_is_shellless(dispatch)? {
-			self.lower_dispatch_value(dispatch, receiver)
+			self.lower_dispatch_value(source, dispatch, receiver)
 		} else {
-			Ok(HirExpr::Call {
-				callee: Box::new(HirExpr::Field {
-					recv: Box::new(receiver),
-					name: self.context.member_name(member)?.as_str().into(),
-				}),
-				args: vec![],
-			})
+			Ok(Self::activation_dispatch_call(
+				source,
+				dispatch,
+				HirExpr::Call {
+					callee: Box::new(HirExpr::Field {
+						recv: Box::new(receiver),
+						name: self.context.member_name(member)?.as_str().into(),
+					}),
+					args: vec![],
+				},
+			))
 		}
 	}
 	fn lower_block(
@@ -6691,15 +7059,27 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			match statement {
 				StableStatement::Let {
 					pattern,
-					mutable,
+					managed,
 					value,
 				} => {
+					let source = value.id;
 					let value = self.lower(value)?;
 					let name = self.declare(pattern_name(pattern)?);
+					let cleanup = if *managed {
+						let dispatch = self.annotations.managed_cleanup(source).ok_or_else(|| {
+							invalid(
+								&self.artifact.definition,
+								"managed binding has no stable cleanup fact",
+							)
+						})?;
+						Some(self.lower_dispatch_value(source, dispatch, HirExpr::Local(name.clone()))?)
+					} else {
+						None
+					};
 					stmts.push(HirStmt::Let {
 						name,
-						mutable: *mutable,
 						value,
+						cleanup,
 					});
 				}
 				StableStatement::Expr(expr) if matches!(expr.kind, StableExprKind::Return { .. }) => {
@@ -6752,96 +7132,44 @@ fn binop(op: BinaryOperator) -> Option<BinOp> {
 		_ => return None,
 	})
 }
-fn assign_binop(op: AssignOperator) -> Option<BinaryOperator> {
-	Some(match op {
-		AssignOperator::PlusAssign => BinaryOperator::Plus,
-		AssignOperator::MinusAssign => BinaryOperator::Minus,
-		AssignOperator::TimesAssign => BinaryOperator::Times,
-		AssignOperator::DivideAssign => BinaryOperator::Divide,
-		AssignOperator::RemainderAssign => BinaryOperator::Remainder,
-		AssignOperator::PowerAssign => BinaryOperator::Power,
-		AssignOperator::BitAndAssign => BinaryOperator::BitAnd,
-		AssignOperator::BitOrAssign => BinaryOperator::BitOr,
-		AssignOperator::BitXorAssign => BinaryOperator::BitXor,
-		AssignOperator::LeftShiftAssign => BinaryOperator::LeftShift,
-		AssignOperator::RightShiftAssign => BinaryOperator::RightShift,
-		_ => return None,
-	})
-}
-
 fn drain_spread(
 	iterator: HirExpr,
 	next_call: HirExpr,
-	option: EcoString,
-	some_name: EcoString,
-	value_name: EcoString,
-	none_name: EcoString,
+	iteration: nymph_hir::hir::HirIterationAbi,
 ) -> HirExpr {
 	let acc: EcoString = "$acc".into();
 	let it: EcoString = "$it".into();
-	let go: EcoString = "$go".into();
 	let value: EcoString = "$x".into();
-	let some = HirArm {
-		pat: HirPat::Variant {
-			enum_name: option.clone(),
-			variant: some_name,
-			fields: vec![(
-				value_name,
-				HirPat::Binding {
-					name: value.clone(),
-					sub: None,
-				},
-			)],
-		},
-		guard: None,
-		body: HirExpr::Call {
-			callee: Box::new(HirExpr::Field {
-				recv: Box::new(HirExpr::Local(acc.clone())),
-				name: "push".into(),
-			}),
-			args: vec![HirExpr::Local(value)],
-		},
-	};
-	let none = HirArm {
-		pat: HirPat::Variant {
-			enum_name: option,
-			variant: none_name,
-			fields: vec![],
-		},
-		guard: None,
-		body: HirExpr::Assign {
-			target: Box::new(HirExpr::Local(go.clone())),
-			value: Box::new(HirExpr::Bool(false)),
-		},
+	let append = HirExpr::Call {
+		callee: Box::new(HirExpr::Field {
+			recv: Box::new(HirExpr::Local(acc.clone())),
+			name: "push".into(),
+		}),
+		args: vec![HirExpr::Local(value)],
 	};
 	HirExpr::Block {
 		stmts: vec![
 			HirStmt::Let {
 				name: acc.clone(),
-				mutable: false,
 				value: HirExpr::Array {
 					kind: HirArrayKind::Raw,
 					items: vec![],
 				},
+				cleanup: None,
 			},
-			HirStmt::Let {
-				name: it,
-				mutable: false,
-				value: iterator,
-			},
-			HirStmt::Let {
-				name: go.clone(),
-				mutable: true,
-				value: HirExpr::Bool(true),
-			},
-			HirStmt::Expr(HirExpr::While {
+			HirStmt::Expr(HirExpr::For {
 				target: u32::MAX,
-				cond: Box::new(HirExpr::Local(go)),
-				body: Box::new(HirExpr::Match {
-					scrutinee: Box::new(next_call),
-					arms: vec![some, none],
-				}),
-				continue_epilogue: None,
+				source: u32::MAX,
+				iterator_name: it,
+				successor_name: "$next".into(),
+				iterator: Box::new(iterator),
+				next: Box::new(next_call),
+				pat: HirPat::Binding {
+					name: "$x".into(),
+					sub: None,
+				},
+				body: Box::new(append),
+				iteration,
 				option: None,
 			}),
 		],
@@ -6849,11 +7177,7 @@ fn drain_spread(
 	}
 }
 fn peel_mut(ty: &InterfaceType) -> &InterfaceType {
-	if let InterfaceType::Mutable(inner) = ty {
-		inner
-	} else {
-		ty
-	}
+	ty
 }
 fn string_pattern(parts: &[StableStringPatternPart]) -> EcoString {
 	let mut result = EcoString::new();
@@ -6865,10 +7189,43 @@ fn string_pattern(parts: &[StableStringPatternPart]) -> EcoString {
 	}
 	result
 }
+
+fn stable_integer_constant(expr: &StableExpr) -> Option<BigInt> {
+	match &expr.kind {
+		StableExprKind::Int(value) | StableExprKind::UInt(value) => Some(BigInt::from(*value)),
+		StableExprKind::Grouped(inner) => stable_integer_constant(inner),
+		StableExprKind::PrefixOp {
+			op: PrefixOperator::Negate,
+			value,
+		} => Some(-stable_integer_constant(value)?),
+		StableExprKind::PrefixOp {
+			op: PrefixOperator::BitNot,
+			value,
+		} => Some(!stable_integer_constant(value)?),
+		StableExprKind::BinaryOp { lhs, op, rhs } => {
+			let lhs = stable_integer_constant(lhs)?;
+			let rhs = stable_integer_constant(rhs)?;
+			Some(match op {
+				BinaryOperator::Plus => lhs + rhs,
+				BinaryOperator::Minus => lhs - rhs,
+				BinaryOperator::Times => lhs * rhs,
+				BinaryOperator::Remainder => lhs % rhs,
+				BinaryOperator::BitAnd => lhs & rhs,
+				BinaryOperator::BitOr => lhs | rhs,
+				BinaryOperator::BitXor => lhs ^ rhs,
+				BinaryOperator::LeftShift => lhs << u32::try_from(rhs).ok()?,
+				BinaryOperator::RightShift => lhs >> u32::try_from(rhs).ok()?,
+				_ => return None,
+			})
+		}
+		_ => None,
+	}
+}
+
 fn literal_pattern(pattern: &StablePattern) -> Result<HirLit, StableLoweringError> {
 	Ok(match &pattern.kind {
-		StablePatternKind::Int(v) => HirLit::Num(*v as f64, NumKind::Int),
-		StablePatternKind::UInt(v) => HirLit::Num(*v as f64, NumKind::UInt),
+		StablePatternKind::Int(v) => HirLit::Int(*v),
+		StablePatternKind::UInt(v) => HirLit::UInt(*v),
 		StablePatternKind::Float(v) => HirLit::Num(v.into_inner(), NumKind::Float),
 		StablePatternKind::Boolean(v) => HirLit::Bool(*v),
 		StablePatternKind::Char(v) => HirLit::Char(*v),

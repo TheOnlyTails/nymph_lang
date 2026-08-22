@@ -20,7 +20,7 @@ use nymph_ast::{
 
 use crate::check::Checker;
 use crate::def::DefKind;
-use crate::ids::ParamIdx;
+use crate::ids::{DefId, ParamIdx};
 use crate::ty::{GenericArgs, Ty, TyKind};
 
 /// A pattern in a matrix column: either a wildcard or a borrowed AST pattern.
@@ -35,8 +35,8 @@ type Row<'a> = Vec<Pat<'a>>;
 /// A value constructor for a column's type.
 #[derive(Clone, PartialEq, Eq)]
 enum Ctor {
-	/// An enum variant (by index).
-	Variant(usize),
+	/// A source-owned enum variant.
+	Variant(DefId),
 	/// The sole constructor of a tuple or struct.
 	Single,
 	Bool(bool),
@@ -53,10 +53,6 @@ enum Witness {
 
 impl Checker<'_> {
 	pub(crate) fn check_exhaustive(&mut self, scrutinee: Ty, arms: &[MatchArm], span: Span) {
-		// Peel a top-level `mut` before resolving: mutability doesn't affect the
-		// constructor space, but an unstripped `TyKind::Mut` would fall through to
-		// the catch-all-only arm below and spuriously demand a `_` case.
-		let scrutinee = self.strip_mut(scrutinee);
 		let scrutinee = self.resolve_deep(scrutinee);
 		match self.interner.kind(scrutinee) {
 			// Can't judge an unknown or already-errored scrutinee.
@@ -104,11 +100,7 @@ impl Checker<'_> {
 			// No columns left: useful iff nothing above matched everything.
 			return matrix.is_empty().then(Vec::new);
 		};
-		// A column's type can itself carry `mut` at any recursion depth (a tuple
-		// element, a struct field, an enum-variant field) — strip it before it
-		// drives constructor-signature lookups, or a `mut`-typed sub-position
-		// falls through to "no signature" and spuriously demands a catch-all.
-		let ty = self.strip_mut(types[0]);
+		let ty = self.shallow_resolve(types[0]);
 
 		match self.head_ctor(head, ty) {
 			Head::Or(a, b) => {
@@ -169,7 +161,7 @@ impl Checker<'_> {
 		ctor: &Ctor,
 		types: &[Ty],
 	) -> Option<Vec<Witness>> {
-		let ty = self.strip_mut(types[0]);
+		let ty = self.shallow_resolve(types[0]);
 		let arity = self.ctor_arity(ctor, ty);
 		let mut sub_types = self.ctor_sub_types(ctor, ty);
 		sub_types.extend_from_slice(&types[1..]);
@@ -399,11 +391,13 @@ impl Checker<'_> {
 			TyKind::Boolean => Some(vec![Ctor::Bool(false), Ctor::Bool(true)]),
 			TyKind::Tuple(_) => Some(vec![Ctor::Single]),
 			TyKind::Adt(def, _) => match self.defs.data(*def).kind {
-				DefKind::Enum => Some(
+				DefKind::Enum if self.sigs.enums[def].embeddings.is_empty() => Some(
 					(0..self.sigs.enums[def].variants.len())
+						.filter_map(|index| self.enum_variant_def(*def, index))
 						.map(Ctor::Variant)
 						.collect(),
 				),
+				DefKind::Enum => self.view_ctors(ty),
 				DefKind::Struct => Some(vec![Ctor::Single]),
 				_ => None,
 			},
@@ -411,9 +405,17 @@ impl Checker<'_> {
 		}
 	}
 
+	fn view_ctors(&self, ty: Ty) -> Option<Vec<Ctor>> {
+		self
+			.enum_variant_set(ty)
+			.map(|variants| variants.into_iter().map(Ctor::Variant).collect())
+	}
+
 	fn ctor_arity(&self, ctor: &Ctor, ty: Ty) -> usize {
 		match (ctor, self.interner.kind(ty)) {
-			(Ctor::Variant(i), TyKind::Adt(def, _)) => self.sigs.enums[def].variants[*i].fields.len(),
+			(Ctor::Variant(variant), TyKind::Adt(_, _)) => self
+				.variant_sig(*variant)
+				.map_or(0, |variant| variant.fields.len()),
 			(Ctor::Single, TyKind::Tuple(elems)) => elems.len(),
 			(Ctor::Single, TyKind::Adt(def, _)) => self.sigs.structs[def].fields.len(),
 			_ => 0,
@@ -422,8 +424,11 @@ impl Checker<'_> {
 
 	fn ctor_sub_types(&mut self, ctor: &Ctor, ty: Ty) -> Vec<Ty> {
 		match (ctor, self.interner.kind(ty).clone()) {
-			(Ctor::Variant(i), TyKind::Adt(def, args)) => {
-				let fields = self.sigs.enums[&def].variants[*i].fields.clone();
+			(Ctor::Variant(variant), TyKind::Adt(_, args)) => {
+				let fields = self
+					.variant_sig(*variant)
+					.map(|variant| variant.fields.clone())
+					.unwrap_or_default();
 				let subst = adt_param_subst(&args);
 				fields
 					.iter()
@@ -445,9 +450,10 @@ impl Checker<'_> {
 
 	fn ctor_field_names(&self, ctor: &Ctor, ty: Ty) -> Vec<EcoString> {
 		match (ctor, self.interner.kind(ty)) {
-			(Ctor::Variant(i), TyKind::Adt(def, _)) => self.sigs.enums[def].variants[*i]
-				.fields
-				.iter()
+			(Ctor::Variant(variant), TyKind::Adt(_, _)) => self
+				.variant_sig(*variant)
+				.into_iter()
+				.flat_map(|variant| &variant.fields)
 				.map(|(n, _)| n.clone())
 				.collect(),
 			(Ctor::Single, TyKind::Adt(def, _)) => self.sigs.structs[def]
@@ -460,38 +466,51 @@ impl Checker<'_> {
 	}
 
 	/// The variant index a bare name refers to in `ty`'s enum, if it names one.
-	fn variant_index(&self, ty: Ty, name: &str) -> Option<usize> {
-		let TyKind::Adt(def, _) = self.interner.kind(ty) else {
-			return None;
-		};
-		if !matches!(self.defs.data(*def).kind, DefKind::Enum) {
-			return None;
+	fn variant_index(&self, ty: Ty, name: &str) -> Option<DefId> {
+		if let TyKind::Adt(def, _) = self.interner.kind(ty)
+			&& matches!(self.defs.data(*def).kind, DefKind::Enum)
+			&& self.sigs.enums[def].embeddings.is_empty()
+		{
+			let index = self.sigs.enums[def]
+				.variants
+				.iter()
+				.position(|variant| variant.name == name)?;
+			return self.enum_variant_def(*def, index);
 		}
-		self.sigs.enums[def]
-			.variants
-			.iter()
-			.position(|v| v.name == *name)
+		let variants = self.enum_variant_set(ty)?;
+		let mut matches = variants
+			.into_iter()
+			.filter(|variant| self.defs.data(*variant).name == name);
+		let result = matches.next()?;
+		matches.next().is_none().then_some(result)
 	}
 
 	/// The variant index a struct-pattern path refers to in `ty`'s enum, if any.
-	fn classify_variant(&self, path: &[nymph_ast::Ident], ty: Ty) -> Option<usize> {
-		let TyKind::Adt(def, _) = self.interner.kind(ty) else {
-			return None;
-		};
-		let name = match path {
-			[single] => &single.0,
+	fn classify_variant(&self, path: &[nymph_ast::Ident], ty: Ty) -> Option<DefId> {
+		if let TyKind::Adt(def, _) = self.interner.kind(ty)
+			&& matches!(self.defs.data(*def).kind, DefKind::Enum)
+			&& self.sigs.enums[def].embeddings.is_empty()
+		{
+			let name = match path {
+				[single] => &single.0,
+				[type_name, variant] if self.defs.get(&type_name.0) == Some(*def) => &variant.0,
+				_ => return None,
+			};
+			return self.variant_index(ty, name);
+		}
+		let accepted = self.enum_variant_set(ty)?;
+		match path {
+			[single] => return self.variant_index(ty, &single.0),
 			[type_name, variant] => {
-				if self.defs.get(&type_name.0) != Some(*def) {
-					return None;
-				}
-				&variant.0
+				let owner = self.defs.get(&type_name.0)?;
+				return self.defs.iter().find_map(|(candidate, data)| {
+					matches!(data.kind, DefKind::Variant { enum_def, .. } if enum_def == owner)
+						.then_some(candidate)
+						.filter(|candidate| accepted.contains(candidate) && data.name == variant.0)
+				});
 			}
 			_ => return None,
-		};
-		self.sigs.enums[def]
-			.variants
-			.iter()
-			.position(|v| v.name == *name)
+		}
 	}
 
 	fn render_witness(&self, witness: &Witness, ty: Ty) -> String {
@@ -508,8 +527,8 @@ impl Checker<'_> {
 					.collect();
 				match (ctor, self.interner.kind(ty)) {
 					(Ctor::Single, TyKind::Tuple(_)) => format!("#({})", inner.join(", ")),
-					(Ctor::Variant(i), TyKind::Adt(def, _)) => {
-						let name = &self.sigs.enums[def].variants[*i].name;
+					(Ctor::Variant(variant), TyKind::Adt(_, _)) => {
+						let name = &self.defs.data(*variant).name;
 						if inner.is_empty() {
 							name.to_string()
 						} else {
@@ -534,9 +553,10 @@ impl Checker<'_> {
 	/// as `_`, which is fine for a diagnostic).
 	fn witness_sub_types(&self, ctor: &Ctor, ty: Ty) -> Vec<Ty> {
 		match (ctor, self.interner.kind(ty)) {
-			(Ctor::Variant(i), TyKind::Adt(def, _)) => self.sigs.enums[def].variants[*i]
-				.fields
-				.iter()
+			(Ctor::Variant(variant), TyKind::Adt(_, _)) => self
+				.variant_sig(*variant)
+				.into_iter()
+				.flat_map(|variant| &variant.fields)
 				.map(|(_, t)| *t)
 				.collect(),
 			(Ctor::Single, TyKind::Tuple(elems)) => elems.clone(),
@@ -547,6 +567,17 @@ impl Checker<'_> {
 				.collect(),
 			_ => Vec::new(),
 		}
+	}
+
+	fn variant_sig(&self, variant: DefId) -> Option<&crate::def::VariantSig> {
+		let DefKind::Variant {
+			enum_def,
+			variant: index,
+		} = self.defs.data(variant).kind
+		else {
+			return None;
+		};
+		self.sigs.enums.get(&enum_def)?.variants.get(index)
 	}
 
 	/// Check an `int` match by covering the full `i64` line with literal/range patterns.

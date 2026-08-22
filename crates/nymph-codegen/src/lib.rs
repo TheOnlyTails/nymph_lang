@@ -11,9 +11,20 @@ use oxc::allocator::Allocator;
 
 pub use box_rt::{
 	BOX_MODULE_DECLARATIONS, BOX_MODULE_KEY, box_module_declarations, box_module_source,
-	box_module_source_with_option_enum, box_preamble,
+	box_module_source_with_option_enum, box_module_source_with_option_enum_release, box_preamble,
+	box_preamble_release,
 };
 pub use strip::{EmbeddedModuleInspection, inspect_embedded_module, strip_ts_to_js};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EchoEmission {
+	Development {
+		source_name: String,
+		source_uri: Option<String>,
+		source: String,
+	},
+	Release,
+}
 
 /// Emit an ES module string for `module`.
 pub fn emit(module: &HirModule) -> String {
@@ -50,6 +61,20 @@ pub fn emit_for_project_module_with_imports(
 	let allocator = Allocator::default();
 	emit::Emitter::for_project_module(&allocator, module_key)
 		.with_needed_imports(imports)
+		.emit_module(module)
+}
+
+#[must_use]
+pub fn emit_for_project_module_with_imports_and_echo(
+	module: &HirModule,
+	module_key: &str,
+	imports: &[(String, String, String)],
+	echo: EchoEmission,
+) -> String {
+	let allocator = Allocator::default();
+	emit::Emitter::for_project_module(&allocator, module_key)
+		.with_needed_imports(imports)
+		.with_echo_emission(echo)
 		.emit_module(module)
 }
 

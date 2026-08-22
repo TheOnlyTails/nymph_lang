@@ -134,6 +134,11 @@ produces no edits. VS Code's standard `editor.formatOnSave` setting can be enabl
 func add(a: int, b: int): int = a + b
 ```
 
+Built-in snippets teach immutable destinations: `let` creates an immutable
+binding, `loop-state` evolves named loop state with `continue(name = next)`, and
+`main` creates an explicit `void` executable root. They intentionally do not
+offer mutable binding, receiver, or field templates.
+
 See the
 [function reference](https://github.com/TheOnlyTails/nymph_lang/blob/main/docs/reference/functions.md)
 for parameters, inferred return types, blocks, methods, and closures.

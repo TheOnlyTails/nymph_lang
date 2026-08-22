@@ -23,6 +23,8 @@ pub struct Manifest {
 	pub dependencies: BTreeMap<String, Dependency>,
 	#[serde(default, skip_serializing_if = "Build::is_default")]
 	pub build: Build,
+	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+	pub lints: BTreeMap<String, nymph_compiler::LintLevel>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -151,6 +153,7 @@ impl Manifest {
 			},
 			dependencies: BTreeMap::new(),
 			build: Build::default(),
+			lints: BTreeMap::new(),
 		}
 	}
 
@@ -377,6 +380,34 @@ mod tests {
 		let defaults: Manifest = toml::from_str("[package]\nname='x'\nversion='1.0.0'").unwrap();
 		assert!(defaults.dependencies.is_empty());
 		assert_eq!(defaults.build.entry, Path::new("main.nym"));
+		assert!(defaults.lints.is_empty());
+	}
+
+	#[test]
+	fn lints_parse_validate_and_round_trip_without_frontend_policy() {
+		let source =
+			"[package]\nname='x'\nversion='1.0.0'\n[lints]\necho-in-release='deny'\nunused='allow'\n";
+		let manifest: Manifest = toml::from_str(source).unwrap();
+		assert_eq!(
+			manifest.lints,
+			BTreeMap::from([
+				(
+					"echo-in-release".to_string(),
+					nymph_compiler::LintLevel::Deny
+				),
+				("unused".to_string(), nymph_compiler::LintLevel::Allow),
+			])
+		);
+		let serialized = manifest.to_toml().unwrap();
+		let round_trip: Manifest = toml::from_str(&serialized).unwrap();
+		assert_eq!(round_trip.lints, manifest.lints);
+		assert!(serialized.contains("[lints]\n"));
+
+		let error = toml::from_str::<Manifest>(
+			"[package]\nname='x'\nversion='1.0.0'\n[lints]\necho-in-release='error'\n",
+		)
+		.unwrap_err();
+		assert!(error.to_string().contains("unknown variant `error`"));
 	}
 
 	#[test]

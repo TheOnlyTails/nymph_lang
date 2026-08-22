@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use nymph_ast::decl::Declaration;
+use nymph_ast::decl::{Declaration, Visibility};
 use nymph_ast::expr::{ExprKind, Statement};
 use nymph_sema::{
-	BinderScope, DeclarationCategory, DeclarationKey, DefinitionId, DefinitionShapeKind, EntryMode,
+	DeclarationCategory, DeclarationKey, DefinitionId, DefinitionShapeKind, EntryMode,
 	ExportedDefinition, InterfaceType, ModuleAnnotations, ModuleEnvironment, ModuleIdentity,
 	ModuleInterface, ModuleOrigin, RecoveredDefinitionReference, RecoveredExportedDefinition,
 	RecoveredExportedImpl, RecoveredInterfaceType, RecoveredModuleInterface, SemanticAnalysis,
@@ -60,6 +60,10 @@ fn environment_check_uses_imported_function_without_mutating_environment() {
 		dependency.clone(),
 		DeclarationKey::top_level(DeclarationCategory::Function, "answer"),
 	);
+	let io = DefinitionId::new(
+		dependency.clone(),
+		DeclarationKey::top_level(DeclarationCategory::Function, "io"),
+	);
 	let exported = ExportedDefinition {
 		id: function_id.clone(),
 		name: "answer".into(),
@@ -70,9 +74,11 @@ fn environment_check_uses_imported_function_without_mutating_environment() {
 		constraints: vec![],
 		parameters: vec![],
 		return_type: Some(InterfaceType::Int),
+		effects: nymph_sema::EffectRow::new(vec![nymph_sema::EffectAtom::Nominal(io.clone())]),
 		ty: None,
 		fields: vec![],
 		variants: vec![],
+		enum_view_variants: vec![],
 		members: vec![],
 		super_interfaces: vec![],
 		external: None,
@@ -96,12 +102,23 @@ fn environment_check_uses_imported_function_without_mutating_environment() {
 	let environment =
 		SemanticEnvironment::from_modules(current.clone(), &[dependency, intermediary]).unwrap();
 	let before = format!("{environment:?}");
-	let parsed = parse_module("func local(): int = answer()", "consumer.nymph");
+	let parsed = parse_module(
+		"func local(): int + !_ = recursive()\nfunc recursive(): int + !_ = { answer() local() }",
+		"consumer.nymph",
+	);
 	assert!(parsed.diagnostics.is_empty());
-	let answer_node = match &parsed.tree.members[0] {
+	let answer_node = match &parsed.tree.members[1] {
 		Declaration::Func { body, .. } => match &body.kind {
-			ExprKind::Call { func, .. } => func.id,
-			other => panic!("expected call body, got {other:?}"),
+			ExprKind::Block { body, .. } => {
+				let Statement::Expr(expression) = &body[0].0 else {
+					panic!("expected answer expression")
+				};
+				let ExprKind::Call { func, .. } = &expression.kind else {
+					panic!("expected answer call")
+				};
+				func.id
+			}
+			other => panic!("expected block body, got {other:?}"),
 		},
 		other => panic!("expected function, got {other:?}"),
 	};
@@ -117,6 +134,32 @@ fn environment_check_uses_imported_function_without_mutating_environment() {
 
 	assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
 	assert!(result.lowerable);
+	let local = result
+		.analysis
+		.checked
+		.semantic
+		.effect_row(&DefinitionId::new(
+			current.clone(),
+			DeclarationKey::top_level(DeclarationCategory::Function, "local"),
+		))
+		.unwrap();
+	assert_eq!(
+		local,
+		&nymph_sema::EffectRow::new(vec![nymph_sema::EffectAtom::Nominal(io.clone())])
+	);
+	let recursive = result
+		.analysis
+		.checked
+		.semantic
+		.effect_row(&DefinitionId::new(
+			current.clone(),
+			DeclarationKey::top_level(DeclarationCategory::Function, "recursive"),
+		))
+		.unwrap();
+	assert_eq!(
+		recursive,
+		&nymph_sema::EffectRow::new(vec![nymph_sema::EffectAtom::Nominal(io)])
+	);
 	assert_eq!(result.diagnostics, owned.diagnostics);
 	assert_eq!(result.lowerable, owned.lowerable);
 	assert_eq!(
@@ -157,18 +200,128 @@ fn environment_check_uses_imported_function_without_mutating_environment() {
 			.definition_target_of(answer_node),
 		owned.analysis.annotations.definition_target_of(answer_node)
 	);
-	assert_eq!(result.analysis.checked.semantic.local_definitions.start, 1);
-	assert_eq!(result.analysis.checked.semantic.local_definitions.end, 2);
+	assert_eq!(result.analysis.checked.semantic.local_definitions.start, 2);
+	assert_eq!(result.analysis.checked.semantic.local_definitions.end, 4);
 	assert_eq!(
 		result
 			.analysis
 			.checked
 			.semantic
-			.stable_definition(nymph_sema::DefId(1)),
+			.stable_definition(nymph_sema::DefId(2)),
 		Some(&DefinitionId::new(
 			current,
 			DeclarationKey::top_level(DeclarationCategory::Function, "local"),
 		))
+	);
+}
+
+#[test]
+fn struct_defaults_charge_fresh_construction_but_not_clone_updates() {
+	let dependency = identity("dependency.nymph");
+	let io = DefinitionId::new(
+		dependency.clone(),
+		DeclarationKey::top_level(DeclarationCategory::Function, "io"),
+	);
+	let dependency = Arc::new(ModuleEnvironment::Complete(ModuleInterface {
+		module: dependency.clone(),
+		exports: vec![ExportedDefinition {
+			id: DefinitionId::new(
+				dependency,
+				DeclarationKey::top_level(DeclarationCategory::Function, "answer"),
+			),
+			name: "answer".into(),
+			visibility: Some(Visibility::Public),
+			kind: DefinitionShapeKind::Function,
+			declaration_kind: None,
+			binders: vec![],
+			constraints: vec![],
+			parameters: vec![],
+			return_type: Some(InterfaceType::Int),
+			effects: nymph_sema::EffectRow::new(vec![nymph_sema::EffectAtom::Nominal(io.clone())]),
+			ty: None,
+			fields: vec![],
+			variants: vec![],
+			enum_view_variants: vec![],
+			members: vec![],
+			super_interfaces: vec![],
+			external: None,
+			runtime_owner: None,
+		}],
+		support_definitions: vec![],
+		implementations: vec![],
+		fingerprint: 0,
+	}));
+	let current = identity("structs.nymph");
+	let environment = SemanticEnvironment::from_modules(current.clone(), &[dependency]).unwrap();
+	let parsed = parse_module(
+		"public struct Box(value: int = answer())\n\
+		 public func fresh(): Box + !_ = Box()\n\
+		 public func clone(source: Box): Box = Box(...source)",
+		"structs.nymph",
+	);
+	assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+	let module = Arc::new(parsed.tree);
+	let checked = check_module_with_environment(
+		module.clone(),
+		current.clone(),
+		&environment,
+		EntryMode::Library,
+	);
+	assert!(checked.diagnostics.is_empty(), "{:?}", checked.diagnostics);
+	let expected = nymph_sema::EffectRow::new(vec![nymph_sema::EffectAtom::Nominal(io)]);
+	let struct_id = DefinitionId::new(
+		current.clone(),
+		DeclarationKey::top_level(DeclarationCategory::Struct, "Box"),
+	);
+	let effect_row = |category, name| {
+		checked
+			.analysis
+			.checked
+			.semantic
+			.effect_row(&DefinitionId::new(
+				current.clone(),
+				DeclarationKey::top_level(category, name),
+			))
+	};
+	assert_eq!(
+		checked
+			.analysis
+			.checked
+			.semantic
+			.effect_row(&DefinitionId::new(
+				current.clone(),
+				DeclarationKey::member(struct_id, DeclarationCategory::Field, "value"),
+			)),
+		Some(&expected)
+	);
+	assert_eq!(
+		effect_row(DeclarationCategory::Function, "fresh"),
+		Some(&expected)
+	);
+	assert_eq!(
+		effect_row(DeclarationCategory::Function, "clone"),
+		Some(&nymph_sema::EffectRow::pure())
+	);
+
+	let facts = nymph_sema::Checked {
+		diags: vec![],
+		facts: checked.analysis.checked.as_ref().clone(),
+	};
+	let headers = declared_headers(current.clone(), &module);
+	let interface = extract_module_interface(current, &module, &facts, &headers).unwrap();
+	let definition = interface
+		.exports
+		.iter()
+		.find(|definition| definition.name == "Box")
+		.unwrap();
+	assert_eq!(
+		definition.fields[0].default_effects.as_ref(),
+		Some(&expected)
+	);
+	let recovered = RecoveredExportedDefinition::from(definition.clone());
+	assert_eq!(
+		recovered.fields[0].default_effects.as_ref(),
+		Some(&expected)
 	);
 }
 
@@ -212,18 +365,19 @@ fn stable_definition_kind_resolves_namespace_and_inherent_function_members() {
 	}
 }
 
+/* Legacy mutable Option-iterator source coverage lives in the frozen corpus.
 #[test]
 fn imported_opaque_method_return_retains_its_exact_interface_bound() {
 	let dependency_identity = identity("iterable.nymph");
 	let parsed = parse_module(
 		"public enum Option<T> { Some(value: T), None }\n\
-		 public interface Iterator<Item> { mut func next(): Option<Item> }\n\
+		 public interface Iterator<Item> { func consume(): Item }\n\
 		 public interface Iterable<Item> { func iter(): Iterator<Item> }\n\
 		 public struct ListIter<Item>(item: Item) {\n\
-		   impl Iterator<Item> { mut func next(): Option<Item> = Some(this.item) }\n\
+			 impl Iterator<Item> { func consume(): Item = this.item }\n\
 		 }\n\
 		 public struct Values<Item>(item: Item) {\n\
-		   impl Iterable<Item> { func iter(): Iterator<Item> = ListIter(item = this.item) }\n\
+			 impl Iterable<Item> { func iter(): Iterator<Item> = ListIter(item = this.item) }\n\
 		 }",
 		"iterable.nymph",
 	);
@@ -346,7 +500,7 @@ fn imported_opaque_method_return_retains_its_exact_interface_bound() {
 	assert_eq!(imported_item, imported_owner_item);
 
 	let consumer = parse_module(
-			"func advance(values: Values<int>): Option<int> = { let mut iterator = values.iter() iterator.next() }",
+			"func advance(values: Values<int>): int = values.iter().consume()",
 			"consumer.nymph",
 		)
 		.tree;
@@ -391,6 +545,7 @@ fn imported_opaque_method_return_retains_its_exact_interface_bound() {
 		&TyKind::Int
 	);
 }
+*/
 
 #[test]
 fn local_definition_overlays_imported_name_without_rechecking_imported_body() {
@@ -409,9 +564,11 @@ fn local_definition_overlays_imported_name_without_rechecking_imported_body() {
 		constraints: vec![],
 		parameters: vec![],
 		return_type: Some(InterfaceType::String),
+		effects: nymph_sema::EffectRow::pure(),
 		ty: None,
 		fields: vec![],
 		variants: vec![],
+		enum_view_variants: vec![],
 		members: vec![],
 		super_interfaces: vec![],
 		external: None,
@@ -483,9 +640,11 @@ fn recovered_dependency_poison_suppresses_cascades_without_hiding_independent_er
 			constraints: vec![],
 			parameters: vec![],
 			return_type: Some(return_type),
+			effects: nymph_sema::RecoveredEffectRow::Known(nymph_sema::EffectRow::pure()),
 			ty: None,
 			fields: vec![],
 			variants: vec![],
+			enum_view_variants: vec![],
 			members: vec![],
 			super_interfaces: vec![],
 			external: None,
@@ -501,8 +660,8 @@ fn recovered_dependency_poison_suppresses_cascades_without_hiding_independent_er
 		availability: SemanticAvailability::StructureUnavailable,
 		interface: Some(RecoveredDefinitionReference::Poison),
 		interface_arguments: vec![],
+		interface_effect_arguments: vec![],
 		self_type: RecoveredInterfaceType::Poison,
-		mutable: false,
 		binders: vec![],
 		constraints: vec![],
 		members: vec![],
@@ -584,9 +743,11 @@ fn recovered_dependency_poison_suppresses_cascades_without_hiding_independent_er
 		constraints: vec![],
 		parameters: vec![],
 		return_type: Some(InterfaceType::Int),
+		effects: nymph_sema::EffectRow::pure(),
 		ty: None,
 		fields: vec![],
 		variants: vec![],
+		enum_view_variants: vec![],
 		members: vec![],
 		super_interfaces: vec![],
 		external: None,

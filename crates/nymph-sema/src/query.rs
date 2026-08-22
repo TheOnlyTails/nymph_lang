@@ -101,6 +101,7 @@ pub enum ImportedNameKind {
 	Interface,
 	Namespace,
 	Variant,
+	Effect,
 }
 
 /// One resolved spelling visible in the importing module.
@@ -134,19 +135,14 @@ pub fn imported_names(
 							DeclarationCategory::Function | DeclarationCategory::Method => {
 								ImportedNameKind::Function
 							}
-							DeclarationCategory::Let | DeclarationCategory::Field => {
-								if imported_definition_is_mutable(definition, modules) {
-									ImportedNameKind::Variable
-								} else {
-									ImportedNameKind::Value
-								}
-							}
+							DeclarationCategory::Let | DeclarationCategory::Field => ImportedNameKind::Value,
 							DeclarationCategory::TypeAlias => ImportedNameKind::TypeAlias,
 							DeclarationCategory::Struct => ImportedNameKind::Struct,
 							DeclarationCategory::Enum => ImportedNameKind::Enum,
 							DeclarationCategory::Interface => ImportedNameKind::Interface,
 							DeclarationCategory::Namespace => ImportedNameKind::Namespace,
 							DeclarationCategory::Variant => ImportedNameKind::Variant,
+							DeclarationCategory::Effect => ImportedNameKind::Effect,
 							DeclarationCategory::Static
 							| DeclarationCategory::Implementation
 							| DeclarationCategory::MethodBody => return None,
@@ -232,34 +228,18 @@ pub fn imported_names(
 	names
 }
 
-fn imported_definition_is_mutable(
-	definition: &crate::DefinitionId,
-	modules: &[Arc<ModuleEnvironment>],
-) -> bool {
-	modules.iter().any(|module| match module.as_ref() {
-		ModuleEnvironment::Complete(interface) => interface.exports.iter().any(|candidate| {
-			candidate.id == *definition
-				&& candidate.declaration_kind == Some(crate::MemberKind::MutableValue)
-		}),
-		ModuleEnvironment::Recovered(interface) => interface.exports.iter().any(|candidate| {
-			candidate.id == *definition
-				&& candidate.declaration_kind == Some(crate::MemberKind::MutableValue)
-		}),
-	})
-}
-
 /// Find the type of the smallest checked expression covering byte `offset`
 /// in `module`, rendered as a display string (`"int"`, `"#[Option<T0>]"`,
 /// `MyStruct<int>`, …). Returns `None` when no annotated expression covers
 /// `offset` (whitespace, a comment, a pattern/binder position, or an
 /// expression the checker never annotated, e.g. inside a still-erroring
 /// subtree), OR when the smallest covering expression is a container/
-/// control-flow kind (`Block`, `If`, `While`, `For`, `Match`, `Closure`,
+/// control-flow kind (`Block`, `If`, `For`, `Match`, `Closure`,
 /// `Return`, `Break`, `Continue`) rather than a leaf/primary value
-/// genuinely under the cursor — hovering the `let`/`func`/`while`/`for`
+/// genuinely under the cursor — hovering the `let`/`func`/`for`
 /// keyword, a binder name, a type annotation, or whitespace inside a block
 /// all land on one of these containers (the only expr kinds actually
-/// annotated among them are `While`/`For` as `void` and a value-position
+/// annotated among them are `For` as `void` and a value-position
 /// `Block` as its trailing expression's type) and would otherwise leak the
 /// *enclosing* type rather than reporting nothing. A leaf under the cursor
 /// always has a strictly smaller span than its enclosing container, so it
@@ -449,8 +429,8 @@ fn suppresses_hover(kind: &ExprKind) -> bool {
 		kind,
 		ExprKind::Block { .. }
 			| ExprKind::If { .. }
-			| ExprKind::While { .. }
 			| ExprKind::For { .. }
+			| ExprKind::StateLoop { .. }
 			| ExprKind::Match { .. }
 			| ExprKind::Closure { .. }
 			| ExprKind::Return { .. }
@@ -458,8 +438,8 @@ fn suppresses_hover(kind: &ExprKind) -> bool {
 			| ExprKind::Continue { .. }
 			| ExprKind::Call { .. }
 			| ExprKind::BinaryOp { .. }
-			| ExprKind::AssignOp { .. }
 			| ExprKind::PrefixOp { .. }
+			| ExprKind::Echo { .. }
 			| ExprKind::PostfixOp { .. }
 			| ExprKind::TypeOp { .. }
 			| ExprKind::PatternOp { .. }
@@ -488,6 +468,12 @@ fn covers(span: Span, offset: usize) -> bool {
 /// range, falling back to the internal `T{idx}` otherwise (out-of-scope
 /// index, or a synthetic `impl Interface` param).
 fn render(interner: &Interner, defs: &DefMap, params: &[EcoString], ty: Ty) -> String {
+	if matches!(
+		interner.kind(ty),
+		TyKind::Task { .. } | TyKind::Handle(_) | TyKind::HandleOutcome(_)
+	) {
+		return render_async_type(interner, defs, params, ty);
+	}
 	match interner.kind(ty) {
 		TyKind::Int => "int".to_string(),
 		TyKind::UInt => "uint".to_string(),
@@ -520,6 +506,7 @@ fn render(interner: &Interner, defs: &DefMap, params: &[EcoString], ty: Ty) -> S
 		TyKind::Fn {
 			params: fn_params,
 			ret,
+			..
 		} => {
 			let inner: Vec<_> = fn_params
 				.iter()
@@ -531,6 +518,7 @@ fn render(interner: &Interner, defs: &DefMap, params: &[EcoString], ty: Ty) -> S
 				render(interner, defs, params, *ret)
 			)
 		}
+		TyKind::Task { .. } | TyKind::Handle(_) | TyKind::HandleOutcome(_) => unreachable!(),
 		TyKind::Adt(def_id, args) => render_adt(interner, defs, params, *def_id, args),
 		TyKind::Intersection(parts) => {
 			let inner: Vec<_> = parts
@@ -539,7 +527,25 @@ fn render(interner: &Interner, defs: &DefMap, params: &[EcoString], ty: Ty) -> S
 				.collect();
 			inner.join(" + ")
 		}
-		TyKind::Mut(inner) => format!("mut {}", render(interner, defs, params, *inner)),
+	}
+}
+
+fn render_async_type(interner: &Interner, defs: &DefMap, params: &[EcoString], ty: Ty) -> String {
+	match interner.kind(ty) {
+		TyKind::Task { output, effects } => {
+			let suffix = if effects.atoms().is_empty() {
+				""
+			} else {
+				" + !…"
+			};
+			format!("Task<{}{suffix}>", render(interner, defs, params, *output))
+		}
+		TyKind::Handle(output) => format!("Handle<{}>", render(interner, defs, params, *output)),
+		TyKind::HandleOutcome(output) => format!(
+			"Result<{}, HandleError>",
+			render(interner, defs, params, *output)
+		),
+		_ => unreachable!(),
 	}
 }
 
@@ -601,17 +607,10 @@ fn render_semantic_variant(
 /// [`Token`] variant so tests can assert it verbatim.
 fn keyword_doc(token: &Token) -> Option<&'static str> {
 	match token {
-		Token::Func => Some(
-			"`func` declares a function: `func name(params): ReturnType = body`. \
-			 A `mut func` inside a struct/enum may mutate `this`.",
-		),
+		Token::Func => Some("`func` declares a function: `func name(params): ReturnType = body`."),
 		Token::Let => Some(
 			"`let` introduces a binding: `let name = value`, optionally with a \
 			 type annotation (`let name: Type = value`).",
-		),
-		Token::Mut => Some(
-			"`mut` marks something mutable — a reassignable `let mut` binding, a \
-			 mutable function parameter, a `mut func` method, or a `mut T` view type.",
 		),
 		Token::If => Some(
 			"`if` branches on a boolean condition: `if cond { ... } else { ... }`. \
@@ -623,7 +622,6 @@ fn keyword_doc(token: &Token) -> Option<&'static str> {
 			 `match value { pattern -> body, ... }`.",
 		),
 		Token::For => Some("`for` iterates over an iterable: `for item in iterable { ... }`."),
-		Token::While => Some("`while` loops while a boolean condition holds: `while cond { ... }`."),
 		Token::Struct => Some(
 			"`struct` declares a product type with named fields: \
 			 `struct Name(field: Type, ...)`.",
@@ -647,6 +645,9 @@ fn keyword_doc(token: &Token) -> Option<&'static str> {
 		Token::Return => Some("`return` exits the enclosing function early with a value."),
 		Token::Break => Some("`break` exits the enclosing loop early, optionally with a value."),
 		Token::Continue => Some("`continue` skips to the next iteration of the enclosing loop."),
+		Token::Echo => Some(
+			"`echo` writes a development-only structural observation to stderr and returns its operand unchanged.",
+		),
 		Token::Import => Some(
 			"`import` brings a module into scope: `import @/math`, `import @/math as m`, \
 			 or `import @/math with (sin, cos)`.",
@@ -669,8 +670,10 @@ fn keyword_doc(token: &Token) -> Option<&'static str> {
 			"`external` declares a binding backed by a foreign (JS) implementation: \
 			 `external(js_name) func name(...): Ret`.",
 		),
-		Token::Async => Some("`async` is reserved for a future async model — not yet usable."),
-		Token::Await => Some("`await` is reserved for a future async model — not yet usable."),
+		Token::Async => Some(
+			"`async` constructs a cold task recipe; async blocks establish a nested structured context.",
+		),
+		Token::Await => Some("`.await` drives a task or observes an existing execution handle."),
 		Token::This => Some("`this` refers to the current instance inside a method body."),
 		Token::True => Some("`true` — the `boolean` literal for truth."),
 		Token::False => Some("`false` — the `boolean` literal for falsity."),
@@ -747,6 +750,7 @@ fn extended(owner: &[EcoString], extra: &[Spanned<GenericParam>]) -> Vec<EcoStri
 fn decl_generic_scope(decl: &Declaration, offset: usize) -> Option<Vec<EcoString>> {
 	match decl {
 		Declaration::Import { .. }
+		| Declaration::Effect { .. }
 		| Declaration::ExternalLet(..)
 		| Declaration::ExternalFunc(..)
 		| Declaration::TypeAlias { .. } => None,
@@ -929,6 +933,7 @@ fn interface_member_scope(
 fn collect_decl_exprs<'a>(decl: &'a Declaration, out: &mut Vec<&'a Expr>) {
 	match decl {
 		Declaration::Import { .. }
+		| Declaration::Effect { .. }
 		| Declaration::ExternalLet(..)
 		| Declaration::ExternalFunc(..)
 		| Declaration::TypeAlias { .. } => {}
@@ -1019,6 +1024,22 @@ fn collect_interface_member<'a>(member: &'a InterfaceMember, out: &mut Vec<&'a E
 fn collect_expr<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 	out.push(expr);
 	expr.for_each_child(|child| collect_expr(child, out));
+}
+
+/// Source spans of every privileged `echo` keyword in declaration order.
+#[must_use]
+pub fn echo_sites(module: &Module) -> Vec<Span> {
+	let mut expressions = Vec::new();
+	for declaration in &module.members {
+		collect_decl_exprs(declaration, &mut expressions);
+	}
+	expressions
+		.into_iter()
+		.filter_map(|expression| match &expression.kind {
+			ExprKind::Echo { keyword, .. } => Some(*keyword),
+			_ => None,
+		})
+		.collect()
 }
 
 // ── Go-to-definition ───────────────────────────────────────────────────────
@@ -1687,6 +1708,7 @@ fn func_decl_meta(decl: &Declaration) -> Option<&FuncDeclaration> {
 fn walk_decl_for_binder(decl: &Declaration, target_id: NodeId) -> Option<Option<Span>> {
 	match decl {
 		Declaration::Import { .. }
+		| Declaration::Effect { .. }
 		| Declaration::ExternalLet(..)
 		| Declaration::ExternalFunc(..)
 		| Declaration::TypeAlias { .. } => None,
@@ -1938,13 +1960,13 @@ fn self_type_name(decl: &Declaration) -> Option<EcoString> {
 	}
 }
 
-/// Peel `Type::Mut`/`Type::Grouped` down to a `Type::Reference`'s own name —
+/// Peel `Type::Grouped` down to a `Type::Reference`'s own name —
 /// the surface spellings `impl Point`, `impl mut Point`, `impl (Point)` all
 /// name the same Self type.
 fn type_ref_name(ty: &Type) -> Option<EcoString> {
 	match ty {
 		Type::Reference { name, .. } => Some(name.0.clone()),
-		Type::Mut(inner) | Type::Grouped(inner) => type_ref_name(&inner.0),
+		Type::Grouped(inner) => type_ref_name(&inner.0),
 		_ => None,
 	}
 }
@@ -2049,6 +2071,7 @@ fn this_method_definition_at(module: &Module, offset: usize) -> Option<Span> {
 /// interface" case; anything missed here simply returns `None`.
 fn collect_decl_type_refs<'a>(decl: &'a Declaration, out: &mut Vec<(&'a Ident, Span)>) {
 	match decl {
+		Declaration::Effect { .. } => {}
 		Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => {
 			for p in &meta.params {
 				collect_type_refs(&p.0.type_, out);
@@ -2136,10 +2159,13 @@ fn collect_type_refs<'a>(ty: &'a Spanned<Type>, out: &mut Vec<(&'a Ident, Span)>
 		Type::Reference { name, generics } => {
 			out.push((name, ty.1));
 			for g in generics {
-				collect_type_refs(&g.0.value, out);
+				match &g.0.value {
+					nymph_ast::ty::GenericArgValue::Type(ty) => collect_type_refs(ty, out),
+					nymph_ast::ty::GenericArgValue::Effect(row) => collect_effect_refs(row, out),
+				}
 			}
 		}
-		Type::List(inner) | Type::Grouped(inner) | Type::Mut(inner) => collect_type_refs(inner, out),
+		Type::List(inner) | Type::Grouped(inner) => collect_type_refs(inner, out),
 		Type::Tuple(elems) => {
 			for e in elems {
 				collect_type_refs(e, out);
@@ -2152,11 +2178,15 @@ fn collect_type_refs<'a>(ty: &'a Spanned<Type>, out: &mut Vec<(&'a Ident, Span)>
 		Type::Function {
 			params,
 			return_type,
+			effects,
 		} => {
 			for (_, t) in params {
 				collect_type_refs(t, out);
 			}
 			collect_type_refs(return_type, out);
+			if let Some(effects) = effects {
+				collect_effect_refs(effects, out);
+			}
 		}
 		Type::Intersection(a, b) => {
 			collect_type_refs(a, out);
@@ -2172,6 +2202,17 @@ fn collect_type_refs<'a>(ty: &'a Spanned<Type>, out: &mut Vec<(&'a Ident, Span)>
 		| Type::Never
 		| Type::SelfType
 		| Type::Infer => {}
+	}
+}
+
+fn collect_effect_refs<'a>(
+	row: &'a Spanned<nymph_ast::ty::EffectRow>,
+	out: &mut Vec<(&'a Ident, Span)>,
+) {
+	for effect in &row.0.effects {
+		if let nymph_ast::ty::Effect::Named(name) = &effect.0 {
+			out.push((name, name.1));
+		}
 	}
 }
 
@@ -2247,12 +2288,14 @@ fn render_type_node(ty: &Type) -> Option<String> {
 		Type::Function {
 			params,
 			return_type,
+			effects,
 		} => {
 			let inner: Option<Vec<String>> = params.iter().map(|(_, t)| render_type_node(&t.0)).collect();
 			Some(format!(
-				"({}) -> {}",
+				"({}) -> {}{}",
 				inner?.join(", "),
-				render_type_node(&return_type.0)?
+				render_type_node(&return_type.0)?,
+				render_effect_row(effects.as_ref())
 			))
 		}
 		Type::Reference { name, generics } => {
@@ -2262,7 +2305,7 @@ fn render_type_node(ty: &Type) -> Option<String> {
 			let inner: Option<Vec<String>> = generics
 				.iter()
 				.map(|g| {
-					let rendered = render_type_node(&g.0.value.0)?;
+					let rendered = render_generic_argument(&g.0.value)?;
 					Some(match &g.0.name {
 						Some(label) => format!("{} = {rendered}", label.0),
 						None => rendered,
@@ -2272,7 +2315,38 @@ fn render_type_node(ty: &Type) -> Option<String> {
 			Some(format!("{}<{}>", name.0, inner?.join(", ")))
 		}
 		Type::Grouped(inner) => render_type_node(&inner.0),
-		Type::Mut(inner) => Some(format!("mut {}", render_type_node(&inner.0)?)),
+	}
+}
+
+fn render_effect_row(row: Option<&Spanned<nymph_ast::ty::EffectRow>>) -> String {
+	let Some(row) = row else {
+		return String::new();
+	};
+	if row.0.effects.is_empty() {
+		return " + !()".to_string();
+	}
+	let effects = row
+		.0
+		.effects
+		.iter()
+		.map(|effect| match &effect.0 {
+			nymph_ast::ty::Effect::Named(name) => format!("!{}", name.0),
+			nymph_ast::ty::Effect::Infer => "!_".to_string(),
+			nymph_ast::ty::Effect::Error => "!<error>".to_string(),
+		})
+		.collect::<Vec<_>>()
+		.join(" + ");
+	format!(" + {effects}")
+}
+
+fn render_generic_argument(value: &nymph_ast::ty::GenericArgValue) -> Option<String> {
+	match value {
+		nymph_ast::ty::GenericArgValue::Type(ty) => render_type_node(&ty.0),
+		nymph_ast::ty::GenericArgValue::Effect(row) => Some(
+			render_effect_row(Some(row))
+				.trim_start_matches(" + ")
+				.to_string(),
+		),
 	}
 }
 
@@ -2317,15 +2391,17 @@ fn render_type_node_subst(ty: &Type, subst: &FxHashMap<EcoString, String>) -> Op
 		Type::Function {
 			params,
 			return_type,
+			effects,
 		} => {
 			let inner: Option<Vec<String>> = params
 				.iter()
 				.map(|(_, t)| render_type_node_subst(&t.0, subst))
 				.collect();
 			Some(format!(
-				"({}) -> {}",
+				"({}) -> {}{}",
 				inner?.join(", "),
-				render_type_node_subst(&return_type.0, subst)?
+				render_type_node_subst(&return_type.0, subst)?,
+				render_effect_row(effects.as_ref())
 			))
 		}
 		Type::Reference { name, generics } => {
@@ -2338,7 +2414,12 @@ fn render_type_node_subst(ty: &Type, subst: &FxHashMap<EcoString, String>) -> Op
 			let inner: Option<Vec<String>> = generics
 				.iter()
 				.map(|g| {
-					let rendered = render_type_node_subst(&g.0.value.0, subst)?;
+					let rendered = match &g.0.value {
+						nymph_ast::ty::GenericArgValue::Type(ty) => render_type_node_subst(&ty.0, subst)?,
+						nymph_ast::ty::GenericArgValue::Effect(row) => render_effect_row(Some(row))
+							.trim_start_matches(" + ")
+							.to_string(),
+					};
 					Some(match &g.0.name {
 						Some(label) => format!("{} = {rendered}", label.0),
 						None => rendered,
@@ -2348,7 +2429,6 @@ fn render_type_node_subst(ty: &Type, subst: &FxHashMap<EcoString, String>) -> Op
 			Some(format!("{}<{}>", name.0, inner?.join(", ")))
 		}
 		Type::Grouped(inner) => render_type_node_subst(&inner.0, subst),
-		Type::Mut(inner) => Some(format!("mut {}", render_type_node_subst(&inner.0, subst)?)),
 	}
 }
 
@@ -2407,10 +2487,6 @@ fn adt_generic_subst(
 	params: &[EcoString],
 	ty: Ty,
 ) -> FxHashMap<EcoString, String> {
-	let mut ty = ty;
-	if let TyKind::Mut(inner) = checked.interner.kind(ty) {
-		ty = *inner;
-	}
 	let TyKind::Adt(def_id, args) = checked.interner.kind(ty) else {
 		return FxHashMap::default();
 	};
@@ -2436,13 +2512,18 @@ fn render_visibility_prefix(visibility: Option<Visibility>) -> &'static str {
 /// why bounds live here rather than in [`generic_scope_at`]'s semantic
 /// `Param(idx)` recovery.
 fn render_generic_param(param: &GenericParam) -> String {
+	let name = if param.kind == nymph_ast::ty::GenericParamKind::Effect {
+		format!("!{}", param.name.0)
+	} else {
+		param.name.0.to_string()
+	};
 	match &param.constraint {
 		Some(constraint) => format!(
 			"{}: {}",
-			param.name.0,
+			name,
 			render_type_node(&constraint.0).unwrap_or_else(|| param.name.0.to_string())
 		),
-		None => param.name.0.to_string(),
+		None => name,
 	}
 }
 
@@ -2606,7 +2687,7 @@ fn has_unresolved_infer(interner: &Interner, ty: Ty) -> bool {
 		TyKind::Map(key, value) => {
 			has_unresolved_infer(interner, *key) || has_unresolved_infer(interner, *value)
 		}
-		TyKind::Fn { params, ret } => {
+		TyKind::Fn { params, ret, .. } => {
 			params.iter().any(|&p| has_unresolved_infer(interner, p))
 				|| has_unresolved_infer(interner, *ret)
 		}
@@ -2621,7 +2702,6 @@ fn has_unresolved_infer(interner: &Interner, ty: Ty) -> bool {
 					.any(|(_, t)| has_unresolved_infer(interner, *t))
 		}
 		TyKind::Intersection(parts) => parts.iter().any(|&p| has_unresolved_infer(interner, p)),
-		TyKind::Mut(inner) => has_unresolved_infer(interner, *inner),
 		_ => false,
 	}
 }
@@ -2637,8 +2717,8 @@ fn func_decl_body(decl: &Declaration) -> Option<&Expr> {
 }
 
 fn render_named_signature(meta: &FuncDeclaration, inferred_ret: Option<String>) -> String {
+	let async_kw = if meta.is_async { "async " } else { "" };
 	let kind_kw = match meta.kind {
-		FuncKind::Mut => "mut ",
 		FuncKind::Namespace => "namespace ",
 		FuncKind::Instance => "",
 	};
@@ -2652,9 +2732,6 @@ fn render_named_signature(meta: &FuncDeclaration, inferred_ret: Option<String>) 
 			if p.0.spread {
 				prefix.push_str("...");
 			}
-			if p.0.mutable {
-				prefix.push_str("mut ");
-			}
 			match render_param_pattern(&p.0.name.0) {
 				Some(name) => format!("{prefix}{name}: {ty}"),
 				None => format!("{prefix}{ty}"),
@@ -2665,8 +2742,9 @@ fn render_named_signature(meta: &FuncDeclaration, inferred_ret: Option<String>) 
 		Some(rt) => render_type_node(&rt.0).unwrap_or_else(|| "void".to_string()),
 		None => inferred_ret.unwrap_or_else(|| "void".to_string()),
 	};
+	let effects = render_effect_row(meta.effects.as_ref());
 	format!(
-		"{kind_kw}func {}{generics}({}): {ret}",
+		"{async_kw}{kind_kw}func {}{generics}({}): {ret}{effects}",
 		meta.name.0,
 		params.join(", ")
 	)
@@ -2757,8 +2835,8 @@ fn render_interface_member(member: &InterfaceMember) -> Option<String> {
 			InterfaceElement::Func { meta, .. } => Some(render_named_signature(meta, None)),
 			InterfaceElement::Let { meta, .. } => {
 				let modifier = match meta.kind {
-					LetKind::Mut => "mut ",
 					LetKind::Namespace => "namespace ",
+					LetKind::Use => "use ",
 					LetKind::Instance => "",
 				};
 				let name = render_param_pattern(&meta.name.0).unwrap_or_else(|| "_".to_string());
@@ -2811,10 +2889,12 @@ fn collect_type_node_candidates(ty: &Spanned<Type>, out: &mut Vec<(Span, String)
 	match &ty.0 {
 		Type::Reference { generics, .. } => {
 			for g in generics {
-				collect_type_node_candidates(&g.0.value, out);
+				if let nymph_ast::ty::GenericArgValue::Type(ty) = &g.0.value {
+					collect_type_node_candidates(ty, out);
+				}
 			}
 		}
-		Type::List(inner) | Type::Grouped(inner) | Type::Mut(inner) => {
+		Type::List(inner) | Type::Grouped(inner) => {
 			collect_type_node_candidates(inner, out);
 		}
 		Type::Tuple(elems) => {
@@ -2829,6 +2909,7 @@ fn collect_type_node_candidates(ty: &Spanned<Type>, out: &mut Vec<(Span, String)
 		Type::Function {
 			params,
 			return_type,
+			effects: _,
 		} => {
 			for (_, t) in params {
 				collect_type_node_candidates(t, out);
@@ -3014,7 +3095,7 @@ fn syntactic_generic_renderings(generics: &[EcoString], ty: &Type) -> Vec<EcoStr
 	};
 	let mut positional = 0;
 	for arg in args {
-		let Some(value) = render_type_node(&arg.0.value.0) else {
+		let Some(value) = render_generic_argument(&arg.0.value) else {
 			continue;
 		};
 		if let Some(name) = &arg.0.name {
@@ -3040,10 +3121,6 @@ fn semantic_generic_renderings(
 	generics: &[EcoString],
 ) -> Vec<EcoString> {
 	let mut rendered = generics.to_vec();
-	let mut ty = ty;
-	if let TyKind::Mut(inner) = checked.interner.kind(ty) {
-		ty = *inner;
-	}
 	let TyKind::Adt(definition, args) = checked.interner.kind(ty) else {
 		return rendered;
 	};
@@ -3427,10 +3504,7 @@ fn push_for_binder_candidates(
 	) {
 		return;
 	}
-	let mut ty = info.ty;
-	if let TyKind::Mut(inner) = checked.interner.kind(ty) {
-		ty = *inner;
-	}
+	let ty = info.ty;
 	match checked.interner.kind(ty) {
 		TyKind::List(elem) => {
 			bind_pattern_semantic(variable, *elem, checked, module, defs, params, out);
@@ -3514,6 +3588,9 @@ fn collect_fallback_decl(
 ) {
 	match decl {
 		Declaration::Import { .. } | Declaration::TypeAlias { .. } => {}
+		Declaration::Effect { name, .. } => {
+			out.push((name.1, format!("effect {}", name.0)));
+		}
 		Declaration::ExternalLet(_, _, meta) => {
 			if let Some(t) = &meta.type_ {
 				collect_type_node_candidates(t, out);
@@ -3581,6 +3658,7 @@ fn collect_fallback_decl(
 			variants,
 			members,
 			impls,
+			..
 		} => {
 			out.push((
 				name.1,
@@ -3802,6 +3880,40 @@ fn collect_fallback_exprs(
 			collect_fallback_exprs(body, checked, module, defs, params, out);
 			return;
 		}
+		ExprKind::StateLoop { bindings, body, .. } => {
+			for binding in bindings {
+				push_let_binder(
+					&binding.meta.name,
+					&binding.value,
+					checked,
+					module,
+					defs,
+					params,
+					out,
+				);
+				if let Some(type_) = &binding.meta.type_ {
+					collect_type_node_candidates(type_, out);
+				}
+				collect_fallback_exprs(&binding.value, checked, module, defs, params, out);
+			}
+			collect_fallback_exprs(body, checked, module, defs, params, out);
+			return;
+		}
+		ExprKind::Continue { replacements, .. } => {
+			for replacement in replacements {
+				let declaration = checked
+					.annotations
+					.local_declarations()
+					.find_map(|(span, declaration)| (span == replacement.name.1).then_some(declaration));
+				if let Some(declaration) = declaration
+					&& let Some((_, rendered)) = out.iter().find(|(span, _)| *span == declaration)
+				{
+					out.push((replacement.name.1, rendered.clone()));
+				}
+				collect_fallback_exprs(&replacement.value, checked, module, defs, params, out);
+			}
+			return;
+		}
 		ExprKind::Match { value, arms } => {
 			collect_fallback_exprs(value, checked, module, defs, params, out);
 			let scrutinee_ty = checked.annotations.get(value.id).map(|info| info.ty);
@@ -3845,6 +3957,7 @@ fn collect_fallback_exprs(
 fn collect_decl_scope_names(decl: &Declaration, offset: usize, out: &mut ScopeNames) {
 	match decl {
 		Declaration::Import { .. }
+		| Declaration::Effect { .. }
 		| Declaration::ExternalLet(..)
 		| Declaration::ExternalFunc(..)
 		| Declaration::TypeAlias { .. } => {}
@@ -4744,19 +4857,6 @@ mod type_at_tests {
 	}
 
 	#[test]
-	fn hovering_a_mut_func_decl_name_includes_the_mut_keyword() {
-		let text = "struct Counter(count: int) {\n  mut func bump(): void = {}\n}";
-		let module = module_of(text);
-		let checked = check_module(&module);
-		let offset = text.find("bump").unwrap() + 1;
-
-		assert_eq!(
-			type_at(&module, &checked, offset),
-			Some("mut func bump(): void".to_string())
-		);
-	}
-
-	#[test]
 	fn hovering_an_enum_decl_name_renders_every_variant_and_its_fields() {
 		let text =
 			"enum Shape { Circle(radius: int), Square }\nfunc origin(): Shape = Circle(radius = 1)";
@@ -5142,7 +5242,7 @@ mod type_at_tests {
 
 	#[test]
 	fn hovering_a_truly_void_bodied_funcs_name_still_shows_void() {
-		let text = "func void_expr() = while (true) {}";
+		let text = "func void_expr() = {}";
 		let module = module_of(text);
 		let checked = check_module(&module);
 		let offset = text.find("void_expr").unwrap();
@@ -5360,22 +5460,6 @@ mod member_completion_tests {
 			vec![("name".into(), Kind::Method, "() -> string".into())]
 		);
 		assert!(at(source, "value.nope").is_empty());
-	}
-
-	#[test]
-	fn mutating_methods_obey_place_capability_without_same_name_suppression() {
-		let source = "struct Cell { mut func change(): int = 1 }\nstruct Other { func change(): string = \"\" }\nfunc mutable(value: mut Cell): int = value.change\nfunc immutable(value: Cell): int = value.change\nfunc owned(): int = Cell().change";
-		assert!(at(source, "value.change").is_empty());
-		assert_eq!(at(source, "Cell().change")[0].0, "change");
-		let mutable_source = source.replacen("value.change", "value.change", 1);
-		let (analysis, _) = analyze(&mutable_source);
-		let first = mutable_source.find("value.change").unwrap() + "value".len();
-		assert_eq!(member_completions_at(&analysis, first)[0].name, "change");
-
-		let owned =
-			"struct Cell { mut func change(): int = 1 }\nfunc take(): () -> int = Cell().change";
-		let (_, diagnostics) = analyze(owned);
-		assert!(diagnostics.is_empty(), "{diagnostics:?}");
 	}
 
 	#[test]

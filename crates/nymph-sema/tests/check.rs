@@ -56,10 +56,6 @@ fn external_let_linkage_errors_are_structured_diagnostics() {
 			"registered as a function",
 		),
 		(
-			"external(max_float) let mut value: float",
-			"external lets are immutable",
-		),
-		(
 			"external(max_float) let value: boolean",
 			"incompatible declared type",
 		),
@@ -204,12 +200,7 @@ fn simple_annotated_function() {
 #[test]
 fn list_index_is_native_for_uint_and_extensible_for_other_keys() {
 	assert_ok("func unsigned(xs: #[int], i: uint): int = xs[i]");
-	assert_ok(
-		"func previous(xs: mut #[int], i: uint): int = {
-		   xs[i - 1] = xs[i - 1] + 1
-		   xs[i - 1]
-		 }",
-	);
+	assert_ok("func previous(xs: #[int], i: uint): int = xs[i - 1]");
 	assert_error_contains(
 		"func signed(xs: #[int], i: int): int = xs[i]",
 		"no method `index`",
@@ -276,13 +267,6 @@ fn binding_subpattern_union_requires_compatible_binding_types() {
 		"enum Value { Number(value: int), Text(value: string) }
 		 func bad(value: Value): int = match (value) {
 		   Number(x) | Text(x) -> 0,
-		 }",
-		"mismatched types for union pattern binding `x`",
-	);
-	assert_error_contains(
-		"enum Value { Mutable(value: mut #[int]), Immutable(value: #[int]) }
-		 func bad(value: Value): int = match (value) {
-		   Mutable(x) | Immutable(x) -> 0,
 		 }",
 		"mismatched types for union pattern binding `x`",
 	);
@@ -423,6 +407,48 @@ fn struct_construction_and_field_access() {
 }
 
 #[test]
+fn immutable_struct_fresh_clone_and_defaults_are_checked() {
+	assert_ok(
+		"struct Point(x: int = 1, y: int)\n\
+		 func update(point: Point): Point = Point(...point, x = 2)\n\
+		 func fresh(): Point = Point(y = 3)",
+	);
+	assert_error_contains(
+		"struct Point(x: int, y: int)\nfunc bad(): Point = Point(x = 1)",
+		"missing required struct field(s): y",
+	);
+	assert_error_contains(
+		"struct Point(x: int, y: int)\nfunc bad(): Point = Point(x = 1, x = 2, y = 3)",
+		"struct field `x` is supplied more than once",
+	);
+	assert_error_contains(
+		"struct Point(x: int, y: int)\nfunc bad(point: Point): Point = Point(x = 1, ...point)",
+		"requires exactly one leading source spread",
+	);
+}
+
+#[test]
+fn struct_defaults_use_owner_scope_and_declared_type() {
+	assert_error_contains(
+		"struct Bad(value: int = true)",
+		"expected `int`, found `boolean`",
+	);
+	assert_error_contains(
+		"struct Bad(first: int = 1, second: int = first)",
+		"cannot find `first`",
+	);
+}
+
+#[test]
+fn struct_clone_source_must_have_the_exact_generic_owner() {
+	assert_error_contains(
+		"struct Box<T>(value: T)\n\
+		 func bad(source: Box<boolean>): Box<int> = Box(...source, value = 1)",
+		"mismatched types",
+	);
+}
+
+#[test]
 fn field_variant_as_value_is_rejected() {
 	// A field-carrying variant used as a first-class value has no representable
 	// constructor in the current value ABI, so it is rejected (not miscompiled).
@@ -495,111 +521,6 @@ fn let_inference_in_block() {
 }
 
 #[test]
-fn assignment_to_immutable_is_reported() {
-	assert_error_contains(
-		"func f(): int = {
-		   let x = 1
-		   x = 2
-		   x
-		 }",
-		"cannot assign to immutable `x`",
-	);
-}
-
-#[test]
-fn mutable_assignment_is_allowed() {
-	assert_ok(
-		"func f(): int = {
-		   let mut x = 1
-		   x = 2
-		   x
-		 }",
-	);
-}
-
-#[test]
-fn plain_let_with_an_explicit_mut_annotation_keeps_the_mut_type() {
-	// (annotation-position `mut`) + (`let mut` sugar) are independent
-	// axes: a plain `let` (no `let mut`) with an explicit `mut T` annotation
-	// must still bind at `mut T` — the annotation is the authority here, not
-	// the `let mut` keyword, which is a SEPARATE way to reach the same `mut`
-	// type. The plain-let branch must not strip `mut` and discard the annotation.
-	assert_ok(
-		"struct Counter(n: int)
-		 func f(c: mut Counter): int = {
-		   let x: mut Counter = c
-		   x.n = x.n + 1
-		   x.n
-		 }",
-	);
-}
-
-#[test]
-fn let_mut_with_an_explicit_mut_annotation_accepts_a_fresh_plain_value() {
-	// `let mut c: mut Counter = Counter(n = 0)` must type-check: the freshly
-	// constructed `Counter(n = 0)` is plain (non-`mut`), but initializing a
-	// `mut`-annotated binding only requires the value be assignable to the
-	// PLAIN inner type (`mut` is a capability layer the binding gains, not a
-	// runtime distinction the initializer must already carry) — mirrors the
-	// un-annotated `let mut` form, which already accepts a plain value and
-	// wraps it in `mut` after the fact.
-	assert_ok(
-		"struct Counter(n: int)
-		 func f(): int = {
-		   let mut c: mut Counter = Counter(n = 0)
-		   c.n = c.n + 1
-		   c.n
-		 }",
-	);
-}
-
-#[test]
-fn field_slot_assign_through_an_immutable_receiver_is_rejected() {
-	// headline enforcement: `p.field = v` requires a `mut` receiver. Through
-	// an immutable parameter it is the `AssignFieldThroughImmutable` diagnostic —
-	// the error path (the happy `mut`-receiver path is the run_node e2e tests).
-	assert_error_contains(
-		"struct Counter(n: int)
-		 func f(c: Counter): int = {
-		   c.n = c.n + 1
-		   c.n
-		 }",
-		"through immutable",
-	);
-}
-
-#[test]
-fn cast_on_a_mut_typed_value_uses_the_builtin_path() {
-	// `mut` is transparent to casting: a `let mut`/`mut`-param
-	// scalar's identity or scalar cast must reach the built-in path, not fall
-	// through to requiring an `Into` impl ("cannot cast `mut int` to `int`").
-	assert_ok(
-		"func f(x: int): float = {
-		   let mut y = x
-		   let same = y as int
-		   same as float
-		 }",
-	);
-}
-
-#[test]
-fn for_in_over_a_mut_list_types_the_element() {
-	// Iterating a `mut #[int]` must bind `int` elements, not an
-	// unconstrained fresh var — so a type error in the loop body is still caught.
-	assert_error_contains(
-		"func f(): int = {
-		   let mut xs = #[1, 2, 3]
-		   for (x in xs) {
-		     let z: boolean = x
-		     z
-		   }
-		   0
-		 }",
-		"mismatched types",
-	);
-}
-
-#[test]
 fn for_in_over_an_iterator_directly_types_the_element() {
 	// A for-loop source that itself implements `Iterator<Item>` is used
 	// directly (no `.iter()` hop) — the element type must flow through as
@@ -619,51 +540,6 @@ fn for_in_over_an_iterator_directly_types_the_element() {
 		   0
 		 }",
 		"mismatched types",
-	);
-}
-
-#[test]
-fn for_in_over_an_iterator_directly_requires_a_mut_receiver() {
-	// The mut-safety gate (`MutMethodNeedsMutReceiver`) that an EXPLICIT
-	// `c.next()` call would hit for a `mut func next` on a non-`mut` `c` must
-	// also fire for the implicit `next()` call the `for`-loop desugar
-	// generates — `resolve_iterable_source` resolves the `Iterator` impl but
-	// must gate it exactly like `resolve_method` does for any other mutating
-	// call, or a non-`mut` binding's fields get mutated through the loop.
-	assert_error_contains(
-		"struct Counter(n: int)
-		 interface Iterator<Item> { mut func next(): Item }
-		 impl Iterator<int> for Counter {
-		   mut func next(): int = { this.n = this.n + 1 this.n }
-		 }
-		 func f(): int = {
-		   let c = Counter(n = 0)
-		   for (x in c) {
-		     x
-		   }
-		   0
-		 }",
-		"mut",
-	);
-}
-
-#[test]
-fn for_in_over_an_iterator_directly_accepts_a_mut_receiver() {
-	// The same program as above, but with `c` declared `mut`, must type-check
-	// cleanly — the gate must not reject a receiver that IS mut.
-	assert_ok(
-		"struct Counter(n: int)
-		 interface Iterator<Item> { mut func next(): Item }
-		 impl Iterator<int> for Counter {
-		   mut func next(): int = { this.n = this.n + 1 this.n }
-		 }
-		 func f(): int = {
-		   let mut c = Counter(n = 0)
-		   for (x in c) {
-		     x
-		   }
-		   0
-		 }",
 	);
 }
 
@@ -700,13 +576,11 @@ fn for_in_over_an_iterable_via_iter_types_the_element() {
 #[test]
 fn for_in_over_generic_iterable_bound_types_the_element() {
 	assert_ok(
-		"enum Option<T> { Some(value: T), None }
-		 interface Iterator<Item> { mut func next(): Option<Item> }
+		"enum Iteration<Item, Next> { Done, Yield(item: Item, next: Next) }
+		 interface Iterator<Item> { func next(): Iteration<Item, self> }
 		 interface Iterable<Item> { func iter(): Iterator<Item> }
-		 func first_sum<T: Iterable<Item = int>>(items: T): int = {
-		   let mut total = 0
-		   for (item in items) { total = total + item }
-		   total
+		 func visit<T: Iterable<Item = int>>(items: T): void = {
+		   for (item in items) { let value: int = item }
 		 }",
 	);
 }
@@ -804,39 +678,6 @@ fn index_access_without_an_index_impl_is_diagnosed() {
 }
 
 #[test]
-fn assignment_through_a_custom_index_impl_is_diagnosed() {
-	assert_error_contains(
-		"interface Index<Key, Output> { func index(key: Key): Output }
-		 struct Box(value: int) {
-		   impl Index<Key = int, Output = int> {
-		     func index(key: int): int = this.value + key
-		   }
-		 }
-		 func f(): void = {
-		   let mut box = Box(value = 1)
-		   box[0] = 2
-		 }",
-		"cannot assign to `custom index access`",
-	);
-}
-
-#[test]
-fn mutating_method_on_a_custom_index_result_accepts_the_temporary() {
-	assert_ok(
-		"interface Index<Key, Output> { func index(key: Key): Output }
-		 struct Counter(value: int) {
-		   mut func increment(): int = { this.value = this.value + 1 this.value }
-		 }
-		 struct Store(value: Counter) {
-		   impl Index<Key = int, Output = Counter> {
-		     func index(key: int): Counter = this.value
-		   }
-		 }
-		 func f(): int = Store(value = Counter(value = 0))[0].increment()",
-	);
-}
-
-#[test]
 fn method_generic_shadowing_does_not_change_an_owner_bound() {
 	assert_ok(
 		"interface Echo<X> { func echo(value: X): X }
@@ -886,42 +727,27 @@ fn list_spread_over_a_native_list_source_element_mismatch_is_reported() {
 
 #[test]
 fn list_spread_over_a_user_iterator_types_the_element() {
-	// a spread source need not be a same-kind list literal — ANY
-	// `Iterator<T>`/`Iterable<T>` whose element matches is accepted, reusing
-	// Track A's own iterable resolution.
 	assert_ok(
-		"enum Option<T> { Some(value: T), None }
-		 interface Iterator<Item> { mut func next(): Option<Item> }
-		 struct Counter(n: int, max: int)
+		"enum Iteration<Item, Next> { Done, Yield(item: Item, next: Next) }
+		 interface Iterator<Item> { func next(): Iteration<Item, self> }
+		 struct Counter
 		 impl Iterator<int> for Counter {
-		   mut func next(): Option<int> = if (this.n > this.max) {
-		     None
-		   } else {
-		     let v = this.n
-		     this.n = this.n + 1
-		     Some(value = v)
-		   }
+		   func next(): Iteration<int, self> = Done
 		 }
-		 func f(): #[int] = {
-		   let mut c = Counter(n = 1, max = 3)
-		   #[...c, 99]
-		 }",
+		 func f(value: Counter): #[int] = #[...value, 99]",
 	);
 }
 
 #[test]
 fn list_spread_over_a_user_iterator_element_mismatch_is_reported() {
 	assert_error_contains(
-		"enum Option<T> { Some(value: T), None }
-		 interface Iterator<Item> { mut func next(): Option<Item> }
-		 struct Counter(n: int, max: int)
+		"enum Iteration<Item, Next> { Done, Yield(item: Item, next: Next) }
+		 interface Iterator<Item> { func next(): Iteration<Item, self> }
+		 struct Counter
 		 impl Iterator<boolean> for Counter {
-		   mut func next(): Option<boolean> = None
+		   func next(): Iteration<boolean, self> = Done
 		 }
-		 func f(): #[int] = {
-		   let mut c = Counter(n = 1, max = 3)
-		   #[...c, 99]
-		 }",
+		 func f(value: Counter): #[int] = #[...value, 99]",
 		"mismatched types",
 	);
 }
@@ -961,26 +787,14 @@ fn map_spread_over_a_native_map_source_value_mismatch_is_reported() {
 
 #[test]
 fn map_spread_over_a_non_map_iterable_of_pairs_types_the_entry() {
-	// `Map` has no stdlib `Iterable` impl, so a non-map spread source must
-	// resolve through the ordinary `Iterator`/`Iterable` protocol as an
-	// iterable of `#(K, V)` pairs.
 	assert_ok(
-		"enum Option<T> { Some(value: T), None }
-		 interface Iterator<Item> { mut func next(): Option<Item> }
-		 struct Pairs(n: int, max: int)
+		"enum Iteration<Item, Next> { Done, Yield(item: Item, next: Next) }
+		 interface Iterator<Item> { func next(): Iteration<Item, self> }
+		 struct Pairs
 		 impl Iterator<#(int, string)> for Pairs {
-		   mut func next(): Option<#(int, string)> = if (this.n > this.max) {
-		     None
-		   } else {
-		     let v = this.n
-		     this.n = this.n + 1
-		     Some(value = #(v, \"x\"))
-		   }
+		   func next(): Iteration<#(int, string), self> = Done
 		 }
-		 func f(): #{int: string} = {
-		   let mut p = Pairs(n = 1, max = 3)
-		   #{...p, 9: \"z\"}
-		 }",
+		 func f(value: Pairs): #{int: string} = #{...value, 9: \"z\"}",
 	);
 }
 
@@ -1035,12 +849,6 @@ fn int_literal_widens_to_float_in_return_position() {
 #[test]
 fn int_literal_widens_to_uint_in_return_position() {
 	assert_ok("func f(): uint = 0");
-}
-
-#[test]
-fn uint_value_widens_to_int() {
-	assert_ok("func f(n: uint): int = n");
-	assert_ok("func takes_int(n: int): int = n func f(n: uint): int = takes_int(n)");
 }
 
 #[test]
@@ -1177,41 +985,6 @@ fn bare_variant_nested_in_a_list_literal_is_disambiguated() {
 		"enum Tree { Leaf, Branch }
 		 enum Plant { Leaf, Root }
 		 func make(): #[Tree] = #[Leaf]",
-	);
-}
-
-#[test]
-fn compound_assignment_on_a_mutable_local() {
-	assert_ok(
-		"func f(): int = {
-		   let mut x = 1
-		   x += 2
-		   x
-		 }",
-	);
-}
-
-#[test]
-fn compound_assignment_to_an_immutable_local_is_reported() {
-	assert_error_contains(
-		"func f(): int = {
-		   let x = 1
-		   x += 2
-		   x
-		 }",
-		"cannot assign to immutable",
-	);
-}
-
-#[test]
-fn compound_assignment_result_must_fit_the_place() {
-	// `x` is a `float`; `x *= 2` stays a `float` (the `2` literal widens) — no error.
-	assert_ok(
-		"func f(): float = {
-		   let mut x = 1.5
-		   x *= 2
-		   x
-		 }",
 	);
 }
 

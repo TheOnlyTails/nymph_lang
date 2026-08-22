@@ -10,7 +10,7 @@ func fizzbuzz(n: int): string = match (#(n % 3, n % 5)) {
   _ -> "${n}",
 }
 
-func main() = {
+func main(): void = {
   for (n in 1..=100) {
     println(fizzbuzz(n))
   }

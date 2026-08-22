@@ -3,9 +3,9 @@
 //! Every error and warning the checker can emit is one variant of [`TypeError`],
 //! carrying only its semantic data; the [`IntoDiagnostic`] impl is the one place
 //! that turns a variant into a rendered message, severity, labels, and help. The
-//! primary span is supplied at the emit site (`Checker::emit`). Error *codes* are
-//! not assigned yet — `code` inherits the trait default (`None`) until the code
-//! scheme lands.
+//! primary span is supplied at the emit site (`Checker::emit`). Existing variants
+//! remain in place and new variants are appended so their generated codes stay
+//! stable.
 
 use ecow::EcoString;
 use nymph_ast::Span;
@@ -194,6 +194,10 @@ pub enum TypeError {
 	NonExhaustiveNeedsWildcard,
 	/// A `match` arm can never be reached. **Warning.**
 	UnreachableArm,
+	/// A `let use` initializer does not satisfy the canonical `Close` interface.
+	ManagedResourceRequired {
+		ty: EcoString,
+	},
 
 	// ── Codegen-ABI limitations ──────────────────────────────────────────────
 	/// A field-carrying variant was used as a first-class value (e.g. `let g = Some`).
@@ -290,74 +294,9 @@ pub enum TypeError {
 		found: String,
 	},
 
-	/// A source `int`/`uint` literal whose magnitude exceeds `2^53 - 1`
-	/// (`Number.MAX_SAFE_INTEGER`) — Nymph's `int`/`uint` are JS doubles at
-	/// runtime, and a magnitude past this bound can't round-trip through one
-	/// exactly, so the literal as written and the value the program actually
-	/// runs with can silently diverge. A warning, not an error (precedent:
-	/// `UnreachableArm`'s `Severity::Warning` arm below) — the program still
-	/// runs, just with the nearest representable `f64` in place of the exact
-	/// literal. `int`/`uint` literals store their magnitude as `u64` with the
-	/// sign (for `int`) as a separate `PrefixOperator::Negate` wrapping the
-	/// literal node, so this also fires for a negative literal like
-	/// `-9007199254740992`: inferring the `Negate` operand infers the inner
-	/// literal expression first, which is where this warning is emitted — no
-	/// special-casing of the surrounding `Negate` is needed.
-	IntLiteralUnsafe {
+	/// A signed source integer literal outside `i64::MIN..=i64::MAX`.
+	IntLiteralOutOfRange {
 		value: u64,
-	},
-
-	/// A field's SLOT was reassigned (`p.field = v`) through a receiver whose
-	/// type is not `mut` — mutable-types enforcement. The field's own
-	/// declared type is irrelevant here; what's gating is whether `p` itself is
-	/// a `mut` view.
-	AssignFieldThroughImmutable {
-		field: EcoString,
-		ty: String,
-	},
-
-	// ── Mutable types, interfaces  ──────────────────────────────────────
-	/// A `mut func` interface method (the interface's declared kind is the
-	/// source of truth) was called on a receiver that isn't `mut` — a plain
-	/// value only has the interface's non-`mut` methods available. Reached
-	/// uniformly through `resolve_method`'s single gate for a concrete `mut B`
-	/// receiver, an interface default body, and a `T: A` bound's `mut T`
-	/// requirement alike.
-	MutMethodNeedsMutReceiver {
-		method: EcoString,
-	},
-
-	/// An `impl A for B` (or nested `impl A { .. }`) restated a method's
-	/// `mut func`/`func` kind differently from what interface `A` itself
-	/// declares — e.g. the interface says `mut func push`, the impl says
-	/// plain `func push`. The interface is the source of truth every call-site
-	/// gate reads, so a mismatch here would silently desync what the impl body
-	/// requires from what callers are checked against. `expected_mut` is the
-	/// interface's own declared kind.
-	MethodMutMismatch {
-		name: EcoString,
-		ty: String,
-		expected_mut: bool,
-	},
-
-	/// A generic parameter `T: A` was instantiated, across the arguments of one
-	/// call, by BOTH a `mut` and a non-`mut` value at positions sharing that
-	/// same `T`  — e.g. `f<T: A>(x: T, y: T)` called `f(mut_b, b)`. No
-	/// single type for `T` can be correct for both call sites when `A` is
-	/// implemented only for `mut B` (`impl A for mut B` / `impl mut A for B`).
-	MixedMutabilityForBound {
-		interface: EcoString,
-	},
-
-	/// A `T: A` bound obligation failed for a plain type `ty`, but the `mut`
-	/// version of `ty` WOULD satisfy it (`A` is implemented only for
-	/// `mut ty`, via `impl A for mut ty` / `impl mut A for ty`) — a more
-	/// specific diagnostic than [`TypeError::BoundNotSatisfied`], hinting the
-	/// fix directly (pass a `mut` value) rather than leaving the caller to
-	/// guess.
-	BoundSatisfiedOnlyByMut {
-		ty: String,
-		interface: EcoString,
 	},
 
 	/// A `for` loop's source implements neither `Iterator` nor `Iterable` (the
@@ -429,8 +368,6 @@ pub enum TypeError {
 	ExternalValueTypeMismatch {
 		marker: EcoString,
 	},
-	/// External host values are snapshots and cannot be mutable bindings.
-	ExternalValueMutable,
 	/// A loop-control expression has no lexically enclosing loop. Appended so
 	/// existing numeric diagnostic codes remain stable.
 	LoopControlOutsideLoop {
@@ -457,11 +394,6 @@ pub enum TypeError {
 		left: String,
 		right: String,
 	},
-	/// The same local has different binding mutability in two union alternatives.
-	/// Appended so existing numeric diagnostic codes remain stable.
-	InconsistentUnionBindingMutability {
-		name: EcoString,
-	},
 	QuestionOperand {
 		found: String,
 	},
@@ -470,6 +402,88 @@ pub enum TypeError {
 		found: String,
 	},
 	QuestionOutsideCallable,
+	/// `.await` was used without an enclosing async function or block.
+	AwaitOutsideAsync,
+	/// `.await` was applied to a value that is not a task or execution handle.
+	AwaitOperand {
+		found: String,
+	},
+	/// A fully constant fixed-width integer operation that would fail at runtime.
+	/// Appended so existing numeric diagnostic codes remain stable.
+	IntegerConstantInvalid {
+		reason: EcoString,
+	},
+	RangeOperationInvalid {
+		reason: EcoString,
+	},
+	TupleSliceUnsupported,
+	/// An effect name was referenced that is not in scope.
+	CannotFindEffect {
+		name: EcoString,
+	},
+	/// A name used in an effect row does not denote an effect.
+	NotAnEffect {
+		name: EcoString,
+	},
+	/// An effect generic was used where a type was required, or vice versa.
+	GenericKindMismatch {
+		name: EcoString,
+		expected: &'static str,
+	},
+	/// `!_` needs a body or initializer from which effects can be inferred.
+	CannotInferEffectRow,
+	/// A callable body requires effects outside its declared closed upper bound.
+	EffectRowExceedsAnnotation,
+	/// An interface implementation declares effects outside the interface contract.
+	ImplementationEffectRowExceedsContract {
+		method: EcoString,
+	},
+	PositionalStructField,
+	InvalidStructSpread,
+	DuplicateStructField {
+		field: EcoString,
+	},
+	InaccessibleStructField {
+		field: EcoString,
+	},
+	StructFreshUnavailable,
+	MissingStructFields {
+		fields: Vec<EcoString>,
+	},
+	StructPatternRestRequired,
+	PositionalStructPattern,
+	InvalidStructPatternRest,
+	/// A nominal type directly stores a managed resource but does not define its
+	/// own cleanup behavior. This warning is deliberately non-transitive.
+	ManagedFieldWithoutClose {
+		owner: EcoString,
+		field: EcoString,
+		owner_span: Span,
+		field_span: Span,
+	},
+	/// A spawned child captures a managed local beyond that local's lexical
+	/// cleanup boundary. This remains a warning rather than ownership checking.
+	ManagedChildCapture {
+		declaration: Span,
+		close: Span,
+		join: Span,
+	},
+	/// A state-loop header must declare a named immutable binding.
+	InvalidStateLoopBinding,
+	/// A named continue replacement does not match a state binding.
+	UnknownStateReplacement {
+		name: EcoString,
+	},
+	/// A named continue replaces the same state binding more than once.
+	DuplicateStateReplacement {
+		name: EcoString,
+	},
+	/// Argument-bearing continue can only target an immutable state loop.
+	StateReplacementOutsideStateLoop,
+	/// A destination enum was used as a runtime wrapper around a source enum.
+	RetiredEnumWrapper,
+	/// A destination enum qualified a source-owned variant pattern.
+	RetiredEnumWrapperPattern,
 }
 
 impl IntoDiagnostic for TypeError {
@@ -488,6 +502,23 @@ impl IntoDiagnostic for TypeError {
 			E::GenericParamWithArgs { name } => {
 				format!("generic parameter `{name}` cannot take type arguments").into()
 			}
+			E::CannotFindEffect { name } => {
+				format!("cannot find effect `{name}` in this scope").into()
+			}
+			E::NotAnEffect { name } => format!("`{name}` is not an effect").into(),
+			E::GenericKindMismatch { name, expected } => {
+				format!("generic parameter `{name}` is not a {expected} parameter").into()
+			}
+			E::CannotInferEffectRow => {
+				"cannot infer this effect row without a callable body or initializer".into()
+			}
+			E::EffectRowExceedsAnnotation => {
+				"callable body requires effects outside its declared effect row".into()
+			}
+			E::ImplementationEffectRowExceedsContract { method } => format!(
+				"implementation method `{method}` requires effects outside the interface contract"
+			)
+			.into(),
 			E::Redefinition { name, .. } => format!("`{name}` is defined more than once").into(),
 			E::RecursiveTypeAlias => "type alias expands recursively without end".into(),
 			E::InfiniteType { ty } => format!("this expression has an infinite type `{ty}`").into(),
@@ -509,6 +540,12 @@ impl IntoDiagnostic for TypeError {
 			.into(),
 			E::QuestionOutsideCallable => {
 				"unlabelled `?` is only valid inside a callable".into()
+			}
+			E::AwaitOutsideAsync => {
+				"`.await` is only valid inside an async function or async block".into()
+			}
+			E::AwaitOperand { found } => {
+				format!("the `.await` operand must be a task or execution handle, found `{found}`").into()
 			}
 
 			E::ThisOutsideMethod => "`this` is only valid inside a method".into(),
@@ -614,6 +651,9 @@ impl IntoDiagnostic for TypeError {
 				"non-exhaustive match: add a `_` arm to cover the remaining cases".into()
 			}
 			E::UnreachableArm => "unreachable match arm".into(),
+			E::ManagedResourceRequired { ty } => {
+				format!("`let use` requires a value implementing `Close`, not `{ty}`").into()
+			}
 
 			E::CannotInferOperandType => {
 				"cannot infer the operand type of this operator; add a type annotation".into()
@@ -636,9 +676,6 @@ impl IntoDiagnostic for TypeError {
 				"mismatched types for union pattern binding `{name}`: left alternative has `{left}`, right alternative has `{right}`"
 			)
 			.into(),
-			E::InconsistentUnionBindingMutability { name } => {
-				format!("`{name}` has different mutability across union pattern alternatives").into()
-			}
 			E::ExternalValueLinkageMissing { marker } => {
 				format!("external value marker `{marker}` is not registered").into()
 			}
@@ -654,13 +691,12 @@ impl IntoDiagnostic for TypeError {
 			E::ExternalValueTypeMismatch { marker } => {
 				format!("external value marker `{marker}` has an incompatible declared type").into()
 			}
-			E::ExternalValueMutable => "external lets are immutable; remove `mut`".into(),
 
 			E::MainMissing => "no `main` function found".into(),
 			E::MainGeneric => "`main` cannot declare generic parameters".into(),
 			E::MainHasParams => "`main` must not declare any parameters".into(),
 			E::MainNonVoidReturn => {
-				"`main` must not declare a return type other than `void`".into()
+				"`main` must return `void`, `Option<void>`, `Result<void, E>`, or a `Task` producing one of those types".into()
 			}
 
 			E::CastRequiresInto { from, to } => {
@@ -677,38 +713,12 @@ impl IntoDiagnostic for TypeError {
 			E::LogicalOperandNotBoolean { found } => {
 				format!("mismatched types: expected `boolean`, found `{found}`").into()
 			}
-			E::IntLiteralUnsafe { value } => format!(
-				"integer literal `{value}` exceeds `Number.MAX_SAFE_INTEGER` (2^53 - 1) and will lose \
-				 precision"
-			)
-			.into(),
-			E::AssignFieldThroughImmutable { field, ty } => {
-				format!("cannot assign to field `{field}` through immutable `{ty}`").into()
+			E::IntLiteralOutOfRange { value } => {
+				format!("integer literal `{value}` is out of range for `int`").into()
 			}
-
-			E::MutMethodNeedsMutReceiver { method } => {
-				format!("`{method}` requires a `mut` receiver").into()
-			}
-			E::MethodMutMismatch {
-				name, expected_mut, ..
-			} => {
-				let (declared, restated) = if *expected_mut {
-					("mut func", "func")
-				} else {
-					("func", "mut func")
-				};
-				format!(
-					"`{name}` is declared `{declared}` on the interface but restated `{restated}` here"
-				)
-				.into()
-			}
-			E::MixedMutabilityForBound { interface } => format!(
-				"mixed `mut`/non-`mut` arguments for one type parameter bounded by `{interface}`"
-			)
-			.into(),
-			E::BoundSatisfiedOnlyByMut { ty, interface } => {
-				format!("`{ty}` does not implement `{interface}`; `mut {ty}` does").into()
-			}
+			E::IntegerConstantInvalid { reason } => reason.clone(),
+			E::RangeOperationInvalid { reason } => reason.clone(),
+			E::TupleSliceUnsupported => "tuple slicing is unsupported".into(),
 			E::NotIterable { ty } => {
 				format!("`{ty}` is not iterable; it implements neither `Iterator` nor `Iterable`")
 					.into()
@@ -716,15 +726,51 @@ impl IntoDiagnostic for TypeError {
 			E::InvalidRangeBound { ty } => {
 				format!("range bounds must be `int` or `uint`, not `{ty}`").into()
 			}
+			E::InvalidStateLoopBinding => {
+				"state-loop headers require named immutable `let` or `let use` bindings".into()
+			}
+			E::UnknownStateReplacement { name } => {
+				format!("`{name}` is not a state binding of the target loop").into()
+			}
+			E::DuplicateStateReplacement { name } => {
+				format!("state binding `{name}` is replaced more than once").into()
+			}
+			E::StateReplacementOutsideStateLoop => {
+				"named `continue` replacements require a state loop target".into()
+			}
+			E::RetiredEnumWrapper => {
+				"enum embedding changes the static view and does not construct a wrapper".into()
+			}
+			E::RetiredEnumWrapperPattern => {
+				"embedded variants are matched through their qualified source enum".into()
+			}
+			E::PositionalStructField => "struct fields must be supplied by name (`field = value`)".into(),
+			E::InvalidStructSpread => "a struct clone/update requires exactly one leading source spread".into(),
+			E::DuplicateStructField { field } => format!("struct field `{field}` is supplied more than once").into(),
+			E::InaccessibleStructField { field } => format!("struct field `{field}` is not available in this context").into(),
+			E::StructFreshUnavailable => "this struct cannot be constructed fresh because it has hidden fields".into(),
+			E::MissingStructFields { fields } => format!("missing required struct field(s): {}", fields.join(", ")).into(),
+			E::StructPatternRestRequired => "a partial struct pattern must end with anonymous `...`".into(),
+			E::PositionalStructPattern => "struct pattern fields must be named".into(),
+			E::InvalidStructPatternRest => "anonymous `...` must occur once at the end of a struct pattern".into(),
 			E::TupleSpreadRequiresStaticTuple { ty } => {
 				format!("tuple spread requires a statically shaped tuple, found `{ty}`").into()
+			}
+			E::ManagedFieldWithoutClose { owner, field, .. } => format!(
+				"`{owner}` directly stores managed field `{field}` but does not implement `Close`"
+			)
+			.into(),
+			E::ManagedChildCapture { .. } => {
+				"spawned child may use this managed resource after its lexical cleanup".into()
 			}
 		}
 	}
 
 	fn severity(&self) -> Severity {
 		match self {
-			TypeError::UnreachableArm | TypeError::IntLiteralUnsafe { .. } => Severity::Warning,
+			TypeError::UnreachableArm
+			| TypeError::ManagedFieldWithoutClose { .. }
+			| TypeError::ManagedChildCapture { .. } => Severity::Warning,
 			_ => Severity::Error,
 		}
 	}
@@ -747,6 +793,23 @@ impl IntoDiagnostic for TypeError {
 			TypeError::DuplicateControlLabel { previous, .. } => {
 				vec![Label::new(*previous, "previous label is here")]
 			}
+			TypeError::ManagedFieldWithoutClose {
+				owner_span,
+				field_span,
+				..
+			} => vec![
+				Label::new(*owner_span, "containing type declared here"),
+				Label::new(*field_span, "managed field declared here"),
+			],
+			TypeError::ManagedChildCapture {
+				declaration,
+				close,
+				join,
+			} => vec![
+				Label::new(*declaration, "managed resource declared here"),
+				Label::new(*close, "resource closes at this lexical boundary"),
+				Label::new(*join, "child is joined at this boundary"),
+			],
 			_ => Vec::new(),
 		}
 	}
@@ -771,7 +834,7 @@ impl IntoDiagnostic for TypeError {
 				Some("`main` is called with no arguments — remove the parameters".into())
 			}
 			TypeError::MainNonVoidReturn => {
-				Some("`main` returns nothing — remove the return type".into())
+				Some("use one of the supported resolved root result shapes".into())
 			}
 			TypeError::CastRequiresInto { .. } => Some(
 				"declare or import an `Into` interface and implement it for the source type, or cast \
@@ -788,30 +851,8 @@ impl IntoDiagnostic for TypeError {
 				 short-circuit"
 					.into(),
 			),
-			TypeError::IntLiteralUnsafe { .. } => Some(
-				"Nymph's `int`/`uint` are JS doubles at runtime — integers beyond ±(2^53 - 1) can't \
-				 be represented exactly and will be rounded to the nearest representable value"
-					.into(),
-			),
-			TypeError::AssignFieldThroughImmutable { ty, .. } => Some(
-				format!("make the receiver a mutable view, e.g. `let mut` or a `mut {ty}` annotation")
-					.into(),
-			),
-			TypeError::MutMethodNeedsMutReceiver { .. } => Some(
-				"bind or annotate the receiver as `mut`, e.g. `let mut` or a `mut` type annotation".into(),
-			),
-			TypeError::MethodMutMismatch {
-				name, expected_mut, ..
-			} => Some(if *expected_mut {
-				format!("declare `{name}` as `mut func` here to match the interface").into()
-			} else {
-				format!("declare `{name}` as `func` here to match the interface").into()
-			}),
-			TypeError::MixedMutabilityForBound { .. } => Some(
-				"pass `mut` values at every use of this type parameter, or non-`mut` values at none".into(),
-			),
-			TypeError::BoundSatisfiedOnlyByMut { ty, .. } => {
-				Some(format!("pass a `mut {ty}` instead").into())
+			TypeError::IntLiteralOutOfRange { .. } => {
+				Some("use a `uint` literal suffix (`u`) for values up to `u64::MAX`".into())
 			}
 			_ => None,
 		}

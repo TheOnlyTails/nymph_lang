@@ -5,9 +5,9 @@ use ecow::EcoString;
 use nymph_ast::{
 	Ident, Spanned,
 	decl::{
-		Declaration, EnumVariant, FuncDeclaration, FuncKind, FuncParam, ImplMember, ImportRoot,
-		InterfaceElement, InterfaceMember, LetDeclaration, LetKind, StructField, StructImpl,
-		TypeAliasDeclaration, Visibility,
+		Declaration, EnumEmbedding, EnumVariant, FuncDeclaration, FuncKind, FuncParam, ImplMember,
+		ImportRoot, InterfaceElement, InterfaceMember, LetDeclaration, LetKind, StructField,
+		StructImpl, TypeAliasDeclaration, Visibility,
 	},
 	expr::{Expr, ExprKind},
 	token::Token,
@@ -52,18 +52,11 @@ impl Parser<'_> {
 		let visibility = self.parse_visibility();
 		match self.peek() {
 			Some(Token::External) => Some(self.parse_external(visibility)),
+			Some(Token::Effect) => Some(self.parse_effect(visibility)),
 			Some(Token::Let) => Some(self.parse_let_decl(visibility)),
-			Some(Token::Func) => Some(self.parse_func_decl(visibility, FuncKind::Instance)),
-			// `mut func` at module level has no receiver to mutate — diagnose, but
-			// still parse it so recovery stays clean.
-			Some(Token::Mut) => {
-				self.emit(
-					self.current_span(),
-					ParseError::FuncKindOutsideType {
-						kind: "mut func".into(),
-					},
-				);
-				Some(self.parse_func_decl(visibility, FuncKind::Mut))
+			Some(Token::Func) => Some(self.parse_func_decl(visibility, FuncKind::Instance, false)),
+			Some(Token::Async) if self.peek_nth(1) == Some(&Token::Func) => {
+				Some(self.parse_func_decl(visibility, FuncKind::Instance, true))
 			}
 			// `namespace` is overloaded: `namespace func …` / `namespace let …` are
 			// (misplaced at top level) namespaced members, while `namespace Name { … }`
@@ -76,7 +69,7 @@ impl Parser<'_> {
 							kind: "namespace func".into(),
 						},
 					);
-					Some(self.parse_func_decl(visibility, FuncKind::Namespace))
+					Some(self.parse_func_decl(visibility, FuncKind::Namespace, false))
 				}
 				Some(Token::Let) => {
 					self.emit(
@@ -111,6 +104,14 @@ impl Parser<'_> {
 				);
 				None
 			}
+		}
+	}
+
+	fn parse_effect(&mut self, visibility: Option<Visibility>) -> Declaration {
+		self.advance(); // `effect`
+		Declaration::Effect {
+			visibility,
+			name: self.expect_ident(),
 		}
 	}
 
@@ -172,24 +173,23 @@ impl Parser<'_> {
 		}
 	}
 
-	/// Parse `let [mut] pattern [: type] = expr`, shared by declarations and statements.
+	/// Parse `let [use] pattern [: type] = expr`, shared by declarations and statements.
 	pub(super) fn parse_let_binding(&mut self) -> (LetDeclaration, Expr) {
 		self.parse_let_binding_kinded(false)
 	}
 
-	/// Parse a `[namespace] let [mut] …` binding. When `namespaced`, the caller has
-	/// already consumed the `namespace` keyword; a `mut` is then rejected (a static
-	/// binding can never be mutable — `namespace let mut` is unrepresentable).
+	/// Parse a `[namespace] let …` binding.
 	fn parse_let_binding_kinded(&mut self, namespaced: bool) -> (LetDeclaration, Expr) {
 		self.advance(); // `let`
-		let mut_span = self.eat(&Token::Mut);
+		let managed =
+			!namespaced && matches!(self.peek(), Some(Token::Identifier(name)) if name == "use");
+		if managed {
+			self.advance();
+		}
 		let kind = if namespaced {
-			if let Some(span) = mut_span {
-				self.emit(span, ParseError::MutableNamespaceLet);
-			}
 			LetKind::Namespace
-		} else if mut_span.is_some() {
-			LetKind::Mut
+		} else if managed {
+			LetKind::Use
 		} else {
 			LetKind::Instance
 		};
@@ -206,6 +206,9 @@ impl Parser<'_> {
 
 	fn parse_let_decl(&mut self, visibility: Option<Visibility>) -> Declaration {
 		let (meta, value) = self.parse_let_binding();
+		if meta.is_managed() {
+			self.emit(meta.name.1, ParseError::ManagedLetOutsideLocal);
+		}
 		Declaration::Let {
 			visibility,
 			meta,
@@ -213,23 +216,26 @@ impl Parser<'_> {
 		}
 	}
 
-	/// If the cursor is at the start of a function member — `func`, `mut func`, or
-	/// `namespace func` — return its [`FuncKind`], else `None`.
+	/// If the cursor is at the start of a function member, return its destination
+	/// [`FuncKind`].
 	fn func_kind_here(&self) -> Option<FuncKind> {
 		match self.peek() {
 			Some(Token::Func) => Some(FuncKind::Instance),
-			Some(Token::Mut) if self.peek_nth(1) == Some(&Token::Func) => Some(FuncKind::Mut),
 			Some(Token::Namespace) if self.peek_nth(1) == Some(&Token::Func) => Some(FuncKind::Namespace),
+			Some(Token::Async) if self.peek_nth(1) == Some(&Token::Func) => Some(FuncKind::Instance),
 			_ => None,
 		}
 	}
 
 	/// Parse the signature `name<generics>(params) [: return_type]`.
-	fn parse_func_signature(&mut self, kind: FuncKind) -> FuncDeclaration {
+	fn parse_func_signature(&mut self, kind: FuncKind, is_async: bool) -> FuncDeclaration {
+		if is_async {
+			self.advance(); // `async`
+		}
 		match kind {
-			FuncKind::Namespace | FuncKind::Mut => {
+			FuncKind::Namespace => {
 				self.advance();
-			} // `namespace` or `mut`
+			}
 			FuncKind::Instance => {}
 		};
 		self.advance(); // `func`
@@ -237,24 +243,26 @@ impl Parser<'_> {
 		let generics = self.parse_generic_params();
 		self.expect(&Token::LParen);
 		let params = self.comma_separated(&Token::RParen, |p| p.parse_func_param());
-		let return_type = if self.eat(&Token::Colon).is_some() {
-			Some(self.parse_type())
+		let (return_type, effects) = if self.eat(&Token::Colon).is_some() {
+			let (return_type, effects) = self.parse_callable_return();
+			(Some(return_type), effects)
 		} else {
-			None
+			(None, None)
 		};
 		FuncDeclaration {
 			kind,
+			is_async,
 			name,
 			generics,
 			params,
 			return_type,
+			effects,
 		}
 	}
 
 	fn parse_func_param(&mut self) -> Spanned<FuncParam> {
 		let start = self.position();
 		let spread = self.eat(&Token::DotDotDot).is_some();
-		let mutable = self.eat(&Token::Mut).is_some();
 		let name = self.parse_binding_pattern();
 		self.expect(&Token::Colon);
 		let type_ = self.parse_type();
@@ -262,15 +270,19 @@ impl Parser<'_> {
 			FuncParam {
 				name,
 				type_,
-				mutable,
 				spread,
 			},
 			self.span_from(start),
 		)
 	}
 
-	fn parse_func_decl(&mut self, visibility: Option<Visibility>, kind: FuncKind) -> Declaration {
-		let meta = self.parse_func_signature(kind);
+	fn parse_func_decl(
+		&mut self,
+		visibility: Option<Visibility>,
+		kind: FuncKind,
+		is_async: bool,
+	) -> Declaration {
+		let meta = self.parse_func_signature(kind, is_async);
 		self.expect(&Token::Eq);
 		let body = self.parse_expr();
 		Declaration::Func {
@@ -292,17 +304,17 @@ impl Parser<'_> {
 
 		if let Some(kind) = self.func_kind_here() {
 			// `external func`, `external mut func`, `external namespace func`.
-			let meta = self.parse_func_signature(kind);
+			if self.check(&Token::Async) {
+				let span = self.advance().expect("checked async token").1;
+				self.emit(span, ParseError::AsyncExternalFunction);
+			}
+			let meta = self.parse_func_signature(kind, false);
 			let js_name = explicit_name.unwrap_or_else(|| meta.name.0.clone());
 			Declaration::ExternalFunc(visibility, js_name, meta)
 		} else {
 			// external let: `external(name) let x: T`
 			self.advance(); // `let`
-			let kind = if self.eat(&Token::Mut).is_some() {
-				LetKind::Mut
-			} else {
-				LetKind::Instance
-			};
+			let kind = LetKind::Instance;
 			let name = self.parse_binding_pattern();
 			let type_ = if self.eat(&Token::Colon).is_some() {
 				Some(self.parse_type())
@@ -359,9 +371,6 @@ impl Parser<'_> {
 	fn parse_struct_field(&mut self) -> Spanned<StructField> {
 		let start = self.position();
 		let visibility = self.parse_visibility();
-		if let Some(span) = self.eat(&Token::Mut) {
-			self.emit(span, ParseError::MutFieldModifier);
-		}
 		let name = self.expect_ident();
 		self.expect(&Token::Colon);
 		let type_ = self.parse_type();
@@ -387,24 +396,48 @@ impl Parser<'_> {
 		let generics = self.parse_generic_params();
 		self.expect(&Token::LBrace);
 
+		let mut embeddings = Vec::new();
 		let mut variants = Vec::new();
-		// Variants come first: a bare identifier that is not a member keyword.
-		while matches!(self.peek(), Some(Token::Identifier(_))) {
+		// Enum entries come first. `...Source` embeds a complete view;
+		// `Source.Variant` embeds one source-owned variant.
+		while self.check(&Token::DotDotDot) || matches!(self.peek(), Some(Token::Identifier(_))) {
 			let start = self.position();
-			let variant_name = self.expect_ident();
-			let fields = if self.check(&Token::LParen) {
-				self.advance();
-				self.comma_separated(&Token::RParen, |p| p.parse_struct_field())
+			if self.eat(&Token::DotDotDot).is_some() {
+				let source = self.expect_ident();
+				embeddings.push(Spanned(
+					EnumEmbedding {
+						source,
+						variant: None,
+					},
+					self.span_from(start),
+				));
 			} else {
-				Vec::new()
-			};
-			variants.push(Spanned(
-				EnumVariant {
-					name: variant_name,
-					fields,
-				},
-				self.span_from(start),
-			));
+				let variant_name = self.expect_ident();
+				if self.eat(&Token::Dot).is_some() {
+					let variant = self.expect_ident();
+					embeddings.push(Spanned(
+						EnumEmbedding {
+							source: variant_name,
+							variant: Some(variant),
+						},
+						self.span_from(start),
+					));
+				} else {
+					let fields = if self.check(&Token::LParen) {
+						self.advance();
+						self.comma_separated(&Token::RParen, |p| p.parse_struct_field())
+					} else {
+						Vec::new()
+					};
+					variants.push(Spanned(
+						EnumVariant {
+							name: variant_name,
+							fields,
+						},
+						self.span_from(start),
+					));
+				}
+			}
 			if self.eat(&Token::Comma).is_none() {
 				break;
 			}
@@ -417,6 +450,7 @@ impl Parser<'_> {
 			visibility,
 			name,
 			generics,
+			embeddings,
 			variants,
 			members,
 			impls,
@@ -482,7 +516,8 @@ impl Parser<'_> {
 				_ => unreachable!(),
 			}
 		} else if let Some(kind) = self.func_kind_here() {
-			let meta = self.parse_func_signature(kind);
+			let is_async = self.check(&Token::Async);
+			let meta = self.parse_func_signature(kind, is_async);
 			self.expect(&Token::Eq);
 			let body = self.parse_expr();
 			ImplMember::Func {
@@ -492,6 +527,9 @@ impl Parser<'_> {
 			}
 		} else if self.check(&Token::Let) {
 			let (meta, value) = self.parse_let_binding();
+			if meta.is_managed() {
+				self.emit(meta.name.1, ParseError::ManagedLetOutsideLocal);
+			}
 			ImplMember::Let {
 				visibility,
 				meta,
@@ -568,7 +606,8 @@ impl Parser<'_> {
 	fn parse_interface_member(&mut self) -> Option<Spanned<InterfaceMember>> {
 		let start = self.position();
 		if let Some(kind) = self.func_kind_here() {
-			let meta = self.parse_func_signature(kind);
+			let is_async = self.check(&Token::Async);
+			let meta = self.parse_func_signature(kind, is_async);
 			let body = if self.eat(&Token::Eq).is_some() {
 				Some(self.parse_expr())
 			} else {
@@ -583,12 +622,19 @@ impl Parser<'_> {
 			))
 		} else if self.check(&Token::Let) {
 			self.advance(); // `let`
-			let kind = if self.eat(&Token::Mut).is_some() {
-				LetKind::Mut
+			let managed = matches!(self.peek(), Some(Token::Identifier(name)) if name == "use");
+			if managed {
+				self.advance();
+			}
+			let kind = if managed {
+				LetKind::Use
 			} else {
 				LetKind::Instance
 			};
 			let name = self.parse_binding_pattern();
+			if managed {
+				self.emit(name.1, ParseError::ManagedLetOutsideLocal);
+			}
 			let type_ = if self.eat(&Token::Colon).is_some() {
 				Some(self.parse_type())
 			} else {
@@ -649,7 +695,6 @@ impl Parser<'_> {
 			match &m.0 {
 				ImplMember::Func { meta, .. } => {
 					let kind = match meta.kind {
-						FuncKind::Mut => "mut func",
 						FuncKind::Namespace => "namespace func",
 						FuncKind::Instance => continue,
 					};
@@ -679,7 +724,6 @@ impl Parser<'_> {
 	fn parse_impl(&mut self, visibility: Option<Visibility>) -> Declaration {
 		self.advance(); // `impl`
 		let generics = self.parse_generic_params();
-		let mutable = self.eat(&Token::Mut).is_some();
 		let first = self.parse_type();
 
 		if self.eat(&Token::For).is_some() {
@@ -692,7 +736,6 @@ impl Parser<'_> {
 			Declaration::ImplFor {
 				visibility,
 				generics,
-				mutable,
 				type_,
 				for_interface,
 				members,
@@ -704,7 +747,6 @@ impl Parser<'_> {
 			Declaration::Impl {
 				visibility,
 				generics,
-				mutable,
 				type_: first,
 				members,
 			}

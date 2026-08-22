@@ -221,9 +221,16 @@ fn semantic_tokens_for_source_cancellable(
 
 	let mut items: Vec<(Span, u32, u32)> = Vec::new();
 
-	for spanned in &lexed.tokens {
+	for (index, spanned) in lexed.tokens.iter().enumerate() {
 		cancellation.checkpoint()?;
-		push_token(spanned, roles, &mut items, cancellation)?;
+		if matches!(&spanned.0, Token::Identifier(name) if name == "use")
+			&& index > 0
+			&& matches!(lexed.tokens[index - 1].0, Token::Let)
+		{
+			items.push((spanned.1, KEYWORD, 0));
+		} else {
+			push_token(spanned, roles, &mut items, cancellation)?;
+		}
 	}
 
 	for span in comment_spans(text, &lexed.tokens, cancellation)? {
@@ -349,18 +356,18 @@ fn push_str_token(
 fn lexer_token_type(token: &Token) -> Option<u32> {
 	use Token::*;
 	Some(match token {
-		Public | Internal | Private | Import | With | Type | Struct | Enum | Let | Mut | External
-		| Func | Interface | Impl | Namespace | For | While | If | Else | Match | Continue | Break
-		| Return | This | In | As | Is | Async | Await | True | False => KEYWORD,
-
+		Public | Internal | Private | Import | With | Type | Struct | Enum | Effect | Let
+		| External | Func | Interface | Impl | Namespace | For | Loop | If | Else | Match
+		| Continue | Break | Return | Echo | This | In | As | Is | Async | Await | True | False => {
+			KEYWORD
+		}
 		IntType | UIntType | FloatType | BooleanType | CharType | StringType | VoidType | NeverType
 		| SelfType => TYPE,
 
 		Arrow | DotDotDot | Question | DoubleQuestion | QuestionDot | Dot | PipeArrow | Bang | Plus
 		| Minus | Star | Slash | Percent | StarStar | Amp | Pipe | Caret | Tilde | EqEq | BangEq
-		| Lt | Gt | LtEq | GtEq | BangIn | BangIs | AmpAmp | PipePipe | Eq | PlusEq | MinusEq
-		| StarEq | SlashEq | PercentEq | StarStarEq | AmpAmpEq | PipePipeEq | AmpEq | PipeEq
-		| CaretEq | TildeEq | LtLtEq | GtGtEq | DotDot | DotDotEq | ColonColon => OPERATOR,
+		| Lt | Gt | LtEq | GtEq | BangIn | BangIs | AmpAmp | PipePipe | Eq | DotDot | DotDotEq
+		| ColonColon => OPERATOR,
 
 		Int(_) | UInt(_) | Float(_) => NUMBER,
 		Str(_) | Char(_) => STRING,
@@ -621,6 +628,9 @@ fn walk_import_decl(decl: &Declaration, analysis: &SemanticAnalysis, map: &mut R
 fn walk_decl(decl: &Declaration, map: &mut RoleMap) {
 	match decl {
 		Declaration::Import { .. } => {}
+		Declaration::Effect { name, .. } => {
+			map.insert(name.1.start, (TYPE, DECLARATION));
+		}
 		Declaration::Let { meta, value, .. } => {
 			bind_let(meta, map);
 			walk_type_opt(&meta.type_, map);
@@ -665,6 +675,7 @@ fn walk_decl(decl: &Declaration, map: &mut RoleMap) {
 		Declaration::Enum {
 			name,
 			generics,
+			embeddings,
 			variants,
 			members,
 			impls,
@@ -672,6 +683,12 @@ fn walk_decl(decl: &Declaration, map: &mut RoleMap) {
 		} => {
 			map.insert(name.1.start, (TYPE, DECLARATION));
 			walk_generics(generics, map);
+			for embedding in embeddings {
+				map.insert(embedding.0.source.1.start, (TYPE, 0));
+				if let Some(variant) = &embedding.0.variant {
+					map.insert(variant.1.start, (ENUM_MEMBER, 0));
+				}
+			}
 			for v in variants {
 				walk_enum_variant(v, map);
 			}
@@ -740,13 +757,12 @@ fn walk_decl(decl: &Declaration, map: &mut RoleMap) {
 
 fn bind_let(meta: &LetDeclaration, map: &mut RoleMap) {
 	if let Some(name) = meta.name.0.as_binding() {
-		let mods = if meta.is_mutable() {
-			DECLARATION
-		} else {
-			DECLARATION | READONLY
-		};
-		map.insert(name.1.start, (VARIABLE, mods));
+		map.insert(name.1.start, let_binding_role());
 	}
+}
+
+fn let_binding_role() -> (u32, u32) {
+	(VARIABLE, DECLARATION | READONLY)
 }
 
 fn bind_func(meta: &FuncDeclaration, kind: u32, map: &mut RoleMap) {
@@ -759,6 +775,9 @@ fn bind_func(meta: &FuncDeclaration, kind: u32, map: &mut RoleMap) {
 		walk_type(&p.0.type_, map);
 	}
 	walk_type_opt(&meta.return_type, map);
+	if let Some(effects) = &meta.effects {
+		walk_effect_row(effects, map);
+	}
 }
 
 fn walk_struct_field(f: &Spanned<StructField>, map: &mut RoleMap) {
@@ -874,7 +893,18 @@ fn walk_generics(generics: &[Spanned<GenericParam>], map: &mut RoleMap) {
 }
 
 fn walk_generic_arg(arg: &Spanned<GenericArg>, map: &mut RoleMap) {
-	walk_type(&arg.0.value, map);
+	match &arg.0.value {
+		nymph_ast::ty::GenericArgValue::Type(ty) => walk_type(ty, map),
+		nymph_ast::ty::GenericArgValue::Effect(effects) => walk_effect_row(effects, map),
+	}
+}
+
+fn walk_effect_row(row: &Spanned<nymph_ast::ty::EffectRow>, map: &mut RoleMap) {
+	for effect in &row.0.effects {
+		if let nymph_ast::ty::Effect::Named(name) = &effect.0 {
+			map.insert(name.1.start, (TYPE, 0));
+		}
+	}
 }
 
 fn walk_type_opt(opt: &Option<Spanned<Type>>, map: &mut RoleMap) {
@@ -912,11 +942,15 @@ fn walk_type(ty: &Spanned<Type>, map: &mut RoleMap) {
 		Type::Function {
 			params,
 			return_type,
+			effects,
 		} => {
 			for (_, t) in params {
 				walk_type(t, map);
 			}
 			walk_type(return_type, map);
+			if let Some(effects) = effects {
+				walk_effect_row(effects, map);
+			}
 		}
 		Type::Reference { name, generics } => {
 			map.insert(name.1.start, (TYPE, 0));
@@ -924,7 +958,7 @@ fn walk_type(ty: &Spanned<Type>, map: &mut RoleMap) {
 				walk_generic_arg(g, map);
 			}
 		}
-		Type::Grouped(a) | Type::Mut(a) => walk_type(a, map),
+		Type::Grouped(a) => walk_type(a, map),
 	}
 }
 
@@ -937,8 +971,7 @@ fn walk_expr(expr: &Expr, map: &mut RoleMap) {
 		| ExprKind::Boolean(_)
 		| ExprKind::Identifier(_)
 		| ExprKind::AnonymousParam(_)
-		| ExprKind::This
-		| ExprKind::Continue { .. } => {}
+		| ExprKind::This => {}
 		ExprKind::String(parts) => {
 			for part in parts {
 				if let StringPart::InterpolatedExpr(e) = &part.0 {
@@ -946,6 +979,8 @@ fn walk_expr(expr: &Expr, map: &mut RoleMap) {
 				}
 			}
 		}
+		ExprKind::AsyncBlock { body, .. } => walk_expr(body, map),
+		ExprKind::Await { value, .. } => walk_expr(value, map),
 		ExprKind::List(items) | ExprKind::Tuple(items) => {
 			for item in items {
 				match &item.0 {
@@ -981,7 +1016,7 @@ fn walk_expr(expr: &Expr, map: &mut RoleMap) {
 				walk_generic_arg(g, map);
 			}
 			for a in args {
-				walk_expr(&a.0.value, map);
+				walk_expr(a.0.value(), map);
 			}
 		}
 		ExprKind::MemberAccess { parent, .. } => walk_expr(parent, map),
@@ -1007,6 +1042,7 @@ fn walk_expr(expr: &Expr, map: &mut RoleMap) {
 			walk_expr(body, map);
 		}
 		ExprKind::PrefixOp { value, .. } | ExprKind::PostfixOp { value, .. } => walk_expr(value, map),
+		ExprKind::Echo { operand, .. } => walk_expr(operand, map),
 		ExprKind::BinaryOp { lhs, rhs, .. } => {
 			walk_expr(lhs, map);
 			walk_expr(rhs, map);
@@ -1016,23 +1052,26 @@ fn walk_expr(expr: &Expr, map: &mut RoleMap) {
 			walk_type(rhs, map);
 		}
 		ExprKind::PatternOp { lhs, .. } => walk_expr(lhs, map),
-		ExprKind::AssignOp { lhs, rhs, .. } => {
-			walk_expr(lhs, map);
-			walk_expr(rhs, map);
-		}
 		ExprKind::Return { value, .. } | ExprKind::Break { value, .. } => {
 			if let Some(v) = value {
 				walk_expr(v, map);
 			}
 		}
-		ExprKind::While {
-			condition, body, ..
-		} => {
-			walk_expr(condition, map);
-			walk_expr(body, map);
+		ExprKind::Continue { replacements, .. } => {
+			for replacement in replacements {
+				walk_expr(&replacement.value, map);
+			}
 		}
 		ExprKind::For { iterable, body, .. } => {
 			walk_expr(iterable, map);
+			walk_expr(body, map);
+		}
+		ExprKind::StateLoop { bindings, body, .. } => {
+			for binding in bindings {
+				bind_let(&binding.meta, map);
+				walk_type_opt(&binding.meta.type_, map);
+				walk_expr(&binding.value, map);
+			}
 			walk_expr(body, map);
 		}
 		ExprKind::If {
@@ -1188,7 +1227,9 @@ fn is_unshadowed_namespace(analysis: &SemanticAnalysis, name: &Ident) -> bool {
 fn definition_kind_role(kind: DefKind) -> (u32, u32) {
 	match kind {
 		DefKind::Func => (FUNCTION, 0),
-		DefKind::Struct | DefKind::Enum | DefKind::TypeAlias | DefKind::Interface => (TYPE, 0),
+		DefKind::Struct | DefKind::Enum | DefKind::TypeAlias | DefKind::Interface | DefKind::Effect => {
+			(TYPE, 0)
+		}
 		DefKind::Namespace => (NAMESPACE, 0),
 		DefKind::Variant { .. } => (ENUM_MEMBER, 0),
 		DefKind::Let => (VARIABLE, READONLY),
@@ -1245,13 +1286,19 @@ fn walk_decl_uses(
 	out: &mut Vec<(usize, (u32, u32))>,
 ) {
 	match decl {
-		Declaration::Import { .. }
-		| Declaration::ExternalLet(..)
-		| Declaration::ExternalFunc(..)
-		| Declaration::TypeAlias { .. } => {}
-		Declaration::Let { value, .. } | Declaration::Func { body: value, .. } => {
+		Declaration::Import { .. } | Declaration::Effect { .. } | Declaration::TypeAlias { .. } => {}
+		Declaration::Let { meta, value, .. } => {
+			walk_pattern_bindings(&meta.name, analysis, let_binding_role(), out);
 			walk_expr_uses(value, analysis, variant_names, decls, out);
 		}
+		Declaration::ExternalLet(_, _, meta) => {
+			walk_pattern_bindings(&meta.name, analysis, let_binding_role(), out)
+		}
+		Declaration::Func { meta, body, .. } => {
+			walk_func_param_bindings(meta, analysis, out);
+			walk_expr_uses(body, analysis, variant_names, decls, out);
+		}
+		Declaration::ExternalFunc(_, _, meta) => walk_func_param_bindings(meta, analysis, out),
 		Declaration::Struct {
 			fields,
 			members,
@@ -1308,9 +1355,17 @@ fn walk_impl_member_uses(
 	out: &mut Vec<(usize, (u32, u32))>,
 ) {
 	match member {
-		ImplMember::ExternalLet(..) | ImplMember::ExternalFunc(..) => {}
-		ImplMember::Let { value, .. } | ImplMember::Func { body: value, .. } => {
+		ImplMember::ExternalLet(_, _, meta) => {
+			walk_pattern_bindings(&meta.name, analysis, let_binding_role(), out)
+		}
+		ImplMember::ExternalFunc(_, _, meta) => walk_func_param_bindings(meta, analysis, out),
+		ImplMember::Let { meta, value, .. } => {
+			walk_pattern_bindings(&meta.name, analysis, let_binding_role(), out);
 			walk_expr_uses(value, analysis, variant_names, decls, out);
+		}
+		ImplMember::Func { meta, body, .. } => {
+			walk_func_param_bindings(meta, analysis, out);
+			walk_expr_uses(body, analysis, variant_names, decls, out);
 		}
 	}
 }
@@ -1324,12 +1379,14 @@ fn walk_interface_member_uses(
 ) {
 	match member {
 		InterfaceMember::Element(elem) => match &elem.0 {
-			InterfaceElement::Let { value, .. } => {
+			InterfaceElement::Let { meta, value } => {
+				walk_pattern_bindings(&meta.name, analysis, let_binding_role(), out);
 				if let Some(v) = value {
 					walk_expr_uses(v, analysis, variant_names, decls, out);
 				}
 			}
-			InterfaceElement::Func { body, .. } => {
+			InterfaceElement::Func { meta, body } => {
+				walk_func_param_bindings(meta, analysis, out);
 				if let Some(b) = body {
 					walk_expr_uses(b, analysis, variant_names, decls, out);
 				}
@@ -1340,6 +1397,16 @@ fn walk_interface_member_uses(
 				walk_impl_member_uses(&m.0, analysis, variant_names, decls, out);
 			}
 		}
+	}
+}
+
+fn walk_func_param_bindings(
+	meta: &FuncDeclaration,
+	analysis: &SemanticAnalysis,
+	out: &mut Vec<(usize, (u32, u32))>,
+) {
+	for parameter in &meta.params {
+		walk_pattern_bindings(&parameter.0.name, analysis, (PARAMETER, DECLARATION), out);
 	}
 }
 
@@ -1358,8 +1425,7 @@ fn walk_expr_uses(
 		| ExprKind::Char(_)
 		| ExprKind::Boolean(_)
 		| ExprKind::AnonymousParam(_)
-		| ExprKind::This
-		| ExprKind::Continue { .. } => {}
+		| ExprKind::This => {}
 		ExprKind::Identifier(name) => {
 			if let Some(role) = identifier_role(analysis, decls, variant_names, expr, name) {
 				out.push((expr.span.start, role));
@@ -1372,6 +1438,8 @@ fn walk_expr_uses(
 				}
 			}
 		}
+		ExprKind::AsyncBlock { body, .. } => walk_expr_uses(body, analysis, variant_names, decls, out),
+		ExprKind::Await { value, .. } => walk_expr_uses(value, analysis, variant_names, decls, out),
 		ExprKind::List(items) | ExprKind::Tuple(items) => {
 			for item in items {
 				match &item.0 {
@@ -1464,10 +1532,10 @@ fn walk_expr_uses(
 				));
 			}
 			for a in args {
-				if let Some(label) = &a.0.name {
+				if let Some(label) = a.0.name() {
 					out.push((label.1.start, (PROPERTY, 0)));
 				}
-				walk_expr_uses(&a.0.value, analysis, variant_names, decls, out);
+				walk_expr_uses(a.0.value(), analysis, variant_names, decls, out);
 			}
 		}
 		ExprKind::MemberAccess { parent, member, .. } => {
@@ -1506,13 +1574,19 @@ fn walk_expr_uses(
 			walk_expr_uses(parent, analysis, variant_names, decls, out);
 			walk_expr_uses(index, analysis, variant_names, decls, out);
 		}
-		ExprKind::Closure { body, .. } => {
+		ExprKind::Closure { params, body, .. } => {
+			for parameter in params {
+				walk_pattern_bindings(&parameter.0.name, analysis, (PARAMETER, DECLARATION), out);
+			}
 			walk_expr_uses(body, analysis, variant_names, decls, out);
 		}
 		ExprKind::PrefixOp { value, .. } | ExprKind::PostfixOp { value, .. } => {
 			walk_expr_uses(value, analysis, variant_names, decls, out);
 		}
-		ExprKind::BinaryOp { lhs, rhs, .. } | ExprKind::AssignOp { lhs, rhs, .. } => {
+		ExprKind::Echo { operand, .. } => {
+			walk_expr_uses(operand, analysis, variant_names, decls, out);
+		}
+		ExprKind::BinaryOp { lhs, rhs, .. } => {
 			walk_expr_uses(lhs, analysis, variant_names, decls, out);
 			walk_expr_uses(rhs, analysis, variant_names, decls, out);
 		}
@@ -1521,6 +1595,7 @@ fn walk_expr_uses(
 		}
 		ExprKind::PatternOp { lhs, rhs, .. } => {
 			walk_expr_uses(lhs, analysis, variant_names, decls, out);
+			walk_pattern_bindings(rhs, analysis, (VARIABLE, DECLARATION | READONLY), out);
 			walk_pattern_uses(rhs, analysis, variant_names, out);
 		}
 		ExprKind::Return { value, .. } | ExprKind::Break { value, .. } => {
@@ -1528,11 +1603,11 @@ fn walk_expr_uses(
 				walk_expr_uses(v, analysis, variant_names, decls, out);
 			}
 		}
-		ExprKind::While {
-			condition, body, ..
-		} => {
-			walk_expr_uses(condition, analysis, variant_names, decls, out);
-			walk_expr_uses(body, analysis, variant_names, decls, out);
+		ExprKind::Continue { replacements, .. } => {
+			for replacement in replacements {
+				out.push((replacement.name.1.start, (VARIABLE, 0)));
+				walk_expr_uses(&replacement.value, analysis, variant_names, decls, out);
+			}
 		}
 		ExprKind::For {
 			variable,
@@ -1541,7 +1616,20 @@ fn walk_expr_uses(
 			..
 		} => {
 			walk_expr_uses(iterable, analysis, variant_names, decls, out);
+			walk_pattern_bindings(variable, analysis, (VARIABLE, DECLARATION | READONLY), out);
 			walk_pattern_uses(variable, analysis, variant_names, out);
+			walk_expr_uses(body, analysis, variant_names, decls, out);
+		}
+		ExprKind::StateLoop { bindings, body, .. } => {
+			for binding in bindings {
+				walk_pattern_bindings(
+					&binding.meta.name,
+					analysis,
+					(VARIABLE, DECLARATION | READONLY),
+					out,
+				);
+				walk_expr_uses(&binding.value, analysis, variant_names, decls, out);
+			}
 			walk_expr_uses(body, analysis, variant_names, decls, out);
 		}
 		ExprKind::If {
@@ -1558,6 +1646,12 @@ fn walk_expr_uses(
 		ExprKind::Match { value, arms } => {
 			walk_expr_uses(value, analysis, variant_names, decls, out);
 			for arm in arms {
+				walk_pattern_bindings(
+					&arm.pattern,
+					analysis,
+					(VARIABLE, DECLARATION | READONLY),
+					out,
+				);
 				walk_pattern_uses(&arm.pattern, analysis, variant_names, out);
 				if let Some(g) = &arm.guard {
 					walk_expr_uses(g, analysis, variant_names, decls, out);
@@ -1569,7 +1663,8 @@ fn walk_expr_uses(
 			for stmt in body {
 				match &stmt.0 {
 					Statement::Expr(e) => walk_expr_uses(e, analysis, variant_names, decls, out),
-					Statement::Let { value, .. } => {
+					Statement::Let { meta, value } => {
+						walk_pattern_bindings(&meta.name, analysis, let_binding_role(), out);
 						walk_expr_uses(value, analysis, variant_names, decls, out);
 					}
 				}
@@ -1602,6 +1697,72 @@ fn push_qualified_parent(expr: &Expr, out: &mut Vec<(usize, (u32, u32))>) {
 		&& matches!(parent.kind, ExprKind::Identifier(_))
 	{
 		out.push((parent.span.start, (TYPE, 0)));
+	}
+}
+
+/// Record each name introduced by a pattern. Semantic resolution keeps bare
+/// enum variants from being reported as locals.
+fn walk_pattern_bindings(
+	pattern: &Spanned<Pattern>,
+	analysis: &SemanticAnalysis,
+	role: (u32, u32),
+	out: &mut Vec<(usize, (u32, u32))>,
+) {
+	match &pattern.0 {
+		Pattern::Binding { name, inner } => {
+			if analysis.annotations.pattern_variant_of(pattern.1).is_none() {
+				out.push((name.1.start, role));
+			}
+			walk_pattern_bindings(inner, analysis, role, out);
+		}
+		Pattern::List(items) | Pattern::Tuple(items) => {
+			for item in items {
+				match &item.0 {
+					ListPatternEntry::Item(pattern) => {
+						walk_pattern_bindings(pattern, analysis, role, out);
+					}
+					ListPatternEntry::Rest(Some(name)) => out.push((name.1.start, role)),
+					ListPatternEntry::Rest(None) => {}
+				}
+			}
+		}
+		Pattern::Map(entries) => {
+			for entry in entries {
+				match &entry.0 {
+					MapPatternEntry::Entry(key, value) => {
+						walk_pattern_bindings(key, analysis, role, out);
+						walk_pattern_bindings(value, analysis, role, out);
+					}
+					MapPatternEntry::Rest(Some(name)) => out.push((name.1.start, role)),
+					MapPatternEntry::Rest(None) => {}
+				}
+			}
+		}
+		Pattern::Struct { fields, .. } => {
+			for field in fields {
+				match &field.0 {
+					StructPatternField::Value { value, .. } | StructPatternField::Positional(value) => {
+						walk_pattern_bindings(value, analysis, role, out);
+					}
+					// Shorthand fields keep their property role; rename tracks their
+					// simultaneous local-binding identity separately.
+					StructPatternField::Named(_) | StructPatternField::Rest => {}
+				}
+			}
+		}
+		Pattern::Union(left, right) => {
+			walk_pattern_bindings(left, analysis, role, out);
+			walk_pattern_bindings(right, analysis, role, out);
+		}
+		Pattern::Grouped(inner) => walk_pattern_bindings(inner, analysis, role, out),
+		Pattern::Int(_)
+		| Pattern::UInt(_)
+		| Pattern::Float(_)
+		| Pattern::Char(_)
+		| Pattern::String(_)
+		| Pattern::Boolean(_)
+		| Pattern::Range(_)
+		| Pattern::Placeholder => {}
 	}
 }
 
@@ -1883,6 +2044,19 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 	}
 
 	#[test]
+	fn classifies_use_only_in_a_managed_let_and_marks_its_binding_readonly() {
+		let text = "func use(value: int): void = {}\nfunc main(): void = {\n  let use resource = acquire()\n  use(resource)\n}";
+		let decoded = tokens_for(text);
+
+		assert_eq!(find(&decoded, 2, 6).type_name, "keyword");
+		let resource = find(&decoded, 2, 10);
+		assert_eq!(resource.type_name, "variable");
+		assert!(resource.modifiers.contains(&"declaration"));
+		assert!(resource.modifiers.contains(&"readonly"));
+		assert_eq!(find(&decoded, 3, 2).type_name, "function");
+	}
+
+	#[test]
 	fn an_interpolated_identifier_is_classified_as_a_variable_not_swallowed_into_the_string() {
 		let text = "func main(): void = {\n  let name = \"x\"\n  print(\"Hello, ${name}!\")\n}";
 		let decoded = tokens_for(text);
@@ -1964,22 +2138,14 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 	}
 
 	#[test]
-	fn a_let_binding_is_variable_with_readonly_unless_mut() {
-		let text = "func main(): int = { let x = 1\n  let mut y = 2\n  x + y }";
+	fn a_let_binding_is_a_readonly_variable_declaration() {
+		let text = "func main(): int = { let x = 1\n  x }";
 		let decoded = tokens_for(text);
 
 		let x = find(&decoded, 0, 25);
 		assert_eq!(x.type_name, "variable");
 		assert!(x.modifiers.contains(&"declaration"));
 		assert!(x.modifiers.contains(&"readonly"));
-
-		let y = find(&decoded, 1, 10);
-		assert_eq!(y.type_name, "variable");
-		assert!(y.modifiers.contains(&"declaration"));
-		assert!(
-			!y.modifiers.contains(&"readonly"),
-			"a `let mut` binding must not carry `readonly`"
-		);
 	}
 
 	#[test]
@@ -2153,6 +2319,23 @@ func f(p: Point): int = match (p) { _ -> 1 } // c
 		// The call target `f` itself still resolves to `function`.
 		let callee = find(&decoded, 1, 19);
 		assert_eq!(callee.type_name, "function");
+	}
+
+	#[test]
+	fn named_struct_construction_and_patterns_classify_fields_and_spread_payloads() {
+		let text = "struct Point(x: int, y: int)\n\
+			func merge(base: Point, n: int): Point = Point(x = n, ...base)\n\
+			func read(point: Point): int = match (point) { Point(x, y = value, ...) -> x + value }";
+		let decoded = tokens_for(text);
+		assert_sorted_and_non_overlapping(&decoded);
+
+		assert_eq!(find(&decoded, 1, 47).type_name, "property"); // construction x
+		assert_eq!(find(&decoded, 1, 51).type_name, "parameter"); // n payload
+		assert_eq!(find(&decoded, 1, 54).type_name, "operator"); // ...
+		assert_eq!(find(&decoded, 1, 57).type_name, "parameter"); // spread payload
+		assert_eq!(find(&decoded, 2, 53).type_name, "property"); // shorthand x
+		assert_eq!(find(&decoded, 2, 56).type_name, "property"); // explicit y
+		assert_eq!(find(&decoded, 2, 67).type_name, "operator"); // rest, not a field
 	}
 
 	/// The `(line, col)` of byte `offset` in `text` — ASCII-only test inputs,

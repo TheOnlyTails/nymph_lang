@@ -1,0 +1,6 @@
+enum Source { Value(value: int) }
+enum Destination { ...Source }
+
+func example(value: Destination): int = match (value) {
+	Destination.Source.Value(inner) -> inner
+}

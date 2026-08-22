@@ -294,6 +294,112 @@ mod swc {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::process::Command;
+
+	#[test]
+	fn compiler_host_graph_bundles_and_runs_the_structured_task_kernel() {
+		let mut sources = crate::host_runtime::HostRuntimeGraph::compiler_facts().module_sources(
+			"Option",
+			"@nymph/runtime/std/option",
+			false,
+		);
+		sources.insert(
+			"task-test".to_string(),
+			r#"import { nymphCallable, nymphReturn, nymphRunTask, nymphTaskRecipe } from "std/box";
+const task = nymphTaskRecipe(nymphCallable(() => nymphReturn(42)), true);
+console.log(await nymphRunTask(task));
+"#
+			.to_string(),
+		);
+		let bundled = bundle("task-test", sources).expect("bundle task runtime");
+		let path = std::env::temp_dir().join(format!(
+			"nymph_task_host_runtime_{}.mjs",
+			std::process::id()
+		));
+		std::fs::write(&path, &bundled).expect("write task runtime test module");
+		let output = Command::new("node")
+			.arg(&path)
+			.output()
+			.expect("run task runtime under Node");
+		let _ = std::fs::remove_file(path);
+		assert!(
+			output.status.success(),
+			"node failed:\n{}\n--- js ---\n{bundled}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+		assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
+	}
+
+	#[test]
+	fn node_adapter_boundary_preserves_modes_bigints_opaque_aliases_and_defects() {
+		let mut sources = crate::host_runtime::HostRuntimeGraph::compiler_facts().module_sources(
+			"Option",
+			"@nymph/runtime/std/option",
+			false,
+		);
+		sources.insert(
+			"std/test-adapters".to_string(),
+			r#"const resource = { closed: false };
+export function open() { return resource; }
+export function ordinary(value) {
+  if (arguments.length !== 1) throw new TypeError("ordinary adapter received hidden state");
+  return value;
+}
+export function cancellable(value, signal) {
+  if (arguments.length !== 2 || !(signal instanceof AbortSignal)) throw new TypeError("missing execution AbortSignal");
+  return value;
+}
+export function close(value) {
+  if (arguments.length !== 1) throw new TypeError("cleanup adapter received hidden state");
+  value.closed = true;
+}
+export function defect() { throw new TypeError("bad trusted ABI"); }
+"#
+			.to_string(),
+		);
+		sources.insert(
+			"adapter-test".to_string(),
+			r#"import { nymphBoxOpaque, nymphCallable, nymphCurrentExecutionSignal, nymphReturn, nymphRunTask, nymphTaskRecipe, nymphUnboxOpaque } from "std/box";
+import { cancellable, close, defect, open, ordinary } from "std/test-adapters";
+const file = nymphBoxOpaque(117n, open());
+const alias = file;
+const exact = ordinary(9007199254740993n);
+const direct = (() => { try { defect(); return "repaired"; } catch (error) { return `${error.name}:${error.message}`; } })();
+const step = nymphCallable(() => {
+  const host = nymphUnboxOpaque(117n, alias);
+  const value = cancellable(host, nymphCurrentExecutionSignal());
+  close(value);
+  close(nymphUnboxOpaque(117n, file));
+  return nymphReturn(value.closed);
+});
+const spawned = await nymphRunTask(nymphTaskRecipe(step, false));
+const defectStep = nymphCallable(() => defect());
+const taskDefect = await (async () => { try { await nymphRunTask(nymphTaskRecipe(defectStep, false)); return "repaired"; } catch (error) { return `${error.name}:${error.message}`; } })();
+console.log([typeof exact, exact, nymphUnboxOpaque(117n, file) === nymphUnboxOpaque(117n, alias), spawned, direct, taskDefect].join("|"));
+"#
+			.to_string(),
+		);
+		let bundled = bundle("adapter-test", sources).expect("bundle adapter runtime");
+		let path = std::env::temp_dir().join(format!(
+			"nymph_adapter_host_runtime_{}.mjs",
+			std::process::id()
+		));
+		std::fs::write(&path, &bundled).expect("write adapter runtime test module");
+		let output = Command::new("node")
+			.arg(&path)
+			.output()
+			.expect("run adapter runtime under Node");
+		let _ = std::fs::remove_file(path);
+		assert!(
+			output.status.success(),
+			"node failed:\n{}\n--- js ---\n{bundled}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+		assert_eq!(
+			String::from_utf8_lossy(&output.stdout).trim(),
+			"bigint|9007199254740993|true|true|TypeError:bad trusted ABI|TypeError:bad trusted ABI"
+		);
+	}
 
 	#[test]
 	fn self_contained_entry_is_returned_without_rebundling() {

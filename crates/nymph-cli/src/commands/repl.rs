@@ -291,7 +291,7 @@ mod tests {
 			),
 			(
 				"entry".to_string(),
-				"import 'dependency'; export function render() { return { v: 'unreachable' }; }"
+				"import 'dependency'; export function render() { return { v: 'unreachable' }; } export const $nymph$replDebug = (value) => value;"
 					.to_string(),
 			),
 		]);
@@ -305,7 +305,7 @@ mod tests {
 			("dependency".to_string(), "export const value = 42;".to_string()),
 			(
 				"entry".to_string(),
-				"import { value } from 'dependency'; export function render() { return { v: String(value) }; }"
+				"import { value } from 'dependency'; export function render() { return { v: String(value) }; } export const $nymph$replDebug = (value) => value;"
 					.to_string(),
 			),
 		]);

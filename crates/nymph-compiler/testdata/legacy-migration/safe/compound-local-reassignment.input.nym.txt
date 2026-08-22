@@ -1,0 +1,5 @@
+func example(): int = {
+	let mut value = 2
+	value *= 3
+	value
+}

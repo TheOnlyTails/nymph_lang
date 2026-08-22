@@ -1,0 +1,8 @@
+enum Source { Value(value: int) }
+enum Destination { Source }
+
+func convert(value: Source): Destination = Destination.Source(value)
+
+func inspect(value: Destination): int = match (value) {
+	Destination.Source(...) -> 1
+}

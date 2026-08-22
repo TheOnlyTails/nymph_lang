@@ -26,6 +26,20 @@ fn definition(name: &str) -> DefinitionId {
 }
 
 #[test]
+fn opaque_external_identity_is_stable_and_definition_owned() {
+	let file = definition("File");
+	let socket = definition("Socket");
+	assert_eq!(
+		nymph_sema::opaque_external_identity(&file),
+		nymph_sema::opaque_external_identity(&file)
+	);
+	assert_ne!(
+		nymph_sema::opaque_external_identity(&file),
+		nymph_sema::opaque_external_identity(&socket)
+	);
+}
+
+#[test]
 fn every_type_shape_round_trips_into_a_fresh_interner() {
 	let mut source = Interner::new();
 	let def = DefId(7);
@@ -40,8 +54,7 @@ fn every_type_shape_round_trips_into_a_fresh_interner() {
 		def,
 		GenericArgs::new(vec![function], vec![("Output".into(), param)]),
 	);
-	let mutable = source.mk_mut(adt);
-	let intersection = source.mk_intersection(vec![mutable, source.char()]);
+	let intersection = source.mk_intersection(vec![adt, source.char()]);
 	let context = CanonicalizationContext::new(
 		HashMap::from([(def, definition("Box"))]),
 		HashMap::from([(ParamIdx(3), parameter.clone())]),
@@ -66,8 +79,7 @@ fn every_type_shape_round_trips_into_a_fresh_interner() {
 		DefId(99),
 		GenericArgs::new(vec![expected_fn], vec![("Output".into(), expected_param)]),
 	);
-	let expected_mut = fresh.mk_mut(expected_adt);
-	let expected = fresh.mk_intersection(vec![expected_mut, fresh.char()]);
+	let expected = fresh.mk_intersection(vec![expected_adt, fresh.char()]);
 	assert_eq!(fresh.kind(instantiated), fresh.kind(expected));
 }
 
@@ -177,20 +189,22 @@ fn complete_fixture() -> ModuleInterface {
 	let binder = GenericParameter {
 		id: parameter_id.clone(),
 		name: "T".into(),
+		kind: nymph_sema::GenericParameterKind::Type,
 	};
 	let constraint = ConstraintShape {
 		parameter: parameter_id,
 		interface: definition("Bound"),
 		positional: vec![InterfaceType::Int],
 		named: vec![("Output".into(), InterfaceType::String)],
+		effect_args: vec![],
 	};
 	let field = FieldShape {
 		id: definition("field"),
 		name: "field".into(),
 		visibility: Some(Visibility::Public),
 		ty: InterfaceType::Int,
-		mutable: true,
 		has_default: true,
+		default_effects: Some(nymph_sema::EffectRow::pure()),
 	};
 	let member = MemberShape {
 		id: definition("member"),
@@ -202,17 +216,25 @@ fn complete_fixture() -> ModuleInterface {
 		parameters: vec![ParameterShape {
 			name: Some("arg".into()),
 			ty: InterfaceType::String,
-			mutable: true,
 			spread: true,
 		}],
 		return_type: InterfaceType::Boolean,
+		effects: nymph_sema::EffectRow::pure(),
 		external: Some(ExternalAbi {
 			marker: "js".into(),
 			callable: nymph_sema::ExternalCallable::Linked {
-				module: "host".into(),
-				symbol: "call".into(),
+				adapter: nymph_sema::ExternalAdapterId {
+					module: "host".into(),
+					symbol: "call".into(),
+				},
 			},
-			marshal: Some(MarshalKind::Int),
+			effects: nymph_sema::EffectRow::pure(),
+			audit: nymph_sema::ExternalAudit::default(),
+			call_mode: nymph_sema::ExternalCallMode::Ordinary,
+			marshal: nymph_sema::ExternalMarshalPlan {
+				parameters: vec![None],
+				result: Some(MarshalKind::Int),
+			},
 		}),
 		runtime_owner: Some(owner.clone()),
 		has_default: true,
@@ -228,10 +250,10 @@ fn complete_fixture() -> ModuleInterface {
 		parameters: vec![ParameterShape {
 			name: Some("value".into()),
 			ty: InterfaceType::Int,
-			mutable: false,
 			spread: false,
 		}],
 		return_type: Some(InterfaceType::String),
+		effects: nymph_sema::EffectRow::pure(),
 		ty: Some(InterfaceType::Int),
 		fields: vec![field.clone()],
 		variants: vec![VariantShape {
@@ -239,6 +261,7 @@ fn complete_fixture() -> ModuleInterface {
 			name: "Variant".into(),
 			fields: vec![field],
 		}],
+		enum_view_variants: vec![],
 		members: vec![member.clone()],
 		super_interfaces: vec![SuperInterfaceShape {
 			interface: definition("Bound"),
@@ -263,13 +286,13 @@ fn complete_fixture() -> ModuleInterface {
 			visibility: Some(Visibility::Private),
 			interface: Some(definition("Bound")),
 			interface_arguments: vec![("Output".into(), InterfaceType::String)],
+			interface_effect_arguments: vec![],
 			interface_argument_bindings: vec![],
 			self_type: InterfaceType::Named {
 				definition: owner.clone(),
 				positional: vec![InterfaceType::Int],
 				named: vec![("T".into(), InterfaceType::String)],
 			},
-			mutable: true,
 			binders: vec![binder],
 			constraints: vec![constraint],
 			members: vec![member],
@@ -300,16 +323,14 @@ fn fully_populated_complete_interface_hashes_every_observable_category() {
 	);
 	changed!(|x: &mut ModuleInterface| x.exports[0].parameters[0].spread = true);
 	changed!(|x: &mut ModuleInterface| x.exports[0].return_type = Some(InterfaceType::Void));
-	changed!(|x: &mut ModuleInterface| x.exports[0].fields[0].mutable = false);
 	changed!(|x: &mut ModuleInterface| x.exports[0].variants[0].name = "Other".into());
 	changed!(|x: &mut ModuleInterface| x.exports[0].members[0].kind = MemberKind::StaticFunction);
 	changed!(|x: &mut ModuleInterface| x.exports[0].super_interfaces.clear());
 	changed!(
-		|x: &mut ModuleInterface| x.exports[0].external.as_mut().unwrap().marshal =
+		|x: &mut ModuleInterface| x.exports[0].external.as_mut().unwrap().marshal.result =
 			Some(MarshalKind::String)
 	);
 	changed!(|x: &mut ModuleInterface| x.exports[0].runtime_owner = Some(definition("Other")));
-	changed!(|x: &mut ModuleInterface| x.implementations[0].mutable = false);
 	changed!(|x: &mut ModuleInterface| x.implementations[0].members.clear());
 	changed!(|x: &mut ModuleInterface| x.support_definitions.clear());
 	let mut metadata = original.clone();
@@ -332,16 +353,17 @@ fn recovered_fixture() -> RecoveredModuleInterface {
 		parameters: vec![ParameterShape {
 			name: Some("nested".into()),
 			ty: RecoveredInterfaceType::Poison,
-			mutable: false,
 			spread: false,
 		}],
 		return_type: Some(RecoveredInterfaceType::Known(InterfaceType::String)),
+		effects: nymph_sema::RecoveredEffectRow::Known(nymph_sema::EffectRow::pure()),
 		ty: Some(RecoveredInterfaceType::Poison),
 		fields: vec![],
 		variants: vec![],
+		enum_view_variants: vec![],
 		members: vec![],
 		super_interfaces: vec![],
-		external: complete.external,
+		external: complete.external.map(ExternalAbi::recovered),
 		runtime_owner: complete.runtime_owner,
 	};
 	RecoveredModuleInterface {

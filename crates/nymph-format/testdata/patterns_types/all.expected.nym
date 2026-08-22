@@ -1,4 +1,4 @@
-type Shapes<A, B> = #(#[A], #{string: B}, (A) -> B, A + B, mut A)
+type Shapes<A, B> = #(#[A], #{string: B}, (A) -> B, A + B, A)
 func destructure(value: #(int, int)) = {
 	let whole = #(left, right): #(int, int) = value
 	match (value) {

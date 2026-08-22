@@ -40,6 +40,7 @@ pub struct IfaceMethod {
 	pub has_default: bool,
 	pub params: Vec<Ty>,
 	pub ret: Ty,
+	pub effects: crate::ty::EffectRow,
 	/// The method's OWN generic parameter names (e.g. `map<R>` → `["R"]`), in
 	/// declaration order. Their `Param` indices follow the owning interface's/impl's
 	/// generics: a method generic `j` is `Param(owner_generics + j)`, and any
@@ -48,13 +49,6 @@ pub struct IfaceMethod {
 	/// fresh inference variable per method generic when instantiating the signature.
 	pub generics: Vec<EcoString>,
 	pub bounds: Vec<Bound>,
-	/// Whether this method is declared `mut func` (needs a `mut` receiver) rather
-	/// than plain `func`. On an [`InterfaceDef`]'s copy this is the SOURCE OF
-	/// TRUTH that every call-site gate (`solve.rs`) consults; on an
-	/// [`ImplDef`]'s copy it is the impl's own restatement, compared against the
-	/// interface's declaration at collection time and otherwise unused for
-	/// gating (the interface's copy is what's authoritative).
-	pub mutating: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +65,7 @@ pub struct RuntimeMemberDef {
 #[derive(Debug, Clone, Default)]
 pub struct InterfaceDef {
 	pub generics: Vec<EcoString>,
+	pub generic_kinds: Vec<crate::GenericParameterKind>,
 	/// All runtime-bearing interface members in declaration order.
 	pub runtime_members: Vec<RuntimeMemberDef>,
 	pub methods: FxHashMap<EcoString, IfaceMethod>,
@@ -82,6 +77,7 @@ pub struct Bound {
 	pub ty: Ty,
 	pub interface: DefId,
 	pub args: Vec<(EcoString, Ty)>,
+	pub effect_args: Vec<(EcoString, crate::ty::EffectRow)>,
 }
 
 /// A collected `impl Interface<…> for Type { … }`.
@@ -94,6 +90,7 @@ pub struct ImplDef {
 	pub member_catalog: crate::ImplementationMemberCatalog,
 	pub runtime_members: Vec<RuntimeMemberDef>,
 	pub generics: Vec<EcoString>,
+	pub generic_kinds: Vec<crate::GenericParameterKind>,
 	pub self_ty: Ty,
 	pub interface: DefId,
 	/// The span of the interface reference in the `impl … for …` header, used to
@@ -102,10 +99,18 @@ pub struct ImplDef {
 	/// Interface argument bindings (`Other = …`, `Output = …`), by parameter name,
 	/// with `self` already substituted to `self_ty`.
 	pub args: Vec<(EcoString, Ty)>,
+	/// Erased effect argument bindings, retained for interface effect contracts.
+	pub effect_args: Vec<(EcoString, crate::ty::EffectRow)>,
 	pub methods: FxHashMap<EcoString, IfaceMethod>,
 	pub constraints: Vec<Bound>,
 	/// True when the implementing type is a bare generic parameter (a blanket impl).
 	pub blanket: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct AlignedInterfaceArgs {
+	pub types: Vec<(EcoString, Ty)>,
+	pub effects: Vec<(EcoString, crate::ty::EffectRow)>,
 }
 
 /// The head constructor of a type, used as an impl-index key.
@@ -123,6 +128,7 @@ pub enum Head {
 	Tuple,
 	Map,
 	Fn,
+	Task,
 	Adt(DefId),
 }
 
@@ -142,10 +148,9 @@ pub fn head_of(interner: &Interner, ty: Ty) -> Option<Head> {
 		TyKind::Tuple(_) => Some(Head::Tuple),
 		TyKind::Map(..) => Some(Head::Map),
 		TyKind::Fn { .. } => Some(Head::Fn),
+		TyKind::Task { .. } => Some(Head::Task),
+		TyKind::Handle(_) | TyKind::HandleOutcome(_) => None,
 		TyKind::Adt(def, _) => Some(Head::Adt(*def)),
-		// `mut` is transparent to method/impl dispatch in — per-method mut
-		// availability (which methods a `mut` receiver additionally unlocks) is.
-		TyKind::Mut(inner) => head_of(interner, *inner),
 		TyKind::Param(_)
 		| TyKind::Infer(_)
 		| TyKind::SelfTy
@@ -241,6 +246,7 @@ impl Checker<'_> {
 					match &element.0 {
 						InterfaceElement::Func { meta, body } => {
 							let mut sig = self.lower_method_sig(meta, generics.len());
+							self.record_effect_spec(meta, sig.effects.clone(), body.is_some());
 							sig.has_default = body.is_some();
 							runtime_members.push(RuntimeMemberDef {
 								definition: None,
@@ -272,6 +278,13 @@ impl Checker<'_> {
 				id,
 				InterfaceDef {
 					generics: names,
+					generic_kinds: generics
+						.iter()
+						.map(|generic| match generic.0.kind {
+							nymph_ast::ty::GenericParamKind::Type => crate::GenericParameterKind::Type,
+							nymph_ast::ty::GenericParamKind::Effect => crate::GenericParameterKind::Effect,
+						})
+						.collect(),
 					runtime_members,
 					methods,
 				},
@@ -294,7 +307,6 @@ impl Checker<'_> {
 		let module = self.module;
 		let Declaration::ImplFor {
 			generics,
-			mutable,
 			type_,
 			for_interface,
 			members,
@@ -308,24 +320,16 @@ impl Checker<'_> {
 
 		self.push_params(build_param_scope(generics));
 		let self_ty = self.lower_type(type_);
-		// `impl A for mut B` and `impl mut A for B` are the SAME
-		// feature under two spellings (design ruling: "`impl mut A for B` = mut
-		// applies to BOTH A and B (same effect: only mut B)") — the interface is
-		// implemented ONLY for the mutable view of the type. `impl A for mut B`
-		// already lowers `type_` to `TyKind::Mut(B)` above (nothing to do); `impl
-		// mut A for B` instead sets this header-level `mutable` flag with a PLAIN
-		// `type_`, so normalize it here to the same `Mut(B)` self type — every
-		// downstream consumer (the impl registry, receiver matching, bound
-		// satisfaction via `holds`) then only has to understand one shape.
-		// `mk_mut` never nests, so `impl mut A for mut B` (redundant but
-		// harmless) collapses to the same single `Mut(B)`.
-		let self_ty = if *mutable {
-			self.interner.mk_mut(self_ty)
-		} else {
-			self_ty
-		};
 		let constraints = self.lower_constraints(generics, 0);
-		self.finish_interface_impl(names, self_ty, iface_name, iface_args, members, constraints);
+		self.finish_interface_impl(
+			names,
+			generic_kinds(generics),
+			self_ty,
+			iface_name,
+			iface_args,
+			members,
+			constraints,
+		);
 		self.pop_params();
 	}
 
@@ -388,19 +392,53 @@ impl Checker<'_> {
 			.cloned()
 			.collect();
 		let names = generic_names(&combined);
+		let kinds = generic_kinds(&combined);
 		let owner_len = owner_generics.len();
 		self.push_params(build_param_scope(owner_generics));
 		let mut constraints = self.lower_constraints(owner_generics, 0);
 		self.push_params(build_param_scope_at(impl_generics, owner_len));
 		constraints.extend(self.lower_constraints(impl_generics, owner_len));
-		let positional: Vec<Ty> = (0..owner_len)
-			.map(|i| self.interner.mk_param(ParamIdx(i as u32)))
-			.collect();
+		let owner_has_effects = owner_generics
+			.iter()
+			.any(|generic| generic.0.kind == nymph_ast::ty::GenericParamKind::Effect);
+		let positional = (!owner_has_effects)
+			.then(|| {
+				owner_generics
+					.iter()
+					.enumerate()
+					.filter(|(_, generic)| generic.0.kind == nymph_ast::ty::GenericParamKind::Type)
+					.map(|(index, _)| self.interner.mk_param(ParamIdx(index as u32)))
+					.collect()
+			})
+			.unwrap_or_default();
+		let named = owner_has_effects
+			.then(|| {
+				owner_generics
+					.iter()
+					.enumerate()
+					.filter(|(_, generic)| generic.0.kind == nymph_ast::ty::GenericParamKind::Type)
+					.map(|(index, generic)| {
+						(
+							generic.0.name.0.clone(),
+							self.interner.mk_param(ParamIdx(index as u32)),
+						)
+					})
+					.collect()
+			})
+			.unwrap_or_default();
 		let self_ty = self
 			.interner
-			.mk_adt(def, GenericArgs::new(positional, Vec::new()));
+			.mk_adt(def, GenericArgs::new(positional, named));
 		let (iface_name, iface_args) = interface;
-		self.finish_interface_impl(names, self_ty, iface_name, iface_args, members, constraints);
+		self.finish_interface_impl(
+			names,
+			kinds,
+			self_ty,
+			iface_name,
+			iface_args,
+			members,
+			constraints,
+		);
 		self.pop_params();
 		self.pop_params();
 	}
@@ -417,6 +455,7 @@ impl Checker<'_> {
 	fn finish_interface_impl(
 		&mut self,
 		names: Vec<EcoString>,
+		generic_kinds: Vec<crate::GenericParameterKind>,
 		self_ty: Ty,
 		iface_name: &Ident,
 		iface_args: &[Spanned<GenericArg>],
@@ -444,9 +483,11 @@ impl Checker<'_> {
 		let raw_args = self.align_args(interface, iface_args);
 		let empty = FxHashMap::default();
 		let args: Vec<(EcoString, Ty)> = raw_args
+			.types
 			.into_iter()
 			.map(|(name, ty)| (name, self.subst(ty, &empty, Some(self_ty))))
 			.collect();
+		let effect_args = raw_args.effects;
 
 		// Map each interface `Param(k)` to this impl's binding for the k-th generic, so an
 		// omitted method return can be resolved to the interface's declared return type.
@@ -536,10 +577,15 @@ impl Checker<'_> {
 				Some(ty) => self.lower_type(ty),
 				None => self.interface_method_ret(interface, &meta.name.0, &isubst, self_ty),
 			};
+			let effects = meta
+				.effects
+				.as_ref()
+				.map(|effects| self.lower_effect_row(effects).0)
+				.unwrap_or_else(crate::ty::EffectRow::pure);
+			self.record_effect_spec(meta, effects.clone(), true);
 			let bounds = self.lower_constraints(&meta.generics, base);
 			self.pop_params();
-			let mutating = meta.kind == FuncKind::Mut;
-			// a plain-target impl (`impl A for B`, not `for mut B`)
+			// OO2 (MT2): a plain-target impl (`impl A for B`, not `for mut B`)
 			// restates each method's `mut func`/`func` kind and it must MATCH the
 			// interface's own declaration — the interface is the source of truth
 			// every call-site gate (`solve.rs`) reads, so a mismatched restatement
@@ -551,25 +597,6 @@ impl Checker<'_> {
 			// the mutable view at all), so per-method kind restatement inside the
 			// impl body doesn't carry the same meaning and isn't checked against
 			// the interface's declared kind.
-			let self_ty_is_mut = matches!(self.interner.kind(self_ty), TyKind::Mut(_));
-			if !self_ty_is_mut
-				&& let Some(expected) = self
-					.interfaces
-					.get(&interface)
-					.and_then(|i| i.methods.get(&meta.name.0))
-					.map(|m| m.mutating)
-				&& expected != mutating
-			{
-				let ty = self.display(self_ty);
-				self.emit(
-					meta.name.1,
-					TypeError::MethodMutMismatch {
-						name: meta.name.0.clone(),
-						ty,
-						expected_mut: expected,
-					},
-				);
-			}
 			methods.insert(
 				meta.name.0.clone(),
 				IfaceMethod {
@@ -577,9 +604,9 @@ impl Checker<'_> {
 					has_default: false,
 					params,
 					ret,
+					effects,
 					generics: generic_names(&meta.generics),
 					bounds,
-					mutating,
 				},
 			);
 		}
@@ -587,7 +614,7 @@ impl Checker<'_> {
 		for member in members {
 			if let ImplMember::ExternalLet(_, marker, meta) = &member.0 {
 				let ty = meta.type_.as_ref().map(|ty| self.lower_type(ty));
-				self.check_external_value(marker, meta.name.1, meta.is_mutable(), ty);
+				self.check_external_value(marker, meta.name.1, ty);
 			}
 		}
 
@@ -607,10 +634,12 @@ impl Checker<'_> {
 			member_catalog: Default::default(),
 			runtime_members,
 			generics: names,
+			generic_kinds,
 			self_ty,
 			interface,
 			source_span: Some(iface_name.1),
 			args,
+			effect_args,
 			methods,
 			constraints,
 			blanket,
@@ -656,9 +685,22 @@ impl Checker<'_> {
 			.iter()
 			.map(|p| self.lower_type(&p.0.type_))
 			.collect();
-		let ret = match &meta.return_type {
+		let output = match &meta.return_type {
 			Some(ty) => self.lower_type(ty),
 			None => self.interner.void(),
+		};
+		let latent_effects = meta
+			.effects
+			.as_ref()
+			.map(|effects| self.lower_effect_row(effects).0)
+			.unwrap_or_else(crate::ty::EffectRow::pure);
+		let (ret, effects) = if meta.is_async {
+			(
+				self.interner.mk_task(output, latent_effects),
+				crate::ty::EffectRow::pure(),
+			)
+		} else {
+			(output, latent_effects)
 		};
 		let bounds = self.lower_constraints(&meta.generics, base);
 		self.pop_params();
@@ -667,9 +709,9 @@ impl Checker<'_> {
 			has_default: false,
 			params,
 			ret,
+			effects,
 			generics: generic_names(&meta.generics),
 			bounds,
-			mutating: meta.kind == FuncKind::Mut,
 		}
 	}
 
@@ -679,27 +721,63 @@ impl Checker<'_> {
 		&mut self,
 		interface: DefId,
 		args: &[Spanned<GenericArg>],
-	) -> Vec<(EcoString, Ty)> {
+	) -> AlignedInterfaceArgs {
 		if let Some(owner) = self.defs.stable(interface).cloned() {
 			self.queue_named_generic_labels(owner, args);
 		}
-		let names = self
+		let (names, kinds) = self
 			.interfaces
 			.get(&interface)
-			.map(|i| i.generics.clone())
+			.map(|i| (i.generics.clone(), i.generic_kinds.clone()))
 			.unwrap_or_default();
-		let mut out = Vec::new();
+		let mut out = AlignedInterfaceArgs::default();
 		let mut positional = 0;
 		for arg in args {
-			let ty = self.lower_type(&arg.0.value);
-			match &arg.0.name {
-				Some(label) => out.push((label.0.clone(), ty)),
-				None => {
-					if let Some(name) = names.get(positional) {
-						out.push((name.clone(), ty));
-					}
-					positional += 1;
+			let (name, index) = if let Some(label) = &arg.0.name {
+				(
+					label.0.clone(),
+					names.iter().position(|name| name == &label.0),
+				)
+			} else {
+				let index = positional;
+				positional += 1;
+				let Some(name) = names.get(index).cloned() else {
+					continue;
+				};
+				(name, Some(index))
+			};
+			let kind = index
+				.and_then(|index| kinds.get(index))
+				.copied()
+				.unwrap_or_else(|| match arg.0.value {
+					nymph_ast::ty::GenericArgValue::Type(_) => crate::GenericParameterKind::Type,
+					nymph_ast::ty::GenericArgValue::Effect(_) => crate::GenericParameterKind::Effect,
+				});
+			match (&arg.0.value, kind) {
+				(nymph_ast::ty::GenericArgValue::Type(value), crate::GenericParameterKind::Type) => {
+					out.types.push((name, self.lower_type(value)));
 				}
+				(nymph_ast::ty::GenericArgValue::Effect(value), crate::GenericParameterKind::Effect) => {
+					let (row, infer) = self.lower_effect_row(value);
+					if infer {
+						self.emit(value.1, TypeError::CannotInferEffectRow);
+					}
+					out.effects.push((name, row));
+				}
+				(_, crate::GenericParameterKind::Type) => self.emit(
+					arg.1,
+					TypeError::GenericKindMismatch {
+						name,
+						expected: "type",
+					},
+				),
+				(_, crate::GenericParameterKind::Effect) => self.emit(
+					arg.1,
+					TypeError::GenericKindMismatch {
+						name,
+						expected: "effect",
+					},
+				),
 			}
 		}
 		out
@@ -770,7 +848,8 @@ impl Checker<'_> {
 					out.push(Bound {
 						ty: target,
 						interface,
-						args,
+						args: args.types,
+						effect_args: args.effects,
 					});
 				}
 			}
@@ -782,15 +861,13 @@ impl Checker<'_> {
 fn func_member_kind(kind: FuncKind) -> crate::MemberKind {
 	match kind {
 		FuncKind::Instance => crate::MemberKind::Function,
-		FuncKind::Mut => crate::MemberKind::MutatingFunction,
 		FuncKind::Namespace => crate::MemberKind::StaticFunction,
 	}
 }
 
 fn let_member_kind(kind: LetKind) -> crate::MemberKind {
 	match kind {
-		LetKind::Instance => crate::MemberKind::Value,
-		LetKind::Mut => crate::MemberKind::MutableValue,
+		LetKind::Instance | LetKind::Use => crate::MemberKind::Value,
 		LetKind::Namespace => crate::MemberKind::StaticValue,
 	}
 }
@@ -837,4 +914,16 @@ fn runtime_member_def(
 
 fn generic_names(generics: &[Spanned<nymph_ast::ty::GenericParam>]) -> Vec<EcoString> {
 	generics.iter().map(|g| g.0.name.0.clone()).collect()
+}
+
+fn generic_kinds(
+	generics: &[Spanned<nymph_ast::ty::GenericParam>],
+) -> Vec<crate::GenericParameterKind> {
+	generics
+		.iter()
+		.map(|generic| match generic.0.kind {
+			nymph_ast::ty::GenericParamKind::Type => crate::GenericParameterKind::Type,
+			nymph_ast::ty::GenericParamKind::Effect => crate::GenericParameterKind::Effect,
+		})
+		.collect()
 }

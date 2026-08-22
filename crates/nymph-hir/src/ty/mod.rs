@@ -14,6 +14,37 @@ use rustc_hash::FxHashMap;
 
 use crate::ids::{DefId, InferVar, ParamIdx};
 
+/// One rigid atom in a checked effect row.
+///
+/// Nominal IDs are local semantic IDs until the owning semantic module
+/// canonicalizes them for interface publication. Parameters are rigid and never
+/// participate in ordinary type unification.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub enum EffectAtom {
+	Nominal(DefId),
+	Parameter(ParamIdx),
+}
+
+/// Canonical finite effects attached to a callable semantic type.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
+pub struct EffectRow(Vec<EffectAtom>);
+
+impl EffectRow {
+	pub fn new(mut atoms: Vec<EffectAtom>) -> Self {
+		atoms.sort_unstable();
+		atoms.dedup();
+		Self(atoms)
+	}
+
+	pub fn pure() -> Self {
+		Self::default()
+	}
+
+	pub fn atoms(&self) -> &[EffectAtom] {
+		&self.0
+	}
+}
+
 /// An interned semantic type: an index into the [`Interner`] that produced it.
 ///
 /// Handles are only meaningful relative to the interner that minted them. Two
@@ -52,18 +83,23 @@ pub enum TyKind {
 	Fn {
 		params: Vec<Ty>,
 		ret: Ty,
+		effects: EffectRow,
 	},
+	/// A cold async recipe. Effects are latent until the recipe is driven.
+	Task {
+		output: Ty,
+		effects: EffectRow,
+	},
+	/// One running execution. Observing it is pure and reports a host outcome.
+	Handle(Ty),
+	/// The result of observing a handle, distinct from an application `Result`.
+	HandleOutcome(Ty),
 	/// A nominal `struct` or `enum` applied to generic arguments.
 	Adt(DefId, GenericArgs),
 	/// The intersection `A + B` of interface bounds — a *conjunction*: a value of
 	/// this type satisfies every listed interface. Treated as logical AND
 	/// everywhere; treating it as OR accepts values missing required bounds.
 	Intersection(Vec<Ty>),
-	/// `mut T` — a mutable *view* of `T`. Compile-time-only: codegen ignores it,
-	/// since JS values are already mutable. `mut T` is implicitly assignable to
-	/// `T` (one-way; see `subtype`), never the reverse. The field's declared type
-	/// is the sole authority for whether that field's slot is mutable.
-	Mut(Ty),
 
 	// ── Variables ────────────────────────────────────────────────────────────
 	/// A rigid generic parameter (skolem) — may not be unified away.
@@ -229,7 +265,26 @@ impl Interner {
 		self.intern(TyKind::Map(key, value))
 	}
 	pub fn mk_fn(&mut self, params: Vec<Ty>, ret: Ty) -> Ty {
-		self.intern(TyKind::Fn { params, ret })
+		self.mk_effectful_fn(params, ret, EffectRow::pure())
+	}
+
+	pub fn mk_effectful_fn(&mut self, params: Vec<Ty>, ret: Ty, effects: EffectRow) -> Ty {
+		self.intern(TyKind::Fn {
+			params,
+			ret,
+			effects,
+		})
+	}
+	pub fn mk_task(&mut self, output: Ty, effects: EffectRow) -> Ty {
+		self.intern(TyKind::Task { output, effects })
+	}
+
+	pub fn mk_handle(&mut self, output: Ty) -> Ty {
+		self.intern(TyKind::Handle(output))
+	}
+
+	pub fn mk_handle_outcome(&mut self, output: Ty) -> Ty {
+		self.intern(TyKind::HandleOutcome(output))
 	}
 	pub fn mk_adt(&mut self, def: DefId, args: GenericArgs) -> Ty {
 		self.intern(TyKind::Adt(def, args))
@@ -240,16 +295,6 @@ impl Interner {
 	pub fn mk_infer(&mut self, var: InferVar) -> Ty {
 		self.intern(TyKind::Infer(var))
 	}
-	/// Idempotent: `mut mut T` collapses to `mut T` (a mutable view of a mutable
-	/// view is just a mutable view) so `Mut` never nests. Callers elsewhere in
-	/// the checker (e.g. `strip_mut`, one `match` peel) rely on this invariant.
-	pub fn mk_mut(&mut self, inner: Ty) -> Ty {
-		if matches!(self.kind(inner), TyKind::Mut(_)) {
-			return inner;
-		}
-		self.intern(TyKind::Mut(inner))
-	}
-
 	/// Build an intersection, flattening nested intersections and collapsing the
 	/// zero/one-element cases. An empty intersection is `void` (the trivial bound).
 	pub fn mk_intersection(&mut self, parts: Vec<Ty>) -> Ty {

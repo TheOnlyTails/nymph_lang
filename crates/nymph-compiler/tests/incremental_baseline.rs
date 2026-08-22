@@ -70,7 +70,7 @@ fn run_root_value(mut js: String, root_symbol: &str) {
 		"node failed: {}",
 		String::from_utf8_lossy(&output.stderr)
 	);
-	assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0");
+	assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0n");
 }
 
 #[test]

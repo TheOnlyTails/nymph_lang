@@ -1,0 +1,5 @@
+struct Point(x: int, y: int)
+
+func sum(point: Point): int = match (point) {
+	Point(x = x, y = y) -> x + y
+}

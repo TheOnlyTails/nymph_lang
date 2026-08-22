@@ -33,8 +33,7 @@ func verbose_demo(): boolean = Config(verbose = true).verbose
 
 ### Field access
 
-`.field` reads a field. Reassigning one (`p.field = v`) requires `p`'s type to be `mut` — see
-[Field assignment](./mutability#field-assignment).
+`.field` reads a field. Fields are immutable; construct a replacement value to represent an update.
 
 ```nym
 struct Segment(from: Point, to: Point)
@@ -91,8 +90,9 @@ func make(s: Square): Container<Square> = Container(value = s)
 
 ## Enums
 
-An `enum` is a fixed set of named variants — a sum type. A variant can carry its own fields
-(exactly like a struct's) or none at all.
+An enum is a nominal static view over a canonical, deduplicated set of single-variant types. A
+variant can carry its own fields (exactly like a struct's) or none at all. Every qualified variant
+is also a source-nameable type.
 
 ```nym
 enum Shape {
@@ -148,6 +148,33 @@ impl Shape {
 
 func total(a: Shape, b: Shape): int = a.area() + b.area()
 ```
+
+### Embedding and static views
+
+An enum may embed every variant accepted by another enum with `...Source`, or one qualified variant
+with `Source.Variant`:
+
+```nym
+enum InputError { Missing, Invalid(message: string) }
+enum NetworkError { Offline }
+enum AppError { ...InputError, NetworkError.Offline, Cancelled }
+
+func widen(error: InputError): AppError = error
+func selected(error: NetworkError.Offline): AppError = error as AppError
+```
+
+Embedding is set inclusion, not wrapper construction. Assignment, arguments, returns, and `as` may
+change the nominal static view only when the source's known variant set is a subset of the
+destination set. The runtime value retains its original variant identity and fields.
+
+Accepted sets are least fixed points. Self-embedding, mutual cycles, diamonds, and repeated paths are
+legal and deduplicate the same single-variant type. Selected variants stay qualified and cannot add
+fields. Exhaustiveness uses the destination's final set, while a successful qualified pattern
+rebinds the source view. Methods dispatch through the current static view.
+
+Embedding never synthesizes `Into`. An explicitly declared `Into` implementation remains legal and
+is the only conversion used by `.to()`; direct set assignability takes precedence during `?`, with a
+unique pure, infallible explicit `Into` as the fallback.
 
 ### `namespace func` and `self`
 

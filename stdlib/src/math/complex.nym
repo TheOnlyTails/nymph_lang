@@ -2,6 +2,9 @@ external(atan2) func complex_atan2(y: float, x: float): float
 external(power_domain_error) func complex_power_domain_error(): never
 
 public struct Complex(real: float, imaginary: float) {
+  namespace func new(real: float, imaginary: float): Complex =
+    Complex(real = real, imaginary = imaginary)
+
   func conjugate() = Complex(real = this.real, imaginary = -this.imaginary)
 
   func abs() = complex_log_magnitude(this).exp()
@@ -97,47 +100,59 @@ func complex_reciprocal(value: Complex): Complex = {
 
 func complex_power_uint(base: Complex, exponent: uint): Complex = {
   if (exponent == 1) { return base }
-  let mut result = complex_one()
-  let mut factor = base
-  let mut remaining = exponent
-  while (remaining > 0) {
-    if (remaining % 2 == 1) { result = result * factor }
-    remaining = (remaining / 2) as uint
-    if (remaining > 0) { factor = factor * factor }
-  }
-  result
+  complex_power_uint_state(complex_one(), base, exponent)
 }
+
+func complex_power_uint_state(result: Complex, factor: Complex, remaining: uint): Complex =
+  if (remaining == 0u) result else {
+    let next_remaining = (remaining / 2u) as uint
+    complex_power_uint_state(
+      if (remaining % 2u == 1u) result * factor else result,
+      if (next_remaining > 0u) factor * factor else factor,
+      next_remaining,
+    )
+  }
 
 // Float magnitudes stay floats while the integral fast path halves them. This
 // avoids a saturating float-to-int cast and covers every finite integral IEEE
-// value represented by Nymph.
+// value represented by Nymph. Ordered identity checks also accept an exact
+// integer payload routed through the shared JavaScript overload slot.
 func complex_power_integral_float(base: Complex, exponent: float): Complex = {
-  if (exponent == 1.0) { return base }
-  if (exponent == -1.0) { return complex_reciprocal(base) }
+  if (exponent >= 1.0 && exponent <= 1.0) { return base }
+  if (exponent >= -1.0 && exponent <= -1.0) { return complex_reciprocal(base) }
   let negative = exponent < 0.0
-  let mut remaining = if (negative) { -exponent } else { exponent }
-  let mut result = complex_one()
-  let mut factor = if (negative) { complex_reciprocal(base) } else { base }
-  while (remaining > 0.0) {
-    if (remaining % 2.0 == 1.0) { result = result * factor }
-    remaining = (remaining - (remaining % 2.0)) / 2.0
-    if (remaining > 0.0) { factor = factor * factor }
-  }
-  result
+  complex_power_float_state(
+    complex_one(),
+    if (negative) complex_reciprocal(base) else base,
+    if (negative) -exponent else exponent,
+  )
 }
+
+func complex_power_float_state(result: Complex, factor: Complex, remaining: float): Complex =
+  if (remaining <= 0.0) result else {
+    let next_remaining = (remaining - (remaining % 2.0)) / 2.0
+    complex_power_float_state(
+      if (remaining % 2.0 == 1.0) result * factor else result,
+      if (next_remaining > 0.0) factor * factor else factor,
+      next_remaining,
+    )
+  }
 
 func real_power_integral_float(base: float, exponent: float): float = {
   let negative = exponent < 0.0
-  let mut remaining = if (negative) { -exponent } else { exponent }
-  let mut result = 1.0
-  let mut factor = base
-  while (remaining > 0.0) {
-    if (remaining % 2.0 == 1.0) { result = result * factor }
-    remaining = (remaining - (remaining % 2.0)) / 2.0
-    if (remaining > 0.0) { factor = factor * factor }
-  }
+  let result = real_power_float_state(1.0, base, if (negative) -exponent else exponent)
   if (negative) { 1.0 / result } else { result }
 }
+
+func real_power_float_state(result: float, factor: float, remaining: float): float =
+  if (remaining <= 0.0) result else {
+    let next_remaining = (remaining - (remaining % 2.0)) / 2.0
+    real_power_float_state(
+      if (remaining % 2.0 == 1.0) result * factor else result,
+      if (next_remaining > 0.0) factor * factor else factor,
+      next_remaining,
+    )
+  }
 
 func complex_log(value: Complex): Complex = Complex(
   real = complex_log_magnitude(value),
@@ -222,7 +237,7 @@ impl Power<Other = uint, Output = Complex> for Complex {
 impl Power<Other = int, Output = Complex> for Complex {
   func power(other: int): Complex = if (other < 0) {
     if (this.real == 0.0 && this.imaginary == 0.0) { complex_power_domain_error() }
-    complex_power_uint(complex_reciprocal(this), other as uint)
+    complex_power_uint(complex_reciprocal(this), ((-(other + 1)) as uint) + 1u)
   } else {
     complex_power_uint(this, other as uint)
   }

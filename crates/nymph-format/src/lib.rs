@@ -326,11 +326,18 @@ impl Hints {
 				}
 			}
 			Declaration::Enum {
+				embeddings,
 				variants,
 				members,
 				impls,
 				..
 			} => {
+				for embedding in embeddings {
+					self.line_before.insert(embedding.1.start);
+					if !source[embedding.1.end..].trim_start().starts_with(',') {
+						self.comma_after.insert(embedding.1.end);
+					}
+				}
 				for variant in variants {
 					self.line_before.insert(variant.1.start);
 					if !source[variant.1.end..].trim_start().starts_with(',') {
@@ -369,6 +376,7 @@ impl Hints {
 				}
 			}
 			Declaration::Import { .. }
+			| Declaration::Effect { .. }
 			| Declaration::ExternalLet(..)
 			| Declaration::ExternalFunc(..)
 			| Declaration::TypeAlias { .. } => {}
@@ -415,7 +423,6 @@ impl Hints {
 				| ExprKind::Map(_)
 				| ExprKind::Call { .. }
 				| ExprKind::BinaryOp { .. }
-				| ExprKind::AssignOp { .. }
 				| ExprKind::Match { .. }
 				| ExprKind::Block { .. }
 				| ExprKind::Grouped(_)
@@ -452,14 +459,27 @@ impl Hints {
 				self.visit_expr(source, func, false);
 				for arg in args {
 					let removable =
-						arg.0.name.is_some() || arg.0.spread || !exposes_named_argument(&arg.0.value);
-					self.visit_expr(source, &arg.0.value, removable);
+						arg.0.name().is_some() || arg.0.is_spread() || !exposes_named_argument(arg.0.value());
+					self.visit_expr(source, arg.0.value(), removable);
 				}
 			}
+			ExprKind::AsyncBlock { body, .. } => {
+				self.units.push(expr.span);
+				if matches!(&body.kind, ExprKind::Block { .. })
+					&& let Some(open) = source[body.span.start..body.span.end].find('{')
+				{
+					self.blocks.insert(body.span.start + open);
+				}
+				self.visit_expr(source, body, false);
+			}
+			ExprKind::Await { value, .. } => self.visit_expr(source, value, false),
 			ExprKind::MemberAccess { parent, .. }
 			| ExprKind::IndexAccess { parent, .. }
 			| ExprKind::PostfixOp { value: parent, .. }
-			| ExprKind::PrefixOp { value: parent, .. } => self.visit_expr(source, parent, false),
+			| ExprKind::PrefixOp { value: parent, .. }
+			| ExprKind::Echo {
+				operand: parent, ..
+			} => self.visit_expr(source, parent, false),
 			ExprKind::Closure { body, label, .. } => {
 				if label.is_some()
 					&& matches!(&body.kind, ExprKind::Block { .. })
@@ -469,7 +489,7 @@ impl Hints {
 				}
 				self.visit_expr(source, body, true);
 			}
-			ExprKind::BinaryOp { lhs, rhs, .. } | ExprKind::AssignOp { lhs, rhs, .. } => {
+			ExprKind::BinaryOp { lhs, rhs, .. } => {
 				if flat_width(&source[expr.span.start..expr.span.end]) > WIDTH.saturating_sub(30)
 					&& let Some(operator) = first_token_start(source, lhs.span.end, rhs.span.start)
 				{
@@ -487,14 +507,19 @@ impl Hints {
 					self.visit_expr(source, value, true);
 				}
 			}
-			ExprKind::While {
-				condition, body, ..
-			} => {
-				self.visit_expr(source, condition, true);
-				self.visit_expr(source, body, true);
+			ExprKind::Continue { replacements, .. } => {
+				for replacement in replacements {
+					self.visit_expr(source, &replacement.value, true);
+				}
 			}
 			ExprKind::For { iterable, body, .. } => {
 				self.visit_expr(source, iterable, true);
+				self.visit_expr(source, body, true);
+			}
+			ExprKind::StateLoop { bindings, body, .. } => {
+				for binding in bindings {
+					self.visit_expr(source, &binding.value, true);
+				}
 				self.visit_expr(source, body, true);
 			}
 			ExprKind::If {
@@ -585,7 +610,6 @@ impl Hints {
 			| ExprKind::Boolean(_)
 			| ExprKind::Identifier(_)
 			| ExprKind::AnonymousParam(_)
-			| ExprKind::Continue { .. }
 			| ExprKind::This => {}
 		}
 	}
@@ -599,18 +623,17 @@ fn ends_in_unmatched_if(expr: &Expr) -> bool {
 			Statement::Let { .. } => false,
 		},
 		ExprKind::Grouped(inner) => ends_in_unmatched_if(inner),
-		ExprKind::While { body, .. } | ExprKind::For { body, .. } | ExprKind::Closure { body, .. } => {
-			ends_in_unmatched_if(body)
+		ExprKind::For { body, .. } | ExprKind::Closure { body, .. } => ends_in_unmatched_if(body),
+		ExprKind::PrefixOp { value, .. } | ExprKind::Echo { operand: value, .. } => {
+			ends_in_unmatched_if(value)
 		}
-		ExprKind::PrefixOp { value, .. } => ends_in_unmatched_if(value),
 		ExprKind::Return {
 			value: Some(value), ..
 		}
 		| ExprKind::Break {
 			value: Some(value), ..
 		}
-		| ExprKind::BinaryOp { rhs: value, .. }
-		| ExprKind::AssignOp { rhs: value, .. } => ends_in_unmatched_if(value),
+		| ExprKind::BinaryOp { rhs: value, .. } => ends_in_unmatched_if(value),
 		ExprKind::Range(range) => match range {
 			nymph_ast::expr::RangeKind::To(value)
 			| nymph_ast::expr::RangeKind::ToInclusive(value)
@@ -629,10 +652,6 @@ fn exposes_named_argument(expr: &Expr) -> bool {
 			Statement::Expr(expr) => exposes_named_argument(expr),
 			Statement::Let { .. } => false,
 		},
-		ExprKind::AssignOp { lhs, op, .. } => {
-			matches!(lhs.kind, ExprKind::Identifier(_))
-				&& matches!(op, nymph_ast::ops::AssignOperator::Assign)
-		}
 		_ => false,
 	}
 }
@@ -1164,7 +1183,7 @@ impl<'a> Formatter<'a> {
 		if token == "match" {
 			self.match_pending = true;
 		}
-		if matches!(token, "if" | "while" | "for" | "match") {
+		if matches!(token, "if" | "while" | "for" | "loop" | "match") {
 			self.control_pending = true;
 		}
 		match token {
@@ -1388,7 +1407,13 @@ impl<'a> Formatter<'a> {
 						return true;
 					}
 				}
-				"+" | "-" | "*" | "/" | "%" | "==" | "!=" | "&&" | "||" if depth == 1 => {
+				"+" if depth == 1 => {
+					let next = std::iter::from_fn(|| scanner.next()).find(|next| next.kind == Kind::Token);
+					if !next.is_some_and(|next| next.text == "!") {
+						return false;
+					}
+				}
+				"-" | "*" | "/" | "%" | "==" | "!=" | "&&" | "||" if depth == 1 => {
 					return false;
 				}
 				"(" | ")" | "[" | "]" | "{" | "}" | ";" if depth == 1 => return false,
@@ -1463,12 +1488,24 @@ impl<'a> Formatter<'a> {
 fn is_declaration_start(token: &str) -> bool {
 	matches!(
 		token,
-		"import" | "let" | "func" | "type" | "struct" | "enum" | "namespace" | "interface" | "impl"
+		"import"
+			| "let"
+			| "func"
+			| "effect"
+			| "type"
+			| "struct"
+			| "enum"
+			| "namespace"
+			| "interface"
+			| "impl"
 	)
 }
 
 fn is_declaration_prefix(token: &str) -> bool {
-	matches!(token, "public" | "internal" | "private" | "external")
+	matches!(
+		token,
+		"public" | "internal" | "private" | "external" | "async"
+	)
 }
 
 fn is_infix_operator(token: &str) -> bool {

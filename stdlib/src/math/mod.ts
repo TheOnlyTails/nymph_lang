@@ -1,4 +1,4 @@
-import { NFloat, NInt } from "std/box";
+import { NFloat, nymphFloatToInteger } from "std/box";
 
 export const sin = (x: NFloat) => new NFloat(Math.sin(x.v));
 export const cos = (x: NFloat) => new NFloat(Math.cos(x.v));
@@ -24,9 +24,9 @@ export const power_domain_error = (): never => {
 	throw new RangeError("zero cannot be raised to a negative power");
 };
 
-export const floor = (x: NFloat) => new NInt(Math.floor(x.v));
-export const ceil = (x: NFloat) => new NInt(Math.ceil(x.v));
-export const round = (x: NFloat) => new NInt(Math.round(x.v));
+export const floor = (x: NFloat) => nymphFloatToInteger(Math.floor(x.v), false);
+export const ceil = (x: NFloat) => nymphFloatToInteger(Math.ceil(x.v), false);
+export const round = (x: NFloat) => nymphFloatToInteger(Math.round(x.v), false);
 
 export const max_float = Number.MAX_VALUE;
 export const min_float = -Number.MAX_VALUE;

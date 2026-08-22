@@ -48,6 +48,7 @@ ecow = "0.3.0"
 ena = "0.14.4"
 indexmap = "2.14.0"
 itertools = "0.15.0"
+num-bigint = "0.4.8"
 ordered-float = "5.3.0"
 oxc = { version = "0.140.0", features = ["codegen", "transformer", "semantic"] }
 rayon = "1.12.0"

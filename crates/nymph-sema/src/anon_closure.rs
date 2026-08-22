@@ -45,7 +45,7 @@
 //! `Call`, one group from round zero). The search installs the current
 //! round's hypothesis, trial-checks the WHOLE slot, and rolls every side effect
 //! back (diagnostics, unification bindings, the `pending_operators`/
-//! `pending_bounds`/`pending_bound_arg_mut` queues) whether it passed or not —
+//! `pending_bounds` queue) whether it passed or not —
 //! win or lose, this is only ever a trial; the caller's own subsequent, REAL
 //! `check`/`infer` call is what actually produces lasting diagnostics and
 //! annotations. On failure, the smallest (lowest-level) hypothesis still able to
@@ -171,7 +171,6 @@ impl<'m> Checker<'m> {
 		let diag_mark = self.diags.len();
 		let pending_op_mark = self.pending_operators.len();
 		let pending_bound_mark = self.pending_bounds.len();
-		let pending_mut_snapshot = self.pending_bound_arg_mut.clone();
 		let table_snapshot = self.table.snapshot();
 
 		for (&id, &arity) in boundaries {
@@ -189,8 +188,6 @@ impl<'m> Checker<'m> {
 		self.table.rollback_to(table_snapshot);
 		self.pending_operators.truncate(pending_op_mark);
 		self.pending_bounds.truncate(pending_bound_mark);
-		self.pending_bound_arg_mut = pending_mut_snapshot;
-
 		ok
 	}
 

@@ -32,7 +32,6 @@ impl Parser<'_> {
 
 	fn parse_range_pattern(&mut self) -> Spanned<Pattern> {
 		let start = self.position();
-
 		// Leading unbounded ranges: `..max` / `..=max`.
 		if self.check(&Token::DotDot) {
 			self.advance();
@@ -134,9 +133,14 @@ impl Parser<'_> {
 				Spanned(Pattern::Boolean(Spanned(false, span)), span)
 			}
 			Token::Int(v) => {
-				let v = *v as i64;
 				let span = self.advance().unwrap().1;
-				Spanned(Pattern::Int(Spanned(v, span)), span)
+				match i64::try_from(*v) {
+					Ok(v) => Spanned(Pattern::Int(Spanned(v, span)), span),
+					Err(_) => {
+						self.emit(span, ParseError::IntegerPatternOutOfRange);
+						Spanned(Pattern::Placeholder, span)
+					}
+				}
 			}
 			Token::UInt(v) => {
 				let v = *v;
@@ -184,12 +188,18 @@ impl Parser<'_> {
 		self.advance(); // `-`
 		match self.peek() {
 			Some(Token::Int(v)) => {
-				let v = -(*v as i64);
+				let magnitude = *v;
 				self.advance();
-				Spanned(
-					Pattern::Int(Spanned(v, self.span_from(start))),
-					self.span_from(start),
-				)
+				let span = self.span_from(start);
+				let value = match magnitude {
+					0..=9_223_372_036_854_775_807 => -(magnitude as i64),
+					9_223_372_036_854_775_808 => i64::MIN,
+					_ => {
+						self.emit(span, ParseError::IntegerPatternOutOfRange);
+						return Spanned(Pattern::Placeholder, span);
+					}
+				};
+				Spanned(Pattern::Int(Spanned(value, span)), span)
 			}
 			Some(Token::Float(v)) => {
 				let v = OrderedFloat(-v.0);

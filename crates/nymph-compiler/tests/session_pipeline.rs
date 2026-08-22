@@ -84,7 +84,7 @@ fn module_analysis_type_at_uses_the_checked_project_definition_arena() {
 
 #[test]
 fn module_analysis_type_at_renders_imported_constructors_and_pattern_substitutions() {
-	let source = "import @/namespace_dep as dependency\nimport @/dep with (Choice as Selected, Box)\nfunc choose(choice: Selected<int>): int = match (choice) { Pick(value) -> value, Empty -> 0 }\nfunc unbox(box: Box<string>): string = match (box) { Box(value) -> value }\nfunc make(): Selected<int> = Selected.Pick(value = 1)\nfunc through_namespace(): Box<int> = dependency.make_box()";
+	let source = "import @/namespace_dep as dependency\nimport @/dep with (Choice as Selected, Box)\nfunc choose(choice: Selected<int>): int = match (choice) { Pick(value) -> value, Empty -> 0 }\nfunc unbox(box: Box<string>): string = match (box) { Box(value = value) -> value }\nfunc make(): Selected<int> = Selected.Pick(value = 1)\nfunc through_namespace(): Box<int> = dependency.make_box()";
 	let files = FxHashMap::from_iter([
 		("main", source),
 		(
@@ -109,7 +109,7 @@ fn module_analysis_type_at_renders_imported_constructors_and_pattern_substitutio
 	for (needle, delta, expected) in [
 		("Pick(value) ->", 1, "Choice.Pick(value: T)"),
 		("Pick(value) ->", "Pick(".len(), "int"),
-		("Box(value) ->", "Box(".len(), "string"),
+		("Box(value = value) ->", "Box(value = ".len(), "string"),
 		(
 			"Selected.Pick(value = 1)",
 			"Selected.".len() + 1,
@@ -147,7 +147,7 @@ fn session_checks_and_compiles_a_representative_project() {
 		.unwrap();
 	assert_eq!(compiled.entry_main, "main");
 	assert_eq!(compiled.entry_symbol("value"), "$m1$value");
-	assert!(compiled.js.contains("function main"));
+	assert!(compiled.js.contains("let main = nymphCallable(function("));
 }
 
 fn assert_session_emission(files: &FxHashMap<&str, &str>) {

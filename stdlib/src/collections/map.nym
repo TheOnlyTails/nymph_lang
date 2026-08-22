@@ -1,28 +1,17 @@
 import @/option with (Option)
-import @/ops with (Plus, Contains, Hash)
+import @/ops with (Plus, Contains)
 import @/iter with (Iterator)
-import @/iter/iterable with (Iterable)
+import @/iter/iterable with (Iterable, ListIter)
 
-impl<K: Hash, V> mut #{K: V} {
+impl<K, V> #{K: V} {
   external(size) func size(): uint
   external(get) func get(key: K): Option<V>
-  external(insert) func insert(key: K, value: V): boolean
-  external(remove) func remove(key: K): Option<V>
-  external(clear) func clear(): void
-  func get_or_insert(key: K, default: V): V = match (this.get(key)) {
-    Some(value) -> value,
-    None -> {
-      this.insert(key, default)
-      default
-    },
-  }
+  /// Returns a map containing `key` without changing this map.
+  external(inserted) func inserted(key: K, value: V): #{K: V}
 
-  /// Returns `true` if the map contains no entries.
-  func is_empty(): boolean = this.size() == 0
-  func is_not_empty(): boolean = !this.is_empty()
-}
+  /// Returns a map without `key`, without changing this map.
+  external(removed) func removed(key: K): #{K: V}
 
-impl<K: Hash, V> #{K: V} {
   /// Returns `true` if the map contains the given key.
   func contains_key(key: K): boolean = match (this.get(key)) {
     Some(_) -> true,
@@ -37,25 +26,22 @@ impl<K: Hash, V> #{K: V} {
 
   /// Returns a list of all key-value pairs as tuples.
   external(entries) func entries(): #[#(K, V)]
+
+  func is_empty(): boolean = this.size() == 0
+  func is_not_empty(): boolean = !this.is_empty()
 }
 
-impl<K: Hash, V> Plus<Other = self, Output = self> for #{K: V} {
-  func plus(other: self): self = {
-    let mut result: #{K: V} = #{}
-    for (#(key, value) in this.entries()) {
-      result.insert(key, value)
-    }
-    for (#(key, value) in other.entries()) {
-      result.insert(key, value)
-    }
-    result
-  }
+impl<K, V> Plus<Other = self, Output = self> for #{K: V} {
+  func plus(other: self): self = other.entries().iter().fold(
+    this,
+    (result, entry) -> result.inserted(entry[0], entry[1]),
+  )
 }
 
-impl<K: Hash, V> Contains<Item = K> for #{K: V} {
+impl<K, V> Contains<Item = K> for #{K: V} {
   func contains(item: K): boolean = this.contains_key(item)
 }
 
-impl<K: Hash, V> Iterable<#(K, V)> for #{K: V} {
-  func iter(): Iterator<#(K, V)> = this.entries().iter()
+impl<K, V> Iterable<#(K, V)> for #{K: V} {
+  func iter(): ListIter<#(K, V)> = this.entries().iter()
 }

@@ -280,7 +280,7 @@ fn every_doc_sample_is_covered() {
 	let started = Instant::now();
 	let docs_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
 	assert!(docs_dir.is_dir(), "expected {docs_dir:?} to exist");
-	let mut session = CompilerSession::without_builtin_sources();
+	let mut session = CompilerSession::new();
 	let mut session_count = 1;
 
 	let mut md_files = Vec::new();
@@ -301,7 +301,7 @@ fn every_doc_sample_is_covered() {
 			if sample_index > 0 && sample_index % SAMPLES_PER_SESSION == 0 {
 				// Bound retained incremental state while still amortizing ambient-core
 				// analysis across a useful, deterministic fixture scope.
-				session = CompilerSession::without_builtin_sources();
+				session = CompilerSession::new();
 				session_count += 1;
 			}
 			if fence.body.lines().any(has_error_marker) {
@@ -309,8 +309,16 @@ fn every_doc_sample_is_covered() {
 			} else {
 				clean_count += 1;
 			}
-			if let Err(reason) = check_fence(&mut session, sample_index, file, &fence) {
-				failures.push(reason);
+			match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+				check_fence(&mut session, sample_index, file, &fence)
+			})) {
+				Ok(Ok(())) => {}
+				Ok(Err(reason)) => failures.push(reason),
+				Err(_) => failures.push(format!(
+					"{}:{}: compiler panicked while checking this sample",
+					file.display(),
+					fence.line
+				)),
 			}
 			sample_index += 1;
 		}
@@ -336,6 +344,50 @@ fn every_doc_sample_is_covered() {
 		failures.len(),
 		clean_count + error_marked_count,
 		failures.join("\n\n")
+	);
+}
+
+/// Runtime-visible claims in the public tour/reference get a bounded emit +
+/// Node check in addition to the data-driven type-check sweep above.
+#[test]
+fn selected_public_doc_claims_emit_and_run() {
+	let source = r#"
+public struct Secret(public shown: int, private hidden: int)
+public func inspect(value: Secret): Secret = echo value
+public func secret(): Secret = Secret(shown = 1, hidden = 2)
+public func sum_to(limit: int): int = loop (let next = 1, let total = 0) {
+	if (next > limit) { break total }
+	continue(next = next + 1, total = total + next)
+}
+"#;
+	let mut js = nymph_compiler::compile(source, "docs/runtime_claims.nym")
+		.unwrap_or_else(|diagnostics| panic!("selected docs sample failed to emit: {diagnostics:?}"));
+	assert!(
+		js.contains("nymphEcho"),
+		"development emission must retain the echo observer"
+	);
+	js.push_str(
+		"\nconst value = secret();\n\
+		 const same = inspect(value) === value;\n\
+		 console.log(`${same} ${sum_to(new NInt(4n)).v}`);\n",
+	);
+	let path = std::env::temp_dir().join(format!("nymph_docs_samples_{}.mjs", std::process::id()));
+	std::fs::write(&path, js).expect("write selected docs Node fixture");
+	let output = std::process::Command::new("node")
+		.arg(&path)
+		.output()
+		.expect("run selected docs sample under Node");
+	let _ = std::fs::remove_file(path);
+	assert!(
+		output.status.success(),
+		"Node failed: {}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "true 10");
+	assert!(
+		String::from_utf8_lossy(&output.stderr).contains("Secret(shown: 1, hidden: 2)"),
+		"echo must render private fields: {}",
+		String::from_utf8_lossy(&output.stderr)
 	);
 }
 

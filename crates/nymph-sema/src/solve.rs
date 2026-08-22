@@ -69,12 +69,10 @@ impl Checker<'_> {
 		name: &str,
 		span: Span,
 	) -> Option<MethodResolution> {
-		let resolved = self.shallow_resolve(recv);
-		let receiver_is_mut = matches!(self.interner.kind(resolved), TyKind::Mut(_));
-		let receiver = self.strip_mut(resolved);
+		let receiver = self.shallow_resolve(recv);
 
 		if let Some((params, ty, target, implementation, type_arguments)) =
-			self.resolve_inherent_value(receiver, receiver_is_mut, name, span)
+			self.resolve_inherent_value(receiver, name, span)
 		{
 			let resolved_target =
 				target
@@ -98,8 +96,7 @@ impl Checker<'_> {
 		}
 
 		if let TyKind::Param(parameter) = *self.interner.kind(receiver)
-			&& let Some(resolution) =
-				self.resolve_param_method_value(parameter, receiver_is_mut, name, span)
+			&& let Some(resolution) = self.resolve_param_method_value(parameter, name, span)
 		{
 			return Some(resolution);
 		}
@@ -121,7 +118,7 @@ impl Checker<'_> {
 		let mut receiver_matches = Vec::new();
 		for index in candidates {
 			let snapshot = self.table.snapshot();
-			let matched = self.method_matches_receiver(index, receiver, receiver_is_mut);
+			let matched = self.method_matches_receiver(index, receiver);
 			self.table.rollback_to(snapshot);
 			if matched {
 				receiver_matches.push(index);
@@ -136,19 +133,12 @@ impl Checker<'_> {
 				return Some(self.error_method_resolution());
 			}
 		};
-		self.gate_mutating(
-			self.impls.impls[index].interface,
-			name,
-			receiver_is_mut,
-			span,
-		);
 		Some(self.commit_method(index, receiver, name, None, span))
 	}
 
 	fn resolve_param_method_value(
 		&mut self,
 		parameter: ParamIdx,
-		receiver_is_mut: bool,
 		name: &str,
 		span: Span,
 	) -> Option<MethodResolution> {
@@ -168,7 +158,6 @@ impl Checker<'_> {
 			return Some(self.error_method_resolution());
 		}
 		let (interface, bound_args, definition, method) = candidates.pop()?;
-		self.gate_mutating(interface, name, receiver_is_mut, span);
 		let mut substitution = FxHashMap::default();
 		for (index, generic) in definition.generics.iter().enumerate() {
 			let ty = bound_args
@@ -264,63 +253,11 @@ impl Checker<'_> {
 			.map(|(_, ty)| ty)
 	}
 
-	/// emit [`TypeError::MutMethodNeedsMutReceiver`] if `interface`'s
-	/// OWN declared kind for `name` (the source of truth — an impl's restatement
-	/// is checked to MATCH it at collection time, `iface.rs`'s check) is
-	/// `mut func`, but the receiver the caller actually wrote wasn't `mut`. The
-	/// single gate every method-resolution path in `resolve_method` calls,
-	/// keyed by whichever interface actually provided the resolved method.
-	pub(crate) fn gate_mutating(
-		&mut self,
-		interface: DefId,
-		name: &str,
-		recv_is_mut: bool,
-		span: Span,
-	) {
-		let mutating = self
-			.interfaces
-			.get(&interface)
-			.and_then(|i| i.methods.get(name))
-			.is_some_and(|m| m.mutating);
-		if mutating && !recv_is_mut {
-			self.emit(
-				span,
-				TypeError::MutMethodNeedsMutReceiver {
-					method: name.into(),
-				},
-			);
-		}
-	}
-
 	/// Does `self_ty` implement `interface`, with the given known argument bindings?
 	/// Existence only — used for winnowing an impl's constraints.
 	pub(crate) fn holds(
 		&mut self,
 		self_ty: Ty,
-		interface: DefId,
-		known: &[(EcoString, Ty)],
-		depth: u32,
-	) -> bool {
-		self.holds_self(self_ty, false, interface, known, depth)
-	}
-
-	/// [`Self::holds`], additionally honoring a `Mut` impl self type
-	/// (`impl A for mut B` / `impl mut A for B`) the same way method resolution's
-	/// `try_unify_self` does: `self_is_mut` records whether the caller's argument
-	/// was actually written `mut`, and `try_impl` peels a `Mut` impl self type one
-	/// way against `self_ty`, requiring `self_is_mut` for that match — WITHOUT
-	/// requiring `self_ty` itself to be wrapped in `Mut` (unlike a plain
-	/// `try_unify(self_ty, impl_self)`, which only has a `(Mut, Mut)` arm and so
-	/// can't match `self_ty` against a plain impl once `self_ty` is `Mut`-wrapped;
-	/// see `finalize_pending_bounds`'s doc comment). `self_ty` is always passed
-	/// as the plain (un-wrapped) resolved type: a `mut` argument still satisfies
-	/// an ordinary, non-mut-specific bound one-way, same as the `mut T <: T`
-	/// subtype rule everywhere else — a mut-only impl is an ADDITIONAL match,
-	/// never a replacement for that.
-	pub(crate) fn holds_self(
-		&mut self,
-		self_ty: Ty,
-		self_is_mut: bool,
 		interface: DefId,
 		known: &[(EcoString, Ty)],
 		depth: u32,
@@ -362,7 +299,7 @@ impl Checker<'_> {
 		let head = head_of(&self.interner, resolved);
 		for idx in self.impls.candidates(interface, head) {
 			let snapshot = self.table.snapshot();
-			let matched = self.try_impl(idx, self_ty, self_is_mut, known, depth);
+			let matched = self.try_impl(idx, self_ty, known, depth);
 			self.table.rollback_to(snapshot);
 			if matched {
 				return true;
@@ -373,19 +310,15 @@ impl Checker<'_> {
 
 	/// Trial: can impl `idx` satisfy the obligation `self_ty: interface<known>`?
 	/// Binds inference variables (the caller controls rollback).
-	fn try_impl(
-		&mut self,
-		idx: usize,
-		self_ty: Ty,
-		self_is_mut: bool,
-		known: &[(EcoString, Ty)],
-		depth: u32,
-	) -> bool {
+	fn try_impl(&mut self, idx: usize, self_ty: Ty, known: &[(EcoString, Ty)], depth: u32) -> bool {
+		if !self.structural_blanket_allows(idx, self_ty, depth) {
+			return false;
+		}
 		let def = self.impls.impls[idx].clone();
 		let inst = self.instantiate_impl_scheme(&def);
 		let subst = inst.substitution;
 		let impl_self = inst.ty;
-		if !self.try_unify_self(self_ty, impl_self, self_is_mut) {
+		if !self.try_unify(self_ty, impl_self) {
 			return false;
 		}
 		let impl_args: Vec<(EcoString, Ty)> = def
@@ -405,27 +338,14 @@ impl Checker<'_> {
 
 	/// Does `self_ty` implement `interface`, and if so what is it bound to for
 	/// the interface argument named `arg_name` (e.g. `"Item"` for
-	/// `Iterator<Item>`, `"T"` for `Iterable<T>`)? Unlike `holds`/`holds_self`
-	/// (existence only — every trial rolls back so no candidate ever leaves a
-	/// binding behind), a caller here needs the ACTUAL type argument a still-
-	/// generic impl bound during unification, so the first matching candidate's
-	/// bindings are committed rather than rolled back (only failed candidates
-	/// roll back, so a failed trial never leaks bindings the caller didn't ask
-	/// for). Assumes single-impl coherence, same as every other call site in
-	/// this module: the first matching candidate wins.
-	///
-	/// `self_ty` is the PEELED (non-`mut`) type, same convention `holds`/
-	/// `resolve_method` use throughout; `self_is_mut` carries whether the
-	/// caller's value was actually written `mut` (mirrors `resolve_method`'s own
-	/// `recv_is_mut`), so an impl reachable only through the mutable view (`impl
-	/// A for mut B` / `impl mut A for B`, — the only way an
-	/// `Iterator`/`Iterable` impl can mutate `this` inside its own body, since
-	/// `check_method_body` binds `this: mut Self` only for a `mut func`) still
-	/// matches correctly rather than being permanently unreachable.
+	/// `Iterator<Item>`, `"T"` for `Iterable<T>`)? Unlike `holds` (existence only —
+	/// every trial rolls back so no candidate leaves a binding behind), this keeps
+	/// the type argument bound by the first matching generic impl. Failed candidates
+	/// roll back, so they cannot leak bindings. Assumes single-impl coherence, as do
+	/// the other call sites in this module.
 	pub(crate) fn resolve_iface_arg_with_implementation(
 		&mut self,
 		self_ty: Ty,
-		self_is_mut: bool,
 		interface: DefId,
 		arg_name: &str,
 		depth: u32,
@@ -437,7 +357,7 @@ impl Checker<'_> {
 		let head = head_of(&self.interner, resolved);
 		for idx in self.impls.candidates(interface, head) {
 			let snapshot = self.table.snapshot();
-			match self.try_impl_arg(idx, self_ty, self_is_mut, arg_name, depth) {
+			match self.try_impl_arg(idx, self_ty, arg_name, depth) {
 				Some(ty) => return Some((ty, idx)),
 				None => self.table.rollback_to(snapshot),
 			}
@@ -449,19 +369,15 @@ impl Checker<'_> {
 	/// returns the impl's substituted binding for `arg_name` instead of a bare
 	/// `bool`. Leaves the unification bindings live on success (caller commits);
 	/// the caller rolls back on `None`.
-	fn try_impl_arg(
-		&mut self,
-		idx: usize,
-		self_ty: Ty,
-		self_is_mut: bool,
-		arg_name: &str,
-		depth: u32,
-	) -> Option<Ty> {
+	fn try_impl_arg(&mut self, idx: usize, self_ty: Ty, arg_name: &str, depth: u32) -> Option<Ty> {
+		if !self.structural_blanket_allows(idx, self_ty, depth) {
+			return None;
+		}
 		let def = self.impls.impls[idx].clone();
 		let inst = self.instantiate_impl_scheme(&def);
 		let subst = inst.substitution;
 		let impl_self = inst.ty;
-		if !self.try_unify_self(self_ty, impl_self, self_is_mut) {
+		if !self.try_unify(self_ty, impl_self) {
 			return None;
 		}
 		if !self.instantiated_constraints_hold(&inst.obligations, depth) {
@@ -482,6 +398,142 @@ impl Checker<'_> {
 		constraints
 			.iter()
 			.all(|bound| self.holds(bound.ty, bound.interface, &bound.args, depth + 1))
+	}
+
+	fn structural_blanket_capability(&self, index: usize) -> Option<bool> {
+		let implementation = &self.impls.impls[index];
+		if !implementation.blanket {
+			return None;
+		}
+		let interface = self.defs.data(implementation.interface);
+		if !implementation
+			.runtime_members
+			.iter()
+			.any(|member| member.external)
+		{
+			return None;
+		}
+		match interface.name.as_str() {
+			"Equals" => Some(false),
+			"Hash" => Some(true),
+			_ => None,
+		}
+	}
+
+	fn structural_blanket_allows(&mut self, index: usize, ty: Ty, depth: u32) -> bool {
+		let Some(hash) = self.structural_blanket_capability(index) else {
+			return true;
+		};
+		self.structural_capability_holds(ty, hash, depth, &mut rustc_hash::FxHashSet::default())
+	}
+
+	fn structural_capability_holds(
+		&mut self,
+		ty: Ty,
+		hash: bool,
+		depth: u32,
+		seen: &mut rustc_hash::FxHashSet<(Ty, bool)>,
+	) -> bool {
+		if depth > MAX_DEPTH {
+			return false;
+		}
+		let ty = self.shallow_resolve(ty);
+		if !seen.insert((ty, hash)) {
+			return true;
+		}
+
+		if self.explicit_capability_holds(ty, hash, depth) {
+			return true;
+		}
+		if hash
+			&& matches!(self.interner.kind(ty), TyKind::Adt(..))
+			&& self.explicit_capability_holds(ty, false, depth)
+		{
+			return false;
+		}
+
+		let child =
+			|checker: &mut Self, child_ty, child_hash, seen: &mut rustc_hash::FxHashSet<(Ty, bool)>| {
+				checker.structural_capability_holds(child_ty, child_hash, depth + 1, seen)
+			};
+		match self.interner.kind(ty).clone() {
+			TyKind::Int
+			| TyKind::UInt
+			| TyKind::Char
+			| TyKind::String
+			| TyKind::Boolean
+			| TyKind::Void
+			| TyKind::Never => true,
+			TyKind::Float
+			| TyKind::Fn { .. }
+			| TyKind::Task { .. }
+			| TyKind::Handle(_)
+			| TyKind::HandleOutcome(_) => false,
+			TyKind::List(item) => child(self, item, hash, seen),
+			TyKind::Tuple(items) => items.into_iter().all(|item| child(self, item, hash, seen)),
+			TyKind::Map(key, value) => child(self, key, true, seen) && child(self, value, hash, seen),
+			TyKind::Adt(definition, arguments) => {
+				let mut substitution = FxHashMap::default();
+				for (index, argument) in arguments.positional.into_iter().enumerate() {
+					substitution.insert(ParamIdx(index as u32), argument);
+				}
+				let fields = match self.defs.data(definition).kind {
+					crate::DefKind::Struct => self.sigs.structs[&definition]
+						.fields
+						.iter()
+						.map(|(_, field)| *field)
+						.collect::<Vec<_>>(),
+					crate::DefKind::Enum => self.sigs.enums[&definition]
+						.variants
+						.iter()
+						.flat_map(|variant| variant.fields.iter().map(|(_, field)| *field))
+						.collect(),
+					_ => return false,
+				};
+				fields.into_iter().all(|field| {
+					let field = self.subst(field, &substitution, None);
+					child(self, field, hash, seen)
+				})
+			}
+			TyKind::Param(parameter) => {
+				self
+					.param_interface_bounds(parameter)
+					.into_iter()
+					.any(|(interface, _)| {
+						let name = self.defs.data(interface).name.as_str();
+						name == if hash { "Hash" } else { "Equals" } || (!hash && name == "Hash")
+					})
+			}
+			TyKind::Error => true,
+			TyKind::Infer(_) | TyKind::SelfTy | TyKind::Intersection(_) => false,
+		}
+	}
+
+	fn explicit_capability_holds(&mut self, ty: Ty, hash: bool, depth: u32) -> bool {
+		let interface_name = if hash { "Hash" } else { "Equals" };
+		let equals_args = [(EcoString::from("Other"), ty)];
+		let known = if hash { &[][..] } else { &equals_args };
+		let interfaces = self
+			.interfaces
+			.keys()
+			.copied()
+			.filter(|interface| self.defs.data(*interface).name == interface_name)
+			.collect::<Vec<_>>();
+		let head = head_of(&self.interner, ty);
+		for interface in interfaces {
+			for index in self.impls.candidates(interface, head) {
+				if self.structural_blanket_capability(index).is_some() {
+					continue;
+				}
+				let snapshot = self.table.snapshot();
+				let matched = self.try_impl(index, ty, known, depth + 1);
+				self.table.rollback_to(snapshot);
+				if matched {
+					return true;
+				}
+			}
+		}
+		false
 	}
 
 	fn instantiate_impl_scheme(
@@ -758,8 +810,8 @@ impl Checker<'_> {
 		// a `mut`-receiver call finds both applicable and falls through to a
 		// confusing `AmbiguousCall`. Without the peel, `try_unify(B, Mut(B))` fails
 		// (it has only a `(Mut, Mut)` arm) and the conflict slips through.
-		let a_self = self.strip_mut(a_inst.ty);
-		let b_self = self.strip_mut(b_inst.ty);
+		let a_self = self.shallow_resolve(a_inst.ty);
+		let b_self = self.shallow_resolve(b_inst.ty);
 		let mut overlap = self.try_unify(a_self, b_self);
 		if overlap {
 			for (name, a_ty) in &a.args {
@@ -794,25 +846,7 @@ impl Checker<'_> {
 		arg_lits: &[bool],
 		span: Span,
 	) -> Option<MethodResolution> {
-		// Captured BEFORE the peel below erases it: whether the receiver, as the
-		// caller actually wrote it, is `mut`. A concrete `mut B`
-		// receiver, or a `mut T` bound parameter (which lowers to
-		// `TyKind::Mut(Param(idx))`), both read `true` here; a plain `B` or bare
-		// `T` param reads `false`. This is the single flag every `mut func`
-		// call-site gate below consults — see `mutating_gate`.
-		let recv_resolved = self.shallow_resolve(recv);
-		let recv_is_mut = matches!(self.interner.kind(recv_resolved), TyKind::Mut(_));
-
-		// A `mut` receiver dispatches exactly like its inner type — `mut` is
-		// transparent to method/impl resolution (mirrors `head_of`'s own peel);
-		// every impl's `Self` type is never itself `mut`, so unifying an unpeeled
-		// `mut Adt` receiver against it would spuriously mismatch. Peeled once
-		// here, at entry, covers every downstream use in this function
-		// (`resolve_inherent`, `method_matches_receiver`, `commit_method`, …).
-		// Method resolution/matching against a `Mut`-self-type impl
-		// still needs the real receiver mutability, which is why `recv_is_mut`
-		// was captured above rather than derived from this peeled `recv`.
-		let recv = self.strip_mut(recv);
+		let recv = self.shallow_resolve(recv);
 
 		// While checking an interface's own default-method body, `this`
 		// is bound to a rigid synthetic `Param` so the body checks once, generically,
@@ -838,10 +872,6 @@ impl Checker<'_> {
 				.and_then(|i| i.methods.get(name))
 				.cloned()
 		{
-			// gate: the default body of one interface method calling another
-			// (`mut func`) method of the same interface on `this` needs `this` to
-			// be `mut` too — mirrors every other call-site gate below.
-			self.gate_mutating(iface_id, name, recv_is_mut, span);
 			let owner_generics = self.interfaces[&iface_id].generics.len();
 			let (params, ret, type_arguments) = self.instantiate_iface_method_signature(
 				&method,
@@ -901,7 +931,7 @@ impl Checker<'_> {
 
 		// Inherent methods take priority over interface methods.
 		if let Some((params, ret, target, implementation, type_arguments)) =
-			self.resolve_matching_inherent(recv, recv_is_mut, name, arg_tys, arg_lits, span)
+			self.resolve_matching_inherent(recv, name, arg_tys, arg_lits, span)
 		{
 			let resolved_target =
 				target
@@ -942,10 +972,6 @@ impl Checker<'_> {
 			&& let Some((ty, iface_def, params, type_arguments)) =
 				self.resolve_param_method(idx, name, arg_tys, arg_lits, span)
 		{
-			// gate: `x.method` where `x: T` (or `x: mut T`) and `T: A`
-			// resolved `method` through `A`'s bound — same gate as everywhere
-			// else, keyed off the interface the bound was satisfied through.
-			self.gate_mutating(iface_def, name, recv_is_mut, span);
 			let target = self.interfaces[&iface_def].methods[name].definition.clone();
 			let resolved_target = self
 				.defs
@@ -989,7 +1015,7 @@ impl Checker<'_> {
 		let mut receiver_matches: Vec<usize> = Vec::new();
 		for idx in candidates {
 			let snapshot = self.table.snapshot();
-			let matched = self.method_matches_receiver(idx, recv, recv_is_mut);
+			let matched = self.method_matches_receiver(idx, recv);
 			self.table.rollback_to(snapshot);
 			if matched {
 				receiver_matches.push(idx);
@@ -1003,7 +1029,7 @@ impl Checker<'_> {
 			// inherent method whose arguments did not fit; it was skipped above only
 			// to give a viable interface overload the opportunity to resolve.
 			if let Some((params, ret, target, implementation, type_arguments)) =
-				self.resolve_inherent(recv, recv_is_mut, name, arg_tys, arg_lits, span)
+				self.resolve_inherent(recv, name, arg_tys, arg_lits, span)
 			{
 				let resolved_target =
 					target
@@ -1031,12 +1057,6 @@ impl Checker<'_> {
 		// The overwhelmingly common case: exactly one impl matches the receiver, so
 		// commit it directly without argument disambiguation.
 		if receiver_matches.len() == 1 {
-			self.gate_mutating(
-				self.impls.impls[receiver_matches[0]].interface,
-				name,
-				recv_is_mut,
-				span,
-			);
 			return Some(self.commit_method(
 				receiver_matches[0],
 				recv,
@@ -1053,7 +1073,7 @@ impl Checker<'_> {
 		// blanket `Equals<Other = self>` rather than committing the cross-type
 		// `Equals<Other = uint> for int` and then mismatching the `int` argument.
 		// Each surviving candidate is tagged with whether it matched only via numeric
-		// widening (`int` literal → `uint`/`float`, or `uint` → `int`); an exact-type match is
+		// literal widening (`int` literal → `uint`/`float`); an exact-type match is
 		// strictly more specific, so if any candidate matches exactly, the widened ones
 		// are dropped, and `most_specific` (concrete over blanket) breaks any remaining
 		// tie. This keeps `a.plus(2)` (a: int) resolving to `Plus<Other = int> for int`
@@ -1062,7 +1082,7 @@ impl Checker<'_> {
 		let mut arg_matches: Vec<(usize, bool)> = Vec::new();
 		for &idx in &receiver_matches {
 			let snapshot = self.table.snapshot();
-			let matched = self.try_method(idx, recv, recv_is_mut, name, arg_tys, arg_lits);
+			let matched = self.try_method(idx, recv, name, arg_tys, arg_lits);
 			self.table.rollback_to(snapshot);
 			if let Some((_, widened)) = matched {
 				arg_matches.push((idx, widened));
@@ -1096,15 +1116,7 @@ impl Checker<'_> {
 					resolved_target: None,
 				})
 			}
-			1 => {
-				self.gate_mutating(
-					self.impls.impls[chosen[0]].interface,
-					name,
-					recv_is_mut,
-					span,
-				);
-				Some(self.commit_method(chosen[0], recv, name, Some((arg_tys, arg_lits)), span))
-			}
+			1 => Some(self.commit_method(chosen[0], recv, name, Some((arg_tys, arg_lits)), span)),
 			_ => {
 				self.emit(span, TypeError::AmbiguousCall { name: name.into() });
 				Some(MethodResolution {
@@ -1150,42 +1162,20 @@ impl Checker<'_> {
 		}
 	}
 
-	/// Trial-unify a receiver against an impl's (subst'ed) self type, honoring a
-	/// `Mut` self type (`impl A for mut B` / `impl mut A for B`,
-	/// normalized to a `Mut` self type at collection — `iface.rs`). Such an impl
-	/// matches ONLY a receiver the caller actually wrote as `mut`: without this,
-	/// `recv` (already `strip_mut`-peeled, like every other receiver use in this
-	/// file) would unify against a `Mut(B)` self type and always fail — the
-	/// "dead impl" bug (`try_unify`'s only `Mut` arm is `(Mut, Mut)`) — for
-	/// *every* receiver, mut or not, since the peel already stripped the tag
-	/// `try_unify` would need to see. `recv_is_mut` supplies that original
-	/// mutability, captured once at `resolve_method`'s entry.
-	fn try_unify_self(&mut self, recv: Ty, impl_self: Ty, recv_is_mut: bool) -> bool {
-		match self.interner.kind(impl_self) {
-			&TyKind::Mut(inner) => recv_is_mut && self.try_unify(recv, inner),
-			_ => self.try_unify(recv, impl_self),
-		}
-	}
-
-	/// Non-trial counterpart of [`Self::try_unify_self`], for `commit_method`:
-	/// only ever reached after `method_matches_receiver` already confirmed the
-	/// receiver's mutability matches, so no `recv_is_mut` check is needed here —
-	/// just the same `Mut` self-type peel so the real unification (which emits
-	/// diagnostics on failure) compares the right pair of types.
+	/// Non-trial receiver unification for `commit_method`.
 	fn unify_self(&mut self, recv: Ty, impl_self: Ty, span: Span) {
-		match self.interner.kind(impl_self) {
-			&TyKind::Mut(inner) => self.unify(recv, inner, span),
-			_ => self.unify(recv, impl_self, span),
-		}
+		self.unify(recv, impl_self, span);
 	}
 
 	/// Does impl `idx`'s receiver type (and its constraints) match `recv`?
-	fn method_matches_receiver(&mut self, idx: usize, recv: Ty, recv_is_mut: bool) -> bool {
+	fn method_matches_receiver(&mut self, idx: usize, recv: Ty) -> bool {
+		if !self.structural_blanket_allows(idx, recv, 0) {
+			return false;
+		}
 		let def = self.impls.impls[idx].clone();
 		let inst = self.instantiate_impl_scheme(&def);
 		let impl_self = inst.ty;
-		self.try_unify_self(recv, impl_self, recv_is_mut)
-			&& self.instantiated_constraints_hold(&inst.obligations, 0)
+		self.try_unify(recv, impl_self) && self.instantiated_constraints_hold(&inst.obligations, 0)
 	}
 
 	/// Trial (arg-aware): does impl `idx` provide `name` applicable to `recv(args)`?
@@ -1197,17 +1187,18 @@ impl Checker<'_> {
 		&mut self,
 		idx: usize,
 		recv: Ty,
-		recv_is_mut: bool,
 		name: &str,
 		arg_tys: &[Ty],
 		arg_lits: &[bool],
 	) -> Option<(Ty, bool)> {
+		if !self.structural_blanket_allows(idx, recv, 0) {
+			return None;
+		}
 		let def = self.impls.impls[idx].clone();
 		let inst = self.instantiate_impl_scheme(&def);
 		let subst = inst.substitution;
 		let impl_self = inst.ty;
-		if !self.try_unify_self(recv, impl_self, recv_is_mut)
-			|| !self.instantiated_constraints_hold(&inst.obligations, 0)
+		if !self.try_unify(recv, impl_self) || !self.instantiated_constraints_hold(&inst.obligations, 0)
 		{
 			return None;
 		}
@@ -1474,6 +1465,7 @@ impl Checker<'_> {
 					ty,
 					interface: bound.interface,
 					args,
+					effect_args: bound.effect_args,
 				});
 		}
 		ty

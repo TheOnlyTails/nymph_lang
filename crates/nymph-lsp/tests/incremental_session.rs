@@ -177,7 +177,7 @@ fn project_completion_uses_resolved_imports_ranking_kinds_and_shadowing() {
 			.iter()
 			.position(|label| *label == "z_local_top")
 			.unwrap()
-			< labels.iter().position(|label| *label == "while").unwrap()
+			< labels.iter().position(|label| *label == "loop").unwrap()
 	);
 	let mut client_sorted = items.clone();
 	client_sorted.sort_by(|left, right| {
@@ -204,7 +204,58 @@ fn project_completion_uses_resolved_imports_ranking_kinds_and_shadowing() {
 }
 
 #[test]
-fn project_completion_matches_variant_precedence_ambiguity_and_mutability() {
+fn effect_syntax_participates_in_completion_hover_and_semantic_tokens() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='effect-tooling'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let source = "effect Io\nfunc marker(): void = {}\nfunc apply<!E>(callback: () -> void + !E): !Io + !E = callback()\nfunc use(): !Io = apply(marker)\n";
+	let path = temp.path().join("src/main.nym");
+	fs::write(&path, source).unwrap();
+	let uri = uri(&path);
+	let mut compiler = CompilerState::default();
+	let mut docs = DocumentStore::default();
+	compiler
+		.open(&mut docs, uri.clone(), source.into(), 1)
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &uri)
+			.unwrap()
+			.is_empty()
+	);
+
+	let completions = completion_items(&compiler, &docs, &uri, 4, 0);
+	let effect = completions
+		.iter()
+		.find(|item| item.label == "Io")
+		.expect("effect completion");
+	assert_eq!(effect.kind, Some(lsp_types::CompletionItemKind::CLASS));
+
+	let hover = hover_needle(&compiler, &docs, &uri, source, "apply(marker)")
+		.expect("effectful callable hover");
+	assert!(hover.contains("!E"), "{hover}");
+	assert!(hover.contains("!Io"), "{hover}");
+
+	let declaration = semantic_token_at(&compiler, &docs, &uri, source, "Io\nfunc");
+	assert_eq!(declaration.token_type, 2);
+	assert_eq!(declaration.token_modifiers_bitset & 1, 1);
+	let nominal_reference = semantic_token_at(&compiler, &docs, &uri, source, "Io + !E");
+	assert_eq!(nominal_reference.token_type, 2);
+	assert_eq!(nominal_reference.token_modifiers_bitset & 1, 0);
+	let parameter_declaration = semantic_token_at(&compiler, &docs, &uri, source, "E>(callback");
+	assert_eq!(parameter_declaration.token_type, 2);
+	assert_eq!(parameter_declaration.token_modifiers_bitset & 1, 1);
+	let parameter_reference = semantic_token_at(&compiler, &docs, &uri, source, "E): !Io");
+	assert_eq!(parameter_reference.token_type, 2);
+	assert_eq!(parameter_reference.token_modifiers_bitset & 1, 0);
+}
+
+#[test]
+fn project_completion_matches_variant_precedence_and_ambiguity() {
 	let temp = tempfile::tempdir().unwrap();
 	fs::write(
 		temp.path().join("nymph.toml"),
@@ -217,7 +268,7 @@ fn project_completion_matches_variant_precedence_ambiguity_and_mutability() {
 	fs::write(&main_path, source).unwrap();
 	fs::write(
 		temp.path().join("src/first.nym"),
-		"public enum Remote { Unique, TopCollision, Ambiguous, LocalAmbiguous }\npublic let mut counter: int = 0",
+		"public enum Remote { Unique, TopCollision, Ambiguous, LocalAmbiguous }\npublic let counter: int = 0",
 	)
 	.unwrap();
 	fs::write(
@@ -254,7 +305,7 @@ fn project_completion_matches_variant_precedence_ambiguity_and_mutability() {
 		);
 	}
 	let counter = items.iter().find(|item| item.label == "counter").unwrap();
-	assert_eq!(counter.kind, Some(lsp_types::CompletionItemKind::VARIABLE));
+	assert_eq!(counter.kind, Some(lsp_types::CompletionItemKind::CONSTANT));
 }
 
 #[test]
@@ -392,7 +443,7 @@ fn project_member_completion_enforces_visibility_and_static_context() {
 	fs::write(&main_path, source).unwrap();
 	fs::write(
 		temp.path().join("src/dep.nym"),
-		"public struct Vault(public shown: int, private secret: int) {\n  public func read(): int = this.shown\n  private func erase(): int = 0\n  public namespace func make(value: int): Vault = Vault(shown = value, secret = 0)\n}\npublic namespace Tools {\n  public func run(value: int): string = \"\"\n  public let mut counter: int = 0\n  private func hidden(): int = 0\n}",
+		"public struct Vault(public shown: int, private secret: int) {\n  public func read(): int = this.shown\n  private func erase(): int = 0\n  public namespace func make(value: int): Vault = Vault(shown = value, secret = 0)\n}\npublic namespace Tools {\n  public func run(value: int): string = \"\"\n  public let counter: int = 0\n  private func hidden(): int = 0\n}",
 	)
 	.unwrap();
 	let main_uri = uri(&main_path);
@@ -415,7 +466,8 @@ fn project_member_completion_enforces_visibility_and_static_context() {
 			.iter()
 			.any(|item| matches!(item.label.as_str(), "secret" | "erase" | "make"))
 	);
-	let namespace_source = "import @/dep with (Vault, Tools)\nfunc inspect(): int = Tools.r";
+	let namespace_source = r"import @/dep with (Vault, Tools)
+func inspect(): int = Tools.r";
 	compiler
 		.change(&mut docs, &main_uri, namespace_source.into(), 2)
 		.unwrap();
@@ -637,6 +689,44 @@ fn semantic_token_type_at(
 }
 
 #[test]
+fn immutable_state_loops_participate_in_completion_hover_and_semantic_tokens() {
+	let temp = tempfile::tempdir().unwrap();
+	fs::write(
+		temp.path().join("nymph.toml"),
+		"[package]\nname='state-loop-tooling'\nversion='0.1.0'\n",
+	)
+	.unwrap();
+	fs::create_dir(temp.path().join("src")).unwrap();
+	let source = "func count(): int = loop (let value = 0) { if (value == 2) break value continue(value = value + 1) }\n";
+	let path = temp.path().join("src/main.nym");
+	fs::write(&path, source).unwrap();
+	let uri = uri(&path);
+	let mut compiler = CompilerState::default();
+	let mut docs = DocumentStore::default();
+	compiler
+		.open(&mut docs, uri.clone(), source.into(), 1)
+		.unwrap();
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &uri)
+			.unwrap()
+			.is_empty()
+	);
+
+	let completions = completion_items(&compiler, &docs, &uri, 1, 0);
+	assert!(completions.iter().any(|item| item.label == "loop"));
+	let declaration = semantic_token_at(&compiler, &docs, &uri, source, "value = 0");
+	assert_eq!(declaration.token_type, 5);
+	assert_eq!(declaration.token_modifiers_bitset, 3);
+	let replacement = semantic_token_at(&compiler, &docs, &uri, source, "value = value + 1");
+	assert_eq!(replacement.token_type, 5);
+	assert_eq!(replacement.token_modifiers_bitset, 0);
+	let hover = hover_needle(&compiler, &docs, &uri, source, "value = value + 1")
+		.expect("replacement name resolves to its state declaration");
+	assert!(hover.contains("int"), "{hover}");
+}
+
+#[test]
 fn unchanged_features_share_one_analysis_and_change_recomputes_once() {
 	let parse = Arc::new(AtomicUsize::new(0));
 	let check = Arc::new(AtomicUsize::new(0));
@@ -722,6 +812,70 @@ fn unchanged_features_share_one_analysis_and_change_recomputes_once() {
 	compiler.analysis_for_uri(&docs, &uri).unwrap();
 	assert_eq!(parse.load(Ordering::Relaxed), initial_parse_count + 1);
 	assert_eq!(check.load(Ordering::Relaxed), 2);
+}
+
+#[test]
+fn retained_async_edits_keep_hover_diagnostics_and_tokens_on_one_version() {
+	let mut compiler = CompilerState::default();
+	let mut docs = DocumentStore::default();
+	let uri: Uri = "file:///tmp/async-retained.nym".parse().unwrap();
+	let valid = "async func child(): Result<int, string> = Ok(value = 1)\n\
+		async func value() = {\n\
+		\tlet expected = child().await\n\
+		\tlet handle = child().spawn()\n\
+		\tlet observed = handle.await\n\
+		\tobserved\n\
+		}";
+	compiler
+		.open(&mut docs, uri.clone(), valid.into(), 1)
+		.unwrap();
+	let first = compiler.analysis_for_uri(&docs, &uri).unwrap();
+	assert_eq!(first.document_version, 1);
+	assert!(
+		hover_needle(&compiler, &docs, &uri, valid, "value()")
+			.unwrap()
+			.contains("async func value(): Result<Result<int, string>, HandleError>")
+	);
+	assert!(
+		hover_needle(&compiler, &docs, &uri, valid, "expected")
+			.unwrap()
+			.contains("Result<int, string>")
+	);
+	assert!(
+		hover_needle(&compiler, &docs, &uri, valid, "observed")
+			.unwrap()
+			.contains("Result<Result<int, string>, HandleError>")
+	);
+	assert_eq!(
+		semantic_token_type_at(&compiler, &docs, &uri, valid, "await"),
+		0,
+		"await must remain a keyword token"
+	);
+
+	let invalid = valid.replacen("async func value", "func value", 1);
+	compiler.change(&mut docs, &uri, invalid.into(), 2).unwrap();
+	let second = compiler.analysis_for_uri(&docs, &uri).unwrap();
+	assert_eq!(second.document_version, 2);
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &uri)
+			.unwrap()
+			.iter()
+			.any(|diagnostic| diagnostic
+				.diag
+				.message
+				.contains("only valid inside an async"))
+	);
+
+	compiler.change(&mut docs, &uri, valid.into(), 3).unwrap();
+	let third = compiler.analysis_for_uri(&docs, &uri).unwrap();
+	assert_eq!(third.document_version, 3);
+	assert!(
+		compiler
+			.diagnostics_for_uri(&docs, &uri)
+			.unwrap()
+			.is_empty()
+	);
 }
 
 #[test]
@@ -841,6 +995,7 @@ fn closing_dependency_overlay_restores_disk_hover_with_project_and_prelude_conte
 	);
 	let restored = compiler.analysis_for_uri(&docs, &main_uri).unwrap();
 	assert_eq!(overlay.project, restored.project);
+	assert_eq!(overlay.package, restored.package);
 	assert_eq!(overlay.module, restored.module);
 	assert!(!Arc::ptr_eq(&overlay.analysis, &restored.analysis));
 	assert_eq!(
@@ -1099,6 +1254,7 @@ fn loose_file_identity_is_stable_and_uses_library_mode() {
 		.unwrap();
 	let second = compiler.analysis_for_uri(&docs, &uri).unwrap();
 	assert_eq!(first.project, second.project);
+	assert_eq!(first.package, second.package);
 	assert!(
 		compiler
 			.diagnostics_for_uri(&docs, &uri)
@@ -1184,7 +1340,7 @@ fn project_semantic_tokens_use_imports_prelude_and_dependency_overlays() {
 	fs::create_dir(temp.path().join("src")).unwrap();
 	let main_path = temp.path().join("src/main.nym");
 	let dep_path = temp.path().join("src/dep.nym");
-	let source = "import @/dep as dependency with (Box as ImportedBox, Choice, Config, make as build, amount as imported_amount)\nfunc use(box: ImportedBox): Option<Choice> = Some(value = build(box))\nfunc choose(): Choice = Choice.One\nfunc read(box: ImportedBox): int = box.get() + box.value + Config.count + dependency.amount + imported_amount\nfunc construct(): ImportedBox = ImportedBox(value = 1)\nfunc static_construct(): ImportedBox = ImportedBox.create()\nfunc qualified_pattern(choice: Choice): int = match (choice) { Choice.One -> 1 }";
+	let source = "import @/dep as dependency with (Box as ImportedBox, Choice, Config, make as build, amount as imported_amount)\nfunc use(box: ImportedBox): Option<Choice> = Some(value = build(box))\nfunc choose(): Choice = Choice.One\nfunc read(box: ImportedBox): int = box.get() + box.value + Config.count + dependency.amount + imported_amount\nfunc construct(): ImportedBox = ImportedBox(value = 1)\nfunc static_construct(): ImportedBox = ImportedBox.create()\nfunc qualified_pattern(choice: Choice): int = match (choice) { Choice.One -> 1 }\nfunc destructure(box: ImportedBox): int = match (box) { ImportedBox(value = field) -> field }";
 	let dependency = "public struct Box(public value: int) { func get(): int = this.value namespace func create(): Box = Box(value = 1) }\npublic enum Choice { One }\npublic namespace Config { public let count = 1 }\npublic func make(box: Box): Choice = Choice.One\npublic let amount: int = 1";
 	fs::write(&main_path, source).unwrap();
 	fs::write(&dep_path, dependency).unwrap();
@@ -1283,6 +1439,12 @@ fn project_semantic_tokens_use_imports_prelude_and_dependency_overlays() {
 		semantic_token_type_at(&compiler, &docs, &main_uri, source, "Choice.One ->"),
 		2
 	);
+	let field_binding = semantic_token_at(&compiler, &docs, &main_uri, source, "field) ->");
+	assert_eq!(field_binding.token_type, 5);
+	assert_eq!(field_binding.token_modifiers_bitset, 3);
+	let field_use = semantic_token_at(&compiler, &docs, &main_uri, source, "field }");
+	assert_eq!(field_use.token_type, 5);
+	assert_eq!(field_use.token_modifiers_bitset, 0);
 	assert_eq!(
 		semantic_token_type_at(&compiler, &docs, &main_uri, source, "One ->"),
 		8

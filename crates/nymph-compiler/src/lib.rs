@@ -37,13 +37,19 @@ pub use project::documentation::{
 	StaticDocSite, document_project, document_project_with_std,
 };
 pub use project::{
-	AmbientCoreModuleKey, BuiltinRuntimeOwnerArtifact, BuiltinRuntimeOwnerShape, CompiledProject,
-	CompilerSession, ModuleAnalysis, ModulePath, ProjectDiagnostic, ProjectId, ReplInputStatus,
+	AmbientCoreModuleKey, BuildProfile, BuiltinRuntimeOwnerArtifact, BuiltinRuntimeOwnerShape,
+	CompiledEntryRoot, CompiledProject, CompilerOptions, CompilerSession, LintLevel, ModuleAnalysis,
+	ModulePath, PackageGraphError, PackageId, ProjectDiagnostic, ProjectId, ReplInputStatus,
 	ReplSession, ReplStageError, SourceVersion, StagedReplSubmission, ToolingModuleDeclarations,
 	check_project, check_project_library, check_project_library_with_embedded_std,
-	check_project_library_with_std, check_project_with_embedded_std, check_project_with_std,
-	compile_project, compile_project_library, compile_project_library_with_std,
-	compile_project_with_std, repl_input_status,
+	check_project_library_with_embedded_std_and_options, check_project_library_with_std,
+	check_project_with_embedded_std, check_project_with_embedded_std_and_options,
+	check_project_with_std, compile_project, compile_project_library,
+	compile_project_library_with_embedded_std_and_options,
+	compile_project_library_with_embedded_std_options_and_source_uris,
+	compile_project_library_with_std, compile_project_with_embedded_std_and_options,
+	compile_project_with_embedded_std_options_and_source_uris, compile_project_with_std,
+	repl_input_status,
 };
 pub use std_source::embedded_std_provider;
 
@@ -82,6 +88,14 @@ use nymph_sema::EntryMode;
 /// checking if the source fails to parse or type-check.
 pub fn compile(source: &str, path: &str) -> Result<String, Vec<Diagnostic>> {
 	compile_impl(source, path, EntryMode::Library)
+}
+
+pub fn compile_with_options(
+	source: &str,
+	path: &str,
+	options: &CompilerOptions,
+) -> Result<String, Vec<Diagnostic>> {
+	project::compile_standalone_with_options(source, path, EntryMode::Library, options)
 }
 
 /// Compile Nymph `source` as the program's *entry module*, to a JavaScript

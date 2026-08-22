@@ -1,19 +1,85 @@
 use nymph_codegen::{
-	emit, emit_for_transactional_project_module, emit_for_transactional_project_module_checked,
+	EchoEmission, emit, emit_for_project_module_with_imports_and_echo,
+	emit_for_transactional_project_module_checked,
 };
 use nymph_hir::hir::{
-	BinOp, BuiltinResult, HirArm, HirBoundDispatchCase, HirBoundDispatchTarget, HirClass, HirEnum,
-	HirExpr, HirFunc, HirLit, HirMethod, HirModule, HirPat, HirStmt, HirVariant, NumKind,
+	BinOp, BuiltinResult, HirArm, HirBoundDispatchCase, HirBoundDispatchTarget, HirEnum, HirExpr,
+	HirFunc, HirLit, HirMethod, HirModule, HirPat, HirStmt, HirTaskContext, HirTaskOperation,
+	HirVariant, NumKind, OperationMode,
 };
 
 #[test]
-fn emits_a_function_returning_a_number() {
+fn echo_development_emits_a_site_and_release_erases_every_observer_byte() {
+	let module = HirModule {
+		lets: vec![],
+		funcs: vec![HirFunc {
+			name: "observe".into(),
+			params: vec!["value".into()],
+			body: HirExpr::Echo {
+				operand: Box::new(HirExpr::Local("value".into())),
+				site: nymph_hir::hir::EchoSite {
+					module: "main".into(),
+					start: 14,
+					end: 18,
+				},
+			},
+		}],
+		classes: vec![],
+		enums: vec![],
+	};
+	let development = emit_for_project_module_with_imports_and_echo(
+		&module,
+		"main",
+		&[],
+		EchoEmission::Development {
+			source_name: "/workspace/src/main.nym".into(),
+			source_uri: Some("file:///workspace/src/main.nym".into()),
+			source: "func f() = {\n\techo 1\n}".into(),
+		},
+	);
+	assert!(development.contains("nymphEcho"), "{development}");
+	assert!(development.contains("main.nym"), "{development}");
+	assert!(
+		development.contains("file:///workspace/src/main.nym"),
+		"{development}"
+	);
+
+	let release =
+		emit_for_project_module_with_imports_and_echo(&module, "main", &[], EchoEmission::Release);
+	assert!(!release.contains("nymphEcho"), "{release}");
+	assert!(!release.contains("nymphEchoBoxes"), "{release}");
+	assert!(!release.contains("nymphEchoStructuralShapes"), "{release}");
+	assert!(!release.contains("main.nym"), "{release}");
+	assert!(!release.contains("file:///"), "{release}");
+	let operand_only = HirModule {
+		lets: vec![],
+		funcs: vec![HirFunc {
+			name: "observe".into(),
+			params: vec!["value".into()],
+			body: HirExpr::Local("value".into()),
+		}],
+		classes: vec![],
+		enums: vec![],
+	};
+	assert_eq!(
+		release,
+		emit_for_project_module_with_imports_and_echo(
+			&operand_only,
+			"main",
+			&[],
+			EchoEmission::Release,
+		)
+	);
+}
+
+#[test]
+fn emits_a_function_returning_an_exact_integer() {
 	let module = HirModule {
 		lets: vec![],
 		funcs: vec![HirFunc {
 			name: "answer".into(),
 			params: vec![],
-			body: HirExpr::Num(42.0, NumKind::Int),
+			body: HirExpr::Int(42),
 		}],
 		classes: vec![],
 		enums: vec![],
@@ -21,130 +87,45 @@ fn emits_a_function_returning_a_number() {
 	let js = emit(&module);
 	// A single-expression body becomes an arrow-style function returning the value.
 	assert!(js.contains("answer"), "function name present: {js}");
-	assert!(js.contains("42"), "literal present: {js}");
+	assert!(js.contains("new NInt(42n)"), "exact literal present: {js}");
 }
 
 #[test]
-fn transactional_callable_parameters_are_cells_but_hidden_type_parameters_are_not() {
+fn emits_exact_integer_boundaries_and_checked_power() {
 	let module = HirModule {
 		lets: vec![],
-		funcs: vec![HirFunc {
-			name: "capture".into(),
-			params: vec!["value".into(), "$type$T".into()],
-			body: HirExpr::Closure {
-				params: vec!["next".into()],
-				body: Box::new(HirExpr::Assign {
-					target: Box::new(HirExpr::Local("value".into())),
-					value: Box::new(HirExpr::Local("next".into())),
-				}),
+		funcs: vec![
+			HirFunc {
+				name: "signed_min".into(),
+				params: vec![],
+				body: HirExpr::Int(i64::MIN),
 			},
-		}],
+			HirFunc {
+				name: "unsigned_max".into(),
+				params: vec![],
+				body: HirExpr::UInt(u64::MAX),
+			},
+			HirFunc {
+				name: "power".into(),
+				params: vec!["base".into(), "exponent".into()],
+				body: HirExpr::Binary {
+					op: BinOp::Pow,
+					result: BuiltinResult::Int,
+					mode: OperationMode::Checked,
+					lhs: Box::new(HirExpr::Local("base".into())),
+					rhs: Box::new(HirExpr::Local("exponent".into())),
+				},
+			},
+		],
 		classes: vec![],
 		enums: vec![],
 	};
-	let ordinary = emit(&module);
-	let transactional = emit_for_transactional_project_module(&module, "test", &[], &[]);
-
-	assert!(
-		ordinary.contains("function capture(value, $type$T)"),
-		"{ordinary}"
-	);
-	assert!(!ordinary.contains("nymphCell"), "{ordinary}");
-	assert!(
-		transactional.contains("function capture($nymph$temp$0, $type$T)"),
-		"{transactional}"
-	);
-	assert!(
-		transactional.contains("const value = nymphCell($nymph$temp$0);"),
-		"{transactional}"
-	);
-	assert!(
-		transactional.contains("const next = nymphCell($nymph$temp$1);"),
-		"{transactional}"
-	);
-	assert!(
-		transactional.contains("nymphCellSet.call(null, value, nymphCellGet(next))"),
-		"{transactional}"
-	);
-	assert!(
-		!transactional.contains("nymphCell($type$T)"),
-		"{transactional}"
-	);
-}
-
-#[test]
-fn representation_policy_preserves_direct_bindings_and_routes_transactional_mutations() {
-	let module = HirModule {
-		lets: vec![],
-		funcs: vec![HirFunc {
-			name: "update".into(),
-			params: vec!["object".into()],
-			body: HirExpr::Block {
-				stmts: vec![
-					HirStmt::Let {
-						name: "value".into(),
-						mutable: true,
-						value: HirExpr::Num(1.0, NumKind::Int),
-					},
-					HirStmt::Expr(HirExpr::Assign {
-						target: Box::new(HirExpr::Local("value".into())),
-						value: Box::new(HirExpr::Num(2.0, NumKind::Int)),
-					}),
-					HirStmt::Expr(HirExpr::Assign {
-						target: Box::new(HirExpr::Field {
-							recv: Box::new(HirExpr::Local("object".into())),
-							name: "field".into(),
-						}),
-						value: Box::new(HirExpr::Local("value".into())),
-					}),
-				],
-				tail: Some(Box::new(HirExpr::Local("value".into()))),
-			},
-		}],
-		classes: vec![HirClass {
-			name: "Record".into(),
-			fields: vec!["field".into()],
-			methods: vec![],
-			statics: vec![],
-		}],
-		enums: vec![],
-	};
-	let direct = emit(&module);
-	let transactional = emit_for_transactional_project_module(&module, "test", &[], &[]);
-
-	assert!(direct.contains("class Record"), "{direct}");
-	assert!(direct.contains("Object.assign(this, fields)"), "{direct}");
-	assert!(direct.contains("let value = new NInt(1)"), "{direct}");
-	assert!(direct.contains("value = new NInt(2)"), "{direct}");
-	assert!(direct.contains("object.field = value"), "{direct}");
-	assert!(!direct.contains("const value = nymphCell"), "{direct}");
-
-	assert!(
-		transactional.contains("nymphRuntimeClass"),
-		"{transactional}"
-	);
-	assert!(
-		transactional.contains("nymphAssign(this, fields)"),
-		"{transactional}"
-	);
-	assert!(
-		transactional.contains("const value = nymphCell(new NInt(1))"),
-		"{transactional}"
-	);
-	assert!(
-		transactional.contains("nymphCellSet.call(null, value, new NInt(2))"),
-		"{transactional}"
-	);
-	assert!(
-		transactional.contains(
-			"nymphSetProperty.call(null, nymphCellGet(object), \"field\", nymphCellGet(value))"
-		),
-		"{transactional}"
-	);
-	assert!(
-		transactional.contains("return nymphCellGet(value)"),
-		"{transactional}"
-	);
+	let js = emit(&module);
+	assert!(js.contains("new NInt(-9223372036854775808n)"), "{js}");
+	assert!(js.contains("new NUint(18446744073709551615n)"), "{js}");
+	assert!(js.contains("new NInt(nymphCheckedPower("), "{js}");
+	assert!(js.contains(".liveLocals[0].v"), "{js}");
+	assert!(js.contains(".liveLocals[1].v"), "{js}");
 }
 
 #[test]
@@ -158,6 +139,9 @@ fn strict_transactional_emission_rejects_the_exact_unaudited_external_inventory(
 				module: "host/state",
 				symbol: "mutate",
 				args: vec![],
+				call_mode: nymph_hir::hir::ExternalCallMode::Ordinary,
+				argument_marshals: vec![],
+				return_marshal: None,
 			},
 		}],
 		classes: vec![],
@@ -174,7 +158,6 @@ fn external_value_is_imported_marshaled_and_bound_once() {
 	let module = HirModule {
 		lets: vec![nymph_hir::hir::HirLet {
 			name: "limit".into(),
-			mutable: false,
 			value: HirExpr::ExternValue {
 				module: "host/limits",
 				symbol: "maximum",
@@ -212,7 +195,6 @@ fn duplicate_external_value_declarations_share_one_import_and_box() {
 		lets: vec![
 			nymph_hir::hir::HirLet {
 				name: "first".into(),
-				mutable: false,
 				value: HirExpr::ExternValue {
 					module: "host/limits",
 					symbol: "maximum",
@@ -221,7 +203,6 @@ fn duplicate_external_value_declarations_share_one_import_and_box() {
 			},
 			nymph_hir::hir::HirLet {
 				name: "second".into(),
-				mutable: false,
 				value: HirExpr::ExternValue {
 					module: "host/limits",
 					symbol: "maximum",
@@ -244,7 +225,6 @@ fn external_aliases_include_module_symbol_and_kind_identity() {
 	let module = HirModule {
 		lets: vec![nymph_hir::hir::HirLet {
 			name: "value".into(),
-			mutable: false,
 			value: HirExpr::ExternValue {
 				module: "host/a",
 				symbol: "same",
@@ -261,11 +241,17 @@ fn external_aliases_include_module_symbol_and_kind_identity() {
 						module: "host/a",
 						symbol: "same",
 						args: vec![],
+						call_mode: nymph_hir::hir::ExternalCallMode::Ordinary,
+						argument_marshals: vec![],
+						return_marshal: None,
 					},
 					HirExpr::ExternCall {
 						module: "host/b",
 						symbol: "same",
 						args: vec![],
+						call_mode: nymph_hir::hir::ExternalCallMode::Ordinary,
+						argument_marshals: vec![],
+						return_marshal: None,
 					},
 				],
 			},
@@ -282,26 +268,39 @@ fn external_aliases_include_module_symbol_and_kind_identity() {
 }
 
 #[test]
-fn display_protocol_call_includes_its_runtime_without_other_boxed_values() {
+fn external_calls_emit_exact_mode_and_opaque_marshalling_abis() {
+	let external = |name: &str, call_mode, identity| HirFunc {
+		name: name.into(),
+		params: vec!["value".into()],
+		body: HirExpr::ExternCall {
+			module: "host/resources",
+			symbol: Box::leak(name.to_string().into_boxed_str()),
+			args: vec![HirExpr::Local("value".into())],
+			call_mode,
+			argument_marshals: vec![Some(nymph_hir::hir::MarshalKind::Opaque(identity))],
+			return_marshal: Some(nymph_hir::hir::MarshalKind::Opaque(identity)),
+		},
+	};
 	let module = HirModule {
 		lets: vec![],
-		funcs: vec![HirFunc {
-			name: "render".into(),
-			params: vec!["value".into()],
-			body: HirExpr::ExternCall {
-				module: "std/display",
-				symbol: "debug",
-				args: vec![HirExpr::Local("value".into())],
-			},
-		}],
+		funcs: vec![
+			external("ordinary", nymph_hir::hir::ExternalCallMode::Ordinary, 117),
+			external(
+				"cancellable",
+				nymph_hir::hir::ExternalCallMode::Cancellable,
+				117,
+			),
+		],
 		classes: vec![],
 		enums: vec![],
 	};
-
 	let js = emit(&module);
-	assert!(
-		js.contains("function nymphProtocolDebug"),
-		"display protocol helper must be defined alongside its call: {js}"
+	assert!(js.matches("nymphUnboxOpaque(117n").count() == 2, "{js}");
+	assert_eq!(js.matches("nymphBoxOpaque(117n").count(), 2, "{js}");
+	assert_eq!(
+		js.matches("nymphCurrentExecutionSignal()").count(),
+		2,
+		"the runtime definition plus exactly one cancellable call must be present: {js}"
 	);
 }
 
@@ -335,6 +334,8 @@ fn bound_dispatch_evaluates_operands_once_and_falls_back_to_the_user_method() {
 						name: "int_less_than".into(),
 					},
 				}],
+				mode: nymph_hir::hir::HirCallMode::Push,
+				source: 7,
 			},
 		}],
 		classes: vec![],
@@ -342,20 +343,16 @@ fn bound_dispatch_evaluates_operands_once_and_falls_back_to_the_user_method() {
 	};
 
 	let js = emit(&module);
-	assert_eq!(js.matches("make_left()").count(), 1, "{js}");
-	assert_eq!(js.matches("make_right()").count(), 1, "{js}");
-	assert_eq!(js.matches("make_hidden()").count(), 1, "{js}");
-	// Nested IIFEs print inner arguments first, so this textual order proves
-	// runtime evaluation is receiver, source argument, then hidden argument.
-	assert!(
-		js.find("make_hidden()").unwrap() < js.find("make_right()").unwrap()
-			&& js.find("make_right()").unwrap() < js.find("make_left()").unwrap(),
-		"{js}"
-	);
+	assert_eq!(js.matches("undefined, [], 0,").count(), 3, "{js}");
+	assert_eq!(js.matches("= make_hidden;").count(), 1, "{js}");
 	assert!(js.contains("Symbol.for(\"nymph.tag\")"), "{js}");
 	assert!(js.contains("Symbol.for(\"nymph.int\")"), "{js}");
-	assert!(js.contains("int_less_than"), "{js}");
-	assert!(js.contains(".less_than("), "{js}");
+	assert!(js.contains("nymphPush(int_less_than, undefined,"), "{js}");
+	assert!(
+		js.contains("nymphPush(") && js.contains(".less_than,"),
+		"{js}"
+	);
+	assert!(js.contains("], 7, 1,"), "{js}");
 }
 
 #[test]
@@ -367,11 +364,7 @@ fn interpolation_emits_cooked_text_as_raw_strings() {
 			params: vec!["value".into()],
 			body: HirExpr::InterpolatedString(vec![
 				HirExpr::Str("value=".into()),
-				HirExpr::ExternCall {
-					module: "std/display",
-					symbol: "display",
-					args: vec![HirExpr::Local("value".into())],
-				},
+				HirExpr::ProtocolDisplay(Box::new(HirExpr::Local("value".into()))),
 				HirExpr::Str("!".into()),
 			]),
 		}],
@@ -398,12 +391,14 @@ fn emits_arithmetic_and_params() {
 			body: HirExpr::Binary {
 				op: BinOp::Add,
 				result: BuiltinResult::Raw,
+				mode: OperationMode::Direct,
 				lhs: Box::new(HirExpr::Local("a".into())),
 				rhs: Box::new(HirExpr::Binary {
 					op: BinOp::Mul,
 					result: BuiltinResult::Raw,
+					mode: OperationMode::Direct,
 					lhs: Box::new(HirExpr::Local("b".into())),
-					rhs: Box::new(HirExpr::Num(2.0, NumKind::Int)),
+					rhs: Box::new(HirExpr::Num(2.0, NumKind::Raw)),
 				}),
 			},
 		}],
@@ -485,7 +480,7 @@ fn emits_method_less_enum_with_a_canonical_prototype() {
 
 #[test]
 fn emits_enum_with_methods_prototype_shape() {
-	// An enum with methods gets a shared `proto` object and every variant
+	// X1: an enum WITH methods gets a shared `proto` object and every variant
 	// is created via `Object.create(proto)`, while the tag ABI (Object.freeze /
 	// factory-tagging Object.assign) stays intact.
 	let module = HirModule {
@@ -507,7 +502,7 @@ fn emits_enum_with_methods_prototype_shape() {
 			methods: vec![HirMethod {
 				name: "idx".into(),
 				params: vec![],
-				body: HirExpr::Num(0.0, NumKind::Int),
+				body: HirExpr::Int(0),
 			}],
 			statics: vec![],
 		}],
@@ -527,64 +522,7 @@ fn emits_enum_with_methods_prototype_shape() {
 }
 
 #[test]
-fn emits_list_index_assignment_against_the_boxed_payload() {
-	let module = HirModule {
-		lets: vec![],
-		funcs: vec![HirFunc {
-			name: "set".into(),
-			params: vec!["xs".into(), "i".into(), "v".into()],
-			body: HirExpr::Assign {
-				target: Box::new(HirExpr::Index {
-					recv: Box::new(HirExpr::Local("xs".into())),
-					index: Box::new(HirExpr::Local("i".into())),
-				}),
-				value: Box::new(HirExpr::Local("v".into())),
-			},
-		}],
-		classes: vec![],
-		enums: vec![],
-	};
-	let js = emit(&module);
-	assert!(
-		js.contains("xs.setIndex(i, v)"),
-		"list wrapper owns index normalization and assignment: {js}"
-	);
-}
-
-#[test]
-fn emits_map_index_assignment_as_a_set_call() {
-	// A JS `Map` receiver has no assignment-expression
-	// form for its entries, so `HirExpr::Assign { target: MapGet { .. }, .. }`
-	// must lower to a `.set(key, value)` call, never a computed-member
-	// assignment (which would silently set an own property on the `Map`
-	// object instead of mutating an entry).
-	let module = HirModule {
-		lets: vec![],
-		funcs: vec![HirFunc {
-			name: "set".into(),
-			params: vec!["m".into(), "k".into(), "v".into()],
-			body: HirExpr::Assign {
-				target: Box::new(HirExpr::MapGet {
-					recv: Box::new(HirExpr::Local("m".into())),
-					key: Box::new(HirExpr::Local("k".into())),
-				}),
-				value: Box::new(HirExpr::Local("v".into())),
-			},
-		}],
-		classes: vec![],
-		enums: vec![],
-	};
-	let js = emit(&module);
-	assert!(js.contains("m.set(k, v)"), "map .set call: {js}");
-	assert!(
-		!js.contains("m[k] ="),
-		"never a computed-member assignment on a Map: {js}"
-	);
-}
-
-#[test]
-fn emits_a_closure_as_an_arrow_function() {
-	// A closure block flattens directly into the arrow body rather than a nested IIFE.
+fn emits_a_closure_as_an_activation_state() {
 	let module = HirModule {
 		lets: vec![],
 		funcs: vec![HirFunc {
@@ -595,6 +533,7 @@ fn emits_a_closure_as_an_arrow_function() {
 				body: Box::new(HirExpr::Binary {
 					op: BinOp::Add,
 					result: BuiltinResult::Raw,
+					mode: OperationMode::Direct,
 					lhs: Box::new(HirExpr::Local("x".into())),
 					rhs: Box::new(HirExpr::Local("y".into())),
 				}),
@@ -604,14 +543,104 @@ fn emits_a_closure_as_an_arrow_function() {
 		enums: vec![],
 	};
 	let js = emit(&module);
-	assert!(js.contains("(x, y) =>"), "arrow params present: {js}");
-	assert!(js.contains("x + y"), "arrow body present: {js}");
+	assert!(js.matches("nymphCallable(function(").count() >= 2, "{js}");
+	assert!(
+		js.contains(".bind(this)"),
+		"closure captures its lexical receiver: {js}"
+	);
+	assert!(
+		js.contains(".liveLocals[0] +") && js.contains(".liveLocals[1]"),
+		"{js}"
+	);
+}
+
+#[test]
+fn task_hir_emits_cold_recipes_and_explicit_suspension_operations() {
+	let operation = |name: &str, operation: HirTaskOperation, operands: Vec<&str>| HirFunc {
+		name: name.into(),
+		params: operands.iter().map(|name: &&str| (*name).into()).collect(),
+		body: HirExpr::TaskOperation {
+			operation,
+			operands: operands
+				.into_iter()
+				.map(|name| HirExpr::Local(name.into()))
+				.collect(),
+		},
+	};
+	let module = HirModule {
+		lets: vec![],
+		funcs: vec![
+			HirFunc {
+				name: "make".into(),
+				params: vec![],
+				body: HirExpr::TaskRecipe {
+					body: Box::new(HirExpr::Block {
+						stmts: vec![HirStmt::Expr(HirExpr::TaskOperation {
+							operation: HirTaskOperation::Checkpoint,
+							operands: vec![],
+						})],
+						tail: Some(Box::new(HirExpr::Int(42))),
+					}),
+					context: HirTaskContext::Nested,
+				},
+			},
+			operation("drive", HirTaskOperation::Drive, vec!["task"]),
+			operation("spawn", HirTaskOperation::Spawn, vec!["task"]),
+			operation("observe", HirTaskOperation::Observe, vec!["handle"]),
+			operation("cancel", HirTaskOperation::Cancel, vec!["handle"]),
+			operation("select", HirTaskOperation::Select, vec!["first", "second"]),
+			operation("race", HirTaskOperation::Race, vec!["first", "second"]),
+		],
+		classes: vec![],
+		enums: vec![],
+	};
+	let js = emit(&module);
+	for helper in [
+		"nymphTaskRecipe",
+		"nymphTaskDrive",
+		"nymphTaskSpawn",
+		"nymphHandleObserve",
+		"nymphHandleCancel",
+		"nymphCheckpoint",
+		"nymphTaskSelect",
+		"nymphTaskRace",
+	] {
+		assert!(js.contains(helper), "missing {helper}: {js}");
+	}
+	assert!(
+		js.contains("nymphTaskRecipe(") && js.contains(", true)"),
+		"{js}"
+	);
+	assert!(
+		js.contains("return nymphSuspend(") && js.contains("return nymphCheckpoint();"),
+		"{js}"
+	);
+
+	let script =
+		format!("{js}\nconst result = await nymphRunTask(make()); console.log(String(result.v));");
+	let output = std::process::Command::new("node")
+		.arg("--input-type=module")
+		.arg("--eval")
+		.arg(script)
+		.output()
+		.expect("Node must be available for emitted task HIR tests");
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "42");
 }
 
 #[test]
 fn closure_return_emits_fine_inside_a_subexpression_position_match_arm() {
-	// A closure inside a subexpression-position match arm establishes its own
-	// return boundary, so its return must not target the match IIFE.
+	// A `return` inside a closure that itself sits inside a
+	// SUBEXPRESSION-position match arm
+	// (which sets `in_iife_subexpr = true` for everything underneath, Slice
+	// 4E, Y1) must still emit as a plain arrow `return`, not panic as if it
+	// targeted the match's own IIFE. This is exactly what the closure-body
+	// emission's save/reset-to-`false` of `in_iife_subexpr` (mirroring
+	// `emit_func`'s implicit top-level function boundary) exists to give.
 	let module = HirModule {
 		lets: vec![],
 		funcs: vec![HirFunc {
@@ -620,7 +649,6 @@ fn closure_return_emits_fine_inside_a_subexpression_position_match_arm() {
 			body: HirExpr::Block {
 				stmts: vec![HirStmt::Let {
 					name: "g".into(),
-					mutable: false,
 					value: HirExpr::Match {
 						scrutinee: Box::new(HirExpr::Local("n".into())),
 						arms: vec![HirArm {
@@ -638,6 +666,7 @@ fn closure_return_emits_fine_inside_a_subexpression_position_match_arm() {
 							},
 						}],
 					},
+					cleanup: None,
 				}],
 				tail: Some(Box::new(HirExpr::Local("g".into()))),
 			},
@@ -646,8 +675,39 @@ fn closure_return_emits_fine_inside_a_subexpression_position_match_arm() {
 		enums: vec![],
 	};
 	let js = emit(&module);
-	assert!(js.contains("=>"), "arrow present: {js}");
-	assert!(js.contains("return x"), "closure body's own return: {js}");
+	assert!(js.matches("nymphCallable(function(").count() >= 2, "{js}");
+	assert!(
+		js.contains("return nymphReturn("),
+		"closure return terminal: {js}"
+	);
+}
+
+#[test]
+fn managed_hir_registers_one_cleanup_and_emits_lexical_unwind() {
+	let module = HirModule {
+		lets: vec![],
+		funcs: vec![HirFunc {
+			name: "managed".into(),
+			params: vec!["resource".into(), "close".into()],
+			body: HirExpr::Block {
+				stmts: vec![HirStmt::Let {
+					name: "managed_resource".into(),
+					value: HirExpr::Local("resource".into()),
+					cleanup: Some(HirExpr::Call {
+						callee: Box::new(HirExpr::Local("close".into())),
+						args: vec![],
+					}),
+				}],
+				tail: Some(Box::new(HirExpr::Local("managed_resource".into()))),
+			},
+		}],
+		classes: vec![],
+		enums: vec![],
+	};
+	let js = emit(&module);
+	assert_eq!(js.matches("nymphRegisterCleanup(() =>").count(), 1, "{js}");
+	assert!(js.contains("nymphEnterCleanupScope()"), "{js}");
+	assert!(js.contains("nymphUnwindCleanupScopes(1)"), "{js}");
 }
 
 #[test]
@@ -660,17 +720,18 @@ fn function_return_crosses_a_generated_iife_without_losing_sibling_values() {
 			body: HirExpr::Binary {
 				op: BinOp::Add,
 				result: BuiltinResult::Raw,
-				lhs: Box::new(HirExpr::Num(1.0, NumKind::Int)),
+				mode: OperationMode::Direct,
+				lhs: Box::new(HirExpr::Num(1.0, NumKind::Raw)),
 				rhs: Box::new(HirExpr::If {
 					cond: Box::new(HirExpr::Local("flag".into())),
 					then: Box::new(HirExpr::Block {
 						stmts: vec![HirStmt::Return {
-							value: Some(HirExpr::Num(7.0, NumKind::Int)),
+							value: Some(HirExpr::Num(7.0, NumKind::Raw)),
 							target: nymph_hir::hir::HirReturnTarget::Callable,
 						}],
 						tail: None,
 					}),
-					otherwise: Some(Box::new(HirExpr::Num(2.0, NumKind::Int))),
+					otherwise: Some(Box::new(HirExpr::Num(2.0, NumKind::Raw))),
 				}),
 			},
 		}],
@@ -679,12 +740,16 @@ fn function_return_crosses_a_generated_iife_without_losing_sibling_values() {
 	};
 	let js = emit(&module);
 	assert!(
-		js.contains("throw $nymph$completion$"),
-		"return crosses the generated IIFE: {js}"
+		js.contains("= 7;"),
+		"return value is retained in a frame slot: {js}"
 	);
 	assert!(
-		js.contains("catch ("),
-		"function consumes its completion: {js}"
+		js.contains("return nymphReturn("),
+		"return is a state terminal: {js}"
+	);
+	assert!(
+		js.contains("resumeState"),
+		"function has explicit states: {js}"
 	);
 	assert!(
 		js.contains(" + "),
@@ -707,16 +772,15 @@ fn return_inside_a_nested_subexpression_uses_the_closure_completion_target() {
 				body: Box::new(HirExpr::Block {
 					stmts: vec![HirStmt::Let {
 						name: "y".into(),
-						mutable: false,
 						value: HirExpr::Match {
 							scrutinee: Box::new(HirExpr::Local("x".into())),
 							arms: vec![
 								HirArm {
-									pat: HirPat::Lit(HirLit::Num(0.0, NumKind::Int)),
+									pat: HirPat::Lit(HirLit::Int(0)),
 									guard: None,
 									body: HirExpr::Block {
 										stmts: vec![HirStmt::Return {
-											value: Some(HirExpr::Num(1.0, NumKind::Int)),
+											value: Some(HirExpr::Int(1)),
 											target: nymph_hir::hir::HirReturnTarget::Callable,
 										}],
 										tail: None,
@@ -729,6 +793,7 @@ fn return_inside_a_nested_subexpression_uses_the_closure_completion_target() {
 								},
 							],
 						},
+						cleanup: None,
 					}],
 					tail: Some(Box::new(HirExpr::Local("y".into()))),
 				}),
@@ -739,11 +804,12 @@ fn return_inside_a_nested_subexpression_uses_the_closure_completion_target() {
 	};
 	let js = emit(&module);
 	assert!(
-		js.contains("throw $nymph$completion$"),
-		"return completion is thrown: {js}"
+		js.contains("new NInt(1n)"),
+		"return value is retained in a frame slot: {js}"
 	);
 	assert!(
-		js.contains("catch ("),
-		"closure catches its completion: {js}"
+		js.contains("return nymphReturn("),
+		"return is a closure terminal: {js}"
 	);
+	assert!(js.matches("nymphCallable(function(").count() >= 2, "{js}");
 }

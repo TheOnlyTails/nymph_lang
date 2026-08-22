@@ -207,6 +207,12 @@ fn number<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> + C
 	let oct = regex(r"0[oO][0-7](_?[0-7])*[uU]?").map(|s: &str| int_radix(s, 8));
 	let bin = regex(r"0[bB][01](_?[01])*[uU]?").map(|s: &str| int_radix(s, 2));
 	let dec = regex(r"\d(_?\d)*[uU]?").map(int_decimal);
+	let integer = choice((hex, oct, bin, dec)).validate(|token, e, emitter| {
+		token.unwrap_or_else(|| {
+			emitter.emit(Rich::custom(e.span(), LexError::IntegerLiteralOutOfRange));
+			Token::Int(u64::MAX)
+		})
+	});
 
 	let float_dot = regex(r"\d(_?\d)*\.\d(_?\d)*([eE][+-]?\d(_?\d)*)?")
 		.map(|s: &str| Token::Float(parse_f64(s).into()));
@@ -217,33 +223,32 @@ fn number<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> + C
 
 	// Floats are tried before integers so `1.5` is not read as `1` `.` `5`, and the
 	// dotted form is tried first so `1e3` and `1f` still work.
-	choice((float_dot, float_exp, float_suffix, hex, oct, bin, dec))
-		.map_with(|v, e| Spanned::new(v, e.span()))
+	choice((float_dot, float_exp, float_suffix, integer)).map_with(|v, e| Spanned::new(v, e.span()))
 }
 
-fn int_radix(s: &str, radix: u32) -> Token {
+fn int_radix(s: &str, radix: u32) -> Option<Token> {
 	let unsigned = s.ends_with(['u', 'U']);
 	let body = if unsigned {
 		&s[2..s.len() - 1]
 	} else {
 		&s[2..]
 	};
-	let value = u64::from_str_radix(&clean(body), radix).unwrap_or(0);
+	let value = u64::from_str_radix(&clean(body), radix).ok()?;
 	if unsigned {
-		Token::UInt(value)
+		Some(Token::UInt(value))
 	} else {
-		Token::Int(value)
+		Some(Token::Int(value))
 	}
 }
 
-fn int_decimal(s: &str) -> Token {
+fn int_decimal(s: &str) -> Option<Token> {
 	let unsigned = s.ends_with(['u', 'U']);
 	let body = if unsigned { &s[..s.len() - 1] } else { s };
-	let value = clean(body).parse::<u64>().unwrap_or(0);
+	let value = clean(body).parse::<u64>().ok()?;
 	if unsigned {
-		Token::UInt(value)
+		Some(Token::UInt(value))
 	} else {
-		Token::Int(value)
+		Some(Token::Int(value))
 	}
 }
 
@@ -381,14 +386,14 @@ fn keyword_or_ident<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<
 		text::keyword("struct").to(Token::Struct),
 		text::keyword("enum").to(Token::Enum),
 		text::keyword("let").to(Token::Let),
-		text::keyword("mut").to(Token::Mut),
 		text::keyword("external").to(Token::External),
+		text::keyword("effect").to(Token::Effect),
 		text::keyword("func").to(Token::Func),
 		text::keyword("interface").to(Token::Interface),
 		text::keyword("impl").to(Token::Impl),
 		text::keyword("namespace").to(Token::Namespace),
 		text::keyword("for").to(Token::For),
-		text::keyword("while").to(Token::While),
+		text::keyword("loop").to(Token::Loop),
 		text::keyword("if").to(Token::If),
 		text::keyword("else").to(Token::Else),
 		text::keyword("match").to(Token::Match),
@@ -407,6 +412,7 @@ fn keyword_or_ident<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<
 		text::keyword("return").to(Token::Return),
 		text::keyword("break").to(Token::Break),
 		text::keyword("continue").to(Token::Continue),
+		text::keyword("echo").to(Token::Echo),
 		text::keyword("this").to(Token::This),
 	]);
 
@@ -427,17 +433,10 @@ fn operators<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> 
 		just("..").to(Token::DotDot),
 		just(".").to(Token::Dot),
 	]);
-	let stars = choice([
-		just("**=").to(Token::StarStarEq),
-		just("**").to(Token::StarStar),
-		just("*=").to(Token::StarEq),
-		just("*").to(Token::Star),
-	]);
+	let stars = choice([just("**").to(Token::StarStar), just("*").to(Token::Star)]);
 	let angles = choice([
-		just("<<=").to(Token::LtLtEq),
 		just("<=").to(Token::LtEq),
 		just("<").to(Token::Lt),
-		just(">>=").to(Token::GtGtEq),
 		just(">=").to(Token::GtEq),
 		just(">").to(Token::Gt),
 	]);
@@ -446,34 +445,20 @@ fn operators<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> 
 		just("??").to(Token::DoubleQuestion),
 		just("?").to(Token::Question),
 	]);
-	let dashes = choice([
-		just("->").to(Token::Arrow),
-		just("-=").to(Token::MinusEq),
-		just("-").to(Token::Minus),
-	]);
+	let dashes = choice([just("->").to(Token::Arrow), just("-").to(Token::Minus)]);
 	let pipes = choice([
 		just("|>").to(Token::PipeArrow),
-		just("||=").to(Token::PipePipeEq),
 		just("||").to(Token::PipePipe),
-		just("|=").to(Token::PipeEq),
 		just("|").to(Token::Pipe),
 	]);
-	let amps = choice([
-		just("&&=").to(Token::AmpAmpEq),
-		just("&&").to(Token::AmpAmp),
-		just("&=").to(Token::AmpEq),
-		just("&").to(Token::Amp),
-	]);
-	let carets = choice([just("^=").to(Token::CaretEq), just("^").to(Token::Caret)]);
-	let tildes = choice([just("~=").to(Token::TildeEq), just("~").to(Token::Tilde)]);
+	let amps = choice([just("&&").to(Token::AmpAmp), just("&").to(Token::Amp)]);
+	let carets = just("^").to(Token::Caret);
+	let tildes = just("~").to(Token::Tilde);
 	let eqs = choice([just("==").to(Token::EqEq), just("=").to(Token::Eq)]);
 	let bangs = choice([just("!=").to(Token::BangEq), just("!").to(Token::Bang)]);
-	let pluses = choice([just("+=").to(Token::PlusEq), just("+").to(Token::Plus)]);
-	let slashes = choice([just("/=").to(Token::SlashEq), just("/").to(Token::Slash)]);
-	let percents = choice([
-		just("%=").to(Token::PercentEq),
-		just("%").to(Token::Percent),
-	]);
+	let pluses = just("+").to(Token::Plus);
+	let slashes = just("/").to(Token::Slash);
+	let percents = just("%").to(Token::Percent);
 	let colons = choice([just("::").to(Token::ColonColon), just(":").to(Token::Colon)]);
 	let hashes = choice([
 		just("#(").to(Token::HashLParen),
@@ -619,8 +604,8 @@ mod tests {
 	}
 
 	#[test]
-	fn shift_operators_are_two_tokens() {
-		// Bare `<<` is two `<` so generics stay unambiguous; the parser recombines them.
+	fn shift_operators_have_no_compound_assignment_token() {
+		// The parser recombines bare `<<`; the retired spelling remains separate operators.
 		assert_eq!(
 			toks("a << b"),
 			vec![
@@ -634,7 +619,8 @@ mod tests {
 			toks("a <<= b"),
 			vec![
 				Token::Identifier("a".into()),
-				Token::LtLtEq,
+				Token::Lt,
+				Token::LtEq,
 				Token::Identifier("b".into())
 			]
 		);

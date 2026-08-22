@@ -34,10 +34,26 @@ pub fn substitute_params(interner: &mut Interner, ty: Ty, subst: &FxHashMap<Para
 			let value = substitute_params(interner, value, subst);
 			interner.mk_map(key, value)
 		}
-		TyKind::Fn { params, ret } => {
+		TyKind::Fn {
+			params,
+			ret,
+			effects,
+		} => {
 			let params = substitute_each(interner, &params, subst);
 			let ret = substitute_params(interner, ret, subst);
-			interner.mk_fn(params, ret)
+			interner.mk_effectful_fn(params, ret, effects)
+		}
+		TyKind::Task { output, effects } => {
+			let output = substitute_params(interner, output, subst);
+			interner.mk_task(output, effects)
+		}
+		TyKind::Handle(output) => {
+			let output = substitute_params(interner, output, subst);
+			interner.mk_handle(output)
+		}
+		TyKind::HandleOutcome(output) => {
+			let output = substitute_params(interner, output, subst);
+			interner.mk_handle_outcome(output)
 		}
 		TyKind::Adt(def, args) => {
 			let args = substitute_args(interner, &args, subst);
@@ -47,11 +63,6 @@ pub fn substitute_params(interner: &mut Interner, ty: Ty, subst: &FxHashMap<Para
 			let parts = substitute_each(interner, &parts, subst);
 			interner.mk_intersection(parts)
 		}
-		TyKind::Mut(inner) => {
-			let inner = substitute_params(interner, inner, subst);
-			interner.mk_mut(inner)
-		}
-
 		// Primitives, `self`, inference variables, error, and unmapped params are
 		// all leaves with nothing to rewrite.
 		TyKind::Int
@@ -107,14 +118,16 @@ pub fn occurs(interner: &Interner, var: InferVar, ty: Ty) -> bool {
 			elems.iter().any(|&e| occurs(interner, var, e))
 		}
 		TyKind::Map(key, value) => occurs(interner, var, *key) || occurs(interner, var, *value),
-		TyKind::Fn { params, ret } => {
+		TyKind::Fn { params, ret, .. } => {
 			params.iter().any(|&p| occurs(interner, var, p)) || occurs(interner, var, *ret)
+		}
+		TyKind::Task { output, .. } | TyKind::Handle(output) | TyKind::HandleOutcome(output) => {
+			occurs(interner, var, *output)
 		}
 		TyKind::Adt(_, args) => {
 			args.positional.iter().any(|&t| occurs(interner, var, t))
 				|| args.named.iter().any(|(_, t)| occurs(interner, var, *t))
 		}
-		TyKind::Mut(inner) => occurs(interner, var, *inner),
 		TyKind::Int
 		| TyKind::UInt
 		| TyKind::Float

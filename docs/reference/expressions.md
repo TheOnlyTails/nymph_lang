@@ -1,6 +1,6 @@
 # Expressions
 
-Nymph is expression-oriented: `if`, `match`, `while`, `for`, and blocks all _produce_ a value,
+Nymph is expression-oriented: `if`, `match`, state loops, `for`, and blocks all _produce_ a value,
 not just literals and operator chains. The only things that are _not_ expressions are a bare `let`
 binding and the handful of top-level [declarations](./declarations).
 
@@ -8,30 +8,29 @@ binding and the handful of top-level [declarations](./declarations).
 
 From lowest to highest binding strength:
 
-| Tier           | Operators                                                                                       |
-| -------------- | ----------------------------------------------------------------------------------------------- |
-| Assignment     | `=`, `+=`, `-=`, `*=`, `/=`, `%=`, `**=`, `<<=`, `>>=`, `&=`, `^=`, `\|=`, `~=`, `&&=`, `\|\|=` |
-| Pipe           | `\|>`                                                                                           |
-| Logical or     | `\|\|`                                                                                          |
-| Logical and    | `&&`                                                                                            |
-| Equality       | `==`, `!=`                                                                                      |
-| Comparison     | `<`, `<=`, `>`, `>=`                                                                            |
-| Inclusion      | `in`, `!in`                                                                                     |
-| Unwrap         | `??`                                                                                            |
-| Bitwise or     | `\|`                                                                                            |
-| Bitwise xor    | `^`                                                                                             |
-| Bitwise and    | `&`                                                                                             |
-| Shift          | `<<`, `>>`                                                                                      |
-| Range          | `..`, `..=`                                                                                     |
-| Additive       | `+`, `-`                                                                                        |
-| Multiplicative | `*`, `/`, `%`                                                                                   |
-| Power          | `**`                                                                                            |
-| Pattern test   | `is`, `!is`                                                                                     |
-| Cast           | `as`                                                                                            |
-| Unary          | `!`, `-`, `~`                                                                                   |
-| Indexing       | `x[i]`                                                                                          |
-| Member access  | `x.field`                                                                                       |
-| Call           | `f(x)`                                                                                          |
+| Tier           | Operators            |
+| -------------- | -------------------- |
+| Pipe           | `\|>`                |
+| Logical or     | `\|\|`               |
+| Logical and    | `&&`                 |
+| Equality       | `==`, `!=`           |
+| Comparison     | `<`, `<=`, `>`, `>=` |
+| Inclusion      | `in`, `!in`          |
+| Unwrap         | `??`                 |
+| Bitwise or     | `\|`                 |
+| Bitwise xor    | `^`                  |
+| Bitwise and    | `&`                  |
+| Shift          | `<<`, `>>`           |
+| Range          | `..`, `..=`          |
+| Additive       | `+`, `-`             |
+| Multiplicative | `*`, `/`, `%`        |
+| Power          | `**`                 |
+| Pattern test   | `is`, `!is`          |
+| Cast           | `as`                 |
+| Unary          | `!`, `-`, `~`        |
+| Indexing       | `x[i]`               |
+| Member access  | `x.field`            |
+| Call           | `f(x)`               |
 
 Most binary and unary operators are backed by an interface from the stdlib's ambient operator
 prelude, so user types can overload them by implementing the matching interface — see
@@ -64,11 +63,7 @@ A `...` prefix on a call argument spreads an iterable into the call. It's how yo
 
 ```nym
 func sum(...xs: #[int]): int = {
-  let mut total = 0
-  for (x in xs) {
-    total = total + x
-  }
-  total
+  xs.iter().fold(0, (total, x) -> total + x)
 }
 
 func demo(): int = sum(...#[1, 2, 3])
@@ -107,14 +102,11 @@ func swap_sum(t: #(int, int)): int = t[1] + t[0]
 func lookup(scores: #{int: int}, level: int): int = scores[level]
 ```
 
-Indexing is also a valid assignment target — see [Field assignment](./mutability#field-assignment)
-for the general mutability rule it falls under:
+Collections are persistent. Use `replaced` to produce a list with a new value at an index while
+preserving the original list:
 
 ```nym
-func set(xs: #[int], i: uint, v: int): #[int] = {
-  xs[i] = v
-  xs
-}
+func set(xs: #[int], i: uint, v: int): #[int] = xs.replaced(i, v)
 ```
 
 ## Ranges
@@ -125,11 +117,7 @@ inclusive ranges require an upper bound. See [Ranges](./literals#ranges) for the
 
 ```nym
 func sum_inclusive(n: int): int = {
-  let mut total = 0
-  for (i in 1..=n) {
-    total = total + i
-  }
-  total
+  (1..=n).iter().fold(0, (total, i) -> total + i)
 }
 ```
 
@@ -159,8 +147,7 @@ An `if` with no `else`, used where no value is needed, is fine in statement posi
 
 ```nym
 func demo(n: int): int = {
-  let mut x = 0
-  if (n > 0) { x = n }
+  let x = if (n > 0) { n } else { 0 }
   x
 }
 ```
@@ -168,8 +155,8 @@ func demo(n: int): int = {
 ## Blocks
 
 `{ stmt; stmt; expr }` runs each statement in order and evaluates to its last expression (or `void`
-if the block ends in a statement, not an expression). Blocks are how `func` bodies, `if`/`while`/
-`for` bodies, and match arm bodies all get more than one step.
+if the block ends in a statement, not an expression). Blocks are how `func` bodies, conditionals,
+loops, and match arm bodies all get more than one step.
 
 ```nym
 func average_scaled(a: int, b: int, scale: int): float = {
@@ -193,17 +180,14 @@ func apply_twice(f: (int) -> int, x: int): int = f(f(x))
 func demo(): int = apply_twice((x: int) -> x * 2, 3)
 ```
 
-A closure captures its enclosing scope the way a JS arrow function does: reading and — if the
-outer binding is `let mut` — reassigning an outer variable both work from inside the closure body,
-and a closure built inside a method body keeps reading the original receiver's fields even after
-the method returns.
+A closure captures immutable values from its enclosing scope. A closure built inside a method body
+keeps reading the original receiver's fields even after the method returns.
 
 ```nym
 func demo(): int = {
-  let mut x = 1
-  let bump = () -> { x = x + 1 }
+  let x = 1
+  let bump = () -> x + 1
   bump()
-  x
 }
 ```
 
@@ -338,17 +322,18 @@ func classify(n: int): string = {
 
 ```nym
 func first_positive(xs: #[int]): int = {
-  let mut i = 0
-  while (i < 10) {
-    if (xs[i] > 0) { break }
-    i += 1
+  let found = for (i in 0u..xs.length()) {
+    if (xs[i as int] > 0) { break i }
   }
-  i
+  match (found) {
+    Some(value) -> value as int,
+    None -> -1,
+  }
 }
 ```
 
-`break` and `continue` target the innermost lexically enclosing `while` or `for` loop. Label a loop
-as `while@outer (...)` or `for@outer (...)`, then target it as `break@outer value` or
+`break` and `continue` target the innermost lexically enclosing `loop` or `for` loop. Label a loop
+as `loop@outer (...)` or `for@outer (...)`, then target it as `break@outer value` or
 `continue@outer`. A block is labeled `outer@{ ... }`; `return@outer value` completes that block,
 and all such returns unify with its direct tail value. A callable body is a boundary: control can
 never target a construct outside the current callable. Unlabeled return still targets the nearest

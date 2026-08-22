@@ -12,14 +12,14 @@ use lsp_server::{
 	Response,
 };
 use lsp_types::{
-	CompletionParams, DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-	DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentFormattingParams,
-	DocumentRangeFormattingParams, DocumentSymbolParams, GotoDefinitionParams, HoverParams,
-	PublishDiagnosticsParams, ReferenceParams, RenameParams, SemanticTokensParams, Uri,
-	WorkspaceSymbolParams,
+	CompletionParams, DidChangeConfigurationParams, DidChangeTextDocumentParams,
+	DidChangeWatchedFilesParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+	DocumentFormattingParams, DocumentRangeFormattingParams, DocumentSymbolParams,
+	GotoDefinitionParams, HoverParams, PublishDiagnosticsParams, ReferenceParams, RenameParams,
+	SemanticTokensParams, Uri, WorkspaceSymbolParams,
 	notification::{
-		DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
-		Notification as _, PublishDiagnostics,
+		DidChangeConfiguration, DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument,
+		DidOpenTextDocument, Notification as _, PublishDiagnostics,
 	},
 	request::{
 		Completion, DocumentSymbolRequest, Formatting, GotoDefinition, HoverRequest,
@@ -1369,6 +1369,20 @@ fn handle_notification(
 	}
 
 	match notification.method.as_str() {
+		method if method == DidChangeConfiguration::METHOD => {
+			let Some(params) =
+				decode_notification_params::<DidChangeConfigurationParams>(notification.params)
+			else {
+				return Ok(false);
+			};
+			let Some(profile) = configured_build_profile(&params.settings) else {
+				return Ok(false);
+			};
+			let changed = owner.documents.lock().unwrap().set_build_profile(profile);
+			if changed {
+				schedule_profile_diagnostics(owner)?;
+			}
+		}
 		method if method == DidOpenTextDocument::METHOD => {
 			let Some(params) =
 				decode_notification_params::<DidOpenTextDocumentParams>(notification.params)
@@ -1442,6 +1456,38 @@ fn handle_notification(
 
 fn decode_notification_params<T: DeserializeOwned>(params: serde_json::Value) -> Option<T> {
 	serde_json::from_value(params).ok()
+}
+
+#[derive(Default, serde::Deserialize)]
+struct NymphConfiguration {
+	#[serde(default, rename = "buildProfile")]
+	build_profile: nymph_compiler::BuildProfile,
+}
+
+fn configured_build_profile(settings: &serde_json::Value) -> Option<nymph_compiler::BuildProfile> {
+	let settings = settings.get("nymph").unwrap_or(settings);
+	serde_json::from_value::<NymphConfiguration>(settings.clone())
+		.ok()
+		.map(|configuration| configuration.build_profile)
+}
+
+fn schedule_profile_diagnostics(owner: &mut ProtocolOwner<'_>) -> anyhow::Result<()> {
+	let mut uris = owner
+		.documents
+		.lock()
+		.unwrap()
+		.iter()
+		.map(|(uri, _)| uri.clone())
+		.collect::<Vec<_>>();
+	uris.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+	let mut scheduled = HashSet::new();
+	for uri in uris {
+		let key = owner.diagnostic_key_for_uri(&uri);
+		if scheduled.insert(key) {
+			schedule_document_diagnostics(owner, uri, false)?;
+		}
+	}
+	Ok(())
 }
 
 fn schedule_document_diagnostics(
@@ -3162,5 +3208,21 @@ mod tests {
 		);
 		assert_eq!(recv_response(&client).id, RequestId::from(41));
 		owner.finish();
+	}
+
+	#[test]
+	fn workspace_configuration_selects_only_known_compiler_profiles() {
+		assert_eq!(
+			configured_build_profile(&serde_json::json!({})),
+			Some(nymph_compiler::BuildProfile::Development)
+		);
+		assert_eq!(
+			configured_build_profile(&serde_json::json!({ "nymph": { "buildProfile": "release" } })),
+			Some(nymph_compiler::BuildProfile::Release)
+		);
+		assert_eq!(
+			configured_build_profile(&serde_json::json!({ "buildProfile": "invalid" })),
+			None
+		);
 	}
 }

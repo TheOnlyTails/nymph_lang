@@ -1,4 +1,4 @@
-//! The external-linkage registry: a table mapping an
+//! The external-linkage registry (Gap 3, L0/L1): a table mapping an
 //! `external(name)` MARKER (the identifier a stdlib `.nym` declaration writes
 //! inside the `external(..)` parens — e.g. `external(length) func length():
 //! uint`) to the real JS module specifier + exported symbol name that
@@ -12,27 +12,14 @@
 //!
 //! # Key: marker name, RECEIVER-TAG-DISAMBIGUATED where needed
 //!
-//! A bare marker name is insufficient because `list.nym` (both its `mut #[T]`
-//! and plain `#[T]`
-//! impls) AND `map.nym`'s `mut #{K: V}` impl all declare their OWN
-//! `external(get)` — same bare marker, three DIFFERENT JS implementations
-//! (`list.ts`'s `get` vs a future `map.ts`'s `get`). A bare-name lookup would
-//! mislink `map`'s `get` to `list`'s the instant `get` gained ANY entry, so
-//! [`lookup`] also takes the caller's RECEIVER TAG (the same tag
-//! `nymph-sema`'s `inherent_self_type_tag` already computes to key a
-//! materialized prelude method's mangled name — `"list"`/`"mut_list"`/
-//! `"map"`/`"mut_map"`/… ) and an entry only matches when its own
+//! Lists, maps, and strings share markers such as `get` and `length`, but use
+//! different JavaScript implementations. A bare-name lookup could therefore
+//! link a receiver to the wrong adapter. [`lookup`] also takes the caller's
+//! receiver tag, and an entry only matches when its own
 //! [`Linked::receiver_tag`] is either `None` (an UNAMBIGUOUS marker, safe
 //! against any receiver — `first`/`last`/`pop` today, each declared by exactly
 //! one collection) or exactly equal to the caller's tag (an AMBIGUOUS marker
 //! like `get` or `length`, disambiguated per receiver).
-//!
-//! `List`'s `mut #[T]` and plain `#[T]` impls both declare `get` against the
-//! SAME `list.ts` symbol (mutability doesn't change how reading an element
-//! works), so `get` gets two registry rows — `"list"` and `"mut_list"` — both
-//! pointing at `list.ts`'s `get`; `Map`'s `get` is deliberately NOT
-//! registered at all (no `map.ts` runtime exists), so a `Map` receiver's `get`
-//! fails `lookup` and remains a loud external defer.
 use rustc_hash::FxHashMap;
 
 use crate::hir::{BinOp, BuiltinResult, MarshalKind, UnOp};
@@ -52,8 +39,7 @@ pub struct Linked {
 	/// exactly one collection declares it). `Some(tag)` for an AMBIGUOUS
 	/// marker shared by multiple receiver types with DIFFERENT JS
 	/// implementations — only matches a [`lookup`] whose caller-supplied tag
-	/// is exactly `tag` (mirrors `nymph-sema`'s `inherent_self_type_tag`:
-	/// `"list"`/`"mut_list"`/`"map"`/`"mut_map"`/the six primitive tags/…).
+	/// is exactly `tag` (mirrors `nymph-sema`'s `inherent_self_type_tag`).
 	pub receiver_tag: Option<&'static str>,
 }
 
@@ -72,18 +58,15 @@ pub enum ExternalEffect {
 pub fn external_effect(module: &str, symbol: &str) -> ExternalEffect {
 	match (module, symbol) {
 		("std/io", "print" | "println") => ExternalEffect::IrreversibleHostIo,
-		("std/display", "display" | "debug")
-		| ("std/equality", "equals" | "primitive_equals" | "not_equals")
-		| ("std/hash", "hash")
-		| (
-			"std/collections/list",
-			"length" | "get" | "slice" | "to_string" | "push" | "splice" | "insert" | "clear" | "remove",
-		)
+		("std/equality", "primitive_equals")
+		| ("std/collections/list", "length" | "get" | "slice")
 		| (
 			"std/collections/map",
-			"get" | "insert" | "remove" | "clear" | "size" | "keys" | "values" | "entries" | "to_string",
+			"get" | "size" | "keys" | "values" | "entries" | "inserted" | "removed",
 		) => ExternalEffect::TransactionAware,
-		("std/comparison", "compare_char" | "compare_string")
+		("std/collections/set", "set_inserted" | "set_removed")
+		| ("std/comparison", "compare_char" | "compare_string")
+		| ("std/collections/list", "appended" | "replaced")
 		| (
 			"std/math/intrinsics",
 			"sin" | "cos" | "tan" | "asin" | "acos" | "atan" | "sinh" | "cosh" | "tanh" | "asinh"
@@ -199,50 +182,10 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 		math_intrinsic("power_domain_error", None),
 	),
 	(
-		"display",
-		Linked {
-			module: "std/display",
-			symbol: "display",
-			receiver_tag: None,
-		},
-	),
-	(
-		"debug",
-		Linked {
-			module: "std/display",
-			symbol: "debug",
-			receiver_tag: None,
-		},
-	),
-	(
-		"equals",
-		Linked {
-			module: "std/equality",
-			symbol: "equals",
-			receiver_tag: None,
-		},
-	),
-	(
 		"primitive_equals",
 		Linked {
 			module: "std/equality",
 			symbol: "primitive_equals",
-			receiver_tag: None,
-		},
-	),
-	(
-		"not_equals",
-		Linked {
-			module: "std/equality",
-			symbol: "not_equals",
-			receiver_tag: None,
-		},
-	),
-	(
-		"hash",
-		Linked {
-			module: "std/hash",
-			symbol: "hash",
 			receiver_tag: None,
 		},
 	),
@@ -271,27 +214,11 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 		},
 	),
 	(
-		"length",
-		Linked {
-			module: "std/collections/list",
-			symbol: "length",
-			receiver_tag: Some("mut_list"),
-		},
-	),
-	(
 		"get",
 		Linked {
 			module: "std/collections/list",
 			symbol: "get",
 			receiver_tag: Some("list"),
-		},
-	),
-	(
-		"get",
-		Linked {
-			module: "std/collections/list",
-			symbol: "get",
-			receiver_tag: Some("mut_list"),
 		},
 	),
 	(
@@ -303,54 +230,22 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 		},
 	),
 	(
-		"to_string",
+		"appended",
 		Linked {
 			module: "std/collections/list",
-			symbol: "to_string",
-			receiver_tag: Some("list"),
-		},
-	),
-	(
-		"push",
-		Linked {
-			module: "std/collections/list",
-			symbol: "push",
+			symbol: "appended",
 			receiver_tag: None,
 		},
 	),
 	(
-		"splice",
+		"replaced",
 		Linked {
 			module: "std/collections/list",
-			symbol: "splice",
+			symbol: "replaced",
 			receiver_tag: None,
 		},
 	),
-	(
-		"insert",
-		Linked {
-			module: "std/collections/list",
-			symbol: "insert",
-			receiver_tag: Some("mut_list"),
-		},
-	),
-	(
-		"clear",
-		Linked {
-			module: "std/collections/list",
-			symbol: "clear",
-			receiver_tag: Some("mut_list"),
-		},
-	),
-	(
-		"remove",
-		Linked {
-			module: "std/collections/list",
-			symbol: "remove",
-			receiver_tag: Some("mut_list"),
-		},
-	),
-	// Free-function externals: a top-level `external`
+	// Free-function externals (the print/io slice): a top-level `external`
 	// func (no enclosing `impl`, so no receiver at all) links exactly like
 	// any other marker, just with `receiver_tag: None` — `lookup(marker,
 	// None)` (a top-level `Declaration::ExternalFunc` has no receiver-type
@@ -373,48 +268,13 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 			receiver_tag: None,
 		},
 	),
-	// `map.nym`'s primitive markers. Its mut impl puts `size`/`get`/`insert`/
-	// `remove`/`clear` in `impl<K,V> mut #{K:V}` (tag `"mut_map"`,
-	// per `inherent_self_type_tag`'s IMPL-mutability-keyed tagging — a
-	// non-mut receiver calling one of these still tags `mut_map`, since the
-	// tag comes from the impl block, not the call-site receiver) —
-	// `keys`/`values`/`entries` live in the non-mut impl. `get`/`insert`/
-	// `remove`/`clear` collide with `list.nym`'s own markers of the same
-	// name (registered above under `"list"`/`"mut_list"`), so each needs
-	// `Some("mut_map")` to stay `Map`-only; `size` is unique. `to_string`
-	// (the marker behind `Into<string> for
-	// #{K:V}`'s `into`) collides with `list.nym`'s own `to_string`
-	// (registered `Some("list")` above), so it needs `Some("map")`.
+	// Map and list share the `get` marker; the receiver tag selects the matching JS implementation.
 	(
 		"get",
 		Linked {
 			module: "std/collections/map",
 			symbol: "get",
-			receiver_tag: Some("mut_map"),
-		},
-	),
-	(
-		"insert",
-		Linked {
-			module: "std/collections/map",
-			symbol: "insert",
-			receiver_tag: Some("mut_map"),
-		},
-	),
-	(
-		"remove",
-		Linked {
-			module: "std/collections/map",
-			symbol: "remove",
-			receiver_tag: Some("mut_map"),
-		},
-	),
-	(
-		"clear",
-		Linked {
-			module: "std/collections/map",
-			symbol: "clear",
-			receiver_tag: Some("mut_map"),
+			receiver_tag: Some("map"),
 		},
 	),
 	(
@@ -450,11 +310,35 @@ pub const REGISTRY: &[(&str, Linked)] = &[
 		},
 	),
 	(
-		"to_string",
+		"inserted",
 		Linked {
 			module: "std/collections/map",
-			symbol: "to_string",
-			receiver_tag: Some("map"),
+			symbol: "inserted",
+			receiver_tag: None,
+		},
+	),
+	(
+		"removed",
+		Linked {
+			module: "std/collections/map",
+			symbol: "removed",
+			receiver_tag: None,
+		},
+	),
+	(
+		"set_inserted",
+		Linked {
+			module: "std/collections/set",
+			symbol: "set_inserted",
+			receiver_tag: None,
+		},
+	),
+	(
+		"set_removed",
+		Linked {
+			module: "std/collections/set",
+			symbol: "set_removed",
+			receiver_tag: None,
 		},
 	),
 	// `string.nym`'s host primitives. `string` is a primitive, so its receiver
@@ -673,7 +557,7 @@ pub fn is_value_marker(name: &str) -> bool {
 /// to keep (after stripping/filtering the `.ts` source) so an unrelated,
 /// still-unlinked import (e.g. `Option`, when nothing kept still references
 /// it) never becomes a fatal bundle-resolution failure. Deduped because an
-/// ambiguous marker like `get` contributes MULTIPLE registry rows (one
+/// ambiguous marker like `get` now contributes MULTIPLE registry rows (one
 /// per receiver tag) that all name the SAME `(module, symbol)` pair —
 /// without deduping, `strip_ts_to_js`'s `keep` list would carry a duplicate
 /// entry, harmless there (`Vec::contains`) but not the honest "one row per
@@ -734,12 +618,9 @@ mod tests {
 
 	#[test]
 	fn length_links_to_the_canonical_module_for_each_supported_receiver() {
-		for receiver in ["list", "mut_list"] {
-			let linked =
-				lookup("length", Some(receiver)).expect("`length` must be linked for list receivers");
-			assert_eq!(linked.module, "std/collections/list");
-			assert_eq!(linked.symbol, "length");
-		}
+		let list = lookup("length", Some("list")).expect("`length` must be linked for list receivers");
+		assert_eq!(list.module, "std/collections/list");
+		assert_eq!(list.symbol, "length");
 
 		let string =
 			lookup("length", Some("string")).expect("`length` must be linked for a string receiver");
@@ -771,31 +652,22 @@ mod tests {
 		let list = lookup("get", Some("list")).expect("`get` must be linked for a `list` receiver");
 		assert_eq!(list.module, "std/collections/list");
 		assert_eq!(list.symbol, "get");
-		let mut_list =
-			lookup("get", Some("mut_list")).expect("`get` must be linked for a `mut_list` receiver");
-		assert_eq!(mut_list.module, "std/collections/list");
-		assert_eq!(mut_list.symbol, "get");
+		assert!(lookup("get", Some("mut_list")).is_none());
 	}
 
 	#[test]
-	fn get_links_to_map_only_for_a_mut_map_receiver() {
-		// `map.nym` declares `get` in its `impl<K,V> mut #{K:V}` block, so
-		// it links under `"mut_map"` — a DIFFERENT JS implementation than
-		// `list`'s `get`, disambiguated by the receiver tag (a bare-name
-		// lookup would have mislinked one to the other). A non-mut `"map"`
-		// receiver never reaches `get` (the impl itself is `mut`-only), and a
-		// tag-less caller stays unresolved too.
-		let mut_map =
-			lookup("get", Some("mut_map")).expect("`get` must be linked for a `mut_map` receiver");
-		assert_eq!(mut_map.module, "std/collections/map");
-		assert_eq!(mut_map.symbol, "get");
-		assert!(lookup("get", Some("map")).is_none());
+	fn get_links_to_map_only_for_an_immutable_map_receiver() {
+		let map = lookup("get", Some("map")).expect("`get` must be linked for a `map` receiver");
+		assert_eq!(map.module, "std/collections/map");
+		assert_eq!(map.symbol, "get");
+		assert!(lookup("get", Some("mut_map")).is_none());
 		assert!(lookup("get", None).is_none());
 	}
 
 	#[test]
 	fn an_unlinked_marker_is_none() {
-		// Iterator/range remains an unlinked surface.
+		// The collection AND string markers are all linked now — retarget to a
+		// genuinely still-unlinked surface (iterator/range) instead.
 		assert!(lookup("iter", Some("list")).is_none());
 		assert!(lookup("len", Some("list")).is_none());
 	}
@@ -808,39 +680,17 @@ mod tests {
 			vec![
 				(
 					"std/collections/list",
-					vec![
-						"clear",
-						"get",
-						"insert",
-						"length",
-						"push",
-						"remove",
-						"slice",
-						"splice",
-						"to_string",
-					]
+					vec!["appended", "get", "length", "replaced", "slice"]
 				),
 				(
 					"std/collections/map",
 					vec![
-						"clear",
-						"entries",
-						"get",
-						"insert",
-						"keys",
-						"remove",
-						"size",
-						"to_string",
-						"values",
+						"entries", "get", "inserted", "keys", "removed", "size", "values"
 					]
 				),
+				("std/collections/set", vec!["set_inserted", "set_removed"]),
 				("std/comparison", vec!["compare_char", "compare_string"]),
-				("std/display", vec!["debug", "display"]),
-				(
-					"std/equality",
-					vec!["equals", "not_equals", "primitive_equals"]
-				),
-				("std/hash", vec!["hash"]),
+				("std/equality", vec!["primitive_equals"]),
 				("std/io", vec!["print", "println"]),
 				(
 					"std/math/intrinsics",
@@ -890,13 +740,6 @@ mod tests {
 	}
 
 	#[test]
-	fn hash_links_to_the_blanket_runtime_intrinsic() {
-		let linked = lookup("hash", None).expect("`hash` must be linked");
-		assert_eq!(linked.module, "std/hash");
-		assert_eq!(linked.symbol, "hash");
-	}
-
-	#[test]
 	fn comparison_leaves_are_linked_host_primitives() {
 		for symbol in ["compare_char", "compare_string"] {
 			let linked = lookup(symbol, None).expect("comparison leaf must be linked");
@@ -923,11 +766,7 @@ mod tests {
 		);
 		assert!(matches!(
 			resolve("equals", None, None, None),
-			ExternalCallable::Linked(Linked {
-				module: "std/equality",
-				symbol: "equals",
-				..
-			})
+			ExternalCallable::Deferred
 		));
 		assert_eq!(
 			resolve(
@@ -976,7 +815,6 @@ mod tests {
 
 		for module in [
 			"std/io",
-			"std/display",
 			"std/collections/list",
 			"std/math/intrinsics",
 			"std/string",

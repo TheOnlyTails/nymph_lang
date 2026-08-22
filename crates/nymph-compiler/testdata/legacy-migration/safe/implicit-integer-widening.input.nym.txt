@@ -1,0 +1,1 @@
+func widen(value: uint): int = value

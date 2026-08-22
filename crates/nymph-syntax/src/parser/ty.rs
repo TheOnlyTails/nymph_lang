@@ -2,9 +2,12 @@
 
 use crate::errors::ParseError;
 use nymph_ast::{
-	Spanned,
+	Span, Spanned,
 	token::Token,
-	ty::{FunctionTypeParam, GenericArg, GenericParam, Type},
+	ty::{
+		Effect, EffectRow, FunctionTypeParam, GenericArg, GenericArgValue, GenericParam,
+		GenericParamKind, Type,
+	},
 };
 
 use super::Parser;
@@ -14,7 +17,7 @@ impl Parser<'_> {
 	pub(super) fn parse_type(&mut self) -> Spanned<Type> {
 		let start = self.position();
 		let mut lhs = self.parse_type_primary();
-		while self.check(&Token::Plus) {
+		while self.check(&Token::Plus) && self.peek_nth(1) != Some(&Token::Bang) {
 			self.advance();
 			let rhs = self.parse_type_primary();
 			let span = self.span_from(start);
@@ -25,18 +28,6 @@ impl Parser<'_> {
 
 	fn parse_type_primary(&mut self) -> Spanned<Type> {
 		let start = self.position();
-
-		// `mut T` — nests at primary level (not the outer `+` loop) so it can wrap
-		// anywhere a primary type can appear: map values, list elements, generic
-		// args, fn params/returns. `mut A + B` therefore parses as `(mut A) + B`;
-		// `mut (A + B)` needs explicit parens. Distinct from binding-position
-		// `mut` (`let mut`, `mut` params), which is always consumed before the `:`
-		// / `->` that precedes any type, so there is no ambiguity here.
-		if self.check(&Token::Mut) {
-			self.advance();
-			let inner = self.parse_type_primary();
-			return Spanned(Type::Mut(Box::new(inner)), self.span_from(start));
-		}
 
 		let Some(token) = self.peek() else {
 			let span = self.current_span();
@@ -119,11 +110,12 @@ impl Parser<'_> {
 		let params = self.comma_separated(&Token::RParen, |p| p.parse_fn_type_param());
 
 		if self.eat(&Token::Arrow).is_some() {
-			let return_type = self.parse_type();
+			let (return_type, effects) = self.parse_callable_return();
 			return Spanned(
 				Type::Function {
 					params,
 					return_type: Box::new(return_type),
+					effects,
 				},
 				self.span_from(start),
 			);
@@ -159,11 +151,99 @@ impl Parser<'_> {
 		let start = self.position();
 		let name = self.expect_ident();
 		let generics = self.parse_generic_args();
-		Spanned(Type::Reference { name, generics }, self.span_from(start))
+		if self.eat(&Token::Dot).is_some() {
+			let variant = self.expect_ident();
+			Spanned(
+				Type::Reference {
+					name: Spanned(
+						format!("{}.{}", name.0, variant.0).into(),
+						self.span_from(start),
+					),
+					generics,
+				},
+				self.span_from(start),
+			)
+		} else {
+			Spanned(Type::Reference { name, generics }, self.span_from(start))
+		}
 	}
 
-	/// Parse `<A, Output = B>` if present, else an empty list. Each argument may be
-	/// labelled (`Output = T`).
+	/// Parse the value/effect result after a callable's `:` or `->`.
+	pub(super) fn parse_callable_return(&mut self) -> (Spanned<Type>, Option<Spanned<EffectRow>>) {
+		if self.check(&Token::Bang) {
+			let effects = self.parse_effect_row();
+			return (Spanned(Type::Void, effects.1), Some(effects));
+		}
+
+		let return_type = self.parse_type();
+		let effects = if self.check(&Token::Plus) && self.peek_nth(1) == Some(&Token::Bang) {
+			self.advance();
+			Some(self.parse_effect_row())
+		} else {
+			None
+		};
+		(return_type, effects)
+	}
+
+	pub(super) fn parse_effect_row(&mut self) -> Spanned<EffectRow> {
+		let start = self.position();
+		let mut effects = Vec::new();
+		loop {
+			let bang = self
+				.eat(&Token::Bang)
+				.unwrap_or_else(|| self.current_span());
+			let effect = match self.peek() {
+				Some(Token::LParen) => {
+					self.advance();
+					self.expect(&Token::RParen);
+					None
+				}
+				Some(Token::Underscore) => {
+					let span = self.advance().map_or(bang, |token| token.1);
+					Some(Spanned(Effect::Infer, Span::new(bang.start, span.end)))
+				}
+				Some(Token::Identifier(_)) => {
+					let name = self.expect_ident();
+					Some(Spanned(
+						Effect::Named(name.clone()),
+						Span::new(bang.start, name.1.end),
+					))
+				}
+				other => {
+					let span = self.current_span();
+					let found = other.map_or("end of input", Token::describe);
+					self.emit(
+						span,
+						ParseError::ExpectedEffect {
+							found: found.into(),
+						},
+					);
+					Some(Spanned(Effect::Error, Span::new(bang.start, span.end)))
+				}
+			};
+			if let Some(effect) = effect {
+				effects.push(effect);
+			}
+			if self.eat(&Token::Plus).is_none() {
+				break;
+			}
+			if !self.check(&Token::Bang) {
+				let span = self.current_span();
+				let found = self.peek().map_or("end of input", Token::describe);
+				self.emit(
+					span,
+					ParseError::ExpectedEffectAfterPlus {
+						found: found.into(),
+					},
+				);
+				effects.push(Spanned(Effect::Error, span));
+				break;
+			}
+		}
+		Spanned(EffectRow { effects }, self.span_from(start))
+	}
+
+	/// Parse `<A, !E, Output = B, Effects = !Io>` if present.
 	pub(super) fn parse_generic_args(&mut self) -> Vec<Spanned<GenericArg>> {
 		if !self.check(&Token::Lt) {
 			return Vec::new();
@@ -181,9 +261,17 @@ impl Parser<'_> {
 			} else {
 				None
 			};
-			let value = self.parse_type();
+			let value = if self.check(&Token::Bang) {
+				GenericArgValue::Effect(self.parse_effect_row())
+			} else {
+				GenericArgValue::Type(self.parse_type())
+			};
 			args.push(Spanned(GenericArg { value, name }, self.span_from(start)));
-			if self.eat(&Token::Comma).is_none() {
+			if self.eat(&Token::Comma).is_none()
+				&& !(self.check(&Token::Plus)
+					&& self.peek_nth(1) == Some(&Token::Bang)
+					&& self.advance().is_some())
+			{
 				break;
 			}
 		}
@@ -191,7 +279,7 @@ impl Parser<'_> {
 		args
 	}
 
-	/// Parse `<T, U: Constraint, V = Default>` generic *parameters* if present.
+	/// Parse `<T, U: Constraint, !E>` generic parameters if present.
 	pub(super) fn parse_generic_params(&mut self) -> Vec<Spanned<GenericParam>> {
 		if !self.check(&Token::Lt) {
 			return Vec::new();
@@ -200,13 +288,18 @@ impl Parser<'_> {
 		let mut params = Vec::new();
 		while !self.check(&Token::Gt) && !self.at_end() {
 			let start = self.position();
+			let kind = if self.eat(&Token::Bang).is_some() {
+				GenericParamKind::Effect
+			} else {
+				GenericParamKind::Type
+			};
 			let name = self.expect_ident();
-			let constraint = if self.eat(&Token::Colon).is_some() {
+			let constraint = if kind == GenericParamKind::Type && self.eat(&Token::Colon).is_some() {
 				Some(self.parse_type())
 			} else {
 				None
 			};
-			let default = if self.eat(&Token::Eq).is_some() {
+			let default = if kind == GenericParamKind::Type && self.eat(&Token::Eq).is_some() {
 				Some(self.parse_type())
 			} else {
 				None
@@ -214,12 +307,17 @@ impl Parser<'_> {
 			params.push(Spanned(
 				GenericParam {
 					name,
+					kind,
 					constraint,
 					default,
 				},
 				self.span_from(start),
 			));
-			if self.eat(&Token::Comma).is_none() {
+			if self.eat(&Token::Comma).is_none()
+				&& !(self.check(&Token::Plus)
+					&& self.peek_nth(1) == Some(&Token::Bang)
+					&& self.advance().is_some())
+			{
 				break;
 			}
 		}

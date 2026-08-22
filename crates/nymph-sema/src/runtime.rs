@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use ecow::EcoString;
 use nymph_ast::{
+	Span,
 	decl::{
 		FuncDeclaration, FuncParam, ImplMember, InterfaceElement, InterfaceMember, LetDeclaration,
 	},
@@ -16,9 +17,7 @@ use nymph_ast::{
 		Pattern, RangeKind, RangePatternKind, Statement, StringEscape, StringPart, StringPatternPart,
 		StructPatternField,
 	},
-	ops::{
-		AssignOperator, BinaryOperator, PatternOperator, PostfixOperator, PrefixOperator, TypeOperator,
-	},
+	ops::{BinaryOperator, PatternOperator, PostfixOperator, PrefixOperator, TypeOperator},
 };
 
 use crate::{
@@ -32,16 +31,228 @@ pub struct BodyNodeId(pub u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
 pub struct PatternNodeId(pub u32);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+pub enum RangeDecision {
+	Invalid,
+	Safe,
+	Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+pub enum RangeOperation {
+	Arithmetic,
+	Division,
+	Remainder,
+	Power,
+	Shift,
+	Conversion,
+	HostIndex,
+	Index,
+	SliceExclusive,
+	SliceInclusive,
+}
+
+/// Canonical evidence retained with a body-local range decision. Intervals use
+/// `i128`, which exactly contains every source `int`/`uint` value and the signed
+/// pair bounds needed by the bounded proof domain.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+pub enum RangeEvidence {
+	Interval {
+		min: i128,
+		max: i128,
+	},
+	Target {
+		min: i128,
+		max: i128,
+	},
+	Excluded {
+		operand: u8,
+		value: i128,
+	},
+	SignedPairBound {
+		left_sign: i8,
+		right_sign: i8,
+		upper: i128,
+	},
+	KnownLength(u64),
+	SliceBound {
+		min: i128,
+		max: i128,
+		inclusive: bool,
+	},
+	SymbolicSliceBound {
+		min: i128,
+		max: i128,
+		inclusive: bool,
+		lower: bool,
+		upper: bool,
+	},
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, salsa::SalsaValue)]
+pub struct RangeProof {
+	pub operation: RangeOperation,
+	pub decision: RangeDecision,
+	pub evidence: Arc<[RangeEvidence]>,
+}
+
+impl RangeProof {
+	/// Replays the compact certificate without consulting checker state. Safe and
+	/// invalid decisions must carry evidence; unknown decisions deliberately may
+	/// carry only the declared operand interval.
+	pub fn audit(&self) -> bool {
+		if self.decision == RangeDecision::Unknown {
+			return true;
+		}
+		let intervals = self
+			.evidence
+			.iter()
+			.filter_map(|evidence| match evidence {
+				RangeEvidence::Interval { min, max } => Some((*min, *max)),
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		let target = self.evidence.iter().find_map(|evidence| match evidence {
+			RangeEvidence::Target { min, max } => Some((*min, *max)),
+			_ => None,
+		});
+		let length = self.evidence.iter().find_map(|evidence| match evidence {
+			RangeEvidence::KnownLength(length) => Some(*length as i128),
+			_ => None,
+		});
+		let classify_interval = |interval: Option<&(i128, i128)>, target: Option<(i128, i128)>| {
+			let (Some(&(min, max)), Some((lo, hi))) = (interval, target) else {
+				return RangeDecision::Unknown;
+			};
+			if min >= lo && max <= hi {
+				RangeDecision::Safe
+			} else if max < lo || min > hi {
+				RangeDecision::Invalid
+			} else {
+				RangeDecision::Unknown
+			}
+		};
+		let replayed = match self.operation {
+			RangeOperation::Arithmetic => classify_interval(intervals.last(), target),
+			RangeOperation::Conversion => classify_interval(intervals.first(), target),
+			RangeOperation::Division | RangeOperation::Remainder => {
+				if intervals.get(1) == Some(&(0, 0)) {
+					RangeDecision::Invalid
+				} else if self.evidence.iter().any(|evidence| {
+					matches!(
+						evidence,
+						RangeEvidence::Excluded {
+							operand: 1,
+							value: 0
+						}
+					)
+				}) {
+					RangeDecision::Safe
+				} else {
+					RangeDecision::Unknown
+				}
+			}
+			RangeOperation::Shift => match intervals.get(1) {
+				Some((min, max)) if *max < 0 || *min >= 64 => RangeDecision::Invalid,
+				Some((min, max)) if *min >= 0 && *max < 64 => classify_interval(intervals.last(), target),
+				_ => RangeDecision::Unknown,
+			},
+			RangeOperation::Index => intervals
+				.first()
+				.is_some_and(|&(min, max)| {
+					length.is_some_and(|length| min >= -length && max < length)
+						|| self.evidence.iter().any(|evidence| match evidence {
+							RangeEvidence::SignedPairBound {
+								left_sign: 1,
+								right_sign: -1,
+								upper,
+							} => min >= 0 && *upper <= -1,
+							RangeEvidence::SignedPairBound {
+								left_sign: -1,
+								right_sign: -1,
+								upper,
+							} => max <= -1 && *upper <= 0,
+							_ => false,
+						})
+				})
+				.then_some(RangeDecision::Safe)
+				.unwrap_or_else(|| match (intervals.first(), length) {
+					(Some((min, max)), Some(length)) if *max < -length || *min >= length => {
+						RangeDecision::Invalid
+					}
+					_ => RangeDecision::Unknown,
+				}),
+			RangeOperation::SliceExclusive | RangeOperation::SliceInclusive => {
+				let bounds = self
+					.evidence
+					.iter()
+					.filter_map(|evidence| match evidence {
+						RangeEvidence::SliceBound {
+							min,
+							max,
+							inclusive,
+						} if length.is_some() => {
+							let length = length.unwrap();
+							let maximum = if *inclusive { length - 1 } else { length };
+							Some(if *min >= -length && *max <= maximum {
+								RangeDecision::Safe
+							} else if *max < -length || *min > maximum {
+								RangeDecision::Invalid
+							} else {
+								RangeDecision::Unknown
+							})
+						}
+						RangeEvidence::SymbolicSliceBound {
+							min,
+							max,
+							inclusive: _,
+							lower,
+							upper,
+						} => Some(if (*min >= 0 || *lower) && (*max < 0 || *upper) {
+							RangeDecision::Safe
+						} else {
+							RangeDecision::Unknown
+						}),
+						_ => None,
+					})
+					.collect::<Vec<_>>();
+				if bounds.is_empty() {
+					RangeDecision::Unknown
+				} else {
+					bounds
+						.into_iter()
+						.fold(RangeDecision::Safe, |left, right| match (left, right) {
+							(RangeDecision::Invalid, _) | (_, RangeDecision::Invalid) => RangeDecision::Invalid,
+							(RangeDecision::Unknown, _) | (_, RangeDecision::Unknown) => RangeDecision::Unknown,
+							_ => RangeDecision::Safe,
+						})
+				}
+			}
+			RangeOperation::HostIndex => match intervals.first() {
+				Some((min, max)) if *min >= 0 && *max <= 9_007_199_254_740_991 => RangeDecision::Safe,
+				Some((min, max)) if *max < 0 || *min > 9_007_199_254_740_991 => RangeDecision::Invalid,
+				_ => RangeDecision::Unknown,
+			},
+			RangeOperation::Power => match intervals.get(1) {
+				Some((_, max)) if *max < 0 => RangeDecision::Invalid,
+				Some((min, _)) if *min >= 0 => classify_interval(intervals.last(), target),
+				_ => RangeDecision::Unknown,
+			},
+		};
+		replayed == self.decision
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub struct StableBody {
 	pub params: Arc<[StableParameter]>,
 	pub root: StableExpr,
+	pub is_async: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub struct StableParameter {
 	pub pattern: StablePattern,
-	pub mutable: bool,
 	pub spread: bool,
 }
 
@@ -83,6 +294,8 @@ pub enum StableExprKind {
 		params: Arc<[StableParameter]>,
 		body: Box<StableExpr>,
 	},
+	AsyncBlock(Box<StableExpr>),
+	Await(Box<StableExpr>),
 	PrefixOp {
 		op: PrefixOperator,
 		value: Box<StableExpr>,
@@ -106,11 +319,6 @@ pub enum StableExprKind {
 		op: PatternOperator,
 		rhs: StablePattern,
 	},
-	AssignOp {
-		lhs: Box<StableExpr>,
-		op: AssignOperator,
-		rhs: Box<StableExpr>,
-	},
 	Return {
 		value: Option<Box<StableExpr>>,
 		label: Option<EcoString>,
@@ -121,15 +329,20 @@ pub enum StableExprKind {
 	},
 	Continue {
 		label: Option<EcoString>,
+		replacements: Arc<[StableStateReplacement]>,
 	},
-	While {
-		condition: Box<StableExpr>,
-		body: Box<StableExpr>,
-		label: Option<EcoString>,
+	Echo {
+		operand: Box<StableExpr>,
+		keyword: Span,
 	},
 	For {
 		variable: StablePattern,
 		iterable: Box<StableExpr>,
+		body: Box<StableExpr>,
+		label: Option<EcoString>,
+	},
+	StateLoop {
+		bindings: Arc<[StableStateBinding]>,
 		body: Box<StableExpr>,
 		label: Option<EcoString>,
 	},
@@ -173,6 +386,17 @@ pub struct StableCallArg {
 	pub spread: bool,
 }
 #[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub struct StableStateBinding {
+	pub name: EcoString,
+	pub managed: bool,
+	pub value: StableExpr,
+}
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub struct StableStateReplacement {
+	pub name: EcoString,
+	pub value: StableExpr,
+}
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub enum StableRange {
 	From(Box<StableExpr>),
 	To(Box<StableExpr>),
@@ -191,7 +415,7 @@ pub enum StableStatement {
 	Expr(StableExpr),
 	Let {
 		pattern: StablePattern,
-		mutable: bool,
+		managed: bool,
 		value: StableExpr,
 	},
 }
@@ -281,6 +505,7 @@ pub enum StablePatternRange {
 pub enum BuiltinDispatch {
 	Eager,
 	ShortCircuit,
+	StructuralEquality,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
@@ -364,12 +589,26 @@ pub struct PatternVariant {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub enum StableStructConstructionMode {
+	Fresh,
+	CloneUpdate { source: BodyNodeId },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub struct StableStructConstructionPlan {
+	pub definition: DefinitionId,
+	pub mode: StableStructConstructionMode,
+	pub explicit_fields: Arc<[(DefinitionId, BodyNodeId)]>,
+	pub omitted_defaults: Arc<[DefinitionId]>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum RuntimeIteration {
 	Direct {
 		iterator_interface: DefinitionId,
 		next: DefinitionId,
 		next_dispatch: Option<StableDispatch>,
-		option: crate::OptionRuntimeRole,
+		iteration: crate::IterationRuntimeRole,
 	},
 	ViaIter {
 		iterable_interface: DefinitionId,
@@ -378,7 +617,7 @@ pub enum RuntimeIteration {
 		iterator_interface: DefinitionId,
 		next: DefinitionId,
 		next_dispatch: Option<StableDispatch>,
-		option: crate::OptionRuntimeRole,
+		iteration: crate::IterationRuntimeRole,
 	},
 }
 
@@ -398,13 +637,15 @@ pub struct RuntimeAnnotations {
 	pub option: Option<crate::OptionRuntimeRole>,
 	pub result: Option<crate::ResultRuntimeRole>,
 	pub types: Arc<[(BodyNodeId, InterfaceType)]>,
-	pub implicit_uint_to_int: Arc<[BodyNodeId]>,
 	pub definition_targets: Arc<[(BodyNodeId, DefinitionId)]>,
 	pub direct_namespace_members: Arc<[BodyNodeId]>,
 	pub dispatches: Arc<[(BodyNodeId, StableDispatch)]>,
+	/// Managed initializer → exact `Close.close` dispatch.
+	pub managed_cleanups: Arc<[(BodyNodeId, StableDispatch)]>,
 	pub variants: Arc<[(BodyNodeId, ExpressionVariant)]>,
 	pub pattern_variants: Arc<[(PatternNodeId, PatternVariant)]>,
 	pub positional_fields: Arc<[(PatternNodeId, StableVariantField)]>,
+	pub struct_constructions: Arc<[(BodyNodeId, StableStructConstructionPlan)]>,
 	pub iterations: Arc<[(BodyNodeId, RuntimeIteration)]>,
 	pub anonymous_closures: Arc<[(BodyNodeId, u8)]>,
 	pub generic_namespaced_calls: Arc<[(BodyNodeId, u32, DefinitionId, DefinitionId)]>,
@@ -414,7 +655,8 @@ pub struct RuntimeAnnotations {
 	pub external_marshals: Arc<[(BodyNodeId, nymph_hir::hir::MarshalKind)]>,
 	/// Resolved jump node → typed lexical target, projected to stable body ids.
 	pub control_targets: Arc<[(BodyNodeId, RuntimeControlTarget)]>,
-	pub propagations: Arc<[(BodyNodeId, RuntimePropagationKind)]>,
+	pub propagations: Arc<[(BodyNodeId, RuntimePropagation)]>,
+	pub range_proofs: Arc<[(BodyNodeId, RangeProof)]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, salsa::SalsaValue)]
@@ -423,16 +665,18 @@ pub enum RuntimePropagationKind {
 	Result,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub struct RuntimePropagation {
+	pub kind: RuntimePropagationKind,
+	pub conversion: Option<StableDispatch>,
+}
+
 impl RuntimeAnnotations {
 	pub fn type_of(&self, node: BodyNodeId) -> Option<&InterfaceType> {
 		self
 			.types
 			.iter()
 			.find_map(|(id, value)| (*id == node).then_some(value))
-	}
-
-	pub fn implicitly_converts_uint_to_int(&self, node: BodyNodeId) -> bool {
-		self.implicit_uint_to_int.contains(&node)
 	}
 
 	pub fn definition_target(&self, node: BodyNodeId) -> Option<&DefinitionId> {
@@ -449,6 +693,13 @@ impl RuntimeAnnotations {
 	pub fn dispatch(&self, node: BodyNodeId) -> Option<&StableDispatch> {
 		self
 			.dispatches
+			.iter()
+			.find_map(|(id, value)| (*id == node).then_some(value))
+	}
+
+	pub fn managed_cleanup(&self, node: BodyNodeId) -> Option<&StableDispatch> {
+		self
+			.managed_cleanups
 			.iter()
 			.find_map(|(id, value)| (*id == node).then_some(value))
 	}
@@ -472,6 +723,13 @@ impl RuntimeAnnotations {
 			.positional_fields
 			.iter()
 			.find_map(|(id, value)| (*id == node).then_some(value))
+	}
+
+	pub fn struct_construction(&self, node: BodyNodeId) -> Option<&StableStructConstructionPlan> {
+		self
+			.struct_constructions
+			.iter()
+			.find_map(|(id, plan)| (*id == node).then_some(plan))
 	}
 
 	pub fn iteration(&self, node: BodyNodeId) -> Option<&RuntimeIteration> {
@@ -527,6 +785,13 @@ impl RuntimeAnnotations {
 			.iter()
 			.find_map(|(id, value)| (*id == node).then_some(*value))
 	}
+
+	pub fn range_proof(&self, node: BodyNodeId) -> Option<&RangeProof> {
+		self
+			.range_proofs
+			.iter()
+			.find_map(|(id, proof)| (*id == node).then_some(proof))
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
@@ -572,11 +837,18 @@ impl PartialEq for CheckedRuntimeBody {
 }
 impl Eq for CheckedRuntimeBody {}
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+#[derive(Clone, Debug, PartialEq, Eq, salsa::SalsaValue)]
 pub struct StructShell {
 	pub binders: Vec<crate::GenericParameter>,
 	pub constraints: Vec<crate::GenericConstraint>,
 	pub fields: Vec<crate::FieldShape<InterfaceType>>,
+	pub defaults: Vec<StructFieldDefault>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, salsa::SalsaValue)]
+pub struct StructFieldDefault {
+	pub field: DefinitionId,
+	pub body: CheckedRuntimeBody,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
@@ -643,7 +915,7 @@ pub fn runtime_definitions(
 					required_top_level(checked, name)?,
 					RuntimePlacement::TopLevel,
 					value,
-					!meta.is_mutable(),
+					true,
 					checked,
 				)?;
 			}
@@ -679,11 +951,65 @@ pub fn runtime_definitions(
 			}
 			nymph_ast::decl::Declaration::Struct {
 				name,
+				fields,
 				members,
 				impls,
 				..
+			} => {
+				let item = shapes
+					.iter()
+					.copied()
+					.find(|s| s.name == name.0 && s.kind == crate::DefinitionShapeKind::Struct)
+					.ok_or_else(|| RuntimeExtractionError::MissingStableId(name.0.clone()))?;
+				let defaults = fields
+					.iter()
+					.zip(&item.fields)
+					.filter_map(|(field, shape)| {
+						field.0.default.as_ref().map(|default| {
+							checked_runtime_body(
+								&shape.id,
+								RuntimeBodyKind::Value,
+								true,
+								&[],
+								default,
+								false,
+								checked,
+							)
+							.map(|body| StructFieldDefault {
+								field: shape.id.clone(),
+								body,
+							})
+						})
+					})
+					.collect::<Result<Vec<_>, _>>()?;
+				result.push(RuntimeDefinition {
+					definition: item.id.clone(),
+					source_owner: item.id.module.clone(),
+					placement: RuntimePlacement::TopLevel,
+					payload: RuntimePayload::Struct(StructShell {
+						binders: item.binders.clone(),
+						constraints: item.constraints.clone(),
+						fields: item.fields.clone(),
+						defaults,
+					}),
+				});
+				extract_members(&mut result, members, &item.members, false, checked)?;
+				for (nested_index, nested) in impls.iter().enumerate() {
+					let path = crate::annotate::ImplementationSourcePath {
+						declaration: declaration_index as u32,
+						nested: Some(nested_index as u32),
+					};
+					let implementation = required_implementation(interface, checked, path)?;
+					extract_implementation_members(
+						&mut result,
+						&nested.0.members,
+						implementation,
+						checked,
+						path,
+					)?;
+				}
 			}
-			| nymph_ast::decl::Declaration::Enum {
+			nymph_ast::decl::Declaration::Enum {
 				name,
 				members,
 				impls,
@@ -692,32 +1018,17 @@ pub fn runtime_definitions(
 				let item = shapes
 					.iter()
 					.copied()
-					.find(|s| {
-						s.name == name.0
-							&& matches!(
-								s.kind,
-								crate::DefinitionShapeKind::Struct | crate::DefinitionShapeKind::Enum
-							)
-					})
+					.find(|s| s.name == name.0 && s.kind == crate::DefinitionShapeKind::Enum)
 					.ok_or_else(|| RuntimeExtractionError::MissingStableId(name.0.clone()))?;
-				let payload = match item.kind {
-					crate::DefinitionShapeKind::Struct => RuntimePayload::Struct(StructShell {
-						binders: item.binders.clone(),
-						constraints: item.constraints.clone(),
-						fields: item.fields.clone(),
-					}),
-					crate::DefinitionShapeKind::Enum => RuntimePayload::Enum(EnumShell {
-						binders: item.binders.clone(),
-						constraints: item.constraints.clone(),
-						variants: item.variants.clone(),
-					}),
-					_ => unreachable!(),
-				};
 				result.push(RuntimeDefinition {
 					definition: item.id.clone(),
 					source_owner: item.id.module.clone(),
 					placement: RuntimePlacement::TopLevel,
-					payload,
+					payload: RuntimePayload::Enum(EnumShell {
+						binders: item.binders.clone(),
+						constraints: item.constraints.clone(),
+						variants: item.variants.clone(),
+					}),
 				});
 				extract_members(&mut result, members, &item.members, false, checked)?;
 				for (nested_index, nested) in impls.iter().enumerate() {
@@ -772,14 +1083,14 @@ pub fn runtime_definitions(
 									checked,
 								)?,
 								InterfaceElement::Let {
-									meta,
+									meta: _,
 									value: Some(value),
 								} => push_value(
 									&mut result,
 									member.id.clone(),
 									attached(member),
 									value,
-									!meta.is_mutable(),
+									true,
 									checked,
 								)?,
 								_ => {}
@@ -912,14 +1223,9 @@ fn extract_members(
 			ImplMember::Func { meta, body, .. } => {
 				push_body(result, shape.id.clone(), placement(), meta, body, checked)?
 			}
-			ImplMember::Let { meta, value, .. } => push_value(
-				result,
-				shape.id.clone(),
-				placement(),
-				value,
-				!meta.is_mutable(),
-				checked,
-			)?,
+			ImplMember::Let { value, .. } => {
+				push_value(result, shape.id.clone(), placement(), value, true, checked)?
+			}
 			ImplMember::ExternalFunc(..) | ImplMember::ExternalLet(..) => push_external(
 				result,
 				shape.id.clone(),
@@ -984,14 +1290,9 @@ fn extract_implementation_members(
 			ImplMember::Func { meta, body, .. } => {
 				push_body(result, definition, placement, meta, body, checked)?
 			}
-			ImplMember::Let { meta, value, .. } => push_value(
-				result,
-				definition,
-				placement,
-				value,
-				!meta.is_mutable(),
-				checked,
-			)?,
+			ImplMember::Let { value, .. } => {
+				push_value(result, definition, placement, value, true, checked)?
+			}
 			ImplMember::ExternalFunc(..) => {
 				push_external(result, definition, placement, member_shape.external.clone())?
 			}
@@ -1018,6 +1319,7 @@ fn push_value(
 		immutable,
 		&[],
 		value,
+		false,
 		checked,
 	)
 }
@@ -1042,6 +1344,7 @@ fn push_body(
 		true,
 		&meta.params,
 		body,
+		meta.is_async,
 		checked,
 	)
 }
@@ -1054,8 +1357,36 @@ fn push_canonical_body(
 	immutable: bool,
 	params: &[nymph_ast::Spanned<FuncParam>],
 	body: &Expr,
+	is_async: bool,
 	checked: &crate::CheckedFacts,
 ) -> Result<(), RuntimeExtractionError> {
+	let body = checked_runtime_body(
+		&definition,
+		kind,
+		immutable,
+		params,
+		body,
+		is_async,
+		checked,
+	)?;
+	result.push(RuntimeDefinition {
+		source_owner: definition.module.clone(),
+		definition,
+		placement,
+		payload: RuntimePayload::NymphBody(body),
+	});
+	Ok(())
+}
+
+fn checked_runtime_body(
+	definition: &DefinitionId,
+	kind: RuntimeBodyKind,
+	immutable: bool,
+	params: &[nymph_ast::Spanned<FuncParam>],
+	body: &Expr,
+	is_async: bool,
+	checked: &crate::CheckedFacts,
+) -> Result<CheckedRuntimeBody, RuntimeExtractionError> {
 	let mut nodes = Vec::new();
 	walk_expr(body, &mut nodes);
 	let local = nodes
@@ -1075,7 +1406,7 @@ fn push_canonical_body(
 		.collect::<std::collections::HashSet<_>>();
 	let required_type_nodes = required_type_nodes(&nodes, checked);
 	let builder = StableBodyBuilder::new(&local);
-	let stable = builder.body(params, body)?;
+	let stable = builder.body(params, body, is_async)?;
 	let pattern_sites = builder.pattern_sites.into_inner();
 	let positional_sites = builder.positional_sites.into_inner();
 	let annotations = runtime_annotations(
@@ -1092,22 +1423,16 @@ fn push_canonical_body(
 		.into_iter()
 		.collect::<Vec<_>>();
 	type_parameters.sort_by_key(|(index, _)| index.0);
-	result.push(RuntimeDefinition {
-		source_owner: definition.module.clone(),
-		definition,
-		placement,
-		payload: RuntimePayload::NymphBody(CheckedRuntimeBody {
-			kind,
-			immutable,
-			type_parameters: type_parameters
-				.into_iter()
-				.map(|(_, parameter)| parameter)
-				.collect(),
-			stable,
-			annotations,
-		}),
-	});
-	Ok(())
+	Ok(CheckedRuntimeBody {
+		kind,
+		immutable,
+		type_parameters: type_parameters
+			.into_iter()
+			.map(|(_, parameter)| parameter)
+			.collect(),
+		stable,
+		annotations,
+	})
 }
 
 struct StableBodyBuilder<'a> {
@@ -1135,6 +1460,7 @@ impl<'a> StableBodyBuilder<'a> {
 		&self,
 		params: &[nymph_ast::Spanned<FuncParam>],
 		root: &Expr,
+		is_async: bool,
 	) -> Result<StableBody, RuntimeExtractionError> {
 		Ok(StableBody {
 			params: params
@@ -1142,19 +1468,18 @@ impl<'a> StableBodyBuilder<'a> {
 				.map(|p| self.func_param(&p.0))
 				.collect::<Result<_, _>>()?,
 			root: self.expr(root)?,
+			is_async,
 		})
 	}
 	fn func_param(&self, param: &FuncParam) -> Result<StableParameter, RuntimeExtractionError> {
 		Ok(StableParameter {
 			pattern: self.pattern(&param.name)?,
-			mutable: param.mutable,
 			spread: param.spread,
 		})
 	}
 	fn closure_param(&self, param: &ClosureParam) -> Result<StableParameter, RuntimeExtractionError> {
 		Ok(StableParameter {
 			pattern: self.pattern(&param.name)?,
-			mutable: param.mutable,
 			spread: param.spread,
 		})
 	}
@@ -1381,6 +1706,8 @@ impl<'a> StableBodyBuilder<'a> {
 					.collect::<Result<_, _>>()?,
 				body: boxed(body)?,
 			},
+			ExprKind::AsyncBlock { body, .. } => StableExprKind::AsyncBlock(boxed(body)?),
+			ExprKind::Await { value, .. } => StableExprKind::Await(boxed(value)?),
 			ExprKind::PrefixOp { op, value } => StableExprKind::PrefixOp {
 				op: *op,
 				value: boxed(value)?,
@@ -1408,11 +1735,6 @@ impl<'a> StableBodyBuilder<'a> {
 				op: *op,
 				rhs: self.pattern(rhs)?,
 			},
-			ExprKind::AssignOp { lhs, op, rhs } => StableExprKind::AssignOp {
-				lhs: boxed(lhs)?,
-				op: *op,
-				rhs: boxed(rhs)?,
-			},
 			ExprKind::Return { value, label: l } => StableExprKind::Return {
 				value: value.as_deref().map(boxed).transpose()?,
 				label: label(l),
@@ -1421,15 +1743,24 @@ impl<'a> StableBodyBuilder<'a> {
 				value: value.as_deref().map(boxed).transpose()?,
 				label: label(l),
 			},
-			ExprKind::Continue { label: l } => StableExprKind::Continue { label: label(l) },
-			ExprKind::While {
-				condition,
-				body,
+			ExprKind::Continue {
 				label: l,
-			} => StableExprKind::While {
-				condition: boxed(condition)?,
-				body: boxed(body)?,
+				replacements,
+			} => StableExprKind::Continue {
 				label: label(l),
+				replacements: replacements
+					.iter()
+					.map(|replacement| {
+						Ok(StableStateReplacement {
+							name: replacement.name.0.clone(),
+							value: self.expr(&replacement.value)?,
+						})
+					})
+					.collect::<Result<_, _>>()?,
+			},
+			ExprKind::Echo { operand, keyword } => StableExprKind::Echo {
+				operand: boxed(operand)?,
+				keyword: *keyword,
 			},
 			ExprKind::For {
 				variable,
@@ -1439,6 +1770,31 @@ impl<'a> StableBodyBuilder<'a> {
 			} => StableExprKind::For {
 				variable: self.pattern(variable)?,
 				iterable: boxed(iterable)?,
+				body: boxed(body)?,
+				label: label(l),
+			},
+			ExprKind::StateLoop {
+				bindings,
+				body,
+				label: l,
+			} => StableExprKind::StateLoop {
+				bindings: bindings
+					.iter()
+					.map(|binding| {
+						let name = binding
+							.meta
+							.name
+							.0
+							.as_binding()
+							.map(|name| name.0.clone())
+							.unwrap_or_default();
+						Ok(StableStateBinding {
+							name,
+							managed: binding.meta.is_managed(),
+							value: self.expr(&binding.value)?,
+						})
+					})
+					.collect::<Result<_, _>>()?,
 				body: boxed(body)?,
 				label: label(l),
 			},
@@ -1472,7 +1828,7 @@ impl<'a> StableBodyBuilder<'a> {
 							Statement::Expr(v) => StableStatement::Expr(self.expr(v)?),
 							Statement::Let { meta, value } => StableStatement::Let {
 								pattern: self.pattern(&meta.name)?,
-								mutable: meta.is_mutable(),
+								managed: meta.is_managed(),
 								value: self.expr(value)?,
 							},
 						})
@@ -1492,9 +1848,9 @@ impl<'a> StableBodyBuilder<'a> {
 	}
 	fn call_arg(&self, arg: &CallArg) -> Result<StableCallArg, RuntimeExtractionError> {
 		Ok(StableCallArg {
-			value: self.expr(&arg.value)?,
-			name: arg.name.as_ref().map(|n| n.0.clone()),
-			spread: arg.spread,
+			value: self.expr(arg.value())?,
+			name: arg.name().map(|n| n.0.clone()),
+			spread: arg.is_spread(),
 		})
 	}
 }
@@ -1565,11 +1921,23 @@ fn runtime_annotations(
 			required.then_some(expression.id)
 		})
 		.collect::<std::collections::HashSet<_>>();
+	let async_type_nodes = nodes
+		.iter()
+		.flat_map(|expression| match &expression.kind {
+			ExprKind::Await { value, .. } => vec![value.id],
+			ExprKind::Call { func, .. }
+				if matches!(&func.kind, ExprKind::MemberAccess { member, .. } if member.0 == "spawn") =>
+			{
+				vec![expression.id]
+			}
+			_ => Vec::new(),
+		})
+		.collect::<std::collections::HashSet<_>>();
 	for (node, info) in checked.annotations.infos() {
 		let Some(&id) = local.get(&node) else {
 			continue;
 		};
-		if required_type_nodes.contains(&node) {
+		if required_type_nodes.contains(&node) || async_type_nodes.contains(&node) {
 			types.push((
 				id,
 				required_canonical_type(&checked.interner, info.ty, &context)?,
@@ -1589,11 +1957,12 @@ fn runtime_annotations(
 		.definition_targets()
 		.filter_map(|(id, target)| local.get(&id).map(|id| (*id, target.clone())))
 		.collect::<Vec<_>>();
-	let mut implicit_uint_to_int = checked
+	let mut managed_cleanups = checked
 		.annotations
-		.implicit_uint_to_int()
-		.filter_map(|source| local.get(&source).copied())
-		.collect::<Vec<_>>();
+		.managed_cleanups()
+		.filter_map(|(node, resolution)| local.get(&node).map(|id| (*id, resolution)))
+		.map(|(id, resolution)| Ok((id, stable_dispatch(checked, resolution, &context)?)))
+		.collect::<Result<Vec<_>, RuntimeExtractionError>>()?;
 	let mut variants = checked
 		.annotations
 		.variants()
@@ -1626,6 +1995,35 @@ fn runtime_annotations(
 			})
 		})
 		.collect::<Result<Vec<_>, RuntimeExtractionError>>()?;
+	let mut struct_constructions = checked
+		.annotations
+		.struct_constructions()
+		.filter_map(|(node, plan)| {
+			let node = *local.get(&node)?;
+			let mode = match plan.mode {
+				crate::annotate::StructConstructionMode::Fresh => StableStructConstructionMode::Fresh,
+				crate::annotate::StructConstructionMode::CloneUpdate { source } => {
+					StableStructConstructionMode::CloneUpdate {
+						source: *local.get(&source)?,
+					}
+				}
+			};
+			let explicit_fields = plan
+				.explicit_fields
+				.iter()
+				.filter_map(|(field, value)| local.get(value).map(|value| (field.clone(), *value)))
+				.collect::<Vec<_>>();
+			Some((
+				node,
+				StableStructConstructionPlan {
+					definition: plan.definition.clone(),
+					mode,
+					explicit_fields: explicit_fields.into(),
+					omitted_defaults: plan.omitted_defaults.clone().into(),
+				},
+			))
+		})
+		.collect::<Vec<_>>();
 	let mut iterations = Vec::new();
 	let mut anonymous_closures = Vec::new();
 	let mut generic_namespaced_calls = Vec::new();
@@ -1648,14 +2046,26 @@ fn runtime_annotations(
 	let mut propagations = checked
 		.annotations
 		.propagations()
-		.filter_map(|(node, kind)| {
+		.filter_map(|(node, propagation)| {
 			let node = *local.get(&node)?;
-			let kind = match kind {
+			let kind = match propagation.kind {
 				crate::annotate::PropagationKind::Option => RuntimePropagationKind::Option,
 				crate::annotate::PropagationKind::Result => RuntimePropagationKind::Result,
 			};
-			Some((node, kind))
+			Some(
+				propagation
+					.conversion
+					.as_ref()
+					.map(|resolution| stable_dispatch(checked, resolution, &context))
+					.transpose()
+					.map(|conversion| (node, RuntimePropagation { kind, conversion })),
+			)
 		})
+		.collect::<Result<Vec<_>, _>>()?;
+	let mut range_proofs = checked
+		.annotations
+		.range_proofs()
+		.filter_map(|(node, proof)| local.get(&node).map(|id| (*id, proof.clone())))
 		.collect::<Vec<_>>();
 	for (&source, &id) in local {
 		if let Some(mode) = checked.annotations.iter_mode_of(source).or_else(|| {
@@ -1669,7 +2079,7 @@ fn runtime_annotations(
 					iterator_interface: protocols.0.clone(),
 					next: protocols.1.clone(),
 					next_dispatch: stable_iteration_next_dispatch(checked, source, &context)?,
-					option: protocols.2.clone(),
+					iteration: protocols.2.clone(),
 				},
 				crate::IterMode::ViaIter => {
 					let (iterable_interface, iter_interface_member, iter) =
@@ -1725,7 +2135,7 @@ fn runtime_annotations(
 						iterator_interface: protocols.0.clone(),
 						next: protocols.1.clone(),
 						next_dispatch: stable_iteration_next_dispatch(checked, source, &context)?,
-						option: protocols.2.clone(),
+						iteration: protocols.2.clone(),
 					}
 				}
 			};
@@ -1816,19 +2226,21 @@ fn runtime_annotations(
 		})
 		.collect::<Vec<_>>();
 	types.sort_by_key(|item| item.0);
-	implicit_uint_to_int.sort_unstable();
 	definition_targets.sort_by_key(|item| item.0);
 	dispatches.sort_by_key(|item| item.0);
+	managed_cleanups.sort_by_key(|item| item.0);
 	variants.sort_by_key(|item| item.0);
 	pattern_variants.sort_by_key(|item| item.0);
 	positional_fields.sort_by_key(|item| item.0);
+	struct_constructions.sort_by_key(|item| item.0);
 	iterations.sort_by_key(|item| item.0);
 	anonymous_closures.sort_by_key(|item| item.0);
 	generic_namespaced_calls.sort_unstable();
 	generic_call_arguments.sort_by_key(|item| item.0);
 	generic_call_targets.sort_by_key(|item| item.0);
 	control_targets.sort_unstable();
-	propagations.sort_unstable();
+	propagations.sort_unstable_by_key(|(node, _)| *node);
+	range_proofs.sort_by_key(|item| item.0);
 	let mut direct_namespace_members = checked
 		.annotations
 		.direct_namespace_members()
@@ -1845,13 +2257,14 @@ fn runtime_annotations(
 		option: checked.runtime_roles.option.clone(),
 		result: checked.runtime_roles.result.clone(),
 		types: types.into(),
-		implicit_uint_to_int: implicit_uint_to_int.into(),
 		definition_targets: definition_targets.into(),
 		direct_namespace_members: direct_namespace_members.into(),
 		dispatches: dispatches.into(),
+		managed_cleanups: managed_cleanups.into(),
 		variants: variants.into(),
 		pattern_variants: pattern_variants.into(),
 		positional_fields: positional_fields.into(),
+		struct_constructions: struct_constructions.into(),
 		iterations: iterations.into(),
 		anonymous_closures: anonymous_closures.into(),
 		generic_namespaced_calls: generic_namespaced_calls.into(),
@@ -1860,6 +2273,7 @@ fn runtime_annotations(
 		external_marshals: external_marshals.into(),
 		control_targets: control_targets.into(),
 		propagations: propagations.into(),
+		range_proofs: range_proofs.into(),
 	})
 }
 
@@ -1873,9 +2287,7 @@ fn runtime_type_object_supported(ty: &InterfaceType) -> bool {
 		| InterfaceType::Boolean
 		| InterfaceType::SelfType
 		| InterfaceType::Generic(_) => true,
-		InterfaceType::List(argument) | InterfaceType::Mutable(argument) => {
-			runtime_type_object_supported(argument)
-		}
+		InterfaceType::List(argument) => runtime_type_object_supported(argument),
 		InterfaceType::Tuple(arguments) => arguments.iter().all(runtime_type_object_supported),
 		InterfaceType::Map(key, value) => {
 			runtime_type_object_supported(key) && runtime_type_object_supported(value)
@@ -1930,7 +2342,7 @@ fn required_type_nodes(
 				)
 			}) {
 			match &expression.kind {
-				ExprKind::BinaryOp { lhs, rhs, .. } | ExprKind::AssignOp { lhs, rhs, .. } => {
+				ExprKind::BinaryOp { lhs, rhs, .. } => {
 					required.insert(lhs.id);
 					required.insert(rhs.id);
 				}
@@ -1938,15 +2350,12 @@ fn required_type_nodes(
 					if let ExprKind::MemberAccess { parent, .. } = &func.kind {
 						required.insert(parent.id);
 					}
-					required.extend(args.iter().map(|argument| argument.value().value.id));
+					required.extend(args.iter().map(|argument| argument.value().value().id));
 				}
 				_ => {}
 			}
 		}
 		match &expression.kind {
-			ExprKind::While { .. } => {
-				required.insert(expression.id);
-			}
 			// Persist only a contextual widening. A plain `int` literal already
 			// carries its runtime kind syntactically and some recovered declaration
 			// paths do not annotate that redundant fact.
@@ -2030,21 +2439,6 @@ fn required_type_nodes(
 					}) =>
 			{
 				required.insert(expression.id);
-			}
-			ExprKind::AssignOp { lhs, op, .. }
-				if *op != AssignOperator::Assign
-					&& checked
-						.annotations
-						.get(expression.id)
-						.and_then(|info| info.resolution)
-						.is_some_and(|resolution| {
-							matches!(
-								resolution.dispatch,
-								DispatchKind::BuiltinEager | DispatchKind::BuiltinShortCircuit
-							)
-						}) =>
-			{
-				required.insert(lhs.id);
 			}
 			ExprKind::List(items) | ExprKind::Tuple(items) => {
 				for item in items {
@@ -2137,6 +2531,7 @@ fn stable_dispatch(
 	let category = match resolution.dispatch {
 		DispatchKind::BuiltinEager => BuiltinDispatch::Eager,
 		DispatchKind::BuiltinShortCircuit => BuiltinDispatch::ShortCircuit,
+		DispatchKind::BuiltinStructuralEquality => BuiltinDispatch::StructuralEquality,
 		DispatchKind::UserImpl | DispatchKind::UserImplDefaultMethod => {
 			return exact_method_dispatch(checked, resolution, context);
 		}
@@ -2183,7 +2578,7 @@ fn exact_method_dispatch(
 				Ok(StableDispatch::External {
 					member: member.clone(),
 					implementation: implementation.clone(),
-					marshal: abi.marshal,
+					marshal: abi.marshal.result,
 				})
 			} else {
 				Ok(StableDispatch::Direct {
@@ -2233,7 +2628,7 @@ fn exact_method_dispatch(
 				return Ok(StableDispatch::External {
 					member: slot.member_id.clone(),
 					implementation: slot.implementation_id.clone(),
-					marshal: abi.marshal,
+					marshal: abi.marshal.result,
 				});
 			}
 			Ok(match slot.source {
@@ -2364,7 +2759,7 @@ fn body_parameters(
 	// Rigid parameter indices are body-local and allocated in declaration order.
 	// Implementation-header binders are allocated before member-local binders,
 	// matching interface extraction's owner-then-member canonicalization context.
-	let member_count = checked
+	let function_signature = checked
 		.semantic
 		.definitions
 		.defs
@@ -2376,7 +2771,8 @@ fn body_parameters(
 				.signatures
 				.funcs
 				.get(&crate::DefId(index as u32))
-		})
+		});
+	let member_count = function_signature
 		.map(|signature| signature.generics.len())
 		.or_else(|| {
 			checked
@@ -2397,6 +2793,16 @@ fn body_parameters(
 				.map(|method| method.generics.len())
 		})
 		.unwrap_or(0);
+	let member_parameters = function_signature
+		.map(|signature| {
+			signature
+				.generic_kinds
+				.iter()
+				.enumerate()
+				.filter_map(|(index, kind)| (*kind == crate::GenericParameterKind::Type).then_some(index))
+				.collect::<Vec<_>>()
+		})
+		.unwrap_or_else(|| (0..member_count).collect());
 	let owner = definition_owner(definition);
 	let owner_count = owner
 		.map(|owner| match &owner.key {
@@ -2451,7 +2857,7 @@ fn body_parameters(
 		crate::BinderScope::Member
 	};
 	owner_parameters
-		.chain((0..member_count).map(|index| {
+		.chain(member_parameters.into_iter().map(|index| {
 			(
 				crate::ParamIdx((owner_count + index) as u32),
 				crate::GenericParameterId::new(definition.binder(member_scope, 0), index as u32),
@@ -2470,23 +2876,23 @@ fn definition_owner(definition: &DefinitionId) -> Option<&DefinitionId> {
 
 fn iteration_protocol(
 	checked: &crate::CheckedFacts,
-) -> Result<(DefinitionId, DefinitionId, crate::OptionRuntimeRole), RuntimeExtractionError> {
+) -> Result<(DefinitionId, DefinitionId, crate::IterationRuntimeRole), RuntimeExtractionError> {
 	let iterator = checked
 		.semantic
 		.compiler_runtime_roles
 		.iterator
 		.as_ref()
 		.ok_or(RuntimeExtractionError::MissingIterationProtocol)?;
-	let option = checked
+	let iteration = checked
 		.semantic
 		.compiler_runtime_roles
-		.option
+		.iteration
 		.as_ref()
 		.ok_or(RuntimeExtractionError::MissingIterationProtocol)?;
 	Ok((
 		iterator.interface.clone(),
 		iterator.member.clone(),
-		option.clone(),
+		iteration.clone(),
 	))
 }
 
@@ -2505,7 +2911,7 @@ fn external_marshal(
 			.semantic
 			.external_abis
 			.get(&definition)
-			.and_then(|abi| abi.marshal)
+			.and_then(|abi| abi.marshal.result)
 	}
 }
 

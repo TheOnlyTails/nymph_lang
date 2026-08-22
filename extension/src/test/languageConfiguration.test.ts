@@ -19,6 +19,17 @@ interface TextMateGrammar {
 	};
 }
 
+interface ExtensionManifest {
+	contributes?: {
+		configuration?: {
+			properties?: Record<
+				string,
+				{ type?: string; enum?: string[]; default?: unknown; scope?: string }
+			>;
+		};
+	};
+}
+
 void test("comment editing delimiters match the TextMate grammar", async () => {
 	const extensionRoot = join(__dirname, "..", "..");
 	const configuration = parse(
@@ -38,4 +49,20 @@ void test("comment editing delimiters match the TextMate grammar", async () => {
 		configuration.comments?.blockComment,
 		[blockComment?.begin, blockComment?.end].map((delimiter) => delimiter?.replace("\\*", "*")),
 	);
+});
+
+void test("workspace diagnostics expose development and release compiler profiles", async () => {
+	const extensionRoot = join(__dirname, "..", "..");
+	const manifest = JSON.parse(
+		await readFile(join(extensionRoot, "package.json"), "utf8"),
+	) as ExtensionManifest;
+	const profile = manifest.contributes?.configuration?.properties?.["nymph.buildProfile"];
+
+	assert.equal(profile?.type, "string");
+	assert.deepEqual(profile?.enum, ["development", "release"]);
+	assert.equal(profile?.default, "development");
+	assert.equal(profile?.scope, "window");
+
+	const clientSource = await readFile(join(extensionRoot, "src", "extension.ts"), "utf8");
+	assert.match(clientSource, /configurationSection:\s*"nymph"/);
 });

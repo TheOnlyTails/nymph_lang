@@ -204,14 +204,13 @@ fn negation_of_a_method_with_omitted_return() {
 
 // ── Duplicate inner members (checker-level collision detection) ────────────
 //
-// Struct/enum inner members of any kind (instance `func`, `namespace func`
-// statics, `mut func` methods) share one `FxHashMap` keyed only by name
-// (`collect_impl_member`), where a later member could silently overwrite an
-// earlier same-named one without a diagnostic. The shadowed member's body is
-// not type-checked, yet HIR lowering walks the
-// raw AST and emits every member's body regardless — an
-// unchecked-body-reaches-JS soundness hole. Any such collision must be
-// reported as an error, for every kind combination, on
+// Struct/enum inner members used to be collected into one `FxHashMap` keyed
+// only by name (`collect_impl_member`), with a later member silently
+// overwriting an earlier same-named one and no diagnostic ever fired. The
+// shadowed member's body was then never type-checked, yet the Slice 4J HIR
+// lowering walks the raw AST and emits EVERY member's body regardless — an
+// unchecked-body-reaches-JS soundness hole. These tests pin the fix: any such
+// collision must now be reported as an error, for every kind combination, on
 // both structs and enums.
 
 #[test]
@@ -248,17 +247,6 @@ fn func_and_namespace_static_same_name_is_reported() {
 }
 
 #[test]
-fn func_and_impl_mut_same_name_is_reported() {
-	assert_error_contains(
-		"struct Counter(n: int) {
-		   func bump(): void = {}
-		   mut func bump(): void = { this.n = this.n + 1 }
-		 }",
-		"defined more than once",
-	);
-}
-
-#[test]
 fn two_namespace_statics_same_name_is_reported() {
 	assert_error_contains(
 		"struct Point(x: int) {
@@ -286,7 +274,6 @@ fn two_different_member_names_stay_clean() {
 		"struct Point(x: int) {
 		   func get(): int = this.x
 		   namespace func at(v: int): Point = Point(x = v)
-		   mut func reset(): void = {}
 		 }",
 	);
 }
@@ -301,28 +288,6 @@ fn variant_name_matching_namespaced_function_is_not_a_member_duplicate() {
 	assert_ok(
 		"enum Color { Red
 		   namespace func Red(): Color = Color.Red
-		 }",
-	);
-}
-
-// ── Mutable types: `mut T <: T` through method-call syntax ───────────
-//
-// `recv.method(arg)` resolves through `resolve_method` -> `resolve_inherent`
-// (this file) / `commit_method` (interface impls, see solve.rs), both of
-// which check arguments via `unify_arg`. `mut T` is one-way
-// assignable to `T` everywhere; free-function calls and binary operators
-// already honored that, but the method-call path didn't.
-
-#[test]
-fn mut_typed_argument_is_accepted_by_an_inherent_method_call() {
-	assert_ok(
-		"struct Adder(base: int) {
-		   func plus(x: int): int = this.base + x
-		 }
-		 func f(): int = {
-		   let mut n = 1
-		   let a = Adder(base = 0)
-		   a.plus(n)
 		 }",
 	);
 }
@@ -405,6 +370,33 @@ fn positional_subpattern_on_a_multi_field_constructor_is_rejected() {
 		 func f(p: Pair): int = match (p) {
 		   Pair(#(1, 2)) -> 0,
 		 }",
-		"positional sub-pattern is only allowed on a constructor with exactly one field",
+		"struct pattern fields must be named",
+	);
+}
+
+#[test]
+fn named_struct_patterns_require_anonymous_trailing_omission() {
+	assert_ok(
+		"struct Pair(a: int, b: int)\n\
+		 func first(pair: Pair): int = match (pair) { Pair(a = a, ...) -> a }",
+	);
+	assert_error_contains(
+		"struct Pair(a: int, b: int)\n\
+		 func first(pair: Pair): int = match (pair) { Pair(a = a) -> a }",
+		"partial struct pattern must end with anonymous `...`",
+	);
+	assert_error_contains(
+		"struct Pair(a: int, b: int)\n\
+		 func first(pair: Pair): int = match (pair) { Pair(..., a = a) -> a }",
+		"anonymous `...` must occur once at the end",
+	);
+}
+
+#[test]
+fn positional_struct_patterns_are_rejected_even_for_one_field() {
+	assert_error_contains(
+		"struct Box(value: int)\n\
+		 func get(box: Box): int = match (box) { Box(0) -> 0, Box(...) -> 1 }",
+		"struct pattern fields must be named",
 	);
 }

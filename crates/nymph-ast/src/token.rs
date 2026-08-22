@@ -48,20 +48,21 @@ pub enum Token {
 	Struct,
 	Enum,
 	Let,
-	Mut,
 	External,
+	Effect,
 	Func,
 	Interface,
 	Impl,
 	Namespace,
 	For,
-	While,
+	Loop,
 	If,
 	Else,
 	Match,
 	Continue,
 	Break,
 	Return,
+	Echo,
 	This,
 	/// `in` — used both as a binary operator and in `for` loops.
 	In,
@@ -178,34 +179,6 @@ pub enum Token {
 	PipePipe,
 	/// `=`
 	Eq,
-	/// `+=`
-	PlusEq,
-	/// `-=`
-	MinusEq,
-	/// `*=`
-	StarEq,
-	/// `/=`
-	SlashEq,
-	/// `%=`
-	PercentEq,
-	/// `**=`
-	StarStarEq,
-	/// `&&=`
-	AmpAmpEq,
-	/// `||=`
-	PipePipeEq,
-	/// `&=`
-	AmpEq,
-	/// `|=`
-	PipeEq,
-	/// `^=`
-	CaretEq,
-	/// `~=`
-	TildeEq,
-	/// `<<=`
-	LtLtEq,
-	/// `>>=`
-	GtGtEq,
 	/// `..`
 	DotDot,
 	/// `..=`
@@ -252,20 +225,21 @@ impl Token {
 			Struct => "`struct`",
 			Enum => "`enum`",
 			Let => "`let`",
-			Mut => "`mut`",
 			External => "`external`",
+			Effect => "`effect`",
 			Func => "`func`",
 			Interface => "`interface`",
 			Impl => "`impl`",
 			Namespace => "`namespace`",
 			For => "`for`",
-			While => "`while`",
+			Loop => "`loop`",
 			If => "`if`",
 			Else => "`else`",
 			Match => "`match`",
 			Continue => "`continue`",
 			Break => "`break`",
 			Return => "`return`",
+			Echo => "`echo`",
 			This => "`this`",
 			In => "`in`",
 			As => "`as`",
@@ -325,20 +299,6 @@ impl Token {
 			AmpAmp => "`&&`",
 			PipePipe => "`||`",
 			Eq => "`=`",
-			PlusEq => "`+=`",
-			MinusEq => "`-=`",
-			StarEq => "`*=`",
-			SlashEq => "`/=`",
-			PercentEq => "`%=`",
-			StarStarEq => "`**=`",
-			AmpAmpEq => "`&&=`",
-			PipePipeEq => "`||=`",
-			AmpEq => "`&=`",
-			PipeEq => "`|=`",
-			CaretEq => "`^=`",
-			TildeEq => "`~=`",
-			LtLtEq => "`<<=`",
-			GtGtEq => "`>>=`",
 			DotDot => "`..`",
 			DotDotEq => "`..=`",
 			Error => "invalid input",

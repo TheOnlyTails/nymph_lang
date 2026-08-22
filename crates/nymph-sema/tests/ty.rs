@@ -104,62 +104,6 @@ fn substitution_leaves_unmapped_params_alone() {
 }
 
 #[test]
-fn mut_wraps_structurally_and_dedups() {
-	let mut i = Interner::new();
-	let a = i.mk_mut(i.int());
-	let b = i.mk_mut(i.int());
-	assert_eq!(a, b, "interning `mut int` twice must yield the same handle");
-	assert_ne!(a, i.int(), "`mut int` must differ from plain `int`");
-	match i.kind(a) {
-		TyKind::Mut(inner) => assert_eq!(*inner, i.int()),
-		other => panic!("expected TyKind::Mut, got {other:?}"),
-	}
-}
-
-#[test]
-fn mut_is_idempotent_and_never_nests() {
-	// `mut mut T` collapses to `mut T` — a mutable view of a mutable view is
-	// just a mutable view, and several checker sites (`strip_mut`) rely on
-	// `Mut` never nesting.
-	let mut i = Interner::new();
-	let once = i.mk_mut(i.int());
-	let twice = i.mk_mut(once);
-	assert_eq!(once, twice, "`mut mut int` must collapse to `mut int`");
-}
-
-#[test]
-fn substitution_preserves_a_field_s_own_mut_wrapper() {
-	// `subst`'s HIR-level counterpart, `substitute_params`, recurses through
-	// `Mut` and rebuilds it — pins that a generic `mut T` field keeps its `mut`
-	// after a generic parameter is instantiated.
-	let mut i = Interner::new();
-	let p0 = i.mk_param(ParamIdx(0));
-	let mut_p0 = i.mk_mut(p0);
-
-	let mut subst = FxHashMap::default();
-	subst.insert(ParamIdx(0), i.int());
-
-	let instantiated = substitute_params(&mut i, mut_p0, &subst);
-	let expected = i.mk_mut(i.int());
-	assert_eq!(
-		instantiated, expected,
-		"`mut T` with T=int becomes `mut int`, not plain `int`"
-	);
-}
-
-#[test]
-fn occurs_check_sees_through_mut() {
-	let mut i = Interner::new();
-	let v = InferVar(0);
-	let infer = i.mk_infer(v);
-	let mut_infer = i.mk_mut(infer);
-	assert!(
-		occurs(&i, v, mut_infer),
-		"a variable occurs under a `mut` wrapper too"
-	);
-}
-
-#[test]
 fn occurs_check_detects_and_rejects() {
 	let mut i = Interner::new();
 	let v = InferVar(0);

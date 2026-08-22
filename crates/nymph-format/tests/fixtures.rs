@@ -5,7 +5,7 @@ use std::{
 
 use nymph_ast::{
 	decl::Declaration,
-	expr::{ExprKind, Statement, StringPart},
+	expr::{CallArg, ExprKind, StringPart},
 	token::Token,
 };
 use nymph_format::format;
@@ -101,6 +101,41 @@ fn without_nested_spans(mut debug: String) -> String {
 }
 
 #[test]
+fn formats_async_function_block_and_await_without_changing_their_tokens() {
+	let source = "async   func load( ) : int=async{1}.await";
+	let formatted = format(source, "async.nym").expect("async source formats");
+	assert_eq!(
+		formatted,
+		"async func load(): int =\nasync {\n\t1\n}.await\n"
+	);
+	parse_clean(&formatted, Path::new("async.nym"));
+	assert_eq!(format(&formatted, "async.nym").unwrap(), formatted);
+	assert_eq!(
+		semantic_fingerprint(source),
+		semantic_fingerprint(&formatted)
+	);
+}
+
+#[test]
+fn formats_immutable_state_headers_and_named_continue_arguments() {
+	let source =
+		"func cycle()=loop@outer(let left=1,let right=2){continue@outer(left=right,right=left)}";
+	let formatted = format(source, "state-loop.nym").expect("state loop formats");
+	assert_eq!(
+		formatted,
+		"func cycle() = loop@outer (let left = 1, let right = 2) continue@outer(\n\
+		\tleft = right,\n\
+		\tright = left,\n\
+		)\n"
+	);
+	assert_eq!(format(&formatted, "state-loop.nym").unwrap(), formatted);
+	assert_eq!(
+		semantic_fingerprint(source),
+		semantic_fingerprint(&formatted)
+	);
+}
+
+#[test]
 fn all_successful_file_fixtures_are_exact_idempotent_parseable_and_semantic() {
 	let fixtures = successful_fixtures();
 	assert!(
@@ -164,6 +199,18 @@ fn malformed_and_recovered_documents_never_produce_partial_output() {
 		);
 	}
 	assert!(count >= 8);
+
+	for source in [
+		"func old(): int = { let mut value = 1 value = 2 value }",
+		"func old(): void = while (true) {}",
+		"struct Old(field: mut int) { mut func update(mut value: int): void = {} }",
+		"func old(value: int): int = match (value) { ...Source -> 0 }",
+	] {
+		assert!(
+			format(source, "retired.nym").is_err(),
+			"retired source produced formatter output: {source}"
+		);
+	}
 }
 
 #[test]
@@ -202,37 +249,25 @@ fn block_elision_preserves_control_flow_precedence_and_dangling_else_binding() {
 }
 
 #[test]
-fn call_argument_elision_does_not_turn_positional_assignments_into_named_arguments() {
-	let source = "func sink(x: int): int = x\n\
-		func repro(): int = {\n\
-		\tlet mut x = 0\n\
-		\tsink((x = 1))\n\
-		\tsink({ x = 2 })\n\
-		\tx\n\
-		}\n";
-	let actual = format(source, "call-argument-elision.nym").expect("format call arguments");
+fn formats_named_struct_fresh_clone_and_match_without_losing_argument_identity() {
+	let source = "struct Pair(a:int=1,b:int)\nfunc fresh():Pair=Pair(b=2)\nfunc clone(pair:Pair):Pair=Pair(...pair,b=3)\nfunc read(pair:Pair):int=match(pair){Pair(a=value,b=_)->value}";
+	let actual = format(source, "struct-clone.nym").expect("format struct clone");
 	assert_eq!(
-		format(&actual, "call-argument-elision.nym").unwrap(),
-		actual
+		actual,
+		"struct Pair(a: int = 1, b: int)\nfunc fresh(): Pair = Pair(b = 2)\nfunc clone(pair: Pair): Pair = Pair(...pair, b = 3)\nfunc read(pair: Pair): int = match (pair) {\n\tPair(a = value, b = _) -> value,\n}\n"
 	);
-
-	let parsed = parse_module(&actual, "call-argument-elision.nym");
-	assert!(parsed.diagnostics.is_empty());
-	let Declaration::Func { body, .. } = &parsed.tree.members[1] else {
-		panic!("expected repro function");
+	parse_clean(&actual, Path::new("struct-clone.nym"));
+	assert_eq!(format(&actual, "struct-clone.nym").unwrap(), actual);
+	assert_eq!(semantic_fingerprint(source), semantic_fingerprint(&actual));
+	let parsed = parse_module(&actual, "struct-clone.nym");
+	let Declaration::Func { body, .. } = &parsed.tree.members[2] else {
+		panic!("expected function");
 	};
-	let ExprKind::Block { body, .. } = &body.kind else {
-		panic!("expected repro block");
+	let ExprKind::Call { args, .. } = &body.kind else {
+		panic!("expected call");
 	};
-	for statement in &body[1..=2] {
-		let Statement::Expr(call) = &statement.0 else {
-			panic!("expected call statement");
-		};
-		let ExprKind::Call { args, .. } = &call.kind else {
-			panic!("expected call expression");
-		};
-		assert!(args[0].0.name.is_none(), "positional call became named");
-	}
+	assert!(matches!(args[0].0, CallArg::Spread { .. }));
+	assert!(matches!(args[1].0, CallArg::Value { name: Some(_), .. }));
 }
 
 #[test]
@@ -270,18 +305,12 @@ fn required_precedence_groups_have_canonical_spacing_and_are_idempotent() {
 		func right(a:int,b:int,c:int)= a * (b + c)\n\
 		func unary(a:int,b:int)= -(a + b)\n\
 		func power()=2**3**2\n\
-		func left_power()=(2**3)**2\n\
-		func power_assign()={let mut x=2 x**=3 x}\n";
+		func left_power()=(2**3)**2\n";
 	let expected = "func left(a: int, b: int, c: int) = (a + b) * c\n\
 		func right(a: int, b: int, c: int) = a * (b + c)\n\
 		func unary(a: int, b: int) = -(a + b)\n\
 		func power() = 2 ** 3 ** 2\n\
-		func left_power() = (2 ** 3) ** 2\n\
-		func power_assign() = {\n\
-		\tlet mut x = 2\n\
-		\tx **= 3\n\
-		\tx\n\
-		}\n";
+		func left_power() = (2 ** 3) ** 2\n";
 	let actual = format(source, "groups.nym").expect("format groups");
 	assert_eq!(actual, expected);
 	assert_eq!(format(&actual, "groups.nym").unwrap(), actual);
@@ -334,4 +363,21 @@ fn unicode_xid_identifiers_always_advance_the_lossless_scanner() {
 	let actual = format(source, "unicode-identifiers.nym").expect("format Unicode identifiers");
 	assert_eq!(actual, source);
 	assert_eq!(format(&actual, "unicode-identifiers.nym").unwrap(), actual);
+}
+
+#[test]
+fn echo_prefix_and_pipeline_positions_format_idempotently() {
+	let source =
+		"func observe(value:int):int={echo(value)}\nfunc pipeline(value:int):int=value\n|>echo\n";
+	let formatted = format(source, "echo.nym").expect("format echo expressions");
+	assert_eq!(
+		formatted,
+		"func observe(value: int): int = echo (value)\nfunc pipeline(value: int): int = value |> echo\n"
+	);
+	parse_clean(&formatted, Path::new("echo.nym"));
+	assert_eq!(format(&formatted, "echo.nym").unwrap(), formatted);
+	assert_eq!(
+		semantic_fingerprint(source),
+		semantic_fingerprint(&formatted)
+	);
 }

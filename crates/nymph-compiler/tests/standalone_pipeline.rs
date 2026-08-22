@@ -38,12 +38,18 @@ fn public_standalone_checks_use_the_stable_session_pipeline() {
 fn public_standalone_compilers_use_one_stable_check_on_success_and_failure() {
 	let javascript = assert_one_stable_check(|| compile("func value(): int = 1", "src/lib.nym"))
 		.expect("library source should compile");
-	assert!(javascript.contains("function value("));
+	assert!(
+		javascript.contains("value = nymphCallable(function("),
+		"{javascript}"
+	);
 
 	let javascript =
 		assert_one_stable_check(|| compile_entry("func main(): void = {}", "src/main.nym"))
 			.expect("entry source should compile");
-	assert!(javascript.contains("function main("));
+	assert!(
+		javascript.contains("main = nymphCallable(function("),
+		"{javascript}"
+	);
 
 	let diagnostics =
 		assert_one_stable_check(|| compile("func value(): int = true", "src/broken.nym"))

@@ -17,9 +17,9 @@ impl Shape for Figure {
   /// Exhaustive `match` — the compiler checks every variant is covered, so adding a
   /// new `Figure` here would fail to compile until it's handled.
   func area(): float = match (this) {
-    Circle(radius) -> 3.14159 * radius * radius,
-    Rectangle(width, height) -> width * height,
-    Triangle(base, height) -> 0.5 * base * height,
+    Circle(radius = radius) -> 3.14159 * radius * radius,
+    Rectangle(width = width, height = height) -> width * height,
+    Triangle(base = base, height = height) -> 0.5 * base * height,
   }
 
   func name(): string = match (this) {
@@ -35,14 +35,10 @@ func describe<T: Shape>(shape: T): string =
 
 /// Fold a list of shapes into their total area.
 func total_area(shapes: #[Figure]): float = {
-  let mut sum = 0.0
-  for (shape in shapes) {
-    sum = sum + shape.area()
-  }
-  sum
+  shapes.iter().map((shape) -> shape.area()).fold(0.0, (sum, area) -> sum + area)
 }
 
-func main() = {
+func main(): void = {
   let figures = #[
     Circle(radius = 2.0),
     Rectangle(width = 3.0, height = 4.0),

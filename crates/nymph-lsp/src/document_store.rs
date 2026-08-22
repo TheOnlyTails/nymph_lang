@@ -5,6 +5,7 @@
 //! `textDocument/didClose`.
 
 use lsp_types::Uri;
+use nymph_compiler::BuildProfile;
 use std::{collections::HashMap, sync::Arc};
 
 /// One open document: its full current text and the client's version
@@ -35,6 +36,7 @@ pub struct DocumentStore {
 	docs: HashMap<Uri, Document>,
 	revision: DocumentStoreRevision,
 	filesystem_revision: u64,
+	build_profile: BuildProfile,
 }
 
 impl DocumentStore {
@@ -117,6 +119,20 @@ impl DocumentStore {
 			.expect("document store filesystem revision exhausted");
 	}
 
+	pub fn set_build_profile(&mut self, profile: BuildProfile) -> bool {
+		if self.build_profile == profile {
+			return false;
+		}
+		self.build_profile = profile;
+		self.advance_revision();
+		true
+	}
+
+	#[must_use]
+	pub fn build_profile(&self) -> BuildProfile {
+		self.build_profile
+	}
+
 	#[must_use]
 	pub(crate) fn filesystem_revision(&self) -> u64 {
 		self.filesystem_revision
@@ -156,5 +172,17 @@ mod tests {
 		assert!(!store.change_full(&uri, "let stale = true".into(), 9));
 		assert_eq!(store.revision(), close_revision);
 		assert!(store.get(&uri).is_none());
+	}
+
+	#[test]
+	fn build_profile_changes_advance_the_workspace_revision_once() {
+		let mut store = DocumentStore::default();
+		let development = store.revision();
+		assert_eq!(store.build_profile(), BuildProfile::Development);
+		assert!(store.set_build_profile(BuildProfile::Release));
+		assert!(store.revision() > development);
+		let release = store.revision();
+		assert!(!store.set_build_profile(BuildProfile::Release));
+		assert_eq!(store.revision(), release);
 	}
 }

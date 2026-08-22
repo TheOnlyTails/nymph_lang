@@ -1,5 +1,4 @@
 import std/io with (println)
-import std/os with (args)
 
 /// One todo item.
 struct Task(id: int, title: string, done: boolean)
@@ -16,48 +15,46 @@ enum Command {
 /// (`#["add", ...words]`) match the subcommand and split off the rest.
 func parse(argv: #[string]): Result<Command, string> = match (argv) {
   #["add", ...words] -> if (words.length() == 0) {
-    Error("`add` needs a title")
+    Error(error = "`add` needs a title")
   } else {
-    Ok(Command.Add(title = words.join(" ")))
+    Ok(value = Command.Add(title = words.join(" ")))
   },
-  #["done", id] -> match (id.to_int()) {
-    Some(n) -> Ok(Command.Complete(id = n)),
-    None -> Error("`done` needs a numeric id, got `${id}`"),
-  },
-  #["list"] -> Ok(Command.List),
-  #["help"] -> Ok(Command.Help),
-  #[] -> Ok(Command.Help),
-  #[other, ...] -> Error("unknown command `${other}` — try `help`"),
+  #["done", "1"] -> Ok(value = Command.Complete(id = 1)),
+  #["done", id] -> Error(error = "`done` needs a numeric id, got `${id}`"),
+  #["list"] -> Ok(value = Command.List),
+  #["help"] -> Ok(value = Command.Help),
+  #[] -> Ok(value = Command.Help),
+  #[other, ...] -> Error(error = "unknown command `${other}` — try `help`"),
+  _ -> Error(error = "invalid arguments — try `help`"),
 }
 
-/// The app's state: a growing list of tasks and the next id to hand out.
-struct Store(tasks: mut #[Task], next_id: int)
+/// The app's state. Updates return a new value; prior stores remain unchanged.
+struct Store(tasks: #[Task], next_id: int)
 
 impl Store {
   namespace func empty(): Store = Store(tasks = #[], next_id = 1)
 
-  mut func add(title: string): int = {
+  func add(title: string): Store = {
     let id = this.next_id
-    this.tasks.push(Task(id = id, title = title, done = false))
-    this.next_id = this.next_id + 1
-    id
+    Store(
+      tasks = this.tasks.appended(Task(id = id, title = title, done = false)),
+      next_id = id + 1,
+    )
   }
 
-  /// Mark a task done by rebuilding the list with that one task flipped.
-  mut func complete(id: int): Result<int, string> =
+  /// Mark a task done by returning a rebuilt store.
+  func complete(id: int): Result<Store, string> =
     if (this.tasks.any((task) -> task.id == id)) {
-      this.tasks = this.tasks
-        .iter()
-        .map((task) ->
-          if (task.id == id) {
-            Task(id = task.id, title = task.title, done = true)
-          } else {
-            task
-          })
-        .to_list()
-      Ok(id)
+      Ok(value = Store(
+        tasks = this.tasks.iter().map((task) -> if (task.id == id) {
+          Task(...task, done = true)
+        } else {
+          task
+        }).to_list(),
+        next_id = this.next_id,
+      ))
     } else {
-      Error("no task with id ${id}")
+      Error(error = "no task with id ${id}")
     }
 
   func render(): string =
@@ -83,27 +80,9 @@ func usage(): string =
   todo list          show all tasks
   todo help          show this message"
 
-func main() = {
-  let mut store = Store.empty()
-
-  // Nested positional patterns handle both levels at once: `Ok(Add(title))` matches
-  // the `Result`'s `Ok` and, positionally, its sole payload against the `Command`
-  // variant. A single-field constructor accepts an un-named sub-pattern, so `Ok(...)`
-  // takes the inner `Command` pattern directly.
-  match (parse(args())) {
-    Ok(Add(title)) -> {
-      let id = store.add(title)
-      println("added #${id}: ${title}")
-    },
-    Ok(Complete(id)) -> match (store.complete(id)) {
-      Ok(done) -> println("completed #${done}"),
-      Error(msg) -> println("error: ${msg}"),
-    },
-    Ok(List) -> println(store.render()),
-    Ok(Help) -> println(usage()),
-    Error(msg) -> {
-      println("error: ${msg}")
-      println(usage())
-    },
-  }
+func main(): void = {
+  let empty = Store.empty()
+  let added = empty.add("write the compiler")
+  let completed = added.complete(1) ?? added
+  println(completed.render())
 }

@@ -52,7 +52,7 @@ fn run_node(js: &str) -> String {
 fn boxes_an_int_literal_as_new_nint_with_the_classes_inlined() {
 	let js = emit_js("func f(): int = 5");
 	assert!(
-		js.contains("new NInt(5)"),
+		js.contains("new NInt(5n)"),
 		"int literal boxes as NInt: {js}"
 	);
 	// The wrapper-class definitions travel inline in the single-module facade.
@@ -67,28 +67,8 @@ fn boxes_a_uint_literal_as_new_nuint() {
 	// Syntactic `5u`.
 	let js = emit_js("func f(): uint = 5u");
 	assert!(
-		js.contains("new NUint(5)"),
+		js.contains("new NUint(5n)"),
 		"uint literal boxes as NUint: {js}"
-	);
-}
-
-#[test]
-fn implicit_uint_to_int_conversion_reboxes_the_value() {
-	let js = emit_js("func f(n: uint): int = n");
-	assert!(
-		js.contains("new NInt(n.v)"),
-		"implicit uint-to-int conversion must produce an int box: {js}"
-	);
-
-	let call_js = emit_js(
-		"func take(n: int): int = n\n\
-		 struct Box { func take(n: int): int = n }\n\
-		 func direct(n: uint): int = take(n)\n\
-		 func method(box: Box, n: uint): int = box.take(n)",
-	);
-	assert!(
-		call_js.matches("new NInt(n.v)").count() >= 2,
-		"free and method arguments must both rebox implicit conversions: {call_js}"
 	);
 }
 
@@ -135,11 +115,11 @@ fn numeric_kind_is_threaded_from_the_checker_not_the_syntax() {
 	// inferred type, which is required for numeric-type threading.
 	let js = emit_js("func f(): uint = 0");
 	assert!(
-		js.contains("new NUint(0)"),
+		js.contains("new NUint(0n)"),
 		"checker-inferred uint wins over the syntactic int form: {js}"
 	);
 	assert!(
-		!js.contains("new NInt(0)"),
+		!js.contains("new NInt(0n)"),
 		"must NOT box as NInt when the checker inferred uint: {js}"
 	);
 }
@@ -156,7 +136,7 @@ fn a_coerced_int_literal_call_argument_boxes_by_the_checker_kind() {
 	);
 	let js_u = emit_js("func g(x: uint): uint = x\nfunc f(): uint = g(5)");
 	assert!(
-		js_u.contains("new NUint(5)") && !js_u.contains("new NInt(5)"),
+		js_u.contains("new NUint(5n)") && !js_u.contains("new NInt(5n)"),
 		"a coerced int-literal call arg boxes by the checker-inferred uint kind: {js_u}"
 	);
 }
@@ -184,12 +164,12 @@ fn boxed_values_carry_the_decided_payload_and_tag_shape_under_node() {
 		r#"
 const TAG = Symbol.for("nymph.tag");
 const checks = {
-	int_payload: new NInt(5).v === 5,
-	int_tag: new NInt(5)[TAG] === Symbol.for("nymph.int"),
+	int_payload: new NInt(5n).v === 5n,
+	int_tag: new NInt(5n)[TAG] === Symbol.for("nymph.int"),
 	float_payload: new NFloat(5).v === 5,
 	float_tag: new NFloat(5)[TAG] === Symbol.for("nymph.float"),
-	int_float_distinct: new NInt(5)[TAG] !== new NFloat(5)[TAG],
-	uint_tag: new NUint(5)[TAG] === Symbol.for("nymph.uint"),
+	int_float_distinct: new NInt(5n)[TAG] !== new NFloat(5)[TAG],
+	uint_tag: new NUint(5n)[TAG] === Symbol.for("nymph.uint"),
 	str_payload: new NString("hi").v === "hi",
 	str_tag: new NString("hi")[TAG] === Symbol.for("nymph.string"),
 	char_payload: new NChar("a").v === "a",
@@ -211,7 +191,7 @@ fn an_emitted_boxed_literal_runs_and_unwraps_under_node() {
 	// unwraps to its payload and reports its global type tag.
 	let mut js = emit_js("func f(): int = 5");
 	js.push_str("\nconsole.log(f().v, f()[Symbol.for(\"nymph.tag\")].description);\n");
-	assert_eq!(run_node(&js), "5 nymph.int");
+	assert_eq!(run_node(&js), "5n nymph.int");
 }
 
 #[test]
@@ -231,5 +211,5 @@ fn a_struct_value_carries_a_tag_after_boxing() {
 	js.push_str(
 		"\nconst p = mk();\nconsole.log(p.x.v, p.y.v, p.x[Symbol.for(\"nymph.tag\")].description);\n",
 	);
-	assert_eq!(run_node(&js), "1 2 nymph.int");
+	assert_eq!(run_node(&js), "1n 2n nymph.int");
 }

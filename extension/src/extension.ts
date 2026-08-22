@@ -28,6 +28,9 @@ export async function activate(context: ExtensionContext) {
 			{ scheme: "file", language: "nymph" },
 			{ scheme: "untitled", language: "nymph" },
 		],
+		synchronize: {
+			configurationSection: "nymph",
+		},
 	};
 
 	client = new LanguageClient("nymph-lsp", "Nymph Language Server", serverOptions, clientOptions);

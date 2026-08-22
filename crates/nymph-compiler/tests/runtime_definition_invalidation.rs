@@ -54,7 +54,7 @@ public interface Blanket { func blanket_method(): int }
 
 public struct Record(value: int) {
 	func inline_func(): int = this.value
-	mut func inline_mut_func(): int = this.value
+	func inline_mut_func(): int = this.value
 	namespace func inline_static(): int = 13
 	namespace let inline_static_value: int = 14
 	external(host_member_func) func external_member_func(): int
@@ -66,7 +66,7 @@ public struct Record(value: int) {
 }
 public enum Choice { One
 	func enum_func(): int = 16
-	mut func enum_mut_func(): int = 17
+	func enum_mut_func(): int = 17
 	namespace func enum_static(): int = 18
 	namespace let enum_static_value: int = 19
 }

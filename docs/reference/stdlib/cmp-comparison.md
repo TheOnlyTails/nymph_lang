@@ -54,6 +54,6 @@ the box, so `<`/`<=`/`>`/`>=` already work on every built-in scalar without writ
 
 ## `Equals`
 
-A related, separate interface — see [Operators](../operators#equals) — provides `.equals()`/
-`.not_equals()` through a blanket impl on every type. It's unrelated to `==`/`!=`, which never
-dispatch to it.
+A related, separate interface — see [Operators](../operators#equals) — provides `.equals()` and
+`.not_equals()` for types with an explicit `Equals` implementation. It's unrelated to `==`/`!=`,
+which never dispatch to it.

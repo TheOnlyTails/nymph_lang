@@ -63,6 +63,7 @@ pub enum DefOrigin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DefKind {
 	Func,
+	Effect,
 	Struct,
 	Enum,
 	/// An enum variant, referenced by bare name as a constructor/pattern.
@@ -314,6 +315,9 @@ pub(crate) fn build_def_map_on(
 			Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => {
 				declare(&mut map, diags, &meta.name, DefKind::Func, i);
 			}
+			Declaration::Effect { name, .. } => {
+				declare(&mut map, diags, name, DefKind::Effect, i);
+			}
 			Declaration::Let { meta, .. } | Declaration::ExternalLet(_, _, meta) => {
 				if let Some(name) = binding_name(&meta.name) {
 					declare(&mut map, diags, name, DefKind::Let, i);
@@ -389,10 +393,20 @@ pub struct StructSig {
 #[derive(Debug, Clone)]
 pub struct EnumSig {
 	pub generics: Generics,
+	/// Edges in the enum-view graph. The final accepted variant set is computed
+	/// as a least fixed point, so cycles and repeated paths are valid.
+	pub embeddings: Vec<EnumEmbeddingSig>,
 	pub variants: Vec<VariantSig>,
 	/// The interface bounds declared on this enum's own generics, in the same
 	/// index space as [`StructSig::bounds`] (matching `instantiate_enum`).
 	pub bounds: Vec<crate::iface::Bound>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EnumEmbeddingSig {
+	pub source: DefId,
+	/// A selected native source variant, or all variants when absent.
+	pub variant: Option<DefId>,
 }
 
 #[derive(Debug, Clone)]
@@ -406,7 +420,7 @@ pub struct VariantSig {
 #[derive(Debug, Clone)]
 pub struct FieldSigMetadata {
 	pub target: Option<DefinitionId>,
-	pub mutable: bool,
+	pub visibility: nymph_ast::decl::Visibility,
 	pub has_default: bool,
 }
 
@@ -415,9 +429,11 @@ pub struct OwnedMemberSig {
 	pub target: DefinitionId,
 	pub kind: crate::MemberKind,
 	pub generics: Generics,
+	pub generic_kinds: Vec<crate::GenericParameterKind>,
 	pub bounds: Vec<crate::iface::Bound>,
 	pub params: Vec<FuncParamSig>,
 	pub ret: Ty,
+	pub effects: crate::ty::EffectRow,
 	pub has_default: bool,
 	pub external: Option<crate::ExternalAbi>,
 }
@@ -436,9 +452,12 @@ pub struct FuncParamSig {
 #[derive(Debug, Clone)]
 pub struct FuncSig {
 	pub generics: Generics,
+	pub generic_kinds: Vec<crate::GenericParameterKind>,
 	pub params: Vec<FuncParamSig>,
 	pub ret: Ty,
-	/// Whether the function has a `this` receiver.
+	pub effects: crate::ty::EffectRow,
+	/// Whether the function has a `this` receiver (an inherent method). Always
+	/// `false` in Milestone A, which has no method definitions.
 	#[allow(dead_code)]
 	pub has_self: bool,
 	/// The interface bounds declared on this function's own generics,
@@ -481,8 +500,6 @@ pub enum NamespaceMemberSig {
 		#[allow(dead_code)]
 		target: Option<DefinitionId>,
 		ty: Ty,
-		#[allow(dead_code)]
-		mutable: bool,
 	},
 }
 

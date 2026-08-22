@@ -6,7 +6,6 @@ use strum::FromRepr;
 /// to decide how to fold `a + b * c` into `a + (b * c)`.
 #[derive(Copy, Clone, Ord, PartialOrd, Eq, PartialEq, Debug, FromRepr, salsa::SalsaValue)]
 pub enum Precedence {
-	Assignment,
 	Pipeline,
 	BoolOr,
 	BoolAnd,
@@ -130,38 +129,4 @@ pub enum PatternOperator {
 	Is,
 	/// `!is`
 	NotIs,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug, salsa::SalsaValue)]
-pub enum AssignOperator {
-	/// `=`
-	Assign,
-	/// `+=`
-	PlusAssign,
-	/// `-=`
-	MinusAssign,
-	/// `*=`
-	TimesAssign,
-	/// `/=`
-	DivideAssign,
-	/// `%=`
-	RemainderAssign,
-	/// `**=`
-	PowerAssign,
-	/// `<<=`
-	LeftShiftAssign,
-	/// `>>=`
-	RightShiftAssign,
-	/// `&=`
-	BitAndAssign,
-	/// `^=`
-	BitXorAssign,
-	/// `|=`
-	BitOrAssign,
-	/// `~=`
-	BitNotAssign,
-	/// `&&=`
-	BoolAndAssign,
-	/// `||=`
-	BoolOrAssign,
 }

@@ -5,6 +5,7 @@ use std::{
 };
 
 use nymph_ast::decl::Declaration;
+use nymph_diagnostics::SourceVersion;
 use nymph_sema::EntryMode;
 use salsa::Setter;
 
@@ -12,6 +13,47 @@ use super::{
 	CompiledProject, ProjectDiagnostic,
 	queries::{self, Db},
 };
+
+#[derive(
+	Clone,
+	Copy,
+	Default,
+	PartialEq,
+	Eq,
+	Hash,
+	PartialOrd,
+	Ord,
+	Debug,
+	serde::Deserialize,
+	serde::Serialize,
+	salsa::SalsaValue,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildProfile {
+	#[default]
+	Development,
+	Release,
+}
+
+#[derive(
+	Clone,
+	Copy,
+	PartialEq,
+	Eq,
+	Hash,
+	PartialOrd,
+	Ord,
+	Debug,
+	serde::Deserialize,
+	serde::Serialize,
+	salsa::SalsaValue,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum LintLevel {
+	Allow,
+	Warn,
+	Deny,
+}
 
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, salsa::SalsaValue)]
 pub struct ProjectId(Arc<str>);
@@ -25,6 +67,50 @@ impl ProjectId {
 	pub fn as_str(&self) -> &str {
 		&self.0
 	}
+}
+
+/// Opaque compiler-owned identity for one resolved package graph node.
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, salsa::SalsaValue)]
+pub struct PackageId {
+	project: ProjectId,
+	node: u64,
+}
+
+impl PackageId {
+	pub(crate) fn root(project: ProjectId) -> Self {
+		Self { project, node: 0 }
+	}
+
+	#[must_use]
+	pub fn project(&self) -> &ProjectId {
+		&self.project
+	}
+
+	#[must_use]
+	pub fn is_root(&self) -> bool {
+		self.node == 0
+	}
+
+	/// Whether a semantic module belongs to this exact resolved package node.
+	#[must_use]
+	pub fn owns_module(&self, module: &nymph_sema::ModuleIdentity) -> bool {
+		module.package_identity()
+			== nymph_sema::PackageIdentity::Resolved {
+				project: self.project.as_str().into(),
+				node: self.node,
+			}
+	}
+
+	pub(crate) fn node(&self) -> u64 {
+		self.node
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PackageGraphError {
+	WrongProject,
+	UnknownPackage,
+	InvalidAlias,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, salsa::SalsaValue)]
@@ -88,9 +174,6 @@ impl fmt::Display for ModulePath {
 	}
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct SourceVersion(pub i64);
-
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, salsa::SalsaValue)]
 pub(crate) enum BuiltinModuleDomain {
 	ImportableStd,
@@ -123,9 +206,17 @@ pub(crate) struct ModuleInput {
 	#[returns(clone)]
 	pub project: ProjectId,
 	#[returns(clone)]
+	pub package: PackageId,
+	#[returns(clone)]
 	pub path: ModulePath,
 	#[returns(clone)]
 	pub source: Option<Arc<str>>,
+	#[returns(clone)]
+	pub source_name: Arc<str>,
+	#[returns(clone)]
+	pub source_uri: Option<Arc<str>>,
+	#[returns(copy)]
+	pub version: SourceVersion,
 }
 
 #[salsa::input]
@@ -177,12 +268,40 @@ pub(crate) struct ProjectInput {
 	pub project: ProjectId,
 	#[returns(clone)]
 	pub active_modules: Arc<[ModuleInput]>,
+	#[returns(clone)]
+	pub package_aliases: Arc<[PackageAlias]>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, salsa::SalsaValue)]
+pub(crate) struct LintSetting {
+	pub(crate) name: Arc<str>,
+	pub(crate) level: LintLevel,
+}
+
+#[salsa::input]
+#[derive(Debug)]
+pub(crate) struct ProjectPolicyInput {
+	#[returns(clone)]
+	pub root_package: PackageId,
+	#[returns(copy)]
+	pub profile: BuildProfile,
+	#[returns(clone)]
+	pub lints: Arc<[LintSetting]>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, salsa::SalsaValue)]
+pub(crate) struct PackageAlias {
+	pub(crate) owner: PackageId,
+	pub(crate) name: Arc<str>,
+	pub(crate) target: PackageId,
 }
 
 #[salsa::interned]
 pub(crate) struct ProjectKey<'db> {
 	#[returns(copy)]
 	pub project_input: ProjectInput,
+	#[returns(copy)]
+	pub policy_input: ProjectPolicyInput,
 	#[returns(copy)]
 	pub builtin_registry: BuiltinRegistryInput,
 	#[returns(copy)]
@@ -274,11 +393,13 @@ struct SemanticTestHook {
 	body_guard: Option<(ProjectId, ModulePath)>,
 }
 
-type RegistryKey = (ProjectId, ModulePath);
+type RegistryKey = (PackageId, ModulePath);
 
 struct SourceRecord {
 	input: ModuleInput,
 	source: Option<Arc<str>>,
+	source_name: Arc<str>,
+	source_uri: Option<Arc<str>>,
 	version: SourceVersion,
 }
 
@@ -385,7 +506,13 @@ pub enum RuntimeDefinitionError {
 pub struct CompilerSession {
 	db: Database,
 	registry: BTreeMap<RegistryKey, SourceRecord>,
+	packages: BTreeSet<PackageId>,
+	package_aliases: BTreeMap<(PackageId, Arc<str>), PackageId>,
+	next_package_nodes: BTreeMap<ProjectId, u64>,
 	projects: Mutex<BTreeMap<ProjectId, ProjectInput>>,
+	policy_inputs: Mutex<BTreeMap<ProjectId, ProjectPolicyInput>>,
+	project_lints: BTreeMap<ProjectId, Arc<[LintSetting]>>,
+	build_profile: BuildProfile,
 	builtin_sources: BTreeMap<Arc<str>, Arc<str>>,
 	builtins: BTreeMap<BuiltinModuleKey, BuiltinModuleInput>,
 	builtin_registry: BuiltinRegistryInput,
@@ -539,7 +666,19 @@ impl CompilerSession {
 	) -> Option<SemanticModuleInput> {
 		self
 			.registry
-			.get(&(project.clone(), module.clone()))
+			.get(&(PackageId::root(project.clone()), module.clone()))
+			.map(|record| SemanticModuleInput::Project(record.input))
+	}
+
+	#[cfg(feature = "test-support")]
+	fn package_semantic_input(
+		&self,
+		package: &PackageId,
+		module: &ModulePath,
+	) -> Option<SemanticModuleInput> {
+		self
+			.registry
+			.get(&(package.clone(), module.clone()))
 			.map(|record| SemanticModuleInput::Project(record.input))
 	}
 
@@ -568,6 +707,20 @@ impl CompilerSession {
 	) -> Option<Arc<nymph_sema::ModuleEnvironment>> {
 		let input = self.semantic_input(&project, &module)?;
 		let key = self.project_key(project, entry, mode, true, true);
+		Some(queries::interface_module_environment(&self.db, key, input))
+	}
+
+	#[must_use]
+	#[cfg(feature = "test-support")]
+	pub fn package_module_environment_for_test(
+		&self,
+		package: PackageId,
+		entry: ModulePath,
+		module: ModulePath,
+		mode: EntryMode,
+	) -> Option<Arc<nymph_sema::ModuleEnvironment>> {
+		let input = self.package_semantic_input(&package, &module)?;
+		let key = self.project_key(package.project.clone(), entry, mode, true, true);
 		Some(queries::interface_module_environment(&self.db, key, input))
 	}
 
@@ -658,7 +811,10 @@ impl CompilerSession {
 		module: ModulePath,
 		mode: EntryMode,
 	) -> Option<Arc<ModuleAnalysis>> {
-		let input = self.registry.get(&(project.clone(), module))?.input;
+		let input = self
+			.registry
+			.get(&(PackageId::root(project.clone()), module))?
+			.input;
 		let key = self.project_key(project.clone(), entry, mode, true, true);
 		self.module_analysis(project, input, key)
 	}
@@ -671,7 +827,10 @@ impl CompilerSession {
 		document_private_items: bool,
 	) -> Option<Result<Arc<nymph_sema::ModuleInterface>, Arc<nymph_sema::InterfaceConversionError>>>
 	{
-		let input = self.registry.get(&(project.clone(), module))?.input;
+		let input = self
+			.registry
+			.get(&(PackageId::root(project.clone()), module))?
+			.input;
 		let key = self.project_key(project, entry, EntryMode::Library, true, true);
 		Some(queries::documentation_module_interface(
 			&self.db,
@@ -721,7 +880,7 @@ impl CompilerSession {
 	) -> Result<Arc<nymph_sema::StableHirModule>, nymph_sema::StableModuleAssemblyError> {
 		let input = self
 			.registry
-			.get(&(project.clone(), module))
+			.get(&(PackageId::root(project.clone()), module))
 			.map(|record| record.input)
 			.ok_or_else(
 				|| nymph_sema::StableModuleAssemblyError::RecoveredEnvironment {
@@ -754,6 +913,25 @@ impl CompilerSession {
 			return Err(diagnostics.0);
 		}
 		match super::emission::emitted_interface_project(&self.db, key, false) {
+			super::emission::StableEmissionResult::Value(value) => Ok(value),
+			super::emission::StableEmissionResult::Diagnostics(diagnostics) => Err(diagnostics),
+		}
+	}
+
+	#[cfg(feature = "test-support")]
+	#[doc(hidden)]
+	pub fn emit_interface_module_for_test(
+		&self,
+		project: ProjectId,
+		entry: ModulePath,
+		module: ModulePath,
+		mode: EntryMode,
+	) -> Result<Arc<String>, Arc<[ProjectDiagnostic]>> {
+		let input = self
+			.semantic_input(&project, &module)
+			.expect("test emission must name an active project module");
+		let key = self.project_key(project, entry, mode, false, true);
+		match super::emission::emitted_interface_module(&self.db, key, input, false) {
 			super::emission::StableEmissionResult::Value(value) => Ok(value),
 			super::emission::StableEmissionResult::Diagnostics(diagnostics) => Err(diagnostics),
 		}
@@ -834,7 +1012,10 @@ impl CompilerSession {
 		module: ModulePath,
 		mode: EntryMode,
 	) -> Option<Vec<Arc<nymph_sema::RuntimeDefinition>>> {
-		let input = self.registry.get(&(project.clone(), module))?.input;
+		let input = self
+			.registry
+			.get(&(PackageId::root(project.clone()), module))?
+			.input;
 		let key = self.project_key(project, entry, mode, true, true);
 		Some(
 			queries::runtime_manifest(&self.db, key, SemanticModuleInput::Project(input))
@@ -923,7 +1104,10 @@ impl CompilerSession {
 		ambient_prelude: bool,
 		isolated: bool,
 	) -> Option<ToolingCompletionAnalysis> {
-		let input = self.registry.get(&(project.clone(), module))?.input;
+		let input = self
+			.registry
+			.get(&(PackageId::root(project.clone()), module))?
+			.input;
 		let key = if isolated {
 			self.isolated_tooling_key(project.clone(), entry, ambient_prelude)
 		} else {
@@ -1029,7 +1213,10 @@ impl CompilerSession {
 		module: ModulePath,
 		ambient_prelude: bool,
 	) -> Option<Arc<ModuleAnalysis>> {
-		let input = self.registry.get(&(project.clone(), module))?.input;
+		let input = self
+			.registry
+			.get(&(PackageId::root(project.clone()), module))?
+			.input;
 		let key = self.tooling_key(project.clone(), entry, ambient_prelude);
 		self.module_analysis(project, input, key)
 	}
@@ -1051,7 +1238,10 @@ impl CompilerSession {
 		if entry != module {
 			return None;
 		}
-		let input = self.registry.get(&(project.clone(), module))?.input;
+		let input = self
+			.registry
+			.get(&(PackageId::root(project.clone()), module))?
+			.input;
 		let key = self.isolated_tooling_key(project.clone(), entry, ambient_prelude);
 		(input.project(&self.db) == project
 			&& key.project_input(&self.db).project(&self.db) == project
@@ -1110,7 +1300,9 @@ impl CompilerSession {
 		let mut modules = self
 			.registry
 			.iter()
-			.filter(|((owner, _), record)| owner == &project && record.source.is_some())
+			.filter(|((package, _), record)| {
+				package.is_root() && package.project == project && record.source.is_some()
+			})
 			.filter_map(|((_, path), record)| Some((path.clone(), record.input, record.source.clone()?)))
 			.collect::<Vec<_>>();
 		modules.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
@@ -1151,7 +1343,9 @@ impl CompilerSession {
 		let mut modules = self
 			.registry
 			.iter()
-			.filter(|((owner, _), record)| owner == project && record.source.is_some())
+			.filter(|((package, _), record)| {
+				package.is_root() && package.project == *project && record.source.is_some()
+			})
 			.map(|((_, module), record)| ToolingModuleDeclarations {
 				module: module.clone(),
 				source: record.source.clone().expect("active module has source"),
@@ -1231,6 +1425,7 @@ impl CompilerSession {
 				}
 				if let Ok(target) =
 					super::resolve::resolve_import_target(root, path, &key, nymph_ast::Span::new(0, 0))
+					&& let Some(target) = target.loader_key()
 				{
 					imports.push(target);
 				}
@@ -1275,11 +1470,13 @@ impl CompilerSession {
 	#[doc(hidden)]
 	#[must_use]
 	pub fn isolated_empty(&self) -> Self {
-		Self::with_builtin_sources(
+		let mut isolated = Self::with_builtin_sources(
 			self.builtin_sources.clone(),
 			self.event_callback.clone(),
 			self.tombstone_threshold,
-		)
+		);
+		isolated.build_profile = self.build_profile;
+		isolated
 	}
 
 	fn with_builtin_sources(
@@ -1293,7 +1490,13 @@ impl CompilerSession {
 		Self {
 			db,
 			registry: BTreeMap::new(),
+			packages: BTreeSet::new(),
+			package_aliases: BTreeMap::new(),
+			next_package_nodes: BTreeMap::new(),
 			projects: Mutex::new(BTreeMap::new()),
+			policy_inputs: Mutex::new(BTreeMap::new()),
+			project_lints: BTreeMap::new(),
+			build_profile: BuildProfile::default(),
 			builtin_sources,
 			builtins,
 			builtin_registry,
@@ -1429,6 +1632,7 @@ impl CompilerSession {
 						| "interface_module_interface"
 						| "interface_module_environment"
 						| "interface_project_diagnostics"
+						| "policy_project_diagnostics"
 						| "emitted_interface_module"
 						| "emitted_interface_project"
 						| "compiled_interface_project" => Some(query),
@@ -1457,29 +1661,117 @@ impl CompilerSession {
 		source: String,
 		version: SourceVersion,
 	) {
-		let key = (project.clone(), module.clone());
+		let source_name = format!("{module}.nym");
+		self.set_package_source_inner(
+			PackageId::root(project),
+			module,
+			source,
+			version,
+			source_name,
+			None,
+		);
+	}
+
+	pub fn set_source_with_location(
+		&mut self,
+		project: ProjectId,
+		module: ModulePath,
+		source: String,
+		version: SourceVersion,
+		source_name: impl Into<Arc<str>>,
+		source_uri: Option<impl Into<Arc<str>>>,
+	) {
+		self.set_package_source_inner(
+			PackageId::root(project),
+			module,
+			source,
+			version,
+			source_name.into(),
+			source_uri.map(Into::into),
+		);
+	}
+
+	pub fn set_project_source_uris(
+		&mut self,
+		project: &ProjectId,
+		uri_for_module: &dyn Fn(&str) -> Option<String>,
+	) {
+		for ((package, path), record) in &mut self.registry {
+			if package.project() != project {
+				continue;
+			}
+			let source_uri = uri_for_module(path.as_str()).map(Arc::from);
+			if record.source_uri != source_uri {
+				record
+					.input
+					.set_source_uri(&mut self.db)
+					.to(source_uri.clone());
+				record.source_uri = source_uri;
+			}
+		}
+	}
+
+	fn set_package_source_inner(
+		&mut self,
+		package: PackageId,
+		module: ModulePath,
+		source: String,
+		version: SourceVersion,
+		source_name: impl Into<Arc<str>>,
+		source_uri: Option<Arc<str>>,
+	) {
+		let project = package.project.clone();
+		let key = (package.clone(), module.clone());
 		let source: Arc<str> = source.into();
+		let source_name = source_name.into();
 		let membership_changed;
 		if let Some(record) = self.registry.get_mut(&key) {
 			membership_changed = record.source.is_none();
+			let source_changed = record.source.as_deref() != Some(source.as_ref());
 			if membership_changed {
 				self.tombstones = self.tombstones.saturating_sub(1);
 			}
-			if record.source.as_deref() != Some(source.as_ref()) {
+			if source_changed {
 				record
 					.input
 					.set_source(&mut self.db)
 					.to(Some(source.clone()));
+				record.input.set_version(&mut self.db).to(version);
+			}
+			if record.source_name != source_name {
+				record
+					.input
+					.set_source_name(&mut self.db)
+					.to(source_name.clone());
+			}
+			if record.source_uri != source_uri {
+				record
+					.input
+					.set_source_uri(&mut self.db)
+					.to(source_uri.clone());
 			}
 			record.source = Some(source);
+			record.source_name = source_name;
+			record.source_uri = source_uri;
 			record.version = version;
 		} else {
-			let input = ModuleInput::new(&self.db, project.clone(), module, Some(source.clone()));
+			let input = ModuleInput::new(
+				&self.db,
+				project.clone(),
+				package,
+				module,
+				Some(source.clone()),
+				source_name.clone(),
+				source_uri.clone(),
+				version,
+			);
 			self.registry.insert(
 				key,
 				SourceRecord {
 					input,
 					source: Some(source),
+					source_name,
+					source_uri,
 					version,
 				},
 			);
@@ -1490,39 +1782,213 @@ impl CompilerSession {
 		}
 	}
 
-	pub fn remove_source(&mut self, project: ProjectId, module: ModulePath) {
-		let key = (project.clone(), module);
-		if let Some(record) = self.registry.get_mut(&key)
+	/// Return the stable root package identity for a compiler project.
+	#[must_use]
+	pub fn root_package(&self, project: ProjectId) -> PackageId {
+		PackageId::root(project)
+	}
+
+	#[must_use]
+	pub fn build_profile(&self) -> BuildProfile {
+		self.build_profile
+	}
+
+	pub fn set_build_profile(&mut self, profile: BuildProfile) {
+		if self.build_profile == profile {
+			return;
+		}
+		self.build_profile = profile;
+		let inputs = self
+			.policy_inputs
+			.get_mut()
+			.unwrap_or_else(|error| error.into_inner());
+		for input in inputs.values() {
+			input.set_profile(&mut self.db).to(profile);
+		}
+	}
+
+	pub fn set_project_lints(
+		&mut self,
+		project: ProjectId,
+		lints: impl IntoIterator<Item = (String, LintLevel)>,
+	) {
+		let mut lints = lints
+			.into_iter()
+			.map(|(name, level)| LintSetting {
+				name: name.into(),
+				level,
+			})
+			.collect::<Vec<_>>();
+		lints.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+		let lints: Arc<[LintSetting]> = lints.into();
+		if self.project_lints.get(&project) == Some(&lints) {
+			return;
+		}
+		self.project_lints.insert(project.clone(), lints.clone());
+		if let Some(input) = self
+			.policy_inputs
+			.get_mut()
+			.unwrap_or_else(|error| error.into_inner())
+			.get(&project)
+		{
+			input.set_lints(&mut self.db).to(lints);
+		}
+	}
+
+	#[must_use]
+	pub fn lint_level(
+		&self,
+		project: ProjectId,
+		package: PackageId,
+		lint: &str,
+		default: LintLevel,
+	) -> LintLevel {
+		queries::effective_lint_level(
+			&self.db,
+			self.policy_input(project),
+			package,
+			Arc::from(lint),
+			default,
+		)
+	}
+
+	/// Mint a new exact resolved package node. Names and versions are deliberately
+	/// absent: resolver aliases point to this identity rather than defining it.
+	pub fn mint_package(&mut self, project: ProjectId) -> PackageId {
+		let next = self.next_package_nodes.entry(project.clone()).or_insert(1);
+		let package = PackageId {
+			project,
+			node: *next,
+		};
+		*next += 1;
+		self.packages.insert(package.clone());
+		package
+	}
+
+	pub fn set_package_alias(
+		&mut self,
+		owner: PackageId,
+		alias: impl Into<Arc<str>>,
+		target: PackageId,
+	) -> Result<(), PackageGraphError> {
+		if owner.project != target.project {
+			return Err(PackageGraphError::WrongProject);
+		}
+		if (!owner.is_root() && !self.packages.contains(&owner))
+			|| (!target.is_root() && !self.packages.contains(&target))
+		{
+			return Err(PackageGraphError::UnknownPackage);
+		}
+		let alias = alias.into();
+		if alias.is_empty() || alias.contains(['/', '\\', ':']) {
+			return Err(PackageGraphError::InvalidAlias);
+		}
+		let project = owner.project.clone();
+		let previous = self.package_aliases.insert((owner, alias), target.clone());
+		if previous.as_ref() != Some(&target) {
+			self.refresh_project(project);
+		}
+		Ok(())
+	}
+
+	pub fn set_package_source(
+		&mut self,
+		package: PackageId,
+		module: ModulePath,
+		source: String,
+		version: SourceVersion,
+	) -> Result<(), PackageGraphError> {
+		if !package.is_root() && !self.packages.contains(&package) {
+			return Err(PackageGraphError::UnknownPackage);
+		}
+		let source_name = format!("{module}.nym");
+		self.set_package_source_inner(package, module, source, version, source_name, None);
+		Ok(())
+	}
+
+	pub fn set_package_source_with_location(
+		&mut self,
+		package: PackageId,
+		module: ModulePath,
+		source: String,
+		version: SourceVersion,
+		source_name: impl Into<Arc<str>>,
+		source_uri: Option<impl Into<Arc<str>>>,
+	) -> Result<(), PackageGraphError> {
+		if !package.is_root() && !self.packages.contains(&package) {
+			return Err(PackageGraphError::UnknownPackage);
+		}
+		self.set_package_source_inner(
+			package,
+			module,
+			source,
+			version,
+			source_name,
+			source_uri.map(Into::into),
+		);
+		Ok(())
+	}
+
+	pub fn remove_package_source(
+		&mut self,
+		package: PackageId,
+		module: ModulePath,
+	) -> Result<(), PackageGraphError> {
+		if !package.is_root() && !self.packages.contains(&package) {
+			return Err(PackageGraphError::UnknownPackage);
+		}
+		self.remove_package_source_inner(package, module);
+		Ok(())
+	}
+
+	fn remove_package_source_inner(&mut self, package: PackageId, module: ModulePath) {
+		if let Some(record) = self.registry.get_mut(&(package.clone(), module))
 			&& record.source.take().is_some()
 		{
 			record.input.set_source(&mut self.db).to(None);
 			self.tombstones += 1;
-			self.refresh_project(project);
+			self.refresh_project(package.project.clone());
 			if self.tombstones >= self.tombstone_threshold {
 				self.rebuild_database();
 			}
 		}
 	}
 
+	pub fn remove_source(&mut self, project: ProjectId, module: ModulePath) {
+		self.remove_package_source_inner(PackageId::root(project), module);
+	}
+
 	fn refresh_project(&mut self, project: ProjectId) {
 		let mut active: Vec<ModuleInput> = self
 			.registry
 			.iter()
-			.filter(|((owner, _), record)| owner == &project && record.source.is_some())
+			.filter(|((package, _), record)| package.project == project && record.source.is_some())
 			.map(|(_, record)| record.input)
 			.collect();
-		active.sort_by_key(|module| module.path(&self.db));
+		active.sort_by_key(|module| (module.package(&self.db), module.path(&self.db)));
 		let active: Arc<[ModuleInput]> = active.into();
+		let aliases: Arc<[PackageAlias]> = self
+			.package_aliases
+			.iter()
+			.filter(|((owner, _), _)| owner.project == project)
+			.map(|((owner, name), target)| PackageAlias {
+				owner: owner.clone(),
+				name: name.clone(),
+				target: target.clone(),
+			})
+			.collect::<Vec<_>>()
+			.into();
 		let projects = self
 			.projects
 			.get_mut()
 			.unwrap_or_else(|error| error.into_inner());
 		if let Some(input) = projects.get(&project) {
 			input.set_active_modules(&mut self.db).to(active);
+			input.set_package_aliases(&mut self.db).to(aliases);
 		} else {
 			projects.insert(
 				project.clone(),
-				ProjectInput::new(&self.db, project, active),
+				ProjectInput::new(&self.db, project, active, aliases),
 			);
 		}
 	}
@@ -1536,24 +2002,52 @@ impl CompilerSession {
 			.get_mut()
 			.unwrap_or_else(|error| error.into_inner())
 			.clear();
+		self
+			.policy_inputs
+			.get_mut()
+			.unwrap_or_else(|error| error.into_inner())
+			.clear();
 		self.registry.retain(|_, record| record.source.is_some());
-		for ((project, path), record) in &mut self.registry {
+		for ((package, path), record) in &mut self.registry {
 			record.input = ModuleInput::new(
 				&self.db,
-				project.clone(),
+				package.project.clone(),
+				package.clone(),
 				path.clone(),
 				record.source.clone(),
+				record.source_name.clone(),
+				record.source_uri.clone(),
+				record.version,
 			);
 		}
-		let projects: Vec<_> = self
+		let projects: BTreeSet<_> = self
 			.registry
 			.keys()
-			.map(|(project, _)| project.clone())
+			.map(|(package, _)| package.project.clone())
 			.collect();
 		for project in projects {
 			self.refresh_project(project);
 		}
 		self.tombstones = 0;
+	}
+
+	fn policy_input(&self, project: ProjectId) -> ProjectPolicyInput {
+		let mut inputs = self
+			.policy_inputs
+			.lock()
+			.unwrap_or_else(|error| error.into_inner());
+		*inputs.entry(project.clone()).or_insert_with(|| {
+			ProjectPolicyInput::new(
+				&self.db,
+				PackageId::root(project.clone()),
+				self.build_profile,
+				self
+					.project_lints
+					.get(&project)
+					.cloned()
+					.unwrap_or_default(),
+			)
+		})
 	}
 
 	fn graph(
@@ -1567,7 +2061,7 @@ impl CompilerSession {
 			.lock()
 			.unwrap_or_else(|error| error.into_inner());
 		let input = projects.get(&project).copied().unwrap_or_else(|| {
-			let input = ProjectInput::new(&self.db, project.clone(), Arc::new([]));
+			let input = ProjectInput::new(&self.db, project.clone(), Arc::new([]), Arc::new([]));
 			projects.insert(project.clone(), input);
 			input
 		});
@@ -1576,6 +2070,7 @@ impl CompilerSession {
 			ProjectKey::new(
 				&self.db,
 				input,
+				self.policy_input(project),
 				self.builtin_registry,
 				self.ambient_core_registry,
 				entry,
@@ -1601,13 +2096,14 @@ impl CompilerSession {
 			.lock()
 			.unwrap_or_else(|error| error.into_inner());
 		let input = projects.get(&project).copied().unwrap_or_else(|| {
-			let input = ProjectInput::new(&self.db, project.clone(), Arc::new([]));
-			projects.insert(project, input);
+			let input = ProjectInput::new(&self.db, project.clone(), Arc::new([]), Arc::new([]));
+			projects.insert(project.clone(), input);
 			input
 		});
 		ProjectKey::new(
 			&self.db,
 			input,
+			self.policy_input(project),
 			self.builtin_registry,
 			self.ambient_core_registry,
 			entry,
@@ -1637,6 +2133,7 @@ impl CompilerSession {
 		ProjectKey::new(
 			&self.db,
 			key.project_input(&self.db),
+			key.policy_input(&self.db),
 			self.builtin_registry,
 			self.ambient_core_registry,
 			key.entry(&self.db),
@@ -1750,9 +2247,13 @@ impl CompilerSession {
 		match super::emission::emitted_interface_project(&self.db, key, true) {
 			super::emission::StableEmissionResult::Value(emitted) => {
 				let mut sources = emitted.module_sources.clone();
+				let echo = sources.values().any(|source| source.contains("nymphEcho"));
 				for (module, source) in crate::host_runtime::HostRuntimeGraph::compiler_facts()
-					.module_sources(&emitted.compiler_option_binding)
-				{
+					.module_sources(
+						&emitted.compiler_option_binding,
+						&emitted.compiler_option_module,
+						echo,
+					) {
 					if sources.insert(module.clone(), source).is_some() {
 						return Err(
 							vec![ProjectDiagnostic {
@@ -1785,6 +2286,7 @@ impl CompilerSession {
 			.graph(project, entry, mode)
 			.order
 			.iter()
+			.filter(|module| module.package(&self.db).is_root())
 			.map(|module| module.path(&self.db))
 			.collect()
 	}
@@ -1804,7 +2306,7 @@ impl CompilerSession {
 		let graph = self.graph(project.clone(), entry, mode);
 		let Some(module) = self
 			.registry
-			.get(&(project, module))
+			.get(&(PackageId::root(project), module))
 			.map(|record| record.input)
 		else {
 			return Vec::new();
@@ -1812,6 +2314,7 @@ impl CompilerSession {
 		graph
 			.direct_dependencies(module)
 			.iter()
+			.filter(|dependency| dependency.package(&self.db).is_root())
 			.map(|dependency| dependency.path(&self.db))
 			.collect()
 	}
@@ -1831,7 +2334,7 @@ impl CompilerSession {
 		let graph = self.graph(project.clone(), entry, mode);
 		let Some(module) = self
 			.registry
-			.get(&(project, module))
+			.get(&(PackageId::root(project), module))
 			.map(|record| record.input)
 		else {
 			return Vec::new();
@@ -1839,6 +2342,7 @@ impl CompilerSession {
 		graph
 			.reverse_importers(module)
 			.iter()
+			.filter(|importer| importer.package(&self.db).is_root())
 			.map(|importer| importer.path(&self.db))
 			.collect()
 	}
@@ -1875,7 +2379,7 @@ impl CompilerSession {
 	pub fn source_version(&self, project: ProjectId, module: ModulePath) -> Option<SourceVersion> {
 		self
 			.registry
-			.get(&(project, module))
+			.get(&(PackageId::root(project), module))
 			.map(|record| record.version)
 	}
 	#[doc(hidden)]
@@ -1883,7 +2387,7 @@ impl CompilerSession {
 	pub fn has_source(&self, project: ProjectId, module: ModulePath) -> bool {
 		self
 			.registry
-			.get(&(project, module))
+			.get(&(PackageId::root(project), module))
 			.is_some_and(|record| record.source.is_some())
 	}
 }
@@ -1951,7 +2455,7 @@ mod tests {
 				"project:missing",
 				"std:root",
 				"std:child",
-				"project:project",
+				"std:project",
 			]
 		);
 	}

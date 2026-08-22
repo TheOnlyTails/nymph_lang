@@ -6,10 +6,25 @@ use ecow::EcoString;
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
 pub enum ModuleOrigin {
+	/// The root resolved package for one compiler project.
 	Project(EcoString),
+	/// A non-root package node minted by the compiler's resolution graph.
+	ResolvedPackage { node: u64 },
 	/// An explicitly importable standard-library module.
 	ImportableStd,
 	/// Ambient compiler-core/runtime definitions which are never imported.
+	Compiler,
+}
+
+/// Exact package-instance identity within a compiler-owned resolution graph.
+///
+/// Resolved IDs are opaque graph-node identities, not package names or versions.
+/// Standard-library and compiler-owned modules live in reserved domains which
+/// cannot collide with resolved project packages.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+pub enum PackageIdentity {
+	Resolved { project: EcoString, node: u64 },
+	ImportableStd,
 	Compiler,
 }
 
@@ -18,6 +33,64 @@ pub struct ModuleIdentity {
 	pub origin: ModuleOrigin,
 	pub project: EcoString,
 	pub path: EcoString,
+}
+
+impl ModuleIdentity {
+	pub fn project(project: impl Into<EcoString>, path: impl Into<EcoString>) -> Self {
+		Self::resolved_project(project, 0, path)
+	}
+
+	pub fn resolved_project(
+		project: impl Into<EcoString>,
+		package_node: u64,
+		path: impl Into<EcoString>,
+	) -> Self {
+		let project = project.into();
+		Self {
+			origin: if package_node == 0 {
+				ModuleOrigin::Project(project.clone())
+			} else {
+				ModuleOrigin::ResolvedPackage { node: package_node }
+			},
+			project,
+			path: path.into(),
+		}
+	}
+
+	pub fn importable_std(path: impl Into<EcoString>) -> Self {
+		Self {
+			origin: ModuleOrigin::ImportableStd,
+			project: "compiler".into(),
+			path: path.into(),
+		}
+	}
+
+	pub fn compiler(path: impl Into<EcoString>) -> Self {
+		Self {
+			origin: ModuleOrigin::Compiler,
+			project: "compiler".into(),
+			path: path.into(),
+		}
+	}
+
+	pub fn package_identity(&self) -> PackageIdentity {
+		match &self.origin {
+			ModuleOrigin::Project(project) => PackageIdentity::Resolved {
+				project: project.clone(),
+				node: 0,
+			},
+			ModuleOrigin::ResolvedPackage { node } => PackageIdentity::Resolved {
+				project: self.project.clone(),
+				node: *node,
+			},
+			ModuleOrigin::ImportableStd => PackageIdentity::ImportableStd,
+			ModuleOrigin::Compiler => PackageIdentity::Compiler,
+		}
+	}
+
+	pub fn same_package_as(&self, other: &Self) -> bool {
+		self.package_identity() == other.package_identity()
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
@@ -35,6 +108,7 @@ pub enum DeclarationCategory {
 	Static,
 	Implementation,
 	MethodBody,
+	Effect,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
@@ -63,14 +137,20 @@ pub enum HeaderType {
 	Function {
 		parameters: Vec<Self>,
 		return_type: Box<Self>,
+		effects: crate::EffectRow,
 	},
+	Task {
+		output: Box<Self>,
+		effects: crate::EffectRow,
+	},
+	Handle(Box<Self>),
+	HandleOutcome(Box<Self>),
 	Named {
 		definition: DefinitionId,
 		positional: Vec<Self>,
 		named: Vec<(EcoString, Self)>,
 	},
 	Intersection(Vec<Self>),
-	Mutable(Box<Self>),
 	Generic(HeaderParameterId),
 }
 
@@ -87,7 +167,6 @@ pub struct ImplementationHeader {
 	pub interface: Option<DefinitionId>,
 	pub interface_arguments: Vec<(EcoString, HeaderType)>,
 	pub self_type: HeaderType,
-	pub mutable: bool,
 	pub binders: Vec<HeaderBinder>,
 	pub constraints: Vec<HeaderConstraint>,
 }
@@ -111,14 +190,20 @@ pub enum RecoveredHeaderType {
 	Function {
 		parameters: Vec<Self>,
 		return_type: Box<Self>,
+		effects: crate::RecoveredEffectRow,
 	},
+	Task {
+		output: Box<Self>,
+		effects: crate::RecoveredEffectRow,
+	},
+	Handle(Box<Self>),
+	HandleOutcome(Box<Self>),
 	Reference {
 		name: EcoString,
 		positional: Vec<Self>,
 		named: Vec<(EcoString, Self)>,
 	},
 	Intersection(Vec<Self>),
-	Mutable(Box<Self>),
 	Generic(HeaderParameterId),
 }
 
@@ -127,7 +212,6 @@ pub struct RecoveredImplementationHeader {
 	pub interface: Option<EcoString>,
 	pub interface_arguments: Vec<(EcoString, RecoveredHeaderType)>,
 	pub self_type: RecoveredHeaderType,
-	pub mutable: bool,
 	pub binders: Vec<HeaderBinder>,
 	pub constraints: Vec<RecoveredHeaderConstraint>,
 }
@@ -136,9 +220,9 @@ impl RecoveredImplementationHeader {
 	pub fn canonical(mut self) -> Self {
 		fn canonical_type(ty: &mut RecoveredHeaderType) {
 			match ty {
-				RecoveredHeaderType::List(inner) | RecoveredHeaderType::Mutable(inner) => {
-					canonical_type(inner)
-				}
+				RecoveredHeaderType::List(inner)
+				| RecoveredHeaderType::Handle(inner)
+				| RecoveredHeaderType::HandleOutcome(inner) => canonical_type(inner),
 				RecoveredHeaderType::Tuple(items) => items.iter_mut().for_each(canonical_type),
 				RecoveredHeaderType::Map(key, value) => {
 					canonical_type(key);
@@ -147,10 +231,12 @@ impl RecoveredImplementationHeader {
 				RecoveredHeaderType::Function {
 					parameters,
 					return_type,
+					..
 				} => {
 					parameters.iter_mut().for_each(canonical_type);
 					canonical_type(return_type);
 				}
+				RecoveredHeaderType::Task { output, .. } => canonical_type(output),
 				RecoveredHeaderType::Reference {
 					positional, named, ..
 				} => {
@@ -202,7 +288,7 @@ impl ImplementationHeader {
 		};
 		fn rewrite_type(ty: &mut HeaderType, rewrite_parameter: &impl Fn(&mut HeaderParameterId)) {
 			match ty {
-				HeaderType::List(inner) | HeaderType::Mutable(inner) => {
+				HeaderType::List(inner) | HeaderType::Handle(inner) | HeaderType::HandleOutcome(inner) => {
 					rewrite_type(inner, rewrite_parameter);
 				}
 				HeaderType::Tuple(items) => {
@@ -234,12 +320,14 @@ impl ImplementationHeader {
 				HeaderType::Function {
 					parameters,
 					return_type,
+					..
 				} => {
 					for parameter in parameters {
 						rewrite_type(parameter, rewrite_parameter);
 					}
 					rewrite_type(return_type, rewrite_parameter);
 				}
+				HeaderType::Task { output, .. } => rewrite_type(output, rewrite_parameter),
 				HeaderType::Named {
 					positional, named, ..
 				} => {

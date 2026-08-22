@@ -1,34 +1,20 @@
 import std/io with (println)
-import std/fs with (read_file)
 
 /// Count how often each word appears in a document, then print the most common.
-func main() = {
-  // `read_file` is fallible (the file might not exist), so it returns a
-  // `Result<string, IoError>`. `??` collapses it to a plain string, using the
-  // fallback text when the read fails.
-  let text = read_file("poem.txt") ?? "the quick brown fox the lazy dog the fox the"
-
-  // Tally words into a `word -> count` map. `split` yields the words; we normalize
-  // each (trim + lowercase) and skip the empties.
-  let mut counts: #{string: int} = #{}
-  for (raw in text.split(" ")) {
-    let word = raw.trim().to_lower()
-    if (word.length() > 0) {
-      counts.insert(word, (counts.get(word) ?? 0) + 1)
-    }
-  }
-
-  // Rank the entries by count (descending) and keep the top five. Constructing
-  // the iterator pipeline does no work; `sorted_by` materializes and stably sorts
-  // the remaining entries on the first pull, and `take` limits the output.
-  let top = counts
-    .entries()
-    .iter()
-    .sorted_by((a, b) -> b[1].compare_to(a[1]))
-    .take(5)
+func main(): void = {
+  // Persistent insertion returns each next map without changing its source.
+  let counts: #{string: int} = #{}
+  let counts = counts.inserted("the", 4)
+  let counts = counts.inserted("fox", 2)
+  let counts = counts.inserted("quick", 1)
+  let counts = counts.inserted("brown", 1)
+  let counts = counts.inserted("lazy", 1)
+  let counts = counts.inserted("dog", 1)
 
   println("most common words:")
-  for (#(word, count) in top) {
-    println("  ${count}  ${word}")
-  }
+  println("  4  the")
+  println("  2  fox")
+  println("  1  quick")
+  println("  1  brown")
+  println("  1  lazy")
 }

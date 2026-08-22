@@ -31,29 +31,16 @@ function or closure boundary.
 
 ## Parameters
 
-Each parameter is `name: Type`. Two modifiers can prefix a parameter, and they mean different
-things:
-
-- A `mut` **before the name** (`mut x: int`) makes the parameter binding itself reassignable inside
-  the function body — purely local; the caller's own value is never affected.
-- A `mut` **inside the type** (`x: mut Counter`) is a [mut type](./mutability#mut-types): it grants
-  permission to mutate *through* `x` — reassign one of its fields, or call a `mut func` method on
-  it.
+Each parameter is `name: Type`. Parameter bindings and values are immutable. Functions return a
+replacement value when they need to represent an update.
 
 ```nym
-func inc_twice(mut x: int): int = {
-  x = x + 1
-  x = x + 1
-  x
-}
+func inc_twice(x: int): int = x + 2
 ```
 
 ```nym
 struct Counter(n: int)
-func bump(c: mut Counter): int = {
-  c.n = c.n + 1
-  c.n
-}
+func bump(c: Counter): Counter = Counter(n = c.n + 1)
 ```
 
 ### Spread parameters
@@ -64,11 +51,7 @@ parameter list. Calling it takes a spread list argument:
 
 ```nym
 func sum(...xs: #[int]): int = {
-  let mut total = 0
-  for (x in xs) {
-    total = total + x
-  }
-  total
+  xs.iter().fold(0, (total, x) -> total + x)
 }
 
 func demo(): int = sum(...#[1, 2, 3])
@@ -112,25 +95,23 @@ func demo(): int = apply_twice(double, 3)
 func demo2(): int = apply_twice((x: int) -> x * 2, 5)
 ```
 
-## `mut func` and `namespace func`
+## `namespace func`
 
-Inside a `struct`, `enum`, or `interface` body — never at the top level of a module — two more
-function kinds exist:
+Inside a `struct`, `enum`, or `interface` body — never at the top level of a module — a static
+function can use this declaration form:
 
-- `mut func` — an instance method allowed to mutate its receiver; see
-  [Mut func](./mutability#mut-func).
 - `namespace func` — a static, invoked on the type itself (`Type.name(...)`), not an instance.
 
 ```nym
 struct Counter(n: int) {
-  mut func bump(): void = { this.n = this.n + 1 }
+  func bumped(): Counter = Counter(n = this.n + 1)
   namespace func zero(): Counter = Counter(n = 0)
 }
 
 func demo(): int = {
-  let mut c = Counter.zero()
-  c.bump()
-  c.n
+  let before = Counter.zero()
+  let after = before.bumped()
+  after.n
 }
 ```
 

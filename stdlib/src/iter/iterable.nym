@@ -1,11 +1,10 @@
-import @/iter with (Iterator)
-import @/option with (Option)
+import @/iter with (ExactSizeIterator, Iteration, Iterator)
 import @/collections/list
 
 /// An object which is able to be iterated over, for example by a `for` loop, by turning it into
 /// an iterator.
-public interface Iterable<T> {
-  func iter(): Iterator<T>
+public interface Iterable<Item + !E> {
+  func iter(): Iterator<Item + !E>
 }
 
 /// The iterator over a list `#[T]`: walks indices `0 .. length`, yielding each
@@ -13,21 +12,24 @@ public interface Iterable<T> {
 /// adapter surface (`map`/`filter`/`fold`/…) composes over a plain list.
 struct ListIter<T>(items: #[T], index: uint) {
   impl Iterator<T> {
-    mut func next(): Option<T> = {
-      // `get` is a linked external returning the INTRINSIC `Option` (a plain
-      // tagged object with no methods); re-wrap it into a Nymph `Option` so the
-      // adapters' `Option::map` etc. are available (the tags compare equal, both
-      // being `Symbol.for("Option.…")`). Past the end, `get` yields `None`.
-      let current = this.items.get(this.index)
-      this.index = this.index + 1
-      match (current) {
-        Some(value) -> Option.Some(value = value),
-        None -> Option.None,
-      }
+    func next(): Iteration<T, self> = match (this.items.get(this.index)) {
+      Some(item) -> Iteration.Yield(
+        item = item,
+        next = ListIter(items = this.items, index = this.index + 1u),
+      ),
+      None -> Iteration.Done,
+    }
+  }
+
+  impl ExactSizeIterator<T> {
+    func remaining(): uint = if (this.index < this.items.length()) {
+      this.items.length() - this.index
+    } else {
+      0u
     }
   }
 }
 
 impl<T> Iterable<T> for #[T] {
-  func iter(): ListIter<T> = ListIter(items = this, index = 0)
+  func iter(): ListIter<T> = ListIter(items = this, index = 0u)
 }

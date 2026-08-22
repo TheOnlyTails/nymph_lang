@@ -8,7 +8,8 @@ with no `import`, in every module; this is separate from opt-in `std/...` module
 > [!NOTE] `==` and `!=` are the exception
 > Equality and inequality never dispatch anywhere — they always compare by native identity
 > (structs and enums) or value (primitives), even for a type that implements `Equals`. `Equals` and
-> its blanket impl exist for explicit `.equals()`/`.not_equals()` calls, not for `==`/`!=` syntax.
+> its explicit implementations exist for `.equals()`/`.not_equals()` calls, not for `==`/`!=`
+> syntax.
 
 ## Arithmetic
 
@@ -134,12 +135,13 @@ func outdated(a: Version, b: Version): boolean = a < b
 
 ## `Equals`
 
-`.equals(other)` / `.not_equals(other)` are explicit methods, backed by `Equals<Other>` — every
-type gets them for free through a blanket impl, so they're always callable, on anything:
+`.equals(other)` / `.not_equals(other)` are explicit methods backed by `Equals<Other>`. They are
+available only when the type implements that interface. The standard library provides mixed
+signed/unsigned integer equality:
 
 ```nym
-func same(a: int, b: int): boolean = a.equals(b)
-func different(a: int, b: int): boolean = a.not_equals(b)
+func same(a: int, b: uint): boolean = a.equals(b)
+func different(a: int, b: uint): boolean = a.not_equals(b)
 ```
 
 Remember: this is unrelated to `==`/`!=`, which never dispatch to `Equals` no matter what a type

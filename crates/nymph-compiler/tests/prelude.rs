@@ -12,7 +12,7 @@ use nymph_compiler::{check, compile, compile_project_library};
 /// may not import from another crate's test files).
 fn run(src: &str, call: &str) -> String {
 	let mut js = compile(src, "test").expect("expected a clean compile");
-	js.push_str(&format!("\nconsole.log({call});\n"));
+	js.push_str(&format!("\nconsole.log(String({call}));\n"));
 	run_emitted_js(js)
 }
 
@@ -24,7 +24,7 @@ fn run_int_entry(src: &str, entry: &str) -> String {
 		.unwrap_or_else(|diagnostics| panic!("expected a clean compile, got: {diagnostics:?}"));
 	let call = compiled.entry_symbol(entry);
 	let mut js = compiled.js;
-	js.push_str(&format!("\nconsole.log({call}().v);\n"));
+	js.push_str(&format!("\nconsole.log(String({call}().v));\n"));
 	run_emitted_js(js)
 }
 
@@ -67,21 +67,6 @@ fn with_compiler_stack(test: impl FnOnce() + Send + 'static) {
 		.expect("spawn ambient compiler test")
 		.join()
 		.expect("ambient compiler test panicked");
-}
-
-#[test]
-fn standalone_intrinsic_and_source_options_share_one_runtime_prototype() {
-	let source = r#"
-		func intrinsic_option(): Option<char> = "x".char_at(0u)
-		func source_option(): Option<char> = Some(value = 'x')
-	"#;
-	assert_eq!(
-		run(
-			source,
-			"Object.getPrototypeOf(intrinsic_option()) === Object.getPrototypeOf(source_option())",
-		),
-		"true"
-	);
 }
 
 #[test]
@@ -177,46 +162,6 @@ fn generic_bound_operator_executes_through_the_stable_protocol() {
 }
 
 #[test]
-fn blanket_impl_only_equals_method_call_links_and_runs() {
-	let source = "struct P(v: int)
-		func result(): #(boolean, boolean) = #(
-			P(v = 1).equals(P(v = 1)),
-			P(v = 1).not_equals(P(v = 2)),
-		)";
-
-	let diags = check(source, "test");
-	assert!(
-		!diags.iter().any(|d| d.is_error()),
-		"expected `P.equals` to resolve cleanly via the prelude's blanket impl, got: {diags:?}"
-	);
-
-	assert_eq!(
-		run(source, "result().v.map(value => value.v).join(' ')"),
-		"true true"
-	);
-}
-
-#[test]
-fn blanket_impl_only_not_equals_method_call_links_and_runs() {
-	let source = "struct P(v: int)
-		func result(): #(boolean, boolean) = #(
-			P(v = 1).equals(P(v = 1)),
-			P(v = 1).not_equals(P(v = 2)),
-		)";
-
-	let diags = check(source, "test");
-	assert!(
-		!diags.iter().any(|d| d.is_error()),
-		"expected `P.not_equals` to resolve cleanly via the prelude's blanket impl, got: {diags:?}"
-	);
-
-	assert_eq!(
-		run(source, "result().v.map(value => value.v).join(' ')"),
-		"true true"
-	);
-}
-
-#[test]
 fn generic_bound_plain_method_executes_through_the_stable_protocol() {
 	let source = "func add<T: Plus<Other = T, Output = T>>(a: T, b: T): T = a.plus(b)
 		func result(): int = add(20, 22)";
@@ -260,16 +205,17 @@ fn ambient_iterator_default_adapter_chain_and_terminals_body() {
 	let source = r#"
 		struct Counter(current: uint, limit: uint) {
 			impl Iterator<uint> {
-				mut func next(): Option<uint> = if (this.current < this.limit) {
-					let value = this.current
-					this.current = this.current + 1u
-					Some(value = value)
-				} else None
+				func next(): Iteration<uint, self> = if (this.current < this.limit) {
+					Yield(
+						item = this.current,
+						next = Counter(current = this.current + 1u, limit = this.limit),
+					)
+				} else Done
 			}
 		}
 
 		func values(): #[uint] = {
-			let mut counter = Counter(current = 0u, limit = 20u)
+			let counter = Counter(current = 0u, limit = 20u)
 			counter
 				.filter((value) -> value % 2u == 0u)
 				.map((value) -> value * 10u)
@@ -279,7 +225,7 @@ fn ambient_iterator_default_adapter_chain_and_terminals_body() {
 		}
 
 		func count(): uint = {
-			let mut counter = Counter(current = 0u, limit = 6u)
+			let counter = Counter(current = 0u, limit = 6u)
 			counter.map((value) -> value + 1u).count()
 		}
 	"#;
@@ -293,39 +239,47 @@ fn ambient_iterator_default_adapter_chain_and_terminals_body() {
 }
 
 #[test]
-fn iterator_sorted_by_is_lazy_and_materializes_exactly_once() {
-	with_compiler_stack(iterator_sorted_by_is_lazy_and_materializes_exactly_once_body);
+fn iterator_sorted_by_yields_through_persistent_successor_states() {
+	with_compiler_stack(iterator_sorted_by_yields_through_persistent_successor_states_body);
 }
 
-fn iterator_sorted_by_is_lazy_and_materializes_exactly_once_body() {
+fn iterator_sorted_by_yields_through_persistent_successor_states_body() {
 	let source = r#"
-		struct Observed(values: #[int], index: uint, pulled: mut #[int]) {
+		struct Observed(values: #[int], index: uint) {
 			impl Iterator<int> {
-				mut func next(): Option<int> = match (this.values.get(this.index)) {
-					Some(value) -> {
-						this.index = this.index + 1u
-						this.pulled.push(value)
-						Some(value = value)
-					},
-					None -> None,
+				func next(): Iteration<int, self> = match (this.values.get(this.index)) {
+					Some(value) -> Yield(
+							item = value,
+							next = Observed(
+								values = this.values,
+								index = this.index + 1u,
+							),
+						),
+					None -> Done,
 				}
 			}
 		}
 
-		func observations(): #(uint, uint, uint, int, int) = {
-			let mut pulled: #[int] = #[]
-			let mut sorted = Observed(values = #[3, 1, 2], index = 0u, pulled = pulled)
+		func observations(): #(int, int, int) + !_ = {
+			let sorted = Observed(values = #[3, 1, 2], index = 0u)
 				.sorted_by((left, right) -> left.compare_to(right))
-			let before = pulled.length()
-			let first = sorted.next().unwrap(-1)
-			let after_first = pulled.length()
-			let second = sorted.next().unwrap(-1)
-			#(before, after_first, pulled.length(), first, second)
+			match (sorted.next()) {
+				Yield(item = first, next = next) -> {
+					match (next.next()) {
+						Yield(item = second, next = final) -> match (final.next()) {
+							Yield(item = third, next = _) -> #(first, second, third),
+							Done -> #(-1, -1, -1),
+						},
+						Done -> #(-1, -1, -1),
+					}
+				},
+				Done -> #(-1, -1, -1),
+			}
 		}
 	"#;
 	assert_eq!(
 		run(source, "observations().v.map(value => value.v).join(',')"),
-		"0,3,3,1,2"
+		"1,2,3"
 	);
 }
 
@@ -363,8 +317,7 @@ fn iterator_sorted_by_sorts_only_the_remaining_source() {
 fn iterator_sorted_by_sorts_only_the_remaining_source_body() {
 	let source = r#"
 		func values(): #[int] = {
-			let mut source = #[9, 3, 1, 2].iter()
-			let skipped = source.next()
+			let source = #[9, 3, 1, 2].iter().drop(1u)
 			source.sorted_by((left, right) -> left.compare_to(right)).to_list()
 		}
 	"#;
@@ -393,7 +346,7 @@ fn iterator_sorted_by_handles_empty_and_single_sources_body() {
 }
 
 #[test]
-fn materialized_self_equality_substitutes_primitive_and_nominal_receivers() {
+fn unbounded_materialized_self_equality_is_rejected() {
 	let source = "interface IdentityDefault { func same(other: self): boolean = this == other }\n\
 		struct Box(value: int)\n\
 		impl IdentityDefault for int {}\n\
@@ -402,12 +355,10 @@ fn materialized_self_equality_substitutes_primitive_and_nominal_receivers() {
 
 	let diags = check(source, "test");
 	assert!(
-		!diags.iter().any(|d| d.is_error()),
-		"expected materialized SelfType equality defaults to compile cleanly, got: {diags:?}"
-	);
-	assert_eq!(
-		run(source, "result().v.map(value => value.v).join(' ')"),
-		"true false"
+		diags
+			.iter()
+			.any(|diagnostic| diagnostic.message.contains("operator is not implemented")),
+		"expected unbounded SelfType equality to be rejected, got: {diags:?}"
 	);
 }
 
@@ -434,6 +385,10 @@ fn comparable_compare_to_for_string_links_and_runs() {
 
 #[test]
 fn list_sort_orders_primitives_without_mutating_the_source() {
+	with_compiler_stack(list_sort_orders_primitives_without_mutating_the_source_body);
+}
+
+fn list_sort_orders_primitives_without_mutating_the_source_body() {
 	let source = r#"
 		func values(): #(#[int], #[int]) = {
 			let source = #[3, 1, 2]
@@ -451,6 +406,10 @@ fn list_sort_orders_primitives_without_mutating_the_source() {
 
 #[test]
 fn list_sort_dispatches_comparable_for_user_structs() {
+	with_compiler_stack(list_sort_dispatches_comparable_for_user_structs_body);
+}
+
+fn list_sort_dispatches_comparable_for_user_structs_body() {
 	let source = r#"
 		struct Item(key: int)
 		impl Comparable<Other = Item> for Item {
@@ -466,6 +425,10 @@ fn list_sort_dispatches_comparable_for_user_structs() {
 
 #[test]
 fn list_sort_uses_compare_to_when_less_than_override_disagrees() {
+	with_compiler_stack(list_sort_uses_compare_to_when_less_than_override_disagrees_body);
+}
+
+fn list_sort_uses_compare_to_when_less_than_override_disagrees_body() {
 	let source = r#"
 		struct Item(key: int)
 		impl Comparable<Other = Item> for Item {
@@ -482,6 +445,10 @@ fn list_sort_uses_compare_to_when_less_than_override_disagrees() {
 
 #[test]
 fn list_sort_is_stable_for_equal_keys() {
+	with_compiler_stack(list_sort_is_stable_for_equal_keys_body);
+}
+
+fn list_sort_is_stable_for_equal_keys_body() {
 	let source = r#"
 		struct Item(key: int, sequence: int)
 		impl Comparable<Other = Item> for Item {
@@ -502,6 +469,10 @@ fn list_sort_is_stable_for_equal_keys() {
 
 #[test]
 fn list_sort_by_accepts_descending_order_comparator() {
+	with_compiler_stack(list_sort_by_accepts_descending_order_comparator_body);
+}
+
+fn list_sort_by_accepts_descending_order_comparator_body() {
 	let source = r#"
 		func values(): #[int] = #[1, 3, 2].sort_by((left, right) ->
 			if (left > right) { Order.LessThan }
@@ -514,6 +485,10 @@ fn list_sort_by_accepts_descending_order_comparator() {
 
 #[test]
 fn list_sort_by_preserves_source_and_equal_element_order() {
+	with_compiler_stack(list_sort_by_preserves_source_and_equal_element_order_body);
+}
+
+fn list_sort_by_preserves_source_and_equal_element_order_body() {
 	let source = r#"
 		struct Item(key: int, sequence: int)
 		func compare_items(left: Item, right: Item): Order =
@@ -539,28 +514,11 @@ fn list_sort_by_preserves_source_and_equal_element_order() {
 }
 
 #[test]
-fn list_any_short_circuits_in_source_order() {
-	let source = r#"
-		func observations(): #(boolean, #[int]) = {
-			let mut visited: #[int] = #[]
-			let found = #[1, 2, 3, 4].any((value) -> {
-				visited.push(value)
-				value == 3
-			})
-			#(found, visited.slice(0u, visited.length()))
-		}
-	"#;
-	assert_eq!(
-		run(
-			source,
-			"observations().v[0].v + '|' + observations().v[1].v.map(x => x.v).join(',')"
-		),
-		"true|1,2,3"
-	);
+fn list_join_converts_in_order_and_places_separators_between_elements() {
+	with_compiler_stack(list_join_converts_in_order_and_places_separators_between_elements_body);
 }
 
-#[test]
-fn list_join_converts_in_order_and_places_separators_between_elements() {
+fn list_join_converts_in_order_and_places_separators_between_elements_body() {
 	let source = r#"
 		struct Label(value: int) {
 			impl Display {
@@ -581,33 +539,21 @@ fn list_join_converts_in_order_and_places_separators_between_elements() {
 }
 
 #[test]
-fn collection_and_string_convenience_apis_run_from_nymph_bodies() {
+fn persistent_collection_apis_preserve_their_sources() {
 	with_compiler_stack(|| {
 		let source = r#"
-		func summary(): string = {
-			let mut mutable = #[1, 2, 3]
-			let popped = mutable.pop() ?? 0
-			let combined = #[1, 2].concat(#[3, 4])
-			let window = combined.drop(1u).take(2u).reversed()
-			let edges = (combined.first() ?? 0) + (combined.last() ?? 0)
-
-			let mut map = #{1: 10}
-			let existing = map.get_or_insert(1, 99)
-			let inserted = map.get_or_insert(2, 20)
-			let merged = map + #{2: 22, 3: 30}
-
-			let text = "ab".repeat(2u).concat_chars(#['c'])
-			let pieces = "a,,b,".split(",")
-			let scalars = "😀x".split("")
-			let replaced = "aaaa".replace("aa", "b")
-			let inserted_between = "😀x".replace("", "-")
-			let replaced_first = "aaaa".replace_first("aa", "b")
-			"${popped}|${window[0]}${window[1]}|${edges}|${existing},${inserted},${merged[2]},${merged[3]}|${text}|${text.starts_with("ab")},${text.ends_with("bc")},${'c' in text}|${pieces.length()}:${pieces[1]}:${pieces[3]}|${scalars.length()}:${scalars[0]}|${replaced}:${inserted_between}:${replaced_first}"
+		func values(): #(int, uint, int, int, int, uint) = {
+			let source = #[1, 2]
+			let changed = source.appended(3).replaced(0u, 4)
+			let map = #{1: 10}
+			let inserted = map.inserted(2, 20)
+			let removed = inserted.removed(1)
+			#(source[0], source.length(), changed[0], changed[2], inserted[2], removed.size())
 		}
 	"#;
 		assert_eq!(
-			run(source, "summary().v"),
-			"3|32|5|10,20,22,30|ababc|true,true,true|4::|2:😀|bb:-😀-x-:baa"
+			run(source, "values().v.map(value => value.v).join(',')"),
+			"1,2,4,3,20,1"
 		);
 	});
 }

@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use lsp_server::Connection;
 use lsp_types::{
-	Diagnostic as LspDiagnostic, DiagnosticSeverity, NumberOrString, PublishDiagnosticsParams, Uri,
+	Diagnostic as LspDiagnostic, DiagnosticRelatedInformation, DiagnosticSeverity, Location,
+	NumberOrString, PublishDiagnosticsParams, Uri,
 	notification::{Notification as _, PublishDiagnostics},
 };
 use nymph_diagnostics::{Diagnostic, Severity};
@@ -283,7 +284,10 @@ fn params(
 	version: Option<i32>,
 ) -> PublishDiagnosticsParams {
 	let index = LineIndex::new(text);
-	let lsp_diags: Vec<LspDiagnostic> = diags.iter().map(|d| to_lsp(d, text, &index)).collect();
+	let lsp_diags: Vec<LspDiagnostic> = diags
+		.iter()
+		.map(|diagnostic| to_lsp(diagnostic, &uri, text, &index))
+		.collect();
 	PublishDiagnosticsParams {
 		uri,
 		diagnostics: lsp_diags,
@@ -291,13 +295,37 @@ fn params(
 	}
 }
 
-fn to_lsp(diag: &Diagnostic, text: &str, index: &LineIndex) -> LspDiagnostic {
+fn to_lsp(diag: &Diagnostic, uri: &Uri, text: &str, index: &LineIndex) -> LspDiagnostic {
+	let mut message = diag.message.to_string();
+	for note in &diag.notes {
+		message.push_str("\n\nnote: ");
+		message.push_str(note);
+	}
+	if let Some(help) = &diag.help {
+		message.push_str("\nhelp: ");
+		message.push_str(help);
+	}
+	let related_information = (!diag.labels.is_empty()).then(|| {
+		diag
+			.labels
+			.iter()
+			.map(|label| DiagnosticRelatedInformation {
+				location: Location {
+					uri: uri.clone(),
+					range: index.range(text, label.span),
+				},
+				message: label.message.to_string(),
+			})
+			.collect()
+	});
 	LspDiagnostic {
 		range: index.range(text, diag.span),
 		severity: Some(to_lsp_severity(diag.severity)),
 		code: Some(NumberOrString::String(diag.code.to_string())),
 		source: Some("nymph".to_string()),
-		message: diag.message.to_string(),
+		message,
+		related_information,
+		data: None,
 		..Default::default()
 	}
 }
@@ -899,5 +927,47 @@ mod tests {
 				.all(|params| !params.uri.as_str().contains("std::")),
 			"provider identity was fabricated into a workspace URI: {notifications:?}"
 		);
+	}
+
+	#[test]
+	fn unicode_multiline_related_diagnostics_have_one_canonical_lsp_projection() {
+		use nymph_ast::Span;
+		use nymph_diagnostics::Label;
+
+		let uri: Uri = "file:///workspace/main.nym".parse().unwrap();
+		let source = "let α = 1\nlet café = α\nlet result = café\n";
+		let primary_start = source.find("café").unwrap();
+		let primary_end = source.len() - 1;
+		let related_start = source.find('α').unwrap();
+		let diagnostic = Diagnostic::warning(
+			"example-warning".into(),
+			"this binding is unused",
+			Span::new(primary_start, primary_end),
+		)
+		.with_label(Label::new(
+			Span::new(related_start, related_start + 'α'.len_utf8()),
+			"independent related declaration",
+		))
+		.with_note("the declaration is independent")
+		.with_help("remove the unused binding");
+
+		let projected = to_lsp(&diagnostic, &uri, source, &LineIndex::new(source));
+		assert_eq!(projected.range.start.line, 1);
+		assert_eq!(projected.range.start.character, 4);
+		assert_eq!(projected.range.end.line, 2);
+		assert_eq!(projected.range.end.character, 17);
+		let related = projected.related_information.as_ref().unwrap();
+		assert_eq!(related.len(), 1);
+		assert_eq!(related[0].location.uri, uri);
+		assert_eq!(related[0].location.range.start.character, 4);
+		assert_eq!(
+			projected.message,
+			"this binding is unused\n\nnote: the declaration is independent\nhelp: remove the unused binding"
+		);
+		assert_eq!(projected.data, None);
+
+		let terminal = nymph_diagnostics::render("main.nym", source, &[diagnostic]);
+		assert!(terminal.contains("the declaration is independent"));
+		assert!(terminal.contains("remove the unused binding"));
 	}
 }

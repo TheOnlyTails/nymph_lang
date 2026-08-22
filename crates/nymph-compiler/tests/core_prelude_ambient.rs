@@ -1,8 +1,8 @@
-//! Integration tests for the core/std split: `core` (the
+//! Integration tests for the core/std split, Slice A: `core` (the
 //! compiler-coupled subset of the stdlib — `ops`, `default`, `option`,
-//! `result`, `convert`, `iter`, `iter/iterable`, `range`) is injected as
+//! `result`, `convert`, `iter`, `iter/iterable`, `range`) is now injected as
 //! the AMBIENT prelude for every `check`/`compile` call, not just
-//! only `stdlib/src/ops/mod.nym`.
+//! `stdlib/src/ops/mod.nym` as before this slice.
 //!
 //! See `crates/nymph-compiler/tests/golden_programs.rs` for the two
 //! pre-existing golden tests (`golden_enums_construction_and_qualification`,
@@ -18,7 +18,7 @@ use nymph_compiler::{check, compile};
 fn ambient_step_and_directional_range_capabilities_check() {
 	let accepted = r#"
 func generic_step<T: Step>(value: T): #(Option<T>, Option<T>) =
-  #(value.next(), value.previous())
+  #(value.successor(), value.previous())
 func generic_range<T: Step>(start: T, end: T): Range<T> = start..end
 func ranges(): void = {
   for (_ in 1..3) {}
@@ -46,18 +46,6 @@ func ranges(): void = {
 	}
 }
 
-#[test]
-fn ambient_hash_interface_lowers_to_the_boxed_runtime_intrinsic() {
-	let js = compile("func value(): int = 1.hash()", "hash_ambient")
-		.expect("Hash should be available from the ambient ops prelude");
-	assert!(!js.contains("//#region std/option"), "{js}");
-	assert!(js.contains("return hash(new NInt(1))"), "{js}");
-	assert_eq!(
-		run("func value(): int = 1.hash()", "value()"),
-		"-1852055280"
-	);
-}
-
 /// Emit `src`, append a driver that logs `call`, run under Node, return
 /// trimmed stdout. Local copy of `golden_programs.rs`'s `run` helper (tests
 /// may not import from another crate's test files).
@@ -78,7 +66,7 @@ fn run(src: &str, call: &str) -> String {
 			.insert(src.to_owned(), compiled.clone());
 		compiled
 	});
-	js.push_str(&format!("\nconsole.log(({call}).v);\n"));
+	js.push_str(&format!("\nconsole.log(String(({call}).v));\n"));
 
 	static COUNTER: AtomicU64 = AtomicU64::new(0);
 	let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -106,12 +94,12 @@ fn run(src: &str, call: &str) -> String {
 	String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
-/// A program using `Option` (construction +
+/// The headline Slice A payoff: a program using `Option` (construction +
 /// `match`), `Result`, `convert.nym`'s `Option`/`Result` conversions
 /// (`.ok_or(..)`, `.ok()`), and a `for`-over-list — all with **no `import`
 /// anywhere** — compiles clean and runs under Node with the right values.
 /// `Default`'s `T.default()` is exercised separately below so its unsupported
-/// generic namespaced dispatch has a focused diagnostic check.
+/// generic namespaced dispatch has a focused diagnostic regression.
 #[test]
 fn ambient_core_option_result_convert_and_for_over_list_run_with_no_import() {
 	let src = r#"
@@ -127,14 +115,6 @@ fn ambient_core_option_result_convert_and_for_over_list_run_with_no_import() {
 			Result.Error(error = "div by zero")
 		} else {
 			Result.Ok(value = a / b)
-		}
-
-		func sum_list(): int = {
-			let mut total = 0
-			for (x in #[1, 2, 3, 4]) {
-				total = total + x
-			}
-			total
 		}
 
 		// `convert.nym`'s `Option::ok_or` (builds a `Result` from an `Option`).
@@ -155,7 +135,6 @@ fn ambient_core_option_result_convert_and_for_over_list_run_with_no_import() {
 
 	assert_eq!(run(src, "classify(new NInt(5))"), "pos");
 	assert_eq!(run(src, "classify(new NInt(-5))"), "non-pos");
-	assert_eq!(run(src, "sum_list()"), "10");
 	// `n = 7 > 0` -> `Some(7)` -> `.ok_or(-1)` -> `Result.Ok(7)` -> `.unwrap(-99)` -> `7`.
 	assert_eq!(run(src, "opt_to_result(new NInt(7))"), "7");
 	// `n = -1 <= 0` -> `None` -> `.ok_or(-1)` -> `Result.Error(-1)` -> `.unwrap(-99)` -> the
@@ -171,10 +150,10 @@ fn ambient_core_option_result_convert_and_for_over_list_run_with_no_import() {
 /// `std/math` (added to `CORE_SOURCES` alongside the other core modules) is
 /// ambient too: `int`/`float`'s `abs`/`sqrt` methods and integer-exponent
 /// `Power` implementations all resolve and run with **no `import` anywhere** —
-/// the headline payoff of making `math` a 9th core module. Dropping
-/// `("std/math", ..)` from
+/// the headline payoff of making `math` a 9th core module. Locks in the
+/// runtime behavior so a regression (e.g. dropping `("std/math", ..)` from
 /// `CORE_SOURCES`, or reintroducing the `Power<Other = float, Output =
-/// Complex> for int` ambiguity in `complex.nym`) fails
+/// Complex> for int` ambiguity this slice removed from `complex.nym`) fails
 /// loudly here instead of staying silently green under `stdlib_typechecks_
 /// cleanly`/`docs_samples` (both compile-only, never run under Node).
 #[test]
@@ -198,19 +177,6 @@ fn ambient_math_abs_sqrt_and_power_run_with_no_import() {
 	assert_eq!(run(src, "float_abs()"), "2.5");
 	assert_eq!(run(src, "int_sqrt()"), "4");
 	assert_eq!(run(src, "int_pow()"), "1024");
-}
-
-#[test]
-fn power_compound_assignment_evaluates_an_index_target_once() {
-	let src = r#"
-		func probe(): int = {
-			let mut calls = 0
-			let mut values: mut #[int] = #[2]
-			values[{ calls += 1 0u }] **= 2u
-			calls * 10 + values[0u]
-		}
-	"#;
-	assert_eq!(run(src, "probe()"), "14");
 }
 
 #[test]
@@ -240,19 +206,6 @@ fn ambient_boxed_float_intrinsics_cover_the_complete_runtime_surface() {
 		func nan_value(): float = (0.0 - 1.0).ln()
 		func neg_infinity_value(): float = 0.0.ln()
 		func infinity_value(): float = (1.0 / 0.0).exp()
-		func receiver_once(): int = {
-			let mut calls = 0
-			let value = ({ calls = calls + 1 0.0 }).sin()
-			calls
-		}
-		func atan2_order(): int = {
-			let mut order = 0
-			let value = atan2(
-				{ order = order * 10 + 1 1.0 },
-				{ order = order * 10 + 2 1.0 },
-			)
-			order
-		}
 	"#;
 
 	let expected = [
@@ -275,8 +228,6 @@ fn ambient_boxed_float_intrinsics_cover_the_complete_runtime_surface() {
 		("round_value()", "2"),
 		("int_sin_value()", "0"),
 		("int_cosh_value()", "1"),
-		("receiver_once()", "1"),
-		("atan2_order()", "12"),
 	];
 	for (call, value) in expected {
 		assert_eq!(run(src, call), value, "{call}");
@@ -304,8 +255,8 @@ fn ambient_boxed_float_intrinsics_cover_the_complete_runtime_surface() {
 /// `max_int`, `min_int` — literal-initialized, never `external`) are ambient
 /// too, and must be genuinely usable with no import: a bare reference type-
 /// checks (name resolution sees every core module's names) AND runs correctly
-/// under Node. Ambient runtime lowering's materialization machinery must
-/// demand-materialize prelude
+/// under Node. Before the fix this locks in, ambient runtime lowering's
+/// materialization machinery only ever demand-materialized prelude
 /// FUNCTIONS/METHODS (`try_materialize_prelude_dispatch`,
 /// `materialize_referenced_prelude_enums`) — a bare identifier referencing a
 /// prelude top-level `let` lowered straight through `resolve()`'s fallback
@@ -346,16 +297,8 @@ fn ambient_math_constants_run_with_no_import() {
 	assert_eq!(run(src, "get_tau()"), tau.to_string());
 	assert_eq!(run(src, "get_e()"), e.to_string());
 	assert_eq!(run(src, "get_phi()"), phi.to_string());
-	// `int` lowers to a plain JS `number` (an `f64`) throughout this compiler,
-	// so `2 ** 63 - 1`/`-2 ** 63` — both outside `f64`'s 53-bit exact-integer
-	// range — round to the nearest representable double on both sides; assert
-	// against that same rounding (`f64` arithmetic), not the exact `i64`
-	// bound, so this test isn't asserting a precision guarantee the language
-	// doesn't make.
-	let max_int: f64 = 2f64.powi(63) - 1.0;
-	let min_int: f64 = -(2f64.powi(63));
-	assert_eq!(run(src, "get_max_int()"), max_int.to_string());
-	assert_eq!(run(src, "get_min_int()"), min_int.to_string());
+	assert_eq!(run(src, "get_max_int()"), "9223372036854775807");
+	assert_eq!(run(src, "get_min_int()"), "-9223372036854775808");
 	assert_eq!(
 		run(src, "get_max_float()").parse::<f64>().unwrap(),
 		f64::MAX

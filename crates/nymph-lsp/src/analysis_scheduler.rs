@@ -161,6 +161,9 @@ impl WorkerState {
 		cancellation: &CancellationToken,
 	) -> Result<(), TaskError> {
 		cancellation.checkpoint()?;
+		if self.owner_snapshot.build_profile() != snapshot.build_profile() {
+			self.compiler.set_build_profile(snapshot.build_profile());
+		}
 		if !self.initialized
 			|| self.owner_snapshot.filesystem_revision() != snapshot.filesystem_revision()
 			|| self.owner_snapshot.revision() > snapshot.revision()
@@ -242,6 +245,7 @@ impl WorkerState {
 		cancellation: &CancellationToken,
 	) -> Result<(), TaskError> {
 		self.compiler = self.compiler.isolated_empty();
+		self.compiler.set_build_profile(snapshot.build_profile());
 		self.documents = DocumentStore::default();
 		for (uri, document) in snapshot.documents_in_update_order() {
 			cancellation.checkpoint()?;
@@ -423,6 +427,38 @@ mod tests {
 			TaskResult::Request(Err(TaskError::Cancelled))
 		));
 		pool.finish();
+	}
+
+	#[test]
+	fn worker_applies_profile_revisions_to_both_retained_sessions() {
+		let mut worker = WorkerState::new(&CompilerState::new());
+		let mut development = DocumentStore::default();
+		let uri: lsp_types::Uri = "untitled:profile-revision".parse().unwrap();
+		development.open(uri, "func value(): int = 1".into(), 1);
+		worker
+			.synchronize(&development, &CancellationToken::default())
+			.unwrap();
+		assert_eq!(
+			worker.compiler.retained_build_profiles(),
+			(
+				nymph_compiler::BuildProfile::Development,
+				nymph_compiler::BuildProfile::Development
+			)
+		);
+
+		let mut release = development.clone();
+		release.set_build_profile(nymph_compiler::BuildProfile::Release);
+		worker
+			.synchronize(&release, &CancellationToken::default())
+			.unwrap();
+		assert_eq!(worker.documents.revision(), development.revision());
+		assert_eq!(
+			worker.compiler.retained_build_profiles(),
+			(
+				nymph_compiler::BuildProfile::Release,
+				nymph_compiler::BuildProfile::Release
+			)
+		);
 	}
 
 	#[test]

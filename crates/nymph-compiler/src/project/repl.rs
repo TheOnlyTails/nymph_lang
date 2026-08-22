@@ -298,7 +298,7 @@ impl ReplSession {
 		} else if parsed_expression.diagnostics.is_empty() {
 			let render = format!("__nymph_repl_render_{generation}");
 			PreparedSubmission {
-				body: format!("public func {render}(): string = ({input}).debug()\n"),
+				body: format!("public let {render} = () -> ({input})\n"),
 				declared: BTreeSet::new(),
 				imports: self.imports.clone(),
 				render_function: Some(render),
@@ -375,6 +375,12 @@ impl ReplSession {
 		}
 
 		let mut modules = version_runtime_modules(modules);
+		if prepared.render_function.is_some() {
+			modules
+				.get_mut(&module)
+				.expect("emitted REPL project contains its entry module")
+				.push_str("export { nymphProtocolDebug as $nymph$replDebug } from \"std/box\";\n");
+		}
 		modules.retain(|key, _| !self.loaded_modules.contains_key(key));
 		let mut visible = self.visible.clone();
 		let imported_names: BTreeSet<_> = prepared
@@ -386,9 +392,11 @@ impl ReplSession {
 		for name in prepared.declared {
 			visible.insert(name, module.clone());
 		}
-		let render_symbol = prepared
-			.render_function
-			.map(|render| format!("$m{}${render}", super::queries::repl_module_tag(&module)));
+		let render_symbol = prepared.render_function.map(|render| {
+			let identity =
+				nymph_sema::ModuleIdentity::resolved_project(self.project.as_str(), 0, &module);
+			format!("$m{}${render}", super::queries::repl_module_tag(&identity))
+		});
 		Ok(StagedReplSubmission {
 			generation,
 			committed: CommittedSubmission { module, source },
@@ -702,6 +710,7 @@ fn declaration_visibility(declaration: &Declaration) -> Option<Visibility> {
 		Declaration::Import { .. } => None,
 		Declaration::Let { visibility, .. }
 		| Declaration::Func { visibility, .. }
+		| Declaration::Effect { visibility, .. }
 		| Declaration::TypeAlias { visibility, .. }
 		| Declaration::Struct { visibility, .. }
 		| Declaration::Enum { visibility, .. }
@@ -722,6 +731,9 @@ fn declaration_names(declaration: &Declaration, names: &mut BTreeSet<String>) {
 		}
 		Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => {
 			names.insert(meta.name.0.to_string());
+		}
+		Declaration::Effect { name, .. } => {
+			names.insert(name.0.to_string());
 		}
 		Declaration::TypeAlias { meta, .. } => {
 			names.insert(meta.name.0.to_string());

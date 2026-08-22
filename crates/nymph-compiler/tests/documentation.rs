@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use nymph_compiler::{DocFragment, DocOptions, DocSignature, Severity, document_project_with_std};
+use nymph_compiler::{DocFragment, DocOptions, DocSignature, document_project_with_std};
 
 fn project(
 	files: BTreeMap<&'static str, &'static str>,
@@ -168,51 +168,13 @@ fn doc_html_is_deterministic_escaped_and_diagnostics_block_output() {
 }
 
 #[test]
-fn warnings_do_not_block_documentation() {
+fn exact_integers_do_not_warn_or_block_documentation() {
 	let docs = project(
 		BTreeMap::from([("main", "public func large(): int = 9007199254740992")]),
 		false,
 	);
 	assert_eq!(docs.modules.values().next().unwrap().items[0].name, "large");
-	assert_eq!(docs.diagnostics.len(), 1, "{:#?}", docs.diagnostics);
-	assert_eq!(docs.diagnostics[0].diag.severity, Severity::Warning);
-}
-
-#[test]
-fn declaration_external_and_mutable_implementation_modifiers_are_preserved() {
-	let docs = project(
-		BTreeMap::from([(
-			"main",
-			"public let mut counter: int = 0\npublic external(max_float) let external_count: float\npublic struct Cell(value: int)\npublic impl mut Cell { public external(display) func read(): string }",
-		)]),
-		false,
-	);
-	let module = docs.modules.values().next().unwrap();
-	let counter = module
-		.items
-		.iter()
-		.find(|item| item.name == "counter")
-		.unwrap();
-	assert_eq!(
-		signature_text(&counter.signature),
-		"public let mut counter: int"
-	);
-	let external_count = module
-		.items
-		.iter()
-		.find(|item| item.name == "external_count")
-		.unwrap();
-	assert_eq!(
-		signature_text(&external_count.signature),
-		"public external(max_float) let external_count: float"
-	);
-	let implementation = module.implementations.first().unwrap();
-	let signature = signature_text(&implementation.signature);
-	assert!(signature.starts_with("public impl mut "), "{signature}");
-	assert!(
-		signature.contains("public external(display) func read(): string"),
-		"{signature}"
-	);
+	assert!(docs.diagnostics.is_empty(), "{:#?}", docs.diagnostics);
 }
 
 #[test]

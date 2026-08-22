@@ -7,28 +7,12 @@
 //! for overload resolution (bindings kept iff the trial succeeds).
 
 use crate::errors::TypeError;
-use nymph_ast::{
-	Span,
-	expr::{Expr, ExprKind},
-};
+use nymph_ast::Span;
 
 use crate::check::Checker;
 use crate::ty::{Ty, TyKind};
 
 impl Checker<'_> {
-	fn uint_fits_int(&mut self, expected: Ty, found: Ty) -> bool {
-		let expected = self.shallow_resolve(expected);
-		let found = self.strip_mut(found);
-		matches!(self.interner.kind(expected), TyKind::Int)
-			&& matches!(self.interner.kind(found), TyKind::UInt)
-	}
-
-	pub(crate) fn record_implicit_uint_to_int(&mut self, expr: &Expr, found: Ty, expected: Ty) {
-		if self.uint_fits_int(expected, found) {
-			self.annotations.record_implicit_uint_to_int(expr.id);
-		}
-	}
-
 	/// Whether an `int` literal argument may implicitly widen to the parameter type
 	/// (`float`/`uint`) — the argument-position counterpart of the check-mode literal
 	/// widening, since method/operator arguments are synthesised, not checked.
@@ -40,35 +24,17 @@ impl Checker<'_> {
 	}
 
 	/// Unify a call/operator argument against its parameter, letting an `int` *literal*
-	/// widen to `float`/`uint`, any `uint` value widen to `int`, and a `mut`-typed
-	/// argument satisfy a non-`mut` parameter (the one-way `mut T <: T` rule,
-	/// mirroring [`Checker::subtype`] — see the comment there for why the peel is
-	/// asymmetric). Every method-style call (inherent, interface-impl, interface-default,
-	/// generic-bound) routes arguments through here, so without this, `mut T <: T` held
-	/// only for free-function calls and operators, not method calls.
+	/// widen to `float`/`uint`.
 	pub(crate) fn unify_arg(&mut self, param: Ty, arg: Ty, is_int_literal: bool, span: Span) {
 		if is_int_literal && self.int_literal_fits_param(param, arg) {
 			return;
 		}
-		if self.uint_fits_int(param, arg) {
-			return;
-		}
-		let param_r = self.shallow_resolve(param);
-		let arg_r = self.shallow_resolve(arg);
-		match (self.interner.kind(param_r), self.interner.kind(arg_r)) {
-			// `mut T` param, `mut U` arg: peel both, same as `subtype`'s `(Mut, Mut)` arm.
-			(&TyKind::Mut(p), &TyKind::Mut(a)) => self.unify_arg(p, a, is_int_literal, span),
-			// Non-`mut` param, `mut U` arg: peel just the argument — dropping mutability
-			// is always allowed. Never the reverse (a `mut` param can't be satisfied by a
-			// plain arg): that falls to `unify` below, which mismatches correctly.
-			(_, &TyKind::Mut(a)) => self.unify_arg(param, a, is_int_literal, span),
-			_ => self.unify(param, arg, span),
-		}
+		self.unify(param, arg, span);
 	}
 
 	/// Trial version of [`Checker::unify_arg`] for overload selection (non-emitting).
 	/// On success also reports whether the match required numeric widening (`int`
-	/// literal → `float`/`uint`, or `uint` → `int`) rather than exact-type unification.
+	/// literal → `float`/`uint`) rather than exact-type unification.
 	/// Overload phase 2 uses this to prefer an exact-type
 	/// argument match over a widened one, so a same-type operator impl
 	/// (`Plus<Other = int> for int`) beats a cross-type sibling
@@ -84,16 +50,7 @@ impl Checker<'_> {
 		if is_int_literal && self.int_literal_fits_param(param, arg) {
 			return Some(true);
 		}
-		if self.uint_fits_int(param, arg) {
-			return Some(true);
-		}
-		let param_r = self.shallow_resolve(param);
-		let arg_r = self.shallow_resolve(arg);
-		match (self.interner.kind(param_r), self.interner.kind(arg_r)) {
-			(&TyKind::Mut(p), &TyKind::Mut(a)) => self.try_unify_arg_widened(p, a, is_int_literal),
-			(_, &TyKind::Mut(a)) => self.try_unify_arg_widened(param, a, is_int_literal),
-			_ => self.try_unify(param, arg).then_some(false),
-		}
+		self.try_unify(param, arg).then_some(false)
 	}
 
 	/// Structural unification (Hindley-Milner): make two types equal by walking them
@@ -131,13 +88,31 @@ impl Checker<'_> {
 				}
 			}
 			(
+				TyKind::Task {
+					output: x,
+					effects: effects_x,
+				},
+				TyKind::Task {
+					output: y,
+					effects: effects_y,
+				},
+			) => {
+				if effects_x == effects_y {
+					self.unify(x, y, span);
+				} else {
+					self.mismatch(a, b, span);
+				}
+			}
+			(
 				TyKind::Fn {
 					params: p1,
 					ret: r1,
+					..
 				},
 				TyKind::Fn {
 					params: p2,
 					ret: r2,
+					..
 				},
 			) => {
 				if p1.len() != p2.len() {
@@ -161,7 +136,8 @@ impl Checker<'_> {
 					}
 				}
 			}
-			(TyKind::Mut(x), TyKind::Mut(y)) => self.unify(x, y, span),
+			(TyKind::Handle(x), TyKind::Handle(y))
+			| (TyKind::HandleOutcome(x), TyKind::HandleOutcome(y)) => self.unify(x, y, span),
 
 			_ => self.mismatch(a, b, span),
 		}
@@ -194,13 +170,25 @@ impl Checker<'_> {
 				xs.len() == ys.len() && xs.iter().zip(&ys).all(|(&x, &y)| self.try_unify(x, y))
 			}
 			(
+				TyKind::Task {
+					output: x,
+					effects: effects_x,
+				},
+				TyKind::Task {
+					output: y,
+					effects: effects_y,
+				},
+			) => effects_x == effects_y && self.try_unify(x, y),
+			(
 				TyKind::Fn {
 					params: p1,
 					ret: r1,
+					..
 				},
 				TyKind::Fn {
 					params: p2,
 					ret: r2,
+					..
 				},
 			) => {
 				p1.len() == p2.len()
@@ -231,7 +219,8 @@ impl Checker<'_> {
 				}
 				true
 			}
-			(TyKind::Mut(x), TyKind::Mut(y)) => self.try_unify(x, y),
+			(TyKind::Handle(x), TyKind::Handle(y))
+			| (TyKind::HandleOutcome(x), TyKind::HandleOutcome(y)) => self.try_unify(x, y),
 			_ => false,
 		}
 	}
@@ -244,10 +233,8 @@ impl Checker<'_> {
 		true
 	}
 
-	/// Subtyping treats `never` as a subtype of everything, lets `error` absorb,
-	/// `mut T` is (one-way) assignable to `T`, `uint` is safely assignable to `int`,
-	/// and everything else is invariant unification. (Covariance for containers and
-	/// functions is a later refinement.)
+	/// `never` is a subtype of everything, `error` absorbs, and everything else is
+	/// invariant unification except for the explicit semantic cases below.
 	pub(crate) fn subtype(&mut self, sub: Ty, sup: Ty, span: Span) {
 		let sub = self.shallow_resolve(sub);
 		let sup = self.shallow_resolve(sup);
@@ -263,43 +250,31 @@ impl Checker<'_> {
 			}
 			return;
 		}
+		if self.enum_view_includes(sub, sup) {
+			return;
+		}
 		match (self.interner.kind(sub), self.interner.kind(sup)) {
 			(TyKind::Never, _) | (TyKind::Error, _) | (_, TyKind::Error) => {}
-			(TyKind::UInt, TyKind::Int) => {}
-			// `mut T <: mut U` iff `T <: U` (inner variance carries through).
-			(&TyKind::Mut(a), &TyKind::Mut(b)) => self.subtype(a, b, span),
-			// `mut T <: T`, one-way: dropping mutability is always allowed. Never
-			// the reverse — that falls through to `unify`, which mismatches since
-			// only `unify`'s `(Mut, Mut)` arm matches on `Mut`.
-			(&TyKind::Mut(a), _) => self.subtype(a, sup, span),
+			(
+				TyKind::Fn {
+					effects: actual, ..
+				},
+				TyKind::Fn {
+					effects: expected, ..
+				},
+			) if !expected
+				.atoms()
+				.iter()
+				.any(|effect| matches!(effect, nymph_hir::ty::EffectAtom::Parameter(_)))
+				&& !actual
+					.atoms()
+					.iter()
+					.all(|effect| expected.atoms().contains(effect)) =>
+			{
+				self.mismatch(sub, sup, span);
+			}
 			_ => self.unify(sub, sup, span),
 		}
-	}
-
-	/// If `expected` is (shallow-resolved to) `mut T` and `expr` is a freshly-
-	/// constructed `#{…}`/`#[…]` collection literal, check `expr` directly against
-	/// the peeled `T` and report success — a collection literal is a uniquely-owned
-	/// temporary with no other aliases, so it may stand in for `mut T` the same way
-	/// an explicit `mut`-annotated `let`'s initializer already can
-	/// (`check_let_statement`'s own `strip_mut(declared)` peel). This is narrower
-	/// than that: it keys off the EXPRESSION being a literal, not off `expected`
-	/// alone, so a NAMED binding (whose expression is `ExprKind::Identifier`, never
-	/// matched here) still falls through to the ordinary `infer` + `subtype` path
-	/// and correctly rejects a plain-typed named binding against a `mut` target —
-	/// `mut T <: T` stays one-way; this only ever widens on the LITERAL side, never
-	/// the named-binding side. Returns `false` (leaving the caller's ordinary path
-	/// untouched) whenever `expected` isn't `mut` or `expr` isn't a literal.
-	pub(crate) fn try_coerce_owned_literal_to_mut(&mut self, expr: &Expr, expected: Ty) -> bool {
-		if !matches!(expr.kind, ExprKind::Map(_) | ExprKind::List(_)) {
-			return false;
-		}
-		let expected_r = self.shallow_resolve(expected);
-		let TyKind::Mut(inner) = self.interner.kind(expected_r) else {
-			return false;
-		};
-		let inner = *inner;
-		self.check(expr, inner);
-		true
 	}
 
 	/// Report a type mismatch. The dominant caller is `subtype(got, expected)` →

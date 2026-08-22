@@ -5,9 +5,8 @@
 //! snapshot, so dependency overlays, import visibility, and aliases stay under
 //! compiler/sema ownership. Loose files retain lexical/same-file completion.
 //!
-//! Member applicability is computed by sema while its solver, generic bounds,
-//! and place-mutability facts are live. This module only converts that immutable
-//! snapshot to LSP items.
+//! Member applicability is computed by sema while its solver and generic bounds
+//! are live. This module only converts that immutable snapshot to LSP items.
 
 use std::collections::HashSet;
 
@@ -47,6 +46,7 @@ const KEYWORDS: &[&str] = &[
 	"namespace",
 	"for",
 	"while",
+	"loop",
 	"if",
 	"else",
 	"match",
@@ -65,6 +65,7 @@ const KEYWORDS: &[&str] = &[
 	"return",
 	"break",
 	"continue",
+	"echo",
 	"this",
 ];
 
@@ -210,8 +211,24 @@ fn complete(
 		&prefix,
 		4,
 	);
+	if completes_let_kind(text, prefix_start) {
+		push_tier(
+			&mut items,
+			&mut seen,
+			[("use".to_string(), CompletionItemKind::KEYWORD)],
+			&prefix,
+			4,
+		);
+	}
 
 	CompletionResponse::Array(items)
+}
+
+fn completes_let_kind(text: &str, prefix_start: usize) -> bool {
+	text[..prefix_start]
+		.trim_end()
+		.strip_suffix("let")
+		.is_some_and(|before| before.chars().next_back().is_none_or(char::is_whitespace))
 }
 
 fn member_kind(kind: nymph_sema::MemberCompletionKind) -> CompletionItemKind {
@@ -259,6 +276,7 @@ fn imported_kind(kind: nymph_sema::query::ImportedNameKind) -> CompletionItemKin
 		ImportedNameKind::Interface => CompletionItemKind::INTERFACE,
 		ImportedNameKind::ModuleNamespace | ImportedNameKind::Namespace => CompletionItemKind::MODULE,
 		ImportedNameKind::Variant => CompletionItemKind::ENUM_MEMBER,
+		ImportedNameKind::Effect => CompletionItemKind::CLASS,
 	}
 }
 
@@ -299,17 +317,13 @@ fn top_level_items(module: &nymph_ast::decl::Module) -> Vec<(String, CompletionI
 		.members
 		.iter()
 		.filter_map(|decl| match decl {
+			Declaration::Effect { name, .. } => Some((name.0.to_string(), CompletionItemKind::CLASS)),
 			Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => {
 				Some((meta.name.0.to_string(), CompletionItemKind::FUNCTION))
 			}
 			Declaration::Let { meta, .. } | Declaration::ExternalLet(_, _, meta) => {
 				let name = meta.name.0.as_binding()?;
-				let kind = if meta.is_mutable() {
-					CompletionItemKind::VARIABLE
-				} else {
-					CompletionItemKind::CONSTANT
-				};
-				Some((name.0.to_string(), kind))
+				Some((name.0.to_string(), CompletionItemKind::CONSTANT))
 			}
 			Declaration::Struct { name, .. } => Some((name.0.to_string(), CompletionItemKind::STRUCT)),
 			Declaration::Enum { name, .. } => Some((name.0.to_string(), CompletionItemKind::ENUM)),
@@ -406,6 +420,20 @@ mod tests {
 			!labels.contains(&"func".to_string()),
 			"keyword `func` doesn't start with `fi`"
 		);
+	}
+
+	#[test]
+	fn offers_use_only_as_a_let_kind() {
+		let uri: Uri = "file:///complete_use.nym".parse().unwrap();
+		let text = "func main(): void = {\n  let us\n}";
+		let docs = docs_with(&uri, text);
+		let result = completion(&docs, &params(&uri, 1, 8, None));
+		assert!(labels(result.unwrap()).contains(&"use".to_string()));
+
+		let text = "func main(): void = {\n  us\n}";
+		let docs = docs_with(&uri, text);
+		let result = completion(&docs, &params(&uri, 1, 4, None));
+		assert!(!labels(result.unwrap()).contains(&"use".to_string()));
 	}
 
 	#[test]

@@ -14,7 +14,7 @@ use nymph_hir::{
 	ty::{GenericArgs, Interner, Ty, TyKind},
 };
 
-use crate::{DefinitionId, GenericParameterId, ModuleIdentity};
+use crate::{DefinitionId, EffectRow, GenericParameterId, ModuleIdentity, RecoveredEffectRow};
 
 /// Body-independent lexical declarations owned by one semantic module.
 ///
@@ -36,7 +36,18 @@ pub struct NamespaceDeclaration {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum NamespaceVisibility {
 	Importable,
+	Internal,
 	Private,
+}
+
+impl NamespaceVisibility {
+	pub fn allows(self, owner: &ModuleIdentity, current: &ModuleIdentity) -> bool {
+		match self {
+			Self::Importable => true,
+			Self::Internal => owner.same_package_as(current),
+			Self::Private => owner == current,
+		}
+	}
 }
 
 /// Body-independent source facts for one user-visible top-level declaration.
@@ -49,7 +60,6 @@ pub struct TopLevelDeclaration {
 	pub definition: DefinitionId,
 	pub visibility: NamespaceVisibility,
 	pub category: crate::DeclarationCategory,
-	pub mutable: bool,
 	pub name_span: Span,
 }
 
@@ -81,14 +91,20 @@ pub enum InterfaceType {
 	Function {
 		parameters: Vec<Self>,
 		return_type: Box<Self>,
+		effects: EffectRow,
 	},
+	Task {
+		output: Box<Self>,
+		effects: EffectRow,
+	},
+	Handle(Box<Self>),
+	HandleOutcome(Box<Self>),
 	Named {
 		definition: DefinitionId,
 		positional: Vec<Self>,
 		named: Vec<(EcoString, Self)>,
 	},
 	Intersection(Vec<Self>),
-	Mutable(Box<Self>),
 	Generic(GenericParameterId),
 }
 
@@ -172,6 +188,16 @@ pub fn canonicalize_type(
 		ty: Ty,
 		context: &CanonicalizationContext,
 	) -> Result<InterfaceType, InterfaceConversionError> {
+		match interner.kind(ty) {
+			TyKind::Task { output, effects } => {
+				return canonicalize_task(interner, *output, effects, context);
+			}
+			TyKind::Handle(output) => return canonicalize_handle(interner, *output, false, context),
+			TyKind::HandleOutcome(output) => {
+				return canonicalize_handle(interner, *output, true, context);
+			}
+			_ => {}
+		}
 		Ok(match interner.kind(ty) {
 			TyKind::Int => InterfaceType::Int,
 			TyKind::UInt => InterfaceType::UInt,
@@ -193,13 +219,38 @@ pub fn canonicalize_type(
 				Box::new(go(interner, *k, context)?),
 				Box::new(go(interner, *v, context)?),
 			),
-			TyKind::Fn { params, ret } => InterfaceType::Function {
+			TyKind::Fn {
+				params,
+				ret,
+				effects,
+			} => InterfaceType::Function {
 				parameters: params
 					.iter()
 					.map(|t| go(interner, *t, context))
 					.collect::<Result<_, _>>()?,
 				return_type: Box::new(go(interner, *ret, context)?),
+				effects: EffectRow::new(
+					effects
+						.atoms()
+						.iter()
+						.map(|atom| match atom {
+							nymph_hir::ty::EffectAtom::Nominal(definition) => context
+								.definitions
+								.get(definition)
+								.cloned()
+								.map(crate::EffectAtom::Nominal)
+								.ok_or(InterfaceConversionError::UnknownDefinition(*definition)),
+							nymph_hir::ty::EffectAtom::Parameter(parameter) => context
+								.parameters
+								.get(parameter)
+								.cloned()
+								.map(crate::EffectAtom::Parameter)
+								.ok_or(InterfaceConversionError::UnknownBinder(*parameter)),
+						})
+						.collect::<Result<_, _>>()?,
+				),
 			},
+			TyKind::Task { .. } | TyKind::Handle(_) | TyKind::HandleOutcome(_) => unreachable!(),
 			TyKind::Adt(def, args) => InterfaceType::Named {
 				definition: context
 					.definitions
@@ -226,7 +277,6 @@ pub fn canonicalize_type(
 				items.dedup();
 				InterfaceType::Intersection(items)
 			}
-			TyKind::Mut(inner) => InterfaceType::Mutable(Box::new(go(interner, *inner, context)?)),
 			TyKind::Param(idx) if context.self_parameter == Some(*idx) => InterfaceType::SelfType,
 			TyKind::Param(idx) => InterfaceType::Generic(
 				context
@@ -242,11 +292,73 @@ pub fn canonicalize_type(
 	go(interner, ty, context)
 }
 
+fn canonicalize_task(
+	interner: &Interner,
+	output: Ty,
+	effects: &nymph_hir::ty::EffectRow,
+	context: &CanonicalizationContext,
+) -> Result<InterfaceType, InterfaceConversionError> {
+	Ok(InterfaceType::Task {
+		output: Box::new(canonicalize_type(interner, output, context)?),
+		effects: canonicalize_effect_row(effects, context)?,
+	})
+}
+
+fn canonicalize_handle(
+	interner: &Interner,
+	output: Ty,
+	outcome: bool,
+	context: &CanonicalizationContext,
+) -> Result<InterfaceType, InterfaceConversionError> {
+	let output = Box::new(canonicalize_type(interner, output, context)?);
+	Ok(if outcome {
+		InterfaceType::HandleOutcome(output)
+	} else {
+		InterfaceType::Handle(output)
+	})
+}
+
+pub fn canonicalize_effect_row(
+	effects: &nymph_hir::ty::EffectRow,
+	context: &CanonicalizationContext,
+) -> Result<EffectRow, InterfaceConversionError> {
+	Ok(EffectRow::new(
+		effects
+			.atoms()
+			.iter()
+			.map(|atom| match atom {
+				nymph_hir::ty::EffectAtom::Nominal(definition) => context
+					.definitions
+					.get(definition)
+					.cloned()
+					.map(crate::EffectAtom::Nominal)
+					.ok_or(InterfaceConversionError::UnknownDefinition(*definition)),
+				nymph_hir::ty::EffectAtom::Parameter(parameter) => context
+					.parameters
+					.get(parameter)
+					.cloned()
+					.map(crate::EffectAtom::Parameter)
+					.ok_or(InterfaceConversionError::UnknownBinder(*parameter)),
+			})
+			.collect::<Result<_, _>>()?,
+	))
+}
+
 pub fn try_instantiate_interface_type(
 	interner: &mut Interner,
 	ty: &InterfaceType,
 	context: &InstantiationContext,
 ) -> Result<Ty, InterfaceConversionError> {
+	match ty {
+		InterfaceType::Task { output, effects } => {
+			return instantiate_task(interner, output, effects, context);
+		}
+		InterfaceType::Handle(output) => return instantiate_handle(interner, output, false, context),
+		InterfaceType::HandleOutcome(output) => {
+			return instantiate_handle(interner, output, true, context);
+		}
+		_ => {}
+	}
 	Ok(match ty {
 		InterfaceType::Int => interner.int(),
 		InterfaceType::UInt => interner.uint(),
@@ -276,13 +388,18 @@ pub fn try_instantiate_interface_type(
 		InterfaceType::Function {
 			parameters,
 			return_type,
+			effects,
 		} => {
 			let ps = parameters
 				.iter()
 				.map(|t| try_instantiate_interface_type(interner, t, context))
 				.collect::<Result<_, _>>()?;
 			let ret = try_instantiate_interface_type(interner, return_type, context)?;
-			interner.mk_fn(ps, ret)
+			let effects = try_instantiate_effect_row(effects, context)?;
+			interner.mk_effectful_fn(ps, ret, effects)
+		}
+		InterfaceType::Task { .. } | InterfaceType::Handle(_) | InterfaceType::HandleOutcome(_) => {
+			unreachable!()
 		}
 		InterfaceType::Named {
 			definition,
@@ -315,10 +432,6 @@ pub fn try_instantiate_interface_type(
 				.collect::<Result<_, _>>()?;
 			interner.mk_intersection(ts)
 		}
-		InterfaceType::Mutable(t) => {
-			let t = try_instantiate_interface_type(interner, t, context)?;
-			interner.mk_mut(t)
-		}
 		InterfaceType::Generic(parameter) => {
 			let idx = *context
 				.parameters
@@ -327,6 +440,66 @@ pub fn try_instantiate_interface_type(
 			interner.mk_param(idx)
 		}
 	})
+}
+
+fn instantiate_task(
+	interner: &mut Interner,
+	output: &InterfaceType,
+	effects: &EffectRow,
+	context: &InstantiationContext,
+) -> Result<Ty, InterfaceConversionError> {
+	let output = try_instantiate_interface_type(interner, output, context)?;
+	let effects = try_instantiate_effect_row(effects, context)?;
+	Ok(interner.mk_task(output, effects))
+}
+
+fn instantiate_handle(
+	interner: &mut Interner,
+	output: &InterfaceType,
+	outcome: bool,
+	context: &InstantiationContext,
+) -> Result<Ty, InterfaceConversionError> {
+	let output = try_instantiate_interface_type(interner, output, context)?;
+	Ok(if outcome {
+		interner.mk_handle_outcome(output)
+	} else {
+		interner.mk_handle(output)
+	})
+}
+
+pub fn try_instantiate_effect_row(
+	effects: &EffectRow,
+	context: &InstantiationContext,
+) -> Result<nymph_hir::ty::EffectRow, InterfaceConversionError> {
+	Ok(nymph_hir::ty::EffectRow::new(
+		effects
+			.atoms()
+			.iter()
+			.map(|atom| match atom {
+				crate::EffectAtom::Nominal(definition) => context
+					.definitions
+					.get(definition)
+					.copied()
+					.map(nymph_hir::ty::EffectAtom::Nominal)
+					.ok_or_else(|| InterfaceConversionError::UnknownStableDefinition(definition.clone())),
+				crate::EffectAtom::Parameter(parameter) => context
+					.parameters
+					.get(parameter)
+					.copied()
+					.map(nymph_hir::ty::EffectAtom::Parameter)
+					.ok_or_else(|| InterfaceConversionError::UnknownGenericParameter(parameter.clone())),
+			})
+			.collect::<Result<_, _>>()?,
+	))
+}
+
+#[must_use]
+pub fn instantiate_effect_row(
+	effects: &EffectRow,
+	context: &InstantiationContext,
+) -> nymph_hir::ty::EffectRow {
+	try_instantiate_effect_row(effects, context)
+		.expect("complete effect rows require complete definition and binder mappings")
 }
 
 /// Instantiates a complete canonical interface type.
@@ -346,6 +519,13 @@ pub fn instantiate_interface_type(
 pub struct GenericParameter {
 	pub id: GenericParameterId,
 	pub name: EcoString,
+	pub kind: GenericParameterKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+pub enum GenericParameterKind {
+	Type,
+	Effect,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
@@ -354,6 +534,7 @@ pub struct ConstraintShape<T, R = DefinitionId> {
 	pub interface: R,
 	pub positional: Vec<T>,
 	pub named: Vec<(EcoString, T)>,
+	pub effect_args: Vec<(EcoString, EffectRow)>,
 }
 pub type GenericConstraint = ConstraintShape<InterfaceType>;
 pub type RecoveredGenericConstraint =
@@ -375,7 +556,6 @@ pub type RecoveredSuperInterface =
 pub struct ParameterShape<T> {
 	pub name: Option<EcoString>,
 	pub ty: T,
-	pub mutable: bool,
 	pub spread: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
@@ -384,8 +564,10 @@ pub struct FieldShape<T> {
 	pub name: EcoString,
 	pub visibility: Option<Visibility>,
 	pub ty: T,
-	pub mutable: bool,
 	pub has_default: bool,
+	/// Checked owner-default effects. `None` means no default or a recovered
+	/// default whose effect row was unavailable.
+	pub default_effects: Option<EffectRow>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct VariantShape<T> {
@@ -394,7 +576,7 @@ pub struct VariantShape<T> {
 	pub fields: Vec<FieldShape<T>>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
-pub struct MemberShape<T, R = DefinitionId> {
+pub struct MemberShape<T, R = DefinitionId, E = EffectRow> {
 	pub id: DefinitionId,
 	pub name: EcoString,
 	pub visibility: Option<Visibility>,
@@ -403,44 +585,135 @@ pub struct MemberShape<T, R = DefinitionId> {
 	pub constraints: Vec<ConstraintShape<T, R>>,
 	pub parameters: Vec<ParameterShape<T>>,
 	pub return_type: T,
-	pub external: Option<ExternalAbi>,
+	pub effects: E,
+	pub external: Option<ExternalAbi<E>>,
 	pub runtime_owner: Option<DefinitionId>,
 	pub has_default: bool,
 }
-pub type RecoveredMemberShape = MemberShape<RecoveredInterfaceType, RecoveredDefinitionReference>;
+pub type RecoveredMemberShape =
+	MemberShape<RecoveredInterfaceType, RecoveredDefinitionReference, RecoveredEffectRow>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum MemberKind {
 	Value,
-	MutableValue,
 	Function,
-	MutatingFunction,
 	StaticValue,
 	StaticFunction,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum ExternalCallable {
-	Linked {
-		module: EcoString,
-		symbol: EcoString,
-	},
+	Linked { adapter: ExternalAdapterId },
 	Native(nymph_hir::linkage::NativeExternal),
 	Deferred,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
-pub struct ExternalAbi {
+pub struct ExternalAdapterId {
+	/// Compiler-owned logical module identity. Backends resolve this identity to
+	/// their own delivery mechanism; it is not a host import path.
+	pub module: EcoString,
+	pub symbol: EcoString,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub enum ExternalState {
+	#[default]
+	None,
+	Read,
+	Write,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub enum ExternalTransaction {
+	#[default]
+	Pure,
+	Aware,
+	Irreversible,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub struct ExternalAudit {
+	pub state: ExternalState,
+	pub transaction: ExternalTransaction,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub enum ExternalCallMode {
+	#[default]
+	Ordinary,
+	Cancellable,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub struct ExternalMarshalPlan {
+	pub parameters: Vec<Option<MarshalKind>>,
+	pub result: Option<MarshalKind>,
+}
+
+/// Mint the stable nominal payload carried by an opaque external marshal step.
+/// The source definition, not a backend class or import path, owns this ID.
+#[must_use]
+pub fn opaque_external_identity(definition: &DefinitionId) -> u64 {
+	let mut hash = Fnv(0xcbf29ce484222325);
+	"nymph.opaque.external.v1".hash(&mut hash);
+	definition.hash(&mut hash);
+	hash.finish()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub struct ExternalAbi<E = EffectRow> {
 	pub marker: EcoString,
 	pub callable: ExternalCallable,
-	pub marshal: Option<MarshalKind>,
+	pub effects: E,
+	pub audit: ExternalAudit,
+	pub call_mode: ExternalCallMode,
+	pub marshal: ExternalMarshalPlan,
+}
+
+impl<E> ExternalAbi<E> {
+	#[must_use]
+	pub fn adapter(&self) -> Option<&ExternalAdapterId> {
+		match &self.callable {
+			ExternalCallable::Linked { adapter } => Some(adapter),
+			ExternalCallable::Native(_) | ExternalCallable::Deferred => None,
+		}
+	}
+
+	#[must_use]
+	pub fn linked(&self) -> Option<(&EcoString, &EcoString)> {
+		self
+			.adapter()
+			.map(|adapter| (&adapter.module, &adapter.symbol))
+	}
 }
 
 impl ExternalAbi {
 	#[must_use]
-	pub fn linked(&self) -> Option<(&EcoString, &EcoString)> {
-		match &self.callable {
-			ExternalCallable::Linked { module, symbol } => Some((module, symbol)),
-			ExternalCallable::Native(_) | ExternalCallable::Deferred => None,
+	pub fn recovered(self) -> ExternalAbi<RecoveredEffectRow> {
+		ExternalAbi {
+			marker: self.marker,
+			callable: self.callable,
+			effects: RecoveredEffectRow::Known(self.effects),
+			audit: self.audit,
+			call_mode: self.call_mode,
+			marshal: self.marshal,
 		}
+	}
+}
+
+impl ExternalAbi<RecoveredEffectRow> {
+	#[must_use]
+	pub fn complete(&self) -> Option<ExternalAbi> {
+		let RecoveredEffectRow::Known(effects) = &self.effects else {
+			return None;
+		};
+		Some(ExternalAbi {
+			marker: self.marker.clone(),
+			callable: self.callable.clone(),
+			effects: effects.clone(),
+			audit: self.audit,
+			call_mode: self.call_mode,
+			marshal: self.marshal.clone(),
+		})
 	}
 }
 
@@ -453,6 +726,7 @@ pub enum DefinitionShapeKind {
 	Enum,
 	Interface,
 	Namespace,
+	Effect,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct ExportedDefinition {
@@ -466,9 +740,12 @@ pub struct ExportedDefinition {
 	pub constraints: Vec<GenericConstraint>,
 	pub parameters: Vec<ParameterShape<InterfaceType>>,
 	pub return_type: Option<InterfaceType>,
+	pub effects: EffectRow,
 	pub ty: Option<InterfaceType>,
 	pub fields: Vec<FieldShape<InterfaceType>>,
 	pub variants: Vec<VariantShape<InterfaceType>>,
+	/// Source-owned variants accepted by this enum's fixed-point static view.
+	pub enum_view_variants: Vec<DefinitionId>,
 	pub members: Vec<MemberShape<InterfaceType>>,
 	pub super_interfaces: Vec<SuperInterface>,
 	pub external: Option<ExternalAbi>,
@@ -484,9 +761,9 @@ pub struct ExportedImpl {
 	pub visibility: Option<Visibility>,
 	pub interface: Option<DefinitionId>,
 	pub interface_arguments: Vec<(EcoString, InterfaceType)>,
+	pub interface_effect_arguments: Vec<(EcoString, EffectRow)>,
 	pub interface_argument_bindings: Vec<(GenericParameterId, InterfaceType)>,
 	pub self_type: InterfaceType,
-	pub mutable: bool,
 	pub binders: Vec<GenericParameter>,
 	pub constraints: Vec<GenericConstraint>,
 	pub members: Vec<MemberShape<InterfaceType>>,
@@ -647,6 +924,68 @@ impl ModuleInterface {
 		self.hash(&mut h);
 		h.finish()
 	}
+
+	fn available_to(&self, current: &ModuleIdentity) -> Self {
+		let mut interface = self.clone();
+		let owner = interface.module.clone();
+		let mut hidden = Vec::new();
+		interface.exports.retain_mut(|definition| {
+			project_definition(definition, &owner, current);
+			if visibility_allows(definition.visibility, &owner, current) {
+				true
+			} else {
+				hidden.push(SupportDefinition {
+					definition: definition.clone(),
+				});
+				false
+			}
+		});
+		let mut promoted = Vec::new();
+		interface.support_definitions.retain_mut(|support| {
+			project_definition(&mut support.definition, &owner, current);
+			if visibility_allows(support.definition.visibility, &owner, current) {
+				promoted.push(support.definition.clone());
+				false
+			} else {
+				true
+			}
+		});
+		interface.exports.extend(promoted);
+		interface.support_definitions.extend(hidden);
+		interface.implementations.retain_mut(|implementation| {
+			project_members(&mut implementation.members, &owner, current);
+			visibility_allows(implementation.visibility, &owner, current)
+		});
+		interface
+	}
+}
+
+fn visibility_allows(
+	visibility: Option<Visibility>,
+	owner: &ModuleIdentity,
+	current: &ModuleIdentity,
+) -> bool {
+	match visibility {
+		None | Some(Visibility::Public) => true,
+		Some(Visibility::Internal) => owner.same_package_as(current),
+		Some(Visibility::Private) => owner == current,
+	}
+}
+
+fn project_members<T, R, E>(
+	members: &mut Vec<MemberShape<T, R, E>>,
+	owner: &ModuleIdentity,
+	current: &ModuleIdentity,
+) {
+	members.retain(|member| visibility_allows(member.visibility, owner, current));
+}
+
+fn project_definition(
+	definition: &mut ExportedDefinition,
+	owner: &ModuleIdentity,
+	current: &ModuleIdentity,
+) {
+	project_members(&mut definition.members, owner, current);
 }
 struct Fnv(u64);
 impl Hasher for Fnv {
@@ -688,12 +1027,14 @@ pub struct RecoveredExportedDefinition {
 	pub constraints: Vec<RecoveredGenericConstraint>,
 	pub parameters: Vec<ParameterShape<RecoveredInterfaceType>>,
 	pub return_type: Option<RecoveredInterfaceType>,
+	pub effects: RecoveredEffectRow,
 	pub ty: Option<RecoveredInterfaceType>,
 	pub fields: Vec<FieldShape<RecoveredInterfaceType>>,
 	pub variants: Vec<VariantShape<RecoveredInterfaceType>>,
+	pub enum_view_variants: Vec<DefinitionId>,
 	pub members: Vec<RecoveredMemberShape>,
 	pub super_interfaces: Vec<RecoveredSuperInterface>,
-	pub external: Option<ExternalAbi>,
+	pub external: Option<ExternalAbi<RecoveredEffectRow>>,
 	pub runtime_owner: Option<DefinitionId>,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
@@ -707,8 +1048,8 @@ pub struct RecoveredExportedImpl {
 	pub availability: SemanticAvailability,
 	pub interface: Option<RecoveredDefinitionReference>,
 	pub interface_arguments: Vec<(EcoString, RecoveredInterfaceType)>,
+	pub interface_effect_arguments: Vec<(EcoString, RecoveredEffectRow)>,
 	pub self_type: RecoveredInterfaceType,
-	pub mutable: bool,
 	pub binders: Vec<GenericParameter>,
 	pub constraints: Vec<RecoveredGenericConstraint>,
 	pub members: Vec<RecoveredMemberShape>,
@@ -746,9 +1087,60 @@ impl RecoveredModuleInterface {
 		self.hash(&mut h);
 		h.finish()
 	}
+
+	fn available_to(&self, current: &ModuleIdentity) -> Self {
+		let mut interface = self.clone();
+		let owner = interface.module.clone();
+		let mut hidden = Vec::new();
+		interface.exports.retain_mut(|definition| {
+			project_recovered_definition(definition, &owner, current);
+			if visibility_allows(definition.visibility, &owner, current) {
+				true
+			} else {
+				hidden.push(RecoveredSupportDefinition {
+					definition: definition.clone(),
+				});
+				false
+			}
+		});
+		let mut promoted = Vec::new();
+		interface.support_definitions.retain_mut(|support| {
+			project_recovered_definition(&mut support.definition, &owner, current);
+			if visibility_allows(support.definition.visibility, &owner, current) {
+				promoted.push(support.definition.clone());
+				false
+			} else {
+				true
+			}
+		});
+		interface.exports.extend(promoted);
+		interface.support_definitions.extend(hidden);
+		interface.implementations.retain_mut(|implementation| {
+			project_members(&mut implementation.members, &owner, current);
+			visibility_allows(implementation.visibility, &owner, current)
+		});
+		interface
+	}
+}
+
+fn project_recovered_definition(
+	definition: &mut RecoveredExportedDefinition,
+	owner: &ModuleIdentity,
+	current: &ModuleIdentity,
+) {
+	project_members(&mut definition.members, owner, current);
 }
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum ModuleEnvironment {
 	Complete(ModuleInterface),
 	Recovered(RecoveredModuleInterface),
+}
+
+impl ModuleEnvironment {
+	pub(crate) fn available_to(&self, current: &ModuleIdentity) -> Self {
+		match self {
+			Self::Complete(interface) => Self::Complete(interface.available_to(current)),
+			Self::Recovered(interface) => Self::Recovered(interface.available_to(current)),
+		}
+	}
 }

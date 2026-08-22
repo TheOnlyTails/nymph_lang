@@ -20,6 +20,7 @@ mod anon_closure;
 mod check;
 mod coerce;
 mod def;
+mod effects;
 mod entry;
 mod environment;
 mod errors;
@@ -33,6 +34,7 @@ mod interface_extract;
 mod lower;
 mod members;
 pub mod query;
+mod range_analysis;
 mod runtime;
 mod solve;
 mod stable_lowering;
@@ -54,12 +56,14 @@ pub use def::{
 	AliasSig, DefData, DefKind, DefMap, DefOrigin, FieldSigMetadata, NamespaceMemberSig,
 	NamespaceSig, OwnedMemberSig, Signatures, ValueSig,
 };
+pub use effects::*;
+pub use entry::EntryRootShape;
 pub use environment::*;
 pub use errors::TypeError;
 pub use identity::{
 	BinderId, BinderScope, DeclarationCategory, DeclarationKey, DefinitionId, GenericParameterId,
 	HeaderBinder, HeaderConstraint, HeaderParameterId, HeaderType, ImplementationHeader,
-	ModuleIdentity, ModuleOrigin, RecoveredHeaderConstraint, RecoveredHeaderType,
+	ModuleIdentity, ModuleOrigin, PackageIdentity, RecoveredHeaderConstraint, RecoveredHeaderType,
 	RecoveredImplementationHeader, StableIdBuilder,
 };
 pub use iface::{ImplRegistry, InterfaceDef};
@@ -70,12 +74,13 @@ pub use nymph_hir::ids::{self, DefId, InferVar, ParamIdx};
 pub use nymph_hir::ty::{self, GenericArgs, Interner, Ty, TyKind};
 pub use runtime::{
 	BodyNodeId, BuiltinDispatch, CheckedRuntimeBody, DispatchMaterialization, EnumShell,
-	ExpressionVariant, PatternNodeId, PatternVariant, RuntimeAnnotations, RuntimeBodyKind,
-	RuntimeDefinition, RuntimeExtractionError, RuntimeIteration, RuntimePayload, RuntimePlacement,
-	RuntimePropagationKind, StableBody, StableCallArg, StableDispatch, StableExpr, StableExprKind,
-	StableListItem, StableListPatternEntry, StableMapEntry, StableMapPatternEntry, StableMatchArm,
-	StableParameter, StablePattern, StablePatternKind, StablePatternRange, StableRange,
-	StableStatement, StableStringPart, StableStringPatternPart, StableStructPatternField,
-	StableVariantField, StructShell, VariantExpressionMode, VariantPatternMode, runtime_definitions,
+	ExpressionVariant, PatternNodeId, PatternVariant, RangeDecision, RangeEvidence, RangeOperation,
+	RangeProof, RuntimeAnnotations, RuntimeBodyKind, RuntimeDefinition, RuntimeExtractionError,
+	RuntimeIteration, RuntimePayload, RuntimePlacement, RuntimePropagationKind, StableBody,
+	StableCallArg, StableDispatch, StableExpr, StableExprKind, StableListItem,
+	StableListPatternEntry, StableMapEntry, StableMapPatternEntry, StableMatchArm, StableParameter,
+	StablePattern, StablePatternKind, StablePatternRange, StableRange, StableStatement,
+	StableStringPart, StableStringPatternPart, StableStructPatternField, StableVariantField,
+	StructShell, VariantExpressionMode, VariantPatternMode, runtime_definitions,
 };
 pub use stable_lowering::*;

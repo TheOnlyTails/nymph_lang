@@ -5,7 +5,7 @@ The smallest Nymph program: print a line and exit.
 ```nym
 import std/io with (println)
 
-func main() = {
+func main(): void = {
   println("Hello, world!")
 }
 ```

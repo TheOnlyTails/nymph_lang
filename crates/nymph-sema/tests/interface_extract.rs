@@ -188,7 +188,7 @@ impl Pair for B {}
 fn recovered_known_implementation_projects_the_complete_exact_catalog() {
 	let valid = r#"
 interface Limit {
-	let mut maximum: float
+	let maximum: float
 	func render(): string
 	func fallback(): int = 1
 }
@@ -255,7 +255,13 @@ impl Limit for Box {
 	assert_eq!(recovered.members.len(), complete.members.len());
 	for (recovered, complete) in recovered.members.iter().zip(&complete.members) {
 		assert_eq!(recovered.id, complete.id);
-		assert_eq!(recovered.external, complete.external);
+		assert_eq!(
+			recovered.external,
+			complete
+				.external
+				.clone()
+				.map(nymph_sema::ExternalAbi::recovered)
+		);
 	}
 	let maximum = complete
 		.member_slots
@@ -391,7 +397,13 @@ impl int {
 	assert_eq!(recovered.availability, SemanticAvailability::Available);
 	for (recovered, complete) in recovered.members.iter().zip(&complete.members) {
 		assert_eq!(recovered.id, complete.id);
-		assert_eq!(recovered.external, complete.external);
+		assert_eq!(
+			recovered.external,
+			complete
+				.external
+				.clone()
+				.map(nymph_sema::ExternalAbi::recovered)
+		);
 	}
 }
 
@@ -666,9 +678,11 @@ fn extraction_preserves_transitive_imported_nominal_return_identity() {
 			constraints: vec![],
 			parameters: vec![],
 			return_type: None,
+			effects: nymph_sema::EffectRow::pure(),
 			ty: None,
 			fields: vec![],
 			variants: vec![],
+			enum_view_variants: vec![],
 			members: vec![],
 			super_interfaces: vec![],
 			external: None,
@@ -796,6 +810,137 @@ public func measure(shape: Area): int = shape.area()
 }
 
 #[test]
+fn effect_generic_interface_arguments_are_published_as_effect_rows() {
+	let module = parse(
+		"effect Io\n\
+		 interface Runner<!E> { func run(): !E }\n\
+		 interface Mapper<T, !E> { func map(value: T): T + !E }\n\
+		 struct Worker\n\
+		 impl Runner<!Io> for Worker { func run(): !() = {} }",
+	);
+	let environment = SemanticEnvironment::from_modules(identity(), &[]).unwrap();
+	let result = check_module_with_environment(
+		Arc::new(module.clone()),
+		identity(),
+		&environment,
+		EntryMode::Library,
+	);
+	assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+	let checked = nymph_sema::Checked {
+		diags: Vec::new(),
+		facts: result.analysis.checked.as_ref().clone(),
+	};
+	let headers = declared_headers(identity(), &module);
+	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();
+	let runner = interface
+		.exports
+		.iter()
+		.find(|definition| definition.name == "Runner")
+		.unwrap();
+	let run = runner
+		.members
+		.iter()
+		.find(|member| member.name == "run")
+		.unwrap();
+	assert_eq!(
+		run.effects.atoms(),
+		[nymph_sema::EffectAtom::Parameter(
+			runner.binders[0].id.clone()
+		)]
+	);
+	let mapper = interface
+		.exports
+		.iter()
+		.find(|definition| definition.name == "Mapper")
+		.unwrap();
+	let map = mapper
+		.members
+		.iter()
+		.find(|member| member.name == "map")
+		.unwrap();
+	assert_eq!(
+		mapper.binders[1].kind,
+		nymph_sema::GenericParameterKind::Effect
+	);
+	assert_eq!(
+		map.effects.atoms(),
+		[nymph_sema::EffectAtom::Parameter(
+			mapper.binders[1].id.clone()
+		)]
+	);
+	SemanticEnvironment::from_modules(
+		identity(),
+		&[std::sync::Arc::new(ModuleEnvironment::Complete(
+			interface.clone(),
+		))],
+	)
+	.unwrap();
+	let implementation = interface
+		.implementations
+		.iter()
+		.find(|implementation| implementation.interface.is_some())
+		.unwrap();
+	assert!(implementation.interface_arguments.is_empty());
+	let [(name, effects)] = implementation.interface_effect_arguments.as_slice() else {
+		panic!("missing effect argument: {implementation:?}");
+	};
+	assert_eq!(name, "E");
+	assert!(matches!(
+		effects.atoms(),
+		[nymph_sema::EffectAtom::Nominal(definition)]
+			if matches!(
+				&definition.key,
+				DeclarationKey::TopLevel {
+					category: DeclarationCategory::Effect,
+					name,
+					..
+				} if name == "Io"
+			)
+	));
+
+	let malformed = parse(
+		"interface Runner<!E> { func run(): !E }\n\
+		 struct Worker\n\
+		 impl Runner<!_> for Worker { func run(): !() = {} }",
+	);
+	let result = check_module_with_environment(
+		Arc::new(malformed.clone()),
+		identity(),
+		&environment,
+		EntryMode::Library,
+	);
+	assert!(
+		result
+			.diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.message.contains("cannot infer this effect row"))
+	);
+	let malformed_checked = nymph_sema::Checked {
+		diags: result.diagnostics.to_vec(),
+		facts: result.analysis.checked.as_ref().clone(),
+	};
+	let malformed_headers = declared_headers(identity(), &malformed);
+	let ModuleEnvironment::Recovered(recovered) = recover_module_environment(
+		identity(),
+		&malformed,
+		&malformed_checked,
+		&malformed_headers,
+	) else {
+		panic!("malformed effect argument unexpectedly published complete facts");
+	};
+	let implementation = recovered
+		.implementations
+		.iter()
+		.find(|implementation| implementation.interface.is_some())
+		.unwrap();
+	assert!(implementation.interface_arguments.is_empty());
+	assert!(matches!(
+		implementation.interface_effect_arguments.as_slice(),
+		[(_, nymph_sema::RecoveredEffectRow::Poison)]
+	));
+}
+
+#[test]
 fn extraction_uses_finalized_inferred_top_level_let_type() {
 	let module = parse(
 		r#"
@@ -893,20 +1038,21 @@ public impl<T> Show<T = T> for Choice<T> {
 fn extraction_preserves_constraints_superinterfaces_and_all_member_kinds_in_source_order() {
 	let module = parse(
 		r#"
-public interface Parent<T> { func parent(): T }
+public interface Parent<T> { func parent(): T
+	namespace func default(): self }
 public interface Child<T: Parent<T = int>>: Parent<T = T> {
 	let value: T
-	let mut changing: T
+	let changing: T
 	func required(value: T, rest: #[T]): T
-	mut func update(value: T): T = value
+	func update(value: T): T = value
 	namespace func make(value: T): T = value
 }
-public struct Box<T: Parent<T = int>>(value: T = 1) {
+public struct Box<T: Parent<T = int>>(value: T = T.default()) {
 	func get(): T = this.value
-	mut func set(value: T): T = value
-	namespace func make(value: T): Box<T> = Box(value)
+	func set(value: T): T = value
+	namespace func make(value: T): Box<T> = Box(value = value)
 	let cached: T = this.value
-	let mut changing: T = this.value
+	let changing: T = this.value
 	namespace let empty: int = 0
 }
 "#,
@@ -940,13 +1086,17 @@ public struct Box<T: Parent<T = int>>(value: T = 1) {
 	assert_eq!(boxed.constraints.len(), 1);
 	assert!(boxed.fields[0].has_default);
 	assert_eq!(
+		boxed.fields[0].visibility,
+		Some(nymph_ast::decl::Visibility::Internal)
+	);
+	assert_eq!(
 		boxed.members.iter().map(|m| m.kind).collect::<Vec<_>>(),
 		[
 			nymph_sema::MemberKind::Function,
-			nymph_sema::MemberKind::MutatingFunction,
+			nymph_sema::MemberKind::Function,
 			nymph_sema::MemberKind::StaticFunction,
 			nymph_sema::MemberKind::Value,
-			nymph_sema::MemberKind::MutableValue,
+			nymph_sema::MemberKind::Value,
 			nymph_sema::MemberKind::StaticValue,
 		]
 	);
@@ -966,7 +1116,7 @@ fn extraction_keeps_public_shape_and_private_nominal_support() {
 		r#"
 private struct Secret(value: int) {}
 public struct Wrapper(secret: Secret) {}
-public func expose(value: Secret): Wrapper = Wrapper(value)
+public func expose(value: Secret): Wrapper = Wrapper(secret = value)
 private func helper(): int = 1
 "#,
 	);
@@ -983,8 +1133,14 @@ private func helper(): int = 1
 			.collect::<Vec<_>>(),
 		["Wrapper", "expose"]
 	);
-	assert_eq!(interface.support_definitions.len(), 1);
-	assert_eq!(interface.support_definitions[0].definition.name, "Secret");
+	assert_eq!(
+		interface
+			.support_definitions
+			.iter()
+			.map(|support| support.definition.name.as_str())
+			.collect::<std::collections::BTreeSet<_>>(),
+		["Secret", "helper"].into_iter().collect()
+	);
 	assert_eq!(interface.exports[0].kind, DefinitionShapeKind::Struct);
 	assert_eq!(interface.fingerprint, interface.structural_fingerprint());
 }
@@ -1022,19 +1178,93 @@ public func valid(value: int): int = value
 }
 
 #[test]
+fn async_complete_and_recovered_interfaces_preserve_the_cold_task_shape() {
+	let complete_module = parse("public async func value(): int = 1");
+	let complete_checked = check(&complete_module);
+	assert!(
+		complete_checked.diags.is_empty(),
+		"{:?}",
+		complete_checked.diags
+	);
+	let headers = declared_headers(identity(), &complete_module);
+	let complete =
+		extract_module_interface(identity(), &complete_module, &complete_checked, &headers).unwrap();
+	assert!(matches!(
+		complete.exports[0].return_type,
+		Some(InterfaceType::Task { ref output, .. }) if **output == InterfaceType::Int
+	));
+
+	let recovered_module = parse("public async func value(): int = missing");
+	let recovered_checked = check(&recovered_module);
+	let headers = declared_headers(identity(), &recovered_module);
+	let ModuleEnvironment::Recovered(recovered) =
+		recover_module_environment(identity(), &recovered_module, &recovered_checked, &headers)
+	else {
+		panic!("invalid body must recover its declaration facts");
+	};
+	assert!(matches!(
+		recovered.exports[0].return_type,
+		Some(RecoveredInterfaceType::Known(InterfaceType::Task { ref output, .. }))
+			if **output == InterfaceType::Int
+	));
+}
+
+#[test]
+fn struct_field_visibility_and_default_presence_affect_complete_and_recovered_fingerprints() {
+	fn complete(source: &str) -> ModuleInterface {
+		let module = parse(source);
+		let checked = check(&module);
+		assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+		let headers = declared_headers(identity(), &module);
+		extract_module_interface(identity(), &module, &checked, &headers).unwrap()
+	}
+	fn recovered(source: &str) -> nymph_sema::RecoveredModuleInterface {
+		let module = parse(source);
+		let checked = check(&module);
+		let headers = declared_headers(identity(), &module);
+		let ModuleEnvironment::Recovered(interface) =
+			recover_module_environment(identity(), &module, &checked, &headers)
+		else {
+			panic!("expected recovered interface")
+		};
+		interface
+	}
+
+	let complete_default =
+		complete("public struct Record(public shown: int, private hidden: int = 1)");
+	let complete_required = complete("public struct Record(public shown: int, private hidden: int)");
+	assert_eq!(complete_default.exports[0].fields.len(), 2);
+	assert!(complete_default.exports[0].fields[1].has_default);
+	assert_ne!(complete_default.fingerprint, complete_required.fingerprint);
+
+	let recovered_private = recovered(
+		"public struct Record(public shown: int, private hidden: int = 1)\nfunc broken(): Missing = panic(\"broken\")",
+	);
+	let recovered_internal = recovered(
+		"public struct Record(public shown: int, internal hidden: int = 1)\nfunc broken(): Missing = panic(\"broken\")",
+	);
+	assert_eq!(recovered_private.exports[0].fields.len(), 2);
+	assert!(recovered_private.exports[0].fields[1].has_default);
+	assert_ne!(
+		recovered_private.fingerprint,
+		recovered_internal.fingerprint
+	);
+}
+
+#[test]
 fn extraction_includes_inherent_nested_impl_method_facts_and_recursive_support() {
 	let module = parse(
 		r#"
 public interface Marker<T> { func mark<U: Marker<T = T>>(value: U): T }
 private struct Secret(value: int) {}
 public struct Box<T>(value: T) {
-	func reveal<U: Marker<T = Secret>>(value: U) = Secret(1)
+	func reveal<U: Marker<T = Secret>>(value: U) = Secret(value = 1)
 	impl Marker<T = Secret> {
-		func mark(value: int) = Secret(1)
+		func mark(value: int) = Secret(value = 1)
 	}
 }
 public impl<T: Marker<T = Secret>> Box<T> {
-	func extra<U: Marker<T = Secret>>(value: U) = Secret(1)
+	func extra<U: Marker<T = Secret>>(value: U) = Secret(value = 1)
 }
 "#,
 	);
@@ -1244,8 +1474,14 @@ public impl Bound<T = int> for Missing {
 		environment.implementations[0].id,
 		environment.implementations[1].id
 	);
-	assert_eq!(environment.support_definitions.len(), 1);
-	assert_eq!(environment.support_definitions[0].definition.name, "Used");
+	assert_eq!(
+		environment
+			.support_definitions
+			.iter()
+			.map(|support| support.definition.name.as_str())
+			.collect::<std::collections::BTreeSet<_>>(),
+		["Unused", "Used"].into_iter().collect()
+	);
 	assert_eq!(
 		environment.fingerprint,
 		environment.structural_fingerprint()
@@ -1359,17 +1595,142 @@ fn extraction_uses_checked_external_value_linkage_and_marshal() {
 	assert_eq!(
 		abi.callable,
 		nymph_sema::ExternalCallable::Linked {
-			module: "std/math/intrinsics".into(),
-			symbol: "max_float".into(),
+			adapter: nymph_sema::ExternalAdapterId {
+				module: "std/math/intrinsics".into(),
+				symbol: "max_float".into(),
+			},
 		}
 	);
-	assert_eq!(abi.marshal, Some(MarshalKind::Float));
+	assert_eq!(abi.effects, nymph_sema::EffectRow::pure());
+	assert_eq!(abi.call_mode, nymph_sema::ExternalCallMode::Ordinary);
+	assert_eq!(abi.marshal.parameters, []);
+	assert_eq!(abi.marshal.result, Some(MarshalKind::Float));
+}
+
+#[test]
+fn effectful_external_abi_publishes_backend_neutral_contract_and_affects_fingerprint() {
+	let module = parse("public effect Io\npublic external(println) func send(value: string): !Io");
+	let checked = check(&module);
+	assert!(checked.diags.is_empty(), "{:?}", checked.diags);
+	let headers = declared_headers(identity(), &module);
+	let interface = extract_module_interface(identity(), &module, &checked, &headers).unwrap();
+	let send = interface
+		.exports
+		.iter()
+		.find(|definition| definition.name == "send")
+		.unwrap();
+	let abi = send.external.as_ref().unwrap();
+	assert_eq!(
+		abi.callable,
+		nymph_sema::ExternalCallable::Linked {
+			adapter: nymph_sema::ExternalAdapterId {
+				module: "std/io".into(),
+				symbol: "println".into(),
+			},
+		}
+	);
+	assert_eq!(abi.effects, send.effects);
+	assert_eq!(abi.effects.atoms().len(), 1);
+	assert_eq!(
+		abi.audit,
+		nymph_sema::ExternalAudit {
+			state: nymph_sema::ExternalState::Write,
+			transaction: nymph_sema::ExternalTransaction::Irreversible,
+		}
+	);
+	assert_eq!(abi.call_mode, nymph_sema::ExternalCallMode::Ordinary);
+	assert_eq!(abi.marshal.parameters, [Some(MarshalKind::String)]);
+	assert_eq!(abi.marshal.result, None);
+
+	let mut without_effects = interface.clone();
+	let send = without_effects
+		.exports
+		.iter_mut()
+		.find(|definition| definition.name == "send")
+		.unwrap();
+	send.effects = nymph_sema::EffectRow::pure();
+	send.external.as_mut().unwrap().effects = nymph_sema::EffectRow::pure();
+	without_effects.fingerprint = without_effects.structural_fingerprint();
+	assert_ne!(interface.fingerprint, without_effects.fingerprint);
+
+	let mutate_abi = |mut candidate: nymph_sema::ModuleInterface,
+	                  mutate: fn(&mut nymph_sema::ExternalAbi)| {
+		let abi = candidate
+			.exports
+			.iter_mut()
+			.find(|definition| definition.name == "send")
+			.unwrap()
+			.external
+			.as_mut()
+			.unwrap();
+		mutate(abi);
+		candidate.fingerprint = candidate.structural_fingerprint();
+		candidate
+	};
+	for changed in [
+		mutate_abi(interface.clone(), |abi| {
+			let nymph_sema::ExternalCallable::Linked { adapter } = &mut abi.callable else {
+				unreachable!()
+			};
+			adapter.module = "std/other".into();
+		}),
+		mutate_abi(interface.clone(), |abi| {
+			let nymph_sema::ExternalCallable::Linked { adapter } = &mut abi.callable else {
+				unreachable!()
+			};
+			adapter.symbol = "other".into();
+		}),
+		mutate_abi(interface.clone(), |abi| {
+			abi.audit.state = nymph_sema::ExternalState::Read;
+		}),
+		mutate_abi(interface.clone(), |abi| {
+			abi.audit.transaction = nymph_sema::ExternalTransaction::Aware;
+		}),
+		mutate_abi(interface.clone(), |abi| {
+			abi.call_mode = nymph_sema::ExternalCallMode::Cancellable;
+		}),
+		mutate_abi(interface.clone(), |abi| {
+			abi.marshal.parameters[0] = Some(MarshalKind::Opaque(91));
+		}),
+		mutate_abi(interface.clone(), |abi| {
+			abi.marshal.result = Some(MarshalKind::Opaque(92));
+		}),
+	] {
+		assert_ne!(interface.fingerprint, changed.fingerprint);
+	}
+}
+
+#[test]
+fn bodyless_inferred_effect_row_is_poisoned_in_recovered_external_facts() {
+	let module = parse("public external(println) func send(value: string): !_");
+	let checked = check(&module);
+	assert!(checked.diags.iter().any(|diagnostic| {
+		diagnostic
+			.message
+			.contains("cannot infer this effect row without a callable body")
+	}));
+	let headers = declared_headers(identity(), &module);
+	let ModuleEnvironment::Recovered(recovered) =
+		recover_module_environment(identity(), &module, &checked, &headers)
+	else {
+		panic!("expected recovered environment");
+	};
+	let send = recovered
+		.exports
+		.iter()
+		.find(|definition| definition.name == "send")
+		.unwrap();
+	assert_eq!(send.effects, nymph_sema::RecoveredEffectRow::Poison);
+	assert_eq!(
+		send.external.as_ref().unwrap().effects,
+		nymph_sema::RecoveredEffectRow::Poison
+	);
 }
 
 #[test]
 fn implementation_value_shapes_project_checker_owned_kind_and_marshal() {
 	let module = Arc::new(parse(
-		"type Scalar = float\ninterface Limit { let mut maximum: Scalar }\nstruct Box {}\nimpl Limit for Box { external(max_float) let maximum: Scalar }",
+		"type Scalar = float\ninterface Limit { let maximum: Scalar }\nstruct Box {}\nimpl Limit for Box { external(max_float) let maximum: Scalar }",
 	));
 	let module_identity = identity();
 	let environment = SemanticEnvironment::from_modules(module_identity.clone(), &[]).unwrap();
@@ -1387,9 +1748,9 @@ fn implementation_value_shapes_project_checker_owned_kind_and_marshal() {
 	let headers = declared_headers(module_identity.clone(), &module);
 	let interface = extract_module_interface(module_identity, &module, &checked, &headers).unwrap();
 	let member = &interface.implementations[0].members[0];
-	assert_eq!(member.kind, nymph_sema::MemberKind::MutableValue);
+	assert_eq!(member.kind, nymph_sema::MemberKind::Value);
 	assert_eq!(
-		member.external.as_ref().and_then(|abi| abi.marshal),
+		member.external.as_ref().and_then(|abi| abi.marshal.result),
 		Some(MarshalKind::Float)
 	);
 	let slot = interface.implementations[0]

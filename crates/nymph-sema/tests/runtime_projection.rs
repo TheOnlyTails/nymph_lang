@@ -37,7 +37,7 @@ fn project(source: &str) -> Vec<nymph_sema::RuntimeDefinition> {
 #[test]
 fn generic_iterable_iteration_preserves_the_exact_iter_member() {
 	let definitions = project(
-		"enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nfunc each<T: Iterable<Item = int>>(items: T): void = for (_ in items) { 0 }",
+		"enum Iteration<Item, Next> { Done, Yield(item: Item, next: Next) }\ninterface Iterator<Item + !E> { func next(): Iteration<Item, self> + !E }\ninterface Iterable<Item + !E> { func iter(): Iterator<Item + !E> }\nfunc each<T: Iterable<Item = int>>(items: T): void = for (_ in items) { 0 }",
 	);
 	let each = definitions
 		.iter()
@@ -252,8 +252,11 @@ fn collect_owned_ids(
 		}
 		StableExprKind::PrefixOp { value, .. }
 		| StableExprKind::PostfixOp { value, .. }
+		| StableExprKind::Echo { operand: value, .. }
+		| StableExprKind::AsyncBlock(value)
+		| StableExprKind::Await(value)
 		| StableExprKind::Grouped(value) => visit!(value),
-		StableExprKind::BinaryOp { lhs, rhs, .. } | StableExprKind::AssignOp { lhs, rhs, .. } => {
+		StableExprKind::BinaryOp { lhs, rhs, .. } => {
 			visit!(lhs);
 			visit!(rhs);
 		}
@@ -267,11 +270,10 @@ fn collect_owned_ids(
 				visit!(value);
 			}
 		}
-		StableExprKind::While {
-			condition, body, ..
-		} => {
-			visit!(condition);
-			visit!(body);
+		StableExprKind::Continue { replacements, .. } => {
+			for replacement in replacements.iter() {
+				visit!(&replacement.value);
+			}
 		}
 		StableExprKind::For {
 			variable,
@@ -281,6 +283,12 @@ fn collect_owned_ids(
 		} => {
 			collect_pattern_ids(variable, pattern_ids);
 			visit!(iterable);
+			visit!(body);
+		}
+		StableExprKind::StateLoop { bindings, body, .. } => {
+			for binding in bindings.iter() {
+				visit!(&binding.value);
+			}
 			visit!(body);
 		}
 		StableExprKind::If {
@@ -322,7 +330,6 @@ fn collect_owned_ids(
 		| StableExprKind::Boolean(_)
 		| StableExprKind::Identifier(_)
 		| StableExprKind::AnonymousParam(_)
-		| StableExprKind::Continue { .. }
 		| StableExprKind::This => {}
 	}
 }

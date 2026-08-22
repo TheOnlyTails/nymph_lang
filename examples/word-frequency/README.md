@@ -1,35 +1,23 @@
 # word-frequency
 
-Read a document, count how often each word appears, and print the five most common.
+Build a persistent word-count map and print its five most common entries.
 
-This is the example that best shows where iteration is headed: a **lazy pipeline**
-built by chaining adapters on an iterator.
+The example builds its counts through persistent map updates: each binding is a
+new map, while every prior map remains valid.
 
 ```nym
-let top = counts
-  .entries()
-  .iter()
-  .sorted_by((a, b) -> b[1].compare_to(a[1]))
-  .take(5)
+let counts: #{string: int} = #{}
+let counts = counts.inserted("the", 4)
+let counts = counts.inserted("fox", 2)
 ```
 
-`entries()` gives a list of `#(word, count)` tuples; `iter()` turns it into an
-iterator; `sorted_by` orders the remaining entries by count descending; `take(5)`
-keeps the first five. Building the pipeline does no iteration. On the first pull,
-`sorted_by` materializes and stably sorts its remaining source once, then yields
-from that buffer.
+The bounded sample uses deterministic input and output so its runtime check does
+not depend on files, locale, or unstable map traversal order.
 
 Also on display:
 
-- **`Option` + `??`** — `counts.get(word) ?? 0` reads a possibly-absent map value
-  with a default; `read_file(...) ?? fallback` does the same for a fallible read.
-- **Tuple-destructuring patterns** — `for (#(word, count) in top)` unpacks each
-  entry directly in the loop header.
-- **String methods** — `split`, `trim`, `to_lower`, `length`.
+- **Persistent maps** — each `inserted` call returns the next map while the source
+  map remains valid and unchanged.
+- **Deterministic output** — the example has exact expected stdout and status.
 
-**Status:** 🚧 In flight.
-
-- The word-tallying loop (map + `Option` default) works today.
-- `read_file` needs `std/fs` (not implemented yet).
-- The `entries().iter().sorted_by(...).take(...)` iterator chain is implemented.
-  The missing `std/fs` module still prevents the complete example from running.
+**Status:** ✅ Runs today with deterministic built-in input.

@@ -75,17 +75,11 @@ fn make_symbol(
 
 /// Shared semantic declaration-category to LSP symbol-kind mapping.
 #[must_use]
-pub(crate) fn symbol_kind(category: DeclarationCategory, mutable: bool) -> SymbolKind {
+pub(crate) fn symbol_kind(category: DeclarationCategory) -> SymbolKind {
 	match category {
 		DeclarationCategory::Function => SymbolKind::FUNCTION,
 		DeclarationCategory::Method | DeclarationCategory::MethodBody => SymbolKind::METHOD,
-		DeclarationCategory::Let | DeclarationCategory::Static => {
-			if mutable {
-				SymbolKind::VARIABLE
-			} else {
-				SymbolKind::CONSTANT
-			}
-		}
+		DeclarationCategory::Let | DeclarationCategory::Static => SymbolKind::CONSTANT,
 		DeclarationCategory::TypeAlias => SymbolKind::CLASS,
 		DeclarationCategory::Struct => SymbolKind::STRUCT,
 		DeclarationCategory::Enum => SymbolKind::ENUM,
@@ -94,6 +88,7 @@ pub(crate) fn symbol_kind(category: DeclarationCategory, mutable: bool) -> Symbo
 		DeclarationCategory::Variant => SymbolKind::ENUM_MEMBER,
 		DeclarationCategory::Field => SymbolKind::FIELD,
 		DeclarationCategory::Implementation => SymbolKind::OBJECT,
+		DeclarationCategory::Effect => SymbolKind::CLASS,
 	}
 }
 
@@ -108,12 +103,22 @@ fn decl_symbol(
 	cancellation: &CancellationToken,
 ) -> Result<Option<DocumentSymbol>, TaskError> {
 	Ok(match decl {
+		Declaration::Effect { name, .. } => {
+			let selection = index.range(text, name.1);
+			Some(make_symbol(
+				&name.0,
+				symbol_kind(DeclarationCategory::Effect),
+				selection,
+				selection,
+				None,
+			))
+		}
 		Declaration::Func { meta, body, .. } => {
 			let selection = index.range(text, meta.name.1);
 			let full = index.range(text, meta.name.1.to(body.span));
 			Some(make_symbol(
 				&meta.name.0,
-				symbol_kind(DeclarationCategory::Function, false),
+				symbol_kind(DeclarationCategory::Function),
 				full,
 				selection,
 				None,
@@ -123,7 +128,7 @@ fn decl_symbol(
 			let selection = index.range(text, meta.name.1);
 			Some(make_symbol(
 				&meta.name.0,
-				symbol_kind(DeclarationCategory::Function, false),
+				symbol_kind(DeclarationCategory::Function),
 				selection,
 				selection,
 				None,
@@ -135,7 +140,7 @@ fn decl_symbol(
 			};
 			let selection = index.range(text, name.1);
 			let full = index.range(text, name.1.to(value.span));
-			let kind = symbol_kind(DeclarationCategory::Let, meta.is_mutable());
+			let kind = symbol_kind(DeclarationCategory::Let);
 			Some(make_symbol(&name.0, kind, full, selection, None))
 		}
 		Declaration::ExternalLet(_, _, meta) => {
@@ -143,7 +148,7 @@ fn decl_symbol(
 				return Ok(None);
 			};
 			let selection = index.range(text, name.1);
-			let kind = symbol_kind(DeclarationCategory::Let, meta.is_mutable());
+			let kind = symbol_kind(DeclarationCategory::Let);
 			Some(make_symbol(&name.0, kind, selection, selection, None))
 		}
 		Declaration::Struct { name, fields, .. } => {
@@ -156,7 +161,7 @@ fn decl_symbol(
 				let field_selection = index.range(text, f.0.name.1);
 				children.push(make_symbol(
 					&f.0.name.0,
-					symbol_kind(DeclarationCategory::Field, false),
+					symbol_kind(DeclarationCategory::Field),
 					field_selection,
 					field_selection,
 					None,
@@ -166,23 +171,31 @@ fn decl_symbol(
 			let children = (!children.is_empty()).then_some(children);
 			Some(make_symbol(
 				&name.0,
-				symbol_kind(DeclarationCategory::Struct, false),
+				symbol_kind(DeclarationCategory::Struct),
 				full,
 				selection,
 				children,
 			))
 		}
-		Declaration::Enum { name, variants, .. } => {
+		Declaration::Enum {
+			name,
+			embeddings,
+			variants,
+			..
+		} => {
 			let selection = index.range(text, name.1);
 			let mut whole = name.1;
 			let mut children = Vec::new();
+			for embedding in embeddings {
+				whole = whole.to(embedding.1);
+			}
 			for v in variants {
 				cancellation.checkpoint()?;
 				whole = whole.to(v.1);
 				let variant_selection = index.range(text, v.0.name.1);
 				children.push(make_symbol(
 					&v.0.name.0,
-					symbol_kind(DeclarationCategory::Variant, false),
+					symbol_kind(DeclarationCategory::Variant),
 					variant_selection,
 					variant_selection,
 					None,
@@ -192,7 +205,7 @@ fn decl_symbol(
 			let children = (!children.is_empty()).then_some(children);
 			Some(make_symbol(
 				&name.0,
-				symbol_kind(DeclarationCategory::Enum, false),
+				symbol_kind(DeclarationCategory::Enum),
 				full,
 				selection,
 				children,
@@ -202,7 +215,7 @@ fn decl_symbol(
 			let selection = index.range(text, name.1);
 			Some(make_symbol(
 				&name.0,
-				symbol_kind(DeclarationCategory::Interface, false),
+				symbol_kind(DeclarationCategory::Interface),
 				selection,
 				selection,
 				None,
@@ -212,7 +225,7 @@ fn decl_symbol(
 			let selection = index.range(text, name.1);
 			Some(make_symbol(
 				&name.0,
-				symbol_kind(DeclarationCategory::Namespace, false),
+				symbol_kind(DeclarationCategory::Namespace),
 				selection,
 				selection,
 				None,
@@ -223,7 +236,7 @@ fn decl_symbol(
 			let full = index.range(text, meta.name.1.to(value.1));
 			Some(make_symbol(
 				&meta.name.0,
-				symbol_kind(DeclarationCategory::TypeAlias, false),
+				symbol_kind(DeclarationCategory::TypeAlias),
 				full,
 				selection,
 				None,
@@ -267,6 +280,7 @@ mod tests {
 		let text = "\
 func add(a: int, b: int): int = a + b
 let total = 0
+effect Io
 struct Point(x: int, y: int)
 enum Color { Red, Green, Blue }
 interface Shape { func area(): float }
@@ -283,12 +297,13 @@ type Pair<A, B> = #(A, B)
 
 		assert_eq!(by_name["add"].kind, SymbolKind::FUNCTION);
 		assert_eq!(by_name["total"].kind, SymbolKind::CONSTANT);
+		assert_eq!(by_name["Io"].kind, SymbolKind::CLASS);
 		assert_eq!(by_name["Point"].kind, SymbolKind::STRUCT);
 		assert_eq!(by_name["Color"].kind, SymbolKind::ENUM);
 		assert_eq!(by_name["Shape"].kind, SymbolKind::INTERFACE);
 		assert_eq!(by_name["Constants"].kind, SymbolKind::NAMESPACE);
 		assert_eq!(by_name["Pair"].kind, SymbolKind::CLASS);
-		assert_eq!(symbols.len(), 7);
+		assert_eq!(symbols.len(), 8);
 	}
 
 	#[test]

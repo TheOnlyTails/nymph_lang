@@ -17,6 +17,21 @@ fn module(path: &str) -> ModuleIdentity {
 }
 
 #[test]
+fn exact_resolved_package_instance_is_part_of_stable_identity() {
+	let key = DeclarationKey::top_level(DeclarationCategory::Struct, "Value");
+	let package = |node| ModuleIdentity::resolved_project("workspace", node, "types");
+
+	let first = DefinitionId::new(package(1), key.clone());
+	let alias_of_first = DefinitionId::new(package(1), key.clone());
+	let independent_copy = DefinitionId::new(package(2), key);
+
+	assert_eq!(first, alias_of_first);
+	assert_ne!(first, independent_copy);
+	assert!(first.module.same_package_as(&alias_of_first.module));
+	assert!(!first.module.same_package_as(&independent_copy.module));
+}
+
+#[test]
 fn ordinary_identity_uses_only_owned_source_header_identity() {
 	let key = DeclarationKey::top_level(DeclarationCategory::Function, "answer");
 	let a = DefinitionId::new(module("main"), key.clone());
@@ -137,7 +152,6 @@ fn implementation_identity_changes_only_with_its_observable_header() {
 		)),
 		interface_arguments: vec![],
 		self_type,
-		mutable: false,
 		binders: vec![],
 		constraints: vec![],
 	};
@@ -193,7 +207,6 @@ fn generic_implementation_headers_are_alpha_normalized_and_order_insensitive() {
 				positional: vec![HeaderType::Generic(a), HeaderType::Generic(b)],
 				named: vec![],
 			},
-			mutable: false,
 			binders: vec![HeaderBinder { parameter: a }, HeaderBinder { parameter: b }],
 			constraints,
 		}
@@ -214,7 +227,6 @@ fn implementation_header_intersections_match_interner_normalization_everywhere()
 		interface: None,
 		interface_arguments: vec![("Named".into(), HeaderType::Generic(a))],
 		self_type: HeaderType::Intersection(vec![HeaderType::Int, HeaderType::String]),
-		mutable: false,
 		binders: vec![HeaderBinder { parameter: a }],
 		constraints: vec![HeaderConstraint {
 			parameter: a,
@@ -233,7 +245,6 @@ fn implementation_header_intersections_match_interner_normalization_everywhere()
 			HeaderType::String,
 			HeaderType::Intersection(vec![HeaderType::Int, HeaderType::String]),
 		]),
-		mutable: false,
 		binders: vec![HeaderBinder {
 			parameter: HeaderParameterId(7),
 		}],
@@ -261,7 +272,6 @@ fn intersections_normalize_in_nested_named_positional_and_named_arguments() {
 		interface: None,
 		interface_arguments: vec![],
 		self_type,
-		mutable: false,
 		binders: vec![],
 		constraints: vec![],
 	};
@@ -297,7 +307,6 @@ fn duplicate_header_parameter_ids_are_an_invariant_violation() {
 		interface: None,
 		interface_arguments: vec![],
 		self_type: HeaderType::Void,
-		mutable: false,
 		binders: vec![
 			HeaderBinder {
 				parameter: duplicate,
@@ -319,7 +328,6 @@ fn distinct_parameter_ids_remain_valid_even_when_source_names_could_duplicate() 
 			HeaderType::Generic(HeaderParameterId(1)),
 			HeaderType::Generic(HeaderParameterId(2)),
 		]),
-		mutable: false,
 		binders: vec![
 			HeaderBinder {
 				parameter: HeaderParameterId(1),

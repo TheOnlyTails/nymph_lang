@@ -2,17 +2,27 @@
 //!
 //! Entry mode (`check_module_entry`, see `check.rs`) requires the module to
 //! declare a top-level `func main` taking no parameters, declaring no generic
-//! parameters, and declaring no return type other than `void`; library mode
-//! (`check_module`) never runs this pass. Deliberately its own small file
-//! rather than folded into `check.rs`, per the crate's anti-monolith split
-//! (see `check.rs`'s module doc).
+//! parameters, and resolving to one of the supported root result shapes;
+//! library mode (`check_module`) never runs this pass. This stays separate
+//! from `check.rs` to keep that file from growing further.
 
 use nymph_ast::Span;
 use nymph_ast::decl::Declaration;
-use nymph_ast::ty::Type;
 
 use crate::check::Checker;
 use crate::errors::TypeError;
+use crate::{DefKind, GenericArgs, Ty, TyKind};
+
+/// Exact semantic result shape accepted at the executable root.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EntryRootShape {
+	Void,
+	Option,
+	Result,
+	TaskVoid,
+	TaskOption,
+	TaskResult,
+}
 
 impl Checker<'_> {
 	/// Validate the module's entry point. Called once, in entry mode only,
@@ -29,15 +39,20 @@ impl Checker<'_> {
 	/// count" holds by construction, with no special-casing needed. An
 	/// `external` func named `main` also doesn't satisfy this: it has no body
 	/// to run as the program's entry point, and isn't a `Declaration::Func`.
-	pub(crate) fn check_entry_main(&mut self) {
-		let main = self.module.members.iter().find_map(|decl| match decl {
-			Declaration::Func { meta, .. } if meta.name.0 == "main" => Some(meta),
-			_ => None,
-		});
+	pub(crate) fn check_entry_main(&mut self) -> Option<EntryRootShape> {
+		let main = self
+			.module
+			.members
+			.iter()
+			.enumerate()
+			.find_map(|(member, decl)| match decl {
+				Declaration::Func { meta, .. } if meta.name.0 == "main" => Some((member, meta)),
+				_ => None,
+			});
 
-		let Some(meta) = main else {
+		let Some((member, meta)) = main else {
 			self.emit(Span::new(0, 0), TypeError::MainMissing);
-			return;
+			return None;
 		};
 
 		// Independent checks: a single malformed `main` can fail more than
@@ -52,21 +67,68 @@ impl Checker<'_> {
 			self.emit(first.span().to(last.span()), TypeError::MainHasParams);
 		}
 
-		if let Some(ret) = &meta.return_type {
-			// This is an AST-declared-annotation-only rule: an unannotated
-			// `main` is accepted even when its body infers a non-`void`
-			// type (`func main = 42`), and `type V = void; func main:
-			// V = {}` is rejected despite `V` being an alias for `void` —
-			// only the surface annotation is inspected, not the lowered
-			// semantic type. Unwrap a `Grouped` annotation first so `func
-			// main: (void)` is accepted like the unparenthesized form.
-			let mut inner = ret;
-			while let Type::Grouped(boxed) = inner.value() {
-				inner = boxed.as_ref();
-			}
-			if !matches!(inner.value(), Type::Void) {
-				self.emit(ret.span(), TypeError::MainNonVoidReturn);
+		let main_def = self
+			.defs
+			.defs
+			.iter()
+			.enumerate()
+			.find_map(|(index, definition)| {
+				let id = crate::DefId(index as u32);
+				(definition.kind == DefKind::Func && self.defs.local_member(id) == Some(member))
+					.then_some(id)
+			});
+		let shape = main_def
+			.and_then(|main| self.sigs.funcs.get(&main).map(|signature| signature.ret))
+			.and_then(|root| self.classify_entry_root(root));
+		if shape.is_none() {
+			let span = meta
+				.return_type
+				.as_ref()
+				.map_or_else(|| meta.name.span(), |ret| ret.span());
+			self.emit(span, TypeError::MainNonVoidReturn);
+		}
+		shape
+	}
+
+	fn classify_entry_root(&mut self, root: Ty) -> Option<EntryRootShape> {
+		let root = self.resolve_deep(root);
+		match self.interner.kind(root).clone() {
+			TyKind::Void => Some(EntryRootShape::Void),
+			TyKind::Adt(definition, arguments) => self.classify_sync_root(definition, &arguments),
+			TyKind::Task { output, .. } => match self.classify_entry_root(output)? {
+				EntryRootShape::Void => Some(EntryRootShape::TaskVoid),
+				EntryRootShape::Option => Some(EntryRootShape::TaskOption),
+				EntryRootShape::Result => Some(EntryRootShape::TaskResult),
+				EntryRootShape::TaskVoid | EntryRootShape::TaskOption | EntryRootShape::TaskResult => None,
+			},
+			_ => None,
+		}
+	}
+
+	fn classify_sync_root(
+		&mut self,
+		definition: crate::DefId,
+		arguments: &GenericArgs,
+	) -> Option<EntryRootShape> {
+		if !arguments.named.is_empty() {
+			return None;
+		}
+		if Some(definition) == self.runtime_roles.option
+			&& let [value] = arguments.positional.as_slice()
+		{
+			let value = self.resolve_deep(*value);
+			if matches!(self.interner.kind(value), TyKind::Void) {
+				return Some(EntryRootShape::Option);
 			}
 		}
+		if Some(definition) == self.runtime_roles.result
+			&& let [value, _error] = arguments.positional.as_slice()
+		{
+			let value = self.resolve_deep(*value);
+			if matches!(self.interner.kind(value), TyKind::Void) {
+				return Some(EntryRootShape::Result);
+			}
+		}
+		None
 	}
 }

@@ -11,6 +11,7 @@ use nymph_sema::{
 pub(crate) enum LinkArtifact<'a> {
 	TopLevel,
 	External(&'a ExternalAbi),
+	WrappedExternal,
 	Attached,
 }
 
@@ -115,8 +116,10 @@ pub(crate) fn plan_project_module(
 		if fragment.definition.module == *module {
 			plan_external_alias(&mut plan, fragment, resolver)?;
 			if !matches!(fragment.artifact, LinkArtifact::Attached)
-				&& (matches!(fragment.artifact, LinkArtifact::External(_))
-					|| preserve_names
+				&& (matches!(
+					fragment.artifact,
+					LinkArtifact::External(_) | LinkArtifact::WrappedExternal
+				) || preserve_names
 					|| public.contains(fragment.definition))
 			{
 				plan.exports.push(PlannedExport {
@@ -304,10 +307,25 @@ mod tests {
 		ExternalAbi {
 			marker: "js".into(),
 			callable: ExternalCallable::Linked {
-				module: module.into(),
-				symbol: symbol.into(),
+				adapter: nymph_sema::ExternalAdapterId {
+					module: module.into(),
+					symbol: symbol.into(),
+				},
 			},
-			marshal: None,
+			effects: nymph_sema::EffectRow::pure(),
+			audit: nymph_sema::ExternalAudit::default(),
+			call_mode: nymph_sema::ExternalCallMode::Ordinary,
+			marshal: nymph_sema::ExternalMarshalPlan::default(),
+		}
+	}
+	fn deferred() -> ExternalAbi {
+		ExternalAbi {
+			marker: "js".into(),
+			callable: ExternalCallable::Deferred,
+			effects: nymph_sema::EffectRow::pure(),
+			audit: nymph_sema::ExternalAudit::default(),
+			call_mode: nymph_sema::ExternalCallMode::Ordinary,
+			marshal: nymph_sema::ExternalMarshalPlan::default(),
 		}
 	}
 	struct Resolver {
@@ -503,11 +521,7 @@ mod tests {
 		let external = definition(&own, "external");
 		let attached = definition(&own, "attached");
 		let foreign = definition(&dep, "foreign");
-		let deferred = ExternalAbi {
-			marker: "js".into(),
-			callable: ExternalCallable::Deferred,
-			marshal: None,
-		};
+		let deferred = deferred();
 		let fragments = [
 			LinkFragment {
 				definition: &private,
@@ -634,11 +648,7 @@ mod tests {
 		let linked_id = definition(&own, "linked");
 		let deferred_id = definition(&own, "deferred");
 		let linked_abi = linked("host", "call");
-		let deferred_abi = ExternalAbi {
-			marker: "js".into(),
-			callable: ExternalCallable::Deferred,
-			marshal: None,
-		};
+		let deferred_abi = deferred();
 		let fragments = [
 			LinkFragment {
 				definition: &linked_id,

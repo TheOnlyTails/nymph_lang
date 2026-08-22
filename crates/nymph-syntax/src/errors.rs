@@ -5,8 +5,8 @@
 //! message. The parser emits a [`ParseError`] with a span via `Parser::emit`; the
 //! lexer runs on chumsky, whose `Rich::custom` carries a `&'static str`, so
 //! [`LexError`] exposes its text via [`LexError::text`] (and still implements
-//! [`IntoDiagnostic`] for when the code scheme lands). Codes are not assigned yet —
-//! `code()` inherits the trait default (`None`).
+//! [`IntoDiagnostic`]). Existing catalog variants remain in place and new variants
+//! are appended so their generated numeric codes stay stable.
 
 use ecow::EcoString;
 use nymph_ast::Span;
@@ -78,6 +78,16 @@ pub enum ParseError {
 		inner: EcoString,
 		inner_span: Span,
 	},
+	/// A signed integer pattern is outside the source language's `i64` range.
+	IntegerPatternOutOfRange,
+	/// A leading `!` was not followed by `()`, `_`, or an effect name.
+	ExpectedEffect { found: EcoString },
+	/// Effect rows require `!` on every composed atom.
+	ExpectedEffectAfterPlus { found: EcoString },
+	/// External functions cannot use the generated async execution-frame ABI.
+	AsyncExternalFunction,
+	/// Managed bindings are lexical locals, not module or type members.
+	ManagedLetOutsideLocal,
 }
 
 impl ParseError {
@@ -154,6 +164,18 @@ impl IntoDiagnostic for ParseError {
 			E::MismatchedClosureLabels { outer, inner, .. } => {
 				format!("closure labels must match: `{outer}` and `{inner}` differ").into()
 			}
+			E::IntegerPatternOutOfRange => "signed integer pattern is out of range".into(),
+			E::ExpectedEffect { found } => {
+				format!("expected `()`, `_`, or an effect name after `!`, found {found}").into()
+			}
+			E::ExpectedEffectAfterPlus { found } => {
+				format!("expected an effect beginning with `!` after `+`, found {found}").into()
+			}
+			E::AsyncExternalFunction => {
+				"`external async func` is unsupported because external functions use the direct host ABI"
+					.into()
+			}
+			E::ManagedLetOutsideLocal => "`let use` is only allowed for lexical local bindings".into(),
 		}
 	}
 
@@ -184,6 +206,8 @@ pub enum LexError {
 	InvalidUnicodeCodePoint,
 	/// A `$N` closure parameter index did not fit in a `u8`.
 	ClosureIndexTooLarge,
+	/// An integer literal's magnitude cannot be represented by the source token model.
+	IntegerLiteralOutOfRange,
 }
 
 impl IntoDiagnostic for LexError {
@@ -201,6 +225,7 @@ impl IntoDiagnostic for LexError {
 			LexError::ClosureIndexTooLarge => {
 				"closure parameter index is too large, must be smaller than 256".into()
 			}
+			LexError::IntegerLiteralOutOfRange => "integer literal is out of range".into(),
 		}
 		.into()
 	}

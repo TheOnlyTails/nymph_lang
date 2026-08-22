@@ -13,11 +13,20 @@ pub(crate) struct BuildCommand {
 	/// Output path for the emitted JavaScript (defaults to `<input>.mjs`)
 	#[arg(short, long, value_name = "FILE")]
 	output: Option<PathBuf>,
+
+	/// Build with the release compiler profile.
+	#[arg(long)]
+	release: bool,
 }
 
 impl NymphCommand for BuildCommand {
 	fn run(&self, manifest: &ManifestSelection) -> i32 {
-		let operation = match ProjectOperation::resolve(self.file.as_deref(), manifest) {
+		let profile = if self.release {
+			nymph_compiler::BuildProfile::Release
+		} else {
+			nymph_compiler::BuildProfile::Development
+		};
+		let operation = match ProjectOperation::resolve(self.file.as_deref(), manifest, profile) {
 			Some(operation) => operation,
 			None => return 1,
 		};

@@ -7,6 +7,13 @@ export default defineConfig({
 	description: "A simple language that gets out of your way.",
 	cleanUrls: true,
 	lastUpdated: true,
+	// Planning evidence is linked from the repository but is not part of the
+	// public language manual. Excluding it also makes every built Markdown page
+	// intentionally reachable from nav/sidebar content rather than publishing
+	// orphan research pages.
+	srcExclude: ["research/**", "design/**", "superpowers/**", "agents/**", "adr/**"],
+	// Keep broken internal links fatal in `vitepress build`.
+	ignoreDeadLinks: false,
 	markdown: {
 		math: true,
 		lineNumbers: true,
@@ -68,7 +75,7 @@ export default defineConfig({
 					{ text: "Pattern Matching", link: "/pattern-matching/" },
 					{ text: "Operators", link: "/operators/" },
 					{ text: "Error Handling", link: "/error-handling/" },
-					{ text: "Mutability", link: "/mutability/" },
+					{ text: "Immutability and migration", link: "/mutability/" },
 					{ text: "Iteration", link: "/iteration/" },
 					{ text: "Standard Library", link: "/stdlib/" },
 				],

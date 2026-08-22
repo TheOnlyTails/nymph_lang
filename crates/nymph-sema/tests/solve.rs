@@ -168,8 +168,9 @@ fn pending_operator_finalization_is_declaration_order_independent() {
 	// diagnostics.
 	let a_then_b = format!(
 		"{PLUS}
+		 func defer<T>(): T = defer()
 		 func a<T: Plus<Other = T, Output = T>>(): T = {{
-		   let xs = #[]
+		   let xs = #[defer()]
 		   let y = xs[0u] + xs[0u]
 		   let z: T = xs[0u]
 		   y
@@ -178,9 +179,10 @@ fn pending_operator_finalization_is_declaration_order_independent() {
 	);
 	let b_then_a = format!(
 		"{PLUS}
+		 func defer<T>(): T = defer()
 		 func b(): int = 1
 		 func a<T: Plus<Other = T, Output = T>>(): T = {{
-		   let xs = #[]
+		   let xs = #[defer()]
 		   let y = xs[0u] + xs[0u]
 		   let z: T = xs[0u]
 		   y
@@ -561,36 +563,6 @@ fn bare_bounded_generic_inherent_method_value_enforces_its_obligation() {
 		 struct Box(value: int) { func apply<T: Area>(value: T): int = value.area() }
 		 func f(box: Box): int = { let apply = box.apply apply(1) }",
 		"does not implement `Area`",
-	);
-}
-
-#[test]
-fn mut_typed_argument_is_accepted_through_an_interface_impl_method_call() {
-	// `commit_method` (the interface-impl dispatch path) checks arguments via
-	// `unify_arg`, like the inherent-method path, so the one-way `mut T <: T`
-	// rule holds here too.
-	assert_ok(
-		"interface Adds { func plus(other: int): int }
-		 struct P(base: int)
-		 impl Adds for P { func plus(other: int): int = this.base + other }
-		 func f(): int = {
-		   let mut n = 1
-		   let p = P(base = 0)
-		   p.plus(n)
-		 }",
-	);
-}
-
-#[test]
-fn mut_typed_argument_is_accepted_through_a_generic_bound_method_call() {
-	// `resolve_param_method` (the generic-bound dispatch path) also checks
-	// arguments via `unify_arg`.
-	assert_ok(
-		"interface Adds { func plus(other: int): int }
-		 func f<T: Adds>(t: T): int = {
-		   let mut n = 1
-		   t.plus(n)
-		 }",
 	);
 }
 

@@ -64,14 +64,12 @@ fn can_left_bias_from(token: &Token) -> bool {
 			| Struct
 			| Enum
 			| Let
-			| Mut
 			| External
 			| Func
 			| Interface
 			| Impl
 			| Namespace
 			| For
-			| While
 			| If
 			| Else
 			| Match

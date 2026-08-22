@@ -11,12 +11,103 @@ use rustc_hash::FxHashMap;
 
 use super::{
 	ProjectDiagnostic,
-	resolve::resolve_import_target,
+	resolve::{ResolvedImportTarget, resolve_import_target},
 	session::{
-		AmbientCoreRegistryInput, BuiltinModuleDomain, BuiltinModuleInput, BuiltinModuleKey,
-		ModuleInput, ModulePath, ProjectInput, ProjectKey, SemanticModuleDomain, SemanticModuleInput,
+		AmbientCoreRegistryInput, BuiltinModuleDomain, BuiltinModuleInput, LintLevel, ModuleInput,
+		ModulePath, PackageId, ProjectInput, ProjectKey, ProjectPolicyInput, SemanticModuleDomain,
+		SemanticModuleInput,
 	},
 };
+
+#[salsa::tracked(returns(copy))]
+pub(crate) fn effective_lint_level(
+	db: &dyn Db,
+	policy: ProjectPolicyInput,
+	package: PackageId,
+	lint: Arc<str>,
+	default: LintLevel,
+) -> LintLevel {
+	if package != policy.root_package(db) {
+		return default;
+	}
+	policy
+		.lints(db)
+		.iter()
+		.find(|setting| setting.name == lint)
+		.map_or(default, |setting| setting.level)
+}
+
+fn apply_semantic_lint(
+	db: &dyn Db,
+	key: ProjectKey<'_>,
+	module: SemanticModuleInput,
+	mut diagnostic: Diagnostic,
+) -> Option<Diagnostic> {
+	let lint = match diagnostic.code.as_str() {
+		"managed-field" | "managed-child-capture" => diagnostic.code.clone(),
+		_ => return Some(diagnostic),
+	};
+	let SemanticModuleInput::Project(module) = module else {
+		return Some(diagnostic);
+	};
+	match effective_lint_level(
+		db,
+		key.policy_input(db),
+		module.package(db),
+		Arc::from(lint.as_str()),
+		LintLevel::Warn,
+	) {
+		LintLevel::Allow => None,
+		LintLevel::Warn => Some(diagnostic),
+		LintLevel::Deny => {
+			diagnostic.severity = nymph_diagnostics::Severity::Error;
+			Some(diagnostic)
+		}
+	}
+}
+
+#[salsa::tracked(returns(clone))]
+fn policy_project_diagnostics(
+	db: &dyn Db,
+	key: ProjectKey<'_>,
+) -> super::session::ProjectDiagnostics {
+	let policy = key.policy_input(db);
+	if policy.profile(db) != super::session::BuildProfile::Release {
+		return super::session::ProjectDiagnostics(Arc::new([]));
+	}
+	let root_package = policy.root_package(db);
+	let level = effective_lint_level(
+		db,
+		policy,
+		root_package.clone(),
+		Arc::from("echo-in-release"),
+		LintLevel::Warn,
+	);
+	if level == LintLevel::Allow {
+		return super::session::ProjectDiagnostics(Arc::new([]));
+	}
+	let mut diagnostics = Vec::new();
+	for module in key.project_input(db).active_modules(db).iter().copied() {
+		if module.package(db) != root_package {
+			continue;
+		}
+		let module_name = module.path(db).to_string();
+		for span in nymph_sema::query::echo_sites(&parse(db, module).tree) {
+			let message = "`echo` is erased from release builds";
+			let diagnostic = match level {
+				LintLevel::Allow => unreachable!(),
+				LintLevel::Warn => Diagnostic::warning("echo-in-release".into(), message, span),
+				LintLevel::Deny => Diagnostic::error("echo-in-release".into(), message, span),
+			}
+			.with_help("use `println` or telemetry for intentional release output");
+			diagnostics.push(ProjectDiagnostic {
+				module: module_name.clone(),
+				diag: diagnostic,
+			});
+		}
+	}
+	super::session::ProjectDiagnostics(diagnostics.into())
+}
 
 #[salsa::db]
 pub(crate) trait Db: salsa::Database {
@@ -98,7 +189,7 @@ fn ambient_runtime_role_inventory(
 	module: BuiltinModuleInput,
 ) -> Arc<nymph_sema::CompilerRuntimeRoles> {
 	use nymph_ast::decl::{Declaration, InterfaceElement, InterfaceMember};
-	use nymph_ast::ty::{GenericArg, Type};
+	use nymph_ast::ty::Type;
 	use nymph_sema::{DeclarationCategory as Category, DeclarationKey, DefinitionId};
 	let parsed = parse_builtin(db, module);
 	if !parsed.diagnostics.is_empty() {
@@ -118,22 +209,6 @@ fn ambient_runtime_role_inventory(
 				DeclarationKey::TopLevel { category, .. } if category == expected
 			))
 		.then_some(result)
-	};
-	let references_generic = |ty: &Type, target: &str, generic: &str| {
-		let Type::Reference { name, generics } = ty else {
-			return false;
-		};
-		name.0 == target
-			&& matches!(
-				generics.as_slice(),
-				[argument]
-					if argument.0.name.is_none()
-						&& matches!(
-							&argument.0,
-							GenericArg { value, .. }
-								if matches!(&value.0, Type::Reference { name, generics } if name.0 == generic && generics.is_empty())
-						)
-			)
 	};
 	let interface = |name: &str, member_name: &str| {
 		let owner = exact_top(name, Category::Interface)?;
@@ -177,18 +252,56 @@ fn ambient_runtime_role_inventory(
 						)
 				}
 				"Iterator" => {
-					matches!(generics.as_slice(), [generic] if generic.0.name.0 == "Item")
-						&& method
-							.return_type
-							.as_ref()
-							.is_some_and(|ty| references_generic(&ty.0, "Option", &generics[0].0.name.0))
+					matches!(
+						generics.as_slice(),
+						[item, effect]
+							if item.0.name.0 == "Item"
+								&& effect.0.kind == nymph_ast::ty::GenericParamKind::Effect
+					) && matches!(
+						method.return_type.as_ref().map(|ty| &ty.0),
+						Some(Type::Reference { name, generics: arguments })
+							if name.0 == "Iteration"
+								&& matches!(
+									arguments.as_slice(),
+									[item, next]
+										if matches!(item.0.value.as_type().map(|ty| &ty.0), Some(Type::Reference { name, generics }) if name.0 == "Item" && generics.is_empty())
+											&& matches!(next.0.value.as_type().map(|ty| &ty.0), Some(Type::SelfType))
+								)
+					)
 				}
 				"Iterable" => {
-					matches!(generics.as_slice(), [generic] if generic.0.name.0 == "T")
-						&& method
-							.return_type
-							.as_ref()
-							.is_some_and(|ty| references_generic(&ty.0, "Iterator", &generics[0].0.name.0))
+					matches!(
+						generics.as_slice(),
+						[item, effect]
+							if item.0.name.0 == "Item"
+								&& effect.0.kind == nymph_ast::ty::GenericParamKind::Effect
+					) && matches!(
+						method.return_type.as_ref().map(|ty| &ty.0),
+						Some(Type::Reference { name, generics: arguments })
+							if name.0 == "Iterator"
+								&& matches!(arguments.as_slice(), [item, effect]
+									if matches!(item.0.value.as_type().map(|ty| &ty.0), Some(Type::Reference { name, generics }) if name.0 == "Item" && generics.is_empty())
+										&& effect.0.value.as_effect().is_some())
+					)
+				}
+				"Close" => {
+					matches!(
+						generics.as_slice(),
+						[generic]
+							if generic.0.kind == nymph_ast::ty::GenericParamKind::Effect
+								&& method.return_type.as_ref().is_some_and(|ty| ty.0 == Type::Void)
+								&& method.effects.as_ref().is_some_and(|effects| {
+									matches!(
+										effects.0.effects.as_slice(),
+										[effect]
+											if matches!(
+												&effect.0,
+												nymph_ast::ty::Effect::Named(name)
+													if name.0 == generic.0.name.0
+											)
+									)
+								})
+					)
 				}
 				_ => false,
 			};
@@ -259,6 +372,62 @@ fn ambient_runtime_role_inventory(
 			),
 		})
 	})();
+	let iteration = (|| {
+		let owner = exact_top("Iteration", Category::Enum)?;
+		let mut enums = parsed
+			.tree
+			.members
+			.iter()
+			.filter_map(|declaration| match declaration {
+				Declaration::Enum {
+					name,
+					generics,
+					variants,
+					..
+				} if name.0 == "Iteration" => Some((generics, variants)),
+				_ => None,
+			});
+		let (generics, variants) = enums.next()?;
+		if enums.next().is_some() || generics.len() != 2 {
+			return None;
+		}
+		let done = variants
+			.iter()
+			.find(|variant| variant.0.name.0 == "Done" && variant.0.fields.is_empty())?;
+		let yield_ = variants.iter().find(|variant| {
+			variant.0.name.0 == "Yield"
+				&& matches!(variant.0.fields.as_slice(), [item, next]
+					if item.0.name.0 == "item" && next.0.name.0 == "next")
+		})?;
+		let yield_id = DefinitionId::new(
+			identity.clone(),
+			DeclarationKey::member(owner.clone(), Category::Variant, "Yield"),
+		);
+		Some(nymph_sema::IterationRuntimeRole {
+			iteration: owner.clone(),
+			done: DefinitionId::new(
+				identity.clone(),
+				DeclarationKey::member(owner, Category::Variant, &done.0.name.0),
+			),
+			yield_item: DefinitionId::new(
+				identity.clone(),
+				DeclarationKey::member(
+					yield_id.clone(),
+					Category::Field,
+					&yield_.0.fields[0].0.name.0,
+				),
+			),
+			yield_next: DefinitionId::new(
+				identity.clone(),
+				DeclarationKey::member(
+					yield_id.clone(),
+					Category::Field,
+					&yield_.0.fields[1].0.name.0,
+				),
+			),
+			yield_: yield_id,
+		})
+	})();
 	let result = (|| {
 		let owner = exact_top("Result", Category::Enum)?;
 		let mut enums = parsed
@@ -324,6 +493,8 @@ fn ambient_runtime_role_inventory(
 		debug: interface("Debug", "debug"),
 		iterable: interface("Iterable", "iter"),
 		iterator: interface("Iterator", "next"),
+		iteration,
+		close: interface("Close", "close"),
 		option,
 		result,
 	})
@@ -350,11 +521,15 @@ pub(crate) fn compiler_runtime_roles(
 		module("option").and_then(|module| ambient_runtime_role_inventory(db, module).option.clone());
 	let result =
 		module("result").and_then(|module| ambient_runtime_role_inventory(db, module).result.clone());
+	let iteration =
+		module("iter").and_then(|module| ambient_runtime_role_inventory(db, module).iteration.clone());
 	Arc::new(nymph_sema::CompilerRuntimeRoles {
 		display: interface("ops", |roles| &roles.display),
 		debug: interface("ops", |roles| &roles.debug),
 		iterable: interface("iter/iterable", |roles| &roles.iterable),
 		iterator: interface("iter", |roles| &roles.iterator),
+		iteration,
+		close: interface("ops", |roles| &roles.close),
 		option,
 		result,
 	})
@@ -368,7 +543,7 @@ pub struct ParsedModule {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DirectImport {
-	pub target: Result<String, Diagnostic>,
+	pub target: Result<ResolvedImportTarget, Diagnostic>,
 	pub span: Span,
 	pub namespace: Ident,
 	pub has_with_list: bool,
@@ -496,6 +671,59 @@ fn insert_import_binding(
 	true
 }
 
+fn resolved_import_module(
+	db: &dyn Db,
+	key: ProjectKey<'_>,
+	owner: SemanticModuleInput,
+	target: &ResolvedImportTarget,
+) -> Option<SemanticModuleInput> {
+	match target {
+		ResolvedImportTarget::ImportableStd(path) => key
+			.builtin_registry(db)
+			.modules(db)
+			.iter()
+			.copied()
+			.find(|module| module.key(db).path.as_ref() == path)
+			.map(SemanticModuleInput::Builtin),
+		ResolvedImportTarget::CurrentPackage(path) => match owner {
+			SemanticModuleInput::Project(module) => key
+				.project_input(db)
+				.active_modules(db)
+				.iter()
+				.copied()
+				.find(|candidate| {
+					candidate.package(db) == module.package(db) && candidate.path(db).as_str() == path
+				})
+				.map(SemanticModuleInput::Project),
+			SemanticModuleInput::Builtin(_) => key
+				.builtin_registry(db)
+				.modules(db)
+				.iter()
+				.copied()
+				.find(|module| module.key(db).path.as_ref() == path)
+				.map(SemanticModuleInput::Builtin),
+		},
+		ResolvedImportTarget::Package { alias, path } => {
+			let SemanticModuleInput::Project(module) = owner else {
+				return None;
+			};
+			let project = key.project_input(db);
+			let package = project
+				.package_aliases(db)
+				.iter()
+				.find(|edge| edge.owner == module.package(db) && edge.name.as_ref() == alias)?
+				.target
+				.clone();
+			project
+				.active_modules(db)
+				.iter()
+				.copied()
+				.find(|candidate| candidate.package(db) == package && candidate.path(db).as_str() == path)
+				.map(SemanticModuleInput::Project)
+		}
+	}
+}
+
 #[salsa::tracked(returns(clone))]
 pub(crate) fn resolved_module_imports<'db>(
 	db: &'db dyn Db,
@@ -530,18 +758,19 @@ pub(crate) fn resolved_module_imports<'db>(
 		let Ok(target_key) = &import.target else {
 			continue;
 		};
-		let Some(target) = direct
-			.iter()
-			.copied()
-			.find(|candidate| candidate.display_key(db) == *target_key)
+		let Some(target) =
+			resolved_import_module(db, key, module, target_key).filter(|target| direct.contains(target))
 		else {
 			continue;
 		};
 		let identity = target.identity(db);
+		let current_identity = module.identity(db);
 		let summary = namespace_summary(db, key, target);
 		let namespace = import.namespace.0.clone();
 		let namespace_matches_export = summary.declaration(&namespace).is_some_and(|declaration| {
-			declaration.visibility == nymph_sema::NamespaceVisibility::Importable
+			declaration
+				.visibility
+				.allows(&summary.module, &current_identity)
 		}) && (!import.has_with_list
 			|| import.with_idents.iter().any(|(source, alias)| {
 				source.0 == namespace && alias.as_ref().unwrap_or(source).0 == namespace
@@ -584,7 +813,9 @@ pub(crate) fn resolved_module_imports<'db>(
 				.iter()
 				.enumerate()
 				.filter(|(index, declaration)| {
-					declaration.visibility == nymph_sema::NamespaceVisibility::Importable
+					declaration
+						.visibility
+						.allows(&summary.module, &current_identity)
 						&& !summary.declarations[index + 1..]
 							.iter()
 							.any(|later| later.name == declaration.name)
@@ -602,7 +833,9 @@ pub(crate) fn resolved_module_imports<'db>(
 		for (source, local, span, written_spans) in selected {
 			match summary.declaration(&source) {
 				Some(declaration)
-					if declaration.visibility == nymph_sema::NamespaceVisibility::Importable =>
+					if declaration
+						.visibility
+						.allows(&summary.module, &current_identity) =>
 				{
 					if insert_import_binding(
 						&mut bindings,
@@ -655,18 +888,25 @@ impl SemanticModuleInput {
 
 	pub(crate) fn display_key(self, db: &dyn Db) -> String {
 		match self {
-			Self::Project(module) => module.path(db).to_string(),
+			Self::Project(module) if module.package(db).is_root() => module.path(db).to_string(),
+			Self::Project(module) => {
+				format!(
+					"package::{}::{}",
+					module.package(db).node(),
+					module.path(db)
+				)
+			}
 			Self::Builtin(module) => format!("std::{}", module.key(db).path),
 		}
 	}
 
 	pub(crate) fn identity(self, db: &dyn Db) -> nymph_sema::ModuleIdentity {
 		match self {
-			Self::Project(module) => nymph_sema::ModuleIdentity {
-				origin: nymph_sema::ModuleOrigin::Project(module.project(db).as_str().into()),
-				project: module.project(db).as_str().into(),
-				path: module.path(db).as_str().into(),
-			},
+			Self::Project(module) => nymph_sema::ModuleIdentity::resolved_project(
+				module.project(db).as_str(),
+				module.package(db).node(),
+				module.path(db).as_str(),
+			),
 			Self::Builtin(module) => nymph_sema::ModuleIdentity {
 				origin: match module.key(db).domain {
 					BuiltinModuleDomain::ImportableStd => nymph_sema::ModuleOrigin::ImportableStd,
@@ -859,6 +1099,7 @@ pub(crate) fn project_dependency_graph(
 	let active: BTreeMap<ModulePath, ModuleInput> = project
 		.active_modules(db)
 		.iter()
+		.filter(|module| module.package(db).is_root())
 		.map(|module| (module.path(db), *module))
 		.collect();
 	let direct = active
@@ -867,6 +1108,9 @@ pub(crate) fn project_dependency_graph(
 			let mut dependencies = Vec::new();
 			for import in direct_imports(db, *module).iter() {
 				let Ok(target) = &import.target else {
+					continue;
+				};
+				let Some(target) = target.current_package_path() else {
 					continue;
 				};
 				let Ok(target) = ModulePath::new(target) else {
@@ -1088,7 +1332,10 @@ fn ambient_core_graph(
 		let mut valid = true;
 		for import in ambient_core_direct_imports(db, module).iter() {
 			if let Ok(target) = &import.target {
-				if let Some(child) = modules.get(target.as_str()) {
+				if let Some(child) = target
+					.current_package_path()
+					.and_then(|path| modules.get(path))
+				{
 					valid &= visit(db, *child, modules, marks, stack, order, diagnostics);
 				} else {
 					diagnostics.push(Diagnostic::error(
@@ -1168,12 +1415,11 @@ pub(crate) fn ambient_core_analysis(
 		let mut bindings = FxHashMap::default();
 		for import in ambient_core_direct_imports(db, module).iter() {
 			let Ok(target) = &import.target else { continue };
-			let Some(dependency) = graph
-				.order
-				.iter()
-				.copied()
-				.find(|input| input.key(db).path.as_ref() == target.as_str())
-			else {
+			let Some(dependency) = graph.order.iter().copied().find(|input| {
+				target
+					.current_package_path()
+					.is_some_and(|path| input.key(db).path.as_ref() == path)
+			}) else {
 				continue;
 			};
 			let identity = ambient_identity(db, dependency);
@@ -1775,8 +2021,16 @@ fn declaration_name(definition: &nymph_sema::DefinitionId) -> Option<&str> {
 	}
 }
 
-pub(crate) fn repl_module_tag(path: &str) -> String {
-	path
+pub(crate) fn repl_module_tag(module: &nymph_sema::ModuleIdentity) -> String {
+	let key = match &module.origin {
+		nymph_sema::ModuleOrigin::Project(_) => module.path.to_string(),
+		nymph_sema::ModuleOrigin::ResolvedPackage { node } => {
+			format!("package::{node}::{}", module.path)
+		}
+		nymph_sema::ModuleOrigin::ImportableStd => format!("std::{}", module.path),
+		nymph_sema::ModuleOrigin::Compiler => format!("compiler::{}", module.path),
+	};
+	key
 		.as_bytes()
 		.iter()
 		.map(|byte| format!("{byte:02x}"))
@@ -1816,7 +2070,7 @@ pub(crate) fn binding_name<'db>(
 			definition: definition.clone(),
 		})?;
 	let tag = if key.mode(db) == nymph_sema::EntryMode::Repl {
-		repl_module_tag(&definition.module.path)
+		repl_module_tag(&definition.module)
 	} else {
 		tag.to_string()
 	};
@@ -1877,7 +2131,6 @@ fn primitive_header_tag(ty: &nymph_sema::HeaderType) -> Option<&'static str> {
 		HeaderType::Void => Some("void"),
 		HeaderType::List(_) | HeaderType::Tuple(_) => Some("list"),
 		HeaderType::Map(..) => Some("map"),
-		HeaderType::Mutable(inner) => primitive_header_tag(inner),
 		_ => None,
 	}
 }
@@ -2007,9 +2260,16 @@ pub(crate) fn module_specifier<'db>(
 		module: module.clone(),
 	})?;
 	Ok(match owner.domain(db) {
-		SemanticModuleDomain::Project => nymph_sema::CanonicalModuleSpecifier::Project(module.path),
+		SemanticModuleDomain::Project => {
+			nymph_sema::CanonicalModuleSpecifier::Project(match module.origin {
+				nymph_sema::ModuleOrigin::ResolvedPackage { node } => {
+					format!("package::{node}::{}", module.path).into()
+				}
+				_ => module.path,
+			})
+		}
 		SemanticModuleDomain::ImportableStd => {
-			nymph_sema::CanonicalModuleSpecifier::Importable(module.path)
+			nymph_sema::CanonicalModuleSpecifier::Importable(format!("std::{}", module.path).into())
 		}
 		SemanticModuleDomain::AmbientCore => nymph_sema::CanonicalModuleSpecifier::CompilerRuntime(
 			format!("@nymph/runtime/{}", module.path).into(),
@@ -2106,6 +2366,19 @@ pub(crate) fn lower_runtime_definition<'db>(
 	nymph_sema::lower_runtime_definition(&context, artifact).map(Arc::new)
 }
 
+fn collect_unresolved_runtime_calls(
+	execution: &nymph_sema::RuntimeExecutionSummary,
+	calls: &mut Vec<nymph_sema::UnresolvedRuntimeCall>,
+) {
+	calls.extend(execution.unresolved_calls().iter().cloned());
+	if let Some(invocation) = execution.invocation() {
+		collect_unresolved_runtime_calls(invocation, calls);
+	}
+	for closure in execution.closures() {
+		collect_unresolved_runtime_calls(closure, calls);
+	}
+}
+
 #[salsa::tracked(returns(clone))]
 pub(crate) fn lower_interface_module<'db>(
 	db: &'db dyn Db,
@@ -2170,6 +2443,7 @@ pub(crate) fn lower_interface_module<'db>(
 		.collect::<std::collections::VecDeque<_>>();
 	let mut seen = std::collections::HashSet::new();
 	let mut lowered: Vec<nymph_sema::LoweredRuntimeDefinition> = Vec::new();
+	let mut unresolved_calls = Vec::new();
 	while let Some(definition) = queue.pop_front() {
 		if !seen.insert(definition.clone()) {
 			continue;
@@ -2209,17 +2483,15 @@ pub(crate) fn lower_interface_module<'db>(
 			}
 		}
 		queue.extend(fragment.demands().iter().cloned());
-		// An Iterable implementation may intentionally erase its concrete return
-		// type behind Iterator. Once its body demands the exact iterator shell,
-		// resolve any deferred `next` call against that shell rather than widening
-		// the closure to every Iterator implementation.
-		for call in lowered
-			.iter()
-			.flat_map(|item| item.unresolved_calls())
-			.chain(fragment.unresolved_calls())
-		{
-			let nymph_sema::UnresolvedRuntimeCall::IteratorNext { interface, member } = call else {
-				continue;
+		// A generic implementation may call a bound member whose concrete owner is
+		// known only from the demand closure. Resolve those calls against every
+		// demanded shell; the shell and call may enter the queue in either order.
+		collect_unresolved_runtime_calls(fragment.execution_summary(), &mut unresolved_calls);
+		for call in &unresolved_calls {
+			let (interface, member) = match call {
+				nymph_sema::UnresolvedRuntimeCall::GenericDispatch { interface, member }
+				| nymph_sema::UnresolvedRuntimeCall::IteratorNext { interface, member } => (interface, member),
+				_ => continue,
 			};
 			let request = nymph_sema::StableShapeRequest::ImplementationsForInterface(interface.clone());
 			let Ok(nymph_sema::StableShapeFact::Implementations(implementations)) =
@@ -2228,12 +2500,12 @@ pub(crate) fn lower_interface_module<'db>(
 				continue;
 			};
 			for implementation in implementations {
-				if matches!(
+				let owner_is_demanded = matches!(
 					&implementation.self_type,
 					nymph_sema::InterfaceType::Named { definition: owner, .. }
-						if owner == &definition
-				) && let Some(slot) = implementation.member_slots.target(&member)
-				{
+						if seen.contains(owner)
+				);
+				if owner_is_demanded && let Some(slot) = implementation.member_slots.target(member) {
 					queue.push_back(slot.member_id.clone());
 				}
 			}
@@ -2469,7 +2741,11 @@ pub(crate) fn interface_module_analysis<'db>(
 				.find(|dependency| dependency.identity(db) == access.module)?;
 			let summary = namespace_summary(db, key, dependency);
 			Some(match summary.declaration(&access.member) {
-				Some(declaration) if declaration.visibility == nymph_sema::NamespaceVisibility::Private => {
+				Some(declaration)
+					if !declaration
+						.visibility
+						.allows(&summary.module, &module.identity(db)) =>
+				{
 					ImportDiagnosticCause::PrivateNamespaceMember {
 						declaration: declaration.clone(),
 						span: access.span,
@@ -2488,6 +2764,7 @@ pub(crate) fn interface_module_analysis<'db>(
 			.diagnostics
 			.iter()
 			.cloned()
+			.filter_map(|diag| apply_semantic_lint(db, key, module, diag))
 			.map(|diag| ProjectDiagnostic {
 				module: module.display_key(db),
 				diag,
@@ -2722,26 +2999,35 @@ pub(crate) fn interface_project_diagnostics<'db>(
 	db: &'db dyn Db,
 	key: super::session::ProjectKey<'db>,
 ) -> super::session::ProjectDiagnostics {
+	let policy_diagnostics = policy_project_diagnostics(db, key);
 	let graph = project_graph(db, key);
 	if !graph.diagnostics.is_empty() {
 		let mut diagnostics = graph.diagnostics.iter().cloned().collect::<Vec<_>>();
-		// A name-preserving project is the standalone facade. Preserve its
-		// long-standing recovery contract by checking the parser's recovered AST
-		// after reporting parse diagnostics, rather than aborting at graph build.
-		if key.preserve_names(db)
-			&& key.project_input(db).project(db).as_str() == super::FACADE_PROJECT
-			&& let Some(entry) = key
-				.project_input(db)
-				.active_modules(db)
-				.iter()
-				.find(|module| module.path(db) == key.entry(db))
-		{
-			diagnostics.extend(
-				interface_module_diagnostics(db, key, SemanticModuleInput::Project(*entry))
+		// Graph roots remain first. Then check valid dependencies and modules
+		// recovered solely from parser errors in dependency order.
+		for (module, _) in graph.semantic_direct.iter() {
+			let parsed = module.parsed(db);
+			let valid = graph.semantic_order.contains(module);
+			let parser_recovered = parsed.diagnostics.iter().any(Diagnostic::is_error)
+				&& graph
+					.diagnostics
 					.iter()
-					.cloned(),
-			);
+					.filter(|diagnostic| diagnostic.module == module.display_key(db))
+					.all(|diagnostic| parsed.diagnostics.contains(&diagnostic.diag))
+				&& graph
+					.semantic_direct_dependencies(*module)
+					.iter()
+					.all(|dependency| graph.semantic_order.contains(dependency));
+			if !valid && !parser_recovered {
+				continue;
+			}
+			for diagnostic in interface_module_diagnostics(db, key, *module).iter() {
+				if !diagnostics.contains(diagnostic) {
+					diagnostics.push(diagnostic.clone());
+				}
+			}
 		}
+		diagnostics.extend(policy_diagnostics.0.iter().cloned());
 		return super::session::ProjectDiagnostics(diagnostics.into());
 	}
 	// Native cold builds evaluate independent branches through cloned Salsa handles.
@@ -2766,6 +3052,7 @@ pub(crate) fn interface_project_diagnostics<'db>(
 				.cloned(),
 		);
 	}
+	all.extend(policy_diagnostics.0.iter().cloned());
 	let diagnostics = all.into();
 	super::session::ProjectDiagnostics(diagnostics)
 }
@@ -2782,10 +3069,11 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 
 	struct Walker<'a> {
 		db: &'a dyn Db,
-		active: &'a BTreeMap<ModulePath, ModuleInput>,
-		builtins: &'a BTreeMap<BuiltinModuleKey, BuiltinModuleInput>,
-		colors: BTreeMap<String, Color>,
-		stack: Vec<String>,
+		active: &'a BTreeMap<(PackageId, ModulePath), ModuleInput>,
+		builtins: &'a BTreeMap<Arc<str>, BuiltinModuleInput>,
+		aliases: &'a BTreeMap<(PackageId, Arc<str>), PackageId>,
+		colors: FxHashMap<SemanticModuleInput, Color>,
+		stack: Vec<SemanticModuleInput>,
 		order: Vec<ModuleInput>,
 		direct: Vec<(ModuleInput, Arc<[ModuleInput]>)>,
 		semantic_order: Vec<SemanticModuleInput>,
@@ -2801,15 +3089,76 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 			});
 		}
 
-		fn visit(&mut self, path: &str, import_site: Option<(&str, Span)>) -> bool {
-			match self.colors.get(path) {
+		fn resolve_target(
+			&self,
+			owner: SemanticModuleInput,
+			target: &ResolvedImportTarget,
+		) -> Option<SemanticModuleInput> {
+			match target {
+				ResolvedImportTarget::ImportableStd(path) => self
+					.builtins
+					.get(path.as_str())
+					.copied()
+					.map(SemanticModuleInput::Builtin),
+				ResolvedImportTarget::CurrentPackage(path) => match owner {
+					SemanticModuleInput::Project(module) => self
+						.active
+						.get(&(
+							module.package(self.db),
+							ModulePath::new(path).expect("resolved current-package path is canonical"),
+						))
+						.copied()
+						.map(SemanticModuleInput::Project),
+					SemanticModuleInput::Builtin(_) => self
+						.builtins
+						.get(path.as_str())
+						.copied()
+						.map(SemanticModuleInput::Builtin),
+				},
+				ResolvedImportTarget::Package { alias, path } => {
+					let SemanticModuleInput::Project(module) = owner else {
+						return None;
+					};
+					let package = self
+						.aliases
+						.get(&(module.package(self.db), Arc::from(alias.as_str())))?;
+					self
+						.active
+						.get(&(
+							package.clone(),
+							ModulePath::new(path).expect("resolved package path is canonical"),
+						))
+						.copied()
+						.map(SemanticModuleInput::Project)
+				}
+			}
+		}
+
+		fn target_label(target: &ResolvedImportTarget) -> String {
+			match target {
+				ResolvedImportTarget::CurrentPackage(path) => path.clone(),
+				ResolvedImportTarget::Package { alias, path } => format!("{alias}/{path}"),
+				ResolvedImportTarget::ImportableStd(path) => format!("std/{path}"),
+			}
+		}
+
+		fn visit(&mut self, module: SemanticModuleInput) -> bool {
+			let display = module.display_key(self.db);
+			match self.colors.get(&module) {
 				Some(Color::Black) => return true,
 				Some(Color::Gray) => {
-					let start = self.stack.iter().position(|item| item == path).unwrap_or(0);
-					let mut cycle = self.stack[start..].to_vec();
-					cycle.push(path.to_string());
+					let start = self
+						.stack
+						.iter()
+						.position(|item| *item == module)
+						.unwrap_or(0);
+					let mut cycle = self.stack[start..]
+						.iter()
+						.map(|item| item.display_key(self.db))
+						.collect::<Vec<_>>();
+					cycle.push(display.clone());
 					self.diagnostic(
-						path,
+						&display,
 						Diagnostic::error(
 							"IMPORT-CYCLE".into(),
 							format!("import cycle detected: {}", cycle.join(" -> ")),
@@ -2820,110 +3169,65 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 				}
 				None => {}
 			}
-			self.colors.insert(path.to_string(), Color::Gray);
-			self.stack.push(path.to_string());
+			self.colors.insert(module, Color::Gray);
+			self.stack.push(module);
 
-			let builtin = path
-				.strip_prefix(super::resolve::STD_KEY_PREFIX)
-				.and_then(|stripped| {
-					self
-						.builtins
-						.get(&BuiltinModuleKey {
-							domain: BuiltinModuleDomain::ImportableStd,
-							path: Arc::from(stripped),
-						})
-						.copied()
-				});
-			let project = ModulePath::new(path)
-				.ok()
-				.and_then(|module_path| self.active.get(&module_path).copied());
-			if builtin.is_none() && project.is_none() {
-				let (blame, span) = import_site.unwrap_or((path, Span::new(0, 0)));
-				self.diagnostic(
-					blame,
-					Diagnostic::error(
-						"IMPORT-UNRESOLVED".into(),
-						format!("module `{path}` could not be resolved (no source file found)"),
-						span,
-					),
-				);
-				self.colors.insert(path.to_string(), Color::Black);
-				self.stack.pop();
-				return false;
-			}
-
-			let parsed = builtin
-				.map(|module| parse_builtin(self.db, module))
-				.unwrap_or_else(|| parse(self.db, project.unwrap()));
+			let parsed = module.parsed(self.db);
 			let mut ok = true;
 			for diag in parsed.diagnostics.iter().filter(|diag| diag.is_error()) {
-				self.diagnostic(path, diag.clone());
+				self.diagnostic(&display, diag.clone());
 				ok = false;
 			}
-			let imports = builtin
-				.map(|module| builtin_direct_imports(self.db, module))
-				.unwrap_or_else(|| direct_imports(self.db, project.unwrap()));
+			let imports = module.imports(self.db);
 			let mut handles = Vec::new();
 			let mut semantic_handles = Vec::new();
+			let mut unresolved_targets = Vec::new();
 			for import in imports.iter() {
 				match &import.target {
 					Ok(target) => {
-						let semantic_handle = target
-							.strip_prefix(super::resolve::STD_KEY_PREFIX)
-							.and_then(|path| {
-								self
-									.builtins
-									.get(&BuiltinModuleKey {
-										domain: BuiltinModuleDomain::ImportableStd,
-										path: Arc::from(path),
-									})
-									.copied()
-							})
-							.map(SemanticModuleInput::Builtin)
-							.or_else(|| {
-								ModulePath::new(target)
-									.ok()
-									.and_then(|path| self.active.get(&path).copied())
-									.map(SemanticModuleInput::Project)
-							});
-						if let Some(handle) = semantic_handle
-							&& !semantic_handles.contains(&handle)
-						{
+						let Some(handle) = self.resolve_target(module, target) else {
+							if !unresolved_targets.contains(target) {
+								unresolved_targets.push(target.clone());
+								let label = Self::target_label(target);
+								self.diagnostic(
+									&display,
+									Diagnostic::error(
+										"IMPORT-UNRESOLVED".into(),
+										format!("module `{label}` could not be resolved (no source file found)"),
+										import.span,
+									),
+								);
+							}
+							ok = false;
+							continue;
+						};
+						if !semantic_handles.contains(&handle) {
 							semantic_handles.push(handle);
 						}
-						if !target.starts_with(super::resolve::STD_KEY_PREFIX) {
-							let target_path =
-								ModulePath::new(target).expect("resolved local import is canonical");
-							if let Some(handle) = self.active.get(&target_path)
-								&& !handles.contains(handle)
-							{
-								handles.push(*handle);
-							}
+						if let SemanticModuleInput::Project(project) = handle
+							&& !handles.contains(&project)
+						{
+							handles.push(project);
 						}
-						let child_ok = self.visit(target, Some((path, import.span)));
+						let child_ok = self.visit(handle);
 						ok = ok && child_ok;
 					}
 					Err(diag) => {
-						self.diagnostic(path, diag.clone());
+						self.diagnostic(&display, diag.clone());
 						ok = false;
 					}
 				}
 			}
-			if let Some(module) = project {
-				self.direct.push((module, handles.into()));
+			if let SemanticModuleInput::Project(project) = module {
+				self.direct.push((project, handles.into()));
 			}
-			let semantic = builtin
-				.map(SemanticModuleInput::Builtin)
-				.unwrap_or_else(|| SemanticModuleInput::Project(project.unwrap()));
-			self
-				.semantic_direct
-				.push((semantic, semantic_handles.into()));
-			self.colors.insert(path.to_string(), Color::Black);
+			self.semantic_direct.push((module, semantic_handles.into()));
+			self.colors.insert(module, Color::Black);
 			self.stack.pop();
 			if ok {
-				self.semantic_order.push(semantic);
-				if let Some(module) = project {
-					self.order.push(module);
+				self.semantic_order.push(module);
+				if let SemanticModuleInput::Project(project) = module {
+					self.order.push(project);
 				}
 			}
 			ok
@@ -2931,22 +3235,33 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 	}
 
 	let project_input: ProjectInput = key.project_input(db);
-	let active: BTreeMap<ModulePath, ModuleInput> = project_input
+	let active: BTreeMap<(PackageId, ModulePath), ModuleInput> = project_input
 		.active_modules(db)
 		.iter()
-		.map(|module| (module.path(db).clone(), *module))
+		.map(|module| ((module.package(db), module.path(db)), *module))
 		.collect();
-	let builtins: BTreeMap<BuiltinModuleKey, BuiltinModuleInput> = key
+	let builtins: BTreeMap<Arc<str>, BuiltinModuleInput> = key
 		.builtin_registry(db)
 		.modules(db)
 		.iter()
-		.map(|module| (module.key(db), *module))
+		.map(|module| (module.key(db).path, *module))
 		.collect();
+	let aliases = project_input
+		.package_aliases(db)
+		.iter()
+		.map(|alias| {
+			(
+				(alias.owner.clone(), alias.name.clone()),
+				alias.target.clone(),
+			)
+		})
+		.collect::<BTreeMap<_, _>>();
 	let mut walker = Walker {
 		db,
 		active: &active,
 		builtins: &builtins,
-		colors: BTreeMap::new(),
+		aliases: &aliases,
+		colors: FxHashMap::default(),
 		stack: Vec::new(),
 		order: Vec::new(),
 		direct: Vec::new(),
@@ -2954,7 +3269,20 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 		semantic_direct: Vec::new(),
 		diagnostics: Vec::new(),
 	};
-	walker.visit(key.entry(db).as_str(), None);
+	let entry_package = PackageId::root(project_input.project(db));
+	if let Some(entry) = active.get(&(entry_package, key.entry(db))).copied() {
+		walker.visit(SemanticModuleInput::Project(entry));
+	} else {
+		let entry = key.entry(db).to_string();
+		walker.diagnostic(
+			&entry,
+			Diagnostic::error(
+				"IMPORT-UNRESOLVED".into(),
+				format!("module `{entry}` could not be resolved (no source file found)"),
+				Span::new(0, 0),
+			),
+		);
+	}
 	Arc::new(ProjectGraph {
 		order: walker.order.into(),
 		direct: walker.direct.into(),
@@ -2971,7 +3299,7 @@ mod tests {
 	use salsa::Setter;
 
 	use super::*;
-	use crate::project::session::{BuiltinRegistryInput, ProjectId};
+	use crate::project::session::{BuiltinModuleKey, BuiltinRegistryInput, ProjectId};
 
 	#[salsa::db]
 	#[derive(Clone)]
@@ -3009,6 +3337,7 @@ mod tests {
 				binders: Vec::new(),
 				constraints: Vec::new(),
 				fields: Vec::new(),
+				defaults: Vec::new(),
 			}),
 		};
 
@@ -3050,14 +3379,19 @@ mod tests {
 			storage: salsa::Storage::default(),
 		};
 		let project = ProjectId::new("graph-regression");
+		let root_package = super::super::session::PackageId::root(project.clone());
 		let modules: Arc<[ModuleInput]> = files
 			.iter()
 			.map(|(path, source)| {
 				ModuleInput::new(
 					&db,
 					project.clone(),
+					root_package.clone(),
 					ModulePath::new(path).unwrap(),
 					Some(Arc::from(*source)),
+					Arc::from(format!("{path}.nym")),
+					None,
+					nymph_diagnostics::SourceVersion(1),
 				)
 			})
 			.collect::<Vec<_>>()
@@ -3076,12 +3410,19 @@ mod tests {
 			})
 			.collect::<Vec<_>>()
 			.into();
-		let input = ProjectInput::new(&db, project, modules);
+		let policy = ProjectPolicyInput::new(
+			&db,
+			PackageId::root(project.clone()),
+			crate::project::BuildProfile::Development,
+			Arc::new([]),
+		);
+		let input = ProjectInput::new(&db, project, modules, Arc::new([]));
 		let registry = BuiltinRegistryInput::new(&db, builtin_modules);
 		let ambient = AmbientCoreRegistryInput::new(&db, Arc::new([]));
 		let key = ProjectKey::new(
 			&db,
 			input,
+			policy,
 			registry,
 			ambient,
 			ModulePath::new("main").unwrap(),
@@ -3137,7 +3478,7 @@ mod tests {
 		let mixed = graph_diagnostics(&[("main", "import pkg/nope\nimport @/missing")]);
 		assert_eq!(
 			mixed.iter().map(|item| item.1.as_str()).collect::<Vec<_>>(),
-			["IMPORT-PACKAGE-UNSUPPORTED", "IMPORT-UNRESOLVED"]
+			["IMPORT-UNRESOLVED", "IMPORT-UNRESOLVED"]
 		);
 
 		let duplicate = graph_diagnostics(&[("main", "import @/missing\nimport @/missing")]);

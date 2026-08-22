@@ -229,7 +229,7 @@ fn local_option_collision_cannot_replace_the_ambient_iteration_role() {
 		project.clone(),
 		main.clone(),
 		"enum Option<T> { Bogus(value: T) }
-		 func consume<T: Iterator<Item = int>>(items: mut T): void = {
+		 func consume<T: Iterator<Item = int>>(items: T): void = {
 		   for (_item in items) {}
 		 }"
 		.into(),
@@ -249,11 +249,9 @@ fn same_named_method_on_an_earlier_bound_cannot_replace_iterator_next() {
 	session.set_source(
 		project.clone(),
 		main.clone(),
-		"interface Pretender { mut func next(): Option<string> }
-		 func consume<T: Pretender + Iterator<Item = int>>(items: mut T): int = {
-		   let mut result = 0
-		   for (item in items) { result = item }
-		   result
+		"interface Pretender { func next(): string }
+		 func consume<T: Pretender + Iterator<Item = int>>(items: T): void = {
+		   for (item in items) { let result: int = item }
 		 }"
 		.into(),
 		SourceVersion(1),

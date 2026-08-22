@@ -40,7 +40,7 @@ generated program and shared by every reference.
 ## Complex numbers and powers
 
 `import std/math/complex with (Complex)` provides the canonical
-`Complex(real: float, imaginary: float)` type. It supports addition,
+`Complex.new(real: float, imaginary: float)` constructs a complex number. It supports addition,
 subtraction, multiplication, division, negation, conjugation, magnitude, and
 the exact scalar exponentiation matrix documented under
 [Operators](../operators#exponentiation). The same import supplies the real

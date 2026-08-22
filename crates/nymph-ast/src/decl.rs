@@ -24,7 +24,7 @@ pub enum Declaration {
 		alias: Option<Ident>,
 		idents: Option<Vec<(Ident, Option<Ident>)>>,
 	},
-	/// `let x = 1`, `public let mut count: int = 0`
+	/// `let x = 1`, `public let count: int = 0`
 	Let {
 		visibility: Option<Visibility>,
 		meta: LetDeclaration,
@@ -32,6 +32,11 @@ pub enum Declaration {
 	},
 	/// `external(js_name) let max_float: float`
 	ExternalLet(Option<Visibility>, EcoString, LetDeclaration),
+	/// `effect Database`
+	Effect {
+		visibility: Option<Visibility>,
+		name: Ident,
+	},
 	/// `func add(a: int, b: int): int = a + b`
 	Func {
 		visibility: Option<Visibility>,
@@ -46,8 +51,8 @@ pub enum Declaration {
 		meta: TypeAliasDeclaration,
 		value: Spanned<Type>,
 	},
-	/// A product type. Its body splits into flat [`ImplMember`]s (instance /
-	/// `mut` / `namespace` funcs and lets) and nested interface [`StructImpl`]s.
+	/// A product type. Its body splits into flat instance/namespace [`ImplMember`]s
+	/// and nested interface [`StructImpl`]s.
 	Struct {
 		visibility: Option<Visibility>,
 		name: Ident,
@@ -61,6 +66,9 @@ pub enum Declaration {
 		visibility: Option<Visibility>,
 		name: Ident,
 		generics: Vec<Spanned<GenericParam>>,
+		/// Source enum views embedded by `...Source`, or one selected source
+		/// variant embedded by `Source.Variant`.
+		embeddings: Vec<Spanned<EnumEmbedding>>,
 		variants: Vec<Spanned<EnumVariant>>,
 		members: Vec<Spanned<ImplMember>>,
 		impls: Vec<Spanned<StructImpl>>,
@@ -79,11 +87,10 @@ pub enum Declaration {
 		super_interfaces: Vec<Spanned<(Ident, Vec<Spanned<GenericArg>>)>>,
 		members: Vec<Spanned<InterfaceMember>>,
 	},
-	/// An inherent impl: `impl<T> Option<T> { ... }`, `impl<T> mut #[T] { ... }`.
+	/// An inherent impl: `impl<T> Option<T> { ... }`.
 	Impl {
 		visibility: Option<Visibility>,
 		generics: Vec<Spanned<GenericParam>>,
-		mutable: bool,
 		type_: Spanned<Type>,
 		members: Vec<Spanned<ImplMember>>,
 	},
@@ -91,7 +98,6 @@ pub enum Declaration {
 	ImplFor {
 		visibility: Option<Visibility>,
 		generics: Vec<Spanned<GenericParam>>,
-		mutable: bool,
 		type_: Spanned<Type>,
 		for_interface: (Ident, Vec<Spanned<GenericArg>>),
 		members: Vec<Spanned<ImplMember>>,
@@ -130,24 +136,22 @@ pub struct LetDeclaration {
 	pub type_: Option<Spanned<Type>>,
 }
 
-/// How a `let` binding is introduced. `Mut` (mutable, `let mut`) and `Namespace`
-/// (a static `namespace let`) are mutually exclusive by construction — a
-/// namespaced binding can never be mutable, so `namespace let mut` is
-/// unrepresentable. Mirrors [`FuncKind`].
+/// How a `let` binding is introduced. Managed bindings are local, while
+/// namespaced bindings are static.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, salsa::SalsaValue)]
 pub enum LetKind {
 	/// `let x = …` — an immutable per-instance / local binding.
 	Instance,
-	/// `let mut x = …` — a mutable per-instance / local binding.
-	Mut,
+	/// `let use x = …` — an immutable local with lexical cleanup.
+	Use,
 	/// `namespace let x = …` — an immutable static (type-level) binding.
 	Namespace,
 }
 
 impl LetDeclaration {
-	/// Whether the binding may be reassigned (`let mut`).
-	pub fn is_mutable(&self) -> bool {
-		matches!(self.kind, LetKind::Mut)
+	/// Whether this is a managed `let use` binding.
+	pub fn is_managed(&self) -> bool {
+		matches!(self.kind, LetKind::Use)
 	}
 
 	/// Whether the binding is a static `namespace let`.
@@ -160,15 +164,19 @@ impl LetDeclaration {
 pub struct FuncDeclaration {
 	pub name: Ident,
 	pub kind: FuncKind,
+	/// Whether this callable constructs a cold task recipe.
+	pub is_async: bool,
 	pub generics: Vec<Spanned<GenericParam>>,
 	pub params: Vec<Spanned<FuncParam>>,
 	pub return_type: Option<Spanned<Type>>,
+	/// An explicit checked-effect row. With an explicit return type, omission is
+	/// pure; when the return type is also omitted, both value and effects infer.
+	pub effects: Option<Spanned<crate::ty::EffectRow>>,
 }
 
 #[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub enum FuncKind {
 	Instance,
-	Mut,
 	Namespace,
 }
 
@@ -176,7 +184,6 @@ pub enum FuncKind {
 pub struct FuncParam {
 	pub name: Spanned<Pattern>,
 	pub type_: Spanned<Type>,
-	pub mutable: bool,
 	pub spread: bool,
 }
 
@@ -241,4 +248,10 @@ pub enum InterfaceElement {
 pub struct EnumVariant {
 	pub name: Ident,
 	pub fields: Vec<Spanned<StructField>>,
+}
+
+#[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
+pub struct EnumEmbedding {
+	pub source: Ident,
+	pub variant: Option<Ident>,
 }

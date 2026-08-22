@@ -7,6 +7,7 @@
 //! owns only the commands' shared selection policy.
 
 use std::path::{Path, PathBuf};
+use std::{cell::RefCell, collections::BTreeMap, fs::OpenOptions, io::Write as _, rc::Rc};
 
 use crate::compile_guard::{guarded, unsupported_feature_message};
 
@@ -73,6 +74,7 @@ pub(crate) struct ResolvedTarget {
 	pub src_root: PathBuf,
 	pub entry_key: String,
 	pub intent: TargetIntent,
+	pub options: nymph_compiler::CompilerOptions,
 }
 
 type SourceLoader = dyn Fn(&str) -> Option<String>;
@@ -82,18 +84,40 @@ type SourceLoader = dyn Fn(&str) -> Option<String>;
 pub(crate) struct ProjectOperation {
 	target: ResolvedTarget,
 	load: Box<SourceLoader>,
+	analyzed_sources: Rc<RefCell<BTreeMap<String, String>>>,
 }
 
 impl ProjectOperation {
 	/// Resolve the command target and report selection failures consistently.
-	pub fn resolve(file: Option<&Path>, manifest: &ManifestSelection) -> Option<Self> {
-		let target = resolve(file, manifest)
+	pub fn resolve(
+		file: Option<&Path>,
+		manifest: &ManifestSelection,
+		profile: nymph_compiler::BuildProfile,
+	) -> Option<Self> {
+		let target = resolve(file, manifest, profile)
 			.map_err(|error| {
 				eprintln!("error: {error}");
 			})
 			.ok()?;
-		let load = Box::new(nymph_project::fs_loader(target.src_root.clone()));
-		Some(Self { target, load })
+		let fs_load = nymph_project::fs_loader(target.src_root.clone());
+		let analyzed_sources = Rc::new(RefCell::new(BTreeMap::<String, String>::new()));
+		let observed = analyzed_sources.clone();
+		let load = Box::new(move |module: &str| {
+			if let Some(source) = observed.borrow().get(module) {
+				return Some(source.clone());
+			}
+			let source = fs_load(module)?;
+			observed
+				.borrow_mut()
+				.entry(module.to_string())
+				.or_insert_with(|| source.clone());
+			Some(source)
+		});
+		Some(Self {
+			target,
+			load,
+			analyzed_sources,
+		})
 	}
 
 	pub fn target_file(&self) -> &Path {
@@ -101,13 +125,18 @@ impl ProjectOperation {
 	}
 
 	pub fn check_selected_mode(&self) -> Vec<nymph_compiler::ProjectDiagnostic> {
+		self.analyzed_sources.borrow_mut().clear();
 		match self.target.intent {
-			TargetIntent::Entry => {
-				nymph_compiler::check_project_with_embedded_std(&self.target.entry_key, &self.load)
-			}
-			TargetIntent::Library => {
-				nymph_compiler::check_project_library_with_embedded_std(&self.target.entry_key, &self.load)
-			}
+			TargetIntent::Entry => nymph_compiler::check_project_with_embedded_std_and_options(
+				&self.target.entry_key,
+				&self.load,
+				&self.target.options,
+			),
+			TargetIntent::Library => nymph_compiler::check_project_library_with_embedded_std_and_options(
+				&self.target.entry_key,
+				&self.load,
+				&self.target.options,
+			),
 		}
 	}
 
@@ -124,17 +153,33 @@ impl ProjectOperation {
 	}
 
 	fn compile(&self, intent: TargetIntent) -> Option<nymph_compiler::CompiledProject> {
+		let source_root = &self.target.src_root;
+		let source_uri = |module: &str| {
+			url::Url::from_file_path(
+				nymph_compiler::ModulePath::new(module)
+					.ok()?
+					.source_file(source_root),
+			)
+			.ok()
+			.map(String::from)
+		};
 		let result = guarded(|| match intent {
-			TargetIntent::Entry => nymph_compiler::compile_project_with_std(
-				&self.target.entry_key,
-				&self.load,
-				&nymph_compiler::embedded_std_provider,
-			),
-			TargetIntent::Library => nymph_compiler::compile_project_library_with_std(
-				&self.target.entry_key,
-				&self.load,
-				&nymph_compiler::embedded_std_provider,
-			),
+			TargetIntent::Entry => {
+				nymph_compiler::compile_project_with_embedded_std_options_and_source_uris(
+					&self.target.entry_key,
+					&self.load,
+					&self.target.options,
+					&source_uri,
+				)
+			}
+			TargetIntent::Library => {
+				nymph_compiler::compile_project_library_with_embedded_std_options_and_source_uris(
+					&self.target.entry_key,
+					&self.load,
+					&self.target.options,
+					&source_uri,
+				)
+			}
 		});
 		match result {
 			Ok(Ok(compiled)) => Some(compiled),
@@ -158,6 +203,7 @@ impl ProjectOperation {
 pub(crate) fn resolve(
 	file: Option<&Path>,
 	manifest: &ManifestSelection,
+	profile: nymph_compiler::BuildProfile,
 ) -> anyhow::Result<ResolvedTarget> {
 	let explicit_file = file.map(nymph_project::normalize_path).transpose()?;
 	let current_dir = nymph_project::normalize_path(std::env::current_dir()?)?;
@@ -179,6 +225,10 @@ pub(crate) fn resolve(
 
 	match project {
 		Some(project) => {
+			let options = nymph_compiler::CompilerOptions {
+				profile,
+				lints: project.manifest().lints.clone(),
+			};
 			let src_root = project.source_root();
 			let entry_module = project.entry_module().map_err(|error| {
 				anyhow::anyhow!(
@@ -213,6 +263,7 @@ pub(crate) fn resolve(
 				src_root,
 				entry_key: module.as_str().to_string(),
 				intent,
+				options,
 			})
 		}
 		None => {
@@ -234,6 +285,10 @@ pub(crate) fn resolve(
 				src_root,
 				entry_key,
 				intent: TargetIntent::Library,
+				options: nymph_compiler::CompilerOptions {
+					profile,
+					lints: Default::default(),
+				},
 			})
 		}
 	}
@@ -259,6 +314,73 @@ fn ensure_source_within_root(file: &Path, src_root: &Path) -> anyhow::Result<()>
 			src_root.display()
 		)
 	}
+}
+
+pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
+	let parent = path.parent().unwrap_or(Path::new("."));
+	let permissions = std::fs::metadata(path)?.permissions();
+	if permissions.readonly() {
+		anyhow::bail!("source file is read-only");
+	}
+	let name = path
+		.file_name()
+		.and_then(|name| name.to_str())
+		.unwrap_or("source.nym");
+	for attempt in 0..1000_u32 {
+		let temporary = parent.join(format!(
+			".{name}.nymph-write-{}-{attempt}",
+			std::process::id()
+		));
+		match OpenOptions::new()
+			.write(true)
+			.create_new(true)
+			.open(&temporary)
+		{
+			Ok(mut output) => {
+				let result = (|| -> std::io::Result<()> {
+					output.set_permissions(permissions.clone())?;
+					output.write_all(contents)?;
+					output.sync_all()?;
+					drop(output);
+					replace_file(&temporary, path)
+				})();
+				if result.is_err() {
+					let _ = std::fs::remove_file(&temporary);
+				}
+				return result.map_err(Into::into);
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+			Err(error) => return Err(error.into()),
+		}
+	}
+	anyhow::bail!("could not create an atomic temporary file")
+}
+
+#[cfg(not(windows))]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+	std::fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
+	use std::os::windows::ffi::OsStrExt as _;
+	use windows_sys::Win32::Storage::FileSystem::{
+		MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+	};
+
+	let from: Vec<_> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+	let to: Vec<_> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+	if unsafe {
+		MoveFileExW(
+			from.as_ptr(),
+			to.as_ptr(),
+			MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+		)
+	} == 0
+	{
+		return Err(std::io::Error::last_os_error());
+	}
+	Ok(())
 }
 
 /// Render a batch of project diagnostics, each against its own module's

@@ -1,177 +1,107 @@
 # Iteration
 
-Nymph has one looping construct for walking over a source of values: `for (pat in src) { .. }`.
-What `src` may be — and how fast the resulting loop is — depends on its type: a range, a list,
-or any type implementing one of the two iteration interfaces, [Iterator](#iterators) or
-[Iterable](#iterables).
+Nymph iteration is immutable. `for (pattern in source) { … }` is the traversal construct; general
+source `while` does not exist. Accumulate with iterator terminals such as `fold`, or use a
+[state loop](#state-loops) when several named values must advance together.
 
-## Ranges
+## Nominal successor state
 
-Ranges advance through the fallible `Step` interface. `Step.next()` and `Step.previous()` return
-`Option<Self>`, so an iterator stops at a representation boundary instead of wrapping or producing
-an invalid value. The standard library implements `Step` for `int`, `uint`, and `char`; character
-stepping skips the UTF-16 surrogate interval and stops at the Unicode scalar boundaries.
-
-`Range`, `RangeInclusive`, and `RangeFrom` are forward `Iterable` values. A bounded range whose
-start is greater than its end is empty; endpoint order never selects an implicit descending loop.
-Call `.reversed()` explicitly for descending traversal:
-
-```nym
-func sum(): int = {
-  let mut total = 0
-  for (i in 1..=4) {
-    total = total + i
-  }
-  total
-}
-
-func countdown(): int = {
-  let mut digits = 0
-  for (i in (1..4).reversed()) {
-    digits = digits * 10 + i
-  }
-  digits // 321
-}
-```
-
-`RangeTo` and `RangeToInclusive` have no starting value and therefore are not forward iterable.
-Their explicit reversed views are iterable: `(..4).reversed()` begins at `3`, while
-`(..=4).reversed()` begins at `4`. `RangeFrom` is open-ended in the other direction. Open-ended
-iteration must be stopped by control flow or an iterator adapter, and also stops cleanly if `Step`
-returns `None`.
-
-Exclusive and inclusive endpoints are symmetric after reversal. For example, `(1..4).reversed()`
-yields `3, 2, 1`, and `(1..=4).reversed()` yields `4, 3, 2, 1`.
-
-A direct bounded `int` or `uint` range remains an allocation-free compiler specialization. Stored,
-passed, or returned ranges use the canonical standard-library value and the ordinary
-`Iterable`/`Iterator` protocol. Both paths have the same direction, endpoint, emptiness, and
-boundary behavior.
-
-## Lists
-
-A `#[T]` list is iterated natively as well — the element type needs no interface at all:
-
-```nym
-func sum(): int = {
-  let mut total = 0
-  for (x in #[1, 2, 3, 4]) {
-    total = total + x
-  }
-  total
-}
-```
-
-## Iterators
-
-A source whose type directly implements `Iterator<Item>` is iterated by repeatedly calling its
-`next()` method until it returns `None`, binding each `Some` value to `pat` in turn.
+`Iteration` is a nominal enum, not `Option` and not a `{ value, done }` host convention. An iterator
+is persistent: `next` returns either `Done` or an item together with the immutable successor.
 
 ```nymph
-interface Iterator<Item> {
-  mut func next(): Option<Item>
+enum Iteration<Item, Next> {
+  Done,
+  Yield(item: Item, next: Next),
+}
+
+interface Iterator<Item + !E> {
+  func next(): Iteration<Item, self> + !E
+}
+
+interface Iterable<Item + !E> {
+  func iter(): Iterator<Item + !E>
 }
 ```
 
-`next` is a [mut func](./mutability#mut-func): producing the next value is inherently a mutation
-of the iterator's own state, not necessarily of the collection it traverses. A binding used as a
-direct `Iterator` source must therefore be declared `let mut`.
+These declarations are illustrative grammar because the nominal interfaces are ambient. Programs
+use them without an import. `Iterable.iter()` is pure and called once; its returned iterator carries
+the latent effects of stepping.
 
 ```nym
-struct Counter(n: int, max: int)
+struct Counter(next: int, end: int)
+
 impl Iterator<int> for Counter {
-  mut func next(): Option<int> = if (this.n > this.max) {
-    None
+  func next(): Iteration<int, self> = if (this.next > this.end) {
+    Done
   } else {
-    let v = this.n
-    this.n = this.n + 1
-    Some(value = v)
+    Yield(item = this.next, next = Counter(next = this.next + 1, end = this.end))
   }
 }
 
-func sum_counter(): int = {
-  let mut c = Counter(n = 1, max = 4)
-  let mut total = 0
-  for (x in c) {
-    total = total + x
-  }
-  total
+func first(counter: Counter): int = match (counter.next()) {
+  Yield(item, next) -> item,
+  Done -> 0,
 }
 ```
 
-## Iterables
+Saving `counter` above preserves that position. Calling `next()` again replays the step; it does not
+advance `counter` in place.
 
-A source that doesn't implement `Iterator` itself, but implements `Iterable<T>`, is iterated by
-first calling `.iter()` to obtain an `Iterator<T>`, then following the same protocol as above.
+## `for`
 
-```nymph
-interface Iterable<T> {
-  func iter(): Iterator<T>
-}
-```
+`for` accepts an iterator, an iterable, a list, or a supported range. It is a dedicated compiler HIR
+operation, not source-level sugar for another loop. The source expression and `iter()` each evaluate
+once. Every iteration calls `next()` once and saves the successor before entering the body, so
+`continue` resumes from that successor and every other departure performs no extra step.
 
 ```nym
-struct Counter(n: int, max: int)
-impl Iterator<int> for Counter {
-  mut func next(): Option<int> = if (this.n > this.max) {
-    None
-  } else {
-    let v = this.n
-    this.n = this.n + 1
-    Some(value = v)
-  }
-}
-
-struct Bag(lo: int, hi: int)
-impl Iterable<int> for Bag {
-  func iter(): Counter = Counter(n = this.lo, max = this.hi)
-}
-
-func sum_bag(): int = {
-  let b = Bag(lo = 1, hi = 4)
-  let mut total = 0
-  for (x in b) {
-    total = total + x
-  }
-  total
+func first_even(): Option<int> = for (value in 1..=6) {
+  if (value % 2 == 0) { break value }
 }
 ```
 
-Note that `Bag` itself need not be bound `mut` — only the `Iterator` the loop steps through
-(`b.iter()`'s result, held internally) needs to be, and the loop's own desugaring takes care of
-that.
+Natural exhaustion of a `for` with valued breaks is `None`; an executed `break value` is `Some`.
+A bare break makes the loop `void`, and bare and valued breaks cannot be mixed. Labels use
+`for@outer` and `break@outer`/`continue@outer`.
 
-Maps implement `Iterable<#(K, V)>` in ordinary Nymph by returning
-`this.entries().iter()`. Explicitly consuming a map's iterator and iterating it with `for` therefore
-yield the same key-value tuple sequence. Repeated iteration of an unchanged map instance is stable,
-but map order is otherwise unspecified: separate map instances need not have the same order, and
-mutation may change it. As with every `for` source, the map expression is evaluated exactly once.
+Ranges iterate forward. A reversed endpoint order is empty rather than implicitly descending; use
+`.reversed()` explicitly. Lists are directly iterable. Iterator adapters are lazy, and predictable
+callbacks execute sequentially in source order.
 
-Both `while` and `for` are expressions. A loop with no lexical `break` has type `void`; bare
-breaks produce `Option<#()>`, and consistently valued breaks produce `Option<T>`. Natural
-exhaustion is `None`, while an executed break is `Some`. Break collection scans the complete loop
-body syntactically, including unreachable branches, but stops at nested loops and callable bodies.
-See [Control flow](./expressions.md#control-flow) for the full jump-expression rules.
+## State loops
 
-Loops can be labeled with `while@outer` or `for@outer`; `break@outer` and `continue@outer` select
-that loop through intervening nested loops. There is no whitespace between the keyword, `@`, and
-label.
-
-> [!NOTE] `Iterator` and `Iterable` are ambient
-> The versions declared inline above are for illustrating their complete shape and exercise the
-> same for-loop desugaring as Nymph's real ambient [`Iterator`/`Iterable`](./stdlib/iter#Iterator)
-> interfaces. Ordinary programs use those interfaces directly, with no import.
-
-## Non-iterable sources
-
-A `for` loop over a source that is neither a range, a list, nor a type implementing `Iterator` or
-`Iterable` is rejected at compile time — there is no silent fallback and nothing is iterated at
-runtime that the checker didn't first prove iterable.
+A state loop carries one or more immutable bindings:
 
 ```nym
-struct NotIterable(n: int)
-
-func demo(): void = {
-  for (x in NotIterable(n = 1)) {} // [!code error]
+func sum_to(limit: int): int = loop (
+  let next = 1
+  let total = 0
+) {
+  if (next > limit) { break total }
+  continue(next = next + 1, total = total + next)
 }
 ```
+
+Header declarations evaluate once from left to right. Each iteration receives fresh bindings.
+Replacement expressions evaluate left to right against the old bindings, then install together;
+omitted names retain their old values. Closures therefore retain the iteration they captured.
+Fallthrough is equivalent to continuing without replacements.
+
+State loops cannot exhaust, so `break value` has type `T`, not `Option<T>`. Labels use `loop@outer`
+and `continue@outer(name = value)`. Header `let use` declarations participate in normal managed
+resource cleanup when replaced or when the loop exits.
+
+```nym
+func swap_twice(): #(int, int) = loop (
+  let left = 1
+  let right = 2
+  let step = 0
+) {
+  if (step == 2) { break #(left, right) }
+  continue(left = right, right = left, step = step + 1)
+}
+```
+
+The compiler implements continuation without growing the stack. See
+[Immutability and migration](./mutability) for translating legacy mutable loops.

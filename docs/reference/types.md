@@ -47,8 +47,6 @@ using a [literal](./literals):
 
 Compound types are reference to other types, usually imposing a kind of constraint on them:
 
-- Mut `mut A`: a reference to type `A` that additionally carries permission to mutate through it.
-  See [Mutability](./mutability) for the full rules governing `mut` types.
 - Reference `A<B>`: a reference to a user-defined type named `A`, with an optional list of generic
   type arguments (that may be labelled).
 - Function `(A) -> B`: a list of ordered parameters surrounded by parentheses and a return type,

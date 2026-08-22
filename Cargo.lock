@@ -1496,6 +1496,8 @@ dependencies = [
  "owo-colors",
  "rustix",
  "serde_json",
+ "signal-hook",
+ "url",
  "windows-sys",
 ]
 
@@ -1520,6 +1522,7 @@ dependencies = [
  "nymph-ast",
  "nymph-codegen",
  "nymph-diagnostics",
+ "nymph-format",
  "nymph-hir",
  "nymph-sema",
  "nymph-syntax",
@@ -1528,6 +1531,7 @@ dependencies = [
  "rolldown",
  "rustc-hash",
  "salsa",
+ "serde",
  "serde_json",
  "swc_bundler",
  "swc_common",
@@ -1616,6 +1620,7 @@ version = "0.1.0"
 dependencies = [
  "ecow",
  "ena",
+ "num-bigint 0.4.8",
  "nymph-ast",
  "nymph-diagnostics",
  "nymph-errorcode",
@@ -4086,6 +4091,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]

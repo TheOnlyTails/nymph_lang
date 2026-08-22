@@ -9,7 +9,7 @@
 use nymph_ast::{
 	NodeId,
 	decl::Declaration,
-	expr::{Expr, ExprKind, Statement},
+	expr::{Expr, ExprKind, ListItem, Statement},
 };
 use nymph_sema::{DispatchKind, Resolution, check_module};
 use nymph_syntax::parse_module;
@@ -28,6 +28,13 @@ fn collect_binary_ops(expr: &Expr, out: &mut Vec<NodeId>) {
 	}
 	match &expr.kind {
 		ExprKind::Grouped(inner) => collect_binary_ops(inner, out),
+		ExprKind::Tuple(items) => {
+			for item in items {
+				match &item.0 {
+					ListItem::Expr(expr) | ListItem::Spread(expr) => collect_binary_ops(expr, out),
+				}
+			}
+		}
 		ExprKind::If {
 			condition,
 			then,
@@ -50,16 +57,12 @@ fn collect_binary_ops(expr: &Expr, out: &mut Vec<NodeId>) {
 		ExprKind::Call { func, args, .. } => {
 			collect_binary_ops(func, out);
 			for arg in args {
-				collect_binary_ops(&arg.0.value, out);
+				collect_binary_ops(arg.0.value(), out);
 			}
 		}
 		ExprKind::MemberAccess { parent, .. } => collect_binary_ops(parent, out),
 		ExprKind::PrefixOp { value, .. } | ExprKind::PostfixOp { value, .. } => {
 			collect_binary_ops(value, out);
-		}
-		ExprKind::AssignOp { lhs, rhs, .. } => {
-			collect_binary_ops(lhs, out);
-			collect_binary_ops(rhs, out);
 		}
 		_ => {}
 	}
@@ -220,8 +223,9 @@ fn late_resolved_infer_var_less_than_is_builtin_eager() {
 	// this `BinaryOp` node is recorded and is pinned to `int` only afterward. The
 	// pending-operator queue finalizes it once `f`'s body is fully checked.
 	let res = resolution_for(
-		"func f(): boolean = {
-		   let xs = #[]
+		"func defer<T>(): T = defer()
+		 func f(): boolean = {
+		   let xs = #[defer()]
 		   let c = xs[0u] < xs[0u]
 		   let pin: int = xs[0u]
 		   c
@@ -238,13 +242,14 @@ fn late_pinned_adt_less_than_dispatches_to_user_impl() {
 	// recorded and is pinned to `Vec2` afterward by the `#[Vec2]` annotation.
 	// Pending resolution then selects the direct `less_than` impl (`UserImpl`).
 	let res = resolution_for(
-		"interface Comparable<Other> { func less_than(other: Other): boolean }
+		"func defer<T>(): T = defer()
+		 interface Comparable<Other> { func less_than(other: Other): boolean }
 		 struct Vec2(x: int)
 		 impl Comparable<Other = Vec2> for Vec2 {
 		   func less_than(other: Vec2): boolean = true
 		 }
 		 func f(): boolean = {
-		   let xs = #[]
+		   let xs = #[defer()]
 		   let c = xs[0u] < xs[0u]
 		   let pin: #[Vec2] = xs
 		   c
@@ -253,198 +258,6 @@ fn late_pinned_adt_less_than_dispatches_to_user_impl() {
 	);
 	assert_eq!(res.dispatch, DispatchKind::UserImpl);
 	assert_eq!(res.method, "less_than");
-}
-
-/// Like [`collect_binary_ops`], but collects `AssignOp` nodes instead. The checker
-/// records the compound-assign operator's `Resolution` on the `AssignOp` node
-/// itself (there's no separate desugared `BinaryOp` AST node to hang it on).
-fn collect_assign_ops(expr: &Expr, out: &mut Vec<NodeId>) {
-	if let ExprKind::AssignOp { lhs, rhs, .. } = &expr.kind {
-		out.push(expr.id);
-		collect_assign_ops(lhs, out);
-		collect_assign_ops(rhs, out);
-		return;
-	}
-	match &expr.kind {
-		ExprKind::Grouped(inner) => collect_assign_ops(inner, out),
-		ExprKind::Block { body, .. } => {
-			for stmt in body {
-				match &stmt.0 {
-					Statement::Expr(e) => collect_assign_ops(e, out),
-					Statement::Let { value, .. } => collect_assign_ops(value, out),
-				}
-			}
-		}
-		ExprKind::While { body, .. } => collect_assign_ops(body, out),
-		_ => {}
-	}
-}
-
-/// Parse+check `source` (asserting zero diagnostics), find the single `AssignOp`
-/// node inside the named top-level `func`'s body, and return the `Resolution` the
-/// checker recorded for it.
-fn assign_resolution_for(source: &str, func_name: &str) -> Resolution {
-	let parsed = parse_module(source, "test");
-	let parse_errors: Vec<_> = parsed
-		.diagnostics
-		.iter()
-		.filter(|d| d.is_error())
-		.map(|d| d.message.to_string())
-		.collect();
-	assert!(
-		parse_errors.is_empty(),
-		"source failed to parse: {parse_errors:?}\n---\n{source}"
-	);
-
-	let checked = check_module(&parsed.tree);
-	let check_errors: Vec<_> = checked
-		.diags
-		.iter()
-		.filter(|d| d.is_error())
-		.map(|d| d.message.to_string())
-		.collect();
-	assert!(
-		check_errors.is_empty(),
-		"expected no errors, got: {check_errors:?}\n---\n{source}"
-	);
-
-	let body = parsed
-		.tree
-		.members
-		.iter()
-		.find_map(|member| match member {
-			Declaration::Func { meta, body, .. } if meta.name.0 == func_name => Some(body),
-			_ => None,
-		})
-		.unwrap_or_else(|| panic!("no func named `{func_name}` in module:\n{source}"));
-
-	let mut ops = Vec::new();
-	collect_assign_ops(body, &mut ops);
-	assert_eq!(
-		ops.len(),
-		1,
-		"expected exactly one AssignOp node in `{func_name}`'s body, found {}",
-		ops.len()
-	);
-
-	checked
-		.annotations
-		.resolution_of(ops[0])
-		.unwrap_or_else(|| panic!("no Resolution recorded for the AssignOp node in `{func_name}`"))
-		.clone()
-}
-
-#[test]
-fn compound_assign_user_struct_plus_is_user_impl() {
-	// `v1 += v2` on a struct with a directly-defined `Plus.plus` impl resolves
-	// through a direct user impl method, same as `v1 + v2` would: the
-	// `AssignOp` node itself carries the `Resolution`, not a separate `BinaryOp`.
-	let res = assign_resolution_for(
-		&format!(
-			"{PLUS}
-			 struct Vec2(x: int, y: int)
-			 impl Plus<Other = Vec2, Output = Vec2> for Vec2 {{
-			   func plus(other: Vec2): Vec2 = other
-			 }}
-			 func add(a: Vec2, b: Vec2): Vec2 = {{
-			   let mut v1 = a
-			   v1 += b
-			   v1
-			 }}",
-		),
-		"add",
-	);
-	assert_eq!(res.dispatch, DispatchKind::UserImpl);
-	assert_eq!(res.method, "plus");
-}
-
-#[test]
-fn compound_assign_int_plus_is_builtin_eager() {
-	// `x += 1` on a plain `int` stays a native builtin, same as `x + 1` would.
-	let res = assign_resolution_for(
-		"func f(): int = {
-		   let mut x = 1
-		   x += 1
-		   x
-		 }",
-		"f",
-	);
-	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
-	assert_eq!(res.method, "plus");
-}
-
-#[test]
-fn deferred_compound_assign_keeps_its_own_type_as_void() {
-	// Finalizing a deferred compound operator preserves the `AssignOp` node's
-	// `void` type while recording the resolved operand and result types.
-	// two paths must agree on the stored `ExprInfo.ty` for the same AST shape.
-	let source = "func f(): int = {
-	   let mut xs = #[]
-	   let mut x = xs[0u]
-	   x += xs[0u]
-	   x
-	 }";
-	let parsed = parse_module(source, "test");
-	let parse_errors: Vec<_> = parsed
-		.diagnostics
-		.iter()
-		.filter(|d| d.is_error())
-		.map(|d| d.message.to_string())
-		.collect();
-	assert!(
-		parse_errors.is_empty(),
-		"source failed to parse: {parse_errors:?}\n---\n{source}"
-	);
-
-	let checked = check_module(&parsed.tree);
-	let check_errors: Vec<_> = checked
-		.diags
-		.iter()
-		.filter(|d| d.is_error())
-		.map(|d| d.message.to_string())
-		.collect();
-	assert!(
-		check_errors.is_empty(),
-		"expected no errors, got: {check_errors:?}\n---\n{source}"
-	);
-
-	let body = parsed
-		.tree
-		.members
-		.iter()
-		.find_map(|member| match member {
-			Declaration::Func { meta, body, .. } if meta.name.0 == "f" => Some(body),
-			_ => None,
-		})
-		.expect("no func named `f` in module");
-
-	let mut ops = Vec::new();
-	collect_assign_ops(body, &mut ops);
-	assert_eq!(
-		ops.len(),
-		1,
-		"expected exactly one AssignOp node in `f`'s body, found {}",
-		ops.len()
-	);
-
-	let info = checked
-		.annotations
-		.get(ops[0])
-		.unwrap_or_else(|| panic!("no ExprInfo recorded for the AssignOp node in `f`"));
-	assert_eq!(
-		info.ty,
-		checked.interner.void(),
-		"the AssignOp node's own recorded type must stay Void even when its operator \
-		 Resolution was deferred to finalize_pending_operators"
-	);
-
-	// Sanity: the deferred `Resolution` itself is still attached correctly.
-	let res = checked
-		.annotations
-		.resolution_of(ops[0])
-		.unwrap_or_else(|| panic!("no Resolution recorded for the AssignOp node in `f`"));
-	assert_eq!(res.method, "plus");
-	assert_eq!(res.dispatch, DispatchKind::BuiltinEager);
 }
 
 #[test]
@@ -457,8 +270,9 @@ fn late_resolved_infer_var_operand_is_builtin_eager() {
 	// diagnostics, so `finalize_pending_operators` must retry this node once the
 	// whole module is checked, rather than leaving lowering to panic on it.
 	let res = resolution_for(
-		"func f(): int = {
-		   let xs = #[]
+		"func defer<T>(): T = defer()
+		 func f(): int = {
+		   let xs = #[defer()]
 		   xs[0u] + xs[0u]
 		 }",
 		"f",
@@ -491,6 +305,13 @@ fn collect_prefix_ops(expr: &Expr, out: &mut Vec<NodeId>) {
 	}
 	match &expr.kind {
 		ExprKind::Grouped(inner) => collect_prefix_ops(inner, out),
+		ExprKind::Tuple(items) => {
+			for item in items {
+				match &item.0 {
+					ListItem::Expr(expr) | ListItem::Spread(expr) => collect_prefix_ops(expr, out),
+				}
+			}
+		}
 		ExprKind::If {
 			condition,
 			then,
@@ -513,7 +334,7 @@ fn collect_prefix_ops(expr: &Expr, out: &mut Vec<NodeId>) {
 		ExprKind::Call { func, args, .. } => {
 			collect_prefix_ops(func, out);
 			for arg in args {
-				collect_prefix_ops(&arg.0.value, out);
+				collect_prefix_ops(arg.0.value(), out);
 			}
 		}
 		ExprKind::MemberAccess { parent, .. } => collect_prefix_ops(parent, out),
@@ -522,7 +343,7 @@ fn collect_prefix_ops(expr: &Expr, out: &mut Vec<NodeId>) {
 			collect_prefix_ops(index, out);
 		}
 		ExprKind::PostfixOp { value, .. } => collect_prefix_ops(value, out),
-		ExprKind::AssignOp { lhs, rhs, .. } | ExprKind::BinaryOp { lhs, rhs, .. } => {
+		ExprKind::BinaryOp { lhs, rhs, .. } => {
 			collect_prefix_ops(lhs, out);
 			collect_prefix_ops(rhs, out);
 		}
@@ -670,8 +491,9 @@ fn late_resolved_infer_var_negate_operand_is_builtin_eager() {
 	// parses as *binary* minus, not a prefix negate — the fixture binds the negation
 	// to its own `let` to avoid that trap.
 	let res = prefix_resolution_for(
-		"func f(): int = {
-		   let xs = #[]
+		"func defer<T>(): T = defer()
+		 func f(): int = {
+		   let xs = #[defer()]
 		   let y = -xs[0u]
 		   y
 		 }",
@@ -929,8 +751,9 @@ fn unresolved_prefix_operand_reports_cannot_infer_operand_type() {
 	// body reports `CannotInferOperandType` rather than silently leaving lowering
 	// to panic on a supposedly zero-diagnostic program.
 	let parsed = parse_module(
-		"func f(): int = {
-		   let xs = #[]
+		"func defer<T>(): T = defer()
+		 func f(): int = {
+		   let xs = #[defer()]
 		   let y = -xs[0]
 		   0
 		 }",

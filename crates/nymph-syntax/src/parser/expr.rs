@@ -4,10 +4,10 @@ use crate::errors::ParseError;
 use nymph_ast::{
 	Ident, Span, Spanned,
 	expr::{
-		CallArg, ClosureParam, Expr, ExprKind, ListItem, MapEntry, MatchArm, RangeKind, Statement,
-		StringPart,
+		CallArg, ClosureParam, Expr, ExprKind, ListItem, MapEntry, MatchArm, RangeKind, StateBinding,
+		StateReplacement, Statement, StringPart,
 	},
-	ops::{AssignOperator, BinaryOperator, Precedence, PrefixOperator},
+	ops::{BinaryOperator, Precedence, PrefixOperator},
 	token::{StrFragment, Token},
 };
 
@@ -16,7 +16,6 @@ use super::Parser;
 /// What an infix position can hold, along with how many tokens to consume.
 enum Infix {
 	Binary(BinaryOperator),
-	Assign(AssignOperator),
 	As,
 	Is,
 	NotIs,
@@ -54,26 +53,26 @@ impl Parser<'_> {
 			}
 			lhs = match infix {
 				Infix::Binary(op) => {
-					let rhs = self.parse_bp(r_bp);
-					self.mk_expr(
-						ExprKind::BinaryOp {
-							lhs: Box::new(lhs),
-							op,
-							rhs: Box::new(rhs),
-						},
-						self.span_from(start),
-					)
-				}
-				Infix::Assign(op) => {
-					let rhs = self.parse_bp(r_bp);
-					self.mk_expr(
-						ExprKind::AssignOp {
-							lhs: Box::new(lhs),
-							op,
-							rhs: Box::new(rhs),
-						},
-						self.span_from(start),
-					)
+					if op == BinaryOperator::Pipe && self.check(&Token::Echo) {
+						let keyword = self.advance().expect("checked echo token").1;
+						self.mk_expr(
+							ExprKind::Echo {
+								operand: Box::new(lhs),
+								keyword,
+							},
+							self.span_from(start),
+						)
+					} else {
+						let rhs = self.parse_bp(r_bp);
+						self.mk_expr(
+							ExprKind::BinaryOp {
+								lhs: Box::new(lhs),
+								op,
+								rhs: Box::new(rhs),
+							},
+							self.span_from(start),
+						)
+					}
 				}
 				Infix::As => {
 					let ty = self.parse_type();
@@ -205,31 +204,8 @@ impl Parser<'_> {
 				let (l, r) = bp(Precedence::Is, false);
 				Some((Infix::NotIs, l, r, 1))
 			}
-			_ => self.peek_assign(),
+			_ => None,
 		}
-	}
-
-	fn peek_assign(&self) -> Option<(Infix, u16, u16, usize)> {
-		let op = match self.peek()? {
-			Token::Eq => AssignOperator::Assign,
-			Token::PlusEq => AssignOperator::PlusAssign,
-			Token::MinusEq => AssignOperator::MinusAssign,
-			Token::StarEq => AssignOperator::TimesAssign,
-			Token::SlashEq => AssignOperator::DivideAssign,
-			Token::PercentEq => AssignOperator::RemainderAssign,
-			Token::StarStarEq => AssignOperator::PowerAssign,
-			Token::LtLtEq => AssignOperator::LeftShiftAssign,
-			Token::GtGtEq => AssignOperator::RightShiftAssign,
-			Token::AmpEq => AssignOperator::BitAndAssign,
-			Token::CaretEq => AssignOperator::BitXorAssign,
-			Token::PipeEq => AssignOperator::BitOrAssign,
-			Token::TildeEq => AssignOperator::BitNotAssign,
-			Token::AmpAmpEq => AssignOperator::BoolAndAssign,
-			Token::PipePipeEq => AssignOperator::BoolOrAssign,
-			_ => return None,
-		};
-		let (l, r) = bp(Precedence::Assignment, true);
-		Some((Infix::Assign(op), l, r, 1))
 	}
 
 	/// True when the next token equals `token` and its span immediately follows the
@@ -260,6 +236,18 @@ impl Parser<'_> {
 				ExprKind::PrefixOp {
 					op,
 					value: Box::new(operand),
+				},
+				self.span_from(start),
+			);
+		}
+		if self.check(&Token::Echo) {
+			let keyword = self.advance().expect("checked echo token").1;
+			let (_, r) = bp(Precedence::Unary, false);
+			let operand = self.parse_bp(r);
+			return self.mk_expr(
+				ExprKind::Echo {
+					operand: Box::new(operand),
+					keyword,
 				},
 				self.span_from(start),
 			);
@@ -296,15 +284,26 @@ impl Parser<'_> {
 			expr = match self.peek() {
 				Some(Token::Dot) => {
 					self.advance();
-					let member = self.expect_ident();
-					self.mk_expr(
-						ExprKind::MemberAccess {
-							parent: Box::new(expr),
-							member,
-							optional: false,
-						},
-						expr_start.to(self.span_from(start)),
-					)
+					if self.check(&Token::Await) {
+						let keyword = self.advance().expect("checked await token").1;
+						self.mk_expr(
+							ExprKind::Await {
+								value: Box::new(expr),
+								keyword,
+							},
+							expr_start.to(self.span_from(start)),
+						)
+					} else {
+						let member = self.expect_ident();
+						self.mk_expr(
+							ExprKind::MemberAccess {
+								parent: Box::new(expr),
+								member,
+								optional: false,
+							},
+							expr_start.to(self.span_from(start)),
+						)
+					}
 				}
 				Some(Token::QuestionDot) => {
 					self.advance();
@@ -380,14 +379,7 @@ impl Parser<'_> {
 		if self.check(&Token::DotDotDot) {
 			self.advance();
 			let value = self.parse_expr();
-			return Spanned(
-				CallArg {
-					value,
-					name: None,
-					spread: true,
-				},
-				self.span_from(start),
-			);
+			return Spanned(CallArg::Spread { value }, self.span_from(start));
 		}
 		let name = if matches!(self.peek(), Some(Token::Identifier(_)))
 			&& self.peek_nth(1) == Some(&Token::Eq)
@@ -399,14 +391,7 @@ impl Parser<'_> {
 			None
 		};
 		let value = self.parse_expr();
-		Spanned(
-			CallArg {
-				value,
-				name,
-				spread: false,
-			},
-			self.span_from(start),
-		)
+		Spanned(CallArg::Value { name, value }, self.span_from(start))
 	}
 
 	fn parse_primary(&mut self) -> Expr {
@@ -494,10 +479,21 @@ impl Parser<'_> {
 			Token::HashLBrace => self.parse_map_literal(),
 			Token::LParen => self.parse_paren_or_closure(),
 			Token::LBrace => self.parse_block(),
+			Token::Async => {
+				let keyword = self.advance().expect("matched async token").1;
+				let body = self.parse_block();
+				self.mk_expr(
+					ExprKind::AsyncBlock {
+						body: Box::new(body),
+						keyword,
+					},
+					self.span_from(start),
+				)
+			}
 			Token::If => self.parse_if(),
 			Token::Match => self.parse_match(),
-			Token::While => self.parse_while(),
 			Token::For => self.parse_for(),
+			Token::Loop => self.parse_state_loop(),
 			Token::Return => {
 				let keyword = self.advance().unwrap().1;
 				let label = self.parse_control_label(keyword);
@@ -521,7 +517,23 @@ impl Parser<'_> {
 			Token::Continue => {
 				let keyword = self.advance().unwrap().1;
 				let label = self.parse_control_label(keyword);
-				self.mk_expr(ExprKind::Continue { label }, self.span_from(start))
+				let replacements = if self.eat(&Token::LParen).is_some() {
+					self.comma_separated(&Token::RParen, |parser| {
+						let name = parser.expect_ident();
+						parser.expect(&Token::Eq);
+						let value = parser.parse_expr();
+						StateReplacement { name, value }
+					})
+				} else {
+					Vec::new()
+				};
+				self.mk_expr(
+					ExprKind::Continue {
+						label,
+						replacements,
+					},
+					self.span_from(start),
+				)
 			}
 			other => {
 				let span = self.current_span();
@@ -732,7 +744,6 @@ impl Parser<'_> {
 	fn parse_closure_param(&mut self) -> Spanned<ClosureParam> {
 		let start = self.position();
 		let spread = self.eat(&Token::DotDotDot).is_some();
-		let mutable = self.eat(&Token::Mut).is_some();
 		let name = self.parse_binding_pattern();
 		let type_ = if self.eat(&Token::Colon).is_some() {
 			Some(self.parse_type())
@@ -743,7 +754,6 @@ impl Parser<'_> {
 			ClosureParam {
 				name,
 				type_,
-				mutable,
 				spread,
 			},
 			self.span_from(start),
@@ -763,7 +773,6 @@ impl Parser<'_> {
 					name.1,
 				),
 				type_: None,
-				mutable: false,
 				spread: false,
 			},
 			name.1,
@@ -835,24 +844,6 @@ impl Parser<'_> {
 		)
 	}
 
-	fn parse_while(&mut self) -> Expr {
-		let start = self.position();
-		let keyword = self.advance().unwrap().1; // `while`
-		let label = self.parse_control_label(keyword);
-		self.expect(&Token::LParen);
-		let condition = self.parse_expr();
-		self.expect(&Token::RParen);
-		let body = self.parse_expr();
-		self.mk_expr(
-			ExprKind::While {
-				condition: Box::new(condition),
-				body: Box::new(body),
-				label,
-			},
-			self.span_from(start),
-		)
-	}
-
 	fn parse_for(&mut self) -> Expr {
 		let start = self.position();
 		let keyword = self.advance().unwrap().1; // `for`
@@ -867,6 +858,29 @@ impl Parser<'_> {
 			ExprKind::For {
 				variable,
 				iterable: Box::new(iterable),
+				body: Box::new(body),
+				label,
+			},
+			self.span_from(start),
+		)
+	}
+
+	fn parse_state_loop(&mut self) -> Expr {
+		let start = self.position();
+		let keyword = self.advance().unwrap().1; // `loop`
+		let label = self.parse_control_label(keyword);
+		self.expect(&Token::LParen);
+		let mut bindings = Vec::new();
+		while !self.check(&Token::RParen) && !self.at_end() {
+			let (meta, value) = self.parse_let_binding();
+			bindings.push(StateBinding { meta, value });
+			self.eat(&Token::Comma);
+		}
+		self.expect(&Token::RParen);
+		let body = self.parse_expr();
+		self.mk_expr(
+			ExprKind::StateLoop {
+				bindings,
 				body: Box::new(body),
 				label,
 			},
@@ -919,9 +933,10 @@ impl Parser<'_> {
 					| Token::HashLBrace
 					| Token::LParen
 					| Token::LBrace
+					| Token::Async
 					| Token::If
 					| Token::Match
-					| Token::While
+					| Token::Loop
 					| Token::For
 					| Token::Bang
 					| Token::Minus
@@ -929,6 +944,7 @@ impl Parser<'_> {
 					| Token::Return
 					| Token::Break
 					| Token::Continue
+					| Token::Echo
 			)
 		)
 	}

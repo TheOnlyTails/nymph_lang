@@ -103,6 +103,11 @@ interface Debug {
   func debug(): string
 }
 
+/// Synchronous, non-fallible, idempotent cleanup for managed resources.
+interface Close<!E> {
+  func close(): void + !E
+}
+
 interface Contains<Item: Equals<Other = Item>> {
   func contains(item: Item): boolean
 
@@ -128,11 +133,23 @@ interface Into<Other> {
 interface Comparable<Other> {
   func compare_to(other: Other): Order
 
-  func less_than(other: Other): boolean = this.compare_to(other) == Order.LessThan
-  func less_than_eq(other: Other): boolean = this.compare_to(other) != Order.GreaterThan
+  func less_than(other: Other): boolean = match (this.compare_to(other)) {
+    LessThan -> true,
+    _ -> false,
+  }
+  func less_than_eq(other: Other): boolean = match (this.compare_to(other)) {
+    GreaterThan -> false,
+    _ -> true,
+  }
 
-  func greater_than(other: Other): boolean = this.compare_to(other) == Order.GreaterThan
-  func greater_than_eq(other: Other): boolean = this.compare_to(other) != Order.LessThan
+  func greater_than(other: Other): boolean = match (this.compare_to(other)) {
+    GreaterThan -> true,
+    _ -> false,
+  }
+  func greater_than_eq(other: Other): boolean = match (this.compare_to(other)) {
+    LessThan -> false,
+    _ -> true,
+  }
 
   // `min`/`max` are deliberately not provided here: a default body can only be
   // checked once, generically, for every future implementor, and
@@ -142,7 +159,10 @@ interface Comparable<Other> {
   // real, not just conventional. Provide `min`/`max` per concrete type instead.
 
   impl Equals<Other> {
-    func equals(other: Other): boolean = this.compare_to(other) == Order.Equal
+    func equals(other: Other): boolean = match (this.compare_to(other)) {
+      Equal -> true,
+      _ -> false,
+    }
   }
 }
 
@@ -292,40 +312,37 @@ impl Equals<Other = int> for uint {
 // language's zero-domain rules instead of falling through to JavaScript `**`.
 // The three helpers intentionally use exponentiation by squaring.
 func int_power_uint(base: int, exponent: uint): int = {
-  let mut result = 1
-  let mut factor = base
-  let mut remaining = exponent
-  while (remaining > 0) {
-    if (remaining % 2 == 1) { result = result * factor }
-    remaining = (remaining / 2) as uint
-    if (remaining > 0) { factor = factor * factor }
-  }
-  result
+  int_power_uint_state(1, base, exponent)
 }
+
+func int_power_uint_state(result: int, factor: int, remaining: uint): int =
+  if (remaining == 0u) result else int_power_uint_state(
+    if (remaining % 2u == 1u) result * factor else result,
+    if (remaining > 1u) factor * factor else factor,
+    (remaining / 2u) as uint,
+  )
 
 func uint_power_uint(base: uint, exponent: uint): uint = {
-  let mut result: uint = 1
-  let mut factor = base
-  let mut remaining = exponent
-  while (remaining > 0) {
-    if (remaining % 2 == 1) { result = result * factor }
-    remaining = (remaining / 2) as uint
-    if (remaining > 0) { factor = factor * factor }
-  }
-  result
+  uint_power_uint_state(1u, base, exponent)
 }
 
+func uint_power_uint_state(result: uint, factor: uint, remaining: uint): uint =
+  if (remaining == 0u) result else uint_power_uint_state(
+    if (remaining % 2u == 1u) result * factor else result,
+    if (remaining > 1u) factor * factor else factor,
+    (remaining / 2u) as uint,
+  )
+
 func float_power_uint(base: float, exponent: uint): float = {
-  let mut result = 1.0
-  let mut factor = base
-  let mut remaining = exponent
-  while (remaining > 0) {
-    if (remaining % 2 == 1) { result = result * factor }
-    remaining = (remaining / 2) as uint
-    if (remaining > 0) { factor = factor * factor }
-  }
-  result
+  float_power_uint_state(1.0, base, exponent)
 }
+
+func float_power_uint_state(result: float, factor: float, remaining: uint): float =
+  if (remaining == 0u) result else float_power_uint_state(
+    if (remaining % 2u == 1u) result * factor else result,
+    if (remaining > 1u) factor * factor else factor,
+    (remaining / 2u) as uint,
+  )
 
 impl Power<Other = uint, Output = int> for int {
   func power(other: uint): int = int_power_uint(this, other)
@@ -342,7 +359,7 @@ impl Power<Other = uint, Output = float> for float {
 impl Power<Other = int, Output = float> for int {
   func power(other: int): float = if (other < 0) {
     if (this == 0) { scalar_power_domain_error() }
-    1.0 / float_power_uint(this as float, other as uint)
+    1.0 / float_power_uint(this as float, ((-(other + 1)) as uint) + 1u)
   } else {
     float_power_uint(this as float, other as uint)
   }
@@ -351,7 +368,7 @@ impl Power<Other = int, Output = float> for int {
 impl Power<Other = int, Output = float> for uint {
   func power(other: int): float = if (other < 0) {
     if (this == 0) { scalar_power_domain_error() }
-    1.0 / float_power_uint(this as float, other as uint)
+    1.0 / float_power_uint(this as float, ((-(other + 1)) as uint) + 1u)
   } else {
     float_power_uint(this as float, other as uint)
   }
@@ -360,7 +377,7 @@ impl Power<Other = int, Output = float> for uint {
 impl Power<Other = int, Output = float> for float {
   func power(other: int): float = if (other < 0) {
     if (this == 0.0) { scalar_power_domain_error() }
-    1.0 / float_power_uint(this, other as uint)
+    1.0 / float_power_uint(this, ((-(other + 1)) as uint) + 1u)
   } else {
     float_power_uint(this, other as uint)
   }
@@ -458,28 +475,8 @@ impl Comparable<Other = self> for #() {
 
 // Comparable extension: minmax
 impl<T> Comparable<Other = T> for T {
-  func minmax(other: T) =
-    if (this.compare_to(other) == Order.LessThan) #(this, other) else #(other, this)  
-}
-
-// Equals blanket impl
-impl<T> Equals<Other = self> for T {
-  external(equals) func equals(other: self): boolean
-  external(not_equals) func not_equals(other: self): boolean
-}
-
-impl<T: Equals<Other = T>> Hash for T {
-  external(hash) func hash(): int
-}
-
-impl<T> Display for T {
-  external(display) func display(): string
-}
-
-impl<T> Debug for T {
-  external(debug) func debug(): string
-}
-
-impl<T: Display> Into<string> for T {
-  external(display) func into(): string
+  func minmax(other: T) = match (this.compare_to(other)) {
+    LessThan -> #(this, other),
+    _ -> #(other, this),
+  }
 }

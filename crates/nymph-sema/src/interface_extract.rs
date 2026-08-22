@@ -17,7 +17,8 @@ use crate::{
 	ImplementationHeader, InterfaceConversionError, InterfaceType, MemberKind, MemberShape,
 	ModuleEnvironment, ModuleIdentity, ModuleInterface, ParameterShape, RecoveredExportedDefinition,
 	RecoveredExportedImpl, RecoveredInterfaceType, RecoveredModuleInterface, SemanticAvailability,
-	StableIdBuilder, SuperInterfaceShape, SupportDefinition, VariantShape, canonicalize_type,
+	StableIdBuilder, SuperInterfaceShape, SupportDefinition, VariantShape, canonicalize_effect_row,
+	canonicalize_type,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
@@ -148,6 +149,7 @@ fn declaration_identity(declaration: &Declaration) -> Option<(DeclarationCategor
 		Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => {
 			(DeclarationCategory::Function, &meta.name.0)
 		}
+		Declaration::Effect { name, .. } => (DeclarationCategory::Effect, &name.0),
 		Declaration::Let { meta, .. } | Declaration::ExternalLet(_, _, meta) => {
 			let Pattern::Binding { name, .. } = &meta.name.0 else {
 				return None;
@@ -179,6 +181,14 @@ fn visible(visibility: Option<Visibility>) -> bool {
 	!matches!(visibility, Some(Visibility::Private))
 }
 
+fn namespace_visibility(visibility: Option<Visibility>) -> crate::NamespaceVisibility {
+	match visibility {
+		Some(Visibility::Internal) => crate::NamespaceVisibility::Internal,
+		Some(Visibility::Private) => crate::NamespaceVisibility::Private,
+		None | Some(Visibility::Public) => crate::NamespaceVisibility::Importable,
+	}
+}
+
 /// Exact top-level declaration facts from the recovered source module.
 ///
 /// This deliberately shares identity, source-name normalization, category,
@@ -200,24 +210,25 @@ pub fn top_level_declarations(
 			if raw_name.is_empty() {
 				return None;
 			}
-			let (visibility, name_span, mutable) = match declaration {
+			let (visibility, name_span) = match declaration {
 				Declaration::Func {
 					visibility, meta, ..
-				} => (*visibility, meta.name.1, false),
-				Declaration::ExternalFunc(visibility, _, meta) => (*visibility, meta.name.1, false),
+				} => (*visibility, meta.name.1),
+				Declaration::ExternalFunc(visibility, _, meta) => (*visibility, meta.name.1),
 				Declaration::Let {
 					visibility, meta, ..
 				} => {
 					let name = meta.name.0.as_binding()?;
-					(*visibility, name.1, meta.is_mutable())
+					(*visibility, name.1)
 				}
 				Declaration::ExternalLet(visibility, _, meta) => {
 					let name = meta.name.0.as_binding()?;
-					(*visibility, name.1, meta.is_mutable())
+					(*visibility, name.1)
 				}
 				Declaration::TypeAlias {
 					visibility, meta, ..
-				} => (*visibility, meta.name.1, false),
+				} => (*visibility, meta.name.1),
+				Declaration::Effect { visibility, name } => (*visibility, name.1),
 				Declaration::Struct {
 					visibility, name, ..
 				}
@@ -229,7 +240,7 @@ pub fn top_level_declarations(
 				}
 				| Declaration::Namespace {
 					visibility, name, ..
-				} => (*visibility, name.1, false),
+				} => (*visibility, name.1),
 				Declaration::Import { .. } | Declaration::Impl { .. } | Declaration::ImplFor { .. } => {
 					return None;
 				}
@@ -237,13 +248,8 @@ pub fn top_level_declarations(
 			Some(crate::TopLevelDeclaration {
 				name: source_name(raw_name).into(),
 				definition: headers.member_id(member)?.clone(),
-				visibility: if visible(visibility) {
-					crate::NamespaceVisibility::Importable
-				} else {
-					crate::NamespaceVisibility::Private
-				},
+				visibility: namespace_visibility(visibility),
 				category,
-				mutable,
 				name_span,
 			})
 		})
@@ -281,16 +287,71 @@ fn external_function_abi_with_result(
 ) -> ExternalAbi {
 	let callable = match nymph_hir::linkage::resolve(marker, receiver_tag, explicit_arity, result) {
 		nymph_hir::linkage::ExternalCallable::Linked(linked) => crate::ExternalCallable::Linked {
-			module: linked.module.into(),
-			symbol: linked.symbol.into(),
+			adapter: crate::ExternalAdapterId {
+				module: linked.module.into(),
+				symbol: linked.symbol.into(),
+			},
 		},
 		nymph_hir::linkage::ExternalCallable::Native(native) => crate::ExternalCallable::Native(native),
 		nymph_hir::linkage::ExternalCallable::Deferred => crate::ExternalCallable::Deferred,
 	};
+	let audit = external_audit(&callable);
 	ExternalAbi {
 		marker: marker.clone(),
 		callable,
-		marshal: None,
+		effects: crate::EffectRow::pure(),
+		audit,
+		call_mode: crate::ExternalCallMode::Ordinary,
+		marshal: crate::ExternalMarshalPlan::default(),
+	}
+}
+
+fn external_audit(callable: &crate::ExternalCallable) -> crate::ExternalAudit {
+	use crate::{ExternalState, ExternalTransaction};
+	use nymph_hir::linkage::ExternalEffect;
+
+	let crate::ExternalCallable::Linked { adapter } = callable else {
+		return crate::ExternalAudit {
+			state: ExternalState::None,
+			transaction: ExternalTransaction::Pure,
+		};
+	};
+	let effect = nymph_hir::linkage::external_effect(&adapter.module, &adapter.symbol);
+	let state = match effect {
+		ExternalEffect::Pure => ExternalState::None,
+		ExternalEffect::TransactionAware => match (adapter.module.as_str(), adapter.symbol.as_str()) {
+			("std/collections/list", "push" | "splice" | "insert" | "clear" | "remove")
+			| ("std/collections/map", "insert" | "remove" | "clear") => ExternalState::Write,
+			_ => ExternalState::Read,
+		},
+		ExternalEffect::IrreversibleHostIo | ExternalEffect::UnauditedStateful => ExternalState::Write,
+	};
+	let transaction = match effect {
+		ExternalEffect::Pure => ExternalTransaction::Pure,
+		ExternalEffect::TransactionAware => ExternalTransaction::Aware,
+		ExternalEffect::IrreversibleHostIo | ExternalEffect::UnauditedStateful => {
+			ExternalTransaction::Irreversible
+		}
+	};
+	crate::ExternalAudit { state, transaction }
+}
+
+fn external_function_contract<E>(
+	abi: ExternalAbi,
+	effects: E,
+	parameters: impl IntoIterator<Item = Option<nymph_hir::hir::MarshalKind>>,
+	result: Option<nymph_hir::hir::MarshalKind>,
+) -> crate::ExternalAbi<E> {
+	crate::ExternalAbi {
+		marker: abi.marker,
+		callable: abi.callable,
+		effects,
+		audit: abi.audit,
+		call_mode: abi.call_mode,
+		marshal: crate::ExternalMarshalPlan {
+			parameters: parameters.into_iter().collect(),
+			result,
+		},
 	}
 }
 
@@ -324,20 +385,39 @@ fn checked_external_function_abi(
 		nymph_hir::ty::TyKind::SelfTy => receiver_builtin_result(receiver_tag),
 		_ => None,
 	};
-	external_function_abi_with_result(marker, receiver_tag, Some(explicit_arity), result)
+	let result_marshal = checked_external_marshal(interner, return_type);
+	external_function_contract(
+		external_function_abi_with_result(marker, receiver_tag, Some(explicit_arity), result),
+		crate::EffectRow::pure(),
+		[],
+		result_marshal,
+	)
+}
+
+fn checked_external_marshal(
+	interner: &crate::ty::Interner,
+	ty: crate::Ty,
+) -> Option<nymph_hir::hir::MarshalKind> {
+	use nymph_hir::{hir::MarshalKind, ty::TyKind};
+	match interner.kind(ty) {
+		TyKind::Int => Some(MarshalKind::Int),
+		TyKind::UInt => Some(MarshalKind::UInt),
+		TyKind::Float => Some(MarshalKind::Float),
+		TyKind::Char => Some(MarshalKind::Char),
+		TyKind::String => Some(MarshalKind::String),
+		TyKind::Boolean => Some(MarshalKind::Boolean),
+		TyKind::List(_) => Some(MarshalKind::List),
+		TyKind::Tuple(_) => Some(MarshalKind::Tuple),
+		TyKind::Map(_, _) => Some(MarshalKind::Map),
+		_ => None,
+	}
 }
 
 fn implementation_receiver_tag(owner: &DefinitionId) -> Option<&'static str> {
 	let DeclarationKey::Implementation { header, .. } = &owner.key else {
 		return None;
 	};
-	let mut mutable = header.mutable;
-	let mut self_type = &header.self_type;
-	while let HeaderType::Mutable(inner) = self_type {
-		mutable = true;
-		self_type = inner;
-	}
-	let base = match self_type {
+	let base = match &header.self_type {
 		HeaderType::List(_) => "list",
 		HeaderType::Map(_, _) => "map",
 		HeaderType::Int => "int",
@@ -348,11 +428,7 @@ fn implementation_receiver_tag(owner: &DefinitionId) -> Option<&'static str> {
 		HeaderType::Boolean => "boolean",
 		_ => return None,
 	};
-	match (mutable, base) {
-		(true, "list") => Some("mut_list"),
-		(true, "map") => Some("mut_map"),
-		_ => Some(base),
-	}
+	Some(base)
 }
 
 pub(crate) fn external_value_abi(
@@ -360,15 +436,25 @@ pub(crate) fn external_value_abi(
 	marshal: Option<nymph_hir::hir::MarshalKind>,
 ) -> ExternalAbi {
 	let linked = nymph_hir::linkage::lookup_value(marker).ok();
-	ExternalAbi {
-		marker: marker.clone(),
-		callable: linked.map_or(crate::ExternalCallable::Deferred, |linkage| {
-			crate::ExternalCallable::Linked {
+	let callable = linked.map_or(crate::ExternalCallable::Deferred, |linkage| {
+		crate::ExternalCallable::Linked {
+			adapter: crate::ExternalAdapterId {
 				module: linkage.linked.module.into(),
 				symbol: linkage.linked.symbol.into(),
-			}
-		}),
-		marshal,
+			},
+		}
+	});
+	let audit = external_audit(&callable);
+	ExternalAbi {
+		marker: marker.clone(),
+		callable,
+		effects: crate::EffectRow::pure(),
+		audit,
+		call_mode: crate::ExternalCallMode::Ordinary,
+		marshal: crate::ExternalMarshalPlan {
+			parameters: Vec::new(),
+			result: marshal,
+		},
 	}
 }
 
@@ -404,14 +490,66 @@ fn empty_definition(
 		constraints: Vec::new(),
 		parameters: Vec::new(),
 		return_type: None,
+		effects: crate::EffectRow::pure(),
 		ty: None,
 		fields: Vec::new(),
 		variants: Vec::new(),
+		enum_view_variants: Vec::new(),
 		members: Vec::new(),
 		super_interfaces: Vec::new(),
 		external: None,
 		runtime_owner: None,
 	}
+}
+
+fn accepted_enum_variants(checked: &CheckedFacts, root: crate::DefId) -> Vec<DefinitionId> {
+	if let Some(signature) = checked.semantic.signatures.enums.get(&root)
+		&& signature.embeddings.is_empty()
+	{
+		return signature
+			.variants
+			.iter()
+			.filter_map(|variant| variant.target.clone())
+			.collect();
+	}
+
+	fn visit(
+		checked: &CheckedFacts,
+		enum_def: crate::DefId,
+		visited: &mut rustc_hash::FxHashSet<crate::DefId>,
+		accepted: &mut std::collections::BTreeSet<DefinitionId>,
+	) {
+		if !visited.insert(enum_def) {
+			return;
+		}
+		let Some(signature) = checked.semantic.signatures.enums.get(&enum_def) else {
+			return;
+		};
+		accepted.extend(
+			signature
+				.variants
+				.iter()
+				.filter_map(|variant| variant.target.clone()),
+		);
+		for embedding in &signature.embeddings {
+			if let Some(variant) = embedding.variant {
+				if let Some(target) = checked.semantic.definitions.stable(variant) {
+					accepted.insert(target.clone());
+				}
+			} else {
+				visit(checked, embedding.source, visited, accepted);
+			}
+		}
+	}
+
+	let mut accepted = std::collections::BTreeSet::new();
+	visit(
+		checked,
+		root,
+		&mut rustc_hash::FxHashSet::default(),
+		&mut accepted,
+	);
+	accepted.into_iter().collect()
 }
 
 fn context(checked: &CheckedFacts, headers: &DeclaredHeaders) -> CanonicalizationContext {
@@ -436,7 +574,7 @@ fn definition_context(
 	checked: &CheckedFacts,
 	headers: &DeclaredHeaders,
 	id: &DefinitionId,
-	generic_names: impl IntoIterator<Item = EcoString>,
+	generics: impl IntoIterator<Item = (EcoString, crate::GenericParameterKind)>,
 ) -> (CanonicalizationContext, Vec<GenericParameter>) {
 	let definitions = checked
 		.semantic
@@ -452,12 +590,13 @@ fn definition_context(
 				.map(|stable| (crate::DefId(index as u32), stable))
 		})
 		.collect();
-	let binders = generic_names
+	let binders = generics
 		.into_iter()
 		.enumerate()
-		.map(|(index, name)| GenericParameter {
+		.map(|(index, (name, kind))| GenericParameter {
 			id: GenericParameterId::new(id.binder(BinderScope::Definition, 0), index as u32),
 			name,
+			kind,
 		})
 		.collect::<Vec<_>>();
 	let parameters = binders
@@ -469,6 +608,13 @@ fn definition_context(
 		CanonicalizationContext::new(definitions, parameters),
 		binders,
 	)
+}
+
+fn generic_parameter_kind(kind: nymph_ast::ty::GenericParamKind) -> crate::GenericParameterKind {
+	match kind {
+		nymph_ast::ty::GenericParamKind::Type => crate::GenericParameterKind::Type,
+		nymph_ast::ty::GenericParamKind::Effect => crate::GenericParameterKind::Effect,
+	}
 }
 
 fn ast_type(
@@ -489,7 +635,6 @@ fn ast_type(
 		Type::Infer => return Err(InterfaceConversionError::ErrorType),
 		Type::Grouped(inner) => ast_type(&inner.0, headers, binders)?,
 		Type::List(inner) => InterfaceType::List(Box::new(ast_type(&inner.0, headers, binders)?)),
-		Type::Mut(inner) => InterfaceType::Mutable(Box::new(ast_type(&inner.0, headers, binders)?)),
 		Type::Tuple(items) => InterfaceType::Tuple(
 			items
 				.iter()
@@ -503,12 +648,18 @@ fn ast_type(
 		Type::Function {
 			params,
 			return_type,
+			effects,
 		} => InterfaceType::Function {
 			parameters: params
 				.iter()
 				.map(|(_, t)| ast_type(&t.0, headers, binders))
 				.collect::<Result<_, _>>()?,
 			return_type: Box::new(ast_type(&return_type.0, headers, binders)?),
+			effects: effects
+				.as_ref()
+				.map(|row| ast_effect_row(&row.0, headers, binders))
+				.transpose()?
+				.unwrap_or_else(crate::EffectRow::pure),
 		},
 		Type::Intersection(a, b) => InterfaceType::Intersection(vec![
 			ast_type(&a.0, headers, binders)?,
@@ -527,7 +678,10 @@ fn ast_type(
 				let mut positional = Vec::new();
 				let mut named = Vec::new();
 				for argument in generics {
-					let value = ast_type(&argument.0.value.0, headers, binders)?;
+					let Some(argument_type) = argument.0.value.as_type() else {
+						continue;
+					};
+					let value = ast_type(&argument_type.0, headers, binders)?;
 					if let Some(name) = &argument.0.name {
 						named.push((name.0.clone(), value));
 					} else {
@@ -542,6 +696,35 @@ fn ast_type(
 			}
 		}
 	})
+}
+
+fn ast_effect_row(
+	row: &nymph_ast::ty::EffectRow,
+	headers: &DeclaredHeaders,
+	binders: &[GenericParameter],
+) -> Result<crate::EffectRow, InterfaceConversionError> {
+	let mut atoms = Vec::new();
+	for effect in &row.effects {
+		match &effect.0 {
+			nymph_ast::ty::Effect::Named(name) => {
+				if let Some(parameter) = binders.iter().find(|parameter| parameter.name == name.0) {
+					if parameter.kind != crate::GenericParameterKind::Effect {
+						return Err(InterfaceConversionError::ErrorType);
+					}
+					atoms.push(crate::EffectAtom::Parameter(parameter.id.clone()));
+				} else {
+					let definition = headers
+						.id(&name.0)
+						.ok_or(InterfaceConversionError::ErrorType)?;
+					atoms.push(crate::EffectAtom::Nominal(definition));
+				}
+			}
+			nymph_ast::ty::Effect::Infer | nymph_ast::ty::Effect::Error => {
+				return Err(InterfaceConversionError::ErrorType);
+			}
+		}
+	}
+	Ok(crate::EffectRow::new(atoms))
 }
 
 fn generic_constraints(
@@ -567,6 +750,7 @@ fn generic_constraints(
 			interface: definition,
 			positional,
 			named,
+			effect_args: Vec::new(),
 		});
 	}
 	Ok(constraints)
@@ -607,6 +791,11 @@ fn checked_constraints(
 						))
 					})
 					.collect::<Result<_, InterfaceConversionError>>()?,
+				effect_args: bound
+					.effect_args
+					.iter()
+					.map(|(name, effects)| Ok((name.clone(), canonicalize_effect_row(effects, context)?)))
+					.collect::<Result<_, InterfaceConversionError>>()?,
 			})
 		})
 		.collect()
@@ -635,6 +824,7 @@ fn checked_member_shape(
 		.map(|(index, generic)| GenericParameter {
 			id: GenericParameterId::new(id.binder(BinderScope::Member, 0), index as u32),
 			name: generic.0.name.0.clone(),
+			kind: generic_parameter_kind(generic.0.kind),
 		})
 		.collect::<Vec<_>>();
 	let mut anonymous = HashSet::new();
@@ -648,6 +838,7 @@ fn checked_member_shape(
 		binders.push(GenericParameter {
 			id: GenericParameterId::new(id.binder(BinderScope::Member, 0), binder_index as u32),
 			name: format!("$anonymous{binder_index}").into(),
+			kind: crate::GenericParameterKind::Type,
 		});
 	}
 	let parameters = owner_binders
@@ -676,40 +867,89 @@ fn checked_member_shape(
 		);
 	}
 	let return_type = canonicalize_type(&checked.interner, facts.ret, &member_context)?;
+	let id = facts.definition.clone().unwrap_or(id);
+	let effects = checked
+		.semantic
+		.effect_row(&id)
+		.cloned()
+		.unwrap_or_default();
+	let known_effect_parameters = owner_binders
+		.iter()
+		.chain(&binders)
+		.filter(|binder| binder.kind == crate::GenericParameterKind::Effect)
+		.collect::<Vec<_>>();
+	let member_binder = id.binder(BinderScope::Member, 0);
+	let effects = crate::EffectRow::new(
+		effects
+			.atoms()
+			.iter()
+			.map(|atom| match atom {
+				crate::EffectAtom::Parameter(parameter)
+					if !known_effect_parameters
+						.iter()
+						.any(|binder| binder.id == *parameter) =>
+				{
+					let replacement = if parameter.binder == member_binder {
+						owner_binders
+							.get(parameter.index as usize)
+							.or_else(|| binders.get(parameter.index as usize - owner_binders.len()))
+					} else {
+						known_effect_parameters.iter().copied().find(|binder| {
+							binder.id.binder == parameter.binder && binder.id.index == parameter.index
+						})
+					};
+					replacement
+						.filter(|binder| binder.kind == crate::GenericParameterKind::Effect)
+						.map_or_else(
+							|| atom.clone(),
+							|binder| crate::EffectAtom::Parameter(binder.id.clone()),
+						)
+				}
+				_ => atom.clone(),
+			})
+			.collect(),
+	);
+	let parameters = facts
+		.params
+		.iter()
+		.zip(&meta.params)
+		.map(|(ty, parameter)| {
+			Ok(ParameterShape {
+				name: match &parameter.0.name.0 {
+					Pattern::Binding { name, .. } => Some(name.0.clone()),
+					_ => None,
+				},
+				ty: canonicalize_type(&checked.interner, *ty, &member_context)?,
+				spread: parameter.0.spread,
+			})
+		})
+		.collect::<Result<Vec<_>, InterfaceConversionError>>()?;
 	Ok(MemberShape {
-		id: facts.definition.clone().unwrap_or(id),
+		id,
 		name: meta.name.0.clone(),
 		visibility,
 		kind: match meta.kind {
 			FuncKind::Instance => MemberKind::Function,
-			FuncKind::Mut => MemberKind::MutatingFunction,
 			FuncKind::Namespace => MemberKind::StaticFunction,
 		},
 		binders,
 		constraints: checked_constraints(&bounds, checked, headers, &member_context)?,
-		parameters: facts
-			.params
-			.iter()
-			.zip(&meta.params)
-			.map(|(ty, parameter)| {
-				Ok(ParameterShape {
-					name: match &parameter.0.name.0 {
-						Pattern::Binding { name, .. } => Some(name.0.clone()),
-						_ => None,
-					},
-					ty: canonicalize_type(&checked.interner, *ty, &member_context)?,
-					mutable: parameter.0.mutable,
-					spread: parameter.0.spread,
-				})
-			})
-			.collect::<Result<_, InterfaceConversionError>>()?,
+		parameters: parameters.clone(),
 		return_type: return_type.clone(),
+		effects: effects.clone(),
 		external: external_symbol.map(|symbol| {
-			external_function_abi_for_receiver(
-				symbol,
-				implementation_receiver_tag(owner),
-				Some(facts.params.len()),
-				Some(&return_type),
+			external_function_contract(
+				external_function_abi_for_receiver(
+					symbol,
+					implementation_receiver_tag(owner),
+					Some(facts.params.len()),
+					Some(&return_type),
+				),
+				effects,
+				parameters
+					.iter()
+					.map(|parameter| external_marshal(&parameter.ty)),
+				external_marshal(&return_type),
 			)
 		}),
 		runtime_owner: Some(owner.clone()),
@@ -727,7 +967,7 @@ fn collect_anonymous_parameters(
 		TyKind::Param(parameter) if parameter.0 >= 1 << 28 => {
 			parameters.insert(*parameter);
 		}
-		TyKind::List(inner) | TyKind::Mut(inner) => {
+		TyKind::List(inner) => {
 			collect_anonymous_parameters(interner, *inner, parameters);
 		}
 		TyKind::Tuple(items) | TyKind::Intersection(items) => {
@@ -739,7 +979,7 @@ fn collect_anonymous_parameters(
 			collect_anonymous_parameters(interner, *key, parameters);
 			collect_anonymous_parameters(interner, *value, parameters);
 		}
-		TyKind::Fn { params, ret } => {
+		TyKind::Fn { params, ret, .. } => {
 			for parameter in params {
 				collect_anonymous_parameters(interner, *parameter, parameters);
 			}
@@ -790,6 +1030,7 @@ fn definition_anonymous_context(
 				binder_index as u32,
 			),
 			name: format!("$anonymous{binder_index}").into(),
+			kind: crate::GenericParameterKind::Type,
 		});
 	}
 	let parameters = binders
@@ -820,89 +1061,102 @@ fn member_shape(
 	binders: &[GenericParameter],
 	ids: &mut StableIdBuilder,
 ) -> Result<MemberShape<InterfaceType>, InterfaceConversionError> {
-	let (visibility, name, kind, parameters, return_type, external, has_default) = match member {
-		ImplMember::Func {
-			visibility, meta, ..
-		}
-		| ImplMember::ExternalFunc(visibility, _, meta) => {
-			let parameters: Vec<ParameterShape<InterfaceType>> = meta
-				.params
-				.iter()
-				.map(|p| {
-					Ok(ParameterShape {
-						name: match &p.0.name.0 {
-							Pattern::Binding { name, .. } => Some(name.0.clone()),
-							_ => None,
-						},
-						ty: ast_type(&p.0.type_.0, headers, binders)?,
-						mutable: p.0.mutable,
-						spread: p.0.spread,
+	let (visibility, name, kind, parameters, return_type, effects, external, has_default) =
+		match member {
+			ImplMember::Func {
+				visibility, meta, ..
+			}
+			| ImplMember::ExternalFunc(visibility, _, meta) => {
+				let parameters: Vec<ParameterShape<InterfaceType>> = meta
+					.params
+					.iter()
+					.map(|p| {
+						Ok(ParameterShape {
+							name: match &p.0.name.0 {
+								Pattern::Binding { name, .. } => Some(name.0.clone()),
+								_ => None,
+							},
+							ty: ast_type(&p.0.type_.0, headers, binders)?,
+							spread: p.0.spread,
+						})
 					})
-				})
-				.collect::<Result<_, InterfaceConversionError>>()?;
-			let ret = meta
-				.return_type
-				.as_ref()
-				.map(|t| ast_type(&t.0, headers, binders))
-				.transpose()?
-				.unwrap_or(InterfaceType::Void);
-			let external = match member {
-				ImplMember::ExternalFunc(_, symbol, _) => Some(external_function_abi_for_receiver(
-					symbol,
-					implementation_receiver_tag(owner),
-					Some(parameters.len()),
-					Some(&ret),
-				)),
-				_ => None,
-			};
-			(
-				*visibility,
-				meta.name.0.clone(),
-				match meta.kind {
-					FuncKind::Instance => MemberKind::Function,
-					FuncKind::Mut => MemberKind::MutatingFunction,
-					FuncKind::Namespace => MemberKind::StaticFunction,
-				},
-				parameters,
-				ret,
-				external,
-				true,
-			)
-		}
-		ImplMember::Let {
-			visibility, meta, ..
-		}
-		| ImplMember::ExternalLet(visibility, _, meta) => {
-			let Pattern::Binding { name, .. } = &meta.name.0 else {
-				return Err(InterfaceConversionError::ErrorType);
-			};
-			let ty = meta
-				.type_
-				.as_ref()
-				.map(|t| ast_type(&t.0, headers, binders))
-				.transpose()?
-				.unwrap_or(InterfaceType::Void);
-			let external = match member {
-				ImplMember::ExternalLet(_, symbol, _) => {
-					Some(external_value_abi(symbol, external_marshal(&ty)))
-				}
-				_ => None,
-			};
-			(
-				*visibility,
-				name.0.clone(),
-				match meta.kind {
-					nymph_ast::decl::LetKind::Instance => MemberKind::Value,
-					nymph_ast::decl::LetKind::Mut => MemberKind::MutableValue,
-					nymph_ast::decl::LetKind::Namespace => MemberKind::StaticValue,
-				},
-				Vec::new(),
-				ty,
-				external,
-				true,
-			)
-		}
-	};
+					.collect::<Result<_, InterfaceConversionError>>()?;
+				let ret = meta
+					.return_type
+					.as_ref()
+					.map(|t| ast_type(&t.0, headers, binders))
+					.transpose()?
+					.unwrap_or(InterfaceType::Void);
+				let effects = meta
+					.effects
+					.as_ref()
+					.map(|row| ast_effect_row(&row.0, headers, binders))
+					.transpose()?
+					.unwrap_or_default();
+				let external = match member {
+					ImplMember::ExternalFunc(_, symbol, _) => Some(external_function_contract(
+						external_function_abi_for_receiver(
+							symbol,
+							implementation_receiver_tag(owner),
+							Some(parameters.len()),
+							Some(&ret),
+						),
+						effects.clone(),
+						parameters
+							.iter()
+							.map(|parameter| external_marshal(&parameter.ty)),
+						external_marshal(&ret),
+					)),
+					_ => None,
+				};
+				(
+					*visibility,
+					meta.name.0.clone(),
+					match meta.kind {
+						FuncKind::Instance => MemberKind::Function,
+						FuncKind::Namespace => MemberKind::StaticFunction,
+					},
+					parameters,
+					ret,
+					effects,
+					external,
+					true,
+				)
+			}
+			ImplMember::Let {
+				visibility, meta, ..
+			}
+			| ImplMember::ExternalLet(visibility, _, meta) => {
+				let Pattern::Binding { name, .. } = &meta.name.0 else {
+					return Err(InterfaceConversionError::ErrorType);
+				};
+				let ty = meta
+					.type_
+					.as_ref()
+					.map(|t| ast_type(&t.0, headers, binders))
+					.transpose()?
+					.unwrap_or(InterfaceType::Void);
+				let external = match member {
+					ImplMember::ExternalLet(_, symbol, _) => {
+						Some(external_value_abi(symbol, external_marshal(&ty)))
+					}
+					_ => None,
+				};
+				(
+					*visibility,
+					name.0.clone(),
+					match meta.kind {
+						nymph_ast::decl::LetKind::Instance | nymph_ast::decl::LetKind::Use => MemberKind::Value,
+						nymph_ast::decl::LetKind::Namespace => MemberKind::StaticValue,
+					},
+					Vec::new(),
+					ty,
+					crate::EffectRow::pure(),
+					external,
+					true,
+				)
+			}
+		};
 	Ok(MemberShape {
 		id: ids.allocate(DeclarationKey::member(
 			owner.clone(),
@@ -916,14 +1170,15 @@ fn member_shape(
 		constraints: Vec::new(),
 		parameters,
 		return_type,
+		effects,
 		external,
 		runtime_owner: Some(owner.clone()),
 		has_default,
 	})
 }
 
-fn project_checked_runtime_member_facts<T, R>(
-	members: &mut [MemberShape<T, R>],
+fn project_checked_runtime_member_facts<T, R, E>(
+	members: &mut [MemberShape<T, R, E>],
 	runtime_members: &[crate::iface::RuntimeMemberDef],
 ) -> Result<(), InterfaceConversionError> {
 	for member in members {
@@ -935,16 +1190,18 @@ fn project_checked_runtime_member_facts<T, R>(
 			return Err(InterfaceConversionError::ErrorType);
 		}
 		member.kind = exact.kind;
-		if let Some(abi) = &mut member.external {
-			abi.marshal = exact.marshal;
+		if matches!(member.kind, MemberKind::Value | MemberKind::StaticValue)
+			&& let Some(abi) = &mut member.external
+		{
+			abi.marshal.result = exact.marshal;
 		}
 	}
 	Ok(())
 }
 
-fn project_checked_implementation_facts<T, R>(
+fn project_checked_implementation_facts<T, R, E>(
 	implementation_id: &DefinitionId,
-	members: &mut [MemberShape<T, R>],
+	members: &mut [MemberShape<T, R, E>],
 	implementation: &crate::iface::ImplDef,
 ) -> Result<crate::ImplementationMemberCatalog, InterfaceConversionError> {
 	if implementation.definition.as_ref() != Some(implementation_id) {
@@ -982,7 +1239,7 @@ fn project_checked_external_value_marshals(
 				.external
 				.as_mut()
 				.ok_or(InterfaceConversionError::ErrorType)?;
-			abi.marshal = Some(marshal);
+			abi.marshal.result = Some(marshal);
 		}
 	}
 	Ok(())
@@ -1109,14 +1366,14 @@ fn namespace_members(
 					name: name.0.clone(),
 					visibility: *visibility,
 					kind: match meta.kind {
-						nymph_ast::decl::LetKind::Instance => MemberKind::Value,
-						nymph_ast::decl::LetKind::Mut => MemberKind::MutableValue,
+						nymph_ast::decl::LetKind::Instance | nymph_ast::decl::LetKind::Use => MemberKind::Value,
 						nymph_ast::decl::LetKind::Namespace => MemberKind::StaticValue,
 					},
 					binders: Vec::new(),
 					constraints: Vec::new(),
 					parameters: Vec::new(),
 					return_type: ty,
+					effects: crate::EffectRow::pure(),
 					external,
 					runtime_owner: Some(owner.clone()),
 					has_default: true,
@@ -1127,6 +1384,12 @@ fn namespace_members(
 }
 
 fn header_type(ty: &InterfaceType, binders: &[GenericParameter]) -> HeaderType {
+	match ty {
+		InterfaceType::Task { .. } | InterfaceType::Handle(_) | InterfaceType::HandleOutcome(_) => {
+			return header_async_type(ty, binders);
+		}
+		_ => {}
+	}
 	match ty {
 		InterfaceType::Int => HeaderType::Int,
 		InterfaceType::UInt => HeaderType::UInt,
@@ -1148,10 +1411,15 @@ fn header_type(ty: &InterfaceType, binders: &[GenericParameter]) -> HeaderType {
 		InterfaceType::Function {
 			parameters,
 			return_type,
+			effects,
 		} => HeaderType::Function {
 			parameters: parameters.iter().map(|t| header_type(t, binders)).collect(),
 			return_type: Box::new(header_type(return_type, binders)),
+			effects: effects.clone(),
 		},
+		InterfaceType::Task { .. } | InterfaceType::Handle(_) | InterfaceType::HandleOutcome(_) => {
+			unreachable!()
+		}
 		InterfaceType::Named {
 			definition,
 			positional,
@@ -1167,13 +1435,26 @@ fn header_type(ty: &InterfaceType, binders: &[GenericParameter]) -> HeaderType {
 		InterfaceType::Intersection(ts) => {
 			HeaderType::Intersection(ts.iter().map(|t| header_type(t, binders)).collect())
 		}
-		InterfaceType::Mutable(t) => HeaderType::Mutable(Box::new(header_type(t, binders))),
 		InterfaceType::Generic(id) => HeaderType::Generic(HeaderParameterId(
 			binders
 				.iter()
 				.position(|b| b.id == *id)
 				.expect("impl binder exists") as u32,
 		)),
+	}
+}
+
+fn header_async_type(ty: &InterfaceType, binders: &[GenericParameter]) -> HeaderType {
+	match ty {
+		InterfaceType::Task { output, effects } => HeaderType::Task {
+			output: Box::new(header_type(output, binders)),
+			effects: effects.clone(),
+		},
+		InterfaceType::Handle(output) => HeaderType::Handle(Box::new(header_type(output, binders))),
+		InterfaceType::HandleOutcome(output) => {
+			HeaderType::HandleOutcome(Box::new(header_type(output, binders)))
+		}
+		_ => unreachable!(),
 	}
 }
 
@@ -1365,7 +1646,6 @@ pub(crate) fn assign_runtime_body_identities(
 		.enumerate()
 		.filter_map(|(declaration, item)| match item {
 			Declaration::ImplFor {
-				mutable,
 				for_interface,
 				members,
 				..
@@ -1375,7 +1655,6 @@ pub(crate) fn assign_runtime_body_identities(
 					declaration: declaration as u32,
 					nested: None,
 				},
-				*mutable,
 				members,
 			)]),
 			Declaration::Struct { impls, .. } | Declaration::Enum { impls, .. } => Some(
@@ -1389,7 +1668,6 @@ pub(crate) fn assign_runtime_body_identities(
 								declaration: declaration as u32,
 								nested: Some(nested as u32),
 							},
-							false,
 							&implementation.0.members,
 						)
 					})
@@ -1407,7 +1685,7 @@ pub(crate) fn assign_runtime_body_identities(
 		.iter_mut()
 		.filter(|implementation| implementation.definition.is_none())
 	{
-		let Some((_, _, mutable, _)) = implementation_sources
+		let Some((_, _, _)) = implementation_sources
 			.iter()
 			.find(|(span, ..)| Some(*span) == implementation.source_span)
 		else {
@@ -1421,7 +1699,11 @@ pub(crate) fn assign_runtime_body_identities(
 			&snapshot,
 			&headers,
 			&temporary,
-			implementation.generics.clone(),
+			implementation
+				.generics
+				.iter()
+				.cloned()
+				.map(|name| (name, crate::GenericParameterKind::Type)),
 		);
 		let Ok(self_type) = canonicalize_type(&checker.interner, implementation.self_ty, &context)
 		else {
@@ -1455,7 +1737,6 @@ pub(crate) fn assign_runtime_body_identities(
 				.map(|(name, ty)| (name.clone(), header_type(ty, &binders)))
 				.collect(),
 			self_type: header_type(&self_type, &binders),
-			mutable: *mutable,
 			binders: (0..binders.len())
 				.map(|index| HeaderBinder {
 					parameter: HeaderParameterId(index as u32),
@@ -1489,7 +1770,7 @@ pub(crate) fn assign_runtime_body_identities(
 		let source_runtime_members = implementation_sources
 			.iter()
 			.find(|(span, ..)| Some(*span) == implementation.source_span)
-			.map(|(_, _, _, members)| {
+			.map(|(_, _, members)| {
 				members
 					.iter()
 					.filter_map(|member| match &member.0 {
@@ -1551,13 +1832,6 @@ pub(crate) fn assign_runtime_body_identities(
 			)
 		})
 		.count();
-	let inherent_mutability =
-		std::iter::repeat_n(false, adt_groups).chain(checker.module.members.iter().filter_map(
-			|declaration| match declaration {
-				Declaration::Impl { mutable, .. } => Some(*mutable),
-				_ => None,
-			},
-		));
 	let adt_member_generics = checker
 		.module
 		.members
@@ -1577,13 +1851,12 @@ pub(crate) fn assign_runtime_body_identities(
 			_ => None,
 		})
 		.collect::<Vec<_>>();
-	for ((index, implementation), mutable) in checker
+	for (index, implementation) in checker
 		.inherent
 		.impls
 		.iter_mut()
 		.filter(|implementation| !implementation.imported)
 		.enumerate()
-		.zip(inherent_mutability)
 	{
 		let owner = (index < adt_groups)
 			.then(|| match checker.interner.kind(implementation.self_ty) {
@@ -1634,7 +1907,11 @@ pub(crate) fn assign_runtime_body_identities(
 				&snapshot,
 				&headers,
 				&temporary,
-				implementation.owner_generic_names.clone(),
+				implementation
+					.owner_generic_names
+					.iter()
+					.cloned()
+					.map(|name| (name, crate::GenericParameterKind::Type)),
 			);
 			if let Ok(self_type) = canonicalize_type(&checker.interner, implementation.self_ty, &context)
 			{
@@ -1643,7 +1920,6 @@ pub(crate) fn assign_runtime_body_identities(
 						interface: None,
 						interface_arguments: Vec::new(),
 						self_type: header_type(&self_type, &binders),
-						mutable,
 						binders: (0..binders.len())
 							.map(|index| HeaderBinder {
 								parameter: HeaderParameterId(index as u32),
@@ -1669,7 +1945,7 @@ pub(crate) fn assign_runtime_body_identities(
 			.is_some_and(|definition| definition.module == *identity)
 	});
 	for implementation in local_impls {
-		let Some((_, path, _, members)) = implementation_sources
+		let Some((_, path, members)) = implementation_sources
 			.iter()
 			.find(|(span, ..)| Some(*span) == implementation.source_span)
 		else {
@@ -1839,6 +2115,11 @@ fn collect_declaration_provenance(
 				.then_some(crate::DefId(index as u32))
 			});
 		match declaration {
+			Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => {
+				if let Some(target) = def.and_then(|def| checker.defs.stable(def)) {
+					source.declarations.insert(target.clone(), meta.name.1);
+				}
+			}
 			Declaration::Namespace { members, .. } => {
 				let Some(signature) = def.and_then(|def| checker.sigs.namespaces.get(&def)) else {
 					continue;
@@ -1985,6 +2266,7 @@ fn checker_snapshot(checker: &crate::check::Checker<'_>) -> Checked {
 		facts: crate::CheckedFacts {
 			annotations: crate::Annotations::default(),
 			runtime_roles: checker.stable_runtime_roles.clone(),
+			entry_root: None,
 			external_value_marshals: Default::default(),
 			interner: checker.interner.clone(),
 			semantic: crate::CheckedSemantic {
@@ -1995,6 +2277,7 @@ fn checker_snapshot(checker: &crate::check::Checker<'_>) -> Checked {
 				implementations: checker.impls.clone(),
 				inherent: Vec::new(),
 				anonymous_bounds: checker.synthetic_bound_details.clone(),
+				effect_rows: Default::default(),
 				local_definitions: 0..0,
 				local_implementations: 0..0,
 				local_inherent: 0..0,
@@ -2018,11 +2301,10 @@ fn function_shape(
 		.params
 		.iter()
 		.zip(&meta.params)
-		.map(|(sig, source)| {
+		.map(|(sig, _)| {
 			Ok(ParameterShape {
 				name: sig.label.clone(),
 				ty: canonicalize_type(&checked.interner, sig.ty, context)?,
-				mutable: source.0.mutable,
 				spread: sig.spread,
 			})
 		})
@@ -2032,6 +2314,11 @@ fn function_shape(
 		signature.ret,
 		context,
 	)?);
+	definition.effects = checked
+		.semantic
+		.effect_row(&definition.id)
+		.cloned()
+		.unwrap_or_default();
 	Ok(())
 }
 
@@ -2055,10 +2342,21 @@ fn extract_definition(
 		.by_stable(&id)
 		.expect("checked definition exists");
 	let mut result = match declaration {
+		Declaration::Effect { visibility, .. } => {
+			empty_definition(id, source_name, *visibility, DefinitionShapeKind::Effect)
+		}
 		Declaration::Func {
 			visibility, meta, ..
 		}
 		| Declaration::ExternalFunc(visibility, _, meta) => {
+			if matches!(declaration, Declaration::ExternalFunc(..))
+				&& meta
+					.effects
+					.as_ref()
+					.is_some_and(|effects| effects.0.requests_inference())
+			{
+				return Err(InterfaceConversionError::ErrorType);
+			}
 			let mut shape = empty_definition(
 				id,
 				source_name.clone(),
@@ -2069,7 +2367,12 @@ fn extract_definition(
 				checked,
 				headers,
 				&shape.id,
-				checked.semantic.signatures.funcs[&def].generics.clone(),
+				meta.generics.iter().map(|generic| {
+					(
+						generic.0.name.0.clone(),
+						generic_parameter_kind(generic.0.kind),
+					)
+				}),
 			);
 			let signature = &checked.semantic.signatures.funcs[&def];
 			let (generic_context, binders, anonymous_constraints) = definition_anonymous_context(
@@ -2090,7 +2393,21 @@ fn extract_definition(
 			function_shape(&mut shape, meta, def, checked, &generic_context)?;
 			shape.runtime_owner = Some(shape.id.clone());
 			if let Declaration::ExternalFunc(_, symbol, _) = declaration {
-				shape.external = Some(external_function_abi(symbol));
+				let return_type = shape.return_type.as_ref().unwrap_or(&InterfaceType::Void);
+				shape.external = Some(external_function_contract(
+					external_function_abi_for_receiver(
+						symbol,
+						None,
+						Some(shape.parameters.len()),
+						Some(return_type),
+					),
+					shape.effects.clone(),
+					shape
+						.parameters
+						.iter()
+						.map(|parameter| external_marshal(&parameter.ty)),
+					external_marshal(return_type),
+				));
 			}
 			shape
 		}
@@ -2132,7 +2449,12 @@ fn extract_definition(
 				checked,
 				headers,
 				&shape.id,
-				generics.iter().map(|g| g.0.name.0.clone()),
+				generics.iter().map(|generic| {
+					(
+						generic.0.name.0.clone(),
+						generic_parameter_kind(generic.0.kind),
+					)
+				}),
 			);
 			let (generic_context, binders, anonymous_constraints) = definition_anonymous_context(
 				&shape.id,
@@ -2149,17 +2471,22 @@ fn extract_definition(
 				.iter()
 				.zip(&signature.fields)
 				.map(|(field, (_, ty))| {
+					let field_id = member_ids.allocate(DeclarationKey::member(
+						id.clone(),
+						DeclarationCategory::Field,
+						field.0.name.0.clone(),
+					));
 					Ok(FieldShape {
-						id: member_ids.allocate(DeclarationKey::member(
-							id.clone(),
-							DeclarationCategory::Field,
-							field.0.name.0.clone(),
-						)),
+						id: field_id.clone(),
 						name: field.0.name.0.clone(),
-						visibility: field.0.visibility,
+						visibility: Some(field.0.visibility.unwrap_or(Visibility::Internal)),
 						ty: canonicalize_type(&checked.interner, *ty, &generic_context)?,
-						mutable: false,
 						has_default: field.0.default.is_some(),
+						default_effects: field
+							.0
+							.default
+							.as_ref()
+							.and_then(|_| checked.semantic.effect_row(&field_id).cloned()),
 					})
 				})
 				.collect::<Result<_, _>>()?;
@@ -2189,8 +2516,17 @@ fn extract_definition(
 				DefinitionShapeKind::Enum,
 			);
 			let signature = &checked.semantic.signatures.enums[&def];
-			let (_, binders) =
-				definition_context(checked, headers, &shape.id, signature.generics.clone());
+			let (_, binders) = definition_context(
+				checked,
+				headers,
+				&shape.id,
+				generics.iter().map(|generic| {
+					(
+						generic.0.name.0.clone(),
+						generic_parameter_kind(generic.0.kind),
+					)
+				}),
+			);
 			let (generic_context, binders, anonymous_constraints) = definition_anonymous_context(
 				&shape.id,
 				binders,
@@ -2227,10 +2563,10 @@ fn extract_definition(
 									field.0.name.0.clone(),
 								)),
 								name: field.0.name.0.clone(),
-								visibility: field.0.visibility,
+								visibility: Some(field.0.visibility.unwrap_or(Visibility::Internal)),
 								ty: canonicalize_type(&checked.interner, *ty, &generic_context)?,
-								mutable: false,
 								has_default: field.0.default.is_some(),
+								default_effects: None,
 							})
 						})
 						.collect::<Result<_, InterfaceConversionError>>()?;
@@ -2241,6 +2577,7 @@ fn extract_definition(
 					})
 				})
 				.collect::<Result<Vec<_>, InterfaceConversionError>>()?;
+			shape.enum_view_variants = accepted_enum_variants(checked, def);
 			shape.members = definition_members(
 				members,
 				def,
@@ -2268,7 +2605,12 @@ fn extract_definition(
 				checked,
 				headers,
 				&shape.id,
-				meta.generics.iter().map(|g| g.0.name.0.clone()),
+				meta.generics.iter().map(|generic| {
+					(
+						generic.0.name.0.clone(),
+						generic_parameter_kind(generic.0.kind),
+					)
+				}),
 			);
 			shape.ty = Some(ast_type(&value.0, headers, &binders)?);
 			shape.constraints = generic_constraints(&meta.generics, headers, &binders)?;
@@ -2292,7 +2634,12 @@ fn extract_definition(
 				checked,
 				headers,
 				&shape.id,
-				generics.iter().map(|g| g.0.name.0.clone()),
+				generics.iter().map(|generic| {
+					(
+						generic.0.name.0.clone(),
+						generic_parameter_kind(generic.0.kind),
+					)
+				}),
 			);
 			shape.binders = binders;
 			shape.constraints = generic_constraints(generics, headers, &shape.binders)?;
@@ -2303,7 +2650,10 @@ fn extract_definition(
 					let mut positional = Vec::new();
 					let mut named = Vec::new();
 					for argument in arguments {
-						let ty = ast_type(&argument.0.value.0, headers, &shape.binders)?;
+						let Some(value) = argument.0.value.as_type() else {
+							continue;
+						};
+						let ty = ast_type(&value.0, headers, &shape.binders)?;
 						if let Some(name) = &argument.0.name {
 							named.push((name.0.clone(), ty));
 						} else {
@@ -2403,6 +2753,17 @@ fn extract_definition(
 			unreachable!()
 		}
 	};
+	let source_generics: &[nymph_ast::Spanned<nymph_ast::ty::GenericParam>] = match declaration {
+		Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => &meta.generics,
+		Declaration::TypeAlias { meta, .. } => &meta.generics,
+		Declaration::Struct { generics, .. }
+		| Declaration::Enum { generics, .. }
+		| Declaration::Interface { generics, .. } => generics,
+		_ => &[],
+	};
+	for (binder, generic) in result.binders.iter_mut().zip(source_generics) {
+		binder.kind = generic_parameter_kind(generic.0.kind);
+	}
 	result.declaration_kind = declaration_member_kind(declaration);
 	// External ABI metadata comes from checked linkage during lowering; stable
 	// ownership is already represented here.
@@ -2415,16 +2776,22 @@ fn declaration_member_kind(declaration: &Declaration) -> Option<MemberKind> {
 		Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => {
 			Some(match meta.kind {
 				FuncKind::Instance => MemberKind::Function,
-				FuncKind::Mut => MemberKind::MutatingFunction,
 				FuncKind::Namespace => MemberKind::StaticFunction,
 			})
 		}
 		Declaration::Let { meta, .. } | Declaration::ExternalLet(_, _, meta) => Some(match meta.kind {
-			nymph_ast::decl::LetKind::Instance => MemberKind::Value,
-			nymph_ast::decl::LetKind::Mut => MemberKind::MutableValue,
+			nymph_ast::decl::LetKind::Instance | nymph_ast::decl::LetKind::Use => MemberKind::Value,
 			nymph_ast::decl::LetKind::Namespace => MemberKind::StaticValue,
 		}),
 		_ => None,
+	}
+}
+
+fn referenced_effects(effects: &crate::EffectRow, out: &mut HashSet<DefinitionId>) {
+	for atom in effects.atoms() {
+		if let crate::EffectAtom::Nominal(definition) = atom {
+			out.insert(definition.clone());
+		}
 	}
 }
 
@@ -2443,7 +2810,7 @@ fn referenced_definitions(ty: &InterfaceType, out: &mut HashSet<DefinitionId>) {
 				referenced_definitions(ty, out);
 			}
 		}
-		InterfaceType::List(ty) | InterfaceType::Mutable(ty) => referenced_definitions(ty, out),
+		InterfaceType::List(ty) => referenced_definitions(ty, out),
 		InterfaceType::Tuple(types) | InterfaceType::Intersection(types) => {
 			for ty in types {
 				referenced_definitions(ty, out);
@@ -2456,17 +2823,21 @@ fn referenced_definitions(ty: &InterfaceType, out: &mut HashSet<DefinitionId>) {
 		InterfaceType::Function {
 			parameters,
 			return_type,
+			effects,
 		} => {
 			for ty in parameters {
 				referenced_definitions(ty, out);
 			}
 			referenced_definitions(return_type, out);
+			referenced_effects(effects, out);
 		}
 		_ => {}
 	}
 }
 
 fn referenced_definition_shape(definition: &ExportedDefinition, out: &mut HashSet<DefinitionId>) {
+	referenced_effects(&definition.effects, out);
+	out.extend(definition.enum_view_variants.iter().cloned());
 	for constraint in &definition.constraints {
 		out.insert(constraint.interface.clone());
 		for ty in constraint
@@ -2503,6 +2874,7 @@ fn referenced_definition_shape(definition: &ExportedDefinition, out: &mut HashSe
 		referenced_definitions(ty, out);
 	}
 	for member in &definition.members {
+		referenced_effects(&member.effects, out);
 		for constraint in &member.constraints {
 			out.insert(constraint.interface.clone());
 			for ty in constraint
@@ -2543,6 +2915,7 @@ fn referenced_impl_shape(implementation: &ExportedImpl, out: &mut HashSet<Defini
 		}
 	}
 	for member in &implementation.members {
+		referenced_effects(&member.effects, out);
 		for constraint in &member.constraints {
 			out.insert(constraint.interface.clone());
 			for ty in constraint
@@ -2577,7 +2950,6 @@ fn extract_implementations(
 		.filter_map(|(index, declaration)| match declaration {
 			Declaration::ImplFor {
 				visibility,
-				mutable,
 				members,
 				..
 			} => Some((
@@ -2586,7 +2958,6 @@ fn extract_implementations(
 					nested: None,
 				},
 				*visibility,
-				*mutable,
 				members,
 			)),
 			_ => None,
@@ -2604,7 +2975,6 @@ fn extract_implementations(
 					nested: Some(nested as u32),
 				},
 				None,
-				false,
 				&implementation.0.members,
 			)
 		}));
@@ -2614,7 +2984,7 @@ fn extract_implementations(
 		.collect::<Vec<_>>();
 	let implementations = declarations
 		.iter()
-		.map(|(path, _, _, _)| {
+		.map(|(path, _, _)| {
 			let id = checked
 				.source_identities
 				.implementations
@@ -2630,13 +3000,21 @@ fn extract_implementations(
 	let mut extracted = declarations
 		.into_iter()
 		.zip(implementations)
-		.map(|((_path, visibility, mutable, members), implementation)| {
+		.map(|((_path, visibility, members), implementation)| {
 			let scope = DefinitionId::new(
 				headers.module.clone(),
 				DeclarationKey::top_level(DeclarationCategory::Namespace, "$impl"),
 			);
-			let (temporary_context, temporary_binders) =
-				definition_context(checked, headers, &scope, implementation.generics.clone());
+			let (temporary_context, temporary_binders) = definition_context(
+				checked,
+				headers,
+				&scope,
+				implementation
+					.generics
+					.iter()
+					.cloned()
+					.zip(implementation.generic_kinds.iter().copied()),
+			);
 			let self_type = canonicalize_type(
 				&checked.interner,
 				implementation.self_ty,
@@ -2679,7 +3057,6 @@ fn extract_implementations(
 						.map(|(n, t)| (n.clone(), header_type(t, &temporary_binders)))
 						.collect(),
 					self_type: header_type(&self_type, &temporary_binders),
-					mutable,
 					binders: (0..temporary_binders.len())
 						.map(|i| HeaderBinder {
 							parameter: HeaderParameterId(i as u32),
@@ -2710,8 +3087,16 @@ fn extract_implementations(
 				}),
 			);
 			let id = implementation.definition.clone().unwrap_or(id);
-			let (context, binders) =
-				definition_context(checked, headers, &id, implementation.generics.clone());
+			let (context, binders) = definition_context(
+				checked,
+				headers,
+				&id,
+				implementation
+					.generics
+					.iter()
+					.cloned()
+					.zip(implementation.generic_kinds.iter().copied()),
+			);
 			let mut member_ids = StableIdBuilder::new(headers.module.clone());
 			let mut members = members
 				.iter()
@@ -2802,9 +3187,13 @@ fn extract_implementations(
 						))
 					})
 					.collect::<Result<_, InterfaceConversionError>>()?,
+				interface_effect_arguments: implementation
+					.effect_args
+					.iter()
+					.map(|(name, row)| Ok((name.clone(), canonicalize_effect_row(row, &context)?)))
+					.collect::<Result<_, InterfaceConversionError>>()?,
 				interface_argument_bindings,
 				self_type: canonicalize_type(&checked.interner, implementation.self_ty, &context)?,
-				mutable,
 				binders,
 				constraints: checked_constraints(&implementation.constraints, checked, headers, &context)?,
 				members,
@@ -2821,7 +3210,6 @@ fn extract_implementations(
 		.filter_map(|(declaration, item)| match item {
 			Declaration::Impl {
 				visibility,
-				mutable,
 				members,
 				..
 			} => Some((
@@ -2830,12 +3218,11 @@ fn extract_implementations(
 					nested: None,
 				},
 				*visibility,
-				*mutable,
 				members,
 			)),
 			_ => None,
 		});
-	for (path, visibility, mutable, members) in top_level_inherent {
+	for (path, visibility, members) in top_level_inherent {
 		let id = checked
 			.source_identities
 			.implementations
@@ -2845,8 +3232,16 @@ fn extract_implementations(
 			.iter()
 			.find(|implementation| implementation.definition.as_ref() == Some(id))
 			.ok_or_else(|| InterfaceConversionError::UnknownStableDefinition(id.clone()))?;
-		let (impl_context, binders) =
-			definition_context(checked, headers, &id, implementation.generics.clone());
+		let (impl_context, binders) = definition_context(
+			checked,
+			headers,
+			&id,
+			implementation
+				.generics
+				.iter()
+				.cloned()
+				.map(|name| (name, crate::GenericParameterKind::Type)),
+		);
 		let mut member_ids = StableIdBuilder::new(headers.module.clone());
 		let source_members = members;
 		let mut members = source_members
@@ -2887,9 +3282,9 @@ fn extract_implementations(
 			visibility,
 			interface: None,
 			interface_arguments: Vec::new(),
+			interface_effect_arguments: Vec::new(),
 			interface_argument_bindings: Vec::new(),
 			self_type: canonicalize_type(&checked.interner, implementation.self_ty, &impl_context)?,
-			mutable,
 			binders,
 			constraints: checked_constraints(
 				&implementation.constraints,
@@ -3004,6 +3399,11 @@ pub fn extract_module_interface_from_facts_with_selection(
 			support_definitions.push(SupportDefinition { definition });
 		}
 	}
+	support_definitions.extend(
+		private
+			.into_values()
+			.map(|definition| SupportDefinition { definition }),
+	);
 	support_definitions.sort_by(|a, b| a.definition.id.cmp(&b.definition.id));
 	let mut interface = ModuleInterface {
 		module: module_identity,
@@ -3048,11 +3448,7 @@ pub fn namespace_summary(identity: ModuleIdentity, module: &Module) -> crate::Na
 			crate::NamespaceDeclaration {
 				name: name.into(),
 				definition,
-				visibility: if visible(visibility) {
-					crate::NamespaceVisibility::Importable
-				} else {
-					crate::NamespaceVisibility::Private
-				},
+				visibility: namespace_visibility(visibility),
 			}
 		})
 		.collect();
@@ -3072,6 +3468,10 @@ fn poison_binders(
 		.map(|(index, generic)| GenericParameter {
 			id: GenericParameterId::new(owner.binder(BinderScope::Definition, 0), index as u32),
 			name: generic.0.name.0.clone(),
+			kind: match generic.0.kind {
+				nymph_ast::ty::GenericParamKind::Type => crate::GenericParameterKind::Type,
+				nymph_ast::ty::GenericParamKind::Effect => crate::GenericParameterKind::Effect,
+			},
 		})
 		.collect()
 }
@@ -3084,6 +3484,45 @@ fn recover_ast_type(
 	ast_type(ty, headers, binders)
 		.map(RecoveredInterfaceType::Known)
 		.unwrap_or(RecoveredInterfaceType::Poison)
+}
+
+fn recover_generic_argument(
+	argument: &nymph_ast::Spanned<nymph_ast::ty::GenericArg>,
+	headers: &DeclaredHeaders,
+	binders: &[GenericParameter],
+) -> RecoveredInterfaceType {
+	argument
+		.0
+		.value
+		.as_type()
+		.map(|value| recover_ast_type(&value.0, headers, binders))
+		.unwrap_or(RecoveredInterfaceType::Poison)
+}
+
+fn recover_effect_argument(
+	argument: &nymph_ast::Spanned<nymph_ast::ty::GenericArg>,
+	headers: &DeclaredHeaders,
+	binders: &[GenericParameter],
+) -> crate::RecoveredEffectRow {
+	argument
+		.0
+		.value
+		.as_effect()
+		.and_then(|row| ast_effect_row(&row.0, headers, binders).ok())
+		.map(crate::RecoveredEffectRow::Known)
+		.unwrap_or(crate::RecoveredEffectRow::Poison)
+}
+
+fn recovered_source_generic_argument(
+	argument: &nymph_ast::Spanned<nymph_ast::ty::GenericArg>,
+	binders: &[GenericParameter],
+) -> crate::RecoveredHeaderType {
+	argument
+		.0
+		.value
+		.as_type()
+		.map(|value| recovered_source_header_type(&value.0, binders))
+		.unwrap_or_else(|| crate::RecoveredHeaderType::Atom("!effect".into()))
 }
 
 fn recovered_source_header_type(
@@ -3110,9 +3549,17 @@ fn recovered_source_header_type(
 		Type::Function {
 			params,
 			return_type,
+			effects,
 		} => R::Function {
 			parameters: params.iter().map(|(_, ty)| nested(&ty.0)).collect(),
 			return_type: Box::new(nested(&return_type.0)),
+			effects: match effects {
+				None => crate::RecoveredEffectRow::Known(crate::EffectRow::pure()),
+				Some(row) if row.0.effects.is_empty() => {
+					crate::RecoveredEffectRow::Known(crate::EffectRow::pure())
+				}
+				Some(_) => crate::RecoveredEffectRow::Poison,
+			},
 		},
 		Type::Reference { name, generics } => {
 			if generics.is_empty()
@@ -3123,7 +3570,12 @@ fn recovered_source_header_type(
 			let mut positional = Vec::new();
 			let mut named = Vec::new();
 			for argument in generics {
-				let value = nested(&argument.0.value.0);
+				let value = argument
+					.0
+					.value
+					.as_type()
+					.map(|value| nested(&value.0))
+					.unwrap_or_else(|| R::Atom("!effect".into()));
 				if let Some(name) = &argument.0.name {
 					named.push((name.0.clone(), value));
 				} else {
@@ -3137,7 +3589,6 @@ fn recovered_source_header_type(
 			}
 		}
 		Type::Grouped(inner) => nested(&inner.0),
-		Type::Mut(inner) => R::Mutable(Box::new(nested(&inner.0))),
 	}
 }
 
@@ -3157,7 +3608,12 @@ fn recovered_source_header_constraints(
 			let mut positional = Vec::new();
 			let mut named = Vec::new();
 			for argument in generics {
-				let ty = recovered_source_header_type(&argument.0.value.0, binders);
+				let ty = argument
+					.0
+					.value
+					.as_type()
+					.map(|value| recovered_source_header_type(&value.0, binders))
+					.unwrap_or_else(|| crate::RecoveredHeaderType::Atom("!effect".into()));
 				if let Some(name) = &argument.0.name {
 					named.push((name.0.clone(), ty));
 				} else {
@@ -3266,6 +3722,7 @@ fn recover_generic_constraints_with_types(
 					interface: crate::RecoveredDefinitionReference::Poison,
 					positional: Vec::new(),
 					named: Vec::new(),
+					effect_args: Vec::new(),
 				});
 			};
 			let interface = headers
@@ -3274,12 +3731,32 @@ fn recover_generic_constraints_with_types(
 				.unwrap_or(crate::RecoveredDefinitionReference::Poison);
 			let mut positional = Vec::new();
 			let mut named = Vec::new();
+			let mut effect_args = Vec::new();
 			for argument in generics {
-				let ty = recover_ast_type(&argument.0.value.0, headers, type_binders);
-				if let Some(name) = &argument.0.name {
-					named.push((name.0.clone(), ty));
+				if argument.0.value.as_effect().is_some() {
+					let name = argument
+						.0
+						.name
+						.as_ref()
+						.map(|name| name.0.clone())
+						.unwrap_or_else(|| effect_args.len().to_string().into());
+					if let crate::RecoveredEffectRow::Known(effects) =
+						recover_effect_argument(argument, headers, type_binders)
+					{
+						effect_args.push((name, effects));
+					}
 				} else {
-					positional.push(ty);
+					let ty = argument
+						.0
+						.value
+						.as_type()
+						.map(|value| recover_ast_type(&value.0, headers, type_binders))
+						.unwrap_or(RecoveredInterfaceType::Poison);
+					if let Some(name) = &argument.0.name {
+						named.push((name.0.clone(), ty));
+					} else {
+						positional.push(ty);
+					}
 				}
 			}
 			Some(crate::ConstraintShape {
@@ -3287,6 +3764,7 @@ fn recover_generic_constraints_with_types(
 				interface,
 				positional,
 				named,
+				effect_args,
 			})
 		})
 		.collect()
@@ -3314,6 +3792,10 @@ fn recover_func_member(
 		.map(|(index, generic)| GenericParameter {
 			id: GenericParameterId::new(id.binder(BinderScope::Member, 0), index as u32),
 			name: generic.0.name.0.clone(),
+			kind: match generic.0.kind {
+				nymph_ast::ty::GenericParamKind::Type => crate::GenericParameterKind::Type,
+				nymph_ast::ty::GenericParamKind::Effect => crate::GenericParameterKind::Effect,
+			},
 		})
 		.collect::<Vec<_>>();
 	let all = owner_binders
@@ -3321,18 +3803,66 @@ fn recover_func_member(
 		.chain(&binders)
 		.cloned()
 		.collect::<Vec<_>>();
-	let return_type = meta
+	let mut return_type = meta
 		.return_type
 		.as_ref()
 		.map(|ty| recover_ast_type(&ty.0, headers, &all))
 		.unwrap_or(RecoveredInterfaceType::Poison);
+	let effects = match &meta.effects {
+		Some(row) if row.0.requests_inference() || row.0.contains_error() => {
+			crate::RecoveredEffectRow::Poison
+		}
+		Some(row) => ast_effect_row(&row.0, headers, &all)
+			.map(crate::RecoveredEffectRow::Known)
+			.unwrap_or(crate::RecoveredEffectRow::Poison),
+		None if meta.return_type.is_some() => {
+			crate::RecoveredEffectRow::Known(crate::EffectRow::pure())
+		}
+		None => crate::RecoveredEffectRow::Poison,
+	};
+	let callable_effects = if meta.is_async {
+		if let (RecoveredInterfaceType::Known(output), crate::RecoveredEffectRow::Known(latent)) =
+			(&return_type, &effects)
+		{
+			return_type = RecoveredInterfaceType::Known(InterfaceType::Task {
+				output: Box::new(output.clone()),
+				effects: latent.clone(),
+			});
+		}
+		crate::RecoveredEffectRow::Known(crate::EffectRow::pure())
+	} else {
+		effects.clone()
+	};
+	let parameters = meta
+		.params
+		.iter()
+		.map(|parameter| ParameterShape {
+			name: match &parameter.0.name.0 {
+				Pattern::Binding { name, .. } => Some(name.0.clone()),
+				_ => None,
+			},
+			ty: recover_ast_type(&parameter.0.type_.0, headers, &all),
+			spread: parameter.0.spread,
+		})
+		.collect::<Vec<_>>();
 	let external = external_marker.map(|marker| {
-		external_function_abi_for_receiver(
-			marker,
-			implementation_receiver_tag(owner),
-			Some(meta.params.len()),
+		external_function_contract(
+			external_function_abi_for_receiver(
+				marker,
+				implementation_receiver_tag(owner),
+				Some(meta.params.len()),
+				match &return_type {
+					RecoveredInterfaceType::Known(ty) => Some(ty),
+					RecoveredInterfaceType::Poison => None,
+				},
+			),
+			effects.clone(),
+			parameters.iter().map(|parameter| match &parameter.ty {
+				RecoveredInterfaceType::Known(ty) => external_marshal(ty),
+				RecoveredInterfaceType::Poison => None,
+			}),
 			match &return_type {
-				RecoveredInterfaceType::Known(ty) => Some(ty),
+				RecoveredInterfaceType::Known(ty) => external_marshal(ty),
 				RecoveredInterfaceType::Poison => None,
 			},
 		)
@@ -3343,25 +3873,13 @@ fn recover_func_member(
 		visibility,
 		kind: match meta.kind {
 			FuncKind::Instance => MemberKind::Function,
-			FuncKind::Mut => MemberKind::MutatingFunction,
 			FuncKind::Namespace => MemberKind::StaticFunction,
 		},
 		binders: binders.clone(),
 		constraints: recover_generic_constraints_with_types(&meta.generics, &binders, &all, headers),
-		parameters: meta
-			.params
-			.iter()
-			.map(|parameter| ParameterShape {
-				name: match &parameter.0.name.0 {
-					Pattern::Binding { name, .. } => Some(name.0.clone()),
-					_ => None,
-				},
-				ty: recover_ast_type(&parameter.0.type_.0, headers, &all),
-				mutable: parameter.0.mutable,
-				spread: parameter.0.spread,
-			})
-			.collect(),
+		parameters,
 		return_type,
+		effects: callable_effects,
 		external,
 		runtime_owner: Some(owner.clone()),
 		has_default,
@@ -3395,8 +3913,7 @@ fn recover_value_member(
 		name: name.0.clone(),
 		visibility,
 		kind: match meta.kind {
-			nymph_ast::decl::LetKind::Instance => MemberKind::Value,
-			nymph_ast::decl::LetKind::Mut => MemberKind::MutableValue,
+			nymph_ast::decl::LetKind::Instance | nymph_ast::decl::LetKind::Use => MemberKind::Value,
 			nymph_ast::decl::LetKind::Namespace => MemberKind::StaticValue,
 		},
 		binders: Vec::new(),
@@ -3407,7 +3924,8 @@ fn recover_value_member(
 			.as_ref()
 			.map(|ty| recover_ast_type(&ty.0, headers, binders))
 			.unwrap_or(RecoveredInterfaceType::Poison),
-		external: external_marker.map(|marker| external_value_abi(marker, None)),
+		effects: crate::RecoveredEffectRow::Known(crate::EffectRow::pure()),
+		external: external_marker.map(|marker| external_value_abi(marker, None).recovered()),
 		runtime_owner: Some(owner.clone()),
 		has_default,
 	}
@@ -3490,13 +4008,24 @@ fn recover_implementation_members(
 							.map(|method| method.ret)
 					});
 				if let Some(return_type) = return_type {
-					member.external = Some(checked_external_function_abi(
+					let mut abi = checked_external_function_abi(
 						marker,
 						owner,
 						meta.params.len(),
 						return_type,
 						&checked.interner,
-					));
+					)
+					.recovered();
+					abi.effects = member.effects.clone();
+					abi.marshal.parameters = member
+						.parameters
+						.iter()
+						.map(|parameter| match &parameter.ty {
+							RecoveredInterfaceType::Known(ty) => external_marshal(ty),
+							RecoveredInterfaceType::Poison => None,
+						})
+						.collect();
+					member.external = Some(abi);
 				} else {
 					member.external = None;
 					member.return_type = RecoveredInterfaceType::Poison;
@@ -3505,7 +4034,7 @@ fn recover_implementation_members(
 			ImplMember::ExternalLet(_, marker, meta) => {
 				let marshal = checked.external_value_marshals.get(&meta.name.1).copied();
 				if marshal.is_some() {
-					member.external = Some(external_value_abi(marker, marshal));
+					member.external = Some(external_value_abi(marker, marshal).recovered());
 				} else {
 					member.external = None;
 					member.return_type = RecoveredInterfaceType::Poison;
@@ -3532,7 +4061,6 @@ fn recover_implementations(
 			let Declaration::ImplFor {
 				visibility,
 				generics,
-				mutable,
 				type_,
 				for_interface: (interface_name, source_arguments),
 				members,
@@ -3549,16 +4077,18 @@ fn recover_implementations(
 			let interface_arguments = source_arguments
 				.iter()
 				.enumerate()
-				.map(|(index, argument)| {
-					(
-						argument
-							.0
-							.name
-							.as_ref()
-							.map(|name| name.0.clone())
-							.unwrap_or_else(|| format!("${index}").into()),
-						recover_ast_type(&argument.0.value.0, headers, &temporary_binders),
-					)
+				.filter_map(|(index, argument)| {
+					argument.0.value.as_type().map(|_| {
+						(
+							argument
+								.0
+								.name
+								.as_ref()
+								.map(|name| name.0.clone())
+								.unwrap_or_else(|| format!("${index}").into()),
+							recover_generic_argument(argument, headers, &temporary_binders),
+						)
+					})
 				})
 				.collect::<Vec<_>>();
 			let constraints = recover_generic_constraints(generics, &temporary_binders, headers);
@@ -3575,12 +4105,11 @@ fn recover_implementations(
 								.as_ref()
 								.map(|name| name.0.clone())
 								.unwrap_or_else(|| format!("${index}").into()),
-							recovered_source_header_type(&argument.0.value.0, &temporary_binders),
+							recovered_source_generic_argument(argument, &temporary_binders),
 						)
 					})
 					.collect(),
 				self_type: recovered_source_header_type(&type_.0, &temporary_binders),
-				mutable: *mutable,
 				binders: (0..temporary_binders.len())
 					.map(|index| HeaderBinder {
 						parameter: HeaderParameterId(index as u32),
@@ -3636,7 +4165,6 @@ fn recover_implementations(
 					interface: Some(interface),
 					interface_arguments,
 					self_type: header_type(self_type, &temporary_binders),
-					mutable: *mutable,
 					binders: recovered_header.binders.clone(),
 					constraints,
 				})
@@ -3659,16 +4187,18 @@ fn recover_implementations(
 			let interface_arguments = source_arguments
 				.iter()
 				.enumerate()
-				.map(|(index, argument)| {
-					(
-						argument
-							.0
-							.name
-							.as_ref()
-							.map(|n| n.0.clone())
-							.unwrap_or_else(|| format!("${index}").into()),
-						recover_ast_type(&argument.0.value.0, headers, &binders),
-					)
+				.filter_map(|(index, argument)| {
+					argument.0.value.as_type().map(|_| {
+						(
+							argument
+								.0
+								.name
+								.as_ref()
+								.map(|name| name.0.clone())
+								.unwrap_or_else(|| format!("${index}").into()),
+							recover_generic_argument(argument, headers, &binders),
+						)
+					})
 				})
 				.collect();
 			let mut member_ids = StableIdBuilder::new(headers.module.clone());
@@ -3683,8 +4213,24 @@ fn recover_implementations(
 						.unwrap_or(crate::RecoveredDefinitionReference::Poison),
 				),
 				interface_arguments,
+				interface_effect_arguments: source_arguments
+					.iter()
+					.enumerate()
+					.filter_map(|(index, argument)| {
+						argument.0.value.as_effect().map(|_| {
+							(
+								argument
+									.0
+									.name
+									.as_ref()
+									.map(|name| name.0.clone())
+									.unwrap_or_else(|| format!("${index}").into()),
+								recover_effect_argument(argument, headers, &binders),
+							)
+						})
+					})
+					.collect(),
 				self_type,
-				mutable: *mutable,
 				binders: binders.clone(),
 				constraints: recover_generic_constraints(generics, &binders, headers),
 				members: recover_implementation_members(
@@ -3705,7 +4251,6 @@ fn recover_implementations(
 		let Declaration::Impl {
 			visibility,
 			generics,
-			mutable,
 			type_,
 			members,
 		} = declaration
@@ -3721,7 +4266,6 @@ fn recover_implementations(
 			interface: None,
 			interface_arguments: Vec::new(),
 			self_type: recovered_source_header_type(&type_.0, &temporary_binders),
-			mutable: *mutable,
 			binders: (0..temporary_binders.len())
 				.map(|index| HeaderBinder {
 					parameter: HeaderParameterId(index as u32),
@@ -3747,8 +4291,8 @@ fn recover_implementations(
 			availability: SemanticAvailability::Available,
 			interface: None,
 			interface_arguments: Vec::new(),
+			interface_effect_arguments: Vec::new(),
 			self_type: recover_ast_type(&type_.0, headers, &binders),
-			mutable: *mutable,
 			binders: binders.clone(),
 			constraints: recover_generic_constraints(generics, &binders, headers),
 			members: recover_implementation_members(
@@ -3798,6 +4342,7 @@ fn recover_implementations(
 						index as u32,
 					),
 					name: generic.0.name.0.clone(),
+					kind: generic_parameter_kind(generic.0.kind),
 				})
 				.collect::<Vec<_>>();
 			let fallback_id = ids.allocate(DeclarationKey::recovered_implementation(
@@ -3817,7 +4362,7 @@ fn recover_implementations(
 									.as_ref()
 									.map(|name| name.0.clone())
 									.unwrap_or_else(|| format!("${index}").into()),
-								recovered_source_header_type(&argument.0.value.0, &temporary_binders),
+								recovered_source_generic_argument(argument, &temporary_binders),
 							)
 						})
 						.collect(),
@@ -3832,7 +4377,6 @@ fn recover_implementations(
 							.collect(),
 						named: Vec::new(),
 					},
-					mutable: false,
 					binders: (0..temporary_binders.len())
 						.map(|index| HeaderBinder {
 							parameter: HeaderParameterId(index as u32),
@@ -3862,6 +4406,7 @@ fn recover_implementations(
 				.map(|(index, generic)| GenericParameter {
 					id: GenericParameterId::new(id.binder(BinderScope::Definition, 0), index as u32),
 					name: generic.0.name.0.clone(),
+					kind: generic_parameter_kind(generic.0.kind),
 				})
 				.collect::<Vec<_>>();
 			let self_type = RecoveredInterfaceType::Known(InterfaceType::Named {
@@ -3878,16 +4423,18 @@ fn recover_implementations(
 				.1
 				.iter()
 				.enumerate()
-				.map(|(index, argument)| {
-					(
-						argument
-							.0
-							.name
-							.as_ref()
-							.map(|n| n.0.clone())
-							.unwrap_or_else(|| format!("${index}").into()),
-						recover_ast_type(&argument.0.value.0, headers, &binders),
-					)
+				.filter_map(|(index, argument)| {
+					argument.0.value.as_type().map(|_| {
+						(
+							argument
+								.0
+								.name
+								.as_ref()
+								.map(|n| n.0.clone())
+								.unwrap_or_else(|| format!("${index}").into()),
+							recover_generic_argument(argument, headers, &binders),
+						)
+					})
 				})
 				.collect();
 			let mut member_ids = StableIdBuilder::new(headers.module.clone());
@@ -3902,8 +4449,27 @@ fn recover_implementations(
 						.unwrap_or(crate::RecoveredDefinitionReference::Poison),
 				),
 				interface_arguments: arguments,
+				interface_effect_arguments: implementation
+					.0
+					.interface
+					.1
+					.iter()
+					.enumerate()
+					.filter_map(|(index, argument)| {
+						argument.0.value.as_effect().map(|_| {
+							(
+								argument
+									.0
+									.name
+									.as_ref()
+									.map(|name| name.0.clone())
+									.unwrap_or_else(|| format!("${index}").into()),
+								recover_effect_argument(argument, headers, &binders),
+							)
+						})
+					})
+					.collect(),
 				self_type,
-				mutable: false,
 				binders: binders.clone(),
 				constraints: recover_generic_constraints(
 					&implementation.0.generics,
@@ -3942,11 +4508,22 @@ fn poison_definition(
 		| Declaration::TypeAlias { visibility, .. }
 		| Declaration::Interface { visibility, .. }
 		| Declaration::Namespace { visibility, .. }
+		| Declaration::Effect { visibility, .. }
 		| Declaration::ExternalFunc(visibility, ..)
 		| Declaration::ExternalLet(visibility, ..) => *visibility,
 		_ => None,
 	};
 	let (kind, binders, parameters, return_type, ty, fields, variants, members) = match declaration {
+		Declaration::Effect { .. } => (
+			DefinitionShapeKind::Effect,
+			Vec::new(),
+			Vec::new(),
+			None,
+			None,
+			Vec::new(),
+			Vec::new(),
+			Vec::new(),
+		),
 		Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => (
 			DefinitionShapeKind::Function,
 			poison_binders(id.clone(), &meta.generics),
@@ -3956,7 +4533,6 @@ fn poison_definition(
 				.map(|p| ParameterShape {
 					name: None,
 					ty: RecoveredInterfaceType::Poison,
-					mutable: p.0.mutable,
 					spread: p.0.spread,
 				})
 				.collect(),
@@ -4009,14 +4585,14 @@ fn poison_definition(
 							field.0.name.0.clone(),
 						)),
 						name: field.0.name.0.clone(),
-						visibility: field.0.visibility,
+						visibility: Some(field.0.visibility.unwrap_or(Visibility::Internal)),
 						ty: recover_ast_type(
 							&field.0.type_.0,
 							headers,
 							&poison_binders(owner.clone(), generics),
 						),
-						mutable: false,
 						has_default: field.0.default.is_some(),
+						default_effects: None,
 					})
 					.collect(),
 				Vec::new(),
@@ -4060,10 +4636,10 @@ fn poison_definition(
 									field.0.name.0.clone(),
 								)),
 								name: field.0.name.0.clone(),
-								visibility: field.0.visibility,
+								visibility: Some(field.0.visibility.unwrap_or(Visibility::Internal)),
 								ty: recover_ast_type(&field.0.type_.0, headers, &binders),
-								mutable: false,
 								has_default: field.0.default.is_some(),
+								default_effects: None,
 							})
 							.collect(),
 					}
@@ -4155,6 +4731,7 @@ fn poison_definition(
 			return None;
 		}
 	};
+	let enum_view_variants = variants.iter().map(|variant| variant.id.clone()).collect();
 	let mut recovered = RecoveredExportedDefinition {
 		id,
 		name: name.clone(),
@@ -4166,9 +4743,11 @@ fn poison_definition(
 		constraints: Vec::new(),
 		parameters,
 		return_type,
+		effects: crate::RecoveredEffectRow::Known(crate::EffectRow::pure()),
 		ty,
 		fields,
 		variants,
+		enum_view_variants,
 		members,
 		super_interfaces: Vec::new(),
 		external: None,
@@ -4183,6 +4762,34 @@ fn poison_definition(
 		_ => &[],
 	};
 	recovered.constraints = recover_generic_constraints(generics, &recovered.binders, headers);
+	if let Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) = declaration {
+		recovered.effects = match &meta.effects {
+			Some(row) if row.0.requests_inference() || row.0.contains_error() => {
+				crate::RecoveredEffectRow::Poison
+			}
+			Some(row) => ast_effect_row(&row.0, headers, &recovered.binders)
+				.map(crate::RecoveredEffectRow::Known)
+				.unwrap_or(crate::RecoveredEffectRow::Poison),
+			None if meta.return_type.is_some() => {
+				crate::RecoveredEffectRow::Known(crate::EffectRow::pure())
+			}
+			None => crate::RecoveredEffectRow::Poison,
+		};
+	}
+	match declaration {
+		Declaration::ExternalFunc(_, marker, meta) => {
+			recovered.external = Some(external_function_contract(
+				external_function_abi_for_receiver(marker, None, Some(meta.params.len()), None),
+				recovered.effects.clone(),
+				(0..meta.params.len()).map(|_| None),
+				None,
+			));
+		}
+		Declaration::ExternalLet(_, marker, _) => {
+			recovered.external = Some(external_value_abi(marker, None).recovered());
+		}
+		_ => {}
+	}
 	if let Declaration::Interface {
 		super_interfaces, ..
 	} = declaration
@@ -4198,7 +4805,7 @@ fn poison_definition(
 				let mut positional = Vec::new();
 				let mut named = Vec::new();
 				for argument in arguments {
-					let ty = recover_ast_type(&argument.0.value.0, headers, &recovered.binders);
+					let ty = recover_generic_argument(argument, headers, &recovered.binders);
 					if let Some(name) = &argument.0.name {
 						named.push((name.0.clone(), ty));
 					} else {
@@ -4250,7 +4857,7 @@ pub fn recover_module_environment_with_facts(
 		}
 	}
 	let context = context(checked, headers);
-	let exports: Vec<RecoveredExportedDefinition> = module
+	let definitions: Vec<RecoveredExportedDefinition> = module
 		.members
 		.iter()
 		.enumerate()
@@ -4259,21 +4866,19 @@ pub fn recover_module_environment_with_facts(
 			extract_definition(member, declaration, checked, headers, &context)
 				.ok()
 				.flatten()
-				.filter(|d| visible(d.visibility))
 				.map(RecoveredExportedDefinition::from)
 				.or_else(|| poison_definition(member, declaration, headers))
-				.filter(|definition| visible(definition.visibility))
 		})
 		.collect();
-	let mut private = module
-		.members
-		.iter()
-		.enumerate()
-		.filter(|(member, declaration)| lexical_winner(module, *member, declaration))
-		.filter_map(|(member, declaration)| poison_definition(member, declaration, headers))
-		.filter(|definition| !visible(definition.visibility))
-		.map(|definition| (definition.id.clone(), definition))
-		.collect::<HashMap<_, _>>();
+	let mut exports = Vec::new();
+	let mut private = HashMap::new();
+	for definition in definitions {
+		if facts.include_private_definitions || visible(definition.visibility) {
+			exports.push(definition);
+		} else {
+			private.insert(definition.id.clone(), definition);
+		}
+	}
 	let unavailable_interfaces = exports
 		.iter()
 		.chain(private.values())
@@ -4341,6 +4946,11 @@ pub fn recover_module_environment_with_facts(
 			support_definitions.push(crate::RecoveredSupportDefinition { definition });
 		}
 	}
+	support_definitions.extend(
+		private
+			.into_values()
+			.map(|definition| crate::RecoveredSupportDefinition { definition }),
+	);
 	support_definitions.sort_by(|left, right| left.definition.id.cmp(&right.definition.id));
 	let mut recovered = RecoveredModuleInterface {
 		module: module_identity,
@@ -4372,6 +4982,9 @@ fn referenced_recovered_member(
 	member: &crate::RecoveredMemberShape,
 	out: &mut HashSet<DefinitionId>,
 ) {
+	if let crate::RecoveredEffectRow::Known(effects) = &member.effects {
+		referenced_effects(effects, out);
+	}
 	for constraint in &member.constraints {
 		recovered_reference(&constraint.interface, out);
 		for ty in constraint
@@ -4396,6 +5009,10 @@ fn referenced_recovered_definition_shape(
 	definition: &RecoveredExportedDefinition,
 	out: &mut HashSet<DefinitionId>,
 ) {
+	if let crate::RecoveredEffectRow::Known(effects) = &definition.effects {
+		referenced_effects(effects, out);
+	}
+	out.extend(definition.enum_view_variants.iter().cloned());
 	for constraint in &definition.constraints {
 		recovered_reference(&constraint.interface, out);
 		for ty in constraint
@@ -4488,6 +5105,7 @@ impl From<ExportedDefinition> for RecoveredExportedDefinition {
 						.into_iter()
 						.map(|(n, t)| (n, RecoveredInterfaceType::Known(t)))
 						.collect(),
+					effect_args: c.effect_args,
 				})
 				.collect(),
 			parameters: value
@@ -4496,11 +5114,11 @@ impl From<ExportedDefinition> for RecoveredExportedDefinition {
 				.map(|p| ParameterShape {
 					name: p.name,
 					ty: RecoveredInterfaceType::Known(p.ty),
-					mutable: p.mutable,
 					spread: p.spread,
 				})
 				.collect(),
 			return_type: value.return_type.map(RecoveredInterfaceType::Known),
+			effects: crate::RecoveredEffectRow::Known(value.effects),
 			ty: value.ty.map(RecoveredInterfaceType::Known),
 			fields: value
 				.fields
@@ -4510,8 +5128,8 @@ impl From<ExportedDefinition> for RecoveredExportedDefinition {
 					name: f.name,
 					visibility: f.visibility,
 					ty: RecoveredInterfaceType::Known(f.ty),
-					mutable: f.mutable,
 					has_default: f.has_default,
+					default_effects: f.default_effects,
 				})
 				.collect(),
 			variants: value
@@ -4528,12 +5146,13 @@ impl From<ExportedDefinition> for RecoveredExportedDefinition {
 							name: f.name,
 							visibility: f.visibility,
 							ty: RecoveredInterfaceType::Known(f.ty),
-							mutable: f.mutable,
 							has_default: f.has_default,
+							default_effects: f.default_effects,
 						})
 						.collect(),
 				})
 				.collect(),
+			enum_view_variants: value.enum_view_variants,
 			members: value
 				.members
 				.into_iter()
@@ -4559,6 +5178,7 @@ impl From<ExportedDefinition> for RecoveredExportedDefinition {
 								.into_iter()
 								.map(|(n, t)| (n, RecoveredInterfaceType::Known(t)))
 								.collect(),
+							effect_args: c.effect_args,
 						})
 						.collect(),
 					parameters: m
@@ -4567,12 +5187,12 @@ impl From<ExportedDefinition> for RecoveredExportedDefinition {
 						.map(|p| ParameterShape {
 							name: p.name,
 							ty: RecoveredInterfaceType::Known(p.ty),
-							mutable: p.mutable,
 							spread: p.spread,
 						})
 						.collect(),
 					return_type: RecoveredInterfaceType::Known(m.return_type),
-					external: m.external,
+					effects: crate::RecoveredEffectRow::Known(m.effects),
+					external: m.external.map(crate::ExternalAbi::recovered),
 					runtime_owner: m.runtime_owner,
 					has_default: m.has_default,
 				})
@@ -4594,7 +5214,7 @@ impl From<ExportedDefinition> for RecoveredExportedDefinition {
 						.collect(),
 				})
 				.collect(),
-			external: value.external,
+			external: value.external.map(crate::ExternalAbi::recovered),
 			runtime_owner: value.runtime_owner,
 		}
 	}

@@ -27,7 +27,7 @@
 		"test:unit": "pnpm run compile && node --test test/*.test.cjs",
 		"stage:server": "node scripts/stage-server.cjs",
 		"verify:vsix": "node scripts/verify-vsix.cjs",
-		"package:target": "vsce package",
+		"package:target": "vsce package --no-dependencies",
 		"deploy": "vsce publish"
 	},
 	"dependencies": {
@@ -51,6 +51,16 @@
 					"default": "",
 					"scope": "machine",
 					"description": "Development-only absolute path override for nymph-lsp. Published packages use their bundled server by default."
+				},
+				"nymph.buildProfile": {
+					"type": "string",
+					"enum": [
+						"development",
+						"release"
+					],
+					"default": "development",
+					"scope": "window",
+					"description": "Select the compiler profile used for workspace diagnostics."
 				}
 			}
 		},
@@ -65,6 +75,12 @@
 					".nym"
 				],
 				"configuration": "./language-configuration.json"
+			}
+		],
+		"snippets": [
+			{
+				"language": "nymph",
+				"path": "./snippets/nymph.json"
 			}
 		],
 		"grammars": [

@@ -219,10 +219,8 @@ fn signature(d: &ExportedDefinition, document_private_items: bool) -> DocSignatu
 		.map(|binder| (binder.id.clone(), binder.name.as_ref()))
 		.collect::<HashMap<_, _>>();
 	let keyword = match (d.kind, d.declaration_kind) {
-		(DefinitionShapeKind::Function, Some(MemberKind::MutatingFunction)) => "mut func ",
 		(DefinitionShapeKind::Function, Some(MemberKind::StaticFunction)) => "namespace func ",
 		(DefinitionShapeKind::Function, Some(MemberKind::Function) | None) => "func ",
-		(DefinitionShapeKind::Let, Some(MemberKind::MutableValue)) => "let mut ",
 		(DefinitionShapeKind::Let, Some(MemberKind::StaticValue)) => "namespace let ",
 		(DefinitionShapeKind::Let, Some(MemberKind::Value) | None) => "let ",
 		(DefinitionShapeKind::TypeAlias, _) => "type ",
@@ -230,6 +228,7 @@ fn signature(d: &ExportedDefinition, document_private_items: bool) -> DocSignatu
 		(DefinitionShapeKind::Enum, _) => "enum ",
 		(DefinitionShapeKind::Interface, _) => "interface ",
 		(DefinitionShapeKind::Namespace, _) => "namespace ",
+		(DefinitionShapeKind::Effect, _) => "effect ",
 		(DefinitionShapeKind::Function, Some(_)) | (DefinitionShapeKind::Let, Some(_)) => {
 			unreachable!("definition declaration modifier does not match its shape")
 		}
@@ -268,6 +267,7 @@ fn signature(d: &ExportedDefinition, document_private_items: bool) -> DocSignatu
 		);
 		ty_doc(&mut out, ty, &generic_names);
 	}
+	effects(&mut out, &d.effects, &generic_names);
 	constraints(&mut out, &d.binders, &d.constraints, &generic_names);
 	for field in d
 		.fields
@@ -326,9 +326,6 @@ fn implementation_signature(
 	text(&mut out, "impl");
 	binders(&mut out, &implementation.binders);
 	text(&mut out, " ");
-	if implementation.mutable {
-		text(&mut out, "mut ");
-	}
 	if let Some(interface) = &implementation.interface {
 		definition(&mut out, interface);
 		generic_args(
@@ -374,9 +371,10 @@ fn type_references_private(
 					.iter()
 					.any(|(_, ty)| type_references_private(ty, private_definitions))
 		}
-		InterfaceType::List(inner) | InterfaceType::Mutable(inner) => {
-			type_references_private(inner, private_definitions)
-		}
+		InterfaceType::List(inner)
+		| InterfaceType::Handle(inner)
+		| InterfaceType::HandleOutcome(inner) => type_references_private(inner, private_definitions),
+		InterfaceType::Task { output, .. } => type_references_private(output, private_definitions),
 		InterfaceType::Tuple(items) | InterfaceType::Intersection(items) => items
 			.iter()
 			.any(|ty| type_references_private(ty, private_definitions)),
@@ -387,6 +385,7 @@ fn type_references_private(
 		InterfaceType::Function {
 			parameters,
 			return_type,
+			..
 		} => {
 			parameters
 				.iter()
@@ -452,9 +451,7 @@ fn member_doc(
 		out,
 		match member.kind {
 			MemberKind::Value => "let ",
-			MemberKind::MutableValue => "let mut ",
 			MemberKind::Function => "func ",
-			MemberKind::MutatingFunction => "mut func ",
 			MemberKind::StaticValue => "namespace let ",
 			MemberKind::StaticFunction => "namespace func ",
 		},
@@ -463,12 +460,13 @@ fn member_doc(
 	binders(out, &member.binders);
 	if matches!(
 		member.kind,
-		MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction
+		MemberKind::Function | MemberKind::StaticFunction
 	) {
 		parameters(out, &member.parameters, &generic_names);
 	}
 	text(out, ": ");
 	ty_doc(out, &member.return_type, &generic_names);
+	effects(out, &member.effects, &generic_names);
 	constraints(out, &member.binders, &member.constraints, &generic_names);
 }
 
@@ -479,9 +477,28 @@ fn binders(out: &mut DocSignature, values: &[GenericParameter]) {
 			if i > 0 {
 				text(out, ", ");
 			}
+			if v.kind == nymph_sema::GenericParameterKind::Effect {
+				text(out, "!");
+			}
 			text(out, &v.name);
 		}
 		text(out, ">");
+	}
+}
+
+fn effects(
+	out: &mut DocSignature,
+	row: &nymph_sema::EffectRow,
+	generic_names: &HashMap<nymph_sema::GenericParameterId, &str>,
+) {
+	for effect in row.atoms() {
+		text(out, " + !");
+		match effect {
+			nymph_sema::EffectAtom::Nominal(definition_id) => definition(out, definition_id),
+			nymph_sema::EffectAtom::Parameter(parameter) => {
+				text(out, generic_names.get(parameter).copied().unwrap_or("?"));
+			}
+		}
 	}
 }
 fn parameters(
@@ -496,9 +513,6 @@ fn parameters(
 		}
 		if p.spread {
 			text(out, "...");
-		}
-		if p.mutable {
-			text(out, "mut ");
 		}
 		if let Some(name) = &p.name {
 			text(out, name);
@@ -597,11 +611,31 @@ fn ty_doc(
 		InterfaceType::Function {
 			parameters,
 			return_type,
+			..
 		} => {
 			text(out, "(");
 			list_types(out, parameters, ", ", generic_names);
 			text(out, ") -> ");
 			ty_doc(out, return_type, generic_names);
+		}
+		InterfaceType::Task {
+			output,
+			effects: row,
+		} => {
+			text(out, "Task<");
+			ty_doc(out, output, generic_names);
+			effects(out, row, generic_names);
+			text(out, ">");
+		}
+		InterfaceType::Handle(output) => {
+			text(out, "Handle<");
+			ty_doc(out, output, generic_names);
+			text(out, ">");
+		}
+		InterfaceType::HandleOutcome(output) => {
+			text(out, "Result<");
+			ty_doc(out, output, generic_names);
+			text(out, ", HandleError>");
 		}
 		InterfaceType::Named {
 			definition: d,
@@ -612,10 +646,6 @@ fn ty_doc(
 			generic_args(out, positional, named, generic_names);
 		}
 		InterfaceType::Intersection(v) => list_types(out, v, " + ", generic_names),
-		InterfaceType::Mutable(v) => {
-			text(out, "mut ");
-			ty_doc(out, v, generic_names);
-		}
 		InterfaceType::Generic(g) => text(
 			out,
 			generic_names.get(g).copied().unwrap_or("<unknown generic>"),

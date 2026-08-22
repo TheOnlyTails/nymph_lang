@@ -8,6 +8,8 @@
 		{ "include": "#characters" },
 		{ "include": "#numbers" },
 		{ "include": "#anonymous-parameters" },
+		{ "include": "#async-syntax" },
+		{ "include": "#effects" },
 		{ "include": "#keywords" },
 		{ "include": "#label" },
 		{ "include": "#operators" },
@@ -100,11 +102,65 @@
 			"name": "variable.language.anonymous-parameter.nymph",
 			"match": "\\$\\d*(?!\\{)"
 		},
+		"async-syntax": {
+			"patterns": [
+				{
+					"match": "\\b(async)\\s+(func)\\b",
+					"captures": {
+						"1": { "name": "storage.modifier.async.nymph" },
+						"2": { "name": "storage.type.function.nymph" }
+					}
+				},
+				{
+					"name": "keyword.control.async.nymph",
+					"match": "\\basync\\b(?=\\s*\\{)"
+				},
+				{
+					"match": "(\\.)\\s*(await)\\b",
+					"captures": {
+						"1": { "name": "punctuation.accessor.nymph" },
+						"2": { "name": "keyword.operator.await.nymph" }
+					}
+				}
+			]
+		},
+		"effects": {
+			"patterns": [
+				{
+					"match": "\\b(effect)\\s+([\\p{XID_Start}_][\\p{XID_Continue}]*)",
+					"captures": {
+						"1": { "name": "storage.type.effect.nymph" },
+						"2": { "name": "entity.name.type.effect.nymph" }
+					}
+				},
+				{
+					"match": "(!)(\\(\\))",
+					"captures": {
+						"1": { "name": "keyword.operator.effect.nymph" },
+						"2": { "name": "constant.language.effect.pure.nymph" }
+					}
+				},
+				{
+					"match": "(!)([\\p{XID_Start}_][\\p{XID_Continue}]*|_)",
+					"captures": {
+						"1": { "name": "keyword.operator.effect.nymph" },
+						"2": { "name": "entity.name.type.effect.nymph" }
+					}
+				}
+			]
+		},
 		"keywords": {
 			"patterns": [
 				{
+					"match": "\\b(let)\\s+(use)\\b",
+					"captures": {
+						"1": { "name": "storage.type.nymph" },
+						"2": { "name": "storage.modifier.use.nymph" }
+					}
+				},
+				{
 					"name": "keyword.control.nymph",
-					"match": "\\b(if|else|for|while|match|return|break|continue)\\b"
+					"match": "\\b(if|else|for|loop|match|return|break|continue|echo)\\b"
 				},
 				{
 					"name": "keyword.control.import.nymph",
@@ -116,11 +172,11 @@
 				},
 				{
 					"name": "storage.type.nymph",
-					"match": "\\b(let|struct|enum|interface|impl|namespace|type)\\b"
+					"match": "\\b(let|struct|enum|effect|interface|impl|namespace|type)\\b"
 				},
 				{
 					"name": "storage.modifier.nymph",
-					"match": "\\b(public|internal|private|mut|external|async|await)\\b"
+					"match": "\\b(public|internal|private|external)\\b"
 				},
 				{
 					"name": "keyword.operator.word.nymph",
@@ -184,10 +240,6 @@
 				{
 					"name": "keyword.operator.pipe.nymph",
 					"match": "\\|>"
-				},
-				{
-					"name": "keyword.operator.assignment.compound.nymph",
-					"match": "(\\*\\*|\\+|-|\\*|/|%|&&|\\|\\||&|\\||\\^|~|<<|>>)="
 				},
 				{
 					"name": "keyword.operator.comparison.nymph",
@@ -268,11 +320,14 @@
 		"struct-fields": {
 			"patterns": [
 				{
-					"match": "\\b(public|internal|private)?\\s*(mut)?\\s*([\\p{XID_Start}][\\p{XID_Continue}]*)\\s*(?=:)",
+					"name": "variable.other.property.nymph",
+					"match": "\\b[\\p{XID_Start}_][\\p{XID_Continue}]*\\b(?=\\s*=)"
+				},
+				{
+					"match": "\\b(public|internal|private)?\\s*([\\p{XID_Start}][\\p{XID_Continue}]*)\\s*(?=:)",
 					"captures": {
 						"1": { "name": "storage.modifier.nymph" },
-						"2": { "name": "storage.modifier.nymph" },
-						"3": { "name": "variable.other.property.nymph" }
+						"2": { "name": "variable.other.property.nymph" }
 					}
 				}
 			]
@@ -291,6 +346,8 @@
 				{ "include": "#characters" },
 				{ "include": "#numbers" },
 				{ "include": "#anonymous-parameters" },
+				{ "include": "#async-syntax" },
+				{ "include": "#effects" },
 				{ "include": "#keywords" },
 				{ "include": "#operators" },
 				{ "include": "#type-expressions" },

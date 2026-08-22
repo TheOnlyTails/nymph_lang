@@ -100,12 +100,12 @@ canonical compiler module paths by removing `.nym` and joining components with
 
 `run`, `build`, and `check` use the same target-selection rules:
 
-| Project found? | File argument? | Selected target |
-| -------------- | -------------- | --------------- |
-| Yes | Omitted | The manifest's `build.entry`, relative to `package.src` |
-| Yes | Explicit | That file, which must be below the project's source root |
-| No | Explicit | That loose `.nym` file |
-| No | Omitted | Error: pass a `.nym` file or run inside a project |
+| Project found? | File argument? | Selected target                                          |
+| -------------- | -------------- | -------------------------------------------------------- |
+| Yes            | Omitted        | The manifest's `build.entry`, relative to `package.src`  |
+| Yes            | Explicit       | That file, which must be below the project's source root |
+| No             | Explicit       | That loose `.nym` file                                   |
+| No             | Omitted        | Error: pass a `.nym` file or run inside a project        |
 
 The manifest entry is an executable entry module for `build` and `check`;
 other explicit project files and loose files are libraries. `run` always
@@ -116,6 +116,53 @@ depends on whether a file happens to be named `main.nym`.
 ambient core and `std/…` sources as `build` and `run`. It stops after parsing,
 binding, and semantic checking: it emits no JavaScript, creates no `.mjs`
 artifact, and executes neither the selected module nor Node.
+
+## Executable roots and the Node launcher
+
+After aliases are normalized, `main` must have no parameters and exactly one of these result shapes:
+
+```text
+void
+Option<void>
+Result<void, E>
+Task<void>
+Task<Option<void>>
+Task<Result<void, E>>
+```
+
+`E` must implement `Display`. The compiler chooses the adapter from the resolved static type; the
+runtime never guesses by inspecting a value. `nymph build` produces an inert importable ES module.
+Only `nymph run` (and future explicitly runnable Node artifacts) adds the Node launcher.
+
+The launcher writes no successful root value. `void`, `Some(void)`, and `Ok(void)` exit 0; `None`
+writes `error: main returned None` and exits 1; `Error(error)` writes `error: ` followed by
+`Display(error)` and one final newline, then exits 1. Embedded newlines are preserved. Synchronous
+and task-shaped roots have identical terminal behavior after the root task context joins.
+
+Cancellation writes `error: execution cancelled`: unsourced or `SIGINT` cancellation exits 130 and
+`SIGTERM` cancellation exits 143. A defect uses the runtime-owned renderer and exits 101; it never
+invokes user `Display` or `Debug`. If displaying an application error defects, that is a defect.
+The first termination signal requests cooperative cancellation and cleanup; a second may force exit.
+
+## `echo` and intentional output
+
+`echo expression` is a compiler observation expression. It evaluates its operand exactly once,
+returns that identical value, preserves the operand's type and effects, and adds no `!Io`.
+
+```nym
+struct Credential(public user: string, private token: string)
+func inspect(value: Credential): Credential = echo value
+```
+
+Development observations are atomic stderr lines containing source location and a recursive debug
+render. Rendering is visibility-independent: private and internal fields are included. `echo` never
+dispatches `Debug`, calls host getters, or traverses opaque externals, functions, or managed
+resources. Visibility controls source access, not secrecy from development output.
+
+Release builds retain operand evaluation and its effects but erase the observer and all source-site
+metadata. The root package's `echo-in-release` lint is configurable as `allow`, `warn`, or `deny`;
+dependencies own their policy when built as roots. Use effectful `print`/`println` or telemetry for
+intentional program output.
 
 From a project directory, all three commands select `build.entry`:
 

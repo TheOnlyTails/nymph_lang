@@ -1,6 +1,6 @@
 //! Expressions, statements, and patterns.
 //!
-//! Nymph is expression-oriented: `if`, `match`, `while`, `for`, and blocks all *are*
+//! Nymph is expression-oriented: `if`, `match`, `for`, state loops, and blocks all *are*
 //! expressions that produce values, which is why they live here rather than in a
 //! separate statement grammar. The only statements are a bare expression and a `let`.
 
@@ -11,9 +11,7 @@ use strum::Display;
 use crate::{
 	Ident, NodeId, Span, Spanned,
 	decl::LetDeclaration,
-	ops::{
-		AssignOperator, BinaryOperator, PatternOperator, PostfixOperator, PrefixOperator, TypeOperator,
-	},
+	ops::{BinaryOperator, PatternOperator, PostfixOperator, PrefixOperator, TypeOperator},
 	ty::{GenericArg, GenericParam, Type},
 };
 
@@ -80,7 +78,7 @@ impl Expr {
 			ExprKind::Call { func, args, .. } => {
 				f(func);
 				for arg in args {
-					f(&arg.0.value);
+					f(arg.0.value());
 				}
 			}
 			ExprKind::MemberAccess { parent, .. } => f(parent),
@@ -89,12 +87,15 @@ impl Expr {
 				f(index);
 			}
 			ExprKind::Closure { body, .. }
+			| ExprKind::AsyncBlock { body, .. }
+			| ExprKind::Await { value: body, .. }
 			| ExprKind::PrefixOp { value: body, .. }
 			| ExprKind::PostfixOp { value: body, .. }
 			| ExprKind::TypeOp { lhs: body, .. }
 			| ExprKind::PatternOp { lhs: body, .. }
+			| ExprKind::Echo { operand: body, .. }
 			| ExprKind::Grouped(body) => f(body),
-			ExprKind::BinaryOp { lhs, rhs, .. } | ExprKind::AssignOp { lhs, rhs, .. } => {
+			ExprKind::BinaryOp { lhs, rhs, .. } => {
 				f(lhs);
 				f(rhs);
 			}
@@ -103,14 +104,19 @@ impl Expr {
 					f(value);
 				}
 			}
-			ExprKind::While {
-				condition, body, ..
-			} => {
-				f(condition);
-				f(body);
+			ExprKind::Continue { replacements, .. } => {
+				for replacement in replacements {
+					f(&replacement.value);
+				}
 			}
 			ExprKind::For { iterable, body, .. } => {
 				f(iterable);
+				f(body);
+			}
+			ExprKind::StateLoop { bindings, body, .. } => {
+				for binding in bindings {
+					f(&binding.value);
+				}
 				f(body);
 			}
 			ExprKind::If {
@@ -147,8 +153,7 @@ impl Expr {
 			| ExprKind::Boolean(_)
 			| ExprKind::Identifier(_)
 			| ExprKind::AnonymousParam(_)
-			| ExprKind::This
-			| ExprKind::Continue { .. } => {}
+			| ExprKind::This => {}
 		}
 	}
 }
@@ -205,6 +210,10 @@ pub enum ExprKind {
 		return_type: Option<Spanned<Type>>,
 		body: Box<Expr>,
 	},
+	/// `async { ... }` — a cold recipe with a nested structured context.
+	AsyncBlock { body: Box<Expr>, keyword: Span },
+	/// `value.await` — drives a task or observes an existing handle.
+	Await { value: Box<Expr>, keyword: Span },
 	PrefixOp {
 		op: PrefixOperator,
 		value: Box<Expr>,
@@ -232,11 +241,6 @@ pub enum ExprKind {
 		op: PatternOperator,
 		rhs: Spanned<Pattern>,
 	},
-	AssignOp {
-		lhs: Box<Expr>,
-		op: AssignOperator,
-		rhs: Box<Expr>,
-	},
 	Return {
 		value: Option<Box<Expr>>,
 		label: Option<Ident>,
@@ -247,15 +251,19 @@ pub enum ExprKind {
 	},
 	Continue {
 		label: Option<Ident>,
+		replacements: Vec<StateReplacement>,
 	},
-	While {
-		condition: Box<Expr>,
-		body: Box<Expr>,
-		label: Option<Ident>,
-	},
+	/// `echo value` — a compiler observation that returns `value` unchanged.
+	Echo { operand: Box<Expr>, keyword: Span },
 	For {
 		variable: Spanned<Pattern>,
 		iterable: Box<Expr>,
+		body: Box<Expr>,
+		label: Option<Ident>,
+	},
+	/// `loop (let state = initial) { continue(state = next) }`.
+	StateLoop {
+		bindings: Vec<StateBinding>,
 		body: Box<Expr>,
 		label: Option<Ident>,
 	},
@@ -276,6 +284,18 @@ pub enum ExprKind {
 	},
 	/// `(expr)` — kept to preserve grouping intent.
 	Grouped(Box<Expr>),
+}
+
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub struct StateBinding {
+	pub meta: LetDeclaration,
+	pub value: Expr,
+}
+
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub struct StateReplacement {
+	pub name: Ident,
+	pub value: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
@@ -373,15 +393,35 @@ pub enum RangeKind {
 pub struct ClosureParam {
 	pub name: Spanned<Pattern>,
 	pub type_: Option<Spanned<Type>>,
-	pub mutable: bool,
 	pub spread: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
-pub struct CallArg {
-	pub value: Expr,
-	pub name: Option<Ident>,
-	pub spread: bool,
+pub enum CallArg {
+	Value { name: Option<Ident>, value: Expr },
+	Spread { value: Expr },
+}
+
+impl CallArg {
+	#[must_use]
+	pub fn value(&self) -> &Expr {
+		match self {
+			Self::Value { value, .. } | Self::Spread { value } => value,
+		}
+	}
+
+	#[must_use]
+	pub fn name(&self) -> Option<&Ident> {
+		match self {
+			Self::Value { name, .. } => name.as_ref(),
+			Self::Spread { .. } => None,
+		}
+	}
+
+	#[must_use]
+	pub fn is_spread(&self) -> bool {
+		matches!(self, Self::Spread { .. })
+	}
 }
 
 #[derive(Clone, PartialEq, Debug, salsa::SalsaValue)]
@@ -493,10 +533,7 @@ mod tests {
 	use super::*;
 	use crate::{
 		decl::{LetDeclaration, LetKind},
-		ops::{
-			AssignOperator, BinaryOperator, PatternOperator, PostfixOperator, PrefixOperator,
-			TypeOperator,
-		},
+		ops::{BinaryOperator, PatternOperator, PostfixOperator, PrefixOperator, TypeOperator},
 		ty::Type,
 	};
 
@@ -552,10 +589,9 @@ mod tests {
 				func: Box::new(child(1)),
 				generics: Vec::new(),
 				args: vec![Spanned::new(
-					CallArg {
-						value: child(2),
+					CallArg::Value {
 						name: None,
-						spread: false,
+						value: child(2),
 					},
 					SPAN,
 				)],
@@ -647,14 +683,6 @@ mod tests {
 			&[1, 2],
 		);
 		assert_children(
-			ExprKind::AssignOp {
-				lhs: Box::new(child(1)),
-				op: AssignOperator::Assign,
-				rhs: Box::new(child(2)),
-			},
-			&[1, 2],
-		);
-		assert_children(
 			ExprKind::TypeOp {
 				lhs: Box::new(child(1)),
 				op: TypeOperator::As,
@@ -669,14 +697,6 @@ mod tests {
 				rhs: Spanned::new(Pattern::Placeholder, SPAN),
 			},
 			&[1],
-		);
-		assert_children(
-			ExprKind::While {
-				condition: Box::new(child(1)),
-				body: Box::new(child(2)),
-				label: None,
-			},
-			&[1, 2],
 		);
 		assert_children(
 			ExprKind::For {

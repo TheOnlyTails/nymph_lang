@@ -29,36 +29,32 @@ func average_scaled(a: int, b: int, scale: int): float = {
 generics, and higher-order functions, and [Expressions](../reference/expressions) for everything
 that can appear in a body — `if`/`match` as values, closures, and the full operator set.
 
-## Mutable values
+## Immutable values
 
-Everything in Nymph is immutable unless you say otherwise. A plain `let` binding can never be
-reassigned:
+Values and bindings in Nymph are immutable. Operations return replacements rather than changing
+existing values:
 
 ```nym
-func demo(): int = {
-  let x = 5
-  x
+struct Counter(value: int)
+func increment(counter: Counter): Counter = Counter(value = counter.value + 1)
+func demo(): #(int, int) = {
+  let before = Counter(value = 0)
+  let after = increment(before)
+  #(before.value, after.value)
 }
 ```
 
-Add `mut` to make a binding reassignable, and to let you mutate through it — call a mutating
-method, or reassign one of its fields:
+Repeated state uses an immutable state loop. Each `continue` installs fresh loop-carried values
+simultaneously:
 
 ```nym
-struct Counter(n: int) {
-  mut func bump(): void = { this.n = this.n + 1 }
-}
-
-func demo(): int = {
-  let mut c = Counter(n = 0)
-  c.bump()
-  c.bump()
-  c.n
+func sum_to(limit: int): int = loop (let next = 1, let total = 0) {
+  if (next > limit) { break total }
+  continue(next = next + 1, total = total + next)
 }
 ```
 
-The full rules — `mut` as a type, one-way coercion, and how it interacts with interfaces — are in
-the [Mutability](../reference/mutability) reference page.
+See [Immutability and migration](../reference/mutability) for translating legacy mutable code.
 
 ## Structs
 
@@ -137,21 +133,13 @@ standard library's iteration interfaces:
 
 ```nym
 func sum(): int = {
-  let mut total = 0
-  for (i in 1..=4) {
-    total = total + i
-  }
-  total
+  (1..=4).iter().fold(0, $0 + $1)
 }
 ```
 
 ```nym
 func sum_list(): int = {
-  let mut total = 0
-  for (x in #[1, 2, 3, 4]) {
-    total = total + x
-  }
-  total
+  #[1, 2, 3, 4].iter().fold(0, $0 + $1)
 }
 ```
 
@@ -200,5 +188,5 @@ From here, the [Reference](../reference/) covers each piece in full:
   [Interfaces and impls](../reference/interfaces-and-impls) — the shapes user code takes.
 - [Pattern matching](../reference/pattern-matching) and [Operators](../reference/operators) — the
   two topics this tour only sampled.
-- [Mutability](../reference/mutability) and [Iteration](../reference/iteration) — the two rules
+- [Immutability and migration](../reference/mutability) and [Iteration](../reference/iteration) — the two rules
   that shape how state and loops behave.

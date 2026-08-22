@@ -36,6 +36,7 @@ fn profiling_preserves_output_and_prewarm_never_exceeds_its_pool() {
 	let profile = finish_benchmark_profile();
 	assert_eq!(actual.js, expected.js);
 	assert_eq!(actual.entry_main, expected.entry_main);
+	assert_eq!(actual.entry_root, expected.entry_root);
 	assert_eq!(actual.entry_tag, expected.entry_tag);
 	assert!(
 		profile.prewarm_configured_workers > 0,

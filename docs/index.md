@@ -13,7 +13,7 @@ hero:
 
 features:
   - title: Expression-oriented
-    details: "if, match, blocks, and loops all produce values — write the answer, not a pile of statements."
+    details: "Immutable values, matches, folds, and state loops make data flow explicit."
   - title: Structs, enums, and matching
     details: Model your domain with product and sum types, then take them apart with exhaustive pattern matching.
   - title: No null, no exceptions
@@ -26,7 +26,7 @@ modules are opt-in through `std/...`; project modules use source-rooted `@/...` 
 
 ::: code-group
 
-```nymph [hello_world.nym]
+```nym [hello_world.nym]
 import std/io
 
 func main() = {
@@ -48,16 +48,12 @@ enum BinaryTree<T> {
 }
 ```
 
-```nymph [lists.nym]
-import std/io
-
-let nums = #[1, 2, 3]
-nums
+```nym [lists.nym]
+func odd_squares(nums: #[int]): #[int] = nums
   .iter()
-  .filter($ % 2 == 1)
-  .map($ ** 2u)
-  .fold(0, $0 + $1)
-  |> io.println // 10
+  .filter((value: int) -> value % 2 == 1)
+  .map((value: int) -> value ** 2u)
+  .to_list()
 ```
 
 :::

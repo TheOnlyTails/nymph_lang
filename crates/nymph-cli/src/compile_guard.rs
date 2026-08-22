@@ -46,7 +46,11 @@ thread_local! {
 /// from inside the pipeline and reporting it as data instead of unwinding
 /// into the caller. This single-module path compiles a library; entry builds
 /// use the project compiler through [`guarded`].
-pub(crate) fn compile_guarded(source: &str, path: &str) -> CompileOutcome {
+pub(crate) fn compile_guarded(
+	source: &str,
+	path: &str,
+	profile: nymph_compiler::BuildProfile,
+) -> CompileOutcome {
 	CAPTURED_PANIC_MESSAGE.with(|cell| *cell.borrow_mut() = None);
 
 	// The default hook prints "thread '...' panicked at ...:LINE:COL:\n<msg>\n
@@ -61,7 +65,16 @@ pub(crate) fn compile_guarded(source: &str, path: &str) -> CompileOutcome {
 		CAPTURED_PANIC_MESSAGE.with(|cell| *cell.borrow_mut() = Some(message));
 	}));
 
-	let result = panic::catch_unwind(AssertUnwindSafe(|| nymph_compiler::compile(source, path)));
+	let result = panic::catch_unwind(AssertUnwindSafe(|| {
+		nymph_compiler::compile_with_options(
+			source,
+			path,
+			&nymph_compiler::CompilerOptions {
+				profile,
+				lints: Default::default(),
+			},
+		)
+	}));
 
 	panic::set_hook(previous_hook);
 

@@ -21,8 +21,7 @@ void test(".nym is the extension's sole source suffix", () => {
 		1,
 	);
 	assert.equal(
-		(clientSource.match(/\{\s*scheme:\s*"untitled",\s*language:\s*"nymph"\s*\}/g) || [])
-			.length,
+		(clientSource.match(/\{\s*scheme:\s*"untitled",\s*language:\s*"nymph"\s*\}/g) || []).length,
 		1,
 	);
 	assert.doesNotMatch(clientSource, /createFileSystemWatcher/);
@@ -32,6 +31,25 @@ void test(".nym is the extension's sole source suffix", () => {
 	);
 	assert.match(serverSource, /\["\*\*\/\*\.nym", "\*\*\/nymph\.toml"\]/);
 	assert.ok(!clientSource.includes(`.nym${"ph"}`));
+});
+
+void test("TextMate grammar scopes effect declarations and every row atom", () => {
+	const grammar = JSON.parse(
+		fs.readFileSync(path.join(extensionRoot, "syntaxes", "nymph.tmLanguage.json"), "utf8"),
+	);
+	const patterns = grammar.repository.effects.patterns;
+	assert.equal(patterns.length, 3);
+	assert.equal(patterns[0].captures[1].name, "storage.type.effect.nymph");
+	assert.equal(patterns[0].captures[2].name, "entity.name.type.effect.nymph");
+	assert.match("effect Database", new RegExp(patterns[0].match, "u"));
+	assert.equal(patterns[1].captures[1].name, "keyword.operator.effect.nymph");
+	assert.equal(patterns[1].captures[2].name, "constant.language.effect.pure.nymph");
+	assert.match("!()", new RegExp(patterns[1].match, "u"));
+	assert.equal(patterns[2].captures[1].name, "keyword.operator.effect.nymph");
+	assert.equal(patterns[2].captures[2].name, "entity.name.type.effect.nymph");
+	for (const atom of ["!Database", "!E", "!_"]) {
+		assert.match(atom, new RegExp(patterns[2].match, "u"));
+	}
 });
 
 void test("maintained guidance rejects the legacy suffix without renaming nymph scopes", () => {

@@ -3,10 +3,10 @@
 //! `check_module_entry` is strictly additive: plain `check_module` (library
 //! mode) never requires a `main` at all — every existing corpus/test caller of
 //! `check_module` stays unaffected. Entry mode requires a top-level `func
-//! main` taking no parameters, declaring no generics, and declaring no return
-//! type other than `void`.
+//! main` taking no parameters, declaring no generics, and resolving to one of
+//! the six executable root shapes.
 
-use nymph_sema::{check_module, check_module_entry};
+use nymph_sema::{EntryRootShape, check_module, check_module_entry};
 use nymph_syntax::parse_module;
 
 /// Parse and check `source` in entry mode, returning the checker's error
@@ -45,6 +45,34 @@ fn assert_error_contains(source: &str, needle: &str) {
 	);
 }
 
+const ROOT_TYPES: &str = r#"
+interface Display { func display(): string }
+enum Option<T> { Some(value: T), None }
+enum Result<T, E> { Ok(value: T), Error(error: E) }
+struct Good()
+impl Display for Good { func display(): string = "good" }
+"#;
+
+fn assert_root(source: &str, expected: EntryRootShape) {
+	let source = format!("{ROOT_TYPES}\n{source}");
+	let parsed = parse_module(&source, "test");
+	assert!(
+		!parsed
+			.diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.is_error()),
+		"source failed to parse: {:?}",
+		parsed.diagnostics
+	);
+	let checked = check_module_entry(&parsed.tree);
+	assert!(
+		!checked.diags.iter().any(|diagnostic| diagnostic.is_error()),
+		"entry failed to check: {:?}",
+		checked.diags
+	);
+	assert_eq!(checked.entry_root, Some(expected));
+}
+
 #[test]
 fn accepts_a_void_main_with_no_params() {
 	assert_ok("func main(): void = {}");
@@ -61,11 +89,63 @@ fn accepts_a_grouped_void_return_type() {
 }
 
 #[test]
-fn accepts_a_main_with_no_annotation_and_a_non_void_inferring_body() {
-	// AST-declared-annotation-only rule: an unannotated `main` is accepted even
-	// though its body infers a non-void type — only an explicit non-`void`
-	// annotation is rejected.
-	assert_ok("func main() = 42");
+fn rejects_a_main_with_no_annotation_and_a_non_root_inferring_body() {
+	assert_error_contains("func main() = 42", "must return");
+}
+
+#[test]
+fn accepts_all_six_resolved_root_shapes() {
+	assert_root("func main(): void = {}", EntryRootShape::Void);
+	assert_root(
+		"func main(): Option<void> = Some(value = {})",
+		EntryRootShape::Option,
+	);
+	assert_root(
+		"func main(): Result<void, Good> = Ok(value = {})",
+		EntryRootShape::Result,
+	);
+	assert_root("async func main(): void = {}", EntryRootShape::TaskVoid);
+	assert_root(
+		"async func main(): Option<void> = None",
+		EntryRootShape::TaskOption,
+	);
+	assert_root(
+		"async func main(): Result<void, Good> = Error(error = Good())",
+		EntryRootShape::TaskResult,
+	);
+}
+
+#[test]
+fn accepts_alias_normalized_root_shapes() {
+	assert_root(
+		"type Root = void\nfunc main(): Root = {}",
+		EntryRootShape::Void,
+	);
+	assert_root(
+		"type Root<T> = Option<T>\nfunc main(): Root<void> = None",
+		EntryRootShape::Option,
+	);
+	assert_root(
+		"type Root = Result<void, Good>\nasync func main(): Root = Ok(value = {})",
+		EntryRootShape::TaskResult,
+	);
+}
+
+#[test]
+fn rejects_invalid_near_misses() {
+	for root in [
+		"Option<int>",
+		"Result<int, Good>",
+		"Option<Option<void>>",
+		"Task<Task<void>>",
+	] {
+		let source = format!("{ROOT_TYPES}\nfunc main(): {root} = main()");
+		assert_error_contains(&source, "must return");
+	}
+	assert_root(
+		"struct ErrorValue()\nfunc main(): Result<void, ErrorValue> = Error(error = ErrorValue())",
+		EntryRootShape::Result,
+	);
 }
 
 #[test]

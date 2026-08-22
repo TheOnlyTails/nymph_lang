@@ -1,5 +1,9 @@
 #![warn(clippy::all)]
 
+//! Derive stable four-digit diagnostic codes from a phase prefix and catalog
+//! position. Existing catalog variants must never be reordered or removed;
+//! new variants are appended so every published code keeps its meaning.
+
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{DeriveInput, Fields, LitInt, Meta, Variant, parse_macro_input};

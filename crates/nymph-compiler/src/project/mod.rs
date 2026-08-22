@@ -27,10 +27,12 @@ pub use repl::{
 };
 
 pub use session::{
-	AmbientCoreModuleKey, BuiltinRuntimeOwnerArtifact, BuiltinRuntimeOwnerShape, CompilerSession,
-	ModuleAnalysis, ModulePath, ProjectDiagnostics, ProjectId, RuntimeDefinitionError, SourceVersion,
-	ToolingModuleDeclarations,
+	AmbientCoreModuleKey, BuildProfile, BuiltinRuntimeOwnerArtifact, BuiltinRuntimeOwnerShape,
+	CompilerSession, LintLevel, ModuleAnalysis, ModulePath, PackageGraphError, PackageId,
+	ProjectDiagnostics, ProjectId, RuntimeDefinitionError, ToolingModuleDeclarations,
 };
+
+pub use nymph_diagnostics::SourceVersion;
 
 #[cfg(feature = "test-support")]
 pub use emission::StableEmittedProject;
@@ -47,6 +49,12 @@ pub use session::SemanticQueryEvent;
 pub use test_support::{GraphFixture, GraphShape};
 
 use nymph_diagnostics::Diagnostic;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompilerOptions {
+	pub profile: BuildProfile,
+	pub lints: std::collections::BTreeMap<String, LintLevel>,
+}
 
 #[cfg(feature = "test-support")]
 mod test_support {
@@ -202,6 +210,18 @@ pub struct ProjectDiagnostic {
 	pub diag: Diagnostic,
 }
 
+/// Statically selected executable-root adapter and its exact canonical enum
+/// binding when value classification is required.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompiledEntryRoot {
+	Void,
+	Option { binding: String },
+	Result { binding: String },
+	TaskVoid,
+	TaskOption { binding: String },
+	TaskResult { binding: String },
+}
+
 /// The result of a successful [`compile_project`]: the whole program as one
 /// runnable JS string, plus the entry module's `main` — every OTHER
 /// top-level name in the project is renamed (step 2 above) to stay globally
@@ -213,6 +233,9 @@ pub struct ProjectDiagnostic {
 pub struct CompiledProject {
 	pub js: String,
 	pub entry_main: String,
+	/// Present only when this project was compiled in entry mode. The emitted
+	/// `js` remains inert; executable hosts consume this separate adapter fact.
+	pub entry_root: Option<CompiledEntryRoot>,
 	/// The entry module's own per-project tag. Every top-level name the entry
 	/// module declares OTHER than `main` is mangled `$m{entry_tag}$<name>`
 	/// (see [`Self::entry_symbol`]) — exposed so a caller (chiefly tests)
@@ -241,8 +264,20 @@ fn facade_session(
 	load: &dyn Fn(&str) -> Option<String>,
 	std_provider: &dyn Fn(&str) -> Option<String>,
 ) -> (CompilerSession, ProjectId, ModulePath) {
+	facade_session_with_options(entry, load, std_provider, &CompilerOptions::default())
+}
+
+fn facade_session_with_options(
+	entry: &str,
+	load: &dyn Fn(&str) -> Option<String>,
+	std_provider: &dyn Fn(&str) -> Option<String>,
+	options: &CompilerOptions,
+) -> (CompilerSession, ProjectId, ModulePath) {
 	let project = ProjectId::new(FACADE_PROJECT);
-	let session = CompilerSession::from_source_loaders(project.clone(), entry, load, std_provider);
+	let mut session =
+		CompilerSession::from_source_loaders(project.clone(), entry, load, std_provider);
+	session.set_build_profile(options.profile);
+	session.set_project_lints(project.clone(), options.lints.clone());
 	let entry = ModulePath::new(entry).expect("project entry must be a canonical module path");
 	(session, project, entry)
 }
@@ -287,6 +322,20 @@ pub fn check_project_with_embedded_std(
 	check_project_with_std(entry, load, &crate::embedded_std_provider)
 }
 
+pub fn check_project_with_embedded_std_and_options(
+	entry: &str,
+	load: &dyn Fn(&str) -> Option<String>,
+	options: &CompilerOptions,
+) -> Vec<ProjectDiagnostic> {
+	let (session, project, entry) =
+		facade_session_with_options(entry, load, &crate::embedded_std_provider, options);
+	session
+		.check_project(project, entry, nymph_sema::EntryMode::Entry)
+		.iter()
+		.cloned()
+		.collect()
+}
+
 /// Library-mode counterpart of [`check_project`]: `entry` is not required to
 /// declare a `main` — mirrors [`crate::check`] one level up. Used to check a
 /// project graph rooted at a non-entry module (e.g. `nymph build` on a file
@@ -322,6 +371,20 @@ pub fn check_project_library_with_embedded_std(
 	load: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<ProjectDiagnostic> {
 	check_project_library_with_std(entry, load, &crate::embedded_std_provider)
+}
+
+pub fn check_project_library_with_embedded_std_and_options(
+	entry: &str,
+	load: &dyn Fn(&str) -> Option<String>,
+	options: &CompilerOptions,
+) -> Vec<ProjectDiagnostic> {
+	let (session, project, entry) =
+		facade_session_with_options(entry, load, &crate::embedded_std_provider, options);
+	session
+		.check_project(project, entry, nymph_sema::EntryMode::Library)
+		.iter()
+		.cloned()
+		.collect()
 }
 
 /// Compile the whole project reachable from `entry` to one runnable JS
@@ -360,29 +423,84 @@ pub fn compile_project_with_std(
 		.map_err(|diagnostics| diagnostics.iter().cloned().collect())
 }
 
+pub fn compile_project_with_embedded_std_and_options(
+	entry: &str,
+	load: &dyn Fn(&str) -> Option<String>,
+	options: &CompilerOptions,
+) -> Result<CompiledProject, Vec<ProjectDiagnostic>> {
+	let (session, project, entry) =
+		facade_session_with_options(entry, load, &crate::embedded_std_provider, options);
+	session
+		.compile_project(project, entry, nymph_sema::EntryMode::Entry)
+		.map(|compiled| compiled.as_ref().clone())
+		.map_err(|diagnostics| diagnostics.iter().cloned().collect())
+}
+
+pub fn compile_project_with_embedded_std_options_and_source_uris(
+	entry: &str,
+	load: &dyn Fn(&str) -> Option<String>,
+	options: &CompilerOptions,
+	uri_for_module: &dyn Fn(&str) -> Option<String>,
+) -> Result<CompiledProject, Vec<ProjectDiagnostic>> {
+	let (mut session, project, entry) =
+		facade_session_with_options(entry, load, &crate::embedded_std_provider, options);
+	session.set_project_source_uris(&project, uri_for_module);
+	session
+		.compile_project(project, entry, nymph_sema::EntryMode::Entry)
+		.map(|compiled| compiled.as_ref().clone())
+		.map_err(|diagnostics| diagnostics.iter().cloned().collect())
+}
+
+pub fn compile_project_library_with_embedded_std_options_and_source_uris(
+	entry: &str,
+	load: &dyn Fn(&str) -> Option<String>,
+	options: &CompilerOptions,
+	uri_for_module: &dyn Fn(&str) -> Option<String>,
+) -> Result<CompiledProject, Vec<ProjectDiagnostic>> {
+	let (mut session, project, entry) =
+		facade_session_with_options(entry, load, &crate::embedded_std_provider, options);
+	session.set_project_source_uris(&project, uri_for_module);
+	session
+		.compile_project(project, entry, nymph_sema::EntryMode::Library)
+		.map(|compiled| compiled.as_ref().clone())
+		.map_err(|diagnostics| diagnostics.iter().cloned().collect())
+}
+
 /// Compile one standalone source through the canonical virtual-module
 /// assembly while retaining the facade's unmangled top-level names.
-fn standalone_session(source: &str) -> (CompilerSession, ProjectId, ModulePath) {
+fn standalone_session(source: &str, source_name: &str) -> (CompilerSession, ProjectId, ModulePath) {
+	standalone_session_with_options(source, source_name, &CompilerOptions::default())
+}
+
+fn standalone_session_with_options(
+	source: &str,
+	source_name: &str,
+	options: &CompilerOptions,
+) -> (CompilerSession, ProjectId, ModulePath) {
 	const STANDALONE_ENTRY: &str = "__nymph_internal_standalone_entry__";
 	let project = ProjectId::new(FACADE_PROJECT);
 	let path = ModulePath::new(STANDALONE_ENTRY).expect("standalone key is canonical");
 	let mut session = CompilerSession::from_builtin_sources(Default::default());
-	session.set_source(
+	session.set_build_profile(options.profile);
+	session.set_project_lints(project.clone(), options.lints.clone());
+	session.set_source_with_location(
 		project.clone(),
 		path.clone(),
 		source.to_string(),
 		SourceVersion(1),
+		source_name,
+		None::<String>,
 	);
 	(session, project, path)
 }
 
 pub(crate) fn check_standalone(
 	source: &str,
-	_path: &str,
+	path: &str,
 	entry_mode: nymph_sema::EntryMode,
 	ambient_prelude: bool,
 ) -> Vec<Diagnostic> {
-	let (session, project, path) = standalone_session(source);
+	let (session, project, path) = standalone_session(source, path);
 	let diagnostics = if ambient_prelude {
 		session.check_project_with_options(project, path, entry_mode, true)
 	} else {
@@ -393,10 +511,23 @@ pub(crate) fn check_standalone(
 
 pub(crate) fn compile_standalone(
 	source: &str,
-	_path: &str,
+	path: &str,
 	entry_mode: nymph_sema::EntryMode,
 ) -> Result<String, Vec<Diagnostic>> {
-	let (session, project, path) = standalone_session(source);
+	let (session, project, path) = standalone_session(source, path);
+	session
+		.compile_project_with_options(project, path, entry_mode, true)
+		.map(|compiled| compiled.js.clone())
+		.map_err(|diags| diags.iter().map(|item| item.diag.clone()).collect())
+}
+
+pub(crate) fn compile_standalone_with_options(
+	source: &str,
+	path: &str,
+	entry_mode: nymph_sema::EntryMode,
+	options: &CompilerOptions,
+) -> Result<String, Vec<Diagnostic>> {
+	let (session, project, path) = standalone_session_with_options(source, path, options);
 	session
 		.compile_project_with_options(project, path, entry_mode, true)
 		.map(|compiled| compiled.js.clone())
@@ -405,10 +536,10 @@ pub(crate) fn compile_standalone(
 
 pub(crate) fn compile_standalone_report(
 	source: &str,
-	_path: &str,
+	path: &str,
 	entry_mode: nymph_sema::EntryMode,
 ) -> crate::StandaloneCompileReport {
-	let (session, project, path) = standalone_session(source);
+	let (session, project, path) = standalone_session(source, path);
 	let mut diagnostics = session
 		.check_project_with_options(project.clone(), path.clone(), entry_mode, true)
 		.iter()
@@ -474,4 +605,64 @@ pub fn compile_project_library_with_std(
 		.compile_project(project, entry, nymph_sema::EntryMode::Library)
 		.map(|compiled| compiled.as_ref().clone())
 		.map_err(|diagnostics| diagnostics.iter().cloned().collect())
+}
+
+pub fn compile_project_library_with_embedded_std_and_options(
+	entry: &str,
+	load: &dyn Fn(&str) -> Option<String>,
+	options: &CompilerOptions,
+) -> Result<CompiledProject, Vec<ProjectDiagnostic>> {
+	let (session, project, entry) =
+		facade_session_with_options(entry, load, &crate::embedded_std_provider, options);
+	session
+		.compile_project(project, entry, nymph_sema::EntryMode::Library)
+		.map(|compiled| compiled.as_ref().clone())
+		.map_err(|diagnostics| diagnostics.iter().cloned().collect())
+}
+
+#[cfg(test)]
+mod stable_session_contracts {
+	use super::*;
+	use nymph_sema::EntryMode;
+
+	#[test]
+	fn one_shot_and_retained_sessions_have_exact_diagnostic_and_emission_parity() {
+		let sources = [
+			"public func answer(): int = 1",
+			"public func answer(): int = 2",
+			"public func answer(value: Missing): int = 2",
+		];
+		let (mut retained, project, path) = standalone_session(sources[0], "ignored.nym");
+
+		for (index, source) in sources.into_iter().enumerate() {
+			if index != 0 {
+				retained.set_source(
+					project.clone(),
+					path.clone(),
+					source.to_string(),
+					SourceVersion(index as i64 + 1),
+				);
+			}
+			let one_shot = compile_standalone_report(source, "ignored.nym", EntryMode::Library);
+			let retained_diagnostics = retained
+				.check_project_with_options(project.clone(), path.clone(), EntryMode::Library, true)
+				.iter()
+				.map(|diagnostic| diagnostic.diag.clone())
+				.collect::<Vec<_>>();
+			let retained_js = if retained_diagnostics.iter().any(Diagnostic::is_error) {
+				None
+			} else {
+				Some(
+					retained
+						.compile_project_with_options(project.clone(), path.clone(), EntryMode::Library, true)
+						.expect("checked retained source emits")
+						.js
+						.clone(),
+				)
+			};
+
+			assert_eq!(one_shot.diagnostics, retained_diagnostics, "source {index}");
+			assert_eq!(one_shot.js, retained_js, "source {index}");
+		}
+	}
 }

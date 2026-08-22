@@ -69,8 +69,8 @@ fn println_hello_nymph_compiles_bundles_and_runs() {
 		.expect("expected `import std/io` + a bare `println(..)` call to compile");
 
 	assert!(
-		compiled.js.contains("println("),
-		"expected the bundle to contain a `println(` call, got:\n{}",
+		compiled.js.contains("nymphPrintlnStep"),
+		"expected the bundle to route `println` through the activation driver, got:\n{}",
 		compiled.js
 	);
 	assert!(
@@ -134,7 +134,7 @@ func main(): void = {
 	println(true)
 	println('x')
 	println("hi")
-	println(#["a", "b"].debug())
+	println(#["a", "b"])
 }"#;
 	let load = only_entry("main", entry);
 	let compiled = compile_project_with_std("main", &load, &real_stdlib_provider)
@@ -157,8 +157,7 @@ struct Marker(v: int) {
 }
 struct Holder(value: Marker, v: int)
 func main(): void = {
-	println(#[Marker(v = 1)].debug())
-	println(Holder(v = 2, value = Marker(v = 1)).debug())
+	println(#[Marker(v = 1)])
 	println(Holder(v = 2, value = Marker(v = 1)))
 }"#;
 	let load = only_entry("main", entry);
@@ -168,7 +167,7 @@ func main(): void = {
 	js.push_str(&format!("\n{}();\n", compiled.entry_main));
 	assert_eq!(
 		run_node(&js, "nested_debug"),
-		"#[<marker>]\nHolder(value: <marker>, v: 2)\nHolder(value: <marker>, v: 2)\n"
+		"#[<marker>]\nHolder(value: <marker>, v: 2)\n"
 	);
 }
 
@@ -176,16 +175,14 @@ func main(): void = {
 fn debug_escapes_control_characters() {
 	let entry = r#"import std/io with (println)
 func main(): void = {
-	println('\n'.debug())
-	println('\r'.debug())
-	println('\t'.debug())
+	println(#['\n', '\r', '\t'])
 }"#;
 	let load = only_entry("main", entry);
 	let compiled = compile_project_with_std("main", &load, &real_stdlib_provider)
 		.expect("Debug should compile for escaped characters");
 	let mut js = compiled.js;
 	js.push_str(&format!("\n{}();\n", compiled.entry_main));
-	assert_eq!(run_node(&js, "debug_chars"), "'\\n'\n'\\r'\n'\\t'\n");
+	assert_eq!(run_node(&js, "debug_chars"), "#['\\n', '\\r', '\\t']\n");
 }
 
 #[test]
@@ -207,26 +204,6 @@ func main(): void = println(rendered())"#;
 }
 
 #[test]
-fn into_string_delegates_to_display() {
-	let entry = r#"import std/io with (println)
-struct Label(value: int) {
-	impl Display {
-		func display(): string = "label=${this.value}"
-	}
-}
-func main(): void = {
-	println(1 as string)
-	println(Label(value = 7) as string)
-}"#;
-	let load = only_entry("main", entry);
-	let compiled = compile_project_with_std("main", &load, &real_stdlib_provider)
-		.expect("Into<string> should be available through the blanket Display implementation");
-	let mut js = compiled.js;
-	js.push_str(&format!("\n{}();\n", compiled.entry_main));
-	assert_eq!(run_node(&js, "display_into_string"), "1\nlabel=7\n");
-}
-
-#[test]
 fn unrelated_inherent_methods_do_not_override_display_protocols() {
 	let entry = r#"import std/io with (println)
 struct Coin() {
@@ -235,24 +212,24 @@ struct Coin() {
 }
 func main(): void = {
 	println(Coin())
-	println(#[Coin()].debug())
+	println(#[Coin()])
 }"#;
 	let load = only_entry("main", entry);
 	let compiled = compile_project_with_std("main", &load, &real_stdlib_provider)
-		.expect("unrelated inherent method names should not affect blanket Display/Debug");
+		.expect("unrelated inherent method names should not affect runtime rendering");
 	let mut js = compiled.js;
 	js.push_str(&format!("\n{}();\n", compiled.entry_main));
 	assert_eq!(run_node(&js, "nominal_display"), "Coin\n#[Coin]\n");
 }
 
 #[test]
-fn println_accepts_void_through_blanket_display() {
+fn println_accepts_void_through_runtime_rendering() {
 	let entry = r#"import std/io with (println)
 func noop(): void = {}
 func main(): void = println(noop())"#;
 	let load = only_entry("main", entry);
 	let compiled = compile_project_with_std("main", &load, &real_stdlib_provider)
-		.expect("void should satisfy the blanket Display implementation");
+		.expect("println should render void without a compatibility implementation");
 	let mut js = compiled.js;
 	js.push_str(&format!("\n{}();\n", compiled.entry_main));
 	assert_eq!(run_node(&js, "display_void"), "void\n");
@@ -284,7 +261,7 @@ fn a_program_without_importing_io_is_unaffected() {
 	let mut js = compiled.js;
 	js.push_str(&format!("\nconsole.log({call}().v);\n"));
 
-	assert_eq!(run_node(&js, "no_io").trim(), "5");
+	assert_eq!(run_node(&js, "no_io").trim(), "5n");
 }
 
 /// `import std/io` alone (through the real on-disk `stdlib/src/io.nym`, no

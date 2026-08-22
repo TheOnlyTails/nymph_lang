@@ -8,13 +8,16 @@ use rustc_hash::FxHashMap;
 
 use super::queries::Db;
 use super::session::{ProjectKey, SemanticModuleDomain, SemanticModuleInput};
-use super::{CompiledProject, ProjectDiagnostic, bundle, link_plan, queries};
+use super::{CompiledEntryRoot, CompiledProject, ProjectDiagnostic, bundle, link_plan, queries};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct StableEmittedProject {
 	pub module_sources: FxHashMap<String, String>,
 	pub entry_tag: usize,
+	pub entry_root: Option<CompiledEntryRoot>,
 	pub(crate) compiler_option_binding: String,
+	pub(crate) compiler_option_module: String,
+	pub(crate) echo_runtime: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -32,10 +35,13 @@ fn internal_diagnostic(key: &str, code: &str, message: String) -> Arc<[ProjectDi
 }
 
 fn module_specifier(module: &nymph_sema::ModuleIdentity) -> String {
-	if matches!(module.origin, nymph_sema::ModuleOrigin::Compiler) {
-		format!("@nymph/runtime/{}", module.path)
-	} else {
-		module.path.to_string()
+	match &module.origin {
+		nymph_sema::ModuleOrigin::Project(_) => module.path.to_string(),
+		nymph_sema::ModuleOrigin::ResolvedPackage { node } => {
+			format!("package::{node}::{}", module.path)
+		}
+		nymph_sema::ModuleOrigin::ImportableStd => format!("std::{}", module.path),
+		nymph_sema::ModuleOrigin::Compiler => format!("@nymph/runtime/{}", module.path),
 	}
 }
 
@@ -50,8 +56,48 @@ fn compiler_option_definition<'db>(
 		.ok_or_else(|| "compiler Option definition is unavailable".to_string())
 }
 
+fn compiler_result_binding<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Result<String, String> {
+	let definition = queries::compiler_runtime_roles(db, key.ambient_core_registry(db))
+		.result
+		.as_ref()
+		.map(|role| role.result.clone())
+		.ok_or_else(|| "compiler Result definition is unavailable".to_string())?;
+	queries::binding_name(db, key, definition)
+		.map(|name| name.as_str().to_string())
+		.map_err(|error| format!("compiler Result binding is unavailable: {error:?}"))
+}
+
+fn compiled_entry_root(
+	db: &dyn Db,
+	key: ProjectKey<'_>,
+	shape: Option<nymph_sema::EntryRootShape>,
+	option_binding: &str,
+) -> Result<Option<CompiledEntryRoot>, String> {
+	use nymph_sema::EntryRootShape as Shape;
+	Ok(match shape {
+		None => None,
+		Some(Shape::Void) => Some(CompiledEntryRoot::Void),
+		Some(Shape::Option) => Some(CompiledEntryRoot::Option {
+			binding: option_binding.to_string(),
+		}),
+		Some(Shape::Result) => Some(CompiledEntryRoot::Result {
+			binding: compiler_result_binding(db, key)?,
+		}),
+		Some(Shape::TaskVoid) => Some(CompiledEntryRoot::TaskVoid),
+		Some(Shape::TaskOption) => Some(CompiledEntryRoot::TaskOption {
+			binding: option_binding.to_string(),
+		}),
+		Some(Shape::TaskResult) => Some(CompiledEntryRoot::TaskResult {
+			binding: compiler_result_binding(db, key)?,
+		}),
+	})
+}
+
 fn prepend_external_aliases(source: &mut String, aliases: &[link_plan::LinkedExternalAlias]) {
 	for alias in aliases.iter().rev() {
+		crate::host_runtime::HostRuntimeGraph::compiler_facts()
+			.validate_abi(&alias.abi)
+			.unwrap_or_else(|error| panic!("invalid compiler Node adapter plan: {error:?}"));
 		let (module, symbol) = alias
 			.abi
 			.linked()
@@ -94,10 +140,49 @@ fn link_artifact(fragment: &nymph_sema::LoweredHirFragment) -> link_plan::LinkAr
 		| nymph_sema::LoweredHirFragment::TopLevelValue(_)
 		| nymph_sema::LoweredHirFragment::StructShell(_)
 		| nymph_sema::LoweredHirFragment::EnumShell(_) => link_plan::LinkArtifact::TopLevel,
-		nymph_sema::LoweredHirFragment::TopLevelExternal { abi, .. } => {
-			link_plan::LinkArtifact::External(abi)
-		}
+		nymph_sema::LoweredHirFragment::TopLevelExternal { abi, function, .. } => match function {
+			Some(_) => link_plan::LinkArtifact::WrappedExternal,
+			None => link_plan::LinkArtifact::External(abi),
+		},
 		_ => link_plan::LinkArtifact::Attached,
+	}
+}
+
+fn echo_emission(
+	db: &dyn Db,
+	key: ProjectKey<'_>,
+	module: SemanticModuleInput,
+) -> nymph_codegen::EchoEmission {
+	if key.policy_input(db).profile(db) == super::session::BuildProfile::Release {
+		return nymph_codegen::EchoEmission::Release;
+	}
+	match module {
+		SemanticModuleInput::Project(module) => nymph_codegen::EchoEmission::Development {
+			source_name: module.source_name(db).to_string(),
+			source_uri: module.source_uri(db).map(|uri| uri.to_string()),
+			source: module.source(db).unwrap_or_default().to_string(),
+		},
+		SemanticModuleInput::Builtin(module) => nymph_codegen::EchoEmission::Development {
+			source_name: format!("{}.nym", module.key(db).path),
+			source_uri: None,
+			source: module.source(db).to_string(),
+		},
+	}
+}
+
+fn virtual_echo_emission(
+	db: &dyn Db,
+	key: ProjectKey<'_>,
+	owner: &nymph_sema::ModuleIdentity,
+) -> nymph_codegen::EchoEmission {
+	if key.policy_input(db).profile(db) == super::session::BuildProfile::Release {
+		nymph_codegen::EchoEmission::Release
+	} else {
+		nymph_codegen::EchoEmission::Development {
+			source_name: format!("{}.nym", owner.path),
+			source_uri: None,
+			source: String::new(),
+		}
 	}
 }
 
@@ -112,16 +197,6 @@ pub(crate) fn emitted_interface_module<'db>(
 	db.semantic_query_will_execute("emitted_interface_module", module);
 	#[cfg(feature = "test-support")]
 	let _timing = super::benchmark_support::phase(super::benchmark_support::Phase::Emission);
-	let stable = match queries::lower_interface_module(db, key, module) {
-		Ok(module) => module,
-		Err(error) => {
-			return StableEmissionResult::Diagnostics(internal_diagnostic(
-				&module.display_key(db),
-				"STABLE-EMISSION-LOWERING",
-				format!("stable module lowering failed: {error:?}"),
-			));
-		}
-	};
 	let environment = queries::interface_module_environment(db, key, module);
 	let mut public: std::collections::HashSet<_> = match environment.as_ref() {
 		nymph_sema::ModuleEnvironment::Complete(interface) => interface
@@ -135,6 +210,16 @@ pub(crate) fn emitted_interface_module<'db>(
 				&module.display_key(db),
 				"STABLE-EMISSION-RECOVERED",
 				"stable emission cannot consume a recovered environment".to_string(),
+			));
+		}
+	};
+	let stable = match queries::lower_interface_module(db, key, module) {
+		Ok(module) => module,
+		Err(error) => {
+			return StableEmissionResult::Diagnostics(internal_diagnostic(
+				&module.display_key(db),
+				"STABLE-EMISSION-LOWERING",
+				format!("stable module lowering failed: {error:?}"),
 			));
 		}
 	};
@@ -244,7 +329,12 @@ pub(crate) fn emitted_interface_module<'db>(
 			}
 		}
 	} else {
-		nymph_codegen::emit_for_project_module_with_imports(&stable.hir, &stable.module.path, &imports)
+		nymph_codegen::emit_for_project_module_with_imports_and_echo(
+			&stable.hir,
+			&stable.module.path,
+			&imports,
+			echo_emission(db, key, module),
+		)
 	};
 	prepend_external_aliases(&mut source, &plan.external_aliases);
 	if !plan.exports.is_empty() {
@@ -276,6 +366,12 @@ pub(crate) fn emitted_interface_project<'db>(
 		return StableEmissionResult::Diagnostics(diagnostics.0);
 	}
 	let graph = queries::project_graph(db, key);
+	let echo_runtime = key.policy_input(db).profile(db) != super::session::BuildProfile::Release
+		&& graph
+			.semantic_order
+			.iter()
+			.copied()
+			.any(|module| !nymph_sema::query::echo_sites(&module.parsed(db).tree).is_empty());
 	let compiler_option = match compiler_option_definition(db, key) {
 		Ok(definition) => definition,
 		Err(message) => {
@@ -301,21 +397,6 @@ pub(crate) fn emitted_interface_project<'db>(
 	let mut option_requested = false;
 	let mut option_definition = None;
 	let host_runtime = crate::host_runtime::HostRuntimeGraph::compiler_facts();
-	let reserved_runtime = crate::host_runtime::HostRuntimeGraph::role_import_specifier(
-		crate::host_runtime::CompilerRuntimeRole::Option,
-	);
-	if graph.semantic_order.iter().copied().any(|module| {
-		module.domain(db) != SemanticModuleDomain::AmbientCore
-			&& module.identity(db).path.as_str() == reserved_runtime
-	}) {
-		return StableEmissionResult::Diagnostics(internal_diagnostic(
-			reserved_runtime,
-			"STABLE-RUNTIME-MODULE-COLLISION",
-			format!(
-				"canonical runtime module `{reserved_runtime}` collides with project module `{reserved_runtime}`"
-			),
-		));
-	}
 	for module in graph
 		.semantic_order
 		.iter()
@@ -356,7 +437,7 @@ pub(crate) fn emitted_interface_project<'db>(
 		match emitted_interface_module(db, key, module, transactional) {
 			StableEmissionResult::Value(source) => {
 				sources.insert(
-					module.identity(db).path.to_string(),
+					module_specifier(&module.identity(db)),
 					source.as_ref().clone(),
 				);
 			}
@@ -443,22 +524,16 @@ pub(crate) fn emitted_interface_project<'db>(
 				"assembled Option definition does not match the compiler Option".to_string(),
 			));
 		}
-		let shim = format!(
-			"export {{ {} as Option }} from \"@nymph/runtime/{}\";\n",
-			compiler_option_binding, compiler_option.module.path
-		);
-		if sources.insert(reserved_runtime.to_string(), shim).is_some() {
-			return StableEmissionResult::Diagnostics(internal_diagnostic(
-				reserved_runtime,
-				"STABLE-INTRINSIC-COLLISION",
-				"compiler Option shim collides with a project module".to_string(),
-			));
-		}
 	}
+	let entry_identity = nymph_sema::ModuleIdentity::resolved_project(
+		key.project_input(db).project(db).as_str(),
+		0,
+		key.entry(db).as_str(),
+	);
 	let Some(entry_tag) = graph
 		.semantic_order
 		.iter()
-		.position(|module| module.identity(db).path == key.entry(db).as_str())
+		.position(|module| module.identity(db) == entry_identity)
 	else {
 		return StableEmissionResult::Diagnostics(internal_diagnostic(
 			key.entry(db).as_str(),
@@ -466,10 +541,33 @@ pub(crate) fn emitted_interface_project<'db>(
 			"the stable project graph does not contain its entry module".to_string(),
 		));
 	};
+	let entry_module = graph
+		.semantic_order
+		.iter()
+		.copied()
+		.find(|module| module.identity(db) == entry_identity)
+		.expect("entry module was located above");
+	let semantic_root = queries::interface_module_analysis(db, key, entry_module)
+		.semantic
+		.checked
+		.entry_root;
+	let entry_root = match compiled_entry_root(db, key, semantic_root, &compiler_option_binding) {
+		Ok(root) => root,
+		Err(message) => {
+			return StableEmissionResult::Diagnostics(internal_diagnostic(
+				key.entry(db).as_str(),
+				"STABLE-ENTRY-ADAPTER",
+				message,
+			));
+		}
+	};
 	StableEmissionResult::Value(Arc::new(StableEmittedProject {
 		module_sources: sources,
 		entry_tag,
+		entry_root,
 		compiler_option_binding,
+		compiler_option_module: format!("@nymph/runtime/{}", compiler_option.module.path),
+		echo_runtime,
 	}))
 }
 
@@ -561,7 +659,12 @@ fn emit_virtual_runtime_module(
 			format!("strict REPL mode rejects unaudited stateful external `{module}::{symbol}`")
 		})?
 	} else {
-		nymph_codegen::emit_for_project_module_with_imports(&hir, &current_module, &runtime_imports)
+		nymph_codegen::emit_for_project_module_with_imports_and_echo(
+			&hir,
+			&current_module,
+			&runtime_imports,
+			virtual_echo_emission(db, key, owner),
+		)
 	};
 	prepend_external_aliases(&mut source, &plan.external_aliases);
 	if !plan.exports.is_empty() {
@@ -590,9 +693,19 @@ pub(crate) fn compiled_interface_project<'db>(
 		}
 	};
 	let mut module_sources = emitted.module_sources.clone();
-	for (module, source) in crate::host_runtime::HostRuntimeGraph::compiler_facts()
-		.module_sources(&emitted.compiler_option_binding)
-	{
+	if emitted.entry_root.is_some() {
+		let entry = module_sources
+			.get_mut(key.entry(db).as_str())
+			.expect("emitted project contains its entry source");
+		entry.push_str(
+			"export { nymphActivate, nymphProtocolDisplayStep, nymphRenderDefect, nymphStartRoot } from \"std/box\";\n",
+		);
+	}
+	for (module, source) in crate::host_runtime::HostRuntimeGraph::compiler_facts().module_sources(
+		&emitted.compiler_option_binding,
+		&emitted.compiler_option_module,
+		emitted.echo_runtime,
+	) {
 		if module_sources.insert(module.clone(), source).is_some() {
 			return StableEmissionResult::Diagnostics(internal_diagnostic(
 				&module,
@@ -607,6 +720,7 @@ pub(crate) fn compiled_interface_project<'db>(
 		Ok(js) => StableEmissionResult::Value(Arc::new(CompiledProject {
 			js,
 			entry_main: "main".to_string(),
+			entry_root: emitted.entry_root.clone(),
 			entry_tag: emitted.entry_tag,
 		})),
 		Err(error) => StableEmissionResult::Diagnostics(internal_diagnostic(

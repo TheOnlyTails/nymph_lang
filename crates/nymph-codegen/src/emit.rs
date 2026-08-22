@@ -1,18 +1,21 @@
 use oxc::{
-	allocator::{Allocator, Box as ArenaBox, Vec as ArenaVec},
+	allocator::{Allocator, Box as ArenaBox, CloneIn, Vec as ArenaVec},
 	ast::{AstBuilder, ast::*},
 	codegen::Codegen,
 	span::SPAN,
+	syntax::number::BigintBase,
 };
 
 use ecow::EcoString;
 
 use nymph_hir::hir::{
-	BinOp, BuiltinResult, HirArrayElem, HirArrayKind, HirBoundDispatchCase, HirBoundDispatchTarget,
-	HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit, HirMapElem, HirMethod, HirModule, HirPat,
-	HirRange, HirStmt, NumKind, ScalarCastKind, UnOp,
+	BinOp, BuiltinResult, HirArm, HirArrayElem, HirArrayKind, HirBoundDispatchCase,
+	HirBoundDispatchTarget, HirCallMode, HirClass, HirEnum, HirExpr, HirFunc, HirLet, HirLit,
+	HirMapElem, HirMethod, HirModule, HirOptionAbi, HirPat, HirRange, HirReturnTarget, HirStmt,
+	NumKind, OperationMode, ScalarCastKind, UnOp,
 };
 
+use crate::EchoEmission;
 use crate::box_rt;
 
 fn external_alias(module: &str, symbol: &str, kind: &str) -> String {
@@ -48,9 +51,8 @@ enum Subject {
 	/// `<base>.slice(<start>, <base>.length - <end_from_end>)` — a list rest slice
 	/// (`end_from_end == 0` ⇒ `<base>.slice(<start>)`).
 	Slice(Box<Subject>, usize, usize, HirArrayKind),
-	/// The rest-of-map for a map pattern's `...rest` — a shallow copy of `<base>`
-	/// minus the named keys: `new NMap(<base>)` when `keys` is empty, else an
-	/// IIFE that copies then deletes each key.
+	/// The rest-of-map for a map pattern's `...rest`: a persistent map built by
+	/// removing each named key from `<base>`.
 	MapRest(Box<Subject>, Vec<HirLit>),
 	/// Select the subject bound by the matching side of a union pattern. The
 	/// decision is assigned while testing the union and shared by every binding,
@@ -80,118 +82,1970 @@ struct MatchArmControl<'a> {
 	label: Option<&'a str>,
 }
 
-/// The JavaScript representation selected for user bindings and mutations.
-/// Transactional emission keeps source bindings in runtime cells and routes
-/// observable object changes through rollback-aware runtime helpers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ActivationLocation {
+	frame: String,
+	slot: usize,
+}
+
+#[derive(Clone, Debug)]
+enum ActivationAction {
+	Store {
+		target: ActivationLocation,
+		value: HirExpr,
+	},
+	RegisterCleanup(HirExpr),
+	RegisterStateCleanup {
+		cleanup: HirExpr,
+		binding: String,
+		value: ActivationLocation,
+		handle: ActivationLocation,
+	},
+	CommitStateTransition {
+		header_depth: usize,
+		replacements: Vec<(ActivationLocation, ActivationLocation)>,
+	},
+	EnterCleanupScope,
+	UnwindCleanupScopes(usize),
+}
+
+#[derive(Clone, Debug)]
+enum ActivationTerminal {
+	Goto(u32),
+	Branch {
+		condition: HirExpr,
+		then_state: u32,
+		else_state: u32,
+	},
+	Transfer {
+		call: HirExpr,
+		resume_state: u32,
+		result_slot: usize,
+	},
+	Return(HirExpr),
+}
+
+#[derive(Clone, Debug)]
+struct ActivationState {
+	environment: std::collections::BTreeMap<String, ActivationLocation>,
+	pattern_bindings: std::collections::BTreeSet<String>,
+	actions: Vec<ActivationAction>,
+	terminal: ActivationTerminal,
+}
+
+#[derive(Clone, Debug)]
+struct ActivationPlan {
+	frame: String,
+	states: Vec<ActivationState>,
+}
+
+#[derive(Clone)]
+struct ActivationLoop {
+	target: nymph_hir::hir::LoopTarget,
+	result: ActivationLocation,
+	exit_state: u32,
+	continue_state: u32,
+	option: Option<HirOptionAbi>,
+	cleanup_depth: usize,
+	state: Option<ActivationStateLoop>,
+}
+
+#[derive(Clone, Debug)]
+struct ActivationStateBinding {
+	name: String,
+	location: ActivationLocation,
+	cleanup: Option<HirExpr>,
+	cleanup_handle: Option<ActivationLocation>,
+}
+
+#[derive(Clone, Debug)]
+struct ActivationStateLoop {
+	bindings: Vec<ActivationStateBinding>,
+	header_depth: usize,
+	loop_head: u32,
+}
+
+#[derive(Clone)]
+struct ActivationBlock {
+	target: nymph_hir::hir::BlockTarget,
+	result: ActivationLocation,
+	exit_state: u32,
+	cleanup_depth: usize,
+}
+
+fn pattern_binding_names(pattern: &HirPat, names: &mut std::collections::BTreeSet<EcoString>) {
+	match pattern {
+		HirPat::Wildcard | HirPat::Lit(_) | HirPat::Range(_) => {}
+		HirPat::Binding { name, sub } => {
+			names.insert(name.clone());
+			if let Some(sub) = sub {
+				pattern_binding_names(sub, names);
+			}
+		}
+		HirPat::Variant { fields, .. } | HirPat::Struct { fields } => {
+			for (_, pattern) in fields {
+				pattern_binding_names(pattern, names);
+			}
+		}
+		HirPat::Tuple(items) => {
+			for pattern in items {
+				pattern_binding_names(pattern, names);
+			}
+		}
+		HirPat::List {
+			prefix,
+			rest,
+			suffix,
+			..
+		} => {
+			for pattern in prefix.iter().chain(suffix) {
+				pattern_binding_names(pattern, names);
+			}
+			if let Some(Some(name)) = rest {
+				names.insert(name.clone());
+			}
+		}
+		HirPat::Map { entries, rest } => {
+			for (_, pattern) in entries {
+				pattern_binding_names(pattern, names);
+			}
+			if let Some(Some(name)) = rest {
+				names.insert(name.clone());
+			}
+		}
+		HirPat::Or(left, right) => {
+			pattern_binding_names(left, names);
+			pattern_binding_names(right, names);
+		}
+	}
+}
+
+fn activation_protocol_step(module: &str, symbol: &str) -> Option<&'static str> {
+	match (module, symbol) {
+		("std/io", "print") => Some("nymphPrintStep"),
+		("std/io", "println") => Some("nymphPrintlnStep"),
+		_ => None,
+	}
+}
+
+fn requires_activation_split(expr: &HirExpr) -> bool {
+	fn any(items: &[HirExpr]) -> bool {
+		items.iter().any(requires_activation_split)
+	}
+	fn array(items: &[HirArrayElem]) -> bool {
+		items.iter().any(|item| match item {
+			HirArrayElem::Item(value) | HirArrayElem::Spread(value) => requires_activation_split(value),
+		})
+	}
+	fn map(items: &[HirMapElem]) -> bool {
+		items.iter().any(|item| match item {
+			HirMapElem::Entry(key, value) => {
+				requires_activation_split(key) || requires_activation_split(value)
+			}
+			HirMapElem::Spread(value) => requires_activation_split(value),
+		})
+	}
+	match expr {
+		HirExpr::Int(_)
+		| HirExpr::UInt(_)
+		| HirExpr::Num(..)
+		| HirExpr::Str(_)
+		| HirExpr::Bool(_)
+		| HirExpr::Char(_)
+		| HirExpr::Undefined
+		| HirExpr::Local(_)
+		| HirExpr::ExternValue { .. }
+		| HirExpr::This
+		| HirExpr::Closure { .. } => false,
+		HirExpr::TaskRecipe { .. } => false,
+		HirExpr::TaskOperation {
+			operation,
+			operands,
+		} => operation.suspends() || any(operands),
+		HirExpr::Continue { .. } | HirExpr::ContinueTransition { .. } => true,
+		HirExpr::ActivationCall { .. }
+		| HirExpr::StaticEnumDispatch { .. }
+		| HirExpr::BoundDispatch { .. }
+		| HirExpr::UnaryBoundDispatch { .. } => true,
+		HirExpr::InterpolatedString(items) | HirExpr::Array { items, .. } => any(items),
+		HirExpr::ProtocolDisplay(_) => true,
+		HirExpr::ListConstruct(items) => array(items),
+		HirExpr::RuntimeTypeObject { arguments, .. } => any(arguments),
+		HirExpr::RuntimeTypeProjection { receiver, .. }
+		| HirExpr::Field { recv: receiver, .. }
+		| HirExpr::ScalarCast {
+			operand: receiver, ..
+		} => requires_activation_split(receiver),
+		HirExpr::Echo { operand, .. } => requires_activation_split(operand),
+		HirExpr::WithPrototype { value, prototype } => {
+			requires_activation_split(value) || requires_activation_split(prototype)
+		}
+		HirExpr::RuntimeTypeAttachment { object, .. } => requires_activation_split(object),
+		HirExpr::Binary { lhs, rhs, .. } => {
+			requires_activation_split(lhs) || requires_activation_split(rhs)
+		}
+		HirExpr::Unary { operand, .. } => requires_activation_split(operand),
+		HirExpr::Call { callee, args } => {
+			requires_activation_split(callee) || args.iter().any(requires_activation_split)
+		}
+		HirExpr::ExternCall {
+			module,
+			symbol,
+			args,
+			..
+		} => activation_protocol_step(module, symbol).is_some() || any(args),
+		HirExpr::ListRead { recv, index, .. } | HirExpr::Index { recv, index, .. } => {
+			requires_activation_split(recv) || requires_activation_split(index)
+		}
+		HirExpr::ListAppend { recv, value } => {
+			requires_activation_split(recv) || requires_activation_split(value)
+		}
+		HirExpr::ListReplace { recv, index, value } => {
+			requires_activation_split(recv)
+				|| requires_activation_split(index)
+				|| requires_activation_split(value)
+		}
+		HirExpr::ListSlice { recv, start, end } => {
+			requires_activation_split(recv)
+				|| requires_activation_split(start)
+				|| requires_activation_split(end)
+		}
+		HirExpr::ArraySpread { elems, .. } => array(elems),
+		HirExpr::MapLit(entries) => entries
+			.iter()
+			.any(|(key, value)| requires_activation_split(key) || requires_activation_split(value)),
+		HirExpr::MapSpread(items) => map(items),
+		HirExpr::Slice {
+			recv, start, end, ..
+		} => {
+			requires_activation_split(recv)
+				|| start.as_deref().is_some_and(requires_activation_split)
+				|| end.as_deref().is_some_and(requires_activation_split)
+		}
+		HirExpr::MapGet { recv, key } => {
+			requires_activation_split(recv) || requires_activation_split(key)
+		}
+		HirExpr::New {
+			fields, prototype, ..
+		}
+		| HirExpr::StructFresh {
+			fields, prototype, ..
+		}
+		| HirExpr::VariantNew {
+			fields, prototype, ..
+		} => {
+			fields
+				.iter()
+				.any(|(_, value)| requires_activation_split(value))
+				|| prototype.as_deref().is_some_and(requires_activation_split)
+		}
+		HirExpr::StructCloneUpdate {
+			source,
+			replacements,
+			prototype,
+			..
+		} => {
+			requires_activation_split(source)
+				|| replacements
+					.iter()
+					.any(|(_, value)| requires_activation_split(value))
+				|| prototype.as_deref().is_some_and(requires_activation_split)
+		}
+		HirExpr::VariantRef { prototype, .. } => {
+			prototype.as_deref().is_some_and(requires_activation_split)
+		}
+		HirExpr::Block { stmts, tail } => {
+			stmts.iter().any(|stmt| match stmt {
+				HirStmt::Let { value, cleanup, .. } => {
+					cleanup.is_some() || requires_activation_split(value)
+				}
+				HirStmt::Expr(value) => requires_activation_split(value),
+				HirStmt::Return { .. } => true,
+			}) || tail.as_deref().is_some_and(requires_activation_split)
+		}
+		HirExpr::LabeledBlock { body, .. } => requires_activation_split(body),
+		HirExpr::If {
+			cond,
+			then,
+			otherwise,
+		} => {
+			requires_activation_split(cond)
+				|| requires_activation_split(then)
+				|| otherwise.as_deref().is_some_and(requires_activation_split)
+		}
+		HirExpr::StateLoop { .. } => true,
+		HirExpr::For {
+			iterator,
+			next,
+			body,
+			..
+		} => {
+			requires_activation_split(iterator)
+				|| requires_activation_split(next)
+				|| requires_activation_split(body)
+		}
+		HirExpr::Break { .. } => true,
+		HirExpr::Match { scrutinee, arms } => {
+			requires_activation_split(scrutinee)
+				|| arms.iter().any(|arm| {
+					arm.guard.as_ref().is_some_and(requires_activation_split)
+						|| requires_activation_split(&arm.body)
+				})
+		}
+	}
+}
+
+struct ActivationPlanner<'e, 'a> {
+	emitter: &'e Emitter<'a>,
+	frame: String,
+	next_slot: usize,
+	source_scopes: Vec<std::collections::BTreeMap<String, ActivationLocation>>,
+	temporaries: std::collections::BTreeMap<String, ActivationLocation>,
+	states: Vec<Option<ActivationState>>,
+	loops: Vec<ActivationLoop>,
+	blocks: Vec<ActivationBlock>,
+	cleanup_depth: usize,
+}
+
+impl<'e, 'a> ActivationPlanner<'e, 'a> {
+	fn new(
+		emitter: &'e Emitter<'a>,
+		params: &[EcoString],
+		outer: std::collections::BTreeMap<String, ActivationLocation>,
+	) -> Self {
+		let frame = emitter.gensym();
+		let mut parameters = std::collections::BTreeMap::new();
+		for (slot, param) in params.iter().enumerate() {
+			parameters.insert(
+				param.to_string(),
+				ActivationLocation {
+					frame: frame.clone(),
+					slot,
+				},
+			);
+		}
+		Self {
+			emitter,
+			frame,
+			next_slot: params.len(),
+			source_scopes: vec![outer, parameters],
+			temporaries: std::collections::BTreeMap::new(),
+			states: vec![None],
+			loops: Vec::new(),
+			blocks: Vec::new(),
+			cleanup_depth: 1,
+		}
+	}
+
+	fn finish(mut self, body: &HirExpr) -> ActivationPlan {
+		let result = self.temporary();
+		let terminal = self.state(Vec::new(), ActivationTerminal::Return(self.local(&result)));
+		let entry = self.compile_expr(body, result, terminal);
+		self.states[0] = Some(self.activation_state(Vec::new(), ActivationTerminal::Goto(entry)));
+		ActivationPlan {
+			frame: self.frame,
+			states: self
+				.states
+				.into_iter()
+				.map(|state| state.expect("every activation state is initialized"))
+				.collect(),
+		}
+	}
+
+	fn activation_state(
+		&self,
+		actions: Vec<ActivationAction>,
+		terminal: ActivationTerminal,
+	) -> ActivationState {
+		ActivationState {
+			environment: self.environment(),
+			pattern_bindings: std::collections::BTreeSet::new(),
+			actions,
+			terminal,
+		}
+	}
+
+	fn environment(&self) -> std::collections::BTreeMap<String, ActivationLocation> {
+		let mut environment = std::collections::BTreeMap::new();
+		for scope in &self.source_scopes {
+			environment.extend(scope.clone());
+		}
+		environment.extend(self.temporaries.clone());
+		environment
+	}
+
+	fn state(&mut self, actions: Vec<ActivationAction>, terminal: ActivationTerminal) -> u32 {
+		let id = self.states.len() as u32;
+		self
+			.states
+			.push(Some(self.activation_state(actions, terminal)));
+		id
+	}
+
+	fn reserve_state(&mut self) -> u32 {
+		let id = self.states.len() as u32;
+		self.states.push(None);
+		id
+	}
+
+	fn fill_state(&mut self, id: u32, actions: Vec<ActivationAction>, terminal: ActivationTerminal) {
+		let state = self.activation_state(actions, terminal);
+		let target = self
+			.states
+			.get_mut(id as usize)
+			.expect("reserved activation state exists");
+		assert!(
+			target.replace(state).is_none(),
+			"activation state is filled once"
+		);
+	}
+
+	fn push_scope(&mut self) {
+		self.source_scopes.push(std::collections::BTreeMap::new());
+	}
+
+	fn pop_scope(&mut self) {
+		assert!(self.source_scopes.pop().is_some());
+	}
+
+	fn location(&mut self) -> ActivationLocation {
+		let location = ActivationLocation {
+			frame: self.frame.clone(),
+			slot: self.next_slot,
+		};
+		self.next_slot += 1;
+		location
+	}
+
+	fn temporary(&mut self) -> ActivationLocation {
+		let name = self.emitter.gensym();
+		let location = self.location();
+		self.temporaries.insert(name, location.clone());
+		location
+	}
+
+	fn temporary_named(&mut self) -> (EcoString, ActivationLocation) {
+		let name: EcoString = self.emitter.gensym().into();
+		let location = self.location();
+		self.temporaries.insert(name.to_string(), location.clone());
+		(name, location)
+	}
+
+	fn bind(&mut self, name: &str) -> ActivationLocation {
+		let location = self.location();
+		self
+			.source_scopes
+			.last_mut()
+			.expect("activation source scope")
+			.insert(name.to_string(), location.clone());
+		location
+	}
+
+	fn local(&self, location: &ActivationLocation) -> HirExpr {
+		let name = self
+			.environment()
+			.into_iter()
+			.find_map(|(name, candidate)| (candidate == *location).then_some(name))
+			.expect("activation location has a compiler-local name");
+		HirExpr::Local(name.into())
+	}
+
+	fn store_state(&mut self, target: ActivationLocation, value: HirExpr, next: u32) -> u32 {
+		self.state(
+			vec![ActivationAction::Store { target, value }],
+			ActivationTerminal::Goto(next),
+		)
+	}
+
+	fn compile_values<F>(
+		&mut self,
+		values: Vec<&HirExpr>,
+		target: ActivationLocation,
+		next: u32,
+		build: F,
+	) -> u32
+	where
+		F: FnOnce(Vec<HirExpr>) -> HirExpr,
+	{
+		let temporaries = values
+			.iter()
+			.map(|_| self.temporary_named())
+			.collect::<Vec<_>>();
+		let rebuilt = build(
+			temporaries
+				.iter()
+				.map(|(name, _)| HirExpr::Local(name.clone()))
+				.collect(),
+		);
+		let mut entry = self.store_state(target, rebuilt, next);
+		for (value, (_, temporary)) in values.into_iter().zip(temporaries).rev() {
+			entry = self.compile_expr(value, temporary, entry);
+		}
+		entry
+	}
+
+	fn compile_transfer<F>(
+		&mut self,
+		values: Vec<&HirExpr>,
+		target: ActivationLocation,
+		next: u32,
+		build: F,
+	) -> u32
+	where
+		F: FnOnce(Vec<HirExpr>) -> HirExpr,
+	{
+		let temporaries = values
+			.iter()
+			.map(|_| self.temporary_named())
+			.collect::<Vec<_>>();
+		let call = build(
+			temporaries
+				.iter()
+				.map(|(name, _)| HirExpr::Local(name.clone()))
+				.collect(),
+		);
+		let mut entry = self.state(
+			Vec::new(),
+			ActivationTerminal::Transfer {
+				call,
+				resume_state: next,
+				result_slot: target.slot,
+			},
+		);
+		for (value, (_, temporary)) in values.into_iter().zip(temporaries).rev() {
+			entry = self.compile_expr(value, temporary, entry);
+		}
+		entry
+	}
+
+	fn compile_expr(&mut self, expr: &HirExpr, target: ActivationLocation, next: u32) -> u32 {
+		if let HirExpr::Call { callee, args } = expr {
+			return self.compile_activation_call(callee, args, HirCallMode::Push, 0, target, next);
+		}
+		if let HirExpr::ProtocolDisplay(value) = expr {
+			self
+				.emitter
+				.box_runtime_bindings
+				.borrow_mut()
+				.insert("nymphProtocolDisplayStep".to_string());
+			return self.compile_transfer(vec![value], target, next, |mut args| {
+				HirExpr::ActivationCall {
+					callee: Box::new(HirExpr::Local("nymphProtocolDisplayStep".into())),
+					args: vec![args.remove(0)],
+					mode: HirCallMode::Push,
+					source: 0,
+				}
+			});
+		}
+		if let HirExpr::ExternCall {
+			module,
+			symbol,
+			args,
+			..
+		} = expr
+		{
+			let step = activation_protocol_step(module, symbol);
+			if let Some(step) = step {
+				self
+					.emitter
+					.box_runtime_bindings
+					.borrow_mut()
+					.insert(step.to_string());
+				let step: EcoString = step.into();
+				return self.compile_transfer(args.iter().collect(), target, next, move |args| {
+					HirExpr::ActivationCall {
+						callee: Box::new(HirExpr::Local(step)),
+						args,
+						mode: HirCallMode::Push,
+						source: 0,
+					}
+				});
+			}
+		}
+		if let HirExpr::TaskOperation {
+			operation,
+			operands,
+		} = expr
+			&& operation.suspends()
+		{
+			let operation = *operation;
+			return self.compile_transfer(operands.iter().collect(), target, next, move |operands| {
+				HirExpr::TaskOperation {
+					operation,
+					operands,
+				}
+			});
+		}
+		let control = matches!(
+			expr,
+			HirExpr::Block { .. }
+				| HirExpr::LabeledBlock { .. }
+				| HirExpr::If { .. }
+				| HirExpr::For { .. }
+				| HirExpr::Break { .. }
+				| HirExpr::Continue { .. }
+				| HirExpr::Match { .. }
+				| HirExpr::StructFresh { .. }
+		);
+		if !control && !requires_activation_split(expr) {
+			return self.store_state(target, expr.clone(), next);
+		}
+		match expr {
+			HirExpr::ActivationCall {
+				callee,
+				args,
+				mode,
+				source,
+			} => self.compile_activation_call(callee, args, *mode, *source, target, next),
+			HirExpr::StaticEnumDispatch {
+				owner,
+				method,
+				receiver,
+				args,
+				mode,
+				source,
+			} => {
+				let owner = owner.clone();
+				let method = method.clone();
+				let mode = *mode;
+				let source = *source;
+				let mut values = vec![receiver.as_ref()];
+				values.extend(args.iter());
+				self.compile_transfer(values, target, next, move |mut values| {
+					let receiver = Box::new(values.remove(0));
+					HirExpr::StaticEnumDispatch {
+						owner,
+						method,
+						receiver,
+						args: values,
+						mode,
+						source,
+					}
+				})
+			}
+			HirExpr::BoundDispatch {
+				interface,
+				method,
+				receiver,
+				argument,
+				hidden_arguments,
+				cases,
+				mode,
+				source,
+			} => {
+				let interface = interface.clone();
+				let method = method.clone();
+				let cases = cases.clone();
+				let mode = *mode;
+				let source = *source;
+				let mut values = vec![receiver.as_ref(), argument.as_ref()];
+				values.extend(hidden_arguments.iter());
+				self.compile_transfer(values, target, next, move |mut values| {
+					let receiver = Box::new(values.remove(0));
+					let argument = Box::new(values.remove(0));
+					HirExpr::BoundDispatch {
+						interface,
+						method,
+						receiver,
+						argument,
+						hidden_arguments: values,
+						cases,
+						mode,
+						source,
+					}
+				})
+			}
+			HirExpr::UnaryBoundDispatch {
+				interface,
+				method,
+				receiver,
+				hidden_arguments,
+				cases,
+				mode,
+				source,
+			} => {
+				let interface = interface.clone();
+				let method = method.clone();
+				let cases = cases.clone();
+				let mode = *mode;
+				let source = *source;
+				let mut values = vec![receiver.as_ref()];
+				values.extend(hidden_arguments.iter());
+				self.compile_transfer(values, target, next, move |mut values| {
+					let receiver = Box::new(values.remove(0));
+					HirExpr::UnaryBoundDispatch {
+						interface,
+						method,
+						receiver,
+						hidden_arguments: values,
+						cases,
+						mode,
+						source,
+					}
+				})
+			}
+			HirExpr::Block { stmts, tail } => self.compile_block(stmts, tail.as_deref(), target, next),
+			HirExpr::LabeledBlock {
+				target: block_target,
+				body,
+			} => {
+				self.blocks.push(ActivationBlock {
+					target: *block_target,
+					result: target.clone(),
+					exit_state: next,
+					cleanup_depth: self.cleanup_depth,
+				});
+				let entry = self.compile_expr(body, target, next);
+				self.blocks.pop();
+				entry
+			}
+			HirExpr::If {
+				cond,
+				then,
+				otherwise,
+			} => {
+				let then_state = self.compile_expr(then, target.clone(), next);
+				let else_state = if let Some(otherwise) = otherwise {
+					self.compile_expr(otherwise, target.clone(), next)
+				} else {
+					self.store_state(target.clone(), HirExpr::Undefined, next)
+				};
+				let (condition_name, condition) = self.temporary_named();
+				let branch = self.state(
+					Vec::new(),
+					ActivationTerminal::Branch {
+						condition: HirExpr::Local(condition_name),
+						then_state,
+						else_state,
+					},
+				);
+				self.compile_expr(cond, condition, branch)
+			}
+			HirExpr::StateLoop {
+				target: loop_target,
+				bindings,
+				body,
+			} => self.compile_state_loop(*loop_target, bindings, body, target, next),
+			HirExpr::For {
+				target: loop_target,
+				iterator_name,
+				successor_name,
+				iterator,
+				next: next_step,
+				pat,
+				body,
+				iteration,
+				option,
+				..
+			} => self.compile_for(
+				*loop_target,
+				iterator_name,
+				successor_name,
+				iterator,
+				next_step,
+				pat,
+				body,
+				iteration,
+				option.as_ref(),
+				target,
+				next,
+			),
+			HirExpr::Break {
+				target: loop_target,
+				value,
+			} => self.compile_break(*loop_target, value),
+			HirExpr::Continue {
+				target: loop_target,
+			} => {
+				let loop_ = self
+					.loops
+					.iter()
+					.rev()
+					.find(|loop_| loop_.target == *loop_target)
+					.cloned()
+					.expect("continue target is active");
+				self.state(
+					vec![ActivationAction::UnwindCleanupScopes(loop_.cleanup_depth)],
+					ActivationTerminal::Goto(loop_.continue_state),
+				)
+			}
+			HirExpr::ContinueTransition {
+				target: loop_target,
+				replacements,
+			} => {
+				let loop_ = self
+					.loops
+					.iter()
+					.rev()
+					.find(|loop_| loop_.target == *loop_target)
+					.cloned()
+					.expect("state-loop continue target is active");
+				let state = loop_
+					.state
+					.expect("continue transition targets a state loop");
+				self.compile_state_transition(&state, replacements)
+			}
+			HirExpr::Match { scrutinee, arms } => self.compile_match(scrutinee, arms, target, next),
+			HirExpr::Binary {
+				op: op @ (BinOp::And | BinOp::Or),
+				lhs,
+				rhs,
+				..
+			} => self.compile_logical(*op, lhs, rhs, target, next),
+			_ => self.compile_composite(expr, target, next),
+		}
+	}
+
+	fn compile_activation_call(
+		&mut self,
+		callee: &HirExpr,
+		args: &[HirExpr],
+		mode: HirCallMode,
+		source: u32,
+		target: ActivationLocation,
+		next: u32,
+	) -> u32 {
+		if let HirExpr::Field { recv, name } = callee {
+			let name = name.clone();
+			let mut values = vec![recv.as_ref()];
+			values.extend(args.iter());
+			return self.compile_transfer(values, target, next, move |mut values| {
+				let recv = Box::new(values.remove(0));
+				HirExpr::ActivationCall {
+					callee: Box::new(HirExpr::Field { recv, name }),
+					args: values,
+					mode,
+					source,
+				}
+			});
+		}
+		let mut values = vec![callee];
+		values.extend(args.iter());
+		self.compile_transfer(values, target, next, move |mut values| {
+			HirExpr::ActivationCall {
+				callee: Box::new(values.remove(0)),
+				args: values,
+				mode,
+				source,
+			}
+		})
+	}
+
+	fn compile_block(
+		&mut self,
+		stmts: &[HirStmt],
+		tail: Option<&HirExpr>,
+		target: ActivationLocation,
+		next: u32,
+	) -> u32 {
+		self.push_scope();
+		let managed = stmts.iter().any(|stmt| {
+			matches!(
+				stmt,
+				HirStmt::Let {
+					cleanup: Some(_),
+					..
+				}
+			)
+		});
+		let outer_depth = self.cleanup_depth;
+		let normal_next = if managed {
+			self.state(
+				vec![ActivationAction::UnwindCleanupScopes(outer_depth)],
+				ActivationTerminal::Goto(next),
+			)
+		} else {
+			next
+		};
+		if managed {
+			self.cleanup_depth += 1;
+		}
+		let body = self.compile_statements(stmts, 0, tail, target, normal_next);
+		self.cleanup_depth = outer_depth;
+		self.pop_scope();
+		if managed {
+			self.state(
+				vec![ActivationAction::EnterCleanupScope],
+				ActivationTerminal::Goto(body),
+			)
+		} else {
+			body
+		}
+	}
+
+	fn compile_statements(
+		&mut self,
+		stmts: &[HirStmt],
+		index: usize,
+		tail: Option<&HirExpr>,
+		target: ActivationLocation,
+		next: u32,
+	) -> u32 {
+		let Some(stmt) = stmts.get(index) else {
+			return if let Some(tail) = tail {
+				self.compile_expr(tail, target, next)
+			} else {
+				self.store_state(target, HirExpr::Undefined, next)
+			};
+		};
+		match stmt {
+			HirStmt::Let {
+				name,
+				value,
+				cleanup,
+				..
+			} => {
+				let before_binding = self.source_scopes.clone();
+				let binding = self.bind(name);
+				let remainder = self.compile_statements(stmts, index + 1, tail, target, next);
+				let after_binding = self.source_scopes.clone();
+				let (value_name, value_slot) = self.temporary_named();
+				let mut actions = vec![ActivationAction::Store {
+					target: binding,
+					value: HirExpr::Local(value_name),
+				}];
+				if let Some(cleanup) = cleanup {
+					actions.push(ActivationAction::RegisterCleanup(cleanup.clone()));
+				}
+				let initialize = self.state(actions, ActivationTerminal::Goto(remainder));
+				self.source_scopes = before_binding;
+				let entry = self.compile_expr(value, value_slot, initialize);
+				self.source_scopes = after_binding;
+				entry
+			}
+			HirStmt::Expr(expr) => {
+				let remainder = self.compile_statements(stmts, index + 1, tail, target, next);
+				let discarded = self.temporary();
+				self.compile_expr(expr, discarded, remainder)
+			}
+			HirStmt::Return { value, target } => self.compile_return(value.as_ref(), *target),
+		}
+	}
+
+	fn compile_return(&mut self, value: Option<&HirExpr>, target: HirReturnTarget) -> u32 {
+		match target {
+			HirReturnTarget::Callable => {
+				let (name, result) = self.temporary_named();
+				let terminal = self.state(Vec::new(), ActivationTerminal::Return(HirExpr::Local(name)));
+				if let Some(value) = value {
+					self.compile_expr(value, result, terminal)
+				} else {
+					self.store_state(result, HirExpr::Undefined, terminal)
+				}
+			}
+			HirReturnTarget::Block(target) => {
+				let block = self
+					.blocks
+					.iter()
+					.rev()
+					.find(|block| block.target == target)
+					.cloned()
+					.expect("block return target is active");
+				let (name, result) = self.temporary_named();
+				let exit = self.state(
+					vec![
+						ActivationAction::Store {
+							target: block.result,
+							value: HirExpr::Local(name),
+						},
+						ActivationAction::UnwindCleanupScopes(block.cleanup_depth),
+					],
+					ActivationTerminal::Goto(block.exit_state),
+				);
+				if let Some(value) = value {
+					self.compile_expr(value, result, exit)
+				} else {
+					self.store_state(result, HirExpr::Undefined, exit)
+				}
+			}
+		}
+	}
+
+	fn compile_logical(
+		&mut self,
+		op: BinOp,
+		lhs: &HirExpr,
+		rhs: &HirExpr,
+		target: ActivationLocation,
+		next: u32,
+	) -> u32 {
+		let rhs_state = self.compile_expr(rhs, target.clone(), next);
+		let (lhs_name, lhs_slot) = self.temporary_named();
+		let short = self.store_state(target, HirExpr::Local(lhs_name.clone()), next);
+		let (then_state, else_state) = if op == BinOp::And {
+			(rhs_state, short)
+		} else {
+			(short, rhs_state)
+		};
+		let branch = self.state(
+			Vec::new(),
+			ActivationTerminal::Branch {
+				condition: HirExpr::Local(lhs_name),
+				then_state,
+				else_state,
+			},
+		);
+		self.compile_expr(lhs, lhs_slot, branch)
+	}
+
+	fn compile_for(
+		&mut self,
+		target_id: nymph_hir::hir::LoopTarget,
+		iterator_name: &EcoString,
+		successor_name: &EcoString,
+		iterator: &HirExpr,
+		next_step: &HirExpr,
+		pattern: &HirPat,
+		body: &HirExpr,
+		iteration: &nymph_hir::hir::HirIterationAbi,
+		option: Option<&HirOptionAbi>,
+		target: ActivationLocation,
+		next: u32,
+	) -> u32 {
+		self.push_scope();
+		let iterator_location = self.bind(iterator_name);
+		let item_name: EcoString = self.emitter.gensym().into();
+		self.bind(&item_name);
+		self.bind(successor_name);
+
+		let normal_value = option.map_or(HirExpr::Undefined, |option| HirExpr::VariantRef {
+			enum_name: option.enum_name.clone(),
+			variant: option.none.clone(),
+			prototype: None,
+		});
+		let normal_exit = self.store_state(target.clone(), normal_value, next);
+		let loop_head = self.reserve_state();
+		self.loops.push(ActivationLoop {
+			target: target_id,
+			result: target.clone(),
+			exit_state: next,
+			continue_state: loop_head,
+			option: option.cloned(),
+			cleanup_depth: self.cleanup_depth,
+			state: None,
+		});
+		let discarded = self.temporary();
+		let body_entry = self.compile_expr(
+			&HirExpr::Match {
+				scrutinee: Box::new(HirExpr::Local(item_name.clone())),
+				arms: vec![HirArm {
+					pat: pattern.clone(),
+					guard: None,
+					body: body.clone(),
+				}],
+			},
+			discarded,
+			loop_head,
+		);
+		self.loops.pop();
+		let advance = self.state(
+			vec![ActivationAction::Store {
+				target: iterator_location.clone(),
+				value: HirExpr::Local(successor_name.clone()),
+			}],
+			ActivationTerminal::Goto(body_entry),
+		);
+
+		let (matched_name, matched_slot) = self.temporary_named();
+		let branch = self.state(
+			Vec::new(),
+			ActivationTerminal::Branch {
+				condition: HirExpr::Local(matched_name),
+				then_state: advance,
+				else_state: normal_exit,
+			},
+		);
+		let (step_name, step_slot) = self.temporary_named();
+		let matched = HirExpr::Match {
+			scrutinee: Box::new(HirExpr::Local(step_name)),
+			arms: vec![
+				HirArm {
+					pat: HirPat::Variant {
+						enum_name: iteration.enum_name.clone(),
+						variant: iteration.yield_.clone(),
+						fields: vec![
+							(
+								iteration.item.clone(),
+								HirPat::Binding {
+									name: item_name.clone(),
+									sub: None,
+								},
+							),
+							(
+								iteration.next.clone(),
+								HirPat::Binding {
+									name: successor_name.clone(),
+									sub: None,
+								},
+							),
+						],
+					},
+					guard: None,
+					body: HirExpr::Bool(true),
+				},
+				HirArm {
+					pat: HirPat::Wildcard,
+					guard: None,
+					body: HirExpr::Bool(false),
+				},
+			],
+		};
+		let attempt = self.store_state(matched_slot, matched, branch);
+		self.states[attempt as usize]
+			.as_mut()
+			.expect("iterator step state")
+			.pattern_bindings = [item_name.to_string(), successor_name.to_string()]
+			.into_iter()
+			.collect();
+		let next_entry = self.compile_expr(next_step, step_slot, attempt);
+		self.fill_state(loop_head, Vec::new(), ActivationTerminal::Goto(next_entry));
+
+		let (initial_name, initial_slot) = self.temporary_named();
+		let initialized = self.state(
+			vec![ActivationAction::Store {
+				target: iterator_location,
+				value: HirExpr::Local(initial_name),
+			}],
+			ActivationTerminal::Goto(loop_head),
+		);
+		let entry = self.compile_expr(iterator, initial_slot, initialized);
+		self.pop_scope();
+		entry
+	}
+
+	fn compile_state_loop(
+		&mut self,
+		target_id: nymph_hir::hir::LoopTarget,
+		bindings: &[nymph_hir::hir::HirStateBinding],
+		body: &HirExpr,
+		target: ActivationLocation,
+		next: u32,
+	) -> u32 {
+		self.push_scope();
+		let outer_depth = self.cleanup_depth;
+		self.cleanup_depth += 1;
+		let loop_head = self.reserve_state();
+		let state_bindings = bindings
+			.iter()
+			.map(|binding| ActivationStateBinding {
+				name: binding.name.to_string(),
+				location: self.bind(&binding.name),
+				cleanup: binding.cleanup.clone(),
+				cleanup_handle: binding.cleanup.as_ref().map(|_| self.temporary()),
+			})
+			.collect::<Vec<_>>();
+		let state = ActivationStateLoop {
+			bindings: state_bindings,
+			header_depth: self.cleanup_depth,
+			loop_head,
+		};
+		let normal_continue = self.compile_state_transition(&state, &[]);
+		self.loops.push(ActivationLoop {
+			target: target_id,
+			result: target,
+			exit_state: next,
+			continue_state: normal_continue,
+			option: None,
+			cleanup_depth: outer_depth,
+			state: Some(state.clone()),
+		});
+		let discarded = self.temporary();
+		let body_entry = self.compile_expr(body, discarded, normal_continue);
+		self.loops.pop();
+		self.fill_state(loop_head, Vec::new(), ActivationTerminal::Goto(body_entry));
+
+		let mut initialize = loop_head;
+		for (binding, source) in state.bindings.iter().zip(bindings).rev() {
+			let value = self.temporary();
+			let mut actions = vec![ActivationAction::Store {
+				target: binding.location.clone(),
+				value: self.local(&value),
+			}];
+			if let (Some(cleanup), Some(handle)) = (&binding.cleanup, &binding.cleanup_handle) {
+				actions.push(ActivationAction::RegisterStateCleanup {
+					cleanup: cleanup.clone(),
+					binding: binding.name.clone(),
+					value: binding.location.clone(),
+					handle: handle.clone(),
+				});
+			}
+			let installed = self.state(actions, ActivationTerminal::Goto(initialize));
+			initialize = self.compile_expr(&source.value, value, installed);
+		}
+		self.cleanup_depth = outer_depth;
+		self.pop_scope();
+		self.state(
+			vec![ActivationAction::EnterCleanupScope],
+			ActivationTerminal::Goto(initialize),
+		)
+	}
+
+	fn compile_state_transition(
+		&mut self,
+		state: &ActivationStateLoop,
+		replacements: &[(EcoString, HirExpr)],
+	) -> u32 {
+		let values = state
+			.bindings
+			.iter()
+			.map(|_| self.temporary())
+			.collect::<Vec<_>>();
+		let mut actions = Vec::new();
+		let mut managed = Vec::new();
+		for binding in &state.bindings {
+			if replacements
+				.iter()
+				.any(|(name, _)| name.as_str() == binding.name)
+				&& binding.cleanup.is_some()
+			{
+				let new_handle = self.temporary();
+				managed.push((
+					binding.name.clone(),
+					binding
+						.cleanup_handle
+						.clone()
+						.expect("managed cleanup handle"),
+					new_handle,
+				));
+			}
+		}
+		if managed.is_empty() {
+			actions.push(ActivationAction::UnwindCleanupScopes(state.header_depth));
+		} else {
+			actions.push(ActivationAction::CommitStateTransition {
+				header_depth: state.header_depth,
+				replacements: managed
+					.iter()
+					.map(|(_, old, new)| (old.clone(), new.clone()))
+					.collect(),
+			});
+			for (_, old, new) in &managed {
+				actions.push(ActivationAction::Store {
+					target: old.clone(),
+					value: self.local(&new),
+				});
+			}
+		}
+		for (binding, value) in state.bindings.iter().zip(&values) {
+			actions.push(ActivationAction::Store {
+				target: binding.location.clone(),
+				value: self.local(value),
+			});
+		}
+		let commit = self.state(actions, ActivationTerminal::Goto(state.loop_head));
+		let mut evaluate = commit;
+		for (name, replacement) in replacements.iter().rev() {
+			let index = state
+				.bindings
+				.iter()
+				.position(|binding| binding.name == name.as_str())
+				.expect("checked state replacement");
+			if let Some((_, _, handle)) = managed
+				.iter()
+				.find(|(binding, _, _)| binding == name.as_str())
+			{
+				evaluate = self.state(
+					vec![ActivationAction::RegisterStateCleanup {
+						cleanup: state.bindings[index]
+							.cleanup
+							.clone()
+							.expect("managed binding"),
+						binding: state.bindings[index].name.clone(),
+						value: values[index].clone(),
+						handle: handle.clone(),
+					}],
+					ActivationTerminal::Goto(evaluate),
+				);
+			}
+			evaluate = self.compile_expr(replacement, values[index].clone(), evaluate);
+		}
+		let mut snapshots = Vec::new();
+		if !replacements.is_empty()
+			&& state.bindings.iter().any(|binding| {
+				replacements
+					.iter()
+					.any(|(name, _)| name.as_str() == binding.name)
+					&& binding.cleanup.is_some()
+			}) {
+			snapshots.push(ActivationAction::EnterCleanupScope);
+		}
+		for (binding, value) in state.bindings.iter().zip(values) {
+			snapshots.push(ActivationAction::Store {
+				target: value,
+				value: HirExpr::Local(binding.name.as_str().into()),
+			});
+		}
+		self.state(snapshots, ActivationTerminal::Goto(evaluate))
+	}
+
+	fn compile_break(&mut self, target: nymph_hir::hir::LoopTarget, value: &HirExpr) -> u32 {
+		let loop_ = self
+			.loops
+			.iter()
+			.rev()
+			.find(|loop_| loop_.target == target)
+			.cloned()
+			.expect("break target is active");
+		let (value_name, value_slot) = self.temporary_named();
+		let completed = if let Some(option) = loop_.option {
+			HirExpr::VariantNew {
+				enum_name: option.enum_name,
+				variant: option.some,
+				fields: vec![(option.some_value, HirExpr::Local(value_name))],
+				prototype: None,
+			}
+		} else {
+			HirExpr::Local(value_name)
+		};
+		let exit = self.state(
+			vec![
+				ActivationAction::Store {
+					target: loop_.result,
+					value: completed,
+				},
+				ActivationAction::UnwindCleanupScopes(loop_.cleanup_depth),
+			],
+			ActivationTerminal::Goto(loop_.exit_state),
+		);
+		self.compile_expr(value, value_slot, exit)
+	}
+
+	fn compile_match(
+		&mut self,
+		scrutinee: &HirExpr,
+		arms: &[HirArm],
+		target: ActivationLocation,
+		next: u32,
+	) -> u32 {
+		let (scrutinee_name, scrutinee_slot) = self.temporary_named();
+		// Refutable `for` bindings lower to a `Some(pattern)` arm that skips a
+		// source item when its nested pattern does not match.
+		let mut fallback = self.store_state(target.clone(), HirExpr::Undefined, next);
+		for arm in arms.iter().rev() {
+			self.push_scope();
+			let mut bindings = std::collections::BTreeSet::new();
+			pattern_binding_names(&arm.pat, &mut bindings);
+			for binding in &bindings {
+				self.bind(binding);
+			}
+			let body = self.compile_expr(&arm.body, target.clone(), next);
+			let committed = if let Some(guard) = &arm.guard {
+				let (guard_name, guard_slot) = self.temporary_named();
+				let branch = self.state(
+					Vec::new(),
+					ActivationTerminal::Branch {
+						condition: HirExpr::Local(guard_name),
+						then_state: body,
+						else_state: fallback,
+					},
+				);
+				self.compile_expr(guard, guard_slot, branch)
+			} else {
+				body
+			};
+			let (matched_name, matched_slot) = self.temporary_named();
+			let matched = HirExpr::Match {
+				scrutinee: Box::new(HirExpr::Local(scrutinee_name.clone())),
+				arms: vec![
+					HirArm {
+						pat: arm.pat.clone(),
+						guard: None,
+						body: HirExpr::Bool(true),
+					},
+					HirArm {
+						pat: HirPat::Wildcard,
+						guard: None,
+						body: HirExpr::Bool(false),
+					},
+				],
+			};
+			let branch = self.state(
+				Vec::new(),
+				ActivationTerminal::Branch {
+					condition: HirExpr::Local(matched_name),
+					then_state: committed,
+					else_state: fallback,
+				},
+			);
+			let attempt = self.store_state(matched_slot, matched, branch);
+			self.states[attempt as usize]
+				.as_mut()
+				.expect("match attempt state")
+				.pattern_bindings = bindings.iter().map(ToString::to_string).collect();
+			fallback = attempt;
+			self.pop_scope();
+		}
+		self.compile_expr(scrutinee, scrutinee_slot, fallback)
+	}
+
+	fn compile_composite(&mut self, expr: &HirExpr, target: ActivationLocation, next: u32) -> u32 {
+		match expr {
+			HirExpr::InterpolatedString(items) => {
+				let parts = items
+					.iter()
+					.map(|item| match item {
+						HirExpr::Str(text) => Some(text.clone()),
+						_ => None,
+					})
+					.collect::<Vec<_>>();
+				let values = items
+					.iter()
+					.filter(|item| !matches!(item, HirExpr::Str(_)))
+					.collect();
+				self.compile_values(values, target, next, move |values| {
+					let mut values = values.into_iter();
+					HirExpr::InterpolatedString(
+						parts
+							.into_iter()
+							.map(|part| {
+								part.map_or_else(|| values.next().expect("interpolation value"), HirExpr::Str)
+							})
+							.collect(),
+					)
+				})
+			}
+			HirExpr::RuntimeTypeObject {
+				binding,
+				box_runtime,
+				is_enum,
+				arguments,
+			} => {
+				let binding = binding.clone();
+				let box_runtime = *box_runtime;
+				let is_enum = *is_enum;
+				self.compile_values(arguments.iter().collect(), target, next, move |arguments| {
+					HirExpr::RuntimeTypeObject {
+						binding,
+						box_runtime,
+						is_enum,
+						arguments,
+					}
+				})
+			}
+			HirExpr::RuntimeTypeProjection { receiver, path } => {
+				let path = path.clone();
+				self.compile_values(vec![receiver], target, next, move |mut values| {
+					HirExpr::RuntimeTypeProjection {
+						receiver: Box::new(values.remove(0)),
+						path,
+					}
+				})
+			}
+			HirExpr::WithPrototype { value, prototype } => {
+				self.compile_values(vec![value, prototype], target, next, |mut values| {
+					HirExpr::WithPrototype {
+						value: Box::new(values.remove(0)),
+						prototype: Box::new(values.remove(0)),
+					}
+				})
+			}
+			HirExpr::RuntimeTypeAttachment { object, method } => {
+				let method = method.clone();
+				self.compile_values(vec![object], target, next, move |mut values| {
+					HirExpr::RuntimeTypeAttachment {
+						object: Box::new(values.remove(0)),
+						method,
+					}
+				})
+			}
+			HirExpr::Call { callee, args } => {
+				if let HirExpr::Field { recv, name } = callee.as_ref() {
+					let name = name.clone();
+					return self.compile_values(
+						std::iter::once(recv.as_ref()).chain(args).collect(),
+						target,
+						next,
+						move |mut values| HirExpr::Call {
+							callee: Box::new(HirExpr::Field {
+								recv: Box::new(values.remove(0)),
+								name,
+							}),
+							args: values,
+						},
+					);
+				}
+				self.compile_values(
+					std::iter::once(callee.as_ref()).chain(args).collect(),
+					target,
+					next,
+					|mut values| HirExpr::Call {
+						callee: Box::new(values.remove(0)),
+						args: values,
+					},
+				)
+			}
+			HirExpr::ExternCall {
+				module,
+				symbol,
+				args,
+				call_mode,
+				argument_marshals,
+				return_marshal,
+			} => {
+				let module = *module;
+				let symbol = *symbol;
+				let call_mode = *call_mode;
+				let argument_marshals = argument_marshals.clone();
+				let return_marshal = *return_marshal;
+				self.compile_values(args.iter().collect(), target, next, move |args| {
+					HirExpr::ExternCall {
+						module,
+						symbol,
+						args,
+						call_mode,
+						argument_marshals,
+						return_marshal,
+					}
+				})
+			}
+			HirExpr::ListConstruct(items) => {
+				let spread = items
+					.iter()
+					.map(|item| matches!(item, HirArrayElem::Spread(_)))
+					.collect::<Vec<_>>();
+				let values = items
+					.iter()
+					.map(|item| match item {
+						HirArrayElem::Item(value) | HirArrayElem::Spread(value) => value,
+					})
+					.collect();
+				self.compile_values(values, target, next, move |values| {
+					HirExpr::ListConstruct(
+						values
+							.into_iter()
+							.zip(spread)
+							.map(|(value, spread)| {
+								if spread {
+									HirArrayElem::Spread(value)
+								} else {
+									HirArrayElem::Item(value)
+								}
+							})
+							.collect(),
+					)
+				})
+			}
+			HirExpr::ListRead { recv, index, mode } => {
+				let mode = *mode;
+				self.compile_values(vec![recv, index], target, next, move |mut values| {
+					HirExpr::ListRead {
+						recv: Box::new(values.remove(0)),
+						index: Box::new(values.remove(0)),
+						mode,
+					}
+				})
+			}
+			HirExpr::ListAppend { recv, value } => {
+				self.compile_values(vec![recv, value], target, next, |mut values| {
+					HirExpr::ListAppend {
+						recv: Box::new(values.remove(0)),
+						value: Box::new(values.remove(0)),
+					}
+				})
+			}
+			HirExpr::ListReplace { recv, index, value } => {
+				self.compile_values(vec![recv, index, value], target, next, |mut values| {
+					HirExpr::ListReplace {
+						recv: Box::new(values.remove(0)),
+						index: Box::new(values.remove(0)),
+						value: Box::new(values.remove(0)),
+					}
+				})
+			}
+			HirExpr::ListSlice { recv, start, end } => {
+				self.compile_values(vec![recv, start, end], target, next, |mut values| {
+					HirExpr::ListSlice {
+						recv: Box::new(values.remove(0)),
+						start: Box::new(values.remove(0)),
+						end: Box::new(values.remove(0)),
+					}
+				})
+			}
+			HirExpr::Array { kind, items } => {
+				let kind = *kind;
+				self.compile_values(items.iter().collect(), target, next, move |items| {
+					HirExpr::Array { kind, items }
+				})
+			}
+			HirExpr::ArraySpread { kind, elems } => {
+				let kind = *kind;
+				let spread = elems
+					.iter()
+					.map(|item| matches!(item, HirArrayElem::Spread(_)))
+					.collect::<Vec<_>>();
+				let values = elems
+					.iter()
+					.map(|item| match item {
+						HirArrayElem::Item(value) | HirArrayElem::Spread(value) => value,
+					})
+					.collect();
+				self.compile_values(values, target, next, move |values| HirExpr::ArraySpread {
+					kind,
+					elems: values
+						.into_iter()
+						.zip(spread)
+						.map(|(value, spread)| {
+							if spread {
+								HirArrayElem::Spread(value)
+							} else {
+								HirArrayElem::Item(value)
+							}
+						})
+						.collect(),
+				})
+			}
+			HirExpr::MapLit(entries) => {
+				let values = entries
+					.iter()
+					.flat_map(|(key, value)| [key, value])
+					.collect();
+				self.compile_values(values, target, next, |values| {
+					HirExpr::MapLit(
+						values
+							.chunks_exact(2)
+							.map(|pair| (pair[0].clone(), pair[1].clone()))
+							.collect(),
+					)
+				})
+			}
+			HirExpr::MapSpread(items) => {
+				let entry = items
+					.iter()
+					.map(|item| matches!(item, HirMapElem::Entry(_, _)))
+					.collect::<Vec<_>>();
+				let values = items
+					.iter()
+					.flat_map(|item| match item {
+						HirMapElem::Entry(key, value) => vec![key, value],
+						HirMapElem::Spread(value) => vec![value],
+					})
+					.collect();
+				self.compile_values(values, target, next, move |values| {
+					let mut values = values.into_iter();
+					HirExpr::MapSpread(
+						entry
+							.into_iter()
+							.map(|entry| {
+								let first = values.next().expect("map element value");
+								if entry {
+									HirMapElem::Entry(first, values.next().expect("map entry value"))
+								} else {
+									HirMapElem::Spread(first)
+								}
+							})
+							.collect(),
+					)
+				})
+			}
+			HirExpr::Index { recv, index, mode } => {
+				let mode = *mode;
+				self.compile_values(vec![recv, index], target, next, move |mut values| {
+					HirExpr::Index {
+						recv: Box::new(values.remove(0)),
+						index: Box::new(values.remove(0)),
+						mode,
+					}
+				})
+			}
+			HirExpr::Slice {
+				recv,
+				start,
+				end,
+				inclusive,
+				string,
+				mode,
+			} => {
+				let has_start = start.is_some();
+				let has_end = end.is_some();
+				let inclusive = *inclusive;
+				let string = *string;
+				let mode = *mode;
+				let mut values = vec![recv.as_ref()];
+				values.extend(start.as_deref());
+				values.extend(end.as_deref());
+				self.compile_values(values, target, next, move |mut values| HirExpr::Slice {
+					recv: Box::new(values.remove(0)),
+					start: has_start.then(|| Box::new(values.remove(0))),
+					end: has_end.then(|| Box::new(values.remove(0))),
+					inclusive,
+					string,
+					mode,
+				})
+			}
+			HirExpr::MapGet { recv, key } => {
+				self.compile_values(vec![recv, key], target, next, |mut values| {
+					HirExpr::MapGet {
+						recv: Box::new(values.remove(0)),
+						key: Box::new(values.remove(0)),
+					}
+				})
+			}
+			HirExpr::New {
+				class,
+				fields,
+				prototype,
+			} => {
+				let class = class.clone();
+				let field_names = fields
+					.iter()
+					.map(|(name, _)| name.clone())
+					.collect::<Vec<_>>();
+				let has_prototype = prototype.is_some();
+				let field_count = field_names.len();
+				let mut values = fields.iter().map(|(_, value)| value).collect::<Vec<_>>();
+				values.extend(prototype.as_deref());
+				self.compile_values(values, target, next, move |mut values| HirExpr::New {
+					class,
+					fields: field_names
+						.into_iter()
+						.zip(values.drain(..field_count))
+						.collect(),
+					prototype: has_prototype.then(|| Box::new(values.remove(0))),
+				})
+			}
+			HirExpr::StructFresh {
+				class,
+				fields,
+				prototype,
+			} => {
+				let class = class.clone();
+				let mut field_names = fields
+					.iter()
+					.map(|(name, _)| name.clone())
+					.collect::<Vec<_>>();
+				let has_prototype = prototype.is_some();
+				let mut values = fields.iter().map(|(_, value)| value).collect::<Vec<_>>();
+				let defaults = self
+					.emitter
+					.class_defaults
+					.borrow()
+					.get(class.as_str())
+					.cloned()
+					.unwrap_or_default();
+				for (name, value) in &defaults {
+					if !field_names.contains(name) {
+						field_names.push(name.clone());
+						values.push(value);
+					}
+				}
+				let field_count = field_names.len();
+				values.extend(prototype.as_deref());
+				self.compile_values(values, target, next, move |mut values| {
+					HirExpr::StructFresh {
+						class,
+						fields: field_names
+							.into_iter()
+							.zip(values.drain(..field_count))
+							.collect(),
+						prototype: has_prototype.then(|| Box::new(values.remove(0))),
+					}
+				})
+			}
+			HirExpr::StructCloneUpdate {
+				class,
+				source,
+				replacements,
+				prototype,
+			} => {
+				let class = class.clone();
+				let names = replacements
+					.iter()
+					.map(|(name, _)| name.clone())
+					.collect::<Vec<_>>();
+				let has_prototype = prototype.is_some();
+				let mut values = vec![source.as_ref()];
+				values.extend(replacements.iter().map(|(_, value)| value));
+				values.extend(prototype.as_deref());
+				self.compile_values(values, target, next, move |mut values| {
+					let source = Box::new(values.remove(0));
+					let replacements = names
+						.iter()
+						.cloned()
+						.zip(values.drain(..names.len()))
+						.collect();
+					HirExpr::StructCloneUpdate {
+						class,
+						source,
+						replacements,
+						prototype: has_prototype.then(|| Box::new(values.remove(0))),
+					}
+				})
+			}
+			HirExpr::Field { recv, name } => {
+				let name = name.clone();
+				self.compile_values(vec![recv], target, next, move |mut values| HirExpr::Field {
+					recv: Box::new(values.remove(0)),
+					name,
+				})
+			}
+			HirExpr::VariantNew {
+				enum_name,
+				variant,
+				fields,
+				prototype,
+			} => {
+				let enum_name = enum_name.clone();
+				let variant = variant.clone();
+				let names = fields
+					.iter()
+					.map(|(name, _)| name.clone())
+					.collect::<Vec<_>>();
+				let has_prototype = prototype.is_some();
+				let mut values = fields.iter().map(|(_, value)| value).collect::<Vec<_>>();
+				values.extend(prototype.as_deref());
+				self.compile_values(values, target, next, move |mut values| {
+					let fields = names
+						.iter()
+						.cloned()
+						.zip(values.drain(..names.len()))
+						.collect();
+					HirExpr::VariantNew {
+						enum_name,
+						variant,
+						fields,
+						prototype: has_prototype.then(|| Box::new(values.remove(0))),
+					}
+				})
+			}
+			HirExpr::VariantRef {
+				enum_name,
+				variant,
+				prototype,
+			} => {
+				let enum_name = enum_name.clone();
+				let variant = variant.clone();
+				self.compile_values(
+					prototype.iter().map(AsRef::as_ref).collect(),
+					target,
+					next,
+					move |mut values| HirExpr::VariantRef {
+						enum_name,
+						variant,
+						prototype: values.pop().map(Box::new),
+					},
+				)
+			}
+			HirExpr::Binary {
+				op,
+				result,
+				mode,
+				lhs,
+				rhs,
+			} => {
+				let op = *op;
+				let result = *result;
+				let mode = *mode;
+				self.compile_values(vec![lhs, rhs], target, next, move |mut values| {
+					HirExpr::Binary {
+						op,
+						result,
+						mode,
+						lhs: Box::new(values.remove(0)),
+						rhs: Box::new(values.remove(0)),
+					}
+				})
+			}
+			HirExpr::Unary {
+				op,
+				result,
+				operand,
+			} => {
+				let op = *op;
+				let result = *result;
+				self.compile_values(vec![operand], target, next, move |mut values| {
+					HirExpr::Unary {
+						op,
+						result,
+						operand: Box::new(values.remove(0)),
+					}
+				})
+			}
+			HirExpr::ScalarCast {
+				kind,
+				operand,
+				mode,
+			} => {
+				let kind = *kind;
+				let mode = *mode;
+				self.compile_values(vec![operand], target, next, move |mut values| {
+					HirExpr::ScalarCast {
+						kind,
+						operand: Box::new(values.remove(0)),
+						mode,
+					}
+				})
+			}
+			HirExpr::Echo { operand, site } => {
+				let site = site.clone();
+				self.compile_values(vec![operand], target, next, move |mut values| {
+					HirExpr::Echo {
+						operand: Box::new(values.remove(0)),
+						site,
+					}
+				})
+			}
+			HirExpr::TaskOperation {
+				operation,
+				operands,
+			} => {
+				let operation = *operation;
+				self.compile_values(operands.iter().collect(), target, next, move |operands| {
+					HirExpr::TaskOperation {
+						operation,
+						operands,
+					}
+				})
+			}
+			HirExpr::Int(_)
+			| HirExpr::UInt(_)
+			| HirExpr::Num(..)
+			| HirExpr::Str(_)
+			| HirExpr::Bool(_)
+			| HirExpr::Char(_)
+			| HirExpr::Undefined
+			| HirExpr::Local(_)
+			| HirExpr::ExternValue { .. }
+			| HirExpr::This
+			| HirExpr::Closure { .. }
+			| HirExpr::TaskRecipe { .. }
+			| HirExpr::ProtocolDisplay(_)
+			| HirExpr::ActivationCall { .. }
+			| HirExpr::StaticEnumDispatch { .. }
+			| HirExpr::BoundDispatch { .. }
+			| HirExpr::UnaryBoundDispatch { .. }
+			| HirExpr::Block { .. }
+			| HirExpr::LabeledBlock { .. }
+			| HirExpr::If { .. }
+			| HirExpr::StateLoop { .. }
+			| HirExpr::For { .. }
+			| HirExpr::Break { .. }
+			| HirExpr::Continue { .. }
+			| HirExpr::ContinueTransition { .. }
+			| HirExpr::Match { .. } => unreachable!("non-composite activation expression"),
+		}
+	}
+}
+
+/// The JavaScript representation selected for declarations that must be
+/// registered with the transactional REPL runtime.
 enum RepresentationPolicy {
 	Direct,
-	Transactional {
-		cell_scopes: std::cell::RefCell<Vec<std::collections::BTreeMap<String, bool>>>,
-	},
+	Transactional,
 }
 
 impl RepresentationPolicy {
-	fn transactional(imported_top_level_lets: &[String]) -> Self {
-		Self::Transactional {
-			cell_scopes: std::cell::RefCell::new(vec![
-				imported_top_level_lets
-					.iter()
-					.cloned()
-					.map(|name| (name, true))
-					.collect(),
-			]),
-		}
+	fn transactional() -> Self {
+		Self::Transactional
 	}
 
 	fn is_transactional(&self) -> bool {
-		matches!(self, Self::Transactional { .. })
-	}
-
-	fn declaration_kind(&self, mutable: bool) -> VariableDeclarationKind {
-		match self {
-			Self::Transactional { .. } => VariableDeclarationKind::Const,
-			Self::Direct if mutable => VariableDeclarationKind::Let,
-			Self::Direct => VariableDeclarationKind::Const,
-		}
+		matches!(self, Self::Transactional)
 	}
 
 	fn class_type(&self) -> ClassType {
 		match self {
 			Self::Direct => ClassType::ClassDeclaration,
-			Self::Transactional { .. } => ClassType::ClassExpression,
-		}
-	}
-
-	fn push_scope(&self, non_cells: &[EcoString]) {
-		if let Self::Transactional { cell_scopes } = self {
-			cell_scopes.borrow_mut().push(
-				non_cells
-					.iter()
-					.map(|name| (name.to_string(), false))
-					.collect(),
-			);
-		}
-	}
-
-	fn push_param_scope(
-		&self,
-		params: &[EcoString],
-		mut gensym: impl FnMut() -> String,
-	) -> Vec<String> {
-		match self {
-			Self::Direct => params.iter().map(ToString::to_string).collect(),
-			Self::Transactional { cell_scopes } => {
-				let mut scope = std::collections::BTreeMap::new();
-				let js_params = params
-					.iter()
-					.map(|param| {
-						let is_hidden_type = param.starts_with("$type$");
-						scope.insert(param.to_string(), !is_hidden_type);
-						if is_hidden_type {
-							param.to_string()
-						} else {
-							gensym()
-						}
-					})
-					.collect();
-				cell_scopes.borrow_mut().push(scope);
-				js_params
-			}
-		}
-	}
-
-	fn pop_scope(&self) {
-		if let Self::Transactional { cell_scopes } = self {
-			assert!(cell_scopes.borrow_mut().pop().is_some());
-		}
-	}
-
-	fn bind_cell(&self, name: &str) {
-		if let Self::Transactional { cell_scopes } = self {
-			cell_scopes
-				.borrow_mut()
-				.last_mut()
-				.expect("transactional cell scope")
-				.insert(name.to_string(), true);
-		}
-	}
-
-	fn is_cell(&self, name: &str) -> bool {
-		match self {
-			Self::Direct => false,
-			Self::Transactional { cell_scopes } => cell_scopes
-				.borrow()
-				.iter()
-				.rev()
-				.find_map(|scope| scope.get(name).copied())
-				.unwrap_or(false),
-		}
-	}
-
-	fn bind_module_lets(&self, module: &HirModule) {
-		if let Self::Transactional { cell_scopes } = self {
-			cell_scopes.borrow_mut()[0]
-				.extend(module.lets.iter().map(|item| (item.name.to_string(), true)));
+			Self::Transactional => ClassType::ClassExpression,
 		}
 	}
 }
@@ -258,7 +2112,7 @@ pub struct Emitter<'a> {
 	/// independent.
 	in_iife_subexpr: std::cell::Cell<bool>,
 	/// Every `(module, symbol)` pair a `HirExpr::ExternCall` lowered during
-	/// this emit run needs imported — populated by the
+	/// this emit run needs imported (Gap 3, L0) — populated by the
 	/// `HirExpr::ExternCall` arm of [`Self::emit_expr`], drained by
 	/// [`Self::emit_module`] into a deduped, deterministically-ordered
 	/// `import { symbol } from "module";` per pair, prepended ahead of every
@@ -283,9 +2137,20 @@ pub struct Emitter<'a> {
 	/// the corresponding catch boundary.
 	return_completion_tokens: std::cell::RefCell<Vec<(&'a str, bool)>>,
 	block_completion_tokens: std::cell::RefCell<Vec<(nymph_hir::hir::BlockTarget, &'a str)>>,
+	/// Source and compiler-local names visible while an explicit activation state
+	/// is emitted. Each location names the retained frame and live-local slot
+	/// that owns the value, including captured slots in an enclosing frame.
+	activation_environment:
+		std::cell::RefCell<std::collections::BTreeMap<String, ActivationLocation>>,
+	/// Bindings introduced by the one-pattern match used to enter an activation
+	/// arm. Those bindings are copied into retained frame slots instead of being
+	/// left as native block locals.
+	activation_pattern_bindings: std::cell::RefCell<std::collections::BTreeSet<String>>,
+	class_defaults: std::cell::RefCell<std::collections::BTreeMap<String, Vec<(EcoString, HirExpr)>>>,
 	import_box_runtime: bool,
 	current_module: Option<String>,
 	representation: RepresentationPolicy,
+	echo_emission: EchoEmission,
 }
 
 impl<'a> Emitter<'a> {
@@ -301,16 +2166,34 @@ impl<'a> Emitter<'a> {
 			loop_completion_tokens: std::cell::RefCell::new(Vec::new()),
 			return_completion_tokens: std::cell::RefCell::new(Vec::new()),
 			block_completion_tokens: std::cell::RefCell::new(Vec::new()),
+			activation_environment: std::cell::RefCell::new(std::collections::BTreeMap::new()),
+			activation_pattern_bindings: std::cell::RefCell::new(std::collections::BTreeSet::new()),
+			class_defaults: std::cell::RefCell::new(std::collections::BTreeMap::new()),
 			import_box_runtime: false,
 			current_module: None,
 			representation: RepresentationPolicy::Direct,
+			echo_emission: EchoEmission::Development {
+				source_name: "<expr>".to_string(),
+				source_uri: None,
+				source: String::new(),
+			},
 		}
 	}
 
 	pub fn for_module(alloc: &'a Allocator, module: &str) -> Self {
 		let mut emitter = Self::new(alloc);
 		emitter.current_module = Some(module.to_string());
+		emitter.echo_emission = EchoEmission::Development {
+			source_name: format!("{module}.nym"),
+			source_uri: None,
+			source: String::new(),
+		};
 		emitter
+	}
+
+	pub fn with_echo_emission(mut self, echo_emission: EchoEmission) -> Self {
+		self.echo_emission = echo_emission;
+		self
 	}
 
 	pub fn for_project_module(alloc: &'a Allocator, module: &str) -> Self {
@@ -322,64 +2205,11 @@ impl<'a> Emitter<'a> {
 	pub fn for_transactional_project_module(
 		alloc: &'a Allocator,
 		module: &str,
-		imported_top_level_lets: &[String],
+		_imported_top_level_lets: &[String],
 	) -> Self {
 		let mut emitter = Self::for_project_module(alloc, module);
-		emitter.representation = RepresentationPolicy::transactional(imported_top_level_lets);
+		emitter.representation = RepresentationPolicy::transactional();
 		emitter
-	}
-
-	fn push_cell_scope(&self, non_cells: &[EcoString]) {
-		self.representation.push_scope(non_cells);
-	}
-
-	/// Enter a callable scope and choose its JavaScript formal names. Transactional
-	/// user parameters are represented by cells under their source names, so the
-	/// incoming values first need compiler-private raw bindings. Hidden runtime
-	/// type parameters remain ordinary values.
-	fn push_param_cell_scope(&self, params: &[EcoString]) -> Vec<String> {
-		self
-			.representation
-			.push_param_scope(params, || self.gensym())
-	}
-
-	/// Emit `const param = nymphCell(raw);` for transactional user parameters.
-	fn param_cell_prologue(
-		&self,
-		params: &[EcoString],
-		js_params: &[String],
-	) -> ArenaVec<'a, Statement<'a>> {
-		let mut stmts = ArenaVec::new_in(&self.ast);
-		if !self.representation.is_transactional() {
-			return stmts;
-		}
-		for (param, raw) in params.iter().zip(js_params) {
-			if param.starts_with("$type$") {
-				continue;
-			}
-			let init = self.transaction_call(
-				"nymphCell",
-				vec![Expression::new_identifier(
-					SPAN,
-					self.ast.allocator.alloc_str(raw),
-					&self.ast,
-				)],
-			);
-			stmts.push(self.const_decl(param, init));
-		}
-		stmts
-	}
-
-	fn pop_cell_scope(&self) {
-		self.representation.pop_scope();
-	}
-
-	fn bind_cell(&self, name: &str) {
-		self.representation.bind_cell(name);
-	}
-
-	fn is_cell(&self, name: &str) -> bool {
-		self.representation.is_cell(name)
 	}
 
 	fn transaction_call(&self, helper: &str, args: Vec<Expression<'a>>) -> Expression<'a> {
@@ -399,20 +2229,8 @@ impl<'a> Emitter<'a> {
 		)
 	}
 
-	fn binding_declaration(
-		&self,
-		name: &str,
-		mutable: bool,
-		mut init: Expression<'a>,
-		local: bool,
-	) -> Statement<'a> {
-		let kind = self.representation.declaration_kind(mutable);
-		if self.representation.is_transactional() {
-			if local {
-				self.bind_cell(name);
-			}
-			init = self.transaction_call("nymphCell", vec![init]);
-		}
+	fn binding_declaration(&self, name: &str, init: Expression<'a>) -> Statement<'a> {
+		let kind = VariableDeclarationKind::Const;
 		let pat =
 			BindingPattern::new_binding_identifier(SPAN, self.ast.allocator.alloc_str(name), &self.ast);
 		let declarator = VariableDeclarator::new(
@@ -437,12 +2255,56 @@ impl<'a> Emitter<'a> {
 	}
 
 	fn local_read(&self, name: &str) -> Expression<'a> {
-		let value = Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(name), &self.ast);
-		if self.is_cell(name) {
-			self.transaction_call("nymphCellGet", vec![value])
-		} else {
-			value
+		if let Some(location) = self.activation_environment.borrow().get(name).cloned() {
+			return self.activation_slot(&location);
 		}
+		Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(name), &self.ast)
+	}
+
+	fn activation_frame_member(&self, frame: &str, member: &str) -> Expression<'a> {
+		Expression::new_static_member_expression(
+			SPAN,
+			Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(frame), &self.ast),
+			IdentifierName::new(SPAN, self.ast.allocator.alloc_str(member), &self.ast),
+			false,
+			&self.ast,
+		)
+	}
+
+	fn activation_slot(&self, location: &ActivationLocation) -> Expression<'a> {
+		Expression::from(MemberExpression::ComputedMemberExpression(
+			ComputedMemberExpression::boxed(
+				SPAN,
+				self.activation_frame_member(&location.frame, "liveLocals"),
+				Expression::new_numeric_literal(
+					SPAN,
+					location.slot as f64,
+					None,
+					NumberBase::Decimal,
+					&self.ast,
+				),
+				false,
+				&self.ast,
+			),
+		))
+	}
+
+	fn activation_slot_target(&self, location: &ActivationLocation) -> AssignmentTarget<'a> {
+		AssignmentTarget::from(MemberExpression::ComputedMemberExpression(
+			ComputedMemberExpression::boxed(
+				SPAN,
+				self.activation_frame_member(&location.frame, "liveLocals"),
+				Expression::new_numeric_literal(
+					SPAN,
+					location.slot as f64,
+					None,
+					NumberBase::Decimal,
+					&self.ast,
+				),
+				false,
+				&self.ast,
+			),
+		))
 	}
 
 	fn object_assign(&self, args: Vec<Expression<'a>>) -> Expression<'a> {
@@ -452,7 +2314,7 @@ impl<'a> Emitter<'a> {
 				"assign",
 				args,
 			),
-			RepresentationPolicy::Transactional { .. } => self.transaction_call("nymphAssign", args),
+			RepresentationPolicy::Transactional => self.transaction_call("nymphAssign", args),
 		}
 	}
 
@@ -464,47 +2326,8 @@ impl<'a> Emitter<'a> {
 				"setPrototypeOf",
 				args,
 			),
-			RepresentationPolicy::Transactional { .. } => {
-				self.transaction_call("nymphSetPrototypeOf", args)
-			}
+			RepresentationPolicy::Transactional => self.transaction_call("nymphSetPrototypeOf", args),
 		}
-	}
-
-	fn transactional_assignment(&self, target: &HirExpr, value: &HirExpr) -> Option<Expression<'a>> {
-		if !self.representation.is_transactional() {
-			return None;
-		}
-		let (helper, args) = match target {
-			HirExpr::Local(name) if self.is_cell(name) => (
-				"nymphCellSet",
-				vec![
-					Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(name), &self.ast),
-					self.emit_expr(value),
-				],
-			),
-			HirExpr::Field { recv, name } => (
-				"nymphSetProperty",
-				vec![
-					self.emit_expr(recv),
-					Expression::new_string_literal(SPAN, self.ast.allocator.alloc_str(name), None, &self.ast),
-					self.emit_expr(value),
-				],
-			),
-			_ => return None,
-		};
-		self
-			.box_runtime_bindings
-			.borrow_mut()
-			.insert(helper.to_string());
-		Some(
-			self.member_call(
-				Expression::new_identifier(SPAN, helper, &self.ast),
-				"call",
-				std::iter::once(Expression::new_null_literal(SPAN, &self.ast))
-					.chain(args)
-					.collect(),
-			),
-		)
 	}
 
 	pub(crate) fn with_needed_imports(mut self, imports: &[(String, String, String)]) -> Self {
@@ -540,7 +2363,12 @@ impl<'a> Emitter<'a> {
 	}
 
 	pub fn emit_module(&self, module: &HirModule) -> String {
-		self.representation.bind_module_lets(module);
+		self.class_defaults.borrow_mut().extend(
+			module
+				.classes
+				.iter()
+				.map(|class| (class.name.to_string(), class.defaults.clone())),
+		);
 		let mut stmts = ArenaVec::new_in(&self.ast);
 		// The shared discriminant symbol, emitted once if the module has any enum.
 		if !module.enums.is_empty() {
@@ -552,12 +2380,19 @@ impl<'a> Emitter<'a> {
 		// Classes next so constructors are in scope for the functions that build them.
 		for class in &module.classes {
 			stmts.push(self.emit_class(class));
+			for method in &class.methods {
+				stmts.push(self.mark_class_callable(&class.name, &method.name, false));
+			}
+			for method in &class.statics {
+				stmts.push(self.mark_class_callable(&class.name, &method.name, true));
+			}
 		}
-		// Top-level `let`s follow classes/enums because a binding that constructs or
-		// referencing one must see it already defined — module-scope `const`/`let`
-		// is TDZ, unlike a function declaration) and before functions (whose JS
-		// `function` declarations hoist, so a let calling one is safe regardless of
-		// relative placement). Kept in source order relative to each other.
+		// Activation callables are initialized before top-level values so a value
+		// initializer can call one without crossing a `const` TDZ.
+		for func in &module.funcs {
+			stmts.push(self.emit_func(func));
+		}
+		// Top-level `let`s remain in source order after declarations they may use.
 		let mut external_values: std::collections::BTreeMap<_, EcoString> =
 			std::collections::BTreeMap::new();
 		for let_ in &module.lets {
@@ -570,7 +2405,6 @@ impl<'a> Emitter<'a> {
 			{
 				let alias = HirLet {
 					name: let_.name.clone(),
-					mutable: let_.mutable,
 					value: HirExpr::Local(canonical.clone()),
 				};
 				stmts.push(self.emit_module_let(&alias));
@@ -586,10 +2420,7 @@ impl<'a> Emitter<'a> {
 				stmts.push(self.emit_module_let(let_));
 			}
 		}
-		for func in &module.funcs {
-			stmts.push(self.emit_func(func));
-		}
-		// Prepend one deduped, deterministically-ordered `import`
+		// Gap 3 (L0): prepend one deduped, deterministically-ordered `import`
 		// per `(module, symbol)` pair any `HirExpr::ExternCall` above
 		// recorded — emitted INTO the returned module string rather than via
 		// a changed `emit`/`emit_module` return shape (a `-> String` many
@@ -617,7 +2448,7 @@ impl<'a> Emitter<'a> {
 			&self.ast,
 		);
 		let code = Codegen::new().build(&program).code;
-		// Standalone modules carry the boxing runtime
+		// Uniform value boxing (slice #2): standalone modules carry the runtime
 		// inline for direct Node execution, while project modules import their
 		// exact bindings from the canonical virtual module. Modules that never
 		// reference the runtime remain byte-identical.
@@ -635,11 +2466,16 @@ impl<'a> Emitter<'a> {
 				box_rt::BOX_MODULE_KEY,
 			)
 		} else {
-			format!("{}{code}", box_rt::box_preamble())
+			let preamble = if box_runtime_bindings.contains("nymphEcho") {
+				box_rt::box_preamble()
+			} else {
+				box_rt::box_preamble_release()
+			};
+			format!("{preamble}{code}")
 		}
 	}
 
-	/// Build `import { <symbol> as <local> } from "<module_specifier>";`.
+	/// Build `import { <symbol> as <local> } from "<module_specifier>";` (Gap 3, L0).
 	fn build_import_statement(
 		&self,
 		module_specifier: &str,
@@ -673,64 +2509,398 @@ impl<'a> Emitter<'a> {
 		))
 	}
 
-	fn emit_func(&self, func: &HirFunc) -> Statement<'a> {
-		// function <name>(<params>) { return <body>; }
-		//
-		// When the body is itself a `Block`, emit its statements directly into the
-		// function body (followed by `return <tail>;`) instead of wrapping them in a
-		// needless IIFE via `emit_expr`/`into_expression`.
-		let raw_params = self.push_param_cell_scope(&func.params);
-		let return_token = self.begin_return_completion();
-		let mut body_stmts = ArenaVec::new_in(&self.ast);
-		match &func.body {
-			HirExpr::Block { .. } => {
-				let value = self.emit_value(&func.body);
-				body_stmts.extend(value.stmts);
-				body_stmts.push(Statement::ReturnStatement(ReturnStatement::boxed(
-					SPAN,
-					Some(value.expr),
-					&self.ast,
-				)));
-			}
-			other => {
-				let body_expr = self.emit_expr(other);
-				body_stmts.push(Statement::ReturnStatement(ReturnStatement::boxed(
-					SPAN,
-					Some(body_expr),
-					&self.ast,
-				)));
-			}
-		}
-		let body_stmts = self.finish_return_completion(return_token, body_stmts);
-		let mut prologue = self.param_cell_prologue(&func.params, &raw_params);
-		prologue.extend(body_stmts);
-		let body_stmts = prologue;
-		self.pop_cell_scope();
-		let mut js_params = ArenaVec::new_in(&self.ast);
-		for param in &raw_params {
-			let binding_pattern = BindingPattern::BindingIdentifier(BindingIdentifier::boxed(
+	fn activation_assignment(
+		&self,
+		target: AssignmentTarget<'a>,
+		value: Expression<'a>,
+	) -> Statement<'a> {
+		let assignment = Expression::new_assignment_expression(
+			SPAN,
+			AssignmentOperator::Assign,
+			target,
+			value,
+			&self.ast,
+		);
+		Statement::new_expression_statement(SPAN, assignment, &self.ast)
+	}
+
+	fn activation_resume_target(&self, frame: &str) -> AssignmentTarget<'a> {
+		AssignmentTarget::from(MemberExpression::StaticMemberExpression(
+			StaticMemberExpression::boxed(
 				SPAN,
-				self.ast.allocator.alloc_str(param),
+				Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(frame), &self.ast),
+				IdentifierName::new(SPAN, "resumeState", &self.ast),
+				false,
+				&self.ast,
+			),
+		))
+	}
+
+	fn activation_state_number(&self, state: u32) -> Expression<'a> {
+		Expression::new_numeric_literal(SPAN, f64::from(state), None, NumberBase::Decimal, &self.ast)
+	}
+
+	fn activation_goto(&self, frame: &str, state: u32) -> ArenaVec<'a, Statement<'a>> {
+		let mut statements = ArenaVec::new_in(&self.ast);
+		statements.push(self.activation_assignment(
+			self.activation_resume_target(frame),
+			self.activation_state_number(state),
+		));
+		statements.push(Statement::new_continue_statement(SPAN, None, &self.ast));
+		statements
+	}
+
+	fn activation_packet(
+		&self,
+		callee: Expression<'a>,
+		receiver: Expression<'a>,
+		args: Vec<Expression<'a>>,
+		mode: HirCallMode,
+		source: u32,
+		resume_state: u32,
+		result_slot: usize,
+	) -> Expression<'a> {
+		let mut packet = vec![
+			callee,
+			receiver,
+			self.emit_activation_args(args),
+			self.emit_activation_source(source),
+		];
+		let helper = if mode == HirCallMode::Tail {
+			"nymphTailCall"
+		} else {
+			packet.push(self.activation_state_number(resume_state));
+			packet.push(Expression::new_numeric_literal(
+				SPAN,
+				result_slot as f64,
+				None,
+				NumberBase::Decimal,
 				&self.ast,
 			));
-			js_params.push(FormalParameter::new_plain(SPAN, binding_pattern, &self.ast));
+			"nymphPush"
+		};
+		self.runtime_call(helper, packet)
+	}
+
+	fn activation_member_packet(
+		&self,
+		receiver: Expression<'a>,
+		member: &str,
+		args: Vec<Expression<'a>>,
+		mode: HirCallMode,
+		source: u32,
+		resume_state: u32,
+		result_slot: usize,
+	) -> Expression<'a> {
+		let callee = Expression::new_static_member_expression(
+			SPAN,
+			receiver.clone_in(self.ast.allocator),
+			IdentifierName::new(SPAN, self.ast.allocator.alloc_str(member), &self.ast),
+			false,
+			&self.ast,
+		);
+		self.activation_packet(
+			callee,
+			receiver,
+			args,
+			mode,
+			source,
+			resume_state,
+			result_slot,
+		)
+	}
+
+	fn emit_activation_transfer(
+		&self,
+		call: &HirExpr,
+		resume_state: u32,
+		result_slot: usize,
+	) -> Expression<'a> {
+		match call {
+			HirExpr::TaskOperation {
+				operation,
+				operands,
+			} => {
+				assert!(operation.suspends());
+				let effect = self.zero_argument_arrow(self.emit_task_operation(*operation, operands));
+				self.runtime_call(
+					"nymphSuspend",
+					vec![
+						effect,
+						self.activation_state_number(resume_state),
+						self.activation_state_number(result_slot as u32),
+					],
+				)
+			}
+			HirExpr::ActivationCall {
+				callee,
+				args,
+				mode,
+				source,
+			} => {
+				let args = args.iter().map(|arg| self.emit_expr(arg)).collect();
+				if let HirExpr::Field { recv, name } = callee.as_ref() {
+					return self.activation_member_packet(
+						self.emit_expr(recv),
+						name,
+						args,
+						*mode,
+						*source,
+						resume_state,
+						result_slot,
+					);
+				}
+				self.activation_packet(
+					self.emit_expr(callee),
+					Expression::new_identifier(SPAN, "undefined", &self.ast),
+					args,
+					*mode,
+					*source,
+					resume_state,
+					result_slot,
+				)
+			}
+			HirExpr::StaticEnumDispatch {
+				owner,
+				method,
+				receiver,
+				args,
+				mode,
+				source,
+			} => {
+				let prototype = Expression::new_static_member_expression(
+					SPAN,
+					self.local_read(owner),
+					IdentifierName::new(SPAN, "$nymph$type", &self.ast),
+					false,
+					&self.ast,
+				);
+				let callee = Expression::new_static_member_expression(
+					SPAN,
+					prototype,
+					IdentifierName::new(SPAN, self.ast.allocator.alloc_str(method), &self.ast),
+					false,
+					&self.ast,
+				);
+				self.activation_packet(
+					callee,
+					self.emit_expr(receiver),
+					args.iter().map(|arg| self.emit_expr(arg)).collect(),
+					*mode,
+					*source,
+					resume_state,
+					result_slot,
+				)
+			}
+			HirExpr::BoundDispatch {
+				method,
+				receiver,
+				argument,
+				hidden_arguments,
+				cases,
+				mode,
+				source,
+				..
+			} => self.emit_bound_dispatch(
+				method,
+				receiver,
+				argument,
+				hidden_arguments,
+				cases,
+				*mode,
+				*source,
+				Some((resume_state, result_slot)),
+			),
+			HirExpr::UnaryBoundDispatch {
+				method,
+				receiver,
+				hidden_arguments,
+				cases,
+				mode,
+				source,
+				..
+			} => self.emit_unary_bound_dispatch(
+				method,
+				receiver,
+				hidden_arguments,
+				cases,
+				*mode,
+				*source,
+				Some((resume_state, result_slot)),
+			),
+			_ => unreachable!("activation transfer terminal must contain a generated call"),
 		}
+	}
+
+	fn emit_activation_plan(&self, plan: ActivationPlan) -> Expression<'a> {
+		let mut loop_body = ArenaVec::new_in(&self.ast);
+		for (state_number, state) in plan.states.into_iter().enumerate() {
+			let old_environment = self.activation_environment.replace(state.environment);
+			let old_patterns = self
+				.activation_pattern_bindings
+				.replace(state.pattern_bindings);
+			let mut statements = ArenaVec::new_in(&self.ast);
+			for action in state.actions {
+				match action {
+					ActivationAction::Store { target, value } => {
+						let value = self.emit_expr(&value);
+						statements
+							.push(self.activation_assignment(self.activation_slot_target(&target), value));
+					}
+					ActivationAction::RegisterCleanup(cleanup) => {
+						let cleanup = self.zero_argument_arrow(self.emit_expr(&cleanup));
+						let call = self.runtime_call("nymphRegisterCleanup", vec![cleanup]);
+						statements.push(Statement::new_expression_statement(SPAN, call, &self.ast));
+					}
+					ActivationAction::RegisterStateCleanup {
+						cleanup,
+						binding,
+						value,
+						handle,
+					} => {
+						let previous = self
+							.activation_environment
+							.borrow_mut()
+							.insert(binding.clone(), value);
+						let cleanup = self.zero_argument_arrow(self.emit_expr(&cleanup));
+						if let Some(previous) = previous {
+							self
+								.activation_environment
+								.borrow_mut()
+								.insert(binding, previous);
+						} else {
+							self.activation_environment.borrow_mut().remove(&binding);
+						}
+						let call = self.runtime_call("nymphRegisterCleanup", vec![cleanup]);
+						statements.push(self.activation_assignment(self.activation_slot_target(&handle), call));
+					}
+					ActivationAction::CommitStateTransition {
+						header_depth,
+						replacements,
+					} => {
+						let mut pairs = ArenaVec::new_in(&self.ast);
+						for (old, new) in replacements {
+							pairs.push(ArrayExpressionElement::from(self.activation_slot(&old)));
+							pairs.push(ArrayExpressionElement::from(self.activation_slot(&new)));
+						}
+						let pairs = Expression::new_array_expression(SPAN, pairs, &self.ast);
+						let depth = Expression::new_numeric_literal(
+							SPAN,
+							header_depth as f64,
+							None,
+							NumberBase::Decimal,
+							&self.ast,
+						);
+						let call = self.runtime_call("nymphCommitStateTransition", vec![depth, pairs]);
+						statements.push(Statement::new_expression_statement(SPAN, call, &self.ast));
+					}
+					ActivationAction::EnterCleanupScope => {
+						let call = self.runtime_call("nymphEnterCleanupScope", vec![]);
+						statements.push(Statement::new_expression_statement(SPAN, call, &self.ast));
+					}
+					ActivationAction::UnwindCleanupScopes(depth) => {
+						let depth = Expression::new_numeric_literal(
+							SPAN,
+							depth as f64,
+							None,
+							NumberBase::Decimal,
+							&self.ast,
+						);
+						let call = self.runtime_call("nymphUnwindCleanupScopes", vec![depth]);
+						statements.push(Statement::new_expression_statement(SPAN, call, &self.ast));
+					}
+				}
+			}
+			match state.terminal {
+				ActivationTerminal::Goto(next) => {
+					statements.extend(self.activation_goto(&plan.frame, next))
+				}
+				ActivationTerminal::Branch {
+					condition,
+					then_state,
+					else_state,
+				} => {
+					let next = Expression::new_conditional_expression(
+						SPAN,
+						self.emit_cond(&condition),
+						self.activation_state_number(then_state),
+						self.activation_state_number(else_state),
+						&self.ast,
+					);
+					statements
+						.push(self.activation_assignment(self.activation_resume_target(&plan.frame), next));
+					statements.push(Statement::new_continue_statement(SPAN, None, &self.ast));
+				}
+				ActivationTerminal::Transfer {
+					call,
+					resume_state,
+					result_slot,
+				} => statements.push(Statement::new_return_statement(
+					SPAN,
+					Some(self.emit_activation_transfer(&call, resume_state, result_slot)),
+					&self.ast,
+				)),
+				ActivationTerminal::Return(value) => statements.push(Statement::new_return_statement(
+					SPAN,
+					Some(self.runtime_call("nymphReturn", vec![self.emit_expr(&value)])),
+					&self.ast,
+				)),
+			}
+			self.activation_environment.replace(old_environment);
+			self.activation_pattern_bindings.replace(old_patterns);
+
+			let condition = Expression::new_binary_expression(
+				SPAN,
+				self.activation_frame_member(&plan.frame, "resumeState"),
+				BinaryOperator::StrictEquality,
+				self.activation_state_number(state_number as u32),
+				&self.ast,
+			);
+			loop_body.push(Statement::new_if_statement(
+				SPAN,
+				condition,
+				Statement::new_block_statement(SPAN, statements, &self.ast),
+				None,
+				&self.ast,
+			));
+		}
+		let invalid = self.runtime_call(
+			"nymphDefect",
+			vec![Expression::new_identifier(SPAN, "undefined", &self.ast)],
+		);
+		loop_body.push(Statement::new_return_statement(
+			SPAN,
+			Some(invalid),
+			&self.ast,
+		));
+		let while_loop = Statement::new_while_statement(
+			SPAN,
+			Expression::new_boolean_literal(SPAN, true, &self.ast),
+			Statement::new_block_statement(SPAN, loop_body, &self.ast),
+			&self.ast,
+		);
 		let params = FormalParameters::new(
 			SPAN,
 			FormalParameterKind::FormalParameter,
-			js_params,
+			ArenaVec::from_value_in(
+				FormalParameter::new_plain(
+					SPAN,
+					BindingPattern::new_binding_identifier(
+						SPAN,
+						self.ast.allocator.alloc_str(&plan.frame),
+						&self.ast,
+					),
+					&self.ast,
+				),
+				&self.ast,
+			),
 			oxc::ast::NONE,
 			&self.ast,
 		);
-		let fn_body = FunctionBody::new(SPAN, ArenaVec::new_in(&self.ast), body_stmts, &self.ast);
-		let function = Function::boxed(
+		Expression::FunctionExpression(Function::boxed(
 			SPAN,
-			FunctionType::FunctionDeclaration,
-			Some(BindingIdentifier::new(
-				SPAN,
-				self.ast.allocator.alloc_str(&func.name),
-				&self.ast,
-			)),
+			FunctionType::FunctionExpression,
+			None,
 			false,
 			false,
 			false,
@@ -738,35 +2908,162 @@ impl<'a> Emitter<'a> {
 			oxc::ast::NONE,
 			params,
 			oxc::ast::NONE,
-			Some(fn_body),
+			Some(FunctionBody::new(
+				SPAN,
+				ArenaVec::new_in(&self.ast),
+				ArenaVec::from_value_in(while_loop, &self.ast),
+				&self.ast,
+			)),
 			&self.ast,
-		);
-		Statement::FunctionDeclaration(function)
+		))
 	}
 
-	/// `const <name> = <value>;` (or `let` when `mutable`) — a top-level `let`.
-	/// Mirrors `HirStmt::Let`'s mutable → `Let`/`Const` mapping in
-	/// `emit_stmt`, generalizing the const-only `const_decl` helper for the `let
-	/// mut` case (the checker accepts top-level `let mut`, so codegen honors it).
+	fn activation_outer_environment(&self) -> std::collections::BTreeMap<String, ActivationLocation> {
+		self.activation_environment.borrow().clone()
+	}
+
+	fn activation_callable(
+		&self,
+		params: &[EcoString],
+		body: &HirExpr,
+		capture_receiver: bool,
+	) -> Expression<'a> {
+		let mut outer = self.activation_outer_environment();
+		let capture_frame = self.gensym();
+		let mut captured = Vec::new();
+		if capture_receiver {
+			for location in outer.values_mut() {
+				captured.push(self.activation_slot(location));
+				location.frame = capture_frame.clone();
+				location.slot = captured.len() - 1;
+			}
+		}
+		let plan = ActivationPlanner::new(self, params, outer).finish(body);
+		let mut step = self.emit_activation_plan(plan);
+		if capture_receiver {
+			step = self.member_call(
+				step,
+				"bind",
+				vec![Expression::ThisExpression(ThisExpression::boxed(
+					SPAN, &self.ast,
+				))],
+			);
+		}
+		let callable = self.runtime_call("nymphCallable", vec![step]);
+		if captured.is_empty() {
+			callable
+		} else {
+			let capture_frame = self.ast.allocator.alloc_str(&capture_frame);
+			let frame = self.runtime_call(
+				"nymphCaptureFrame",
+				vec![self.emit_activation_args(captured)],
+			);
+			self.arrow_iife(capture_frame, callable, frame)
+		}
+	}
+
+	fn emit_func(&self, func: &HirFunc) -> Statement<'a> {
+		let callable = self.activation_callable(&func.params, &func.body, false);
+		self.plain_decl(&func.name, callable, VariableDeclarationKind::Let)
+	}
+
+	/// Emit an immutable top-level binding.
 	fn emit_module_let(&self, let_: &HirLet) -> Statement<'a> {
-		self.binding_declaration(&let_.name, let_.mutable, self.emit_expr(&let_.value), false)
+		self.binding_declaration(&let_.name, self.emit_expr(&let_.value))
 	}
 
-	/// Emit a struct as `class <Name> { constructor(fields) { Object.assign(this, fields); } }`.
+	/// Emit a struct as `class <Name> { constructor(fields) { … } }`.
 	///
 	/// The object-argument constructor lets construction pass labeled fields as a
 	/// plain object (`new Point({ x, y })`) without depending on field order.
-	/// `Object.assign` copies each property onto the instance; this representation
-	/// does not apply field defaults or runtime validation.
+	/// Owner defaults run in declaration order only for properties absent from
+	/// the incoming object. Clone/update objects already contain every field, so
+	/// they never re-run defaults. `Object.assign` then copies all fields.
+	fn mark_class_callable(&self, class: &str, method: &str, static_: bool) -> Statement<'a> {
+		let class = Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(class), &self.ast);
+		let owner = if static_ {
+			class
+		} else {
+			Expression::new_static_member_expression(
+				SPAN,
+				class,
+				IdentifierName::new(SPAN, "prototype", &self.ast),
+				false,
+				&self.ast,
+			)
+		};
+		let callable = Expression::new_static_member_expression(
+			SPAN,
+			owner,
+			IdentifierName::new(SPAN, self.ast.allocator.alloc_str(method), &self.ast),
+			false,
+			&self.ast,
+		);
+		Statement::new_expression_statement(
+			SPAN,
+			self.runtime_call("nymphMarkCallable", vec![callable]),
+			&self.ast,
+		)
+	}
+
 	fn emit_class(&self, class: &HirClass) -> Statement<'a> {
+		self
+			.box_runtime_bindings
+			.borrow_mut()
+			.insert("nymphStructuralValue".to_string());
 		let assign_call = self.object_assign(vec![
 			Expression::ThisExpression(ThisExpression::boxed(SPAN, &self.ast)),
 			Expression::Identifier(IdentifierReference::boxed(SPAN, "fields", &self.ast)),
 		]);
 		let mut ctor_stmts = ArenaVec::new_in(&self.ast);
+		for (name, default) in &class.defaults {
+			let fields = || Expression::new_identifier(SPAN, "fields", &self.ast);
+			let has_own = self.member_call(
+				Expression::new_identifier(SPAN, "Object", &self.ast),
+				"hasOwn",
+				vec![
+					fields(),
+					Expression::new_string_literal(SPAN, self.ast.allocator.alloc_str(name), None, &self.ast),
+				],
+			);
+			let missing =
+				Expression::new_unary_expression(SPAN, UnaryOperator::LogicalNot, has_own, &self.ast);
+			let member = StaticMemberExpression::boxed(
+				SPAN,
+				fields(),
+				IdentifierName::new(SPAN, self.ast.allocator.alloc_str(name), &self.ast),
+				false,
+				&self.ast,
+			);
+			let assign = Expression::new_assignment_expression(
+				SPAN,
+				AssignmentOperator::Assign,
+				AssignmentTarget::from(MemberExpression::StaticMemberExpression(member)),
+				self.emit_expr(default),
+				&self.ast,
+			);
+			ctor_stmts.push(Statement::new_if_statement(
+				SPAN,
+				missing,
+				Statement::new_expression_statement(SPAN, assign, &self.ast),
+				None,
+				&self.ast,
+			));
+		}
 		ctor_stmts.push(Statement::new_expression_statement(
 			SPAN,
 			assign_call,
+			&self.ast,
+		));
+		let identity = format!("struct:{}", class.name);
+		let structural_value = self.structural_value(
+			Expression::ThisExpression(ThisExpression::boxed(SPAN, &self.ast)),
+			&identity,
+			&class.fields,
+		);
+		ctor_stmts.push(Statement::new_expression_statement(
+			SPAN,
+			structural_value,
 			&self.ast,
 		));
 
@@ -881,40 +3178,34 @@ impl<'a> Emitter<'a> {
 	/// Build a method's params/body into a plain JS `FunctionExpression`
 	/// (`(<params>) { return <body>; }`), independent of how the caller wraps
 	/// it — a class method definition (struct/class instance methods) or an
-	/// object-literal method property in the enum prototype ABI both
+	/// object-literal method property (the enum prototype ABI, Slice 4D) both
 	/// share this exactly. Mirrors [`Self::emit_func`]'s param/body handling.
 	/// Deliberately a plain function, never an arrow: prototype methods need
 	/// their own `this` bound to the receiver at call time.
 	fn method_function(&self, method: &HirMethod) -> ArenaBox<'a, Function<'a>> {
-		let raw_params = self.push_param_cell_scope(&method.params);
-		let return_token = self.begin_return_completion();
-		let mut body_stmts = ArenaVec::new_in(&self.ast);
-		match &method.body {
-			HirExpr::Block { .. } => {
-				let value = self.emit_value(&method.body);
-				body_stmts.extend(value.stmts);
-				body_stmts.push(Statement::new_return_statement(
+		let plan = ActivationPlanner::new(self, &method.params, std::collections::BTreeMap::new())
+			.finish(&method.body);
+		let step = self.emit_activation_plan(plan);
+		let bridge = self.runtime_call(
+			"nymphMethodStep",
+			vec![
+				Expression::ThisExpression(ThisExpression::boxed(SPAN, &self.ast)),
+				Expression::new_string_literal(
 					SPAN,
-					Some(value.expr),
+					self.ast.allocator.alloc_str(&method.name),
+					None,
 					&self.ast,
-				));
-			}
-			other => {
-				let body_expr = self.emit_expr(other);
-				body_stmts.push(Statement::new_return_statement(
-					SPAN,
-					Some(body_expr),
-					&self.ast,
-				));
-			}
-		}
-		let body_stmts = self.finish_return_completion(return_token, body_stmts);
-		let mut prologue = self.param_cell_prologue(&method.params, &raw_params);
-		prologue.extend(body_stmts);
-		let body_stmts = prologue;
-		self.pop_cell_scope();
+				),
+				Expression::new_identifier(SPAN, "arguments", &self.ast),
+				step,
+			],
+		);
+		let body_stmts = ArenaVec::from_value_in(
+			Statement::new_return_statement(SPAN, Some(bridge), &self.ast),
+			&self.ast,
+		);
 		let mut js_params = ArenaVec::new_in(&self.ast);
-		for param in &raw_params {
+		for param in &method.params {
 			let pat = BindingPattern::new_binding_identifier(
 				SPAN,
 				self.ast.allocator.alloc_str(param),
@@ -947,8 +3238,8 @@ impl<'a> Emitter<'a> {
 	}
 
 	/// Emit an inherent instance method as a class method `<name>(<params>) { return
-	/// <body>; }`. When `is_static`, emits a `namespace func` as a JS `static`
-	/// class method instead — `Type.func(args)` then
+	/// <body>; }`. When `is_static`, emits a `namespace func` static function
+	/// (Slice 4J) as a JS `static` class method instead — `Type.func(args)` then
 	/// resolves to it natively, with zero call-site changes needed.
 	fn emit_method(&self, method: &HirMethod, is_static: bool) -> ClassElement<'a> {
 		let func = self.method_function(method);
@@ -974,7 +3265,7 @@ impl<'a> Emitter<'a> {
 
 	/// Emit an instance method as an object-literal method property (shorthand
 	/// `<name>(<params>) { … }` syntax), used for the enum prototype ABI's
-	/// `const proto = { … };` object. Must stay a plain
+	/// `const proto = { … };` object (Slice 4D). Must stay a plain
 	/// `FunctionExpression` (never an arrow) so each call gets its own `this`.
 	fn emit_method_property(&self, method: &HirMethod) -> ObjectPropertyKind<'a> {
 		let func = self.method_function(method);
@@ -987,8 +3278,11 @@ impl<'a> Emitter<'a> {
 			SPAN,
 			PropertyKind::Init,
 			key,
-			Expression::FunctionExpression(func),
-			true,
+			self.runtime_call(
+				"nymphMarkCallable",
+				vec![Expression::FunctionExpression(func)],
+			),
+			false,
 			false,
 			false,
 			&self.ast,
@@ -1000,7 +3294,23 @@ impl<'a> Emitter<'a> {
 	/// `const TAG = Symbol.for("nymph.tag");` — the shared discriminant key, the
 	/// same symbol in every module via the global registry.
 	fn emit_tag_const(&self) -> Statement<'a> {
-		self.const_decl("TAG", self.global_symbol("nymph.tag"))
+		let symbol_for = Expression::new_static_member_expression(
+			SPAN,
+			Expression::new_identifier(SPAN, "Symbol", &self.ast),
+			IdentifierName::new(SPAN, "for", &self.ast),
+			false,
+			&self.ast,
+		);
+		let mut args = ArenaVec::new_in(&self.ast);
+		args.push(Argument::from(Expression::new_string_literal(
+			SPAN,
+			self.ast.allocator.alloc_str("nymph.tag"),
+			None,
+			&self.ast,
+		)));
+		let init =
+			Expression::new_call_expression(SPAN, symbol_for, oxc::ast::NONE, args, false, &self.ast);
+		self.const_decl("TAG", init)
 	}
 
 	/// Emit an enum as `const <E> = (() => { const t0 = Symbol.for("E.V0"); …
@@ -1009,7 +3319,7 @@ impl<'a> Emitter<'a> {
 	/// factories, nullary variants frozen singletons — each carrying `[TAG]`
 	/// so a matcher can compare identity.
 	///
-	/// The variant discriminant is
+	/// L1 (external linkage's Option ABI seam): the variant discriminant is
 	/// `Symbol.for(label)` — the GLOBAL symbol registry, keyed by the exact
 	/// string `label` (`"<enum-name>.<variant-name>"`, enum name emitted
 	/// UNMANGLED) — not a bare `Symbol(label)` call, which mints a FRESH,
@@ -1019,8 +3329,8 @@ impl<'a> Emitter<'a> {
 	/// `Symbol(..)`, two DIFFERENT modules' own inline `Option` IIFEs mint
 	/// two DIFFERENT `Symbol("Option.Some")` values, so a `Some` built in one
 	/// module fails an `=== ` tag comparison against `Option.Some[TAG]` read
-	/// from another module's own inline `Option` — cross-module and
-	/// intrinsic-runtime-built `Option`/enum
+	/// from another module's own inline `Option` — cross-module (and,
+	/// crucially for this slice, intrinsic-runtime-built) `Option`/enum
 	/// values silently mismatch every `match`, EVEN THOUGH the checker
 	/// already treats them as the identical type. `Symbol.for` fixes this:
 	/// the same string always resolves to the same global symbol, so any two
@@ -1029,16 +3339,21 @@ impl<'a> Emitter<'a> {
 	/// values of "the same" enum variant compare equal by construction. The
 	/// TAG KEY itself (`emit_tag_const`, above) was already global via
 	/// `Symbol.for("nymph.tag")` — only the per-variant discriminant VALUE
-	/// would otherwise mismatch.
+	/// was the gap.
 	///
-	/// Every enum has a `const proto = { … };` object (built the
+	/// X1: every enum has a `const proto = { … };` object (built the
 	/// same way as struct class methods, see [`Self::emit_method_property`]) is
 	/// also emitted inside the IIFE, and every variant value is created with
 	/// `Object.create(proto)` as its prototype instead of a plain object literal
 	/// — so `c.m()` and `this` inside a method work natively, while methodless
 	/// enums still have a canonical runtime type object.
 	fn emit_enum(&self, hir_enum: &HirEnum) -> Statement<'a> {
+		self
+			.box_runtime_bindings
+			.borrow_mut()
+			.insert("nymphStructuralValue".to_string());
 		let mut stmts = ArenaVec::new_in(&self.ast);
+		let has_methods = true;
 		// The prototype is also the enum's canonical runtime type object, so it
 		// exists even when there are no instance methods.
 		stmts.push(self.emit_enum_proto(&hir_enum.methods));
@@ -1047,7 +3362,33 @@ impl<'a> Emitter<'a> {
 			let t_name = format!("t{i}");
 			// const t<i> = Symbol("<E>.<V>");
 			let label = format!("{}.{}", hir_enum.name, variant.name);
-			stmts.push(self.const_decl(&t_name, self.global_symbol(&label)));
+			// `Symbol.for(label)`, not a bare `Symbol(label)` call — see this
+			// method's own doc comment for why the discriminant must be the
+			// GLOBAL symbol registry entry, mirroring `emit_tag_const`'s own
+			// `Symbol.for("nymph.tag")` shape.
+			let symbol_for = Expression::new_static_member_expression(
+				SPAN,
+				Expression::new_identifier(SPAN, "Symbol", &self.ast),
+				IdentifierName::new(SPAN, "for", &self.ast),
+				false,
+				&self.ast,
+			);
+			let mut sym_args = ArenaVec::new_in(&self.ast);
+			sym_args.push(Argument::from(Expression::new_string_literal(
+				SPAN,
+				self.ast.allocator.alloc_str(&label),
+				None,
+				&self.ast,
+			)));
+			let sym_call = Expression::new_call_expression(
+				SPAN,
+				symbol_for,
+				oxc::ast::NONE,
+				sym_args,
+				false,
+				&self.ast,
+			);
+			stmts.push(self.const_decl(&t_name, sym_call));
 
 			// The `{ [TAG]: t<i> }` object both variant shapes carry.
 			let mut tag_props = ArenaVec::new_in(&self.ast);
@@ -1055,13 +3396,24 @@ impl<'a> Emitter<'a> {
 			let tag_obj = Expression::new_object_expression(SPAN, tag_props, &self.ast);
 			// The variant's value: a factory (fields) or a frozen singleton (nullary).
 			let value = if variant.fields.is_empty() {
+				let base = if has_methods {
+					self.object_create_and_assign("proto", tag_obj)
+				} else {
+					tag_obj
+				};
+				let base = self.structural_value(base, &format!("variant:{label}"), &variant.fields);
 				self.member_call(
 					Expression::new_identifier(SPAN, "Object", &self.ast),
 					"freeze",
-					vec![self.object_create_and_assign("proto", tag_obj)],
+					vec![base],
 				)
 			} else {
-				let factory = self.variant_factory(&t_name);
+				let factory = self.variant_factory(
+					&t_name,
+					has_methods,
+					&format!("variant:{label}"),
+					&variant.fields,
+				);
 				self.object_assign(vec![factory, tag_obj])
 			};
 
@@ -1081,7 +3433,7 @@ impl<'a> Emitter<'a> {
 				&self.ast,
 			)));
 		}
-		// `namespace func` static functions become object-level
+		// `namespace func` static functions (Slice 4J) become OBJECT-level
 		// method properties on the returned object itself, alongside the
 		// variant keys — NOT on `proto` (only reachable through a constructed
 		// variant instance, never through the enum name; call sites emit
@@ -1134,7 +3486,7 @@ impl<'a> Emitter<'a> {
 	}
 
 	/// `const proto = { m1(…) { … }, … };` — the shared prototype object an
-	/// enum's methodful variants are `Object.create`d against.
+	/// enum's methodful variants are `Object.create`d against (Slice 4D, X1).
 	/// Each method is built the same way a struct's class method is (via
 	/// [`Self::method_function`]), just wrapped as an object-literal method
 	/// property instead of a class element.
@@ -1159,8 +3511,17 @@ impl<'a> Emitter<'a> {
 		self.object_assign(vec![create_call, props])
 	}
 
-	/// A field variant factory whose values inherit the enum's shared prototype.
-	fn variant_factory(&self, t_name: &str) -> Expression<'a> {
+	/// `(fields) => { return { [TAG]: <t_name>, ...fields }; }` — a field variant's
+	/// object-argument factory. When `has_methods`, the returned object is instead
+	/// `Object.assign(Object.create(proto), { [TAG]: <t_name>, ...fields })` so the
+	/// constructed value carries the shared prototype's methods (Slice 4D, X1).
+	fn variant_factory(
+		&self,
+		t_name: &str,
+		has_methods: bool,
+		identity: &str,
+		fields: &[EcoString],
+	) -> Expression<'a> {
 		let mut obj_props = ArenaVec::new_in(&self.ast);
 		obj_props.push(self.tag_prop(t_name));
 		obj_props.push(ObjectPropertyKind::new_spread_property(
@@ -1169,10 +3530,16 @@ impl<'a> Emitter<'a> {
 			&self.ast,
 		));
 		let obj = Expression::new_object_expression(SPAN, obj_props, &self.ast);
+		let ret_expr = if has_methods {
+			self.object_create_and_assign("proto", obj)
+		} else {
+			obj
+		};
+		let ret_expr = self.structural_value(ret_expr, identity, fields);
 		let mut body_stmts = ArenaVec::new_in(&self.ast);
 		body_stmts.push(Statement::new_return_statement(
 			SPAN,
-			Some(self.object_create_and_assign("proto", obj)),
+			Some(ret_expr),
 			&self.ast,
 		));
 		let body = FunctionBody::new(SPAN, ArenaVec::new_in(&self.ast), body_stmts, &self.ast);
@@ -1201,6 +3568,39 @@ impl<'a> Emitter<'a> {
 		)
 	}
 
+	fn structural_value(
+		&self,
+		value: Expression<'a>,
+		identity: &str,
+		fields: &[EcoString],
+	) -> Expression<'a> {
+		let mut elements = ArenaVec::new_in(&self.ast);
+		for field in fields {
+			elements.push(ArrayExpressionElement::from(
+				Expression::new_string_literal(SPAN, self.ast.allocator.alloc_str(field), None, &self.ast),
+			));
+		}
+		let mut args = ArenaVec::new_in(&self.ast);
+		args.push(Argument::from(value));
+		args.push(Argument::from(Expression::new_string_literal(
+			SPAN,
+			self.ast.allocator.alloc_str(identity),
+			None,
+			&self.ast,
+		)));
+		args.push(Argument::from(Expression::new_array_expression(
+			SPAN, elements, &self.ast,
+		)));
+		Expression::new_call_expression(
+			SPAN,
+			Expression::new_identifier(SPAN, "nymphStructuralValue", &self.ast),
+			oxc::ast::NONE,
+			args,
+			false,
+			&self.ast,
+		)
+	}
+
 	/// A computed `[TAG]: <t_name>` object property.
 	fn tag_prop(&self, t_name: &str) -> ObjectPropertyKind<'a> {
 		let key = PropertyKey::from(Expression::new_identifier(SPAN, "TAG", &self.ast));
@@ -1219,11 +3619,20 @@ impl<'a> Emitter<'a> {
 
 	/// `const <name> = <init>;`
 	fn const_decl(&self, name: &str, init: Expression<'a>) -> Statement<'a> {
+		self.plain_decl(name, init, VariableDeclarationKind::Const)
+	}
+
+	fn plain_decl(
+		&self,
+		name: &str,
+		init: Expression<'a>,
+		kind: VariableDeclarationKind,
+	) -> Statement<'a> {
 		let pat =
 			BindingPattern::new_binding_identifier(SPAN, self.ast.allocator.alloc_str(name), &self.ast);
 		let declarator = VariableDeclarator::new(
 			SPAN,
-			VariableDeclarationKind::Const,
+			kind,
 			pat,
 			oxc::ast::NONE,
 			Some(init),
@@ -1232,7 +3641,7 @@ impl<'a> Emitter<'a> {
 		);
 		let decl = VariableDeclaration::new(
 			SPAN,
-			VariableDeclarationKind::Const,
+			kind,
 			ArenaVec::from_value_in(declarator, &self.ast),
 			false,
 			&self.ast,
@@ -1254,8 +3663,8 @@ impl<'a> Emitter<'a> {
 		)
 	}
 
-	/// `new <class>(<payload>)` — a boxed primitive value. `class` is a box wrapper
-	/// name (`NInt`/`NString`/…); the wrapper
+	/// `new <class>(<payload>)` — a boxed primitive value (uniform value boxing,
+	/// slice #2). `class` is a box wrapper name (`NInt`/`NString`/…); the wrapper
 	/// stores `payload` in `.v` and carries its type discriminant on its
 	/// prototype. Records the runtime binding so [`Self::emit_module`] can either
 	/// provide the inline runtime or import it from the project runtime module.
@@ -1270,7 +3679,25 @@ impl<'a> Emitter<'a> {
 		Expression::new_new_expression(SPAN, callee, oxc::ast::NONE, args, &self.ast)
 	}
 
-	/// `<expr>.v` — read a boxed value's raw payload (ADR-0002).
+	fn direct_integer_box(&self, class: &str, payload: Expression<'a>) -> Expression<'a> {
+		self
+			.box_runtime_bindings
+			.borrow_mut()
+			.insert(class.to_string());
+		let callee = Expression::new_static_member_expression(
+			SPAN,
+			Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(class), &self.ast),
+			IdentifierName::new(SPAN, "direct", &self.ast),
+			false,
+			&self.ast,
+		);
+		let mut args = ArenaVec::new_in(&self.ast);
+		args.push(Argument::from(payload));
+		Expression::new_call_expression(SPAN, callee, oxc::ast::NONE, args, false, &self.ast)
+	}
+
+	/// `<expr>.v` — read a boxed value's raw payload (uniform value boxing,
+	/// ADR-0002). The condition/logical-operator unwrap of slice #4:
 	/// `ToBoolean(object)` is unconditionally `true`, so a user `boolean` in an
 	/// `if`/`while`/guard condition or an `&&`/`||`/`!` slot must consult its raw
 	/// `.v` payload rather than the (always-truthy) box.
@@ -1286,7 +3713,7 @@ impl<'a> Emitter<'a> {
 
 	/// Whether `cond`, in a condition slot, already evaluates to a raw JS boolean
 	/// and so must not be `.v`-unwrapped. Only compiler-generated operator nodes
-	/// carry `BuiltinResult::Raw`; user comparisons produce boxed `NBool`s.
+	/// carry `BuiltinResult::Raw`; user comparisons now produce boxed `NBool`s.
 	fn cond_is_raw(cond: &HirExpr) -> bool {
 		matches!(
 			cond,
@@ -1350,6 +3777,25 @@ impl<'a> Emitter<'a> {
 		Expression::new_call_expression(SPAN, callee, oxc::ast::NONE, args, false, &self.ast)
 	}
 
+	fn runtime_call(&self, name: &str, args: Vec<Expression<'a>>) -> Expression<'a> {
+		self
+			.box_runtime_bindings
+			.borrow_mut()
+			.insert(name.to_string());
+		let mut arguments = ArenaVec::new_in(&self.ast);
+		for arg in args {
+			arguments.push(Argument::from(arg));
+		}
+		Expression::new_call_expression(
+			SPAN,
+			self.ident(self.ast.allocator.alloc_str(name)),
+			oxc::ast::NONE,
+			arguments,
+			false,
+			&self.ast,
+		)
+	}
+
 	/// `object.method(...args)`.
 	fn member_call(
 		&self,
@@ -1371,8 +3817,7 @@ impl<'a> Emitter<'a> {
 		Expression::new_call_expression(SPAN, callee, oxc::ast::NONE, js_args, false, &self.ast)
 	}
 
-	/// A bare global identifier reference (`Math`, `Number`, `Infinity`, or a
-	/// cast-IIFE's gensym parameter — see `saturating_scalar_cast`).
+	/// A bare global identifier reference or compiler-generated local.
 	fn ident(&self, name: &'a str) -> Expression<'a> {
 		Expression::new_identifier(SPAN, name, &self.ast)
 	}
@@ -1381,12 +3826,6 @@ impl<'a> Emitter<'a> {
 	fn math_call(&self, method: &str, arg: Expression<'a>) -> Expression<'a> {
 		let math = self.ident("Math");
 		self.member_call(math, method, vec![arg])
-	}
-
-	/// `Number.isNaN(<arg>)`.
-	fn number_is_nan(&self, arg: Expression<'a>) -> Expression<'a> {
-		let number = self.ident("Number");
-		self.member_call(number, "isNaN", vec![arg])
 	}
 
 	/// `<left> === <right>`.
@@ -1405,17 +3844,11 @@ impl<'a> Emitter<'a> {
 		Expression::new_numeric_literal(SPAN, 0.0, None, NumberBase::Decimal, &self.ast)
 	}
 
-	/// `-Infinity` — a unary negation of the `Infinity` global.
-	fn neg_infinity(&self) -> Expression<'a> {
-		let infinity = self.ident("Infinity");
-		Expression::new_unary_expression(SPAN, UnaryOperator::UnaryNegation, infinity, &self.ast)
+	fn bigint_literal(&self, value: impl ToString) -> Expression<'a> {
+		let value = self.ast.allocator.alloc_str(&value.to_string());
+		Expression::new_big_int_literal(SPAN, value, None, BigintBase::Decimal, &self.ast)
 	}
 
-	/// An `i64` value as a JS numeric literal. `i64::MAX` (`2^63 - 1`) isn't
-	/// exactly representable as an `f64` — JS stores/prints the nearest double,
-	/// `2^63`, exactly as if `9223372036854775807` had been written directly in
-	/// JS source and parsed as a `Number`. `i64::MIN` (`-2^63`) IS exactly
-	/// representable.
 	fn i64_literal(&self, value: i64) -> Expression<'a> {
 		Expression::new_numeric_literal(SPAN, value as f64, None, NumberBase::Decimal, &self.ast)
 	}
@@ -1465,7 +3898,23 @@ impl<'a> Emitter<'a> {
 		argument: &HirExpr,
 		hidden_arguments: &[HirExpr],
 		cases: &[HirBoundDispatchCase],
+		mode: nymph_hir::hir::HirCallMode,
+		source: u32,
+		continuation: Option<(u32, usize)>,
 	) -> Expression<'a> {
+		if let Some((resume_state, result_slot)) = continuation {
+			return self.emit_bound_dispatch_state(
+				method,
+				receiver,
+				argument,
+				hidden_arguments,
+				cases,
+				mode,
+				source,
+				resume_state,
+				result_slot,
+			);
+		}
 		let receiver_param = self.gensym();
 		let receiver_param = self.ast.allocator.alloc_str(&receiver_param);
 		let argument_param = self.gensym();
@@ -1477,8 +3926,26 @@ impl<'a> Emitter<'a> {
 			.collect::<Vec<_>>();
 		let fallback_args = std::iter::once(self.ident(argument_param))
 			.chain(hidden_params.iter().map(|name| self.ident(name)))
-			.collect();
-		let mut body = self.member_call(self.ident(receiver_param), method, fallback_args);
+			.collect::<Vec<_>>();
+		let mut body = if let Some((resume_state, result_slot)) = continuation {
+			self.activation_member_packet(
+				self.ident(receiver_param),
+				method,
+				fallback_args,
+				mode,
+				source,
+				resume_state,
+				result_slot,
+			)
+		} else {
+			self.emit_member_activation(
+				self.ident(receiver_param),
+				method,
+				fallback_args,
+				mode,
+				source,
+			)
+		};
 		for case in cases.iter().rev() {
 			let receiver_matches = self.strict_eq(
 				self.tag_read(self.ident(receiver_param), true),
@@ -1495,23 +3962,60 @@ impl<'a> Emitter<'a> {
 				argument_matches,
 				&self.ast,
 			);
-			let target_name = match &case.target {
+			let dispatched = match &case.target {
 				HirBoundDispatchTarget::TopLevel { module, name } => {
-					self.route_module_symbol(module, name, false)
+					let target_name = self.route_module_symbol(module, name, false);
+					let args = std::iter::once(self.ident(receiver_param))
+						.chain(std::iter::once(self.ident(argument_param)))
+						.chain(hidden_params.iter().map(|name| self.ident(name)))
+						.collect();
+					if let Some((resume_state, result_slot)) = continuation {
+						self.activation_packet(
+							self.ident(self.ast.allocator.alloc_str(&target_name)),
+							Expression::new_identifier(SPAN, "undefined", &self.ast),
+							args,
+							mode,
+							source,
+							resume_state,
+							result_slot,
+						)
+					} else {
+						self.emit_target_activation(
+							self.ident(self.ast.allocator.alloc_str(&target_name)),
+							args,
+							mode,
+							source,
+						)
+					}
 				}
-				HirBoundDispatchTarget::Extern { module, symbol } => {
-					self.route_module_symbol(module, symbol, true)
+				HirBoundDispatchTarget::Extern {
+					module,
+					symbol,
+					call_mode,
+				} => {
+					let target_name = self.route_module_symbol(module, symbol, true);
+					let values = std::iter::once(self.ident(receiver_param))
+						.chain(std::iter::once(self.ident(argument_param)))
+						.chain(hidden_params.iter().map(|name| self.ident(name)))
+						.collect::<Vec<_>>();
+					let mut args = ArenaVec::new_in(&self.ast);
+					args.extend(values.into_iter().map(Argument::from));
+					if *call_mode == nymph_hir::hir::ExternalCallMode::Cancellable {
+						args.push(Argument::from(
+							self.runtime_call("nymphCurrentExecutionSignal", vec![]),
+						));
+					}
+					let call = Expression::new_call_expression(
+						SPAN,
+						self.ident(self.ast.allocator.alloc_str(&target_name)),
+						oxc::ast::NONE,
+						args,
+						false,
+						&self.ast,
+					);
+					self.activation_direct_result(call, mode, continuation)
 				}
 			};
-			let target = self.ident(self.ast.allocator.alloc_str(&target_name));
-			let mut args = ArenaVec::new_in(&self.ast);
-			args.push(Argument::from(self.ident(receiver_param)));
-			args.push(Argument::from(self.ident(argument_param)));
-			for name in &hidden_params {
-				args.push(Argument::from(self.ident(name)));
-			}
-			let dispatched =
-				Expression::new_call_expression(SPAN, target, oxc::ast::NONE, args, false, &self.ast);
 			body = Expression::new_conditional_expression(SPAN, test, dispatched, body, &self.ast);
 		}
 
@@ -1528,45 +4032,324 @@ impl<'a> Emitter<'a> {
 		receiver: &HirExpr,
 		hidden_arguments: &[HirExpr],
 		cases: &[HirBoundDispatchCase],
+		mode: nymph_hir::hir::HirCallMode,
+		source: u32,
+		continuation: Option<(u32, usize)>,
 	) -> Expression<'a> {
+		if let Some((resume_state, result_slot)) = continuation {
+			return self.emit_unary_bound_dispatch_state(
+				method,
+				receiver,
+				hidden_arguments,
+				cases,
+				mode,
+				source,
+				resume_state,
+				result_slot,
+			);
+		}
 		let receiver_param = self.gensym();
 		let receiver_param = self.ast.allocator.alloc_str(&receiver_param);
 		let hidden_params = hidden_arguments
 			.iter()
 			.map(|_| self.ast.allocator.alloc_str(&self.gensym()))
 			.collect::<Vec<_>>();
-		let mut body = self.member_call(
-			self.ident(receiver_param),
-			method,
-			hidden_params.iter().map(|name| self.ident(name)).collect(),
-		);
+		let fallback_args = hidden_params
+			.iter()
+			.map(|name| self.ident(name))
+			.collect::<Vec<_>>();
+		let mut body = if let Some((resume_state, result_slot)) = continuation {
+			self.activation_member_packet(
+				self.ident(receiver_param),
+				method,
+				fallback_args,
+				mode,
+				source,
+				resume_state,
+				result_slot,
+			)
+		} else {
+			self.emit_member_activation(
+				self.ident(receiver_param),
+				method,
+				fallback_args,
+				mode,
+				source,
+			)
+		};
 		for case in cases.iter().rev() {
 			let test = self.strict_eq(
 				self.tag_read(self.ident(receiver_param), true),
 				self.global_symbol(&case.receiver_tag),
 			);
-			let target_name = match &case.target {
+			let dispatched = match &case.target {
 				HirBoundDispatchTarget::TopLevel { module, name } => {
-					self.route_module_symbol(module, name, false)
+					let target_name = self.route_module_symbol(module, name, false);
+					let args = std::iter::once(self.ident(receiver_param))
+						.chain(hidden_params.iter().map(|name| self.ident(name)))
+						.collect();
+					if let Some((resume_state, result_slot)) = continuation {
+						self.activation_packet(
+							self.ident(self.ast.allocator.alloc_str(&target_name)),
+							Expression::new_identifier(SPAN, "undefined", &self.ast),
+							args,
+							mode,
+							source,
+							resume_state,
+							result_slot,
+						)
+					} else {
+						self.emit_target_activation(
+							self.ident(self.ast.allocator.alloc_str(&target_name)),
+							args,
+							mode,
+							source,
+						)
+					}
 				}
-				HirBoundDispatchTarget::Extern { module, symbol } => {
-					self.route_module_symbol(module, symbol, true)
+				HirBoundDispatchTarget::Extern {
+					module,
+					symbol,
+					call_mode,
+				} => {
+					let target_name = self.route_module_symbol(module, symbol, true);
+					let values = std::iter::once(self.ident(receiver_param))
+						.chain(hidden_params.iter().map(|name| self.ident(name)))
+						.collect::<Vec<_>>();
+					let mut args = ArenaVec::new_in(&self.ast);
+					args.extend(values.into_iter().map(Argument::from));
+					if *call_mode == nymph_hir::hir::ExternalCallMode::Cancellable {
+						args.push(Argument::from(
+							self.runtime_call("nymphCurrentExecutionSignal", vec![]),
+						));
+					}
+					let call = Expression::new_call_expression(
+						SPAN,
+						self.ident(self.ast.allocator.alloc_str(&target_name)),
+						oxc::ast::NONE,
+						args,
+						false,
+						&self.ast,
+					);
+					self.activation_direct_result(call, mode, continuation)
 				}
 			};
-			let target = self.ident(self.ast.allocator.alloc_str(&target_name));
-			let mut args = ArenaVec::new_in(&self.ast);
-			args.push(Argument::from(self.ident(receiver_param)));
-			for name in &hidden_params {
-				args.push(Argument::from(self.ident(name)));
-			}
-			let dispatched =
-				Expression::new_call_expression(SPAN, target, oxc::ast::NONE, args, false, &self.ast);
 			body = Expression::new_conditional_expression(SPAN, test, dispatched, body, &self.ast);
 		}
 		for (name, argument) in hidden_params.iter().zip(hidden_arguments).rev() {
 			body = self.arrow_iife(name, body, self.emit_expr(argument));
 		}
 		self.arrow_iife(receiver_param, body, self.emit_expr(receiver))
+	}
+
+	fn emit_bound_dispatch_state(
+		&self,
+		method: &str,
+		receiver: &HirExpr,
+		argument: &HirExpr,
+		hidden_arguments: &[HirExpr],
+		cases: &[HirBoundDispatchCase],
+		mode: HirCallMode,
+		source: u32,
+		resume_state: u32,
+		result_slot: usize,
+	) -> Expression<'a> {
+		let receiver = self.emit_expr(receiver);
+		let argument = self.emit_expr(argument);
+		let hidden = hidden_arguments
+			.iter()
+			.map(|argument| self.emit_expr(argument))
+			.collect::<Vec<_>>();
+		let fallback_args = std::iter::once(argument.clone_in(self.ast.allocator))
+			.chain(
+				hidden
+					.iter()
+					.map(|value| value.clone_in(self.ast.allocator)),
+			)
+			.collect();
+		let mut body = self.activation_member_packet(
+			receiver.clone_in(self.ast.allocator),
+			method,
+			fallback_args,
+			mode,
+			source,
+			resume_state,
+			result_slot,
+		);
+		for case in cases.iter().rev() {
+			let receiver_matches = self.strict_eq(
+				self.tag_read(receiver.clone_in(self.ast.allocator), true),
+				self.global_symbol(&case.receiver_tag),
+			);
+			let argument_matches = self.strict_eq(
+				self.tag_read(argument.clone_in(self.ast.allocator), true),
+				self.global_symbol(&case.argument_tag),
+			);
+			let test = Expression::new_logical_expression(
+				SPAN,
+				receiver_matches,
+				LogicalOperator::And,
+				argument_matches,
+				&self.ast,
+			);
+			let values = std::iter::once(receiver.clone_in(self.ast.allocator))
+				.chain(std::iter::once(argument.clone_in(self.ast.allocator)))
+				.chain(
+					hidden
+						.iter()
+						.map(|value| value.clone_in(self.ast.allocator)),
+				)
+				.collect::<Vec<_>>();
+			let dispatched = match &case.target {
+				HirBoundDispatchTarget::TopLevel { module, name } => {
+					let target_name = self.route_module_symbol(module, name, false);
+					self.activation_packet(
+						self.ident(self.ast.allocator.alloc_str(&target_name)),
+						Expression::new_identifier(SPAN, "undefined", &self.ast),
+						values,
+						mode,
+						source,
+						resume_state,
+						result_slot,
+					)
+				}
+				HirBoundDispatchTarget::Extern {
+					module,
+					symbol,
+					call_mode,
+				} => {
+					let target_name = self.route_module_symbol(module, symbol, true);
+					let mut args = ArenaVec::new_in(&self.ast);
+					args.extend(values.into_iter().map(Argument::from));
+					if *call_mode == nymph_hir::hir::ExternalCallMode::Cancellable {
+						args.push(Argument::from(
+							self.runtime_call("nymphCurrentExecutionSignal", vec![]),
+						));
+					}
+					let call = Expression::new_call_expression(
+						SPAN,
+						self.ident(self.ast.allocator.alloc_str(&target_name)),
+						oxc::ast::NONE,
+						args,
+						false,
+						&self.ast,
+					);
+					self.activation_direct_result(call, mode, Some((resume_state, result_slot)))
+				}
+			};
+			body = Expression::new_conditional_expression(SPAN, test, dispatched, body, &self.ast);
+		}
+		body
+	}
+
+	fn emit_unary_bound_dispatch_state(
+		&self,
+		method: &str,
+		receiver: &HirExpr,
+		hidden_arguments: &[HirExpr],
+		cases: &[HirBoundDispatchCase],
+		mode: HirCallMode,
+		source: u32,
+		resume_state: u32,
+		result_slot: usize,
+	) -> Expression<'a> {
+		let receiver = self.emit_expr(receiver);
+		let hidden = hidden_arguments
+			.iter()
+			.map(|argument| self.emit_expr(argument))
+			.collect::<Vec<_>>();
+		let mut body = self.activation_member_packet(
+			receiver.clone_in(self.ast.allocator),
+			method,
+			hidden
+				.iter()
+				.map(|value| value.clone_in(self.ast.allocator))
+				.collect(),
+			mode,
+			source,
+			resume_state,
+			result_slot,
+		);
+		for case in cases.iter().rev() {
+			let test = self.strict_eq(
+				self.tag_read(receiver.clone_in(self.ast.allocator), true),
+				self.global_symbol(&case.receiver_tag),
+			);
+			let values = std::iter::once(receiver.clone_in(self.ast.allocator))
+				.chain(
+					hidden
+						.iter()
+						.map(|value| value.clone_in(self.ast.allocator)),
+				)
+				.collect::<Vec<_>>();
+			let dispatched = match &case.target {
+				HirBoundDispatchTarget::TopLevel { module, name } => {
+					let target_name = self.route_module_symbol(module, name, false);
+					self.activation_packet(
+						self.ident(self.ast.allocator.alloc_str(&target_name)),
+						Expression::new_identifier(SPAN, "undefined", &self.ast),
+						values,
+						mode,
+						source,
+						resume_state,
+						result_slot,
+					)
+				}
+				HirBoundDispatchTarget::Extern {
+					module,
+					symbol,
+					call_mode,
+				} => {
+					let target_name = self.route_module_symbol(module, symbol, true);
+					let mut args = ArenaVec::new_in(&self.ast);
+					args.extend(values.into_iter().map(Argument::from));
+					if *call_mode == nymph_hir::hir::ExternalCallMode::Cancellable {
+						args.push(Argument::from(
+							self.runtime_call("nymphCurrentExecutionSignal", vec![]),
+						));
+					}
+					let call = Expression::new_call_expression(
+						SPAN,
+						self.ident(self.ast.allocator.alloc_str(&target_name)),
+						oxc::ast::NONE,
+						args,
+						false,
+						&self.ast,
+					);
+					self.activation_direct_result(call, mode, Some((resume_state, result_slot)))
+				}
+			};
+			body = Expression::new_conditional_expression(SPAN, test, dispatched, body, &self.ast);
+		}
+		body
+	}
+
+	fn activation_direct_result(
+		&self,
+		value: Expression<'a>,
+		mode: HirCallMode,
+		continuation: Option<(u32, usize)>,
+	) -> Expression<'a> {
+		let Some((resume_state, result_slot)) = continuation else {
+			return value;
+		};
+		if mode == HirCallMode::Tail {
+			return self.runtime_call("nymphReturn", vec![value]);
+		}
+		self.runtime_call(
+			"nymphResume",
+			vec![
+				value,
+				self.activation_state_number(resume_state),
+				Expression::new_numeric_literal(
+					SPAN,
+					result_slot as f64,
+					None,
+					NumberBase::Decimal,
+					&self.ast,
+				),
+			],
+		)
 	}
 
 	fn route_module_symbol(&self, module: &str, symbol: &str, external: bool) -> String {
@@ -1588,63 +4371,6 @@ impl<'a> Emitter<'a> {
 			.borrow_mut()
 			.insert((import_module, symbol.to_string(), local.clone()));
 		local
-	}
-
-	/// The saturating JS runtime mapping for a numeric `ScalarCast`: Nymph defines
-	/// its own float→int/uint semantics rather than inheriting JS's (`Math.trunc`
-	/// passes `NaN`/`±Infinity` straight through) or Rust's (`as` saturates, but
-	/// isn't reproducible on JS numbers as-is). Builds an `arrow_iife` around
-	/// `operand` — evaluating it exactly once — with `t` (a gensym) standing in
-	/// for it in the body:
-	///
-	/// * `unsigned == false` (`float as int`): `Number.isNaN(t) ? 0 : t ===
-	///   Infinity ? i64::MAX : t === -Infinity ? i64::MIN : Math.trunc(t)`.
-	/// * `unsigned == true` (`float as uint` / `int as uint`): `t` is
-	///   `Math.abs`-ed first, so `-Infinity` collapses onto the same `Infinity`
-	///   branch as `+Infinity`, and a negative finite value (or a negative `int`)
-	///   saturates to its absolute value: `Number.isNaN(a) ? 0 : a === Infinity ?
-	///   i64::MAX : Math.trunc(a)` where `a = Math.abs(t)`.
-	fn saturating_scalar_cast(&self, operand: Expression<'a>, unsigned: bool) -> Expression<'a> {
-		let param = self.gensym();
-		let param = self.ast.allocator.alloc_str(&param);
-		let max = self.i64_literal(i64::MAX);
-
-		let body = if unsigned {
-			let is_nan = self.number_is_nan(self.math_call("abs", self.ident(param)));
-			let is_inf = self.strict_eq(
-				self.math_call("abs", self.ident(param)),
-				self.ident("Infinity"),
-			);
-			let trunc = self.math_call("trunc", self.math_call("abs", self.ident(param)));
-			Expression::new_conditional_expression(
-				SPAN,
-				is_nan,
-				self.zero(),
-				Expression::new_conditional_expression(SPAN, is_inf, max, trunc, &self.ast),
-				&self.ast,
-			)
-		} else {
-			let is_nan = self.number_is_nan(self.ident(param));
-			let is_pos_inf = self.strict_eq(self.ident(param), self.ident("Infinity"));
-			let is_neg_inf = self.strict_eq(self.ident(param), self.neg_infinity());
-			let min = self.i64_literal(i64::MIN);
-			let trunc = self.math_call("trunc", self.ident(param));
-			Expression::new_conditional_expression(
-				SPAN,
-				is_nan,
-				self.zero(),
-				Expression::new_conditional_expression(
-					SPAN,
-					is_pos_inf,
-					max,
-					Expression::new_conditional_expression(SPAN, is_neg_inf, min, trunc, &self.ast),
-					&self.ast,
-				),
-				&self.ast,
-			)
-		};
-
-		self.arrow_iife(param, body, operand)
 	}
 
 	fn numeric_to_char(&self, operand: Expression<'a>, truncate: bool) -> Expression<'a> {
@@ -1710,21 +4436,83 @@ impl<'a> Emitter<'a> {
 		self.arrow_iife(param, body, operand)
 	}
 
+	fn emit_echo_site(&self, site: &nymph_hir::hir::EchoSite) -> Expression<'a> {
+		let EchoEmission::Development {
+			source_name,
+			source_uri,
+			source,
+		} = &self.echo_emission
+		else {
+			unreachable!("release echo sites are erased before site emission")
+		};
+		let mut offset = usize::try_from(site.start)
+			.unwrap_or(usize::MAX)
+			.min(source.len());
+		while !source.is_char_boundary(offset) {
+			offset -= 1;
+		}
+		let prefix = &source[..offset];
+		let line = prefix.bytes().filter(|byte| *byte == b'\n').count() + 1;
+		let column = prefix
+			.rsplit_once('\n')
+			.map_or(prefix, |(_, tail)| tail)
+			.chars()
+			.count()
+			+ 1;
+		let file = source_name
+			.rsplit(['/', '\\'])
+			.next()
+			.filter(|name| !name.is_empty())
+			.unwrap_or(source_name);
+		let mut properties = ArenaVec::new_in(&self.ast);
+		let mut property = |name: &'a str, value: Expression<'a>| {
+			properties.push(ObjectPropertyKind::ObjectProperty(ObjectProperty::boxed(
+				SPAN,
+				PropertyKind::Init,
+				PropertyKey::new_static_identifier(SPAN, name, &self.ast),
+				value,
+				false,
+				false,
+				false,
+				&self.ast,
+			)));
+		};
+		property(
+			"file",
+			Expression::new_string_literal(SPAN, self.ast.allocator.alloc_str(file), None, &self.ast),
+		);
+		property(
+			"line",
+			Expression::new_numeric_literal(SPAN, line as f64, None, NumberBase::Decimal, &self.ast),
+		);
+		property(
+			"column",
+			Expression::new_numeric_literal(SPAN, column as f64, None, NumberBase::Decimal, &self.ast),
+		);
+		property(
+			"uri",
+			source_uri.as_ref().map_or_else(
+				|| Expression::new_null_literal(SPAN, &self.ast),
+				|uri| {
+					Expression::new_string_literal(SPAN, self.ast.allocator.alloc_str(uri), None, &self.ast)
+				},
+			),
+		);
+		Expression::new_object_expression(SPAN, properties, &self.ast)
+	}
+
 	fn emit_expr(&self, expr: &HirExpr) -> Expression<'a> {
 		match expr {
-			// A numeric literal → a boxed `new NInt/NUint/NFloat(<raw>)`, with the
-			// box class chosen from the checker-threaded
-			// `NumKind`. `NumKind::Raw` is compiler-internal scaffolding (loop
-			// counters/indices doing native JS arithmetic) and stays an unboxed bare
-			// numeric literal — see `NumKind::Raw`'s own doc comment.
+			// Exact integers are BigInt payloads. `NumKind::Raw` is compiler-internal
+			// scaffolding and stays an unboxed Number; floats are boxed Numbers.
+			HirExpr::Int(value) => self.new_box("NInt", self.bigint_literal(value)),
+			HirExpr::UInt(value) => self.new_box("NUint", self.bigint_literal(value)),
 			HirExpr::Num(value, kind) => {
 				let raw =
 					Expression::new_numeric_literal(SPAN, *value, None, NumberBase::Decimal, &self.ast);
 				match kind {
 					NumKind::Raw => raw,
-					NumKind::Int | NumKind::UInt | NumKind::Float => {
-						self.new_box(box_rt::num_box_class(*kind), raw)
-					}
+					NumKind::Float => self.new_box(box_rt::num_box_class(*kind), raw),
 				}
 			}
 			// String/char/bool literals have an unambiguous box type.
@@ -1757,6 +4545,13 @@ impl<'a> Emitter<'a> {
 				});
 				self.new_box("NString", raw)
 			}
+			HirExpr::ProtocolDisplay(value) => {
+				self
+					.box_runtime_bindings
+					.borrow_mut()
+					.insert("nymphProtocolDisplay".to_string());
+				self.runtime_call("nymphProtocolDisplay", vec![self.emit_expr(value)])
+			}
 			HirExpr::Bool(b) => {
 				let raw = Expression::new_boolean_literal(SPAN, *b, &self.ast);
 				self.new_box("NBool", raw)
@@ -1774,6 +4569,27 @@ impl<'a> Emitter<'a> {
 				&self.ast,
 			),
 			HirExpr::Local(name) => self.local_read(name),
+			HirExpr::Echo { operand, site } => {
+				if matches!(self.echo_emission, EchoEmission::Release) {
+					self.emit_expr(operand)
+				} else {
+					self
+						.box_runtime_bindings
+						.borrow_mut()
+						.insert("nymphEcho".to_string());
+					let mut arguments = ArenaVec::new_in(&self.ast);
+					arguments.push(Argument::from(self.emit_expr(operand)));
+					arguments.push(Argument::from(self.emit_echo_site(site)));
+					Expression::new_call_expression(
+						SPAN,
+						Expression::new_identifier(SPAN, "nymphEcho", &self.ast),
+						oxc::ast::NONE,
+						arguments,
+						false,
+						&self.ast,
+					)
+				}
+			}
 			HirExpr::RuntimeTypeObject {
 				binding,
 				box_runtime,
@@ -1885,17 +4701,19 @@ impl<'a> Emitter<'a> {
 			HirExpr::Binary {
 				op,
 				result,
+				mode,
 				lhs,
 				rhs,
 			} => {
 				let left = self.emit_expr(lhs);
 				let right = self.emit_expr(rhs);
-				self.emit_binary(*op, *result, left, right)
+				self.emit_binary(*op, *result, *mode, left, right)
 			}
 			// `!x` reads the raw boolean payload, negates it, and re-boxes:
 			// `new NBool(!x.v)` — `!box` is always `false` (a box is truthy), so the
 			// native operator can't run on the box (uniform value boxing, ADR-0002).
-			// `Neg`/`BitNot` use bare native unary operators over the operand.
+			// `Neg`/`BitNot` are arithmetic (still broken until slice #10a) and stay
+			// as bare native unary ops over the operand.
 			HirExpr::Unary {
 				op: UnOp::Not,
 				operand,
@@ -1933,7 +4751,69 @@ impl<'a> Emitter<'a> {
 				}
 				Expression::new_call_expression(SPAN, callee, oxc::ast::NONE, arguments, false, &self.ast)
 			}
-			// A call resolved through the linkage registry —
+			HirExpr::ActivationCall {
+				callee,
+				args,
+				mode,
+				source,
+			} => self.emit_activation_call(callee, args, *mode, *source),
+			HirExpr::TaskRecipe { body, context } => {
+				let callable = self.activation_callable(&[], body, true);
+				let nested = Expression::new_boolean_literal(
+					SPAN,
+					*context == nymph_hir::hir::HirTaskContext::Nested,
+					&self.ast,
+				);
+				self.runtime_call("nymphTaskRecipe", vec![callable, nested])
+			}
+			HirExpr::TaskOperation {
+				operation,
+				operands,
+			} => self.emit_task_operation(*operation, operands),
+			HirExpr::StaticEnumDispatch {
+				owner,
+				method,
+				receiver,
+				args,
+				mode,
+				source,
+			} => {
+				let prototype = Expression::new_static_member_expression(
+					SPAN,
+					self.local_read(owner),
+					IdentifierName::new(SPAN, "$nymph$type", &self.ast),
+					false,
+					&self.ast,
+				);
+				let method = Expression::new_static_member_expression(
+					SPAN,
+					prototype,
+					IdentifierName::new(SPAN, self.ast.allocator.alloc_str(method), &self.ast),
+					false,
+					&self.ast,
+				);
+				let mut elements = ArenaVec::new_in(&self.ast);
+				for argument in args {
+					elements.push(ArrayExpressionElement::from(self.emit_expr(argument)));
+				}
+				let arguments = Expression::new_array_expression(SPAN, elements, &self.ast);
+				let source = Expression::new_numeric_literal(
+					SPAN,
+					f64::from(*source),
+					None,
+					NumberBase::Decimal,
+					&self.ast,
+				);
+				self.runtime_call(
+					if *mode == nymph_hir::hir::HirCallMode::Tail {
+						"nymphTailCall"
+					} else {
+						"nymphActivate"
+					},
+					vec![method, self.emit_expr(receiver), arguments, source],
+				)
+			}
+			// Gap 3 (L0/L1): a call resolved through the linkage registry —
 			// `module`/`symbol` are already the resolved `Linked` fields
 			// (lowering did the receiver-tag-disambiguated lookup; see
 			// `HirExpr::ExternCall`'s own doc comment for why emit never
@@ -1945,31 +4825,69 @@ impl<'a> Emitter<'a> {
 				module,
 				symbol,
 				args,
+				call_mode,
+				argument_marshals,
+				return_marshal,
 			} => {
-				let callee_name = if *module == "std/display" {
-					let name = match *symbol {
-						"display" => "nymphProtocolDisplay".to_string(),
-						"debug" => "nymphProtocolDebug".to_string(),
-						_ => unreachable!("unknown display protocol intrinsic `{symbol}`"),
-					};
-					self.box_runtime_bindings.borrow_mut().insert(name.clone());
-					name
-				} else {
-					self.route_module_symbol(module, symbol, true)
-				};
+				let callee_name = self.route_module_symbol(module, symbol, true);
 				let callee =
 					Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(&callee_name), &self.ast);
 				let mut arguments = ArenaVec::new_in(&self.ast);
-				for arg in args {
-					arguments.push(Argument::from(self.emit_expr(arg)));
+				for (arg, marshal) in args.iter().zip(argument_marshals) {
+					let argument = self.emit_expr(arg);
+					let argument = match marshal {
+						Some(nymph_hir::hir::MarshalKind::Int | nymph_hir::hir::MarshalKind::UInt) => {
+							self.unwrap_v(argument)
+						}
+						Some(nymph_hir::hir::MarshalKind::Opaque(identity)) => {
+							let identity = self.bigint_literal(identity);
+							self.runtime_call("nymphUnboxOpaque", vec![identity, argument])
+						}
+						_ => argument,
+					};
+					arguments.push(Argument::from(argument));
 				}
-				Expression::new_call_expression(SPAN, callee, oxc::ast::NONE, arguments, false, &self.ast)
+				if *call_mode == nymph_hir::hir::ExternalCallMode::Cancellable {
+					arguments.push(Argument::from(
+						self.runtime_call("nymphCurrentExecutionSignal", vec![]),
+					));
+				}
+				let call = Expression::new_call_expression(
+					SPAN,
+					callee,
+					oxc::ast::NONE,
+					arguments,
+					false,
+					&self.ast,
+				);
+				match return_marshal {
+					Some(nymph_hir::hir::MarshalKind::Int) => {
+						let checked = self.runtime_call("nymphTrustedInt", vec![call]);
+						self.new_box("NInt", checked)
+					}
+					Some(nymph_hir::hir::MarshalKind::UInt) => {
+						let checked = self.runtime_call("nymphTrustedUInt", vec![call]);
+						self.new_box("NUint", checked)
+					}
+					Some(nymph_hir::hir::MarshalKind::Opaque(identity)) => {
+						let identity = self.bigint_literal(identity);
+						self.runtime_call("nymphBoxOpaque", vec![identity, call])
+					}
+					_ => call,
+				}
 			}
 			HirExpr::ExternValue {
 				module,
 				symbol,
 				marshal,
 			} => {
+				if let Some(step) = activation_protocol_step(module, symbol) {
+					self
+						.box_runtime_bindings
+						.borrow_mut()
+						.insert(step.to_string());
+					return Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(step), &self.ast);
+				}
 				let local = external_alias(module, symbol, "value$");
 				self.needed_imports.borrow_mut().insert((
 					module.to_string(),
@@ -1977,6 +4895,15 @@ impl<'a> Emitter<'a> {
 					local.clone(),
 				));
 				let raw = Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(&local), &self.ast);
+				let raw = match marshal {
+					nymph_hir::hir::MarshalKind::Int => self.runtime_call("nymphTrustedInt", vec![raw]),
+					nymph_hir::hir::MarshalKind::UInt => self.runtime_call("nymphTrustedUInt", vec![raw]),
+					nymph_hir::hir::MarshalKind::Opaque(identity) => {
+						let identity = self.bigint_literal(identity);
+						return self.runtime_call("nymphBoxOpaque", vec![identity, raw]);
+					}
+					_ => raw,
+				};
 				let class = match marshal {
 					nymph_hir::hir::MarshalKind::Int => "NInt",
 					nymph_hir::hir::MarshalKind::UInt => "NUint",
@@ -1987,6 +4914,7 @@ impl<'a> Emitter<'a> {
 					nymph_hir::hir::MarshalKind::List => "NList",
 					nymph_hir::hir::MarshalKind::Tuple => "NTuple",
 					nymph_hir::hir::MarshalKind::Map => "NMap",
+					nymph_hir::hir::MarshalKind::Opaque(_) => unreachable!(),
 				};
 				self.new_box(class, raw)
 			}
@@ -1996,15 +4924,82 @@ impl<'a> Emitter<'a> {
 				argument,
 				hidden_arguments,
 				cases,
+				mode,
+				source,
 				..
-			} => self.emit_bound_dispatch(method, receiver, argument, hidden_arguments, cases),
+			} => self.emit_bound_dispatch(
+				method,
+				receiver,
+				argument,
+				hidden_arguments,
+				cases,
+				*mode,
+				*source,
+				None,
+			),
 			HirExpr::UnaryBoundDispatch {
 				method,
 				receiver,
 				hidden_arguments,
 				cases,
+				mode,
+				source,
 				..
-			} => self.emit_unary_bound_dispatch(method, receiver, hidden_arguments, cases),
+			} => self.emit_unary_bound_dispatch(
+				method,
+				receiver,
+				hidden_arguments,
+				cases,
+				*mode,
+				*source,
+				None,
+			),
+			HirExpr::ListConstruct(elems) => {
+				let mut items = ArenaVec::new_in(&self.ast);
+				for elem in elems {
+					match elem {
+						HirArrayElem::Item(value) => {
+							items.push(ArrayExpressionElement::from(self.emit_expr(value)));
+						}
+						HirArrayElem::Spread(value) => {
+							items.push(ArrayExpressionElement::new_spread_element(
+								SPAN,
+								self.emit_expr(value),
+								&self.ast,
+							));
+						}
+					}
+				}
+				let array = Expression::new_array_expression(SPAN, items, &self.ast);
+				self.new_box("NList", array)
+			}
+			HirExpr::ListRead { recv, index, mode } => {
+				let object = self.emit_expr(recv);
+				let key = self.emit_expr(index);
+				let method = if *mode == OperationMode::Direct {
+					"indexDirect"
+				} else {
+					"index"
+				};
+				self.member_call(object, method, vec![key])
+			}
+			HirExpr::ListAppend { recv, value } => {
+				let object = self.emit_expr(recv);
+				let value = self.emit_expr(value);
+				self.member_call(object, "appended", vec![value])
+			}
+			HirExpr::ListReplace { recv, index, value } => {
+				let object = self.emit_expr(recv);
+				let index = self.emit_expr(index);
+				let value = self.emit_expr(value);
+				self.member_call(object, "replaced", vec![index, value])
+			}
+			HirExpr::ListSlice { recv, start, end } => {
+				let object = self.emit_expr(recv);
+				let start = self.emit_expr(start);
+				let end = self.emit_expr(end);
+				self.member_call(object, "slice", vec![start, end])
+			}
 			// Collection literals own a native array payload; compiler-internal
 			// accumulators remain raw arrays.
 			HirExpr::Array { kind, items } => {
@@ -2019,7 +5014,7 @@ impl<'a> Emitter<'a> {
 					HirArrayKind::Raw => array,
 				}
 			}
-			// A list literal with at least one spread element → a JS array
+			// A list literal with at least one spread element (SS1) → a JS array
 			// `[a, ...xs, b]`, preserving left-to-right source order. Each
 			// `HirArrayElem::Spread` payload is already a JS-array-valued
 			// expression (a native source or a `lower_spread_source` drain IIFE),
@@ -2057,10 +5052,10 @@ impl<'a> Emitter<'a> {
 				let outer = Expression::new_array_expression(SPAN, entries, &self.ast);
 				self.new_box("NMap", outer)
 			}
-			// A map literal with at least one spread entry → `new NMap([...])`
+			// A map literal with at least one spread entry (SS1) → `new NMap([...])`
 			// merging the spread entries in, left-to-right (a later duplicate key
 			// wins — the `Map` constructor processes its entries array in order,
-			// source order). Each `HirMapElem::Spread` payload is already an array of
+			// SS4). Each `HirMapElem::Spread` payload is already an array of
 			// `[k, v]` pairs (an `NMap` iterates as `[k, v]` pairs, or a
 			// `lower_spread_source` drain IIFE), so it always emits with JS spread
 			// syntax inside the entries array.
@@ -2086,14 +5081,59 @@ impl<'a> Emitter<'a> {
 				let outer = Expression::new_array_expression(SPAN, entries, &self.ast);
 				self.new_box("NMap", outer)
 			}
-			// A list/tuple subscript dispatches through its boxed wrapper.
-			HirExpr::Index { recv, index } => {
+			// A collection subscript dispatches through its boxed wrapper.
+			HirExpr::Index { recv, index, mode } => {
 				let object = self.emit_expr(recv);
 				let key = self.emit_expr(index);
-				self.member_call(object, "index", vec![key])
+				self.member_call(
+					object,
+					if *mode == OperationMode::Direct {
+						"indexDirect"
+					} else {
+						"index"
+					},
+					vec![key],
+				)
+			}
+			HirExpr::Slice {
+				recv,
+				start,
+				end,
+				inclusive,
+				string,
+				mode,
+			} => {
+				let recv = self.emit_expr(recv);
+				let start = start.as_ref().map_or_else(
+					|| Expression::new_null_literal(SPAN, &self.ast),
+					|value| self.unwrap_v(self.emit_expr(value)),
+				);
+				let end = end.as_ref().map_or_else(
+					|| Expression::new_null_literal(SPAN, &self.ast),
+					|value| self.unwrap_v(self.emit_expr(value)),
+				);
+				self.runtime_call(
+					if *string {
+						"nymphStringSlice"
+					} else {
+						"nymphListSlice"
+					},
+					vec![
+						recv,
+						start,
+						end,
+						Expression::new_boolean_literal(SPAN, *inclusive, &self.ast),
+						Expression::new_boolean_literal(SPAN, *mode == OperationMode::Checked, &self.ast),
+					],
+				)
 			}
 			// Struct construction → `new <class>({ field: value, … })`.
 			HirExpr::New {
+				class,
+				fields,
+				prototype,
+			}
+			| HirExpr::StructFresh {
 				class,
 				fields,
 				prototype,
@@ -2125,6 +5165,42 @@ impl<'a> Emitter<'a> {
 					Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(class), &self.ast);
 				let mut args = ArenaVec::new_in(&self.ast);
 				args.push(Argument::from(obj));
+				let value = Expression::new_new_expression(SPAN, callee, oxc::ast::NONE, args, &self.ast);
+				if let Some(prototype) = prototype {
+					self.set_prototype(value, self.emit_expr(prototype))
+				} else {
+					value
+				}
+			}
+			HirExpr::StructCloneUpdate {
+				class,
+				source,
+				replacements,
+				prototype,
+			} => {
+				let mut props = ArenaVec::new_in(&self.ast);
+				props.push(ObjectPropertyKind::new_spread_property(
+					SPAN,
+					self.emit_expr(source),
+					&self.ast,
+				));
+				for (name, value) in replacements {
+					props.push(ObjectPropertyKind::ObjectProperty(ObjectProperty::boxed(
+						SPAN,
+						PropertyKind::Init,
+						PropertyKey::new_static_identifier(SPAN, self.ast.allocator.alloc_str(name), &self.ast),
+						self.emit_expr(value),
+						false,
+						false,
+						false,
+						&self.ast,
+					)));
+				}
+				let object = Expression::new_object_expression(SPAN, props, &self.ast);
+				let callee =
+					Expression::new_identifier(SPAN, self.ast.allocator.alloc_str(class), &self.ast);
+				let mut args = ArenaVec::new_in(&self.ast);
+				args.push(Argument::from(object));
 				let value = Expression::new_new_expression(SPAN, callee, oxc::ast::NONE, args, &self.ast);
 				if let Some(prototype) = prototype {
 					self.set_prototype(value, self.emit_expr(prototype))
@@ -2202,68 +5278,17 @@ impl<'a> Emitter<'a> {
 			}
 			// A map lookup → `recv.get(key)`.
 			HirExpr::MapGet { recv, key } => {
-				self.member_call(self.emit_expr(recv), "get", vec![self.emit_expr(key)])
-			}
-			HirExpr::Assign { target, value } => {
-				if let HirExpr::Index { recv, index } = target.as_ref() {
-					let object = self.emit_expr(recv);
-					let key = self.emit_expr(index);
-					let value = self.emit_expr(value);
-					return self.member_call(object, "setIndex", vec![key, value]);
-				}
-				if let Some(transactional) = self.transactional_assignment(target, value) {
-					return transactional;
-				}
-				let value_expr = self.emit_expr(value);
-				// A `Map` target has no JS assignment-expression form at all — `m[k] =
-				// v` on a real `Map` would silently set an own property on the `Map`
-				// object rather than mutating its entries — so it lowers to a
-				// `.set(key, value)` call instead of an `AssignmentTarget` (confirmed
-				// reachable: `infer_assign`'s field/index arm, infer_expr.rs, accepts
-				// any place expression including `IndexAccess` with no restriction,
-				// and a `Map`-typed receiver's `IndexAccess` lowers to
-				// `HirExpr::MapGet` just like a read, so `m[k] = v`
-				// reaches here as `Assign { target: MapGet { .. }, .. }` from a
-				// zero-diagnostic program).
-				if let HirExpr::MapGet { recv, key } = target.as_ref() {
-					let object = self.emit_expr(recv);
-					let key_expr = self.emit_expr(key);
-					return self.member_call(object, "set", vec![key_expr, value_expr]);
-				}
-				// A plain `this.field = value` assignment (a
-				// `mut func` — or, per the checker's own permissiveness, ANY
-				// method's — field mutation) lowers to `HirExpr::Assign { target:
-				// Field { .. }, .. }` and reaches here from a zero-diagnostic
-				// program (the checker imposes no mutability restriction beyond
-				// an ordinary field-assignment target, confirmed by probe). A
-				// member-expression target needs its own `AssignmentTarget`
-				// (`SimpleAssignmentTarget` inherits `MemberExpression`), not the
-				// identifier-only path `HirExpr::Local` uses.
-				//
-				let assignment_target = match target.as_ref() {
-					HirExpr::Local(n) => self.assign_target(self.ast.allocator.alloc_str(n)),
-					HirExpr::Field { recv, name } => {
-						let object = self.emit_expr(recv);
-						let member = StaticMemberExpression::boxed(
-							SPAN,
-							object,
-							IdentifierName::new(SPAN, self.ast.allocator.alloc_str(name), &self.ast),
-							false,
-							&self.ast,
-						);
-						AssignmentTarget::from(MemberExpression::StaticMemberExpression(member))
-					}
-					other => unreachable!(
-						"lowering never produces an assignment target other than a local, a field access, a list/tuple subscript, or a map index (got {other:?})"
-					),
-				};
-				Expression::new_assignment_expression(
+				let object = self.emit_expr(recv);
+				let member = Expression::new_static_member_expression(
 					SPAN,
-					AssignmentOperator::Assign,
-					assignment_target,
-					value_expr,
+					object,
+					IdentifierName::new(SPAN, "get", &self.ast),
+					false,
 					&self.ast,
-				)
+				);
+				let mut args = ArenaVec::new_in(&self.ast);
+				args.push(Argument::from(self.emit_expr(key)));
+				Expression::new_call_expression(SPAN, member, oxc::ast::NONE, args, false, &self.ast)
 			}
 			HirExpr::Break { target, value } => {
 				let token = self
@@ -2325,36 +5350,63 @@ impl<'a> Emitter<'a> {
 			// arm can recurse (a match arm's own body can itself be a
 			// subexpression-position `if`), and a bare set would leave the flag
 			// stuck true once the outer call returns to a statement-position
-			// caller.
+			// caller (Slice 4E, Y1).
 			HirExpr::Block { .. }
 			| HirExpr::If { .. }
-			| HirExpr::While { .. }
+			| HirExpr::StateLoop { .. }
+			| HirExpr::ContinueTransition { .. }
+			| HirExpr::For { .. }
 			| HirExpr::Match { .. } => {
 				let prev = self.in_iife_subexpr.replace(true);
 				let result = self.emit_value(expr).into_expression(self.ast);
 				self.in_iife_subexpr.set(prev);
 				result
 			}
-			// A built-in `as` cast's JS runtime mapping — see
-			// `HirExpr::ScalarCast`'s doc comment for
-			// why these are dedicated calls rather than composed `Field`/`Call`
-			// nodes over a `Local("Math"/"String"/"Number")` (shadow-proofing a user
-			// local of that name).
-			HirExpr::ScalarCast { kind, operand } => {
+			// Dedicated scalar-cast nodes keep generated runtime calls from being
+			// shadowed by user bindings.
+			HirExpr::ScalarCast {
+				kind,
+				operand,
+				mode,
+			} => {
 				let operand = self.unwrap_v(self.emit_expr(operand));
 				match kind {
-					ScalarCastKind::IdentityInt | ScalarCastKind::ToInt => self.new_box("NInt", operand),
-					ScalarCastKind::IdentityUInt => self.new_box("NUint", operand),
-					ScalarCastKind::IdentityFloat | ScalarCastKind::ToFloat => {
-						self.new_box("NFloat", operand)
+					ScalarCastKind::IdentityInt | ScalarCastKind::ToInt if *mode == OperationMode::Direct => {
+						self.direct_integer_box("NInt", operand)
 					}
+					ScalarCastKind::IdentityInt | ScalarCastKind::ToInt => self.new_box("NInt", operand),
+					ScalarCastKind::IdentityUInt | ScalarCastKind::IntToUInt
+						if *mode == OperationMode::Direct =>
+					{
+						self.direct_integer_box("NUint", operand)
+					}
+					ScalarCastKind::IdentityUInt | ScalarCastKind::IntToUInt => {
+						self.new_box("NUint", operand)
+					}
+					ScalarCastKind::IdentityFloat => self.new_box("NFloat", operand),
+					ScalarCastKind::ToFloat => self.new_box(
+						"NFloat",
+						self.runtime_call("nymphIntegerToFloat", vec![operand]),
+					),
 					ScalarCastKind::IdentityChar => self.new_box("NChar", operand),
-					ScalarCastKind::SaturatingToInt => {
-						let raw = self.saturating_scalar_cast(operand, false);
+					ScalarCastKind::CheckedToInt => {
+						let raw = self.runtime_call(
+							"nymphFloatToInteger",
+							vec![
+								operand,
+								Expression::new_boolean_literal(SPAN, false, &self.ast),
+							],
+						);
 						self.new_box("NInt", raw)
 					}
-					ScalarCastKind::SaturatingToUInt => {
-						let raw = self.saturating_scalar_cast(operand, true);
+					ScalarCastKind::CheckedToUInt => {
+						let raw = self.runtime_call(
+							"nymphFloatToInteger",
+							vec![
+								operand,
+								Expression::new_boolean_literal(SPAN, true, &self.ast),
+							],
+						);
 						self.new_box("NUint", raw)
 					}
 					ScalarCastKind::CharToInt | ScalarCastKind::CharToUInt | ScalarCastKind::CharToFloat => {
@@ -2370,7 +5422,8 @@ impl<'a> Emitter<'a> {
 						self.new_box(class, raw)
 					}
 					ScalarCastKind::NumToChar => {
-						let raw = self.numeric_to_char(operand, false);
+						let number = self.runtime_call("nymphCharCode", vec![operand]);
+						let raw = self.numeric_to_char(number, false);
 						self.new_box("NChar", raw)
 					}
 					ScalarCastKind::FloatToChar => {
@@ -2379,7 +5432,7 @@ impl<'a> Emitter<'a> {
 					}
 				}
 			}
-			HirExpr::Closure { params, body } => self.closure_arrow(params, body),
+			HirExpr::Closure { params, body } => self.activation_callable(params, body, true),
 			HirExpr::LabeledBlock { target, body } => {
 				let token = self.begin_return_completion();
 				self
@@ -2405,80 +5458,184 @@ impl<'a> Emitter<'a> {
 		}
 	}
 
-	/// `(<params>) => { <body stmts>; return <tail>; }` — a closure's arrow
-	/// function. Mirrors `emit_func`'s body split exactly: a `Block`
-	/// body's own statements/tail flatten directly into the arrow's
-	/// `FunctionBody` (no needless nested IIFE), any other body becomes a
-	/// single `return <expr>;`.
-	///
-	/// Saves and resets `in_iife_subexpr` to `false` around the body emission —
-	/// the arrow is a real function boundary, exactly like `emit_func`'s
-	/// top-level function body implicitly is (that path never sets the flag at
-	/// all). Lowering rejects every `return` lexically inside a closure body, so
-	/// no `HirStmt::Return` can actually reach this
-	/// boundary today — but it's the correct boundary story regardless (a
-	/// closure built while emitting an enclosing subexpression-position
-	/// construct, e.g. a closure passed as a call argument inside a match arm
-	/// used as a subexpression, must not inherit that outer IIFE's `return`
-	/// target), and it stops being merely defensive the moment closure-scoped
-	/// `return` is ever allowed.
-	fn closure_arrow(&self, params: &[ecow::EcoString], body: &HirExpr) -> Expression<'a> {
-		let raw_params = self.push_param_cell_scope(params);
-		let prev = self.in_iife_subexpr.replace(false);
-		let return_token = self.begin_return_completion();
-		let mut body_stmts = ArenaVec::new_in(&self.ast);
-		match body {
-			HirExpr::Block { .. } => {
-				let value = self.emit_value(body);
-				body_stmts.extend(value.stmts);
-				body_stmts.push(Statement::new_return_statement(
-					SPAN,
-					Some(value.expr),
-					&self.ast,
-				));
-			}
-			other => {
-				let body_expr = self.emit_expr(other);
-				body_stmts.push(Statement::new_return_statement(
-					SPAN,
-					Some(body_expr),
-					&self.ast,
-				));
-			}
+	fn emit_activation_call(
+		&self,
+		callee: &HirExpr,
+		args: &[HirExpr],
+		mode: nymph_hir::hir::HirCallMode,
+		source: u32,
+	) -> Expression<'a> {
+		let args = args
+			.iter()
+			.map(|argument| self.emit_expr(argument))
+			.collect();
+		if let HirExpr::Field { recv, name } = callee {
+			return self.emit_member_activation(self.emit_expr(recv), name, args, mode, source);
 		}
-		let body_stmts = self.finish_return_completion(return_token, body_stmts);
-		let mut prologue = self.param_cell_prologue(params, &raw_params);
-		prologue.extend(body_stmts);
-		let body_stmts = prologue;
-		self.in_iife_subexpr.set(prev);
-		self.pop_cell_scope();
+		self.emit_target_activation(self.emit_expr(callee), args, mode, source)
+	}
 
-		let mut js_params = ArenaVec::new_in(&self.ast);
-		for param in &raw_params {
-			let binding_pattern = BindingPattern::new_binding_identifier(
-				SPAN,
-				self.ast.allocator.alloc_str(param),
-				&self.ast,
-			);
-			js_params.push(FormalParameter::new_plain(SPAN, binding_pattern, &self.ast));
+	fn emit_activation_args(&self, args: Vec<Expression<'a>>) -> Expression<'a> {
+		let mut elements = ArenaVec::new_in(&self.ast);
+		for argument in args {
+			elements.push(ArrayExpressionElement::from(argument));
 		}
-		let formal = FormalParameters::new(
+		let args = Expression::new_array_expression(SPAN, elements, &self.ast);
+		args
+	}
+
+	fn zero_argument_arrow(&self, value: Expression<'a>) -> Expression<'a> {
+		let body = FunctionBody::new(
+			SPAN,
+			ArenaVec::new_in(&self.ast),
+			ArenaVec::from_value_in(
+				Statement::new_return_statement(SPAN, Some(value), &self.ast),
+				&self.ast,
+			),
+			&self.ast,
+		);
+		let params = FormalParameters::new(
 			SPAN,
 			FormalParameterKind::ArrowFormalParameters,
-			js_params,
+			ArenaVec::new_in(&self.ast),
 			oxc::ast::NONE,
 			&self.ast,
 		);
-		let function_body = FunctionBody::new(SPAN, ArenaVec::new_in(&self.ast), body_stmts, &self.ast);
 		Expression::new_arrow_function_expression(
 			SPAN,
 			false,
 			false,
 			oxc::ast::NONE,
-			formal,
+			params,
 			oxc::ast::NONE,
-			function_body,
+			body,
 			&self.ast,
+		)
+	}
+
+	fn emit_task_operation(
+		&self,
+		operation: nymph_hir::hir::HirTaskOperation,
+		operands: &[HirExpr],
+	) -> Expression<'a> {
+		use nymph_hir::hir::HirTaskOperation;
+
+		let values = operands
+			.iter()
+			.map(|operand| self.emit_expr(operand))
+			.collect::<Vec<_>>();
+		match operation {
+			HirTaskOperation::Drive => {
+				assert_eq!(values.len(), 1);
+				self.runtime_call("nymphTaskDrive", values)
+			}
+			HirTaskOperation::Spawn => {
+				assert_eq!(values.len(), 1);
+				self.runtime_call("nymphTaskSpawn", values)
+			}
+			HirTaskOperation::Observe => {
+				assert_eq!(values.len(), 1);
+				self.runtime_call("nymphHandleObserve", values)
+			}
+			HirTaskOperation::Cancel => {
+				assert_eq!(values.len(), 1);
+				self.runtime_call("nymphHandleCancel", values)
+			}
+			HirTaskOperation::Checkpoint => {
+				assert!(values.is_empty());
+				self.runtime_call("nymphCheckpoint", values)
+			}
+			HirTaskOperation::Select | HirTaskOperation::Race => {
+				let values = self.emit_activation_args(values);
+				self.runtime_call(
+					if operation == HirTaskOperation::Select {
+						"nymphTaskSelect"
+					} else {
+						"nymphTaskRace"
+					},
+					vec![values],
+				)
+			}
+		}
+	}
+
+	fn emit_activation_source(&self, source: u32) -> Expression<'a> {
+		let source = Expression::new_numeric_literal(
+			SPAN,
+			f64::from(source),
+			None,
+			NumberBase::Decimal,
+			&self.ast,
+		);
+		source
+	}
+
+	fn emit_member_activation(
+		&self,
+		receiver: Expression<'a>,
+		member: &str,
+		args: Vec<Expression<'a>>,
+		mode: nymph_hir::hir::HirCallMode,
+		source: u32,
+	) -> Expression<'a> {
+		let tail = mode == nymph_hir::hir::HirCallMode::Tail;
+		if tail {
+			return self.runtime_call(
+				"nymphTailCallMember",
+				vec![
+					receiver,
+					Expression::new_string_literal(
+						SPAN,
+						self.ast.allocator.alloc_str(member),
+						None,
+						&self.ast,
+					),
+					self.emit_activation_args(args),
+					self.emit_activation_source(source),
+				],
+			);
+		}
+		let receiver_name = self.gensym();
+		let receiver_name = self.ast.allocator.alloc_str(&receiver_name);
+		let callee = Expression::new_static_member_expression(
+			SPAN,
+			self.ident(receiver_name),
+			IdentifierName::new(SPAN, self.ast.allocator.alloc_str(member), &self.ast),
+			false,
+			&self.ast,
+		);
+		let activation = self.runtime_call(
+			"nymphActivate",
+			vec![
+				callee,
+				self.ident(receiver_name),
+				self.emit_activation_args(args),
+				self.emit_activation_source(source),
+			],
+		);
+		self.arrow_iife(receiver_name, activation, receiver)
+	}
+
+	fn emit_target_activation(
+		&self,
+		callee: Expression<'a>,
+		args: Vec<Expression<'a>>,
+		mode: nymph_hir::hir::HirCallMode,
+		source: u32,
+	) -> Expression<'a> {
+		let tail = mode == nymph_hir::hir::HirCallMode::Tail;
+		self.runtime_call(
+			if tail {
+				"nymphTailCall"
+			} else {
+				"nymphActivate"
+			},
+			vec![
+				callee,
+				Expression::new_identifier(SPAN, "undefined", &self.ast),
+				self.emit_activation_args(args),
+				self.emit_activation_source(source),
+			],
 		)
 	}
 
@@ -2679,24 +5836,20 @@ impl<'a> Emitter<'a> {
 	/// Emit a single HIR statement as a JS statement.
 	fn emit_stmt(&self, stmt: &HirStmt) -> Statement<'a> {
 		match stmt {
-			HirStmt::Let {
-				name,
-				mutable,
-				value,
-			} => self.binding_declaration(name, *mutable, self.emit_expr(value), true),
+			HirStmt::Let { name, value, .. } => self.binding_declaration(name, self.emit_expr(value)),
 			// A statement-position control-flow expression flattens directly into a
 			// plain JS `BlockStatement` via `block_stmt` (matching how a `while` body
 			// already does), rather than going through `emit_expr`'s subexpression
-			// fallthrough — which would otherwise wrap it in a needless IIFE and
-			// trip the `return`-inside-IIFE guard for a
+			// fallthrough — which would otherwise wrap it in a needless IIFE, and
+			// (post Slice 4E, Y1) trip the `return`-inside-IIFE guard for a
 			// statement-position `if`/`while`/`match` that legitimately contains a
 			// `return`. The `BlockStatement` still gives it its own JS scope
-			// and keeps any gensym `let $nymph$temp$N` temps
+			// (unaffected by Y2 shadowing) and keeps any gensym `let $nymph$temp$N` temps
 			// scoped to it, same as before.
 			HirStmt::Expr(
 				e @ (HirExpr::Block { .. }
 				| HirExpr::If { .. }
-				| HirExpr::While { .. }
+				| HirExpr::For { .. }
 				| HirExpr::Match { .. }),
 			) => self.block_stmt(e),
 			HirStmt::Expr(e) => {
@@ -2760,7 +5913,6 @@ impl<'a> Emitter<'a> {
 	fn emit_value(&self, expr: &HirExpr) -> JsValue<'a> {
 		match expr {
 			HirExpr::Block { stmts, tail } => {
-				self.push_cell_scope(&[]);
 				let mut js_stmts = ArenaVec::new_in(&self.ast);
 				for stmt in stmts {
 					js_stmts.push(self.emit_stmt(stmt));
@@ -2772,7 +5924,6 @@ impl<'a> Emitter<'a> {
 				} else {
 					Expression::new_identifier(SPAN, "undefined", &self.ast)
 				};
-				self.pop_cell_scope();
 				JsValue {
 					stmts: js_stmts,
 					expr: tail_expr,
@@ -2799,169 +5950,7 @@ impl<'a> Emitter<'a> {
 					expr: Expression::new_identifier(SPAN, tmp, &self.ast),
 				}
 			}
-			HirExpr::While {
-				target,
-				cond,
-				body,
-				continue_epilogue,
-				option,
-			} => {
-				let cond_expr = self.emit_cond(cond);
-				let completion = self.ast.allocator.alloc_str(&self.completion_name());
-				let token = self.ast.allocator.alloc_str(&self.completion_name());
-				self
-					.loop_completion_tokens
-					.borrow_mut()
-					.push((*target, token));
-				let try_body = match self.block_stmt(body) {
-					Statement::BlockStatement(block) => block,
-					_ => unreachable!(),
-				};
-				self.loop_completion_tokens.borrow_mut().pop();
-				let completion_at = |index: f64| {
-					Expression::from(MemberExpression::ComputedMemberExpression(
-						ComputedMemberExpression::boxed(
-							SPAN,
-							Expression::new_identifier(SPAN, completion, &self.ast),
-							Expression::new_numeric_literal(SPAN, index, None, NumberBase::Decimal, &self.ast),
-							false,
-							&self.ast,
-						),
-					))
-				};
-				let wrong_token = Expression::new_binary_expression(
-					SPAN,
-					Expression::new_identifier(SPAN, completion, &self.ast),
-					BinaryOperator::StrictInequality,
-					Expression::new_identifier(SPAN, token, &self.ast),
-					&self.ast,
-				);
-				let mut catch_stmts = ArenaVec::new_in(&self.ast);
-				catch_stmts.push(Statement::new_if_statement(
-					SPAN,
-					wrong_token,
-					Statement::new_throw_statement(
-						SPAN,
-						Expression::new_identifier(SPAN, completion, &self.ast),
-						&self.ast,
-					),
-					None,
-					&self.ast,
-				));
-				let continue_test = Expression::new_binary_expression(
-					SPAN,
-					completion_at(1.0),
-					BinaryOperator::StrictEquality,
-					Expression::new_numeric_literal(SPAN, 1.0, None, NumberBase::Decimal, &self.ast),
-					&self.ast,
-				);
-				let continue_body = if let Some(epilogue) = continue_epilogue {
-					let mut statements = self.emit_value(epilogue).stmts;
-					statements.push(Statement::new_continue_statement(SPAN, None, &self.ast));
-					Statement::new_block_statement(SPAN, statements, &self.ast)
-				} else {
-					Statement::new_continue_statement(SPAN, None, &self.ast)
-				};
-				catch_stmts.push(Statement::new_if_statement(
-					SPAN,
-					continue_test,
-					continue_body,
-					None,
-					&self.ast,
-				));
-				let result = option
-					.as_ref()
-					.map(|_| self.ast.allocator.alloc_str(&self.gensym()));
-				if let (Some(result), Some(option)) = (result, option) {
-					let key = PropertyKey::new_static_identifier(
-						SPAN,
-						self.ast.allocator.alloc_str(&option.some_value),
-						&self.ast,
-					);
-					let property = ObjectProperty::boxed(
-						SPAN,
-						PropertyKind::Init,
-						key,
-						completion_at(2.0),
-						false,
-						false,
-						false,
-						&self.ast,
-					);
-					let object = Expression::new_object_expression(
-						SPAN,
-						ArenaVec::from_value_in(ObjectPropertyKind::ObjectProperty(property), &self.ast),
-						&self.ast,
-					);
-					let value = self.call1(self.variant_member(&option.enum_name, &option.some), object);
-					catch_stmts.push(Statement::new_expression_statement(
-						SPAN,
-						Expression::new_assignment_expression(
-							SPAN,
-							AssignmentOperator::Assign,
-							self.assign_target(result),
-							value,
-							&self.ast,
-						),
-						&self.ast,
-					));
-				}
-				catch_stmts.push(Statement::new_break_statement(SPAN, None, &self.ast));
-				let catch_pattern = BindingPattern::new_binding_identifier(SPAN, completion, &self.ast);
-				let handler = CatchClause::boxed(
-					SPAN,
-					Some(CatchParameter::new(
-						SPAN,
-						catch_pattern,
-						oxc::ast::NONE,
-						&self.ast,
-					)),
-					BlockStatement::new(SPAN, catch_stmts, &self.ast),
-					&self.ast,
-				);
-				let try_stmt = Statement::new_try_statement(
-					SPAN,
-					try_body,
-					Some(handler),
-					None::<ArenaBox<'a, BlockStatement<'a>>>,
-					&self.ast,
-				);
-				let body_stmt = Statement::new_block_statement(
-					SPAN,
-					ArenaVec::from_value_in(try_stmt, &self.ast),
-					&self.ast,
-				);
-				let while_stmt = Statement::new_while_statement(SPAN, cond_expr, body_stmt, &self.ast);
-				let mut stmts = ArenaVec::new_in(&self.ast);
-				stmts.push(self.const_decl(
-					token,
-					Expression::new_array_expression(SPAN, ArenaVec::new_in(&self.ast), &self.ast),
-				));
-				if let (Some(result), Some(option)) = (result, option) {
-					stmts.push(self.let_uninit(result));
-					let none = self.emit_expr(&HirExpr::VariantRef {
-						enum_name: option.enum_name.clone(),
-						variant: option.none.clone(),
-						prototype: None,
-					});
-					stmts.push(Statement::new_expression_statement(
-						SPAN,
-						Expression::new_assignment_expression(
-							SPAN,
-							AssignmentOperator::Assign,
-							self.assign_target(result),
-							none,
-							&self.ast,
-						),
-						&self.ast,
-					));
-				}
-				stmts.push(while_stmt);
-				JsValue {
-					stmts,
-					expr: Expression::new_identifier(SPAN, result.unwrap_or("undefined"), &self.ast),
-				}
-			}
+			HirExpr::For { .. } => unreachable!("for expressions are emitted through activation plans"),
 			HirExpr::Match { scrutinee, arms } => {
 				// const <s> = <scrutinee>; let <r>;
 				// <m>: {
@@ -3173,24 +6162,9 @@ impl<'a> Emitter<'a> {
 			}
 			Subject::MapRest(base, keys) => {
 				let map_expr = self.emit_subject(base);
-				let new_map = self.new_box("NMap", map_expr);
-				if keys.is_empty() {
-					return new_map;
-				}
-				// `(() => { const _tN = new NMap(<base>); _tN.delete(<k1>); ...; return _tN; })()`
-				let tmp = self.ast.allocator.alloc_str(&self.gensym());
-				let mut stmts = ArenaVec::new_in(&self.ast);
-				stmts.push(self.const_decl(tmp, new_map));
-				for key in keys {
-					let m_ident = Expression::new_identifier(SPAN, tmp, &self.ast);
-					let del = self.member_call(m_ident, "delete", vec![self.emit_boxed_lit(key)]);
-					stmts.push(Statement::new_expression_statement(SPAN, del, &self.ast));
-				}
-				let value = JsValue {
-					stmts,
-					expr: Expression::new_identifier(SPAN, tmp, &self.ast),
-				};
-				value.into_expression(self.ast)
+				keys.iter().fold(map_expr, |map, key| {
+					self.member_call(map, "without", vec![self.emit_boxed_lit(key)])
+				})
 			}
 			Subject::PatternSelect {
 				decision,
@@ -3209,6 +6183,8 @@ impl<'a> Emitter<'a> {
 	/// A scalar pattern literal as a JS expression (for `=== <lit>` tests).
 	fn emit_lit(&self, lit: &HirLit) -> Expression<'a> {
 		match lit {
+			HirLit::Int(v) => self.bigint_literal(v),
+			HirLit::UInt(v) => self.bigint_literal(v),
 			HirLit::Num(v, _) => {
 				Expression::new_numeric_literal(SPAN, *v, None, NumberBase::Decimal, &self.ast)
 			}
@@ -3227,6 +6203,8 @@ impl<'a> Emitter<'a> {
 	fn emit_boxed_lit(&self, lit: &HirLit) -> Expression<'a> {
 		let value = self.emit_lit(lit);
 		let class = match lit {
+			HirLit::Int(_) => "NInt",
+			HirLit::UInt(_) => "NUint",
 			HirLit::Num(_, kind) => box_rt::num_box_class(*kind),
 			HirLit::Bool(_) => "NBool",
 			HirLit::Char(_) => "NChar",
@@ -3635,7 +6613,13 @@ impl<'a> Emitter<'a> {
 		let mut block = ArenaVec::new_in(&self.ast);
 		for (name, subj) in binds {
 			let init = self.emit_subject(subj);
-			block.push(self.const_decl(name, init));
+			let activation_binding = self.activation_pattern_bindings.borrow().contains(name);
+			if activation_binding {
+				let location = self.activation_environment.borrow()[name].clone();
+				block.push(self.activation_assignment(self.activation_slot_target(&location), init));
+			} else {
+				block.push(self.const_decl(name, init));
+			}
 		}
 		block.push(committed);
 		let block = Statement::new_block_statement(SPAN, block, &self.ast);
@@ -3663,6 +6647,7 @@ impl<'a> Emitter<'a> {
 		&self,
 		op: BinOp,
 		result: BuiltinResult,
+		mode: OperationMode,
 		left: Expression<'a>,
 		right: Expression<'a>,
 	) -> Expression<'a> {
@@ -3674,12 +6659,44 @@ impl<'a> Emitter<'a> {
 				unreachable!("logical `&&`/`||` are lowered in emit_expr, not emit_binary")
 			}
 			_ => {
-				let (left, right) = if matches!(result, BuiltinResult::Raw | BuiltinResult::IdentityBoolean)
-				{
+				let (left, right) = if matches!(result, BuiltinResult::Raw) {
 					(left, right)
 				} else {
 					(self.unwrap_v(left), self.unwrap_v(right))
 				};
+				if op == BinOp::Div && result == BuiltinResult::Float && mode == OperationMode::Checked {
+					let raw = self.runtime_call("nymphCheckedDivide", vec![left, right]);
+					return self.box_builtin_result(result, raw);
+				}
+				let (left, right) = if result == BuiltinResult::Float {
+					(
+						self.runtime_call("nymphIntegerToFloat", vec![left]),
+						self.runtime_call("nymphIntegerToFloat", vec![right]),
+					)
+				} else {
+					(left, right)
+				};
+				if op == BinOp::Pow
+					&& matches!(result, BuiltinResult::Int | BuiltinResult::UInt)
+					&& mode == OperationMode::Checked
+				{
+					let raw = self.runtime_call("nymphCheckedPower", vec![left, right]);
+					return self.box_builtin_result(result, raw);
+				}
+				if matches!(op, BinOp::Shl | BinOp::Shr)
+					&& matches!(result, BuiltinResult::Int | BuiltinResult::UInt)
+					&& mode == OperationMode::Checked
+				{
+					let raw = self.runtime_call(
+						"nymphCheckedShift",
+						vec![
+							left,
+							right,
+							Expression::new_boolean_literal(SPAN, op == BinOp::Shl, &self.ast),
+						],
+					);
+					return self.box_builtin_result(result, raw);
+				}
 				let raw = Expression::BinaryExpression(BinaryExpression::boxed(
 					SPAN,
 					left,
@@ -3706,9 +6723,25 @@ impl<'a> Emitter<'a> {
 					right,
 					&self.ast,
 				));
-				self.box_builtin_result(result, raw)
+				self.box_builtin_result_with_mode(result, raw, mode)
 			}
 		}
+	}
+
+	fn box_builtin_result_with_mode(
+		&self,
+		result: BuiltinResult,
+		raw: Expression<'a>,
+		mode: OperationMode,
+	) -> Expression<'a> {
+		if mode == OperationMode::Direct {
+			match result {
+				BuiltinResult::Int => return self.direct_integer_box("NInt", raw),
+				BuiltinResult::UInt => return self.direct_integer_box("NUint", raw),
+				_ => {}
+			}
+		}
+		self.box_builtin_result(result, raw)
 	}
 
 	fn box_builtin_result(&self, result: BuiltinResult, raw: Expression<'a>) -> Expression<'a> {
@@ -3718,7 +6751,7 @@ impl<'a> Emitter<'a> {
 			BuiltinResult::Float => "NFloat",
 			BuiltinResult::Char => "NChar",
 			BuiltinResult::String => "NString",
-			BuiltinResult::Boolean | BuiltinResult::IdentityBoolean => "NBool",
+			BuiltinResult::Boolean => "NBool",
 			BuiltinResult::Raw => return raw,
 		};
 		self.new_box(class, raw)

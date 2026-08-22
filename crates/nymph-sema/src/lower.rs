@@ -11,14 +11,17 @@ use ecow::EcoString;
 use nymph_ast::{
 	Span, Spanned,
 	decl::{Declaration, ImplMember},
-	ty::{GenericArg, GenericParam, Type},
+	ty::{
+		Effect, EffectRow as AstEffectRow, GenericArg, GenericArgValue, GenericParam, GenericParamKind,
+		Type,
+	},
 };
 use rustc_hash::FxHashMap;
 
 use crate::check::{AliasLowerState, Checker};
 use crate::def::{
-	AliasSig, DefKind, EnumSig, FuncParamSig, FuncSig, NamespaceMemberSig, NamespaceSig, StructSig,
-	ValueSig, VariantSig,
+	AliasSig, DefKind, EnumEmbeddingSig, EnumSig, FuncParamSig, FuncSig, NamespaceMemberSig,
+	NamespaceSig, StructSig, ValueSig, VariantSig,
 };
 use crate::ids::{DefId, ParamIdx};
 use crate::ty::{GenericArgs, Ty};
@@ -28,6 +31,7 @@ use crate::ty::{GenericArgs, Ty};
 #[derive(Clone, Debug)]
 pub(crate) struct GenericBinding {
 	pub index: ParamIdx,
+	pub kind: GenericParamKind,
 	pub declaration: Span,
 	pub written_declarations: Vec<Span>,
 }
@@ -57,6 +61,7 @@ pub(crate) fn build_param_scope_at(
 			generic.0.name.0.clone(),
 			GenericBinding {
 				index: ParamIdx((base + i) as u32),
+				kind: generic.0.kind,
 				declaration,
 				written_declarations,
 			},
@@ -69,7 +74,49 @@ fn generic_names(generics: &[Spanned<GenericParam>]) -> Vec<EcoString> {
 	generics.iter().map(|g| g.0.name.0.clone()).collect()
 }
 
+fn generic_kinds(generics: &[Spanned<GenericParam>]) -> Vec<crate::GenericParameterKind> {
+	generics
+		.iter()
+		.map(|generic| match generic.0.kind {
+			GenericParamKind::Type => crate::GenericParameterKind::Type,
+			GenericParamKind::Effect => crate::GenericParameterKind::Effect,
+		})
+		.collect()
+}
+
 impl Checker<'_> {
+	pub(crate) fn record_effect_spec(
+		&mut self,
+		meta: &nymph_ast::decl::FuncDeclaration,
+		row: crate::ty::EffectRow,
+		has_body: bool,
+	) {
+		let explicit_infer = meta
+			.effects
+			.as_ref()
+			.is_some_and(|effects| effects.0.requests_inference());
+		if explicit_infer && !has_body {
+			self.emit(
+				meta
+					.effects
+					.as_ref()
+					.map_or(meta.name.1, |effects| effects.1),
+				TypeError::CannotInferEffectRow,
+			);
+		}
+		self.source_effect_specs.insert(
+			meta.name.1,
+			crate::check::SourceEffectSpec {
+				row,
+				infer: explicit_infer || meta.return_type.is_none(),
+				span: meta
+					.effects
+					.as_ref()
+					.map_or(meta.name.1, |effects| effects.1),
+			},
+		);
+	}
+
 	fn stabilize_generics(&mut self, generics: &[Spanned<GenericParam>], owner: DefId) {
 		let Some(owner) = self.defs.stable(owner).cloned() else {
 			return;
@@ -116,26 +163,29 @@ impl Checker<'_> {
 					let scope = build_param_scope(generics);
 					let names = generic_names(generics);
 					self.push_params(scope);
-					let fields: Vec<(EcoString, Ty)> = fields
+					let field_types: Vec<(EcoString, Ty)> = fields
 						.iter()
 						.map(|f| (f.0.name.0.clone(), self.lower_type(&f.0.type_)))
 						.collect();
 					let owner = self.defs.stable(id).cloned();
 					let field_metadata = fields
 						.iter()
-						.map(|(name, _)| crate::def::FieldSigMetadata {
+						.map(|field| crate::def::FieldSigMetadata {
 							target: owner.clone().map(|owner| {
 								crate::DefinitionId::new(
 									owner.module.clone(),
 									crate::DeclarationKey::member(
 										owner,
 										crate::DeclarationCategory::Field,
-										name.clone(),
+										field.0.name.0.clone(),
 									),
 								)
 							}),
-							mutable: false,
-							has_default: false,
+							visibility: field
+								.0
+								.visibility
+								.unwrap_or(nymph_ast::decl::Visibility::Internal),
+							has_default: field.0.default.is_some(),
 						})
 						.collect();
 					// Lower the struct's generic bounds while their parameter scope is
@@ -147,7 +197,7 @@ impl Checker<'_> {
 						id,
 						StructSig {
 							generics: names,
-							fields,
+							fields: field_types,
 							field_metadata,
 							bounds,
 						},
@@ -155,7 +205,10 @@ impl Checker<'_> {
 				}
 				DefKind::Enum => {
 					let Declaration::Enum {
-						generics, variants, ..
+						generics,
+						embeddings,
+						variants,
+						..
 					} = &module.members[member]
 					else {
 						continue;
@@ -191,8 +244,11 @@ impl Checker<'_> {
 											),
 										)
 									}),
-									mutable: false,
-									has_default: false,
+									visibility: field
+										.0
+										.visibility
+										.unwrap_or(nymph_ast::decl::Visibility::Internal),
+									has_default: field.0.default.is_some(),
 								})
 								.collect();
 							VariantSig {
@@ -212,19 +268,43 @@ impl Checker<'_> {
 					// for the same reason as the struct arm above.
 					let bounds = self.lower_constraints(generics, 0);
 					self.pop_params();
+					let embeddings = embeddings
+						.iter()
+						.filter_map(|embedding| {
+							let source = self.defs.get(&embedding.0.source.0)?;
+							if !matches!(self.defs.data(source).kind, DefKind::Enum) {
+								self.emit(
+									embedding.1,
+									TypeError::CannotFind {
+										name: embedding.0.source.0.clone(),
+									},
+								);
+								return None;
+							}
+							let variant = embedding.0.variant.as_ref().and_then(|name| {
+								self.defs.iter().find_map(|(candidate, data)| {
+									matches!(data.kind, DefKind::Variant { enum_def, .. } if enum_def == source)
+										.then_some(candidate)
+										.filter(|_| data.name == name.0)
+								})
+							});
+							Some(EnumEmbeddingSig { source, variant })
+						})
+						.collect();
 					self.sigs.enums.insert(
 						id,
 						EnumSig {
 							generics: names,
+							embeddings,
 							variants,
 							bounds,
 						},
 					);
 				}
 				DefKind::Func => {
-					let meta = match &module.members[member] {
-						Declaration::Func { meta, .. } => meta,
-						Declaration::ExternalFunc(_, _, meta) => meta,
+					let (meta, has_body) = match &module.members[member] {
+						Declaration::Func { meta, .. } => (meta, true),
+						Declaration::ExternalFunc(_, _, meta) => (meta, false),
 						_ => continue,
 					};
 					self.stabilize_generics(&meta.generics, id);
@@ -240,12 +320,26 @@ impl Checker<'_> {
 							spread: p.0.spread,
 						})
 						.collect();
-					let ret = match &meta.return_type {
+					let output = match &meta.return_type {
 						Some(ty) => self.lower_type(ty),
 						None => self.fresh(),
 					};
-					// Lower the generic bounds while their parameter scope is active so
-					// `Bound::ty`/`args` land in the same `Param`
+					let latent_effects = meta
+						.effects
+						.as_ref()
+						.map(|effects| self.lower_effect_row(effects).0)
+						.unwrap_or_else(crate::ty::EffectRow::pure);
+					self.record_effect_spec(meta, latent_effects.clone(), has_body);
+					let (ret, effects) = if meta.is_async {
+						(
+							self.interner.mk_task(output, latent_effects),
+							crate::ty::EffectRow::pure(),
+						)
+					} else {
+						(output, latent_effects)
+					};
+					// Lower the generics' own bounds while their param scope is still
+					// active (Slice 4G), so `Bound::ty`/`args` land in the same `Param`
 					// index space as `params`/`ret` above and a call site can substitute
 					// them with the scheme's identical instantiation map.
 					let bounds = self.lower_constraints(&meta.generics, 0);
@@ -254,8 +348,10 @@ impl Checker<'_> {
 						id,
 						FuncSig {
 							generics: names,
+							generic_kinds: generic_kinds(&meta.generics),
 							params,
 							ret,
+							effects,
 							has_self: false,
 							bounds,
 						},
@@ -284,7 +380,7 @@ impl Checker<'_> {
 					self.lower_alias_signature(id, member, self.defs.data(id).span);
 				}
 				DefKind::Namespace => self.lower_namespace_signature(id, member),
-				DefKind::Variant { .. } | DefKind::Interface => {}
+				DefKind::Variant { .. } | DefKind::Interface | DefKind::Effect => {}
 			}
 		}
 		self.collecting_signatures = false;
@@ -324,16 +420,17 @@ impl Checker<'_> {
 			Type::Function {
 				params,
 				return_type,
+				effects,
 			} => {
 				let params = params.iter().map(|(_, t)| self.lower_type(t)).collect();
 				let ret = self.lower_type(return_type);
-				self.interner.mk_fn(params, ret)
+				let effects = effects
+					.as_ref()
+					.map(|effects| self.lower_effect_row(effects).0)
+					.unwrap_or_else(crate::ty::EffectRow::pure);
+				self.interner.mk_effectful_fn(params, ret, effects)
 			}
 			Type::Grouped(inner) => self.lower_type(inner),
-			Type::Mut(inner) => {
-				let inner = self.lower_type(inner);
-				self.interner.mk_mut(inner)
-			}
 			Type::Reference { name, generics } => self.lower_reference(ast.1, name, generics),
 		}
 	}
@@ -359,20 +456,42 @@ impl Checker<'_> {
 				crate::annotate::GenericSymbolIdentity::Local(binding.declaration),
 				false,
 			);
+			if binding.kind != GenericParamKind::Type {
+				self.emit(
+					name.1,
+					TypeError::GenericKindMismatch {
+						name: name.0.clone(),
+						expected: "type",
+					},
+				);
+				return self.interner.error();
+			}
 			return self.interner.mk_param(binding.index);
 		}
 
 		let mut positional = Vec::new();
 		let mut named = Vec::new();
 		for g in generics {
-			let ty = self.lower_type(&g.0.value);
+			let GenericArgValue::Type(value) = &g.0.value else {
+				// Effect arguments are compile-time contracts. Their rows are retained
+				// by interface bounds and implementation facts; runtime nominal type
+				// arguments contain only reified type parameters.
+				continue;
+			};
+			let ty = self.lower_type(value);
 			match &g.0.name {
 				Some(label) => named.push((label.0.clone(), ty)),
 				None => positional.push(ty),
 			}
 		}
 
-		let Some(def) = self.defs.get(&name.0) else {
+		let (lookup_name, selected_variant) = name
+			.0
+			.split_once('.')
+			.map_or((name.0.as_str(), None), |(owner, variant)| {
+				(owner, Some(variant))
+			});
+		let Some(def) = self.defs.get(lookup_name) else {
 			self.emit(
 				span,
 				TypeError::CannotFindType {
@@ -381,6 +500,39 @@ impl Checker<'_> {
 			);
 			return self.interner.error();
 		};
+		if let Some(selected_variant) = selected_variant {
+			if !matches!(self.defs.data(def).kind, DefKind::Enum) {
+				self.emit(
+					span,
+					TypeError::CannotFindType {
+						name: name.0.clone(),
+					},
+				);
+				return self.interner.error();
+			}
+			let variant = self.defs.iter().find_map(|(candidate, data)| {
+				match data.kind {
+					DefKind::Variant { enum_def, variant } if enum_def == def => Some((candidate, variant)),
+					_ => None,
+				}
+				.filter(|_| data.name == selected_variant)
+			});
+			let Some((variant, index)) = variant else {
+				self.emit(
+					span,
+					TypeError::CannotFindType {
+						name: name.0.clone(),
+					},
+				);
+				return self.interner.error();
+			};
+			self
+				.annotations
+				.record_type_definition_target(name.1, self.defs.stable(variant));
+			return self
+				.enum_single_variant_ty(def, index, GenericArgs::new(positional, named))
+				.unwrap_or_else(|| self.interner.error());
+		}
 
 		let kind = self.defs.data(def).kind;
 		if let Some(owner) = self.defs.stable(def).cloned() {
@@ -425,6 +577,66 @@ impl Checker<'_> {
 				self.interner.error()
 			}
 		}
+	}
+
+	/// Lower source effect syntax to the canonical local row used by signatures.
+	/// The boolean reports whether the source requested inference with `!_`.
+	pub(crate) fn lower_effect_row(
+		&mut self,
+		ast: &Spanned<AstEffectRow>,
+	) -> (crate::ty::EffectRow, bool) {
+		let mut atoms = Vec::new();
+		let mut infer = false;
+		for effect in &ast.0.effects {
+			match &effect.0 {
+				Effect::Infer => infer = true,
+				Effect::Error => {}
+				Effect::Named(name) => {
+					if let Some(binding) = self.lookup_param_binding(&name.0) {
+						self.annotations.record_generic_symbol(
+							name.1,
+							crate::annotate::GenericSymbolIdentity::Local(binding.declaration),
+							false,
+						);
+						if binding.kind == GenericParamKind::Effect {
+							atoms.push(crate::ty::EffectAtom::Parameter(binding.index));
+						} else {
+							self.emit(
+								name.1,
+								TypeError::GenericKindMismatch {
+									name: name.0.clone(),
+									expected: "effect",
+								},
+							);
+						}
+						continue;
+					}
+					let Some(definition) = self.defs.get(&name.0) else {
+						self.emit(
+							name.1,
+							TypeError::CannotFindEffect {
+								name: name.0.clone(),
+							},
+						);
+						continue;
+					};
+					if self.defs.data(definition).kind != DefKind::Effect {
+						self.emit(
+							name.1,
+							TypeError::NotAnEffect {
+								name: name.0.clone(),
+							},
+						);
+						continue;
+					}
+					self
+						.annotations
+						.record_type_definition_target(name.1, self.defs.stable(definition));
+					atoms.push(crate::ty::EffectAtom::Nominal(definition));
+				}
+			}
+		}
+		(crate::ty::EffectRow::new(atoms), infer)
 	}
 
 	/// Mint a fresh anonymous generic parameter for an `impl Interface` type, recording
@@ -474,6 +686,7 @@ impl Checker<'_> {
 				ty,
 				interface,
 				args,
+				effect_args: Vec::new(),
 			});
 		ty
 	}
@@ -544,9 +757,27 @@ impl Checker<'_> {
 							spread: param.0.spread,
 						})
 						.collect();
-					let ret = match &meta.return_type {
+					let output = match &meta.return_type {
 						Some(ty) => self.lower_type(ty),
 						None => self.fresh(),
+					};
+					let latent_effects = meta
+						.effects
+						.as_ref()
+						.map(|effects| self.lower_effect_row(effects).0)
+						.unwrap_or_else(crate::ty::EffectRow::pure);
+					self.record_effect_spec(
+						meta,
+						latent_effects.clone(),
+						matches!(&member.0, ImplMember::Func { .. }),
+					);
+					let (ret, effects) = if meta.is_async {
+						(
+							self.interner.mk_task(output, latent_effects),
+							crate::ty::EffectRow::pure(),
+						)
+					} else {
+						(output, latent_effects)
 					};
 					let bounds = self.lower_constraints(&meta.generics, 0);
 					self.pop_params();
@@ -556,8 +787,10 @@ impl Checker<'_> {
 							target: None,
 							sig: FuncSig {
 								generics,
+								generic_kinds: generic_kinds(&meta.generics),
 								params,
 								ret,
+								effects,
 								has_self: false,
 								bounds,
 							},
@@ -585,11 +818,7 @@ impl Checker<'_> {
 					};
 					owned.members.insert(
 						name.0.clone(),
-						NamespaceMemberSig::Value {
-							target: None,
-							ty,
-							mutable: meta.is_mutable(),
-						},
+						NamespaceMemberSig::Value { target: None, ty },
 					);
 				}
 			}

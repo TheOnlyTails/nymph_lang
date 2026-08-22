@@ -25,6 +25,7 @@ thread_local! {
 pub struct Project {
 	pub src_root: PathBuf,
 	pub entry_key: String,
+	pub lints: std::collections::BTreeMap<String, nymph_compiler::LintLevel>,
 }
 
 /// Filesystem policy for an LSP document URI.
@@ -104,6 +105,7 @@ pub fn detect(file: &Path) -> anyhow::Result<Option<Project>> {
 	Ok(Some(Project {
 		src_root,
 		entry_key,
+		lints: project.manifest().lints.clone(),
 	}))
 }
 
@@ -214,7 +216,7 @@ mod tests {
 		let tmp = TempDir::new();
 		std::fs::write(
 			tmp.path().join("nymph.toml"),
-			"[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+			"[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[lints]\necho-in-release = \"deny\"\n",
 		)
 		.unwrap();
 		std::fs::create_dir_all(tmp.path().join("src/sub")).unwrap();
@@ -224,6 +226,10 @@ mod tests {
 			.unwrap()
 			.expect("should detect a project");
 		assert_eq!(project.entry_key, "sub/b");
+		assert_eq!(
+			project.lints.get("echo-in-release"),
+			Some(&nymph_compiler::LintLevel::Deny)
+		);
 		assert_eq!(
 			std::path::absolute(project.src_root).unwrap(),
 			std::path::absolute(tmp.path().join("src")).unwrap()

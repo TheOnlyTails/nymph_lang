@@ -1,5 +1,5 @@
-//! Tests for boxed collection representation,
-//! value-equality maps, and uniform index/iteration dispatch.
+//! Boxed collection representation, persistent-list sharing, value-equality
+//! maps, and uniform index/iteration dispatch.
 
 use std::io::Write;
 use std::process::Command;
@@ -37,37 +37,107 @@ fn run_node(js: &str) -> String {
 }
 
 #[test]
-fn list_literal_boxes_a_native_array_of_boxed_elements() {
+fn list_literal_constructs_a_persistent_vector_of_boxed_elements() {
 	let js = emit_js("func values(): #[int] = #[1, 2]");
 	assert!(
-		js.contains("new NList([new NInt(1), new NInt(2)])"),
-		"list wrapper owns a native array of boxed elements: {js}"
+		js.contains("new NList([new NInt(1n), new NInt(2n)])"),
+		"list construction preserves boxed element order: {js}"
 	);
+}
+
+#[test]
+fn persistent_list_updates_preserve_aliases_and_share_unchanged_branches() {
+	let mut js = nymph_codegen::box_module_source();
+	js.push_str(
+		r#"
+const source = new NList(Array.from({ length: 4096 }, (_, i) => new NInt(BigInt(i))));
+const alias = source;
+const appended = source.appended(new NInt(4096n));
+const replaced = source.replaced(new NUint(1024n), new NInt(9999n));
+const sharedLeaf = source.v._leafFor(0) === replaced.v._leafFor(0);
+console.log(
+	alias === source,
+	source.v.length,
+	source.v.get(1024).v,
+	appended.v.length,
+	replaced.v.get(1024).v,
+	sharedLeaf,
+);
+"#,
+	);
+	assert_eq!(run_node(&js), "true 4096 1024n 4097 9999n true");
+}
+
+#[test]
+fn deep_and_nested_slices_are_trimmed_rebased_and_share_only_overlapping_leaves() {
+	let mut js = nymph_codegen::box_module_source();
+	js.push_str(
+		r#"
+const source = new NList(Array.from({ length: 4096 }, (_, i) => new NInt(BigInt(i))));
+const slice = source.slice(new NUint(1024n), new NUint(3072n));
+const nested = slice.slice(new NUint(512n), new NUint(1024n));
+const outsideLeaf = source.v._leafFor(0);
+const includesReference = (node, target) =>
+	node === target || (Array.isArray(node) && node.some((child) => includesReference(child, target)));
+console.log(
+	slice.v.length,
+	slice.v.get(0).v,
+	nested.v.length,
+	nested.v.get(0).v,
+	slice.v._leafFor(0) === source.v._leafFor(1024),
+	nested.v._leafFor(0) === source.v._leafFor(1536),
+	includesReference(slice.v._root, outsideLeaf),
+	Object.isFrozen(slice.v),
+	Object.isFrozen(slice.v._root),
+	Object.isFrozen(slice.v._tail),
+	typeof globalThis.NymphListTransient,
+);
+"#,
+	);
+	assert_eq!(
+		run_node(&js),
+		"2048 1024n 512 1536n true true false true true true undefined"
+	);
+}
+
+#[test]
+fn immutable_stdlib_list_apis_leave_every_branch_unchanged() {
+	let source = r#"
+		func branches(): #[#[int]] = {
+			let original = #[1, 2]
+			#[original, original.appended(3), original.replaced(0, 9), original.slice(1, 2)]
+		}
+	"#;
+	let mut js = emit_js(source);
+	js.push_str(
+		"\nconsole.log(branches().v.map(list => list.v.map(item => item.v).join(',')).join('|'));\n",
+	);
+	assert_eq!(run_node(&js), "1,2|1,2,3|9,2|2");
 }
 
 #[test]
 fn tuple_literal_uses_its_distinct_box_and_tag() {
 	let mut js = emit_js("func pair(): #(int, string) = #(1, \"one\")");
 	assert!(
-		js.contains("new NTuple([new NInt(1), new NString(\"one\")])")
-			|| js.contains("new NTuple([new NInt(1), new NString('one')])"),
+		js.contains("new NTuple([new NInt(1n), new NString(\"one\")])")
+			|| js.contains("new NTuple([new NInt(1n), new NString('one')])"),
 		"{js}"
 	);
 	js.push_str(
 		"\nconst pairValue = pair();\nconsole.log(pairValue.v[0].v, pairValue[Symbol.for(\"nymph.tag\")].description);\n",
 	);
-	assert_eq!(run_node(&js), "1 nymph.tuple");
+	assert_eq!(run_node(&js), "1n nymph.tuple");
 }
 
 #[test]
-fn boxed_list_index_returns_the_already_boxed_element() {
-	let mut js = emit_js("func second(): int = #[10, 20][1u]");
+fn signed_list_index_dispatches_through_the_extensible_index_impl() {
+	let mut js = emit_js("func second(): int = #[10, 20][1]");
 	assert!(
-		js.contains(".index(new NUint(1))"),
-		"index dispatches through the list box: {js}"
+		!js.contains(".indexDirect(new NInt(1n))"),
+		"an `int` key must dispatch through `Index<int>`: {js}"
 	);
 	js.push_str("\nconsole.log(second().v);\n");
-	assert_eq!(run_node(&js), "20");
+	assert_eq!(run_node(&js), "20n");
 }
 
 #[test]
@@ -76,14 +146,6 @@ fn list_spread_splices_the_boxed_sources_payload_and_reboxes_the_result() {
 	let mut js = emit_js(src);
 	js.push_str("\nconsole.log(values().v.map(x => x.v).join(','));\n");
 	assert_eq!(run_node(&js), "1,2,3,4");
-}
-
-#[test]
-fn mutable_list_index_assignment_updates_the_payload() {
-	let src = "func replace(): int = { let mut values = #[1, 2] values[1u] = 9 values[1u] }";
-	let mut js = emit_js(src);
-	js.push_str("\nconsole.log(replace().v);\n");
-	assert_eq!(run_node(&js), "9");
 }
 
 #[test]
@@ -100,7 +162,7 @@ fn separately_boxed_equal_map_key_retrieves_the_entry() {
 	let src = "func value(): int = #{1: 7}[1]";
 	let mut js = emit_js(src);
 	js.push_str("\nconsole.log(value().v);\n");
-	assert_eq!(run_node(&js), "7");
+	assert_eq!(run_node(&js), "7n");
 }
 
 #[test]
@@ -108,7 +170,7 @@ fn equal_map_key_overwrites_without_growing_the_map() {
 	let src = "func values(): #{int: int} = #{1: 7, 1: 9}";
 	let mut js = emit_js(src);
 	js.push_str("\nconst map = values(); console.log(map.size, map.get(new NInt(1)).v);\n");
-	assert_eq!(run_node(&js), "1 9");
+	assert_eq!(run_node(&js), "1 9n");
 }
 
 #[test]
@@ -116,7 +178,7 @@ fn separately_boxed_equal_tuple_key_retrieves_the_entry() {
 	let src = "func value(): int = #{#(1, 2): 7}[#(1, 2)]";
 	let mut js = emit_js(src);
 	js.push_str("\nconsole.log(value().v);\n");
-	assert_eq!(run_node(&js), "7");
+	assert_eq!(run_node(&js), "7n");
 }
 
 #[test]
@@ -124,57 +186,52 @@ fn hamt_collision_node_uses_key_equality() {
 	let mut js = nymph_codegen::box_module_source();
 	js.push_str(
 		r#"
-class CollisionKey extends NBox {
-	hash() { return new NInt(42); }
-	equals(other) { return new NBool(this.v === other.v); }
-}
-const map = new NMap([
-	[new CollisionKey("left"), new NInt(1)],
-	[new CollisionKey("right"), new NInt(2)],
-]);
-console.log(map.size, map.get(new CollisionKey("left")).v, map.get(new CollisionKey("right")).v);
+const key = value => {
+	const result = nymphStructuralValue({}, "struct:CollisionKey", ["value"]);
+	result.value = new NString(value);
+	return result;
+};
+let root = null;
+[root] = hamtSet(root, 42, key("left"), new NInt(1), 0);
+[root] = hamtSet(root, 42, key("right"), new NInt(2), 0);
+console.log(
+	root.entries.length,
+	hamtGet(root, 42, key("left"), 0).v,
+	hamtGet(root, 42, key("right"), 0).v,
+);
 "#,
 	);
-	assert_eq!(run_node(&js), "2 1 2");
+	assert_eq!(run_node(&js), "2 1n 2n");
 }
 
 #[test]
-fn map_assignment_and_deletion_use_value_equal_keys() {
-	let mut js =
-		emit_js("func values(): #{int: int} = { let mut map = #{1: 7, 2: 8} map[1] = 9 map }");
-	js.push_str(
-		"\nconst map = values(); const removed = map.delete(new NInt(2)); console.log(map.get(new NInt(1)).v, removed, map.size);\n",
-	);
-	assert_eq!(run_node(&js), "9 true 1");
-}
-
-#[test]
-fn numeric_tags_keep_int_and_float_keys_distinct() {
+fn unlawful_float_keys_fail_at_runtime_when_bypassing_sema() {
 	let mut js = nymph_codegen::box_module_source();
 	js.push_str(
 		r#"
-const map = new NMap([
-	[new NInt(5), new NString("int")],
-	[new NFloat(5), new NString("float")],
-]);
-console.log(map.size, map.get(new NInt(5)).v, map.get(new NFloat(5)).v);
+try {
+	new NMap([[new NFloat(5), new NString("float")]]);
+	console.log("accepted");
+} catch (error) {
+	console.log(error.message);
+}
 "#,
 	);
-	assert_eq!(run_node(&js), "2 int float");
+	assert_eq!(run_node(&js), "float has no lawful structural hash");
 }
 
 #[test]
-fn hamt_handles_deep_branching_and_in_place_deletion() {
+fn hamt_handles_deep_branching_and_persistent_deletion() {
 	let mut js = nymph_codegen::box_module_source();
 	js.push_str(
 		r#"
-const map = new NMap([]);
-for (let i = 0; i < 1000; i++) map.set(new NInt(i), new NInt(i * 3));
+let map = new NMap([]);
+for (let i = 0; i < 1000; i++) map = map.with(new NInt(i), new NInt(i * 3));
 let valid = map.size === 1000;
-for (let i = 0; i < 1000; i++) valid &&= map.get(new NInt(i)).v === i * 3;
-for (let i = 0; i < 1000; i += 2) valid &&= map.delete(new NInt(i));
+for (let i = 0; i < 1000; i++) valid &&= map.get(new NInt(i)).v === BigInt(i * 3);
+for (let i = 0; i < 1000; i += 2) map = map.without(new NInt(i));
 valid &&= map.size === 500;
-for (let i = 1; i < 1000; i += 2) valid &&= map.get(new NInt(i)).v === i * 3;
+for (let i = 1; i < 1000; i += 2) valid &&= map.get(new NInt(i)).v === BigInt(i * 3);
 console.log(valid ? "ok" : "failed");
 "#,
 	);
@@ -191,24 +248,20 @@ fn map_pattern_uses_boxed_value_equal_keys() {
 	"#;
 	let mut js = emit_js(src);
 	js.push_str("\nconsole.log(value().v);\n");
-	assert_eq!(run_node(&js), "7");
+	assert_eq!(run_node(&js), "7n");
 }
 
 #[test]
-fn map_pattern_preserves_uint_and_float_key_tags() {
+fn map_pattern_accepts_lawful_uint_keys() {
 	let src = r#"
 		func uint_value(): int = match (#{1u: 7}) {
 			#{1u: found} -> found,
 			_ -> 0,
 		}
-		func float_value(): int = match (#{1.0: 9}) {
-			#{1.0: found} -> found,
-			_ -> 0,
-		}
 	"#;
 	let mut js = emit_js(src);
-	js.push_str("\nconsole.log(uint_value().v, float_value().v);\n");
-	assert_eq!(run_node(&js), "7 9");
+	js.push_str("\nconsole.log(uint_value().v);\n");
+	assert_eq!(run_node(&js), "7n");
 }
 
 #[test]
@@ -216,12 +269,12 @@ fn separately_constructed_struct_and_enum_keys_use_structural_value_equality() {
 	let struct_src = "struct Point(x: int, y: int)\nfunc value(): int = #{Point(x = 1, y = 2): 7}[Point(x = 1, y = 2)]";
 	let mut struct_js = emit_js(struct_src);
 	struct_js.push_str("\nconsole.log(value().v);\n");
-	assert_eq!(run_node(&struct_js), "7");
+	assert_eq!(run_node(&struct_js), "7n");
 
 	let enum_src = "enum Key { Named(value: int), Empty }\nfunc value(): int = #{Key.Named(value = 1): 9}[Key.Named(value = 1)]";
 	let mut enum_js = emit_js(enum_src);
 	enum_js.push_str("\nconsole.log(value().v);\n");
-	assert_eq!(run_node(&enum_js), "9");
+	assert_eq!(run_node(&enum_js), "9n");
 }
 
 #[test]
@@ -237,22 +290,57 @@ const outer = new NMap([[inner(), new NInt(7)]]);
 console.log(outer.get(inner()).v);
 "#,
 	);
-	assert_eq!(run_node(&js), "7");
+	assert_eq!(run_node(&js), "7n");
 }
 
 #[test]
-fn equal_maps_with_custom_equal_keys_have_equal_hashes() {
+fn structural_hash_and_persistent_hamt_obey_equality_laws() {
 	let mut js = nymph_codegen::box_module_source();
 	js.push_str(
 		r#"
-class CustomKey extends NBox {
-	hash() { return new NInt(42); }
-	equals(other) { return new NBool(other instanceof CustomKey); }
-}
-const inner = value => new NMap([[new CustomKey(value), new NInt(1)]]);
-const outer = new NMap([[inner("left"), new NInt(7)]]);
-console.log(outer.get(inner("right")).v);
+const key = value => {
+	const result = nymphStructuralValue({}, "struct:Key", ["value"]);
+	result.value = new NInt(BigInt(value));
+	return result;
+};
+const signed = new NInt(42n);
+const unsigned = new NUint(42n);
+const crossNumeric = new NMap([[signed, new NString("value")]]);
+
+const left = new NMap()
+	.with(key(1), new NString("one"))
+	.with(key(2), new NString("two"));
+const right = new NMap()
+	.with(key(2), new NString("two"))
+	.with(key(1), new NString("one"));
+const extended = left.with(key(3), new NString("three"));
+const removed = extended.without(key(1));
+
+const hiddenA = nymphStructuralValue({}, "struct:Hidden", ["visible", "hidden"]);
+hiddenA.visible = new NInt(1n);
+hiddenA.hidden = new NInt(2n);
+const hiddenB = nymphStructuralValue({}, "struct:Hidden", ["visible", "hidden"]);
+hiddenB.visible = new NUint(1n);
+hiddenB.hidden = new NInt(2n);
+
+console.log(
+	nymphKeyEquals(signed, unsigned),
+	nymphHash(signed) === nymphHash(unsigned),
+	crossNumeric.get(unsigned).v,
+	nymphKeyEquals(left, right),
+	nymphHash(left) === nymphHash(right),
+	left.size,
+	extended.size,
+	removed.size,
+	left.has(key(1)),
+	removed.has(key(1)),
+	nymphKeyEquals(hiddenA, hiddenB),
+	nymphHash(hiddenA) === nymphHash(hiddenB),
+);
 "#,
 	);
-	assert_eq!(run_node(&js), "7");
+	assert_eq!(
+		run_node(&js),
+		"true true value true true 2 3 2 true false true true"
+	);
 }

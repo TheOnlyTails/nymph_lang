@@ -20,7 +20,8 @@ use crate::{
 	ImplRegistry, InherentRegistry, InstantiationContext, InterfaceDef, InterfaceType, Interner,
 	MemberKind, MemberShape, ModuleEnvironment, ModuleIdentity, NamespaceMemberSig, NamespaceSig,
 	RecoveredDefinitionReference, RecoveredExportedDefinition, RecoveredExportedImpl,
-	RecoveredInterfaceType, Signatures, VariantShape, instantiate_interface_type,
+	RecoveredInterfaceType, Signatures, VariantShape, instantiate_effect_row,
+	instantiate_interface_type,
 };
 
 /// Exact stable identities assigned by the compiler to declarations with runtime
@@ -32,6 +33,8 @@ pub struct CompilerRuntimeRoles {
 	pub debug: Option<InterfaceRuntimeRole>,
 	pub iterable: Option<InterfaceRuntimeRole>,
 	pub iterator: Option<InterfaceRuntimeRole>,
+	pub iteration: Option<IterationRuntimeRole>,
+	pub close: Option<InterfaceRuntimeRole>,
 	pub option: Option<OptionRuntimeRole>,
 	pub result: Option<ResultRuntimeRole>,
 }
@@ -48,6 +51,15 @@ pub struct OptionRuntimeRole {
 	pub some: DefinitionId,
 	pub some_value: DefinitionId,
 	pub none: DefinitionId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IterationRuntimeRole {
+	pub iteration: DefinitionId,
+	pub done: DefinitionId,
+	pub yield_: DefinitionId,
+	pub yield_item: DefinitionId,
+	pub yield_next: DefinitionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -69,8 +81,11 @@ pub(crate) enum RuntimeRoleProvenance {
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct LocalCompilerRuntimeRoles {
+	pub display: Option<DefId>,
 	pub iterable: Option<(DefId, DefinitionId)>,
 	pub iterator: Option<(DefId, DefinitionId)>,
+	pub iteration: Option<DefId>,
+	pub close: Option<(DefId, DefinitionId)>,
 	pub option: Option<DefId>,
 	pub result: Option<DefId>,
 }
@@ -78,7 +93,6 @@ pub(crate) struct LocalCompilerRuntimeRoles {
 #[derive(Debug, Default, Clone)]
 pub struct ImportedFacts {
 	pub defs: DefMap,
-	pub mutable_values: rustc_hash::FxHashSet<crate::DefId>,
 	pub signatures: Signatures,
 	pub interfaces: FxHashMap<crate::DefId, InterfaceDef>,
 	pub implementations: ImplRegistry,
@@ -87,6 +101,7 @@ pub struct ImportedFacts {
 	pub external_abis: FxHashMap<crate::DefId, ExternalAbi>,
 	/// Lossless member facts for namespaces, interfaces, and nominal types.
 	pub definition_members: FxHashMap<crate::DefId, Vec<OwnedMemberSig>>,
+	pub effect_rows: FxHashMap<DefinitionId, crate::EffectRow>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -144,23 +159,21 @@ impl SemanticEnvironment {
 		modules: &[Arc<ModuleEnvironment>],
 		compiler_runtime_roles: CompilerRuntimeRoles,
 	) -> Result<Self, EnvironmentConstructionError> {
+		let modules = modules
+			.iter()
+			.map(|module| Arc::new(module.available_to(&current)))
+			.collect::<Vec<_>>();
 		let mut imported = ImportedFacts::default();
 		let mut module_exports: FxHashMap<ModuleIdentity, ModuleExportIndex> = FxHashMap::default();
 		let mut contains_recovery = false;
 
-		for module in modules {
+		for module in &modules {
 			match module.as_ref() {
 				ModuleEnvironment::Complete(interface) => {
 					let index = module_exports.entry(interface.module.clone()).or_default();
 					for definition in &interface.exports {
 						allocate_complete_definition(&mut imported.defs, definition, true)?;
-						if definition.declaration_kind == Some(crate::MemberKind::MutableValue) {
-							let id = imported
-								.defs
-								.by_stable(&definition.id)
-								.expect("allocated exported definition");
-							imported.mutable_values.insert(id);
-						}
+						record_effects(&mut imported.effect_rows, definition);
 						index
 							.by_name
 							.insert(definition.name.clone(), definition.id.clone());
@@ -168,9 +181,15 @@ impl SemanticEnvironment {
 					}
 					for support in &interface.support_definitions {
 						allocate_complete_definition(&mut imported.defs, &support.definition, false)?;
+						record_effects(&mut imported.effect_rows, &support.definition);
 					}
 					for implementation in &interface.implementations {
 						allocate_complete_impl_references(&mut imported.defs, implementation)?;
+						for member in &implementation.members {
+							imported
+								.effect_rows
+								.insert(member.id.clone(), member.effects.clone());
+						}
 					}
 				}
 				ModuleEnvironment::Recovered(interface) => {
@@ -178,13 +197,7 @@ impl SemanticEnvironment {
 					let index = module_exports.entry(interface.module.clone()).or_default();
 					for definition in &interface.exports {
 						allocate_recovered_definition(&mut imported.defs, definition, true)?;
-						if definition.declaration_kind == Some(crate::MemberKind::MutableValue) {
-							let id = imported
-								.defs
-								.by_stable(&definition.id)
-								.expect("allocated recovered exported definition");
-							imported.mutable_values.insert(id);
-						}
+						record_recovered_effects(&mut imported.effect_rows, definition);
 						index
 							.by_name
 							.insert(definition.name.clone(), definition.id.clone());
@@ -192,9 +205,17 @@ impl SemanticEnvironment {
 					}
 					for support in &interface.support_definitions {
 						allocate_recovered_definition(&mut imported.defs, &support.definition, false)?;
+						record_recovered_effects(&mut imported.effect_rows, &support.definition);
 					}
 					for implementation in &interface.implementations {
 						allocate_recovered_impl_references(&mut imported.defs, implementation)?;
+						for member in &implementation.members {
+							if let crate::RecoveredEffectRow::Known(effects) = &member.effects {
+								imported
+									.effect_rows
+									.insert(member.id.clone(), effects.clone());
+							}
+						}
 					}
 				}
 			}
@@ -204,7 +225,7 @@ impl SemanticEnvironment {
 		// checker-local allocation, so conversion can never allocate on demand.
 		let definitions = Arc::new(definition_map(&imported.defs));
 		let mut interner = Interner::new();
-		for module in modules {
+		for module in &modules {
 			match module.as_ref() {
 				ModuleEnvironment::Complete(interface) => {
 					for definition in interface.exports.iter().chain(
@@ -241,7 +262,7 @@ impl SemanticEnvironment {
 		// Interfaces from every dependency are complete before candidates are indexed:
 		// default-method completion and stable interface lookup must not depend on a
 		// definition's position within one module summary.
-		for module in modules {
+		for module in &modules {
 			match module.as_ref() {
 				ModuleEnvironment::Complete(interface) => {
 					for implementation in &interface.implementations {
@@ -322,7 +343,6 @@ impl SemanticEnvironment {
 									.map(|sig| NamespaceMemberSig::Value {
 										target: Some(stable.clone()),
 										ty: sig.ty,
-										mutable: false,
 									})
 							};
 							if let Some(member) = member {
@@ -339,6 +359,44 @@ impl SemanticEnvironment {
 	}
 }
 
+fn record_effects(
+	rows: &mut FxHashMap<DefinitionId, crate::EffectRow>,
+	definition: &ExportedDefinition,
+) {
+	rows.insert(definition.id.clone(), definition.effects.clone());
+	rows.extend(
+		definition
+			.members
+			.iter()
+			.map(|member| (member.id.clone(), member.effects.clone())),
+	);
+	rows.extend(definition.fields.iter().filter_map(|field| {
+		field
+			.default_effects
+			.clone()
+			.map(|effects| (field.id.clone(), effects))
+	}));
+}
+
+fn record_recovered_effects(
+	rows: &mut FxHashMap<DefinitionId, crate::EffectRow>,
+	definition: &RecoveredExportedDefinition,
+) {
+	if let crate::RecoveredEffectRow::Known(effects) = &definition.effects {
+		rows.insert(definition.id.clone(), effects.clone());
+	}
+	for member in &definition.members {
+		if let crate::RecoveredEffectRow::Known(effects) = &member.effects {
+			rows.insert(member.id.clone(), effects.clone());
+		}
+	}
+	for field in &definition.fields {
+		if let Some(effects) = &field.default_effects {
+			rows.insert(field.id.clone(), effects.clone());
+		}
+	}
+}
+
 fn shape_kind(kind: DefinitionShapeKind) -> DefKind {
 	match kind {
 		DefinitionShapeKind::Function => DefKind::Func,
@@ -348,6 +406,7 @@ fn shape_kind(kind: DefinitionShapeKind) -> DefKind {
 		DefinitionShapeKind::Enum => DefKind::Enum,
 		DefinitionShapeKind::Interface => DefKind::Interface,
 		DefinitionShapeKind::Namespace => DefKind::Namespace,
+		DefinitionShapeKind::Effect => DefKind::Effect,
 	}
 }
 
@@ -368,6 +427,7 @@ fn inferred_kind(id: &DefinitionId) -> DefKind {
 		DeclarationCategory::Enum | DeclarationCategory::Variant => DefKind::Enum,
 		DeclarationCategory::Interface => DefKind::Interface,
 		DeclarationCategory::Namespace => DefKind::Namespace,
+		DeclarationCategory::Effect => DefKind::Effect,
 		DeclarationCategory::Struct | DeclarationCategory::Implementation => DefKind::Struct,
 	}
 }
@@ -406,6 +466,18 @@ fn id_name(id: &DefinitionId) -> EcoString {
 	}
 }
 
+fn walk_effects(
+	defs: &mut DefMap,
+	effects: &crate::EffectRow,
+) -> Result<(), EnvironmentConstructionError> {
+	for atom in effects.atoms() {
+		if let crate::EffectAtom::Nominal(definition) = atom {
+			allocate_reference(defs, definition)?;
+		}
+	}
+	Ok(())
+}
+
 fn walk_type(defs: &mut DefMap, ty: &InterfaceType) -> Result<(), EnvironmentConstructionError> {
 	match ty {
 		InterfaceType::Named {
@@ -421,7 +493,7 @@ fn walk_type(defs: &mut DefMap, ty: &InterfaceType) -> Result<(), EnvironmentCon
 				walk_type(defs, ty)?;
 			}
 		}
-		InterfaceType::List(ty) | InterfaceType::Mutable(ty) => walk_type(defs, ty)?,
+		InterfaceType::List(ty) => walk_type(defs, ty)?,
 		InterfaceType::Tuple(types) | InterfaceType::Intersection(types) => {
 			for ty in types {
 				walk_type(defs, ty)?;
@@ -434,11 +506,13 @@ fn walk_type(defs: &mut DefMap, ty: &InterfaceType) -> Result<(), EnvironmentCon
 		InterfaceType::Function {
 			parameters,
 			return_type,
+			effects,
 		} => {
 			for ty in parameters {
 				walk_type(defs, ty)?;
 			}
 			walk_type(defs, return_type)?;
+			walk_effects(defs, effects)?;
 		}
 		_ => {}
 	}
@@ -454,6 +528,7 @@ fn walk_member(
 		walk_type(defs, &parameter.ty)?;
 	}
 	walk_type(defs, &member.return_type)?;
+	walk_effects(defs, &member.effects)?;
 	if let Some(owner) = &member.runtime_owner {
 		allocate_reference(defs, owner)?;
 	}
@@ -516,6 +591,7 @@ fn allocate_complete_definition(
 	if let Some(ty) = &definition.return_type {
 		walk_type(defs, ty)?;
 	}
+	walk_effects(defs, &definition.effects)?;
 	if let Some(ty) = &definition.ty {
 		walk_type(defs, ty)?;
 	}
@@ -547,6 +623,9 @@ fn allocate_complete_impl_references(
 	for (_, ty) in &implementation.interface_arguments {
 		walk_type(defs, ty)?;
 	}
+	for (_, effects) in &implementation.interface_effect_arguments {
+		walk_effects(defs, effects)?;
+	}
 	for constraint in &implementation.constraints {
 		allocate_reference(defs, &constraint.interface)?;
 	}
@@ -565,6 +644,16 @@ fn walk_recovered_type(
 ) -> Result<(), EnvironmentConstructionError> {
 	if let RecoveredInterfaceType::Known(ty) = ty {
 		walk_type(defs, ty)?;
+	}
+	Ok(())
+}
+
+fn walk_recovered_effects(
+	defs: &mut DefMap,
+	effects: &crate::RecoveredEffectRow,
+) -> Result<(), EnvironmentConstructionError> {
+	if let crate::RecoveredEffectRow::Known(effects) = effects {
+		walk_effects(defs, effects)?;
 	}
 	Ok(())
 }
@@ -592,6 +681,7 @@ fn allocate_recovered_definition(
 	if let Some(ty) = &definition.return_type {
 		walk_recovered_type(defs, ty)?;
 	}
+	walk_recovered_effects(defs, &definition.effects)?;
 	if let Some(ty) = &definition.ty {
 		walk_recovered_type(defs, ty)?;
 	}
@@ -612,6 +702,7 @@ fn allocate_recovered_definition(
 			walk_recovered_type(defs, &parameter.ty)?;
 		}
 		walk_recovered_type(defs, &member.return_type)?;
+		walk_recovered_effects(defs, &member.effects)?;
 	}
 	for super_interface in &definition.super_interfaces {
 		if let RecoveredDefinitionReference::Known(id) = &super_interface.interface {
@@ -635,6 +726,9 @@ fn allocate_recovered_impl_references(
 	for (_, ty) in &implementation.interface_arguments {
 		walk_recovered_type(defs, ty)?;
 	}
+	for (_, effects) in &implementation.interface_effect_arguments {
+		walk_recovered_effects(defs, effects)?;
+	}
 	for constraint in &implementation.constraints {
 		if let RecoveredDefinitionReference::Known(id) = &constraint.interface {
 			allocate_reference(defs, id)?;
@@ -642,6 +736,7 @@ fn allocate_recovered_impl_references(
 	}
 	for member in &implementation.members {
 		allocate_reference(defs, &member.id)?;
+		walk_recovered_effects(defs, &member.effects)?;
 	}
 	if let Some(owner) = &implementation.runtime_owner {
 		allocate_reference(defs, owner)?;
@@ -708,10 +803,16 @@ fn bounds(
 					.iter()
 					.map(|(name, ty)| (name.clone(), instantiate_interface_type(interner, ty, &ctx))),
 			);
+			let effect_args = constraint
+				.effect_args
+				.iter()
+				.map(|(name, effects)| (name.clone(), instantiate_effect_row(effects, &ctx)))
+				.collect();
 			Ok(Bound {
 				ty,
 				interface,
 				args,
+				effect_args,
 			})
 		})
 		.collect()
@@ -724,6 +825,7 @@ fn func_sig(
 	constraints: &[crate::GenericConstraint],
 	parameters: &[crate::ParameterShape<InterfaceType>],
 	ret: &InterfaceType,
+	effects: &crate::EffectRow,
 	definitions: &Arc<HashMap<DefinitionId, DefId>>,
 ) -> Result<FuncSig, EnvironmentConstructionError> {
 	let ctx = context(definitions, binders);
@@ -738,8 +840,10 @@ fn func_sig(
 	let ret = instantiate_interface_type(interner, ret, &ctx);
 	Ok(FuncSig {
 		generics: binders.iter().map(|binder| binder.name.clone()).collect(),
+		generic_kinds: binders.iter().map(|binder| binder.kind).collect(),
 		params,
 		ret,
+		effects: instantiate_effect_row(effects, &ctx),
 		has_self: false,
 		bounds: bounds(defs, interner, binders, constraints, definitions)?,
 	})
@@ -761,15 +865,18 @@ fn owned_member(
 		&member.constraints,
 		&member.parameters,
 		&member.return_type,
+		&member.effects,
 		definitions,
 	)?;
 	Ok(OwnedMemberSig {
 		target: member.id.clone(),
 		kind: member.kind,
 		generics: sig.generics,
+		generic_kinds: sig.generic_kinds,
 		bounds: sig.bounds,
 		params: sig.params,
 		ret: sig.ret,
+		effects: sig.effects,
 		has_default: member.has_default,
 		external: member.external.clone(),
 	})
@@ -789,6 +896,7 @@ fn recovered_owned_member(
 		target: member.id.clone(),
 		kind: member.kind,
 		generics: binders.iter().map(|binder| binder.name.clone()).collect(),
+		generic_kinds: binders.iter().map(|binder| binder.kind).collect(),
 		bounds: recovered_bounds(defs, interner, &binders, &member.constraints, definitions)?,
 		params: member
 			.parameters
@@ -800,8 +908,15 @@ fn recovered_owned_member(
 			})
 			.collect(),
 		ret: recovered_ty(interner, &member.return_type, &ctx),
+		effects: match &member.effects {
+			crate::RecoveredEffectRow::Known(effects) => instantiate_effect_row(effects, &ctx),
+			crate::RecoveredEffectRow::Poison => crate::ty::EffectRow::pure(),
+		},
 		has_default: member.has_default,
-		external: member.external.clone(),
+		external: member
+			.external
+			.as_ref()
+			.and_then(crate::ExternalAbi::complete),
 	})
 }
 
@@ -858,6 +973,7 @@ fn instantiate_complete_definition(
 					&definition.constraints,
 					&definition.parameters,
 					ret,
+					&definition.effects,
 					definitions,
 				)?,
 			);
@@ -880,7 +996,6 @@ fn instantiate_complete_definition(
 			let fields = definition
 				.fields
 				.iter()
-				.filter(|field| field.visibility != Some(nymph_ast::decl::Visibility::Private))
 				.map(|field| {
 					(
 						field.name.clone(),
@@ -896,10 +1011,11 @@ fn instantiate_complete_definition(
 					field_metadata: definition
 						.fields
 						.iter()
-						.filter(|field| field.visibility != Some(nymph_ast::decl::Visibility::Private))
 						.map(|field| FieldSigMetadata {
 							target: Some(field.id.clone()),
-							mutable: field.mutable,
+							visibility: field
+								.visibility
+								.unwrap_or(nymph_ast::decl::Visibility::Internal),
 							has_default: field.has_default,
 						})
 						.collect(),
@@ -908,6 +1024,26 @@ fn instantiate_complete_definition(
 			);
 		}
 		DefinitionShapeKind::Enum => {
+			let native_variants = definition
+				.variants
+				.iter()
+				.map(|variant| variant.id.clone())
+				.collect::<std::collections::HashSet<_>>();
+			let embeddings = definition
+				.enum_view_variants
+				.iter()
+				.filter(|variant| !native_variants.contains(*variant))
+				.filter_map(|variant| {
+					let variant = facts.defs.by_stable(variant)?;
+					let DefKind::Variant { enum_def, .. } = facts.defs.data(variant).kind else {
+						return None;
+					};
+					Some(crate::def::EnumEmbeddingSig {
+						source: enum_def,
+						variant: Some(variant),
+					})
+				})
+				.collect();
 			let variants = definition
 				.variants
 				.iter()
@@ -929,7 +1065,9 @@ fn instantiate_complete_definition(
 						.iter()
 						.map(|field| FieldSigMetadata {
 							target: Some(field.id.clone()),
-							mutable: field.mutable,
+							visibility: field
+								.visibility
+								.unwrap_or(nymph_ast::decl::Visibility::Internal),
 							has_default: field.has_default,
 						})
 						.collect(),
@@ -939,6 +1077,7 @@ fn instantiate_complete_definition(
 				def,
 				EnumSig {
 					generics,
+					embeddings,
 					variants,
 					bounds: definition_bounds,
 				},
@@ -970,24 +1109,22 @@ fn instantiate_complete_definition(
 				let member_ctx = context(definitions, &member_binders);
 				let target = Some(member.id.clone());
 				let value = match member.kind {
-					MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction => {
-						NamespaceMemberSig::Func {
-							target,
-							sig: func_sig(
-								&facts.defs,
-								interner,
-								&member_binders,
-								&[],
-								&member.parameters,
-								&member.return_type,
-								definitions,
-							)?,
-						}
-					}
+					MemberKind::Function | MemberKind::StaticFunction => NamespaceMemberSig::Func {
+						target,
+						sig: func_sig(
+							&facts.defs,
+							interner,
+							&member_binders,
+							&[],
+							&member.parameters,
+							&member.return_type,
+							&member.effects,
+							definitions,
+						)?,
+					},
 					_ => NamespaceMemberSig::Value {
 						target,
 						ty: instantiate_interface_type(interner, &member.return_type, &member_ctx),
-						mutable: matches!(member.kind, MemberKind::MutableValue),
 					},
 				};
 				namespace.members.insert(member.name.clone(), value);
@@ -997,6 +1134,11 @@ fn instantiate_complete_definition(
 		DefinitionShapeKind::Interface => {
 			let mut interface = InterfaceDef {
 				generics,
+				generic_kinds: definition
+					.binders
+					.iter()
+					.map(|binder| binder.kind)
+					.collect(),
 				runtime_members: definition
 					.members
 					.iter()
@@ -1007,7 +1149,7 @@ fn instantiate_complete_definition(
 						kind: member.kind,
 						has_default: member.has_default,
 						external: member.external.is_some(),
-						marshal: member.external.as_ref().and_then(|abi| abi.marshal),
+						marshal: member.external.as_ref().and_then(|abi| abi.marshal.result),
 					})
 					.collect(),
 				methods: FxHashMap::default(),
@@ -1017,10 +1159,7 @@ fn instantiate_complete_definition(
 				.iter()
 				.filter(|member| member.visibility != Some(nymph_ast::decl::Visibility::Private))
 			{
-				if matches!(
-					member.kind,
-					MemberKind::Function | MemberKind::MutatingFunction
-				) {
+				if matches!(member.kind, MemberKind::Function) {
 					let mut member_binders = definition.binders.clone();
 					member_binders.extend(member.binders.clone());
 					let sig = func_sig(
@@ -1030,6 +1169,7 @@ fn instantiate_complete_definition(
 						&[],
 						&member.parameters,
 						&member.return_type,
+						&member.effects,
 						definitions,
 					)?;
 					interface.methods.insert(
@@ -1039,15 +1179,16 @@ fn instantiate_complete_definition(
 							has_default: member.has_default,
 							params: sig.params.into_iter().map(|p| p.ty).collect(),
 							ret: sig.ret,
+							effects: sig.effects,
 							generics: member.binders.iter().map(|b| b.name.clone()).collect(),
 							bounds: sig.bounds,
-							mutating: matches!(member.kind, MemberKind::MutatingFunction),
 						},
 					);
 				}
 			}
 			facts.interfaces.insert(def, interface);
 		}
+		DefinitionShapeKind::Effect => {}
 	}
 	if let Some(external) = &definition.external {
 		facts.external_abis.insert(def, external.clone());
@@ -1083,12 +1224,12 @@ fn complete_inherent_method(
 			.map(|parameter| parameter.ty)
 			.collect(),
 		ret: owned.ret,
+		effects: owned.effects,
 		bounds: owned.bounds,
 		namespaced: matches!(
 			member.kind,
 			MemberKind::StaticFunction | MemberKind::StaticValue
 		),
-		mutating: matches!(member.kind, MemberKind::MutatingFunction),
 		external: member.external.is_some(),
 	})
 }
@@ -1120,7 +1261,7 @@ fn instantiate_definition_inherent(
 			member.visibility != Some(nymph_ast::decl::Visibility::Private)
 				&& matches!(
 					member.kind,
-					MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction
+					MemberKind::Function | MemberKind::StaticFunction
 				)
 		})
 		.map(|member| {
@@ -1177,7 +1318,7 @@ fn instantiate_complete_impl(
 		.filter(|member| {
 			matches!(
 				member.kind,
-				MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction
+				MemberKind::Function | MemberKind::StaticFunction
 			)
 		})
 		.map(|member| {
@@ -1195,9 +1336,9 @@ fn instantiate_complete_impl(
 					has_default: false,
 					params: method.params,
 					ret: method.ret,
+					effects: method.effects,
 					generics: method.generic_names,
 					bounds: method.bounds,
-					mutating: method.mutating,
 				},
 			))
 		})
@@ -1211,6 +1352,11 @@ fn instantiate_complete_impl(
 			.interface_arguments
 			.iter()
 			.map(|(name, ty)| (name.clone(), instantiate_interface_type(interner, ty, &ctx)))
+			.collect();
+		let effect_args = implementation
+			.interface_effect_arguments
+			.iter()
+			.map(|(name, effects)| (name.clone(), instantiate_effect_row(effects, &ctx)))
 			.collect();
 		let blanket = matches!(interner.kind(self_ty), crate::TyKind::Param(_));
 		facts.implementations.add(
@@ -1227,7 +1373,7 @@ fn instantiate_complete_impl(
 						kind: member.kind,
 						has_default: member.has_default,
 						external: member.external.is_some(),
-						marshal: member.external.as_ref().and_then(|abi| abi.marshal),
+						marshal: member.external.as_ref().and_then(|abi| abi.marshal.result),
 					})
 					.collect(),
 				generics: implementation
@@ -1235,10 +1381,12 @@ fn instantiate_complete_impl(
 					.iter()
 					.map(|b| b.name.clone())
 					.collect(),
+				generic_kinds: implementation.binders.iter().map(|b| b.kind).collect(),
 				self_ty,
 				interface,
 				source_span: None,
 				args,
+				effect_args,
 				methods,
 				constraints,
 				blanket,
@@ -1252,7 +1400,7 @@ fn instantiate_complete_impl(
 				member.visibility != Some(nymph_ast::decl::Visibility::Private)
 					&& matches!(
 						member.kind,
-						MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction
+						MemberKind::Function | MemberKind::StaticFunction
 					)
 			})
 			.map(|member| {
@@ -1336,10 +1484,16 @@ fn recovered_bounds(
 					.iter()
 					.map(|(name, arg)| (name.clone(), recovered_ty(interner, arg, &ctx))),
 			);
+			let effect_args = constraint
+				.effect_args
+				.iter()
+				.map(|(name, effects)| (name.clone(), instantiate_effect_row(effects, &ctx)))
+				.collect();
 			Ok(Bound {
 				ty,
 				interface,
 				args,
+				effect_args,
 			})
 		})
 		.collect()
@@ -1426,16 +1580,16 @@ fn instantiate_recovered_definition(
 					fields: definition
 						.fields
 						.iter()
-						.filter(|field| field.visibility != Some(nymph_ast::decl::Visibility::Private))
 						.map(|f| (f.name.clone(), recovered_ty(interner, &f.ty, &ctx)))
 						.collect(),
 					field_metadata: definition
 						.fields
 						.iter()
-						.filter(|field| field.visibility != Some(nymph_ast::decl::Visibility::Private))
 						.map(|field| FieldSigMetadata {
 							target: Some(field.id.clone()),
-							mutable: field.mutable,
+							visibility: field
+								.visibility
+								.unwrap_or(nymph_ast::decl::Visibility::Internal),
 							has_default: field.has_default,
 						})
 						.collect(),
@@ -1450,10 +1604,31 @@ fn instantiate_recovered_definition(
 			);
 		}
 		DefinitionShapeKind::Enum => {
+			let native_variants = definition
+				.variants
+				.iter()
+				.map(|variant| variant.id.clone())
+				.collect::<std::collections::HashSet<_>>();
+			let embeddings = definition
+				.enum_view_variants
+				.iter()
+				.filter(|variant| !native_variants.contains(*variant))
+				.filter_map(|variant| {
+					let variant = facts.defs.by_stable(variant)?;
+					let DefKind::Variant { enum_def, .. } = facts.defs.data(variant).kind else {
+						return None;
+					};
+					Some(crate::def::EnumEmbeddingSig {
+						source: enum_def,
+						variant: Some(variant),
+					})
+				})
+				.collect();
 			facts.signatures.enums.insert(
 				def,
 				EnumSig {
 					generics,
+					embeddings,
 					variants: definition
 						.variants
 						.iter()
@@ -1470,7 +1645,9 @@ fn instantiate_recovered_definition(
 								.iter()
 								.map(|field| FieldSigMetadata {
 									target: Some(field.id.clone()),
-									mutable: field.mutable,
+									visibility: field
+										.visibility
+										.unwrap_or(nymph_ast::decl::Visibility::Internal),
 									has_default: field.has_default,
 								})
 								.collect(),
@@ -1504,8 +1681,17 @@ fn instantiate_recovered_definition(
 				def,
 				FuncSig {
 					generics,
+					generic_kinds: definition
+						.binders
+						.iter()
+						.map(|binder| binder.kind)
+						.collect(),
 					params,
 					ret,
+					effects: match &definition.effects {
+						crate::RecoveredEffectRow::Known(effects) => instantiate_effect_row(effects, &ctx),
+						crate::RecoveredEffectRow::Poison => crate::ty::EffectRow::pure(),
+					},
 					has_self: false,
 					bounds: recovered_bounds(
 						&facts.defs,
@@ -1527,22 +1713,21 @@ fn instantiate_recovered_definition(
 			{
 				let target = Some(member.target.clone());
 				let value = match member.kind {
-					MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction => {
-						NamespaceMemberSig::Func {
-							target,
-							sig: FuncSig {
-								generics: member.generics.clone(),
-								params: member.params.clone(),
-								ret: member.ret,
-								has_self: false,
-								bounds: member.bounds.clone(),
-							},
-						}
-					}
+					MemberKind::Function | MemberKind::StaticFunction => NamespaceMemberSig::Func {
+						target,
+						sig: FuncSig {
+							generics: member.generics.clone(),
+							generic_kinds: member.generic_kinds.clone(),
+							params: member.params.clone(),
+							ret: member.ret,
+							effects: member.effects.clone(),
+							has_self: false,
+							bounds: member.bounds.clone(),
+						},
+					},
 					_ => NamespaceMemberSig::Value {
 						target,
 						ty: member.ret,
-						mutable: matches!(member.kind, MemberKind::MutableValue),
 					},
 				};
 				namespace.members.insert(shape.name.clone(), value);
@@ -1557,6 +1742,11 @@ fn instantiate_recovered_definition(
 				.zip(&facts.definition_members[&def]);
 			let mut interface = InterfaceDef {
 				generics,
+				generic_kinds: definition
+					.binders
+					.iter()
+					.map(|binder| binder.kind)
+					.collect(),
 				runtime_members: visible
 					.clone()
 					.map(|(shape, member)| crate::iface::RuntimeMemberDef {
@@ -1565,16 +1755,13 @@ fn instantiate_recovered_definition(
 						kind: member.kind,
 						has_default: member.has_default,
 						external: shape.external.is_some(),
-						marshal: shape.external.as_ref().and_then(|abi| abi.marshal),
+						marshal: shape.external.as_ref().and_then(|abi| abi.marshal.result),
 					})
 					.collect(),
 				methods: FxHashMap::default(),
 			};
 			for (shape, member) in visible {
-				if matches!(
-					member.kind,
-					MemberKind::Function | MemberKind::MutatingFunction
-				) {
+				if matches!(member.kind, MemberKind::Function) {
 					interface.methods.insert(
 						shape.name.clone(),
 						crate::iface::IfaceMethod {
@@ -1582,18 +1769,23 @@ fn instantiate_recovered_definition(
 							has_default: member.has_default,
 							params: member.params.iter().map(|p| p.ty).collect(),
 							ret: member.ret,
+							effects: member.effects.clone(),
 							generics: shape.binders.iter().map(|b| b.name.clone()).collect(),
 							bounds: member.bounds.clone(),
-							mutating: matches!(member.kind, MemberKind::MutatingFunction),
 						},
 					);
 				}
 			}
 			facts.interfaces.insert(def, interface);
 		}
+		DefinitionShapeKind::Effect => {}
 	}
-	if let Some(external) = &definition.external {
-		facts.external_abis.insert(def, external.clone());
+	if let Some(external) = definition
+		.external
+		.as_ref()
+		.and_then(crate::ExternalAbi::complete)
+	{
+		facts.external_abis.insert(def, external);
 	}
 	if definition.availability == crate::SemanticAvailability::Available
 		&& matches!(
@@ -1614,7 +1806,7 @@ fn instantiate_recovered_definition(
 				member.visibility != Some(nymph_ast::decl::Visibility::Private)
 					&& matches!(
 						member.kind,
-						MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction
+						MemberKind::Function | MemberKind::StaticFunction
 					)
 			})
 			.map(|member| {
@@ -1641,12 +1833,12 @@ fn instantiate_recovered_definition(
 							.map(|parameter| parameter.ty)
 							.collect(),
 						ret: owned.ret,
+						effects: owned.effects,
 						bounds: owned.bounds,
 						namespaced: matches!(
 							member.kind,
 							MemberKind::StaticFunction | MemberKind::StaticValue
 						),
-						mutating: matches!(member.kind, MemberKind::MutatingFunction),
 						external: member.external.is_some(),
 					},
 				))
@@ -1720,7 +1912,7 @@ fn instantiate_recovered_impl(
 			member.visibility != Some(nymph_ast::decl::Visibility::Private)
 				&& matches!(
 					member.kind,
-					MemberKind::Function | MemberKind::MutatingFunction | MemberKind::StaticFunction
+					MemberKind::Function | MemberKind::StaticFunction
 				)
 		})
 		.map(|member| {
@@ -1742,13 +1934,13 @@ fn instantiate_recovered_impl(
 						.map(|parameter| parameter.ty)
 						.collect(),
 					ret: owned.ret,
+					effects: owned.effects,
 					generics: member
 						.binders
 						.iter()
 						.map(|binder| binder.name.clone())
 						.collect(),
 					bounds: owned.bounds,
-					mutating: matches!(member.kind, MemberKind::MutatingFunction),
 				},
 			))
 		})
@@ -1763,6 +1955,19 @@ fn instantiate_recovered_impl(
 				.interface_arguments
 				.iter()
 				.map(|(name, ty)| (name.clone(), recovered_ty(interner, ty, &ctx)))
+				.collect();
+			let effect_args = implementation
+				.interface_effect_arguments
+				.iter()
+				.map(|(name, effects)| {
+					(
+						name.clone(),
+						match effects {
+							crate::RecoveredEffectRow::Known(effects) => instantiate_effect_row(effects, &ctx),
+							crate::RecoveredEffectRow::Poison => crate::ty::EffectRow::pure(),
+						},
+					)
+				})
 				.collect();
 			let blanket = matches!(interner.kind(self_ty), crate::TyKind::Param(_));
 			facts.implementations.add(
@@ -1779,7 +1984,7 @@ fn instantiate_recovered_impl(
 							kind: member.kind,
 							has_default: member.has_default,
 							external: member.external.is_some(),
-							marshal: member.external.as_ref().and_then(|abi| abi.marshal),
+							marshal: member.external.as_ref().and_then(|abi| abi.marshal.result),
 						})
 						.collect(),
 					generics: implementation
@@ -1787,10 +1992,12 @@ fn instantiate_recovered_impl(
 						.iter()
 						.map(|b| b.name.clone())
 						.collect(),
+					generic_kinds: implementation.binders.iter().map(|b| b.kind).collect(),
 					self_ty,
 					interface,
 					source_span: None,
 					args,
+					effect_args,
 					methods,
 					constraints,
 					blanket,
@@ -1809,6 +2016,7 @@ fn instantiate_recovered_impl(
 							generic_names: method.generics,
 							params: method.params,
 							ret: method.ret,
+							effects: method.effects,
 							bounds: method.bounds,
 							namespaced: implementation
 								.members
@@ -1820,7 +2028,6 @@ fn instantiate_recovered_impl(
 										MemberKind::StaticFunction | MemberKind::StaticValue
 									)
 								}),
-							mutating: method.mutating,
 							external: implementation
 								.members
 								.iter()

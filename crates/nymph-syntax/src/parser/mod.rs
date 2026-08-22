@@ -185,6 +185,13 @@ impl<'src> Parser<'src> {
 					.unwrap_or_else(|| self.current_span());
 				Spanned(name, span)
 			}
+			Some(Token::Echo) => {
+				let span = self
+					.advance()
+					.map(|token| token.1)
+					.unwrap_or_else(|| self.current_span());
+				Spanned("echo".into(), span)
+			}
 			_ => {
 				let found = self.peek().map_or("end of input", Token::describe);
 				let span = self.current_span();
@@ -205,6 +212,7 @@ impl<'src> Parser<'src> {
 			if matches!(
 				token,
 				Token::Func
+					| Token::Async
 					| Token::Let
 					| Token::Struct
 					| Token::Enum
@@ -217,6 +225,7 @@ impl<'src> Parser<'src> {
 					| Token::Internal
 					| Token::Private
 					| Token::External
+					| Token::Effect
 			) {
 				break;
 			}

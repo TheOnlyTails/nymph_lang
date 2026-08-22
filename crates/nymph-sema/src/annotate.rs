@@ -25,6 +25,7 @@ pub struct CheckedSemantic {
 	pub(crate) implementations: crate::iface::ImplRegistry,
 	pub(crate) inherent: Vec<CheckedInherentImpl>,
 	pub(crate) anonymous_bounds: FxHashMap<crate::ParamIdx, Vec<crate::iface::Bound>>,
+	pub(crate) effect_rows: FxHashMap<DefinitionId, crate::EffectRow>,
 	pub local_definitions: std::ops::Range<usize>,
 	pub local_implementations: std::ops::Range<usize>,
 	pub local_inherent: std::ops::Range<usize>,
@@ -76,6 +77,11 @@ impl CheckedSemantic {
 	pub fn stable_definition(&self, id: crate::DefId) -> Option<&DefinitionId> {
 		self.definitions.stable(id)
 	}
+
+	#[must_use]
+	pub fn effect_row(&self, id: &DefinitionId) -> Option<&crate::EffectRow> {
+		self.effect_rows.get(id)
+	}
 }
 
 /// How a resolved binary operator must be emitted by codegen.
@@ -87,6 +93,9 @@ pub enum DispatchKind {
 	/// A built-in default whose semantics short-circuit (`&&`, `||`), lowered to
 	/// lazy control flow rather than an eager call.
 	BuiltinShortCircuit,
+	/// Equality between overlapping enum views. The values are erased at runtime,
+	/// but enum construction installs source-variant structural equality methods.
+	BuiltinStructuralEquality,
 	/// A method defined directly in a user impl: compile to `lhs.method(rhs)`.
 	UserImpl,
 	/// Resolved to an interface *default* method body (e.g. `Comparable`'s
@@ -191,11 +200,11 @@ pub struct VariantResolution {
 
 /// How a `for` loop's source was proven iterable, once the syntactic-range and
 /// native-list fast paths are ruled out (see `infer_iterable_element`). Recorded
-/// on the iterable expression's `NodeId` so lowering (`lower_for`), which has no
+/// on the iterable expression's `NodeId` so lowering (`lower_iteration`), which has no
 /// solver access of its own, can tell a source that IS the iterator (call
-/// `.next` directly) apart from one that must first be turned into one (call
-/// `.iter`). Both desugar to the same while/match protocol; only the first
-/// statement of the desugared block differs.
+/// `.next()` directly) apart from one that must first be turned into one (call
+/// `.iter()`). Both use the same runtime iteration protocol; only source
+/// preparation differs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IterMode {
 	/// The source itself implements `Iterator<Item>` — use it as-is.
@@ -233,9 +242,8 @@ pub enum GenericSymbolIdentity {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Annotations {
 	infos: FxHashMap<NodeId, ExprInfo>,
-	/// Expressions whose `uint` value is implicitly widened to `int` at this use site.
-	/// Lowering reboxes these nodes as `NInt`, preserving the declared runtime type.
-	implicit_uint_to_int: FxHashSet<NodeId>,
+	/// Resolved `Close.close` dispatch for a managed initializer.
+	managed_cleanups: FxHashMap<NodeId, Resolution>,
 	member_completions: FxHashMap<NodeId, Vec<MemberCompletion>>,
 	unresolved_qualified_accesses: Vec<UnresolvedQualifiedAccess>,
 	direct_namespace_members: FxHashSet<NodeId>,
@@ -262,6 +270,7 @@ pub struct Annotations {
 	/// checker resolves it to the constructor's sole field; lowering reads this back to
 	/// emit the field access, having no type access of its own.
 	positional_fields: FxHashMap<Span, PositionalFieldResolution>,
+	struct_constructions: FxHashMap<NodeId, StructConstructionPlan>,
 	/// A `for` loop's iterable, keyed by its own `NodeId` — see [`IterMode`].
 	iter_modes: FxHashMap<NodeId, IterMode>,
 	/// Resolution of the implicit `.iter` call inserted for an iterable source.
@@ -290,13 +299,20 @@ pub struct Annotations {
 	/// share a source node (notably a callable and its directly labeled body).
 	/// Lowering must never repeat name lookup.
 	control_targets: FxHashMap<NodeId, ResolvedControlTarget>,
-	propagations: FxHashMap<NodeId, PropagationKind>,
+	propagations: FxHashMap<NodeId, Propagation>,
+	range_proofs: FxHashMap<NodeId, crate::RangeProof>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PropagationKind {
 	Option,
 	Result,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Propagation {
+	pub kind: PropagationKind,
+	pub conversion: Option<Box<Resolution>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -318,15 +334,39 @@ pub struct PositionalFieldResolution {
 	pub definition: Option<DefinitionId>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StructConstructionMode {
+	Fresh,
+	CloneUpdate { source: NodeId },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StructConstructionPlan {
+	pub definition: DefinitionId,
+	pub mode: StructConstructionMode,
+	pub explicit_fields: Vec<(DefinitionId, NodeId)>,
+	pub omitted_defaults: Vec<DefinitionId>,
+}
+
 impl Annotations {
-	pub(crate) fn record_implicit_uint_to_int(&mut self, id: NodeId) {
-		if id != NodeId::DUMMY {
-			self.implicit_uint_to_int.insert(id);
+	pub(crate) fn record_range_proof(&mut self, node: NodeId, proof: crate::RangeProof) {
+		if node != NodeId::DUMMY {
+			self.range_proofs.insert(node, proof);
 		}
 	}
 
-	pub(crate) fn implicit_uint_to_int(&self) -> impl Iterator<Item = NodeId> + '_ {
-		self.implicit_uint_to_int.iter().copied()
+	pub fn range_proof(&self, node: NodeId) -> Option<&crate::RangeProof> {
+		self.range_proofs.get(&node)
+	}
+
+	pub fn range_proofs(&self) -> impl Iterator<Item = (NodeId, &crate::RangeProof)> {
+		let mut entries = self
+			.range_proofs
+			.iter()
+			.map(|(&id, proof)| (id, proof))
+			.collect::<Vec<_>>();
+		entries.sort_unstable_by_key(|(id, _)| *id);
+		entries.into_iter()
 	}
 
 	pub(crate) fn record_member_completions(
@@ -368,12 +408,26 @@ impl Annotations {
 			.iter()
 			.map(|(&jump, &target)| (jump, target))
 	}
-	pub(crate) fn record_propagation(&mut self, node: NodeId, kind: PropagationKind) {
-		self.propagations.insert(node, kind);
+	pub(crate) fn record_propagation(
+		&mut self,
+		node: NodeId,
+		kind: PropagationKind,
+		conversion: Option<Box<Resolution>>,
+	) {
+		self
+			.propagations
+			.insert(node, Propagation { kind, conversion });
 	}
 
-	pub(crate) fn propagations(&self) -> impl Iterator<Item = (NodeId, PropagationKind)> + '_ {
-		self.propagations.iter().map(|(&node, &kind)| (node, kind))
+	pub(crate) fn propagations(&self) -> impl Iterator<Item = (NodeId, Propagation)> + '_ {
+		self
+			.propagations
+			.iter()
+			.map(|(&node, plan)| (node, plan.clone()))
+	}
+
+	pub(crate) fn propagation_conversion(&self, node: NodeId) -> Option<&Resolution> {
+		self.propagations.get(&node)?.conversion.as_deref()
 	}
 	pub fn record_unresolved_qualified_access(
 		&mut self,
@@ -493,6 +547,7 @@ impl Annotations {
 			.iter_resolutions
 			.values_mut()
 			.chain(self.iteration_next_resolutions.values_mut())
+			.chain(self.managed_cleanups.values_mut())
 		{
 			map_resolution_types(resolution, &mut map);
 		}
@@ -501,6 +556,19 @@ impl Annotations {
 				*argument = map(*argument);
 			}
 		}
+	}
+
+	pub(crate) fn record_managed_cleanup(&mut self, initializer: NodeId, resolution: Resolution) {
+		if initializer != NodeId::DUMMY {
+			self.managed_cleanups.insert(initializer, resolution);
+		}
+	}
+
+	pub(crate) fn managed_cleanups(&self) -> impl Iterator<Item = (NodeId, &Resolution)> {
+		self
+			.managed_cleanups
+			.iter()
+			.map(|(&id, resolution)| (id, resolution))
 	}
 
 	/// Record the stable declaration referenced by a source node.
@@ -664,6 +732,17 @@ impl Annotations {
 		self.positional_fields.get(&span)
 	}
 
+	pub(crate) fn record_struct_construction(&mut self, node: NodeId, plan: StructConstructionPlan) {
+		self.struct_constructions.insert(node, plan);
+	}
+
+	pub fn struct_constructions(&self) -> impl Iterator<Item = (NodeId, &StructConstructionPlan)> {
+		self
+			.struct_constructions
+			.iter()
+			.map(|(&node, plan)| (node, plan))
+	}
+
 	/// Record how a `for` loop's iterable (by its own `NodeId`) was proven
 	/// iterable. Nodes built outside the parser carry [`NodeId::DUMMY`] and are
 	/// never annotated (mirrors [`Annotations::record`]).
@@ -792,6 +871,9 @@ impl Annotations {
 pub struct CheckedFacts {
 	pub annotations: Annotations,
 	pub runtime_roles: crate::CompilerRuntimeRoles,
+	/// Statically classified entry result. Absent outside entry mode and when
+	/// entry validation failed.
+	pub entry_root: Option<crate::EntryRootShape>,
 	/// Resolved host marshalling ABI for each checked external-let declaration,
 	/// keyed by its binding span for consumption during HIR lowering.
 	pub external_value_marshals: FxHashMap<Span, MarshalKind>,

@@ -510,6 +510,18 @@ mod tests {
 			.unwrap();
 	}
 
+	fn send_build_profile(client: &Connection, profile: &str) {
+		client
+			.sender
+			.send(Message::Notification(Notification::new(
+				lsp_types::notification::DidChangeConfiguration::METHOD.into(),
+				serde_json::json!({
+					"settings": { "nymph": { "buildProfile": profile } }
+				}),
+			)))
+			.unwrap();
+	}
+
 	fn request_value(
 		client: &Connection,
 		id: i32,
@@ -569,6 +581,44 @@ mod tests {
 			assert!(observed_docs.lock().unwrap().get(uri).is_none());
 			assert!(client.receiver.try_recv().is_err());
 		}
+
+		shutdown(&client, handle);
+	}
+
+	#[test]
+	fn workspace_profile_switches_republish_the_exact_open_revision() {
+		let (server, client) = Connection::memory();
+		let docs = Arc::new(Mutex::new(DocumentStore::default()));
+		let observed_docs = docs.clone();
+		let handle =
+			std::thread::spawn(move || serve(server, docs, Arc::new(Mutex::new(CompilerState::new()))));
+		handshake(&client);
+		let uri: Uri = "untitled:profile-switch".parse().unwrap();
+		send_open(&client, uri.clone(), 7, "func value(): Missing = 1");
+		let development = recv_diagnostics_for(&client, &uri);
+		assert_eq!(development.version, Some(7));
+		assert!(!development.diagnostics.is_empty());
+
+		send_build_profile(&client, "release");
+		let release = barrier_diagnostics(&client, 70);
+		assert_eq!(release.len(), 1);
+		assert_eq!(release[0].uri, uri);
+		assert_eq!(release[0].version, Some(7));
+		assert_eq!(release[0].diagnostics, development.diagnostics);
+		assert_eq!(
+			observed_docs.lock().unwrap().build_profile(),
+			nymph_compiler::BuildProfile::Release
+		);
+
+		send_build_profile(&client, "development");
+		let restored = barrier_diagnostics(&client, 71);
+		assert_eq!(restored.len(), 1);
+		assert_eq!(restored[0].version, Some(7));
+		assert_eq!(restored[0].diagnostics, development.diagnostics);
+		assert_eq!(
+			observed_docs.lock().unwrap().build_profile(),
+			nymph_compiler::BuildProfile::Development
+		);
 
 		shutdown(&client, handle);
 	}

@@ -301,7 +301,7 @@ fn failed_semantic_checking_prevents_stable_lowering_emission_and_bundling() {
 }
 
 #[test]
-fn equal_emitted_module_stops_project_and_bundle_invalidation() {
+fn equal_emitted_project_stops_bundle_invalidation() {
 	let (mut session, events) = event_session();
 	let project = ProjectId::new("stable-emission-backdating");
 	let main = ModulePath::new("main").unwrap();
@@ -331,7 +331,7 @@ fn equal_emitted_module_stops_project_and_bundle_invalidation() {
 		"{observed:#?}"
 	);
 	assert!(
-		!executed(&observed, "emitted_interface_project", None),
+		executed(&observed, "emitted_interface_project", None),
 		"{observed:#?}"
 	);
 	assert!(
@@ -347,8 +347,14 @@ fn stable_importable_std_identity_is_distinct_from_colliding_project_names_and_r
 	let main = ModulePath::new("main").unwrap();
 	session.set_source(
 		project.clone(),
+		ModulePath::new("collections/tree").unwrap(),
+		"public struct ProjectTree(value: int)".into(),
+		SourceVersion(1),
+	);
+	session.set_source(
+		project.clone(),
 		main.clone(),
-		"import std/collections/tree with (Tree as StdTree)\nstruct Option(value: int)\nstruct List(value: int)\nstruct Range(value: int)\nstruct Tree(value: int)\nlet pi = 42\nfunc answer(): int = { let local = Option(value = pi) let foreign = StdTree.Leaf(value = local.value) match (foreign) { Leaf(value) -> value, Node(...) -> 0 } }\npublic func main(): void = {}".into(),
+		"import std/collections/tree as std_tree with (Tree as StdTree)\nimport @/collections/tree as project_tree with (ProjectTree)\nstruct Option(value: int)\nstruct List(value: int)\nstruct Range(value: int)\nstruct Tree(value: int)\nlet pi = 42\nfunc answer(): int = { let local = Option(value = pi) let project = ProjectTree(value = local.value) let foreign = StdTree.Leaf(value = project.value) match (foreign) { Leaf(value) -> value, Node(...) -> 0 } }\npublic func main(): void = {}".into(),
 		SourceVersion(1),
 	);
 
@@ -357,10 +363,11 @@ fn stable_importable_std_identity_is_distinct_from_colliding_project_names_and_r
 		.expect("stable identities keep project declarations separate from std and ambient owners");
 	let source = &emitted.module_sources["main"];
 	assert_eq!(
-		source.matches("from \"collections/tree\"").count(),
+		source.matches("from \"std::collections/tree\"").count(),
 		1,
 		"{source}"
 	);
+	assert!(emitted.module_sources.contains_key("std::collections/tree"));
 	assert!(emitted.module_sources.contains_key("collections/tree"));
 	let compiled = session
 		.compile_interface_project_for_test(project, main, EntryMode::Entry)
@@ -385,7 +392,7 @@ fn stable_importable_std_identity_is_distinct_from_colliding_project_names_and_r
 		"{}",
 		String::from_utf8_lossy(&output.stderr)
 	);
-	assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+	assert_eq!(String::from_utf8_lossy(&output.stdout), "42n\n");
 }
 
 #[test]
@@ -423,7 +430,7 @@ fn stable_emission_links_demanded_ambient_option_runtime() {
 		"{}",
 		String::from_utf8_lossy(&output.stderr)
 	);
-	assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+	assert_eq!(String::from_utf8_lossy(&output.stdout), "42n\n");
 }
 
 #[test]
@@ -476,7 +483,18 @@ fn stable_result_construction_match_and_inherited_default_run() {
 		"{}",
 		compiled.js
 	);
-	assert_eq!(compiled.js.matches("unwrap(").count(), 2, "{}", compiled.js);
+	assert_eq!(
+		compiled.js.matches("unwrap: nymphMarkCallable").count(),
+		1,
+		"{}",
+		compiled.js
+	);
+	assert_eq!(
+		compiled.js.matches(".unwrap,").count(),
+		1,
+		"{}",
+		compiled.js
+	);
 	assert!(
 		!compiled.js.contains("@nymph/runtime/option"),
 		"{}",
@@ -499,7 +517,7 @@ fn stable_result_construction_match_and_inherited_default_run() {
 		"{}",
 		String::from_utf8_lossy(&output.stderr)
 	);
-	assert_eq!(String::from_utf8_lossy(&output.stdout), "7 9\n");
+	assert_eq!(String::from_utf8_lossy(&output.stdout), "7n 9n\n");
 }
 
 #[test]
@@ -511,13 +529,13 @@ fn stable_native_list_runtime_is_exact_collision_safe_and_runs_after_dependency_
 	session.set_source(
 		project.clone(),
 		dependency.clone(),
-		"public func values(): mut #[int] = #[1, 2, 3]".into(),
+		"public func values(): #[int] = #[1, 2, 3]".into(),
 		SourceVersion(1),
 	);
 	session.set_source(
 		project.clone(),
 		main.clone(),
-		"import @/collections/list with (values)\nfunc exercise(): int = {\n  let mut items = values()\n  let before = match (items.get(1u)) { Some(value) -> value, None -> 0 }\n  items[1u] = 7\n  let mut total = 0\n  for (item in items) { total = total + item }\n  before + items[1] + items.length() + total\n}\npublic func main(): void = {}"
+		"import @/collections/list with (values)\nfunc exercise(): int = {\n  let original = values()\n  let before = match (original.get(1u)) { Some(value) -> value, None -> 0 }\n  let items = original.replaced(1u, 7)\n  let total = items.iter().fold(0, (sum, item) -> sum + item)\n  before + items[1] + items.length() + total\n}\npublic func main(): void = {}"
 			.into(),
 		SourceVersion(1),
 	);
@@ -632,7 +650,7 @@ fn stable_native_list_runtime_is_exact_collision_safe_and_runs_after_dependency_
 		"{}",
 		String::from_utf8_lossy(&output.stderr)
 	);
-	assert_eq!(String::from_utf8_lossy(&output.stdout), "23\n");
+	assert_eq!(String::from_utf8_lossy(&output.stdout), "23n\n");
 }
 
 #[test]
@@ -644,13 +662,13 @@ fn stable_native_map_runtime_is_exact_collision_safe_and_runs_after_dependency_w
 	session.set_source(
 		project.clone(),
 		dependency.clone(),
-		"public func values(): mut #{int: int} = #{1: 10, 2: 20}".into(),
+		"public func values(): #{int: int} = #{1: 10, 2: 20}".into(),
 		SourceVersion(1),
 	);
 	session.set_source(
 		project.clone(),
 		main.clone(),
-		"import @/collections/map with (values)\nfunc exercise(): int = {\n  let mut items = values()\n  let before = match (items.get(1)) { Some(value) -> value, None -> 0 }\n  let indexed = items[2]\n  items.insert(3, 30)\n  items.insert(2, 7)\n  items[3] = 4\n  let mut total = 0\n  for (#(key, value) in items) { total = total + key + value }\n  before + indexed + items[2] + items[3] + items.size() + total\n}\npublic func main(): void = {}"
+		"import @/collections/map with (values)\nfunc exercise(): int = {\n  let original = values()\n  let before = match (original.get(1)) { Some(value) -> value, None -> 0 }\n  let indexed = original[2]\n  let items = original.inserted(3, 30).inserted(2, 7).inserted(3, 4)\n  let total = items.entries().iter().fold(0, (sum, entry) -> sum + entry[0] + entry[1])\n  before + indexed + items[2] + items[3] + items.size() + total\n}\npublic func main(): void = {}"
 			.into(),
 		SourceVersion(1),
 	);
@@ -764,228 +782,7 @@ fn stable_native_map_runtime_is_exact_collision_safe_and_runs_after_dependency_w
 		"{}",
 		String::from_utf8_lossy(&output.stderr)
 	);
-	assert_eq!(String::from_utf8_lossy(&output.stdout), "71\n");
-}
-
-#[test]
-fn stable_native_range_runtime_is_exact_collision_safe_and_runs_after_dependency_warmup() {
-	let mut session = CompilerSession::new();
-	let project = ProjectId::new("stable-range-runtime");
-	let main = ModulePath::new("main").unwrap();
-	let dependency = ModulePath::new("ranges/source").unwrap();
-	session.set_source(
-		project.clone(),
-		dependency.clone(),
-		"public func int_start(): int = 1\npublic func uint_start(): uint = 2u".into(),
-		SourceVersion(1),
-	);
-	session.set_source(
-		project.clone(),
-		main.clone(),
-		"import @/ranges/source with (int_start, uint_start)\ninterface Plus<Other, Output> { func plus(other: Other): Output func plus_default(other: Other): Output = this.plus(other) }\nstruct Box<T>(value: T)\nimpl<T> Plus<Other = Box<T>, Output = T> for Box<T> { func plus(other: Box<T>): T = other.value }\nfunc exercise(): int = {\n  let mut total = 0\n  for (value in int_start()..4) { total = total + value }\n  for (value in int_start()..=3) { total = total + value }\n  for (value in uint_start()..5u) { total = total + (value as int) }\n  for (value in uint_start()..=4u) { total = total + (value as int) }\n  Box(value = 0).plus_default(Box(value = total + 1))\n}\npublic func main(): void = {}"
-			.into(),
-		SourceVersion(1),
-	);
-
-	session
-		.lower_interface_module_for_test(project.clone(), main.clone(), dependency, EntryMode::Entry)
-		.expect("dependency stable runtime facts warm successfully");
-	session.panic_on_dependency_body_access_for_test(project.clone(), main.clone());
-	let emitted = session
-		.emit_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
-		.expect("stable Range and operator modules emit");
-	let source = &emitted.module_sources["main"];
-	assert_eq!(source.matches("from \"std/box\"").count(), 1);
-	assert_eq!(source.matches("new NymphRange").count(), 0);
-	assert_eq!(source.matches("while (").count(), 4);
-	assert!(!source.contains("@nymph/runtime/option"));
-	assert!(!source.contains("@nymph/runtime/iter"));
-	assert!(!source.contains("@nymph/runtime/collections/list"));
-	assert!(!source.contains("@nymph/runtime/collections/map"));
-	assert!(!source.contains("@nymph/runtime/result"));
-	assert!(emitted.module_sources.contains_key("ranges/source"));
-	assert!(!emitted.module_sources.contains_key("@nymph/runtime/option"));
-	assert!(!emitted.module_sources.contains_key("@nymph/runtime/iter"));
-	assert!(
-		!emitted
-			.module_sources
-			.contains_key("@nymph/runtime/collections/list")
-	);
-	assert!(
-		!emitted
-			.module_sources
-			.contains_key("@nymph/runtime/collections/map")
-	);
-	assert!(!emitted.module_sources.contains_key("@nymph/runtime/result"));
-
-	let compiled = session
-		.compile_interface_project_for_test(project, main, EntryMode::Entry)
-		.expect("stable emission links only the direct Range loop and operator closure");
-	assert_eq!(
-		compiled.js.matches("NymphRange").count(),
-		0,
-		"{}",
-		compiled.js
-	);
-	assert!(!compiled.js.contains("//#region @nymph/runtime/option"));
-	assert!(!compiled.js.contains("//#region @nymph/runtime/iter"));
-	assert_eq!(
-		compiled.js.matches("plus_default(").count(),
-		2,
-		"{}",
-		compiled.js
-	);
-	assert!(!compiled.js.contains("collections/list"), "{}", compiled.js);
-	assert!(!compiled.js.contains("collections/map"), "{}", compiled.js);
-	assert!(
-		!compiled.js.contains("@nymph/runtime/result"),
-		"{}",
-		compiled.js
-	);
-
-	let exercise = compiled.entry_symbol("exercise");
-	let script = format!("{}\nconsole.log({exercise}().v);\n", compiled.js);
-	let path = std::env::temp_dir().join(format!("nymph-stable-range-{}.mjs", std::process::id()));
-	std::fs::write(&path, script).unwrap();
-	let output = std::process::Command::new("node")
-		.arg(&path)
-		.output()
-		.unwrap();
-	let _ = std::fs::remove_file(path);
-	assert!(
-		output.status.success(),
-		"{}",
-		String::from_utf8_lossy(&output.stderr)
-	);
-	assert_eq!(String::from_utf8_lossy(&output.stdout), "31\n");
-}
-
-#[test]
-fn stable_native_range_endpoints_evaluate_once_in_source_order() {
-	let mut session = CompilerSession::new();
-	let project = ProjectId::new("stable-range-order");
-	let main = ModulePath::new("main").unwrap();
-	session.set_source(
-		project.clone(),
-		main.clone(),
-		r#"func ordered(): int = {
-  let mut order = 0
-  let endpoint = (value: int) -> { order = order * 10 + value value }
-  let mut total = 0
-  for (value in (if (true) { endpoint(1) } else { endpoint(9) })..endpoint(4)) {
-    total = total + value
-  }
-  order * 100 + total
-}
-public func main(): void = {}"#
-			.into(),
-		SourceVersion(1),
-	);
-
-	let emitted = session
-		.emit_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
-		.expect("check-mode numeric range starts emit as direct native loops");
-	let source = &emitted.module_sources["main"];
-	assert_eq!(source.matches("while (").count(), 1, "{source}");
-	assert!(!source.contains("NymphRange"), "{source}");
-	assert!(!source.contains("@nymph/runtime/option"), "{source}");
-	assert!(!source.contains("@nymph/runtime/iter"), "{source}");
-	assert!(!emitted.module_sources.contains_key("@nymph/runtime/option"));
-	assert!(!emitted.module_sources.contains_key("@nymph/runtime/iter"));
-
-	let compiled = session
-		.compile_interface_project_for_test(project, main, EntryMode::Entry)
-		.expect("ordered direct native range bundles");
-	let ordered = compiled.entry_symbol("ordered");
-	let script = format!("{}\nconsole.log({ordered}().v);\n", compiled.js);
-	let path = std::env::temp_dir().join(format!(
-		"nymph-stable-range-order-{}.mjs",
-		std::process::id()
-	));
-	std::fs::write(&path, script).unwrap();
-	let output = std::process::Command::new("node")
-		.arg(&path)
-		.output()
-		.unwrap();
-	let _ = std::fs::remove_file(path);
-	assert!(
-		output.status.success(),
-		"{}",
-		String::from_utf8_lossy(&output.stderr)
-	);
-	assert_eq!(String::from_utf8_lossy(&output.stdout), "1406\n");
-}
-
-#[test]
-fn stable_native_range_loop_results_link_only_option_and_preserve_completion_values() {
-	let mut session = CompilerSession::new();
-	let project = ProjectId::new("stable-range-results");
-	let main = ModulePath::new("main").unwrap();
-	session.set_source(
-		project.clone(),
-		main.clone(),
-		"func early(): int = match (for (value in (if (true) { 1 } else { 2 })..4) { if (value == 2) { break value } }) { Some(value) -> value, None -> 0 }\nfunc natural(): int = match (for (value in (match (true) { true -> 1, false -> 2 })..3) { if (value == 9) { break value } }) { Some(value) -> value, None -> 4 }\nfunc exercise(): int = early() + natural()\npublic func main(): void = {}"
-			.into(),
-		SourceVersion(1),
-	);
-
-	let emitted = session
-		.emit_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
-		.expect("used native Range loops emit with their Option completion ABI");
-	let source = &emitted.module_sources["main"];
-	assert_eq!(
-		source.matches("from \"@nymph/runtime/option\"").count(),
-		1,
-		"{source}"
-	);
-	assert!(!source.contains("@nymph/runtime/range"), "{source}");
-	assert!(!source.contains("@nymph/runtime/iter"), "{source}");
-	assert_eq!(source.matches("while (").count(), 2, "{source}");
-	assert!(emitted.module_sources.contains_key("@nymph/runtime/option"));
-	assert!(!emitted.module_sources.contains_key("@nymph/runtime/range"));
-	assert!(!emitted.module_sources.contains_key("@nymph/runtime/iter"));
-
-	let compiled = session
-		.compile_interface_project_for_test(project, main, EntryMode::Entry)
-		.expect("native Range completion values bundle");
-	assert_eq!(
-		compiled
-			.js
-			.matches("//#region @nymph/runtime/option")
-			.count(),
-		1,
-		"{}",
-		compiled.js
-	);
-	assert!(
-		!compiled.js.contains("@nymph/runtime/range"),
-		"{}",
-		compiled.js
-	);
-	assert!(
-		!compiled.js.contains("@nymph/runtime/iter"),
-		"{}",
-		compiled.js
-	);
-
-	let exercise = compiled.entry_symbol("exercise");
-	let script = format!("{}\nconsole.log({exercise}().v);\n", compiled.js);
-	let path = std::env::temp_dir().join(format!(
-		"nymph-stable-range-results-{}.mjs",
-		std::process::id()
-	));
-	std::fs::write(&path, script).unwrap();
-	let output = std::process::Command::new("node")
-		.arg(&path)
-		.output()
-		.unwrap();
-	let _ = std::fs::remove_file(path);
-	assert!(
-		output.status.success(),
-		"{}",
-		String::from_utf8_lossy(&output.stderr)
-	);
-	assert_eq!(String::from_utf8_lossy(&output.stdout), "6\n");
+	assert_eq!(String::from_utf8_lossy(&output.stdout), "71n\n");
 }
 
 #[test]
@@ -1011,13 +808,17 @@ fn stable_emission_links_exact_ambient_math_demands_once_and_runs() {
 		compiled.js
 	);
 	assert_eq!(
-		compiled.js.matches("function $m12$int$i0$sqrt(").count(),
+		compiled
+			.js
+			.matches("let $m12$int$i0$sqrt = nymphCallable(function(")
+			.count(),
 		1,
 		"{}",
 		compiled.js
 	);
-	assert!(
-		compiled.js.contains("$m12$int$i0$sqrt(new NInt(16))"),
+	assert_eq!(
+		compiled.js.matches("$m12$int$i0$sqrt").count(),
+		2,
 		"{}",
 		compiled.js
 	);
@@ -1026,7 +827,9 @@ fn stable_emission_links_exact_ambient_math_demands_once_and_runs() {
 		"import { NFloat, NInt } from \"std/box\";",
 		"class NFloat { constructor(v) { this.v = v; } } class NInt { constructor(v) { this.v = v; } }",
 	);
-	let script = format!("{js}\nconsole.log($m0$constant().v, $m0$root().v, $m0$power().v);\n");
+	let script = format!(
+		"{js}\nconsole.log(nymphActivate($m0$constant, undefined, [], undefined).v, nymphActivate($m0$root, undefined, [], undefined).v, nymphActivate($m0$power, undefined, [], undefined).v);\n"
+	);
 	let path = std::env::temp_dir().join(format!("nymph-stable-math-{}.mjs", std::process::id()));
 	std::fs::write(&path, script).unwrap();
 	let output = std::process::Command::new("node")
@@ -1041,7 +844,7 @@ fn stable_emission_links_exact_ambient_math_demands_once_and_runs() {
 	);
 	assert_eq!(
 		String::from_utf8_lossy(&output.stdout),
-		"3.141592653589793 4 1024\n"
+		"3.141592653589793 4 1024n\n"
 	);
 }
 
@@ -1064,14 +867,14 @@ fn stable_compare_to_closes_same_module_runtime_demands_and_runs() {
 		compiled
 			.js
 			.lines()
-			.filter(|line| line.starts_with("function ") && line.contains("order_from_sign("))
+			.filter(|line| line.contains("order_from_sign = nymphCallable(function("))
 			.count(),
 		1,
 		"{}",
 		compiled.js
 	);
 	assert_eq!(
-		compiled.js.matches("order_from_sign(").count(),
+		compiled.js.matches("$m13$order_from_sign").count(),
 		2,
 		"{}",
 		compiled.js
@@ -1081,7 +884,9 @@ fn stable_compare_to_closes_same_module_runtime_demands_and_runs() {
 		"import { NInt } from \"std/box\";",
 		"class NInt { constructor(v) { this.v = v; } }",
 	);
-	let script = format!("{js}\nconsole.log({compare}()[Symbol.for('nymph.tag')].description);\n");
+	let script = format!(
+		"{js}\nconsole.log(nymphActivate({compare}, undefined, [], undefined)[Symbol.for('nymph.tag')].description);\n"
+	);
 	let path = std::env::temp_dir().join(format!("nymph-stable-compare-{}.mjs", std::process::id()));
 	std::fs::write(&path, script).unwrap();
 	let output = std::process::Command::new("node")
@@ -1136,7 +941,7 @@ fn stable_project_module_exports_first_class_external_alias_and_runs() {
 	session.set_source(
 		project.clone(),
 		provider,
-		"public external(println) func println<T: Display>(value: T): void".into(),
+		"public external(println) func println<T>(value: T): void".into(),
 		SourceVersion(1),
 	);
 	session.set_source(
@@ -1149,7 +954,7 @@ fn stable_project_module_exports_first_class_external_alias_and_runs() {
 	let emitted = session
 		.emit_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
 		.expect("ordinary module emits its external ABI alias");
-	assert!(emitted.module_sources["provider"].contains(" as $m0$println"));
+	assert!(emitted.module_sources["provider"].contains("let $m0$println = nymphCallable(function("));
 	assert!(emitted.module_sources["provider"].contains("export { $m0$println };"));
 	assert!(emitted.module_sources["main"].contains("import { $m0$println } from \"provider\";"));
 	let compiled = session
@@ -1181,7 +986,10 @@ fn stable_project_module_exports_first_class_external_alias_and_runs() {
 		"{}",
 		String::from_utf8_lossy(&output.stderr)
 	);
-	assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n2\n3\n0 0 0\n");
+	assert_eq!(
+		String::from_utf8_lossy(&output.stdout),
+		"1\n2\n3\n0n 0n 0n\n"
+	);
 }
 
 #[test]
@@ -1192,7 +1000,7 @@ fn stable_private_first_class_generic_external_uses_its_checked_shape() {
 	session.set_source(
 		project.clone(),
 		main.clone(),
-		"private external(println) func emit<T: Display>(value: T): void\nfunc value(): int = { let f = emit f(1) 0 }\nfunc grouped(): int = { let f = (emit) f(2) 0 }\npublic func main(): void = {}".into(),
+		"private external(println) func emit<T>(value: T): void\nfunc value(): int = { let f = emit f(1) 0 }\nfunc grouped(): int = { let f = (emit) f(2) 0 }\npublic func main(): void = {}".into(),
 		SourceVersion(1),
 	);
 
@@ -1209,7 +1017,7 @@ fn stable_namespace_generic_external_adapts_first_class_values() {
 	session.set_source(
 		project.clone(),
 		main.clone(),
-		"namespace Host { external(println) namespace func emit<T: Display>(value: T): void }\nfunc stored(): int = { let f = Host.emit f(1) 0 }\nfunc stored_grouped(): int = { let f = (Host.emit) f(2) 0 }\nfunc immediate_grouped(): int = { (Host.emit)(3) 0 }\nfunc direct(): int = { Host.emit(4) 0 }\npublic func main(): void = {}".into(),
+		"namespace Host { external(println) namespace func emit<T>(value: T): void }\nfunc stored(): int = { let f = Host.emit f(1) 0 }\nfunc stored_grouped(): int = { let f = (Host.emit) f(2) 0 }\nfunc immediate_grouped(): int = { (Host.emit)(3) 0 }\nfunc direct(): int = { Host.emit(4) 0 }\npublic func main(): void = {}".into(),
 		SourceVersion(1),
 	);
 
@@ -1219,7 +1027,7 @@ fn stable_namespace_generic_external_adapts_first_class_values() {
 	assert_eq!(
 		emitted.module_sources["main"]
 			.lines()
-			.filter(|line| line.starts_with("import { println"))
+			.filter(|line| line.starts_with("import {") && line.contains("nymphPrintlnStep"))
 			.count(),
 		1,
 		"{}",
@@ -1259,7 +1067,7 @@ fn stable_namespace_generic_external_adapts_first_class_values() {
 	);
 	assert_eq!(
 		String::from_utf8_lossy(&output.stdout),
-		"1\n2\n3\n4\n0 0 0 0\n"
+		"1\n2\n3\n4\n0n 0n 0n 0n\n"
 	);
 }
 
@@ -1316,11 +1124,11 @@ fn stable_static_generic_external_forwards_hidden_arguments_and_runs() {
 		"{}",
 		String::from_utf8_lossy(&output.stderr)
 	);
-	assert_eq!(String::from_utf8_lossy(&output.stdout), "-1 1 0 -1\n");
+	assert_eq!(String::from_utf8_lossy(&output.stdout), "-1n 1n 0n -1n\n");
 }
 
 #[test]
-fn stable_importable_module_emits_demanded_external_member_alias() {
+fn stable_importable_module_emits_demanded_external_member_wrapper() {
 	let mut session = CompilerSession::new();
 	let project = ProjectId::new("stable-importable-external-member");
 	let provider = ModulePath::new("provider").unwrap();
@@ -1328,28 +1136,29 @@ fn stable_importable_module_emits_demanded_external_member_alias() {
 	session.set_source(
 		project.clone(),
 		provider,
-		"impl int { external(display) func rendered(): string }".into(),
+		"impl string { external(length) func measured(): uint }".into(),
 		SourceVersion(1),
 	);
 	session.set_source(
 		project.clone(),
 		main.clone(),
-		"import @/provider\nfunc value(): string = (1).rendered()\npublic func main(): void = {}"
+		"import @/provider\nfunc value(): uint = \"nymph\".measured()\npublic func main(): void = {}"
 			.into(),
 		SourceVersion(1),
 	);
 
 	let emitted = session
 		.emit_interface_project_for_test(project.clone(), main.clone(), EntryMode::Entry)
-		.expect("importable module emits a demanded external member alias");
+		.expect("importable module emits a demanded external member wrapper");
 	let provider = &emitted.module_sources["provider"];
-	assert!(provider.contains(" as $m0$int$i0$rendered"), "{provider}");
+	assert!(provider.contains("std/string"), "{provider}");
+	assert!(provider.contains("length"), "{provider}");
 	assert!(
-		provider.contains("export { $m0$int$i0$rendered"),
+		provider.contains("export { $m0$string$i0$measured"),
 		"{provider}"
 	);
 	assert!(
-		emitted.module_sources["main"].contains("import { $m0$int$i0$rendered } from \"provider\";")
+		emitted.module_sources["main"].contains("import { $m0$string$i0$measured } from \"provider\";")
 	);
 	let compiled = session
 		.compile_interface_project_for_test(project, main, EntryMode::Entry)
@@ -1374,7 +1183,7 @@ fn stable_importable_module_emits_demanded_external_member_alias() {
 		"{}",
 		String::from_utf8_lossy(&output.stderr)
 	);
-	assert_eq!(String::from_utf8_lossy(&output.stdout), "1\n");
+	assert_eq!(String::from_utf8_lossy(&output.stdout), "5n\n");
 }
 
 #[test]

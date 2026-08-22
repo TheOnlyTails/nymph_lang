@@ -109,8 +109,8 @@ impl float {
 
 public external(atan2) func atan2(y: float, x: float): float
 
-public let max_int = 2 ** 63u - 1
-public let min_int = -(2 ** 63u)
+public let max_int = 9223372036854775807
+public let min_int = -9223372036854775808
 public external(max_float) let max_float: float
 public external(min_float) let min_float: float
 public external(min_positive_float) let min_positive_float: float

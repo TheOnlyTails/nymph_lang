@@ -60,7 +60,7 @@ pub(crate) fn workspace_symbols_cancellable(
 		for declaration in module
 			.declarations
 			.iter()
-			.filter(|declaration| declaration.visibility == NamespaceVisibility::Importable)
+			.filter(|declaration| declaration.visibility != NamespaceVisibility::Private)
 		{
 			cancellation.checkpoint()?;
 			let name = declaration.name.as_str();
@@ -87,7 +87,7 @@ pub(crate) fn workspace_symbols_cancellable(
 			#[allow(deprecated)]
 			let symbol = SymbolInformation {
 				name: name.to_string(),
-				kind: symbol_kind(declaration.category, declaration.mutable),
+				kind: symbol_kind(declaration.category),
 				tags: None,
 				deprecated: None,
 				location,
@@ -287,7 +287,7 @@ mod tests {
 			("main", "private func hidden(): void = {}"),
 			(
 				"nested/types",
-				"public struct Point()\ninternal let mut counter = 0\ntype Alias = int",
+				"public struct Point()\ninternal let counter = 0\ntype Alias = int",
 			),
 		]);
 		let symbols = fixture.search("");
@@ -305,7 +305,7 @@ mod tests {
 				.find(|symbol| symbol.name == "counter")
 				.unwrap()
 				.kind,
-			lsp_types::SymbolKind::VARIABLE
+			lsp_types::SymbolKind::CONSTANT
 		);
 		assert_eq!(
 			symbols
@@ -321,7 +321,7 @@ mod tests {
 	fn malformed_modules_expose_every_top_level_kind_without_nested_or_private_leaks() {
 		let mut fixture = Fixture::new(&[(
 			"main",
-			"public func top(): void = { let local = 1 }\npublic let constant = 1\npublic let mut variable = 2\npublic type Alias = int\npublic struct Record(field: int)\npublic enum Choice { Variant }\npublic interface Contract { func method(): void }\npublic namespace Tools { namespace func nested(): void = {} }\nimpl Record { func implementation(): void = {} }\nprivate func hidden(): void = {}\npublic func (",
+			"public func top(): void = { let local = 1 }\npublic let constant = 1\npublic let variable = 2\npublic type Alias = int\npublic struct Record(field: int)\npublic enum Choice { Variant }\npublic interface Contract { func method(): void }\npublic namespace Tools { namespace func nested(): void = {} }\nimpl Record { func implementation(): void = {} }\nprivate func hidden(): void = {}\npublic func (",
 		)]);
 		let symbols = fixture.search("");
 		assert_eq!(
@@ -332,7 +332,7 @@ mod tests {
 			[
 				("top", lsp_types::SymbolKind::FUNCTION),
 				("constant", lsp_types::SymbolKind::CONSTANT),
-				("variable", lsp_types::SymbolKind::VARIABLE),
+				("variable", lsp_types::SymbolKind::CONSTANT),
 				("Alias", lsp_types::SymbolKind::CLASS),
 				("Record", lsp_types::SymbolKind::STRUCT),
 				("Choice", lsp_types::SymbolKind::ENUM),

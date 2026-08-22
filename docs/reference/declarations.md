@@ -5,10 +5,10 @@ attach behavior to them. This page is the map of what's declarable at the top le
 form is written; see [Functions](./functions), [Structs and enums](./structs-and-enums), and
 [Interfaces and impls](./interfaces-and-impls) for the deeper treatment of each.
 
-## `let` / `let mut`
+## `let`
 
-A top-level `let` declares a module-level binding, evaluated once. Add `mut` to make it
-reassignable — see [Mutability](./mutability) for what that actually grants.
+A top-level `let` declares an immutable module-level binding, evaluated once. To represent an
+updated value, bind the replacement under a new name — see [Immutability](./mutability).
 
 ```nym
 let limit = 100
@@ -30,11 +30,11 @@ External lets differ from external functions: the generated module imports
 the host export once, marshals its raw value into the declared canonical boxed
 Nymph representation once, and stores that snapshot in one `const` binding.
 Every reference shares that binding and identity; the host export is not read
-or boxed again. `external let mut` is rejected. Ambient external lets are
-emitted only when demanded, preserving single canonical type emission and
+or boxed again. Ambient external lets are emitted only when demanded,
+preserving single canonical type emission and
 avoiding duplicate imports or initializers.
 
-The same `let [mut] name [: Type] = value` form is also how a local binding is introduced inside a
+The same `let name [: Type] = value` form is also how a local binding is introduced inside a
 block — see [Blocks](./expressions#blocks).
 
 ## `func`
@@ -46,24 +46,22 @@ inferred from the body; the body is any [expression](./expressions), most often 
 func add(a: int, b: int): int = a + b
 ```
 
-Two more keywords change what a function member *is*, but both are only meaningful **inside** a
-`struct`, `enum`, or `interface` body — declaring either at the top level of a module is rejected:
+One more keyword changes what a function member _is_, and it is only meaningful **inside** a
+`struct`, `enum`, or `interface` body — declaring it at the top level of a module is rejected:
 
-- `mut func` — an instance method that may mutate its receiver (`this` behaves like a `mut Self`
-  inside the body). See [Mut func](./mutability#mut-func).
 - `namespace func` — a static, called on the type itself (`Type.name(...)`) rather than on an
   instance.
 
 ```nym
 struct Counter(n: int) {
-  mut func bump(): void = { this.n = this.n + 1 }
+  func bumped(): Counter = Counter(n = this.n + 1)
   namespace func zero(): Counter = Counter(n = 0)
 }
 
 func demo(): int = {
-  let mut c = Counter.zero()
-  c.bump()
-  c.n
+  let before = Counter.zero()
+  let after = before.bumped()
+  after.n
 }
 ```
 
@@ -172,8 +170,8 @@ overloading.
 ## `namespace`
 
 A top-level `namespace Name { … }` block groups plain `func`s and `let`s under a shared name. Since
-there's no receiver to mutate and nesting another namespace would be pointless, only ordinary
-`func`s and `let`s are accepted inside — a `mut func`, `namespace func`, or `namespace let` here is
+there's no receiver and nesting another namespace would be pointless, only ordinary
+`func`s and `let`s are accepted inside — a `namespace func` or `namespace let` here is
 rejected the same way it would be at the bare top level.
 
 ```nym
@@ -184,8 +182,8 @@ namespace MathUtils {
 
 > [!NOTE] `Namespace.member` access isn't wired up yet
 > The declaration above type-checks cleanly, but calling `MathUtils.double(21)` from elsewhere does
-> not — resolving a member *through* a top-level namespace name isn't implemented yet (unlike a
-> struct/enum's own `namespace func`, which *is* callable as `Type.member`; see [`func`](#func)
+> not — resolving a member _through_ a top-level namespace name isn't implemented yet (unlike a
+> struct/enum's own `namespace func`, which _is_ callable as `Type.member`; see [`func`](#func)
 > above). Declare the namespace, but don't rely on reaching into it yet.
 
 ## Visibility

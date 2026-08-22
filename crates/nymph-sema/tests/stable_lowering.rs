@@ -9,6 +9,41 @@ use nymph_sema::{
 	lower_runtime_definition,
 };
 
+fn linked_abi(
+	marker: &str,
+	module: &str,
+	symbol: &str,
+	result: Option<nymph_hir::hir::MarshalKind>,
+) -> ExternalAbi {
+	ExternalAbi {
+		marker: marker.into(),
+		callable: nymph_sema::ExternalCallable::Linked {
+			adapter: nymph_sema::ExternalAdapterId {
+				module: module.into(),
+				symbol: symbol.into(),
+			},
+		},
+		effects: nymph_sema::EffectRow::pure(),
+		audit: nymph_sema::ExternalAudit::default(),
+		call_mode: nymph_sema::ExternalCallMode::Ordinary,
+		marshal: nymph_sema::ExternalMarshalPlan {
+			parameters: vec![],
+			result,
+		},
+	}
+}
+
+fn deferred_abi(marker: &str) -> ExternalAbi {
+	ExternalAbi {
+		marker: marker.into(),
+		callable: nymph_sema::ExternalCallable::Deferred,
+		effects: nymph_sema::EffectRow::pure(),
+		audit: nymph_sema::ExternalAudit::default(),
+		call_mode: nymph_sema::ExternalCallMode::Ordinary,
+		marshal: nymph_sema::ExternalMarshalPlan::default(),
+	}
+}
+
 #[derive(Default)]
 struct Context {
 	names: HashMap<DefinitionId, EmittedBindingName>,
@@ -140,6 +175,41 @@ fn lower_named(source: &str, wanted: &str) -> nymph_sema::LoweredRuntimeDefiniti
 	lower_runtime_definition(&context, Arc::new(item)).unwrap()
 }
 
+#[test]
+fn managed_binding_lowers_exact_close_dispatch_into_hir_cleanup() {
+	let source = "interface Close<!E> { func close(): void + !E }\n\
+		 struct Resource\n\
+		 impl Close<!()> for Resource { func close(): void = {} }\n\
+		 func managed(): void = { let use resource = Resource() }";
+	let artifact = artifacts(source)
+		.into_iter()
+		.find(|artifact| source_name(&artifact.definition) == "managed")
+		.expect("managed runtime artifact");
+	let nymph_sema::RuntimePayload::NymphBody(body) = artifact.payload else {
+		panic!("managed function must have a Nymph body")
+	};
+	assert_eq!(body.annotations.managed_cleanups.len(), 1);
+	assert!(matches!(
+		&body.annotations.managed_cleanups[0].1,
+		nymph_sema::StableDispatch::SelectedImplementation { .. }
+	));
+
+	let lowered = lower_named(source, "managed");
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("unexpected fragment: {:?}", lowered.fragment());
+	};
+	let nymph_hir::hir::HirExpr::Block { stmts, .. } = &function.body else {
+		panic!("expected managed block: {:?}", function.body);
+	};
+	assert!(matches!(
+		stmts.as_slice(),
+		[nymph_hir::hir::HirStmt::Let {
+			cleanup: Some(nymph_hir::hir::HirExpr::ActivationCall { .. }),
+			..
+		}]
+	));
+}
+
 fn artifacts(source: &str) -> Vec<RuntimeDefinition> {
 	artifacts_and_interface(source).0
 }
@@ -195,33 +265,69 @@ fn stable_lowering_is_identical_across_body_formatting() {
 }
 
 #[test]
-fn stable_lowering_preserves_loop_targets_and_canonical_option_abi() {
+fn async_lowering_uses_inherited_function_and_nested_block_contexts() {
+	use nymph_hir::hir::{HirExpr, HirTaskContext, HirTaskOperation};
+
+	let lowered = lower_named("async func run(): int = async { 1 }.await", "run");
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("unexpected fragment: {:?}", lowered.fragment());
+	};
+	let HirExpr::TaskRecipe {
+		body: function_body,
+		context: HirTaskContext::Inherited,
+	} = &function.body
+	else {
+		panic!("async function did not lower to an inherited task recipe");
+	};
+	let HirExpr::TaskOperation {
+		operation: HirTaskOperation::Drive,
+		operands,
+	} = function_body.as_ref()
+	else {
+		panic!("await did not lower to a task drive");
+	};
+	assert!(matches!(
+		operands.as_slice(),
+		[HirExpr::TaskRecipe {
+			context: HirTaskContext::Nested,
+			..
+		}]
+	));
+}
+
+#[test]
+fn stable_lowering_preserves_state_loops_and_simultaneous_transitions() {
 	let lowered = lower_named(
-		"enum Option<T> { Some(value: T), None }\nfunc choose(): Option<int> = while (true) { break 7 }",
-		"choose",
+		"func cycle(): #(int, int) = loop (let left = 1, let right = 2) { if (left == 3) break #(left, right) continue(left = right, right = left) }",
+		"cycle",
 	);
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
 		panic!("expected function fragment")
 	};
-	let nymph_hir::hir::HirExpr::While {
+	let nymph_hir::hir::HirExpr::StateLoop {
 		target,
+		bindings,
 		body,
-		option: Some(option),
-		..
 	} = &function.body
 	else {
-		panic!("expected Option-valued while, got {:?}", function.body)
+		panic!("expected a dedicated state loop, got {:?}", function.body)
 	};
-	assert_eq!(option.enum_name, "Option");
-	assert_eq!(option.some, "Some");
-	assert_eq!(option.some_value, "value");
-	assert_eq!(option.none, "None");
+	assert_eq!(bindings.len(), 2);
+	assert_eq!(bindings[0].name, "left");
+	assert_eq!(bindings[1].name, "right");
 	assert!(matches!(
 		body.as_ref(),
 		nymph_hir::hir::HirExpr::Block {
 			tail: Some(tail),
 			..
-		} if matches!(tail.as_ref(), nymph_hir::hir::HirExpr::Break { target: break_target, .. } if break_target == target)
+		} if matches!(
+			tail.as_ref(),
+			nymph_hir::hir::HirExpr::ContinueTransition {
+				target: continue_target,
+				replacements,
+			} if continue_target == target
+				&& replacements.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>() == ["left", "right"]
+		)
 	));
 }
 
@@ -273,16 +379,19 @@ fn stable_lowering_preserves_contextual_integer_literal_kinds() {
 	}
 
 	for (source, expected) in [
-		("func value(): uint = 5", nymph_hir::hir::NumKind::UInt),
-		("func value(): float = 5", nymph_hir::hir::NumKind::Float),
+		("func value(): uint = 5", nymph_hir::hir::HirExpr::UInt(5)),
+		(
+			"func value(): float = 5",
+			nymph_hir::hir::HirExpr::Num(5.0, nymph_hir::hir::NumKind::Float),
+		),
 	] {
 		let lowered = lower_named(source, "value");
 		assert!(matches!(
 			lowered.fragment(),
 			nymph_sema::LoweredHirFragment::TopLevelFunction(nymph_hir::hir::HirFunc {
-				body: nymph_hir::hir::HirExpr::Num(5.0, kind),
+				body,
 				..
-			}) if *kind == expected
+			}) if *body == expected
 		));
 	}
 
@@ -293,41 +402,10 @@ fn stable_lowering_preserves_contextual_integer_literal_kinds() {
 	assert!(matches!(
 		lowered.fragment(),
 		nymph_sema::LoweredHirFragment::TopLevelFunction(nymph_hir::hir::HirFunc {
-			body: nymph_hir::hir::HirExpr::Call { args, .. },
+			body: nymph_hir::hir::HirExpr::ActivationCall { args, mode: nymph_hir::hir::HirCallMode::Tail, .. },
 			..
 		}) if matches!(args.as_slice(), [nymph_hir::hir::HirExpr::Num(5.0, nymph_hir::hir::NumKind::Float)])
 	));
-}
-
-#[test]
-fn stable_lowering_accepts_unbraced_return_branches() {
-	for source in [
-		"func value(flag: boolean): int = { if (flag) return 1\n2 }",
-		"func value(flag: boolean): int = { while (flag) return 1\n2 }",
-	] {
-		let lowered = lower_named(source, "value");
-		let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
-			panic!("expected function fragment")
-		};
-		let nymph_hir::hir::HirExpr::Block { stmts, .. } = &function.body else {
-			panic!("expected function block")
-		};
-		let nymph_hir::hir::HirStmt::Expr(branch) = &stmts[0] else {
-			panic!("expected branch statement")
-		};
-		let body = match branch {
-			nymph_hir::hir::HirExpr::If { then, .. } => then.as_ref(),
-			nymph_hir::hir::HirExpr::While { body, .. } => body.as_ref(),
-			_ => panic!("expected if or while branch"),
-		};
-		assert!(matches!(
-			body,
-			nymph_hir::hir::HirExpr::Block {
-				stmts,
-				tail: None,
-			} if matches!(stmts.as_slice(), [nymph_hir::hir::HirStmt::Return { value: Some(_), .. }])
-		));
-	}
 }
 
 #[test]
@@ -340,18 +418,6 @@ fn stable_lowering_accepts_return_in_a_general_expression_position() {
 			..
 		})
 	));
-}
-
-#[test]
-fn stable_lowering_accepts_semantic_never_operands_without_dispatch() {
-	let source = "func stop(): never = stop()\nfunc binary(): int = 1 + stop()\nfunc prefix(): int = -(stop())\nfunc cast(): int = stop() as int\nfunc index(): int = stop()[0]\nfunc compound(): int = { let mut value = 1\nvalue += stop()\nvalue }";
-	for name in ["binary", "prefix", "cast", "index", "compound"] {
-		let lowered = lower_named(source, name);
-		assert!(matches!(
-			lowered.fragment(),
-			nymph_sema::LoweredHirFragment::TopLevelFunction(_)
-		));
-	}
 }
 
 #[test]
@@ -374,7 +440,7 @@ fn stable_lowering_preserves_labeled_constructor_argument_order() {
 	let Some(tail) = tail else {
 		panic!("expected struct construction tail");
 	};
-	let nymph_hir::hir::HirExpr::New { fields, .. } = tail.as_ref() else {
+	let nymph_hir::hir::HirExpr::StructFresh { fields, .. } = tail.as_ref() else {
 		panic!("expected struct construction");
 	};
 	assert_eq!(
@@ -574,19 +640,19 @@ fn imported_external_reference_has_exact_stable_marshal_annotation() {
 			constraints: vec![],
 			parameters: vec![],
 			return_type: None,
+			effects: nymph_sema::EffectRow::pure(),
 			ty: Some(InterfaceType::Float),
 			fields: vec![],
 			variants: vec![],
+			enum_view_variants: vec![],
 			members: vec![],
 			super_interfaces: vec![],
-			external: Some(ExternalAbi {
-				marker: "max_float".into(),
-				callable: nymph_sema::ExternalCallable::Linked {
-					module: "std/math/intrinsics".into(),
-					symbol: "max_float".into(),
-				},
-				marshal: Some(nymph_hir::hir::MarshalKind::Float),
-			}),
+			external: Some(linked_abi(
+				"max_float",
+				"std/math/intrinsics",
+				"max_float",
+				Some(nymph_hir::hir::MarshalKind::Float),
+			)),
 			runtime_owner: None,
 		}],
 		support_definitions: vec![],
@@ -806,7 +872,7 @@ fn materialized_default_is_placed_in_implementation_and_dispatches_to_materializ
 	);
 	let lowered = lower_runtime_definition(&context, Arc::new(artifact.clone())).unwrap();
 	assert!(
-		matches!(lowered.fragment(), nymph_sema::LoweredHirFragment::MaterializedDefault { owner, implementation: found, interface_member, method } if owner == &implementation.id && found == &implementation.id && interface_member == &first.interface_member_id && matches!(&method.body, nymph_hir::hir::HirExpr::Call { callee, args } if args.is_empty() && matches!(&**callee, nymph_hir::hir::HirExpr::Field { name, .. } if name == "second")))
+		matches!(lowered.fragment(), nymph_sema::LoweredHirFragment::MaterializedDefault { owner, implementation: found, interface_member, method } if owner == &implementation.id && found == &implementation.id && interface_member == &first.interface_member_id && matches!(&method.body, nymph_hir::hir::HirExpr::ActivationCall { callee, args, mode: nymph_hir::hir::HirCallMode::Tail, .. } if args.is_empty() && matches!(&**callee, nymph_hir::hir::HirExpr::Field { name, .. } if name == "second")))
 	);
 	let InterfaceType::Named {
 		definition: owner, ..
@@ -985,7 +1051,7 @@ fn lowers_one_canonical_function_and_value_without_a_module() {
 		matches!(lowered[0].fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if function.params == ["x", "$type$0"] && function.body == nymph_hir::hir::HirExpr::Local("x".into()))
 	);
 	assert!(
-		matches!(lowered[1].fragment(), nymph_sema::LoweredHirFragment::TopLevelValue(value) if value.value == nymph_hir::hir::HirExpr::Num(42.0, nymph_hir::hir::NumKind::Int))
+		matches!(lowered[1].fragment(), nymph_sema::LoweredHirFragment::TopLevelValue(value) if value.value == nymph_hir::hir::HirExpr::Int(42))
 	);
 	for item in &lowered {
 		assert_eq!(
@@ -1113,7 +1179,6 @@ fn top_level_external_value_lowers_to_exact_marshaled_binding() {
 		lowered.fragment(),
 		nymph_sema::LoweredHirFragment::TopLevelValue(nymph_hir::hir::HirLet {
 			name,
-			mutable: false,
 			value: nymph_hir::hir::HirExpr::ExternValue {
 				module: "std/math/intrinsics",
 				symbol: "max_float",
@@ -1153,9 +1218,9 @@ fn namespace_external_value_uses_its_exact_member_kind_and_marshal() {
 #[test]
 fn nominal_external_members_preserve_their_exact_attachment_placement() {
 	let (artifacts, _, context) = materialized_fixture(
-		"type Scalar = float\nstruct Box {}\nimpl Box { external(display) func rendered(): string external(max_float) let maximum: Scalar }",
+		"type Scalar = float\nstruct Box {}\nimpl Box { external(primitive_equals) func equals(other: Box): boolean external(max_float) let maximum: Scalar }",
 	);
-	for name in ["rendered", "maximum"] {
+	for name in ["equals", "maximum"] {
 		let artifact = artifacts
 			.iter()
 			.find(|artifact| source_name(&artifact.definition) == name)
@@ -1173,7 +1238,7 @@ fn nominal_external_members_preserve_their_exact_attachment_placement() {
 		));
 		assert!(matches!(
 			(lowered.fragment(), name),
-			(nymph_sema::LoweredHirFragment::AttachedInstance { owner, .. }, "rendered")
+			(nymph_sema::LoweredHirFragment::AttachedInstance { owner, .. }, "equals")
 				| (nymph_sema::LoweredHirFragment::AttachedMember { owner, .. }, "maximum")
 					if owner == expected_owner
 		));
@@ -1181,27 +1246,39 @@ fn nominal_external_members_preserve_their_exact_attachment_placement() {
 }
 
 #[test]
-fn generic_blanket_external_lowers_to_its_exact_module_binding() {
+fn concrete_integer_external_marshals_its_shellless_receiver_and_argument() {
 	let (artifacts, _, context) = materialized_fixture(
-		"interface Hash { func hash(): int }\nimpl<T> Hash for T { external(hash) func hash(): int }",
+		"interface Equals<Other> { func equals(other: Other): boolean }\nimpl Equals<uint> for int { external(primitive_equals) func equals(other: uint): boolean }",
 	);
 	let artifact = artifacts
 		.into_iter()
-		.find(|artifact| source_name(&artifact.definition) == "hash")
-		.expect("generic blanket external");
-	let definition = artifact.definition.clone();
+		.find(|artifact| {
+			matches!(&artifact.payload, nymph_sema::RuntimePayload::External(_))
+				&& matches!(
+					&artifact.placement,
+					nymph_sema::RuntimePlacement::Attached { owner, .. }
+						if matches!(owner.key, nymph_sema::DeclarationKey::Implementation { .. })
+				)
+		})
+		.expect("concrete external implementation member");
 	let lowered = lower_runtime_definition(&context, Arc::new(artifact)).unwrap();
-	assert_eq!(lowered.definition(), &definition);
 	assert!(matches!(
 		lowered.fragment(),
-		nymph_sema::LoweredHirFragment::TopLevelExternal { abi, .. }
-			if matches!(&abi.callable, nymph_sema::ExternalCallable::Linked { module, symbol }
-				if module == "std/hash" && symbol == "hash")
+		nymph_sema::LoweredHirFragment::TopLevelExternal {
+			function: Some(nymph_hir::hir::HirFunc {
+				body: nymph_hir::hir::HirExpr::ExternCall {
+					argument_marshals,
+					return_marshal: Some(nymph_hir::hir::MarshalKind::Boolean),
+					..
+				},
+				..
+			}),
+			..
+		} if argument_marshals == &[
+			Some(nymph_hir::hir::MarshalKind::Int),
+			Some(nymph_hir::hir::MarshalKind::UInt),
+		]
 	));
-	assert_eq!(
-		lowered.placement(),
-		&nymph_sema::RuntimeAssemblyPlacement::Module(definition.module)
-	);
 }
 
 #[test]
@@ -1236,7 +1313,7 @@ fn generic_blanket_body_and_dispatch_use_the_exact_module_binding() {
 			lowered.fragment(),
 			nymph_sema::LoweredHirFragment::TopLevelFunction(function)
 				if function.params == ["$self", "$type$0"]
-					&& matches!(&function.body, nymph_hir::hir::HirExpr::Call { callee, args }
+					&& matches!(&function.body, nymph_hir::hir::HirExpr::ActivationCall { callee, args, mode: nymph_hir::hir::HirCallMode::Tail, .. }
 						if args == &[
 							nymph_hir::hir::HirExpr::Local("$self".into()),
 							nymph_hir::hir::HirExpr::Local("$type$0".into()),
@@ -1261,7 +1338,7 @@ fn generic_blanket_body_and_dispatch_use_the_exact_module_binding() {
 		matches!(
 			lowered.fragment(),
 			nymph_sema::LoweredHirFragment::TopLevelFunction(function)
-				if matches!(&function.body, nymph_hir::hir::HirExpr::Call { callee, args }
+				if matches!(&function.body, nymph_hir::hir::HirExpr::ActivationCall { callee, args, mode: nymph_hir::hir::HirCallMode::Tail, .. }
 					if args.len() == 2
 						&& matches!(&args[1], nymph_hir::hir::HirExpr::RuntimeTypeObject { binding, .. } if binding == "NInt")
 						&& matches!(&**callee, nymph_hir::hir::HirExpr::Local(name) if name == "wrapper"))
@@ -1297,31 +1374,6 @@ fn generic_interface_extension_body_keeps_exact_identity_and_skips_absent_dispat
 }
 
 #[test]
-fn generic_interface_external_extension_keeps_exact_module_binding() {
-	let (artifacts, interface, context) = materialized_fixture(
-		"interface Hash { func hash(): int }\nimpl<T> Hash for T { external(hash) func fingerprint(): int }",
-	);
-	assert!(interface.implementations[0].member_slots.is_empty());
-	let artifact = artifacts
-		.iter()
-		.find(|artifact| source_name(&artifact.definition) == "fingerprint")
-		.expect("generic interface external extension");
-	let definition = artifact.definition.clone();
-	let lowered = lower_runtime_definition(&context, Arc::new(artifact.clone())).unwrap();
-	assert_eq!(lowered.definition(), &definition);
-	assert!(matches!(
-		lowered.fragment(),
-		nymph_sema::LoweredHirFragment::TopLevelExternal { abi, .. }
-			if matches!(&abi.callable, nymph_sema::ExternalCallable::Linked { module, symbol }
-				if module == "std/hash" && symbol == "hash")
-	));
-	assert_eq!(
-		lowered.placement(),
-		&nymph_sema::RuntimeAssemblyPlacement::Module(definition.module)
-	);
-}
-
-#[test]
 fn generic_blanket_materialized_default_uses_the_exact_module_binding() {
 	let (artifacts, interface, context) = materialized_fixture(
 		"interface Blanket { func blanket(): int = 23 }\nimpl<T> Blanket for T {}",
@@ -1347,33 +1399,6 @@ fn generic_blanket_materialized_default_uses_the_exact_module_binding() {
 }
 
 #[test]
-fn mutable_nominal_implementation_spellings_retain_the_exact_shell() {
-	for source in [
-		"interface Read { func read(): int }\nstruct Box(value: int)\nimpl Read for mut Box { func read(): int = 1 }",
-		"interface Read { func read(): int }\nstruct Box(value: int)\nimpl mut Read for Box { func read(): int = 1 }",
-	] {
-		let (artifacts, interface, context) = materialized_fixture(source);
-		let implementation = &interface.implementations[0];
-		let member = implementation.member_slots[0].member_id.clone();
-		let artifact = artifacts
-			.iter()
-			.find(|artifact| artifact.definition == member)
-			.expect("mutable nominal implementation member");
-		let lowered = lower_runtime_definition(&context, Arc::new(artifact.clone())).unwrap();
-		let InterfaceType::Mutable(inner) = &implementation.self_type else {
-			panic!("mutable implementation self type")
-		};
-		let InterfaceType::Named { definition, .. } = inner.as_ref() else {
-			panic!("mutable nominal implementation owner")
-		};
-		assert_eq!(
-			lowered.placement(),
-			&nymph_sema::RuntimeAssemblyPlacement::Shell(definition.clone())
-		);
-	}
-}
-
-#[test]
 fn first_class_interface_method_lowers_as_an_exact_receiver_bound_closure() {
 	let lowered = lower_named(
 		"interface Read { func read(value: int): int }\nstruct Box(value: int)\nimpl Read for Box { func read(value: int): int = this.value + value }\nfunc apply(box: Box): int = { let read = box.read read(1) }",
@@ -1390,7 +1415,7 @@ fn first_class_interface_method_lowers_as_an_exact_receiver_bound_closure() {
 	};
 	assert!(matches!(
 		value,
-		nymph_hir::hir::HirExpr::Call { callee, args }
+		nymph_hir::hir::HirExpr::ActivationCall { callee, args, .. }
 			if args.len() == 1
 				&& matches!(&**callee, nymph_hir::hir::HirExpr::Closure { params, body }
 					if params == &["$receiver"]
@@ -1413,19 +1438,21 @@ fn first_class_generic_bound_method_uses_the_exact_interface_member() {
 	let nymph_hir::hir::HirStmt::Let { value, .. } = &stmts[0] else {
 		panic!("method value must initialize its binding")
 	};
-	assert!(matches!(value, nymph_hir::hir::HirExpr::Call { callee, .. }
+	assert!(
+		matches!(value, nymph_hir::hir::HirExpr::ActivationCall { callee, .. }
 		if matches!(&**callee, nymph_hir::hir::HirExpr::Closure { body, .. }
 			if matches!(&**body, nymph_hir::hir::HirExpr::Closure { body, .. }
-				if matches!(&**body, nymph_hir::hir::HirExpr::Call { callee, args }
+				if matches!(&**body, nymph_hir::hir::HirExpr::ActivationCall { callee, args, .. }
 					if matches!(&**callee, nymph_hir::hir::HirExpr::Field { name, .. } if name == "read")
 						&& args.len() == 2
-						&& matches!(&args[1], nymph_hir::hir::HirExpr::RuntimeTypeObject { binding, .. } if binding == "NInt"))))));
+						&& matches!(&args[1], nymph_hir::hir::HirExpr::RuntimeTypeObject { binding, .. } if binding == "NInt")))))
+	);
 }
 
 #[test]
 fn first_class_external_method_uses_the_catalog_selected_abi() {
 	let lowered = lower_named(
-		"interface Render { func render(): string }\nstruct Box {}\nimpl Render for Box { external(display) func render(): string }\nfunc apply(box: Box): string = { let render = box.render render() }",
+		"interface Equal { func equal(other: Box): boolean }\nstruct Box {}\nimpl Equal for Box { external(primitive_equals) func equal(other: Box): boolean }\nfunc apply(box: Box): boolean = { let equal = box.equal equal(box) }",
 		"apply",
 	);
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
@@ -1438,19 +1465,19 @@ fn first_class_external_method_uses_the_catalog_selected_abi() {
 		panic!("method value must initialize its binding")
 	};
 	assert!(
-		matches!(value, nymph_hir::hir::HirExpr::Call { callee, .. }
+		matches!(value, nymph_hir::hir::HirExpr::ActivationCall { callee, .. }
 		if matches!(&**callee, nymph_hir::hir::HirExpr::Closure { body, .. }
 			if matches!(&**body, nymph_hir::hir::HirExpr::Closure { body, .. }
-				if matches!(&**body, nymph_hir::hir::HirExpr::Call { callee, args }
-					if matches!(&**callee, nymph_hir::hir::HirExpr::Field { name, .. } if name == "render")
-						&& args.is_empty())))),
+				if matches!(&**body, nymph_hir::hir::HirExpr::ActivationCall { callee, args, .. }
+					if matches!(&**callee, nymph_hir::hir::HirExpr::Field { name, .. } if name == "equal")
+						&& args.len() == 1)))),
 		"{value:#?}"
 	);
 }
 
 #[test]
 fn inherent_external_method_calls_and_values_use_the_exact_member_abi() {
-	let source = "struct Box { external(display) func render(): string }\nfunc call(box: Box): string = box.render()\nfunc value(box: Box): string = { let render = box.render render() }";
+	let source = "struct Box { external(primitive_equals) func equal(other: Box): boolean }\nfunc call(box: Box): boolean = box.equal(box)\nfunc value(box: Box): boolean = { let equal = box.equal equal(box) }";
 	for function in ["call", "value"] {
 		let lowered = lower_named(source, function);
 		let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
@@ -1458,7 +1485,7 @@ fn inherent_external_method_calls_and_values_use_the_exact_member_abi() {
 		};
 		let rendered = format!("{:#?}", function.body);
 		assert!(rendered.contains("Call"), "{rendered}");
-		assert!(rendered.contains("render"), "{rendered}");
+		assert!(rendered.contains("equal"), "{rendered}");
 		assert!(!rendered.contains("ExternCall"), "{rendered}");
 	}
 }
@@ -1466,24 +1493,17 @@ fn inherent_external_method_calls_and_values_use_the_exact_member_abi() {
 #[test]
 fn first_class_external_method_rejects_runtime_and_shape_abi_drift() {
 	let (artifacts, _, mut context) = materialized_fixture(
-		"interface Render { func render(): string }\nstruct Box {}\nimpl Render for Box { external(display) func render(): string }\nfunc apply(box: Box): string = { let render = box.render render() }",
+		"interface Equal { func equal(other: Box): boolean }\nstruct Box {}\nimpl Equal for Box { external(primitive_equals) func equal(other: Box): boolean }\nfunc apply(box: Box): boolean = { let equal = box.equal equal(box) }",
 	);
-	let render = artifacts
+	let equal = artifacts
 		.iter()
-		.find(|artifact| source_name(&artifact.definition) == "render")
+		.find(|artifact| source_name(&artifact.definition) == "equal")
 		.unwrap()
 		.definition
 		.clone();
 	context.shapes.insert(
-		StableShapeRequest::ExternalAbi(render.clone()),
-		StableShapeFact::ExternalAbi(ExternalAbi {
-			marker: "println".into(),
-			callable: nymph_sema::ExternalCallable::Linked {
-				module: "std/io".into(),
-				symbol: "println".into(),
-			},
-			marshal: None,
-		}),
+		StableShapeRequest::ExternalAbi(equal.clone()),
+		StableShapeFact::ExternalAbi(linked_abi("println", "std/io", "println", None)),
 	);
 	let apply = artifacts
 		.into_iter()
@@ -1492,14 +1512,14 @@ fn first_class_external_method_rejects_runtime_and_shape_abi_drift() {
 	assert!(matches!(
 		lower_runtime_definition(&context, Arc::new(apply)),
 		Err(nymph_sema::StableLoweringError::MismatchedExternalAbi { definition })
-			if definition == render
+			if definition == equal
 	));
 }
 
 #[test]
 fn first_class_generic_external_uses_checked_arity_and_exact_linked_abi() {
 	let (artifacts, _, context) = materialized_fixture(
-		"external(println) func print<T: Display>(value: T): void\nfunc apply(): int = { let f = print f(1) 0 }",
+		"external(println) func print<T>(value: T): void\nfunc apply(): int = { let f = print f(1) 0 }",
 	);
 	let print = artifacts
 		.iter()
@@ -1540,7 +1560,7 @@ fn first_class_generic_external_uses_checked_arity_and_exact_linked_abi() {
 #[test]
 fn generic_external_rejects_definition_binder_drift() {
 	let (artifacts, _, mut context) = materialized_fixture(
-		"external(println) func print<T: Display>(value: T): void\nfunc apply(): int = { let f = print f(1) 0 }",
+		"external(println) func print<T>(value: T): void\nfunc apply(): int = { let f = print f(1) 0 }",
 	);
 	let print = artifacts
 		.iter()
@@ -1570,7 +1590,7 @@ fn generic_external_rejects_definition_binder_drift() {
 #[test]
 fn grouped_generic_external_value_keeps_its_receiverless_adapter() {
 	let lowered = lower_named(
-		"external(println) func print<T: Display>(value: T): void\nfunc apply(): int = { let f = (print) f(1) 0 }",
+		"external(println) func print<T>(value: T): void\nfunc apply(): int = { let f = (print) f(1) 0 }",
 		"apply",
 	);
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
@@ -1595,8 +1615,8 @@ fn grouped_generic_external_value_keeps_its_receiverless_adapter() {
 fn direct_generic_externals_append_hidden_arguments_after_exact_source_arity() {
 	for (source, expected_arity) in [
 		(
-			"external(display) func make<T>(): T\nfunc apply(): int = make()",
-			1,
+			"external(println) func write<T>(value: T): void\nfunc apply(): void = write(1)",
+			2,
 		),
 		(
 			"external(compare_char) func compare<A, B>(first: A, second: B): int\nfunc apply(): int = compare(first = 1, second = 2)",
@@ -1610,7 +1630,11 @@ fn direct_generic_externals_append_hidden_arguments_after_exact_source_arity() {
 		assert!(
 			matches!(
 				&function.body,
-				nymph_hir::hir::HirExpr::Call { args, .. }
+				nymph_hir::hir::HirExpr::ActivationCall {
+					args,
+					mode: nymph_hir::hir::HirCallMode::Tail,
+					..
+				}
 					if args.len() == expected_arity
 						&& matches!(args.last(), Some(nymph_hir::hir::HirExpr::RuntimeTypeObject { binding, .. }) if binding == "NInt")
 			),
@@ -1618,6 +1642,21 @@ fn direct_generic_externals_append_hidden_arguments_after_exact_source_arity() {
 			function.body
 		);
 	}
+}
+
+#[test]
+fn effect_generics_are_erased_from_stable_call_arity() {
+	let lowered = lower_named(
+		"effect Io\nexternal(source) func source(): !Io\nfunc apply<!E>(callback: () -> void + !E): !E = callback()\nfunc caller(): !Io = apply(source)",
+		"caller",
+	);
+	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+		panic!("caller must lower as a function")
+	};
+	assert!(matches!(
+		&function.body,
+		nymph_hir::hir::HirExpr::ActivationCall { args, mode: nymph_hir::hir::HirCallMode::Tail, .. } if args.len() == 1
+	));
 }
 
 #[test]
@@ -1634,10 +1673,10 @@ fn generic_external_method_calls_and_values_preserve_receiver_source_hidden_orde
 		panic!("external method value must initialize its binding")
 	};
 	assert!(
-		matches!(value, nymph_hir::hir::HirExpr::Call { callee, .. }
+		matches!(value, nymph_hir::hir::HirExpr::ActivationCall { callee, .. }
 			if matches!(&**callee, nymph_hir::hir::HirExpr::Closure { body, .. }
 				if matches!(&**body, nymph_hir::hir::HirExpr::Closure { body, .. }
-					if matches!(&**body, nymph_hir::hir::HirExpr::Call { args, .. }
+					if matches!(&**body, nymph_hir::hir::HirExpr::ActivationCall { args, .. }
 						if args.len() == 3
 							&& matches!(&args[0], nymph_hir::hir::HirExpr::Local(name) if name == "$receiver")
 							&& matches!(&args[1], nymph_hir::hir::HirExpr::Local(name) if name == "$arg0")
@@ -1652,7 +1691,11 @@ fn generic_external_method_calls_and_values_preserve_receiver_source_hidden_orde
 	assert!(
 		matches!(
 			&function.body,
-			nymph_hir::hir::HirExpr::Call { args, .. }
+			nymph_hir::hir::HirExpr::ActivationCall {
+				args,
+				mode: nymph_hir::hir::HirCallMode::Tail,
+				..
+			}
 				if args.len() == 3
 					&& matches!(&args[2], nymph_hir::hir::HirExpr::RuntimeTypeObject { binding, .. } if binding == "NInt")
 		),
@@ -1738,18 +1781,14 @@ fn concrete_parameterized_static_value_keeps_its_generic_adapter() {
 #[test]
 fn first_class_generic_external_rejects_a_deferred_runtime_target() {
 	let (artifacts, _, mut context) = materialized_fixture(
-		"external(println) func print<T: Display>(value: T): void\nfunc apply(): int = { let f = print f(1) 0 }",
+		"external(println) func print<T>(value: T): void\nfunc apply(): int = { let f = print f(1) 0 }",
 	);
 	let mut print = artifacts
 		.iter()
 		.find(|artifact| source_name(&artifact.definition) == "print")
 		.unwrap()
 		.clone();
-	let deferred = ExternalAbi {
-		marker: "println".into(),
-		callable: nymph_sema::ExternalCallable::Deferred,
-		marshal: None,
-	};
+	let deferred = deferred_abi("println");
 	print.payload = nymph_sema::RuntimePayload::External(deferred.clone());
 	context
 		.runtime
@@ -1846,14 +1885,12 @@ fn direct_external_call_rejects_runtime_and_shape_abi_drift() {
 		.clone();
 	context.shapes.insert(
 		StableShapeRequest::ExternalAbi(compare.clone()),
-		StableShapeFact::ExternalAbi(ExternalAbi {
-			marker: "display".into(),
-			callable: nymph_sema::ExternalCallable::Linked {
-				module: "std/display".into(),
-				symbol: "display".into(),
-			},
-			marshal: None,
-		}),
+		StableShapeFact::ExternalAbi(linked_abi(
+			"compare_string",
+			"std/comparison",
+			"compare_string",
+			None,
+		)),
 	);
 	let sign = artifacts
 		.into_iter()
@@ -1869,8 +1906,8 @@ fn direct_external_call_rejects_runtime_and_shape_abi_drift() {
 
 #[test]
 fn external_dispatch_rejects_a_missing_persisted_marshal() {
-	let (mut artifacts, _, context) = materialized_fixture(
-		"interface Render { func render(): string }\nstruct Box {}\nimpl Render for Box { external(display) func render(): string }\nfunc read(box: Box): string = box.render()",
+	let (mut artifacts, _, mut context) = materialized_fixture(
+		"interface Equal { func equal(other: Box): boolean }\nstruct Box {}\nimpl Equal for Box { external(primitive_equals) func equal(other: Box): boolean }\nfunc read(box: Box): boolean = box.equal(box)",
 	);
 	let mut read = artifacts
 		.drain(..)
@@ -1887,7 +1924,14 @@ fn external_dispatch_rejects_a_missing_persisted_marshal() {
 		unreachable!()
 	};
 	let member = member.clone();
-	*marshal = Some(nymph_hir::hir::MarshalKind::String);
+	*marshal = Some(nymph_hir::hir::MarshalKind::Boolean);
+	let Some(nymph_sema::StableShapeFact::ExternalAbi(abi)) = context
+		.shapes
+		.get_mut(&nymph_sema::StableShapeRequest::ExternalAbi(member.clone()))
+	else {
+		unreachable!()
+	};
+	abi.marshal.result = None;
 
 	assert!(matches!(
 		lower_runtime_definition(&context, Arc::new(read)),
@@ -1910,12 +1954,13 @@ fn top_level_external_values_preserve_every_stable_marshal_kind() {
 		nymph_hir::hir::MarshalKind::List,
 		nymph_hir::hir::MarshalKind::Tuple,
 		nymph_hir::hir::MarshalKind::Map,
+		nymph_hir::hir::MarshalKind::Opaque(0x117),
 	] {
 		let mut artifact = template.clone();
 		let nymph_sema::RuntimePayload::External(abi) = &mut artifact.payload else {
 			unreachable!()
 		};
-		abi.marshal = Some(marshal);
+		abi.marshal.result = Some(marshal);
 		let mut context = Context::default();
 		context.names.insert(
 			artifact.definition.clone(),
@@ -1958,7 +2003,7 @@ fn malformed_external_artifacts_return_distinct_typed_errors() {
 	let nymph_sema::RuntimePayload::External(abi) = &mut missing_marshal.payload else {
 		unreachable!()
 	};
-	abi.marshal = None;
+	abi.marshal.result = None;
 	context.shapes.insert(
 		StableShapeRequest::ExternalAbi(missing_marshal.definition.clone()),
 		StableShapeFact::ExternalAbi(abi.clone()),
@@ -1970,14 +2015,12 @@ fn malformed_external_artifacts_return_distinct_typed_errors() {
 
 	context.shapes.insert(
 		StableShapeRequest::ExternalAbi(artifact.definition.clone()),
-		StableShapeFact::ExternalAbi(nymph_sema::ExternalAbi {
-			marker: "different".into(),
-			callable: nymph_sema::ExternalCallable::Linked {
-				module: "elsewhere".into(),
-				symbol: "different".into(),
-			},
-			marshal: Some(nymph_hir::hir::MarshalKind::Float),
-		}),
+		StableShapeFact::ExternalAbi(linked_abi(
+			"different",
+			"elsewhere",
+			"different",
+			Some(nymph_hir::hir::MarshalKind::Float),
+		)),
 	);
 	assert!(matches!(
 		lower_runtime_definition(&context, Arc::new(artifact)),
@@ -2026,14 +2069,10 @@ fn lowers_list_and_map_spreads_to_spread_hir() {
 }
 
 #[test]
-fn lowers_interpolation_compound_assignment_and_closure_shadowing() {
+fn lowers_interpolation_and_closure_shadowing() {
 	let interpolation = lower_fixture("func show(x: int): string = \"value: ${x}\"");
 	assert!(
 		matches!(interpolation.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(f) if matches!(f.body, nymph_hir::hir::HirExpr::InterpolatedString(_)))
-	);
-	let compound = lower_fixture("func bump(mut x: int): void = { x += 1 }");
-	assert!(
-		matches!(compound.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(f) if matches!(f.body, nymph_hir::hir::HirExpr::Block { tail: Some(ref tail), .. } if matches!(**tail, nymph_hir::hir::HirExpr::Assign { .. })))
 	);
 	let closure = lower_fixture("func nested(x: int): (int) -> int = (x) -> x");
 	assert!(
@@ -2059,12 +2098,14 @@ fn inherent_member_dispatch_has_exact_call_fragment_and_member_demand() {
 	};
 	assert_eq!(
 		function.body,
-		nymph_hir::hir::HirExpr::Call {
+		nymph_hir::hir::HirExpr::ActivationCall {
 			callee: Box::new(nymph_hir::hir::HirExpr::Field {
 				recv: Box::new(nymph_hir::hir::HirExpr::Local("value".into())),
 				name: "get".into(),
 			}),
 			args: vec![],
+			mode: nymph_hir::hir::HirCallMode::Tail,
+			source: 2,
 		}
 	);
 	assert_eq!(item.demands().len(), 1);
@@ -2084,12 +2125,14 @@ fn inherent_static_dispatch_uses_exact_owner_binding_and_member_demand() {
 	};
 	assert_eq!(
 		function.body,
-		nymph_hir::hir::HirExpr::Call {
+		nymph_hir::hir::HirExpr::ActivationCall {
 			callee: Box::new(nymph_hir::hir::HirExpr::Field {
 				recv: Box::new(nymph_hir::hir::HirExpr::Local("Box".into())),
 				name: "make".into(),
 			}),
 			args: vec![],
+			mode: nymph_hir::hir::HirCallMode::Tail,
+			source: 0,
 		}
 	);
 	assert_eq!(item.demands().len(), 1);
@@ -2127,12 +2170,14 @@ fn nested_static_dispatch_uses_the_exact_nominal_owner() {
 		};
 		assert_eq!(
 			function.body,
-			nymph_hir::hir::HirExpr::Call {
+			nymph_hir::hir::HirExpr::ActivationCall {
 				callee: Box::new(nymph_hir::hir::HirExpr::Field {
 					recv: Box::new(nymph_hir::hir::HirExpr::Local(owner_name.as_str().into())),
 					name: member_name.as_str().into(),
 				}),
 				args: vec![],
+				mode: nymph_hir::hir::HirCallMode::Tail,
+				source: 0,
 			}
 		);
 		assert_eq!(item.demands(), [static_definition]);
@@ -2148,12 +2193,14 @@ fn selected_override_dispatch_has_exact_call_and_placement_demand() {
 	};
 	assert_eq!(
 		function.body,
-		nymph_hir::hir::HirExpr::Call {
+		nymph_hir::hir::HirExpr::ActivationCall {
 			callee: Box::new(nymph_hir::hir::HirExpr::Field {
 				recv: Box::new(nymph_hir::hir::HirExpr::Local("a".into())),
 				name: "plus".into(),
 			}),
 			args: vec![nymph_hir::hir::HirExpr::Local("b".into())],
+			mode: nymph_hir::hir::HirCallMode::Tail,
+			source: 1,
 		}
 	);
 	assert_eq!(item.demands().len(), 1);
@@ -2173,12 +2220,14 @@ fn inherited_interface_default_dispatch_has_exact_call_and_materialization_deman
 	};
 	assert_eq!(
 		function.body,
-		nymph_hir::hir::HirExpr::Call {
+		nymph_hir::hir::HirExpr::ActivationCall {
 			callee: Box::new(nymph_hir::hir::HirExpr::Field {
 				recv: Box::new(nymph_hir::hir::HirExpr::Local("a".into())),
 				name: "less_than".into(),
 			}),
 			args: vec![nymph_hir::hir::HirExpr::Local("b".into())],
+			mode: nymph_hir::hir::HirCallMode::Tail,
+			source: 1,
 		}
 	);
 	assert_eq!(item.demands().len(), 1);
@@ -2203,6 +2252,8 @@ fn generic_bound_unary_dispatch_has_no_concrete_runtime_demand() {
 			receiver: Box::new(nymph_hir::hir::HirExpr::Local("value".into())),
 			hidden_arguments: vec![],
 			cases: vec![],
+			mode: nymph_hir::hir::HirCallMode::Tail,
+			source: 2,
 		}
 	);
 	assert_eq!(item.demands(), []);
@@ -2227,7 +2278,7 @@ fn namespaced_call_through_generic_parameter_uses_hidden_type_object() {
 	assert_eq!(function.params, ["$type$0"]);
 	assert!(matches!(
 		&function.body,
-		nymph_hir::hir::HirExpr::Call { callee, args }
+		nymph_hir::hir::HirExpr::ActivationCall { callee, args, mode: nymph_hir::hir::HirCallMode::Tail, .. }
 			if args.is_empty()
 				&& matches!(callee.as_ref(), nymph_hir::hir::HirExpr::Field { recv, name }
 					if name == "default" && matches!(recv.as_ref(), nymph_hir::hir::HirExpr::Local(local) if local == "$type$0"))
@@ -2254,6 +2305,36 @@ fn primitive_eager_and_short_circuit_dispatch_stay_native_without_demands() {
 			if matches!(function.body, nymph_hir::hir::HirExpr::Binary { op: nymph_hir::hir::BinOp::And, .. })
 	));
 	assert_eq!(short.demands(), []);
+}
+
+#[test]
+fn range_proofs_select_explicit_direct_and_checked_hir() {
+	use nymph_hir::hir::{HirExpr, OperationMode};
+
+	let direct = lower_named(
+		"func add(value: uint): uint = if (value < 18446744073709551615u) value + 1u else value",
+		"add",
+	);
+	assert!(matches!(
+		direct.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
+			if matches!(function.body, HirExpr::If { ref then, .. }
+				if matches!(then.as_ref(), HirExpr::Binary { mode: OperationMode::Direct, .. }))
+	));
+
+	let checked = lower_named("func add(left: int, right: int): int = left + right", "add");
+	assert!(matches!(
+		checked.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
+			if matches!(function.body, HirExpr::Binary { mode: OperationMode::Checked, .. })
+	));
+
+	let index = lower_named("func item(): int = #[1, 2][1u]", "item");
+	assert!(matches!(
+		index.fragment(),
+		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
+			if matches!(function.body, HirExpr::ListRead { mode: OperationMode::Direct, .. })
+	));
 }
 
 #[test]
@@ -2352,6 +2433,8 @@ fn generic_bound_with_two_primitive_implementations_lowers_to_stable_multi_case_
 					},
 				},
 			],
+			mode: nymph_hir::hir::HirCallMode::Tail,
+			source: 2,
 		}
 	);
 	assert_eq!(lowered.demands(), expected_targets);
@@ -2412,7 +2495,7 @@ fn lowers_struct_and_enum_construction_and_variant_patterns_from_stable_facts() 
 		point.fragment(),
 		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
 			if matches!(&function.body, nymph_hir::hir::HirExpr::Block { stmts, tail: Some(tail) }
-				if stmts.len() == 2 && matches!(tail.as_ref(), nymph_hir::hir::HirExpr::New { class, fields, .. }
+				if stmts.len() == 2 && matches!(tail.as_ref(), nymph_hir::hir::HirExpr::StructFresh { class, fields, .. }
 					if class == "Point" && fields.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>() == ["value", "v"]))
 	));
 	let choice = lower_named(source, "choose");
@@ -2427,21 +2510,53 @@ fn lowers_struct_and_enum_construction_and_variant_patterns_from_stable_facts() 
 }
 
 #[test]
-fn lowers_native_index_access_and_assignment_without_protocol_fallback() {
-	let list = lower_fixture("func update(xs: mut #[int]): int = { xs[0u] = 2\nxs[0u] }");
-	assert!(matches!(
-		list.fragment(),
-		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
-			if matches!(function.body, nymph_hir::hir::HirExpr::Block { tail: Some(ref tail), .. }
-				if matches!(**tail, nymph_hir::hir::HirExpr::Index { .. }))
-	));
-	assert_eq!(list.demands(), []);
+fn lowers_native_index_access_without_protocol_fallback() {
 	let map = lower_fixture("func lookup(xs: #{string: int}): int = xs[\"one\"]");
 	assert!(matches!(
 		map.fragment(),
 		nymph_sema::LoweredHirFragment::TopLevelFunction(function)
 			if matches!(function.body, nymph_hir::hir::HirExpr::MapGet { .. })
 	));
+}
+
+#[test]
+fn list_externals_lower_to_persistent_hir() {
+	let source = r#"
+		impl<T> #[T] {
+			external(appended) func appended(item: T): #[T]
+			external(replaced) func replaced(index: uint, item: T): #[T]
+			external(slice) func slice(start: uint, end: uint): #[T]
+		}
+		func do_append(xs: #[int]): #[int] = xs.appended(1)
+		func do_replace(xs: #[int]): #[int] = xs.replaced(0, 1)
+		func do_slice(xs: #[int]): #[int] = xs.slice(0, 1)
+	"#;
+	let (artifacts, _, context) = materialized_fixture(source);
+	for (name, expected) in [
+		("do_append", "append"),
+		("do_replace", "replace"),
+		("do_slice", "slice"),
+	] {
+		let artifact = artifacts
+			.iter()
+			.find(|artifact| source_name(&artifact.definition) == name)
+			.unwrap()
+			.clone();
+		let lowered = lower_runtime_definition(&context, Arc::new(artifact)).unwrap();
+		let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
+			panic!("{name} must lower as a function: {:?}", lowered.fragment());
+		};
+		assert!(
+			match (expected, &function.body) {
+				("append", nymph_hir::hir::HirExpr::ListAppend { .. })
+				| ("replace", nymph_hir::hir::HirExpr::ListReplace { .. })
+				| ("slice", nymph_hir::hir::HirExpr::ListSlice { .. }) => true,
+				_ => false,
+			},
+			"unexpected {name} HIR: {:?}",
+			function.body
+		);
+	}
 }
 
 #[test]
@@ -2492,24 +2607,24 @@ fn lowers_custom_user_index_access_with_exact_method_and_implementation_demand()
 		&nymph_sema::LoweredHirFragment::TopLevelFunction(nymph_hir::hir::HirFunc {
 			name: "read".into(),
 			params: vec!["value".into()],
-			body: nymph_hir::hir::HirExpr::Call {
+			body: nymph_hir::hir::HirExpr::ActivationCall {
 				callee: Box::new(nymph_hir::hir::HirExpr::Field {
 					recv: Box::new(nymph_hir::hir::HirExpr::Local("value".into())),
 					name: "index".into(),
 				}),
-				args: vec![nymph_hir::hir::HirExpr::Num(
-					2.0,
-					nymph_hir::hir::NumKind::Int
-				)],
+				args: vec![nymph_hir::hir::HirExpr::Int(2)],
+				mode: nymph_hir::hir::HirCallMode::Tail,
+				source: 1,
 			},
 		})
 	);
 	assert_eq!(lowered.demands(), [index]);
 }
 
+/* Legacy assignment-source rejection coverage lives in the frozen corpus.
 #[test]
 fn custom_index_assignment_and_compound_assignment_are_rejected_by_the_checker() {
-	for assignment in ["value[0] = 1", "value[0] += 1"] {
+	for assignment in ["legacy assignment", "legacy compound assignment"] {
 		let source = format!(
 			"interface Index<Key, Output> {{ func index(key: Key): Output }}\nstruct Value {{ impl Index<Key = int, Output = int> {{ func index(key: int): int = key }} }}\nfunc write(value: Value): void = {assignment}"
 		);
@@ -2535,6 +2650,7 @@ fn custom_index_assignment_and_compound_assignment_are_rejected_by_the_checker()
 		);
 	}
 }
+*/
 
 #[test]
 fn lowers_native_map_and_user_iterator_spreads_with_exact_ordered_demands() {
@@ -2547,7 +2663,7 @@ fn lowers_native_map_and_user_iterator_spreads_with_exact_ordered_demands() {
 	);
 	assert_eq!(native.demands(), []);
 
-	let source = "enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nstruct Values\nimpl Iterator<int> for Values { mut func next(): Option<int> = None }\nstruct Pairs\nimpl Iterator<#(int, int)> for Pairs { mut func next(): Option<#(int, int)> = None }\nfunc list(value: mut Values): #[int] = #[...value]\nfunc map(value: mut Pairs): #{int: int} = #{...value}";
+	let source = "enum Iteration<Item, Next> { Done, Yield(item: Item, next: Next) }\ninterface Iterator<Item + !E> { func next(): Iteration<Item, self> + !E }\ninterface Iterable<Item + !E> { func iter(): Iterator<Item + !E> }\nstruct Values\nimpl Iterator<int> for Values { func next(): Iteration<int, self> = Done }\nstruct Pairs\nimpl Iterator<#(int, int)> for Pairs { func next(): Iteration<#(int, int), self> = Done }\nfunc list(value: Values): #[int] = #[...value]\nfunc map(value: Pairs): #{int: int} = #{...value}";
 	let (items, interface, context) = materialized_fixture(source);
 	let expected = interface
 		.implementations
@@ -2564,7 +2680,7 @@ fn lowers_native_map_and_user_iterator_spreads_with_exact_ordered_demands() {
 		assert!(if map {
 			matches!(lowered.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if matches!(&function.body, nymph_hir::hir::HirExpr::WithPrototype { value, .. } if matches!(value.as_ref(), nymph_hir::hir::HirExpr::MapSpread(items) if matches!(&items[0], nymph_hir::hir::HirMapElem::Spread(nymph_hir::hir::HirExpr::Block { .. })))))
 		} else {
-			matches!(lowered.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if matches!(&function.body, nymph_hir::hir::HirExpr::WithPrototype { value, .. } if matches!(value.as_ref(), nymph_hir::hir::HirExpr::ArraySpread { elems, .. } if matches!(&elems[0], nymph_hir::hir::HirArrayElem::Spread(nymph_hir::hir::HirExpr::Block { .. })))))
+			matches!(lowered.fragment(), nymph_sema::LoweredHirFragment::TopLevelFunction(function) if matches!(&function.body, nymph_hir::hir::HirExpr::WithPrototype { value, .. } if matches!(value.as_ref(), nymph_hir::hir::HirExpr::ListConstruct(elems) if matches!(&elems[0], nymph_hir::hir::HirArrayElem::Spread(nymph_hir::hir::HirExpr::Block { .. })))))
 		});
 		let _resolved_implementation = if map { &expected[1] } else { &expected[0] };
 		assert_eq!(lowered.demands(), []);
@@ -2573,7 +2689,7 @@ fn lowers_native_map_and_user_iterator_spreads_with_exact_ordered_demands() {
 
 #[test]
 fn lowers_for_over_native_list_user_iterator_and_bounded_ranges_with_exact_modes() {
-	let source = "enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nstruct Values\nimpl Iterator<int> for Values { mut func next(): Option<int> = None }\nfunc each(xs: mut Values): void = for (x in xs) { x }";
+	let source = "enum Iteration<Item, Next> { Done, Yield(item: Item, next: Next) }\ninterface Iterator<Item + !E> { func next(): Iteration<Item, self> + !E }\ninterface Iterable<Item + !E> { func iter(): Iterator<Item + !E> }\nstruct Values\nimpl Iterator<int> for Values { func next(): Iteration<int, self> = Done }\nfunc each(xs: Values): void = for (x in xs) { x }";
 	let (items, interface, context) = materialized_fixture(source);
 	let item = items
 		.into_iter()
@@ -2587,7 +2703,7 @@ fn lowers_for_over_native_list_user_iterator_and_bounded_ranges_with_exact_modes
 
 #[test]
 fn generic_iterable_for_retains_member_dispatch_without_a_template_runtime_demand() {
-	let source = "enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\nstruct Cursor\nimpl Iterator<int> for Cursor { mut func next(): Option<int> = None }\ninterface Iterable<Item> { func iter(): Cursor = Cursor() }\nfunc each<T: Iterable<Item = int>>(values: T): void = for (_ in values) { 0 }";
+	let source = "enum Iteration<Item, Next> { Done, Yield(item: Item, next: Next) }\ninterface Iterator<Item + !E> { func next(): Iteration<Item, self> + !E }\nstruct Cursor\nimpl Iterator<int> for Cursor { func next(): Iteration<int, self> = Done }\ninterface Iterable<Item + !E> { func iter(): Cursor = Cursor() }\nfunc each<T: Iterable<Item = int>>(values: T): void = for (_ in values) { 0 }";
 	let (items, _, context) = materialized_fixture(source);
 	let iter = items
 		.iter()
@@ -2609,21 +2725,18 @@ fn generic_iterable_for_retains_member_dispatch_without_a_template_runtime_deman
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
 		panic!("expected each function")
 	};
-	let nymph_hir::hir::HirExpr::Block { stmts, .. } = &function.body else {
-		panic!("expected lowered for block")
-	};
 	assert!(matches!(
-		&stmts[0],
-		nymph_hir::hir::HirStmt::Let {
-			value: nymph_hir::hir::HirExpr::Call { callee, args },
+		&function.body,
+		nymph_hir::hir::HirExpr::For {
+			iterator,
 			..
-		} if args.is_empty()
-			&& matches!(
+		} if matches!(iterator.as_ref(), nymph_hir::hir::HirExpr::ActivationCall { callee, args, .. }
+			if args.is_empty() && matches!(
 				callee.as_ref(),
 				nymph_hir::hir::HirExpr::Field { recv, name }
 					if name == "iter"
 						&& matches!(recv.as_ref(), nymph_hir::hir::HirExpr::Local(value) if value == "values")
-			)
+			))
 	));
 	let nymph_sema::RuntimePayload::NymphBody(body) = &mut each.payload else {
 		panic!("expected checked each body")
@@ -2648,7 +2761,7 @@ fn generic_iterable_for_retains_member_dispatch_without_a_template_runtime_deman
 
 #[test]
 fn nominal_iterable_for_calls_the_attached_iter_member_on_its_receiver() {
-	let source = "enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nstruct Cursor\nimpl Iterator<int> for Cursor { mut func next(): Option<int> = None }\nstruct Values(cursor: Cursor)\nimpl Iterable<int> for Values { func iter(): Cursor = this.cursor }\nfunc each(values: Values): void = for (_ in values) { 0 }";
+	let source = "enum Iteration<Item, Next> { Done, Yield(item: Item, next: Next) }\ninterface Iterator<Item + !E> { func next(): Iteration<Item, self> + !E }\ninterface Iterable<Item + !E> { func iter(): Iterator<Item + !E> }\nstruct Cursor\nimpl Iterator<int> for Cursor { func next(): Iteration<int, self> = Done }\nstruct Values(cursor: Cursor)\nimpl Iterable<int> for Values { func iter(): Cursor = this.cursor }\nfunc each(values: Values): void = for (_ in values) { 0 }";
 	let (items, interface, context) = materialized_fixture(source);
 	let iter = interface
 		.implementations
@@ -2667,21 +2780,18 @@ fn nominal_iterable_for_calls_the_attached_iter_member_on_its_receiver() {
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
 		panic!("expected each function")
 	};
-	let nymph_hir::hir::HirExpr::Block { stmts, .. } = &function.body else {
-		panic!("expected lowered for block")
-	};
 	assert!(matches!(
-		&stmts[0],
-		nymph_hir::hir::HirStmt::Let {
-			value: nymph_hir::hir::HirExpr::Call { callee, args },
+		&function.body,
+		nymph_hir::hir::HirExpr::For {
+			iterator,
 			..
-		} if args.is_empty()
-			&& matches!(
+		} if matches!(iterator.as_ref(), nymph_hir::hir::HirExpr::ActivationCall { callee, args, .. }
+			if args.is_empty() && matches!(
 				callee.as_ref(),
 				nymph_hir::hir::HirExpr::Field { recv, name }
 					if name == "iter"
 						&& matches!(recv.as_ref(), nymph_hir::hir::HirExpr::Local(value) if value == "values")
-			)
+			))
 	));
 }
 
@@ -2689,40 +2799,40 @@ fn assert_protocol_for(fragment: &nymph_sema::LoweredHirFragment, inclusive: boo
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = fragment else {
 		panic!("expected function")
 	};
-	let nymph_hir::hir::HirExpr::Block { stmts, .. } = &function.body else {
-		panic!("expected protocol block: {:?}", function.body)
+	let nymph_hir::hir::HirExpr::For {
+		iterator_name,
+		iterator,
+		iteration,
+		..
+	} = &function.body
+	else {
+		panic!("expected dedicated for: {:?}", function.body)
 	};
-	let nymph_hir::hir::HirStmt::Let { name, value, .. } = &stmts[0] else {
-		panic!("expected iterator binding")
-	};
-	assert_eq!(name, "$it");
+	assert_eq!(iterator_name, "$it");
+	assert_eq!(iteration.enum_name, "Iteration");
 	if inclusive {
-		assert!(matches!(value, nymph_hir::hir::HirExpr::Call { callee, .. }
+		assert!(
+			matches!(iterator.as_ref(), nymph_hir::hir::HirExpr::ActivationCall { callee, .. }
 			if matches!(callee.as_ref(), nymph_hir::hir::HirExpr::Field { name, recv }
 				if name == "iter" && matches!(recv.as_ref(), nymph_hir::hir::HirExpr::New { fields, .. }
-					if fields[2].1 == nymph_hir::hir::HirExpr::Bool(true)))));
+					if fields[2].1 == nymph_hir::hir::HirExpr::Bool(true))))
+		);
 	}
-	assert!(
-		matches!(&stmts[2], nymph_hir::hir::HirStmt::Expr(nymph_hir::hir::HirExpr::While { body, .. }) if matches!(body.as_ref(), nymph_hir::hir::HirExpr::Match { arms, .. } if matches!(&arms[0].pat, nymph_hir::hir::HirPat::Variant { variant, fields, .. } if variant == "Some" && fields.len() == 1)))
-	);
 }
 
 #[test]
 fn range_from_for_uses_the_iterable_protocol() {
-	let source = "enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nstruct OpenIter(value: int)\nimpl Iterator<int> for OpenIter { mut func next(): Option<int> = Option.None }\nstruct Range<T>(start: T, end: T)\nstruct RangeFrom<T>(start: T)\nstruct RangeTo<T>(end: T)\nstruct RangeInclusive<T>(start: T, end: T)\nstruct RangeToInclusive<T>(end: T)\nimpl Iterable<int> for RangeFrom<int> { func iter(): OpenIter = OpenIter(value = this.start) }\nfunc each(): void = for (_ in 1..) { 0 }";
+	let source = "enum Iteration<Item, Next> { Done, Yield(item: Item, next: Next) }\ninterface Iterator<Item + !E> { func next(): Iteration<Item, self> + !E }\ninterface Iterable<Item + !E> { func iter(): Iterator<Item + !E> }\nstruct OpenIter(value: int)\nimpl Iterator<int> for OpenIter { func next(): Iteration<int, self> = Done }\nstruct Range<T>(start: T, end: T)\nstruct RangeFrom<T>(start: T)\nstruct RangeTo<T>(end: T)\nstruct RangeInclusive<T>(start: T, end: T)\nstruct RangeToInclusive<T>(end: T)\nimpl Iterable<int> for RangeFrom<int> { func iter(): OpenIter = OpenIter(value = this.start) }\nfunc each(): void = for (_ in 1..) { 0 }";
 	let lowered = lower_named(source, "each");
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
 		panic!("expected function")
 	};
-	assert!(matches!(
-		function.body,
-		nymph_hir::hir::HirExpr::Block { .. }
-	));
+	assert!(matches!(function.body, nymph_hir::hir::HirExpr::For { .. }));
 }
 
 #[test]
 fn range_values_lower_to_their_canonical_structs_with_source_order_fields() {
-	let source = "enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nstruct Range<T>(start: T, end: T)\nstruct RangeFrom<T>(start: T)\nstruct RangeTo<T>(end: T)\nstruct RangeInclusive<T>(start: T, end: T)\nstruct RangeToInclusive<T>(end: T)\nfunc values(): void = { let a = 1..2\nlet b = 3..\nlet c = ..4\nlet d = 5..=6\nlet e = ..=7 }";
+	let source = "enum Iteration<Item, Next> { Done, Yield(item: Item, next: Next) }\ninterface Iterator<Item + !E> { func next(): Iteration<Item, self> + !E }\ninterface Iterable<Item + !E> { func iter(): Iterator<Item + !E> }\nstruct Range<T>(start: T, end: T)\nstruct RangeFrom<T>(start: T)\nstruct RangeTo<T>(end: T)\nstruct RangeInclusive<T>(start: T, end: T)\nstruct RangeToInclusive<T>(end: T)\nfunc values(): void = { let a = 1..2\nlet b = 3..\nlet c = ..4\nlet d = 5..=6\nlet e = ..=7 }";
 	let lowered = lower_named(source, "values");
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
 		panic!("expected function")
@@ -2774,7 +2884,7 @@ fn missing_index_dispatch_iteration_mode_and_iteration_resolution_are_distinct_t
 	);
 
 	let (items, _, context) = materialized_fixture(
-		"enum Option<T> { Some(value: T), None }\ninterface Iterator<Item> { mut func next(): Option<Item> }\ninterface Iterable<Item> { func iter(): Iterator<Item> }\nstruct Values\nimpl Iterator<int> for Values { mut func next(): Option<int> = None }\nfunc each(xs: mut Values): void = for (x in xs) { x }",
+		"enum Iteration<Item, Next> { Done, Yield(item: Item, next: Next) }\ninterface Iterator<Item + !E> { func next(): Iteration<Item, self> + !E }\ninterface Iterable<Item + !E> { func iter(): Iterator<Item + !E> }\nstruct Values\nimpl Iterator<int> for Values { func next(): Iteration<int, self> = Done }\nfunc each(xs: Values): void = for (x in xs) { x }",
 	);
 	let mut item = items
 		.into_iter()
@@ -2815,7 +2925,7 @@ fn runtime_annotation_lookups_are_typed_and_body_local() {
 
 #[test]
 fn body_local_pattern_facts_survive_unrelated_earlier_declarations() {
-	let body = "enum Choice { Pair(left: int, right: int) }\nfunc choose(value: Choice): int = match (value) { Choice.Pair(left, right) -> left + right }";
+	let body = "enum Choice { Pair(left: int, right: int) }\nfunc choose(value: Choice): int = match (value) { Choice.Pair(left = left, right = right) -> left + right }";
 	let before = artifacts(body)
 		.into_iter()
 		.find(|item| source_name(&item.definition) == "choose")

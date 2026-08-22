@@ -27,8 +27,8 @@ collectMarkdownFiles(extensionRoot);
 
 assert.deepEqual(
 	markdownFiles.map(([name]) => name).sort((left, right) => left.localeCompare(right)),
-	["CHANGELOG.md", "README.md"],
-	"README.md must be the extension's single maintained documentation surface",
+	["CHANGELOG.md", "README.md", "test/fixtures/destination.md"],
+	"README.md must be the extension's single maintained documentation surface apart from test fixtures",
 );
 
 const staleClaims = [
@@ -133,12 +133,14 @@ const functionReference = fs.readFileSync(
 	"utf8",
 );
 assert.match(functionReference, /`func name\(params\): ReturnType = body`/);
-const snippets = markdownFiles.flatMap(([file, contents]) =>
-	[...contents.matchAll(/```(?:nym|nymph)(?:[ \t]+[^\n]*)?\r?\n([\s\S]*?)```/g)].map((match) => ({
-		file,
-		source: match[1],
-	})),
-);
+const snippets = markdownFiles
+	.filter(([file]) => !file.startsWith(`test${path.sep}fixtures${path.sep}`))
+	.flatMap(([file, contents]) =>
+		[...contents.matchAll(/```(?:nym|nymph)(?:[ \t]+[^\n]*)?\r?\n([\s\S]*?)```/g)].map((match) => ({
+			file,
+			source: match[1],
+		})),
+	);
 assert.ok(snippets.length > 0, "README.md must contain a Nymph example");
 for (const { source } of snippets) {
 	assert.doesNotMatch(source, /^\s*fn\b/m, "Nymph examples must not use obsolete fn syntax");

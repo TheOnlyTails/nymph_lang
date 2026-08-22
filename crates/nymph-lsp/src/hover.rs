@@ -52,7 +52,10 @@ pub(crate) fn hover_snapshot(snapshot: &AnalysisSnapshot, params: &HoverParams) 
 		)
 	} else {
 		let kw_doc = query_with_whitespace_left_bias(text, offset, |candidate| {
-			nymph_sema::query::keyword_doc_at(text, candidate)
+			match contextual_use_doc_at(text, candidate) {
+				Some(doc) => doc,
+				None => nymph_sema::query::keyword_doc_at(text, candidate),
+			}
 		})?;
 		kw_doc.to_string()
 	};
@@ -64,6 +67,20 @@ pub(crate) fn hover_snapshot(snapshot: &AnalysisSnapshot, params: &HoverParams) 
 		}),
 		range: None,
 	})
+}
+
+fn contextual_use_doc_at(text: &str, offset: usize) -> Option<Option<&'static str>> {
+	let tokens = nymph_syntax::lex(text).tokens;
+	let index = tokens.iter().position(|token| {
+		matches!(&token.0, nymph_ast::token::Token::Identifier(name) if name == "use")
+			&& token.1.start <= offset
+			&& offset < token.1.end
+	})?;
+	Some(
+		(index > 0 && matches!(tokens[index - 1].0, nymph_ast::token::Token::Let)).then_some(
+			"`use` marks a managed, read-only binding whose value is closed when its activation exits.",
+		),
+	)
 }
 
 #[cfg(test)]
@@ -202,6 +219,23 @@ mod tests {
 				);
 			}
 			other => panic!("expected plain-text markup, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn hovering_use_in_a_managed_let_shows_its_contextual_doc() {
+		let uri: Uri = "file:///hover_use_kw.nym".parse().unwrap();
+		let text = "func main(): void = {\n  let use resource = acquire()\n}";
+		let docs = docs_with(&uri, text);
+		let mut cache = crate::compiler_state::CompilerState::new();
+
+		let result = hover_fixture(&docs, &mut cache, &params(&uri, 1, 7));
+		let hover = result.expect("hovering contextual `use` should resolve its doc");
+		match hover.contents {
+			HoverContents::Markup(MarkupContent { value, .. }) => {
+				assert!(value.contains("managed, read-only binding"));
+			}
+			other => panic!("expected Markdown markup, got {other:?}"),
 		}
 	}
 

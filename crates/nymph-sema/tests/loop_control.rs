@@ -97,7 +97,7 @@ fn jumps_require_a_lexically_enclosing_loop() {
 
 #[test]
 fn callable_is_a_loop_control_boundary() {
-	let found = messages("func f(): void = while (true) { let g = () -> break }");
+	let found = messages("func f(): void = for (_ in #[#()]) { let g = () -> break }");
 	assert!(
 		found.iter().any(|message| message.contains("break")),
 		"{found:?}"
@@ -107,8 +107,10 @@ fn callable_is_a_loop_control_boundary() {
 #[test]
 fn labels_resolve_by_kind_and_do_not_cross_callables() {
 	assert!(
-		messages("func f(): Option<int> = while@outer (true) { while (true) { break@outer 7 } }")
-			.is_empty()
+		messages(
+			"func f(): Option<int> = for@outer (_ in #[#()]) { for (_ in #[#()]) { break@outer 7 } }"
+		)
+		.is_empty()
 	);
 	assert!(
 		messages("func f(): void = outer@{ break@outer }")
@@ -126,12 +128,12 @@ fn labels_resolve_by_kind_and_do_not_cross_callables() {
 		);
 	}
 	assert!(
-		messages("func f(): void = while@outer (true) { return@outer }")
+		messages("func f(): void = for@outer (_ in #[#()]) { return@outer }")
 			.iter()
 			.any(|m| m.contains("wrong kind"))
 	);
 	assert!(
-		messages("func f(): void = while@outer (true) { let g = () -> break@outer }")
+		messages("func f(): void = for@outer (_ in #[#()]) { let g = () -> break@outer }")
 			.iter()
 			.any(|m| m.contains("unknown"))
 	);
@@ -139,8 +141,45 @@ fn labels_resolve_by_kind_and_do_not_cross_callables() {
 }
 
 #[test]
+fn state_loops_check_named_replacements_against_the_old_state_contract() {
+	for source in [
+		"func swap(): #(int, int) = loop (let left = 1, let right = left + 1) { if (left == 3) break #(left, right) continue(left = right, right = left) }",
+		"func labeled(): int = loop@outer (let value = 0) { for (_ in #[#()]) { break@outer value } }",
+		"func bare(): void = loop (let value = 0) { break }",
+	] {
+		let found = messages(source);
+		assert!(found.is_empty(), "{source}: {found:?}");
+	}
+
+	for (source, expected) in [
+		(
+			"func unknown(): void = loop (let value = 0) { continue(other = 1) }",
+			"not a state binding",
+		),
+		(
+			"func duplicate(): void = loop (let value = 0) { continue(value = 1, value = 2) }",
+			"replaced more than once",
+		),
+		(
+			"func incompatible(): void = loop (let value = 0) { continue(value = true) }",
+			"mismatched types",
+		),
+		(
+			"func wrong_target(): void = for (_ in #[#()]) { continue(value = 1) }",
+			"require a state loop target",
+		),
+	] {
+		let found = messages(source);
+		assert!(
+			found.iter().any(|message| message.contains(expected)),
+			"{source}: {found:?}"
+		);
+	}
+}
+
+#[test]
 fn duplicate_active_labels_are_ambiguous_but_names_can_repeat_across_callables() {
-	let source = "func f(): int = outer@{ while@outer (true) { return@outer 1 } 2 }";
+	let source = "func f(): int = outer@{ for@outer (_ in #[#()]) { return@outer 1 } 2 }";
 	let parsed = parse_module(source, "test");
 	assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
 	let checked = check_module(&parsed.tree);
@@ -162,7 +201,7 @@ fn duplicate_active_labels_are_ambiguous_but_names_can_repeat_across_callables()
 #[test]
 fn anonymous_closures_do_not_capture_outer_control_labels() {
 	for source in [
-		"func f(): void = while@outer (true) { let g: (boolean) -> boolean = { if ($) { break@outer } true } break }",
+		"func f(): void = for@outer (_ in #[#()]) { let g: (boolean) -> boolean = { if ($) { break@outer } true } break }",
 		"func f(): int = { let g: (boolean) -> boolean = { if ($) { return@f 1 } true } 0 }",
 	] {
 		let found = messages(source);
@@ -183,7 +222,7 @@ fn anonymous_closures_do_not_capture_outer_control_labels() {
 fn named_method_forms_install_callable_labels() {
 	for source in [
 		"struct S { func inherent(): int = { return@inherent 1 } }",
-		"struct S {} impl S { namespace func make(): int = { return@make 1 } mut func change(): int = { return@change 2 } }",
+		"struct S {} impl S { namespace func make(): int = { return@make 1 } func change(): int = { return@change 2 } }",
 		"interface I { func defaulted(): int = { return@defaulted 1 } } struct S {} impl I for S {}",
 		"interface I { func value(): int } struct S {} impl I for S { func value(): int = { return@value 1 } }",
 	] {
@@ -223,7 +262,7 @@ fn bare_returns_unify_void_with_the_target_result() {
 #[test]
 fn one_loop_cannot_mix_bare_and_valued_breaks() {
 	let found =
-		messages("func f(flag: boolean) = while (true) { if (flag) { break } else { break 1 } }");
+		messages("func f(flag: boolean) = for (_ in #[#()]) { if (flag) { break } else { break 1 } }");
 	assert!(
 		found.iter().any(|message| message.contains("cannot mix")),
 		"{found:?}"
@@ -232,32 +271,33 @@ fn one_loop_cannot_mix_bare_and_valued_breaks() {
 
 #[test]
 fn nested_loop_breaks_do_not_determine_the_outer_result() {
-	let found = messages("func f(): void = while (true) { while (true) { break 1 } continue }");
+	let found =
+		messages("func f(): void = for (_ in #[#()]) { for (_ in #[#()]) { break 1 } continue }");
 	assert!(found.is_empty(), "{found:?}");
 }
 
 #[test]
 fn loop_result_contracts_type_check() {
 	for source in [
-		"func no_break(): void = while (false) {}",
-		"func bare(): Option<#()> = while (false) { break }",
-		"func valued(): Option<int> = while (false) { if (false) { break 1 } break 2 }",
-		"func labeled_while(): Option<int> = while@outer (true) { break 1 }",
+		"func no_break(): void = for (_ in #[]) {}",
+		"func bare(): Option<#()> = for (_ in #[]) { break }",
+		"func valued(): Option<int> = for (_ in #[]) { if (false) { break 1 } break 2 }",
+		"func labeled_loop(): Option<int> = for@outer (_ in #[#()]) { break 1 }",
 		"func labeled_for(): Option<int> = for@outer (_ in #[1]) { break 1 }",
-		"func nested_unlabeled(): void = while@outer (false) { while (true) { break 1 } }",
-		"func lexical(): Option<int> = while (false) { break 1 }",
-		"func branch(flag: boolean): Option<int> = while (true) { let value = if (flag) { break 1 } else { 2 } break value }",
-		"func arm(value: int): Option<int> = while (true) { let found = match (value) { 0 -> break 1, _ -> 2 } break found }",
-		"func nested_break(): Option<int> = while (true) { break (break 1) }",
-		"func all_arms(value: boolean): Option<int> = while (true) { 1 + match (value) { true -> break 1, false -> break 2 } }",
-		"func guarded_arm(value: int): Option<int> = while (true) { 1 + match (value) { 0 if true -> break 1, _ -> break 2 } }",
-		"func short_circuit(): Option<int> = while (true) { false && break 1\ntrue || break 2\ntrue && break 3 }",
-		"func prefix(): Option<int> = while (true) { -(break 1) }",
-		"func callee(): Option<int> = while (true) { (break 1)() }",
-		"func member(): Option<int> = while (true) { (break 1).field }",
-		"func index(): Option<int> = while (true) { #[0][break 1] }",
-		"func cast(): Option<int> = while (true) { (break 1) as int }",
-		"func outer_in_nested_break_value(): Option<int> = while@outer (true) { while (true) { break (break@outer 7) } }",
+		"func nested_unlabeled(): void = for@outer (_ in #[]) { for (_ in #[#()]) { break 1 } }",
+		"func lexical(): Option<int> = for (_ in #[]) { break 1 }",
+		"func branch(flag: boolean): Option<int> = for (_ in #[#()]) { let value = if (flag) { break 1 } else { 2 } break value }",
+		"func arm(value: int): Option<int> = for (_ in #[#()]) { let found = match (value) { 0 -> break 1, _ -> 2 } break found }",
+		"func nested_break(): Option<int> = for (_ in #[#()]) { break (break 1) }",
+		"func all_arms(value: boolean): Option<int> = for (_ in #[#()]) { 1 + match (value) { true -> break 1, false -> break 2 } }",
+		"func guarded_arm(value: int): Option<int> = for (_ in #[#()]) { 1 + match (value) { 0 if true -> break 1, _ -> break 2 } }",
+		"func short_circuit(): Option<int> = for (_ in #[#()]) { false && break 1\ntrue || break 2\ntrue && break 3 }",
+		"func prefix(): Option<int> = for (_ in #[#()]) { -(break 1) }",
+		"func callee(): Option<int> = for (_ in #[#()]) { (break 1)() }",
+		"func member(): Option<int> = for (_ in #[#()]) { (break 1).field }",
+		"func index(): Option<int> = for (_ in #[#()]) { #[0][break 1] }",
+		"func cast(): Option<int> = for (_ in #[#()]) { (break 1) as int }",
+		"func outer_in_nested_break_value(): Option<int> = for@outer (_ in #[#()]) { for (_ in #[#()]) { break (break@outer 7) } }",
 	] {
 		let found = messages(source);
 		assert!(found.is_empty(), "{source}: {found:?}");
@@ -267,8 +307,8 @@ fn loop_result_contracts_type_check() {
 #[test]
 fn loop_headers_preserve_outer_targets_without_adding_the_new_loop() {
 	for source in [
-		"func f(): void = while (true) { while (break 1) {} }",
-		"func f(): void = while (true) { for (_ in break 1) {} }",
+		"func f(): void = for (_ in #[#()]) { for (_ in break 1) {} }",
+		"func f(): void = for (_ in #[#()]) { for (_ in break 1) {} }",
 	] {
 		let found = messages(source);
 		assert!(
@@ -282,8 +322,9 @@ fn loop_headers_preserve_outer_targets_without_adding_the_new_loop() {
 
 #[test]
 fn valued_breaks_must_unify() {
-	let found =
-		messages("func f(flag: boolean) = while (true) { if (flag) { break 1 } else { break true } }");
+	let found = messages(
+		"func f(flag: boolean) = for (_ in #[#()]) { if (flag) { break 1 } else { break true } }",
+	);
 	assert!(
 		found.iter().any(|message| message.contains("mismatched")),
 		"{found:?}"

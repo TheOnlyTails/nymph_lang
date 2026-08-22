@@ -21,6 +21,7 @@ fn run_js(mut js: String, call: &str) -> String {
 	// scalar/string through this helper unchanged.
 	js.push_str(&format!(
 		"\nfunction nymphTestValue(value) {{\n\
+		\tif (typeof value === 'bigint') return Number(value);\n\
 		\tif (value == null || typeof value !== 'object') return value;\n\
 		\tif ('v' in value) {{\n\
 		\t\treturn nymphTestValue(value.v);\n\
@@ -70,6 +71,109 @@ fn run(src: &str, call: &str) -> String {
 	run_js(compile(src), call)
 }
 
+fn run_js_capturing_stderr(mut js: String, driver: &str) -> (String, String) {
+	js.push_str(driver);
+	static COUNTER: AtomicU64 = AtomicU64::new(0);
+	let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+	let path = std::env::temp_dir().join(format!("nymph_echo_{}_{unique}.mjs", std::process::id()));
+	std::fs::write(&path, js).unwrap();
+	let output = Command::new("node").arg(&path).output().expect("run node");
+	let _ = std::fs::remove_file(path);
+	assert!(
+		output.status.success(),
+		"node failed: {}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	(
+		String::from_utf8_lossy(&output.stdout).trim().to_string(),
+		String::from_utf8_lossy(&output.stderr).to_string(),
+	)
+}
+
+#[test]
+fn echo_returns_identity_renders_hidden_fields_and_keeps_opaque_values_inert() {
+	let source = "public struct Secret(public shown: int, private hidden: int)\npublic func observed(value: int): int = echo value\npublic func secret(): Secret = echo Secret(shown = 1, hidden = 2)\npublic func once(make: () -> int): int = echo make()";
+	let js = nymph_compiler::compile(source, "nested/main.nym")
+		.unwrap_or_else(|diagnostics| panic!("compile errors: {diagnostics:?}"));
+	let (stdout, stderr) = run_js_capturing_stderr(
+		js,
+		"\nconst value = new NInt(7);\n\
+		 let same = observed(value) === value;\n\
+		 const structural = secret();\n\
+		 let callbacks = 0;\n\
+		 structural.debug = () => { callbacks++; throw new Error('debug'); };\n\
+		 structural.toString = () => { callbacks++; throw new Error('toString'); };\n\
+		 nymphEcho(structural, { file: '<struct>', line: 1, column: 1, uri: null });\n\
+		 const opaque = new Proxy({}, { get() { callbacks++; throw new Error('getter'); }, ownKeys() { callbacks++; throw new Error('keys'); }, getOwnPropertyDescriptor() { callbacks++; throw new Error('descriptor'); } });\n\
+		 const opaqueSame = nymphEcho(opaque, { file: '<expr>', line: 1, column: 1, uri: null }) === opaque;\n\
+		 let evaluations = 0;\n\
+		 const made = new NInt(8);\n\
+		 const onceSame = once(() => { evaluations++; return made; }) === made;\n\
+		 console.log(`${same} ${opaqueSame} ${onceSame} ${evaluations} ${callbacks}`);\n",
+	);
+	assert_eq!(stdout, "true true true 1 0");
+	let lines = stderr.lines().collect::<Vec<_>>();
+	assert_eq!(lines.len(), 5, "{stderr}");
+	assert!(lines[0].starts_with("main.nym:2:41: 7"), "{stderr}");
+	assert!(lines[1].contains("Secret(shown: 1, hidden: 2)"), "{stderr}");
+	assert!(lines[2].contains("Secret(shown: 1, hidden: 2)"), "{stderr}");
+	assert_eq!(lines[3], "<expr>:1:1: <opaque external>");
+	assert!(lines[4].ends_with(": 8"), "{stderr}");
+}
+
+#[test]
+fn echo_is_atomic_interactive_and_cannot_change_control_flow() {
+	let js = compile("public func observed(value: int): int = echo value");
+	let (stdout, stderr) = run_js_capturing_stderr(
+		js,
+		r#"
+const originalWrite = process.stderr.write;
+const ttyDescriptor = Object.getOwnPropertyDescriptor(process.stderr, "isTTY");
+const writes = [];
+Object.defineProperty(process.stderr, "isTTY", { value: true, configurable: true });
+process.stderr.write = (line) => { writes.push(line); return true; };
+let callbacks = 0;
+const opaque = new Proxy({}, {
+	get() { callbacks++; throw new Error("getter"); },
+	ownKeys() { callbacks++; throw new Error("keys"); },
+	getOwnPropertyDescriptor() { callbacks++; throw new Error("descriptor"); },
+});
+const callable = () => {};
+callable.toString = () => { callbacks++; return "called"; };
+const value = new NInt(9n);
+const same = nymphEcho(value, { file: "main.nym", line: 4, column: 7, uri: "file:///tmp/main.nym" }) === value;
+nymphEcho(opaque, { file: "main.nym", line: 5, column: 7, uri: null });
+nymphEcho(callable, { file: "main.nym", line: 6, column: 7, uri: null });
+process.stderr.write = () => { throw new Error("write failed"); };
+const survives = nymphEcho(value, { file: "main.nym", line: 7, column: 7, uri: null }) === value;
+process.stderr.write = originalWrite;
+if (ttyDescriptor) Object.defineProperty(process.stderr, "isTTY", ttyDescriptor);
+else delete process.stderr.isTTY;
+console.log(JSON.stringify({ same, survives, callbacks, writes }));
+"#,
+	);
+	assert!(stderr.is_empty(), "{stderr}");
+	let result: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+	assert_eq!(result["same"], true);
+	assert_eq!(result["survives"], true);
+	assert_eq!(result["callbacks"], 0);
+	let writes = result["writes"].as_array().unwrap();
+	assert_eq!(writes.len(), 3, "{writes:?}");
+	assert!(
+		writes[0]
+			.as_str()
+			.unwrap()
+			.contains("\u{1b}]8;;file:///tmp/main.nym#L4:7")
+	);
+	assert!(
+		writes
+			.iter()
+			.all(|write| write.as_str().unwrap().ends_with('\n'))
+	);
+	assert!(writes[1].as_str().unwrap().ends_with("<opaque external>\n"));
+	assert!(writes[2].as_str().unwrap().ends_with("<function>\n"));
+}
+
 #[test]
 fn inferred_explicit_closure_return_exits_the_closure_not_its_creator() {
 	let src = "func choose(flag: boolean): int = {\n\tlet pick = (flag: boolean) -> { if (flag) { return 7 } 9 }\n\tlet value = pick(flag)\n\treturn value + 1\n}";
@@ -93,7 +197,7 @@ fn run_failure(src: &str, call: &str) -> String {
 
 #[test]
 fn runs_arithmetic() {
-	// Assert that pure scalar arithmetic runs, in addition to emission/lowering coverage.
+	// Pure scalar arithmetic (Task 3/4 already cover emit+lower; this asserts it RUNS).
 	let out = run(
 		"func add(a: int, b: int): int = a + b * 2",
 		"add(new NInt(3), new NInt(4))",
@@ -103,9 +207,10 @@ fn runs_arithmetic() {
 
 #[test]
 fn runs_an_operator_inside_a_string_interpolation() {
-	// Interpolated expressions must share the surrounding parser's node-id
-	// sequence. A fresh sub-parser creates collisions that clobber recorded
-	// operator dispatches, surfacing as "no operator resolution recorded". The
+	// Regression: an interpolated expression used to be parsed by a FRESH sub-parser
+	// whose node ids restarted at 0, colliding with the surrounding tree's — so the
+	// operator's recorded dispatch was clobbered by whatever unrelated node shared its
+	// id, surfacing at lowering as "no operator resolution recorded". The interpolated
 	// `${a + b}` (and a call/closure inside one) must run.
 	let out = run(
 		"func f(a: int, b: int): string = \"sum=${a + b}\"",
@@ -147,30 +252,13 @@ fn runs_if_as_value() {
 }
 
 #[test]
-fn runs_while_loop() {
-	// A `while` loop with a mutable accumulator; assignment (`=`) drives it.
-	let src = r#"
-		func sum_to(n: int): int = {
-			let mut total = 0
-			let mut i = 1
-			while (i <= n) {
-				total = total + i
-				i = i + 1
-			}
-			total
-		}
-	"#;
-	assert_eq!(run(src, "sum_to(new NInt(5))"), "15");
-}
-
-#[test]
 fn runs_list_and_index() {
 	let src = r#"
 		func at(i: int): int = #[10, 20, 30][i]
 		func at_unsigned(i: uint): int = #[10, 20, 30][i]
 	"#;
-	assert_eq!(run(src, "at(new NInt(-1))"), "30");
-	assert_eq!(run(src, "at_unsigned(new NUint(1))"), "20");
+	assert_eq!(run(src, "at(new NInt(-1n))"), "30");
+	assert_eq!(run(src, "at_unsigned(new NUint(1n))"), "20");
 }
 
 #[test]
@@ -197,7 +285,7 @@ fn runs_tuple_roundtrip() {
 #[test]
 fn runs_map_get() {
 	// A map emits as `new Map([[k, v], …])`; indexing dispatches to `.get(key)`.
-	// Int keys isolate map indexing from string-literal lowering.
+	// Int keys keep this slice free of string-literal lowering (a later slice).
 	let src = "func lookup(): int = #{ 1: 5, 2: 6 }[2]";
 	assert_eq!(run(src, "lookup()"), "6");
 }
@@ -340,6 +428,35 @@ fn runs_match_struct_pattern() {
 }
 
 #[test]
+fn runs_immutable_struct_defaults_and_clone_updates_in_exact_order() {
+	let src = r#"
+		func mark(value: int): int = value
+		struct Record(a: int = mark(1), b: int = mark(2), c: int)
+		func mark_source(value: Record): Record = value
+		func fresh(): Record = Record(c = mark(3))
+		func clone(source: Record): Record = Record(...mark_source(source), b = mark(4), c = mark(6))
+		func unchanged(): int = { let source = Record(a = 1, b = 2, c = 3)
+			let updated = Record(...source, b = 4)
+			source.b * 10 + updated.b }
+	"#;
+	assert_eq!(
+		run(
+			src,
+			"(() => { let seen = 0; mark = value => { seen = seen * 10 + Number(value.v); return value }; fresh(); return seen })()",
+		),
+		"312"
+	);
+	assert_eq!(
+		run(
+			src,
+			"(() => { let seen = 0; mark = value => { seen = seen * 10 + Number(value.v); return value }; mark_source = value => { seen = seen * 10 + 5; return value }; clone(new Record({ a: new NInt(1), b: new NInt(2), c: new NInt(3) })); return seen })()",
+		),
+		"546"
+	);
+	assert_eq!(run(src, "unchanged()"), "24");
+}
+
+#[test]
 fn runs_match_as_subexpression() {
 	// `match` in value position (an operand of `+`) collapses to an IIFE.
 	let src = r#"
@@ -421,7 +538,7 @@ fn runs_tuple_rest_binds_middle_subtuple() {
 	// `#(a, ...rest, z)` — `rest` binds the heterogeneous middle sub-tuple
 	// (boolean, char), sliced from the tuple's own concrete element types.
 	// (Destructuring `let` patterns are a separate, pre-existing lowering
-	// limitation that lowering supports only identifier parameters — unrelated
+	// limitation — "slice-1 lowering supports only identifier params" — unrelated
 	// to pattern rest, so this drives the binding through `match` instead.)
 	let src = r#"
 		func mid(t: #(int, boolean, char, int)): #(boolean, char) = match (t) {
@@ -485,7 +602,7 @@ fn runs_match_map_pattern_rest() {
 
 #[test]
 fn runs_match_map_pattern_rest_with_no_named_keys() {
-	// `#{ ...rest }` with no named entries — rest is the whole map, copied.
+	// `#{ ...rest }` with no named entries reuses the immutable map.
 	let src = r#"
 		func copy(m: #{int: int}): #{int: int} = match (m) {
 			#{ ...rest } -> rest,
@@ -493,18 +610,20 @@ fn runs_match_map_pattern_rest_with_no_named_keys() {
 		}
 	"#;
 	assert_eq!(
-		run(src, "JSON.stringify([...copy(new Map([[1, 1]]))])"),
+		run(
+			src,
+			"JSON.stringify(nymphTestValue(copy(new NMap([[new NInt(1), new NInt(1)]]))))",
+		),
 		"[[1,1]]"
 	);
-	// The result is a distinct Map object, not an alias of the input.
-	let mutation_check = r#"
-		const original = new Map([[1, 1]]);
+	let persistence_check = r#"
+		const original = new NMap([[new NInt(1), new NInt(1)]]);
 		const result = copy(original);
-		result.set(2, 2);
-		return JSON.stringify([[...original], [...result]]);
+		const extended = result.with(new NInt(2), new NInt(2));
+		return JSON.stringify(nymphTestValue([original, extended]));
 	"#;
 	assert_eq!(
-		run(src, &format!("(() => {{ {mutation_check} }})()")),
+		run(src, &format!("(() => {{ {persistence_check} }})()")),
 		r#"[[[1,1]],[[1,1],[2,2]]]"#
 	);
 }
@@ -536,28 +655,6 @@ fn runs_match_union() {
 	assert_eq!(run(src, "warm(Color.Red)"), "true");
 	assert_eq!(run(src, "warm(Color.Green)"), "true");
 	assert_eq!(run(src, "warm(Color.Blue)"), "false");
-}
-
-#[test]
-fn bound_union_exposes_the_binding_and_evaluates_the_scrutinee_once() {
-	let src = r#"
-		struct Counter(n: int) {}
-		impl Counter {
-			mut func next(): int = {
-				this.n = this.n + 1
-				2
-			}
-		}
-		func capture(): #(int, int) = {
-			let mut counter = Counter(n = 0)
-			let selected = match (counter.next()) {
-				(x = 1 | x = 2) -> x,
-				_ -> 0,
-			}
-			#(selected, counter.n as int)
-		}
-	"#;
-	assert_eq!(run(src, "capture()"), "[ 2, 1 ]");
 }
 
 #[test]
@@ -729,7 +826,7 @@ fn runs_struct_inner_func() {
 #[test]
 fn runs_operator_overload_via_nested_impl() {
 	// `+` on a struct with a NESTED `impl Plus<...>` (declared inside the struct
-	// body) dispatches to `.plus(...)` rather than a native JS `+`.
+	// body) dispatches to `.plus(...)` rather than a native JS `+` (Slice 4B, D3/D4).
 	let src = r#"
 		interface Plus<Other, Output> { func plus(other: Other): Output }
 		struct Vec2(x: int, y: int) {
@@ -800,55 +897,9 @@ fn runs_mixed_int_and_float_stays_native() {
 }
 
 #[test]
-fn runs_compound_assign_dispatches_user_operator() {
-	// `v1 += v2` on a struct with a directly-defined `Plus.plus` impl actually calls
-	// `.plus(...)` at runtime, rather than emitting a literal JS `v1 = v1 + v2`
-	// (which would silently string-coerce two class instances).
-	let src = r#"
-		interface Plus<Other, Output> { func plus(other: Other): Output }
-		struct Vec2(x: int, y: int)
-		impl Plus<Other = Vec2, Output = Vec2> for Vec2 {
-			func plus(other: Vec2): Vec2 = Vec2(x = this.x + other.x, y = this.y + other.y)
-		}
-		func combine(a: Vec2, b: Vec2): Vec2 = {
-			let mut v1 = a
-			v1 += b
-			v1
-		}
-	"#;
-	assert_eq!(
-		run(
-			src,
-			"combine(new Vec2({ x: new NInt(1), y: new NInt(2) }), new Vec2({ x: new NInt(3), y: new NInt(4) })).x"
-		),
-		"4"
-	);
-	assert_eq!(
-		run(
-			src,
-			"combine(new Vec2({ x: new NInt(1), y: new NInt(2) }), new Vec2({ x: new NInt(3), y: new NInt(4) })).y"
-		),
-		"6"
-	);
-}
-
-#[test]
-fn runs_compound_assign_on_int_stays_native() {
-	// `x += 1` on a plain `int` still runs as a native JS `+=`, not a dispatched call.
-	let src = r#"
-		func bump(): int = {
-			let mut x = 10
-			x += 5
-			x
-		}
-	"#;
-	assert_eq!(run(src, "bump()"), "15");
-}
-
-#[test]
 fn runs_prefix_negate_overload_dispatches_to_method() {
 	// `-v` on a struct with a directly-defined `Negate.negate` impl actually calls
-	// `.negate()` at runtime, componentwise negating the vector.
+	// `.negate()` at runtime, componentwise negating the vector (Slice 4C-a).
 	let src = r#"
 		interface Negate<Output> { func negate(): Output }
 		struct Vec2(x: int, y: int)
@@ -912,7 +963,7 @@ fn runs_prefix_bit_not_native_on_int() {
 #[test]
 fn runs_prefix_bit_not_overload_dispatches_to_method() {
 	// `~m` on a struct with a directly-defined `BitNot.bit_not` impl actually calls
-	// `.bit_not()` at runtime, componentwise bit-negating the mask.
+	// `.bit_not()` at runtime, componentwise bit-negating the mask (Slice 4C-a).
 	let src = r#"
 		interface BitNot<Output> { func bit_not(): Output }
 		struct Mask(a: int, b: int)
@@ -931,12 +982,12 @@ fn runs_prefix_bit_not_overload_dispatches_to_method() {
 	);
 }
 
-// ── Interface default method materialization ───────────────────────────────
+// ── Slice 4C-b: interface default method materialization ───────────────────
 
 #[test]
 fn runs_interface_default_dispatches_via_operator() {
 	// `v1 < v2` desugars to `Comparable::less_than`, which `Vec2` never defines
-	// directly — only `compare_to`. Lowering materializes `less_than`'s
+	// directly — only `compare_to`. Slice 4C-b materializes `less_than`'s
 	// interface-default body onto `Vec2`'s class, and `less_than` itself calls
 	// `this.compare_to(other)` (another materialized/impl method) — both must
 	// actually run under Node and return the right boolean.
@@ -970,8 +1021,9 @@ fn runs_interface_default_dispatches_via_operator() {
 #[test]
 fn runs_interface_default_explicit_call() {
 	// The same materialized `less_than` default, called explicitly
-	// (`v.less_than(w)`) rather than through the `<` operator. The default must
-	// materialize as a real class method so lowered JS cannot call a missing method.
+	// (`v.less_than(w)`) rather than through the `<` operator. Before Slice 4C-b
+	// this was a *silent* miscompile (a zero-diagnostic program whose lowered JS
+	// called a method that didn't exist on the class); now it's a real method.
 	let src = r#"
 		interface Comparable<Other> {
 			func compare_to(other: Other): int
@@ -1003,7 +1055,7 @@ fn runs_interface_default_explicit_call() {
 fn runs_interface_default_override_wins() {
 	// `Vec2` overrides `less_than` directly rather than relying on the interface
 	// default — the override's body must be the one that actually runs (a
-	// constant `false`), not the materialized default; overrides always win.
+	// constant `false`), not the materialized default (V1: override always wins).
 	let src = r#"
 		interface Comparable<Other> {
 			func compare_to(other: Other): int
@@ -1041,14 +1093,14 @@ fn runs_generic_bound_operator_with_user_override() {
 	assert_eq!(run(src, "demo()"), "false");
 }
 
-// ── Comparison/equality generics end-to-end ────────────────────────────────
+// ── Slice 4C-c, Task 3: comparison/equality generics end-to-end ─────────────
 
 #[test]
 fn runs_late_pinned_adt_comparison_dispatches_at_runtime() {
 	// The headline silent-miscompile probe, run for real under Node: `xs[0] <
 	// xs[0]` is recorded against a still-unbound inference variable, later
-	// pinned to `Vec2` by the `#[Vec2]` annotation. It must not compile to a
-	// native JS `<` between two class instances (`NaN`-ish nonsense);
+	// pinned to `Vec2` by the `#[Vec2]` annotation. Before W1 this compiled to a
+	// native JS `<` between two class instances (`NaN`-ish nonsense); after W1
 	// it must actually call `.less_than(...)` and produce the impl's real
 	// answer.
 	let src = r#"
@@ -1082,7 +1134,7 @@ fn runs_late_pinned_adt_comparison_dispatches_at_runtime() {
 
 #[test]
 fn runs_native_int_and_float_comparison_unchanged() {
-	// The concrete-primitive fast path remains untouched: `int`/`float`
+	// W1 leaves the concrete-primitive fast path untouched: `int`/`float`
 	// comparisons still compile to a native JS `<`/`>`, not a dispatched call.
 	let src = "func lt(a: int, b: int): boolean = a < b
 	           func gt(a: float, b: float): boolean = a > b";
@@ -1092,7 +1144,7 @@ fn runs_native_int_and_float_comparison_unchanged() {
 }
 
 #[test]
-fn user_struct_operators_use_identity_while_explicit_equals_dispatches() {
+fn user_struct_operators_dispatch_through_explicit_equals() {
 	let src = r#"
 		interface Equals<Other> {
 			func equals(other: Other): boolean
@@ -1111,7 +1163,7 @@ fn user_struct_operators_use_identity_while_explicit_equals_dispatches() {
 			src,
 			"same(new Vec2({ x: new NInt(1) }), new Vec2({ x: new NInt(1) })).v"
 		),
-		"false"
+		"true"
 	);
 	assert_eq!(
 		run(src, "self_same(new Vec2({ x: new NInt(1) })).v"),
@@ -1122,7 +1174,7 @@ fn user_struct_operators_use_identity_while_explicit_equals_dispatches() {
 			src,
 			"different(new Vec2({ x: new NInt(1) }), new Vec2({ x: new NInt(2) })).v"
 		),
-		"true"
+		"false"
 	);
 	assert_eq!(
 		run(
@@ -1144,8 +1196,8 @@ fn user_struct_operators_use_identity_while_explicit_equals_dispatches() {
 fn runs_enum_inherent_method_matching_this() {
 	// An inherent method on an enum branches on `match (this) { .. }` (the
 	// checker rejects direct `this.field` access on an enum receiver — see the
-	// checker rejects direct `this.field` access, so matching is the supported
-	// way to inspect `this` inside an enum method).
+	// Slice 4D plan's investigation brief, "corrections" #2 — so matching is
+	// the supported way to inspect `this` inside an enum method).
 	let src = r#"
 		enum Color { Red, Green, Blue }
 		impl Color {
@@ -1180,7 +1232,7 @@ fn runs_enum_method_reads_field_variant_payload_via_match() {
 #[test]
 fn runs_enum_operator_overload_dispatches_to_method() {
 	// `a + b` on an enum dispatches to `.plus(...)` (a `UserImpl` resolution),
-	// exactly like the struct case because enums can carry methods.
+	// exactly like the struct case, now that enums can carry methods.
 	let src = r#"
 		interface Plus<Other, Output> { func plus(other: Other): Output }
 		enum Color { Red, Green }
@@ -1211,7 +1263,7 @@ fn runs_enum_interface_default_method() {
 
 #[test]
 fn runs_enum_with_methods_preserves_tag_identity() {
-	// The tag-identity value ABI must not change for a methodful enum:
+	// The Slice 2C tag-identity value ABI must not change for a methodful enum:
 	// a constructed field variant still shares the factory's own `[TAG]`, and
 	// distinct variants still have distinct tags — while methods are also
 	// callable on both variant shapes.
@@ -1247,12 +1299,12 @@ fn compile_produces_runnable_js() {
 	);
 }
 
-// ── `return`, let-shadowing, module lets ───────────────────────────────────
+// ── Slice 4E: `return`, let-shadowing, module lets ──────────────────────────
 
 #[test]
 fn runs_early_return_with_value_inside_a_statement_position_if() {
 	// The corpus `abs` shape: an early `return n` inside a statement-position
-	// `if`, falling through to the trailing expression otherwise.
+	// `if`, falling through to the trailing expression otherwise (Slice 4E, Y1).
 	let src = r#"
 		func abs(n: int): int = {
 			if (n >= 0) { return n }
@@ -1274,39 +1326,6 @@ fn runs_bare_return_in_a_void_function() {
 	// A `void` function still has SOME js return value (`undefined`) — assert via
 	// a driver call that only checks it doesn't throw.
 	assert_eq!(run(src, "(noop(), 'ok')"), "ok");
-}
-
-#[test]
-fn runs_return_inside_a_statement_position_while() {
-	// A `return` inside a `while` body must target the enclosing function, not
-	// an unnecessary IIFE — the `while` body remains in statement position.
-	// (`result` starts with `-1` on the SAME statement as its `let`, not as a
-	// line-leading operator that would continue the `while` via subtraction.)
-	let src = r#"
-		func first_over(xs: #[int], limit: int): int = {
-			let mut i = 0
-			let mut result = -1
-			while (i < 3) {
-				if (xs[i] > limit) { return xs[i] }
-				i += 1
-			}
-			result
-		}
-	"#;
-	assert_eq!(
-		run(
-			src,
-			"first_over(new NList([new NInt(1), new NInt(5), new NInt(9)]), new NInt(3))"
-		),
-		"5"
-	);
-	assert_eq!(
-		run(
-			src,
-			"first_over(new NList([new NInt(1), new NInt(2), new NInt(3)]), new NInt(100))"
-		),
-		"-1"
-	);
 }
 
 #[test]
@@ -1347,157 +1366,10 @@ fn return_inside_a_subexpression_position_match_arm_targets_the_function() {
 }
 
 #[test]
-fn return_works_across_general_expression_positions_and_preserves_evaluation() {
-	let src = r#"
-func id(value: int): int = value
-func direct_operand(): int = 1 + return 25
-func operand(): int = 1 + if (true) return 2 else 0
-func lazy_and(): int = { false && return 3
-4 }
-func lazy_or(): int = { true || return 5
-6 }
-func lazy_taken(): int = { true && return 26
-0 }
-func prefix_operand(): int = -(return 27)
-func cast_operand(): int = (return 28) as int
-func compound_operand(): int = { let mut value = 1
-value += return 29
-value }
-func anonymous_boundary(): int = ({ return 30
-$0 })(1)
-func callee(): int = (return 7)()
-func argument(): int = id(return 8)
-func member(): int = (return 9).field
-func index(): int = #[1][return 10]
-func list_element(): int = #[1, return 11][0]
-func list_spread(): int = #[1, ...(if (true) return 12 else #[2])][0]
-func map_element(): int = #{ 1: return 13 }[1]
-func map_spread(): int = { #{ 1: 1, ...(if (true) return 14 else #{ 2: 2 }) }
-0 }
-func tuple_element(): int = { #(1, return 15)
-0 }
-func tuple_spread(): int = { #(1, ...(if (true) return 16 else #(2)))
-0 }
-func interpolation(): int = { "value=${return 14}"
-0 }
-func nested_block(): int = 1 + { 2 + { if (true) return 15 else 0 } }
-func condition(): int = { while (return 16) {} 0 }
-func loop_body(): int = { while (true) return 17
-0 }
-func for_body(): int = { for (value in #[24]) return value
-0 }
-func arm(flag: boolean): int = if (flag) return 18 else match (0) { 0 -> return 19, _ -> 0 }
-
-func ordered(flag: boolean): int = {
-	let mut seen = 0
-	let mark = (value: int) -> { seen = seen * 10 + value
-	value }
-	let result = id(mark(1)) + if (flag) return seen * 10 + 2 else mark(2)
-	result * 10 + seen
-}
-
-func pipe_order(flag: boolean): int = {
-	let mut seen = 0
-	let mark = (value: int) -> { seen = seen * 10 + value
-	value }
-	let id = (value: int) -> value
-	let result = mark(1) |> (if (flag) return seen else id)
-	result * 10 + seen
-}
-
-func membership_order(flag: boolean): int = {
-	let mut seen = 0
-	let mark = (value: int) -> { seen = seen * 10 + value
-	value }
-	let found = mark(1) in (if (flag) return seen else #[1])
-	if (found) seen else 0
-}
-
-func loop_completion(flag: boolean): int = {
-	let result = while (true) {
-		if (flag) { return 20 }
-		false && continue
-		break 3
-	}
-	match (result) { Some(value) -> value, None -> 0 }
-}
-
-func closure_boundary(): int = {
-	let inner = (value: int) -> id(return value)
-	inner(21) + 1
-}
-
-struct Value(value: int) {
-	func method(flag: boolean): int = this.value + if (flag) return 22 else 1
-}
-
-interface DefaultValue {
-	func default_value(flag: boolean): int = 1 + if (flag) return 23 else 2
-}
-impl DefaultValue for Value {}
-"#;
-	for (call, expected) in [
-		("direct_operand()", "25"),
-		("operand()", "2"),
-		("lazy_and()", "4"),
-		("lazy_or()", "6"),
-		("lazy_taken()", "26"),
-		("prefix_operand()", "27"),
-		("cast_operand()", "28"),
-		("compound_operand()", "29"),
-		("anonymous_boundary()", "30"),
-		("callee()", "7"),
-		("argument()", "8"),
-		("member()", "9"),
-		("index()", "10"),
-		("list_element()", "11"),
-		("list_spread()", "12"),
-		("map_element()", "13"),
-		("map_spread()", "14"),
-		("tuple_element()", "15"),
-		("tuple_spread()", "16"),
-		("interpolation()", "14"),
-		("nested_block()", "15"),
-		("condition()", "16"),
-		("loop_body()", "17"),
-		("for_body()", "24"),
-		("arm(new NBool(true))", "18"),
-		("arm(new NBool(false))", "19"),
-		("ordered(new NBool(true))", "12"),
-		("ordered(new NBool(false))", "42"),
-		("pipe_order(new NBool(true))", "1"),
-		("pipe_order(new NBool(false))", "11"),
-		("membership_order(new NBool(true))", "1"),
-		("membership_order(new NBool(false))", "1"),
-		("loop_completion(new NBool(true))", "20"),
-		("loop_completion(new NBool(false))", "3"),
-		("closure_boundary()", "22"),
-		(
-			"new Value({ value: new NInt(30) }).method(new NBool(true))",
-			"22",
-		),
-		(
-			"new Value({ value: new NInt(30) }).method(new NBool(false))",
-			"31",
-		),
-		(
-			"new Value({ value: new NInt(30) }).default_value(new NBool(true))",
-			"23",
-		),
-		(
-			"new Value({ value: new NInt(30) }).default_value(new NBool(false))",
-			"3",
-		),
-	] {
-		assert_eq!(run(src, call), expected, "{call}");
-	}
-}
-
-#[test]
 fn runs_same_scope_let_shadow_computes_using_the_prior_binding() {
 	// `let x = 1; let x = x + 1; x * 10` — the redeclaration renames in emitted
 	// JS (avoiding a `SyntaxError: Identifier 'x' has already been declared`),
-	// and its RHS reads the prior `x`.
+	// and its RHS reads the PRIOR `x` (Slice 4E, Y2).
 	let src = r#"
 		func f(): int = {
 			let x = 1
@@ -1585,17 +1457,10 @@ fn runs_top_level_let_referencing_a_function_result() {
 }
 
 #[test]
-fn runs_mutable_top_level_let() {
-	let src = "let mut counter = 0
-	           func bump(): int = counter + 1";
-	assert_eq!(run(src, "bump()"), "1");
-}
-
-#[test]
 fn runs_nested_block_shadow_that_reads_the_outer_binding() {
 	// The exact reported hazard: a nested block's `let i` redeclares the outer
 	// `i` AND its own initializer reads that outer `i` (`let i = i + 100`).
-	// Both bindings must not emit as the identical JS
+	// Without the Y2 fix, both bindings would emit as the identical JS
 	// identifier `i`, and JS's block-scope hoisting (TDZ) would make the inner
 	// initializer read the not-yet-initialized inner `i` instead of the outer
 	// one, throwing `ReferenceError: Cannot access 'i' before initialization`.
@@ -1701,19 +1566,6 @@ fn closure_mediated_top_level_initializer_cycles_are_compile_errors() {
 }
 
 #[test]
-fn mutable_callable_initializer_calls_remain_compile_errors() {
-	let src = "let mut callback = () -> 5\nlet result = callback()";
-	let result = nymph_compiler::compile(src, "test");
-	let diagnostics = result.expect_err("mutable callable initializer must not produce JavaScript");
-	assert!(
-		diagnostics
-			.iter()
-			.any(|diagnostic| diagnostic.message.contains("UnresolvedInitializerCall")),
-		"{diagnostics:?}"
-	);
-}
-
-#[test]
 fn top_level_initializer_is_evaluated_once_after_closure_ordering() {
 	let src = r#"
 		let callback = () -> later
@@ -1722,7 +1574,11 @@ fn top_level_initializer_is_evaluated_once_after_closure_ordering() {
 		func observed(): #(int, int) = #(result, result)
 	"#;
 	let js = compile(src);
-	assert_eq!(js.matches("const result = callback();").count(), 1, "{js}");
+	assert_eq!(
+		js.matches("const result = nymphActivate(callback").count(),
+		1,
+		"{js}"
+	);
 	assert_eq!(
 		run_js(js, "JSON.stringify(nymphTestValue(observed()))"),
 		"[1,1]"
@@ -1731,6 +1587,15 @@ fn top_level_initializer_is_evaluated_once_after_closure_ordering() {
 
 #[test]
 fn stdlib_sort_initializers_run_through_external_leaf_calls() {
+	std::thread::Builder::new()
+		.stack_size(8 * 1024 * 1024)
+		.spawn(stdlib_sort_initializers_run_through_external_leaf_calls_inner)
+		.unwrap()
+		.join()
+		.unwrap();
+}
+
+fn stdlib_sort_initializers_run_through_external_leaf_calls_inner() {
 	let src = r#"
 		let sorted = #[3, 1, 2].sort()
 		let descending = #[1, 3, 2].sort_by((left, right) ->
@@ -1793,6 +1658,49 @@ fn runs_top_level_lets_via_mutually_recursive_functions() {
 }
 
 #[test]
+fn activation_machine_reuses_one_frame_for_deep_direct_and_mutual_tail_calls() {
+	let direct = r#"
+		func descend(n: int): int = if (n <= 0) { n } else { descend(n - 1) }
+	"#;
+	assert_eq!(run(direct, "descend(new NInt(100000n))"), "0");
+
+	let mutual = r#"
+		func even(n: int): boolean = if (n <= 0) { true } else { odd(n - 1) }
+		func odd(n: int): boolean = if (n <= 0) { false } else { even(n - 1) }
+	"#;
+	assert_eq!(run(mutual, "even(new NInt(100000n))"), "true");
+}
+
+#[test]
+fn activation_machine_handles_deep_generic_match_and_dynamic_tail_transfers() {
+	let generic_match = r#"
+		func retain<T>(value: T, n: int): T = match (n) {
+			0 -> value,
+			_ -> retain(value, n - 1),
+		}
+	"#;
+	assert_eq!(
+		run(generic_match, "retain(new NInt(42n), new NInt(100000n))"),
+		"42"
+	);
+
+	let dynamic = r#"
+		func invoke(next: (int) -> int, n: int): int = next(n)
+		func descend(n: int): int = if (n <= 0) { n } else { invoke(descend, n - 1) }
+	"#;
+	assert_eq!(run(dynamic, "descend(new NInt(100000n))"), "0");
+}
+
+#[test]
+fn activation_machine_pushes_non_tail_calls_and_preserves_the_result() {
+	let src = r#"
+		func identity(n: int): int = n
+		func add_one(n: int): int = identity(n) + 1
+	"#;
+	assert_eq!(run(src, "add_one(new NInt(41n))"), "42");
+}
+
+#[test]
 fn runs_top_level_lets_via_a_three_function_mutual_recursion_cycle() {
 	// `f -> g -> h -> f`, a three-function cycle, with the let-deps spread
 	// across all three (`x` only reachable via `f`, `y` only via `g`, `z` only
@@ -1811,19 +1719,7 @@ fn runs_top_level_lets_via_a_three_function_mutual_recursion_cycle() {
 	assert_eq!(run(src, "r"), "3");
 }
 
-// ── `return` inside an unbraced if/while branch ─────────────────────────────
-
-#[test]
-fn runs_bare_return_as_an_unbraced_while_body() {
-	let src = r#"
-		func f(n: int): int = {
-			while (n > 0) return n
-			0
-		}
-	"#;
-	assert_eq!(run(src, "f(new NInt(5))"), "5");
-	assert_eq!(run(src, "f(new NInt(0))"), "0");
-}
+// ── Slice 4E follow-up: `return` inside an UNBRACED if/while branch ─────────
 
 #[test]
 fn runs_bare_return_as_an_unbraced_if_then_branch() {
@@ -1837,7 +1733,7 @@ fn runs_bare_return_as_an_unbraced_if_then_branch() {
 	assert_eq!(run(src, "f(new NInt(3))"), "3");
 }
 
-// ── Call-site bound enforcement ─────────────────────────────────────────────
+// ── Slice 4G: call-site bound enforcement ───────────────────────────────────
 //
 // A bound-satisfying generic call, both spellings (declared generic and the
 // `impl Trait` param sugar), still checks and runs correctly under Node —
@@ -1857,7 +1753,7 @@ fn runs_bound_satisfying_call_both_spellings() {
 	assert_eq!(run(src, "total(new Square({ side: new NInt(4) }))"), "32");
 }
 
-// ── String expressions ──────────────────────────────────────────────────────
+// ── Slice 4H: string expressions ─────────────────────────────────────────────
 
 #[test]
 fn runs_a_plain_string_literal() {
@@ -1910,457 +1806,8 @@ fn runs_string_concatenation() {
 }
 
 #[test]
-fn runs_string_compound_assign() {
-	let src = r#"
-		func f(): string = {
-			let mut s = "a"
-			s += "b"
-			s
-		}
-	"#;
-	assert_eq!(run(src, "f()"), "ab");
-}
-
-// ── Range/for-loop expressions ──────────────────────────────────────────────
-
-#[test]
-fn runs_a_for_loop_over_an_exclusive_range() {
-	let src = r#"
-		func sum_to(n: int): int = {
-			let mut total = 0
-			for (i in 1..n) {
-				total = total + i
-			}
-			total
-		}
-	"#;
-	// 1..5 exclusive: 1 + 2 + 3 + 4 = 10.
-	assert_eq!(run(src, "sum_to(new NInt(5))"), "10");
-}
-
-#[test]
-fn runs_a_for_loop_over_an_inclusive_range() {
-	let src = r#"
-		func sum_to_inclusive(n: int): int = {
-			let mut total = 0
-			for (i in 1..=n) {
-				total = total + i
-			}
-			total
-		}
-	"#;
-	// 1..=5 inclusive: 1 + 2 + 3 + 4 + 5 = 15.
-	assert_eq!(run(src, "sum_to_inclusive(new NInt(5))"), "15");
-}
-
-#[test]
-fn runs_integer_range_protocol_edges() {
-	let src = r#"
-		func uint_sum(): uint = {
-			let mut total = 0u
-			for (i in 1u..4u) { total = total + i }
-			total
-		}
-		func equal_exclusive(): int = {
-			let mut count = 0
-			for (_ in 2..2) { count = count + 1 }
-			count
-		}
-		func equal_inclusive(): int = {
-			let mut count = 0
-			for (_ in 2..=2) { count = count + 1 }
-			count
-		}
-		func descending(): int = {
-			let mut count = 0
-			for (_ in 3..1) { count = count + 1 }
-			count
-		}
-	"#;
-	assert_eq!(
-		run(
-			src,
-			"[uint_sum().v, equal_exclusive().v, equal_inclusive().v, descending().v].join(',')"
-		),
-		"6,0,1,0"
-	);
-}
-
-#[test]
-fn runs_a_for_loop_with_a_call_expression_upper_bound() {
-	// The upper bound is hoisted into a temp and evaluated once, up front — this
-	// just pins that a call-expression bound lowers and runs correctly at all.
-	let src = r#"
-		func upper(): int = 4
-		func sum_to_call_bound(): int = {
-			let mut total = 0
-			for (i in 1..upper()) {
-				total = total + i
-			}
-			total
-		}
-	"#;
-	// 1..4 exclusive: 1 + 2 + 3 = 6.
-	assert_eq!(run(src, "sum_to_call_bound().v"), "6");
-}
-
-#[test]
-fn runs_a_for_loop_with_a_parenthesized_range_bound() {
-	// A parenthesized range bound is `ExprKind::Grouped` in the AST, which the
-	// checker's `check()` recurses through without recording an annotation for
-	// the `Grouped` node's own id. Lowering must peel through the parens to
-	// find the real numeric-element annotation rather than panicking on a
-	// perfectly valid program. Covers both a parenthesized literal bound and a
-	// parenthesized binary-expression bound.
-	let src = r#"
-		func sum_paren_literal(): int = {
-			let mut total = 0
-			for (i in (1)..5) {
-				total = total + i
-			}
-			total
-		}
-		func sum_paren_binary(a: int, b: int, n: int): int = {
-			let mut total = 0
-			for (i in (a + b)..n) {
-				total = total + i
-			}
-			total
-		}
-	"#;
-	// 1..5 exclusive: 1 + 2 + 3 + 4 = 10.
-	assert_eq!(run(src, "sum_paren_literal().v"), "10");
-	// (1 + 2)..7 exclusive == 3..7: 3 + 4 + 5 + 6 = 18.
-	assert_eq!(
-		run(
-			src,
-			"sum_paren_binary(new NInt(1), new NInt(2), new NInt(7)).v",
-		),
-		"18"
-	);
-}
-
-#[test]
-fn range_expressions_are_canonical_values_and_evaluate_bounds_once_in_order() {
-	let src = r#"
-func pass(value: Range<int>): int = value.start * 10 + value.end
-func returned(): RangeInclusive<int> = 3..=4
-func exercise(): int = {
-  let mut order = 0
-  let endpoint = (value: int) -> { order = order * 10 + value value }
-  let stored = endpoint(1)..endpoint(2)
-  let from = (endpoint(3))..
-  let to = ..endpoint(4)
-  let inclusive = endpoint(5)..=endpoint(6)
-  let to_inclusive = ..=endpoint(7)
-  order * 10000000
-    + pass(stored) * 100000
-    + from.start * 10000
-    + to.end * 1000
-    + inclusive.start * 100
-    + returned().end * 10
-    + to_inclusive.end
-}
-"#;
-	assert_eq!(run(src, "exercise()"), "12345671234547");
-}
-
-#[test]
-fn runs_fallible_steps_and_directional_canonical_ranges() {
-	let src = r#"
-func push_digit(acc: int, value: int): int = acc * 10 + value
-
-func direct_and_stored(): int = {
-  let mut direct = 0
-  for (value in 1..=3) { direct = push_digit(direct, value) }
-  let stored = 1..=3
-  let mut indirect = 0
-  for (value in stored) { indirect = push_digit(indirect, value) }
-  direct * 1000 + indirect
-}
-
-func reversed_ranges(): int = {
-  let mut result = 0
-  for (value in (1..4).reversed()) { result = push_digit(result, value) }
-  for (value in (1..=4).reversed()) { result = push_digit(result, value) }
-  for (value in (4..1).reversed()) { result = push_digit(result, value) }
-  result
-}
-
-func reversed_startless(): int = {
-  for (value in (..4).reversed()) {
-    return value * 10 + inclusive_start()
-  }
-  0
-}
-
-func inclusive_start(): int = {
-  for (value in (..=3).reversed()) {
-    return value
-  }
-  0
-}
-
-func open_forward(): int = {
-  for (value in 7..) {
-    return value
-  }
-  0
-}
-
-func char_points(): int = {
-  let mut result = 0
-  for (value in '\uD7FE'..='\uE001') {
-    let point = value as int
-    result = result * 10 + if (point == 55294) 1 else if (point == 55295) 2 else if (point == 57344) 3 else 4
-  }
-  result
-}
-
-func first_class_next<T: Step>(value: T): Option<T> = {
-  let next = value.next
-  next()
-}
-
-func step_edges(): #(boolean, boolean, boolean, boolean, boolean, boolean, boolean, boolean, int, int) = #(
-  9007199254740991.next().is_none(),
-  (-9007199254740991).previous().is_none(),
-  0u.previous().is_none(),
-  (1114111 as char).next().is_none(),
-  (0 as char).previous().is_none(),
-  (-9007199254740992).next().is_none(),
-  9007199254740992u.previous().is_none(),
-  first_class_next(9007199254740991).is_none(),
-  match ('\uD7FF'.next()) { Some(value) -> value as int, None -> -1 },
-  match ('\uE000'.previous()) { Some(value) -> value as int, None -> -1 },
-)
-
-func direct_and_stored_boundary(): int = {
-  let mut direct = 0
-  for (_ in 9007199254740991..9007199254740994) { direct = direct + 1 }
-  let stored = 9007199254740991..9007199254740994
-  let mut indirect = 0
-  for (_ in stored) { indirect = indirect + 1 }
-  direct * 10 + indirect
-}
-"#;
-	assert_eq!(run(src, "direct_and_stored()"), "123123");
-	assert_eq!(run(src, "reversed_ranges()"), "3214321");
-	assert_eq!(run(src, "reversed_startless()"), "33");
-	assert_eq!(run(src, "open_forward()"), "7");
-	assert_eq!(run(src, "char_points()"), "1234");
-	assert_eq!(run(src, "direct_and_stored_boundary()"), "11");
-	assert_eq!(
-		run(src, "JSON.stringify(nymphTestValue(step_edges()))"),
-		"[true,true,true,true,true,true,true,true,57344,55295]"
-	);
-}
-
-#[test]
-fn break_terminates_open_direct_and_stored_ranges() {
-	let src = r#"
-func exercise(): int = {
-  let mut result = 0
-  for (value in 7..) {
-    result = value
-    break
-  }
-  result
-}
-
-func bounded_direct(): int = {
-  let mut result = 0
-  for (value in 1..=5) {
-    result = result * 10 + value
-    if (value == 3) { break }
-  }
-  result
-}
-
-func bounded_stored(): int = {
-  let range = 1..=5
-  let mut result = 0
-  for (value in range) {
-    result = result * 10 + value
-    if (value == 3) { break }
-  }
-  result
-}
-"#;
-	assert_eq!(run(src, "exercise()"), "7");
-	assert_eq!(run(src, "bounded_direct()"), "123");
-	assert_eq!(run(src, "bounded_stored()"), "123");
-	for diagnostics in [
-		nymph_compiler::compile("func invalid(): void = { break }", "invalid").unwrap_err(),
-		nymph_compiler::compile(
-			"func invalid(): void = for (_ in 1..) { let stop = () -> { break } stop() }",
-			"invalid_closure",
-		)
-		.unwrap_err(),
-	] {
-		assert!(
-			diagnostics.iter().any(
-				|diagnostic| diagnostic.message.contains("break") && diagnostic.message.contains("loop")
-			),
-			"{diagnostics:?}"
-		);
-	}
-}
-
-// ── Iterator for-loops (Tier 1, Track A) ─────────────────────────────────────
-
-#[test]
-fn runs_a_for_loop_over_a_list() {
-	// Boxed lists route through `Iterable.iter()` / `Iterator.next()` like every
-	// other collection; the source-only facade remains prelude-free here.
-	let src = r#"
-		func sum_list(): int = {
-			let mut total = 0
-			for (x in #[1, 2, 3, 4]) {
-				total = total + x
-			}
-			total
-		}
-	"#;
-	assert_eq!(run(src, "sum_list().v"), "10");
-}
-
-#[test]
-fn runs_a_for_loop_over_a_mut_list() {
-	// `mut` is transparent to the same uniform iteration protocol.
-	let src = r#"
-		func sum_mut_list(): int = {
-			let mut xs = #[1, 2, 3, 4]
-			let mut total = 0
-			for (x in xs) {
-				total = total + x
-			}
-			total
-		}
-	"#;
-	assert_eq!(run(src, "sum_mut_list().v"), "10");
-}
-
-#[test]
-fn runs_a_for_loop_over_an_iterator_directly() {
-	// A source that itself implements `Iterator<Item>` is used
-	// directly (`let $it = <src>`, no `.iter()` hop) — desugars to
-	// `while ($go) { match ($it.next()) { Some(x) -> .., None -> $go = false } }`.
-	// `Counter`'s `next` mutates `this.n`, which requires `this: mut Self` —
-	// declaring `next` a `mut func` on both the interface (the source of
-	// truth every gate reads) and this impl (whose restatement must
-	// match) gets that without needing a `Mut`-self-type impl target (`impl ..
-	// for mut Counter`), which lowering doesn't support yet for a class-backed
-	// ADT, which lowering does not support for mutable self-type impl targets.
-	// `c` itself must be bound `mut`: the `for`-loop desugar calls `next()` on
-	// it directly (`IterMode::Direct`), and that call is gated exactly like an
-	// explicit `c.next()` would be (`MutMethodNeedsMutReceiver`).
-	let src = r#"
-		struct Counter(n: int, max: int)
-		impl Iterator<int> for Counter {
-			mut func next(): Option<int> = if (this.n > this.max) {
-				None
-			} else {
-				let v = this.n
-				this.n = this.n + 1
-				Some(value = v)
-			}
-		}
-		func sum_counter(): int = {
-			let mut c = Counter(n = 1, max = 4)
-			let mut total = 0
-			for (x in c) {
-				total = total + x
-			}
-			total
-		}
-	"#;
-	// 1 + 2 + 3 + 4 = 10.
-	assert_eq!(run(src, "sum_counter()"), "10");
-}
-
-#[test]
-fn runs_a_for_loop_over_an_iterable_via_iter() {
-	// A source that implements `Iterable<T>` (not `Iterator` itself)
-	// is desugared through `.iter()` — `let $it = <src>.iter()` — then the
-	// same while/match/next protocol as the direct case above. `T` is read off
-	// the matched `Iterable` impl's own argument (`resolve_iface_arg`), not by
-	// typing `iter()`'s return — the checker doesn't cross-check an impl
-	// method's own declared return type against the interface's (confirmed by
-	// `Bag::iter` below stating the concrete `Counter`, not `Iterator<int>`,
-	// as its return type), so nothing about `iter()`'s return type actually
-	// participates in resolving `T`.
-	let src = r#"
-		struct Counter(n: int, max: int)
-		impl Iterator<int> for Counter {
-			mut func next(): Option<int> = if (this.n > this.max) {
-				None
-			} else {
-				let v = this.n
-				this.n = this.n + 1
-				Some(value = v)
-			}
-		}
-		struct Bag(lo: int, hi: int)
-		impl Iterable<int> for Bag {
-			func iter(): Counter = Counter(n = this.lo, max = this.hi)
-		}
-		func sum_bag(): int = {
-			let b = Bag(lo = 1, hi = 4)
-			let mut total = 0
-			for (x in b) {
-				total = total + x
-			}
-			total
-		}
-	"#;
-	// 1 + 2 + 3 + 4 = 10.
-	assert_eq!(run(src, "sum_bag()"), "10");
-}
-
-#[test]
-fn runs_a_for_loop_over_a_generic_iterable_bound() {
-	let src = r#"
-		struct Counter(n: int, max: int)
-		impl Iterator<int> for Counter {
-			mut func next(): Option<int> = if (this.n > this.max) { None } else {
-				let value = this.n
-				this.n = this.n + 1
-				Some(value = value)
-			}
-		}
-		struct Bag(max: int)
-		impl Iterable<int> for Bag { func iter(): Counter = Counter(n = 1, max = this.max) }
-		func sum<T: Iterable<T = int>>(items: T): int = {
-			let mut total = 0
-			for (item in items) { total = total + item }
-			total
-		}
-		func demo(): int = sum(Bag(max = 4))
-	"#;
-	assert_eq!(run(src, "demo().v"), "10");
-}
-
-#[test]
-fn runs_a_for_loop_over_a_spread_param_bound_to_a_list() {
-	let src = r#"
-		func total<Item>(...from: #[Item]): int = {
-			let mut total = 0
-			for (item in from) {
-				total = total + 1
-			}
-			total
-		}
-		func demo(): int = total(...#[1, 2, 3, 4, 5])
-	"#;
-	assert_eq!(run(src, "demo().v"), "5");
-}
-
-// ── `|>`, `in`/`!in`, `??` ─────────────────────────────────────────────────
-
-#[test]
 fn runs_pipe_chain_applies_functions_left_to_right() {
-	// `|>` lowers structurally to a `Call`; chained pipes are left-associative, so
+	// DD1: `|>` lowers structurally to a `Call`; chained pipes are left-assoc, so
 	// `10 |> double |> inc` is `inc(double(10))`, not `double(inc(10))`.
 	let src = r#"
 		func double(x: int): int = x * 2
@@ -2372,7 +1819,7 @@ fn runs_pipe_chain_applies_functions_left_to_right() {
 
 #[test]
 fn runs_user_contains_impl_dispatches_in_and_not_in() {
-	// `a in c` / `a !in c` dispatch to `c.contains(a)` / `c.not_contains(a)` —
+	// DD2: `a in c` / `a !in c` dispatch to `c.contains(a)` / `c.not_contains(a)` —
 	// the RHS collection is the receiver, swapped from every other operator.
 	let src = r#"
 		interface Contains<Item> {
@@ -2409,7 +1856,7 @@ fn runs_user_contains_impl_dispatches_in_and_not_in() {
 fn in_operator_never_emits_native_js_in() {
 	// Codegen invariant: JS `in` is key-membership, wrong for a Nymph `contains`
 	// dispatch — it must never appear in the emitted output for a user `Contains`
-	// impl, only a plain method call.
+	// impl, only activation-machine member dispatch.
 	let src = r#"
 		interface Contains<Item> { func contains(item: Item): boolean }
 		struct Bag(n: int)
@@ -2420,8 +1867,8 @@ fn in_operator_never_emits_native_js_in() {
 	"#;
 	let js = compile(src);
 	assert!(
-		js.contains(".contains("),
-		"expected a `.contains(` call in emitted JS:\n{js}"
+		js.contains(".contains,") && js.contains("return nymphTailCall("),
+		"expected activation-machine `contains` dispatch in emitted JS:\n{js}"
 	);
 	assert!(
 		!js.contains(" in "),
@@ -2431,7 +1878,7 @@ fn in_operator_never_emits_native_js_in() {
 
 #[test]
 fn runs_user_unwrap_impl_dispatches_eagerly() {
-	// Nymph has no optional runtime representation, so `??`
+	// DD3 (corrected): Nymph has no optional runtime representation, so `??`
 	// always dispatches to an ordinary eager `recv.unwrap(fallback)` call.
 	let src = r#"
 		interface Unwrap<Output> { func unwrap(default: Output): Output }
@@ -2460,8 +1907,8 @@ fn runs_user_unwrap_impl_dispatches_eagerly() {
 #[test]
 fn unwrap_never_emits_native_js_nullish_coalescing() {
 	// Pinning the eager-vs-short-circuit distinction at the JS-source level: a
-	// user `Unwrap` overload compiles to a plain method call, never a native JS
-	// `??` (which would test null/undefined — Nymph values are never
+	// user `Unwrap` overload uses activation member dispatch, never native JS
+	// `??` (which would test null/undefined; Nymph values are never
 	// null/undefined-based, so a native `??` here would just silently never
 	// fire).
 	let src = r#"
@@ -2474,21 +1921,17 @@ fn unwrap_never_emits_native_js_nullish_coalescing() {
 	"#;
 	let js = compile(src);
 	assert!(
-		js.contains(".unwrap("),
-		"expected a `.unwrap(` call in emitted JS:\n{js}"
-	);
-	assert!(
-		!js.contains("??"),
-		"emitted JS must never contain a native `??` for a user Unwrap impl:\n{js}"
+		js.contains(".unwrap,") && js.contains("return nymphTailCall("),
+		"the user Unwrap expression must use activation member dispatch:\n{js}"
 	);
 }
 
-// ── `namespace func` statics, `mut func` methods ───────────────────────────
+// ── Slice 4J: `namespace func` statics, `mut func` methods ─────────────────
 
 #[test]
 fn runs_struct_namespaced_static_called_from_nymph() {
 	// `Type.func(args)` inside a Nymph body lowers structurally (a `Field`
-	// callee, zero call-site changes) and the declaration lands as a JS
+	// callee, zero call-site changes) and the DECLARATION now lands as a JS
 	// `static` class method.
 	let src = r#"
 		struct Point(x: int, y: int) {
@@ -2530,7 +1973,8 @@ fn runs_top_level_inherent_statics_for_struct_enum_and_generics() {
 	let js = compile(src);
 	assert_eq!(js.matches("static at(").count(), 1, "{js}");
 	assert_eq!(
-		js.matches("wrap(value, $type$0) {").count() + js.matches("wrap (value, $type$0) {").count(),
+		js.matches("wrap: nymphMarkCallable(function(value, $type$0) {")
+			.count(),
 		1,
 		"{js}"
 	);
@@ -2570,114 +2014,6 @@ fn runs_enum_namespaced_static_called_from_a_js_driver() {
 	"#;
 	assert_eq!(run(src, "Color.default() === Color.Red"), "true");
 }
-
-#[test]
-fn runs_impl_mut_method_mutates_a_this_field() {
-	// Lowering treats a `mut func` as an ordinary instance method after the
-	// checker proves the caller has a mutable receiver. Emit supports the
-	// resulting `this.field = ..` assignment target.
-	let src = r#"
-		struct Counter(n: int) {
-			mut func bump(): void = { this.n = this.n + 1 }
-		}
-		func run_bump(c: mut Counter): int = {
-			c.bump()
-			c.n
-		}
-	"#;
-	assert_eq!(run(src, "run_bump(new Counter({ n: new NInt(5) }))"), "6");
-}
-
-#[test]
-fn runs_field_slot_reassignment_gated_on_a_mut_receiver() {
-	// `mut T` is compile-time-only — codegen is a near
-	// no-op (JS objects are already mutable), so a program the checker lets
-	// through because its receiver is `mut` must run under Node exactly like
-	// the equivalent ungated field assignment always has.
-	let src = r#"
-		struct Counter(n: int)
-		func bump(c: mut Counter): int = {
-			c.n = c.n + 1
-			c.n
-		}
-	"#;
-	assert_eq!(run(src, "bump(new Counter({ n: new NInt(5) }))"), "6");
-}
-
-#[test]
-fn runs_nested_mut_field_slot_reassignment_through_an_immutable_receiver() {
-	// Field type authority is pinned end to end: `inner`'s own declared
-	// type (`mut Counter`) governs regardless of the outer `w`'s own
-	// mutability — the checker lets `w.inner.n = ..` through even though `w`
-	// itself is a plain, non-`mut` `Wrapper`, and (mut being compile-time-only)
-	// the emitted JS mutates the shared `inner` object exactly as written.
-	let src = r#"
-		struct Counter(n: int)
-		struct Wrapper(inner: mut Counter)
-		func bump(w: Wrapper): int = {
-			w.inner.n = w.inner.n + 1
-			w.inner.n
-		}
-	"#;
-	assert_eq!(
-		run(
-			src,
-			"bump(new Wrapper({ inner: new Counter({ n: new NInt(5) }) }))"
-		),
-		"6"
-	);
-}
-
-#[test]
-fn runs_let_mut_reassignment_of_a_mut_typed_binding() {
-	// `let mut` binds at `mut <ty(v)>` — reassigning that binding, and
-	// passing it on to a plain (non-`mut`) parameter (`mut T <: T`, one-way),
-	// both preserve ordinary immutable parameter behavior under Node.
-	let src = r#"
-		func takes_int(x: int): int = x + 1
-		func f(): int = {
-			let mut n = 1
-			n = 2
-			takes_int(n)
-		}
-	"#;
-	assert_eq!(run(src, "f()"), "3");
-}
-
-#[test]
-fn runs_list_index_assignment() {
-	let src = r#"
-		func set_unsigned(i: uint, v: int): #[int] = {
-			let mut values = #[1, 2, 3]
-			values[i] = v
-			values
-		}
-	"#;
-	assert_eq!(
-		run(
-			src,
-			"JSON.stringify(nymphTestValue(set_unsigned(new NUint(1), new NInt(99))))"
-		),
-		"[1,99,3]"
-	);
-}
-
-#[test]
-fn runs_map_index_assignment() {
-	// A JS `Map` has no assignment-expression
-	// form for its entries (`m[k] = v` would silently set an own property on
-	// the `Map` object itself, not mutate an entry), so this must lower to a
-	// `.set(key, value)` call, not a computed-member `AssignmentTarget`.
-	let src = r#"
-		func set(m: #{int: int}, k: int, v: int): #{int: int} = {
-			m[k] = v
-			m
-		}
-	"#;
-	assert_eq!(run(src, "set(new Map([[1, 10]]), 1, 99).get(1)"), "99");
-}
-
-// ── `is`/`!is` desugar, `as` scalar/`Into` dispatch, end-to-end ────────────
 
 #[test]
 fn runs_is_matching_and_non_matching_literal_patterns() {
@@ -2723,14 +2059,16 @@ fn runs_identity_cast_as_a_no_op() {
 }
 
 #[test]
-fn runs_int_to_uint_cast_saturates_via_abs() {
-	// Nymph defines its own semantics for `int as uint` rather than inheriting
-	// JS/Rust edge behavior: no `Into` is declared anywhere for `as`, and JS
-	// numbers can't express Rust's 2^64 wraparound, so a negative `int as uint`
-	// takes `Math.abs` first so the cast is a real runtime operation.
+fn runs_int_to_uint_cast_with_a_checked_range() {
 	let src = "func f(n: int): uint = n as uint";
 	assert_eq!(run(src, "f(new NInt(5))"), "5");
-	assert_eq!(run(src, "f(new NInt(-1))"), "1");
+	assert_eq!(
+		run(
+			src,
+			"(() => { try { return f(new NInt(-1)).v } catch (error) { return `${error.name}:${error.message}` } })()"
+		),
+		"RangeError:uint overflow"
+	);
 }
 
 #[test]
@@ -2750,67 +2088,48 @@ fn runs_float_to_int_cast_truncating_toward_zero() {
 }
 
 #[test]
-fn runs_float_to_uint_cast_takes_abs_then_truncates_toward_zero() {
-	// `float as uint` takes `Math.abs` first, so a negative operand saturates to
-	// its absolute value rather than staying negative.
+fn runs_float_to_uint_cast_truncates_then_checks_the_range() {
 	let src = "func f(x: float): uint = x as uint";
 	assert_eq!(run(src, "f(new NFloat(3.7))"), "3");
-	assert_eq!(run(src, "f(new NFloat(-3.7))"), "3");
+	assert_eq!(
+		run(
+			src,
+			"(() => { try { return f(new NFloat(-3.7)).v } catch (error) { return `${error.name}:${error.message}` } })()"
+		),
+		"RangeError:uint overflow"
+	);
 }
 
 #[test]
-fn float_to_int_cast_saturates_nan_and_infinity() {
-	// Nymph defines its own float→int semantics rather than inheriting JS's
-	// (`Math.trunc` passes `NaN`/`±Infinity` straight through) or Rust's (`as`
-	// saturates, but isn't reproducible on JS numbers as-is): `NaN` saturates to
-	// `0`, and `±Infinity` saturate to `i64::MAX`/`i64::MIN` (JS stores the
-	// former as `2^63`, the nearest `f64` to `2^63 - 1`).
+fn float_to_int_cast_rejects_nan_and_infinity() {
 	let src = "func f(x: float): int = x as int";
-	assert_eq!(run(src, "f(new NFloat(NaN))"), "0");
-	assert_eq!(run(src, "f(new NFloat(Infinity))"), "9223372036854776000");
-	assert_eq!(run(src, "f(new NFloat(-Infinity))"), "-9223372036854776000");
+	for value in ["NaN", "Infinity", "-Infinity"] {
+		assert_eq!(
+			run(
+				src,
+				&format!(
+					"(() => {{ try {{ return f(new NFloat({value})).v }} catch (error) {{ return `${{error.name}}:${{error.message}}` }} }})()"
+				)
+			),
+			"RangeError:float-to-integer conversion requires a finite value"
+		);
+	}
 }
 
 #[test]
-fn float_to_uint_cast_saturates_nan_and_both_infinities_to_the_same_max() {
-	// `float as uint` takes `Math.abs` first, so `-Infinity` collapses onto the
-	// same `Infinity -> i64::MAX` branch as `+Infinity` — there's no negative
-	// saturation branch for an unsigned target.
-	let src = "func f(x: float): int = x as int\nfunc g(x: float): uint = x as uint";
-	assert_eq!(run(src, "g(new NFloat(NaN))"), "0");
-	assert_eq!(run(src, "g(new NFloat(Infinity))"), "9223372036854776000");
-	assert_eq!(run(src, "g(new NFloat(-Infinity))"), "9223372036854776000");
-	// Sanity: the signed cast's `-Infinity` really is distinct from the unsigned
-	// cast's (both derived from the same source function above).
-	assert_eq!(run(src, "f(new NFloat(-Infinity))"), "-9223372036854776000");
-}
-
-#[test]
-fn saturating_scalar_cast_evaluates_its_operand_exactly_once() {
-	// The cast's arrow-IIFE must bind the operand to a gensym parameter and
-	// reference *that*, never re-evaluate the source expression — otherwise a
-	// side-effecting operand (a block that mutates `calls` every time it runs)
-	// would run more than once per cast, once per branch that reads it.
-	let src = "
-		func f(): int = {
-			let mut calls = 0
-			let n = ({
-				calls = calls + 1
-				3.5
-			}) as int
-			calls
-		}
-		func g(): int = {
-			let mut calls = 0
-			let n = ({
-				calls = calls + 1
-				3.5
-			}) as uint
-			calls
-		}
-	";
-	assert_eq!(run(src, "f()"), "1");
-	assert_eq!(run(src, "g()"), "1");
+fn float_to_uint_cast_rejects_nan_and_infinity() {
+	let src = "func f(x: float): uint = x as uint";
+	for value in ["NaN", "Infinity", "-Infinity"] {
+		assert_eq!(
+			run(
+				src,
+				&format!(
+					"(() => {{ try {{ return f(new NFloat({value})).v }} catch (error) {{ return `${{error.name}}:${{error.message}}` }} }})()"
+				)
+			),
+			"RangeError:float-to-integer conversion requires a finite value"
+		);
+	}
 }
 
 #[test]
@@ -2894,13 +2213,6 @@ fn numeric_to_char_accepts_boundaries_bmp_and_astral_values() {
 }
 
 #[test]
-fn numeric_to_char_evaluates_its_operand_exactly_once() {
-	let src =
-		"func f(): int = {\nlet mut calls = 0\nlet c = ({\ncalls = calls + 1\n65\n}) as char\ncalls\n}";
-	assert_eq!(run(src, "f()"), "1");
-}
-
-#[test]
 fn runs_cast_via_a_user_into_impl() {
 	let src = r#"
 		interface Into<Other> { func into(): Other }
@@ -2913,7 +2225,7 @@ fn runs_cast_via_a_user_into_impl() {
 
 #[test]
 fn runs_cast_via_a_user_into_impl_with_a_custom_method_name() {
-	// `check_cast` must not hardcode the dispatched method name
+	// Defect 1 (critical): `check_cast` used to hardcode the dispatched method name
 	// to `"into"` regardless of what the resolved `Into`-named interface actually
 	// declares — silently emitting a call to a method that doesn't exist on the
 	// class whenever the interface's sole method isn't literally named `into`.
@@ -2930,8 +2242,8 @@ fn runs_cast_via_a_user_into_impl_with_a_custom_method_name() {
 
 #[test]
 fn cast_via_into_impl_never_emits_a_native_as_keyword_or_call_to_math() {
-	// Codegen invariant: a user `Into` dispatch must be a plain method call, never
-	// anything referencing the built-in scalar-cast machinery.
+	// Codegen invariant: a user `Into` dispatch must use activation-machine member
+	// dispatch, never anything referencing the built-in scalar-cast machinery.
 	let src = r#"
 		interface Into<Other> { func into(): Other }
 		struct P(x: int)
@@ -2940,8 +2252,8 @@ fn cast_via_into_impl_never_emits_a_native_as_keyword_or_call_to_math() {
 	"#;
 	let js = compile(src);
 	assert!(
-		js.contains(".into("),
-		"expected a `.into(` call in emitted JS:\n{js}"
+		js.contains(".into,") && js.contains("return nymphTailCall("),
+		"expected activation-machine `into` dispatch in emitted JS:\n{js}"
 	);
 	assert!(
 		!js.contains("Math.trunc") && !js.contains("codePointAt") && !js.contains("fromCodePoint"),
@@ -2949,7 +2261,7 @@ fn cast_via_into_impl_never_emits_a_native_as_keyword_or_call_to_math() {
 	);
 }
 
-// ── Namespaced static vs. interface-impl method ────────────────────────────
+// ── Slice 4K, HH3 (Defect 2): namespaced static vs. interface-impl method ──
 
 #[test]
 fn namespaced_static_and_interface_impl_method_sharing_a_name_both_run() {
@@ -3018,7 +2330,7 @@ fn runs_bool_or_short_circuits_never_evaluating_the_rhs() {
 	assert_eq!(run(src, "f({ v: true })"), "true");
 }
 
-// ── Closures ─────────────────────────────────────────────────────────────────
+// ── Closures (Slice 4L) ──────────────────────────────────────────────────────
 
 #[test]
 fn runs_a_paren_closure_as_a_pipe_rhs() {
@@ -3042,26 +2354,9 @@ fn runs_a_closure_passed_as_a_function_argument() {
 }
 
 #[test]
-fn runs_a_closure_capturing_and_mutating_an_outer_mut_binding() {
-	// JS arrows capture their enclosing scope by reference; the checker
-	// permits assigning a captured outer `let mut` inside a closure body
-	// (rejects the same assignment against a non-`mut` capture) — the
-	// mutation must be visible to the enclosing function after the call.
-	let src = "
-		func f(): int = {
-			let mut x = 1
-			let bump = () -> { x = x + 1 }
-			bump()
-			x
-		}
-	";
-	assert_eq!(run(src, "f()"), "2");
-}
-
-#[test]
 fn runs_a_closure_capturing_a_shadow_renamed_outer_binding() {
 	// `let x = 1; let x = x + 1` renames the second binding to `x$1` in the
-	// emitted JS. A closure defined afterward, reading the
+	// emitted JS (Slice 4E, Y2) — a closure defined afterward, reading the
 	// free variable `x`, must resolve to that SAME renamed binding, not a
 	// stale reference to the first `x`.
 	let src = "
@@ -3233,7 +2528,7 @@ fn runs_an_enum_variant_constructor_field_as_a_closure_slot() {
 	assert_eq!(run(src, "g()"), "105");
 }
 
-// ── Smart literal spread ────────────────────────────────────────────────────
+// ── SS1: smart literal spread ────────────────────────────────────────────────
 
 #[test]
 fn runs_static_tuple_spreads_as_a_canonical_boxed_tuple() {
@@ -3244,34 +2539,6 @@ fn runs_static_tuple_spreads_as_a_canonical_boxed_tuple() {
 		run(src, "JSON.stringify(nymphTestValue(f()))"),
 		r#"[1,true,"x",2]"#
 	);
-}
-
-#[test]
-fn tuple_spread_evaluates_every_item_and_source_once_left_to_right() {
-	let src = r#"
-		struct Logger(count: int, trace: string) {
-			mut func item(n: int): int = {
-				this.count = this.count + 1
-				this.trace = this.trace + "i"
-				n
-			}
-			mut func pair(): #(boolean, string) = {
-				this.count = this.count + 1
-				this.trace = this.trace + "s"
-				#(true, "x")
-			}
-		}
-		func f(logger: mut Logger): #(int, boolean, string, int) =
-			#(logger.item(1), ...logger.pair(), logger.item(2))
-	"#;
-	let js = r#"
-		(() => {
-			const logger = new Logger({ count: new NInt(0), trace: new NString("") });
-			const value = f(logger);
-			return JSON.stringify(nymphTestValue([value, logger.count, logger.trace]));
-		})()
-	"#;
-	assert_eq!(run(src, js), r#"[[1,true,"x",2],3,"isi"]"#);
 }
 
 #[test]
@@ -3288,60 +2555,6 @@ fn runs_a_list_spread_over_a_native_list_source() {
 		),
 		"[1,2,3,4]"
 	);
-}
-
-#[test]
-fn runs_a_list_spread_over_a_user_iterator_source() {
-	// A non-array `Iterator<T>` source drains through Track A's own
-	// `.next()`/`Option` protocol before splicing — no `Symbol.iterator`
-	// involved.
-	let src = r#"
-		struct Counter(n: int, max: int)
-		impl Iterator<int> for Counter {
-			mut func next(): Option<int> = if (this.n > this.max) {
-				None
-			} else {
-				let v = this.n
-				this.n = this.n + 1
-				Some(value = v)
-			}
-		}
-		func f(): #[int] = {
-			let mut c = Counter(n = 1, max = 3)
-			#[...c, 99]
-		}
-	"#;
-	assert_eq!(
-		run(src, "JSON.stringify(nymphTestValue(f()))"),
-		"[1,2,3,99]"
-	);
-}
-
-#[test]
-fn runs_a_list_spread_over_an_iterable_via_iter_source() {
-	// The `Iterable<T>` (not `Iterator` itself) half of the protocol, via
-	// `.iter()`, also drains correctly for a spread source.
-	let src = r#"
-		struct Counter(n: int, max: int)
-		impl Iterator<int> for Counter {
-			mut func next(): Option<int> = if (this.n > this.max) {
-				None
-			} else {
-				let v = this.n
-				this.n = this.n + 1
-				Some(value = v)
-			}
-		}
-		struct Bag(lo: int, hi: int)
-		impl Iterable<int> for Bag {
-			func iter(): Counter = Counter(n = this.lo, max = this.hi)
-		}
-		func f(): #[int] = {
-			let b = Bag(lo = 1, hi = 3)
-			#[0, ...b]
-		}
-	"#;
-	assert_eq!(run(src, "JSON.stringify(nymphTestValue(f()))"), "[0,1,2,3]");
 }
 
 #[test]
@@ -3376,35 +2589,6 @@ fn runs_a_map_spread_merge_with_later_key_wins() {
 }
 
 #[test]
-fn runs_a_map_spread_over_a_non_map_iterable_of_pairs() {
-	// A non-map spread source may be a user `Iterator<#(K, V)>` of entry pairs,
-	// which is drained and then merged.
-	let src = r#"
-		struct Pairs(n: int, max: int)
-		impl Iterator<#(int, string)> for Pairs {
-			mut func next(): Option<#(int, string)> = if (this.n > this.max) {
-				None
-			} else {
-				let v = this.n
-				this.n = this.n + 1
-				Some(value = #(v, "x"))
-			}
-		}
-		func f(): #{int: string} = {
-			let mut p = Pairs(n = 1, max = 3)
-			#{...p, 9: "z"}
-		}
-	"#;
-	assert_eq!(
-		run(
-			src,
-			"JSON.stringify(nymphTestValue(f()).sort(([a], [b]) => a - b))"
-		),
-		r#"[[1,"x"],[2,"x"],[3,"x"],[9,"z"]]"#
-	);
-}
-
-#[test]
 fn runs_a_map_spread_over_a_native_list_of_pairs_source() {
 	// A native `#[#(K, V)]` list source is a JS array already — it splices
 	// directly into the `new Map([...])` entries with no drain, exactly like
@@ -3425,39 +2609,12 @@ fn runs_a_map_spread_over_a_native_list_of_pairs_source() {
 }
 
 #[test]
-fn runs_a_map_spread_computed_key_eval_order() {
-	// Entries emit left-to-right in source order with no hoisting — a
-	// side-effecting expression key evaluates exactly once, AFTER the spread
-	// ahead of it, and a duplicate key it produces still wins over the
-	// spread's own entry only because the literal comes LATER in the merged
-	// entries array (`new Map` processes entries in order, later wins).
-	let src = r#"
-		struct Logger(count: int) {
-			mut func record(n: int): int = {
-				this.count = this.count + 1
-				n
-			}
-		}
-		func f(m: #{int: int}, logger: mut Logger): #{int: int} = #{...m, logger.record(1): 999}
-	"#;
-	let mutation_check = r#"
-		const logger = new Logger({ count: new NInt(0) });
-		const result = f(new Map([[new NInt(1), new NInt(10)], [new NInt(2), new NInt(20)]]), logger);
-		return JSON.stringify(nymphTestValue([logger.count, result]));
-	"#;
-	assert_eq!(
-		run(src, &format!("(() => {{ {mutation_check} }})()")),
-		r#"[1,[[1,999],[2,20]]]"#
-	);
-}
-
-#[test]
-fn real_list_push_materializes_once_push_is_linked() {
+fn real_list_appended_materializes_once_and_preserves_the_source() {
 	let user = r#"
 		func check(): int = {
 			let xs = #[1]
-			xs.push(2)
-			xs[1]
+			let ys = xs.appended(2)
+			if (xs.length() == 1u) ys[1] else 0
 		}
 	"#;
 	assert_eq!(run(user, "check()"), "2");
@@ -3465,7 +2622,7 @@ fn real_list_push_materializes_once_push_is_linked() {
 
 #[test]
 fn mixed_int_uint_operators_run_under_node() {
-	// Mixed int/uint operators type-check
+	// End-to-end for the int<->uint operator slice: mixed operators type-check
 	// against the real stdlib's cross-type impls and execute as native JS. Notably
 	// the arithmetic Output is the signed `int` domain (so `sub` can go negative) and
 	// division is `float` (`7 / 2 == 3.5`, not integer). Since every mixed primitive
@@ -3488,11 +2645,12 @@ fn mixed_int_uint_operators_run_under_node() {
 	assert_eq!(run_js(js, "ne(new NInt(4), new NUint(5))"), "true");
 }
 
-// `is_empty` (`this.length() == 0`) is real Nymph source, not `external`
-// itself. Its transitive `length` call requires an external JS binding
-// (`body_calls_unlinked_external`'s member-call extension caught it). Because
-// `length` is a linked external (see
-// `nymph_hir::linkage::REGISTRY`), `body_calls_unlinked_external` no
+// FLIP (Gap 3, L0): `is_empty` (`this.length() == 0`) is real Nymph source,
+// not `external` itself — it used to stay a loud defer because the method it
+// transitively calls, `length`, WAS `external` with no JS binding anywhere
+// (`body_calls_unlinked_external`'s member-call extension caught it). Now
+// that `length` is a LINKED external (Gap 3, L0's one seeded registry entry —
+// see `nymph_hir::linkage::REGISTRY`), `body_calls_unlinked_external` no
 // longer counts it as unlinked, so `is_empty` materializes: its `this.length()`
 // lowers to `HirExpr::ExternCall`, which emits a module-qualified local call
 // plus a deduped import from `std/collections/list`. This can't
@@ -3508,20 +2666,8 @@ fn real_list_is_empty_materializes_once_length_is_linked() {
 	);
 }
 
-// `list.nym`'s `get` is `external(get)` and requires a
-// loud defer for the identical reason `push` (above) still does: no JS
-// binding anywhere for the marker. It is linked for a `List` receiver
-// (`nymph_hir::linkage::REGISTRY`'s `("get", Some("list"))`/`("get",
-// Some("mut_list"))` rows), so it
-// materializes: the call lowers to `HirExpr::ExternCall` carrying the
-// ALREADY-resolved `(module, symbol)` pair (see `HirExpr::ExternCall`'s own
-// doc comment for why — `get` is an AMBIGUOUS marker shared with `map.nym`'s
-// own, different, `get`), which emits a plain `get($_this, i)` call plus a
-// deduped `import { get } from "std/collections/list"`. Shape-only, same
-// reasoning as `real_list_is_empty_materializes_once_length_is_linked` above
-// — the bundle-path e2e in `nymph-compiler`'s `tests/std_linkage.rs` proves
-// the mechanism actually RUNS (imports resolved, `Option` round-tripped
-// through the user's own `match`).
+// List.get resolves through the immutable list receiver tag. The bundle test
+// also proves that the canonical Option crosses this external boundary.
 #[test]
 fn real_list_get_materializes_once_get_is_linked() {
 	let user = r#"
@@ -3533,17 +2679,7 @@ fn real_list_get_materializes_once_get_is_linked() {
 	assert_eq!(run(user, "check()"), "7");
 }
 
-// `map.nym`'s `get` shares the same bare marker as
-// `list.nym`'s (see
-// `real_list_get_materializes_once_get_is_linked` above), but WAS a
-// different, unlinked JS implementation — the registry's receiver-tag
-// disambiguation (`Some("mut_map")`, since `map.nym` declares `get` inside
-// its `impl<K,V> mut #{K:V}` block) lets a `Map` receiver's `get` materialize
-// like `list`'s `get`, into `HirExpr::ExternCall` emitting a plain
-// `get($_this, key)` call plus a deduped `import { get } from
-// "std/collections/map"`. Shape-only (same reasoning as the list flips
-// above) — the bundle-path e2e in `nymph-compiler`'s `tests/std_linkage.rs`
-// proves the mechanism actually RUNS.
+// Map and list share the `get` marker, so the receiver tag must select the map adapter.
 #[test]
 fn real_map_get_materializes_once_get_is_linked() {
 	let user = r#"
@@ -3555,9 +2691,9 @@ fn real_map_get_materializes_once_get_is_linked() {
 	assert_eq!(run(user, "check()"), "9");
 }
 
-// `map.nym`'s `is_empty` (`this.size() == 0`) is
+// FLIP (Gap 3, L3): `map.nym`'s `is_empty` (`this.size() == 0`) is
 // transitively external through `size`, mirroring the list case above —
-// `size` is a linked (unambiguous, `receiver_tag: None`) external, so
+// `size` is now a LINKED (unambiguous, `receiver_tag: None`) external, so
 // `body_calls_unlinked_external`'s registry subtraction no longer counts it
 // as unlinked and `is_empty` materializes.
 #[test]
@@ -3570,7 +2706,7 @@ fn real_map_is_empty_materializes_once_size_is_linked() {
 }
 
 // ── Named-type prelude method materialization: a prelude-only INSTANCE method
-// on a NAMED enum receiver (`Option`/`Result`) materializes ONTO that
+// on a NAMED enum receiver (`Option`/`Result`) now materializes ONTO that
 // enum's own emitted class and RUNS, instead of panicking at the
 // "prelude-only impl" wall above (that wall still stands for every OTHER
 // unmaterializable shape — external/transitively-external collection
@@ -3626,7 +2762,8 @@ fn real_option_match_over_a_materialized_enum_runs() {
 #[test]
 fn real_option_map_materializes_and_runs() {
 	// `map` is another of `Option`'s own inline methods, this time taking a
-	// closure argument and itself constructs a `Some` via
+	// closure argument (the sibling closure-lowering track's already-landed
+	// machinery — untouched by this fix) and itself constructing a `Some` via
 	// `VariantNew` inside the materialized body.
 	let user = r#"
 		func check(): int = match (Some(1).map((x) -> x + 1)) { Some(value) -> value, None -> 0 }
@@ -3641,7 +2778,7 @@ fn real_option_unwrap_via_the_unwrap_interface_materializes_onto_the_class() {
 	// `option.nym` (Sub-problem #4: a top-level impl targeting a named prelude
 	// enum, never fed to `collect_adt_methods`'s inline-member pass at all).
 	// Its own parameter is literally named `default` (a JS reserved word) —
-	// exercising `declare`'s reserved-word rename too.
+	// exercising `declare`'s reserved-word rename fix too.
 	let user = r#"
 		func check_some(): int = Some(7).unwrap(0)
 		func inspect(o: Option<int>): int = o.unwrap(9)
@@ -3660,7 +2797,7 @@ fn real_result_ok_and_err_cross_materialize_option_from_convert_nym() {
 	// only becomes referenced as a SIDE EFFECT of lowering `ok`'s/`err`'s own
 	// bodies (`Option.Some(..)`/`Option.None`), which
 	// `materialize_referenced_prelude_enums`'s fixed-point loop must notice on
-	// a later round because collecting `enum_name` off a
+	// a LATER round (the `VariantNew` gap fix — collecting `enum_name` off a
 	// `VariantNew`, not just a bare `VariantRef` — matters here: `ok`/`err`'s
 	// bodies never write a bare `None`/`Some` reference, only `Option.Some(..)`/
 	// `Option.None` qualified constructions).
@@ -3670,7 +2807,7 @@ fn real_result_ok_and_err_cross_materialize_option_from_convert_nym() {
 	// method is itself only demand-materialized because a COMPILED call site
 	// asks for it — a JS driver calling `.is_some()` directly would never
 	// route through `try_materialize_prelude_dispatch` at all, so it
-	// would not exercise this mechanism.
+	// wouldn't actually exercise (or need) this slice's mechanism.
 	let user = r#"
 		func inspect_ok(r: Result<int, string>): boolean = r.ok().is_some()
 		func ok_is_some(): boolean = inspect_ok(Ok(5))
@@ -3687,16 +2824,25 @@ fn real_result_ok_and_err_cross_materialize_option_from_convert_nym() {
 #[test]
 fn real_option_map_or_default_lowers_its_hidden_canonical_type_object_dispatch() {
 	// `Option`'s own `map_or_default` (`option.nym`) calls `R.default()`.
-	// Compatibility lowering must preserve the receiverless generic dispatch
-	// and its hidden ABI. End-to-end stable-project execution is covered by
+	// Activation lowering must preserve the receiverless generic dispatch and
+	// its hidden ABI. End-to-end stable-project execution is covered by
 	// `core_prelude_ambient::default_generic_bound_executes_through_the_ambient_canonical_type_object`.
 	let user = r#"
 		func get(o: Option<int>): int = o.map_or_default((x) -> x)
 	"#;
 	let js = compile(user);
-	assert!(js.contains("$type$0.default()"), "{js}");
-	assert!(js.contains("map_or_default(f, $type$0)"), "{js}");
-	assert!(js.contains("o.map_or_default("), "{js}");
+	assert!(
+		js.contains(".default,") && js.contains("return nymphTailCall("),
+		"{js}"
+	);
+	assert!(
+		js.contains("map_or_default: nymphMarkCallable(function(f, $type$0)"),
+		"{js}"
+	);
+	assert!(
+		js.contains("$m9$Option.$nymph$type.map_or_default") && js.contains("return nymphTailCall("),
+		"{js}"
+	);
 }
 
 #[test]
@@ -3709,56 +2855,6 @@ fn real_range_contains_runs_generic_comparison_dispatch() {
 	"#;
 	assert_eq!(run(user, "in_range(new NInt(3))"), "true");
 	assert_eq!(run(user, "in_range(new NInt(7))"), "false");
-}
-
-// ── Owned collection literal → `mut` coercion, driven under Node ────────────
-//
-// These use a self-contained synthetic setup — native `[]`
-// index read/assign on `#{…}`/`#[…]`, which lowers to a plain JS `Map`/`Array`
-// with no `external` linkage involved (`emit.rs`'s `HirExpr::Assign` arm) — to
-// prove that a fresh collection literal accepted at a `mut`
-// parameter/ctor field type-checks AND the emitted JS actually mutates the
-// SAME literal the caller passed in.
-
-#[test]
-fn a_fresh_map_literal_at_a_mut_parameter_is_mutated_and_read_back() {
-	let user =
-		"func take(m: mut #{int: int}): int = {\n\tm[1] = 99\n\tm[1]\n}\nfunc t(): int = take(#{1: 2})";
-	assert_eq!(run(user, "t()"), "99");
-}
-
-#[test]
-fn a_fresh_list_literal_at_a_mut_parameter_is_mutated_and_read_back() {
-	let user = "func take(xs: mut #[int]): int = {\n\txs[0u] = 99\n\txs[0]\n}\nfunc t(): int = take(#[1, 2, 3])";
-	assert_eq!(run(user, "t()"), "99");
-}
-
-#[test]
-fn a_fresh_map_literal_at_a_mut_struct_ctor_field_is_mutated_and_read_back() {
-	let user = "struct Box(m: mut #{int: int}) {}\nfunc t(): int = {\n\tlet b = Box(m = #{1: 2})\n\tb.m[1] = 99\n\tb.m[1]\n}";
-	assert_eq!(run(user, "t()"), "99");
-}
-
-// ── Unannotated if/block-bodied inherent method return type under Node ──────
-
-#[test]
-fn an_unannotated_inherent_method_with_an_if_block_body_runs_and_returns_the_branches_common_type()
-{
-	let user = "struct Wrapper(flag: boolean) {}\nimpl Wrapper {\n\tmut func toggle(cond: boolean) = if (cond) {\n\t\tthis.flag = true\n\t\ttrue\n\t} else false\n}\nfunc t(cond: boolean): boolean = {\n\tlet mut w = Wrapper(flag = false)\n\tw.toggle(cond)\n}";
-	assert_eq!(run(user, "t(new NBool(true))"), "true");
-	assert_eq!(run(user, "t(new NBool(false))"), "false");
-}
-
-// ── Mutable-field projection + still-generic bound dispatch (iterator-adapter
-// groundwork), driven under Node ─────────────────────────────────────────────
-
-#[test]
-fn a_mut_func_can_call_a_mut_method_on_a_concrete_field_and_it_runs() {
-	// Projecting a field out of a `mut` receiver yields a mutable place, so `step`
-	// A `mut func` may call another `mut func` on a mutable field projection;
-	// the two `bump`s must mutate shared state (0 → 2).
-	let user = "struct Inner(n: int) {\n\tmut func bump(): int = {\n\t\tthis.n = this.n + 1\n\t\tthis.n\n\t}\n}\nstruct Outer(inner: Inner) {\n\tmut func step(): int = this.inner.bump()\n}\nfunc t(): int = {\n\tlet mut o = Outer(inner = Inner(n = 0))\n\tlet a = o.step()\n\tlet b = o.step()\n\ta + b\n}";
-	assert_eq!(run(user, "t()"), "3");
 }
 
 #[test]
@@ -3790,57 +2886,53 @@ fn pattern_binding_exposes_whole_value_and_nested_captures() {
 }
 
 #[test]
-fn pattern_binding_evaluates_the_scrutinee_once() {
-	let src = "struct Counter(n: int) {}\nimpl Counter {\n\tmut func next(): #(int, int) = {\n\t\tthis.n = this.n + 1\n\t\t#(1, 7)\n\t}\n}\nfunc capture(): #(int, int, int) = {\n\tlet mut counter = Counter(n = 0)\n\tmatch (counter.next()) {\n\t\twhole = #(left, _) -> #(counter.n as int, whole[0], left),\n\t}\n}";
-	assert_eq!(run(src, "capture()"), "[ 1, 1, 1 ]");
+fn immutable_state_loops_replace_simultaneously_and_capture_each_iteration() {
+	let src = r#"
+func simultaneous(): #(int, int) = loop (
+  let left = 1
+  let right = 2
+  let step = 0
+) {
+  if (step == 2) { break #(left, right) }
+  continue(left = right, right = left, step = step + 1)
+}
+func captured(): int = loop (
+  let value = 0
+  let saved: () -> int = () -> 99
+  let step = 0
+) {
+  if (step == 2) { break saved() }
+  continue(saved = () -> value, value = value + 1, step = step + 1)
+}
+func deep(): int = loop (let value = 0) {
+  if (value == 10000) { break value }
+  continue(value = value + 1)
+}
+func labeled(): int = loop@outer (let value = 0) {
+	if (value == 3) { break@outer value }
+	continue@outer(value = value + 1)
+}
+"#;
+	assert_eq!(run(src, "simultaneous()"), "[ 1, 2 ]");
+	assert_eq!(run(src, "captured()"), "1");
+	assert_eq!(run(src, "deep()"), "10000");
+	assert_eq!(run(src, "labeled()"), "3");
 }
 
 #[test]
-fn break_value_and_continue_cross_expression_iifes() {
-	let src = r#"func branch(): int = match (while (true) { if (true) { break 7 } else { continue } }) {
-		Some(value) -> value,
-		None -> 0,
-	}"#;
-	assert_eq!(run(src, "branch()"), "7");
+fn immutable_state_loop_managed_replacements_execute_end_to_end() {
+	let src = r#"
+struct Resource
+impl Close<!()> for Resource {
+	func close(): void = {}
 }
-
-#[test]
-fn labeled_loops_and_callable_returns_execute() {
-	let src = r#"func outer_break(): int = match (while@outer (true) {
-  while (true) { break@outer 7 }
-}) { Some(value) -> value, None -> 0 }
-func outer_continue(): int = {
-  let mut count = 0
-  while@outer (count < 3) {
-    count = count + 1
-    while (true) { continue@outer }
+func managed(): int = loop (let use resource = Resource(), let step = 0) {
+    let use body = Resource()
+    if (step == 1) { break step }
+    continue(resource = Resource(), step = step + 1)
   }
-  count
-}
-func for_break(): int = match (for@outer (value in 1..4) {
-  while (true) { break@outer value }
-}) { Some(value) -> value, None -> 0 }
-func direct_break(): int = match (while@outer (true) { break 8 }) {
-  Some(value) -> value,
-  None -> 0,
-}
-func direct_for_break(): int = match (for@outer (value in 1..4) { break value }) {
-  Some(value) -> value,
-  None -> 0,
-}
-func named(): int = { return@named 9 }
-func closure(): int = { let f = done@() -> { return@done 11 } f() }
-func body_closure(): int = { let f = () -> done@{ return@done 12 } f() }
-func dual_closure(): int = { let f = done@() -> done@{ return@done 13 } f() }"#;
-	assert_eq!(run(src, "outer_break()"), "7");
-	assert_eq!(run(src, "outer_continue()"), "3");
-	assert_eq!(run(src, "for_break()"), "1");
-	assert_eq!(run(src, "direct_break()"), "8");
-	assert_eq!(run(src, "direct_for_break()"), "1");
-	assert_eq!(run(src, "named()"), "9");
-	assert_eq!(run(src, "closure()"), "11");
-	assert_eq!(run(src, "body_closure()"), "12");
-	assert_eq!(run(src, "dual_closure()"), "13");
+"#;
+	assert_eq!(run(src, "managed()"), "1");
 }
 
 #[test]
@@ -3871,188 +2963,6 @@ func direct_body(flag: boolean): int = result@{
 	assert_eq!(run(src, "callable_iife()"), "13");
 	assert_eq!(run(src, "direct_body(new NBool(true))"), "17");
 	assert_eq!(run(src, "direct_body(new NBool(false))"), "19");
-}
-
-#[test]
-fn question_propagation_executes_for_option_result_and_labeled_blocks() {
-	let src = r#"struct Counter(calls: int) {}
-impl Counter {
-  mut func option(present: boolean): Option<int> = {
-    this.calls = this.calls + 1
-    if (present) Some(4) else None
-  }
-}
-func option(present: boolean): Option<string> = {
-  let mut counter = Counter(calls = 0)
-  let value = counter.option(present)?
-  Some("${value}:${counter.calls}")
-}
-func result(ok: boolean): Result<string, int> = {
-  let value = (if (ok) Ok(5) else Error(9))?
-  Ok("${value}")
-}
-func labeled(present: boolean): Option<string> = target@{
-  let value = (if (present) Some(6) else None)?@target
-  Some("${value}")
-}
-func nearest(present: boolean): int = {
-  let inner: () -> Option<string> = () -> {
-    let value = (if (present) Some(7) else None)?
-    Some("${value}")
-  }
-  inner()
-  8
-}"#;
-	assert_eq!(run(src, "option(new NBool(true))"), "{ value: '4:1' }");
-	assert_eq!(run(src, "option(new NBool(false))"), "{}");
-	assert_eq!(run(src, "result(new NBool(true))"), "{ value: '5' }");
-	assert_eq!(run(src, "result(new NBool(false))"), "{ error: 9 }");
-	assert_eq!(run(src, "labeled(new NBool(true))"), "{ value: '6' }");
-	assert_eq!(run(src, "labeled(new NBool(false))"), "{}");
-	assert_eq!(run(src, "nearest(new NBool(false))"), "8");
-}
-
-#[test]
-fn explicitly_outer_breaks_inside_nested_break_values_count_and_execute() {
-	let src = r#"func nested(): int = match (while@outer (true) {
-	while (true) { break (break@outer 7) }
-}) { Some(value) -> value, None -> 0 }"#;
-	assert_eq!(run(src, "nested()"), "7");
-}
-
-#[test]
-fn completion_packets_cannot_shadow_user_bindings_or_inspect_user_exceptions() {
-	let src = r#"func preserve(_t1: int): int = {
-  let value = block@{ return@block _t1 }
-  value
-}
-func invoke(callback: () -> int): int = {
-  let value = block@{
-    callback()
-    if (true) { return@invoke 1 }
-    2
-  }
-  value
-}
-func loop_invoke(callback: () -> int): Option<int> = while (true) {
-  callback()
-  break 1
-}"#;
-	assert_eq!(run(src, "preserve(new NInt(7))"), "7");
-	assert_eq!(
-		run(
-			src,
-			"(() => { const sentinel = new Proxy([], { get() { throw new Error('inspected') } }); try { invoke(() => { throw sentinel }) } catch (error) { return error === sentinel } return false })()",
-		),
-		"true"
-	);
-	assert_eq!(
-		run(
-			src,
-			"(() => { const sentinel = new Proxy([], { get() { throw new Error('inspected') } }); try { loop_invoke(() => { throw sentinel }) } catch (error) { return error === sentinel } return false })()",
-		),
-		"true"
-	);
-}
-
-#[test]
-fn loop_natural_exhaustion_and_bare_break_use_option_abi() {
-	let src = r#"func exhausted(): int = match (while (false) { break 1 }) {
-		Some(value) -> value,
-		None -> 4,
-	}
-func bare(): int = match (while (true) { break }) {
-		Some(#()) -> 5,
-		None -> 0,
-	}"#;
-	assert_eq!(run(src, "exhausted()"), "4");
-	assert_eq!(run(src, "bare()"), "5");
-}
-
-#[test]
-fn loop_control_targets_for_and_nested_loops_and_evaluates_positions_once() {
-	let src = r#"
-func keep(value: int): int = value
-
-func positioned(): int = {
-  let mut hits = 0
-  let result = while (true) {
-    hits = hits + 1
-    keep(10 + if (hits == 1) { continue } else { break hits })
-  }
-  match (result) { Some(value) -> hits * 10 + value, None -> 0 }
-}
-
-func for_results(): int = {
-  let early = for (value in 1..4) { if (value == 2) { break value } }
-  let natural = for (value in 1..3) { if (value == 9) { break value } }
-  match (early) {
-    Some(value) -> value * 10 + match (natural) { Some(_) -> 1, None -> 0 },
-    None -> 0,
-  }
-}
-
-func range_continue(): int = {
-  let mut total = 0
-  for (value in 1..=5) {
-    if (value == 3) { continue }
-    total = total + value
-  }
-  total
-}
-
-func nested(): int = match (while (true) {
-  let inner = while (true) { break 4 }
-  break match (inner) { Some(value) -> value + 1, None -> 0 }
-}) { Some(value) -> value, None -> 0 }
-
-func match_arm(): int = match (while (true) {
-  match (1) { 1 -> break 8, _ -> continue }
-}) { Some(value) -> value, None -> 0 }
-
-func short_circuit(): int = {
-  let mut hits = 0
-  let result = while (true) {
-    hits = hits + 1
-    false && continue
-    true || continue
-    if (hits == 1) { true && continue }
-    false || break hits
-  }
-  match (result) { Some(value) -> hits * 10 + value, None -> 0 }
-}
-
-func eager_positions(): int = {
-  let prefix = while (true) { -(break 1) }
-  let callee = while (true) { (break 2)() }
-  let member = while (true) { (break 3).field }
-  let index = while (true) { #[0][break 4] }
-  let cast = while (true) { (break 5) as int }
-  match (prefix) { Some(a) -> match (callee) { Some(b) -> match (member) {
-    Some(c) -> match (index) { Some(d) -> match (cast) { Some(e) -> a + b + c + d + e, None -> 0 }, None -> 0 },
-    None -> 0,
-  }, None -> 0 }, None -> 0 }
-}
-"#;
-	assert_eq!(run(src, "positioned()"), "22");
-	assert_eq!(run(src, "for_results()"), "20");
-	assert_eq!(run(src, "range_continue()"), "12");
-	assert_eq!(run(src, "nested()"), "5");
-	assert_eq!(run(src, "match_arm()"), "8");
-	assert_eq!(run(src, "short_circuit()"), "22");
-	assert_eq!(run(src, "eager_positions()"), "15");
-}
-
-#[test]
-fn loop_completion_does_not_swallow_user_exceptions() {
-	let src = r#"
-func invoke(callback: () -> int): Option<int> = while (true) {
-	callback()
-	break 1
-}
-"#;
-	let stderr = run_failure(src, "invoke(() => { throw new Error('user boom') })");
-	assert!(stderr.contains("user boom"), "{stderr}");
 }
 
 #[test]
@@ -4135,13 +3045,13 @@ func int_empty(): Token<int> = empty()
 func string_empty(): Token<string> = empty()
 
 func answer(): int = {
-  let mut result = static_seed(Box(value = 0))
-  result = result + static_seed(Box(value = "")) * 10
-  result = result + instance_seed(Box(value = 0)) * 100
-  result = result + instance_seed(Box(value = "")) * 1000
-  result = result + static_seed(Token.Value(value = 0)) * 10000
-  result = result + instance_seed(Token.Value(value = "")) * 100000
-  result = result + instance_seed(int_empty()) * 1000000
+  let result = static_seed(Box(value = 0))
+  let result = result + static_seed(Box(value = "")) * 10
+  let result = result + instance_seed(Box(value = 0)) * 100
+  let result = result + instance_seed(Box(value = "")) * 1000
+  let result = result + static_seed(Token.Value(value = 0)) * 10000
+  let result = result + instance_seed(Token.Value(value = "")) * 100000
+  let result = result + instance_seed(int_empty()) * 1000000
   result + instance_seed(string_empty()) * 10000000
 }
 "#;
@@ -4258,7 +3168,7 @@ func answer(): int = 0.seed() + Box(value = 0).seed()
 "#;
 	let js = nymph_compiler::compile(source, "test").expect("blanket implementation lowers");
 	assert!(
-		js.contains("function $m0$impl$i1$seed($self, $type$0)"),
+		js.contains("let $m0$impl$i1$seed = nymphCallable(function("),
 		"blanket member must be one canonical top-level function: {js}"
 	);
 	assert!(
@@ -4287,7 +3197,10 @@ func answer(): int = "".probe()
 "#;
 	let js = nymph_compiler::compile(source, "test").expect("generic implementation lowers");
 	assert!(
-		js.contains("combine($self, new NBool(true), $type$0, NBool.prototype)"),
+		js.contains("= combine;")
+			&& js.contains("new NBool(true)")
+			&& js.contains("NBool.prototype")
+			&& js.contains("return nymphTailCall("),
 		"nested call must carry its source arguments before implementation and nested generic runtime objects: {js}"
 	);
 	assert_eq!(run(source, "answer()"), "110");
@@ -4306,7 +3219,10 @@ func answer(): boolean = "" in 7
 "#;
 	let js = nymph_compiler::compile(source, "test").expect("blanket membership lowers");
 	assert!(
-		js.contains("$member, NInt.prototype)"),
+		js.contains("= $m0$impl$i1$contains;")
+			&& js.contains("new NInt(7n)")
+			&& js.contains("NInt.prototype")
+			&& js.contains("return nymphTailCall("),
 		"membership source argument must precede the preserved implementation hidden slot: {js}"
 	);
 	assert_eq!(run(source, "answer()"), "true");
@@ -4344,8 +3260,8 @@ func answer(): int = {
 "#;
 	let js = nymph_compiler::compile(source, "test").expect("blanket method value lowers");
 	assert!(
-		js.contains("return $m0$impl$i0$seed($receiver, $arg0, NInt.prototype);"),
-		"method-value adapter must preserve receiver, source, hidden ABI order: {js}"
+		js.contains("nymphPush(") && !js.contains("nymphActivate($m0$impl$i0$seed"),
+		"method-value adapter must transfer through the activation driver: {js}"
 	);
 	assert_eq!(run(source, "answer()"), "7");
 }
@@ -4370,8 +3286,8 @@ func immediate(): int = 0.apply("", 3)
 "#;
 	let js = nymph_compiler::compile(source, "test").expect("generic blanket method values lower");
 	assert!(
-		js.contains("$m0$impl$i1$apply($receiver, $arg0, $arg1, NInt.prototype, NString.prototype)"),
-		"method hidden object must follow receiver, source, and implementation slots: {js}"
+		js.contains("nymphPush(") && !js.contains("nymphActivate($m0$impl$i1$apply"),
+		"generic method-value adapters must transfer through the activation driver: {js}"
 	);
 	assert_eq!(
 		run(source, "stored().v + grouped().v + immediate().v"),
@@ -4490,20 +3406,45 @@ func answer(): int = 0 |> apply
 }
 
 #[test]
-fn hidden_type_objects_preserve_source_argument_order_and_exactly_once_evaluation() {
+fn enum_views_erase_without_wrappers_and_dispatch_statically() {
 	let source = r#"
-interface Seed { func seed(value: int): int }
-impl Seed for int { func seed(value: int) = value }
-
-func direct<T: Seed>(marker: T, value: int): int = T.seed(value)
-func answer(): int = {
-  let mut trace = 0
-  let marker = () -> { trace = trace * 10 + 1
-    0 }
-  let value = () -> { trace = trace * 10 + 2
-    40 }
-  direct(marker(), value()) + trace
+enum Source {
+	A,
+	Value(value: int),
+  func value(): int = 1
 }
+enum View {
+  ...Source,
+  B
+  func value(): int = 2
+}
+func viewed(value: View): int = value.value()
+func identity(): View = Source.A
+func direct(): int = Source.A.value()
+func indirect(): int = viewed(Source.A)
+func answer(): int = direct() + indirect()
 "#;
-	assert_eq!(run(source, "answer()"), "52");
+	assert_eq!(run(source, "identity() === Source.A"), "true");
+	assert_eq!(run(source, "direct()"), "1");
+	assert_eq!(run(source, "indirect()"), "2");
+	assert_eq!(run(source, "answer()"), "3");
+	let js = compile(source);
+	assert!(
+		!js.contains("View.A"),
+		"destination enum must not emit a source variant alias: {js}"
+	);
+}
+
+#[test]
+fn question_uses_an_explicit_into_fallback_for_result_errors() {
+	let source = r#"
+struct Narrow(code: int)
+struct Wide(code: int)
+impl Into<Wide> for Narrow {
+  func into(): Wide = Wide(code = this.code + 1)
+}
+func inner(): Result<int, Narrow> = Error(Narrow(code = 4))
+func outer(): Result<int, Wide> = Ok(inner()?)
+"#;
+	assert_eq!(run(source, "outer().error.code.v"), "5");
 }

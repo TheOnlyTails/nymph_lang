@@ -1,4 +1,4 @@
-//! Tests that built-in arithmetic, bitwise, and
+//! Phase-scoped tests for slice #10a: built-in arithmetic, bitwise, and
 //! relational operators unwrap their boxed operands, use the native JS fast
 //! path, and re-box the result in the checker-resolved output type.
 
@@ -10,6 +10,11 @@ use nymph_compiler::compile;
 
 fn emit_js(src: &str) -> String {
 	compile(src, "test").unwrap_or_else(|diags| panic!("unexpected diagnostics: {diags:?}"))
+}
+
+fn has_emitted_line(js: &str, parts: &[&str]) -> bool {
+	js.lines()
+		.any(|line| parts.iter().all(|part| line.contains(part)))
 }
 
 fn run_node(js: &str) -> String {
@@ -47,7 +52,7 @@ fn run(src: &str, expr: &str) -> String {
 fn int_addition_unwraps_and_reboxes_as_nint() {
 	let js = emit_js("func add(a: int, b: int): int = a + b");
 	assert!(
-		js.contains("new NInt(a.v + b.v)"),
+		has_emitted_line(&js, &["new NInt(", ".v + ", ".v)"]),
 		"int addition uses the boxed built-in fast path: {js}"
 	);
 }
@@ -61,19 +66,22 @@ fn uint_arithmetic_retypes_an_unsuffixed_int_literal() {
 		 func increment(value: float): float = value + 1",
 	);
 	assert!(
-		js.contains("new NUint(index.v - new NUint(1).v)"),
+		has_emitted_line(&js, &["new NUint(", ".v - new NUint(1n).v)"]),
 		"a right-hand literal inherits the uint operand type: {js}"
 	);
 	assert!(
-		js.contains("new NUint(new NUint(1).v + index.v)"),
+		has_emitted_line(&js, &["new NUint(new NUint(1n).v + ", ".v)"]),
 		"a left-hand literal inherits the uint operand type: {js}"
 	);
 	assert!(
-		js.contains("new NFloat(value.v / new NUint(2).v)"),
+		has_emitted_line(
+			&js,
+			&["new NFloat(nymphCheckedDivide(", ".v, new NUint(2n).v))"],
+		),
 		"uint division by an inherited literal still produces a float: {js}"
 	);
 	assert!(
-		js.contains("new NFloat(value.v + new NFloat(1).v)"),
+		has_emitted_line(&js, &["new NFloat(", ".v) + ", "new NFloat(1).v)"],),
 		"an unsuffixed literal inherits a float operand type: {js}"
 	);
 }
@@ -85,11 +93,11 @@ fn negative_literals_and_int_values_stay_signed_in_uint_arithmetic() {
 		 func add_offset(index: uint, offset: int): int = index + offset",
 	);
 	assert!(
-		js.contains("new NInt(index.v + new NInt(-new NInt(1).v).v)"),
+		has_emitted_line(&js, &["new NInt(", ".v + new NInt(-1n).v)"]),
 		"a negated literal remains signed: {js}"
 	);
 	assert!(
-		js.contains("new NInt(index.v + offset.v)"),
+		has_emitted_line(&js, &["new NInt(", ".v + ", ".v)"]),
 		"an int value remains signed: {js}"
 	);
 }
@@ -98,7 +106,7 @@ fn negative_literals_and_int_values_stay_signed_in_uint_arithmetic() {
 fn division_reboxes_in_the_resolved_float_output_type() {
 	let js = emit_js("func divide(a: int, b: int): float = a / b");
 	assert!(
-		js.contains("new NFloat(a.v / b.v)"),
+		has_emitted_line(&js, &["new NFloat(nymphCheckedDivide(", ".v, ", ".v))"]),
 		"division follows its resolved float Output type: {js}"
 	);
 }
@@ -106,15 +114,22 @@ fn division_reboxes_in_the_resolved_float_output_type() {
 #[test]
 fn late_resolved_integral_division_reboxes_as_nfloat() {
 	let js = emit_js(
-		"func divide(): float = {
-			let xs = #[]
+		"func defer<T>(): T = defer()
+		func divide(): float = {
+			let xs = #[defer()]
 			let result = xs[0u] / xs[0u]
 			let pin: int = xs[0u]
 			result
 		}",
 	);
 	assert!(
-		js.contains("new NFloat(xs.index(") && js.contains(").v / xs.index(") && js.contains(").v)"),
+		has_emitted_line(
+			&js,
+			&[
+				"new NFloat(nymphCheckedDivide(",
+				".indexDirect(new NUint(0n)).v"
+			],
+		),
 		"late-resolved integral division follows its float Output type: {js}"
 	);
 }
@@ -123,21 +138,21 @@ fn late_resolved_integral_division_reboxes_as_nfloat() {
 fn relational_operators_rebox_as_nbool() {
 	let js = emit_js("func less(a: int, b: int): boolean = a < b");
 	assert!(
-		js.contains("new NBool(a.v < b.v)"),
+		has_emitted_line(&js, &["new NBool(", ".v < ", ".v)"]),
 		"primitive comparison produces a boxed boolean: {js}"
 	);
 }
 
 #[test]
-fn non_primitive_equality_uses_identity() {
+fn non_primitive_equality_uses_equals() {
 	let src = "struct Point(x: int)
 		impl Equals<Other = Point> for Point { func equals(other: Point): boolean = true }
 		func distinct(): boolean = Point(x = 1) == Point(x = 1)
 		func identical(): boolean = { let p = Point(x = 1) p == p }
 		func different(): boolean = Point(x = 1) != Point(x = 2)";
-	assert_eq!(run(src, "distinct().v"), "false");
+	assert_eq!(run(src, "distinct().v"), "true");
 	assert_eq!(run(src, "identical().v"), "true");
-	assert_eq!(run(src, "different().v"), "true");
+	assert_eq!(run(src, "different().v"), "false");
 }
 
 #[test]
@@ -157,34 +172,36 @@ fn explicit_not_equals_call_uses_the_override() {
 #[test]
 fn late_resolved_primitive_equality_compares_payloads() {
 	let js = emit_js(
-		"func same(): boolean = {
-			let xs = #[]
+		"func defer<T>(): T = defer()
+		func same(): boolean = {
+			let xs = #[defer()]
 			let result = xs[0u] == xs[0u]
 			let pin: int = xs[0u]
 			result
 		}",
 	);
 	assert!(
-		js.contains(").v === xs.index(") && js.contains(").v)"),
+		has_emitted_line(&js, &["new NBool(", ".indexDirect(", ".v === ", ".v)"]),
 		"late-resolved primitive equality compares boxed payloads: {js}"
 	);
 }
 
 #[test]
-fn late_resolved_adt_equality_uses_identity() {
+fn late_resolved_adt_equality_uses_equals() {
 	let js = emit_js(
-		"struct Point(x: int)
+		"func defer<T>(): T = defer()
+		struct Point(x: int)
 		impl Equals<Other = Point> for Point { func equals(other: Point): boolean = true }
 		func same(): boolean = {
-			let xs = #[]
+			let xs = #[defer()]
 			let result = xs[0u] == xs[0u]
 			let pin: #[Point] = xs
 			result
 		}",
 	);
 	assert!(
-		js.contains("xs.index(") && js.contains(" === xs.index("),
-		"late-resolved ADT equality compares identity: {js}"
+		js.contains(".indexDirect(") && has_emitted_line(&js, &["nymphPush(", ".equals"]),
+		"late-resolved ADT equality dispatches through Equals: {js}"
 	);
 }
 
@@ -192,40 +209,18 @@ fn late_resolved_adt_equality_uses_identity() {
 fn numeric_prefix_operators_unwrap_and_rebox() {
 	let js = emit_js("func negate(x: int): int = -x\nfunc invert(x: int): int = ~x");
 	assert!(
-		js.contains("new NInt(-x.v)"),
+		has_emitted_line(&js, &["new NInt(-", ".v)"]),
 		"negation reboxes as NInt: {js}"
 	);
 	assert!(
-		js.contains("new NInt(~x.v)"),
+		has_emitted_line(&js, &["new NInt(~", ".v)"]),
 		"bit-not reboxes as NInt: {js}"
 	);
 }
 
 #[test]
-fn compound_assignment_uses_the_target_type_for_reboxing() {
-	let src = "func f(): int = { let mut x = 2 x += 3 x }";
-	let js = emit_js(src);
-	assert!(
-		js.contains("x = new NInt(x.v + new NInt(3).v)"),
-		"compound assignment reboxes its inner operation as the target type: {js}"
-	);
-	assert_eq!(run(src, "f().v"), "5");
-}
-
-#[test]
-fn compound_assignment_preserves_the_checker_selected_uint_type() {
-	let src = "func f(): uint = { let mut x = 2u x += 3u x }";
-	let js = emit_js(src);
-	assert!(
-		js.contains("x = new NUint(x.v + new NUint(3).v)"),
-		"compound assignment reboxes its inner operation as the target type: {js}"
-	);
-	assert_eq!(run(src, "f().v"), "5");
-}
-
-#[test]
 fn boxed_builtin_operators_execute_under_node() {
 	assert_eq!(run("func f(): float = (5 + 3) / 2", "f().v"), "4");
-	assert_eq!(run("func f(): int = if (2 < 3) 7 else 9", "f().v"), "7");
-	assert_eq!(run("func f(): int = -(~5)", "f().v"), "6");
+	assert_eq!(run("func f(): int = if (2 < 3) 7 else 9", "f().v"), "7n");
+	assert_eq!(run("func f(): int = -(~5)", "f().v"), "6n");
 }

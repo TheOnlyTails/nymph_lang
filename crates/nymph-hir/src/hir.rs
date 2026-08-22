@@ -1,6 +1,6 @@
-//! The mid-level typed IR consumed by code generation. Most nodes are deliberately
-//! type-free because JavaScript has a single numeric representation; nodes retain
-//! type information only where runtime representation or dispatch requires it.
+//! The mid-level IR consumed by code generation. It carries the representation
+//! choices emission cannot recover, including exact fixed-width integers,
+//! built-in operator results, and external marshalling plans.
 
 use ecow::EcoString;
 use rustc_hash::FxHashSet;
@@ -41,14 +41,13 @@ impl HirModule {
 	}
 }
 
-/// A top-level `let`/`let mut` binding → a module-scope `const`/`let` declaration.
-/// Kept in source order relative to other top-level lets; emitted
+/// A top-level `let` binding → a module-scope `const` declaration. Kept in source
+/// order relative to other top-level lets; emitted
 /// after classes/enums (so a let constructing/referencing one is safe) and before
 /// functions (whose JS `function` declarations hoist regardless of placement).
 #[derive(Clone, Debug, PartialEq)]
 pub struct HirLet {
 	pub name: EcoString,
-	pub mutable: bool,
 	pub value: HirExpr,
 }
 
@@ -59,8 +58,11 @@ pub struct HirLet {
 pub struct HirClass {
 	pub name: EcoString,
 	pub fields: Vec<EcoString>,
+	/// Owner-defined field defaults, in declaration order. Constructors apply
+	/// these only when the incoming object does not own the field.
+	pub defaults: Vec<(EcoString, HirExpr)>,
 	pub methods: Vec<HirMethod>,
-	/// `namespace func` static functions → JS `static` class methods.
+	/// `namespace func` static functions (Slice 4J) → JS `static` class methods.
 	/// A separate list, not a flag on `HirMethod`: JS legally allows a static and
 	/// an instance method sharing one name (they live in different tables), so
 	/// keeping them in separate lists keeps `assert_no_duplicate_methods`'
@@ -86,7 +88,7 @@ pub struct HirEnum {
 	pub name: EcoString,
 	pub variants: Vec<HirVariant>,
 	pub methods: Vec<HirMethod>,
-	/// `namespace func` static functions. Unlike a struct's
+	/// `namespace func` static functions (Slice 4J). Unlike a struct's
 	/// `statics`, these become OBJECT-level method properties on the IIFE's
 	/// returned object (not `proto`-level): call sites emit `E.func(..)` against
 	/// the object `E` itself, and `proto` is only reachable through a
@@ -125,16 +127,18 @@ pub enum HirBoundDispatchTarget {
 	Extern {
 		module: &'static str,
 		symbol: &'static str,
+		call_mode: ExternalCallMode,
 	},
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HirStmt {
-	/// `let`/`mut` binding. `mutable` selects JS `let` vs `const`.
+	/// An immutable `let` binding.
 	Let {
 		name: EcoString,
-		mutable: bool,
 		value: HirExpr,
+		/// Exact checker-selected `Close.close` call for `let use`.
+		cleanup: Option<HirExpr>,
 	},
 	/// A bare expression evaluated for its effect.
 	Expr(HirExpr),
@@ -158,6 +162,44 @@ pub enum HirReturnTarget {
 
 pub type LoopTarget = u32;
 
+/// How a generated Nymph call advances the current activation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HirCallMode {
+	/// Push a frame and resume the caller with the result.
+	Push,
+	/// Unwind the current frame and replace it without growing the logical stack.
+	Tail,
+}
+
+/// Whether a cold task recipe inherits its driving context or establishes a
+/// nested structured join scope. This is execution policy, not a host-backend
+/// representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HirTaskContext {
+	Inherited,
+	Nested,
+}
+
+/// Backend-neutral operations on cold task recipes and execution handles.
+/// Promise scheduling, cancellation controllers, and host adapter arguments
+/// remain private to the selected runtime backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum HirTaskOperation {
+	Drive,
+	Spawn,
+	Observe,
+	Cancel,
+	Checkpoint,
+	Select,
+	Race,
+}
+
+impl HirTaskOperation {
+	pub const fn suspends(self) -> bool {
+		matches!(self, Self::Drive | Self::Observe | Self::Checkpoint)
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HirOptionAbi {
 	pub enum_name: EcoString,
@@ -166,19 +208,21 @@ pub struct HirOptionAbi {
 	pub none: EcoString,
 }
 
-/// The runtime numeric type a boxed numeric value carries — the one piece of
-/// type information codegen needs to pick the right box wrapper class (`NInt` /
-/// `NUint` / `NFloat`) for an otherwise type-free numeric HIR node. HIR is
-/// deliberately type-free (JS has one `number`),
-/// so lowering threads this on from the checker's inferred type at the point it
-/// builds a numeric node; without it emit could not tell `5`, `5u` and `5.0`
-/// apart, all of which lower to the same `f64`.
+/// Canonical nominal ABI used by persistent iterator steps.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HirIterationAbi {
+	pub enum_name: EcoString,
+	pub done: EcoString,
+	pub yield_: EcoString,
+	pub item: EcoString,
+	pub next: EcoString,
+}
+
+/// Whether an `f64` HIR value is a boxed Nymph `float` or a compiler-internal
+/// raw JavaScript number. Integers have separate exact [`HirExpr::Int`] and
+/// [`HirExpr::UInt`] representations and never use this enum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NumKind {
-	/// `int` → boxed as `new NInt(v)`.
-	Int,
-	/// `uint` → boxed as `new NUint(v)`.
-	UInt,
 	/// `float` → boxed as `new NFloat(v)`.
 	Float,
 	/// A compiler-internal raw JS number — NEVER produced from a user literal.
@@ -186,7 +230,7 @@ pub enum NumKind {
 	/// desugared control-flow machinery operates on with native JS arithmetic
 	/// (loop counters `i + 1`, list indices `arr[i]`, `i < arr.length`), not a
 	/// user-visible Nymph value. Boxing these would break the emitted loop
-	/// desugarings, so they stay raw.
+	/// desugarings; they stay raw until a later slice reworks that machinery.
 	Raw,
 }
 
@@ -201,11 +245,16 @@ pub enum BuiltinResult {
 	Char,
 	String,
 	Boolean,
-	/// `==`/`!=` on non-primitives compares object identity directly, then boxes
-	/// the raw comparison result as `NBool`.
-	IdentityBoolean,
 	/// Compiler-generated arithmetic and predicates used by desugarings.
 	Raw,
+}
+
+/// Whether codegen must retain a runtime guard or may emit the direct operation
+/// selected by sema's body-local proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum OperationMode {
+	Checked,
+	Direct,
 }
 
 /// Raw-host-to-boxed-Nymph marshalling performed once for an external let.
@@ -220,23 +269,50 @@ pub enum MarshalKind {
 	List,
 	Tuple,
 	Map,
+	/// A live host reference boxed with its compiler-owned nominal identity.
+	/// The identity is part of the stable ABI plan; backends must reject a box
+	/// minted for any other external type instead of inspecting or repairing it.
+	Opaque(u64),
+}
+
+/// Backend-neutral external invocation mode. A backend may translate the
+/// execution signal into its native cancellation primitive, but only for the
+/// explicitly cancellable ABI.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ExternalCallMode {
+	#[default]
+	Ordinary,
+	Cancellable,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HirExpr {
-	/// Any numeric literal (int/uint/float), tagged with the [`NumKind`] codegen
-	/// boxes it as — all three are the same JS `number` at the payload level.
+	/// An exact fixed-width integer literal. Keeping these separate from
+	/// [`Self::Num`] prevents an integer from travelling through `f64` on its way
+	/// from stable facts to the JavaScript BigInt runtime.
+	Int(i64),
+	UInt(u64),
+	/// A floating-point literal or compiler-internal raw JS number.
 	Num(f64, NumKind),
 	Str(EcoString),
 	/// Cooked string segments and Display-rendered interpolands, concatenated as
 	/// raw JS strings and boxed once by codegen.
 	InterpolatedString(Vec<HirExpr>),
+	/// Render one value through its explicit Display implementation or the
+	/// backend's structural fallback.
+	ProtocolDisplay(Box<HirExpr>),
 	Bool(bool),
 	Char(char),
 	/// Compiler-only placeholder for an erased hidden ABI slot.
 	Undefined,
 	/// An identifier or parameter reference.
 	Local(EcoString),
+	/// A privileged development observation. Release emission replaces this
+	/// node with its operand and retains none of the site data.
+	Echo {
+		operand: Box<HirExpr>,
+		site: EchoSite,
+	},
 	/// Compiler-only canonical runtime type object. This is never a Nymph value:
 	/// it is calling-convention data used by receiverless generic dispatch.
 	RuntimeTypeObject {
@@ -264,12 +340,45 @@ pub enum HirExpr {
 		callee: Box<HirExpr>,
 		args: Vec<HirExpr>,
 	},
-	/// A call to a linked external — a method call that
+	/// A call whose target uses the generated-Nymph activation ABI. External
+	/// adapters deliberately remain [`Self::ExternCall`] and never enter this
+	/// machine. `source` is the stable body-node anchor of the source call.
+	ActivationCall {
+		callee: Box<HirExpr>,
+		args: Vec<HirExpr>,
+		mode: HirCallMode,
+		source: u32,
+	},
+	/// Construct a reusable cold recipe around one generated activation body.
+	/// The runtime supplies the hidden execution frame when an execution starts.
+	TaskRecipe {
+		body: Box<HirExpr>,
+		context: HirTaskContext,
+	},
+	/// Operate on recipes or handles without exposing backend scheduling values
+	/// in HIR. Driving, observing, and checkpoints are explicit suspension
+	/// points; the remaining operations complete synchronously.
+	TaskOperation {
+		operation: HirTaskOperation,
+		operands: Vec<HirExpr>,
+	},
+	/// Invoke an enum method through the receiver's compile-time enum view.
+	/// The value remains the source variant object; only method selection uses
+	/// the view's canonical prototype.
+	StaticEnumDispatch {
+		owner: EcoString,
+		method: EcoString,
+		receiver: Box<HirExpr>,
+		args: Vec<HirExpr>,
+		mode: HirCallMode,
+		source: u32,
+	},
+	/// A call to a LINKED external (Gap 3, L0/L1) — a method call that
 	/// resolved through a prelude `external(name)` marker present in
 	/// [`nymph_hir::linkage::REGISTRY`], instead of the loud "prelude-only
 	/// impl" defer every other `external`/transitively-external body still
 	/// gets. `module`/`symbol` are the ALREADY-RESOLVED [`crate::linkage::Linked`]
-	/// fields — not the bare `external(name)` marker — because `get` is
+	/// fields — not the bare `external(name)` marker — because L1's `get` is
 	/// an AMBIGUOUS marker shared by `List` and `Map` with DIFFERENT JS
 	/// implementations: the only place that knows which receiver's `impl`
 	/// block resolved this call (and can therefore compute the receiver tag
@@ -277,7 +386,7 @@ pub enum HirExpr {
 	/// at the point it decides to build this variant — re-deriving that tag
 	/// from a bare marker at emit time, with only `args[0]`'s already-erased
 	/// HIR to go on, isn't possible. Baking the resolved pair into HIR (rather
-	/// than re-`lookup`-ing by marker in codegen) keeps codegen a
+	/// than re-`lookup`-ing by marker in codegen, as L0 did) keeps codegen a
 	/// dumb consumer instead of a second place that has to re-derive
 	/// receiver-tag disambiguation. `args` is already in `$_this`-FIRST
 	/// order: the receiver lowered first, then the call's own arguments,
@@ -287,6 +396,15 @@ pub enum HirExpr {
 		module: &'static str,
 		symbol: &'static str,
 		args: Vec<HirExpr>,
+		/// Ordinary adapters receive exactly `args`. Cancellable adapters receive
+		/// one backend-provided execution signal after those arguments.
+		call_mode: ExternalCallMode,
+		/// Signature-directed unboxing for each argument. Integer entries cross
+		/// the trusted JavaScript ABI as raw BigInt values; `None` preserves the
+		/// existing boxed Nymph ABI for every other type.
+		argument_marshals: Vec<Option<MarshalKind>>,
+		/// Signature-directed reboxing for a direct integer result.
+		return_marshal: Option<MarshalKind>,
 	},
 	/// A registry-resolved immutable host value. This expression occurs only as
 	/// a canonical module `HirLet` initializer, never at each reference site.
@@ -305,6 +423,8 @@ pub enum HirExpr {
 		argument: Box<HirExpr>,
 		hidden_arguments: Vec<HirExpr>,
 		cases: Vec<HirBoundDispatchCase>,
+		mode: HirCallMode,
+		source: u32,
 	},
 	/// A zero-argument method selected through a still-generic interface bound.
 	/// Like `BoundDispatch`, but dispatch depends only on the receiver's boxed
@@ -315,8 +435,36 @@ pub enum HirExpr {
 		receiver: Box<HirExpr>,
 		hidden_arguments: Vec<HirExpr>,
 		cases: Vec<HirBoundDispatchCase>,
+		mode: HirCallMode,
+		source: u32,
 	},
-	/// A tuple, list, or compiler-internal raw array.
+	/// Persistent list construction. Spread elements retain source evaluation
+	/// order, while the runtime may use one private transient before freezing.
+	ListConstruct(Vec<HirArrayElem>),
+	/// Semantic persistent-list read; trie nodes remain runtime-private.
+	ListRead {
+		recv: Box<HirExpr>,
+		index: Box<HirExpr>,
+		mode: OperationMode,
+	},
+	/// Return a list with one item appended, preserving the receiver.
+	ListAppend {
+		recv: Box<HirExpr>,
+		value: Box<HirExpr>,
+	},
+	/// Return a list with one item replaced, preserving the receiver.
+	ListReplace {
+		recv: Box<HirExpr>,
+		index: Box<HirExpr>,
+		value: Box<HirExpr>,
+	},
+	/// Return a rebased, trimmed structural-sharing slice.
+	ListSlice {
+		recv: Box<HirExpr>,
+		start: Box<HirExpr>,
+		end: Box<HirExpr>,
+	},
+	/// A tuple or compiler-internal raw array.
 	Array {
 		kind: HirArrayKind,
 		items: Vec<HirExpr>,
@@ -332,16 +480,26 @@ pub enum HirExpr {
 	},
 	/// A map literal — emits as a boxed value-equality HAMT.
 	MapLit(Vec<(HirExpr, HirExpr)>),
-	/// A map literal containing at least one spread entry
+	/// A map literal (SS1) containing at least one spread entry
 	/// (`#{...m, k: v}`) — emits as an `NMap` with the spread entries'
 	/// JS `...` syntax preserved in position (a Map merge, later-key-wins,
 	/// since the `Map` constructor processes its entries array in order). A
 	/// spread-free map still lowers to the plain [`HirExpr::MapLit`] above.
 	MapSpread(Vec<HirMapElem>),
-	/// A subscript into a list/tuple — dispatches through its boxed wrapper.
+	/// A subscript into a list, tuple, or Unicode string — dispatches through its boxed wrapper.
 	Index {
 		recv: Box<HirExpr>,
 		index: Box<HirExpr>,
+		mode: OperationMode,
+	},
+	/// A homogeneous list or Unicode string range index.
+	Slice {
+		recv: Box<HirExpr>,
+		start: Option<Box<HirExpr>>,
+		end: Option<Box<HirExpr>>,
+		inclusive: bool,
+		string: bool,
+		mode: OperationMode,
 	},
 	/// A map lookup — emits as `recv.get(key)`.
 	MapGet {
@@ -352,6 +510,17 @@ pub enum HirExpr {
 	New {
 		class: EcoString,
 		fields: Vec<(EcoString, HirExpr)>,
+		prototype: Option<Box<HirExpr>>,
+	},
+	StructFresh {
+		class: EcoString,
+		fields: Vec<(EcoString, HirExpr)>,
+		prototype: Option<Box<HirExpr>>,
+	},
+	StructCloneUpdate {
+		class: EcoString,
+		source: Box<HirExpr>,
+		replacements: Vec<(EcoString, HirExpr)>,
 		prototype: Option<Box<HirExpr>>,
 	},
 	/// Field access — emits as `recv.name`.
@@ -375,6 +544,7 @@ pub enum HirExpr {
 	Binary {
 		op: BinOp,
 		result: BuiltinResult,
+		mode: OperationMode,
 		lhs: Box<HirExpr>,
 		rhs: Box<HirExpr>,
 	},
@@ -382,12 +552,6 @@ pub enum HirExpr {
 		op: UnOp,
 		result: BuiltinResult,
 		operand: Box<HirExpr>,
-	},
-	/// An assignment `target = value`. Compound assignments (`+=`, …) are desugared
-	/// by lowering into `target = target <op> value`, so this is always a plain `=`.
-	Assign {
-		target: Box<HirExpr>,
-		value: Box<HirExpr>,
 	},
 	/// A block: statements then an optional trailing expression (the block's value).
 	Block {
@@ -403,13 +567,24 @@ pub enum HirExpr {
 		then: Box<HirExpr>,
 		otherwise: Option<Box<HirExpr>>,
 	},
-	While {
+	StateLoop {
 		target: LoopTarget,
-		cond: Box<HirExpr>,
+		bindings: Vec<HirStateBinding>,
 		body: Box<HirExpr>,
-		/// Compiler-generated work that must run before a `continue` resumes this
-		/// loop (for example advancing a lowered bounded-range counter).
-		continue_epilogue: Option<Box<HirExpr>>,
+	},
+	/// Persistent iteration remains explicit until the backend selects its loop
+	/// representation. `next` references `iterator_name`; a yielded successor is
+	/// stored into that binding before `body` starts.
+	For {
+		target: LoopTarget,
+		source: u32,
+		iterator_name: EcoString,
+		successor_name: EcoString,
+		iterator: Box<HirExpr>,
+		next: Box<HirExpr>,
+		pat: HirPat,
+		body: Box<HirExpr>,
+		iteration: HirIterationAbi,
 		option: Option<HirOptionAbi>,
 	},
 	Break {
@@ -419,28 +594,27 @@ pub enum HirExpr {
 	Continue {
 		target: LoopTarget,
 	},
+	ContinueTransition {
+		target: LoopTarget,
+		replacements: Vec<(EcoString, HirExpr)>,
+	},
 	/// `match <scrutinee> { <arms> }` — compiled to an if/else-if chain.
 	Match {
 		scrutinee: Box<HirExpr>,
 		arms: Vec<HirArm>,
 	},
-	/// A built-in `as` scalar conversion that needs an actual JS runtime operation,
-	/// not just a value
-	/// pass-through. Identity casts and the remaining same-"JS number" numeric
-	/// casts (`int`/`uint` → `float`, `uint` → `int`, plus `Foo as Foo` for any
-	/// `Foo`) need no node at all — lowering just returns the operand unchanged —
-	/// so this variant only ever wraps the `kind`s below. Kept as a dedicated node
-	/// (rather than composing `Call`/`Field` onto `Local("Math")`/`Local("String")`/
-	/// `Local("Number")`) so a user local of one of those names can never shadow
-	/// the conversion codegen emits (see `emit.rs`).
+	/// A built-in `as` scalar conversion that needs a runtime operation. Keeping
+	/// it as a dedicated node prevents user bindings named `Math`, `String`, or
+	/// `Number` from shadowing conversion helpers emitted by codegen.
 	ScalarCast {
 		kind: ScalarCastKind,
 		operand: Box<HirExpr>,
+		mode: OperationMode,
 	},
 	/// A closure expression (`(x, y) -> x + y`, `x -> x * 2`) — emits as a JS
 	/// arrow function. Captures are free: JS arrows close over their enclosing
-	/// scope by reference, which matches the checker's capture semantics, so no
-	/// explicit capture list is carried here.
+	/// scope by reference, which already matches the checker's own capture
+	/// semantics (Slice 4L), so no explicit capture list is carried here.
 	/// This is a real callable boundary: a `return` in `body` exits this closure,
 	/// including when synthetic expression IIFEs occur inside it.
 	Closure {
@@ -449,10 +623,26 @@ pub enum HirExpr {
 	},
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct HirStateBinding {
+	pub name: EcoString,
+	pub value: HirExpr,
+	pub cleanup: Option<HirExpr>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EchoSite {
+	pub module: EcoString,
+	pub start: u32,
+	pub end: u32,
+}
+
 impl HirExpr {
 	fn collect_runtime_type_references(&self, references: &mut FxHashSet<EcoString>) {
 		match self {
-			Self::Num(..)
+			Self::Int(_)
+			| Self::UInt(_)
+			| Self::Num(..)
 			| Self::Str(_)
 			| Self::Bool(_)
 			| Self::Char(_)
@@ -478,9 +668,27 @@ impl HirExpr {
 			Self::Local(name) => {
 				references.insert(name.clone());
 			}
+			Self::Echo { operand, .. } => operand.collect_runtime_type_references(references),
+			Self::TaskRecipe { body, .. } => body.collect_runtime_type_references(references),
+			Self::TaskOperation { operands, .. } => {
+				for operand in operands {
+					operand.collect_runtime_type_references(references);
+				}
+			}
 			Self::InterpolatedString(items) => collect_exprs(items, references),
-			Self::Call { callee, args } => {
+			Self::ProtocolDisplay(value) => value.collect_runtime_type_references(references),
+			Self::Call { callee, args } | Self::ActivationCall { callee, args, .. } => {
 				callee.collect_runtime_type_references(references);
+				collect_exprs(args, references);
+			}
+			Self::StaticEnumDispatch {
+				owner,
+				receiver,
+				args,
+				..
+			} => {
+				references.insert(owner.clone());
+				receiver.collect_runtime_type_references(references);
 				collect_exprs(args, references);
 			}
 			Self::ExternCall { args, .. } => collect_exprs(args, references),
@@ -502,6 +710,33 @@ impl HirExpr {
 			} => {
 				receiver.collect_runtime_type_references(references);
 				collect_exprs(hidden_arguments, references);
+			}
+			Self::ListConstruct(elems) => {
+				for elem in elems {
+					match elem {
+						HirArrayElem::Item(expr) | HirArrayElem::Spread(expr) => {
+							expr.collect_runtime_type_references(references)
+						}
+					}
+				}
+			}
+			Self::ListRead { recv, index, .. } => {
+				recv.collect_runtime_type_references(references);
+				index.collect_runtime_type_references(references);
+			}
+			Self::ListAppend { recv, value } => {
+				recv.collect_runtime_type_references(references);
+				value.collect_runtime_type_references(references);
+			}
+			Self::ListReplace { recv, index, value } => {
+				recv.collect_runtime_type_references(references);
+				index.collect_runtime_type_references(references);
+				value.collect_runtime_type_references(references);
+			}
+			Self::ListSlice { recv, start, end } => {
+				recv.collect_runtime_type_references(references);
+				start.collect_runtime_type_references(references);
+				end.collect_runtime_type_references(references);
 			}
 			Self::Array { items, .. } => collect_exprs(items, references),
 			Self::ArraySpread { elems, .. } => {
@@ -525,9 +760,20 @@ impl HirExpr {
 					}
 				}
 			}
-			Self::Index { recv, index } => {
+			Self::Index { recv, index, .. } => {
 				recv.collect_runtime_type_references(references);
 				index.collect_runtime_type_references(references);
+			}
+			Self::Slice {
+				recv, start, end, ..
+			} => {
+				recv.collect_runtime_type_references(references);
+				if let Some(start) = start {
+					start.collect_runtime_type_references(references);
+				}
+				if let Some(end) = end {
+					end.collect_runtime_type_references(references);
+				}
 			}
 			Self::MapGet { recv, key } => {
 				recv.collect_runtime_type_references(references);
@@ -537,9 +783,27 @@ impl HirExpr {
 				class,
 				fields,
 				prototype,
+			}
+			| Self::StructFresh {
+				class,
+				fields,
+				prototype,
 			} => {
 				references.insert(class.clone());
 				collect_named(fields, references);
+				if let Some(prototype) = prototype {
+					prototype.collect_runtime_type_references(references);
+				}
+			}
+			Self::StructCloneUpdate {
+				class,
+				source,
+				replacements,
+				prototype,
+			} => {
+				references.insert(class.clone());
+				source.collect_runtime_type_references(references);
+				collect_named(replacements, references);
 				if let Some(prototype) = prototype {
 					prototype.collect_runtime_type_references(references);
 				}
@@ -574,10 +838,6 @@ impl HirExpr {
 			Self::Unary { operand, .. } | Self::ScalarCast { operand, .. } => {
 				operand.collect_runtime_type_references(references)
 			}
-			Self::Assign { target, value } => {
-				target.collect_runtime_type_references(references);
-				value.collect_runtime_type_references(references);
-			}
 			Self::Block { stmts, tail } => {
 				for stmt in stmts {
 					match stmt {
@@ -607,24 +867,40 @@ impl HirExpr {
 					otherwise.collect_runtime_type_references(references);
 				}
 			}
-			Self::While {
-				cond,
+			Self::StateLoop { bindings, body, .. } => {
+				for binding in bindings {
+					binding.value.collect_runtime_type_references(references);
+					if let Some(cleanup) = &binding.cleanup {
+						cleanup.collect_runtime_type_references(references);
+					}
+				}
+				body.collect_runtime_type_references(references);
+			}
+			Self::For {
+				iterator,
+				next,
+				pat,
 				body,
-				continue_epilogue,
+				iteration,
 				option,
 				..
 			} => {
-				cond.collect_runtime_type_references(references);
+				iterator.collect_runtime_type_references(references);
+				next.collect_runtime_type_references(references);
+				pat.collect_runtime_type_references(references);
 				body.collect_runtime_type_references(references);
-				if let Some(epilogue) = continue_epilogue {
-					epilogue.collect_runtime_type_references(references);
-				}
+				references.insert(iteration.enum_name.clone());
 				if let Some(option) = option {
 					references.insert(option.enum_name.clone());
 				}
 			}
 			Self::Break { value, .. } => value.collect_runtime_type_references(references),
 			Self::Continue { .. } => {}
+			Self::ContinueTransition { replacements, .. } => {
+				for (_, value) in replacements {
+					value.collect_runtime_type_references(references);
+				}
+			}
 			Self::Match { scrutinee, arms } => {
 				scrutinee.collect_runtime_type_references(references);
 				for arm in arms {
@@ -700,18 +976,14 @@ pub enum ScalarCastKind {
 	IdentityChar,
 	/// Numeric widening/reinterpretation conversions that only change the box.
 	ToInt,
+	IntToUInt,
 	ToFloat,
-	/// `float as int` — Nymph defines its own float→int semantics rather than
-	/// inheriting `Math.trunc`'s JS passthrough: `NaN` saturates to `0`,
-	/// `Infinity`/`-Infinity` saturate to `i64::MAX`/`i64::MIN` (JS stores the
-	/// former as `2^63`, the nearest `f64` to `2^63 - 1`), and any other (finite)
-	/// value truncates toward zero as before.
-	SaturatingToInt,
-	/// `float as uint` / `int as uint` — like `SaturatingToInt`, but the operand
-	/// is `Math.abs`-ed first: a negative finite value (or a negative `int` being
-	/// cast to `uint`) saturates to its absolute value, and `-Infinity` collapses
-	/// onto the same `Infinity → i64::MAX` branch as `+Infinity`.
-	SaturatingToUInt,
+	/// Checked `float as int`: truncate a finite value toward zero, then reject
+	/// anything outside the signed 64-bit range.
+	CheckedToInt,
+	/// Checked `float as uint`: reject negative, non-finite, fractional, and
+	/// out-of-range values rather than silently wrapping or saturating.
+	CheckedToUInt,
 	/// `char as int`/`char as uint`/`char as float` — `operand.codePointAt(0)`.
 	CharToInt,
 	CharToUInt,
@@ -825,6 +1097,8 @@ impl HirPat {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum HirLit {
+	Int(i64),
+	UInt(u64),
 	Num(f64, NumKind),
 	Bool(bool),
 	Char(char),

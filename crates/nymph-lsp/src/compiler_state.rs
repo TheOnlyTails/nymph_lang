@@ -7,7 +7,8 @@ use std::{
 
 use lsp_types::Uri;
 use nymph_compiler::{
-	CompilerSession, ModuleAnalysis, ModulePath, ProjectDiagnostic, ProjectId, SourceVersion,
+	BuildProfile, CompilerSession, ModuleAnalysis, ModulePath, PackageId, ProjectDiagnostic,
+	ProjectId, SourceVersion,
 };
 use nymph_sema::EntryMode;
 
@@ -20,6 +21,7 @@ use crate::{
 #[derive(Clone)]
 struct DocumentIdentity {
 	project: ProjectId,
+	package: PackageId,
 	module: ModulePath,
 	entry: ModulePath,
 	root: PathBuf,
@@ -31,6 +33,7 @@ impl DocumentIdentity {
 	fn module_identity(&self) -> ModuleIdentity {
 		ModuleIdentity {
 			project: self.project.clone(),
+			package: self.package.clone(),
 			module: self.module.clone(),
 			without_prelude: self.without_prelude,
 		}
@@ -40,6 +43,7 @@ impl DocumentIdentity {
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct ModuleIdentity {
 	project: ProjectId,
+	package: PackageId,
 	module: ModulePath,
 	without_prelude: bool,
 }
@@ -78,6 +82,7 @@ pub struct DiagnosticsSnapshot {
 pub struct AnalysisSnapshot {
 	pub uri: Uri,
 	pub project: ProjectId,
+	pub package: PackageId,
 	pub module: ModulePath,
 	/// Client sequence number used only to suppress responses after a newer
 	/// notification. It is protocol metadata, not an analysis-cache key.
@@ -229,6 +234,19 @@ impl CompilerState {
 			diagnostic_targets: HashMap::new(),
 			diagnostic_owners: HashMap::new(),
 		}
+	}
+
+	pub fn set_build_profile(&mut self, profile: BuildProfile) {
+		self.session.set_build_profile(profile);
+		self.stdlib_session.set_build_profile(profile);
+	}
+
+	#[cfg(test)]
+	pub(crate) fn retained_build_profiles(&self) -> (BuildProfile, BuildProfile) {
+		(
+			self.session.build_profile(),
+			self.stdlib_session.build_profile(),
+		)
 	}
 
 	pub fn open(
@@ -530,6 +548,7 @@ impl CompilerState {
 				Some((
 					identity.root.clone(),
 					identity.project.clone(),
+					identity.package.clone(),
 					identity.without_prelude,
 					module,
 				))
@@ -539,18 +558,23 @@ impl CompilerState {
 			left
 				.0
 				.cmp(&right.0)
-				.then_with(|| left.3.as_str().cmp(right.3.as_str()))
+				.then_with(|| left.4.as_str().cmp(right.4.as_str()))
 		});
 		roots.dedup_by(|left, right| {
-			left.0 == right.0 && left.1 == right.1 && left.2 == right.2 && left.3 == right.3
+			left.0 == right.0
+				&& left.1 == right.1
+				&& left.2 == right.2
+				&& left.3 == right.3
+				&& left.4 == right.4
 		});
-		for (root, project, without_prelude, module) in roots {
+		for (root, project, package, without_prelude, module) in roots {
 			let disk_path = nymph_project::file_for_module(&root, &module);
 			let Some(disk_uri) = workspace::path_to_uri(&disk_path) else {
 				continue;
 			};
 			let identity = DocumentIdentity {
 				project,
+				package,
 				module: module.clone(),
 				entry: module.clone(),
 				root,
@@ -623,6 +647,7 @@ impl CompilerState {
 	) -> Option<Uri> {
 		let module_identity = ModuleIdentity {
 			project: identity.project.clone(),
+			package: identity.package.clone(),
 			module: module.clone(),
 			without_prelude: identity.without_prelude,
 		};
@@ -697,12 +722,27 @@ impl CompilerState {
 		source: String,
 		version: SourceVersion,
 	) {
-		self.session_mut(identity.without_prelude).set_source(
-			identity.project.clone(),
-			identity.module.clone(),
-			source.clone(),
-			version,
-		);
+		let source_uri = self
+			.authoritative_overlays
+			.get(identity)
+			.or_else(|| {
+				self
+					.documents
+					.iter()
+					.find_map(|(uri, document)| (document.module_identity() == *identity).then_some(uri))
+			})
+			.map(|uri| uri.as_str().to_string());
+		self
+			.session_mut(identity.without_prelude)
+			.set_package_source_with_location(
+				identity.package.clone(),
+				identity.module.clone(),
+				source.clone(),
+				version,
+				format!("{}.nym", identity.module),
+				source_uri,
+			)
+			.expect("retained document package belongs to its compiler session");
 		self
 			.effective_sources
 			.insert(identity.clone(), Arc::from(source));
@@ -711,7 +751,8 @@ impl CompilerState {
 	fn remove_effective_source(&mut self, identity: &ModuleIdentity) {
 		self
 			.session_mut(identity.without_prelude)
-			.remove_source(identity.project.clone(), identity.module.clone());
+			.remove_package_source(identity.package.clone(), identity.module.clone())
+			.expect("retained document package belongs to its compiler session");
 		self.effective_sources.remove(identity);
 	}
 
@@ -836,6 +877,7 @@ impl CompilerState {
 		Some(AnalysisSnapshot {
 			uri: uri.clone(),
 			project: identity.project.clone(),
+			package: identity.package.clone(),
 			module: identity.module.clone(),
 			document_version: document.version,
 			document_revision: docs.revision(),
@@ -1059,12 +1101,7 @@ impl CompilerState {
 		) {
 			return None;
 		}
-		let nymph_sema::ModuleOrigin::Project(owner_project) = &definition.module.origin else {
-			return None;
-		};
-		if owner_project.as_str() != snapshot.project.as_str()
-			|| definition.module.project.as_str() != snapshot.project.as_str()
-		{
+		if !snapshot.package.owns_module(&definition.module) {
 			return None;
 		}
 		let module = ModulePath::new(definition.module.path.as_str()).ok()?;
@@ -1090,6 +1127,7 @@ impl CompilerState {
 		let source = analysis.source.clone();
 		let target_is_open = self.documents.iter().any(|(open_uri, identity)| {
 			identity.project == snapshot.project
+				&& identity.package == snapshot.package
 				&& identity.module == module
 				&& identity.without_prelude == snapshot.without_prelude
 				&& docs.get(open_uri).is_some()
@@ -1173,6 +1211,7 @@ impl CompilerState {
 			for (uri, identity) in &self.documents {
 				cancellation.checkpoint()?;
 				if identity.project == snapshot.project
+					&& identity.package == snapshot.package
 					&& identity.module == module
 					&& identity.without_prelude == snapshot.without_prelude
 					&& docs.get(uri).is_some()
@@ -1187,6 +1226,7 @@ impl CompilerState {
 					continue;
 				};
 				if identity.project == snapshot.project
+					&& identity.package == snapshot.package
 					&& identity.module == module
 					&& identity.without_prelude == snapshot.without_prelude
 					&& self
@@ -1532,11 +1572,12 @@ impl CompilerState {
 			}
 			Ok(class) => class,
 		};
-		let (root, module, kind) = match class {
+		let (root, module, kind, lints) = match class {
 			workspace::UriClass::ProjectFile { path, project } => (
 				project.src_root,
 				ModulePath::new(project.entry_key).unwrap(),
 				DocumentKind::Project(path),
+				project.lints,
 			),
 			workspace::UriClass::LooseFile { path } => {
 				let root = path
@@ -1553,17 +1594,19 @@ impl CompilerState {
 						path.display()
 					)
 				})?;
-				(root, module, DocumentKind::Loose(path))
+				(root, module, DocumentKind::Loose(path), Default::default())
 			}
 			workspace::UriClass::Untitled => (
 				PathBuf::new(),
 				ModulePath::new("document").unwrap(),
 				DocumentKind::Untitled,
+				Default::default(),
 			),
 			workspace::UriClass::NonFile => (
 				PathBuf::new(),
 				ModulePath::new("document").unwrap(),
 				DocumentKind::NonFile,
+				Default::default(),
 			),
 		};
 		self.manifest_errors.remove(uri);
@@ -1596,12 +1639,16 @@ impl CompilerState {
 		};
 		let identity = DocumentIdentity {
 			project: project.clone(),
+			package: self.session.root_package(project.clone()),
 			module: module.clone(),
 			entry: module,
 			root: root.clone(),
 			without_prelude,
 			kind: kind.clone(),
 		};
+		self
+			.session_mut(without_prelude)
+			.set_project_lints(project.clone(), lints);
 		if let Some(previous) = previous_identity
 			&& previous.module_identity() != identity.module_identity()
 		{
@@ -1656,6 +1703,7 @@ impl CompilerState {
 		without_prelude: bool,
 	) -> anyhow::Result<()> {
 		let mut present = HashSet::new();
+		let package = self.session.root_package(project.clone());
 		let disk_files = nymph_files(root);
 		self.project_disk_files.insert(
 			root.to_path_buf(),
@@ -1664,12 +1712,14 @@ impl CompilerState {
 		for (path, module) in disk_files {
 			let module_identity = ModuleIdentity {
 				project: project.clone(),
+				package: package.clone(),
 				module: module.clone(),
 				without_prelude,
 			};
 			present.insert(module_identity.clone());
 			let disk_identity = DocumentIdentity {
 				project: project.clone(),
+				package: package.clone(),
 				module: module.clone(),
 				entry: module,
 				root: root.to_path_buf(),
@@ -1848,6 +1898,24 @@ pub fn publish_completion_if_current<T>(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn profile_switches_both_retained_sessions_and_survives_isolation() {
+		let mut state = CompilerState::new();
+		assert_eq!(
+			state.retained_build_profiles(),
+			(BuildProfile::Development, BuildProfile::Development)
+		);
+		state.set_build_profile(BuildProfile::Release);
+		assert_eq!(
+			state.retained_build_profiles(),
+			(BuildProfile::Release, BuildProfile::Release)
+		);
+		assert_eq!(
+			state.isolated_empty().retained_build_profiles(),
+			(BuildProfile::Release, BuildProfile::Release)
+		);
+	}
 	use std::cell::Cell;
 	use std::sync::Mutex;
 
@@ -2037,6 +2105,7 @@ mod tests {
 		let plain_snapshot = state.analysis_for_uri(&docs, &plain).unwrap();
 		let encoded_snapshot = state.analysis_for_uri(&docs, &encoded).unwrap();
 		assert_ne!(plain_snapshot.project, encoded_snapshot.project);
+		assert_ne!(plain_snapshot.package, encoded_snapshot.package);
 		assert_eq!(plain_snapshot.source.as_ref(), "func plain_only(): int = 1");
 		assert_eq!(
 			encoded_snapshot.source.as_ref(),

@@ -17,13 +17,12 @@ use crate::annotate::{Checked, CheckedFacts, CheckedSemantic};
 use crate::def::{DefMap, Signatures, build_def_map_on};
 use crate::ids::{DefId, InferVar, ParamIdx};
 use crate::ty::fold::occurs;
-use crate::ty::{Interner, Ty, TyKind};
+use crate::ty::{GenericArgs, Interner, Ty, TyKind};
 use crate::unify::{TyVarValue, UnifyTable};
 
 /// A local variable binding in a lexical scope.
 pub(crate) struct Binding {
 	pub ty: Ty,
-	pub mutable: bool,
 	pub declaration: Span,
 }
 
@@ -38,24 +37,29 @@ pub(crate) enum LoopBreakKind {
 /// carrying the specific operator itself (a prefix op has no separate
 /// `BinaryOperator` to hang off a shared tuple slot, so the operator moved into the
 /// variant) — see [`Checker::pending_operators`] for why `finalize_pending_operators`
-/// must treat `BinaryOp`/`AssignOp` and `PrefixOp` differently.
+/// must treat binary and prefix operators differently.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 // The shared `Op` postfix names the AST node shape each variant was recorded
-// from (`BinaryOp`/`AssignOp`/`PrefixOp` expression kinds) — deliberate, not an
+// from (`BinaryOp`/`PrefixOp` expression kinds) — deliberate, not an
 // accidental naming collision the lint should flag.
 #[allow(clippy::enum_variant_names)]
 pub(crate) enum PendingOperatorKind {
 	BinaryOp(nymph_ast::ops::BinaryOperator),
-	AssignOp(nymph_ast::ops::BinaryOperator),
 	PrefixOp(nymph_ast::ops::PrefixOperator),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SourceEffectSpec {
+	pub row: crate::ty::EffectRow,
+	pub infer: bool,
+	pub span: Span,
 }
 
 pub struct Checker<'m> {
 	pub(crate) module: &'m Module,
+	pub(crate) current_module: Option<crate::ModuleIdentity>,
 	pub(crate) interner: Interner,
 	pub(crate) defs: DefMap,
-	pub(crate) mutable_imports: FxHashSet<DefId>,
-	pub(crate) allow_imported_assignment: bool,
 	pub(crate) sigs: Signatures,
 	/// Collected interface definitions (method signatures), keyed by interface def.
 	pub(crate) interfaces: FxHashMap<DefId, crate::iface::InterfaceDef>,
@@ -72,6 +76,11 @@ pub struct Checker<'m> {
 	pub(crate) runtime_roles: crate::environment::LocalCompilerRuntimeRoles,
 	pub(crate) stable_runtime_roles: crate::CompilerRuntimeRoles,
 	pub(crate) runtime_role_provenance: crate::environment::RuntimeRoleProvenance,
+	pub(crate) declared_effects: FxHashMap<crate::DefinitionId, crate::EffectRow>,
+	pub(crate) effect_callables: FxHashMap<Span, crate::DefinitionId>,
+	pub(crate) current_effect_caller: Option<crate::DefinitionId>,
+	pub(crate) effect_charges: Vec<(crate::DefinitionId, crate::effects::EffectCharge)>,
+	pub(crate) source_effect_specs: FxHashMap<Span, SourceEffectSpec>,
 
 	// ── Transient per-body state ─────────────────────────────────────────────
 	pub(crate) scopes: Vec<FxHashMap<EcoString, Binding>>,
@@ -91,6 +100,8 @@ pub struct Checker<'m> {
 	pub(crate) self_ty: Option<Ty>,
 	/// The declared/expected return type of the function currently being checked.
 	pub(crate) ret_ty: Option<Ty>,
+	pub(crate) async_depth: usize,
+	pub(crate) captured_effects: Option<Vec<crate::ty::EffectRow>>,
 	/// Lexical loop-control contracts, innermost last. Callable inference replaces
 	/// this stack so jumps cannot escape a callable body.
 	pub(crate) loop_controls: Vec<LoopBreakKind>,
@@ -117,6 +128,9 @@ pub struct Checker<'m> {
 	/// bypassing impl search entirely — see `resolve_method`'s doc comment on why
 	/// the ordinary impl/blanket search is wrong for this one case.
 	pub(crate) checking_interface_default: Option<(DefId, ParamIdx)>,
+	/// Set while inferring the literal operand of contextual unary minus, where
+	/// magnitude `2^63` denotes `i64::MIN` rather than a positive `int`.
+	pub(crate) allow_i64_min_magnitude: bool,
 
 	/// The per-expression decisions recorded for the lowering pass (resolved type,
 	/// selected operator/method impl). Keyed by [`nymph_ast::NodeId`]. Emitted
@@ -141,11 +155,7 @@ pub struct Checker<'m> {
 	/// is a single shared map that each body's checking clears and rebuilds, so a
 	/// module-end pass would resolve every deferred operator against only the *last*
 	/// body's bounds, making a valid program's diagnostics depend on declaration
-	/// order. `kind` distinguishes a `BinaryOp` node (whose recorded type is the
-	/// operator's own placeholder result and must be unified with the
-	/// finally-resolved type) from an `AssignOp` node (whose recorded type is always
-	/// `Void` and must be left alone; only the `Resolution` gets attached
-	/// there).
+	/// order.
 	pub(crate) pending_operators: Vec<(nymph_ast::NodeId, Span, Ty, Ty, PendingOperatorKind)>,
 
 	/// Call-site bound obligations deferred until the instantiated variable has
@@ -176,7 +186,6 @@ pub struct Checker<'m> {
 	/// Drained per body alongside `pending_bounds` (same lifecycle, same
 	/// reasoning: a module-end pass would check every obligation against only
 	/// the last body's recordings).
-	pub(crate) pending_bound_arg_mut: FxHashMap<Ty, (bool, bool)>,
 
 	/// Stack of the parameter types of the anonymous (`$N`) closures currently
 	/// being FORMED, innermost last — pushed/popped only by
@@ -208,6 +217,14 @@ pub(crate) struct ControlLabel {
 	pub kind: ControlLabelKind,
 	pub loop_index: Option<usize>,
 	pub result_ty: Option<Ty>,
+	pub state_bindings: Option<Vec<StateBindingContract>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct StateBindingContract {
+	pub name: EcoString,
+	pub ty: Ty,
+	pub declaration: Span,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -294,6 +311,7 @@ fn check_module_from_parts(
 	module_identity: Option<&crate::ModuleIdentity>,
 	external_abis: FxHashMap<crate::DefId, crate::ExternalAbi>,
 ) -> Checked {
+	checker.current_module = module_identity.cloned();
 	checker.lower_signatures();
 	checker.collect_interfaces();
 	// Interface member identities are collected before protocol registration. The
@@ -327,6 +345,13 @@ fn check_module_from_parts(
 		};
 		checker.stable_runtime_roles.iterable = interface_role(&checker, "Iterable", "iter");
 		checker.stable_runtime_roles.iterator = interface_role(&checker, "Iterator", "next");
+		checker.stable_runtime_roles.close = interface_role(&checker, "Close", "close");
+		checker.stable_runtime_roles.display = interface_role(&checker, "Display", "display");
+		checker.runtime_roles.display = checker
+			.stable_runtime_roles
+			.display
+			.as_ref()
+			.and_then(|role| checker.defs.by_stable(&role.interface));
 		checker.runtime_roles.iterable =
 			checker
 				.stable_runtime_roles
@@ -349,6 +374,44 @@ fn check_module_from_parts(
 						role.member.clone(),
 					))
 				});
+		if let Some(iteration) = checker.defs.get("Iteration")
+			&& let Some(stable) = checker.defs.stable(iteration).cloned()
+			&& let Some(signature) = checker.sigs.enums.get(&iteration)
+			&& signature.generics.len() == 2
+			&& let Some(done) = signature
+				.variants
+				.iter()
+				.find(|variant| variant.name == "Done" && variant.fields.is_empty())
+			&& let Some(yield_) = signature.variants.iter().find(|variant| {
+				variant.name == "Yield"
+					&& variant.fields.len() == 2
+					&& variant.fields[0].0 == "item"
+					&& variant.fields[1].0 == "next"
+			}) && let (Some(done_id), Some(yield_id), Some(item_id), Some(next_id)) = (
+			done.target.clone(),
+			yield_.target.clone(),
+			yield_.field_metadata[0].target.clone(),
+			yield_.field_metadata[1].target.clone(),
+		) {
+			checker.runtime_roles.iteration = Some(iteration);
+			checker.stable_runtime_roles.iteration = Some(crate::IterationRuntimeRole {
+				iteration: stable,
+				done: done_id,
+				yield_: yield_id,
+				yield_item: item_id,
+				yield_next: next_id,
+			});
+		}
+		checker.runtime_roles.close = checker
+			.stable_runtime_roles
+			.close
+			.as_ref()
+			.and_then(|role| {
+				Some((
+					checker.defs.by_stable(&role.interface)?,
+					role.member.clone(),
+				))
+			});
 		if let Some(option) = checker.defs.get("Option")
 			&& let Some(stable) = checker.defs.stable(option).cloned()
 			&& let Some(signature) = checker.sigs.enums.get(&option)
@@ -438,6 +501,11 @@ fn check_module_from_parts(
 	} else {
 		Default::default()
 	};
+	checker.effect_callables = source_identities
+		.declarations
+		.iter()
+		.map(|(definition, span)| (*span, definition.clone()))
+		.collect();
 	checker.check_bodies();
 	checker.check_member_bodies();
 	// Type syntax in bodies (typed locals, casts, and member bodies) can create
@@ -445,11 +513,15 @@ fn check_module_from_parts(
 	checker.finalize_named_generic_labels();
 	checker.check_external_value_linkage();
 	checker.check_external_func_kinds();
-	if entry == EntryMode::Entry {
+	checker.check_managed_fields();
+	checker.check_managed_child_captures();
+	let entry_root = if entry == EntryMode::Entry {
 		// Runs after every body has been checked, so its diagnostics append
 		// after body-checking diagnostics rather than interleaving with them.
-		checker.check_entry_main();
-	}
+		checker.check_entry_main()
+	} else {
+		None
+	};
 	// Every body-checking path (`check_func_body`, `check_let_body`,
 	// `check_method_body`, `check_interface_impl_members`) drains its own
 	// `pending_operators` entries before the next body's `param_bounds` are
@@ -465,20 +537,31 @@ fn check_module_from_parts(
 		checker.pending_bounds.is_empty(),
 		"pending_bounds should be drained per-body, not left for module end"
 	);
-	debug_assert!(
-		checker.pending_bound_arg_mut.is_empty(),
-		"pending_bound_arg_mut should be drained per-body, not left for module end"
-	);
 	assert!(
 		checker.pending_generic_labels.is_empty(),
 		"named generic labels must be finalized before annotations are published"
 	);
 	checker.finalize_pending_member_completions();
-	// Some annotations are recorded before later expressions constrain their
-	// inference variables. Resolve them one final time while the unify table is
-	// still available so lowering never sees a stale `TyKind::Infer`.
+	// Resolve inference handles before range analysis reads declared operand
+	// bounds. The same finalized annotations are then published below.
 	let mut annotations = std::mem::take(&mut checker.annotations);
 	annotations.map_types(|ty| checker.resolve_deep(ty));
+	checker.annotations = annotations;
+	let range =
+		crate::range_analysis::analyze_module(checker.module, &checker.annotations, &checker.interner);
+	for (node, proof) in range.proofs {
+		checker.annotations.record_range_proof(node, proof);
+	}
+	for (span, reason) in range.diagnostics {
+		if !checker
+			.diags
+			.iter()
+			.any(|diagnostic| diagnostic.is_error() && diagnostic.span == span)
+		{
+			checker.emit(span, TypeError::RangeOperationInvalid { reason });
+		}
+	}
+	let annotations = std::mem::take(&mut checker.annotations);
 	// Signatures are lowered before body inference, so their slots may still hold
 	// inference handles even after checking has solved them.  CheckedSemantic is
 	// the immutable completion boundary: publish the resolved forms, just as we
@@ -600,11 +683,212 @@ fn check_module_from_parts(
 	let implementation_end = checker.impls.impls.len();
 	let inherent_end = inherent.len();
 	let definition_end = checker.defs.defs.len();
+	// Solve effects after value inference and before CheckedFacts escapes.
+	let callable_ids = checker
+		.sigs
+		.funcs
+		.keys()
+		.filter(|id| (definition_start..definition_end).contains(&(id.0 as usize)))
+		.filter_map(|id| checker.defs.stable(*id).cloned())
+		.chain(source_identities.declarations.keys().cloned())
+		.filter(|id| {
+			matches!(
+				&id.key,
+				crate::DeclarationKey::TopLevel {
+					category: crate::DeclarationCategory::Function,
+					..
+				} | crate::DeclarationKey::Member {
+					category: crate::DeclarationCategory::Function
+						| crate::DeclarationCategory::Method
+						| crate::DeclarationCategory::Static
+						| crate::DeclarationCategory::Field,
+					..
+				}
+			)
+		})
+		.collect::<std::collections::BTreeSet<_>>();
+	let mut effect_solver = crate::EffectSolver::default();
+	let effect_variables = callable_ids
+		.iter()
+		.map(|id| (id.clone(), effect_solver.variable()))
+		.collect::<Vec<_>>();
+	let effect_variable_by_id = effect_variables
+		.iter()
+		.cloned()
+		.collect::<FxHashMap<_, _>>();
+	let effect_specs = checker
+		.source_effect_specs
+		.iter()
+		.filter_map(|(span, spec)| {
+			let id = checker.effect_callables.get(span)?.clone();
+			Some((
+				id.clone(),
+				(
+					checker.canonical_effect_row(&id, &spec.row),
+					spec.infer,
+					spec.span,
+				),
+			))
+		})
+		.collect::<FxHashMap<_, _>>();
+	for (id, (known, infer, _)) in &effect_specs {
+		let Some(&variable) = effect_variable_by_id.get(id) else {
+			continue;
+		};
+		effect_solver.require_row(known.clone(), variable);
+		if !infer {
+			effect_solver.set_upper_bound(variable, known.clone());
+		}
+	}
+	for (caller, charge) in &checker.effect_charges {
+		let Some(&caller) = effect_variable_by_id.get(caller) else {
+			continue;
+		};
+		match charge {
+			crate::effects::EffectCharge::Callable(callee) => {
+				if let Some((known, false, _)) = effect_specs.get(callee) {
+					effect_solver.require_row(known.clone(), caller);
+				} else if let Some(&callee) = effect_variable_by_id.get(callee) {
+					effect_solver.require_subset(callee, caller);
+				} else if let Some(row) = checker.declared_effects.get(callee) {
+					effect_solver.require_row(row.clone(), caller);
+				}
+			}
+			crate::effects::EffectCharge::Row(row) => {
+				effect_solver.require_row(row.clone(), caller);
+			}
+		}
+	}
+	let effect_solution = match effect_solver.solve() {
+		Ok(solution) => solution,
+		Err(errors) => {
+			for error in &errors {
+				if let Some((id, _)) = effect_variables
+					.iter()
+					.find(|(_, variable)| *variable == error.variable)
+				{
+					let span = effect_specs
+						.get(id)
+						.map_or(Span::new(0, 0), |(_, _, span)| *span);
+					checker.emit(span, TypeError::EffectRowExceedsAnnotation);
+				}
+			}
+			let mut fallback = crate::EffectSolver::default();
+			let variables = callable_ids
+				.iter()
+				.map(|id| (id.clone(), fallback.variable()))
+				.collect::<FxHashMap<_, _>>();
+			for (id, (known, _, _)) in &effect_specs {
+				if let Some(&variable) = variables.get(id) {
+					fallback.require_row(known.clone(), variable);
+				}
+			}
+			for (caller, charge) in &checker.effect_charges {
+				let Some(&caller) = variables.get(caller) else {
+					continue;
+				};
+				match charge {
+					crate::effects::EffectCharge::Callable(callee) => {
+						if let Some((known, false, _)) = effect_specs.get(callee) {
+							fallback.require_row(known.clone(), caller);
+						} else if let Some(&callee) = variables.get(callee) {
+							fallback.require_subset(callee, caller);
+						} else if let Some(row) = checker.declared_effects.get(callee) {
+							fallback.require_row(row.clone(), caller);
+						}
+					}
+					crate::effects::EffectCharge::Row(row) => {
+						fallback.require_row(row.clone(), caller);
+					}
+				}
+			}
+			fallback
+				.solve()
+				.expect("fallback effect constraints have no upper bounds")
+		}
+	};
+	let effect_rows: FxHashMap<_, _> = effect_variables
+		.into_iter()
+		.map(|(id, variable)| {
+			let row = effect_specs
+				.get(&id)
+				.and_then(|(known, infer, _)| (!infer).then(|| known.clone()));
+			(
+				id,
+				row.unwrap_or_else(|| effect_solution.row(variable).clone()),
+			)
+		})
+		.collect();
+	let mut effect_contract_violations = Vec::new();
+	for implementation in checker.impls.impls.iter().skip(implementation_start) {
+		let Some(interface) = checker.interfaces.get(&implementation.interface) else {
+			continue;
+		};
+		for (name, method) in &implementation.methods {
+			let Some(method_id) = method.definition.as_ref() else {
+				continue;
+			};
+			let Some(actual) = effect_rows.get(method_id) else {
+				continue;
+			};
+			let Some(contract) = interface.methods.get(name) else {
+				continue;
+			};
+			let contract = nymph_hir::ty::EffectRow::new(
+				contract
+					.effects
+					.atoms()
+					.iter()
+					.flat_map(|atom| match atom {
+						nymph_hir::ty::EffectAtom::Nominal(_) => vec![*atom],
+						nymph_hir::ty::EffectAtom::Parameter(parameter) => interface
+							.generics
+							.get(parameter.0 as usize)
+							.and_then(|name| {
+								implementation
+									.effect_args
+									.iter()
+									.find(|(argument, _)| argument == name)
+							})
+							.map_or_else(|| vec![*atom], |(_, row)| row.atoms().to_vec()),
+					})
+					.collect(),
+			);
+			let contract = checker.canonical_effect_row(method_id, &contract);
+			// A missing effect argument leaves the contract open. Generic argument
+			// validation reports the source error rather than manufacturing a closed row.
+			if contract
+				.atoms()
+				.iter()
+				.any(|atom| matches!(atom, crate::EffectAtom::Parameter(_)))
+			{
+				continue;
+			}
+			if !crate::implementation_effects_are_valid(actual, &contract) {
+				let span = method
+					.definition
+					.as_ref()
+					.and_then(|definition| effect_specs.get(definition))
+					.map_or_else(
+						|| implementation.source_span.unwrap_or(Span::new(0, 0)),
+						|(_, _, span)| *span,
+					);
+				effect_contract_violations.push((span, name.clone()));
+			}
+		}
+	}
+	for (span, method) in effect_contract_violations {
+		checker.emit(
+			span,
+			TypeError::ImplementationEffectRowExceedsContract { method },
+		);
+	}
 	Checked {
 		diags: checker.diags,
 		facts: CheckedFacts {
 			annotations,
 			runtime_roles: checker.stable_runtime_roles.clone(),
+			entry_root,
 			external_value_marshals: checker.external_value_marshals,
 			interner: checker.interner,
 			semantic: CheckedSemantic {
@@ -615,6 +899,7 @@ fn check_module_from_parts(
 				implementations: checker.impls,
 				inherent,
 				anonymous_bounds: checker.synthetic_bound_details,
+				effect_rows,
 				local_definitions: definition_start..definition_end,
 				local_implementations: implementation_start..implementation_end,
 				local_inherent: inherent_start..inherent_end,
@@ -626,7 +911,401 @@ fn check_module_from_parts(
 	}
 }
 
+#[derive(Clone, Copy)]
+struct ManagedCaptureWarning {
+	declaration: Span,
+	capture: Span,
+	close: Span,
+	join: Span,
+}
+
+fn boundary(span: Span) -> Span {
+	Span::new(span.end.saturating_sub(1), span.end)
+}
+
+fn binding_name(meta: &nymph_ast::decl::LetDeclaration) -> Option<&nymph_ast::Ident> {
+	match &meta.name.0 {
+		nymph_ast::expr::Pattern::Binding { name, .. } => Some(name),
+		_ => None,
+	}
+}
+
+fn find_local_reference(
+	expr: &nymph_ast::expr::Expr,
+	declaration: Span,
+	annotations: &crate::Annotations,
+) -> Option<Span> {
+	if let nymph_ast::expr::ExprKind::Identifier(identifier) = &expr.kind
+		&& annotations.local_definition_target_of(expr.id) == Some(declaration)
+	{
+		return Some(identifier.1);
+	}
+	let mut found = None;
+	expr.for_each_child(|child| {
+		if found.is_none() {
+			found = find_local_reference(child, declaration, annotations);
+		}
+	});
+	found
+}
+
+fn find_spawn_capture(
+	expr: &nymph_ast::expr::Expr,
+	declaration: Span,
+	inside_await: bool,
+	annotations: &crate::Annotations,
+) -> Option<(Span, bool)> {
+	let inside_await = inside_await || matches!(expr.kind, nymph_ast::expr::ExprKind::Await { .. });
+	if let nymph_ast::expr::ExprKind::Call { func, .. } = &expr.kind
+		&& let nymph_ast::expr::ExprKind::MemberAccess { parent, member, .. } = &func.kind
+		&& member.0 == "spawn"
+		&& let Some(capture) = find_local_reference(parent, declaration, annotations)
+	{
+		return Some((capture, inside_await));
+	}
+	let mut found = None;
+	expr.for_each_child(|child| {
+		if found.is_none() {
+			found = find_spawn_capture(child, declaration, inside_await, annotations);
+		}
+	});
+	found
+}
+
+fn find_spawned_local(
+	expr: &nymph_ast::expr::Expr,
+	inside_await: bool,
+	annotations: &crate::Annotations,
+) -> Option<(Span, bool)> {
+	let inside_await = inside_await || matches!(expr.kind, nymph_ast::expr::ExprKind::Await { .. });
+	if let nymph_ast::expr::ExprKind::Call { func, .. } = &expr.kind
+		&& let nymph_ast::expr::ExprKind::MemberAccess { parent, member, .. } = &func.kind
+		&& member.0 == "spawn"
+		&& let Some(declaration) = annotations.local_definition_target_of(parent.id)
+	{
+		return Some((declaration, inside_await));
+	}
+	let mut found = None;
+	expr.for_each_child(|child| {
+		if found.is_none() {
+			found = find_spawned_local(child, inside_await, annotations);
+		}
+	});
+	found
+}
+
+fn find_await(
+	expr: &nymph_ast::expr::Expr,
+	declaration: Span,
+	annotations: &crate::Annotations,
+) -> Option<Span> {
+	if let nymph_ast::expr::ExprKind::Await { value, keyword } = &expr.kind
+		&& annotations.local_definition_target_of(value.id) == Some(declaration)
+	{
+		return Some(*keyword);
+	}
+	let mut found = None;
+	expr.for_each_child(|child| {
+		if found.is_none() {
+			found = find_await(child, declaration, annotations);
+		}
+	});
+	found
+}
+
+fn statement_expr(statement: &nymph_ast::expr::Statement) -> &nymph_ast::expr::Expr {
+	match statement {
+		nymph_ast::expr::Statement::Expr(expr)
+		| nymph_ast::expr::Statement::Let { value: expr, .. } => expr,
+	}
+}
+
+fn push_managed_capture_warning(
+	warnings: &mut Vec<ManagedCaptureWarning>,
+	warning: ManagedCaptureWarning,
+) {
+	if warnings.iter().any(|existing| {
+		existing.declaration == warning.declaration
+			&& existing.capture == warning.capture
+			&& existing.close == warning.close
+	}) {
+		return;
+	}
+	warnings.push(warning);
+}
+
+fn scan_managed_child_captures(
+	expr: &nymph_ast::expr::Expr,
+	context_join: Span,
+	managed: &FxHashSet<NodeId>,
+	annotations: &crate::Annotations,
+	warnings: &mut Vec<ManagedCaptureWarning>,
+) {
+	if let nymph_ast::expr::ExprKind::AsyncBlock { body, .. } = &expr.kind {
+		scan_managed_child_captures(body, boundary(body.span), managed, annotations, warnings);
+		return;
+	}
+	if let nymph_ast::expr::ExprKind::Block { body, .. } = &expr.kind {
+		let close = boundary(expr.span);
+		for (declaration_index, statement) in body.iter().enumerate() {
+			let nymph_ast::expr::Statement::Let { meta, value } = &statement.0 else {
+				continue;
+			};
+			if !meta.is_managed() || !managed.contains(&value.id) {
+				continue;
+			}
+			let Some(resource) = binding_name(meta) else {
+				continue;
+			};
+			for (spawn_index, child_statement) in body.iter().enumerate().skip(declaration_index + 1) {
+				let child_expr = statement_expr(&child_statement.0);
+				let direct = find_spawn_capture(child_expr, resource.1, false, annotations);
+				let indirect =
+					find_spawned_local(child_expr, false, annotations).and_then(|(spawned, awaited)| {
+						body[..spawn_index].iter().find_map(|candidate| {
+							let nymph_ast::expr::Statement::Let { meta, value } = &candidate.0 else {
+								return None;
+							};
+							let name = binding_name(meta)?;
+							if name.1 != spawned {
+								return None;
+							}
+							find_local_reference(value, resource.1, annotations).map(|capture| (capture, awaited))
+						})
+					});
+				let Some((capture, awaited_directly)) = direct.or(indirect) else {
+					continue;
+				};
+				if awaited_directly {
+					continue;
+				}
+				let handle = match &child_statement.0 {
+					nymph_ast::expr::Statement::Let { meta, .. } => binding_name(meta),
+					_ => None,
+				};
+				if let Some(handle) = handle
+					&& body
+						.iter()
+						.skip(spawn_index + 1)
+						.any(|later| find_await(statement_expr(&later.0), handle.1, annotations).is_some())
+				{
+					continue;
+				}
+				push_managed_capture_warning(
+					warnings,
+					ManagedCaptureWarning {
+						declaration: resource.1,
+						capture,
+						close,
+						join: context_join,
+					},
+				);
+			}
+		}
+	}
+	expr.for_each_child(|child| {
+		scan_managed_child_captures(child, context_join, managed, annotations, warnings);
+	});
+}
+
+fn for_impl_member_exprs(
+	members: &[nymph_ast::Spanned<nymph_ast::decl::ImplMember>],
+	f: &mut impl FnMut(&nymph_ast::expr::Expr),
+) {
+	for member in members {
+		match &member.0 {
+			nymph_ast::decl::ImplMember::Let { value, .. }
+			| nymph_ast::decl::ImplMember::Func { body: value, .. } => f(value),
+			nymph_ast::decl::ImplMember::ExternalLet(..)
+			| nymph_ast::decl::ImplMember::ExternalFunc(..) => {}
+		}
+	}
+}
+
+fn for_declaration_exprs(
+	declaration: &nymph_ast::decl::Declaration,
+	f: &mut impl FnMut(&nymph_ast::expr::Expr),
+) {
+	use nymph_ast::decl::Declaration;
+	match declaration {
+		Declaration::Let { value, .. } | Declaration::Func { body: value, .. } => f(value),
+		Declaration::Struct {
+			fields,
+			members,
+			impls,
+			..
+		} => {
+			for field in fields {
+				if let Some(default) = &field.0.default {
+					f(default);
+				}
+			}
+			for_impl_member_exprs(members, f);
+			for implementation in impls {
+				for_impl_member_exprs(&implementation.0.members, f);
+			}
+		}
+		Declaration::Enum {
+			variants,
+			members,
+			impls,
+			..
+		} => {
+			for variant in variants {
+				for field in &variant.0.fields {
+					if let Some(default) = &field.0.default {
+						f(default);
+					}
+				}
+			}
+			for_impl_member_exprs(members, f);
+			for implementation in impls {
+				for_impl_member_exprs(&implementation.0.members, f);
+			}
+		}
+		Declaration::Namespace { members, .. }
+		| Declaration::Impl { members, .. }
+		| Declaration::ImplFor { members, .. } => for_impl_member_exprs(members, f),
+		Declaration::Interface { members, .. } => {
+			for member in members {
+				match &member.0 {
+					nymph_ast::decl::InterfaceMember::Element(element) => match &element.0 {
+						nymph_ast::decl::InterfaceElement::Let { value, .. } => {
+							if let Some(value) = value {
+								f(value);
+							}
+						}
+						nymph_ast::decl::InterfaceElement::Func { body, .. } => {
+							if let Some(body) = body {
+								f(body);
+							}
+						}
+					},
+					nymph_ast::decl::InterfaceMember::Impl { members, .. } => {
+						for_impl_member_exprs(members, f);
+					}
+				}
+			}
+		}
+		Declaration::Import { .. }
+		| Declaration::ExternalLet(..)
+		| Declaration::Effect { .. }
+		| Declaration::ExternalFunc(..)
+		| Declaration::TypeAlias { .. } => {}
+	}
+}
+
 impl Checker<'_> {
+	fn check_managed_child_captures(&mut self) {
+		let managed = self
+			.annotations
+			.managed_cleanups()
+			.map(|(initializer, _)| initializer)
+			.collect::<FxHashSet<_>>();
+		let mut warnings = Vec::new();
+		for declaration in &self.module.members {
+			for_declaration_exprs(declaration, &mut |expr| {
+				scan_managed_child_captures(
+					expr,
+					boundary(expr.span),
+					&managed,
+					&self.annotations,
+					&mut warnings,
+				);
+			});
+		}
+		for warning in warnings {
+			self.emit(
+				warning.capture,
+				TypeError::ManagedChildCapture {
+					declaration: warning.declaration,
+					close: warning.close,
+					join: warning.join,
+				},
+			);
+		}
+	}
+
+	fn check_managed_fields(&mut self) {
+		let Some((close, _)) = self.runtime_roles.close.clone() else {
+			return;
+		};
+		let mut candidates = Vec::new();
+		for declaration in &self.module.members {
+			match declaration {
+				nymph_ast::decl::Declaration::Struct { name, fields, .. } => {
+					let Some(owner) = self.defs.get(&name.0) else {
+						continue;
+					};
+					let Some(signature) = self.sigs.structs.get(&owner) else {
+						continue;
+					};
+					for (field, (_, ty)) in fields.iter().zip(&signature.fields) {
+						candidates.push((
+							owner,
+							name.clone(),
+							field.0.name.clone(),
+							field.0.type_.1,
+							*ty,
+							signature.generics.len(),
+							signature.bounds.clone(),
+						));
+					}
+				}
+				nymph_ast::decl::Declaration::Enum { name, variants, .. } => {
+					let Some(owner) = self.defs.get(&name.0) else {
+						continue;
+					};
+					let Some(signature) = self.sigs.enums.get(&owner) else {
+						continue;
+					};
+					for (variant, variant_signature) in variants.iter().zip(&signature.variants) {
+						for (field, (_, ty)) in variant.0.fields.iter().zip(&variant_signature.fields) {
+							candidates.push((
+								owner,
+								name.clone(),
+								field.0.name.clone(),
+								field.0.type_.1,
+								*ty,
+								signature.generics.len(),
+								signature.bounds.clone(),
+							));
+						}
+					}
+				}
+				_ => {}
+			}
+		}
+		for (owner, owner_name, field, span, field_ty, generic_count, bounds) in candidates {
+			let arguments = (0..generic_count)
+				.map(|index| self.interner.mk_param(crate::ParamIdx(index as u32)))
+				.collect();
+			let owner_ty = self
+				.interner
+				.mk_adt(owner, crate::ty::GenericArgs::new(arguments, Vec::new()));
+			if self.holds(owner_ty, close, &[], 0) {
+				continue;
+			}
+			let field_is_managed = match self.interner.kind(field_ty) {
+				crate::ty::TyKind::Param(_) => bounds
+					.iter()
+					.any(|bound| bound.ty == field_ty && bound.interface == close && bound.args.is_empty()),
+				_ => self.holds(field_ty, close, &[], 0),
+			};
+			if field_is_managed {
+				self.emit(
+					span,
+					TypeError::ManagedFieldWithoutClose {
+						owner: owner_name.0.clone(),
+						field: field.0.clone(),
+						owner_span: owner_name.1,
+						field_span: field.1,
+					},
+				);
+			}
+		}
+	}
+
 	pub(crate) fn assign_runtime_body_identities(
 		&mut self,
 		identity: &crate::ModuleIdentity,
@@ -646,12 +1325,12 @@ pub fn check_module_with_environment(
 		identity,
 		environment.interner.clone(),
 		environment.imported.defs.clone(),
-		environment.imported.mutable_values.clone(),
 		environment.imported.signatures.clone(),
 		environment.imported.interfaces.clone(),
 		environment.imported.implementations.clone(),
 		environment.imported.inherent.clone(),
 		environment.imported.external_abis.clone(),
+		environment.imported.effect_rows.clone(),
 		environment.contains_recovery,
 		environment.compiler_runtime_roles.clone(),
 		environment.runtime_role_provenance,
@@ -680,25 +1359,25 @@ pub fn check_module_with_owned_environment(
 	} = environment;
 	let crate::ImportedFacts {
 		defs,
-		mutable_values,
 		signatures,
 		interfaces,
 		implementations,
 		inherent,
 		external_abis,
 		definition_members: _,
+		effect_rows,
 	} = imported;
 	check_module_with_environment_parts(
 		module,
 		identity,
 		interner,
 		defs,
-		mutable_values,
 		signatures,
 		interfaces,
 		implementations,
 		inherent,
 		external_abis,
+		effect_rows,
 		contains_recovery,
 		compiler_runtime_roles,
 		runtime_role_provenance,
@@ -712,12 +1391,12 @@ fn check_module_with_environment_parts(
 	identity: crate::ModuleIdentity,
 	interner: Interner,
 	imported_defs: DefMap,
-	imported_mutable_values: FxHashSet<DefId>,
 	imported_signatures: Signatures,
 	imported_interfaces: FxHashMap<DefId, crate::iface::InterfaceDef>,
 	imported_implementations: crate::iface::ImplRegistry,
 	imported_inherent: crate::members::InherentRegistry,
 	external_abis: FxHashMap<DefId, crate::ExternalAbi>,
+	declared_effects: FxHashMap<crate::DefinitionId, crate::EffectRow>,
 	contains_recovery: bool,
 	compiler_runtime_roles: crate::CompilerRuntimeRoles,
 	runtime_role_provenance: crate::environment::RuntimeRoleProvenance,
@@ -742,13 +1421,13 @@ fn check_module_with_environment_parts(
 		})
 		.collect();
 	let mut checker = Checker::new(&module, defs, diagnostics);
-	checker.mutable_imports = imported_mutable_values;
-	checker.allow_imported_assignment = mode == EntryMode::Repl;
+	let _ = mode;
 	checker.interner = interner;
 	checker.sigs = imported_signatures;
 	checker.interfaces = imported_interfaces;
 	checker.impls = imported_implementations;
 	checker.inherent = imported_inherent;
+	checker.declared_effects = declared_effects;
 	let map_interface = |role: &crate::InterfaceRuntimeRole| {
 		Some((
 			checker.defs.by_stable(&role.interface)?,
@@ -756,12 +1435,24 @@ fn check_module_with_environment_parts(
 		))
 	};
 	checker.runtime_roles = crate::environment::LocalCompilerRuntimeRoles {
+		display: compiler_runtime_roles
+			.display
+			.as_ref()
+			.and_then(|role| checker.defs.by_stable(&role.interface)),
 		iterable: compiler_runtime_roles
 			.iterable
 			.as_ref()
 			.and_then(map_interface),
 		iterator: compiler_runtime_roles
 			.iterator
+			.as_ref()
+			.and_then(map_interface),
+		iteration: compiler_runtime_roles
+			.iteration
+			.as_ref()
+			.and_then(|role| checker.defs.by_stable(&role.iteration)),
+		close: compiler_runtime_roles
+			.close
 			.as_ref()
 			.and_then(map_interface),
 		option: compiler_runtime_roles
@@ -829,8 +1520,8 @@ pub fn check_module(module: &Module) -> Checked {
 /// every diagnostic produced.
 ///
 /// Identical to [`check_module`], except it additionally requires a top-level
-/// `func main` taking no parameters, declaring no generics, and declaring no
-/// return type other than `void` — see `entry::check_entry_main` for the
+/// `func main` taking no parameters, declaring no generics, and returning a
+/// supported semantic root result — see `entry::check_entry_main` for the
 /// exact rules and [`crate::TypeError`]'s `Main*` variants for the
 /// diagnostics it can emit.
 pub fn check_module_entry(module: &Module) -> Checked {
@@ -900,7 +1591,7 @@ impl<'m> Checker<'m> {
 				.defs
 				.get(&meta.name.0.as_binding().expect("external let binding").0)
 				.and_then(|def| self.sigs.lets.get(&def).map(|sig| sig.ty));
-			self.check_external_value(marker, meta.name.1, meta.is_mutable(), ty);
+			self.check_external_value(marker, meta.name.1, ty);
 		}
 	}
 
@@ -908,7 +1599,6 @@ impl<'m> Checker<'m> {
 		&mut self,
 		marker: &ecow::EcoString,
 		span: Span,
-		mutable: bool,
 		ty: Option<Ty>,
 	) {
 		let linked = match nymph_hir::linkage::lookup_value(marker) {
@@ -957,18 +1647,14 @@ impl<'m> Checker<'m> {
 				},
 			);
 		}
-		if mutable {
-			self.emit(span, TypeError::ExternalValueMutable);
-		}
 	}
 
 	fn new(module: &'m Module, defs: DefMap, diags: Vec<Diagnostic>) -> Self {
 		Self {
 			module,
+			current_module: None,
 			interner: Interner::new(),
 			defs,
-			mutable_imports: FxHashSet::default(),
-			allow_imported_assignment: false,
 			sigs: Signatures::default(),
 			interfaces: FxHashMap::default(),
 			impls: crate::iface::ImplRegistry::default(),
@@ -980,6 +1666,11 @@ impl<'m> Checker<'m> {
 			runtime_roles: Default::default(),
 			stable_runtime_roles: Default::default(),
 			runtime_role_provenance: crate::environment::RuntimeRoleProvenance::StandaloneFixture,
+			declared_effects: FxHashMap::default(),
+			effect_callables: FxHashMap::default(),
+			current_effect_caller: None,
+			effect_charges: Vec::new(),
+			source_effect_specs: FxHashMap::default(),
 			scopes: Vec::new(),
 			params: Vec::new(),
 			pending_generic_labels: Vec::new(),
@@ -987,17 +1678,19 @@ impl<'m> Checker<'m> {
 			param_bound_details: FxHashMap::default(),
 			self_ty: None,
 			ret_ty: None,
+			async_depth: 0,
+			captured_effects: None,
 			alias_states: FxHashMap::default(),
 			collecting_signatures: false,
 			synthetic_params: 0,
 			synthetic_bounds: FxHashMap::default(),
 			synthetic_bound_details: FxHashMap::default(),
 			checking_interface_default: None,
+			allow_i64_min_magnitude: false,
 			annotations: crate::annotate::Annotations::default(),
 			pending_member_completions: Vec::new(),
 			pending_operators: Vec::new(),
 			pending_bounds: Vec::new(),
-			pending_bound_arg_mut: FxHashMap::default(),
 			anon_ctx: Vec::new(),
 			anon_consumed: FxHashSet::default(),
 			loop_controls: Vec::new(),
@@ -1009,7 +1702,15 @@ impl<'m> Checker<'m> {
 	/// Emit a typed [`TypeError`](crate::errors::TypeError), anchored at `span`.
 	pub(crate) fn emit(&mut self, span: Span, err: TypeError) {
 		use nymph_diagnostics::IntoDiagnostic;
-		self.diags.push(err.as_diagnostic(span));
+		let mut diagnostic = err.as_diagnostic(span);
+		match &err {
+			TypeError::ManagedFieldWithoutClose { .. } => diagnostic.code = "managed-field".into(),
+			TypeError::ManagedChildCapture { .. } => {
+				diagnostic.code = "managed-child-capture".into();
+			}
+			_ => {}
+		}
+		self.diags.push(diagnostic);
 	}
 
 	// ── Annotations ──────────────────────────────────────────────────────────
@@ -1047,8 +1748,8 @@ impl<'m> Checker<'m> {
 		self.scopes.pop();
 	}
 
-	pub(crate) fn define_local(&mut self, name: EcoString, span: Span, ty: Ty, mutable: bool) {
-		self.define_local_with_declarations(name, span, [span], ty, mutable);
+	pub(crate) fn define_local(&mut self, name: EcoString, span: Span, ty: Ty) {
+		self.define_local_with_declarations(name, span, [span], ty);
 	}
 
 	pub(crate) fn define_local_with_declarations(
@@ -1057,20 +1758,12 @@ impl<'m> Checker<'m> {
 		declaration: Span,
 		written: impl IntoIterator<Item = Span>,
 		ty: Ty,
-		mutable: bool,
 	) {
 		for span in written {
 			self.annotations.record_local_declaration(span, declaration);
 		}
 		if let Some(scope) = self.scopes.last_mut() {
-			scope.insert(
-				name,
-				Binding {
-					ty,
-					mutable,
-					declaration,
-				},
-			);
+			scope.insert(name, Binding { ty, declaration });
 		}
 	}
 
@@ -1175,18 +1868,6 @@ impl<'m> Checker<'m> {
 		}
 	}
 
-	/// Peel a top-level `mut` wrapper, if present. `mk_mut` guarantees `Mut` never
-	/// nests, so a single peel is always enough. Used at the two mutability
-	/// "cancel points": a plain `let x = v` drops `v`'s `mut`, and dispatch/
-	/// type-inspection sites that don't care about mutability.
-	pub(crate) fn strip_mut(&mut self, ty: Ty) -> Ty {
-		let ty = self.shallow_resolve(ty);
-		match self.interner.kind(ty) {
-			TyKind::Mut(inner) => *inner,
-			_ => ty,
-		}
-	}
-
 	/// If `expected` is (shallow-resolved to) a concrete enum `Adt` whose variants
 	/// include `name`, return that enum's def and the variant's index — the
 	/// type-directed resolution a bare variant name (pattern or construction) should
@@ -1199,7 +1880,7 @@ impl<'m> Checker<'m> {
 		expected: Ty,
 		name: &str,
 	) -> Option<(DefId, usize)> {
-		let ty = self.strip_mut(expected);
+		let ty = self.shallow_resolve(expected);
 		let TyKind::Adt(def, _) = self.interner.kind(ty).clone() else {
 			return None;
 		};
@@ -1224,23 +1905,23 @@ impl<'m> Checker<'m> {
 	/// non-list type, in which case the caller falls back to a fresh element var
 	/// exactly as `infer_kind`'s own `ExprKind::List` arm does.
 	pub(crate) fn expected_list_element(&mut self, expected: Ty) -> Option<Ty> {
-		let ty = self.strip_mut(expected);
+		let ty = self.shallow_resolve(expected);
 		match self.interner.kind(ty) {
 			TyKind::List(elem) => Some(*elem),
 			_ => None,
 		}
 	}
 
-	/// If `expected` is (shallow-resolved to, through `mut`) a concrete `Map` type,
+	/// If `expected` is shallow-resolved to a concrete `Map` type,
 	/// return its `(key, value)` types — the type-directed target a map literal's
 	/// own entries should check against. Mirrors [`Self::expected_list_element`]
 	/// exactly (see its doc comment); the `Map` counterpart is what lets
 	/// `check_dispatch`'s own `ExprKind::Map` arm propagate a concrete, possibly
-	/// `mut`, value type (e.g. `#{int: mut #[int]}`'s value) down into a nested
+	/// value type down into a nested
 	/// literal, instead of that nested literal only ever seeing an unconstrained
 	/// fresh var. Returns `None` for an unbound inference var or any non-map type.
 	pub(crate) fn expected_map_entry(&mut self, expected: Ty) -> Option<(Ty, Ty)> {
-		let ty = self.strip_mut(expected);
+		let ty = self.shallow_resolve(expected);
 		match self.interner.kind(ty) {
 			TyKind::Map(key, value) => Some((*key, *value)),
 			_ => None,
@@ -1265,10 +1946,26 @@ impl<'m> Checker<'m> {
 				let value = self.resolve_deep(value);
 				self.interner.mk_map(key, value)
 			}
-			TyKind::Fn { params, ret } => {
+			TyKind::Fn {
+				params,
+				ret,
+				effects,
+			} => {
 				let params = params.iter().map(|&p| self.resolve_deep(p)).collect();
 				let ret = self.resolve_deep(ret);
-				self.interner.mk_fn(params, ret)
+				self.interner.mk_effectful_fn(params, ret, effects)
+			}
+			TyKind::Task { output, effects } => {
+				let output = self.resolve_deep(output);
+				self.interner.mk_task(output, effects)
+			}
+			TyKind::Handle(output) => {
+				let output = self.resolve_deep(output);
+				self.interner.mk_handle(output)
+			}
+			TyKind::HandleOutcome(output) => {
+				let output = self.resolve_deep(output);
+				self.interner.mk_handle_outcome(output)
 			}
 			TyKind::Adt(def, args) => {
 				let positional = args
@@ -1289,10 +1986,6 @@ impl<'m> Checker<'m> {
 				let parts = parts.iter().map(|&p| self.resolve_deep(p)).collect();
 				self.interner.mk_intersection(parts)
 			}
-			TyKind::Mut(inner) => {
-				let inner = self.resolve_deep(inner);
-				self.interner.mk_mut(inner)
-			}
 			_ => ty,
 		}
 	}
@@ -1304,15 +1997,15 @@ impl<'m> Checker<'m> {
 			TyKind::List(elem) => self.has_infer(*elem),
 			TyKind::Tuple(elems) => elems.iter().any(|&e| self.has_infer(e)),
 			TyKind::Map(key, value) => self.has_infer(*key) || self.has_infer(*value),
-			TyKind::Fn { params, ret } => {
+			TyKind::Fn { params, ret, .. } => {
 				params.iter().any(|&p| self.has_infer(p)) || self.has_infer(*ret)
 			}
+			TyKind::Task { output, .. } => self.has_infer(*output),
 			TyKind::Adt(_, args) => {
 				args.positional.iter().any(|&t| self.has_infer(t))
 					|| args.named.iter().any(|(_, t)| self.has_infer(*t))
 			}
 			TyKind::Intersection(parts) => parts.iter().any(|&p| self.has_infer(p)),
-			TyKind::Mut(inner) => self.has_infer(*inner),
 			_ => false,
 		}
 	}
@@ -1346,10 +2039,26 @@ impl<'m> Checker<'m> {
 				let value = self.subst(value, params, self_ty);
 				self.interner.mk_map(key, value)
 			}
-			TyKind::Fn { params: ps, ret } => {
+			TyKind::Fn {
+				params: ps,
+				ret,
+				effects,
+			} => {
 				let ps = ps.iter().map(|&p| self.subst(p, params, self_ty)).collect();
 				let ret = self.subst(ret, params, self_ty);
-				self.interner.mk_fn(ps, ret)
+				self.interner.mk_effectful_fn(ps, ret, effects)
+			}
+			TyKind::Task { output, effects } => {
+				let output = self.subst(output, params, self_ty);
+				self.interner.mk_task(output, effects)
+			}
+			TyKind::Handle(output) => {
+				let output = self.subst(output, params, self_ty);
+				self.interner.mk_handle(output)
+			}
+			TyKind::HandleOutcome(output) => {
+				let output = self.subst(output, params, self_ty);
+				self.interner.mk_handle_outcome(output)
 			}
 			TyKind::Adt(def, args) => {
 				let positional = args
@@ -1372,10 +2081,6 @@ impl<'m> Checker<'m> {
 					.map(|&p| self.subst(p, params, self_ty))
 					.collect();
 				self.interner.mk_intersection(parts)
-			}
-			TyKind::Mut(inner) => {
-				let inner = self.subst(inner, params, self_ty);
-				self.interner.mk_mut(inner)
 			}
 			_ => ty,
 		}
@@ -1458,11 +2163,14 @@ impl<'m> Checker<'m> {
 				self.synthetic_params_in(key, out);
 				self.synthetic_params_in(value, out);
 			}
-			TyKind::Fn { params, ret } => {
+			TyKind::Fn { params, ret, .. } => {
 				for p in params {
 					self.synthetic_params_in(p, out);
 				}
 				self.synthetic_params_in(ret, out);
+			}
+			TyKind::Task { output, .. } | TyKind::Handle(output) | TyKind::HandleOutcome(output) => {
+				self.synthetic_params_in(output, out);
 			}
 			TyKind::Adt(_, args) => {
 				for &t in &args.positional {
@@ -1477,7 +2185,6 @@ impl<'m> Checker<'m> {
 					self.synthetic_params_in(p, out);
 				}
 			}
-			TyKind::Mut(inner) => self.synthetic_params_in(inner, out),
 			_ => {}
 		}
 	}
@@ -1503,6 +2210,12 @@ impl<'m> Checker<'m> {
 	}
 
 	fn display_resolved(&self, ty: Ty) -> String {
+		if matches!(
+			self.interner.kind(ty),
+			TyKind::Task { .. } | TyKind::Handle(_) | TyKind::HandleOutcome(_)
+		) {
+			return self.display_async_type(ty);
+		}
 		match self.interner.kind(ty) {
 			TyKind::Int => "int".into(),
 			TyKind::UInt => "uint".into(),
@@ -1536,10 +2249,11 @@ impl<'m> Checker<'m> {
 				self.display_resolved(*key),
 				self.display_resolved(*value)
 			),
-			TyKind::Fn { params, ret } => {
+			TyKind::Fn { params, ret, .. } => {
 				let inner: Vec<_> = params.iter().map(|&p| self.display_resolved(p)).collect();
 				format!("({}) -> {}", inner.join(", "), self.display_resolved(*ret))
 			}
+			TyKind::Task { .. } | TyKind::Handle(_) | TyKind::HandleOutcome(_) => unreachable!(),
 			TyKind::Adt(def, args) => {
 				let name = self.defs.data(*def).name.clone();
 				if args.is_empty() {
@@ -1563,7 +2277,25 @@ impl<'m> Checker<'m> {
 				let inner: Vec<_> = parts.iter().map(|&p| self.display_resolved(p)).collect();
 				inner.join(" + ")
 			}
-			TyKind::Mut(inner) => format!("mut {}", self.display_resolved(*inner)),
+		}
+	}
+
+	fn display_async_type(&self, ty: Ty) -> String {
+		match self.interner.kind(ty) {
+			TyKind::Task { output, effects } => format!(
+				"Task<{}{}>",
+				self.display_resolved(*output),
+				if effects.atoms().is_empty() {
+					""
+				} else {
+					" + !…"
+				}
+			),
+			TyKind::Handle(output) => format!("Handle<{}>", self.display_resolved(*output)),
+			TyKind::HandleOutcome(output) => {
+				format!("Result<{}, HandleError>", self.display_resolved(*output))
+			}
+			_ => unreachable!(),
 		}
 	}
 }
@@ -1572,6 +2304,227 @@ impl<'m> Checker<'m> {
 pub(crate) enum AliasLowerState {
 	Lowering,
 	Lowered,
+}
+
+impl Checker<'_> {
+	pub(crate) fn enum_variant_def(&self, enum_def: DefId, variant: usize) -> Option<DefId> {
+		self.defs.iter().find_map(|(id, data)| {
+			matches!(data.kind, crate::def::DefKind::Variant { enum_def: owner, variant: index }
+				if owner == enum_def && index == variant)
+			.then_some(id)
+		})
+	}
+
+	pub(crate) fn enum_single_variant_ty(
+		&mut self,
+		enum_def: DefId,
+		variant: usize,
+		arguments: GenericArgs,
+	) -> Option<Ty> {
+		let definition = self.enum_variant_def(enum_def, variant)?;
+		let signature = self.sigs.enums.get(&enum_def)?.variants.get(variant)?;
+		let mut used = FxHashSet::default();
+		for (_, field) in &signature.fields {
+			collect_enum_type_params(&self.interner, *field, &mut used);
+		}
+		let projected = arguments
+			.positional
+			.into_iter()
+			.enumerate()
+			.filter(|(index, _)| used.contains(&crate::ParamIdx(*index as u32)))
+			.map(|(_, argument)| argument)
+			.collect();
+		Some(
+			self
+				.interner
+				.mk_adt(definition, GenericArgs::new(projected, Vec::new())),
+		)
+	}
+
+	/// Return an enum view's canonical source-owned variant set. Walking with a
+	/// visited set computes the least fixed point for this finite graph: cycles,
+	/// self edges, diamonds, and repetition therefore converge without special
+	/// cases. `BTreeSet` makes every consumer deterministic.
+	pub(crate) fn enum_variant_set(&self, ty: Ty) -> Option<std::collections::BTreeSet<DefId>> {
+		self.enum_variant_identity_set(ty).map(|variants| {
+			variants
+				.into_iter()
+				.map(|(definition, _)| definition)
+				.collect()
+		})
+	}
+
+	fn enum_variant_identity_set(
+		&self,
+		ty: Ty,
+	) -> Option<std::collections::BTreeSet<(DefId, Vec<Ty>)>> {
+		let TyKind::Adt(def, arguments) = self.interner.kind(ty) else {
+			return None;
+		};
+		if matches!(
+			self.defs.data(*def).kind,
+			crate::def::DefKind::Variant { .. }
+		) {
+			return Some([(*def, arguments.positional.clone())].into_iter().collect());
+		}
+		if !matches!(self.defs.data(*def).kind, crate::def::DefKind::Enum) {
+			return None;
+		}
+		let signature = self.sigs.enums.get(def)?;
+		if signature.embeddings.is_empty() {
+			let mut variants = std::collections::BTreeSet::new();
+			for (index, signature) in signature.variants.iter().enumerate() {
+				let Some(variant) = self.enum_variant_def(*def, index) else {
+					continue;
+				};
+				let mut used = FxHashSet::default();
+				for (_, field) in &signature.fields {
+					collect_enum_type_params(&self.interner, *field, &mut used);
+				}
+				let projected = arguments
+					.positional
+					.iter()
+					.enumerate()
+					.filter(|(index, _)| used.contains(&crate::ParamIdx(*index as u32)))
+					.map(|(_, argument)| *argument)
+					.collect();
+				variants.insert((variant, projected));
+			}
+			return Some(variants);
+		}
+
+		fn visit(
+			checker: &Checker<'_>,
+			enum_def: DefId,
+			arguments: &[Ty],
+			visited: &mut FxHashSet<DefId>,
+			out: &mut std::collections::BTreeSet<(DefId, Vec<Ty>)>,
+		) {
+			if !visited.insert(enum_def) {
+				return;
+			}
+			let Some(sig) = checker.sigs.enums.get(&enum_def) else {
+				return;
+			};
+			for index in 0..sig.variants.len() {
+				if let Some(variant) = checker.enum_variant_def(enum_def, index) {
+					let mut used = FxHashSet::default();
+					for (_, field) in &sig.variants[index].fields {
+						collect_enum_type_params(&checker.interner, *field, &mut used);
+					}
+					let projected = arguments
+						.iter()
+						.enumerate()
+						.filter(|(index, _)| used.contains(&crate::ParamIdx(*index as u32)))
+						.map(|(_, argument)| *argument)
+						.collect();
+					out.insert((variant, projected));
+				}
+			}
+			for embedding in &sig.embeddings {
+				if let Some(variant) = embedding.variant {
+					let source = checker.sigs.enums.get(&embedding.source);
+					let index = source.and_then(|source| {
+						source
+							.variants
+							.iter()
+							.position(|candidate| candidate.target.as_ref() == checker.defs.stable(variant))
+					});
+					if let (Some(source), Some(index)) = (source, index) {
+						let mut used = FxHashSet::default();
+						for (_, field) in &source.variants[index].fields {
+							collect_enum_type_params(&checker.interner, *field, &mut used);
+						}
+						let projected = arguments
+							.iter()
+							.enumerate()
+							.filter(|(index, _)| used.contains(&crate::ParamIdx(*index as u32)))
+							.map(|(_, argument)| *argument)
+							.collect();
+						out.insert((variant, projected));
+					}
+				} else {
+					visit(checker, embedding.source, arguments, visited, out);
+				}
+			}
+		}
+
+		let mut out = std::collections::BTreeSet::new();
+		visit(
+			self,
+			*def,
+			&arguments.positional,
+			&mut FxHashSet::default(),
+			&mut out,
+		);
+		Some(out)
+	}
+
+	pub(crate) fn enum_view_includes(&self, sub: Ty, sup: Ty) -> bool {
+		if matches!(
+			(self.interner.kind(sub), self.interner.kind(sup)),
+			(TyKind::Adt(sub, _), TyKind::Adt(sup, _)) if sub == sup
+		) {
+			return false;
+		}
+		match (
+			self.enum_variant_identity_set(sub),
+			self.enum_variant_identity_set(sup),
+		) {
+			(Some(sub), Some(sup)) => sub.is_subset(&sup),
+			_ => false,
+		}
+	}
+
+	/// A single-variant value dispatches through its source enum until a wider
+	/// contextual view is applied. Wider views are already represented by their
+	/// enum `Adt`, so only variant heads need normalization here.
+	pub(crate) fn static_enum_view_ty(&mut self, ty: Ty) -> Ty {
+		let TyKind::Adt(def, arguments) = self.interner.kind(ty).clone() else {
+			return ty;
+		};
+		let crate::def::DefKind::Variant { enum_def, .. } = self.defs.data(def).kind else {
+			return ty;
+		};
+		if arguments.positional.len() != self.sigs.enums[&enum_def].generics.len() {
+			return ty;
+		}
+		self.interner.mk_adt(enum_def, arguments)
+	}
+}
+
+fn collect_enum_type_params(interner: &Interner, ty: Ty, out: &mut FxHashSet<crate::ParamIdx>) {
+	match interner.kind(ty) {
+		TyKind::Param(parameter) => {
+			out.insert(*parameter);
+		}
+		TyKind::List(item) => collect_enum_type_params(interner, *item, out),
+		TyKind::Tuple(items) | TyKind::Intersection(items) => {
+			for item in items {
+				collect_enum_type_params(interner, *item, out);
+			}
+		}
+		TyKind::Map(key, value) => {
+			collect_enum_type_params(interner, *key, out);
+			collect_enum_type_params(interner, *value, out);
+		}
+		TyKind::Fn { params, ret, .. } => {
+			for parameter in params {
+				collect_enum_type_params(interner, *parameter, out);
+			}
+			collect_enum_type_params(interner, *ret, out);
+		}
+		TyKind::Adt(_, arguments) => {
+			for argument in arguments
+				.positional
+				.iter()
+				.chain(arguments.named.iter().map(|(_, argument)| argument))
+			{
+				collect_enum_type_params(interner, *argument, out);
+			}
+		}
+		_ => {}
+	}
 }
 
 #[cfg(test)]
@@ -1729,9 +2682,9 @@ mod tests {
 				generic_names: Vec::new(),
 				params: Vec::new(),
 				ret: int,
+				effects: crate::ty::EffectRow::pure(),
 				bounds: Vec::new(),
 				namespaced: false,
-				mutating: false,
 				external: false,
 			},
 		);
@@ -1743,9 +2696,9 @@ mod tests {
 				generic_names: Vec::new(),
 				params: Vec::new(),
 				ret: self_ty,
+				effects: crate::ty::EffectRow::pure(),
 				bounds: Vec::new(),
 				namespaced: true,
-				mutating: false,
 				external: false,
 			},
 		);
@@ -1763,7 +2716,7 @@ mod tests {
 
 		let span = Span::new(0, 0);
 		let (_, resolved, _, _, _) = checker
-			.resolve_inherent(self_ty, false, "get", &[], &[], span)
+			.resolve_inherent(self_ty, "get", &[], &[], span)
 			.expect("imported instance method should resolve");
 		assert_eq!(resolved, int);
 		assert_eq!(
@@ -1841,14 +2794,15 @@ mod tests {
 			has_default,
 			params: Vec::new(),
 			ret: int,
+			effects: crate::ty::EffectRow::pure(),
 			generics: Vec::new(),
 			bounds: Vec::new(),
-			mutating: false,
 		};
 		checker.interfaces.insert(
 			direct_iface,
 			InterfaceDef {
 				generics: Vec::new(),
+				generic_kinds: Vec::new(),
 				runtime_members: vec![crate::iface::RuntimeMemberDef {
 					definition: Some(direct_member.clone()),
 					name: "direct".into(),
@@ -1864,6 +2818,7 @@ mod tests {
 			default_iface,
 			InterfaceDef {
 				generics: Vec::new(),
+				generic_kinds: Vec::new(),
 				runtime_members: vec![crate::iface::RuntimeMemberDef {
 					definition: Some(default_member.clone()),
 					name: "defaulted".into(),
@@ -1937,10 +2892,12 @@ mod tests {
 						)
 						.collect(),
 					generics: Vec::new(),
+					generic_kinds: Vec::new(),
 					self_ty,
 					interface,
 					source_span: None,
 					args: Vec::new(),
+					effect_args: Vec::new(),
 					methods: method.into_iter().collect(),
 					constraints: Vec::new(),
 					blanket: false,
@@ -1956,9 +2913,9 @@ mod tests {
 				generic_names: Vec::new(),
 				params: Vec::new(),
 				ret: int,
+				effects: crate::ty::EffectRow::pure(),
 				bounds: Vec::new(),
 				namespaced: false,
-				mutating: false,
 				external: false,
 			},
 		);
@@ -2078,8 +3035,10 @@ mod tests {
 							target: None,
 							sig: FuncSig {
 								generics: Vec::new(),
+								generic_kinds: Vec::new(),
 								params: Vec::new(),
 								ret: int,
+								effects: crate::ty::EffectRow::pure(),
 								has_self: false,
 								bounds: Vec::new(),
 							},
@@ -2090,7 +3049,6 @@ mod tests {
 						NamespaceMemberSig::Value {
 							target: None,
 							ty: int,
-							mutable: false,
 						},
 					),
 				]),

@@ -3,8 +3,9 @@
 //! visibility, cycles, and collisions — over a virtual, filesystem-free
 //! project (an `FxHashMap<String, String>` keyed by canonical module path).
 use nymph_compiler::{
-	check_project, check_project_with_embedded_std, compile_project,
-	project::compile_project_module_sources_with_std,
+	CompiledEntryRoot, CompilerOptions, check_project, check_project_with_embedded_std,
+	compile_project, compile_project_library_with_embedded_std_and_options,
+	compile_project_with_embedded_std_and_options, project::compile_project_module_sources_with_std,
 };
 use rustc_hash::FxHashMap;
 /// Build a `load` closure over a virtual project map.
@@ -42,6 +43,85 @@ fn embedded_std_project_check_resolves_project_and_std_graph() {
 }
 
 #[test]
+fn entry_compilation_propagates_all_six_static_root_adapters() {
+	let cases = [
+		("func main(): void = {}", "void"),
+		("func main(): Option<void> = None", "option"),
+		(
+			"func main(): Result<void, string> = Ok(value = {})",
+			"result",
+		),
+		("async func main(): void = {}", "task-void"),
+		("async func main(): Option<void> = None", "task-option"),
+		(
+			"async func main(): Result<void, string> = Ok(value = {})",
+			"task-result",
+		),
+	];
+	for (source, expected) in cases {
+		let load = |key: &str| (key == "main").then(|| source.to_string());
+		let compiled =
+			compile_project_with_embedded_std_and_options("main", &load, &CompilerOptions::default())
+				.expect("root project should compile");
+		let actual = match compiled.entry_root.as_ref().expect("entry adapter") {
+			CompiledEntryRoot::Void => "void",
+			CompiledEntryRoot::Option { binding } => {
+				assert!(!binding.is_empty());
+				"option"
+			}
+			CompiledEntryRoot::Result { binding } => {
+				assert!(!binding.is_empty());
+				"result"
+			}
+			CompiledEntryRoot::TaskVoid => "task-void",
+			CompiledEntryRoot::TaskOption { binding } => {
+				assert!(!binding.is_empty());
+				"task-option"
+			}
+			CompiledEntryRoot::TaskResult { binding } => {
+				assert!(!binding.is_empty());
+				"task-result"
+			}
+		};
+		assert_eq!(actual, expected);
+	}
+}
+
+#[test]
+fn ordinary_build_is_an_inert_importable_module_without_node_launcher_policy() {
+	let load = |key: &str| (key == "main").then(|| "func main(): Option<void> = None".to_string());
+	let compiled = compile_project_library_with_embedded_std_and_options(
+		"main",
+		&load,
+		&CompilerOptions::default(),
+	)
+	.expect("library project should compile");
+	assert_eq!(compiled.entry_root, None);
+	for forbidden in [
+		"nymphStartRoot",
+		"execution cancelled",
+		"main returned None",
+		"main();",
+	] {
+		assert!(
+			!compiled.js.contains(forbidden),
+			"ordinary module contains {forbidden:?}"
+		);
+	}
+	let output = std::process::Command::new("node")
+		.args(["--input-type=module", "--eval", &compiled.js])
+		.output()
+		.expect("Node should import the ordinary module");
+	assert!(
+		output.status.success(),
+		"{}",
+		String::from_utf8_lossy(&output.stderr)
+	);
+	assert!(output.stdout.is_empty());
+	assert!(output.stderr.is_empty());
+}
+
+#[test]
 fn project_modules_import_one_shared_box_runtime_instead_of_inlining_it() {
 	let files = FxHashMap::from_iter([
 		(
@@ -56,7 +136,9 @@ fn project_modules_import_one_shared_box_runtime_instead_of_inlining_it() {
 	let helper = &sources["helper"];
 
 	assert!(
-		helper.contains("import { NInt } from \"std/box\";"),
+		helper.lines().any(|line| line.starts_with("import { ")
+			&& line.contains("NInt")
+			&& line.ends_with("from \"std/box\";")),
 		"boxed project values should import the canonical runtime: {helper}"
 	);
 	assert!(
@@ -294,7 +376,7 @@ fn run_project(files: FxHashMap<&'static str, &'static str>, call_fn: &str, args
 	let call_symbol = compiled.entry_symbol(call_fn);
 	let mut js = compiled.js;
 	js.push_str(&format!("\n{}();\n", compiled.entry_main));
-	js.push_str(&format!("console.log({call_symbol}({args}).v);\n"));
+	js.push_str(&format!("console.log(String({call_symbol}({args}).v));\n"));
 	static COUNTER: AtomicU64 = AtomicU64::new(0);
 	let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
 	let dir = std::env::temp_dir();
@@ -401,6 +483,60 @@ fn imported_struct_construction_lowers_to_new_not_a_plain_call() {
 }
 
 #[test]
+fn imported_struct_clone_preserves_private_fields_without_rerunning_defaults() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/vault with (Vault)\nfunc main(): void = {}\nfunc result(): int = { let source = Vault.make(1, 9)\nlet updated = Vault(...source, shown = 2)\nupdated.shown * 10 + updated.reveal() }",
+		),
+		(
+			"vault",
+			"public struct Vault(public shown: int, private secret: int = 7) { public namespace func make(shown: int, secret: int): Vault = Vault(shown = shown, secret = secret)\npublic func reveal(): int = this.secret }",
+		),
+	]);
+	assert_eq!(run_project(files, "result", ""), "29");
+}
+
+#[test]
+fn imported_struct_hidden_fields_block_fresh_construction_and_require_pattern_omission() {
+	let fresh = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/vault with (Vault)\nfunc main(): void = {}\nfunc bad(): Vault = Vault(shown = 1)",
+		),
+		(
+			"vault",
+			"public struct Vault(public shown: int, private secret: int = 7)",
+		),
+	]);
+	let diagnostics = check_project("main", &loader(fresh));
+	assert!(diagnostics.iter().any(|diagnostic| {
+		diagnostic
+			.diag
+			.message
+			.contains("cannot be constructed fresh because it has hidden fields")
+	}));
+
+	let pattern = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/vault with (Vault)\nfunc main(): void = {}\nfunc bad(value: Vault): int = match (value) { Vault(shown) -> shown }",
+		),
+		(
+			"vault",
+			"public struct Vault(public shown: int, private secret: int)",
+		),
+	]);
+	let diagnostics = check_project("main", &loader(pattern));
+	assert!(diagnostics.iter().any(|diagnostic| {
+		diagnostic
+			.diag
+			.message
+			.contains("partial struct pattern must end with anonymous `...`")
+	}));
+}
+
+#[test]
 fn same_module_struct_pattern_matches_after_own_name_mangling() {
 	// A single-file project (no imports at all) still goes through the
 	// project driver's own-name mangling (every module gets a `$m{tag}$`
@@ -408,7 +544,7 @@ fn same_module_struct_pattern_matches_after_own_name_mangling() {
 	// matching a struct declared IN THE SAME MODULE must still resolve.
 	let files = FxHashMap::from_iter([(
 		"main",
-		"struct Point(x: int, y: int)\nfunc main(): void = {}\nfunc result(): int = match (Point(x = 1, y = 2)) { Point(x, y) -> x + y }",
+		"struct Point(x: int, y: int)\nfunc main(): void = {}\nfunc result(): int = match (Point(x = 1, y = 2)) { Point(x = x, y = y) -> x + y }",
 	)]);
 	let diags = check_project("main", &loader(files));
 	assert!(diags.is_empty(), "expected a clean project, got: {diags:?}");
@@ -418,7 +554,7 @@ fn same_module_struct_pattern_matches_after_own_name_mangling() {
 fn same_module_struct_pattern_runs_under_node() {
 	let files = FxHashMap::from_iter([(
 		"main",
-		"struct Point(x: int, y: int)\nfunc main(): void = {}\nfunc result(): int = match (Point(x = 1, y = 2)) { Point(x, y) -> x + y }",
+		"struct Point(x: int, y: int)\nfunc main(): void = {}\nfunc result(): int = match (Point(x = 1, y = 2)) { Point(x = x, y = y) -> x + y }",
 	)]);
 	let out = run_project(files, "result", "");
 	assert_eq!(out, "3");
@@ -633,20 +769,14 @@ fn a_with_name_colliding_with_a_namespace_name_is_a_diagnostic() {
 }
 
 #[test]
-fn project_module_cannot_be_silently_replaced_by_a_runtime_module() {
+fn project_module_named_like_a_removed_runtime_shim_remains_distinct() {
 	let files = FxHashMap::from_iter([
 		("main", "import @/std/option\nfunc main(): void = {}"),
 		("std/option", "public func project_value(): int = 1"),
 	]);
-	let diags = match compile_project("main", &loader(files)) {
-		Ok(_) => panic!("the canonical runtime module must not overwrite a project dependency"),
-		Err(diags) => diags,
-	};
 	assert!(
-		diags
-			.iter()
-			.any(|d| d.diag.code == "STABLE-RUNTIME-MODULE-COLLISION"),
-		"expected a runtime-module collision diagnostic, got: {diags:?}"
+		compile_project("main", &loader(files)).is_ok(),
+		"the compiler runtime's exact owner must not collide with a project std/option module"
 	);
 }
 
@@ -670,6 +800,15 @@ fn project_module_cannot_be_silently_replaced_by_an_intrinsic_module() {
 
 #[test]
 fn canonical_runtime_functions_are_emitted_once_for_multiple_consumers() {
+	std::thread::Builder::new()
+		.stack_size(8 * 1024 * 1024)
+		.spawn(canonical_runtime_functions_are_emitted_once)
+		.unwrap()
+		.join()
+		.unwrap();
+}
+
+fn canonical_runtime_functions_are_emitted_once() {
 	let files = FxHashMap::from_iter([
 		(
 			"main",
@@ -689,20 +828,30 @@ fn canonical_runtime_functions_are_emitted_once_for_multiple_consumers() {
 	let sort_declarations = list
 		.lines()
 		.filter(|line| {
-			line.starts_with("function ") && line.contains("$list$i") && line.contains("$sort(")
+			line.starts_with("let ")
+				&& line.contains(" = nymphCallable(function(")
+				&& line.contains("$list$i")
+				&& line
+					.split_once(" =")
+					.is_some_and(|(binding, _)| binding.ends_with("$sort"))
 		})
 		.collect::<Vec<_>>();
 	assert_eq!(sort_declarations.len(), 1, "{list}");
 	let sort_binding = sort_declarations[0]
-		.trim_start_matches("function ")
-		.split_once('(')
+		.trim_start_matches("let ")
+		.split_once(" =")
 		.unwrap()
 		.0;
 	let ops = &sources["@nymph/runtime/ops"];
 	let compare_declarations = ops
 		.lines()
 		.filter(|line| {
-			line.starts_with("function ") && line.contains("$int$i") && line.contains("$compare_to(")
+			line.starts_with("let ")
+				&& line.contains(" = nymphCallable(function(")
+				&& line.contains("$int$i")
+				&& line
+					.split_once(" =")
+					.is_some_and(|(binding, _)| binding.ends_with("$compare_to"))
 		})
 		.collect::<Vec<_>>();
 	assert_eq!(compare_declarations.len(), 1, "{ops}");
@@ -752,7 +901,13 @@ fn native_generic_dispatch_members_are_declared_once_by_exact_identity() {
 		.flat_map(|(module, source)| {
 			source
 				.lines()
-				.filter(|line| line.starts_with("function ") && line.contains("$plus("))
+				.filter(|line| {
+					line.starts_with("let ")
+						&& line.contains(" = nymphCallable(function(")
+						&& line
+							.split_once(" =")
+							.is_some_and(|(binding, _)| binding.ends_with("$plus"))
+				})
 				.map(move |line| (module.as_str(), line))
 		})
 		.collect::<Vec<_>>();
@@ -831,6 +986,34 @@ fn cross_module_enum_match_runs_under_node() {
 		out.status.success(),
 		"cross-module enum match crashed under Node:\n{}",
 		String::from_utf8_lossy(&out.stderr)
+	);
+}
+
+#[test]
+fn cross_module_enum_views_check_deterministically() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/view with (View, widen)\nimport @/source with (Source, make)\nfunc direct(value: Source): View = value\nfunc use(): View = direct(make())\nfunc main(): void = { let value = widen(make()) }",
+		),
+		(
+			"source",
+			"public enum Source { A, B }\npublic func make(): Source = Source.A",
+		),
+		(
+			"view",
+			"import @/source with (Source)\npublic enum View { ...Source, C }\npublic func widen(value: Source): View = value",
+		),
+	]);
+	let first = check_project("main", &loader(files.clone()));
+	let second = check_project("main", &loader(files));
+	assert!(
+		first.is_empty(),
+		"expected a clean fixed point, got: {first:?}"
+	);
+	assert_eq!(
+		first, second,
+		"fixed-point diagnostics must be deterministic"
 	);
 }
 

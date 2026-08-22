@@ -11,6 +11,33 @@ use nymph_sema::{
 	StableShapeLookup, StableShapeLookupError, StableShapeRequest,
 };
 
+fn linked_abi(marker: &str, module: &str, symbol: &str) -> ExternalAbi {
+	ExternalAbi {
+		marker: marker.into(),
+		callable: nymph_sema::ExternalCallable::Linked {
+			adapter: nymph_sema::ExternalAdapterId {
+				module: module.into(),
+				symbol: symbol.into(),
+			},
+		},
+		effects: nymph_sema::EffectRow::pure(),
+		audit: nymph_sema::ExternalAudit::default(),
+		call_mode: nymph_sema::ExternalCallMode::Ordinary,
+		marshal: nymph_sema::ExternalMarshalPlan::default(),
+	}
+}
+
+fn deferred_abi(marker: &str) -> ExternalAbi {
+	ExternalAbi {
+		marker: marker.into(),
+		callable: nymph_sema::ExternalCallable::Deferred,
+		effects: nymph_sema::EffectRow::pure(),
+		audit: nymph_sema::ExternalAudit::default(),
+		call_mode: nymph_sema::ExternalCallMode::Ordinary,
+		marshal: nymph_sema::ExternalMarshalPlan::default(),
+	}
+}
+
 fn module(origin: ModuleOrigin, project: &str, path: &str) -> ModuleIdentity {
 	ModuleIdentity {
 		origin,
@@ -90,6 +117,9 @@ impl StableNameLookup for FakeLookup {
 				"{}:{}",
 				module.project, module.path
 			))),
+			ModuleOrigin::ResolvedPackage { node } => CanonicalModuleSpecifier::Importable(
+				EcoString::from(format!("package::{node}::{}", module.path)),
+			),
 		})
 	}
 }
@@ -146,14 +176,7 @@ fn shape_requests_cover_exact_lowering_facts_and_recovery() {
 		"host",
 	);
 	let request = StableShapeRequest::ExternalAbi(id.clone());
-	let abi = ExternalAbi {
-		marker: "clock".into(),
-		callable: nymph_sema::ExternalCallable::Linked {
-			module: "runtime/time".into(),
-			symbol: "clock".into(),
-		},
-		marshal: None,
-	};
+	let abi = linked_abi("clock", "runtime/time", "clock");
 	let mut lookup = FakeLookup::default();
 	lookup.shapes.insert(
 		request.clone(),
@@ -245,7 +268,6 @@ fn lowered_fragments_encode_placement_and_ordered_deduplicated_demands() {
 
 	let _value = LoweredHirFragment::TopLevelValue(HirLet {
 		name: "answer".into(),
-		mutable: false,
 		value: HirExpr::Bool(false),
 	});
 	let method = || HirMethod {
@@ -256,15 +278,13 @@ fn lowered_fragments_encode_placement_and_ordered_deduplicated_demands() {
 	let variants = [
 		LoweredHirFragment::TopLevelExternal {
 			name: EmittedBindingName::new("host"),
-			abi: ExternalAbi {
-				marker: "host".into(),
-				callable: nymph_sema::ExternalCallable::Deferred,
-				marshal: None,
-			},
+			abi: deferred_abi("host"),
+			function: None,
 		},
 		LoweredHirFragment::StructShell(HirClass {
 			name: "Counter".into(),
 			fields: vec![],
+			defaults: vec![],
 			methods: vec![],
 			statics: vec![],
 		}),

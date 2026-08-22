@@ -11,7 +11,7 @@
 //! registry names, and strips + filters it (via `nymph_codegen::strip_ts_to_js`)
 //! into virtual sources merged with the stable emitted project before bundling.
 //!
-//! `list.ts`'s `get`/`first`/`last`/`pop`
+//! L1 extension (the Option ABI seam): `list.ts`'s `get`/`first`/`last`/`pop`
 //! all return `Option<T>`, built by calling the SAME `Option` their `.ts`
 //! source imports (`import { Option } from "../option"`). Two things make
 //! that import resolve to the compiler's canonical, source-derived Option:
@@ -76,18 +76,7 @@ const OPTION: ImportDependency = ImportDependency {
 	destination: "std/option",
 	target: DependencyTarget::CompilerRuntimeRole(CompilerRuntimeRole::Option),
 };
-const DISPLAY: ImportDependency = ImportDependency {
-	source: "./display",
-	destination: "std/display",
-	target: DependencyTarget::HostModule("std/display"),
-};
-
 const HOST_MODULES: &[HostModuleDescriptor] = &[
-	HostModuleDescriptor {
-		module: "std/display",
-		provider: SourceProvider::EmbeddedTs(include_str!("../../../stdlib/src/display.ts")),
-		dependencies: &[BOX],
-	},
 	HostModuleDescriptor {
 		module: "std/equality",
 		provider: SourceProvider::EmbeddedTs(include_str!("../../../stdlib/src/ops/equality.ts")),
@@ -96,11 +85,6 @@ const HOST_MODULES: &[HostModuleDescriptor] = &[
 	HostModuleDescriptor {
 		module: "std/comparison",
 		provider: SourceProvider::EmbeddedTs(include_str!("../../../stdlib/src/ops/comparison.ts")),
-		dependencies: &[BOX],
-	},
-	HostModuleDescriptor {
-		module: "std/hash",
-		provider: SourceProvider::EmbeddedTs(include_str!("../../../stdlib/src/hash.ts")),
 		dependencies: &[BOX],
 	},
 	HostModuleDescriptor {
@@ -114,9 +98,14 @@ const HOST_MODULES: &[HostModuleDescriptor] = &[
 		dependencies: &[BOX, OPTION],
 	},
 	HostModuleDescriptor {
+		module: "std/collections/set",
+		provider: SourceProvider::EmbeddedTs(include_str!("../../../stdlib/src/collections/set.ts")),
+		dependencies: &[BOX],
+	},
+	HostModuleDescriptor {
 		module: "std/io",
 		provider: SourceProvider::EmbeddedTs(include_str!("../../../stdlib/src/io.ts")),
-		dependencies: &[DISPLAY],
+		dependencies: &[BOX],
 	},
 	HostModuleDescriptor {
 		module: "std/math/intrinsics",
@@ -137,7 +126,7 @@ const HOST_MODULES: &[HostModuleDescriptor] = &[
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Delivery {
-	Callable,
+	Callable(nymph_sema::ExternalCallMode),
 	Value(MarshalKind),
 }
 
@@ -203,6 +192,16 @@ pub(crate) enum HostRuntimeGraphError {
 	},
 	UnownedLinkageModule {
 		module: &'static str,
+	},
+	MissingAdapter {
+		module: String,
+		symbol: String,
+	},
+	MismatchedAdapter {
+		module: String,
+		symbol: String,
+		expected: Delivery,
+		actual: Delivery,
 	},
 }
 
@@ -384,6 +383,42 @@ impl HostRuntimeGraph {
 		self.exports.get(&(module, symbol)).copied()
 	}
 
+	pub(crate) fn validate_abi(
+		&self,
+		abi: &nymph_sema::ExternalAbi,
+	) -> Result<(), HostRuntimeGraphError> {
+		let Some(adapter) = abi.adapter() else {
+			return Ok(());
+		};
+		let expected = nymph_hir::linkage::lookup_value(&abi.marker)
+			.ok()
+			.filter(|value| {
+				value.linked.module == adapter.module && value.linked.symbol == adapter.symbol
+			})
+			.map_or(Delivery::Callable(abi.call_mode), |value| {
+				Delivery::Value(value.marshal)
+			});
+		let Some(actual) = self
+			.exports
+			.get(&(adapter.module.as_str(), adapter.symbol.as_str()))
+			.copied()
+		else {
+			return Err(HostRuntimeGraphError::MissingAdapter {
+				module: adapter.module.to_string(),
+				symbol: adapter.symbol.to_string(),
+			});
+		};
+		if actual != expected {
+			return Err(HostRuntimeGraphError::MismatchedAdapter {
+				module: adapter.module.to_string(),
+				symbol: adapter.symbol.to_string(),
+				expected,
+				actual,
+			});
+		}
+		Ok(())
+	}
+
 	pub(crate) fn semantic_dependencies(
 		&self,
 		module: &str,
@@ -405,7 +440,17 @@ impl HostRuntimeGraph {
 		}
 	}
 
-	pub(crate) fn module_sources(&self, option_enum_name: &str) -> FxHashMap<String, String> {
+	pub(crate) fn module_sources(
+		&self,
+		option_enum_name: &str,
+		option_module: &str,
+		echo: bool,
+	) -> FxHashMap<String, String> {
+		let option_import = if option_enum_name == "Option" {
+			format!("import {{ Option }} from \"{option_module}\";")
+		} else {
+			format!("import {{ {option_enum_name} as Option }} from \"{option_module}\";")
+		};
 		let mut symbols: FxHashMap<&str, Vec<&str>> = FxHashMap::default();
 		for &(module, symbol) in self.exports.keys() {
 			symbols.entry(module).or_default().push(symbol);
@@ -421,15 +466,18 @@ impl HostRuntimeGraph {
 						.iter()
 						.map(|dependency| (dependency.source, dependency.destination))
 						.collect::<Vec<_>>();
-					sources.insert(
-						descriptor.module.to_string(),
-						nymph_codegen::strip_ts_to_js(source, &keep, &rewrites),
-					);
+					let source = nymph_codegen::strip_ts_to_js(source, &keep, &rewrites)
+						.replace("import { Option } from \"std/option\";", &option_import);
+					sources.insert(descriptor.module.to_string(), source);
 				}
 				SourceProvider::GeneratedBox => {
 					sources.insert(
 						descriptor.module.to_string(),
-						nymph_codegen::box_module_source_with_option_enum(option_enum_name),
+						if echo {
+							nymph_codegen::box_module_source_with_option_enum(option_enum_name)
+						} else {
+							nymph_codegen::box_module_source_with_option_enum_release(option_enum_name)
+						},
 					);
 				}
 			}
@@ -446,7 +494,7 @@ fn linkage_exports() -> Vec<HostExport> {
 			module: linked.module,
 			symbol: linked.symbol,
 			receiver_tag: linked.receiver_tag,
-			delivery: Delivery::Callable,
+			delivery: Delivery::Callable(nymph_sema::ExternalCallMode::Ordinary),
 		});
 	}
 	for (marker, value) in nymph_hir::linkage::VALUE_REGISTRY {
@@ -480,7 +528,7 @@ mod tests {
 			module,
 			symbol,
 			receiver_tag: None,
-			delivery: Delivery::Callable,
+			delivery: Delivery::Callable(nymph_sema::ExternalCallMode::Ordinary),
 		}
 	}
 
@@ -490,7 +538,7 @@ mod tests {
 		for (_, linked) in nymph_hir::linkage::REGISTRY {
 			assert_eq!(
 				graph.delivery(linked.module, linked.symbol),
-				Some(Delivery::Callable)
+				Some(Delivery::Callable(nymph_sema::ExternalCallMode::Ordinary))
 			);
 		}
 		for (_, value) in nymph_hir::linkage::VALUE_REGISTRY {
@@ -505,19 +553,106 @@ mod tests {
 		);
 	}
 
+	fn linked_abi(
+		module: &str,
+		symbol: &str,
+		call_mode: nymph_sema::ExternalCallMode,
+	) -> nymph_sema::ExternalAbi {
+		nymph_sema::ExternalAbi {
+			marker: symbol.into(),
+			callable: nymph_sema::ExternalCallable::Linked {
+				adapter: nymph_sema::ExternalAdapterId {
+					module: module.into(),
+					symbol: symbol.into(),
+				},
+			},
+			effects: nymph_sema::EffectRow::pure(),
+			audit: nymph_sema::ExternalAudit::default(),
+			call_mode,
+			marshal: nymph_sema::ExternalMarshalPlan::default(),
+		}
+	}
+
 	#[test]
-	fn generated_io_source_uses_the_canonical_display_specifier() {
-		let sources = HostRuntimeGraph::compiler_facts().module_sources("Option");
+	fn adapter_registry_validates_ordinary_cancellable_missing_and_mismatched_plans() {
+		let descriptors = [HostModuleDescriptor {
+			module: "std/test",
+			provider: SourceProvider::EmbeddedTs(
+				"export const ordinary = () => {}; export const cancellable = () => {};",
+			),
+			dependencies: &[],
+		}];
+		let mut ordinary = test_export("std/test", "ordinary");
+		let mut cancellable = test_export("std/test", "cancellable");
+		cancellable.delivery = Delivery::Callable(nymph_sema::ExternalCallMode::Cancellable);
+		let graph = HostRuntimeGraph::build(&descriptors, &[ordinary, cancellable]).unwrap();
+		assert!(
+			graph
+				.validate_abi(&linked_abi(
+					"std/test",
+					"ordinary",
+					nymph_sema::ExternalCallMode::Ordinary,
+				))
+				.is_ok()
+		);
+		assert!(
+			graph
+				.validate_abi(&linked_abi(
+					"std/test",
+					"cancellable",
+					nymph_sema::ExternalCallMode::Cancellable,
+				))
+				.is_ok()
+		);
+		assert!(matches!(
+			graph.validate_abi(&linked_abi(
+				"std/test",
+				"missing",
+				nymph_sema::ExternalCallMode::Ordinary,
+			)),
+			Err(HostRuntimeGraphError::MissingAdapter { .. })
+		));
+		assert!(matches!(
+			graph.validate_abi(&linked_abi(
+				"std/test",
+				"ordinary",
+				nymph_sema::ExternalCallMode::Cancellable,
+			)),
+			Err(HostRuntimeGraphError::MismatchedAdapter { .. })
+		));
+		ordinary.delivery = Delivery::Value(MarshalKind::Float);
+		let graph = HostRuntimeGraph::build(&descriptors, &[ordinary]).unwrap();
+		assert!(matches!(
+			graph.validate_abi(&linked_abi(
+				"std/test",
+				"ordinary",
+				nymph_sema::ExternalCallMode::Ordinary,
+			)),
+			Err(HostRuntimeGraphError::MismatchedAdapter { .. })
+		));
+	}
+
+	#[test]
+	fn generated_io_source_uses_the_box_protocol_boundary() {
+		let sources = HostRuntimeGraph::compiler_facts().module_sources(
+			"Option",
+			"@nymph/runtime/std/option",
+			false,
+		);
 		let io_js = sources
 			.get("std/io")
 			.expect("expected the linked I/O runtime module to be injected");
-		assert!(io_js.contains("from \"std/display\""), "{io_js}");
-		assert!(!io_js.contains("from \"./display\""), "{io_js}");
+		assert!(io_js.contains("from \"std/box\""), "{io_js}");
+		assert!(io_js.contains("nymphProtocolDisplay"), "{io_js}");
 	}
 
 	#[test]
 	fn math_source_exports_every_registry_symbol_through_the_canonical_box_runtime() {
-		let sources = HostRuntimeGraph::compiler_facts().module_sources("Option");
+		let sources = HostRuntimeGraph::compiler_facts().module_sources(
+			"Option",
+			"@nymph/runtime/std/option",
+			false,
+		);
 		let math_js = sources
 			.get("std/math/intrinsics")
 			.expect("expected the linked math runtime module to be injected");
@@ -692,22 +827,24 @@ mod tests {
 
 	#[test]
 	fn injects_a_list_primitive_module_with_a_resolvable_option_import() {
-		let sources = HostRuntimeGraph::compiler_facts().module_sources("Option");
+		let sources = HostRuntimeGraph::compiler_facts().module_sources(
+			"Option",
+			"@nymph/runtime/std/option",
+			false,
+		);
 		let list_js = sources
 			.get("std/collections/list")
 			.expect("expected the linked-symbol registry module to be injected");
-		for symbol in ["length", "get", "remove", "slice", "splice"] {
+		for symbol in ["length", "get", "appended", "replaced", "slice"] {
 			assert!(
 				list_js.contains(symbol),
 				"expected the linked `{symbol}` export to survive stripping, got:\n{list_js}"
 			);
 		}
-		// `get` and `remove` construct `Option.Some`/`Option.None`
-		// — the import must survive, rewritten to the injected virtual
-		// `std/option` key (never the original, unresolvable `"../option"`).
+		// `get` constructs `Option.Some`/`Option.None`; import the exact owner.
 		assert!(
-			list_js.contains("import { Option } from \"std/option\";"),
-			"expected the `Option` import to survive, rewritten to `std/option`, got:\n{list_js}"
+			list_js.contains("from \"@nymph/runtime/std/option\";"),
+			"expected the `Option` import to target its exact owner, got:\n{list_js}"
 		);
 		assert!(
 			!list_js.contains("\"../option\""),
@@ -721,32 +858,26 @@ mod tests {
 
 	#[test]
 	fn injects_a_map_module_with_every_linked_symbol_and_a_resolvable_option_import() {
-		let sources = HostRuntimeGraph::compiler_facts().module_sources("Option");
+		let sources = HostRuntimeGraph::compiler_facts().module_sources(
+			"Option",
+			"@nymph/runtime/std/option",
+			false,
+		);
 		let map_js = sources
 			.get("std/collections/map")
 			.expect("expected the linked-symbol registry module to be injected");
 		for symbol in [
-			"size",
-			"get",
-			"insert",
-			"remove",
-			"clear",
-			"keys",
-			"values",
-			"entries",
-			"to_string",
+			"size", "get", "inserted", "removed", "keys", "values", "entries",
 		] {
 			assert!(
 				map_js.contains(symbol),
 				"expected the linked `{symbol}` export to survive stripping, got:\n{map_js}"
 			);
 		}
-		// `get`/`remove` both construct `Option.Some`/`Option.None` — the
-		// import must survive, rewritten to the canonical `std/option`
-		// key (never the original, unresolvable `"../option"`).
+		// `get` constructs `Option.Some`/`Option.None`; import the exact owner.
 		assert!(
-			map_js.contains("import { Option } from \"std/option\";"),
-			"expected the `Option` import to survive, rewritten to `std/option`, got:\n{map_js}"
+			map_js.contains("from \"@nymph/runtime/std/option\";"),
+			"expected the `Option` import to target its exact owner, got:\n{map_js}"
 		);
 		assert!(
 			!map_js.contains("\"../option\""),
@@ -756,10 +887,10 @@ mod tests {
 			map_js.contains("from \"std/box\""),
 			"map results must use the canonical box module: {map_js}"
 		);
-		// `get`/`remove` must build `Option.Some({ value: .. })`
+		// `get` must build `Option.Some({ value: .. })`
 		// — a named-field object, not a bare positional value — to
 		// interoperate with the checker's generated `Some(value)` pattern
-		// binding (see `map.ts`'s own doc comment and `list.ts`).
+		// binding (see `map.ts`'s own doc comment / L1's `list.ts` template).
 		assert!(
 			map_js.contains("Option.Some({ value:") || map_js.contains("Option.Some({ value }"),
 			"expected `get`/`remove` to build a named-field `Option.Some`, got:\n{map_js}"
@@ -767,21 +898,12 @@ mod tests {
 	}
 
 	#[test]
-	fn injects_the_hash_intrinsic() {
-		let sources = HostRuntimeGraph::compiler_facts().module_sources("Option");
-		let hash_js = sources
-			.get("std/hash")
-			.expect("expected the hash runtime module to be injected");
-		assert!(hash_js.contains("export const hash"), "{hash_js}");
-		assert!(
-			hash_js.contains("from \"std/box\""),
-			"hash must share the box runtime's structural implementation: {hash_js}"
-		);
-	}
-
-	#[test]
 	fn does_not_fabricate_the_canonical_option_module() {
-		let sources = HostRuntimeGraph::compiler_facts().module_sources("Option");
+		let sources = HostRuntimeGraph::compiler_facts().module_sources(
+			"Option",
+			"@nymph/runtime/std/option",
+			false,
+		);
 		assert!(
 			!sources.contains_key("std/option"),
 			"the project compiler must be the sole owner of canonical std/option"
@@ -798,7 +920,7 @@ mod tests {
 				vec![CompilerRuntimeRole::Option]
 			);
 		}
-		for module in ["std/hash", "std/display", "std/io", "std/math/intrinsics"] {
+		for module in ["std/io", "std/math/intrinsics"] {
 			assert_eq!(
 				HostRuntimeGraph::compiler_facts()
 					.semantic_dependencies(module)

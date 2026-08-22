@@ -16,6 +16,7 @@ nymph-hir = { workspace = true }
 nymph-syntax = { workspace = true }
 ecow = { workspace = true }
 ena = { workspace = true }
+num-bigint = { workspace = true }
 ordered-float = { workspace = true }
 rustc-hash = { workspace = true }
 salsa = { workspace = true }

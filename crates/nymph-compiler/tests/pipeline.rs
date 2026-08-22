@@ -1,7 +1,7 @@
 //! Integration tests for the `nymph-compiler` facade: `compile` and `check`,
 //! plus their entry-mode counterparts `compile_entry` and `check_entry`.
 
-use nymph_compiler::{Severity, check, check_entry, compile, compile_entry, compile_report};
+use nymph_compiler::{check, check_entry, compile, compile_entry, compile_report};
 
 fn run_node(js: &str, call: &str) -> String {
 	use std::io::Write;
@@ -12,7 +12,7 @@ fn run_node(js: &str, call: &str) -> String {
 		std::thread::current().name().unwrap_or("test")
 	));
 	let mut file = std::fs::File::create(&path).expect("create temporary JavaScript module");
-	write!(file, "{js}\nconsole.log({call});").expect("write temporary JavaScript module");
+	write!(file, "{js}\nconsole.log(String({call}));").expect("write temporary JavaScript module");
 
 	let output = std::process::Command::new("node")
 		.arg(&path)
@@ -36,25 +36,74 @@ fn compiles_a_valid_program() {
 }
 
 #[test]
+fn ordinary_javascript_emission_erases_effect_declarations_and_rows() {
+	let js = compile(
+		"effect Io\nfunc source(): !Io = {}\nfunc run(): !Io = source()",
+		"effects",
+	)
+	.expect("effectful source should compile");
+	assert!(js.contains("let source = nymphCallable(function("));
+	assert!(js.contains("let run = nymphCallable(function("));
+	assert!(!js.contains("effect Io"));
+	assert!(!js.contains("!Io"));
+}
+
+#[test]
+fn async_syntax_runs_through_the_activation_task_runtime() {
+	let js = compile(
+		"async func nested(): int = async { 42 }.await",
+		"async_runtime",
+	)
+	.expect("async source should compile through stable lowering");
+	assert_eq!(run_node(&js, "(await nested().drive(null)).v"), "42");
+	assert!(!js.contains("async function nested"));
+}
+
+#[test]
+fn spawned_handle_observation_keeps_the_host_outcome_layer() {
+	let js = compile(
+		"async func child(): Result<int, string> = Ok(value = 7)\nasync func observed() = { let handle = child().spawn() handle.await }",
+		"async_handle",
+	)
+	.expect("spawn and handle observation should compile");
+	assert_eq!(
+		run_node(
+			&js,
+			"((outcome) => `${outcome.tag}:${outcome.value.value.v}`)(await observed().drive(null))"
+		),
+		"produced:7"
+	);
+}
+
+#[test]
+fn cancellation_exits_an_accepted_async_function_as_a_host_outcome() {
+	let js = compile(
+		"async func pending(): int = async { 1 }.await",
+		"async_cancel",
+	)
+	.expect("cancellable async source should compile");
+	assert_eq!(
+		run_node(
+			&js,
+			"await (async () => { const handle = pending().spawn(null); handle.cancel(); return (await handle.observe()).tag; })()"
+		),
+		"cancelled"
+	);
+}
+
+#[test]
 fn optional_chaining_maps_canonical_option_and_result_and_is_lazy() {
 	let source = r#"
 		struct Child(name: string)
 		struct Item(name: string, child: Child, maybe: Option<string>) {
 		  func add(value: int): int = value + 1
 		}
-		struct Counter(value: int) {
-		  mut func bump(): int = { this.value += 1 this.value }
-		  mut func wrap(item: Item): Option<Item> = {
-		    this.value += 1
-		    Some(value = item)
-		  }
-		}
-
 		func item(): Item = Item(name = "nymph", child = Child(name = "nested"), maybe = Some(value = "inner"))
 		func field_some(): string = Some(value = item())?.name ?? "missing"
 		func field_none(): string = { let value: Option<Item> = None value?.name ?? "missing" }
 		func method_some(): int = Some(value = item())?.add(41) ?? 0
 		func index_some(): int = Some(value = #[7, 8])?.[1] ?? 0
+		func slice_some(): #[int] = Some(value = #[1, 2, 3, 4])?.[1..3] ?? #[]
 		func chained(): string = Some(value = item())?.child?.name ?? "missing"
 		func result_ok(): string = {
 		  let value: Result<Item, string> = Ok(value = item())
@@ -68,23 +117,14 @@ fn optional_chaining_maps_canonical_option_and_result_and_is_lazy() {
 		  Some(value = Some(value)) -> value,
 		  _ -> "flattened"
 		}
-		func evaluation_count(): int = {
-		  let mut counter = Counter(value = 0)
-		  let none_item: Option<Item> = None
-		  let none_list: Option<#[int]> = None
-		  let ignored_argument = none_item?.add(counter.bump())
-		  let ignored_index = none_list?.[counter.bump()]
-		  let mapped = counter.wrap(item())?.name
-		  counter.value
-		}
 	"#;
 	let js = compile(source, "optional_runtime").expect("optional chaining should compile");
 	assert_eq!(
 		run_node(
 			&js,
-			"[field_some().v, field_none().v, method_some().v, index_some().v, chained().v, result_ok().v, result_error().v, nested_is_not_flattened().v, evaluation_count().v].join('|')"
+			"[field_some().v, field_none().v, method_some().v, index_some().v, slice_some().v.map((value) => value.v).join(','), chained().v, result_ok().v, result_error().v, nested_is_not_flattened().v].join('|')"
 		),
-		"nymph|missing|42|8|nested|nymph|kept|inner|1"
+		"nymph|missing|42|8|2,3|nested|nymph|kept|inner"
 	);
 }
 
@@ -115,15 +155,10 @@ fn check_is_clean_for_a_valid_program() {
 }
 
 #[test]
-fn compile_report_preserves_warnings_with_javascript() {
+fn compile_report_accepts_exact_large_integers_without_warnings() {
 	let report = compile_report("func f(): int = 9007199254740992", "test");
 	assert!(report.js.is_some());
-	assert!(
-		report
-			.diagnostics
-			.iter()
-			.any(|d| d.severity == Severity::Warning)
-	);
+	assert!(report.diagnostics.is_empty(), "{:#?}", report.diagnostics);
 }
 
 #[test]
@@ -188,7 +223,7 @@ fn compile_entry_preserves_callable_names_and_canonical_option_identity() {
 
 	for callable in ["main", "intrinsic_option", "source_option"] {
 		assert!(
-			js.contains(&format!("function {callable}(")),
+			js.contains(&format!("let {callable} = nymphCallable(function(")),
 			"standalone entry callable `{callable}` must remain unmangled: {js}"
 		);
 	}
@@ -206,7 +241,10 @@ fn standalone_diagnostic_paths_never_become_virtual_module_keys() {
 	for path in ["std/option", "std/box", "std::anything"] {
 		let js = compile("func identity(n: int): int = n", path)
 			.unwrap_or_else(|diags| panic!("diagnostic path `{path}` must compile: {diags:?}"));
-		assert!(js.contains("function identity("), "path `{path}`: {js}");
+		assert!(
+			js.contains("let identity = nymphCallable(function("),
+			"path `{path}`: {js}"
+		);
 	}
 }
 

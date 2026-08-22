@@ -16,11 +16,20 @@ use crate::project_support::{ManifestSelection, ProjectOperation};
 pub(crate) struct CheckCommand {
 	/// Path to the `.nym` source file to check (defaults to project build.entry).
 	file: Option<PathBuf>,
+
+	/// Check with the release compiler profile.
+	#[arg(long)]
+	release: bool,
 }
 
 impl NymphCommand for CheckCommand {
 	fn run(&self, manifest: &ManifestSelection) -> i32 {
-		let operation = match ProjectOperation::resolve(self.file.as_deref(), manifest) {
+		let profile = if self.release {
+			nymph_compiler::BuildProfile::Release
+		} else {
+			nymph_compiler::BuildProfile::Development
+		};
+		let operation = match ProjectOperation::resolve(self.file.as_deref(), manifest, profile) {
 			Some(operation) => operation,
 			None => return 1,
 		};

@@ -9,17 +9,19 @@
 use std::collections::BTreeSet;
 
 use ecow::EcoString;
+use num_bigint::BigInt;
 use nymph_ast::{
 	Ident, NodeId, Span, Spanned,
 	decl::{Declaration, ImplMember},
 	expr::{CallArg, Expr, ExprKind, ListItem, MapEntry, RangeKind, Statement, StringPart},
-	ops::{AssignOperator, BinaryOperator, PrefixOperator},
+	ops::{BinaryOperator, PrefixOperator},
 	ty::Type,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::annotate::{
 	DispatchKind, IterMode, Resolution, ResolvedControlTarget, ResolvedControlTargetKind,
+	StructConstructionMode, StructConstructionPlan,
 };
 use crate::check::{
 	Checker, ControlLabel, ControlLabelKind, InstantiatedObligation, LoopBreakKind, PendingBound,
@@ -34,6 +36,12 @@ use crate::ty::{GenericArgs, Ty, TyKind};
 enum OptionalContainer {
 	Option(DefId, GenericArgs),
 	Result(DefId, GenericArgs),
+}
+
+enum IntegerConstant {
+	Value(BigInt),
+	Invalid(&'static str),
+	NotConstant,
 }
 
 /// Whether a resolved method is owned by canonical compiler or importable-stdlib
@@ -190,6 +198,7 @@ impl<'m> Checker<'m> {
 			kind,
 			loop_index,
 			result_ty,
+			state_bindings: None,
 		});
 	}
 
@@ -257,6 +266,12 @@ impl<'m> Checker<'m> {
 		body: &Expr,
 		ret: Ty,
 	) {
+		let definition = self
+			.effect_callables
+			.get(&name.1)
+			.cloned()
+			.or_else(|| self.current_effect_caller.clone());
+		let outer_effect_caller = std::mem::replace(&mut self.current_effect_caller, definition);
 		let outer_labels = std::mem::take(&mut self.control_labels);
 		self.push_control_label(
 			Some(name),
@@ -268,6 +283,7 @@ impl<'m> Checker<'m> {
 		self.resolve_anon(body, Some(ret));
 		self.check(body, ret);
 		self.control_labels = outer_labels;
+		self.current_effect_caller = outer_effect_caller;
 	}
 	// ── Body driver ──────────────────────────────────────────────────────────
 	pub(crate) fn check_bodies(&mut self) {
@@ -288,10 +304,44 @@ impl<'m> Checker<'m> {
 			match kind {
 				DefKind::Func => self.check_func_body(id, member),
 				DefKind::Let => self.check_let_body(id, member),
+				DefKind::Struct => self.check_struct_defaults(id, member),
 				DefKind::Namespace => self.check_namespace_bodies(id, member),
 				_ => {}
 			}
 		}
+	}
+
+	fn check_struct_defaults(&mut self, id: DefId, member: usize) {
+		let module = self.module;
+		let Declaration::Struct {
+			generics, fields, ..
+		} = &module.members[member]
+		else {
+			return;
+		};
+		let sig = self.sigs.structs[&id].clone();
+		self.param_bounds.clear();
+		self.param_bound_details.clear();
+		self.push_params(build_param_scope(generics));
+		self.record_param_bounds(generics, 0);
+		self.push_scope();
+		for (field, ((_, ty), metadata)) in fields
+			.iter()
+			.zip(sig.fields.iter().zip(&sig.field_metadata))
+		{
+			let Some(default) = &field.0.default else {
+				continue;
+			};
+			let previous_effect_caller =
+				std::mem::replace(&mut self.current_effect_caller, metadata.target.clone());
+			self.resolve_anon(default, Some(*ty));
+			self.check(default, *ty);
+			self.current_effect_caller = previous_effect_caller;
+			self.finalize_pending_operators();
+			self.finalize_pending_bounds();
+		}
+		self.pop_scope();
+		self.pop_params();
 	}
 
 	fn check_func_body(&mut self, id: DefId, member: usize) {
@@ -301,6 +351,10 @@ impl<'m> Checker<'m> {
 			_ => return, // external funcs have no body
 		};
 		let sig = self.sigs.funcs[&id].clone();
+		let body_ret = match self.interner.kind(sig.ret) {
+			TyKind::Task { output, .. } if meta.is_async => *output,
+			_ => sig.ret,
+		};
 
 		self.param_bounds.clear();
 		self.param_bound_details.clear();
@@ -308,15 +362,26 @@ impl<'m> Checker<'m> {
 		self.record_param_bounds(&meta.generics, 0);
 		self.push_scope();
 		for (param, psig) in meta.params.iter().zip(&sig.params) {
-			self.bind_pattern(&param.0.name, psig.ty, param.0.mutable);
+			self.bind_pattern(&param.0.name, psig.ty);
 		}
-		let prev = self.ret_ty.replace(sig.ret);
+		let prev = self.ret_ty.replace(body_ret);
 		// A function's own body is exactly the same kind of closure slot a
 		// `let` initializer is (see `check_let_body`'s matching call) — e.g.
 		// `func pred: (int) -> boolean = $ % 2 == 0` is just the top-level
 		// spelling of the same boundary the canonical `xs.filter($ % 2 == 0)`
 		// example forms as a call argument.
-		self.check_named_callable_body(&meta.name, body, sig.ret);
+		let previous_effect_caller = std::mem::replace(
+			&mut self.current_effect_caller,
+			self.defs.stable(id).cloned(),
+		);
+		if meta.is_async {
+			self.async_depth += 1;
+		}
+		self.check_named_callable_body(&meta.name, body, body_ret);
+		if meta.is_async {
+			self.async_depth -= 1;
+		}
+		self.current_effect_caller = previous_effect_caller;
 		self.ret_ty = prev;
 		// Drain this body's deferred operators now, while its `param_bounds` are
 		// still the ones just built above — see `pending_operators`'s doc comment.
@@ -364,10 +429,20 @@ impl<'m> Checker<'m> {
 					self.record_param_bounds(&meta.generics, 0);
 					self.push_scope();
 					for (parameter, checked) in meta.params.iter().zip(&sig.params) {
-						self.bind_pattern(&parameter.0.name, checked.ty, parameter.0.mutable);
+						self.bind_pattern(&parameter.0.name, checked.ty);
 					}
-					let previous = self.ret_ty.replace(sig.ret);
-					self.check_named_callable_body(&meta.name, body, sig.ret);
+					let body_ret = match self.interner.kind(sig.ret) {
+						TyKind::Task { output, .. } if meta.is_async => *output,
+						_ => sig.ret,
+					};
+					let previous = self.ret_ty.replace(body_ret);
+					if meta.is_async {
+						self.async_depth += 1;
+					}
+					self.check_named_callable_body(&meta.name, body, body_ret);
+					if meta.is_async {
+						self.async_depth -= 1;
+					}
 					self.ret_ty = previous;
 					self.finalize_pending_operators();
 					self.finalize_pending_bounds();
@@ -423,13 +498,12 @@ impl<'m> Checker<'m> {
 		// `expected` is `mut`. Handled once here, ahead of the per-kind match, so
 		// every `check`-routed call site — struct/enum ctor fields, block/if/match
 		// branches, the `List` arm just below — benefits uniformly. See
-		// `try_coerce_owned_literal_to_mut`'s doc comment for why this can't leak
-		// into accepting a named binding.
-		if self.try_coerce_owned_literal_to_mut(expr, expected) {
-			return;
-		}
 		match &expr.kind {
 			ExprKind::Closure { .. } => self.check_closure(expr, expected),
+			ExprKind::AsyncBlock { .. } | ExprKind::Await { .. } => {
+				let got = self.infer(expr);
+				self.subtype(got, expected, expr.span);
+			}
 			ExprKind::Block { body, label } => {
 				if label.is_some() {
 					self.push_control_label(
@@ -477,15 +551,18 @@ impl<'m> Checker<'m> {
 				}
 				self.check_exhaustive(scrutinee, arms, expr.span);
 			}
-			ExprKind::Grouped(inner) => self.check(inner, expected),
+			ExprKind::Grouped(inner) | ExprKind::Echo { operand: inner, .. } => {
+				self.check(inner, expected)
+			}
 			// An integer literal implicitly widens to the expected `float`/`uint` (the
 			// literal is retyped, e.g. `1` → `1f` / `1u`, rather than reported as a
 			// mismatch). In any other expected context it synthesises `int` as usual.
-			// The literal's node is recorded with the retyped value, not the syntactic
-			// `int`, because lowering uses it to choose `NFloat`/`NUint` rather than
-			// `NInt`; a
-			// `func f: float = 5` whose `5` stayed recorded as `int` would misbox.
-			ExprKind::Int(_) if self.int_literal_coerces_to(expected) => {
+			// The literal's node is recorded with the RETYPED (coerced) type, not the
+			// syntactic `int` — uniform value boxing (slice #2) reads this back in
+			// lowering to box the literal as `NFloat`/`NUint` rather than `NInt`; a
+			// `func f(): float = 5` whose `5` stayed recorded as `int` would misbox.
+			ExprKind::Int(lit) if self.int_literal_coerces_to(expected) => {
+				self.check_int_literal_range(lit);
 				let coerced = self.shallow_resolve(expected);
 				self.record(expr.id, coerced, None);
 			}
@@ -532,7 +609,6 @@ impl<'m> Checker<'m> {
 					Some(ty) => ty,
 					None => self.infer(expr),
 				};
-				self.record_implicit_uint_to_int(expr, got, expected);
 				self.subtype(got, expected, expr.span);
 			}
 		}
@@ -549,6 +625,24 @@ impl<'m> Checker<'m> {
 	/// doesn't pin a concrete enum that declares the name as a variant.
 	fn try_check_expected_variant(&mut self, expr: &Expr, expected: Ty) -> Option<Ty> {
 		match &expr.kind {
+			ExprKind::MemberAccess { parent, member, .. } => {
+				let ExprKind::Identifier(owner) = &parent.kind else {
+					return None;
+				};
+				let (enum_def, variant, _variant_def) =
+					self.expected_qualified_variant(expected, &owner.0, &member.0)?;
+				let expected_view = self.shallow_resolve(expected);
+				if matches!(self.interner.kind(expected_view), TyKind::Adt(def, _) if *def == enum_def) {
+					return None;
+				}
+				let source = self.variant_value(enum_def, variant, expr.id, expr.span);
+				let TyKind::Adt(_, arguments) = self.interner.kind(source).clone() else {
+					return Some(self.interner.error());
+				};
+				let ty = self.enum_single_variant_ty(enum_def, variant, arguments)?;
+				self.record(expr.id, ty, None);
+				Some(ty)
+			}
 			ExprKind::Identifier(name) => {
 				if self.lookup_local(&name.0).is_some() || self.defs.get(&name.0).is_some() {
 					return None;
@@ -559,6 +653,23 @@ impl<'m> Checker<'m> {
 				Some(ty)
 			}
 			ExprKind::Call { func, args, .. } => {
+				if let ExprKind::MemberAccess { parent, member, .. } = &func.kind
+					&& let ExprKind::Identifier(owner) = &parent.kind
+					&& let Some((enum_def, variant, _variant_def)) =
+						self.expected_qualified_variant(expected, &owner.0, &member.0)
+				{
+					let expected_view = self.shallow_resolve(expected);
+					if matches!(self.interner.kind(expected_view), TyKind::Adt(def, _) if *def == enum_def) {
+						return None;
+					}
+					let source = self.infer_variant_ctor(enum_def, variant, args, expr.span, expr.id, None);
+					let TyKind::Adt(_, arguments) = self.interner.kind(source).clone() else {
+						return Some(self.interner.error());
+					};
+					let ty = self.enum_single_variant_ty(enum_def, variant, arguments)?;
+					self.record(expr.id, ty, None);
+					return Some(ty);
+				}
 				let ExprKind::Identifier(name) = &func.kind else {
 					return None;
 				};
@@ -572,6 +683,77 @@ impl<'m> Checker<'m> {
 				Some(ty)
 			}
 			_ => None,
+		}
+	}
+
+	fn expected_qualified_variant(
+		&self,
+		expected: Ty,
+		owner: &str,
+		name: &str,
+	) -> Option<(DefId, usize, DefId)> {
+		let enum_def = self.defs.get(owner)?;
+		let variant = self
+			.sigs
+			.enums
+			.get(&enum_def)?
+			.variants
+			.iter()
+			.position(|variant| variant.name == name)?;
+		let variant_def = self.enum_variant_def(enum_def, variant)?;
+		self
+			.enum_variant_set(expected)?
+			.contains(&variant_def)
+			.then_some((enum_def, variant, variant_def))
+	}
+
+	fn deep_propagation_conversion(
+		&mut self,
+		source: Ty,
+		target: Ty,
+		span: Span,
+	) -> Option<Box<Resolution>> {
+		if source == target || self.enum_view_includes(source, target) {
+			// Direct inclusion is erased and always wins over an explicit conversion.
+			return None;
+		}
+		if self.defs.get("Into").is_none() {
+			self.subtype(source, target, span);
+			return None;
+		}
+		let Some(resolution) = self.check_cast(source, target, span) else {
+			if self.is_scalar_cast_ty(source) && self.is_scalar_cast_ty(target) {
+				self.subtype(source, target, span);
+			}
+			return None;
+		};
+		if !matches!(
+			resolution.dispatch,
+			DispatchKind::UserImpl | DispatchKind::UserImplDefaultMethod
+		) {
+			return None;
+		}
+		let valid = resolution
+			.implementation
+			.as_ref()
+			.and_then(|implementation| {
+				self
+					.impls
+					.impls
+					.iter()
+					.find(|candidate| candidate.definition.as_ref() == Some(implementation))?
+					.methods
+					.get(&resolution.method)
+					.map(|method| (method.ret, method.effects.atoms().is_empty()))
+			})
+			.is_some_and(|(ret, pure)| pure && self.shallow_resolve(ret) == target);
+		if valid {
+			Some(Box::new(resolution))
+		} else {
+			let from = self.display(source);
+			let to = self.display(target);
+			self.emit(span, TypeError::CannotCast { from, to });
+			None
 		}
 	}
 
@@ -626,7 +808,7 @@ impl<'m> Checker<'m> {
 				}
 				MapEntry::Spread(e) => {
 					let ty = self.infer(e);
-					let stripped = self.strip_mut(ty);
+					let stripped = self.shallow_resolve(ty);
 					match self.interner.kind(stripped).clone() {
 						TyKind::Map(k2, v2) => {
 							self.unify(k2, key, span);
@@ -681,29 +863,7 @@ impl<'m> Checker<'m> {
 					crate::check::PendingOperatorKind::BinaryOp(*op),
 				));
 			}
-			return ty;
-		}
-		// `AssignOp` mirrors the `BinaryOp` special case above: a compound assign
-		// (`v1 += v2`) desugars to a binary op whose `Resolution` must be recorded
-		// on the `AssignOp` node itself — there is no
-		// separate desugared `BinaryOp` AST node to hang it on. Plain `=` and `~=`
-		// (`BitNotAssign`) never produce a resolution (`binary_of_assign` maps both
-		// to `None`).
-		if let ExprKind::AssignOp { lhs, op, rhs } = &expr.kind {
-			let (ty, resolution, pending) = self.infer_assign(lhs, *op, rhs, expr.span);
-			self.record(expr.id, ty, None);
-			if let Some(resolution) = resolution {
-				self.annotations.record_resolution(expr.id, resolution);
-			}
-			if let Some((binop, pending_ty, result_ty)) = pending {
-				self.pending_operators.push((
-					expr.id,
-					expr.span,
-					pending_ty,
-					result_ty,
-					crate::check::PendingOperatorKind::AssignOp(binop),
-				));
-			}
+			self.check_integer_constant(expr);
 			return ty;
 		}
 		// `PrefixOp` mirrors the `BinaryOp` special case above:
@@ -724,6 +884,7 @@ impl<'m> Checker<'m> {
 					crate::check::PendingOperatorKind::PrefixOp(*op),
 				));
 			}
+			self.check_integer_constant(expr);
 			return ty;
 		}
 		// `TypeOp` (`as`) mirrors the `BinaryOp` special case above:
@@ -761,7 +922,10 @@ impl<'m> Checker<'m> {
 				}
 				return ty;
 			}
-			let (ty, resolution) = self.infer_call(func, args, expr.span, expr.id);
+			let (ty, resolution) = match self.infer_task_spawn(func, args) {
+				Some(spawn) => (spawn, None),
+				None => self.infer_call(func, args, expr.span, expr.id),
+			};
 			self.record(expr.id, ty, None);
 			if let Some(resolution) = resolution {
 				self.annotations.record_resolution(expr.id, resolution);
@@ -810,7 +974,11 @@ impl<'m> Checker<'m> {
 		let ty = self.infer_kind(expr);
 		// Record the node's resolved type for the lowering pass. Zonking happens
 		// inside `record`. Returns the *raw* ty so callers can still unify against it.
+		let propagation_conversion = self.annotations.propagation_conversion(expr.id).cloned();
 		self.record(expr.id, ty, None);
+		if let Some(resolution) = propagation_conversion {
+			self.annotations.record_resolution(expr.id, resolution);
+		}
 		ty
 	}
 
@@ -818,13 +986,10 @@ impl<'m> Checker<'m> {
 		let span = expr.span;
 		match &expr.kind {
 			ExprKind::Int(lit) => {
-				self.check_unsafe_int_literal(*lit.value(), lit.span());
+				self.check_int_literal_range(lit);
 				self.interner.int()
 			}
-			ExprKind::UInt(lit) => {
-				self.check_unsafe_int_literal(*lit.value(), lit.span());
-				self.interner.uint()
-			}
+			ExprKind::UInt(_) => self.interner.uint(),
 			ExprKind::Float(_) => self.interner.float(),
 			ExprKind::Char(_) => self.interner.char(),
 			ExprKind::Boolean(_) => self.interner.boolean(),
@@ -877,7 +1042,7 @@ impl<'m> Checker<'m> {
 						ListItem::Expr(e) => tys.push(self.infer(e)),
 						ListItem::Spread(e) => {
 							let ty = self.infer(e);
-							let stripped = self.strip_mut(ty);
+							let stripped = self.shallow_resolve(ty);
 							match self.interner.kind(stripped).clone() {
 								TyKind::Tuple(items) => tys.extend(items),
 								_ => {
@@ -916,7 +1081,7 @@ impl<'m> Checker<'m> {
 						// against the `#(K, V)` pair type.
 						MapEntry::Spread(e) => {
 							let ty = self.infer(e);
-							let stripped = self.strip_mut(ty);
+							let stripped = self.shallow_resolve(ty);
 							match self.interner.kind(stripped).clone() {
 								TyKind::Map(k2, v2) => {
 									self.unify(k2, key, span);
@@ -962,14 +1127,17 @@ impl<'m> Checker<'m> {
 				inst.ty
 			}
 			ExprKind::Call { func, args, .. } => self.infer_call(func, args, span, expr.id).0,
+			ExprKind::Echo { operand, .. } => self.infer(operand),
 			ExprKind::MemberAccess { parent, member, .. } => {
 				self.infer_member(parent, &member.0, member.1, expr.id)
 			}
 			ExprKind::IndexAccess { parent, index, .. } => self.infer_index_access(parent, index, span).0,
 			ExprKind::Closure { .. } => self.infer_closure(expr),
+			ExprKind::AsyncBlock { body, .. } => self.infer_async_block(body),
+			ExprKind::Await { value, .. } => self.infer_await(value, expr.span),
 			ExprKind::PrefixOp { op, value } => {
 				// Unreachable in practice: `infer` intercepts `PrefixOp` before it gets
-				// here, for the same reason it intercepts `BinaryOp`/`AssignOp` above —
+				// here, for the same reason it intercepts `BinaryOp` above —
 				// recording the operator's `Resolution` needs the node's type entry to
 				// already exist. This arm only exists so the match stays exhaustive; it
 				// discards the resolution/pending slot rather than duplicating that
@@ -978,7 +1146,7 @@ impl<'m> Checker<'m> {
 			}
 			ExprKind::PostfixOp { value, label, .. } => {
 				let operand = self.infer(value);
-				let operand = self.strip_mut(operand);
+				let operand = self.shallow_resolve(operand);
 				let target = self.resolve_control(
 					expr,
 					label.as_ref(),
@@ -996,6 +1164,12 @@ impl<'m> Checker<'m> {
 					}
 					return self.interner.error();
 				};
+				let source_error =
+					if Some(definition) == self.runtime_roles.result && arguments.positional.len() == 2 {
+						Some(arguments.positional[1])
+					} else {
+						None
+					};
 				let (kind, value_ty, expected_target) = if Some(definition) == self.runtime_roles.option
 					&& arguments.positional.len() == 1
 				{
@@ -1024,8 +1198,9 @@ impl<'m> Checker<'m> {
 					self.emit(expr.span, TypeError::QuestionOperand { found });
 					return self.interner.error();
 				};
+				let mut conversion = None;
 				if let Some(target_ty) = target_ty {
-					let resolved = self.strip_mut(target_ty);
+					let resolved = self.shallow_resolve(target_ty);
 					let family_matches = match (kind, self.interner.kind(resolved)) {
 						(_, TyKind::Infer(_)) | (_, TyKind::Error) => true,
 						(crate::annotate::PropagationKind::Option, TyKind::Adt(def, _)) => {
@@ -1037,7 +1212,18 @@ impl<'m> Checker<'m> {
 						_ => false,
 					};
 					if family_matches {
-						self.unify(expected_target, target_ty, expr.span);
+						if kind == crate::annotate::PropagationKind::Result
+							&& let TyKind::Adt(_, target_arguments) = self.interner.kind(resolved).clone()
+							&& target_arguments.positional.len() == 2
+							&& let Some(source_error) = source_error
+						{
+							let target_error = target_arguments.positional[1];
+							let source_error = self.shallow_resolve(source_error);
+							let target_error = self.shallow_resolve(target_error);
+							conversion = self.deep_propagation_conversion(source_error, target_error, expr.span);
+						} else {
+							self.unify(expected_target, target_ty, expr.span);
+						}
 					} else {
 						let found = self.display(target_ty);
 						let family = match kind {
@@ -1047,7 +1233,9 @@ impl<'m> Checker<'m> {
 						self.emit(expr.span, TypeError::QuestionTarget { family, found });
 					}
 				}
-				self.annotations.record_propagation(expr.id, kind);
+				self
+					.annotations
+					.record_propagation(expr.id, kind, conversion);
 				value_ty
 			}
 			ExprKind::BinaryOp { lhs, op, rhs } => {
@@ -1071,13 +1259,6 @@ impl<'m> Checker<'m> {
 				self.check_pattern(rhs, scrutinee);
 				self.pop_scope();
 				self.interner.boolean()
-			}
-			ExprKind::AssignOp { lhs, op, rhs } => {
-				// Unreachable in practice: `infer` intercepts `AssignOp` before it gets
-				// here, for the same reason it intercepts `BinaryOp` above — recording the
-				// operator's `Resolution` needs the node's type entry to already exist.
-				// This arm only exists so the match stays exhaustive.
-				self.infer_assign(lhs, *op, rhs, span).0
 			}
 			ExprKind::Return { value, label } => {
 				let target = self.resolve_control(
@@ -1137,11 +1318,13 @@ impl<'m> Checker<'m> {
 				}
 				self.interner.never()
 			}
-			ExprKind::Continue { label } => {
-				if self
-					.resolve_control(expr, label.as_ref(), "continue", &[ControlLabelKind::Loop])
-					.is_none()
-				{
+			ExprKind::Continue {
+				label,
+				replacements,
+			} => {
+				let target =
+					self.resolve_control(expr, label.as_ref(), "continue", &[ControlLabelKind::Loop]);
+				if target.is_none() {
 					if label.is_none() {
 						self.emit(
 							expr.span,
@@ -1150,36 +1333,48 @@ impl<'m> Checker<'m> {
 							},
 						);
 					}
+				} else if !replacements.is_empty() {
+					let target = target.expect("checked target");
+					if let Some(bindings) = target.state_bindings {
+						let mut seen = FxHashSet::default();
+						for replacement in replacements {
+							let Some(binding) = bindings
+								.iter()
+								.find(|binding| binding.name == replacement.name.0)
+							else {
+								self.resolve_anon(&replacement.value, None);
+								self.infer(&replacement.value);
+								self.emit(
+									replacement.name.1,
+									TypeError::UnknownStateReplacement {
+										name: replacement.name.0.clone(),
+									},
+								);
+								continue;
+							};
+							self
+								.annotations
+								.record_local_declaration(replacement.name.1, binding.declaration);
+							if !seen.insert(replacement.name.0.clone()) {
+								self.emit(
+									replacement.name.1,
+									TypeError::DuplicateStateReplacement {
+										name: replacement.name.0.clone(),
+									},
+								);
+							}
+							self.resolve_anon(&replacement.value, Some(binding.ty));
+							self.check(&replacement.value, binding.ty);
+						}
+					} else {
+						for replacement in replacements {
+							self.resolve_anon(&replacement.value, None);
+							self.infer(&replacement.value);
+						}
+						self.emit(expr.span, TypeError::StateReplacementOutsideStateLoop);
+					}
 				}
 				self.interner.never()
-			}
-			ExprKind::While {
-				condition,
-				body,
-				label,
-			} => {
-				let boolean = self.interner.boolean();
-				self.check(condition, boolean);
-				let break_kind = self.targeting_break_kind(body, label.as_ref());
-				let break_ty = match break_kind {
-					Some(false) => Some(LoopBreakKind::Bare),
-					Some(true) => Some(LoopBreakKind::Valued(self.fresh())),
-					None => Some(LoopBreakKind::None),
-				};
-				self.loop_controls.push(break_ty.unwrap());
-				self.push_control_label(
-					label.as_ref(),
-					expr.id,
-					ControlLabelKind::Loop,
-					Some(self.loop_controls.len() - 1),
-					None,
-				);
-				self.push_scope();
-				self.infer(body);
-				self.pop_scope();
-				self.loop_controls.pop();
-				self.control_labels.pop();
-				self.loop_result_type(break_ty)
 			}
 			ExprKind::For {
 				variable,
@@ -1209,6 +1404,56 @@ impl<'m> Checker<'m> {
 				self.loop_controls.pop();
 				self.control_labels.pop();
 				self.loop_result_type(break_ty)
+			}
+			ExprKind::StateLoop {
+				bindings,
+				body,
+				label,
+			} => {
+				let break_kind = self.targeting_break_kind(body, label.as_ref());
+				let break_ty = match break_kind {
+					Some(false) => Some(LoopBreakKind::Bare),
+					Some(true) => Some(LoopBreakKind::Valued(self.fresh())),
+					None => Some(LoopBreakKind::None),
+				};
+				self.push_scope();
+				let mut contracts = Vec::new();
+				for binding in bindings {
+					if binding.meta.is_namespaced() {
+						self.emit(binding.meta.name.1, TypeError::InvalidStateLoopBinding);
+					}
+					let Some(name) = binding.meta.name.0.as_binding().cloned() else {
+						self.emit(binding.meta.name.1, TypeError::InvalidStateLoopBinding);
+						self.check_let_statement(&binding.meta, &binding.value);
+						continue;
+					};
+					self.check_let_statement(&binding.meta, &binding.value);
+					if let Some(local) = self.lookup_local(&name.0) {
+						contracts.push(crate::check::StateBindingContract {
+							name: name.0.clone(),
+							ty: local.ty,
+							declaration: local.declaration,
+						});
+					}
+				}
+				self.loop_controls.push(break_ty.unwrap());
+				self.push_control_label(
+					label.as_ref(),
+					expr.id,
+					ControlLabelKind::Loop,
+					Some(self.loop_controls.len() - 1),
+					None,
+				);
+				self
+					.control_labels
+					.last_mut()
+					.expect("state-loop target")
+					.state_bindings = Some(contracts);
+				self.infer(body);
+				self.loop_controls.pop();
+				self.control_labels.pop();
+				self.pop_scope();
+				self.state_loop_result_type(break_ty)
 			}
 			ExprKind::If {
 				condition,
@@ -1291,23 +1536,169 @@ impl<'m> Checker<'m> {
 		}
 	}
 
-	/// Warn on a source `int`/`uint` literal whose magnitude can't round-trip
-	/// through the `f64` Nymph's `int`/`uint` are backed by at runtime. `Int`/
-	/// `UInt` literals (`ExprKind::Int`/`ExprKind::UInt`) store their magnitude as
-	/// a `u64`; a negative `int` literal is this same (positive) literal node
-	/// wrapped in a `PrefixOperator::Negate` at parse time, so calling this once
-	/// per literal (regardless of any enclosing `Negate`) is already correct —
-	/// no separate handling of the negative case is needed.
-	fn check_unsafe_int_literal(&mut self, value: u64, span: Span) {
-		const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991; // 2^53 - 1
-		if value > MAX_SAFE_INTEGER {
-			self.emit(span, TypeError::IntLiteralUnsafe { value });
+	fn check_int_literal_range(&mut self, lit: &Spanned<u64>) {
+		let max = if self.allow_i64_min_magnitude {
+			i64::MAX as u64 + 1
+		} else {
+			i64::MAX as u64
+		};
+		if *lit.value() > max {
+			self.emit(
+				lit.span(),
+				TypeError::IntLiteralOutOfRange {
+					value: *lit.value(),
+				},
+			);
+		}
+	}
+
+	fn eval_integer_constant(expr: &Expr) -> IntegerConstant {
+		let unary = |value: &Expr, op: fn(BigInt) -> BigInt| match Self::eval_integer_constant(value) {
+			IntegerConstant::Value(value) => IntegerConstant::Value(op(value)),
+			other => other,
+		};
+		match &expr.kind {
+			ExprKind::Int(value) => IntegerConstant::Value(BigInt::from(*value.value())),
+			ExprKind::UInt(value) => IntegerConstant::Value(BigInt::from(*value.value())),
+			ExprKind::Grouped(inner) => Self::eval_integer_constant(inner),
+			ExprKind::PrefixOp {
+				op: PrefixOperator::Negate,
+				value,
+			} => unary(value, |value| -value),
+			ExprKind::PrefixOp {
+				op: PrefixOperator::BitNot,
+				value,
+			} => unary(value, |value| !value),
+			ExprKind::BinaryOp { lhs, op, rhs } => {
+				let lhs = match Self::eval_integer_constant(lhs) {
+					IntegerConstant::Value(value) => value,
+					other => return other,
+				};
+				let rhs = match Self::eval_integer_constant(rhs) {
+					IntegerConstant::Value(value) => value,
+					other => return other,
+				};
+				let zero = BigInt::from(0);
+				IntegerConstant::Value(match op {
+					BinaryOperator::Plus => lhs + rhs,
+					BinaryOperator::Minus => lhs - rhs,
+					BinaryOperator::Times => lhs * rhs,
+					BinaryOperator::Divide | BinaryOperator::Remainder if rhs == zero => {
+						return IntegerConstant::Invalid("constant integer division by zero");
+					}
+					BinaryOperator::Divide => lhs / rhs,
+					BinaryOperator::Remainder => lhs % rhs,
+					BinaryOperator::BitAnd => lhs & rhs,
+					BinaryOperator::BitOr => lhs | rhs,
+					BinaryOperator::BitXor => lhs ^ rhs,
+					BinaryOperator::LeftShift | BinaryOperator::RightShift => {
+						let Ok(count) = u32::try_from(rhs) else {
+							return IntegerConstant::Invalid("constant integer shift count must be in 0..63");
+						};
+						if count >= 64 {
+							return IntegerConstant::Invalid("constant integer shift count must be in 0..63");
+						}
+						if *op == BinaryOperator::LeftShift {
+							lhs << count
+						} else {
+							lhs >> count
+						}
+					}
+					_ => return IntegerConstant::NotConstant,
+				})
+			}
+			_ => IntegerConstant::NotConstant,
+		}
+	}
+
+	fn check_integer_constant(&mut self, expr: &Expr) {
+		let ty = self
+			.annotations
+			.get(expr.id)
+			.map(|info| self.shallow_resolve(info.ty));
+		let fixed_width = matches!(
+			ty.map(|ty| self.interner.kind(ty)),
+			Some(TyKind::Int | TyKind::UInt)
+		);
+		let integer_division = matches!(
+			expr.kind,
+			ExprKind::BinaryOp {
+				op: BinaryOperator::Divide,
+				..
+			}
+		);
+		let builtin = self
+			.annotations
+			.resolution_of(expr.id)
+			.is_some_and(|resolution| resolution.dispatch == DispatchKind::BuiltinEager);
+		if !builtin || (!fixed_width && !integer_division) {
+			return;
+		}
+		let evaluated = Self::eval_integer_constant(expr);
+		let reason = match evaluated {
+			IntegerConstant::Invalid(reason) => Some(reason),
+			IntegerConstant::Value(value) => match ty.map(|ty| self.interner.kind(ty)) {
+				Some(TyKind::Int) if value < BigInt::from(i64::MIN) || value > BigInt::from(i64::MAX) => {
+					Some("constant integer operation overflows `int`")
+				}
+				Some(TyKind::UInt) if value < BigInt::from(0_u8) || value > BigInt::from(u64::MAX) => {
+					Some("constant integer operation overflows `uint`")
+				}
+				_ => None,
+			},
+			IntegerConstant::NotConstant => None,
+		};
+		if let Some(reason) = reason {
+			self.emit(
+				expr.span,
+				TypeError::IntegerConstantInvalid {
+					reason: reason.into(),
+				},
+			);
 		}
 	}
 
 	// ── Identifiers & definitions ────────────────────────────────────────────
 	/// Infer `receiver[key]`. Structural collections use their built-in ABI;
 	/// every other receiver resolves the equivalent `receiver.index(key)` call.
+	fn infer_async_block(&mut self, body: &Expr) -> Ty {
+		let previous_capture = self.captured_effects.take();
+		self.captured_effects = Some(Vec::new());
+		self.async_depth += 1;
+		let output = self.infer(body);
+		self.async_depth -= 1;
+		let captured = self.captured_effects.take().unwrap_or_default();
+		self.captured_effects = previous_capture;
+		let effects = crate::ty::EffectRow::new(
+			captured
+				.into_iter()
+				.flat_map(|row| row.atoms().to_vec())
+				.collect(),
+		);
+		self.interner.mk_task(output, effects)
+	}
+
+	fn infer_await(&mut self, value: &Expr, span: Span) -> Ty {
+		if self.async_depth == 0 {
+			self.emit(span, TypeError::AwaitOutsideAsync);
+		}
+		let task = self.infer(value);
+		let task_view = self.shallow_resolve(task);
+		match self.interner.kind(task_view).clone() {
+			TyKind::Task { output, effects } => {
+				self.charge_local_effects(&effects);
+				output
+			}
+			TyKind::Handle(output) => self.interner.mk_handle_outcome(output),
+			TyKind::Error | TyKind::Never => self.interner.error(),
+			_ => {
+				let found = self.display(task);
+				self.emit(span, TypeError::AwaitOperand { found });
+				self.interner.error()
+			}
+		}
+	}
+
 	fn infer_index_access(
 		&mut self,
 		parent: &Expr,
@@ -1325,18 +1716,33 @@ impl<'m> Checker<'m> {
 		span: Span,
 	) -> (Ty, Option<Resolution>) {
 		let key = self.infer(index);
+		let range = matches!(index.kind, ExprKind::Range(_));
 		if matches!(self.interner.kind(recv), TyKind::Never)
 			|| matches!(self.interner.kind(key), TyKind::Never)
 		{
 			return (self.interner.never(), None);
 		}
-		let key = self.strip_mut(key);
-		let recv_r = self.strip_mut(recv);
+		let key = self.shallow_resolve(key);
+		let recv_r = self.shallow_resolve(recv);
 		match self.interner.kind(recv_r).clone() {
 			TyKind::Error => (self.interner.error(), None),
+			TyKind::List(_) if range => (recv_r, None),
 			TyKind::List(elem) if matches!(self.interner.kind(key), TyKind::UInt) => (elem, None),
 			TyKind::List(_) => self.infer_index_dispatch(recv, index, key, span),
+			TyKind::Tuple(_) if range => {
+				self.emit(span, TypeError::TupleSliceUnsupported);
+				(self.interner.error(), None)
+			}
 			TyKind::Tuple(_) => (self.fresh(), None),
+			TyKind::String => {
+				if range {
+					(self.interner.string(), None)
+				} else {
+					let int = self.interner.int();
+					self.unify(key, int, span);
+					(self.interner.char(), None)
+				}
+			}
 			TyKind::Map(k, v) => {
 				self.unify(key, k, span);
 				(v, None)
@@ -1437,19 +1843,12 @@ impl<'m> Checker<'m> {
 			.annotations
 			.record_definition_target(id, self.defs.stable(def));
 		match self.defs.data(def).kind {
-			DefKind::Let => {
-				let ty = self
-					.sigs
-					.lets
-					.get(&def)
-					.map(|sig| sig.ty)
-					.unwrap_or_else(|| self.fresh());
-				if self.allow_imported_assignment && self.mutable_imports.contains(&def) {
-					self.interner.mk_mut(ty)
-				} else {
-					ty
-				}
-			}
+			DefKind::Let => self
+				.sigs
+				.lets
+				.get(&def)
+				.map(|sig| sig.ty)
+				.unwrap_or_else(|| self.fresh()),
 			DefKind::Func => {
 				let (ty, arguments) = self.fn_type_of(def, span);
 				self
@@ -1462,7 +1861,11 @@ impl<'m> Checker<'m> {
 				self.emit(span, TypeError::StructTypeAsValue);
 				self.interner.error()
 			}
-			DefKind::Enum | DefKind::TypeAlias | DefKind::Namespace | DefKind::Interface => {
+			DefKind::Enum
+			| DefKind::TypeAlias
+			| DefKind::Namespace
+			| DefKind::Interface
+			| DefKind::Effect => {
 				self.emit(span, TypeError::TypeAsValue);
 				self.interner.error()
 			}
@@ -1506,8 +1909,13 @@ impl<'m> Checker<'m> {
 		for p in &sig.params {
 			self.synthetic_params_in(p.ty, &mut synthetics);
 		}
-		let indices = (0..sig.generics.len())
-			.map(|i| ParamIdx(i as u32))
+		let indices = sig
+			.generic_kinds
+			.iter()
+			.enumerate()
+			.filter_map(|(index, kind)| {
+				(*kind == crate::GenericParameterKind::Type).then_some(ParamIdx(index as u32))
+			})
 			.chain(synthetics.iter().copied());
 		let inst = self.instantiate(sig.ret, &sig.bounds, indices, FxHashMap::default(), None);
 		self.defer_obligations(span, inst.obligations.iter().cloned());
@@ -1533,10 +1941,20 @@ impl<'m> Checker<'m> {
 			.map(|p| self.subst(p.ty, &subst, None))
 			.collect();
 		let ret = self.subst(sig.ret, &subst, None);
-		let arguments = (0..sig.generics.len())
-			.map(|index| subst[&ParamIdx(index as u32)])
+		let arguments = sig
+			.generic_kinds
+			.iter()
+			.enumerate()
+			.filter_map(|(index, kind)| {
+				(*kind == crate::GenericParameterKind::Type).then(|| subst[&ParamIdx(index as u32)])
+			})
 			.collect();
-		(self.interner.mk_fn(params, ret), arguments)
+		(
+			self
+				.interner
+				.mk_effectful_fn(params, ret, sig.effects.clone()),
+			arguments,
+		)
 	}
 
 	/// Build the `(enum, variant)` resolution recorded for lowering.
@@ -1630,20 +2048,15 @@ impl<'m> Checker<'m> {
 		let receiver = self.infer(parent);
 		let Some((payload, container)) = self.optional_chain_payload(receiver, span) else {
 			for argument in args {
-				self.infer(&argument.0.value);
+				self.infer(argument.0.value());
 			}
 			return (self.interner.error(), None);
 		};
 		self.record_member_completion_facts(parent, Some(payload), member.1);
-		let payload = self.shallow_resolve(payload);
-		let dispatch = if matches!(self.interner.kind(payload), TyKind::Mut(_)) {
-			payload
-		} else {
-			self.interner.mk_mut(payload)
-		};
+		let dispatch = self.shallow_resolve(payload);
 		let arg_tys: Vec<Ty> = args
 			.iter()
-			.map(|argument| self.infer_method_call_arg(&argument.0.value))
+			.map(|argument| self.infer_method_call_arg(argument.0.value()))
 			.collect();
 		let arg_lits = arg_int_lits(args);
 		match self.resolve_method(dispatch, &member.0, &arg_tys, &arg_lits, member.1) {
@@ -1654,11 +2067,10 @@ impl<'m> Checker<'m> {
 				self
 					.annotations
 					.record_generic_call_arguments(id, resolution.type_arguments.clone());
-				for ((argument, found), expected) in args.iter().zip(&arg_tys).zip(&resolution.params) {
-					if matches!(argument.0.value.kind, ExprKind::Closure { .. }) {
-						self.check_closure(&argument.0.value, *expected);
+				for ((argument, _), expected) in args.iter().zip(&arg_tys).zip(&resolution.params) {
+					if matches!(argument.0.value().kind, ExprKind::Closure { .. }) {
+						self.check_closure(argument.0.value(), *expected);
 					}
-					self.record_implicit_uint_to_int(&argument.0.value, *found, *expected);
 				}
 				let mapped = resolution.ty;
 				let dispatch = Resolution {
@@ -1716,7 +2128,7 @@ impl<'m> Checker<'m> {
 				self
 					.annotations
 					.record_definition_target(func.id, self.defs.stable(def));
-				return (self.infer_struct_ctor(def, args, span), None);
+				return (self.infer_struct_ctor(def, args, span, id), None);
 			}
 			match self.defs.resolve_variant(&name.0) {
 				Some(Ok((enum_def, variant))) => {
@@ -1796,6 +2208,30 @@ impl<'m> Checker<'m> {
 					}
 				}
 				DefKind::Enum => {
+					if let [argument] = args
+						&& let CallArg::Value { name: None, value } = &argument.0
+						&& let Some(source) = self.defs.get(&member.0)
+						&& matches!(self.defs.data(source).kind, DefKind::Enum)
+					{
+						let direct_embedding = self.sigs.enums[&def]
+							.embeddings
+							.iter()
+							.any(|embedding| embedding.source == source && embedding.variant.is_none());
+						let empty_wrapper_variant = self.sigs.enums[&def]
+							.variants
+							.iter()
+							.find(|variant| variant.name == member.0)
+							.is_some_and(|variant| variant.fields.is_empty());
+						if direct_embedding || empty_wrapper_variant {
+							let source = self.instantiate_enum(source);
+							self.defer_obligations(member.1, source.obligations.iter().cloned());
+							self.check(value, source.ty);
+							let destination = self.instantiate_enum(def);
+							self.defer_obligations(member.1, destination.obligations.iter().cloned());
+							self.emit(span, TypeError::RetiredEnumWrapper);
+							return (destination.ty, None);
+						}
+					}
 					let variant = self.sigs.enums[&def]
 						.variants
 						.iter()
@@ -1806,7 +2242,7 @@ impl<'m> Checker<'m> {
 							None,
 						);
 					}
-					let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
+					let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(a.0.value())).collect();
 					let arg_lits = arg_int_lits(args);
 					if let Some((ret, target, type_arguments)) =
 						self.resolve_namespaced(def, &member.0, &arg_tys, &arg_lits, member.1)
@@ -1833,7 +2269,7 @@ impl<'m> Checker<'m> {
 					return (self.interner.error(), None);
 				}
 				DefKind::Struct => {
-					let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
+					let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(a.0.value())).collect();
 					let arg_lits = arg_int_lits(args);
 					if let Some((ret, target, type_arguments)) =
 						self.resolve_namespaced(def, &member.0, &arg_tys, &arg_lits, member.1)
@@ -1878,7 +2314,7 @@ impl<'m> Checker<'m> {
 							None,
 						);
 					}
-					let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
+					let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(a.0.value())).collect();
 					let arg_lits = arg_int_lits(args);
 					if let Some((ret, target, type_arguments)) = self.resolve_namespaced_on(
 						owner,
@@ -1888,6 +2324,7 @@ impl<'m> Checker<'m> {
 						&arg_lits,
 						member.1,
 					) {
+						self.charge_effect_target(target.clone());
 						self
 							.annotations
 							.record_generic_call_arguments(id, type_arguments);
@@ -1921,13 +2358,14 @@ impl<'m> Checker<'m> {
 			&& let Some(pidx) = self.lookup_param(&pname.0)
 		{
 			self.record_member_completion_facts(parent, None, member.1);
-			let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(&a.0.value)).collect();
+			let arg_tys: Vec<Ty> = args.iter().map(|a| self.infer(a.0.value())).collect();
 			let (result, target, type_arguments) =
 				self.resolve_param_namespaced(pidx, &member.0, &arg_tys, member.1);
 			self
 				.annotations
 				.record_generic_call_arguments(id, type_arguments);
 			if let Some((interface, member)) = target {
+				self.charge_effect_target(Some(member.clone()));
 				self
 					.annotations
 					.record_definition_target(func.id, Some(&member));
@@ -1947,37 +2385,44 @@ impl<'m> Checker<'m> {
 		if let ExprKind::MemberAccess { parent, member, .. } = &func.kind {
 			let recv = self.infer(parent);
 			self.record_member_completion_facts(parent, Some(recv), member.1);
-			// A temporary (rvalue) receiver is owned here, so present it to the solver as
-			// `mut`: a `mut func` such as an iterator's `fold`/`to_list`/`count` may then be
-			// called directly on `a.map(f)` without an intermediate `let mut` binding.
-			let recv_dispatch = {
-				let resolved = self.shallow_resolve(recv);
-				if (!expr_is_place(parent) || self.custom_index_value(parent))
-					&& !matches!(self.interner.kind(resolved), TyKind::Mut(_))
-				{
-					self.interner.mk_mut(resolved)
-				} else {
-					recv
-				}
-			};
+			let recv_dispatch = self.shallow_resolve(recv);
 			let arg_tys: Vec<Ty> = args
 				.iter()
-				.map(|a| self.infer_method_call_arg(&a.0.value))
+				.map(|a| self.infer_method_call_arg(a.0.value()))
 				.collect();
 			let arg_lits = arg_int_lits(args);
 			return match self.resolve_method(recv_dispatch, &member.0, &arg_tys, &arg_lits, member.1) {
 				Some(res) => {
+					let receiver = recv_dispatch;
+					let charged_bound = if res.source == crate::solve::MethodSource::GenericBound
+						&& let TyKind::Param(parameter) = *self.interner.kind(receiver)
+						&& let Some(crate::annotate::ResolvedMethodTarget::GenericBound { interface, .. }) =
+							&res.resolved_target
+						&& let Some(interface) = self.defs.by_stable(interface)
+					{
+						self.charge_generic_bound_effects(
+							parameter,
+							interface,
+							res.target.as_ref(),
+							&res.params,
+							&arg_tys,
+						)
+					} else {
+						false
+					};
+					if !charged_bound {
+						self.charge_effect_call(res.target.clone(), &res.params, &arg_tys);
+					}
 					self
 						.annotations
 						.record_definition_target(func.id, res.target.as_ref());
 					self
 						.annotations
 						.record_generic_call_arguments(id, res.type_arguments.clone());
-					for ((argument, found), expected) in args.iter().zip(&arg_tys).zip(&res.params) {
-						if matches!(argument.0.value.kind, ExprKind::Closure { .. }) {
-							self.check_closure(&argument.0.value, *expected);
+					for ((argument, _), expected) in args.iter().zip(&arg_tys).zip(&res.params) {
+						if matches!(argument.0.value().kind, ExprKind::Closure { .. }) {
+							self.check_closure(argument.0.value(), *expected);
 						}
-						self.record_implicit_uint_to_int(&argument.0.value, *found, *expected);
 					}
 					let dispatch = dispatch_kind_for_method_call(&res);
 					let resolution = Resolution {
@@ -2004,6 +2449,7 @@ impl<'m> Checker<'m> {
 		}
 
 		let callee = self.infer(func);
+		let effect_target = self.annotations.definition_target_of(func.id).cloned();
 		// Hidden ABI metadata belongs to the call expression, not to a callee
 		// reference which may be grouped or otherwise reused by lowering. A call
 		// used as a callee keeps its own metadata: `factory(value)` must pass the
@@ -2021,9 +2467,16 @@ impl<'m> Checker<'m> {
 		if matches!(self.interner.kind(callee), TyKind::Never) {
 			return (self.interner.never(), None);
 		}
-		let callee = self.strip_mut(callee);
+		let callee = self.shallow_resolve(callee);
 		let ty = match self.interner.kind(callee).clone() {
-			TyKind::Fn { params, ret } => {
+			TyKind::Fn {
+				params,
+				ret,
+				effects,
+			} => {
+				if effect_target.is_none() {
+					self.charge_local_effects(&effects);
+				}
 				if args.len() != params.len() {
 					self.emit(
 						span,
@@ -2034,24 +2487,34 @@ impl<'m> Checker<'m> {
 					);
 				}
 				for (arg, pty) in args.iter().zip(&params) {
-					self.check_call_arg(&arg.0.value, *pty);
+					self.check_call_arg(arg.0.value(), *pty);
 				}
 				for arg in args.iter().skip(params.len()) {
-					self.infer(&arg.0.value);
+					self.infer(arg.0.value());
 				}
+				let argument_types = args
+					.iter()
+					.map(|argument| {
+						self
+							.annotations
+							.get(argument.0.value().id)
+							.map_or_else(|| self.interner.error(), |info| info.ty)
+					})
+					.collect::<Vec<_>>();
+				self.charge_effect_call(effect_target, &params, &argument_types);
 				ret
 			}
 			TyKind::Error => self.interner.error(),
 			TyKind::Infer(_) => {
 				for arg in args {
-					self.infer(&arg.0.value);
+					self.infer(arg.0.value());
 				}
 				self.fresh()
 			}
 			_ => {
 				self.emit(span, TypeError::NotCallable);
 				for arg in args {
-					self.infer(&arg.0.value);
+					self.infer(arg.0.value());
 				}
 				self.interner.error()
 			}
@@ -2059,7 +2522,29 @@ impl<'m> Checker<'m> {
 		(ty, None)
 	}
 
-	fn infer_struct_ctor(&mut self, def: DefId, args: &[Spanned<CallArg>], span: Span) -> Ty {
+	fn infer_task_spawn(&mut self, func: &Expr, args: &[Spanned<CallArg>]) -> Option<Ty> {
+		let ExprKind::MemberAccess { parent, member, .. } = &func.kind else {
+			return None;
+		};
+		if member.0 != "spawn" || !args.is_empty() {
+			return None;
+		}
+		let receiver = self.infer(parent);
+		let receiver = self.shallow_resolve(receiver);
+		let TyKind::Task { output, effects } = self.interner.kind(receiver).clone() else {
+			return None;
+		};
+		self.charge_local_effects(&effects);
+		Some(self.interner.mk_handle(output))
+	}
+
+	fn infer_struct_ctor(
+		&mut self,
+		def: DefId,
+		args: &[Spanned<CallArg>],
+		span: Span,
+		id: NodeId,
+	) -> Ty {
 		let inst = self.instantiate_struct(def);
 		self.defer_obligations(span, inst.obligations.iter().cloned());
 		let (adt, subst) = (inst.ty, inst.substitution);
@@ -2067,20 +2552,153 @@ impl<'m> Checker<'m> {
 		// Construction commits the exact obligations returned with the same
 		// substitution used for the fields below. Pattern callers intentionally
 		// leave those obligations undeferred.
-		let fields: Vec<(EcoString, Ty, Option<crate::DefinitionId>)> = sig
+		let fields: Vec<(EcoString, Ty, crate::def::FieldSigMetadata)> = sig
 			.fields
 			.iter()
 			.zip(&sig.field_metadata)
-			.map(|((n, t), metadata)| {
-				(
-					n.clone(),
-					self.subst(*t, &subst, None),
-					metadata.target.clone(),
-				)
-			})
+			.map(|((n, t), metadata)| (n.clone(), self.subst(*t, &subst, None), metadata.clone()))
 			.collect();
-		self.check_ctor_args(&fields, args);
+		self.check_struct_ctor_args(def, adt, &fields, args, span, id);
 		adt
+	}
+
+	pub(crate) fn field_available(&self, metadata: &crate::def::FieldSigMetadata) -> bool {
+		let Some(owner) = metadata.target.as_ref().map(|target| &target.module) else {
+			return true;
+		};
+		let Some(current) = self.current_module.as_ref() else {
+			return true;
+		};
+		match metadata.visibility {
+			nymph_ast::decl::Visibility::Public => true,
+			nymph_ast::decl::Visibility::Internal => owner.same_package_as(current),
+			nymph_ast::decl::Visibility::Private => owner == current,
+		}
+	}
+
+	fn check_struct_ctor_args(
+		&mut self,
+		def: DefId,
+		adt: Ty,
+		fields: &[(EcoString, Ty, crate::def::FieldSigMetadata)],
+		args: &[Spanned<CallArg>],
+		span: Span,
+		id: NodeId,
+	) {
+		let spread_count = args
+			.iter()
+			.filter(|argument| argument.0.is_spread())
+			.count();
+		let clone_update = spread_count == 1 && args.first().is_some_and(|arg| arg.0.is_spread());
+		if spread_count > 0 && !clone_update {
+			self.emit(span, TypeError::InvalidStructSpread);
+		}
+		if !clone_update
+			&& fields
+				.iter()
+				.any(|(_, _, metadata)| !self.field_available(metadata))
+		{
+			self.emit(span, TypeError::StructFreshUnavailable);
+		}
+
+		let mut supplied = FxHashSet::default();
+		let mut explicit_fields = Vec::new();
+		let mut source = None;
+		for (index, argument) in args.iter().enumerate() {
+			match &argument.0 {
+				CallArg::Spread { value } => {
+					self.resolve_anon(value, Some(adt));
+					self.check(value, adt);
+					if index == 0 && source.is_none() {
+						source = Some(value.id);
+					}
+				}
+				CallArg::Value { name: None, value } => {
+					self.emit(argument.1, TypeError::PositionalStructField);
+					if let Some((name, ty, _)) = fields.get(index) {
+						supplied.insert(name.clone());
+						self.resolve_anon(value, Some(*ty));
+						self.check(value, *ty);
+					} else {
+						self.infer(value);
+					}
+				}
+				CallArg::Value {
+					name: Some(label),
+					value,
+				} => {
+					let Some((field, ty, metadata)) = fields.iter().find(|(field, ..)| field == &label.0)
+					else {
+						self.emit(
+							label.1,
+							TypeError::UnknownField {
+								field: label.0.clone(),
+							},
+						);
+						self.infer(value);
+						continue;
+					};
+					self
+						.annotations
+						.record_source_definition_target(label.1, metadata.target.as_ref());
+					if !supplied.insert(field.clone()) {
+						self.emit(
+							label.1,
+							TypeError::DuplicateStructField {
+								field: field.clone(),
+							},
+						);
+					}
+					if !self.field_available(metadata) {
+						self.emit(
+							label.1,
+							TypeError::InaccessibleStructField {
+								field: field.clone(),
+							},
+						);
+					}
+					self.resolve_anon(value, Some(*ty));
+					self.check(value, *ty);
+					if let Some(target) = &metadata.target {
+						explicit_fields.push((target.clone(), value.id));
+					}
+				}
+			}
+		}
+
+		let mut omitted_defaults = Vec::new();
+		if !clone_update {
+			let missing = fields
+				.iter()
+				.filter(|(name, _, metadata)| !supplied.contains(name) && !metadata.has_default)
+				.map(|(name, ..)| name.clone())
+				.collect::<Vec<_>>();
+			if !missing.is_empty() {
+				self.emit(span, TypeError::MissingStructFields { fields: missing });
+			}
+			omitted_defaults.extend(fields.iter().filter_map(|(name, _, metadata)| {
+				(!supplied.contains(name) && metadata.has_default)
+					.then(|| metadata.target.clone())
+					.flatten()
+			}));
+			for default in &omitted_defaults {
+				self.charge_effect_target(Some(default.clone()));
+			}
+		}
+
+		if let Some(definition) = self.defs.stable(def).cloned() {
+			self.annotations.record_struct_construction(
+				id,
+				StructConstructionPlan {
+					definition,
+					mode: source.map_or(StructConstructionMode::Fresh, |source| {
+						StructConstructionMode::CloneUpdate { source }
+					}),
+					explicit_fields,
+					omitted_defaults,
+				},
+			);
+		}
 	}
 
 	/// `expected`, when given, is the concrete enum type the caller already knows this
@@ -2143,7 +2761,7 @@ impl<'m> Checker<'m> {
 	) {
 		for (i, arg) in args.iter().enumerate() {
 			let call = &arg.0;
-			let target = if let Some(label) = &call.name {
+			let target = if let Some(label) = call.name() {
 				match fields.iter().find(|(n, ..)| n == &label.0) {
 					Some((_, ty, definition)) => {
 						self
@@ -2165,19 +2783,19 @@ impl<'m> Checker<'m> {
 				match fields.get(i) {
 					Some((_, ty, _)) => Some(*ty),
 					None => {
-						self.emit(call.value.span, TypeError::TooManyFields);
+						self.emit(call.value().span, TypeError::TooManyFields);
 						None
 					}
 				}
 			};
 			match target {
 				Some(ty) => {
-					self.resolve_anon(&call.value, Some(ty));
-					self.check(&call.value, ty);
+					self.resolve_anon(call.value(), Some(ty));
+					self.check(call.value(), ty);
 				}
 				None => {
-					self.resolve_anon(&call.value, None);
-					self.infer(&call.value);
+					self.resolve_anon(call.value(), None);
+					self.infer(call.value());
 				}
 			}
 		}
@@ -2217,7 +2835,7 @@ impl<'m> Checker<'m> {
 			return (self.interner.never(), None);
 		}
 		let resolved_parent = self.shallow_resolve(parent_ty);
-		let nominal = self.strip_mut(resolved_parent);
+		let nominal = resolved_parent;
 		let has_field = match self.interner.kind(nominal) {
 			TyKind::Adt(definition, _) if matches!(self.defs.data(*definition).kind, DefKind::Struct) => {
 				self.sigs.structs[definition]
@@ -2227,13 +2845,7 @@ impl<'m> Checker<'m> {
 			}
 			_ => false,
 		};
-		let method_receiver = if (!expr_is_place(parent) || self.custom_index_value(parent))
-			&& !matches!(self.interner.kind(resolved_parent), TyKind::Mut(_))
-		{
-			self.interner.mk_mut(resolved_parent)
-		} else {
-			parent_ty
-		};
+		let method_receiver = resolved_parent;
 		if !has_field && let Some(resolution) = self.resolve_method_value(method_receiver, member, span)
 		{
 			self
@@ -2277,7 +2889,8 @@ impl<'m> Checker<'m> {
 		receiver: Ty,
 		span: Span,
 	) -> Option<(Ty, OptionalContainer)> {
-		let receiver = self.strip_mut(receiver);
+		let receiver = self.shallow_resolve(receiver);
+		let receiver = self.shallow_resolve(receiver);
 		let TyKind::Adt(definition, args) = self.interner.kind(receiver).clone() else {
 			let ty = self.display(receiver);
 			self.emit(span, TypeError::OptionalChainReceiver { ty });
@@ -2310,8 +2923,8 @@ impl<'m> Checker<'m> {
 		self.interner.mk_adt(definition, args)
 	}
 
-	/// Capture completion at the point where all lexical generic bounds and place
-	/// mutability are live. Tooling consumes these immutable facts and never
+	/// Capture completion at the point where all lexical generic bounds are live.
+	/// Tooling consumes these immutable facts and never
 	/// reconstructs solver decisions.
 	fn record_member_completion_facts(&mut self, parent: &Expr, inferred: Option<Ty>, span: Span) {
 		use crate::{MemberCompletion, MemberCompletionKind};
@@ -2333,7 +2946,6 @@ impl<'m> Checker<'m> {
 				let diagnostics = self.diags.len();
 				let pending_bounds = self.pending_bounds.len();
 				let pending_operators = self.pending_operators.len();
-				let pending_bound_arg_mut = self.pending_bound_arg_mut.clone();
 				let synthetic_params = self.synthetic_params;
 				let synthetic_bounds = self.synthetic_bounds.clone();
 				let synthetic_bound_details = self.synthetic_bound_details.clone();
@@ -2347,7 +2959,6 @@ impl<'m> Checker<'m> {
 				self.diags.truncate(diagnostics);
 				self.pending_bounds.truncate(pending_bounds);
 				self.pending_operators.truncate(pending_operators);
-				self.pending_bound_arg_mut = pending_bound_arg_mut;
 				self.synthetic_params = synthetic_params;
 				self.synthetic_bounds = synthetic_bounds;
 				self.synthetic_bound_details = synthetic_bound_details;
@@ -2371,7 +2982,6 @@ impl<'m> Checker<'m> {
 			let diagnostics = self.diags.len();
 			let pending_bounds = self.pending_bounds.len();
 			let pending_operators = self.pending_operators.len();
-			let pending_bound_arg_mut = self.pending_bound_arg_mut.clone();
 			let synthetic_params = self.synthetic_params;
 			let synthetic_bounds = self.synthetic_bounds.clone();
 			let synthetic_bound_details = self.synthetic_bound_details.clone();
@@ -2385,13 +2995,8 @@ impl<'m> Checker<'m> {
 									let (ty, _) = self.namespace_func_type(&sig, span);
 									(MemberCompletionKind::Function, self.display(ty))
 								}
-								NamespaceMemberSig::Value { ty, mutable, .. } => {
-									let kind = if mutable {
-										MemberCompletionKind::Variable
-									} else {
-										MemberCompletionKind::Value
-									};
-									(kind, self.display(ty))
+								NamespaceMemberSig::Value { ty, .. } => {
+									(MemberCompletionKind::Value, self.display(ty))
 								}
 							};
 							out.push(MemberCompletion { name, kind, detail });
@@ -2456,7 +3061,6 @@ impl<'m> Checker<'m> {
 						let diagnostics = self.diags.len();
 						let pending_bounds = self.pending_bounds.len();
 						let pending_operators = self.pending_operators.len();
-						let pending_bound_arg_mut = self.pending_bound_arg_mut.clone();
 						let synthetic_params = self.synthetic_params;
 						let synthetic_bounds = self.synthetic_bounds.clone();
 						let synthetic_bound_details = self.synthetic_bound_details.clone();
@@ -2474,7 +3078,6 @@ impl<'m> Checker<'m> {
 						self.table.rollback_to(checkpoint);
 						self.pending_bounds.truncate(pending_bounds);
 						self.pending_operators.truncate(pending_operators);
-						self.pending_bound_arg_mut = pending_bound_arg_mut;
 						self.synthetic_params = synthetic_params;
 						self.synthetic_bounds = synthetic_bounds;
 						self.synthetic_bound_details = synthetic_bound_details;
@@ -2494,7 +3097,6 @@ impl<'m> Checker<'m> {
 			self.table.rollback_to(checkpoint);
 			self.pending_bounds.truncate(pending_bounds);
 			self.pending_operators.truncate(pending_operators);
-			self.pending_bound_arg_mut = pending_bound_arg_mut;
 			self.synthetic_params = synthetic_params;
 			self.synthetic_bounds = synthetic_bounds;
 			self.synthetic_bound_details = synthetic_bound_details;
@@ -2540,17 +3142,17 @@ impl<'m> Checker<'m> {
 	) {
 		use crate::{MemberCompletion, MemberCompletionKind};
 		let mut out = Vec::new();
-		let dispatch = if temporary_receiver && !matches!(self.interner.kind(recv), TyKind::Mut(_)) {
-			self.interner.mk_mut(recv)
-		} else {
-			recv
-		};
-		let nominal = self.strip_mut(recv);
+		let dispatch = recv;
+		let nominal = recv;
+		let _ = temporary_receiver;
 		if let TyKind::Adt(def, args) = self.interner.kind(nominal).clone()
 			&& let Some(sig) = self.sigs.structs.get(&def).cloned()
 		{
 			let subst = adt_subst(&args);
-			for (name, ty) in sig.fields {
+			for ((name, ty), metadata) in sig.fields.into_iter().zip(&sig.field_metadata) {
+				if !self.field_available(metadata) {
+					continue;
+				}
 				let ty = self.subst(ty, &subst, Some(nominal));
 				out.push(MemberCompletion {
 					name,
@@ -2583,7 +3185,6 @@ impl<'m> Checker<'m> {
 			let diagnostics = self.diags.len();
 			let pending_bounds = self.pending_bounds.len();
 			let pending_operators = self.pending_operators.len();
-			let pending_bound_arg_mut = self.pending_bound_arg_mut.clone();
 			let synthetic_params = self.synthetic_params;
 			let synthetic_bounds = self.synthetic_bounds.clone();
 			let synthetic_bound_details = self.synthetic_bound_details.clone();
@@ -2604,7 +3205,6 @@ impl<'m> Checker<'m> {
 			self.table.rollback_to(checkpoint);
 			self.pending_bounds.truncate(pending_bounds);
 			self.pending_operators.truncate(pending_operators);
-			self.pending_bound_arg_mut = pending_bound_arg_mut;
 			self.synthetic_params = synthetic_params;
 			self.synthetic_bounds = synthetic_bounds;
 			self.synthetic_bound_details = synthetic_bound_details;
@@ -2821,7 +3421,13 @@ impl<'m> Checker<'m> {
 		let inst = self.instantiate(
 			sig.ret,
 			&sig.bounds,
-			(0..sig.generics.len()).map(|index| ParamIdx(index as u32)),
+			sig
+				.generic_kinds
+				.iter()
+				.enumerate()
+				.filter_map(|(index, kind)| {
+					(*kind == crate::GenericParameterKind::Type).then_some(ParamIdx(index as u32))
+				}),
 			FxHashMap::default(),
 			None,
 		);
@@ -2833,14 +3439,24 @@ impl<'m> Checker<'m> {
 			.map(|param| self.subst(param.ty, &subst, None))
 			.collect();
 		let ret = self.subst(sig.ret, &subst, None);
-		let arguments = (0..sig.generics.len())
-			.map(|index| subst[&ParamIdx(index as u32)])
+		let arguments = sig
+			.generic_kinds
+			.iter()
+			.enumerate()
+			.filter_map(|(index, kind)| {
+				(*kind == crate::GenericParameterKind::Type).then(|| subst[&ParamIdx(index as u32)])
+			})
 			.collect();
-		(self.interner.mk_fn(params, ret), arguments)
+		(
+			self
+				.interner
+				.mk_effectful_fn(params, ret, sig.effects.clone()),
+			arguments,
+		)
 	}
 
 	fn check_direct_call(&mut self, callee: Ty, args: &[Spanned<CallArg>], span: Span) -> Ty {
-		let TyKind::Fn { params, ret } = self.interner.kind(callee).clone() else {
+		let TyKind::Fn { params, ret, .. } = self.interner.kind(callee).clone() else {
 			return self.interner.error();
 		};
 		if args.len() != params.len() {
@@ -2853,10 +3469,10 @@ impl<'m> Checker<'m> {
 			);
 		}
 		for (argument, parameter) in args.iter().zip(&params) {
-			self.check_call_arg(&argument.0.value, *parameter);
+			self.check_call_arg(argument.0.value(), *parameter);
 		}
 		for argument in args.iter().skip(params.len()) {
-			self.infer(&argument.0.value);
+			self.infer(argument.0.value());
 		}
 		ret
 	}
@@ -2878,14 +3494,20 @@ impl<'m> Checker<'m> {
 						.enumerate()
 						.find(|(_, (n, _))| n == member)
 					{
-						if let Some(id) = id {
-							self.annotations.record_definition_target(
-								id,
-								sig
-									.field_metadata
-									.get(field_index)
-									.and_then(|metadata| metadata.target.as_ref()),
+						let metadata = &sig.field_metadata[field_index];
+						if !self.field_available(metadata) {
+							self.emit(
+								span,
+								TypeError::InaccessibleStructField {
+									field: member.into(),
+								},
 							);
+							return self.interner.error();
+						}
+						if let Some(id) = id {
+							self
+								.annotations
+								.record_definition_target(id, metadata.target.as_ref());
 						}
 						return self.subst(*fty, &subst, Some(parent_ty));
 					}
@@ -2901,21 +3523,6 @@ impl<'m> Checker<'m> {
 				}
 				self.emit(span, TypeError::MethodCallsUnsupported);
 				self.interner.error()
-			}
-			// A `mut Struct` still has the struct's fields — re-dispatch on the peeled
-			// inner type, then re-wrap the field in `mut`: projecting a field out of a
-			// mutable receiver yields a mutable *place*, so a `mut func` may be called on
-			// it (e.g. an iterator adapter's `this.source.next`) and it may be
-			// reassigned. Reads coerce `mut T` → `T` as usual (`coerce.rs`), so this
-			// doesn't disturb ordinary field reads. `mk_mut` is idempotent, so a field
-			// whose declared type is already `mut` isn't double-wrapped; `Error` stays
-			// `Error`.
-			TyKind::Mut(inner) => {
-				let fty = self.member_ty_of(inner, member, span, id);
-				match self.interner.kind(fty) {
-					TyKind::Error => fty,
-					_ => self.interner.mk_mut(fty),
-				}
 			}
 			TyKind::Error => self.interner.error(),
 			TyKind::Infer(_) => self.fresh(),
@@ -2953,7 +3560,7 @@ impl<'m> Checker<'m> {
 				Some(annot) => self.lower_type(annot),
 				None => self.fresh(),
 			};
-			self.bind_pattern(&param.0.name, ty, param.0.mutable);
+			self.bind_pattern(&param.0.name, ty);
 			param_tys.push(ty);
 		}
 		// An explicit closure's own body is itself a hard `$N` boundary: it does
@@ -3000,7 +3607,7 @@ impl<'m> Checker<'m> {
 	}
 
 	fn check_closure(&mut self, expr: &Expr, expected: Ty) {
-		let expected = self.strip_mut(expected);
+		let expected = self.shallow_resolve(expected);
 		let ExprKind::Closure {
 			params,
 			generics,
@@ -3016,7 +3623,7 @@ impl<'m> Checker<'m> {
 		let outer_labels = std::mem::take(&mut self.control_labels);
 		// Pull expected parameter/return types out of an expected function type.
 		let (exp_params, exp_ret) = match self.interner.kind(expected).clone() {
-			TyKind::Fn { params, ret } => (Some(params), Some(ret)),
+			TyKind::Fn { params, ret, .. } => (Some(params), Some(ret)),
 			_ => (None, None),
 		};
 		self.push_control_label(
@@ -3038,7 +3645,7 @@ impl<'m> Checker<'m> {
 					.and_then(|ps| ps.get(i).copied())
 					.unwrap_or_else(|| self.fresh()),
 			};
-			self.bind_pattern(&param.0.name, ty, param.0.mutable);
+			self.bind_pattern(&param.0.name, ty);
 			param_tys.push(ty);
 		}
 		// See `infer_closure`'s matching comment: an explicit closure's body is
@@ -3095,13 +3702,16 @@ impl<'m> Checker<'m> {
 		span: Span,
 	) -> (Ty, Option<Resolution>, Option<Ty>) {
 		use nymph_ast::ops::PrefixOperator::*;
+		let previous_allowance = self.allow_i64_min_magnitude;
+		self.allow_i64_min_magnitude = op == Negate && matches!(value.kind, ExprKind::Int(_));
 		let operand = self.infer(value);
+		self.allow_i64_min_magnitude = previous_allowance;
 		if matches!(self.interner.kind(operand), TyKind::Never) {
 			return (self.interner.never(), None, None);
 		}
 		// See the matching comment in `infer_binary`: an operator's operand type
 		// is used mut-transparently throughout this function.
-		let operand = self.strip_mut(operand);
+		let operand = self.shallow_resolve(operand);
 		match op {
 			BoolNot => {
 				// `!` defaults to `boolean`: a primitive or a still-unresolved operand
@@ -3271,9 +3881,9 @@ impl<'m> Checker<'m> {
 			let callee = self.infer(rhs);
 			// A `mut`-bound closure pipes exactly like a plain one — see the
 			// matching comment above `l`/`r`'s strip a few lines down.
-			let resolved_callee = self.strip_mut(callee);
+			let resolved_callee = self.shallow_resolve(callee);
 			return match self.interner.kind(resolved_callee).clone() {
-				TyKind::Fn { params, ret } if params.len() == 1 => {
+				TyKind::Fn { params, ret, .. } if params.len() == 1 => {
 					self.check(lhs, params[0]);
 					(ret, None, None)
 				}
@@ -3297,8 +3907,8 @@ impl<'m> Checker<'m> {
 		// every later `self.unify(l, r,..)`/`dispatch_operator(l,..)` call and
 		// the returned result type consistent, instead of comparing a peeled
 		// discriminant against still-`mut`-wrapped operand handles).
-		let l = self.strip_mut(l);
-		let r = self.strip_mut(r);
+		let l = self.shallow_resolve(l);
+		let r = self.shallow_resolve(r);
 		let boolean = self.interner.boolean();
 		let eager = |method: &str| {
 			Some(Resolution {
@@ -3427,6 +4037,21 @@ impl<'m> Checker<'m> {
 			},
 			Equals | NotEquals => {
 				let method = if op == Equals { "equals" } else { "not_equals" };
+				if let (Some(left), Some(right)) = (self.enum_variant_set(l), self.enum_variant_set(r))
+					&& left.iter().any(|variant| right.contains(variant))
+				{
+					return (
+						boolean,
+						Some(Resolution {
+							method: method.into(),
+							dispatch: DispatchKind::BuiltinStructuralEquality,
+							target: None,
+							implementation: None,
+							resolved_target: None,
+						}),
+						None,
+					);
+				}
 				match (self.prim_kind(l), self.prim_kind(r)) {
 					// Same primitive: unify the two sides (letting an int literal widen),
 					// native JS `===`/`!==`.
@@ -3869,7 +4494,7 @@ impl<'m> Checker<'m> {
 		if matches!(self.interner.kind(src), TyKind::Never) {
 			return (self.interner.never(), None);
 		}
-		let target_r = self.strip_mut(target);
+		let target_r = self.shallow_resolve(target);
 		if matches!(self.interner.kind(target_r), TyKind::Char)
 			&& self.numeric_literal_value(lhs).is_some_and(|value| {
 				let value = value.trunc();
@@ -3909,8 +4534,8 @@ impl<'m> Checker<'m> {
 		// cast as `int as int`. Peel it off both sides (a common `let mut`/`mut`
 		// param/field operand) before the built-in-path check, else the cast falls
 		// through to a bogus "no `Into` impl" diagnostic.
-		let src = self.strip_mut(src);
-		let target_r = self.strip_mut(target);
+		let src = self.shallow_resolve(src);
+		let target_r = self.shallow_resolve(target);
 		// Don't pile diagnostics onto a poisoned or still-unknown operand, and don't
 		// record a resolution lowering could act on either — an `Error`/`Infer` type
 		// already has (or will have) its own diagnostic; lowering never runs on a
@@ -3919,7 +4544,10 @@ impl<'m> Checker<'m> {
 			return None;
 		}
 		// Identity and scalar numeric/char conversions need no `Into` impl.
-		if src == target_r || (self.is_scalar_cast_ty(src) && self.is_scalar_cast_ty(target_r)) {
+		if src == target_r
+			|| self.enum_view_includes(src, target_r)
+			|| (self.is_scalar_cast_ty(src) && self.is_scalar_cast_ty(target_r))
+		{
 			return Some(Resolution {
 				method: "as".into(),
 				dispatch: DispatchKind::BuiltinEager,
@@ -4037,7 +4665,7 @@ impl<'m> Checker<'m> {
 		// A `mut` primitive is still that primitive for every dispatch purpose —
 		// `mut` is a compile-time-only view, transparent here exactly like
 		// `head_of` treats it for method/impl dispatch.
-		let ty = self.strip_mut(ty);
+		let ty = self.shallow_resolve(ty);
 		match self.interner.kind(ty) {
 			k @ (TyKind::Int
 			| TyKind::UInt
@@ -4052,7 +4680,7 @@ impl<'m> Checker<'m> {
 	/// Whether a (resolved) type has a nominal head an impl could be keyed on.
 	/// Peels `mut` first, same rationale as [`Self::prim_kind`].
 	fn is_adt(&mut self, ty: Ty) -> bool {
-		let ty = self.strip_mut(ty);
+		let ty = self.shallow_resolve(ty);
 		matches!(
 			self.interner.kind(ty),
 			TyKind::Adt(..) | TyKind::List(_) | TyKind::Tuple(_) | TyKind::Map(..)
@@ -4061,7 +4689,7 @@ impl<'m> Checker<'m> {
 
 	/// Apply a callee type to argument types via unification (used by `|>`).
 	fn apply(&mut self, callee: Ty, arg_tys: Vec<Ty>, span: Span) -> Ty {
-		let callee = self.strip_mut(callee);
+		let callee = self.shallow_resolve(callee);
 		if matches!(self.interner.kind(callee), TyKind::Error) {
 			return self.interner.error();
 		}
@@ -4069,144 +4697,6 @@ impl<'m> Checker<'m> {
 		let expected = self.interner.mk_fn(arg_tys, ret);
 		self.unify(callee, expected, span);
 		ret
-	}
-
-	/// Type an assignment `place = value` or a compound `place op= value`. A compound
-	/// assignment reads as `place = place <op> value`, so its value type comes from the
-	/// underlying binary operator; a plain `=` checks the value against the place type
-	/// (letting an `int` literal widen, etc.).
-	///
-	/// Returns the assignment's (void) type, plus — for a compound assignment — the
-	/// underlying operator's `Resolution`, mirroring `infer_binary`. The desugared
-	/// `place op value` has no `BinaryOp` AST node of its own; the `AssignOp` node
-	/// itself carries the id the resolution is recorded against, in `infer`'s
-	/// `AssignOp` special case. The third element stores `infer_binary`'s
-	/// pending-operand slot for late finalization,
-	/// paired with the operator so `finalize_pending_operators` knows which method to
-	/// retry.
-	fn infer_assign(
-		&mut self,
-		lhs: &Expr,
-		op: AssignOperator,
-		rhs: &Expr,
-		span: Span,
-	) -> (Ty, Option<Resolution>, Option<(BinaryOperator, Ty, Ty)>) {
-		// Resolve the assignable place, reporting non-places and immutable targets.
-		let place_ty = match &lhs.kind {
-			ExprKind::Identifier(name) => match self.lookup_local(&name.0).map(|b| (b.ty, b.mutable)) {
-				Some((ty, mutable)) => {
-					if !mutable {
-						self.emit(
-							lhs.span,
-							TypeError::AssignToImmutable {
-								name: name.0.clone(),
-							},
-						);
-					}
-					ty
-				}
-				None
-					if self.allow_imported_assignment
-						&& self
-							.defs
-							.get(&name.0)
-							.is_some_and(|definition| self.mutable_imports.contains(&definition)) =>
-				{
-					let definition = self.defs.get(&name.0).expect("checked imported definition");
-					self
-						.annotations
-						.record_definition_target(lhs.id, self.defs.stable(definition));
-					self
-						.sigs
-						.lets
-						.get(&definition)
-						.map(|signature| signature.ty)
-						.unwrap_or_else(|| self.fresh())
-				}
-				None => {
-					self.emit(
-						lhs.span,
-						TypeError::CannotAssign {
-							name: name.0.clone(),
-						},
-					);
-					self.infer(rhs);
-					return (self.interner.void(), None, None);
-				}
-			},
-			// A field-slot target (`p.field`): gated on a `mut` receiver — the
-			// headline mutable-types enforcement. `xs[i]` index targets are left
-			// ungated in (a separate question is intentionally unsupported).
-			ExprKind::MemberAccess { parent, member, .. } => {
-				let parent_ty = self.infer(parent);
-				let resolved = self.shallow_resolve(parent_ty);
-				match self.interner.kind(resolved) {
-					// A prior error/unresolved var: don't cascade a second diagnostic.
-					TyKind::Mut(_) | TyKind::Error | TyKind::Infer(_) => {}
-					_ => {
-						let ty = self.display(resolved);
-						self.emit(
-							lhs.span,
-							TypeError::AssignFieldThroughImmutable {
-								field: member.0.clone(),
-								ty,
-							},
-						);
-					}
-				}
-				self.member_ty_of(parent_ty, &member.0, member.1, None)
-			}
-			ExprKind::IndexAccess { parent, .. } => {
-				let place_ty = self.infer(lhs);
-				let parent_ty = self
-					.annotations
-					.get(parent.id)
-					.map(|info| self.strip_mut(info.ty));
-				let stripped_place = self.strip_mut(place_ty);
-				let place_is_error = matches!(self.interner.kind(stripped_place), TyKind::Error);
-				if !place_is_error
-					&& !parent_ty.is_some_and(|ty| {
-						matches!(
-							self.interner.kind(ty),
-							TyKind::List(_) | TyKind::Tuple(_) | TyKind::Map(..) | TyKind::Error
-						)
-					}) {
-					self.emit(
-						lhs.span,
-						TypeError::CannotAssign {
-							name: "custom index access".into(),
-						},
-					);
-				}
-				place_ty
-			}
-			_ => self.infer(lhs),
-		};
-
-		// Fitting a value back into a place is about the STORED value's type, not
-		// the place's own `mut`-ness (a characteristic of the binding/field slot,
-		// already gated above for a field target) — strip it here so storing an
-		// ordinary `T` into a `mut T` place (e.g. reassigning a `let mut` local)
-		// doesn't spuriously demand the value itself be `mut`-typed too.
-		let expected = self.strip_mut(place_ty);
-
-		let mut resolution = None;
-		let mut pending = None;
-		match binary_of_assign(op) {
-			// `place op= value` ≡ `place = place op value`: the operator's result type
-			// must be assignable back into the place.
-			Some(binop) => {
-				let (result, res, pend) = self.infer_binary(lhs, binop, rhs, span);
-				if !matches!(self.interner.kind(result), TyKind::Never) {
-					self.unify(result, expected, span);
-				}
-				resolution = res;
-				pending = pend.map(|ty| (binop, ty, result));
-			}
-			// Plain `=`.
-			None => self.check(rhs, expected),
-		}
-		(self.interner.void(), resolution, pending)
 	}
 
 	// ── Blocks ───────────────────────────────────────────────────────────────
@@ -4241,53 +4731,47 @@ impl<'m> Checker<'m> {
 	}
 
 	fn check_let_statement(&mut self, meta: &nymph_ast::decl::LetDeclaration, value: &Expr) {
-		let has_annot = meta.type_.is_some();
 		let ty = match &meta.type_ {
 			Some(annot) => {
 				let declared = self.lower_type(annot);
-				// Check the initializer against the declared type with any `mut` the
-				// annotation itself carries peeled off first: initializing a
-				// `mut T`-annotated binding only needs a plain `T`-compatible value —
-				// `mut` here is a capability layer the BINDING gains, not a runtime
-				// distinction the initializer must already carry (mirrors the
-				// un-annotated `let mut` form below, which already accepts a plain
-				// value and wraps it in `mut` after the fact). Without this peel,
-				// `subtype` (one-way `mut T <: T`, never the reverse) would reject
-				// every plain-typed initializer against an explicit `mut T`
-				// annotation, e.g. `let mut c: mut Counter = Counter(n = 0)`.
-				let expected = self.strip_mut(declared);
-				self.check(value, expected);
+				self.check(value, declared);
 				declared
 			}
 			None => self.infer(value),
 		};
-		// `let mut x = v` binds `x` at `mut <ty(v)>` (one of the two mutability
-		// cancel points: dropping into a `let mut` always gains `mut`, whatever
-		// `v`'s own mutability was — `mk_mut` is idempotent, so this never nests).
-		// A plain `let x = v` WITHOUT an explicit annotation instead drops any
-		// `mut` `v` had (the other cancel point): the binding is immutable, so its
-		// type must be too. But a plain `let x: mut T = v` — an explicit `mut`
-		// annotation is its own, separate authority, independent of the
-		// `let mut` keyword  — must keep the `mut` the user wrote instead of
-		// silently stripping it.
-		let ty = if meta.is_mutable() {
-			self.interner.mk_mut(ty)
-		} else if has_annot {
-			ty
-		} else {
-			self.strip_mut(ty)
+		if meta.is_managed() {
+			self.check_managed_binding(value, ty);
+		}
+		self.bind_pattern(&meta.name, ty);
+	}
+
+	fn check_managed_binding(&mut self, value: &Expr, ty: Ty) {
+		let Some((interface, _)) = self.runtime_roles.close.clone() else {
+			let ty = self.display(ty).into();
+			self.emit(value.span, TypeError::ManagedResourceRequired { ty });
+			return;
 		};
-		self.bind_pattern(&meta.name, ty, meta.is_mutable());
+		let ty = self.shallow_resolve(ty);
+		if !self.holds(ty, interface, &[], 0) {
+			let ty = self.display(ty).into();
+			self.emit(value.span, TypeError::ManagedResourceRequired { ty });
+			return;
+		}
+		let Some(resolution) = self.resolve_method(ty, "close", &[], &[], value.span) else {
+			let ty = self.display(ty).into();
+			self.emit(value.span, TypeError::ManagedResourceRequired { ty });
+			return;
+		};
+		self.charge_effect_call(resolution.target.clone(), &resolution.params, &[]);
+		self
+			.annotations
+			.record_managed_cleanup(value.id, method_resolution("close".into(), &resolution));
 	}
 
 	// ── Iteration ────────────────────────────────────────────────────────────
 	fn infer_iterable_element(&mut self, iterable: &Expr) -> Ty {
 		let ty = self.infer(iterable);
-		// `mut` is transparent to iteration: `for x in xs` over a `mut #[int]`
-		// yields `int` elements, same as an immutable list. Peel it, else the
-		// element type falls through to an unconstrained fresh var and the loop
-		// body escapes type-checking.
-		let stripped = self.strip_mut(ty);
+		let stripped = self.shallow_resolve(ty);
 		if let TyKind::List(elem) = self.interner.kind(stripped)
 			&& self.runtime_roles.iterable.is_none()
 		{
@@ -4315,21 +4799,13 @@ impl<'m> Checker<'m> {
 	/// a two-hop `iter.next` would come back unpinned.
 	///
 	/// Records which mode won (`IterMode`) on the iterable's own node id —
-	/// `lower_for` has no solver access of its own and reads this back to know
-	/// whether to emit `<src>.iter` or `<src>` as the desugar's first `let`.
+	/// `lower_iteration` has no solver access of its own and reads this back to know
+	/// whether to emit `<src>.iter()` or `<src>` as the desugar's first `let`.
 	fn resolve_iterable_source(&mut self, iterable: &Expr, ty: Ty, stripped: Ty) -> Ty {
 		if self.is_error_or_infer(stripped) {
 			return self.interner.error();
 		}
-		// Captured the same way `resolve_method`'s own `recv_is_mut` is (BEFORE
-		// the `mut` peel above erases it): whether the source, as the caller
-		// actually wrote it, is `mut`. Needed so an `Iterator`/`Iterable` impl
-		// reachable only through the mutable view (`impl A for mut B` / `impl
-		// mut A for B` — the only way such an impl's `next`/`iter`
-		// can mutate `this`, since a plain `func` binds `this: Self`, not `mut
-		// Self`) is actually reachable, rather than permanently unmatched.
-		let resolved = self.shallow_resolve(ty);
-		let self_is_mut = matches!(self.interner.kind(resolved), TyKind::Mut(_));
+		let _ = ty;
 		if let TyKind::Param(idx) = self.interner.kind(stripped) {
 			let idx = *idx;
 			// A generic parameter's iterability can't be found through the impl registry
@@ -4341,12 +4817,11 @@ impl<'m> Checker<'m> {
 			// `.next` protocol rather than the native-list index fast path.
 			if let Some((iterator, next)) = self.runtime_roles.iterator.clone()
 				&& let Some((ret, _)) = self.resolve_param_exact_method(idx, iterator, &next, iterable.span)
-				&& let Some(item) = self.option_element(ret)
+				&& let Some(item) = self.iteration_element(ret)
 			{
 				let Some(next_name) = self.runtime_role_member_name(iterator, &next) else {
 					return self.interner.error();
 				};
-				self.gate_mutating(iterator, &next_name, self_is_mut, iterable.span);
 				if let (Some(interface), Some(interface_member)) =
 					(self.defs.stable(iterator).cloned(), Some(next.clone()))
 				{
@@ -4377,10 +4852,9 @@ impl<'m> Checker<'m> {
 				&& let Some(item) = self.resolve_param_iface_arg(idx, iface, &item_name)
 				&& let Some((_ret, _)) = self.resolve_param_exact_method(idx, iface, &iter, iterable.span)
 			{
-				let Some(iter_name) = self.runtime_role_member_name(iface, &iter) else {
+				let Some(_) = self.runtime_role_member_name(iface, &iter) else {
 					return self.interner.error();
 				};
-				self.gate_mutating(iface, &iter_name, self_is_mut, iterable.span);
 				if let (Some(interface), Some(interface_member)) =
 					(self.defs.stable(iface).cloned(), Some(iter.clone()))
 				{
@@ -4410,18 +4884,11 @@ impl<'m> Checker<'m> {
 				.get(&iterator)
 				.and_then(|i| i.generics.first().cloned())
 			&& let Some((item, implementation_index)) =
-				self.resolve_iface_arg_with_implementation(stripped, self_is_mut, iterator, &item_name, 0)
+				self.resolve_iface_arg_with_implementation(stripped, iterator, &item_name, 0)
 		{
-			// The desugar (`lower_for_protocol`) invokes `next` on this exact
-			// source directly (`IterMode::Direct`: `let $it = <src>`) — gate it
-			// exactly like an explicit `<src>.next` call would be via
-			// `resolve_method`, or a non-`mut` receiver's fields get mutated
-			// through the loop with no diagnostic at all (MutMethodNeedsMutReceiver
-			// bypassed).
 			let Some(next_name) = self.runtime_role_member_name(iterator, &next) else {
 				return self.interner.error();
 			};
-			self.gate_mutating(iterator, &next_name, self_is_mut, iterable.span);
 			let resolution = self.commit_method(
 				implementation_index,
 				stripped,
@@ -4443,17 +4910,11 @@ impl<'m> Checker<'m> {
 				.get(&iface)
 				.and_then(|i| i.generics.first().cloned())
 			&& let Some((elem, implementation_index)) =
-				self.resolve_iface_arg_with_implementation(stripped, self_is_mut, iface, &t_name, 0)
+				self.resolve_iface_arg_with_implementation(stripped, iface, &t_name, 0)
 		{
-			// Same reasoning as the `Direct` gate above, but for the `.iter` hop
-			// the desugar calls on this source (`IterMode::ViaIter`): gate it
-			// against `Iterable::iter`'s own declared mutability, not `Iterator::next`'s
-			// (the iterator `iter` returns is a distinct value, resolved and
-			// gated separately were it ever user-callable — out of scope here).
 			let Some(iter_name) = self.runtime_role_member_name(iface, &iter) else {
 				return self.interner.error();
 			};
-			self.gate_mutating(iface, &iter_name, self_is_mut, iterable.span);
 			let iter_resolution = self.commit_method(
 				implementation_index,
 				stripped,
@@ -4461,7 +4922,7 @@ impl<'m> Checker<'m> {
 				Some((&[], &[])),
 				iterable.span,
 			);
-			let iterator_ty = self.strip_mut(iter_resolution.ty);
+			let iterator_ty = self.shallow_resolve(iter_resolution.ty);
 			if let Some((iterator, next)) = self.runtime_roles.iterator.clone()
 				&& let Some(next_name) = self.runtime_role_member_name(iterator, &next)
 				&& let Some(item_name) = self
@@ -4469,7 +4930,7 @@ impl<'m> Checker<'m> {
 					.get(&iterator)
 					.and_then(|interface| interface.generics.first().cloned())
 				&& let Some((_, next_implementation_index)) =
-					self.resolve_iface_arg_with_implementation(iterator_ty, true, iterator, &item_name, 0)
+					self.resolve_iface_arg_with_implementation(iterator_ty, iterator, &item_name, 0)
 			{
 				let next_resolution = self.commit_method(
 					next_implementation_index,
@@ -4496,14 +4957,15 @@ impl<'m> Checker<'m> {
 		self.interner.error()
 	}
 
-	/// If `ty` is `Option<T>` (the return of `Iterator::next`), return `T`.
-	fn option_element(&mut self, ty: Ty) -> Option<Ty> {
+	/// If `ty` is the canonical `Iteration<Item, Next>` returned by
+	/// `Iterator::next`, return `Item`.
+	fn iteration_element(&mut self, ty: Ty) -> Option<Ty> {
 		let ty = self.shallow_resolve(ty);
 		let (def, first) = match self.interner.kind(ty) {
 			TyKind::Adt(def, args) => (*def, args.positional.first().copied()),
 			_ => return None,
 		};
-		if self.runtime_roles.option == Some(def) {
+		if self.runtime_roles.iteration == Some(def) {
 			first
 		} else {
 			None
@@ -4559,33 +5021,13 @@ impl<'m> Checker<'m> {
 		let pending = std::mem::take(&mut self.pending_operators);
 		for (id, span, ty, pending_result, kind) in pending {
 			let resolved = match kind {
-				PendingOperatorKind::BinaryOp(op) | PendingOperatorKind::AssignOp(op) => {
-					self.resolve_fallback_operand(op, ty, span)
-				}
+				PendingOperatorKind::BinaryOp(op) => self.resolve_fallback_operand(op, ty, span),
 				PendingOperatorKind::PrefixOp(op) => self.resolve_fallback_prefix_operand(op, ty, span),
 			};
 			match resolved {
 				Some((result_ty, resolution)) => {
 					self.unify(result_ty, pending_result, span);
-					match kind {
-						// A `BinaryOp`/`PrefixOp` node's initially-recorded type was only the
-						// (possibly still-unbound) operand placeholder; overwrite it with the
-						// now-final result type, same as the immediately-resolved path would
-						// have (a `PrefixOp`'s placeholder is the operand type itself, per
-						// `infer_prefix`, exactly mirroring the arithmetic fallback's
-						// operand-as-placeholder shape).
-						PendingOperatorKind::BinaryOp(_) | PendingOperatorKind::PrefixOp(_) => {
-							self.record(id, result_ty, Some(resolution))
-						}
-						// an `AssignOp` node's own type is always `Void` — set
-						// immediately in `infer`'s `AssignOp` special case — and must stay
-						// that way. `record` overwrites the whole `ExprInfo` (including
-						// `ty`), so only `record_resolution` (which touches just the
-						// `resolution` field) is safe here; it must never regress to
-						// clobbering `Void` with the operator's operand/result type the way
-						// the immediately-resolved compound-assign path never does.
-						PendingOperatorKind::AssignOp(_) => self.annotations.record_resolution(id, resolution),
-					}
+					self.record(id, result_ty, Some(resolution));
 				}
 				None => {
 					// Still unbound (a genuinely under-determined program) or `Error` (an
@@ -4628,7 +5070,6 @@ impl<'m> Checker<'m> {
 	///   fidelity for an argful declared bound like `Comparable<Other = T>`).
 	pub(crate) fn finalize_pending_bounds(&mut self) {
 		let pending = std::mem::take(&mut self.pending_bounds);
-		let arg_mut = std::mem::take(&mut self.pending_bound_arg_mut);
 		for obligation in pending {
 			let PendingBound {
 				site: span,
@@ -4660,80 +5101,20 @@ impl<'m> Checker<'m> {
 							.is_some_and(|is| is.contains(&interface));
 					bounded || self.holds(resolved, interface, &args, 0)
 				}
-				// `resolved` here has already had any `mut` cancelled by
-				// `subtype`'s one-way `mut T <: T` (`check_call_arg` is what binds
-				// this obligation's variable) — `pending_bound_arg_mut`, keyed by
-				// the SAME un-resolved `ty` `fn_type_of` pushed this obligation
-				// with, is the side channel that survived that cancellation.
-				BoundFinalizationDisposition::Check(_) => match arg_mut.get(&ty).copied() {
-					// One contributing argument was `mut`, another wasn't. This is
-					// NOT automatically an error: if the bound is satisfied by the
-					// PLAIN type (an ordinary `impl A for B`, no mut-only impl), both
-					// a `mut` and a plain argument satisfy it — the mixed-ness is
-					// harmless. Only when the plain type FAILS the bound (i.e. A is
-					// implemented only for `mut B`) does this reject, and then the
-					// general `!satisfied` block below emits `BoundSatisfiedOnlyByMut`
-					// — the precise "B doesn't fit; A is implemented for `mut B`"
-					// message — rather than a vaguer mixed-arguments one. So the
-					// mixed case is just the ordinary plain-type check.
-					Some((true, true)) => self.holds(resolved, interface, &args, 0),
-					// Every contributing argument was `mut`: a `Mut(B)`-only impl
-					// additionally matches (`holds_self`, mut-aware), on top of the
-					// ordinary plain-type check every argument (mut or not) already
-					// gets — a `mut` argument still satisfies an unrelated, non-mut
-					// bound one-way, same as the `mut T <: T` subtype rule elsewhere.
-					Some((true, false)) => {
-						self.holds(resolved, interface, &args, 0)
-							|| self.holds_self(resolved, true, interface, &args, 0)
-					}
-					_ => self.holds(resolved, interface, &args, 0),
-				},
+				BoundFinalizationDisposition::Check(_) => self.holds(resolved, interface, &args, 0),
 			};
 			if !satisfied {
-				// The plain type failed the bound — if its `mut` version WOULD
-				// satisfy it (`impl A for mut ty` / `impl mut A for ty`), say so
-				// directly rather than a bare "does not implement". `holds_self`
-				// (not a `mk_mut`-wrapped `holds`) so a `Mut` impl self type is
-				// peeled correctly rather than compared against a doubly-`Mut`
-				// `self_ty` (see `holds_self`'s doc comment).
-				if self.holds_self(resolved, true, interface, &args, 0) {
-					let ty = self.display(resolved);
-					let interface = self.defs.data(interface).name.clone();
-					self.emit(span, TypeError::BoundSatisfiedOnlyByMut { ty, interface });
-				} else {
-					let ty = self.display(resolved);
-					let interface = self.defs.data(interface).name.clone();
-					self.emit(span, TypeError::BoundNotSatisfied { ty, interface });
-				}
+				let ty = self.display(resolved);
+				let interface = self.defs.data(interface).name.clone();
+				self.emit(span, TypeError::BoundNotSatisfied { ty, interface });
 			}
 		}
 	}
 
-	/// Infer a `receiver.method(args…)` call argument's shape for `resolve_method`.
-	/// Closure bodies are deferred until the selected method supplies their exact
-	/// contextual function type; collection literals retain the existing owned-`Mut`
-	/// coercion described below.
-	///
-	/// Wraps a fresh `#{…}`/`#[…]` literal argument's inferred type in `Mut` so
-	/// it can satisfy a `mut`-typed method parameter. Unlike
-	/// free-function calls — `check_call_arg` — and ctor/block/if/match positions
-	/// — `check_dispatch`'s own hook — a method call has no parameter type to
-	/// `check` the argument against up front; the candidate's params only become
-	/// known *after* `resolve_method` has already committed to one). This is
-	/// exactly [`Checker::try_coerce_owned_literal_to_mut`]'s own rationale
-	/// (a collection literal is a uniquely-owned temporary with no other alias,
-	/// so it may stand in for `mut T`), applied at the type level instead: wrapping
-	/// unconditionally is safe because `unify_arg` (`coerce.rs`) already peels a
-	/// `mut`-typed ARGUMENT one-way — `(_, Mut(a)) => unify_arg(param, a, …)` —
-	/// whenever the matched parameter isn't itself `mut`, so this can never leak a
-	/// spurious `Mut` into a non-`mut`/generic parameter's binding; it only ever
-	/// unlocks the one case `unify_arg` couldn't reach before: a genuinely
-	/// `mut`-typed parameter matched against this now-`Mut`-typed literal argument.
-	/// A NAMED binding (`ExprKind::Identifier`, never wrapped here) is untouched,
-	/// so the existing one-way `mut T <: T` invariant — a plain-typed named
-	/// argument still can't satisfy a `mut` parameter — is unaffected.
+	/// Infer a method-call argument shape. Closure bodies remain deferred until
+	/// the selected method supplies their contextual function type.
 	fn infer_method_call_arg(&mut self, expr: &Expr) -> Ty {
-		let ty = if let ExprKind::Closure {
+		if let ExprKind::Closure {
 			params,
 			generics,
 			return_type,
@@ -4756,24 +5137,10 @@ impl<'m> Checker<'m> {
 			self.interner.mk_fn(params, return_type)
 		} else {
 			self.infer(expr)
-		};
-		if matches!(expr.kind, ExprKind::Map(_) | ExprKind::List(_)) {
-			self.interner.mk_mut(ty)
-		} else {
-			ty
 		}
 	}
 
-	/// Check a free-function call argument against its (possibly still a fresh
-	/// generic-parameter variable) parameter type, additionally recording the
-	/// argument's ACTUAL, pre-cancellation mutability against that parameter
-	/// type — mirrors [`Self::check`] exactly, branch for branch, so
-	/// behavior is unchanged; the one addition is the record in the generic
-	/// fallback arm, made before `subtype` (via the fallback's call) cancels a
-	/// `mut` argument's tag. See [`Checker::pending_bound_arg_mut`]'s doc
-	/// comment for why this can't instead hook `subtype` itself (it also
-	/// checks return values, `let` bindings, etc. — this call site is the one
-	/// `fn_type_of`'s `pending_bounds` obligations are actually about).
+	/// Check a free-function call argument against its parameter type.
 	fn check_call_arg(&mut self, expr: &Expr, pty: Ty) {
 		self.resolve_anon(expr, Some(pty));
 		match &expr.kind {
@@ -4802,27 +5169,9 @@ impl<'m> Checker<'m> {
 			// `try_coerce_owned_literal_to_mut` in turn. A blind `infer` here leaves
 			// nested elements with no expected type at
 			// all, so a `mut`-expected nested item could never win the coercion).
-			// `check_call_arg`'s extra `pending_bound_arg_mut` tracking (below, in
-			// the `_` arm) is for a NAMED argument's own recorded mutability
-			// feeding a later generic-bound check; a `Map`/`List` literal is never
-			// itself typed `mut` by `infer`, so skipping that tracking here changes
-			// nothing observable — `is_mut` in the `_` arm would always have read
-			// `false` for these two expression kinds anyway.
 			ExprKind::Map(_) | ExprKind::List(_) => self.check(expr, pty),
 			_ => {
 				let got = self.infer(expr);
-				self.record_implicit_uint_to_int(expr, got, pty);
-				let got_resolved = self.shallow_resolve(got);
-				let is_mut = matches!(self.interner.kind(got_resolved), TyKind::Mut(_));
-				let entry = self
-					.pending_bound_arg_mut
-					.entry(pty)
-					.or_insert((false, false));
-				if is_mut {
-					entry.0 = true;
-				} else {
-					entry.1 = true;
-				}
 				self.subtype(got, pty, expr.span);
 			}
 		}
@@ -4953,6 +5302,13 @@ impl Checker<'_> {
 			.mk_adt(option, GenericArgs::new(vec![element], vec![]))
 	}
 
+	fn state_loop_result_type(&mut self, kind: Option<LoopBreakKind>) -> Ty {
+		match kind {
+			Some(LoopBreakKind::Valued(ty)) => self.shallow_resolve(ty),
+			Some(LoopBreakKind::None | LoopBreakKind::Bare) | None => self.interner.void(),
+		}
+	}
+
 	/// Finds breaks targeting the immediately enclosing loop. `Some(true)` means
 	/// at least one valued break; nested loops and every callable body are boundaries.
 	fn targeting_break_kind(
@@ -4996,23 +5352,6 @@ impl Checker<'_> {
 					}
 				}
 				ExprKind::Closure { .. } => None,
-				ExprKind::While {
-					condition,
-					body,
-					label,
-				} => merge(
-					walk(checker, condition, target),
-					if target.0.is_none()
-						|| label
-							.as_ref()
-							.zip(target.0)
-							.is_some_and(|(a, b)| a.0 == b.0)
-					{
-						None
-					} else {
-						walk(checker, body, (target.0, false))
-					},
-				),
 				ExprKind::For {
 					iterable,
 					body,
@@ -5067,7 +5406,7 @@ impl Checker<'_> {
 				},
 				ExprKind::Call { func, args, .. } => merge(
 					walk(checker, func, target),
-					many(args.iter().map(|arg| &arg.0.value).collect()),
+					many(args.iter().map(|arg| arg.0.value()).collect()),
 				),
 				ExprKind::MemberAccess { parent, .. } => walk(checker, parent, target),
 				ExprKind::IndexAccess { parent, index, .. } => {
@@ -5078,7 +5417,7 @@ impl Checker<'_> {
 				| ExprKind::Grouped(value)
 				| ExprKind::TypeOp { lhs: value, .. }
 				| ExprKind::PatternOp { lhs: value, .. } => walk(checker, value, target),
-				ExprKind::BinaryOp { lhs, rhs, .. } | ExprKind::AssignOp { lhs, rhs, .. } => {
+				ExprKind::BinaryOp { lhs, rhs, .. } => {
 					merge(walk(checker, lhs, target), walk(checker, rhs, target))
 				}
 				ExprKind::Return { value, .. } => value
@@ -5141,31 +5480,6 @@ fn adt_subst(args: &GenericArgs) -> FxHashMap<ParamIdx, Ty> {
 fn arg_int_lits(args: &[Spanned<CallArg>]) -> Vec<bool> {
 	args
 		.iter()
-		.map(|a| matches!(a.0.value.kind, ExprKind::Int(_)))
+		.map(|a| matches!(a.0.value().kind, ExprKind::Int(_)))
 		.collect()
-}
-
-/// The binary operator underlying a compound assignment (`+=` → `+`), or `None` for a
-/// plain `=`.
-fn binary_of_assign(op: AssignOperator) -> Option<BinaryOperator> {
-	use AssignOperator::*;
-	use BinaryOperator as B;
-	Some(match op {
-		Assign => return None,
-		PlusAssign => B::Plus,
-		MinusAssign => B::Minus,
-		TimesAssign => B::Times,
-		DivideAssign => B::Divide,
-		RemainderAssign => B::Remainder,
-		PowerAssign => B::Power,
-		LeftShiftAssign => B::LeftShift,
-		RightShiftAssign => B::RightShift,
-		BitAndAssign => B::BitAnd,
-		BitXorAssign => B::BitXor,
-		BitOrAssign => B::BitOr,
-		BoolAndAssign => B::BoolAnd,
-		BoolOrAssign => B::BoolOr,
-		// `~=` has no binary form; treat it as a plain re-assignment.
-		BitNotAssign => return None,
-	})
 }

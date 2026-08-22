@@ -7,7 +7,8 @@ use nymph_compiler::project::{
 	SemanticQueryEvent, SourceVersion,
 };
 use nymph_sema::{
-	EntryMode, InterfaceType, ModuleEnvironment, RecoveredDefinitionReference, RecoveredInterfaceType,
+	EffectRow, EntryMode, InterfaceType, ModuleEnvironment, RecoveredDefinitionReference,
+	RecoveredInterfaceType,
 };
 
 fn interface_event_session() -> (CompilerSession, Arc<Mutex<Vec<SemanticQueryEvent>>>) {
@@ -223,7 +224,7 @@ fn every_public_interface_shape_edit_changes_the_interface() {
 }
 
 #[test]
-fn unrelated_anonymous_binder_insertion_does_not_change_public_interface() {
+fn unrelated_private_definition_does_not_renumber_public_anonymous_binders() {
 	let mut session = CompilerSession::without_builtin_sources();
 	let project = ProjectId::new("anonymous-binder-stability");
 	let main = ModulePath::new("main").unwrap();
@@ -266,7 +267,13 @@ fn unrelated_anonymous_binder_insertion_does_not_change_public_interface() {
 	let after = session
 		.module_interface(project, main.clone(), main, EntryMode::Library)
 		.expect("complete interface after insertion");
-	assert_eq!(before, after);
+	assert_eq!(before.exports, after.exports);
+	assert!(
+		after
+			.support_definitions
+			.iter()
+			.any(|definition| definition.definition.name == "unrelated")
+	);
 }
 
 #[test]
@@ -348,24 +355,99 @@ fn private_leaf_body_edit_backdates_before_consumers_execute() {
 			)
 			.is_some()
 	);
+	let leaf = ModulePath::new("leaf").unwrap();
+	let before = session
+		.module_interface(
+			project.clone(),
+			leaf.clone(),
+			leaf.clone(),
+			EntryMode::Library,
+		)
+		.unwrap();
+	assert_eq!(before.exports[0].effects, EffectRow::pure());
 	events.lock().unwrap().clear();
 	session.set_source(
 		project.clone(),
-		ModulePath::new("leaf").unwrap(),
+		leaf.clone(),
 		"public func value(): int = 2".into(),
 		SourceVersion(2),
 	);
 	assert!(
 		session
-			.analyze_module(project, main.clone(), main, EntryMode::Entry)
+			.analyze_module(project.clone(), main.clone(), main, EntryMode::Entry)
 			.is_some()
 	);
-	let observed = events.lock().unwrap();
-	assert_eq!(count(&observed, "interface_module_analysis", "leaf"), 1);
-	assert_eq!(count(&observed, "interface_module_interface", "leaf"), 1);
-	assert_eq!(count(&observed, "interface_module_environment", "leaf"), 1);
-	assert_eq!(count(&observed, "interface_module_analysis", "middle"), 0);
-	assert_eq!(count(&observed, "interface_module_analysis", "main"), 0);
+	{
+		let observed = events.lock().unwrap();
+		assert_eq!(count(&observed, "interface_module_analysis", "leaf"), 1);
+		assert_eq!(count(&observed, "interface_module_interface", "leaf"), 1);
+		assert_eq!(count(&observed, "interface_module_environment", "leaf"), 1);
+		assert_eq!(count(&observed, "interface_module_analysis", "middle"), 0);
+		assert_eq!(count(&observed, "interface_module_analysis", "main"), 0);
+	}
+	let after = session
+		.module_interface(project.clone(), leaf.clone(), leaf, EntryMode::Library)
+		.unwrap();
+	assert_eq!(after.exports[0].effects, EffectRow::pure());
+	assert_eq!(before, after);
+}
+
+#[test]
+fn imported_range_facts_do_not_change_caller_diagnostics_or_interface_fingerprint() {
+	let mut session = CompilerSession::new();
+	let project = ProjectId::new("range-body-isolation");
+	let leaf = ModulePath::new("leaf").unwrap();
+	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		leaf.clone(),
+		"public func value(input: int): int = input + 1".into(),
+		SourceVersion(1),
+	);
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"import @/leaf with (value)\nfunc main(): int = value(1)".into(),
+		SourceVersion(1),
+	);
+	let before_interface = session
+		.module_interface(
+			project.clone(),
+			leaf.clone(),
+			leaf.clone(),
+			EntryMode::Library,
+		)
+		.unwrap();
+	let before_diagnostics = session
+		.analyze_module(
+			project.clone(),
+			main.clone(),
+			main.clone(),
+			EntryMode::Entry,
+		)
+		.unwrap()
+		.diagnostics
+		.clone();
+	session.set_source(
+		project.clone(),
+		leaf.clone(),
+		"public func value(input: int): int = input + 2".into(),
+		SourceVersion(2),
+	);
+	let after_interface = session
+		.module_interface(project.clone(), leaf.clone(), leaf, EntryMode::Library)
+		.unwrap();
+	let after_diagnostics = session
+		.analyze_module(project, main.clone(), main, EntryMode::Entry)
+		.unwrap()
+		.diagnostics
+		.clone();
+
+	assert_eq!(
+		before_interface.structural_fingerprint(),
+		after_interface.structural_fingerprint()
+	);
+	assert_eq!(before_diagnostics, after_diagnostics);
 }
 
 #[test]
@@ -618,6 +700,12 @@ fn equal_intermediate_interface_stops_transitive_invalidation() {
 	let project = ProjectId::new("interface-stop");
 	install_chain(&mut session, &project);
 	let main = ModulePath::new("main").unwrap();
+	session.set_source(
+		project.clone(),
+		ModulePath::new("middle").unwrap(),
+		"import @/leaf with (value)\nprivate func detail(): int = 1\npublic func forwarded(): int = value()".into(),
+		SourceVersion(2),
+	);
 	let _ = session.analyze_module(
 		project.clone(),
 		main.clone(),
@@ -629,7 +717,7 @@ fn equal_intermediate_interface_stops_transitive_invalidation() {
 		project.clone(),
 		ModulePath::new("middle").unwrap(),
 		"import @/leaf with (value)\nprivate func detail(): int = 2\npublic func forwarded(): int = value()".into(),
-		SourceVersion(2),
+		SourceVersion(3),
 	);
 	let _ = session.analyze_module(project, main.clone(), main, EntryMode::Entry);
 	let observed = events.lock().unwrap();

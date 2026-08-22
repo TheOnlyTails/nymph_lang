@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use nymph_sema::{
-	BinderScope, DeclarationCategory, DeclarationKey, DefinitionId, DefinitionShapeKind,
+	BinderScope, DeclarationCategory, DeclarationKey, DefinitionId, DefinitionShapeKind, EffectRow,
 	ExportedDefinition, ExportedImpl, ExternalAbi, FieldShape, GenericConstraint, GenericParameter,
 	GenericParameterId, InterfaceType, MemberKind, MemberShape, ModuleEnvironment, ModuleIdentity,
-	ModuleInterface, ModuleOrigin, ParameterShape, RecoveredDefinitionReference,
+	ModuleInterface, ModuleOrigin, ParameterShape, RecoveredDefinitionReference, RecoveredEffectRow,
 	RecoveredExportedDefinition, RecoveredExportedImpl, RecoveredInterfaceType,
 	RecoveredModuleInterface, RecoveredSupportDefinition, SemanticAvailability, SemanticEnvironment,
 };
@@ -22,9 +22,11 @@ fn recovered(definition: ExportedDefinition) -> RecoveredExportedDefinition {
 		constraints: vec![],
 		parameters: vec![],
 		return_type: None,
+		effects: RecoveredEffectRow::Known(definition.effects),
 		ty: definition.ty.map(RecoveredInterfaceType::Known),
 		fields: vec![],
 		variants: vec![],
+		enum_view_variants: vec![],
 		members: definition
 			.members
 			.into_iter()
@@ -42,17 +44,17 @@ fn recovered(definition: ExportedDefinition) -> RecoveredExportedDefinition {
 						name: parameter.name,
 						ty: RecoveredInterfaceType::Known(parameter.ty),
 						spread: parameter.spread,
-						mutable: parameter.mutable,
 					})
 					.collect(),
 				return_type: RecoveredInterfaceType::Known(member.return_type),
-				external: member.external,
+				effects: RecoveredEffectRow::Known(member.effects),
+				external: member.external.map(ExternalAbi::recovered),
 				runtime_owner: member.runtime_owner,
 				has_default: member.has_default,
 			})
 			.collect(),
 		super_interfaces: vec![],
-		external: definition.external,
+		external: definition.external.map(ExternalAbi::recovered),
 		runtime_owner: definition.runtime_owner,
 	}
 }
@@ -63,6 +65,10 @@ fn module(path: &str) -> ModuleIdentity {
 		project: "test".into(),
 		path: path.into(),
 	}
+}
+
+fn package_module(node: u64, path: &str) -> ModuleIdentity {
+	ModuleIdentity::resolved_project("test", node, path)
 }
 
 fn id(owner: &ModuleIdentity, name: &str) -> DefinitionId {
@@ -83,9 +89,11 @@ fn exported(id: DefinitionId, name: &str) -> ExportedDefinition {
 		constraints: vec![],
 		parameters: vec![],
 		return_type: None,
+		effects: EffectRow::pure(),
 		ty: None,
 		fields: vec![],
 		variants: vec![],
+		enum_view_variants: vec![],
 		members: vec![],
 		super_interfaces: vec![],
 		external: None,
@@ -121,6 +129,7 @@ fn member(
 		constraints: vec![],
 		parameters: vec![],
 		return_type: ret,
+		effects: EffectRow::pure(),
 		external: None,
 		runtime_owner: Some(owner.clone()),
 		has_default: false,
@@ -146,18 +155,8 @@ fn complete_interfaces_and_impls_populate_owned_dispatch_registries() {
 	ty.members.push(member(
 		&type_id,
 		"touch",
-		MemberKind::MutatingFunction,
+		MemberKind::Function,
 		InterfaceType::Boolean,
-	));
-	ty.members.push(member(
-		&type_id,
-		"make",
-		MemberKind::StaticFunction,
-		InterfaceType::Named {
-			definition: type_id.clone(),
-			positional: vec![],
-			named: vec![],
-		},
 	));
 	let touch_id = ty.members[0].id.clone();
 	let impl_id = DefinitionId::new(
@@ -169,13 +168,13 @@ fn complete_interfaces_and_impls_populate_owned_dispatch_registries() {
 		visibility: None,
 		interface: Some(iface_id.clone()),
 		interface_arguments: vec![("Output".into(), InterfaceType::String)],
+		interface_effect_arguments: vec![],
 		interface_argument_bindings: vec![],
 		self_type: InterfaceType::Named {
 			definition: type_id.clone(),
 			positional: vec![],
 			named: vec![],
 		},
-		mutable: false,
 		binders: vec![],
 		constraints: vec![],
 		members: vec![],
@@ -213,8 +212,6 @@ fn complete_interfaces_and_impls_populate_owned_dispatch_registries() {
 		inherent.methods["touch"].definition.as_ref(),
 		Some(&touch_id)
 	);
-	assert!(inherent.methods["touch"].mutating);
-	assert!(inherent.methods["make"].namespaced);
 }
 
 #[test]
@@ -246,7 +243,6 @@ fn complete_and_recovered_imports_keep_only_ordered_public_members() {
 			name: None,
 			ty: InterfaceType::String,
 			spread: false,
-			mutable: false,
 		});
 		let mut after = member(
 			&iface_id,
@@ -372,10 +368,12 @@ fn private_support_is_stable_addressable_but_not_bare_visible() {
 		ModuleEnvironment::Complete(interface) => interface.clone(),
 		ModuleEnvironment::Recovered(_) => unreachable!(),
 	};
+	let mut private_definition = exported(private.clone(), "Private");
+	private_definition.visibility = Some(nymph_ast::decl::Visibility::Private);
 	interface
 		.support_definitions
 		.push(nymph_sema::SupportDefinition {
-			definition: exported(private.clone(), "Private"),
+			definition: private_definition,
 		});
 	let env = SemanticEnvironment::from_modules(
 		module("consumer"),
@@ -385,6 +383,95 @@ fn private_support_is_stable_addressable_but_not_bare_visible() {
 
 	assert_eq!(env.imported.defs.get("Private"), None);
 	assert!(env.imported.defs.by_stable(&private).is_some());
+}
+
+#[test]
+fn stable_support_is_projected_by_exact_package_and_module_identity() {
+	let owner = package_module(1, "types");
+	let public = exported(id(&owner, "Public"), "Public");
+	let mut internal = exported(id(&owner, "Internal"), "Internal");
+	internal.visibility = Some(nymph_ast::decl::Visibility::Internal);
+	let mut private = exported(id(&owner, "Private"), "Private");
+	private.visibility = Some(nymph_ast::decl::Visibility::Private);
+	let stable = Arc::new(ModuleEnvironment::Complete(ModuleInterface {
+		module: owner.clone(),
+		exports: vec![public],
+		support_definitions: vec![
+			nymph_sema::SupportDefinition {
+				definition: internal.clone(),
+			},
+			nymph_sema::SupportDefinition {
+				definition: private.clone(),
+			},
+		],
+		implementations: vec![],
+		fingerprint: 0,
+	}));
+
+	let names_for = |consumer| {
+		let environment = SemanticEnvironment::from_modules(consumer, &[stable.clone()]).unwrap();
+		let mut names = environment
+			.imported
+			.defs
+			.by_name
+			.keys()
+			.map(ToString::to_string)
+			.collect::<Vec<_>>();
+		names.sort();
+		names
+	};
+
+	assert_eq!(
+		names_for(package_module(1, "types")),
+		["Internal", "Private", "Public"]
+	);
+	assert_eq!(
+		names_for(package_module(1, "consumer")),
+		["Internal", "Public"]
+	);
+	assert_eq!(names_for(package_module(2, "consumer")), ["Public"]);
+
+	let recovered = Arc::new(ModuleEnvironment::Recovered(RecoveredModuleInterface {
+		module: owner,
+		exports: vec![recovered(exported(
+			id(&package_module(1, "types"), "Public"),
+			"Public",
+		))],
+		support_definitions: vec![
+			RecoveredSupportDefinition {
+				definition: recovered(internal),
+			},
+			RecoveredSupportDefinition {
+				definition: recovered(private),
+			},
+		],
+		implementations: vec![],
+		fingerprint: 0,
+	}));
+	let recovered_names_for = |consumer| {
+		let environment = SemanticEnvironment::from_modules(consumer, &[recovered.clone()]).unwrap();
+		let mut names = environment
+			.imported
+			.defs
+			.by_name
+			.keys()
+			.map(ToString::to_string)
+			.collect::<Vec<_>>();
+		names.sort();
+		names
+	};
+	assert_eq!(
+		recovered_names_for(package_module(1, "types")),
+		["Internal", "Private", "Public"]
+	);
+	assert_eq!(
+		recovered_names_for(package_module(1, "consumer")),
+		["Internal", "Public"]
+	);
+	assert_eq!(
+		recovered_names_for(package_module(2, "consumer")),
+		["Public"]
+	);
 }
 
 #[test]
@@ -419,13 +506,13 @@ fn impl_only_referenced_identity_is_allocated_in_pass_a() {
 		visibility: None,
 		interface: None,
 		interface_arguments: vec![],
+		interface_effect_arguments: vec![],
 		interface_argument_bindings: vec![],
 		self_type: InterfaceType::Named {
 			definition: hidden.clone(),
 			positional: vec![],
 			named: vec![],
 		},
-		mutable: false,
 		binders: vec![],
 		constraints: vec![],
 		members: vec![],
@@ -460,9 +547,11 @@ fn recovery_taints_without_fabricating_poison_ids() {
 		constraints: vec![],
 		parameters: vec![],
 		return_type: None,
+		effects: RecoveredEffectRow::Known(EffectRow::pure()),
 		ty: Some(RecoveredInterfaceType::Poison),
 		fields: vec![],
 		variants: vec![],
+		enum_view_variants: vec![],
 		members: vec![],
 		super_interfaces: vec![],
 		external: None,
@@ -477,8 +566,8 @@ fn recovery_taints_without_fabricating_poison_ids() {
 		availability: SemanticAvailability::StructureUnavailable,
 		interface: Some(RecoveredDefinitionReference::Poison),
 		interface_arguments: vec![],
+		interface_effect_arguments: vec![],
 		self_type: RecoveredInterfaceType::Poison,
-		mutable: false,
 		binders: vec![],
 		constraints: vec![],
 		members: vec![],
@@ -508,6 +597,7 @@ fn pass_b_instantiates_owned_definition_facts_after_all_ids_exist() {
 	let generic = GenericParameter {
 		id: GenericParameterId::new(box_id.binder(BinderScope::Definition, 0), 0),
 		name: "T".into(),
+		kind: nymph_sema::GenericParameterKind::Type,
 	};
 	let iface = id(&a, "Project");
 	let mut box_def = exported(box_id, "Box");
@@ -520,14 +610,15 @@ fn pass_b_instantiates_owned_definition_facts_after_all_ids_exist() {
 		name: "value".into(),
 		visibility: None,
 		ty: InterfaceType::Generic(generic.id.clone()),
-		mutable: false,
 		has_default: false,
+		default_effects: None,
 	});
 	box_def.constraints.push(GenericConstraint {
 		parameter: generic.id.clone(),
 		interface: iface.clone(),
 		positional: vec![],
 		named: vec![("Output".into(), InterfaceType::Generic(generic.id.clone()))],
+		effect_args: vec![],
 	});
 	let mut function = exported(
 		DefinitionId::new(
@@ -541,7 +632,6 @@ fn pass_b_instantiates_owned_definition_facts_after_all_ids_exist() {
 	function.parameters.push(ParameterShape {
 		name: Some("item".into()),
 		ty: InterfaceType::Generic(generic.id.clone()),
-		mutable: false,
 		spread: true,
 	});
 	function.return_type = Some(InterfaceType::Named {
@@ -563,6 +653,7 @@ fn pass_b_instantiates_owned_definition_facts_after_all_ids_exist() {
 		constraints: vec![],
 		parameters: vec![],
 		return_type: InterfaceType::Int,
+		effects: EffectRow::pure(),
 		external: None,
 		runtime_owner: None,
 		has_default: false,
@@ -618,9 +709,11 @@ fn recovered_poison_is_error_fact_and_environment_remains_tainted() {
 		constraints: vec![],
 		parameters: vec![],
 		return_type: None,
+		effects: RecoveredEffectRow::Known(EffectRow::pure()),
 		ty: Some(RecoveredInterfaceType::Poison),
 		fields: vec![],
 		variants: vec![],
+		enum_view_variants: vec![],
 		members: vec![],
 		super_interfaces: vec![],
 		external: None,
@@ -648,6 +741,7 @@ fn recovered_definitions_retain_every_independently_known_owned_fact() {
 	let generic = GenericParameter {
 		id: GenericParameterId::new(generic_owner.binder(BinderScope::Definition, 0), 0),
 		name: "T".into(),
+		kind: nymph_sema::GenericParameterKind::Type,
 	};
 	let mut alias = RecoveredExportedDefinition {
 		id: generic_owner.clone(),
@@ -664,14 +758,17 @@ fn recovered_definitions_retain_every_independently_known_owned_fact() {
 				generic.id.clone(),
 			))],
 			named: vec![],
+			effect_args: vec![],
 		}],
 		parameters: vec![],
 		return_type: None,
+		effects: RecoveredEffectRow::Known(EffectRow::pure()),
 		ty: Some(RecoveredInterfaceType::Known(InterfaceType::Generic(
 			generic.id.clone(),
 		))),
 		fields: vec![],
 		variants: vec![],
+		enum_view_variants: vec![],
 		members: vec![],
 		super_interfaces: vec![],
 		external: None,
@@ -693,20 +790,30 @@ fn recovered_definitions_retain_every_independently_known_owned_fact() {
 		constraints: alias.constraints.clone(),
 		parameters: vec![],
 		return_type: None,
+		effects: RecoveredEffectRow::Known(EffectRow::pure()),
 		ty: Some(RecoveredInterfaceType::Known(InterfaceType::Generic(
 			generic.id.clone(),
 		))),
 		fields: vec![],
 		variants: vec![],
+		enum_view_variants: vec![],
 		members: vec![],
 		super_interfaces: vec![],
 		external: Some(ExternalAbi {
 			marker: "host".into(),
 			callable: nymph_sema::ExternalCallable::Linked {
-				module: "runtime".into(),
-				symbol: "value".into(),
+				adapter: nymph_sema::ExternalAdapterId {
+					module: "runtime".into(),
+					symbol: "value".into(),
+				},
 			},
-			marshal: Some(nymph_hir::hir::MarshalKind::Int),
+			effects: RecoveredEffectRow::Known(EffectRow::pure()),
+			audit: nymph_sema::ExternalAudit::default(),
+			call_mode: nymph_sema::ExternalCallMode::Ordinary,
+			marshal: nymph_sema::ExternalMarshalPlan {
+				parameters: vec![],
+				result: Some(nymph_hir::hir::MarshalKind::Int),
+			},
 		}),
 		runtime_owner: None,
 	};
@@ -725,9 +832,11 @@ fn recovered_definitions_retain_every_independently_known_owned_fact() {
 				constraints: vec![],
 				parameters: vec![],
 				return_type: None,
+				effects: RecoveredEffectRow::Known(EffectRow::pure()),
 				ty: None,
 				fields: vec![],
 				variants: vec![],
+				enum_view_variants: vec![],
 				members: vec![],
 				super_interfaces: vec![],
 				external: None,
@@ -754,7 +863,9 @@ fn recovered_definitions_retain_every_independently_known_owned_fact() {
 		TyKind::Param(ParamIdx(0))
 	));
 	assert_eq!(
-		env.imported.external_abis[&env.imported.defs.by_stable(&value_id).unwrap()].marshal,
+		env.imported.external_abis[&env.imported.defs.by_stable(&value_id).unwrap()]
+			.marshal
+			.result,
 		Some(nymph_hir::hir::MarshalKind::Int)
 	);
 }

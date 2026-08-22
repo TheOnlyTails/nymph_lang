@@ -166,7 +166,12 @@ fn assemble_runtime_module_with_collected(
 				validate_module(target, lowered)?;
 				top_level_values.insert(lowered.definition().clone(), value.clone());
 			}
-			Fragment::TopLevelExternal { .. } => validate_module(target, lowered)?,
+			Fragment::TopLevelExternal { function, .. } => {
+				validate_module(target, lowered)?;
+				if let Some(function) = function {
+					hir.funcs.push(function.clone());
+				}
+			}
 			Fragment::RuntimeTypeAttachment {
 				object,
 				function,
@@ -186,7 +191,6 @@ fn assemble_runtime_module_with_collected(
 				let attachment_index = runtime_type_attachments.len();
 				runtime_type_attachments.push(HirLet {
 					name: format!("$attach${attachment_index}").into(),
-					mutable: false,
 					value: HirExpr::RuntimeTypeAttachment {
 						object: Box::new(object.clone()),
 						method: Box::new(method.clone()),
@@ -487,16 +491,10 @@ fn resolve_shell(owner: &DefinitionId) -> Option<&DefinitionId> {
 			category: DeclarationCategory::Struct | DeclarationCategory::Enum,
 			..
 		} => Some(owner),
-		DeclarationKey::Implementation { header, .. } => {
-			let mut self_type = &header.self_type;
-			while let HeaderType::Mutable(inner) = self_type {
-				self_type = inner;
-			}
-			match self_type {
-				HeaderType::Named { definition, .. } => Some(definition),
-				_ => None,
-			}
-		}
+		DeclarationKey::Implementation { header, .. } => match &header.self_type {
+			HeaderType::Named { definition, .. } => Some(definition),
+			_ => None,
+		},
 		_ => None,
 	}
 }
@@ -618,6 +616,7 @@ mod tests {
 		HirClass {
 			name: name.into(),
 			fields: vec![],
+			defaults: vec![],
 			methods: vec![],
 			statics: vec![],
 		}
@@ -657,7 +656,6 @@ mod tests {
 			value.clone(),
 			LoweredHirFragment::TopLevelValue(nymph_hir::hir::HirLet {
 				name: "value".into(),
-				mutable: false,
 				value: HirExpr::Bool(true),
 			}),
 			RuntimeAssemblyPlacement::Module(target.clone()),
@@ -721,12 +719,11 @@ mod tests {
 			DeclarationKey::implementation(ImplementationHeader {
 				interface: None,
 				interface_arguments: vec![],
-				self_type: HeaderType::Mutable(Box::new(HeaderType::Named {
+				self_type: HeaderType::Named {
 					definition: owner.clone(),
 					positional: vec![],
 					named: vec![],
-				})),
-				mutable: true,
+				},
 				binders: vec![],
 				constraints: vec![],
 			}),

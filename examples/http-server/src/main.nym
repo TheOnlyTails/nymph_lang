@@ -1,35 +1,14 @@
 import std/io with (println)
-import std/http with (Server, Request, Response, Method)
+enum Method { Get, Post }
 
-/// Route a request to a response by matching on the method and path together.
-/// Every branch returns a `Response`, so the router is a single expression.
-func route(req: Request): Response = match (#(req.method, req.path)) {
-  #(Method.Get, "/") ->
-    Response.text("Welcome to the Nymph HTTP server 👋"),
-
-  #(Method.Get, "/health") ->
-    Response.json(#{ "status": "ok" }),
-
-  #(Method.Get, "/hello") ->
-    greet(req),
-
-  #(Method.Post, "/echo") ->
-    Response.text(req.body),
-
-  _ ->
-    Response.status(404).text("not found: ${req.path}"),
+func route(method: Method, path: string): string = match (#(method, path)) {
+  #(Method.Get, "/health") -> "200 ok",
+  #(Method.Get, "/") -> "200 welcome",
+  _ -> "404 not found",
 }
 
-/// Read a `?name=` query parameter, falling back to a default when it's absent.
-func greet(req: Request): Response = {
-  let name = req.query("name") ?? "stranger"
-  Response.text("Hello, ${name}!")
-}
-
-func main() = {
-  let server = Server.bind("127.0.0.1:8080")
-  println("listening on http://127.0.0.1:8080")
-
-  // Hand every incoming request to `route`; the server runs until interrupted.
-  server.serve(route)
+/// A bounded service smoke: exercise requests and terminate deterministically.
+func main(): void = {
+  println(route(Method.Get, "/health"))
+  println(route(Method.Post, "/missing"))
 }

@@ -113,6 +113,63 @@ fn nymph_with_stdin(
 	}
 }
 
+fn example_manifest(name: &str) -> std::path::PathBuf {
+	std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+		.join("../../examples")
+		.join(name)
+		.join("nymph.toml")
+}
+
+#[test]
+fn every_example_manifest_checks() {
+	for name in [
+		"fizzbuzz",
+		"hello-world",
+		"http-server",
+		"shapes",
+		"todo-cli",
+		"word-frequency",
+	] {
+		let manifest = example_manifest(name);
+		let out = nymph(&["check", "--manifest", manifest.to_str().unwrap()]);
+		assert!(out.status.success(), "{name}: {}", out.stderr);
+	}
+}
+
+#[test]
+fn deterministic_examples_have_exact_output_and_status() {
+	let fizzbuzz = (1..=100)
+		.map(|value| match (value % 3, value % 5) {
+			(0, 0) => "FizzBuzz".to_string(),
+			(0, _) => "Fizz".to_string(),
+			(_, 0) => "Buzz".to_string(),
+			_ => value.to_string(),
+		})
+		.collect::<Vec<_>>()
+		.join("\n")
+		+ "\n";
+	for (name, expected) in [
+		("fizzbuzz", fizzbuzz.as_str()),
+		("hello-world", "Hello, world!\n"),
+		("http-server", "200 ok\n404 not found\n"),
+		(
+			"shapes",
+			"circle with area 12.56636\nrectangle with area 12.0\ntriangle with area 6.0\ntotal area: 30.56636\n",
+		),
+		("todo-cli", "[x] #1 write the compiler\n"),
+		(
+			"word-frequency",
+			"most common words:\n  4  the\n  2  fox\n  1  quick\n  1  brown\n  1  lazy\n",
+		),
+	] {
+		let manifest = example_manifest(name);
+		let out = nymph(&["run", "--manifest", manifest.to_str().unwrap()]);
+		assert_eq!(out.status.code(), Some(0), "{name}: {}", out.stderr);
+		assert_eq!(out.stdout, expected, "{name}");
+		assert_eq!(out.stderr, "", "{name}");
+	}
+}
+
 fn write_project(entry: &str, source: &str) -> std::path::PathBuf {
 	let root = unique_temp_path("nymph_cli_project", "dir");
 	let entry_path = root.join("src").join(entry);
@@ -226,18 +283,13 @@ fn doc_failure_preserves_the_previous_output_tree() {
 }
 
 #[test]
-fn doc_reports_warnings_without_blocking_publication() {
+fn doc_publishes_exact_large_integers_without_warning() {
 	let root = write_project("main.nym", "public func large(): int = 9007199254740992\n");
 	let result = nymph_in(&["doc"], &root);
 	assert!(result.status.success(), "{}", result.stderr);
 	assert!(
-		result.stderr.to_ascii_lowercase().contains("warning"),
-		"{}",
-		result.stderr
-	);
-	assert!(
-		result.stderr.contains("9007199254740992"),
-		"{}",
+		!result.stderr.to_ascii_lowercase().contains("warning"),
+		"unexpected warning: {}",
 		result.stderr
 	);
 	assert!(root.join("target/nymph/doc/index.html").is_file());
@@ -341,6 +393,31 @@ fn manifest_is_a_global_flag_before_or_after_the_subcommand() {
 
 	std::fs::remove_dir_all(root).unwrap();
 	std::fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
+fn release_flag_is_available_only_on_build_check_and_run() {
+	let root = write_project("main.nym", "func main(): void = {}\n");
+	for command in ["build", "check", "run"] {
+		let out = nymph_in(&[command, "--release"], &root);
+		assert!(
+			out.status.success(),
+			"{command} --release should select the compiler profile: {}",
+			out.stderr
+		);
+	}
+	let expression = nymph_in(&["run", "--release", "--expr", "1 + 1"], &root);
+	assert!(expression.status.success(), "{}", expression.stderr);
+	assert_eq!(expression.stdout.trim(), "2");
+
+	let repl = nymph_in(&["repl", "--release"], &root);
+	assert_eq!(repl.status.code(), Some(2));
+	assert!(repl.stderr.contains("unexpected argument '--release'"));
+	let global = nymph_in(&["--release", "check"], &root);
+	assert_eq!(global.status.code(), Some(2));
+	assert!(global.stderr.contains("unexpected argument '--release'"));
+
+	std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -812,19 +889,19 @@ fn check_reports_a_type_error_with_location_and_message() {
 }
 
 #[test]
-fn check_renders_warnings_without_failing() {
+fn check_accepts_exact_large_integers_without_warning() {
 	let path = write_source("func value(): int = 9007199254740992");
 	let out = nymph(&["check", path.to_str().unwrap()]);
 	let _ = std::fs::remove_file(&path);
 
 	assert!(
 		out.status.success(),
-		"warnings alone should exit successfully: {}",
+		"exact integer should pass: {}",
 		out.stderr
 	);
 	assert!(
-		out.stderr.to_ascii_lowercase().contains("warning"),
-		"the warning should still be rendered: {}",
+		!out.stderr.to_ascii_lowercase().contains("warning"),
+		"unexpected warning: {}",
 		out.stderr
 	);
 }
@@ -876,7 +953,7 @@ fn build_writes_nothing_on_a_type_error() {
 
 #[test]
 fn build_leaves_a_previously_built_artifact_intact_when_a_later_build_fails() {
-	// A failed rebuild must NEVER delete (or otherwise touch) whatever
+	// Fix 3: a failed rebuild must NEVER delete (or otherwise touch) whatever
 	// was already at the output path — including a real artifact from an
 	// earlier successful build of the same source.
 	let path = write_source("func add(a: int, b: int): int = a + b");
@@ -915,7 +992,7 @@ fn build_leaves_a_previously_built_artifact_intact_when_a_later_build_fails() {
 
 #[test]
 fn build_failure_does_not_touch_an_unrelated_file_at_the_output_path() {
-	// The file at `-o` does not have to be a stale
+	// Fix 3, the other half: the file at `-o` doesn't have to be a stale
 	// nymph-build artifact at all — it could be anything already sitting at
 	// that path. A failed build must leave it byte-for-byte alone.
 	let path = write_source("func f(): int = true");
@@ -995,9 +1072,17 @@ fn check_reports_ok_for_a_user_struct_plus_impl_via_the_default_prelude() {
 
 #[test]
 fn build_and_run_succeed_for_a_user_impl_of_a_stdlib_interface() {
-	// A user `impl Plus for P` resolves `Plus` from the default prelude. Lowering
-	// must search prelude interfaces as well as the user AST for default bodies.
-	// No I/O exists yet to print the
+	// The stdlib body materialization slice's payoff (flips the prelude
+	// flip's former honest-scope KK4 limitation, pinned pre-this-slice as
+	// `build_reports_a_readable_error_for_a_user_impl_of_a_stdlib_interface`):
+	// checking a user struct's `impl Plus for P` (with no local `interface
+	// Plus` declaration at all) was already clean via the default prelude,
+	// but lowering used to panic — "impl references unknown interface
+	// `Plus`" — because the interface's own declaration lives in the
+	// prelude tree, invisible to a lowering that only ever walked the
+	// user's own AST. Feeding the prelude's interfaces into the same
+	// lookup fixes this directly: `build` now succeeds and writes real JS,
+	// and `run` actually executes it. No I/O exists yet to print the
 	// result directly, so — mirroring
 	// `run_invokes_main_and_surfaces_a_runtime_error_from_its_body`'s
 	// "observable side effect without I/O" trick — `main` deliberately
@@ -1102,8 +1187,10 @@ fn run_evaluates_an_inline_expression_and_prints_its_value() {
 
 #[test]
 fn run_evaluates_boolean_bitwise_operators_to_booleans_not_numbers() {
-	// Boolean `&`/`|`/`^` must dispatch to the materialized stdlib impls;
-	// native JS bitwise ops coerce booleans to numbers (`true & false` → 0).
+	// Regression: boolean `&`/`|`/`^` used to hit infer_binary's same-primitive
+	// BuiltinEager fast path and emit native JS bitwise ops, which coerce
+	// booleans to numbers (`true & false` → 0). They now dispatch to the stdlib
+	// BitAnd/BitOr/BitXor impls (materialized) and produce real booleans.
 	let out = nymph(&["run", "-e", "#(true & false, true | false, true ^ true)"]);
 	assert!(
 		out.status.success(),
@@ -1127,16 +1214,16 @@ fn run_reports_a_type_error_in_an_inline_expression() {
 }
 
 #[test]
-fn repl_piped_transcript_is_prompt_free_persistent_multiline_and_transactional() {
+fn repl_piped_transcript_is_prompt_free_persistent_multiline_and_recovers_errors() {
 	let root = unique_temp_path("nymph_cli_repl_loose", "dir");
 	std::fs::create_dir_all(&root).unwrap();
+	// The malformed `let = 1` submission is intentionally retained as parser-
+	// recovery evidence; it is not maintained mutable-source syntax.
 	let transcript = r#"let stable = 7
 let old = stable
 let stable = 9
 let = 1
 let wrong: int = true
-func recurse(): int = recurse()
-let failed = recurse()
 #(stable, old)
 "value ${if (true) {
   42
@@ -1160,7 +1247,6 @@ comment */ 1
 		"{}",
 		out.stderr
 	);
-	assert!(out.stderr.contains("failed at runtime"), "{}", out.stderr);
 }
 
 #[test]
@@ -1229,145 +1315,6 @@ fn repl_eof_exits_cleanly_without_prompts_or_output() {
 }
 
 #[test]
-fn repl_rolls_back_cells_collections_closures_iterators_and_debug_rendering() {
-	let root = unique_temp_path("nymph_cli_repl_transactions", "dir");
-	std::fs::create_dir_all(&root).unwrap();
-	let transcript = r#"func recurse(): int = recurse()
-let mut scalar = 1
-let mut list = #[1, 2]
-let alias = list
-let mut map = #{1: 10}
-func mutate_then_fail(): int = { scalar = 9 list.insert(1, 8) list.remove(0) list.splice(0, 1, #[7]) list.pop() list.push(3) list[4u] = 9 list.clear() map.insert(2, 20) map.remove(1) map.get_or_insert(3, 30) map[4] = 40 map.clear() recurse() }
-mutate_then_fail()
-#(scalar, list, alias, map)
-func make_counter(): () -> int = { let mut value = 0 return () -> { value = value + 1 value } }
-let counter = make_counter()
-counter()
-func counter_then_fail(): int = { counter() recurse() }
-counter_then_fail()
-counter()
-let mut iterator = #[4, 5].iter()
-iterator.next()
-func iterator_then_fail(): int = { iterator.next() recurse() }
-iterator_then_fail()
-iterator.next()
-func debug_fail(): string = debug_fail()
-struct Bad { impl Debug { func debug(): string = { list.push(8) debug_fail() } } }
-Bad()
-list
-"#;
-	let out = nymph_with_stdin(&["repl"], &root, transcript);
-	std::fs::remove_dir_all(root).unwrap();
-	assert!(out.status.success(), "{}", out.stderr);
-	assert_eq!(
-		out.stdout,
-		"#(1, #[1, 2], #[1, 2], #{1: 10})\n1\n2\nOption.Some(value: 4)\nOption.Some(value: 5)\n#[1, 2]\n"
-	);
-	assert_eq!(
-		out.stderr.matches("failed at runtime").count(),
-		4,
-		"{}",
-		out.stderr
-	);
-}
-
-#[test]
-fn repl_rolls_back_closure_private_collections_structs_and_nested_aliases() {
-	let root = unique_temp_path("nymph_cli_repl_closure_state", "dir");
-	std::fs::create_dir_all(&root).unwrap();
-	let transcript = r#"func recurse(): int = recurse()
-struct Cell(value: mut int)
-func make_list_state(): () -> #[int] = { let mut values = #[1] return () -> { values.push(2) values } }
-let list_state = make_list_state()
-list_state()
-func fail_list_state(): int = { list_state() recurse() }
-fail_list_state()
-list_state()
-func make_map_state(): () -> #{int: int} = { let mut values = #{1: 10} return () -> { values.insert(2, 20) values } }
-let map_state = make_map_state()
-map_state()
-func fail_map_state(): int = { map_state() recurse() }
-fail_map_state()
-map_state()
-func make_struct_state(): () -> Cell = { let mut seed = 1 let mut value: mut Cell = Cell(value = seed) return () -> { value.value = value.value + 1 value } }
-let struct_state = make_struct_state()
-struct_state()
-func fail_struct_state(): int = { struct_state() recurse() }
-fail_struct_state()
-struct_state()
-let mut seed = 3
-let mut cell = Cell(value = seed)
-let nested: #[mut Cell] = #[cell]
-let nested_alias = nested
-func fail_nested(): int = { nested_alias[0].value = 9 recurse() }
-fail_nested()
-#(nested[0].value, nested_alias[0].value)
-"#;
-	let out = nymph_with_stdin(&["repl"], &root, transcript);
-	std::fs::remove_dir_all(root).unwrap();
-	assert!(out.status.success(), "{}", out.stderr);
-	assert_eq!(
-		out.stdout,
-		"#[1, 2]\n#[1, 2, 2]\n#{1: 10, 2: 20}\n#{1: 10, 2: 20}\nCell(value: 2)\nCell(value: 3)\n#(3, 3)\n"
-	);
-	assert_eq!(
-		out.stderr.matches("failed at runtime").count(),
-		4,
-		"{}",
-		out.stderr
-	);
-}
-
-#[test]
-fn repl_preserves_project_private_state_and_bare_import_siblings_when_shadowed() {
-	let root = write_project("main.nym", "func main(): void = {}");
-	std::fs::write(
-		root.join("src/state.nym"),
-		concat!(
-			"private let mut values = #[1]\n",
-			"public func current(): #[int] = values\n",
-			"func recurse(): int = recurse()\n",
-			"public func fail(): int = { values.push(2) recurse() }\n",
-			"public let a = 1\n",
-			"public let b = 2\n",
-			"public enum Shade { Light }",
-		),
-	)
-	.unwrap();
-	std::fs::write(root.join("src/dep.nym"), "public let dep = 4").unwrap();
-	let transcript = concat!(
-		"import @/state\n",
-		"current()\n",
-		"fail()\n",
-		"current()\n",
-		"let a = 9\n",
-		"#(a, b, state.b)\n",
-		"Light\n",
-		"let state = 7\n",
-		"state\n",
-		"import @/state with (a as grouped_a, b as grouped_b)\n",
-		"let grouped_a = 8\n",
-		"#(grouped_a, grouped_b)\n",
-		"import @/dep\n",
-		"let dep = 9\n",
-		"dep\n",
-	);
-	let out = nymph_with_stdin(&["repl"], &root, transcript);
-	std::fs::remove_dir_all(root).unwrap();
-	assert!(out.status.success(), "{}", out.stderr);
-	assert_eq!(
-		out.stdout,
-		"#[1]\n#[1]\n#(9, 2, 2)\nShade.Light\n7\n#(8, 2)\n9\n"
-	);
-	assert_eq!(
-		out.stderr.matches("failed at runtime").count(),
-		1,
-		"{}",
-		out.stderr
-	);
-}
-
-#[test]
 fn repl_renders_void_canonically() {
 	let root = unique_temp_path("nymph_cli_repl_void", "dir");
 	std::fs::create_dir_all(&root).unwrap();
@@ -1376,101 +1323,6 @@ fn repl_renders_void_canonically() {
 	assert!(out.status.success(), "{}", out.stderr);
 	assert_eq!(out.stdout, "void\n");
 	assert!(!out.stdout.contains("undefined"));
-}
-
-#[test]
-fn repl_rolls_back_hamt_collisions_and_equal_nonidentical_keys() {
-	let root = unique_temp_path("nymph_cli_repl_hamt", "dir");
-	std::fs::create_dir_all(&root).unwrap();
-	let transcript = r#"func recurse(): int = recurse()
-struct Key(id: int) { impl Equals<Other = Key> { func equals(other: Key): boolean = this.id == other.id } impl Hash { func hash(): int = 0 } }
-let mut values = #{Key(id = 1): 10, Key(id = 2): 20}
-func mutate_hamt_then_fail(): int = { values.insert(Key(id = 3), 30) values.remove(Key(id = 1)) recurse() }
-mutate_hamt_then_fail()
-#(values.size(), values[Key(id = 1)], values[Key(id = 2)])
-let mut hash_calls = 0
-let mut hash_side_effects: #[int] = #[]
-struct StatefulKey(id: int) { impl Equals<Other = StatefulKey> { func equals(other: StatefulKey): boolean = this.id == other.id } impl Hash { func hash(): int = { hash_calls = hash_calls + 1 hash_side_effects.push(hash_calls) 0 } } }
-let mut stateful_values = #{StatefulKey(id = 1): 10}
-func mutate_stateful_hash_then_fail(): int = { stateful_values[StatefulKey(id = 2)] = 20 recurse() }
-mutate_stateful_hash_then_fail()
-#(hash_calls, hash_side_effects, stateful_values)
-"#;
-	let out = nymph_with_stdin(&["repl"], &root, transcript);
-	std::fs::remove_dir_all(root).unwrap();
-	assert!(out.status.success(), "{}", out.stderr);
-	assert_eq!(
-		out.stdout,
-		"#(2, 10, 20)\n#(1, #[1], #{StatefulKey(id: 1): 10})\n"
-	);
-	assert_eq!(
-		out.stderr.matches("failed at runtime").count(),
-		2,
-		"{}",
-		out.stderr
-	);
-}
-
-#[test]
-fn repl_hamt_callbacks_cannot_corrupt_the_map_they_are_querying() {
-	let root = write_project("main.nym", "func main(): void = {}");
-	std::fs::write(
-		root.join("src/state.nym"),
-		r#"let mut hash_armed = #[false]
-struct HashKey(id: int) {
-  impl Equals<Other = HashKey> { func equals(other: HashKey): boolean = this.id == other.id }
-  impl Hash { func hash(): int = { if (hash_armed[0]) { hash_armed[0u] = false hash_map.insert(HashKey(id = 99), 99) } 0 } }
-}
-let mut hash_map = #{HashKey(id = 1): 10}
-public func mutate_from_hash(): #(uint, uint, boolean) = {
-  hash_armed[0u] = true
-  hash_map[HashKey(id = 2)] = 20
-  #(hash_map.size(), hash_map.entries().length(), hash_map.contains_key(HashKey(id = 99)))
-}
-
-let mut equals_armed = #[false]
-struct EqualsKey(id: int) {
-  impl Equals<Other = EqualsKey> {
-    func equals(other: EqualsKey): boolean = {
-      if (equals_armed[0]) { equals_armed[0u] = false equals_map.insert(EqualsKey(id = 99), 99) }
-      this.id == other.id
-    }
-  }
-  impl Hash { func hash(): int = 0 }
-}
-let mut equals_map = #{EqualsKey(id = 1): 10}
-public func mutate_from_equals(): void = {
-  equals_armed[0u] = true
-  equals_map[EqualsKey(id = 2)] = 20
-}
-public func equals_snapshot(): #(uint, uint, boolean) =
-  #(equals_map.size(), equals_map.entries().length(), equals_map.contains_key(EqualsKey(id = 99)))
-"#,
-	)
-	.unwrap();
-	let transcript = concat!(
-		"import @/state with (mutate_from_hash, mutate_from_equals, equals_snapshot)\n",
-		"mutate_from_hash()\n",
-		"mutate_from_equals()\n",
-		"equals_snapshot()\n",
-	);
-	let out = nymph_with_stdin(&["repl"], &root, transcript);
-	std::fs::remove_dir_all(root).unwrap();
-	assert!(out.status.success(), "{}", out.stderr);
-	assert_eq!(out.stdout, "#(3, 3, true)\n#(1, 1, false)\n");
-	assert_eq!(
-		out.stderr.matches("failed at runtime").count(),
-		1,
-		"{}",
-		out.stderr
-	);
-	assert!(
-		out
-			.stderr
-			.contains("map equality callback mutated the map being updated"),
-		"{}",
-		out.stderr
-	);
 }
 
 #[test]
@@ -1499,24 +1351,99 @@ fn repl_reports_a_truncated_piped_submission_at_eof() {
 }
 
 #[test]
-fn run_invokes_main_and_surfaces_a_runtime_error_from_its_body() {
-	// The language has no I/O yet, so a `main` can't print a value to prove
-	// it ran. Deliberate unbounded recursion is a side effect that IS
-	// observable without I/O: it can only reach the JS engine's call-stack
-	// limit if `main()` was genuinely invoked (an unexecuted module never
-	// runs `spin` at all), and Node reports it deterministically.
-	let path = write_source("func spin(): void = spin()\n\nfunc main(): void = spin()");
+fn run_classifies_a_runtime_defect_from_main() {
+	let path = write_source(
+		"func divide(zero: int): float = 1 / zero\nfunc main(): void = { let boom = divide(0) }",
+	);
 	let out = nymph(&["run", path.to_str().unwrap()]);
 	let _ = std::fs::remove_file(&path);
 
-	assert!(
-		!out.status.success(),
-		"expected a nonzero exit from the runtime stack overflow"
+	assert_eq!(out.status.code(), Some(101));
+	assert!(out.stdout.is_empty());
+	assert_eq!(
+		out.stderr,
+		"error: program defected: RangeError: integer division by zero\n"
 	);
-	assert!(
-		out.stderr.contains("Maximum call stack size exceeded") && out.stderr.contains("spin"),
-		"stderr should show the crash originating from `main`'s own call to `spin`:\n{}",
-		out.stderr
+}
+
+#[test]
+fn run_applies_the_exact_sync_and_task_root_value_matrix() {
+	let cases = [
+		("func main(): void = {}", 0, ""),
+		("func main(): Option<void> = Some(value = {})", 0, ""),
+		(
+			"func main(): Option<void> = None",
+			1,
+			"error: main returned None\n",
+		),
+		("func main(): Result<void, string> = Ok(value = {})", 0, ""),
+		(
+			"func main(): Result<void, string> = Error(error = \"bad\")",
+			1,
+			"error: bad\n",
+		),
+		(
+			"func main(): Result<void, string> = Error(error = \"first\\nsecond\")",
+			1,
+			"error: first\nsecond\n",
+		),
+		(
+			"func main(): Result<void, Result<void, string>> = Error(error = Ok(value = {}))",
+			1,
+			"error: Result.Ok(value: void)\n",
+		),
+		("async func main(): void = {}", 0, ""),
+		("async func main(): Option<void> = Some(value = {})", 0, ""),
+		(
+			"async func main(): Option<void> = None",
+			1,
+			"error: main returned None\n",
+		),
+		(
+			"async func main(): Result<void, string> = Ok(value = {})",
+			0,
+			"",
+		),
+		(
+			"async func main(): Result<void, string> = Error(error = \"bad\")",
+			1,
+			"error: bad\n",
+		),
+	];
+	for (source, status, stderr) in cases {
+		let path = write_source(source);
+		let out = nymph(&["run", path.to_str().unwrap()]);
+		let _ = std::fs::remove_file(path);
+		assert_eq!(
+			out.status.code(),
+			Some(status),
+			"source: {source}\n{}",
+			out.stderr
+		);
+		assert!(out.stdout.is_empty(), "source: {source}");
+		assert_eq!(out.stderr, stderr, "source: {source}");
+	}
+}
+
+#[test]
+fn run_uses_alias_normalization_and_turns_display_failure_into_a_defect() {
+	let path = write_source("type Root = Option<void>\nasync func main(): Root = None");
+	let out = nymph(&["run", path.to_str().unwrap()]);
+	let _ = std::fs::remove_file(path);
+	assert_eq!(out.status.code(), Some(1));
+	assert!(out.stdout.is_empty());
+	assert_eq!(out.stderr, "error: main returned None\n");
+
+	let path = write_source(
+		"struct Bad(zero: int)\nimpl Display for Bad { func display(): string = { let failure = 1 / this.zero \"unreachable\" } }\nfunc main(): Result<void, Bad> = Error(error = Bad(zero = 0))",
+	);
+	let out = nymph(&["run", path.to_str().unwrap()]);
+	let _ = std::fs::remove_file(path);
+	assert_eq!(out.status.code(), Some(101));
+	assert!(out.stdout.is_empty());
+	assert_eq!(
+		out.stderr,
+		"error: program defected: RangeError: integer division by zero\n"
 	);
 }
 
@@ -1620,8 +1547,8 @@ fn run_with_main_declaring_a_non_void_return_type_errors() {
 	assert!(
 		out
 			.stderr
-			.contains("`main` must not declare a return type other than `void`"),
-		"stderr should explain that `main` must not declare a non-`void` return type:\n{}",
+			.contains("`main` must return `void`, `Option<void>`, `Result<void, E>`"),
+		"stderr should explain the supported semantic root types:\n{}",
 		out.stderr
 	);
 }
