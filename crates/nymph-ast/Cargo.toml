@@ -13,4 +13,3 @@ ecow = { workspace = true }
 ordered-float = { workspace = true }
 salsa = { workspace = true }
 strum = { workspace = true }
-chumsky = { workspace = true }

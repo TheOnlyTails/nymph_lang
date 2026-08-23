@@ -41,7 +41,6 @@ nymph-project = { path = "crates/nymph-project" }
 # Shared external dependencies (proven set carried over from the previous implementation)
 anyhow = "1.0.104"
 ariadne = "0.6.0"
-chumsky = { version = "0.13.0", features = ["pratt", "memoization", "regex", "nightly"] }
 clap = { version = "4.6.2", features = ["derive", "cargo"] }
 crossbeam-channel = "0.5.16"
 ecow = "0.3.0"

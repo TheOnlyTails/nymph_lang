@@ -68,12 +68,6 @@ impl From<Span> for std::ops::Range<usize> {
 	}
 }
 
-impl From<chumsky::span::SimpleSpan> for Span {
-	fn from(value: chumsky::span::SimpleSpan) -> Self {
-		Self::new(value.start, value.end)
-	}
-}
-
 /// Stable identity for an AST expression node, assigned once by the parser in
 /// construction order. Distinct from [`Span`]: two nodes can share text but never
 /// an id. Used to key semantic annotations (resolved types, operator impl
@@ -114,12 +108,6 @@ impl<T> Spanned<T> {
 
 	pub fn as_ref(&self) -> Spanned<&T> {
 		Spanned(&self.0, self.1)
-	}
-}
-
-impl<T> From<chumsky::span::Spanned<T>> for Spanned<T> {
-	fn from(value: chumsky::span::Spanned<T>) -> Self {
-		Self::new(value.inner, value.span)
 	}
 }
 
