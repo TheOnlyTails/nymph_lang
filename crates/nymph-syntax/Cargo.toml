@@ -16,8 +16,5 @@ ecow = { workspace = true }
 ordered-float = { workspace = true }
 unicode-ident = "1.0.24"
 
-[dev-dependencies]
-test-case = { workspace = true }
-
 [lints.clippy]
 all = "warn"

@@ -16,11 +16,8 @@ path = "src/main.rs"
 nymph-compiler = { workspace = true }
 nymph-project = { workspace = true }
 nymph-diagnostics = { workspace = true }
-nymph-format = { path = "../nymph-format" }
-ecow = { workspace = true }
+nymph-format = { workspace = true }
 clap = { workspace = true }
-inquire = "0.9.4"
-owo-colors = "4.3.0"
 rustix = { workspace = true, features = ["process"] }
 signal-hook = "0.3.18"
 anyhow = { workspace = true }

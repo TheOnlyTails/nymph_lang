@@ -12,6 +12,3 @@ authors.workspace = true
 nymph-hir = { workspace = true }
 oxc = { workspace = true }
 ecow = { workspace = true }
-
-[dev-dependencies]
-nymph-ast = { workspace = true }

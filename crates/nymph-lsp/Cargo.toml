@@ -19,7 +19,7 @@ nymph-sema = { workspace = true }
 nymph-syntax = { workspace = true }
 nymph-diagnostics = { workspace = true }
 nymph-ast = { workspace = true }
-nymph-format = { path = "../nymph-format" }
+nymph-format = { workspace = true }
 anyhow = { workspace = true }
 crossbeam-channel = { workspace = true }
 serde = { workspace = true }
