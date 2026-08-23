@@ -2926,6 +2926,8 @@ impl<'m> Checker<'m> {
 	/// Capture completion at the point where all lexical generic bounds are live.
 	/// Tooling consumes these immutable facts and never
 	/// reconstructs solver decisions.
+	/// Candidate resolution below does not write annotations; copying the growing
+	/// annotation table for each trial would make checking quadratic.
 	fn record_member_completion_facts(&mut self, parent: &Expr, inferred: Option<Ty>, span: Span) {
 		use crate::{MemberCompletion, MemberCompletionKind};
 		let mut out = Vec::new();
@@ -2949,7 +2951,6 @@ impl<'m> Checker<'m> {
 				let synthetic_params = self.synthetic_params;
 				let synthetic_bounds = self.synthetic_bounds.clone();
 				let synthetic_bound_details = self.synthetic_bound_details.clone();
-				let annotations = self.annotations.clone();
 				let resolved = self.resolve_param_namespaced_value(param, &candidate_name, span);
 				let detail = resolved.map(|(params, ret)| {
 					let ty = self.interner.mk_fn(params, ret);
@@ -2962,7 +2963,6 @@ impl<'m> Checker<'m> {
 				self.synthetic_params = synthetic_params;
 				self.synthetic_bounds = synthetic_bounds;
 				self.synthetic_bound_details = synthetic_bound_details;
-				self.annotations = annotations;
 				if let Some(detail) = detail {
 					out.push(MemberCompletion {
 						name: candidate_name,
@@ -2985,7 +2985,6 @@ impl<'m> Checker<'m> {
 			let synthetic_params = self.synthetic_params;
 			let synthetic_bounds = self.synthetic_bounds.clone();
 			let synthetic_bound_details = self.synthetic_bound_details.clone();
-			let annotations = self.annotations.clone();
 			match self.defs.data(def).kind {
 				DefKind::Namespace => {
 					if let Some(namespace) = self.sigs.namespaces.get(&def).cloned() {
@@ -3064,7 +3063,6 @@ impl<'m> Checker<'m> {
 						let synthetic_params = self.synthetic_params;
 						let synthetic_bounds = self.synthetic_bounds.clone();
 						let synthetic_bound_details = self.synthetic_bound_details.clone();
-						let annotations = self.annotations.clone();
 						let mut candidate = None;
 						if let Some((params, ret, _, _)) =
 							self.resolve_namespaced_value_on(owner.unwrap_or(def), concrete_owner, &name, span)
@@ -3081,7 +3079,6 @@ impl<'m> Checker<'m> {
 						self.synthetic_params = synthetic_params;
 						self.synthetic_bounds = synthetic_bounds;
 						self.synthetic_bound_details = synthetic_bound_details;
-						self.annotations = annotations;
 						if let Some(detail) = candidate {
 							out.push(MemberCompletion {
 								name,
@@ -3100,7 +3097,6 @@ impl<'m> Checker<'m> {
 			self.synthetic_params = synthetic_params;
 			self.synthetic_bounds = synthetic_bounds;
 			self.synthetic_bound_details = synthetic_bound_details;
-			self.annotations = annotations;
 			self.annotations.record_member_completions(parent.id, out);
 			return;
 		}
@@ -3188,7 +3184,6 @@ impl<'m> Checker<'m> {
 			let synthetic_params = self.synthetic_params;
 			let synthetic_bounds = self.synthetic_bounds.clone();
 			let synthetic_bound_details = self.synthetic_bound_details.clone();
-			let annotations = self.annotations.clone();
 			if let Some(method) = self.resolve_method_value(dispatch, &name, span)
 				&& self.diags.len() == diagnostics
 				&& !matches!(self.interner.kind(method.ty), TyKind::Error)
@@ -3208,7 +3203,6 @@ impl<'m> Checker<'m> {
 			self.synthetic_params = synthetic_params;
 			self.synthetic_bounds = synthetic_bounds;
 			self.synthetic_bound_details = synthetic_bound_details;
-			self.annotations = annotations;
 		}
 		self.annotations.record_member_completions(receiver, out);
 	}

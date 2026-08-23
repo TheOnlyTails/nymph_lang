@@ -1172,8 +1172,17 @@ impl Checker<'_> {
 		if !self.structural_blanket_allows(idx, recv, 0) {
 			return false;
 		}
-		let def = self.impls.impls[idx].clone();
-		let inst = self.instantiate_impl_scheme(&def);
+		let (self_ty, constraints, generic_count) = {
+			let def = &self.impls.impls[idx];
+			(def.self_ty, def.constraints.clone(), def.generics.len())
+		};
+		let inst = self.instantiate(
+			self_ty,
+			&constraints,
+			(0..generic_count).map(|index| ParamIdx(index as u32)),
+			FxHashMap::default(),
+			None,
+		);
 		let impl_self = inst.ty;
 		self.try_unify(recv, impl_self) && self.instantiated_constraints_hold(&inst.obligations, 0)
 	}
