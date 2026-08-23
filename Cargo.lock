@@ -1635,7 +1635,6 @@ dependencies = [
 name = "nymph-syntax"
 version = "0.1.0"
 dependencies = [
- "chumsky",
  "ecow",
  "nymph-ast",
  "nymph-diagnostics",

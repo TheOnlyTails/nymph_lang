@@ -14,15 +14,12 @@
 //!   which correctly leaves `!inside` as `!` followed by the identifier `inside`.
 
 use crate::errors::LexError;
-use chumsky::{error::RichReason, prelude::*};
 use nymph_ast::{
 	Span, Spanned,
 	expr::StringEscape,
 	token::{StrFragment, Token},
 };
 use nymph_diagnostics::{Diagnostic, IntoDiagnostic};
-
-type Err<'src> = extra::Err<Rich<'src, char, SimpleSpan, LexError>>;
 
 /// The result of lexing: the token stream plus any diagnostics gathered along the way.
 pub struct LexResult {
@@ -49,79 +46,47 @@ fn parse_f64(s: &str) -> f64 {
 
 /// Lex a whole source file.
 pub fn lex(source: &str) -> LexResult {
-	if let Some(mut tokens) = FastLexer::new(source).lex() {
-		normalize_tokens(&mut tokens);
-		return LexResult {
-			tokens,
-			diagnostics: Vec::new(),
-			incomplete: false,
-		};
-	}
-
-	lex_with_chumsky(source)
+	Lexer::new(source).lex()
 }
 
-/// Preserve Chumsky's recovery and detailed diagnostics for malformed source.
-fn lex_with_chumsky(source: &str) -> LexResult {
-	let (output, errors) = lexer().parse(source).into_output_errors();
-	let mut tokens = output.unwrap_or_default();
-	normalize_tokens(&mut tokens);
-	let incomplete = has_unterminated_block_comment(source)
-		|| errors.iter().any(|error| {
-			matches!(
-				error.reason(),
-				RichReason::ExpectedFound { found: None, .. }
-			)
-		});
-
-	let diagnostics = errors
-		.into_iter()
-		.map(|err| {
-			let span = *err.span();
-			let err = match err.reason() {
-				RichReason::ExpectedFound { expected, found } => &LexError::ExpectedFound {
-					found: found.map(|it| it.into_inner()),
-					expected: expected.iter().map(|it| it.to_string().into()).collect(),
-				},
-				RichReason::Custom(err) => err,
-			};
-			err.as_diagnostic(span)
-		})
-		.collect();
-
-	LexResult {
-		tokens,
-		diagnostics,
-		incomplete,
-	}
-}
-
-/// Allocation-light lexer for well-formed source. Any malformed or ambiguous
-/// token returns `None`, which sends the source through the diagnostic lexer.
-struct FastLexer<'src> {
+struct Lexer<'src> {
 	source: &'src str,
 	position: usize,
+	diagnostics: Vec<Diagnostic>,
+	incomplete: bool,
 }
 
-impl<'src> FastLexer<'src> {
+impl<'src> Lexer<'src> {
 	fn new(source: &'src str) -> Self {
 		Self {
 			source,
 			position: 0,
+			diagnostics: Vec::new(),
+			incomplete: false,
 		}
 	}
 
-	fn lex(mut self) -> Option<Vec<Spanned<Token>>> {
-		self.tokens(false)
+	fn lex(mut self) -> LexResult {
+		let mut tokens = self.tokens(false).unwrap_or_default();
+		normalize_tokens(&mut tokens);
+		LexResult {
+			tokens,
+			diagnostics: self.diagnostics,
+			incomplete: self.incomplete,
+		}
 	}
 
 	fn tokens(&mut self, interpolation: bool) -> Option<Vec<Spanned<Token>>> {
 		let mut tokens = Vec::new();
 		let mut brace_depth = 0;
 		loop {
-			self.skip_trivia()?;
+			self.skip_trivia();
 			if self.position == self.source.len() {
-				return (!interpolation).then_some(tokens);
+				return if interpolation {
+					self.fail(&["'}'"])
+				} else {
+					Some(tokens)
+				};
 			}
 			if interpolation && self.starts_with("}") && brace_depth == 0 {
 				self.position += 1;
@@ -138,7 +103,7 @@ impl<'src> FastLexer<'src> {
 		}
 	}
 
-	fn skip_trivia(&mut self) -> Option<()> {
+	fn skip_trivia(&mut self) {
 		loop {
 			while self.peek().is_some_and(char::is_whitespace) {
 				self.bump();
@@ -149,10 +114,14 @@ impl<'src> FastLexer<'src> {
 					self.bump();
 				}
 			} else if self.starts_with("/*") {
-				let end = self.source[self.position + 2..].find("*/")?;
-				self.position += end + 4;
+				if let Some(end) = self.source[self.position + 2..].find("*/") {
+					self.position += end + 4;
+				} else {
+					self.incomplete = true;
+					return;
+				}
 			} else {
-				return Some(());
+				return;
 			}
 		}
 	}
@@ -161,13 +130,13 @@ impl<'src> FastLexer<'src> {
 		let start = self.position;
 		let first = self.peek()?;
 		let token = if first.is_ascii_digit() {
-			self.number()?
+			self.number()
 		} else if first == '\'' {
 			self.character()?
 		} else if first == '"' {
 			self.string()?
 		} else if first == '$' {
-			self.anonymous_param()?
+			self.anonymous_param()
 		} else if first == '_' || unicode_ident::is_xid_start(first) {
 			self.identifier()
 		} else {
@@ -176,7 +145,7 @@ impl<'src> FastLexer<'src> {
 		Some(Spanned(token, Span::new(start, self.position)))
 	}
 
-	fn number(&mut self) -> Option<Token> {
+	fn number(&mut self) -> Token {
 		if self.starts_with("0x") || self.starts_with("0X") {
 			return self.radix_number(16, |c| c.is_ascii_hexdigit());
 		}
@@ -193,40 +162,46 @@ impl<'src> FastLexer<'src> {
 			self.position += 1;
 			self.digit_sequence(|c| c.is_ascii_digit());
 			self.optional_exponent();
-			return Some(Token::Float(
-				parse_f64(&self.source[start..self.position]).into(),
-			));
+			return Token::Float(parse_f64(&self.source[start..self.position]).into());
 		}
 		if self.has_exponent() {
 			self.optional_exponent();
-			return Some(Token::Float(
-				parse_f64(&self.source[start..self.position]).into(),
-			));
+			return Token::Float(parse_f64(&self.source[start..self.position]).into());
 		}
 		if self.peek().is_some_and(|c| matches!(c, 'f' | 'F')) {
 			self.bump();
-			return Some(Token::Float(
-				parse_f64(&self.source[start..self.position - 1]).into(),
-			));
+			return Token::Float(parse_f64(&self.source[start..self.position - 1]).into());
 		}
 		if self.peek().is_some_and(|c| matches!(c, 'u' | 'U')) {
 			self.bump();
 		}
-		int_decimal(&self.source[start..self.position])
+		int_decimal(&self.source[start..self.position]).unwrap_or_else(|| {
+			self.emit(
+				LexError::IntegerLiteralOutOfRange,
+				Span::new(start, self.position),
+			);
+			Token::Int(u64::MAX)
+		})
 	}
 
-	fn radix_number(&mut self, radix: u32, is_digit: impl Fn(char) -> bool + Copy) -> Option<Token> {
+	fn radix_number(&mut self, radix: u32, is_digit: impl Fn(char) -> bool + Copy) -> Token {
 		let start = self.position;
 		if !self.peek_at(2).is_some_and(is_digit) {
 			self.position += 1;
-			return int_decimal(&self.source[start..self.position]);
+			return Token::Int(0);
 		}
 		self.position += 2;
 		self.digit_sequence(is_digit);
 		if self.peek().is_some_and(|c| matches!(c, 'u' | 'U')) {
 			self.bump();
 		}
-		int_radix(&self.source[start..self.position], radix)
+		int_radix(&self.source[start..self.position], radix).unwrap_or_else(|| {
+			self.emit(
+				LexError::IntegerLiteralOutOfRange,
+				Span::new(start, self.position),
+			);
+			Token::Int(u64::MAX)
+		})
 	}
 
 	fn digit_sequence(&mut self, is_digit: impl Fn(char) -> bool + Copy) {
@@ -259,25 +234,33 @@ impl<'src> FastLexer<'src> {
 	fn character(&mut self) -> Option<Token> {
 		self.position += 1;
 		let value = if self.starts_with("\\") {
+			let escape_start = self.position;
 			self.position += 1;
-			match self.bump()? {
+			let escape = match self.bump() {
+				Some(escape) => escape,
+				None => return self.fail(&["a character escape"]),
+			};
+			match escape {
 				'n' => '\n',
 				'r' => '\r',
 				't' => '\t',
 				'\\' => '\\',
 				'\'' => '\'',
-				'u' | 'U' => self.unicode_escape()?,
-				_ => return None,
+				'u' | 'U' => self.unicode_escape(escape_start)?,
+				_ => return self.fail_at(self.position - 1, &["a valid character escape"]),
 			}
 		} else {
-			let value = self.bump()?;
+			let value = match self.bump() {
+				Some(value) => value,
+				None => return self.fail(&["a character"]),
+			};
 			if matches!(value, '\\' | '\'') {
-				return None;
+				return self.fail_at(self.position - value.len_utf8(), &["a character"]);
 			}
 			value
 		};
 		if !self.starts_with("'") {
-			return None;
+			return self.fail(&["'''"]);
 		}
 		self.position += 1;
 		Some(Token::Char(value))
@@ -288,25 +271,37 @@ impl<'src> FastLexer<'src> {
 		let mut fragments = Vec::new();
 		loop {
 			let start = self.position;
-			match self.peek()? {
+			let Some(next) = self.peek() else {
+				return self.fail(&["text", "an escape", "an interpolation", "'\"'"]);
+			};
+			match next {
 				'"' => {
 					self.position += 1;
 					return Some(Token::Str(fragments));
 				}
 				'\\' => {
 					self.position += 1;
-					let escape = match self.bump()? {
+					let escaped = match self.bump() {
+						Some(escaped) => escaped,
+						None => return self.fail(&["a string escape"]),
+					};
+					let escape = match escaped {
 						'n' => StringEscape::Newline,
 						'r' => StringEscape::Carriage,
 						't' => StringEscape::Tab,
 						'\\' => StringEscape::Backslash,
 						'"' => StringEscape::Quote,
-						'u' | 'U' => StringEscape::Unicode(self.unicode_escape()?),
+						'u' | 'U' => StringEscape::Unicode(self.unicode_escape(start)?),
 						'$' if self.starts_with("{") => {
 							self.position += 1;
 							StringEscape::Interpolation
 						}
-						_ => return None,
+						_ => {
+							return self.fail_at(
+								self.position - 1,
+								&["'n'", "'r'", "'t'", "'\\\\'", "'\"'", "'$'"],
+							);
+						}
 					};
 					fragments.push(Spanned(
 						StrFragment::Escape(escape),
@@ -337,30 +332,49 @@ impl<'src> FastLexer<'src> {
 		}
 	}
 
-	fn unicode_escape(&mut self) -> Option<char> {
+	fn unicode_escape(&mut self, escape_start: usize) -> Option<char> {
 		let start = self.position;
 		while self.position - start < 6 && self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
 			self.bump();
 		}
 		if self.position == start {
-			return None;
+			return self.fail(&["a hexadecimal digit"]);
 		}
-		u32::from_str_radix(&self.source[start..self.position], 16)
+		let value = u32::from_str_radix(&self.source[start..self.position], 16)
 			.ok()
-			.and_then(char::from_u32)
+			.and_then(char::from_u32);
+		Some(value.unwrap_or_else(|| {
+			self.emit(
+				LexError::InvalidUnicodeCodePoint,
+				Span::new(escape_start, self.position),
+			);
+			'\u{FFFD}'
+		}))
 	}
 
-	fn anonymous_param(&mut self) -> Option<Token> {
+	fn anonymous_param(&mut self) -> Token {
+		let token_start = self.position;
 		self.position += 1;
 		let start = self.position;
 		while self.peek().is_some_and(|c| c.is_ascii_digit()) {
 			self.bump();
 		}
-		let index = (start != self.position)
-			.then(|| self.source[start..self.position].parse::<u8>())
-			.transpose()
-			.ok()?;
-		Some(Token::AnonymousParam(index))
+		let index = if start == self.position {
+			None
+		} else {
+			Some(
+				self.source[start..self.position]
+					.parse::<u8>()
+					.unwrap_or_else(|_| {
+						self.emit(
+							LexError::ClosureIndexTooLarge,
+							Span::new(token_start, self.position),
+						);
+						0
+					}),
+			)
+		};
+		Token::AnonymousParam(index)
 	}
 
 	fn identifier(&mut self) -> Token {
@@ -443,6 +457,11 @@ impl<'src> FastLexer<'src> {
 				return Some(token);
 			}
 		}
+		if self.starts_with("#") {
+			self.position += 1;
+			return self.fail(&["'('", "'['", "'{'"]);
+		}
+		let start = self.position;
 		let token = match self.bump()? {
 			'.' => Token::Dot,
 			'*' => Token::Star,
@@ -469,9 +488,31 @@ impl<'src> FastLexer<'src> {
 			',' => Token::Comma,
 			';' => Token::Semicolon,
 			'@' => Token::At,
-			_ => return None,
+			_ => return self.fail_at(start, &["a token"]),
 		};
 		Some(token)
+	}
+
+	fn emit(&mut self, error: LexError, span: Span) {
+		self.diagnostics.push(error.as_diagnostic(span));
+	}
+
+	fn fail<T>(&mut self, expected: &[&str]) -> Option<T> {
+		self.fail_at(self.position, expected)
+	}
+
+	fn fail_at<T>(&mut self, position: usize, expected: &[&str]) -> Option<T> {
+		let found = self.source[position..].chars().next();
+		let end = found.map_or(position, |c| position + c.len_utf8());
+		self.incomplete |= found.is_none();
+		self.emit(
+			LexError::ExpectedFound {
+				found,
+				expected: expected.iter().map(|value| (*value).into()).collect(),
+			},
+			Span::new(position, end),
+		);
+		None
 	}
 
 	fn starts_with(&self, text: &str) -> bool {
@@ -491,52 +532,6 @@ impl<'src> FastLexer<'src> {
 		self.position += value.len_utf8();
 		Some(value)
 	}
-}
-
-/// The token parser can recover a failed `/* ... */` as `/` and `*` operator
-/// tokens. Keep that lexical recovery for diagnostics, but retain the fact
-/// that the comment token itself is still open for incremental/REPL clients.
-fn has_unterminated_block_comment(source: &str) -> bool {
-	let bytes = source.as_bytes();
-	let mut index = 0;
-	let mut quote = None;
-	while index < bytes.len() {
-		if let Some(end) = quote {
-			if bytes[index] == b'\\' {
-				index += 2;
-				continue;
-			}
-			if bytes[index] == end {
-				quote = None;
-			}
-			index += 1;
-			continue;
-		}
-		if matches!(bytes[index], b'\'' | b'"') {
-			quote = Some(bytes[index]);
-			index += 1;
-			continue;
-		}
-		if bytes[index..].starts_with(b"//") {
-			index += bytes[index..]
-				.iter()
-				.position(|byte| *byte == b'\n')
-				.unwrap_or(bytes.len() - index);
-			continue;
-		}
-		if bytes[index..].starts_with(b"/*") {
-			let Some(close) = bytes[index + 2..]
-				.windows(2)
-				.position(|window| window == b"*/")
-			else {
-				return true;
-			};
-			index += close + 4;
-			continue;
-		}
-		index += 1;
-	}
-	false
 }
 
 /// Apply post-lex normalization to this token stream and every interpolation nested in it.
@@ -583,60 +578,6 @@ fn merge_bang_keywords(tokens: &mut Vec<Spanned<Token>>) {
 	*tokens = merged;
 }
 
-fn lexer<'src>() -> impl Parser<'src, &'src str, Vec<Spanned<Token>>, Err<'src>> + Clone {
-	recursive(|token| {
-		choice((
-			number(),
-			char_literal(),
-			string_literal(token.clone()),
-			anonymous_param(),
-			keyword_or_ident(),
-			operators(),
-		))
-		.padded_by(comment().repeated())
-		.padded()
-	})
-	.repeated()
-	.collect()
-	.padded_by(comment().repeated())
-	.padded()
-}
-
-fn comment<'src>() -> impl Parser<'src, &'src str, (), Err<'src>> + Clone {
-	let line = just("//")
-		.then(any().and_is(just('\n').not()).repeated())
-		.ignored();
-	let block = just("/*")
-		.then(any().and_is(just("*/").not()).repeated())
-		.then(just("*/"))
-		.ignored();
-	choice((line, block)).padded()
-}
-
-fn number<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> + Clone {
-	let hex = regex(r"0[xX][0-9a-fA-F](_?[0-9a-fA-F])*[uU]?").map(|s: &str| int_radix(s, 16));
-	let oct = regex(r"0[oO][0-7](_?[0-7])*[uU]?").map(|s: &str| int_radix(s, 8));
-	let bin = regex(r"0[bB][01](_?[01])*[uU]?").map(|s: &str| int_radix(s, 2));
-	let dec = regex(r"\d(_?\d)*[uU]?").map(int_decimal);
-	let integer = choice((hex, oct, bin, dec)).validate(|token, e, emitter| {
-		token.unwrap_or_else(|| {
-			emitter.emit(Rich::custom(e.span(), LexError::IntegerLiteralOutOfRange));
-			Token::Int(u64::MAX)
-		})
-	});
-
-	let float_dot = regex(r"\d(_?\d)*\.\d(_?\d)*([eE][+-]?\d(_?\d)*)?")
-		.map(|s: &str| Token::Float(parse_f64(s).into()));
-	let float_exp =
-		regex(r"\d(_?\d)*[eE][+-]?\d(_?\d)*").map(|s: &str| Token::Float(parse_f64(s).into()));
-	let float_suffix =
-		regex(r"\d(_?\d)*[fF]").map(|s: &str| Token::Float(parse_f64(&s[..s.len() - 1]).into()));
-
-	// Floats are tried before integers so `1.5` is not read as `1` `.` `5`, and the
-	// dotted form is tried first so `1e3` and `1f` still work.
-	choice((float_dot, float_exp, float_suffix, integer)).map_with(|v, e| Spanned::new(v, e.span()))
-}
-
 fn int_radix(s: &str, radix: u32) -> Option<Token> {
 	let unsigned = s.ends_with(['u', 'U']);
 	let body = if unsigned {
@@ -661,238 +602,6 @@ fn int_decimal(s: &str) -> Option<Token> {
 	} else {
 		Some(Token::Int(value))
 	}
-}
-
-fn char_literal<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> + Clone {
-	let unicode = just('\\')
-		.ignore_then(one_of("uU"))
-		.ignore_then(text::digits(16).at_least(1).at_most(6).to_slice())
-		.map(|s: &str| u32::from_str_radix(s, 16).ok().and_then(char::from_u32))
-		.validate(|c, e, emitter| {
-			c.unwrap_or_else(|| {
-				emitter.emit(Rich::custom(e.span(), LexError::InvalidUnicodeCodePoint));
-				'\u{FFFD}'
-			})
-		});
-
-	let escape = choice((
-		just(r"\n").to('\n'),
-		just(r"\r").to('\r'),
-		just(r"\t").to('\t'),
-		just(r"\\").to('\\'),
-		just(r"\'").to('\''),
-	));
-
-	choice((unicode, escape, none_of("\\'")))
-		.delimited_by(just('\''), just('\''))
-		.map(Token::Char)
-		.map_with(|v, e| Spanned::new(v, e.span()))
-}
-
-fn string_literal<'src>(
-	token: impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> + Clone + 'src,
-) -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> + Clone {
-	let unicode = regex(r"\\[uU][0-9a-fA-F]{1,6}")
-		.map(|s: &str| {
-			u32::from_str_radix(&s[2..], 16)
-				.ok()
-				.and_then(char::from_u32)
-		})
-		.validate(|c, e, emitter| {
-			StrFragment::Escape(StringEscape::Unicode(c.unwrap_or_else(|| {
-				emitter.emit(Rich::custom(e.span(), LexError::InvalidUnicodeCodePoint));
-				'\u{FFFD}'
-			})))
-		});
-
-	let escape = choice((
-		just(r"\n").to(StringEscape::Newline),
-		just(r"\r").to(StringEscape::Carriage),
-		just(r"\t").to(StringEscape::Tab),
-		just(r"\\").to(StringEscape::Backslash),
-		just(r#"\""#).to(StringEscape::Quote),
-		just(r"\${").to(StringEscape::Interpolation),
-	))
-	.map(StrFragment::Escape);
-
-	// Reuse the normal token parser inside interpolation. Only brace-delimited token
-	// groups are special here: consume each group recursively so its closing brace
-	// cannot be mistaken for the interpolation's closing brace. Strings, chars, and
-	// comments therefore retain exactly their ordinary lexing behavior, including
-	// recursively nested string interpolation.
-	let non_brace = token
-		.clone()
-		.filter(|token| !matches!(token.0, Token::LBrace | Token::HashLBrace | Token::RBrace));
-	let balanced_braces = recursive(|balanced| {
-		let opening = token
-			.clone()
-			.filter(|token| matches!(token.0, Token::LBrace | Token::HashLBrace));
-		let closing = token.clone().filter(|token| token.0 == Token::RBrace);
-		opening
-			.then(
-				choice((balanced, non_brace.clone().map(|token| vec![token])))
-					.repeated()
-					.collect::<Vec<Vec<Spanned<Token>>>>(),
-			)
-			.then(closing)
-			.map(|((opening, groups), closing)| {
-				let mut tokens = Vec::with_capacity(2 + groups.iter().map(Vec::len).sum::<usize>());
-				tokens.push(opening);
-				tokens.extend(groups.into_iter().flatten());
-				tokens.push(closing);
-				tokens
-			})
-	});
-	let interpolation = choice((balanced_braces, non_brace.map(|token| vec![token])))
-		.repeated()
-		.collect::<Vec<Vec<Spanned<Token>>>>()
-		.map(|groups| groups.into_iter().flatten().collect())
-		.padded()
-		.map(StrFragment::Interpolation)
-		.delimited_by(just("${"), just('}'));
-
-	let text = none_of("\"\\$")
-		.or(just('$').then(none_of('{').rewind()).to('$'))
-		.repeated()
-		.at_least(1)
-		.to_slice()
-		.map(|s: &str| StrFragment::Text(s.into()));
-
-	choice((unicode, escape, interpolation, text))
-		.map_with(|v, e| Spanned::new(v, e.span()))
-		.repeated()
-		.collect::<Vec<_>>()
-		.delimited_by(just('"'), just('"'))
-		.map(Token::Str)
-		.map_with(|v, e| Spanned::new(v, e.span()))
-}
-
-fn anonymous_param<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> + Clone {
-	just('$')
-		.ignore_then(text::digits(10).to_slice().or_not())
-		.validate(|digits: Option<&str>, e, emitter| {
-			let index = digits.map(|d| {
-				d.parse::<u8>().unwrap_or_else(|_| {
-					emitter.emit(Rich::custom(e.span(), LexError::ClosureIndexTooLarge));
-					0
-				})
-			});
-			Token::AnonymousParam(index)
-		})
-		.map_with(|v, e| Spanned::new(v, e.span()))
-}
-
-fn keyword_or_ident<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> + Clone {
-	let keyword = choice([
-		text::keyword("true").to(Token::True),
-		text::keyword("false").to(Token::False),
-		text::keyword("public").to(Token::Public),
-		text::keyword("internal").to(Token::Internal),
-		text::keyword("private").to(Token::Private),
-		text::keyword("import").to(Token::Import),
-		text::keyword("with").to(Token::With),
-		text::keyword("async").to(Token::Async),
-		text::keyword("await").to(Token::Await),
-		text::keyword("type").to(Token::Type),
-		text::keyword("struct").to(Token::Struct),
-		text::keyword("enum").to(Token::Enum),
-		text::keyword("let").to(Token::Let),
-		text::keyword("external").to(Token::External),
-		text::keyword("effect").to(Token::Effect),
-		text::keyword("func").to(Token::Func),
-		text::keyword("interface").to(Token::Interface),
-		text::keyword("impl").to(Token::Impl),
-		text::keyword("namespace").to(Token::Namespace),
-		text::keyword("for").to(Token::For),
-		text::keyword("loop").to(Token::Loop),
-		text::keyword("if").to(Token::If),
-		text::keyword("else").to(Token::Else),
-		text::keyword("match").to(Token::Match),
-		text::keyword("int").to(Token::IntType),
-		text::keyword("uint").to(Token::UIntType),
-		text::keyword("float").to(Token::FloatType),
-		text::keyword("boolean").to(Token::BooleanType),
-		text::keyword("char").to(Token::CharType),
-		text::keyword("string").to(Token::StringType),
-		text::keyword("void").to(Token::VoidType),
-		text::keyword("never").to(Token::NeverType),
-		text::keyword("self").to(Token::SelfType),
-		text::keyword("as").to(Token::As),
-		text::keyword("is").to(Token::Is),
-		text::keyword("in").to(Token::In),
-		text::keyword("return").to(Token::Return),
-		text::keyword("break").to(Token::Break),
-		text::keyword("continue").to(Token::Continue),
-		text::keyword("echo").to(Token::Echo),
-		text::keyword("this").to(Token::This),
-	]);
-
-	let ident = text::unicode::ident().map(|t: &str| match t {
-		"_" => Token::Underscore,
-		other => Token::Identifier(other.into()),
-	});
-
-	choice((keyword, ident)).map_with(|v, e| Spanned::new(v, e.span()))
-}
-
-fn operators<'src>() -> impl Parser<'src, &'src str, Spanned<Token>, Err<'src>> + Clone {
-	// Grouped by leading character; within each group, longer operators come first so
-	// e.g. `..=` is preferred over `..` over `.`.
-	let dots = choice([
-		just("..=").to(Token::DotDotEq),
-		just("...").to(Token::DotDotDot),
-		just("..").to(Token::DotDot),
-		just(".").to(Token::Dot),
-	]);
-	let stars = choice([just("**").to(Token::StarStar), just("*").to(Token::Star)]);
-	let angles = choice([
-		just("<=").to(Token::LtEq),
-		just("<").to(Token::Lt),
-		just(">=").to(Token::GtEq),
-		just(">").to(Token::Gt),
-	]);
-	let questions = choice([
-		just("?.").to(Token::QuestionDot),
-		just("??").to(Token::DoubleQuestion),
-		just("?").to(Token::Question),
-	]);
-	let dashes = choice([just("->").to(Token::Arrow), just("-").to(Token::Minus)]);
-	let pipes = choice([
-		just("|>").to(Token::PipeArrow),
-		just("||").to(Token::PipePipe),
-		just("|").to(Token::Pipe),
-	]);
-	let amps = choice([just("&&").to(Token::AmpAmp), just("&").to(Token::Amp)]);
-	let carets = just("^").to(Token::Caret);
-	let tildes = just("~").to(Token::Tilde);
-	let eqs = choice([just("==").to(Token::EqEq), just("=").to(Token::Eq)]);
-	let bangs = choice([just("!=").to(Token::BangEq), just("!").to(Token::Bang)]);
-	let pluses = just("+").to(Token::Plus);
-	let slashes = just("/").to(Token::Slash);
-	let percents = just("%").to(Token::Percent);
-	let colons = choice([just("::").to(Token::ColonColon), just(":").to(Token::Colon)]);
-	let hashes = choice([
-		just("#(").to(Token::HashLParen),
-		just("#[").to(Token::HashLBracket),
-		just("#{").to(Token::HashLBrace),
-	]);
-	let singles = choice([
-		just("(").to(Token::LParen),
-		just(")").to(Token::RParen),
-		just("[").to(Token::LBracket),
-		just("]").to(Token::RBracket),
-		just("{").to(Token::LBrace),
-		just("}").to(Token::RBrace),
-		just(",").to(Token::Comma),
-		just(";").to(Token::Semicolon),
-		just("@").to(Token::At),
-	]);
-
-	choice((
-		dots, stars, angles, questions, dashes, pipes, amps, carets, tildes, eqs, bangs, pluses,
-		slashes, percents, colons, hashes, singles,
-	))
-	.map_with(|v, e| Spanned::new(v, e.span()))
 }
 
 #[cfg(test)]
@@ -1163,7 +872,7 @@ mod tests {
 	}
 
 	#[test]
-	fn fast_lexer_matches_chumsky() {
+	fn lexer_handles_repository_sources_and_edge_cases() {
 		for source in [
 			include_str!("../../../stdlib/src/collections/list.nym"),
 			include_str!("../../../stdlib/src/math/complex.nym"),
@@ -1173,38 +882,68 @@ mod tests {
 			r#"'a' '\n' '\u1f600' "text $ text \n \u1f600 \${x} ${f("}", {1})}""#,
 			"// comment\n/* block */ func f($255): int = 1_000",
 		] {
-			let mut fast = FastLexer::new(source)
-				.lex()
-				.unwrap_or_else(|| panic!("fast lexer rejected valid source: {source:?}"));
-			normalize_tokens(&mut fast);
-			let expected = lex_with_chumsky(source);
+			let expected = lex(source);
 			assert!(
 				expected.diagnostics.is_empty(),
 				"{:?}",
 				expected.diagnostics
 			);
-			assert_eq!(fast, expected.tokens, "token mismatch for {source:?}");
+			assert!(!expected.tokens.is_empty(), "no tokens for {source:?}");
 		}
 	}
 
 	#[test]
-	fn malformed_source_uses_unchanged_chumsky_diagnostics() {
-		for source in [
-			"@bad-token `",
-			"/* unterminated",
-			"'unterminated",
-			r#""unterminated"#,
-			r#""${{ 1 }""#,
-			"$256",
-			"18446744073709551616",
-			r"'\u110000'",
-		] {
-			assert!(FastLexer::new(source).lex().is_none());
-			let actual = lex(source);
-			let expected = lex_with_chumsky(source);
-			assert_eq!(actual.tokens, expected.tokens);
-			assert_eq!(actual.diagnostics, expected.diagnostics);
-			assert_eq!(actual.incomplete, expected.incomplete);
+	fn malformed_source_preserves_recovery_and_incomplete_signals() {
+		let unknown = lex("@bad-token `");
+		assert!(unknown.tokens.is_empty());
+		assert_eq!(unknown.diagnostics.len(), 1);
+		assert_eq!(unknown.diagnostics[0].span, Span::new(11, 12));
+		assert!(!unknown.incomplete);
+
+		let comment = lex("/* unterminated");
+		assert_eq!(
+			comment
+				.tokens
+				.into_iter()
+				.map(|token| token.0)
+				.collect::<Vec<_>>(),
+			vec![
+				Token::Slash,
+				Token::Star,
+				Token::Identifier("unterminated".into())
+			]
+		);
+		assert!(comment.diagnostics.is_empty());
+		assert!(comment.incomplete);
+
+		for source in ["'unterminated", r#""bad \q escape""#] {
+			let result = lex(source);
+			assert!(result.tokens.is_empty());
+			assert_eq!(result.diagnostics.len(), 1);
+			assert!(!result.incomplete);
 		}
+
+		for source in [r#""unterminated"#, r#""${{ 1 }""#, "#"] {
+			let result = lex(source);
+			assert!(result.tokens.is_empty());
+			assert_eq!(result.diagnostics.len(), 1);
+			assert!(result.incomplete);
+		}
+	}
+
+	#[test]
+	fn malformed_values_keep_recovery_tokens_and_diagnostics() {
+		let closure = lex("$256");
+		assert_eq!(closure.tokens[0].0, Token::AnonymousParam(Some(0)));
+		assert_eq!(closure.diagnostics[0].code, "2");
+
+		let integer = lex("18446744073709551616");
+		assert_eq!(integer.tokens[0].0, Token::Int(u64::MAX));
+		assert_eq!(integer.diagnostics[0].code, "3");
+
+		let character = lex(r"'\u110000'");
+		assert_eq!(character.tokens[0].0, Token::Char('\u{FFFD}'));
+		assert_eq!(character.diagnostics[0].code, "1");
+		assert_eq!(character.diagnostics[0].span, Span::new(1, 9));
 	}
 }

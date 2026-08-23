@@ -12,7 +12,6 @@ authors.workspace = true
 nymph-ast = { workspace = true }
 nymph-diagnostics = { workspace = true }
 nymph-errorcode = { workspace = true }
-chumsky = { workspace = true }
 ecow = { workspace = true }
 ordered-float = { workspace = true }
 unicode-ident = "1.0.24"

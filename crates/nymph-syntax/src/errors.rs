@@ -2,11 +2,8 @@
 //!
 //! [`ParseError`] and [`LexError`] each collect one phase's messages into a single
 //! enum whose [`IntoDiagnostic`] impl is the one place a variant becomes a rendered
-//! message. The parser emits a [`ParseError`] with a span via `Parser::emit`; the
-//! lexer runs on chumsky, whose `Rich::custom` carries a `&'static str`, so
-//! [`LexError`] exposes its text via [`LexError::text`] (and still implements
-//! [`IntoDiagnostic`]). Existing catalog variants remain in place and new variants
-//! are appended so their generated numeric codes stay stable.
+//! message. Existing catalog variants remain in place and new variants are appended
+//! so their generated numeric codes stay stable.
 
 use ecow::EcoString;
 use nymph_ast::Span;
@@ -192,9 +189,7 @@ impl IntoDiagnostic for ParseError {
 	}
 }
 
-/// A diagnostic produced while lexing. Because lexing runs on chumsky (whose
-/// `Rich::custom` message is a `&'static str`), the lexer passes [`LexError::text`]
-/// at the error site; the enum is still the single home for the message text.
+/// A diagnostic produced while lexing.
 #[derive(Clone, Debug, PartialEq, Eq, ErrorCode)]
 #[error_code(0)]
 pub enum LexError {
