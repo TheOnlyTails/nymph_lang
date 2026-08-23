@@ -1642,6 +1642,7 @@ dependencies = [
  "nymph-errorcode",
  "ordered-float",
  "test-case",
+ "unicode-ident",
 ]
 
 [[package]]

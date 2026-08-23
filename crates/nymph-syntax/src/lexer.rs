@@ -49,6 +49,20 @@ fn parse_f64(s: &str) -> f64 {
 
 /// Lex a whole source file.
 pub fn lex(source: &str) -> LexResult {
+	if let Some(mut tokens) = FastLexer::new(source).lex() {
+		normalize_tokens(&mut tokens);
+		return LexResult {
+			tokens,
+			diagnostics: Vec::new(),
+			incomplete: false,
+		};
+	}
+
+	lex_with_chumsky(source)
+}
+
+/// Preserve Chumsky's recovery and detailed diagnostics for malformed source.
+fn lex_with_chumsky(source: &str) -> LexResult {
 	let (output, errors) = lexer().parse(source).into_output_errors();
 	let mut tokens = output.unwrap_or_default();
 	normalize_tokens(&mut tokens);
@@ -79,6 +93,403 @@ pub fn lex(source: &str) -> LexResult {
 		tokens,
 		diagnostics,
 		incomplete,
+	}
+}
+
+/// Allocation-light lexer for well-formed source. Any malformed or ambiguous
+/// token returns `None`, which sends the source through the diagnostic lexer.
+struct FastLexer<'src> {
+	source: &'src str,
+	position: usize,
+}
+
+impl<'src> FastLexer<'src> {
+	fn new(source: &'src str) -> Self {
+		Self {
+			source,
+			position: 0,
+		}
+	}
+
+	fn lex(mut self) -> Option<Vec<Spanned<Token>>> {
+		self.tokens(false)
+	}
+
+	fn tokens(&mut self, interpolation: bool) -> Option<Vec<Spanned<Token>>> {
+		let mut tokens = Vec::new();
+		let mut brace_depth = 0;
+		loop {
+			self.skip_trivia()?;
+			if self.position == self.source.len() {
+				return (!interpolation).then_some(tokens);
+			}
+			if interpolation && self.starts_with("}") && brace_depth == 0 {
+				self.position += 1;
+				return Some(tokens);
+			}
+
+			let token = self.token()?;
+			match &token.0 {
+				Token::LBrace | Token::HashLBrace if interpolation => brace_depth += 1,
+				Token::RBrace if interpolation => brace_depth -= 1,
+				_ => {}
+			}
+			tokens.push(token);
+		}
+	}
+
+	fn skip_trivia(&mut self) -> Option<()> {
+		loop {
+			while self.peek().is_some_and(char::is_whitespace) {
+				self.bump();
+			}
+			if self.starts_with("//") {
+				self.position += 2;
+				while self.peek().is_some_and(|c| c != '\n') {
+					self.bump();
+				}
+			} else if self.starts_with("/*") {
+				let end = self.source[self.position + 2..].find("*/")?;
+				self.position += end + 4;
+			} else {
+				return Some(());
+			}
+		}
+	}
+
+	fn token(&mut self) -> Option<Spanned<Token>> {
+		let start = self.position;
+		let first = self.peek()?;
+		let token = if first.is_ascii_digit() {
+			self.number()?
+		} else if first == '\'' {
+			self.character()?
+		} else if first == '"' {
+			self.string()?
+		} else if first == '$' {
+			self.anonymous_param()?
+		} else if first == '_' || unicode_ident::is_xid_start(first) {
+			self.identifier()
+		} else {
+			self.operator()?
+		};
+		Some(Spanned(token, Span::new(start, self.position)))
+	}
+
+	fn number(&mut self) -> Option<Token> {
+		if self.starts_with("0x") || self.starts_with("0X") {
+			return self.radix_number(16, |c| c.is_ascii_hexdigit());
+		}
+		if self.starts_with("0o") || self.starts_with("0O") {
+			return self.radix_number(8, |c| matches!(c, '0'..='7'));
+		}
+		if self.starts_with("0b") || self.starts_with("0B") {
+			return self.radix_number(2, |c| matches!(c, '0' | '1'));
+		}
+
+		let start = self.position;
+		self.digit_sequence(|c| c.is_ascii_digit());
+		if self.starts_with(".") && self.peek_at(1).is_some_and(|c| c.is_ascii_digit()) {
+			self.position += 1;
+			self.digit_sequence(|c| c.is_ascii_digit());
+			self.optional_exponent();
+			return Some(Token::Float(
+				parse_f64(&self.source[start..self.position]).into(),
+			));
+		}
+		if self.has_exponent() {
+			self.optional_exponent();
+			return Some(Token::Float(
+				parse_f64(&self.source[start..self.position]).into(),
+			));
+		}
+		if self.peek().is_some_and(|c| matches!(c, 'f' | 'F')) {
+			self.bump();
+			return Some(Token::Float(
+				parse_f64(&self.source[start..self.position - 1]).into(),
+			));
+		}
+		if self.peek().is_some_and(|c| matches!(c, 'u' | 'U')) {
+			self.bump();
+		}
+		int_decimal(&self.source[start..self.position])
+	}
+
+	fn radix_number(&mut self, radix: u32, is_digit: impl Fn(char) -> bool + Copy) -> Option<Token> {
+		let start = self.position;
+		if !self.peek_at(2).is_some_and(is_digit) {
+			self.position += 1;
+			return int_decimal(&self.source[start..self.position]);
+		}
+		self.position += 2;
+		self.digit_sequence(is_digit);
+		if self.peek().is_some_and(|c| matches!(c, 'u' | 'U')) {
+			self.bump();
+		}
+		int_radix(&self.source[start..self.position], radix)
+	}
+
+	fn digit_sequence(&mut self, is_digit: impl Fn(char) -> bool + Copy) {
+		while self.peek().is_some_and(is_digit) {
+			self.bump();
+			if self.starts_with("_") && self.peek_at(1).is_some_and(is_digit) {
+				self.position += 1;
+			}
+		}
+	}
+
+	fn has_exponent(&self) -> bool {
+		if !self.peek().is_some_and(|c| matches!(c, 'e' | 'E')) {
+			return false;
+		}
+		let sign = usize::from(self.peek_at(1).is_some_and(|c| matches!(c, '+' | '-')));
+		self.peek_at(sign + 1).is_some_and(|c| c.is_ascii_digit())
+	}
+
+	fn optional_exponent(&mut self) {
+		if self.has_exponent() {
+			self.bump();
+			if self.peek().is_some_and(|c| matches!(c, '+' | '-')) {
+				self.bump();
+			}
+			self.digit_sequence(|c| c.is_ascii_digit());
+		}
+	}
+
+	fn character(&mut self) -> Option<Token> {
+		self.position += 1;
+		let value = if self.starts_with("\\") {
+			self.position += 1;
+			match self.bump()? {
+				'n' => '\n',
+				'r' => '\r',
+				't' => '\t',
+				'\\' => '\\',
+				'\'' => '\'',
+				'u' | 'U' => self.unicode_escape()?,
+				_ => return None,
+			}
+		} else {
+			let value = self.bump()?;
+			if matches!(value, '\\' | '\'') {
+				return None;
+			}
+			value
+		};
+		if !self.starts_with("'") {
+			return None;
+		}
+		self.position += 1;
+		Some(Token::Char(value))
+	}
+
+	fn string(&mut self) -> Option<Token> {
+		self.position += 1;
+		let mut fragments = Vec::new();
+		loop {
+			let start = self.position;
+			match self.peek()? {
+				'"' => {
+					self.position += 1;
+					return Some(Token::Str(fragments));
+				}
+				'\\' => {
+					self.position += 1;
+					let escape = match self.bump()? {
+						'n' => StringEscape::Newline,
+						'r' => StringEscape::Carriage,
+						't' => StringEscape::Tab,
+						'\\' => StringEscape::Backslash,
+						'"' => StringEscape::Quote,
+						'u' | 'U' => StringEscape::Unicode(self.unicode_escape()?),
+						'$' if self.starts_with("{") => {
+							self.position += 1;
+							StringEscape::Interpolation
+						}
+						_ => return None,
+					};
+					fragments.push(Spanned(
+						StrFragment::Escape(escape),
+						Span::new(start, self.position),
+					));
+				}
+				'$' if self.peek_at(1) == Some('{') => {
+					self.position += 2;
+					let tokens = self.tokens(true)?;
+					fragments.push(Spanned(
+						StrFragment::Interpolation(tokens),
+						Span::new(start, self.position),
+					));
+				}
+				_ => {
+					while self
+						.peek()
+						.is_some_and(|c| c != '"' && c != '\\' && !(c == '$' && self.peek_at(1) == Some('{')))
+					{
+						self.bump();
+					}
+					fragments.push(Spanned(
+						StrFragment::Text(self.source[start..self.position].into()),
+						Span::new(start, self.position),
+					));
+				}
+			}
+		}
+	}
+
+	fn unicode_escape(&mut self) -> Option<char> {
+		let start = self.position;
+		while self.position - start < 6 && self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+			self.bump();
+		}
+		if self.position == start {
+			return None;
+		}
+		u32::from_str_radix(&self.source[start..self.position], 16)
+			.ok()
+			.and_then(char::from_u32)
+	}
+
+	fn anonymous_param(&mut self) -> Option<Token> {
+		self.position += 1;
+		let start = self.position;
+		while self.peek().is_some_and(|c| c.is_ascii_digit()) {
+			self.bump();
+		}
+		let index = (start != self.position)
+			.then(|| self.source[start..self.position].parse::<u8>())
+			.transpose()
+			.ok()?;
+		Some(Token::AnonymousParam(index))
+	}
+
+	fn identifier(&mut self) -> Token {
+		let start = self.position;
+		self.bump();
+		while self.peek().is_some_and(unicode_ident::is_xid_continue) {
+			self.bump();
+		}
+		match &self.source[start..self.position] {
+			"true" => Token::True,
+			"false" => Token::False,
+			"public" => Token::Public,
+			"internal" => Token::Internal,
+			"private" => Token::Private,
+			"import" => Token::Import,
+			"with" => Token::With,
+			"async" => Token::Async,
+			"await" => Token::Await,
+			"type" => Token::Type,
+			"struct" => Token::Struct,
+			"enum" => Token::Enum,
+			"let" => Token::Let,
+			"external" => Token::External,
+			"effect" => Token::Effect,
+			"func" => Token::Func,
+			"interface" => Token::Interface,
+			"impl" => Token::Impl,
+			"namespace" => Token::Namespace,
+			"for" => Token::For,
+			"loop" => Token::Loop,
+			"if" => Token::If,
+			"else" => Token::Else,
+			"match" => Token::Match,
+			"int" => Token::IntType,
+			"uint" => Token::UIntType,
+			"float" => Token::FloatType,
+			"boolean" => Token::BooleanType,
+			"char" => Token::CharType,
+			"string" => Token::StringType,
+			"void" => Token::VoidType,
+			"never" => Token::NeverType,
+			"self" => Token::SelfType,
+			"as" => Token::As,
+			"is" => Token::Is,
+			"in" => Token::In,
+			"return" => Token::Return,
+			"break" => Token::Break,
+			"continue" => Token::Continue,
+			"echo" => Token::Echo,
+			"this" => Token::This,
+			"_" => Token::Underscore,
+			other => Token::Identifier((*other).into()),
+		}
+	}
+
+	fn operator(&mut self) -> Option<Token> {
+		let pairs = [
+			("..=", Token::DotDotEq),
+			("...", Token::DotDotDot),
+			("..", Token::DotDot),
+			("**", Token::StarStar),
+			("<=", Token::LtEq),
+			(">=", Token::GtEq),
+			("?.", Token::QuestionDot),
+			("??", Token::DoubleQuestion),
+			("->", Token::Arrow),
+			("|>", Token::PipeArrow),
+			("||", Token::PipePipe),
+			("&&", Token::AmpAmp),
+			("==", Token::EqEq),
+			("!=", Token::BangEq),
+			("::", Token::ColonColon),
+			("#(", Token::HashLParen),
+			("#[", Token::HashLBracket),
+			("#{", Token::HashLBrace),
+		];
+		for (text, token) in pairs {
+			if self.starts_with(text) {
+				self.position += text.len();
+				return Some(token);
+			}
+		}
+		let token = match self.bump()? {
+			'.' => Token::Dot,
+			'*' => Token::Star,
+			'<' => Token::Lt,
+			'>' => Token::Gt,
+			'?' => Token::Question,
+			'-' => Token::Minus,
+			'|' => Token::Pipe,
+			'&' => Token::Amp,
+			'^' => Token::Caret,
+			'~' => Token::Tilde,
+			'=' => Token::Eq,
+			'!' => Token::Bang,
+			'+' => Token::Plus,
+			'/' => Token::Slash,
+			'%' => Token::Percent,
+			':' => Token::Colon,
+			'(' => Token::LParen,
+			')' => Token::RParen,
+			'[' => Token::LBracket,
+			']' => Token::RBracket,
+			'{' => Token::LBrace,
+			'}' => Token::RBrace,
+			',' => Token::Comma,
+			';' => Token::Semicolon,
+			'@' => Token::At,
+			_ => return None,
+		};
+		Some(token)
+	}
+
+	fn starts_with(&self, text: &str) -> bool {
+		self.source[self.position..].starts_with(text)
+	}
+
+	fn peek(&self) -> Option<char> {
+		self.source[self.position..].chars().next()
+	}
+
+	fn peek_at(&self, offset: usize) -> Option<char> {
+		self.source[self.position..].chars().nth(offset)
+	}
+
+	fn bump(&mut self) -> Option<char> {
+		let value = self.peek()?;
+		self.position += value.len_utf8();
+		Some(value)
 	}
 }
 
@@ -749,5 +1160,51 @@ mod tests {
 		assert_eq!(toks(r"'\n'"), vec![Token::Char('\n')]);
 		assert_eq!(toks("'a'"), vec![Token::Char('a')]);
 		assert_eq!(toks(r"'A'"), vec![Token::Char('A')]);
+	}
+
+	#[test]
+	fn fast_lexer_matches_chumsky() {
+		for source in [
+			include_str!("../../../stdlib/src/collections/list.nym"),
+			include_str!("../../../stdlib/src/math/complex.nym"),
+			include_str!("../../../examples/shapes/src/main.nym"),
+			"0x 0o8 0b2 1_ 1.0e 1e+ 2f 3u _ λ λ2",
+			"#[1, 2] #{1: 2} #() a...b a..=b a?.b a??b a::b",
+			r#"'a' '\n' '\u1f600' "text $ text \n \u1f600 \${x} ${f("}", {1})}""#,
+			"// comment\n/* block */ func f($255): int = 1_000",
+		] {
+			let mut fast = FastLexer::new(source)
+				.lex()
+				.unwrap_or_else(|| panic!("fast lexer rejected valid source: {source:?}"));
+			normalize_tokens(&mut fast);
+			let expected = lex_with_chumsky(source);
+			assert!(
+				expected.diagnostics.is_empty(),
+				"{:?}",
+				expected.diagnostics
+			);
+			assert_eq!(fast, expected.tokens, "token mismatch for {source:?}");
+		}
+	}
+
+	#[test]
+	fn malformed_source_uses_unchanged_chumsky_diagnostics() {
+		for source in [
+			"@bad-token `",
+			"/* unterminated",
+			"'unterminated",
+			r#""unterminated"#,
+			r#""${{ 1 }""#,
+			"$256",
+			"18446744073709551616",
+			r"'\u110000'",
+		] {
+			assert!(FastLexer::new(source).lex().is_none());
+			let actual = lex(source);
+			let expected = lex_with_chumsky(source);
+			assert_eq!(actual.tokens, expected.tokens);
+			assert_eq!(actual.diagnostics, expected.diagnostics);
+			assert_eq!(actual.incomplete, expected.incomplete);
+		}
 	}
 }
