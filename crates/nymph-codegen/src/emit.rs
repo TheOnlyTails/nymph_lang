@@ -1088,6 +1088,7 @@ impl<'e, 'a> ActivationPlanner<'e, 'a> {
 		self.compile_expr(lhs, lhs_slot, branch)
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn compile_for(
 		&mut self,
 		target_id: nymph_hir::hir::LoopTarget,
@@ -1322,7 +1323,7 @@ impl<'e, 'a> ActivationPlanner<'e, 'a> {
 			for (_, old, new) in &managed {
 				actions.push(ActivationAction::Store {
 					target: old.clone(),
-					value: self.local(&new),
+					value: self.local(new),
 				});
 			}
 		}
@@ -1702,7 +1703,9 @@ impl<'e, 'a> ActivationPlanner<'e, 'a> {
 				self.compile_values(values, target, next, |values| {
 					HirExpr::MapLit(
 						values
-							.chunks_exact(2)
+							.as_chunks::<2>()
+							.0
+							.iter()
 							.map(|pair| (pair[0].clone(), pair[1].clone()))
 							.collect(),
 					)
@@ -2550,6 +2553,7 @@ impl<'a> Emitter<'a> {
 		statements
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn activation_packet(
 		&self,
 		callee: Expression<'a>,
@@ -2582,6 +2586,7 @@ impl<'a> Emitter<'a> {
 		self.runtime_call(helper, packet)
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn activation_member_packet(
 		&self,
 		receiver: Expression<'a>,
@@ -3891,6 +3896,7 @@ impl<'a> Emitter<'a> {
 		self.call1(arrow, operand)
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn emit_bound_dispatch(
 		&self,
 		method: &str,
@@ -4026,6 +4032,7 @@ impl<'a> Emitter<'a> {
 		self.arrow_iife(receiver_param, argument_iife, self.emit_expr(receiver))
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn emit_unary_bound_dispatch(
 		&self,
 		method: &str,
@@ -4142,6 +4149,7 @@ impl<'a> Emitter<'a> {
 		self.arrow_iife(receiver_param, body, self.emit_expr(receiver))
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn emit_bound_dispatch_state(
 		&self,
 		method: &str,
@@ -4242,6 +4250,7 @@ impl<'a> Emitter<'a> {
 		body
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn emit_unary_bound_dispatch_state(
 		&self,
 		method: &str,
@@ -5480,8 +5489,8 @@ impl<'a> Emitter<'a> {
 		for argument in args {
 			elements.push(ArrayExpressionElement::from(argument));
 		}
-		let args = Expression::new_array_expression(SPAN, elements, &self.ast);
-		args
+
+		Expression::new_array_expression(SPAN, elements, &self.ast)
 	}
 
 	fn zero_argument_arrow(&self, value: Expression<'a>) -> Expression<'a> {
@@ -5560,14 +5569,13 @@ impl<'a> Emitter<'a> {
 	}
 
 	fn emit_activation_source(&self, source: u32) -> Expression<'a> {
-		let source = Expression::new_numeric_literal(
+		Expression::new_numeric_literal(
 			SPAN,
 			f64::from(source),
 			None,
 			NumberBase::Decimal,
 			&self.ast,
-		);
-		source
+		)
 	}
 
 	fn emit_member_activation(

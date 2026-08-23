@@ -1269,7 +1269,7 @@ pub(crate) fn tooling_top_level_declarations(
 
 #[salsa::tracked]
 pub(crate) fn direct_imports(db: &dyn Db, module: ModuleInput) -> Arc<DirectImports> {
-	collect_imports(&parse(db, module), module.path(db).as_str())
+	collect_imports(parse(db, module), module.path(db).as_str())
 }
 
 #[salsa::tracked]
@@ -1527,7 +1527,7 @@ pub(crate) fn ambient_core_environment(
 		SemanticModuleInput::Builtin(module),
 	);
 	let analysis = ambient_core_analysis(db, registry, module);
-	let checked = checked_from_analysis(&analysis, []);
+	let checked = checked_from_analysis(analysis, []);
 	let facts =
 		nymph_sema::ExtractionFactSelection::current_module(&analysis.semantic.module, &checked);
 	Arc::new(nymph_sema::recover_module_environment_with_facts(
@@ -2337,6 +2337,7 @@ impl nymph_sema::StableNameLookup for CompilerStableContext<'_> {
 	}
 }
 
+#[allow(clippy::result_large_err)]
 #[salsa::tracked(returns(clone))]
 pub(crate) fn lower_runtime_definition<'db>(
 	db: &'db dyn Db,
@@ -2379,6 +2380,7 @@ fn collect_unresolved_runtime_calls(
 	}
 }
 
+#[allow(clippy::result_large_err)]
 #[salsa::tracked(returns(clone))]
 pub(crate) fn lower_interface_module<'db>(
 	db: &'db dyn Db,

@@ -284,15 +284,11 @@ fn ambient_math_constants_run_with_no_import() {
 		"expected the ambient-math constants program to check cleanly with no import, got: {diags:?}"
 	);
 
-	// `pi`/`tau`/`e` match Rust's own `std::f64::consts` (both languages'
-	// literals round to the same nearest `f64`) — use those directly rather
-	// than repeat the full-precision literal `clippy::excessive_precision`/
-	// `clippy::approx_constant` would flag. `phi` has no `std` counterpart, so
-	// it stays a literal, truncated to `f64`'s significant digits.
+	// The Nymph literals round to the same nearest `f64` as Rust's constants.
 	let pi: f64 = std::f64::consts::PI;
 	let tau: f64 = std::f64::consts::TAU;
 	let e: f64 = std::f64::consts::E;
-	let phi: f64 = 1.618_033_988_749_895;
+	let phi: f64 = std::f64::consts::GOLDEN_RATIO;
 	assert_eq!(run(src, "get_pi()"), pi.to_string());
 	assert_eq!(run(src, "get_tau()"), tau.to_string());
 	assert_eq!(run(src, "get_e()"), e.to_string());

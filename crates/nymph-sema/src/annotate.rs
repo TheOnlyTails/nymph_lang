@@ -107,6 +107,9 @@ pub enum DispatchKind {
 
 /// Exact semantic target selected for a resolved method use.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// These are stable semantic facts exposed to downstream compiler crates. Boxing
+// the slot would make the representation cheaper but needlessly complicate that API.
+#[allow(clippy::large_enum_variant)]
 pub enum ResolvedMethodTarget {
 	Inherent {
 		member: DefinitionId,

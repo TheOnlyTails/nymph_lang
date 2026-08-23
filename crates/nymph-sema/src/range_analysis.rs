@@ -611,7 +611,7 @@ impl Analyzer<'_> {
 			.iter()
 			.filter(|bound| {
 				&bound.left == index
-					&& &bound.right == &length
+					&& bound.right == length
 					&& ((bound.left_sign == 1 && bound.right_sign == -1 && bound.upper <= -1)
 						|| (bound.left_sign == -1 && bound.right_sign == -1 && bound.upper <= 0))
 			})
@@ -758,7 +758,7 @@ fn saturating_shift_left(value: i128, shift: u32) -> i128 {
 }
 
 fn saturating_power(value: i128, exponent: u32) -> i128 {
-	value.checked_pow(exponent).unwrap_or_else(|| {
+	value.checked_pow(exponent).unwrap_or({
 		if value < 0 && exponent % 2 == 1 {
 			i128::MIN
 		} else {

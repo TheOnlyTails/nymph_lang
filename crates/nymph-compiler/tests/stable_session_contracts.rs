@@ -109,7 +109,7 @@ fn independent_sessions_repeat_complete_runtime_hir_name_and_emission_snapshots(
 		.unwrap();
 	assert_eq!(first_hir, second_hir);
 	assert_eq!(first_hir.module, answer.module);
-	assert_eq!(first_hir.own_definitions, [answer.clone()]);
+	assert_eq!(first_hir.own_definitions, std::slice::from_ref(&answer));
 	assert_eq!(first_hir.hir.funcs.len(), 1);
 	assert_eq!(first_hir.hir.funcs[0].name, "$m0$answer");
 	assert_eq!(

@@ -388,7 +388,8 @@ fn check_error_prevents_lower_emit_and_bundle_work() {
 			.iter()
 			.any(|name| name == "interface_module_analysis")
 	);
-	for forbidden in ["emitted_interface_module"] {
+	{
+		let forbidden = "emitted_interface_module";
 		assert!(
 			!observed.iter().any(|name| name == forbidden),
 			"{observed:?}"

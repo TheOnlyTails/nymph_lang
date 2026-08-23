@@ -818,6 +818,7 @@ fn bounds(
 		.collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn func_sig(
 	defs: &DefMap,
 	interner: &mut Interner,

@@ -801,6 +801,7 @@ fn checked_constraints(
 		.collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn checked_member_shape(
 	meta: &FuncDeclaration,
 	visibility: Option<Visibility>,
@@ -3235,7 +3236,7 @@ fn extract_implementations(
 		let (impl_context, binders) = definition_context(
 			checked,
 			headers,
-			&id,
+			id,
 			implementation
 				.generics
 				.iter()
@@ -3254,7 +3255,7 @@ fn extract_implementations(
 					*visibility,
 					None,
 					&implementation.methods[&meta.name.0],
-					&id,
+					id,
 					&binders,
 					checked,
 					headers,
@@ -3265,14 +3266,14 @@ fn extract_implementations(
 					*visibility,
 					Some(symbol),
 					&implementation.methods[&meta.name.0],
-					&id,
+					id,
 					&binders,
 					checked,
 					headers,
 					&mut member_ids,
 				),
 				ImplMember::Let { .. } | ImplMember::ExternalLet(..) => {
-					member_shape(&member.0, &id, headers, &binders, &mut member_ids)
+					member_shape(&member.0, id, headers, &binders, &mut member_ids)
 				}
 			})
 			.collect::<Result<Vec<_>, _>>()?;
@@ -3770,6 +3771,7 @@ fn recover_generic_constraints_with_types(
 		.collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn recover_func_member(
 	meta: &FuncDeclaration,
 	visibility: Option<Visibility>,
@@ -4796,7 +4798,7 @@ fn poison_definition(
 	{
 		recovered.super_interfaces = super_interfaces
 			.iter()
-			.filter_map(|super_interface| {
+			.map(|super_interface| {
 				let (name, arguments) = &super_interface.0;
 				let interface = headers
 					.id(&name.0)
@@ -4812,11 +4814,11 @@ fn poison_definition(
 						positional.push(ty);
 					}
 				}
-				Some(SuperInterfaceShape {
+				SuperInterfaceShape {
 					interface,
 					positional,
 					named,
-				})
+				}
 			})
 			.collect();
 	}
@@ -4849,12 +4851,10 @@ pub fn recover_module_environment_with_facts(
 		.diags
 		.iter()
 		.any(nymph_diagnostics::Diagnostic::is_error)
-	{
-		if let Ok(interface) =
+		&& let Ok(interface) =
 			extract_module_interface_with_facts(module_identity.clone(), module, checked, headers, facts)
-		{
-			return ModuleEnvironment::Complete(interface);
-		}
+	{
+		return ModuleEnvironment::Complete(interface);
 	}
 	let context = context(checked, headers);
 	let definitions: Vec<RecoveredExportedDefinition> = module

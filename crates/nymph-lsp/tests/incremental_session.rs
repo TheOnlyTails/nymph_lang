@@ -853,7 +853,7 @@ fn retained_async_edits_keep_hover_diagnostics_and_tokens_on_one_version() {
 	);
 
 	let invalid = valid.replacen("async func value", "func value", 1);
-	compiler.change(&mut docs, &uri, invalid.into(), 2).unwrap();
+	compiler.change(&mut docs, &uri, invalid, 2).unwrap();
 	let second = compiler.analysis_for_uri(&docs, &uri).unwrap();
 	assert_eq!(second.document_version, 2);
 	assert!(

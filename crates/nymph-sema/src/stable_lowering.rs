@@ -3,6 +3,10 @@
 //! Its inputs are exact stable identities and owned semantic artifacts, so lowering
 //! does not need compiler queries, parser identities, source locations, or module ASTs.
 
+// Stable lowering errors intentionally retain full stable identities by value.
+// Boxing them would either alter the public error API or add pervasive allocation.
+#![allow(clippy::result_large_err)]
+
 use std::{
 	cell::{Cell, RefCell},
 	collections::{HashMap, HashSet},
@@ -174,6 +178,9 @@ impl<T> StableLoweringContext for T where
 
 /// A typed HIR contribution with its only legal placement encoded by variant.
 #[derive(Clone, Debug, PartialEq)]
+// Runtime type attachments directly own the HIR pieces consumed by codegen;
+// boxing only this arm would complicate the public lowering contract.
+#[allow(clippy::large_enum_variant)]
 pub enum LoweredHirFragment {
 	TopLevelFunction(HirFunc),
 	TopLevelValue(HirLet),
@@ -2109,6 +2116,7 @@ fn fragment_method(fragment: LoweredHirFragment) -> Result<HirMethod, StableLowe
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 fn lower_body(
 	context: &impl StableLoweringContext,
 	artifact: &RuntimeDefinition,
@@ -2211,8 +2219,8 @@ fn lower_body(
 						.iter()
 						.any(|(candidate, _)| candidate == *parameter)
 			})
+			.filter(|&parameter| !type_parameters.contains(parameter))
 			.cloned()
-			.filter(|parameter| !type_parameters.contains(parameter))
 			.collect::<Vec<_>>(),
 	);
 	let lowerer = StableBodyLowerer {
@@ -3496,7 +3504,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					}
 					self.generic_callable_adapter(self.id(expr), HirExpr::Local(emitted.as_str().into()))?
 				} else {
-					self.generic_callable_adapter(self.id(expr), HirExpr::Local(self.resolve(&name)))?
+					self.generic_callable_adapter(self.id(expr), HirExpr::Local(self.resolve(name)))?
 				}
 			}
 			StableExprKind::AnonymousParam(index) => {
@@ -3761,8 +3769,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						.map(|(index, arg)| {
 							let field = arg
 								.name
-								.as_ref()
-								.map(|name| name.clone())
+								.clone()
 								.or_else(|| variant.fields.get(index).map(|field| field.name.clone()))
 								.ok_or_else(|| {
 									invalid(
@@ -4930,7 +4937,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					"zero-argument generic method value did not lower to unary dispatch",
 				));
 			};
-			*dispatched_receiver = Box::new(receiver_value);
+			**dispatched_receiver = receiver_value;
 			return Ok(Self::activation_call(
 				self.id(receiver),
 				HirExpr::Call {
@@ -5720,7 +5727,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			StablePatternKind::String(parts) => HirPat::Lit(HirLit::Str(string_pattern(parts))),
 			StablePatternKind::Grouped(inner) => self.lower_pattern(inner)?,
 			StablePatternKind::Binding { name, inner } if variant.is_none() => HirPat::Binding {
-				name: self.declare(&name),
+				name: self.declare(name),
 				sub: (!matches!(inner.kind, StablePatternKind::Placeholder))
 					.then(|| self.lower_pattern(inner).map(Box::new))
 					.transpose()?,
@@ -5760,7 +5767,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							entries.push((literal_pattern(key)?, self.lower_pattern(value)?))
 						}
 						StableMapPatternEntry::Rest(name) => {
-							rest = Some(name.as_ref().map(|name| self.declare(&name)))
+							rest = Some(name.as_ref().map(|name| self.declare(name)))
 						}
 					}
 				}
@@ -5806,7 +5813,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							"list-shaped pattern has more than one rest entry",
 						));
 					}
-					rest = Some(name.as_ref().map(|name| self.declare(&name)));
+					rest = Some(name.as_ref().map(|name| self.declare(name)));
 				}
 			}
 		}

@@ -500,7 +500,7 @@ impl Checker<'_> {
 		}
 		let accepted = self.enum_variant_set(ty)?;
 		match path {
-			[single] => return self.variant_index(ty, &single.0),
+			[single] => self.variant_index(ty, &single.0),
 			[type_name, variant] => {
 				let owner = self.defs.get(&type_name.0)?;
 				return self.defs.iter().find_map(|(candidate, data)| {
@@ -509,7 +509,7 @@ impl Checker<'_> {
 						.filter(|candidate| accepted.contains(candidate) && data.name == variant.0)
 				});
 			}
-			_ => return None,
+			_ => None,
 		}
 	}
 

@@ -205,12 +205,14 @@ pub(crate) enum EffectCharge {
 impl crate::check::Checker<'_> {
 	pub(crate) fn charge_effect_target(&mut self, target: Option<DefinitionId>) {
 		if self.captured_effects.is_some() {
-			if let Some(effects) = target
+			let effects = target
 				.as_ref()
 				.and_then(|target| self.callable_effect_row(target))
-				&& !effects.atoms().is_empty()
+				.filter(|effects| !effects.atoms().is_empty());
+			if let Some(effects) = effects
+				&& let Some(captured_effects) = &mut self.captured_effects
 			{
-				self.captured_effects.as_mut().unwrap().push(effects);
+				captured_effects.push(effects);
 			}
 			return;
 		}
@@ -272,7 +274,7 @@ impl crate::check::Checker<'_> {
 		let mut instantiated = Vec::new();
 		for effect in effects.atoms() {
 			match effect {
-				HirEffectAtom::Nominal(_) => instantiated.push(effect.clone()),
+				HirEffectAtom::Nominal(_) => instantiated.push(*effect),
 				HirEffectAtom::Parameter(parameter) => {
 					let Some(row) = substitutions.get(parameter) else {
 						self.charge_effect_target(Some(target));
@@ -341,7 +343,7 @@ impl crate::check::Checker<'_> {
 		let mut instantiated = Vec::new();
 		for atom in effects.atoms() {
 			match atom {
-				HirEffectAtom::Nominal(_) => instantiated.push(atom.clone()),
+				HirEffectAtom::Nominal(_) => instantiated.push(*atom),
 				HirEffectAtom::Parameter(index) => {
 					let row = definition
 						.generics

@@ -1,5 +1,8 @@
 //! Pure, typed planning for the names and modules delivered to code generation.
 
+// Planning errors keep complete stable identities for deterministic diagnostics.
+#![allow(clippy::result_large_err)]
+
 use std::collections::{HashMap, HashSet};
 
 use nymph_sema::{

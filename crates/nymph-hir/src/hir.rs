@@ -132,6 +132,9 @@ pub enum HirBoundDispatchTarget {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+// Statements keep expressions inline because they are traversed pervasively
+// throughout lowering and codegen; boxing one variant would add broad churn.
+#[allow(clippy::large_enum_variant)]
 pub enum HirStmt {
 	/// An immutable `let` binding.
 	Let {
@@ -955,6 +958,9 @@ pub enum HirArrayElem {
 
 /// One element of a spread-bearing map literal (see [`HirExpr::MapSpread`]).
 #[derive(Clone, Debug, PartialEq)]
+// Map entries intentionally keep both expressions inline, matching ordinary
+// map literals and avoiding an allocation for the common non-spread case.
+#[allow(clippy::large_enum_variant)]
 pub enum HirMapElem {
 	/// An ordinary `k: v` entry.
 	Entry(HirExpr, HirExpr),

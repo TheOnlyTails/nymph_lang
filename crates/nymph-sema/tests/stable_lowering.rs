@@ -1838,7 +1838,7 @@ fn same_module_identifier_records_its_exact_definition_demand() {
 
 	let lowered = lower_runtime_definition(&context, Arc::new(read)).unwrap();
 
-	assert_eq!(lowered.demands(), [answer.clone()]);
+	assert_eq!(lowered.demands(), std::slice::from_ref(&answer));
 	assert_eq!(lowered.immediate_reads(), [answer]);
 	assert!(lowered.immediate_calls().is_empty());
 
@@ -2547,12 +2547,12 @@ fn list_externals_lower_to_persistent_hir() {
 			panic!("{name} must lower as a function: {:?}", lowered.fragment());
 		};
 		assert!(
-			match (expected, &function.body) {
+			matches!(
+				(expected, &function.body),
 				("append", nymph_hir::hir::HirExpr::ListAppend { .. })
-				| ("replace", nymph_hir::hir::HirExpr::ListReplace { .. })
-				| ("slice", nymph_hir::hir::HirExpr::ListSlice { .. }) => true,
-				_ => false,
-			},
+					| ("replace", nymph_hir::hir::HirExpr::ListReplace { .. })
+					| ("slice", nymph_hir::hir::HirExpr::ListSlice { .. })
+			),
 			"unexpected {name} HIR: {:?}",
 			function.body
 		);

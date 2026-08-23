@@ -168,8 +168,8 @@ mod test_support {
 		pub fn unresolved_imports(&self) -> Vec<String> {
 			self
 				.sources
-				.iter()
-				.flat_map(|(_, source)| source.lines())
+				.values()
+				.flat_map(|source| source.lines())
 				.filter_map(|line| line.strip_prefix("import @/"))
 				.filter(|target| !self.sources.contains_key(*target))
 				.map(str::to_string)

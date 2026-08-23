@@ -401,31 +401,31 @@ impl Checker<'_> {
 		let owner_has_effects = owner_generics
 			.iter()
 			.any(|generic| generic.0.kind == nymph_ast::ty::GenericParamKind::Effect);
-		let positional = (!owner_has_effects)
-			.then(|| {
-				owner_generics
-					.iter()
-					.enumerate()
-					.filter(|(_, generic)| generic.0.kind == nymph_ast::ty::GenericParamKind::Type)
-					.map(|(index, _)| self.interner.mk_param(ParamIdx(index as u32)))
-					.collect()
-			})
-			.unwrap_or_default();
-		let named = owner_has_effects
-			.then(|| {
-				owner_generics
-					.iter()
-					.enumerate()
-					.filter(|(_, generic)| generic.0.kind == nymph_ast::ty::GenericParamKind::Type)
-					.map(|(index, generic)| {
-						(
-							generic.0.name.0.clone(),
-							self.interner.mk_param(ParamIdx(index as u32)),
-						)
-					})
-					.collect()
-			})
-			.unwrap_or_default();
+		let positional = if !owner_has_effects {
+			owner_generics
+				.iter()
+				.enumerate()
+				.filter(|(_, generic)| generic.0.kind == nymph_ast::ty::GenericParamKind::Type)
+				.map(|(index, _)| self.interner.mk_param(ParamIdx(index as u32)))
+				.collect()
+		} else {
+			Default::default()
+		};
+		let named = if owner_has_effects {
+			owner_generics
+				.iter()
+				.enumerate()
+				.filter(|(_, generic)| generic.0.kind == nymph_ast::ty::GenericParamKind::Type)
+				.map(|(index, generic)| {
+					(
+						generic.0.name.0.clone(),
+						self.interner.mk_param(ParamIdx(index as u32)),
+					)
+				})
+				.collect()
+		} else {
+			Default::default()
+		};
 		let self_ty = self
 			.interner
 			.mk_adt(def, GenericArgs::new(positional, named));
@@ -452,6 +452,7 @@ impl Checker<'_> {
 	/// (mapped through the impl's interface arguments), so callers see the real result
 	/// type — e.g. `impl Plus<Output = Complex> for Complex { func plus(o) = … }` returns
 	/// `Complex`, not `void`.
+	#[allow(clippy::too_many_arguments)]
 	fn finish_interface_impl(
 		&mut self,
 		names: Vec<EcoString>,
@@ -749,7 +750,7 @@ impl Checker<'_> {
 			let kind = index
 				.and_then(|index| kinds.get(index))
 				.copied()
-				.unwrap_or_else(|| match arg.0.value {
+				.unwrap_or(match arg.0.value {
 					nymph_ast::ty::GenericArgValue::Type(_) => crate::GenericParameterKind::Type,
 					nymph_ast::ty::GenericArgValue::Effect(_) => crate::GenericParameterKind::Effect,
 				});

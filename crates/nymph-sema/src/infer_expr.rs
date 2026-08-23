@@ -175,21 +175,20 @@ impl<'m> Checker<'m> {
 		loop_index: Option<usize>,
 		result_ty: Option<Ty>,
 	) {
-		if let Some(label) = label {
-			if let Some(previous) = self
+		if let Some(label) = label
+			&& let Some(previous) = self
 				.control_labels
 				.iter()
 				.rev()
 				.find(|target| target.name.as_ref() == Some(&label.0))
-			{
-				self.emit(
-					label.1,
-					TypeError::DuplicateControlLabel {
-						name: label.0.clone(),
-						previous: previous.span,
-					},
-				);
-			}
+		{
+			self.emit(
+				label.1,
+				TypeError::DuplicateControlLabel {
+					name: label.0.clone(),
+					previous: previous.span,
+				},
+			);
 		}
 		self.control_labels.push(ControlLabel {
 			name: label.map(|label| label.0.clone()),
@@ -1324,55 +1323,58 @@ impl<'m> Checker<'m> {
 			} => {
 				let target =
 					self.resolve_control(expr, label.as_ref(), "continue", &[ControlLabelKind::Loop]);
-				if target.is_none() {
-					if label.is_none() {
-						self.emit(
-							expr.span,
-							TypeError::LoopControlOutsideLoop {
-								keyword: "continue",
-							},
-						);
+				match target {
+					None => {
+						if label.is_none() {
+							self.emit(
+								expr.span,
+								TypeError::LoopControlOutsideLoop {
+									keyword: "continue",
+								},
+							);
+						}
 					}
-				} else if !replacements.is_empty() {
-					let target = target.expect("checked target");
-					if let Some(bindings) = target.state_bindings {
-						let mut seen = FxHashSet::default();
-						for replacement in replacements {
-							let Some(binding) = bindings
-								.iter()
-								.find(|binding| binding.name == replacement.name.0)
-							else {
+					Some(target) if !replacements.is_empty() => {
+						if let Some(bindings) = target.state_bindings {
+							let mut seen = FxHashSet::default();
+							for replacement in replacements {
+								let Some(binding) = bindings
+									.iter()
+									.find(|binding| binding.name == replacement.name.0)
+								else {
+									self.resolve_anon(&replacement.value, None);
+									self.infer(&replacement.value);
+									self.emit(
+										replacement.name.1,
+										TypeError::UnknownStateReplacement {
+											name: replacement.name.0.clone(),
+										},
+									);
+									continue;
+								};
+								self
+									.annotations
+									.record_local_declaration(replacement.name.1, binding.declaration);
+								if !seen.insert(replacement.name.0.clone()) {
+									self.emit(
+										replacement.name.1,
+										TypeError::DuplicateStateReplacement {
+											name: replacement.name.0.clone(),
+										},
+									);
+								}
+								self.resolve_anon(&replacement.value, Some(binding.ty));
+								self.check(&replacement.value, binding.ty);
+							}
+						} else {
+							for replacement in replacements {
 								self.resolve_anon(&replacement.value, None);
 								self.infer(&replacement.value);
-								self.emit(
-									replacement.name.1,
-									TypeError::UnknownStateReplacement {
-										name: replacement.name.0.clone(),
-									},
-								);
-								continue;
-							};
-							self
-								.annotations
-								.record_local_declaration(replacement.name.1, binding.declaration);
-							if !seen.insert(replacement.name.0.clone()) {
-								self.emit(
-									replacement.name.1,
-									TypeError::DuplicateStateReplacement {
-										name: replacement.name.0.clone(),
-									},
-								);
 							}
-							self.resolve_anon(&replacement.value, Some(binding.ty));
-							self.check(&replacement.value, binding.ty);
+							self.emit(expr.span, TypeError::StateReplacementOutsideStateLoop);
 						}
-					} else {
-						for replacement in replacements {
-							self.resolve_anon(&replacement.value, None);
-							self.infer(&replacement.value);
-						}
-						self.emit(expr.span, TypeError::StateReplacementOutsideStateLoop);
 					}
+					Some(_) => {}
 				}
 				self.interner.never()
 			}
@@ -1945,9 +1947,8 @@ impl<'m> Checker<'m> {
 			.generic_kinds
 			.iter()
 			.enumerate()
-			.filter_map(|(index, kind)| {
-				(*kind == crate::GenericParameterKind::Type).then(|| subst[&ParamIdx(index as u32)])
-			})
+			.filter(|&(_index, kind)| *kind == crate::GenericParameterKind::Type)
+			.map(|(index, _kind)| subst[&ParamIdx(index as u32)])
 			.collect();
 		(
 			self
@@ -3437,9 +3438,8 @@ impl<'m> Checker<'m> {
 			.generic_kinds
 			.iter()
 			.enumerate()
-			.filter_map(|(index, kind)| {
-				(*kind == crate::GenericParameterKind::Type).then(|| subst[&ParamIdx(index as u32)])
-			})
+			.filter(|&(_index, kind)| *kind == crate::GenericParameterKind::Type)
+			.map(|(index, _kind)| subst[&ParamIdx(index as u32)])
 			.collect();
 		(
 			self

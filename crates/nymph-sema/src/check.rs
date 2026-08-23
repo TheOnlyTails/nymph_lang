@@ -301,6 +301,7 @@ pub(crate) fn check_module_impl(module: &Module, entry: EntryMode) -> Checked {
 	)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn check_module_from_parts(
 	entry: EntryMode,
 	mut checker: Checker<'_>,

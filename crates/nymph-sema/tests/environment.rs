@@ -409,7 +409,8 @@ fn stable_support_is_projected_by_exact_package_and_module_identity() {
 	}));
 
 	let names_for = |consumer| {
-		let environment = SemanticEnvironment::from_modules(consumer, &[stable.clone()]).unwrap();
+		let environment =
+			SemanticEnvironment::from_modules(consumer, std::slice::from_ref(&stable)).unwrap();
 		let mut names = environment
 			.imported
 			.defs
@@ -449,7 +450,8 @@ fn stable_support_is_projected_by_exact_package_and_module_identity() {
 		fingerprint: 0,
 	}));
 	let recovered_names_for = |consumer| {
-		let environment = SemanticEnvironment::from_modules(consumer, &[recovered.clone()]).unwrap();
+		let environment =
+			SemanticEnvironment::from_modules(consumer, std::slice::from_ref(&recovered)).unwrap();
 		let mut names = environment
 			.imported
 			.defs

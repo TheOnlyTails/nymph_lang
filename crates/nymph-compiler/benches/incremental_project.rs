@@ -13,6 +13,7 @@ use nymph_compiler::{check_project_library, compile_project_library};
 use nymph_sema::{DeclarationKey, DefinitionId, EntryMode};
 
 type Events = Arc<Mutex<Vec<SemanticQueryEvent>>>;
+type BenchmarkCase = (&'static str, fn() -> RetainedState, Request);
 const PRIVATE_MODULE: &str = "mixed/branch_000/level_003";
 
 #[derive(Clone, Copy, Debug)]
@@ -437,7 +438,7 @@ fn retained_shape(shape: GraphShape, request_kind: Request, warm_request: bool) 
 
 fn incremental_project(c: &mut Criterion) {
 	audit_preflight();
-	let cases: &[(&str, fn() -> RetainedState, Request)] = &[
+	let cases: &[BenchmarkCase] = &[
 		(
 			"diagnostics/fresh",
 			|| fresh(Request::Diagnostics),

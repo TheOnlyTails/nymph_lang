@@ -157,9 +157,8 @@ impl RangeProof {
 				Some((min, max)) if *min >= 0 && *max < 64 => classify_interval(intervals.last(), target),
 				_ => RangeDecision::Unknown,
 			},
-			RangeOperation::Index => intervals
-				.first()
-				.is_some_and(|&(min, max)| {
+			RangeOperation::Index => {
+				if intervals.first().is_some_and(|&(min, max)| {
 					length.is_some_and(|length| min >= -length && max < length)
 						|| self.evidence.iter().any(|evidence| match evidence {
 							RangeEvidence::SignedPairBound {
@@ -174,14 +173,17 @@ impl RangeProof {
 							} => max <= -1 && *upper <= 0,
 							_ => false,
 						})
-				})
-				.then_some(RangeDecision::Safe)
-				.unwrap_or_else(|| match (intervals.first(), length) {
-					(Some((min, max)), Some(length)) if *max < -length || *min >= length => {
-						RangeDecision::Invalid
+				}) {
+					RangeDecision::Safe
+				} else {
+					match (intervals.first(), length) {
+						(Some((min, max)), Some(length)) if *max < -length || *min >= length => {
+							RangeDecision::Invalid
+						}
+						_ => RangeDecision::Unknown,
 					}
-					_ => RangeDecision::Unknown,
-				}),
+				}
+			}
 			RangeOperation::SliceExclusive | RangeOperation::SliceInclusive => {
 				let bounds = self
 					.evidence
@@ -603,6 +605,9 @@ pub struct StableStructConstructionPlan {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
+// This stable query value mirrors the runtime protocol directly; boxing its
+// larger arm would leak allocation details into every consumer.
+#[allow(clippy::large_enum_variant)]
 pub enum RuntimeIteration {
 	Direct {
 		iterator_interface: DefinitionId,
@@ -859,6 +864,9 @@ pub struct EnumShell {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, salsa::SalsaValue)]
+// Payloads are a public, stable semantic contract. Keep their direct ownership
+// model rather than imposing boxes solely to equalize variant sizes.
+#[allow(clippy::large_enum_variant)]
 pub enum RuntimePayload {
 	NymphBody(CheckedRuntimeBody),
 	MaterializedInterfaceMember {
@@ -1349,6 +1357,7 @@ fn push_body(
 	)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_canonical_body(
 	result: &mut Vec<RuntimeDefinition>,
 	definition: DefinitionId,
@@ -1410,7 +1419,7 @@ fn checked_runtime_body(
 	let pattern_sites = builder.pattern_sites.into_inner();
 	let positional_sites = builder.positional_sites.into_inner();
 	let annotations = runtime_annotations(
-		&definition,
+		definition,
 		&nodes,
 		&local,
 		&pattern_sites,
@@ -1419,7 +1428,7 @@ fn checked_runtime_body(
 		&required_type_nodes,
 		checked,
 	)?;
-	let mut type_parameters = body_parameters(&definition, checked)
+	let mut type_parameters = body_parameters(definition, checked)
 		.into_iter()
 		.collect::<Vec<_>>();
 	type_parameters.sort_by_key(|(index, _)| index.0);
@@ -1855,6 +1864,7 @@ impl<'a> StableBodyBuilder<'a> {
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 fn runtime_annotations(
 	definition: &DefinitionId,
 	nodes: &[&Expr],
@@ -1888,7 +1898,7 @@ fn runtime_annotations(
 			}
 		)
 	});
-	let self_parameter = self_parameter.then(|| crate::ParamIdx(parameters.len() as u32));
+	let self_parameter = self_parameter.then_some(crate::ParamIdx(parameters.len() as u32));
 	let context = CanonicalizationContext::new(definitions, parameters);
 	let context = if let Some(parameter) = self_parameter {
 		context.with_self_parameter(parameter)
@@ -2404,14 +2414,13 @@ fn required_type_nodes(
 				}
 			}
 			ExprKind::BinaryOp { lhs, op, .. } => {
-				if matches!(op, BinaryOperator::Equals | BinaryOperator::NotEquals) {
-					if checked
+				if matches!(op, BinaryOperator::Equals | BinaryOperator::NotEquals)
+					&& checked
 						.annotations
 						.get(lhs.id)
 						.is_some_and(|info| !matches!(checked.interner.kind(info.ty), crate::TyKind::Error))
-					{
-						required.insert(lhs.id);
-					}
+				{
+					required.insert(lhs.id);
 				}
 				if checked
 					.annotations
@@ -2479,35 +2488,6 @@ fn required_type_nodes(
 		}
 	}
 	required
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-	use crate::{InterfaceConversionError, ParamIdx, ty::Interner};
-
-	#[test]
-	fn required_type_canonicalization_errors_are_loud() {
-		let mut interner = Interner::new();
-		let missing_binder = interner.mk_param(ParamIdx(7));
-
-		assert_eq!(
-			required_canonical_type(
-				&interner,
-				missing_binder,
-				&CanonicalizationContext::default()
-			),
-			Err(RuntimeExtractionError::IncompleteCanonicalType)
-		);
-		assert_eq!(
-			canonicalize_type(
-				&interner,
-				missing_binder,
-				&CanonicalizationContext::default()
-			),
-			Err(InterfaceConversionError::UnknownBinder(ParamIdx(7)))
-		);
-	}
 }
 
 fn stable_iteration_next_dispatch(
@@ -2918,4 +2898,33 @@ fn external_marshal(
 fn walk_expr<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 	out.push(expr);
 	expr.for_each_child(|child| walk_expr(child, out));
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::{InterfaceConversionError, ParamIdx, ty::Interner};
+
+	#[test]
+	fn required_type_canonicalization_errors_are_loud() {
+		let mut interner = Interner::new();
+		let missing_binder = interner.mk_param(ParamIdx(7));
+
+		assert_eq!(
+			required_canonical_type(
+				&interner,
+				missing_binder,
+				&CanonicalizationContext::default()
+			),
+			Err(RuntimeExtractionError::IncompleteCanonicalType)
+		);
+		assert_eq!(
+			canonicalize_type(
+				&interner,
+				missing_binder,
+				&CanonicalizationContext::default()
+			),
+			Err(InterfaceConversionError::UnknownBinder(ParamIdx(7)))
+		);
+	}
 }

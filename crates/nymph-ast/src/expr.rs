@@ -368,6 +368,9 @@ pub enum ListItem {
 }
 
 #[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+// Keeping both expressions inline avoids adding indirection to every map entry
+// and preserves the uniform expression representation consumed by later phases.
+#[allow(clippy::large_enum_variant)]
 pub enum MapEntry {
 	Entry(Expr, Expr),
 	Spread(Expr),

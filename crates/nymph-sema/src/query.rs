@@ -294,11 +294,11 @@ pub fn type_at(module: &Module, checked: &Checked, offset: usize) -> Option<Stri
 			&& let Some(meta) = func_decl_meta(&module.members[member])
 		{
 			let inferred_ret = func_decl_body(&module.members[member])
-				.and_then(|body| inferred_return(body, checked, module, &defs));
+				.and_then(|body| inferred_return(body, checked, module, defs));
 			return Some(render_named_signature(meta, inferred_ret));
 		}
 
-		return Some(render(&checked.interner, &defs, &params, info.ty));
+		return Some(render(&checked.interner, defs, &params, info.ty));
 	}
 
 	fallback_type_at(module, checked, offset)
@@ -2242,7 +2242,7 @@ fn fallback_type_at(module: &Module, checked: &Checked, offset: usize) -> Option
 
 	let mut candidates: Vec<(Span, String)> = Vec::new();
 	for decl in &module.members {
-		collect_fallback_decl(decl, checked, module, &defs, &params, &mut candidates);
+		collect_fallback_decl(decl, checked, module, defs, &params, &mut candidates);
 	}
 
 	candidates

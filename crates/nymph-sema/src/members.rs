@@ -27,6 +27,15 @@ use crate::iface::{Bound, Head, head_of};
 use crate::lower::{build_param_scope, build_param_scope_at};
 use crate::ty::{GenericArgs, Ty, TyKind};
 
+type InherentResolution = (
+	Vec<Ty>,
+	Ty,
+	Option<DefinitionId>,
+	Option<DefinitionId>,
+	Vec<Ty>,
+);
+type NamespacedResolution = (Vec<Ty>, Ty, Option<DefinitionId>, Vec<Ty>);
+
 /// Owned semantic facts for one inherent method. Local syntax is kept separately in
 /// [`InherentBodyJob`], so imported methods cannot accidentally become body jobs.
 #[derive(Debug, Clone)]
@@ -415,13 +424,7 @@ impl<'m> Checker<'m> {
 		arg_tys: &[Ty],
 		arg_lits: &[bool],
 		span: nymph_ast::Span,
-	) -> Option<(
-		Vec<Ty>,
-		Ty,
-		Option<DefinitionId>,
-		Option<DefinitionId>,
-		Vec<Ty>,
-	)> {
+	) -> Option<InherentResolution> {
 		self.resolve_inherent_impl(recv, name, arg_tys, arg_lits, span, false)
 	}
 
@@ -434,13 +437,7 @@ impl<'m> Checker<'m> {
 		arg_tys: &[Ty],
 		arg_lits: &[bool],
 		span: nymph_ast::Span,
-	) -> Option<(
-		Vec<Ty>,
-		Ty,
-		Option<DefinitionId>,
-		Option<DefinitionId>,
-		Vec<Ty>,
-	)> {
+	) -> Option<InherentResolution> {
 		self.resolve_inherent_impl(recv, name, arg_tys, arg_lits, span, true)
 	}
 
@@ -453,13 +450,7 @@ impl<'m> Checker<'m> {
 		arg_lits: &[bool],
 		span: nymph_ast::Span,
 		require_argument_match: bool,
-	) -> Option<(
-		Vec<Ty>,
-		Ty,
-		Option<DefinitionId>,
-		Option<DefinitionId>,
-		Vec<Ty>,
-	)> {
+	) -> Option<InherentResolution> {
 		// See `resolve_method`'s matching comment: peel `mut` before matching
 		// against any impl's (never-`mut`) `Self` type.
 		let recv = self.shallow_resolve(recv);
@@ -507,13 +498,7 @@ impl<'m> Checker<'m> {
 		recv: Ty,
 		name: &str,
 		span: nymph_ast::Span,
-	) -> Option<(
-		Vec<Ty>,
-		Ty,
-		Option<DefinitionId>,
-		Option<DefinitionId>,
-		Vec<Ty>,
-	)> {
+	) -> Option<InherentResolution> {
 		let recv = self.shallow_resolve(recv);
 		let recv = self.static_enum_view_ty(recv);
 		let head = head_of(&self.interner, recv)?;
@@ -608,7 +593,7 @@ impl<'m> Checker<'m> {
 		type_def: DefId,
 		name: &str,
 		span: nymph_ast::Span,
-	) -> Option<(Vec<Ty>, Ty, Option<DefinitionId>, Vec<Ty>)> {
+	) -> Option<NamespacedResolution> {
 		self.resolve_namespaced_value_on(type_def, None, name, span)
 	}
 
@@ -618,7 +603,7 @@ impl<'m> Checker<'m> {
 		receiver: Option<Ty>,
 		name: &str,
 		span: nymph_ast::Span,
-	) -> Option<(Vec<Ty>, Ty, Option<DefinitionId>, Vec<Ty>)> {
+	) -> Option<NamespacedResolution> {
 		let mut matches = Vec::new();
 		for index in self.inherent.candidates(Head::Adt(type_def)) {
 			let implementation = &self.inherent.impls[index];

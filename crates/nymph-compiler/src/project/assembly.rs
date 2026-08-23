@@ -1,3 +1,7 @@
+// These typed consistency errors retain full definition identities so callers can
+// report the exact malformed runtime graph without rebuilding semantic context.
+#![allow(clippy::result_large_err)]
+
 use std::collections::{BTreeMap, HashMap, HashSet, btree_map::Entry};
 
 use ecow::EcoString;
@@ -527,6 +531,7 @@ fn placement_error<T>(lowered: &LoweredRuntimeDefinition) -> Result<T, RuntimeAs
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attach(
 	target: &ModuleIdentity,
 	hir: &mut HirModule,
@@ -680,7 +685,7 @@ mod tests {
 			target.clone(),
 			DeclarationKey::member(owner.clone(), DeclarationCategory::Method, "get"),
 		);
-		let fragments = vec![
+		let fragments = [
 			lowered(
 				owner.clone(),
 				LoweredHirFragment::StructShell(shell("Box")),

@@ -460,6 +460,9 @@ pub struct BuiltinRuntimeOwnerArtifact {
 	pub shape: BuiltinRuntimeOwnerShape,
 }
 
+// Both forms are stable semantic artifacts; boxing them would add allocations to
+// ambient-runtime setup solely to equalize their representation sizes.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub enum BuiltinRuntimeOwnerShape {
 	Definition(nymph_sema::ExportedDefinition),
@@ -842,7 +845,6 @@ impl CompilerSession {
 
 	/// Resolve and read one exact runtime-bearing definition from its source
 	/// module. The owner comes from `DefinitionId`, never from placement metadata.
-	#[must_use]
 	pub fn runtime_definition(
 		&self,
 		project: ProjectId,
@@ -855,7 +857,7 @@ impl CompilerSession {
 	}
 
 	/// Lower exactly one checked runtime definition through the stable semantic context.
-	#[must_use]
+	#[allow(clippy::result_large_err)]
 	pub fn lower_runtime_definition(
 		&self,
 		project: ProjectId,
@@ -870,7 +872,7 @@ impl CompilerSession {
 	/// Assemble one module exclusively from exact stable runtime fragments.
 	#[cfg(feature = "test-support")]
 	#[doc(hidden)]
-	#[must_use]
+	#[allow(clippy::result_large_err)]
 	pub fn lower_interface_module_for_test(
 		&self,
 		project: ProjectId,
@@ -962,7 +964,6 @@ impl CompilerSession {
 
 	#[cfg(feature = "test-support")]
 	#[doc(hidden)]
-	#[must_use]
 	pub fn runtime_definition_consumer_for_test(
 		&self,
 		project: ProjectId,
@@ -1429,7 +1430,7 @@ impl CompilerSession {
 			let Some(source) = source else {
 				continue;
 			};
-			let parsed = nymph_syntax::parse_module(&source, &format!("{key}.nym"));
+			let parsed = nymph_syntax::parse_module(&source, format!("{key}.nym"));
 			let mut imports = Vec::new();
 			for declaration in &parsed.tree.members {
 				let Declaration::Import {
@@ -2219,6 +2220,7 @@ impl CompilerSession {
 	/// Returns the exact ES-module graph before bundling, together with the
 	/// entry module's stable module tag.
 	#[doc(hidden)]
+	#[allow(clippy::type_complexity)]
 	pub fn inspect_emitted_project(
 		&self,
 		project: ProjectId,
@@ -2228,6 +2230,7 @@ impl CompilerSession {
 		self.inspect_emitted_project_with_options(project, entry, mode, false)
 	}
 
+	#[allow(clippy::type_complexity)]
 	pub(crate) fn inspect_emitted_project_with_options(
 		&self,
 		project: ProjectId,
@@ -2247,6 +2250,7 @@ impl CompilerSession {
 
 	/// Emit an exact ES-module graph with the explicit synchronous REPL
 	/// transaction mode. Ordinary compilation never selects this path.
+	#[allow(clippy::type_complexity)]
 	pub(crate) fn emit_transactional_repl_project(
 		&self,
 		project: ProjectId,

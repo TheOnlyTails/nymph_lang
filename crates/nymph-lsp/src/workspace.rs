@@ -76,7 +76,6 @@ pub fn classify_uri(uri: &Uri) -> anyhow::Result<UriClass> {
 /// Returns `None` only for a bare, project-less file. Discovery and source-
 /// path errors are authoritative and must be surfaced instead of selecting
 /// loose-file checking.
-#[must_use]
 pub fn detect(file: &Path) -> anyhow::Result<Option<Project>> {
 	#[cfg(test)]
 	PROJECT_DETECTIONS.set(PROJECT_DETECTIONS.get() + 1);
