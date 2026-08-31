@@ -42,6 +42,7 @@ type Inspection = {
 	types: TypeState[];
 	stages: Stage[];
 	js: string | null;
+	run: { js: string; root_kind: "void" | "option" | "result"; task: boolean } | null;
 	diagnostics: Diagnostic[];
 };
 type HighlightSegment = {
@@ -74,7 +75,7 @@ const examples = {
 	_ -> fibonacci(n - 1) + fibonacci(n - 2),
 }
 
-func main(): int = fibonacci(10)
+func main(): void = { let value = echo fibonacci(10) }
 `,
 	Types: `enum Shape {
 	Circle(radius: float),
@@ -84,6 +85,10 @@ func main(): int = fibonacci(10)
 func area(shape: Shape): float = match (shape) {
 	Shape.Circle(radius) -> 3.14159 * radius ** 2,
 	Shape.Rectangle(width, height) -> width * height,
+}
+`,
+	Async: `async func main(): void = {
+	let exact = echo 18446744073709551615u
 }
 `,
 	"Type error": `func greet(name: string): string = "Hello, " + name
@@ -260,10 +265,10 @@ function runProgram() {
 		consoleLines.value.push({ level: "system", text: "Wait for compilation to finish." });
 		return;
 	}
-	if (!result.value?.js) {
+	if (!result.value?.run) {
 		consoleLines.value.push({
 			level: "system",
-			text: "Fix compiler errors before running the program.",
+			text: "Add a valid main returning void, Option<void>, Result<void, E>, or an async Task form.",
 		});
 		return;
 	}
@@ -288,7 +293,11 @@ function runProgram() {
 		consoleLines.value.push({ level: "error", text: event.message });
 		running.value = false;
 	});
-	runtimeWorker.postMessage({ js: result.value.js });
+	runtimeWorker.postMessage({
+		js: result.value.run.js,
+		root_kind: result.value.run.root_kind,
+		task: result.value.run.task,
+	});
 }
 
 function handleEditorKeydown(event: KeyboardEvent) {

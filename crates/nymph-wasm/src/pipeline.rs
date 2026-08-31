@@ -1,10 +1,14 @@
 //! Browser DTO adaptation around the stable compiler session pipeline.
 
-use nymph_compiler::{CompilerSession, EntryMode, ModulePath, ProjectId, Severity, SourceVersion};
+use nymph_compiler::{
+	CompiledEntryRoot, CompilerOptions, CompilerSession, EntryMode, ModulePath, ProjectId, Severity,
+	SourceVersion, compile_project_with_embedded_std_and_options,
+};
 use nymph_syntax::{lex, parse_module};
 
 use crate::diag::{
-	CompileResult, InspectionResult, LineIndex, StageStatus, StageView, TokenView, TypeStateView,
+	CompileResult, InspectionResult, LineIndex, RunArtifactView, StageStatus, StageView, TokenView,
+	TypeStateView,
 };
 
 /// Parse, check, and (if error-free) lower + emit `source` to a JS module
@@ -61,6 +65,32 @@ pub(crate) fn run_inspect(source: &str) -> InspectionResult {
 			}
 		})
 		.collect::<Vec<_>>();
+	let run = compile_project_with_embedded_std_and_options(
+		"playground",
+		&|module| (module == "playground").then(|| source.to_owned()),
+		&CompilerOptions::default(),
+	)
+	.ok()
+	.and_then(|compiled| {
+		let root = compiled.entry_root?;
+		let (root_kind, task, binding) = match root {
+			CompiledEntryRoot::Void => ("void", false, None),
+			CompiledEntryRoot::Option { binding } => ("option", false, Some(binding)),
+			CompiledEntryRoot::Result { binding } => ("result", false, Some(binding)),
+			CompiledEntryRoot::TaskVoid => ("void", true, None),
+			CompiledEntryRoot::TaskOption { binding } => ("option", true, Some(binding)),
+			CompiledEntryRoot::TaskResult { binding } => ("result", true, Some(binding)),
+		};
+		let mut js = compiled.js;
+		if let Some(binding) = binding {
+			js.push_str(&format!("\nexport {{ {binding} as __nymphRootEnum }};\n"));
+		}
+		Some(RunArtifactView {
+			js,
+			root_kind,
+			task,
+		})
+	});
 	let lex_failed = lexed
 		.diagnostics
 		.iter()
@@ -191,6 +221,7 @@ pub(crate) fn run_inspect(source: &str) -> InspectionResult {
 		types,
 		stages,
 		js: report.js,
+		run,
 		diagnostics,
 	}
 }

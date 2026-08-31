@@ -98,7 +98,9 @@ mod tests {
 
 	#[test]
 	fn inspect_exposes_real_syntax_artifacts_and_pipeline_status() {
-		let result = run_inspect("func add(a: int, b: int): int = a + b\n");
+		let result = run_inspect(
+			"func add(a: int, b: int): int = a + b\nfunc main(): void = { let value = echo add(1, 2) }\n",
+		);
 
 		assert!(result.tokens.iter().any(|token| token.text == "func"));
 		assert!(result.ast.contains("Func"));
@@ -106,6 +108,7 @@ mod tests {
 		assert!(result.types.iter().any(|entry| entry.parent.is_some()));
 		assert_eq!(result.stages.len(), 4);
 		assert!(result.js.is_some());
+		assert!(result.run.as_ref().is_some_and(|run| !run.task));
 		assert!(result.diagnostics.is_empty());
 	}
 }

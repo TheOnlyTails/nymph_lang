@@ -74,6 +74,14 @@ pub struct TypeStateView {
 	pub col: usize,
 }
 
+/// Browser-executable entry bundle and its statically validated root adapter.
+#[derive(Clone, Debug, Serialize)]
+pub struct RunArtifactView {
+	pub js: String,
+	pub root_kind: &'static str,
+	pub task: bool,
+}
+
 /// Debug information for every browser-observable compiler stage.
 #[derive(Clone, Debug, Serialize)]
 pub struct InspectionResult {
@@ -82,6 +90,7 @@ pub struct InspectionResult {
 	pub types: Vec<TypeStateView>,
 	pub stages: Vec<StageView>,
 	pub js: Option<String>,
+	pub run: Option<RunArtifactView>,
 	pub diagnostics: Vec<Diag>,
 }
 
