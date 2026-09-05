@@ -99,7 +99,7 @@ impl Expr {
 				f(lhs);
 				f(rhs);
 			}
-			ExprKind::Return { value, .. } | ExprKind::Break { value, .. } => {
+			ExprKind::Break { value, .. } => {
 				if let Some(value) = value {
 					f(value);
 				}
@@ -240,10 +240,6 @@ pub enum ExprKind {
 		lhs: Box<Expr>,
 		op: PatternOperator,
 		rhs: Spanned<Pattern>,
-	},
-	Return {
-		value: Option<Box<Expr>>,
-		label: Option<Ident>,
 	},
 	Break {
 		value: Option<Box<Expr>>,
@@ -671,7 +667,7 @@ mod tests {
 		);
 		assert_children(
 			ExprKind::PostfixOp {
-				op: PostfixOperator::ErrorReturn,
+				op: PostfixOperator::ErrorPropagate,
 				value: Box::new(child(1)),
 				label: None,
 			},
@@ -717,13 +713,6 @@ mod tests {
 				otherwise: Some(Box::new(child(3))),
 			},
 			&[1, 2, 3],
-		);
-		assert_children(
-			ExprKind::Return {
-				value: Some(Box::new(child(1))),
-				label: None,
-			},
-			&[1],
 		);
 		assert_children(
 			ExprKind::Break {

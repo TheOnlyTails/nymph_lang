@@ -550,7 +550,7 @@ the result before returning it.
 iterator dispatch, latent effects, persistent successor state, pattern and control targets, and source
 spans. The iterable expression and its pure `iter()` call each evaluate once. Every iteration calls
 `next()` once and saves the successor before entering the body. `continue` resumes from that successor;
-`break`, return, `?`, panic, and cancellation abandon it without another step. Iteration-local cleanup
+`break`, `?`, panic, and cancellation abandon it without another step. Iteration-local cleanup
 runs on every departure through the shared activation unwind. A tail transfer first cleans every
 departing scope. Loops add no implicit cancellation checkpoint.
 
@@ -566,12 +566,12 @@ General mutation-oriented `while` loops are removed. A functional state loop dec
 loop-carried bindings and advances them through named `continue` values:
 
 ```nymph
-loop (
+loop@state (
   let index: uint = 0
   let use file = File.open(path)?
 ) {
   if (done(index)) {
-    break result
+    break@state result
   }
 
   continue(index = index + 1)
@@ -592,7 +592,7 @@ declaration order, installs the new bindings, and starts the next iteration. If 
 exits or defects, the next iteration does not start and newly acquired managed values are also cleaned
 up. Loop exit closes the currently managed resources normally.
 
-The activation machine implements state-loop continuation without stack growth. Return, `?`, panic,
+The activation machine implements state-loop continuation without stack growth. `break`, `?`, panic,
 cancellation, and proper tail calls use its ordinary cleanup path. A state loop cannot exhaust, so a
 valued `break` produces `T`; a bare break produces `void`.
 
@@ -715,7 +715,7 @@ Semantics:
   implement `Close` explicitly to define its own cleanup behavior.
 - Register synchronous cleanup at lexical scope exit.
 - Include `!E` in the enclosing computation's effects because cleanup performs it on scope exit.
-- Close on normal completion, `?`, return, panic, and cancellation.
+- Close on normal completion, `break`, `?`, panic, and cancellation.
 - Close in reverse declaration order.
 - `close(): void + !E` is synchronous, non-fallible, and idempotent.
 - Fallible or suspending finalization is explicit through operations such as

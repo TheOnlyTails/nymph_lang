@@ -82,8 +82,8 @@ impl Iterator<int> for Counter {
   }
 }
 
-func find_three(): Option<int> = for (value in Counter(next = 1, end = 4)) {
-  if (value == 3) { break value }
+func find_three(): Option<int> = for@values (value in Counter(next = 1, end = 4)) {
+  if (value == 3) { break@values value }
 }
 ```
 
@@ -93,11 +93,11 @@ There is no source `while`. A state loop gives every iteration fresh immutable b
 named values simultaneously on `continue`.
 
 ```nym
-func sum_to(limit: int): int = loop (
+func sum_to(limit: int): int = loop@sum (
   let next = 1
   let total = 0
 ) {
-  if (next > limit) { break total }
+  if (next > limit) { break@sum total }
   continue(next = next + 1, total = total + next)
 }
 ```

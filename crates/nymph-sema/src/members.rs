@@ -827,6 +827,7 @@ impl<'m> Checker<'m> {
 		self.push_control_label(
 			Some(&meta.name),
 			body.id,
+			body.id,
 			crate::check::ControlLabelKind::Callable,
 			None,
 			Some(trial_ret),

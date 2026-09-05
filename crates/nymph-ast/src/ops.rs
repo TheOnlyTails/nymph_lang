@@ -41,8 +41,8 @@ pub enum PrefixOperator {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, salsa::SalsaValue)]
 pub enum PostfixOperator {
-	/// `?` — propagate an error / `None` to a callable or labeled target.
-	ErrorReturn,
+	/// `?` — propagate an error / `None` to the selected control target.
+	ErrorPropagate,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, salsa::SalsaValue)]

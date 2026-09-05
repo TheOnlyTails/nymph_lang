@@ -10,8 +10,8 @@ whose value is the function's result; there's no separate `return` needed for th
 func add(a: int, b: int): int = a + b
 
 func classify(n: int): string = {
-  if (n < 0) { return "negative" }
-  if (n == 0) { return "zero" }
+  if (n < 0) { break@classify "negative" }
+  if (n == 0) { break@classify "zero" }
   "positive"
 }
 ```
@@ -24,10 +24,12 @@ func doubled(x: int) = x * 2
 
 ## Callable labels
 
-A named function's name is its callable label, so `return@name value` explicitly returns from it.
+A named function's name is its callable label, so `break@name value` explicitly completes it.
 Closures may write a label as `label@(params) -> body` or `(params) -> label@{ body }`. If both
 positions are used, their labels must match. Labels are lexical and cannot escape across a nested
-function or closure boundary.
+function or closure boundary. Unlabeled `break` uses the innermost explicit block, loop body, or
+callable instead, so use the callable label when nested blocks must be skipped. A bare `break`
+explicitly completes a `void` function.
 
 ## Parameters
 

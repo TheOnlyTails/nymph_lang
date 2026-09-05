@@ -117,7 +117,7 @@ impl<T: Equals<Other = T>> Contains<Item = T> for #[T] {
   func contains(item: T): boolean = {
     for (candidate in this) {
       if (candidate.equals(item)) {
-        return true
+        break@contains true
       }
     }
     false

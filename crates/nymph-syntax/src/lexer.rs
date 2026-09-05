@@ -420,7 +420,6 @@ impl<'src> Lexer<'src> {
 			"as" => Token::As,
 			"is" => Token::Is,
 			"in" => Token::In,
-			"return" => Token::Return,
 			"break" => Token::Break,
 			"continue" => Token::Continue,
 			"echo" => Token::Echo,

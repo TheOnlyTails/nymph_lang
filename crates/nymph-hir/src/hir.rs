@@ -145,10 +145,10 @@ pub enum HirStmt {
 	},
 	/// A bare expression evaluated for its effect.
 	Expr(HirExpr),
-	/// `return <value>;` (`None` for a bare `return`). Source returns remain
-	/// statement-flavored in HIR: expression-position returns lower to a
-	/// one-statement `HirExpr::Block`. Codegen carries them across synthetic
-	/// expression IIFEs to the nearest real callable boundary.
+	/// A callable or block completion (`None` for a bare completion). Source
+	/// `break` expressions remain statement-flavored in HIR: expression-position
+	/// exits lower to a one-statement `HirExpr::Block`. Codegen carries them
+	/// across synthetic expression IIFEs to the selected source target.
 	Return {
 		value: Option<HirExpr>,
 		target: HirReturnTarget,
@@ -618,7 +618,7 @@ pub enum HirExpr {
 	/// arrow function. Captures are free: JS arrows close over their enclosing
 	/// scope by reference, which already matches the checker's own capture
 	/// semantics (Slice 4L), so no explicit capture list is carried here.
-	/// This is a real callable boundary: a `return` in `body` exits this closure,
+	/// This is a real callable boundary: a callable-targeted exit in `body` exits this closure,
 	/// including when synthetic expression IIFEs occur inside it.
 	Closure {
 		params: Vec<EcoString>,

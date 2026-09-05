@@ -175,8 +175,8 @@ console.log(JSON.stringify({ same, survives, callbacks, writes }));
 }
 
 #[test]
-fn inferred_explicit_closure_return_exits_the_closure_not_its_creator() {
-	let src = "func choose(flag: boolean): int = {\n\tlet pick = (flag: boolean) -> { if (flag) { return 7 } 9 }\n\tlet value = pick(flag)\n\treturn value + 1\n}";
+fn inferred_explicit_closure_break_exits_the_closure_not_its_creator() {
+	let src = "func choose(flag: boolean): int = {\n\tlet pick = (flag: boolean) -> { if (flag) break 7\n9 }\n\tlet value = pick(flag)\n\tbreak value + 1\n}";
 	assert_eq!(run(src, "choose(new NBool(true))"), "8");
 	assert_eq!(run(src, "choose(new NBool(false))"), "10");
 }
@@ -1299,15 +1299,15 @@ fn compile_produces_runnable_js() {
 	);
 }
 
-// ── Slice 4E: `return`, let-shadowing, module lets ──────────────────────────
+// ── Callable and block exits, let-shadowing, module lets ───────────────────
 
 #[test]
-fn runs_early_return_with_value_inside_a_statement_position_if() {
-	// The corpus `abs` shape: an early `return n` inside a statement-position
-	// `if`, falling through to the trailing expression otherwise (Slice 4E, Y1).
+fn runs_early_break_with_value_inside_a_statement_position_if() {
+	// An early callable-targeted break inside a statement-position `if`, falling
+	// through to the trailing expression otherwise.
 	let src = r#"
 		func abs(n: int): int = {
-			if (n >= 0) { return n }
+			if (n >= 0) { break@abs n }
 			0 - n
 		}
 	"#;
@@ -1317,10 +1317,10 @@ fn runs_early_return_with_value_inside_a_statement_position_if() {
 }
 
 #[test]
-fn runs_bare_return_in_a_void_function() {
+fn runs_bare_break_in_a_void_function() {
 	let src = r#"
 		func noop(): void = {
-			return
+			break
 		}
 	"#;
 	// A `void` function still has SOME js return value (`undefined`) — assert via
@@ -1329,15 +1329,15 @@ fn runs_bare_return_in_a_void_function() {
 }
 
 #[test]
-fn runs_return_inside_a_statement_position_match() {
-	// A braced match-arm body (`-> { return .. }`) in a STATEMENT-position match
+fn runs_callable_break_inside_a_statement_position_match() {
+	// A braced match-arm body with a callable-targeted break in a statement-position match
 	// (not a subexpression) emits directly — the whole `match` stays in
-	// `block_stmt`, never wrapped in an IIFE, so the `return` inside targets the
+	// `block_stmt`, never wrapped in an IIFE, so the exit targets the
 	// enclosing function correctly.
 	let src = r#"
 		func classify(n: int): int = {
 			match (n) {
-				0 -> { return 100 },
+				0 -> { break@classify 100 },
 				_ -> { },
 			}
 			n * 2
@@ -1348,14 +1348,14 @@ fn runs_return_inside_a_statement_position_match() {
 }
 
 #[test]
-fn return_inside_a_subexpression_position_match_arm_targets_the_function() {
+fn break_inside_a_subexpression_position_match_arm_targets_the_function() {
 	// A braced match-arm body used as a SUBEXPRESSION (here, a `let` initializer)
 	// is wrapped in an IIFE by emit. The private callable completion carries its
-	// return across that generated boundary to the enclosing function.
+	// value across that generated boundary to the enclosing function.
 	let src = r#"
 		func f(n: int): int = {
 			let x = match (n) {
-				0 -> { return 7 },
+				0 -> { break@f 7 },
 				_ -> n,
 			}
 			x
@@ -1719,13 +1719,13 @@ fn runs_top_level_lets_via_a_three_function_mutual_recursion_cycle() {
 	assert_eq!(run(src, "r"), "3");
 }
 
-// ── Slice 4E follow-up: `return` inside an UNBRACED if/while branch ─────────
+// ── Callable break inside an unbraced branch ───────────────────────────────
 
 #[test]
-fn runs_bare_return_as_an_unbraced_if_then_branch() {
+fn runs_break_as_an_unbraced_if_then_branch() {
 	let src = r#"
 		func f(n: int): int = {
-			if (n < 0) return 0 - n
+			if (n < 0) break 0 - n
 			n
 		}
 	"#;
@@ -2888,24 +2888,24 @@ fn pattern_binding_exposes_whole_value_and_nested_captures() {
 #[test]
 fn immutable_state_loops_replace_simultaneously_and_capture_each_iteration() {
 	let src = r#"
-func simultaneous(): #(int, int) = loop (
+func simultaneous(): #(int, int) = loop@simultaneous_state (
   let left = 1
   let right = 2
   let step = 0
 ) {
-  if (step == 2) { break #(left, right) }
+  if (step == 2) { break@simultaneous_state #(left, right) }
   continue(left = right, right = left, step = step + 1)
 }
-func captured(): int = loop (
+func captured(): int = loop@captured_state (
   let value = 0
   let saved: () -> int = () -> 99
   let step = 0
 ) {
-  if (step == 2) { break saved() }
+  if (step == 2) { break@captured_state saved() }
   continue(saved = () -> value, value = value + 1, step = step + 1)
 }
-func deep(): int = loop (let value = 0) {
-  if (value == 10000) { break value }
+func deep(): int = loop@deep_state (let value = 0) {
+  if (value == 10000) { break@deep_state value }
   continue(value = value + 1)
 }
 func labeled(): int = loop@outer (let value = 0) {
@@ -2926,9 +2926,9 @@ struct Resource
 impl Close<!()> for Resource {
 	func close(): void = {}
 }
-func managed(): int = loop (let use resource = Resource(), let step = 0) {
+func managed(): int = loop@managed_state (let use resource = Resource(), let step = 0) {
     let use body = Resource()
-    if (step == 1) { break step }
+    if (step == 1) { break@managed_state step }
     continue(resource = Resource(), step = step + 1)
   }
 "#;
@@ -2936,26 +2936,26 @@ func managed(): int = loop (let use resource = Resource(), let step = 0) {
 }
 
 #[test]
-fn labeled_block_returns_complete_only_the_target_block() {
+fn labeled_block_breaks_complete_only_the_target_block() {
 	let src = r#"func block(): int = {
-  let value = result@{ return@result 7 }
+  let value = result@{ break@result 7 }
   value + 1
 }
 func nested(): int = {
-  let value = outer@{ inner@{ return@outer 9 } 1 }
+  let value = outer@{ inner@{ break@outer 9 } 1 }
   value + 2
 }
 func callable_iife(): int = {
-  let value = block@{ if (true) { return@callable_iife 13 } 3 }
+  let value = block@{ if (true) { break@callable_iife 13 } 3 }
   value + 4
 }
 func callable_iife_fallthrough(): int = {
-  let value = block@{ if (false) { return@callable_iife_fallthrough 13 } 3 }
+  let value = block@{ if (false) { break@callable_iife_fallthrough 13 } 3 }
   value + 4
 }
 func direct_body(flag: boolean): int = result@{
-  if (flag) { return@direct_body 17 }
-  return@result 19
+  if (flag) { break@direct_body 17 }
+  break@result 19
 }"#;
 	assert_eq!(run(src, "block()"), "8");
 	assert_eq!(run(src, "nested()"), "11");
@@ -2963,6 +2963,51 @@ func direct_body(flag: boolean): int = result@{
 	assert_eq!(run(src, "callable_iife()"), "13");
 	assert_eq!(run(src, "direct_body(new NBool(true))"), "17");
 	assert_eq!(run(src, "direct_body(new NBool(false))"), "19");
+}
+
+#[test]
+fn unlabeled_break_and_question_use_the_innermost_block_or_loop_body() {
+	let src = r#"
+func nested_block(): int = {
+  let value = {
+    let branch = if (true) { break 7 } else { 0 }
+    branch + 2
+  }
+  value + 1
+}
+func direct_loop_body(): Option<int> = for (value in 1..=3) { break value }
+func nested_branch_does_not_break_loop(): int = loop@outer (let value = 0) {
+  let branch = if (value == 0) { break 7 } else { 0 }
+  if (value == 1) { break@outer 11 }
+  continue(value = value + 1)
+}
+func labeled_branch_breaks_loop(): int = loop@outer (let value = 1) {
+  let branch = if (true) { break@outer value } else { 0 }
+}
+func question_block(value: Option<int>): Option<int> = {
+  let propagated = {
+    let inner = value?
+    Some(inner + 1)
+  }
+  propagated
+}
+func question_loop(value: Option<int>): Option<Option<int>> = for (_ in 1..=1) {
+  let inner = value?
+  break Some(inner + 1)
+}
+func question_block_none(): Option<int> = question_block(None)
+func question_block_some(): Option<int> = question_block(Some(4))
+func question_loop_none(): Option<Option<int>> = question_loop(None)
+func question_loop_some(): Option<Option<int>> = question_loop(Some(4))
+"#;
+	assert_eq!(run(src, "nested_block()"), "10");
+	assert_eq!(run(src, "direct_loop_body()"), "{ value: 1 }");
+	assert_eq!(run(src, "nested_branch_does_not_break_loop()"), "11");
+	assert_eq!(run(src, "labeled_branch_breaks_loop()"), "1");
+	assert_eq!(run(src, "question_block_none()"), "{}");
+	assert_eq!(run(src, "question_block_some()"), "{ value: 5 }");
+	assert_eq!(run(src, "question_loop_none()"), "{ value: {} }");
+	assert_eq!(run(src, "question_loop_some()"), "{ value: { value: 5 } }");
 }
 
 #[test]
@@ -3079,7 +3124,7 @@ enum Token<T> { Empty }
 func make<T>(): Token<T> = Token.Empty
 func answer(): void = {
   make()
-  return
+  break
 }
 "#;
 	let diagnostics = nymph_compiler::compile(source, "test").expect_err("T is underdetermined");
@@ -3100,7 +3145,7 @@ func make<T>(): Token<T> = Token.Empty
 func outer<U>(): Token<Box<U>> = make()
 func answer(): void = {
   outer()
-  return
+  break
 }
 "#;
 	let diagnostics = nymph_compiler::compile(source, "test").expect_err("U is underdetermined");
@@ -3121,7 +3166,7 @@ impl Seed for int { func seed(value: int) = value + 1 }
 func direct<T: Seed>(value: int): int = T.seed(value)
 func answer(): void = {
   direct(40)
-  return
+  break
 }
 "#;
 	let diagnostics = nymph_compiler::compile(source, "test").expect_err("T is underdetermined");
@@ -3143,7 +3188,7 @@ func inner<T: Seed>(value: int): int = T.seed(value)
 func outer<U: Seed>(value: int): int = inner(value)
 func answer(): void = {
   outer(40)
-  return
+  break
 }
 "#;
 	let diagnostics = nymph_compiler::compile(source, "test").expect_err("U is underdetermined");

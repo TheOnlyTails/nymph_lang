@@ -213,6 +213,9 @@ pub struct Checker<'m> {
 pub(crate) struct ControlLabel {
 	pub name: Option<EcoString>,
 	pub id: NodeId,
+	/// The expression node whose body this target owns. Its explicit block is
+	/// the target itself rather than a nested block target.
+	pub body: NodeId,
 	pub span: Span,
 	pub kind: ControlLabelKind,
 	pub loop_index: Option<usize>,

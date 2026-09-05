@@ -56,14 +56,16 @@ once. Every iteration calls `next()` once and saves the successor before enterin
 `continue` resumes from that successor and every other departure performs no extra step.
 
 ```nym
-func first_even(): Option<int> = for (value in 1..=6) {
-  if (value % 2 == 0) { break value }
+func first_even(): Option<int> = for@values (value in 1..=6) {
+  if (value % 2 == 0) { break@values value }
 }
 ```
 
 Natural exhaustion of a `for` with valued breaks is `None`; an executed `break value` is `Some`.
 A bare break makes the loop `void`, and bare and valued breaks cannot be mixed. Labels use
-`for@outer` and `break@outer`/`continue@outer`.
+`for@outer` and `break@outer`/`continue@outer`. The loop body block is the loop target itself, but an
+explicit block nested inside it is a separate target. Use the loop label to break the loop from such
+a nested block.
 
 Ranges iterate forward. A reversed endpoint order is empty rather than implicitly descending; use
 `.reversed()` explicitly. Lists are directly iterable. Iterator adapters are lazy, and predictable
@@ -74,11 +76,11 @@ callbacks execute sequentially in source order.
 A state loop carries one or more immutable bindings:
 
 ```nym
-func sum_to(limit: int): int = loop (
+func sum_to(limit: int): int = loop@sum (
   let next = 1
   let total = 0
 ) {
-  if (next > limit) { break total }
+  if (next > limit) { break@sum total }
   continue(next = next + 1, total = total + next)
 }
 ```
@@ -104,12 +106,12 @@ and `continue@outer(name = value)`. Header `let use` declarations participate in
 resource cleanup when replaced or when the loop exits.
 
 ```nym
-func swap_twice(): #(int, int) = loop (
+func swap_twice(): #(int, int) = loop@swap (
   let left = 1
   let right = 2
   let step = 0
 ) {
-  if (step == 2) { break #(left, right) }
+  if (step == 2) { break@swap #(left, right) }
   continue(left = right, right = left, step = step + 1)
 }
 ```

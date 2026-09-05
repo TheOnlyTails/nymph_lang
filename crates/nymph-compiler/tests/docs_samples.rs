@@ -355,8 +355,8 @@ fn selected_public_doc_claims_emit_and_run() {
 public struct Secret(public shown: int, private hidden: int)
 public func inspect(value: Secret): Secret = echo value
 public func secret(): Secret = Secret(shown = 1, hidden = 2)
-public func sum_to(limit: int): int = loop (let next = 1, let total = 0) {
-	if (next > limit) { break total }
+public func sum_to(limit: int): int = loop@sum (let next = 1, let total = 0) {
+	if (next > limit) { break@sum total }
 	continue(next = next + 1, total = total + next)
 }
 "#;

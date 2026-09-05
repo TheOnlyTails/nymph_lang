@@ -321,10 +321,6 @@ pub enum StableExprKind {
 		op: PatternOperator,
 		rhs: StablePattern,
 	},
-	Return {
-		value: Option<Box<StableExpr>>,
-		label: Option<EcoString>,
-	},
 	Break {
 		value: Option<Box<StableExpr>>,
 		label: Option<EcoString>,
@@ -1743,10 +1739,6 @@ impl<'a> StableBodyBuilder<'a> {
 				lhs: boxed(lhs)?,
 				op: *op,
 				rhs: self.pattern(rhs)?,
-			},
-			ExprKind::Return { value, label: l } => StableExprKind::Return {
-				value: value.as_deref().map(boxed).transpose()?,
-				label: label(l),
 			},
 			ExprKind::Break { value, label: l } => StableExprKind::Break {
 				value: value.as_deref().map(boxed).transpose()?,

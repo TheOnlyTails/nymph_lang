@@ -235,7 +235,7 @@ pub fn imported_names(
 /// expression the checker never annotated, e.g. inside a still-erroring
 /// subtree), OR when the smallest covering expression is a container/
 /// control-flow kind (`Block`, `If`, `For`, `Match`, `Closure`,
-/// `Return`, `Break`, `Continue`) rather than a leaf/primary value
+/// `Break`, `Continue`) rather than a leaf/primary value
 /// genuinely under the cursor — hovering the `let`/`func`/`for`
 /// keyword, a binder name, a type annotation, or whitespace inside a block
 /// all land on one of these containers (the only expr kinds actually
@@ -499,7 +499,6 @@ fn suppresses_hover(kind: &ExprKind) -> bool {
 			| ExprKind::StateLoop { .. }
 			| ExprKind::Match { .. }
 			| ExprKind::Closure { .. }
-			| ExprKind::Return { .. }
 			| ExprKind::Break { .. }
 			| ExprKind::Continue { .. }
 			| ExprKind::Call { .. }
@@ -708,8 +707,9 @@ fn keyword_doc(token: &Token) -> Option<&'static str> {
 			Some("`namespace` groups type-level (static) members that aren't tied to an instance.")
 		}
 		Token::Type => Some("`type` declares a type alias: `type Alias<G..> = Type`."),
-		Token::Return => Some("`return` exits the enclosing function early with a value."),
-		Token::Break => Some("`break` exits the enclosing loop early, optionally with a value."),
+		Token::Break => {
+			Some("`break` exits the nearest enclosing block, loop, or callable, optionally with a value.")
+		}
 		Token::Continue => Some("`continue` skips to the next iteration of the enclosing loop."),
 		Token::Echo => Some(
 			"`echo` writes a development-only structural observation to stderr and returns its operand unchanged.",

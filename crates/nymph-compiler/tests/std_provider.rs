@@ -132,7 +132,7 @@ func normal(): int = {
 }
 func early(): int = {
   let use resource = Resource(id = 3)
-  return 8
+  break 8
 }
 func fail(): Result<int, string> = Error("stop")
 func question(): Result<int, string> = {

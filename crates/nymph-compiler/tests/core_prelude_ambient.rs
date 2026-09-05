@@ -23,9 +23,9 @@ func generic_range<T: Step>(start: T, end: T): Range<T> = start..end
 func ranges(): void = {
   for (_ in 1..3) {}
   for (_ in 1..=3) {}
-  for (_ in 1..) { return }
-  for (_ in (..3).reversed()) { return }
-  for (_ in (..=3).reversed()) { return }
+  for (_ in 1..) { break@ranges }
+  for (_ in (..3).reversed()) { break@ranges }
+  for (_ in (..=3).reversed()) { break@ranges }
   for (_ in 'a'..='c') {}
 }
 "#;

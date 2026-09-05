@@ -444,7 +444,7 @@ fn labeled_control_syntax() {
 		ExprKind::For { label: Some(_), .. }
 	));
 	assert!(matches!(
-		expr("outer@{ return@outer 1 }").kind,
+		expr("outer@{ break@outer 1 }").kind,
 		ExprKind::Block { label: Some(_), .. }
 	));
 	assert!(matches!(
@@ -460,11 +460,11 @@ fn labeled_control_syntax() {
 		ExprKind::Closure { label: Some(_), .. }
 	));
 	assert!(matches!(
-		expr("() -> outer@{ return@outer 1 }").kind,
+		expr("() -> outer@{ break@outer 1 }").kind,
 		ExprKind::Closure { label: Some(_), .. }
 	));
 	assert!(matches!(
-		expr("outer@(x)  ->  outer@{ return@outer x }").kind,
+		expr("outer@(x)  ->  outer@{ break@outer x }").kind,
 		ExprKind::Closure { label: Some(_), .. }
 	));
 }
@@ -540,8 +540,6 @@ fn label_edges_must_be_adjacent() {
 		"break@ outer 1",
 		"continue @outer",
 		"continue@ outer",
-		"return @outer 1",
-		"return@ outer 1",
 		"value? @outer",
 		"value?@ outer",
 		"outer @{ 1 }",

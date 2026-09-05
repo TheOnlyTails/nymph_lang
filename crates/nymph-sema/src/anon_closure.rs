@@ -32,7 +32,7 @@
 //!
 //! [`Checker::resolve_anon`] is called at every "closure slot" — a free-function
 //! call argument (`check_call_arg`), a `let` initializer (`check_let_body`), a
-//! `return` operand, a constructor field (`check_ctor_args`), and an explicit
+//! `break` operand, a constructor field (`check_ctor_args`), and an explicit
 //! closure's own body (`infer_closure`/`check_closure`, itself a hard boundary
 //! `$N` cannot escape past) — immediately before that site's ordinary
 //! `check`/`infer` call. It scans the slot for `$N` occurrences (bailing out
@@ -194,7 +194,7 @@ impl<'m> Checker<'m> {
 	/// Form the closure hypothesized/committed at `expr` (a node id
 	/// [`crate::annotate::Annotations::anon_boundary_arity`] maps to `arity`):
 	/// push a fresh param-type frame onto [`Checker::anon_ctx`], establish a
-	/// fresh closure-local return type, dispatch `expr`'s OWN kind through it
+	/// fresh closure-local result type, dispatch `expr`'s OWN kind through it
 	/// (exactly the shape `$N` reads back out of, via
 	/// `ExprKind::AnonymousParam`'s arm in `infer_dispatch`), and return the
 	/// resulting `(fresh params) -> body_ty` function type — mirroring
@@ -202,7 +202,7 @@ impl<'m> Checker<'m> {
 	/// closure never declares generics, exactly like an explicit one never
 	/// does either).
 	///
-	/// The body's inferred fallthrough and every return are constrained to the
+	/// The body's inferred fallthrough and every targeted exit are constrained to the
 	/// same fresh result type before the caller applies any expected function
 	/// type, matching explicit closure boundaries.
 	pub(crate) fn form_anon_closure(&mut self, expr: &Expr, arity: u8) -> Ty {
@@ -214,6 +214,7 @@ impl<'m> Checker<'m> {
 		let outer_labels = std::mem::take(&mut self.control_labels);
 		self.push_control_label(
 			None,
+			expr.id,
 			expr.id,
 			crate::check::ControlLabelKind::Callable,
 			None,

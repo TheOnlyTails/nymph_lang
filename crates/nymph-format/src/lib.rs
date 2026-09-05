@@ -502,7 +502,7 @@ impl Hints {
 			ExprKind::TypeOp { lhs, .. } | ExprKind::PatternOp { lhs, .. } => {
 				self.visit_expr(source, lhs, false)
 			}
-			ExprKind::Return { value, .. } | ExprKind::Break { value, .. } => {
+			ExprKind::Break { value, .. } => {
 				if let Some(value) = value {
 					self.visit_expr(source, value, true);
 				}
@@ -647,10 +647,7 @@ fn ends_in_unmatched_if(expr: &Expr) -> bool {
 		ExprKind::PrefixOp { value, .. } | ExprKind::Echo { operand: value, .. } => {
 			ends_in_unmatched_if(value)
 		}
-		ExprKind::Return {
-			value: Some(value), ..
-		}
-		| ExprKind::Break {
+		ExprKind::Break {
 			value: Some(value), ..
 		}
 		| ExprKind::BinaryOp { rhs: value, .. } => ends_in_unmatched_if(value),
@@ -1592,7 +1589,6 @@ fn is_prefix_operator(token: &str, previous: Option<&str>) -> bool {
 				| "="
 				| "->"
 				| ":"
-				| "return"
 				| "break"
 				| "+"
 				| "-"

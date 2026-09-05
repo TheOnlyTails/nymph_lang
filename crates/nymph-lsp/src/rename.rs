@@ -445,7 +445,15 @@ mod tests {
 
 	#[test]
 	fn new_name_requires_one_complete_identifier_token() {
-		for valid in ["renamed", "éclair", "Δelta", "变量", "snake_case", "x2"] {
+		for valid in [
+			"renamed",
+			"éclair",
+			"Δelta",
+			"变量",
+			"snake_case",
+			"x2",
+			"return",
+		] {
 			assert!(valid_new_name(valid), "{valid}");
 		}
 		for invalid in [
@@ -459,7 +467,6 @@ mod tests {
 			"as",
 			"if",
 			"let",
-			"return",
 			"two names",
 			"name ",
 			" name",

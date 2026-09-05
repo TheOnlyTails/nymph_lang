@@ -361,7 +361,7 @@ impl Parser<'_> {
 					let label = self.parse_control_label(question);
 					self.mk_expr(
 						ExprKind::PostfixOp {
-							op: nymph_ast::ops::PostfixOperator::ErrorReturn,
+							op: nymph_ast::ops::PostfixOperator::ErrorPropagate,
 							value: Box::new(expr),
 							label,
 						},
@@ -494,16 +494,6 @@ impl Parser<'_> {
 			Token::Match => self.parse_match(),
 			Token::For => self.parse_for(),
 			Token::Loop => self.parse_state_loop(),
-			Token::Return => {
-				let keyword = self.advance().unwrap().1;
-				let label = self.parse_control_label(keyword);
-				let value = if self.can_start_expr() {
-					Some(Box::new(self.parse_expr()))
-				} else {
-					None
-				};
-				self.mk_expr(ExprKind::Return { value, label }, self.span_from(start))
-			}
 			Token::Break => {
 				let keyword = self.advance().unwrap().1;
 				let label = self.parse_control_label(keyword);
@@ -943,7 +933,6 @@ impl Parser<'_> {
 					| Token::Bang
 					| Token::Minus
 					| Token::Tilde
-					| Token::Return
 					| Token::Break
 					| Token::Continue
 					| Token::Echo

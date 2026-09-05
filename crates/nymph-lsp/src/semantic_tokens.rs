@@ -358,9 +358,7 @@ fn lexer_token_type(token: &Token) -> Option<u32> {
 	Some(match token {
 		Public | Internal | Private | Import | With | Type | Struct | Enum | Effect | Let
 		| External | Func | Interface | Impl | Namespace | For | Loop | If | Else | Match
-		| Continue | Break | Return | Echo | This | In | As | Is | Async | Await | True | False => {
-			KEYWORD
-		}
+		| Continue | Break | Echo | This | In | As | Is | Async | Await | True | False => KEYWORD,
 		IntType | UIntType | FloatType | BooleanType | CharType | StringType | VoidType | NeverType
 		| SelfType => TYPE,
 
@@ -1052,7 +1050,7 @@ fn walk_expr(expr: &Expr, map: &mut RoleMap) {
 			walk_type(rhs, map);
 		}
 		ExprKind::PatternOp { lhs, .. } => walk_expr(lhs, map),
-		ExprKind::Return { value, .. } | ExprKind::Break { value, .. } => {
+		ExprKind::Break { value, .. } => {
 			if let Some(v) = value {
 				walk_expr(v, map);
 			}
@@ -1598,7 +1596,7 @@ fn walk_expr_uses(
 			walk_pattern_bindings(rhs, analysis, (VARIABLE, DECLARATION | READONLY), out);
 			walk_pattern_uses(rhs, analysis, variant_names, out);
 		}
-		ExprKind::Return { value, .. } | ExprKind::Break { value, .. } => {
+		ExprKind::Break { value, .. } => {
 			if let Some(v) = value {
 				walk_expr_uses(v, analysis, variant_names, decls, out);
 			}

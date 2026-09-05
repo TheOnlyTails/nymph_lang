@@ -75,7 +75,6 @@ fn can_left_bias_from(token: &Token) -> bool {
 			| Match
 			| Continue
 			| Break
-			| Return
 			| This
 			| Async
 			| Await

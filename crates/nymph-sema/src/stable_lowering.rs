@@ -2973,9 +2973,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			return true;
 		}
 		match &expr.kind {
-			StableExprKind::Return { .. }
-			| StableExprKind::Break { .. }
-			| StableExprKind::Continue { .. } => true,
+			StableExprKind::Break { .. } | StableExprKind::Continue { .. } => true,
 			StableExprKind::Grouped(value) => self.definitely_transfers(value),
 			StableExprKind::Block { body, .. } => body.iter().any(|statement| {
 				self.definitely_transfers(match statement {
@@ -3102,8 +3100,8 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 	}
 
 	/// Mark only calls whose result is the callable's result. Blocks, branches,
-	/// matches, and explicit callable returns preserve tail position; argument,
-	/// condition, and lexical-block-return expressions do not.
+	/// matches, and explicit callable exits preserve tail position; argument,
+	/// condition, and block-targeted exit expressions do not.
 	fn mark_tail_call(expr: &mut HirExpr) {
 		match expr {
 			HirExpr::ActivationCall { mode, .. }
@@ -3149,7 +3147,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 		target: u32,
 		expr: &StableExpr,
 	) -> Result<HirExpr, StableLoweringError> {
-		self.with_loop_target(source, target, || self.lower(expr))
+		self.with_loop_target(source, target, || match &expr.kind {
+			StableExprKind::Block { body, .. } => self.lower_block(body, true),
+			_ => self.lower(expr),
+		})
 	}
 	fn next_loop(&self) -> u32 {
 		let target = self.next_loop_target.get();
@@ -3171,6 +3172,33 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 			.map_or(nymph_hir::hir::HirReturnTarget::Callable, |(_, target)| {
 				nymph_hir::hir::HirReturnTarget::Block(*target)
 			})
+	}
+
+	fn lower_control_exit(
+		&self,
+		expr: &StableExpr,
+		value: Option<HirExpr>,
+	) -> Result<HirExpr, StableLoweringError> {
+		match self.annotations.control_target(self.id(expr)) {
+			Some(crate::runtime::RuntimeControlTarget::Loop(_)) => Ok(HirExpr::Break {
+				target: self.resolve_loop_target(expr, "break outside a target")?,
+				value: Box::new(value.unwrap_or(HirExpr::Array {
+					kind: HirArrayKind::Tuple,
+					items: vec![],
+				})),
+			}),
+			Some(
+				crate::runtime::RuntimeControlTarget::Block(_)
+				| crate::runtime::RuntimeControlTarget::Callable(_),
+			) => Ok(HirExpr::Block {
+				stmts: vec![HirStmt::Return {
+					value,
+					target: self.return_target(expr),
+				}],
+				tail: None,
+			}),
+			None => Err(self.unsupported(expr, "break outside a target")),
+		}
 	}
 	fn lower_propagation(
 		&self,
@@ -3289,13 +3317,7 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 							fields: failure_fields,
 						},
 						guard: None,
-						body: HirExpr::Block {
-							stmts: vec![HirStmt::Return {
-								value: Some(failure_return),
-								target: self.return_target(expr),
-							}],
-							tail: None,
-						},
+						body: self.lower_control_exit(expr, Some(failure_return))?,
 					},
 				],
 			})),
@@ -4127,21 +4149,17 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 					operand: Box::new(self.lower(value)?),
 				}
 			}
-			StableExprKind::Block { body, label } => {
-				if label.is_some() {
-					let target = self.next_block_target.get();
-					self.next_block_target.set(target + 1);
-					self.with_block_target(self.id(expr), target, || {
-						self
-							.lower_block(body, true)
-							.map(|body| HirExpr::LabeledBlock {
-								target,
-								body: Box::new(body),
-							})
-					})?
-				} else {
-					self.lower_block(body, true)?
-				}
+			StableExprKind::Block { body, .. } => {
+				let target = self.next_block_target.get();
+				self.next_block_target.set(target + 1);
+				self.with_block_target(self.id(expr), target, || {
+					self
+						.lower_block(body, true)
+						.map(|body| HirExpr::LabeledBlock {
+							target,
+							body: Box::new(body),
+						})
+				})?
 			}
 			StableExprKind::If {
 				condition,
@@ -4167,26 +4185,10 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 				})
 			})?,
 			StableExprKind::AsyncBlock(_) | StableExprKind::Await(_) => unreachable!(),
-			StableExprKind::Return { value, .. } => HirExpr::Block {
-				stmts: vec![HirStmt::Return {
-					value: value.as_ref().map(|value| self.lower(value)).transpose()?,
-					target: self.return_target(expr),
-				}],
-				tail: None,
-			},
-			StableExprKind::Break { value, .. } => HirExpr::Break {
-				target: self.resolve_loop_target(expr, "break outside a loop")?,
-				value: Box::new(
-					value
-						.as_ref()
-						.map(|value| self.lower(value))
-						.transpose()?
-						.unwrap_or(HirExpr::Array {
-							kind: HirArrayKind::Tuple,
-							items: vec![],
-						}),
-				),
-			},
+			StableExprKind::Break { value, .. } => self.lower_control_exit(
+				expr,
+				value.as_ref().map(|value| self.lower(value)).transpose()?,
+			)?,
 			StableExprKind::Continue { replacements, .. } => {
 				let target = self.resolve_loop_target(expr, "continue outside a loop")?;
 				if self.state_loop_targets.borrow().contains(&target) {
@@ -7089,8 +7091,14 @@ impl<C: StableLoweringContext> StableBodyLowerer<'_, C> {
 						cleanup,
 					});
 				}
-				StableStatement::Expr(expr) if matches!(expr.kind, StableExprKind::Return { .. }) => {
-					let StableExprKind::Return { value, .. } = &expr.kind else {
+				StableStatement::Expr(expr)
+					if matches!(expr.kind, StableExprKind::Break { .. })
+						&& !matches!(
+							self.annotations.control_target(expr.id),
+							Some(crate::runtime::RuntimeControlTarget::Loop(_))
+						) =>
+				{
+					let StableExprKind::Break { value, .. } = &expr.kind else {
 						unreachable!()
 					};
 					stmts.push(HirStmt::Return {

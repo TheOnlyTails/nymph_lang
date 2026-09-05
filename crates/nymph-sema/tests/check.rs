@@ -5,15 +5,15 @@ use nymph_sema::check_module;
 use nymph_syntax::parse_module;
 
 #[test]
-fn anonymous_closure_returns_are_checked_against_the_closure_result() {
+fn anonymous_closure_breaks_are_checked_against_the_closure_result() {
 	let parsed = parse_module(
-		"func value(): int = { let closure: (int) -> boolean = { if ($0 > 0) { return 1 } true }\nif (closure(1)) 1 else 0 }",
+		"func value(): int = { let closure: (int) -> boolean = { if ($0 > 0) break 1 else true }\nif (closure(1)) 1 else 0 }",
 		"test",
 	);
 	let checked = check_module(&parsed.tree);
 	assert!(
 		!checked.diags.is_empty(),
-		"a return from the anonymous closure was checked against the enclosing function"
+		"a break from the anonymous closure was checked against the enclosing function"
 	);
 }
 
@@ -334,31 +334,31 @@ fn return_type_mismatch_spans_the_whole_call_expression() {
 }
 
 #[test]
-fn closure_return_is_checked_against_the_closure_not_the_outer_function() {
+fn closure_break_is_checked_against_the_closure_not_the_outer_function() {
 	assert_error_contains(
-		"func f(): int = { let g: (boolean) -> boolean = (b: boolean) -> { if (b) { return 1 } true } 1 }",
+		"func f(): int = { let g: (boolean) -> boolean = (b: boolean) -> { if (b) break 1 else true } 1 }",
 		"mismatched types",
 	);
 }
 
 #[test]
-fn nested_closure_return_contexts_restore_to_the_nearest_callable() {
+fn nested_closure_break_contexts_restore_to_the_nearest_callable() {
 	assert_ok(
-		"func f(): int = { let outer: (boolean) -> string = (b: boolean) -> { let inner: () -> boolean = () -> { return true } if (b) { return \"outer\" } \"tail\" } return 7 }",
+		"func f(): int = { let outer: (boolean) -> string = (b: boolean) -> { let inner: () -> boolean = () -> break true if (b) break \"outer\" else \"tail\" } break 7 }",
 	);
 }
 
 #[test]
-fn return_typechecks_in_general_expression_positions_and_callable_kinds() {
+fn break_typechecks_in_general_expression_positions_and_callable_kinds() {
 	assert_ok(
 		r#"
 		func id(value: int): int = value
-		func positions(flag: boolean): int = id(1 + if (flag) return 2 else #[3][0u])
+		func positions(flag: boolean): int = id(1 + if (flag) break 2 else #[3][0u])
 		struct Value(value: int) {
-			func get(flag: boolean): int = this.value + if (flag) return 4 else 1
+			func get(flag: boolean): int = this.value + if (flag) break 4 else 1
 		}
 		interface DefaultValue {
-			func default_value(flag: boolean): int = 1 + if (flag) return 5 else 2
+			func default_value(flag: boolean): int = 1 + if (flag) break 5 else 2
 		}
 		impl DefaultValue for Value {}
 		"#,

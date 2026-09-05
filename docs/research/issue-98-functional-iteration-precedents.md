@@ -257,11 +257,11 @@ These constrain the issue; they intentionally do not select a final HIR or ABI.
    short-circuit points, result/error shape, and whether abandoned successor state requires cleanup.
 6. **Model early completion once.** Guards/filter are `continue`-like; `take`, short-circuit predicates,
    `reduced`, `try_fold`, base cases, and typed handler exits are `break`-like. Nymph's `for`, `?`,
-   return, panic, and cancellation should converge on explicit completion forms rather than ad-hoc
+   `break`, panic, and cancellation should converge on explicit completion forms rather than ad-hoc
    adapter flags, so the same completion can trigger settled reverse lexical cleanup.
 7. **Cleanup cannot be copied from ordinary collection libraries.** Haskell `bracket`, OCaml
    `Fun.protect`, Scala `finally`, and Koka resumption finalization cover different unwind sets. None
-   alone covers Nymph's settled normal/`?`/return/panic/cancellation cleanup, suppressed defects,
+   alone covers Nymph's settled normal/`?`/`break`/panic/cancellation cleanup, suppressed defects,
    child cancellation, and join-after-cleanup. Iterator lowering must preserve the structured cleanup
    continuation rather than treating early exhaustion as an unobservable branch.
 8. **Private mutation is an optimization, not an ABI.** Scala demonstrates the observable aliasing

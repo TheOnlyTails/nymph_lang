@@ -245,16 +245,16 @@ fn literal_spelling_and_import_order_are_byte_stable() {
 
 #[test]
 fn block_elision_preserves_control_flow_precedence_and_dangling_else_binding() {
-	let source = "func g(): int = { return@g 1 } + 2\n\
-		func call(): int = ({return@call 1})(2)\n\
+	let source = "func g(): int = { break@g 1 } + 2\n\
+		func call(): int = ({break@call 1})(2)\n\
 		func branch(a: bool, b: bool): int = if (a) {if (b) 1} else 2\n\
 		func nested(a: bool, b: bool, c: bool): int = if (a) {if (b) 1 else if (c) 2} else 3\n\
 		func safe(a: bool): int = if(a){break@safe 1}else{2}\n";
 	let expected = "func g(): int = {\n\
-		\treturn@g 1\n\
+		\tbreak@g 1\n\
 		} + 2\n\
 		func call(): int = ({\n\
-		\treturn@call 1\n\
+		\tbreak@call 1\n\
 		})(2)\n\
 		func branch(a: bool, b: bool): int = if (a) {\n\
 		\tif (b) 1\n\

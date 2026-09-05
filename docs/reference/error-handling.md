@@ -11,10 +11,10 @@ There is no `throw` or `try`/`catch`. A failure is an ordinary value, handled wi
 
 ## Propagation with `?`
 
-Postfix `?` extracts the success value and completes the nearest callable early on
-failure. For `Option<T>`, `Some(value)` produces `value` and `None` returns `None`.
-For `Result<T, E>`, `Ok(value)` produces `value` and `Error(error)` returns that same
-error. The target must return the same family, and `Result` error types must match
+Postfix `?` extracts the success value and completes the nearest explicit block, loop body, or
+callable early on failure. For `Option<T>`, `Some(value)` produces `value` and `None` completes the
+target with `None`. For `Result<T, E>`, `Ok(value)` produces `value` and `Error(error)` completes the
+target with that same error. The target must produce the same family, and `Result` error types must match
 exactly; the success types may differ.
 
 ```nym
@@ -32,9 +32,9 @@ func validate(code: Result<int, string>): Result<boolean, string> = {
 ```
 
 Propagation never converts between `Option` and `Result`; use `.ok()`, `.err()`, or
-`.ok_or(error)` explicitly. Like `return`, `?` cannot cross a callable boundary.
-It can target a labeled block or callable with `value?@label`, following the same
-lexical label rules as `return@label`:
+`.ok_or(error)` explicitly. Like `break`, `?` cannot cross a callable boundary.
+It can target a labeled block, loop, or callable with `value?@label`, following the same
+lexical label rules as `break@label`:
 
 ```nym
 func label_example(value: Option<int>): Option<string> = target@{

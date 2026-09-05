@@ -20,6 +20,8 @@ fn question_propagation_checks_family_target_and_result_error() {
 		"func option(o: Option<int>): Option<string> = { let value = o? Some(\"${value}\") }",
 		"func result(r: Result<int, string>): Result<boolean, string> = { let value = r? Ok(value > 0) }",
 		"func labeled(o: Option<int>): Option<string> = target@{ let value = o?@target Some(\"${value}\") }",
+		"func block(o: Option<int>): Option<int> = { let value: Option<int> = { let inner = o? Some(inner) } value }",
+		"func loop_target(o: Option<int>): Option<Option<int>> = for (_ in #[#()]) { o? }",
 	] {
 		let found = messages(source);
 		assert!(found.is_empty(), "{source}: {found:?}");
@@ -50,6 +52,25 @@ fn question_propagation_checks_family_target_and_result_error() {
 }
 
 #[test]
+fn every_explicit_block_is_a_break_target() {
+	for source in [
+		"func direct(): int = { break 1 2 }",
+		"func nested(): int = { let value = { break 1 2 } value }",
+		"func branch(flag: boolean): int = if (flag) { break 1 2 } else { 3 }",
+		"func expression_body(): int = break 1",
+	] {
+		let found = messages(source);
+		assert!(found.is_empty(), "{source}: {found:?}");
+	}
+}
+
+#[test]
+fn return_is_an_ordinary_identifier() {
+	let found = messages("func value(): int = { let return = 1 return }");
+	assert!(found.is_empty(), "{found:?}");
+}
+
+#[test]
 fn question_labels_do_not_cross_callable_boundaries() {
 	let found = messages(
 		"func outer(o: Option<int>): Option<int> = target@{ let inner = () -> { o?@target Some(1) } inner() }",
@@ -76,30 +97,39 @@ fn question_labels_do_not_cross_callable_boundaries() {
 	assert!(
 		found
 			.iter()
-			.any(|message| message.contains("inside a callable")),
+			.any(|message| message.contains("enclosing block, loop, or callable")),
 		"{found:?}"
 	);
 }
 
 #[test]
-fn jumps_require_a_lexically_enclosing_loop() {
-	for (source, keyword) in [
-		("func f(): void = { break }", "break"),
-		("func f(): void = { continue }", "continue"),
-	] {
-		let found = messages(source);
-		assert!(
-			found.iter().any(|message| message.contains(keyword)),
-			"{found:?}"
-		);
-	}
+fn jumps_require_a_lexically_enclosing_target() {
+	let source = "let invalid = break 1";
+	let parsed = parse_module(source, "test");
+	let found = check_module(&parsed.tree)
+		.diags
+		.into_iter()
+		.map(|diagnostic| diagnostic.message.to_string())
+		.collect::<Vec<_>>();
+	assert!(
+		found.iter().any(|message| message.contains("break")),
+		"{found:?}"
+	);
+
+	let found = messages("func f(): void = { continue }");
+	assert!(
+		found.iter().any(|message| message.contains("continue")),
+		"{found:?}"
+	);
 }
 
 #[test]
 fn callable_is_a_loop_control_boundary() {
-	let found = messages("func f(): void = for (_ in #[#()]) { let g = () -> break }");
+	let found = messages("func f(): void = for@outer (_ in #[#()]) { let g = () -> break@outer }");
 	assert!(
-		found.iter().any(|message| message.contains("break")),
+		found
+			.iter()
+			.any(|message| message.contains("unknown control label `outer`")),
 		"{found:?}"
 	);
 }
@@ -112,14 +142,8 @@ fn labels_resolve_by_kind_and_do_not_cross_callables() {
 		)
 		.is_empty()
 	);
-	assert!(
-		messages("func f(): void = outer@{ break@outer }")
-			.iter()
-			.any(|m| m.contains("wrong kind"))
-	);
 	for source in [
 		"func f(): void = outer@{ continue@outer }",
-		"func f(): void = { break@f }",
 		"func f(): void = { continue@f }",
 	] {
 		assert!(
@@ -128,16 +152,12 @@ fn labels_resolve_by_kind_and_do_not_cross_callables() {
 		);
 	}
 	assert!(
-		messages("func f(): void = for@outer (_ in #[#()]) { return@outer }")
-			.iter()
-			.any(|m| m.contains("wrong kind"))
-	);
-	assert!(
 		messages("func f(): void = for@outer (_ in #[#()]) { let g = () -> break@outer }")
 			.iter()
 			.any(|m| m.contains("unknown"))
 	);
-	assert!(messages("func f(): int = { return@f 3 }").is_empty());
+	assert!(messages("func f(): int = { break@f 3 }").is_empty());
+	assert!(messages("func f(): void = outer@{ break@outer }").is_empty());
 }
 
 #[test]
@@ -179,7 +199,7 @@ fn state_loops_check_named_replacements_against_the_old_state_contract() {
 
 #[test]
 fn duplicate_active_labels_are_ambiguous_but_names_can_repeat_across_callables() {
-	let source = "func f(): int = outer@{ for@outer (_ in #[#()]) { return@outer 1 } 2 }";
+	let source = "func f(): int = outer@{ for@outer (_ in #[#()]) { break@outer 1 } 2 }";
 	let parsed = parse_module(source, "test");
 	assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
 	let checked = check_module(&parsed.tree);
@@ -202,7 +222,7 @@ fn duplicate_active_labels_are_ambiguous_but_names_can_repeat_across_callables()
 fn anonymous_closures_do_not_capture_outer_control_labels() {
 	for source in [
 		"func f(): void = for@outer (_ in #[#()]) { let g: (boolean) -> boolean = { if ($) { break@outer } true } break }",
-		"func f(): int = { let g: (boolean) -> boolean = { if ($) { return@f 1 } true } 0 }",
+		"func f(): int = { let g: (boolean) -> boolean = { if ($) { break@f 1 } true } 0 }",
 	] {
 		let found = messages(source);
 		assert!(
@@ -221,10 +241,10 @@ fn anonymous_closures_do_not_capture_outer_control_labels() {
 #[test]
 fn named_method_forms_install_callable_labels() {
 	for source in [
-		"struct S { func inherent(): int = { return@inherent 1 } }",
-		"struct S {} impl S { namespace func make(): int = { return@make 1 } func change(): int = { return@change 2 } }",
-		"interface I { func defaulted(): int = { return@defaulted 1 } } struct S {} impl I for S {}",
-		"interface I { func value(): int } struct S {} impl I for S { func value(): int = { return@value 1 } }",
+		"struct S { func inherent(): int = { break@inherent 1 } }",
+		"struct S {} impl S { namespace func make(): int = { break@make 1 } func change(): int = { break@change 2 } }",
+		"interface I { func defaulted(): int = { break@defaulted 1 } } struct S {} impl I for S {}",
+		"interface I { func value(): int } struct S {} impl I for S { func value(): int = { break@value 1 } }",
 	] {
 		let found = messages(source);
 		assert!(found.is_empty(), "{source}: {found:?}");
@@ -232,22 +252,22 @@ fn named_method_forms_install_callable_labels() {
 }
 
 #[test]
-fn labeled_block_returns_unify_with_the_tail() {
+fn block_breaks_unify_with_the_tail() {
 	assert!(
-		messages("func f(flag: boolean): int = result@{ if (flag) { return@result 1 } 2 }").is_empty()
+		messages("func f(flag: boolean): int = result@{ if (flag) { break@result 1 } 2 }").is_empty()
 	);
 	assert!(
-		messages("func f(): int = result@{ if (true) { return@result true } 2 }")
+		messages("func f(): int = result@{ if (true) { break@result true } 2 }")
 			.iter()
 			.any(|m| m.contains("type"))
 	);
 }
 
 #[test]
-fn bare_returns_unify_void_with_the_target_result() {
+fn bare_breaks_unify_void_with_the_target_result() {
 	for source in [
-		"func f(): int = { return }",
-		"func f(): int = value@{ return@value }",
+		"func f(): int = { break }",
+		"func f(): int = value@{ break@value }",
 	] {
 		let found = messages(source);
 		assert!(
@@ -261,8 +281,9 @@ fn bare_returns_unify_void_with_the_target_result() {
 
 #[test]
 fn one_loop_cannot_mix_bare_and_valued_breaks() {
-	let found =
-		messages("func f(flag: boolean) = for (_ in #[#()]) { if (flag) { break } else { break 1 } }");
+	let found = messages(
+		"func f(flag: boolean) = for@items (_ in #[#()]) { if (flag) { break@items } else { break@items 1 } }",
+	);
 	assert!(
 		found.iter().any(|message| message.contains("cannot mix")),
 		"{found:?}"
@@ -323,7 +344,7 @@ fn loop_headers_preserve_outer_targets_without_adding_the_new_loop() {
 #[test]
 fn valued_breaks_must_unify() {
 	let found = messages(
-		"func f(flag: boolean) = for (_ in #[#()]) { if (flag) { break 1 } else { break true } }",
+		"func f(flag: boolean) = for@items (_ in #[#()]) { if (flag) { break@items 1 } else { break@items true } }",
 	);
 	assert!(
 		found.iter().any(|message| message.contains("mismatched")),

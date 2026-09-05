@@ -191,11 +191,10 @@ func demo(): int = {
 }
 ```
 
-`return` exits the nearest enclosing callable. Inside an explicit closure it therefore exits that
-closure, and its value must match the closure's return type; it does not return from the function
-that created the closure. It can occur in any grammar-valid expression position. Compiler-generated
-helpers used to evaluate expression-valued control flow are transparent: they neither capture nor
-retarget a source `return`.
+`break` exits the nearest enclosing explicit block, loop body, or callable. A callable body block and
+its callable are one target, while an expression-bodied closure is itself a target. Control inside a
+closure therefore cannot break from the function that created it. Compiler-generated helpers used to
+evaluate expression-valued control flow are transparent and do not retarget a source `break`.
 
 ## Anonymous closure parameters
 
@@ -228,7 +227,7 @@ the resulting closure type-checks in its position. That's why `$ % 2 == 0` above
 becomes the whole predicate `(x) -> x % 2 == 0` rather than `((x) -> x % 2) == 0`:
 only the wider reading is a `(int) -> boolean`, which is what `filter` wants. The
 search runs at each spot a closure is expected — a call argument, a `let`
-initializer, a `return` operand, a constructor field — and can't cross out past that
+initializer, a `break` operand, a constructor field — and can't cross out past that
 spot, so a `$` always resolves to the nearest such boundary.
 
 ## Pipe
@@ -306,24 +305,24 @@ impl Unwrap<Output = int> for MaybeInt {
 func get(m: MaybeInt, d: int): int = m ?? d
 ```
 
-## `return`, `break`, `continue`
+## `break` and `continue`
 
-All three are expressions typed [`never`](./types#basic-types) — the type of an expression that
+Both are expressions typed [`never`](./types#basic-types) — the type of an expression that
 never produces a value because control leaves right there — so they can appear anywhere a value of
 any type is expected, including as an operand.
 
 ```nym
 func classify(n: int): string = {
-  if (n < 0) { return "negative" }
-  if (n == 0) { return "zero" }
+  if (n < 0) { break@classify "negative" }
+  if (n == 0) { break@classify "zero" }
   "positive"
 }
 ```
 
 ```nym
 func first_positive(xs: #[int]): int = {
-  let found = for (i in 0u..xs.length()) {
-    if (xs[i as int] > 0) { break i }
+  let found = for@search (i in 0u..xs.length()) {
+    if (xs[i as int] > 0) { break@search i }
   }
   match (found) {
     Some(value) -> value as int,
@@ -332,20 +331,27 @@ func first_positive(xs: #[int]): int = {
 }
 ```
 
-`break` and `continue` target the innermost lexically enclosing `loop` or `for` loop. Label a loop
-as `loop@outer (...)` or `for@outer (...)`, then target it as `break@outer value` or
-`continue@outer`. A block is labeled `outer@{ ... }`; `return@outer value` completes that block,
-and all such returns unify with its direct tail value. A callable body is a boundary: control can
-never target a construct outside the current callable. Unlabeled return still targets the nearest
-callable.
+Every explicit `{ ... }` block is a `break` target. An unlabeled `break` completes the innermost
+explicit block, loop body, or callable; a loop body and its block are the same target. The break
+values and the target's final expression must have one type. A bare `break` explicitly completes the
+target with `void`, and cannot be mixed with a value or final expression of another type.
 
-Postfix `?` uses the same targets: unlabelled `value?` propagates `None` or `Error` to the nearest
-callable, while `value?@label` may complete a labeled block or callable. See
+Label a loop as `loop@outer (...)` or `for@outer (...)`, a block as `outer@{ ... }`, or a closure as
+`outer@(params) -> body`, then target it with `break@outer value`. A named function's callable label
+is its name. `continue` targets loops only. A callable is a hard lexical boundary: neither form can
+target a construct outside the current callable. `if` itself is not a target, though its explicit
+branch blocks are.
+
+Postfix `?` uses exactly the same targets: unlabelled `value?` propagates `None` or `Error` to the
+innermost target, while `value?@label` completes a labeled block, loop, or callable. See
 [Error handling](./error-handling#propagation-with) for its `Option` and `Result` type rules.
 
 A loop with no targeting `break` has type `void`. If it contains bare `break`, its result is
 `Option<#()>` (`Some(#())` on the early exit and `None` on natural exhaustion). If every targeting
 break supplies a value of type `T`, the result is `Option<T>` instead. Bare and valued breaks may
 not be mixed in one loop, and all valued breaks must agree on `T`. This is determined by a lexical
-scan of the whole loop body, including unreachable branches; breaks in nested loops or callable
-bodies are deliberately excluded.
+scan of the whole loop body, including unreachable branches; unlabeled breaks in nested explicit
+blocks and all breaks in nested callables are excluded. A labeled break from a nested block can still
+target the loop.
+
+`return` is not a keyword; it is available as an ordinary identifier.

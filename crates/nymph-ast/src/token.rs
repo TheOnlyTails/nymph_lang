@@ -61,7 +61,6 @@ pub enum Token {
 	Match,
 	Continue,
 	Break,
-	Return,
 	Echo,
 	This,
 	/// `in` — used both as a binary operator and in `for` loops.
@@ -238,7 +237,6 @@ impl Token {
 			Match => "`match`",
 			Continue => "`continue`",
 			Break => "`break`",
-			Return => "`return`",
 			Echo => "`echo`",
 			This => "`this`",
 			In => "`in`",

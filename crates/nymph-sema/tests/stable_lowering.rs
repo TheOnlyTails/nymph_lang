@@ -332,9 +332,9 @@ fn stable_lowering_preserves_state_loops_and_simultaneous_transitions() {
 }
 
 #[test]
-fn stable_lowering_preserves_resolved_labeled_block_returns() {
+fn stable_lowering_preserves_resolved_labeled_block_breaks() {
 	let lowered = lower_named(
-		"func choose(flag: boolean): int = result@{ if (flag) { return@choose 1 } return@result 7 }",
+		"func choose(flag: boolean): int = result@{ if (flag) { break@choose 1 } break@result 7 }",
 		"choose",
 	);
 	let nymph_sema::LoweredHirFragment::TopLevelFunction(function) = lowered.fragment() else {
@@ -348,10 +348,12 @@ fn stable_lowering_preserves_resolved_labeled_block_returns() {
 					target: nymph_hir::hir::HirReturnTarget::Block(return_target), ..
 				}) if return_target == target)
 					&& matches!(stmts.first(), Some(nymph_hir::hir::HirStmt::Expr(nymph_hir::hir::HirExpr::If { then, .. }))
-						if matches!(then.as_ref(), nymph_hir::hir::HirExpr::Block { stmts, .. }
-							if matches!(stmts.as_slice(), [nymph_hir::hir::HirStmt::Return {
-								target: nymph_hir::hir::HirReturnTarget::Callable, ..
-							}])
+						if matches!(then.as_ref(), nymph_hir::hir::HirExpr::LabeledBlock { body, .. }
+							if matches!(body.as_ref(), nymph_hir::hir::HirExpr::Block { stmts, .. }
+								if matches!(stmts.as_slice(), [nymph_hir::hir::HirStmt::Return {
+									target: nymph_hir::hir::HirReturnTarget::Callable, ..
+								}])
+							)
 						)
 					)
 			)
@@ -409,8 +411,8 @@ fn stable_lowering_preserves_contextual_integer_literal_kinds() {
 }
 
 #[test]
-fn stable_lowering_accepts_return_in_a_general_expression_position() {
-	let lowered = lower_named("func value(): int = 1 + return 9", "value");
+fn stable_lowering_accepts_break_in_a_general_expression_position() {
+	let lowered = lower_named("func value(): int = 1 + break 9", "value");
 	assert!(matches!(
 		lowered.fragment(),
 		nymph_sema::LoweredHirFragment::TopLevelFunction(nymph_hir::hir::HirFunc {
@@ -556,7 +558,10 @@ fn stable_pattern_operator_lowers_source_before_union_bindings() {
 	let nymph_hir::hir::HirExpr::Match { scrutinee, arms } = &function.body else {
 		panic!("expected pattern operator to lower to a match")
 	};
-	let nymph_hir::hir::HirExpr::Block { stmts, .. } = scrutinee.as_ref() else {
+	let nymph_hir::hir::HirExpr::LabeledBlock { body, .. } = scrutinee.as_ref() else {
+		panic!("expected labeled block scrutinee")
+	};
+	let nymph_hir::hir::HirExpr::Block { stmts, .. } = body.as_ref() else {
 		panic!("expected block scrutinee")
 	};
 	assert!(matches!(

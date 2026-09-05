@@ -265,7 +265,7 @@ fn collect_owned_ids(
 			visit!(lhs);
 			collect_pattern_ids(rhs, pattern_ids);
 		}
-		StableExprKind::Return { value, .. } | StableExprKind::Break { value, .. } => {
+		StableExprKind::Break { value, .. } => {
 			if let Some(value) = value {
 				visit!(value);
 			}

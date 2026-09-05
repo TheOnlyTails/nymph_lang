@@ -62,7 +62,6 @@ const KEYWORDS: &[&str] = &[
 	"as",
 	"is",
 	"in",
-	"return",
 	"break",
 	"continue",
 	"echo",

@@ -23,11 +23,11 @@ bindings for each iteration, and `continue(name = value)` replaces them simultan
 when the operation is naturally a reduction.
 
 ```nym
-func sum_to(limit: int): int = loop (
+func sum_to(limit: int): int = loop@sum (
   let next = 1
   let total = 0
 ) {
-  if (next > limit) { break total }
+  if (next > limit) { break@sum total }
   continue(next = next + 1, total = total + next)
 }
 ```

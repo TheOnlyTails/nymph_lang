@@ -209,7 +209,7 @@ not itself implement `Close`; recursive containers are not inspected and intenti
 suppress the warning.
 
 `close(): void + !E` is synchronous, non-fallible, and idempotent. The runtime invokes it on normal
-scope completion, `?`, return, panic, and cancellation, in reverse declaration order. Fallible or
+scope completion, `break`, `?`, panic, and cancellation, in reverse declaration order. Fallible or
 suspending finalization is an explicit operation such as `finish(): Result<...>`.
 
 A functional state loop may carry a `let use` binding across iterations. An omitted binding remains

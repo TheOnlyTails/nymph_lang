@@ -171,6 +171,7 @@ impl<'m> Checker<'m> {
 		&mut self,
 		label: Option<&nymph_ast::Ident>,
 		id: NodeId,
+		body: NodeId,
 		kind: ControlLabelKind,
 		loop_index: Option<usize>,
 		result_ty: Option<Ty>,
@@ -193,6 +194,7 @@ impl<'m> Checker<'m> {
 		self.control_labels.push(ControlLabel {
 			name: label.map(|label| label.0.clone()),
 			id,
+			body,
 			span: label.map_or(Span::new(0, 0), |label| label.1),
 			kind,
 			loop_index,
@@ -229,10 +231,7 @@ impl<'m> Checker<'m> {
 				.control_labels
 				.iter()
 				.rev()
-				.find(|target| {
-					allowed.contains(&target.kind)
-						&& (!matches!(keyword, "return" | "?") || target.kind == ControlLabelKind::Callable)
-				})
+				.find(|target| allowed.contains(&target.kind))
 				.cloned()
 		};
 		let target = target?;
@@ -274,6 +273,7 @@ impl<'m> Checker<'m> {
 		let outer_labels = std::mem::take(&mut self.control_labels);
 		self.push_control_label(
 			Some(name),
+			body.id,
 			body.id,
 			ControlLabelKind::Callable,
 			None,
@@ -504,9 +504,18 @@ impl<'m> Checker<'m> {
 				self.subtype(got, expected, expr.span);
 			}
 			ExprKind::Block { body, label } => {
-				if label.is_some() {
+				let owns_active_target = label.is_none()
+					&& self.control_labels.last().is_some_and(|target| {
+						target.body == expr.id
+							&& matches!(
+								target.kind,
+								ControlLabelKind::Loop | ControlLabelKind::Callable
+							)
+					});
+				if !owns_active_target {
 					self.push_control_label(
 						label.as_ref(),
+						expr.id,
 						expr.id,
 						ControlLabelKind::Block,
 						None,
@@ -514,7 +523,7 @@ impl<'m> Checker<'m> {
 					);
 				}
 				let ty = self.infer_block(body, Some(expected));
-				if label.is_some() {
+				if !owns_active_target {
 					self.control_labels.pop();
 				}
 				self.subtype(ty, expected, expr.span);
@@ -1150,12 +1159,15 @@ impl<'m> Checker<'m> {
 					expr,
 					label.as_ref(),
 					"?",
-					&[ControlLabelKind::Block, ControlLabelKind::Callable],
+					&[
+						ControlLabelKind::Loop,
+						ControlLabelKind::Block,
+						ControlLabelKind::Callable,
+					],
 				);
 				if target.is_none() && label.is_none() {
-					self.emit(expr.span, TypeError::QuestionOutsideCallable);
+					self.emit(expr.span, TypeError::QuestionOutsideTarget);
 				}
-				let target_ty = target.and_then(|target| target.result_ty).or(self.ret_ty);
 				let TyKind::Adt(definition, arguments) = self.interner.kind(operand).clone() else {
 					if !matches!(self.interner.kind(operand), TyKind::Error | TyKind::Never) {
 						let found = self.display(operand);
@@ -1197,6 +1209,24 @@ impl<'m> Checker<'m> {
 					self.emit(expr.span, TypeError::QuestionOperand { found });
 					return self.interner.error();
 				};
+				let target_ty = target.as_ref().and_then(|target| match target.kind {
+					ControlLabelKind::Loop => {
+						let loop_index = target.loop_index.expect("loop target has contract");
+						let previous = self.loop_controls[loop_index];
+						match previous {
+							LoopBreakKind::None => {
+								self.loop_controls[loop_index] = LoopBreakKind::Valued(expected_target);
+								Some(expected_target)
+							}
+							LoopBreakKind::Bare => {
+								self.emit(expr.span, TypeError::MixedBreakForms);
+								None
+							}
+							LoopBreakKind::Valued(target_ty) => Some(target_ty),
+						}
+					}
+					ControlLabelKind::Block | ControlLabelKind::Callable => target.result_ty.or(self.ret_ty),
+				});
 				let mut conversion = None;
 				if let Some(target_ty) = target_ty {
 					let resolved = self.shallow_resolve(target_ty);
@@ -1259,44 +1289,38 @@ impl<'m> Checker<'m> {
 				self.pop_scope();
 				self.interner.boolean()
 			}
-			ExprKind::Return { value, label } => {
-				let target = self.resolve_control(
+			ExprKind::Break { value, label } => {
+				let Some(target) = self.resolve_control(
 					expr,
 					label.as_ref(),
-					"return",
-					&[ControlLabelKind::Block, ControlLabelKind::Callable],
-				);
-				let ret = target.and_then(|target| target.result_ty).or(self.ret_ty);
-				if let Some(v) = value {
-					match ret {
-						Some(rt) => {
-							self.resolve_anon(v, Some(rt));
-							self.check(v, rt);
-						}
-						None => {
-							self.resolve_anon(v, None);
-							self.infer(v);
-						}
-					}
-				} else if let Some(ret) = ret {
-					let void = self.interner.void();
-					self.unify(void, ret, expr.span);
-				}
-				self.interner.never()
-			}
-			ExprKind::Break { value, label } => {
-				let found = value.as_ref().map(|v| self.infer(v));
-				let Some(target) =
-					self.resolve_control(expr, label.as_ref(), "break", &[ControlLabelKind::Loop])
-				else {
+					"break",
+					&[
+						ControlLabelKind::Loop,
+						ControlLabelKind::Block,
+						ControlLabelKind::Callable,
+					],
+				) else {
 					if label.is_none() {
-						self.emit(
-							expr.span,
-							TypeError::LoopControlOutsideLoop { keyword: "break" },
-						);
+						self.emit(expr.span, TypeError::BreakOutsideTarget);
 					}
 					return self.interner.never();
 				};
+				if !matches!(target.kind, ControlLabelKind::Loop) {
+					let result = target.result_ty.or(self.ret_ty);
+					if let Some(value) = value {
+						self.resolve_anon(value, result);
+						if let Some(result) = result {
+							self.check(value, result);
+						} else {
+							self.infer(value);
+						}
+					} else if let Some(result) = result {
+						let void = self.interner.void();
+						self.unify(void, result, expr.span);
+					}
+					return self.interner.never();
+				}
+				let found = value.as_ref().map(|value| self.infer(value));
 				let loop_index = target.loop_index.expect("loop target has contract");
 				let previous = self.loop_controls[loop_index];
 				match (previous, found) {
@@ -1395,6 +1419,7 @@ impl<'m> Checker<'m> {
 				self.push_control_label(
 					label.as_ref(),
 					expr.id,
+					body.id,
 					ControlLabelKind::Loop,
 					Some(self.loop_controls.len() - 1),
 					None,
@@ -1442,6 +1467,7 @@ impl<'m> Checker<'m> {
 				self.push_control_label(
 					label.as_ref(),
 					expr.id,
+					body.id,
 					ControlLabelKind::Loop,
 					Some(self.loop_controls.len() - 1),
 					None,
@@ -1505,12 +1531,27 @@ impl<'m> Checker<'m> {
 				}
 			}
 			ExprKind::Block { body, label } => {
-				if label.is_none() {
-					self.infer_block(body, None)
+				let owns_active_target = label.is_none()
+					&& self.control_labels.last().is_some_and(|target| {
+						target.body == expr.id
+							&& matches!(
+								target.kind,
+								ControlLabelKind::Loop | ControlLabelKind::Callable
+							)
+					});
+				if owns_active_target {
+					self.infer_block(
+						body,
+						self
+							.control_labels
+							.last()
+							.and_then(|target| target.result_ty),
+					)
 				} else {
 					let result = self.fresh();
 					self.push_control_label(
 						label.as_ref(),
+						expr.id,
 						expr.id,
 						ControlLabelKind::Block,
 						None,
@@ -3571,6 +3612,7 @@ impl<'m> Checker<'m> {
 		self.push_control_label(
 			label.as_ref(),
 			expr.id,
+			body.id,
 			ControlLabelKind::Callable,
 			None,
 			Some(closure_ret),
@@ -3623,6 +3665,7 @@ impl<'m> Checker<'m> {
 		self.push_control_label(
 			label.as_ref(),
 			expr.id,
+			body.id,
 			ControlLabelKind::Callable,
 			None,
 			exp_ret,
@@ -5320,7 +5363,7 @@ impl Checker<'_> {
 		fn walk(
 			checker: &Checker<'_>,
 			expr: &Expr,
-			target: (Option<&nymph_ast::Ident>, bool),
+			target: (Option<&nymph_ast::Ident>, bool, NodeId),
 		) -> Option<bool> {
 			if checker.annotations.anon_boundary_arity(expr.id).is_some() {
 				return None;
@@ -5361,7 +5404,7 @@ impl Checker<'_> {
 					{
 						None
 					} else {
-						walk(checker, body, (target.0, false))
+						walk(checker, body, (target.0, false, target.2))
 					},
 				),
 				ExprKind::String(parts) => many(
@@ -5406,17 +5449,25 @@ impl Checker<'_> {
 				ExprKind::IndexAccess { parent, index, .. } => {
 					merge(walk(checker, parent, target), walk(checker, index, target))
 				}
+				ExprKind::PostfixOp { value, label, .. } => {
+					let nested = walk(checker, value, target);
+					if match (label, target.0) {
+						(None, _) => target.1,
+						(Some(a), Some(b)) => a.0 == b.0,
+						_ => false,
+					} {
+						merge(Some(true), nested)
+					} else {
+						nested
+					}
+				}
 				ExprKind::PrefixOp { value, .. }
-				| ExprKind::PostfixOp { value, .. }
 				| ExprKind::Grouped(value)
 				| ExprKind::TypeOp { lhs: value, .. }
 				| ExprKind::PatternOp { lhs: value, .. } => walk(checker, value, target),
 				ExprKind::BinaryOp { lhs, rhs, .. } => {
 					merge(walk(checker, lhs, target), walk(checker, rhs, target))
 				}
-				ExprKind::Return { value, .. } => value
-					.as_deref()
-					.and_then(|value| walk(checker, value, target)),
 				ExprKind::If {
 					condition,
 					then,
@@ -5446,17 +5497,20 @@ impl Checker<'_> {
 							)
 						})
 				}
-				ExprKind::Block { body, .. } => body.iter().fold(None, |found, statement| {
-					let expr = match &statement.0 {
-						Statement::Expr(expr) => expr,
-						Statement::Let { value, .. } => value,
-					};
-					merge(found, walk(checker, expr, target))
-				}),
+				ExprKind::Block { body, .. } => {
+					let nested_target = (target.0, target.1 && expr.id == target.2, target.2);
+					body.iter().fold(None, |found, statement| {
+						let expr = match &statement.0 {
+							Statement::Expr(expr) => expr,
+							Statement::Let { value, .. } => value,
+						};
+						merge(found, walk(checker, expr, nested_target))
+					})
+				}
 				_ => None,
 			}
 		}
-		walk(self, expr, (target_label, true))
+		walk(self, expr, (target_label, true, expr.id))
 	}
 }
 

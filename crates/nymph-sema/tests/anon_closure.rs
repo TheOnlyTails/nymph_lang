@@ -137,11 +137,11 @@ fn a_let_initializer_is_a_closure_slot() {
 }
 
 #[test]
-fn a_return_operand_is_a_closure_slot() {
+fn a_break_operand_is_a_closure_slot() {
 	assert_ok(
 		"func apply(cb: (int) -> int, x: int): int = cb(x)
 		 func mk(): (int) -> int = {
-		 	return $0 + 1
+			break $0 + 1
 		 }
 		 func g(): int = apply(mk(), 5)",
 	);

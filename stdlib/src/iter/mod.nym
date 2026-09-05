@@ -110,16 +110,19 @@ struct Filtered<Item, S: Iterator<Item + !E>, !E, !F>(
   predicate: (Item) -> boolean + !F,
 ) {
   impl Iterator<Item + !E + !F> {
-    func next(): Iteration<Item, self> + !E + !F = loop (let source = this.source) {
+    func next(): Iteration<Item, self> + !E + !F = loop@filtered (let source = this.source) {
       match (source.next()) {
         Yield(item, next) -> {
           let predicate = this.predicate
           if (predicate(item)) {
-            break Iteration.Yield(item = item, next = Filtered(source = next, predicate = predicate))
+            break@filtered Iteration.Yield(
+              item = item,
+              next = Filtered(source = next, predicate = predicate),
+            )
           }
           continue(source = next)
         },
-        Done -> break Iteration.Done,
+        Done -> break@filtered Iteration.Done,
       }
     }
   }
@@ -148,17 +151,17 @@ impl<Item, S: ExactSizeIterator<Item + !E>, !E> ExactSizeIterator<Item + !E>
 
 struct Drop<Item, S: Iterator<Item + !E>, !E>(source: S, remaining: uint) {
   impl Iterator<Item + !E> {
-    func next(): Iteration<Item, self> + !E = loop (
+    func next(): Iteration<Item, self> + !E = loop@drop (
       let source = this.source,
       let remaining = this.remaining,
     ) {
       match (source.next()) {
         Yield(item, next) -> if (remaining == 0u) {
-          break Iteration.Yield(item = item, next = Drop(source = next, remaining = 0u))
+          break@drop Iteration.Yield(item = item, next = Drop(source = next, remaining = 0u))
         } else {
           continue(source = next, remaining = remaining - 1u)
         },
-        Done -> break Iteration.Done,
+        Done -> break@drop Iteration.Done,
       }
     }
   }

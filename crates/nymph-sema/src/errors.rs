@@ -401,7 +401,8 @@ pub enum TypeError {
 		family: &'static str,
 		found: String,
 	},
-	QuestionOutsideCallable,
+	QuestionOutsideTarget,
+	BreakOutsideTarget,
 	/// `.await` was used without an enclosing async function or block.
 	AwaitOutsideAsync,
 	/// `.await` was applied to a value that is not a task or execution handle.
@@ -538,9 +539,10 @@ impl IntoDiagnostic for TypeError {
 				"cannot propagate `{family}` into a target returning `{found}`"
 			)
 			.into(),
-			E::QuestionOutsideCallable => {
-				"unlabelled `?` is only valid inside a callable".into()
+			E::QuestionOutsideTarget => {
+				"unlabelled `?` requires an enclosing block, loop, or callable".into()
 			}
+			E::BreakOutsideTarget => "`break` requires an enclosing block, loop, or callable".into(),
 			E::AwaitOutsideAsync => {
 				"`.await` is only valid inside an async function or async block".into()
 			}

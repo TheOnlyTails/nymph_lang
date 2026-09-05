@@ -48,8 +48,8 @@ Repeated state uses an immutable state loop. Each `continue` installs fresh loop
 simultaneously:
 
 ```nym
-func sum_to(limit: int): int = loop (let next = 1, let total = 0) {
-  if (next > limit) { break total }
+func sum_to(limit: int): int = loop@sum (let next = 1, let total = 0) {
+  if (next > limit) { break@sum total }
   continue(next = next + 1, total = total + next)
 }
 ```

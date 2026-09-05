@@ -830,13 +830,13 @@ fn golden_late_pinned_comparison_via_param_annotation() {
 }
 
 #[test]
-fn golden_return_early_multiple_branches() {
-	// `return` (4E) in more than one guard branch of the same function body.
+fn golden_break_early_multiple_branches() {
+	// Callable-targeted `break` in more than one guard branch of the same function body.
 	compile_ok(
 		r#"
 		func classify(n: int): int = {
-			if (n < 0) { return -1 }
-			if (n == 0) { return 0 }
+			if (n < 0) { break@classify -1 }
+			if (n == 0) { break@classify 0 }
 			1
 		}
 		"#,
@@ -1367,13 +1367,13 @@ fn golden_run_ctor_bounds_struct_and_enum() {
 }
 
 #[test]
-fn golden_return_statement_lowers() {
+fn golden_break_expression_lowers() {
 	// (`0 - n` rather than a line-leading `-n`, which would continue the previous
 	// expression as a binary minus — the parse gotcha, not the finding.)
 	compile_ok(
 		r#"
 		func abs(n: int): int = {
-			if (n >= 0) { return n }
+			if (n >= 0) { break@abs n }
 			0 - n
 		}
 		"#,
