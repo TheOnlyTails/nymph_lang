@@ -71,7 +71,8 @@ This document details all LSP features implemented and planned for the Nymph Lan
 
 - **11 token types**: keyword, type, function, variable, parameter, number, string, comment, operator, interface, member
 - **4 modifiers**: declaration, definition, builtin, mutable
-- Keyword highlighting (let, fn, if, else, struct, interface, return, true, false)
+- Keyword highlighting (for example `let`, `func`, `if`, `else`, `struct`, `interface`, `break`,
+  `true`, and `false`)
 
 #### Hover Information
 
@@ -142,30 +143,23 @@ This document details all LSP features implemented and planned for the Nymph Lan
 ### Keywords
 
 ```nymph
-let x = 5      // 'let' is tokenized as Keyword
-fn add(a, b) { // 'fn' is tokenized as Keyword
-  return a + b // 'return' is tokenized as Keyword
-}
+let x = 5 // 'let' is tokenized as Keyword
+func add(a: int, b: int): int = a + b // 'func' is tokenized as Keyword
 ```
 
 ### Types and Functions
 
 ```nymph
-struct Point {         // 'struct' is Keyword, 'Point' is Type
-  x: i32              // 'x' is Member
-  y: i32              // 'y' is Member
-}
+struct Point(x: float, y: float) // 'struct' is Keyword, 'Point' is Type
 
-fn distance(p: Point) -> f64 {  // 'fn' is Keyword, 'distance' is Function
-  return p.x + p.y              // 'p' is Variable, 'x'/'y' are Member
-}
+func distance(p: Point): float = p.x + p.y
 ```
 
 ### Interfaces
 
 ```nymph
-interface Drawable {              // 'interface' is Keyword, 'Drawable' is Interface
-  fn draw(self) -> void          // 'fn' is Keyword, 'draw' is Function
+interface Drawable { // 'interface' is Keyword, 'Drawable' is Interface
+  func draw(): void // 'func' is Keyword, 'draw' is Function
 }
 ```
 

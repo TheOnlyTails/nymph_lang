@@ -7,8 +7,8 @@
 	"Immutable state loop": {
 		"prefix": "loop-state",
 		"body": [
-			"loop (let ${1:state} = ${2:initial}) {",
-			"\tif (${3:done}) { break ${1:state} }",
+			"loop@state (let ${1:state} = ${2:initial}) {",
+			"\tif (${3:done}) { break@state ${1:state} }",
 			"\tcontinue(${1:state} = ${4:next})",
 			"}"
 		],

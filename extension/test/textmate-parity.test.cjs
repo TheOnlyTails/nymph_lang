@@ -42,6 +42,8 @@ void test("destination .nym fixture has TextMate fallbacks matching LSP token ca
 		const scope = rule.name ?? rule.captures?.[2]?.name;
 		assert.ok(scope.startsWith(scopeFamily), `${semanticCategory} fallback was ${scope}`);
 	}
+
+	assert.doesNotMatch("return", new RegExp(keyword.match, "u"));
 });
 
 void test("Markdown injection embeds both nym and nymph fenced destination fixtures", () => {

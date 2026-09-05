@@ -13,7 +13,7 @@ service-shaped example is deliberately bounded so smoke checks always terminate.
 
 Every example is a self-contained project: a `nymph.toml` manifest at the root and
 sources under `src/`, with `src/main.nym` as the entry module. Its `main()` function
-(no arguments, no return) is the program's entry point.
+(no arguments, returning `void`) is the program's entry point.
 
 ```
 todo-cli/

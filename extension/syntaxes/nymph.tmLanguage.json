@@ -160,7 +160,7 @@
 				},
 				{
 					"name": "keyword.control.nymph",
-					"match": "\\b(if|else|for|loop|match|return|break|continue|echo)\\b"
+					"match": "\\b(if|else|for|loop|match|break|continue|echo)\\b"
 				},
 				{
 					"name": "keyword.control.import.nymph",

@@ -346,12 +346,11 @@ Postfix `?` uses exactly the same targets: unlabelled `value?` propagates `None`
 innermost target, while `value?@label` completes a labeled block, loop, or callable. See
 [Error handling](./error-handling#propagation-with) for its `Option` and `Result` type rules.
 
-A loop with no targeting `break` has type `void`. If it contains bare `break`, its result is
-`Option<#()>` (`Some(#())` on the early exit and `None` on natural exhaustion). If every targeting
-break supplies a value of type `T`, the result is `Option<T>` instead. Bare and valued breaks may
-not be mixed in one loop, and all valued breaks must agree on `T`. This is determined by a lexical
-scan of the whole loop body, including unreachable branches; unlabeled breaks in nested explicit
-blocks and all breaks in nested callables are excluded. A labeled break from a nested block can still
-target the loop.
+Bare and valued breaks may not be mixed in one loop, and all valued breaks must agree on `T`. A bare
+break makes either kind of loop `void`. A `for` with valued breaks produces `Option<T>` because it
+can exhaust naturally; a state loop with valued breaks produces `T` because it cannot exhaust. This
+is determined by a lexical scan of the whole loop body, including unreachable branches; unlabeled
+breaks in nested explicit blocks and all breaks in nested callables are excluded. A labeled break
+from a nested block can still target the loop.
 
 `return` is not a keyword; it is available as an ordinary identifier.
