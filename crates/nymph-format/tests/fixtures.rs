@@ -136,6 +136,27 @@ fn formats_immutable_state_headers_and_named_continue_arguments() {
 }
 
 #[test]
+fn formats_empty_state_loop_headers_as_headerless_blocks() {
+	let source = "func forever()=loop (/* retained */) {continue}";
+	let formatted = format(source, "empty-state-loop.nym").expect("state loop formats");
+	assert_eq!(
+		formatted,
+		"func forever() = loop /* retained */ {\n\
+		\tcontinue\n\
+		}\n"
+	);
+	parse_clean(&formatted, Path::new("empty-state-loop.nym"));
+	assert_eq!(
+		format(&formatted, "empty-state-loop.nym").unwrap(),
+		formatted
+	);
+	assert_eq!(
+		semantic_fingerprint(source),
+		semantic_fingerprint(&formatted)
+	);
+}
+
+#[test]
 fn all_successful_file_fixtures_are_exact_idempotent_parseable_and_semantic() {
 	let fixtures = successful_fixtures();
 	assert!(

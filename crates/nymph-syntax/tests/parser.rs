@@ -512,6 +512,26 @@ fn immutable_state_loop_syntax_keeps_named_replacements() {
 }
 
 #[test]
+fn state_loops_without_bindings_omit_the_header() {
+	for source in ["loop { continue }", "loop@outer { continue@outer }"] {
+		let ExprKind::StateLoop { bindings, body, .. } = expr(source).kind else {
+			panic!("expected a state loop for {source:?}")
+		};
+		assert!(bindings.is_empty());
+		assert!(matches!(body.kind, ExprKind::Block { .. }));
+	}
+}
+
+#[test]
+fn state_loops_keep_accepting_legacy_empty_headers() {
+	let ExprKind::StateLoop { bindings, body, .. } = expr("loop () { continue }").kind else {
+		panic!("expected a state loop")
+	};
+	assert!(bindings.is_empty());
+	assert!(matches!(body.kind, ExprKind::Block { .. }));
+}
+
+#[test]
 fn label_edges_must_be_adjacent() {
 	for source in [
 		"for @outer (x in xs) {}",

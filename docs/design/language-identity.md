@@ -583,7 +583,8 @@ bindings; closures retain the iteration they captured. A `continue` evaluates su
 left to right against the old bindings and installs them together. Omitted values remain unchanged.
 Body fallthrough is equivalent to continuing with every value unchanged. Named values are accepted
 only by state-loop `continue`; unknown, duplicate, or incompatible replacements are errors. Labels
-permit `continue@outer(...)` in nested loops.
+permit `continue@outer(...)` in nested loops. A loop with no loop-carried bindings omits the header
+and is written `loop { ... }`.
 
 An unchanged header `let use` resource remains live. Replacing one first evaluates and acquires every
 named replacement, then closes body-local resources, closes replaced header resources in reverse

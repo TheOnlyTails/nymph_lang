@@ -520,6 +520,26 @@ impl Hints {
 				for binding in bindings {
 					self.visit_expr(source, &binding.value, true);
 				}
+				if bindings.is_empty() && matches!(body.kind, ExprKind::Block { .. }) {
+					let header = &source[expr.span.start..body.span.start];
+					let mut scanner = Scanner::new(header);
+					let (mut open, mut close) = (None, None);
+					while let Some(item) = scanner.next() {
+						match (item.kind, item.text) {
+							(Kind::Token, "(") => open = Some(item.start),
+							(Kind::Token, ")") => close = Some(item.start),
+							_ => {}
+						}
+					}
+					if let (Some(open), Some(close)) = (open, close) {
+						self
+							.remove_delimiters
+							.insert(expr.span.start + open, expr.span.start + close);
+					}
+					if let Some(open) = source[body.span.start..body.span.end].find('{') {
+						self.blocks.insert(body.span.start + open);
+					}
+				}
 				self.visit_expr(source, body, true);
 			}
 			ExprKind::If {

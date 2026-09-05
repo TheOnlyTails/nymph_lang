@@ -869,14 +869,16 @@ impl Parser<'_> {
 		let start = self.position();
 		let keyword = self.advance().unwrap().1; // `loop`
 		let label = self.parse_control_label(keyword);
-		self.expect(&Token::LParen);
 		let mut bindings = Vec::new();
-		while !self.check(&Token::RParen) && !self.at_end() {
-			let (meta, value) = self.parse_let_binding();
-			bindings.push(StateBinding { meta, value });
-			self.eat(&Token::Comma);
+		if !self.check(&Token::LBrace) {
+			self.expect(&Token::LParen);
+			while !self.check(&Token::RParen) && !self.at_end() {
+				let (meta, value) = self.parse_let_binding();
+				bindings.push(StateBinding { meta, value });
+				self.eat(&Token::Comma);
+			}
+			self.expect(&Token::RParen);
 		}
-		self.expect(&Token::RParen);
 		let body = self.parse_expr();
 		self.mk_expr(
 			ExprKind::StateLoop {

@@ -88,6 +88,17 @@ Replacement expressions evaluate left to right against the old bindings, then in
 omitted names retain their old values. Closures therefore retain the iteration they captured.
 Fallthrough is equivalent to continuing without replacements.
 
+When a loop carries no bindings, omit the header entirely:
+
+```nym
+loop {
+  continue
+}
+```
+
+The older `loop () { ... }` spelling remains accepted for compatibility, but the formatter rewrites
+it to `loop { ... }`.
+
 State loops cannot exhaust, so `break value` has type `T`, not `Option<T>`. Labels use `loop@outer`
 and `continue@outer(name = value)`. Header `let use` declarations participate in normal managed
 resource cleanup when replaced or when the loop exits.
