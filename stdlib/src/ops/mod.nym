@@ -310,39 +310,45 @@ impl Equals<Other = int> for uint {
 
 // Integer-exponent powers are ordinary Nymph so every call observes the
 // language's zero-domain rules instead of falling through to JavaScript `**`.
-// The three helpers intentionally use exponentiation by squaring.
-func int_power_uint(base: int, exponent: uint): int = {
-  int_power_uint_state(1, base, exponent)
+// All three use exponentiation by squaring.
+func int_power_uint(base: int, exponent: uint): int = loop@power_int (
+  let result = 1,
+  let factor = base,
+  let remaining = exponent,
+) {
+  if (remaining == 0u) { break@power_int result }
+  continue(
+    result = if (remaining % 2u == 1u) result * factor else result,
+    factor = if (remaining > 1u) factor * factor else factor,
+    remaining = (remaining / 2u) as uint,
+  )
 }
 
-func int_power_uint_state(result: int, factor: int, remaining: uint): int =
-  if (remaining == 0u) result else int_power_uint_state(
-    if (remaining % 2u == 1u) result * factor else result,
-    if (remaining > 1u) factor * factor else factor,
-    (remaining / 2u) as uint,
+func uint_power_uint(base: uint, exponent: uint): uint = loop@power_uint (
+  let result = 1u,
+  let factor = base,
+  let remaining = exponent,
+) {
+  if (remaining == 0u) { break@power_uint result }
+  continue(
+    result = if (remaining % 2u == 1u) result * factor else result,
+    factor = if (remaining > 1u) factor * factor else factor,
+    remaining = (remaining / 2u) as uint,
   )
-
-func uint_power_uint(base: uint, exponent: uint): uint = {
-  uint_power_uint_state(1u, base, exponent)
 }
 
-func uint_power_uint_state(result: uint, factor: uint, remaining: uint): uint =
-  if (remaining == 0u) result else uint_power_uint_state(
-    if (remaining % 2u == 1u) result * factor else result,
-    if (remaining > 1u) factor * factor else factor,
-    (remaining / 2u) as uint,
+func float_power_uint(base: float, exponent: uint): float = loop@power_float (
+  let result = 1.0,
+  let factor = base,
+  let remaining = exponent,
+) {
+  if (remaining == 0u) { break@power_float result }
+  continue(
+    result = if (remaining % 2u == 1u) result * factor else result,
+    factor = if (remaining > 1u) factor * factor else factor,
+    remaining = (remaining / 2u) as uint,
   )
-
-func float_power_uint(base: float, exponent: uint): float = {
-  float_power_uint_state(1.0, base, exponent)
 }
-
-func float_power_uint_state(result: float, factor: float, remaining: uint): float =
-  if (remaining == 0u) result else float_power_uint_state(
-    if (remaining % 2u == 1u) result * factor else result,
-    if (remaining > 1u) factor * factor else factor,
-    (remaining / 2u) as uint,
-  )
 
 impl Power<Other = uint, Output = int> for int {
   func power(other: uint): int = int_power_uint(this, other)

@@ -43,41 +43,58 @@ public interface Iterator<Item + !E> {
   func sorted_by(compare: (Item, Item) -> Order): SortedBy<Item = Item, E = !E, S = self> =
     SortedBy(source = this, compare = compare, items = Option.None, index = 0u)
 
-  func for_each<!F>(f: (Item) -> void + !F): void + !E + !F = match (this.next()) {
-    Yield(item, next) -> {
-      f(item)
-      next.for_each(f)
-    },
-    Done -> {},
+  func for_each<!F>(f: (Item) -> void + !F): void + !E + !F = loop@visit_items (
+    let source = this,
+  ) {
+    match (source.next()) {
+      Yield(item, next) -> {
+        f(item)
+        continue(source = next)
+      },
+      Done -> break@visit_items,
+    }
   }
 
-  func fold<Acc + !F>(initial: Acc, combine: (Acc, Item) -> Acc + !F): Acc + !E + !F =
-    match (this.next()) {
-      Yield(item, next) -> next.fold(combine(initial, item), combine),
-      Done -> initial,
+  func fold<Acc + !F>(initial: Acc, combine: (Acc, Item) -> Acc + !F): Acc + !E + !F = loop@fold_items (
+    let source = this,
+    let result = initial,
+  ) {
+    match (source.next()) {
+      Yield(item, next) -> continue(source = next, result = combine(result, item)),
+      Done -> break@fold_items result,
     }
+  }
 
   func to_list(): #[Item] + !E = this.fold(#[], (items: #[Item], item) -> items.appended(item))
 
   func count(): uint + !E = this.fold(0u, (count, _) -> count + 1u)
 
-  func any<!F>(predicate: (Item) -> boolean + !F): boolean + !E + !F =
-    match (this.next()) {
-      Yield(item, next) -> if (predicate(item)) true else next.any(predicate),
-      Done -> false,
+  func any<!F>(predicate: (Item) -> boolean + !F): boolean + !E + !F = loop@find_match (
+    let source = this,
+  ) {
+    match (source.next()) {
+      Yield(item, next) -> if (predicate(item)) break@find_match true else continue(source = next),
+      Done -> break@find_match false,
     }
+  }
 
-  func all<!F>(predicate: (Item) -> boolean + !F): boolean + !E + !F =
-    match (this.next()) {
-      Yield(item, next) -> if (predicate(item)) next.all(predicate) else false,
-      Done -> true,
+  func all<!F>(predicate: (Item) -> boolean + !F): boolean + !E + !F = loop@find_mismatch (
+    let source = this,
+  ) {
+    match (source.next()) {
+      Yield(item, next) -> if (predicate(item)) continue(source = next) else break@find_mismatch false,
+      Done -> break@find_mismatch true,
     }
+  }
 
-  func find<!F>(predicate: (Item) -> boolean + !F): Option<Item> + !E + !F =
-    match (this.next()) {
-      Yield(item, next) -> if (predicate(item)) Some(value = item) else next.find(predicate),
-      Done -> None,
+  func find<!F>(predicate: (Item) -> boolean + !F): Option<Item> + !E + !F = loop@find_item (
+    let source = this,
+  ) {
+    match (source.next()) {
+      Yield(item, next) -> if (predicate(item)) break@find_item Some(value = item) else continue(source = next),
+      Done -> break@find_item None,
     }
+  }
 }
 
 /// The exact number of future `Yield` steps.

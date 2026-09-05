@@ -29,58 +29,87 @@ impl string {
   external(trim) func trim(): string
   external(trim_start) func trim_start(): string
   external(trim_end) func trim_end(): string
-  func split(separator: string): #[string] =
-    if (separator.is_empty()) this.split_chars(0u, #[])
-    else this.split_remaining(separator, #[])
-
-  func split_chars(index: uint, parts: #[string]): #[string] =
-    if (index >= this.length()) parts
-    else this.split_chars(index + 1u, parts.appended("${this[index as int]}"))
-
-  func split_remaining(separator: string, parts: #[string]): #[string] =
-    match (this.index_of(separator)) {
-      Some(index) -> this.drop(index + separator.length()).split_remaining(
-        separator, parts.appended(this.take(index))),
-      None -> parts.appended(this),
+  func split(separator: string): #[string] = if (separator.is_empty()) {
+    loop@split_chars (
+      let index = 0u,
+      let parts: #[string] = #[],
+    ) {
+      if (index >= this.length()) { break@split_chars parts }
+      continue(index = index + 1u, parts = parts.appended("${this[index as int]}"))
     }
-
-  func replace(from: string, to: string): string =
-    if (from.is_empty()) this.replace_between(to, 0u, to)
-    else this.replace_remaining(from, to, "")
-
-  func replace_between(to: string, index: uint, result: string): string =
-    if (index >= this.length()) result
-    else this.replace_between(to, index + 1u, result.concat("${this[index as int]}").concat(to))
-
-  func replace_remaining(from: string, to: string, result: string): string =
-    match (this.index_of(from)) {
-      Some(index) -> this.drop(index + from.length()).replace_remaining(
-        from, to, result.concat(this.take(index)).concat(to)),
-      None -> result.concat(this),
+  } else {
+    loop@split_remaining (
+      let remaining = this,
+      let parts: #[string] = #[],
+    ) {
+      match (remaining.index_of(separator)) {
+        Some(index) -> continue(
+          remaining = remaining.drop(index + separator.length()),
+          parts = parts.appended(remaining.take(index)),
+        ),
+        None -> break@split_remaining parts.appended(remaining),
+      }
     }
+  }
+
+  func replace(from: string, to: string): string = if (from.is_empty()) {
+    loop@replace_between (
+      let index = 0u,
+      let result = to,
+    ) {
+      if (index >= this.length()) { break@replace_between result }
+      continue(index = index + 1u, result = result.concat("${this[index as int]}").concat(to))
+    }
+  } else {
+    loop@replace_remaining (
+      let remaining = this,
+      let result = "",
+    ) {
+      match (remaining.index_of(from)) {
+        Some(index) -> continue(
+          remaining = remaining.drop(index + from.length()),
+          result = result.concat(remaining.take(index)).concat(to),
+        ),
+        None -> break@replace_remaining result.concat(remaining),
+      }
+    }
+  }
   func replace_first(from: string, to: string): string = match (this.index_of(from)) {
     Some(index) -> this.take(index).concat(to).concat(this.drop(index + from.length())),
     None -> this,
   }
-  func repeat(n: uint): string = if (n == 0u) "" else this.concat(this.repeat(n - 1u))
-  func chars(): #[char] = this.chars_from(0u, #[])
-
-  func chars_from(index: uint, result: #[char]): #[char] = match (this.char_at(index)) {
-    Some(value) -> this.chars_from(index + 1u, result.appended(value)),
-    None -> result,
+  func repeat(n: uint): string = loop@repeat_string (
+    let result = "",
+    let remaining = n,
+  ) {
+    if (remaining == 0u) { break@repeat_string result }
+    continue(result = this.concat(result), remaining = remaining - 1u)
+  }
+  func chars(): #[char] = loop@collect_chars (
+    let index = 0u,
+    let result: #[char] = #[],
+  ) {
+    match (this.char_at(index)) {
+      Some(value) -> continue(index = index + 1u, result = result.appended(value)),
+      None -> break@collect_chars result,
+    }
   }
   external(concat) func concat(other: string): string
-  func concat_chars(other: #[char]): string = this.concat_from(other, 0u)
+  func concat_chars(other: #[char]): string = loop@append_chars (
+    let result = this,
+    let index = 0u,
+  ) {
+    if (index >= other.length()) { break@append_chars result }
+    continue(result = result.concat("${other[index as int]}"), index = index + 1u)
+  }
 
-  func concat_from(other: #[char], index: uint): string =
-    if (index >= other.length()) this
-    else this.concat("${other[index as int]}").concat_from(other, index + 1u)
-
-  func reversed(): string = this.reverse_from(this.length(), "")
-
-  func reverse_from(end: uint, result: string): string =
-    if (end == 0u) result
-    else this.reverse_from(end - 1u, result.concat(this.substring(end - 1u, end)))
+  func reversed(): string = loop@reverse_chars (
+    let end = this.length(),
+    let result = "",
+  ) {
+    if (end == 0u) { break@reverse_chars result }
+    continue(end = end - 1u, result = result.concat(this.substring(end - 1u, end)))
+  }
   /// Pads on the left to `length` Unicode code points.
   func pad_start(length: uint, pad: char): string =
     if (length > this.length()) "${pad}".repeat(length - this.length()).concat(this) else this

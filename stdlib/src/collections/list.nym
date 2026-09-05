@@ -25,26 +25,39 @@ impl<T> #[T] {
   external(slice) func slice(start: uint, end: uint): #[T]
 
   /// Returns a new list with `other` appended.
-  func concat(other: #[T]): #[T] = this.concat_from(other, 0u)
-
-  func concat_from(other: #[T], index: uint): #[T] = match (other.get(index)) {
-    Some(item) -> this.appended(item).concat_from(other, index + 1u),
-    None -> this,
+  func concat(other: #[T]): #[T] = loop@concat_items (
+    let result = this,
+    let index = 0u,
+  ) {
+    match (other.get(index)) {
+      Some(item) -> continue(result = result.appended(item), index = index + 1u),
+      None -> break@concat_items result,
+    }
   }
 
   /// Returns a new list with the elements in reverse order.
-  func reversed(): #[T] = this.reverse_into(#[], this.length())
-
-  func reverse_into(result: #[T], end: uint): #[T] =
-    if (end == 0u) result else this.reverse_into(result.appended(this[(end - 1u) as int]), end - 1u)
+  func reversed(): #[T] = loop@reverse_items (
+    let result: #[T] = #[],
+    let end = this.length(),
+  ) {
+    if (end == 0u) { break@reverse_items result }
+    continue(result = result.appended(this[(end - 1u) as int]), end = end - 1u)
+  }
 
   /// Returns a list of sub-lists, each of the given `size` (the last chunk may be smaller).
-  func chunked(size: uint): #[#[T]] =
-    if (size == 0u) #[] else this.chunks_from(size, 0u, #[])
-
-  func chunks_from(size: uint, start: uint, result: #[#[T]]): #[#[T]] =
-    if (start >= this.length()) result
-    else this.chunks_from(size, start + size, result.appended(this.slice(start, start + size)))
+  func chunked(size: uint): #[#[T]] = {
+    if (size == 0u) { break@chunked #[] }
+    loop@build_chunks (
+      let start = 0u,
+      let result: #[#[T]] = #[],
+    ) {
+      if (start >= this.length()) { break@build_chunks result }
+      continue(
+        start = start + size,
+        result = result.appended(this.slice(start, start + size)),
+      )
+    }
+  }
 
   /// Returns a new list with the first `n` elements dropped.
   func drop(n: uint): #[T] = this.slice(n, this.length())
@@ -53,29 +66,38 @@ impl<T> #[T] {
   func take(n: uint): #[T] = this.slice(0, n)
 
   /// Returns whether any element satisfies `predicate`, stopping at the first match.
-  func any(predicate: (T) -> boolean): boolean = this.any_from(predicate, 0u)
-
-  func any_from(predicate: (T) -> boolean, index: uint): boolean =
-    if (index >= this.length()) false
-    else if (predicate(this[index as int])) true
-    else this.any_from(predicate, index + 1u)
+  func any(predicate: (T) -> boolean): boolean = loop@find_match (let index = 0u) {
+    if (index >= this.length()) { break@find_match false }
+    if (predicate(this[index as int])) { break@find_match true }
+    continue(index = index + 1u)
+  }
 
   /// Returns a new list stably ordered by `compare`; the source is unchanged.
-  func sort_by(compare: (T, T) -> Order): #[T] = this.sort_from(compare, 1u)
-
-  func sort_from(compare: (T, T) -> Order, index: uint): #[T] =
-    if (index >= this.length()) this
-    else this.insert_sorted(compare, index).sort_from(compare, index + 1u)
-
-  func insert_sorted(compare: (T, T) -> Order, index: uint): #[T] =
-    if (index == 0u) this
-    else match (compare(this[index as int], this[(index - 1u) as int])) {
-      LessThan -> {
-        let previous = this[(index - 1u) as int]
-        this.replaced(index - 1u, this[index as int]).replaced(index, previous).insert_sorted(compare, index - 1u)
-      },
-      _ -> this,
+  func sort_by(compare: (T, T) -> Order): #[T] = loop@sort_items (
+    let result = this,
+    let index = 1u,
+  ) {
+    if (index >= this.length()) { break@sort_items result }
+    let inserted = loop@insert_item (
+      let current = result,
+      let insert_index = index,
+    ) {
+      if (insert_index == 0u) { break@insert_item current }
+      match (compare(current[insert_index as int], current[(insert_index - 1u) as int])) {
+        LessThan -> {
+          let previous = current[(insert_index - 1u) as int]
+          continue(
+            current = current
+              .replaced(insert_index - 1u, current[insert_index as int])
+              .replaced(insert_index, previous),
+            insert_index = insert_index - 1u,
+          )
+        },
+        _ -> break@insert_item current,
+      }
     }
+    continue(result = inserted, index = index + 1u)
+  }
 }
 
 impl<T> Index<Key = int, Output = T> for #[T] {
@@ -84,12 +106,16 @@ impl<T> Index<Key = int, Output = T> for #[T] {
 
 impl<T> #[T] {
   /// Converts each element to a string and joins them with `separator`.
-  func join(separator: string): string = this.join_from(separator, 0u, "")
-
-  func join_from(separator: string, index: uint, result: string): string =
-    if (index >= this.length()) result
-    else this.join_from(separator, index + 1u,
-      result + if (index == 0u) "${this[index as int]}" else separator + "${this[index as int]}")
+  func join(separator: string): string = loop@join_items (
+    let index = 0u,
+    let result = "",
+  ) {
+    if (index >= this.length()) { break@join_items result }
+    continue(
+      index = index + 1u,
+      result = result + if (index == 0u) "${this[index as int]}" else separator + "${this[index as int]}",
+    )
+  }
 }
 
 impl<T: Comparable<Other = T>> #[T] {
@@ -101,12 +127,16 @@ impl<T: Comparable<Other = T>> #[T] {
 
 impl<T: Equals<Other = T>> #[T] {
   /// Returns a new list with duplicate elements removed, preserving first-seen order.
-  func distinct(): #[T] = this.distinct_from(0u, #[])
-
-  func distinct_from(index: uint, result: #[T]): #[T] =
-    if (index >= this.length()) result
-    else this.distinct_from(index + 1u,
-      if (result.contains(this[index as int])) result else result.appended(this[index as int]))
+  func distinct(): #[T] = loop@distinct_items (
+    let index = 0u,
+    let result: #[T] = #[],
+  ) {
+    if (index >= this.length()) { break@distinct_items result }
+    continue(
+      index = index + 1u,
+      result = if (result.contains(this[index as int])) result else result.appended(this[index as int]),
+    )
+  }
 }
 
 impl<T> Plus<Other = self, Output = self> for #[T] {
