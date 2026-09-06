@@ -78,7 +78,17 @@ export default defineConfig({
 					{ text: "Error Handling", link: "/error-handling/" },
 					{ text: "Immutability", link: "/mutability/" },
 					{ text: "Iteration", link: "/iteration/" },
-					{ text: "Standard Library", link: "/stdlib/" },
+					{
+						text: "Standard Library",
+						collapsed: false,
+						items: [
+							{ text: "Comparison", link: "/stdlib/cmp-comparison/" },
+							{ text: "Lists", link: "/stdlib/collections-list/" },
+							{ text: "Linked lists", link: "/stdlib/collections-linked_list/" },
+							{ text: "Iteration", link: "/stdlib/iter/" },
+							{ text: "Math", link: "/stdlib/math/" },
+						],
+					},
 				],
 			},
 		],
