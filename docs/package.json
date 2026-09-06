@@ -14,12 +14,14 @@
 		"dev": "vitepress dev",
 		"prebuild": "pnpm build:wasm",
 		"build": "vitepress build",
+		"deploy": "pnpm build && wrangler deploy",
 		"preview": "vitepress preview"
 	},
 	"devDependencies": {
 		"markdown-it-mathjax3": "^5.2.0",
 		"vitepress": "2.0.0-alpha.15",
 		"vue": "^3.5.40",
-		"wasm-pack": "^0.15.0"
+		"wasm-pack": "^0.15.0",
+		"wrangler": "4.129.0"
 	}
 }
