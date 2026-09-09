@@ -35,6 +35,12 @@ whether the result is a declaration, member, field, variant, parameter, generic
 parameter, match arm, statement, expression, pattern, or type. There is no separate
 quote operation or macro declaration.
 
+`$name(arguments)` is exact syntax sugar for `$(name(arguments))` in every destination.
+Inside a token literal it is the equivalent interpolation shorthand, and `...$name(arguments)`
+is the equivalent splice. The callee is one identifier, `$` must be adjacent to it, and
+arguments use ordinary call syntax. The formatter keeps the shorthand spelling. Member
+calls and arbitrary callee expressions continue to use the long form.
+
 ## Attached declaration macros
 
 `$[call(...)]` immediately precedes a declaration and adds peer declarations after it.

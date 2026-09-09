@@ -73,6 +73,23 @@ func demo(): int = sum(...#[1, 2, 3])
 > A generic function's type parameters are always inferred from the argument types — there is no
 > `f<int>(x)` turbofish-style syntax for pinning them explicitly at the call.
 
+## Compile-time expansion calls
+
+`$make(arguments)` is shorthand for the compile-time expansion `$(make(arguments))`.
+The `$` must touch the function name. The shorthand accepts ordinary positional, labeled,
+and spread call arguments, and works anywhere direct expansion is accepted, including as
+an interpolation or splice inside a `\(...)` token literal. It is limited to one named
+function; use the long form for member calls or another callee expression.
+
+```nym
+import std/meta as meta
+
+const func make_answer(value: int): meta.Tokens =
+  \(func answer(): int = $(value))
+
+$make_answer(42)
+```
+
 ## Method calls
 
 `receiver.method(args…)` resolves `method` against the receiver's type: an inherent method, an

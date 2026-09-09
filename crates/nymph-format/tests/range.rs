@@ -152,3 +152,12 @@ fn selection_inside_balanced_interpolation_formats_its_expression() {
 	assert!(edit.range.start > source.find("${{").unwrap());
 	assert!(apply(source, &edit).contains("λ + 2"));
 }
+
+#[test]
+fn selection_inside_shorthand_expansion_preserves_the_shorthand() {
+	let source = "$make( 1,name=2 )\n";
+	let edit = assert_bounded_range(source, byte_span(source, "name=2"));
+	let formatted = apply(source, &edit);
+	assert_eq!(formatted, "$make(1, name = 2)\n");
+	assert!(!formatted.contains("$(make"));
+}

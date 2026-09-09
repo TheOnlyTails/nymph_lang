@@ -114,6 +114,10 @@
 					"match": "\\$(?=\\()"
 				},
 				{
+					"name": "keyword.operator.expansion.nymph",
+					"match": "\\$(?=[_\\p{L}][_\\p{L}\\p{N}]*\\()"
+				},
+				{
 					"name": "keyword.operator.attached-macro.nymph",
 					"match": "\\$(?=\\[)"
 				}

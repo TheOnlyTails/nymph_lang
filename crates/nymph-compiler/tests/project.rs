@@ -142,6 +142,77 @@ fn source_expansions_work_at_every_nested_grammar_destination() {
 }
 
 #[test]
+fn shorthand_expansions_use_the_canonical_path_at_every_grammar_destination() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func type_tokens(): meta.Tokens = \\(int)\n\
+		 const func parameter(): meta.Tokens = \\(value: int)\n\
+		 const func field(): meta.Tokens = \\(value: int)\n\
+		 const func variant(): meta.Tokens = \\(Value(value: int))\n\
+		 const func pattern(): meta.Tokens = \\(_)\n\
+		 const func expression(): meta.Tokens = \\(41)\n\
+		 const func statement(): meta.Tokens = \\(let _: int = 40)\n\
+		 const func arms(): meta.Tokens = \\(41 -> 42, _ -> 0)\n\
+		 struct Box($field())\n\
+		 enum Number { $variant() }\n\
+		 func answer($parameter()): $type_tokens() = {\n\
+		   $statement()\n\
+		   let $pattern(): int = $expression()\n\
+		   match (41) { $arms() }\n\
+		 }\n\
+		 func result(): int = answer(0)\n\
+		 func main(): void = {}",
+	)]);
+	assert_eq!(run_project(files, "result", ""), "42");
+}
+
+#[test]
+fn shorthand_token_interpolation_splicing_and_labeled_arguments_match_long_form() {
+	let shorthand = FxHashMap::from_iter([(
+		"main",
+		"const func value(base: int, extra: int): int = base + extra\n\
+		 const func parameters(): #[meta.Tokens] = #[\\(left: int,), \\(right: int)]\n\
+		 const func make(base: int, extra: int): meta.Tokens = \
+		   \\(func generated(...$parameters()): int = $value(base, extra = extra))\n\
+		 $make(40, extra = 2)\n\
+		 func result(): int = generated(0, 0)\n\
+		 func main(): void = {}",
+	)]);
+	let long_form = FxHashMap::from_iter([(
+		"main",
+		"const func value(base: int, extra: int): int = base + extra\n\
+		 const func parameters(): #[meta.Tokens] = #[\\(left: int,), \\(right: int)]\n\
+		 const func make(base: int, extra: int): meta.Tokens = \
+		   \\(func generated(...$(parameters())): int = $(value(base, extra = extra)))\n\
+		 $(make(40, extra = 2))\n\
+		 func result(): int = generated(0, 0)\n\
+		 func main(): void = {}",
+	)]);
+	assert_eq!(run_project(shorthand, "result", ""), "42");
+	assert_eq!(run_project(long_form, "result", ""), "42");
+}
+
+#[test]
+fn shorthand_generated_errors_retain_expansion_provenance() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func broken(): meta.Tokens = \\(func generated(: int) = 0)\n$broken()",
+	)]);
+	let diagnostics = check_project_with_embedded_std("main", &loader(files));
+	assert!(
+		diagnostics.iter().any(|diagnostic| {
+			diagnostic.diag.span.origin != nymph_ast::OriginId::SOURCE
+				&& diagnostic
+					.diag
+					.labels
+					.iter()
+					.any(|label| label.message.contains("invoked here"))
+		}),
+		"missing shorthand expansion provenance: {diagnostics:?}"
+	);
+}
+
+#[test]
 fn expansion_generated_imports_participate_in_graph_discovery() {
 	let files = FxHashMap::from_iter([
 		(

@@ -153,7 +153,12 @@ fn contains_unexpanded_source_insertion(source: &str) -> bool {
 			continue;
 		}
 		if lexed.tokens[index].0 == nymph_ast::token::Token::Dollar
-			&& lexed.tokens[index + 1].0 == nymph_ast::token::Token::LParen
+			&& (lexed.tokens[index + 1].0 == nymph_ast::token::Token::LParen
+				|| matches!(
+					lexed.tokens[index + 1].0,
+					nymph_ast::token::Token::Identifier(_)
+				) && lexed.tokens.get(index + 2).map(|token| &token.0)
+					== Some(&nymph_ast::token::Token::LParen))
 		{
 			return true;
 		}
@@ -337,7 +342,12 @@ impl Hints {
 
 	fn visit_declaration(&mut self, source: &str, declaration: &Declaration) {
 		match declaration {
-			Declaration::Expansion(value) => self.visit_expr(source, value, true),
+			Declaration::Expansion(value) => {
+				if let Some(dollar) = source[..value.span.start].rfind('$') {
+					self.line_before.insert(dollar);
+				}
+				self.visit_expr(source, value, true);
+			}
 			Declaration::Attached { macros, target, .. } => {
 				for call in macros {
 					self.visit_expr(source, call, true);
@@ -1419,7 +1429,7 @@ impl<'a> Formatter<'a> {
 		let tight_before = matches!(token, ")" | "]" | "," | "." | "?." | "::" | "?" | "(" | "[");
 		let tight_after = matches!(
 			prev,
-			"(" | "[" | "." | "?." | "::" | "#(" | "#[" | "#{" | "@" | "!" | "..." | ".." | "..="
+			"(" | "[" | "." | "?." | "::" | "#(" | "#[" | "#{" | "@" | "$" | "!" | "..." | ".." | "..="
 		) || self.previous_was_prefix
 			|| self.generic_depth > 0 && prev == "<";
 		if self.in_import && prev == "/" {
@@ -1574,7 +1584,7 @@ fn is_declaration_start(token: &str) -> bool {
 fn is_declaration_prefix(token: &str) -> bool {
 	matches!(
 		token,
-		"public" | "internal" | "private" | "external" | "async"
+		"public" | "internal" | "private" | "external" | "const" | "async"
 	)
 }
 

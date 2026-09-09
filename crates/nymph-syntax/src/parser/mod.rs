@@ -173,6 +173,17 @@ impl<'src> Parser<'src> {
 		self.cursor.check(token)
 	}
 
+	fn at_expansion_shorthand(&self) -> bool {
+		self.check(&Token::Dollar)
+			&& matches!(self.peek_nth(1), Some(Token::Identifier(_)))
+			&& self.peek_nth(2) == Some(&Token::LParen)
+	}
+
+	fn at_expansion(&self) -> bool {
+		self.check(&Token::Dollar)
+			&& (self.peek_nth(1) == Some(&Token::LParen) || self.at_expansion_shorthand())
+	}
+
 	fn at_end(&self) -> bool {
 		self.cursor.at_end()
 	}

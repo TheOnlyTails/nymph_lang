@@ -135,7 +135,10 @@ impl<'src> Lexer<'src> {
 			self.character()?
 		} else if first == '"' {
 			self.string()?
-		} else if first == '$' && !matches!(self.peek_at(1), Some('(' | '[')) {
+		} else if first == '$'
+			&& !matches!(self.peek_at(1), Some('(' | '['))
+			&& !self.peek_at(1).is_some_and(unicode_ident::is_xid_start)
+		{
 			self.anonymous_param()
 		} else if first == '_' || unicode_ident::is_xid_start(first) {
 			self.identifier()
@@ -667,6 +670,24 @@ mod tests {
 		assert_eq!(toks("$"), vec![Token::AnonymousParam(None)]);
 		assert_eq!(toks("$0"), vec![Token::AnonymousParam(Some(0))]);
 		assert_eq!(toks("$12"), vec![Token::AnonymousParam(Some(12))]);
+		assert_eq!(
+			toks("$make()"),
+			vec![
+				Token::Dollar,
+				Token::Identifier("make".into()),
+				Token::LParen,
+				Token::RParen,
+			]
+		);
+		assert_eq!(
+			toks("$ make()"),
+			vec![
+				Token::AnonymousParam(None),
+				Token::Identifier("make".into()),
+				Token::LParen,
+				Token::RParen,
+			]
+		);
 		assert_eq!(toks("_"), vec![Token::Underscore]);
 	}
 

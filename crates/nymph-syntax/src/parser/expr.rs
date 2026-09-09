@@ -411,6 +411,7 @@ impl Parser<'_> {
 				self.expect(&Token::RParen);
 				self.mk_expr(ExprKind::Expansion(Box::new(value)), self.span_from(start))
 			}
+			Token::Dollar if self.at_expansion_shorthand() => self.parse_expansion_shorthand(),
 			Token::Int(v) => {
 				let v = *v;
 				let span = self.advance().unwrap().1;
@@ -547,6 +548,25 @@ impl Parser<'_> {
 		}
 	}
 
+	fn parse_expansion_shorthand(&mut self) -> Expr {
+		let start = self.position();
+		self.advance(); // `$`
+		let name = self.expect_ident();
+		let name_span = name.1;
+		let function = self.mk_expr(ExprKind::Identifier(name), name_span);
+		self.expect(&Token::LParen);
+		let args = self.comma_separated(&Token::RParen, |parser| parser.parse_call_arg());
+		let call = self.mk_expr(
+			ExprKind::Call {
+				func: Box::new(function),
+				generics: Vec::new(),
+				args,
+			},
+			self.span_from(start + 1),
+		);
+		self.mk_expr(ExprKind::Expansion(Box::new(call)), self.span_from(start))
+	}
+
 	fn parse_token_literal(&mut self) -> Expr {
 		let start = self.position();
 		self.advance(); // `\`
@@ -559,17 +579,28 @@ impl Parser<'_> {
 			}
 			let splice = self.check(&Token::DotDotDot)
 				&& self.peek_nth(1) == Some(&Token::Dollar)
-				&& self.peek_nth(2) == Some(&Token::LParen);
-			let interpolation = self.check(&Token::Dollar) && self.peek_nth(1) == Some(&Token::LParen);
+				&& (self.peek_nth(2) == Some(&Token::LParen)
+					|| matches!(self.peek_nth(2), Some(Token::Identifier(_)))
+						&& self.peek_nth(3) == Some(&Token::LParen));
+			let interpolation = self.at_expansion();
 			if splice || interpolation {
 				let piece_start = self.position();
 				if splice {
 					self.advance();
 				}
-				self.advance(); // `$`
-				self.advance(); // `(`
-				let tokens = self.take_interpolation_tokens();
-				let (value, separator) = self.parse_token_interpolation(tokens);
+				let shorthand = self.at_expansion_shorthand();
+				let (value, separator) = if shorthand {
+					let expansion = self.parse_expansion_shorthand();
+					let ExprKind::Expansion(value) = expansion.kind else {
+						unreachable!("shorthand parsed as another expression kind");
+					};
+					(*value, None)
+				} else {
+					self.advance(); // `$`
+					self.advance(); // `(`
+					let tokens = self.take_interpolation_tokens();
+					self.parse_token_interpolation(tokens)
+				};
 				pieces.push(Spanned(
 					TokenLiteralPiece::Interpolation {
 						value: Box::new(value),

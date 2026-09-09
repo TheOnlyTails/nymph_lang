@@ -929,16 +929,25 @@ impl<'a> Evaluator<'a> {
 				index = matching_rparen(tokens, index + 1).map_or(tokens.len(), |end| end + 1);
 				continue;
 			}
-			if tokens[index].0 != Token::Dollar || tokens[index + 1].0 != Token::LParen {
+			let long_form = tokens[index].0 == Token::Dollar && tokens[index + 1].0 == Token::LParen;
+			let shorthand = tokens[index].0 == Token::Dollar
+				&& matches!(tokens[index + 1].0, Token::Identifier(_))
+				&& tokens
+					.get(index + 2)
+					.is_some_and(|token| token.0 == Token::LParen);
+			if !long_form && !shorthand {
 				index += 1;
 				continue;
 			}
-			let Some(end) = matching_rparen(tokens, index + 1) else {
+			let open = index + if long_form { 1 } else { 2 };
+			let Some(end) = matching_rparen(tokens, open) else {
 				return Err(self.error(tokens[index].1, "unterminated source expansion"));
 			};
 			let span = tokens[index].1.to(tokens[end].1);
+			let expression_start = index + if long_form { 2 } else { 1 };
+			let expression_end = end + usize::from(shorthand);
 			let parsed = nymph_syntax::parse_expression_tokens_from(
-				&tokens[index + 2..end],
+				&tokens[expression_start..expression_end],
 				tokens[end].1,
 				*next_node_id,
 			);

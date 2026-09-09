@@ -108,7 +108,7 @@ func broken(): int = greet("Nymph")
 	Metaprogramming: `const func make_answer(value: int): meta.Tokens =
   \\(func answer(): int = $(value))
 
-$(make_answer(42))
+$make_answer(42)
 `,
 };
 

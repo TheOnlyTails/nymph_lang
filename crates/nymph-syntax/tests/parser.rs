@@ -2,7 +2,7 @@
 //! (lex → parse).
 
 use nymph_ast::{
-	Span,
+	Span, Spanned,
 	decl::{Declaration, FuncDeclaration, FuncKind, ImplMember, LetKind},
 	expr::{
 		CallArg, Expr, ExprKind, ListItem, Pattern, RangeKind, RangePatternKind, Statement, StringPart,
@@ -142,6 +142,62 @@ fn const_declarations_and_token_forms_parse() {
 
 	let expanded = expr("$(make(42))");
 	assert!(matches!(expanded.kind, ExprKind::Expansion(_)));
+}
+
+#[test]
+fn shorthand_expansion_builds_the_same_call_shape_as_the_long_form() {
+	for source in [
+		"$make()",
+		"$make(1, nested((2)), name = value)",
+		"$(make())",
+		"$(make(1, nested((2)), name = value))",
+	] {
+		let expansion = expr(source);
+		let ExprKind::Expansion(value) = expansion.kind else {
+			panic!("expected expansion for {source}");
+		};
+		let ExprKind::Call { func, args, .. } = value.kind else {
+			panic!("expected expansion of a call for {source}");
+		};
+		assert!(matches!(func.kind, ExprKind::Identifier(ref name) if name.0 == "make"));
+		assert_eq!(args.len(), if source.contains('1') { 3 } else { 0 });
+		if let Some(argument) = args.last() {
+			assert!(matches!(
+				&argument.0,
+				CallArg::Value { name: Some(name), value }
+					if name.0 == "name" && matches!(value.kind, ExprKind::Identifier(ref value) if value.0 == "value")
+			));
+		}
+	}
+}
+
+#[test]
+fn shorthand_interpolation_and_splicing_use_normal_call_expressions() {
+	for (source, splice) in [("\\($value())", false), ("\\(...$items())", true)] {
+		let literal = expr(source);
+		let ExprKind::TokenLiteral(literal) = literal.kind else {
+			panic!("expected token literal for {source}");
+		};
+		assert!(matches!(
+			literal.pieces.as_slice(),
+			[Spanned(
+				nymph_ast::expr::TokenLiteralPiece::Interpolation { value, splice: actual, separator: None },
+				_,
+			)] if *actual == splice
+				&& matches!(value.kind, ExprKind::Call { ref func, .. }
+					if matches!(func.kind, ExprKind::Identifier(_)))
+		));
+	}
+}
+
+#[test]
+fn shorthand_requires_adjacency_and_a_complete_call() {
+	let separated = parse_expression("$ make()");
+	assert!(!matches!(separated.tree.kind, ExprKind::Expansion(_)));
+
+	let incomplete = parse_expression("$make(");
+	assert!(incomplete.incomplete);
+	assert!(!incomplete.diagnostics.is_empty());
 }
 
 #[test]

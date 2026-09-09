@@ -46,7 +46,7 @@ fn imported_const_changes_invalidate_consumers_but_not_unrelated_modules() {
 	session.set_source(
 		project.clone(),
 		main.clone(),
-		"import @/macros with (make)\n$(make())".into(),
+		"import @/macros with (make)\n$make()".into(),
 		SourceVersion(1),
 	);
 	session.set_source(

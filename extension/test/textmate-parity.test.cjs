@@ -50,9 +50,12 @@ void test("metaprogramming forms have lexical scopes before anonymous parameters
 	const includes = grammar.patterns.map((pattern) => pattern.include);
 	assert.ok(includes.indexOf("#metaprogramming") < includes.indexOf("#anonymous-parameters"));
 
-	const [tokens, expansion, attached] = grammar.repository.metaprogramming.patterns;
+	const [tokens, expansion, shorthand, attached] = grammar.repository.metaprogramming.patterns;
 	assert.match("\\(", new RegExp(tokens.match, "u"));
 	assert.match("$(", new RegExp(expansion.match, "u"));
+	assert.match("$make(", new RegExp(shorthand.match, "u"));
+	assert.doesNotMatch("$ make(", new RegExp(shorthand.match, "u"));
+	assert.doesNotMatch("$module.make(", new RegExp(shorthand.match, "u"));
 	assert.match("$[", new RegExp(attached.match, "u"));
 	assert.match("const", new RegExp(grammar.repository.keywords.patterns[5].match, "u"));
 });

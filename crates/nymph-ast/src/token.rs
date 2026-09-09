@@ -126,7 +126,8 @@ pub enum Token {
 	At,
 	/// `#` when it is not part of a collection opener.
 	Hash,
-	/// `$` before a metaprogramming delimiter (`$(` or `$[`).
+	/// `$` before a metaprogramming delimiter (`$(` or `$[`) or an adjacent
+	/// shorthand expansion call (`$name(`).
 	Dollar,
 	/// `\` when it is not part of a string or character escape.
 	Backslash,

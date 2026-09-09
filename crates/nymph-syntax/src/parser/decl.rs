@@ -50,7 +50,7 @@ impl Parser<'_> {
 	}
 
 	fn parse_declaration(&mut self) -> Option<Declaration> {
-		if self.check(&Token::Dollar) && self.peek_nth(1) == Some(&Token::LParen) {
+		if self.at_expansion() {
 			let expansion = self.parse_expr();
 			let ExprKind::Expansion(value) = expansion.kind else {
 				unreachable!("declaration expansion parsed as another expression kind");

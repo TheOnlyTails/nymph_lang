@@ -172,6 +172,20 @@ fn formats_metaprogramming_without_rewriting_captured_tokens() {
 }
 
 #[test]
+fn formats_shorthand_expansion_without_rewriting_it_to_long_form() {
+	let source = "const func make(value:int,name:int):meta.Tokens=\\(func answer():int=$(value))\n$make( 1,name=2 )";
+	let formatted = format(source, "shorthand-metaprogramming.nym")
+		.expect("shorthand metaprogramming source formats");
+	assert_eq!(
+		formatted,
+		"const func make(value: int, name: int): meta.Tokens = \\(func answer(): int = $(value))\n\
+		$make(1, name = 2)\n"
+	);
+	assert!(!formatted.contains("$(make"));
+	parse_clean(&formatted, Path::new("shorthand-metaprogramming.nym"));
+}
+
+#[test]
 fn preserves_unexpanded_insertions_at_contextual_grammar_destinations() {
 	let source = "const let part: meta.Tokens = \\(value: int)\nstruct Box($(part))\nfunc read(value: $(\\(int))): int = value";
 	assert_eq!(
