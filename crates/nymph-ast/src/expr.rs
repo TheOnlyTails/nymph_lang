@@ -12,13 +12,17 @@ use crate::{
 	Ident, NodeId, Span, Spanned,
 	decl::LetDeclaration,
 	ops::{BinaryOperator, PatternOperator, PostfixOperator, PrefixOperator, TypeOperator},
+	token::Token,
 	ty::{GenericArg, GenericParam, Type},
 };
 
 #[derive(Clone, PartialEq, Debug, salsa::SalsaValue)]
 pub enum Statement {
 	Expr(Expr),
-	Let { meta: LetDeclaration, value: Expr },
+	Let {
+		meta: LetDeclaration,
+		value: Box<Expr>,
+	},
 }
 
 /// A self-spanned expression node: its kind, the source span it covers, and a
@@ -47,6 +51,13 @@ impl Expr {
 				for part in parts {
 					if let StringPart::InterpolatedExpr(expr) = &part.0 {
 						f(expr);
+					}
+				}
+			}
+			ExprKind::TokenLiteral(literal) => {
+				for piece in &literal.pieces {
+					if let TokenLiteralPiece::Interpolation { value, .. } = &piece.0 {
+						f(value);
 					}
 				}
 			}
@@ -94,6 +105,7 @@ impl Expr {
 			| ExprKind::TypeOp { lhs: body, .. }
 			| ExprKind::PatternOp { lhs: body, .. }
 			| ExprKind::Echo { operand: body, .. }
+			| ExprKind::Expansion(body)
 			| ExprKind::Grouped(body) => f(body),
 			ExprKind::BinaryOp { lhs, rhs, .. } => {
 				f(lhs);
@@ -142,7 +154,8 @@ impl Expr {
 			ExprKind::Block { body, .. } => {
 				for statement in body {
 					match &statement.0 {
-						Statement::Expr(expr) | Statement::Let { value: expr, .. } => f(expr),
+						Statement::Expr(expr) => f(expr),
+						Statement::Let { value, .. } => f(value),
 					}
 				}
 			}
@@ -172,6 +185,10 @@ pub enum ExprKind {
 	String(Vec<Spanned<StringPart>>),
 	/// `true`, `false`
 	Boolean(Spanned<bool>),
+	/// `\(...)` — a compile-time token value. Ordinary pieces remain unparsed.
+	TokenLiteral(TokenLiteral),
+	/// `$(expression)` — compile-time tokens inserted at this grammar position.
+	Expansion(Box<Expr>),
 	/// `a`, `my_var`
 	Identifier(Ident),
 	/// `$`, `$0`, `$1` — a positional parameter of the enclosing implicit closure.
@@ -282,6 +299,26 @@ pub enum ExprKind {
 	Grouped(Box<Expr>),
 }
 
+/// The contents of a `\(...)` token literal, excluding its outer parentheses.
+///
+/// The eventual `std/meta.Tokens` value is flat. This source form keeps
+/// interpolation boundaries only until const evaluation has converted them to
+/// tokens.
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub struct TokenLiteral {
+	pub pieces: Vec<Spanned<TokenLiteralPiece>>,
+}
+
+#[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
+pub enum TokenLiteralPiece {
+	Token(Token),
+	Interpolation {
+		value: Box<Expr>,
+		splice: bool,
+		separator: Option<Spanned<Token>>,
+	},
+}
+
 #[derive(Clone, Debug, PartialEq, salsa::SalsaValue)]
 pub struct StateBinding {
 	pub meta: LetDeclaration,
@@ -298,7 +335,7 @@ pub struct StateReplacement {
 pub enum StringPart {
 	Text(EcoString),
 	EscapeSequence(StringEscape),
-	InterpolatedExpr(Expr),
+	InterpolatedExpr(Box<Expr>),
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug, Hash, Display, salsa::SalsaValue)]
@@ -536,14 +573,14 @@ mod tests {
 		ty::Type,
 	};
 
-	const SPAN: Span = Span { start: 0, end: 0 };
+	const SPAN: Span = Span::new(0, 0);
 
 	fn child(id: u32) -> Expr {
-		Expr::new(ExprKind::This, SPAN, NodeId(id))
+		Expr::new(ExprKind::This, SPAN, NodeId::source(id))
 	}
 
 	fn assert_children(kind: ExprKind, expected: &[u32]) {
-		let expr = Expr::new(kind, SPAN, NodeId(0));
+		let expr = Expr::new(kind, SPAN, NodeId::source(0));
 		let mut actual = Vec::new();
 		expr.for_each_child(|child| actual.push(child.id.0));
 		assert_eq!(actual, expected);
@@ -553,7 +590,7 @@ mod tests {
 	fn structural_children_cover_embedded_expression_collections_in_order() {
 		assert_children(
 			ExprKind::String(vec![Spanned::new(
-				StringPart::InterpolatedExpr(child(1)),
+				StringPart::InterpolatedExpr(Box::new(child(1))),
 				SPAN,
 			)]),
 			&[1],
@@ -615,11 +652,12 @@ mod tests {
 					Spanned::new(
 						Statement::Let {
 							meta: LetDeclaration {
+								is_const: false,
 								kind: LetKind::Instance,
 								name: Spanned::new(Pattern::Placeholder, SPAN),
 								type_: None,
 							},
-							value: child(2),
+							value: Box::new(child(2)),
 						},
 						SPAN,
 					),

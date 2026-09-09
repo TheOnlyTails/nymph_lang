@@ -94,6 +94,8 @@ fn bodies(module: &Module) -> Vec<&Expr> {
 	let mut result = Vec::new();
 	for declaration in &module.members {
 		match declaration {
+			Declaration::Expansion(value) => result.push(value),
+			Declaration::Attached { .. } => {}
 			Declaration::Let { value, .. } | Declaration::Func { body: value, .. } => result.push(value),
 			Declaration::Struct {
 				members,

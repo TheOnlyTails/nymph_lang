@@ -117,6 +117,30 @@ ambient core and `std/…` sources as `build` and `run`. It stops after parsing,
 binding, and semantic checking: it emits no JavaScript, creates no `.mjs`
 artifact, and executes neither the selected module nor Node.
 
+## Inspecting fully expanded source
+
+`nymph expand <module-path>` prints one project's fully expanded runtime module
+as formatted Nymph. The module path is relative to `package.src`, uses `/` between
+components, and omits both the `.nym` suffix and import prefixes. For example:
+
+```sh
+nymph expand main
+nymph expand network/http
+nymph --manifest ../app/nymph.toml expand generated/routes
+```
+
+Forms such as `@/network/http`, `./network/http`, `network/http.nym`, absolute
+paths, and paths containing `..` are rejected. Unlike `check`, `build`, and `run`,
+`expand` is project-only and always requires an explicit module path; it does not
+accept a loose source file or default to `build.entry`.
+
+The output is the final project expansion fixed point. It includes generated
+imports and declarations, applies direct expansions in every grammar destination
+and additive attached macros, and omits const-only declarations and macro markers.
+The output goes to stdout only after the complete project passes expansion,
+parsing, and analysis. Failures produce the normal source diagnostics on stderr,
+return a nonzero status, and print no partial source.
+
 ## Executable roots and the Node launcher
 
 After aliases are normalized, `main` must have no parameters and exactly one of these result shapes:

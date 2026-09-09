@@ -15,6 +15,24 @@ pub struct Diag {
 	pub severity: &'static str,
 	pub message: String,
 	pub code: String,
+	/// Canonical CLI-style visual rendering without terminal color codes.
+	pub pretty: String,
+	pub labels: Vec<DiagLabel>,
+	pub notes: Vec<String>,
+	pub help: Option<String>,
+	pub start: usize,
+	pub end: usize,
+	pub start_line: usize,
+	pub start_col: usize,
+	pub end_line: usize,
+	pub end_col: usize,
+}
+
+/// A secondary source label attached to a diagnostic, including macro
+/// invocation and definition locations from expansion provenance.
+#[derive(Clone, Debug, Serialize)]
+pub struct DiagLabel {
+	pub message: String,
 	pub start: usize,
 	pub end: usize,
 	pub start_line: usize,
@@ -28,6 +46,13 @@ pub struct Diag {
 #[derive(Clone, Debug, Serialize)]
 pub struct CompileResult {
 	pub js: Option<String>,
+	pub diagnostics: Vec<Diag>,
+}
+
+/// Canonical fully expanded Nymph source and its structured diagnostics.
+#[derive(Clone, Debug, Serialize)]
+pub struct ExpandedSourceResult {
+	pub source: Option<String>,
 	pub diagnostics: Vec<Diag>,
 }
 
@@ -89,6 +114,8 @@ pub struct InspectionResult {
 	pub ast: String,
 	pub types: Vec<TypeStateView>,
 	pub stages: Vec<StageView>,
+	pub expanded: Option<String>,
+	pub expanded_tokens: Vec<TokenView>,
 	pub js: Option<String>,
 	pub run: Option<RunArtifactView>,
 	pub diagnostics: Vec<Diag>,
@@ -131,13 +158,33 @@ impl LineIndex {
 		(line + 1, col)
 	}
 
-	pub(crate) fn to_diag(&self, d: &Diagnostic) -> Diag {
+	pub(crate) fn to_diag(&self, source: &str, filename: &str, d: &Diagnostic) -> Diag {
 		let (start_line, start_col) = self.line_col(d.span.start);
 		let (end_line, end_col) = self.line_col(d.span.end);
 		Diag {
 			severity: severity_str(d.severity),
 			message: d.message.to_string(),
 			code: d.code.to_string(),
+			pretty: nymph_diagnostics::render_plain(filename, source, std::slice::from_ref(d)),
+			labels: d
+				.labels
+				.iter()
+				.map(|label| {
+					let (start_line, start_col) = self.line_col(label.span.start);
+					let (end_line, end_col) = self.line_col(label.span.end);
+					DiagLabel {
+						message: label.message.to_string(),
+						start: label.span.start,
+						end: label.span.end,
+						start_line,
+						start_col,
+						end_line,
+						end_col,
+					}
+				})
+				.collect(),
+			notes: d.notes.iter().map(ToString::to_string).collect(),
+			help: d.help.as_ref().map(ToString::to_string),
 			start: d.span.start,
 			end: d.span.end,
 			start_line,

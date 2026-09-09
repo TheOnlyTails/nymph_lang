@@ -168,13 +168,33 @@ fn report_kind(severity: Severity) -> ReportKind<'static> {
 /// Render a batch of diagnostics for one source file into a pretty string suitable
 /// for terminal output. `filename` is used as the report's source id.
 pub fn render(filename: &str, source: &str, diagnostics: &[Diagnostic]) -> String {
+	render_with_config(filename, source, diagnostics, Config::default())
+}
+
+/// Render diagnostics with the canonical visual layout but without terminal color codes.
+/// This is suitable for browser and other text surfaces that provide their own styling.
+pub fn render_plain(filename: &str, source: &str, diagnostics: &[Diagnostic]) -> String {
+	render_with_config(
+		filename,
+		source,
+		diagnostics,
+		Config::default().with_color(false),
+	)
+}
+
+fn render_with_config(
+	filename: &str,
+	source: &str,
+	diagnostics: &[Diagnostic],
+	config: Config,
+) -> String {
 	let mut out = Vec::new();
 	for diagnostic in diagnostics {
 		let mut builder = Report::build(
 			report_kind(diagnostic.severity),
 			(filename, range(diagnostic.span)),
 		)
-		.with_config(Config::default().with_index_type(IndexType::Byte))
+		.with_config(config.with_index_type(IndexType::Byte))
 		.with_message(diagnostic.message.as_str());
 
 		builder = builder.with_code(diagnostic.code.as_str());

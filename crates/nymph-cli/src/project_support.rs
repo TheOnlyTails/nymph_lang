@@ -88,17 +88,7 @@ pub(crate) struct ProjectOperation {
 }
 
 impl ProjectOperation {
-	/// Resolve the command target and report selection failures consistently.
-	pub fn resolve(
-		file: Option<&Path>,
-		manifest: &ManifestSelection,
-		profile: nymph_compiler::BuildProfile,
-	) -> Option<Self> {
-		let target = resolve(file, manifest, profile)
-			.map_err(|error| {
-				eprintln!("error: {error}");
-			})
-			.ok()?;
+	fn from_target(target: ResolvedTarget) -> Self {
 		let fs_load = nymph_project::fs_loader(target.src_root.clone());
 		let analyzed_sources = Rc::new(RefCell::new(BTreeMap::<String, String>::new()));
 		let observed = analyzed_sources.clone();
@@ -113,11 +103,51 @@ impl ProjectOperation {
 				.or_insert_with(|| source.clone());
 			Some(source)
 		});
-		Some(Self {
+		Self {
 			target,
 			load,
 			analyzed_sources,
-		})
+		}
+	}
+
+	/// Resolve the command target and report selection failures consistently.
+	pub fn resolve(
+		file: Option<&Path>,
+		manifest: &ManifestSelection,
+		profile: nymph_compiler::BuildProfile,
+	) -> Option<Self> {
+		let target = resolve(file, manifest, profile)
+			.map_err(|error| {
+				eprintln!("error: {error}");
+			})
+			.ok()?;
+		Some(Self::from_target(target))
+	}
+
+	/// Resolve a canonical extension-less module path within an authoritative project.
+	pub fn resolve_module(module: &str, manifest: &ManifestSelection) -> Option<Self> {
+		let target = (|| -> anyhow::Result<ResolvedTarget> {
+			let project = load_project(manifest)?;
+			let module = nymph_compiler::ModulePath::new(module)
+				.map_err(|error| anyhow::anyhow!("invalid module path `{module}`: {error}"))?;
+			let src_root = nymph_project::normalize_path(project.source_root())?;
+			let file = nymph_project::file_for_module(&src_root, &module);
+			ensure_source_file(&file)?;
+			ensure_source_within_root(&file, &src_root)?;
+			Ok(ResolvedTarget {
+				file,
+				src_root,
+				entry_key: module.to_string(),
+				intent: TargetIntent::Library,
+				options: nymph_compiler::CompilerOptions {
+					profile: nymph_compiler::BuildProfile::Development,
+					lints: project.manifest().lints.clone(),
+				},
+			})
+		})()
+		.map_err(|error| eprintln!("error: {error}"))
+		.ok()?;
+		Some(Self::from_target(target))
 	}
 
 	pub fn target_file(&self) -> &Path {
@@ -146,6 +176,23 @@ impl ProjectOperation {
 
 	pub fn compile_entry(&self) -> Option<nymph_compiler::CompiledProject> {
 		self.compile(TargetIntent::Entry)
+	}
+
+	pub fn expand(&self) -> Option<nymph_compiler::ExpandedModuleSource> {
+		self.analyzed_sources.borrow_mut().clear();
+		match guarded(|| {
+			nymph_compiler::expand_project_module_with_embedded_std_and_options(
+				&self.target.entry_key,
+				&self.load,
+				&self.target.options,
+			)
+		}) {
+			Ok(report) => Some(report),
+			Err(payload) => {
+				eprintln!("{}", unsupported_feature_message(&payload));
+				None
+			}
+		}
 	}
 
 	pub fn render(&self, diagnostics: &[nymph_compiler::ProjectDiagnostic]) -> String {

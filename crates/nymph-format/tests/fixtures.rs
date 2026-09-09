@@ -157,6 +157,30 @@ fn formats_empty_state_loop_headers_as_headerless_blocks() {
 }
 
 #[test]
+fn formats_metaprogramming_without_rewriting_captured_tokens() {
+	let source = "const   func make(xs:#[meta.Tokens]):meta.Tokens=\\(func f(...$(xs,)):int=1)\n$[decorate( 1 )]struct S(x:int)\n$(make(#[\\(a:int),\\(b:int)]))";
+	let formatted = format(source, "metaprogramming.nym").expect("metaprogramming source formats");
+	parse_clean(&formatted, Path::new("metaprogramming.nym"));
+	assert_eq!(
+		format(&formatted, "metaprogramming.nym").unwrap(),
+		formatted
+	);
+	assert_eq!(
+		semantic_fingerprint(source),
+		semantic_fingerprint(&formatted)
+	);
+}
+
+#[test]
+fn preserves_unexpanded_insertions_at_contextual_grammar_destinations() {
+	let source = "const let part: meta.Tokens = \\(value: int)\nstruct Box($(part))\nfunc read(value: $(\\(int))): int = value";
+	assert_eq!(
+		format(source, "unexpanded-metaprogramming.nym").expect("source remains format-safe"),
+		source
+	);
+}
+
+#[test]
 fn all_successful_file_fixtures_are_exact_idempotent_parseable_and_semantic() {
 	let fixtures = successful_fixtures();
 	assert!(

@@ -12,7 +12,7 @@ use nymph_ast::{
 	expr::{Expr, ExprKind, ListItem, MapEntry, Statement, StringPart},
 };
 use nymph_diagnostics::Diagnostic;
-use nymph_syntax::{parse_expression, parse_module};
+use nymph_syntax::{lex, parse_expression, parse_module};
 use thiserror::Error;
 use unicode_width::UnicodeWidthChar as _;
 
@@ -50,6 +50,9 @@ pub struct FormattedRange {
 pub fn format(source: &str, path: &str) -> Result<String, FormatError> {
 	let parsed = parse_module(source, path);
 	if !parsed.diagnostics.is_empty() {
+		if contains_unexpanded_source_insertion(source) {
+			return Ok(source.to_owned());
+		}
 		return Err(FormatError::syntax(path, parsed.diagnostics));
 	}
 	let hints = Hints::module(source, &parsed.tree);
@@ -67,6 +70,9 @@ pub fn format_range(
 ) -> Result<Option<FormattedRange>, FormatError> {
 	let parsed = parse_module(source, path);
 	if !parsed.diagnostics.is_empty() {
+		if contains_unexpanded_source_insertion(source) {
+			return Ok(None);
+		}
 		return Err(FormatError::syntax(path, parsed.diagnostics));
 	}
 	if range.start > range.end
@@ -122,6 +128,38 @@ pub fn format_range(
 		range: selected,
 		text: candidate,
 	}))
+}
+
+fn contains_unexpanded_source_insertion(source: &str) -> bool {
+	let lexed = lex(source);
+	if !lexed.diagnostics.is_empty() {
+		return false;
+	}
+	let mut index = 0;
+	while index + 1 < lexed.tokens.len() {
+		if lexed.tokens[index].0 == nymph_ast::token::Token::Backslash
+			&& lexed.tokens[index + 1].0 == nymph_ast::token::Token::LParen
+		{
+			let mut depth = 1;
+			index += 2;
+			while index < lexed.tokens.len() && depth != 0 {
+				match lexed.tokens[index].0 {
+					nymph_ast::token::Token::LParen => depth += 1,
+					nymph_ast::token::Token::RParen => depth -= 1,
+					_ => {}
+				}
+				index += 1;
+			}
+			continue;
+		}
+		if lexed.tokens[index].0 == nymph_ast::token::Token::Dollar
+			&& lexed.tokens[index + 1].0 == nymph_ast::token::Token::LParen
+		{
+			return true;
+		}
+		index += 1;
+	}
+	false
 }
 
 fn smallest_containing(units: &[Span], requested: Span) -> Option<Span> {
@@ -299,6 +337,13 @@ impl Hints {
 
 	fn visit_declaration(&mut self, source: &str, declaration: &Declaration) {
 		match declaration {
+			Declaration::Expansion(value) => self.visit_expr(source, value, true),
+			Declaration::Attached { macros, target, .. } => {
+				for call in macros {
+					self.visit_expr(source, call, true);
+				}
+				self.visit_declaration(source, target);
+			}
 			Declaration::Let { value, .. } | Declaration::Func { body: value, .. } => {
 				self.visit_expr(source, value, true);
 			}
@@ -437,6 +482,14 @@ impl Hints {
 					}
 				}
 			}
+			ExprKind::TokenLiteral(literal) => {
+				for piece in &literal.pieces {
+					if let nymph_ast::expr::TokenLiteralPiece::Interpolation { value, .. } = &piece.0 {
+						self.visit_expr(source, value, true);
+					}
+				}
+			}
+			ExprKind::Expansion(value) => self.visit_expr(source, value, true),
 			ExprKind::List(items) | ExprKind::Tuple(items) => {
 				for item in items {
 					match &item.0 {

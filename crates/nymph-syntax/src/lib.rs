@@ -7,4 +7,7 @@ pub mod parser;
 
 pub use errors::{LexError, ParseError};
 pub use lexer::{LexResult, lex};
-pub use parser::{ParseResult, parse_expression, parse_module};
+pub use parser::{
+	ModuleParseResult, ParseResult, parse_expression, parse_expression_tokens_from, parse_module,
+	parse_module_tokens, parse_module_tokens_from, parse_module_tokens_from_with_ranges,
+};

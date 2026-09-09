@@ -5,6 +5,7 @@ use std::ops::Range;
 
 use ecow::EcoString;
 use nymph_ast::{
+	Span,
 	decl::{Declaration, FuncDeclaration, FuncKind, ImplMember, Module, Visibility},
 	expr::Pattern,
 	ty::Type,
@@ -113,6 +114,40 @@ fn source_name(name: &str) -> &str {
 		.unwrap_or(name)
 }
 
+fn stable_source_name(name: &str, span: Span) -> EcoString {
+	let name = source_name(name);
+	match span.context {
+		nymph_ast::SyntaxContext::Source
+		| nymph_ast::SyntaxContext::CallSite(_)
+		| nymph_ast::SyntaxContext::Exposed(_) => name.into(),
+		nymph_ast::SyntaxContext::Definition(definition) => {
+			format!("{name}$definition${definition}").into()
+		}
+		nymph_ast::SyntaxContext::Fresh { origin, index } => {
+			format!("{name}$fresh${}${index}", origin.0).into()
+		}
+	}
+}
+
+fn declaration_name_span(declaration: &Declaration) -> Option<Span> {
+	Some(match declaration {
+		Declaration::Expansion(_) | Declaration::Attached { .. } => return None,
+		Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => meta.name.1,
+		Declaration::Effect { name, .. } => name.1,
+		Declaration::Let { meta, .. } | Declaration::ExternalLet(_, _, meta) => {
+			meta.name.0.as_binding()?.1
+		}
+		Declaration::TypeAlias { meta, .. } => meta.name.1,
+		Declaration::Struct { name, .. }
+		| Declaration::Enum { name, .. }
+		| Declaration::Interface { name, .. }
+		| Declaration::Namespace { name, .. } => name.1,
+		Declaration::Import { .. } | Declaration::Impl { .. } | Declaration::ImplFor { .. } => {
+			return None;
+		}
+	})
+}
+
 pub fn declared_headers(identity: ModuleIdentity, module: &Module) -> DeclaredHeaders {
 	let mut ids = StableIdBuilder::new(identity.clone());
 	let allocated: Vec<(usize, EcoString, DefinitionId)> = module
@@ -122,10 +157,11 @@ pub fn declared_headers(identity: ModuleIdentity, module: &Module) -> DeclaredHe
 		.filter_map(|(member, declaration)| {
 			let (category, name) = declaration_identity(declaration)?;
 			let source_name: EcoString = source_name(name).into();
+			let stable_name = stable_source_name(name, declaration_name_span(declaration)?);
 			Some((
 				member,
 				source_name.clone(),
-				ids.allocate(DeclarationKey::top_level(category, source_name)),
+				ids.allocate(DeclarationKey::top_level(category, stable_name)),
 			))
 		})
 		.collect();
@@ -146,6 +182,7 @@ pub fn declared_headers(identity: ModuleIdentity, module: &Module) -> DeclaredHe
 
 fn declaration_identity(declaration: &Declaration) -> Option<(DeclarationCategory, &EcoString)> {
 	Some(match declaration {
+		Declaration::Expansion(_) | Declaration::Attached { .. } => return None,
 		Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => {
 			(DeclarationCategory::Function, &meta.name.0)
 		}
@@ -171,9 +208,15 @@ fn lexical_winner(module: &Module, member: usize, declaration: &Declaration) -> 
 	let Some((_, name)) = declaration_identity(declaration) else {
 		return true;
 	};
-	let name = source_name(name);
+	let Some(span) = declaration_name_span(declaration) else {
+		return true;
+	};
+	let name = stable_source_name(name, span);
 	!module.members[member + 1..].iter().any(|later| {
-		declaration_identity(later).is_some_and(|(_, later_name)| source_name(later_name) == name)
+		declaration_identity(later).is_some_and(|(_, later_name)| {
+			declaration_name_span(later)
+				.is_some_and(|later_span| stable_source_name(later_name, later_span) == name)
+		})
 	})
 }
 
@@ -211,6 +254,7 @@ pub fn top_level_declarations(
 				return None;
 			}
 			let (visibility, name_span) = match declaration {
+				Declaration::Expansion(_) | Declaration::Attached { .. } => return None,
 				Declaration::Func {
 					visibility, meta, ..
 				} => (*visibility, meta.name.1),
@@ -2750,7 +2794,11 @@ fn extract_definition(
 				namespace_members(members, def, &shape.id, checked, headers, &mut member_ids)?;
 			shape
 		}
-		Declaration::Import { .. } | Declaration::Impl { .. } | Declaration::ImplFor { .. } => {
+		Declaration::Expansion(_)
+		| Declaration::Attached { .. }
+		| Declaration::Import { .. }
+		| Declaration::Impl { .. }
+		| Declaration::ImplFor { .. } => {
 			unreachable!()
 		}
 	};
@@ -4729,7 +4777,11 @@ fn poison_definition(
 				recover_members(members, &owner, headers, &[], &mut ids),
 			)
 		}
-		Declaration::Import { .. } | Declaration::Impl { .. } | Declaration::ImplFor { .. } => {
+		Declaration::Expansion(_)
+		| Declaration::Attached { .. }
+		| Declaration::Import { .. }
+		| Declaration::Impl { .. }
+		| Declaration::ImplFor { .. } => {
 			return None;
 		}
 	};

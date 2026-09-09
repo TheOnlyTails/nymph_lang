@@ -652,7 +652,7 @@ impl<'m> Checker<'m> {
 				Some(ty)
 			}
 			ExprKind::Identifier(name) => {
-				if self.lookup_local(&name.0).is_some() || self.defs.get(&name.0).is_some() {
+				if self.lookup_local(&name.0, name.1).is_some() || self.defs.get_ident(name).is_some() {
 					return None;
 				}
 				let (enum_def, variant) = self.expected_enum_variant(expected, &name.0)?;
@@ -681,7 +681,7 @@ impl<'m> Checker<'m> {
 				let ExprKind::Identifier(name) = &func.kind else {
 					return None;
 				};
-				if self.defs.get(&name.0).is_some() {
+				if self.defs.get_ident(name).is_some() {
 					return None;
 				}
 				let (enum_def, variant) = self.expected_enum_variant(expected, &name.0)?;
@@ -993,6 +993,10 @@ impl<'m> Checker<'m> {
 	fn infer_kind(&mut self, expr: &Expr) -> Ty {
 		let span = expr.span;
 		match &expr.kind {
+			ExprKind::TokenLiteral(_) | ExprKind::Expansion(_) => {
+				self.emit(span, TypeError::UnexpandedMetaprogramming);
+				self.interner.error()
+			}
 			ExprKind::Int(lit) => {
 				self.check_int_literal_range(lit);
 				self.interner.int()
@@ -1016,7 +1020,7 @@ impl<'m> Checker<'m> {
 					self.interner.error()
 				}
 			},
-			ExprKind::Identifier(name) => self.infer_identifier(&name.0, span, expr.id),
+			ExprKind::Identifier(name) => self.infer_identifier(name, expr.id),
 			// `$N` never resolves through the ordinary local-scope lookup every
 			// other identifier uses — it reads positionally out of the innermost
 			// `anon_ctx` frame `Checker::form_anon_closure` pushed while forming
@@ -1455,7 +1459,7 @@ impl<'m> Checker<'m> {
 						continue;
 					};
 					self.check_let_statement(&binding.meta, &binding.value);
-					if let Some(local) = self.lookup_local(&name.0) {
+					if let Some(local) = self.lookup_local(&name.0, name.1) {
 						contracts.push(crate::check::StateBindingContract {
 							name: name.0.clone(),
 							ty: local.ty,
@@ -1856,9 +1860,10 @@ impl<'m> Checker<'m> {
 			&& self.annotations.resolution_of(expr.id).is_some()
 	}
 
-	fn infer_identifier(&mut self, name: &str, span: Span, id: NodeId) -> Ty {
+	fn infer_identifier(&mut self, name: &nymph_ast::Ident, id: NodeId) -> Ty {
+		let span = name.1;
 		if let Some((ty, declaration)) = self
-			.lookup_local(name)
+			.lookup_local(&name.0, name.1)
 			.map(|binding| (binding.ty, binding.declaration))
 		{
 			self
@@ -1866,18 +1871,28 @@ impl<'m> Checker<'m> {
 				.record_local_definition_target(id, declaration);
 			return ty;
 		}
-		if let Some(def) = self.defs.get(name) {
+		if let Some(def) = self.defs.get_ident(name) {
 			return self.type_of_def(def, span, id);
 		}
-		match self.defs.resolve_variant(name) {
+		match self.defs.resolve_variant_ident(name) {
 			Some(Ok((enum_def, variant))) => return self.variant_value(enum_def, variant, id, span),
 			Some(Err(())) => {
-				self.emit(span, TypeError::AmbiguousVariant { name: name.into() });
+				self.emit(
+					span,
+					TypeError::AmbiguousVariant {
+						name: name.0.clone(),
+					},
+				);
 				return self.interner.error();
 			}
 			None => {}
 		}
-		self.emit(span, TypeError::CannotFind { name: name.into() });
+		self.emit(
+			span,
+			TypeError::CannotFind {
+				name: name.0.clone(),
+			},
+		);
 		self.interner.error()
 	}
 
@@ -2159,9 +2174,9 @@ impl<'m> Checker<'m> {
 	) -> (Ty, Option<Resolution>) {
 		// Constructor calls: `Struct(field = …)` / `Variant(field = …)`.
 		if let ExprKind::Identifier(name) = &func.kind
-			&& self.lookup_local(&name.0).is_none()
+			&& self.lookup_local(&name.0, name.1).is_none()
 		{
-			if let Some(def) = self.defs.get(&name.0)
+			if let Some(def) = self.defs.get_ident(name)
 				&& let DefKind::Struct = self.defs.data(def).kind
 			{
 				self
@@ -2172,7 +2187,7 @@ impl<'m> Checker<'m> {
 					.record_definition_target(func.id, self.defs.stable(def));
 				return (self.infer_struct_ctor(def, args, span, id), None);
 			}
-			match self.defs.resolve_variant(&name.0) {
+			match self.defs.resolve_variant_ident(name) {
 				Some(Ok((enum_def, variant))) => {
 					return (
 						self.infer_variant_ctor(enum_def, variant, args, span, id, None),
@@ -2196,8 +2211,8 @@ impl<'m> Checker<'m> {
 		// type name, not a value.
 		if let ExprKind::MemberAccess { parent, member, .. } = &func.kind
 			&& let ExprKind::Identifier(type_name) = &parent.kind
-			&& self.lookup_local(&type_name.0).is_none()
-			&& let Some(def) = self.defs.get(&type_name.0)
+			&& self.lookup_local(&type_name.0, type_name.1).is_none()
+			&& let Some(def) = self.defs.get_ident(type_name)
 		{
 			self.record_member_completion_facts(parent, None, member.1);
 			self
@@ -2252,7 +2267,7 @@ impl<'m> Checker<'m> {
 				DefKind::Enum => {
 					if let [argument] = args
 						&& let CallArg::Value { name: None, value } = &argument.0
-						&& let Some(source) = self.defs.get(&member.0)
+						&& let Some(source) = self.defs.get_ident(member)
 						&& matches!(self.defs.data(source).kind, DefKind::Enum)
 					{
 						let direct_embedding = self.sigs.enums[&def]
@@ -2396,7 +2411,7 @@ impl<'m> Checker<'m> {
 		// function reached through `P`'s bound, e.g. `R.default` with `R: Default`.
 		if let ExprKind::MemberAccess { parent, member, .. } = &func.kind
 			&& let ExprKind::Identifier(pname) = &parent.kind
-			&& self.lookup_local(&pname.0).is_none()
+			&& self.lookup_local(&pname.0, pname.1).is_none()
 			&& let Some(pidx) = self.lookup_param(&pname.0)
 		{
 			self.record_member_completion_facts(parent, None, member.1);
@@ -2852,8 +2867,8 @@ impl<'m> Checker<'m> {
 		id: NodeId,
 	) -> (Ty, Option<Resolution>) {
 		if let ExprKind::Identifier(name) = &parent.kind
-			&& self.lookup_local(&name.0).is_none()
-			&& let Some(definition) = self.defs.get(&name.0)
+			&& self.lookup_local(&name.0, name.1).is_none()
+			&& let Some(definition) = self.defs.get_ident(name)
 			&& matches!(
 				self.defs.data(definition).kind,
 				DefKind::Namespace | DefKind::Struct | DefKind::Enum | DefKind::TypeAlias
@@ -2974,7 +2989,7 @@ impl<'m> Checker<'m> {
 		use crate::{MemberCompletion, MemberCompletionKind};
 		let mut out = Vec::new();
 		if let ExprKind::Identifier(name) = &parent.kind
-			&& self.lookup_local(&name.0).is_none()
+			&& self.lookup_local(&name.0, name.1).is_none()
 			&& let Some(param) = self.lookup_param(&name.0)
 		{
 			let mut names = self
@@ -3017,8 +3032,8 @@ impl<'m> Checker<'m> {
 			return;
 		}
 		if let ExprKind::Identifier(name) = &parent.kind
-			&& self.lookup_local(&name.0).is_none()
-			&& let Some(def) = self.defs.get(&name.0)
+			&& self.lookup_local(&name.0, name.1).is_none()
+			&& let Some(def) = self.defs.get_ident(name)
 		{
 			let checkpoint = self.table.snapshot();
 			let diagnostics = self.diags.len();
@@ -3275,8 +3290,8 @@ impl<'m> Checker<'m> {
 
 	fn infer_member(&mut self, parent: &Expr, member: &str, span: Span, id: NodeId) -> Ty {
 		if let ExprKind::Identifier(name) = &parent.kind
-			&& self.lookup_local(&name.0).is_none()
-			&& let Some(definition) = self.defs.get(&name.0)
+			&& self.lookup_local(&name.0, name.1).is_none()
+			&& let Some(definition) = self.defs.get_ident(name)
 			&& matches!(
 				self.defs.data(definition).kind,
 				DefKind::Namespace | DefKind::Struct | DefKind::Enum | DefKind::TypeAlias
@@ -3284,8 +3299,8 @@ impl<'m> Checker<'m> {
 			self.record_member_completion_facts(parent, None, span);
 		}
 		if let ExprKind::Identifier(name) = &parent.kind
-			&& self.lookup_local(&name.0).is_none()
-			&& let Some(def) = self.defs.get(&name.0)
+			&& self.lookup_local(&name.0, name.1).is_none()
+			&& let Some(def) = self.defs.get_ident(name)
 			&& matches!(
 				self.defs.data(def).kind,
 				DefKind::Namespace | DefKind::Struct | DefKind::Enum | DefKind::TypeAlias
@@ -3295,8 +3310,8 @@ impl<'m> Checker<'m> {
 				.record_definition_target(parent.id, self.defs.stable(def));
 		}
 		if let ExprKind::Identifier(name) = &parent.kind
-			&& self.lookup_local(&name.0).is_none()
-			&& let Some(def) = self.defs.get(&name.0)
+			&& self.lookup_local(&name.0, name.1).is_none()
+			&& let Some(def) = self.defs.get_ident(name)
 			&& matches!(self.defs.data(def).kind, DefKind::Namespace)
 		{
 			let module = match (&self.defs.data(def).origin, self.defs.stable(def)) {
@@ -3353,8 +3368,8 @@ impl<'m> Checker<'m> {
 			};
 		}
 		if let ExprKind::Identifier(type_name) = &parent.kind
-			&& self.lookup_local(&type_name.0).is_none()
-			&& let Some(definition) = self.defs.get(&type_name.0)
+			&& self.lookup_local(&type_name.0, type_name.1).is_none()
+			&& let Some(definition) = self.defs.get_ident(type_name)
 			&& matches!(self.defs.data(definition).kind, DefKind::Struct)
 		{
 			if let Some((parameters, return_type, target, type_arguments)) =
@@ -3379,8 +3394,8 @@ impl<'m> Checker<'m> {
 			return self.interner.error();
 		}
 		if let ExprKind::Identifier(type_name) = &parent.kind
-			&& self.lookup_local(&type_name.0).is_none()
-			&& let Some(alias_def) = self.defs.get(&type_name.0)
+			&& self.lookup_local(&type_name.0, type_name.1).is_none()
+			&& let Some(alias_def) = self.defs.get_ident(type_name)
 			&& matches!(self.defs.data(alias_def).kind, DefKind::TypeAlias)
 			&& let Some(alias) = self.sigs.aliases.get(&alias_def).cloned()
 			&& let TyKind::Adt(owner, _) = self.interner.kind(alias.target).clone()
@@ -3418,8 +3433,8 @@ impl<'m> Checker<'m> {
 		}
 		// `EnumName.Variant` — a variant referenced through its type.
 		if let ExprKind::Identifier(tname) = &parent.kind
-			&& self.lookup_local(&tname.0).is_none()
-			&& let Some(def) = self.defs.get(&tname.0)
+			&& self.lookup_local(&tname.0, tname.1).is_none()
+			&& let Some(def) = self.defs.get_ident(tname)
 			&& let DefKind::Enum = self.defs.data(def).kind
 		{
 			let variants = &self.sigs.enums[&def].variants;
@@ -5411,7 +5426,7 @@ impl Checker<'_> {
 					parts
 						.iter()
 						.filter_map(|part| match &part.0 {
-							StringPart::InterpolatedExpr(expr) => Some(expr),
+							StringPart::InterpolatedExpr(expr) => Some(expr.as_ref()),
 							_ => None,
 						})
 						.collect(),

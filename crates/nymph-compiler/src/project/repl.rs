@@ -715,6 +715,8 @@ fn version_runtime_modules(
 
 fn declaration_visibility(declaration: &Declaration) -> Option<Visibility> {
 	match declaration {
+		Declaration::Expansion(_) => None,
+		Declaration::Attached { target, .. } => declaration_visibility(target),
 		Declaration::Import { .. } => None,
 		Declaration::Let { visibility, .. }
 		| Declaration::Func { visibility, .. }
@@ -734,6 +736,8 @@ fn declaration_visibility(declaration: &Declaration) -> Option<Visibility> {
 
 fn declaration_names(declaration: &Declaration, names: &mut BTreeSet<String>) {
 	match declaration {
+		Declaration::Expansion(_) => {}
+		Declaration::Attached { target, .. } => declaration_names(target, names),
 		Declaration::Let { meta, .. } | Declaration::ExternalLet(_, _, meta) => {
 			pattern_names(&meta.name.0, names);
 		}

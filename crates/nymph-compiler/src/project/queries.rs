@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
+use ecow::EcoString;
 use nymph_ast::{
-	Ident, Span,
+	Ident, Span, Spanned,
 	decl::{Declaration, Module},
 };
 use nymph_diagnostics::Diagnostic;
@@ -18,6 +19,9 @@ use super::{
 		SemanticModuleInput,
 	},
 };
+
+const META_FIXED_POINT_ROUND_LIMIT: usize = 64;
+const META_FIXED_POINT_IMPORT_LIMIT: usize = 10_000;
 
 #[salsa::tracked(returns(copy))]
 pub(crate) fn effective_lint_level(
@@ -92,7 +96,11 @@ fn policy_project_diagnostics(
 			continue;
 		}
 		let module_name = module.path(db).to_string();
-		for span in nymph_sema::query::echo_sites(&parse(db, module).tree) {
+		for span in nymph_sema::query::echo_sites(
+			&SemanticModuleInput::Project(module)
+				.project_parsed(db, key)
+				.tree,
+		) {
 			let message = "`echo` is erased from release builds";
 			let diagnostic = match level {
 				LintLevel::Allow => unreachable!(),
@@ -538,7 +546,9 @@ pub(crate) fn compiler_runtime_roles(
 #[derive(Clone, Debug, PartialEq)]
 pub struct ParsedModule {
 	pub tree: Module,
+	pub(crate) tokens: Arc<[Spanned<nymph_ast::token::Token>]>,
 	pub diagnostics: Arc<[Diagnostic]>,
+	pub(crate) origins: Arc<[crate::metaprogramming::ExpansionOrigin]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -626,14 +636,14 @@ impl ImportDiagnosticCause {
 #[salsa::tracked(returns(clone))]
 fn namespace_summary<'db>(
 	db: &'db dyn Db,
-	_key: ProjectKey<'db>,
+	key: ProjectKey<'db>,
 	module: SemanticModuleInput,
 ) -> Arc<nymph_sema::NamespaceSummary> {
 	#[cfg(feature = "test-support")]
 	db.semantic_query_will_execute("namespace_summary", module);
 	Arc::new(nymph_sema::namespace_summary(
 		module.identity(db),
-		&module.parsed(db).tree,
+		&module.project_parsed(db, key).tree,
 	))
 }
 
@@ -742,7 +752,7 @@ pub(crate) fn resolved_module_imports<'db>(
 		})
 		.collect::<Vec<_>>();
 	let locals = module
-		.parsed(db)
+		.project_parsed(db, key)
 		.tree
 		.members
 		.iter()
@@ -754,7 +764,7 @@ pub(crate) fn resolved_module_imports<'db>(
 	let mut references = Vec::new();
 	let mut diagnostic_causes = Vec::new();
 	let owner = module.display_key(db);
-	for import in graph.semantic_direct_imports(db, module).iter() {
+	for import in graph.semantic_direct_imports(db, key, module).iter() {
 		let Ok(target_key) = &import.target else {
 			continue;
 		};
@@ -920,16 +930,17 @@ impl SemanticModuleInput {
 
 	pub(crate) fn parsed(self, db: &dyn Db) -> Arc<ParsedModule> {
 		match self {
-			Self::Project(module) => parse(db, module).clone(),
+			Self::Project(module) => parse_expanded(db, module).clone(),
 			Self::Builtin(module) => parse_builtin(db, module).clone(),
 		}
 	}
 
-	pub(crate) fn imports(self, db: &dyn Db) -> Arc<DirectImports> {
-		match self {
-			Self::Project(module) => direct_imports(db, module).clone(),
-			Self::Builtin(module) => builtin_direct_imports(db, module).clone(),
-		}
+	pub(crate) fn project_parsed(self, db: &dyn Db, key: ProjectKey<'_>) -> Arc<ParsedModule> {
+		expanded_project_module(db, key, self)
+	}
+
+	pub(crate) fn project_imports(self, db: &dyn Db, key: ProjectKey<'_>) -> Arc<DirectImports> {
+		project_direct_imports(db, key, self).clone()
 	}
 
 	#[cfg(test)]
@@ -1174,6 +1185,7 @@ impl ProjectGraph {
 	pub(crate) fn semantic_direct_imports(
 		&self,
 		db: &dyn Db,
+		key: ProjectKey<'_>,
 		module: SemanticModuleInput,
 	) -> Arc<DirectImports> {
 		// A validated graph guarantees each successful import has a matching
@@ -1184,7 +1196,7 @@ impl ProjectGraph {
 			.iter()
 			.any(|(owner, _)| *owner == module)
 		{
-			module.imports(db)
+			module.project_imports(db, key)
 		} else {
 			Arc::new([])
 		}
@@ -1216,8 +1228,16 @@ impl ProjectGraph {
 }
 
 #[salsa::tracked]
-pub(crate) fn parse(db: &dyn Db, module: ModuleInput) -> Arc<ParsedModule> {
+fn parse_expanded(db: &dyn Db, module: ModuleInput) -> Arc<ParsedModule> {
 	parse_source(
+		module.source(db).unwrap_or_default(),
+		format!("{}.nym", module.path(db)),
+	)
+}
+
+#[salsa::tracked]
+pub(crate) fn parse(db: &dyn Db, module: ModuleInput) -> Arc<ParsedModule> {
+	parse_raw_source(
 		module.source(db).unwrap_or_default(),
 		format!("{}.nym", module.path(db)),
 	)
@@ -1245,13 +1265,276 @@ pub(crate) fn parse_builtin(db: &dyn Db, module: BuiltinModuleInput) -> Arc<Pars
 	}
 }
 
-fn parse_source(source: Arc<str>, path: String) -> Arc<ParsedModule> {
-	#[cfg(feature = "test-support")]
-	let _timing = super::benchmark_support::phase(super::benchmark_support::Phase::Parse);
+#[salsa::tracked]
+fn parse_builtin_raw(db: &dyn Db, module: BuiltinModuleInput) -> Arc<ParsedModule> {
+	let key = module.key(db);
+	let path = match key.domain {
+		BuiltinModuleDomain::ImportableStd => format!("std::{}.nym", key.path),
+		BuiltinModuleDomain::AmbientCore => format!("core::{}.nym", key.path),
+	};
+	parse_raw_source(module.source(db), path)
+}
+
+fn parse_raw_source(source: Arc<str>, path: String) -> Arc<ParsedModule> {
+	let tokens = nymph_syntax::lex(&source).tokens;
 	let parsed = nymph_syntax::parse_module(&source, path);
 	Arc::new(ParsedModule {
 		tree: parsed.tree,
+		tokens: tokens.into(),
 		diagnostics: parsed.diagnostics.into(),
+		origins: Arc::new([]),
+	})
+}
+
+#[salsa::tracked(returns(clone))]
+pub(super) fn expanded_project_module<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	root: SemanticModuleInput,
+) -> Arc<ParsedModule> {
+	let mut raw = Vec::new();
+	let mut pending = vec![root];
+	while let Some(module) = pending.pop() {
+		if raw.iter().any(|(input, _)| *input == module) {
+			continue;
+		}
+		let parsed = match module {
+			SemanticModuleInput::Project(module) => parse(db, module),
+			SemanticModuleInput::Builtin(module) => parse_builtin_raw(db, module),
+		};
+		pending.extend(
+			const_import_edges(db, key, module, parsed)
+				.into_iter()
+				.map(|(_, target)| target),
+		);
+		raw.push((module, parsed));
+	}
+	let mut extra_edges: BTreeMap<EcoString, Vec<crate::metaprogramming::ConstImport>> =
+		BTreeMap::new();
+	for round in 1..=META_FIXED_POINT_ROUND_LIMIT {
+		raw.sort_by_key(|(module, _)| module.display_key(db));
+		let world = raw
+			.iter()
+			.map(|(module, parsed)| {
+				let mut imports = const_imports(db, key, *module, parsed);
+				imports.extend(
+					extra_edges
+						.get(module.display_key(db).as_str())
+						.into_iter()
+						.flatten()
+						.cloned(),
+				);
+				crate::metaprogramming::ConstModuleSource {
+					key: module.display_key(db).into(),
+					path: parsed.tree.path.clone(),
+					source: match module {
+						SemanticModuleInput::Project(module) => module.source(db).unwrap_or_default(),
+						SemanticModuleInput::Builtin(module) => module.source(db),
+					},
+					imports,
+				}
+			})
+			.collect::<Vec<_>>();
+		let expanded = raw
+			.iter()
+			.map(|(module, parsed)| {
+				let source = match module {
+					SemanticModuleInput::Project(module) => module.source(db).unwrap_or_default(),
+					SemanticModuleInput::Builtin(module) => module.source(db),
+				};
+				let result = crate::metaprogramming::expand_source_with_imports(
+					&source,
+					parsed.tree.path.clone(),
+					module.display_key(db).into(),
+					&world,
+				);
+				(*module, Arc::clone(parsed), result)
+			})
+			.collect::<Vec<_>>();
+		let mut changed = false;
+		for (module, _, result) in &expanded {
+			let parsed = ParsedModule {
+				tree: result.tree.clone(),
+				tokens: result.tokens.clone().into(),
+				diagnostics: Arc::new([]),
+				origins: Arc::new([]),
+			};
+			for (import, target) in const_import_edges(db, key, *module, &parsed) {
+				let edges = extra_edges
+					.entry(module.display_key(db).into())
+					.or_default();
+				if !edges.contains(&import) {
+					edges.push(import);
+					changed = true;
+				}
+				if !raw.iter().any(|(input, _)| *input == target) {
+					pending.push(target);
+				}
+			}
+		}
+		while let Some(module) = pending.pop() {
+			if raw.iter().any(|(input, _)| *input == module) {
+				continue;
+			}
+			let parsed = match module {
+				SemanticModuleInput::Project(module) => parse(db, module),
+				SemanticModuleInput::Builtin(module) => parse_builtin_raw(db, module),
+			};
+			pending.extend(
+				const_import_edges(db, key, module, parsed)
+					.into_iter()
+					.map(|(_, target)| target),
+			);
+			raw.push((module, parsed));
+			changed = true;
+		}
+		if !changed {
+			let (_, _parsed, result) = expanded
+				.into_iter()
+				.find(|(module, _, _)| *module == root)
+				.expect("expanded closure contains its root");
+			let diagnostics = result
+				.diagnostics
+				.into_iter()
+				.map(|diagnostic| crate::metaprogramming::add_expansion_trace(diagnostic, &result.origins))
+				.collect::<Vec<_>>();
+			return Arc::new(ParsedModule {
+				tree: result.tree,
+				tokens: result.tokens.into(),
+				diagnostics: diagnostics.into(),
+				origins: result.origins.into(),
+			});
+		}
+		let import_count = raw.len() + extra_edges.values().map(Vec::len).sum::<usize>();
+		if round == META_FIXED_POINT_ROUND_LIMIT || import_count > META_FIXED_POINT_IMPORT_LIMIT {
+			let (_, _, result) = expanded
+				.into_iter()
+				.find(|(module, _, _)| *module == root)
+				.expect("expanded closure contains its root");
+			let (message, help) = if import_count > META_FIXED_POINT_IMPORT_LIMIT {
+				(
+					format!(
+						"compile-time expansion discovered more than {META_FIXED_POINT_IMPORT_LIMIT} modules and generated imports"
+					),
+					"remove recursively generated imports or reduce the generated module graph",
+				)
+			} else {
+				(
+					format!(
+						"compile-time import expansion did not reach a fixed point within {META_FIXED_POINT_ROUND_LIMIT} rounds"
+					),
+					"break the generated-import cycle or make each expansion converge to stable output",
+				)
+			};
+			let mut diagnostics = result
+				.diagnostics
+				.into_iter()
+				.map(|diagnostic| crate::metaprogramming::add_expansion_trace(diagnostic, &result.origins))
+				.collect::<Vec<_>>();
+			let span = result
+				.tree
+				.members
+				.iter()
+				.map(crate::metaprogramming::declaration_span)
+				.find(|span| span.origin != nymph_ast::OriginId::SOURCE)
+				.or_else(|| {
+					result
+						.tree
+						.members
+						.first()
+						.map(crate::metaprogramming::declaration_span)
+				})
+				.unwrap_or_else(|| Span::new(0, 0));
+			diagnostics.push(crate::metaprogramming::add_expansion_trace(
+				Diagnostic::error("META-FIXED-POINT".into(), message, span).with_help(help),
+				&result.origins,
+			));
+			return Arc::new(ParsedModule {
+				tree: result.tree,
+				tokens: result.tokens.into(),
+				diagnostics: diagnostics.into(),
+				origins: result.origins.into(),
+			});
+		}
+	}
+	unreachable!("fixed-point loop returns on convergence or its deterministic limit")
+}
+
+#[salsa::tracked]
+fn project_direct_imports<'db>(
+	db: &'db dyn Db,
+	key: ProjectKey<'db>,
+	module: SemanticModuleInput,
+) -> Arc<DirectImports> {
+	collect_imports(&module.project_parsed(db, key), &module.display_key(db))
+}
+
+fn const_import_edges(
+	db: &dyn Db,
+	key: ProjectKey<'_>,
+	owner: SemanticModuleInput,
+	parsed: &ParsedModule,
+) -> Vec<(crate::metaprogramming::ConstImport, SemanticModuleInput)> {
+	collect_imports(parsed, &owner.display_key(db))
+		.iter()
+		.filter_map(|import| {
+			let target = resolved_import_module(db, key, owner, import.target.as_ref().ok()?)?;
+			Some((const_import(import, target.display_key(db).into()), target))
+		})
+		.collect()
+}
+
+fn const_imports(
+	db: &dyn Db,
+	key: ProjectKey<'_>,
+	owner: SemanticModuleInput,
+	parsed: &ParsedModule,
+) -> Vec<crate::metaprogramming::ConstImport> {
+	collect_imports(parsed, &owner.display_key(db))
+		.iter()
+		.filter_map(|import| {
+			let target = resolved_import_module(db, key, owner, import.target.as_ref().ok()?)?;
+			Some(const_import(import, target.display_key(db).into()))
+		})
+		.collect()
+}
+
+fn const_import(import: &DirectImport, target: EcoString) -> crate::metaprogramming::ConstImport {
+	crate::metaprogramming::ConstImport {
+		target,
+		namespace: import.namespace.0.clone(),
+		names: import
+			.with_idents
+			.iter()
+			.map(
+				|(source, alias)| crate::metaprogramming::ConstImportSource {
+					source: source.0.clone(),
+					local: alias.as_ref().unwrap_or(source).0.clone(),
+				},
+			)
+			.collect(),
+	}
+}
+
+fn parse_source(source: Arc<str>, path: String) -> Arc<ParsedModule> {
+	#[cfg(feature = "test-support")]
+	let _timing = super::benchmark_support::phase(super::benchmark_support::Phase::Parse);
+	let expanded = crate::metaprogramming::expand_source_with_imports(
+		&source,
+		path.into(),
+		"<single-module>".into(),
+		&[],
+	);
+	let diagnostics = expanded
+		.diagnostics
+		.into_iter()
+		.map(|diagnostic| crate::metaprogramming::add_expansion_trace(diagnostic, &expanded.origins))
+		.collect::<Vec<_>>();
+	Arc::new(ParsedModule {
+		tree: expanded.tree,
+		tokens: expanded.tokens.into(),
+		diagnostics: diagnostics.into(),
+		origins: expanded.origins.into(),
 	})
 }
 
@@ -1262,14 +1545,14 @@ pub(crate) fn tooling_top_level_declarations(
 ) -> Arc<[nymph_sema::TopLevelDeclaration]> {
 	nymph_sema::top_level_declarations(
 		SemanticModuleInput::Project(module).identity(db),
-		&parse(db, module).tree,
+		&parse_expanded(db, module).tree,
 	)
 	.into()
 }
 
 #[salsa::tracked]
 pub(crate) fn direct_imports(db: &dyn Db, module: ModuleInput) -> Arc<DirectImports> {
-	collect_imports(parse(db, module), module.path(db).as_str())
+	collect_imports(parse_expanded(db, module), module.path(db).as_str())
 }
 
 #[salsa::tracked]
@@ -2054,18 +2337,31 @@ pub(crate) fn binding_name<'db>(
 		.iter()
 		.position(|module| module.identity(db) == definition.module);
 	let importable = key.builtin_registry(db).modules(db);
+	let runtime_importable_count = importable
+		.iter()
+		.filter(|module| module.key(db).path.as_ref() != "meta")
+		.count();
 	let importable_tag = importable
 		.iter()
-		.position(|module| SemanticModuleInput::Builtin(*module).identity(db) == definition.module)
+		.copied()
+		.filter(|module| module.key(db).path.as_ref() != "meta")
+		.position(|module| SemanticModuleInput::Builtin(module).identity(db) == definition.module)
 		.map(|index| graph.semantic_order.len() + index);
 	let ambient = key.ambient_core_registry(db).modules(db);
 	let ambient_tag = ambient
 		.iter()
 		.position(|module| ambient_identity(db, *module) == definition.module)
-		.map(|index| graph.semantic_order.len() + importable.len() + index);
+		.map(|index| graph.semantic_order.len() + runtime_importable_count + index);
+	let meta_tag = importable
+		.iter()
+		.copied()
+		.find(|module| module.key(db).path.as_ref() == "meta")
+		.filter(|module| SemanticModuleInput::Builtin(*module).identity(db) == definition.module)
+		.map(|_| graph.semantic_order.len() + runtime_importable_count + ambient.len());
 	let tag = project_tag
 		.or(importable_tag)
 		.or(ambient_tag)
+		.or(meta_tag)
 		.ok_or_else(|| nymph_sema::StableNameLookupError::MissingBinding {
 			definition: definition.clone(),
 		})?;
@@ -2674,7 +2970,7 @@ pub(crate) fn interface_module_analysis<'db>(
 		);
 	}
 	roots.extend(dependencies);
-	let parsed = module.parsed(db);
+	let parsed = module.project_parsed(db, key);
 	#[cfg(feature = "test-support")]
 	let environment_timing =
 		super::benchmark_support::phase(super::benchmark_support::Phase::Environment);
@@ -2793,6 +3089,10 @@ pub(crate) fn interface_module_analysis<'db>(
 			});
 		}
 	}
+	for diagnostic in &mut diagnostics {
+		diagnostic.diag =
+			crate::metaprogramming::add_expansion_trace(diagnostic.diag.clone(), &parsed.origins);
+	}
 	let mut semantic = result.analysis.as_ref().clone();
 	semantic.import_references = resolved.references.clone().into();
 	Arc::new(super::session::ModuleAnalysis {
@@ -2811,7 +3111,7 @@ fn interface_declared_headers<'db>(
 	key: super::session::ProjectKey<'db>,
 	module: SemanticModuleInput,
 ) -> Arc<nymph_sema::DeclaredHeaders> {
-	let own = nymph_sema::declared_headers(module.identity(db), &module.parsed(db).tree);
+	let own = nymph_sema::declared_headers(module.identity(db), &module.project_parsed(db, key).tree);
 	let mut checked_definitions = own.checked_definitions.clone();
 	checked_definitions.extend(
 		resolved_module_imports(db, key, module)
@@ -3008,7 +3308,7 @@ pub(crate) fn interface_project_diagnostics<'db>(
 		// Graph roots remain first. Then check valid dependencies and modules
 		// recovered solely from parser errors in dependency order.
 		for (module, _) in graph.semantic_direct.iter() {
-			let parsed = module.parsed(db);
+			let parsed = module.project_parsed(db, key);
 			let valid = graph.semantic_order.contains(module);
 			let parser_recovered = parsed.diagnostics.iter().any(Diagnostic::is_error)
 				&& graph
@@ -3071,6 +3371,7 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 
 	struct Walker<'a> {
 		db: &'a dyn Db,
+		key: ProjectKey<'a>,
 		active: &'a BTreeMap<(PackageId, ModulePath), ModuleInput>,
 		builtins: &'a BTreeMap<Arc<str>, BuiltinModuleInput>,
 		aliases: &'a BTreeMap<(PackageId, Arc<str>), PackageId>,
@@ -3174,13 +3475,13 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 			self.colors.insert(module, Color::Gray);
 			self.stack.push(module);
 
-			let parsed = module.parsed(self.db);
+			let parsed = module.project_parsed(self.db, self.key);
 			let mut ok = true;
 			for diag in parsed.diagnostics.iter().filter(|diag| diag.is_error()) {
 				self.diagnostic(&display, diag.clone());
 				ok = false;
 			}
-			let imports = module.imports(self.db);
+			let imports = module.project_imports(self.db, self.key);
 			let mut handles = Vec::new();
 			let mut semantic_handles = Vec::new();
 			let mut unresolved_targets = Vec::new();
@@ -3260,6 +3561,7 @@ pub(crate) fn project_graph<'db>(db: &'db dyn Db, key: ProjectKey<'db>) -> Arc<P
 		.collect::<BTreeMap<_, _>>();
 	let mut walker = Walker {
 		db,
+		key,
 		active: &active,
 		builtins: &builtins,
 		aliases: &aliases,
@@ -3570,7 +3872,7 @@ mod tests {
 				.collect::<Vec<_>>(),
 			["a", "std::tool"]
 		);
-		assert_eq!(graph.semantic_direct_imports(&db, main).len(), 2);
+		assert_eq!(graph.semantic_direct_imports(&db, key, main).len(), 2);
 	}
 
 	#[test]

@@ -32,6 +32,65 @@ fn count(events: &[SemanticQueryEvent], query: &str, module: Option<&str>) -> us
 		.count()
 }
 
+#[test]
+fn imported_const_changes_invalidate_consumers_but_not_unrelated_modules() {
+	let events = Arc::new(Mutex::new(Vec::<SemanticQueryEvent>::new()));
+	let sink = events.clone();
+	let mut session = CompilerSession::with_detailed_event_callback_for_test(move |event| {
+		sink.lock().unwrap().push(event)
+	});
+	let project = ProjectId::new("incremental-const");
+	let main = ModulePath::new("main").unwrap();
+	let macros = ModulePath::new("macros").unwrap();
+	let unrelated = ModulePath::new("unrelated").unwrap();
+	session.set_source(
+		project.clone(),
+		main.clone(),
+		"import @/macros with (make)\n$(make())".into(),
+		SourceVersion(1),
+	);
+	session.set_source(
+		project.clone(),
+		macros.clone(),
+		"public const func make(): meta.Tokens = \\(public func answer(): int = 41)".into(),
+		SourceVersion(1),
+	);
+	session.set_source(
+		project.clone(),
+		unrelated.clone(),
+		"public func untouched(): int = 0".into(),
+		SourceVersion(1),
+	);
+	let first = session
+		.emit_interface_module_for_test(
+			project.clone(),
+			main.clone(),
+			main.clone(),
+			EntryMode::Library,
+		)
+		.expect("initial expansion emits");
+	assert!(first.contains("41n"), "unexpected output: {first}");
+
+	events.lock().unwrap().clear();
+	session.set_source(
+		project.clone(),
+		macros,
+		"public const func make(): meta.Tokens = \\(public func answer(): int = 42)".into(),
+		SourceVersion(2),
+	);
+	let second = session
+		.emit_interface_module_for_test(project, main.clone(), main, EntryMode::Library)
+		.expect("updated expansion emits");
+	assert!(second.contains("42n"), "unexpected output: {second}");
+	assert!(
+		!events
+			.lock()
+			.unwrap()
+			.iter()
+			.any(|event| event.module.as_deref() == Some(unrelated.as_str()))
+	);
+}
+
 fn install_sources(
 	session: &mut CompilerSession,
 	project: &ProjectId,

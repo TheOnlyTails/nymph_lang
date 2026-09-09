@@ -2,10 +2,12 @@
 //! (`nymph_compiler::project`): resolution, namespace/`with` binding,
 //! visibility, cycles, and collisions — over a virtual, filesystem-free
 //! project (an `FxHashMap<String, String>` keyed by canonical module path).
+use nymph_ast::Span;
 use nymph_compiler::{
 	CompiledEntryRoot, CompilerOptions, check_project, check_project_with_embedded_std,
 	compile_project, compile_project_library_with_embedded_std_and_options,
-	compile_project_with_embedded_std_and_options, project::compile_project_module_sources_with_std,
+	compile_project_with_embedded_std_and_options, embedded_std_provider,
+	project::compile_project_module_sources_with_std,
 };
 use rustc_hash::FxHashMap;
 /// Build a `load` closure over a virtual project map.
@@ -40,6 +42,1094 @@ fn embedded_std_project_check_resolves_project_and_std_graph() {
 	let diags = check_project_with_embedded_std("main", &loader(files));
 
 	assert!(diags.is_empty(), "expected a clean project, got: {diags:?}");
+}
+
+#[test]
+fn const_token_expansion_runs_through_the_normal_project_pipeline() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"import std/meta as meta\n\
+		 const func make_answer(value: int): meta.Tokens = \\
+		(func answer(): int = $(value))\n\
+		 $(make_answer(42))\n\
+		 func main(): void = { let value: int = answer() }",
+	)]);
+	let diagnostics = check_project_with_embedded_std("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn aliased_meta_values_remain_compile_time_only() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"import std/meta as reflection\n\
+		 const func only_at_compile_time(value: reflection.Tokens): reflection.Tokens = value\n\
+		 func main(): void = {}",
+	)]);
+	let sources =
+		compile_project_module_sources_with_std("main", &loader(files), &embedded_std_provider)
+			.expect("project should compile");
+	assert!(
+		!sources["main"].contains("only_at_compile_time"),
+		"meta-typed const functions must not leak into runtime output: {}",
+		sources["main"]
+	);
+}
+
+#[test]
+fn runtime_declarations_cannot_expose_aliased_meta_values() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"import std/meta as reflection\n\
+		 func leak(value: reflection.Tokens): reflection.Tokens = value\n\
+		 func main(): void = {}",
+	)]);
+	let diagnostics = check_project_with_embedded_std("main", &loader(files));
+	assert!(
+		diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.diag.message == "std/meta values are compile-time-only"),
+		"expected a compile-time-only diagnostic, got: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn generated_source_expansions_work_in_type_and_expression_positions() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func make(): meta.Tokens = \
+		   \\(func answer(value: $(\\(int))): $(\\(int)) = value + $(\\(2)))\n\
+		 $(make())\n\
+		 func result(): int = answer(40)\n\
+		 func main(): void = {}",
+	)]);
+	assert_eq!(run_project(files, "result", ""), "42");
+}
+
+#[test]
+fn source_expansions_work_at_every_nested_grammar_destination() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const let type_tokens: meta.Tokens = \\(int)\n\
+		 const let parameter: meta.Tokens = {\n\
+		   let name = meta.Name.exposed(\"value\")\n\
+		   \\($(name): int)\n\
+		 }\n\
+		 const let field: meta.Tokens = \\(value: int)\n\
+		 const let variant: meta.Tokens = \\(Value(value: int))\n\
+		 const let pattern: meta.Tokens = {\n\
+		   let name = meta.Name.exposed(\"incremented\")\n\
+		   \\($(name))\n\
+		 }\n\
+		 const let statement: meta.Tokens = {\n\
+		   let value = meta.Name.exposed(\"value\")\n\
+		   \\(let $(pattern): int = $(value) + 1)\n\
+		 }\n\
+		 const let arm: meta.Tokens = \\(41 -> 42, _ -> 0)\n\
+		 struct Box($(field))\n\
+		 enum Number { $(variant) }\n\
+		 func answer($(parameter)): $(type_tokens) = {\n\
+		   $(statement)\n\
+		   match (incremented) { $(arm) }\n\
+		 }\n\
+		 func result(): int = answer(40)\n\
+		 func main(): void = {}",
+	)]);
+	assert_eq!(run_project(files, "result", ""), "42");
+}
+
+#[test]
+fn expansion_generated_imports_participate_in_graph_discovery() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"const func generated_import(): meta.Tokens = \\
+			(import @/generated with (answer))\n\
+			 $(generated_import())\n\
+			 func main(): void = { let value: int = answer() }",
+		),
+		("generated", "public func answer(): int = 42"),
+	]);
+	let diagnostics = check_project("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn generated_import_fixed_point_limit_is_labeled_and_actionable() {
+	let mut files = FxHashMap::default();
+	for index in 0..=64 {
+		let key = if index == 0 {
+			"main".to_string()
+		} else {
+			format!("generated_{index}")
+		};
+		let next = format!("generated_{}", index + 1);
+		files.insert(
+			key,
+			format!(
+				"const func generated_import(): meta.Tokens = \\(import @/{next})\n$(generated_import())"
+			),
+		);
+	}
+	files.insert("generated_65".to_string(), String::new());
+	let load = |key: &str| files.get(key).cloned();
+	let diagnostics = check_project("main", &load);
+	let diagnostic = diagnostics
+		.iter()
+		.find(|diagnostic| diagnostic.diag.code == "META-FIXED-POINT")
+		.unwrap_or_else(|| panic!("missing fixed-point diagnostic: {diagnostics:?}"));
+
+	assert_ne!(diagnostic.diag.span.origin, nymph_ast::OriginId::SOURCE);
+	assert!(
+		diagnostic
+			.diag
+			.help
+			.as_deref()
+			.is_some_and(|help| help.contains("cycle") || help.contains("stable output"))
+	);
+	assert!(
+		diagnostic
+			.diag
+			.labels
+			.iter()
+			.any(|label| label.message.contains("macro was defined here"))
+	);
+}
+
+#[test]
+fn attached_macros_apply_to_imports_before_graph_discovery() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"const func inspect(target: meta.Import): meta.Tokens = \\()\n\
+			 $[inspect()] import @/generated with (answer)\n\
+			 func main(): void = { let value: int = answer() }",
+		),
+		("generated", "public func answer(): int = 42"),
+	]);
+	let diagnostics = check_project("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn typed_import_records_rebuild_before_graph_discovery() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"const let target: meta.Import = meta.Import.parse(\\(import @/generated with (answer)))\n\
+			 $(meta.Import(\
+			  root = target.root,\
+			  path = target.path,\
+			  alias = target.alias,\
+			  names = target.names,\
+			  span = target.span,\
+			 ))\n\
+			func main(): void = { let value: int = answer() }",
+		),
+		("generated", "public func answer(): int = 42"),
+	]);
+	let diagnostics = check_project("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn attached_macros_receive_the_typed_target_while_the_compiler_retains_it() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func inspect(target: meta.Struct): meta.Tokens = \\()\n\
+		 $[inspect()] struct Point(x: int)\n\
+		 func main(): void = { let point = Point(x = 1) }",
+	)]);
+	let diagnostics = check_project("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn imported_const_functions_expand_with_their_definition_scope() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/macros with (make)\n\
+			 $(make(41))\n\
+			 func main(): void = {}",
+		),
+		(
+			"macros",
+			"const func plus_one(value: int): int = value + 1\n\
+			 public const func make(value: int): meta.Tokens = \
+			 \\(func answer(): int = $(plus_one(value)))",
+		),
+	]);
+	let diagnostics = check_project("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn imported_const_macros_can_add_modules_to_the_project_graph() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import @/macros with (add_generated_import)\n\
+			 $(add_generated_import())\n\
+			 func main(): void = { generated() }",
+		),
+		(
+			"macros",
+			"public const func add_generated_import(): meta.Tokens = \
+			 \\(import @/generated with (generated))",
+		),
+		("generated", "public func generated(): void = {}"),
+	]);
+	let diagnostics = check_project("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn imported_const_protocol_dispatch_uses_the_values_nominal_owner() {
+	let files = FxHashMap::from_iter([
+		(
+			"main",
+			"import std/meta as meta\n\
+			 import @/macros with (make)\n\
+			 struct Box\n\
+			 impl Into<Other = meta.Tokens> for Box {\n\
+			   func into(): meta.Tokens = \\(func generated(): int = 0)\n\
+			 }\n\
+			 $(make())\n\
+			 func main(): void = { let value: int = generated() }",
+		),
+		(
+			"macros",
+			"import std/meta as meta\n\
+			 public struct Box\n\
+			 impl Into<Other = meta.Tokens> for Box {\n\
+			   func into(): meta.Tokens = \\(func generated(): int = 42)\n\
+			 }\n\
+			 public const func make(): Box = Box()",
+		),
+	]);
+	let compiled = compile_project_with_embedded_std_and_options(
+		"main",
+		&loader(files),
+		&CompilerOptions::default(),
+	)
+	.expect("project should compile with the imported type's Into implementation");
+	assert!(compiled.js.contains("42"));
+}
+
+#[test]
+fn typed_meta_functions_are_constructible_and_convert_back_to_tokens() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const let target: meta.Function = meta.Function.parse(\\(func answer(): int = 0))\n\
+		 $(meta.Function(\n\
+		     visibility = target.visibility,\n\
+		     name = target.name,\n\
+		     is_const = false,\n\
+		     is_async = target.is_async,\n\
+		     parameters = target.parameters,\n\
+		     return_type = target.return_type,\n\
+		     body = meta.Expression.parse(\\(42)),\n\
+		     span = target.span,\n\
+		   ))\n\
+		 func result(): int = answer()\n\
+		 func main(): void = {}",
+	)]);
+	assert_eq!(run_project(files, "result", ""), "42");
+}
+
+#[test]
+fn public_meta_tokens_and_flat_token_variants_are_constructible() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const let answer: meta.Tokens = meta.Tokens(items = #[\
+		   meta.Token.Func,\
+		   meta.Token.Identifier(value = \"answer\"),\
+		   meta.Token.LParen,\
+		   meta.Token.RParen,\
+		   meta.Token.Colon,\
+		   meta.Token.IntType,\
+		   meta.Token.Eq,\
+		   meta.Token.Int(value = 42u),\
+		 ])\n\
+		 $(answer)\n\
+		 func result(): int = answer()\n\
+		 func main(): void = {}",
+	)]);
+	assert_eq!(run_project(files, "result", ""), "42");
+}
+
+#[test]
+fn public_meta_span_constructor_preserves_context_and_origin() {
+	let source = "const func reject(target: meta.Struct): Result<meta.Tokens, meta.Diagnostic> = \
+		 Error(error = meta.Diagnostic(\
+		   message = \"constructed span\",\
+		   span = meta.Span(\
+		     start = 7u,\
+		     end = 11u,\
+		     context = meta.SyntaxContext.Fresh(origin = 3u, index = 5u),\
+		     origin = 3u,\
+		   ),\
+		 ))\n\
+		 $[reject()] struct Point";
+	let files = FxHashMap::from_iter([("main", source)]);
+	let diagnostics = check_project("main", &loader(files));
+	let span = diagnostics
+		.iter()
+		.find(|diagnostic| diagnostic.diag.message == "constructed span")
+		.unwrap_or_else(|| panic!("constructed diagnostic, got: {diagnostics:?}"))
+		.diag
+		.span;
+	assert_eq!(span.start, 7);
+	assert_eq!(span.end, 11);
+	assert_eq!(span.origin.0, 3);
+	assert_eq!(
+		span.context,
+		nymph_ast::SyntaxContext::Fresh {
+			origin: nymph_ast::OriginId(3),
+			index: 5,
+		}
+	);
+}
+
+#[test]
+fn public_struct_and_declaration_records_rebuild_nested_members() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const let target: meta.Struct = meta.Struct.parse(\\(struct Point { namespace func answer(): int = 42 }))\n\
+		 $(meta.Declaration.Struct(value = meta.Struct(\
+		     visibility = target.visibility,\
+		     name = target.name,\
+		     fields = target.fields,\
+		     members = target.members,\
+		     span = target.span,\
+		   )))\n\
+		 func result(): int = Point.answer()\n\
+		 func main(): void = {}",
+	)]);
+	assert_eq!(run_project(files, "result", ""), "42");
+}
+
+#[test]
+fn const_evaluation_supports_finite_collections_ranges_and_state_loops() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"struct Pair(left: int, right: int)\n\
+		 const func pair_value(): int = match (Pair(left = 40, right = 2)) {\
+		   Pair(left = left, right = right) -> left + right,\
+		 }\n\
+		 const func sum(): int = loop (let index = 0, let total = 0) {\
+		   if (index == 4) break total\n\
+		   continue(index = index + 1, total = total + index)\
+		 }\n\
+		 const func last(): Option<int> = for (value in 40..=42) {\
+		   if (value == 42) break value\
+		 }\n\
+		 const let base: int = #{ \"sum\": sum() + match (last()) {\
+		   Some(value = value) -> value,\
+		   None -> 0,\
+		 } - 6 + pair_value() - 42 }[\"sum\"]\n\
+		 const let answer: int = {\
+		   let plus_one = value -> value + 1\n\
+		   plus_one(base - 1)\
+		 }\n\
+		 $(\\(func result(): int = $(answer)))\n\
+		 func main(): void = {}",
+	)]);
+	assert_eq!(run_project(files, "result", ""), "42");
+}
+
+#[test]
+fn broad_attached_macro_can_pattern_match_the_public_declaration_enum() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func inspect_struct(target: meta.Declaration): meta.Tokens = match (target) {\n\
+		   meta.Declaration.Struct(value = value) -> \\(),\n\
+		   _ -> \\(),\n\
+		 }\n\
+		 $[inspect_struct()] struct Point(x: int)\n\
+		 func main(): void = { let point = Point(x = 1) }",
+	)]);
+	let diagnostics = check_project("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn narrow_meta_records_expose_constructible_syntax_fields() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func derive_copy(target: meta.Struct): meta.Tokens = \
+		\\(struct Copy(...$(target.fields,)))\n\
+		 $[derive_copy()] struct Point(x: int, y: int)\n\
+		 func main(): void = {\n\
+		   let point = Point(x = 1, y = 2)\n\
+		   let copy = Copy(x = 1, y = 2)\
+		 }",
+	)]);
+	let diagnostics = check_project("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn attached_macro_result_diagnostics_use_the_supplied_meta_span() {
+	let source = "const func reject(target: meta.Struct): Result<meta.Tokens, meta.Diagnostic> = \
+		 Error(error = meta.Diagnostic(message = \"derive failed\", span = target.span))\n\
+		 $[reject()] struct Point(x: int)";
+	let files = FxHashMap::from_iter([("main", source)]);
+	let diagnostics = check_project("main", &loader(files));
+	let diagnostic = diagnostics
+		.iter()
+		.find(|diagnostic| diagnostic.diag.message == "derive failed")
+		.expect("macro diagnostic");
+	let start = source.find("struct Point").expect("target declaration");
+	assert_eq!(
+		diagnostic.diag.span,
+		Span::new(start, start + "struct Point(x: int)".len())
+	);
+}
+
+#[test]
+fn attached_macro_reports_every_returned_diagnostic() {
+	let source = "const func reject(target: meta.Struct): Result<meta.Tokens, #[meta.Diagnostic]> = \
+		 Error(error = #[\
+			meta.Diagnostic(message = \"first failure\", span = target.span), \
+			meta.Diagnostic(message = \"second failure\", span = target.span)\
+		 ])\n\
+		 $[reject()] struct Point(x: int)";
+	let files = FxHashMap::from_iter([("main", source)]);
+	let diagnostics = check_project("main", &loader(files));
+	let messages = diagnostics
+		.iter()
+		.map(|diagnostic| diagnostic.diag.message.as_str())
+		.filter(|message| message.ends_with("failure"))
+		.collect::<Vec<_>>();
+	assert_eq!(messages, ["first failure", "second failure"]);
+}
+
+#[test]
+fn attached_macro_accepts_result_ok_tokens() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func inspect(target: meta.Struct): Result<meta.Tokens, meta.Diagnostic> = \
+		 Ok(value = \\())\n\
+		 $[inspect()] struct Point(x: int)\n\
+		 func main(): void = { let point = Point(x = 1) }",
+	)]);
+	let diagnostics = check_project("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn direct_expansion_accepts_meta_syntax_values_and_result_wrappers() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func make(): Result<meta.Function, meta.Diagnostic> = \
+		 Ok(value = meta.Function.parse(\\(func generated(): int = 42)))\n\
+		 $(make())\n\
+		 func main(): void = { let value: int = generated() }",
+	)]);
+	let diagnostics = check_project("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn every_typed_meta_fragment_expands_directly_at_its_grammar_destination() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"import std/meta as meta\n\
+		 const let expression: meta.Expression = meta.Expression.parse(\\(40 + 2))\n\
+		 const let statement: meta.Statement = meta.Statement.parse(\\(let local: int = 1))\n\
+		 const let pattern: meta.Pattern = meta.Pattern.parse(\\(answer))\n\
+		 const let type_: meta.Type = meta.Type.parse(\\(int))\n\
+		 const let parameter: meta.Parameter = meta.Parameter.parse(\\(input: int))\n\
+		 const let field: meta.Field = meta.Field.parse(\\(value: int))\n\
+		 const let variant: meta.Variant = meta.Variant.parse(\\(One))\n\
+		 const let arm: meta.MatchArm = meta.MatchArm.parse(\\(_ -> 42))\n\
+		 struct Box($(field))\n\
+		 enum Choice { $(variant) }\n\
+		 func generated($(parameter)): $(type_) = {\n\
+		   $(statement)\n\
+		   let $(pattern): int = $(expression)\n\
+		   match (Choice.One) { $(arm) }\n\
+		 }\n\
+		 func main(): void = { let result: int = generated(0) }",
+	)]);
+	let diagnostics = check_project_with_embedded_std("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn direct_expansion_uses_user_defined_into_tokens() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"import std/meta as meta\n\
+		 struct Answer(value: int)\n\
+		 impl Into<Other = meta.Tokens> for Answer {\n\
+		   func into(): meta.Tokens = \\(func generated(): int = $(this.value))\n\
+		 }\n\
+		 const func make(): Answer = Answer(value = 42)\n\
+		 $(make())\n\
+		 func main(): void = { let value: int = generated() }",
+	)]);
+	let diagnostics = check_project_with_embedded_std("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn direct_expansion_dispatches_user_into_for_enum_values() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"import std/meta as meta\n\
+		 enum Answer { Value(amount: int) }\n\
+		 impl Into<Other = meta.Tokens> for Answer {\n\
+		   func into(): meta.Tokens = match (this) {\n\
+		     Answer.Value(amount) -> \\(func generated(): int = $(amount)),\n\
+		   }\n\
+		 }\n\
+		 const func make(): Answer = Answer.Value(amount = 42)\n\
+		 $(make())\n\
+		 func main(): void = { let value: int = generated() }",
+	)]);
+	let diagnostics = check_project_with_embedded_std("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn iterable_token_splicing_accepts_non_list_iterators_and_separators() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"import std/meta as meta\n\
+		 struct ParameterTokens(index: int)\n\
+		 struct Parameters\n\
+		 impl Iterable<meta.Tokens> for Parameters {\n\
+		   func iter(): ParameterTokens = ParameterTokens(index = 0)\n\
+		 }\n\
+		 impl Iterator<meta.Tokens> for ParameterTokens {\n\
+		   func next(): Iteration<meta.Tokens, ParameterTokens> = if (this.index == 0) {\n\
+		     Iteration.Yield(item = \\(left: int), next = ParameterTokens(index = 1))\n\
+		   } else if (this.index == 1) {\n\
+		     Iteration.Yield(item = \\(right: int), next = ParameterTokens(index = 2))\n\
+		   } else Iteration.Done\n\
+		 }\n\
+		 const func make(name: meta.Name, parameters: ParameterTokens): meta.Tokens = \
+		   \\(func $(name)(...$(parameters,)): int = 42)\n\
+		 $(make(meta.Name.exposed(\"add\"), Parameters().iter()))\n\
+		 $(make(meta.Name.exposed(\"one\"), ParameterTokens(index = 1)))\n\
+		 $(make(meta.Name.exposed(\"zero\"), ParameterTokens(index = 2)))\n\
+		 func main(): void = {\n\
+		   let value: int = add(20, 22) + one(1) + zero()\n\
+		 }",
+	)]);
+	let diagnostics = check_project_with_embedded_std("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn direct_macro_output_flattens_generic_iterators_in_order() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"import std/meta as meta\n\
+		 struct Functions(index: int)\n\
+		 impl Iterator<meta.Function> for Functions {\n\
+		   func next(): Iteration<meta.Function, Functions> = if (this.index == 0) {\n\
+		     Iteration.Yield(\
+		       item = meta.Function.parse(\\(func first(): int = 20)),\
+		       next = Functions(index = 1),\
+		     )\n\
+		   } else if (this.index == 1) {\n\
+		     Iteration.Yield(\
+		       item = meta.Function.parse(\\(func second(): int = 22)),\
+		       next = Functions(index = 2),\
+		     )\n\
+		   } else Iteration.Done\n\
+		 }\n\
+		 const func make(): Functions = Functions(index = 0)\n\
+		 $(make())\n\
+		 func main(): void = { let value: int = first() + second() }",
+	)]);
+	let diagnostics = check_project_with_embedded_std("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn stacked_attachments_are_additive_and_flatten_zero_or_many_outputs() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func emit_nothing(target: meta.Struct): meta.Tokens = \\()\n\
+		 const func emit_many(target: meta.Struct): Result<#[meta.Function], #[meta.Diagnostic]> = \
+		 Ok(value = #[\
+		   meta.Function.parse(\\(func first(): int = 20)),\
+		   meta.Function.parse(\\(func second(): int = 22)),\
+		 ])\n\
+		 $[emit_nothing()] $[emit_many()] struct Point(value: int)\n\
+		 func main(): void = {\
+		   let point = Point(value = first() + second())\
+		 }",
+	)]);
+	let diagnostics = check_project("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn every_stacked_attachment_is_checked_against_the_original_target() {
+	let source = "const func emit_function(target: meta.Struct): meta.Tokens = \
+		 \\(func generated(): int = 42)\n\
+		 const func expects_function(target: meta.Function): meta.Tokens = \\()\n\
+		 $[emit_function()] $[expects_function()] struct Point\n\
+		 func main(): void = { let value: int = generated() }";
+	let diagnostics = check_project("main", &loader(FxHashMap::from_iter([("main", source)])));
+	let diagnostic = diagnostics
+		.iter()
+		.find(|diagnostic| diagnostic.diag.message.contains("expects `meta.Function`"))
+		.unwrap_or_else(|| panic!("missing original-target mismatch: {diagnostics:?}"));
+	assert!(
+		diagnostic
+			.diag
+			.labels
+			.iter()
+			.any(|label| label.message.contains("target is Struct")),
+		"missing original target label: {diagnostic:?}"
+	);
+	assert!(
+		!diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.diag.message.contains("generated")
+				&& diagnostic.diag.code != "META001"),
+		"the successful sibling output was not retained: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn attached_macros_accept_alias_narrow_targets() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func inspect_alias(target: meta.TypeAlias): meta.Tokens = \\()\n\
+		 $[inspect_alias()] type Count = int\n\
+		 func main(): void = {}",
+	)]);
+	let diagnostics = check_project("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn attached_macro_target_mismatch_is_reported_before_execution() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func only_struct(target: meta.Struct): meta.Tokens = \\($(target))\n\
+		 $[only_struct()] func main(): void = {}",
+	)]);
+	let diagnostics = check_project("main", &loader(files));
+	assert!(
+		diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.diag.message.contains("expects `meta.Struct`")),
+		"missing target mismatch: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn token_splices_insert_the_separator_only_between_items() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func make_adder(parameters: #[meta.Tokens], body: meta.Tokens): meta.Tokens = {\n\
+		   let name = meta.Name.exposed(\"add\")\n\
+		   \\(func $(name)(...$(parameters,)): int = $(body))\n\
+		 }\n\
+		 $(make_adder(#[\\(x: int), \\(y: int)], \\(x + y)))\n\
+		 func main(): void = { let result: int = add(20, 22) }",
+	)]);
+	let diagnostics = check_project("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn const_let_is_evaluated_even_when_nothing_references_it() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const let broken: int = 1 / 0\nfunc main(): void = {}",
+	)]);
+	let diagnostics = check_project("main", &loader(files));
+	assert!(
+		diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.diag.message.contains("division by zero")),
+		"missing const-evaluation diagnostic: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn stacked_attachment_output_follows_source_order_after_the_original() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func first(target: meta.Struct): meta.Tokens = \
+		\\(func attachment_source_order_first_marker(): int = 20)\n\
+		 const func second(target: meta.Struct): meta.Tokens = \
+		\\(func attachment_source_order_second_marker(): int = 22)\n\
+		 $[first()] $[second()] struct Point(value: int)\n\
+		 func main(): void = {\
+		   let point = Point(value = attachment_source_order_first_marker() + attachment_source_order_second_marker())\
+		 }",
+	)]);
+	let sources =
+		compile_project_module_sources_with_std("main", &loader(files), &embedded_std_provider)
+			.expect("additive attachments should compile");
+	let source = &sources["main"];
+	let point = source.find("Point").expect("original struct");
+	let first = source
+		.find("attachment_source_order_first_marker")
+		.expect("first attachment output");
+	let second = source
+		.find("attachment_source_order_second_marker")
+		.expect("second attachment output");
+	assert!(
+		point < first && first < second,
+		"unexpected output order: {source}"
+	);
+}
+
+#[test]
+fn stacked_attachments_receive_byte_and_identity_equivalent_originals() {
+	let source = "const func first(target: meta.Struct): meta.Struct = target\n\
+		 const func second(target: meta.Struct): meta.Struct = target\n\
+		 $[first()] $[second()] struct Point(value: int)\n\
+		 func main(): void = {}";
+	let diagnostics = check_project("main", &loader(FxHashMap::from_iter([("main", source)])));
+	let collisions = diagnostics
+		.iter()
+		.filter(|diagnostic| {
+			diagnostic
+				.diag
+				.message
+				.contains("`Point` is defined more than once")
+		})
+		.collect::<Vec<_>>();
+	let start = source.find("Point(value: int)").expect("target name");
+	let end = start + "Point".len();
+	assert_eq!(
+		collisions.len(),
+		2,
+		"each attachment must receive and re-emit the original"
+	);
+	assert!(
+		collisions.iter().all(|diagnostic| {
+			diagnostic.diag.span.start == start
+				&& diagnostic.diag.span.end == end
+				&& diagnostic.diag.span.origin != nymph_ast::OriginId::SOURCE
+		}),
+		"{collisions:#?}"
+	);
+	assert!(
+		collisions
+			.iter()
+			.any(|diagnostic| diagnostic.diag.labels.iter().any(|label| {
+				label.message == "first defined here" && label.span == Span::new(start, end)
+			}))
+	);
+}
+
+#[test]
+fn a_failing_attachment_does_not_hide_successful_sibling_output() {
+	let source = "const func reject(target: meta.Struct): Result<meta.Tokens, meta.Diagnostic> = \
+		 Error(error = meta.Diagnostic(message = \"independent failure\", span = target.span))\n\
+		 const func emit(target: meta.Struct): meta.Tokens = \\(func generated(): int = 42)\n\
+		 $[reject()] $[emit()] struct Point\n\
+		 func main(): void = { let value: int = generated() }";
+	let diagnostics = check_project("main", &loader(FxHashMap::from_iter([("main", source)])));
+	assert!(
+		diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.diag.message == "independent failure"),
+		"missing attachment failure: {diagnostics:?}"
+	);
+	assert!(
+		!diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.diag.message.contains("generated")
+				&& diagnostic.diag.message != "independent failure"),
+		"successful sibling output was lost: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn reemitting_an_attached_target_reports_a_provenance_labeled_collision() {
+	let source = "const func duplicate(target: meta.Struct): meta.Struct = target\n\
+		 $[duplicate()] struct Point\n\
+		 func main(): void = {}";
+	let diagnostics = check_project("main", &loader(FxHashMap::from_iter([("main", source)])));
+	let diagnostic = diagnostics
+		.iter()
+		.find(|diagnostic| {
+			diagnostic
+				.diag
+				.message
+				.contains("`Point` is defined more than once")
+		})
+		.unwrap_or_else(|| panic!("missing normal collision: {diagnostics:?}"));
+	assert!(
+		diagnostic
+			.diag
+			.labels
+			.iter()
+			.any(|label| label.message == "first defined here"
+				&& label.span.origin == nymph_ast::OriginId::SOURCE)
+	);
+	assert!(
+		diagnostic
+			.diag
+			.labels
+			.iter()
+			.any(|label| label.message == "macro was defined here"),
+		"missing expansion provenance: {diagnostic:?}"
+	);
+}
+
+#[test]
+fn fresh_names_are_unique_and_exposed_names_bind_at_the_expansion_site() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func private_helper(): meta.Tokens = {\n\
+		   let name = meta.Name.fresh(\"helper\")\n\
+		   \\(func $(name)(): int = 1)\n\
+		 }\n\
+		 const func public_answer(): meta.Tokens = {\n\
+		   let name = meta.Name.exposed(\"answer\")\n\
+		   \\(func $(name)(): int = 42)\n\
+		 }\n\
+		 $(private_helper())\n\
+		 $(private_helper())\n\
+		 $(public_answer())\n\
+		 func main(): void = { let value: int = answer() }",
+	)]);
+	let diagnostics = check_project("main", &loader(files));
+	assert!(
+		diagnostics.is_empty(),
+		"unexpected diagnostics: {diagnostics:?}"
+	);
+}
+
+#[test]
+fn definition_context_names_bind_without_capturing_same_text_at_the_call_site() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"func helper(): int = 41\n\
+		 const func generate(): meta.Tokens = {\n\
+		   let exported = meta.Name.exposed(\"generated\")\n\
+		   \\(func helper(): int = 1 func $(exported)(): int = helper())\n\
+		 }\n\
+		 $(generate())\n\
+		 func result(): int = helper() + generated()\n\
+		 func main(): void = {}",
+	)]);
+	assert_eq!(run_project(files, "result", ""), "42");
+}
+
+#[test]
+fn const_call_depth_limit_reports_an_expansion_trace() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func recurse(): meta.Tokens = recurse()\n\
+		 $(recurse())\n\
+		 func main(): void = {}",
+	)]);
+	let diagnostics = check_project("main", &loader(files));
+	let diagnostic = diagnostics
+		.iter()
+		.find(|diagnostic| diagnostic.diag.message.contains("call depth"))
+		.unwrap_or_else(|| panic!("missing deterministic limit diagnostic: {diagnostics:?}"));
+	assert!(
+		diagnostic
+			.diag
+			.notes
+			.iter()
+			.any(|note| note.contains("while evaluating const function `recurse`")),
+		"missing expansion trace: {diagnostic:?}"
+	);
+}
+
+#[test]
+fn external_declarations_expose_typed_function_and_let_variants() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func inspect(target: meta.ExternalDeclaration): Result<meta.Tokens, meta.Diagnostic> = match (target) {\
+		   meta.ExternalDeclaration.Function(value = function) -> Error(error = meta.Diagnostic(message = \"saw external function\", span = function.span)),\
+		   meta.ExternalDeclaration.Let(value = let_) -> Error(error = meta.Diagnostic(message = \"saw external let\", span = let_.span)),\
+		 }\n\
+		 $[inspect()] external(host_value) let value: int\n\
+		 $[inspect()] external(host_call) func call(value: int): int\n\
+		 func main(): void = {}",
+	)]);
+	let diagnostics = check_project("main", &loader(files));
+	let messages = diagnostics
+		.iter()
+		.map(|diagnostic| diagnostic.diag.message.as_str())
+		.collect::<Vec<_>>();
+	assert!(
+		messages.contains(&"saw external function"),
+		"{diagnostics:?}"
+	);
+	assert!(messages.contains(&"saw external let"), "{diagnostics:?}");
+}
+
+#[test]
+fn generated_parse_diagnostics_walk_embedded_provenance() {
+	let source = "const func broken(): meta.Tokens = \\(func generated(): = 1)\n\
+		 $(broken())\n\
+		 func main(): void = {}";
+	let files = FxHashMap::from_iter([("main", source)]);
+	let diagnostics = check_project("main", &loader(files));
+	let diagnostic = diagnostics
+		.iter()
+		.find(|diagnostic| {
+			diagnostic
+				.diag
+				.notes
+				.iter()
+				.any(|note| note.contains("while parsing compile-time expansion output"))
+		})
+		.unwrap_or_else(|| panic!("missing generated parse diagnostic: {diagnostics:?}"));
+	assert!(
+		diagnostic
+			.diag
+			.notes
+			.iter()
+			.any(|note| note.contains("expanded at") && note.contains("macro definition")),
+		"missing provenance trace: {diagnostic:?}"
+	);
+	assert!(
+		diagnostic.diag.labels.len() >= 2,
+		"missing invocation/definition labels: {diagnostic:?}"
+	);
+	assert!(
+		diagnostic.diag.help.is_some(),
+		"missing generated-code help: {diagnostic:?}"
+	);
+	let rendered =
+		nymph_diagnostics::render("main.nym", source, std::slice::from_ref(&diagnostic.diag));
+	assert!(
+		rendered.contains("fix the generated syntax"),
+		"diagnostic was not pretty-rendered with help: {rendered}"
+	);
+	assert!(
+		rendered.contains("macro was defined here"),
+		"missing rendered provenance label: {rendered}"
+	);
+}
+
+#[test]
+fn generated_type_diagnostics_walk_embedded_provenance() {
+	let files = FxHashMap::from_iter([(
+		"main",
+		"const func broken(): meta.Tokens = \\(func generated(): int = true)\n\
+		 $(broken())\n\
+		 func main(): void = {}",
+	)]);
+	let diagnostics = check_project("main", &loader(files));
+	let diagnostic = diagnostics
+		.iter()
+		.find(|diagnostic| diagnostic.diag.span.origin != nymph_ast::OriginId::SOURCE)
+		.unwrap_or_else(|| panic!("missing generated type diagnostic: {diagnostics:?}"));
+	assert!(
+		diagnostic
+			.diag
+			.notes
+			.iter()
+			.any(|note| note.contains("expanded at") && note.contains("macro definition")),
+		"missing provenance trace: {diagnostic:?}"
+	);
+	assert!(
+		diagnostic.diag.labels.len() >= 2,
+		"missing invocation/definition labels: {diagnostic:?}"
+	);
+	assert!(
+		diagnostic.diag.help.is_some(),
+		"missing generated-code help: {diagnostic:?}"
+	);
+}
+
+#[test]
+fn meta_diagnostics_have_actionable_help_and_const_call_labels() {
+	let source = "func runtime_only(): int = 1\n\
+		 const func broken(): meta.Tokens = \\(func value(): int = $(runtime_only()))\n\
+		 $(broken())";
+	let files = FxHashMap::from_iter([("main", source)]);
+	let diagnostics = check_project("main", &loader(files));
+	let diagnostic = diagnostics
+		.iter()
+		.find(|diagnostic| diagnostic.diag.code == "META001")
+		.unwrap_or_else(|| panic!("missing META001 diagnostic: {diagnostics:?}"));
+	assert!(
+		diagnostic
+			.diag
+			.help
+			.as_deref()
+			.is_some_and(|help| help.contains("const func")),
+		"missing practical const correction: {diagnostic:?}"
+	);
+	assert!(
+		diagnostic
+			.diag
+			.labels
+			.iter()
+			.any(|label| label.message.contains("`broken` was called here")),
+		"missing const call label: {diagnostic:?}"
+	);
 }
 
 #[test]

@@ -25,6 +25,7 @@
 //! lowered by stable definition identity.
 
 mod host_runtime;
+mod metaprogramming;
 mod prelude;
 pub mod project;
 mod std_source;
@@ -38,18 +39,18 @@ pub use project::documentation::{
 };
 pub use project::{
 	AmbientCoreModuleKey, BuildProfile, BuiltinRuntimeOwnerArtifact, BuiltinRuntimeOwnerShape,
-	CompiledEntryRoot, CompiledProject, CompilerOptions, CompilerSession, LintLevel, ModuleAnalysis,
-	ModulePath, PackageGraphError, PackageId, ProjectDiagnostic, ProjectId, ReplInputStatus,
-	ReplSession, ReplStageError, SourceVersion, StagedReplSubmission, ToolingModuleDeclarations,
-	check_project, check_project_library, check_project_library_with_embedded_std,
-	check_project_library_with_embedded_std_and_options, check_project_library_with_std,
-	check_project_with_embedded_std, check_project_with_embedded_std_and_options,
-	check_project_with_std, compile_project, compile_project_library,
-	compile_project_library_with_embedded_std_and_options,
+	CompiledEntryRoot, CompiledProject, CompilerOptions, CompilerSession, ExpandedModuleSource,
+	LintLevel, ModuleAnalysis, ModulePath, PackageGraphError, PackageId, ProjectDiagnostic,
+	ProjectId, ReplInputStatus, ReplSession, ReplStageError, SourceVersion, StagedReplSubmission,
+	ToolingModuleDeclarations, check_project, check_project_library,
+	check_project_library_with_embedded_std, check_project_library_with_embedded_std_and_options,
+	check_project_library_with_std, check_project_with_embedded_std,
+	check_project_with_embedded_std_and_options, check_project_with_std, compile_project,
+	compile_project_library, compile_project_library_with_embedded_std_and_options,
 	compile_project_library_with_embedded_std_options_and_source_uris,
 	compile_project_library_with_std, compile_project_with_embedded_std_and_options,
 	compile_project_with_embedded_std_options_and_source_uris, compile_project_with_std,
-	repl_input_status,
+	expand_project_module_with_embedded_std_and_options, expand_standalone_report, repl_input_status,
 };
 pub use std_source::embedded_std_provider;
 

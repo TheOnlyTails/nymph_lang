@@ -485,6 +485,8 @@ pub enum TypeError {
 	RetiredEnumWrapper,
 	/// A destination enum qualified a source-owned variant pattern.
 	RetiredEnumWrapperPattern,
+	/// Metaprogramming syntax reached ordinary semantic checking before expansion.
+	UnexpandedMetaprogramming,
 }
 
 impl IntoDiagnostic for TypeError {
@@ -745,6 +747,9 @@ impl IntoDiagnostic for TypeError {
 			}
 			E::RetiredEnumWrapperPattern => {
 				"embedded variants are matched through their qualified source enum".into()
+			}
+			E::UnexpandedMetaprogramming => {
+				"compile-time metaprogramming must be expanded before type checking".into()
 			}
 			E::PositionalStructField => "struct fields must be supplied by name (`field = value`)".into(),
 			E::InvalidStructSpread => "a struct clone/update requires exactly one leading source spread".into(),

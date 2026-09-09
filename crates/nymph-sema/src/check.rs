@@ -14,7 +14,7 @@ use nymph_diagnostics::Diagnostic;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::annotate::{Checked, CheckedFacts, CheckedSemantic};
-use crate::def::{DefMap, Signatures, build_def_map_on};
+use crate::def::{DefMap, NameKey, Signatures, build_def_map_on};
 use crate::ids::{DefId, InferVar, ParamIdx};
 use crate::ty::fold::occurs;
 use crate::ty::{GenericArgs, Interner, Ty, TyKind};
@@ -83,7 +83,7 @@ pub struct Checker<'m> {
 	pub(crate) source_effect_specs: FxHashMap<Span, SourceEffectSpec>,
 
 	// ── Transient per-body state ─────────────────────────────────────────────
-	pub(crate) scopes: Vec<FxHashMap<EcoString, Binding>>,
+	pub(crate) scopes: Vec<FxHashMap<NameKey, Binding>>,
 	/// Stack of generic-parameter scopes (name → rigid `ParamIdx`).
 	pub(crate) params: Vec<FxHashMap<EcoString, crate::lower::GenericBinding>>,
 	/// Named generic labels waiting for the referenced declaration's final
@@ -1019,8 +1019,8 @@ fn find_await(
 
 fn statement_expr(statement: &nymph_ast::expr::Statement) -> &nymph_ast::expr::Expr {
 	match statement {
-		nymph_ast::expr::Statement::Expr(expr)
-		| nymph_ast::expr::Statement::Let { value: expr, .. } => expr,
+		nymph_ast::expr::Statement::Expr(expr) => expr,
+		nymph_ast::expr::Statement::Let { value, .. } => value,
 	}
 }
 
@@ -1132,6 +1132,13 @@ fn for_declaration_exprs(
 ) {
 	use nymph_ast::decl::Declaration;
 	match declaration {
+		Declaration::Expansion(value) => f(value),
+		Declaration::Attached { macros, target, .. } => {
+			for call in macros {
+				f(call);
+			}
+			for_declaration_exprs(target, f);
+		}
 		Declaration::Let { value, .. } | Declaration::Func { body: value, .. } => f(value),
 		Declaration::Struct {
 			fields,
@@ -1238,7 +1245,7 @@ impl Checker<'_> {
 		for declaration in &self.module.members {
 			match declaration {
 				nymph_ast::decl::Declaration::Struct { name, fields, .. } => {
-					let Some(owner) = self.defs.get(&name.0) else {
+					let Some(owner) = self.defs.get_ident(name) else {
 						continue;
 					};
 					let Some(signature) = self.sigs.structs.get(&owner) else {
@@ -1257,7 +1264,7 @@ impl Checker<'_> {
 					}
 				}
 				nymph_ast::decl::Declaration::Enum { name, variants, .. } => {
-					let Some(owner) = self.defs.get(&name.0) else {
+					let Some(owner) = self.defs.get_ident(name) else {
 						continue;
 					};
 					let Some(signature) = self.sigs.enums.get(&owner) else {
@@ -1767,12 +1774,13 @@ impl<'m> Checker<'m> {
 			self.annotations.record_local_declaration(span, declaration);
 		}
 		if let Some(scope) = self.scopes.last_mut() {
-			scope.insert(name, Binding { ty, declaration });
+			scope.insert(NameKey::new(name, declaration), Binding { ty, declaration });
 		}
 	}
 
-	pub(crate) fn lookup_local(&self, name: &str) -> Option<&Binding> {
-		self.scopes.iter().rev().find_map(|scope| scope.get(name))
+	pub(crate) fn lookup_local(&self, name: &str, span: Span) -> Option<&Binding> {
+		let key = NameKey::new(name, span);
+		self.scopes.iter().rev().find_map(|scope| scope.get(&key))
 	}
 
 	// ── Generic-parameter scopes ─────────────────────────────────────────────

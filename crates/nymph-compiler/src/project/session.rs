@@ -448,6 +448,14 @@ impl std::ops::Deref for ProjectDiagnostics {
 	}
 }
 
+/// Canonical formatted source for one fully expanded project module.
+/// Source is absent whenever expansion or project analysis has an error.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExpandedModuleSource {
+	pub source: Option<Arc<str>>,
+	pub diagnostics: Arc<[ProjectDiagnostic]>,
+}
+
 /// Stable semantic owner information for runtime-bearing compiler definitions.
 ///
 /// This is an ABI/interface descriptor rather than HIR or a checked body.
@@ -1420,46 +1428,127 @@ impl CompilerSession {
 		load: &dyn Fn(&str) -> Option<String>,
 		std_provider: &dyn Fn(&str) -> Option<String>,
 	) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+		fn imports(key: &str, source: &str) -> Vec<String> {
+			let parsed = nymph_syntax::parse_module(source, format!("{key}.nym"));
+			module_imports(key, &parsed.tree)
+		}
+
+		fn module_imports(key: &str, module: &nymph_ast::decl::Module) -> Vec<String> {
+			module
+				.members
+				.iter()
+				.filter_map(|declaration| {
+					let Declaration::Import {
+						root, path, alias, ..
+					} = declaration
+					else {
+						return None;
+					};
+					if path.is_empty() && alias.is_none() {
+						return None;
+					}
+					super::resolve::resolve_import_target(root, path, key, nymph_ast::Span::new(0, 0))
+						.ok()?
+						.loader_key()
+				})
+				.collect()
+		}
+
 		let mut project_sources = BTreeMap::new();
 		let mut builtin_sources = BTreeMap::new();
 		let mut seen = BTreeSet::new();
 		let mut pending = vec![entry.to_string()];
-		while let Some(key) = pending.pop() {
-			if !seen.insert(key.clone()) {
-				continue;
-			}
-			let source = if let Some(path) = key.strip_prefix(super::resolve::STD_KEY_PREFIX) {
-				std_provider(path)
-			} else {
-				load(&key)
-			};
-			let Some(source) = source else {
-				continue;
-			};
-			let parsed = nymph_syntax::parse_module(&source, format!("{key}.nym"));
-			let mut imports = Vec::new();
-			for declaration in &parsed.tree.members {
-				let Declaration::Import {
-					root, path, alias, ..
-				} = declaration
-				else {
+		loop {
+			while let Some(key) = pending.pop() {
+				if !seen.insert(key.clone()) {
+					continue;
+				}
+				let source = if let Some(path) = key.strip_prefix(super::resolve::STD_KEY_PREFIX) {
+					std_provider(path)
+				} else {
+					load(&key)
+				};
+				let Some(source) = source else {
 					continue;
 				};
-				if path.is_empty() && alias.is_none() {
-					continue;
-				}
-				if let Ok(target) =
-					super::resolve::resolve_import_target(root, path, &key, nymph_ast::Span::new(0, 0))
-					&& let Some(target) = target.loader_key()
-				{
-					imports.push(target);
+				pending.extend(imports(&key, &source).into_iter().rev());
+				if let Some(path) = key.strip_prefix(super::resolve::STD_KEY_PREFIX) {
+					builtin_sources.insert(path.to_string(), source);
+				} else {
+					project_sources.insert(key, source);
 				}
 			}
-			pending.extend(imports.into_iter().rev());
-			if let Some(path) = key.strip_prefix(super::resolve::STD_KEY_PREFIX) {
-				builtin_sources.insert(path.to_string(), source);
-			} else {
-				project_sources.insert(key, source);
+
+			let sources = project_sources
+				.iter()
+				.map(|(key, source)| (key.clone(), source.clone()))
+				.chain(builtin_sources.iter().map(|(path, source)| {
+					(
+						format!("{}{path}", super::resolve::STD_KEY_PREFIX),
+						source.clone(),
+					)
+				}))
+				.collect::<BTreeMap<_, _>>();
+			let world = sources
+				.iter()
+				.map(|(key, source)| {
+					let parsed = nymph_syntax::parse_module(source, format!("{key}.nym"));
+					let bindings = parsed
+						.tree
+						.members
+						.iter()
+						.filter_map(|declaration| {
+							let Declaration::Import {
+								root,
+								path,
+								alias,
+								idents,
+							} = declaration
+							else {
+								return None;
+							};
+							let target =
+								super::resolve::resolve_import_target(root, path, key, nymph_ast::Span::new(0, 0))
+									.ok()?
+									.loader_key()?;
+							Some(crate::metaprogramming::ConstImport {
+								target: target.into(),
+								namespace: alias
+									.as_ref()
+									.or_else(|| path.last())
+									.map_or_else(Default::default, |name| name.0.clone()),
+								names: idents
+									.iter()
+									.flatten()
+									.map(
+										|(source, alias)| crate::metaprogramming::ConstImportSource {
+											source: source.0.clone(),
+											local: alias.as_ref().unwrap_or(source).0.clone(),
+										},
+									)
+									.collect(),
+							})
+						})
+						.collect();
+					crate::metaprogramming::ConstModuleSource {
+						key: key.as_str().into(),
+						path: parsed.tree.path.clone(),
+						source: Arc::from(source.as_str()),
+						imports: bindings,
+					}
+				})
+				.collect::<Vec<_>>();
+			for (key, source) in &sources {
+				let expanded = crate::metaprogramming::expand_source_with_imports(
+					source,
+					format!("{key}.nym").into(),
+					key.as_str().into(),
+					&world,
+				);
+				pending.extend(module_imports(key, &expanded.tree).into_iter().rev());
+			}
+			if pending.iter().all(|key| seen.contains(key)) {
+				break;
 			}
 		}
 		(project_sources, builtin_sources)
@@ -1631,7 +1720,7 @@ impl CompilerSession {
 					let query = debug
 						.split_once('(')
 						.map_or(debug.as_str(), |(name, _)| name);
-					if query == "parse_builtin" {
+					if matches!(query, "parse_builtin" | "parse_builtin_raw") {
 						// This private compiler-core bootstrap producer serves both importable
 						// builtins (observed as `parse`) and ambient-core registry entries.
 						// Preserve the established parse event while also exposing the narrower
@@ -1642,7 +1731,9 @@ impl CompilerSession {
 					}
 					let public_name = match query {
 						"parse" => Some("parse"),
-						"direct_imports" | "builtin_direct_imports" => Some("direct_imports"),
+						"direct_imports" | "builtin_direct_imports" | "project_direct_imports" => {
+							Some("direct_imports")
+						}
 						"project_graph" => Some("project_graph"),
 						"interface_module_analysis"
 						| "interface_module_interface"
@@ -2171,6 +2262,68 @@ impl CompilerSession {
 		queries::interface_project_diagnostics(&self.db, key)
 			.0
 			.clone()
+	}
+
+	/// Expand one project module through the normal project fixed point and
+	/// render the resulting runtime syntax with the canonical formatter.
+	#[must_use]
+	pub fn expand_module_source(
+		&self,
+		project: ProjectId,
+		module: ModulePath,
+		mode: EntryMode,
+	) -> ExpandedModuleSource {
+		let key = self.project_key(project.clone(), module.clone(), mode, true, true);
+		let mut diagnostics = queries::interface_project_diagnostics(&self.db, key)
+			.0
+			.iter()
+			.cloned()
+			.collect::<Vec<_>>();
+		if diagnostics
+			.iter()
+			.any(|diagnostic| diagnostic.diag.is_error())
+		{
+			return ExpandedModuleSource {
+				source: None,
+				diagnostics: diagnostics.into(),
+			};
+		}
+		let Some(input) = self
+			.registry
+			.get(&(PackageId::root(project), module.clone()))
+			.map(|record| record.input)
+		else {
+			return ExpandedModuleSource {
+				source: None,
+				diagnostics: diagnostics.into(),
+			};
+		};
+		let expanded =
+			queries::expanded_project_module(&self.db, key, SemanticModuleInput::Project(input));
+		let original = input.source(&self.db).unwrap_or_default();
+		let unformatted = crate::metaprogramming::render_tokens(&expanded.tokens, &original);
+		let source = match nymph_format::format(&unformatted, &format!("{module}.nym")) {
+			Ok(source) => Some(Arc::from(source)),
+			Err(error) => {
+				diagnostics.push(ProjectDiagnostic {
+					module: module.to_string(),
+					diag: nymph_diagnostics::Diagnostic::error(
+						"META-EXPANDED-SOURCE".into(),
+						"the fully expanded module could not be rendered as Nymph source",
+						nymph_ast::Span::new(0, 0),
+					)
+					.with_note(error.to_string())
+					.with_help(
+						"report this compiler error with the macro invocation and generated token output",
+					),
+				});
+				None
+			}
+		};
+		ExpandedModuleSource {
+			source,
+			diagnostics: diagnostics.into(),
+		}
 	}
 
 	pub(crate) fn check_project_with_options(

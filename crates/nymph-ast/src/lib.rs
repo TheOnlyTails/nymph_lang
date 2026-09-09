@@ -24,16 +24,55 @@ pub mod ty;
 /// A source-relative identifier: its text plus the span it occupied.
 pub type Ident = Spanned<EcoString>;
 
+/// Stable identity for the expansion that produced syntax. Zero denotes source text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, salsa::SalsaValue)]
+pub struct OriginId(pub u64);
+
+impl OriginId {
+	pub const SOURCE: Self = Self(0);
+}
+
+/// The name-resolution context carried by every token and identifier span.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, salsa::SalsaValue)]
+pub enum SyntaxContext {
+	#[default]
+	Source,
+	Definition(u64),
+	CallSite(OriginId),
+	Fresh {
+		origin: OriginId,
+		index: u32,
+	},
+	Exposed(OriginId),
+}
+
 /// A half-open byte range `[start, end)` into a source file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, salsa::SalsaValue)]
 pub struct Span {
 	pub start: usize,
 	pub end: usize,
+	pub context: SyntaxContext,
+	pub origin: OriginId,
 }
 
 impl Span {
-	pub fn new(start: usize, end: usize) -> Self {
-		Self { start, end }
+	pub const fn new(start: usize, end: usize) -> Self {
+		Self {
+			start,
+			end,
+			context: SyntaxContext::Source,
+			origin: OriginId::SOURCE,
+		}
+	}
+
+	pub fn with_context(mut self, context: SyntaxContext) -> Self {
+		self.context = context;
+		self
+	}
+
+	pub fn with_origin(mut self, origin: OriginId) -> Self {
+		self.origin = origin;
+		self
 	}
 
 	/// The smallest span covering both `self` and `other`.
@@ -41,6 +80,16 @@ impl Span {
 		Span {
 			start: self.start.min(other.start),
 			end: self.end.max(other.end),
+			context: if self.context == SyntaxContext::Source {
+				other.context
+			} else {
+				self.context
+			},
+			origin: if self.origin == OriginId::SOURCE {
+				other.origin
+			} else {
+				self.origin
+			},
 		}
 	}
 
@@ -58,6 +107,8 @@ impl From<std::ops::Range<usize>> for Span {
 		Self {
 			start: range.start,
 			end: range.end,
+			context: SyntaxContext::Source,
+			origin: OriginId::SOURCE,
 		}
 	}
 }
@@ -73,12 +124,20 @@ impl From<Span> for std::ops::Range<usize> {
 /// an id. Used to key semantic annotations (resolved types, operator impl
 /// selections) that later passes read back.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, salsa::SalsaValue)]
-pub struct NodeId(pub u32);
+pub struct NodeId(pub u32, pub OriginId);
 
 impl NodeId {
 	/// A placeholder id for nodes built outside the parser (tests, synthetic
 	/// nodes). Never assigned by the parser, so it never collides with a real id.
-	pub const DUMMY: NodeId = NodeId(u32::MAX);
+	pub const DUMMY: NodeId = NodeId(u32::MAX, OriginId::SOURCE);
+
+	pub const fn source(local: u32) -> Self {
+		Self(local, OriginId::SOURCE)
+	}
+
+	pub const fn generated(local: u32, origin: OriginId) -> Self {
+		Self(local, origin)
+	}
 }
 
 /// A value paired with the source [`Span`] it was produced from.

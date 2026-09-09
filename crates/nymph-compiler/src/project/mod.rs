@@ -28,8 +28,8 @@ pub use repl::{
 
 pub use session::{
 	AmbientCoreModuleKey, BuildProfile, BuiltinRuntimeOwnerArtifact, BuiltinRuntimeOwnerShape,
-	CompilerSession, LintLevel, ModuleAnalysis, ModulePath, PackageGraphError, PackageId,
-	ProjectDiagnostics, ProjectId, RuntimeDefinitionError, ToolingModuleDeclarations,
+	CompilerSession, ExpandedModuleSource, LintLevel, ModuleAnalysis, ModulePath, PackageGraphError,
+	PackageId, ProjectDiagnostics, ProjectId, RuntimeDefinitionError, ToolingModuleDeclarations,
 };
 
 pub use nymph_diagnostics::SourceVersion;
@@ -49,7 +49,7 @@ pub use session::SemanticQueryEvent;
 pub use test_support::{GraphFixture, GraphShape};
 
 use nymph_diagnostics::Diagnostic;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompilerOptions {
@@ -209,6 +209,31 @@ mod test_support {
 pub struct ProjectDiagnostic {
 	pub module: String,
 	pub diag: Diagnostic,
+}
+
+/// Expand one library-mode project module against the embedded standard library.
+#[must_use]
+pub fn expand_project_module_with_embedded_std_and_options(
+	module: &str,
+	load: &dyn Fn(&str) -> Option<String>,
+	options: &CompilerOptions,
+) -> ExpandedModuleSource {
+	let (session, project, module) =
+		facade_session_with_options(module, load, &crate::embedded_std_provider, options);
+	session.expand_module_source(project, module, nymph_sema::EntryMode::Library)
+}
+
+/// Expand standalone library source while retaining structured diagnostics.
+#[must_use]
+pub fn expand_standalone_report(source: &str, path: &str) -> ExpandedModuleSource {
+	let loader = |module: &str| (module == STANDALONE_ENTRY).then(|| source.to_owned());
+	let (session, project, module) =
+		facade_session(STANDALONE_ENTRY, &loader, &crate::embedded_std_provider);
+	let mut report = session.expand_module_source(project, module, nymph_sema::EntryMode::Library);
+	for diagnostic in Arc::make_mut(&mut report.diagnostics) {
+		diagnostic.module = path.to_owned();
+	}
+	report
 }
 
 /// Statically selected executable-root adapter and its exact canonical enum

@@ -135,7 +135,7 @@ impl<'src> Lexer<'src> {
 			self.character()?
 		} else if first == '"' {
 			self.string()?
-		} else if first == '$' {
+		} else if first == '$' && !matches!(self.peek_at(1), Some('(' | '[')) {
 			self.anonymous_param()
 		} else if first == '_' || unicode_ident::is_xid_start(first) {
 			self.identifier()
@@ -399,6 +399,7 @@ impl<'src> Lexer<'src> {
 			"let" => Token::Let,
 			"external" => Token::External,
 			"effect" => Token::Effect,
+			"const" => Token::Const,
 			"func" => Token::Func,
 			"interface" => Token::Interface,
 			"impl" => Token::Impl,
@@ -456,10 +457,6 @@ impl<'src> Lexer<'src> {
 				return Some(token);
 			}
 		}
-		if self.starts_with("#") {
-			self.position += 1;
-			return self.fail(&["'('", "'['", "'{'"]);
-		}
 		let start = self.position;
 		let token = match self.bump()? {
 			'.' => Token::Dot,
@@ -487,6 +484,10 @@ impl<'src> Lexer<'src> {
 			',' => Token::Comma,
 			';' => Token::Semicolon,
 			'@' => Token::At,
+			'#' => Token::Hash,
+			'$' => Token::Dollar,
+			'\\' => Token::Backslash,
+			'`' => Token::Backtick,
 			_ => return self.fail_at(start, &["a token"]),
 		};
 		Some(token)
@@ -672,10 +673,39 @@ mod tests {
 	#[test]
 	fn keywords_vs_identifiers() {
 		assert_eq!(toks("func"), vec![Token::Func]);
+		assert_eq!(toks("const"), vec![Token::Const]);
 		// `internal` must not be lexed as `in` + `ternal`.
 		assert_eq!(toks("internal"), vec![Token::Internal]);
 		assert_eq!(toks("inside"), vec![Token::Identifier("inside".into())]);
 		assert_eq!(toks("match"), vec![Token::Match]);
+	}
+
+	#[test]
+	fn metaprogramming_and_foreign_punctuation_are_tokens() {
+		assert_eq!(
+			toks("\\(x) $(x) $[x] # \\ `"),
+			vec![
+				Token::Backslash,
+				Token::LParen,
+				Token::Identifier("x".into()),
+				Token::RParen,
+				Token::Dollar,
+				Token::LParen,
+				Token::Identifier("x".into()),
+				Token::RParen,
+				Token::Dollar,
+				Token::LBracket,
+				Token::Identifier("x".into()),
+				Token::RBracket,
+				Token::Hash,
+				Token::Backslash,
+				Token::Backtick,
+			]
+		);
+		assert_eq!(
+			toks("$ $0"),
+			vec![Token::AnonymousParam(None), Token::AnonymousParam(Some(0))]
+		);
 	}
 
 	#[test]
@@ -893,7 +923,7 @@ mod tests {
 
 	#[test]
 	fn malformed_source_preserves_recovery_and_incomplete_signals() {
-		let unknown = lex("@bad-token `");
+		let unknown = lex("@bad-token ");
 		assert!(unknown.tokens.is_empty());
 		assert_eq!(unknown.diagnostics.len(), 1);
 		assert_eq!(unknown.diagnostics[0].span, Span::new(11, 12));
@@ -922,7 +952,7 @@ mod tests {
 			assert!(!result.incomplete);
 		}
 
-		for source in [r#""unterminated"#, r#""${{ 1 }""#, "#"] {
+		for source in [r#""unterminated"#, r#""${{ 1 }""#] {
 			let result = lex(source);
 			assert!(result.tokens.is_empty());
 			assert_eq!(result.diagnostics.len(), 1);

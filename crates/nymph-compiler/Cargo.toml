@@ -29,6 +29,7 @@ nymph-codegen = { workspace = true }
 nymph-diagnostics = { workspace = true }
 nymph-ast = { workspace = true }
 nymph-hir = { workspace = true }
+nymph-format = { workspace = true }
 ecow = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }

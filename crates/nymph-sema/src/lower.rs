@@ -271,7 +271,7 @@ impl Checker<'_> {
 					let embeddings = embeddings
 						.iter()
 						.filter_map(|embedding| {
-							let source = self.defs.get(&embedding.0.source.0)?;
+							let source = self.defs.get_ident(&embedding.0.source)?;
 							if !matches!(self.defs.data(source).kind, DefKind::Enum) {
 								self.emit(
 									embedding.1,
@@ -611,7 +611,7 @@ impl Checker<'_> {
 						}
 						continue;
 					}
-					let Some(definition) = self.defs.get(&name.0) else {
+					let Some(definition) = self.defs.get_ident(name) else {
 						self.emit(
 							name.1,
 							TypeError::CannotFindEffect {

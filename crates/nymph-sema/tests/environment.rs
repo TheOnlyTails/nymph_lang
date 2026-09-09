@@ -414,8 +414,7 @@ fn stable_support_is_projected_by_exact_package_and_module_identity() {
 		let mut names = environment
 			.imported
 			.defs
-			.by_name
-			.keys()
+			.names()
 			.map(ToString::to_string)
 			.collect::<Vec<_>>();
 		names.sort();
@@ -455,8 +454,7 @@ fn stable_support_is_projected_by_exact_package_and_module_identity() {
 		let mut names = environment
 			.imported
 			.defs
-			.by_name
-			.keys()
+			.names()
 			.map(ToString::to_string)
 			.collect::<Vec<_>>();
 		names.sort();

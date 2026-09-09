@@ -7,46 +7,13 @@ use nymph_compiler::{
 use nymph_syntax::{lex, parse_module};
 
 use crate::diag::{
-	CompileResult, InspectionResult, LineIndex, RunArtifactView, StageStatus, StageView, TokenView,
-	TypeStateView,
+	CompileResult, ExpandedSourceResult, InspectionResult, LineIndex, RunArtifactView, StageStatus,
+	StageView, TokenView, TypeStateView,
 };
 
-/// Parse, check, and (if error-free) lower + emit `source` to a JS module
-/// string. Mirrors `nymph_compiler::compile`.
-pub(crate) fn run_compile(source: &str) -> CompileResult {
-	let report = nymph_compiler::compile_report(source, "playground");
+fn token_views(source: &str) -> Vec<TokenView> {
 	let index = LineIndex::new(source);
-	let diagnostics = report
-		.diagnostics
-		.iter()
-		.map(|d| index.to_diag(d))
-		.collect();
-	CompileResult {
-		js: report.js,
-		diagnostics,
-	}
-}
-
-/// Parse and check `source`, returning every diagnostic (errors and
-/// warnings alike) with no emission. Mirrors `nymph_compiler::check`.
-pub(crate) fn run_check(source: &str) -> CompileResult {
-	let checked = nymph_compiler::check(source, "playground");
-	let index = LineIndex::new(source);
-	let diagnostics = checked.iter().map(|d| index.to_diag(d)).collect();
-
-	CompileResult {
-		js: None,
-		diagnostics,
-	}
-}
-
-/// Inspect the concrete outputs that are useful while debugging a compilation.
-/// The final compile still goes through `nymph-compiler`; direct syntax calls only
-/// expose the lexer and parser artifacts which that stable facade intentionally hides.
-pub(crate) fn run_inspect(source: &str) -> InspectionResult {
-	let index = LineIndex::new(source);
-	let lexed = lex(source);
-	let tokens = lexed
+	lex(source)
 		.tokens
 		.iter()
 		.map(|token| {
@@ -64,7 +31,62 @@ pub(crate) fn run_inspect(source: &str) -> InspectionResult {
 				col,
 			}
 		})
-		.collect::<Vec<_>>();
+		.collect()
+}
+
+/// Parse, check, and (if error-free) lower + emit `source` to a JS module
+/// string. Mirrors `nymph_compiler::compile`.
+pub(crate) fn run_compile(source: &str) -> CompileResult {
+	let report = nymph_compiler::compile_report(source, "playground");
+	let index = LineIndex::new(source);
+	let diagnostics = report
+		.diagnostics
+		.iter()
+		.map(|d| index.to_diag(source, "playground", d))
+		.collect();
+	CompileResult {
+		js: report.js,
+		diagnostics,
+	}
+}
+
+/// Parse and check `source`, returning every diagnostic (errors and
+/// warnings alike) with no emission. Mirrors `nymph_compiler::check`.
+pub(crate) fn run_check(source: &str) -> CompileResult {
+	let checked = nymph_compiler::check(source, "playground");
+	let index = LineIndex::new(source);
+	let diagnostics = checked
+		.iter()
+		.map(|d| index.to_diag(source, "playground", d))
+		.collect();
+
+	CompileResult {
+		js: None,
+		diagnostics,
+	}
+}
+
+/// Expand source through the canonical project/session query.
+pub(crate) fn run_expand(source: &str) -> ExpandedSourceResult {
+	let report = nymph_compiler::expand_standalone_report(source, "playground");
+	let index = LineIndex::new(source);
+	ExpandedSourceResult {
+		source: report.source.as_deref().map(str::to_owned),
+		diagnostics: report
+			.diagnostics
+			.iter()
+			.map(|diagnostic| index.to_diag(source, "playground", &diagnostic.diag))
+			.collect(),
+	}
+}
+
+/// Inspect the concrete outputs that are useful while debugging a compilation.
+/// The final compile still goes through `nymph-compiler`; direct syntax calls only
+/// expose the lexer and parser artifacts which that stable facade intentionally hides.
+pub(crate) fn run_inspect(source: &str) -> InspectionResult {
+	let index = LineIndex::new(source);
+	let lexed = lex(source);
+	let tokens = token_views(source);
 	let run = compile_project_with_embedded_std_and_options(
 		"playground",
 		&|module| (module == "playground").then(|| source.to_owned()),
@@ -140,6 +162,11 @@ pub(crate) fn run_inspect(source: &str) -> InspectionResult {
 		.unwrap_or_default();
 
 	let report = nymph_compiler::compile_report(source, "playground");
+	let expansion = run_expand(source);
+	let expanded_tokens = expansion
+		.source
+		.as_deref()
+		.map_or_else(Vec::new, token_views);
 	let compile_failed = report
 		.diagnostics
 		.iter()
@@ -147,7 +174,7 @@ pub(crate) fn run_inspect(source: &str) -> InspectionResult {
 	let diagnostics = report
 		.diagnostics
 		.iter()
-		.map(|diagnostic| index.to_diag(diagnostic))
+		.map(|diagnostic| index.to_diag(source, "playground", diagnostic))
 		.collect::<Vec<_>>();
 
 	let syntax_failed = lex_failed || parse_failed;
@@ -220,6 +247,8 @@ pub(crate) fn run_inspect(source: &str) -> InspectionResult {
 		ast,
 		types,
 		stages,
+		expanded: expansion.source,
+		expanded_tokens,
 		js: report.js,
 		run,
 		diagnostics,

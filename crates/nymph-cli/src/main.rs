@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use clap::Parser;
 
 use crate::commands::{
-	build::BuildCommand, check::CheckCommand, doc::DocCommand, format::FormatCommand,
-	new::NewCommand, repl::ReplCommand, run::RunCommand,
+	build::BuildCommand, check::CheckCommand, doc::DocCommand, expand::ExpandCommand,
+	format::FormatCommand, new::NewCommand, repl::ReplCommand, run::RunCommand,
 };
 
 mod commands;
@@ -36,6 +36,7 @@ enum NymphCommands {
 	Build(BuildCommand),
 	Check(CheckCommand),
 	Doc(DocCommand),
+	Expand(ExpandCommand),
 	Format(FormatCommand),
 	New(NewCommand),
 	Repl(ReplCommand),
@@ -48,6 +49,7 @@ impl NymphCommands {
 			NymphCommands::Build(cmd) => cmd.run(manifest),
 			NymphCommands::Check(cmd) => cmd.run(manifest),
 			NymphCommands::Doc(cmd) => cmd.run(manifest),
+			NymphCommands::Expand(cmd) => cmd.run(manifest),
 			NymphCommands::Format(cmd) => cmd.run(manifest),
 			NymphCommands::New(cmd) => cmd.run(manifest),
 			NymphCommands::Repl(cmd) => cmd.run(manifest),

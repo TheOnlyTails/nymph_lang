@@ -365,7 +365,7 @@ impl Checker<'_> {
 					self.emit(
 						span,
 						TypeError::InconsistentUnionBindingType {
-							name: name.clone(),
+							name: name.text().clone(),
 							left,
 							right,
 						},
@@ -373,7 +373,7 @@ impl Checker<'_> {
 				}
 			}
 			self.define_local_with_declarations(
-				name,
+				name.text().clone(),
 				left_binding.declaration,
 				[left_binding.declaration, right_declaration],
 				left_binding.ty,
@@ -391,10 +391,10 @@ impl Checker<'_> {
 		let retired_wrapper = match path {
 			[destination, source, variant] => self
 				.defs
-				.get(&destination.0)
+				.get_ident(destination)
 				.filter(|definition| matches!(self.defs.data(*definition).kind, DefKind::Enum))
 				.and_then(|_| {
-					let source = self.defs.get(&source.0)?;
+					let source = self.defs.get_ident(source)?;
 					if !matches!(self.defs.data(source).kind, DefKind::Enum) {
 						return None;
 					}
@@ -694,7 +694,7 @@ impl Checker<'_> {
 	) -> Option<PatternTarget> {
 		match path {
 			[single] => {
-				if let Some(def) = self.defs.get(&single.0)
+				if let Some(def) = self.defs.get_ident(single)
 					&& let DefKind::Struct = self.defs.data(def).kind
 				{
 					return Some(PatternTarget::Struct(def));
@@ -702,7 +702,7 @@ impl Checker<'_> {
 				if let Some((enum_def, variant)) = self.expected_enum_variant(expected, &single.0) {
 					return Some(PatternTarget::Variant(enum_def, variant));
 				}
-				match self.defs.resolve_variant(&single.0) {
+				match self.defs.resolve_variant_ident(single) {
 					Some(Ok((enum_def, variant))) => {
 						return Some(PatternTarget::Variant(enum_def, variant));
 					}
@@ -726,7 +726,7 @@ impl Checker<'_> {
 				None
 			}
 			[type_name, variant_name] => {
-				if let Some(def) = self.defs.get(&type_name.0)
+				if let Some(def) = self.defs.get_ident(type_name)
 					&& let DefKind::Enum = self.defs.data(def).kind
 				{
 					let position = self.sigs.enums[&def]

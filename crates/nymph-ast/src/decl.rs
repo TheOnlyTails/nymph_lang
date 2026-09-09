@@ -17,6 +17,17 @@ pub struct Module {
 
 #[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
 pub enum Declaration {
+	/// `$(expression)` in declaration position. Expansion replaces this item
+	/// before ordinary module consumers run.
+	Expansion(Expr),
+	/// One or more additive `$[call(...)]` macros attached to `target`.
+	/// Calls are stored and execute independently in source order.
+	Attached {
+		macros: Vec<Expr>,
+		/// Original target tokens supplied unchanged to every attached call.
+		target_tokens: Vec<Spanned<crate::token::Token>>,
+		target: Box<Declaration>,
+	},
 	/// `import @/math`, `import @/math as m`, `import @/math with (sin as sine, cos)`
 	Import {
 		root: ImportRoot,
@@ -131,6 +142,8 @@ pub struct TypeAliasDeclaration {
 
 #[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
 pub struct LetDeclaration {
+	/// Whether this binding must be evaluated during compilation.
+	pub is_const: bool,
 	pub kind: LetKind,
 	pub name: Spanned<Pattern>,
 	pub type_: Option<Spanned<Type>>,
@@ -163,6 +176,8 @@ impl LetDeclaration {
 #[derive(Debug, Clone, PartialEq, salsa::SalsaValue)]
 pub struct FuncDeclaration {
 	pub name: Ident,
+	/// Whether this function is callable during compile-time evaluation.
+	pub is_const: bool,
 	pub kind: FuncKind,
 	/// Whether this callable constructs a cold task recipe.
 	pub is_async: bool,

@@ -102,7 +102,11 @@ fn decl_symbol(
 	index: &LineIndex,
 	cancellation: &CancellationToken,
 ) -> Result<Option<DocumentSymbol>, TaskError> {
+	if let Declaration::Attached { target, .. } = decl {
+		return decl_symbol(target, text, index, cancellation);
+	}
 	Ok(match decl {
+		Declaration::Expansion(_) | Declaration::Attached { .. } => None,
 		Declaration::Effect { name, .. } => {
 			let selection = index.range(text, name.1);
 			Some(make_symbol(

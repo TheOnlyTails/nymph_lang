@@ -63,6 +63,28 @@ fn render_still_shows_the_source_excerpt_when_the_span_contains_a_multibyte_char
 	);
 }
 
+#[test]
+fn plain_render_keeps_visual_context_without_terminal_escape_codes() {
+	let source = "func answer(): int = true\n";
+	let start = source.find("true").expect("fixture contains `true`");
+	let diagnostic = Diagnostic::error(
+		EcoString::from("2024"),
+		"expected `int`, found `bool`",
+		Span::new(start, start + "true".len()),
+	)
+	.with_help("return an integer value");
+
+	let rendered = nymph_diagnostics::render_plain("test.nym", source, &[diagnostic]);
+
+	assert!(rendered.contains("test.nym:1:22"), "{rendered}");
+	assert!(rendered.contains("func answer(): int = true"), "{rendered}");
+	assert!(
+		rendered.contains("Help: return an integer value"),
+		"{rendered}"
+	);
+	assert!(!rendered.contains('\u{1b}'), "{rendered:?}");
+}
+
 /// Strip ANSI escape sequences (ariadne colors each character of a label
 /// individually, which would otherwise split a substring like `"héllo"`
 /// across escape codes).

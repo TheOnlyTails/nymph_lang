@@ -493,7 +493,7 @@ impl Checker<'_> {
 		{
 			let name = match path {
 				[single] => &single.0,
-				[type_name, variant] if self.defs.get(&type_name.0) == Some(*def) => &variant.0,
+				[type_name, variant] if self.defs.get_ident(type_name) == Some(*def) => &variant.0,
 				_ => return None,
 			};
 			return self.variant_index(ty, name);
@@ -502,7 +502,7 @@ impl Checker<'_> {
 		match path {
 			[single] => self.variant_index(ty, &single.0),
 			[type_name, variant] => {
-				let owner = self.defs.get(&type_name.0)?;
+				let owner = self.defs.get_ident(type_name)?;
 				return self.defs.iter().find_map(|(candidate, data)| {
 					matches!(data.kind, DefKind::Variant { enum_def, .. } if enum_def == owner)
 						.then_some(candidate)

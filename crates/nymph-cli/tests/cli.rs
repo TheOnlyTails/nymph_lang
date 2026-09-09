@@ -184,6 +184,121 @@ fn write_project(entry: &str, source: &str) -> std::path::PathBuf {
 }
 
 #[test]
+fn expand_prints_plain_formatted_source_and_is_deterministic() {
+	let root = write_project("main.nym", "func  answer( ):int=42\n");
+	let first = nymph_in(&["expand", "main"], &root);
+	let second = nymph_in(&["expand", "main"], &root);
+	assert!(first.status.success(), "{}", first.stderr);
+	assert_eq!(first.stderr, "");
+	assert_eq!(first.stdout, "func answer(): int = 42\n");
+	assert_eq!(second.stdout, first.stdout);
+
+	std::fs::write(root.join("src/main.nym"), &first.stdout).unwrap();
+	let reexpanded = nymph_in(&["expand", "main"], &root);
+	assert!(reexpanded.status.success(), "{}", reexpanded.stderr);
+	assert_eq!(reexpanded.stdout, first.stdout);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn expand_applies_direct_nested_and_independent_attached_macros() {
+	let root = write_project(
+		"main.nym",
+		"const func integer(): meta.Tokens = \\(int)\n\
+		 const func value(): meta.Tokens = \\(42)\n\
+		 const func first(target: meta.Struct): meta.Tokens = \\(func first_helper(): int = 20)\n\
+		 const func second(target: meta.Struct): meta.Tokens = \\(func second_helper(): int = 22)\n\
+		 $[first()] $[second()] struct Point(value: $(integer()))\n\
+		 func answer(): int = $(value())\n",
+	);
+	let output = nymph_in(&["expand", "main"], &root);
+	assert!(output.status.success(), "{}", output.stderr);
+	assert_eq!(output.stderr, "");
+	assert!(output.stdout.contains("struct Point(value: int)"));
+	assert!(output.stdout.contains("func answer(): int = 42"));
+	let point = output.stdout.find("struct Point").unwrap();
+	let first = output.stdout.find("func first_helper").unwrap();
+	let second = output.stdout.find("func second_helper").unwrap();
+	assert!(point < first && first < second, "{}", output.stdout);
+	assert!(!output.stdout.contains("const func"));
+	assert!(!output.stdout.contains("$("));
+	assert!(!output.stdout.contains("$["));
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn expand_reaches_the_generated_import_fixed_point() {
+	let root = write_project(
+		"main.nym",
+		"const func include(): meta.Tokens = \\(import @/generated with (answer))\n\
+		 $(include())\n\
+		 func result(): int = answer()\n",
+	);
+	std::fs::write(
+		root.join("src/generated.nym"),
+		"const func make(): meta.Tokens = \\(public func answer(): int = 42)\n$(make())\n",
+	)
+	.unwrap();
+	let output = nymph_in(&["expand", "main"], &root);
+	assert!(output.status.success(), "{}", output.stderr);
+	assert_eq!(output.stderr, "");
+	assert!(
+		output.stdout.contains("import @/generated with (answer)"),
+		"{}",
+		output.stdout
+	);
+	assert!(output.stdout.contains("func result(): int = answer()"));
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn expand_failure_writes_only_pretty_diagnostics_to_stderr() {
+	let root = write_project(
+		"main.nym",
+		"const func broken(): meta.Tokens = \\(func generated(): = 1)\n$(broken())\n",
+	);
+	let output = nymph_in(&["expand", "main"], &root);
+	assert_eq!(output.status.code(), Some(1));
+	assert_eq!(output.stdout, "");
+	assert!(output.stderr.contains("Error:"), "{}", output.stderr);
+	assert!(output.stderr.contains("generated"), "{}", output.stderr);
+	assert!(
+		output.stderr.contains("macro was defined here"),
+		"{}",
+		output.stderr
+	);
+	assert!(output.stderr.contains("Help"), "{}", output.stderr);
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn expand_accepts_only_existing_canonical_project_module_paths() {
+	let root = write_project("nested/module.nym", "func answer(): int = 42\n");
+	let valid = nymph_in(&["expand", "nested/module"], &root);
+	assert!(valid.status.success(), "{}", valid.stderr);
+	for invalid in [
+		"nested/module.nym",
+		"@/nested/module",
+		"nested/../module",
+		"missing",
+	] {
+		let output = nymph_in(&["expand", invalid], &root);
+		assert_eq!(output.status.code(), Some(1), "{invalid}");
+		assert_eq!(output.stdout, "", "{invalid}");
+		assert!(
+			output.stderr.starts_with("error:"),
+			"{invalid}: {}",
+			output.stderr
+		);
+	}
+	let help = nymph_in(&["expand", "--help"], &root);
+	assert!(help.status.success());
+	assert!(help.stdout.contains("without @/, ./, or .nym"));
+	assert!(help.stdout.contains("nymph expand network/http"));
+	std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn doc_generates_default_and_custom_deterministic_sites_with_visibility_and_links() {
 	let root = write_project(
 		"main.nym",

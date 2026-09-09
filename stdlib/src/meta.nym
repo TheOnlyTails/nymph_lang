@@ -1,0 +1,237 @@
+// Structural names for compiler-owned, immutable compile-time values. The
+// compiler supplies their values and operations; this module supplies the
+// ordinary Nymph type surface used by const signatures.
+//
+// `$[...]` macros are additive: each independently receives the same original
+// typed declaration, while the compiler retains that declaration exactly once
+// and appends generated peers in attachment source order. Direct `$()`
+// expansion is the syntax for replacing or removing source.
+
+public enum SyntaxContext {
+  Source,
+  Definition(id: uint),
+  CallSite(origin: uint),
+  Fresh(origin: uint, index: uint),
+  Exposed(origin: uint),
+}
+public struct Span(start: uint, end: uint, context: SyntaxContext, origin: uint)
+public struct Name(text: string, span: Span)
+public struct Tokens(items: #[Token])
+public enum Visibility { Public, Internal, Private }
+public enum Token {
+  Int(value: uint),
+  UInt(value: uint),
+  Float(value: float),
+  Char(value: char),
+  String(value: string),
+  True,
+  False,
+  Identifier(value: string),
+  AnonymousParam(index: Option<uint>),
+  Public,
+  Internal,
+  Private,
+  Import,
+  With,
+  Type,
+  Struct,
+  Enum,
+  Let,
+  External,
+  Effect,
+  Const,
+  Func,
+  Interface,
+  Impl,
+  Namespace,
+  For,
+  Loop,
+  If,
+  Else,
+  Match,
+  Continue,
+  Break,
+  Echo,
+  This,
+  In,
+  As,
+  Is,
+  Async,
+  Await,
+  IntType,
+  UIntType,
+  FloatType,
+  BooleanType,
+  CharType,
+  StringType,
+  VoidType,
+  NeverType,
+  SelfType,
+  LParen,
+  RParen,
+  LBracket,
+  RBracket,
+  LBrace,
+  RBrace,
+  HashLParen,
+  HashLBracket,
+  HashLBrace,
+  Arrow,
+  DotDotDot,
+  Question,
+  DoubleQuestion,
+  QuestionDot,
+  Dot,
+  At,
+  Hash,
+  Dollar,
+  Backslash,
+  Backtick,
+  Comma,
+  Semicolon,
+  Colon,
+  ColonColon,
+  Underscore,
+  PipeArrow,
+  Bang,
+  Plus,
+  Minus,
+  Star,
+  Slash,
+  Percent,
+  StarStar,
+  Amp,
+  Pipe,
+  Caret,
+  Tilde,
+  EqEq,
+  BangEq,
+  Lt,
+  Gt,
+  LtEq,
+  GtEq,
+  BangIn,
+  BangIs,
+  AmpAmp,
+  PipePipe,
+  Eq,
+  DotDot,
+  DotDotEq,
+}
+
+// Returned macro diagnostics enter the compiler's standard structured visual
+// renderer. The compiler supplies expansion labels/backtraces and actionable
+// help in addition to this stable macro-authored message and primary span.
+public struct Diagnostic(message: string, span: Span)
+
+// These are language-facing values rather than aliases for the compiler's Rust AST.
+// Syntax-shaped fields remain immutable and token conversion preserves their identity.
+// Every meaningful syntax type below is compiler-adapted to `Into<Tokens>`; direct
+// expansion/interpolation therefore does not require an explicit `.tokens()` call.
+public struct Expression(tokens: Tokens, span: Span)
+public struct Statement(tokens: Tokens, span: Span)
+public struct Pattern(tokens: Tokens, span: Span)
+public struct Type(tokens: Tokens, span: Span)
+public struct Parameter(name: Option<Name>, pattern: Pattern, type_: Type, spread: boolean, span: Span)
+public struct Field(name: Name, type_: Type, default: Option<Expression>, span: Span)
+public struct Variant(name: Name, fields: #[Field], span: Span)
+public struct MatchArm(pattern: Pattern, guard: Option<Expression>, body: Expression, span: Span)
+public struct ImportName(source: Name, alias: Option<Name>)
+public enum ImportRoot { Package(name: Name), Project, Current, Parent }
+
+public struct Function(
+  visibility: Option<Visibility>,
+  name: Name,
+  is_const: boolean,
+  is_async: boolean,
+  parameters: #[Parameter],
+  return_type: Option<Type>,
+  body: Expression,
+  span: Span,
+)
+public struct Let(
+  visibility: Option<Visibility>,
+  name: Option<Name>,
+  pattern: Pattern,
+  type_: Option<Type>,
+  value: Expression,
+  is_const: boolean,
+  span: Span,
+)
+public struct Struct(
+  visibility: Option<Visibility>,
+  name: Name,
+  fields: #[Field],
+  members: #[Declaration],
+  span: Span,
+)
+public struct Enum(
+  visibility: Option<Visibility>,
+  name: Name,
+  variants: #[Variant],
+  members: #[Declaration],
+  span: Span,
+)
+public struct Interface(
+  visibility: Option<Visibility>,
+  name: Name,
+  members: #[Declaration],
+  span: Span,
+)
+public struct Implementation(
+  visibility: Option<Visibility>,
+  target: Type,
+  implemented_interface: Option<Type>,
+  members: #[Declaration],
+  span: Span,
+)
+public struct Namespace(
+  visibility: Option<Visibility>,
+  name: Name,
+  members: #[Declaration],
+  span: Span,
+)
+public struct Import(
+  root: ImportRoot,
+  path: #[Name],
+  alias: Option<Name>,
+  names: #[ImportName],
+  span: Span,
+)
+public struct Effect(visibility: Option<Visibility>, name: Name, span: Span)
+public struct TypeAlias(visibility: Option<Visibility>, name: Name, value: Type, span: Span)
+public struct ExternalFunction(
+  visibility: Option<Visibility>,
+  name: Name,
+  external_name: string,
+  is_async: boolean,
+  parameters: #[Parameter],
+  return_type: Option<Type>,
+  span: Span,
+)
+public struct ExternalLet(
+  visibility: Option<Visibility>,
+  name: Option<Name>,
+  external_name: string,
+  pattern: Pattern,
+  type_: Option<Type>,
+  span: Span,
+)
+public enum ExternalDeclaration {
+  Function(value: ExternalFunction),
+  Let(value: ExternalLet),
+}
+
+public enum Declaration {
+  Function(value: Function),
+  Let(value: Let),
+  Struct(value: Struct),
+  Enum(value: Enum),
+  Interface(value: Interface),
+  Implementation(value: Implementation),
+  Namespace(value: Namespace),
+  Import(value: Import),
+  Effect(value: Effect),
+  TypeAlias(value: TypeAlias),
+  External(value: ExternalDeclaration),
+}

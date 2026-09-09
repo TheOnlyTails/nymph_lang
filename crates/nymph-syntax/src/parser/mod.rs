@@ -24,6 +24,14 @@ use nymph_diagnostics::Diagnostic;
 
 use crate::lex;
 
+/// A parsed module and the token range consumed by each top-level declaration.
+/// The ranges line up with `parsed.tree.members` and let expansion keep the
+/// canonical token stream alongside the syntax tree.
+pub struct ModuleParseResult {
+	pub parsed: ParseResult<Module>,
+	pub declaration_ranges: Vec<std::ops::Range<usize>>,
+}
+
 pub struct Parser<'src> {
 	cursor: TokenCursor<'src>,
 	diagnostics: Vec<Diagnostic>,
@@ -44,19 +52,56 @@ pub struct ParseResult<T> {
 pub fn parse_module(source: &str, module_path: impl Into<EcoString>) -> ParseResult<Module> {
 	let lexed = lex(source);
 	let eoi = Span::new(source.len(), source.len());
-	let mut parser = Parser::new(&lexed.tokens, eoi);
-	let members = parser.parse_module_members();
+	let mut parsed = parse_module_tokens(&lexed.tokens, eoi, module_path);
 	let incomplete = lexed.incomplete
-		|| (!parser.diagnostics.is_empty() && lexed.diagnostics.is_empty() && parser.incomplete);
+		|| (!parsed.diagnostics.is_empty() && lexed.diagnostics.is_empty() && parsed.incomplete);
 	let mut diagnostics = lexed.diagnostics;
-	diagnostics.extend(parser.diagnostics);
-	ParseResult {
-		tree: Module {
-			members,
-			path: module_path.into(),
+	diagnostics.append(&mut parsed.diagnostics);
+	parsed.diagnostics = diagnostics;
+	parsed.incomplete = incomplete;
+	parsed
+}
+
+/// Parse an already lexed flat token stream as a module. Expansion uses this
+/// entry point so token provenance and spans survive reparsing.
+pub fn parse_module_tokens(
+	tokens: &[Spanned<Token>],
+	eoi: Span,
+	module_path: impl Into<EcoString>,
+) -> ParseResult<Module> {
+	parse_module_tokens_from(tokens, eoi, module_path, 0)
+}
+
+/// Parse generated tokens while continuing a module's node-id sequence.
+pub fn parse_module_tokens_from(
+	tokens: &[Spanned<Token>],
+	eoi: Span,
+	module_path: impl Into<EcoString>,
+	first_node_id: u32,
+) -> ParseResult<Module> {
+	parse_module_tokens_from_with_ranges(tokens, eoi, module_path, first_node_id).parsed
+}
+
+/// Parse generated tokens while retaining each top-level declaration's token range.
+pub fn parse_module_tokens_from_with_ranges(
+	tokens: &[Spanned<Token>],
+	eoi: Span,
+	module_path: impl Into<EcoString>,
+	first_node_id: u32,
+) -> ModuleParseResult {
+	let mut parser = Parser::new(tokens, eoi);
+	parser.next_id = first_node_id;
+	let (members, declaration_ranges) = parser.parse_module_members_with_ranges();
+	ModuleParseResult {
+		parsed: ParseResult {
+			tree: Module {
+				members,
+				path: module_path.into(),
+			},
+			diagnostics: parser.diagnostics,
+			incomplete: parser.incomplete,
 		},
-		diagnostics,
-		incomplete,
+		declaration_ranges,
 	}
 }
 
@@ -64,20 +109,33 @@ pub fn parse_module(source: &str, module_path: impl Into<EcoString>) -> ParseRes
 pub fn parse_expression(source: &str) -> ParseResult<Expr> {
 	let lexed = lex(source);
 	let eoi = Span::new(source.len(), source.len());
-	let mut parser = Parser::new(&lexed.tokens, eoi);
+	let mut parsed = parse_expression_tokens_from(&lexed.tokens, eoi, 0);
+	let incomplete = lexed.incomplete
+		|| (!parsed.diagnostics.is_empty() && lexed.diagnostics.is_empty() && parsed.incomplete);
+	let mut diagnostics = lexed.diagnostics;
+	diagnostics.append(&mut parsed.diagnostics);
+	parsed.diagnostics = diagnostics;
+	parsed.incomplete = incomplete;
+	parsed
+}
+
+/// Parse generated tokens as one expression while preserving syntax identity.
+pub fn parse_expression_tokens_from(
+	tokens: &[Spanned<Token>],
+	eoi: Span,
+	first_node_id: u32,
+) -> ParseResult<Expr> {
+	let mut parser = Parser::new(tokens, eoi);
+	parser.next_id = first_node_id;
 	let expr = parser.parse_expr();
 	if !parser.at_end() {
 		let span = parser.current_span();
 		parser.emit(span, ParseError::TrailingTokens);
 	}
-	let incomplete = lexed.incomplete
-		|| (!parser.diagnostics.is_empty() && lexed.diagnostics.is_empty() && parser.incomplete);
-	let mut diagnostics = lexed.diagnostics;
-	diagnostics.extend(parser.diagnostics);
 	ParseResult {
 		tree: expr,
-		diagnostics,
-		incomplete,
+		diagnostics: parser.diagnostics,
+		incomplete: parser.incomplete,
 	}
 }
 
@@ -93,7 +151,7 @@ impl<'src> Parser<'src> {
 
 	/// Build a self-spanned expression, assigning the next fresh node id.
 	pub(super) fn mk_expr(&mut self, kind: ExprKind, span: Span) -> Expr {
-		let id = NodeId(self.next_id);
+		let id = NodeId::generated(self.next_id, span.origin);
 		self.next_id += 1;
 		Expr { kind, span, id }
 	}
@@ -137,6 +195,10 @@ impl<'src> Parser<'src> {
 
 	fn restore(&mut self, pos: usize) {
 		self.cursor.restore(pos);
+	}
+
+	fn token_slice(&self, start: usize, end: usize) -> &'src [Spanned<Token>] {
+		self.cursor.slice(start, end)
 	}
 
 	/// Emit a typed [`ParseError`](crate::errors::ParseError), anchored at `span`.
@@ -212,6 +274,7 @@ impl<'src> Parser<'src> {
 			if matches!(
 				token,
 				Token::Func
+					| Token::Const
 					| Token::Async
 					| Token::Let
 					| Token::Struct

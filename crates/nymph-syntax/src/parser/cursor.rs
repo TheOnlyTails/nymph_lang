@@ -64,17 +64,21 @@ impl<'src> TokenCursor<'src> {
 		self.pos = pos;
 	}
 
+	pub fn slice(&self, start: usize, end: usize) -> &'src [Spanned<Token>] {
+		&self.tokens[start..end]
+	}
+
 	/// The span from the token at index `start` through the most recently consumed token.
 	pub fn span_from(&self, start: usize) -> Span {
-		let start_pos = self.tokens.get(start).map_or(self.eoi.start, |t| t.1.start);
-		let end_pos = if self.pos > 0 {
+		let start_span = self.tokens.get(start).map_or(self.eoi, |token| token.1);
+		let end_span = if self.pos > 0 {
 			self
 				.tokens
 				.get(self.pos - 1)
-				.map_or(self.eoi.end, |t| t.1.end)
+				.map_or(self.eoi, |token| token.1)
 		} else {
-			start_pos
+			start_span
 		};
-		Span::new(start_pos, end_pos.max(start_pos))
+		start_span.to(end_span)
 	}
 }

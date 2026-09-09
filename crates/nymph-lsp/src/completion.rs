@@ -316,6 +316,7 @@ fn top_level_items(module: &nymph_ast::decl::Module) -> Vec<(String, CompletionI
 		.members
 		.iter()
 		.filter_map(|decl| match decl {
+			Declaration::Expansion(_) | Declaration::Attached { .. } => None,
 			Declaration::Effect { name, .. } => Some((name.0.to_string(), CompletionItemKind::CLASS)),
 			Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => {
 				Some((meta.name.0.to_string(), CompletionItemKind::FUNCTION))

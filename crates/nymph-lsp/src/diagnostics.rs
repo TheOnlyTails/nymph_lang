@@ -344,11 +344,72 @@ mod tests {
 	use super::*;
 	use crate::document_store::DocumentStore;
 	use lsp_server::{Connection, Message};
+	use nymph_ast::Span;
+	use nymph_diagnostics::Label;
 
 	fn open_doc(uri: &Uri, text: &str) -> Arc<Mutex<DocumentStore>> {
 		let docs = Arc::new(Mutex::new(DocumentStore::default()));
 		docs.lock().unwrap().open(uri.clone(), text.to_string(), 1);
 		docs
+	}
+
+	#[test]
+	fn structured_help_notes_and_expansion_labels_survive_lsp_conversion() {
+		let uri: Uri = "file:///macro.nym".parse().unwrap();
+		let text = "$(broken())";
+		let diagnostic =
+			Diagnostic::error("META001".into(), "generated syntax failed", Span::new(2, 8))
+				.with_label(Label::new(
+					Span::new(0, 11),
+					"macro expansion was invoked here",
+				))
+				.with_note("expanded at 0..11 from macro definition at 2..8")
+				.with_help("fix the generated syntax in the macro definition");
+		let converted = to_lsp(&diagnostic, &uri, text, &LineIndex::new(text));
+
+		assert!(converted.message.contains("note: expanded at"));
+		assert!(converted.message.contains("help: fix the generated syntax"));
+		assert!(
+			converted
+				.related_information
+				.as_ref()
+				.is_some_and(|labels| labels
+					.iter()
+					.any(|label| { label.message.contains("macro expansion was invoked here") }))
+		);
+	}
+
+	#[test]
+	fn additive_attachment_collisions_keep_provenance_in_lsp() {
+		let uri: Uri = "file:///macro.nym".parse().unwrap();
+		let text = "const func duplicate(target: meta.Struct): meta.Struct = target\n\
+			$[duplicate()] struct Point\n";
+		let diagnostics = nymph_compiler::check(text, "macro.nym");
+		let diagnostic = diagnostics
+			.iter()
+			.find(|diagnostic| {
+				diagnostic
+					.message
+					.contains("`Point` is defined more than once")
+			})
+			.unwrap_or_else(|| panic!("missing collision diagnostic: {diagnostics:?}"));
+		let converted = to_lsp(diagnostic, &uri, text, &LineIndex::new(text));
+		let related = converted
+			.related_information
+			.as_ref()
+			.expect("collision and expansion labels");
+
+		assert!(
+			related
+				.iter()
+				.any(|label| label.message == "first defined here")
+		);
+		assert!(
+			related
+				.iter()
+				.any(|label| label.message == "macro was defined here")
+		);
+		assert!(converted.message.contains("note: expanded at"));
 	}
 
 	#[test]

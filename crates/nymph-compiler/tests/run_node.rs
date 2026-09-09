@@ -206,6 +206,17 @@ fn runs_arithmetic() {
 }
 
 #[test]
+fn runtime_capable_const_function_remains_callable_at_runtime() {
+	assert_eq!(
+		run(
+			"const func doubled(value: int): int = value * 2\npublic func result(): int = doubled(21)",
+			"result()",
+		),
+		"42"
+	);
+}
+
+#[test]
 fn runs_an_operator_inside_a_string_interpolation() {
 	// Regression: an interpolated expression used to be parsed by a FRESH sub-parser
 	// whose node ids restarted at 0, colliding with the surrounding tree's — so the

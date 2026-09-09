@@ -1408,6 +1408,7 @@ dependencies = [
  "nymph-ast",
  "nymph-codegen",
  "nymph-diagnostics",
+ "nymph-format",
  "nymph-hir",
  "nymph-sema",
  "nymph-syntax",
@@ -1533,6 +1534,7 @@ name = "nymph-wasm"
 version = "0.1.0"
 dependencies = [
  "nymph-compiler",
+ "nymph-diagnostics",
  "nymph-syntax",
  "serde",
  "serde-wasm-bindgen",

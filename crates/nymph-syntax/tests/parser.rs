@@ -113,6 +113,80 @@ fn literals_and_identifiers() {
 }
 
 #[test]
+fn const_declarations_and_token_forms_parse() {
+	let members = module_ok(
+		"const let answer: int = 42\n\
+		 const func make(value: int): meta.Tokens = \\
+		(func answer(): int = $(value))",
+	);
+	let Declaration::Let { meta, .. } = &members[0] else {
+		panic!("expected const let");
+	};
+	assert!(meta.is_const);
+	let Declaration::Func { meta, body, .. } = &members[1] else {
+		panic!("expected const func");
+	};
+	assert!(meta.is_const);
+	let ExprKind::TokenLiteral(literal) = &body.kind else {
+		panic!("expected token literal");
+	};
+	assert!(matches!(
+		literal.pieces[0].0,
+		nymph_ast::expr::TokenLiteralPiece::Token(Token::Func)
+	));
+	assert!(literal.pieces.iter().any(|piece| matches!(
+		&piece.0,
+		nymph_ast::expr::TokenLiteralPiece::Interpolation { value, splice: false, separator: None }
+			if matches!(value.kind, ExprKind::Identifier(ref name) if name.0 == "value")
+	)));
+
+	let expanded = expr("$(make(42))");
+	assert!(matches!(expanded.kind, ExprKind::Expansion(_)));
+}
+
+#[test]
+fn token_splice_separators_are_single_final_tokens() {
+	for (source, expected) in [
+		("\\(...$(items,))", Token::Comma),
+		("\\(...$(items|))", Token::Pipe),
+		("\\(...$(items]))", Token::RBracket),
+		("\\(...$(items->))", Token::Arrow),
+	] {
+		let literal = expr(source);
+		let ExprKind::TokenLiteral(literal) = literal.kind else {
+			panic!("expected token literal for {source}");
+		};
+		assert!(matches!(
+			literal.pieces.as_slice(),
+			[nymph_ast::Spanned(
+				nymph_ast::expr::TokenLiteralPiece::Interpolation {
+					splice: true,
+					separator: Some(nymph_ast::Spanned(separator, _)),
+					..
+				},
+				_
+			)] if *separator == expected
+		));
+	}
+}
+
+#[test]
+fn declaration_expansions_and_stacked_attachments_parse() {
+	let members = module_ok(
+		"$(make_answer(42))\n\
+		 $[outer()]\n\
+		 $[inner(flag = true)]\n\
+		 struct Point(x: int)",
+	);
+	assert!(matches!(members[0], Declaration::Expansion(_)));
+	let Declaration::Attached { macros, target, .. } = &members[1] else {
+		panic!("expected attached declaration macros");
+	};
+	assert_eq!(macros.len(), 2);
+	assert!(matches!(target.as_ref(), Declaration::Struct { name, .. } if name.0 == "Point"));
+}
+
+#[test]
 fn echo_parses_as_a_dedicated_prefix_and_pipeline_expression() {
 	let prefixed = expr("echo value");
 	let ExprKind::Echo { operand, keyword } = prefixed.kind else {

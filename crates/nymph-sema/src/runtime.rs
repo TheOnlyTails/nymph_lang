@@ -902,7 +902,7 @@ pub fn runtime_definitions(
 	for (declaration_index, declaration) in module.members.iter().enumerate() {
 		match declaration {
 			nymph_ast::decl::Declaration::Func { meta, body, .. } => {
-				let definition = required_top_level(checked, &meta.name.0)?;
+				let definition = required_top_level(checked, &meta.name)?;
 				push_body(
 					&mut result,
 					definition,
@@ -913,7 +913,7 @@ pub fn runtime_definitions(
 				)?;
 			}
 			nymph_ast::decl::Declaration::Let { meta, value, .. } => {
-				let name = binding_name(meta)?;
+				let name = binding_ident(meta)?;
 				push_value(
 					&mut result,
 					required_top_level(checked, name)?,
@@ -924,7 +924,7 @@ pub fn runtime_definitions(
 				)?;
 			}
 			nymph_ast::decl::Declaration::ExternalFunc(_, marker, meta) => {
-				let definition = required_top_level(checked, &meta.name.0)?;
+				let definition = required_top_level(checked, &meta.name)?;
 				let abi = shape(crate::DeclarationCategory::Function, &meta.name.0)
 					.and_then(|item| item.external.clone())
 					.unwrap_or_else(|| crate::interface_extract::external_function_abi(marker));
@@ -936,9 +936,9 @@ pub fn runtime_definitions(
 				)?;
 			}
 			nymph_ast::decl::Declaration::ExternalLet(_, marker, meta) => {
-				let name = binding_name(meta)?;
+				let name = binding_ident(meta)?;
 				let definition = required_top_level(checked, name)?;
-				let abi = shape(crate::DeclarationCategory::Let, name)
+				let abi = shape(crate::DeclarationCategory::Let, &name.0)
 					.and_then(|item| item.external.clone())
 					.unwrap_or_else(|| {
 						crate::interface_extract::external_value_abi(
@@ -1158,26 +1158,32 @@ pub enum RuntimeExtractionError {
 	CorruptImplementationMemberMapping(DefinitionId),
 	DuplicateRuntimeDefinition(DefinitionId),
 	MissingBodyExpressionIdentity,
+	UnexpandedMetaprogramming,
 }
 
 fn required_top_level(
 	checked: &crate::CheckedFacts,
-	name: &str,
+	name: &nymph_ast::Ident,
 ) -> Result<DefinitionId, RuntimeExtractionError> {
 	checked
 		.semantic
 		.definitions
-		.get(name)
+		.get_ident(name)
 		.and_then(|id| checked.semantic.definitions.stable(id))
 		.cloned()
-		.ok_or_else(|| RuntimeExtractionError::MissingStableId(name.into()))
+		.ok_or_else(|| RuntimeExtractionError::MissingStableId(name.0.clone()))
 }
-fn binding_name(meta: &LetDeclaration) -> Result<&str, RuntimeExtractionError> {
+
+fn binding_ident(meta: &LetDeclaration) -> Result<&nymph_ast::Ident, RuntimeExtractionError> {
 	if let nymph_ast::expr::Pattern::Binding { name, .. } = &meta.name.0 {
-		Ok(&name.0)
+		Ok(name)
 	} else {
 		Err(RuntimeExtractionError::MissingStableId("<pattern>".into()))
 	}
+}
+
+fn binding_name(meta: &LetDeclaration) -> Result<&str, RuntimeExtractionError> {
+	Ok(&binding_ident(meta)?.0)
 }
 fn attached(member: &crate::MemberShape<InterfaceType>) -> RuntimePlacement {
 	RuntimePlacement::Attached {
@@ -1627,6 +1633,9 @@ impl<'a> StableBodyBuilder<'a> {
 		let boxed = |v: &Expr| self.expr(v).map(Box::new);
 		let label = |v: &Option<nymph_ast::Ident>| v.as_ref().map(|n| n.0.clone());
 		let kind = match &expr.kind {
+			ExprKind::TokenLiteral(_) | ExprKind::Expansion(_) => {
+				return Err(RuntimeExtractionError::UnexpandedMetaprogramming);
+			}
 			ExprKind::Int(v) => StableExprKind::Int(v.0),
 			ExprKind::UInt(v) => StableExprKind::UInt(v.0),
 			ExprKind::Float(v) => StableExprKind::Float(v.0),

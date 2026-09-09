@@ -50,6 +50,8 @@ pub enum Token {
 	Let,
 	External,
 	Effect,
+	/// `const` — marks declarations that are available to compile-time evaluation.
+	Const,
 	Func,
 	Interface,
 	Impl,
@@ -122,6 +124,14 @@ pub enum Token {
 	Dot,
 	/// `@`
 	At,
+	/// `#` when it is not part of a collection opener.
+	Hash,
+	/// `$` before a metaprogramming delimiter (`$(` or `$[`).
+	Dollar,
+	/// `\` when it is not part of a string or character escape.
+	Backslash,
+	/// A standalone backtick. Nymph does not otherwise assign it grammar meaning.
+	Backtick,
 	/// `,`
 	Comma,
 	/// `;` — not a statement separator, but retained so the parser can diagnose it.
@@ -226,6 +236,7 @@ impl Token {
 			Let => "`let`",
 			External => "`external`",
 			Effect => "`effect`",
+			Const => "`const`",
 			Func => "`func`",
 			Interface => "`interface`",
 			Impl => "`impl`",
@@ -269,6 +280,10 @@ impl Token {
 			QuestionDot => "`?.`",
 			Dot => "`.`",
 			At => "`@`",
+			Hash => "`#`",
+			Dollar => "`$`",
+			Backslash => "`\\`",
+			Backtick => "```",
 			Comma => "`,`",
 			Semicolon => "`;`",
 			Colon => "`:`",

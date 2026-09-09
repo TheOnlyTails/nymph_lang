@@ -17,6 +17,14 @@ type Diagnostic = {
 	severity: "error" | "warning" | "info" | "hint";
 	message: string;
 	code: string;
+	pretty: string;
+	labels: Array<{
+		message: string;
+		start_line: number;
+		start_col: number;
+	}>;
+	notes: string[];
+	help: string | null;
 	start: number;
 	end: number;
 	start_line: number;
@@ -41,6 +49,8 @@ type Inspection = {
 	ast: string;
 	types: TypeState[];
 	stages: Stage[];
+	expanded: string | null;
+	expanded_tokens: Token[];
 	js: string | null;
 	run: { js: string; root_kind: "void" | "option" | "result"; task: boolean } | null;
 	diagnostics: Diagnostic[];
@@ -95,6 +105,11 @@ func area(shape: Shape): float = match (shape) {
 
 func broken(): int = greet("Nymph")
 `,
+	Metaprogramming: `const func make_answer(value: int): meta.Tokens =
+  \\(func answer(): int = $(value))
+
+$(make_answer(42))
+`,
 };
 
 const source = ref(examples.Functions);
@@ -102,9 +117,17 @@ const result = ref<Inspection | null>(null);
 const loading = ref(true);
 const compiling = ref(false);
 const failure = ref("");
-const activeTab = ref<"tokens" | "ast" | "types" | "diagnostics" | "console" | "javascript">(
-	"tokens",
-);
+const tabs = [
+	{ id: "console", label: "Console" },
+	{ id: "diagnostics", label: "Diagnostics" },
+	{ id: "tokens", label: "Tokens" },
+	{ id: "ast", label: "AST" },
+	{ id: "types", label: "Types" },
+	{ id: "expanded", label: "Macro Expansion" },
+	{ id: "javascript", label: "JavaScript" },
+] as const;
+type Tab = (typeof tabs)[number]["id"];
+const activeTab = ref<Tab>("tokens");
 const editor = ref<HTMLTextAreaElement | null>(null);
 const highlightedEditor = ref<HTMLElement | null>(null);
 const diagnosticPopup = ref<DiagnosticPopup | null>(null);
@@ -172,10 +195,8 @@ const typeTree = computed<TypeNode[]>(() => {
 
 	return roots;
 });
-const highlightedSource = computed<HighlightSegment[]>(() => {
-	const bytes = new TextEncoder().encode(source.value);
-	const tokens = result.value?.tokens ?? [];
-	const diagnostics = result.value?.diagnostics ?? [];
+function highlightSegments(text: string, tokens: Token[], diagnostics: Diagnostic[]) {
+	const bytes = new TextEncoder().encode(text);
 	const boundaries = new Set([0, bytes.length]);
 
 	for (const token of tokens) {
@@ -188,7 +209,7 @@ const highlightedSource = computed<HighlightSegment[]>(() => {
 	}
 
 	const offsets = [...boundaries].sort((left, right) => left - right);
-	return offsets.slice(0, -1).map((start, index) => {
+	return offsets.slice(0, -1).map<HighlightSegment>((start, index) => {
 		const end = offsets[index + 1];
 		const token = tokens.find((item) => item.start <= start && item.end >= end);
 		const overlappingDiagnostics = diagnostics.filter(
@@ -203,7 +224,14 @@ const highlightedSource = computed<HighlightSegment[]>(() => {
 			diagnostics: overlappingDiagnostics,
 		};
 	});
-});
+}
+
+const highlightedSource = computed(() =>
+	highlightSegments(source.value, result.value?.tokens ?? [], result.value?.diagnostics ?? []),
+);
+const highlightedExpansion = computed(() =>
+	highlightSegments(result.value?.expanded ?? "", result.value?.expanded_tokens ?? [], []),
+);
 
 function syntaxClass(kind: string) {
 	if (kind.startsWith("Identifier") || kind.startsWith("AnonymousParam"))
@@ -366,12 +394,14 @@ onMounted(() => {
 		}
 		if (response.id === undefined || response.id === latestRequestId) {
 			failure.value = `Could not run the compiler: ${response.message}`;
+			result.value = null;
 			loading.value = false;
 			compiling.value = false;
 		}
 	});
 	compilerWorker.addEventListener("error", (event) => {
 		failure.value = `Could not load the compiler worker: ${event.message}`;
+		result.value = null;
 		loading.value = false;
 		compiling.value = false;
 	});
@@ -462,25 +492,18 @@ onBeforeUnmount(() => {
 			<section class="lab-panel output-panel">
 				<div class="tabs" role="tablist" aria-label="Compiler output">
 					<button
-						v-for="tab in [
-							'tokens',
-							'ast',
-							'types',
-							'diagnostics',
-							'console',
-							'javascript',
-						] as const"
-						:key="tab"
+						v-for="tab in tabs"
+						:key="tab.id"
 						type="button"
 						role="tab"
-						:aria-selected="activeTab === tab"
-						@click="activeTab = tab"
+						:aria-selected="activeTab === tab.id"
+						@click="activeTab = tab.id"
 					>
-						{{ tab === "ast" ? "AST" : tab[0].toUpperCase() + tab.slice(1) }}
-						<span v-if="tab === 'diagnostics'" class="tab-count">
+						{{ tab.label }}
+						<span v-if="tab.id === 'diagnostics'" class="tab-count">
 							{{ result?.diagnostics.length ?? 0 }}
 						</span>
-						<i v-if="tab === 'console' && running" class="loading-dot" aria-label="Running"></i>
+						<i v-if="tab.id === 'console' && running" class="loading-dot" aria-label="Running"></i>
 					</button>
 				</div>
 
@@ -515,6 +538,17 @@ onBeforeUnmount(() => {
 						No inferred expression state is available for this module.
 					</p>
 				</div>
+				<div v-else-if="activeTab === 'expanded'" class="expanded-output" role="tabpanel">
+					<p v-if="compiling" class="empty-state">Updating macro expansion…</p>
+					<pre v-else-if="result?.expanded" class="syntax-output"><code><span
+						v-for="(segment, index) in highlightedExpansion"
+						:key="index"
+						:class="segment.classes"
+					>{{ segment.text }}</span></code></pre>
+					<p v-else class="empty-state">
+						Macro expansion is available after a clean expansion and analysis.
+					</p>
+				</div>
 				<div v-else-if="activeTab === 'diagnostics'" class="diagnostic-output" role="tabpanel">
 					<button
 						v-for="diagnostic in result?.diagnostics ?? []"
@@ -522,12 +556,10 @@ onBeforeUnmount(() => {
 						type="button"
 						class="diagnostic"
 						:class="`is-${diagnostic.severity}`"
+						:aria-label="`${diagnostic.severity} ${diagnostic.code}: ${diagnostic.message}`"
 						@click="selectRange(diagnostic.start, diagnostic.end)"
 					>
-						<span class="severity">{{ diagnostic.severity }}</span>
-						<span class="message">{{ diagnostic.message }}</span>
-						<code>{{ diagnostic.code }}</code>
-						<small>{{ diagnostic.start_line }}:{{ diagnostic.start_col }}</small>
+						<pre><code>{{ diagnostic.pretty }}</code></pre>
 					</button>
 					<p v-if="!result?.diagnostics.length" class="clean-state">
 						✓ No diagnostics. The module compiles cleanly.
@@ -811,29 +843,37 @@ textarea:focus {
 .editor-shell textarea::selection {
 	background: color-mix(in srgb, var(--vp-c-brand-1) 32%, transparent);
 }
-.source-highlight .syntax-keyword {
+.source-highlight .syntax-keyword,
+.syntax-output .syntax-keyword {
 	color: var(--syntax-keyword);
 	font-weight: 600;
 }
-.source-highlight .syntax-type {
+.source-highlight .syntax-type,
+.syntax-output .syntax-type {
 	color: var(--syntax-type);
 }
-.source-highlight .syntax-string {
+.source-highlight .syntax-string,
+.syntax-output .syntax-string {
 	color: var(--syntax-string);
 }
-.source-highlight .syntax-number {
+.source-highlight .syntax-number,
+.syntax-output .syntax-number {
 	color: var(--syntax-number);
 }
-.source-highlight .syntax-boolean {
+.source-highlight .syntax-boolean,
+.syntax-output .syntax-boolean {
 	color: var(--syntax-keyword);
 }
-.source-highlight .syntax-identifier {
+.source-highlight .syntax-identifier,
+.syntax-output .syntax-identifier {
 	color: var(--syntax-identifier);
 }
-.source-highlight .syntax-delimiter {
+.source-highlight .syntax-delimiter,
+.syntax-output .syntax-delimiter {
 	color: var(--syntax-delimiter);
 }
-.source-highlight .syntax-operator {
+.source-highlight .syntax-operator,
+.syntax-output .syntax-operator {
 	color: var(--syntax-operator);
 }
 .source-highlight .inline-error,
@@ -943,12 +983,13 @@ pre code {
 	align-items: center;
 	gap: 5px;
 	align-self: stretch;
-	padding: 0 7px;
+	padding: 0 4px;
 	border: 0;
 	border-bottom: 2px solid transparent;
 	background: transparent;
 	color: var(--vp-c-text-2);
 	cursor: pointer;
+	white-space: nowrap;
 }
 .tabs button[aria-selected="true"] {
 	border-color: var(--vp-c-brand-1);
@@ -1170,7 +1211,8 @@ pre code {
 	cursor: pointer;
 }
 .diagnostic-output,
-.console-output {
+.console-output,
+.expanded-output {
 	box-sizing: border-box;
 	height: 430px;
 	overflow: auto;
@@ -1180,6 +1222,14 @@ pre code {
 	background: #121212;
 	color: #dbd7caee;
 	font: 12px/1.6 var(--vp-font-family-mono);
+}
+.expanded-output {
+	background: #121212;
+}
+.expanded-output .syntax-output {
+	height: 430px;
+	background: transparent;
+	color: var(--syntax-foreground);
 }
 .console-output p {
 	display: flex;
@@ -1209,11 +1259,10 @@ pre code {
 	color: #bd976a;
 }
 .diagnostic {
-	display: grid;
-	grid-template-columns: 66px 1fr auto 52px;
-	gap: 12px;
+	display: block;
+	min-width: 0;
 	width: 100%;
-	padding: 10px 14px;
+	padding: 12px 14px;
 	border: 0;
 	border-bottom: 1px solid var(--lab-border);
 	background: transparent;
@@ -1221,24 +1270,25 @@ pre code {
 	text-align: left;
 	cursor: pointer;
 }
+.diagnostic pre {
+	height: auto;
+	max-width: 100%;
+	margin: 0;
+	padding: 0;
+	background: transparent;
+	color: var(--vp-c-text-1);
+	font: 12px/1.4 var(--vp-font-family-mono);
+	text-align: left;
+	overflow-wrap: anywhere;
+	white-space: pre-wrap;
+}
+.diagnostic pre code {
+	padding: 0;
+	background: transparent;
+	color: inherit;
+}
 .diagnostic:hover {
 	background: var(--vp-c-bg-soft);
-}
-.severity {
-	font-size: 11px;
-	font-weight: 700;
-	letter-spacing: 0.05em;
-	text-transform: uppercase;
-}
-.is-error .severity {
-	color: var(--vp-c-danger-1);
-}
-.is-warning .severity {
-	color: var(--vp-c-warning-1);
-}
-.diagnostic code,
-.diagnostic small {
-	color: var(--vp-c-text-3);
 }
 .clean-state,
 .empty-state {
@@ -1263,7 +1313,9 @@ pre code {
 
 @media (max-width: 820px) {
 	.compiler-lab {
-		width: calc(100vw - 28px);
+		width: 100%;
+		margin: 32px 0 48px;
+		transform: none;
 	}
 	.lab-toolbar {
 		align-items: flex-start;
@@ -1271,13 +1323,22 @@ pre code {
 	}
 	.pipeline {
 		display: grid;
-		grid-template-columns: 1fr 1fr;
+		grid-template-columns: 1fr;
 	}
 	.stage-arrow {
 		display: none;
 	}
 	.lab-grid {
 		grid-template-columns: 1fr;
+	}
+	.tabs {
+		height: auto;
+		min-height: 45px;
+		flex-wrap: wrap;
+	}
+	.tabs button {
+		min-height: 44px;
+		flex: 0 0 auto;
 	}
 	textarea,
 	pre,
@@ -1291,18 +1352,19 @@ pre code {
 		height: 340px;
 	}
 	.diagnostic-output,
-	.console-output {
+	.console-output,
+	.expanded-output .syntax-output {
 		height: 340px;
+	}
+	.diagnostic-output {
+		height: auto;
+		overflow: visible;
 	}
 	.editor-shell {
 		height: 340px;
 	}
-	.diagnostic {
-		grid-template-columns: 60px 1fr;
-	}
-	.diagnostic code,
-	.diagnostic small {
-		display: none;
+	.diagnostic pre {
+		font-size: 11px;
 	}
 }
 </style>

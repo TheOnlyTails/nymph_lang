@@ -231,7 +231,7 @@ impl Checker<'_> {
 			};
 			for super_interface in super_interfaces {
 				let name = &super_interface.0.0;
-				if let Some(interface) = self.defs.get(&name.0).filter(|&d| self.is_interface(d)) {
+				if let Some(interface) = self.defs.get_ident(name).filter(|&d| self.is_interface(d)) {
 					self
 						.annotations
 						.record_type_definition_target(name.1, self.defs.stable(interface));
@@ -841,7 +841,7 @@ impl Checker<'_> {
 				self.lower_bound_into(b, target, out);
 			}
 			Type::Reference { name, generics } => {
-				if let Some(interface) = self.defs.get(&name.0).filter(|&d| self.is_interface(d)) {
+				if let Some(interface) = self.defs.get_ident(name).filter(|&d| self.is_interface(d)) {
 					self
 						.annotations
 						.record_type_definition_target(name.1, self.defs.stable(interface));

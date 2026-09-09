@@ -166,7 +166,12 @@ pub fn imported_names(
 		.map(|imported| imported.name.clone())
 		.collect::<HashSet<_>>();
 	let local_definitions = def::build_def_map(module, &mut Vec::new());
-	seen.extend(local_definitions.by_name.keys().map(ToString::to_string));
+	seen.extend(
+		local_definitions
+			.by_name
+			.keys()
+			.map(|name| name.text().to_string()),
+	);
 	let imported_enums = bindings
 		.values()
 		.filter_map(|binding| match binding {
@@ -215,7 +220,7 @@ pub fn imported_names(
 	}
 	for (variant, candidates) in variants {
 		if candidates.len() == 1
-			&& !local_definitions.variants.contains_key(variant.as_str())
+			&& local_definitions.resolve_variant(&variant).is_none()
 			&& seen.insert(variant.clone())
 		{
 			names.push(ImportedName {
@@ -287,7 +292,7 @@ pub fn type_at(module: &Module, checked: &Checked, offset: usize) -> Option<Stri
 		// [`render_named_signature`].
 		if let ExprKind::Identifier(name) = &smallest.kind
 			&& matches!(checked.interner.kind(info.ty), TyKind::Fn { .. })
-			&& let Some(id) = defs.get(name.0.as_str())
+			&& let Some(id) = defs.get_ident(name)
 			&& matches!(defs.data(id).kind, def::DefKind::Func)
 			&& let Some(member) = defs.local_member(id)
 			&& !is_shadowed_by_local(module, smallest.id)
@@ -815,7 +820,9 @@ fn extended(owner: &[EcoString], extra: &[Spanned<GenericParam>]) -> Vec<EcoStri
 
 fn decl_generic_scope(decl: &Declaration, offset: usize) -> Option<Vec<EcoString>> {
 	match decl {
-		Declaration::Import { .. }
+		Declaration::Expansion(_)
+		| Declaration::Attached { .. }
+		| Declaration::Import { .. }
 		| Declaration::Effect { .. }
 		| Declaration::ExternalLet(..)
 		| Declaration::ExternalFunc(..)
@@ -998,6 +1005,13 @@ fn interface_member_scope(
 
 fn collect_decl_exprs<'a>(decl: &'a Declaration, out: &mut Vec<&'a Expr>) {
 	match decl {
+		Declaration::Expansion(value) => collect_expr(value, out),
+		Declaration::Attached { macros, target, .. } => {
+			for call in macros {
+				collect_expr(call, out);
+			}
+			collect_decl_exprs(target, out);
+		}
 		Declaration::Import { .. }
 		| Declaration::Effect { .. }
 		| Declaration::ExternalLet(..)
@@ -1644,7 +1658,7 @@ pub fn definition_at(module: &Module, offset: usize) -> Option<Span> {
 		.min_by_key(|(_, span)| span.end - span.start)?;
 
 	let defs = def::build_def_map(module, &mut Vec::new());
-	defs.get(name.0.as_str()).map(|id| defs.data(id).span)
+	defs.get_ident(name).map(|id| defs.data(id).span)
 }
 
 /// Every local/parameter binder whose semantic scope encloses byte `offset` —
@@ -1773,6 +1787,15 @@ fn func_decl_meta(decl: &Declaration) -> Option<&FuncDeclaration> {
 /// it — the caller then falls back to the top-level `DefMap`).
 fn walk_decl_for_binder(decl: &Declaration, target_id: NodeId) -> Option<Option<Span>> {
 	match decl {
+		Declaration::Expansion(value) => walk_expr(value, target_id, &mut Vec::new()),
+		Declaration::Attached { macros, target, .. } => {
+			for call in macros {
+				if let Some(result) = walk_expr(call, target_id, &mut Vec::new()) {
+					return Some(result);
+				}
+			}
+			walk_decl_for_binder(target, target_id)
+		}
 		Declaration::Import { .. }
 		| Declaration::Effect { .. }
 		| Declaration::ExternalLet(..)
@@ -2137,6 +2160,8 @@ fn this_method_definition_at(module: &Module, offset: usize) -> Option<Span> {
 /// interface" case; anything missed here simply returns `None`.
 fn collect_decl_type_refs<'a>(decl: &'a Declaration, out: &mut Vec<(&'a Ident, Span)>) {
 	match decl {
+		Declaration::Expansion(_) => {}
+		Declaration::Attached { target, .. } => collect_decl_type_refs(target, out),
 		Declaration::Effect { .. } => {}
 		Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => {
 			for p in &meta.params {
@@ -3057,7 +3082,7 @@ fn struct_field_types<'m>(
 		return None;
 	};
 	let name = path.last()?;
-	let id = defs.get(name.0.as_str())?;
+	let id = defs.get_ident(name)?;
 	let def::DefKind::Struct = defs.data(id).kind else {
 		return None;
 	};
@@ -3653,6 +3678,15 @@ fn collect_fallback_decl(
 	out: &mut Vec<(Span, String)>,
 ) {
 	match decl {
+		Declaration::Expansion(value) => {
+			collect_fallback_exprs(value, checked, module, defs, params, out);
+		}
+		Declaration::Attached { macros, target, .. } => {
+			for call in macros {
+				collect_fallback_exprs(call, checked, module, defs, params, out);
+			}
+			collect_fallback_decl(target, checked, module, defs, params, out);
+		}
 		Declaration::Import { .. } | Declaration::TypeAlias { .. } => {}
 		Declaration::Effect { name, .. } => {
 			out.push((name.1, format!("effect {}", name.0)));
@@ -3910,9 +3944,9 @@ fn collect_fallback_exprs(
 				// 1)`) isn't in `defs.by_name` at all (see `DefMap`'s own
 				// doc comment) and needs the same `resolve_variant` fallback
 				// `definition_at` already uses for go-to-definition.
-				if let Some(id) = defs.get(name.0.as_str()) {
+				if let Some(id) = defs.get_ident(name) {
 					out.push((func.span, defs.data(id).name.to_string()));
-				} else if let Some(Ok((enum_def, _variant))) = defs.resolve_variant(name.0.as_str()) {
+				} else if let Some(Ok((enum_def, _variant))) = defs.resolve_variant_ident(name) {
 					out.push((func.span, defs.data(enum_def).name.to_string()));
 				}
 			}
@@ -4022,6 +4056,8 @@ fn collect_fallback_exprs(
 
 fn collect_decl_scope_names(decl: &Declaration, offset: usize, out: &mut ScopeNames) {
 	match decl {
+		Declaration::Expansion(_) => {}
+		Declaration::Attached { target, .. } => collect_decl_scope_names(target, offset, out),
 		Declaration::Import { .. }
 		| Declaration::Effect { .. }
 		| Declaration::ExternalLet(..)

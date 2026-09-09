@@ -12,7 +12,7 @@
 use crate::errors::TypeError;
 use ecow::EcoString;
 use nymph_ast::{
-	Ident, Span, Spanned,
+	Ident, OriginId, Span, Spanned, SyntaxContext,
 	decl::{Declaration, Module},
 	expr::Pattern,
 };
@@ -20,6 +20,46 @@ use nymph_diagnostics::{Diagnostic, IntoDiagnostic};
 use rustc_hash::FxHashMap;
 
 use crate::{DefId, DefinitionId, ModuleIdentity, Ty};
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct NameKey {
+	text: EcoString,
+	context: NameContext,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NameContext {
+	Caller,
+	Definition(u64),
+	Fresh { origin: OriginId, index: u32 },
+}
+
+impl NameKey {
+	pub(crate) fn new(text: impl Into<EcoString>, span: Span) -> Self {
+		let context = match span.context {
+			SyntaxContext::Source | SyntaxContext::CallSite(_) | SyntaxContext::Exposed(_) => {
+				NameContext::Caller
+			}
+			SyntaxContext::Definition(definition) => NameContext::Definition(definition),
+			SyntaxContext::Fresh { origin, index } => NameContext::Fresh { origin, index },
+		};
+		Self {
+			text: text.into(),
+			context,
+		}
+	}
+
+	fn caller(text: impl Into<EcoString>) -> Self {
+		Self {
+			text: text.into(),
+			context: NameContext::Caller,
+		}
+	}
+
+	pub(crate) fn text(&self) -> &EcoString {
+		&self.text
+	}
+}
 
 /// The resolved top-level items of a module.
 #[derive(Debug, Default, Clone)]
@@ -29,11 +69,11 @@ pub struct DefMap {
 	/// Top-level names (types, functions, lets, namespaces) in a single value/type
 	/// namespace. Enum variants are *not* here — they live in [`DefMap::variants`], so
 	/// two enums may share a variant name and a struct may share a name with a variant.
-	pub by_name: FxHashMap<EcoString, DefId>,
+	pub(crate) by_name: FxHashMap<NameKey, DefId>,
 	/// Enum variants by bare name; a name maps to every variant declared with it (across
 	/// enums). A bare use is resolved against this and is ambiguous only if more than one
 	/// candidate exists — a qualified `Enum.Variant` always disambiguates.
-	pub variants: FxHashMap<EcoString, Vec<DefId>>,
+	pub(crate) variants: FxHashMap<NameKey, Vec<DefId>>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,17 +127,32 @@ impl DefMap {
 			.map(|(index, data)| (DefId(index as u32), data))
 	}
 
+	/// Iterate the names visible from ordinary caller/source syntax.
+	pub fn names(&self) -> impl Iterator<Item = &EcoString> {
+		self
+			.by_name
+			.keys()
+			.filter_map(|name| matches!(name.context, NameContext::Caller).then_some(name.text()))
+	}
+
 	pub(crate) fn clear_lexical_imports(&mut self) {
 		self.by_name.clear();
 		self.variants.clear();
 	}
 
 	pub(crate) fn expose_name(&mut self, name: EcoString, id: DefId) {
-		self.by_name.insert(name, id);
+		self.by_name.insert(NameKey::caller(name), id);
 	}
 
 	pub fn get(&self, name: &str) -> Option<DefId> {
-		self.by_name.get(name).copied()
+		self.by_name.get(&NameKey::caller(name)).copied()
+	}
+
+	pub fn get_ident(&self, name: &Ident) -> Option<DefId> {
+		self
+			.by_name
+			.get(&NameKey::new(name.0.clone(), name.1))
+			.copied()
 	}
 
 	pub fn data(&self, def: DefId) -> &DefData {
@@ -161,7 +216,11 @@ impl DefMap {
 			origin,
 			stable,
 		});
-		self.by_name.insert(name, id);
+		let key = NameKey::new(name.clone(), span);
+		self.by_name.insert(key, id);
+		if matches!(span.context, SyntaxContext::Definition(_)) {
+			self.by_name.entry(NameKey::caller(name)).or_insert(id);
+		}
 		id
 	}
 
@@ -193,7 +252,7 @@ impl DefMap {
 	) -> DefId {
 		if let Some(id) = self.by_stable(&stable) {
 			if bare_visible {
-				self.by_name.insert(name, id);
+				self.by_name.insert(NameKey::caller(name), id);
 			}
 			return id;
 		}
@@ -208,13 +267,13 @@ impl DefMap {
 			stable: Some(stable),
 		});
 		if bare_visible {
-			self.by_name.insert(name, id);
+			self.by_name.insert(NameKey::caller(name), id);
 		}
 		id
 	}
 
 	pub(crate) fn expose_imported_variant(&mut self, name: EcoString, id: DefId) {
-		let candidates = self.variants.entry(name).or_default();
+		let candidates = self.variants.entry(NameKey::caller(name)).or_default();
 		if !candidates.contains(&id) {
 			candidates.push(id);
 		}
@@ -242,13 +301,25 @@ impl DefMap {
 			origin: DefOrigin::Local { member },
 			stable,
 		});
-		self.variants.entry(name).or_default().push(id);
+		self
+			.variants
+			.entry(NameKey::new(name, span))
+			.or_default()
+			.push(id);
 		id
 	}
 
 	/// Resolve a bare variant name: `None` if unknown, `Some(Ok)` if a single variant
 	/// matches, `Some(Err)` if several do (ambiguous — needs a qualified `Enum.Variant`).
 	pub fn resolve_variant(&self, name: &str) -> Option<Result<(DefId, usize), ()>> {
+		self.resolve_variant_key(&NameKey::caller(name))
+	}
+
+	pub fn resolve_variant_ident(&self, name: &Ident) -> Option<Result<(DefId, usize), ()>> {
+		self.resolve_variant_key(&NameKey::new(name.0.clone(), name.1))
+	}
+
+	fn resolve_variant_key(&self, name: &NameKey) -> Option<Result<(DefId, usize), ()>> {
 		let ids = self.variants.get(name)?;
 		match ids.as_slice() {
 			[] => None,
@@ -281,7 +352,7 @@ pub(crate) fn build_def_map_on(
 	diags: &mut Vec<Diagnostic>,
 	headers: Option<&crate::DeclaredHeaders>,
 ) -> DefMap {
-	let mut seen: FxHashMap<EcoString, Span> = FxHashMap::default();
+	let mut seen: FxHashMap<NameKey, Span> = FxHashMap::default();
 
 	let mut declare = |map: &mut DefMap,
 	                   diags: &mut Vec<Diagnostic>,
@@ -289,7 +360,8 @@ pub(crate) fn build_def_map_on(
 	                   kind: DefKind,
 	                   member: usize|
 	 -> DefId {
-		if let Some(&prev) = seen.get(&name.0) {
+		let key = NameKey::new(name.0.clone(), name.1);
+		if let Some(&prev) = seen.get(&key) {
 			diags.push(
 				TypeError::Redefinition {
 					name: name.0.clone(),
@@ -299,7 +371,7 @@ pub(crate) fn build_def_map_on(
 				.as_diagnostic(name.1),
 			);
 		}
-		seen.insert(name.0.clone(), name.1);
+		seen.insert(key, name.1);
 		let stable = headers.and_then(|headers| headers.member_id(member));
 		map.define(
 			name.0.clone(),
@@ -312,6 +384,7 @@ pub(crate) fn build_def_map_on(
 
 	for (i, decl) in module.members.iter().enumerate() {
 		match decl {
+			Declaration::Expansion(_) | Declaration::Attached { .. } => {}
 			Declaration::Func { meta, .. } | Declaration::ExternalFunc(_, _, meta) => {
 				declare(&mut map, diags, &meta.name, DefKind::Func, i);
 			}

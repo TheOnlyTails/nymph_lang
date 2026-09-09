@@ -7,6 +7,7 @@
 		{ "include": "#strings" },
 		{ "include": "#characters" },
 		{ "include": "#numbers" },
+		{ "include": "#metaprogramming" },
 		{ "include": "#anonymous-parameters" },
 		{ "include": "#async-syntax" },
 		{ "include": "#effects" },
@@ -102,6 +103,22 @@
 			"name": "variable.language.anonymous-parameter.nymph",
 			"match": "\\$\\d*(?!\\{)"
 		},
+		"metaprogramming": {
+			"patterns": [
+				{
+					"name": "punctuation.definition.tokens.begin.nymph",
+					"match": "\\\\(?=\\()"
+				},
+				{
+					"name": "keyword.operator.expansion.nymph",
+					"match": "\\$(?=\\()"
+				},
+				{
+					"name": "keyword.operator.attached-macro.nymph",
+					"match": "\\$(?=\\[)"
+				}
+			]
+		},
 		"async-syntax": {
 			"patterns": [
 				{
@@ -176,7 +193,7 @@
 				},
 				{
 					"name": "storage.modifier.nymph",
-					"match": "\\b(public|internal|private|external)\\b"
+					"match": "\\b(public|internal|private|external|const)\\b"
 				},
 				{
 					"name": "keyword.operator.word.nymph",

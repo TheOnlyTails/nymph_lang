@@ -13,6 +13,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 nymph-compiler = { path = "../nymph-compiler", default-features = false, features = ["bundler-swc"] }
+nymph-diagnostics.workspace = true
 nymph-syntax.workspace = true
 serde = { workspace = true }
 wasm-bindgen = "0.2.126"

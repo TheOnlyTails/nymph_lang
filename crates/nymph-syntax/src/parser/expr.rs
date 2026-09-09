@@ -5,7 +5,7 @@ use nymph_ast::{
 	Ident, Span, Spanned,
 	expr::{
 		CallArg, ClosureParam, Expr, ExprKind, ListItem, MapEntry, MatchArm, RangeKind, StateBinding,
-		StateReplacement, Statement, StringPart,
+		StateReplacement, Statement, StringPart, TokenLiteral, TokenLiteralPiece,
 	},
 	ops::{BinaryOperator, Precedence, PrefixOperator},
 	token::{StrFragment, Token},
@@ -403,6 +403,14 @@ impl Parser<'_> {
 		};
 
 		match token {
+			Token::Backslash if self.peek_nth(1) == Some(&Token::LParen) => self.parse_token_literal(),
+			Token::Dollar if self.peek_nth(1) == Some(&Token::LParen) => {
+				self.advance();
+				self.advance();
+				let value = self.parse_expr();
+				self.expect(&Token::RParen);
+				self.mk_expr(ExprKind::Expansion(Box::new(value)), self.span_from(start))
+			}
 			Token::Int(v) => {
 				let v = *v;
 				let span = self.advance().unwrap().1;
@@ -539,6 +547,126 @@ impl Parser<'_> {
 		}
 	}
 
+	fn parse_token_literal(&mut self) -> Expr {
+		let start = self.position();
+		self.advance(); // `\`
+		self.advance(); // `(`
+		let mut pieces = Vec::new();
+		let mut delimiters = Vec::new();
+		while !self.at_end() {
+			if self.check(&Token::RParen) && delimiters.is_empty() {
+				break;
+			}
+			let splice = self.check(&Token::DotDotDot)
+				&& self.peek_nth(1) == Some(&Token::Dollar)
+				&& self.peek_nth(2) == Some(&Token::LParen);
+			let interpolation = self.check(&Token::Dollar) && self.peek_nth(1) == Some(&Token::LParen);
+			if splice || interpolation {
+				let piece_start = self.position();
+				if splice {
+					self.advance();
+				}
+				self.advance(); // `$`
+				self.advance(); // `(`
+				let tokens = self.take_interpolation_tokens();
+				let (value, separator) = self.parse_token_interpolation(tokens);
+				pieces.push(Spanned(
+					TokenLiteralPiece::Interpolation {
+						value: Box::new(value),
+						splice,
+						separator,
+					},
+					self.span_from(piece_start),
+				));
+				continue;
+			}
+
+			let token = self
+				.advance()
+				.expect("checked token literal content")
+				.clone();
+			match token.0 {
+				Token::LParen | Token::HashLParen => delimiters.push(Token::RParen),
+				Token::LBracket | Token::HashLBracket => delimiters.push(Token::RBracket),
+				Token::LBrace | Token::HashLBrace => delimiters.push(Token::RBrace),
+				ref close if delimiters.last() == Some(close) => {
+					delimiters.pop();
+				}
+				_ => {}
+			}
+			pieces.push(token.map(TokenLiteralPiece::Token));
+		}
+		self.expect(&Token::RParen);
+		self.mk_expr(
+			ExprKind::TokenLiteral(TokenLiteral { pieces }),
+			self.span_from(start),
+		)
+	}
+
+	fn take_interpolation_tokens(&mut self) -> Vec<Spanned<Token>> {
+		let mut tokens = Vec::new();
+		let mut delimiters = Vec::new();
+		while !self.at_end() {
+			if self.check(&Token::RParen) && delimiters.is_empty() {
+				self.advance();
+				return tokens;
+			}
+			let token = self
+				.advance()
+				.expect("checked interpolation content")
+				.clone();
+			match token.0 {
+				Token::LParen | Token::HashLParen => delimiters.push(Token::RParen),
+				Token::LBracket | Token::HashLBracket => delimiters.push(Token::RBracket),
+				Token::LBrace | Token::HashLBrace => delimiters.push(Token::RBrace),
+				ref close if delimiters.last() == Some(close) => {
+					delimiters.pop();
+				}
+				_ => {}
+			}
+			tokens.push(token);
+		}
+		self.expect(&Token::RParen);
+		tokens
+	}
+
+	fn parse_token_interpolation(
+		&mut self,
+		mut tokens: Vec<Spanned<Token>>,
+	) -> (Expr, Option<Spanned<Token>>) {
+		if let Some((expr, next_id)) = self.try_parse_interpolation(&tokens) {
+			self.next_id = next_id;
+			return (expr, None);
+		}
+
+		let separator = tokens.pop();
+		if let Some((expr, next_id)) = self.try_parse_interpolation(&tokens) {
+			self.next_id = next_id;
+			return (expr, separator);
+		}
+
+		let eoi = tokens.last().map_or(self.current_span(), |token| {
+			Span::new(token.1.end, token.1.end)
+		});
+		let mut parser = Parser::new(&tokens, eoi);
+		parser.next_id = self.next_id;
+		let expr = parser.parse_expr();
+		self.next_id = parser.next_id;
+		self.diagnostics.extend(parser.diagnostics);
+		(expr, separator)
+	}
+
+	fn try_parse_interpolation(&self, tokens: &[Spanned<Token>]) -> Option<(Expr, u32)> {
+		if tokens.is_empty() {
+			return None;
+		}
+		let end = tokens.last().expect("non-empty tokens").1.end;
+		let mut parser = Parser::new(tokens, Span::new(end, end));
+		parser.next_id = self.next_id;
+		let expr = parser.parse_expr();
+		(parser.at_end() && parser.diagnostics.is_empty()).then_some((expr, parser.next_id))
+	}
+
 	fn parse_string(&mut self) -> Expr {
 		let start = self.position();
 		let fragments = match self.peek() {
@@ -581,7 +709,10 @@ impl Parser<'_> {
 						self.incomplete = false;
 					}
 					self.diagnostics.extend(sub.diagnostics);
-					parts.push(Spanned(StringPart::InterpolatedExpr(expr), fragment.1));
+					parts.push(Spanned(
+						StringPart::InterpolatedExpr(Box::new(expr)),
+						fragment.1,
+					));
 				}
 			}
 		}
@@ -899,7 +1030,13 @@ impl Parser<'_> {
 		let start = self.position();
 		if self.check(&Token::Let) {
 			let (meta, value) = self.parse_let_binding();
-			Spanned(Statement::Let { meta, value }, self.span_from(start))
+			Spanned(
+				Statement::Let {
+					meta,
+					value: Box::new(value),
+				},
+				self.span_from(start),
+			)
 		} else {
 			let expr = self.parse_expr();
 			Spanned(Statement::Expr(expr), self.span_from(start))
@@ -911,6 +1048,8 @@ impl Parser<'_> {
 			self.peek(),
 			Some(
 				Token::Int(_)
+					| Token::Backslash
+					| Token::Dollar
 					| Token::UInt(_)
 					| Token::Float(_)
 					| Token::Char(_)

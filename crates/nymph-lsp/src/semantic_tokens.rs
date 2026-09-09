@@ -60,7 +60,7 @@ use nymph_ast::{
 	},
 	expr::{
 		Expr, ExprKind, ListItem, ListPatternEntry, MapEntry, MapPatternEntry, Pattern, RangeKind,
-		Statement, StringPart, StructPatternField,
+		Statement, StringPart, StructPatternField, TokenLiteralPiece,
 	},
 	token::{StrFragment, Token},
 	ty::{GenericArg, GenericParam, Type},
@@ -356,7 +356,7 @@ fn push_str_token(
 fn lexer_token_type(token: &Token) -> Option<u32> {
 	use Token::*;
 	Some(match token {
-		Public | Internal | Private | Import | With | Type | Struct | Enum | Effect | Let
+		Public | Internal | Private | Import | With | Type | Struct | Enum | Effect | Let | Const
 		| External | Func | Interface | Impl | Namespace | For | Loop | If | Else | Match
 		| Continue | Break | Echo | This | In | As | Is | Async | Await | True | False => KEYWORD,
 		IntType | UIntType | FloatType | BooleanType | CharType | StringType | VoidType | NeverType
@@ -371,7 +371,8 @@ fn lexer_token_type(token: &Token) -> Option<u32> {
 		Str(_) | Char(_) => STRING,
 
 		LParen | RParen | LBracket | RBracket | LBrace | RBrace | HashLParen | HashLBracket
-		| HashLBrace | Comma | Semicolon | Colon | At | Underscore | Error => return None,
+		| HashLBrace | Comma | Semicolon | Colon | At | Hash | Dollar | Backslash | Backtick
+		| Underscore | Error => return None,
 
 		Identifier(_) | AnonymousParam(_) => return None,
 	})
@@ -625,6 +626,13 @@ fn walk_import_decl(decl: &Declaration, analysis: &SemanticAnalysis, map: &mut R
 
 fn walk_decl(decl: &Declaration, map: &mut RoleMap) {
 	match decl {
+		Declaration::Expansion(value) => walk_expr(value, map),
+		Declaration::Attached { macros, target, .. } => {
+			for call in macros {
+				walk_expr(call, map);
+			}
+			walk_decl(target, map);
+		}
 		Declaration::Import { .. } => {}
 		Declaration::Effect { name, .. } => {
 			map.insert(name.1.start, (TYPE, DECLARATION));
@@ -977,6 +985,14 @@ fn walk_expr(expr: &Expr, map: &mut RoleMap) {
 				}
 			}
 		}
+		ExprKind::TokenLiteral(literal) => {
+			for piece in &literal.pieces {
+				if let TokenLiteralPiece::Interpolation { value, .. } = &piece.0 {
+					walk_expr(value, map);
+				}
+			}
+		}
+		ExprKind::Expansion(value) => walk_expr(value, map),
 		ExprKind::AsyncBlock { body, .. } => walk_expr(body, map),
 		ExprKind::Await { value, .. } => walk_expr(value, map),
 		ExprKind::List(items) | ExprKind::Tuple(items) => {
@@ -1284,6 +1300,15 @@ fn walk_decl_uses(
 	out: &mut Vec<(usize, (u32, u32))>,
 ) {
 	match decl {
+		Declaration::Expansion(value) => {
+			walk_expr_uses(value, analysis, variant_names, decls, out);
+		}
+		Declaration::Attached { macros, target, .. } => {
+			for call in macros {
+				walk_expr_uses(call, analysis, variant_names, decls, out);
+			}
+			walk_decl_uses(target, analysis, variant_names, decls, out);
+		}
 		Declaration::Import { .. } | Declaration::Effect { .. } | Declaration::TypeAlias { .. } => {}
 		Declaration::Let { meta, value, .. } => {
 			walk_pattern_bindings(&meta.name, analysis, let_binding_role(), out);
@@ -1435,6 +1460,16 @@ fn walk_expr_uses(
 					walk_expr_uses(e, analysis, variant_names, decls, out);
 				}
 			}
+		}
+		ExprKind::TokenLiteral(literal) => {
+			for piece in &literal.pieces {
+				if let TokenLiteralPiece::Interpolation { value, .. } = &piece.0 {
+					walk_expr_uses(value, analysis, variant_names, decls, out);
+				}
+			}
+		}
+		ExprKind::Expansion(value) => {
+			walk_expr_uses(value, analysis, variant_names, decls, out);
 		}
 		ExprKind::AsyncBlock { body, .. } => walk_expr_uses(body, analysis, variant_names, decls, out),
 		ExprKind::Await { value, .. } => walk_expr_uses(value, analysis, variant_names, decls, out),

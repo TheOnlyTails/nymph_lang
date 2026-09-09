@@ -17,12 +17,16 @@ use nymph_ast::{
 use super::Parser;
 
 impl Parser<'_> {
-	pub(super) fn parse_module_members(&mut self) -> Vec<Declaration> {
+	pub(super) fn parse_module_members_with_ranges(
+		&mut self,
+	) -> (Vec<Declaration>, Vec<std::ops::Range<usize>>) {
 		let mut members = Vec::new();
+		let mut ranges = Vec::new();
 		while !self.at_end() {
 			let before = self.position();
 			if let Some(decl) = self.parse_declaration() {
 				members.push(decl);
+				ranges.push(before..self.position());
 			}
 			// Guarantee forward progress even on unrecognised input.
 			if self.position() == before {
@@ -30,7 +34,7 @@ impl Parser<'_> {
 				self.recover_to_declaration();
 			}
 		}
-		members
+		(members, ranges)
 	}
 
 	fn parse_visibility(&mut self) -> Option<Visibility> {
@@ -46,6 +50,30 @@ impl Parser<'_> {
 	}
 
 	fn parse_declaration(&mut self) -> Option<Declaration> {
+		if self.check(&Token::Dollar) && self.peek_nth(1) == Some(&Token::LParen) {
+			let expansion = self.parse_expr();
+			let ExprKind::Expansion(value) = expansion.kind else {
+				unreachable!("declaration expansion parsed as another expression kind");
+			};
+			return Some(Declaration::Expansion(*value));
+		}
+		if self.check(&Token::Dollar) && self.peek_nth(1) == Some(&Token::LBracket) {
+			let mut macros = Vec::new();
+			while self.check(&Token::Dollar) && self.peek_nth(1) == Some(&Token::LBracket) {
+				self.advance();
+				self.advance();
+				macros.push(self.parse_expr());
+				self.expect(&Token::RBracket);
+			}
+			let target_start = self.position();
+			let target = self.parse_declaration()?;
+			let target_tokens = self.token_slice(target_start, self.position()).to_vec();
+			return Some(Declaration::Attached {
+				macros,
+				target_tokens,
+				target: Box::new(target),
+			});
+		}
 		if self.check(&Token::Import) {
 			return Some(self.parse_import());
 		}
@@ -54,7 +82,13 @@ impl Parser<'_> {
 			Some(Token::External) => Some(self.parse_external(visibility)),
 			Some(Token::Effect) => Some(self.parse_effect(visibility)),
 			Some(Token::Let) => Some(self.parse_let_decl(visibility)),
+			Some(Token::Const) if self.peek_nth(1) == Some(&Token::Let) => {
+				Some(self.parse_let_decl(visibility))
+			}
 			Some(Token::Func) => Some(self.parse_func_decl(visibility, FuncKind::Instance, false)),
+			Some(Token::Const) if self.peek_nth(1) == Some(&Token::Func) => {
+				Some(self.parse_func_decl(visibility, FuncKind::Instance, false))
+			}
 			Some(Token::Async) if self.peek_nth(1) == Some(&Token::Func) => {
 				Some(self.parse_func_decl(visibility, FuncKind::Instance, true))
 			}
@@ -180,6 +214,7 @@ impl Parser<'_> {
 
 	/// Parse a `[namespace] let …` binding.
 	fn parse_let_binding_kinded(&mut self, namespaced: bool) -> (LetDeclaration, Expr) {
+		let is_const = self.eat(&Token::Const).is_some();
 		self.advance(); // `let`
 		let managed =
 			!namespaced && matches!(self.peek(), Some(Token::Identifier(name)) if name == "use");
@@ -201,7 +236,15 @@ impl Parser<'_> {
 		};
 		self.expect(&Token::Eq);
 		let value = self.parse_expr();
-		(LetDeclaration { kind, name, type_ }, value)
+		(
+			LetDeclaration {
+				is_const,
+				kind,
+				name,
+				type_,
+			},
+			value,
+		)
 	}
 
 	fn parse_let_decl(&mut self, visibility: Option<Visibility>) -> Declaration {
@@ -221,6 +264,7 @@ impl Parser<'_> {
 	fn func_kind_here(&self) -> Option<FuncKind> {
 		match self.peek() {
 			Some(Token::Func) => Some(FuncKind::Instance),
+			Some(Token::Const) if self.peek_nth(1) == Some(&Token::Func) => Some(FuncKind::Instance),
 			Some(Token::Namespace) if self.peek_nth(1) == Some(&Token::Func) => Some(FuncKind::Namespace),
 			Some(Token::Async) if self.peek_nth(1) == Some(&Token::Func) => Some(FuncKind::Instance),
 			_ => None,
@@ -238,6 +282,7 @@ impl Parser<'_> {
 			}
 			FuncKind::Instance => {}
 		};
+		let is_const = self.eat(&Token::Const).is_some();
 		self.advance(); // `func`
 		let name = self.expect_ident();
 		let generics = self.parse_generic_params();
@@ -251,6 +296,7 @@ impl Parser<'_> {
 		};
 		FuncDeclaration {
 			kind,
+			is_const,
 			is_async,
 			name,
 			generics,
@@ -323,7 +369,16 @@ impl Parser<'_> {
 			};
 			let js_name = explicit_name
 				.unwrap_or_else(|| name.0.as_binding().map(|i| i.0.clone()).unwrap_or_default());
-			Declaration::ExternalLet(visibility, js_name, LetDeclaration { kind, name, type_ })
+			Declaration::ExternalLet(
+				visibility,
+				js_name,
+				LetDeclaration {
+					is_const: false,
+					kind,
+					name,
+					type_,
+				},
+			)
 		}
 	}
 
@@ -557,6 +612,7 @@ impl Parser<'_> {
 			ImplMember::Let {
 				visibility,
 				meta: LetDeclaration {
+					is_const: false,
 					kind: LetKind::Instance,
 					name: Spanned(nymph_ast::expr::Pattern::Placeholder, span),
 					type_: None,
@@ -648,7 +704,12 @@ impl Parser<'_> {
 			Some(Spanned(
 				InterfaceMember::Element(Box::new(Spanned(
 					InterfaceElement::Let {
-						meta: LetDeclaration { kind, name, type_ },
+						meta: LetDeclaration {
+							is_const: false,
+							kind,
+							name,
+							type_,
+						},
 						value,
 					},
 					self.span_from(start),

@@ -16,6 +16,7 @@
 /// `import std/…` (i.e. it is NOT in `prelude::CORE_SOURCES`).
 const STD_SOURCES: &[(&str, &str)] = &[
 	("io", include_str!("../../../stdlib/src/io.nym")),
+	("meta", include_str!("../../../stdlib/src/meta.nym")),
 	(
 		"collections/set",
 		include_str!("../../../stdlib/src/collections/set.nym"),
